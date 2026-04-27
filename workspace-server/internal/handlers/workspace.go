@@ -20,15 +20,28 @@ import (
 	"github.com/Molecule-AI/molecule-monorepo/platform/internal/events"
 	"github.com/Molecule-AI/molecule-monorepo/platform/internal/models"
 	"github.com/Molecule-AI/molecule-monorepo/platform/internal/provisioner"
+	"github.com/Molecule-AI/molecule-monorepo/platform/internal/wsauth"
 	"github.com/Molecule-AI/molecule-monorepo/platform/pkg/provisionhook"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
 
 type WorkspaceHandler struct {
-	broadcaster *events.Broadcaster
+	// broadcaster narrowed from `*events.Broadcaster` to the
+	// events.EventEmitter interface (#1814) so tests can substitute a
+	// capture-only stub without standing up the real Redis + WS-hub
+	// topology. Production callers still pass *events.Broadcaster, which
+	// satisfies the interface — see the compile-time assertion in
+	// internal/events/broadcaster.go.
+	broadcaster events.EventEmitter
 	provisioner *provisioner.Provisioner
-	cpProv      *provisioner.CPProvisioner
+	// cpProv narrowed from `*provisioner.CPProvisioner` to the
+	// provisioner.CPProvisionerAPI interface (#1814) so tests can
+	// substitute a stub without standing up the real CP HTTP client +
+	// auth chain. Production callers still pass *CPProvisioner via
+	// SetCPProvisioner, which satisfies the interface — see the
+	// compile-time assertion in internal/provisioner/cp_provisioner.go.
+	cpProv      provisioner.CPProvisionerAPI
 	platformURL string
 	configsDir  string // path to workspace-configs-templates/ (for reading templates)
 	// envMutators runs registered EnvMutator plugins right before
@@ -40,9 +53,13 @@ type WorkspaceHandler struct {
 	// calls made by HibernateWorkspace without requiring a running Docker daemon.
 	// Always nil in production; the real provisioner path is used when nil.
 	stopFnOverride func(ctx context.Context, workspaceID string)
+	// provisionTimeouts caches per-runtime provision-timeout values from
+	// template manifests (#2054 phase 2). Lazy-init on first scan; see
+	// runtime_provision_timeouts.go for the loader contract.
+	provisionTimeouts runtimeProvisionTimeoutsCache
 }
 
-func NewWorkspaceHandler(b *events.Broadcaster, p *provisioner.Provisioner, platformURL, configsDir string) *WorkspaceHandler {
+func NewWorkspaceHandler(b events.EventEmitter, p *provisioner.Provisioner, platformURL, configsDir string) *WorkspaceHandler {
 	return &WorkspaceHandler{
 		broadcaster: b,
 		provisioner: p,
@@ -53,7 +70,10 @@ func NewWorkspaceHandler(b *events.Broadcaster, p *provisioner.Provisioner, plat
 
 // SetCPProvisioner wires the control plane provisioner for SaaS tenants.
 // Auto-activated when MOLECULE_ORG_ID is set (no manual config needed).
-func (h *WorkspaceHandler) SetCPProvisioner(cp *provisioner.CPProvisioner) {
+//
+// Parameter is the CPProvisionerAPI interface (#1814) — production passes
+// the *CPProvisioner from NewCPProvisioner; tests pass a stub.
+func (h *WorkspaceHandler) SetCPProvisioner(cp provisioner.CPProvisionerAPI) {
 	h.cpProv = cp
 }
 
@@ -200,11 +220,15 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 		return
 	}
 
+	maxConcurrent := payload.MaxConcurrentTasks
+	if maxConcurrent <= 0 {
+		maxConcurrent = models.DefaultMaxConcurrentTasks
+	}
 	// Insert workspace with runtime persisted in DB (inside transaction)
 	_, err := tx.ExecContext(ctx, `
-		INSERT INTO workspaces (id, name, role, tier, runtime, awareness_namespace, status, parent_id, workspace_dir, workspace_access, budget_limit)
-		VALUES ($1, $2, $3, $4, $5, $6, 'provisioning', $7, $8, $9, $10)
-	`, id, payload.Name, role, payload.Tier, payload.Runtime, awarenessNamespace, payload.ParentID, workspaceDir, workspaceAccess, payload.BudgetLimit)
+		INSERT INTO workspaces (id, name, role, tier, runtime, awareness_namespace, status, parent_id, workspace_dir, workspace_access, budget_limit, max_concurrent_tasks)
+		VALUES ($1, $2, $3, $4, $5, $6, 'provisioning', $7, $8, $9, $10, $11)
+	`, id, payload.Name, role, payload.Tier, payload.Runtime, awarenessNamespace, payload.ParentID, workspaceDir, workspaceAccess, payload.BudgetLimit, maxConcurrent)
 	if err != nil {
 		tx.Rollback() //nolint:errcheck
 		log.Printf("Create workspace error: %v", err)
@@ -264,25 +288,91 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 		"runtime": payload.Runtime,
 	})
 
-	// External workspaces: no container provisioning — just set the URL and mark online
-	if payload.External {
+	// External workspaces: no container provisioning. Two shapes:
+	//   (a) URL supplied up-front  — the operator already has their
+	//       agent running somewhere reachable; we mark it online
+	//       immediately. Legacy flow, preserved for callers that
+	//       don't need the copy-this-snippet UX (org-import, etc.).
+	//   (b) URL omitted             — the operator will install
+	//       molecule-sdk-python or another A2A server later. We
+	//       mint a workspace_auth_token now and return it alongside
+	//       workspace_id + platform_url so the canvas UI can show
+	//       one copy-paste connection snippet. Status is set to
+	//       "awaiting_agent" — distinct from "provisioning" (which
+	//       implies docker work in flight) so the canvas can render
+	//       a "waiting for external agent to connect" state without
+	//       tripping the provisioning-timeout UX.
+	if payload.External || payload.Runtime == "external" {
+		var connectionToken string
 		if payload.URL != "" {
-			db.DB.ExecContext(ctx, `UPDATE workspaces SET url = $1, status = 'online', updated_at = now() WHERE id = $2`, payload.URL, id)
+			db.DB.ExecContext(ctx, `UPDATE workspaces SET url = $1, status = 'online', runtime = 'external', updated_at = now() WHERE id = $2`, payload.URL, id)
 			if err := db.CacheURL(ctx, id, payload.URL); err != nil {
 				log.Printf("External workspace: failed to cache URL for %s: %v", id, err)
 			}
+			h.broadcaster.RecordAndBroadcast(ctx, "WORKSPACE_ONLINE", id, map[string]interface{}{
+				"name": payload.Name, "external": true,
+			})
 		} else {
-			db.DB.ExecContext(ctx, `UPDATE workspaces SET status = 'online', updated_at = now() WHERE id = $1`, id)
+			// Pre-register flow: mint a token and park the workspace
+			// in awaiting_agent. First POST /registry/register call
+			// from the external agent (with this token + its URL)
+			// flips the row to online.
+			db.DB.ExecContext(ctx, `UPDATE workspaces SET status = 'awaiting_agent', runtime = 'external', updated_at = now() WHERE id = $1`, id)
+			tok, tokErr := wsauth.IssueToken(ctx, db.DB, id)
+			if tokErr != nil {
+				log.Printf("External workspace %s: token issuance failed: %v", id, tokErr)
+				// Non-fatal — the workspace row still exists; the
+				// operator can call POST /workspaces/:id/tokens later
+				// to mint one. Return a 201 with a hint instead of
+				// 500'ing a partial-success write.
+			} else {
+				connectionToken = tok
+			}
+			h.broadcaster.RecordAndBroadcast(ctx, "WORKSPACE_AWAITING_AGENT", id, map[string]interface{}{
+				"name": payload.Name, "external": true,
+			})
 		}
-		h.broadcaster.RecordAndBroadcast(ctx, "WORKSPACE_ONLINE", id, map[string]interface{}{
-			"name": payload.Name, "external": true,
-		})
-		log.Printf("Created external workspace %s (%s) at %s", payload.Name, id, payload.URL)
-		c.JSON(http.StatusCreated, gin.H{
+		log.Printf("Created external workspace %s (%s) url=%q awaiting=%v",
+			payload.Name, id, payload.URL, payload.URL == "")
+		resp := gin.H{
 			"id":       id,
-			"status":   "online",
 			"external": true,
-		})
+		}
+		if payload.URL != "" {
+			resp["status"] = "online"
+		} else {
+			resp["status"] = "awaiting_agent"
+			// Connection snippet payload. Returned ONCE on create —
+			// the token is not recoverable from any later read. UI
+			// is responsible for surfacing this in a copy-paste modal.
+			platformURL := strings.TrimSuffix(externalPlatformURL(c), "/")
+			resp["connection"] = gin.H{
+				"workspace_id": id,
+				"platform_url": platformURL,
+				"auth_token":   connectionToken, // may be "" if IssueToken failed above
+				"registry_endpoint": platformURL + "/registry/register",
+				"heartbeat_endpoint": platformURL + "/registry/heartbeat",
+				// Pre-formatted snippet that a non-Go operator can
+				// paste verbatim. curl-based so there's no SDK
+				// install dependency. The external agent only
+				// needs to replace $AGENT_URL with its own public URL.
+				"curl_register_template": strings.ReplaceAll(
+					strings.ReplaceAll(externalCurlTemplate,
+						"{{PLATFORM_URL}}", platformURL),
+					"{{WORKSPACE_ID}}", id,
+				),
+				// Python/SDK snippet. molecule-sdk-python PR #13
+				// shipped A2AServer + RemoteAgentClient specifically
+				// for this flow. The SDK is not yet on PyPI — the
+				// snippet pins @main until we cut a release.
+				"python_snippet": strings.ReplaceAll(
+					strings.ReplaceAll(externalPythonTemplate,
+						"{{PLATFORM_URL}}", platformURL),
+					"{{WORKSPACE_ID}}", id,
+				),
+			}
+		}
+		c.JSON(http.StatusCreated, resp)
 		return
 	}
 
@@ -341,6 +431,17 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 		"awareness_namespace": awarenessNamespace,
 		"workspace_access":    workspaceAccess,
 	})
+}
+
+// addProvisionTimeoutMs decorates a workspace response map with the
+// per-runtime provision-timeout override (#2054 phase 2) when one is
+// declared in the runtime's template manifest. No-op when the runtime
+// has no declared timeout — the canvas-side resolver falls through to
+// its runtime-profile default.
+func (h *WorkspaceHandler) addProvisionTimeoutMs(ws map[string]interface{}, runtime string) {
+	if secs := h.provisionTimeouts.get(h.configsDir, runtime); secs > 0 {
+		ws["provision_timeout_ms"] = secs * 1000
+	}
 }
 
 // scanWorkspaceRow is a helper to scan workspace+layout rows into a clean JSON map.
@@ -441,6 +542,13 @@ func (h *WorkspaceHandler) List(c *gin.Context) {
 			log.Printf("List scan error: %v", err)
 			continue
 		}
+		// #2054 phase 2: surface per-runtime provision-timeout for
+		// canvas's ProvisioningTimeout banner. Decorating per-row
+		// (vs map-once-and-reuse) keeps the helper self-contained;
+		// the cache hit is sub-microsecond.
+		if rt, _ := ws["runtime"].(string); rt != "" {
+			h.addProvisionTimeoutMs(ws, rt)
+		}
 		workspaces = append(workspaces, ws)
 	}
 	if err := rows.Err(); err != nil {
@@ -506,6 +614,12 @@ func (h *WorkspaceHandler) Get(c *gin.Context) {
 		ws["last_outbound_at"] = lastOutbound.Time
 	} else {
 		ws["last_outbound_at"] = nil
+	}
+
+	// #2054 phase 2: per-runtime provision-timeout for canvas's
+	// ProvisioningTimeout banner.
+	if rt, _ := ws["runtime"].(string); rt != "" {
+		h.addProvisionTimeoutMs(ws, rt)
 	}
 
 	c.JSON(http.StatusOK, ws)

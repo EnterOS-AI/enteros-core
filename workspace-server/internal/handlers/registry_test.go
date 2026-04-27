@@ -298,6 +298,163 @@ func TestHeartbeatHandler_OnlineStaysOnline(t *testing.T) {
 	}
 }
 
+// ==================== Heartbeat — runtime wedge (claude_agent_sdk init timeout) ====================
+
+// TestHeartbeatHandler_RuntimeWedged_FlipsOnlineToDegraded verifies the
+// runtime_state="wedged" path. Heartbeat task in the workspace lives in
+// its own asyncio task and keeps reporting online while the Claude SDK
+// is wedged on Control request timeout; the workspace tells us about
+// the wedge via this field, and we honor it by flipping status →
+// degraded with the wedge reason in last_sample_error.
+func TestHeartbeatHandler_RuntimeWedged_FlipsOnlineToDegraded(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewRegistryHandler(broadcaster)
+
+	wedgeMsg := "claude_agent_sdk wedge: Control request timeout: initialize — restart workspace to recover"
+
+	mock.ExpectQuery("SELECT COALESCE\\(current_task").
+		WithArgs("ws-wedged").
+		WillReturnRows(sqlmock.NewRows([]string{"current_task"}).AddRow(""))
+
+	// Heartbeat UPDATE — sample_error carries the wedge reason from the
+	// workspace's _runtime_state_payload() helper.
+	mock.ExpectExec("UPDATE workspaces SET").
+		WithArgs("ws-wedged", 0.0, wedgeMsg, 0, 600, "").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// evaluateStatus: currentStatus = online
+	mock.ExpectQuery("SELECT status FROM workspaces WHERE id =").
+		WithArgs("ws-wedged").
+		WillReturnRows(sqlmock.NewRows([]string{"status"}).AddRow("online"))
+
+	// The wedge-handling branch fires the degraded UPDATE with the
+	// `AND status = 'online'` guard (race-safe against concurrent
+	// removal). Match the SQL with the guard included.
+	mock.ExpectExec("UPDATE workspaces SET status = 'degraded'.*status = 'online'").
+		WithArgs("ws-wedged").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// RecordAndBroadcast for WORKSPACE_DEGRADED
+	mock.ExpectExec("INSERT INTO structure_events").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+
+	body := `{"workspace_id":"ws-wedged","error_rate":0.0,"sample_error":"` + wedgeMsg + `","active_tasks":0,"uptime_seconds":600,"runtime_state":"wedged"}`
+	c.Request = httptest.NewRequest("POST", "/registry/heartbeat", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Heartbeat(c)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// TestHeartbeatHandler_DegradedRecoversOnlyAfterWedgeClears verifies that
+// the degraded → online recovery path requires BOTH error_rate < 0.1
+// AND runtime_state cleared. A workspace still reporting wedged stays
+// degraded even when error_rate happens to be 0 (no calls have been
+// recorded as errors yet — the wedge is captured as a runtime state,
+// not an error count).
+func TestHeartbeatHandler_DegradedRecoversOnlyAfterWedgeClears(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewRegistryHandler(broadcaster)
+
+	mock.ExpectQuery("SELECT COALESCE\\(current_task").
+		WithArgs("ws-still-wedged").
+		WillReturnRows(sqlmock.NewRows([]string{"current_task"}).AddRow(""))
+
+	mock.ExpectExec("UPDATE workspaces SET").
+		WithArgs("ws-still-wedged", 0.0, "still broken", 0, 800, "").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// currentStatus = degraded
+	mock.ExpectQuery("SELECT status FROM workspaces WHERE id =").
+		WithArgs("ws-still-wedged").
+		WillReturnRows(sqlmock.NewRows([]string{"status"}).AddRow("degraded"))
+
+	// No additional UPDATE expected — the recovery branch's
+	// `runtime_state == ""` guard blocks the flip back to online.
+	// (sqlmock fails the test if any unmocked Exec runs.)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+
+	body := `{"workspace_id":"ws-still-wedged","error_rate":0.0,"sample_error":"still broken","active_tasks":0,"uptime_seconds":800,"runtime_state":"wedged"}`
+	c.Request = httptest.NewRequest("POST", "/registry/heartbeat", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Heartbeat(c)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// TestHeartbeatHandler_DegradedToOnline_AfterWedgeClears verifies the
+// happy-path recovery: a workspace previously marked degraded is
+// post-restart, error_rate is back to 0, and runtime_state is empty
+// (the new process re-imported claude_sdk_executor with the flag
+// fresh). Status flips back to online and a WORKSPACE_ONLINE event
+// fires.
+func TestHeartbeatHandler_DegradedToOnline_AfterWedgeClears(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewRegistryHandler(broadcaster)
+
+	mock.ExpectQuery("SELECT COALESCE\\(current_task").
+		WithArgs("ws-recovered").
+		WillReturnRows(sqlmock.NewRows([]string{"current_task"}).AddRow(""))
+
+	mock.ExpectExec("UPDATE workspaces SET").
+		WithArgs("ws-recovered", 0.0, "", 0, 30, "").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	mock.ExpectQuery("SELECT status FROM workspaces WHERE id =").
+		WithArgs("ws-recovered").
+		WillReturnRows(sqlmock.NewRows([]string{"status"}).AddRow("degraded"))
+
+	// Recovery UPDATE fires (degraded → online).
+	mock.ExpectExec("UPDATE workspaces SET status = 'online'").
+		WithArgs("ws-recovered").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	mock.ExpectExec("INSERT INTO structure_events").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+
+	// runtime_state intentionally absent (== ""); error_rate = 0; this
+	// is exactly what a freshly-restarted workspace's first heartbeat
+	// looks like.
+	body := `{"workspace_id":"ws-recovered","error_rate":0.0,"sample_error":"","active_tasks":0,"uptime_seconds":30}`
+	c.Request = httptest.NewRequest("POST", "/registry/heartbeat", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Heartbeat(c)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
 // ==================== UpdateCard ====================
 
 func TestUpdateCard_Success(t *testing.T) {
@@ -540,6 +697,21 @@ func TestValidateAgentURL(t *testing.T) {
 		{"blocked IPv6 loopback [::1]", "http://[::1]:8080", true},
 		{"blocked IPv6 link-local [fe80::1]", "http://[fe80::1]:8080", true},
 		{"blocked IPv6 ULA [fd00::1]", "http://[fd00::1]:8080", true},
+
+		// ── Must be rejected: RFC 5737 TEST-NET reserved ranges ─────────────
+		// These addresses are reserved for documentation and example code.
+		// No production agent has a legitimate reason to use them.
+		{"blocked TEST-NET-1 192.0.2.x", "http://192.0.2.1:8080", true},
+		{"blocked TEST-NET-1 192.0.2.254", "http://192.0.2.254:9000", true},
+		{"blocked TEST-NET-2 198.51.100.x", "http://198.51.100.1:8080", true},
+		{"blocked TEST-NET-2 198.51.100.99", "http://198.51.100.99:8000", true},
+		{"blocked TEST-NET-3 203.0.113.x", "http://203.0.113.1:8080", true},
+		{"blocked TEST-NET-3 203.0.113.254", "http://203.0.113.254:9000", true},
+
+		// ── Must be rejected: RFC 3849 IPv6 documentation prefix ────────────
+		{"blocked IPv6 documentation 2001:db8::1", "http://[2001:db8::1]:8080", true},
+		{"blocked IPv6 documentation 2001:db8::ffff", "http://[2001:db8::ffff]:8000", true},
+
 		// IPv4-mapped IPv6 for a blocked range must also be rejected.
 		// Go normalises ::ffff:169.254.x.x to IPv4 via To4(), so the existing
 		// 169.254.0.0/16 entry catches it without a dedicated rule.
@@ -567,6 +739,91 @@ func TestValidateAgentURL(t *testing.T) {
 				t.Errorf("validateAgentURL(%q) = %v, want nil", tc.url, err)
 			}
 		})
+	}
+}
+
+// TestValidateAgentURL_SaaSMode_AllowsRFC1918 is the integration-level wrapper test
+// for the SaaS-mode SSRF relaxation in validateAgentURL (used at registration).
+// It exercises validateAgentURL as called by the Register handler, not just the
+// inner blockedRanges slice.  Regression guard for the same class of bug as
+// isSafeURL (issue #1785).
+func TestValidateAgentURL_SaaSMode_AllowsRFC1918(t *testing.T) {
+	t.Setenv("MOLECULE_DEPLOY_MODE", "saas")
+	t.Setenv("MOLECULE_ORG_ID", "")
+	for _, url := range []string{
+		"http://10.1.2.3/agent",
+		"http://10.0.0.5:8000/a2a",
+		"http://172.16.0.1/agent",
+		"http://172.18.0.42:8000/a2a",
+		"http://172.31.44.78/agent",
+		"http://192.168.1.100/agent",
+		"http://192.168.255.254:9000/a2a",
+		"http://[fd00::1]/agent",
+		"http://[fd12:3456:789a::42]/a2a",
+	} {
+		if err := validateAgentURL(url); err != nil {
+			t.Errorf("validateAgentURL(%q) in saasMode: got %v, want nil", url, err)
+		}
+	}
+}
+
+// TestValidateAgentURL_SaaSMode_StillBlocksMetadataEtAl verifies that even in
+// SaaS mode the always-blocked ranges (metadata, loopback, TEST-NET, CGNAT,
+// non-fd00 ULA) stay blocked.
+func TestValidateAgentURL_SaaSMode_StillBlocksMetadataEtAl(t *testing.T) {
+	t.Setenv("MOLECULE_DEPLOY_MODE", "saas")
+	t.Setenv("MOLECULE_ORG_ID", "")
+	for _, url := range []string{
+		"http://169.254.169.254/latest/meta-data/",
+		"http://169.254.0.1/",
+		"http://127.0.0.1:8080",
+		"http://[::1]:8080",
+		"http://192.0.2.5/agent",
+		"http://198.51.100.5/a2a",
+		"http://203.0.113.42/agent",
+		"http://100.64.0.1/agent",
+		"http://100.127.255.254:8000/a2a",
+		"http://[fc00::1]/agent",
+		"http://224.0.0.1/",
+	} {
+		if err := validateAgentURL(url); err == nil {
+			t.Errorf("validateAgentURL(%q) in saasMode: got nil, want block", url)
+		}
+	}
+}
+
+// TestValidateAgentURL_StrictMode_BlocksRFC1918 is the strict-mode counterpart
+// to TestValidateAgentURL_SaaSMode_AllowsRFC1918.
+func TestValidateAgentURL_StrictMode_BlocksRFC1918(t *testing.T) {
+	t.Setenv("MOLECULE_DEPLOY_MODE", "self-hosted")
+	t.Setenv("MOLECULE_ORG_ID", "")
+	for _, url := range []string{
+		"http://10.1.2.3/agent",
+		"http://172.16.0.1:8000/a2a",
+		"http://172.31.44.78/agent",
+		"http://192.168.1.100/agent",
+		"http://[fd00::1]/agent",
+	} {
+		if err := validateAgentURL(url); err == nil {
+			t.Errorf("validateAgentURL(%q) in strict mode: got nil, want block", url)
+		}
+	}
+}
+
+// TestValidateAgentURL_SaaSMode_LegacyOrgID covers the legacy MOLECULE_ORG_ID
+// signal (no MOLECULE_DEPLOY_MODE set) for validateAgentURL.
+func TestValidateAgentURL_SaaSMode_LegacyOrgID(t *testing.T) {
+	t.Setenv("MOLECULE_DEPLOY_MODE", "")
+	t.Setenv("MOLECULE_ORG_ID", "7b2179dc-8cc6-4581-a3c6-c8bff4481086")
+	for _, url := range []string{
+		"http://10.1.2.3/agent",
+		"http://172.18.0.42:8000/a2a",
+		"http://192.168.1.100/agent",
+		"http://[fd00::1]/agent",
+	} {
+		if err := validateAgentURL(url); err != nil {
+			t.Errorf("validateAgentURL(%q) with legacy MOLECULE_ORG_ID: got %v, want nil", url, err)
+		}
 	}
 }
 

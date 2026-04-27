@@ -1,5 +1,7 @@
-"""Tests for executor_helpers.py — the shared helpers that back both
-CLIAgentExecutor (codex, ollama) and ClaudeSDKExecutor (claude-code).
+"""Tests for executor_helpers.py — the shared helpers that back the
+adapter executors. Post-#87 the executors live in template repos
+(claude-code, gemini-cli, etc.); this module stays in molecule-runtime
+because the helpers are runtime-agnostic.
 
 Covers 100% of the public surface:
 - get_mcp_server_path
@@ -21,6 +23,7 @@ Covers 100% of the public surface:
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -84,6 +87,18 @@ def _install_mock_http_client(monkeypatch) -> AsyncMock:
 def test_get_mcp_server_path_default(monkeypatch):
     monkeypatch.delenv("A2A_MCP_SERVER_PATH", raising=False)
     assert get_mcp_server_path() == DEFAULT_MCP_SERVER_PATH
+
+
+def test_get_mcp_server_path_default_resolves_to_existing_file():
+    # Locks in the wheel-relative resolution: if a future refactor moves
+    # a2a_mcp_server.py out of the package directory or breaks the
+    # __file__-based lookup, Claude Code SDK silently fails to spawn the
+    # MCP subprocess and inter-agent tools (list_peers, delegate_task)
+    # vanish at runtime. This assertion catches that at unit-test time.
+    assert os.path.exists(DEFAULT_MCP_SERVER_PATH), (
+        f"DEFAULT_MCP_SERVER_PATH points at a missing file: "
+        f"{DEFAULT_MCP_SERVER_PATH}"
+    )
 
 
 def test_get_mcp_server_path_env_override(monkeypatch):
@@ -430,8 +445,26 @@ def test_get_a2a_instructions_mcp_default():
 
 def test_get_a2a_instructions_cli_variant():
     out = get_a2a_instructions(mcp=False)
-    assert "a2a_cli.py" in out
+    assert "a2a_cli" in out
     assert "MCP tools" not in out
+
+
+def test_a2a_cli_instructions_use_module_invocation_not_legacy_app_path():
+    # The CLI variant of the a2a instructions ships in the agent system
+    # prompt for non-MCP runtimes (Ollama, custom). The model copies the
+    # invocation form verbatim into shell calls, so any path drift here
+    # silently breaks delegation. The legacy /app/a2a_cli.py path was
+    # correct under the pre-#87 monolithic-template Docker layout but
+    # stops resolving once the runtime ships as a wheel — pin the
+    # canonical `python3 -m molecule_runtime.a2a_cli` form so future
+    # refactors can't silently regress it.
+    out = get_a2a_instructions(mcp=False)
+    assert "/app/a2a_cli.py" not in out, (
+        "Legacy /app/a2a_cli.py path leaked back into the CLI-variant "
+        "system prompt — agents on Ollama/custom runtimes would copy "
+        "this verbatim and every delegation would fail."
+    )
+    assert "python3 -m molecule_runtime.a2a_cli" in out
 
 
 def test_a2a_mcp_instructions_reference_existing_tools():
@@ -654,3 +687,255 @@ def test_classify_subprocess_error_generic_fallback():
     assert classify_subprocess_error("generic unknown failure", None) == "subprocess_error"
     # exit_code=0 with no keyword match also lands here
     assert classify_subprocess_error("mysterious but zero exit", 0) == "subprocess_error"
+
+
+# ============================================================================
+# Chat attachment helpers (drag-drop file + agent-returned file)
+# ============================================================================
+
+
+def test_resolve_attachment_uri_all_schemes(tmp_path, monkeypatch):
+    """All three canvas-issued URI shapes resolve to the same container path.
+
+    The canvas mints ``workspace:`` but the download endpoint used to accept
+    ``file:///`` and bare ``/workspace/…`` for legacy agents — the helper has
+    to handle all three so agents don't have to normalize before calling us.
+    """
+    from executor_helpers import resolve_attachment_uri, WORKSPACE_MOUNT
+
+    # Use a real path that starts with WORKSPACE_MOUNT. resolve() enforces
+    # the containment check — anything outside /workspace/ must return None.
+    ws_path = f"{WORKSPACE_MOUNT}/foo.txt"
+    assert resolve_attachment_uri(f"workspace:{ws_path}") == ws_path
+    assert resolve_attachment_uri(f"file://{ws_path}") == ws_path
+    assert resolve_attachment_uri(ws_path) == ws_path
+
+    # Out-of-tree is refused even when the raw path shape looks right.
+    # CWE-22 regression: a crafted "workspace:/workspace/../etc/passwd"
+    # must NOT return "/etc/passwd" just because resolve() normalizes it.
+    assert resolve_attachment_uri("/etc/passwd") is None
+    assert resolve_attachment_uri("workspace:/workspace/../etc/passwd") is None
+    assert resolve_attachment_uri("") is None
+    assert resolve_attachment_uri("https://example.com/x") is None
+
+
+def test_extract_attached_files_skips_unresolvable():
+    """Files with URIs that don't resolve to an existing file are dropped.
+
+    A crafted A2A message can include any uri it wants; we must not hand
+    non-existent or out-of-tree paths to downstream code as if they were
+    real attachments.
+    """
+    from types import SimpleNamespace
+    from executor_helpers import extract_attached_files
+
+    msg = SimpleNamespace(parts=[
+        SimpleNamespace(kind="file", file=SimpleNamespace(
+            uri="workspace:/etc/passwd", name="x", mimeType="text/plain"
+        )),
+        SimpleNamespace(root=SimpleNamespace(kind="file", file=SimpleNamespace(
+            uri="/workspace/does-not-exist", name="y", mimeType="text/plain"
+        ))),
+        SimpleNamespace(kind="text", text="ignored"),
+    ])
+    assert extract_attached_files(msg) == []
+
+
+def test_extract_attached_files_accepts_both_shapes(tmp_path, monkeypatch):
+    """a2a-sdk emits ``part.root.file`` via RootModel; some callers still
+    build ``part.file`` directly. Both shapes have to yield the same
+    dict structure — runtimes can pick either without surprise."""
+    from types import SimpleNamespace
+    from executor_helpers import extract_attached_files
+
+    # Stage two real files under a fake /workspace for the resolver
+    real_a = tmp_path / "a.txt"
+    real_b = tmp_path / "b.txt"
+    real_a.write_text("A")
+    real_b.write_text("B")
+    # Point the helper's containment check at tmp_path instead of /workspace
+    monkeypatch.setattr("executor_helpers.WORKSPACE_MOUNT", str(tmp_path))
+
+    msg = SimpleNamespace(parts=[
+        SimpleNamespace(kind="file", file=SimpleNamespace(
+            uri=f"workspace:{real_a}", name="a.txt", mimeType="text/plain"
+        )),
+        SimpleNamespace(root=SimpleNamespace(kind="file", file=SimpleNamespace(
+            uri=f"workspace:{real_b}", name="b.txt", mimeType="text/plain"
+        ))),
+    ])
+    out = extract_attached_files(msg)
+    assert len(out) == 2
+    assert {f["name"] for f in out} == {"a.txt", "b.txt"}
+
+
+def test_build_user_content_with_files_no_attachments_is_string():
+    """Zero attachments → plain string so models without multi-modal
+    support (most non-vision LLMs) see the same payload shape they always
+    did. Regressing this would break every runtime that assumed
+    content is a string."""
+    from executor_helpers import build_user_content_with_files
+
+    out = build_user_content_with_files("hello", [])
+    assert out == "hello"
+
+
+def test_build_user_content_with_files_non_image_is_string_with_manifest():
+    """Non-image attachments append a manifest line so the agent knows the
+    filename and absolute path. Without this the agent had no signal that
+    anything was attached — see canvas/src/components/tabs/ChatTab.tsx
+    and the "I'm not sure what you're referring to" user report."""
+    from executor_helpers import build_user_content_with_files
+
+    content = build_user_content_with_files("read this", [
+        {"name": "app.log", "mime_type": "text/plain", "path": "/workspace/app.log"},
+    ])
+    assert isinstance(content, str)
+    assert "app.log" in content and "/workspace/app.log" in content
+    assert "read this" in content
+
+
+def test_build_user_content_with_files_image_is_multimodal(tmp_path):
+    """Image attachments yield the OpenAI-compat list-of-parts shape so
+    vision models see the bytes. Data URL check covers the common
+    regression where an empty/missing file silently drops the image part."""
+    from executor_helpers import build_user_content_with_files
+
+    # Minimal 1x1 PNG
+    png = tmp_path / "x.png"
+    png.write_bytes(bytes.fromhex(
+        "89504e470d0a1a0a0000000d49484452000000010000000108060000001f"
+        "15c4890000000a49444154789c6300010000000500010d0a2db40000000049454e44ae426082"
+    ))
+    content = build_user_content_with_files("describe", [
+        {"name": "x.png", "mime_type": "image/png", "path": str(png)},
+    ])
+    assert isinstance(content, list)
+    assert len(content) == 2
+    assert content[0]["type"] == "text"
+    assert content[1]["type"] == "image_url"
+    assert content[1]["image_url"]["url"].startswith("data:image/png;base64,")
+
+
+def test_build_user_content_with_files_large_image_skipped(tmp_path, monkeypatch):
+    """Images over the inline cap don't break the request — the manifest
+    still carries the path so the agent can read via its file_read tool
+    without blowing past provider context limits with a 50MB base64 blob."""
+    from executor_helpers import build_user_content_with_files
+    monkeypatch.setattr("executor_helpers.MAX_INLINE_ATTACHMENT_BYTES", 10)
+
+    big = tmp_path / "big.png"
+    big.write_bytes(b"x" * 100)
+    content = build_user_content_with_files("describe", [
+        {"name": "big.png", "mime_type": "image/png", "path": str(big)},
+    ])
+    # Image too large → no image_url entry, but the text manifest still mentions it
+    assert isinstance(content, list)
+    # Only the text part — the image_url was skipped
+    assert all(c["type"] == "text" for c in content)
+
+
+def test_collect_outbound_files_stages_workspace_paths(tmp_path, monkeypatch):
+    """Agent reply mentioning a /workspace/… path → each unique existing
+    file becomes an attachment, staged under chat-uploads. A crafted
+    reply referencing /etc/passwd must NOT escape."""
+    from pathlib import Path as _Path
+    from executor_helpers import collect_outbound_files
+
+    # Point the chat-uploads dir and the workspace root at a sandboxed tmp.
+    # resolve() normalizes macOS /var → /private/var so the helper's
+    # containment check (which also resolve()s) sees identical prefixes.
+    ws_root = _Path(str(tmp_path / "workspace"))
+    ws_root.mkdir()
+    ws_root = ws_root.resolve()
+    uploads = ws_root / ".molecule" / "chat-uploads"
+    uploads.mkdir(parents=True)
+    monkeypatch.setattr("executor_helpers.WORKSPACE_MOUNT", str(ws_root))
+    monkeypatch.setattr("executor_helpers.CHAT_UPLOADS_DIR", str(uploads))
+    # Rebuild the regex against the overridden mount (module caches it)
+    import re as _re
+    monkeypatch.setattr(
+        "executor_helpers._WORKSPACE_PATH_RE",
+        _re.compile(rf"(?:^|[\s`(\[])({ws_root}/[A-Za-z0-9_./\-]+)"),
+    )
+
+    # A real file inside the fake workspace
+    report = ws_root / "report.txt"
+    report.write_text("data")
+    # A decoy outside the workspace — must be ignored even if mentioned
+    (tmp_path / "secret.txt").write_text("leaked")
+
+    reply = f"Saved to {report} — also see {tmp_path}/secret.txt for extras."
+    out = collect_outbound_files(reply)
+    assert len(out) == 1
+    assert out[0]["name"] == "report.txt"
+    # Staged copy lives under chat-uploads (the download endpoint's whitelist)
+    assert out[0]["path"].startswith(str(uploads))
+
+
+def test_ensure_workspace_writable_chmods_777(tmp_path, monkeypatch):
+    """The platform-level hook opens /workspace + chat-uploads to 777 so
+    agents running as any non-root user can write files the user will
+    then download. This is the single point of fix for what used to need
+    a chmod in every template's Dockerfile."""
+    import stat
+    from executor_helpers import ensure_workspace_writable
+
+    ws = tmp_path / "workspace"
+    ws.mkdir(mode=0o755)
+    uploads = ws / ".molecule" / "chat-uploads"
+    # Don't pre-create uploads — the helper must makedirs it.
+    monkeypatch.setattr("executor_helpers.WORKSPACE_MOUNT", str(ws))
+    monkeypatch.setattr("executor_helpers.CHAT_UPLOADS_DIR", str(uploads))
+
+    ensure_workspace_writable()
+
+    assert uploads.is_dir(), "chat-uploads dir should be created"
+    assert stat.S_IMODE(ws.stat().st_mode) == 0o777
+    assert stat.S_IMODE(uploads.stat().st_mode) == 0o777
+
+
+def test_ensure_workspace_writable_tolerates_non_root(tmp_path, monkeypatch, caplog):
+    """When molecule-runtime isn't root (rare CP configurations), the
+    chmod silently no-ops rather than crashing boot — a misconfigured
+    perm is recoverable; a SystemExit here would wedge the workspace
+    in provisioning forever."""
+    import logging
+    from executor_helpers import ensure_workspace_writable
+
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+    monkeypatch.setattr("executor_helpers.WORKSPACE_MOUNT", str(ws))
+    monkeypatch.setattr("executor_helpers.CHAT_UPLOADS_DIR", str(ws / "x"))
+
+    def _boom(*_a, **_kw):
+        raise PermissionError("Operation not permitted")
+
+    monkeypatch.setattr("executor_helpers.os.chmod", _boom)
+    with caplog.at_level(logging.INFO, logger="executor_helpers"):
+        ensure_workspace_writable()  # must not raise
+
+
+def test_collect_outbound_files_deduplicates(tmp_path, monkeypatch):
+    """Reply mentioning the same path twice should only attach once."""
+    from pathlib import Path as _Path
+    from executor_helpers import collect_outbound_files
+
+    ws_root = _Path(str(tmp_path / "workspace"))
+    ws_root.mkdir()
+    ws_root = ws_root.resolve()
+    uploads = ws_root / ".molecule" / "chat-uploads"
+    uploads.mkdir(parents=True)
+    monkeypatch.setattr("executor_helpers.WORKSPACE_MOUNT", str(ws_root))
+    monkeypatch.setattr("executor_helpers.CHAT_UPLOADS_DIR", str(uploads))
+    import re as _re
+    monkeypatch.setattr(
+        "executor_helpers._WORKSPACE_PATH_RE",
+        _re.compile(rf"(?:^|[\s`(\[])({ws_root}/[A-Za-z0-9_./\-]+)"),
+    )
+
+    report = ws_root / "report.txt"
+    report.write_text("data")
+    reply = f"Wrote {report}. Again at {report}."
+    out = collect_outbound_files(reply)
+    assert len(out) == 1

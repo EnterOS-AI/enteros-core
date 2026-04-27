@@ -8,6 +8,12 @@ global.fetch = vi.fn(() =>
 import { useCanvasStore } from "../../store/canvas";
 import type { WorkspaceData } from "../../store/socket";
 import { DEFAULT_PROVISION_TIMEOUT_MS } from "../ProvisioningTimeout";
+import {
+  DEFAULT_RUNTIME_PROFILE,
+  RUNTIME_PROFILES,
+  getRuntimeProfile,
+  provisionTimeoutForRuntime,
+} from "@/lib/runtimeProfiles";
 
 // Helper to build a WorkspaceData object
 function makeWS(overrides: Partial<WorkspaceData> & { id: string }): WorkspaceData {
@@ -183,5 +189,168 @@ describe("ProvisioningTimeout", () => {
       .getState()
       .nodes.filter((n) => n.data.status === "provisioning");
     expect(stillProvisioning).toHaveLength(2);
+  });
+
+  // ── Runtime-aware timeout regression tests (2026-04-24 outage) ────────────
+  // Prior to this, a hermes workspace consistently false-alarmed at 2 min
+  // into its 8-13 min cold boot, pushing users to retry something that
+  // would have come online on its own. The runtime-aware override keeps
+  // the 2-min floor for fast docker runtimes while giving hermes its
+  // honest 12-min budget.
+
+  describe("runtime profile resolution (@/lib/runtimeProfiles)", () => {
+    describe("provisionTimeoutForRuntime", () => {
+      it("returns the default for unknown/missing runtimes", () => {
+        expect(provisionTimeoutForRuntime(undefined)).toBe(
+          DEFAULT_RUNTIME_PROFILE.provisionTimeoutMs,
+        );
+        expect(provisionTimeoutForRuntime("")).toBe(
+          DEFAULT_RUNTIME_PROFILE.provisionTimeoutMs,
+        );
+        expect(provisionTimeoutForRuntime("some-future-runtime")).toBe(
+          DEFAULT_RUNTIME_PROFILE.provisionTimeoutMs,
+        );
+      });
+
+      it("returns default for known-fast runtimes (not in profile map)", () => {
+        // If someone ever adds one of these to RUNTIME_PROFILES with a
+        // slower value, this test catches the unintended regression.
+        expect(provisionTimeoutForRuntime("claude-code")).toBe(
+          DEFAULT_RUNTIME_PROFILE.provisionTimeoutMs,
+        );
+        expect(provisionTimeoutForRuntime("langgraph")).toBe(
+          DEFAULT_RUNTIME_PROFILE.provisionTimeoutMs,
+        );
+        expect(provisionTimeoutForRuntime("crewai")).toBe(
+          DEFAULT_RUNTIME_PROFILE.provisionTimeoutMs,
+        );
+      });
+
+      it("hermes returns default — value moved server-side post-#2054 phase 3", () => {
+        // RUNTIME_PROFILES.hermes was removed when template-hermes
+        // started declaring provision_timeout_seconds in its
+        // config.yaml. The value now flows server-side via the
+        // workspace API → WorkspaceData.provision_timeout_ms →
+        // resolver overrides path. With no override supplied, the
+        // resolver falls through to the default — same as any other
+        // runtime without a canvas-side override.
+        expect(provisionTimeoutForRuntime("hermes")).toBe(
+          DEFAULT_RUNTIME_PROFILE.provisionTimeoutMs,
+        );
+        expect(RUNTIME_PROFILES.hermes).toBeUndefined();
+      });
+
+      it("server-side workspace override wins over runtime profile", () => {
+        // The resolution order is: overrides → profile → default.
+        // An operator-tunable per-workspace number on the backend
+        // (e.g. via a template manifest field) should beat the canvas
+        // runtime map.
+        expect(
+          provisionTimeoutForRuntime("hermes", {
+            provisionTimeoutMs: 60_000,
+          }),
+        ).toBe(60_000);
+        expect(
+          provisionTimeoutForRuntime("some-unknown", {
+            provisionTimeoutMs: 300_000,
+          }),
+        ).toBe(300_000);
+      });
+    });
+
+    describe("getRuntimeProfile", () => {
+      it("returns a structural profile with required fields", () => {
+        const profile = getRuntimeProfile("hermes");
+        expect(profile.provisionTimeoutMs).toBeTypeOf("number");
+        expect(profile.provisionTimeoutMs).toBeGreaterThan(0);
+      });
+
+      it("default profile is a valid superset of every override", () => {
+        // Every entry in RUNTIME_PROFILES must provide fields the
+        // default does — otherwise consumers could get undefined where
+        // they expected a number. This test enforces that contract so
+        // future entries can't accidentally drop fields.
+        for (const [runtime, profile] of Object.entries(RUNTIME_PROFILES)) {
+          const resolved = getRuntimeProfile(runtime);
+          expect(
+            resolved.provisionTimeoutMs,
+            `runtime=${runtime} must resolve to a number`,
+          ).toBeTypeOf("number");
+          expect(resolved.provisionTimeoutMs).toBeGreaterThan(0);
+          // Profile's explicit value should be used iff present.
+          if (profile.provisionTimeoutMs !== undefined) {
+            expect(resolved.provisionTimeoutMs).toBe(profile.provisionTimeoutMs);
+          }
+        }
+      });
+    });
+
+    describe("DEFAULT_PROVISION_TIMEOUT_MS backward-compat export", () => {
+      it("still exports the same default for legacy importers", () => {
+        expect(DEFAULT_PROVISION_TIMEOUT_MS).toBe(
+          DEFAULT_RUNTIME_PROFILE.provisionTimeoutMs,
+        );
+      });
+    });
+
+    // #2054 — per-workspace server override threading from socket
+    // payload through node-data into ProvisioningTimeout's resolver.
+    // Doesn't render the component; verifies the data path lands the
+    // value where ProvisioningTimeout reads it from.
+    describe("server-side per-workspace override (#2054)", () => {
+      it("hydrate carries provision_timeout_ms onto node.data.provisionTimeoutMs", () => {
+        useCanvasStore.getState().hydrate([
+          makeWS({
+            id: "ws-slow",
+            name: "Slow",
+            status: "provisioning",
+            runtime: "future-runtime",
+            provision_timeout_ms: 600_000,
+          }),
+        ]);
+        const node = useCanvasStore
+          .getState()
+          .nodes.find((n) => n.id === "ws-slow");
+        expect(node?.data.provisionTimeoutMs).toBe(600_000);
+      });
+
+      it("absent provision_timeout_ms hydrates to null (falls through to default post-cleanup)", () => {
+        useCanvasStore.getState().hydrate([
+          makeWS({ id: "ws-default", name: "Default", status: "provisioning", runtime: "hermes" }),
+        ]);
+        const node = useCanvasStore
+          .getState()
+          .nodes.find((n) => n.id === "ws-default");
+        expect(node?.data.provisionTimeoutMs).toBeNull();
+        // Post-#2054 phase 3: hermes no longer has a canvas-side
+        // RUNTIME_PROFILES entry. With no node override the resolver
+        // falls all the way through to DEFAULT_RUNTIME_PROFILE. In
+        // production the workspace-server-side template lookup
+        // populates node.provisionTimeoutMs to 720000 before this
+        // resolver runs (#2094); this test isolates the fall-through
+        // behavior when that population hasn't happened yet.
+        expect(
+          provisionTimeoutForRuntime("hermes", {
+            provisionTimeoutMs: node?.data.provisionTimeoutMs ?? undefined,
+          }),
+        ).toBe(DEFAULT_RUNTIME_PROFILE.provisionTimeoutMs);
+      });
+
+      it("server override wins over default via the resolver path the component uses", () => {
+        // Mirrors ProvisioningTimeout.tsx where node.provisionTimeoutMs
+        // is passed as overrides — verifies the resolver respects the
+        // override regardless of the runtime's profile state.
+        const override = 600_000;
+        expect(
+          provisionTimeoutForRuntime("hermes", {
+            provisionTimeoutMs: override,
+          }),
+        ).toBe(override);
+        // Sanity — the override is the path that wins (default is much smaller).
+        expect(DEFAULT_RUNTIME_PROFILE.provisionTimeoutMs).toBeLessThan(
+          override,
+        );
+      });
+    });
   });
 });

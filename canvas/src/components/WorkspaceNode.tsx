@@ -6,6 +6,8 @@ import { useCanvasStore, type WorkspaceNodeData } from "@/store/canvas";
 import { showToast } from "@/components/Toaster";
 import { Tooltip } from "@/components/Tooltip";
 import { STATUS_CONFIG, TIER_CONFIG } from "@/lib/design-tokens";
+import { useOrgDeployState } from "@/components/canvas/useOrgDeployState";
+import { OrgCancelButton } from "@/components/canvas/OrgCancelButton";
 
 /** Descendant count for the "N sub" badge — children are first-class nodes
  *  rendered as full cards inside this one via React Flow's native parentId,
@@ -35,6 +37,10 @@ function EjectIcon(props: React.SVGProps<SVGSVGElement>) {
 export function WorkspaceNode({ id, data }: NodeProps<Node<WorkspaceNodeData>>) {
   const statusCfg = STATUS_CONFIG[data.status] || STATUS_CONFIG.offline;
   const tierCfg = TIER_CONFIG[data.tier] || { label: `T${data.tier}`, color: "text-zinc-500 bg-zinc-800" };
+  // Org-deploy context — four derived flags off one store subscription.
+  // Drives the shimmer while provisioning, the dimmed/non-draggable
+  // treatment on locked descendants, and the Cancel pill on the root.
+  const deploy = useOrgDeployState(id);
   const selectedNodeId = useCanvasStore((s) => s.selectedNodeId);
   const selectNode = useCanvasStore((s) => s.selectNode);
   const openContextMenu = useCanvasStore((s) => s.openContextMenu);
@@ -138,8 +144,21 @@ export function WorkspaceNode({ id, data }: NodeProps<Node<WorkspaceNodeData>>) 
         }
         backdrop-blur-sm
         focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500/70 focus-visible:ring-offset-1 focus-visible:ring-offset-zinc-950
+        ${deploy.isActivelyProvisioning ? "mol-deploy-shimmer" : ""}
+        ${deploy.isLockedChild ? "mol-deploy-locked" : ""}
       `}
     >
+      {/* Cancel-deployment pill — rendered on the root of a deploying
+          org only. Positioned absolute inside the card so it moves
+          with drag; class="nodrag" on the button stops React Flow
+          from treating clicks as a drag start. */}
+      {deploy.isDeployingRoot && (
+        <OrgCancelButton
+          rootId={id}
+          rootName={data.name}
+          workspaceCount={deploy.descendantProvisioningCount}
+        />
+      )}
       {/* Status gradient bar at top */}
       <div className={`absolute inset-x-0 top-0 h-8 bg-gradient-to-b ${statusCfg.bar} pointer-events-none`} />
 
@@ -321,31 +340,6 @@ function countDescendants(nodeId: string, allNodes: Node<WorkspaceNodeData>[], v
 /** Maximum nesting depth for recursive TeamMemberChip rendering — prevents
  *  infinite recursion on circular parentId references and keeps the UI readable. */
 const MAX_NESTING_DEPTH = 3;
-
-/** Subscribes to allNodes only when children exist — isolates re-renders from parent */
-function EmbeddedTeam({ members, depth, onSelect, onExtract }: {
-  members: Node<WorkspaceNodeData>[];
-  depth: number;
-  onSelect: (id: string) => void;
-  onExtract: (id: string) => void;
-}) {
-  const allNodes = useCanvasStore((s) => s.nodes);
-  // Use grid layout at depth 0 when there are multiple members (departments side-by-side)
-  const useGrid = depth === 0 && members.length >= 2;
-  return (
-    <div className="mt-2 pt-2 border-t border-zinc-700/30">
-      <div className="text-[10px] text-zinc-500 uppercase tracking-widest mb-1.5">Team Members</div>
-      <div className={useGrid
-        ? "grid grid-cols-2 gap-1.5 lg:grid-cols-3"
-        : "space-y-1.5"
-      }>
-        {members.map((child) => (
-          <TeamMemberChip key={child.id} node={child} allNodes={allNodes} depth={depth} onSelect={onSelect} onExtract={onExtract} />
-        ))}
-      </div>
-    </div>
-  );
-}
 
 /** Recursive mini-card — mirrors parent card layout at smaller scale */
 function TeamMemberChip({

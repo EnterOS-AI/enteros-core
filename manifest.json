@@ -4,6 +4,7 @@
   "plugins": [
     {"name": "browser-automation", "repo": "Molecule-AI/molecule-ai-plugin-browser-automation", "ref": "main"},
     {"name": "ecc", "repo": "Molecule-AI/molecule-ai-plugin-ecc", "ref": "main"},
+    {"name": "gh-identity", "repo": "Molecule-AI/molecule-ai-plugin-gh-identity", "ref": "main"},
     {"name": "molecule-audit", "repo": "Molecule-AI/molecule-ai-plugin-molecule-audit", "ref": "main"},
     {"name": "molecule-audit-trail", "repo": "Molecule-AI/molecule-ai-plugin-molecule-audit-trail", "ref": "main"},
     {"name": "molecule-careful-bash", "repo": "Molecule-AI/molecule-ai-plugin-molecule-careful-bash", "ref": "main"},
@@ -38,6 +39,7 @@
     {"name": "free-beats-all", "repo": "Molecule-AI/molecule-ai-org-template-free-beats-all", "ref": "main"},
     {"name": "medo-smoke", "repo": "Molecule-AI/molecule-ai-org-template-medo-smoke", "ref": "main"},
     {"name": "molecule-worker-gemini", "repo": "Molecule-AI/molecule-ai-org-template-molecule-worker-gemini", "ref": "main"},
-    {"name": "reno-stars", "repo": "Molecule-AI/molecule-ai-org-template-reno-stars", "ref": "main"}
+    {"name": "reno-stars", "repo": "Molecule-AI/molecule-ai-org-template-reno-stars", "ref": "main"},
+    {"name": "ux-ab-lab", "repo": "Molecule-AI/molecule-ai-org-template-ux-ab-lab", "ref": "main"}
   ]
 }

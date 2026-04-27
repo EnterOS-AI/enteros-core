@@ -2,6 +2,8 @@ package handlers
 
 import (
 	"bytes"
+	"context"
+	"database/sql/driver"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -217,6 +219,208 @@ func TestActivityReport_RejectsUnknownType(t *testing.T) {
 	}
 }
 
+func TestNotify_PersistsToActivityLogsForReloadRecovery(t *testing.T) {
+	// Regression guard for the "responses gone on reload" bug. send_message_to_user
+	// pushes (which route through Notify) used to be broadcast-only — they
+	// rendered in the canvas but vanished on page reload because nothing
+	// wrote them to activity_logs. The chat history loader queries
+	// `type=a2a_receive&source=canvas`, so the persisted row must:
+	//   - Use activity_type='a2a_receive' (loader's filter)
+	//   - Have source_id NULL (canvas-source filter)
+	//   - Carry the message text in response_body so extractResponseText
+	//     can reconstruct the agent reply on reload
+	mockDB, mock, _ := sqlmock.New()
+	defer mockDB.Close()
+	db.DB = mockDB
+
+	// Workspace existence check
+	mock.ExpectQuery(`SELECT name FROM workspaces`).
+		WithArgs("ws-notify").
+		WillReturnRows(sqlmock.NewRows([]string{"name"}).AddRow("DD"))
+
+	// Persistence INSERT — verify shape
+	mock.ExpectExec(`INSERT INTO activity_logs`).
+		WithArgs(
+			"ws-notify",
+			sqlmock.AnyArg(), // summary
+			sqlmock.AnyArg(), // response_body JSON
+		).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	broadcaster := newTestBroadcaster()
+	handler := NewActivityHandler(broadcaster)
+
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-notify"}}
+	body := `{"message":"agent reply that arrived after the sync POST timed out"}`
+	c.Request = httptest.NewRequest("POST", "/workspaces/ws-notify/notify", strings.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	handler.Notify(c)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("DB expectations not met: %v", err)
+	}
+}
+
+func TestNotify_WithAttachments_PersistsFilePartsForReload(t *testing.T) {
+	// Pins the response_body shape: must include {result: msg, parts: [{kind:"file", file: {...}}]}
+	// so the chat history loader's extractFilesFromTask reconstructs the
+	// download chips after a page reload. Without `parts`, the bubble
+	// shows up but the attachment chip is silently dropped on every
+	// refresh.
+	mockDB, mock, _ := sqlmock.New()
+	defer mockDB.Close()
+	db.DB = mockDB
+
+	mock.ExpectQuery(`SELECT name FROM workspaces`).
+		WithArgs("ws-attach").
+		WillReturnRows(sqlmock.NewRows([]string{"name"}).AddRow("DD"))
+
+	// Capture the JSONB arg so we can assert on the persisted shape
+	// AFTER the call (must include parts[].kind=file so reload
+	// reconstructs download chips). Use AnyArg() for the binding
+	// gate — the substring asserts below are what actually validate
+	// the shape; a custom matcher that always returned true would
+	// be misleading about which step does the gating.
+	var capturedRespJSON string
+	mock.ExpectExec(`INSERT INTO activity_logs`).
+		WithArgs("ws-attach", sqlmock.AnyArg(), sqlmockCaptureArg(&capturedRespJSON)).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	broadcaster := newTestBroadcaster()
+	handler := NewActivityHandler(broadcaster)
+
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-attach"}}
+	body := `{
+		"message": "Here's the build:",
+		"attachments": [
+			{"uri": "workspace:/workspace/.molecule/chat-uploads/abc-build.zip",
+			 "name": "build.zip", "mimeType": "application/zip", "size": 12345}
+		]
+	}`
+	c.Request = httptest.NewRequest("POST", "/workspaces/ws-attach/notify", strings.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	handler.Notify(c)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("DB expectations not met: %v", err)
+	}
+	// Verify the persisted response_body has both the text (so chat
+	// reload renders the bubble) AND a parts[].kind=file (so reload
+	// renders the download chip).
+	if !strings.Contains(capturedRespJSON, `"result":"Here's the build:"`) {
+		t.Errorf("response_body missing result text: %s", capturedRespJSON)
+	}
+	if !strings.Contains(capturedRespJSON, `"kind":"file"`) ||
+		!strings.Contains(capturedRespJSON, `"name":"build.zip"`) ||
+		!strings.Contains(capturedRespJSON, `workspace:/workspace/.molecule/chat-uploads/abc-build.zip`) {
+		t.Errorf("response_body missing file part — chat reload won't render the chip: %s", capturedRespJSON)
+	}
+}
+
+func TestNotify_RejectsAttachmentWithEmptyURIOrName(t *testing.T) {
+	// Critical regression guard. gin's go-playground/validator does NOT
+	// iterate slice elements without `dive`, so `binding:"required"` on
+	// NotifyAttachment.URI/Name would silently fail to enforce on
+	// `attachments: [{"uri":"","name":""}]`. Without this explicit
+	// per-element check, the platform broadcasts empty-URI chips that
+	// render blank in the canvas AND get persisted in activity_logs
+	// for every page reload to re-render. Pre-fix: passed validation.
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"empty uri", `{"message":"hi","attachments":[{"uri":"","name":"file.zip"}]}`},
+		{"empty name", `{"message":"hi","attachments":[{"uri":"workspace:/x","name":""}]}`},
+		{"both empty", `{"message":"hi","attachments":[{"uri":"","name":""}]}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mockDB, _, _ := sqlmock.New()
+			defer mockDB.Close()
+			db.DB = mockDB
+			// No DB expectations — handler must reject with 400 BEFORE
+			// reaching SELECT/INSERT. sqlmock will fail "expectations not met"
+			// only if the handler unexpectedly queries.
+
+			broadcaster := newTestBroadcaster()
+			handler := NewActivityHandler(broadcaster)
+			gin.SetMode(gin.TestMode)
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Params = gin.Params{{Key: "id", Value: "ws-x"}}
+			c.Request = httptest.NewRequest("POST", "/workspaces/ws-x/notify", strings.NewReader(tc.body))
+			c.Request.Header.Set("Content-Type", "application/json")
+			handler.Notify(c)
+
+			if w.Code != http.StatusBadRequest {
+				t.Errorf("expected 400 for %s, got %d: %s", tc.name, w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
+// sqlmockCaptureArg returns an sqlmock.Argument that always matches AND
+// writes the string-coerced driver value into `dst`. Lets a test
+// inspect the actual JSON bytes written to a JSONB column without
+// pretending to enforce shape — that's what the downstream substring
+// asserts in the test body do.
+func sqlmockCaptureArg(dst *string) sqlmock.Argument {
+	return sqlmockArgFn(func(v driver.Value) bool {
+		if s, ok := v.(string); ok {
+			*dst = s
+		}
+		return true
+	})
+}
+
+type sqlmockArgFn func(driver.Value) bool
+
+func (f sqlmockArgFn) Match(v driver.Value) bool { return f(v) }
+
+func TestNotify_DBFailure_StillBroadcastsAnd200(t *testing.T) {
+	// Persistence is best-effort — a DB hiccup must NOT block the
+	// WebSocket push (which the user is already seeing in their open
+	// canvas). Pre-fix the WS push always succeeded; we don't want
+	// the new persistence step to regress that path.
+	mockDB, mock, _ := sqlmock.New()
+	defer mockDB.Close()
+	db.DB = mockDB
+
+	mock.ExpectQuery(`SELECT name FROM workspaces`).
+		WithArgs("ws-x").
+		WillReturnRows(sqlmock.NewRows([]string{"name"}).AddRow("DD"))
+	mock.ExpectExec(`INSERT INTO activity_logs`).
+		WillReturnError(fmt.Errorf("simulated db hiccup"))
+
+	broadcaster := newTestBroadcaster()
+	handler := NewActivityHandler(broadcaster)
+
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-x"}}
+	body := `{"message":"hi"}`
+	c.Request = httptest.NewRequest("POST", "/workspaces/ws-x/notify", strings.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	handler.Notify(c)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("DB failure must not break the response; got %d", w.Code)
+	}
+}
+
 // ==================== Direct unit tests for SessionSearch helpers ====================
 
 // --- parseSessionSearchParams ---
@@ -397,5 +601,128 @@ func TestScanSessionSearchRows_RowsErrPropagates(t *testing.T) {
 	_, err := scanSessionSearchRows(f)
 	if err == nil {
 		t.Fatal("expected error to propagate")
+	}
+}
+
+// recordingBroadcaster records every BroadcastOnly invocation so a test
+// can assert what made it onto the wire. Implements events.EventEmitter.
+type recordingBroadcaster struct {
+	calls []recordedBroadcast
+}
+
+type recordedBroadcast struct {
+	workspaceID string
+	eventType   string
+	payload     map[string]interface{}
+}
+
+func (c *recordingBroadcaster) RecordAndBroadcast(_ context.Context, _ string, _ string, _ interface{}) error {
+	return nil
+}
+
+func (c *recordingBroadcaster) BroadcastOnly(workspaceID string, eventType string, payload interface{}) {
+	// Re-marshal/unmarshal so tests assert the actual wire shape (matches
+	// what hub.Broadcast does before sending). json.RawMessage values in
+	// the source payload survive the round-trip as their underlying JSON.
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		c.calls = append(c.calls, recordedBroadcast{workspaceID, eventType, nil})
+		return
+	}
+	var out map[string]interface{}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		c.calls = append(c.calls, recordedBroadcast{workspaceID, eventType, nil})
+		return
+	}
+	c.calls = append(c.calls, recordedBroadcast{workspaceID, eventType, out})
+}
+
+// TestLogActivity_Broadcast_IncludesRequestAndResponseBodies pins the
+// fix for the canvas Agent Comms "Delegating to <peer>" boilerplate
+// regression: without request_body/response_body in the live broadcast,
+// the panel renders the fallback string and the actual task text only
+// appears after a refresh re-fetches the row from /activity.
+func TestLogActivity_Broadcast_IncludesRequestAndResponseBodies(t *testing.T) {
+	mock := setupTestDB(t)
+	defer mock.ExpectationsWereMet()
+
+	mock.ExpectExec("INSERT INTO activity_logs").
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	cb := &recordingBroadcaster{}
+	srcID := "ws-source"
+	tgtID := "ws-target"
+	method := "message/send"
+	summary := "Delegating to ws-target"
+	status := "ok"
+
+	LogActivity(context.Background(), cb, ActivityParams{
+		WorkspaceID:  "ws-source",
+		ActivityType: "a2a_send",
+		SourceID:     &srcID,
+		TargetID:     &tgtID,
+		Method:       &method,
+		Summary:      &summary,
+		RequestBody:  map[string]interface{}{"task": "audit moleculesai.app for performance"},
+		ResponseBody: nil,
+		Status:       status,
+	})
+
+	if len(cb.calls) != 1 {
+		t.Fatalf("expected 1 broadcast, got %d", len(cb.calls))
+	}
+	payload := cb.calls[0].payload
+	if payload["activity_type"] != "a2a_send" {
+		t.Errorf("activity_type missing/wrong: %v", payload["activity_type"])
+	}
+	// Critical: request_body must be present and carry the task text so
+	// the canvas's live-update path can render the actual delegation
+	// content instead of "Delegating to <peer>".
+	rb, ok := payload["request_body"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("request_body missing from broadcast payload: got %#v", payload["request_body"])
+	}
+	if got := rb["task"]; got != "audit moleculesai.app for performance" {
+		t.Errorf("request_body.task = %v, want the actual task text", got)
+	}
+	// response_body was nil — must NOT be present (otherwise the canvas
+	// renders an empty agent reply bubble).
+	if _, present := payload["response_body"]; present {
+		t.Errorf("response_body should be omitted when nil, got %v", payload["response_body"])
+	}
+}
+
+func TestLogActivity_Broadcast_IncludesResponseBody(t *testing.T) {
+	mock := setupTestDB(t)
+	defer mock.ExpectationsWereMet()
+
+	mock.ExpectExec("INSERT INTO activity_logs").
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	cb := &recordingBroadcaster{}
+	srcID := "ws-source"
+	method := "message/send"
+	status := "ok"
+
+	LogActivity(context.Background(), cb, ActivityParams{
+		WorkspaceID:  "ws-source",
+		ActivityType: "a2a_receive",
+		SourceID:     &srcID,
+		Method:       &method,
+		RequestBody:  map[string]interface{}{"task": "audit"},
+		ResponseBody: map[string]interface{}{"result": "LCP 2.1s, INP 180ms, CLS 0.05"},
+		Status:       status,
+	})
+
+	if len(cb.calls) != 1 {
+		t.Fatalf("expected 1 broadcast, got %d", len(cb.calls))
+	}
+	payload := cb.calls[0].payload
+	rb, ok := payload["response_body"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("response_body missing from broadcast: got %#v", payload["response_body"])
+	}
+	if got := rb["result"]; got != "LCP 2.1s, INP 180ms, CLS 0.05" {
+		t.Errorf("response_body.result = %v, want the actual reply text", got)
 	}
 }

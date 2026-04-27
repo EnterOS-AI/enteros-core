@@ -199,10 +199,34 @@ class TestSendA2AMessage:
             result = await a2a_client.send_a2a_message("http://target/a2a", "task")
 
         assert result.startswith(a2a_client._A2A_ERROR_PREFIX)
-        assert "unknown" in result
+        # The error includes the JSON-RPC code so the operator can look it
+        # up; "no message" surfaces the missing-message condition explicitly
+        # instead of the previous opaque "unknown".
+        assert "code=-32600" in result
+        assert "no message" in result.lower()
+        # Target URL is included so chained delegations are traceable.
+        assert "target=http://target/a2a" in result
 
-    async def test_neither_result_nor_error_returns_str_of_data(self):
-        """Response with neither 'result' nor 'error' → str(data)."""
+    async def test_jsonrpc_error_with_code_zero_includes_code_in_detail(self):
+        """JSON-RPC error code=0 is technically not valid in the spec,
+        but a malformed peer can still send it — make sure the code is
+        preserved in the detail rather than collapsing into the
+        no-code path. Locks in the `code is not None` semantics over
+        the truthy-check shortcut."""
+        import a2a_client
+
+        resp = _make_response(200, {"error": {"code": 0, "message": "weird"}})
+        mock_client = _make_mock_client(post_resp=resp)
+
+        with patch("a2a_client.httpx.AsyncClient", return_value=mock_client):
+            result = await a2a_client.send_a2a_message("http://target/a2a", "task")
+
+        assert result.startswith(a2a_client._A2A_ERROR_PREFIX)
+        assert "code=0" in result
+        assert "weird" in result
+
+    async def test_neither_result_nor_error_returns_a2a_error_with_payload(self):
+        """Response with neither 'result' nor 'error' → A2A_ERROR + payload context."""
         import a2a_client
 
         payload = {"jsonrpc": "2.0", "id": "abc123"}
@@ -212,7 +236,14 @@ class TestSendA2AMessage:
         with patch("a2a_client.httpx.AsyncClient", return_value=mock_client):
             result = await a2a_client.send_a2a_message("http://target/a2a", "task")
 
-        assert result == str(payload)
+        # Pre-fix this returned bare str(payload) which the canvas
+        # rendered as a confusing "looks like a successful response"
+        # block. Now it's tagged so downstream UI / delegate_task
+        # routes it through the error path.
+        assert result.startswith(a2a_client._A2A_ERROR_PREFIX)
+        assert "unexpected response shape" in result
+        assert "abc123" in result  # snippet of payload included for context
+        assert "target=http://target/a2a" in result
 
     async def test_exception_returns_error_prefix_and_message(self):
         """Network exception → returns _A2A_ERROR_PREFIX + exception text."""
@@ -225,6 +256,39 @@ class TestSendA2AMessage:
 
         assert result.startswith(a2a_client._A2A_ERROR_PREFIX)
         assert "connection refused" in result
+        # Exception class name is prepended when the message doesn't
+        # already include it — gives the operator a typed handle to
+        # search for in container logs.
+        assert "ConnectionError" in result
+        assert "target=http://target/a2a" in result
+
+    async def test_empty_stringifying_exception_falls_back_to_class_name(self):
+        """The user's reported bug: httpx.RemoteProtocolError and similar
+        exceptions can stringify to "" — pre-fix the canvas rendered
+        "[A2A_ERROR] " with no detail. Verify the empty path now
+        produces an actionable message including the exception type
+        and the target URL."""
+        import a2a_client
+
+        # Subclass Exception with __str__ → "" to simulate the
+        # silent-exception variants without depending on a specific
+        # httpx version's behavior.
+        class _SilentRemoteProtocolError(Exception):
+            def __str__(self) -> str:
+                return ""
+
+        mock_client = _make_mock_client(post_exc=_SilentRemoteProtocolError())
+
+        with patch("a2a_client.httpx.AsyncClient", return_value=mock_client):
+            result = await a2a_client.send_a2a_message("http://target/a2a", "task")
+
+        # Must NOT be just the bare prefix — that's the regression.
+        assert result != a2a_client._A2A_ERROR_PREFIX.strip()
+        assert result != f"{a2a_client._A2A_ERROR_PREFIX}"
+        # Must include the class name + something explanatory.
+        assert "_SilentRemoteProtocolError" in result
+        assert "no message" in result.lower()
+        assert "target=http://target/a2a" in result
 
     async def test_result_text_part_missing_text_key_returns_empty(self):
         """Part dict without 'text' key → falls back to '' (empty string returned)."""
@@ -240,6 +304,196 @@ class TestSendA2AMessage:
 
         # Returns "" (empty string — does not start with _A2A_ERROR_PREFIX)
         assert result == ""
+
+
+# ---------------------------------------------------------------------------
+# send_a2a_message — transient-error retry behaviour
+# ---------------------------------------------------------------------------
+
+def _make_seq_mock_client(post_side_effect):
+    """Build an AsyncClient mock whose .post() returns a different result
+    on each successive call (matching httpx.AsyncClient's per-request
+    semantics — each AsyncClient context-manager opens fresh in the
+    retry loop, so the sequence is observed across attempts).
+
+    A new AsyncClient context is opened for every retry attempt in the
+    SUT, so we route AsyncClient(...) to a single mock that hands back
+    the same client on every __aenter__ but the .post side-effect list
+    is shared and consumed sequentially across attempts.
+    """
+    mock_client = AsyncMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.post = AsyncMock(side_effect=post_side_effect)
+    return mock_client
+
+
+class TestSendA2AMessageRetry:
+    """Verify auto-retry on transient transport errors (RemoteProtocolError,
+    ConnectError, ReadTimeout, etc.) up to _DELEGATE_MAX_ATTEMPTS times.
+    Application-level errors (HTTP-status errors, JSON-RPC error in
+    response body) MUST NOT be retried — they're deterministic and
+    re-trying just wastes wall-clock.
+
+    asyncio.sleep is patched to a no-op so tests don't actually wait
+    out the exponential backoff.
+    """
+
+    async def test_retry_succeeds_after_two_remote_protocol_errors(self):
+        """Two RemoteProtocolErrors followed by a 200 → returns the 200's text."""
+        import a2a_client
+        import httpx
+
+        success = _make_response(200, {"result": {"parts": [{"kind": "text", "text": "OK"}]}})
+        side_effects = [
+            httpx.RemoteProtocolError("Server disconnected"),
+            httpx.RemoteProtocolError("Server disconnected"),
+            success,
+        ]
+        mock_client = _make_seq_mock_client(side_effects)
+
+        with patch("a2a_client.httpx.AsyncClient", return_value=mock_client), \
+             patch("a2a_client.asyncio.sleep", new=AsyncMock()):
+            result = await a2a_client.send_a2a_message("http://target/a2a", "ping")
+
+        assert result == "OK"
+        assert mock_client.post.await_count == 3
+
+    async def test_retry_succeeds_after_connect_error(self):
+        """Single ConnectError then 200 → returns the 200's text."""
+        import a2a_client
+        import httpx
+
+        success = _make_response(200, {"result": {"parts": [{"kind": "text", "text": "OK"}]}})
+        side_effects = [
+            httpx.ConnectError("connection refused"),
+            success,
+        ]
+        mock_client = _make_seq_mock_client(side_effects)
+
+        with patch("a2a_client.httpx.AsyncClient", return_value=mock_client), \
+             patch("a2a_client.asyncio.sleep", new=AsyncMock()):
+            result = await a2a_client.send_a2a_message("http://target/a2a", "ping")
+
+        assert result == "OK"
+        assert mock_client.post.await_count == 2
+
+    async def test_all_attempts_fail_returns_last_error(self):
+        """5 RemoteProtocolErrors → returns the last error formatted with target URL."""
+        import a2a_client
+        import httpx
+
+        side_effects = [httpx.RemoteProtocolError("Server disconnected")] * 5
+        mock_client = _make_seq_mock_client(side_effects)
+
+        with patch("a2a_client.httpx.AsyncClient", return_value=mock_client), \
+             patch("a2a_client.asyncio.sleep", new=AsyncMock()):
+            result = await a2a_client.send_a2a_message("http://target/a2a", "ping")
+
+        assert mock_client.post.await_count == 5  # _DELEGATE_MAX_ATTEMPTS
+        assert result.startswith(a2a_client._A2A_ERROR_PREFIX)
+        assert "RemoteProtocolError" in result
+        assert "target=http://target/a2a" in result
+
+    async def test_caps_at_max_attempts(self):
+        """If transient errors keep coming, we MUST stop at _DELEGATE_MAX_ATTEMPTS,
+        not retry forever. Pin the exact attempt count so a future tweak to
+        the constant has to update this test in lockstep."""
+        import a2a_client
+        import httpx
+
+        side_effects = [httpx.ReadTimeout("timeout")] * 20  # way more than max
+        mock_client = _make_seq_mock_client(side_effects)
+
+        with patch("a2a_client.httpx.AsyncClient", return_value=mock_client), \
+             patch("a2a_client.asyncio.sleep", new=AsyncMock()):
+            result = await a2a_client.send_a2a_message("http://target/a2a", "ping")
+
+        assert mock_client.post.await_count == a2a_client._DELEGATE_MAX_ATTEMPTS
+        assert mock_client.post.await_count == 5
+        assert result.startswith(a2a_client._A2A_ERROR_PREFIX)
+
+    async def test_application_error_not_retried(self):
+        """JSON-RPC error response (application-level) is deterministic —
+        retrying just wastes wall-clock. Must return on the first attempt."""
+        import a2a_client
+
+        resp = _make_response(200, {
+            "error": {"code": -32603, "message": "Internal error"}
+        })
+        mock_client = _make_seq_mock_client([resp, resp, resp])
+
+        with patch("a2a_client.httpx.AsyncClient", return_value=mock_client), \
+             patch("a2a_client.asyncio.sleep", new=AsyncMock()):
+            result = await a2a_client.send_a2a_message("http://target/a2a", "ping")
+
+        assert mock_client.post.await_count == 1  # NO retry
+        assert "Internal error" in result
+
+    async def test_non_transient_exception_not_retried(self):
+        """A non-httpx exception (programmer bug, JSON parse, etc.) must
+        not trigger retry — surface immediately so the bug is loud."""
+        import a2a_client
+
+        # A plain ValueError isn't in _TRANSIENT_HTTP_ERRORS.
+        side_effects = [ValueError("malformed something")] * 3
+        mock_client = _make_seq_mock_client(side_effects)
+
+        with patch("a2a_client.httpx.AsyncClient", return_value=mock_client), \
+             patch("a2a_client.asyncio.sleep", new=AsyncMock()):
+            result = await a2a_client.send_a2a_message("http://target/a2a", "ping")
+
+        assert mock_client.post.await_count == 1  # NO retry
+        assert result.startswith(a2a_client._A2A_ERROR_PREFIX)
+        assert "ValueError" in result
+
+    async def test_total_budget_caps_retry_loop(self, monkeypatch):
+        """Total wall-clock budget caps the retry loop even if attempts
+        remain — protects against a string of 5×300s ReadTimeouts.
+        Simulate elapsed time advancing past the budget on attempt 2."""
+        import a2a_client
+        import httpx
+
+        side_effects = [httpx.ReadTimeout("timeout")] * 5
+        mock_client = _make_seq_mock_client(side_effects)
+
+        # Make time.monotonic() jump forward past the budget after the
+        # second attempt — the retry loop should detect the deadline
+        # and stop, even though _DELEGATE_MAX_ATTEMPTS is 5.
+        call_count = {"n": 0}
+        original_budget = a2a_client._DELEGATE_TOTAL_BUDGET_S
+
+        def fake_monotonic():
+            call_count["n"] += 1
+            # First call (deadline computation) → 0
+            # Subsequent calls → 0 until attempt 3, then jump past budget
+            if call_count["n"] <= 4:
+                return 0.0
+            return original_budget + 1.0
+
+        monkeypatch.setattr(a2a_client.time, "monotonic", fake_monotonic)
+
+        with patch("a2a_client.httpx.AsyncClient", return_value=mock_client), \
+             patch("a2a_client.asyncio.sleep", new=AsyncMock()):
+            result = await a2a_client.send_a2a_message("http://target/a2a", "ping")
+
+        # Stopped before exhausting all 5 attempts.
+        assert mock_client.post.await_count < 5
+        assert result.startswith(a2a_client._A2A_ERROR_PREFIX)
+
+
+def test_delegate_backoff_seconds_grows_exponentially_with_jitter():
+    """Schedule: ~1s, ~2s, ~4s, ~8s, then capped at 16s. ±25% jitter
+    means each delay falls in [base*0.75, base*1.25]."""
+    import a2a_client
+
+    # Run a bunch to sample the jitter distribution; assert each value
+    # falls in the expected window.
+    for attempt, base in [(0, 1.0), (1, 2.0), (2, 4.0), (3, 8.0), (4, 16.0), (10, 16.0)]:
+        for _ in range(20):
+            d = a2a_client._delegate_backoff_seconds(attempt)
+            assert d >= base * 0.75 - 1e-9, f"attempt {attempt}: {d} < lower"
+            assert d <= base * 1.25 + 1e-9, f"attempt {attempt}: {d} > upper"
 
 
 # ---------------------------------------------------------------------------

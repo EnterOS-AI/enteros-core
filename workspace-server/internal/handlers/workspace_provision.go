@@ -96,6 +96,14 @@ func (h *WorkspaceHandler) provisionWorkspaceOpts(workspaceID, templatePath stri
 	applyAgentGitIdentity(envVars, payload.Name)
 	applyRuntimeModelEnv(envVars, payload.Runtime, payload.Model)
 
+	// Propagate the workspace's role into env so role-aware plugins
+	// (gh-identity — molecule-core#1957) can read it without the
+	// plugin interface having to carry the full payload. Role is
+	// cosmetic metadata — no auth weight on it — safe to surface as env.
+	if payload.Role != "" {
+		envVars["MOLECULE_AGENT_ROLE"] = payload.Role
+	}
+
 	// Plugin extension point: run any registered EnvMutators (e.g.
 	// github-app-auth, vault-secrets) AFTER built-in identity injection so
 	// plugins can override or augment GIT_AUTHOR_*, GITHUB_TOKEN, etc.
@@ -168,20 +176,33 @@ func (h *WorkspaceHandler) provisionWorkspaceOpts(workspaceID, templatePath stri
 			// Try to recover by applying the runtime-default template. payload.Runtime
 			// is populated by the caller (Restart handler / Create handler) from the
 			// DB row — same source of truth the apply_template=true path uses.
+			// Try `<runtime>-default` first (historical naming), then plain
+			// `<runtime>` (current naming in workspace-configs-templates/).
+			// Only claude-code has the `-default` suffix; every other
+			// runtime directory uses the bare name. Without the bare-name
+			// fallback, recovery only worked for claude-code and blank
+			// workspaces on every other runtime bricked on first start.
 			recovered := false
 			if payload.Runtime != "" {
-				runtimeTemplate := filepath.Join(h.configsDir, payload.Runtime+"-default")
-				if _, statErr := os.Stat(runtimeTemplate); statErr == nil {
-					log.Printf("Provisioner: auto-recover for %s — config volume empty, applying %s-default template (#1858)",
-						workspaceID, payload.Runtime)
-					templatePath = runtimeTemplate
-					// Rebuild cfg with the recovered template path so Start() sees it.
-					cfg = h.buildProvisionerConfig(workspaceID, templatePath, configFiles, payload, envVars, pluginsPath, awarenessNamespace)
-					cfg.ResetClaudeSession = resetClaudeSession
-					recovered = true
-				} else {
-					log.Printf("Provisioner: auto-recover for %s — runtime template %s not found: %v",
-						workspaceID, runtimeTemplate, statErr)
+				candidates := []string{
+					filepath.Join(h.configsDir, payload.Runtime+"-default"),
+					filepath.Join(h.configsDir, payload.Runtime),
+				}
+				for _, runtimeTemplate := range candidates {
+					if _, statErr := os.Stat(runtimeTemplate); statErr == nil {
+						log.Printf("Provisioner: auto-recover for %s — config volume empty, applying %s template (#1858)",
+							workspaceID, filepath.Base(runtimeTemplate))
+						templatePath = runtimeTemplate
+						// Rebuild cfg with the recovered template path so Start() sees it.
+						cfg = h.buildProvisionerConfig(workspaceID, templatePath, configFiles, payload, envVars, pluginsPath, awarenessNamespace)
+						cfg.ResetClaudeSession = resetClaudeSession
+						recovered = true
+						break
+					}
+				}
+				if !recovered {
+					log.Printf("Provisioner: auto-recover for %s — no template found under %s for runtime=%s",
+						workspaceID, h.configsDir, payload.Runtime)
 				}
 			}
 
@@ -493,15 +514,25 @@ func configDirName(workspaceID string) string {
 //
 // Keep in sync with workspace/build-all.sh — adding a new
 // runtime means bumping both this list and the Docker image tags.
-var knownRuntimes = map[string]struct{}{
-	"langgraph":   {},
-	"claude-code": {},
-	"openclaw":    {},
-	"crewai":      {},
-	"autogen":     {},
-	"deepagents":  {},
-	"hermes":      {},
-	"codex":       {},
+// knownRuntimes is populated from manifest.json at service init (see
+// runtime_registry.go). The package init order is:
+//   1. var knownRuntimes = fallbackRuntimes
+//   2. init() calls initKnownRuntimes() which replaces it if
+//      manifest.json is readable.
+// The fallback matters for unit tests that don't mount the manifest.
+//
+// "external" is a first-class runtime that intentionally does NOT
+// spawn a Docker container. Workspaces with runtime="external" are
+// created in status=awaiting_agent; the operator installs
+// molecule-sdk-python (or any A2A-compatible agent) somewhere they
+// control and calls POST /registry/register with the workspace_id +
+// workspace_auth_token from the create response. Canvas proxies A2A
+// calls to the registered URL thereafter. "external" has no template
+// repo, so it's always injected by the registry layer.
+var knownRuntimes = fallbackRuntimes
+
+func init() {
+	initKnownRuntimes()
 }
 
 // yamlQuote emits a YAML double-quoted scalar that safely contains any
@@ -608,6 +639,17 @@ func (h *WorkspaceHandler) ensureDefaultConfig(workspaceID string, payload model
 // payload.Model at boot), this is a no-op — no harm in the switch
 // being empty for those cases.
 func applyRuntimeModelEnv(envVars map[string]string, runtime, model string) {
+	// Fall back to the MODEL_PROVIDER workspace secret when the caller
+	// didn't pass one explicitly. This is the path that "Save+Restart"
+	// hits — Restart builds its payload from the workspaces row (no model
+	// column there) so payload.Model is always empty, but the user's
+	// canvas selection was stored as MODEL_PROVIDER via PUT /model and
+	// is already loaded into envVars here. Without this fallback hermes
+	// silently boots with the template default and errors "No LLM
+	// provider configured" even though the user picked a valid model.
+	if model == "" {
+		model = envVars["MODEL_PROVIDER"]
+	}
 	if model == "" {
 		return
 	}
@@ -678,6 +720,11 @@ func (h *WorkspaceHandler) provisionWorkspaceCP(workspaceID, templatePath string
 
 	applyAgentGitIdentity(envVars, payload.Name)
 	applyRuntimeModelEnv(envVars, payload.Runtime, payload.Model)
+	// Propagate role for role-aware plugins (#1957). See provisionWorkspace
+	// above for rationale.
+	if payload.Role != "" {
+		envVars["MOLECULE_AGENT_ROLE"] = payload.Role
+	}
 	if err := h.envMutators.Run(ctx, workspaceID, envVars); err != nil {
 		log.Printf("CPProvisioner: env mutator failed for %s: %v", workspaceID, err)
 		// F1086 / #1206: env mutator errors (missing tokens, vault paths) must not

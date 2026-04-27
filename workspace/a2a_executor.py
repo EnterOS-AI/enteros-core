@@ -41,12 +41,16 @@ from a2a.server.events import EventQueue
 from a2a.server.tasks import TaskUpdater
 from a2a.types import Part
 # KI-009: a2a-sdk v1 renames a2a.utils → a2a.helpers; TextPart removed (Part takes text= directly)
-from a2a.helpers import new_agent_text_message
+from a2a.helpers import new_text_message
 from shared_runtime import (
     extract_history as _extract_history,
     extract_message_text,
     brief_task,
     set_current_task,
+)
+from executor_helpers import (
+    collect_outbound_files,
+    extract_attached_files,
 )
 from builtin_tools.telemetry import (
     A2A_TASK_ID,
@@ -211,11 +215,23 @@ class LangGraphA2AExecutor(AgentExecutor):
           3. Message(final_text)                      — terminal event
         """
         user_input = extract_message_text(context)
+        # Pull attached files from A2A message parts (kind: "file") and
+        # append a manifest to the prompt so the agent knows they exist.
+        # LangGraph tools (filesystem, bash, skills) can then open the
+        # files by path — without this the agent silently ignores the
+        # attachments and replies "I'm not sure what you're referring to".
+        _attached_files = extract_attached_files(getattr(context, "message", None))
+        if _attached_files:
+            _manifest = "\n\nAttached files:\n" + "\n".join(
+                f"- {f['name']} ({f['mime_type'] or 'unknown type'}) at {f['path']}"
+                for f in _attached_files
+            )
+            user_input = (user_input + _manifest) if user_input else _manifest.lstrip()
         if not user_input:
             parts = getattr(getattr(context, "message", None), "parts", None)
             logger.warning("A2A execute: no text content in message parts: %s", parts)
             await event_queue.enqueue_event(
-                new_agent_text_message("Error: message contained no text content.")
+                new_text_message("Error: message contained no text content.")
             )
             return ""
 
@@ -230,7 +246,7 @@ class LangGraphA2AExecutor(AgentExecutor):
                 )
             except PromptInjectionError as exc:
                 await event_queue.enqueue_event(
-                    new_agent_text_message(f"Request blocked: {exc}")
+                    new_text_message(f"Request blocked: {exc}")
                 )
                 return ""
 
@@ -247,8 +263,6 @@ class LangGraphA2AExecutor(AgentExecutor):
             task_span.set_attribute(A2A_TASK_ID, context.context_id or "")
             task_span.set_attribute("a2a.input_preview", user_input[:256])
 
-            await set_current_task(self._heartbeat, brief_task(user_input))
-
             # Resolve IDs — the RequestContextBuilder always sets them, but
             # we generate fallbacks for safety (e.g. in unit tests).
             task_id = context.task_id or str(uuid.uuid4())
@@ -257,6 +271,12 @@ class LangGraphA2AExecutor(AgentExecutor):
             updater = TaskUpdater(event_queue, task_id, context_id)
 
             try:
+                # set_current_task INSIDE the try so active_tasks is always
+                # decremented by the finally block even if CancelledError hits
+                # during the heartbeat HTTP push. Moving it outside the try
+                # created a window where cancellation left active_tasks stuck
+                # at 1, permanently blocking queue drain. (#2026)
+                await set_current_task(self._heartbeat, brief_task(user_input))
                 messages = _extract_history(context)
                 if messages:
                     logger.info("A2A execute: injecting %d history messages", len(messages))
@@ -411,14 +431,64 @@ class LangGraphA2AExecutor(AgentExecutor):
                 # Non-streaming: ResultAggregator.consume_all() returns this
                 #   immediately as the response (a2a_client.py reads .parts[0].text).
                 # Streaming: yielded as the last SSE event in the stream.
-                msg = new_agent_text_message(final_text, task_id=task_id, context_id=context_id)
+                #
+                # If the reply mentions /workspace/... paths, stage each one
+                # and emit as FileParts alongside the text so the canvas can
+                # render a download button. Same contract the hermes executor
+                # uses — every runtime going through this code path (langgraph,
+                # deepagents, future ReAct variants) inherits it.
+                _outbound = collect_outbound_files(final_text)
+                if _outbound:
+                    # NOTE: do NOT re-import `Part` here. It is already imported
+                    # at module scope (line 42). A function-scope `from a2a.types
+                    # import ... Part ...` would mark `Part` as a local name
+                    # throughout this function under Python's scoping rules,
+                    # making the earlier `Part(text=text)` call (line ~358, inside
+                    # the astream_events loop) raise UnboundLocalError because
+                    # the local binding is not yet in scope at that point.
+                    #
+                    # a2a-sdk 1.x flattened the Part shape: 0.x used
+                    # `Part(root=TextPart(text=...))` / `Part(root=FilePart(file=
+                    # FileWithUri(uri=..., name=..., mimeType=...)))` (Pydantic
+                    # discriminated-union style). 1.x's Part is a single proto
+                    # message with flat fields: text, url, filename, media_type,
+                    # raw, data, metadata. TextPart/FilePart/FileWithUri were
+                    # removed. Same for Message: messageId/taskId/contextId
+                    # camelCase became message_id/task_id/context_id.
+                    from a2a.types import Message, Role
+                    _parts: list[Part] = [Part(text=final_text)] if final_text else []
+                    for f in _outbound:
+                        _parts.append(Part(
+                            url="workspace:" + f["path"],
+                            filename=f["name"],
+                            media_type=f["mime_type"],
+                        ))
+                    msg = Message(
+                        message_id=uuid.uuid4().hex,
+                        # 1.x Role is a protobuf enum: ROLE_UNSPECIFIED,
+                        # ROLE_USER, ROLE_AGENT. Old `Role.agent` (Pydantic
+                        # lowercase enum) doesn't exist anymore.
+                        role=Role.ROLE_AGENT,
+                        parts=_parts,
+                        task_id=task_id,
+                        context_id=context_id,
+                    )
+                else:
+                    msg = new_text_message(final_text, task_id=task_id, context_id=context_id)
                 # Attach tool_trace via metadata when supported. Guarded with
                 # hasattr because some test mocks return a plain string here.
                 if tool_trace and hasattr(msg, "metadata"):
                     try:
                         msg.metadata = {"tool_trace": tool_trace}
                     except (AttributeError, TypeError):
-                        pass
+                        # `new_text_message()` returns a plain string in
+                        # MagicMock paths in tests, where assignment to
+                        # .metadata raises despite hasattr being true (the
+                        # mock has the attribute as a property). Suppression
+                        # is intentional — production Message objects always
+                        # accept the assignment. See #1787 + commit dcbcf19
+                        # for the original test-mock motivation.
+                        logger.debug("metadata attach skipped (non-Message return from new_text_message)")
                 await event_queue.enqueue_event(msg)
                 _result = final_text
 
@@ -433,7 +503,7 @@ class LangGraphA2AExecutor(AgentExecutor):
                 # Emit a Message so both streaming and non-streaming clients
                 # receive an error response rather than hanging.
                 await event_queue.enqueue_event(
-                    new_agent_text_message(
+                    new_text_message(
                         f"Agent error: {e}", task_id=task_id, context_id=context_id
                     )
                 )

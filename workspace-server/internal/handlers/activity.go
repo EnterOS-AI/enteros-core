@@ -257,17 +257,52 @@ func scanSessionSearchRows(rows interface {
 	return items, nil
 }
 
+// NotifyAttachment is one file the agent wants to attach to its push.
+// URIs come from /workspaces/:id/chat/uploads (canonical "workspace:"
+// scheme) — the runtime's tool_send_message_to_user uploads any
+// caller-specified file path through that endpoint first to get a
+// shape the canvas can resolve via the existing Download path.
+type NotifyAttachment struct {
+	URI      string `json:"uri" binding:"required"`
+	Name     string `json:"name" binding:"required"`
+	MimeType string `json:"mimeType,omitempty"`
+	Size     int64  `json:"size,omitempty"`
+}
+
 // Notify handles POST /workspaces/:id/notify — agents push messages to the canvas chat.
 // This enables agents to send interim updates ("I'll check on it") and follow-up results
 // without waiting for the user to poll. Messages are broadcast via WebSocket only.
+//
+// Attachments: optional list of file references. Each renders as a
+// download chip in the canvas via the existing extractFilesFromTask
+// path. The runtime tool uploads file bytes to /chat/uploads first
+// and passes the returned URIs here, so this handler only stores
+// metadata — never raw bytes.
 func (h *ActivityHandler) Notify(c *gin.Context) {
 	workspaceID := c.Param("id")
 	var body struct {
-		Message string `json:"message" binding:"required"`
+		Message     string             `json:"message" binding:"required"`
+		Attachments []NotifyAttachment `json:"attachments,omitempty"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "message is required"})
 		return
+	}
+
+	// Per-element attachment validation: gin's go-playground/validator
+	// does NOT iterate slice elements without `dive`, so the inner
+	// `binding:"required"` tags on NotifyAttachment.URI/Name don't
+	// actually run. Without this loop, attachments: [{"uri":"","name":""}]
+	// would slip through, broadcast empty-URI chips that render
+	// blank/broken in the canvas, and persist them in activity_logs
+	// for every page reload to re-render. Validate explicitly.
+	for i, a := range body.Attachments {
+		if a.URI == "" || a.Name == "" {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": fmt.Sprintf("attachment[%d]: uri and name are required", i),
+			})
+			return
+		}
 	}
 
 	// Verify workspace exists
@@ -280,11 +315,69 @@ func (h *ActivityHandler) Notify(c *gin.Context) {
 		return
 	}
 
-	h.broadcaster.BroadcastOnly(workspaceID, "AGENT_MESSAGE", map[string]interface{}{
+	broadcastPayload := map[string]interface{}{
 		"message":      body.Message,
 		"workspace_id": workspaceID,
 		"name":         wsName,
-	})
+	}
+	if len(body.Attachments) > 0 {
+		broadcastPayload["attachments"] = body.Attachments
+	}
+	h.broadcaster.BroadcastOnly(workspaceID, "AGENT_MESSAGE", broadcastPayload)
+
+	// Persist to activity_logs so the chat history loader restores this
+	// message after a page reload. Pre-fix, send_message_to_user pushes
+	// were broadcast-only — survived the WebSocket session but vanished
+	// when the user refreshed because nothing wrote them to the DB.
+	//
+	// Shape chosen to match the existing loader query
+	// (`type=a2a_receive&source=canvas`):
+	//   - activity_type='a2a_receive' so it joins the same query path
+	//   - source_id=NULL so the canvas-source filter accepts it
+	//   - method='notify' to distinguish from real A2A receives in audits
+	//   - request_body=NULL so the loader doesn't append a duplicate
+	//     "user message" bubble for it
+	//   - response_body={"result": "<text>"} matches extractResponseText's
+	//     simplest branch ({result: string} → take verbatim)
+	//
+	// Errors are logged-only — broadcast already succeeded, the user
+	// sees the message; persistence failure just means the message
+	// won't survive reload (pre-fix behavior). Don't fail the whole
+	// notify on a DB hiccup.
+	// response_body shape — chosen to feed BOTH:
+	//   - extractResponseText: looks at body.result (string) and returns it
+	//   - extractFilesFromTask: looks at body.parts[] for kind=file
+	// so a chat reload after a notify-with-attachments restores both
+	// the text bubble AND the download chips.
+	respPayload := map[string]interface{}{"result": body.Message}
+	if len(body.Attachments) > 0 {
+		fileParts := make([]map[string]interface{}, 0, len(body.Attachments))
+		for _, a := range body.Attachments {
+			fileMeta := map[string]interface{}{"uri": a.URI, "name": a.Name}
+			if a.MimeType != "" {
+				fileMeta["mimeType"] = a.MimeType
+			}
+			if a.Size > 0 {
+				fileMeta["size"] = a.Size
+			}
+			fileParts = append(fileParts, map[string]interface{}{
+				"kind": "file",
+				"file": fileMeta,
+			})
+		}
+		respPayload["parts"] = fileParts
+	}
+	respJSON, _ := json.Marshal(respPayload)
+	preview := body.Message
+	if len(preview) > 80 {
+		preview = preview[:80] + "…"
+	}
+	if _, err := db.DB.ExecContext(c.Request.Context(), `
+		INSERT INTO activity_logs (workspace_id, activity_type, method, summary, response_body, status)
+		VALUES ($1, 'a2a_receive', 'notify', $2, $3::jsonb, 'ok')
+	`, workspaceID, "Agent message: "+preview, string(respJSON)); err != nil {
+		log.Printf("Notify: failed to persist message for %s: %v", workspaceID, err)
+	}
 
 	c.JSON(http.StatusOK, gin.H{"status": "sent"})
 }
@@ -373,7 +466,9 @@ func (h *ActivityHandler) Report(c *gin.Context) {
 }
 
 // LogActivity inserts an activity log and optionally broadcasts via WebSocket.
-func LogActivity(ctx context.Context, broadcaster *events.Broadcaster, params ActivityParams) {
+// Takes events.EventEmitter (#1814) so callers passing a stub broadcaster
+// in tests no longer need to construct the full *events.Broadcaster.
+func LogActivity(ctx context.Context, broadcaster events.EventEmitter, params ActivityParams) {
 	reqJSON, reqErr := json.Marshal(params.RequestBody)
 	if reqErr != nil {
 		log.Printf("LogActivity: failed to marshal request_body for %s: %v", params.WorkspaceID, reqErr)
@@ -423,6 +518,25 @@ func LogActivity(ctx context.Context, broadcaster *events.Broadcaster, params Ac
 		}
 		if len(params.ToolTrace) > 0 {
 			payload["tool_trace"] = json.RawMessage(params.ToolTrace)
+		}
+		// Include request/response bodies in the live broadcast so the
+		// canvas's Agent Comms panel can render the actual task text
+		// and reply text immediately, instead of falling back to the
+		// "Delegating to <peer>" boilerplate. Without this, the live
+		// bubble was useless until a refresh re-fetched the activity
+		// row from /workspaces/:id/activity (which DOES return these
+		// columns from the DB). The workspace's report_activity helper
+		// caps each side at sensible sizes (4096 chars for error_detail,
+		// 256 for summary; request/response are bounded by the
+		// runtime's own caps — typical delegate_task payload is a few
+		// hundred chars to a few KB). json.RawMessage avoids a
+		// re-marshal round-trip; reqJSON/respJSON were already encoded
+		// for the DB insert above.
+		if reqStr != nil {
+			payload["request_body"] = json.RawMessage(reqJSON)
+		}
+		if respStr != nil {
+			payload["response_body"] = json.RawMessage(respJSON)
 		}
 		broadcaster.BroadcastOnly(params.WorkspaceID, "ACTIVITY_LOGGED", payload)
 	}

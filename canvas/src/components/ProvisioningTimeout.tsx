@@ -2,14 +2,21 @@
 
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import { useCanvasStore, type WorkspaceNodeData } from "@/store/canvas";
+import { pruneStaleKeys } from "./canvas/useCanvasViewport";
 import { api } from "@/lib/api";
 import { showToast } from "./Toaster";
 import { ConsoleModal } from "./ConsoleModal";
 
-/** Base provisioning timeout in milliseconds (2 minutes). Used as the
- *  floor; the effective threshold scales with the number of workspaces
- *  concurrently provisioning (see effectiveTimeoutMs below). */
-export const DEFAULT_PROVISION_TIMEOUT_MS = 120_000;
+import {
+  DEFAULT_RUNTIME_PROFILE,
+  provisionTimeoutForRuntime,
+} from "@/lib/runtimeProfiles";
+
+/** Re-export for backward compatibility with tests and other importers
+ *  that previously imported DEFAULT_PROVISION_TIMEOUT_MS from this file.
+ *  New code should read via getRuntimeProfile() from @/lib/runtimeProfiles. */
+export const DEFAULT_PROVISION_TIMEOUT_MS =
+  DEFAULT_RUNTIME_PROFILE.provisionTimeoutMs;
 
 /** The server provisions up to `PROVISION_CONCURRENCY` containers at
  *  once and paces the rest in a queue (`workspaceCreatePacingMs` =
@@ -43,8 +50,12 @@ interface TimeoutEntry {
  * time per node.
  */
 export function ProvisioningTimeout({
-  timeoutMs = DEFAULT_PROVISION_TIMEOUT_MS,
+  timeoutMs,
 }: {
+  // If undefined (the default when mounted without a prop), each workspace's
+  // threshold is resolved from its runtime via timeoutForRuntime().
+  // Pass an explicit number to force a single threshold for every workspace
+  // (used by tests that want deterministic behavior regardless of runtime).
   timeoutMs?: number;
 }) {
   const [timedOut, setTimedOut] = useState<TimeoutEntry[]>([]);
@@ -55,21 +66,49 @@ export function ProvisioningTimeout({
   // banner even if they stay in provisioning. Cleared when the
   // workspace leaves provisioning (status changes).
   const [dismissed, setDismissed] = useState<Set<string>>(new Set());
+  // Watch the live WS health. While it's not "connected", local node
+  // status reflects the last event we received before the drop —
+  // workspaces may have actually transitioned to online minutes ago.
+  // Suppress the banner until WS recovers + rehydrate confirms each
+  // workspace is genuinely still provisioning.
+  const wsStatus = useCanvasStore((s) => s.wsStatus);
 
   // Subscribe to provisioning nodes — use shallow compare to avoid infinite re-render
-  // (filter+map creates new array reference on every store update)
+  // (filter+map creates new array reference on every store update).
+  // Runtime included so the timeout threshold can be resolved per-node
+  // (hermes cold-boot legitimately takes 8-13 min vs 30-90s for docker
+  //  runtimes — a single threshold would false-alarm on one or the other).
+  // provisionTimeoutMs added by #2054 — server-declared per-workspace
+  // override that wins over the runtime profile when present.
+  // Separator: `|` between fields, `,` between nodes. Only `name` is
+  // user-typed (gets sanitized below); the other fields are
+  // primitive-typed (id is a UUID, runtime is a [a-z-]+ slug,
+  // provisionTimeoutMs is numeric). If a future field is string-typed,
+  // extend the sanitize step to strip `|` + `,` from it too.
+  // Empty-string sentinels for missing values so split/index stays positional.
   const provisioningNodes = useCanvasStore((s) => {
     const result = s.nodes
       .filter((n) => n.data.status === "provisioning")
-      .map((n) => `${n.id}:${n.data.name}`);
+      .map((n) => {
+        const safeName = (n.data.name ?? "").replace(/[|,]/g, " ");
+        const runtime = n.data.runtime ?? "";
+        const provisionTimeoutMs = n.data.provisionTimeoutMs ?? "";
+        return `${n.id}|${safeName}|${runtime}|${provisionTimeoutMs}`;
+      });
     return result.join(",");
   });
   const parsedProvisioningNodes = useMemo(
     () =>
       provisioningNodes
         ? provisioningNodes.split(",").map((entry) => {
-            const [id, name] = entry.split(":");
-            return { id, name };
+            const [id, name, runtime, provisionTimeoutMs] = entry.split("|");
+            const ptms = provisionTimeoutMs ? Number(provisionTimeoutMs) : undefined;
+            return {
+              id,
+              name,
+              runtime,
+              provisionTimeoutMs: Number.isFinite(ptms) ? ptms : undefined,
+            };
           })
         : [],
     [provisioningNodes],
@@ -87,11 +126,7 @@ export function ProvisioningTimeout({
 
     // Remove tracking for nodes that are no longer provisioning
     const activeIds = new Set(parsedProvisioningNodes.map((n) => n.id));
-    for (const id of tracking.keys()) {
-      if (!activeIds.has(id)) {
-        tracking.delete(id);
-      }
-    }
+    pruneStaleKeys(tracking, activeIds);
 
     // Also remove from timedOut list if no longer provisioning, and
     // clear `dismissed` entries for workspaces that finished so a
@@ -113,14 +148,30 @@ export function ProvisioningTimeout({
     const interval = setInterval(() => {
       const now = Date.now();
       const newTimedOut: TimeoutEntry[] = [];
-      const effective = effectiveTimeoutMs(
-        timeoutMs,
-        parsedProvisioningNodes.length,
-      );
 
+      // Per-node timeout: each workspace resolves its own base via
+      // @/lib/runtimeProfiles (server-override → runtime profile →
+      // default), then scales by concurrent-provisioning count. A
+      // hermes workspace in a batch alongside two langgraph workspaces
+      // gets hermes's 12-min base, not langgraph's 2-min base.
+      //
+      // Resolution priority (most specific wins):
+      //   1. node.provisionTimeoutMs — server-declared per-workspace
+      //      override (#2054, sourced from template manifest)
+      //   2. timeoutMs prop — single-threshold test override
+      //   3. runtime profile in @/lib/runtimeProfiles
+      //   4. DEFAULT_RUNTIME_PROFILE
       for (const node of parsedProvisioningNodes) {
         const startedAt = tracking.get(node.id);
-        if (startedAt && now - startedAt >= effective) {
+        if (!startedAt) continue;
+        const base = provisionTimeoutForRuntime(node.runtime, {
+          provisionTimeoutMs: node.provisionTimeoutMs ?? timeoutMs,
+        });
+        const effective = effectiveTimeoutMs(
+          base,
+          parsedProvisioningNodes.length,
+        );
+        if (now - startedAt >= effective) {
           newTimedOut.push({
             workspaceId: node.id,
             workspaceName: node.name,
@@ -225,8 +276,11 @@ export function ProvisioningTimeout({
   }, []);
 
   const visibleTimedOut = useMemo(
-    () => timedOut.filter((e) => !dismissed.has(e.workspaceId)),
-    [timedOut, dismissed],
+    () =>
+      wsStatus === "connected"
+        ? timedOut.filter((e) => !dismissed.has(e.workspaceId))
+        : [],
+    [timedOut, dismissed, wsStatus],
   );
 
   if (visibleTimedOut.length === 0) return null;

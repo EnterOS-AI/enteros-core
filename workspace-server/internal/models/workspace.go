@@ -6,6 +6,12 @@ import (
 	"time"
 )
 
+// DefaultMaxConcurrentTasks mirrors the workspaces.max_concurrent_tasks
+// schema default. Handlers that resolve a 0/omitted payload value write
+// this constant so the read-side (scheduler capacity check) sees a
+// guaranteed non-zero column on every row.
+const DefaultMaxConcurrentTasks = 1
+
 type Workspace struct {
 	ID                 string          `json:"id" db:"id"`
 	Name               string          `json:"name" db:"name"`
@@ -51,6 +57,53 @@ type HeartbeatPayload struct {
 	// a previously-reported spend value. Any non-zero value is clamped to
 	// [0, maxMonthlySpend] before the DB write. (#615)
 	MonthlySpend int64 `json:"monthly_spend"`
+	// RuntimeState is a self-reported runtime health flag separate from
+	// "is the heartbeat task firing at all". The heartbeat task lives in
+	// its own asyncio task and keeps pinging even when the agent runtime
+	// is wedged (e.g. claude_agent_sdk's `Control request timeout:
+	// initialize` leaves the SDK in a permanent error state for the
+	// process lifetime). RuntimeState is how the workspace tells the
+	// platform "I'm alive but my Claude runtime is broken — flip me to
+	// degraded so the canvas can show a Restart hint."
+	//
+	// Empty string = healthy / no signal. The only currently-recognised
+	// non-empty value is "wedged"; future values can extend this without
+	// migration.
+	RuntimeState string `json:"runtime_state"`
+
+	// RuntimeMetadata is the adapter-declared capability map + per-
+	// capability override values. The Python runtime builds this from
+	// BaseAdapter.capabilities() + per-hook methods (e.g.
+	// idle_timeout_override()) — see workspace/heartbeat.py:
+	// _runtime_metadata_payload. Optional: missing means "use platform
+	// defaults for everything", matching pre-2026-04 behavior.
+	//
+	// Pointer (not value) so a missing JSON field is nil rather than a
+	// zero-value RuntimeMetadata{} that would falsely claim "all caps =
+	// false declared explicitly". Lets the platform distinguish "adapter
+	// said no native ownership" from "old runtime version, didn't say".
+	RuntimeMetadata *RuntimeMetadata `json:"runtime_metadata,omitempty"`
+}
+
+// RuntimeMetadata is the adapter-declared capability + override block
+// the Python runtime sends in the heartbeat payload. New fields can be
+// added with `omitempty` without breaking older runtime versions.
+//
+// See project memory `project_runtime_native_pluggable.md` for the
+// principle and workspace/adapter_base.py:RuntimeCapabilities for the
+// Python source of truth.
+type RuntimeMetadata struct {
+	// Capabilities maps capability name → "adapter owns it natively".
+	// Keys (heartbeat, scheduler, session, status_mgmt, retry,
+	// activity_decoration, channel_dispatch) match
+	// RuntimeCapabilities.to_dict() in adapter_base.py — keep in sync.
+	Capabilities map[string]bool `json:"capabilities,omitempty"`
+
+	// IdleTimeoutSeconds, when set, overrides the per-dispatch silence
+	// window in a2a_proxy.go for this workspace's A2A traffic. Pointer
+	// so nil means "no override; use the global default". Zero / negative
+	// is treated as nil by the consumer (a2a_proxy.go).
+	IdleTimeoutSeconds *int `json:"idle_timeout_seconds,omitempty"`
 }
 
 type UpdateCardPayload struct {
@@ -85,6 +138,9 @@ type CreateWorkspacePayload struct {
 	// workspace secrets at creation time.  Stored encrypted (same path as
 	// POST /workspaces/:id/secrets).  Nil/empty map is a no-op.
 	Secrets map[string]string `json:"secrets"`
+	// MaxConcurrentTasks caps parallel A2A + cron dispatch. 0 means use
+	// DefaultMaxConcurrentTasks. Leaders typically set 3.
+	MaxConcurrentTasks int `json:"max_concurrent_tasks"`
 	Canvas   struct {
 		X float64 `json:"x"`
 		Y float64 `json:"y"`

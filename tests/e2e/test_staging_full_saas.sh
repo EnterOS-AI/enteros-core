@@ -72,7 +72,12 @@ CURL_COMMON=(-sS --fail-with-body --max-time 30)
 # ─── cleanup trap ───────────────────────────────────────────────────────
 CLEANUP_DONE=0
 cleanup_org() {
-  [ "$CLEANUP_DONE" = "1" ] && return 0
+  # Capture upstream exit code IMMEDIATELY — must be the first statement
+  # in the trap, before any command (including the CLEANUP_DONE check)
+  # that would clobber $?.
+  local entry_rc=$?
+
+  if [ "$CLEANUP_DONE" = "1" ]; then return 0; fi
   CLEANUP_DONE=1
 
   if [ "${E2E_KEEP_ORG:-0}" = "1" ]; then
@@ -99,6 +104,20 @@ cleanup_org() {
     exit 4
   fi
   ok "Teardown clean — no orphan resources for $SLUG"
+
+  # Normalize unexpected upstream exit codes to 1 (generic failure). The
+  # script's documented contract (header "Exit codes" section) only emits
+  # {0, 1, 2, 3, 4}, but `set -e` propagates the raw exit code of the
+  # failing command — e.g. curl exits 22 on HTTP error under
+  # --fail-with-body. Without this normalization, the
+  # E2E_INTENTIONAL_FAILURE sanity workflow (e2e-staging-sanity.yml)
+  # gets rc=22 from the poisoned-token curl, falls through its
+  # case statement, and opens a false-positive priority-high
+  # "safety net broken" issue (#2159, 2026-04-27).
+  case "$entry_rc" in
+    0|1|2|3|4) ;;          # contracted codes — let bash use entry_rc
+    *) exit 1 ;;            # anything else is a generic failure
+  esac
 }
 trap cleanup_org EXIT INT TERM
 
@@ -167,7 +186,29 @@ print('')
   fi
   case "$STATUS" in
     running)  break ;;
-    failed)   fail "Tenant provisioning failed for $SLUG" ;;
+    failed)
+      # Diagnostic burst: dump the org row so the operator sees
+      # `last_error` (CP migration 022 / handler #289 — issue #285).
+      # Pre-fix the harness only logged "Tenant provisioning failed",
+      # forcing whoever debugs canary to scrape CP server logs to
+      # learn WHY. Same shape as the TLS-readiness burst at step 4
+      # (PR #2107). Redacts nothing because /cp/admin/orgs already
+      # returns a narrow, ops-safe shape (id/slug/name/plan/
+      # member_count/instance_status/last_error/timestamps —
+      # no tokens, no encrypted fields).
+      log "── DIAGNOSTIC BURST (step 2 — tenant provisioning failed) ──"
+      echo "$LIST_JSON" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+for o in d.get('orgs', []):
+    if o.get('slug') == '$SLUG':
+        print(json.dumps(o, indent=2))
+        sys.exit(0)
+print('(no org row found for slug=$SLUG — DB drift?)')
+" 2>&1 | sed 's/^/  /'
+      log "── END DIAGNOSTIC ──"
+      fail "Tenant provisioning failed for $SLUG (see diagnostic above for last_error)"
+      ;;
     *)        sleep 15 ;;
   esac
 done
@@ -195,14 +236,35 @@ TENANT_TOKEN=$(echo "$TENANT_TOKEN_RESP" | python3 -c "import json,sys; print(js
 ok "Tenant admin token retrieved (len=${#TENANT_TOKEN})"
 
 # ─── 4. Wait for tenant TLS / DNS propagation ──────────────────────────
+# Kept below the 20-min provision envelope so a genuinely-stuck tenant
+# still fails loud at the earlier provision step rather than masquerading
+# as a TLS issue. CF DNS propagation + tunnel hostname registration +
+# ACME cert + edge cache run 5-7 min on a healthy day; +5 min headroom
+# over the previous 10-min cap covers the slower path observed in #2090.
+#
+# On timeout, dump DNS + curl -v + headers so the next failure identifies
+# the broken layer (DNS / TLS / HTTP). Authorization is redacted
+# defensively in case a future caller adds an auth header to this probe.
 log "4/11 Waiting for tenant TLS / DNS propagation..."
-TLS_DEADLINE=$(( $(date +%s) + 180 ))
+TLS_TIMEOUT_SEC=$((15 * 60))
+TLS_DEADLINE=$(( $(date +%s) + TLS_TIMEOUT_SEC ))
+TENANT_HOST="${TENANT_URL#http*://}"
+TENANT_HOST="${TENANT_HOST%%/*}"
+TENANT_HOST="${TENANT_HOST%%:*}"
 while true; do
   if curl -sSfk --max-time 5 "$TENANT_URL/health" >/dev/null 2>&1; then
     break
   fi
   if [ "$(date +%s)" -gt "$TLS_DEADLINE" ]; then
-    fail "Tenant URL never responded 2xx on /health within 3 min"
+    log "── DIAGNOSTIC BURST (TLS-readiness timeout) ──"
+    log "DNS lookup ($TENANT_HOST):"
+    getent hosts "$TENANT_HOST" 2>&1 || log "  (no DNS resolution)"
+    log "curl -v $TENANT_URL/health (last 40 lines):"
+    curl -kv --max-time 10 "$TENANT_URL/health" 2>&1 \
+      | sed -E 's/(Authorization|Cookie):.*/\1: [redacted]/i' \
+      | tail -n 40 | sed 's/^/  /' || true
+    log "── END DIAGNOSTIC ──"
+    fail "Tenant URL never responded 2xx on /health within ${TLS_TIMEOUT_SEC}s"
   fi
   sleep 5
 done
@@ -402,6 +464,13 @@ if echo "$AGENT_TEXT" | grep -qF "Encrypted content is not supported"; then
 fi
 if echo "$AGENT_TEXT" | grep -qF "Unknown provider"; then
   fail "A2A — REGRESSION: install.sh set PROVIDER to a value not in hermes's registry. Run 'hermes doctor' on the workspace to see valid values. Raw: $AGENT_TEXT"
+fi
+# "Invalid API key" — the comment block lists this as a CP #238 race
+# (tenant auth chain) signal but the grep was missing. Caller-side
+# 401's containing this exact phrase don't match the generic
+# "error|exception" catch-all below, so they'd slip through.
+if echo "$AGENT_TEXT" | grep -qF "Invalid API key"; then
+  fail "A2A — REGRESSION: tenant auth chain returned 'Invalid API key'. Likely CP boot-event 401 race (CP #238) or stale OPENAI_API_KEY in the runtime env. Raw: $AGENT_TEXT"
 fi
 # Generic catch-all — falls through if none of the known regressions hit.
 if echo "$AGENT_TEXT" | grep -qiE "error|exception"; then

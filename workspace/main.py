@@ -33,7 +33,7 @@ from initial_prompt import (
     mark_initial_prompt_attempted,
     resolve_initial_prompt_marker,
 )
-from platform_auth import auth_headers
+from platform_auth import auth_headers, self_source_headers
 
 
 def get_machine_ip() -> str:  # pragma: no cover
@@ -68,6 +68,15 @@ async def main():  # pragma: no cover
 
     # 0. Initialise OpenTelemetry (no-op if packages not installed)
     setup_telemetry(service_name=workspace_id)
+
+    # 0a. Fix /workspace perms before any agent code runs. Docker ships
+    # named volumes as root:root 755 — without this the non-root agent
+    # user can't write files the user asked it to produce, and the
+    # "agent → file → user downloads" flow dead-ends at a bash "permission
+    # denied". Best-effort: no-ops silently if molecule-runtime itself
+    # isn't root (template's own start.sh should have handled it there).
+    from executor_helpers import ensure_workspace_writable
+    ensure_workspace_writable()
 
     # 1. Load config
     config = load_config(config_path)
@@ -166,20 +175,35 @@ async def main():  # pragma: no cover
     machine_ip = os.environ.get("HOSTNAME", get_machine_ip())
     workspace_url = f"http://{machine_ip}:{port}"
 
-    # v1: AgentCard.url removed; put url+protocol in supported_protocols instead.
+    # v1: AgentCard.url removed; put url+protocol in supported_interfaces instead.
     # v1: AgentCapabilities.inputModes/outputModes removed; move to AgentCard.default_*.
     # v1: pushNotifications → push_notifications (Pydantic field name)
+    #
+    # AgentCard's protocol message uses `supported_interfaces` (plural,
+    # interfaces — see a2a-sdk types/a2a_pb2.pyi:189). The 0.3.x→1.0
+    # migration in #1974 originally used `supported_protocols`, which
+    # the protobuf doesn't expose at all — every workspace boot since
+    # then crashed with `ValueError: Protocol message AgentCard has no
+    # "supported_protocols" field`. The crash didn't surface in the
+    # publish-runtime smoke because the smoke only IMPORTS
+    # molecule_runtime.main, never CALLS the AgentCard constructor.
+    # Don't rename back.
     agent_card = AgentCard(
         name=config.name,
         description=config.description or config.name,
         version=config.version,
-        supported_protocols=[
+        supported_interfaces=[
             AgentInterface(protocol_binding="https://a2a.g/v1", url=workspace_url)
         ],
         capabilities=AgentCapabilities(
             streaming=config.a2a.streaming,
             push_notifications=config.a2a.push_notifications,
-            state_transition_history=True,
+            # Note: state_transition_history (a 0.x capability flag) was
+            # removed in a2a-sdk 1.0. Per the SDK's own
+            # a2a/compat/v0_3/conversions.py: "No longer supported in
+            # v1.0". The capability is now universal — Task.history is
+            # always available and tasks/get accepts historyLength via
+            # apply_history_length(). Don't add this kwarg back.
         ),
         skills=[
             AgentSkill(
@@ -209,12 +233,36 @@ async def main():  # pragma: no cover
     handler = DefaultRequestHandler(
         agent_executor=executor,
         task_store=InMemoryTaskStore(),
+        # a2a-sdk 1.x added agent_card as a required positional/keyword
+        # argument — it's used internally for capability dispatch (e.g.
+        # routing tasks/get historyLength based on the card's protocol
+        # version). Pass the same agent_card we registered with the
+        # platform so the handler's capability surface matches what the
+        # AgentCard advertises.
+        agent_card=agent_card,
     )
 
-    # v1: replace A2AStarletteApplication with Starlette route factory
+    # v1: replace A2AStarletteApplication with Starlette route factory.
+    # rpc_url is required in a2a-sdk 1.x (was implicit at root in 0.x).
+    # Use '/' to match a2a.utils.constants.DEFAULT_RPC_URL — that's also
+    # what the platform's a2a_proxy.go POSTs to (it forwards to the
+    # workspace's URL without appending a path). Card endpoint stays at
+    # the well-known path /.well-known/agent-card.json (handled by
+    # create_agent_card_routes default).
     routes = []
     routes.extend(create_agent_card_routes(agent_card))
-    routes.extend(create_jsonrpc_routes(request_handler=handler))
+    # enable_v0_3_compat=True is the JSON-RPC wire-compat path: clients
+    # using v0.3-shaped payloads (`"role": "user"` lowercase + camelCase
+    # Pydantic field names) can talk to us without re-deploying. Outbound
+    # JSON-RPC wire payloads MUST also use v0.3 shape — the v0.3 compat
+    # adapter at /usr/local/lib/python3.11/site-packages/a2a/compat/v0_3/
+    # validates against Pydantic Role enum (`agent`|`user`) and rejects
+    # the protobuf-style `ROLE_USER` enum names with JSON-RPC -32600
+    # (Invalid Request). Native v1.x types (a2a.types.Role.ROLE_AGENT)
+    # are only for code that constructs Message objects in-process and
+    # hands them to the SDK, which serialises them correctly for the
+    # outbound wire format.
+    routes.extend(create_jsonrpc_routes(request_handler=handler, rpc_url="/", enable_v0_3_compat=True))
     app = Starlette(routes=routes)
 
     # 8. Register with platform
@@ -314,6 +362,7 @@ async def main():  # pragma: no cover
                 config_path=config_path,
                 skill_names=config.skills,
                 on_reload=_on_skill_reload,
+                current_runtime=runtime,
             )
             asyncio.create_task(skills_watcher.start())
             print(f"Skills hot-reload enabled for: {config.skills}")
@@ -430,7 +479,15 @@ async def main():  # pragma: no cover
                 # silently rejected once any workspace has a live token on
                 # file. Without this, initial_prompt 401s in multi-tenant
                 # mode exactly like /registry/register did in #215.
-                headers = {"Content-Type": "application/json", **auth_headers()}
+                # X-Workspace-ID via self_source_headers() so the platform
+                # tags the row source=agent — without it the canvas's
+                # My Chat tab renders the initial_prompt as if the user
+                # had typed it. See platform_auth.py for the full
+                # explanation.
+                headers = {
+                    "Content-Type": "application/json",
+                    **self_source_headers(workspace_id),
+                }
 
                 # Retry with backoff — the platform proxy may not be able to
                 # reach us yet (container networking takes a moment to settle).
@@ -522,7 +579,13 @@ async def main():  # pragma: no cover
                     # actual outcome instead of a bare "post failed" line.
                     # #220: include auth_headers() on every idle fire. Without
                     # this, the idle loop 401s in multi-tenant mode.
-                    headers = {"Content-Type": "application/json", **auth_headers()}
+                    # self_source_headers() adds X-Workspace-ID so the
+                    # platform classifies the idle fire as source=agent
+                    # rather than user-typed canvas input.
+                    headers = {
+                        "Content-Type": "application/json",
+                        **self_source_headers(workspace_id),
+                    }
                     try:
                         req = _urlreq.Request(
                             f"{platform_url}/workspaces/{workspace_id}/a2a",
@@ -589,5 +652,18 @@ async def main():  # pragma: no cover
         await temporal_wrapper.stop()
 
 
-if __name__ == "__main__":  # pragma: no cover
+def main_sync():  # pragma: no cover
+    """Synchronous entry point for the `molecule-runtime` console script.
+
+    Declared in scripts/build_runtime_package.py as the wheel's entry-point
+    target (`molecule-runtime = "molecule_runtime.main:main_sync"`). Removed
+    silently during the pre-monorepo consolidation, which broke every
+    workspace startup against 0.1.16/0.1.17/0.1.18 with `ImportError:
+    cannot import name 'main_sync'`. The .github/workflows/runtime-pin-compat.yml
+    smoke step is the regression gate.
+    """
     asyncio.run(main())
+
+
+if __name__ == "__main__":  # pragma: no cover
+    main_sync()

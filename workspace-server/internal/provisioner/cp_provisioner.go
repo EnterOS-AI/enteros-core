@@ -15,6 +15,28 @@ import (
 	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
 )
 
+// CPProvisionerAPI is the contract WorkspaceHandler uses to talk to the
+// control-plane provisioner. Extracted as an interface (#1814) so handler
+// tests can substitute a mock without standing up the real CP HTTP client
+// + auth chain. Production wires *CPProvisioner directly via
+// NewCPProvisioner — see the compile-time assertion below.
+//
+// Method set is intentionally narrow — only the methods that
+// WorkspaceHandler actually calls. Adding a new handler call site that
+// reaches into CPProvisioner means widening this interface explicitly,
+// which surfaces the dependency in code review.
+type CPProvisionerAPI interface {
+	Start(ctx context.Context, cfg WorkspaceConfig) (string, error)
+	Stop(ctx context.Context, workspaceID string) error
+	GetConsoleOutput(ctx context.Context, workspaceID string) (string, error)
+}
+
+// Compile-time assertion: *CPProvisioner satisfies CPProvisionerAPI.
+// Catches a future method-signature drift at build time instead of at
+// the SetCPProvisioner call site (which would be a runtime "interface
+// not implemented" only when the SaaS path is exercised).
+var _ CPProvisionerAPI = (*CPProvisioner)(nil)
+
 // CPProvisioner provisions workspace agents by calling the control plane's
 // workspace provision API. The control plane creates EC2 instances with
 // Docker + the workspace runtime installed at boot from PyPI.
@@ -194,6 +216,9 @@ func (p *CPProvisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string,
 // blocking the next provision with InvalidGroup.Duplicate — a full
 // "Save & Restart" crash on SaaS.
 func (p *CPProvisioner) Stop(ctx context.Context, workspaceID string) error {
+	if p == nil {
+		return ErrNoBackend
+	}
 	instanceID, err := resolveInstanceID(ctx, workspaceID)
 	if err != nil {
 		return fmt.Errorf("cp provisioner: stop: resolve instance_id: %w", err)
@@ -201,8 +226,16 @@ func (p *CPProvisioner) Stop(ctx context.Context, workspaceID string) error {
 	if instanceID == "" {
 		// No instance was ever provisioned (or already deprovisioned and
 		// the column was cleared). Nothing to terminate — idempotent.
+		// Reached even when httpClient is nil since the empty-instance
+		// path doesn't need HTTP — symmetric with IsRunning.
 		log.Printf("CP provisioner: Stop for %s — no instance_id on file, nothing to do", workspaceID)
 		return nil
+	}
+	if p.httpClient == nil {
+		// HTTP wiring missing but we have an instance_id to terminate —
+		// can't make the DELETE call. Report ErrNoBackend so the
+		// orphan sweeper / shutdown path can branch.
+		return ErrNoBackend
 	}
 	url := fmt.Sprintf("%s/cp/workspaces/%s?instance_id=%s", p.baseURL, workspaceID, instanceID)
 	req, _ := http.NewRequestWithContext(ctx, "DELETE", url, nil)
@@ -269,6 +302,9 @@ var resolveInstanceID = func(ctx context.Context, workspaceID string) (string, e
 // Both callers are happy with (true, err); callers that need the
 // previous (false, err) shape must inspect err themselves.
 func (p *CPProvisioner) IsRunning(ctx context.Context, workspaceID string) (bool, error) {
+	if p == nil {
+		return false, ErrNoBackend
+	}
 	instanceID, err := resolveInstanceID(ctx, workspaceID)
 	if err != nil {
 		// Treat DB errors the same as transport errors — (true, err) keeps
@@ -277,8 +313,19 @@ func (p *CPProvisioner) IsRunning(ctx context.Context, workspaceID string) (bool
 	}
 	if instanceID == "" {
 		// No instance recorded. Report "not running" cleanly (no error)
-		// so restart cascades can trigger a fresh provision.
+		// so restart cascades can trigger a fresh provision. This path
+		// is reached even on a zero-valued provisioner (no httpClient
+		// wired) — that's intentional; the resolveInstanceID lookup
+		// goes through the package-level db var, not p.httpClient, so
+		// a no-instance workspace gets a clean answer regardless of
+		// HTTP wiring state.
 		return false, nil
+	}
+	if p.httpClient == nil {
+		// HTTP wiring missing but we have an instance_id to query —
+		// can't proceed without a client. Report ErrNoBackend so the
+		// caller can branch (a2a_proxy keeps alive, healthsweep skips).
+		return false, ErrNoBackend
 	}
 	url := fmt.Sprintf("%s/cp/workspaces/%s/status?instance_id=%s", p.baseURL, workspaceID, instanceID)
 	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
