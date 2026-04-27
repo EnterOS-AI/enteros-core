@@ -71,7 +71,7 @@ async def send_a2a_message(target_url: str, message: str) -> str:
                     "method": "message/send",
                     "params": {
                         "message": {
-                            "role": "ROLE_USER",
+                            "role": "user",
                             "messageId": str(uuid.uuid4()),
                             "parts": [{"kind": "text", "text": message}],
                         }

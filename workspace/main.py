@@ -251,10 +251,17 @@ async def main():  # pragma: no cover
     # create_agent_card_routes default).
     routes = []
     routes.extend(create_agent_card_routes(agent_card))
-    # enable_v0_3_compat=True so any external 0.3.x A2A client (still using
-    # `"role": "user"` lowercase + camelCase Pydantic field names) can talk
-    # to us without re-deploying. Internally our outbound payloads are now
-    # 1.x-shaped (ROLE_USER), but inbound is opt-in compatible.
+    # enable_v0_3_compat=True is the JSON-RPC wire-compat path: clients
+    # using v0.3-shaped payloads (`"role": "user"` lowercase + camelCase
+    # Pydantic field names) can talk to us without re-deploying. Outbound
+    # JSON-RPC wire payloads MUST also use v0.3 shape — the v0.3 compat
+    # adapter at /usr/local/lib/python3.11/site-packages/a2a/compat/v0_3/
+    # validates against Pydantic Role enum (`agent`|`user`) and rejects
+    # the protobuf-style `ROLE_USER` enum names with JSON-RPC -32600
+    # (Invalid Request). Native v1.x types (a2a.types.Role.ROLE_AGENT)
+    # are only for code that constructs Message objects in-process and
+    # hands them to the SDK, which serialises them correctly for the
+    # outbound wire format.
     routes.extend(create_jsonrpc_routes(request_handler=handler, rpc_url="/", enable_v0_3_compat=True))
     app = Starlette(routes=routes)
 
@@ -461,7 +468,7 @@ async def main():  # pragma: no cover
                     "method": "message/send",
                     "params": {
                         "message": {
-                            "role": "ROLE_USER",
+                            "role": "user",
                             "messageId": f"initial-{_uuid.uuid4().hex[:8]}",
                             "parts": [{"kind": "text", "text": config.initial_prompt}],
                         },
@@ -560,7 +567,7 @@ async def main():  # pragma: no cover
                     "method": "message/send",
                     "params": {
                         "message": {
-                            "role": "ROLE_USER",
+                            "role": "user",
                             "messageId": f"idle-{_uuid.uuid4().hex[:8]}",
                             "parts": [{"kind": "text", "text": config.idle_prompt}],
                         },

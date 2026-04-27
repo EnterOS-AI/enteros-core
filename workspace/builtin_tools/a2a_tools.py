@@ -57,7 +57,7 @@ async def delegate_task(workspace_id: str, task: str) -> str:
                     "method": "message/send",
                     "params": {
                         "message": {
-                            "role": "ROLE_USER",
+                            "role": "user",
                             "messageId": str(uuid.uuid4()),
                             "parts": [{"kind": "text", "text": task}],
                         },
