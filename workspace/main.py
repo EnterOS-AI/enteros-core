@@ -233,6 +233,13 @@ async def main():  # pragma: no cover
     handler = DefaultRequestHandler(
         agent_executor=executor,
         task_store=InMemoryTaskStore(),
+        # a2a-sdk 1.x added agent_card as a required positional/keyword
+        # argument — it's used internally for capability dispatch (e.g.
+        # routing tasks/get historyLength based on the card's protocol
+        # version). Pass the same agent_card we registered with the
+        # platform so the handler's capability surface matches what the
+        # AgentCard advertises.
+        agent_card=agent_card,
     )
 
     # v1: replace A2AStarletteApplication with Starlette route factory
