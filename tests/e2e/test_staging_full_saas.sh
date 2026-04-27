@@ -186,7 +186,29 @@ print('')
   fi
   case "$STATUS" in
     running)  break ;;
-    failed)   fail "Tenant provisioning failed for $SLUG" ;;
+    failed)
+      # Diagnostic burst: dump the org row so the operator sees
+      # `last_error` (CP migration 022 / handler #289 — issue #285).
+      # Pre-fix the harness only logged "Tenant provisioning failed",
+      # forcing whoever debugs canary to scrape CP server logs to
+      # learn WHY. Same shape as the TLS-readiness burst at step 4
+      # (PR #2107). Redacts nothing because /cp/admin/orgs already
+      # returns a narrow, ops-safe shape (id/slug/name/plan/
+      # member_count/instance_status/last_error/timestamps —
+      # no tokens, no encrypted fields).
+      log "── DIAGNOSTIC BURST (step 2 — tenant provisioning failed) ──"
+      echo "$LIST_JSON" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+for o in d.get('orgs', []):
+    if o.get('slug') == '$SLUG':
+        print(json.dumps(o, indent=2))
+        sys.exit(0)
+print('(no org row found for slug=$SLUG — DB drift?)')
+" 2>&1 | sed 's/^/  /'
+      log "── END DIAGNOSTIC ──"
+      fail "Tenant provisioning failed for $SLUG (see diagnostic above for last_error)"
+      ;;
     *)        sleep 15 ;;
   esac
 done
