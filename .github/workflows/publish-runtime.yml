@@ -79,6 +79,7 @@ jobs:
       id-token: write   # PyPI Trusted Publisher (OIDC) — no PYPI_TOKEN needed
     outputs:
       version: ${{ steps.version.outputs.version }}
+      wheel_sha256: ${{ steps.wheel_hash.outputs.wheel_sha256 }}
     steps:
       - uses: actions/checkout@v4
 
@@ -128,6 +129,28 @@ jobs:
       - name: Build wheel + sdist
         working-directory: ${{ runner.temp }}/runtime-build
         run: python -m build
+
+      - name: Capture wheel SHA256 for cascade content-verification
+        # Recorded BEFORE upload so the cascade probe can verify the
+        # bytes Fastly serves under the new version's URL match what
+        # we built. Closes a hole left by #2197: that probe verified
+        # pip can resolve the version (catches propagation lag) but
+        # not that the wheel content matches (would silently pass a
+        # Fastly stale-content scenario where the new version's URL
+        # serves an old wheel binary).
+        id: wheel_hash
+        working-directory: ${{ runner.temp }}/runtime-build
+        run: |
+          set -eu
+          WHEEL=$(ls dist/*.whl 2>/dev/null | head -1)
+          if [ -z "$WHEEL" ]; then
+            echo "::error::No .whl in dist/ — `python -m build` must have failed silently"
+            exit 1
+          fi
+          HASH=$(sha256sum "$WHEEL" | awk '{print $1}')
+          echo "wheel_sha256=${HASH}" >> "$GITHUB_OUTPUT"
+          echo "Local wheel SHA256 (pre-upload): ${HASH}"
+          echo "Wheel filename: $(basename "$WHEEL")"
 
       - name: Verify package contents (sanity)
         working-directory: ${{ runner.temp }}/runtime-build
@@ -212,6 +235,56 @@ jobs:
               default_output_modes=['text/plain', 'application/json'],
           )
           print('✓ AgentCard call-shape smoke passed')
+
+          # Well-known agent-card path probe alignment. main.py's
+          # _send_initial_prompt() polls AGENT_CARD_WELL_KNOWN_PATH
+          # to know when the local A2A server is ready. If the SDK
+          # ever splits the constant value from the path that
+          # create_agent_card_routes() actually mounts at, every
+          # workspace silently drops its initial_prompt:
+          #   - Probe gets 404 every attempt.
+          #   - Falls through to 'server not ready after 30s,
+          #     skipping' even though the server is fine.
+          #   - The user hits a fresh chat with no kickoff context.
+          # This was the #2193 incident class — the v0.x → v1.x
+          # rename of /.well-known/agent.json → /.well-known/agent-card.json
+          # plus the constant itself moving to a2a.utils.constants.
+          # source-tree pytest (test_agent_card_well_known_path.py)
+          # catches main.py-side regressions; this catches the
+          # SDK-side ones BEFORE PyPI upload.
+          from a2a.utils.constants import AGENT_CARD_WELL_KNOWN_PATH
+          from a2a.server.routes import create_agent_card_routes
+          mounted_paths = [
+              getattr(r, 'path', None)
+              for r in create_agent_card_routes(
+                  AgentCard(
+                      name='wk-smoke',
+                      description='well-known mount alignment',
+                      version='0.0.0-smoke',
+                  )
+              )
+          ]
+          assert AGENT_CARD_WELL_KNOWN_PATH in mounted_paths, (
+              f'AGENT_CARD_WELL_KNOWN_PATH ({AGENT_CARD_WELL_KNOWN_PATH!r}) '
+              f'is NOT among paths mounted by create_agent_card_routes '
+              f'({mounted_paths!r}). The SDK constant and its own route '
+              f'factory have drifted — workspace probes will 404 forever, '
+              f'silently dropping every workspace initial_prompt.'
+          )
+          print(f'✓ well-known mount alignment OK ({AGENT_CARD_WELL_KNOWN_PATH})')
+
+          # Message helper smoke. a2a-sdk renamed
+          # new_agent_text_message → new_text_message in the v1.x
+          # protobuf-flat migration (per the v0→v1 cheat sheet). main.py
+          # and a2a_executor.py call new_text_message in hot paths; if
+          # the import breaks, every reply errors with ImportError before
+          # the message even leaves the workspace. Importing here
+          # catches a future v2.x rename at publish time.
+          from a2a.helpers import new_text_message
+          msg = new_text_message('smoke')
+          assert msg is not None, 'new_text_message returned None'
+          print('✓ message helper import + call OK')
+
           print('✓ smoke import passed')
           "
 
@@ -239,28 +312,98 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Wait for PyPI to propagate the new version
-        # PyPI accepts the upload, then takes a few seconds to make it
-        # available via the package index. If the cascade fires too
-        # fast, downstream template builds run `pip install` against
-        # an index that hasn't seen the new version yet — they resolve
-        # to the previous one, and docker layer cache then locks that
-        # in for subsequent rebuilds (the cache trap that bit us five
-        # times tonight).
+        # PyPI accepts the upload, then takes a few seconds to make the
+        # new version visible across all THREE surfaces pip touches:
+        #   1. /pypi/<pkg>/<ver>/json — metadata endpoint
+        #   2. /simple/<pkg>/         — pip's primary download index
+        #   3. files.pythonhosted.org — CDN-fronted wheel binary
+        # Each has its own cache. The previous check polled only (1)
+        # and would let the cascade fire while (2) or (3) still served
+        # the previous version, so downstream `pip install` resolved
+        # to the old wheel. Docker layer cache then locked that stale
+        # resolution in for subsequent rebuilds (the cache trap that
+        # bit us five times in one night).
         #
-        # Poll PyPI's JSON API for up to 60s. Cheap (~50ms per poll),
-        # avoids over-trusting "publish job said success."
+        # Two-stage probe per poll:
+        #   (a) `pip install --no-cache-dir PACKAGE==VERSION` — succeeds
+        #       only when the version is resolvable. Catches surface (1)
+        #       and (2) propagation lag.
+        #   (b) `pip download` of the same wheel + SHA256 compare against
+        #       the just-built dist's hash. Catches surface (3) lag AND
+        #       Fastly serving stale content under the new version's URL
+        #       (a separate Fastly-corruption mode that pip-install alone
+        #       can't see, since pip install resolves+unpacks against
+        #       whatever bytes Fastly returns and never inspects them).
+        # Both must pass before the cascade fans out.
+        #
+        # The venv is reused across polls; only `pip install`/`pip
+        # download` run in the loop, with --force-reinstall +
+        # --no-cache-dir so the previous poll's cached state doesn't
+        # mask propagation lag.
         env:
           RUNTIME_VERSION: ${{ needs.publish.outputs.version }}
+          EXPECTED_SHA256: ${{ needs.publish.outputs.wheel_sha256 }}
         run: |
           set -eu
+          if [ -z "$EXPECTED_SHA256" ]; then
+            echo "::error::publish job did not expose wheel_sha256 — cannot verify wheel content. Refusing to fan out cascade."
+            exit 1
+          fi
+          python -m venv /tmp/propagation-probe
+          PROBE=/tmp/propagation-probe/bin
+          $PROBE/pip install --upgrade --quiet pip
+          # Poll budget: 30 attempts × (~3-5s pip install + ~3s pip
+          # download + 4s sleep) ≈ 5-6 min wall on a slow GH runner.
+          # Generous vs PyPI's typical few-seconds propagation;
+          # failures past this are signal of a real PyPI / Fastly
+          # issue, not just lag.
           for i in $(seq 1 30); do
-            if curl -fsS "https://pypi.org/pypi/molecule-ai-workspace-runtime/${RUNTIME_VERSION}/json" >/dev/null 2>&1; then
-              echo "::notice::✓ PyPI serving ${RUNTIME_VERSION} after ${i} polls"
-              exit 0
+            # Stage (a): can pip resolve and install the version?
+            if $PROBE/pip install \
+                  --quiet \
+                  --no-cache-dir \
+                  --force-reinstall \
+                  --no-deps \
+                  "molecule-ai-workspace-runtime==${RUNTIME_VERSION}" \
+                  >/dev/null 2>&1; then
+              INSTALLED=$($PROBE/pip show molecule-ai-workspace-runtime 2>/dev/null \
+                          | awk -F': ' '/^Version:/{print $2}')
+              if [ "$INSTALLED" = "$RUNTIME_VERSION" ]; then
+                # Stage (b): does Fastly serve the bytes we uploaded?
+                # `pip download` writes the actual .whl file to disk so
+                # we can sha256sum it (vs `pip install` which unpacks
+                # and discards).
+                rm -rf /tmp/probe-dl
+                mkdir -p /tmp/probe-dl
+                if $PROBE/pip download \
+                      --quiet \
+                      --no-cache-dir \
+                      --no-deps \
+                      --dest /tmp/probe-dl \
+                      "molecule-ai-workspace-runtime==${RUNTIME_VERSION}" \
+                      >/dev/null 2>&1; then
+                  WHEEL=$(ls /tmp/probe-dl/*.whl 2>/dev/null | head -1)
+                  if [ -n "$WHEEL" ]; then
+                    ACTUAL=$(sha256sum "$WHEEL" | awk '{print $1}')
+                    if [ "$ACTUAL" = "$EXPECTED_SHA256" ]; then
+                      echo "::notice::✓ pip resolves AND wheel content matches after ${i} poll(s) (sha256=${EXPECTED_SHA256})"
+                      exit 0
+                    fi
+                    # Hash mismatch: PyPI accepted our upload but Fastly
+                    # is serving different bytes under the version's URL.
+                    # Most often this is propagation lag of the BINARY
+                    # surface — the version is resolvable but the wheel
+                    # cache hasn't caught up. Retry.
+                    echo "::warning::poll ${i}: wheel content mismatch (got ${ACTUAL:0:12}…, want ${EXPECTED_SHA256:0:12}…) — Fastly likely still serving stale binary, retrying"
+                  fi
+                fi
+              fi
             fi
-            sleep 2
+            sleep 4
           done
-          echo "::error::PyPI never propagated ${RUNTIME_VERSION} within 60s — refusing to fan out cascade against stale index"
+          echo "::error::pip never resolved molecule-ai-workspace-runtime==${RUNTIME_VERSION} with matching wheel content within ~5 min."
+          echo "::error::Expected wheel SHA256: ${EXPECTED_SHA256}"
+          echo "::error::Refusing to fan out cascade against stale or corrupt PyPI surfaces."
           exit 1
 
       - name: Fan out repository_dispatch

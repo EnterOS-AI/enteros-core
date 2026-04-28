@@ -10,15 +10,29 @@ name: Runtime Pin Compatibility
 #   4. Every tenant workspace crashed; the canary tenant caught it but
 #      only after 5 hours of degraded staging
 #
-# This workflow installs the runtime in a fresh Python venv from PyPI
-# and tries the same import the EC2 user-data does. If pip resolution
-# silently produces a broken combo, this gate fails before the tenant
-# image gets published.
+# This workflow installs the CURRENTLY PUBLISHED runtime from PyPI on
+# top of `workspace/requirements.txt` and smoke-imports. Catches:
+#   - Upstream PyPI yanks
+#   - Bad re-releases of molecule-ai-workspace-runtime
+#   - Already-shipped wheels that stop importing because a transitive
+#     dep moved underneath
+#
+# This is the "PyPI artifact health" half of pin compatibility. The
+# companion workflow `runtime-prbuild-compat.yml` covers the
+# "PR-introduced breakage" half by building the wheel from THIS PR's
+# workspace/ source. Splitting the two means each gets a narrow
+# `paths:` filter — the pypi-latest job no longer fires on doc-only
+# workspace/ edits whose content can't change what's currently on PyPI.
 
 on:
   push:
     branches: [main, staging]
     paths:
+      # Narrow filter: pypi-latest is sensitive only to changes that
+      # affect what we're INSTALLING (requirements.txt) or WHAT THE
+      # CHECK ITSELF DOES (this workflow file). Edits to workspace/
+      # source code don't change what's on PyPI right now, so they
+      # don't change this gate's verdict.
       - 'workspace/requirements.txt'
       - '.github/workflows/runtime-pin-compat.yml'
   pull_request:
@@ -42,8 +56,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  default-install:
-    name: Default install + import smoke
+  pypi-latest-install:
+    name: PyPI-latest install + import smoke
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
