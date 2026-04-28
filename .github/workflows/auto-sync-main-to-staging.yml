@@ -1,0 +1,136 @@
+name: Auto-sync main → staging
+
+# Reflects every push to `main` back onto `staging` so the
+# staging-as-superset-of-main invariant holds.
+#
+# Background:
+#
+# `auto-promote-staging.yml` advances main via `git merge --ff-only`
+# + `git push origin main` — that's a clean fast-forward, no merge
+# commit. But manual merges of `staging → main` PRs through the
+# GitHub UI / API create a merge commit on main that staging
+# doesn't have. The next `staging → main` PR then evaluates as
+# "BEHIND" because staging is missing that merge commit, requiring
+# a manual `gh pr update-branch` round-trip.
+#
+# This happened twice on 2026-04-28 (PRs #2202, #2205, both manual
+# bridges). Each time the bridge needed update-branch + a re-CI
+# round before merging. Operationally annoying and avoidable.
+#
+# This workflow closes the gap automatically:
+#
+#   1. Push to main fires (regardless of source: auto-promote, UI
+#      merge, API merge, direct push).
+#   2. Check whether main is already in staging's ancestry — if
+#      yes, no-op (auto-promote-staging already kept them in sync
+#      via fast-forward).
+#   3. If not, try fast-forward staging to main first (works when
+#      staging hasn't diverged with its own commits).
+#   4. If ff fails (staging has commits main doesn't — feature work
+#      in flight), do a real merge with a "chore: sync" commit so
+#      staging absorbs main's tip while keeping its own history.
+#   5. Push staging.
+#
+# Loop safety:
+#
+# Pushing the synced staging triggers `auto-promote-staging.yml`,
+# which checks gates on staging's new tip and, if green, ff-pushes
+# staging to main. Since staging now == main (ff case) or ⊇ main
+# (merge case where promote then advances), the resulting push to
+# main is either a no-op (no actual ref change → no push event) or
+# advances main further. In the latter case auto-sync fires again,
+# sees main already in staging's ancestry, no-ops. No infinite loop.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  sync-staging:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout staging
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: staging
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git author
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Check if staging already contains main
+        id: check
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          if git merge-base --is-ancestor origin/main HEAD; then
+            echo "needs_sync=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "## ✅ No-op"
+              echo
+              echo "staging already contains \`origin/main\` ($(git rev-parse --short=8 origin/main))."
+              echo "auto-promote-staging or a previous auto-sync run already kept them aligned."
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "needs_sync=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::staging is missing main's tip — sync needed"
+          fi
+
+      - name: Fast-forward staging → main
+        if: steps.check.outputs.needs_sync == 'true'
+        id: ff
+        run: |
+          set -euo pipefail
+          if git merge --ff-only origin/main; then
+            echo "did_ff=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Fast-forwarded staging to origin/main"
+          else
+            echo "did_ff=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::ff failed — staging has its own commits; will create merge"
+          fi
+
+      - name: Merge main into staging (when ff fails)
+        if: |
+          steps.check.outputs.needs_sync == 'true' &&
+          steps.ff.outputs.did_ff != 'true'
+        run: |
+          set -euo pipefail
+          # ff failed because staging has commits main doesn't — typical
+          # in-flight feature work. Create a merge commit so staging
+          # absorbs main's tip while keeping its own history.
+          if ! git merge --no-ff origin/main -m "chore: sync main → staging (auto)"; then
+            {
+              echo "## ❌ Conflict"
+              echo
+              echo "Auto-merge \`main → staging\` failed with conflicts."
+              echo "A human needs to resolve manually:"
+              echo
+              echo "    git checkout staging"
+              echo "    git merge origin/main"
+              echo "    # resolve, commit, push"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+      - name: Push staging
+        if: steps.check.outputs.needs_sync == 'true'
+        run: |
+          set -euo pipefail
+          git push origin staging
+          {
+            if [ "${{ steps.ff.outputs.did_ff }}" = "true" ]; then
+              echo "## ✅ staging fast-forwarded"
+              echo
+              echo "staging is now at \`$(git rev-parse --short=8 HEAD)\` (== origin/main)."
+            else
+              echo "## ✅ staging absorbed main"
+              echo
+              echo "staging is now at \`$(git rev-parse --short=8 HEAD)\` with a merge commit absorbing main's tip."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
