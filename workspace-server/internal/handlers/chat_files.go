@@ -177,6 +177,10 @@ func (h *ChatFilesHandler) Upload(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "workspace url not registered yet"})
 		return
 	}
+	// Trust note: workspaces.url passes validateAgentURL at /registry/
+	// register write time, blocking SSRF-shaped URLs. We rely on that
+	// upstream gate rather than re-validating here. Tracked at #2316
+	// for follow-up: forward-time re-validation as defense-in-depth.
 
 	secret, err := wsauth.ReadPlatformInboundSecret(ctx, db.DB, workspaceID)
 	if err != nil {
