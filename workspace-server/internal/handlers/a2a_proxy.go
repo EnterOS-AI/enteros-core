@@ -23,6 +23,7 @@ import (
 	"github.com/Molecule-AI/molecule-monorepo/platform/internal/events"
 	"github.com/Molecule-AI/molecule-monorepo/platform/internal/provisioner"
 	"github.com/Molecule-AI/molecule-monorepo/platform/internal/registry"
+	"github.com/Molecule-AI/molecule-monorepo/platform/internal/wsauth"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
@@ -191,6 +192,27 @@ func (h *WorkspaceHandler) ProxyA2A(c *gin.Context) {
 	}
 
 	callerID := c.GetHeader("X-Workspace-ID")
+
+	// #2306: when X-Workspace-ID isn't set, derive callerID from the bearer
+	// token's owning workspace. External callers (third-party SDKs, the
+	// channel plugin, etc.) authenticate purely via bearer and frequently
+	// don't set the header — without this, activity_logs.source_id ends up
+	// NULL and downstream consumers (notification peer_id, "Agent Comms by
+	// peer" tab, analytics) can't identify the sender. The bearer is the
+	// authoritative caller identity per the wsauth contract; the header is
+	// just a display/routing hint that must agree with it.
+	//
+	// Skip when an org-level token is in play (canvas/admin path) — those
+	// tokens grant org-wide access and don't bind to a single workspace.
+	if callerID == "" {
+		if _, isOrg := c.Get("org_token_id"); !isOrg {
+			if tok := wsauth.BearerTokenFromHeader(c.GetHeader("Authorization")); tok != "" {
+				if wsID, err := wsauth.WorkspaceFromToken(ctx, db.DB, tok); err == nil {
+					callerID = wsID
+				}
+			}
+		}
+	}
 
 	// #761 SECURITY: reject requests where the client-supplied X-Workspace-ID
 	// contains a system-caller prefix. isSystemCaller() bypasses both token
