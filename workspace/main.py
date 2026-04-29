@@ -310,6 +310,17 @@ async def main():  # pragma: no cover
                         from platform_auth import save_token
                         save_token(tok)
                         print(f"Saved workspace auth token (prefix={tok[:8]}…)")
+                    # RFC #2312 PR-F: persist platform_inbound_secret if the
+                    # platform supplied one. Idempotent — writing the same
+                    # value over an existing file is harmless. Required for
+                    # SaaS where there's no persistent /configs volume; on
+                    # Docker mode it overwrites the value the provisioner
+                    # already wrote at workspace creation.
+                    inbound = body.get("platform_inbound_secret")
+                    if inbound:
+                        from platform_inbound_auth import save_inbound_secret
+                        save_inbound_secret(inbound)
+                        print(f"Saved platform_inbound_secret (prefix={inbound[:8]}…)")
                 except Exception as parse_exc:
                     print(f"Warning: couldn't parse register response for token: {parse_exc}")
         except Exception as e:
