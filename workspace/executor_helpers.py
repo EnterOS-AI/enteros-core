@@ -933,3 +933,60 @@ def collect_outbound_files(reply_text: str) -> list[dict[str, str]]:
         if staged is not None:
             out.append(staged)
     return out
+
+
+def new_response_message(
+    context: Any,
+    text: str = "",
+    files: list[dict[str, str]] | None = None,
+) -> Any:
+    """Build an A2A v1 protobuf response Message with task/context correlation.
+
+    Adapter executors should use this instead of ``a2a.helpers.new_text_message``
+    (which omits ``task_id`` / ``context_id``) so the platform's a2a proxy can
+    reliably correlate the response to the originating task. Mirrors the shape
+    used by ``workspace/a2a_executor.py``'s own response construction so all
+    runtime paths produce the same Message envelope.
+
+    Args:
+        context: The ``RequestContext`` from the inbound A2A request. Reads
+            ``context.task_id`` and ``context.context_id``; both fall back to
+            fresh UUIDs when ``None`` (RequestContextBuilder always sets them
+            in production; the fallback exists for unit tests).
+        text: Response text. Empty string omits the text Part — useful when
+            replying with files only.
+        files: Optional list of ``{"path": ..., "name": ..., "mime_type": ...}``
+            dicts (e.g. the output of :func:`collect_outbound_files`). Each
+            becomes a Part with ``url="workspace:<path>"``, ``filename``, and
+            ``media_type`` set.
+
+    Returns:
+        A v1 protobuf ``a2a.types.Message`` ready to pass to
+        ``event_queue.enqueue_event(...)``.
+
+    Why this exists: a2a-sdk v1 replaced the v0 Pydantic discriminated-union
+    types (``Part(root=TextPart(...))`` / ``Part(root=FilePart(file=
+    FileWithUri(...)))``) with a flat protobuf Part struct. Templates that
+    were written against v0 + then auto-renamed have shipped without
+    ``task_id``/``context_id`` correlation; this helper centralizes the
+    canonical pattern.
+    """
+    # Lazy import: a2a.types is provided by a2a-sdk which is a runtime
+    # dependency every adapter image already has. Importing here keeps the
+    # module load path lean for callers that don't construct messages.
+    from a2a.types import Message, Part, Role
+
+    parts: list = [Part(text=text)] if text else []
+    for f in files or []:
+        parts.append(Part(
+            url="workspace:" + f["path"],
+            filename=f["name"],
+            media_type=f["mime_type"],
+        ))
+    return Message(
+        message_id=_uuid.uuid4().hex,
+        role=Role.ROLE_AGENT,
+        parts=parts,
+        task_id=getattr(context, "task_id", None) or _uuid.uuid4().hex,
+        context_id=getattr(context, "context_id", None) or _uuid.uuid4().hex,
+    )
