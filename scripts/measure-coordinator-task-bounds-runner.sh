@@ -211,20 +211,18 @@ ELAPSED_SECS=$(python3 -c "print(round(($END_NS - $START_NS) / 1e9, 2))")
 
 emit "a2a_response_observed" "{\"elapsed_secs\":$ELAPSED_SECS,\"response_chars\":${#RESP},\"response_head\":$(python3 -c "import json,sys; print(json.dumps(sys.argv[1][:200]))" "$RESP")}"
 
-# ---- Heartbeat trace ----
-# `/workspaces/:id/heartbeat-history` is a local-dev workspace-server
-# route — on tenant deployments the platform's :8080 fallback proxies
-# any unmatched path to the canvas Next.js, so this 404s with 28KB of
-# HTML rather than a clean error. Skip the fetch entirely in SaaS mode
-# and emit an explicit placeholder instead of polluting the event log
-# with HTML.
-emit "fetching_heartbeat_trace" "{\"mode\":\"$MODE\"}"
-if [ "$MODE" = "saas" ]; then
-  emit "heartbeat_trace" "{\"raw\":\"<skipped: heartbeat-history endpoint unavailable in SaaS — see scripts/README.md\>\"}"
-else
-  HB=$(api "$PLATFORM/workspaces/$PM_ID/heartbeat-history?since_secs=$A2A_TIMEOUT" 2>&1 || echo "<endpoint_unavailable>")
-  emit "heartbeat_trace" "{\"raw\":$(python3 -c "import json,sys; print(json.dumps(sys.argv[1]))" "$HB")}"
-fi
+# ---- Activity trace ----
+# Earlier versions of this runner called /workspaces/:id/heartbeat-history,
+# which doesn't exist on workspace-server. On local dev that returned 404,
+# on tenant builds the platform's canvas-proxy fallback intercepted it and
+# returned 28KB of Next.js HTML — neither of which is useful trace data.
+# /workspaces/:id/activity is the existing endpoint that reads the
+# activity_logs table (a2a_send / a2a_receive / task_update / agent_log /
+# error events with duration_ms + status). That's the data the RFC's
+# §V1.0 step 6 'platform-side transition' check actually needs.
+emit "fetching_activity_trace" "{\"mode\":\"$MODE\"}"
+ACTIVITY=$(api "$PLATFORM/workspaces/$PM_ID/activity?since_secs=$A2A_TIMEOUT" 2>&1 || echo "<endpoint_unavailable>")
+emit "activity_trace" "{\"raw\":$(python3 -c "import json,sys; print(json.dumps(sys.argv[1]))" "$ACTIVITY")}"
 
 # ---- rfc2251_phase log lines from the workspace container ----
 # Local Docker provisioner: workspace container name is workspace-<id>.
@@ -262,7 +260,7 @@ Interpretation:
   60 <= ELAPSED < 300 → Within DELEGATION_TIMEOUT. Doesn't prove or refute
                    Issue 4 — HTTP-level timeout would be sufficient.
 
-  ELAPSED >= 300 → BUG CONFIRMED IF heartbeat_trace shows no platform-side
+  ELAPSED >= 300 → BUG CONFIRMED IF activity_trace shows no platform-side
                    transition. Coordinator ran past DELEGATION_TIMEOUT without
                    any platform ceiling kicking in — exactly the gap V1.0
                    plans to close with MAX_TASK_EXECUTION_SECS.
