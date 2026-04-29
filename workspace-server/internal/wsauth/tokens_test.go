@@ -143,6 +143,65 @@ func TestValidateToken_RemovedWorkspaceRejected(t *testing.T) {
 }
 
 // ------------------------------------------------------------
+// WorkspaceFromToken — #2306
+// ------------------------------------------------------------
+
+func TestWorkspaceFromToken_HappyPath(t *testing.T) {
+	db, mock := setupMock(t)
+
+	mock.ExpectExec(`INSERT INTO workspace_auth_tokens`).WillReturnResult(sqlmock.NewResult(1, 1))
+	tok, err := IssueToken(context.Background(), db, "ws-source")
+	if err != nil {
+		t.Fatalf("IssueToken: %v", err)
+	}
+
+	mock.ExpectQuery(`SELECT t\.workspace_id\s+FROM workspace_auth_tokens t.*JOIN workspaces`).
+		WithArgs(sqlmock.AnyArg()).
+		WillReturnRows(sqlmock.NewRows([]string{"workspace_id"}).AddRow("ws-source"))
+
+	wsID, err := WorkspaceFromToken(context.Background(), db, tok)
+	if err != nil {
+		t.Fatalf("WorkspaceFromToken: %v", err)
+	}
+	if wsID != "ws-source" {
+		t.Errorf("workspace_id: got %q, want %q", wsID, "ws-source")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+func TestWorkspaceFromToken_EmptyTokenRejected(t *testing.T) {
+	db, _ := setupMock(t)
+	if _, err := WorkspaceFromToken(context.Background(), db, ""); err != ErrInvalidToken {
+		t.Errorf("empty token: got %v, want ErrInvalidToken", err)
+	}
+}
+
+func TestWorkspaceFromToken_UnknownTokenRejected(t *testing.T) {
+	db, mock := setupMock(t)
+	mock.ExpectQuery(`SELECT t\.workspace_id\s+FROM workspace_auth_tokens t.*JOIN workspaces`).
+		WillReturnError(sql.ErrNoRows)
+
+	if _, err := WorkspaceFromToken(context.Background(), db, "not-a-real-token"); err != ErrInvalidToken {
+		t.Errorf("got %v, want ErrInvalidToken", err)
+	}
+}
+
+// Defense-in-depth: a token belonging to a workspace with status='removed'
+// must NOT yield a workspace_id usable for callerID derivation.
+func TestWorkspaceFromToken_RemovedWorkspaceRejected(t *testing.T) {
+	db, mock := setupMock(t)
+	mock.ExpectQuery(`SELECT t\.workspace_id\s+FROM workspace_auth_tokens t.*JOIN workspaces`).
+		WithArgs(sqlmock.AnyArg()).
+		WillReturnRows(sqlmock.NewRows([]string{"workspace_id"})) // empty rows
+
+	if _, err := WorkspaceFromToken(context.Background(), db, "token-for-removed-workspace"); err != ErrInvalidToken {
+		t.Errorf("removed workspace token: expected ErrInvalidToken, got %v", err)
+	}
+}
+
+// ------------------------------------------------------------
 // HasAnyLiveToken
 // ------------------------------------------------------------
 
