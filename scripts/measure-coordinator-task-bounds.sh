@@ -47,19 +47,67 @@
 #
 # Usage
 # -----
+#   # local dev — no auth, no tenant scoping required:
 #   PLATFORM=http://localhost:8080 OPENROUTER_API_KEY=... \
 #     bash scripts/measure-coordinator-task-bounds.sh
 #
-# Or against staging-api (requires a tenant admin token):
-#
+#   # staging — explicit tenant + admin token are mandatory; the script
+#   # refuses to run without them when PLATFORM is non-local:
 #   PLATFORM=https://your-staging-tenant.example \
+#   ADMIN_TOKEN=...           \
+#   TENANT_ID=tenant-uuid     \
+#   OPENROUTER_API_KEY=...    \
+#     bash scripts/measure-coordinator-task-bounds.sh
+#
+#   # dry-run — print plan + auth/scoping summary, exit before any
+#   # state mutation. Use this before pointing at staging:
+#   DRY_RUN=1 PLATFORM=... ADMIN_TOKEN=... TENANT_ID=... \
 #   OPENROUTER_API_KEY=... \
 #     bash scripts/measure-coordinator-task-bounds.sh
+#
+# Cleanup
+# -------
+#   The script deletes both workspaces it created on EXIT (success,
+#   failure, or interrupt). Set KEEP_WORKSPACES=1 to skip cleanup when
+#   you need to inspect the workspaces afterward — but remember to
+#   delete them by hand or chain `cleanup-rogue-workspaces.sh`.
 #
 set -euo pipefail
 
 PLATFORM="${PLATFORM:-http://localhost:8080}"
-OR_KEY="${OPENROUTER_API_KEY:-${OPENAI_API_KEY:?Set OPENROUTER_API_KEY (or OPENAI_API_KEY)}}"
+# Require an explicitly-set non-empty key. The previous chained
+# default (`${OPENROUTER_API_KEY:-${OPENAI_API_KEY:?...}}`) silently
+# accepted `OPENROUTER_API_KEY=""` and only failed when OPENAI_API_KEY
+# was also unset — defeating the guard against running with no LLM
+# credentials.
+if [ -z "${OPENROUTER_API_KEY:-}" ] && [ -z "${OPENAI_API_KEY:-}" ]; then
+  echo "ERROR: set OPENROUTER_API_KEY (or OPENAI_API_KEY) to a non-empty value" >&2
+  exit 1
+fi
+OR_KEY="${OPENROUTER_API_KEY:-${OPENAI_API_KEY}}"
+
+# Required for non-localhost platforms — staging-api etc. enforce
+# tenant-admin auth on /workspaces. Without it the harness would either
+# 401 every request OR (worse) provision into the wrong tenant.
+# Explicit auth + tenant scoping is mandatory before pointing this at
+# any shared environment. Memory `feedback_never_run_cluster_cleanup_
+# tests_on_live_platform` calls out the same hazard class.
+ADMIN_TOKEN="${ADMIN_TOKEN:-}"
+TENANT_ID="${TENANT_ID:-}"
+case "$PLATFORM" in
+  http://localhost*|http://127.0.0.1*)
+    : # local dev — auth + tenant optional
+    ;;
+  *)
+    if [ -z "$ADMIN_TOKEN" ] || [ -z "$TENANT_ID" ]; then
+      echo "ERROR: PLATFORM=$PLATFORM is non-local — set both ADMIN_TOKEN and TENANT_ID" >&2
+      echo "       (the harness creates real workspaces; running unscoped against shared infra" >&2
+      echo "       can collide with live tenant state. See cluster-cleanup hazard memory.)" >&2
+      exit 1
+    fi
+    ;;
+esac
+
 # Synthesis prompt knob — choose the size of the post-delegation work
 # the coordinator is asked to do. Default exercises 3 delegation rounds
 # with non-trivial aggregation.
@@ -69,6 +117,18 @@ SYNTHESIS_DEPTH="${SYNTHESIS_DEPTH:-3}"
 # a slow-but-eventually-completing case.
 A2A_TIMEOUT="${A2A_TIMEOUT:-600}"
 
+# Dry-run prints what would be provisioned + the curl commands, then
+# exits before any state mutation. Use this to confirm the platform
+# URL, tenant scoping, and synthesis prompt are right BEFORE creating
+# real workspaces. Set DRY_RUN=1 to engage.
+DRY_RUN="${DRY_RUN:-0}"
+
+# Workspaces are auto-deleted on EXIT (success, failure, or interrupt)
+# to avoid leaking resources against shared infra. Set KEEP_WORKSPACES=1
+# to skip cleanup when you need to inspect the workspaces afterward
+# (e.g. to pull container logs or re-trigger an A2A round-trip).
+KEEP_WORKSPACES="${KEEP_WORKSPACES:-0}"
+
 ts() { date -u +%Y-%m-%dT%H:%M:%S.%3NZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; }
 
 emit() {
@@ -76,33 +136,92 @@ emit() {
   printf '{"ts":"%s","event":"%s","data":%s}\n' "$(ts)" "$1" "${2:-null}"
 }
 
-emit "run_started" "{\"platform\":\"$PLATFORM\",\"synthesis_depth\":$SYNTHESIS_DEPTH,\"a2a_timeout_secs\":$A2A_TIMEOUT}"
+# Helper that adds Authorization + X-Tenant-Id headers when configured.
+# Local-dev runs (no ADMIN_TOKEN) get a no-op pass-through so a developer
+# can iterate against `http://localhost:8080` without setup ceremony.
+api() {
+  local args=()
+  [ -n "$ADMIN_TOKEN" ] && args+=(-H "Authorization: Bearer $ADMIN_TOKEN")
+  [ -n "$TENANT_ID" ]   && args+=(-H "X-Tenant-Id: $TENANT_ID")
+  curl -s "${args[@]}" "$@"
+}
+
+# Set early so we can reference it from the trap; populated as
+# workspaces come online and unset by the cleanup helper to avoid
+# repeat DELETEs on re-entry.
+PM_ID=""
+CHILD_ID=""
+
+cleanup() {
+  local exit_code=$?
+  set +e
+  if [ "$KEEP_WORKSPACES" = "1" ]; then
+    emit "cleanup_skipped" "{\"reason\":\"KEEP_WORKSPACES=1\",\"pm_id\":\"$PM_ID\",\"child_id\":\"$CHILD_ID\"}"
+    return $exit_code
+  fi
+  for id in "$CHILD_ID" "$PM_ID"; do
+    [ -z "$id" ] && continue
+    api -X DELETE "$PLATFORM/workspaces/$id" >/dev/null 2>&1
+    emit "cleanup_deleted" "{\"workspace_id\":\"$id\"}"
+  done
+  return $exit_code
+}
+trap cleanup EXIT INT TERM
+
+emit "run_started" "{\"platform\":\"$PLATFORM\",\"tenant_id\":\"$TENANT_ID\",\"synthesis_depth\":$SYNTHESIS_DEPTH,\"a2a_timeout_secs\":$A2A_TIMEOUT,\"dry_run\":$([ \"$DRY_RUN\" = \"1\" ] && echo true || echo false)}"
+
+if [ "$DRY_RUN" = "1" ]; then
+  cat >&2 <<EOF
+
+=========================================
+  DRY RUN — no state will be mutated.
+=========================================
+
+Would target: $PLATFORM
+Tenant:       ${TENANT_ID:-<local — no tenant scoping>}
+Auth:         $([ -n "$ADMIN_TOKEN" ] && echo "Bearer ***${ADMIN_TOKEN: -4}" || echo "<none — local dev>")
+
+Would provision:
+  PM (coordinator, tier=2, template=claude-code-default)
+  Researcher (child, tier=2, template=langgraph)
+
+Would send synthesis-heavy task: $SYNTHESIS_DEPTH delegations + 600w
+synthesis. Coordinator A2A timeout: ${A2A_TIMEOUT}s.
+
+Workspaces would be auto-deleted on script exit (override with
+KEEP_WORKSPACES=1).
+
+Re-run without DRY_RUN=1 to execute.
+
+EOF
+  exit 0
+fi
 
 # ---- Setup: coordinator + 1 child ----
 emit "provisioning_pm" null
-R=$(curl -s -X POST "$PLATFORM/workspaces" -H 'Content-Type: application/json' \
+R=$(api -X POST "$PLATFORM/workspaces" -H 'Content-Type: application/json' \
   -d '{"name":"PM","role":"Coordinator — delegates and synthesizes","tier":2,"template":"claude-code-default"}')
 PM_ID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))")
 [ -n "$PM_ID" ] || { echo "ERROR: PM create failed: $R" >&2; exit 1; }
 emit "pm_provisioned" "{\"workspace_id\":\"$PM_ID\"}"
 
 emit "provisioning_child" null
-R=$(curl -s -X POST "$PLATFORM/workspaces" -H 'Content-Type: application/json' \
+R=$(api -X POST "$PLATFORM/workspaces" -H 'Content-Type: application/json' \
   -d '{"name":"Researcher","role":"Returns short research findings","tier":2,"template":"langgraph"}')
 CHILD_ID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))")
 [ -n "$CHILD_ID" ] || { echo "ERROR: child create failed: $R" >&2; exit 1; }
 emit "child_provisioned" "{\"workspace_id\":\"$CHILD_ID\"}"
 
-curl -s -X PATCH "$PLATFORM/workspaces/$CHILD_ID" -H 'Content-Type: application/json' \
+api -X PATCH "$PLATFORM/workspaces/$CHILD_ID" -H 'Content-Type: application/json' \
   -d "{\"parent_id\":\"$PM_ID\"}" > /dev/null
-curl -s -X POST "$PLATFORM/workspaces/$CHILD_ID/secrets" -H 'Content-Type: application/json' \
+api -X POST "$PLATFORM/workspaces/$CHILD_ID/secrets" -H 'Content-Type: application/json' \
   -d "{\"key\":\"OPENROUTER_API_KEY\",\"value\":\"$OR_KEY\"}" > /dev/null
 
 # ---- Wait for both online ----
 wait_online() {
   local id="$1"; local label="$2"
   for i in $(seq 1 30); do
-    s=$(curl -s "$PLATFORM/workspaces/$id" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status',''))" 2>/dev/null)
+    s=$(api "$PLATFORM/workspaces/$id" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status',''))" 2>/dev/null)
     [ "$s" = "online" ] && { emit "online" "{\"workspace\":\"$label\",\"after_polls\":$i}"; return 0; }
     sleep 3
   done
@@ -127,7 +246,7 @@ START_NS=$(python3 -c 'import time; print(int(time.time_ns()))')
 # hang past sensible limits). The bound is a measurement-side timeout,
 # NOT a platform-side timeout — the latter is what we're trying to
 # detect.
-RESP=$(curl -s --max-time "$A2A_TIMEOUT" -X POST "$PLATFORM/workspaces/$PM_ID/a2a" \
+RESP=$(api --max-time "$A2A_TIMEOUT" -X POST "$PLATFORM/workspaces/$PM_ID/a2a" \
   -H "Content-Type: application/json" \
   -d "$(python3 -c "
 import json,sys
@@ -154,7 +273,7 @@ emit "a2a_response_observed" "{\"elapsed_secs\":$ELAPSED_SECS,\"response_chars\"
 # such transition over a 10min synthesis is the empirical evidence
 # that no platform ceiling fired.
 emit "fetching_heartbeat_trace" null
-HB=$(curl -s "$PLATFORM/workspaces/$PM_ID/heartbeat-history?since_secs=$A2A_TIMEOUT" 2>&1 || echo "<endpoint_unavailable>")
+HB=$(api "$PLATFORM/workspaces/$PM_ID/heartbeat-history?since_secs=$A2A_TIMEOUT" 2>&1 || echo "<endpoint_unavailable>")
 emit "heartbeat_trace" "{\"raw\":$(python3 -c "import json,sys; print(json.dumps(sys.argv[1]))" "$HB")}"
 
 # ---- Summary ----
@@ -192,8 +311,17 @@ Interpretation guide:
                         synthesis is just very slow. Pull workspace
                         status separately to disambiguate.
 
-Cleanup:
-  curl -X DELETE $PLATFORM/workspaces/$PM_ID
-  curl -X DELETE $PLATFORM/workspaces/$CHILD_ID
+Heartbeat trace caveats:
+
+  If heartbeat_trace.raw is the literal string "<endpoint_unavailable>"
+  the platform's /heartbeat-history endpoint is missing or 404'd; the
+  measurement is INCONCLUSIVE on the bound question because we cannot
+  observe whether a platform-side transition fired. Either wire the
+  endpoint or replace this trace pull with an equivalent Datadog query
+  for the workspace's heartbeat metric and re-run.
+
+Workspaces (auto-deleted on exit unless KEEP_WORKSPACES=1):
+  PM:    $PM_ID
+  Child: $CHILD_ID
 
 EOF
