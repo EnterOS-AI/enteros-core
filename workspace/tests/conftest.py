@@ -65,15 +65,42 @@ def _make_a2a_mocks():
 
     tasks_mod.TaskUpdater = TaskUpdater
 
-    # a2a.types needs Part stub for artifact construction (v1: Part takes text= directly, no TextPart)
+    # a2a.types needs stubs for Part, Message, Role.
+    # v1 Part: flat protobuf with optional text/url/filename/media_type/raw/data fields.
+    # v1 Message: has message_id, role, parts, task_id, context_id, etc.
+    # Stubs preserve all kwargs so tests can assert on any field.
     types_mod = ModuleType("a2a.types")
 
     class Part:
-        """Stub for A2A Part (v1: takes text= kwarg directly)."""
+        """Stub for A2A Part (v1: flat protobuf with optional fields)."""
         def __init__(self, text=None, root=None, **kwargs):
             self.text = text
+            # Preserve every other kwarg as an attribute so tests can
+            # assert on Part(url=..., filename=..., media_type=...).
+            for k, v in kwargs.items():
+                setattr(self, k, v)
+
+    class Message:
+        """Stub for A2A Message (v1: protobuf with snake_case fields)."""
+        def __init__(self, message_id="", role=0, parts=None, task_id="",
+                     context_id="", **kwargs):
+            self.message_id = message_id
+            self.role = role
+            self.parts = list(parts) if parts is not None else []
+            self.task_id = task_id
+            self.context_id = context_id
+            for k, v in kwargs.items():
+                setattr(self, k, v)
+
+    class _RoleEnum:
+        """Stub for A2A Role enum (v1 protobuf: ROLE_UNSPECIFIED=0, ROLE_USER=1, ROLE_AGENT=2)."""
+        ROLE_UNSPECIFIED = 0
+        ROLE_USER = 1
+        ROLE_AGENT = 2
 
     types_mod.Part = Part
+    types_mod.Message = Message
+    types_mod.Role = _RoleEnum
 
     # a2a.helpers (v1: moved from a2a.utils, renamed new_agent_text_message
     # → new_text_message). Mock both names — production code only calls
