@@ -336,6 +336,24 @@ _CLI_A2A_COMMAND_KEYWORDS: dict[str, str | None] = {
 }
 
 
+def _validate_cli_a2a_command_keywords() -> None:
+    """Keep CLI instruction text aligned with command keyword mapping."""
+    missing = [
+        (tool_name, keyword)
+        for tool_name, keyword in _CLI_A2A_COMMAND_KEYWORDS.items()
+        if keyword is not None and keyword not in _A2A_INSTRUCTIONS_CLI
+    ]
+    if missing:
+        details = ", ".join(f"{tool_name}={keyword!r}" for tool_name, keyword in missing)
+        raise ValueError(
+            "CLI A2A command mapping is out of sync with _A2A_INSTRUCTIONS_CLI: "
+            f"{details}"
+        )
+
+
+_validate_cli_a2a_command_keywords()
+
+
 def _render_section(heading: str, specs, footer: str = "") -> str:
     """Render a section: heading, per-tool bullet, per-tool when_to_use, footer."""
     parts = [heading, ""]
