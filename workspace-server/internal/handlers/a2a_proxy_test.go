@@ -504,6 +504,182 @@ func TestA2AProxy_SystemCallerForge_IsRejected(t *testing.T) {
 	}
 }
 
+// ==================== ProxyA2A — bearer-derived callerID (#2306) ====================
+
+// TestProxyA2A_CallerIDDerivedFromBearer verifies that when X-Workspace-ID
+// is absent, ProxyA2A derives the callerID from the bearer token's owning
+// workspace. Without this, third-party SDKs that authenticate purely via
+// bearer end up with activity_logs.source_id=NULL, breaking peer_id and
+// "Agent Comms by peer" downstream signals.
+func TestProxyA2A_CallerIDDerivedFromBearer(t *testing.T) {
+	mock := setupTestDB(t)
+	mr := setupTestRedis(t)
+	allowLoopbackForTest(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+
+	agentServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"jsonrpc":"2.0","id":"1","result":{}}`)
+	}))
+	defer agentServer.Close()
+	mr.Set(fmt.Sprintf("ws:%s:url", "ws-target"), agentServer.URL)
+
+	// 1. Bearer-derive lookup → returns ws-caller
+	mock.ExpectQuery(`SELECT t\.workspace_id\s+FROM workspace_auth_tokens t.*JOIN workspaces`).
+		WillReturnRows(sqlmock.NewRows([]string{"workspace_id"}).AddRow("ws-caller"))
+
+	// 2. validateCallerToken's HasAnyLiveToken / ValidateToken queries fall
+	//    through to fail-open (no expectations set) — same pattern as
+	//    TestProxyA2A_CallerIDPropagated.
+
+	// 3. CanCommunicate — siblings under same parent
+	mock.ExpectQuery("SELECT id, parent_id FROM workspaces WHERE id = ").
+		WithArgs("ws-caller").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "parent_id"}).AddRow("ws-caller", "ws-parent"))
+	mock.ExpectQuery("SELECT id, parent_id FROM workspaces WHERE id = ").
+		WithArgs("ws-target").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "parent_id"}).AddRow("ws-target", "ws-parent"))
+
+	expectBudgetCheck(mock, "ws-target")
+
+	// 4. activity_logs INSERT — verify source_id arg is the derived ws-caller
+	//    (column order: workspace_id, activity_type, source_id, target_id, ...)
+	mock.ExpectExec("INSERT INTO activity_logs").
+		WithArgs(
+			"ws-target",                       // $1 workspace_id
+			"a2a_receive",                     // $2 activity_type
+			sqlmock.AnyArg(),                  // $3 source_id — *string("ws-caller"), checked below
+			sqlmock.AnyArg(),                  // $4 target_id
+			sqlmock.AnyArg(),                  // $5 method
+			sqlmock.AnyArg(),                  // $6 summary
+			sqlmock.AnyArg(),                  // $7 request_body
+			sqlmock.AnyArg(),                  // $8 response_body
+			sqlmock.AnyArg(),                  // $9 tool_trace
+			sqlmock.AnyArg(),                  // $10 duration_ms
+			sqlmock.AnyArg(),                  // $11 status
+			sqlmock.AnyArg(),                  // $12 error_detail
+		).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-target"}}
+
+	body := `{"method":"message/send","params":{"message":{"role":"user","parts":[{"text":"test"}]}}}`
+	c.Request = httptest.NewRequest("POST", "/workspaces/ws-target/a2a", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	// NOTE: no X-Workspace-ID — the bearer must be the only callerID source.
+	c.Request.Header.Set("Authorization", "Bearer some-bearer-token")
+
+	handler.ProxyA2A(c)
+	time.Sleep(50 * time.Millisecond) // allow LogActivity goroutine to flush
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// TestProxyA2A_OrgTokenSkipsBearerDerive verifies that when an org-level
+// token is in play (canvas/admin path), the bearer-derive logic is skipped
+// even if the bearer matches a workspace token. Org tokens grant org-wide
+// access and don't bind to a single workspace; treating them as a workspace
+// caller would mis-attribute activity logs.
+func TestProxyA2A_OrgTokenSkipsBearerDerive(t *testing.T) {
+	mock := setupTestDB(t)
+	mr := setupTestRedis(t)
+	allowLoopbackForTest(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+
+	agentServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"jsonrpc":"2.0","id":"1","result":{}}`)
+	}))
+	defer agentServer.Close()
+	mr.Set(fmt.Sprintf("ws:%s:url", "ws-target"), agentServer.URL)
+
+	// No WorkspaceFromToken expectation — the bearer-derive branch must NOT
+	// fire when org_token_id is set.
+	expectBudgetCheck(mock, "ws-target")
+
+	// Activity log INSERT with NULL source_id (canvas-class semantics).
+	mock.ExpectExec("INSERT INTO activity_logs").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-target"}}
+	c.Set("org_token_id", "org-token-123") // org-level auth
+
+	body := `{"method":"message/send","params":{"message":{"role":"user","parts":[{"text":"hi"}]}}}`
+	c.Request = httptest.NewRequest("POST", "/workspaces/ws-target/a2a", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Request.Header.Set("Authorization", "Bearer org-bearer")
+
+	handler.ProxyA2A(c)
+	time.Sleep(50 * time.Millisecond)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// TestProxyA2A_BearerDeriveFailureFallsThrough verifies that if the bearer
+// is present but doesn't resolve (e.g. revoked, removed workspace), the
+// callerID stays empty and the request is treated as canvas-class — we
+// don't 401, we don't error; we just lose the source_id signal. Mirrors
+// the canvas-bypass shape so legacy/anonymous paths aren't broken.
+func TestProxyA2A_BearerDeriveFailureFallsThrough(t *testing.T) {
+	mock := setupTestDB(t)
+	mr := setupTestRedis(t)
+	allowLoopbackForTest(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+
+	agentServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"jsonrpc":"2.0","id":"1","result":{}}`)
+	}))
+	defer agentServer.Close()
+	mr.Set(fmt.Sprintf("ws:%s:url", "ws-target"), agentServer.URL)
+
+	// Bearer-derive lookup fails (no live row) — collapses to ErrInvalidToken
+	// inside WorkspaceFromToken; ProxyA2A swallows the error and proceeds with
+	// callerID="".
+	mock.ExpectQuery(`SELECT t\.workspace_id\s+FROM workspace_auth_tokens t.*JOIN workspaces`).
+		WillReturnError(sql.ErrNoRows)
+
+	expectBudgetCheck(mock, "ws-target")
+	mock.ExpectExec("INSERT INTO activity_logs").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-target"}}
+
+	body := `{"method":"message/send","params":{"message":{"role":"user","parts":[{"text":"hi"}]}}}`
+	c.Request = httptest.NewRequest("POST", "/workspaces/ws-target/a2a", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Request.Header.Set("Authorization", "Bearer revoked-or-stale")
+
+	handler.ProxyA2A(c)
+	time.Sleep(50 * time.Millisecond)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200 (canvas-fallback), got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
 func TestIsSystemCaller(t *testing.T) {
 	cases := []struct {
 		caller   string

@@ -110,6 +110,45 @@ func ValidateToken(ctx context.Context, db *sql.DB, expectedWorkspaceID, plainte
 	return nil
 }
 
+// WorkspaceFromToken resolves the bearer token's owning workspace_id without
+// requiring the caller to know it up front. Used by HTTP handlers that need
+// to identify the source workspace of an inbound request when the caller
+// didn't (or couldn't) set the X-Workspace-ID header — e.g. third-party SDKs
+// or external integrations that authenticate purely via bearer (issue #2306).
+//
+// Returns ErrInvalidToken on any failure (no live token, removed workspace,
+// DB error). Like ValidateToken, the failure modes are collapsed to a single
+// error so handlers can't accidentally distinguish "no token" vs "wrong
+// workspace" — both should result in the same caller-facing response.
+//
+// Defense-in-depth (mirrors ValidateToken / ValidateAnyToken): the JOIN on
+// workspaces filters out tokens that belong to removed workspaces so a
+// deleted workspace's tokens cannot derive a callerID for activity logging.
+//
+// Does NOT update last_used_at — the calling handler chain typically also
+// runs the bearer through ValidateToken or ValidateAnyToken, which already
+// performs that update.
+func WorkspaceFromToken(ctx context.Context, db *sql.DB, plaintext string) (string, error) {
+	if plaintext == "" {
+		return "", ErrInvalidToken
+	}
+	hash := sha256.Sum256([]byte(plaintext))
+
+	var workspaceID string
+	err := db.QueryRowContext(ctx, `
+		SELECT t.workspace_id
+		FROM workspace_auth_tokens t
+		JOIN workspaces w ON w.id = t.workspace_id
+		WHERE t.token_hash = $1
+		  AND t.revoked_at IS NULL
+		  AND w.status != 'removed'
+	`, hash[:]).Scan(&workspaceID)
+	if err != nil {
+		return "", ErrInvalidToken
+	}
+	return workspaceID, nil
+}
+
 // RevokeAllForWorkspace invalidates every live token for a workspace.
 // Called from the workspace-delete handler so compromised credentials
 // can't outlive the workspace, and from future rotation flows.
