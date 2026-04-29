@@ -193,8 +193,24 @@ jobs:
           node-version: '22'
       - run: rm -f package-lock.json && npm install
       - run: npm run build
-      - name: Run tests
-        run: npx vitest run
+      - name: Run tests with coverage
+        # Coverage instrumentation is configured in canvas/vitest.config.ts
+        # (provider: v8, reporters: text + html + json-summary). Step 2 of
+        # #1815 — wires coverage into CI so we get a baseline visible on
+        # every PR. No threshold gate yet; thresholds dial in (Step 3, also
+        # tracked in #1815) after the team sees what current coverage is.
+        # Per the inline comment in vitest.config.ts: "first land
+        # observability so we can see the baseline, then dial in
+        # thresholds + a hard gate" — this PR ships the observability half.
+        run: npx vitest run --coverage
+      - name: Upload coverage summary as artifact
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: canvas-coverage-${{ github.run_id }}
+          path: canvas/coverage/
+          retention-days: 7
+          if-no-files-found: warn
 
   # MCP Server + SDK removed from CI — now in standalone repos:
   # - github.com/Molecule-AI/molecule-mcp-server (npm CI)
