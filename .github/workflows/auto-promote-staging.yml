@@ -39,6 +39,24 @@ name: Auto-promote staging → main
 # unset, the workflow logs what it would have done but doesn't open
 # the PR — useful for dry-running the gate logic without surfacing
 # a noisy PR while staging CI is still flaky.
+#
+# **One-time repo setting (load-bearing):** this workflow opens the
+# staging→main PR via `gh pr create` using the default GITHUB_TOKEN.
+# Since GitHub's 2022 default change, that token cannot create or
+# approve PRs unless the repo opts in. The toggle is at:
+#
+#   Settings → Actions → General → Workflow permissions
+#   → ✅ Allow GitHub Actions to create and approve pull requests
+#
+# Without it, every workflow_run fails with:
+#
+#   pull request create failed: GraphQL: GitHub Actions is not
+#   permitted to create or approve pull requests (createPullRequest)
+#
+# Observed 2026-04-29 01:43 UTC blocking promotion of fcd87b9 (PRs
+# #2248 + #2249); manually bridged via PR #2252. Re-check this
+# setting if auto-promote starts failing with createPullRequest
+# errors after a repo or org admin change.
 
 on:
   workflow_run:
