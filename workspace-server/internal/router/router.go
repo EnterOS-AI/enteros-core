@@ -213,7 +213,7 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		r.GET("/approvals/pending", middleware.AdminAuth(db.DB), apph.ListAll)
 
 		// Team Expansion
-		teamh := handlers.NewTeamHandler(broadcaster, prov, platformURL, configsDir)
+		teamh := handlers.NewTeamHandler(broadcaster, prov, wh, platformURL, configsDir)
 		wsAuth.POST("/expand", teamh.Expand)
 		wsAuth.POST("/collapse", teamh.Collapse)
 
