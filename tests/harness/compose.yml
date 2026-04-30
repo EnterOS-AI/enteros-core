@@ -85,6 +85,14 @@ services:
       PORT: "8080"
       PLATFORM_URL: "http://tenant:8080"
       MOLECULE_ENV: "production"
+      # SECRETS_ENCRYPTION_KEY is required when MOLECULE_ENV=production —
+      # crypto.InitStrict() refuses to boot without it ("32 bytes raw or
+      # base64-encoded"). The harness uses a clearly-test sentinel so the
+      # production code path is exercised end-to-end (including the
+      # encrypted-secret reads/writes) without coupling to a real key.
+      # Value is base64 of the literal string "harness-test-only-not-for-prod!!"
+      # (exactly 32 bytes). Do NOT copy this to any other environment.
+      SECRETS_ENCRYPTION_KEY: "aGFybmVzcy10ZXN0LW9ubHktbm90LWZvci1wcm9kISE="
       # ADMIN_TOKEN flips the platform into strict-auth mode (matches
       # production's CP-minted token configuration). Seeded value lets
       # E2E scripts authenticate without going through CP.
