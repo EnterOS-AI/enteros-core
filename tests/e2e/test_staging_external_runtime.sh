@@ -132,6 +132,10 @@ ORG_ID=$(echo "$CREATE_RESP" | python3 -c "import json,sys; print(json.load(sys.
 ok "Org created (id=$ORG_ID)"
 
 # ─── 2. Wait for tenant provisioning ────────────────────────────────────
+# Terminal status from /cp/admin/orgs is 'running' (org_instances.status),
+# NOT 'ready' — same field the full-saas harness polls. 'failed' surfaces
+# diagnostic dump and aborts. See test_staging_full_saas.sh step 2 for
+# the field-bugfix history (2026-04-21, last_error path).
 log "2/8 Waiting for tenant (up to ${PROVISION_TIMEOUT_SECS}s)..."
 DEADLINE=$(( $(date +%s) + PROVISION_TIMEOUT_SECS ))
 LAST_STATUS=""
@@ -146,18 +150,33 @@ d = json.load(sys.stdin)
 for o in d.get('orgs', []):
     if o.get('slug') == '$SLUG':
         print(o.get('instance_status', ''))
-        break
+        sys.exit(0)
+print('')
 " 2>/dev/null || echo "")
   if [ "$STATUS" != "$LAST_STATUS" ]; then
     log "   instance_status: $STATUS"
     LAST_STATUS="$STATUS"
   fi
-  if [ "$STATUS" = "ready" ]; then
-    break
-  fi
-  sleep 10
+  case "$STATUS" in
+    running) break ;;
+    failed)
+      log "── DIAGNOSTIC BURST (step 2 — tenant provisioning failed) ──"
+      echo "$LIST_JSON" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+for o in d.get('orgs', []):
+    if o.get('slug') == '$SLUG':
+        print(json.dumps(o, indent=2))
+        sys.exit(0)
+print('(no org row found for slug=$SLUG — DB drift?)')
+" 2>&1 | sed 's/^/  /'
+      log "── END DIAGNOSTIC ──"
+      fail "Tenant provisioning failed for $SLUG (see diagnostic above)"
+      ;;
+    *) sleep 15 ;;
+  esac
 done
-ok "Tenant ready"
+ok "Tenant provisioning complete"
 
 # Derive tenant URL the same way the full-saas harness does.
 CP_HOST=$(echo "$CP_URL" | sed -E 's#^https?://##; s#/.*$##')
