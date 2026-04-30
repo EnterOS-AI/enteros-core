@@ -93,6 +93,47 @@ def build_class_signature_record(cls: type) -> dict:
     return {"class": cls.__name__, "methods": methods}
 
 
+def build_module_functions_record(module: object, function_names: list[str] | None = None) -> dict:
+    """Snapshot a module's public top-level functions. By default, walks
+    every public callable defined IN the module (excludes re-exports
+    via __module__ check). Pass ``function_names`` explicitly to pin a
+    specific set when the module exports more than the contract surface
+    (e.g. internal helpers that intentionally aren't part of the gate).
+
+    Returns: ``{module: <name>, functions: [<sorted records>]}``
+    """
+    import types
+
+    fns: list[dict] = []
+    target_module = module.__name__
+
+    if function_names is not None:
+        for fn_name in sorted(function_names):
+            fn = getattr(module, fn_name, None)
+            if fn is None or not isinstance(fn, types.FunctionType):
+                # Caller asked for a name that isn't a function in the
+                # module — surface it as part of the snapshot so the
+                # error path stays in the failure-message-with-diff
+                # path rather than blowing up here.
+                fns.append({"name": fn_name, "missing": True})
+                continue
+            fns.append(_signature_record(fn_name, fn))
+    else:
+        for attr_name in sorted(vars(module)):
+            if attr_name.startswith("_"):
+                continue
+            attr = getattr(module, attr_name)
+            if not isinstance(attr, types.FunctionType):
+                continue
+            # Skip re-exports — only record functions defined IN this
+            # module so a `from foo import bar` doesn't pollute the
+            # snapshot.
+            if getattr(attr, "__module__", None) != target_module:
+                continue
+            fns.append(_signature_record(attr_name, attr))
+    return {"module": target_module, "functions": fns}
+
+
 def build_dataclass_record(cls: type) -> dict:
     """Snapshot a dataclass's field shape. Captures field name + type
     annotation + has_default per field, plus the @dataclass(frozen=...)
