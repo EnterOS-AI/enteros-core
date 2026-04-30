@@ -4,12 +4,13 @@ classifier + the diff/base-set logic that runs without git.
 The end-to-end git diff + gh pr list path is exercised manually (running
 the workflow against test PRs). These tests pin the pure-logic surface
 so a regression in migration-name parsing fails immediately at PR time.
+
+Run locally: ``python3 -m unittest scripts/ops/test_check_migration_collisions.py -v``
 """
 
 import importlib.util
+import unittest
 from pathlib import Path
-
-import pytest
 
 # Load the script as a module without invoking main(). We import the
 # regex + helpers directly so we can test them without setting up git.
@@ -19,7 +20,7 @@ ccm = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ccm)
 
 
-class TestMigrationFileRe:
+class TestMigrationFileRe(unittest.TestCase):
     """The regex classifier — the load-bearing piece of the detector."""
 
     def test_matches_standard_three_digit_prefix(self):
