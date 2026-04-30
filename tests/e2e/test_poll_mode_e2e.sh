@@ -22,12 +22,23 @@ PASS=0
 FAIL=0
 TIMEOUT="${A2A_TIMEOUT:-30}"
 
-# Per-run unique ids — same shape as test_2307_peer_visibility_staging.sh.
-# Date+pid keeps reruns isolated; trap cleans up the row at the end so
-# /workspaces lists don't accumulate test garbage on a long-lived dev DB.
-RUN_TAG="poll-e2e-$(date +%s)-$$"
-POLL_WS_ID="ws-${RUN_TAG}"
-CALLER_WS_ID="ws-caller-${RUN_TAG}"
+# Per-run unique ids — workspaces.id is a UUID column, so we generate
+# real v4 UUIDs. A "ws-<tag>" string fails the pq UUID cast and surfaces
+# as opaque "registration failed" (caught against this very test in CI
+# before merge — the failure mode that motivates the helper).
+gen_uuid() {
+  if command -v uuidgen >/dev/null 2>&1; then
+    uuidgen | tr '[:upper:]' '[:lower:]'
+  else
+    python3 -c 'import uuid; print(uuid.uuid4())'
+  fi
+}
+POLL_WS_ID="$(gen_uuid)"
+CALLER_WS_ID="$(gen_uuid)"
+# Phase 2 uses a separate UUID for its invalid-mode probe so a rerun
+# can't poison POLL_WS_ID's row with a bad upsert (the 400 path doesn't
+# touch DB, but defense in depth).
+INVALID_PROBE_ID="$(gen_uuid)"
 
 cleanup() {
   local rc=$?
@@ -117,7 +128,7 @@ echo "--- Phase 2: Invalid delivery_mode rejected ---"
 INVALID_RESP=$(curl -s -w '\n%{http_code}' -X POST "$BASE/registry/register" \
   -H "Content-Type: application/json" \
   -d "{
-    \"id\": \"${POLL_WS_ID}-bad\",
+    \"id\": \"$INVALID_PROBE_ID\",
     \"delivery_mode\": \"webhook\",
     \"agent_card\": {\"name\": \"bad\"}
   }")
