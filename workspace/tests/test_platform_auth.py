@@ -65,13 +65,34 @@ def test_save_token_rotation_overwrites(tmp_path):
     assert platform_auth.get_token() == "token-v2"
 
 
-def test_auth_headers_when_no_token_is_empty():
+def test_auth_headers_when_no_token_and_no_platform_is_empty(monkeypatch):
+    monkeypatch.delenv("PLATFORM_URL", raising=False)
     assert platform_auth.auth_headers() == {}
 
 
-def test_auth_headers_format():
+def test_auth_headers_when_no_token_includes_origin(monkeypatch):
+    """Origin must be set even without a token — the WAF gates ALL
+    requests to /workspaces and /registry, including pre-token bootstrap
+    register calls. Without Origin those would silently 404 from Next.js."""
+    monkeypatch.setenv("PLATFORM_URL", "https://tenant.moleculesai.app")
+    assert platform_auth.auth_headers() == {"Origin": "https://tenant.moleculesai.app"}
+
+
+def test_auth_headers_format(monkeypatch):
+    monkeypatch.delenv("PLATFORM_URL", raising=False)
     platform_auth.save_token("hello-world")
     assert platform_auth.auth_headers() == {"Authorization": "Bearer hello-world"}
+
+
+def test_auth_headers_includes_origin_when_platform_url_set(monkeypatch):
+    """Both Authorization and Origin land on the same dict so the
+    SaaS edge WAF accepts every workspace-runtime request."""
+    monkeypatch.setenv("PLATFORM_URL", "https://hongmingwang.moleculesai.app")
+    platform_auth.save_token("tok")
+    assert platform_auth.auth_headers() == {
+        "Authorization": "Bearer tok",
+        "Origin": "https://hongmingwang.moleculesai.app",
+    }
 
 
 def test_get_token_caches_after_first_disk_read(tmp_path, monkeypatch):
@@ -179,5 +200,6 @@ def test_env_token_caches_like_file_token(tmp_path, monkeypatch):
 def test_auth_headers_works_with_env_token(tmp_path, monkeypatch):
     """Header construction must use the env-fallback token, not silently
     return {} when no file exists."""
+    monkeypatch.delenv("PLATFORM_URL", raising=False)
     monkeypatch.setenv("MOLECULE_WORKSPACE_TOKEN", "external-bearer")
     assert platform_auth.auth_headers() == {"Authorization": "Bearer external-bearer"}

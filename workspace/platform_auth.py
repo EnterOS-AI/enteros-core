@@ -111,11 +111,26 @@ def auth_headers() -> dict[str, str]:
     """Return a header dict to merge into httpx calls. Empty if no token
     is available yet — callers send the request as-is and the platform's
     heartbeat handler grandfathers pre-token workspaces through until
-    their next /registry/register issues one."""
+    their next /registry/register issues one.
+
+    Always sets ``Origin`` to ``PLATFORM_URL`` when that env var is set.
+    On hosted SaaS deployments the tenant's edge WAF requires a same-
+    origin header — without it ``/workspaces/*`` and ``/registry/*/peers``
+    requests get silently rewritten to the canvas Next.js app, which has
+    no such routes and returns an empty 404. Inside-container calls are
+    unaffected (Docker-internal PLATFORM_URLs aren't behind the WAF).
+    Discovered while smoke-testing the molecule-mcp external-runtime
+    path against a live tenant — every tool call returned "not found"
+    because the WAF was eating them.
+    """
+    headers: dict[str, str] = {}
+    platform_url = os.environ.get("PLATFORM_URL", "").strip()
+    if platform_url:
+        headers["Origin"] = platform_url
     tok = get_token()
-    if not tok:
-        return {}
-    return {"Authorization": f"Bearer {tok}"}
+    if tok:
+        headers["Authorization"] = f"Bearer {tok}"
+    return headers
 
 
 def self_source_headers(workspace_id: str) -> dict[str, str]:
