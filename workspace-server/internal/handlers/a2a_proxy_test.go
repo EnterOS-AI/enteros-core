@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/Molecule-AI/molecule-monorepo/platform/internal/provisioner"
 	"github.com/gin-gonic/gin"
 )
 
@@ -241,6 +242,117 @@ func TestProxyA2A_AgentReturnsError(t *testing.T) {
 
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// TestProxyA2A_Upstream502_TriggersContainerDeadCheck — when the agent
+// tunnel returns 502 (the "tunnel up but no origin" failure mode that
+// surfaces a Cloudflare error page to canvas), proxyA2A must consult
+// IsRunning on cpProv. If the EC2 instance truly is dead, the response
+// becomes a structured 503 with restarting=true (not the upstream 502
+// which CF would mask), and the workspace flips to status='offline' so
+// the next reactive poll sees the right state. This is the
+// 2026-04-30 hongmingwang.moleculesai.app canvas-chat-to-dead-workspace
+// regression: upstream 502 was previously propagated as-is, CF masked
+// it, and no auto-restart fired.
+func TestProxyA2A_Upstream502_TriggersContainerDeadCheck(t *testing.T) {
+	mock := setupTestDB(t)
+	mr := setupTestRedis(t)
+	allowLoopbackForTest(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+	cp := &fakeCPProv{running: false}
+	handler.SetCPProvisioner(cp)
+
+	// Agent tunnel returns 502 with empty body — the CF "no-origin" shape.
+	agentServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer agentServer.Close()
+
+	mr.Set(fmt.Sprintf("ws:%s:url", "ws-tunnel-dead"), agentServer.URL)
+	expectBudgetCheck(mock, "ws-tunnel-dead")
+	// Activity log fires (delivery_confirmed is true on Do() success regardless
+	// of upstream status — handler's existing logA2ASuccess path runs first
+	// and logs as success because the dispatch did get a response).
+	mock.ExpectExec("INSERT INTO activity_logs").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	// maybeMarkContainerDead's runtime lookup, then the offline-flip UPDATE.
+	mock.ExpectQuery(`SELECT COALESCE\(runtime, 'langgraph'\) FROM workspaces WHERE id =`).
+		WithArgs("ws-tunnel-dead").
+		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("hermes"))
+	mock.ExpectExec(`UPDATE workspaces SET status = 'offline'`).
+		WithArgs("ws-tunnel-dead").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-tunnel-dead"}}
+	body := `{"method":"message/send","params":{"message":{"role":"user","parts":[{"text":"hi"}]}}}`
+	c.Request = httptest.NewRequest("POST", "/workspaces/ws-tunnel-dead/a2a", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.ProxyA2A(c)
+
+	time.Sleep(80 * time.Millisecond)
+
+	// Caller sees a structured 503 (NOT the upstream 502 which CF would mask).
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("upstream 502 should translate to 503 once cpProv reports dead; got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "restarting") {
+		t.Errorf("response body should mention restart trigger; got %s", w.Body.String())
+	}
+	if w.Header().Get("Retry-After") != "15" {
+		t.Errorf("Retry-After header should be 15 to throttle canvas-side retry loop; got %q", w.Header().Get("Retry-After"))
+	}
+	if cp.calls != 1 {
+		t.Errorf("cpProv.IsRunning must be consulted exactly once; got %d calls", cp.calls)
+	}
+}
+
+// TestProxyA2A_Upstream502_AliveAgent_PropagatesAsIs — the safety check:
+// if cpProv reports the EC2 IS running, the upstream 502 is propagated
+// as-is. Don't recycle a healthy agent on a transient hiccup — the agent
+// might have legitimately returned 502 (e.g. a downstream service it
+// called returned 502 and it forwarded). Net behavior matches pre-fix
+// for the alive-agent case.
+func TestProxyA2A_Upstream502_AliveAgent_PropagatesAsIs(t *testing.T) {
+	mock := setupTestDB(t)
+	mr := setupTestRedis(t)
+	allowLoopbackForTest(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+	cp := &fakeCPProv{running: true}
+	handler.SetCPProvisioner(cp)
+
+	agentServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		fmt.Fprint(w, `{"error":"downstream service returned 502"}`)
+	}))
+	defer agentServer.Close()
+
+	mr.Set(fmt.Sprintf("ws:%s:url", "ws-alive-502"), agentServer.URL)
+	expectBudgetCheck(mock, "ws-alive-502")
+	mock.ExpectExec("INSERT INTO activity_logs").WillReturnResult(sqlmock.NewResult(0, 1))
+	// IsRunning runtime lookup runs but no UPDATE follows (running=true).
+	mock.ExpectQuery(`SELECT COALESCE\(runtime, 'langgraph'\) FROM workspaces WHERE id =`).
+		WithArgs("ws-alive-502").
+		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("hermes"))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-alive-502"}}
+	body := `{"method":"message/send","params":{"message":{"role":"user","parts":[{"text":"hi"}]}}}`
+	c.Request = httptest.NewRequest("POST", "/workspaces/ws-alive-502/a2a", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.ProxyA2A(c)
+	time.Sleep(50 * time.Millisecond)
+
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("alive agent 502 should propagate as 502; got %d: %s", w.Code, w.Body.String())
 	}
 }
 
@@ -527,8 +639,8 @@ func TestProxyA2A_CallerIDDerivedFromBearer(t *testing.T) {
 	mr.Set(fmt.Sprintf("ws:%s:url", "ws-target"), agentServer.URL)
 
 	// 1. Bearer-derive lookup → returns ws-caller
-	mock.ExpectQuery(`SELECT t\.workspace_id\s+FROM workspace_auth_tokens t.*JOIN workspaces`).
-		WillReturnRows(sqlmock.NewRows([]string{"workspace_id"}).AddRow("ws-caller"))
+	mock.ExpectQuery(`SELECT t\.id, t\.workspace_id.*FROM workspace_auth_tokens t.*JOIN workspaces`).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "workspace_id"}).AddRow("tok-1", "ws-caller"))
 
 	// 2. validateCallerToken's HasAnyLiveToken / ValidateToken queries fall
 	//    through to fail-open (no expectations set) — same pattern as
@@ -654,7 +766,7 @@ func TestProxyA2A_BearerDeriveFailureFallsThrough(t *testing.T) {
 	// Bearer-derive lookup fails (no live row) — collapses to ErrInvalidToken
 	// inside WorkspaceFromToken; ProxyA2A swallows the error and proceeds with
 	// callerID="".
-	mock.ExpectQuery(`SELECT t\.workspace_id\s+FROM workspace_auth_tokens t.*JOIN workspaces`).
+	mock.ExpectQuery(`SELECT t\.id, t\.workspace_id.*FROM workspace_auth_tokens t.*JOIN workspaces`).
 		WillReturnError(sql.ErrNoRows)
 
 	expectBudgetCheck(mock, "ws-target")
@@ -803,6 +915,46 @@ func TestIsUpstreamBusyError(t *testing.T) {
 		got := isUpstreamBusyError(tc.err)
 		if got != tc.want {
 			t.Errorf("%s: isUpstreamBusyError(%v) = %v, want %v", tc.name, tc.err, got, tc.want)
+		}
+	}
+}
+
+// TestIsUpstreamDeadStatus locks in the status-code matrix that gates
+// reactive container-dead detection. Order matters: the helper exists so
+// the proxy + any future caller (e.g. a sweeper) classify CF dead-origin
+// codes the same way. Drift here would re-introduce the SaaS-blind bug
+// for whichever code we forgot.
+func TestIsUpstreamDeadStatus(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		want   bool
+	}{
+		// Standard proxy-layer dead-upstream codes
+		{"502 BadGateway", 502, true},
+		{"503 ServiceUnavailable", 503, true},
+		{"504 GatewayTimeout", 504, true},
+		// Cloudflare dead-origin family
+		{"521 WebServerDown", 521, true},
+		{"522 ConnectionTimedOut", 522, true},
+		{"523 OriginUnreachable", 523, true},
+		{"524 OriginTimedOut", 524, true},
+		// Negative cases — must NOT trigger restart
+		{"200 OK", 200, false},
+		{"400 BadRequest (agent rejected payload)", 400, false},
+		{"401 Unauthorized", 401, false},
+		{"404 NotFound (no such session)", 404, false},
+		{"408 RequestTimeout (client-side)", 408, false},
+		{"429 TooManyRequests (rate limited, agent alive)", 429, false},
+		{"500 InternalServerError (agent crashed mid-request)", 500, false},
+		{"501 NotImplemented", 501, false},
+		{"505 HTTPVersionNotSupported", 505, false},
+		{"520 WebServerReturnedUnknown (agent returned malformed)", 520, false},
+		{"525 SSLHandshakeFailed (TLS misconfig, not dead origin)", 525, false},
+	}
+	for _, tc := range cases {
+		if got := isUpstreamDeadStatus(tc.status); got != tc.want {
+			t.Errorf("%s: isUpstreamDeadStatus(%d) = %v, want %v", tc.name, tc.status, got, tc.want)
 		}
 	}
 }
@@ -1638,6 +1790,143 @@ func TestMaybeMarkContainerDead_NilProvisioner(t *testing.T) {
 	if got := handler.maybeMarkContainerDead(context.Background(), "ws-nilprov"); got {
 		t.Error("expected false when provisioner is nil")
 	}
+}
+
+// SaaS path: h.provisioner=nil but h.cpProv is wired and reports the EC2
+// instance is NOT running. maybeMarkContainerDead must consult cpProv,
+// flip the workspace to status='offline', clear keys, broadcast OFFLINE,
+// and return true so the caller surfaces the structured 503. Pre-fix
+// (#NNN) it returned false unconditionally on h.provisioner==nil, so
+// dead EC2 agents leaked upstream 502 to canvas with no recovery.
+func TestMaybeMarkContainerDead_CPOnly_NotRunning(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
+	cp := &fakeCPProv{running: false}
+	handler.SetCPProvisioner(cp)
+
+	mock.ExpectQuery(`SELECT COALESCE\(runtime, 'langgraph'\) FROM workspaces WHERE id =`).
+		WithArgs("ws-saas-dead").
+		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("hermes"))
+	mock.ExpectExec(`UPDATE workspaces SET status = 'offline'`).
+		WithArgs("ws-saas-dead").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	got := handler.maybeMarkContainerDead(context.Background(), "ws-saas-dead")
+	if !got {
+		t.Fatal("expected true (cpProv reports not running) — without cpProv consultation, SaaS dead-agent recovery is impossible")
+	}
+	if cp.calls != 1 {
+		t.Errorf("expected exactly 1 IsRunning call on cpProv; got %d", cp.calls)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// SaaS path: h.cpProv reports running=true → maybeMarkContainerDead must
+// return false (don't restart a healthy agent on a transient upstream
+// hiccup). This is the safety check that prevents over-eager recycling.
+func TestMaybeMarkContainerDead_CPOnly_Running(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
+	cp := &fakeCPProv{running: true}
+	handler.SetCPProvisioner(cp)
+
+	mock.ExpectQuery(`SELECT COALESCE\(runtime, 'langgraph'\) FROM workspaces WHERE id =`).
+		WithArgs("ws-saas-alive").
+		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("hermes"))
+
+	if got := handler.maybeMarkContainerDead(context.Background(), "ws-saas-alive"); got {
+		t.Error("expected false when cpProv reports running — must not recycle a healthy agent")
+	}
+	if cp.calls != 1 {
+		t.Errorf("expected exactly 1 IsRunning call on cpProv; got %d", cp.calls)
+	}
+}
+
+// SaaS-path runRestartCycle: when h.provisioner is nil and h.cpProv is set,
+// the auto-restart cycle MUST call cpProv.Stop (not Docker provisioner.Stop).
+// Pre-fix this dispatched only to h.provisioner.Stop, NPE'd on nil, was
+// silently swallowed by coalesceRestart's recover-without-re-raise, and
+// left the workspace stuck in status='provisioning' forever — making
+// reactive auto-restart on SaaS effectively dead code. The independent
+// review of PR #2362 caught this gap.
+//
+// We drive runRestartCycle directly (not via RestartByID/coalesceRestart)
+// so we don't fight the goroutine's timing in a unit test. The full
+// restart chain (provisionWorkspaceCP) needs its own mocked DB rows that
+// would explode the surface area of this test; what we care about here
+// is the dispatch decision, which is observable on cpProv.stopCalls.
+// stopForRestart is the dispatch helper extracted from runRestartCycle so the
+// branch logic can be tested without spawning the async sendRestartContext
+// goroutine that the full cycle fires. Pre-fix runRestartCycle's Stop dispatch
+// only called the Docker path, so on SaaS (h.provisioner=nil) the cycle NPE'd
+// silently and left the workspace stuck in status='provisioning'.
+func TestStopForRestart_SaaSPath_DispatchesViaCPProv(t *testing.T) {
+	setupTestRedis(t)
+	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
+	cp := &fakeCPProv{}
+	handler.SetCPProvisioner(cp)
+
+	handler.stopForRestart(context.Background(), "ws-saas-restart")
+
+	if cp.stopCalls != 1 {
+		t.Fatalf("expected cpProv.Stop to be called once on SaaS auto-restart; got %d", cp.stopCalls)
+	}
+	if cp.startCalls != 0 {
+		t.Fatalf("expected cpProv.Start NOT to be called by stopForRestart; got %d", cp.startCalls)
+	}
+}
+
+// Both nil → no-op, no panic, no DB / broadcast side effects. Guards the
+// dispatcher against being invoked on a misconfigured handler. Important
+// because runRestartCycle's surrounding flow (status='provisioning' UPDATE
+// + broadcast) MUST happen even when both provisioners are nil — but
+// stopForRestart itself is a pure dispatcher and shouldn't touch state.
+func TestStopForRestart_NoProvisioner_NoOp(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
+	// no provisioner, no cpProv, no DB expectations set on mock — any
+	// unexpected query/exec will produce a sqlmock error.
+	handler.stopForRestart(context.Background(), "ws-orphan")
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("stopForRestart no-provisioner path should not touch DB: %v", err)
+	}
+}
+
+// fakeCPProv satisfies provisioner.CPProvisionerAPI for tests that exercise
+// the SaaS / EC2-backed reactive-health path.
+//
+// Methods all record calls. Start/Stop/GetConsoleOutput return nil/empty by
+// default — the maybeMarkContainerDead happy path triggers an async
+// `go h.RestartByID(...)` which calls Stop, so the previous "panic on
+// unexpected call" pattern was unsafe (the panic fires on a goroutine,
+// after the assertions ran). Tests that want to ASSERT a method is unused
+// can check `calls == 0` after a sync barrier.
+type fakeCPProv struct {
+	running    bool
+	calls      int
+	stopCalls  int
+	startCalls int
+}
+
+func (f *fakeCPProv) Start(_ context.Context, _ provisioner.WorkspaceConfig) (string, error) {
+	f.startCalls++
+	return "", nil
+}
+func (f *fakeCPProv) Stop(_ context.Context, _ string) error {
+	f.stopCalls++
+	return nil
+}
+func (f *fakeCPProv) GetConsoleOutput(_ context.Context, _ string) (string, error) {
+	return "", nil
+}
+func (f *fakeCPProv) IsRunning(_ context.Context, _ string) (bool, error) {
+	f.calls++
+	return f.running, nil
 }
 
 // external runtime → false regardless of provisioner.

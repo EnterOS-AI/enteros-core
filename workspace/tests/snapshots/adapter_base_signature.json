@@ -1,0 +1,436 @@
+{
+  "class": "BaseAdapter",
+  "dataclasses": [
+    {
+      "fields": [
+        {
+          "annotation": "str",
+          "has_default": false,
+          "name": "system_prompt"
+        },
+        {
+          "annotation": "list",
+          "has_default": false,
+          "name": "loaded_skills"
+        },
+        {
+          "annotation": "list",
+          "has_default": false,
+          "name": "langchain_tools"
+        },
+        {
+          "annotation": "bool",
+          "has_default": false,
+          "name": "is_coordinator"
+        },
+        {
+          "annotation": "list",
+          "has_default": false,
+          "name": "children"
+        }
+      ],
+      "frozen": false,
+      "name": "SetupResult"
+    },
+    {
+      "fields": [
+        {
+          "annotation": "str",
+          "has_default": false,
+          "name": "model"
+        },
+        {
+          "annotation": "str | None",
+          "has_default": true,
+          "name": "system_prompt"
+        },
+        {
+          "annotation": "list[str]",
+          "has_default": true,
+          "name": "tools"
+        },
+        {
+          "annotation": "dict[str, typing.Any]",
+          "has_default": true,
+          "name": "runtime_config"
+        },
+        {
+          "annotation": "str",
+          "has_default": true,
+          "name": "config_path"
+        },
+        {
+          "annotation": "str",
+          "has_default": true,
+          "name": "workspace_id"
+        },
+        {
+          "annotation": "list[str]",
+          "has_default": true,
+          "name": "prompt_files"
+        },
+        {
+          "annotation": "int",
+          "has_default": true,
+          "name": "a2a_port"
+        },
+        {
+          "annotation": "Any",
+          "has_default": true,
+          "name": "heartbeat"
+        }
+      ],
+      "frozen": false,
+      "name": "AdapterConfig"
+    },
+    {
+      "fields": [
+        {
+          "annotation": "bool",
+          "has_default": true,
+          "name": "provides_native_heartbeat"
+        },
+        {
+          "annotation": "bool",
+          "has_default": true,
+          "name": "provides_native_scheduler"
+        },
+        {
+          "annotation": "bool",
+          "has_default": true,
+          "name": "provides_native_session"
+        },
+        {
+          "annotation": "bool",
+          "has_default": true,
+          "name": "provides_native_status_mgmt"
+        },
+        {
+          "annotation": "bool",
+          "has_default": true,
+          "name": "provides_native_retry"
+        },
+        {
+          "annotation": "bool",
+          "has_default": true,
+          "name": "provides_activity_decoration"
+        },
+        {
+          "annotation": "bool",
+          "has_default": true,
+          "name": "provides_channel_dispatch"
+        }
+      ],
+      "frozen": true,
+      "name": "RuntimeCapabilities"
+    }
+  ],
+  "methods": [
+    {
+      "is_abstract": false,
+      "is_async": false,
+      "name": "append_to_memory_hook",
+      "parameters": [
+        {
+          "annotation": "",
+          "has_default": false,
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "name": "self"
+        },
+        {
+          "annotation": "AdapterConfig",
+          "has_default": false,
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "name": "config"
+        },
+        {
+          "annotation": "str",
+          "has_default": false,
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "name": "filename"
+        },
+        {
+          "annotation": "str",
+          "has_default": false,
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "name": "content"
+        }
+      ],
+      "return_annotation": "None"
+    },
+    {
+      "is_abstract": false,
+      "is_async": false,
+      "name": "capabilities",
+      "parameters": [
+        {
+          "annotation": "",
+          "has_default": false,
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "name": "self"
+        }
+      ],
+      "return_annotation": "RuntimeCapabilities"
+    },
+    {
+      "is_abstract": true,
+      "is_async": true,
+      "name": "create_executor",
+      "parameters": [
+        {
+          "annotation": "",
+          "has_default": false,
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "name": "self"
+        },
+        {
+          "annotation": "AdapterConfig",
+          "has_default": false,
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "name": "config"
+        }
+      ],
+      "return_annotation": "AgentExecutor"
+    },
+    {
+      "is_abstract": true,
+      "is_async": false,
+      "name": "description",
+      "parameters": [],
+      "return_annotation": "str"
+    },
+    {
+      "is_abstract": true,
+      "is_async": false,
+      "name": "display_name",
+      "parameters": [],
+      "return_annotation": "str"
+    },
+    {
+      "is_abstract": false,
+      "is_async": false,
+      "name": "get_config_schema",
+      "parameters": [],
+      "return_annotation": "dict"
+    },
+    {
+      "is_abstract": false,
+      "is_async": false,
+      "name": "idle_timeout_override",
+      "parameters": [
+        {
+          "annotation": "",
+          "has_default": false,
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "name": "self"
+        }
+      ],
+      "return_annotation": "int | None"
+    },
+    {
+      "is_abstract": false,
+      "is_async": true,
+      "name": "inject_plugins",
+      "parameters": [
+        {
+          "annotation": "",
+          "has_default": false,
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "name": "self"
+        },
+        {
+          "annotation": "AdapterConfig",
+          "has_default": false,
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "name": "config"
+        },
+        {
+          "annotation": "",
+          "has_default": false,
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "name": "plugins"
+        }
+      ],
+      "return_annotation": "None"
+    },
+    {
+      "is_abstract": false,
+      "is_async": true,
+      "name": "install_plugins_via_registry",
+      "parameters": [
+        {
+          "annotation": "",
+          "has_default": false,
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "name": "self"
+        },
+        {
+          "annotation": "AdapterConfig",
+          "has_default": false,
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "name": "config"
+        },
+        {
+          "annotation": "",
+          "has_default": false,
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "name": "plugins"
+        }
+      ],
+      "return_annotation": "list"
+    },
+    {
+      "is_abstract": false,
+      "is_async": false,
+      "name": "memory_filename",
+      "parameters": [
+        {
+          "annotation": "",
+          "has_default": false,
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "name": "self"
+        }
+      ],
+      "return_annotation": "str"
+    },
+    {
+      "is_abstract": true,
+      "is_async": false,
+      "name": "name",
+      "parameters": [],
+      "return_annotation": "str"
+    },
+    {
+      "is_abstract": false,
+      "is_async": false,
+      "name": "pre_stop_state",
+      "parameters": [
+        {
+          "annotation": "",
+          "has_default": false,
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "name": "self"
+        }
+      ],
+      "return_annotation": "dict"
+    },
+    {
+      "is_abstract": false,
+      "is_async": false,
+      "name": "register_subagent_hook",
+      "parameters": [
+        {
+          "annotation": "",
+          "has_default": false,
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "name": "self"
+        },
+        {
+          "annotation": "str",
+          "has_default": false,
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "name": "name"
+        },
+        {
+          "annotation": "dict",
+          "has_default": false,
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "name": "spec"
+        }
+      ],
+      "return_annotation": "None"
+    },
+    {
+      "is_abstract": false,
+      "is_async": false,
+      "name": "register_tool_hook",
+      "parameters": [
+        {
+          "annotation": "",
+          "has_default": false,
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "name": "self"
+        },
+        {
+          "annotation": "str",
+          "has_default": false,
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "name": "name"
+        },
+        {
+          "annotation": "",
+          "has_default": false,
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "name": "fn"
+        }
+      ],
+      "return_annotation": "None"
+    },
+    {
+      "is_abstract": false,
+      "is_async": false,
+      "name": "restore_state",
+      "parameters": [
+        {
+          "annotation": "",
+          "has_default": false,
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "name": "self"
+        },
+        {
+          "annotation": "dict",
+          "has_default": false,
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "name": "snapshot"
+        }
+      ],
+      "return_annotation": "None"
+    },
+    {
+      "is_abstract": true,
+      "is_async": true,
+      "name": "setup",
+      "parameters": [
+        {
+          "annotation": "",
+          "has_default": false,
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "name": "self"
+        },
+        {
+          "annotation": "AdapterConfig",
+          "has_default": false,
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "name": "config"
+        }
+      ],
+      "return_annotation": "None"
+    },
+    {
+      "is_abstract": false,
+      "is_async": true,
+      "name": "transcript_lines",
+      "parameters": [
+        {
+          "annotation": "",
+          "has_default": false,
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "name": "self"
+        },
+        {
+          "annotation": "int",
+          "has_default": true,
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "name": "since"
+        },
+        {
+          "annotation": "int",
+          "has_default": true,
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "name": "limit"
+        }
+      ],
+      "return_annotation": "dict"
+    }
+  ]
+}
