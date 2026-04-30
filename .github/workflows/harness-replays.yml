@@ -116,6 +116,15 @@ jobs:
           echo "127.0.0.1 harness-tenant.localhost" | sudo tee -a /etc/hosts >/dev/null
           getent hosts harness-tenant.localhost
 
+      - name: Install Python deps for replays
+        # peer-discovery-404 (and future replays) eval Python against the
+        # running tenant — importing workspace/a2a_client.py pulls in
+        # httpx. tests/harness/requirements.txt holds just the HTTP-client
+        # surface to keep CI install fast (~3s) vs the full
+        # workspace/requirements.txt (~30s).
+        if: needs.detect-changes.outputs.run == 'true'
+        run: pip install -r tests/harness/requirements.txt
+
       - name: Run all replays against the harness
         # run-all-replays.sh: boot via up.sh → seed via seed.sh → run
         # every replays/*.sh → tear down via down.sh on EXIT (trap).
