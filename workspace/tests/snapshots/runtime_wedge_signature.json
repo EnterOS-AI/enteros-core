@@ -1,0 +1,40 @@
+{
+  "functions": [
+    {
+      "is_abstract": false,
+      "is_async": false,
+      "name": "clear_wedge",
+      "parameters": [],
+      "return_annotation": "None"
+    },
+    {
+      "is_abstract": false,
+      "is_async": false,
+      "name": "is_wedged",
+      "parameters": [],
+      "return_annotation": "bool"
+    },
+    {
+      "is_abstract": false,
+      "is_async": false,
+      "name": "mark_wedged",
+      "parameters": [
+        {
+          "annotation": "str",
+          "has_default": false,
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "name": "reason"
+        }
+      ],
+      "return_annotation": "None"
+    },
+    {
+      "is_abstract": false,
+      "is_async": false,
+      "name": "wedge_reason",
+      "parameters": [],
+      "return_annotation": "str"
+    }
+  ],
+  "module": "runtime_wedge"
+}
