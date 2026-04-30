@@ -31,31 +31,32 @@ import (
 	"github.com/Molecule-AI/molecule-monorepo/platform/internal/provisioner"
 )
 
-// provisionFunctions are the set of functions that provision a
-// workspace and therefore MUST call mintWorkspaceSecrets. Detected
-// by name match (handler-method pattern); add a new entry whenever
-// a new provision path is introduced.
-var provisionFunctions = map[string]bool{
-	"provisionWorkspace":     true,
-	"provisionWorkspaceOpts": true,
-	"provisionWorkspaceCP":   true,
-}
-
-// provisionExemptFunctions are functions whose name pattern matches
-// the provision-function set but legitimately don't call
-// mintWorkspaceSecrets (e.g., the wrapper provisionWorkspace which
-// delegates to provisionWorkspaceOpts — the actual mint happens in
-// the delegate, not the wrapper).
+// provisionExemptFunctions are functions that call a provision-start
+// method but legitimately do NOT need to mint (e.g. the wrapper
+// `provisionWorkspace` which delegates — the delegate mints; the
+// re-spawn loops inside Restart that re-enter provisionWorkspaceOpts).
+// Add an entry only with a one-line justification.
 var provisionExemptFunctions = map[string]string{
 	"provisionWorkspace": "thin wrapper that delegates to provisionWorkspaceOpts; the delegate mints",
 }
 
 // TestProvisionFunctions_AllCallMintWorkspaceSecrets asserts every
-// non-exempt provision function in this package calls
-// mintWorkspaceSecrets at least once in its body.
+// function in this package that triggers a workspace provision (i.e.
+// calls h.provisioner.Start or h.cpProv.Start) ALSO calls
+// mintWorkspaceSecrets at least once in the same body.
 //
-// The check is presence-in-function, not pairing-by-line — same
-// rationale as the audit-coverage gate from #335.
+// Behavior-based — drift-resistant. A future provision function with
+// any name still trips this gate as long as it calls one of the
+// provisioner Start methods. This replaces an earlier name-list
+// version (PR #2366) that missed TeamHandler.Expand (issue #2367) —
+// the bug that motivated the upgrade.
+//
+// Same shape as the audit-coverage gate from #335 (#2343 PR-5).
+//
+// If this test fails: either add mintWorkspaceSecrets to the
+// offending function (preferred — usually you should delegate to
+// provisionWorkspace via h.wh), OR add it to provisionExemptFunctions
+// with a one-line justification.
 func TestProvisionFunctions_AllCallMintWorkspaceSecrets(t *testing.T) {
 	t.Parallel()
 
@@ -87,10 +88,10 @@ func TestProvisionFunctions_AllCallMintWorkspaceSecrets(t *testing.T) {
 			if !ok || fn.Body == nil {
 				continue
 			}
-			if !provisionFunctions[fn.Name.Name] {
+			if _, exempt := provisionExemptFunctions[fn.Name.Name]; exempt {
 				continue
 			}
-			if _, exempt := provisionExemptFunctions[fn.Name.Name]; exempt {
+			if !callsProvisionStart(fn.Body) {
 				continue
 			}
 			if !callsMintWorkspaceSecrets(fn.Body) {
@@ -105,10 +106,48 @@ func TestProvisionFunctions_AllCallMintWorkspaceSecrets(t *testing.T) {
 
 	for _, v := range violations {
 		t.Errorf(
-			"%s:%d %s does not call mintWorkspaceSecrets — every provision path MUST mint auth_token + platform_inbound_secret. If audit is genuinely impossible here, add %q to provisionExemptFunctions in workspace_provision_shared_test.go with a justification.",
+			"%s:%d %s calls a provisioner Start (h.provisioner.Start or h.cpProv.Start) but does not call mintWorkspaceSecrets — every provision path MUST mint auth_token + platform_inbound_secret. Prefer delegating to h.wh.provisionWorkspace; only add %q to provisionExemptFunctions with a one-line justification if mint is genuinely inappropriate.",
 			v.file, v.line, v.fn, v.fn,
 		)
 	}
+}
+
+// callsProvisionStart reports whether the function body invokes a
+// provisioner-start method. Matches `<x>.provisioner.Start(...)` and
+// `<x>.cpProv.Start(...)` — both look like
+// `<recv>.<provField>.Start(...)` in the AST. Filtering on the
+// provisioner-field name (`provisioner` or `cpProv`) keeps the gate
+// from tripping on unrelated `.Start()` calls (e.g. http.Server.Start
+// in the same package).
+func callsProvisionStart(body *ast.BlockStmt) bool {
+	found := false
+	ast.Inspect(body, func(n ast.Node) bool {
+		if found {
+			return false
+		}
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		if sel.Sel.Name != "Start" {
+			return true
+		}
+		inner, ok := sel.X.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		switch inner.Sel.Name {
+		case "provisioner", "cpProv":
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
 }
 
 // callsMintWorkspaceSecrets walks the function body and reports

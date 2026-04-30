@@ -99,6 +99,14 @@ func (h *WorkspaceHandler) prepareProvisionContext(
 	if payload.Role != "" {
 		envVars["MOLECULE_AGENT_ROLE"] = payload.Role
 	}
+	// PARENT_ID is consumed by workspace/coordinator.py to track the
+	// parent-child relationship at runtime. Sourced from payload so
+	// every provision path that knows about a parent (currently:
+	// TeamHandler.Expand) injects it without having to thread env
+	// through provisioner.WorkspaceConfig manually.
+	if payload.ParentID != nil && *payload.ParentID != "" {
+		envVars["PARENT_ID"] = *payload.ParentID
+	}
 
 	// Plugin extension point: env mutators run AFTER built-in identity
 	// injection so plugins can override or augment identity vars.

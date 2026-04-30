@@ -1,7 +1,6 @@
 package handlers
 
 import (
-	"context"
 	"database/sql"
 	"encoding/json"
 	"log"
@@ -11,23 +10,32 @@ import (
 
 	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
 	"github.com/Molecule-AI/molecule-monorepo/platform/internal/events"
+	"github.com/Molecule-AI/molecule-monorepo/platform/internal/models"
 	"github.com/Molecule-AI/molecule-monorepo/platform/internal/provisioner"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"gopkg.in/yaml.v3"
 )
 
+// TeamHandler delegates child-workspace provisioning to wh so child
+// workspaces go through the same prepare/mint/preflight pipeline that
+// every other provision path uses. Pre-fix (issue #2367): Expand
+// directly invoked h.provisioner.Start which skipped mintWorkspaceSecrets,
+// leaving every team-expanded child with NULL platform_inbound_secret +
+// NULL auth_token — same drift class as the SaaS bug fixed in #2366.
 type TeamHandler struct {
 	broadcaster *events.Broadcaster
 	provisioner *provisioner.Provisioner
+	wh          *WorkspaceHandler
 	platformURL string
 	configsDir  string
 }
 
-func NewTeamHandler(b *events.Broadcaster, p *provisioner.Provisioner, platformURL, configsDir string) *TeamHandler {
+func NewTeamHandler(b *events.Broadcaster, p *provisioner.Provisioner, wh *WorkspaceHandler, platformURL, configsDir string) *TeamHandler {
 	return &TeamHandler{
 		broadcaster: b,
 		provisioner: p,
+		wh:          wh,
 		platformURL: platformURL,
 		configsDir:  configsDir,
 	}
@@ -116,26 +124,25 @@ func (h *TeamHandler) Expand(c *gin.Context) {
 			"parent_id": parentID,
 		})
 
-		// Provision if template exists
-		if h.provisioner != nil && sub.Config != "" {
+		// Delegate child-workspace provisioning to the shared
+		// provision pipeline. Issue #2367: previously Expand called
+		// h.provisioner.Start directly, bypassing mintWorkspaceSecrets
+		// and every other preflight (secrets, env mutators, identity
+		// injection, missing-env). That left every child with NULL
+		// platform_inbound_secret and never-issued auth_token. Now
+		// children go through the same provisionWorkspace path as
+		// Create/Restart, so adding a future provision-time step
+		// automatically covers Expand too.
+		if h.wh != nil && sub.Config != "" {
 			templatePath := filepath.Join(h.configsDir, sub.Config)
 			if _, err := os.Stat(templatePath); err == nil {
-				pluginsPath, _ := filepath.Abs(filepath.Join(h.configsDir, "..", "plugins"))
-				go func(wID, tPath, pPath string, t int) {
-					provCtx, cancel := context.WithTimeout(context.Background(), provisioner.ProvisionTimeout)
-					defer cancel()
-					cfg := provisioner.WorkspaceConfig{
-						WorkspaceID:  wID,
-						TemplatePath: tPath,
-						PluginsPath:  pPath,
-						Tier:         t,
-						EnvVars:      map[string]string{"PARENT_ID": parentID},
-						PlatformURL:  h.platformURL,
-					}
-					if _, err := h.provisioner.Start(provCtx, cfg); err != nil {
-						log.Printf("Expand: provision failed for %s: %v", wID, err)
-					}
-				}(childID, templatePath, pluginsPath, tier)
+				parent := parentID // copy for closure
+				go h.wh.provisionWorkspace(childID, templatePath, nil, models.CreateWorkspacePayload{
+					Name:     childName,
+					Role:     sub.Role,
+					Tier:     tier,
+					ParentID: &parent,
+				})
 			}
 		}
 
