@@ -181,6 +181,35 @@ func isUpstreamBusyError(err error) bool {
 		strings.Contains(msg, "connection reset")
 }
 
+// isUpstreamDeadStatus returns true when the upstream HTTP status indicates
+// the workspace agent is unreachable / unresponsive at the network layer
+// (vs an agent-authored 5xx with a real body). Used by the proxy to gate
+// reactive container-dead detection + auto-restart.
+//
+//   - 502 Bad Gateway, 503 Service Unavailable, 504 Gateway Timeout: standard
+//     proxy-layer "upstream is broken" codes (Cloudflare, ELB, agent tunnel).
+//   - 521 Web Server Is Down: Cloudflare can't open TCP to origin (most
+//     direct dead-EC2 signal).
+//   - 522 Connection Timed Out: Cloudflare opened TCP but no response within
+//     ~15s — typical of SG/NACL flap or agent process hung.
+//   - 523 Origin Is Unreachable: Cloudflare can't route to origin (DNS or
+//     network-path failure).
+//   - 524 A Timeout Occurred: TCP succeeded, but origin didn't return
+//     headers within ~100s — agent process alive but wedged.
+//
+// We always probe IsRunning before acting, so a transient false positive
+// from this set just costs one CP API call.
+func isUpstreamDeadStatus(status int) bool {
+	switch status {
+	case http.StatusBadGateway, // 502
+		http.StatusServiceUnavailable, // 503
+		http.StatusGatewayTimeout,     // 504
+		521, 522, 523, 524:            // CF dead-origin family
+		return true
+	}
+	return false
+}
+
 func (e *proxyA2AError) Error() string {
 	if e == nil || e.Response == nil {
 		return "proxy a2a error"
@@ -484,15 +513,7 @@ func (h *WorkspaceHandler) proxyA2ARequest(ctx context.Context, workspaceID stri
 		// error body. We probe IsRunning regardless (it's the
 		// authoritative check) but the empty-body case is what makes
 		// this fix necessary.
-		// 524 = Cloudflare "origin timed out" — origin accepted the
-		// connection but didn't return headers within ~100s. Same
-		// signal as 504/502 for our purposes: the upstream agent is
-		// not responsive. We probe IsRunning to confirm before
-		// triggering a restart.
-		if resp.StatusCode == http.StatusBadGateway ||
-			resp.StatusCode == http.StatusServiceUnavailable ||
-			resp.StatusCode == http.StatusGatewayTimeout ||
-			resp.StatusCode == 524 {
+		if isUpstreamDeadStatus(resp.StatusCode) {
 			if h.maybeMarkContainerDead(ctx, workspaceID) {
 				return 0, nil, &proxyA2AError{
 					Status:   http.StatusServiceUnavailable,
