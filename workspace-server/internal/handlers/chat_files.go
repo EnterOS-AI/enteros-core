@@ -192,13 +192,35 @@ func (h *ChatFilesHandler) Upload(c *gin.Context) {
 	secret, err := wsauth.ReadPlatformInboundSecret(ctx, db.DB, workspaceID)
 	if err != nil {
 		if errors.Is(err, wsauth.ErrNoInboundSecret) {
-			// Workspace predates migration 044 OR the provisioner's
-			// secret-mint hop failed. Both are operational issues,
-			// not user errors. Log loudly so ops can backfill.
-			log.Printf("chat_files Upload: no platform_inbound_secret for %s — workspace needs reprovision (#2312)", workspaceID)
+			// Lazy-heal: mint the secret now so future requests
+			// succeed. Pre-2026-04-30 the SaaS provision path didn't
+			// mint — every prod workspace started life with a NULL
+			// inbound secret. The shared-mint refactor closes the
+			// new-workspace gap; this lazy-heal closes the existing-
+			// workspace gap without requiring a destructive
+			// reprovision.
+			//
+			// Why the request still 503s: the workspace's local
+			// /configs/.platform_inbound_secret is also empty until
+			// the next /registry/register response (registry.go:344-
+			// 362) propagates the freshly-minted secret. The user
+			// needs to retry once the workspace's heartbeat picks up
+			// the new secret (typically <30s).
+			minted, mintErr := wsauth.IssuePlatformInboundSecret(ctx, db.DB, workspaceID)
+			if mintErr != nil {
+				log.Printf("chat_files Upload: lazy-heal mint failed for %s: %v", workspaceID, mintErr)
+				c.JSON(http.StatusServiceUnavailable, gin.H{
+					"error":  "workspace not yet enrolled in v2 upload (RFC #2312)",
+					"detail": "Failed to mint inbound secret. Reprovision the workspace if this persists.",
+				})
+				return
+			}
+			_ = minted // platform now has it; workspace picks up next heartbeat
+			log.Printf("chat_files Upload: lazy-healed platform_inbound_secret for %s — retry once workspace re-registers (#2312 backfill)", workspaceID)
 			c.JSON(http.StatusServiceUnavailable, gin.H{
-				"error":  "workspace not yet enrolled in v2 upload (RFC #2312)",
-				"detail": "Reprovisioning the workspace will mint the platform_inbound_secret it's missing.",
+				"error":  "workspace re-registering — please retry in 30 seconds",
+				"detail": "Inbound secret was just minted. Workspace will pick it up on its next heartbeat.",
+				"retry_after_seconds": 30,
 			})
 			return
 		}
@@ -324,10 +346,25 @@ func (h *ChatFilesHandler) Download(c *gin.Context) {
 	secret, err := wsauth.ReadPlatformInboundSecret(ctx, db.DB, workspaceID)
 	if err != nil {
 		if errors.Is(err, wsauth.ErrNoInboundSecret) {
-			log.Printf("chat_files Download: no platform_inbound_secret for %s — workspace needs reprovision (#2312)", workspaceID)
+			// Lazy-heal — same shape as the upload handler. Mint the
+			// secret now; workspace picks it up on next heartbeat.
+			// User retries in ~30s. See chat_files.go Upload handler
+			// for full rationale.
+			minted, mintErr := wsauth.IssuePlatformInboundSecret(ctx, db.DB, workspaceID)
+			if mintErr != nil {
+				log.Printf("chat_files Download: lazy-heal mint failed for %s: %v", workspaceID, mintErr)
+				c.JSON(http.StatusServiceUnavailable, gin.H{
+					"error":  "workspace not yet enrolled in v2 download (RFC #2312)",
+					"detail": "Failed to mint inbound secret. Reprovision the workspace if this persists.",
+				})
+				return
+			}
+			_ = minted
+			log.Printf("chat_files Download: lazy-healed platform_inbound_secret for %s — retry once workspace re-registers (#2312 backfill)", workspaceID)
 			c.JSON(http.StatusServiceUnavailable, gin.H{
-				"error":  "workspace not yet enrolled in v2 download (RFC #2312)",
-				"detail": "Reprovisioning the workspace will mint the platform_inbound_secret it's missing.",
+				"error":  "workspace re-registering — please retry in 30 seconds",
+				"detail": "Inbound secret was just minted. Workspace will pick it up on its next heartbeat.",
+				"retry_after_seconds": 30,
 			})
 			return
 		}
