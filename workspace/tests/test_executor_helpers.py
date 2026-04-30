@@ -937,3 +937,89 @@ def test_collect_outbound_files_deduplicates(tmp_path, monkeypatch):
     reply = f"Wrote {report}. Again at {report}."
     out = collect_outbound_files(reply)
     assert len(out) == 1
+
+
+# ============================================================================
+# new_response_message — A2A v1 protobuf Message envelope with task/context
+# correlation. Replaces ad-hoc per-template Message construction so every
+# adapter response threads task_id/context_id back to the platform.
+# ============================================================================
+
+
+def test_new_response_message_text_only():
+    """Text-only response sets one text Part; role=ROLE_AGENT;
+    task_id/context_id passed through from context."""
+    from executor_helpers import new_response_message
+    from a2a.types import Role
+
+    ctx = SimpleNamespace(task_id="task-abc", context_id="ctx-xyz")
+    msg = new_response_message(ctx, "hello world")
+
+    assert msg.role == Role.ROLE_AGENT
+    assert msg.task_id == "task-abc"
+    assert msg.context_id == "ctx-xyz"
+    assert len(msg.parts) == 1
+    assert msg.parts[0].text == "hello world"
+    # message_id should be a 32-char hex (uuid4().hex)
+    assert len(msg.message_id) == 32
+
+
+def test_new_response_message_with_files():
+    """Files become file Parts with workspace: URI scheme, filename,
+    media_type. Text Part comes first when text is non-empty."""
+    from executor_helpers import new_response_message
+
+    ctx = SimpleNamespace(task_id="t", context_id="c")
+    files = [
+        {"path": "/workspace/.molecule/chat-uploads/a.png", "name": "a.png", "mime_type": "image/png"},
+        {"path": "/workspace/.molecule/chat-uploads/b.txt", "name": "b.txt", "mime_type": "text/plain"},
+    ]
+    msg = new_response_message(ctx, "see attachments", files=files)
+
+    assert len(msg.parts) == 3  # 1 text + 2 file parts
+    assert msg.parts[0].text == "see attachments"
+    assert msg.parts[1].url == "workspace:/workspace/.molecule/chat-uploads/a.png"
+    assert msg.parts[1].filename == "a.png"
+    assert msg.parts[1].media_type == "image/png"
+    assert msg.parts[2].url == "workspace:/workspace/.molecule/chat-uploads/b.txt"
+
+
+def test_new_response_message_files_only_no_text():
+    """Empty text omits the text Part — useful when replying with files only."""
+    from executor_helpers import new_response_message
+
+    ctx = SimpleNamespace(task_id="t", context_id="c")
+    files = [{"path": "/x.txt", "name": "x.txt", "mime_type": "text/plain"}]
+    msg = new_response_message(ctx, "", files=files)
+
+    assert len(msg.parts) == 1
+    assert msg.parts[0].url == "workspace:/x.txt"
+
+
+def test_new_response_message_falls_back_when_context_ids_unset():
+    """RequestContextBuilder always populates task_id/context_id in
+    production, but unit tests + edge cases may have None. Helper falls
+    back to fresh UUIDs so the resulting Message is still well-formed."""
+    from executor_helpers import new_response_message
+
+    ctx = SimpleNamespace(task_id=None, context_id=None)
+    msg = new_response_message(ctx, "hi")
+
+    # Both should be 32-char hex UUIDs (fallback path)
+    assert len(msg.task_id) == 32
+    assert len(msg.context_id) == 32
+    # And they should be DIFFERENT (not accidentally the same uuid)
+    assert msg.task_id != msg.context_id
+
+
+def test_new_response_message_handles_missing_attrs():
+    """getattr with default — context object lacking task_id/context_id
+    attributes entirely (not just None) still works."""
+    from executor_helpers import new_response_message
+
+    class BareContext:
+        pass
+
+    msg = new_response_message(BareContext(), "hi")
+    assert len(msg.task_id) == 32  # fallback uuid
+    assert len(msg.context_id) == 32

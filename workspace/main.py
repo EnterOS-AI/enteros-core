@@ -310,6 +310,17 @@ async def main():  # pragma: no cover
                         from platform_auth import save_token
                         save_token(tok)
                         print(f"Saved workspace auth token (prefix={tok[:8]}…)")
+                    # RFC #2312 PR-F: persist platform_inbound_secret if the
+                    # platform supplied one. Idempotent — writing the same
+                    # value over an existing file is harmless. Required for
+                    # SaaS where there's no persistent /configs volume; on
+                    # Docker mode it overwrites the value the provisioner
+                    # already wrote at workspace creation.
+                    inbound = body.get("platform_inbound_secret")
+                    if inbound:
+                        from platform_inbound_auth import save_inbound_secret
+                        save_inbound_secret(inbound)
+                        print(f"Saved platform_inbound_secret (prefix={inbound[:8]}…)")
                 except Exception as parse_exc:
                     print(f"Warning: couldn't parse register response for token: {parse_exc}")
         except Exception as e:
@@ -413,6 +424,23 @@ async def main():  # pragma: no cover
         return JSONResponse(result)
 
     starlette_app.add_route("/transcript", _transcript_handler, methods=["GET"])
+
+    # /internal/* — platform→workspace forward calls (RFC #2312). Auth
+    # is the per-workspace platform_inbound_secret in
+    # /configs/.platform_inbound_secret, distinct from the outbound
+    # workspace_auth_token used by /transcript above.
+    from internal_chat_uploads import ingest_handler as _internal_chat_uploads_ingest
+    starlette_app.add_route(
+        "/internal/chat/uploads/ingest",
+        _internal_chat_uploads_ingest,
+        methods=["POST"],
+    )
+    from internal_file_read import file_read_handler as _internal_file_read
+    starlette_app.add_route(
+        "/internal/file/read",
+        _internal_file_read,
+        methods=["GET"],
+    )
 
     built_app = make_trace_middleware(starlette_app)
 

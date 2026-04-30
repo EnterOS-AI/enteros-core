@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"log"
 	"net/http"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -14,8 +15,33 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// restartMu prevents concurrent RestartByID calls for the same workspace
-var restartMu sync.Map // map[workspaceID]*sync.Mutex
+// restartState coalesces concurrent RestartByID calls for one workspace.
+//
+// The naive "one mutex per workspace, TryLock+drop" pattern caused a real
+// data-loss bug: SetSecret + SetModel both fire `go restartFunc(...)` from
+// the HTTP handler, and both writes commit before either restart goroutine
+// gets to load workspace_secrets. If the second goroutine arrives while the
+// first holds the mutex, TryLock returns false and the second is silently
+// skipped. The first goroutine's loadWorkspaceSecrets ran before the second
+// write committed, so the new container boots without that env var. Surfaced
+// as the "No LLM provider configured" hermes error when MODEL_PROVIDER landed
+// after the API-key write but lost its restart to the mutex.
+//
+// The fix is the pending-flag / coalescing pattern: any restart request that
+// arrives while one is in flight sets the pending flag and returns. The
+// in-flight runner, on completion, checks the flag and runs another cycle.
+// This collapses N concurrent requests into at most 2 sequential restarts
+// (the current one + one more that picks up everything written during it),
+// while guaranteeing the final container always sees the latest secrets.
+type restartState struct {
+	mu      sync.Mutex
+	running bool // true while a restart cycle is in flight
+	pending bool // set by any caller that arrived during the in-flight cycle
+}
+
+// restartStates is a per-workspace map of *restartState. Each workspace gets
+// its own entry so unrelated workspaces don't serialize on each other.
+var restartStates sync.Map // map[workspaceID]*restartState
 
 // isParentPaused checks if any ancestor of the workspace is paused.
 func isParentPaused(ctx context.Context, workspaceID string) (bool, string) {
@@ -294,21 +320,83 @@ func (h *WorkspaceHandler) HibernateWorkspace(ctx context.Context, workspaceID s
 	log.Printf("Hibernate: workspace %s (%s) is now hibernated", wsName, workspaceID)
 }
 
-// RestartByID restarts a workspace by ID — for programmatic use (e.g., auto-restart after secret change).
+// RestartByID restarts a workspace by ID — for programmatic use (e.g.,
+// auto-restart after secret change). Calls that arrive while one is in flight
+// are coalesced via the pending-flag pattern (see restartState above): the
+// in-flight runner picks up the pending request after its current cycle
+// completes, so writes that committed mid-restart are guaranteed to land.
 func (h *WorkspaceHandler) RestartByID(workspaceID string) {
 	if h.provisioner == nil {
 		return
 	}
+	coalesceRestart(workspaceID, func() { h.runRestartCycle(workspaceID) })
+}
 
-	// Per-workspace mutex — skip if already restarting (last-write-wins)
-	mu, _ := restartMu.LoadOrStore(workspaceID, &sync.Mutex{})
-	wsMu := mu.(*sync.Mutex)
-	if !wsMu.TryLock() {
-		log.Printf("Auto-restart: skipping %s — restart already in progress", workspaceID)
+// coalesceRestart implements the pending-flag gate around an arbitrary cycle
+// function. Extracted from RestartByID for direct unit testing — the cycle
+// function in production is `runRestartCycle`, but tests pass a counter to
+// verify the coalescing math (N concurrent requests → ≤2 cycles).
+func coalesceRestart(workspaceID string, cycle func()) {
+	sv, _ := restartStates.LoadOrStore(workspaceID, &restartState{})
+	state := sv.(*restartState)
+
+	// Mark a restart as wanted. If one is already running, return — that
+	// runner will see pending=true on its next loop iteration and run
+	// another cycle that picks up our request's effects. NOT dropped.
+	state.mu.Lock()
+	state.pending = true
+	if state.running {
+		state.mu.Unlock()
+		log.Printf("Auto-restart: %s — coalescing with in-flight cycle (pending=true)", workspaceID)
 		return
 	}
-	defer wsMu.Unlock()
+	state.running = true
+	state.mu.Unlock()
 
+	// Always clear running on exit — including panic — so a panicking
+	// cycle (e.g. a future provisionWorkspace nil-deref) doesn't leave
+	// the workspace permanently locked out of restarts.
+	//
+	// recover()-and-DON'T-re-raise on purpose: this runs in a goroutine
+	// (callers are `go h.RestartByID(...)`); an unrecovered panic in a
+	// goroutine crashes the whole platform process, taking down every
+	// workspace served by this binary because of one bug in cycle for
+	// one workspace. Log the panic with stack trace for debuggability,
+	// then recover and let the goroutine exit cleanly. The next restart
+	// request for this workspace will see running=false and proceed.
+	defer func() {
+		state.mu.Lock()
+		state.running = false
+		state.mu.Unlock()
+		if r := recover(); r != nil {
+			log.Printf("Auto-restart: %s — cycle panicked, restart-state cleared: %v\n%s",
+				workspaceID, r, debug.Stack())
+		}
+	}()
+
+	// Drain pending requests. Each iteration re-loads workspace_secrets
+	// inside provisionWorkspace, so any writes that committed since the
+	// last cycle are picked up. Continues until no pending request was
+	// observed at the top of an iteration.
+	for {
+		state.mu.Lock()
+		if !state.pending {
+			state.mu.Unlock()
+			return // defer clears running
+		}
+		state.pending = false
+		state.mu.Unlock()
+
+		cycle()
+	}
+}
+
+// runRestartCycle does the actual stop+provision work for one restart
+// iteration. Synchronous (waits for provisionWorkspace to complete) so the
+// outer pending-flag loop in RestartByID can correctly coalesce — if this
+// returned before the new container was up, the loop would race the
+// in-progress provision goroutine on the next iteration's Stop call.
+func (h *WorkspaceHandler) runRestartCycle(workspaceID string) {
 	ctx := context.Background()
 
 	var wsName, status, dbRuntime string
@@ -354,7 +442,12 @@ func (h *WorkspaceHandler) RestartByID(workspaceID string) {
 	restartData := loadRestartContextData(ctx, workspaceID)
 
 	// On auto-restart, do NOT re-apply templates — preserve existing config volume.
-	go h.provisionWorkspace(workspaceID, "", nil, payload)
+	// SYNCHRONOUS provisionWorkspace: returns when the new container is up
+	// (or has failed). The outer loop relies on this to know when it's safe
+	// to start another restart cycle without racing this one's Stop call.
+	h.provisionWorkspace(workspaceID, "", nil, payload)
+	// sendRestartContext is a one-way notification to the new container; safe
+	// to fire async — the next restart cycle won't depend on it completing.
 	go h.sendRestartContext(workspaceID, restartData)
 }
 

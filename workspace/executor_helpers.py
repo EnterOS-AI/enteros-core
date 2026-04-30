@@ -26,6 +26,7 @@ import logging
 import mimetypes
 import os
 import re
+import shutil
 import subprocess
 import uuid as _uuid
 from pathlib import Path
@@ -513,9 +514,16 @@ def sanitize_agent_error(
 # Auto-push hook — push unpushed commits and open PR after task completion
 # ========================================================================
 
-# Git/gh wrappers at /usr/local/bin have GH_TOKEN baked in.
-_GIT = "/usr/local/bin/git"
-_GH = "/usr/local/bin/gh"
+# Resolve git/gh from PATH so the runtime works regardless of which
+# image the workspace is on. Some templates ship a /usr/local/bin/{git,gh}
+# wrapper with GH_TOKEN baked in (preferred — picks up auth automatically);
+# other templates have plain /usr/bin/git installed by apt. Hardcoding
+# /usr/local/bin/git crashed every auto-push attempt on the latter image
+# class with `FileNotFoundError: '/usr/local/bin/git'` (issue #2289).
+# `shutil.which` finds the wrapper first if it's earlier in PATH, so the
+# GH_TOKEN injection still wins where it exists.
+_GIT = shutil.which("git") or "/usr/bin/git"
+_GH = shutil.which("gh") or "/usr/bin/gh"
 _PROTECTED_BRANCHES = frozenset({"staging", "main", "master"})
 
 
@@ -933,3 +941,60 @@ def collect_outbound_files(reply_text: str) -> list[dict[str, str]]:
         if staged is not None:
             out.append(staged)
     return out
+
+
+def new_response_message(
+    context: Any,
+    text: str = "",
+    files: list[dict[str, str]] | None = None,
+) -> Any:
+    """Build an A2A v1 protobuf response Message with task/context correlation.
+
+    Adapter executors should use this instead of ``a2a.helpers.new_text_message``
+    (which omits ``task_id`` / ``context_id``) so the platform's a2a proxy can
+    reliably correlate the response to the originating task. Mirrors the shape
+    used by ``workspace/a2a_executor.py``'s own response construction so all
+    runtime paths produce the same Message envelope.
+
+    Args:
+        context: The ``RequestContext`` from the inbound A2A request. Reads
+            ``context.task_id`` and ``context.context_id``; both fall back to
+            fresh UUIDs when ``None`` (RequestContextBuilder always sets them
+            in production; the fallback exists for unit tests).
+        text: Response text. Empty string omits the text Part — useful when
+            replying with files only.
+        files: Optional list of ``{"path": ..., "name": ..., "mime_type": ...}``
+            dicts (e.g. the output of :func:`collect_outbound_files`). Each
+            becomes a Part with ``url="workspace:<path>"``, ``filename``, and
+            ``media_type`` set.
+
+    Returns:
+        A v1 protobuf ``a2a.types.Message`` ready to pass to
+        ``event_queue.enqueue_event(...)``.
+
+    Why this exists: a2a-sdk v1 replaced the v0 Pydantic discriminated-union
+    types (``Part(root=TextPart(...))`` / ``Part(root=FilePart(file=
+    FileWithUri(...)))``) with a flat protobuf Part struct. Templates that
+    were written against v0 + then auto-renamed have shipped without
+    ``task_id``/``context_id`` correlation; this helper centralizes the
+    canonical pattern.
+    """
+    # Lazy import: a2a.types is provided by a2a-sdk which is a runtime
+    # dependency every adapter image already has. Importing here keeps the
+    # module load path lean for callers that don't construct messages.
+    from a2a.types import Message, Part, Role
+
+    parts: list = [Part(text=text)] if text else []
+    for f in files or []:
+        parts.append(Part(
+            url="workspace:" + f["path"],
+            filename=f["name"],
+            media_type=f["mime_type"],
+        ))
+    return Message(
+        message_id=_uuid.uuid4().hex,
+        role=Role.ROLE_AGENT,
+        parts=parts,
+        task_id=getattr(context, "task_id", None) or _uuid.uuid4().hex,
+        context_id=getattr(context, "context_id", None) or _uuid.uuid4().hex,
+    )

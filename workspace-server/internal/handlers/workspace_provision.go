@@ -232,6 +232,7 @@ func (h *WorkspaceHandler) provisionWorkspaceOpts(workspaceID, templatePath stri
 	// WriteFilesToContainer, which runs immediately after ContainerStart and
 	// wins the race against the Python adapter's startup time (~1-2 s).
 	h.issueAndInjectToken(ctx, workspaceID, &cfg)
+	h.issueAndInjectInboundSecret(ctx, workspaceID, &cfg)
 
 	url, err := h.provisioner.Start(ctx, cfg)
 	if err != nil {
@@ -435,6 +436,45 @@ func (h *WorkspaceHandler) issueAndInjectToken(ctx context.Context, workspaceID 
 		}
 	}
 	log.Printf("Provisioner: injected fresh auth token for workspace %s into config volume", workspaceID)
+}
+
+// issueAndInjectInboundSecret mints the platform→workspace shared secret
+// (RFC #2312, migration 044) and persists the plaintext into the
+// workspaces.platform_inbound_secret column so platform-side handlers can
+// read it back on every forward call.
+//
+// Docker mode also writes the plaintext into cfg.ConfigFiles
+// [".platform_inbound_secret"] so WriteFilesToContainer drops it on the
+// /configs volume alongside .auth_token.
+//
+// SaaS mode persists to the DB but does NOT write a local file from
+// here — there is no workspace-server-managed volume in SaaS. The
+// workspace receives the secret out-of-band via the /registry/register
+// response (mirrors the existing .auth_token bootstrap path).
+//
+// Best-effort: failure logs and continues. The workspace-side
+// /internal/* handlers fail-closed when the file is missing, so a
+// failed mint surfaces as 401 on the platform's first forward call —
+// loud, debuggable, no silent fail-open.
+func (h *WorkspaceHandler) issueAndInjectInboundSecret(ctx context.Context, workspaceID string, cfg *provisioner.WorkspaceConfig) {
+	secret, err := wsauth.IssuePlatformInboundSecret(ctx, db.DB, workspaceID)
+	if err != nil {
+		log.Printf("Provisioner: failed to issue platform_inbound_secret for %s: %v — chat upload + other /internal endpoints will 401", workspaceID, err)
+		return
+	}
+
+	if saasMode() {
+		// Plaintext lives in the DB column; the workspace will fetch it
+		// via /registry/register response (handled in a follow-up PR).
+		log.Printf("Provisioner: minted platform_inbound_secret for %s (SaaS mode — workspace will receive via register response)", workspaceID)
+		return
+	}
+
+	if cfg.ConfigFiles == nil {
+		cfg.ConfigFiles = make(map[string][]byte)
+	}
+	cfg.ConfigFiles[".platform_inbound_secret"] = []byte(secret)
+	log.Printf("Provisioner: injected platform_inbound_secret for workspace %s into config volume", workspaceID)
 }
 
 // findTemplateByName looks for a workspace-configs-templates directory matching a name.

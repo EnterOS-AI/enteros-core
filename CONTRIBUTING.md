@@ -53,6 +53,29 @@ cp .env.example .env
 
 See `CLAUDE.md` for a full list of environment variables and their purposes.
 
+## What goes where (content vs code)
+
+This repo is scoped to **code** (canvas, workspace, workspace-server, related
+infra). Public content (blog posts, marketing copy, OG images, SEO briefs,
+DevRel demos) lives in [`Molecule-AI/docs`](https://github.com/Molecule-AI/docs).
+The `Block forbidden paths` CI gate fails any PR that writes to `marketing/`
+or other removed paths — open against `Molecule-AI/docs` instead.
+
+| Content type | Target |
+|---|---|
+| Blog posts | `Molecule-AI/docs` → `content/blog/<YYYY-MM-DD-slug>/` |
+| Doc pages | `Molecule-AI/docs` → `content/docs/` |
+| Marketing copy / PMM positioning | `Molecule-AI/docs` → `marketing/` |
+| OG images, visual assets | `Molecule-AI/docs` → `app/` or `marketing/` |
+| SEO briefs | `Molecule-AI/docs` → `marketing/` |
+| DevRel demos (runnable code) | Standalone repo under `Molecule-AI/`, OR embedded in `Molecule-AI/docs` |
+| Launch checklists, internal tracking | GitHub Issues — **not** committed files |
+| Engineering docs (`docs/adr/`, `docs/architecture/`, `docs/incidents/`) | This repo (internal, not published) |
+| Live product pages (e.g. `canvas/src/app/pricing/page.tsx`) | This repo (these are app code, not marketing copy) |
+
+If a PR fails the `Block forbidden paths` check, the contents belong in
+`Molecule-AI/docs`. No CI drag, no Canvas E2E, content lands in minutes.
+
 ## Development Workflow
 
 ### Branch Naming
@@ -151,6 +174,17 @@ and run CI manually.
 ### Python (Workspace Runtime)
 - Type hints on public functions
 - pytest for all tests
+
+## External integrations
+
+Code in this repo lands in molecule-core. Some related runtime artifacts
+live in their own repos:
+
+- [`Molecule-AI/molecule-ai-workspace-runtime`](https://github.com/Molecule-AI/molecule-ai-workspace-runtime) — Python adapter SDK (`molecule_runtime`) that runs inside containerized Molecule workspaces. Bridges Claude Code SDK / hermes / langgraph / etc. → A2A queue.
+- [`Molecule-AI/molecule-sdk-python`](https://github.com/Molecule-AI/molecule-sdk-python) — `A2AServer` + `RemoteAgentClient` for external agents that register over the public `/registry/register` flow.
+- [`Molecule-AI/molecule-mcp-claude-channel`](https://github.com/Molecule-AI/molecule-mcp-claude-channel) — Claude Code channel plugin. Bridges A2A traffic into a running Claude Code session via MCP `notifications/claude/channel`. Polling-based (no tunnel required); install with `claude --channels plugin:molecule@Molecule-AI/molecule-mcp-claude-channel`.
+
+When extending the **A2A surface** in molecule-core (`workspace-server/internal/handlers/a2a_proxy.go` etc.), consider whether the change has a downstream impact on the runtime SDK or the channel plugin — they're versioned independently but share the wire shape.
 
 ## Architecture Overview
 
