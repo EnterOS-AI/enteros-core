@@ -195,7 +195,7 @@ export function ExternalConnectModal({ info, onClose }: Props) {
             {tab === "mcp" && filledUniversalMcp && (
               <SnippetBlock
                 value={filledUniversalMcp}
-                label="Universal MCP — outbound tools for any MCP-aware runtime (Claude Code, hermes, codex). Pair with Python or Claude Code tab for heartbeat + inbound."
+                label="Universal MCP — standalone register + heartbeat + tools for any MCP-aware runtime (Claude Code, hermes, codex). Pair with Python or Claude Code tab if you need inbound A2A delivery."
                 copyKey="mcp"
                 copied={copiedKey === "mcp"}
                 onCopy={() => copy(filledUniversalMcp, "mcp")}
