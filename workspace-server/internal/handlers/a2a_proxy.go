@@ -484,9 +484,15 @@ func (h *WorkspaceHandler) proxyA2ARequest(ctx context.Context, workspaceID stri
 		// error body. We probe IsRunning regardless (it's the
 		// authoritative check) but the empty-body case is what makes
 		// this fix necessary.
+		// 524 = Cloudflare "origin timed out" — origin accepted the
+		// connection but didn't return headers within ~100s. Same
+		// signal as 504/502 for our purposes: the upstream agent is
+		// not responsive. We probe IsRunning to confirm before
+		// triggering a restart.
 		if resp.StatusCode == http.StatusBadGateway ||
 			resp.StatusCode == http.StatusServiceUnavailable ||
-			resp.StatusCode == http.StatusGatewayTimeout {
+			resp.StatusCode == http.StatusGatewayTimeout ||
+			resp.StatusCode == 524 {
 			if h.maybeMarkContainerDead(ctx, workspaceID) {
 				return 0, nil, &proxyA2AError{
 					Status:   http.StatusServiceUnavailable,

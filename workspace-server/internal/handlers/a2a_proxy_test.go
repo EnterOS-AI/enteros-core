@@ -1819,39 +1819,35 @@ func TestMaybeMarkContainerDead_CPOnly_Running(t *testing.T) {
 // restart chain (provisionWorkspaceCP) needs its own mocked DB rows that
 // would explode the surface area of this test; what we care about here
 // is the dispatch decision, which is observable on cpProv.stopCalls.
-func TestRunRestartCycle_SaaSPath_DispatchesViaCPProv(t *testing.T) {
-	mock := setupTestDB(t)
+// stopForRestart is the dispatch helper extracted from runRestartCycle so the
+// branch logic can be tested without spawning the async sendRestartContext
+// goroutine that the full cycle fires. Pre-fix runRestartCycle's Stop dispatch
+// only called the Docker path, so on SaaS (h.provisioner=nil) the cycle NPE'd
+// silently and left the workspace stuck in status='provisioning'.
+func TestStopForRestart_SaaSPath_DispatchesViaCPProv(t *testing.T) {
 	setupTestRedis(t)
 	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
 	cp := &fakeCPProv{}
 	handler.SetCPProvisioner(cp)
 
-	// runRestartCycle's first query — workspace metadata.
-	mock.ExpectQuery(`SELECT name, status, tier, COALESCE\(runtime, 'langgraph'\) FROM workspaces`).
-		WithArgs("ws-saas-restart").
-		WillReturnRows(sqlmock.NewRows([]string{"name", "status", "tier", "runtime"}).
-			AddRow("Test Workspace", "online", 2, "hermes"))
-	// isParentPaused — return nil parent_id so the helper short-circuits.
-	mock.ExpectQuery(`SELECT parent_id FROM workspaces WHERE id =`).
-		WithArgs("ws-saas-restart").
-		WillReturnRows(sqlmock.NewRows([]string{"parent_id"}).AddRow(nil))
-	// After Stop, the cycle UPDATEs status to 'provisioning'. We allow
-	// that and don't mock everything provisionWorkspaceCP touches —
-	// provisionWorkspaceCP will fail at its first unmocked query, which
-	// is downstream of the dispatch decision under test.
-	mock.ExpectExec(`UPDATE workspaces SET status = 'provisioning'`).
-		WithArgs("ws-saas-restart").
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	// loadRestartContextData query (best-effort lookups; let them not match
-	// and the function returns a zero-valued struct).
-	mock.MatchExpectationsInOrder(false)
+	handler.stopForRestart(context.Background(), "ws-saas-restart")
 
-	handler.runRestartCycle("ws-saas-restart")
-
-	// The dispatch we're testing: SaaS path → cpProv.Stop, never Docker.
 	if cp.stopCalls != 1 {
-		t.Fatalf("expected cpProv.Stop to be called once on SaaS auto-restart; got %d calls — pre-fix the cycle NPE'd before reaching Stop on the (nil) Docker path", cp.stopCalls)
+		t.Fatalf("expected cpProv.Stop to be called once on SaaS auto-restart; got %d", cp.stopCalls)
 	}
+	if cp.startCalls != 0 {
+		t.Fatalf("expected cpProv.Start NOT to be called by stopForRestart; got %d", cp.startCalls)
+	}
+}
+
+// Both nil → no-op, no panic. Defensive guard against the dispatcher being
+// invoked on a misconfigured handler.
+func TestStopForRestart_NoProvisioner_NoOp(t *testing.T) {
+	setupTestRedis(t)
+	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
+	// no provisioner, no cpProv
+	handler.stopForRestart(context.Background(), "ws-orphan")
+	// no panic, no calls — assertion is reaching this line
 }
 
 // fakeCPProv satisfies provisioner.CPProvisionerAPI for tests that exercise

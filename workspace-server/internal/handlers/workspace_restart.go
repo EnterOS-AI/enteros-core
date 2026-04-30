@@ -396,6 +396,25 @@ func coalesceRestart(workspaceID string, cycle func()) {
 	}
 }
 
+// stopForRestart dispatches Stop to whichever provisioner is wired (Docker or
+// CP/EC2 — mutually exclusive in production). Docker provisioner.Stop kills
+// the local container; CP provisioner.Stop calls DELETE /cp/workspaces/:id
+// which terminates the EC2 instance. Pre-fix runRestartCycle only called the
+// Docker path, so on SaaS (h.provisioner=nil) the auto-restart cycle silently
+// NPE'd before reaching the reprovision step — which is why every SaaS dead-
+// agent incident pre-this-fix required manual restart from canvas.
+func (h *WorkspaceHandler) stopForRestart(ctx context.Context, workspaceID string) {
+	if h.provisioner != nil {
+		h.provisioner.Stop(ctx, workspaceID)
+		return
+	}
+	if h.cpProv != nil {
+		if err := h.cpProv.Stop(ctx, workspaceID); err != nil {
+			log.Printf("Auto-restart: cpProv.Stop(%s) failed: %v (continuing to reprovision)", workspaceID, err)
+		}
+	}
+}
+
 // runRestartCycle does the actual stop+provision work for one restart
 // iteration. Synchronous (waits for provisionWorkspace to complete) so the
 // outer pending-flag loop in RestartByID can correctly coalesce — if this
@@ -431,20 +450,7 @@ func (h *WorkspaceHandler) runRestartCycle(workspaceID string) {
 
 	log.Printf("Auto-restart: restarting %s (%s) runtime=%q (was: %s)", wsName, workspaceID, dbRuntime, status)
 
-	// Stop existing compute. Branch on which provisioner is wired (mutually
-	// exclusive in production): Docker provisioner.Stop kills the local
-	// container; CP provisioner.Stop calls DELETE /cp/workspaces/:id which
-	// terminates the EC2 instance. Pre-fix this only called the Docker path,
-	// so on SaaS (h.provisioner=nil) the auto-restart cycle silently NPE'd
-	// before reaching the reprovision step — which is why every SaaS dead-
-	// agent incident pre-this-fix required manual restart from canvas.
-	if h.provisioner != nil {
-		h.provisioner.Stop(ctx, workspaceID)
-	} else if h.cpProv != nil {
-		if err := h.cpProv.Stop(ctx, workspaceID); err != nil {
-			log.Printf("Auto-restart: cpProv.Stop(%s) failed: %v (continuing to reprovision)", workspaceID, err)
-		}
-	}
+	h.stopForRestart(ctx, workspaceID)
 
 	db.DB.ExecContext(ctx,
 		`UPDATE workspaces SET status = 'provisioning', url = '', updated_at = now() WHERE id = $1`, workspaceID)
