@@ -1,18 +1,26 @@
 package handlers
 
-// chat_files.go — file upload (HTTP-forward) + download (Docker-exec)
-// for workspace chat.
+// chat_files.go — file upload + download for workspace chat,
+// both HTTP-forward (RFC #2312, fully landed).
 //
-// Upload is the v2 architecture (RFC #2312): the platform proxies the
-// multipart request straight to the workspace's own /internal/chat/
-// uploads/ingest endpoint. The workspace agent then writes to local
-// /workspace/.molecule/chat-uploads. Same code path on local Docker
-// and SaaS — the v1 docker-exec path was structurally broken in SaaS
-// because workspace-server's local Docker client has no visibility
-// into EC2-hosted workspaces (#2308 root cause).
+// Architecture (v2, post-RFC-#2312):
 //
-// Download still uses the v1 docker-cp path; migrating it lives in the
-// next PR in this stack so each surface is reviewable in isolation.
+//   - Upload (POST /workspaces/:id/uploads): the platform proxies the
+//     multipart request straight to the workspace's own
+//     /internal/chat/uploads/ingest endpoint. The workspace agent then
+//     writes to local /workspace/.molecule/chat-uploads.
+//
+//   - Download (GET /workspaces/:id/files): the platform makes an HTTP
+//     GET to the workspace's /internal/file/read?path=<abs> endpoint
+//     and streams the response body to the caller.
+//
+// Same code path on local Docker and SaaS — the v1 docker-exec /
+// docker-cp paths were structurally broken in SaaS because
+// workspace-server's local Docker client has no visibility into
+// EC2-hosted workspaces (#2308 root cause). Both surfaces now use the
+// per-workspace platform_inbound_secret minted at provision time
+// (RFC #2312 PR-F) for auth, and the workspace's HTTP server mounts
+// the corresponding receiver at workspace/main.py.
 //
 // Split from templates.go because these endpoints have a different
 // security model (no /configs write, no template fallback) and a
