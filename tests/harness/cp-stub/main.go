@@ -24,28 +24,13 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"strings"
 	"sync/atomic"
 )
 
-// peersFailureMode controls /registry/<id>/peers responses for replay scripts.
-// Empty (default) → 200 with the rolling peer list set via /__stub/peers.
-// "404"           → 404 (workspace not registered) — replay #2397.
-// "401"           → 401 (auth failure)             — replay #2397.
-// "500"           → 500 (platform error)           — replay #2397.
-// "timeout"       → hang for 60s                   — replay #2397 network branch.
-//
-// Set via env var CP_STUB_PEERS_MODE at startup, or POST /__stub/mode at runtime.
-var (
-	peersFailureMode atomic.Value // string
-	peersList        atomic.Value // []map[string]any
-	redeployFleetCalls atomic.Int64
-)
-
-func init() {
-	peersFailureMode.Store(strings.ToLower(os.Getenv("CP_STUB_PEERS_MODE")))
-	peersList.Store([]map[string]any{})
-}
+// redeployFleetCalls tracks how many times /cp/admin/tenants/redeploy-fleet
+// was invoked. Replay scripts assert > 0 to confirm the workflow's redeploy
+// step actually reached the stub (catches misrouted CP_URL configs).
+var redeployFleetCalls atomic.Int64
 
 func main() {
 	mux := http.NewServeMux()
@@ -81,39 +66,10 @@ func main() {
 		})
 	})
 
-	// __stub/peers — set the rolling peer list returned via tenant's
-	// /registry/<id>/peers proxy. Used by replay scripts to seed the
-	// scenario before invoking tool_list_peers from a workspace.
-	mux.HandleFunc("/__stub/peers", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "POST required", 405)
-			return
-		}
-		var body []map[string]any
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			http.Error(w, "bad JSON: "+err.Error(), 400)
-			return
-		}
-		peersList.Store(body)
-		writeJSON(w, 200, map[string]any{"ok": true, "count": len(body)})
-	})
-
-	// __stub/mode — toggle peersFailureMode at runtime for replay scripts.
-	mux.HandleFunc("/__stub/mode", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "POST required", 405)
-			return
-		}
-		mode := strings.ToLower(r.URL.Query().Get("peers"))
-		peersFailureMode.Store(mode)
-		writeJSON(w, 200, map[string]any{"ok": true, "peers_mode": mode})
-	})
-
-	// __stub/state — expose stub state (counters, current mode) so replay
-	// scripts can assert the tenant actually called us.
+	// __stub/state — expose stub state (counters) so replay scripts can
+	// assert the tenant actually reached us. Read-only.
 	mux.HandleFunc("/__stub/state", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{
-			"peers_mode":           peersFailureMode.Load(),
 			"redeploy_fleet_calls": redeployFleetCalls.Load(),
 		})
 	})

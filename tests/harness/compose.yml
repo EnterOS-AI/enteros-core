@@ -119,8 +119,12 @@ services:
         condition: service_healthy
     volumes:
       - ./cf-proxy/nginx.conf:/etc/nginx/nginx.conf:ro
+    # Bind to 127.0.0.1 only — the harness uses a hardcoded ADMIN_TOKEN
+    # ("harness-admin-token") so binding 0.0.0.0 (compose's default)
+    # would expose admin access to anyone on the local network or VPN.
+    # Loopback-only is safe for E2E and prevents a known-token leak.
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     networks: [harness-net]
 
 networks:
