@@ -182,7 +182,10 @@ def test_pop_removes_specific_message(state: inbox.InboxState):
 
 def test_pop_missing_id_returns_none(state: inbox.InboxState):
     state.record(_msg("a"))
-    assert state.pop("does-not-exist") is None
+    # Bind the result before asserting so the call still runs under
+    # ``python -O`` (which strips bare assert statements).
+    result = state.pop("does-not-exist")
+    assert result is None
     # Original message still present
     assert len(state.peek(10)) == 1
 
