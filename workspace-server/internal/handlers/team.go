@@ -25,20 +25,28 @@ import (
 // NULL auth_token — same drift class as the SaaS bug fixed in #2366.
 type TeamHandler struct {
 	broadcaster *events.Broadcaster
-	provisioner *provisioner.Provisioner
+	// provisioner is interface-typed (#2369) for the same reason as
+	// WorkspaceHandler.provisioner — Stop is the only call site here
+	// and it's on the LocalProvisionerAPI surface, so widening is free
+	// and symmetric with WorkspaceHandler.
+	provisioner provisioner.LocalProvisionerAPI
 	wh          *WorkspaceHandler
 	platformURL string
 	configsDir  string
 }
 
 func NewTeamHandler(b *events.Broadcaster, p *provisioner.Provisioner, wh *WorkspaceHandler, platformURL, configsDir string) *TeamHandler {
-	return &TeamHandler{
+	h := &TeamHandler{
 		broadcaster: b,
-		provisioner: p,
 		wh:          wh,
 		platformURL: platformURL,
 		configsDir:  configsDir,
 	}
+	// Avoid the typed-nil interface trap (see NewWorkspaceHandler note).
+	if p != nil {
+		h.provisioner = p
+	}
+	return h
 }
 
 // Expand handles POST /workspaces/:id/expand

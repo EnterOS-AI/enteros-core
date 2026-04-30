@@ -51,6 +51,14 @@ import (
 // Kept minimal on purpose; expand only when a new cross-backend
 // behavior needs a contract test. Implementation-private methods stay
 // off this interface.
+//
+// NOTE: this is the SHARED-CONTRACT subset — the methods both backends
+// must implement. The handler-facing surface is wider (LocalProvisionerAPI
+// includes ExecRead / RemoveVolume / VolumeHasFile / WriteAuthTokenToVolume,
+// which are Docker-specific because the CP backend delegates volume
+// management to EC2 boot scripts). Don't widen Backend with Docker-only
+// methods — split into per-backend interfaces if a method only one side
+// implements.
 type Backend interface {
 	Start(ctx context.Context, cfg WorkspaceConfig) (string, error)
 	Stop(ctx context.Context, workspaceID string) error
@@ -223,6 +231,42 @@ func TestZeroValuedBackends_NoPanic(t *testing.T) {
 		var p *CPProvisioner
 		if err := p.Stop(context.Background(), "any"); !errors.Is(err, ErrNoBackend) {
 			t.Errorf("nil *CPProvisioner.Stop: got %v, want ErrNoBackend", err)
+		}
+	})
+
+	// Methods extended to the LocalProvisionerAPI interface in #2369 —
+	// every one needs the same nil-receiver guard so the typed-nil
+	// interface case (handler tests passing nil concrete *Provisioner
+	// to NewWorkspaceHandler, which the constructor now elides into a
+	// real nil interface) doesn't regress in the future.
+	t.Run("nil_Provisioner.Start", func(t *testing.T) {
+		var p *Provisioner
+		if _, err := p.Start(context.Background(), WorkspaceConfig{}); !errors.Is(err, ErrNoBackend) {
+			t.Errorf("nil *Provisioner.Start: got %v, want ErrNoBackend", err)
+		}
+	})
+	t.Run("nil_Provisioner.ExecRead", func(t *testing.T) {
+		var p *Provisioner
+		if _, err := p.ExecRead(context.Background(), "any", "any"); !errors.Is(err, ErrNoBackend) {
+			t.Errorf("nil *Provisioner.ExecRead: got %v, want ErrNoBackend", err)
+		}
+	})
+	t.Run("nil_Provisioner.RemoveVolume", func(t *testing.T) {
+		var p *Provisioner
+		if err := p.RemoveVolume(context.Background(), "any"); !errors.Is(err, ErrNoBackend) {
+			t.Errorf("nil *Provisioner.RemoveVolume: got %v, want ErrNoBackend", err)
+		}
+	})
+	t.Run("nil_Provisioner.VolumeHasFile", func(t *testing.T) {
+		var p *Provisioner
+		if _, err := p.VolumeHasFile(context.Background(), "any", "config.yaml"); !errors.Is(err, ErrNoBackend) {
+			t.Errorf("nil *Provisioner.VolumeHasFile: got %v, want ErrNoBackend", err)
+		}
+	})
+	t.Run("nil_Provisioner.WriteAuthTokenToVolume", func(t *testing.T) {
+		var p *Provisioner
+		if err := p.WriteAuthTokenToVolume(context.Background(), "any", "tok"); !errors.Is(err, ErrNoBackend) {
+			t.Errorf("nil *Provisioner.WriteAuthTokenToVolume: got %v, want ErrNoBackend", err)
 		}
 	})
 }
