@@ -28,130 +28,19 @@ func (h *WorkspaceHandler) provisionWorkspaceOpts(workspaceID, templatePath stri
 	ctx, cancel := context.WithTimeout(context.Background(), provisioner.ProvisionTimeout)
 	defer cancel()
 
-	// Load global secrets first, then workspace-specific secrets (which override globals).
-	envVars := map[string]string{}
-
-	// 1. Global secrets (platform-wide defaults). Uses DecryptVersioned
-	// so plaintext rows written before encryption was enabled (#85)
-	// keep working. A decrypt failure aborts provisioning — silent skip
-	// used to manifest as opaque "missing OAuth token" preflight crashes.
-	globalRows, globalErr := db.DB.QueryContext(ctx,
-		`SELECT key, encrypted_value, encryption_version FROM global_secrets`)
-	if globalErr == nil {
-		defer globalRows.Close()
-		for globalRows.Next() {
-			var k string
-			var v []byte
-			var ver int
-			if globalRows.Scan(&k, &v, &ver) == nil {
-				decrypted, decErr := crypto.DecryptVersioned(v, ver)
-				if decErr != nil {
-					log.Printf("Provisioner: FATAL — failed to decrypt global secret %s (version=%d): %v — aborting provision of workspace %s", k, ver, decErr, workspaceID)
-					h.broadcaster.RecordAndBroadcast(ctx, "WORKSPACE_PROVISION_FAILED", workspaceID, map[string]interface{}{
-						"error": "failed to decrypt global secret",
-					})
-					db.DB.ExecContext(ctx, `UPDATE workspaces SET status = 'failed', updated_at = now() WHERE id = $1`, workspaceID)
-					return
-				}
-				envVars[k] = string(decrypted)
-			}
-		}
-	}
-
-	// 2. Workspace-specific secrets (override globals with same key)
-	rows, err := db.DB.QueryContext(ctx,
-		`SELECT key, encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = $1`, workspaceID)
-	if err == nil {
-		defer rows.Close()
-		for rows.Next() {
-			var k string
-			var v []byte
-			var ver int
-			if rows.Scan(&k, &v, &ver) == nil {
-				decrypted, decErr := crypto.DecryptVersioned(v, ver)
-				if decErr != nil {
-					log.Printf("Provisioner: FATAL — failed to decrypt workspace secret %s (version=%d) for %s: %v — aborting provision", k, ver, workspaceID, decErr)
-					h.broadcaster.RecordAndBroadcast(ctx, "WORKSPACE_PROVISION_FAILED", workspaceID, map[string]interface{}{
-						"error": "failed to decrypt workspace secret",
-					})
-					db.DB.ExecContext(ctx, `UPDATE workspaces SET status = 'failed', updated_at = now() WHERE id = $1`, workspaceID)
-					return
-				}
-				envVars[k] = string(decrypted)
-			}
-		}
-	}
-
-	pluginsPath, _ := filepath.Abs(filepath.Join(h.configsDir, "..", "plugins"))
-	awarenessNamespace := h.loadAwarenessNamespace(ctx, workspaceID)
-
-	// Per-agent git identity (Option 3 of agent-separation rollout).
-	// Sets GIT_AUTHOR_* / GIT_COMMITTER_* so commits from each workspace
-	// carry a distinct author in `git log` / `git blame` — instead of
-	// every agent appearing as whoever the shared PAT belongs to. PR +
-	// issue authorship is still tied to GITHUB_TOKEN (shared PAT); that
-	// gets solved by the GitHub App migration (Option 1, follow-up PR).
-	// Runs after secret loads so an operator can still override via a
-	// workspace_secret named GIT_AUTHOR_NAME if they want custom identity.
-	applyAgentGitIdentity(envVars, payload.Name)
-	applyRuntimeModelEnv(envVars, payload.Runtime, payload.Model)
-
-	// Propagate the workspace's role into env so role-aware plugins
-	// (gh-identity — molecule-core#1957) can read it without the
-	// plugin interface having to carry the full payload. Role is
-	// cosmetic metadata — no auth weight on it — safe to surface as env.
-	if payload.Role != "" {
-		envVars["MOLECULE_AGENT_ROLE"] = payload.Role
-	}
-
-	// Plugin extension point: run any registered EnvMutators (e.g.
-	// github-app-auth, vault-secrets) AFTER built-in identity injection so
-	// plugins can override or augment GIT_AUTHOR_*, GITHUB_TOKEN, etc.
-	// A failure here aborts provisioning — a missing GitHub App token
-	// would manifest later as opaque "git push 401" loops, and the agent
-	// never recovers. Failing fast here surfaces the cause to the operator.
-	if err := h.envMutators.Run(ctx, workspaceID, envVars); err != nil {
-		log.Printf("Provisioner: env mutator chain failed for %s: %v", workspaceID, err)
-		// F1086 / #1206: broadcast and db last_sample_error use generic messages —
-		// env mutator errors (missing tokens, vault paths, etc.) can include
-		// internal credential URIs and file paths that must not reach the caller.
-		h.broadcaster.RecordAndBroadcast(ctx, "WORKSPACE_PROVISION_FAILED", workspaceID, map[string]interface{}{
-			"error": "plugin env mutator chain failed",
-		})
-		if _, dbErr := db.DB.ExecContext(ctx,
-			`UPDATE workspaces SET status = 'failed', last_sample_error = $2, updated_at = now() WHERE id = $1`,
-			workspaceID, "plugin env mutator chain failed"); dbErr != nil {
-
-			log.Printf("Provisioner: failed to mark workspace %s as failed after mutator error: %v", workspaceID, dbErr)
-		}
+	prepared, abort := h.prepareProvisionContext(ctx, workspaceID, templatePath, configFiles, payload, resetClaudeSession)
+	if prepared == nil {
+		log.Printf("Provisioner: prepare failed for %s: %s", workspaceID, abort.Msg)
+		h.markProvisionFailed(ctx, workspaceID, abort.Msg, abort.Extra)
 		return
 	}
-
-	// Preflight: refuse to launch when config.yaml declares required env vars
-	// that are not set. Without this, a missing CLAUDE_CODE_OAUTH_TOKEN (or
-	// similar) crashes the in-container preflight, the container never calls
-	// /registry/register, and the workspace sits in `provisioning` until a
-	// sweeper flips it or the user retries. Failing fast here gives the user
-	// an immediate, actionable error in the Events tab.
-	if missing := missingRequiredEnv(configFiles, envVars); len(missing) > 0 {
-		msg := formatMissingEnvError(missing)
-		log.Printf("Provisioner: %s (workspace=%s)", msg, workspaceID)
-		if _, dbErr := db.DB.ExecContext(ctx,
-			`UPDATE workspaces SET status = 'failed', last_sample_error = $2, updated_at = now() WHERE id = $1`,
-			workspaceID, msg); dbErr != nil {
-			log.Printf("Provisioner: failed to mark workspace %s as failed: %v", workspaceID, dbErr)
-		}
-		h.broadcaster.RecordAndBroadcast(ctx, "WORKSPACE_PROVISION_FAILED", workspaceID, map[string]interface{}{
-			"error":   msg,
-			"missing": missing,
-		})
-		return
-	}
-
-	cfg := h.buildProvisionerConfig(workspaceID, templatePath, configFiles, payload, envVars, pluginsPath, awarenessNamespace)
-	cfg.ResetClaudeSession = resetClaudeSession // #12
+	cfg := prepared.Config
 
 	// Preflight #17: detect + auto-recover the "empty config volume" crashloop.
+	// Docker-specific — SaaS mode delegates volume management to the
+	// control-plane EC2 launcher and never has a local Docker volume to
+	// probe. Runs AFTER prepareProvisionContext because the recovered
+	// template still needs the same env-and-cfg surface the prepare built.
 	//
 	// When the caller supplies neither a template dir nor in-memory configFiles
 	// (the auto-restart path), probe the existing Docker named volume. If the
@@ -194,7 +83,7 @@ func (h *WorkspaceHandler) provisionWorkspaceOpts(workspaceID, templatePath stri
 							workspaceID, filepath.Base(runtimeTemplate))
 						templatePath = runtimeTemplate
 						// Rebuild cfg with the recovered template path so Start() sees it.
-						cfg = h.buildProvisionerConfig(workspaceID, templatePath, configFiles, payload, envVars, pluginsPath, awarenessNamespace)
+						cfg = h.buildProvisionerConfig(workspaceID, templatePath, configFiles, payload, prepared.EnvVars, prepared.PluginsPath, prepared.AwarenessNamespace)
 						cfg.ResetClaudeSession = resetClaudeSession
 						recovered = true
 						break
@@ -209,46 +98,27 @@ func (h *WorkspaceHandler) provisionWorkspaceOpts(workspaceID, templatePath stri
 			if !recovered {
 				msg := fmt.Sprintf("cannot start workspace %s: no config.yaml source and config volume is empty — delete the workspace or provide a template", workspaceID)
 				log.Printf("Provisioner: %s", msg)
-				if _, dbErr := db.DB.ExecContext(ctx,
-					`UPDATE workspaces SET status = 'failed', last_sample_error = $2, updated_at = now() WHERE id = $1`,
-					workspaceID, msg); dbErr != nil {
-					log.Printf("Provisioner: failed to mark workspace %s as failed: %v", workspaceID, dbErr)
-				}
-				h.broadcaster.RecordAndBroadcast(ctx, "WORKSPACE_PROVISION_FAILED", workspaceID, map[string]interface{}{
-					"error": msg,
-				})
+				h.markProvisionFailed(ctx, workspaceID, msg, nil)
 				return
 			}
 		}
 	}
 
-	// Issue/rotate the workspace auth token and inject the plaintext into the
-	// config volume so the workspace always has a valid bearer credential on
-	// disk, even after a container rebuild wiped the volume (issue #418).
-	//
-	// We must rotate (revoke-then-issue) rather than reuse because the DB only
-	// stores sha256(plaintext) — we cannot reconstruct the original token to
-	// write it back. The new plaintext is written into /configs/.auth_token via
-	// WriteFilesToContainer, which runs immediately after ContainerStart and
-	// wins the race against the Python adapter's startup time (~1-2 s).
-	h.issueAndInjectToken(ctx, workspaceID, &cfg)
-	h.issueAndInjectInboundSecret(ctx, workspaceID, &cfg)
+	// Issue/rotate the workspace auth token + platform→workspace inbound secret
+	// and inject both into the config volume. See mintWorkspaceSecrets doc for
+	// the shared invariant — every provision path MUST mint here. Plaintext
+	// is written into /configs/.auth_token + /configs/.platform_inbound_secret
+	// via WriteFilesToContainer, which runs immediately after ContainerStart
+	// and wins the race against the Python adapter's startup time (~1-2 s).
+	h.mintWorkspaceSecrets(ctx, workspaceID, &cfg)
 
 	url, err := h.provisioner.Start(ctx, cfg)
 	if err != nil {
 		// F1086 / #1206: persist a generic message so the canvas and
 		// GET /workspaces/:id expose something actionable without leaking
 		// docker/error internals (image pull messages, volume paths, etc.).
-		errMsg := "workspace start failed"
-		log.Printf("Provisioner: %s for %s: %v", errMsg, workspaceID, err)
-		if _, dbErr := db.DB.ExecContext(ctx,
-			`UPDATE workspaces SET status = 'failed', last_sample_error = $2, updated_at = now() WHERE id = $1`,
-			workspaceID, "workspace start failed"); dbErr != nil {
-			log.Printf("Provisioner: failed to mark workspace %s as failed: %v", workspaceID, dbErr)
-		}
-		h.broadcaster.RecordAndBroadcast(ctx, "WORKSPACE_PROVISION_FAILED", workspaceID, map[string]interface{}{
-			"error": "workspace start failed",
-		})
+		log.Printf("Provisioner: workspace start failed for %s: %v", workspaceID, err)
+		h.markProvisionFailed(ctx, workspaceID, "workspace start failed", nil)
 	} else if url != "" {
 		// Pre-store the host-accessible URL (http://127.0.0.1:<port>) so the A2A proxy can reach the container.
 		// The registry's ON CONFLICT preserves URLs starting with http://127.0.0.1 when the agent self-registers.
@@ -706,6 +576,13 @@ func applyRuntimeModelEnv(envVars map[string]string, runtime, model string) {
 // loadWorkspaceSecrets loads global + workspace-specific secrets into a map.
 // Returns nil map + error string on decrypt failure. Shared by both Docker
 // and control plane provisioning paths to avoid duplication.
+//
+// F1086 / #1206: the returned error string is the SAFE-CANNED message that
+// gets persisted to workspaces.last_sample_error AND broadcast as the
+// WORKSPACE_PROVISION_FAILED payload. Internal detail (the secret key name,
+// the encryption version, the decrypt-error text) is logged here, never
+// returned to the caller, so it can't leak via the canvas event stream
+// (cf. TestProvisionWorkspace_NoInternalErrorsInBroadcast).
 func loadWorkspaceSecrets(ctx context.Context, workspaceID string) (map[string]string, string) {
 	envVars := map[string]string{}
 	globalRows, globalErr := db.DB.QueryContext(ctx,
@@ -719,7 +596,8 @@ func loadWorkspaceSecrets(ctx context.Context, workspaceID string) (map[string]s
 			if globalRows.Scan(&k, &v, &ver) == nil {
 				decrypted, decErr := crypto.DecryptVersioned(v, ver)
 				if decErr != nil {
-					return nil, fmt.Sprintf("cannot decrypt global secret %s: %v", k, decErr)
+					log.Printf("Provisioner: FATAL — failed to decrypt global secret %s (version=%d): %v — aborting provision of workspace %s", k, ver, decErr, workspaceID)
+					return nil, "failed to decrypt global secret"
 				}
 				envVars[k] = string(decrypted)
 			}
@@ -736,7 +614,8 @@ func loadWorkspaceSecrets(ctx context.Context, workspaceID string) (map[string]s
 			if wsRows.Scan(&k, &v, &ver) == nil {
 				decrypted, decErr := crypto.DecryptVersioned(v, ver)
 				if decErr != nil {
-					return nil, fmt.Sprintf("cannot decrypt workspace secret %s: %v", k, decErr)
+					log.Printf("Provisioner: FATAL — failed to decrypt workspace secret %s (version=%d) for %s: %v — aborting provision", k, ver, workspaceID, decErr)
+					return nil, "failed to decrypt workspace secret"
 				}
 				envVars[k] = string(decrypted)
 			}
@@ -746,53 +625,43 @@ func loadWorkspaceSecrets(ctx context.Context, workspaceID string) (map[string]s
 }
 
 // provisionWorkspaceCP provisions a workspace via the control plane API.
+//
+// Mode-specific work this function owns: cpProv.Start (delegates EC2
+// launch to control plane) + persist instance_id in DB. The shared
+// setup (secrets, env mutators, mint of auth_token + inbound_secret)
+// lives in prepareProvisionContext + mintWorkspaceSecrets and is
+// called by both this function and the Docker-mode counterpart.
+//
+// Pre-#2026-04-30: this function did NOT call mintWorkspaceSecrets.
+// That left every prod workspace with a NULL platform_inbound_secret
+// column → 503 on every chat upload (RFC #2312). The bug shipped
+// because the Docker and SaaS provision paths had drifted: Docker
+// got the mint when #2312 landed; SaaS was missed. Refactored to
+// share so the next mint added can't be silently forgotten on one
+// side.
 func (h *WorkspaceHandler) provisionWorkspaceCP(workspaceID, templatePath string, configFiles map[string][]byte, payload models.CreateWorkspacePayload) {
 	ctx, cancel := context.WithTimeout(context.Background(), provisioner.ProvisionTimeout)
 	defer cancel()
 
-	envVars, decryptErr := loadWorkspaceSecrets(ctx, workspaceID)
-	if decryptErr != "" {
-		log.Printf("CPProvisioner: %s for %s", decryptErr, workspaceID)
-		db.DB.ExecContext(ctx, `UPDATE workspaces SET status = 'failed', last_sample_error = $2, updated_at = now() WHERE id = $1`,
-			workspaceID, decryptErr)
+	prepared, abort := h.prepareProvisionContext(ctx, workspaceID, templatePath, configFiles, payload, false)
+	if prepared == nil {
+		log.Printf("CPProvisioner: prepare failed for %s: %s", workspaceID, abort.Msg)
+		h.markProvisionFailed(ctx, workspaceID, abort.Msg, abort.Extra)
 		return
 	}
 
-	applyAgentGitIdentity(envVars, payload.Name)
-	applyRuntimeModelEnv(envVars, payload.Runtime, payload.Model)
-	// Propagate role for role-aware plugins (#1957). See provisionWorkspace
-	// above for rationale.
-	if payload.Role != "" {
-		envVars["MOLECULE_AGENT_ROLE"] = payload.Role
-	}
-	if err := h.envMutators.Run(ctx, workspaceID, envVars); err != nil {
-		log.Printf("CPProvisioner: env mutator failed for %s: %v", workspaceID, err)
-		// F1086 / #1206: env mutator errors (missing tokens, vault paths) must not
-		// leak into last_sample_error — use generic message.
-		db.DB.ExecContext(ctx, `UPDATE workspaces SET status = 'failed', last_sample_error = $2, updated_at = now() WHERE id = $1`,
-				workspaceID, "plugin env mutator chain failed")
-		return
-	}
+	// Mint the workspace's auth_token + platform_inbound_secret now,
+	// before cpProv.Start. Both modes write to the DB column; the
+	// workspace receives the plaintext via /registry/register response
+	// (registry.go:344-362) on its first heartbeat after boot.
+	h.mintWorkspaceSecrets(ctx, workspaceID, &prepared.Config)
 
-	cfg := provisioner.WorkspaceConfig{
-		WorkspaceID: workspaceID,
-		Tier:        payload.Tier,
-		Runtime:     payload.Runtime,
-		EnvVars:     envVars,
-		PlatformURL: h.platformURL,
-	}
-
-	machineID, err := h.cpProv.Start(ctx, cfg)
+	machineID, err := h.cpProv.Start(ctx, prepared.Config)
 	if err != nil {
 		// F1086 / #1206: CP errors can include machine type, AMI IDs, VPC
 		// paths — use generic message for broadcast and last_sample_error.
-		errMsg := "workspace start failed"
-		log.Printf("CPProvisioner: %s for %s: %v", errMsg, workspaceID, err)
-		h.broadcaster.RecordAndBroadcast(ctx, "WORKSPACE_PROVISION_FAILED", workspaceID, map[string]interface{}{
-			"error": "provisioning failed",
-		})
-		db.DB.ExecContext(ctx, `UPDATE workspaces SET status = 'failed', last_sample_error = $2, updated_at = now() WHERE id = $1`,
-			workspaceID, "provisioning failed")
+		log.Printf("CPProvisioner: workspace start failed for %s: %v", workspaceID, err)
+		h.markProvisionFailed(ctx, workspaceID, "provisioning failed", nil)
 		return
 	}
 
@@ -809,13 +678,4 @@ func (h *WorkspaceHandler) provisionWorkspaceCP(workspaceID, templatePath string
 	}
 
 	log.Printf("CPProvisioner: workspace %s started as machine %s via control plane", workspaceID, machineID)
-	// Token issuance is deliberately deferred to the workspace's first
-	// /registry/register call. Minting here without also delivering the
-	// plaintext to the workspace (via user-data or a follow-up callback)
-	// would leave a live token in DB that the workspace has no copy of —
-	// RegistryHandler.requireWorkspaceToken would then 401 every
-	// /registry/register attempt because the workspace is no longer in the
-	// "no live tokens → bootstrap-allowed" state. The register handler
-	// already mints a token on first successful register and returns it in
-	// the response body for the workspace to persist.
 }

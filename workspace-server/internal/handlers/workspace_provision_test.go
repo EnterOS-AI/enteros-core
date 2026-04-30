@@ -1137,10 +1137,14 @@ func TestProvisionWorkspace_NoInternalErrorsInBroadcast(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"key", "encrypted_value", "encryption_version"}).
 			AddRow("FAKE_KEY", []byte("any-bytes"), 99))
 	// On decrypt failure provisionWorkspace also marks the workspace as
-	// failed via UPDATE workspaces. Match-anything on the args so the
-	// test isn't coupled to the exact UPDATE column order.
+	// failed via UPDATE workspaces. Two args: workspace_id + the
+	// last_sample_error message ("failed to decrypt global secret").
+	// Pre-refactor (workspace_provision_shared.go) the decrypt-fail
+	// path skipped last_sample_error; the shared helper now always
+	// persists it so users see the failure in the UI without having
+	// to grep server logs.
 	mock.ExpectExec(`UPDATE workspaces SET status = 'failed'`).
-		WithArgs(sqlmock.AnyArg()).
+		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	cap := &captureBroadcaster{}
