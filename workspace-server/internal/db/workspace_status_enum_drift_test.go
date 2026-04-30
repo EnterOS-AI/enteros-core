@@ -51,6 +51,7 @@ func TestWorkspaceStatusEnum_NoLiteralDrift(t *testing.T) {
 	repoRoot := findRepoRoot(t)
 	migrationsDir := filepath.Join(repoRoot, "workspace-server", "migrations")
 	statusFile := filepath.Join(repoRoot, "workspace-server", "internal", "models", "workspace_status.go")
+	srcRoot := filepath.Join(repoRoot, "workspace-server")
 
 	enum := loadWorkspaceStatusEnum(t, migrationsDir)
 	if len(enum) == 0 {
@@ -75,6 +76,21 @@ func TestWorkspaceStatusEnum_NoLiteralDrift(t *testing.T) {
 				"Add a migration `ALTER TYPE workspace_status ADD VALUE 'X';` (see migration 046 for shape).\n"+
 				"Enum currently: %v\nCodebase declares: %v",
 			rogue, sortedKeys(enum), sortedKeys(codebase),
+		)
+	}
+
+	// Second axis: scan production .go files for hard-coded
+	// `UPDATE workspaces SET status = '<literal>'`. Every status write must
+	// flow through models.Status* constants — the typed-constants refactor
+	// (PR #2396) made this enforceable. Without this scan, a future
+	// site-update can silently re-introduce a literal that bypasses
+	// AllWorkspaceStatuses + the migration gate above. The hard-coded site
+	// in workspace_bootstrap.go:62 was missed in the initial sweep and
+	// only caught by manual grep — this gate makes that automatic.
+	if hits := findHardCodedStatusWrites(t, srcRoot); len(hits) > 0 {
+		t.Errorf(
+			"hard-coded `SET status = '<literal>'` found in production code — replace with a parameterized $N + models.Status* constant:\n  %s",
+			strings.Join(hits, "\n  "),
 		)
 	}
 }
@@ -230,6 +246,88 @@ func loadAllWorkspaceStatuses(t *testing.T, statusFile string) map[string]struct
 	}
 
 	return out
+}
+
+// findHardCodedStatusWrites walks workspace-server/ production .go files
+// (excluding *_test.go) and returns any string literal that contains a
+// `SET status = '<literal>'` write against the workspaces table. Uses Go
+// AST so quoted snippets in comments don't false-positive.
+func findHardCodedStatusWrites(t *testing.T, srcRoot string) []string {
+	t.Helper()
+
+	// Match `SET status = '<lit>'` only in strings that also reference
+	// the workspaces table — narrows out a2a_queue / agents / approvals
+	// which have their own status enums.
+	literalRE := regexp.MustCompile(`(?is)UPDATE\s+workspaces\b[^']*?SET\s+status\s*=\s*'([^']+)'`)
+
+	var hits []string
+	walkErr := filepath.Walk(srcRoot, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			// Skip vendor + .git + migrations (literals there are intentional).
+			base := filepath.Base(path)
+			if base == "vendor" || base == ".git" || base == "migrations" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+
+		fset := token.NewFileSet()
+		f, parseErr := parser.ParseFile(fset, path, nil, parser.ParseComments)
+		if parseErr != nil {
+			return nil
+		}
+
+		ast.Inspect(f, func(n ast.Node) bool {
+			lit, ok := n.(*ast.BasicLit)
+			if !ok || lit.Kind != token.STRING {
+				return true
+			}
+			s := lit.Value
+			if !strings.Contains(s, "UPDATE workspaces") && !strings.Contains(s, "UPDATE\nworkspaces") && !strings.Contains(s, "UPDATE\n\t\t\tworkspaces") {
+				return true
+			}
+			for _, m := range literalRE.FindAllStringSubmatch(s, -1) {
+				pos := fset.Position(lit.Pos())
+				rel, _ := filepath.Rel(srcRoot, path)
+				hits = append(hits, rel+":"+itoa(pos.Line)+" → SET status = '"+m[1]+"'")
+			}
+			return true
+		})
+		return nil
+	})
+	if walkErr != nil {
+		t.Fatalf("walk %s: %v", srcRoot, walkErr)
+	}
+	sort.Strings(hits)
+	return hits
+}
+
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	neg := n < 0
+	if neg {
+		n = -n
+	}
+	var b [20]byte
+	i := len(b)
+	for n > 0 {
+		i--
+		b[i] = byte('0' + n%10)
+		n /= 10
+	}
+	if neg {
+		i--
+		b[i] = '-'
+	}
+	return string(b[i:])
 }
 
 func findRepoRoot(t *testing.T) string {
