@@ -272,6 +272,9 @@ func InternalURL(workspaceID string) string {
 
 // Start provisions and starts a workspace container.
 func (p *Provisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string, error) {
+	if p == nil || p.cli == nil {
+		return "", ErrNoBackend
+	}
 	name := ContainerName(cfg.WorkspaceID)
 	configVolume := ConfigVolumeName(cfg.WorkspaceID)
 
@@ -807,6 +810,9 @@ func (p *Provisioner) CopyToContainer(ctx context.Context, containerID, dstPath 
 // ExecRead runs "cat <filePath>" in an existing container and returns the output.
 // Used to read config files from a running container before stopping it.
 func (p *Provisioner) ExecRead(ctx context.Context, containerName, filePath string) ([]byte, error) {
+	if p == nil || p.cli == nil {
+		return nil, ErrNoBackend
+	}
 	exec, err := p.cli.ContainerExecCreate(ctx, containerName, container.ExecOptions{
 		Cmd:          []string{"cat", filePath},
 		AttachStdout: true,
@@ -891,6 +897,9 @@ func (p *Provisioner) ReadFromVolume(ctx context.Context, volumeName, filePath s
 // Uses a throwaway alpine container to write directly to the named volume,
 // bypassing the container lifecycle entirely.
 func (p *Provisioner) WriteAuthTokenToVolume(ctx context.Context, workspaceID, token string) error {
+	if p == nil || p.cli == nil {
+		return ErrNoBackend
+	}
 	volName := ConfigVolumeName(workspaceID)
 	resp, err := p.cli.ContainerCreate(ctx, &container.Config{
 		Image: "alpine",
@@ -936,6 +945,9 @@ func (p *Provisioner) execInContainer(ctx context.Context, containerID string, c
 // Also removes the claude-sessions volume (best-effort, may not exist
 // for non claude-code runtimes). Issue #12.
 func (p *Provisioner) RemoveVolume(ctx context.Context, workspaceID string) error {
+	if p == nil || p.cli == nil {
+		return ErrNoBackend
+	}
 	volName := ConfigVolumeName(workspaceID)
 	if err := p.cli.VolumeRemove(ctx, volName, true); err != nil {
 		return fmt.Errorf("failed to remove volume %s: %w", volName, err)
@@ -1139,6 +1151,9 @@ var ErrNoConfigSource = fmt.Errorf("no config.yaml source: template path missing
 // volume read-only. Returns (false, nil) if the file is absent and
 // (false, err) only on Docker-level failures.
 func (p *Provisioner) VolumeHasFile(ctx context.Context, workspaceID, relPath string) (bool, error) {
+	if p == nil || p.cli == nil {
+		return false, ErrNoBackend
+	}
 	volName := ConfigVolumeName(workspaceID)
 	// Confirm the volume exists first — Docker auto-creates on bind otherwise.
 	if _, err := p.cli.VolumeInspect(ctx, volName); err != nil {

@@ -34,7 +34,15 @@ type WorkspaceHandler struct {
 	// satisfies the interface — see the compile-time assertion in
 	// internal/events/broadcaster.go.
 	broadcaster events.EventEmitter
-	provisioner *provisioner.Provisioner
+	// provisioner narrowed from `*provisioner.Provisioner` to the
+	// provisioner.LocalProvisionerAPI interface (#2369) so tests can
+	// substitute a stub without standing up the real Docker daemon.
+	// Production callers still pass *provisioner.Provisioner via
+	// NewWorkspaceHandler, which satisfies the interface — see the
+	// compile-time assertion in internal/provisioner/local_provisioner_api.go.
+	// Mirrors cpProv's interface-typed field for symmetry across both
+	// backends.
+	provisioner provisioner.LocalProvisionerAPI
 	// cpProv narrowed from `*provisioner.CPProvisioner` to the
 	// provisioner.CPProvisionerAPI interface (#1814) so tests can
 	// substitute a stub without standing up the real CP HTTP client +
@@ -60,12 +68,22 @@ type WorkspaceHandler struct {
 }
 
 func NewWorkspaceHandler(b events.EventEmitter, p *provisioner.Provisioner, platformURL, configsDir string) *WorkspaceHandler {
-	return &WorkspaceHandler{
+	h := &WorkspaceHandler{
 		broadcaster: b,
-		provisioner: p,
 		platformURL: platformURL,
 		configsDir:  configsDir,
 	}
+	// Only assign p when the concrete pointer is non-nil. Without this
+	// guard, a `NewWorkspaceHandler(..., nil, ...)` call (which all the
+	// non-Docker test fixtures use) yields a typed-nil interface — the
+	// `if h.provisioner != nil` checks scattered through the SaaS-vs-
+	// Docker fork would incorrectly evaluate as non-nil and route into
+	// the Docker path. Mirrors the pattern documented in the Go FAQ
+	// "Why is my nil error value not equal to nil?".
+	if p != nil {
+		h.provisioner = p
+	}
+	return h
 }
 
 // SetCPProvisioner wires the control plane provisioner for SaaS tenants.
