@@ -919,6 +919,46 @@ func TestIsUpstreamBusyError(t *testing.T) {
 	}
 }
 
+// TestIsUpstreamDeadStatus locks in the status-code matrix that gates
+// reactive container-dead detection. Order matters: the helper exists so
+// the proxy + any future caller (e.g. a sweeper) classify CF dead-origin
+// codes the same way. Drift here would re-introduce the SaaS-blind bug
+// for whichever code we forgot.
+func TestIsUpstreamDeadStatus(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		want   bool
+	}{
+		// Standard proxy-layer dead-upstream codes
+		{"502 BadGateway", 502, true},
+		{"503 ServiceUnavailable", 503, true},
+		{"504 GatewayTimeout", 504, true},
+		// Cloudflare dead-origin family
+		{"521 WebServerDown", 521, true},
+		{"522 ConnectionTimedOut", 522, true},
+		{"523 OriginUnreachable", 523, true},
+		{"524 OriginTimedOut", 524, true},
+		// Negative cases — must NOT trigger restart
+		{"200 OK", 200, false},
+		{"400 BadRequest (agent rejected payload)", 400, false},
+		{"401 Unauthorized", 401, false},
+		{"404 NotFound (no such session)", 404, false},
+		{"408 RequestTimeout (client-side)", 408, false},
+		{"429 TooManyRequests (rate limited, agent alive)", 429, false},
+		{"500 InternalServerError (agent crashed mid-request)", 500, false},
+		{"501 NotImplemented", 501, false},
+		{"505 HTTPVersionNotSupported", 505, false},
+		{"520 WebServerReturnedUnknown (agent returned malformed)", 520, false},
+		{"525 SSLHandshakeFailed (TLS misconfig, not dead origin)", 525, false},
+	}
+	for _, tc := range cases {
+		if got := isUpstreamDeadStatus(tc.status); got != tc.want {
+			t.Errorf("%s: isUpstreamDeadStatus(%d) = %v, want %v", tc.name, tc.status, got, tc.want)
+		}
+	}
+}
+
 // ==================== ProxyA2A — upstream timeout returns 503 busy + Retry-After ====================
 
 // Verifies the full error-shaping contract for the 503-busy path:
@@ -1840,14 +1880,21 @@ func TestStopForRestart_SaaSPath_DispatchesViaCPProv(t *testing.T) {
 	}
 }
 
-// Both nil → no-op, no panic. Defensive guard against the dispatcher being
-// invoked on a misconfigured handler.
+// Both nil → no-op, no panic, no DB / broadcast side effects. Guards the
+// dispatcher against being invoked on a misconfigured handler. Important
+// because runRestartCycle's surrounding flow (status='provisioning' UPDATE
+// + broadcast) MUST happen even when both provisioners are nil — but
+// stopForRestart itself is a pure dispatcher and shouldn't touch state.
 func TestStopForRestart_NoProvisioner_NoOp(t *testing.T) {
+	mock := setupTestDB(t)
 	setupTestRedis(t)
 	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
-	// no provisioner, no cpProv
+	// no provisioner, no cpProv, no DB expectations set on mock — any
+	// unexpected query/exec will produce a sqlmock error.
 	handler.stopForRestart(context.Background(), "ws-orphan")
-	// no panic, no calls — assertion is reaching this line
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("stopForRestart no-provisioner path should not touch DB: %v", err)
+	}
 }
 
 // fakeCPProv satisfies provisioner.CPProvisionerAPI for tests that exercise
