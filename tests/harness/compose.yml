@@ -86,13 +86,13 @@ services:
       PLATFORM_URL: "http://tenant:8080"
       MOLECULE_ENV: "production"
       # SECRETS_ENCRYPTION_KEY is required when MOLECULE_ENV=production —
-      # crypto.InitStrict() refuses to boot without it ("32 bytes raw or
-      # base64-encoded"). The harness uses a clearly-test sentinel so the
-      # production code path is exercised end-to-end (including the
-      # encrypted-secret reads/writes) without coupling to a real key.
-      # Value is base64 of the literal string "harness-test-only-not-for-prod!!"
-      # (exactly 32 bytes). Do NOT copy this to any other environment.
-      SECRETS_ENCRYPTION_KEY: "aGFybmVzcy10ZXN0LW9ubHktbm90LWZvci1wcm9kISE="
+      # crypto.InitStrict() refuses to boot without it. up.sh generates a
+      # fresh 32-byte key per harness lifetime via `openssl rand -base64 32`
+      # and exports it into this compose file's interpolation environment.
+      # The :? sentinel makes the misuse loud — running `docker compose up`
+      # directly without going through up.sh fails fast with a clear error
+      # rather than getting a confusing tenant-unhealthy timeout.
+      SECRETS_ENCRYPTION_KEY: "${SECRETS_ENCRYPTION_KEY:?must be set — run via tests/harness/up.sh, which generates one per run}"
       # ADMIN_TOKEN flips the platform into strict-auth mode (matches
       # production's CP-minted token configuration). Seeded value lets
       # E2E scripts authenticate without going through CP.

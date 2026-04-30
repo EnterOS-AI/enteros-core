@@ -18,6 +18,22 @@ for arg in "$@"; do
     esac
 done
 
+# Generate a per-run encryption key. The tenant runs with
+# MOLECULE_ENV=production (intentional, to replay prod-shape bugs), and
+# crypto.InitStrict() refuses to boot without SECRETS_ENCRYPTION_KEY.
+# Generate fresh so:
+#   - No key-shaped string lives in the repo (avoids muscle-memorying a
+#     hardcoded value into other places + secret-scanner false positives).
+#   - Each harness lifetime gets a unique key, mimicking prod's per-tenant
+#     isolation. Persistence across runs isn't required — the harness DB
+#     is wiped on every ./down.sh.
+# Honor a caller-supplied value if already exported (lets a debug session
+# pin a key for reproducibility).
+if [ -z "${SECRETS_ENCRYPTION_KEY:-}" ]; then
+    SECRETS_ENCRYPTION_KEY=$(openssl rand -base64 32)
+    export SECRETS_ENCRYPTION_KEY
+fi
+
 if [ "$REBUILD" = true ]; then
     docker compose -f compose.yml build --no-cache tenant cp-stub
 fi
