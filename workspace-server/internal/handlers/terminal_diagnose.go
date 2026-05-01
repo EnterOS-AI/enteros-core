@@ -1,18 +1,47 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net/http"
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
 	"github.com/Molecule-AI/molecule-monorepo/platform/internal/provisioner"
+	"github.com/Molecule-AI/molecule-monorepo/platform/internal/wsauth"
 	"github.com/gin-gonic/gin"
 )
+
+// syncBuf is a goroutine-safe writer that wraps bytes.Buffer with a mutex.
+// Used to capture subprocess stderr without racing the os/exec stderr-copy
+// goroutine: ``cmd.Stderr = io.Writer`` spawns a background goroutine that
+// reads from the subprocess's stderr fd and calls Write on our writer, so
+// reading the buffer from another goroutine (e.g., on wait-for-port
+// timeout while the tunnel may still be writing) without synchronization
+// is a data race that ``go test -race`` would flag. ``strings.Builder``
+// and bare ``bytes.Buffer`` aren't goroutine-safe; this tiny shim is the
+// cheapest fix.
+type syncBuf struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuf) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuf) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
 
 // HandleDiagnose handles GET /workspaces/:id/terminal/diagnose. It runs the
 // same per-step pipeline as HandleConnect (ssh-keygen → EIC send-key → tunnel
@@ -44,6 +73,29 @@ func (h *TerminalHandler) HandleDiagnose(c *gin.Context) {
 	workspaceID := c.Param("id")
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
 	defer cancel()
+
+	// KI-005 hierarchy check — same shape as HandleConnect. Without this,
+	// an org-level token holder can probe any workspace in their tenant by
+	// guessing the UUID, learning its diagnostic state (which IAM call
+	// fails, what sshd says) even when they don't own it. Per-workspace
+	// bearer tokens are already URL-bound by WorkspaceAuth, so the gap is
+	// org tokens — same vector KI-005 closed for /terminal (#1609).
+	callerID := c.GetHeader("X-Workspace-ID")
+	if callerID != "" && callerID != workspaceID {
+		tok := wsauth.BearerTokenFromHeader(c.GetHeader("Authorization"))
+		if tok != "" {
+			if err := wsauth.ValidateToken(ctx, db.DB, callerID, tok); err != nil {
+				if c.GetString("org_token_id") == "" {
+					c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid token for claimed workspace"})
+					return
+				}
+			}
+		}
+		if !canCommunicateCheck(callerID, workspaceID) {
+			c.JSON(http.StatusForbidden, gin.H{"error": "not authorized to diagnose this workspace's terminal"})
+			return
+		}
+	}
 
 	var instanceID string
 	_ = db.DB.QueryRowContext(ctx,
@@ -155,8 +207,8 @@ func (h *TerminalHandler) diagnoseRemote(ctx context.Context, workspaceID, insta
 
 	pubKey, err := os.ReadFile(keyPath + ".pub")
 	if err != nil {
-		return stop("ssh-keygen", diagnoseStep{
-			Name:  "ssh-keygen",
+		return stop("read-pubkey", diagnoseStep{
+			Name:  "read-pubkey",
 			Error: fmt.Sprintf("read pubkey: %v", err),
 		})
 	}
@@ -201,7 +253,7 @@ func (h *TerminalHandler) diagnoseRemote(ctx context.Context, workspaceID, insta
 	t0 = time.Now()
 	tunnel := openTunnelCmd(opts)
 	tunnel.Env = os.Environ()
-	var tunnelStderr strings.Builder
+	var tunnelStderr syncBuf
 	tunnel.Stderr = &tunnelStderr
 	if err := tunnel.Start(); err != nil {
 		return stop("open-tunnel", diagnoseStep{

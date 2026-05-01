@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http/httptest"
 	"os/exec"
+	"strconv"
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
@@ -111,6 +112,53 @@ func TestHandleDiagnose_RoutesToLocal(t *testing.T) {
 	}
 }
 
+// TestHandleDiagnose_KI005_RejectsCrossWorkspace — the diagnostic endpoint
+// has the same cross-workspace info-leak surface as /terminal had before
+// #1609. Without KI-005, an org-level token holder could probe any
+// workspace in their tenant by guessing the UUID, learning which IAM call
+// fails or which sshd error fires. This test pins that HandleDiagnose
+// applies the same hierarchy guard as HandleConnect (parity: ws-attacker
+// claiming X-Workspace-ID against /workspaces/ws-victim/terminal/diagnose
+// must 403, never reaching the SELECT COALESCE for instance_id).
+func TestHandleDiagnose_KI005_RejectsCrossWorkspace(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+
+	// Stub CanCommunicate to deny. Reset after — same pattern as the
+	// HandleConnect KI-005 tests.
+	prev := canCommunicateCheck
+	canCommunicateCheck = func(callerID, targetID string) bool { return false }
+	defer func() { canCommunicateCheck = prev }()
+
+	// Token validation: caller's bearer is bound to ws-attacker.
+	mock.ExpectQuery(`SELECT t\.id, t\.workspace_id\s+FROM workspace_auth_tokens t`).
+		WithArgs(sqlmock.AnyArg()).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "workspace_id"}).AddRow("tok-1", "ws-attacker"))
+	mock.ExpectExec(`UPDATE workspace_auth_tokens SET last_used_at`).
+		WithArgs(sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	h := NewTerminalHandler(nil)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-victim"}}
+	c.Request = httptest.NewRequest("GET", "/workspaces/ws-victim/terminal/diagnose", nil)
+	c.Request.Header.Set("X-Workspace-ID", "ws-attacker")
+	c.Request.Header.Set("Authorization", "Bearer attacker-token")
+
+	h.HandleDiagnose(c)
+
+	if w.Code != 403 {
+		t.Errorf("cross-workspace diagnose: got %d, want 403 (%s)", w.Code, w.Body.String())
+	}
+	// Critically: the SELECT COALESCE for instance_id must NOT have run —
+	// no expectation was set for it. ExpectationsWereMet ensures we
+	// rejected before reaching the DB lookup.
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations (rejection should fire before instance_id lookup): %v", err)
+	}
+}
+
 // TestDiagnoseRemote_StopsAtSSHProbe — full happy path through send-key,
 // pick-port, open-tunnel, wait-for-port, then stub the ssh probe to fail.
 // Confirms first_failure surfaces the actual ssh stderr ("Permission
@@ -144,7 +192,7 @@ func TestDiagnoseRemote_StopsAtSSHProbe(t *testing.T) {
 		// fall back to a portable busy-wait).
 		return exec.Command("sh", "-c",
 			`port="$1"; while true; do nc -l "$port" >/dev/null 2>&1 || true; done`,
-			"sh", numToString(o.LocalPort))
+			"sh", strconv.Itoa(o.LocalPort))
 	}
 	defer func() { openTunnelCmd = prevTun }()
 
@@ -197,26 +245,3 @@ func TestDiagnoseRemote_StopsAtSSHProbe(t *testing.T) {
 	}
 }
 
-// numToString is a tiny helper to avoid pulling fmt into the test for one
-// integer-to-string call. Same observable behavior as strconv.Itoa.
-func numToString(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	var buf [20]byte
-	i := len(buf)
-	neg := n < 0
-	if neg {
-		n = -n
-	}
-	for n > 0 {
-		i--
-		buf[i] = byte('0' + n%10)
-		n /= 10
-	}
-	if neg {
-		i--
-		buf[i] = '-'
-	}
-	return string(buf[i:])
-}
