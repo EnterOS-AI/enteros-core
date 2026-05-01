@@ -78,6 +78,7 @@ TOP_LEVEL_MODULES = {
     "prompt",
     "runtime_wedge",
     "shared_runtime",
+    "smoke_mode",
     "transcript_auth",
     "watcher",
 }
