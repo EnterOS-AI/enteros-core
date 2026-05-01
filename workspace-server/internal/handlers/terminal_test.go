@@ -320,6 +320,7 @@ func TestSSHCommandCmd_BuildsArgv(t *testing.T) {
 		"-i", "/tmp/k",
 		"-o", "StrictHostKeyChecking=no",
 		"-o", "UserKnownHostsFile=/dev/null",
+		"-o", "ConnectTimeout=10",
 		"-o", "ServerAliveInterval=30",
 		"-o", "ServerAliveCountMax=3",
 		"-p", "2222",
