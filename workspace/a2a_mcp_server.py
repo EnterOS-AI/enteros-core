@@ -248,13 +248,6 @@ def _build_channel_instructions() -> str:
     )
 
 
-# Module-level frozen copy preserves the import-time-stable identity
-# tests + tooling rely on (e.g. wheel-smoke import probes). The function
-# above is the source of truth at runtime — `_build_initialize_result`
-# always calls it fresh so env changes between launches take effect.
-_CHANNEL_INSTRUCTIONS = _build_channel_instructions()
-
-
 def _build_initialize_result() -> dict:
     """MCP initialize handshake result.
 
