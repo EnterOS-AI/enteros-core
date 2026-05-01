@@ -400,28 +400,12 @@ function ProviderPickerModal({
                     <div className="text-[9px] font-mono text-zinc-500">{entry.key}</div>
                   </div>
                   {entry.saved && (
-                    <div className="flex items-center gap-1.5">
-                      <span className="text-[9px] text-emerald-400 bg-emerald-900/30 px-1.5 py-0.5 rounded flex items-center gap-1">
-                        <svg width="8" height="8" viewBox="0 0 8 8" fill="none" aria-hidden="true">
-                          <path d="M1.5 4L3.5 6L6.5 2" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round" />
-                        </svg>
-                        Saved
-                      </span>
-                      {/* Allow override when the saved state came from a
-                          pre-configured global secret — the user may want
-                          to use a different key for this workspace. */}
-                      {configuredKeys?.has(entry.key) && (
-                        <button
-                          type="button"
-                          onClick={() =>
-                            updateEntry(index, { saved: false, value: "" })
-                          }
-                          className="text-[9px] text-zinc-400 hover:text-zinc-200 underline"
-                        >
-                          Override
-                        </button>
-                      )}
-                    </div>
+                    <span className="text-[9px] text-emerald-400 bg-emerald-900/30 px-1.5 py-0.5 rounded flex items-center gap-1">
+                      <svg width="8" height="8" viewBox="0 0 8 8" fill="none" aria-hidden="true">
+                        <path d="M1.5 4L3.5 6L6.5 2" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round" />
+                      </svg>
+                      Saved
+                    </span>
                   )}
                 </div>
 

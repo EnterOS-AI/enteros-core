@@ -6,7 +6,6 @@ import {
   checkDeploySecrets,
   resolveRuntime,
   type PreflightResult,
-  type SecretEntry,
   type Template,
 } from "@/lib/deploy-preflight";
 import { MissingKeysModal } from "@/components/MissingKeysModal";
@@ -45,15 +44,14 @@ export interface UseTemplateDeployOptions {
 /** Paired template + preflight result carried through the "user
  *  clicked deploy → modal opens → keys saved → retry" loop. Named
  *  so the `useState` generic and any future signature change have
- *  a single place to track. `configuredKeys` lets the modal mark
- *  pre-saved entries (global secrets) without re-prompting — the
+ *  a single place to track. `preflight.configuredKeys` lets the
+ *  modal mark pre-saved entries without re-prompting — the
  *  template-deploy "always ask" flow surfaces the picker even when
  *  preflight.ok is true so the user can pick a different provider
  *  per workspace. */
 interface MissingKeysInfo {
   template: Template;
   preflight: PreflightResult;
-  configuredKeys: Set<string>;
 }
 
 export interface UseTemplateDeployResult {
@@ -157,21 +155,7 @@ export function useTemplateDeploy(
       const shouldShowPicker =
         !preflight.ok || preflight.providers.length >= 2;
       if (shouldShowPicker) {
-        // Read the secret set the modal needs to mark pre-saved
-        // entries. We did this inside checkDeploySecrets too but
-        // didn't surface it; pull it again so a slow secrets
-        // endpoint failing here doesn't block the modal — empty
-        // set just means everything renders as input.
-        let configuredKeys = new Set<string>();
-        try {
-          const secrets = await api.get<SecretEntry[]>("/settings/secrets");
-          configuredKeys = new Set(
-            secrets.filter((s) => s.has_value).map((s) => s.key),
-          );
-        } catch {
-          // Empty set — modal will render every entry as input.
-        }
-        setMissingKeysInfo({ template, preflight, configuredKeys });
+        setMissingKeysInfo({ template, preflight });
         setDeploying(null);
         return;
       }
@@ -201,7 +185,7 @@ export function useTemplateDeploy(
     ? "Configure Workspace"
     : undefined;
   const modalDescription = allConfigured
-    ? "Pick the provider and model for this workspace. Saved API keys are reused — click Override to use a different one."
+    ? "Pick the provider and model for this workspace. Saved API keys are reused automatically."
     : undefined;
   const modal: ReactNode = (
     <MissingKeysModal
@@ -209,7 +193,7 @@ export function useTemplateDeploy(
       missingKeys={missingKeysInfo?.preflight.missingKeys ?? []}
       providers={missingKeysInfo?.preflight.providers ?? []}
       runtime={missingKeysInfo?.preflight.runtime ?? ""}
-      configuredKeys={missingKeysInfo?.configuredKeys}
+      configuredKeys={missingKeysInfo?.preflight.configuredKeys}
       modelSuggestions={isMultiProvider ? modelSuggestions : undefined}
       initialModel={isMultiProvider ? initialModel : undefined}
       title={modalTitle}

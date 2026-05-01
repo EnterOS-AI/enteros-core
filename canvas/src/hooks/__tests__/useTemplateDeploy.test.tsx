@@ -129,6 +129,7 @@ beforeEach(() => {
     missingKeys: [],
     providers: [],
     runtime: "claude-code",
+    configuredKeys: new Set(),
   });
   mockApiPost.mockResolvedValue({ id: "ws-new" });
   // Default: secrets endpoint returns nothing so the picker
@@ -232,6 +233,7 @@ describe("useTemplateDeploy — preflight failure modes", () => {
       missingKeys: ["ANTHROPIC_API_KEY"],
       providers: [],
       runtime: "claude-code",
+      configuredKeys: new Set(),
     });
     const onDeployed = vi.fn();
 
@@ -259,6 +261,7 @@ describe("useTemplateDeploy — modal lifecycle", () => {
       missingKeys: ["ANTHROPIC_API_KEY"],
       providers: [],
       runtime: "claude-code",
+      configuredKeys: new Set(),
     });
     const onDeployed = vi.fn();
     const { result, rerender } = renderHook(() =>
@@ -293,6 +296,7 @@ describe("useTemplateDeploy — modal lifecycle", () => {
       missingKeys: ["ANTHROPIC_API_KEY"],
       providers: [],
       runtime: "claude-code",
+      configuredKeys: new Set(),
     });
     const { result, rerender } = renderHook(() => useTemplateDeploy());
 
@@ -345,11 +349,8 @@ describe("useTemplateDeploy — multi-provider always-ask flow", () => {
         { id: "ANTHROPIC_API_KEY", label: "Anthropic", envVars: ["ANTHROPIC_API_KEY"] },
       ],
       runtime: "hermes",
+      configuredKeys: new Set(["MINIMAX_API_KEY", "ANTHROPIC_API_KEY"]),
     });
-    mockApiGet.mockResolvedValueOnce([
-      { key: "MINIMAX_API_KEY", has_value: true, created_at: "", updated_at: "" },
-      { key: "ANTHROPIC_API_KEY", has_value: true, created_at: "", updated_at: "" },
-    ]);
     const { result, rerender } = renderHook(() => useTemplateDeploy());
 
     await act(async () => {
@@ -381,6 +382,7 @@ describe("useTemplateDeploy — multi-provider always-ask flow", () => {
         { id: "ANTHROPIC_API_KEY", label: "Anthropic", envVars: ["ANTHROPIC_API_KEY"] },
       ],
       runtime: "hermes",
+      configuredKeys: new Set(),
     });
     const { result, rerender } = renderHook(() => useTemplateDeploy());
 
@@ -408,6 +410,7 @@ describe("useTemplateDeploy — multi-provider always-ask flow", () => {
         { id: "ANTHROPIC_API_KEY", label: "Anthropic", envVars: ["ANTHROPIC_API_KEY"] },
       ],
       runtime: "hermes",
+      configuredKeys: new Set(),
     });
     const { result, rerender } = renderHook(() => useTemplateDeploy());
 
@@ -449,7 +452,11 @@ describe("useTemplateDeploy — multi-provider always-ask flow", () => {
     expect(onDeployed).toHaveBeenCalledWith("ws-new");
   });
 
-  it("secrets fetch failure still opens picker (empty configuredKeys)", async () => {
+  it("empty configuredKeys (preflight defensive fallback) still opens picker", async () => {
+    // checkDeploySecrets falls back to an empty Set when the
+    // /settings/secrets endpoint errors — the modal must still
+    // open so the user isn't blocked, just with every entry
+    // rendered as input rather than Saved.
     mockCheckDeploySecrets.mockResolvedValueOnce({
       ok: true,
       missingKeys: [],
@@ -458,8 +465,8 @@ describe("useTemplateDeploy — multi-provider always-ask flow", () => {
         { id: "ANTHROPIC_API_KEY", label: "Anthropic", envVars: ["ANTHROPIC_API_KEY"] },
       ],
       runtime: "hermes",
+      configuredKeys: new Set(),
     });
-    mockApiGet.mockRejectedValueOnce(new Error("secrets fetch down"));
     const { result, rerender } = renderHook(() => useTemplateDeploy());
 
     await act(async () => {
