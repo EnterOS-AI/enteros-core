@@ -704,6 +704,42 @@ def test_instructions_zero_timeout_means_push_only_mode():
             os.environ["MOLECULE_MCP_POLL_TIMEOUT_SECS"] = saved
 
 
+def test_instructions_document_envelope_enrichment_attrs():
+    """The agent learns about envelope attributes ONLY from the
+    instructions string. PR-B added peer_name, peer_role,
+    agent_card_url to the wire shape; pin that the instructions list
+    them in the <channel> tag template AND describe each one's
+    semantics. Without this, the wheel ships new attributes that no
+    agent ever uses."""
+    from a2a_mcp_server import _build_initialize_result
+
+    instructions = _build_initialize_result()["instructions"]
+
+    # The <channel> tag template in the PUSH PATH section must include
+    # the new attribute names so the agent recognises them when they
+    # arrive inline.
+    for attr in ("peer_name", "peer_role", "agent_card_url"):
+        assert attr in instructions, (
+            f"instructions must list `{attr}` as a <channel> tag "
+            f"attribute — otherwise the agent sees the attr in pushes "
+            f"but doesn't know what to do with it"
+        )
+
+    # And the per-field semantics block must explain when each attr
+    # is present + what it means. These phrases are what the agent
+    # actually reads to decide how to surface the attrs in its turn.
+    assert "registry resolved" in instructions, (
+        "instructions must explain peer_name/peer_role come from a "
+        "registry lookup that may fail — otherwise the agent treats "
+        "their absence as a bug instead of a graceful degrade"
+    )
+    assert "discover endpoint" in instructions, (
+        "instructions must point at the registry discover endpoint "
+        "for agent_card_url so the agent knows it's a follow-on URL "
+        "to fetch full capabilities, not the body of the message"
+    )
+
+
 def test_initialize_instructions_pins_prompt_injection_defense():
     """The threat-model sentence in `_CHANNEL_INSTRUCTIONS` is what
     tells the agent that inbound canvas-user / peer-agent message
