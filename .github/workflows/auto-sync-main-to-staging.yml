@@ -60,6 +60,24 @@ name: Auto-sync main → staging
 on:
   push:
     branches: [main]
+  # workflow_dispatch lets:
+  #   1. Operators manually backfill a missed sync (e.g. after a manual
+  #      UI merge that the runner missed).
+  #   2. auto-promote-staging.yml's polling tail explicitly invoke us
+  #      after the promote PR lands. This is load-bearing: when the
+  #      merge queue lands a promote-PR merge, the resulting push to
+  #      `main` is "by GITHUB_TOKEN", and per GitHub's no-recursion
+  #      rule (https://docs.github.com/en/actions/using-workflows/triggering-a-workflow#triggering-a-workflow-from-a-workflow)
+  #      that push event does NOT fire any downstream workflows. The
+  #      `on: push` trigger above is silently dead for the very pattern
+  #      we exist to handle. Verified empirically 2026-05-02 against
+  #      SHA 76c604fb (PR #2437 staging→main): only ONE workflow fired
+  #      (publish-workspace-server-image, dispatched explicitly by
+  #      auto-promote's polling tail with an App token). Every other
+  #      `on: push: branches: [main]` workflow — including this one —
+  #      was suppressed. Until the underlying merge call moves to an
+  #      App token, an explicit dispatch is the only reliable path.
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -71,8 +89,14 @@ concurrency:
 
 jobs:
   sync-staging:
-    # Self-hosted Mac mini matches the rest of this repo's workflows.
-    runs-on: [self-hosted, macos, arm64]
+    # ubuntu-latest matches every other workflow in this repo. The
+    # earlier `[self-hosted, macos, arm64]` was a copy-paste artefact
+    # from the molecule-controlplane repo (which IS private and uses a
+    # Mac runner) — molecule-core has no Mac runner registered, so the
+    # job sat unassigned whenever the trigger fired. Verified 2026-05-02:
+    # this is the ONLY workflow in molecule-core/.github/workflows/ with
+    # a non-ubuntu runs-on.
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout staging
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
