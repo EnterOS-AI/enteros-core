@@ -3,7 +3,7 @@
 import asyncio
 import json
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -240,6 +240,223 @@ def test_build_channel_notification_handles_missing_fields_gracefully():
     assert meta["activity_id"] == ""
     assert meta["peer_id"] == ""
     assert meta["kind"] == ""
+
+
+# ----- Channel envelope enrichment (peer_name / peer_role / agent_card_url) ---
+#
+# The bare envelope only carries `peer_id` for peer_agent inbound, so the
+# receiving agent has to round-trip to /registry to find out who's
+# talking. Enrichment surfaces the sender's display name, role, and an
+# agent-card URL alongside the routing fields so the agent can render
+# "ops-agent (sre): hi" in one shot. Cache-backed and TTL'd so a busy
+# multi-peer chat doesn't hit the registry on every push.
+#
+# Tests pin: cache hit, cache miss + registry hit, registry miss
+# (graceful degrade), TTL expiry, canvas_user (no enrichment), and the
+# agent_card_url surfaces even when the registry is reachable but
+# returns nothing usable.
+
+
+_PEER_UUID = "11111111-2222-3333-4444-555555555555"
+_OTHER_PEER = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+
+@pytest.fixture()
+def _reset_peer_metadata_cache(monkeypatch):
+    """Each test starts with a clean ``_peer_metadata`` cache so an
+    earlier test's hit doesn't satisfy a later test's miss. Mutates the
+    module-level dict in place rather than reassigning so other modules
+    that imported the dict by reference still see the same instance."""
+    import a2a_client
+    a2a_client._peer_metadata.clear()
+    yield
+    a2a_client._peer_metadata.clear()
+
+
+def _make_httpx_response(status_code: int, json_body: object) -> MagicMock:
+    resp = MagicMock()
+    resp.status_code = status_code
+    resp.json.return_value = json_body
+    return resp
+
+
+def _patch_httpx_client(returning: MagicMock):
+    """Replace httpx.Client with a context-manager mock returning
+    ``returning`` from .get(). Mirrors the inbox tests' pattern so a
+    future refactor of the registry GET path can be re-tested with the
+    same harness."""
+    client = MagicMock()
+    client.__enter__ = MagicMock(return_value=client)
+    client.__exit__ = MagicMock(return_value=False)
+    client.get = MagicMock(return_value=returning)
+    return patch("httpx.Client", return_value=client), client
+
+
+def test_envelope_enrichment_canvas_user_has_no_peer_fields(_reset_peer_metadata_cache):
+    """canvas_user pushes have no peer (peer_id=''). The enrichment
+    block must short-circuit so we don't fire a wasted registry GET +
+    don't add empty peer_name/role/agent_card_url to the meta dict."""
+    from a2a_mcp_server import _build_channel_notification
+
+    payload = _build_channel_notification({
+        "activity_id": "act-1",
+        "text": "hello from canvas",
+        "peer_id": "",
+        "kind": "canvas_user",
+        "method": "message/send",
+        "created_at": "2026-05-01T00:00:00Z",
+    })
+    meta = payload["params"]["meta"]
+    assert "peer_name" not in meta
+    assert "peer_role" not in meta
+    assert "agent_card_url" not in meta
+
+
+def test_envelope_enrichment_uses_cache_when_present(_reset_peer_metadata_cache):
+    """Cache hit: registry NOT called, meta carries the cached fields.
+    This is the hot path on a busy multi-peer chat — every cache hit
+    saves a 2-second timeout-bounded registry GET."""
+    import a2a_client
+    from a2a_mcp_server import _build_channel_notification
+    import time as _time
+
+    a2a_client._peer_metadata[_PEER_UUID] = (
+        _time.monotonic(),
+        {"id": _PEER_UUID, "name": "ops-agent", "role": "sre", "status": "online"},
+    )
+
+    p, client = _patch_httpx_client(_make_httpx_response(200, {}))
+    with p:
+        payload = _build_channel_notification({
+            "activity_id": "act-2",
+            "text": "ping",
+            "peer_id": _PEER_UUID,
+            "kind": "peer_agent",
+            "method": "message/send",
+            "created_at": "2026-05-01T01:23:45Z",
+        })
+
+    assert client.get.call_count == 0, "cache hit must not fire a registry GET"
+    meta = payload["params"]["meta"]
+    assert meta["peer_id"] == _PEER_UUID
+    assert meta["peer_name"] == "ops-agent"
+    assert meta["peer_role"] == "sre"
+    assert meta["agent_card_url"].endswith(f"/registry/discover/{_PEER_UUID}")
+
+
+def test_envelope_enrichment_fetches_on_cache_miss(_reset_peer_metadata_cache):
+    """Cache miss + registry hit: GET fires, response cached, meta
+    carries fetched fields. Subsequent build for the same peer must
+    NOT re-fetch (cache populated by first call)."""
+    import a2a_client
+    from a2a_mcp_server import _build_channel_notification
+
+    p, client = _patch_httpx_client(
+        _make_httpx_response(
+            200,
+            {"id": _PEER_UUID, "name": "fetched-name", "role": "router", "status": "online"},
+        )
+    )
+    with p:
+        payload1 = _build_channel_notification({
+            "peer_id": _PEER_UUID, "kind": "peer_agent", "text": "first",
+        })
+        payload2 = _build_channel_notification({
+            "peer_id": _PEER_UUID, "kind": "peer_agent", "text": "second",
+        })
+
+    assert client.get.call_count == 1, (
+        f"second push for same peer must use cache, got {client.get.call_count} GETs"
+    )
+    assert payload1["params"]["meta"]["peer_name"] == "fetched-name"
+    assert payload2["params"]["meta"]["peer_name"] == "fetched-name"
+
+
+def test_envelope_enrichment_degrades_on_registry_failure(_reset_peer_metadata_cache):
+    """Registry returns 500 (or 4xx, or network error): enrichment
+    silently degrades to bare peer_id. The push must not crash, the
+    push must not block, and the agent_card_url must still surface
+    because it's constructable from peer_id alone."""
+    from a2a_mcp_server import _build_channel_notification
+
+    p, _ = _patch_httpx_client(_make_httpx_response(500, {}))
+    with p:
+        payload = _build_channel_notification({
+            "activity_id": "act-3",
+            "text": "ping",
+            "peer_id": _PEER_UUID,
+            "kind": "peer_agent",
+            "method": "message/send",
+            "created_at": "2026-05-01T00:00:00Z",
+        })
+
+    meta = payload["params"]["meta"]
+    assert meta["peer_id"] == _PEER_UUID
+    assert "peer_name" not in meta
+    assert "peer_role" not in meta
+    assert meta["agent_card_url"].endswith(f"/registry/discover/{_PEER_UUID}"), (
+        "agent_card_url must be present even on registry failure — "
+        "it's deterministic from peer_id and gives the agent a single "
+        "endpoint to retry against"
+    )
+
+
+def test_envelope_enrichment_re_fetches_after_ttl(_reset_peer_metadata_cache):
+    """Cached entry past TTL: registry is hit again. Pin the TTL
+    behaviour so a future caller bumping ``_PEER_METADATA_TTL_SECONDS``
+    doesn't accidentally make the cache permanent."""
+    import a2a_client
+    from a2a_mcp_server import _build_channel_notification
+
+    # Stale entry: fetched 1 hour ago (>> 5 min TTL).
+    a2a_client._peer_metadata[_PEER_UUID] = (
+        0.0,  # treated as ancient relative to time.monotonic()
+        {"id": _PEER_UUID, "name": "stale-name", "role": "old"},
+    )
+
+    p, client = _patch_httpx_client(
+        _make_httpx_response(
+            200,
+            {"id": _PEER_UUID, "name": "fresh-name", "role": "new", "status": "online"},
+        )
+    )
+    with p:
+        payload = _build_channel_notification({
+            "peer_id": _PEER_UUID, "kind": "peer_agent", "text": "ping",
+        })
+
+    assert client.get.call_count == 1, "stale cache must trigger a re-fetch"
+    assert payload["params"]["meta"]["peer_name"] == "fresh-name"
+    assert payload["params"]["meta"]["peer_role"] == "new"
+
+
+def test_envelope_enrichment_invalid_peer_id_skips_lookup(_reset_peer_metadata_cache):
+    """Defensive: a malformed peer_id (not a UUID) must not crash the
+    push path or cause a registry GET to be fired against an unsanitised
+    URL. enrich_peer_metadata returns None on validation failure; the
+    enrichment fields are simply absent."""
+    from a2a_mcp_server import _build_channel_notification
+
+    p, client = _patch_httpx_client(_make_httpx_response(200, {}))
+    with p:
+        payload = _build_channel_notification({
+            "peer_id": "not-a-uuid",
+            "kind": "peer_agent",
+            "text": "evil",
+        })
+
+    assert client.get.call_count == 0, (
+        "invalid peer_id must not reach a network call — UUID validation "
+        "guards the URL-construction surface"
+    )
+    meta = payload["params"]["meta"]
+    assert meta["peer_id"] == "not-a-uuid"
+    assert "peer_name" not in meta
+    assert "peer_role" not in meta
+    # agent_card_url is constructed unconditionally from peer_id; even on
+    # an invalid id it's harmless (the receiving agent's GET will 404
+    # and it can fall back to inbox_pop without enrichment).
+    assert meta["agent_card_url"] == f"{__import__('a2a_client').PLATFORM_URL}/registry/discover/not-a-uuid"
 
 
 # ============== initialize handshake — capability declaration ==============
