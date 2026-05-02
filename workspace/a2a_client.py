@@ -30,6 +30,104 @@ else:
 # Cache workspace ID → name mappings (populated by list_peers calls)
 _peer_names: dict[str, str] = {}
 
+# Cache workspace ID → full peer record (id, name, role, status, url, ...).
+# Populated by tool_list_peers and by the lazy registry lookup in
+# enrich_peer_metadata. The notification-callback path (channel envelope
+# enrichment) reads this cache on every inbound peer_agent push, so a
+# bare ``dict[str, tuple[float, dict | None]]`` is the fastest read
+# shape; entries carry their fetched-at timestamp so TTL eviction is
+# in-line with the lookup. ``None`` as the record is the negative-cache
+# sentinel: registry failure is cached for one TTL window so we don't
+# re-fire the 2s-bounded GET on every push from a flaky peer.
+_peer_metadata: dict[str, tuple[float, dict | None]] = {}
+
+# How long an entry in ``_peer_metadata`` is treated as fresh. 5 minutes
+# is the same window we use for delegation routing — long enough that a
+# busy agent receiving repeated pushes from one peer doesn't hit the
+# registry on every push, short enough that role/name renames propagate
+# within a single agent session.
+_PEER_METADATA_TTL_SECONDS = 300.0
+
+
+def enrich_peer_metadata(peer_id: str, *, now: float | None = None) -> dict | None:
+    """Return cached or freshly-fetched metadata for ``peer_id``.
+
+    Sync helper — safe to call from the inbox poller's notification
+    callback thread (which is not async). Hits the in-process cache
+    first; on miss or TTL expiry, GETs ``/registry/discover/<peer_id>``
+    synchronously with a tight timeout. Returns None on validation
+    failure, network failure, or non-200 response so callers can
+    degrade gracefully (the channel envelope falls back to the raw
+    ``peer_id`` instead of crashing the push path).
+
+    Negative caching: failure outcomes (4xx/5xx/non-JSON/network
+    exception) are stored as ``(now, None)`` and treated as
+    fresh-but-empty for the TTL window. Without this, a peer with a
+    flaky/missing registry record would re-fire the 2s-bounded GET on
+    EVERY push — turning the cache into a no-op for the exact failure
+    scenarios it most needs to defend against.
+
+    The fetched dict is stored as-is, so callers can read whatever
+    fields the platform exposes (currently: ``id``, ``name``, ``role``,
+    ``status``, ``url``). New fields surface automatically without a
+    code change here.
+    """
+    canon = _validate_peer_id(peer_id)
+    if canon is None:
+        return None
+
+    current = now if now is not None else time.monotonic()
+    cached = _peer_metadata.get(canon)
+    if cached is not None:
+        fetched_at, record = cached
+        if current - fetched_at < _PEER_METADATA_TTL_SECONDS:
+            # Fresh entry — return whatever's there. ``None`` is the
+            # negative-cache sentinel: caller treats absence of fields
+            # the same as a registry miss, which is the desired UX.
+            return record
+
+    url = f"{PLATFORM_URL}/registry/discover/{canon}"
+    try:
+        with httpx.Client(timeout=2.0) as client:
+            resp = client.get(url, headers={"X-Workspace-ID": WORKSPACE_ID, **auth_headers()})
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("enrich_peer_metadata: GET %s failed: %s", url, exc)
+        _peer_metadata[canon] = (current, None)
+        return None
+
+    if resp.status_code != 200:
+        logger.debug(
+            "enrich_peer_metadata: %s returned HTTP %d", url, resp.status_code
+        )
+        _peer_metadata[canon] = (current, None)
+        return None
+
+    try:
+        data = resp.json()
+    except Exception:  # noqa: BLE001
+        _peer_metadata[canon] = (current, None)
+        return None
+    if not isinstance(data, dict):
+        _peer_metadata[canon] = (current, None)
+        return None
+
+    _peer_metadata[canon] = (current, data)
+    if name := data.get("name"):
+        _peer_names[canon] = name
+    return data
+
+
+def _agent_card_url_for(peer_id: str) -> str:
+    """Construct the platform-side agent-card URL for ``peer_id``.
+
+    Uses the registry's discovery path so the agent receiving a push
+    can hit a single endpoint to enumerate the sender's capabilities
+    + role + URL. Same shape every workspace exposes regardless of
+    runtime — claude-code, hermes, langchain wrappers all register
+    through ``/registry/register`` and surface through ``/registry/discover``.
+    """
+    return f"{PLATFORM_URL}/registry/discover/{peer_id}"
+
 # Sentinel prefix for errors originating from send_a2a_message / child agents.
 # Used by delegate_task to distinguish real errors from normal response text.
 _A2A_ERROR_PREFIX = "[A2A_ERROR] "

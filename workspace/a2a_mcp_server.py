@@ -49,8 +49,10 @@ from a2a_client import (  # noqa: F401, E402
     PLATFORM_URL,
     WORKSPACE_ID,
     _A2A_ERROR_PREFIX,
+    _agent_card_url_for,
     _peer_names,
     discover_peer,
+    enrich_peer_metadata,
     get_peers,
     get_workspace_info,
     send_a2a_message,
@@ -226,8 +228,9 @@ def _build_channel_instructions() -> str:
         "\n"
         "PUSH PATH (Claude Code with channel push enabled):\n"
         "Messages arrive as <channel source=\"molecule\" kind=\"...\" "
-        "peer_id=\"...\" activity_id=\"...\" ts=\"...\"> tags as a "
-        "synthetic user turn — no agent action needed to surface them.\n"
+        "peer_id=\"...\" peer_name=\"...\" peer_role=\"...\" "
+        "agent_card_url=\"...\" activity_id=\"...\" ts=\"...\"> tags as "
+        "a synthetic user turn — no agent action needed to surface them.\n"
         "\n"
         "POLL PATH (every other MCP client + Claude Code without push "
         "enabled — this is the universal default):\n"
@@ -239,6 +242,16 @@ def _build_channel_instructions() -> str:
         "delegating to you).\n"
         "- `peer_id` is empty for canvas_user, set to the sender "
         "workspace UUID for peer_agent.\n"
+        "- `peer_name` and `peer_role` are present for peer_agent when "
+        "the platform registry resolved the sender — e.g. "
+        "`peer_name=\"ops-agent\"`, `peer_role=\"sre\"`. Surface these "
+        "in your reasoning so the user can tell which peer is talking "
+        "without having to memorise UUIDs. Absent on canvas_user and "
+        "on a registry-lookup failure (the push still delivers).\n"
+        "- `agent_card_url` is present for peer_agent and points at "
+        "the platform's discover endpoint for that peer — fetch it if "
+        "you need the peer's full capability list (skills, role, "
+        "runtime).\n"
         "- `activity_id` is the inbox row to acknowledge.\n"
         "\n"
         "Reply path:\n"
@@ -377,23 +390,42 @@ def _build_channel_notification(msg: dict) -> dict:
     """Transform an ``InboxMessage.to_dict()`` into the MCP notification
     envelope expected by Claude Code's channel-bridge contract.
 
-    Pure function so the wire shape is unit-testable without spinning
-    up an asyncio loop. The wire-up in ``main()`` just composes this
-    with ``asyncio.run_coroutine_threadsafe``.
+    Side-effecting only via the in-process peer-metadata cache: if the
+    message is from a peer agent, this calls ``enrich_peer_metadata``
+    to surface the peer's name, role, and agent-card URL alongside the
+    raw ``peer_id``. The cache is TTL'd at the source, so a busy agent
+    receiving repeated pushes from one peer doesn't hit the registry on
+    every push. Enrichment failure is logged at DEBUG and degraded to
+    bare ``peer_id`` — the push must never block on a registry stall.
     """
+    meta = {
+        "source": "molecule",
+        "kind": msg.get("kind", ""),
+        "peer_id": msg.get("peer_id", ""),
+        "method": msg.get("method", ""),
+        "activity_id": msg.get("activity_id", ""),
+        "ts": msg.get("created_at", ""),
+    }
+
+    peer_id = msg.get("peer_id") or ""
+    if peer_id:
+        record = enrich_peer_metadata(peer_id)
+        if record is not None:
+            if name := record.get("name"):
+                meta["peer_name"] = name
+            if role := record.get("role"):
+                meta["peer_role"] = role
+        # agent_card_url is constructable from peer_id alone; surface it
+        # even when enrichment fails so the receiving agent has a single
+        # endpoint to hit for capabilities lookup.
+        meta["agent_card_url"] = _agent_card_url_for(peer_id)
+
     return {
         "jsonrpc": "2.0",
         "method": _CHANNEL_NOTIFICATION_METHOD,
         "params": {
             "content": msg.get("text", ""),
-            "meta": {
-                "source": "molecule",
-                "kind": msg.get("kind", ""),
-                "peer_id": msg.get("peer_id", ""),
-                "method": msg.get("method", ""),
-                "activity_id": msg.get("activity_id", ""),
-                "ts": msg.get("created_at", ""),
-            },
+            "meta": meta,
         },
     }
 
