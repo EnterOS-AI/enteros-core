@@ -594,12 +594,8 @@ async def tool_chat_history(peer_id: str, limit: int = 20, before_ts: str = "") 
         "peer_id": peer_id,
         "limit": str(limit),
     }
-    # Server reads `since_secs` as a positive int; client-side `before_ts`
-    # is the wall-clock-friendly knob the agent passes. We don't translate
-    # — instead, ask for the most-recent N (the server's default order is
-    # DESC) and let the agent filter client-side if it needs everything
-    # before a specific timestamp. Future hardening: add a `before_ts`
-    # filter to the server route. For now keep the wire shape minimal.
+    # Forward verbatim — the server route validates as RFC3339 at the
+    # trust boundary and translates into a `created_at < $X` clause.
     if before_ts:
         params["before_ts"] = before_ts
 
