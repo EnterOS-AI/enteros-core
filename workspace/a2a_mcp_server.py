@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 import os
+import stat
 import sys
 from typing import Callable
 
@@ -444,6 +445,52 @@ def _build_channel_notification(msg: dict) -> dict:
 
 # --- MCP Server (JSON-RPC over stdio) ---
 
+
+def _assert_stdio_is_pipe_compatible(
+    stdin_fd: int = 0, stdout_fd: int = 1
+) -> None:
+    """Fail fast with a friendly message when stdio isn't pipe-compatible.
+
+    asyncio.connect_read_pipe / connect_write_pipe accept only pipes,
+    sockets, and character devices. When molecule-mcp is launched with
+    stdout redirected to a regular file (CI smoke tests, ad-hoc local
+    debugging that captures output), the asyncio call later raises
+    ``ValueError: Pipe transport is only for pipes, sockets and character
+    devices`` from inside the event loop — surfaced to the operator as a
+    confusing traceback. Detect early and exit cleanly with guidance
+    instead. See molecule-ai-workspace-runtime#61.
+    """
+    for name, fd in (("stdin", stdin_fd), ("stdout", stdout_fd)):
+        try:
+            mode = os.fstat(fd).st_mode
+        except OSError as exc:
+            print(
+                f"molecule-mcp: cannot stat {name} (fd={fd}): {exc}.\n"
+                f"  This MCP server expects bidirectional pipe stdio. Launch it from\n"
+                f"  an MCP-aware client (Claude Code, Cursor, etc.) — not detached\n"
+                f"  from a terminal or with stdio closed.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        if not (
+            stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode) or stat.S_ISCHR(mode)
+        ):
+            print(
+                f"molecule-mcp: {name} (fd={fd}) is a regular file, not a pipe,\n"
+                f"  socket, or character device — asyncio's stdio transport rejects\n"
+                f"  it with `ValueError: Pipe transport is only for pipes, sockets\n"
+                f"  and character devices`. Common causes:\n"
+                f"      molecule-mcp > out.txt           # stdout → regular file (fails)\n"
+                f"      molecule-mcp < input.json        # stdin  → regular file (fails)\n"
+                f"  Launch molecule-mcp from an MCP-aware client (Claude Code, Cursor,\n"
+                f"  hermes, OpenCode, etc.) so stdio is wired to a pipe pair, or use\n"
+                f"  `tee`/process substitution if you need to capture output:\n"
+                f"      molecule-mcp 2>&1 | tee out.txt  # stdout stays a pipe",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+
+
 async def main():  # pragma: no cover
     """Run MCP server on stdio — reads JSON-RPC requests, writes responses."""
     reader = asyncio.StreamReader()
@@ -547,6 +594,7 @@ def cli_main() -> None:  # pragma: no cover
     break every external-runtime operator's MCP install — the 0.1.16
     ``main_sync`` rename incident is the cautionary precedent.
     """
+    _assert_stdio_is_pipe_compatible()
     asyncio.run(main())
 
 
