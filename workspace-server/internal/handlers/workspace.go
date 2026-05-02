@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/Molecule-AI/molecule-monorepo/platform/internal/crypto"
 	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
@@ -492,9 +493,25 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 // has no declared timeout — the canvas-side resolver falls through to
 // its runtime-profile default.
 func (h *WorkspaceHandler) addProvisionTimeoutMs(ws map[string]interface{}, runtime string) {
-	if secs := h.provisionTimeouts.get(h.configsDir, runtime); secs > 0 {
+	if secs := h.ProvisionTimeoutSecondsForRuntime(runtime); secs > 0 {
 		ws["provision_timeout_ms"] = secs * 1000
 	}
+}
+
+// ProvisionTimeoutSecondsForRuntime returns the per-runtime provision
+// timeout in seconds when a template's config.yaml declared
+// `runtime_config.provision_timeout_seconds`, else 0 ("no override —
+// caller falls through to its own default").
+//
+// Exported so cmd/server/main.go can pass it to
+// registry.StartProvisioningTimeoutSweep — same template-manifest value
+// the canvas reads via addProvisionTimeoutMs. Without this, the
+// sweeper killed claude-code at 10 min while the manifest declared a
+// longer window, and a user saw the "Retry" UI before their image
+// pull even finished. See registry.RuntimeTimeoutLookup for the
+// resolution order.
+func (h *WorkspaceHandler) ProvisionTimeoutSecondsForRuntime(runtime string) int {
+	return h.provisionTimeouts.get(h.configsDir, runtime)
 }
 
 // scanWorkspaceRow is a helper to scan workspace+layout rows into a clean JSON map.
@@ -647,6 +664,42 @@ func (h *WorkspaceHandler) Get(c *gin.Context) {
 		log.Printf("Get workspace error: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "query failed"})
 		return
+	}
+
+	// #2429: workspaces with status='removed' return 410 Gone (not 200)
+	// so callers fail loudly at startup instead of after 60s of revoked-
+	// token heartbeats. The audit-trail consumers that need the body of
+	// a removed workspace opt in via ?include_removed=true.
+	//
+	// Why a query param and not a header: cheap to set in curl/canvas
+	// fetch alike, visible in access logs, and works without coupling
+	// to content negotiation.
+	if status, _ := ws["status"].(string); status == string(models.StatusRemoved) {
+		if c.Query("include_removed") != "true" {
+			// Best-effort fetch of the removal timestamp. If the row was
+			// deleted (or some transient DB error fired) between the
+			// scanWorkspaceRow above and this follow-up SELECT,
+			// removedAt stays as Go's zero time. Emit `null` in that
+			// case rather than the misleading `0001-01-01T00:00:00Z`
+			// the client would otherwise see — the actionable signal
+			// is the 410 + hint, not the timestamp.
+			var removedAt time.Time
+			_ = db.DB.QueryRowContext(c.Request.Context(),
+				`SELECT updated_at FROM workspaces WHERE id = $1`, id,
+			).Scan(&removedAt)
+			body := gin.H{
+				"error": "workspace removed",
+				"id":    id,
+				"hint":  "Regenerate workspace + token from the canvas → Tokens tab",
+			}
+			if removedAt.IsZero() {
+				body["removed_at"] = nil
+			} else {
+				body["removed_at"] = removedAt
+			}
+			c.JSON(http.StatusGone, body)
+			return
+		}
 	}
 
 	// Strip sensitive fields — GET /workspaces/:id is on the open router.

@@ -27,16 +27,16 @@ import { renderHook } from "@testing-library/react";
 import type { Template } from "@/lib/deploy-preflight";
 
 // ── Hoisted mocks ────────────────────────────────────────────────────────────
-const { mockApiPost, mockCheckDeploySecrets, mockResolveRuntime } = vi.hoisted(
-  () => ({
+const { mockApiPost, mockApiGet, mockCheckDeploySecrets, mockResolveRuntime } =
+  vi.hoisted(() => ({
     mockApiPost: vi.fn(),
+    mockApiGet: vi.fn(),
     mockCheckDeploySecrets: vi.fn(),
     mockResolveRuntime: vi.fn(),
-  }),
-);
+  }));
 
 vi.mock("@/lib/api", () => ({
-  api: { post: mockApiPost },
+  api: { post: mockApiPost, get: mockApiGet },
 }));
 
 vi.mock("@/lib/deploy-preflight", async () => {
@@ -51,19 +51,43 @@ vi.mock("@/lib/deploy-preflight", async () => {
   };
 });
 
-// MissingKeysModal: render a minimal stand-in that exposes the two
-// callbacks the hook wires up. The real modal pulls in radix + the
-// secrets store, neither of which is relevant to this hook's behavior.
+// MissingKeysModal: render a minimal stand-in that exposes the
+// callbacks the hook wires up + dumps the new template-deploy props
+// (configuredKeys size, modelSuggestions, initialModel) into the
+// DOM so tests can assert on them. The real modal pulls in radix +
+// the secrets store, neither of which is relevant to this hook's
+// behavior.
 vi.mock("@/components/MissingKeysModal", () => ({
   MissingKeysModal: (props: {
     open: boolean;
-    onKeysAdded: () => void;
+    onKeysAdded: (model?: string) => void;
     onCancel: () => void;
+    configuredKeys?: Set<string>;
+    modelSuggestions?: string[];
+    initialModel?: string;
+    title?: string;
   }) =>
     props.open ? (
       <div data-testid="missing-keys-modal">
-        <button data-testid="modal-keys-added" onClick={props.onKeysAdded}>
+        <span data-testid="modal-configured-size">
+          {props.configuredKeys?.size ?? 0}
+        </span>
+        <span data-testid="modal-model-suggestions">
+          {(props.modelSuggestions ?? []).join(",")}
+        </span>
+        <span data-testid="modal-initial-model">{props.initialModel ?? ""}</span>
+        <span data-testid="modal-title">{props.title ?? ""}</span>
+        <button
+          data-testid="modal-keys-added"
+          onClick={() => props.onKeysAdded()}
+        >
           keys added
+        </button>
+        <button
+          data-testid="modal-keys-added-with-model"
+          onClick={() => props.onKeysAdded("minimax/MiniMax-M2.7")}
+        >
+          keys added with model
         </button>
         <button data-testid="modal-cancel" onClick={props.onCancel}>
           cancel
@@ -95,6 +119,7 @@ function makeTemplate(over: Partial<Template> = {}): Template {
 
 beforeEach(() => {
   mockApiPost.mockReset();
+  mockApiGet.mockReset();
   mockCheckDeploySecrets.mockReset();
   mockResolveRuntime.mockReset();
   // Default: identity-mapped runtime, preflight passes.
@@ -104,8 +129,12 @@ beforeEach(() => {
     missingKeys: [],
     providers: [],
     runtime: "claude-code",
+    configuredKeys: new Set(),
   });
   mockApiPost.mockResolvedValue({ id: "ws-new" });
+  // Default: secrets endpoint returns nothing so the picker
+  // renders every entry as input. Multi-provider tests override.
+  mockApiGet.mockResolvedValue([]);
 });
 
 afterEach(() => {
@@ -114,14 +143,38 @@ afterEach(() => {
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 
-describe("useTemplateDeploy — happy path", () => {
-  it("preflight ok → POST /workspaces → onDeployed fires with new id", async () => {
-    const onDeployed = vi.fn();
-    const { result } = renderHook(() => useTemplateDeploy({ onDeployed }));
+/**
+ * Drive the always-show-picker flow to completion: deploy() opens the
+ * modal, then we click "keys added" to fire the actual POST. Centralised
+ * here because as of the always-prompt change, every happy-path test
+ * must click through the modal before asserting on POST.
+ */
+async function deployThroughPicker<T>(
+  result: { current: ReturnType<typeof useTemplateDeploy> },
+  rerender: () => void,
+  template: Template,
+): Promise<void> {
+  await act(async () => {
+    await result.current.deploy(template);
+  });
+  rerender();
+  render(<>{result.current.modal}</>);
+  await act(async () => {
+    fireEvent.click(screen.getByTestId("modal-keys-added"));
+    // Let the fire-and-forget executeDeploy resolve.
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+}
 
-    await act(async () => {
-      await result.current.deploy(makeTemplate());
-    });
+describe("useTemplateDeploy — happy path", () => {
+  it("preflight ok → modal opens → keys-added → POST /workspaces → onDeployed fires", async () => {
+    const onDeployed = vi.fn();
+    const { result, rerender } = renderHook(() =>
+      useTemplateDeploy({ onDeployed }),
+    );
+
+    await deployThroughPicker(result, rerender, makeTemplate());
 
     expect(mockCheckDeploySecrets).toHaveBeenCalledTimes(1);
     expect(mockApiPost).toHaveBeenCalledWith(
@@ -139,11 +192,11 @@ describe("useTemplateDeploy — happy path", () => {
 
   it("uses caller-supplied canvasCoords when provided", async () => {
     const canvasCoords = vi.fn(() => ({ x: 42, y: 99 }));
-    const { result } = renderHook(() => useTemplateDeploy({ canvasCoords }));
+    const { result, rerender } = renderHook(() =>
+      useTemplateDeploy({ canvasCoords }),
+    );
 
-    await act(async () => {
-      await result.current.deploy(makeTemplate());
-    });
+    await deployThroughPicker(result, rerender, makeTemplate());
 
     expect(canvasCoords).toHaveBeenCalledTimes(1);
     expect(mockApiPost).toHaveBeenCalledWith(
@@ -153,11 +206,9 @@ describe("useTemplateDeploy — happy path", () => {
   });
 
   it("falls back to random coords inside [100,500] × [100,400] when canvasCoords omitted", async () => {
-    const { result } = renderHook(() => useTemplateDeploy());
+    const { result, rerender } = renderHook(() => useTemplateDeploy());
 
-    await act(async () => {
-      await result.current.deploy(makeTemplate());
-    });
+    await deployThroughPicker(result, rerender, makeTemplate());
 
     const body = (mockApiPost as Mock).mock.calls[0]?.[1] as {
       canvas: { x: number; y: number };
@@ -204,6 +255,7 @@ describe("useTemplateDeploy — preflight failure modes", () => {
       missingKeys: ["ANTHROPIC_API_KEY"],
       providers: [],
       runtime: "claude-code",
+      configuredKeys: new Set(),
     });
     const onDeployed = vi.fn();
 
@@ -231,6 +283,7 @@ describe("useTemplateDeploy — modal lifecycle", () => {
       missingKeys: ["ANTHROPIC_API_KEY"],
       providers: [],
       runtime: "claude-code",
+      configuredKeys: new Set(),
     });
     const onDeployed = vi.fn();
     const { result, rerender } = renderHook(() =>
@@ -265,6 +318,7 @@ describe("useTemplateDeploy — modal lifecycle", () => {
       missingKeys: ["ANTHROPIC_API_KEY"],
       providers: [],
       runtime: "claude-code",
+      configuredKeys: new Set(),
     });
     const { result, rerender } = renderHook(() => useTemplateDeploy());
 
@@ -287,15 +341,189 @@ describe("useTemplateDeploy — modal lifecycle", () => {
   });
 });
 
-describe("useTemplateDeploy — POST failure", () => {
-  it("POST rejection sets error and clears deploying", async () => {
-    mockApiPost.mockRejectedValueOnce(new Error("server 500"));
+describe("useTemplateDeploy — multi-provider always-ask flow", () => {
+  // The user-reported bug: clicking a hermes template (which has
+  // multiple provider options) deployed silently when global env
+  // covered the API key, producing "No LLM provider configured" 500
+  // because the workspace booted with no explicit model. Fix:
+  // always open the picker for multi-provider templates so the
+  // user picks provider + model per workspace, even when keys are
+  // already saved.
+  function multiProviderTemplate(): Template {
+    return makeTemplate({
+      id: "hermes-template",
+      name: "Hermes",
+      runtime: "hermes",
+      model: "anthropic/claude-sonnet-4-5",
+      models: [
+        { id: "minimax/MiniMax-M2.7", required_env: ["MINIMAX_API_KEY"] },
+        { id: "anthropic/claude-sonnet-4-5", required_env: ["ANTHROPIC_API_KEY"] },
+      ],
+    });
+  }
+
+  it("opens picker even when preflight.ok=true (≥2 providers)", async () => {
+    mockCheckDeploySecrets.mockResolvedValueOnce({
+      ok: true, // every key is in global env
+      missingKeys: [],
+      providers: [
+        { id: "MINIMAX_API_KEY", label: "MiniMax", envVars: ["MINIMAX_API_KEY"] },
+        { id: "ANTHROPIC_API_KEY", label: "Anthropic", envVars: ["ANTHROPIC_API_KEY"] },
+      ],
+      runtime: "hermes",
+      configuredKeys: new Set(["MINIMAX_API_KEY", "ANTHROPIC_API_KEY"]),
+    });
+    const { result, rerender } = renderHook(() => useTemplateDeploy());
+
+    await act(async () => {
+      await result.current.deploy(multiProviderTemplate());
+    });
+
+    rerender();
+    render(<>{result.current.modal}</>);
+
+    expect(screen.getByTestId("missing-keys-modal")).toBeTruthy();
+    // Both global keys flowed into the modal as `configuredKeys` so
+    // entries can render as Saved without re-prompting.
+    expect(screen.getByTestId("modal-configured-size").textContent).toBe("2");
+    // Confirm POST has NOT fired yet — the user must explicitly
+    // confirm in the picker even though preflight passed.
+    expect(mockApiPost).not.toHaveBeenCalled();
+    // Title shifts to "Configure Workspace" since keys aren't missing.
+    expect(screen.getByTestId("modal-title").textContent).toBe(
+      "Configure Workspace",
+    );
+  });
+
+  it("threads template.models[].id as model suggestions + template.model as initial value", async () => {
+    mockCheckDeploySecrets.mockResolvedValueOnce({
+      ok: true,
+      missingKeys: [],
+      providers: [
+        { id: "MINIMAX_API_KEY", label: "MiniMax", envVars: ["MINIMAX_API_KEY"] },
+        { id: "ANTHROPIC_API_KEY", label: "Anthropic", envVars: ["ANTHROPIC_API_KEY"] },
+      ],
+      runtime: "hermes",
+      configuredKeys: new Set(),
+    });
+    const { result, rerender } = renderHook(() => useTemplateDeploy());
+
+    await act(async () => {
+      await result.current.deploy(multiProviderTemplate());
+    });
+
+    rerender();
+    render(<>{result.current.modal}</>);
+
+    expect(screen.getByTestId("modal-model-suggestions").textContent).toBe(
+      "minimax/MiniMax-M2.7,anthropic/claude-sonnet-4-5",
+    );
+    expect(screen.getByTestId("modal-initial-model").textContent).toBe(
+      "anthropic/claude-sonnet-4-5",
+    );
+  });
+
+  it("POST /workspaces includes model when picker confirms with one", async () => {
+    mockCheckDeploySecrets.mockResolvedValueOnce({
+      ok: true,
+      missingKeys: [],
+      providers: [
+        { id: "MINIMAX_API_KEY", label: "MiniMax", envVars: ["MINIMAX_API_KEY"] },
+        { id: "ANTHROPIC_API_KEY", label: "Anthropic", envVars: ["ANTHROPIC_API_KEY"] },
+      ],
+      runtime: "hermes",
+      configuredKeys: new Set(),
+    });
+    const { result, rerender } = renderHook(() => useTemplateDeploy());
+
+    await act(async () => {
+      await result.current.deploy(multiProviderTemplate());
+    });
+
+    rerender();
+    render(<>{result.current.modal}</>);
+
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("modal-keys-added-with-model"));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(mockApiPost).toHaveBeenCalledWith(
+      "/workspaces",
+      expect.objectContaining({
+        template: "hermes-template",
+        model: "minimax/MiniMax-M2.7",
+      }),
+    );
+  });
+
+  it("single-provider template ALSO opens picker when preflight.ok (always-prompt rule)", async () => {
+    // Default preflight mock: ok=true, providers=[]. claude-code is
+    // single-provider, but the always-prompt rule means the user must
+    // still click through the picker to confirm provider+model — even
+    // when keys are saved and the runtime has only one provider option.
+    // Reason: the user needs an explicit chance to override the
+    // template's default model (e.g. opus vs sonnet vs haiku) before
+    // an EC2 boots and burns billing on the wrong tier.
     const onDeployed = vi.fn();
-    const { result } = renderHook(() => useTemplateDeploy({ onDeployed }));
+    const { result, rerender } = renderHook(() =>
+      useTemplateDeploy({ onDeployed }),
+    );
 
     await act(async () => {
       await result.current.deploy(makeTemplate());
     });
+
+    rerender();
+    render(<>{result.current.modal}</>);
+
+    expect(screen.getByTestId("missing-keys-modal")).toBeTruthy();
+    // POST does NOT fire until the user confirms in the picker.
+    expect(mockApiPost).not.toHaveBeenCalled();
+    expect(onDeployed).not.toHaveBeenCalled();
+    expect(result.current.deploying).toBeNull();
+  });
+
+  it("empty configuredKeys (preflight defensive fallback) still opens picker", async () => {
+    // checkDeploySecrets falls back to an empty Set when the
+    // /settings/secrets endpoint errors — the modal must still
+    // open so the user isn't blocked, just with every entry
+    // rendered as input rather than Saved.
+    mockCheckDeploySecrets.mockResolvedValueOnce({
+      ok: true,
+      missingKeys: [],
+      providers: [
+        { id: "MINIMAX_API_KEY", label: "MiniMax", envVars: ["MINIMAX_API_KEY"] },
+        { id: "ANTHROPIC_API_KEY", label: "Anthropic", envVars: ["ANTHROPIC_API_KEY"] },
+      ],
+      runtime: "hermes",
+      configuredKeys: new Set(),
+    });
+    const { result, rerender } = renderHook(() => useTemplateDeploy());
+
+    await act(async () => {
+      await result.current.deploy(multiProviderTemplate());
+    });
+
+    rerender();
+    render(<>{result.current.modal}</>);
+
+    expect(screen.getByTestId("missing-keys-modal")).toBeTruthy();
+    expect(screen.getByTestId("modal-configured-size").textContent).toBe("0");
+    expect(mockApiPost).not.toHaveBeenCalled();
+  });
+});
+
+describe("useTemplateDeploy — POST failure", () => {
+  it("POST rejection sets error and clears deploying", async () => {
+    mockApiPost.mockRejectedValueOnce(new Error("server 500"));
+    const onDeployed = vi.fn();
+    const { result, rerender } = renderHook(() =>
+      useTemplateDeploy({ onDeployed }),
+    );
+
+    await deployThroughPicker(result, rerender, makeTemplate());
 
     expect(result.current.error).toBe("server 500");
     expect(result.current.deploying).toBeNull();
@@ -304,11 +532,9 @@ describe("useTemplateDeploy — POST failure", () => {
 
   it("non-Error rejection still surfaces a message (defensive)", async () => {
     mockApiPost.mockRejectedValueOnce("plain string");
-    const { result } = renderHook(() => useTemplateDeploy());
+    const { result, rerender } = renderHook(() => useTemplateDeploy());
 
-    await act(async () => {
-      await result.current.deploy(makeTemplate());
-    });
+    await deployThroughPicker(result, rerender, makeTemplate());
 
     expect(result.current.error).toBe("Deploy failed");
     expect(result.current.deploying).toBeNull();

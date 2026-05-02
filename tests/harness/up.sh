@@ -38,18 +38,22 @@ if [ "$REBUILD" = true ]; then
     docker compose -f compose.yml build --no-cache tenant cp-stub
 fi
 
-echo "[harness] starting cp-stub + postgres + redis + tenant + cf-proxy ..."
+echo "[harness] starting redis + cp-stub + tenant-alpha + tenant-beta + cf-proxy ..."
 docker compose -f compose.yml up -d --wait
 
-echo "[harness] /etc/hosts entry for harness-tenant.localhost..."
-if ! grep -q '^127\.0\.0\.1[[:space:]]\+harness-tenant\.localhost' /etc/hosts; then
-    echo "  (skip — your /etc/hosts may not resolve *.localhost. If tests fail with"
-    echo "   'getaddrinfo' errors, add: 127.0.0.1 harness-tenant.localhost)"
-fi
-
+# Sudo-free reachability: cf-proxy/nginx routes by Host header to the
+# right tenant container (matches production CF tunnel: same URL,
+# different Host = different tenant). Replays target loopback :8080
+# with a per-tenant Host header. _curl.sh centralises the helper
+# functions (curl_alpha_admin, curl_beta_admin, etc.).
 echo ""
-echo "[harness] up. Tenant: http://harness-tenant.localhost:8080/health"
-echo "                     http://harness-tenant.localhost:8080/buildinfo"
-echo "          cp-stub:    http://localhost (internal-only via compose net)"
+echo "[harness] up. Multi-tenant topology:"
+echo "          tenant-alpha:  Host: harness-tenant-alpha.localhost"
+echo "          tenant-beta:   Host: harness-tenant-beta.localhost"
+echo "          legacy alias:  Host: harness-tenant.localhost → alpha"
 echo ""
-echo "Next: ./seed.sh   # mint admin token + register sample workspaces"
+echo "          Quick check (no /etc/hosts needed):"
+echo "            curl -H 'Host: harness-tenant-alpha.localhost' http://localhost:8080/health"
+echo "            curl -H 'Host: harness-tenant-beta.localhost'  http://localhost:8080/health"
+echo ""
+echo "Next: ./seed.sh   # register parent+child workspaces in BOTH tenants"

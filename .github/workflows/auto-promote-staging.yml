@@ -364,3 +364,21 @@ jobs:
           else
             echo "::error::Failed to dispatch publish-workspace-server-image. Run manually: gh workflow run publish-workspace-server-image.yml --ref main"
           fi
+
+          # ALSO dispatch auto-sync-main-to-staging.yml. Same root cause as
+          # publish above (issue #2357): the merge-queue-initiated push to
+          # main is by GITHUB_TOKEN → no `on: push` triggers fire downstream.
+          # Without this dispatch, every staging→main promote leaves staging
+          # one merge commit BEHIND main, which silently dead-locks the NEXT
+          # promote PR as `mergeStateStatus: BEHIND` because main's
+          # branch-protection has `strict: true`. Verified empirically on
+          # 2026-05-02 against PR #2442 (Phase 2 promote): only the explicit
+          # publish-workspace-server-image dispatch fired on the previous
+          # promote SHA 76c604fb, while auto-sync silently no-op'd, leaving
+          # staging behind for ~24h until manually bridged.
+          if gh workflow run auto-sync-main-to-staging.yml \
+              --repo "$REPO" --ref main 2>&1; then
+            echo "::notice::Dispatched auto-sync-main-to-staging on ref=main as molecule-ai App — staging will absorb the new main merge commit via PR + merge queue."
+          else
+            echo "::error::Failed to dispatch auto-sync-main-to-staging. Run manually: gh workflow run auto-sync-main-to-staging.yml --ref main"
+          fi

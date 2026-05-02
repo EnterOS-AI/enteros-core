@@ -59,6 +59,7 @@ TOP_LEVEL_MODULES = {
     "agent",
     "agents_md",
     "config",
+    "configs_dir",
     "consolidation",
     "coordinator",
     "events",
@@ -78,6 +79,7 @@ TOP_LEVEL_MODULES = {
     "prompt",
     "runtime_wedge",
     "shared_runtime",
+    "smoke_mode",
     "transcript_auth",
     "watcher",
 }

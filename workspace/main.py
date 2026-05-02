@@ -136,6 +136,20 @@ async def main():  # pragma: no cover
         await adapter.setup(adapter_config)
         executor = await adapter.create_executor(adapter_config)
 
+        # 5a. Boot-smoke short-circuit (issue #2275): if MOLECULE_SMOKE_MODE
+        # is set, exercise the executor's full import tree by calling
+        # execute() once with stub deps + a short timeout. Skips platform
+        # registration + uvicorn entirely. Returns process exit code.
+        from smoke_mode import is_smoke_mode, run_executor_smoke
+        if is_smoke_mode():
+            exit_code = await run_executor_smoke(executor)
+            if hasattr(heartbeat, "stop"):
+                try:
+                    await heartbeat.stop()
+                except Exception:  # noqa: BLE001
+                    pass
+            raise SystemExit(exit_code)
+
         # 5b. Restore from pre-stop snapshot if one exists (GH#1391).
         # The snapshot is scrubbed before being written, so secrets are
         # already redacted — restore_state must not re-expose them.
