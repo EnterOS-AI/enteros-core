@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 
 from unittest.mock import AsyncMock, patch
 
@@ -716,6 +717,104 @@ def test_inbox_bridge_swallows_closed_loop_runtime_error():
         "method": "",
         "created_at": "",
     })
+
+
+class TestStdioPipeAssertion:
+    """Pin _assert_stdio_is_pipe_compatible — the friendly fail-fast guard
+    that turns asyncio's `ValueError: Pipe transport is only for pipes,
+    sockets and character devices` into a clear operator message + exit 2.
+    See molecule-ai-workspace-runtime#61.
+    """
+
+    def test_pipe_pair_passes_silently(self):
+        """Happy path — both fds are pipes (the production launch shape
+        from any MCP client). Should return None without printing or
+        exiting."""
+        import a2a_mcp_server
+
+        r, w = os.pipe()
+        try:
+            # No exit, no stderr noise. We don't capture stderr here
+            # because pipe path should produce zero output.
+            a2a_mcp_server._assert_stdio_is_pipe_compatible(stdin_fd=r, stdout_fd=w)
+        finally:
+            os.close(r)
+            os.close(w)
+
+    def test_regular_file_stdout_exits_with_friendly_message(
+        self, tmp_path, capsys
+    ):
+        """Reproducer for runtime#61: stdout redirected to a regular file.
+        Pre-fix this would surface upstream as
+        `ValueError: Pipe transport is only for pipes...`. Post-fix we
+        exit with code 2 and a stderr message that names the symptom +
+        fix."""
+        import a2a_mcp_server
+
+        # stdin = pipe (so we isolate the stdout failure path);
+        # stdout = regular file (the bug condition).
+        r, _w = os.pipe()
+        regular = tmp_path / "captured.log"
+        f = open(regular, "wb")
+        try:
+            with pytest.raises(SystemExit) as excinfo:
+                a2a_mcp_server._assert_stdio_is_pipe_compatible(
+                    stdin_fd=r, stdout_fd=f.fileno()
+                )
+            assert excinfo.value.code == 2
+            err = capsys.readouterr().err
+            # Names the failing stream + the asyncio constraint that
+            # would otherwise crash. Don't pin the exact wording — the
+            # asserts pin the operator-recoverable signal only.
+            assert "stdout" in err
+            assert "regular file" in err
+            assert "pipe" in err
+        finally:
+            f.close()
+            os.close(r)
+
+    def test_regular_file_stdin_exits_with_friendly_message(
+        self, tmp_path, capsys
+    ):
+        """Symmetric case — stdin redirected from a regular file. Same
+        asyncio constraint applies via connect_read_pipe."""
+        import a2a_mcp_server
+
+        regular = tmp_path / "input.json"
+        regular.write_bytes(b'{"jsonrpc":"2.0","id":1,"method":"initialize"}\n')
+        f = open(regular, "rb")
+        _r, w = os.pipe()
+        try:
+            with pytest.raises(SystemExit) as excinfo:
+                a2a_mcp_server._assert_stdio_is_pipe_compatible(
+                    stdin_fd=f.fileno(), stdout_fd=w
+                )
+            assert excinfo.value.code == 2
+            err = capsys.readouterr().err
+            assert "stdin" in err
+            assert "regular file" in err
+        finally:
+            f.close()
+            os.close(w)
+
+    def test_closed_fd_exits_with_stat_error(self, capsys):
+        """If stdio is closed (rare but seen in detached daemonized
+        contexts), os.fstat raises OSError. We catch it and exit 2 with
+        a guidance message instead of letting the traceback escape."""
+        import a2a_mcp_server
+
+        r, w = os.pipe()
+        os.close(w)  # Now `w` is a stale fd — fstat will fail.
+        try:
+            with pytest.raises(SystemExit) as excinfo:
+                a2a_mcp_server._assert_stdio_is_pipe_compatible(
+                    stdin_fd=r, stdout_fd=w
+                )
+            assert excinfo.value.code == 2
+            err = capsys.readouterr().err
+            assert "cannot stat stdout" in err
+        finally:
+            os.close(r)
 
 
 def _readable(fd: int) -> bool:
