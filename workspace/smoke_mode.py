@@ -15,6 +15,15 @@ times out — that's a *pass*. If a lazy import is broken, the call
 raises `ImportError` / `ModuleNotFoundError` from inside the executor
 body — that's a *fail*.
 
+Universal wedge gate (task #131): timeout-as-pass alone misses init
+wedges where the SDK process spins for 60s+ on a malformed argv
+(claude-agent-sdk PR #25 class). After every result path, the smoke
+consults `runtime_wedge.is_wedged()` — adapters opt-in by calling
+`runtime_wedge.mark_wedged(reason)` from their executor's wedge catch
+arm, and the smoke upgrades the provisional PASS to FAIL when the
+flag is set. Non-opt-in adapters keep working as before — the check
+is additive.
+
 Activated by setting `MOLECULE_SMOKE_MODE=1` in the env. Wired into
 `main.py` after `executor = await adapter.create_executor(...)` so the
 full adapter setup path runs first; the smoke just adds one more
@@ -23,7 +32,10 @@ exercise step before exit.
 CI usage (intended for `molecule-ci/.github/workflows/publish-template-image.yml`):
   docker run --rm \
     -e WORKSPACE_ID=fake -e MOLECULE_SMOKE_MODE=1 \
+    -e MOLECULE_SMOKE_TIMEOUT_SECS=90 \
     "$IMAGE" molecule-runtime
+The 90s timeout is calibrated to claude-agent-sdk's 60s
+`initialize()` handshake — adapters with shorter init can lower it.
 """
 from __future__ import annotations
 
@@ -81,20 +93,52 @@ def _build_stub_context() -> tuple[Any, Any]:
     return context, queue
 
 
+def _check_runtime_wedge() -> str | None:
+    """Return the wedge reason if any adapter has marked the runtime
+    wedged during this smoke run, or None when healthy.
+
+    Universal turn-smoke (task #131): adapters that hit an unrecoverable
+    init wedge (e.g. claude-agent-sdk's `Control request timeout:
+    initialize` after a malformed CLI argv) call
+    `runtime_wedge.mark_wedged(reason)`. The smoke gate consults this
+    flag at the end of every result path — pre-existing PASS branches
+    are upgraded to FAIL when the flag is set, so a wedge that was
+    triggered inside a still-running execute() (timeout branch) or
+    inside a non-import exception (PASS-on-other-error branch) gets
+    surfaced instead of silently shipping a broken image to GHCR.
+
+    Lazy import: the runtime may be installed without runtime_wedge in
+    a corrupt-rolling-deploy state, in which case "no wedge info"
+    reads as "assume healthy" — same fail-open posture heartbeat.py
+    takes for the same reason.
+    """
+    try:
+        from runtime_wedge import is_wedged, wedge_reason
+    except Exception:
+        return None
+    if is_wedged():
+        return wedge_reason() or "<unspecified>"
+    return None
+
+
 async def run_executor_smoke(executor: Any) -> int:
     """Invoke executor.execute() once with stub deps. Return an exit code.
 
     Returns:
-      0 — import tree healthy. Either execution timed out (the
-          expected outcome — we hit a network boundary like an LLM
-          call) or completed cleanly. Either way, no broken imports.
-      1 — broken lazy import detected. Re-raised as a clear log line
-          so the publish gate's stderr captures the offending symbol.
+      0 — import tree healthy AND no adapter marked the runtime wedged.
+          Either execution timed out (the expected outcome — we hit a
+          network boundary like an LLM call) or completed cleanly.
+      1 — broken lazy import detected, OR an adapter marked the
+          runtime wedged via runtime_wedge.mark_wedged(). Re-raised
+          as a clear log line so the publish gate's stderr captures
+          the offending symbol or wedge reason.
 
     The 5-second timeout comes from `MOLECULE_SMOKE_TIMEOUT_SECS` env
-    (default 5.0). Bump it via env if a slow adapter setup overlaps the
-    first execute call. Don't make it too long — the publish workflow
-    multiplies this across N templates.
+    (default 5.0). Bump it via env when the failure mode under test is
+    an init handshake that takes longer than 5s to give up — e.g.
+    claude-agent-sdk's 60s `initialize()` timeout needs ~90s here so
+    the SDK marks itself wedged before our outer wait_for fires.
+    The publish workflow sets this value per-template via env.
     """
     print(
         f"[smoke-mode] invoking executor.execute(stub_ctx, stub_queue) "
@@ -114,6 +158,11 @@ async def run_executor_smoke(executor: Any) -> int:
         )
         return 1
 
+    # Outcome of executor.execute() — narrowed to exit code by the
+    # post-run wedge check below. Pre-wedge-check exit code: 0 for
+    # PASS-shaped paths (timeout, clean return, non-import exception),
+    # 1 for FAIL-shaped paths (import error). Wedge check upgrades
+    # PASS → FAIL when the runtime self-reports wedged.
     try:
         await asyncio.wait_for(
             executor.execute(context, queue),
@@ -121,9 +170,11 @@ async def run_executor_smoke(executor: Any) -> int:
         )
     except (asyncio.TimeoutError, asyncio.CancelledError):
         # Timeout = imports healthy, execution was proceeding and hit
-        # a network boundary or long await. Pass.
-        print("[smoke-mode] PASS: timed out past import-tree (imports healthy)")
-        return 0
+        # a network boundary or long await. Provisionally PASS — but
+        # also check runtime_wedge below: an adapter whose init wedge
+        # fires inside the timeout window still needs to FAIL the gate.
+        pre_wedge_code = 0
+        pre_wedge_msg = "timed out past import-tree (imports healthy)"
     except (ImportError, ModuleNotFoundError) as imp_err:
         # The exact regression class issue #2275 exists to catch.
         print(
@@ -134,13 +185,33 @@ async def run_executor_smoke(executor: Any) -> int:
         return 1
     except Exception as other_err:  # noqa: BLE001
         # Anything else (auth errors, validation errors, runtime bugs)
-        # is downstream of the import gate. Pass — these are caught by
-        # the relevant adapter-level tests, not by this smoke.
-        print(
-            f"[smoke-mode] PASS: execute() raised "
-            f"{type(other_err).__name__} past import-tree (not an import error)"
+        # is downstream of the import gate. Provisionally PASS — these
+        # are caught by adapter-level tests, NOT by this gate, EXCEPT
+        # when the adapter also called runtime_wedge.mark_wedged() on
+        # the way out (the PR-25-class wedge — SDK init failure inside
+        # execute()). The post-run wedge check below catches that.
+        pre_wedge_code = 0
+        pre_wedge_msg = (
+            f"execute() raised {type(other_err).__name__} "
+            "past import-tree (not an import error)"
         )
-        return 0
     else:
-        print("[smoke-mode] PASS: execute() completed within timeout (imports + body OK)")
-        return 0
+        pre_wedge_code = 0
+        pre_wedge_msg = "execute() completed within timeout (imports + body OK)"
+
+    wedge_reason_str = _check_runtime_wedge()
+    if wedge_reason_str is not None:
+        # Adapter self-reported wedge — overrides any provisional PASS.
+        # This is the path that catches the PR-25-class regression
+        # (claude_agent_sdk init wedge from a malformed CLI argv) that
+        # otherwise looks like a benign network-call timeout to the
+        # outer wait_for.
+        print(
+            f"[smoke-mode] FAIL: runtime self-reported wedged after execute(): "
+            f"{wedge_reason_str}",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(f"[smoke-mode] PASS: {pre_wedge_msg}")
+    return pre_wedge_code

@@ -209,3 +209,140 @@ async def test_smoke_fails_when_stub_context_build_breaks(monkeypatch: pytest.Mo
     monkeypatch.setattr(smoke_mode, "_build_stub_context", _fail_build)
     code = await smoke_mode.run_executor_smoke(_CleanExecutor())
     assert code == 1
+
+
+# ─── runtime_wedge integration (universal turn-smoke, task #131) ───────
+#
+# These tests pin the post-execute wedge-check that upgrades a
+# provisional PASS to FAIL when an adapter has marked the runtime
+# wedged via `runtime_wedge.mark_wedged()`. Without this gate, the
+# PR-25-class regression (claude_agent_sdk init wedge from a malformed
+# CLI argv) shipped to GHCR because the smoke saw the outer wait_for
+# timeout as "imports healthy, hit a network boundary."
+
+
+class _MarkWedgedThenRaiseExecutor:
+    """Mimics the claude_sdk_executor wedge path: catches the SDK's
+    `Control request timeout: initialize`, calls
+    `runtime_wedge.mark_wedged()` from the catch arm, then re-raises
+    a sanitized error. The smoke must surface this as FAIL even
+    though the outer exception class (`RuntimeError` here) would
+    otherwise be a PASS-on-non-import-error.
+    """
+
+    def __init__(self, reason: str):
+        self._reason = reason
+
+    async def execute(self, context, event_queue) -> None:  # noqa: ARG002
+        import runtime_wedge
+        runtime_wedge.mark_wedged(self._reason)
+        raise RuntimeError("sanitized adapter error after wedge")
+
+
+class _MarkWedgedThenBlockExecutor:
+    """Mimics a wedge that fires inside a still-running execute() —
+    the adapter marks wedged, then continues to await something
+    network-shaped that the outer wait_for cuts short. The pre-fix
+    smoke returned 0 here ('timed out past import-tree') even though
+    the runtime had already self-reported wedged.
+    """
+
+    def __init__(self, reason: str):
+        self._reason = reason
+
+    async def execute(self, context, event_queue) -> None:  # noqa: ARG002
+        import runtime_wedge
+        runtime_wedge.mark_wedged(self._reason)
+        await asyncio.Event().wait()
+
+
+@pytest.fixture
+def reset_runtime_wedge():
+    """Ensure each wedge-test starts and ends with the runtime healthy.
+
+    The wedge is module-scoped state (`_DEFAULT` in runtime_wedge.py),
+    so a leak from one test would contaminate every subsequent smoke
+    test in the same pytest process. Reset on both sides so an early
+    failure doesn't poison the rest of the file either.
+    """
+    import runtime_wedge
+    runtime_wedge.reset_for_test()
+    yield
+    runtime_wedge.reset_for_test()
+
+
+@pytest.mark.asyncio
+async def test_smoke_fails_when_adapter_marked_wedged_via_exception(
+    stub_build, reset_runtime_wedge,
+):
+    """PR-25 regression class: adapter catches SDK init wedge, marks
+    runtime_wedge, raises a sanitized error. Outer exception class
+    (`RuntimeError`) is non-import → would have been PASS pre-fix.
+    Post-fix: post-run wedge check overrides PASS → FAIL."""
+    code = await smoke_mode.run_executor_smoke(
+        _MarkWedgedThenRaiseExecutor("claude SDK init timeout — restart workspace"),
+    )
+    assert code == 1
+
+
+@pytest.mark.asyncio
+async def test_smoke_fails_when_adapter_marked_wedged_then_blocks(
+    stub_build, reset_runtime_wedge, monkeypatch: pytest.MonkeyPatch,
+):
+    """Same wedge class as above but the adapter doesn't raise — it
+    keeps awaiting (e.g. waiting on a control-message reply that will
+    never come). Outer wait_for cuts short → would have been PASS-on-
+    timeout pre-fix. Post-fix: wedge check upgrades to FAIL.
+    """
+    monkeypatch.setattr(smoke_mode, "_SMOKE_TIMEOUT_SECS", 0.1)
+    code = await smoke_mode.run_executor_smoke(
+        _MarkWedgedThenBlockExecutor("hermes init handshake timed out"),
+    )
+    assert code == 1
+
+
+@pytest.mark.asyncio
+async def test_smoke_passes_when_runtime_wedge_is_clean_after_clean_execute(
+    stub_build, reset_runtime_wedge,
+):
+    """Belt-and-braces: wedge-clean + clean execute() must still PASS.
+    Pins that the new check is additive — it doesn't accidentally
+    fail healthy executions (e.g. by treating "no runtime_wedge import"
+    as a wedge)."""
+    code = await smoke_mode.run_executor_smoke(_CleanExecutor())
+    assert code == 0
+
+
+def test_check_runtime_wedge_returns_none_when_module_missing(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Direct test for the import-resilience contract — the helper
+    must swallow ImportError (and any other exception while reading
+    the module) so a corrupt install doesn't crash the smoke gate."""
+    import builtins
+    real_import = builtins.__import__
+
+    def _raising_import(name, *args, **kwargs):
+        if name == "runtime_wedge":
+            raise ImportError("simulated: runtime_wedge unavailable")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _raising_import)
+    assert smoke_mode._check_runtime_wedge() is None
+
+
+def test_check_runtime_wedge_returns_reason_when_marked(reset_runtime_wedge):
+    """When an adapter has called runtime_wedge.mark_wedged(reason),
+    the helper returns that reason verbatim so the smoke can surface
+    it in the FAIL log line."""
+    import runtime_wedge
+    runtime_wedge.mark_wedged("explicit test reason")
+    assert smoke_mode._check_runtime_wedge() == "explicit test reason"
+
+
+def test_check_runtime_wedge_returns_none_when_clean(reset_runtime_wedge):
+    """Pre-condition for the additive contract: helper must return
+    None (not the empty string from `wedge_reason()`) when no adapter
+    has marked the runtime wedged, so the caller's `is not None`
+    check works."""
+    assert smoke_mode._check_runtime_wedge() is None
