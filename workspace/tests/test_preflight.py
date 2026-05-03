@@ -428,7 +428,6 @@ def test_per_model_explicit_empty_required_env_means_no_auth(tmp_path, monkeypat
     without lying in the per-model list. Distinguished from the no-key
     case via `"required_env" in entry` (key presence, not truthiness)."""
     monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
-    monkeypatch.delenv("MINIMAX_API_KEY", raising=False)
 
     config = make_config(
         runtime="claude-code",
@@ -440,6 +439,31 @@ def test_per_model_explicit_empty_required_env_means_no_auth(tmp_path, monkeypat
             models=[
                 {"id": "sonnet", "required_env": ["CLAUDE_CODE_OAUTH_TOKEN"]},
                 {"id": "local-llama", "required_env": []},  # explicit zero-auth
+            ],
+        ),
+    )
+
+    report = run_preflight(config, str(tmp_path))
+
+    assert report.ok is True
+    assert not any(issue.title == "Required env" for issue in report.failures)
+
+
+def test_per_model_required_env_null_treated_as_empty_no_auth(tmp_path, monkeypatch):
+    """YAML `required_env: null` deserializes to None — the parser falls
+    through to `entry.get("required_env") or []`, so null behaves the
+    same as explicit `[]` (zero-auth). Pins the parser tolerance —
+    template authors who write `required_env:` without a value (common
+    YAML mistake) get the no-auth path, not a confusing TypeError."""
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+
+    config = make_config(
+        runtime="claude-code",
+        runtime_config=RuntimeConfig(
+            model="local-llama",
+            required_env=["CLAUDE_CODE_OAUTH_TOKEN"],
+            models=[
+                {"id": "local-llama", "required_env": None},  # null in YAML
             ],
         ),
     )
