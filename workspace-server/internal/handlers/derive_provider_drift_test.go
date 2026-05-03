@@ -7,10 +7,12 @@ package handlers
 // workspace-server can persist LLM_PROVIDER into workspace_secrets at
 // provision time. That created two sources of truth:
 //
-//   1. workspace-configs-templates/hermes/scripts/derive-provider.sh —
+//   1. molecule-ai-workspace-template-hermes/scripts/derive-provider.sh —
 //      runs inside the container at boot, has the final say on which
 //      provider hermes targets (writes ~/.hermes/config.yaml's
-//      model.provider field).
+//      model.provider field). The shell script lives in a separate
+//      OSS repo, so we vendor a snapshot at testdata/derive-provider.sh
+//      to keep this gate hermetic.
 //   2. workspace-server/internal/handlers/workspace_provision.go's
 //      deriveProviderFromModelSlug — runs at provision time on the
 //      platform side so LLM_PROVIDER lands in workspace_secrets and
@@ -41,17 +43,19 @@ package handlers
 // which pins the *values*; this test pins the *coverage* of the
 // prefix set itself.
 //
-// Hermetic: only reads two files from the monorepo + parses them
-// in-process. No network, no docker, no DB.
+// Hermetic: reads two files (vendored shell script + Go source) from
+// paths relative to the test package directory and parses them
+// in-process. No network, no docker, no DB. The vendored shell script
+// at testdata/derive-provider.sh is a snapshot of the upstream OSS
+// template repo's script — refresh it via the cp command in that file's
+// header when upstream changes.
 
 import (
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"os"
-	"path/filepath"
 	"regexp"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -184,30 +188,15 @@ func TestDeriveProviderDrift_ShellAndGoStayInSync(t *testing.T) {
 	}
 }
 
-// monorepoRoot resolves the absolute path of the molecule-monorepo
-// root by walking up from this test file's directory. Avoids relying
-// on a fixed CWD or env var.
-func monorepoRoot(t *testing.T) string {
-	t.Helper()
-	_, thisFile, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatalf("runtime.Caller failed — cannot locate test file path")
-	}
-	// .../workspace-server/internal/handlers/derive_provider_drift_test.go
-	dir := filepath.Dir(thisFile)
-	for i := 0; i < 6; i++ {
-		if _, err := os.Stat(filepath.Join(dir, "workspace-configs-templates")); err == nil {
-			return dir
-		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			break
-		}
-		dir = parent
-	}
-	t.Fatalf("could not find monorepo root (looked for workspace-configs-templates/) walking up from %s", thisFile)
-	return ""
-}
+// vendoredShellPath is the testdata snapshot of upstream
+// derive-provider.sh. The path is relative to the test package
+// directory (which is what `go test` sets as cwd). See the file's
+// header for the refresh procedure when upstream changes.
+const vendoredShellPath = "testdata/derive-provider.sh"
+
+// goSourcePath is the file containing deriveProviderFromModelSlug.
+// Relative to the test package directory.
+const goSourcePath = "workspace_provision.go"
 
 // loadShellPrefixMap parses derive-provider.sh and returns a
 // map[prefix]provider for every case clause. Aliases inside a single
@@ -228,26 +217,27 @@ func monorepoRoot(t *testing.T) string {
 // hardcode.
 func loadShellPrefixMap(t *testing.T) map[string]string {
 	t.Helper()
-	root := monorepoRoot(t)
-	shellPath := filepath.Join(root, "workspace-configs-templates", "hermes", "scripts", "derive-provider.sh")
-	raw, err := os.ReadFile(shellPath)
+	raw, err := os.ReadFile(vendoredShellPath)
 	if err != nil {
-		t.Fatalf("read %s: %v", shellPath, err)
+		t.Fatalf("read %s: %v (refresh from upstream — see file header)", vendoredShellPath, err)
 	}
 
 	// Locate the case statement body so we don't accidentally match
 	// PROVIDER= assignments above the case (the HERMES_INFERENCE_PROVIDER
-	// override + HERMES_DEFAULT_MODEL empty fallback both write PROVIDER=
-	// before the case).
-	caseStart := regexp.MustCompile(`(?m)^case\s+"\$\{HERMES_DEFAULT_MODEL\}"\s+in\s*$`)
+	// override + the empty-model fallback both write PROVIDER= before
+	// the case). Upstream renamed the case variable to ${_HERMES_MODEL}
+	// in v0.12.0 (the resolved value of HERMES_INFERENCE_MODEL with a
+	// HERMES_DEFAULT_MODEL legacy fallback); accept either spelling so
+	// this test survives a future rename.
+	caseStart := regexp.MustCompile(`(?m)^case\s+"\$\{(_?HERMES(?:_DEFAULT|_INFERENCE)?_MODEL)\}"\s+in\s*$`)
 	startLoc := caseStart.FindIndex(raw)
 	if startLoc == nil {
-		t.Fatalf("could not locate `case \"${HERMES_DEFAULT_MODEL}\" in` in %s — shell file shape changed; rebuild parser", shellPath)
+		t.Fatalf("could not locate `case \"${...HERMES...MODEL}\" in` in %s — shell file shape changed; rebuild parser", vendoredShellPath)
 	}
 	caseEnd := regexp.MustCompile(`(?m)^esac\s*$`)
 	endLoc := caseEnd.FindIndex(raw[startLoc[1]:])
 	if endLoc == nil {
-		t.Fatalf("could not locate `esac` after the case statement in %s — shell file shape changed", shellPath)
+		t.Fatalf("could not locate `esac` after the case statement in %s — shell file shape changed", vendoredShellPath)
 	}
 	body := string(raw[startLoc[1] : startLoc[1]+endLoc[0]])
 
@@ -336,13 +326,11 @@ func loadShellPrefixMap(t *testing.T) map[string]string {
 // in the function.
 func loadGoPrefixMap(t *testing.T) map[string]string {
 	t.Helper()
-	root := monorepoRoot(t)
-	goPath := filepath.Join(root, "workspace-server", "internal", "handlers", "workspace_provision.go")
 
 	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, goPath, nil, parser.ParseComments)
+	file, err := parser.ParseFile(fset, goSourcePath, nil, parser.ParseComments)
 	if err != nil {
-		t.Fatalf("parse %s: %v", goPath, err)
+		t.Fatalf("parse %s: %v", goSourcePath, err)
 	}
 
 	var fn *ast.FuncDecl
@@ -357,7 +345,7 @@ func loadGoPrefixMap(t *testing.T) map[string]string {
 		}
 	}
 	if fn == nil {
-		t.Fatalf("could not find deriveProviderFromModelSlug in %s — function renamed/removed; this gate's invariant has been violated", goPath)
+		t.Fatalf("could not find deriveProviderFromModelSlug in %s — function renamed/removed; this gate's invariant has been violated", goSourcePath)
 	}
 
 	// Walk the function body for the SwitchStmt.
