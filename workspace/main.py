@@ -125,6 +125,16 @@ async def main():  # pragma: no cover
     adapter = adapter_cls()
     print(f"Runtime: {runtime} ({adapter.display_name()})")
 
+    # 3a. Wire pluggable event-log backend from config.observability.event_log.
+    # Default config.yaml sets backend=memory; operators set "disabled" to
+    # opt out without removing append-call sites from adapter code.
+    from event_log import create_event_log
+    adapter.event_log = create_event_log(
+        backend=config.observability.event_log.backend,
+        ttl_seconds=config.observability.event_log.ttl_seconds,
+        max_entries=config.observability.event_log.max_entries,
+    )
+
     # 4. Build adapter config
     adapter_config = AdapterConfig(
         model=config.model,
