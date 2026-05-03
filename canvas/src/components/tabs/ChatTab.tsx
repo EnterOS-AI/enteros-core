@@ -773,14 +773,14 @@ function MyChatPanel({ workspaceId, data }: Props) {
             <div
               className={`max-w-[85%] rounded-lg px-3 py-2 text-xs ${
                 msg.role === "user"
-                  ? "bg-accent-strong/30 text-blue-100 border border-accent/20"
+                  ? "bg-accent text-white border border-accent-strong"
                   : msg.role === "system"
-                    ? "bg-red-900/30 text-red-200 border border-red-800/30"
-                    : "bg-surface-card/80 text-ink border border-line/30"
+                    ? "bg-bad/10 text-bad border border-bad/40"
+                    : "bg-surface-card text-ink border border-line"
               }`}
             >
               {msg.content && (
-                <div className="prose prose-sm prose-invert max-w-none [&>p]:mb-1 [&>p:last-child]:mb-0">
+                <div className={`prose prose-sm max-w-none [&>p]:mb-1 [&>p:last-child]:mb-0 ${msg.role === "user" ? "prose-invert" : ""}`}>
                   <ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown>
                 </div>
               )}
@@ -796,7 +796,7 @@ function MyChatPanel({ workspaceId, data }: Props) {
                   ))}
                 </div>
               )}
-              <div className="text-[9px] text-ink-soft mt-1">
+              <div className={`text-[9px] mt-1 ${msg.role === "user" ? "text-white/70" : "text-ink-mid"}`}>
                 {new Date(msg.timestamp).toLocaleTimeString()}
               </div>
             </div>
