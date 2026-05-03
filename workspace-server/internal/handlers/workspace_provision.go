@@ -700,6 +700,19 @@ func applyRuntimeModelEnv(envVars map[string]string, runtime, model string) {
 	if model == "" {
 		return
 	}
+
+	// Universal MODEL env var — every adapter that wants to honour the
+	// canvas-picked model (instead of its template's default) reads this.
+	// molecule-runtime's workspace/config.py already falls back to MODEL
+	// for runtime_config.model (#194). Without this line, the user's
+	// canvas selection is silently dropped on every templated provision —
+	// confirmed via crash-loop diagnosis on 2026-05-02 where MiniMax
+	// picks booted with model=sonnet (template default) and demanded
+	// CLAUDE_CODE_OAUTH_TOKEN. Set it FIRST so the per-runtime branches
+	// below can still layer on additional vendor-specific names without
+	// fighting over the canonical one.
+	envVars["MODEL"] = model
+
 	switch runtime {
 	case "hermes":
 		// template-hermes install.sh reads this into ~/.hermes/config.yaml's
