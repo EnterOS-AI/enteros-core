@@ -158,6 +158,14 @@ func (h *TemplatesHandler) List(c *gin.Context) {
 			} `yaml:"runtime_config"`
 		}
 		if err := yaml.Unmarshal(data, &raw); err != nil {
+			// Without this log a malformed config.yaml causes the
+			// template to silently disappear from /templates with no
+			// trace — the operator can't tell "excluded due to parse
+			// error" from "never existed." That matters more now that
+			// templates ship richer YAML shapes (top-level providers
+			// registry, models[] with required_env, etc.) where a
+			// type-shape mismatch on one field drops the whole entry.
+			log.Printf("templates list: skip %s: yaml.Unmarshal: %v", id, err)
 			return
 		}
 
