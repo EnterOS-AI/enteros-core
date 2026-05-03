@@ -131,7 +131,7 @@ def _persist_inbound_secret_from_heartbeat(resp) -> None:
         )
 
 
-HEARTBEAT_INTERVAL = 30  # seconds
+HEARTBEAT_INTERVAL = 30  # seconds — fallback default when no per-instance value is passed
 MAX_CONSECUTIVE_FAILURES = 10
 MAX_SEEN_DELEGATION_IDS = 200
 SELF_MESSAGE_COOLDOWN = 60  # seconds — minimum between self-messages to prevent loops
@@ -142,9 +142,22 @@ DELEGATION_RESULTS_FILE = os.environ.get("DELEGATION_RESULTS_FILE", "/tmp/delega
 
 
 class HeartbeatLoop:
-    def __init__(self, platform_url: str, workspace_id: str):
+    def __init__(
+        self,
+        platform_url: str,
+        workspace_id: str,
+        interval_seconds: int = HEARTBEAT_INTERVAL,
+    ):
         self.platform_url = platform_url
         self.workspace_id = workspace_id
+        # Per-instance interval — main.py threads ObservabilityConfig.
+        # heartbeat_interval_seconds (clamped to [5, 300] at parse time)
+        # in here so operators can tune cadence per-workspace via the
+        # `observability:` block in config.yaml. Defaults to the
+        # legacy module constant so callers that haven't been updated
+        # yet (and tests that construct HeartbeatLoop directly with the
+        # 2-arg signature) keep their existing 30s behavior.
+        self._interval_seconds = interval_seconds
         self.start_time = time.time()
         self.error_count = 0
         self.request_count = 0
@@ -280,13 +293,15 @@ class HeartbeatLoop:
                     except Exception as e:
                         logger.debug("Delegation check failed: %s", e)
 
-                    await asyncio.sleep(HEARTBEAT_INTERVAL)
+                    await asyncio.sleep(self._interval_seconds)
 
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                logger.error("Heartbeat loop error: %s — retrying in 30s", e)
-                await asyncio.sleep(HEARTBEAT_INTERVAL)
+                logger.error(
+                    "Heartbeat loop error: %s — retrying in %ds", e, self._interval_seconds
+                )
+                await asyncio.sleep(self._interval_seconds)
             finally:
                 if client:
                     try:

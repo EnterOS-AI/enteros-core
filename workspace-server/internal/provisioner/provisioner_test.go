@@ -436,6 +436,62 @@ func TestWorkspaceConfig_ResetClaudeSessionFieldPresent(t *testing.T) {
 	}
 }
 
+// ---------- selectImage (#2272 layer 1) ----------
+
+// TestSelectImage_PrefersExplicitImage: when the handler resolved a digest
+// pin via runtime_image_pins, cfg.Image is set. selectImage must honor it
+// and ignore the cfg.Runtime → :latest fallback. This is the load-bearing
+// invariant for digest pinning — if it ever silently reverts to :latest,
+// we lose the "one bad publish doesn't break every workspace" guarantee.
+func TestSelectImage_PrefersExplicitImage(t *testing.T) {
+	pinned := "ghcr.io/molecule-ai/workspace-template-claude-code@sha256:3d6761a97ed07d7d33cfc19a8fbab81175d9d9179618d493dbc00c5f7ef076a3"
+	got := selectImage(WorkspaceConfig{Runtime: "claude-code", Image: pinned})
+	if got != pinned {
+		t.Errorf("selectImage with cfg.Image=pinned: got %q, want %q", got, pinned)
+	}
+}
+
+// TestSelectImage_FallsBackToRuntimeMap: handler returned "" (no pin or
+// pin lookup deliberately bypassed via WORKSPACE_IMAGE_LOCAL_OVERRIDE).
+// selectImage must use the legacy runtime→:latest map.
+func TestSelectImage_FallsBackToRuntimeMap(t *testing.T) {
+	got := selectImage(WorkspaceConfig{Runtime: "claude-code", Image: ""})
+	want := RuntimeImages["claude-code"]
+	if got != want {
+		t.Errorf("selectImage with empty Image: got %q, want %q", got, want)
+	}
+}
+
+// TestSelectImage_UnknownRuntimeFallsBackToDefault preserves today's
+// behavior — an unrecognized runtime resolves to DefaultImage rather than
+// "" so ContainerCreate gets a usable arg and surfaces a meaningful
+// "No such image" error if the default itself is missing.
+func TestSelectImage_UnknownRuntimeFallsBackToDefault(t *testing.T) {
+	got := selectImage(WorkspaceConfig{Runtime: "no-such-runtime"})
+	if got != DefaultImage {
+		t.Errorf("selectImage with unknown runtime: got %q, want DefaultImage %q", got, DefaultImage)
+	}
+}
+
+// TestSelectImage_EmptyRuntimeFallsBackToDefault: same invariant for the
+// no-runtime-supplied path (legacy callers / older handler code).
+func TestSelectImage_EmptyRuntimeFallsBackToDefault(t *testing.T) {
+	got := selectImage(WorkspaceConfig{})
+	if got != DefaultImage {
+		t.Errorf("selectImage with zero cfg: got %q, want DefaultImage %q", got, DefaultImage)
+	}
+}
+
+// TestWorkspaceConfig_ImageFieldPresent compile-time-pins the Image field
+// so the handler→provisioner contract for digest-pinned image refs can't
+// be silently removed by a future struct refactor (#2272).
+func TestWorkspaceConfig_ImageFieldPresent(t *testing.T) {
+	cfg := WorkspaceConfig{Image: "ghcr.io/example@sha256:abc"}
+	if cfg.Image == "" {
+		t.Fatal("Image should round-trip through struct literal")
+	}
+}
+
 // ---------- buildContainerEnv — #67 MOLECULE_URL injection ----------
 
 func TestBuildContainerEnv_InjectsBothPlatformURLAndMoleculeAIURL(t *testing.T) {
@@ -729,6 +785,68 @@ func TestRuntimeTagFromImage(t *testing.T) {
 		if got != want {
 			t.Errorf("runtimeTagFromImage(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// ---------- imageTagIsMoving (task #215) ----------
+
+// TestImageTagIsMoving pins the moving-tag classifier. The classifier
+// gates whether Start() forces a re-pull on a local-cache hit — get
+// the classification wrong on the "moving" side and we waste bandwidth
+// on every provision; get it wrong on the "pinned" side and the fleet
+// silently sticks on a stale `:latest` snapshot (the bug class this
+// task closes).
+func TestImageTagIsMoving(t *testing.T) {
+	cases := []struct {
+		name  string
+		image string
+		want  bool
+	}{
+		// Bare references default to :latest at the registry level.
+		{"bare repo no tag", "ghcr.io/molecule-ai/workspace-template-hermes", true},
+		{"bare local image no tag", "workspace-template", true},
+
+		// Explicit moving tags.
+		{"explicit latest", "ghcr.io/molecule-ai/workspace-template-hermes:latest", true},
+		{"explicit staging", "ghcr.io/molecule-ai/workspace-template-hermes:staging", true},
+		{"explicit main", "ghcr.io/molecule-ai/workspace-template-hermes:main", true},
+		{"explicit dev", "ghcr.io/molecule-ai/workspace-template-hermes:dev", true},
+		{"explicit edge", "ghcr.io/molecule-ai/workspace-template-hermes:edge", true},
+		{"explicit nightly", "ghcr.io/molecule-ai/workspace-template-hermes:nightly", true},
+		{"explicit rolling", "ghcr.io/molecule-ai/workspace-template-hermes:rolling", true},
+
+		// Pinned tags — must NOT be classified as moving.
+		{"semver tag", "ghcr.io/molecule-ai/workspace-template-hermes:0.8.2", false},
+		{"semver with v prefix", "ghcr.io/molecule-ai/workspace-template-hermes:v1.2.3", false},
+		{"sha-prefixed commit tag", "ghcr.io/molecule-ai/workspace-template-langgraph:sha-abc1234", false},
+		{"date-stamped tag", "ghcr.io/molecule-ai/workspace-template-hermes:2026-04-30", false},
+		{"build-id tag", "ghcr.io/molecule-ai/workspace-template-hermes:build-12345", false},
+
+		// Digest pinning — strongest immutability signal, never moving
+		// even if a moving-looking tag is also present.
+		{"digest only", "ghcr.io/molecule-ai/workspace-template-hermes@sha256:abc123def456", false},
+		{"tag plus digest", "ghcr.io/molecule-ai/workspace-template-hermes:latest@sha256:abc123def456", false},
+
+		// Registry hostname with port — the `:` in `:5000` must NOT be
+		// mistaken for a tag separator. Without this guard, a private
+		// registry like `localhost:5000/foo` would always re-pull.
+		{"registry with port no tag", "localhost:5000/workspace-template-hermes", true}, // bare → moving
+		{"registry with port pinned tag", "localhost:5000/workspace-template-hermes:0.8.2", false},
+		{"registry with port latest tag", "localhost:5000/workspace-template-hermes:latest", true},
+
+		// Legacy local-build tags from `docker build -t workspace-template:<runtime>`.
+		// These are arbitrary strings, treated as pinned (they don't
+		// move from the registry's perspective — there is no registry).
+		{"legacy local hermes tag", "workspace-template:hermes", false},
+		{"legacy local claude-code tag", "workspace-template:claude-code", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := imageTagIsMoving(tc.image)
+			if got != tc.want {
+				t.Errorf("imageTagIsMoving(%q) = %v, want %v", tc.image, got, tc.want)
+			}
+		})
 	}
 }
 

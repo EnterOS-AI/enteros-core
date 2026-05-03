@@ -81,7 +81,7 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       wheel_sha256: ${{ steps.wheel_hash.outputs.wheel_sha256 }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
@@ -327,7 +327,13 @@ jobs:
             echo "::error::publish job did not expose a version output — cascade cannot fan out"
             exit 1
           fi
-          TEMPLATES="claude-code langgraph crewai autogen deepagents hermes gemini-cli openclaw"
+          # Source of truth: manifest.json workspace_templates (PR #2536 pruned
+          # to 4 actively-supported runtimes: claude-code, hermes, openclaw, codex).
+          # Removed langgraph/crewai/autogen/deepagents/gemini-cli (deprecated, no
+          # shipping images); added codex (had been missing since #2512).
+          # Long-term: derive this list from manifest.json so the cascade can't
+          # drift again — tracked in RFC #388 as a Phase-1 invariant.
+          TEMPLATES="claude-code hermes openclaw codex"
           FAILED=""
           for tpl in $TEMPLATES; do
             REPO="Molecule-AI/molecule-ai-workspace-template-$tpl"

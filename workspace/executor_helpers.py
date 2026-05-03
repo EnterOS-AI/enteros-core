@@ -844,26 +844,66 @@ def resolve_attachment_uri(uri: str) -> str | None:
 def extract_attached_files(message: Any) -> list[dict[str, str]]:
     """Pull ``{name, mime_type, path}`` dicts out of an A2A message.
 
-    Handles the discriminated-union shape ``part.root.file`` that a2a-sdk
-    produces via Pydantic RootModel, and the flatter ``part.file`` shape
-    hand-built callers sometimes emit. Non-file parts and files with
-    unresolvable URIs are skipped — the caller sees an empty list rather
-    than a mix of valid and broken entries.
+    Tolerates three Part shapes:
+
+    1. a2a-sdk v0 Pydantic RootModel — ``part.root.kind == 'file'`` with
+       ``part.root.file.{uri,name,mimeType}``. The hot path; this is
+       what every current caller produces (canvas chat, A2A peer
+       delegations, agent self-attached files).
+    2. v0 flatter shape — ``part.kind == 'file'`` with
+       ``part.file.{uri,name,mimeType}``. Some hand-built callers
+       (older test fixtures, third-party clients) emit this.
+    3. v1 protobuf — ``part.url`` non-empty with ``part.filename`` +
+       ``part.media_type``. **Defensive future-proofing only.** The
+       v1 ``Part`` proto exists in a2a-sdk's ``a2a.types.a2a_pb2`` but
+       a2a-sdk's JSON-RPC layer still validates inbound requests
+       against the v0 Pydantic discriminated union (TextPart |
+       FilePart | DataPart), so a v1 wire shape is rejected at the
+       request boundary today — this branch is unreachable on the
+       JSON-RPC ingress path. Kept so a future SDK release that
+       flips the JSON-RPC schema doesn't silently regress this
+       helper, and so non-conformant in-process callers (e.g. a
+       template that constructs a Part directly from protobuf) get
+       handled correctly.
+
+    Non-file parts and files with unresolvable URIs are skipped — the
+    caller sees an empty list rather than a mix of valid and broken
+    entries.
     """
     if message is None:
         return []
     parts = getattr(message, "parts", None) or []
     out: list[dict[str, str]] = []
     for part in parts:
+        uri = ""
+        name = ""
+        mime = ""
+
         root = getattr(part, "root", part)
-        if getattr(root, "kind", None) != "file":
-            continue
-        f = getattr(root, "file", None)
-        if f is None:
-            continue
-        uri = getattr(f, "uri", "") or ""
-        name = getattr(f, "name", "") or ""
-        mime = getattr(f, "mimeType", None) or getattr(f, "mime_type", None) or ""
+        if getattr(root, "kind", None) == "file":
+            f = getattr(root, "file", None)
+            if f is None:
+                continue
+            uri = getattr(f, "uri", "") or ""
+            name = getattr(f, "name", "") or ""
+            mime = getattr(f, "mimeType", None) or getattr(f, "mime_type", None) or ""
+        else:
+            # Defensive v1 path (see docstring): v1 Part has no `kind`,
+            # detect by a non-empty `url` (the file/url-of-bytes oneof
+            # slot). Fall back from snake_case `media_type` to
+            # camelCase `mediaType` for callers that hand us the
+            # Pydantic-style attribute name.
+            v1_url = getattr(part, "url", "") or ""
+            if not v1_url:
+                continue
+            uri = v1_url
+            name = getattr(part, "filename", "") or ""
+            mime = (
+                getattr(part, "media_type", None)
+                or getattr(part, "mediaType", None)
+                or ""
+            )
+
         path = resolve_attachment_uri(uri)
         if not path or not os.path.isfile(path):
             logger.warning("skipping attached file with unresolvable uri=%r", uri)

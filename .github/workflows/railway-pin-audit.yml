@@ -49,7 +49,7 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Verify RAILWAY_AUDIT_TOKEN present
         # Schedule trigger: hard-fail when the secret is missing —
@@ -143,7 +143,7 @@ jobs:
 
       - name: Open / update drift issue
         if: failure() && steps.audit.outputs.rc == '1'
-        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           AUDIT_LOG: ${{ steps.audit.outputs.log }}
         with:
@@ -184,7 +184,7 @@ jobs:
         # issue with a confirmation comment so the queue doesn't carry
         # stale ones.
         if: success() && steps.audit.outputs.rc == '0'
-        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
             const runURL = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;

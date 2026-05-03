@@ -3,7 +3,17 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import { createPortal } from "react-dom";
 import { api } from "@/lib/api";
-import { getKeyLabel, type ProviderChoice } from "@/lib/deploy-preflight";
+import {
+  getKeyLabel,
+  type ModelSpec,
+  type ProviderChoice,
+} from "@/lib/deploy-preflight";
+import {
+  ProviderModelSelector,
+  buildProviderCatalog,
+  findProviderForModel,
+  type SelectorValue,
+} from "./ProviderModelSelector";
 
 interface Props {
   open: boolean;
@@ -38,6 +48,14 @@ interface Props {
    *  the API-key fields. The picker passes the entered slug back via
    *  onKeysAdded. */
   modelSuggestions?: string[];
+  /** Full model specs from the template (with required_env per model).
+   *  When provided, the picker auto-snaps the provider radio to the
+   *  matching provider as the user changes the model — fixes the
+   *  "type MiniMax model, see ANTHROPIC_API_KEY field" cascade bug
+   *  (sibling of the ConfigTab cascade fix in #2516). Optional so
+   *  callers without model→provider mapping data can still use the
+   *  picker as-is. */
+  models?: ModelSpec[];
   /** Pre-fill the model input. */
   initialModel?: string;
   /** Override the modal's title + description copy. The default
@@ -83,6 +101,7 @@ export function MissingKeysModal({
   workspaceId,
   configuredKeys,
   modelSuggestions,
+  models,
   initialModel,
   title,
   description,
@@ -102,6 +121,7 @@ export function MissingKeysModal({
         workspaceId={workspaceId}
         configuredKeys={configuredKeys}
         modelSuggestions={modelSuggestions}
+        models={models}
         initialModel={initialModel}
         title={title}
         description={description}
@@ -131,6 +151,22 @@ export function MissingKeysModal({
 // Provider-picker mode — choose one option, save its env var(s), deploy.
 // -----------------------------------------------------------------------------
 
+/** Provider id derived from a model spec — sorted+joined required_env,
+ *  matching the formula in providersFromTemplate(). When the model has
+ *  no required_env (local/self-hosted endpoints) returns null, since
+ *  there's no provider option the radio could snap to. Exported for
+ *  the cascade-snap test. */
+export function providerIdForModel(
+  modelId: string,
+  models: ModelSpec[] | undefined,
+): string | null {
+  const trimmed = modelId.trim();
+  if (!trimmed || !models) return null;
+  const m = models.find((x) => x.id === trimmed);
+  if (!m?.required_env || m.required_env.length === 0) return null;
+  return [...m.required_env].sort().join("|");
+}
+
 function ProviderPickerModal({
   open,
   providers,
@@ -141,6 +177,7 @@ function ProviderPickerModal({
   workspaceId,
   configuredKeys,
   modelSuggestions,
+  models,
   initialModel,
   title,
   description,
@@ -154,45 +191,87 @@ function ProviderPickerModal({
   workspaceId?: string;
   configuredKeys?: Set<string>;
   modelSuggestions?: string[];
+  models?: ModelSpec[];
   initialModel?: string;
   title?: string;
   description?: string;
 }) {
-  // Prefer the first provider whose env vars are already satisfied by
-  // the configured set — pre-selecting "the option the user already has
-  // keys for" matches expected UX. Falls back to providers[0] otherwise.
-  const initialSelected = useMemo(() => {
+  // Single model source: `models` from caller when present, else
+  // synthesize a stub list from the legacy `providers` shape so older
+  // callers (pre-PR-2534) still drive the picker. ProviderModelSelector
+  // and findProviderForModel BOTH consume this list — passing the same
+  // shape to both keeps ids identical, so back-derivation matches the
+  // dropdown's option values.
+  const selectorModels = useMemo(() => {
+    if (models && models.length > 0) return models;
+    return providers.map((p) => ({
+      id: p.id,
+      name: p.label,
+      required_env: p.envVars,
+    }));
+  }, [models, providers]);
+
+  const catalog = useMemo(() => buildProviderCatalog(selectorModels), [selectorModels]);
+
+  // Initial selector value: prefer back-derivation from initialModel
+  // (template-deploy passes the template default), then the first
+  // provider already satisfied by configuredKeys, then catalog[0].
+  const initial = useMemo<SelectorValue>(() => {
+    if (initialModel) {
+      const matched = findProviderForModel(catalog, initialModel);
+      if (matched) {
+        return {
+          providerId: matched.id,
+          model: initialModel,
+          envVars: matched.envVars,
+        };
+      }
+    }
     if (configuredKeys) {
-      const satisfied = providers.find((p) =>
+      const satisfied = catalog.find((p) =>
         p.envVars.every((k) => configuredKeys.has(k)),
       );
-      if (satisfied) return satisfied.id;
+      if (satisfied) {
+        return {
+          providerId: satisfied.id,
+          model: satisfied.wildcard ? "" : satisfied.models[0]?.id ?? "",
+          envVars: satisfied.envVars,
+        };
+      }
     }
-    return providers[0].id;
-  }, [providers, configuredKeys]);
+    const first = catalog[0];
+    if (!first) return { providerId: "", model: "", envVars: [] };
+    return {
+      providerId: first.id,
+      model: first.wildcard ? "" : first.models[0]?.id ?? "",
+      envVars: first.envVars,
+    };
+  }, [catalog, initialModel, configuredKeys]);
 
-  const [selectedId, setSelectedId] = useState(initialSelected);
+  const [selectorValue, setSelectorValue] = useState<SelectorValue>(initial);
   const [entries, setEntries] = useState<KeyEntry[]>([]);
-  const [model, setModel] = useState(initialModel ?? "");
   const firstInputRef = useRef<HTMLInputElement>(null);
 
+  // Legacy compat: map the selector value back into the old `selected`/
+  // `model` shape for the rest of the modal body (footer copy, etc.).
   const selected = useMemo(
-    () => providers.find((p) => p.id === selectedId) ?? providers[0],
-    [providers, selectedId],
+    () =>
+      providers.find((p) => p.id === selectorValue.providerId) ??
+      providers[0],
+    [providers, selectorValue.providerId],
   );
-
-  const showModelInput = (modelSuggestions?.length ?? 0) > 0 || initialModel !== undefined;
+  const model = selectorValue.model;
+  const showModelInput = catalog.length > 0;
 
   useEffect(() => {
     if (!open) return;
-    setSelectedId(initialSelected);
-    setModel(initialModel ?? "");
-  }, [open, initialSelected, initialModel]);
+    setSelectorValue(initial);
+  }, [open, initial]);
 
   useEffect(() => {
     if (!open) return;
     setEntries(
-      selected.envVars.map((key) => ({
+      selectorValue.envVars.map((key) => ({
         key,
         value: "",
         // Pre-mark as saved when the key is already in the configured
@@ -203,13 +282,13 @@ function ProviderPickerModal({
         error: null,
       })),
     );
-  }, [open, selected, configuredKeys]);
+  }, [open, selectorValue.envVars, configuredKeys]);
 
   useEffect(() => {
     if (!open) return;
     const raf = requestAnimationFrame(() => firstInputRef.current?.focus());
     return () => cancelAnimationFrame(raf);
-  }, [open, selectedId]);
+  }, [open, selectorValue.providerId]);
 
   useEffect(() => {
     if (!open) return;
@@ -289,9 +368,9 @@ function ProviderPickerModal({
         role="dialog"
         aria-modal="true"
         aria-labelledby="missing-keys-title"
-        className="relative bg-zinc-900 border border-zinc-700 rounded-xl shadow-2xl shadow-black/50 max-w-[480px] w-full mx-4 max-h-[80vh] overflow-auto"
+        className="relative bg-surface-sunken border border-line rounded-xl shadow-2xl shadow-black/50 max-w-[480px] w-full mx-4 max-h-[80vh] overflow-auto"
       >
-        <div className="px-5 py-4 border-b border-zinc-800">
+        <div className="px-5 py-4 border-b border-line">
           <div className="flex items-center gap-2 mb-1">
             <div
               className="w-5 h-5 rounded-md bg-amber-600/20 border border-amber-500/30 flex items-center justify-center"
@@ -303,14 +382,14 @@ function ProviderPickerModal({
                 <circle cx="6" cy="8.5" r="0.5" fill="#fbbf24" />
               </svg>
             </div>
-            <h3 id="missing-keys-title" className="text-sm font-semibold text-zinc-100">
+            <h3 id="missing-keys-title" className="text-sm font-semibold text-ink">
               {title ?? "Missing API Keys"}
             </h3>
           </div>
-          <p className="text-[12px] text-zinc-400 leading-relaxed">
+          <p className="text-[12px] text-ink-mid leading-relaxed">
             {description ?? (
               <>
-                The <span className="text-amber-300 font-medium">{runtimeLabel}</span>{" "}
+                The <span className="text-warm font-medium">{runtimeLabel}</span>{" "}
                 runtime supports multiple providers. Pick one and paste its API key.
               </>
             )}
@@ -318,89 +397,34 @@ function ProviderPickerModal({
         </div>
 
         <div className="px-5 py-4 space-y-3">
-          {showModelInput && (
-            <div>
-              <label
-                htmlFor="provider-picker-model-input"
-                className="text-[10px] uppercase tracking-wide text-zinc-500 font-semibold mb-1.5 block"
-              >
-                Model{" "}
-                <span aria-hidden="true" className="text-red-400">*</span>
-                <span className="sr-only"> (required)</span>
-              </label>
-              <input
-                id="provider-picker-model-input"
-                type="text"
-                value={model}
-                onChange={(e) => setModel(e.target.value)}
-                placeholder="e.g. minimax/MiniMax-M2.7"
-                aria-label="Model slug"
-                autoComplete="off"
-                spellCheck={false}
-                list="provider-picker-model-suggestions"
-                className="w-full bg-zinc-900 border border-zinc-600 rounded px-2 py-1.5 text-[11px] text-zinc-100 font-mono focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500/20 transition-colors"
-              />
-              <datalist id="provider-picker-model-suggestions">
-                {modelSuggestions?.map((m) => (
-                  <option key={m} value={m} />
-                ))}
-              </datalist>
-              <p className="text-[9px] text-zinc-500 mt-1 leading-relaxed">
-                Slug determines provider routing at install time.
-              </p>
-            </div>
-          )}
-          <fieldset className="space-y-1.5">
-            <legend className="text-[10px] uppercase tracking-wide text-zinc-500 font-semibold mb-1.5">
-              Provider
-            </legend>
-            {providers.map((p) => (
-              <label
-                key={p.id}
-                className={`flex items-start gap-2.5 rounded-lg border px-3 py-2 cursor-pointer transition-colors ${
-                  selectedId === p.id
-                    ? "bg-blue-600/15 border-blue-500/50"
-                    : "bg-zinc-800/40 border-zinc-700/50 hover:border-zinc-600"
-                }`}
-              >
-                <input
-                  type="radio"
-                  name="provider"
-                  value={p.id}
-                  checked={selectedId === p.id}
-                  onChange={() => setSelectedId(p.id)}
-                  className="mt-0.5 accent-blue-500"
-                />
-                <div className="min-w-0 flex-1">
-                  <div className="text-[12px] text-zinc-100 font-medium">{p.label}</div>
-                  <div className="text-[10px] font-mono text-zinc-500">
-                    {p.envVars.join(", ")}
-                  </div>
-                  {p.note && (
-                    <div className="text-[10px] text-zinc-500 mt-1 leading-relaxed">
-                      {p.note}
-                    </div>
-                  )}
-                </div>
-              </label>
-            ))}
-          </fieldset>
+          {/* Shared provider→model selector. Source of truth for provider
+              taxonomy + model filtering. Same component is used in
+              ConfigTab so behavior + vendor split is identical across
+              all 3 deploy surfaces (modal here, settings tab, template
+              palette flow). */}
+          <ProviderModelSelector
+            models={selectorModels}
+            value={selectorValue}
+            onChange={setSelectorValue}
+            variant="stack"
+            idPrefix="provider-picker"
+          />
 
           <div className="space-y-2">
             {entries.map((entry, index) => (
               <div
                 key={entry.key}
-                className="bg-zinc-800/50 rounded-lg px-3 py-2.5 border border-zinc-700/50"
+                className="bg-surface-card/50 rounded-lg px-3 py-2.5 border border-line/50"
               >
                 <div className="flex items-center justify-between mb-1.5">
                   <div>
-                    <div className="text-[11px] text-zinc-300 font-medium">
+                    <div className="text-[11px] text-ink-mid font-medium">
                       {getKeyLabel(entry.key)}
                     </div>
-                    <div className="text-[9px] font-mono text-zinc-500">{entry.key}</div>
+                    <div className="text-[9px] font-mono text-ink-soft">{entry.key}</div>
                   </div>
                   {entry.saved && (
-                    <span className="text-[9px] text-emerald-400 bg-emerald-900/30 px-1.5 py-0.5 rounded flex items-center gap-1">
+                    <span className="text-[9px] text-good bg-emerald-900/30 px-1.5 py-0.5 rounded flex items-center gap-1">
                       <svg width="8" height="8" viewBox="0 0 8 8" fill="none" aria-hidden="true">
                         <path d="M1.5 4L3.5 6L6.5 2" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round" />
                       </svg>
@@ -422,12 +446,12 @@ function ProviderPickerModal({
                           handleSaveKey(index);
                         }
                       }}
-                      className="flex-1 bg-zinc-900 border border-zinc-600 rounded px-2 py-1.5 text-[11px] text-zinc-100 font-mono focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500/20 transition-colors"
+                      className="flex-1 bg-surface-sunken border border-line rounded px-2 py-1.5 text-[11px] text-ink font-mono focus:outline-none focus:border-accent focus:ring-1 focus:ring-accent/20 transition-colors"
                     />
                     <button
                       onClick={() => handleSaveKey(index)}
                       disabled={!entry.value.trim() || entry.saving}
-                      className="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 text-[11px] rounded text-white disabled:opacity-30 transition-colors shrink-0"
+                      className="px-3 py-1.5 bg-accent-strong hover:bg-accent text-[11px] rounded text-white disabled:opacity-30 transition-colors shrink-0"
                     >
                       {entry.saving ? "..." : "Save"}
                     </button>
@@ -435,19 +459,19 @@ function ProviderPickerModal({
                 )}
 
                 {entry.error && (
-                  <div className="mt-1.5 text-[10px] text-red-400">{entry.error}</div>
+                  <div className="mt-1.5 text-[10px] text-bad">{entry.error}</div>
                 )}
               </div>
             ))}
           </div>
         </div>
 
-        <div className="px-5 py-3 border-t border-zinc-800 bg-zinc-950/50 flex items-center justify-between gap-2">
+        <div className="px-5 py-3 border-t border-line bg-surface/50 flex items-center justify-between gap-2">
           <div>
             {onOpenSettings && (
               <button
                 onClick={onOpenSettings}
-                className="text-[11px] text-blue-400 hover:text-blue-300 transition-colors"
+                className="text-[11px] text-accent hover:text-accent transition-colors"
               >
                 Open Settings Panel
               </button>
@@ -456,7 +480,7 @@ function ProviderPickerModal({
           <div className="flex items-center gap-2">
             <button
               onClick={onCancel}
-              className="px-3.5 py-1.5 text-[12px] text-zinc-400 hover:text-zinc-200 bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 rounded-lg transition-colors"
+              className="px-3.5 py-1.5 text-[12px] text-ink-mid hover:text-ink bg-surface-card hover:bg-surface-card border border-line rounded-lg transition-colors"
             >
               Cancel Deploy
             </button>
@@ -465,9 +489,10 @@ function ProviderPickerModal({
               disabled={
                 !allSaved ||
                 anySaving ||
+                !selectorValue.providerId ||
                 (showModelInput && model.trim() === "")
               }
-              className="px-3.5 py-1.5 text-[12px] bg-blue-600 hover:bg-blue-500 text-white rounded-lg transition-colors disabled:opacity-40"
+              className="px-3.5 py-1.5 text-[12px] bg-accent-strong hover:bg-accent text-white rounded-lg transition-colors disabled:opacity-40"
             >
               {allSaved ? "Deploy" : entries.length > 1 ? "Add Keys" : "Add Key"}
             </button>
@@ -615,9 +640,9 @@ function AllKeysModal({
         role="dialog"
         aria-modal="true"
         aria-labelledby="missing-keys-title"
-        className="relative bg-zinc-900 border border-zinc-700 rounded-xl shadow-2xl shadow-black/50 max-w-[440px] w-full mx-4 max-h-[80vh] overflow-auto"
+        className="relative bg-surface-sunken border border-line rounded-xl shadow-2xl shadow-black/50 max-w-[440px] w-full mx-4 max-h-[80vh] overflow-auto"
       >
-        <div className="px-5 py-4 border-b border-zinc-800">
+        <div className="px-5 py-4 border-b border-line">
           <div className="flex items-center gap-2 mb-1">
             <div
               className="w-5 h-5 rounded-md bg-amber-600/20 border border-amber-500/30 flex items-center justify-center"
@@ -629,12 +654,12 @@ function AllKeysModal({
                 <circle cx="6" cy="8.5" r="0.5" fill="#fbbf24" />
               </svg>
             </div>
-            <h3 id="missing-keys-title" className="text-sm font-semibold text-zinc-100">
+            <h3 id="missing-keys-title" className="text-sm font-semibold text-ink">
               Missing API Keys
             </h3>
           </div>
-          <p className="text-[12px] text-zinc-400 leading-relaxed">
-            The <span className="text-amber-300 font-medium">{runtimeLabel}</span>{" "}
+          <p className="text-[12px] text-ink-mid leading-relaxed">
+            The <span className="text-warm font-medium">{runtimeLabel}</span>{" "}
             runtime requires the following keys to be configured before deploying.
           </p>
         </div>
@@ -643,17 +668,17 @@ function AllKeysModal({
           {entries.map((entry, index) => (
             <div
               key={entry.key}
-              className="bg-zinc-800/50 rounded-lg px-3 py-2.5 border border-zinc-700/50"
+              className="bg-surface-card/50 rounded-lg px-3 py-2.5 border border-line/50"
             >
               <div className="flex items-center justify-between mb-1">
                 <div>
-                  <div className="text-[11px] text-zinc-300 font-medium">
+                  <div className="text-[11px] text-ink-mid font-medium">
                     {getKeyLabel(entry.key)}
                   </div>
-                  <div className="text-[9px] font-mono text-zinc-500">{entry.key}</div>
+                  <div className="text-[9px] font-mono text-ink-soft">{entry.key}</div>
                 </div>
                 {entry.saved && (
-                  <span className="text-[9px] text-emerald-400 bg-emerald-900/30 px-1.5 py-0.5 rounded flex items-center gap-1">
+                  <span className="text-[9px] text-good bg-emerald-900/30 px-1.5 py-0.5 rounded flex items-center gap-1">
                     <svg width="8" height="8" viewBox="0 0 8 8" fill="none">
                       <path d="M1.5 4L3.5 6L6.5 2" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round" />
                     </svg>
@@ -675,37 +700,37 @@ function AllKeysModal({
                         handleSaveKey(index);
                       }
                     }}
-                    className="flex-1 bg-zinc-900 border border-zinc-600 rounded px-2 py-1.5 text-[11px] text-zinc-100 font-mono focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500/20 transition-colors"
+                    className="flex-1 bg-surface-sunken border border-line rounded px-2 py-1.5 text-[11px] text-ink font-mono focus:outline-none focus:border-accent focus:ring-1 focus:ring-accent/20 transition-colors"
                   />
                   <button
                     type="button"
                     onClick={() => handleSaveKey(index)}
                     disabled={!entry.value.trim() || entry.saving}
-                    className="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 text-[11px] rounded text-white disabled:opacity-30 transition-colors shrink-0"
+                    className="px-3 py-1.5 bg-accent-strong hover:bg-accent text-[11px] rounded text-white disabled:opacity-30 transition-colors shrink-0"
                   >
                     {entry.saving ? "..." : "Save"}
                   </button>
                 </div>
               )}
 
-              {entry.error && <div className="mt-1.5 text-[10px] text-red-400">{entry.error}</div>}
+              {entry.error && <div className="mt-1.5 text-[10px] text-bad">{entry.error}</div>}
             </div>
           ))}
 
           {globalError && (
-            <div className="px-3 py-2 bg-red-950/40 border border-red-800/50 rounded-lg text-[11px] text-red-400">
+            <div className="px-3 py-2 bg-red-950/40 border border-red-800/50 rounded-lg text-[11px] text-bad">
               {globalError}
             </div>
           )}
         </div>
 
-        <div className="px-5 py-3 border-t border-zinc-800 bg-zinc-950/50 flex items-center justify-between gap-2">
+        <div className="px-5 py-3 border-t border-line bg-surface/50 flex items-center justify-between gap-2">
           <div>
             {onOpenSettings && (
               <button
                 type="button"
                 onClick={onOpenSettings}
-                className="text-[11px] text-blue-400 hover:text-blue-300 transition-colors"
+                className="text-[11px] text-accent hover:text-accent transition-colors"
               >
                 Open Settings Panel
               </button>
@@ -715,7 +740,7 @@ function AllKeysModal({
             <button
               type="button"
               onClick={onCancel}
-              className="px-3.5 py-1.5 text-[12px] text-zinc-400 hover:text-zinc-200 bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 rounded-lg transition-colors"
+              className="px-3.5 py-1.5 text-[12px] text-ink-mid hover:text-ink bg-surface-card hover:bg-surface-card border border-line rounded-lg transition-colors"
             >
               Cancel Deploy
             </button>
@@ -723,7 +748,7 @@ function AllKeysModal({
               type="button"
               onClick={handleAddKeysAndDeploy}
               disabled={!allSaved || anySaving}
-              className="px-3.5 py-1.5 text-[12px] bg-blue-600 hover:bg-blue-500 text-white rounded-lg transition-colors disabled:opacity-40"
+              className="px-3.5 py-1.5 text-[12px] bg-accent-strong hover:bg-accent text-white rounded-lg transition-colors disabled:opacity-40"
             >
               {anySaving ? "Saving..." : allSaved ? "Deploy" : "Add Keys"}
             </button>

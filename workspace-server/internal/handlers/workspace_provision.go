@@ -127,7 +127,7 @@ func (h *WorkspaceHandler) provisionWorkspaceOpts(workspaceID, templatePath stri
 							workspaceID, filepath.Base(runtimeTemplate))
 						templatePath = runtimeTemplate
 						// Rebuild cfg with the recovered template path so Start() sees it.
-						cfg = h.buildProvisionerConfig(workspaceID, templatePath, configFiles, payload, prepared.EnvVars, prepared.PluginsPath, prepared.AwarenessNamespace)
+						cfg = h.buildProvisionerConfig(ctx, workspaceID, templatePath, configFiles, payload, prepared.EnvVars, prepared.PluginsPath, prepared.AwarenessNamespace)
 						cfg.ResetClaudeSession = resetClaudeSession
 						recovered = true
 						break
@@ -243,6 +243,7 @@ func (h *WorkspaceHandler) loadAwarenessNamespace(ctx context.Context, workspace
 }
 
 func (h *WorkspaceHandler) buildProvisionerConfig(
+	ctx context.Context,
 	workspaceID, templatePath string,
 	configFiles map[string][]byte,
 	payload models.CreateWorkspacePayload,
@@ -291,6 +292,7 @@ func (h *WorkspaceHandler) buildProvisionerConfig(
 		PlatformURL:        h.platformURL,
 		AwarenessURL:       os.Getenv("AWARENESS_URL"),
 		AwarenessNamespace: awarenessNamespace,
+		Image:              resolveRuntimeImage(ctx, payload.Runtime),
 	}
 }
 
@@ -510,13 +512,13 @@ func yamlQuote(s string) string {
 func sanitizeRuntime(raw string) string {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
-		return "langgraph"
+		return "claude-code"
 	}
 	if _, ok := knownRuntimes[raw]; ok {
 		return raw
 	}
-	log.Printf("provisioner: rejected unknown runtime %q, falling back to langgraph", raw)
-	return "langgraph"
+	log.Printf("provisioner: rejected unknown runtime %q, falling back to claude-code", raw)
+	return "claude-code"
 }
 
 // ensureDefaultConfig generates minimal config files in memory for workspaces without a template.
@@ -562,17 +564,138 @@ func (h *WorkspaceHandler) ensureDefaultConfig(workspaceID string, payload model
 	// and preflight already validates that the env vars are present before
 	// the agent loop starts.  Hardcoding token names here caused #1028
 	// (expired CLAUDE_CODE_OAUTH_TOKEN baked into config.yaml).
-	switch runtime {
-	case "langgraph", "deepagents":
-		// These runtimes read API keys from env directly, no runtime_config needed.
-	default:
-		configYAML += "runtime_config:\n  timeout: 0\n"
-	}
+	configYAML += "runtime_config:\n  timeout: 0\n"
 
 	files["config.yaml"] = []byte(configYAML)
 
 	log.Printf("Provisioner: generated %d config files for workspace %s (runtime: %s)", len(files), workspaceID, runtime)
 	return files
+}
+
+// deriveProviderFromModelSlug maps a hermes-agent model slug prefix to
+// its provider name — a Go translation of the case statement in
+// workspace-configs-templates/hermes/scripts/derive-provider.sh that we
+// can run at provision time so LLM_PROVIDER lands in workspace_secrets
+// (and from there, into /configs/config.yaml via CP user-data) before
+// the container ever boots.
+//
+// Returns "" when the prefix isn't recognized OR when the runtime-only
+// override would be needed to pick a provider — the caller skips the
+// LLM_PROVIDER write in that case so derive-provider.sh keeps the final
+// say at boot. derive-provider.sh remains the source of truth: this is
+// strictly a *gating* hint that survives restarts and gives CP a YAML
+// field to populate. Without it, "Save+Restart" would lose the user's
+// provider choice every time CP regenerates the config.
+//
+// Two intentional differences from the shell version:
+//
+//  1. nousresearch/* and openai/* both return "openrouter" here. The
+//     shell script special-cases "prefer nous if HERMES_API_KEY set" /
+//     "prefer custom if OPENAI_API_KEY set", but those depend on
+//     runtime env that may not yet be loaded at provision time. We pick
+//     the safe default ("openrouter" reaches both Hermes 3 and OpenAI
+//     models without extra config); derive-provider.sh's runtime check
+//     can still upgrade to nous/custom when the keys are present.
+//
+//  2. Unknown prefixes return "" instead of "auto". Persisting "auto"
+//     would block a future "Save+Restart" with a known prefix from
+//     re-deriving — the CP YAML field is sticky once written. Returning
+//     "" means the caller skips the write and the runtime falls through
+//     to derive-provider.sh's *=auto branch on its own.
+//
+// Cover the same prefix list as derive-provider.sh's case statement;
+// keep both files in sync when a new provider is added (table-driven
+// test in workspace_provision_shared_test.go pins the mapping).
+func deriveProviderFromModelSlug(model string) string {
+	if model == "" {
+		return ""
+	}
+	idx := strings.Index(model, "/")
+	if idx <= 0 {
+		return ""
+	}
+	prefix := model[:idx]
+	switch prefix {
+	// Direct-SDK providers (clean 1:1 prefix→provider mapping).
+	case "minimax":
+		return "minimax"
+	case "minimax-cn":
+		return "minimax-cn"
+	case "anthropic":
+		return "anthropic"
+	case "gemini":
+		return "gemini"
+	case "deepseek":
+		return "deepseek"
+	case "zai":
+		return "zai"
+	case "kimi-coding":
+		return "kimi-coding"
+	case "kimi-coding-cn":
+		return "kimi-coding-cn"
+	case "alibaba", "dashscope", "qwen":
+		return "alibaba"
+	case "xiaomi", "mimo":
+		return "xiaomi"
+	case "arcee", "arcee-ai":
+		return "arcee"
+	case "nvidia", "nim":
+		return "nvidia"
+	case "ollama-cloud":
+		return "ollama-cloud"
+	case "huggingface", "hf":
+		return "huggingface"
+	case "ai-gateway", "aigateway":
+		return "ai-gateway"
+	case "kilocode":
+		return "kilocode"
+	case "opencode-zen":
+		return "opencode-zen"
+	case "opencode-go":
+		return "opencode-go"
+	// Aggregator + explicit catch-alls.
+	case "openrouter":
+		return "openrouter"
+	case "custom":
+		return "custom"
+	// Runtime-only override candidates. derive-provider.sh's
+	// HERMES_API_KEY / OPENAI_API_KEY checks happen at boot; we pick the
+	// safe default (openrouter reaches both Hermes 3 and OpenAI without
+	// extra config) and let the script upgrade to nous/custom at runtime.
+	case "nousresearch", "openai":
+		return "openrouter"
+	// Additional 1:1 prefix→provider mappings — kept aligned with upstream's
+	// HERMES_INFERENCE_PROVIDER list (NousResearch/hermes-agent v0.12.0,
+	// 2026-04-30) and the additional case clauses in derive-provider.sh.
+	// The drift gate in derive_provider_drift_test.go enforces parity.
+	case "xai", "grok":
+		return "xai"
+	case "bedrock", "aws":
+		return "bedrock"
+	case "tencent", "tencent-tokenhub":
+		return "tencent-tokenhub"
+	case "gmi":
+		return "gmi"
+	case "qwen-oauth":
+		return "qwen-oauth"
+	case "lmstudio", "lm-studio":
+		return "lmstudio"
+	case "minimax-oauth":
+		return "minimax-oauth"
+	case "alibaba-coding-plan":
+		return "alibaba-coding-plan"
+	case "google-gemini-cli":
+		return "google-gemini-cli"
+	case "openai-codex":
+		return "openai-codex"
+	case "copilot-acp":
+		return "copilot-acp"
+	case "copilot":
+		return "copilot"
+	}
+	// Unknown prefix → don't persist a guess. derive-provider.sh's
+	// *=auto fallback handles it at runtime.
+	return ""
 }
 
 // applyRuntimeModelEnv exposes the workspace's selected model via an
@@ -607,6 +730,19 @@ func applyRuntimeModelEnv(envVars map[string]string, runtime, model string) {
 	if model == "" {
 		return
 	}
+
+	// Universal MODEL env var — every adapter that wants to honour the
+	// canvas-picked model (instead of its template's default) reads this.
+	// molecule-runtime's workspace/config.py already falls back to MODEL
+	// for runtime_config.model (#194). Without this line, the user's
+	// canvas selection is silently dropped on every templated provision —
+	// confirmed via crash-loop diagnosis on 2026-05-02 where MiniMax
+	// picks booted with model=sonnet (template default) and demanded
+	// CLAUDE_CODE_OAUTH_TOKEN. Set it FIRST so the per-runtime branches
+	// below can still layer on additional vendor-specific names without
+	// fighting over the canonical one.
+	envVars["MODEL"] = model
+
 	switch runtime {
 	case "hermes":
 		// template-hermes install.sh reads this into ~/.hermes/config.yaml's

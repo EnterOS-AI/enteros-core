@@ -107,8 +107,16 @@ async def main():  # pragma: no cover
     else:
         print("Governance: disabled (set governance.enabled: true in config.yaml to activate)")
 
-    # 2. Create heartbeat (passed to adapter for task tracking)
-    heartbeat = HeartbeatLoop(platform_url, workspace_id)
+    # 2. Create heartbeat (passed to adapter for task tracking).
+    # interval is sourced from observability.heartbeat_interval_seconds
+    # in config.yaml — clamped to [5, 300] at parse time. Operators
+    # who want a faster crash-detection signal lower it; ones who want
+    # to reduce platform write load raise it.
+    heartbeat = HeartbeatLoop(
+        platform_url,
+        workspace_id,
+        interval_seconds=config.observability.heartbeat_interval_seconds,
+    )
 
     # 3. Get adapter for this runtime
     runtime = config.runtime or "langgraph"
@@ -116,6 +124,16 @@ async def main():  # pragma: no cover
 
     adapter = adapter_cls()
     print(f"Runtime: {runtime} ({adapter.display_name()})")
+
+    # 3a. Wire pluggable event-log backend from config.observability.event_log.
+    # Default config.yaml sets backend=memory; operators set "disabled" to
+    # opt out without removing append-call sites from adapter code.
+    from event_log import create_event_log
+    adapter.event_log = create_event_log(
+        backend=config.observability.event_log.backend,
+        ttl_seconds=config.observability.event_log.ttl_seconds,
+        max_entries=config.observability.event_log.max_entries,
+    )
 
     # 4. Build adapter config
     adapter_config = AdapterConfig(
@@ -458,11 +476,20 @@ async def main():  # pragma: no cover
 
     built_app = make_trace_middleware(starlette_app)
 
+    # uvicorn expects the level name in lowercase ("debug" / "info" /
+    # "warning" / "error" / "critical"). config.observability.log_level
+    # is uppercased at parse time (config.py.load_config) for the
+    # Python ``logging`` module's convention; lower it here so both
+    # consumers get the form they expect from one source of truth.
+    # An ``LOG_LEVEL`` env var still wins as an ops-side debugging
+    # override — set it on the workspace process to bypass YAML
+    # without a config edit + restart cycle.
+    uvicorn_log_level = os.environ.get("LOG_LEVEL", config.observability.log_level).lower()
     server_config = uvicorn.Config(
         built_app,
         host="0.0.0.0",
         port=port,
-        log_level="info",
+        log_level=uvicorn_log_level,
     )
     server = uvicorn.Server(server_config)
 

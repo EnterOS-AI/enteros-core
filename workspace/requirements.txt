@@ -11,16 +11,16 @@ a2a-sdk[http-server]>=1.0.0,<2.0
 # HTTP / server
 httpx>=0.28.1
 uvicorn>=0.46.0
-starlette>=0.38.0
+starlette>=1.0.0
 websockets>=16.0
 
 # multipart/form-data parser — required for Starlette's Request.form() on
 # /internal/chat/uploads/ingest. Pinned ≥ 0.0.18 because earlier versions
 # had a CVE-2024-53981 (DoS via malformed boundary).
-python-multipart>=0.0.18
+python-multipart>=0.0.27
 
 # Config parsing
-pyyaml>=6.0
+pyyaml>=6.0.3
 
 # Shared tools framework (used by coordinator, delegation, memory, sandbox)
 langchain-core>=0.3.0
@@ -28,10 +28,10 @@ langchain-core>=0.3.0
 # OpenTelemetry — workspace-level distributed tracing
 # tools/telemetry.py gracefully degrades (noop) when these are absent,
 # but they are required for actual trace export.
-opentelemetry-api>=1.24.0
+opentelemetry-api>=1.41.1
 opentelemetry-sdk>=1.41.1
 # OTLP/HTTP exporter: sends spans to any OTEL collector and to Langfuse ≥4
-opentelemetry-exporter-otlp-proto-http>=1.24.0
+opentelemetry-exporter-otlp-proto-http>=1.41.1
 
 # SQLAlchemy — used by molecule_audit ledger (EU AI Act Annex III compliance)
 sqlalchemy>=2.0.0

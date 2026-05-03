@@ -501,3 +501,43 @@ async def test_heartbeat_loop_persists_secret_from_response(monkeypatch):
     assert saved == ["from-heartbeat"], (
         "in-container heartbeat must persist platform_inbound_secret from 200 response"
     )
+
+
+# ---------------------------------------------------------------------------
+# observability.heartbeat_interval_seconds wiring (#119 PR-3) — pin that the
+# per-instance interval flows from ObservabilityConfig through the
+# constructor to the asyncio.sleep call. Tests below use the public
+# attribute, but the attribute IS the wire because it's read directly by
+# the loop body.
+# ---------------------------------------------------------------------------
+
+
+def test_init_default_interval_matches_legacy_constant():
+    """When the 2-arg constructor is used (legacy callers, existing tests),
+    the per-instance interval falls back to the module-level
+    HEARTBEAT_INTERVAL constant — preserves backward compat without a
+    behavior change for code that hasn't been updated to pass the
+    observability-driven value."""
+    from heartbeat import HEARTBEAT_INTERVAL
+
+    hb = HeartbeatLoop("http://localhost:8080", "ws-1")
+    assert hb._interval_seconds == HEARTBEAT_INTERVAL
+
+
+def test_init_accepts_explicit_interval():
+    """Passing interval_seconds threads ObservabilityConfig.heartbeat_interval_seconds
+    through to the loop. The integration site (workspace/main.py) does
+    this with the value from config.observability.heartbeat_interval_seconds."""
+    hb = HeartbeatLoop("http://localhost:8080", "ws-1", interval_seconds=60)
+    assert hb._interval_seconds == 60
+
+
+def test_init_accepts_floor_of_5():
+    """The config parser clamps to [5, 300]; the constructor itself accepts
+    any positive int — clamping is the parser's job, not the loop's. This
+    test pins that no defensive re-clamp happens here (which would
+    silently break operators who deliberately want 5s in dev)."""
+    hb = HeartbeatLoop("http://localhost:8080", "ws-1", interval_seconds=5)
+    assert hb._interval_seconds == 5
+    hb2 = HeartbeatLoop("http://localhost:8080", "ws-1", interval_seconds=300)
+    assert hb2._interval_seconds == 300

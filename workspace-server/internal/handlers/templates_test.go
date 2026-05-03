@@ -1,12 +1,15 @@
 package handlers
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -269,6 +272,264 @@ skills: []
 	}
 }
 
+// TestTemplatesList_SurfacesProviderRegistry pins the #235 enrichment:
+// /templates must echo the template's TOP-LEVEL `providers:` block as a
+// structured array of providerRegistryEntry, separate from the
+// runtime_config.providers slug list above. Each entry carries auth_env
+// + model_prefixes + base_url so the canvas can stop inferring vendor
+// taxonomy from per-model required_env tuples.
+//
+// Use a claude-code-shaped fixture (the only template in production
+// that ships the registry today, modulo the per-vendor work in PR #33).
+// Order MUST be preserved — the canvas surfaces the dropdown in
+// declaration order so operators can put their preferred provider first.
+func TestTemplatesList_SurfacesProviderRegistry(t *testing.T) {
+	setupTestDB(t)
+	setupTestRedis(t)
+
+	tmpDir := t.TempDir()
+	tmplDir := filepath.Join(tmpDir, "claude-code")
+	if err := os.MkdirAll(tmplDir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	configYaml := `name: Claude Code
+runtime: claude-code
+providers:
+  - name: anthropic-oauth
+    auth_mode: oauth
+    model_prefixes: []
+    model_aliases: [sonnet, opus, haiku]
+    base_url: null
+    auth_env: [CLAUDE_CODE_OAUTH_TOKEN]
+  - name: minimax
+    auth_mode: third_party_anthropic_compat
+    model_prefixes: [minimax-]
+    model_aliases: []
+    base_url: https://api.minimax.io/anthropic
+    auth_env: [MINIMAX_API_KEY, ANTHROPIC_AUTH_TOKEN]
+runtime_config:
+  model: claude-sonnet-4-6
+skills: []
+`
+	if err := os.WriteFile(filepath.Join(tmplDir, "config.yaml"), []byte(configYaml), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	handler := NewTemplatesHandler(tmpDir, nil)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest("GET", "/templates", nil)
+	handler.List(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp []templateSummary
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(resp) != 1 {
+		t.Fatalf("expected 1 template, got %d", len(resp))
+	}
+	got := resp[0].ProviderRegistry
+	if len(got) != 2 {
+		t.Fatalf("ProviderRegistry: want 2 entries, got %d (%+v)", len(got), got)
+	}
+	// Order preservation
+	if got[0].Name != "anthropic-oauth" {
+		t.Errorf("ProviderRegistry[0].Name: want %q, got %q", "anthropic-oauth", got[0].Name)
+	}
+	if got[1].Name != "minimax" {
+		t.Errorf("ProviderRegistry[1].Name: want %q, got %q", "minimax", got[1].Name)
+	}
+	// Field plumbing on the first (oauth) entry
+	if got[0].AuthMode != "oauth" {
+		t.Errorf("ProviderRegistry[0].AuthMode: want %q, got %q", "oauth", got[0].AuthMode)
+	}
+	if !reflect.DeepEqual(got[0].ModelAliases, []string{"sonnet", "opus", "haiku"}) {
+		t.Errorf("ProviderRegistry[0].ModelAliases: want sonnet/opus/haiku, got %v", got[0].ModelAliases)
+	}
+	if !reflect.DeepEqual(got[0].AuthEnv, []string{"CLAUDE_CODE_OAUTH_TOKEN"}) {
+		t.Errorf("ProviderRegistry[0].AuthEnv: want [CLAUDE_CODE_OAUTH_TOKEN], got %v", got[0].AuthEnv)
+	}
+	// `base_url: null` in YAML → empty string for a plain `string` field
+	// (yaml.v3 default). Pinning this so a future change to `*string`
+	// (which would decode to nil instead and surface differently in JSON)
+	// is caught loudly. The canvas treats "" the same as "no base_url"
+	// (uses provider defaults); a `*string` change would emit a JSON
+	// `null` and break that branch.
+	if got[0].BaseURL != "" {
+		t.Errorf("ProviderRegistry[0].BaseURL: want empty string for `null` YAML, got %q", got[0].BaseURL)
+	}
+	// Field plumbing on the second (third-party) entry — base_url is the
+	// distinguishing signal for compat providers; canvas uses it to render
+	// the "via Anthropic-compat endpoint" badge.
+	if got[1].BaseURL != "https://api.minimax.io/anthropic" {
+		t.Errorf("ProviderRegistry[1].BaseURL: want minimax url, got %q", got[1].BaseURL)
+	}
+	if !reflect.DeepEqual(got[1].ModelPrefixes, []string{"minimax-"}) {
+		t.Errorf("ProviderRegistry[1].ModelPrefixes: want [minimax-], got %v", got[1].ModelPrefixes)
+	}
+	if !reflect.DeepEqual(got[1].AuthEnv, []string{"MINIMAX_API_KEY", "ANTHROPIC_AUTH_TOKEN"}) {
+		t.Errorf("ProviderRegistry[1].AuthEnv: want [MINIMAX_API_KEY, ANTHROPIC_AUTH_TOKEN], got %v", got[1].AuthEnv)
+	}
+
+	// Wire-shape gate — canvas reads this as `provider_registry` (snake_case).
+	// A struct-tag rename would silently drop it from consumers; the typed
+	// assertions above can't catch a tag-only change because they decode via
+	// the same struct.
+	if !strings.Contains(w.Body.String(), `"provider_registry":[{"name":"anthropic-oauth"`) {
+		t.Errorf("response missing provider_registry JSON field with expected first entry: %s", w.Body.String())
+	}
+}
+
+// TestTemplatesList_OmitsProviderRegistryWhenAbsent pins the omitempty
+// behavior for the new field — templates without a top-level
+// `providers:` block (hermes today, langgraph, etc.) must NOT emit
+// `provider_registry: null`, which would break canvas's array-typed
+// parser (Array.isArray check returns false for null).
+// TestTemplatesList_BothProviderShapesCoexist pins the real production
+// shape: claude-code-default ships BOTH a top-level `providers:` block
+// (structured registry) AND a `runtime_config.providers:` slug list
+// (canvas Config tab dropdown). Both must surface independently —
+// `provider_registry` on one field, `providers` on the other — with no
+// cross-talk or struct-tag collision.
+//
+// PR #2543 introduced the structured field; reviewer noted the two
+// fields' coexistence was only tested in isolation. This locks it in
+// against the production layout so a future struct refactor that
+// accidentally aliases the two YAML keys (or, e.g., moves the registry
+// under `runtime_config:`) would fail loudly.
+func TestTemplatesList_BothProviderShapesCoexist(t *testing.T) {
+	setupTestDB(t)
+	setupTestRedis(t)
+
+	tmpDir := t.TempDir()
+	tmplDir := filepath.Join(tmpDir, "claude-code-default")
+	if err := os.MkdirAll(tmplDir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// Mirrors workspace-configs-templates/claude-code-default/config.yaml:
+	// top-level structured `providers:` (auth_mode + auth_env) + nested
+	// `runtime_config.providers:` slug list.
+	configYaml := `name: Claude Code
+runtime: claude-code
+providers:
+  - name: anthropic-oauth
+    auth_mode: oauth
+    auth_env: [CLAUDE_CODE_OAUTH_TOKEN]
+  - name: minimax
+    auth_mode: third_party_anthropic_compat
+    base_url: https://api.minimax.io/anthropic
+    auth_env: [MINIMAX_API_KEY]
+runtime_config:
+  model: claude-sonnet-4-6
+  providers:
+    - anthropic-oauth
+    - anthropic-api
+    - minimax
+skills: []
+`
+	if err := os.WriteFile(filepath.Join(tmplDir, "config.yaml"), []byte(configYaml), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	handler := NewTemplatesHandler(tmpDir, nil)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest("GET", "/templates", nil)
+	handler.List(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp []templateSummary
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(resp) != 1 {
+		t.Fatalf("expected 1 template, got %d", len(resp))
+	}
+	got := resp[0]
+
+	// Slug list (runtime_config.providers) — independent of structured
+	// registry. Order preserved.
+	wantSlugs := []string{"anthropic-oauth", "anthropic-api", "minimax"}
+	if !reflect.DeepEqual(got.Providers, wantSlugs) {
+		t.Errorf("Providers (slug list): want %v, got %v", wantSlugs, got.Providers)
+	}
+
+	// Structured registry (top-level providers) — fully populated, also
+	// in declaration order. Crucially, the slug list above does NOT
+	// bleed into here even though one slug (`anthropic-api`) is NOT in
+	// the structured registry — they really are two distinct YAML paths.
+	if len(got.ProviderRegistry) != 2 {
+		t.Fatalf("ProviderRegistry: want 2 entries (top-level only), got %d: %+v", len(got.ProviderRegistry), got.ProviderRegistry)
+	}
+	if got.ProviderRegistry[0].Name != "anthropic-oauth" || got.ProviderRegistry[0].AuthMode != "oauth" {
+		t.Errorf("ProviderRegistry[0]: want anthropic-oauth/oauth, got %+v", got.ProviderRegistry[0])
+	}
+	if got.ProviderRegistry[1].Name != "minimax" || got.ProviderRegistry[1].BaseURL != "https://api.minimax.io/anthropic" {
+		t.Errorf("ProviderRegistry[1]: want minimax with base_url, got %+v", got.ProviderRegistry[1])
+	}
+
+	// Cross-shape negative: `anthropic-api` appears in slugs but not in
+	// the structured registry — make sure our parsing didn't synthesize
+	// a stub entry for it.
+	for _, e := range got.ProviderRegistry {
+		if e.Name == "anthropic-api" {
+			t.Errorf("ProviderRegistry must not synthesize entries from the slug list — found stray %q", e.Name)
+		}
+	}
+
+	// JSON wire shape: both fields present in the same response.
+	body := w.Body.String()
+	if !strings.Contains(body, `"providers":["anthropic-oauth","anthropic-api","minimax"]`) {
+		t.Errorf("response missing slug-list providers field: %s", body)
+	}
+	if !strings.Contains(body, `"provider_registry":[{"name":"anthropic-oauth"`) {
+		t.Errorf("response missing structured provider_registry field: %s", body)
+	}
+}
+
+func TestTemplatesList_OmitsProviderRegistryWhenAbsent(t *testing.T) {
+	setupTestDB(t)
+	setupTestRedis(t)
+
+	tmpDir := t.TempDir()
+	tmplDir := filepath.Join(tmpDir, "hermes-no-reg")
+	if err := os.MkdirAll(tmplDir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	configYaml := `name: Hermes
+runtime: hermes
+runtime_config:
+  model: nousresearch/hermes-4-70b
+  providers: [nous, openrouter]
+skills: []
+`
+	if err := os.WriteFile(filepath.Join(tmplDir, "config.yaml"), []byte(configYaml), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	handler := NewTemplatesHandler(tmpDir, nil)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest("GET", "/templates", nil)
+	handler.List(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	if strings.Contains(w.Body.String(), `"provider_registry":`) {
+		t.Errorf("response should omit provider_registry when template has none, got: %s", w.Body.String())
+	}
+	// But the slug list must still surface — both shapes coexist.
+	if !strings.Contains(w.Body.String(), `"providers":["nous","openrouter"]`) {
+		t.Errorf("expected slug-list providers field still present: %s", w.Body.String())
+	}
+}
+
 // TestTemplatesList_OmitsProvidersWhenAbsent pins the omitempty
 // behavior — older templates that haven't migrated to
 // runtime_config.providers yet must NOT emit `providers: null` (which
@@ -346,6 +607,90 @@ skills: []
 	}
 	if len(resp[0].Models) != 0 {
 		t.Errorf("Models should be empty for legacy template, got %+v", resp[0].Models)
+	}
+}
+
+// TestTemplatesList_MalformedYAMLLogsAndSkips pins the diagnostic-on-skip
+// behavior. Before, a malformed config.yaml made the affected template
+// vanish from /templates with NO trace — operator can't tell it was
+// excluded vs never existed. Now the handler logs `templates list:
+// skip <id>: yaml.Unmarshal: <err>` and continues with the rest.
+//
+// Asserts:
+//   - bad template is skipped (not present in response)
+//   - good sibling template still surfaces (one bad apple shouldn't
+//     poison the whole list)
+//   - log line names the offending template id (operator can grep)
+func TestTemplatesList_MalformedYAMLLogsAndSkips(t *testing.T) {
+	setupTestDB(t)
+	setupTestRedis(t)
+
+	tmpDir := t.TempDir()
+
+	// Bad: YAML scalar where a struct is expected. tier expects int;
+	// supplying a list crashes yaml.Unmarshal cleanly.
+	badDir := filepath.Join(tmpDir, "bad-template")
+	if err := os.MkdirAll(badDir, 0755); err != nil {
+		t.Fatalf("mkdir bad: %v", err)
+	}
+	badYaml := `name: Broken
+tier: [not, an, int]
+runtime: claude-code
+`
+	if err := os.WriteFile(filepath.Join(badDir, "config.yaml"), []byte(badYaml), 0644); err != nil {
+		t.Fatalf("write bad: %v", err)
+	}
+
+	// Good sibling — must survive the bad neighbor.
+	goodDir := filepath.Join(tmpDir, "good-template")
+	if err := os.MkdirAll(goodDir, 0755); err != nil {
+		t.Fatalf("mkdir good: %v", err)
+	}
+	goodYaml := `name: Good
+tier: 1
+runtime: hermes
+skills: []
+`
+	if err := os.WriteFile(filepath.Join(goodDir, "config.yaml"), []byte(goodYaml), 0644); err != nil {
+		t.Fatalf("write good: %v", err)
+	}
+
+	// Capture log output so we can assert on the skip line.
+	var logBuf bytes.Buffer
+	prevOutput := log.Writer()
+	log.SetOutput(&logBuf)
+	defer log.SetOutput(prevOutput)
+
+	handler := NewTemplatesHandler(tmpDir, nil)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest("GET", "/templates", nil)
+	handler.List(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp []templateSummary
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	// Bad template MUST NOT appear; good template MUST appear.
+	if len(resp) != 1 {
+		t.Fatalf("expected 1 template (good only, bad skipped), got %d: %+v", len(resp), resp)
+	}
+	if resp[0].ID != "good-template" {
+		t.Errorf("surviving template should be good-template, got %q", resp[0].ID)
+	}
+
+	// Log line MUST contain the bad template id and the parse error
+	// signal — without these, an operator looking at logs can't
+	// correlate "missing from /templates" with "yaml.Unmarshal failed".
+	logged := logBuf.String()
+	if !strings.Contains(logged, "bad-template") {
+		t.Errorf("expected log line to name bad-template, got: %s", logged)
+	}
+	if !strings.Contains(logged, "yaml.Unmarshal") {
+		t.Errorf("expected log line to mention yaml.Unmarshal, got: %s", logged)
 	}
 }
 

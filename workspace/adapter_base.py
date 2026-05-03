@@ -8,7 +8,14 @@ from typing import Any
 
 from a2a.server.agent_execution import AgentExecutor
 
+from event_log import DisabledEventLog, EventLogBackend
+
 logger = logging.getLogger(__name__)
+
+# Shared no-op default for adapter.event_log. Safe to share across
+# adapters because every DisabledEventLog method is a pure no-op with
+# no per-instance state.
+_DISABLED_EVENT_LOG: EventLogBackend = DisabledEventLog()
 
 
 @dataclass
@@ -196,6 +203,25 @@ class BaseAdapter(ABC):
         idle timer. None / unset / zero falls through to the global
         default — same behavior as before this hook landed."""
         return None
+
+    @property
+    def event_log(self) -> EventLogBackend:
+        """Pluggable in-process event-log backend.
+
+        Adapters MAY call ``self.event_log.append(kind=..., payload=...)``
+        to record runtime-internal events (tool dispatch, skill load,
+        executor errors, peer-handoff). Readers query the buffer via
+        the platform's ``/workspaces/:id/activity`` endpoint with a
+        cursor — see ``event_log.py`` for the protocol.
+
+        Default: shared ``DisabledEventLog`` no-op, so adapters that
+        never set this still link cleanly. ``main.py`` overrides at boot
+        from the ``observability.event_log`` config block."""
+        return getattr(self, "_event_log", None) or _DISABLED_EVENT_LOG
+
+    @event_log.setter
+    def event_log(self, backend: EventLogBackend) -> None:
+        self._event_log = backend
 
     # ------------------------------------------------------------------
     # Plugin install hooks
