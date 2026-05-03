@@ -623,3 +623,85 @@ func TestWorkspaceCreate_FirstDeploy_UnknownModel_OnlyMintModelProvider(t *testi
 		t.Errorf("sqlmock expectations not met — unknown-prefix model should mint MODEL_PROVIDER but skip LLM_PROVIDER: %v", err)
 	}
 }
+
+// TestApplyRuntimeModelEnv_SetsUniversalMODELForAllRuntimes pins the
+// fix for Bug B (2026-05-02): canvas-selected model was silently dropped
+// for templated workspaces because the per-runtime switch only set
+// HERMES_DEFAULT_MODEL for hermes — every other runtime got nothing.
+// The adapter then read its template's default model from /configs/config.yaml
+// and demanded the wrong env var (e.g. claude-code/sonnet → CLAUDE_CODE_OAUTH_TOKEN
+// even though the user had picked MiniMax-M2 with MINIMAX_API_KEY set).
+//
+// Post-fix: applyRuntimeModelEnv unconditionally sets MODEL=<picked> for
+// every runtime, in addition to any vendor-specific name (HERMES_DEFAULT_MODEL
+// stays for backwards compat). Adapters opt in to honouring MODEL by reading
+// os.environ["MODEL"] in their executor (claude-code adapter does this since
+// the same Bug B fix; see workspace-configs-templates/claude-code-default/adapter.py).
+//
+// Table-driven so adding a new runtime means adding a row, not writing a
+// new test function.
+func TestApplyRuntimeModelEnv_SetsUniversalMODELForAllRuntimes(t *testing.T) {
+	cases := []struct {
+		name              string
+		runtime           string
+		model             string
+		modelProviderEnv  string
+		wantMODEL         string
+		wantHermesDefault string // empty string = must be unset
+	}{
+		{
+			name:      "claude-code: picked model populates MODEL",
+			runtime:   "claude-code",
+			model:     "MiniMax-M2",
+			wantMODEL: "MiniMax-M2",
+		},
+		{
+			name:              "hermes: picked model populates BOTH MODEL and HERMES_DEFAULT_MODEL",
+			runtime:           "hermes",
+			model:             "minimax/MiniMax-M2.7",
+			wantMODEL:         "minimax/MiniMax-M2.7",
+			wantHermesDefault: "minimax/MiniMax-M2.7",
+		},
+		{
+			name:      "langgraph: picked model populates MODEL (no vendor-specific name)",
+			runtime:   "langgraph",
+			model:     "anthropic:claude-opus-4-7",
+			wantMODEL: "anthropic:claude-opus-4-7",
+		},
+		{
+			name:      "crewai: picked model populates MODEL (no vendor-specific name)",
+			runtime:   "crewai",
+			model:     "openai:gpt-4o",
+			wantMODEL: "openai:gpt-4o",
+		},
+		{
+			name:    "empty model + empty MODEL_PROVIDER fallback: nothing set",
+			runtime: "claude-code",
+			model:   "",
+		},
+		{
+			name:             "empty model + MODEL_PROVIDER fallback hits: MODEL set from secret",
+			runtime:          "claude-code",
+			model:            "",
+			modelProviderEnv: "MiniMax-M2",
+			wantMODEL:        "MiniMax-M2",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			envVars := map[string]string{}
+			if tc.modelProviderEnv != "" {
+				envVars["MODEL_PROVIDER"] = tc.modelProviderEnv
+			}
+			applyRuntimeModelEnv(envVars, tc.runtime, tc.model)
+
+			if got := envVars["MODEL"]; got != tc.wantMODEL {
+				t.Errorf("MODEL = %q, want %q", got, tc.wantMODEL)
+			}
+			if got := envVars["HERMES_DEFAULT_MODEL"]; got != tc.wantHermesDefault {
+				t.Errorf("HERMES_DEFAULT_MODEL = %q, want %q", got, tc.wantHermesDefault)
+			}
+		})
+	}
+}
