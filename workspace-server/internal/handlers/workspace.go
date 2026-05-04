@@ -66,6 +66,12 @@ type WorkspaceHandler struct {
 	// template manifests (#2054 phase 2). Lazy-init on first scan; see
 	// runtime_provision_timeouts.go for the loader contract.
 	provisionTimeouts runtimeProvisionTimeoutsCache
+	// namespaceCleanupFn is the I5 (RFC #2728) hook called best-effort
+	// during purge to delete the workspace's plugin-side namespace.
+	// nil = no-op (default for operators who haven't wired the v2
+	// memory plugin). main.go sets this to plugin.DeleteNamespace
+	// when MEMORY_PLUGIN_URL is configured.
+	namespaceCleanupFn func(ctx context.Context, workspaceID string)
 }
 
 func NewWorkspaceHandler(b events.EventEmitter, p *provisioner.Provisioner, platformURL, configsDir string) *WorkspaceHandler {
@@ -84,6 +90,16 @@ func NewWorkspaceHandler(b events.EventEmitter, p *provisioner.Provisioner, plat
 	if p != nil {
 		h.provisioner = p
 	}
+	return h
+}
+
+// WithNamespaceCleanup wires the I5 hook (RFC #2728) so workspace
+// purge can drop the plugin's `workspace:<id>` namespace. main.go
+// passes a closure over plugin.DeleteNamespace; tests pass a stub.
+// Nil-safe: omitting this leaves namespaceCleanupFn nil, which the
+// purge path treats as a no-op.
+func (h *WorkspaceHandler) WithNamespaceCleanup(fn func(ctx context.Context, workspaceID string)) *WorkspaceHandler {
+	h.namespaceCleanupFn = fn
 	return h
 }
 
