@@ -116,22 +116,29 @@ func resolveWorkspaceForwardCreds(c *gin.Context, ctx context.Context, workspace
 		// actionable error rather than a misleading "not registered yet"
 		// (which implies waiting will help):
 		//
-		//  poll-mode → URL is structurally absent. The platform never
-		//    dispatches to a poll-mode workspace, so chat upload (which
-		//    is HTTP-forward by design) cannot proceed. Returning 503
-		//    here would loop the canvas client forever. 422 signals
-		//    "this request can't succeed against THIS workspace's
-		//    configuration" — the only fix is to re-register the
-		//    workspace in push mode with a publicly-reachable URL.
-		//
 		//  push-mode → URL just isn't on the row yet (workspace
 		//    restart in progress, or first /registry/register hasn't
 		//    landed). 503 + "not registered yet" is correct — retry
 		//    after the next heartbeat (~30s) will likely succeed.
-		if deliveryMode.Valid && deliveryMode.String == "poll" {
+		//
+		//  anything else (poll-mode, NULL, empty string) → URL is
+		//    structurally absent. The platform never dispatches to a
+		//    non-push workspace, so chat upload (which is HTTP-forward
+		//    by design) cannot proceed by waiting. Returning 503 here
+		//    would loop the canvas client forever. 422 signals "this
+		//    request can't succeed against THIS workspace's
+		//    configuration" — the only fix is to re-register the
+		//    workspace with a publicly-reachable URL.
+		//
+		// Live-observed 2026-05-04: external runtime workspaces (e.g.
+		// molecule-sdk-python on a mac laptop) register with
+		// delivery_mode=NULL. The narrow "poll" check missed them; the
+		// invariant we actually want is "URL empty + not-push = no
+		// dispatch path, ever".
+		if !deliveryMode.Valid || deliveryMode.String != "push" {
 			c.JSON(http.StatusUnprocessableEntity, gin.H{
-				"error":  "workspace is in poll mode — chat " + op + " requires push mode",
-				"detail": "Poll-mode workspaces have no callback URL the platform can dispatch to. Re-register the workspace with a publicly-reachable URL in push mode (e.g. via ngrok / Cloudflare tunnel) to enable chat file " + op + ".",
+				"error":  "workspace has no callback URL — chat " + op + " requires push-mode + public URL",
+				"detail": "This workspace registered without a publicly-reachable URL (delivery_mode is not 'push'). The platform cannot dispatch chat uploads to it. Re-register the workspace with a public URL in push mode (e.g. via ngrok / Cloudflare tunnel) to enable chat file " + op + ".",
 			})
 			return "", "", false
 		}

@@ -70,11 +70,21 @@ func expectURL(mock sqlmock.Sqlmock, workspaceID, url string) {
 // expectURLAndMode is the explicit form for tests that need to
 // exercise the delivery_mode branch (e.g. poll-mode workspaces get
 // a 422 instead of a 503 when URL is empty — the platform can't
-// dispatch to a poll-mode workspace at all).
+// dispatch to a non-push workspace at all).
 func expectURLAndMode(mock sqlmock.Sqlmock, workspaceID, url, mode string) {
 	mock.ExpectQuery(`SELECT COALESCE\(url, ''\), delivery_mode FROM workspaces WHERE id = \$1`).
 		WithArgs(workspaceID).
 		WillReturnRows(sqlmock.NewRows([]string{"url", "delivery_mode"}).AddRow(url, mode))
+}
+
+// expectURLNullMode is the production-observed shape: external runtime
+// workspaces (molecule-sdk-python on user infra) register with
+// delivery_mode = NULL, not "poll". Caught 2026-05-04 — the narrow
+// "poll" check missed three of three real workspaces in user reports.
+func expectURLNullMode(mock sqlmock.Sqlmock, workspaceID, url string) {
+	mock.ExpectQuery(`SELECT COALESCE\(url, ''\), delivery_mode FROM workspaces WHERE id = \$1`).
+		WithArgs(workspaceID).
+		WillReturnRows(sqlmock.NewRows([]string{"url", "delivery_mode"}).AddRow(url, nil))
 }
 
 // expectURLMissing stubs the SELECT to return sql.ErrNoRows.
@@ -213,11 +223,13 @@ func TestChatUpload_NoURL(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
 
-	// Workspace registered (push-mode default) but URL hasn't been reported
+	// Workspace registered (push-mode) but URL hasn't been reported
 	// yet (mid-boot). 503 + "not registered yet" is the right surface — the
 	// canvas client can retry after the next heartbeat picks up the URL.
+	// Push mode is the only branch that produces 503; everything else
+	// (poll, NULL, empty) gets 422 because no amount of waiting helps.
 	wsID := "00000000-0000-0000-0000-000000000042"
-	expectURL(mock, wsID, "")
+	expectURLAndMode(mock, wsID, "", "push")
 
 	h := NewChatFilesHandler(NewTemplatesHandler(t.TempDir(), nil))
 	body, ct := uploadFixture(t)
@@ -236,12 +248,7 @@ func TestChatUpload_NoURL(t *testing.T) {
 // poll-mode workspace has no URL by design, so chat upload (which is
 // HTTP-forward to the workspace) cannot succeed by retrying. Returning
 // 503 here would loop the canvas client forever; 422 + an actionable
-// message ("re-register in push mode") tells the user what to do.
-//
-// Caught externally on 2026-05-04 — user reported "Upload failed: 503
-// {error: workspace url not registered yet}" on an external runtime
-// workspace (mac laptop, no public URL). The "yet" implied transient,
-// but the workspace's poll-mode meant the URL would never arrive.
+// message tells the user what to do.
 func TestChatUpload_PollModeEmptyURL(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
@@ -257,11 +264,38 @@ func TestChatUpload_PollModeEmptyURL(t *testing.T) {
 	if w.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("expected 422 for poll-mode upload, got %d: %s", w.Code, w.Body.String())
 	}
-	if !strings.Contains(w.Body.String(), "poll mode") {
-		t.Errorf("expected error to mention poll mode, got: %s", w.Body.String())
+	if !strings.Contains(w.Body.String(), "push") {
+		t.Errorf("expected error to suggest push mode, got: %s", w.Body.String())
 	}
-	if !strings.Contains(w.Body.String(), "push mode") {
-		t.Errorf("expected error to suggest re-registering in push mode, got: %s", w.Body.String())
+}
+
+// TestChatUpload_NullModeEmptyURL — production-observed 2026-05-04:
+// external-runtime workspaces (molecule-sdk-python on user infra)
+// register with delivery_mode = NULL, not "poll". The earlier narrow
+// poll-only check fell through to the misleading 503. The fix is the
+// inverse-of-push test: anything not exactly "push" with empty URL
+// can't dispatch and gets the actionable 422.
+//
+// Three of three external workspaces in the user's tenant had this
+// shape (home hermes / runner mac mini / mac laptop, all
+// runtime=external + url='' + delivery_mode=NULL).
+func TestChatUpload_NullModeEmptyURL(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+
+	wsID := "30ba7f0b-b303-4a20-aefe-3a4a675b8aa4" // user's "mac laptop"
+	expectURLNullMode(mock, wsID, "")
+
+	h := NewChatFilesHandler(NewTemplatesHandler(t.TempDir(), nil))
+	body, ct := uploadFixture(t)
+	c, w := makeUploadRequest(t, wsID, body, ct)
+	h.Upload(c)
+
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 for null-delivery-mode upload, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "callback URL") {
+		t.Errorf("expected error to mention callback URL, got: %s", w.Body.String())
 	}
 }
 
