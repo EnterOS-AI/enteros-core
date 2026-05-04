@@ -99,7 +99,7 @@ describe("CommunicationOverlay — fan-out cap", () => {
   });
 });
 
-describe("CommunicationOverlay — visibility gate", () => {
+describe("CommunicationOverlay — cadence", () => {
   it("uses 30s interval cadence (was 10s pre-fix)", async () => {
     await act(async () => {
       render(<CommunicationOverlay />);
@@ -117,5 +117,62 @@ describe("CommunicationOverlay — visibility gate", () => {
       vi.advanceTimersByTime(20_000);
     });
     expect(mockGet).toHaveBeenCalledTimes(6); // +3 from second tick
+  });
+});
+
+describe("CommunicationOverlay — visibility gate", () => {
+  // The visibility gate is the dial that drops collapsed-panel polling
+  // to ZERO. The cadence test above can't catch its removal — if a
+  // refactor dropped `if (!visible) return`, the cadence test would
+  // still pass because the effect would still fire every 30s.
+  //
+  // Direct probe: render with comms-returning mock so the panel
+  // actually renders (close button only exists in the expanded panel,
+  // not the collapsed button-state). Click close, advance the clock,
+  // assert no further fetches.
+  it("stops polling after the user collapses the panel", async () => {
+    // Mock returns one a2a_send so comms.length > 0 → panel renders →
+    // close button accessible.
+    mockGet.mockResolvedValue([
+      {
+        id: "act-1",
+        workspace_id: "ws-1",
+        activity_type: "a2a_send",
+        source_id: "ws-1",
+        target_id: "ws-2",
+        summary: "test",
+        status: "completed",
+        duration_ms: 100,
+        created_at: new Date().toISOString(),
+      },
+    ]);
+
+    const { getByLabelText } = await act(async () => {
+      return render(<CommunicationOverlay />);
+    });
+    // Drain pending microtasks (resolves the await in fetchComms) so
+    // setComms lands and the panel renders. Don't advance time — that
+    // would fire the next interval tick and pollute the assertion.
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    // Initial mount polled 3 workspaces.
+    expect(mockGet).toHaveBeenCalledTimes(3);
+    mockGet.mockClear();
+
+    // Click the close button. Synchronous getByLabelText avoids
+    // findBy's internal setTimeout (deadlocks under useFakeTimers).
+    const closeBtn = getByLabelText("Close communications panel");
+    await act(async () => {
+      fireEvent.click(closeBtn);
+    });
+
+    // Advance well past the 30s cadence — gate should suppress the tick.
+    await act(async () => {
+      vi.advanceTimersByTime(60_000);
+    });
+    expect(mockGet).not.toHaveBeenCalled();
   });
 });
