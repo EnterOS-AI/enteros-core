@@ -58,16 +58,28 @@ func uploadFixture(t *testing.T) (*bytes.Buffer, string) {
 	return &buf, mw.FormDataContentType()
 }
 
-// expectURL stubs the SELECT that resolves the workspace's url.
+// expectURL stubs the SELECT that resolves the workspace's url +
+// delivery_mode. Defaults delivery_mode to "push" — most tests don't
+// care about the mode and just want a URL to forward to. Use
+// expectURLAndMode when the test needs a specific mode (e.g. the
+// poll-mode 422 path).
 func expectURL(mock sqlmock.Sqlmock, workspaceID, url string) {
-	mock.ExpectQuery(`SELECT COALESCE\(url, ''\) FROM workspaces WHERE id = \$1`).
+	expectURLAndMode(mock, workspaceID, url, "push")
+}
+
+// expectURLAndMode is the explicit form for tests that need to
+// exercise the delivery_mode branch (e.g. poll-mode workspaces get
+// a 422 instead of a 503 when URL is empty — the platform can't
+// dispatch to a poll-mode workspace at all).
+func expectURLAndMode(mock sqlmock.Sqlmock, workspaceID, url, mode string) {
+	mock.ExpectQuery(`SELECT COALESCE\(url, ''\), delivery_mode FROM workspaces WHERE id = \$1`).
 		WithArgs(workspaceID).
-		WillReturnRows(sqlmock.NewRows([]string{"url"}).AddRow(url))
+		WillReturnRows(sqlmock.NewRows([]string{"url", "delivery_mode"}).AddRow(url, mode))
 }
 
 // expectURLMissing stubs the SELECT to return sql.ErrNoRows.
 func expectURLMissing(mock sqlmock.Sqlmock, workspaceID string) {
-	mock.ExpectQuery(`SELECT COALESCE\(url, ''\) FROM workspaces WHERE id = \$1`).
+	mock.ExpectQuery(`SELECT COALESCE\(url, ''\), delivery_mode FROM workspaces WHERE id = \$1`).
 		WithArgs(workspaceID).
 		WillReturnError(sql.ErrNoRows)
 }
@@ -201,7 +213,9 @@ func TestChatUpload_NoURL(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
 
-	// Workspace registered but URL hasn't been reported yet (mid-boot).
+	// Workspace registered (push-mode default) but URL hasn't been reported
+	// yet (mid-boot). 503 + "not registered yet" is the right surface — the
+	// canvas client can retry after the next heartbeat picks up the URL.
 	wsID := "00000000-0000-0000-0000-000000000042"
 	expectURL(mock, wsID, "")
 
@@ -211,7 +225,43 @@ func TestChatUpload_NoURL(t *testing.T) {
 	h.Upload(c)
 
 	if w.Code != http.StatusServiceUnavailable {
-		t.Errorf("expected 503 when workspace url empty, got %d: %s", w.Code, w.Body.String())
+		t.Errorf("expected 503 when workspace url empty (push mode), got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "not registered yet") {
+		t.Errorf("expected transient-state error message, got: %s", w.Body.String())
+	}
+}
+
+// TestChatUpload_PollModeEmptyURL pins the 422 distinguisher: a
+// poll-mode workspace has no URL by design, so chat upload (which is
+// HTTP-forward to the workspace) cannot succeed by retrying. Returning
+// 503 here would loop the canvas client forever; 422 + an actionable
+// message ("re-register in push mode") tells the user what to do.
+//
+// Caught externally on 2026-05-04 — user reported "Upload failed: 503
+// {error: workspace url not registered yet}" on an external runtime
+// workspace (mac laptop, no public URL). The "yet" implied transient,
+// but the workspace's poll-mode meant the URL would never arrive.
+func TestChatUpload_PollModeEmptyURL(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+
+	wsID := "00000000-0000-0000-0000-000000000099"
+	expectURLAndMode(mock, wsID, "", "poll")
+
+	h := NewChatFilesHandler(NewTemplatesHandler(t.TempDir(), nil))
+	body, ct := uploadFixture(t)
+	c, w := makeUploadRequest(t, wsID, body, ct)
+	h.Upload(c)
+
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 for poll-mode upload, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "poll mode") {
+		t.Errorf("expected error to mention poll mode, got: %s", w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "push mode") {
+		t.Errorf("expected error to suggest re-registering in push mode, got: %s", w.Body.String())
 	}
 }
 

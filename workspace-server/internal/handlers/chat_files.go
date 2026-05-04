@@ -30,6 +30,7 @@ package handlers
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"io"
 	"log"
@@ -102,14 +103,38 @@ const chatUploadDir = "/workspace/.molecule/chat-uploads"
 // of bug as the original SaaS provision drift fixed in #2366; this
 // extraction prevents that class on the consumer side.
 func resolveWorkspaceForwardCreds(c *gin.Context, ctx context.Context, workspaceID, op string) (wsURL, secret string, ok bool) {
+	var deliveryMode sql.NullString
 	if err := db.DB.QueryRowContext(ctx,
-		`SELECT COALESCE(url, '') FROM workspaces WHERE id = $1`, workspaceID,
-	).Scan(&wsURL); err != nil {
+		`SELECT COALESCE(url, ''), delivery_mode FROM workspaces WHERE id = $1`, workspaceID,
+	).Scan(&wsURL, &deliveryMode); err != nil {
 		log.Printf("chat_files %s: workspace lookup failed for %s: %v", op, workspaceID, err)
 		c.JSON(http.StatusNotFound, gin.H{"error": "workspace not found"})
 		return "", "", false
 	}
 	if wsURL == "" {
+		// Distinguish the two empty-URL classes so the user sees an
+		// actionable error rather than a misleading "not registered yet"
+		// (which implies waiting will help):
+		//
+		//  poll-mode → URL is structurally absent. The platform never
+		//    dispatches to a poll-mode workspace, so chat upload (which
+		//    is HTTP-forward by design) cannot proceed. Returning 503
+		//    here would loop the canvas client forever. 422 signals
+		//    "this request can't succeed against THIS workspace's
+		//    configuration" — the only fix is to re-register the
+		//    workspace in push mode with a publicly-reachable URL.
+		//
+		//  push-mode → URL just isn't on the row yet (workspace
+		//    restart in progress, or first /registry/register hasn't
+		//    landed). 503 + "not registered yet" is correct — retry
+		//    after the next heartbeat (~30s) will likely succeed.
+		if deliveryMode.Valid && deliveryMode.String == "poll" {
+			c.JSON(http.StatusUnprocessableEntity, gin.H{
+				"error":  "workspace is in poll mode — chat " + op + " requires push mode",
+				"detail": "Poll-mode workspaces have no callback URL the platform can dispatch to. Re-register the workspace with a publicly-reachable URL in push mode (e.g. via ngrok / Cloudflare tunnel) to enable chat file " + op + ".",
+			})
+			return "", "", false
+		}
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "workspace url not registered yet"})
 		return "", "", false
 	}
