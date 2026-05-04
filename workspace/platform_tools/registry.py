@@ -271,7 +271,19 @@ _GET_WORKSPACE_INFO = ToolSpec(
         "back to the user, or to determine whether you're a tier-0 "
         "root that can write GLOBAL memory)."
     ),
-    input_schema={"type": "object", "properties": {}},
+    input_schema={
+        "type": "object",
+        "properties": {
+            "source_workspace_id": {
+                "type": "string",
+                "description": (
+                    "Optional. In multi-workspace mode (this agent registered "
+                    "in N workspaces), introspect the named workspace instead "
+                    "of the primary one. Single-workspace agents omit this."
+                ),
+            },
+        },
+    },
     impl=tool_get_workspace_info,
     section=A2A_SECTION,
 )
@@ -455,6 +467,14 @@ _CHAT_HISTORY = ToolSpec(
                     "Use the oldest `created_at` from a previous response."
                 ),
             },
+            "source_workspace_id": {
+                "type": "string",
+                "description": (
+                    "Optional. Multi-workspace mode: query the named "
+                    "workspace's activity log instead of the primary one. "
+                    "Auto-routes via the peer-discovery cache when unset."
+                ),
+            },
         },
         "required": ["peer_id"],
     },
@@ -515,6 +535,16 @@ _COMMIT_MEMORY = ToolSpec(
                 "enum": ["LOCAL", "TEAM", "GLOBAL"],
                 "description": "Memory scope (default LOCAL).",
             },
+            "source_workspace_id": {
+                "type": "string",
+                "description": (
+                    "Optional. Multi-workspace mode: commit the memory "
+                    "into the named workspace's namespace instead of "
+                    "the primary one. Pair with the inbound message's "
+                    "`arrival_workspace_id` so memories stay in the "
+                    "tenant they were derived from."
+                ),
+            },
         },
         "required": ["content"],
     },
@@ -543,6 +573,16 @@ _RECALL_MEMORY = ToolSpec(
                 "type": "string",
                 "enum": ["LOCAL", "TEAM", "GLOBAL", ""],
                 "description": "Filter by scope (empty = all accessible).",
+            },
+            "source_workspace_id": {
+                "type": "string",
+                "description": (
+                    "Optional. Multi-workspace mode: search the named "
+                    "workspace's memories instead of the primary one. "
+                    "Pair with the inbound message's "
+                    "`arrival_workspace_id` to recall context for the "
+                    "right tenant."
+                ),
             },
         },
     },

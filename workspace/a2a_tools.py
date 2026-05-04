@@ -545,19 +545,34 @@ async def tool_list_peers(source_workspace_id: str | None = None) -> str:
     return "\n".join(lines)
 
 
-async def tool_get_workspace_info() -> str:
-    """Get this workspace's own info."""
-    info = await get_workspace_info()
+async def tool_get_workspace_info(source_workspace_id: str | None = None) -> str:
+    """Get this workspace's own info.
+
+    ``source_workspace_id`` selects which registered workspace to
+    introspect when the agent is registered into multiple workspaces.
+    Unset → falls back to module-level WORKSPACE_ID.
+    """
+    info = await get_workspace_info(source_workspace_id=source_workspace_id)
     return json.dumps(info, indent=2)
 
 
-async def tool_commit_memory(content: str, scope: str = "LOCAL") -> str:
+async def tool_commit_memory(
+    content: str,
+    scope: str = "LOCAL",
+    source_workspace_id: str | None = None,
+) -> str:
     """Save important information to persistent memory.
 
     GLOBAL scope is writable only by root workspaces (tier == 0).
     RBAC memory.write permission is required for all scope levels.
     The source workspace_id is embedded in every record so the platform
     can enforce cross-workspace isolation and audit trail.
+
+    ``source_workspace_id`` selects which registered workspace this
+    memory belongs to when the agent is registered into multiple
+    workspaces (PR-1 / multi-workspace mode). When unset, falls back
+    to the module-level WORKSPACE_ID — single-workspace operators see
+    no behaviour change.
     """
     if not content:
         return "Error: content is required"
@@ -581,18 +596,19 @@ async def tool_commit_memory(content: str, scope: str = "LOCAL") -> str:
             "Non-root workspaces may use LOCAL or TEAM scope."
         )
 
+    src = source_workspace_id or WORKSPACE_ID
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(
-                f"{PLATFORM_URL}/workspaces/{WORKSPACE_ID}/memories",
+                f"{PLATFORM_URL}/workspaces/{src}/memories",
                 json={
                     "content": content,
                     "scope": scope,
                     # Embed source workspace so the platform can namespace-isolate
                     # and audit cross-workspace writes (GH#1610 fix).
-                    "workspace_id": WORKSPACE_ID,
+                    "workspace_id": src,
                 },
-                headers=_auth_headers_for_heartbeat(),
+                headers=_auth_headers_for_heartbeat(src),
             )
             data = resp.json()
             if resp.status_code in (200, 201):
@@ -602,13 +618,21 @@ async def tool_commit_memory(content: str, scope: str = "LOCAL") -> str:
         return f"Error saving memory: {e}"
 
 
-async def tool_recall_memory(query: str = "", scope: str = "") -> str:
+async def tool_recall_memory(
+    query: str = "",
+    scope: str = "",
+    source_workspace_id: str | None = None,
+) -> str:
     """Search persistent memory for previously saved information.
 
     RBAC memory.read permission is required (mirrors builtin_tools/memory.py).
     The workspace_id is sent as a query parameter so the platform can
     cross-validate it against the auth token and defend against any future
     path traversal / cross-tenant read bugs in the platform itself.
+
+    ``source_workspace_id`` selects which registered workspace's memories
+    to search when the agent is registered into multiple workspaces.
+    Unset → defaults to the module-level WORKSPACE_ID.
     """
     # RBAC: require memory.read permission (mirrors builtin_tools/memory.py)
     if not _check_memory_read_permission():
@@ -617,7 +641,8 @@ async def tool_recall_memory(query: str = "", scope: str = "") -> str:
             "permission for this operation."
         )
 
-    params: dict[str, str] = {"workspace_id": WORKSPACE_ID}
+    src = source_workspace_id or WORKSPACE_ID
+    params: dict[str, str] = {"workspace_id": src}
     if query:
         params["q"] = query
     if scope:
@@ -625,9 +650,9 @@ async def tool_recall_memory(query: str = "", scope: str = "") -> str:
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(
-                f"{PLATFORM_URL}/workspaces/{WORKSPACE_ID}/memories",
+                f"{PLATFORM_URL}/workspaces/{src}/memories",
                 params=params,
-                headers=_auth_headers_for_heartbeat(),
+                headers=_auth_headers_for_heartbeat(src),
             )
             data = resp.json()
             if isinstance(data, list):
@@ -664,7 +689,12 @@ _INBOX_NOT_ENABLED_MSG = (
 )
 
 
-async def tool_chat_history(peer_id: str, limit: int = 20, before_ts: str = "") -> str:
+async def tool_chat_history(
+    peer_id: str,
+    limit: int = 20,
+    before_ts: str = "",
+    source_workspace_id: str | None = None,
+) -> str:
     """Fetch the prior conversation with one peer.
 
     Hits ``/workspaces/<self>/activity?peer_id=<peer>&limit=<N>``
@@ -686,6 +716,11 @@ async def tool_chat_history(peer_id: str, limit: int = 20, before_ts: str = "") 
             histories — pass the oldest ``ts`` from the previous
             response. Empty (default) returns the most recent ``limit``
             rows.
+        source_workspace_id: Which registered workspace's activity log
+            to query. Auto-routes via ``_peer_to_source`` cache when
+            unset (the workspace this peer was discovered through);
+            falls back to module-level WORKSPACE_ID for single-workspace
+            operators.
 
     Returns a JSON-encoded list of activity rows (or an error string
     starting with ``Error:`` so the agent can branch). Each row carries
@@ -701,6 +736,8 @@ async def tool_chat_history(peer_id: str, limit: int = 20, before_ts: str = "") 
     if limit > 500:
         limit = 500
 
+    src = source_workspace_id or _peer_to_source.get(peer_id) or WORKSPACE_ID
+
     params: dict[str, str] = {
         "peer_id": peer_id,
         "limit": str(limit),
@@ -713,9 +750,9 @@ async def tool_chat_history(peer_id: str, limit: int = 20, before_ts: str = "") 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(
-                f"{PLATFORM_URL}/workspaces/{WORKSPACE_ID}/activity",
+                f"{PLATFORM_URL}/workspaces/{src}/activity",
                 params=params,
-                headers=_auth_headers_for_heartbeat(),
+                headers=_auth_headers_for_heartbeat(src),
             )
     except Exception as exc:  # noqa: BLE001
         return f"Error: chat_history request failed: {exc}"

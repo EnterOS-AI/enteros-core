@@ -491,8 +491,13 @@ async def get_peers() -> list[dict]:
     return peers
 
 
-async def get_workspace_info() -> dict:
+async def get_workspace_info(source_workspace_id: str | None = None) -> dict:
     """Get this workspace's info from the platform.
+
+    ``source_workspace_id`` selects which registered workspace to
+    introspect when the agent is registered into multiple workspaces
+    (multi-workspace mode). Unset → defaults to the module-level
+    WORKSPACE_ID — single-workspace operators see no behaviour change.
 
     Distinguishes three failure shapes so callers can handle them
     distinctly (#2429):
@@ -500,11 +505,12 @@ async def get_workspace_info() -> dict:
       - 404 / other     → workspace never existed (or transient)
       - exception       → network / auth failure
     """
+    src = source_workspace_id or WORKSPACE_ID
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
             resp = await client.get(
-                f"{PLATFORM_URL}/workspaces/{WORKSPACE_ID}",
-                headers=auth_headers(),
+                f"{PLATFORM_URL}/workspaces/{src}",
+                headers=auth_headers(src),
             )
             if resp.status_code == 200:
                 return resp.json()
@@ -521,7 +527,7 @@ async def get_workspace_info() -> dict:
                     body = {}
                 return {
                     "error": "removed",
-                    "id": body.get("id", WORKSPACE_ID),
+                    "id": body.get("id", src),
                     "removed_at": body.get("removed_at"),
                     "hint": body.get(
                         "hint",
