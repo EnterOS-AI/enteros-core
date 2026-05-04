@@ -245,18 +245,13 @@ async def main():  # pragma: no cover
         # 6c. Swap rich skill metadata into the card now that setup() loaded
         # them. In-place mutation: a2a-sdk's create_agent_card_routes serialises
         # the card on each request, so the route mounted below sees the update.
-        loaded_skills = getattr(adapter, "loaded_skills", None)
-        if loaded_skills:
-            agent_card.skills = [
-                AgentSkill(
-                    id=skill.metadata.id,
-                    name=skill.metadata.name,
-                    description=skill.metadata.description,
-                    tags=skill.metadata.tags,
-                    examples=skill.metadata.examples,
-                )
-                for skill in loaded_skills
-            ]
+        # Isolated via card_helpers.enrich_card_skills — a malformed
+        # loaded_skills shape (e.g., a future adapter that doesn't follow
+        # the .metadata convention) is logged + swallowed instead of
+        # propagating up to the outer except, where it would silently
+        # degrade an OK boot to the not-configured state.
+        from card_helpers import enrich_card_skills
+        enrich_card_skills(agent_card, getattr(adapter, "loaded_skills", None))
         adapter_ready = True
     except SystemExit:
         # Smoke-mode exit signal — propagate untouched.
@@ -497,7 +492,24 @@ async def main():  # pragma: no cover
             limit = int(request.query_params.get("limit", "100"))
         except (TypeError, ValueError):
             return JSONResponse({"error": "since and limit must be integers"}, status_code=400)
-        result = await adapter.transcript_lines(since=since, limit=limit)
+        # Isolate adapter call: misconfigured boots leave the adapter
+        # partially-initialised, and a future adapter override of
+        # transcript_lines might assume setup() ran. Surface a 503 with
+        # a clear reason instead of letting the exception propagate to
+        # Starlette's 500 handler — same pattern as the not-configured
+        # JSON-RPC route (PR #2756). BaseAdapter.transcript_lines's
+        # default returns {"supported": false} so today's 4 adapters
+        # never trigger this branch; this is the safety net.
+        try:
+            result = await adapter.transcript_lines(since=since, limit=limit)
+        except Exception as transcript_err:  # noqa: BLE001
+            return JSONResponse(
+                {
+                    "error": "transcript unavailable",
+                    "detail": f"{type(transcript_err).__name__}: {transcript_err}",
+                },
+                status_code=503,
+            )
         return JSONResponse(result)
 
     starlette_app.add_route("/transcript", _transcript_handler, methods=["GET"])
