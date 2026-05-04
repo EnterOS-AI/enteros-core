@@ -112,8 +112,11 @@ class TestDiscoverPeerSourceRouting:
         monkeypatch.setattr(a2a_client.httpx, "AsyncClient", lambda timeout: _Client())
 
         await a2a_client.discover_peer("11111111-1111-1111-1111-111111111111")
-        # Falls back to the env-var WORKSPACE_ID set in _isolate_env.
-        assert captured["headers"]["X-Workspace-ID"] == "00000000-0000-0000-0000-000000000001"
+        # WORKSPACE_ID is captured at a2a_client import time; assert
+        # against the module attribute rather than a hardcoded UUID so
+        # the test is portable across CI environments that pre-set
+        # WORKSPACE_ID before pytest runs.
+        assert captured["headers"]["X-Workspace-ID"] == a2a_client.WORKSPACE_ID
 
     @pytest.mark.asyncio
     async def test_invalid_target_id_returns_none_without_routing(self, monkeypatch):
