@@ -290,30 +290,46 @@ func (h *AdminMemoriesHandler) exportViaPlugin(c *gin.Context, ctx context.Conte
 		rootToWorkspaces[w.RootID] = append(rootToWorkspaces[w.RootID], w)
 	}
 
-	// 3. Resolve namespaces once per root + build namespace→workspace
-	// map for the eventual export-row mapping.
-	nsToOwner := make(map[string]string)            // namespace → workspace_name (first matching wins)
-	allNamespaces := make(map[string]struct{})      // union for plugin search
+	// 3. Resolve team/org namespaces once per root, then add each
+	// member's private workspace:<id> namespace explicitly.
+	//
+	// IMPORTANT: ReadableNamespaces(rootID) returns
+	// {workspace:rootID, team:rootID, org:rootID}. Calling it once
+	// per root is enough for team:/org:/custom: (those are shared by
+	// every member of the root group), but the workspace: namespace
+	// it returns is rootID's only — child members' private
+	// workspace:<childID> namespaces would be silently dropped from
+	// the export. Inject each member's workspace:<id> below to keep
+	// coverage parity with the legacy per-workspace iteration.
+	nsToOwner := make(map[string]string)       // namespace → workspace_name (first matching wins)
+	allNamespaces := make(map[string]struct{}) // union for plugin search
 	for rootID, members := range rootToWorkspaces {
-		// Use the root workspace's id for resolution — any member's
-		// readable list is identical so we pick the canonical one.
 		readable, err := h.resolver.ReadableNamespaces(ctx, rootID)
 		if err != nil {
 			log.Printf("admin/memories/export (cutover) root=%s: resolve: %v", rootID, err)
 			continue
 		}
-		// Pick the workspace whose primary namespace (workspace:<id>)
-		// matches each entry. For team/org namespaces, attribute to
-		// the root (canonical owner).
+		// Collect non-workspace namespaces (team:/org:/custom:/...) from
+		// the root view; these are identical across every member.
 		for _, ns := range readable {
+			if strings.HasPrefix(ns.Name, "workspace:") {
+				continue
+			}
 			allNamespaces[ns.Name] = struct{}{}
 			if _, alreadyMapped := nsToOwner[ns.Name]; alreadyMapped {
 				continue
 			}
-			// workspace:<id> → that specific workspace's name
 			if owner := pickOwnerForNamespace(ns.Name, members); owner != "" {
 				nsToOwner[ns.Name] = owner
 			}
+		}
+		// Inject each member's private workspace:<id> namespace + its
+		// owner. Children's private memories live in workspace:<childID>
+		// which the root-only resolve doesn't surface.
+		for _, m := range members {
+			ns := "workspace:" + m.ID
+			allNamespaces[ns] = struct{}{}
+			nsToOwner[ns] = m.Name
 		}
 	}
 

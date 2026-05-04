@@ -541,7 +541,10 @@ func TestImport_SkipsWhenResolverErrors(t *testing.T) {
 // search per UNIQUE root.
 //
 // Setup: 3 workspaces under 1 root → 1 resolver call + 1 plugin call
-// (was: 3 resolver + 3 plugin in the old code).
+// (was: 3 resolver + 3 plugin in the old code). The plugin search
+// receives 5 namespaces: each member's workspace:<id> + team:root-1
+// + org:root-1. (Children's workspace:<id> namespaces must be
+// included or admin export silently drops their private memories.)
 func TestExport_BatchesPluginCallsByRoot(t *testing.T) {
 	t.Setenv(envMemoryV2Cutover, "true")
 	mock := installMockDB(t)
@@ -556,8 +559,8 @@ func TestExport_BatchesPluginCallsByRoot(t *testing.T) {
 	plugin := &stubAdminPlugin{
 		searchFn: func(_ context.Context, body contract.SearchRequest) (*contract.SearchResponse, error) {
 			pluginSearchCount++
-			if len(body.Namespaces) != 3 {
-				t.Errorf("plugin search call %d: namespaces len = %d, want 3 (workspace+team+org)", pluginSearchCount, len(body.Namespaces))
+			if len(body.Namespaces) != 5 {
+				t.Errorf("plugin search call %d: namespaces len = %d, want 5 (3 workspace + team + org); got %v", pluginSearchCount, len(body.Namespaces), body.Namespaces)
 			}
 			return &contract.SearchResponse{}, nil
 		},
@@ -575,6 +578,126 @@ func TestExport_BatchesPluginCallsByRoot(t *testing.T) {
 	}
 	if pluginSearchCount != 1 {
 		t.Errorf("plugin search called %d times, want 1 (was 3 with the old N+1 code)", pluginSearchCount)
+	}
+}
+
+// perWorkspaceResolver mimics the real resolver: ReadableNamespaces
+// returns the SPECIFIC workspace's view (workspace:<that ID> +
+// team:<root> + org:<root>), not a constant set. The legacy
+// stubAdminResolver hides the I3 silent-drop bug by ignoring its
+// workspace-id argument.
+type perWorkspaceResolver map[string][]namespace.Namespace
+
+func (r perWorkspaceResolver) ReadableNamespaces(_ context.Context, ws string) ([]namespace.Namespace, error) {
+	v, ok := r[ws]
+	if !ok {
+		return nil, errors.New("perWorkspaceResolver: unknown ws " + ws)
+	}
+	return v, nil
+}
+func (r perWorkspaceResolver) WritableNamespaces(_ context.Context, ws string) ([]namespace.Namespace, error) {
+	return r.ReadableNamespaces(nil, ws)
+}
+
+// TestExport_IncludesEveryMembersPrivateNamespace pins the I3 follow-up
+// fix: when a root group has multiple members, the export must surface
+// each member's workspace:<id> namespace, not just the root's. Before
+// the fix, calling ReadableNamespaces(rootID) returned only
+// workspace:rootID + team:rootID + org:rootID — every child workspace's
+// private memories were silently dropped from admin export.
+func TestExport_IncludesEveryMembersPrivateNamespace(t *testing.T) {
+	t.Setenv(envMemoryV2Cutover, "true")
+	mock := installMockDB(t)
+
+	mock.ExpectQuery("WITH RECURSIVE chain").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "root_id"}).
+			AddRow("root-1", "alpha", "root-1").
+			AddRow("child-1", "alpha-child", "root-1").
+			AddRow("child-2", "alpha-grandchild", "root-1"))
+
+	resolver := perWorkspaceResolver{
+		"root-1": {
+			{Name: "workspace:root-1", Kind: contract.NamespaceKindWorkspace, Writable: true},
+			{Name: "team:root-1", Kind: contract.NamespaceKindTeam, Writable: true},
+			{Name: "org:root-1", Kind: contract.NamespaceKindOrg, Writable: true},
+		},
+		"child-1": {
+			{Name: "workspace:child-1", Kind: contract.NamespaceKindWorkspace, Writable: true},
+			{Name: "team:root-1", Kind: contract.NamespaceKindTeam, Writable: true},
+			{Name: "org:root-1", Kind: contract.NamespaceKindOrg, Writable: true},
+		},
+		"child-2": {
+			{Name: "workspace:child-2", Kind: contract.NamespaceKindWorkspace, Writable: true},
+			{Name: "team:root-1", Kind: contract.NamespaceKindTeam, Writable: true},
+			{Name: "org:root-1", Kind: contract.NamespaceKindOrg, Writable: true},
+		},
+	}
+
+	var passedNamespaces []string
+	plugin := &stubAdminPlugin{
+		searchFn: func(_ context.Context, body contract.SearchRequest) (*contract.SearchResponse, error) {
+			passedNamespaces = append(passedNamespaces, body.Namespaces...)
+			return &contract.SearchResponse{Memories: []contract.Memory{
+				{ID: "m-root", Namespace: "workspace:root-1", Content: "root private", Kind: contract.MemoryKindFact, Source: contract.MemorySourceAgent, CreatedAt: time.Now().UTC()},
+				{ID: "m-child1", Namespace: "workspace:child-1", Content: "child-1 private", Kind: contract.MemoryKindFact, Source: contract.MemorySourceAgent, CreatedAt: time.Now().UTC()},
+				{ID: "m-child2", Namespace: "workspace:child-2", Content: "child-2 private", Kind: contract.MemoryKindFact, Source: contract.MemorySourceAgent, CreatedAt: time.Now().UTC()},
+				{ID: "m-team", Namespace: "team:root-1", Content: "shared team", Kind: contract.MemoryKindFact, Source: contract.MemorySourceAgent, CreatedAt: time.Now().UTC()},
+			}}, nil
+		},
+	}
+	h := NewAdminMemoriesHandler().withMemoryV2APIs(plugin, resolver)
+
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest("GET", "/admin/memories/export", nil)
+	h.Export(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("code = %d body=%s", w.Code, w.Body.String())
+	}
+
+	// Every member's private namespace must reach the plugin search.
+	want := []string{"workspace:root-1", "workspace:child-1", "workspace:child-2", "team:root-1", "org:root-1"}
+	got := make(map[string]bool, len(passedNamespaces))
+	for _, ns := range passedNamespaces {
+		got[ns] = true
+	}
+	for _, w := range want {
+		if !got[w] {
+			t.Errorf("plugin search missing namespace %q (got %v)", w, passedNamespaces)
+		}
+	}
+	if len(passedNamespaces) != 5 {
+		t.Errorf("plugin search namespace count = %d, want 5 (3 workspace + team + org)", len(passedNamespaces))
+	}
+
+	// Children's private memories must appear in the export, attributed
+	// to the right workspace_name.
+	var entries []memoryExportEntry
+	if err := json.Unmarshal(w.Body.Bytes(), &entries); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	byID := map[string]memoryExportEntry{}
+	for _, e := range entries {
+		byID[e.ID] = e
+	}
+	for _, exp := range []struct{ id, ns, owner string }{
+		{"m-root", "workspace:root-1", "alpha"},
+		{"m-child1", "workspace:child-1", "alpha-child"},
+		{"m-child2", "workspace:child-2", "alpha-grandchild"},
+	} {
+		e, ok := byID[exp.id]
+		if !ok {
+			t.Errorf("export missing memory %s — children's private memories silently dropped", exp.id)
+			continue
+		}
+		if e.Namespace != exp.ns {
+			t.Errorf("memory %s namespace = %q, want %q", exp.id, e.Namespace, exp.ns)
+		}
+		if e.WorkspaceName != exp.owner {
+			t.Errorf("memory %s owner = %q, want %q", exp.id, e.WorkspaceName, exp.owner)
+		}
 	}
 }
 
