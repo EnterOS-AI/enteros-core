@@ -530,13 +530,22 @@ runtime: ${RUNTIME}
 "
 for wid in $WS_TO_CHECK; do
   PUT_BODY=$(python3 -c "import json,sys; print(json.dumps({'content': sys.stdin.read()}))" <<< "$CONFIG_PAYLOAD")
-  PUT_RESP=$(tenant_call PUT "/workspaces/$wid/files/config.yaml" \
+  # Capture body to a tempfile so curl's -w '%{http_code}' is the only
+  # thing on stdout. The first version used `-w '\n%{http_code}\n'` and
+  # parsed via `tail -n 2 | head -n 1`, which broke because bash $(...)
+  # strips the trailing newline → only 2 lines remain in the captured
+  # value → head -n 1 returned the body, not the status code. Caught
+  # post-merge by E2E Staging SaaS at 22:06 UTC: a 200-with-body got
+  # misreported as "PUT returned <body>".
+  PUT_TMP=$(mktemp -t synth_put.XXXXXX)
+  PUT_CODE=$(tenant_call PUT "/workspaces/$wid/files/config.yaml" \
     -H "Content-Type: application/json" \
     -d "$PUT_BODY" \
-    -w $'\n%{http_code}\n' \
-    2>/dev/null || printf '\n500\n')
-  PUT_CODE=$(echo "$PUT_RESP" | tail -n 2 | head -n 1)
-  PUT_BODY_OUT=$(echo "$PUT_RESP" | sed '$d' | sed '$d')
+    -o "$PUT_TMP" \
+    -w '%{http_code}' \
+    2>/dev/null || echo "000")
+  PUT_BODY_OUT=$(cat "$PUT_TMP" 2>/dev/null || echo "")
+  rm -f "$PUT_TMP"
   if [ "$PUT_CODE" != "200" ] && [ "$PUT_CODE" != "204" ]; then
     fail "Workspace $wid Files API PUT config.yaml returned $PUT_CODE: $PUT_BODY_OUT — likely a path-map or permission regression in workspace-server template_files_eic.go"
   fi
