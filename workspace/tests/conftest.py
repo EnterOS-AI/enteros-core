@@ -145,6 +145,42 @@ def _make_a2a_mocks():
     types_mod.TaskStatus = TaskStatus
     types_mod.TaskState = _TaskStateEnum
 
+    # v1 AgentCard / AgentSkill / AgentCapabilities / AgentInterface — used
+    # by main.py's static-card construction (PR #2756) and by
+    # card_helpers.enrich_card_skills's swap path. Stubs preserve kwargs so
+    # tests can assert on card.skills[i].name etc., and let card.skills be
+    # reassigned in place (the production code's enrichment pattern).
+    class AgentSkill:
+        def __init__(self, id="", name="", description="", tags=None, examples=None, **kwargs):
+            self.id = id
+            self.name = name
+            self.description = description
+            self.tags = list(tags) if tags is not None else []
+            self.examples = list(examples) if examples is not None else []
+            for k, v in kwargs.items():
+                setattr(self, k, v)
+
+    class AgentCapabilities:
+        def __init__(self, **kwargs):
+            for k, v in kwargs.items():
+                setattr(self, k, v)
+
+    class AgentInterface:
+        def __init__(self, **kwargs):
+            for k, v in kwargs.items():
+                setattr(self, k, v)
+
+    class AgentCard:
+        def __init__(self, **kwargs):
+            self.skills = []
+            for k, v in kwargs.items():
+                setattr(self, k, v)
+
+    types_mod.AgentSkill = AgentSkill
+    types_mod.AgentCapabilities = AgentCapabilities
+    types_mod.AgentInterface = AgentInterface
+    types_mod.AgentCard = AgentCard
+
     # a2a.helpers (v1: moved from a2a.utils, renamed new_agent_text_message
     # → new_text_message). Mock both names — production code only calls
     # new_text_message, but if any test still references the old name it

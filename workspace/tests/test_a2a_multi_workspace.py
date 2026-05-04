@@ -426,3 +426,220 @@ class TestListRegisteredWorkspaces:
         platform_auth.register_workspace_token("ws-1", "tok-1")
         platform_auth.clear_cache()
         assert platform_auth.list_registered_workspaces() == []
+
+
+# ---------------------------------------------------------------------------
+# Memory tools — commit/recall must namespace under source_workspace_id
+# so an agent serving multiple tenants doesn't bleed memories across
+# them. Single-workspace path (no source arg) keeps using WORKSPACE_ID.
+# ---------------------------------------------------------------------------
+
+
+class TestCommitMemorySourceRouting:
+    @pytest.mark.asyncio
+    async def test_url_and_auth_use_source_workspace_id(self, monkeypatch):
+        """commit_memory(source_workspace_id=X) must POST to /workspaces/X/
+        with X's bearer token — otherwise a multi-tenant agent could
+        write into the wrong tenant's memory namespace."""
+        import platform_auth, a2a_tools
+
+        platform_auth.register_workspace_token("ffff6666-ffff-ffff-ffff-ffffffffffff", "token-F")
+
+        captured: dict = {}
+
+        class _Resp:
+            status_code = 200
+            def json(self):
+                return {"id": "mem-1"}
+
+        class _Client:
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return None
+            async def post(self, url, headers, json):
+                captured["url"] = url
+                captured["headers"] = headers
+                captured["body"] = json
+                return _Resp()
+
+        monkeypatch.setattr(a2a_tools.httpx, "AsyncClient", lambda timeout: _Client())
+
+        result = await a2a_tools.tool_commit_memory(
+            "remember this",
+            source_workspace_id="ffff6666-ffff-ffff-ffff-ffffffffffff",
+        )
+
+        assert "/workspaces/ffff6666-ffff-ffff-ffff-ffffffffffff/memories" in captured["url"]
+        assert captured["headers"]["Authorization"] == "Bearer token-F"
+        assert captured["body"]["workspace_id"] == "ffff6666-ffff-ffff-ffff-ffffffffffff"
+        import json as _json
+        assert _json.loads(result)["success"] is True
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_module_workspace_id(self, monkeypatch):
+        """Without source_workspace_id, single-workspace operators keep
+        the legacy WORKSPACE_ID-based POST — no behavior change."""
+        import a2a_client, a2a_tools
+
+        captured: dict = {}
+
+        class _Resp:
+            status_code = 200
+            def json(self):
+                return {"id": "mem-1"}
+
+        class _Client:
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return None
+            async def post(self, url, headers, json):
+                captured["url"] = url
+                return _Resp()
+
+        monkeypatch.setattr(a2a_tools.httpx, "AsyncClient", lambda timeout: _Client())
+
+        await a2a_tools.tool_commit_memory("remember this")
+        assert f"/workspaces/{a2a_client.WORKSPACE_ID}/memories" in captured["url"]
+
+
+class TestRecallMemorySourceRouting:
+    @pytest.mark.asyncio
+    async def test_url_params_and_auth_use_source(self, monkeypatch):
+        """recall_memory routes the GET, the workspace_id query param,
+        and the auth header through source_workspace_id."""
+        import platform_auth, a2a_tools
+
+        platform_auth.register_workspace_token("aaaa7777-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "token-G")
+
+        captured: dict = {}
+
+        class _Resp:
+            status_code = 200
+            def json(self):
+                return []
+
+        class _Client:
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return None
+            async def get(self, url, params, headers):
+                captured["url"] = url
+                captured["params"] = params
+                captured["headers"] = headers
+                return _Resp()
+
+        monkeypatch.setattr(a2a_tools.httpx, "AsyncClient", lambda timeout: _Client())
+
+        await a2a_tools.tool_recall_memory(
+            query="x",
+            source_workspace_id="aaaa7777-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        )
+
+        assert "/workspaces/aaaa7777-aaaa-aaaa-aaaa-aaaaaaaaaaaa/memories" in captured["url"]
+        assert captured["params"]["workspace_id"] == "aaaa7777-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        assert captured["headers"]["Authorization"] == "Bearer token-G"
+
+
+# ---------------------------------------------------------------------------
+# chat_history — auto-routes via the peer→source cache so an inbound
+# peer_agent push from workspace X sees its history queried against X.
+# ---------------------------------------------------------------------------
+
+
+class TestChatHistorySourceRouting:
+    @pytest.mark.asyncio
+    async def test_auto_routes_via_peer_cache(self, monkeypatch):
+        """chat_history(peer_id) without an explicit source falls back to
+        ``_peer_to_source[peer_id]`` — same auto-routing as delegate_task,
+        so the agent doesn't have to remember which workspace surfaced
+        each peer."""
+        import platform_auth, a2a_client, a2a_tools
+
+        platform_auth.register_workspace_token("bbbb8888-bbbb-bbbb-bbbb-bbbbbbbbbbbb", "token-H")
+        peer_id = "1111aaaa-1111-1111-1111-111111111111"
+        a2a_client._peer_to_source[peer_id] = "bbbb8888-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+
+        captured: dict = {}
+
+        class _Resp:
+            status_code = 200
+            def json(self):
+                return []
+
+        class _Client:
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return None
+            async def get(self, url, params, headers):
+                captured["url"] = url
+                captured["headers"] = headers
+                return _Resp()
+
+        monkeypatch.setattr(a2a_tools.httpx, "AsyncClient", lambda timeout: _Client())
+
+        await a2a_tools.tool_chat_history(peer_id, limit=5)
+
+        assert "/workspaces/bbbb8888-bbbb-bbbb-bbbb-bbbbbbbbbbbb/activity" in captured["url"]
+        assert captured["headers"]["Authorization"] == "Bearer token-H"
+
+    @pytest.mark.asyncio
+    async def test_explicit_source_beats_cache(self, monkeypatch):
+        import platform_auth, a2a_client, a2a_tools
+
+        platform_auth.register_workspace_token("cccc9999-cccc-cccc-cccc-cccccccccccc", "token-I")
+        peer_id = "1111aaaa-1111-1111-1111-111111111111"
+        a2a_client._peer_to_source[peer_id] = "should-not-be-used"
+
+        captured: dict = {}
+
+        class _Resp:
+            status_code = 200
+            def json(self):
+                return []
+
+        class _Client:
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return None
+            async def get(self, url, params, headers):
+                captured["url"] = url
+                return _Resp()
+
+        monkeypatch.setattr(a2a_tools.httpx, "AsyncClient", lambda timeout: _Client())
+
+        await a2a_tools.tool_chat_history(
+            peer_id, source_workspace_id="cccc9999-cccc-cccc-cccc-cccccccccccc",
+        )
+        assert "/workspaces/cccc9999-cccc-cccc-cccc-cccccccccccc/activity" in captured["url"]
+
+
+# ---------------------------------------------------------------------------
+# get_workspace_info — multi-workspace introspection.
+# ---------------------------------------------------------------------------
+
+
+class TestGetWorkspaceInfoSourceRouting:
+    @pytest.mark.asyncio
+    async def test_introspects_named_workspace(self, monkeypatch):
+        import platform_auth, a2a_client
+
+        platform_auth.register_workspace_token("dddd0000-dddd-dddd-dddd-dddddddddddd", "token-J")
+
+        captured: dict = {}
+
+        class _Resp:
+            status_code = 200
+            def json(self):
+                return {"id": "dddd0000-dddd-dddd-dddd-dddddddddddd", "name": "wsJ"}
+
+        class _Client:
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return None
+            async def get(self, url, headers):
+                captured["url"] = url
+                captured["headers"] = headers
+                return _Resp()
+
+        monkeypatch.setattr(a2a_client.httpx, "AsyncClient", lambda timeout: _Client())
+
+        info = await a2a_client.get_workspace_info(
+            source_workspace_id="dddd0000-dddd-dddd-dddd-dddddddddddd",
+        )
+        assert info["id"] == "dddd0000-dddd-dddd-dddd-dddddddddddd"
+        assert "/workspaces/dddd0000-dddd-dddd-dddd-dddddddddddd" in captured["url"]
+        assert captured["headers"]["Authorization"] == "Bearer token-J"
