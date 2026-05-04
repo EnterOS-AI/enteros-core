@@ -706,8 +706,22 @@ print(json.dumps({
 d=json.load(sys.stdin)
 print(len(d if isinstance(d, list) else d.get('events', [])))" 2>/dev/null || echo 0)
   log "    Activity events observed: $ACTIVITY_COUNT"
+
+  # ─── 9d. shared_context removal gate ─────────────────────────────────
+  # Pin the deletion of GET /workspaces/:id/shared-context. The route + handler
+  # were removed; team-shared knowledge now flows through memory v2's
+  # team:<id> namespace. If anyone re-introduces a shared-context endpoint
+  # without going through RFC #2789, this gate fires.
+  set +e
+  SC_CODE=$(tenant_call GET "/workspaces/$PARENT_ID/shared-context" \
+    -o /dev/null -w "%{http_code}" 2>/dev/null || echo "000")
+  set -e
+  if [ "$SC_CODE" = "200" ]; then
+    fail "shared-context route should be gone but returned 200 — regression. See task #304."
+  fi
+  ok "shared-context route confirmed removed (HTTP $SC_CODE)"
 else
-  log "9/11 Canary mode — skipping HMA / peers / activity"
+  log "9/11 Canary mode — skipping HMA / peers / activity / shared-context-gone"
 fi
 
 # ─── 10. Delegation mechanics (full mode + child) ──────────────────────
