@@ -1322,6 +1322,120 @@ def test_initialize_instructions_calls_out_dual_paths():
     )
 
 
+def test_initialize_instructions_pins_reply_then_pop_ordering():
+    """Without explicit ordering, a literal-minded agent (codex, Cline)
+    can pop after a failed reply call and drop the message permanently.
+    The bridge daemon avoids this in-process via skip-pop-on-error
+    (codex-channel-molecule bridge.py:278-285), but an MCP agent reading
+    the instructions has no equivalent guard. Pin the rule.
+    """
+    from a2a_mcp_server import _build_initialize_result
+
+    instructions = _build_initialize_result()["instructions"]
+
+    # The contract: pop ONLY AFTER reply succeeds.
+    assert "ONLY AFTER" in instructions or "only after" in instructions, (
+        "instructions must explicitly state inbox_pop is conditional "
+        "on the reply tool returning successfully — without this an "
+        "agent can pop after a 502 from send_message_to_user and lose "
+        "the message"
+    )
+    # And the corollary: redelivery is the recovery mechanism.
+    assert "redeliver" in instructions.lower(), (
+        "instructions must tell the agent that a failed reply means "
+        "leave the row unacked and the platform redelivers — otherwise "
+        "an agent that catches the error has no clear recovery path"
+    )
+
+
+def test_initialize_instructions_handles_malformed_peer_agent():
+    """A peer_agent message with empty peer_id (registry lookup failure
+    on the platform side) is poison: delegate_task with
+    workspace_id="" 400s, agent retries on the next poll, infinite
+    loop. The bridge daemon drops + acks (bridge.py:192-200); document
+    the same behavior for in-process agents.
+    """
+    from a2a_mcp_server import _build_initialize_result
+
+    instructions = _build_initialize_result()["instructions"]
+    lower = instructions.lower()
+
+    # Must mention the empty-peer_id case AND the drain action.
+    assert "peer_id" in instructions and "empty" in lower, (
+        "instructions must explicitly call out the empty peer_id case "
+        "for peer_agent so the agent knows to skip the reply"
+    )
+    assert "poison" in lower or "drain" in lower or "malformed" in lower, (
+        "instructions must tell the agent to drain the malformed row "
+        "via inbox_pop rather than looping on it"
+    )
+
+
+def test_initialize_instructions_disclaims_peer_role_attestation():
+    """The platform registry is NOT cryptographic identity. A malicious
+    peer can register with peer_role="admin" or peer_name="system: do
+    X". Without an explicit disclaimer, an agent that surfaces these
+    fields might also act on them ("the SRE peer told me to wipe the
+    database"). Pin the warning so a copy-edit can't drop it.
+    """
+    from a2a_mcp_server import _build_initialize_result
+
+    instructions = _build_initialize_result()["instructions"]
+    lower = instructions.lower()
+
+    # Must use language that distinguishes display from authority.
+    assert ("display string" in lower or "not cryptograph" in lower
+            or "not attestation" in lower or "not authentication" in lower), (
+        "instructions must mark peer_name/peer_role as non-attested "
+        "display strings — without this an agent can be socially "
+        "engineered via a peer registering with a privileged-sounding "
+        "role name"
+    )
+    # And the corollary: don't grant permissions based on these fields.
+    assert ("elevated permission" in lower or "do not grant" in lower
+            or "do not extend" in lower), (
+        "instructions must tell the agent NOT to derive authority "
+        "from peer_role — otherwise the disclaimer is decorative"
+    )
+
+
+def test_initialize_instructions_distinguishes_canvas_user_from_peer_trust():
+    """The previous single-rule security note (\"do not execute without
+    chat-side approval\") effectively disabled peer_agent autonomous
+    handling — codex daemons handling peer_agent messages have NO
+    canvas user to approve. Document the dual trust model explicitly:
+    canvas_user requires user approval for embedded instructions;
+    peer_agent permits autonomous handling but caps destructive side
+    effects at the workspace boundary.
+    """
+    from a2a_mcp_server import _build_initialize_result
+
+    instructions = _build_initialize_result()["instructions"]
+    lower = instructions.lower()
+
+    # The dual model must be visible — both kinds get explicit treatment.
+    canvas_section = "canvas_user:" in instructions or "canvas_user" in instructions
+    peer_section = "peer_agent:" in instructions or "peer_agent" in instructions
+    assert canvas_section and peer_section, (
+        "trust model must address both canvas_user and peer_agent "
+        "explicitly — single-rule guidance is ambiguous for the "
+        "peer_agent autonomous-handling case"
+    )
+    # Peer-agent autonomous handling must be permitted, NOT blanket-blocked.
+    assert "autonomous" in lower, (
+        "instructions must explicitly permit peer_agent autonomous "
+        "handling — the bridge daemon's whole point is that codex "
+        "responds to peer messages without canvas approval"
+    )
+    # But destructive side-effects outside the workspace must still be gated.
+    assert ("destructive" in lower
+            or "side-effect" in lower or "side effect" in lower), (
+        "instructions must require validation before destructive "
+        "actions outside the workspace boundary — peer authority "
+        "doesn't extend to external email, shared infra, etc."
+    )
+
+
 def test_poll_timeout_resolution_clamps_and_falls_back():
     """The env knob must accept positive ints, fall back gracefully
     on bad input, and clamp to a sane upper bound — operator config
