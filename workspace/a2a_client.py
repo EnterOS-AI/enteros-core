@@ -9,8 +9,10 @@ import logging
 import os
 import random
 import re
+import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 
 import httpx
 
@@ -64,6 +66,146 @@ _peer_metadata: dict[str, tuple[float, dict | None]] = {}
 # registry on every push, short enough that role/name renames propagate
 # within a single agent session.
 _PEER_METADATA_TTL_SECONDS = 300.0
+
+
+# Background-fetch executor for enrich_peer_metadata_nonblocking (#2484).
+# A small pool — peers are highly TTL-cached, so the steady-state load
+# is "one fetch per peer per 5 minutes." Two workers handle the cold-
+# start burst when an agent starts receiving pushes from a new peer for
+# the first time without backing up the inbox poller. Daemon threads:
+# the executor must NOT block process exit if the inbox shuts down.
+_enrich_executor: ThreadPoolExecutor | None = None
+_enrich_executor_lock = threading.Lock()
+
+# In-flight peer IDs — guards against a single peer's repeated pushes
+# scheduling N concurrent registry fetches before the first one fills
+# the cache. Set membership is "a worker is currently fetching this
+# peer; subsequent calls should NOT schedule another."
+_enrich_in_flight: set[str] = set()
+_enrich_in_flight_lock = threading.Lock()
+
+
+def _get_enrich_executor() -> ThreadPoolExecutor:
+    """Lazy-init the enrichment worker pool. Lazy because most test
+    fixtures and short-lived CLI invocations don't need it; only the
+    long-running molecule-mcp / inbox-poller path actually schedules
+    background fetches.
+    """
+    global _enrich_executor
+    if _enrich_executor is not None:
+        return _enrich_executor
+    with _enrich_executor_lock:
+        if _enrich_executor is None:
+            _enrich_executor = ThreadPoolExecutor(
+                max_workers=2,
+                thread_name_prefix="enrich-peer",
+            )
+    return _enrich_executor
+
+
+def enrich_peer_metadata_nonblocking(
+    peer_id: str,
+    source_workspace_id: str | None = None,
+) -> dict | None:
+    """Cache-first variant of ``enrich_peer_metadata`` — returns
+    immediately without blocking on a registry GET.
+
+    Behavior:
+      - Cache hit (fresh): return the cached record.
+      - Cache miss or TTL expired: schedule a background fetch via the
+        worker pool, return ``None`` (caller renders bare peer_id).
+        The next push for this peer hits the warm cache and gets the
+        full record.
+
+    Why this exists (#2484): the inbox poller's notification callback
+    in molecule-mcp called the synchronous ``enrich_peer_metadata`` on
+    every push, blocking the poller for up to 2s × N uncached peers
+    per batch. Push-delivery latency was gated on registry latency —
+    the exact thing the negative-cache patch in PR #2471 was supposed
+    to avoid amplifying. Moving the fetch off the poller thread means
+    push delivery is bounded by the inbox poll interval, never by
+    registry RTT.
+
+    Trade-off: the FIRST push from a new peer arrives metadata-light
+    (no name/role). The MCP host renders the bare peer_id. Subsequent
+    pushes (within the 5-min TTL) hit the warm cache and get the full
+    record. Acceptable because:
+      - Channel-envelope enrichment is a UX nicety, not a correctness
+        invariant.
+      - The cold-cache window per peer is bounded to one push.
+      - The TTL is long enough that an active conversation never
+        re-enters the cold state.
+    """
+    canon = _validate_peer_id(peer_id)
+    if canon is None:
+        return None
+    current = time.monotonic()
+    cached = _peer_metadata.get(canon)
+    if cached is not None:
+        fetched_at, record = cached
+        if current - fetched_at < _PEER_METADATA_TTL_SECONDS:
+            return record
+    # Schedule background fetch unless one is already in flight for this
+    # peer. The synchronous version atomically reads-then-writes; the
+    # async version splits that into "schedule fetch" + "fetch fills
+    # cache later." The in-flight set keeps a flurry of pushes from
+    # one peer (e.g., a chatty agent) from spawning N parallel GETs.
+    with _enrich_in_flight_lock:
+        if canon in _enrich_in_flight:
+            return None
+        _enrich_in_flight.add(canon)
+    try:
+        _get_enrich_executor().submit(
+            _enrich_peer_metadata_worker, canon, source_workspace_id
+        )
+    except RuntimeError:
+        # Executor was shut down (process exit path) — drop the request,
+        # let the caller render bare peer_id.
+        with _enrich_in_flight_lock:
+            _enrich_in_flight.discard(canon)
+    return None
+
+
+def _enrich_peer_metadata_worker(
+    canon: str, source_workspace_id: str | None
+) -> None:
+    """Background-thread body for ``enrich_peer_metadata_nonblocking``.
+    Runs the same fetch logic as the synchronous helper but discards
+    the return value — the cache write is the only output anyone
+    needs. Always clears the in-flight marker so a future cache miss
+    can retry.
+    """
+    try:
+        enrich_peer_metadata(canon, source_workspace_id)
+    except Exception as exc:  # noqa: BLE001
+        # Background workers must not crash the executor — log and
+        # move on. The negative-cache path inside enrich_peer_metadata
+        # already records failures, so a re-attempt is rate-limited
+        # by TTL.
+        logger.debug("_enrich_peer_metadata_worker: %s failed: %s", canon, exc)
+    finally:
+        with _enrich_in_flight_lock:
+            _enrich_in_flight.discard(canon)
+
+
+def _wait_for_enrichment_inflight_for_testing(timeout: float = 2.0) -> None:
+    """Block until all in-flight enrichment workers have completed.
+
+    Test-only helper. Production code never has a reason to wait — the
+    point of the nonblocking path is that callers don't care when the
+    cache fills. Tests that want to assert "after the worker runs, the
+    cache has the record" use this to synchronise without sleeping.
+
+    Polls ``_enrich_in_flight`` rather than holding a Condition because
+    the worker pool is already serializing through ``_enrich_in_flight_lock``;
+    poll keeps the production hot path lock-free.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with _enrich_in_flight_lock:
+            if not _enrich_in_flight:
+                return
+        time.sleep(0.01)
 
 
 def enrich_peer_metadata(
