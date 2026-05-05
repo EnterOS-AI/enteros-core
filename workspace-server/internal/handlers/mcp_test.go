@@ -13,16 +13,17 @@ import (
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/events"
 	"github.com/gin-gonic/gin"
 )
 
 // newMCPHandler is a test helper that constructs an MCPHandler backed by the
-// sqlmock DB set up by setupTestDB.
+// sqlmock DB set up by setupTestDB. Uses newTestBroadcaster so handlers
+// that BroadcastOnly (send_message_to_user, etc.) don't nil-panic on the
+// hub — events.NewBroadcaster(nil) crashes inside hub.Broadcast.
 func newMCPHandler(t *testing.T) (*MCPHandler, sqlmock.Sqlmock) {
 	t.Helper()
 	mock := setupTestDB(t)
-	h := NewMCPHandler(db.DB, events.NewBroadcaster(nil))
+	h := NewMCPHandler(db.DB, newTestBroadcaster())
 	return h, mock
 }
 
@@ -625,6 +626,69 @@ func TestMCPHandler_SendMessageToUser_Blocked_WhenEnvNotSet(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unexpected DB calls: %v", err)
+	}
+}
+
+// TestMCPHandler_SendMessageToUser_PersistsToActivityLog pins the fix
+// for the reno-stars / CEO Ryan PC chat-history data-loss bug:
+// external claude-code agents using molecule-mcp's send_message_to_user
+// tool route through THIS handler (not the HTTP /notify endpoint),
+// and the handler used to broadcast WS only — visible live, gone on
+// reload because nothing wrote to activity_logs.
+//
+// Pins:
+//   - INSERT happens on the success path (broadcast + DB write).
+//   - INSERT shape mirrors the HTTP /notify handler exactly:
+//     activity_type='a2a_receive', method='notify', request_body NULL,
+//     response_body={"result": message}, status='ok'. The canvas
+//     hydration query (`type=a2a_receive&source=canvas`) treats
+//     both writers as the same shape — drift here means the bug
+//     re-surfaces silently.
+func TestMCPHandler_SendMessageToUser_PersistsToActivityLog(t *testing.T) {
+	t.Setenv("MOLECULE_MCP_ALLOW_SEND_MESSAGE", "true")
+	h, mock := newMCPHandler(t)
+
+	// Workspace lookup — the handler verifies the workspace exists
+	// before it does anything else. Returning a name lets the
+	// broadcast payload populate; the test doesn't assert on the
+	// broadcast (no observable WS in this fake), only on the DB.
+	mock.ExpectQuery("SELECT name FROM workspaces").
+		WithArgs("ws-msg").
+		WillReturnRows(sqlmock.NewRows([]string{"name"}).AddRow("CEO Ryan PC"))
+
+	// The persistence INSERT — pin the exact shape so a future
+	// refactor that switches columns or drops `method='notify'`
+	// breaks the test loud, not silently. Match by regex on the
+	// table + activity_type + method literals.
+	mock.ExpectExec(`INSERT INTO activity_logs.*'a2a_receive'.*'notify'`).
+		WithArgs(
+			"ws-msg",
+			sqlmock.AnyArg(), // summary "Agent message: ..."
+			sqlmock.AnyArg(), // response_body JSON
+		).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	w := mcpPost(t, h, "ws-msg", map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      99,
+		"method":  "tools/call",
+		"params": map[string]interface{}{
+			"name": "send_message_to_user",
+			"arguments": map[string]interface{}{
+				"message": "Hello, this should persist!",
+			},
+		},
+	})
+
+	var resp mcpResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("response was not valid JSON-RPC: %v\nbody=%s", err, w.Body.String())
+	}
+	if resp.Error != nil {
+		t.Errorf("unexpected JSON-RPC error: %+v", resp.Error)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("DB expectations not met (INSERT missing → reno-stars data-loss regression): %v", err)
 	}
 }
 
