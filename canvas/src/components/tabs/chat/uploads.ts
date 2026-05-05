@@ -44,6 +44,8 @@ export async function uploadChatFiles(
  *    - `workspace:<abs-path>` (our canonical form)
  *    - `file:///workspace/...` (some agents emit this)
  *    - `/workspace/...` (bare absolute path inside the container)
+ *    - `platform-pending:<wsid>/<file_id>` (poll-mode upload, staged
+ *      on platform side; resolves to /pending-uploads/<file_id>/content)
  *  Everything that looks like an allowed-root container path is
  *  rewritten to the authenticated /chat/download endpoint. HTTP(S)
  *  URIs pass through unchanged so we can also render links to
@@ -53,11 +55,48 @@ export function resolveAttachmentHref(
   workspaceId: string,
   uri: string,
 ): string {
+  // platform-pending: agents-emitted URI that lives in the platform-side
+  // staging layer (poll-mode chat uploads, see workspace-server's
+  // chat_files.go ~line 690 + pendinguploads.Storage). The wire shape
+  // is `platform-pending:<workspace_id>/<file_id>`. Resolving it
+  // requires hitting GET /workspaces/<wsid>/pending-uploads/<file_id>/content
+  // which streams the bytes with full workspace auth. Without this
+  // case the browser sees an unhandled-protocol click → about:blank,
+  // which was the user-visible bug from 2026-05-05 (reno-stars).
+  if (uri.startsWith("platform-pending:")) {
+    const rest = uri.slice("platform-pending:".length);
+    const slash = rest.indexOf("/");
+    // Defensive: if the URI doesn't have the expected wsid/fileid
+    // shape, fall through to raw-URI handling so the consumer can
+    // still try to render it (rather than producing a broken /pending-
+    // uploads/// path).
+    if (slash > 0) {
+      const wsid = rest.slice(0, slash);
+      const fileID = rest.slice(slash + 1);
+      if (wsid && fileID) {
+        // Use the URI's own workspace_id (the bytes live in THAT
+        // workspace's pending-uploads store), not the chat's
+        // workspace_id — these CAN differ when a user drags a file
+        // into one workspace's chat that gets forwarded to another
+        // (cross-workspace delegation, agent forwarding).
+        return `${PLATFORM_URL}/workspaces/${wsid}/pending-uploads/${fileID}/content`;
+      }
+    }
+    return uri;
+  }
   const containerPath = normalizeWorkspaceUri(uri);
   if (containerPath) {
     return `${PLATFORM_URL}/workspaces/${workspaceId}/chat/download?path=${encodeURIComponent(containerPath)}`;
   }
   return uri;
+}
+
+/** Returns true when the URI points at a platform-side resource that
+ *  requires our auth headers — caller should route through
+ *  downloadChatFile rather than letting the browser navigate. */
+export function isPlatformAttachment(uri: string): boolean {
+  if (uri.startsWith("platform-pending:")) return true;
+  return normalizeWorkspaceUri(uri) !== null;
 }
 
 /** Extracts the absolute container path from a workspace-scoped URI,
@@ -96,8 +135,7 @@ export async function downloadChatFile(
   attachment: ChatAttachment,
 ): Promise<void> {
   const href = resolveAttachmentHref(workspaceId, attachment.uri);
-  const isContainerPath = normalizeWorkspaceUri(attachment.uri) !== null;
-  if (!isContainerPath) {
+  if (!isPlatformAttachment(attachment.uri)) {
     // External URL — let the browser navigate. Opens in new tab so
     // the canvas context survives a navigation. `href` here is the
     // raw URI (http(s), or anything else the agent sent back).
