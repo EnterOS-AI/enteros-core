@@ -808,6 +808,92 @@ func TestResumeHandler_UsesProvisionWorkspaceAuto(t *testing.T) {
 	}
 }
 
+// TestProvisionWorkspaceAutoSync_RoutesToCPWhenSet — sync variant of the
+// provision dispatcher used by runRestartCycle. CP path runs synchronously
+// (no goroutine wrapper). Verified via the same trackingCPProv stub as
+// the async tests; the absence of `go` semantics is the load-bearing
+// distinction we're pinning.
+func TestProvisionWorkspaceAutoSync_RoutesToCPWhenSet(t *testing.T) {
+	mock := setupTestDB(t)
+	mock.MatchExpectationsInOrder(false)
+	// provisionWorkspaceCP runs prepareProvisionContext synchronously, which
+	// hits secrets selects + the markProvisionFailed UPDATE when CP.Start
+	// returns an error. We allow these calls without strictly asserting
+	// counts — the goal here is to assert the routing branch was taken.
+	mock.ExpectQuery(`SELECT key, encrypted_value, encryption_version FROM global_secrets`).
+		WillReturnRows(sqlmock.NewRows([]string{"key", "encrypted_value", "encryption_version"}))
+	mock.ExpectQuery(`SELECT key, encrypted_value, encryption_version FROM workspace_secrets`).
+		WithArgs(sqlmock.AnyArg()).
+		WillReturnRows(sqlmock.NewRows([]string{"key", "encrypted_value", "encryption_version"}))
+	mock.ExpectExec(`UPDATE workspaces SET status =`).
+		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	rec := &trackingCPProv{startErr: errors.New("simulated CP rejection")}
+	bcast := &concurrentSafeBroadcaster{}
+	h := NewWorkspaceHandler(bcast, nil, "http://localhost:8080", t.TempDir())
+	h.SetCPProvisioner(rec)
+
+	wsID := "ws-sync-routes-cp"
+	ok := h.provisionWorkspaceAutoSync(wsID, "", nil, models.CreateWorkspacePayload{
+		Name: "sync-test", Tier: 1, Runtime: "claude-code",
+	})
+	if !ok {
+		t.Fatalf("expected provisionWorkspaceAutoSync to return true with CP wired")
+	}
+	// Synchronous: the call returns AFTER cpProv.Start has been invoked.
+	// No deadline-poll loop needed.
+	got := rec.startedSnapshot()
+	if len(got) != 1 || got[0] != wsID {
+		t.Errorf("expected cpProv.Start invoked once with %q, got %v", wsID, got)
+	}
+}
+
+// TestProvisionWorkspaceAutoSync_NoBackendMarksFailed — sync variant
+// uses the same no-backend fallback as the async dispatcher: returns
+// false + marks failed. Pinning this so the two helpers stay
+// behaviorally identical except for the goroutine wrapper.
+func TestProvisionWorkspaceAutoSync_NoBackendMarksFailed(t *testing.T) {
+	mock := setupTestDB(t)
+	mock.MatchExpectationsInOrder(false)
+	mock.ExpectExec(`UPDATE workspaces SET status =`).
+		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	bcast := &concurrentSafeBroadcaster{}
+	h := NewWorkspaceHandler(bcast, nil, "http://localhost:8080", t.TempDir())
+
+	ok := h.provisionWorkspaceAutoSync("ws-sync-noback", "", nil, models.CreateWorkspacePayload{
+		Name: "sync-test", Tier: 1, Runtime: "claude-code",
+	})
+	if ok {
+		t.Fatalf("expected provisionWorkspaceAutoSync to return false with no backend wired")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("expected markProvisionFailed UPDATE to fire on no-backend path: %v", err)
+	}
+}
+
+// TestRunRestartCycle_UsesProvisionWorkspaceAutoSync — source-level pin
+// that runRestartCycle (Site 4) routes through the sync dispatcher
+// instead of inlining the if-cpProv-else dispatch. Phase 2 PR-B of
+// #2799 migrated this site.
+func TestRunRestartCycle_UsesProvisionWorkspaceAutoSync(t *testing.T) {
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	src, err := os.ReadFile(filepath.Join(wd, "workspace_restart.go"))
+	if err != nil {
+		t.Fatalf("read workspace_restart.go: %v", err)
+	}
+	stripped := stripGoComments(src)
+	if !bytes.Contains(stripped, []byte("h.provisionWorkspaceAutoSync(workspaceID")) {
+		t.Errorf("workspace_restart.go must call provisionWorkspaceAutoSync from runRestartCycle — current code does not. " +
+			"Phase 2 PR-B of #2799 migrated this site; do not regress to the inline if-cpProv-else dispatch.")
+	}
+}
+
 // stripGoComments removes // line comments and /* */ block comments
 // from Go source. Imperfect (doesn't handle comments-inside-strings)
 // but adequate for the source-level pin tests in this file — none of
