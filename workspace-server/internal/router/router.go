@@ -433,6 +433,15 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		r.POST("/admin/a2a-queue/drop-stale", middleware.AdminAuth(db.DB), qH.DropStale)
 	}
 
+	// Admin — RFC #2829 PR-4 dashboard endpoints over the durable
+	// `delegations` ledger (PR-1 schema). Operators triage in-flight,
+	// stuck, or failed delegations without direct DB access.
+	{
+		adH := handlers.NewAdminDelegationsHandler(db.DB)
+		r.GET("/admin/delegations", middleware.AdminAuth(db.DB), adH.List)
+		r.GET("/admin/delegations/stats", middleware.AdminAuth(db.DB), adH.Stats)
+	}
+
 	// Admin — workspace template image refresh. Pulls latest images from GHCR
 	// and recreates running ws-* containers so they adopt the new image.
 	// Final step of the runtime CD chain — see docs/workspace-runtime-package.md.
