@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
@@ -12,6 +13,68 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
+
+// delegationResultInboxPushEnabled gates the RFC #2829 PR-2 result-push
+// behavior: when callee POSTs `status=completed` (or `failed`) via
+// /workspaces/:id/delegations/:delegation_id/update, ALSO write an
+// `activity_type='a2a_receive'` row to the caller's activity_logs.
+//
+// Why a flag: the caller's inbox poller (workspace/inbox.py) queries
+// `?type=a2a_receive` to surface inbound messages to the agent. Adding
+// a2a_receive rows for delegation results is the universal-sized fix for
+// the 600s message/send timeout class — long-running delegations no
+// longer rely on the proxy holding the HTTP connection open. But it is
+// observable behavior change (existing agents start seeing delegation
+// results in their inbox where they didn't before), so we flag it for
+// staging burn-in before flipping default.
+//
+// Default: off. Staging-canary first; flip to on after RFC #2829 PR-3
+// (agent-side cutover) lands and proves the round-trip end-to-end.
+func delegationResultInboxPushEnabled() bool {
+	return os.Getenv("DELEGATION_RESULT_INBOX_PUSH") == "1"
+}
+
+// pushDelegationResultToInbox writes the inbox-visible row for a
+// completed/failed delegation. Best-effort: a failure logs but does NOT
+// fail the parent UpdateStatus — the existing delegate_result row in
+// activity_logs is still authoritative for the dashboard.
+//
+// Caller (sourceID) is the workspace that initiated the delegation; the
+// inbox row lands in their activity_logs so wait_for_message picks it up.
+//
+// Body shape mirrors a2a_receive rows produced by the proxy on a
+// successful synchronous reply: response_body.text carries the agent's
+// answer, request_body.delegation_id correlates back to the originating
+// row.
+func pushDelegationResultToInbox(ctx context.Context, sourceID, delegationID, status, responsePreview, errorDetail string) {
+	if !delegationResultInboxPushEnabled() {
+		return
+	}
+	respPayload := map[string]interface{}{
+		"text":          responsePreview,
+		"delegation_id": delegationID,
+	}
+	respJSON, _ := json.Marshal(respPayload)
+	reqJSON, _ := json.Marshal(map[string]interface{}{
+		"delegation_id": delegationID,
+	})
+	logStatus := "ok"
+	if status == "failed" {
+		logStatus = "error"
+	}
+	summary := "Delegation result delivered"
+	if status == "failed" {
+		summary = "Delegation failed"
+	}
+	if _, err := db.DB.ExecContext(ctx, `
+		INSERT INTO activity_logs (
+			workspace_id, activity_type, method, source_id,
+			summary, request_body, response_body, status, error_detail
+		) VALUES ($1, 'a2a_receive', 'delegate_result', $2, $3, $4::jsonb, $5::jsonb, $6, NULLIF($7, ''))
+	`, sourceID, sourceID, summary, string(reqJSON), string(respJSON), logStatus, errorDetail); err != nil {
+		log.Printf("Delegation %s: inbox-push insert failed: %v", delegationID, err)
+	}
+}
 
 // Delegation status lifecycle:
 //   pending → dispatched → received → in_progress → completed | failed
@@ -206,6 +269,9 @@ func insertDelegationRow(ctx context.Context, c *gin.Context, sourceID string, b
 		VALUES ($1, 'delegation', 'delegate', $2, $3, $4, $5::jsonb, 'pending', $6)
 	`, sourceID, sourceID, body.TargetID, "Delegating to "+body.TargetID, string(taskJSON), idemArg)
 	if err == nil {
+		// RFC #2829 #318 — mirror to the durable delegations ledger
+		// (gated by DELEGATION_LEDGER_WRITE; default off → no-op).
+		recordLedgerInsert(ctx, sourceID, body.TargetID, delegationID, body.Task, body.IdempotencyKey)
 		return insertOK
 	}
 	// A unique-constraint hit means a concurrent request just took the
@@ -289,6 +355,8 @@ func (h *DelegationHandler) executeDelegation(sourceID, targetID, delegationID s
 		h.broadcaster.RecordAndBroadcast(ctx, "DELEGATION_FAILED", sourceID, map[string]interface{}{
 			"delegation_id": delegationID, "target_id": targetID, "error": proxyErr.Error(),
 		})
+		// RFC #2829 PR-2 result-push (see UpdateStatus for rationale).
+		pushDelegationResultToInbox(ctx, sourceID, delegationID, "failed", "", proxyErr.Error())
 		return
 	}
 
@@ -343,17 +411,28 @@ func (h *DelegationHandler) executeDelegation(sourceID, targetID, delegationID s
 		log.Printf("Delegation %s: failed to insert success log: %v", delegationID, err)
 	}
 
+	// RFC #2829 #318: write the ledger row with result_preview FIRST,
+	// THEN updateDelegationStatus. Order matters: SetStatus has a
+	// same-status replay no-op — if updateDelegationStatus's nested
+	// recordLedgerStatus(completed, "", "") fires first, the outer call
+	// hits the no-op branch and result_preview is never written.
+	// Caught by the local-Postgres integration test in
+	// delegation_ledger_integration_test.go.
+	recordLedgerStatus(ctx, delegationID, "completed", "", responseText)
 	h.updateDelegationStatus(sourceID, delegationID, "completed", "")
 	h.broadcaster.RecordAndBroadcast(ctx, "DELEGATION_COMPLETE", sourceID, map[string]interface{}{
 		"delegation_id":    delegationID,
 		"target_id":        targetID,
 		"response_preview": truncate(responseText, 200),
 	})
+	// RFC #2829 PR-2 result-push (see UpdateStatus for rationale).
+	pushDelegationResultToInbox(ctx, sourceID, delegationID, "completed", responseText, "")
 }
 
 // updateDelegationStatus updates the status of a delegation record in activity_logs.
 func (h *DelegationHandler) updateDelegationStatus(workspaceID, delegationID, status, errorDetail string) {
-	if _, err := db.DB.ExecContext(context.Background(), `
+	ctx := context.Background()
+	if _, err := db.DB.ExecContext(ctx, `
 		UPDATE activity_logs
 		SET status = $1, error_detail = CASE WHEN $2 = '' THEN error_detail ELSE $2 END
 		WHERE workspace_id = $3
@@ -361,6 +440,14 @@ func (h *DelegationHandler) updateDelegationStatus(workspaceID, delegationID, st
 		  AND request_body->>'delegation_id' = $4
 	`, status, errorDetail, workspaceID, delegationID); err != nil {
 		log.Printf("Delegation %s: status update failed: %v", delegationID, err)
+	}
+	// RFC #2829 #318 — mirror status transition to the durable ledger
+	// (gated). Note: the ledger uses different vocabulary for "pending"
+	// (its initial state is `queued`); map "received" / unknown values
+	// the ledger doesn't accept by skipping them rather than failing.
+	switch status {
+	case "queued", "dispatched", "in_progress", "completed", "failed", "stuck":
+		recordLedgerStatus(ctx, delegationID, status, errorDetail, "")
 	}
 }
 
@@ -407,6 +494,15 @@ func (h *DelegationHandler) Record(c *gin.Context) {
 		return
 	}
 
+	// RFC #2829 #318 — mirror to durable ledger (gated). Record always
+	// reflects an A2A request the agent already fired itself, so the
+	// initial activity_logs status is 'dispatched' — but the ledger's
+	// CHECK constraint only accepts 'queued' as the initial state via
+	// Insert. Insert as queued first; the very next SetStatus(...,
+	// dispatched) below promotes it to dispatched on the same row.
+	recordLedgerInsert(ctx, sourceID, body.TargetID, body.DelegationID, body.Task, "")
+	recordLedgerStatus(ctx, body.DelegationID, "dispatched", "", "")
+
 	h.broadcaster.RecordAndBroadcast(ctx, "DELEGATION_SENT", sourceID, map[string]interface{}{
 		"delegation_id": body.DelegationID,
 		"target_id":     body.TargetID,
@@ -442,6 +538,13 @@ func (h *DelegationHandler) UpdateStatus(c *gin.Context) {
 		return
 	}
 
+	// RFC #2829 #318 — same ordering pin as executeDelegation completion:
+	// write the with-preview ledger row FIRST so updateDelegationStatus's
+	// inner same-status no-op doesn't clobber preview.
+	if body.Status == "completed" {
+		recordLedgerStatus(ctx, delegationID, "completed", "", body.ResponsePreview)
+	}
+
 	h.updateDelegationStatus(sourceID, delegationID, body.Status, body.Error)
 
 	if body.Status == "completed" {
@@ -459,11 +562,19 @@ func (h *DelegationHandler) UpdateStatus(c *gin.Context) {
 			"delegation_id":    delegationID,
 			"response_preview": truncate(body.ResponsePreview, 200),
 		})
+		// RFC #2829 PR-2 result-push: when the gate is on, also write an
+		// a2a_receive row so the caller's inbox poller surfaces this to
+		// the agent. Foundational for getting rid of the proxy-blocked
+		// sync path that hits the 600s message/send timeout — once the
+		// agent-side cutover lands, the caller polls its own inbox for
+		// the result instead of holding open an HTTP connection.
+		pushDelegationResultToInbox(ctx, sourceID, delegationID, "completed", body.ResponsePreview, "")
 	} else {
 		h.broadcaster.RecordAndBroadcast(ctx, "DELEGATION_FAILED", sourceID, map[string]interface{}{
 			"delegation_id": delegationID,
 			"error":         body.Error,
 		})
+		pushDelegationResultToInbox(ctx, sourceID, delegationID, "failed", "", body.Error)
 	}
 
 	c.JSON(http.StatusOK, gin.H{"status": body.Status, "delegation_id": delegationID})

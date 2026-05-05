@@ -112,63 +112,6 @@ func (h *WorkspaceHandler) SetCPProvisioner(cp provisioner.CPProvisionerAPI) {
 	h.cpProv = cp
 }
 
-// HasProvisioner reports whether either backend (CP or local Docker) is
-// wired. Callers that gate prep-work on "do we have something that can
-// provision a container?" should use this rather than direct field access
-// to either provisioner — those individual checks miss the SaaS path
-// (cpProv set, provisioner nil) or the self-hosted path (provisioner set,
-// cpProv nil) symmetrically. Org-import + future bulk paths gate their
-// template/config/secret prep on this so the work isn't wasted on
-// deployments where no backend is available.
-func (h *WorkspaceHandler) HasProvisioner() bool {
-	return h.cpProv != nil || h.provisioner != nil
-}
-
-// provisionWorkspaceAuto picks the backend (CP for SaaS, local Docker
-// for self-hosted) and starts provisioning in a goroutine. Returns true
-// when a backend was kicked off, false when neither is wired.
-//
-// Single source of truth for "start provisioning a workspace" across
-// every caller (Create, OrgHandler.createWorkspaceTree, TeamHandler.Expand,
-// future paths). Centralized routing here means callers don't repeat
-// the "Docker vs CP" decision and can't drift on it.
-//
-// Self-marks-failed on the no-backend path: pre-2026-05-05 the false
-// return was silent, and any caller that forgot to handle it (TeamHandler
-// pre-#2367, OrgHandler.createWorkspaceTree pre-this-fix) silently
-// dropped workspaces — they sat in 'provisioning' for 10 min until the
-// sweeper marked them failed with the misleading "container started but
-// never called /registry/register" message. Marking failed inside Auto
-// closes that class: even if a future caller bypasses HasProvisioner
-// gating or ignores the bool return, the workspace ends in a clean
-// failed state with an actionable error message.
-//
-// Architectural principle: templates own runtime/config/prompts/files/
-// plugins; the platform owns where it runs. Anything that picks
-// between CP and local Docker belongs in this one helper. Anything
-// post-routing-but-pre-Start (mint secrets, render template, etc.)
-// lives in prepareProvisionContext (shared by both per-backend
-// goroutines).
-func (h *WorkspaceHandler) provisionWorkspaceAuto(workspaceID, templatePath string, configFiles map[string][]byte, payload models.CreateWorkspacePayload) bool {
-	if h.cpProv != nil {
-		go h.provisionWorkspaceCP(workspaceID, templatePath, configFiles, payload)
-		return true
-	}
-	if h.provisioner != nil {
-		go h.provisionWorkspace(workspaceID, templatePath, configFiles, payload)
-		return true
-	}
-	// No backend wired — mark failed so the workspace doesn't linger in
-	// 'provisioning' for the full 10-minute sweep window. 10s is enough
-	// for the broadcast + single UPDATE inside markProvisionFailed.
-	log.Printf("provisionWorkspaceAuto: no provisioning backend wired for %s — marking failed (cpProv=nil, provisioner=nil)", workspaceID)
-	failCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	h.markProvisionFailed(failCtx, workspaceID,
-		"no provisioning backend available — workspace requires either a Docker daemon (self-hosted) or control-plane provisioner (SaaS)",
-		nil)
-	return false
-}
 
 // SetEnvMutators wires a provisionhook.Registry into the handler. Plugins
 // living in separate repos register on the same Registry instance during
@@ -458,8 +401,8 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 			if tokErr != nil {
 				log.Printf("External workspace %s: token issuance failed: %v", id, tokErr)
 				// Non-fatal — the workspace row still exists; the
-				// operator can call POST /workspaces/:id/tokens later
-				// to mint one. Return a 201 with a hint instead of
+				// operator can call POST /workspaces/:id/external/rotate
+				// later to recover. Return a 201 with a hint instead of
 				// 500'ing a partial-success write.
 			} else {
 				connectionToken = tok
@@ -479,91 +422,16 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 		} else {
 			resp["status"] = "awaiting_agent"
 			// Connection snippet payload. Returned ONCE on create —
-			// the token is not recoverable from any later read. UI
-			// is responsible for surfacing this in a copy-paste modal.
-			platformURL := strings.TrimSuffix(externalPlatformURL(c), "/")
-			resp["connection"] = gin.H{
-				"workspace_id": id,
-				"platform_url": platformURL,
-				"auth_token":   connectionToken, // may be "" if IssueToken failed above
-				"registry_endpoint": platformURL + "/registry/register",
-				"heartbeat_endpoint": platformURL + "/registry/heartbeat",
-				// Pre-formatted snippet that a non-Go operator can
-				// paste verbatim. curl-based so there's no SDK
-				// install dependency. The external agent only
-				// needs to replace $AGENT_URL with its own public URL.
-				"curl_register_template": strings.ReplaceAll(
-					strings.ReplaceAll(externalCurlTemplate,
-						"{{PLATFORM_URL}}", platformURL),
-					"{{WORKSPACE_ID}}", id,
-				),
-				// Python/SDK snippet. molecule-sdk-python PR #13
-				// shipped A2AServer + RemoteAgentClient specifically
-				// for this flow. The SDK is not yet on PyPI — the
-				// snippet pins @main until we cut a release.
-				"python_snippet": strings.ReplaceAll(
-					strings.ReplaceAll(externalPythonTemplate,
-						"{{PLATFORM_URL}}", platformURL),
-					"{{WORKSPACE_ID}}", id,
-				),
-				// Claude Code channel plugin snippet. For operators
-				// whose external agent IS a Claude Code session —
-				// the snippet sets up ~/.claude/channels/molecule/.env
-				// and points at the canonical first-party plugin at
-				// github.com/Molecule-AI/molecule-mcp-claude-channel.
-				// Polling-based; no tunnel needed.
-				"claude_code_channel_snippet": strings.ReplaceAll(
-					strings.ReplaceAll(externalChannelTemplate,
-						"{{PLATFORM_URL}}", platformURL),
-					"{{WORKSPACE_ID}}", id,
-				),
-				// Universal MCP snippet — runtime-agnostic outbound
-				// tool path via the molecule-mcp console script. Same
-				// 8 platform tools any MCP-aware runtime can register
-				// (Claude Code, hermes, codex, etc.). Outbound-only:
-				// the snippet calls out that heartbeat/inbound need
-				// pairing with the SDK or channel tab.
-				"universal_mcp_snippet": strings.ReplaceAll(
-					strings.ReplaceAll(externalUniversalMcpTemplate,
-						"{{PLATFORM_URL}}", platformURL),
-					"{{WORKSPACE_ID}}", id,
-				),
-				// Hermes channel snippet — for operators whose external
-				// agent IS a hermes-agent session. Routes A2A traffic
-				// into the hermes gateway via the molecule-channel
-				// plugin (Molecule-AI/hermes-channel-molecule). Long-
-				// poll based (no tunnel) — same UX as the Claude Code
-				// channel tab. Gives hermes true push parity with the
-				// other runtime templates.
-				"hermes_channel_snippet": strings.ReplaceAll(
-					strings.ReplaceAll(externalHermesChannelTemplate,
-						"{{PLATFORM_URL}}", platformURL),
-					"{{WORKSPACE_ID}}", id,
-				),
-				// Codex MCP config snippet — for operators whose
-				// external agent is a codex CLI (@openai/codex)
-				// session. Wires the molecule MCP server into
-				// ~/.codex/config.toml. Outbound-tools-only today;
-				// codex's MCP client doesn't route arbitrary
-				// notifications/* so push parity needs a separate
-				// bridge daemon (future work).
-				"codex_snippet": strings.ReplaceAll(
-					strings.ReplaceAll(externalCodexTemplate,
-						"{{PLATFORM_URL}}", platformURL),
-					"{{WORKSPACE_ID}}", id,
-				),
-				// OpenClaw MCP config snippet — for operators whose
-				// external agent is an openclaw session. Wires the
-				// molecule MCP server via `openclaw mcp set` + starts
-				// the gateway on loopback. Outbound-tools-only today;
-				// full push parity needs a sessions.steer bridge
-				// daemon (future work).
-				"openclaw_snippet": strings.ReplaceAll(
-					strings.ReplaceAll(externalOpenClawTemplate,
-						"{{PLATFORM_URL}}", platformURL),
-					"{{WORKSPACE_ID}}", id,
-				),
-			}
+			// the token is not recoverable from any later read.
+			//
+			// Payload assembly + per-snippet template stamping lives
+			// in BuildExternalConnectionPayload (external_connection.go)
+			// so the rotate + re-show endpoints emit byte-identical
+			// shape. Adding a new snippet means adding it once there;
+			// all three callers pick it up automatically.
+			resp["connection"] = BuildExternalConnectionPayload(
+				externalPlatformURL(c), id, connectionToken,
+			)
 		}
 		c.JSON(http.StatusCreated, resp)
 		return
