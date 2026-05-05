@@ -170,6 +170,38 @@ func (h *WorkspaceHandler) provisionWorkspaceAuto(workspaceID, templatePath stri
 	return false
 }
 
+// provisionWorkspaceAutoSync is the synchronous variant of
+// provisionWorkspaceAuto — it BLOCKS in the current goroutine until the
+// per-backend provision body returns, instead of spawning a goroutine.
+//
+// Used by callers that need to coordinate stop+provision as a pair and
+// can't return until provision is done — today that's runRestartCycle
+// (auto-restart cycle's pending-flag loop relies on synchronous return
+// to know when it's safe to start the next cycle without racing the
+// in-flight provision goroutine on the next iteration's Stop call).
+//
+// Backend selection + no-backend fallback are identical to
+// provisionWorkspaceAuto. The only difference is the goroutine wrapper.
+// Keep these two helpers in sync — when one grows a new arm (third
+// backend, retry semantics), the other should too.
+func (h *WorkspaceHandler) provisionWorkspaceAutoSync(workspaceID, templatePath string, configFiles map[string][]byte, payload models.CreateWorkspacePayload) bool {
+	if h.cpProv != nil {
+		h.provisionWorkspaceCP(workspaceID, templatePath, configFiles, payload)
+		return true
+	}
+	if h.provisioner != nil {
+		h.provisionWorkspace(workspaceID, templatePath, configFiles, payload)
+		return true
+	}
+	log.Printf("provisionWorkspaceAutoSync: no provisioning backend wired for %s — marking failed (cpProv=nil, provisioner=nil)", workspaceID)
+	failCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	h.markProvisionFailed(failCtx, workspaceID,
+		"no provisioning backend available — workspace requires either a Docker daemon (self-hosted) or control-plane provisioner (SaaS)",
+		nil)
+	return false
+}
+
 // StopWorkspaceAuto picks the backend (CP for SaaS, local Docker for
 // self-hosted) and stops the workspace synchronously. Returns nil when
 // neither backend is wired (a workspace nobody is running can't be

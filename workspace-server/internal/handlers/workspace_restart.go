@@ -553,24 +553,22 @@ func (h *WorkspaceHandler) runRestartCycle(workspaceID string) {
 	restartData := loadRestartContextData(ctx, workspaceID)
 
 	// On auto-restart, do NOT re-apply templates — preserve existing config volume.
-	// SYNCHRONOUS provisionWorkspace: returns when the new container is up
-	// (or has failed). The outer loop relies on this to know when it's safe
-	// to start another restart cycle without racing this one's Stop call.
+	// provisionWorkspaceAutoSync is the SYNCHRONOUS dispatcher (mirrors
+	// provisionWorkspaceAuto but blocks instead of spawning a goroutine):
+	// returns when the new container is up (or has failed). The outer
+	// pending-flag loop in RestartByID relies on this to know when it's
+	// safe to start another restart cycle without racing this one's
+	// Stop call.
 	//
-	// Branch on which provisioner is wired — same dispatch as the other call
-	// sites in this package (workspace.go:431-433, workspace_restart.go:197+596).
-	// Pre-fix this only called the Docker variant, so on SaaS the auto-restart
-	// cycle would NPE inside provisionWorkspace's `h.provisioner.VolumeHasFile`
-	// call, get swallowed by coalesceRestart's recover()-without-re-raise (a
-	// platform-stability safeguard), and leave the workspace permanently
-	// stuck in status='provisioning' (the UPDATE above already ran). User-
-	// observable result before this fix on SaaS: dead workspace → manual
-	// canvas restart was the only recovery path.
-	if h.cpProv != nil {
-		h.provisionWorkspaceCP(workspaceID, "", nil, payload)
-	} else {
-		h.provisionWorkspace(workspaceID, "", nil, payload)
-	}
+	// Pre-2026-05-05 this site inlined the if-cpProv-else dispatch. On
+	// SaaS the cycle would NPE inside provisionWorkspace's
+	// `h.provisioner.VolumeHasFile` call, get swallowed by
+	// coalesceRestart's recover()-without-re-raise (a platform-stability
+	// safeguard), and leave the workspace permanently stuck in
+	// status='provisioning' (the UPDATE above already ran). User-
+	// observable result on SaaS pre-fix: dead workspace → manual canvas
+	// restart was the only recovery path.
+	h.provisionWorkspaceAutoSync(workspaceID, "", nil, payload)
 	// sendRestartContext is a one-way notification to the new container; safe
 	// to fire async — the next restart cycle won't depend on it completing.
 	go h.sendRestartContext(workspaceID, restartData)
