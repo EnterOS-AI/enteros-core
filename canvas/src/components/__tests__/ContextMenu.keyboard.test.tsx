@@ -240,7 +240,11 @@ describe("ContextMenu — keyboard accessibility", () => {
     render(<ContextMenu />);
     const items = screen.getAllByRole("menuitem");
     const labels = items.map((el) => el.textContent?.trim() ?? "");
-    expect(labels).not.toContain(expect.stringMatching(/Expand to Team/));
+    // Literal absence — vitest's toContain uses Object.is/===, so the
+    // earlier `.not.toContain(expect.stringMatching(...))` shape passed
+    // for ANY string array (asymmetric matchers only work with toEqual /
+    // arrayContaining). Pin the production string verbatim.
+    expect(labels.some((l) => l.includes("Expand to Team"))).toBe(false);
     // Sanity: childless menu still has the regular actions.
     expect(labels.some((l) => l.includes("Delete"))).toBe(true);
     expect(labels.some((l) => l.includes("Restart"))).toBe(true);
