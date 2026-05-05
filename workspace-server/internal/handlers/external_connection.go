@@ -289,35 +289,35 @@ hermes gateway --replace
 // externalCodexTemplate — for operators whose external agent is a
 // codex CLI (@openai/codex) session. Wires the molecule_runtime A2A
 // MCP server into codex's config.toml so the agent can call
-// list_peers / delegate_task / send_message_to_user / commit_memory.
+// list_peers / delegate_task / send_message_to_user / commit_memory,
+// AND surfaces the codex-channel-molecule bridge daemon for inbound
+// push parity.
 //
-// Push parity caveat: codex's MCP client doesn't forward arbitrary
-// notifications/* from configured MCP servers (verified by reading
-// codex-rs/codex-mcp/src/connection_manager.rs in openai/codex). So
-// this snippet gives outbound tools but NOT mid-turn push from
-// inbound A2A. For full push parity on a codex external, the
-// equivalent of hermes-channel-molecule would be needed — a bridge
-// daemon that long-polls the platform inbox and calls codex's
-// turn/steer RPC. Tracked separately; this snippet is the
-// outbound-tool-only first cut.
-const externalCodexTemplate = `# Codex MCP config — outbound tool path. For operators whose external
-# agent is a codex CLI (@openai/codex) session.
-#
-# This wires the molecule platform's A2A MCP server into codex so
-# the agent can call list_peers / delegate_task / send_message_to_user
-# / commit_memory. Inbound A2A (canvas messages, peer-initiated tasks)
-# does NOT push into the running codex turn yet — codex's MCP runtime
-# doesn't route arbitrary notifications/* from configured MCP servers.
-# For inbound delivery into a codex session, pair with the Python SDK
-# tab for now.
+// Push parity:
+//   - Outbound (codex calls platform tools) — works via the wired
+//     MCP server (step 2 below).
+//   - Inbound (canvas messages and peer-initiated tasks wake the
+//     codex agent) — works via codex-channel-molecule (step 3),
+//     which long-polls the platform inbox and runs `codex exec
+//     --resume <session>` per inbound message. Each turn is a fresh
+//     subprocess but per-thread session continuity is preserved on
+//     disk so conversation context survives.
+//
+// Long-term: when openai/codex#17543 lands (codex MCP runtime routes
+// inbound notifications/* into the active session as Op::UserInput),
+// the bridge daemon becomes redundant — the wired MCP server in
+// step 2 will deliver push natively. Until then, run both.
+const externalCodexTemplate = `# Codex external setup — outbound tools (MCP) + inbound push (bridge).
+# For operators whose external agent is a codex CLI (@openai/codex)
+# session.
 
-# 1. Install codex CLI + the workspace runtime wheel:
+# 1. Install codex CLI, the workspace runtime, and the bridge daemon:
 npm install -g @openai/codex@^0.57
-pip install molecule-ai-workspace-runtime
+pip install molecule-ai-workspace-runtime codex-channel-molecule
 
-# 2. Edit ~/.codex/config.toml and add the block below. {{PLATFORM_URL}}
-#    and {{WORKSPACE_ID}} are stamped server-side; paste your auth
-#    token for MOLECULE_WORKSPACE_TOKEN before saving.
+# 2. Wire the molecule MCP server into codex's config.toml — this is
+#    the OUTBOUND path (codex calls list_peers / delegate_task /
+#    send_message_to_user / commit_memory).
 #
 #    Don't append blindly — TOML rejects duplicate
 #    [mcp_servers.molecule] tables, so re-running on an existing
@@ -338,7 +338,31 @@ mkdir -p ~/.codex
 # PLATFORM_URL = "{{PLATFORM_URL}}"
 # MOLECULE_WORKSPACE_TOKEN = "<paste from create response>"
 
-# 3. Run codex — the molecule tools are now available to the agent:
+# 3. Run the bridge daemon as a durable background process — this
+#    is the INBOUND path. Long-polls the platform inbox and runs
+#    "codex exec --resume <session>" per inbound canvas/peer message,
+#    routes the assistant reply back via send_message_to_user /
+#    delegate_task. Per-thread session continuity persisted to
+#    ~/.codex-channel-molecule/sessions.json so conversation context
+#    survives daemon restarts.
+#
+#    Same env-var contract as the MCP server above.
+#
+#    Without this daemon, codex still works for outbound calls but
+#    canvas messages won't wake an idle session — codex's MCP runtime
+#    doesn't yet route notifications/* into the chat loop (tracked
+#    upstream at openai/codex#17543; when that lands, the bridge
+#    becomes redundant).
+
+WORKSPACE_ID="{{WORKSPACE_ID}}" \
+PLATFORM_URL="{{PLATFORM_URL}}" \
+MOLECULE_WORKSPACE_TOKEN="<paste from create response>" \
+nohup codex-channel-molecule > ~/.codex-channel-molecule/daemon.log 2>&1 &
+disown
+
+# 4. Run codex itself for interactive use — molecule tools are
+#    available to the agent, and the bridge wakes a non-interactive
+#    codex turn for any inbound canvas/peer message:
 codex
 `
 
