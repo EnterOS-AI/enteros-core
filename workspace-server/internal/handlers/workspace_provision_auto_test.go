@@ -607,6 +607,151 @@ func TestNoCallSiteCallsBareStop(t *testing.T) {
 	}
 }
 
+// TestRestartWorkspaceAuto_RoutesToCPWhenSet — third dispatcher, same
+// drift-class shape as the other two. SaaS path goes through CP with
+// retry semantics. The cpStopWithRetry retry loop fires before
+// provision spawns; this test asserts cpProv.Stop was invoked at
+// least once with the workspace ID (we can't assert exact retry
+// count without mocking out the retry helper itself, which would
+// invert the test contract — the retry IS the dispatcher's job here).
+func TestRestartWorkspaceAuto_RoutesToCPWhenSet(t *testing.T) {
+	rec := &trackingCPProv{}
+	bcast := &concurrentSafeBroadcaster{}
+	h := NewWorkspaceHandler(bcast, nil, "http://localhost:8080", t.TempDir())
+	h.SetCPProvisioner(rec)
+
+	// Mock DB so cpStopWithRetry can run without a real Postgres.
+	mock := setupTestDB(t)
+	mock.MatchExpectationsInOrder(false)
+	// provisionWorkspaceCP runs in the goroutine and will hit secrets
+	// SELECTs + UPDATE workspace as failed (we make CP Start return
+	// an error to short-circuit the post-Start path).
+	mock.ExpectQuery(`SELECT key, encrypted_value, encryption_version FROM global_secrets`).
+		WillReturnRows(sqlmock.NewRows([]string{"key", "encrypted_value", "encryption_version"}))
+	mock.ExpectQuery(`SELECT key, encrypted_value, encryption_version FROM workspace_secrets`).
+		WithArgs(sqlmock.AnyArg()).
+		WillReturnRows(sqlmock.NewRows([]string{"key", "encrypted_value", "encryption_version"}))
+	mock.ExpectExec(`UPDATE workspaces SET status =`).
+		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	rec.startErr = errors.New("simulated CP rejection")
+
+	wsID := "ws-restart-routes-cp-0123456789ab"
+	ok := h.RestartWorkspaceAuto(context.Background(), wsID, "", nil, models.CreateWorkspacePayload{
+		Name: "restart-test", Tier: 1, Runtime: "claude-code",
+	})
+	if !ok {
+		t.Fatalf("expected RestartWorkspaceAuto to return true with CP wired")
+	}
+
+	// Wait for the goroutine to land. cpStopWithRetry runs synchronously
+	// before the provision goroutine fires; both call sites record into
+	// the tracking stub, so we expect at least one Stop and (eventually)
+	// at least one Start.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if len(rec.stoppedSnapshot()) > 0 && len(rec.startedSnapshot()) > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for cpProv.Stop + cpProv.Start; stopped=%v started=%v",
+				rec.stoppedSnapshot(), rec.startedSnapshot())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	stopped := rec.stoppedSnapshot()
+	if len(stopped) == 0 || stopped[0] != wsID {
+		t.Errorf("expected cpProv.Stop invoked with %q, got %v", wsID, stopped)
+	}
+	started := rec.startedSnapshot()
+	if len(started) == 0 || started[0] != wsID {
+		t.Errorf("expected cpProv.Start invoked with %q, got %v", wsID, started)
+	}
+}
+
+// TestRestartWorkspaceAuto_RoutesToDockerWhenOnlyDocker — self-hosted
+// path. Docker provisioner.Stop has no retry; this test only asserts
+// the dispatch order (Stop → spawn provision goroutine) without
+// stubbing the entire Docker provision pipeline.
+//
+// The spawned provision goroutine WILL panic in provisionWorkspaceOpts
+// (no real Docker daemon), be recovered by logProvisionPanic, and
+// attempt a markProvisionFailed UPDATE on the test DB. We pre-register
+// that expectation so the panic-recovery doesn't fail the test as a
+// "was not expected" call. We also wait for the goroutine to land
+// before the test body exits, so its db.DB writes don't leak into the
+// next test's sqlmock when tests run sequentially in the same package.
+func TestRestartWorkspaceAuto_RoutesToDockerWhenOnlyDocker(t *testing.T) {
+	mock := setupTestDB(t)
+	mock.MatchExpectationsInOrder(false)
+	// Allow up to 5 markProvisionFailed UPDATEs from the panic-recovered
+	// goroutine (it'll panic in provisionWorkspaceOpts since
+	// stoppingLocalProv.Start panics, then logProvisionPanic calls
+	// markProvisionFailed). Generous count so a slower CI runner
+	// doesn't trip on duplicate writes; we don't assert
+	// ExpectationsWereMet since the count is a runtime detail.
+	for i := 0; i < 5; i++ {
+		mock.ExpectExec(`UPDATE workspaces SET status =`).
+			WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+	}
+
+	bcast := &concurrentSafeBroadcaster{}
+	h := NewWorkspaceHandler(bcast, nil, "http://localhost:8080", t.TempDir())
+	stub := &stoppingLocalProv{}
+	h.provisioner = stub
+
+	wsID := "ws-restart-routes-docker"
+	ok := h.RestartWorkspaceAuto(context.Background(), wsID, "", nil, models.CreateWorkspacePayload{
+		Name: "restart-test", Tier: 1, Runtime: "claude-code",
+	})
+	if !ok {
+		t.Fatalf("expected RestartWorkspaceAuto to return true with Docker wired")
+	}
+
+	// Wait for the spawned goroutine to settle — it'll panic in
+	// provisionWorkspaceOpts (stoppingLocalProv.Start panics) and be
+	// recovered by logProvisionPanic. Without this wait, the goroutine
+	// outlives the test and writes to a sqlmock that the NEXT test
+	// owns, causing a `was not expected` race.
+	time.Sleep(200 * time.Millisecond)
+
+	// Stop call is synchronous on the Docker leg.
+	if len(stub.stopped) == 0 || stub.stopped[0] != wsID {
+		t.Errorf("expected provisioner.Stop invoked with %q, got %v", wsID, stub.stopped)
+	}
+}
+
+// TestRestartWorkspaceAuto_NoBackendMarksFailed — when neither backend
+// is wired, the dispatcher returns false AND marks the workspace
+// failed (defense in depth, mirroring provisionWorkspaceAuto). Distinct
+// from StopWorkspaceAuto's no-op-on-no-backend contract: Restart's
+// promise is "the workspace will be alive again" — failing silently
+// would strand the user with a stuck workspace and no error path.
+func TestRestartWorkspaceAuto_NoBackendMarksFailed(t *testing.T) {
+	mock := setupTestDB(t)
+	mock.MatchExpectationsInOrder(false)
+	mock.ExpectExec(`UPDATE workspaces SET status =`).
+		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	bcast := &concurrentSafeBroadcaster{}
+	h := NewWorkspaceHandler(bcast, nil, "http://localhost:8080", t.TempDir())
+	// Neither SetCPProvisioner nor a Docker provisioner — both nil.
+
+	ok := h.RestartWorkspaceAuto(context.Background(), "ws-restart-noback", "", nil, models.CreateWorkspacePayload{
+		Name: "restart-test", Tier: 1, Runtime: "claude-code",
+	})
+	if ok {
+		t.Fatalf("expected RestartWorkspaceAuto to return false with no backend wired")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("expected markProvisionFailed UPDATE to fire on no-backend path: %v", err)
+	}
+}
+
 // stripGoComments removes // line comments and /* */ block comments
 // from Go source. Imperfect (doesn't handle comments-inside-strings)
 // but adequate for the source-level pin tests in this file — none of
