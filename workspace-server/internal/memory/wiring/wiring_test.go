@@ -1,9 +1,12 @@
 package wiring
 
 import (
+	"bytes"
 	"context"
+	"log"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 
@@ -149,6 +152,84 @@ func TestNamespaceCleanupFn_PluginErrorDoesNotPanic(t *testing.T) {
 		}
 	}()
 	cleanup(context.Background(), "ws-1")
+}
+
+// captureLogs runs fn with log output captured into a buffer, returns the
+// captured text. Restores the prior log destination on exit.
+func captureLogs(t *testing.T, fn func()) string {
+	t.Helper()
+	var buf bytes.Buffer
+	prev := log.Writer()
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(prev) })
+	fn()
+	return buf.String()
+}
+
+// TestBuild_WarnsWhenCutoverWithoutPluginURL pins the silent-misconfig
+// guard: an operator who flips MEMORY_V2_CUTOVER=true without also
+// pointing MEMORY_PLUGIN_URL at a plugin server has just disabled the
+// cutover with no error visible. Without this WARN, the only signal
+// is "the legacy table is still being written to" — invisible to
+// every operator who doesn't explicitly check.
+func TestBuild_WarnsWhenCutoverWithoutPluginURL(t *testing.T) {
+	t.Setenv("MEMORY_V2_CUTOVER", "true")
+	t.Setenv("MEMORY_PLUGIN_URL", "")
+	out := captureLogs(t, func() {
+		if got := Build(nil); got != nil {
+			t.Errorf("expected nil bundle, got %+v", got)
+		}
+	})
+	if !strings.Contains(out, "MEMORY_V2_CUTOVER=true") || !strings.Contains(out, "MEMORY_PLUGIN_URL is unset") {
+		t.Errorf("expected loud WARN about half-configured cutover; got log:\n%s", out)
+	}
+}
+
+// TestBuild_NoWarnWhenNeitherSet pins the happy default: an operator
+// running without the v2 plugin should not see scary warnings.
+func TestBuild_NoWarnWhenNeitherSet(t *testing.T) {
+	t.Setenv("MEMORY_V2_CUTOVER", "")
+	t.Setenv("MEMORY_PLUGIN_URL", "")
+	out := captureLogs(t, func() { _ = Build(nil) })
+	if strings.Contains(out, "MEMORY_V2_CUTOVER") {
+		t.Errorf("expected no MEMORY_V2_CUTOVER warning when env is unset; got log:\n%s", out)
+	}
+}
+
+// TestBuild_LoudWarnWhenCutoverAndProbeFails pins the second
+// half-config case: cutover is on AND plugin URL is set, but the
+// /v1/health probe fails (server down or wrong URL). Without this
+// loud WARN, the operator sees only the generic "probe failed" line
+// that gets emitted even when cutover is OFF — hiding the fact that
+// real cutover writes will quietly fall back via circuit breaker.
+func TestBuild_LoudWarnWhenCutoverAndProbeFails(t *testing.T) {
+	t.Setenv("MEMORY_V2_CUTOVER", "true")
+	t.Setenv("MEMORY_PLUGIN_URL", "http://127.0.0.1:1") // bogus port
+	db, _, _ := sqlmock.New()
+	defer db.Close()
+	out := captureLogs(t, func() { _ = Build(db) })
+	if !strings.Contains(out, "MEMORY_V2_CUTOVER=true") || !strings.Contains(out, "probe failed") {
+		t.Errorf("expected loud WARN about cutover-with-failing-probe; got log:\n%s", out)
+	}
+}
+
+// TestBuild_QuietProbeFailWhenCutoverOff: the operator is in PRE-cutover
+// mode (plugin URL set, cutover off — they're warming up the plugin).
+// A failing probe in this state is not a misconfig — it should log the
+// generic message, NOT the loud cutover-specific one (so log noise
+// doesn't drown out real cutover misconfigs in dashboards).
+func TestBuild_QuietProbeFailWhenCutoverOff(t *testing.T) {
+	t.Setenv("MEMORY_V2_CUTOVER", "")
+	t.Setenv("MEMORY_PLUGIN_URL", "http://127.0.0.1:1")
+	db, _, _ := sqlmock.New()
+	defer db.Close()
+	out := captureLogs(t, func() { _ = Build(db) })
+	if strings.Contains(out, "MEMORY_V2_CUTOVER=true") {
+		t.Errorf("expected no cutover-specific warning when cutover is off; got log:\n%s", out)
+	}
+	if !strings.Contains(out, "probe failed") {
+		t.Errorf("expected generic probe-failed log; got log:\n%s", out)
+	}
 }
 
 func pathsAndMethods(paths, methods []string) []string {
