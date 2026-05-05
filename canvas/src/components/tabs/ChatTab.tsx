@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useRef, useEffect, useCallback } from "react";
+import { useState, useRef, useEffect, useCallback, useLayoutEffect } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { api } from "@/lib/api";
@@ -124,14 +124,43 @@ function extractReplyText(resp: A2AResponse): string {
 // doesn't). Single source of truth for file-part parsing across
 // live chat, activity log replay, and any future consumers.
 
+/** Initial chat history page size. The newest N messages are rendered
+ *  on first paint; older history is fetched on demand via loadOlder()
+ *  when the user scrolls the top sentinel into view. */
+const INITIAL_HISTORY_LIMIT = 10;
+/** Subsequent older-history batch size. Larger than INITIAL so a long
+ *  scroll-back doesn't fan out into many round-trips. */
+const OLDER_HISTORY_BATCH = 20;
+
 /**
  * Load chat history from the activity_logs database via the platform API.
  * Uses source=canvas to only get user-initiated messages (not agent-to-agent).
+ *
+ * Pagination:
+ *  - Pass `limit` to bound the page size (newest-first from server).
+ *  - Pass `beforeTs` (RFC3339) to fetch rows STRICTLY OLDER than that
+ *    timestamp. Combined with limit, this yields the next-older page
+ *    when scrolling backward through history.
+ *
+ * `reachedEnd` is true when the server returned fewer rows than asked
+ * for — caller uses this to disable further older-batch fetches.
+ * (Counts row-level returns, not chat-bubble count: each row may
+ * produce 1-2 bubbles.)
  */
-async function loadMessagesFromDB(workspaceId: string): Promise<{ messages: ChatMessage[]; error: string | null }> {
+async function loadMessagesFromDB(
+  workspaceId: string,
+  limit: number,
+  beforeTs?: string,
+): Promise<{ messages: ChatMessage[]; error: string | null; reachedEnd: boolean }> {
   try {
+    const params = new URLSearchParams({
+      type: "a2a_receive",
+      source: "canvas",
+      limit: String(limit),
+    });
+    if (beforeTs) params.set("before_ts", beforeTs);
     const activities = await api.get<ActivityRowForHydration[]>(
-      `/workspaces/${workspaceId}/activity?type=a2a_receive&source=canvas&limit=50`,
+      `/workspaces/${workspaceId}/activity?${params.toString()}`,
     );
 
     const messages: ChatMessage[] = [];
@@ -142,11 +171,12 @@ async function loadMessagesFromDB(workspaceId: string): Promise<{ messages: Chat
     for (const a of [...activities].reverse()) {
       messages.push(...activityRowToMessages(a, isInternalSelfMessage));
     }
-    return { messages, error: null };
+    return { messages, error: null, reachedEnd: activities.length < limit };
   } catch (err) {
     return {
       messages: [],
       error: err instanceof Error ? err.message : "Failed to load chat history",
+      reachedEnd: true,
     };
   }
 }
@@ -256,6 +286,23 @@ function MyChatPanel({ workspaceId, data }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [confirmRestart, setConfirmRestart] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
+  // Lazy-load older history on scroll-up.
+  // - containerRef = the scrollable messages viewport
+  // - topRef       = sentinel above the messages list; IO observes it
+  //                  and triggers loadOlder() when it enters view
+  // - hasMore      = false once a fetch returns < limit rows; stops IO
+  // - loadingOlder = guards against duplicate loadOlder() calls while
+  //                  one is already in flight (fast scroll-flick)
+  // - scrollAnchorRef = saves distance-from-bottom before a prepend
+  //                  so the useLayoutEffect below can restore the
+  //                  user's exact viewport position. Without this,
+  //                  prepending older messages would jump the scroll
+  //                  position by the height of the new content.
+  const containerRef = useRef<HTMLDivElement>(null);
+  const topRef = useRef<HTMLDivElement>(null);
+  const [hasMore, setHasMore] = useState(true);
+  const [loadingOlder, setLoadingOlder] = useState(false);
+  const scrollAnchorRef = useRef<{ savedDistanceFromBottom: number } | null>(null);
   // Files the user has picked but not yet sent. Cleared on send
   // (upload success) or by the × on each pill.
   const [pendingFiles, setPendingFiles] = useState<File[]>([]);
@@ -294,16 +341,81 @@ function MyChatPanel({ workspaceId, data }: Props) {
     sendInFlightRef.current = false;
   }, []);
 
-  // Load chat history from database on mount
+  // Load chat history from database on mount.
+  // Initial load is bounded to INITIAL_HISTORY_LIMIT (newest 10) — the
+  // rest streams in as the user scrolls up via loadOlder() below. Pre-
+  // 2026-05-05 this fetched the newest 50 in one shot; on a long-running
+  // workspace that meant 50× message-bubble paint + DOM cost on every
+  // tab-open even when the user only wanted to read the last few.
   useEffect(() => {
     setLoading(true);
     setLoadError(null);
-    loadMessagesFromDB(workspaceId).then(({ messages: msgs, error: fetchErr }) => {
-      setMessages(msgs);
-      setLoadError(fetchErr);
-      setLoading(false);
-    });
+    setHasMore(true);
+    loadMessagesFromDB(workspaceId, INITIAL_HISTORY_LIMIT).then(
+      ({ messages: msgs, error: fetchErr, reachedEnd }) => {
+        setMessages(msgs);
+        setLoadError(fetchErr);
+        setHasMore(!reachedEnd);
+        setLoading(false);
+      },
+    );
   }, [workspaceId]);
+
+  // Fetch the next-older batch and prepend. Caller responsibility:
+  // already check loadingOlder + hasMore (we re-check defensively for
+  // race-safety against the IO callback firing twice).
+  const loadOlder = useCallback(async () => {
+    if (loadingOlder || !hasMore) return;
+    if (messages.length === 0) return;
+    const oldest = messages[0];
+    if (!oldest) return;
+    const container = containerRef.current;
+    if (!container) return;
+    // Capture the user's distance-from-bottom BEFORE we prepend so the
+    // useLayoutEffect can restore it after the new DOM lands. Without
+    // this anchor, the user reading mid-history would get yanked
+    // upward by the height of the newly-prepended messages.
+    scrollAnchorRef.current = {
+      savedDistanceFromBottom: container.scrollHeight - container.scrollTop,
+    };
+    setLoadingOlder(true);
+    const { messages: older, reachedEnd } = await loadMessagesFromDB(
+      workspaceId,
+      OLDER_HISTORY_BATCH,
+      oldest.timestamp,
+    );
+    if (older.length > 0) {
+      setMessages((prev) => [...older, ...prev]);
+    } else {
+      // Nothing came back — clear the anchor so the next paint doesn't
+      // try to "restore" against a no-op prepend.
+      scrollAnchorRef.current = null;
+    }
+    setHasMore(!reachedEnd);
+    setLoadingOlder(false);
+  }, [workspaceId, messages, loadingOlder, hasMore]);
+
+  // IntersectionObserver on the top sentinel. Fires loadOlder() the
+  // moment the user scrolls within 200px of the top. AbortController
+  // unwires cleanly on workspace switch / unmount; root is the
+  // scrollable container so we observe only what's visible inside it.
+  useEffect(() => {
+    const top = topRef.current;
+    const container = containerRef.current;
+    if (!top || !container) return;
+    if (!hasMore) return; // stop observing when no older history exists
+    const ac = new AbortController();
+    const io = new IntersectionObserver(
+      (entries) => {
+        if (ac.signal.aborted) return;
+        if (entries[0]?.isIntersecting) loadOlder();
+      },
+      { root: container, rootMargin: "200px 0px 0px 0px", threshold: 0 },
+    );
+    io.observe(top);
+    ac.signal.addEventListener("abort", () => io.disconnect());
+    return () => ac.abort();
+  }, [loadOlder, hasMore]);
 
   // Agent reachability
   useEffect(() => {
@@ -316,7 +428,20 @@ function MyChatPanel({ workspaceId, data }: Props) {
     currentTaskRef.current = data.currentTask;
   }, [data.currentTask]);
 
-  useEffect(() => {
+  // Scroll behavior across messages updates:
+  //  - Prepend (loadOlder landed)  → restore the user's saved
+  //    distance-from-bottom so their reading position is unchanged.
+  //  - Append / initial            → pin to latest bubble.
+  // useLayoutEffect (not useEffect) so scroll restoration runs BEFORE
+  // paint — otherwise the user sees the page jump for one frame.
+  useLayoutEffect(() => {
+    const container = containerRef.current;
+    if (scrollAnchorRef.current && container) {
+      container.scrollTop =
+        container.scrollHeight - scrollAnchorRef.current.savedDistanceFromBottom;
+      scrollAnchorRef.current = null;
+      return;
+    }
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
@@ -735,7 +860,7 @@ function MyChatPanel({ workspaceId, data }: Props) {
         </div>
       )}
       {/* Messages */}
-      <div className="flex-1 overflow-y-auto p-3 space-y-3">
+      <div ref={containerRef} className="flex-1 overflow-y-auto p-3 space-y-3">
         {loading && (
           <div className="text-xs text-ink-soft text-center py-4">Loading chat history...</div>
         )}
@@ -751,11 +876,15 @@ function MyChatPanel({ workspaceId, data }: Props) {
               onClick={() => {
                 setLoading(true);
                 setLoadError(null);
-                loadMessagesFromDB(workspaceId).then(({ messages: msgs, error: fetchErr }) => {
-                  setMessages(msgs);
-                  setLoadError(fetchErr);
-                  setLoading(false);
-                });
+                setHasMore(true);
+                loadMessagesFromDB(workspaceId, INITIAL_HISTORY_LIMIT).then(
+                  ({ messages: msgs, error: fetchErr, reachedEnd }) => {
+                    setMessages(msgs);
+                    setLoadError(fetchErr);
+                    setHasMore(!reachedEnd);
+                    setLoading(false);
+                  },
+                );
               }}
               className="text-[10px] px-2 py-0.5 rounded bg-red-800/40 text-bad hover:bg-red-700/50 transition-colors"
             >
@@ -766,6 +895,24 @@ function MyChatPanel({ workspaceId, data }: Props) {
         {!loading && loadError === null && messages.length === 0 && (
           <div className="text-xs text-ink-soft text-center py-8">
             No messages yet. Send a message to start chatting with this agent.
+          </div>
+        )}
+        {/* Top sentinel for lazy-loading older history. The IO observer
+            in the effect above watches this; entering view triggers the
+            next-older batch fetch. Sits ABOVE messages.map so it's the
+            first thing the user reaches when scrolling up.
+
+            Only mounted when there might be more history (hasMore) so a
+            short conversation doesn't pay an idle observer. The
+            "Loading older messages…" line replaces the sentinel during
+            the fetch so the user sees feedback for the scroll-up
+            gesture. Once we hit the end, we drop the sentinel entirely
+            instead of showing a "no more messages" footer — the user's
+            scroll resting against the top of the conversation IS the
+            signal. */}
+        {hasMore && messages.length > 0 && (
+          <div ref={topRef} className="text-xs text-ink-soft text-center py-1">
+            {loadingOlder ? "Loading older messages…" : " "}
           </div>
         )}
         {messages.map((msg) => (
