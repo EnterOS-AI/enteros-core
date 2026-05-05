@@ -51,11 +51,10 @@ func (h *OrgHandler) createWorkspaceTree(ws OrgWorkspace, parentID *string, absX
 		model = defaults.Model
 	}
 	if model == "" {
-		if runtime == "claude-code" {
-			model = "sonnet"
-		} else {
-			model = "anthropic:claude-opus-4-7"
-		}
+		// SSOT: per-runtime defaults live in models/runtime_defaults.go
+		// (see RFC #2873). Consolidated from a duplicate of the same
+		// branch in workspace_provision.go.
+		model = models.DefaultModel(runtime)
 	}
 	tier := ws.Tier
 	if tier == 0 {
