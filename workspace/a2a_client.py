@@ -584,6 +584,24 @@ async def send_a2a_message(peer_id: str, message: str, source_workspace_id: str 
                     else:
                         detail = "JSON-RPC error with no message"
                     return f"{_A2A_ERROR_PREFIX}{detail} [target={target_url}]"
+                elif data.get("status") == "queued" and data.get("delivery_mode") == "poll":
+                    # Workspace-server's poll-mode short-circuit envelope
+                    # (workspace-server/internal/handlers/a2a_proxy.go ~line 402).
+                    # The peer is poll-mode and has no URL to dispatch to, so
+                    # the server queued the message for the peer's next inbox
+                    # poll instead of forwarding it. Delivery is acknowledged
+                    # but pending consumption.
+                    #
+                    # Pre-fix this fell through to the "unexpected response
+                    # shape" error path → callers logged false failures, then
+                    # delegate_task retried, and the peer received duplicate
+                    # delegations. Issue #2967.
+                    method = data.get("method") or "message/send"
+                    logger.info(
+                        "send_a2a_message: queued for poll-mode peer (method=%s, target=%s)",
+                        method, target_url,
+                    )
+                    return f"queued for poll-mode peer (method={method})"
                 return f"{_A2A_ERROR_PREFIX}unexpected response shape (no result, no error): {str(data)[:200]} [target={target_url}]"
             except _TRANSIENT_HTTP_ERRORS as e:
                 last_exc = e
