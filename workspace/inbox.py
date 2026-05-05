@@ -641,7 +641,6 @@ def _poll_once(
     # would race with the still-running fetches.
     if batch_fetcher is not None:
         _drain_uploads(batch_fetcher)
-        batch_fetcher = None
 
     if last_id is not None:
         state.save_cursor(last_id, cursor_key)
