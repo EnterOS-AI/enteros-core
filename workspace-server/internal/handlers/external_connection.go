@@ -314,7 +314,7 @@ const externalCodexTemplate = `# Codex external setup — outbound tools (MCP) +
 # 1. Install codex CLI, the workspace runtime, and the bridge daemon:
 npm install -g @openai/codex@^0.57
 pip install molecule-ai-workspace-runtime
-pip install 'git+https://github.com/Molecule-AI/codex-channel-molecule.git'
+pip install codex-channel-molecule
 
 # 2. Wire the molecule MCP server into codex's config.toml — this is
 #    the OUTBOUND path (codex calls list_peers / delegate_task /
