@@ -132,6 +132,11 @@ const TAB_HELP: Record<
         check:
           "TOML rejects duplicate `[mcp_servers.molecule]` tables. Open ~/.codex/config.toml and remove the old block before pasting the new one.",
       },
+      {
+        symptom: "Canvas messages don't wake codex",
+        check:
+          "Step 3 (codex-channel-molecule bridge daemon) is required for inbound push. Check `pgrep -f codex-channel-molecule` and `tail ~/.codex-channel-molecule/daemon.log`.",
+      },
     ],
   },
   openclaw: {
