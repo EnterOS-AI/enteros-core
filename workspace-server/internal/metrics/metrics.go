@@ -76,6 +76,21 @@ func TrackWSConnect() { atomic.AddInt64(&activeWSConns, 1) }
 // Call from the WebSocket disconnect / cleanup path.
 func TrackWSDisconnect() { atomic.AddInt64(&activeWSConns, -1) }
 
+// phantomBusyResets is the cumulative count of workspace rows the
+// phantom-busy sweep reset (active_tasks=0 → active_tasks=0+counter
+// cleared). Surfaced as molecule_phantom_busy_resets_total — a high
+// reset rate signals a regression in task-lifecycle accounting (most
+// often: missing env vars cause claude --print to time out, the
+// agent loop never decrements active_tasks, and the sweep cleans up
+// the counter ~10 min later). Issue #2865.
+var phantomBusyResets int64
+
+// TrackPhantomBusyReset increments the phantom-busy reset counter.
+// Called from sweepPhantomBusy in workspace-server/internal/scheduler/
+// after each row whose active_tasks was reset to 0. Idempotent +
+// goroutine-safe; called once per row per sweep tick.
+func TrackPhantomBusyReset() { atomic.AddInt64(&phantomBusyResets, 1) }
+
 // Handler returns a Gin handler that serialises all collected metrics in
 // Prometheus text exposition format (v0.0.4). Mount this at GET /metrics.
 func Handler() gin.HandlerFunc {
@@ -144,6 +159,11 @@ func Handler() gin.HandlerFunc {
 		writeln(w, "# HELP molecule_websocket_connections_active Number of active WebSocket connections.")
 		writeln(w, "# TYPE molecule_websocket_connections_active gauge")
 		fmt.Fprintf(w, "molecule_websocket_connections_active %d\n", atomic.LoadInt64(&activeWSConns))
+
+		// ── Molecule AI scheduler ──────────────────────────────────────────────
+		writeln(w, "# HELP molecule_phantom_busy_resets_total Cumulative count of workspace rows reset by the phantom-busy sweep (active_tasks cleared after >10 min of activity_log silence). High reset rate signals task-lifecycle accounting regressions — see issue #2865.")
+		writeln(w, "# TYPE molecule_phantom_busy_resets_total counter")
+		fmt.Fprintf(w, "molecule_phantom_busy_resets_total %d\n", atomic.LoadInt64(&phantomBusyResets))
 	}
 }
 
