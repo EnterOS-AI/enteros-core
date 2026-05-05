@@ -43,15 +43,37 @@ type Bundle struct {
 // circuit breaker handles ongoing unavailability; we don't want to
 // block workspace-server boot just because the memory plugin is
 // briefly down.
+//
+// Silent-misconfig guard: if MEMORY_V2_CUTOVER=true is set without
+// MEMORY_PLUGIN_URL, the cutoverActive() check in handlers silently
+// returns false and the legacy SQL path serves every request. The
+// operator sees no errors, no warnings, and assumes the cutover is
+// live. Log a LOUD WARN at boot when the env is half-configured so
+// the misconfig is visible in the boot log, not detectable only by
+// observing that the legacy table is still being written to.
 func Build(db *sql.DB) *Bundle {
-	if os.Getenv("MEMORY_PLUGIN_URL") == "" {
+	cutover := os.Getenv("MEMORY_V2_CUTOVER") == "true"
+	pluginURL := os.Getenv("MEMORY_PLUGIN_URL")
+
+	if pluginURL == "" {
+		if cutover {
+			log.Printf("memory-plugin: ⚠️  MEMORY_V2_CUTOVER=true but MEMORY_PLUGIN_URL is unset — cutover is INACTIVE, legacy SQL path is serving every request. Either unset MEMORY_V2_CUTOVER or point MEMORY_PLUGIN_URL at a reachable plugin server.")
+		}
 		return nil
 	}
 	plugin := mclient.New(mclient.Config{})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if hr, err := plugin.Boot(ctx); err != nil {
-		log.Printf("memory-plugin: /v1/health probe failed (will retry per-request): %v", err)
+		// Log even louder when cutover is on — an unreachable plugin
+		// during cutover means writes that the operator THINKS are
+		// going to v2 will silently fall back to legacy via the
+		// circuit breaker on each request. Make it impossible to miss.
+		if cutover {
+			log.Printf("memory-plugin: ⚠️  MEMORY_V2_CUTOVER=true and MEMORY_PLUGIN_URL=%s but /v1/health probe failed (%v). Cutover writes will fall back to legacy via circuit breaker. Verify the plugin server is reachable.", pluginURL, err)
+		} else {
+			log.Printf("memory-plugin: /v1/health probe failed (will retry per-request): %v", err)
+		}
 	} else {
 		log.Printf("memory-plugin: ok, capabilities=%v", hr.Capabilities)
 	}
