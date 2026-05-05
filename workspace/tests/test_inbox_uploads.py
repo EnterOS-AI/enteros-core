@@ -1034,3 +1034,87 @@ def test_batch_fetcher_httpx_missing_makes_submit_a_noop(monkeypatch):
         else:
             sys.modules.pop("httpx", None)
     assert result is None
+
+
+def test_batch_fetcher_close_after_timeout_does_not_block_on_running_workers():
+    """The deadline contract: when wait_all times out, close() must NOT
+    block waiting for the leaked worker threads. Otherwise the inbox
+    poll loop stalls indefinitely on a hung /content fetch — undoing
+    the user-facing timeout.
+
+    Strategy: build a client whose .get() blocks on a threading.Event
+    that the test never sets. Submit a row, wait_all with a tiny
+    timeout, then time close(). If close() drained-and-waited it would
+    block until we set the event (i.e., forever in this test).
+    """
+    import threading
+    import time
+
+    blocker = threading.Event()  # never set — workers stay running
+
+    def _hang_get(url, headers=None):
+        # Wait at most ~5s so a buggy implementation eventually unblocks
+        # the test instead of timing out the whole pytest run, but
+        # nothing legitimate should reach this fallback.
+        blocker.wait(timeout=5.0)
+        return _make_resp(200, content=b"x", content_type="text/plain")
+
+    client = MagicMock()
+    client.get = MagicMock(side_effect=_hang_get)
+    client.post = MagicMock(return_value=_make_resp(200))
+
+    bf = inbox_uploads.BatchFetcher(
+        platform_url="http://plat",
+        workspace_id="ws-1",
+        headers={},
+        client=client,
+        max_workers=1,  # serialize so submitting 1 keeps the worker busy
+    )
+    bf.submit(_row_with_id("act-a", "a"))
+    # Tiny timeout — wait_all must report the future as not_done.
+    bf.wait_all(timeout=0.05)
+    t0 = time.time()
+    bf.close()
+    elapsed = time.time() - t0
+    # Unblock the lingering worker so it doesn't pollute later tests.
+    blocker.set()
+
+    # Without the cancel-on-timeout fix, close() would block until
+    # blocker.set() — i.e., the full ~5s. With the fix it returns
+    # immediately because shutdown(wait=False) doesn't drain.
+    assert elapsed < 1.0, (
+        f"close() blocked for {elapsed:.2f}s after wait_all timeout — "
+        "cancel-on-timeout regression: close() is draining instead of bailing"
+    )
+
+
+def test_batch_fetcher_close_without_timeout_still_drains():
+    """Negative leg of the timeout contract: when wait_all completes
+    cleanly (no timeout), close() must KEEP its drain-and-wait
+    behavior so a still-queued ack POST isn't dropped mid-write.
+    """
+    import time
+
+    def _slow_get(url, headers=None):
+        time.sleep(0.05)
+        return _make_resp(200, content=b"x", content_type="text/plain")
+
+    client = MagicMock()
+    client.get = MagicMock(side_effect=_slow_get)
+    client.post = MagicMock(return_value=_make_resp(200))
+
+    bf = inbox_uploads.BatchFetcher(
+        platform_url="http://plat",
+        workspace_id="ws-1",
+        headers={},
+        client=client,
+        max_workers=2,
+    )
+    bf.submit(_row_with_id("act-a", "a"))
+    bf.submit(_row_with_id("act-b", "b"))
+    bf.wait_all()  # generous default timeout — should not fire
+    bf.close()
+
+    # All 2 GETs + 2 ACK POSTs ran to completion via drain-and-wait.
+    assert client.get.call_count == 2
+    assert client.post.call_count == 2
