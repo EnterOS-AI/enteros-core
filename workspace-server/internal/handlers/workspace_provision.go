@@ -534,11 +534,10 @@ func (h *WorkspaceHandler) ensureDefaultConfig(workspaceID string, payload model
 	// Generate a minimal config.yaml
 	model := payload.Model
 	if model == "" {
-		if runtime == "claude-code" {
-			model = "sonnet"
-		} else {
-			model = "anthropic:claude-opus-4-7"
-		}
+		// SSOT: per-runtime defaults live in models/runtime_defaults.go
+		// (see RFC #2873). Was previously duplicated here AND in
+		// org_import.go; consolidating prevents silent drift.
+		model = models.DefaultModel(runtime)
 	}
 
 	// Sanitize name/role/model for YAML safety — always double-quote so
