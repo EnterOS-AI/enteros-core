@@ -547,6 +547,9 @@ class BatchFetcher:
         )
         self._futures: list[concurrent.futures.Future[Any]] = []
         self._closed = False
+        # Flipped to True by wait_all when the timeout fires; close()
+        # reads this to decide between drain-and-wait vs cancel-queued.
+        self._timed_out = False
 
     def submit(self, row: dict[str, Any]) -> concurrent.futures.Future[Any] | None:
         """Submit ``row`` for fetch + stage + ack. Non-blocking — the
@@ -580,8 +583,12 @@ class BatchFetcher:
         exception propagating up to here is unexpected and we don't want
         one bad fetch to abort the whole batch.
 
-        Timeouts are also logged + swallowed; the caller will move on
-        and the un-acked rows will be retried by the next poll.
+        Timeouts are also logged + swallowed AND record the timed-out
+        futures on ``self._timed_out`` so ``close`` can cancel them
+        without paying their full latency. Without this hand-off,
+        ``close()``'s ``shutdown(wait=True)`` would block on the leaked
+        workers and undo the user-facing timeout — the inbox poll loop
+        would stall indefinitely on a hung /content fetch.
         """
         if not self._futures:
             return
@@ -606,22 +613,45 @@ class BatchFetcher:
                 len(not_done),
                 timeout,
             )
+            # Mark these futures so close() knows to cancel-not-wait. We
+            # cancel queued-but-not-started ones immediately; futures
+            # already running can't be cancelled (Python's threading
+            # model), but close() will pass cancel_futures=True so any
+            # remaining queued items don't run.
+            for fut in not_done:
+                fut.cancel()
+            self._timed_out = True
 
     def close(self) -> None:
         """Tear down the executor + (if owned) the httpx client.
 
         Idempotent. After close, ``submit`` raises and the BatchFetcher
         cannot be reused — construct a fresh one for the next poll.
+
+        If ``wait_all`` reported a timeout, shutdown skips the
+        ``wait=True`` drain and instead asks the executor to drop queued
+        futures (``cancel_futures=True``). Currently-running workers
+        can't be interrupted by Python's threading model, but the poll
+        loop returns immediately rather than blocking on a hung fetch.
         """
         if self._closed:
             return
         self._closed = True
-        # Drain remaining futures so worker threads aren't killed mid-
-        # request. wait=True is the safe default; for an inbox poller a
-        # 60s tail at shutdown is acceptable since uploads in flight are
-        # the only thing close() is called between.
+        timed_out = getattr(self, "_timed_out", False)
         try:
-            self._executor.shutdown(wait=True)
+            if timed_out:
+                # cancel_futures landed in Python 3.9 — guarded for older
+                # interpreters via a TypeError fallback. Drop queued
+                # tasks; running ones will exit when their httpx call
+                # eventually returns or the daemon thread dies.
+                try:
+                    self._executor.shutdown(wait=False, cancel_futures=True)
+                except TypeError:
+                    self._executor.shutdown(wait=False)
+            else:
+                # Healthy path: wait for in-flight work so we don't
+                # interrupt a fetch mid-write.
+                self._executor.shutdown(wait=True)
         except Exception as exc:  # noqa: BLE001
             logger.warning("inbox_uploads: executor shutdown error: %s", exc)
         if self._own_client and self._client is not None:
