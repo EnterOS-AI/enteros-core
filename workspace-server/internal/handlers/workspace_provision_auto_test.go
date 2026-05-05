@@ -675,17 +675,34 @@ func TestRestartWorkspaceAuto_RoutesToCPWhenSet(t *testing.T) {
 // path. Docker provisioner.Stop has no retry; this test only asserts
 // the dispatch order (Stop → spawn provision goroutine) without
 // stubbing the entire Docker provision pipeline.
+//
+// The spawned provision goroutine WILL panic in provisionWorkspaceOpts
+// (no real Docker daemon), be recovered by logProvisionPanic, and
+// attempt a markProvisionFailed UPDATE on the test DB. We pre-register
+// that expectation so the panic-recovery doesn't fail the test as a
+// "was not expected" call. We also wait for the goroutine to land
+// before the test body exits, so its db.DB writes don't leak into the
+// next test's sqlmock when tests run sequentially in the same package.
 func TestRestartWorkspaceAuto_RoutesToDockerWhenOnlyDocker(t *testing.T) {
+	mock := setupTestDB(t)
+	mock.MatchExpectationsInOrder(false)
+	// Allow up to 5 markProvisionFailed UPDATEs from the panic-recovered
+	// goroutine (it'll panic in provisionWorkspaceOpts since
+	// stoppingLocalProv.Start panics, then logProvisionPanic calls
+	// markProvisionFailed). Generous count so a slower CI runner
+	// doesn't trip on duplicate writes; we don't assert
+	// ExpectationsWereMet since the count is a runtime detail.
+	for i := 0; i < 5; i++ {
+		mock.ExpectExec(`UPDATE workspaces SET status =`).
+			WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+	}
+
 	bcast := &concurrentSafeBroadcaster{}
 	h := NewWorkspaceHandler(bcast, nil, "http://localhost:8080", t.TempDir())
 	stub := &stoppingLocalProv{}
 	h.provisioner = stub
 
-	// We can't easily exercise the full Docker provision path without
-	// a Docker daemon; spawn-and-return is enough to assert the dispatch
-	// took the right branch. The provisionWorkspace goroutine that fires
-	// will panic in setupContainer (no client), recovered by
-	// logProvisionPanic — the test path completes before that.
 	wsID := "ws-restart-routes-docker"
 	ok := h.RestartWorkspaceAuto(context.Background(), wsID, "", nil, models.CreateWorkspacePayload{
 		Name: "restart-test", Tier: 1, Runtime: "claude-code",
@@ -693,6 +710,13 @@ func TestRestartWorkspaceAuto_RoutesToDockerWhenOnlyDocker(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected RestartWorkspaceAuto to return true with Docker wired")
 	}
+
+	// Wait for the spawned goroutine to settle — it'll panic in
+	// provisionWorkspaceOpts (stoppingLocalProv.Start panics) and be
+	// recovered by logProvisionPanic. Without this wait, the goroutine
+	// outlives the test and writes to a sqlmock that the NEXT test
+	// owns, causing a `was not expected` race.
+	time.Sleep(200 * time.Millisecond)
 
 	// Stop call is synchronous on the Docker leg.
 	if len(stub.stopped) == 0 || stub.stopped[0] != wsID {
