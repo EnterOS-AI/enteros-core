@@ -2,7 +2,9 @@ package handlers
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -120,6 +122,36 @@ func TestLookupExistingChild_DBError_Propagates(t *testing.T) {
 	}
 	if id != "" {
 		t.Errorf("expected empty id on DB error, got %q", id)
+	}
+}
+
+// TestLookupExistingChild_WrappedNoRows_TreatedAsNotFound — pins the
+// wrap-safety of the errors.Is(err, sql.ErrNoRows) check. The previous
+// `err == sql.ErrNoRows` equality would fall through to the
+// "real DB error" branch on a wrapped no-rows error, aborting the
+// import for what is in fact the no-rows happy path. driver/sql
+// wrapping is currently a non-issue but a future driver change or a
+// caller that wraps the result via fmt.Errorf("…: %w", err) would
+// silently break the equality check. errors.Is unwraps.
+func TestLookupExistingChild_WrappedNoRows_TreatedAsNotFound(t *testing.T) {
+	mock := setupTestDB(t)
+	parent := "parent-1"
+	wrapped := fmt.Errorf("driver-wrapped: %w", sql.ErrNoRows)
+	mock.ExpectQuery(`SELECT id FROM workspaces`).
+		WithArgs("Alpha", &parent).
+		WillReturnError(wrapped)
+
+	h := &OrgHandler{}
+	id, found, err := h.lookupExistingChild(context.Background(), "Alpha", &parent)
+
+	if err != nil {
+		t.Fatalf("expected wrapped no-rows to be treated as not-found (err=nil), got: %v", err)
+	}
+	if found {
+		t.Errorf("expected found=false on wrapped no-rows, got found=true")
+	}
+	if id != "" {
+		t.Errorf("expected empty id on wrapped no-rows, got %q", id)
 	}
 }
 
