@@ -7,7 +7,7 @@ import { api } from "@/lib/api";
 import { useCanvasStore, type WorkspaceNodeData } from "@/store/canvas";
 import { useSocketEvent } from "@/hooks/useSocketEvent";
 import { type ChatMessage, type ChatAttachment, createMessage, appendMessageDeduped } from "./chat/types";
-import { uploadChatFiles, downloadChatFile } from "./chat/uploads";
+import { uploadChatFiles, downloadChatFile, isPlatformAttachment } from "./chat/uploads";
 import { AttachmentChip, PendingAttachmentPill } from "./chat/AttachmentViews";
 import { extractFilesFromTask } from "./chat/message-parser";
 import { AgentCommsPanel } from "./chat/AgentCommsPanel";
@@ -1081,16 +1081,13 @@ function MyChatPanel({ workspaceId, data }: Props) {
                       // gets a real Blob with proper auth headers.
                       a: ({ href, children, ...rest }) => {
                         const url = String(href ?? "");
-                        const containerPath = url.startsWith("workspace:") ||
-                          url.startsWith("file:///workspace") ||
-                          url.startsWith("file:///configs") ||
-                          url.startsWith("file:///home") ||
-                          url.startsWith("file:///plugins") ||
-                          url.startsWith("/workspace") ||
-                          url.startsWith("/configs") ||
-                          url.startsWith("/home") ||
-                          url.startsWith("/plugins");
-                        if (containerPath) {
+                        // Use the SSOT helper isPlatformAttachment so
+                        // the markdown link override and the chip
+                        // download path agree on which schemes need
+                        // auth-routed download. Pre-fix this list was
+                        // duplicated and missed `platform-pending:`,
+                        // producing about:blank for poll-mode uploads.
+                        if (isPlatformAttachment(url)) {
                           return (
                             <a
                               href={url}

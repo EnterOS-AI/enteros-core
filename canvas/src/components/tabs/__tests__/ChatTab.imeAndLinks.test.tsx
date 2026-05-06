@@ -23,8 +23,8 @@ import React from "react";
 afterEach(cleanup);
 
 // Mock the api module so render doesn't try to talk to a real CP.
-const apiGet = vi.fn(() => Promise.resolve([]));
-const apiPost = vi.fn(() => Promise.resolve({}));
+const apiGet = vi.fn((_path: string): Promise<unknown> => Promise.resolve([]));
+const apiPost = vi.fn((_path: string, _body: unknown): Promise<unknown> => Promise.resolve({}));
 vi.mock("@/lib/api", () => ({
   api: {
     get: (path: string) => apiGet(path),
@@ -44,12 +44,13 @@ vi.mock("@/store/canvas", () => ({
 // Capture the downloadChatFile call so the markdown-link test can
 // assert in-container paths route through the authenticated download
 // path rather than the browser's bare anchor click.
-const downloadChatFileMock = vi.fn(() => Promise.resolve());
+const downloadChatFileMock = vi.fn((_workspaceId: string, _att: { uri: string; name: string }) => Promise.resolve());
 vi.mock("../chat/uploads", async () => {
   const actual = await vi.importActual<typeof import("../chat/uploads")>("../chat/uploads");
   return {
     ...actual,
-    downloadChatFile: (...args: unknown[]) => downloadChatFileMock(...args),
+    downloadChatFile: (workspaceId: string, att: { uri: string; name: string }) =>
+      downloadChatFileMock(workspaceId, att),
   };
 });
 
