@@ -36,7 +36,7 @@
 
 import { useState, useEffect, useRef } from "react";
 import type { ChatAttachment } from "./types";
-import { downloadChatFile, isPlatformAttachment, resolveAttachmentHref } from "./uploads";
+import { isPlatformAttachment, resolveAttachmentHref } from "./uploads";
 import { AttachmentLightbox } from "./AttachmentLightbox";
 import { AttachmentChip } from "./AttachmentViews";
 
