@@ -108,6 +108,18 @@ type eicTunnelPool struct {
 	// First acquirer takes the slot; later ones wait on the channel.
 	pendingSetups map[string]chan struct{}
 	stopJanitor   chan struct{}
+	// janitorInterval is captured at pool construction from the
+	// package-level poolJanitorInterval var. Captured (not re-read on
+	// every tick) so a test that swaps the package var via t.Cleanup
+	// after a global pool's janitor is already running can't race
+	// with that goroutine's ticker read. The global pool is created
+	// lazily once per process via sync.Once; before this capture
+	// landed, every test that touched poolJanitorInterval after the
+	// global pool's first-touch raced the janitor (caught by -race
+	// on staging tip 249dbc6a — TestPooledWithEICTunnel_PanicPoisonsEntry).
+	// Tests still get the new value on a freshPool() because they
+	// set the package var BEFORE calling newEICTunnelPool().
+	janitorInterval time.Duration
 }
 
 var (
@@ -127,11 +139,16 @@ func getEICTunnelPool() *eicTunnelPool {
 
 // newEICTunnelPool constructs an empty pool. Exported so tests can
 // build isolated pools without sharing the singleton.
+//
+// Captures poolJanitorInterval at construction time so the janitor
+// goroutine doesn't race with t.Cleanup-driven swaps of the package
+// var. See the janitorInterval field comment for the failure mode.
 func newEICTunnelPool() *eicTunnelPool {
 	return &eicTunnelPool{
-		entries:       map[string]*pooledTunnel{},
-		pendingSetups: map[string]chan struct{}{},
-		stopJanitor:   make(chan struct{}),
+		entries:         map[string]*pooledTunnel{},
+		pendingSetups:   map[string]chan struct{}{},
+		stopJanitor:     make(chan struct{}),
+		janitorInterval: poolJanitorInterval,
 	}
 }
 
@@ -290,8 +307,11 @@ func (p *eicTunnelPool) evictLRUIfFullLocked(skipInstance string) {
 // janitor periodically scans for entries that are idle AND expired,
 // closing their tunnels. Runs forever (per pool lifetime); cancelled
 // by close(p.stopJanitor) for tests that build short-lived pools.
+//
+// Reads p.janitorInterval (captured at construction) instead of the
+// package-level poolJanitorInterval — see janitorInterval field comment.
 func (p *eicTunnelPool) janitor() {
-	t := time.NewTicker(poolJanitorInterval)
+	t := time.NewTicker(p.janitorInterval)
 	defer t.Stop()
 	for {
 		select {
