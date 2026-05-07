@@ -339,16 +339,41 @@ jobs:
           # Long-term: derive this list from manifest.json so cascade
           # scope can't drift from E2E scope — tracked in RFC #388 as a
           # Phase-1 invariant.
+          # Fan out via Gitea's repository_dispatch API (post-2026-05-06; the
+          # GitHub-org's hostname is no longer reachable). API contract:
+          #   POST {GITEA_URL}/api/v1/repos/{owner}/{repo}/dispatches
+          #   Authorization: token <gitea-pat>     (NOT "Bearer" like GitHub)
+          #   body: {event_type, client_payload}    (same shape as GitHub)
+          # The 9 template repos all have publish-image.yml waiting on
+          # `repository_dispatch: types: [runtime-published]` with
+          # client_payload.runtime_version (verified by devops-engineer
+          # 2026-05-07 when assessing molecule-core#14 Option B safety).
+          #
+          # DISPATCH_TOKEN must be a Gitea PAT (not a GitHub PAT) with
+          # write:repository scope on each of the 9 target repos. Per saved
+          # memory feedback_per_agent_gitea_identity_default this should be
+          # a per-agent-persona token (recommend: dedicated
+          # `publish-runtime-bot` persona), not the founder PAT. Token
+          # rotation is an out-of-band operator-host task; the workflow
+          # consumes whatever value is in the secret.
+          #
+          # GITEA_URL defaults to https://git.moleculesai.app; override via
+          # job env if the platform's Gitea host changes.
+          GITEA_URL="${GITEA_URL:-https://git.moleculesai.app}"
           TEMPLATES="claude-code hermes openclaw codex langgraph crewai autogen deepagents gemini-cli"
           FAILED=""
           for tpl in $TEMPLATES; do
-            REPO="Molecule-AI/molecule-ai-workspace-template-$tpl"
+            # Gitea is owner-case-sensitive: the org slug is lowercase
+            # `molecule-ai`, not `Molecule-AI`. GitHub auto-lowercased on
+            # the receive side; Gitea returns 404 on the wrong case.
+            REPO="molecule-ai/molecule-ai-workspace-template-$tpl"
             STATUS=$(curl -sS -o /tmp/dispatch.out -w "%{http_code}" \
-              -X POST "https://api.github.com/repos/$REPO/dispatches" \
-              -H "Authorization: Bearer $DISPATCH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              -H "X-GitHub-Api-Version: 2022-11-28" \
+              -X POST "$GITEA_URL/api/v1/repos/$REPO/dispatches" \
+              -H "Authorization: token $DISPATCH_TOKEN" \
+              -H "Accept: application/json" \
+              -H "Content-Type: application/json" \
               -d "{\"event_type\":\"runtime-published\",\"client_payload\":{\"runtime_version\":\"$VERSION\"}}")
+            # Gitea returns 204 No Content on success, same as GitHub.
             if [ "$STATUS" = "204" ]; then
               echo "✓ dispatched $tpl ($VERSION)"
             else
