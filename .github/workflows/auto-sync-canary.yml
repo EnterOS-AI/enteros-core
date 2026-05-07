@@ -38,11 +38,17 @@ name: Auto-sync canary — AUTO_SYNC_TOKEN rotation drift
 #    validates the token has `read:repository` scope on this repo
 #    (the v2 scope contract — see saved memory
 #    `reference_persona_token_v2_scope`).
-# 3. `git ls-remote https://oauth2:<token>@<gitea>/.../molecule-core
-#    refs/heads/staging` → validates the EXACT HTTPS basic-auth path
-#    that `actions/checkout` uses inside auto-sync-main-to-staging.yml.
-#    Without this we'd be testing the API surface but not the git
-#    HTTPS surface; they don't share an auth code path on Gitea.
+# 3. `git push --dry-run` of the current staging SHA back to
+#    `refs/heads/staging` via `https://oauth2:<token>@<gitea>/...`
+#    → validates the EXACT HTTPS basic-auth path that
+#    `actions/checkout` + `git push origin staging` use inside
+#    auto-sync-main-to-staging.yml. NOP by construction (push the
+#    current tip to itself = "Everything up-to-date"); auth is
+#    checked at the smart-protocol handshake BEFORE the empty-diff
+#    computation, so bad token → exit 128 with "Authentication
+#    failed". `git ls-remote` is NOT used here because Gitea
+#    falls back to anonymous read on public repos and would
+#    silently green-light a rotated token.
 #
 # Each step exits non-zero with an actionable error message if it
 # fails. The workflow status itself is the operator-facing surface.
@@ -93,9 +99,10 @@ name: Auto-sync canary — AUTO_SYNC_TOKEN rotation drift
 #      token is invalid OR resolves to wrong persona.
 #    - Step "Verify token has repo read scope" red → token valid but
 #      stripped of `read:repository` scope (or repo perms changed).
-#    - Step "Verify git HTTPS auth path works" red → API works but
-#      git HTTPS auth path is broken (rare; usually means a Gitea
-#      config drift, not a token issue).
+#    - Step "Verify git HTTPS auth path via no-op dry-run push to
+#      staging" red → token rotated/revoked OR Gitea git-HTTPS
+#      surface is broken (rare). Auth check happens on the
+#      smart-protocol handshake, separate from the API path.
 #
 # 2. **Re-issue the token** on the operator host:
 #    ```
@@ -279,48 +286,101 @@ jobs:
           fi
           echo "Token has read:repository on ${REPO_PATH} ✓"
 
-      - name: Verify git HTTPS auth path resolves staging tip
+      - name: Verify git HTTPS auth path via no-op dry-run push to staging
         # Final probe: exercise the EXACT auth path that
-        # `actions/checkout` uses in auto-sync-main-to-staging.yml.
-        # Gitea's API and git-HTTPS surfaces share the token but
-        # take different code paths internally — historically (#173)
+        # `actions/checkout` + `git push origin staging` use in
+        # auto-sync-main-to-staging.yml. Gitea's API and git-HTTPS
+        # surfaces share the token-lookup code path internally but
+        # the wire-level error shapes differ — historically (#173)
         # the API path was healthy while git-HTTPS rejected, so
         # checking only the API would have given false-green.
         #
-        # `git ls-remote --refs` is read-only: lists remote refs
-        # without fetching pack data. ~1KB on the wire.
+        # IMPORTANT: `git ls-remote` on a public repo (which
+        # molecule-core is) succeeds even with a junk token because
+        # Gitea falls back to anonymous-read. `ls-remote` therefore
+        # CANNOT validate auth on this surface. We use
+        # `git push --dry-run` instead — push is auth-gated even on
+        # public repos.
+        #
+        # NOP shape: read the current staging SHA via authenticated
+        # ls-remote (the SHA itself is public; auth is incidental
+        # here, used only to colocate the discovery in one step), then
+        # `git push --dry-run <SHA>:refs/heads/staging`. Pushing the
+        # current tip back to itself is "Everything up-to-date" with
+        # exit 0 when auth succeeds. With a bad token Gitea returns
+        # HTTP 401 in the smart-protocol handshake and git exits 128
+        # with "Authentication failed".
+        #
+        # The dry-run never reaches Gitea's pre-receive hook (which
+        # is where branch-protection authz runs), so this probe does
+        # not validate failure mode C. That's intentional —
+        # branch-protection-drift.yml owns authz monitoring; this
+        # canary owns auth.
         env:
-          # Build the URL inline so the token never appears as a
-          # literal string anywhere — it's an env-var interpolation,
-          # subject to GitHub's automatic secret-masking on output.
-          GIT_TERMINAL_PROMPT: "0"  # don't hang waiting for password if auth fails
+          # Don't hang waiting for password prompt if auth fails on a
+          # terminal-attached run. (In Actions there's no terminal,
+          # but the env-var hardens against an interactive runner
+          # config.)
+          GIT_TERMINAL_PROMPT: "0"
         run: |
           set -euo pipefail
           # Token is in $AUTO_SYNC_TOKEN (job-level env). Compose the
           # URL as a local var that's never echoed.
           url="https://oauth2:${AUTO_SYNC_TOKEN}@${GITEA_HOST}/${REPO_PATH}"
 
-          # `timeout 30s` covers the (rare) case where the network
-          # path stalls without curl-style timeout flags — git
-          # honours GIT_HTTP_LOW_SPEED_TIME/LIMIT but not a hard wall.
-          if ! out=$(timeout 30s git ls-remote --refs "$url" refs/heads/staging 2>&1); then
-            # Redact any accidental token leak in the error output.
-            redacted=$(echo "$out" | sed -E "s|oauth2:[^@]+@|oauth2:<redacted>@|g")
-            echo "::error::git ls-remote against staging failed via the AUTO_SYNC_TOKEN HTTPS auth path." >&2
-            echo "::error::API probes passed but git HTTPS surface is broken — likely Gitea config drift, not a token rotation." >&2
+          # Step a: read current staging SHA. ~1KB; auth-gated only
+          # on private repos but always works on public — used here
+          # only to discover the SHA, not to validate auth.
+          staging_ref=$(timeout 30s git ls-remote --refs "$url" refs/heads/staging 2>&1) || {
+            redacted=$(echo "$staging_ref" | sed -E "s|oauth2:[^@]+@|oauth2:<redacted>@|g")
+            echo "::error::ls-remote against staging failed (network/DNS issue):" >&2
+            echo "$redacted" >&2
+            exit 1
+          }
+          if ! echo "$staging_ref" | grep -qE '^[0-9a-f]{40}[[:space:]]+refs/heads/staging$'; then
+            echo "::error::ls-remote returned unexpected shape:" >&2
+            echo "$staging_ref" | sed -E "s|oauth2:[^@]+@|oauth2:<redacted>@|g" >&2
+            exit 1
+          fi
+          staging_sha=$(echo "$staging_ref" | awk '{print $1}')
+
+          # Step b: spin up an ephemeral local repo. `git push` always
+          # requires a local repo even when pushing a remote SHA that
+          # isn't in the local object DB (the protocol negotiates and
+          # discovers we don't need to send any objects). We don't use
+          # `actions/checkout` for this — it would clone the whole
+          # repo (~hundreds of MB) for what's essentially `git init`.
+          tmp_repo="$(mktemp -d)"
+          trap 'rm -rf "$tmp_repo"' EXIT
+          git -C "$tmp_repo" init -q
+          # Author config required for any git operation; values are
+          # arbitrary because nothing gets committed here.
+          git -C "$tmp_repo" config user.email canary@auto-sync.local
+          git -C "$tmp_repo" config user.name auto-sync-canary
+
+          # Step c: dry-run push the current staging SHA back to
+          # staging. NOP by construction — the remote tip equals the
+          # SHA we're pushing, so "Everything up-to-date" is the
+          # success path.
+          #
+          # Authentication is checked at the smart-protocol handshake,
+          # BEFORE the dry-run can compute an empty diff. Bad token
+          # → "Authentication failed", exit 128. Good token → exit 0.
+          set +e
+          push_out=$(timeout 30s git -C "$tmp_repo" push --dry-run "$url" "${staging_sha}:refs/heads/staging" 2>&1)
+          push_rc=$?
+          set -e
+
+          if [ "$push_rc" -ne 0 ]; then
+            redacted=$(echo "$push_out" | sed -E "s|oauth2:[^@]+@|oauth2:<redacted>@|g")
+            echo "::error::Token rotation suspected: git push --dry-run against staging failed via the AUTO_SYNC_TOKEN HTTPS auth path (exit $push_rc)." >&2
+            echo "::error::This is the EXACT auth path that actions/checkout + git push use in auto-sync-main-to-staging.yml." >&2
+            echo "::error::Likely cause: AUTO_SYNC_TOKEN was rotated/revoked on Gitea but the repo Actions secret was not updated. Runbook: see header." >&2
             echo "$redacted" >&2
             exit 1
           fi
 
-          # Sanity-check: response should be one line "<sha> refs/heads/staging".
-          if ! echo "$out" | grep -qE '^[0-9a-f]{40}[[:space:]]+refs/heads/staging$'; then
-            echo "::error::ls-remote returned unexpected shape:" >&2
-            echo "$out" | sed -E "s|oauth2:[^@]+@|oauth2:<redacted>@|g" >&2
-            exit 1
-          fi
-
-          staging_sha=$(echo "$out" | awk '{print $1}')
-          echo "git HTTPS auth path resolves staging → ${staging_sha:0:8} ✓"
+          echo "git HTTPS auth path: NOP push --dry-run to staging → ${staging_sha:0:8} ✓"
 
       - name: Summarise canary result
         # Everything passed — surface a green summary. (Failures
@@ -333,7 +393,7 @@ jobs:
             echo "AUTO_SYNC_TOKEN is healthy:"
             echo "- Authenticates as \`${EXPECTED_PERSONA}\` ✓"
             echo "- Has \`read:repository\` scope on \`${REPO_PATH}\` ✓"
-            echo "- Git HTTPS auth path resolves \`refs/heads/staging\` ✓"
+            echo "- Git HTTPS auth path: no-op dry-run push to \`refs/heads/staging\` succeeds ✓"
             echo ""
             echo "Auto-sync main → staging will succeed on the next push to main."
             echo "If this canary ever goes RED, see the runbook in this workflow's header."
