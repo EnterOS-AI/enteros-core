@@ -176,6 +176,10 @@ jobs:
       # repeating the secret reference. GitHub masks the value in
       # logs automatically.
       AUTO_SYNC_TOKEN: ${{ secrets.AUTO_SYNC_TOKEN }}
+      # MUST stay in sync with auto-sync-main-to-staging.yml's
+      # `git config user.name "devops-engineer"` line. Renaming the
+      # devops-engineer persona requires updating both files (and
+      # the staging branch protection's `push_whitelist_usernames`).
       EXPECTED_PERSONA: devops-engineer
       GITEA_HOST: git.moleculesai.app
       REPO_PATH: molecule-ai/molecule-core
