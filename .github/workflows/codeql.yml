@@ -55,17 +55,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - name: Checkout sibling plugin repo
-        # Same reasoning as publish-workspace-server-image.yml — the Go
-        # module's replace directive needs the plugin source so
-        # CodeQL's "go build" phase can resolve.
-        if: matrix.language == 'go'
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          repository: molecule-ai/molecule-ai-plugin-github-app-auth
-          path: molecule-ai-plugin-github-app-auth
-          token: ${{ secrets.PLUGIN_REPO_PAT || secrets.GITHUB_TOKEN }}
-
+      # github-app-auth sibling-checkout removed 2026-05-07 (#157):
+      # plugin was dropped + the Dockerfile no longer needs it.
       # jq is pre-installed on ubuntu-latest — no setup step needed.
 
       - name: Initialize CodeQL
@@ -121,7 +112,7 @@ jobs:
         # 14-day retention — longer than default 3, short enough not
         # to bloat quota.
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@v3 # pinned to v3 for Gitea act_runner v0.6 compatibility (internal#46)
         with:
           name: codeql-sarif-${{ matrix.language }}
           path: sarif-results/${{ matrix.language }}/
