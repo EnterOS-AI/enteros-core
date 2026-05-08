@@ -119,6 +119,17 @@ jobs:
       # symptom, different root cause: staging still has the in-image
       # clone path, hits the auth error directly).
       #
+      # 2026-05-08 sub-finding (#192): the clone step ALSO fails when
+      # any referenced workspace-template repo is private and the
+      # AUTO_SYNC_TOKEN bearer (devops-engineer persona) lacks read
+      # access. Root cause: 5 of 9 workspace-template repos
+      # (openclaw, codex, crewai, deepagents, gemini-cli) had been
+      # marked private with no team grant. Resolution: flipped them
+      # to public per `feedback_oss_first_repo_visibility_default`
+      # (the OSS surface should be public). Layer-3 (customer-private +
+      # marketplace third-party repos) tracked separately in
+      # internal#102.
+      #
       # Token shape matches publish-workspace-server-image.yml: AUTO_SYNC_TOKEN
       # is the devops-engineer persona PAT, NOT the founder PAT (per
       # `feedback_per_agent_gitea_identity_default`). clone-manifest.sh
