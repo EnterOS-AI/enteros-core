@@ -87,7 +87,7 @@ jobs:
         run: go mod download
       - if: needs.changes.outputs.platform == 'true'
         run: go build ./cmd/server
-      # CLI (molecli) moved to standalone repo: git.moleculesai.app/molecule-ai/molecule-cli
+      # CLI (molecli) moved to standalone repo: github.com/molecule-ai/molecule-cli
       - if: needs.changes.outputs.platform == 'true'
         run: go vet ./... || true
       - if: needs.changes.outputs.platform == 'true'
@@ -235,7 +235,13 @@ jobs:
         run: npx vitest run --coverage
       - name: Upload coverage summary as artifact
         if: needs.changes.outputs.canvas == 'true' && always()
-        uses: actions/upload-artifact@v3 # pinned to v3 for Gitea act_runner v0.6 compatibility (internal#46)
+        # Pinned to v3 for Gitea act_runner v0.6 compatibility — v4+ uses
+        # the GHES 3.10+ artifact protocol that Gitea 1.22.x does NOT
+        # implement, surfacing as `GHESNotSupportedError: @actions/artifact
+        # v2.0.0+, upload-artifact@v4+ and download-artifact@v4+ are not
+        # currently supported on GHES`. Drop this pin when Gitea ships
+        # the v4 protocol (tracked: post-Gitea-1.23 followup).
+        uses: actions/upload-artifact@c6a366c94c3e0affe28c06c8df20a878f24da3cf # v3.2.2
         with:
           name: canvas-coverage-${{ github.run_id }}
           path: canvas/coverage/
@@ -243,8 +249,8 @@ jobs:
           if-no-files-found: warn
 
   # MCP Server + SDK removed from CI — now in standalone repos:
-  # - git.moleculesai.app/molecule-ai/molecule-mcp-server (npm CI)
-  # - git.moleculesai.app/molecule-ai/molecule-sdk-python (PyPI CI)
+  # - github.com/molecule-ai/molecule-mcp-server (npm CI)
+  # - github.com/molecule-ai/molecule-sdk-python (PyPI CI)
 
   # e2e-api job moved to .github/workflows/e2e-api.yml (issue #458).
   # It now has workflow-level concurrency (cancel-in-progress: false) so
@@ -434,5 +440,5 @@ jobs:
           fi
 
       # SDK + plugin validation moved to standalone repo:
-      # git.moleculesai.app/molecule-ai/molecule-sdk-python
+      # github.com/molecule-ai/molecule-sdk-python
 
