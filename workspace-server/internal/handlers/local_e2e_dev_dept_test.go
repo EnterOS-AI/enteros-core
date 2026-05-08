@@ -3,10 +3,13 @@ package handlers
 import (
 	"archive/tar"
 	"bytes"
+	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -245,5 +248,128 @@ func TestLocalE2E_FilesDirConsumption(t *testing.T) {
 	t.Logf("checked %d workspaces with files_dir", checked)
 	if checked < 25 {
 		t.Errorf("expected ~28 workspaces with files_dir (post-atomization); only saw %d", checked)
+	}
+}
+
+// PR-C from the Phase 3a phasing (task #234): real-Gitea e2e for the
+// !external resolver against the LIVE molecule-ai/molecule-dev-department
+// repo. Verifies the production gitFetcher fetches the dev tree and the
+// resolver grafts it correctly into a parent template that has NO
+// symlink — composition is purely platform-side.
+//
+// Skipped if Gitea isn't reachable (offline / firewall / CI without
+// network). Requires `git` binary on PATH.
+func TestLocalE2E_ExternalDevDepartment(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skipf("git binary not found: %v", err)
+	}
+
+	// Skip if Gitea host isn't reachable (TCP probe). Avoids network-
+	// dependent tests failing on offline runners.
+	conn, err := net.DialTimeout("tcp", "git.moleculesai.app:443", 3*time.Second)
+	if err != nil {
+		t.Skipf("git.moleculesai.app:443 unreachable: %v", err)
+	}
+	conn.Close()
+
+	// Build a minimal parent template inline — no need for the
+	// /tmp/local-e2e-deploy/ symlinked fixture. The whole point of
+	// !external is that the parent template is self-contained;
+	// composition resolves over the network at import time.
+	parent := t.TempDir()
+
+	orgYAML := []byte(`name: External-Only Test Parent
+description: Parent template that pulls the entire dev tree via !external.
+defaults:
+  runtime: claude-code
+  tier: 2
+workspaces:
+  - !external
+    repo: molecule-ai/molecule-dev-department
+    ref: main
+    path: dev-lead/workspace.yaml
+`)
+	if err := os.WriteFile(filepath.Join(parent, "org.yaml"), orgYAML, 0o644); err != nil {
+		t.Fatalf("write org.yaml: %v", err)
+	}
+
+	out, err := resolveYAMLIncludes(orgYAML, parent)
+	if err != nil {
+		t.Fatalf("resolveYAMLIncludes (!external against live Gitea): %v", err)
+	}
+
+	var tmpl OrgTemplate
+	if err := yaml.Unmarshal(out, &tmpl); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	// Walk the workspace tree, collect names + check files_dir paths.
+	flat := []OrgWorkspace{}
+	var walk func([]OrgWorkspace)
+	walk = func(ws []OrgWorkspace) {
+		for _, w := range ws {
+			flat = append(flat, w)
+			walk(w.Children)
+		}
+	}
+	walk(tmpl.Workspaces)
+
+	t.Logf("workspaces resolved through !external: %d", len(flat))
+	if len(flat) < 25 {
+		t.Errorf("expected ~28 dev-tree workspaces via !external; got %d", len(flat))
+	}
+
+	// Sentinel checks — same as TestLocalE2E_DevDepartmentExtraction
+	// (Q1+Q2 placements verified).
+	expected := []string{
+		"Dev Lead",
+		"Core Platform Lead",
+		"Controlplane Lead",
+		"App & Docs Lead",
+		"Documentation Specialist", // Q1
+		"Triage Operator",          // Q2
+	}
+	found := map[string]bool{}
+	for _, w := range flat {
+		found[w.Name] = true
+	}
+	for _, want := range expected {
+		if !found[want] {
+			t.Errorf("missing expected workspace %q", want)
+		}
+	}
+
+	// Every workspace's files_dir must be cache-prefixed (proves the
+	// path-rewrite ran end-to-end).
+	cachePrefix := ".external-cache"
+	for _, w := range flat {
+		if w.FilesDir == "" {
+			continue
+		}
+		if !strings.HasPrefix(w.FilesDir, cachePrefix) {
+			t.Errorf("workspace %q files_dir %q missing cache prefix %q", w.Name, w.FilesDir, cachePrefix)
+		}
+	}
+
+	// Verify the fetched cache exists and resolveInsideRoot accepts
+	// every workspace's files_dir (would cause provisioning to fail
+	// if not).
+	for _, w := range flat {
+		if w.FilesDir == "" {
+			continue
+		}
+		abs, err := resolveInsideRoot(parent, w.FilesDir)
+		if err != nil {
+			t.Errorf("workspace %q files_dir %q: resolveInsideRoot: %v", w.Name, w.FilesDir, err)
+			continue
+		}
+		info, err := os.Stat(abs)
+		if err != nil {
+			t.Errorf("workspace %q: stat %q: %v", w.Name, abs, err)
+			continue
+		}
+		if !info.IsDir() {
+			t.Errorf("workspace %q files_dir %q is not a directory", w.Name, w.FilesDir)
+		}
 	}
 }
