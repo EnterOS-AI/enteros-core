@@ -195,6 +195,19 @@ services:
       # App private key — read-only bind-mount. The host-side path is
       # gitignored per .gitignore rules (/.secrets/ + *.pem).
       - ./.secrets/github-app.pem:/secrets/github-app.pem:ro
+      # Per-role persona credentials (molecule-core#242 local surface).
+      # Sourced at workspace creation time by org_import.go::loadPersonaEnvFile
+      # when a workspace.yaml carries `role: <name>`. The host-side dir is
+      # populated by the operator-host bootstrap kit (28 dev-tree personas);
+      # /etc/molecule-bootstrap/personas is the in-container path the
+      # platform expects (matches the prod tenant-EC2 path so the same code
+      # works in both modes).
+      #
+      # Read-only mount — workspace-server only reads, never writes here.
+      # If the host dir is empty/missing the platform's loadPersonaEnvFile
+      # silently no-ops per its existing semantics, so this mount is safe
+      # even on a fresh machine that hasn't run the bootstrap kit yet.
+      - ${MOLECULE_PERSONA_ROOT_HOST:-${HOME}/.molecule-ai/personas}:/etc/molecule-bootstrap/personas:ro
     ports:
       - "${PLATFORM_PUBLISH_PORT:-8080}:${PLATFORM_PORT:-8080}"
     networks:
