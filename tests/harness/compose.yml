@@ -168,40 +168,30 @@ services:
   # subdomain — the Host header carries the tenant identity, not the
   # routing destination. Local cf-proxy mirrors this exactly.
   #
-  # nginx.conf delivery: docker compose `configs:` block (not a bind
-  # mount) so the file ships as content packaged by compose, not a
-  # host-path bind that has to be visible to the docker daemon's runc.
-  # Bind mounts break under Gitea's act_runner DinD because runc
-  # resolves the source path on the OUTER docker host (the runner's
-  # host filesystem), not inside the runner container — the path
-  # `/workspace/.../tests/harness/cf-proxy/nginx.conf` is only visible
-  # to the runner, not to the daemon below it. The `configs:` form
-  # uploads the file to the daemon as part of the service definition
-  # and is bind-mount-equivalent at the container level. See issue #88
-  # item 2.
+  # nginx.conf delivery: built into a custom image via cf-proxy/Dockerfile
+  # (a thin nginx:1.27-alpine + COPY). NOT a bind mount and NOT a
+  # compose `configs:` block, both of which break under Gitea's
+  # act_runner: the runner talks to the OUTER docker daemon over the
+  # host socket, and runc resolves bind sources on the outer host
+  # filesystem, where `/workspace/.../tests/harness/cf-proxy/nginx.conf`
+  # is invisible. Compose `configs:` falls back to bind mounts without
+  # swarm, so it hits the same gap. A build context, by contrast, is
+  # uploaded to the daemon as a tarball at build time — no bind. See
+  # issue #88 item 2.
   cf-proxy:
-    image: nginx:1.27-alpine
+    build:
+      context: ./cf-proxy
+      dockerfile: Dockerfile
     depends_on:
       tenant-alpha:
         condition: service_healthy
       tenant-beta:
         condition: service_healthy
-    configs:
-      - source: cf-proxy-nginx-conf
-        target: /etc/nginx/nginx.conf
-        mode: 0444
     # Bind to 127.0.0.1 only — hardcoded ADMIN_TOKENs make 0.0.0.0
     # exposure unsafe even on a local network.
     ports:
       - "127.0.0.1:8080:8080"
     networks: [harness-net]
-
-configs:
-  # Defined once at compose level so any future service (e.g. a second
-  # nginx variant for an external-connect smoke test) can reuse the
-  # same source file.
-  cf-proxy-nginx-conf:
-    file: ./cf-proxy/nginx.conf
 
 networks:
   harness-net:
