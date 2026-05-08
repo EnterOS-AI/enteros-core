@@ -137,27 +137,28 @@ jobs:
         id: canary
         run: bash tests/e2e/test_staging_full_saas.sh
 
-      # Alerting: open an issue only after THREE consecutive failures so
-      # transient flakes (Cloudflare DNS hiccup, AWS API blip) don't spam
-      # the issue list. If an issue is already open, we still comment on
-      # every failure so ops sees the streak. Auto-close on next green.
+      # Alerting: open a sticky issue on the FIRST failure; comment on
+      # subsequent failures; auto-close on next green. Comment-on-existing
+      # de-duplicates so a single open issue accumulates the streak —
+      # ops sees one issue with N comments rather than N issues.
       #
-      # Threshold rationale: canary fires every 30 min, so 3 failures =
-      # ~90 min of consecutive red — well past any single-run flake but
-      # still tight enough that a real outage gets surfaced before the
-      # next deploy window.
+      # Why no consecutive-failures threshold (e.g., wait 3 runs before
+      # filing): the prior threshold check used
+      # `github.rest.actions.listWorkflowRuns()` which Gitea 1.22.6 does
+      # not expose (returns 404). On Gitea Actions the threshold call
+      # ALWAYS failed, breaking the entire alerting step and going days
+      # silent on real regressions (38h+ chronic red on 2026-05-07/08
+      # before this fix; tracked in molecule-core#129). Filing on first
+      # failure is also better UX — we want to know about the first red,
+      # not wait 90 min for it to "count." Real flakes get one issue +
+      # a quick close-on-green; persistent reds accumulate comments.
       - name: Open issue on failure
         if: failure()
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
-        env:
-          # Inject the workflow path explicitly — context.workflow is
-          # the *name*, not the file path the actions API needs.
-          WORKFLOW_PATH: '.github/workflows/canary-staging.yml'
-          CONSECUTIVE_THRESHOLD: '3'
         with:
           script: |
             const title = '🔴 Canary failing: staging SaaS smoke';
-            const runURL = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const runURL = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
 
             // Find an existing open canary issue (stable title match).
             // If one exists, this isn't a "first failure" — comment and exit.
@@ -177,32 +178,12 @@ jobs:
               return;
             }
 
-            // No open issue yet — check the last N-1 runs' conclusions.
-            // We open the issue only if the last (THRESHOLD-1) runs ALSO
-            // failed (so this is the 3rd consecutive red).
-            const threshold = parseInt(process.env.CONSECUTIVE_THRESHOLD, 10);
-            const { data: runs } = await github.rest.actions.listWorkflowRuns({
-              owner: context.repo.owner, repo: context.repo.repo,
-              workflow_id: process.env.WORKFLOW_PATH,
-              status: 'completed',
-              per_page: threshold,
-              // Skip the current in-progress run; it isn't 'completed' yet.
-            });
-            // listWorkflowRuns returns recent first. We need (threshold-1)
-            // prior failures (current run is the threshold-th).
-            const priorFailures = (runs.workflow_runs || [])
-              .slice(0, threshold - 1)
-              .filter(r => r.id !== context.runId)
-              .filter(r => r.conclusion === 'failure')
-              .length;
-            if (priorFailures < threshold - 1) {
-              core.info(`Below threshold: ${priorFailures + 1}/${threshold} consecutive failures — not filing yet`);
-              return;
-            }
-
+            // No open issue yet — file one on this first failure. The
+            // comment-on-existing branch above means subsequent failures
+            // accumulate as comments on this same issue, so we don't
+            // spam new issues per run.
             const body =
-              `Canary run failed at ${new Date().toISOString()}, ` +
-              `${threshold} consecutive runs red.\n\n` +
+              `Canary run failed at ${new Date().toISOString()}.\n\n` +
               `Run: ${runURL}\n\n` +
               `This issue auto-closes on the next green canary run. ` +
               `Consecutive failures add a comment here rather than a new issue.`;
@@ -211,7 +192,7 @@ jobs:
               title, body,
               labels: ['canary-staging', 'bug'],
             });
-            core.info(`Opened canary failure issue (${threshold} consecutive reds)`);
+            core.info('Opened canary failure issue (first red)');
 
       - name: Auto-close canary issue on success
         if: success()
