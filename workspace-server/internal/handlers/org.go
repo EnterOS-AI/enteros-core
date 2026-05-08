@@ -422,6 +422,16 @@ type OrgWorkspace struct {
 	Tier     int    `yaml:"tier" json:"tier"`
 	Template string `yaml:"template" json:"template"`
 	FilesDir string `yaml:"files_dir" json:"files_dir"`
+	// Spawning gates whether this workspace (AND its descendants) gets
+	// provisioned during /org/import. Pointer so we can distinguish
+	// "explicitly set to false" from "unset" (default = spawn). Use case:
+	// the dev-tree org template declares the full team structure but a
+	// developer's local machine only has RAM for a subset; setting
+	// spawning: false on a leaf or a sub-tree root skips that branch
+	// entirely without editing the canonical template structure.
+	// Counted in countWorkspaces same as actual; subtree-skip happens
+	// at provision time in createWorkspaceTree.
+	Spawning *bool `yaml:"spawning,omitempty" json:"spawning,omitempty"`
 	// SystemPrompt is an inline override. Normally each role's system-prompt.md
 	// lives at `<files_dir>/system-prompt.md` and is copied via the files_dir
 	// template-copy step; inline overrides that path for ad-hoc workspaces.
