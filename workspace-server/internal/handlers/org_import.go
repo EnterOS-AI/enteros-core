@@ -42,6 +42,20 @@ import (
 // straight into the parent's child-coordinate space without doing a
 // canvas-wide absolute-position walk.
 func (h *OrgHandler) createWorkspaceTree(ws OrgWorkspace, parentID *string, absX, absY, relX, relY float64, defaults OrgDefaults, orgBaseDir string, results *[]map[string]interface{}, provisionSem chan struct{}) error {
+	// spawning: false guard — skip this workspace AND all descendants.
+	// Pointer-typed so we distinguish "explicitly false" from "unset"
+	// (unset = default to spawn). The guard sits BEFORE any side effect
+	// (no DB row, no docker provision, no children recursion) so a
+	// false-spawning subtree is genuinely a no-op except for the log line.
+	// Use case: dev-tree org template ships the full role taxonomy but a
+	// developer's machine only has RAM for a subset; a per-workspace
+	// `spawning: false` lets them narrow without editing the parent
+	// template's structure.
+	if ws.Spawning != nil && !*ws.Spawning {
+		log.Printf("Org import: skipping workspace %q (spawning=false; %d descendant workspace(s) in subtree also skipped)", ws.Name, countWorkspaces(ws.Children))
+		return nil
+	}
+
 	// Apply defaults
 	runtime := ws.Runtime
 	if runtime == "" {
