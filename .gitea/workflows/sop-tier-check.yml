@@ -46,17 +46,38 @@ jobs:
     steps:
       - name: Verify tier label + reviewer team membership
         env:
-          GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
-          GITEA_HOST: ${{ vars.GITEA_HOST || 'git.moleculesai.app' }}
-          REPO: ${{ gitea.repository }}
-          PR_NUMBER: ${{ gitea.event.pull_request.number }}
-          PR_AUTHOR: ${{ gitea.event.pull_request.user.login }}
+          # SOP_TIER_CHECK_TOKEN is the read-only `sop-tier-bot` PAT,
+          # provisioned with read:org scope and added to ceo/managers/
+          # engineers teams (a Gitea team-membership probe requires the
+          # caller to be a member of the team being probed). The auto-
+          # injected GITHUB_TOKEN's scope is repo-level only and cannot
+          # query org team membership, hence the dedicated secret.
+          # Falls back to GITHUB_TOKEN so the workflow at least starts and
+          # surfaces a clear error when the secret is missing.
+          GITEA_TOKEN: ${{ secrets.SOP_TIER_CHECK_TOKEN || secrets.GITHUB_TOKEN }}
+          GITEA_HOST: git.moleculesai.app
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
         run: |
           set -euo pipefail
+          if [ -z "${GITEA_TOKEN:-}" ]; then
+            echo "::error::Neither GITEA_TOKEN nor GITHUB_TOKEN is available. Add a GITEA_TOKEN secret with org-membership read scope to enable team-based approval gating."
+            exit 1
+          fi
           OWNER="${REPO%%/*}"
           NAME="${REPO##*/}"
           API="https://${GITEA_HOST}/api/v1"
           AUTH="Authorization: token ${GITEA_TOKEN}"
+          echo "::notice::tier-check start: repo=$OWNER/$NAME pr=$PR_NUMBER author=$PR_AUTHOR"
+          # Sanity-check the token resolves a user; surfaces token-scope problems
+          # early instead of failing on a downstream call with no context.
+          WHOAMI=$(curl -sS -H "$AUTH" "${API}/user" | jq -r '.login // ""')
+          if [ -z "$WHOAMI" ]; then
+            echo "::error::GITEA_TOKEN cannot resolve a user via /api/v1/user — check the token scope and that the secret is wired correctly."
+            exit 1
+          fi
+          echo "::notice::token resolves to user: $WHOAMI"
 
           # 1. Read tier label
           LABELS=$(curl -sS -H "$AUTH" "${API}/repos/${OWNER}/${NAME}/issues/${PR_NUMBER}/labels" | jq -r '.[].name')
@@ -86,6 +107,32 @@ jobs:
           esac
           echo "eligible_teams=$ELIGIBLE"
 
+          # Resolve team-name → team-id once. The /orgs/{org}/teams/{slug}/...
+          # endpoints don't exist on Gitea 1.22; we have to use /teams/{id}.
+          # Fail loud on missing team rather than treating it as "user not in
+          # team" — that'd mask a misconfigured deployment.
+          ORG_TEAMS_FILE=$(mktemp)
+          HTTP_CODE=$(curl -sS -o "$ORG_TEAMS_FILE" -w '%{http_code}' -H "$AUTH" \
+            "${API}/orgs/${OWNER}/teams")
+          echo "teams-list HTTP=$HTTP_CODE size=$(wc -c <"$ORG_TEAMS_FILE")"
+          echo "teams-list body (first 300 chars):"
+          head -c 300 "$ORG_TEAMS_FILE"; echo
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "::error::GET /orgs/${OWNER}/teams returned HTTP $HTTP_CODE — token likely lacks read:org scope. Add a SOP_TIER_CHECK_TOKEN secret with read:organization scope."
+            exit 1
+          fi
+          declare -A TEAM_ID
+          for T in $ELIGIBLE; do
+            ID=$(jq -r --arg t "$T" '.[] | select(.name==$t) | .id' <"$ORG_TEAMS_FILE" | head -1)
+            if [ -z "$ID" ] || [ "$ID" = "null" ]; then
+              VISIBLE=$(jq -r '.[]?.name? // empty' <"$ORG_TEAMS_FILE" 2>/dev/null | tr '\n' ' ')
+              echo "::error::Team \"$T\" not found in org $OWNER. Teams visible: $VISIBLE"
+              exit 1
+            fi
+            TEAM_ID[$T]="$ID"
+            echo "team-id: $T → $ID"
+          done
+
           # 3. Read approving reviewers
           REVIEWS=$(curl -sS -H "$AUTH" "${API}/repos/${OWNER}/${NAME}/pulls/${PR_NUMBER}/reviews")
           APPROVERS=$(echo "$REVIEWS" | jq -r '[.[] | select(.state=="APPROVED") | .user.login] | unique | .[]')
@@ -93,8 +140,9 @@ jobs:
             echo "::error::No approving reviews. Tier $TIER requires approval from {$ELIGIBLE} (non-author)."
             exit 1
           fi
+          echo "approvers: $(echo $APPROVERS | tr '\n' ' ')"
 
-          # 4. For each approver: check non-author + team membership
+          # 4. For each approver: check non-author + team membership (by id)
           OK=""
           for U in $APPROVERS; do
             if [ "$U" = "$PR_AUTHOR" ]; then
@@ -102,10 +150,12 @@ jobs:
               continue
             fi
             for T in $ELIGIBLE; do
+              ID="${TEAM_ID[$T]}"
               CODE=$(curl -sS -o /dev/null -w '%{http_code}' -H "$AUTH" \
-                "${API}/orgs/${OWNER}/teams/${T}/members/${U}")
+                "${API}/teams/${ID}/members/${U}")
+              echo "  probe: $U in team $T (id=$ID) → HTTP $CODE"
               if [ "$CODE" = "200" ] || [ "$CODE" = "204" ]; then
-                echo "approver $U is in team $T (eligible for $TIER)"
+                echo "::notice::approver $U is in team $T (eligible for $TIER)"
                 OK="yes"
                 break
               fi
@@ -114,7 +164,7 @@ jobs:
           done
 
           if [ -z "$OK" ]; then
-            echo "::error::Tier $TIER requires approval from a non-author member of {$ELIGIBLE}. Got approvers: $APPROVERS"
+            echo "::error::Tier $TIER requires approval from a non-author member of {$ELIGIBLE}. Got approvers: $APPROVERS — none of them satisfied team membership (probe HTTP codes above)."
             exit 1
           fi
           echo "::notice::sop-tier-check passed: $TIER, approver in {$ELIGIBLE}"
