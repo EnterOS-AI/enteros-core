@@ -1,33 +1,29 @@
 # sop-tier-check — canonical Gitea Actions workflow for §SOP-6 enforcement.
 #
-# Copy this file to `.gitea/workflows/sop-tier-check.yml` in any repo that
-# wants the §SOP-6 PR gate enforced. Pair with branch protection on the
-# protected branch:
-#   required_status_checks: ["sop-tier-check"]
-#   required_approving_reviews: 1
-#   approving_review_teams: ["ceo", "managers", "engineers"]
+# Logic lives in `.gitea/scripts/sop-tier-check.sh` (extracted 2026-05-09
+# from the previous inline-bash version). The script is the single source
+# of truth; this workflow file just sets env + invokes it.
 #
-# What it does:
-#   1. Reads the PR's `tier:*` label (low | medium | high). Fails if absent
-#      or ambiguous.
-#   2. Reads every approving review on the PR.
-#   3. For each approver, queries Gitea team membership.
-#   4. Marks the check success only if at least one approver is in a team
-#      whose tier-tag covers the PR's tier label, AND the approver is not
-#      the author.
+# Copy BOTH files (`.gitea/workflows/sop-tier-check.yml` +
+# `.gitea/scripts/sop-tier-check.sh`) into any repo that wants the
+# §SOP-6 PR gate enforced. Pair with branch protection on the protected
+# branch:
+#   required_status_checks:    ["sop-tier-check / tier-check (pull_request)"]
+#   required_approving_reviews: 1
+#   approving_review_teams:    ["ceo", "managers", "engineers"]
 #
 # Tier → eligible-team mapping (mirror of dev-sop §SOP-6):
 #   tier:low    → engineers, managers, ceo
 #   tier:medium → managers, ceo
 #   tier:high   → ceo
 #
-# Author identity is excluded automatically; Gitea's review system already
-# rejects self-reviews, but this workflow re-checks defensively in case the
-# native rule is bypassed (admin override, branch-protection edit, etc.).
+# Force-merge: Owners-team override remains available out-of-band via
+# the Gitea merge API; force-merge writes `incident.force_merge` to
+# `structure_events` per §Persistent structured logging gate (Phase 3).
 #
-# Force-merge: Owners-team override remains available out-of-band via the
-# Gitea merge API; force-merge writes `incident.force_merge` to
-# structure_events per §Persistent structured logging gate (Phase 3).
+# Set `SOP_DEBUG: '1'` in the env block to enable per-API-call diagnostic
+# lines — useful when diagnosing token-scope or team-id-resolution
+# issues. Default off.
 
 name: sop-tier-check
 
@@ -40,9 +36,9 @@ name: sop-tier-check
 # `pull_request_target` (added in Gitea 1.21 via go-gitea/gitea#25229)
 # is the documented mitigation.
 #
-# This workflow does NOT call `actions/checkout`, so no untrusted code
-# is ever executed in the runner — we only HTTP-call the Gitea API. If
-# a future change adds a checkout step, it MUST pin to
+# This workflow does NOT call `actions/checkout` of PR HEAD code, so no
+# untrusted code is ever executed in the runner — we only HTTP-call the
+# Gitea API. If a future change adds a checkout step, it MUST pin to
 # `${{ github.event.pull_request.base.sha }}` (NOT `head.sha`) to keep
 # the trust boundary.
 on:
@@ -58,127 +54,28 @@ jobs:
       contents: read
       pull-requests: read
     steps:
+      - name: Check out base branch (for the script)
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          # Pin to base.sha — pull_request_target's protection only
+          # works if we never check out PR HEAD. Same SHA the workflow
+          # itself was loaded from.
+          ref: ${{ github.event.pull_request.base.sha }}
       - name: Verify tier label + reviewer team membership
         env:
-          # SOP_TIER_CHECK_TOKEN is the read-only `sop-tier-bot` PAT,
-          # provisioned with read:org scope and added to ceo/managers/
-          # engineers teams (a Gitea team-membership probe requires the
-          # caller to be a member of the team being probed). The auto-
-          # injected GITHUB_TOKEN's scope is repo-level only and cannot
-          # query org team membership, hence the dedicated secret.
-          # Falls back to GITHUB_TOKEN so the workflow at least starts and
-          # surfaces a clear error when the secret is missing.
+          # SOP_TIER_CHECK_TOKEN is the org-level secret for the
+          # sop-tier-bot PAT (read:organization,read:user,read:issue,
+          # read:repository). Stored at the org level
+          # (/api/v1/orgs/molecule-ai/actions/secrets) so per-repo
+          # configuration is unnecessary — every repo in the org
+          # picks it up automatically.
+          # Falls back to GITHUB_TOKEN with a clear error if missing.
           GITEA_TOKEN: ${{ secrets.SOP_TIER_CHECK_TOKEN || secrets.GITHUB_TOKEN }}
           GITEA_HOST: git.moleculesai.app
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
-        run: |
-          set -euo pipefail
-          if [ -z "${GITEA_TOKEN:-}" ]; then
-            echo "::error::Neither GITEA_TOKEN nor GITHUB_TOKEN is available. Add a GITEA_TOKEN secret with org-membership read scope to enable team-based approval gating."
-            exit 1
-          fi
-          OWNER="${REPO%%/*}"
-          NAME="${REPO##*/}"
-          API="https://${GITEA_HOST}/api/v1"
-          AUTH="Authorization: token ${GITEA_TOKEN}"
-          echo "::notice::tier-check start: repo=$OWNER/$NAME pr=$PR_NUMBER author=$PR_AUTHOR"
-          # Sanity-check the token resolves a user; surfaces token-scope problems
-          # early instead of failing on a downstream call with no context.
-          WHOAMI=$(curl -sS -H "$AUTH" "${API}/user" | jq -r '.login // ""')
-          if [ -z "$WHOAMI" ]; then
-            echo "::error::GITEA_TOKEN cannot resolve a user via /api/v1/user — check the token scope and that the secret is wired correctly."
-            exit 1
-          fi
-          echo "::notice::token resolves to user: $WHOAMI"
-
-          # 1. Read tier label
-          LABELS=$(curl -sS -H "$AUTH" "${API}/repos/${OWNER}/${NAME}/issues/${PR_NUMBER}/labels" | jq -r '.[].name')
-          TIER=""
-          for L in $LABELS; do
-            case "$L" in
-              tier:low|tier:medium|tier:high)
-                if [ -n "$TIER" ]; then
-                  echo "::error::Multiple tier labels: $TIER + $L. Apply exactly one."
-                  exit 1
-                fi
-                TIER="$L"
-              ;;
-            esac
-          done
-          if [ -z "$TIER" ]; then
-            echo "::error::PR has no tier:low|tier:medium|tier:high label. Apply one before merge."
-            exit 1
-          fi
-          echo "tier=$TIER"
-
-          # 2. Tier → eligible teams
-          case "$TIER" in
-            tier:low)    ELIGIBLE="engineers managers ceo" ;;
-            tier:medium) ELIGIBLE="managers ceo" ;;
-            tier:high)   ELIGIBLE="ceo" ;;
-          esac
-          echo "eligible_teams=$ELIGIBLE"
-
-          # Resolve team-name → team-id once. The /orgs/{org}/teams/{slug}/...
-          # endpoints don't exist on Gitea 1.22; we have to use /teams/{id}.
-          # Fail loud on missing team rather than treating it as "user not in
-          # team" — that'd mask a misconfigured deployment.
-          ORG_TEAMS_FILE=$(mktemp)
-          HTTP_CODE=$(curl -sS -o "$ORG_TEAMS_FILE" -w '%{http_code}' -H "$AUTH" \
-            "${API}/orgs/${OWNER}/teams")
-          echo "teams-list HTTP=$HTTP_CODE size=$(wc -c <"$ORG_TEAMS_FILE")"
-          echo "teams-list body (first 300 chars):"
-          head -c 300 "$ORG_TEAMS_FILE"; echo
-          if [ "$HTTP_CODE" != "200" ]; then
-            echo "::error::GET /orgs/${OWNER}/teams returned HTTP $HTTP_CODE — token likely lacks read:org scope. Add a SOP_TIER_CHECK_TOKEN secret with read:organization scope."
-            exit 1
-          fi
-          declare -A TEAM_ID
-          for T in $ELIGIBLE; do
-            ID=$(jq -r --arg t "$T" '.[] | select(.name==$t) | .id' <"$ORG_TEAMS_FILE" | head -1)
-            if [ -z "$ID" ] || [ "$ID" = "null" ]; then
-              VISIBLE=$(jq -r '.[]?.name? // empty' <"$ORG_TEAMS_FILE" 2>/dev/null | tr '\n' ' ')
-              echo "::error::Team \"$T\" not found in org $OWNER. Teams visible: $VISIBLE"
-              exit 1
-            fi
-            TEAM_ID[$T]="$ID"
-            echo "team-id: $T → $ID"
-          done
-
-          # 3. Read approving reviewers
-          REVIEWS=$(curl -sS -H "$AUTH" "${API}/repos/${OWNER}/${NAME}/pulls/${PR_NUMBER}/reviews")
-          APPROVERS=$(echo "$REVIEWS" | jq -r '[.[] | select(.state=="APPROVED") | .user.login] | unique | .[]')
-          if [ -z "$APPROVERS" ]; then
-            echo "::error::No approving reviews. Tier $TIER requires approval from {$ELIGIBLE} (non-author)."
-            exit 1
-          fi
-          echo "approvers: $(echo $APPROVERS | tr '\n' ' ')"
-
-          # 4. For each approver: check non-author + team membership (by id)
-          OK=""
-          for U in $APPROVERS; do
-            if [ "$U" = "$PR_AUTHOR" ]; then
-              echo "skip self-review by $U"
-              continue
-            fi
-            for T in $ELIGIBLE; do
-              ID="${TEAM_ID[$T]}"
-              CODE=$(curl -sS -o /dev/null -w '%{http_code}' -H "$AUTH" \
-                "${API}/teams/${ID}/members/${U}")
-              echo "  probe: $U in team $T (id=$ID) → HTTP $CODE"
-              if [ "$CODE" = "200" ] || [ "$CODE" = "204" ]; then
-                echo "::notice::approver $U is in team $T (eligible for $TIER)"
-                OK="yes"
-                break
-              fi
-            done
-            [ -n "$OK" ] && break
-          done
-
-          if [ -z "$OK" ]; then
-            echo "::error::Tier $TIER requires approval from a non-author member of {$ELIGIBLE}. Got approvers: $APPROVERS — none of them satisfied team membership (probe HTTP codes above)."
-            exit 1
-          fi
-          echo "::notice::sop-tier-check passed: $TIER, approver in {$ELIGIBLE}"
+          # Set to '1' for diagnostic per-API-call output. Off by default
+          # so production logs aren't noisy.
+          SOP_DEBUG: '0'
+        run: bash .gitea/scripts/sop-tier-check.sh
