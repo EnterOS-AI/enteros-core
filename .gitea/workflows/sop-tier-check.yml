@@ -31,8 +31,22 @@
 
 name: sop-tier-check
 
+# SECURITY: triggers MUST use `pull_request_target`, not `pull_request`.
+# `pull_request_target` loads the workflow definition from the BASE
+# branch (i.e. `main`), not the PR's HEAD. With `pull_request`, anyone
+# with write access to a feature branch could rewrite this file in
+# their PR to dump SOP_TIER_CHECK_TOKEN (org-read scope) to logs and
+# exfiltrate it. Verified 2026-05-09 against Gitea 1.22.6 —
+# `pull_request_target` (added in Gitea 1.21 via go-gitea/gitea#25229)
+# is the documented mitigation.
+#
+# This workflow does NOT call `actions/checkout`, so no untrusted code
+# is ever executed in the runner — we only HTTP-call the Gitea API. If
+# a future change adds a checkout step, it MUST pin to
+# `${{ github.event.pull_request.base.sha }}` (NOT `head.sha`) to keep
+# the trust boundary.
 on:
-  pull_request:
+  pull_request_target:
     types: [opened, edited, synchronize, reopened, labeled, unlabeled]
   pull_request_review:
     types: [submitted, dismissed, edited]
