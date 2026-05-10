@@ -18,7 +18,11 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
       },
       {
         keys: ["↑↓←→"],
-        description: "Nudge selected node 20px; hold Shift for 100px",
+        description: "Nudge selected node 10px; hold Shift for 50px",
+      },
+      {
+        keys: ["Cmd", "↑↓←→"],
+        description: "Resize selected node (↑↓ height, ←→ width); hold Shift for fine control (2px)",
       },
       {
         keys: ["Enter"],
