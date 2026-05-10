@@ -330,12 +330,14 @@ describe("Cmd/Ctrl+Arrow — keyboard node resize", () => {
   });
 
   it("resizes height down (smaller) on Cmd/Ctrl+ArrowUp", () => {
+    // Node starts at minHeight=110 (no children). Shrinking clamps to min —
+    // height stays 110. Width is unchanged.
     fireEvent.keyDown(window, { key: "ArrowUp", metaKey: true });
     expect(mockStoreState.onNodesChange).toHaveBeenCalledWith([
       expect.objectContaining({
         type: "dimensions",
         id: "n1",
-        dimensions: { width: 210, height: 100 },
+        dimensions: { width: 210, height: 110 },
       }),
     ]);
   });
@@ -352,12 +354,14 @@ describe("Cmd/Ctrl+Arrow — keyboard node resize", () => {
   });
 
   it("resizes width down (smaller) on Cmd/Ctrl+ArrowLeft", () => {
+    // Node starts at minWidth=210 (no children). Shrinking clamps to min —
+    // width stays 210. Height is unchanged.
     fireEvent.keyDown(window, { key: "ArrowLeft", metaKey: true });
     expect(mockStoreState.onNodesChange).toHaveBeenCalledWith([
       expect.objectContaining({
         type: "dimensions",
         id: "n1",
-        dimensions: { width: 200, height: 110 },
+        dimensions: { width: 210, height: 110 },
       }),
     ]);
   });
@@ -374,10 +378,12 @@ describe("Cmd/Ctrl+Arrow — keyboard node resize", () => {
   });
 
   it("uses 2px step with Shift held", () => {
+    // Step is 2px with Shift, but minHeight=110 clamps the result.
+    // 110 - 2 = 108, Math.max(110, 108) = 110. Width is unchanged.
     fireEvent.keyDown(window, { key: "ArrowUp", metaKey: true, shiftKey: true });
     expect(mockStoreState.onNodesChange).toHaveBeenCalledWith([
       expect.objectContaining({
-        dimensions: { width: 210, height: 108 },
+        dimensions: { width: 210, height: 110 },
       }),
     ]);
   });
