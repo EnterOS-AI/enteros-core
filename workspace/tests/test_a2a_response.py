@@ -121,6 +121,11 @@ _FIXTURES = {
     "push_queued_no_method": {
         "queued": True,
     },
+    "push_queued_no_queue_id": {
+        # queue_id is purely informational — parser must not raise on its absence.
+        "queued": True,
+        "method": "message/send",
+    },
     "malformed_empty_dict": {},
     "malformed_unexpected_keys": {"foo": "bar", "baz": 42},
     "malformed_status_queued_no_delivery_mode": {
@@ -198,6 +203,24 @@ class TestQueuedVariant:
         assert isinstance(v, a2a_response.Queued)
         assert v.method == "message/send"
         assert v.delivery_mode == "push"
+
+    def test_push_queued_missing_queue_id_still_parsed(self):
+        # queue_id is purely informational — its absence must not break parsing.
+        v = a2a_response.parse(_FIXTURES["push_queued_no_queue_id"])
+        assert isinstance(v, a2a_response.Queued)
+        assert v.method == "message/send"
+        assert v.delivery_mode == "push"
+
+    def test_push_queued_is_distinct_from_poll_queued(self):
+        # Both paths return Queued, but from different wire envelopes.
+        # Verify both parse correctly and are independent.
+        push_v = a2a_response.parse(_FIXTURES["push_queued_full"])
+        poll_v = a2a_response.parse(_FIXTURES["poll_queued_full"])
+        assert isinstance(push_v, a2a_response.Queued)
+        assert isinstance(poll_v, a2a_response.Queued)
+        assert push_v.method == poll_v.method == "message/send"
+        assert push_v.delivery_mode == "push"
+        assert poll_v.delivery_mode == "poll"
 
     def test_push_queued_logs_queue_id(self, caplog):
         with caplog.at_level(logging.INFO, logger="a2a_response"):
@@ -493,6 +516,7 @@ class TestRegressionGate:
             "push_queued_full":                  a2a_response.Queued,
             "push_queued_notify":                a2a_response.Queued,
             "push_queued_no_method":             a2a_response.Queued,
+            "push_queued_no_queue_id":           a2a_response.Queued,
             "malformed_empty_dict":              a2a_response.Malformed,
             "malformed_unexpected_keys":         a2a_response.Malformed,
             "malformed_status_queued_no_delivery_mode": a2a_response.Malformed,
