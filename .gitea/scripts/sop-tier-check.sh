@@ -208,7 +208,9 @@ fi
 debug "approvers: $(echo "$APPROVERS" | tr '\n' ' ')"
 
 # 6. For each approver: skip self-review; probe team membership by id.
-# Build $APPROVER_TEAMS[<user>]=space-separated-team-names.
+# Build $APPROVER_TEAMS[<user>]=space-surrounded team names (e.g. " managers ").
+# Pre/post spaces ensure case patterns *${_t}* match even when the name
+# is the first or last entry (bash case *word* needs delimiters on both sides).
 declare -A APPROVER_TEAMS
 for U in $APPROVERS; do
   [ "$U" = "$PR_AUTHOR" ] && debug "skip self-review by $U" && continue
@@ -218,7 +220,7 @@ for U in $APPROVERS; do
       "${API}/teams/${ID}/members/${U}")
     debug "probe: $U in team $T (id=$ID) → HTTP $CODE"
     if [ "$CODE" = "200" ] || [ "$CODE" = "204" ]; then
-      APPROVER_TEAMS[$U]="${APPROVER_TEAMS[$U]:-}${APPROVER_TEAMS[$U]:+ }$T"
+      APPROVER_TEAMS[$U]="${APPROVER_TEAMS[$U]:- } ${APPROVER_TEAMS[$U]:+ }$T "
       debug "$U qualifies for team $T"
     fi
   done
@@ -229,11 +231,11 @@ done
 # legacy OR-gate: use the simplified loop from before internal#189.
 if [ -n "${LEGACY_ELIGIBLE:-}" ]; then
   OK=""
-  for U in "${!APPROVER_TEAMS[@]}"; do
-    for T in $LEGACY_ELIGIBLE; do
-      case "${APPROVER_TEAMS[$U]}" in
-        *"$T"*)
-          echo "::notice::approver $U is in team $T (eligible for $TIER)"
+  for _u in "${!APPROVER_TEAMS[@]}"; do
+    for _t2 in $LEGACY_ELIGIBLE; do
+      case "${APPROVER_TEAMS[$_u]}" in
+        *${_t2}*)
+          echo "::notice::approver $_u is in team $_t2 (eligible for $TIER)"
           OK="yes"
           break
         ;;
@@ -265,8 +267,10 @@ for _raw_clause in $EXPR; do
     [[ "$_t" == *"???" ]] && debug "clause \"$_t\": skipped (team pending creation)" && continue
     [ -z "${TEAM_ID[$_t]:-}" ] && debug "clause \"$_t\": no ID resolved, skipping" && continue
     for _u in "${!APPROVER_TEAMS[@]}"; do
+      # Note: APPROVER_TEAMS values are space-surrounded (e.g. " managers ").
+      # Pattern *${_t}* matches team name anywhere in the space-padded string.
       case "${APPROVER_TEAMS[$_u]}" in
-        *"$_t"*)
+        *${_t}*)
           _clause_passed="yes"
           debug "clause \"$_t\": satisfied by $_u"
           break
