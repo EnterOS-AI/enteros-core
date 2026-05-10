@@ -499,6 +499,59 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		r.POST("/admin/workspace-images/refresh", middleware.AdminAuth(db.DB), imgH.Refresh)
 	}
 
+	// Plugins — plgh must be initialized before the drift handler that uses it.
+	// Moved here (core#248 fix) because the drift handler block (core#123) was
+	// registered before plgh was created, causing "undefined: plgh" on main.
+	pluginsDir := findPluginsDir(configsDir)
+	// Runtime lookup lets the plugins handler filter the registry to plugins
+	// that declare support for the workspace's runtime, without taking a
+	// direct DB dependency in the handler package.
+	runtimeLookup := func(workspaceID string) (string, error) {
+		var runtime string
+		err := db.DB.QueryRowContext(
+			context.Background(),
+			`SELECT COALESCE(runtime, 'langgraph') FROM workspaces WHERE id = $1`,
+			workspaceID,
+		).Scan(&runtime)
+		return runtime, err
+	}
+	// Instance-id lookup powers the SaaS dispatch in install/uninstall:
+	// when a workspace is on the EC2-per-workspace backend (instance_id
+	// non-NULL) and there's no local Docker container to exec into, the
+	// pipeline pushes the staged plugin tarball to that EC2 over EIC SSH.
+	// Empty result means the workspace lives on the local-Docker backend
+	// (or hasn't been provisioned yet) and the handler falls back to its
+	// original Docker path. Same pattern templates.go and terminal.go use.
+	instanceIDLookup := func(workspaceID string) (string, error) {
+		var instanceID string
+		err := db.DB.QueryRowContext(
+			context.Background(),
+			`SELECT COALESCE(instance_id, '') FROM workspaces WHERE id = $1`,
+			workspaceID,
+		).Scan(&instanceID)
+		return instanceID, err
+	}
+	// pluginResolver: when provided (normal production), use it for plgh so
+	// the drift sweeper (which also gets the same resolver in main.go) uses
+	// identical resolver state. When nil (test / backward compat), let
+	// NewPluginsHandler create its own default registry.
+	plgh := handlers.NewPluginsHandler(pluginsDir, dockerCli, wh.RestartByID).
+		WithRuntimeLookup(runtimeLookup).
+		WithInstanceIDLookup(instanceIDLookup)
+	if pluginResolver != nil {
+		plgh = plgh.WithSourceResolver(pluginResolver)
+	}
+	r.GET("/plugins", plgh.ListRegistry)
+	r.GET("/plugins/sources", plgh.ListSources)
+	wsAuth.GET("/plugins", plgh.ListInstalled)
+	wsAuth.GET("/plugins/available", plgh.ListAvailableForWorkspace)
+	wsAuth.GET("/plugins/compatibility", plgh.CheckRuntimeCompatibility)
+	wsAuth.POST("/plugins", plgh.Install)
+	wsAuth.DELETE("/plugins/:name", plgh.Uninstall)
+	// Phase 30.3 — stream plugin as tar.gz so remote agents can pull +
+	// unpack locally instead of going through Docker exec.
+	wsAuth.GET("/plugins/:name/download", plgh.Download)
+
 	// Admin — plugin version-subscription drift queue (core#123).
 	// List pending drift entries and apply approved updates.
 	{
@@ -594,57 +647,6 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 	puh := handlers.NewPendingUploadsHandler(pendinguploads.NewPostgres(db.DB))
 	wsAuth.GET("/pending-uploads/:file_id/content", puh.GetContent)
 	wsAuth.POST("/pending-uploads/:file_id/ack", puh.Ack)
-
-	// Plugins
-	pluginsDir := findPluginsDir(configsDir)
-	// Runtime lookup lets the plugins handler filter the registry to plugins
-	// that declare support for the workspace's runtime, without taking a
-	// direct DB dependency in the handler package.
-	runtimeLookup := func(workspaceID string) (string, error) {
-		var runtime string
-		err := db.DB.QueryRowContext(
-			context.Background(),
-			`SELECT COALESCE(runtime, 'langgraph') FROM workspaces WHERE id = $1`,
-			workspaceID,
-		).Scan(&runtime)
-		return runtime, err
-	}
-	// Instance-id lookup powers the SaaS dispatch in install/uninstall:
-	// when a workspace is on the EC2-per-workspace backend (instance_id
-	// non-NULL) and there's no local Docker container to exec into, the
-	// pipeline pushes the staged plugin tarball to that EC2 over EIC SSH.
-	// Empty result means the workspace lives on the local-Docker backend
-	// (or hasn't been provisioned yet) and the handler falls back to its
-	// original Docker path. Same pattern templates.go and terminal.go use.
-	instanceIDLookup := func(workspaceID string) (string, error) {
-		var instanceID string
-		err := db.DB.QueryRowContext(
-			context.Background(),
-			`SELECT COALESCE(instance_id, '') FROM workspaces WHERE id = $1`,
-			workspaceID,
-		).Scan(&instanceID)
-		return instanceID, err
-	}
-	// pluginResolver: when provided (normal production), use it for plgh so
-	// the drift sweeper (which also gets the same resolver in main.go) uses
-	// identical resolver state. When nil (test / backward compat), let
-	// NewPluginsHandler create its own default registry.
-	plgh := handlers.NewPluginsHandler(pluginsDir, dockerCli, wh.RestartByID).
-		WithRuntimeLookup(runtimeLookup).
-		WithInstanceIDLookup(instanceIDLookup)
-	if pluginResolver != nil {
-		plgh = plgh.WithSourceResolver(pluginResolver)
-	}
-	r.GET("/plugins", plgh.ListRegistry)
-	r.GET("/plugins/sources", plgh.ListSources)
-	wsAuth.GET("/plugins", plgh.ListInstalled)
-	wsAuth.GET("/plugins/available", plgh.ListAvailableForWorkspace)
-	wsAuth.GET("/plugins/compatibility", plgh.CheckRuntimeCompatibility)
-	wsAuth.POST("/plugins", plgh.Install)
-	wsAuth.DELETE("/plugins/:name", plgh.Uninstall)
-	// Phase 30.3 — stream plugin as tar.gz so remote agents can pull +
-	// unpack locally instead of going through Docker exec.
-	wsAuth.GET("/plugins/:name/download", plgh.Download)
 
 	// Bundles — #164 + #165: both gated behind AdminAuth.
 	//   POST /bundles/import — CRITICAL: anon creation of arbitrary workspaces
