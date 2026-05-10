@@ -127,3 +127,51 @@ class TestPollBudgetEnvOverride:
         # numeric and >= the documented floor (180s healthsweep budget).
         assert isinstance(a2a_tools_delegation._SYNC_POLL_BUDGET_S, float)
         assert a2a_tools_delegation._SYNC_POLL_BUDGET_S >= 180.0
+
+
+# ============== Self-delegation guard ==============
+
+class TestSelfDelegationGuard:
+    """delegate_task / delegate_task_async to your own workspace ID must be
+    rejected immediately (it deadlocks _run_lock on the sync path — the
+    sending turn holds the lock, the receive handler waits for it, the
+    request 30s-times-out). A genuinely different target must NOT be
+    short-circuited by the guard."""
+
+    def _fresh(self, monkeypatch, own_id):
+        import a2a_tools_delegation as d
+        monkeypatch.setattr(d, "WORKSPACE_ID", own_id)
+        monkeypatch.setattr(d, "_peer_to_source", {}, raising=False)
+        return d
+
+    def test_delegate_task_rejects_self(self, monkeypatch):
+        import asyncio
+        d = self._fresh(monkeypatch, "ws-self-abc")
+        out = asyncio.run(d.tool_delegate_task("ws-self-abc", "do a thing"))
+        assert "your own workspace" in out.lower()
+
+    def test_delegate_task_rejects_self_via_explicit_source(self, monkeypatch):
+        import asyncio
+        d = self._fresh(monkeypatch, "ws-other-default")
+        out = asyncio.run(
+            d.tool_delegate_task("ws-X", "do a thing", source_workspace_id="ws-X")
+        )
+        assert "your own workspace" in out.lower()
+
+    def test_delegate_task_async_rejects_self(self, monkeypatch):
+        import asyncio
+        d = self._fresh(monkeypatch, "ws-self-abc")
+        out = asyncio.run(d.tool_delegate_task_async("ws-self-abc", "do a thing"))
+        assert "your own workspace" in out.lower()
+
+    def test_delegate_task_allows_different_target(self, monkeypatch):
+        """Guard passes through for a real peer — it reaches discover_peer
+        (stubbed to 'not found' here) rather than returning the self message."""
+        import asyncio
+        d = self._fresh(monkeypatch, "ws-self-abc")
+        async def _no_peer(*_a, **_kw):
+            return None
+        monkeypatch.setattr(d, "discover_peer", _no_peer)
+        out = asyncio.run(d.tool_delegate_task("ws-OTHER-xyz", "do a thing"))
+        assert "your own workspace" not in out.lower()
+        assert "not found" in out.lower()
