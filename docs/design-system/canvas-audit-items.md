@@ -2,7 +2,7 @@
 
 > **Status:** VERIFIED — Cross-referenced against molecule-core/canvas/src/ (2026-05-09)
 > **Author:** Core-FE (draft), Core-UIUX (verification)
-> **Updated:** 2026-05-09 with architecture structure + known issues
+> **Updated:** 2026-05-10 with architecture structure + known issues + new test coverage (PR #205)
 
 ## Canvas Stack (Verified)
 
@@ -128,4 +128,4 @@ PR: `fix/ink-soft-wcag-contrast`.
 ---
 
 *Verified 2026-05-09 by Core-UIUX against molecule-core/canvas/src/*
-*Updated 2026-05-10: keyboard shortcut dialog (PR #175) + keyboard node drag (PR #182) + keyboard edge anchors (PR #190) + keyboard node resize (PR #192) + screen reader announcements (PR #172) + text-ink-soft WCAG AA fix + Next.js 15.5.15*
+*Updated 2026-05-10: keyboard shortcut dialog (PR #175) + keyboard node drag (PR #182) + keyboard edge anchors (PR #190) + keyboard node resize (PR #192) + screen reader announcements (PR #172) + text-ink-soft WCAG AA fix + Next.js 15.5.15 + component test coverage (PR #205: Tooltip, Legend, TermsGate, ApprovalBanner)*
