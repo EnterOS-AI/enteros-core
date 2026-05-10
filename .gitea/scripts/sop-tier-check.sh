@@ -1,10 +1,26 @@
 #!/usr/bin/env bash
 # sop-tier-check — verify a Gitea PR satisfies the §SOP-6 approval gate.
 #
-# Reads the PR's tier label, walks approving reviewers, and checks each
-# approver's Gitea team membership against the tier's eligible-team set.
-# Marks pass only when at least one non-author approver is in an eligible
-# team.
+# Reads the PR's tier label, walks approving reviewers, and checks team
+# membership against the tier's approval expression. Passes only when
+# ALL clauses in the expression are satisfied by the set of approving
+# reviewers (AND-composition; internal#189).
+#
+# Expression syntax:
+#   "team-a"          — OR-set: any ONE of the comma-separated teams
+#   "team-a AND team-b" — AND: BOTH must each have ≥1 approver
+#   "(a,b,c)"         — OR-set wrapped in parens; same as "a,b,c"
+#
+# Example: "qa AND security AND (managers,ceo)" means:
+#   ≥1 approver in team "qa"  AND
+#   ≥1 approver in team "security"  AND
+#   ≥1 approver in team "managers" OR "ceo"
+#
+# Per the spec (internal#189), the hard gate here pairs with the
+# advisory gate of sop-conformance LLM-judge (internal#188): each
+# required-team click must reflect real verification (visible in review
+# body or A2A messages), not rubber-stamp APPROVE. Both gates together
+# close the "teammate clicks APPROVE without verifying" gap.
 #
 # Invoked from `.gitea/workflows/sop-tier-check.yml`. The workflow sets
 # the env vars below; this script does no IO outside of stdout/stderr +
@@ -19,14 +35,12 @@
 #   PR_AUTHOR     — login (from github.event.pull_request.user.login)
 #
 # Optional:
-#   SOP_DEBUG=1   — print per-API-call diagnostic lines (HTTP codes,
-#                   raw response bodies). Default: off.
-#
-# Stale-status caveat: Gitea Actions does not always re-fire workflows
-# on `labeled` / `pull_request_review:submitted` events. If the
-# sop-tier-check status is stale (e.g. red after labels/approvals were
-# added), push an empty commit to the PR branch to force a synchronize
-# event, OR re-request reviews. Tracked: internal#46.
+#   SOP_DEBUG=1        — print per-API-call diagnostic lines. Default: off.
+#   SOP_LEGACY_CHECK=1 — revert to OR-gate (≥1 approver from any eligible
+#                         team). Grace window for PRs in-flight when the
+#                         new AND-composition was deployed. Expires 2026-05-17
+#                         (7-day burn-in window; internal#189 Phase 1).
+#                         Set by workflow for PRs merged before the deploy.
 
 set -euo pipefail
 
@@ -77,16 +91,58 @@ if [ -z "$TIER" ]; then
 fi
 debug "tier=$TIER"
 
-# 2. Tier → eligible teams
-case "$TIER" in
-  tier:low)    ELIGIBLE="engineers managers ceo" ;;
-  tier:medium) ELIGIBLE="managers ceo" ;;
-  tier:high)   ELIGIBLE="ceo" ;;
-esac
-debug "eligible_teams=$ELIGIBLE"
+# 2. Tier → required team expression (AND-composition; internal#189)
+#
+# Expression syntax:
+#   clause-a AND clause-b AND ...   — ALL clauses must pass
+#   team-a,team-b,team-c            — OR-set: ≥1 approver in ANY of these teams
+#   (team-a,team-b)                 — same as team-a,team-b (parens optional)
+#
+# This map is the single source of truth. Update it when the team structure
+# or policy changes. Teams referenced here but absent in Gitea are treated
+# as unachievable (would always fail) — operators notice the clear error
+# and create the missing team.
+#
+# Current Gitea teams: ceo, engineers, managers
+# Future teams (create before removing "???" fallback): qa, security, security-audit
+declare -A TIER_EXPR=(
+  # tier:low — same as previous OR gate: any engineer, manager, or ceo.
+  ["tier:low"]="engineers,managers,ceo"
 
-# Resolve team-name → team-id once. /orgs/{org}/teams/{slug}/... endpoints
-# don't exist on Gitea 1.22; we have to use /teams/{id}.
+  # tier:medium — AND of (managers) AND (engineers) AND (qa???,security???)
+  # The qa+security clause requires both teams to exist; when not yet
+  # created, the PR author is responsible for adding them before requesting
+  # approval on a tier:medium PR. Ops: create qa + security Gitea teams
+  # and update this map to remove the "???" markers (internal#189 follow-up).
+  ["tier:medium"]="managers AND engineers AND qa???,security???"
+
+  # tier:high — ceo only. The AND-composition adds no value for a
+  # single-team gate, but the framework is wired for consistency.
+  ["tier:high"]="ceo"
+)
+
+EXPR="${TIER_EXPR[$TIER]-}"
+if [ -z "$EXPR" ]; then
+  echo "::error::No expression defined for tier $TIER in TIER_EXPR map."
+  exit 1
+fi
+debug "expression=$EXPR"
+
+# 3. Legacy OR-gate override (7-day burn-in grace window; internal#189 Phase 1)
+if [ "${SOP_LEGACY_CHECK:-}" = "1" ]; then
+  LEGACY_ELIGIBLE=""
+  case "$TIER" in
+    tier:low)    LEGACY_ELIGIBLE="engineers managers ceo" ;;
+    tier:medium) LEGACY_ELIGIBLE="managers ceo" ;;
+    tier:high)   LEGACY_ELIGIBLE="ceo" ;;
+  esac
+  echo "::notice::SOP_LEGACY_CHECK=1 — using OR-gate ({$LEGACY_ELIGIBLE}) for this PR."
+  ELIGIBLE="$LEGACY_ELIGIBLE"
+fi
+
+# 4. Resolve all team names → IDs
+# /orgs/{org}/teams/{slug}/... endpoints don't exist on Gitea 1.22;
+# we use /teams/{id}.
 ORG_TEAMS_FILE=$(mktemp)
 trap 'rm -f "$ORG_TEAMS_FILE"' EXIT
 HTTP_CODE=$(curl -sS -o "$ORG_TEAMS_FILE" -w '%{http_code}' -H "$AUTH" \
@@ -97,53 +153,147 @@ if [ "${SOP_DEBUG:-}" = "1" ]; then
   head -c 300 "$ORG_TEAMS_FILE" >&2; echo >&2
 fi
 if [ "$HTTP_CODE" != "200" ]; then
-  echo "::error::GET /orgs/${OWNER}/teams returned HTTP $HTTP_CODE — token likely lacks read:org scope. Add a SOP_TIER_CHECK_TOKEN secret with read:organization scope at the org level."
+  echo "::error::GET /orgs/${OWNER}/teams returned HTTP $HTTP_CODE — token likely lacks read:org scope."
   exit 1
 fi
+
+# Collect every team name that appears in the expression.
+# Bash word-splitting on $EXPR splits on spaces, so "AND" appears as a
+# token. We skip it explicitly.
 declare -A TEAM_ID
-for T in $ELIGIBLE; do
-  ID=$(jq -r --arg t "$T" '.[] | select(.name==$t) | .id' <"$ORG_TEAMS_FILE" | head -1)
-  if [ -z "$ID" ] || [ "$ID" = "null" ]; then
-    VISIBLE=$(jq -r '.[]?.name? // empty' <"$ORG_TEAMS_FILE" 2>/dev/null | tr '\n' ' ')
-    echo "::error::Team \"$T\" not found in org $OWNER. Teams visible: $VISIBLE"
-    exit 1
-  fi
-  TEAM_ID[$T]="$ID"
-  debug "team-id: $T → $ID"
+_all_teams=""
+for _raw_clause in $EXPR; do
+  # Strip parens and split on comma.
+  _clause=${_raw_clause//[()]/}
+  for _t in $(echo "$_clause" | tr ',' '\n'); do
+    _t=$(echo "$_t" | tr -d '[:space:]')
+    [ -z "$_t" ] && continue
+    # Skip AND / OR operator tokens (bash word-split produced them from
+    # spaces in the expression string).
+    [ "$_t" = "AND" ] || [ "$_t" = "OR" ] && continue
+    # Skip if already in set.
+    case " $_all_teams " in
+      *" $_t "*) ;;  # already present
+      *) _all_teams="${_all_teams} $_t " ;;
+    esac
+  done
 done
 
-# 3. Read approving reviewers
+for _t in $_all_teams; do
+  _t=$(echo "$_t" | tr -d ' ')
+  [ -z "$_t" ] && continue
+  _id=$(jq -r --arg t "$_t" '.[] | select(.name==$t) | .id' <"$ORG_TEAMS_FILE" | head -1)
+  if [ -z "$_id" ] || [ "$_id" = "null" ]; then
+    # "??" suffix marks teams that don't exist yet (tier:medium qa/security).
+    # Treat as permanently failing clause; clear error message guides ops.
+    if [[ "$_t" == *"???" ]]; then
+      debug "team \"$_t\" not found (expected — pending team creation per internal#189)"
+      continue
+    fi
+    _visible=$(jq -r '.[]?.name? // empty' <"$ORG_TEAMS_FILE" 2>/dev/null | tr '\n' ' ')
+    echo "::error::Team \"$_t\" referenced in tier $TIER expression but not found in org $OWNER. Teams visible: $_visible"
+    exit 1
+  fi
+  TEAM_ID[$_t]="$_id"
+  debug "team-id: $_t → $_id"
+done
+
+# 5. Read approving reviewers
 REVIEWS=$(curl -sS -H "$AUTH" "${API}/repos/${OWNER}/${NAME}/pulls/${PR_NUMBER}/reviews")
 APPROVERS=$(echo "$REVIEWS" | jq -r '[.[] | select(.state=="APPROVED") | .user.login] | unique | .[]')
 if [ -z "$APPROVERS" ]; then
-  echo "::error::No approving reviews. Tier $TIER requires approval from {$ELIGIBLE} (non-author)."
+  echo "::error::No approving reviews on this PR. Set SOP_DEBUG=1 and re-run for diagnostics."
   exit 1
 fi
 debug "approvers: $(echo "$APPROVERS" | tr '\n' ' ')"
 
-# 4. For each approver: check non-author + team membership (by id)
-OK=""
+# 6. For each approver: skip self-review; probe team membership by id.
+# Build $APPROVER_TEAMS[<user>]=space-separated-team-names.
+declare -A APPROVER_TEAMS
 for U in $APPROVERS; do
-  if [ "$U" = "$PR_AUTHOR" ]; then
-    debug "skip self-review by $U"
-    continue
-  fi
-  for T in $ELIGIBLE; do
+  [ "$U" = "$PR_AUTHOR" ] && debug "skip self-review by $U" && continue
+  for T in "${!TEAM_ID[@]}"; do
     ID="${TEAM_ID[$T]}"
     CODE=$(curl -sS -o /dev/null -w '%{http_code}' -H "$AUTH" \
       "${API}/teams/${ID}/members/${U}")
     debug "probe: $U in team $T (id=$ID) → HTTP $CODE"
     if [ "$CODE" = "200" ] || [ "$CODE" = "204" ]; then
-      echo "::notice::approver $U is in team $T (eligible for $TIER)"
-      OK="yes"
-      break
+      APPROVER_TEAMS[$U]="${APPROVER_TEAMS[$U]:-}${APPROVER_TEAMS[$U]:+ }$T"
+      debug "$U qualifies for team $T"
     fi
   done
-  [ -n "$OK" ] && break
 done
 
-if [ -z "$OK" ]; then
-  echo "::error::Tier $TIER requires approval from a non-author member of {$ELIGIBLE}. Got approvers: $APPROVERS — none of them satisfied team membership. Set SOP_DEBUG=1 to see per-probe HTTP codes."
+# 7. Evaluate the tier expression.
+#
+# legacy OR-gate: use the simplified loop from before internal#189.
+if [ -n "${LEGACY_ELIGIBLE:-}" ]; then
+  OK=""
+  for U in "${!APPROVER_TEAMS[@]}"; do
+    for T in $LEGACY_ELIGIBLE; do
+      case "${APPROVER_TEAMS[$U]}" in
+        *"$T"*)
+          echo "::notice::approver $U is in team $T (eligible for $TIER)"
+          OK="yes"
+          break
+        ;;
+      esac
+    done
+    [ -n "$OK" ] && break
+  done
+  if [ -z "$OK" ]; then
+    echo "::error::Tier $TIER requires approval from a non-author member of {$LEGACY_ELIGIBLE}. Set SOP_DEBUG=1 to see per-probe HTTP codes."
+    exit 1
+  fi
+  echo "::notice::sop-tier-check passed: $TIER (legacy OR-gate)"
+  exit 0
+fi
+
+# AND-gate: evaluate the expression clause by clause.
+# _passed_clauses and _failed_clauses accumulate for the status description.
+_passed_clauses=""
+_failed_clauses=""
+
+for _raw_clause in $EXPR; do
+  # Normalise: strip parens, split on comma, trim whitespace.
+  _clause=$(echo "$_raw_clause" | tr -d '()' | tr ',' '\n' | tr -d '[:space:]' | grep -v '^$')
+  _clause_passed="no"
+  _clause_names=""
+  for _t in $_clause; do
+    _clause_names="${_clause_names:+, }${_t}"
+    # Skip teams not yet in Gitea (qa??? / security??? placeholders).
+    [[ "$_t" == *"???" ]] && debug "clause \"$_t\": skipped (team pending creation)" && continue
+    [ -z "${TEAM_ID[$_t]:-}" ] && debug "clause \"$_t\": no ID resolved, skipping" && continue
+    for _u in "${!APPROVER_TEAMS[@]}"; do
+      case "${APPROVER_TEAMS[$_u]}" in
+        *"$_t"*)
+          _clause_passed="yes"
+          debug "clause \"$_t\": satisfied by $_u"
+          break
+        ;;
+      esac
+    done
+  done
+
+  # Label for display: strip "???" from pending teams.
+  _label=$(echo "$_raw_clause" | tr -d '()' | tr ',' '/' | tr -d '[:space:]' | sed 's/???//g')
+
+  if [ "$_clause_passed" = "yes" ]; then
+    _passed_clauses="${_passed_clauses:+, }$_label"
+    echo "::notice::clause [$_label]: PASS — satisfied by approving reviewer(s)"
+  else
+    _failed_clauses="${_failed_clauses:+, }$_label"
+    echo "::error::clause [$_label]: FAIL — no approving reviewer belongs to any of these teams${_clause_names}. Set SOP_DEBUG=1 to see per-team probe results."
+  fi
+done
+
+if [ -n "$_failed_clauses" ]; then
+  echo ""
+  echo "::error::sop-tier-check FAILED for $TIER."
+  echo "  Passed :${_passed_clauses}"
+  echo "  Missing:${_failed_clauses}"
+  echo "  All clauses must be satisfied. Each missing team needs an APPROVED review from one of its members."
   exit 1
 fi
-echo "::notice::sop-tier-check passed: $TIER, approver in {$ELIGIBLE}"
+
+echo "::notice::sop-tier-check PASSED: $TIER — all required clauses satisfied [${_passed_clauses}]"
