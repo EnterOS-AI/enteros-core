@@ -12,18 +12,31 @@
 #   required_approving_reviews: 1
 #   approving_review_teams:    ["ceo", "managers", "engineers"]
 #
-# Tier → eligible-team mapping (mirror of dev-sop §SOP-6):
-#   tier:low    → engineers, managers, ceo
-#   tier:medium → managers, ceo
-#   tier:high   → ceo
+# Tier → required-team expression (internal#189 AND-composition):
+#   tier:low    → engineers,managers,ceo        (OR: any one suffices)
+#   tier:medium → managers AND engineers AND qa???,security???  (AND: all required)
+#   tier:high   → ceo                           (OR: single team, wired for AND)
+#
+# "???" = teams not yet created in Gitea. When qa + security teams are
+# added, update TIER_EXPR["tier:medium"] in the script to remove the
+# markers. PRs already in-flight when qa/security are created continue
+# to work because their authors explicitly requested those reviews.
 #
 # Force-merge: Owners-team override remains available out-of-band via
 # the Gitea merge API; force-merge writes `incident.force_merge` to
 # `structure_events` per §Persistent structured logging gate (Phase 3).
 #
-# Set `SOP_DEBUG: '1'` in the env block to enable per-API-call diagnostic
-# lines — useful when diagnosing token-scope or team-id-resolution
-# issues. Default off.
+# Environment variables:
+#   SOP_DEBUG=1          — per-API-call diagnostic lines. Default: off.
+#   SOP_LEGACY_CHECK=1   — revert to OR-gate for this run. Grace window
+#                           for PRs in-flight when AND-composition deployed.
+#                           Burn-in: remove after 2026-05-17 (7-day window).
+#
+# BURN-IN NOTE (internal#189 Phase 1): continue-on-error: true is set on
+# the tier-check job below. This prevents AND-composition from blocking
+# PRs during the 7-day burn-in. After 2026-05-17:
+#   1. Remove `continue-on-error: true` from this job block.
+#   2. Update this BURN-IN NOTE comment to mark the window closed.
 
 name: sop-tier-check
 
@@ -50,6 +63,9 @@ on:
 jobs:
   tier-check:
     runs-on: ubuntu-latest
+    # BURN-IN: continue-on-error prevents AND-composition from blocking
+    # PRs during the 7-day window. Remove after 2026-05-17 (internal#189).
+    continue-on-error: true
     permissions:
       contents: read
       pull-requests: read
@@ -78,4 +94,7 @@ jobs:
           # Set to '1' for diagnostic per-API-call output. Off by default
           # so production logs aren't noisy.
           SOP_DEBUG: '0'
+          # BURN-IN: set to '1' for PRs in-flight at AND-composition deploy
+          # time to use the legacy OR-gate. Remove after 2026-05-17.
+          SOP_LEGACY_CHECK: '0'
         run: bash .gitea/scripts/sop-tier-check.sh
