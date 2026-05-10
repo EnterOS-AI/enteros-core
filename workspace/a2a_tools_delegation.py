@@ -204,6 +204,20 @@ async def tool_delegate_task(
     if not workspace_id or not task:
         return "Error: workspace_id and task are required"
 
+    # Self-delegation guard: delegating to your own workspace ID deadlocks —
+    # the sending turn holds _run_lock while the receive handler waits for the
+    # same lock, the request 30s-times-out, and the whole cycle is wasted.
+    # Reject immediately with an actionable message. (effective_src mirrors the
+    # `src or WORKSPACE_ID` resolution used below for routing.)
+    effective_src = source_workspace_id or _peer_to_source.get(workspace_id) or WORKSPACE_ID
+    if workspace_id and workspace_id == effective_src:
+        return (
+            "Error: cannot delegate_task to your own workspace — self-delegation "
+            "deadlocks _run_lock (your sending turn holds it, the receive handler "
+            "waits for it, the request times out). There is no peer who is also you: "
+            "just do the work yourself, or call commit_memory / send_message_to_user directly."
+        )
+
     # Auto-route: if source not specified, look up which registered
     # workspace last saw this peer (populated by tool_list_peers). Falls
     # back to the legacy WORKSPACE_ID for single-workspace operators.
@@ -322,6 +336,16 @@ async def tool_delegate_task_async(
         return "Error: workspace_id and task are required"
 
     src = source_workspace_id or _peer_to_source.get(workspace_id) or WORKSPACE_ID
+
+    # Self-delegation guard: even on the async path, queuing a task to your own
+    # workspace just makes you re-process your own dispatch — never useful, and
+    # on the sync path it deadlocks (see tool_delegate_task). Reject early.
+    if workspace_id and workspace_id == src:
+        return (
+            "Error: cannot delegate_task_async to your own workspace — there is no "
+            "peer who is also you. Do the work yourself, or call commit_memory / "
+            "send_message_to_user directly."
+        )
 
     # Idempotency key: SHA-256 of (source, target, task) so that a
     # restarted agent firing the same delegation gets the same key and
