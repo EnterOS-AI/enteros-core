@@ -84,23 +84,31 @@ jobs:
             exit 0
           fi
 
-          # Determine base and head refs for the Compare API call.
-          # Gitea Compare API accepts branch names OR commit SHAs as base/head.
-          # Pull request: base.ref + head.ref are in the event payload (branch names).
-          # Push: github.event.before (SHA of previous tip) as BASE, $GITHUB_REF
-          #       (branch name) as HEAD. These are different, so the Compare API
-          #       returns the actual diff — unlike the broken form which set both
-          #       BASE and HEAD to the same branch name, making
-          #       "compare/main...main" always return zero files.
+          # Determine changed files.
+          # workflow_dispatch: always run.
+          # pull_request: use Compare API (branch-to-branch works fine).
+          # push: use github.event.commits array (Compare API rejects SHA-to-branch).
+          # new-branch: run everything.
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             BASE="${{ github.event.pull_request.base.ref }}"
             HEAD="${{ github.event.pull_request.head.ref }}"
           elif [ -n "${{ github.event.before }}" ] && \
                ! echo "${{ github.event.before }}" | grep -qE '^0+$'; then
-            # Push event: BASE = previous tip (SHA), HEAD = current branch name.
-            BASE="${{ github.event.before }}"
-            HEAD_REF="${GITHUB_REF#refs/heads/}"
-            HEAD="${HEAD_REF:-main}"
+            # Push event: extract changed files from github.event.commits array.
+            # Gitea Compare API rejects SHA-to-branch comparisons (BaseNotExist),
+            # so we use the commits array instead. This array contains all commits
+            # in the push, each with their added/removed/modified file lists.
+            echo '${{ toJSON(github.event.commits) }}' \
+              | bash .gitea/scripts/push-commits-diff-files.py \
+              > .push-diff-files.txt 2>/dev/null || true
+            DIFF_FILES=$(cat .push-diff-files.txt 2>/dev/null || true)
+            if [ -n "$DIFF_FILES" ] && echo "$DIFF_FILES" | grep -qE '^workspace-server/|^canvas/|^tests/harness/|^.gitea/workflows/harness-replays\.yml$'; then
+              echo "run=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "run=false" >> "$GITHUB_OUTPUT"
+            fi
+            echo "debug=push-files=$DIFF_FILES" >> "$GITHUB_OUTPUT"
+            exit 0
           else
             # New branch or github.event.before unavailable — run everything.
             echo "run=true" >> "$GITHUB_OUTPUT"
@@ -108,23 +116,12 @@ jobs:
             exit 0
           fi
 
-          # Call Gitea Compare API to get the list of changed files.
-          # This is a Gitea-to-Gitea API call from within the Gitea Actions
-          # runner — it hits the local Gitea process, not the external network.
-          # No git network access needed from the runner container
-          # (runbooks/gitea-operational-quirks.md §runner-network-isolation).
-          #
-          # API shape: GET /repos/{owner}/{repo}/compare/{base}...{head}
-          # Returns { commits: [{ files: [{filename}] }] } — files are
-          # nested inside commits (Gitea quirk, not at top level).
+          # Call Gitea Compare API (pull_request path only — branch-to-branch).
+          # Push uses github.event.commits array above.
           RESP=$(curl -sS --fail --max-time 30 \
             -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
             -H "Accept: application/json" \
             "$GITHUB_SERVER_URL/api/v1/repos/$GITHUB_REPOSITORY/compare/$BASE...$HEAD")
-          # compare-api-diff-files.py: extracts filenames from Gitea Compare API
-          # JSON. Script extracted from workflow to avoid YAML parser choking on
-          # nested Python indentation (pyyaml safe_load interprets it as YAML
-          # structure). See runbooks/gitea-operational-quirks.md §large-repo-fetch.
           DIFF_FILES=$(echo "$RESP" | bash .gitea/scripts/compare-api-diff-files.py 2>/dev/null || true)
 
           echo "debug=diff-base=$BASE diff-files=$DIFF_FILES" >> "$GITHUB_OUTPUT"
