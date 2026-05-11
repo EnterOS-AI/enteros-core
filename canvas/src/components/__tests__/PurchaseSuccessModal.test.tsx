@@ -44,7 +44,6 @@ async function waitForDialog() {
 describe("PurchaseSuccessModal — render conditions", () => {
   afterEach(() => {
     cleanup();
-    vi.restoreAllMocks();
     clearSearch();
   });
 
@@ -113,8 +112,6 @@ describe("PurchaseSuccessModal — dismiss", () => {
 
   afterEach(() => {
     cleanup();
-    vi.restoreAllMocks();
-    vi.useRealTimers(); // ensure no fake timer leak
     clearSearch();
   });
 
@@ -170,7 +167,6 @@ describe("PurchaseSuccessModal — URL stripping", () => {
 
   afterEach(() => {
     cleanup();
-    vi.restoreAllMocks();
     clearSearch();
   });
 
@@ -196,13 +192,10 @@ describe("PurchaseSuccessModal — URL stripping", () => {
 describe("PurchaseSuccessModal — accessibility", () => {
   beforeEach(() => {
     setSearch("?purchase_success=1&item=TestItem");
-    vi.useRealTimers(); // ensure clean state
   });
 
   afterEach(() => {
     cleanup();
-    vi.restoreAllMocks();
-    vi.useRealTimers(); // ensure no fake timer leak
     clearSearch();
   });
 

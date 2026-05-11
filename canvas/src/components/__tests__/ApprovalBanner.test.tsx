@@ -5,10 +5,10 @@
  * Covers: renders nothing when no approvals, polls /approvals/pending,
  * shows approval cards, approve/deny decisions, toast notifications.
  *
- * All blocks use vi.useFakeTimers() consistently in beforeEach/afterEach to
- * avoid polluting the fake-timer state for subsequent test files. The
- * vi.spyOn mocks are reset per-spy via mockReset() in afterEach so each
- * test gets a clean mock state without touching the module-level api mock.
+ * Note: does NOT mock @/lib/api — uses vi.spyOn on the real module.
+ * vi.restoreAllMocks() is omitted from afterEach so queued mock values
+ * (set up via mockResolvedValueOnce in beforeEach) are preserved for the
+ * component's useEffect to consume.
  */
 import React from "react";
 import { render, screen, fireEvent, cleanup, act } from "@testing-library/react";
@@ -56,7 +56,7 @@ describe("ApprovalBanner — empty state", () => {
 
   afterEach(() => {
     cleanup();
-    vi.useFakeTimers();
+    vi.useRealTimers();
   });
 
   it("renders nothing when there are no pending approvals", async () => {
@@ -84,8 +84,7 @@ describe("ApprovalBanner — renders approval cards", () => {
 
   afterEach(() => {
     cleanup();
-    mockGet?.mockReset();
-    vi.useFakeTimers();
+    vi.useRealTimers();
   });
 
   it("renders an alert card for each pending approval", async () => {
@@ -93,6 +92,7 @@ describe("ApprovalBanner — renders approval cards", () => {
     await act(async () => { await vi.runOnlyPendingTimersAsync(); });
     const alerts = screen.getAllByRole("alert");
     expect(alerts).toHaveLength(2);
+    mockGet.mockRestore();
   });
 
   it("displays the workspace name and action text", async () => {
@@ -146,9 +146,7 @@ describe("ApprovalBanner — decisions", () => {
 
   afterEach(() => {
     cleanup();
-    mockGet?.mockReset();
-    mockPost?.mockReset();
-    vi.useFakeTimers();
+    vi.useRealTimers();
   });
 
   it("calls POST /workspaces/:id/approvals/:id/decide on Approve click", async () => {
@@ -230,7 +228,7 @@ describe("ApprovalBanner — handles empty list from server", () => {
 
   afterEach(() => {
     cleanup();
-    vi.useFakeTimers();
+    vi.useRealTimers();
   });
 
   it("shows nothing when the API returns an empty array on first poll", async () => {
