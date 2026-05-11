@@ -36,16 +36,19 @@ on:
       # platform-only / docs-only / MCP-only merges.
       - 'canvas/**'
       - '.gitea/workflows/publish-canvas-image.yml'
-  # Manual trigger: use after a non-canvas merge that still needs a fresh
-  # image (e.g. a Dockerfile change lives outside the canvas/ tree).
+  # NOTE (Gitea port): the original GitHub workflow had a
+  # `workflow_dispatch:` manual trigger for the
+  # non-canvas-merge-but-need-fresh-image scenario. Dropped in the
+  # Gitea port (1.22.6 parser-finicky). Manual rebuilds require
+  # pushing an empty commit to canvas/ or running the operator-host
+  # build directly.
+
 permissions:
   contents: read
   packages: write  # required to push to ghcr.io/${{ github.repository_owner }}/*
 
 env:
   IMAGE_NAME: ghcr.io/molecule-ai/canvas
-
-env:
   GITHUB_SERVER_URL: https://git.moleculesai.app
 
 jobs:
