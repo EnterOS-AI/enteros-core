@@ -28,6 +28,11 @@ name: Sweep stale Cloudflare Tunnels
 # Safety: the script's MAX_DELETE_PCT gate (default 90% — higher than
 # the DNS sweep's 50% because tenant-shaped tunnels are mostly
 # orphans by design) refuses to nuke past the threshold.
+#
+# Secrets: CF_API_TOKEN, CF_ACCOUNT_ID are confirmed existing per
+# issue #425 §425 audit. CP_ADMIN_API_TOKEN and CP_STAGING_ADMIN_API_TOKEN
+# are unconfirmed — if missing, the verify step (schedule → hard-fail,
+# dispatch → soft-skip) surfaces it clearly.
 
 on:
   schedule:

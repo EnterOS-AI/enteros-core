@@ -33,6 +33,11 @@ name: Sweep stale Cloudflare DNS records
 # gate halts before damage. Decision-function unit tests in
 # scripts/ops/test_sweep_cf_decide.py (#2027) cover the rule
 # classifier.
+#
+# Secrets: CF_API_TOKEN, CF_ZONE_ID, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+# are confirmed existing per issue #425 §425 audit. CP_ADMIN_API_TOKEN and
+# CP_STAGING_ADMIN_API_TOKEN are unconfirmed — if missing, the verify step
+# (schedule → hard-fail, dispatch → soft-skip) surfaces it clearly.
 
 on:
   schedule:
