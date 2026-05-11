@@ -166,12 +166,19 @@ async def _delegate_sync_via_polling(
                 break
         if terminal:
             if (terminal.get("status") or "").lower() == "completed":
-                return terminal.get("response_preview") or ""
-            err = (
+                # OFFSEC-003: sanitize response_preview before returning so
+                # boundary markers injected by a malicious peer cannot escape
+                # the trust boundary.
+                return sanitize_a2a_result(terminal.get("response_preview") or "")
+            # OFFSEC-003: sanitize error_detail / summary before wrapping with
+            # the _A2A_ERROR_PREFIX sentinel so injected markers cannot appear
+            # inside the trusted error block returned to the agent.
+            err_raw = (
                 terminal.get("error_detail")
                 or terminal.get("summary")
                 or "delegation failed"
             )
+            err = sanitize_a2a_result(err_raw)
             return f"{_A2A_ERROR_PREFIX}{err}"
 
         await asyncio.sleep(_SYNC_POLL_INTERVAL_S)
