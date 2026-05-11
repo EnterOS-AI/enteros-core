@@ -24,17 +24,19 @@ name: E2E Staging SaaS (full lifecycle)
 #     PRs don't need to read.
 #
 # Triggers:
-#   - Push to main (regression guard)
+#   - Push to main (regression guard — fires on merges to main, not on PR updates)
 #   - workflow_dispatch (manual re-run from UI)
 #   - Nightly cron (catches drift even when no pushes land)
-#   - Changes to any provisioning-critical file under PR review (opt-in
-#     via the same paths watcher that e2e-api.yml uses)
+#
+# NOTE: `pull_request` trigger intentionally omitted. This workflow runs a
+# full 25-35 min staging provision + teardown cycle. Firing it on every
+# PR push to main (in addition to the push trigger) causes duplicate runs
+# and wastes runner minutes. Branch protection ensures only merged code
+# reaches main, so the push trigger is sufficient. Pre-merge E2E validation
+# for provisioning-critical paths is better served by local `harness-replays.yml`.
 
 on:
   # Trunk-based (Phase 3 of internal#81): main is the only branch.
-  # Previously this fired on staging push too because staging was a
-  # superset of main and ran the gate ahead of auto-promote; with no
-  # staging branch, main is where E2E gates the deploy.
   push:
     branches: [main]
     paths:
@@ -45,16 +47,7 @@ on:
       - 'workspace-server/internal/provisioner/**'
       - 'tests/e2e/test_staging_full_saas.sh'
       - '.gitea/workflows/e2e-staging-saas.yml'
-  pull_request:
-    branches: [main]
-    paths:
-      - 'workspace-server/internal/handlers/registry.go'
-      - 'workspace-server/internal/handlers/workspace_provision.go'
-      - 'workspace-server/internal/handlers/a2a_proxy.go'
-      - 'workspace-server/internal/middleware/**'
-      - 'workspace-server/internal/provisioner/**'
-      - 'tests/e2e/test_staging_full_saas.sh'
-      - '.gitea/workflows/e2e-staging-saas.yml'
+  workflow_dispatch:
   schedule:
     # 07:00 UTC every day — catches AMI drift, WorkOS cert rotation,
     # Cloudflare API regressions, etc. even on quiet days.
