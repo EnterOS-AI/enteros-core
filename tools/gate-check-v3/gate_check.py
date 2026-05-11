@@ -53,12 +53,28 @@ def api_get(path: str) -> dict | list:
         raise GiteaError(f"GET {url} → {e.code}: {body[:300]}")
 
 
-def api_list(path: str) -> list:
-    """Paginate a list endpoint."""
-    result = api_get(path)
-    if isinstance(result, list):
-        return result
-    return result.get("data", result.get("items", []))
+def api_list(path: str, per_page: int = 100) -> list:
+    """Paginate a list endpoint using Link headers (Gitea/GitHub convention)."""
+    results = []
+    page = 1
+    while True:
+        paged_path = f"{path}?per_page={per_page}&page={page}"
+        result = api_get(paged_path)
+        if isinstance(result, list):
+            results.extend(result)
+            if len(result) < per_page:
+                break
+            page += 1
+        else:
+            # Some endpoints return an object with a data/items key
+            data = result.get("data", result.get("items", result))
+            if isinstance(data, list):
+                results.extend(data)
+            break
+        # Safety cap to avoid runaway pagination
+        if page > 20:
+            break
+    return results
 
 
 class GiteaError(Exception):
