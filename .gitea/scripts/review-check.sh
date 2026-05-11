@@ -21,11 +21,18 @@
 #   suspenders. Keeping it off in v1 simplifies semantics; flip in a follow-up
 #   PR if reviewer telemetry shows residual stale-APPROVE merges.
 #
-# Privilege gate (RFC A1.1 — CRITICAL):
-#   The /qa-recheck and /security-recheck slash-command refire must NOT
-#   re-fire for non-collaborators. The workflow-yaml privilege-check step
-#   handles this BEFORE this script runs. This script does not re-check
-#   privilege; the workflow guards the entry.
+# Privilege gate (RFC#324 v1.3 §A1.1 — INFORMATIONAL ONLY):
+#   The /qa-recheck and /security-recheck slash-commands can be triggered
+#   by anyone who can comment on the PR. The workflow's privilege step
+#   logs collaborator-status but does NOT gate execution of this script.
+#   Why this is safe: this evaluator is read-only and idempotent —
+#   reading `pulls/{N}/reviews` and `teams/{id}/members/{u}` can't be
+#   influenced by who triggered the run. If a real team-member APPROVE
+#   exists the gate flips green; otherwise it stays red. A
+#   non-collaborator commenting /qa-recheck cannot manufacture a green
+#   gate. Original (v1.2) design with `if:`-gating of this step was
+#   fail-open (skipped-via-`if:` job still publishes the status as
+#   `success`) — corrected in v1.3 per hongming-pc review 1421.
 #
 # Trust boundary (RFC A4):
 #   This script is loaded from the BASE branch (sourced via .gitea/scripts/
@@ -56,19 +63,16 @@
 
 set -euo pipefail
 
-# jq is required for JSON parsing — same install dance sop-tier-check uses.
+# jq is required for JSON parsing. It is pre-baked into the runner-base
+# image (per RFC#268 workflow-smoke), so the only reason we'd not find it
+# is a broken runner. The previous fallback dance (apt-get + curl to
+# /usr/local/bin/jq) cannot succeed on a uid-1001 rootless runner
+# (#391/#402 + feedback_ci_runner_install_needs_writable_path), so it's
+# dropped. Fail loud with a clear diagnostic rather than attempt an
+# install that physically cannot work.
 if ! command -v jq >/dev/null 2>&1; then
-  echo "::notice::jq not on PATH — installing..."
-  if apt-get update -qq && apt-get install -y -qq jq 2>/dev/null; then
-    echo "::notice::jq installed via apt-get: $(jq --version)"
-  elif timeout 60 curl -sSL \
-      "https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-amd64" \
-      -o /usr/local/bin/jq && chmod +x /usr/local/bin/jq; then
-    echo "::notice::jq downloaded as binary: $(/usr/local/bin/jq --version)"
-  else
-    echo "::error::jq install failed; cannot parse Gitea API JSON"
-    exit 1
-  fi
+  echo "::error::jq missing from runner-base image — bake it into the runner image (see RFC#268 workflow-smoke / feedback_ci_runner_install_needs_writable_path). This evaluator cannot run without jq."
+  exit 1
 fi
 
 : "${GITEA_TOKEN:?GITEA_TOKEN required}"

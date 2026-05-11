@@ -18,14 +18,30 @@
 #   `qa-review / approved (<event>)` — NO `POST /statuses` call → NO
 #   write:repository token scope needed. Sidesteps internal#321 defect #2.
 #
-# A1.1 (privilege check on slash-comment):
+# A1.1 (privilege check on slash-comment — INFORMATIONAL ONLY, NOT a gate):
 #   The `issue_comment` event fires for ANY commenter, including
-#   non-collaborators. We MUST NOT use `github.event.comment.author_association`
-#   (the field doesn't exist on Gitea 1.22.6 webhook payload — this was
-#   sop-tier-refire's defect #1). Instead, the Privilege check step probes
-#   GET /repos/.../collaborators/{login}:
-#     - 204 → is-collaborator → proceed
-#     - 404 → not-collaborator → exit 0 (ignored; status unchanged)
+#   non-collaborators. The original (v1.2) design gated the eval step
+#   behind a collaborator probe → if a non-collaborator commented
+#   /qa-recheck, the eval was `if:`-skipped → the job exited 0 anyway →
+#   the status context published `success` with ZERO real APPROVE.
+#   That was a fail-open: any visitor could green the gate.
+#
+#   RFC#324 v1.3 §A1.1 correction (option b per hongming-pc 1421):
+#   drop privilege-gating of the evaluation entirely. The eval is
+#   read-only and idempotent — it reads `pulls/{N}/reviews` and
+#   `teams/{id}/members/{u}` (both API-side state that a commenter can't
+#   change). Re-running it on a non-collaborator's comment is harmless
+#   AND correct: if a real team-member APPROVE exists, the eval flips
+#   green; if not, it stays red.
+#
+#   We KEEP the privilege step as a `::notice::` log line only — useful
+#   for griefer-spotting (one operator spamming /recheck) without
+#   touching the gate. If rate-limiting is needed later, add it as a
+#   separate concern (time-window throttle, not a privilege gate).
+#
+#   We MUST NOT use `github.event.comment.author_association` (the
+#   field doesn't exist on Gitea 1.22.6 webhook payload — this was
+#   sop-tier-refire's defect #1).
 #
 # A4 (no PR-head checkout under pull_request_target):
 #   We check out the BASE ref explicitly so the review-check.sh script is
@@ -60,7 +76,9 @@
 #
 #   /qa-recheck   — re-evaluate the gate (e.g. after an APPROVE lands)
 #
-# Restricted to repo collaborators only (privilege-check step A1.1).
+# Open to any PR commenter. The eval is read-only and idempotent, so
+# unprivileged refires are harmless (RFC#324 v1.3 §A1.1). Collaborator
+# status is logged for griefer-spotting but does NOT gate execution.
 
 name: qa-review
 
@@ -79,12 +97,10 @@ jobs:
     # Gate the job:
     #   - On pull_request_target events: always run.
     #   - On issue_comment events: only when it's a PR comment and the body
-    #     contains the slash-command. The privilege check is enforced as
-    #     a job step (A1.1), not here — `if:` can't call the collaborator
-    #     API. The privilege step exits the job early for non-collaborators
-    #     while still publishing the job's previous status (i.e. it does
-    #     NOT flip qa-review from failure to success without a real
-    #     team-member APPROVE).
+    #     contains the slash-command. NO privilege gate at the step level
+    #     (RFC#324 v1.3 §A1.1): a non-collaborator's /qa-recheck is fine
+    #     because the eval is read-only and idempotent — re-running it
+    #     just re-confirms whether a real team-member APPROVE exists.
     if: |
       github.event_name == 'pull_request_target' ||
       (github.event_name == 'issue_comment' &&
@@ -92,10 +108,15 @@ jobs:
        startsWith(github.event.comment.body, '/qa-recheck'))
     runs-on: ubuntu-latest
     steps:
-      - name: Privilege check (A1.1 — collaborator API, NOT author_association)
-        # Only runs on issue_comment events. For pull_request_target the
-        # commenter doesn't exist, so the step is a no-op skip.
-        id: priv
+      - name: Privilege check (A1.1 — INFORMATIONAL log only, NOT a gate)
+        # RFC#324 v1.3 §A1.1: this step does NOT gate subsequent steps.
+        # It exists solely as a log line for griefer-spotting (one
+        # operator spamming /qa-recheck without merit). Re-running the
+        # read-only eval on a non-collaborator comment is harmless;
+        # gating it would be fail-open (skipped steps still publish
+        # `success` for the job's status context).
+        # Only runs on issue_comment events; pull_request_target has
+        # no comment.user.login so the step is a no-op skip there.
         if: github.event_name == 'issue_comment'
         env:
           GITEA_TOKEN: ${{ secrets.RFC_324_TEAM_READ_TOKEN || secrets.GITHUB_TOKEN }}
@@ -106,11 +127,9 @@ jobs:
             -H "Authorization: token ${GITEA_TOKEN}" \
             "${{ github.server_url }}/api/v1/repos/${{ github.repository }}/collaborators/${login}")
           if [ "$code" = "204" ]; then
-            echo "::notice::commenter ${login} is a collaborator — proceeding"
-            echo "proceed=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Recheck from ${login} (collaborator=true)"
           else
-            echo "::notice::comment from non-collaborator ${login} (HTTP ${code}) ignored"
-            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Recheck from ${login} (collaborator=false, HTTP ${code}) — proceeding with read-only eval anyway"
           fi
 
       - name: Check out BASE ref (A4 — never PR-head)
@@ -120,17 +139,11 @@ jobs:
         # script source is always the default-branch version.
         # NEVER use ref: ${{ github.event.pull_request.head.sha }} —
         # that would execute PR-head code with secrets-context.
-        if: |
-          github.event_name == 'pull_request_target' ||
-          (github.event_name == 'issue_comment' && steps.priv.outputs.proceed == 'true')
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           ref: ${{ github.event.repository.default_branch }}
 
       - name: Evaluate qa-review
-        if: |
-          github.event_name == 'pull_request_target' ||
-          (github.event_name == 'issue_comment' && steps.priv.outputs.proceed == 'true')
         env:
           GITEA_TOKEN: ${{ secrets.RFC_324_TEAM_READ_TOKEN || secrets.GITHUB_TOKEN }}
           GITEA_HOST: git.moleculesai.app

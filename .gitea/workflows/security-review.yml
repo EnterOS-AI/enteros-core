@@ -21,6 +21,8 @@ permissions:
 
 jobs:
   approved:
+    # See qa-review.yml header for full A1-α / A1.1 (v1.3 — informational
+    # log only, NOT a gate) / A4 / A5 design rationale.
     if: |
       github.event_name == 'pull_request_target' ||
       (github.event_name == 'issue_comment' &&
@@ -28,8 +30,10 @@ jobs:
        startsWith(github.event.comment.body, '/security-recheck'))
     runs-on: ubuntu-latest
     steps:
-      - name: Privilege check (A1.1 — collaborator API, NOT author_association)
-        id: priv
+      - name: Privilege check (A1.1 — INFORMATIONAL log only, NOT a gate)
+        # RFC#324 v1.3 §A1.1: does NOT gate subsequent steps. See
+        # qa-review.yml for full rationale. Eval is read-only/idempotent
+        # so re-running on a non-collaborator comment is harmless.
         if: github.event_name == 'issue_comment'
         env:
           GITEA_TOKEN: ${{ secrets.RFC_324_TEAM_READ_TOKEN || secrets.GITHUB_TOKEN }}
@@ -40,25 +44,17 @@ jobs:
             -H "Authorization: token ${GITEA_TOKEN}" \
             "${{ github.server_url }}/api/v1/repos/${{ github.repository }}/collaborators/${login}")
           if [ "$code" = "204" ]; then
-            echo "::notice::commenter ${login} is a collaborator — proceeding"
-            echo "proceed=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Recheck from ${login} (collaborator=true)"
           else
-            echo "::notice::comment from non-collaborator ${login} (HTTP ${code}) ignored"
-            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Recheck from ${login} (collaborator=false, HTTP ${code}) — proceeding with read-only eval anyway"
           fi
 
       - name: Check out BASE ref (A4 — never PR-head)
-        if: |
-          github.event_name == 'pull_request_target' ||
-          (github.event_name == 'issue_comment' && steps.priv.outputs.proceed == 'true')
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           ref: ${{ github.event.repository.default_branch }}
 
       - name: Evaluate security-review
-        if: |
-          github.event_name == 'pull_request_target' ||
-          (github.event_name == 'issue_comment' && steps.priv.outputs.proceed == 'true')
         env:
           GITEA_TOKEN: ${{ secrets.RFC_324_TEAM_READ_TOKEN || secrets.GITHUB_TOKEN }}
           GITEA_HOST: git.moleculesai.app
