@@ -185,18 +185,19 @@ func EnsureLocalImage(ctx context.Context, runtime string) (string, error) {
 // production code.
 var ensureLocalImageHook = EnsureLocalImage
 
-// checkToolOnPath verifies tool is on PATH and returns its absolute path,
-// or a descriptive error. Used for pre-flight validation before the
+// checkToolOnPath verifies tool is on PATH and returns an error with a
+// descriptive message if missing. Used for pre-flight validation before the
 // clone/build cold path.
-func checkToolOnPath(tool string) (string, error) {
+func checkToolOnPath(tool string) error {
 	path, err := exec.LookPath(tool)
 	if err != nil {
 		if errors.Is(err, exec.ErrNotFound) {
-			return "", fmt.Errorf("local-build: %q not found on PATH — local-build mode requires both docker and git; either install them, or set MOLECULE_IMAGE_REGISTRY so local-build is bypassed", tool)
+			return fmt.Errorf("%q not found on PATH — local-build mode requires both docker and git; either install them, or set MOLECULE_IMAGE_REGISTRY so local-build is bypassed", tool)
 		}
-		return "", fmt.Errorf("local-build: LookPath(%q) failed: %w", tool, err)
+		return fmt.Errorf("LookPath(%q) failed: %w", tool, err)
 	}
-	return path, nil
+	log.Printf("local-build: pre-flight OK (%s=%s)", tool, path)
+	return nil
 }
 
 func ensureLocalImageWithOpts(ctx context.Context, runtime string, opts *LocalBuildOptions) (string, error) {
