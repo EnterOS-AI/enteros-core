@@ -974,11 +974,17 @@ func collectPerWorkspaceUnsatisfied(workspaces []OrgWorkspace, orgBaseDir string
 			// skipped here (persona env does NOT satisfy required_env —
 			// it carries identity tokens, not workspace LLM keys).
 			envFromFiles := loadWorkspaceEnv(orgBaseDir, ws.FilesDir)
+			// Convert map[string]string (from .env files) to map[string]struct{}
+			// to match IsSatisfied's signature.
+			envSet := make(map[string]struct{}, len(envFromFiles))
+			for k := range envFromFiles {
+				envSet[k] = struct{}{}
+			}
 			for _, req := range ws.RequiredEnv {
 				if req.IsSatisfied(globalSecrets) {
 					continue // covered by a global secret
 				}
-				if req.IsSatisfied(envFromFiles) {
+				if req.IsSatisfied(envSet) {
 					continue // covered by a per-workspace .env file
 				}
 				out = append(out, PerWorkspaceUnsatisfied{
