@@ -72,15 +72,19 @@ jobs:
         run: |
           # With the default fetch-depth: 1, actions/checkout only fetches the
           # PR head commit. The base commit is NOT in the local history, so
-          # `git diff "$BASE" "$GITHUB_SHA"` fails. Fetch the base branch tip
-          # (which is github.event.pull_request.base.sha) at depth 1 — one
-          # cheap round-trip, enough for the diff to work.
+          # `git diff "$BASE" "$GITHUB_SHA"` fails. Fetch the base branch at
+          # depth 1 — the base commit is the immediate parent of the PR head
+          # on the base branch, so depth=1 is sufficient.
           #
-          # github.event.pull_request.base.ref = "main" (confirmed via API).
-          # git fetch origin main --depth=1 fetches the main branch tip + its
-          # immediate parent (the base commit we need). This is faster and more
-          # reliable than fetch-depth:0 (which times out on the 75 MB repo).
-          git fetch origin "${{ github.event.pull_request.base.ref }}" --depth=1
+          # Timeout: 55s. The fetch should complete in <10s on a local network;
+          # 55s gives headroom for cold TCP handshake + one git pack transfer.
+          # Gitea Actions overall job timeout is 60 min, so 55s is safe.
+          timeout 55 git fetch --verbose origin "${{ github.event.pull_request.base.ref }}" --depth=1 || {
+            echo "::error::git fetch origin ${{ github.event.pull_request.base.ref }} --depth=1 timed out after 55s"
+            echo "::error::The base branch tip may not be available in the local history."
+            echo "::error::This causes git diff to fail and detect-changes to report failure."
+            exit 1
+          }
       - id: decide
         run: |
           # workflow_dispatch: always run (manual trigger)
