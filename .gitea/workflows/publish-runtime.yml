@@ -12,7 +12,12 @@ name: publish-runtime
 #   - Replaced `github.ref_name` (GitHub-only) with `${GITHUB_REF#refs/tags/}`
 #     — Gitea Actions exposes github.ref (the full ref) but not ref_name
 #   - Dropped `merge_group` trigger (Gitea has no merge queue)
-#   - Dropped `staging` branch trigger (no staging branch exists in this repo)
+#
+# 2026-05-10 (issue #348): restored `staging`/`main` branch + `workspace/**`
+# path-filter trigger and the PyPI-latest auto-bump path that consumes it.
+# The 2026-05-10 inline comment "no staging branch exists in this repo" was
+# inherited verbatim from the runtime-mirror port and is INCORRECT for
+# molecule-core. hongming-pc is blocked on this trigger.
 #
 # PyPI publishing: requires PYPI_TOKEN repository secret (or org-level secret).
 # Set via: repo Settings → Actions → Variables and Secrets → New Secret.
@@ -23,6 +28,11 @@ name: publish-runtime
 
 on:
   push:
+    branches:
+      - main
+      - staging
+    paths:
+      - "workspace/**"
     tags:
       - "runtime-v*"
   workflow_dispatch:
@@ -65,10 +75,9 @@ jobs:
             VERSION="${GITHUB_REF#refs/tags/runtime-v}"
           else
             # Fallback: derive from PyPI latest + patch bump.
-            # (The staging-push auto-bump trigger is dropped on Gitea —
-            # no staging branch exists. This fallback path is kept for
-            # robustness if a future automation uses workflow_dispatch without
-            # an explicit version input.)
+            # Used by the restored `push.branches: [main, staging]` +
+            # `paths: workspace/**` auto-bump trigger (issue #348). Also kept
+            # for workflow_dispatch invocations that omit the version input.
             LATEST=$(curl -fsS --retry 3 https://pypi.org/pypi/molecule-ai-workspace-runtime/json \
               | python -c "import sys,json; print(json.load(sys.stdin)['info']['version'])")
             MAJOR=$(echo "$LATEST" | cut -d. -f1)
