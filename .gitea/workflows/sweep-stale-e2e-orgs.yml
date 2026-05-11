@@ -63,12 +63,21 @@ jobs:
   sweep:
     name: Sweep e2e orgs
     runs-on: ubuntu-latest
-    # Phase 3 (RFC #219 §1): surface broken workflows without blocking.
-    continue-on-error: true
+    # NOTE: Phase 3 (RFC #219 §1) `continue-on-error: true` removed
+    # 2026-05-11. The "surface broken workflows without blocking"
+    # rationale was correctly applied to advisory/lint workflows but
+    # wrong for this janitor — silent failure here masks real-money
+    # tenant leaks. Hongming observed 15 leaked EC2 in molecule-canary
+    # (004947743811) us-east-2 at 11:05Z 2026-05-11 because the sweep
+    # had been exiting 2 every tick and the failure was swallowed.
+    # See `feedback_strict_root_only_after_class_a` — critical janitors
+    # must fail loud. A follow-up `notify-failure` step below also
+    # surfaces breakage to ops even if branch-protection wiring is
+    # adjusted to keep this off the required-checks list.
     timeout-minutes: 15
     env:
       MOLECULE_CP_URL: https://staging-api.moleculesai.app
-      ADMIN_TOKEN: ${{ secrets.MOLECULE_STAGING_ADMIN_TOKEN }}
+      ADMIN_TOKEN: ${{ secrets.CP_STAGING_ADMIN_API_TOKEN }}
       MAX_AGE_MINUTES: ${{ github.event.inputs.max_age_minutes || '30' }}
       DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
       # Refuse to delete more than this many orgs in one tick. If the
@@ -81,7 +90,7 @@ jobs:
       - name: Verify admin token present
         run: |
           if [ -z "$ADMIN_TOKEN" ]; then
-            echo "::error::MOLECULE_STAGING_ADMIN_TOKEN not set"
+            echo "::error::CP_STAGING_ADMIN_API_TOKEN not set"
             exit 2
           fi
           echo "Admin token present ✓"
@@ -242,3 +251,17 @@ jobs:
         if: env.DRY_RUN == 'true'
         run: |
           echo "DRY RUN — would have deleted ${{ steps.identify.outputs.count }} org(s) AND triggered orphan-tunnels cleanup. Re-run with dry_run=false to actually delete."
+
+      - name: Notify on sweep failure
+        # Fail-loud companion to dropping `continue-on-error: true`.
+        # If any prior step failed (missing token, CP 5xx, safety-cap
+        # tripped, etc.) emit a clearly-tagged ::error:: line so the
+        # Gitea runs UI + any log-tail consumer (Loki SOPRefireRule)
+        # flags this. Without this step, an early `exit 2` shows as a
+        # red run but the message can scroll past in busy log windows;
+        # the explicit tag here is greppable from the orchestrator
+        # triage loop.
+        if: failure()
+        run: |
+          echo "::error::sweep-stale-e2e-orgs FAILED — staging tenants are LEAKING. See prior step logs. Common causes: (a) CP_STAGING_ADMIN_API_TOKEN secret missing/rotated, (b) staging-api.moleculesai.app 5xx, (c) safety-cap tripped (CP admin API returning malformed orgs). Manual cleanup of leaked EC2 + DNS may be required while this is broken."
+          exit 1
