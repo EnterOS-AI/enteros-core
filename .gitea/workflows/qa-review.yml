@@ -123,9 +123,14 @@ jobs:
         run: |
           set -euo pipefail
           login="${{ github.event.comment.user.login }}"
-          code=$(curl -sS -o /dev/null -w '%{http_code}' \
-            -H "Authorization: token ${GITEA_TOKEN}" \
+          # Write token to a mode-600 file so it never appears in curl's argv.
+          # (#541: -H "Authorization: token $TOKEN" puts the secret in /proc/<pid>/cmdline)
+          authfile=$(mktemp)
+          chmod 600 "$authfile"
+          printf 'header = "Authorization: token %s"\n' "$GITEA_TOKEN" > "$authfile"
+          code=$(curl -sS -o /dev/null -w '%{http_code}' -K "$authfile" \
             "${{ github.server_url }}/api/v1/repos/${{ github.repository }}/collaborators/${login}")
+          rm -f "$authfile"
           if [ "$code" = "204" ]; then
             echo "::notice::Recheck from ${login} (collaborator=true)"
           else
