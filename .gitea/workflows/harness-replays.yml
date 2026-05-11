@@ -71,14 +71,15 @@ jobs:
       - name: Fetch base branch tip for diff
         run: |
           # With the default fetch-depth: 1, actions/checkout only fetches the
-          # PR head commit. The base branch tip (github.event.pull_request.base.sha)
-          # is NOT in the local history, so `git diff "$BASE" "$GITHUB_SHA"` fails
-          # because neither ref is fully resolved. Fetch only the base branch at
-          # depth 1 — one cheap network round-trip, sufficient for diff.
+          # PR head commit. The base commit is NOT in the local history, so
+          # `git diff "$BASE" "$GITHUB_SHA"` fails. Fetch the base branch tip
+          # (which is github.event.pull_request.base.sha) at depth 1 — one
+          # cheap round-trip, enough for the diff to work.
           #
-          # Do NOT use fetch-depth: 0 here — the repo is 75+ MB and a full history
-          # fetch times out on the operator-host runner network (github.com unreachable,
-          # ~3s timeout to apt mirrors). A single-commit fetch avoids that.
+          # github.event.pull_request.base.ref = "main" (confirmed via API).
+          # git fetch origin main --depth=1 fetches the main branch tip + its
+          # immediate parent (the base commit we need). This is faster and more
+          # reliable than fetch-depth:0 (which times out on the 75 MB repo).
           git fetch origin "${{ github.event.pull_request.base.ref }}" --depth=1
       - id: decide
         run: |
