@@ -115,6 +115,11 @@ jobs:
       # Build + push platform image (inline ECR auth — mirrors the operator-host
       # approach; credentials come from GITHUB_SECRET_AWS_ACCESS_KEY_ID /
       # GITHUB_SECRET_AWS_SECRET_ACCESS_KEY in Gitea Actions).
+      # docker buildx bake / build required for `imagetools inspect` digest
+      # capture in the CP pin-update step (RFC internal#229 §X step 4 PR-1).
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd  # v4.0.0
+
       - name: Build & push platform image to ECR (staging-<sha> + staging-latest)
         env:
           IMAGE_NAME: ${{ env.IMAGE_NAME }}
@@ -130,17 +135,16 @@ jobs:
           ECR_REGISTRY="${IMAGE_NAME%%/*}"
           aws ecr get-login-password --region us-east-2 | \
             docker login --username AWS --password-stdin "${ECR_REGISTRY}"
-          docker build \
+          docker buildx build \
             --file ./workspace-server/Dockerfile \
             --build-arg GIT_SHA="${GIT_SHA}" \
-            --label "org.opencontainers.image.source=https://github.com/${REPO}" \
+            --label "org.opencontainers.image.source=https://git.moleculesai.app/molecule-ai/${REPO}" \
             --label "org.opencontainers.image.revision=${GIT_SHA}" \
-            --label "org.opencontainers.image.description=Molecule AI platform — pending canary verify" \
+            --label "org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --label "molecule.workflow.run_id=${GITHUB_RUN_ID}" \
             --tag "${IMAGE_NAME}:${TAG_SHA}" \
             --tag "${IMAGE_NAME}:${TAG_LATEST}" \
-            .
-          docker push "${IMAGE_NAME}:${TAG_SHA}"
-          docker push "${IMAGE_NAME}:${TAG_LATEST}"
+            --push .
 
       # Build + push tenant image (Go platform + Next.js canvas in one image).
       - name: Build & push tenant image to ECR (staging-<sha> + staging-latest)
@@ -158,15 +162,14 @@ jobs:
           ECR_REGISTRY="${TENANT_IMAGE_NAME%%/*}"
           aws ecr get-login-password --region us-east-2 | \
             docker login --username AWS --password-stdin "${ECR_REGISTRY}"
-          docker build \
+          docker buildx build \
             --file ./workspace-server/Dockerfile.tenant \
             --build-arg NEXT_PUBLIC_PLATFORM_URL= \
             --build-arg GIT_SHA="${GIT_SHA}" \
-            --label "org.opencontainers.image.source=https://github.com/${REPO}" \
+            --label "org.opencontainers.image.source=https://git.moleculesai.app/molecule-ai/${REPO}" \
             --label "org.opencontainers.image.revision=${GIT_SHA}" \
-            --label "org.opencontainers.image.description=Molecule AI tenant platform + canvas — pending canary verify" \
+            --label "org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --label "molecule.workflow.run_id=${GITHUB_RUN_ID}" \
             --tag "${TENANT_IMAGE_NAME}:${TAG_SHA}" \
             --tag "${TENANT_IMAGE_NAME}:${TAG_LATEST}" \
-            .
-          docker push "${TENANT_IMAGE_NAME}:${TAG_SHA}"
-          docker push "${TENANT_IMAGE_NAME}:${TAG_LATEST}"
+            --push .
