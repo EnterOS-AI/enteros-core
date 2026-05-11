@@ -85,7 +85,26 @@ fi
 OWNER="${REPO%%/*}"
 NAME="${REPO##*/}"
 API="https://${GITEA_HOST}/api/v1"
-AUTH="Authorization: token ${GITEA_TOKEN}"
+
+# Token-in-argv fix (#541): write the Authorization header to a mode-600
+# temp file instead of passing it via curl -H "$AUTH" (which puts the
+# secret token value in the process table for any process to read via
+# /proc/<pid>/cmdline or ps -ef). The curl config file is read by curl
+# itself and never appears in the argv of the curl subprocess.
+CURL_AUTH_FILE=$(mktemp -p /tmp curl-auth.XXXXXX)
+chmod 600 "$CURL_AUTH_FILE"
+printf 'header = "Authorization: token %s"\n' "$GITEA_TOKEN" > "$CURL_AUTH_FILE"
+
+# Pre-create temp files so cleanup trap can reference them by name
+# (bash trap 'function' EXIT expands variables at trap-fire time, not def time).
+PR_JSON=$(mktemp)
+REVIEWS_JSON=$(mktemp)
+TEAM_PROBE_TMP=$(mktemp)
+
+cleanup() {
+  rm -f "$CURL_AUTH_FILE" "$PR_JSON" "$REVIEWS_JSON" "$TEAM_PROBE_TMP"
+}
+trap cleanup EXIT
 
 debug() {
   if [ "${REVIEW_CHECK_DEBUG:-}" = "1" ]; then
@@ -96,10 +115,8 @@ debug() {
 echo "::notice::${TEAM}-review evaluating repo=${OWNER}/${NAME} pr=${PR_NUMBER} team_id=${TEAM_ID}"
 
 # --- Fetch the PR (for author + head.sha) ---
-PR_JSON=$(mktemp)
-trap 'rm -f "$PR_JSON" "$REVIEWS_JSON" "$TEAM_PROBE_TMP" 2>/dev/null || true' EXIT
 HTTP_CODE=$(curl -sS -o "$PR_JSON" -w '%{http_code}' \
-  -H "$AUTH" "${API}/repos/${OWNER}/${NAME}/pulls/${PR_NUMBER}")
+  -K "$CURL_AUTH_FILE" "${API}/repos/${OWNER}/${NAME}/pulls/${PR_NUMBER}")
 if [ "$HTTP_CODE" != "200" ]; then
   echo "::error::GET /pulls/${PR_NUMBER} returned HTTP ${HTTP_CODE} (token scope?)"
   cat "$PR_JSON" >&2
@@ -120,9 +137,8 @@ if [ -z "$PR_AUTHOR" ] || [ -z "$PR_HEAD_SHA" ]; then
 fi
 
 # --- Fetch all reviews on the PR ---
-REVIEWS_JSON=$(mktemp)
 HTTP_CODE=$(curl -sS -o "$REVIEWS_JSON" -w '%{http_code}' \
-  -H "$AUTH" "${API}/repos/${OWNER}/${NAME}/pulls/${PR_NUMBER}/reviews")
+  -K "$CURL_AUTH_FILE" "${API}/repos/${OWNER}/${NAME}/pulls/${PR_NUMBER}/reviews")
 if [ "$HTTP_CODE" != "200" ]; then
   echo "::error::GET /pulls/${PR_NUMBER}/reviews returned HTTP ${HTTP_CODE}"
   cat "$REVIEWS_JSON" >&2
@@ -156,10 +172,9 @@ fi
 #   403     → token owner is not in this team (Gitea 1.22.6 'Must be a team
 #             member' constraint — see follow-up issue for token-provisioning)
 #   404     → not a member
-TEAM_PROBE_TMP=$(mktemp)
 for U in $CANDIDATES; do
   CODE=$(curl -sS -o "$TEAM_PROBE_TMP" -w '%{http_code}' \
-    -H "$AUTH" "${API}/teams/${TEAM_ID}/members/${U}")
+    -K "$CURL_AUTH_FILE" "${API}/teams/${TEAM_ID}/members/${U}")
   debug "probe ${U} in team ${TEAM} (id=${TEAM_ID}) → HTTP ${CODE}"
   case "$CODE" in
     200|204)
