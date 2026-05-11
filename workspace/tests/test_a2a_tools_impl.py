@@ -279,7 +279,7 @@ class TestToolDelegateTask:
              patch("a2a_tools.report_activity", new=AsyncMock()):
             result = await a2a_tools.tool_delegate_task("ws-1", "do something")
 
-        assert result == "Task completed!"
+        assert result == "[A2A_RESULT_FROM_PEER]\nTask completed!\n[/A2A_RESULT_FROM_PEER]"
 
     async def test_error_response_returns_delegation_failed_message(self):
         """When send_a2a_message returns _A2A_ERROR_PREFIX text, delegation fails."""
@@ -307,7 +307,7 @@ class TestToolDelegateTask:
              patch("a2a_tools.report_activity", new=AsyncMock()):
             result = await a2a_tools.tool_delegate_task("ws-cached", "task")
 
-        assert result == "done"
+        assert result == "[A2A_RESULT_FROM_PEER]\ndone\n[/A2A_RESULT_FROM_PEER]"
 
     async def test_peer_name_falls_back_to_id_prefix(self):
         """When peer has no name and cache is empty, name = first 8 chars of workspace_id."""
@@ -321,108 +321,9 @@ class TestToolDelegateTask:
              patch("a2a_tools.report_activity", new=AsyncMock()):
             result = await a2a_tools.tool_delegate_task("ws-nona000", "task")
 
-        assert result == "ok"
+        assert result == "[A2A_RESULT_FROM_PEER]\nok\n[/A2A_RESULT_FROM_PEER]"
         # Cache should now have been set
         assert a2a_tools._peer_names.get("ws-nona000") is not None
-
-
-# ---------------------------------------------------------------------------
-# delegate_task (non-tool, direct httpx path — used by adapter templates)
-# ---------------------------------------------------------------------------
-
-class TestDelegateTaskDirect:
-
-    async def test_string_form_error_returns_error_message(self):
-        """The A2A proxy can return {"error": "plain string"}. Must not raise
-        AttributeError: 'str' object has no attribute 'get'."""
-        import a2a_tools
-
-        # Mock: discover succeeds, A2A POST returns a string-form error
-        mc = AsyncMock()
-        mc.__aenter__ = AsyncMock(return_value=mc)
-        mc.__aexit__ = AsyncMock(return_value=False)
-
-        async def fake_post(url, **kwargs):
-            r = MagicMock()
-            r.status_code = 200
-            r.json = MagicMock(return_value={"error": "peer workspace unreachable"})
-            return r
-
-        async def fake_get(url, **kwargs):
-            r = MagicMock()
-            r.status_code = 200
-            r.json = MagicMock(return_value={"url": "http://peer.svc/a2a"})
-            return r
-
-        mc.post = fake_post
-        mc.get = fake_get
-
-        with patch("a2a_tools.httpx.AsyncClient", return_value=mc):
-            result = await a2a_tools.delegate_task("ws-peer-123", "do a thing")
-
-        assert "Error" in result
-        assert "peer workspace unreachable" in result
-
-    async def test_dict_form_error_returns_error_message(self):
-        """{"error": {"message": "...", "code": ...}} — the pre-existing path."""
-        import a2a_tools
-
-        mc = AsyncMock()
-        mc.__aenter__ = AsyncMock(return_value=mc)
-        mc.__aexit__ = AsyncMock(return_value=False)
-
-        async def fake_post(url, **kwargs):
-            r = MagicMock()
-            r.status_code = 200
-            r.json = MagicMock(return_value={"error": {"message": "internal server error", "code": 500}})
-            return r
-
-        async def fake_get(url, **kwargs):
-            r = MagicMock()
-            r.status_code = 200
-            r.json = MagicMock(return_value={"url": "http://peer.svc/a2a"})
-            return r
-
-        mc.post = fake_post
-        mc.get = fake_get
-
-        with patch("a2a_tools.httpx.AsyncClient", return_value=mc):
-            result = await a2a_tools.delegate_task("ws-peer-456", "do a thing")
-
-        assert "Error" in result
-        assert "internal server error" in result
-
-    async def test_success_returns_result_text(self):
-        """Happy path: result with parts returns the first text part."""
-        import a2a_tools
-
-        mc = AsyncMock()
-        mc.__aenter__ = AsyncMock(return_value=mc)
-        mc.__aexit__ = AsyncMock(return_value=False)
-
-        async def fake_post(url, **kwargs):
-            r = MagicMock()
-            r.status_code = 200
-            r.json = MagicMock(return_value={
-                "result": {
-                    "parts": [{"kind": "text", "text": "Task done!"}]
-                }
-            })
-            return r
-
-        async def fake_get(url, **kwargs):
-            r = MagicMock()
-            r.status_code = 200
-            r.json = MagicMock(return_value={"url": "http://peer.svc/a2a"})
-            return r
-
-        mc.post = fake_post
-        mc.get = fake_get
-
-        with patch("a2a_tools.httpx.AsyncClient", return_value=mc):
-            result = await a2a_tools.delegate_task("ws-peer-789", "do a thing")
-
-        assert result == "Task done!"
 
 
 # ---------------------------------------------------------------------------

@@ -75,14 +75,19 @@ _INJECTION_PATTERNS = [
 
 
 def sanitize_a2a_result(text: str) -> str:
-    """Sanitize and wrap untrusted text from an A2A peer (OFFSEC-003).
+    """Sanitize untrusted text from an A2A peer (OFFSEC-003).
 
     Order of operations:
       1. Escape boundary markers in the raw text (prevents injection).
       2. Escape known injection patterns (defense-in-depth).
-      3. Wrap in trust-boundary markers.
 
     Returns the input unchanged if it is empty/None.
+
+    Note: this function does NOT add boundary wrappers — callers that need
+    to establish a trust boundary should wrap the sanitized result with
+    ``[A2A_RESULT_FROM_PEER]\\n{sanitized}\\n[/A2A_RESULT_FROM_PEER]``.
+    See ``a2a_tools_delegation.py:tool_delegate_task`` for the canonical
+    wrapping pattern.
     """
     if not text:
         return text
@@ -95,5 +100,4 @@ def sanitize_a2a_result(text: str) -> str:
     for pattern, replacement in _INJECTION_PATTERNS:
         escaped = pattern.sub(replacement, escaped)
 
-    # 3. Wrap in trust-boundary markers.
-    return f"{_A2A_BOUNDARY_START}\n{escaped}\n{_A2A_BOUNDARY_END}"
+    return escaped

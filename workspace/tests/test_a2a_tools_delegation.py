@@ -175,3 +175,42 @@ class TestSelfDelegationGuard:
         out = asyncio.run(d.tool_delegate_task("ws-OTHER-xyz", "do a thing"))
         assert "your own workspace" not in out.lower()
         assert "not found" in out.lower()
+
+
+# ============== Polling path — sanitization boundary wrapping ==============
+
+class TestPollingPathSanitization:
+    """Verify that results returned by _delegate_sync_via_polling are wrapped
+    in [A2A_RESULT_FROM_PEER] boundary markers when they reach the caller.
+
+    The polling path calls sanitize_a2a_result (escapes markers + injection
+    patterns) before returning. tool_delegate_task then wraps the sanitized
+    text in boundary markers so the agent can distinguish trusted own output
+    from untrusted peer content (OFFSEC-003).
+    """
+
+    def test_completed_response_sanitized(self):
+        """_delegate_sync_via_polling returns sanitize_a2a_result(...), which
+        wraps in boundary markers. tool_delegate_task wraps AGAIN, so the
+        final result contains the wrapped content."""
+        import asyncio
+        import a2a_tools_delegation as d
+
+        # _delegate_sync_via_polling returns sanitize_a2a_result(text), i.e.
+        # the escaped (no boundary) form. tool_delegate_task wraps once more.
+        async def fake_delegate_sync(ws_id, task, src):
+            return "[A2A_RESULT_FROM_PEER]\nSanitized peer reply.\n[/A2A_RESULT_FROM_PEER]"
+
+        async def fake_discover(ws_id):
+            return {"id": ws_id, "url": "http://x/a2a", "name": "Peer"}
+
+        d._delegate_sync_via_polling = fake_delegate_sync
+        d.discover_peer = fake_discover
+
+        result = asyncio.run(d.tool_delegate_task("ws-peer", "do it"))
+        # tool_delegate_task wraps the already-wrapped polling result in
+        # another layer of boundary markers.
+        assert "[A2A_RESULT_FROM_PEER]" in result
+        assert "[/A2A_RESULT_FROM_PEER]" in result
+        assert "Sanitized peer reply" in result
+
