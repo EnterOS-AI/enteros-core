@@ -139,6 +139,14 @@ jobs:
           /tmp/smoke/bin/python "$GITHUB_WORKSPACE/scripts/wheel_smoke.py"
 
       - name: Publish to PyPI
+        # working-directory matches the preceding Build/Verify steps. Without
+        # this, twine runs from the default workspace checkout dir where
+        # `dist/` doesn't exist and fails with:
+        #   ERROR InvalidDistribution: Cannot find file (or expand pattern): 'dist/*'
+        # Caught on the first-ever successful dispatch of this workflow
+        # (run 5097, 2026-05-11 02:08Z) — every other step in the publish
+        # job already had this working-directory; Publish was missing it.
+        working-directory: ${{ runner.temp }}/runtime-build
         env:
           # PYPI_TOKEN: repository secret scoped to molecule-ai-workspace-runtime.
           # Set via: Settings → Actions → Variables and Secrets → New Secret.
