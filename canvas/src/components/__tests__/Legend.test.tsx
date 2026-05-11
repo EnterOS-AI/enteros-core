@@ -149,7 +149,10 @@ describe("Legend — palette offset positioning", () => {
       (sel) => sel({ templatePaletteOpen: false } as ReturnType<typeof useCanvasStore.getState>)
     );
     render(<Legend />);
-    const panel = screen.getByText("Legend").closest("div");
+    // The outer panel div is the one with position classes (fixed bottom-6).
+    // screen.getByText("Legend") returns the inner heading text; get its
+    // closest ancestor with position-related classes (bottom-6).
+    const panel = screen.getByText("Legend").closest("div[class*='bottom-6']");
     expect(panel?.className).toContain("left-4");
   });
 
@@ -158,7 +161,7 @@ describe("Legend — palette offset positioning", () => {
       (sel) => sel({ templatePaletteOpen: true } as ReturnType<typeof useCanvasStore.getState>)
     );
     render(<Legend />);
-    const panel = screen.getByText("Legend").closest("div");
+    const panel = screen.getByText("Legend").closest("div[class*='bottom-6']");
     expect(panel?.className).toContain("left-[296px]");
   });
 });

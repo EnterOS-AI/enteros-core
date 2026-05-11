@@ -82,22 +82,28 @@ jobs:
         # The sop-tier-check script uses jq for all JSON API parsing.
         # Install jq before the script runs so sop-tier-check can pass.
         #
-        # Method: download binary directly from GitHub releases (faster and
-        # more reliable than apt-get in containerized environments). Falls
-        # back to apt-get if the download fails. The smoke test confirms
-        # jq is on PATH before the main script runs.
-        #
-        # continue-on-error: true ensures this step failing does not fail the
-        # job. The sop-tier-check script has its own jq fallback as a second
-        # line of defense — this step failing gracefully is acceptable.
+        # Method: apt-get first (reliable for Ubuntu runners with internet
+        # access to package mirrors). Falls back to GitHub binary download.
+        # GitHub releases may be unreachable from some runner networks
+        # (infra#241 follow-up: GitHub timeout after 3s on 5.78.80.188
+        # runners). The sop-tier-check script has its own fallback as a
+        # third line of defense. continue-on-error: true ensures this step
+        # failing does not block the job.
         continue-on-error: true
         run: |
-          timeout 60 curl -sSL \
+          # apt-get is the primary method — Ubuntu package mirrors are reliably
+          # reachable from runner containers. GitHub releases may be blocked
+          # or slow on some networks (infra#241 follow-up).
+          if apt-get update -qq && apt-get install -y -qq jq; then
+            echo "::notice::jq installed via apt-get: $(jq --version)"
+          elif timeout 120 curl -sSL \
             "https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-amd64" \
-            -o /usr/local/bin/jq && chmod +x /usr/local/bin/jq \
-          || apt-get update -qq && apt-get install -y -qq jq \
-          || echo "::warning::jq install methods failed — script fallback will retry"
-          jq --version 2>/dev/null || echo "::notice::jq not yet available — script will install"
+            -o /usr/local/bin/jq && chmod +x /usr/local/bin/jq; then
+            echo "::notice::jq binary downloaded: $(/usr/local/bin/jq --version)"
+          else
+            echo "::warning::jq install failed — apt-get and GitHub download both failed."
+          fi
+          jq --version 2>/dev/null || echo "::notice::jq not yet available — script fallback will retry"
 
       - name: Verify tier label + reviewer team membership
         # continue-on-error: true at step level — job-level is ignored by Gitea
