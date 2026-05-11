@@ -35,6 +35,12 @@ GITEA_HOST = os.environ.get("GITEA_HOST", "git.moleculesai.app")
 GITEA_TOKEN = os.environ.get("GITEA_TOKEN", os.environ.get("GITHUB_TOKEN", ""))
 API_BASE = f"https://{GITEA_HOST}/api/v1"
 
+# Timeout in seconds for all HTTP calls. Defence-in-depth: ensures a missing or
+# invalid SOP_TIER_CHECK_TOKEN causes a fast (~15 s) failure rather than an
+# indefinite hang. The real fix is provisioning the token; this caps worst-case
+# wall-clock on a broken/unreachable Gitea host.
+DEFAULT_TIMEOUT = 15
+
 
 def api_get(path: str) -> dict | list:
     url = f"{API_BASE}{path}"
@@ -46,7 +52,7 @@ def api_get(path: str) -> dict | list:
         },
     )
     try:
-        with urllib.request.urlopen(req) as r:
+        with urllib.request.urlopen(req, timeout=DEFAULT_TIMEOUT) as r:
             return json.loads(r.read())
     except urllib.error.HTTPError as e:
         body = e.read().decode(errors="replace")
@@ -521,12 +527,12 @@ def run(repo: str, pr_number: int, post_comment: bool = False) -> dict:
                     comment_id = our_comments[-1]["id"]
                     url = f"{API_BASE}/repos/{owner}/{name}/issues/comments/{comment_id}"
                     req = urllib.request.Request(url, data=json.dumps({"body": comment_body}).encode(), headers=headers, method="PATCH")
-                    with urllib.request.urlopen(req) as r:
+                    with urllib.request.urlopen(req, timeout=DEFAULT_TIMEOUT) as r:
                         r.read()
                 else:
                     url = f"{API_BASE}/repos/{owner}/{name}/issues/{pr_number}/comments"
                     req = urllib.request.Request(url, data=json.dumps({"body": comment_body}).encode(), headers=headers, method="POST")
-                    with urllib.request.urlopen(req) as r:
+                    with urllib.request.urlopen(req, timeout=DEFAULT_TIMEOUT) as r:
                         r.read()
             except urllib.error.HTTPError as e:
                 if e.code == 403:
