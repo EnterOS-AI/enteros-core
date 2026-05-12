@@ -37,10 +37,13 @@ name: main-red-watchdog
 # "unknown on type" when `workflow_dispatch.inputs.X` is present. Revisit
 # when Gitea ≥ 1.23 is fleet-wide.
 on:
-  schedule:
-    # Hourly at :05 — task spec calls for "off-zero" (`5 * * * *`),
-    # offset from :17 (ci-required-drift) and :00 (peak cron load).
-    - cron: '5 * * * *'
+  # SCHEDULE DISABLED 2026-05-12 — interim per RFC#420 Option-C machinery-down emergency
+  # Watchdog timing out behind runner saturation; rev3+dedicated-runner-label in flight
+  # Re-enable after rev3 lands + runner saturation root resolved
+  #   schedule:
+  #     # Hourly at :05 — task spec calls for "off-zero" (`5 * * * *`),
+  #     # offset from :17 (ci-required-drift) and :00 (peak cron load).
+  #     - cron: '5 * * * *'
   workflow_dispatch:
 
 # Read commit status + branch ref + issues; write issues (open/PATCH/close).
