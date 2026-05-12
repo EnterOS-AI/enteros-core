@@ -41,6 +41,11 @@ export function UnsavedChangesGuard({
       <AlertDialog.Portal>
         <AlertDialog.Overlay className="guard-dialog__overlay" />
         <AlertDialog.Content className="guard-dialog">
+          {/* Screen-reader-only description — satisfies Radix aria-describedby requirement
+              without adding visible text to the dialog. */}
+          <AlertDialog.Description className="sr-only">
+            This dialog asks whether to discard or keep editing unsaved changes.
+          </AlertDialog.Description>
           <AlertDialog.Title className="guard-dialog__title">
             Discard unsaved changes?
           </AlertDialog.Title>
@@ -50,6 +55,7 @@ export function UnsavedChangesGuard({
                 Keep editing
               </button>
             </AlertDialog.Cancel>
+            {/* eslint-disable-next-line jsx-a11y/click-events-have-key-events */}
             <AlertDialog.Action asChild>
               <button
                 type="button"
