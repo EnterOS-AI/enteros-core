@@ -32,12 +32,10 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"os"
 	"sync"
 	"testing"
 	"time"
 
-	mdb "github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
 	"github.com/alicebob/miniredis/v2"
 )
 
