@@ -673,6 +673,15 @@ def main(argv: list[str] | None = None) -> int:
         "--status-context",
         default="sop-checklist / all-items-acked (pull_request)",
     )
+    p.add_argument(
+        "--exit-on-state",
+        action="store_true",
+        help=(
+            "If set, exit non-zero when state=failure. Default OFF so the "
+            "job-level conclusion is independent of ack-state — the only "
+            "thing BP sees is the POSTed status. Useful for local debugging."
+        ),
+    )
     args = p.parse_args(argv)
 
     token = os.environ.get("GITEA_TOKEN", "")
@@ -789,7 +798,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.dry_run:
         print("::notice::--dry-run: not posting status")
-        return 0 if state in ("success", "pending") else 1
+        if args.exit_on_state:
+            return 0 if state in ("success", "pending") else 1
+        return 0
 
     target_url = f"https://{args.gitea_host}/{args.owner}/{args.repo}/pulls/{args.pr}"
     client.post_status(
@@ -798,7 +809,14 @@ def main(argv: list[str] | None = None) -> int:
         description=description, target_url=target_url,
     )
     print(f"::notice::status posted: {args.status_context} → {state}")
-    return 0 if state in ("success", "pending") else 1
+    # By default exit 0 — the POSTed status IS the gate, NOT the job
+    # conclusion. If the job exits 1 BP will see TWO failure signals
+    # (one from the job's auto-status, one from our POST), making the
+    # description less actionable. --exit-on-state restores the old
+    # behavior for local debugging.
+    if args.exit_on_state:
+        return 0 if state in ("success", "pending") else 1
+    return 0
 
 
 if __name__ == "__main__":
