@@ -60,13 +60,14 @@ const testTargetID   = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
 // returning the server URL. The server URL (e.g. "http://127.0.0.1:<port>/")
 // is suitable for caching in Redis and passing to executeDelegation.
 //
-// The server reads HTTP headers (which carry Content-Length) using a short
-// deadline, then immediately sends the response. This prevents deadlock where
-// io.Copy(io.Discard, conn) would wait for EOF (client waiting for headers
-// before sending body → server waiting for body before sending response).
+// The server reads HTTP headers using a deadline, then immediately sends the
+// response. This prevents the classic TCP deadlock: server blocked reading
+// body while client blocked waiting for response.
 func rawHTTPServer(t *testing.T, statusCode int, body string) (serverURL string, closeFn func()) {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	// Use ListenTCP with explicit IPv4 to avoid IPv6 mismatch on macOS
+	// (Listen("tcp", "127.0.0.1:0") might bind ::1 on some systems).
+	ln, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
 	if err != nil {
 		t.Fatalf("rawHTTPServer listen: %v", err)
 	}
@@ -87,39 +88,37 @@ func rawHTTPServer(t *testing.T, statusCode int, body string) (serverURL string,
 	}
 
 	// Handle in background so we don't block test execution.
-	// Strategy: read HTTP headers using a 2-second deadline (enough for the
-	// client to send headers + a small body). After deadline fires, send
-	// the response. The kernel discards any unread buffered body bytes
-	// when the connection closes — harmless.
+	// Strategy: read available bytes with a deadline (enough for headers).
+	// After deadline fires, send the response immediately.
+	// The kernel discards any unread buffered body bytes when the
+	// connection closes — harmless.
 	go func() {
 		conn := <-connCh
 		if conn == nil {
-			t.Log("SERVER: accept goroutine got nil conn")
 			return
 		}
-		t.Logf("SERVER: connection accepted from %v", conn.RemoteAddr())
-		defer conn.Close()
 
-		// Read headers with deadline. After 2s, Read returns with whatever
-		// bytes have arrived (headers are always sent first by the HTTP client).
+		// Read what we can with a 2s deadline. Headers always arrive first.
 		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 		headerBuf := make([]byte, 4096)
 		for {
 			n, err := conn.Read(headerBuf)
 			if n > 0 {
-				t.Logf("SERVER: read %d bytes", n)
+				_ = headerBuf[:n]
 			}
 			if err != nil {
-				t.Logf("SERVER: read done, err=%v", err)
 				break
 			}
 		}
 
-		// Send response immediately — don't wait for remaining body bytes.
+		// Send response and IMMEDIATELY close the connection.
+		// If we keep it open, the client's request-body writer goroutine
+		// might block on the socket (waiting for the server to drain the
+		// body). Closing immediately unblocks it. The client already
+		// received the response, so the write error is harmless.
 		resp := buildHTTPResponse(statusCode, body)
-		t.Logf("SERVER: sending response (%d bytes)", len(resp))
 		conn.Write(resp) //nolint:errcheck
-		t.Log("SERVER: response sent")
+		conn.Close()
 	}()
 
 	return serverURL, closeFn
