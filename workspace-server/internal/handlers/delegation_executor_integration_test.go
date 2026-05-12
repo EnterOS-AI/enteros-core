@@ -43,8 +43,8 @@ import (
 // Each test gets a fresh table state.
 
 const testDelegationID = "del-159-test-integration"
-const testSourceID    = "ws-source-159-integration"
-const testTargetID    = "ws-target-159-integration"
+const testSourceID    = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+const testTargetID    = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
 
 // setupIntegrationFixtures inserts the rows executeDelegation requires:
 //   - workspaces: source and target (siblings, parent_id=NULL so CanCommunicate=true)
@@ -58,14 +58,15 @@ func setupIntegrationFixtures(t *testing.T, conn *sql.DB) func() {
 	// We INSERT ... ON CONFLICT DO NOTHING so parallel test runs don't conflict.
 	for _, ws := range []struct {
 		id       string
+		name     string
 		parentID *string // nil means NULL
 	}{
-		{testSourceID, nil},
-		{testTargetID, nil},
+		{testSourceID, "test-source", nil},
+		{testTargetID, "test-target", nil},
 	} {
 		if _, err := conn.ExecContext(context.Background(),
-			`INSERT INTO workspaces (id, parent_id) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING`,
-			ws.id, ws.parentID,
+			`INSERT INTO workspaces (id, name, parent_id) VALUES ($1::uuid, $2, $3) ON CONFLICT (id) DO NOTHING`,
+			ws.id, ws.name, ws.parentID,
 		); err != nil {
 			t.Fatalf("seed workspace %s: %v", ws.id, err)
 		}
