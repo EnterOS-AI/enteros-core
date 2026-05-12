@@ -392,7 +392,7 @@ func TestInstructionsUpdate_ValidPartial(t *testing.T) {
 	c.Params = []gin.Param{{Key: "id", Value: instID}}
 
 	mock.ExpectExec("UPDATE platform_instructions SET").
-		WithArgs(&newTitle, sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), instID).
+		WithArgs(instID, &newTitle, sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	h.Update(c)
@@ -423,7 +423,7 @@ func TestInstructionsUpdate_AllFields(t *testing.T) {
 	c.Params = []gin.Param{{Key: "id", Value: instID}}
 
 	mock.ExpectExec("UPDATE platform_instructions SET").
-		WithArgs(&title, &content, &priority, &enabled, instID).
+		WithArgs(instID, &title, &content, &priority, &enabled).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	h.Update(c)
@@ -528,7 +528,7 @@ func TestInstructionsDelete_Valid(t *testing.T) {
 	w, c := newDeleteRequest("/instructions/" + instID)
 	c.Params = []gin.Param{{Key: "id", Value: instID}}
 
-	mock.ExpectExec("DELETE FROM platform_instructions WHERE id = $1").
+	mock.ExpectExec(`DELETE FROM platform_instructions WHERE id = \$1`).
 		WithArgs(instID).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
@@ -550,7 +550,7 @@ func TestInstructionsDelete_NotFound(t *testing.T) {
 	w, c := newDeleteRequest("/instructions/" + instID)
 	c.Params = []gin.Param{{Key: "id", Value: instID}}
 
-	mock.ExpectExec("DELETE FROM platform_instructions WHERE id = $1").
+	mock.ExpectExec(`DELETE FROM platform_instructions WHERE id = \$1`).
 		WithArgs(instID).
 		WillReturnResult(sqlmock.NewResult(0, 0))
 
@@ -572,7 +572,8 @@ func TestInstructionsDelete_DBError(t *testing.T) {
 	w, c := newDeleteRequest("/instructions/" + instID)
 	c.Params = []gin.Param{{Key: "id", Value: instID}}
 
-	mock.ExpectExec("DELETE FROM platform_instructions WHERE id = $1").
+	mock.ExpectExec(`DELETE FROM platform_instructions WHERE id = \$1`).
+		WithArgs(instID).
 		WillReturnError(errors.New("connection refused"))
 
 	h.Delete(c)
@@ -867,8 +868,9 @@ func TestInstructionsUpdate_EmptyBody(t *testing.T) {
 	c.Params = []gin.Param{{Key: "id", Value: instID}}
 
 	// COALESCE(nil, ...) = unchanged; still updates updated_at.
+	// Args order: ($1=id, $2=title, $3=content, $4=priority, $5=enabled)
 	mock.ExpectExec("UPDATE platform_instructions SET").
-		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), instID).
+		WithArgs(instID, sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	h.Update(c)

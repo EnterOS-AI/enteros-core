@@ -102,6 +102,9 @@ func TestResolveInsideRoot_RejectsSymlinkTraversal(t *testing.T) {
 
 	// Symlink that stays inside root is fine.
 	safe := filepath.Join(inner, "safe")
+	if err := os.MkdirAll(filepath.Join(tmp, "other"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.Symlink(filepath.Join(tmp, "other"), safe); err != nil {
 		t.Fatal(err)
 	}

@@ -497,7 +497,7 @@ func extractToolTrace(respBody []byte) json.RawMessage {
 		return nil
 	}
 	trace, ok := meta["tool_trace"]
-	if !ok || len(trace) == 0 {
+	if !ok || string(trace) == "[]" {
 		return nil
 	}
 	return trace
