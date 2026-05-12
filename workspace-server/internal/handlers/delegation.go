@@ -308,7 +308,7 @@ func insertDelegationRow(ctx context.Context, c *gin.Context, sourceID string, b
 // to land a fresh URL in the cache before we try again. Fixes #74 —
 // bulk restarts used to produce spurious "failed to reach workspace
 // agent" errors when delegations fired within the warm-up window.
-const delegationRetryDelay = 8 * time.Second
+var delegationRetryDelay = 8 * time.Second
 
 func (h *DelegationHandler) executeDelegation(sourceID, targetID, delegationID string, a2aBody []byte) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
@@ -323,6 +323,18 @@ func (h *DelegationHandler) executeDelegation(sourceID, targetID, delegationID s
 	})
 
 	status, respBody, proxyErr := h.workspace.proxyA2ARequest(ctx, targetID, a2aBody, sourceID, true)
+
+	// When proxyA2ARequest returns an error but we have a non-empty response body
+	// with a 2xx status code, the agent completed the work successfully — the error
+	// is a delivery/transport error (e.g., connection reset after response was
+	// received). Treat as success: the response body is valid and the work is done.
+	// This check MUST run before the transient-retry gate so a delivery-confirmed
+	// partial-body 2xx response is never retried.
+	if isDeliveryConfirmedSuccess(proxyErr, status, respBody) {
+		log.Printf("Delegation %s: completed with delivery error (status=%d, respBody=%d bytes, proxyErr=%v) — treating as success",
+			delegationID, status, len(respBody), proxyErr.Error())
+		goto handleSuccess
+	}
 
 	// #74: one retry after the reactive URL refresh has had a chance to
 	// run. The proxyA2ARequest's health-check path on a connection error
@@ -340,18 +352,6 @@ func (h *DelegationHandler) executeDelegation(sourceID, targetID, delegationID s
 		case <-time.After(delegationRetryDelay):
 			status, respBody, proxyErr = h.workspace.proxyA2ARequest(ctx, targetID, a2aBody, sourceID, true)
 		}
-	}
-
-	// When proxyA2ARequest returns an error but we have a non-empty response body
-	// with a 2xx status code, the agent completed the work successfully — the error
-	// is a delivery/transport error (e.g., connection reset after response was
-	// received). Treat as success: the response body is valid and the work is done.
-	// This prevents "retry storms" where the canvas sees error + Restart-workspace
-	// suggestion even though the delegation actually completed.
-	if isDeliveryConfirmedSuccess(proxyErr, status, respBody) {
-		log.Printf("Delegation %s: completed with delivery error (status=%d, respBody=%d bytes, proxyErr=%v) — treating as success",
-			delegationID, status, len(respBody), proxyErr.Error())
-		goto handleSuccess
 	}
 
 	if proxyErr != nil {

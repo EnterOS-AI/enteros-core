@@ -974,18 +974,21 @@ const testDelegationID = "del-159-test"
 const testSourceID = "ws-source-159"
 const testTargetID = "ws-target-159"
 
-// expectExecuteDelegationBase sets up sqlmock expectations for the DB queries that
-// executeDelegation always makes, regardless of outcome.
-func expectExecuteDelegationBase(mock sqlmock.Sqlmock) {
-	// updateDelegationStatus: dispatched
-	// Uses prefix match — sqlmock regexes match the full query string.
-	mock.ExpectExec("UPDATE activity_logs SET status").
-		WithArgs("dispatched", "", testSourceID, testDelegationID).
-		WillReturnResult(sqlmock.NewResult(0, 1))
+// setRetryDelayForTest overrides delegationRetryDelay for the duration of the
+// test. Use 0 in retry-path tests to avoid 8-second sleeps.
+func setRetryDelayForTest(t *testing.T, d time.Duration) {
+	t.Helper()
+	old := delegationRetryDelay
+	delegationRetryDelay = d
+	t.Cleanup(func() { delegationRetryDelay = old })
+}
 
-	// CanCommunicate: source != target → fires two getWorkspaceRef lookups.
-	// Both test fixtures have parent_id = NULL (root-level siblings) → allowed.
-	// Order matches call order: source first, then target.
+// expectProxyA2ARequest sets up DB expectations for one call to proxyA2ARequest:
+// CanCommunicate × 2, budget check, delivery-mode lookup, runtime lookup.
+// resolveAgentURL is NOT mocked — the test sets the URL in Redis so the DB
+// fallback never fires.
+func expectProxyA2ARequest(mock sqlmock.Sqlmock) {
+	// CanCommunicate: source then target (root-level siblings → allowed)
 	mock.ExpectQuery("SELECT id, parent_id FROM workspaces WHERE id").
 		WithArgs(testSourceID).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "parent_id"}).AddRow(testSourceID, nil))
@@ -993,35 +996,83 @@ func expectExecuteDelegationBase(mock sqlmock.Sqlmock) {
 		WithArgs(testTargetID).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "parent_id"}).AddRow(testTargetID, nil))
 
-	// resolveAgentURL: reads ws:{id}:url from Redis, falls back to DB for target
-	mock.ExpectQuery("SELECT url, status FROM workspaces WHERE id = ").
+	// checkWorkspaceBudget: no limit set → fail-open (no 402)
+	mock.ExpectQuery("SELECT budget_limit, COALESCE").
 		WithArgs(testTargetID).
-		WillReturnRows(sqlmock.NewRows([]string{"url", "status"}).AddRow("", "online"))
+		WillReturnRows(sqlmock.NewRows([]string{"budget_limit", "monthly_spend"}).AddRow(nil, int64(0)))
+
+	// lookupDeliveryMode: push → no poll short-circuit
+	mock.ExpectQuery("SELECT delivery_mode FROM workspaces WHERE id").
+		WithArgs(testTargetID).
+		WillReturnRows(sqlmock.NewRows([]string{"delivery_mode"}).AddRow("push"))
+
+	// handleMockA2A/lookupRuntime: not mock runtime → fall through to real dispatch
+	mock.ExpectQuery("SELECT runtime FROM workspaces WHERE id").
+		WithArgs(testTargetID).
+		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow(""))
 }
 
-// expectExecuteDelegationSuccess sets up expectations for a completed delegation.
-func expectExecuteDelegationSuccess(mock sqlmock.Sqlmock, respBody string) {
-	// INSERT activity_logs for delegation completion (response_body status = 'completed')
-	mock.ExpectExec("INSERT INTO activity_logs").
-		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), "completed").
+// expectExecuteDelegationBase sets up DB expectations for the pre-proxy phase
+// (updateDelegationStatus dispatched + broadcaster structure event) followed by
+// one proxyA2ARequest call.
+func expectExecuteDelegationBase(mock sqlmock.Sqlmock) {
+	// updateDelegationStatus: dispatched
+	mock.ExpectExec("UPDATE activity_logs SET status").
+		WithArgs("dispatched", "", testSourceID, testDelegationID).
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	// broadcaster.RecordAndBroadcast(EventDelegationStatus)
+	mock.ExpectExec("INSERT INTO structure_events").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	expectProxyA2ARequest(mock)
+}
 
-	// updateDelegationStatus: completed
+// expectLogA2ASuccess sets up the synchronous SELECT name call inside
+// logA2ASuccess. Add after expectExecuteDelegationBase (or expectProxyA2ARequest)
+// when the proxy attempt calls logA2ASuccess: delivery-confirmed 2xx with body,
+// clean 200, or a non-2xx fully read without a body-read error (e.g. 502 empty).
+func expectLogA2ASuccess(mock sqlmock.Sqlmock) {
+	mock.ExpectQuery("SELECT name FROM workspaces WHERE id").
+		WithArgs(testTargetID).
+		WillReturnRows(sqlmock.NewRows([]string{"name"}).AddRow(""))
+}
+
+// expectMaybeMarkContainerDead sets up the SELECT COALESCE(runtime) call in
+// maybeMarkContainerDead. Fires on the non-2xx path (isUpstreamDeadStatus) after
+// a successful body read. Test WorkspaceHandler has no provisioner so the
+// function returns false after this query.
+func expectMaybeMarkContainerDead(mock sqlmock.Sqlmock) {
+	mock.ExpectQuery("SELECT COALESCE.runtime").
+		WithArgs(testTargetID).
+		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("langgraph"))
+}
+
+// expectExecuteDelegationSuccess sets up DB expectations for the handleSuccess
+// path: INSERT delegation-result log, UPDATE status to completed, structure event.
+// The INSERT uses 5 positional args ($1–$5); status='completed' is a literal.
+func expectExecuteDelegationSuccess(mock sqlmock.Sqlmock) {
+	mock.ExpectExec("INSERT INTO activity_logs").
+		WithArgs(testSourceID, testSourceID, testTargetID, sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec("UPDATE activity_logs SET status").
 		WithArgs("completed", "", testSourceID, testDelegationID).
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	// broadcaster.RecordAndBroadcast(EventDelegationComplete)
+	mock.ExpectExec("INSERT INTO structure_events").
+		WillReturnResult(sqlmock.NewResult(0, 1))
 }
 
-// expectExecuteDelegationFailed sets up expectations for a failed delegation.
+// expectExecuteDelegationFailed sets up DB expectations for the failure path:
+// UPDATE status to failed, INSERT delegation-failure log, structure event.
+// The INSERT uses 5 positional args ($1–$5); status='failed' is a literal.
 func expectExecuteDelegationFailed(mock sqlmock.Sqlmock) {
-	// INSERT activity_logs for delegation failure (response_body status = 'failed')
-	mock.ExpectExec("INSERT INTO activity_logs").
-		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), "failed").
-		WillReturnResult(sqlmock.NewResult(0, 1))
-
-	// updateDelegationStatus: failed
 	mock.ExpectExec("UPDATE activity_logs SET status").
 		WithArgs("failed", sqlmock.AnyArg(), testSourceID, testDelegationID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO activity_logs").
+		WithArgs(testSourceID, testSourceID, testTargetID, "Delegation failed", sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	// broadcaster.RecordAndBroadcast(EventDelegationFailed)
+	mock.ExpectExec("INSERT INTO structure_events").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 }
 
@@ -1087,7 +1138,8 @@ func TestExecuteDelegation_DeliveryConfirmedProxyError_TreatsAsSuccess(t *testin
 	allowLoopbackForTest(t)
 
 	expectExecuteDelegationBase(mock)
-	expectExecuteDelegationSuccess(mock, `{"result":{"parts":[{"text":"work completed successfully"}]}}`)
+	expectLogA2ASuccess(mock)
+	expectExecuteDelegationSuccess(mock)
 
 	// Execute synchronously (not as a goroutine) so we can check DB state immediately.
 	// The handler fires it as goroutine; we call it directly for deterministic testing.
@@ -1181,6 +1233,8 @@ func TestExecuteDelegation_ProxyErrorNon2xx_RemainsFailed(t *testing.T) {
 // path is unchanged when proxyA2ARequest returns an error with a 2xx status but empty body.
 // The new condition requires len(respBody) > 0, so empty body routes to failure.
 func TestExecuteDelegation_ProxyErrorEmptyBody_RemainsFailed(t *testing.T) {
+	setRetryDelayForTest(t, 0)
+
 	mock := setupTestDB(t)
 	mr := setupTestRedis(t)
 	allowLoopbackForTest(t)
@@ -1202,13 +1256,17 @@ func TestExecuteDelegation_ProxyErrorEmptyBody_RemainsFailed(t *testing.T) {
 	mr.Set(fmt.Sprintf("ws:%s:url", testTargetID), agentServer.URL)
 	allowLoopbackForTest(t)
 
-	// First attempt: updateDelegationStatus(dispatched) — from expectExecuteDelegationBase
+	// First attempt: updateDelegationStatus(dispatched) + proxyA2ARequest DB calls
 	expectExecuteDelegationBase(mock)
-	// Second attempt (retry): updateDelegationStatus(dispatched) again
-	mock.ExpectExec("UPDATE activity_logs SET status").
-		WithArgs("dispatched", "", testSourceID, testDelegationID).
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	// Failure: INSERT + UPDATE (failed)
+	// 502 with empty body → logA2ASuccess fires (body read succeeded, no readErr)
+	expectLogA2ASuccess(mock)
+	// maybeMarkContainerDead fires on 502 (isUpstreamDeadStatus); returns false (no provisioner)
+	expectMaybeMarkContainerDead(mock)
+	// Retry attempt: proxyA2ARequest runs again (no extra dispatched UPDATE)
+	expectProxyA2ARequest(mock)
+	expectLogA2ASuccess(mock)
+	expectMaybeMarkContainerDead(mock)
+	// After retry: still fails → failure path
 	expectExecuteDelegationFailed(mock)
 
 	a2aBody, _ := json.Marshal(map[string]interface{}{
@@ -1252,7 +1310,8 @@ func TestExecuteDelegation_CleanProxyResponse_Unchanged(t *testing.T) {
 	allowLoopbackForTest(t)
 
 	expectExecuteDelegationBase(mock)
-	expectExecuteDelegationSuccess(mock, `{"result":{"parts":[{"text":"all good"}]}}`)
+	expectLogA2ASuccess(mock)
+	expectExecuteDelegationSuccess(mock)
 
 	a2aBody, _ := json.Marshal(map[string]interface{}{
 		"jsonrpc": "2.0", "id": "1", "method": "message/send",

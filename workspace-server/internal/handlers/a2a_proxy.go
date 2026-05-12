@@ -501,8 +501,18 @@ func (h *WorkspaceHandler) proxyA2ARequest(ctx context.Context, workspaceID stri
 		// to correctly route delivery-confirmed responses (where the agent completed
 		// the work but the TCP connection dropped before the full body was received)
 		// to success instead of failure (#159).
+		//
+		// For non-2xx responses (server explicitly rejected with 3xx+), preserve
+		// resp.StatusCode in the proxyA2AError.Status so isTransientProxyError
+		// returns false — a server-authored rejection is not a transient transport
+		// error and must not be retried. Only 2xx body-read errors keep Status=502
+		// (the agent completed work but the TCP layer dropped the response).
+		errStatus := http.StatusBadGateway
+		if resp.StatusCode >= 300 {
+			errStatus = resp.StatusCode
+		}
 		return resp.StatusCode, respBody, &proxyA2AError{
-			Status: http.StatusBadGateway,
+			Status: errStatus,
 			Response: gin.H{
 				"error":              "failed to read agent response",
 				"delivery_confirmed": deliveryConfirmed,
