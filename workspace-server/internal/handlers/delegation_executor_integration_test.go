@@ -36,7 +36,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
 	"github.com/alicebob/miniredis/v2"
+	"github.com/redis/go-redis/v9"
 )
 
 // integrationDB is imported from delegation_ledger_integration_test.go.
@@ -110,6 +112,17 @@ func setupIntegrationFixtures(t *testing.T, conn *sql.DB) func() {
 	}
 }
 
+// setupIntegrationRedis starts a miniredis, sets db.RDB, and seeds the target
+// workspace URL. Returns the miniredis instance for cleanup.
+// Idempotent — safe to call in each test regardless of Redis state.
+func setupIntegrationRedis(t *testing.T) *miniredis.Miniredis {
+	t.Helper()
+	mr := setupTestRedis(t)
+	// Seed the target workspace URL so proxyA2ARequest finds it.
+	db.CacheURL(context.Background(), testTargetID, "http://"+testTargetID)
+	return mr
+}
+
 // readDelegationRow returns (status, result_preview, error_detail) for the test
 // delegation, or fails the test if the row is not found.
 func readDelegationRow(t *testing.T, conn *sql.DB) (status, preview, errorDetail string) {
@@ -170,15 +183,12 @@ func TestIntegration_ExecuteDelegation_DeliveryConfirmedProxyError_TreatsAsSucce
 	}()
 
 	// Wire up mocks.
-	mr, err := miniredis.Run()
-	if err != nil {
-		t.Fatalf("miniredis: %v", err)
-	}
+	mr := setupIntegrationRedis(t)
 	defer mr.Close()
-	t.Setenv("REDIS_ADDR", mr.Addr())
 
+	// Override the cached URL with the mock server's actual address.
 	agentURL := "http://" + ln.Addr().String()
-	mr.Set(fmt.Sprintf("ws:%s:url", testTargetID), agentURL)
+	db.RDB.Set(context.Background(), fmt.Sprintf("ws:%s:url", testTargetID), agentURL, 0)
 
 	broadcaster := newTestBroadcaster()
 	wh := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
@@ -253,9 +263,8 @@ func TestIntegration_ExecuteDelegation_ProxyErrorNon2xx_RemainsFailed(t *testing
 		t.Fatalf("miniredis: %v", err)
 	}
 	defer mr.Close()
-	t.Setenv("REDIS_ADDR", mr.Addr())
-
-	mr.Set(fmt.Sprintf("ws:%s:url", testTargetID), "http://"+ln.Addr().String())
+	db.RDB = redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	db.RDB.Set(context.Background(), fmt.Sprintf("ws:%s:url", testTargetID), "http://"+ln.Addr().String(), 0)
 
 	broadcaster := newTestBroadcaster()
 	wh := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
@@ -319,9 +328,8 @@ func TestIntegration_ExecuteDelegation_ProxyErrorEmptyBody_RemainsFailed(t *test
 		t.Fatalf("miniredis: %v", err)
 	}
 	defer mr.Close()
-	t.Setenv("REDIS_ADDR", mr.Addr())
-
-	mr.Set(fmt.Sprintf("ws:%s:url", testTargetID), "http://"+ln.Addr().String())
+	db.RDB = redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	db.RDB.Set(context.Background(), fmt.Sprintf("ws:%s:url", testTargetID), "http://"+ln.Addr().String(), 0)
 
 	broadcaster := newTestBroadcaster()
 	wh := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
@@ -372,14 +380,8 @@ func TestIntegration_ExecuteDelegation_CleanProxyResponse_Unchanged(t *testing.T
 	go agentServer.Serve(ln)
 	defer agentServer.Close()
 
-	mr, err := miniredis.Run()
-	if err != nil {
-		t.Fatalf("miniredis: %v", err)
-	}
+	mr := setupIntegrationRedis(t)
 	defer mr.Close()
-	t.Setenv("REDIS_ADDR", mr.Addr())
-
-	mr.Set(fmt.Sprintf("ws:%s:url", testTargetID), "http://"+ln.Addr().String())
 
 	broadcaster := newTestBroadcaster()
 	wh := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
@@ -418,7 +420,12 @@ func TestIntegration_ExecuteDelegation_RedisDown_FallsBackToDB(t *testing.T) {
 	defer cleanup()
 	t.Setenv("DELEGATION_LEDGER_WRITE", "1")
 
-	// No miniredis — REDIS_ADDR not set, so resolveAgentURL falls back to DB.
+	// Set up miniredis so db.RDB is non-nil (RecordAndBroadcast requires it),
+	// but do NOT cache the workspace URL. resolveAgentURL skips Redis and falls
+	// back to DB, which also has no URL → target unreachable.
+	mr := setupTestRedis(t)
+	defer mr.Close()
+
 	broadcaster := newTestBroadcaster()
 	wh := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
 	dh := NewDelegationHandler(wh, broadcaster)
