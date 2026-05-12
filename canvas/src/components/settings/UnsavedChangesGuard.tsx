@@ -22,7 +22,10 @@ export function UnsavedChangesGuard({
   onDiscard,
 }: UnsavedChangesGuardProps) {
   return (
-    <AlertDialog.Root open={open} onOpenChange={(o) => { if (!o) onKeepEditing(); }}>
+    <AlertDialog.Root
+      open={open}
+      onOpenChange={(o) => { if (!o) onKeepEditing(); }}
+    >
       <AlertDialog.Portal>
         <AlertDialog.Overlay className="guard-dialog__overlay" />
         <AlertDialog.Content className="guard-dialog">
