@@ -113,13 +113,11 @@ func setupIntegrationFixtures(t *testing.T, conn *sql.DB) func() {
 }
 
 // setupIntegrationRedis starts a miniredis, sets db.RDB, and seeds the target
-// workspace URL. Returns the miniredis instance for cleanup.
-// Idempotent — safe to call in each test regardless of Redis state.
-func setupIntegrationRedis(t *testing.T) *miniredis.Miniredis {
+// workspace URL to agentURL. Returns the miniredis instance for cleanup.
+func setupIntegrationRedis(t *testing.T, agentURL string) *miniredis.Miniredis {
 	t.Helper()
 	mr := setupTestRedis(t)
-	// Seed the target workspace URL so proxyA2ARequest finds it.
-	db.CacheURL(context.Background(), testTargetID, "http://"+testTargetID)
+	db.CacheURL(context.Background(), testTargetID, agentURL)
 	return mr
 }
 
@@ -182,13 +180,11 @@ func TestIntegration_ExecuteDelegation_DeliveryConfirmedProxyError_TreatsAsSucce
 		// Close immediately — client gets io.EOF on body read
 	}()
 
-	// Wire up mocks.
-	mr := setupIntegrationRedis(t)
-	defer mr.Close()
-
-	// Override the cached URL with the mock server's actual address.
+	// Wire up mocks. Agent URL must be known before calling setupIntegrationRedis
+	// so the correct address is cached in Redis.
 	agentURL := "http://" + ln.Addr().String()
-	db.RDB.Set(context.Background(), fmt.Sprintf("ws:%s:url", testTargetID), agentURL, 0)
+	mr := setupIntegrationRedis(t, agentURL)
+	defer mr.Close()
 
 	broadcaster := newTestBroadcaster()
 	wh := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
@@ -380,7 +376,7 @@ func TestIntegration_ExecuteDelegation_CleanProxyResponse_Unchanged(t *testing.T
 	go agentServer.Serve(ln)
 	defer agentServer.Close()
 
-	mr := setupIntegrationRedis(t)
+	mr := setupIntegrationRedis(t, "http://"+ln.Addr().String())
 	defer mr.Close()
 
 	broadcaster := newTestBroadcaster()
