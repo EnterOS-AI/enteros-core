@@ -109,13 +109,14 @@ type LocalBuildOptions struct {
 	// http.DefaultClient with a 30s timeout.
 	HTTPClient *http.Client
 
-	// remoteHeadSha + dockerBuild + gitClone are seams for tests; if
-	// nil, the production implementations are used.
-	remoteHeadSha func(ctx context.Context, opts *LocalBuildOptions, runtime string) (string, error)
-	gitClone      func(ctx context.Context, opts *LocalBuildOptions, runtime, dest string) error
-	dockerBuild   func(ctx context.Context, opts *LocalBuildOptions, contextDir, tag string) error
-	dockerHasTag  func(ctx context.Context, tag string) (bool, error)
-	dockerTag     func(ctx context.Context, src, dst string) error
+	// remoteHeadSha + dockerBuild + gitClone + checkShellDeps are seams for
+	// tests; if nil, the production implementations are used.
+	remoteHeadSha   func(ctx context.Context, opts *LocalBuildOptions, runtime string) (string, error)
+	gitClone        func(ctx context.Context, opts *LocalBuildOptions, runtime, dest string) error
+	dockerBuild     func(ctx context.Context, opts *LocalBuildOptions, contextDir, tag string) error
+	dockerHasTag    func(ctx context.Context, tag string) (bool, error)
+	dockerTag       func(ctx context.Context, src, dst string) error
+	checkShellDeps  func() error // nil = use checkShellDepsProd
 }
 
 func newDefaultLocalBuildOptions() *LocalBuildOptions {
@@ -185,6 +186,18 @@ var ensureLocalImageHook = EnsureLocalImage
 func ensureLocalImageWithOpts(ctx context.Context, runtime string, opts *LocalBuildOptions) (string, error) {
 	if !IsKnownRuntime(runtime) {
 		return "", fmt.Errorf("local-build: refusing to build unknown runtime %q (must be one of %v)", runtime, knownRuntimes)
+	}
+
+	// Fail-fast: local-build mode requires docker and git on PATH. The
+	// error from exec.Command is cryptic ("exec: \"docker\": executable
+	// file not found in $PATH"); a pre-flight check surfaces the same
+	// failure with an actionable message and a pointer to the fix.
+	checkFn := opts.checkShellDeps
+	if checkFn == nil {
+		checkFn = checkShellDepsProd
+	}
+	if err := checkFn(); err != nil {
+		return "", err
 	}
 
 	lock := runtimeBuildLock(runtime)
@@ -425,6 +438,28 @@ func parseGiteaBranchHeadSha(body []byte) (string, error) {
 		return "", fmt.Errorf("Gitea returned suspiciously short sha %q", sha)
 	}
 	return sha, nil
+}
+
+// checkShellDepsProd verifies that both `docker` and `git` binaries are
+// reachable via PATH. This runs before any exec.Command call so a missing
+// binary surfaces as an actionable error rather than a cryptic exec-not-found
+// from deep inside the clone/build pipeline.
+func checkShellDepsProd() error {
+	missing := []string{}
+	for _, bin := range []string{"docker", "git"} {
+		if _, err := exec.LookPath(bin); err != nil {
+			missing = append(missing, bin)
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	return fmt.Errorf(
+		"local-build mode requires `docker` and `git` on PATH in the platform container; "+
+			"missing: %s. "+
+			"Fix: either install both, OR set MOLECULE_IMAGE_REGISTRY so local-build is bypassed",
+		strings.Join(missing, ", "),
+	)
 }
 
 // gitCloneProd shallow-clones the runtime's template repo into dest.
