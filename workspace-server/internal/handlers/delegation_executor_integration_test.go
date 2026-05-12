@@ -30,15 +30,14 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"net"
+	"io"
 	"net/http"
-	"sync"
+	"net/http/httptest"
 	"testing"
 	"time"
 
 	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
 	"github.com/alicebob/miniredis/v2"
-	"github.com/redis/go-redis/v9"
 )
 
 // integrationDB is imported from delegation_ledger_integration_test.go.
@@ -136,6 +135,50 @@ func readDelegationRow(t *testing.T, conn *sql.DB) (status, preview, errorDetail
 	return status, prev.String, errDet.String
 }
 
+// mockAgentWithPartialBody creates an httptest.Server that:
+//   - Writes headers (Content-Length larger than actual body) via the buffered
+//     httptest writer so the HTTP parser has moved past headers.
+//   - Writes a partial body and Flush()es the buffered writer (sends to TCP).
+//   - Hijacks and closes the connection while the HTTP client is mid-read.
+//
+// httptest's buffered writer discards unflushed data on Hijack(), so we must
+// Flush() before calling Hijack(). After Hijack(), the underlying TCP
+// connection is ours to close immediately — this triggers a read error on the
+// client (connection reset / EOF) even though headers arrived successfully.
+func mockAgentWithPartialBody(t *testing.T, statusCode int, declaredLength int, actualBody string) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		r.Body.Close()
+
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", declaredLength))
+		w.WriteHeader(statusCode)
+		// Write partial body to the buffered httptest writer and flush it so
+		// the kernel TCP send buffer has the data before Hijack() discards the
+		// buffered writer. After Flush() the client has received headers +
+		// partial body; it will block waiting for the remaining bytes.
+		w.Write([]byte(actualBody)) //nolint:errcheck
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+
+		// Hijack and immediately close the raw TCP connection.
+		// The client's next Read() returns connection-reset / EOF.
+		if hj, ok := w.(http.Hijacker); ok {
+			conn, bufWriter, _ := hj.Hijack()
+			if conn != nil {
+				// bufWriter is the buffered writer (already flushed above);
+				// free it since we no longer need it after Hijack.
+				if bw, ok := bufWriter.(io.Closer); ok {
+					bw.Close()
+				}
+				conn.Close()
+			}
+		}
+	}))
+}
+
 // TestIntegration_ExecuteDelegation_DeliveryConfirmedProxyError_TreatsAsSuccess
 // is the integration regression gate for issue #159.
 //
@@ -153,42 +196,14 @@ func TestIntegration_ExecuteDelegation_DeliveryConfirmedProxyError_TreatsAsSucce
 	defer cleanup()
 	t.Setenv("DELEGATION_LEDGER_WRITE", "1")
 
-	// Mock A2A agent server: 200 OK with Content-Length:100 but only 74 bytes
-	// of body, then close the connection. Go's http.Client sees io.EOF on the
-	// body read and proxyA2ARequest returns (200, <partial>, BadGateway).
-	// isDeliveryConfirmedSuccess sees status=200, len(body)>0, err!=nil → true.
-	var wg sync.WaitGroup
-	wg.Add(1)
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	defer ln.Close()
-	go func() {
-		defer wg.Done()
-		conn, err := ln.Accept()
-		if err != nil {
-			return
-		}
-		buf := make([]byte, 2048)
-		conn.Read(buf) // Read and discard the HTTP request
-		// 200 with Content-Length:100 but only 74 bytes of body — simulates a
-		// connection closed before the full Content-Length was delivered. Without
-		// the sleep below, the goroutine exits immediately after Write (buffered
-		// in the kernel send buffer), defer conn.Close() fires before the kernel
-		// TCP stack finishes transmitting, and the HTTP client hangs waiting for
-		// response headers that never arrive.
-		resp := "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n"
-		resp += `{"result":{"parts":[{"text":"work completed successfully"}]}}` // 74 bytes
-		conn.Write([]byte(resp))
-		time.Sleep(200 * time.Millisecond) // Let kernel TCP finish transmitting before close
-		conn.Close()
-	}()
+	// Mock server: 200 OK, Content-Length:100 declared, only 74 bytes of body sent,
+	// then connection closed. httptest.Server + Hijack ensures the HTTP parser has
+	// consumed the headers before we close, and buf.Flush() ensures data is in the
+	// kernel TCP send buffer before Close().
+	ts := mockAgentWithPartialBody(t, 200, 100, `{"result":{"parts":[{"text":"work completed successfully"}]}}`)
+	defer ts.Close()
 
-	// Wire up mocks. Agent URL must be known before calling setupIntegrationRedis
-	// so the correct address is cached in Redis.
-	agentURL := "http://" + ln.Addr().String()
-	mr := setupIntegrationRedis(t, agentURL)
+	mr := setupIntegrationRedis(t, ts.URL)
 	defer mr.Close()
 
 	broadcaster := newTestBroadcaster()
@@ -210,7 +225,6 @@ func TestIntegration_ExecuteDelegation_DeliveryConfirmedProxyError_TreatsAsSucce
 
 	// Wait for goroutine + DB writes to settle.
 	time.Sleep(500 * time.Millisecond)
-	wg.Wait()
 
 	status, preview, errDet := readDelegationRow(t, conn)
 	if status != "completed" {
@@ -237,36 +251,13 @@ func TestIntegration_ExecuteDelegation_ProxyErrorNon2xx_RemainsFailed(t *testing
 	defer cleanup()
 	t.Setenv("DELEGATION_LEDGER_WRITE", "1")
 
-	// Mock server: 500 with Content-Length:100 but only ~24 bytes of body.
-	var wg sync.WaitGroup
-	wg.Add(1)
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	defer ln.Close()
-	go func() {
-		defer wg.Done()
-		conn, err := ln.Accept()
-		if err != nil {
-			return
-		}
-		buf := make([]byte, 2048)
-		conn.Read(buf) // Read and discard the HTTP request
-		resp := "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n"
-		resp += `{"error":"agent crashed"}` // ~24 bytes
-		conn.Write([]byte(resp))
-		time.Sleep(200 * time.Millisecond) // Let kernel TCP finish transmitting before close
-		conn.Close()
-	}()
+	// Mock server: 500, Content-Length:100 declared, ~24 bytes of body sent.
+	ts := mockAgentWithPartialBody(t, 500, 100, `{"error":"agent crashed"}`)
+	defer ts.Close()
 
-	mr, err := miniredis.Run()
-	if err != nil {
-		t.Fatalf("miniredis: %v", err)
-	}
+	mr := setupTestRedis(t)
 	defer mr.Close()
-	db.RDB = redis.NewClient(&redis.Options{Addr: mr.Addr()})
-	db.RDB.Set(context.Background(), fmt.Sprintf("ws:%s:url", testTargetID), "http://"+ln.Addr().String(), 0)
+	db.CacheURL(context.Background(), testTargetID, ts.URL)
 
 	broadcaster := newTestBroadcaster()
 	wh := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
@@ -283,7 +274,6 @@ func TestIntegration_ExecuteDelegation_ProxyErrorNon2xx_RemainsFailed(t *testing
 	})
 	dh.executeDelegation(testSourceID, testTargetID, testDelegationID, a2aBody)
 	time.Sleep(500 * time.Millisecond)
-	wg.Wait()
 
 	status, _, errDet := readDelegationRow(t, conn)
 	if status != "failed" {
@@ -304,35 +294,17 @@ func TestIntegration_ExecuteDelegation_ProxyErrorEmptyBody_RemainsFailed(t *test
 	defer cleanup()
 	t.Setenv("DELEGATION_LEDGER_WRITE", "1")
 
-	// Mock server: 200 with Content-Length:0, empty body, then close.
-	var wg sync.WaitGroup
-	wg.Add(1)
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	defer ln.Close()
-	go func() {
-		defer wg.Done()
-		conn, err := ln.Accept()
-		if err != nil {
-			return
-		}
-		buf := make([]byte, 2048)
-		conn.Read(buf) // Read and discard the HTTP request
-		resp := "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 0\r\n\r\n"
-		conn.Write([]byte(resp))
-		time.Sleep(200 * time.Millisecond) // Let kernel TCP finish transmitting before close
-		conn.Close()
-	}()
+	// Mock server: 200, Content-Length:0 declared, no body sent, then close.
+	// mockAgentWithPartialBody with empty actualBody writes no body but still
+	// sets Content-Length: 0 in the headers, flushes them, then hijacks and
+	// closes the connection. The HTTP client sees headers + empty body, then
+	// a connection-drop → Read() error.
+	ts := mockAgentWithPartialBody(t, 200, 0, "")
+	defer ts.Close()
 
-	mr, err := miniredis.Run()
-	if err != nil {
-		t.Fatalf("miniredis: %v", err)
-	}
+	mr := setupTestRedis(t)
 	defer mr.Close()
-	db.RDB = redis.NewClient(&redis.Options{Addr: mr.Addr()})
-	db.RDB.Set(context.Background(), fmt.Sprintf("ws:%s:url", testTargetID), "http://"+ln.Addr().String(), 0)
+	db.CacheURL(context.Background(), testTargetID, ts.URL)
 
 	broadcaster := newTestBroadcaster()
 	wh := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
@@ -349,7 +321,6 @@ func TestIntegration_ExecuteDelegation_ProxyErrorEmptyBody_RemainsFailed(t *test
 	})
 	dh.executeDelegation(testSourceID, testTargetID, testDelegationID, a2aBody)
 	time.Sleep(500 * time.Millisecond)
-	wg.Wait()
 
 	status, _, errDet := readDelegationRow(t, conn)
 	if status != "failed" {
@@ -370,20 +341,15 @@ func TestIntegration_ExecuteDelegation_CleanProxyResponse_Unchanged(t *testing.T
 	defer cleanup()
 	t.Setenv("DELEGATION_LEDGER_WRITE", "1")
 
-	// Use httptest.NewServer for the clean success case (no connection drop).
-	agentServer := http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// Use httptest.Server for the clean success case (no connection drop).
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(`{"result":{"parts":[{"text":"all good"}]}}`))
-	})}
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	go agentServer.Serve(ln)
-	defer agentServer.Close()
+	}))
+	defer ts.Close()
 
-	mr := setupIntegrationRedis(t, "http://"+ln.Addr().String())
+	mr := setupIntegrationRedis(t, ts.URL)
 	defer mr.Close()
 
 	broadcaster := newTestBroadcaster()
@@ -454,4 +420,3 @@ func TestIntegration_ExecuteDelegation_RedisDown_FallsBackToDB(t *testing.T) {
 		t.Error("error_detail should be set on failure due to unreachable target")
 	}
 }
-
