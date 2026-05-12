@@ -314,7 +314,7 @@ func TestIntegration_ExecuteDelegation_DeliveryConfirmedProxyError_TreatsAsSucce
 
 	start := time.Now()
 	runWithTimeout(t, 30*time.Second, func() {
-		dh.executeDelegation(testSourceID, testTargetID, testDelegationID, a2aBody)
+		dh.executeDelegation(context.Background(), testSourceID, testTargetID, testDelegationID, a2aBody)
 	})
 	t.Logf("executeDelegation took %v", time.Since(start))
 
@@ -366,7 +366,7 @@ func TestIntegration_ExecuteDelegation_ProxyErrorNon2xx_RemainsFailed(t *testing
 	})
 	start := time.Now()
 	runWithTimeout(t, 30*time.Second, func() {
-		dh.executeDelegation(testSourceID, testTargetID, testDelegationID, a2aBody)
+		dh.executeDelegation(context.Background(), testSourceID, testTargetID, testDelegationID, a2aBody)
 	})
 	t.Logf("executeDelegation took %v", time.Since(start))
 
@@ -415,7 +415,7 @@ func TestIntegration_ExecuteDelegation_ProxyErrorEmptyBody_RemainsFailed(t *test
 	})
 	start := time.Now()
 	runWithTimeout(t, 30*time.Second, func() {
-		dh.executeDelegation(testSourceID, testTargetID, testDelegationID, a2aBody)
+		dh.executeDelegation(context.Background(), testSourceID, testTargetID, testDelegationID, a2aBody)
 	})
 	t.Logf("executeDelegation took %v", time.Since(start))
 
@@ -463,7 +463,7 @@ func TestIntegration_ExecuteDelegation_CleanProxyResponse_Unchanged(t *testing.T
 	})
 	start := time.Now()
 	runWithTimeout(t, 30*time.Second, func() {
-		dh.executeDelegation(testSourceID, testTargetID, testDelegationID, a2aBody)
+		dh.executeDelegation(context.Background(), testSourceID, testTargetID, testDelegationID, a2aBody)
 	})
 	t.Logf("executeDelegation took %v", time.Since(start))
 
@@ -508,7 +508,7 @@ func TestIntegration_ExecuteDelegation_RedisDown_FallsBackToDB(t *testing.T) {
 	})
 	start := time.Now()
 	runWithTimeout(t, 30*time.Second, func() {
-		dh.executeDelegation(testSourceID, testTargetID, testDelegationID, a2aBody)
+		dh.executeDelegation(context.Background(), testSourceID, testTargetID, testDelegationID, a2aBody)
 	})
 	t.Logf("executeDelegation took %v", time.Since(start))
 
