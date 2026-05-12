@@ -316,13 +316,17 @@ func (h *DelegationHandler) executeDelegation(sourceID, targetID, delegationID s
 
 	log.Printf("Delegation %s: %s → %s (dispatched)", delegationID, sourceID, targetID)
 
+	log.Printf("Delegation %s: DIAG step=dispatched_status", delegationID)
 	// Update status: pending → dispatched
 	h.updateDelegationStatus(sourceID, delegationID, "dispatched", "")
+	log.Printf("Delegation %s: DIAG step=dispatched_broadcast", delegationID)
 	h.broadcaster.RecordAndBroadcast(ctx, string(events.EventDelegationStatus), sourceID, map[string]interface{}{
 		"delegation_id": delegationID, "target_id": targetID, "status": "dispatched",
 	})
+	log.Printf("Delegation %s: DIAG step=proxy_request_start", delegationID)
 
 	status, respBody, proxyErr := h.workspace.proxyA2ARequest(ctx, targetID, a2aBody, sourceID, true)
+	log.Printf("Delegation %s: DIAG step=proxy_request_done status=%d bodyLen=%d proxyErr=%v", delegationID, status, len(respBody), proxyErr)
 
 	// #74: one retry after the reactive URL refresh has had a chance to
 	// run. The proxyA2ARequest's health-check path on a connection error
@@ -355,6 +359,7 @@ func (h *DelegationHandler) executeDelegation(sourceID, targetID, delegationID s
 	}
 
 	if proxyErr != nil {
+		log.Printf("Delegation %s: DIAG step=handleFailure proxyErr=%v", delegationID, proxyErr)
 		log.Printf("Delegation %s: failed — %s", delegationID, proxyErr.Error())
 		h.updateDelegationStatus(sourceID, delegationID, "failed", proxyErr.Error())
 
@@ -374,6 +379,7 @@ func (h *DelegationHandler) executeDelegation(sourceID, targetID, delegationID s
 	}
 
 handleSuccess:
+	log.Printf("Delegation %s: DIAG step=handleSuccess status=%d", delegationID, status)
 
 	// 202 + {queued: true} means the target was busy and the proxy
 	// enqueued the request for the next drain tick — NOT a completion.
@@ -414,6 +420,7 @@ handleSuccess:
 	responseText := extractResponseText(respBody)
 	log.Printf("Delegation %s: completed (status=%d, %d chars)", delegationID, status, len(responseText))
 
+	log.Printf("Delegation %s: DIAG step=insert_activity_log", delegationID)
 	// Store success (response_body must be JSONB, include delegation_id)
 	respJSON, _ := json.Marshal(map[string]interface{}{
 		"text":          responseText,
@@ -425,6 +432,7 @@ handleSuccess:
 	`, sourceID, sourceID, targetID, "Delegation completed ("+textutil.TruncateBytes(responseText, 80)+")", string(respJSON)); err != nil {
 		log.Printf("Delegation %s: failed to insert success log: %v", delegationID, err)
 	}
+	log.Printf("Delegation %s: DIAG step=record_ledger_status", delegationID)
 
 	// RFC #2829 #318: write the ledger row with result_preview FIRST,
 	// THEN updateDelegationStatus. Order matters: SetStatus has a
@@ -434,7 +442,9 @@ handleSuccess:
 	// Caught by the local-Postgres integration test in
 	// delegation_ledger_integration_test.go.
 	recordLedgerStatus(ctx, delegationID, "completed", "", responseText)
+	log.Printf("Delegation %s: DIAG step=update_delegation_status", delegationID)
 	h.updateDelegationStatus(sourceID, delegationID, "completed", "")
+	log.Printf("Delegation %s: DIAG step=broadcast_complete", delegationID)
 	h.broadcaster.RecordAndBroadcast(ctx, string(events.EventDelegationComplete), sourceID, map[string]interface{}{
 		"delegation_id":    delegationID,
 		"target_id":        targetID,
@@ -442,6 +452,7 @@ handleSuccess:
 	})
 	// RFC #2829 PR-2 result-push (see UpdateStatus for rationale).
 	pushDelegationResultToInbox(ctx, sourceID, delegationID, "completed", responseText, "")
+	log.Printf("Delegation %s: DIAG step=done", delegationID)
 }
 
 // updateDelegationStatus updates the status of a delegation record in activity_logs.
