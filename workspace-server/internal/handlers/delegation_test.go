@@ -983,7 +983,16 @@ func expectExecuteDelegationBase(mock sqlmock.Sqlmock) {
 		WithArgs("dispatched", "", testSourceID, testDelegationID).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	// CanCommunicate (source=target self-call is always allowed — no DB lookup needed)
+	// CanCommunicate: source != target → fires two getWorkspaceRef lookups.
+	// Both test fixtures have parent_id = NULL (root-level siblings) → allowed.
+	// Order matches call order: source first, then target.
+	mock.ExpectQuery("SELECT id, parent_id FROM workspaces WHERE id").
+		WithArgs(testSourceID).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "parent_id"}).AddRow(testSourceID, nil))
+	mock.ExpectQuery("SELECT id, parent_id FROM workspaces WHERE id").
+		WithArgs(testTargetID).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "parent_id"}).AddRow(testTargetID, nil))
+
 	// resolveAgentURL: reads ws:{id}:url from Redis, falls back to DB for target
 	mock.ExpectQuery("SELECT url, status FROM workspaces WHERE id = ").
 		WithArgs(testTargetID).

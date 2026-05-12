@@ -149,6 +149,21 @@ jobs:
         name: Run golangci-lint
         run: golangci-lint run --timeout 3m ./... || true
       - if: needs.changes.outputs.platform == 'true'
+        name: Diagnostic — per-package verbose 60s
+        run: |
+          set +e
+          go test -race -v -timeout 60s ./internal/handlers/... 2>&1 | tee /tmp/test-handlers.log
+          handlers_exit=$?
+          go test -race -v -timeout 60s ./internal/pendinguploads/... 2>&1 | tee /tmp/test-pu.log
+          pu_exit=$?
+          echo "::group::handlers exit=$handlers_exit (last 100 lines)"
+          tail -100 /tmp/test-handlers.log
+          echo "::endgroup::"
+          echo "::group::pendinguploads exit=$pu_exit (last 100 lines)"
+          tail -100 /tmp/test-pu.log
+          echo "::endgroup::"
+        continue-on-error: true
+      - if: needs.changes.outputs.platform == 'true'
         name: Run tests with race detection and coverage
         run: go test -race -coverprofile=coverage.out ./...
 
