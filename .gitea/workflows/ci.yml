@@ -536,7 +536,7 @@ jobs:
     # `.gitea/scripts/ci-required-drift.py::ci_job_names`).
     #
     # Phase 3 (RFC #219 §1) safety: underlying build jobs carry
-    # continue-on-error: true so their failures are masked to null
+    # continue-on-error: true so their failures are masked to null (2026-05-12: re-enabled mc#664 interim)
     # (Gitea suppresses status reporting for CoE jobs). This sentinel
     # runs with continue-on-error: false so it always reports its
     # result to the API — without this, the required-status entry
