@@ -136,40 +136,37 @@ func readDelegationRow(t *testing.T, conn *sql.DB) (status, preview, errorDetail
 }
 
 // mockAgentWithPartialBody creates an httptest.Server that:
-//   - Writes headers (Content-Length larger than actual body) via the buffered
-//     httptest writer so the HTTP parser has moved past headers.
-//   - Writes a partial body and Flush()es the buffered writer (sends to TCP).
-//   - Hijacks and closes the connection while the HTTP client is mid-read.
+//   - Sends HTTP status + headers with Content-Length > actual body size.
+//   - Writes a partial body and Flush()es via http.Flusher (sends to client).
+//   - Immediately Hijack()s and Close()s the raw TCP connection.
 //
-// httptest's buffered writer discards unflushed data on Hijack(), so we must
-// Flush() before calling Hijack(). After Hijack(), the underlying TCP
-// connection is ours to close immediately — this triggers a read error on the
-// client (connection reset / EOF) even though headers arrived successfully.
+// Key insight (from a2a_proxy_test.go's TestProxyA2A_BodyReadFailure):
+// We do NOT read or close r.Body before Hijack(). The HTTP parser has already
+// consumed the request line + headers; r.Body may still have bytes in flight
+// from the client. Draining it with io.Copy would deadlock: the handler waits
+// to finish reading while the client is blocked writing the body (waiting for
+// response headers that the handler hasn't sent yet).
+// After Hijack() the raw conn is ours — conn.Close() fires RST/EOF to the client.
 func mockAgentWithPartialBody(t *testing.T, statusCode int, declaredLength int, actualBody string) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		io.Copy(io.Discard, r.Body)
-		r.Body.Close()
+		// Do NOT read r.Body — matching a2a_proxy_test.go pattern.
+		// The server closes r.Body when the handler returns (server-managed).
 
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Content-Length", fmt.Sprintf("%d", declaredLength))
 		w.WriteHeader(statusCode)
-		// Write partial body to the buffered httptest writer and flush it so
-		// the kernel TCP send buffer has the data before Hijack() discards the
-		// buffered writer. After Flush() the client has received headers +
-		// partial body; it will block waiting for the remaining bytes.
+		// Write partial body and flush so the client receives it.
 		w.Write([]byte(actualBody)) //nolint:errcheck
 		if flusher, ok := w.(http.Flusher); ok {
 			flusher.Flush()
 		}
 
-		// Hijack and immediately close the raw TCP connection.
-		// The client's next Read() returns connection-reset / EOF.
+		// Hijack: flushes the buffered writer, returns raw conn.
+		// Close: sends FIN/RST to client → client's next Read() errors.
 		if hj, ok := w.(http.Hijacker); ok {
 			conn, bufWriter, _ := hj.Hijack()
 			if conn != nil {
-				// bufWriter is the buffered writer (already flushed above);
-				// free it since we no longer need it after Hijack.
 				if bw, ok := bufWriter.(io.Closer); ok {
 					bw.Close()
 				}
