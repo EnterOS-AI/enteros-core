@@ -41,6 +41,7 @@ import (
 	"encoding/json"
 	"net"
 	"net/http"
+	"runtime"
 	"testing"
 	"time"
 
@@ -226,6 +227,41 @@ func readDelegationRow(t *testing.T, conn *sql.DB) (status, preview, errorDetail
 	return status, prev.String, errDet.String
 }
 
+// stack returns the current goroutine stack trace. Used by runWithTimeout to
+// pinpoint the blocking call site when a test times out.
+func stack() string {
+	buf := make([]byte, 4096)
+	n := runtime.Stack(buf, false)
+	return string(buf[:n])
+}
+
+// runWithTimeout calls fn in a goroutine and fails t if it doesn't return within
+// timeout. This prevents a single hanging test from consuming the full 5-minute CI
+// timeout and leaving no diagnostic time for subsequent tests. The stack trace
+// in the failure output reveals exactly which goroutine is blocking.
+func runWithTimeout(t *testing.T, timeout time.Duration, fn func()) {
+	done := make(chan struct{})
+	var panicErr interface{}
+	go func() {
+		defer func() {
+			if p := recover(); p != nil {
+				panicErr = p
+			}
+			close(done)
+		}()
+		fn()
+	}()
+
+	select {
+	case <-done:
+		if panicErr != nil {
+			t.Fatalf("executeDelegation panicked: %v\n%s", panicErr, stack())
+		}
+	case <-time.After(timeout):
+		t.Fatalf("executeDelegation TIMED OUT after %v — blocking goroutine stack:\n%s", timeout, stack())
+	}
+}
+
 // TestIntegration_ExecuteDelegation_DeliveryConfirmedProxyError_TreatsAsSuccess
 // is the integration regression gate for issue #159.
 //
@@ -235,31 +271,25 @@ func readDelegationRow(t *testing.T, conn *sql.DB) (status, preview, errorDetail
 // 'completed' with the response body as result_preview.
 func TestIntegration_ExecuteDelegation_DeliveryConfirmedProxyError_TreatsAsSuccess(t *testing.T) {
 	allowLoopbackForTest(t)
-	t.Log("=== TEST START ===")
 	conn := integrationDB(t)
-	t.Log("integrationDB done")
 	cleanup := setupIntegrationFixtures(t, conn)
 	defer cleanup()
 	t.Setenv("DELEGATION_LEDGER_WRITE", "1")
 
 	agentURL, closeServer := rawHTTPServer(t, 200, `{"result":{"parts":[{"text":"work completed successfully"}]}}`)
 	defer closeServer()
-	t.Logf("rawHTTPServer started at %s", agentURL)
 
 	mr := setupTestRedis(t)
 	defer mr.Close()
 	db.CacheURL(context.Background(), testTargetID, agentURL)
-	t.Log("Redis setup + URL cache done")
 
 	prevClient := a2aClient
 	defer func() { a2aClient = prevClient }()
 	a2aClient = newA2AClientForHost(extractHostPort(agentURL))
-	t.Log("a2aClient overridden")
 
 	broadcaster := newTestBroadcaster()
 	wh := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
 	dh := NewDelegationHandler(wh, broadcaster)
-	t.Log("handlers created")
 
 	a2aBody, _ := json.Marshal(map[string]interface{}{
 		"jsonrpc": "2.0",
@@ -272,10 +302,12 @@ func TestIntegration_ExecuteDelegation_DeliveryConfirmedProxyError_TreatsAsSucce
 			},
 		},
 	})
-	t.Log("calling executeDelegation...")
+
 	start := time.Now()
-	dh.executeDelegation(testSourceID, testTargetID, testDelegationID, a2aBody)
-	t.Logf("executeDelegation DONE after %v", time.Since(start))
+	runWithTimeout(t, 30*time.Second, func() {
+		dh.executeDelegation(testSourceID, testTargetID, testDelegationID, a2aBody)
+	})
+	t.Logf("executeDelegation took %v", time.Since(start))
 
 	status, preview, errDet := readDelegationRow(t, conn)
 	if status != "completed" {
@@ -324,7 +356,9 @@ func TestIntegration_ExecuteDelegation_ProxyErrorNon2xx_RemainsFailed(t *testing
 		},
 	})
 	start := time.Now()
-	dh.executeDelegation(testSourceID, testTargetID, testDelegationID, a2aBody)
+	runWithTimeout(t, 30*time.Second, func() {
+		dh.executeDelegation(testSourceID, testTargetID, testDelegationID, a2aBody)
+	})
 	t.Logf("executeDelegation took %v", time.Since(start))
 
 	status, _, errDet := readDelegationRow(t, conn)
@@ -371,7 +405,9 @@ func TestIntegration_ExecuteDelegation_ProxyErrorEmptyBody_RemainsFailed(t *test
 		},
 	})
 	start := time.Now()
-	dh.executeDelegation(testSourceID, testTargetID, testDelegationID, a2aBody)
+	runWithTimeout(t, 30*time.Second, func() {
+		dh.executeDelegation(testSourceID, testTargetID, testDelegationID, a2aBody)
+	})
 	t.Logf("executeDelegation took %v", time.Since(start))
 
 	status, _, errDet := readDelegationRow(t, conn)
@@ -417,7 +453,9 @@ func TestIntegration_ExecuteDelegation_CleanProxyResponse_Unchanged(t *testing.T
 		},
 	})
 	start := time.Now()
-	dh.executeDelegation(testSourceID, testTargetID, testDelegationID, a2aBody)
+	runWithTimeout(t, 30*time.Second, func() {
+		dh.executeDelegation(testSourceID, testTargetID, testDelegationID, a2aBody)
+	})
 	t.Logf("executeDelegation took %v", time.Since(start))
 
 	status, preview, errDet := readDelegationRow(t, conn)
@@ -460,7 +498,9 @@ func TestIntegration_ExecuteDelegation_RedisDown_FallsBackToDB(t *testing.T) {
 		},
 	})
 	start := time.Now()
-	dh.executeDelegation(testSourceID, testTargetID, testDelegationID, a2aBody)
+	runWithTimeout(t, 30*time.Second, func() {
+		dh.executeDelegation(testSourceID, testTargetID, testDelegationID, a2aBody)
+	})
 	t.Logf("executeDelegation took %v", time.Since(start))
 
 	status, _, errDet := readDelegationRow(t, conn)
