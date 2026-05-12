@@ -136,41 +136,43 @@ func readDelegationRow(t *testing.T, conn *sql.DB) (status, preview, errorDetail
 }
 
 // mockAgentWithPartialBody creates an httptest.Server that:
-//   - Sends HTTP status + headers with Content-Length > actual body size.
-//   - Writes a partial body and Flush()es via http.Flusher (sends to client).
-//   - Immediately Hijack()s and Close()s the raw TCP connection.
+//   - Hijacks the raw TCP connection after the HTTP parser consumes request
+//     headers (so r.Body is still in-flight from the client).
+//   - Writes raw HTTP response bytes directly to the raw conn so they bypass
+//     httptest's buffered writer (which Hijack() discards, losing any unflushed
+//     data that was written via w.WriteHeader/w.Write).
+//   - Closes the raw conn while the client is mid-read on the body.
 //
-// Key insight (from a2a_proxy_test.go's TestProxyA2A_BodyReadFailure):
-// We do NOT read or close r.Body. Closing r.Body triggers the Go HTTP server's
-// pipe mechanism to signal an EOF to the body reader — which on the CLIENT side
-// causes the request-body writer to fail with "read from closed pipe". This hangs
-// the request indefinitely. The fix: just Hijack() and return without touching
-// r.Body. The HTTP server manages r.Body cleanup when the handler returns.
+// Critical insight: httptest's Hijack() discards the buffered writer, which
+// contains any bytes written via w.WriteHeader/w.Write that weren't flushed to
+// the raw TCP conn. This means the HTTP client NEVER receives the response
+// headers (blocked by ResponseHeaderTimeout = 3 minutes).
+// Fix: write the raw HTTP response directly to the raw conn AFTER Hijack(),
+// bypassing the buffered writer entirely.
 func mockAgentWithPartialBody(t *testing.T, statusCode int, declaredLength int, actualBody string) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Content-Length", fmt.Sprintf("%d", declaredLength))
-		w.WriteHeader(statusCode)
-		// Write partial body and flush so the client receives it.
-		w.Write([]byte(actualBody)) //nolint:errcheck
-		if flusher, ok := w.(http.Flusher); ok {
-			flusher.Flush()
-		}
-
-		// Hijack: flushes the buffered writer, returns raw conn.
-		// Close: sends FIN/RST to client → client's next Read() errors.
-		// Do NOT touch r.Body — matches a2a_proxy_test.go pattern exactly.
+		// Do NOT touch r.Body — server manages it.
 		if hj, ok := w.(http.Hijacker); ok {
 			conn, bufWriter, _ := hj.Hijack()
 			if conn != nil {
+				// Close the buffered writer (no-op on already-flushed data).
 				if bw, ok := bufWriter.(io.Closer); ok {
 					bw.Close()
 				}
-				conn.Close()
+				// Write raw HTTP response bytes DIRECTLY to the raw conn.
+				// Bypasses httptest's buffered writer so Hijack() can't lose them.
+				// Content-Length > actualBody: server announces more bytes than it
+				// sends before closing — simulates a mid-stream connection drop.
+				header := fmt.Sprintf("HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n",
+					statusCode, http.StatusText(statusCode), declaredLength)
+				conn.Write([]byte(header))     //nolint:errcheck
+				conn.Write([]byte(actualBody)) //nolint:errcheck
+				// Brief delay so client reads headers + partial body before close.
+				time.Sleep(50 * time.Millisecond)
+				conn.Close() // FIN/RST → client's next Read() errors
 			}
 		}
-		// Return WITHOUT touching r.Body. The HTTP server manages it.
 	}))
 }
 
