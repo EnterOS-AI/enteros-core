@@ -43,6 +43,38 @@ func (s *syncBuf) String() string {
 	return s.b.String()
 }
 
+// unwrapGoError extracts subprocess stderr from a Go-wrapped error that
+// includes combined output. e.g. from sendSSHPublicKey's
+// fmt.Errorf("send-ssh-public-key: %w (%s)", err, combinedOut), this
+// returns the " (%s)" portion — the actionable subprocess signal like
+// "AccessDeniedException: ... is not authorized to perform:
+// ec2-instance-connect:OpenTunnel". Returns "" when the output is
+// identical to the error string (no stderr captured).
+func unwrapGoError(errMsg string) string {
+	// Find the last ") " at the end — the fmt.Errorf wrapper puts
+	// subprocess output in parentheses at the end of the string.
+	// e.g. "send-ssh-public-key: exec: exit status 1 (AccessDenied...)"
+	if len(errMsg) < 4 {
+		return ""
+	}
+	// Find last ")(" pattern: Go's %w wraps before the output paren
+	// e.g. "send-ssh-public-key: exit status 1 (AccessDeniedException: ...)"
+	// We want everything after the last ") " — the subprocess stderr.
+	// Safe heuristic: strip up to and including the last ") " prefix.
+	sep := ") "
+	idx := strings.LastIndex(errMsg, sep)
+	if idx == -1 {
+		return ""
+	}
+	candidate := errMsg[idx+len(sep):]
+	// If stripping the last ") ..." leaves the string unchanged, there
+	// was no real subprocess output.
+	if candidate == errMsg {
+		return ""
+	}
+	return candidate
+}
+
 // HandleDiagnose handles GET /workspaces/:id/terminal/diagnose. It runs the
 // same per-step pipeline as HandleConnect (ssh-keygen → EIC send-key → tunnel
 // → ssh) but non-interactively, captures the first failing step and its
@@ -214,12 +246,18 @@ func (h *TerminalHandler) diagnoseRemote(ctx context.Context, workspaceID, insta
 	}
 
 	// Step 2: send-ssh-public-key (AWS Instance Connect)
+	// mc#687: populate Detail so the E2E smoke sees the AWS permission error
+	// verbatim. The subprocess stderr (e.g. "AccessDeniedException: ... is not
+	// authorized to perform: ec2-instance-connect:OpenTunnel") is captured by
+	// sendSSHPublicKey's CombinedOutput() and embedded in the Go error string.
 	t0 = time.Now()
 	if err := sendSSHPublicKey(ctx, region, instanceID, osUser, strings.TrimSpace(string(pubKey))); err != nil {
+		errMsg := err.Error()
 		return stop("send-ssh-public-key", diagnoseStep{
 			Name:       "send-ssh-public-key",
 			DurationMs: time.Since(t0).Milliseconds(),
-			Error:      err.Error(),
+			Error:      errMsg,
+			Detail:     unwrapGoError(errMsg),
 		})
 	}
 	res.Steps = append(res.Steps, diagnoseStep{Name: "send-ssh-public-key", OK: true, DurationMs: time.Since(t0).Milliseconds()})
