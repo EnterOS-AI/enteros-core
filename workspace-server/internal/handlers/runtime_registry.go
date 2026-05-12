@@ -146,6 +146,16 @@ func isExternalLikeRuntime(runtime string) bool {
 	return false
 }
 
+// normalizeExternalRuntime returns the given runtime label if non-empty,
+// otherwise falls back to "external". Used when persisting BYO-compute
+// workspaces so we don't store an empty runtime string.
+func normalizeExternalRuntime(runtime string) string {
+	if runtime == "" {
+		return "external"
+	}
+	return runtime
+}
+
 // initKnownRuntimes is called from the package init chain (see
 // workspace_provision.go var initialization) to replace the
 // fallback map with the manifest-derived one. Idempotent —
