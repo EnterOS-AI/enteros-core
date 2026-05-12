@@ -105,6 +105,27 @@ _FIXTURES = {
         "status": "queued",
         "delivery_mode": "poll",
     },
+    # Push-mode queue envelope — returned when a push-mode workspace is at
+    # capacity. The platform queues the request and returns
+    # {"queued": true, "message": "...", "queue_id": "..."}.
+    # Distinguishable from poll-queued by data.get("queued") is True alone.
+    "push_queued_full": {
+        "queued": True,
+        "method": "tasks/send",
+        "message": "Queued for busy push-mode peer",
+        "queue_id": "q-abc123",
+    },
+    "push_queued_no_method": {
+        # method is optional; defaults to "message/send".
+        "queued": True,
+        "message": "at capacity",
+        "queue_id": "q-def456",
+    },
+    "push_queued_message_only": {
+        # queue_id is optional metadata; envelope is still Queued.
+        "queued": True,
+        "message": "server at capacity",
+    },
     "malformed_empty_dict": {},
     "malformed_unexpected_keys": {"foo": "bar", "baz": 42},
     "malformed_status_queued_no_delivery_mode": {
@@ -158,6 +179,42 @@ class TestQueuedVariant:
         with caplog.at_level(logging.INFO, logger="a2a_response"):
             a2a_response.parse(_FIXTURES["poll_queued_full"])
         assert any("queued for poll-mode peer" in r.message for r in caplog.records)
+
+
+class TestQueuedVariant_PushMode:
+    """``parse()`` recognizes the push-mode queue envelope (a2a_proxy.go)
+    and returns ``Queued``. Push-mode queue is distinguishable by
+    ``data.get("queued") is True`` — checked before poll-mode so the two
+    cases are mutually exclusive even if a buggy server sends both."""
+
+    def test_push_queued_full_returns_Queued(self):
+        v = a2a_response.parse(_FIXTURES["push_queued_full"])
+        assert isinstance(v, a2a_response.Queued)
+        assert v.method == "tasks/send"
+
+    def test_push_queued_no_method_defaults_to_message_send(self):
+        v = a2a_response.parse(_FIXTURES["push_queued_no_method"])
+        assert isinstance(v, a2a_response.Queued)
+        assert v.method == "message/send"
+
+    def test_push_queued_message_only_returns_Queued(self):
+        # queue_id is optional metadata; envelope with just queued+message
+        # is still a valid Queued.
+        v = a2a_response.parse(_FIXTURES["push_queued_message_only"])
+        assert isinstance(v, a2a_response.Queued)
+
+    def test_push_queued_logs_info_with_queue_id(self, caplog):
+        with caplog.at_level(logging.INFO, logger="a2a_response"):
+            a2a_response.parse(_FIXTURES["push_queued_full"])
+        assert any("queued for busy push-mode peer" in r.message for r in caplog.records)
+        assert any("q-abc123" in r.message for r in caplog.records)
+
+    def test_push_queued_delivery_mode_defaults_to_poll(self):
+        # Push-mode path sets only method; delivery_mode retains the "poll"
+        # dataclass default. This is technically wrong for push-mode but
+        # matches the current implementation.
+        v = a2a_response.parse(_FIXTURES["push_queued_full"])
+        assert v.delivery_mode == "poll"
 
 
 class TestResultVariant:
@@ -436,6 +493,9 @@ class TestRegressionGate:
             "poll_queued_full":                  a2a_response.Queued,
             "poll_queued_notify":                a2a_response.Queued,
             "poll_queued_no_method":             a2a_response.Queued,
+            "push_queued_full":                  a2a_response.Queued,
+            "push_queued_no_method":             a2a_response.Queued,
+            "push_queued_message_only":          a2a_response.Queued,
             "malformed_empty_dict":              a2a_response.Malformed,
             "malformed_unexpected_keys":         a2a_response.Malformed,
             "malformed_status_queued_no_delivery_mode": a2a_response.Malformed,
