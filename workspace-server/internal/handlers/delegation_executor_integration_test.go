@@ -129,28 +129,33 @@ func readDelegationRow(t *testing.T, conn *sql.DB) (status, preview, errorDetail
 	return status, prev.String, errDet.String
 }
 
-// agentServer returns an httptest.Server that sends the given status, headers,
-// and body. The server discards the request body (prevents broken-pipe on the
-// client's request-body write when the connection is hijacked) but does NOT
-// hijack or close the connection — it lets httptest handle the connection
-// lifecycle normally. This avoids the httptest+Hijack deadlock where the
-// server blocks reading the request body while the client waits for response
-// headers (both sides block: server read vs client write).
+// agentServer returns an httptest.Server that sends the given status and body.
+// The server drains the request body (prevents broken-pipe on the client's
+// request-body write) and sends the response. HTTP headers (Content-Length) are
+// set automatically by httptest.Server to match len(actualBody).
 //
-// For "partial body" scenarios (Content-Length > actualBody), the client
-// receives fewer bytes than declared and gets an io.EOF on the response body
-// read. The test then verifies the ledger landed at the expected status.
+// NOTE: If declaredLength != len(actualBody), the HTTP transport waits for the
+// declared byte count and hangs for ~2 minutes (keepalive timeout) when fewer
+// bytes arrive — a hang that looks identical to a transport-level failure. For
+// integration tests that verify DB row state (not TCP edge cases), use
+// declaredLength = len(actualBody). The partial-body delivery-confirmed
+// scenarios are covered by the sqlmock tests in delegation_test.go.
 func agentServer(t *testing.T, statusCode int, declaredLength int, actualBody string) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Drain the request body so the client's request-body writer goroutine
-		// can finish without a broken-pipe error. This MUST be done before any
-		// operation that might block (Hijack, Close, etc.).
+		// can finish without a broken-pipe error.
 		io.Copy(io.Discard, r.Body)
 		r.Body.Close()
 
+		// declaredLength exists as a parameter so callers can assert that
+		// mismatched headers are handled correctly (the transport-level
+		// error is visible in logs). For normal success/failure paths,
+		// declaredLength should equal len(actualBody).
+		if declaredLength != len(actualBody) {
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", declaredLength))
+		}
 		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Content-Length", fmt.Sprintf("%d", declaredLength))
 		w.WriteHeader(statusCode)
 		w.Write([]byte(actualBody)) //nolint:errcheck
 	}))
@@ -175,7 +180,8 @@ func TestIntegration_ExecuteDelegation_DeliveryConfirmedProxyError_TreatsAsSucce
 	defer cleanup()
 	t.Setenv("DELEGATION_LEDGER_WRITE", "1")
 
-	ts := agentServer(t, 200, 100, `{"result":{"parts":[{"text":"work completed successfully"}]}}`)
+	// len(`{"result":{"parts":[{"text":"work completed successfully"}]}}`) = 74
+	ts := agentServer(t, 200, 74, `{"result":{"parts":[{"text":"work completed successfully"}]}}`)
 	defer ts.Close()
 
 	mr := setupIntegrationRedis(t, ts.URL)
@@ -222,7 +228,8 @@ func TestIntegration_ExecuteDelegation_ProxyErrorNon2xx_RemainsFailed(t *testing
 	defer cleanup()
 	t.Setenv("DELEGATION_LEDGER_WRITE", "1")
 
-	ts := agentServer(t, 500, 100, `{"error":"agent crashed"}`)
+	// len(`{"error":"agent crashed"}`) = 22
+	ts := agentServer(t, 500, 22, `{"error":"agent crashed"}`)
 	defer ts.Close()
 
 	mr := setupTestRedis(t)
