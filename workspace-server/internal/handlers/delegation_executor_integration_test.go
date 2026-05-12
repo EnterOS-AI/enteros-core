@@ -10,6 +10,14 @@
 // were satisfied with "an UPDATE fired" — none verified the row's preview
 // field actually landed. These integration tests close that gap.
 //
+// How HTTP is mocked
+// -----------------
+// a2aClient is a package-level var so tests can reassign it. Each test
+// creates an httptest.Server (same-process, same-host) and redirects
+// a2aClient's Transport to point at it. Same-process HTTP has no DNS, no
+// TCP handshake overhead, and no network partition risk. The httptest.Server
+// is started BEFORE a2aClient is updated so every request hits a live server.
+//
 // Run with:
 //
 //   docker run --rm -d --name pg-integration \
@@ -30,10 +38,10 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"fmt"
-	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 	"time"
 
@@ -46,7 +54,7 @@ import (
 
 const testDelegationID = "del-159-test-integration"
 const testSourceID    = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
-const testTargetID    = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+const testTargetID   = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
 
 // setupIntegrationFixtures inserts the rows executeDelegation requires:
 //   - workspaces: source and target (siblings, parent_id=NULL so CanCommunicate=true)
@@ -105,15 +113,6 @@ func setupIntegrationFixtures(t *testing.T, conn *sql.DB) func() {
 	}
 }
 
-// setupIntegrationRedis starts a miniredis, sets db.RDB, and seeds the target
-// workspace URL to agentURL. Returns the miniredis instance for cleanup.
-func setupIntegrationRedis(t *testing.T, agentURL string) *miniredis.Miniredis {
-	t.Helper()
-	mr := setupTestRedis(t)
-	db.CacheURL(context.Background(), testTargetID, agentURL)
-	return mr
-}
-
 // readDelegationRow returns (status, result_preview, error_detail) for the test
 // delegation, or fails the test if the row is not found.
 func readDelegationRow(t *testing.T, conn *sql.DB) (status, preview, errorDetail string) {
@@ -129,50 +128,13 @@ func readDelegationRow(t *testing.T, conn *sql.DB) (status, preview, errorDetail
 	return status, prev.String, errDet.String
 }
 
-// agentServer returns an httptest.Server that sends the given status and body.
-// The server drains the request body (prevents broken-pipe on the client's
-// request-body write) and sends the response. HTTP headers (Content-Length) are
-// set automatically by httptest.Server to match len(actualBody).
-//
-// NOTE: If declaredLength != len(actualBody), the HTTP transport waits for the
-// declared byte count and hangs for ~2 minutes (keepalive timeout) when fewer
-// bytes arrive — a hang that looks identical to a transport-level failure. For
-// integration tests that verify DB row state (not TCP edge cases), use
-// declaredLength = len(actualBody). The partial-body delivery-confirmed
-// scenarios are covered by the sqlmock tests in delegation_test.go.
-func agentServer(t *testing.T, statusCode int, declaredLength int, actualBody string) *httptest.Server {
-	t.Helper()
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		handlerStart := time.Now()
-		n, _ := io.Copy(io.Discard, r.Body)
-		r.Body.Close()
-		t.Logf("agentServer: request received after %v, body=%d bytes, sending %d", time.Since(handlerStart), n, len(actualBody))
-
-		// declaredLength exists as a parameter so callers can assert that
-		// mismatched headers are handled correctly (the transport-level
-		// error is visible in logs). For normal success/failure paths,
-		// declaredLength should equal len(actualBody).
-		if declaredLength != len(actualBody) {
-			w.Header().Set("Content-Length", fmt.Sprintf("%d", declaredLength))
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(statusCode)
-		w.Write([]byte(actualBody)) //nolint:errcheck
-	}))
-}
-
 // TestIntegration_ExecuteDelegation_DeliveryConfirmedProxyError_TreatsAsSuccess
 // is the integration regression gate for issue #159.
 //
-// Scenario: proxyA2ARequest returns a 200 status code with a non-empty
-// (potentially partial) body and an error. The isDeliveryConfirmedSuccess
-// guard (status>=200 && <300 && len(body)>0 && err!=nil) routes to
-// handleSuccess.
-//
-// We use a clean 200 response here — the partial-body variant is tested
-// via the sqlmock tests in delegation_test.go which pin the exact SQL
-// statement that fires. This integration test verifies the DB row lands
-// correctly at 'completed' with the response body as result_preview.
+// Scenario: proxyA2ARequest returns a 200 status code with a non-empty body.
+// isDeliveryConfirmedSuccess guard (status>=200 && <300 && len(body)>0 && err!=nil)
+// routes to handleSuccess. The integration test verifies the DB row lands at
+// 'completed' with the response body as result_preview.
 func TestIntegration_ExecuteDelegation_DeliveryConfirmedProxyError_TreatsAsSuccess(t *testing.T) {
 	allowLoopbackForTest(t)
 	conn := integrationDB(t)
@@ -180,12 +142,34 @@ func TestIntegration_ExecuteDelegation_DeliveryConfirmedProxyError_TreatsAsSucce
 	defer cleanup()
 	t.Setenv("DELEGATION_LEDGER_WRITE", "1")
 
-	// len(`{"result":{"parts":[{"text":"work completed successfully"}]}}`) = 74
-	ts := agentServer(t, 200, 74, `{"result":{"parts":[{"text":"work completed successfully"}]}}`)
+	// Create test server with 200 response.
+	// NOTE: Do NOT read r.Body here. httptest.Server reads the full request
+	// body into an in-memory buffer before calling the handler — r.Body is
+	// already populated. Reading it here would not block in theory, but
+	// omitting the drain avoids any subtle goroutine lifetime issues.
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"result":{"parts":[{"text":"work completed successfully"}]}}`))
+	}))
 	defer ts.Close()
 
-	mr := setupIntegrationRedis(t, ts.URL)
+	mr := setupTestRedis(t)
 	defer mr.Close()
+	db.CacheURL(context.Background(), testTargetID, ts.URL)
+
+	// Override a2aClient so requests go to the test server (same-process).
+	prevClient := a2aClient
+	defer func() { a2aClient = prevClient }()
+	u, _ := url.Parse(ts.URL)
+	a2aClient = &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return net.Dial("tcp", u.Host)
+			},
+			ResponseHeaderTimeout: 180 * time.Second,
+		},
+	}
 
 	broadcaster := newTestBroadcaster()
 	wh := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
@@ -205,14 +189,13 @@ func TestIntegration_ExecuteDelegation_DeliveryConfirmedProxyError_TreatsAsSucce
 	start := time.Now()
 	dh.executeDelegation(testSourceID, testTargetID, testDelegationID, a2aBody)
 	t.Logf("executeDelegation took %v", time.Since(start))
-	time.Sleep(500 * time.Millisecond)
 
 	status, preview, errDet := readDelegationRow(t, conn)
 	if status != "completed" {
 		t.Errorf("status: want completed, got %q", status)
 	}
 	if preview == "" {
-		t.Logf("result_preview: %q", preview)
+		t.Errorf("result_preview should be non-empty, got %q", preview)
 	}
 	if errDet != "" {
 		t.Errorf("error_detail should be empty on success: got %q", errDet)
@@ -221,8 +204,7 @@ func TestIntegration_ExecuteDelegation_DeliveryConfirmedProxyError_TreatsAsSucce
 
 // TestIntegration_ExecuteDelegation_ProxyErrorNon2xx_RemainsFailed verifies that
 // a 500 response routes to failure, not success. isDeliveryConfirmedSuccess
-// requires status>=200 && <300, so 500 always fails the guard regardless
-// of body length.
+// requires status>=200 && <300, so 500 always fails the guard.
 func TestIntegration_ExecuteDelegation_ProxyErrorNon2xx_RemainsFailed(t *testing.T) {
 	allowLoopbackForTest(t)
 	conn := integrationDB(t)
@@ -230,13 +212,28 @@ func TestIntegration_ExecuteDelegation_ProxyErrorNon2xx_RemainsFailed(t *testing
 	defer cleanup()
 	t.Setenv("DELEGATION_LEDGER_WRITE", "1")
 
-	// len(`{"error":"agent crashed"}`) = 22
-	ts := agentServer(t, 500, 22, `{"error":"agent crashed"}`)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`{"error":"agent crashed"}`))
+	}))
 	defer ts.Close()
 
 	mr := setupTestRedis(t)
 	defer mr.Close()
 	db.CacheURL(context.Background(), testTargetID, ts.URL)
+
+	prevClient := a2aClient
+	defer func() { a2aClient = prevClient }()
+	u, _ := url.Parse(ts.URL)
+	a2aClient = &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return net.Dial("tcp", u.Host)
+			},
+			ResponseHeaderTimeout: 180 * time.Second,
+		},
+	}
 
 	broadcaster := newTestBroadcaster()
 	wh := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
@@ -251,10 +248,9 @@ func TestIntegration_ExecuteDelegation_ProxyErrorNon2xx_RemainsFailed(t *testing
 			},
 		},
 	})
-	execStart := time.Now()
+	start := time.Now()
 	dh.executeDelegation(testSourceID, testTargetID, testDelegationID, a2aBody)
-	t.Logf("executeDelegation took %v", time.Since(execStart))
-	time.Sleep(500 * time.Millisecond)
+	t.Logf("executeDelegation took %v", time.Since(start))
 
 	status, _, errDet := readDelegationRow(t, conn)
 	if status != "failed" {
@@ -266,9 +262,8 @@ func TestIntegration_ExecuteDelegation_ProxyErrorNon2xx_RemainsFailed(t *testing
 }
 
 // TestIntegration_ExecuteDelegation_ProxyErrorEmptyBody_RemainsFailed verifies that
-// a 200 response with an empty body (Content-Length: 0) routes to failure.
-// isDeliveryConfirmedSuccess requires len(body) > 0, so an empty body always
-// fails the guard regardless of status.
+// a 200 response with an empty body routes to failure. isDeliveryConfirmedSuccess
+// requires len(body) > 0, so an empty body fails the guard.
 func TestIntegration_ExecuteDelegation_ProxyErrorEmptyBody_RemainsFailed(t *testing.T) {
 	allowLoopbackForTest(t)
 	conn := integrationDB(t)
@@ -276,12 +271,28 @@ func TestIntegration_ExecuteDelegation_ProxyErrorEmptyBody_RemainsFailed(t *test
 	defer cleanup()
 	t.Setenv("DELEGATION_LEDGER_WRITE", "1")
 
-	ts := agentServer(t, 200, 0, "")
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		// No body — the handler sends a 200 with Content-Length: 0.
+	}))
 	defer ts.Close()
 
 	mr := setupTestRedis(t)
 	defer mr.Close()
 	db.CacheURL(context.Background(), testTargetID, ts.URL)
+
+	prevClient := a2aClient
+	defer func() { a2aClient = prevClient }()
+	u, _ := url.Parse(ts.URL)
+	a2aClient = &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return net.Dial("tcp", u.Host)
+			},
+			ResponseHeaderTimeout: 180 * time.Second,
+		},
+	}
 
 	broadcaster := newTestBroadcaster()
 	wh := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
@@ -296,8 +307,9 @@ func TestIntegration_ExecuteDelegation_ProxyErrorEmptyBody_RemainsFailed(t *test
 			},
 		},
 	})
+	start := time.Now()
 	dh.executeDelegation(testSourceID, testTargetID, testDelegationID, a2aBody)
-	time.Sleep(500 * time.Millisecond)
+	t.Logf("executeDelegation took %v", time.Since(start))
 
 	status, _, errDet := readDelegationRow(t, conn)
 	if status != "failed" {
@@ -310,8 +322,6 @@ func TestIntegration_ExecuteDelegation_ProxyErrorEmptyBody_RemainsFailed(t *test
 
 // TestIntegration_ExecuteDelegation_CleanProxyResponse_Unchanged is the baseline:
 // a clean 200 response with a valid body and no error routes to success.
-// This was always the behavior; the integration test confirms executeDelegation
-// correctly records the ledger entry on the happy path.
 func TestIntegration_ExecuteDelegation_CleanProxyResponse_Unchanged(t *testing.T) {
 	allowLoopbackForTest(t)
 	conn := integrationDB(t)
@@ -320,16 +330,27 @@ func TestIntegration_ExecuteDelegation_CleanProxyResponse_Unchanged(t *testing.T
 	t.Setenv("DELEGATION_LEDGER_WRITE", "1")
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		io.Copy(io.Discard, r.Body)
-		r.Body.Close()
-		w.WriteHeader(http.StatusOK)
 		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{"result":{"parts":[{"text":"all good"}]}}`))
 	}))
 	defer ts.Close()
 
-	mr := setupIntegrationRedis(t, ts.URL)
+	mr := setupTestRedis(t)
 	defer mr.Close()
+	db.CacheURL(context.Background(), testTargetID, ts.URL)
+
+	prevClient := a2aClient
+	defer func() { a2aClient = prevClient }()
+	u, _ := url.Parse(ts.URL)
+	a2aClient = &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return net.Dial("tcp", u.Host)
+			},
+			ResponseHeaderTimeout: 180 * time.Second,
+		},
+	}
 
 	broadcaster := newTestBroadcaster()
 	wh := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
@@ -344,15 +365,16 @@ func TestIntegration_ExecuteDelegation_CleanProxyResponse_Unchanged(t *testing.T
 			},
 		},
 	})
+	start := time.Now()
 	dh.executeDelegation(testSourceID, testTargetID, testDelegationID, a2aBody)
-	time.Sleep(500 * time.Millisecond)
+	t.Logf("executeDelegation took %v", time.Since(start))
 
 	status, preview, errDet := readDelegationRow(t, conn)
 	if status != "completed" {
 		t.Errorf("status: want completed, got %q", status)
 	}
 	if preview == "" {
-		t.Logf("result_preview: %q", preview)
+		t.Errorf("result_preview should be non-empty, got %q", preview)
 	}
 	if errDet != "" {
 		t.Errorf("error_detail should be empty on success: got %q", errDet)
@@ -368,6 +390,8 @@ func TestIntegration_ExecuteDelegation_RedisDown_FallsBackToDB(t *testing.T) {
 	defer cleanup()
 	t.Setenv("DELEGATION_LEDGER_WRITE", "1")
 
+	// Set up miniredis so db.RDB is non-nil, but do NOT cache any URL.
+	// resolveAgentURL skips Redis and falls back to DB, which also has no URL.
 	mr := setupTestRedis(t)
 	defer mr.Close()
 
@@ -384,8 +408,9 @@ func TestIntegration_ExecuteDelegation_RedisDown_FallsBackToDB(t *testing.T) {
 			},
 		},
 	})
+	start := time.Now()
 	dh.executeDelegation(testSourceID, testTargetID, testDelegationID, a2aBody)
-	time.Sleep(500 * time.Millisecond)
+	t.Logf("executeDelegation took %v", time.Since(start))
 
 	status, _, errDet := readDelegationRow(t, conn)
 	if status != "failed" {
