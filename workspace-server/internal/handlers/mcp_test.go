@@ -548,7 +548,13 @@ func TestMCPHandler_CommitMemory_CleanContent_PassesThrough(t *testing.T) {
 // tools/call — recall_memory
 // ─────────────────────────────────────────────────────────────────────────────
 
-func TestMCPHandler_RecallMemory_GlobalScope_Blocked(t *testing.T) {
+// TestMCPHandler_RecallMemory_GlobalScope_ReturnsDescriptiveError verifies C3
+// (GLOBAL scope blocked on MCP bridge) is enforced and the error message
+// propagates to the caller. Unlike "unknown tool:" errors (OFFSEC-001), which
+// are scrubbed to a constant "tool call failed" to avoid leaking tool names,
+// permission/usage errors like "GLOBAL scope is not permitted" are returned
+// verbatim so callers (including tests) can assert on permission messages.
+func TestMCPHandler_RecallMemory_GlobalScope_ReturnsDescriptiveError(t *testing.T) {
 	h, mock := newMCPHandler(t)
 	// No DB expectations — handler must abort before touching the DB.
 
@@ -568,7 +574,17 @@ func TestMCPHandler_RecallMemory_GlobalScope_Blocked(t *testing.T) {
 	var resp mcpResponse
 	json.Unmarshal(w.Body.Bytes(), &resp)
 	if resp.Error == nil {
-		t.Error("expected JSON-RPC error for GLOBAL scope recall, got nil")
+		t.Fatal("expected JSON-RPC error for GLOBAL scope recall, got nil")
+	}
+	// Error code is -32000 (server error).
+	if resp.Error.Code != -32000 {
+		t.Errorf("expected error code -32000, got %d", resp.Error.Code)
+	}
+	// Descriptive error message propagates to the caller. The OFFSEC-001 scrub
+	// applies only to "unknown tool:" errors (to avoid leaking tool names).
+	want := "GLOBAL scope is not permitted via the MCP bridge — use LOCAL, TEAM, or empty"
+	if resp.Error.Message != want {
+		t.Errorf("error message: got %q, want %q", resp.Error.Message, want)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unexpected DB calls on GLOBAL scope block: %v", err)
