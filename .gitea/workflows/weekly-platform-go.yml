@@ -53,9 +53,20 @@ jobs:
       - name: Build
         run: go build ./cmd/server
 
+      # `go vet` is NOT `|| true`-guarded: surfacing latent vet errors on main is
+      # the whole point of this workflow (issue #567 — the motivating case was a
+      # `go vet` error in org_external.go that sat undetected on main for weeks).
+      # A vet error here fails the step → fails the job → shows red on the weekly
+      # commit. Per Gitea quirk #10 (job-level continue-on-error is ignored), that
+      # red surfaces on main — which is the intended signal, not a regression.
       - name: go vet
-        run: go vet ./... || true
+        run: go vet ./...
 
+      # golangci-lint stays `|| true`-guarded: lint is noisier (more false-
+      # positives than vet) and golangci-lint may not be pre-installed on every
+      # runner image — a `|| true` here keeps a missing-binary or lint-noise case
+      # from masking the vet/test signal above. Tighten to match ci.yml's lint
+      # gate if/when ci.yml's lint step becomes hard-failing.
       - name: golangci-lint
         run: golangci-lint run --timeout 3m ./... || true
 
