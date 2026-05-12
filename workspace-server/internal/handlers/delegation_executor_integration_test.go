@@ -141,18 +141,14 @@ func readDelegationRow(t *testing.T, conn *sql.DB) (status, preview, errorDetail
 //   - Immediately Hijack()s and Close()s the raw TCP connection.
 //
 // Key insight (from a2a_proxy_test.go's TestProxyA2A_BodyReadFailure):
-// We do NOT read or close r.Body before Hijack(). The HTTP parser has already
-// consumed the request line + headers; r.Body may still have bytes in flight
-// from the client. Draining it with io.Copy would deadlock: the handler waits
-// to finish reading while the client is blocked writing the body (waiting for
-// response headers that the handler hasn't sent yet).
-// After Hijack() the raw conn is ours — conn.Close() fires RST/EOF to the client.
+// We do NOT read or close r.Body. Closing r.Body triggers the Go HTTP server's
+// pipe mechanism to signal an EOF to the body reader — which on the CLIENT side
+// causes the request-body writer to fail with "read from closed pipe". This hangs
+// the request indefinitely. The fix: just Hijack() and return without touching
+// r.Body. The HTTP server manages r.Body cleanup when the handler returns.
 func mockAgentWithPartialBody(t *testing.T, statusCode int, declaredLength int, actualBody string) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Do NOT read r.Body — matching a2a_proxy_test.go pattern.
-		// The server closes r.Body when the handler returns (server-managed).
-
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Content-Length", fmt.Sprintf("%d", declaredLength))
 		w.WriteHeader(statusCode)
@@ -164,6 +160,7 @@ func mockAgentWithPartialBody(t *testing.T, statusCode int, declaredLength int, 
 
 		// Hijack: flushes the buffered writer, returns raw conn.
 		// Close: sends FIN/RST to client → client's next Read() errors.
+		// Do NOT touch r.Body — matches a2a_proxy_test.go pattern exactly.
 		if hj, ok := w.(http.Hijacker); ok {
 			conn, bufWriter, _ := hj.Hijack()
 			if conn != nil {
@@ -173,6 +170,7 @@ func mockAgentWithPartialBody(t *testing.T, statusCode int, declaredLength int, 
 				conn.Close()
 			}
 		}
+		// Return WITHOUT touching r.Body. The HTTP server manages it.
 	}))
 }
 
