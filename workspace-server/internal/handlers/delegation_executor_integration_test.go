@@ -170,14 +170,19 @@ func TestIntegration_ExecuteDelegation_DeliveryConfirmedProxyError_TreatsAsSucce
 		if err != nil {
 			return
 		}
-		defer conn.Close()
 		buf := make([]byte, 2048)
-		conn.Read(buf)
-		// 200 with Content-Length:100 but only 74 bytes
+		conn.Read(buf) // Read and discard the HTTP request
+		// 200 with Content-Length:100 but only 74 bytes of body — simulates a
+		// connection closed before the full Content-Length was delivered. Without
+		// the sleep below, the goroutine exits immediately after Write (buffered
+		// in the kernel send buffer), defer conn.Close() fires before the kernel
+		// TCP stack finishes transmitting, and the HTTP client hangs waiting for
+		// response headers that never arrive.
 		resp := "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n"
 		resp += `{"result":{"parts":[{"text":"work completed successfully"}]}}` // 74 bytes
 		conn.Write([]byte(resp))
-		// Close immediately — client gets io.EOF on body read
+		time.Sleep(200 * time.Millisecond) // Let kernel TCP finish transmitting before close
+		conn.Close()
 	}()
 
 	// Wire up mocks. Agent URL must be known before calling setupIntegrationRedis
@@ -246,12 +251,13 @@ func TestIntegration_ExecuteDelegation_ProxyErrorNon2xx_RemainsFailed(t *testing
 		if err != nil {
 			return
 		}
-		defer conn.Close()
 		buf := make([]byte, 2048)
-		conn.Read(buf)
+		conn.Read(buf) // Read and discard the HTTP request
 		resp := "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n"
 		resp += `{"error":"agent crashed"}` // ~24 bytes
 		conn.Write([]byte(resp))
+		time.Sleep(200 * time.Millisecond) // Let kernel TCP finish transmitting before close
+		conn.Close()
 	}()
 
 	mr, err := miniredis.Run()
@@ -312,11 +318,12 @@ func TestIntegration_ExecuteDelegation_ProxyErrorEmptyBody_RemainsFailed(t *test
 		if err != nil {
 			return
 		}
-		defer conn.Close()
 		buf := make([]byte, 2048)
-		conn.Read(buf)
+		conn.Read(buf) // Read and discard the HTTP request
 		resp := "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 0\r\n\r\n"
 		conn.Write([]byte(resp))
+		time.Sleep(200 * time.Millisecond) // Let kernel TCP finish transmitting before close
+		conn.Close()
 	}()
 
 	mr, err := miniredis.Run()
