@@ -94,8 +94,10 @@ func rawHTTPServer(t *testing.T, statusCode int, body string) (serverURL string,
 	go func() {
 		conn := <-connCh
 		if conn == nil {
+			t.Log("SERVER: accept goroutine got nil conn")
 			return
 		}
+		t.Logf("SERVER: connection accepted from %v", conn.RemoteAddr())
 		defer conn.Close()
 
 		// Read headers with deadline. After 2s, Read returns with whatever
@@ -105,17 +107,19 @@ func rawHTTPServer(t *testing.T, statusCode int, body string) (serverURL string,
 		for {
 			n, err := conn.Read(headerBuf)
 			if n > 0 {
-				_ = headerBuf[:n] // headers consumed; not used
+				t.Logf("SERVER: read %d bytes", n)
 			}
 			if err != nil {
-				// Deadline exceeded (most likely) — headers have arrived.
+				t.Logf("SERVER: read done, err=%v", err)
 				break
 			}
 		}
 
 		// Send response immediately — don't wait for remaining body bytes.
 		resp := buildHTTPResponse(statusCode, body)
+		t.Logf("SERVER: sending response (%d bytes)", len(resp))
 		conn.Write(resp) //nolint:errcheck
+		t.Log("SERVER: response sent")
 	}()
 
 	return serverURL, closeFn
@@ -232,27 +236,31 @@ func readDelegationRow(t *testing.T, conn *sql.DB) (status, preview, errorDetail
 // 'completed' with the response body as result_preview.
 func TestIntegration_ExecuteDelegation_DeliveryConfirmedProxyError_TreatsAsSuccess(t *testing.T) {
 	allowLoopbackForTest(t)
+	t.Log("=== TEST START ===")
 	conn := integrationDB(t)
+	t.Log("integrationDB done")
 	cleanup := setupIntegrationFixtures(t, conn)
 	defer cleanup()
 	t.Setenv("DELEGATION_LEDGER_WRITE", "1")
 
 	agentURL, closeServer := rawHTTPServer(t, 200, `{"result":{"parts":[{"text":"work completed successfully"}]}}`)
 	defer closeServer()
+	t.Logf("rawHTTPServer started at %s", agentURL)
 
 	mr := setupTestRedis(t)
 	defer mr.Close()
 	db.CacheURL(context.Background(), testTargetID, agentURL)
+	t.Log("Redis setup + URL cache done")
 
-	// Override a2aClient so requests go to our raw TCP server.
-	// Extract host:port from agentURL and dial that directly.
 	prevClient := a2aClient
 	defer func() { a2aClient = prevClient }()
 	a2aClient = newA2AClientForHost(extractHostPort(agentURL))
+	t.Log("a2aClient overridden")
 
 	broadcaster := newTestBroadcaster()
 	wh := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
 	dh := NewDelegationHandler(wh, broadcaster)
+	t.Log("handlers created")
 
 	a2aBody, _ := json.Marshal(map[string]interface{}{
 		"jsonrpc": "2.0",
@@ -265,9 +273,10 @@ func TestIntegration_ExecuteDelegation_DeliveryConfirmedProxyError_TreatsAsSucce
 			},
 		},
 	})
+	t.Log("calling executeDelegation...")
 	start := time.Now()
 	dh.executeDelegation(testSourceID, testTargetID, testDelegationID, a2aBody)
-	t.Logf("executeDelegation took %v", time.Since(start))
+	t.Logf("executeDelegation DONE after %v", time.Since(start))
 
 	status, preview, errDet := readDelegationRow(t, conn)
 	if status != "completed" {
