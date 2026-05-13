@@ -122,7 +122,7 @@ func TestExtractToolTrace_ValidNonEmpty(t *testing.T) {
 
 func TestReadUsageMap_NoUsageKey(t *testing.T) {
 	m := map[string]json.RawMessage{}
-	in, out, ok := readUsageMap(m)
+	_, _, ok := readUsageMap(m)
 	if ok {
 		t.Error("no usage key: ok should be false")
 	}
@@ -130,7 +130,7 @@ func TestReadUsageMap_NoUsageKey(t *testing.T) {
 
 func TestReadUsageMap_InvalidUsageJSON(t *testing.T) {
 	m := map[string]json.RawMessage{"usage": json.RawMessage(`"not an object"`)}
-	in, out, ok := readUsageMap(m)
+	_, _, ok := readUsageMap(m)
 	if ok {
 		t.Error("invalid usage JSON: ok should be false")
 	}
@@ -138,7 +138,7 @@ func TestReadUsageMap_InvalidUsageJSON(t *testing.T) {
 
 func TestReadUsageMap_ZeroUsage(t *testing.T) {
 	m := map[string]json.RawMessage{"usage": json.RawMessage(`{"input_tokens": 0, "output_tokens": 0}`)}
-	in, out, ok := readUsageMap(m)
+	_, _, ok := readUsageMap(m)
 	if ok {
 		t.Error("zero usage: ok should be false")
 	}
