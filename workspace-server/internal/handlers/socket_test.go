@@ -8,15 +8,14 @@ import (
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
 	"github.com/Molecule-AI/molecule-monorepo/platform/internal/ws"
 	"github.com/gin-gonic/gin"
 )
 
-// newSocketHandlerWithDB creates a SocketHandler backed by the given mock DB
-// and a Hub with buffered channels so Register/Unregister don't block.
-func newSocketHandlerWithDB(t *testing.T, mockDB *sql.DB, hub *ws.Hub) *SocketHandler {
-	db.DB = mockDB
+// newSocketHandlerWithDB creates a SocketHandler with buffered Hub channels.
+// The DB is set up via setupTestDB (called before this function in each test).
+func newSocketHandlerWithDB(t *testing.T, hub *ws.Hub) *SocketHandler {
+	t.Helper()
 	if hub == nil {
 		hub = &ws.Hub{
 			Register:   make(chan *ws.Client, 1),
@@ -44,7 +43,7 @@ func socketRequest(method, path, workspaceID, authHeader string) *http.Request {
 
 func TestSocketHandler_AuthGate_DBError_Returns500(t *testing.T) {
 	mock := setupTestDB(t)
-	handler := newSocketHandlerWithDB(t, mock, nil)
+	handler := newSocketHandlerWithDB(t, nil)
 
 	// HasAnyLiveToken issues a query; make it return an error.
 	mock.ExpectQuery("SELECT COUNT").
@@ -71,7 +70,7 @@ func TestSocketHandler_AuthGate_DBError_Returns500(t *testing.T) {
 
 func TestSocketHandler_AuthGate_HasLiveToken_MissingBearer_Returns401(t *testing.T) {
 	mock := setupTestDB(t)
-	handler := newSocketHandlerWithDB(t, mock, nil)
+	handler := newSocketHandlerWithDB(t, nil)
 
 	// HasAnyLiveToken succeeds → workspace has a live token.
 	mock.ExpectQuery("SELECT COUNT").
@@ -98,7 +97,7 @@ func TestSocketHandler_AuthGate_HasLiveToken_MissingBearer_Returns401(t *testing
 
 func TestSocketHandler_AuthGate_HasLiveToken_InvalidBearer_Returns401(t *testing.T) {
 	mock := setupTestDB(t)
-	handler := newSocketHandlerWithDB(t, mock, nil)
+	handler := newSocketHandlerWithDB(t, nil)
 
 	wsID := "ws-invalid-token"
 	badToken := "not-a-valid-token"
@@ -138,7 +137,7 @@ func TestSocketHandler_AuthGate_HasLiveToken_InvalidBearer_Returns401(t *testing
 
 func TestSocketHandler_AuthGate_HasLiveToken_ValidBearer_AuthPassed(t *testing.T) {
 	mock := setupTestDB(t)
-	handler := newSocketHandlerWithDB(t, mock, nil)
+	handler := newSocketHandlerWithDB(t, nil)
 
 	wsID := "ws-valid-token"
 	goodToken := "valid-ws-token-123"
@@ -180,7 +179,7 @@ func TestSocketHandler_AuthGate_HasLiveToken_ValidBearer_AuthPassed(t *testing.T
 
 func TestSocketHandler_CanvasClient_NoAuthGate(t *testing.T) {
 	mock := setupTestDB(t)
-	handler := newSocketHandlerWithDB(t, mock, nil)
+	handler := newSocketHandlerWithDB(t, nil)
 
 	// No X-Workspace-ID header → no auth check → no DB queries expected.
 	w := httptest.NewRecorder()
@@ -208,7 +207,7 @@ func TestSocketHandler_CanvasClient_NoAuthGate(t *testing.T) {
 
 func TestSocketHandler_AuthGate_HasLiveToken_EmptyBearer_Returns401(t *testing.T) {
 	mock := setupTestDB(t)
-	handler := newSocketHandlerWithDB(t, mock, nil)
+	handler := newSocketHandlerWithDB(t, nil)
 
 	wsID := "ws-has-live-token-empty-bearer"
 
