@@ -91,7 +91,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import socket
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -118,6 +120,9 @@ WORKFLOWS_DIR = _env("WORKFLOWS_DIR", default=".gitea/workflows")
 
 OWNER, NAME = (REPO.split("/", 1) + [""])[:2] if REPO else ("", "")
 API = f"https://{GITEA_HOST}/api/v1" if GITEA_HOST else ""
+API_TIMEOUT_SEC = int(_env("STATUS_REAPER_API_TIMEOUT_SEC", default="30") or "30")
+API_RETRIES = int(_env("STATUS_REAPER_API_RETRIES", default="3") or "3")
+API_RETRY_SLEEP_SEC = float(_env("STATUS_REAPER_API_RETRY_SLEEP_SEC", default="2") or "2")
 
 # Compensating-status description prefix. Used as the marker so a human
 # auditing commit statuses can tell at a glance that the green was
@@ -182,13 +187,27 @@ def api(
         data = json.dumps(body).encode("utf-8")
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(url, method=method, data=data, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            raw = resp.read()
-            status = resp.status
-    except urllib.error.HTTPError as e:
-        raw = e.read()
-        status = e.code
+    attempts = max(API_RETRIES, 1)
+    for attempt in range(1, attempts + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=API_TIMEOUT_SEC) as resp:
+                raw = resp.read()
+                status = resp.status
+            break
+        except urllib.error.HTTPError as e:
+            raw = e.read()
+            status = e.code
+            break
+        except (TimeoutError, socket.timeout, urllib.error.URLError, OSError) as e:
+            if attempt >= attempts:
+                raise ApiError(
+                    f"{method} {path} failed after {attempts} attempts: {e}"
+                ) from e
+            print(
+                f"::warning::{method} {path} transient API error "
+                f"(attempt {attempt}/{attempts}): {e}; retrying"
+            )
+            time.sleep(API_RETRY_SLEEP_SEC)
 
     if not (200 <= status < 300):
         snippet = raw[:500].decode("utf-8", errors="replace") if raw else ""
