@@ -608,13 +608,13 @@ func TestMCPHandler_CommitMemory_CleanContent_PassesThrough(t *testing.T) {
 // tools/call — recall_memory
 // ─────────────────────────────────────────────────────────────────────────────
 
-// TestMCPHandler_RecallMemory_GlobalScope_ReturnsDescriptiveError verifies C3
-// (GLOBAL scope blocked on MCP bridge) is enforced and the error message
-// propagates to the caller. Unlike "unknown tool:" errors (OFFSEC-001), which
-// are scrubbed to a constant "tool call failed" to avoid leaking tool names,
-// permission/usage errors like "GLOBAL scope is not permitted" are returned
-// verbatim so callers (including tests) can assert on permission messages.
-func TestMCPHandler_RecallMemory_GlobalScope_ReturnsDescriptiveError(t *testing.T) {
+// TestMCPHandler_RecallMemory_GlobalScope_Blocked_ScrubsInternalError verifies
+// C3 (GLOBAL scope blocked on MCP bridge) is enforced and that the OFFSEC-001
+// scrub contract applies: the client-visible error.message is the constant
+// "tool call failed", NOT the descriptive internal reason. The internal reason
+// ("GLOBAL scope is not permitted via the MCP bridge") is logged server-side
+// but must never reach the wire.
+func TestMCPHandler_RecallMemory_GlobalScope_Blocked_ScrubsInternalError(t *testing.T) {
 	h, mock := newMCPHandler(t)
 	// No DB expectations — handler must abort before touching the DB.
 
@@ -632,20 +632,38 @@ func TestMCPHandler_RecallMemory_GlobalScope_ReturnsDescriptiveError(t *testing.
 	})
 
 	var resp mcpResponse
-	json.Unmarshal(w.Body.Bytes(), &resp)
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("response is not valid JSON: %v", err)
+	}
+	// (1) C3: an error must be reported.
 	if resp.Error == nil {
 		t.Fatal("expected JSON-RPC error for GLOBAL scope recall, got nil")
 	}
-	// Error code is -32000 (server error).
+	// (2) OFFSEC-001 positive assertions — exact equality on the scrubbed
+	// constants so any change (re-leak of err.Error(), code mutation) trips
+	// the test.
 	if resp.Error.Code != -32000 {
-		t.Errorf("expected error code -32000, got %d", resp.Error.Code)
+		t.Errorf("error code should be -32000 (Server error / dispatch-failure), got: %d", resp.Error.Code)
 	}
-	// Descriptive error message propagates to the caller. The OFFSEC-001 scrub
-	// applies only to "unknown tool:" errors (to avoid leaking tool names).
-	want := "GLOBAL scope is not permitted via the MCP bridge — use LOCAL, TEAM, or empty"
-	if resp.Error.Message != want {
-		t.Errorf("error message: got %q, want %q", resp.Error.Message, want)
+	if resp.Error.Message != "tool call failed" {
+		t.Errorf("error message should be the OFFSEC-001 constant %q, got: %q", "tool call failed", resp.Error.Message)
 	}
+	// (3) OFFSEC-001 negative assertions — the internal reason must NOT appear
+	// in the client-visible message.
+	leakedTokens := []string{
+		"GLOBAL",    // scope name
+		"scope",     // policy lexicon
+		"permitted", // policy verb
+		"bridge",    // internal architecture term
+		"LOCAL",     // alternative scope name
+		"TEAM",      // alternative scope name
+	}
+	for _, tok := range leakedTokens {
+		if bytes.Contains([]byte(resp.Error.Message), []byte(tok)) {
+			t.Errorf("OFFSEC-001 scrub regression: client-visible error.message leaks internal token %q (got: %q)", tok, resp.Error.Message)
+		}
+	}
+	// (4) C3 invariant preserved: handler must short-circuit before any DB call.
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unexpected DB calls on GLOBAL scope block: %v", err)
 	}
