@@ -18,6 +18,13 @@ name: publish-workspace-server-image
 #   :staging-<sha> — per-commit digest, stable for canary verify
 #   :staging-latest — tracks most recent build on this branch
 #
+# Production auto-deploy:
+#   After both platform and tenant images are pushed, deploy-production waits
+#   for strict required push contexts on the same SHA to go green, then
+#   calls the production CP redeploy-fleet endpoint with target_tag=
+#   staging-<sha>. Set repo variable or secret PROD_AUTO_DEPLOY_DISABLED=true
+#   to stop production rollout while keeping image publishing enabled.
+#
 # ECR target: 153263036946.dkr.ecr.us-east-2.amazonaws.com/molecule-ai/*
 # Required secrets: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AUTO_SYNC_TOKEN
 #
@@ -38,15 +45,10 @@ on:
       - '.gitea/workflows/publish-workspace-server-image.yml'
   workflow_dispatch:
 
-# Serialize per-branch so two rapid main pushes don't race the same
-# :staging-latest tag retag. Allow parallel runs as they produce
-# different :staging-<sha> tags and last-write-wins on :staging-latest.
-#
-# cancel-in-progress: false → in-flight builds finish; the next push's
-# build queues. This avoids a partially-pushed image.
-concurrency:
-  group: publish-workspace-server-image-${{ github.ref }}
-  cancel-in-progress: false
+# No `concurrency:` block here. Gitea 1.22.6 can cancel queued runs despite
+# `cancel-in-progress: false`; that is not acceptable for a workflow with a
+# production deploy job. Per-SHA image tags are immutable, and staging-latest is
+# best-effort last-writer-wins metadata.
 
 permissions:
   contents: read
@@ -175,3 +177,173 @@ jobs:
             --tag "${TENANT_IMAGE_NAME}:${TAG_SHA}" \
             --tag "${TENANT_IMAGE_NAME}:${TAG_LATEST}" \
             --push .
+
+  # bp-exempt: production deploy side-effect; merge is gated by CI / all-required and this job waits for push CI before acting.
+  deploy-production:
+    name: Production auto-deploy
+    needs: build-and-push
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      CP_URL: ${{ vars.PROD_CP_URL || 'https://api.moleculesai.app' }}
+      CP_ADMIN_API_TOKEN: ${{ secrets.CP_ADMIN_API_TOKEN }}
+      GITEA_HOST: git.moleculesai.app
+      GITEA_TOKEN: ${{ secrets.PROD_AUTO_DEPLOY_CONTROL_TOKEN || secrets.AUTO_SYNC_TOKEN }}
+      PROD_AUTO_DEPLOY_DISABLED: ${{ vars.PROD_AUTO_DEPLOY_DISABLED || secrets.PROD_AUTO_DEPLOY_DISABLED || '' }}
+      PROD_AUTO_DEPLOY_CANARY_SLUG: ${{ vars.PROD_AUTO_DEPLOY_CANARY_SLUG || 'hongming' }}
+      PROD_AUTO_DEPLOY_SOAK_SECONDS: ${{ vars.PROD_AUTO_DEPLOY_SOAK_SECONDS || '60' }}
+      PROD_AUTO_DEPLOY_BATCH_SIZE: ${{ vars.PROD_AUTO_DEPLOY_BATCH_SIZE || '3' }}
+      PROD_AUTO_DEPLOY_DRY_RUN: ${{ vars.PROD_AUTO_DEPLOY_DRY_RUN || '' }}
+      PROD_ALLOW_NON_PROD_CP_URL: ${{ vars.PROD_ALLOW_NON_PROD_CP_URL || '' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Build deploy plan
+        id: plan
+        run: |
+          set -euo pipefail
+          python3 .gitea/scripts/prod-auto-deploy.py plan > "$RUNNER_TEMP/prod-auto-deploy-plan.json"
+          jq . "$RUNNER_TEMP/prod-auto-deploy-plan.json"
+          enabled="$(jq -r '.enabled' "$RUNNER_TEMP/prod-auto-deploy-plan.json")"
+          echo "enabled=$enabled" >> "$GITHUB_OUTPUT"
+          if [ "$enabled" != "true" ]; then
+            reason="$(jq -r '.disabled_reason' "$RUNNER_TEMP/prod-auto-deploy-plan.json")"
+            echo "::notice::Production auto-deploy disabled: $reason"
+            {
+              echo "## Production auto-deploy skipped"
+              echo ""
+              echo "Reason: \`$reason\`"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ -z "${CP_ADMIN_API_TOKEN:-}" ]; then
+            echo "::error::CP_ADMIN_API_TOKEN secret is required for production auto-deploy."
+            exit 1
+          fi
+          if [ -z "${GITEA_TOKEN:-}" ]; then
+            echo "::error::AUTO_SYNC_TOKEN secret is required so production deploy can wait for green CI."
+            exit 1
+          fi
+
+      - name: Self-test production deploy helper
+        if: ${{ steps.plan.outputs.enabled == 'true' }}
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet 'pytest==9.0.2' 'PyYAML==6.0.2'
+          python3 -m pytest .gitea/scripts/tests/test_prod_auto_deploy.py -q
+          python3 .gitea/scripts/lint-workflow-yaml.py --workflow-dir .gitea/workflows
+
+      - name: Wait for green main CI on this SHA
+        if: ${{ steps.plan.outputs.enabled == 'true' }}
+        run: |
+          set -euo pipefail
+          python3 .gitea/scripts/prod-auto-deploy.py wait-ci
+
+      - name: Call production CP redeploy-fleet
+        if: ${{ steps.plan.outputs.enabled == 'true' }}
+        run: |
+          set -euo pipefail
+          python3 .gitea/scripts/prod-auto-deploy.py assert-enabled
+          PLAN="$RUNNER_TEMP/prod-auto-deploy-plan.json"
+          TARGET_TAG="$(jq -r '.target_tag' "$PLAN")"
+          BODY="$(jq -c '.body' "$PLAN")"
+
+          echo "POST $CP_URL/cp/admin/tenants/redeploy-fleet"
+          echo "  target_tag: $TARGET_TAG"
+          echo "  body: $BODY"
+
+          HTTP_RESPONSE="$RUNNER_TEMP/prod-redeploy-response.json"
+          HTTP_CODE_FILE="$RUNNER_TEMP/prod-redeploy-http-code.txt"
+          set +e
+          curl -sS -o "$HTTP_RESPONSE" -w '%{http_code}' \
+            -m 1200 \
+            -H "Authorization: Bearer $CP_ADMIN_API_TOKEN" \
+            -H "Content-Type: application/json" \
+            -X POST "$CP_URL/cp/admin/tenants/redeploy-fleet" \
+            -d "$BODY" > "$HTTP_CODE_FILE"
+          set -e
+
+          HTTP_CODE="$(cat "$HTTP_CODE_FILE" 2>/dev/null || echo "000")"
+          [ -z "$HTTP_CODE" ] && HTTP_CODE="000"
+          echo "HTTP $HTTP_CODE"
+          jq '{ok, result_count: (.results // [] | length)}' "$HTTP_RESPONSE" || true
+
+          {
+            echo "## Production auto-deploy"
+            echo ""
+            echo "**Commit:** \`${GITHUB_SHA:0:7}\`"
+            echo "**Target tag:** \`$TARGET_TAG\`"
+            echo "**HTTP:** $HTTP_CODE"
+            echo ""
+            echo "### Per-tenant result"
+            echo ""
+            echo "| Slug | Phase | SSM Status | Exit | Healthz | Error present |"
+            echo "|------|-------|------------|------|---------|---------------|"
+            jq -r '.results[]? | "| \(.slug) | \(.phase) | \(.ssm_status // "-") | \(.ssm_exit_code) | \(.healthz_ok) | \((.error // "") != "") |"' "$HTTP_RESPONSE" || true
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "::error::redeploy-fleet returned HTTP $HTTP_CODE"
+            exit 1
+          fi
+          OK="$(jq -r '.ok' "$HTTP_RESPONSE")"
+          if [ "$OK" != "true" ]; then
+            echo "::error::redeploy-fleet reported ok=false; production rollout halted."
+            exit 1
+          fi
+
+      - name: Verify reachable tenants report this SHA
+        if: ${{ steps.plan.outputs.enabled == 'true' }}
+        env:
+          TENANT_DOMAIN: moleculesai.app
+        run: |
+          set -euo pipefail
+          RESP="$RUNNER_TEMP/prod-redeploy-response.json"
+          mapfile -t SLUGS < <(jq -r '.results[]? | .slug' "$RESP")
+          if [ ${#SLUGS[@]} -eq 0 ]; then
+            echo "::error::No tenants returned from redeploy-fleet; refusing to mark production deploy verified."
+            exit 1
+          fi
+
+          STALE_COUNT=0
+          UNREACHABLE_COUNT=0
+          UNHEALTHY_COUNT=0
+          for slug in "${SLUGS[@]}"; do
+            healthz_ok="$(jq -r --arg slug "$slug" '.results[]? | select(.slug == $slug) | .healthz_ok' "$RESP" | tail -1)"
+            if [ "$healthz_ok" != "true" ]; then
+              echo "::error::$slug did not report healthz_ok=true in redeploy-fleet response."
+              UNHEALTHY_COUNT=$((UNHEALTHY_COUNT + 1))
+              continue
+            fi
+            url="https://${slug}.${TENANT_DOMAIN}/buildinfo"
+            body="$(curl -sS --max-time 30 --retry 3 --retry-delay 5 --retry-connrefused "$url" || true)"
+            actual="$(echo "$body" | jq -r '.git_sha // ""' 2>/dev/null || echo "")"
+            if [ -z "$actual" ]; then
+              echo "::error::$slug did not return /buildinfo after deploy."
+              UNREACHABLE_COUNT=$((UNREACHABLE_COUNT + 1))
+              continue
+            fi
+            if [ "$actual" != "$GITHUB_SHA" ]; then
+              echo "::error::$slug is stale: actual=${actual:0:7}, expected=${GITHUB_SHA:0:7}"
+              STALE_COUNT=$((STALE_COUNT + 1))
+            else
+              echo "$slug: ${actual:0:7}"
+            fi
+          done
+
+          {
+            echo ""
+            echo "### Buildinfo verification"
+            echo ""
+            echo "Expected SHA: \`${GITHUB_SHA:0:7}\`"
+            echo "Verified tenants: ${#SLUGS[@]}"
+            echo "Stale tenants: $STALE_COUNT"
+            echo "Unhealthy tenants: $UNHEALTHY_COUNT"
+            echo "Unreachable tenants: $UNREACHABLE_COUNT"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$STALE_COUNT" -gt 0 ] || [ "$UNHEALTHY_COUNT" -gt 0 ] || [ "$UNREACHABLE_COUNT" -gt 0 ]; then
+            exit 1
+          fi

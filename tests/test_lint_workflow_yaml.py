@@ -411,3 +411,134 @@ def test_rule1_catches_2026_05_11_publish_runtime_regression(tmp_path):
         f"(memory: feedback_gitea_workflow_dispatch_inputs_unsupported)."
         f"\nstdout={r.stdout}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Rule 7 — production deploys cannot rely on broken Gitea concurrency
+# ---------------------------------------------------------------------------
+
+PROD_CONCURRENCY_BAD = """
+    name: prod-concurrency-bad
+    on: [push]
+    jobs:
+      deploy:
+        runs-on: ubuntu-latest
+        concurrency:
+          group: production-auto-deploy
+          cancel-in-progress: false
+        steps:
+          - run: curl https://api.moleculesai.app/cp/admin/tenants/redeploy-fleet
+"""
+
+
+def test_rule7_prod_deploy_concurrency_detects_violation(tmp_path):
+    _write(tmp_path, "bad.yml", PROD_CONCURRENCY_BAD)
+    r = _run_lint(tmp_path)
+    assert r.returncode == 1
+    assert "production deploy" in r.stdout.lower()
+    assert "concurrency" in r.stdout.lower()
+
+
+# ---------------------------------------------------------------------------
+# Rule 8 — production deploys must not dump raw CP responses/errors
+# ---------------------------------------------------------------------------
+
+PROD_RAW_LOG_BAD = """
+    name: prod-raw-log-bad
+    on: [push]
+    jobs:
+      deploy:
+        runs-on: ubuntu-latest
+        steps:
+          - run: |
+              curl https://api.moleculesai.app/cp/admin/tenants/redeploy-fleet -o "$HTTP_RESPONSE"
+              jq . "$HTTP_RESPONSE"
+              jq -r '.results[]? | .error' "$HTTP_RESPONSE"
+"""
+
+PROD_REDACTED_LOG_OK = """
+    name: prod-redacted-log-ok
+    on: [push]
+    jobs:
+      deploy:
+        runs-on: ubuntu-latest
+        env:
+          PROD_AUTO_DEPLOY_DISABLED: ${{ vars.PROD_AUTO_DEPLOY_DISABLED || '' }}
+        steps:
+          - run: |
+              curl https://api.moleculesai.app/cp/admin/tenants/redeploy-fleet -o "$HTTP_RESPONSE"
+              jq '{ok, result_count: (.results // [] | length)}' "$HTTP_RESPONSE"
+              jq -r '.results[]? | ((.error // "") != "")' "$HTTP_RESPONSE"
+"""
+
+
+def test_rule8_prod_deploy_raw_log_detects_violation(tmp_path):
+    _write(tmp_path, "bad.yml", PROD_RAW_LOG_BAD)
+    r = _run_lint(tmp_path)
+    assert r.returncode == 1
+    assert "raw production cp response" in r.stdout.lower()
+
+
+def test_rule8_prod_deploy_allows_redacted_summary(tmp_path):
+    _write(tmp_path, "ok.yml", PROD_REDACTED_LOG_OK)
+    r = _run_lint(tmp_path)
+    assert r.returncode == 0, f"stdout={r.stdout}\nstderr={r.stderr}"
+
+
+# ---------------------------------------------------------------------------
+# Rule 9 — production deploys require an operational control
+# ---------------------------------------------------------------------------
+
+PROD_NO_CONTROL_BAD = """
+    name: prod-no-control-bad
+    on: [push]
+    jobs:
+      deploy:
+        runs-on: ubuntu-latest
+        steps:
+          - run: curl https://api.moleculesai.app/cp/admin/tenants/redeploy-fleet
+"""
+
+PROD_KILL_SWITCH_OK = """
+    name: prod-kill-switch-ok
+    on: [push]
+    jobs:
+      deploy:
+        runs-on: ubuntu-latest
+        env:
+          PROD_AUTO_DEPLOY_DISABLED: ${{ vars.PROD_AUTO_DEPLOY_DISABLED || '' }}
+        steps:
+          - run: curl https://api.moleculesai.app/cp/admin/tenants/redeploy-fleet
+"""
+
+PROD_ROLLBACK_OK = """
+    name: prod-rollback-ok
+    on:
+      workflow_dispatch:
+    jobs:
+      deploy:
+        runs-on: ubuntu-latest
+        env:
+          PROD_MANUAL_REDEPLOY_TARGET_TAG: ${{ vars.PROD_MANUAL_REDEPLOY_TARGET_TAG || '' }}
+        steps:
+          - run: curl https://api.moleculesai.app/cp/admin/tenants/redeploy-fleet
+"""
+
+
+def test_rule9_prod_deploy_requires_kill_switch_or_rollback(tmp_path):
+    _write(tmp_path, "bad.yml", PROD_NO_CONTROL_BAD)
+    r = _run_lint(tmp_path)
+    assert r.returncode == 1
+    assert "kill switch" in r.stdout.lower()
+
+
+def test_rule9_prod_auto_deploy_allows_kill_switch(tmp_path):
+    _write(tmp_path, "ok.yml", PROD_KILL_SWITCH_OK)
+    r = _run_lint(tmp_path)
+    assert r.returncode == 0, f"stdout={r.stdout}\nstderr={r.stderr}"
+
+
+def test_rule9_prod_manual_deploy_allows_rollback_control(tmp_path):
+    _write(tmp_path, "ok.yml", PROD_ROLLBACK_OK)
+    r = _run_lint(tmp_path)
+    assert r.returncode == 0, f"stdout={r.stdout}\nstderr={r.stderr}"
