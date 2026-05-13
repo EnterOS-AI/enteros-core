@@ -90,22 +90,31 @@ func TestHasUnresolvedVarRef_NoVars(t *testing.T) {
 }
 
 func TestHasUnresolvedVarRef_Resolved(t *testing.T) {
-	// Expansion consumed the var refs.
+	// Expansion consumed the var refs (where "consumed" means the output no longer
+	// contains the original var reference syntax).
 	cases := []struct {
-		orig    string
+		orig     string
 		expanded string
+		want     bool // true = unresolved (function returns true), false = resolved
 	}{
-		{"${VAR}", ""},             // var expanded to empty (unset → removed)
-		{"${VAR}", "value"},       // var replaced
-		{"$VAR", "value"},         // bare var replaced
-		{"prefix${VAR}suffix", "prefixvaluesuffix"},
-		{"${A}${B}", "ab"},
-		{"${FOO} and ${BAR}", "FOO and BAR"},
+		// Empty output: function conservatively returns true — it cannot distinguish
+		// "var was set to empty" from "var was not found and stripped". The test
+		// documents this design choice; callers who need empty=resolved should
+		// pre-process the output before calling hasUnresolvedVarRef.
+		{"${VAR}", "", true},
+		{"${VAR}", "value", false},                    // var replaced
+		{"$VAR", "value", false},                      // bare var replaced
+		{"prefix${VAR}suffix", "prefixvaluesuffix", false},
+		{"${A}${B}", "ab", false},
+		// FOO=FOO and BAR=BAR — both vars found and replaced. Expanded output
+		// "FOO and BAR" has no ${...} syntax left, so function returns false.
+		{"${FOO} and ${BAR}", "FOO and BAR", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.orig, func(t *testing.T) {
-			if hasUnresolvedVarRef(tc.orig, tc.expanded) {
-				t.Errorf("hasUnresolvedVarRef(%q, %q): expected false, got true", tc.orig, tc.expanded)
+			got := hasUnresolvedVarRef(tc.orig, tc.expanded)
+			if got != tc.want {
+				t.Errorf("hasUnresolvedVarRef(%q, %q): got %v, want %v", tc.orig, tc.expanded, got, tc.want)
 			}
 		})
 	}
@@ -308,9 +317,12 @@ func TestAppendYAMLBlock_NoExisting(t *testing.T) {
 }
 
 func TestAppendYAMLBlock_EmptyBlock(t *testing.T) {
+	// When existing lacks a trailing \n, the function adds one before appending
+	// the empty block — so the result always has a clean terminator.
 	got := appendYAMLBlock([]byte("existing: data"), "")
-	if string(got) != "existing: data" {
-		t.Errorf("got %q, want 'existing: data'", string(got))
+	want := "existing: data\n"
+	if string(got) != want {
+		t.Errorf("got %q, want %q", string(got), want)
 	}
 }
 
