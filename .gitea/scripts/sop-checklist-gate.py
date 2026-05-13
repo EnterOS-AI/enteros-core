@@ -620,8 +620,8 @@ def render_status(
 
     state is "success" if every item has at least one valid ack
     (body section presence is informational only — peer-ack is the
-    real gate).  "pending" is reserved for the soft-fail path
-    (tier:low) and is set by the caller.
+    real gate).  tier:low PRs receive state="success" (soft-fail — no
+    acks required); the description carries "[info tier:low]" prefix.
     """
     n = len(items)
     fully_acked = [
@@ -640,8 +640,11 @@ def render_status(
             shown += f", +{len(missing) - 3}"
         desc_parts.append(f"missing: {shown}")
     if missing_body:
-        desc_parts.append(f"body-unfilled: {len(missing_body)}")
-    state = "success" if not missing else "failure"
+        shown = ", ".join(missing_body[:3])
+        if len(missing_body) > 3:
+            shown += f", +{len(missing_body) - 3}"
+        desc_parts.append(f"body-unfilled: {shown}")
+    state = "success" if not missing and not missing_body else "failure"
     return state, " — ".join(desc_parts)
 
 
@@ -773,9 +776,12 @@ def main(argv: list[str] | None = None) -> int:
 
     state, description = render_status(items, ack_state, body_state)
     mode = get_tier_mode(pr, cfg)
-    if state == "failure" and mode == "soft":
-        state = "pending"
-        description = f"[soft-fail tier:low] {description}"
+    if mode == "soft":
+        # tier:low: acks are informational only — post success so BP gate passes.
+        # Description carries "[info tier:low]" prefix so reviewers know acks
+        # were not required (vs a tier:medium+ PR that truly passed all acks).
+        state = "success"
+        description = f"[info tier:low] {description}"
 
     # Diagnostics to job log.
     print(f"::notice::PR #{args.pr} author={author} head={head_sha[:7]} mode={mode}")

@@ -410,6 +410,7 @@ class TestRenderStatus(unittest.TestCase):
             self._state_with(all_slugs),
             {it["slug"]: False for it in self.items},
         )
+        self.assertEqual(state, "failure")
         self.assertIn("body-unfilled", desc)
 
 
@@ -518,6 +519,31 @@ class TestEndToEndAckFlow(unittest.TestCase):
         result_state, desc = sop.render_status(items_list, state, body)
         self.assertEqual(result_state, "success")
         self.assertIn("7/7", desc)
+
+    def test_all_acks_still_fail_when_body_section_unfilled(self):
+        items = _items_by_slug()
+        aliases = _numeric_aliases()
+        comments = [
+            _comment("qa-bot", "/sop-ack comprehensive-testing"),
+            _comment("eng-bot", "/sop-ack local-postgres-e2e"),
+            _comment("eng-bot", "/sop-ack staging-smoke"),
+            _comment("mgr-bot", "/sop-ack root-cause"),
+            _comment("eng-bot", "/sop-ack five-axis-review"),
+            _comment("mgr-bot", "/sop-ack no-backwards-compat"),
+            _comment("eng-bot", "/sop-ack memory-consulted"),
+        ]
+
+        def probe(slug, users):
+            return list(users)
+
+        state = sop.compute_ack_state(comments, "alice-author", items, aliases, probe)
+        body = {it["slug"]: True for it in items.values()}
+        body["root-cause"] = False
+        items_list = list(items.values())
+        result_state, desc = sop.render_status(items_list, state, body)
+        self.assertEqual(result_state, "failure")
+        self.assertIn("7/7", desc)
+        self.assertIn("body-unfilled: root-cause", desc)
 
 
 if __name__ == "__main__":
