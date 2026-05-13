@@ -471,11 +471,11 @@ func TestDelegationRecord_InsertsActivityLogRow(t *testing.T) {
 
 	mock.ExpectExec("INSERT INTO activity_logs").
 		WithArgs(
-			"550e8400-e29b-41d4-a716-446655440000",                // workspace_id
-			"550e8400-e29b-41d4-a716-446655440000",                // source_id
-			"550e8400-e29b-41d4-a716-446655440001",                // target_id
-			"Delegating to 550e8400-e29b-41d4-a716-446655440001",  // summary
-			sqlmock.AnyArg(),                                       // request_body (jsonb)
+			"550e8400-e29b-41d4-a716-446655440000",               // workspace_id
+			"550e8400-e29b-41d4-a716-446655440000",               // source_id
+			"550e8400-e29b-41d4-a716-446655440001",               // target_id
+			"Delegating to 550e8400-e29b-41d4-a716-446655440001", // summary
+			sqlmock.AnyArg(), // request_body (jsonb)
 		).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	// RecordAndBroadcast INSERT for DELEGATION_SENT
@@ -970,9 +970,9 @@ func TestInsertDelegationOutcome_ZeroValueIsUnknown(t *testing.T) {
 // Test strategy: spin up a mock A2A agent server, set up the source/target DB rows, call
 // executeDelegation directly, and verify the activity_logs status and delegation status.
 
-const testDelegationID = "del-159-test"
-const testSourceID = "ws-source-159"
-const testTargetID = "ws-target-159"
+const testDeliveryDelegationID = "del-159-test"
+const testDeliverySourceID = "ws-source-159"
+const testDeliveryTargetID = "ws-target-159"
 
 // expectExecuteDelegationBase sets up sqlmock expectations for the DB queries that
 // executeDelegation always makes, regardless of outcome.
@@ -980,17 +980,17 @@ func expectExecuteDelegationBase(mock sqlmock.Sqlmock) {
 	// updateDelegationStatus: dispatched
 	// Uses prefix match — sqlmock regexes match the full query string.
 	mock.ExpectExec("UPDATE activity_logs SET status").
-		WithArgs("dispatched", "", testSourceID, testDelegationID).
+		WithArgs("dispatched", "", testDeliverySourceID, testDeliveryDelegationID).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// CanCommunicate: getWorkspaceRef(source) + getWorkspaceRef(target).
 	// Both are root-level workspaces (parent_id=NULL) → root-level siblings → allowed.
 	mock.ExpectQuery("SELECT id, parent_id FROM workspaces WHERE id = ").
-		WithArgs(testSourceID).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "parent_id"}).AddRow(testSourceID, nil))
+		WithArgs(testDeliverySourceID).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "parent_id"}).AddRow(testDeliverySourceID, nil))
 	mock.ExpectQuery("SELECT id, parent_id FROM workspaces WHERE id = ").
-		WithArgs(testTargetID).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "parent_id"}).AddRow(testTargetID, nil))
+		WithArgs(testDeliveryTargetID).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "parent_id"}).AddRow(testDeliveryTargetID, nil))
 
 	// resolveAgentURL: test callers always set the URL in Redis (mr.Set ws:{id}:url),
 	// so resolveAgentURL gets a cache hit and never falls back to DB.
@@ -1009,7 +1009,7 @@ func expectExecuteDelegationSuccess(mock sqlmock.Sqlmock, respBody string) {
 
 	// updateDelegationStatus: completed
 	mock.ExpectExec("UPDATE activity_logs SET status").
-		WithArgs("completed", "", testSourceID, testDelegationID).
+		WithArgs("completed", "", testDeliverySourceID, testDeliveryDelegationID).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 }
 
@@ -1018,7 +1018,7 @@ func expectExecuteDelegationSuccess(mock sqlmock.Sqlmock, respBody string) {
 func expectExecuteDelegationFailed(mock sqlmock.Sqlmock) {
 	// updateDelegationStatus: failed (fires before the INSERT in the failure path)
 	mock.ExpectExec("UPDATE activity_logs SET status").
-		WithArgs("failed", sqlmock.AnyArg(), testSourceID, testDelegationID).
+		WithArgs("failed", sqlmock.AnyArg(), testDeliverySourceID, testDeliveryDelegationID).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// INSERT activity_logs for delegation failure ('failed' is a SQL literal, not a param)
@@ -1085,7 +1085,7 @@ func TestExecuteDelegation_DeliveryConfirmedProxyError_TreatsAsSuccess(t *testin
 	}()
 
 	agentURL := "http://" + ln.Addr().String()
-	mr.Set(fmt.Sprintf("ws:%s:url", testTargetID), agentURL)
+	mr.Set(fmt.Sprintf("ws:%s:url", testDeliveryTargetID), agentURL)
 	allowLoopbackForTest(t)
 
 	expectExecuteDelegationBase(mock)
@@ -1104,7 +1104,7 @@ func TestExecuteDelegation_DeliveryConfirmedProxyError_TreatsAsSuccess(t *testin
 			},
 		},
 	})
-	dh.executeDelegation(testSourceID, testTargetID, testDelegationID, a2aBody)
+	dh.executeDelegation(context.Background(), testDeliverySourceID, testDeliveryTargetID, testDeliveryDelegationID, a2aBody)
 
 	time.Sleep(100 * time.Millisecond) // let DB writes settle
 
@@ -1155,7 +1155,7 @@ func TestExecuteDelegation_ProxyErrorNon2xx_RemainsFailed(t *testing.T) {
 	}()
 
 	agentURL := "http://" + ln.Addr().String()
-	mr.Set(fmt.Sprintf("ws:%s:url", testTargetID), agentURL)
+	mr.Set(fmt.Sprintf("ws:%s:url", testDeliveryTargetID), agentURL)
 	allowLoopbackForTest(t)
 
 	expectExecuteDelegationBase(mock)
@@ -1170,7 +1170,7 @@ func TestExecuteDelegation_ProxyErrorNon2xx_RemainsFailed(t *testing.T) {
 			},
 		},
 	})
-	dh.executeDelegation(testSourceID, testTargetID, testDelegationID, a2aBody)
+	dh.executeDelegation(context.Background(), testDeliverySourceID, testDeliveryTargetID, testDeliveryDelegationID, a2aBody)
 
 	time.Sleep(100 * time.Millisecond)
 
@@ -1201,7 +1201,7 @@ func TestExecuteDelegation_ProxyErrorEmptyBody_RemainsFailed(t *testing.T) {
 	}))
 	defer agentServer.Close()
 
-	mr.Set(fmt.Sprintf("ws:%s:url", testTargetID), agentServer.URL)
+	mr.Set(fmt.Sprintf("ws:%s:url", testDeliveryTargetID), agentServer.URL)
 	allowLoopbackForTest(t)
 
 	// executeDelegationBase: UPDATE dispatched + CanCommunicate SELECTs
@@ -1220,7 +1220,7 @@ func TestExecuteDelegation_ProxyErrorEmptyBody_RemainsFailed(t *testing.T) {
 			},
 		},
 	})
-	dh.executeDelegation(testSourceID, testTargetID, testDelegationID, a2aBody)
+	dh.executeDelegation(context.Background(), testDeliverySourceID, testDeliveryTargetID, testDeliveryDelegationID, a2aBody)
 
 	time.Sleep(100 * time.Millisecond)
 
@@ -1248,7 +1248,7 @@ func TestExecuteDelegation_CleanProxyResponse_Unchanged(t *testing.T) {
 	}))
 	defer agentServer.Close()
 
-	mr.Set(fmt.Sprintf("ws:%s:url", testTargetID), agentServer.URL)
+	mr.Set(fmt.Sprintf("ws:%s:url", testDeliveryTargetID), agentServer.URL)
 	allowLoopbackForTest(t)
 
 	expectExecuteDelegationBase(mock)
@@ -1263,7 +1263,7 @@ func TestExecuteDelegation_CleanProxyResponse_Unchanged(t *testing.T) {
 			},
 		},
 	})
-	dh.executeDelegation(testSourceID, testTargetID, testDelegationID, a2aBody)
+	dh.executeDelegation(context.Background(), testDeliverySourceID, testDeliveryTargetID, testDeliveryDelegationID, a2aBody)
 
 	time.Sleep(100 * time.Millisecond)
 
