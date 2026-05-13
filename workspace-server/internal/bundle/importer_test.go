@@ -76,6 +76,7 @@ func TestBuildBundleConfigFiles_Skills(t *testing.T) {
 			},
 		},
 	}
+	files := buildBundleConfigFiles(b)
 	// 2 skills × 1 file each = 2 files
 	if n := len(files); n != 2 {
 		t.Fatalf("skills: want 2 files, got %d", n)
