@@ -94,7 +94,7 @@ func TestExtractToolTrace_EmptyArray(t *testing.T) {
 }
 
 func TestExtractToolTrace_ValidNonEmpty(t *testing.T) {
-	trace := []byte(`[{"name": "search", "result": "done"}]`)
+	trace := []byte(`[{"name":"search","result":"done"}]`)
 	body, _ := json.Marshal(map[string]interface{}{
 		"result": map[string]interface{}{
 			"metadata": map[string]interface{}{
