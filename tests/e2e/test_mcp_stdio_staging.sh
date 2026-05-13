@@ -31,7 +31,7 @@ CURL_COMMON=(-sS --fail-with-body --max-time 30)
 # ─── cleanup trap ───────────────────────────────────────────────────────
 CLEANUP_DONE=0
 cleanup_org() {
-  local entry_rc=$?
+  local _entry_rc=$?
   if [ "$CLEANUP_DONE" = "1" ]; then return 0; fi
   CLEANUP_DONE=1
 
@@ -52,6 +52,7 @@ trap cleanup_org EXIT
 
 # ─── provision tenant ───────────────────────────────────────────────────
 log "Provisioning tenant $SLUG..."
+# shellcheck disable=SC2034  # response body unused; --fail-with-body handles errors
 TENANT=$(curl "${CURL_COMMON[@]}" -X POST "$CP_URL/cp/admin/orgs" \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
