@@ -28,7 +28,8 @@ const FILE_ICONS: Record<string, string> = {
 
 export function getIcon(path: string, isDir: boolean): string {
   if (isDir) return "📁";
-  const ext = "." + (path.split(".").pop() ?? "").toLowerCase();
+  const parts = path.split(".");
+  const ext = parts.length > 1 ? "." + parts[parts.length - 1].toLowerCase() : "";
   return FILE_ICONS[ext] || "📄";
 }
 
