@@ -380,17 +380,27 @@ jobs:
     # mc#774: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
     continue-on-error: true
     needs: [changes, canvas-build]
-    # Only fires on direct pushes to main (i.e. after staging→main promotion).
-    if: needs.changes.outputs.canvas == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Keep the job itself always runnable. Gitea 1.22.6 leaves job-level
+    # event/ref `if:` gates as pending on PRs, which blocks the combined
+    # status even though this reminder is intentionally non-required.
     steps:
       - name: Write deploy reminder to step summary
         env:
           COMMIT_SHA: ${{ github.sha }}
+          CANVAS_CHANGED: ${{ needs.changes.outputs.canvas }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref }}
           # github.server_url resolves via the workflow-level env override
           # to the Gitea instance, so the RUN_URL points at the Gitea run
           # page (not github.com). See feedback_act_runner_github_server_url.
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
+          set -euo pipefail
+          if [ "$CANVAS_CHANGED" != "true" ] || [ "$EVENT_NAME" != "push" ] || [ "$REF_NAME" != "refs/heads/main" ]; then
+            echo "Canvas deploy reminder not applicable for event=$EVENT_NAME ref=$REF_NAME canvas_changed=$CANVAS_CHANGED."
+            exit 0
+          fi
+
           # Write body to a temp file — avoids backtick escaping in shell.
           cat > /tmp/deploy-reminder.md << 'BODY'
           ## Canvas build passed — deploy required
@@ -535,11 +545,10 @@ jobs:
     #     hourly if this list diverges from status_check_contexts or from
     #     audit-force-merge.yml's REQUIRED_CHECKS env (RFC §4 + §6).
     #
-    # Excluded from `needs:`: `canvas-deploy-reminder` — gated by
-    # `if: ... github.event_name == 'push' && github.ref == 'refs/heads/main'`,
-    # so on PR events it's legitimately `skipped`. The drift detector
-    # explicitly excludes `github.event_name`-gated jobs from F1 (see
-    # `.gitea/scripts/ci-required-drift.py::ci_job_names`).
+    # Excluded from `needs:`: `canvas-deploy-reminder` — it is an
+    # operational reminder, not a CI prerequisite. Keep that job runnable
+    # on PRs with an internal no-op guard; job-level event/ref `if:` gates
+    # are a Gitea 1.22.6 pending-status trap.
     #
     # Phase 3 (RFC #219 §1) safety: underlying build jobs carry
     # continue-on-error: true so their failures are masked to null (2026-05-12: re-enabled mc#774 interim)
@@ -559,7 +568,7 @@ jobs:
       - canvas-build
       - shellcheck
       - python-lint
-    if: always()
+    if: ${{ always() }}
     steps:
       - name: Assert every required dependency succeeded
         run: |
