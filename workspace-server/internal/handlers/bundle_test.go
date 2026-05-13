@@ -51,7 +51,20 @@ func TestBundleImport_InvalidJSON(t *testing.T) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 func TestBundleImport_ValidJSON(t *testing.T) {
-	h := NewBundleHandler(nil, nil, "http://localhost:8080", t.TempDir(), nil)
+	mock := setupTestDB(t)
+	broadcaster := newTestBroadcaster()
+	h := NewBundleHandler(broadcaster, nil, "http://localhost:8080", t.TempDir(), nil)
+
+	// bundle.Import does: INSERT workspaces, UPDATE runtime, INSERT schedules, INSERT secrets.
+	// bundle.Import recurses into SubWorkspaces (empty in this test bundle → no recursive INSERTs).
+	mock.ExpectExec("INSERT INTO workspaces").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("UPDATE workspaces SET runtime").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO workspace_schedules").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO workspace_secrets").
+		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	body := `{"name": "test-workspace", "schema": "1.0", "tier": 3}`
 	w := httptest.NewRecorder()
@@ -63,6 +76,9 @@ func TestBundleImport_ValidJSON(t *testing.T) {
 
 	if w.Code != http.StatusCreated {
 		t.Errorf("valid JSON: expected status %d, got %d: %s", http.StatusCreated, w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
 	}
 }
 
