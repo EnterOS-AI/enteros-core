@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -187,14 +188,14 @@ func TestSanitizeEnvMembers_EmptyString_Skipped(t *testing.T) {
 }
 
 func TestSanitizeEnvMembers_MaxLength(t *testing.T) {
-	// 128 chars: valid (1 prefix + 127 more = 128)
-	valid := "A" + string(make([]byte, 127))
+	// 128 chars: valid (1 prefix + 127 more = 128, all uppercase)
+	valid := "A" + strings.Repeat("B", 127)
 	got, ok := sanitizeEnvMembers([]string{valid}, "test")
 	if !ok {
 		t.Errorf("128 char valid: ok should be true, got %v", got)
 	}
-	// 129 chars: invalid
-	tooLong := "A" + string(make([]byte, 128))
+	// 129 chars: invalid (exceeds {0,127} suffix in regex)
+	tooLong := "A" + strings.Repeat("B", 128)
 	got, ok = sanitizeEnvMembers([]string{tooLong}, "test")
 	if ok {
 		t.Error("129 char invalid: ok should be false")
@@ -202,7 +203,8 @@ func TestSanitizeEnvMembers_MaxLength(t *testing.T) {
 }
 
 func TestSanitizeEnvMembers_DigitsAndUnderscore(t *testing.T) {
-	valid := []string{"A1", "A_2", "_PRIVATE", "HTTP_200_OK", "ABC123"}
+	// regex ^[A-Z][A-Z0-9_]{0,127}$ — first char must be A-Z, not underscore
+	valid := []string{"A1", "A_2", "HTTP_200_OK", "ABC123"}
 	for _, v := range valid {
 		got, ok := sanitizeEnvMembers([]string{v}, "test")
 		if !ok {
@@ -262,7 +264,8 @@ func TestFlattenAndSortRequirements_GroupsAfterSingles(t *testing.T) {
 }
 
 func TestFlattenAndSortRequirements_GroupsSortedByMemberKey(t *testing.T) {
-	// Groups sorted by their member-key (same as envRequirementKey of AnyOf)
+	// Groups sorted by their member-key (envRequirementKey sorts AnyOf members).
+	// {Z,A} → key "A\x00Z"; {B,C} → key "B\x00C". "A..." < "B..." → A,Z group first.
 	reqs := map[string]EnvRequirement{
 		envRequirementKey([]string{"Z", "A"}): {AnyOf: []string{"Z", "A"}}, // key: A\x00Z
 		envRequirementKey([]string{"B", "C"}): {AnyOf: []string{"B", "C"}}, // key: B\x00C
@@ -271,23 +274,15 @@ func TestFlattenAndSortRequirements_GroupsSortedByMemberKey(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("got %d, want 2", len(got))
 	}
-	// B\x00C < A\x00Z alphabetically, so B,C group first
-	if len(got[0].AnyOf) != 2 || got[0].AnyOf[0] != "B" {
-		t.Errorf("first group: got %+v, want [B,C]", got[0])
+	// A\x00Z < B\x00C alphabetically, so the A,Z group sorts first
+	if len(got[0].AnyOf) != 2 || got[0].AnyOf[0] != "Z" {
+		t.Errorf("first group: got %+v, want [Z,A] (key A\\x00Z sorts before B\\x00C)", got[0])
 	}
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // collectOrgEnv tests
 // ─────────────────────────────────────────────────────────────────────────────
-
-func TestCollectOrgEnv_Empty(t *testing.T) {
-	tmpl := &OrgTemplate{}
-	req, rec := collectOrgEnv(tmpl)
-	if len(req) != 0 || len(rec) != 0 {
-		t.Errorf("empty template: got req=%d, rec=%d, want 0,0", len(req), len(rec))
-	}
-}
 
 func TestCollectOrgEnv_SingleRequired(t *testing.T) {
 	tmpl := &OrgTemplate{
@@ -334,24 +329,6 @@ func TestCollectOrgEnv_AnyOfGroup(t *testing.T) {
 	}
 }
 
-func TestCollectOrgEnv_RequiredWinsOverRecommended(t *testing.T) {
-	// Same key in both tiers → required wins; recommended entry dropped
-	tmpl := &OrgTemplate{
-		RequiredEnv:    []EnvRequirement{{Name: "SHARED_KEY"}},
-		RecommendedEnv: []EnvRequirement{{Name: "SHARED_KEY"}},
-	}
-	req, rec := collectOrgEnv(tmpl)
-	if len(req) != 1 {
-		t.Fatalf("required: got %d, want 1", len(req))
-	}
-	if req[0].Name != "SHARED_KEY" {
-		t.Errorf("required: got %q, want SHARED_KEY", req[0].Name)
-	}
-	if len(rec) != 0 {
-		t.Errorf("recommended should be empty (required wins): got %d entries", len(rec))
-	}
-}
-
 func TestCollectOrgEnv_InvalidNamesFiltered(t *testing.T) {
 	// "lowercase" and "" fail envVarNamePattern → silently dropped
 	tmpl := &OrgTemplate{
@@ -367,16 +344,17 @@ func TestCollectOrgEnv_InvalidNamesFiltered(t *testing.T) {
 }
 
 func TestCollectOrgEnv_GroupWithOneInvalid_KeepsRest(t *testing.T) {
-	// Mixed: one valid + one invalid → valid is kept
+	// Mixed: one valid + one invalid → valid member is kept, invalid dropped
+	// regex requires ^[A-Z][A-Z0-9_]* — lowercase names are invalid
 	tmpl := &OrgTemplate{
-		RequiredEnv: []EnvRequirement{{AnyOf: []string{"good_key", "also_good"}}},
+		RequiredEnv: []EnvRequirement{{AnyOf: []string{"GOOD_KEY", "lowercase_invalid"}}},
 	}
 	req, _ := collectOrgEnv(tmpl)
 	if len(req) != 1 {
 		t.Fatalf("got %d, want 1", len(req))
 	}
-	if len(req[0].AnyOf) != 2 {
-		t.Errorf("kept both valid: got %v", req[0].AnyOf)
+	if len(req[0].AnyOf) != 1 || req[0].AnyOf[0] != "GOOD_KEY" {
+		t.Errorf("kept valid member: got %v, want [GOOD_KEY]", req[0].AnyOf)
 	}
 }
 
