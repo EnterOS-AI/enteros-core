@@ -640,8 +640,11 @@ def render_status(
             shown += f", +{len(missing) - 3}"
         desc_parts.append(f"missing: {shown}")
     if missing_body:
-        desc_parts.append(f"body-unfilled: {len(missing_body)}")
-    state = "success" if not missing else "failure"
+        shown = ", ".join(missing_body[:3])
+        if len(missing_body) > 3:
+            shown += f", +{len(missing_body) - 3}"
+        desc_parts.append(f"body-unfilled: {shown}")
+    state = "success" if not missing and not missing_body else "failure"
     return state, " — ".join(desc_parts)
 
 
