@@ -589,7 +589,7 @@ func TestRenderCategoryRoutingYAML_SpecialCharactersEscaped(t *testing.T) {
 // ── Additional coverage: appendYAMLBlock ───────────────────────────
 func TestAppendYAMLBlock_BothEmpty(t *testing.T) {
 	result := appendYAMLBlock(nil, "")
-	assert.Nil(t, result)
+	assert.Nil(t, result) // append(nil, []byte("")...) returns nil in Go
 }
 
 func TestAppendYAMLBlock_ExistingHasNewline(t *testing.T) {
