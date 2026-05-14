@@ -345,6 +345,11 @@ func (h *TemplatesHandler) ListFiles(c *gin.Context) {
 		if err != nil || path == walkRoot {
 			return nil
 		}
+		// Skip symlinks to prevent path traversal via malicious symlinks
+		// inside the workspace config directory (OFFSEC-010).
+		if info.Mode()&os.ModeSymlink != 0 {
+			return nil
+		}
 		rel, _ := filepath.Rel(walkRoot, path)
 		// Enforce depth limit
 		if strings.Count(rel, string(filepath.Separator))+1 > depth {
