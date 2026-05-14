@@ -1,6 +1,7 @@
 package provisioner
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -291,6 +292,11 @@ func TestStart_CollectsConfigFiles(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(tmpl, "config.yaml"), []byte("name: test\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	// adapter.py is within the size limit but is NOT config.yaml or prompts/,
+	// so isCPTemplateConfigFile must exclude it from the transport.
+	if err := os.WriteFile(filepath.Join(tmpl, "adapter.py"), bytes.Repeat([]byte("x"), cpConfigFilesMaxBytes), 0o600); err != nil {
+		t.Fatal(err)
+	}
 
 	var gotBody cpProvisionRequest
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -338,6 +344,12 @@ func TestStart_CollectsConfigFiles(t *testing.T) {
 	}
 	if !foundGenerated {
 		t.Errorf("ConfigFiles missing generated.json from ConfigFiles")
+	}
+	// adapter.py must NOT be in ConfigFiles — isCPTemplateConfigFile filters it out
+	for name := range gotBody.ConfigFiles {
+		if name == "adapter.py" {
+			t.Errorf("adapter.py should not be in ConfigFiles — isCPTemplateConfigFile must filter it out")
+		}
 	}
 }
 
