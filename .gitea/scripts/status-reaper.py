@@ -133,6 +133,9 @@ PUSH_COMPENSATION_DESCRIPTION = (
     "Compensated by status-reaper (workflow has no push: trigger; "
     "Gitea 1.22.6 hardcoded-suffix bug — see .gitea/scripts/status-reaper.py)"
 )
+# Backward-compatible alias for older tests/tooling that predate the split
+# between push-suffix compensation and pull-request-shadow compensation.
+COMPENSATION_DESCRIPTION = PUSH_COMPENSATION_DESCRIPTION
 PR_SHADOW_COMPENSATION_DESCRIPTION = (
     "Compensated by status-reaper (default-branch pull_request status "
     "shadowed by successful push status on same SHA; see "
@@ -746,12 +749,32 @@ def main() -> int:
         f"class-O candidates={sum(1 for v in workflow_trigger_map.values() if not v)}"
     )
 
-    counters = reap_branch(
-        workflow_trigger_map,
-        WATCH_BRANCH,
-        limit=args.limit,
-        dry_run=args.dry_run,
-    )
+    try:
+        counters = reap_branch(
+            workflow_trigger_map,
+            WATCH_BRANCH,
+            limit=args.limit,
+            dry_run=args.dry_run,
+        )
+    except ApiError as e:
+        print(
+            "::warning::status-reaper skipped this tick because the "
+            f"commit list could not be read after retries: {e}"
+        )
+        counters = {
+            "scanned_shas": 0,
+            "compensated": 0,
+            "preserved_real_push": 0,
+            "preserved_unknown": 0,
+            "preserved_non_failure": 0,
+            "preserved_non_push_suffix": 0,
+            "preserved_unparseable": 0,
+            "compensated_pr_shadowed_by_push_success": 0,
+            "preserved_pr_without_push_success": 0,
+            "compensated_per_sha": {},
+            "skipped": True,
+            "skip_reason": "commit-list-api-error",
+        }
 
     # Observability: print one JSON line summarising the tick. Loki
     # ingestion via the runner's stdout (`source="gitea-actions"`).
