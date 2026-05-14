@@ -132,6 +132,34 @@ func expandWithEnv(s string, env map[string]string) string {
 	return b.String()
 }
 
+
+func isEnvIdentStart(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'
+}
+
+func isEnvIdentPart(c byte) bool {
+	return isEnvIdentStart(c) || (c >= '0' && c <= '9')
+}
+
+// expandEnvRef resolves a single variable reference extracted from s.
+//
+// Guards:
+//   - Empty key → "$$" escape, return "$"
+//   - key[0] not POSIX ident start → "$" + partial chars, return "$<chars>"
+//   - Key in env map → return the mapped value (template override wins)
+//   - Otherwise → only fall back to os.Getenv if the whole input string IS the
+//     variable reference (ref == whole).
+//
+// Bare $VAR format:
+//   $HOME (alone) → ref==whole → os.Getenv ✓  (host HOME is org-template HOME)
+//   $HOME/path (partial) → ref!=whole → literal "$HOME" ✓  (CWE-78: prevents host leak)
+//
+// Braced ${VAR} format:
+//   ${HOME} (alone) → ref==whole → os.Getenv ✓
+//   ${ROLE}/admin (partial) → ref!=whole → literal ✓
+//   "yes and ${NOT_SET}" (embedded) → ref!=whole → literal ✓
+//
+// This is the CWE-78 fix from commit a3a358f9.
 func expandEnvRef(key, ref, whole string, env map[string]string) string {
 	if key == "" {
 		return "$"
@@ -148,15 +176,8 @@ func expandEnvRef(key, ref, whole string, env map[string]string) string {
 	return ref
 }
 
-func isEnvIdentStart(c byte) bool {
-	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'
-}
 
-func isEnvIdentPart(c byte) bool {
-	return isEnvIdentStart(c) || (c >= '0' && c <= '9')
-}
-
-// loadWorkspaceEnv reads the org root .env and the workspace-specific .env
+// loadWorkspaceEnv reads the org root .env and the workspace-specific .env .env and the workspace-specific .env
 // (workspace overrides org root). Used by both secret injection and channel
 // config expansion.
 //

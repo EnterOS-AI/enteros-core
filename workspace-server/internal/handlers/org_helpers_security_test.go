@@ -16,7 +16,7 @@ import (
 func TestResolveInsideRoot_EmptyUserPath(t *testing.T) {
 	_, err := resolveInsideRoot("/safe/root", "")
 	if err == nil {
-		t.Fatal("empty userPath: expected error, got nil")
+		t.Fatalf("empty userPath: expected error, got nil")
 	}
 	if err.Error() != "path is empty" {
 		t.Errorf("empty userPath: got %q, want %q", err.Error(), "path is empty")
@@ -26,7 +26,7 @@ func TestResolveInsideRoot_EmptyUserPath(t *testing.T) {
 func TestResolveInsideRoot_AbsolutePathRejected(t *testing.T) {
 	_, err := resolveInsideRoot("/safe/root", "/etc/passwd")
 	if err == nil {
-		t.Fatal("absolute userPath: expected error, got nil")
+		t.Fatalf("absolute userPath: expected error, got nil")
 	}
 	if err.Error() != "absolute paths are not allowed" {
 		t.Errorf("absolute userPath: got %q, want %q", err.Error(), "absolute paths are not allowed")
@@ -44,6 +44,11 @@ func TestResolveInsideRoot_DotDotTraversal(t *testing.T) {
 	}
 }
 
+// TestResolveInsideRoot_DotDotWithIntermediate verifies that a/b/../../c does NOT
+// escape when root=/safe/root. After normalization: a/b/../.. = ., so a/b/../../c = c,
+// which is a valid descendant of /safe/root. The original test expected an error
+// but resolveInsideRoot correctly returns nil (the path stays within root).
+// The OFFSEC-006 concern is covered by ../../etc/passwd which DOES escape.
 func TestResolveInsideRoot_DotDotWithIntermediate(t *testing.T) {
 	// a/b/../../c normalises to "c" — a valid descendant inside any root.
 	// Must use t.TempDir() for a real filesystem path so filepath.Abs resolves.
@@ -93,14 +98,16 @@ func TestResolveInsideRoot_DotPathComponent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dot path component: unexpected error: %v", err)
 	}
-	if !strings.HasSuffix(got, "/subdir/file.txt") {
-		t.Errorf("dot path component: got %q, want suffix /subdir/file.txt", got)
+	// Verify the file component is subdir/file.txt regardless of root length.
+	suffix := string(filepath.Separator) + "subdir" + string(filepath.Separator) + "file.txt"
+	if !strings.HasSuffix(got, suffix) {
+		t.Errorf("dot path component: got %q, want suffix %q", got, suffix)
 	}
 }
 
 func TestResolveInsideRoot_NestedDotDotEscapes(t *testing.T) {
 	root := t.TempDir()
-	// a/../../b from /tmp/dirsomething → /tmp/b (escapes temp dir)
+	// a/../../b from /tmp/xyz → /tmp/b (escapes temp dir)
 	got, err := resolveInsideRoot(root, "a/../../b")
 	if err == nil {
 		t.Fatalf("nested dotdot: expected error, got %q", got)
@@ -188,15 +195,17 @@ func TestIsSafeRoleName_SpecialChars(t *testing.T) {
 }
 
 // ── mergeCategoryRouting ──────────────────────────────────────────────────────
+// Duplicate mergeCategoryRouting tests removed to avoid redeclaration with
+// org_helpers_pure_test.go. Only security-specific behaviour lives here.
 
-func TestMergeCategoryRouting_BothNil(t *testing.T) {
+func TestSecureRouting_BothNil(t *testing.T) {
 	got := mergeCategoryRouting(nil, nil)
 	if len(got) != 0 {
 		t.Errorf("both nil: got %v, want empty", got)
 	}
 }
 
-func TestMergeCategoryRouting_DefaultOnly(t *testing.T) {
+func TestSecureRouting_DefaultOnly(t *testing.T) {
 	defaultRouting := map[string][]string{
 		"security": {"Backend Engineer", "DevOps"},
 	}
@@ -209,7 +218,7 @@ func TestMergeCategoryRouting_DefaultOnly(t *testing.T) {
 	}
 }
 
-func TestMergeCategoryRouting_WorkspaceOnly(t *testing.T) {
+func TestSecureRouting_WorkspaceOnly(t *testing.T) {
 	wsRouting := map[string][]string{
 		"ui": {"Frontend Engineer"},
 	}
@@ -222,7 +231,7 @@ func TestMergeCategoryRouting_WorkspaceOnly(t *testing.T) {
 	}
 }
 
-func TestMergeCategoryRouting_MergeNoOverlap(t *testing.T) {
+func TestSecureRouting_MergeNoOverlap(t *testing.T) {
 	defaultRouting := map[string][]string{
 		"security": {"Backend Engineer"},
 	}
@@ -235,7 +244,7 @@ func TestMergeCategoryRouting_MergeNoOverlap(t *testing.T) {
 	}
 }
 
-func TestMergeCategoryRouting_WsOverrideDropsDefault(t *testing.T) {
+func TestSecureRouting_WsOverrideDropsDefault(t *testing.T) {
 	defaultRouting := map[string][]string{
 		"security": {"Backend Engineer", "DevOps"},
 	}
@@ -251,7 +260,34 @@ func TestMergeCategoryRouting_WsOverrideDropsDefault(t *testing.T) {
 	}
 }
 
-func TestMergeCategoryRouting_EmptyRolesInDefaultSkipped(t *testing.T) {
+func TestSecureRouting_EmptyListDropsCategory(t *testing.T) {
+	defaultRouting := map[string][]string{
+		"security": {"Backend Engineer"},
+		"ui":       {"Frontend Engineer"},
+	}
+	wsRouting := map[string][]string{
+		"security": {}, // empty list = opt out
+	}
+	got := mergeCategoryRouting(defaultRouting, wsRouting)
+	if _, exists := got["security"]; exists {
+		t.Error("empty ws list should delete the category from output")
+	}
+	if len(got["ui"]) != 1 {
+		t.Errorf("ui should still exist: got %v", got["ui"])
+	}
+}
+
+func TestSecureRouting_EmptyKeySkipped(t *testing.T) {
+	defaultRouting := map[string][]string{
+		"": {"Backend Engineer"},
+	}
+	got := mergeCategoryRouting(defaultRouting, nil)
+	if _, exists := got[""]; exists {
+		t.Error("empty key should be skipped")
+	}
+}
+
+func TestSecureRouting_EmptyRolesInDefaultSkipped(t *testing.T) {
 	defaultRouting := map[string][]string{
 		"security": {},
 	}
@@ -261,7 +297,7 @@ func TestMergeCategoryRouting_EmptyRolesInDefaultSkipped(t *testing.T) {
 	}
 }
 
-func TestMergeCategoryRouting_OriginalMapsUnmodified(t *testing.T) {
+func TestSecureRouting_OriginalMapsUnmodified(t *testing.T) {
 	defaultRouting := map[string][]string{
 		"security": {"Backend Engineer"},
 	}
@@ -274,5 +310,123 @@ func TestMergeCategoryRouting_OriginalMapsUnmodified(t *testing.T) {
 	}
 	if len(wsRouting) != 1 {
 		t.Error("ws routing should be unmodified after merge")
+	}
+}
+
+// ── expandWithEnv ─────────────────────────────────────────────────────────────
+//
+// CWE-78 regression tests. The original fix (a3a358f9) ensures that partial
+// variable references like $HOME/path are NOT resolved via os.Getenv — the
+// host HOME env var must not leak into org template values. Only whole-string
+// references ($VAR or ${VAR}) may fall back to the host process environment.
+
+func TestExpandWithEnv_PartialRefDollarHomePath(t *testing.T) {
+	// $HOME/path must NOT resolve to the host's HOME env var.
+	// The literal $HOME must be returned as-is.
+	got := expandWithEnv("$HOME/path", nil)
+	if got != "$HOME/path" {
+		t.Errorf("$HOME/path: got %q, want literal $HOME/path", got)
+	}
+}
+
+func TestExpandWithEnv_PartialRefBracedRoleAdmin(t *testing.T) {
+	// ${ROLE}/admin — ROLE is not in env, so expand to the literal ${ROLE}/admin.
+	got := expandWithEnv("${ROLE}/admin", nil)
+	if got != "${ROLE}/admin" {
+		t.Errorf("${ROLE}/admin: got %q, want literal ${ROLE}/admin", got)
+	}
+}
+
+func TestExpandWithEnv_PartialRefMiddleOfString(t *testing.T) {
+	// $ROLE in the middle of a string — literal, not os.Getenv.
+	got := expandWithEnv("prefix/$ROLE/suffix", nil)
+	if got != "prefix/$ROLE/suffix" {
+		t.Errorf("prefix/$ROLE/suffix: got %q, want literal", got)
+	}
+}
+
+func TestExpandWithEnv_WholeVarInEnv(t *testing.T) {
+	// Whole-string $VAR that IS in env — env value wins.
+	env := map[string]string{"FOO": "barvalue"}
+	got := expandWithEnv("$FOO", env)
+	if got != "barvalue" {
+		t.Errorf("$FOO with FOO=barvalue: got %q, want barvalue", got)
+	}
+}
+
+func TestExpandWithEnv_WholeVarBracedInEnv(t *testing.T) {
+	// Whole-string ${VAR} that IS in env — env value wins.
+	env := map[string]string{"FOO": "barvalue"}
+	got := expandWithEnv("${FOO}", env)
+	if got != "barvalue" {
+		t.Errorf("${FOO} with FOO=barvalue: got %q, want barvalue", got)
+	}
+}
+
+func TestExpandWithEnv_WholeVarNotInEnvBare(t *testing.T) {
+	// Whole-string $VAR not in env — falls back to os.Getenv.
+	// If the host has the var, we get the host value. If not, empty.
+	// At minimum, the result must NOT be the literal "$UNDEFINED_VAR_9Z".
+	got := expandWithEnv("$UNDEFINED_VAR_9Z", nil)
+	if got == "$UNDEFINED_VAR_9Z" {
+		t.Errorf("$UNDEFINED_VAR_9Z: should expand (whole-string fallback to os.Getenv), got literal")
+	}
+}
+
+func TestExpandWithEnv_WholeVarNotInEnvBraced(t *testing.T) {
+	// Whole-string ${VAR} not in env — falls back to os.Getenv.
+	got := expandWithEnv("${UNDEFINED_VAR_9Z}", nil)
+	if got == "${UNDEFINED_VAR_9Z}" {
+		t.Errorf("${UNDEFINED_VAR_9Z}: should expand (whole-string fallback to os.Getenv), got literal")
+	}
+}
+
+func TestExpandWithEnv_EmptyString(t *testing.T) {
+	got := expandWithEnv("", map[string]string{"FOO": "bar"})
+	if got != "" {
+		t.Errorf("empty string: got %q, want empty", got)
+	}
+}
+
+func TestExpandWithEnv_NoVarRefs(t *testing.T) {
+	got := expandWithEnv("plain string with no vars", map[string]string{"FOO": "bar"})
+	if got != "plain string with no vars" {
+		t.Errorf("plain string: got %q, want unchanged", got)
+	}
+}
+
+func TestExpandWithEnv_MultipleVarRefs(t *testing.T) {
+	// Two vars, both whole — both expand from env.
+	env := map[string]string{"A": "alpha", "B": "beta"}
+	got := expandWithEnv("$A and $B and more", env)
+	if got != "alpha and beta and more" {
+		t.Errorf("multiple vars: got %q, want alpha and beta and more", got)
+	}
+}
+
+func TestExpandWithEnv_NumericVarRef(t *testing.T) {
+	// $5 — starts with digit, not a valid identifier start.
+	// Must return the literal "$5", not expand via os.Getenv.
+	got := expandWithEnv("$5", map[string]string{"5": "five"})
+	if got != "$5" {
+		t.Errorf("$5: got %q, want literal $5", got)
+	}
+}
+
+func TestExpandWithEnv_DollarEscape(t *testing.T) {
+	// $$ → both $ written literally (each $ is not followed by an identifier char,
+	// so it is written as-is). No special escape sequence for $$.
+	got := expandWithEnv("$$", nil)
+	if got != "$$" {
+		t.Errorf("$$: got %q, want literal $$", got)
+	}
+}
+
+func TestExpandWithEnv_MixedPartialAndWhole(t *testing.T) {
+	// $A is in env (whole), $HOME is partial — only $A expands.
+	env := map[string]string{"A": "alpha"}
+	got := expandWithEnv("$A at $HOME", env)
+	if got != "alpha at $HOME" {
+		t.Errorf("$A at $HOME: got %q, want alpha at $HOME", got)
 	}
 }
