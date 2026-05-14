@@ -86,8 +86,11 @@ func TestInstructionsList_ByWorkspaceID(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
 		t.Fatalf("invalid JSON: %v", err)
 	}
-	if len(result) != 0 {
-		t.Fatalf("expected 0 instructions, got %d", len(result))
+	if len(result) != 2 {
+		t.Fatalf("expected 2 instructions, got %d", len(result))
+	}
+	if result[0].Scope != "global" || result[1].Scope != "workspace" {
+		t.Fatalf("expected global then workspace instructions, got %#v", result)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet expectations: %v", err)
@@ -216,8 +219,8 @@ func TestInstructionsHandler_Create_Success(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
 		t.Fatalf("response not valid JSON: %v", err)
 	}
-	if out["id"] != "new-inst-1" {
-		t.Errorf("expected id new-inst-1, got %s", out["id"])
+	if out["id"] != "new-inst-id" {
+		t.Errorf("expected id new-inst-id, got %s", out["id"])
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet expectations: %v", err)
