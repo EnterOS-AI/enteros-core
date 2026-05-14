@@ -145,7 +145,7 @@ if [ -z "$PR_AUTHOR" ] || [ -z "$PR_HEAD_SHA" ]; then
 fi
 
 # --- RFC#324 §N/A follow-up: check N/A declarations status ---
-# sop-checklist-gate.py posts `sop-checklist / na-declarations (pull_request)`
+# sop-checklist.py posts `sop-checklist / na-declarations (pull_request)`
 # status when a peer posts /sop-n/a <gate>. If our gate is declared N/A,
 # the requirement for a Gitea APPROVE review is waived.
 NA_STATUSES_TMP=$(mktemp)

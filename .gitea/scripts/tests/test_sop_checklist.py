@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-# Unit tests for sop-checklist-gate.py
+# Unit tests for sop-checklist.py
 #
-# Run:  python3 .gitea/scripts/tests/test_sop_checklist_gate.py
-#   or:  pytest .gitea/scripts/tests/test_sop_checklist_gate.py
+# Run:  python3 .gitea/scripts/tests/test_sop_checklist.py
+#   or:  pytest .gitea/scripts/tests/test_sop_checklist.py
 #
 # RFC#351 Step 2 of 6 — implementation MVP. Tests cover:
 #   - slug normalization (the 4 example variants in the script header)
@@ -33,7 +33,7 @@ sys.path.insert(0, PARENT)
 import importlib.util  # noqa: E402
 
 _spec = importlib.util.spec_from_file_location(
-    "sop_checklist_gate", os.path.join(PARENT, "sop-checklist-gate.py")
+    "sop_checklist", os.path.join(PARENT, "sop-checklist.py")
 )
 sop = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(sop)  # type: ignore[union-attr]

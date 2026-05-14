@@ -111,7 +111,7 @@ items:
 # N/A gate declarations (RFC#324 §N/A follow-up).
 # PRs where a gate genuinely does not apply (e.g., pure-infra with no
 # qa surface, or docs-only) can be declared N/A by a non-author peer
-# who is in one of the gate's required_teams. The sop-checklist-gate
+# who is in one of the gate's required_teams. The sop-checklist
 # posts a `sop-checklist / na-declarations (pull_request)` status that
 # review-check.sh reads to skip the Gitea-APPROVE requirement.
 #

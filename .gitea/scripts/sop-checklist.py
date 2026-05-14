@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-# sop-checklist-gate — evaluate whether a PR has peer-acked each
+# sop-checklist — evaluate whether a PR has peer-acked each
 # SOP-checklist item. Posts a commit-status that branch protection
 # can require.
 #
 # RFC#351 Step 2 of 6 (implementation MVP).
 #
-# Invoked by .gitea/workflows/sop-checklist-gate.yml on:
+# Invoked by .gitea/workflows/sop-checklist.yml on:
 #   - pull_request_target: [opened, edited, synchronize, reopened]
 #   - issue_comment:       [created, edited, deleted]
 #
