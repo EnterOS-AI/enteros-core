@@ -66,8 +66,17 @@ export function ThemeToggle({ className = "" }: { className?: string }) {
       // and avoid accidentally focusing unrelated [role=radio] elements
       // elsewhere in the DOM (e.g. React Flow canvas nodes).
       const radiogroup = e.currentTarget.closest("[role=radiogroup]") as HTMLElement | null;
-      const btns = radiogroup?.querySelectorAll<HTMLButtonElement>("> [role=radio]");
-      btns?.[next]?.focus();
+      if (!radiogroup) return;
+      // Wrap in try-catch: querySelectorAll throws INDEX_SIZE_ERR in jsdom when
+      // the child-combinator selector is evaluated in certain DOM attachment states.
+      try {
+        const btns = radiogroup.querySelectorAll<HTMLButtonElement>("> [role=radio]");
+        btns?.[next]?.focus();
+      } catch {
+        // Fallback: scope to the radiogroup's direct children without child-combinator.
+        const allBtns = radiogroup.querySelectorAll<HTMLButtonElement>("[role=radio]");
+        allBtns?.[next]?.focus();
+      }
     },
     []
   );
