@@ -15,6 +15,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 )
+
 // resolvePromptRef reads a prompt body from either an inline string or a
 // file ref relative to the workspace's files_dir. Inline always wins when
 // both are non-empty (caller-provided inline is more authoritative than a
@@ -78,21 +79,81 @@ func hasUnresolvedVarRef(original, expanded string) bool {
 }
 
 // expandWithEnv expands ${VAR} and $VAR references in s using the env map.
-// Falls back to the platform process env if a var isn't in the map.
+// Falls back to the platform process env only when the whole value is a
+// single variable reference; embedded process-env expansion is too broad for
+// imported org YAML because host variables such as HOME are not template data.
 func expandWithEnv(s string, env map[string]string) string {
-	return os.Expand(s, func(key string) string {
-		if len(key) == 0 {
-			return "$"
+	if s == "" {
+		return ""
+	}
+	var b strings.Builder
+	for i := 0; i < len(s); {
+		if s[i] != '$' {
+			b.WriteByte(s[i])
+			i++
+			continue
 		}
-		c := key[0]
-		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_') {
-			return "$" + key // not a valid shell identifier — return literally
+
+		if i+1 >= len(s) {
+			b.WriteByte('$')
+			i++
+			continue
 		}
-		if v, ok := env[key]; ok {
-			return v
+
+		if s[i+1] == '{' {
+			end := strings.IndexByte(s[i+2:], '}')
+			if end < 0 {
+				b.WriteByte('$')
+				i++
+				continue
+			}
+			end += i + 2
+			key := s[i+2 : end]
+			ref := s[i : end+1]
+			b.WriteString(expandEnvRef(key, ref, s, env))
+			i = end + 1
+			continue
 		}
+
+		if !isEnvIdentStart(s[i+1]) {
+			b.WriteByte('$')
+			i++
+			continue
+		}
+		j := i + 2
+		for j < len(s) && isEnvIdentPart(s[j]) {
+			j++
+		}
+		key := s[i+1 : j]
+		ref := s[i:j]
+		b.WriteString(expandEnvRef(key, ref, s, env))
+		i = j
+	}
+	return b.String()
+}
+
+func expandEnvRef(key, ref, whole string, env map[string]string) string {
+	if key == "" {
+		return "$"
+	}
+	if !isEnvIdentStart(key[0]) {
+		return "$" + key
+	}
+	if v, ok := env[key]; ok {
+		return v
+	}
+	if ref == whole {
 		return os.Getenv(key)
-	})
+	}
+	return ref
+}
+
+func isEnvIdentStart(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'
+}
+
+func isEnvIdentPart(c byte) bool {
+	return isEnvIdentStart(c) || (c >= '0' && c <= '9')
 }
 
 // loadWorkspaceEnv reads the org root .env and the workspace-specific .env
