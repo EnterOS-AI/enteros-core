@@ -9,10 +9,10 @@
 #   Triggers on:
 #     - `pull_request_target`: opened, synchronize, reopened
 #         → initial status posts when PR opens / re-pushes
-#     - `issue_comment`: /qa-recheck slash-command on the PR
-#         → manual re-fire after a QA reviewer clicks APPROVE
-#           (Gitea 1.22.6 doesn't re-fire on pull_request_review, per
-#           go-gitea/gitea#33700 + feedback_pull_request_review_no_refire)
+#     - comment refires are handled by `review-refire-comments.yml`
+#         → a single issue_comment dispatcher prevents every SOP/review
+#           comment from enqueueing separate qa/security/tier jobs on
+#           Gitea 1.22.6 before job-level `if:` can skip them.
 #   Workflow name = `qa-review` ; job name = `approved`.
 #   The job's own pass/fail conclusion publishes the status context
 #   `qa-review / approved (<event>)` — NO `POST /statuses` call → NO
@@ -85,8 +85,6 @@ name: qa-review
 on:
   pull_request_target:
     types: [opened, synchronize, reopened]
-  issue_comment:
-    types: [created]
 
 permissions:
   contents: read
@@ -97,16 +95,10 @@ jobs:
   approved:
     # Gate the job:
     #   - On pull_request_target events: always run.
-    #   - On issue_comment events: only when it's a PR comment and the body
-    #     contains the slash-command. NO privilege gate at the step level
-    #     (RFC#324 v1.3 §A1.1): a non-collaborator's /qa-recheck is fine
-    #     because the eval is read-only and idempotent — re-running it
-    #     just re-confirms whether a real team-member APPROVE exists.
+    # Comment-triggered refires live in review-refire-comments.yml. Keeping
+    # this workflow PR-only avoids comment-triggered queue storms.
     if: |
-      github.event_name == 'pull_request_target' ||
-      (github.event_name == 'issue_comment' &&
-       github.event.issue.pull_request != null &&
-       startsWith(github.event.comment.body, '/qa-recheck'))
+      github.event_name == 'pull_request_target'
     runs-on: ubuntu-latest
     steps:
       - name: Privilege check (A1.1 — INFORMATIONAL log only, NOT a gate)
