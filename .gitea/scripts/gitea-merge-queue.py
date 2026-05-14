@@ -222,10 +222,11 @@ def evaluate_merge_readiness(
     if not pr_has_current_base:
         return MergeDecision(False, "update", "PR head does not contain current main")
 
-    pr_state = str(pr_status.get("state") or "").lower()
-    if pr_state != "success":
-        return MergeDecision(False, "wait", f"PR combined status is {pr_state or 'missing'}")
-
+    # Check explicit required contexts instead of combined state. Combined state
+    # can be "failure" due to non-blocking jobs with continue-on-error: true
+    # (e.g. publish-runtime-autobump/pr-validate, qa-review on stale tokens).
+    # The required_contexts list is the authoritative gate — it includes only
+    # the checks that actually block merges.
     latest = latest_statuses_by_context(pr_status.get("statuses") or [])
     ok, missing_or_bad = required_contexts_green(latest, required_contexts)
     if not ok:
@@ -255,13 +256,24 @@ def get_combined_status(sha: str) -> dict:
     # Fetch full statuses list; 200 covers >99% of real-world runs.
     # The list is ordered ascending by id (oldest first) — callers must
     # iterate in reverse to get the newest entry per context.
-    _, all_statuses = api(
-        "GET",
-        f"/repos/{OWNER}/{NAME}/commits/{sha}/statuses",
-        query={"limit": "200"},
-    )
-    if isinstance(all_statuses, list):
-        combined["statuses"] = all_statuses
+    # Best-effort: large repos (main with 550+ statuses) may time out.
+    # On timeout, fall back to the statuses[] already in the combined
+    # response (usually 30 entries — enough for most PRs, enough for
+    # main's early push-required contexts).
+    try:
+        _, all_statuses = api(
+            "GET",
+            f"/repos/{OWNER}/{NAME}/commits/{sha}/statuses",
+            query={"limit": "50"},
+        )
+        if isinstance(all_statuses, list):
+            combined["statuses"] = all_statuses
+    except (ApiError, urllib.error.URLError, TimeoutError, OSError) as exc:
+        # URLError covers network-level failures (DNS, refused, timeout).
+        # TimeoutError and OSError cover socket-level timeouts.
+        sys.stderr.write(f"::warning::could not fetch full statuses list for {sha[:8]}: {exc}\n")
+        # Fall back to the statuses[] already in the combined response.
+        pass
     return combined
 
 
