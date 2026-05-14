@@ -569,10 +569,10 @@ jobs:
     #     hourly if this list diverges from status_check_contexts or from
     #     audit-force-merge.yml's REQUIRED_CHECKS env (RFC §4 + §6).
     #
-    # canvas-deploy-reminder IS included in all-required.needs (mc#958 root-fix).
-    # It intentionally has no job-level `if:` because Gitea can leave skipped
-    # needed jobs pending on PRs. Its step-level no-op exits 0 when not a main
-    # push, so the job succeeds on PRs and the sentinel can complete.
+    # canvas-deploy-reminder is intentionally NOT included in all-required.needs.
+    # It is an informational main-push reminder, not a PR quality gate. Keeping
+    # it in this dependency list lets a skipped reminder skip the required
+    # sentinel before the `always()` guard can emit a branch-protection status.
     #
     # Phase 3 (RFC #219 §1) safety: underlying build jobs carry
     # continue-on-error: true so their failures are masked to null (2026-05-12: re-enabled mc#774 interim)
@@ -592,7 +592,6 @@ jobs:
       - canvas-build
       - shellcheck
       - python-lint
-      - canvas-deploy-reminder
     if: ${{ always() }}
     steps:
       - name: Assert every required dependency succeeded
