@@ -104,8 +104,8 @@ func TestHasUnresolvedVarRef_Resolved(t *testing.T) {
 		// documents this design choice; callers who need empty=resolved should
 		// pre-process the output before calling hasUnresolvedVarRef.
 		{"${VAR}", "", true},
-		{"${VAR}", "value", false},                    // var replaced
-		{"$VAR", "value", false},                      // bare var replaced
+		{"${VAR}", "value", false}, // var replaced
+		{"$VAR", "value", false},   // bare var replaced
 		{"prefix${VAR}suffix", "prefixvaluesuffix", false},
 		{"${A}${B}", "ab", false},
 		// FOO=FOO and BAR=BAR — both vars found and replaced. Expanded output
@@ -125,14 +125,14 @@ func TestHasUnresolvedVarRef_Resolved(t *testing.T) {
 func TestHasUnresolvedVarRef_Unresolved(t *testing.T) {
 	// Expansion left the refs intact → unresolved.
 	cases := []struct {
-		orig    string
+		orig     string
 		expanded string
 	}{
-		{"${VAR}", "${VAR}"},       // untouched
-		{"$VAR", "$VAR"},           // bare untouched
+		{"${VAR}", "${VAR}"}, // untouched
+		{"$VAR", "$VAR"},     // bare untouched
 		{"prefix${VAR}suffix", "prefix${VAR}suffix"},
-		{"${A}${B}", "${A}${B}"},   // both unresolved
-		{"${FOO}", ""},             // empty result with var ref in original
+		{"${A}${B}", "${A}${B}"}, // both unresolved
+		{"${FOO}", ""},           // empty result with var ref in original
 	}
 	for _, tc := range cases {
 		t.Run(tc.orig, func(t *testing.T) {
@@ -205,8 +205,8 @@ func TestMergeCategoryRouting_WorkspaceOverrides(t *testing.T) {
 		"ui":       {"Frontend Engineer"},
 	}
 	ws := map[string][]string{
-		"security": {"SRE Team"}, // narrows
-		"ui":       {},           // drops
+		"security": {"SRE Team"},      // narrows
+		"ui":       {},                // drops
 		"infra":    {"Platform Team"}, // adds
 	}
 	r := mergeCategoryRouting(defaults, ws)
@@ -462,8 +462,14 @@ func TestExpandWithEnv_LiteralDollar(t *testing.T) {
 func TestExpandWithEnv_PartiallyPresent(t *testing.T) {
 	env := map[string]string{"SET": "yes"}
 	result := expandWithEnv("${SET} and ${NOT_SET}", env)
-	// ${SET} resolved; ${NOT_SET} -> "" via empty fallback.
-	assert.Equal(t, "yes and ", result)
+	assert.Equal(t, "yes and ${NOT_SET}", result)
+}
+
+func TestExpandWithEnv_EmbeddedMissingProcessEnvStaysLiteral(t *testing.T) {
+	t.Setenv("MOL_TEST_EMBEDDED_MISSING", "")
+
+	result := expandWithEnv("prefix/${MOL_TEST_EMBEDDED_MISSING}/suffix", map[string]string{})
+	assert.Equal(t, "prefix/${MOL_TEST_EMBEDDED_MISSING}/suffix", result)
 }
 
 // POSIX identifier guard regression tests (CWE-78 fix).
@@ -576,8 +582,8 @@ func TestRenderCategoryRoutingYAML_SingleCategory(t *testing.T) {
 
 func TestRenderCategoryRoutingYAML_MultipleCategoriesSorted(t *testing.T) {
 	routing := map[string][]string{
-		"zebra":   {"RoleZ"},
-		"alpha":   {"RoleA"},
+		"zebra":      {"RoleZ"},
+		"alpha":      {"RoleA"},
 		"middleware": {"RoleM"},
 	}
 	result, err := renderCategoryRoutingYAML(routing)

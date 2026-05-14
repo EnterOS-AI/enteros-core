@@ -145,10 +145,7 @@ func expandEnvRef(key, ref, whole string, env map[string]string) string {
 	if ref == whole {
 		return os.Getenv(key)
 	}
-	if os.Getenv(key) != "" {
-		return ref
-	}
-	return ""
+	return ref
 }
 
 func isEnvIdentStart(c byte) bool {
