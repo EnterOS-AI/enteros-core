@@ -64,7 +64,9 @@ func resolvePromptRef(inline, fileRef, orgBaseDir, filesDir string) (string, err
 
 // envVarRefPattern matches actual ${VAR} or $VAR references (not literal $).
 // Used to detect unresolved placeholders without false positives like "$5".
-var envVarRefPattern = regexp.MustCompile(`\$\{?[A-Za-z_][A-Za-z0-9_]*\}?`)
+// Requires [a-zA-Z_] as the first char after $ so $100 stays literal.
+// Two capture groups: (1) ${VAR} form, (2) $VAR form.
+var envVarRefPattern = regexp.MustCompile(`\$\{([a-zA-Z_][a-zA-Z0-9_]*)\}|\$([a-zA-Z_][a-zA-Z0-9_]*)`)
 
 // hasUnresolvedVarRef returns true if the original string had a ${VAR} or $VAR
 // reference that the expanded string didn't fully replace (i.e. the var was unset).

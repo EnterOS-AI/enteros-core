@@ -5,7 +5,7 @@
 // that the desktop ChatTab uses, but with a slimmer surface: no
 // attachments, no A2A topology overlay, no conversation tracing.
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { api } from "@/lib/api";
 import { useCanvasStore } from "@/store/canvas";
@@ -49,7 +49,10 @@ export function MobileChat({
   onBack: () => void;
 }) {
   const p = usePalette(dark);
-  const node = useCanvasStore((s) => s.nodes.find((n) => n.id === agentId));
+  // Selecting `nodes` stably avoids the `.find()` anti-pattern that
+  // creates a new return value on every store update (React error #185).
+  const nodes = useCanvasStore((s) => s.nodes);
+  const node = useMemo(() => nodes.find((n) => n.id === agentId), [nodes, agentId]);
   // Bootstrap from the canvas store's per-workspace message buffer so the
   // user sees their prior thread on entry. The store is updated by the
   // socket → ChatTab flows the desktop runs; on mobile we read from the
