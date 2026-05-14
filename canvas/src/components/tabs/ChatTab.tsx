@@ -977,7 +977,7 @@ function MyChatPanel({ workspaceId, data }: Props) {
             </p>
             <button
               onClick={loadInitial}
-              className="text-[10px] px-2 py-0.5 rounded bg-red-800/40 text-bad hover:bg-red-700/50 transition-colors"
+              className="text-[10px] px-2 py-0.5 rounded bg-red-800 text-red-200 hover:bg-red-700 transition-colors"
             >
               Retry
             </button>
@@ -1129,7 +1129,7 @@ function MyChatPanel({ workspaceId, data }: Props) {
                   ))}
                 </div>
               )}
-              <div className={`text-[9px] mt-1 ${msg.role === "user" ? "text-white/70" : "text-ink-mid"}`}>
+              <div className={`text-[9px] mt-1 ${msg.role === "user" ? "text-white/80" : "text-ink-mid"}`}>
                 {new Date(msg.timestamp).toLocaleTimeString()}
               </div>
             </div>
@@ -1169,11 +1169,11 @@ function MyChatPanel({ workspaceId, data }: Props) {
       {error && (
         <div className="px-3 py-2 bg-red-900/20 border-t border-red-800/30">
           <div className="flex items-center justify-between">
-            <span className="text-[10px] text-bad">{error}</span>
+            <span className="text-[10px] text-red-300">{error}</span>
             {!isOnline && (
               <button
                 onClick={() => setConfirmRestart(true)}
-                className="text-[11px] px-2 py-0.5 bg-red-800/40 text-bad rounded hover:bg-red-700/50"
+                className="text-[11px] px-2 py-0.5 bg-red-800 text-red-200 rounded hover:bg-red-700"
               >
                 Restart
               </button>
