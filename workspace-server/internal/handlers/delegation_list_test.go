@@ -6,6 +6,7 @@ package handlers
 
 import (
 	"context"
+	"database/sql"
 	"testing"
 	"time"
 
@@ -14,17 +15,14 @@ import (
 
 // ---------- listDelegationsFromLedger ----------
 
-// Columns in the delegations table (SELECT order must match the query).
-const ledgerCols = "delegation_id, caller_id, callee_id, task_preview, " +
-	"status, result_preview, error_detail, last_heartbeat, deadline, created_at, updated_at"
-
 func TestListDelegationsFromLedger_EmptyResult(t *testing.T) {
 	mockDB, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("failed to create sqlmock: %v", err)
 	}
-	defer mockDB.Close()
+	prevDB := db.DB
 	db.DB = mockDB
+	t.Cleanup(func() { db.DB = prevDB; mockDB.Close() })
 
 	rows := sqlmock.NewRows([]string{})
 	mock.ExpectQuery("SELECT .+ FROM delegations").
@@ -49,14 +47,16 @@ func TestListDelegationsFromLedger_SingleRow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create sqlmock: %v", err)
 	}
-	defer mockDB.Close()
+	prevDB := db.DB
 	db.DB = mockDB
+	t.Cleanup(func() { db.DB = prevDB; mockDB.Close() })
 
 	now := time.Now()
 	rows := sqlmock.NewRows([]string{}).AddRow(
 		"del-1", "ws-1", "ws-2", "summarise the report",
 		"completed", "the report is about Q1",
-		"", now, now, now, now,
+		"", sql.NullTime{Time: now, Valid: true}, sql.NullTime{Time: now, Valid: true},
+		sql.NullTime{Time: now, Valid: true}, sql.NullTime{Time: now, Valid: true},
 	)
 	mock.ExpectQuery("SELECT .+ FROM delegations").
 		WithArgs("ws-1").
@@ -102,14 +102,21 @@ func TestListDelegationsFromLedger_MultipleRows(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create sqlmock: %v", err)
 	}
-	defer mockDB.Close()
+	prevDB := db.DB
 	db.DB = mockDB
+	t.Cleanup(func() { db.DB = prevDB; mockDB.Close() })
 
 	now := time.Now()
 	rows := sqlmock.NewRows([]string{}).
-		AddRow("del-a", "ws-1", "ws-2", "task a", "in_progress", "", "", now, now, now, now).
-		AddRow("del-b", "ws-1", "ws-3", "task b", "failed", "", "timeout", now, now, now, now).
-		AddRow("del-c", "ws-1", "ws-4", "task c", "completed", "result c", "", now, now, now, now)
+		AddRow("del-a", "ws-1", "ws-2", "task a", "in_progress", "", "",
+			sql.NullTime{Time: now, Valid: true}, sql.NullTime{Time: now, Valid: true},
+			sql.NullTime{Time: now, Valid: true}, sql.NullTime{Time: now, Valid: true}).
+		AddRow("del-b", "ws-1", "ws-3", "task b", "failed", "", "timeout",
+			sql.NullTime{Time: now, Valid: true}, sql.NullTime{Time: now, Valid: true},
+			sql.NullTime{Time: now, Valid: true}, sql.NullTime{Time: now, Valid: true}).
+		AddRow("del-c", "ws-1", "ws-4", "task c", "completed", "result c", "",
+			sql.NullTime{Time: now, Valid: true}, sql.NullTime{Time: now, Valid: true},
+			sql.NullTime{Time: now, Valid: true}, sql.NullTime{Time: now, Valid: true})
 	mock.ExpectQuery("SELECT .+ FROM delegations").
 		WithArgs("ws-1").
 		WillReturnRows(rows)
@@ -137,12 +144,16 @@ func TestListDelegationsFromLedger_NullsOmitted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create sqlmock: %v", err)
 	}
-	defer mockDB.Close()
+	prevDB := db.DB
 	db.DB = mockDB
+	t.Cleanup(func() { db.DB = prevDB; mockDB.Close() })
 
 	now := time.Now()
 	rows := sqlmock.NewRows([]string{}).
-		AddRow("del-1", "ws-1", "ws-2", "task", "queued", nil, nil, nil, nil, now, now)
+		AddRow("del-1", "ws-1", "ws-2", "task", "queued",
+			sql.NullString{}, sql.NullString{},
+			sql.NullTime{}, sql.NullTime{},
+			sql.NullTime{Time: now, Valid: true}, sql.NullTime{Time: now, Valid: true})
 	mock.ExpectQuery("SELECT .+ FROM delegations").
 		WithArgs("ws-1").
 		WillReturnRows(rows)
@@ -179,8 +190,9 @@ func TestListDelegationsFromLedger_QueryError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create sqlmock: %v", err)
 	}
-	defer mockDB.Close()
+	prevDB := db.DB
 	db.DB = mockDB
+	t.Cleanup(func() { db.DB = prevDB; mockDB.Close() })
 
 	mock.ExpectQuery("SELECT .+ FROM delegations").
 		WithArgs("ws-1").
@@ -205,13 +217,16 @@ func TestListDelegationsFromLedger_RowsErr(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create sqlmock: %v", err)
 	}
-	defer mockDB.Close()
+	prevDB := db.DB
 	db.DB = mockDB
+	t.Cleanup(func() { db.DB = prevDB; mockDB.Close() })
 
 	now := time.Now()
 	rows := sqlmock.NewRows([]string{}).
-		RowError(0, context.DeadlineExceeded). // error on first row
-		AddRow("del-1", "ws-1", "ws-2", "task", "queued", "", "", now, now, now, now)
+		AddRow("del-1", "ws-1", "ws-2", "task", "queued", "", "",
+			sql.NullTime{}, sql.NullTime{},
+			sql.NullTime{Time: now, Valid: true}, sql.NullTime{Time: now, Valid: true}).
+		RowError(0, context.DeadlineExceeded)
 	mock.ExpectQuery("SELECT .+ FROM delegations").
 		WithArgs("ws-1").
 		WillReturnRows(rows)
@@ -221,8 +236,7 @@ func TestListDelegationsFromLedger_RowsErr(t *testing.T) {
 	dh := NewDelegationHandler(wh, broadcaster)
 
 	got := dh.listDelegationsFromLedger(context.Background(), "ws-1")
-	// rows.Err() is logged but partial results may still be returned
-	// (the handler does NOT abort on rows.Err — it logs and returns what it has)
+	// rows.Err() is logged but partial results may still be returned.
 	if got == nil {
 		t.Error("rows.Err path should still return partial results")
 	}
@@ -237,14 +251,17 @@ func TestListDelegationsFromLedger_ScanError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create sqlmock: %v", err)
 	}
-	defer mockDB.Close()
+	prevDB := db.DB
 	db.DB = mockDB
+	t.Cleanup(func() { db.DB = prevDB; mockDB.Close() })
 
 	now := time.Now()
 	// Wrong column count → scan error
 	badRows := sqlmock.NewRows([]string{}).AddRow("only-one-col")
 	goodRows := sqlmock.NewRows([]string{}).
-		AddRow("del-1", "ws-1", "ws-2", "task", "queued", "", "", now, now, now, now)
+		AddRow("del-1", "ws-1", "ws-2", "task", "queued", "", "",
+			sql.NullTime{}, sql.NullTime{},
+			sql.NullTime{Time: now, Valid: true}, sql.NullTime{Time: now, Valid: true})
 	mock.ExpectQuery("SELECT .+ FROM delegations").
 		WithArgs("ws-1").
 		WillReturnRows(badRows, goodRows)
@@ -268,21 +285,14 @@ func TestListDelegationsFromLedger_ScanError(t *testing.T) {
 
 // ---------- listDelegationsFromActivityLogs ----------
 
-// Columns in the activity_logs query.
-const activityCols = "id, activity_type, " +
-	"COALESCE(source_id::text, ''), COALESCE(target_id::text, ''), " +
-	"COALESCE(summary, ''), COALESCE(status, ''), COALESCE(error_detail, ''), " +
-	"COALESCE(response_body->>'text', response_body::text, ''), " +
-	"COALESCE(request_body->>'delegation_id', response_body->>'delegation_id', ''), " +
-	"created_at"
-
 func TestListDelegationsFromActivityLogs_EmptyResult(t *testing.T) {
 	mockDB, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("failed to create sqlmock: %v", err)
 	}
-	defer mockDB.Close()
+	prevDB := db.DB
 	db.DB = mockDB
+	t.Cleanup(func() { db.DB = prevDB; mockDB.Close() })
 
 	rows := sqlmock.NewRows([]string{})
 	mock.ExpectQuery("SELECT .+ FROM activity_logs").
@@ -307,8 +317,9 @@ func TestListDelegationsFromActivityLogs_SingleDelegateRow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create sqlmock: %v", err)
 	}
-	defer mockDB.Close()
+	prevDB := db.DB
 	db.DB = mockDB
+	t.Cleanup(func() { db.DB = prevDB; mockDB.Close() })
 
 	now := time.Now()
 	rows := sqlmock.NewRows([]string{}).AddRow(
@@ -316,7 +327,7 @@ func TestListDelegationsFromActivityLogs_SingleDelegateRow(t *testing.T) {
 		"ws-1", "ws-2",
 		"analyse Q1 numbers",
 		"in_progress",
-		"", "", "",
+		sql.NullString{}, sql.NullString{}, sql.NullString{},
 		now,
 	)
 	mock.ExpectQuery("SELECT .+ FROM activity_logs").
@@ -360,8 +371,9 @@ func TestListDelegationsFromActivityLogs_DelegateResultWithError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create sqlmock: %v", err)
 	}
-	defer mockDB.Close()
+	prevDB := db.DB
 	db.DB = mockDB
+	t.Cleanup(func() { db.DB = prevDB; mockDB.Close() })
 
 	now := time.Now()
 	rows := sqlmock.NewRows([]string{}).AddRow(
@@ -369,9 +381,9 @@ func TestListDelegationsFromActivityLogs_DelegateResultWithError(t *testing.T) {
 		"ws-1", "ws-2",
 		"result summary",
 		"failed",
-		"Callee workspace not reachable",
-		"the result body text",
-		"del-abc",
+		sql.NullString{String: "Callee workspace not reachable", Valid: true},
+		sql.NullString{String: `{"text":"the result body text"}`, Valid: true},
+		sql.NullString{String: "del-abc", Valid: true},
 		now,
 	)
 	mock.ExpectQuery("SELECT .+ FROM activity_logs").
@@ -393,7 +405,7 @@ func TestListDelegationsFromActivityLogs_DelegateResultWithError(t *testing.T) {
 	if e["error"] != "Callee workspace not reachable" {
 		t.Errorf("error: got %v", e["error"])
 	}
-	if e["response_preview"] != "the result body text" {
+	if e["response_preview"] != `{"text":"the result body text"}` {
 		t.Errorf("response_preview: got %v", e["response_preview"])
 	}
 	if e["delegation_id"] != "del-abc" {
@@ -409,8 +421,9 @@ func TestListDelegationsFromActivityLogs_QueryError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create sqlmock: %v", err)
 	}
-	defer mockDB.Close()
+	prevDB := db.DB
 	db.DB = mockDB
+	t.Cleanup(func() { db.DB = prevDB; mockDB.Close() })
 
 	mock.ExpectQuery("SELECT .+ FROM activity_logs").
 		WithArgs("ws-1").
@@ -435,13 +448,15 @@ func TestListDelegationsFromActivityLogs_RowsErr(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create sqlmock: %v", err)
 	}
-	defer mockDB.Close()
+	prevDB := db.DB
 	db.DB = mockDB
+	t.Cleanup(func() { db.DB = prevDB; mockDB.Close() })
 
 	now := time.Now()
 	rows := sqlmock.NewRows([]string{}).
-		RowError(0, context.DeadlineExceeded).
-		AddRow("act-1", "delegate", "ws-1", "ws-2", "task", "queued", "", "", "", now)
+		AddRow("act-1", "delegate", "ws-1", "ws-2", "task", "queued",
+			sql.NullString{}, sql.NullString{}, sql.NullString{}, now).
+		RowError(0, context.DeadlineExceeded)
 	mock.ExpectQuery("SELECT .+ FROM activity_logs").
 		WithArgs("ws-1").
 		WillReturnRows(rows)
@@ -464,14 +479,16 @@ func TestListDelegationsFromActivityLogs_ScanErrorSkipped(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create sqlmock: %v", err)
 	}
-	defer mockDB.Close()
+	prevDB := db.DB
 	db.DB = mockDB
+	t.Cleanup(func() { db.DB = prevDB; mockDB.Close() })
 
 	now := time.Now()
 	// Wrong column count → scan error on first row
 	badRows := sqlmock.NewRows([]string{}).AddRow("only-one")
 	goodRows := sqlmock.NewRows([]string{}).
-		AddRow("act-1", "delegate", "ws-1", "ws-2", "task", "queued", "", "", "", now)
+		AddRow("act-1", "delegate", "ws-1", "ws-2", "task", "queued",
+			sql.NullString{}, sql.NullString{}, sql.NullString{}, now)
 	mock.ExpectQuery("SELECT .+ FROM activity_logs").
 		WithArgs("ws-1").
 		WillReturnRows(badRows, goodRows)
