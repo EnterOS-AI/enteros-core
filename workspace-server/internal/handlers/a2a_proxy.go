@@ -645,7 +645,7 @@ func (h *WorkspaceHandler) resolveAgentURL(ctx context.Context, workspaceID stri
 			// the caller can retry once the workspace is back online (~10s).
 			if status == "hibernated" {
 				log.Printf("ProxyA2A: waking hibernated workspace %s", workspaceID)
-				go h.RestartByID(workspaceID)
+				h.goAsync(func() { h.RestartByID(workspaceID) })
 				return "", &proxyA2AError{
 					Status:  http.StatusServiceUnavailable,
 					Headers: map[string]string{"Retry-After": "15"},

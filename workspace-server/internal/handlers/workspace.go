@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Molecule-AI/molecule-monorepo/platform/internal/crypto"
@@ -73,6 +74,22 @@ type WorkspaceHandler struct {
 	// memory plugin). main.go sets this to plugin.DeleteNamespace
 	// when MEMORY_PLUGIN_URL is configured.
 	namespaceCleanupFn func(ctx context.Context, workspaceID string)
+	// asyncWG tracks goroutines launched by goAsync so tests can wait
+	// for async DB users (restart, provision) before asserting results.
+	// Matches the pattern from main commit 1c3b4ff3.
+	asyncWG sync.WaitGroup
+}
+
+func (h *WorkspaceHandler) goAsync(fn func()) {
+	h.asyncWG.Add(1)
+	go func() {
+		defer h.asyncWG.Done()
+		fn()
+	}()
+}
+
+func (h *WorkspaceHandler) waitAsyncForTest() {
+	h.asyncWG.Wait()
 }
 
 func NewWorkspaceHandler(b events.EventEmitter, p *provisioner.Provisioner, platformURL, configsDir string) *WorkspaceHandler {
