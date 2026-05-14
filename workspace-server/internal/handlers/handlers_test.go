@@ -62,6 +62,11 @@ func setupTestDB(t *testing.T) sqlmock.Sqlmock {
 	return mock
 }
 
+func waitForHandlerAsyncBeforeDBCleanup(t *testing.T, h *WorkspaceHandler) {
+	t.Helper()
+	t.Cleanup(h.waitAsyncForTest)
+}
+
 // setupTestRedis creates a miniredis instance and assigns it to the global db.RDB.
 func setupTestRedis(t *testing.T) *miniredis.Miniredis {
 	t.Helper()
