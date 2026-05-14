@@ -264,6 +264,7 @@ type EnvRequirement struct {
 // Members returns every env name this requirement considers —
 // [Name] for single, AnyOf for groups. Used by preflight, collect,
 // and the name-validation regex gate.
+
 func (e EnvRequirement) Members() []string {
 	if e.Name != "" {
 		return []string{e.Name}
