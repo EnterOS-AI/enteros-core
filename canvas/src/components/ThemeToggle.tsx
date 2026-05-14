@@ -61,8 +61,12 @@ export function ThemeToggle({ className = "" }: { className?: string }) {
         return;
       }
       setTheme(OPTIONS[next].value);
-      // Move focus to the new button so arrow-key navigation is continuous
-      const btns = (e.currentTarget.closest("[role=radiogroup]") as HTMLElement)?.querySelectorAll<HTMLButtonElement>("[role=radio]");
+      // Move focus to the new button so arrow-key navigation is continuous.
+      // Use direct-child query to scope strictly to this radiogroup's buttons
+      // and avoid accidentally focusing unrelated [role=radio] elements
+      // elsewhere in the DOM (e.g. React Flow canvas nodes).
+      const radiogroup = e.currentTarget.closest("[role=radiogroup]") as HTMLElement | null;
+      const btns = radiogroup?.querySelectorAll<HTMLButtonElement>("> [role=radio]");
       btns?.[next]?.focus();
     },
     []

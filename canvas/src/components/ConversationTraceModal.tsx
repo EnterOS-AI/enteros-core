@@ -187,7 +187,7 @@ export function ConversationTraceModal({ open, workspaceId: _workspaceId, onClos
                                 isError
                                   ? "bg-red-950/50 text-bad"
                                   : isSend
-                                  ? "bg-cyan-950/50 text-cyan-400"
+                                  ? "bg-cyan-950 text-cyan-300"
                                   : isReceive
                                   ? "bg-blue-950/50 text-accent"
                                   : "bg-surface-card text-ink-mid"

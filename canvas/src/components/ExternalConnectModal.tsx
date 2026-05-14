@@ -360,7 +360,7 @@ function SnippetBlock({
         <button
           type="button"
           onClick={onCopy}
-          className="text-xs px-2 py-1 rounded bg-accent-strong/80 hover:bg-accent text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-1"
+          className="text-xs px-2 py-1 rounded bg-accent text-white hover:bg-accent-strong transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-1"
         >
           {copied ? "Copied!" : "Copy"}
         </button>
