@@ -2,7 +2,7 @@
 #
 # Gitea 1.22 queues one run per workflow subscribed to `issue_comment` before
 # evaluating job-level `if:`. SOP-heavy PRs therefore created queue storms when
-# qa-review, security-review, sop-checklist-gate, and sop-tier-refire all
+# qa-review, security-review, sop-checklist, and sop-tier-refire all
 # listened to comments. This workflow is the single non-SOP comment subscriber:
 # ordinary comments no-op quickly; slash commands post the required status
 # contexts to the PR head SHA.
