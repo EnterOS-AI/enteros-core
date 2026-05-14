@@ -37,7 +37,7 @@ jobs:
         # so re-running on a non-collaborator comment is harmless.
         if: github.event_name == 'issue_comment'
         env:
-          GITEA_TOKEN: ${{ secrets.RFC_324_TEAM_READ_TOKEN || secrets.GITHUB_TOKEN }}
+          GITEA_TOKEN: ${{ secrets.SOP_TIER_CHECK_TOKEN || secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           login="${{ github.event.comment.user.login }}"
@@ -62,7 +62,7 @@ jobs:
 
       - name: Evaluate security-review
         env:
-          GITEA_TOKEN: ${{ secrets.RFC_324_TEAM_READ_TOKEN || secrets.GITHUB_TOKEN }}
+          GITEA_TOKEN: ${{ secrets.SOP_TIER_CHECK_TOKEN || secrets.GITHUB_TOKEN }}
           GITEA_HOST: git.moleculesai.app
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
