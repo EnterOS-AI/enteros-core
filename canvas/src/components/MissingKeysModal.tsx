@@ -451,7 +451,7 @@ function ProviderPickerModal({
                     <button
                       onClick={() => handleSaveKey(index)}
                       disabled={!entry.value.trim() || entry.saving}
-                      className="px-3 py-1.5 bg-accent-strong hover:bg-accent text-[11px] rounded text-white disabled:opacity-30 transition-colors shrink-0"
+                      className="px-3 py-1.5 bg-accent-strong hover:bg-accent text-[11px] rounded text-white disabled:opacity-30 transition-colors shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-1"
                     >
                       {entry.saving ? "..." : "Save"}
                     </button>
@@ -492,7 +492,7 @@ function ProviderPickerModal({
                 !selectorValue.providerId ||
                 (showModelInput && model.trim() === "")
               }
-              className="px-3.5 py-1.5 text-[12px] bg-accent-strong hover:bg-accent text-white rounded-lg transition-colors disabled:opacity-40"
+              className="px-3.5 py-1.5 text-[12px] bg-accent-strong hover:bg-accent text-white rounded-lg transition-colors disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-1"
             >
               {allSaved ? "Deploy" : entries.length > 1 ? "Add Keys" : "Add Key"}
             </button>

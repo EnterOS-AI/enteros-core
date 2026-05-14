@@ -76,7 +76,7 @@ export class ErrorBoundary extends React.Component<
             <p className="text-sm text-ink-mid mb-1">
               An unexpected error occurred while rendering the application.
             </p>
-            <p className="text-xs text-bad/80 mb-6 font-mono break-all">
+            <p className="text-xs text-bad mb-6 font-mono break-all">
               {this.state.error?.message ?? "Unknown error"}
             </p>
             <div className="flex items-center justify-center gap-3">
