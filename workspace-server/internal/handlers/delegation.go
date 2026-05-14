@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -698,7 +699,8 @@ func (h *DelegationHandler) listDelegationsFromLedger(ctx context.Context, works
 
 	var result []map[string]interface{}
 	for rows.Next() {
-		var delegationID, callerID, calleeID, taskPreview, status, resultPreview, errorDetail string
+		var delegationID, callerID, calleeID, taskPreview, status string
+		var resultPreview, errorDetail sql.NullString
 		var lastHeartbeat, deadline, createdAt, updatedAt *time.Time
 		if err := rows.Scan(
 			&delegationID, &callerID, &calleeID, &taskPreview,
@@ -717,11 +719,11 @@ func (h *DelegationHandler) listDelegationsFromLedger(ctx context.Context, works
 			"updated_at":    updatedAt,
 			"_ledger":       true, // marker so callers know this row is from the ledger
 		}
-		if resultPreview != "" {
-			entry["response_preview"] = textutil.TruncateBytes(resultPreview, 300)
+		if resultPreview.Valid && resultPreview.String != "" {
+			entry["response_preview"] = textutil.TruncateBytes(resultPreview.String, 300)
 		}
-		if errorDetail != "" {
-			entry["error"] = errorDetail
+		if errorDetail.Valid && errorDetail.String != "" {
+			entry["error"] = errorDetail.String
 		}
 		if lastHeartbeat != nil {
 			entry["last_heartbeat"] = lastHeartbeat

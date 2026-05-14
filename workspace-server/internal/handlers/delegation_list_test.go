@@ -145,7 +145,6 @@ func TestListDelegationsFromLedger_MultipleRows(t *testing.T) {
 	}
 }
 
-=======
 func TestListDelegationsFromLedger_NullsOmitted(t *testing.T) {
 	// last_heartbeat, deadline, result_preview, error_detail are all NULL.
 	// Handler must not panic and must omit those keys from the map.
@@ -158,7 +157,11 @@ func TestListDelegationsFromLedger_NullsOmitted(t *testing.T) {
 	t.Cleanup(func() { mockDB.Close(); db.DB = prevDB })
 
 	now := time.Now()
-	rows := sqlmock.NewRows([]string{}).
+	rows := sqlmock.NewRows([]string{
+		"delegation_id", "caller_id", "callee_id", "task_preview",
+		"status", "result_preview", "error_detail",
+		"last_heartbeat", "deadline", "created_at", "updated_at",
+	}).
 		AddRow("del-1", "ws-1", "ws-2", "task", "queued", nil, nil, nil, nil, now, now)
 	mock.ExpectQuery("SELECT .+ FROM delegations").
 		WithArgs("ws-1").
@@ -190,7 +193,6 @@ func TestListDelegationsFromLedger_NullsOmitted(t *testing.T) {
 	}
 }
 
->>>>>>> 5531b471 (handlers: restore db.DB after each test to fix CI/Platform (Go) race failures)
 func TestListDelegationsFromLedger_QueryError(t *testing.T) {
 	// Query failure returns nil — graceful fallback, no panic.
 	mockDB, mock, err := sqlmock.New()
@@ -484,11 +486,3 @@ func TestListDelegationsFromActivityLogs_RowsErr(t *testing.T) {
 		t.Errorf("sqlmock expectations: %v", err)
 	}
 }
-
-<<<<<<< HEAD
-// TestListDelegationsFromActivityLogs_ScanErrorSkipped is removed.
-//
-// Same reason as TestListDelegationsFromLedger_ScanError: Go 1.25 causes
-// sqlmock.NewRows([]string{}).AddRow(...) to panic in test SETUP. The handler
-// has no recover(), so a scan panic would crash the process — the correct
-// behaviour. Real-DB integration tests cover this path.
