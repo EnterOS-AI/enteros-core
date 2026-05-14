@@ -1,6 +1,7 @@
 package provisioner
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -221,6 +222,9 @@ func TestStart_SendsTemplateAndGeneratedConfigFiles(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(tmpl, "config.yaml"), []byte("name: template\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(tmpl, "adapter.py"), bytes.Repeat([]byte("x"), cpConfigFilesMaxBytes), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.Mkdir(filepath.Join(tmpl, "prompts"), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -260,6 +264,9 @@ func TestStart_SendsTemplateAndGeneratedConfigFiles(t *testing.T) {
 	wantPrompt := base64.StdEncoding.EncodeToString([]byte("hello"))
 	if got := body.ConfigFiles["prompts/system.md"]; got != wantPrompt {
 		t.Errorf("prompt payload = %q, want %q", got, wantPrompt)
+	}
+	if _, ok := body.ConfigFiles["adapter.py"]; ok {
+		t.Error("non-config template file adapter.py must not be sent to CP")
 	}
 }
 

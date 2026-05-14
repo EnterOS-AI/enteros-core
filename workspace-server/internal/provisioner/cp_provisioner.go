@@ -248,6 +248,11 @@ func (p *CPProvisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string,
 
 const cpConfigFilesMaxBytes = 12 << 10
 
+func isCPTemplateConfigFile(name string) bool {
+	name = filepath.ToSlash(filepath.Clean(name))
+	return name == "config.yaml" || strings.HasPrefix(name, "prompts/")
+}
+
 func collectCPConfigFiles(cfg WorkspaceConfig) (map[string]string, error) {
 	files := make(map[string]string)
 	total := 0
@@ -300,6 +305,9 @@ func collectCPConfigFiles(cfg WorkspaceConfig) (map[string]string, error) {
 			rel, err := filepath.Rel(cfg.TemplatePath, path)
 			if err != nil {
 				return err
+			}
+			if !isCPTemplateConfigFile(rel) {
+				return nil
 			}
 			data, err := os.ReadFile(path)
 			if err != nil {
