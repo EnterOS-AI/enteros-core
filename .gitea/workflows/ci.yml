@@ -403,13 +403,10 @@ jobs:
   canvas-deploy-reminder:
     name: Canvas Deploy Reminder
     runs-on: ubuntu-latest
-    # mc#774 root-fix: added job-level `if:` so ci-required-drift.py's
-    # ci_job_names() detects this as github.ref-gated and skips it from F1.
-    # The step-level exit 0 handles the "not main push" case; the job-level
-    # `if:` makes the gating explicit so the drift script sees it.
-    # continue-on-error removed (was mc#774 mask): step exits 0 when not applicable.
+    # This job must run on PRs because all-required needs it. The step exits
+    # 0 when it is not a main push, giving branch protection a green no-op
+    # instead of a skipped/missing required dependency.
     needs: [changes, canvas-build]
-    if: ${{ github.ref == 'refs/heads/main' }}
     steps:
       - name: Write deploy reminder to step summary
         env:
@@ -572,11 +569,10 @@ jobs:
     #     hourly if this list diverges from status_check_contexts or from
     #     audit-force-merge.yml's REQUIRED_CHECKS env (RFC §4 + §6).
     #
-    # canvas-deploy-reminder IS now included in all-required.needs (mc#958 root-fix):
-    # added job-level `if: github.ref == 'refs/heads/main'` so ci-required-drift.py's
-    # ci_job_names() detects it as github.ref-gated and skips it from F1.
-    # The step-level `if: ... || REF_NAME != refs/heads/main` exits 0 when not main,
-    # so the job succeeds (not skipped) on non-main pushes — sentinel treats as green.
+    # canvas-deploy-reminder IS included in all-required.needs (mc#958 root-fix).
+    # It intentionally has no job-level `if:` because Gitea can leave skipped
+    # needed jobs pending on PRs. Its step-level no-op exits 0 when not a main
+    # push, so the job succeeds on PRs and the sentinel can complete.
     #
     # Phase 3 (RFC #219 §1) safety: underlying build jobs carry
     # continue-on-error: true so their failures are masked to null (2026-05-12: re-enabled mc#774 interim)
