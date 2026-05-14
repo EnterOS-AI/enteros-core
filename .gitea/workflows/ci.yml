@@ -144,7 +144,7 @@ jobs:
     # Fix-forward for (1) landed in PR #669. The mc#762 gap (2) is a separate
     # issue — it does NOT block this flip because the test is already wrapped in
     # the diagnostic step with its own continue-on-error: true (line 203).
-    # Flip confirmed by CI / Platform (Go) status = success on main HEAD 68560cec.
+    # Flip confirmed by CI / Platform (Go) status = success on main HEAD 363905d3.
     continue-on-error: false
     defaults:
       run:
@@ -562,12 +562,11 @@ jobs:
     #     hourly if this list diverges from status_check_contexts or from
     #     audit-force-merge.yml's REQUIRED_CHECKS env (RFC §4 + §6).
     #
-    # mc#922/#923 fix: canvas-deploy-reminder added to needs: above.
-    # Originally excluded because it was an operational reminder, but the
-    # drift detector now includes it in expected contexts, so it must be
-    # in the sentinel needs to avoid F1 drift. Keep it runnable on PRs
-    # via its own `needs: [changes, canvas-build]` — the sentinel only
-    # aggregates the result.
+    # canvas-deploy-reminder is intentionally excluded from all-required.needs:
+    # it needs canvas-build, which is skipped on CI-only PRs (canvas=false).
+    # Including it in all-required.needs causes all-required to hang on
+    # every CI-only PR. Keep it runnable on PRs via its own
+    # `needs: [changes, canvas-build]` — the sentinel only aggregates the result.
     #
     # Phase 3 (RFC #219 §1) safety: underlying build jobs carry
     # continue-on-error: true so their failures are masked to null (2026-05-12: re-enabled mc#774 interim)
@@ -585,7 +584,6 @@ jobs:
       - changes
       - platform-build
       - canvas-build
-      - canvas-deploy-reminder
       - shellcheck
       - python-lint
     if: ${{ always() }}
