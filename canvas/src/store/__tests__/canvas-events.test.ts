@@ -341,6 +341,105 @@ describe("handleCanvasEvent – WORKSPACE_PROVISIONING", () => {
     const bPos = lastNodes.find((n) => n.id === "ws-b")!.position;
     expect(bPos).toEqual({ x: 420, y: 100 }); // idx 1 = (100 + 320, 100)
   });
+
+  it("uses finalX/finalY from payload when parentId is set and parent exists in store", () => {
+    // Org-import child lands with explicit coords — these are server-computed
+    // parent-relative positions. The handler must trust them verbatim.
+    const parent = makeNode("parent-root", { name: "Root" });
+    const { get, set } = makeStore([parent]);
+
+    handleCanvasEvent(
+      makeMsg({
+        event: "WORKSPACE_PROVISIONING",
+        workspace_id: "child-org",
+        payload: {
+          name: "Org Child",
+          tier: 2,
+          parent_id: "parent-root",
+          x: 500,
+          y: 300,
+        },
+      }),
+      get,
+      set
+    );
+
+    const newNodes = (set.mock.calls[0][0] as { nodes: Node<WorkspaceNodeData>[] }).nodes;
+    expect(newNodes).toHaveLength(2);
+    const child = newNodes.find((n) => n.id === "child-org")!;
+
+    // Must use the server-provided coords, not grid
+    expect(child.position).toEqual({ x: 500, y: 300 });
+    // Must bind parentId so RF renders it nested inside the parent card
+    expect(child.parentId).toBe("parent-root");
+    expect(child.data.parentId).toBe("parent-root");
+    expect(child.data.name).toBe("Org Child");
+    expect(child.data.status).toBe("provisioning");
+  });
+
+  it("uses grid position when parentId is set but parent is NOT in store yet", () => {
+    // Rare WS-reorder: child event arrives before parent's PROVISIONING event.
+    // Must not crash — uses grid slot as fallback. Parent will reparent
+    // the child when it lands.
+    const { get, set } = makeStore([]);
+
+    handleCanvasEvent(
+      makeMsg({
+        event: "WORKSPACE_PROVISIONING",
+        workspace_id: "orphan-child",
+        payload: {
+          name: "Orphan",
+          parent_id: "unknown-parent",
+          x: 999,
+          y: 888,
+        },
+      }),
+      get,
+      set
+    );
+
+    const newNodes = (set.mock.calls[0][0] as { nodes: Node<WorkspaceNodeData>[] }).nodes;
+    const child = newNodes.find((n) => n.id === "orphan-child")!;
+
+    // Must NOT use finalX/finalY — parent isn't in store so grid slot is used
+    expect(child.position).not.toEqual({ x: 999, y: 888 });
+    // Grid slot for idx 0: (100, 100)
+    expect(child.position).toEqual({ x: 100, y: 100 });
+    // parentId is NOT set on the node when parent is unknown:
+    // the node will be reparented when the parent eventually lands
+    expect(child.data.parentId).not.toBe("unknown-parent");
+  });
+
+  it("no-op cascade: parent in store but no finalX/Y → grid position, no parentId", () => {
+    // Parent exists but payload has no x/y → must not crash, uses grid slot.
+    // parentId is NOT set because we don't have parent-relative coords.
+    const parent = makeNode("parent-exists");
+    const { get, set } = makeStore([parent]);
+
+    handleCanvasEvent(
+      makeMsg({
+        event: "WORKSPACE_PROVISIONING",
+        workspace_id: "child-no-coords",
+        payload: {
+          name: "No Coords",
+          parent_id: "parent-exists",
+          // no x or y
+        },
+      }),
+      get,
+      set
+    );
+
+    const newNodes = (set.mock.calls[0][0] as { nodes: Node<WorkspaceNodeData>[] }).nodes;
+    const child = newNodes.find((n) => n.id === "child-no-coords")!;
+
+    // Grid slot for idx 0: (100, 100)
+    expect(child.position).toEqual({ x: 100, y: 100 });
+    // parentId stays null (not undefined) when no finalX/Y — server has no
+    // position for this node, and the handler initialises parentId=null
+    expect(child.parentId).toBeUndefined();
+    expect(child.data.parentId).toBeNull();
+  });
 });
 
 // ---------------------------------------------------------------------------
