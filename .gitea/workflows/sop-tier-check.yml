@@ -61,6 +61,10 @@ on:
   pull_request_review:
     types: [submitted, dismissed, edited]
 
+concurrency:
+  group: ${{ github.repository }}-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   tier-check:
     runs-on: ubuntu-latest
