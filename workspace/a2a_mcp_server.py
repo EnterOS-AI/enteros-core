@@ -35,12 +35,14 @@ from a2a_tools import (
     tool_commit_memory,
     tool_delegate_task,
     tool_delegate_task_async,
+    tool_get_runtime_identity,
     tool_get_workspace_info,
     tool_inbox_peek,
     tool_inbox_pop,
     tool_list_peers,
     tool_recall_memory,
     tool_send_message_to_user,
+    tool_update_agent_card,
     tool_wait_for_message,
 )
 from platform_tools.registry import TOOLS as _PLATFORM_TOOL_SPECS
@@ -130,6 +132,10 @@ async def handle_tool_call(name: str, arguments: dict) -> str:
         return await tool_get_workspace_info(
             source_workspace_id=arguments.get("source_workspace_id") or None,
         )
+    elif name == "get_runtime_identity":
+        return await tool_get_runtime_identity()
+    elif name == "update_agent_card":
+        return await tool_update_agent_card(arguments.get("card"))
     elif name == "commit_memory":
         return await tool_commit_memory(
             arguments.get("content", ""),

@@ -57,12 +57,14 @@ from a2a_tools import (
     tool_commit_memory,
     tool_delegate_task,
     tool_delegate_task_async,
+    tool_get_runtime_identity,
     tool_get_workspace_info,
     tool_inbox_peek,
     tool_inbox_pop,
     tool_list_peers,
     tool_recall_memory,
     tool_send_message_to_user,
+    tool_update_agent_card,
     tool_wait_for_message,
 )
 
@@ -286,6 +288,61 @@ _GET_WORKSPACE_INFO = ToolSpec(
         },
     },
     impl=tool_get_workspace_info,
+    section=A2A_SECTION,
+)
+
+_GET_RUNTIME_IDENTITY = ToolSpec(
+    name="get_runtime_identity",
+    short=(
+        "Return this runtime's identity — model, model_provider, tier, "
+        "workspace_id, runtime template. Reads from process env; no HTTP call."
+    ),
+    when_to_use=(
+        "Use this to answer 'what model am I?' truthfully instead of "
+        "guessing from a stale system prompt — the operator may have "
+        "routed you to a different model via persona env between boots. "
+        "Always permitted by RBAC: even read-only agents may know what "
+        "model they are. Distinct from get_workspace_info — that one "
+        "calls the platform for ID/role/tier/parent (workspace metadata); "
+        "this one returns the live process env (MODEL, MODEL_PROVIDER, "
+        "MOLECULE_MODEL, ANTHROPIC_BASE_URL, TIER, WORKSPACE_ID, "
+        "ADAPTER_MODULE)."
+    ),
+    input_schema={"type": "object", "properties": {}},
+    impl=tool_get_runtime_identity,
+    section=A2A_SECTION,
+)
+
+_UPDATE_AGENT_CARD = ToolSpec(
+    name="update_agent_card",
+    short=(
+        "Replace this workspace's agent_card on the platform. The "
+        "platform validates required fields and broadcasts an "
+        "agent_card_updated event so the canvas reflects the change live."
+    ),
+    when_to_use=(
+        "Use when the workspace's capabilities, skills, description, or "
+        "name change and the canvas display needs to follow. The "
+        "platform stores the new card and pushes an "
+        "``agent_card_updated`` event to subscribers. Gated behind the "
+        "``memory.write`` RBAC capability — read-only roles cannot "
+        "rewrite the card. Tier-1+ owners always have this capability."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "card": {
+                "type": "object",
+                "description": (
+                    "The new agent_card object (name, version, "
+                    "description, skills, etc). Server-side validation "
+                    "rejects payloads missing required fields."
+                ),
+            },
+        },
+        "required": ["card"],
+    },
+    impl=tool_update_agent_card,
     section=A2A_SECTION,
 )
 
@@ -642,6 +699,8 @@ TOOLS: list[ToolSpec] = [
     _CHECK_TASK_STATUS,
     _LIST_PEERS,
     _GET_WORKSPACE_INFO,
+    _GET_RUNTIME_IDENTITY,
+    _UPDATE_AGENT_CARD,
     _BROADCAST_MESSAGE,
     _SEND_MESSAGE_TO_USER,
     # Inbox (standalone-only; in-container returns informational error)
