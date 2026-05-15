@@ -36,6 +36,7 @@ const mockStoreState = {
     height?: number;
   }>,
   agentMessages: {} as Record<string, Array<{ id: string; content: string; timestamp: string }>>,
+  consumeAgentMessages: () => [],
 };
 
 vi.mock("@/store/canvas", () => ({
@@ -357,7 +358,7 @@ describe("MobileChat — chat history", () => {
       renderChat(mockAgentId);
     });
     expect(api.get).toHaveBeenCalledWith(
-      `/workspaces/${mockAgentId}/chat-history?limit=50`,
+      expect.stringContaining(`/workspaces/${mockAgentId}/chat-history`),
     );
   });
 

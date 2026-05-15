@@ -214,6 +214,7 @@ export function MobileDetail({
         <button
           type="button"
           onClick={onChat}
+          data-testid="mobile-chat-cta"
           style={{
             width: "100%",
             height: 52,
