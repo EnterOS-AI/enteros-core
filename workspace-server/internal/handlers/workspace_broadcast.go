@@ -3,7 +3,7 @@ package handlers
 // workspace_broadcast.go — POST /workspaces/:id/broadcast
 //
 // Allows a workspace with broadcast_enabled=true to send a message to every
-// non-removed agent workspace in the org.  The message is:
+// non-removed agent workspace in the SAME ORG.  The message is:
 //
 //   • Persisted in each recipient's activity_logs (type='broadcast_receive')
 //     so poll-mode agents pick it up via GET /activity.
@@ -16,6 +16,11 @@ package handlers
 // Auth: WorkspaceAuth (the agent triggers this with its own bearer token).
 // The handler re-validates broadcast_enabled inside the DB lookup to prevent
 // TOCTOU — the middleware only proved the token is valid, not the ability.
+//
+// Org isolation (OFFSEC-015): recipients are scoped to the sender's org using
+// a recursive CTE that walks the parent_id chain to find the org root. This
+// prevents a compromised or misconfigured workspace from broadcasting to
+// workspaces in other tenants' orgs.
 
 import (
 	"log"
@@ -74,11 +79,49 @@ func (h *BroadcastHandler) Broadcast(c *gin.Context) {
 		return
 	}
 
-	// Collect all non-removed agent workspaces (excludes the sender itself).
-	rows, err := db.DB.QueryContext(ctx,
-		`SELECT id FROM workspaces WHERE status != 'removed' AND id != $1`,
-		senderID,
-	)
+	// Find the sender's org root by walking the parent_id chain.
+	// Workspaces with parent_id = NULL are org roots; every other workspace
+	// belongs to the org identified by its topmost ancestor.
+	var orgRootID string
+	err = db.DB.QueryRowContext(ctx, `
+		WITH RECURSIVE org_chain AS (
+			SELECT id, parent_id, id AS root_id
+			FROM workspaces
+			WHERE id = $1
+			UNION ALL
+			SELECT w.id, w.parent_id, c.root_id
+			FROM workspaces w
+			JOIN org_chain c ON w.id = c.parent_id
+		)
+		SELECT root_id FROM org_chain WHERE parent_id IS NULL LIMIT 1
+	`, senderID).Scan(&orgRootID)
+	if err != nil {
+		log.Printf("Broadcast: org root lookup for %s: %v", senderID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+		return
+	}
+
+	// Collect all non-removed agent workspaces in the SAME ORG (same root_id),
+	// excluding the sender itself.
+	rows, err := db.DB.QueryContext(ctx, `
+		WITH RECURSIVE org_chain AS (
+			SELECT id, parent_id, id AS root_id
+			FROM workspaces
+			WHERE parent_id IS NULL
+			UNION ALL
+			SELECT w.id, w.parent_id, c.root_id
+			FROM workspaces w
+			JOIN org_chain c ON w.parent_id = c.id
+		)
+		SELECT c.id
+		FROM org_chain c
+		WHERE c.root_id = $1
+		  AND c.id != $2
+		  AND EXISTS (
+			  SELECT 1 FROM workspaces w
+			  WHERE w.id = c.id AND w.status != 'removed'
+		  )
+	`, orgRootID, senderID)
 	if err != nil {
 		log.Printf("Broadcast: recipient query failed for %s: %v", senderID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
