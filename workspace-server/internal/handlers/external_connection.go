@@ -646,8 +646,12 @@ const externalOpenClawTemplate = `# OpenClaw MCP config — outbound tool path. 
 # external machine today, pair with the Python SDK tab.
 
 # 1. Install openclaw CLI + the workspace runtime wheel:
+#    The version pin (>=0.1.999) ensures the "molecule-mcp" console
+#    script is present — it is what keeps the workspace ALIVE on canvas
+#    (register-on-startup + 20s heartbeat). Older versions only ship
+#    a2a_mcp_server which does not heartbeat.
 npm install -g openclaw@latest
-pip install molecule-ai-workspace-runtime
+pip install "molecule-ai-workspace-runtime>=0.1.999"
 
 # 2. Onboard openclaw against your model provider (one-time setup).
 #    --non-interactive needs an explicit --provider + --model so it
