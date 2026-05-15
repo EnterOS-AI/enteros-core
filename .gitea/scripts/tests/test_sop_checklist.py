@@ -135,9 +135,9 @@ class TestParseDirectives(unittest.TestCase):
         self.aliases = _numeric_aliases()
 
     def parse_ack_revoke(self, body):
-        directives, na_directives = sop.parse_directives(body, self.aliases)
-        self.assertEqual(na_directives, [])
-        return directives
+        # parse_directives returns a combined list of (kind, slug, note) tuples.
+        # Return it directly; the old two-list interface no longer applies.
+        return sop.parse_directives(body, self.aliases)
 
     def test_simple_ack(self):
         d = self.parse_ack_revoke("/sop-ack comprehensive-testing")
@@ -201,8 +201,8 @@ class TestParseDirectives(unittest.TestCase):
         self.assertEqual(len(d), 1)
 
     def test_empty_body(self):
-        self.assertEqual(sop.parse_directives("", self.aliases), ([], []))
-        self.assertEqual(sop.parse_directives(None, self.aliases), ([], []))
+        self.assertEqual(sop.parse_directives("", self.aliases), [])
+        self.assertEqual(sop.parse_directives(None, self.aliases), [])
 
     def test_normalization_applied(self):
         # /sop-ack Comprehensive_Testing → canonical comprehensive-testing
