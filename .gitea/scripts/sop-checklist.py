@@ -68,7 +68,7 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any
+from typing import Any, Callable
 
 
 # ---------------------------------------------------------------------------
@@ -110,7 +110,7 @@ def normalize_slug(raw: str, numeric_aliases: dict[int, str] | None = None) -> s
 # for /sop-revoke (RFC#351 open question 4 — reason is captured but not
 # yet validated; future iteration may require a min-length).
 _DIRECTIVE_RE = re.compile(
-    r"^[ \t]*/(sop-ack|sop-revoke)[ \t]+([A-Za-z0-9_\- ]+?)(?:[ \t]+(.*))?[ \t]*$",
+    r"^[ \t]*/(sop-ack|sop-revoke|sop-n/a)[ \t]+([A-Za-z0-9_\- ]+?)(?:[ \t]+(.*))?[ \t]*$",
     re.MULTILINE,
 )
 
@@ -118,19 +118,21 @@ _DIRECTIVE_RE = re.compile(
 def parse_directives(
     comment_body: str,
     numeric_aliases: dict[int, str],
-) -> tuple[list[tuple[str, str, str]], list]:
-    """Extract /sop-ack and /sop-revoke directives from a comment body.
+) -> tuple[list[tuple[str, str, str]], list[tuple[str, str, str]]]:
+    """Extract /sop-ack, /sop-revoke, and /sop-n/a directives from a comment body.
 
-    Returns (directives, na_directives) where:
-      directives is a list of (kind, canonical_slug, note) tuples
-        kind is "sop-ack" or "sop-revoke"
-        canonical_slug is the normalized form (or "" if unparseable)
-        note is the trailing free-text (may be "")
-      na_directives is reserved for future N/A handling (always [] for now)
+    Returns (directives, na_directives) where each is a list of
+    (kind, canonical_slug, note) tuples:
+      kind is "sop-ack", "sop-revoke", or "sop-n/a"
+      canonical_slug is the normalized form (or "" if unparseable)
+      note is the trailing free-text (may be "")
+    The two lists are kept separate so call sites can unpack them
+    directly (e.g. directives, na_directives = parse_directives(...)).
     """
-    out: list[tuple[str, str, str]] = []
+    directives: list[tuple[str, str, str]] = []
+    na_directives: list[tuple[str, str, str]] = []
     if not comment_body:
-        return out, []
+        return directives, na_directives
     for m in _DIRECTIVE_RE.finditer(comment_body):
         kind = m.group(1)
         raw_slug = (m.group(2) or "").strip()
@@ -160,8 +162,12 @@ def parse_directives(
         note_from_group = (m.group(3) or "").strip()
         # If we collapsed multi-word slug into kebab and there's a
         # trailing-text group too, append it.
-        out.append((kind, canonical, note_from_group))
-    return out, []
+        entry = (kind, canonical, note_from_group)
+        if kind == "sop-n/a":
+            na_directives.append(entry)
+        else:
+            directives.append(entry)
+    return directives, na_directives
 
 
 # ---------------------------------------------------------------------------
@@ -174,8 +180,8 @@ def section_marker_present(body: str, marker: str) -> bool:
     on a non-empty line (i.e. the author actually filled it in).
 
     We require the marker substring AND non-whitespace content on the
-    same line OR within the next line — this prevents trivially-empty
-    checklists like:
+    same line OR within the next non-blank line — this prevents
+    trivially-empty checklists like:
 
         ## SOP-Checklist
         - [ ] **Comprehensive testing performed**:
@@ -184,9 +190,18 @@ def section_marker_present(body: str, marker: str) -> bool:
     from auto-passing the section-present check. The peer-ack is still
     required, but answering with empty content is captured as a soft
     finding via the section-present test alone.
+
+    NOTE: we scan forward through blank lines (the markdown-header pattern
+    is ## Header\\n\\ncontent) so that a header + blank-line + content
+    structure still satisfies the check. The backward checkbox fallback
+    catches inline markers without a preceding checkbox (mc#1099).
     """
     if not body or not marker:
         return False
+    # Strip trailing whitespace so the blank-line scan below can find
+    # content that appears on the very last line of the body (without
+    # being misled by a trailing \n or spaces).
+    body = body.rstrip()
     body_lower = body.lower()
     marker_lower = marker.lower()
     idx = body_lower.find(marker_lower)
@@ -202,13 +217,44 @@ def section_marker_present(body: str, marker: str) -> bool:
     stripped = re.sub(r"[\s\*:\-\[\]]+", "", line)
     if stripped:
         return True
-    # Fall through: check the NEXT line (multi-line answers).
-    next_line_end = body.find("\n", line_end + 1)
-    if next_line_end < 0:
-        next_line_end = len(body)
-    next_line = body[line_end + 1:next_line_end]
-    stripped_next = re.sub(r"[\s\*:\-\[\]]+", "", next_line)
-    return bool(stripped_next)
+    # Fall through: scan forward, skipping blank-only lines, until we find
+    # non-empty content or run out of body.  Handles:
+    #   ## Header          ← marker line (empty after marker)
+    #                      ← blank line (skipped)
+    #   - actual content   ← found
+    pos = line_end
+    while True:
+        # Skip the current newline and any additional newlines (blank lines).
+        while pos < len(body) and body[pos] == "\n":
+            pos += 1
+        if pos >= len(body):
+            break
+        line_end = body.find("\n", pos)
+        if line_end < 0:
+            line_end = len(body)
+        line = body[pos:line_end]
+        stripped = re.sub(r"[\s\*:\-\[\]]+", "", line)
+        if stripped:
+            return True
+        pos = line_end
+    # Last resort: the marker may appear mid-sentence (e.g.
+    # **Memory/saved-feedback consulted**: No applicable...).
+    # Search backward within the CURRENT LINE only (not preceding lines)
+    # to find a checkbox on the same line before the marker text.
+    # mc#1099 follow-up: memory-consulted detection was failing because
+    # the checkbox was on the same line before the inline marker.
+    _CHECKBOX_RE = re.compile(r"- \[[ x\]]|<input", re.IGNORECASE)
+    line_start = body.rfind("\n", 0, idx) + 1  # 0 if no newline before idx
+    before = body[line_start:idx]
+    m = _CHECKBOX_RE.search(before)
+    if not m:
+        return False
+    # Require meaningful content between the checkbox and the marker text
+    # (markdown formatting like ** or * must also be stripped).
+    # If only whitespace/markdown chars remain, the checkbox line is empty.
+    between = before[m.end() :]
+    stripped_between = re.sub(r"[\s\*:#\[\]_\-]+", "", between)
+    return bool(stripped_between)
 
 
 # ---------------------------------------------------------------------------
@@ -251,8 +297,7 @@ def compute_ack_state(
         user = (c.get("user") or {}).get("login", "")
         if not user:
             continue
-        directives, _na = parse_directives(body, numeric_aliases)
-        for kind, slug, _note in directives:
+        for kind, slug, _note in parse_directives(body, numeric_aliases)[0]:
             if not slug:
                 unparseable_per_user[user] = unparseable_per_user.get(user, 0) + 1
                 continue
@@ -302,6 +347,63 @@ def compute_ack_state(
         }
         for slug in items_by_slug
     }
+
+
+# ---------------------------------------------------------------------------
+# N/A-gate evaluation
+# ---------------------------------------------------------------------------
+
+
+def compute_na_state(
+    comments: list[dict[str, Any]],
+    author: str,
+    na_gates: dict[str, Any],
+    probe: Callable[[str, list[str]], list[str]],
+) -> dict[str, dict[str, Any]]:
+    """Evaluate which N/A gates have a valid declaration from a team member.
+
+    Returns dict[gate_name, dict] where each dict has:
+      declared: bool — at least one valid non-author team-member declared N/A
+      decl_ackers: list[str] — usernames who declared this gate N/A
+      rejected: dict with keys:
+        not_in_team: list[str] — users who tried but aren't in required teams
+    """
+    # Build per-user latest N/A directive (most-recent wins per RFC#324).
+    latest_na: dict[str, tuple[str, str]] = {}  # user → (gate, note)
+    for c in comments:
+        body = c.get("body", "") or ""
+        user = (c.get("user") or {}).get("login", "")
+        if not user:
+            continue
+        for kind, gate, note in parse_directives(body, {})[1]:
+            # [1] = na_directives only
+            if gate in na_gates:
+                latest_na[user] = (gate, note)
+
+    result: dict[str, dict[str, Any]] = {}
+    for gate, gate_cfg in na_gates.items():
+        result[gate] = {
+            "declared": False,
+            "decl_ackers": [],
+            "rejected": {"not_in_team": []},
+        }
+        decl_ackers: list[str] = []
+        not_in_team: list[str] = []
+        for user, (g, _note) in latest_na.items():
+            if g != gate:
+                continue
+            if user == author:
+                continue  # authors cannot self-declare N/A
+            approved = probe(gate, [user])
+            if approved:
+                decl_ackers.append(user)
+            else:
+                not_in_team.append(user)
+        result[gate]["declared"] = bool(decl_ackers)
+        result[gate]["decl_ackers"] = decl_ackers
+        result[gate]["rejected"]["not_in_team"] = not_in_team
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -698,6 +800,7 @@ def main(argv: list[str] | None = None) -> int:
     cfg = load_config(args.config)
     items: list[dict[str, Any]] = cfg["items"]
     items_by_slug = {it["slug"]: it for it in items}
+    na_gates: dict[str, Any] = cfg.get("n/a_gates", {})
     numeric_aliases = {
         int(it["numeric_alias"]): it["slug"] for it in items if it.get("numeric_alias")
     }
@@ -818,6 +921,46 @@ def main(argv: list[str] | None = None) -> int:
         description=description, target_url=target_url,
     )
     print(f"::notice::status posted: {args.status_context} → {state}")
+
+    # --- N/A gate status (RFC#324 §N/A follow-up) ---
+    # Post a separate status so review-check.sh can discover N/A declarations
+    # and waive the Gitea-approve requirement for that gate.
+    na_state: dict[str, dict[str, Any]] = {}
+    if na_gates:
+        na_state = compute_na_state(comments, author, na_gates, probe)
+
+        na_descs: list[str] = []
+        for gate, s in na_state.items():
+            if s["declared"]:
+                na_descs.append(gate)
+            decl = s["decl_ackers"]
+            rej = s["rejected"]["not_in_team"]
+            if decl:
+                print(f"::notice::  [N/A OK] {gate} — declared by {','.join(decl)}")
+            if rej:
+                print(
+                    f"::notice::  [N/A REJ] {gate} — not-in-team: {','.join(rej)}",
+                    file=sys.stderr,
+                )
+
+        na_desc = ", ".join(sorted(na_descs)) if na_descs else "(none)"
+        na_status_state = "success" if na_descs else "pending"
+        # review-check.sh reads the description to discover which gates are N/A.
+        # Include the gate names so it can grep for them.
+        na_description = f"N/A: {na_desc}" if na_descs else "N/A: (none)"
+
+        if not args.dry_run:
+            client.post_status(
+                args.owner, args.repo, head_sha,
+                state=na_status_state,
+                context="sop-checklist / na-declarations (pull_request)",
+                description=na_description,
+                target_url=target_url,
+            )
+            print(
+                f"::notice::na-declarations status → {na_status_state}: {na_description}"
+            )
+
     # By default exit 0 — the POSTed status IS the gate, NOT the job
     # conclusion. If the job exits 1 BP will see TWO failure signals
     # (one from the job's auto-status, one from our POST), making the
