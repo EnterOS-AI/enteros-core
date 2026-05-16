@@ -158,8 +158,68 @@ jobs:
             echo "NOTE: No warning in output (may be suppressed by log level)"
           fi
 
+      - name: Reproduce openclaw failure — pipe held OPEN, no EOF
+        run: |
+          set -euo pipefail
+          echo "=== keep-stdin-open pipe (the real openclaw / Claude Code case) ==="
+          echo ""
+          echo "Before the readline() fix this HANGS: main() did"
+          echo "  stdin.read(65536)  -> on a pipe, blocks until 64KB OR EOF."
+          echo "An MCP client sends one ~150B initialize and keeps stdin"
+          echo "open waiting for the response, so the server never parsed"
+          echo "the request and the client timed out (openclaw: 'MCP error"
+          echo "-32000: Connection closed'). The earlier regular-file /"
+          echo "heredoc-pipe steps PASSED through this bug because a file"
+          echo "(or a closing heredoc) yields EOF immediately."
+          echo ""
+
+          # Drive the server through a real pipe that stays OPEN: write
+          # one initialize, do NOT close stdin, and require a response
+          # within a hard timeout. read(65536) -> no output -> timeout
+          # kills it -> FAIL. readline() -> immediate response -> PASS.
+          python - <<'PYEOF'
+          import json, subprocess, sys, time, select
+
+          proc = subprocess.Popen(
+              [sys.executable, "a2a_mcp_server.py"],
+              stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+              stderr=subprocess.STDOUT,
+              env={**__import__("os").environ},
+          )
+          req = json.dumps({
+              "jsonrpc": "2.0", "id": 1, "method": "initialize",
+              "params": {"protocolVersion": "2024-11-05",
+                         "capabilities": {},
+                         "clientInfo": {"name": "keepopen", "version": "1"}},
+          }) + "\n"
+          proc.stdin.write(req.encode())
+          proc.stdin.flush()
+          # Deliberately DO NOT close proc.stdin — mirror a live MCP client.
+
+          deadline = time.time() + 15
+          line = b""
+          while time.time() < deadline:
+              r, _, _ = select.select([proc.stdout], [], [], 1)
+              if r:
+                  line = proc.stdout.readline()
+                  if line:
+                      break
+          proc.kill()
+
+          if not line:
+              print("FAIL: no response within 15s on an open pipe — "
+                    "stdin.read(65536) regression is back")
+              sys.exit(1)
+          resp = json.loads(line.decode())
+          assert resp.get("id") == 1 and "result" in resp, \
+              f"unexpected response: {line[:200]!r}"
+          assert resp["result"]["serverInfo"]["name"] == "molecule", \
+              f"wrong serverInfo: {line[:200]!r}"
+          print("PASS: server answered initialize on a still-open pipe")
+          PYEOF
+
       - name: Run unit tests for stdio transport
         run: |
           set -euo pipefail
           echo "=== Running stdio transport unit tests ==="
-          python -m pytest tests/test_a2a_mcp_server.py::TestStdioPipeAssertion -v --no-cov
+          python -m pytest tests/test_a2a_mcp_server.py::TestStdioPipeAssertion tests/test_a2a_mcp_server.py::TestStdioKeepOpenPipe -v --no-cov

@@ -2097,3 +2097,124 @@ def test_peer_metadata_set_replaces_existing_entry_in_place(_reset_peer_metadata
     )
     cached = a2a_client._peer_metadata[peer]
     assert cached[1]["name"] == "v2", "re-write must update the value in place"
+
+
+class TestStdioKeepOpenPipe:
+    """Regression for the openclaw peer-visibility outage (2026-05-15).
+
+    main()'s read loop used `await loop.run_in_executor(None,
+    stdin.read, 65536)`. On a PIPE, `read(n)` blocks until n bytes
+    accumulate OR EOF. A real MCP client (openclaw bundle-mcp, Claude
+    Code, Cursor) sends ONE ~150-byte newline-delimited request and
+    keeps stdin OPEN waiting for the reply — so neither condition is
+    met, the server never parses `initialize`, and the client times
+    out (~30s; openclaw surfaced "MCP error -32000: Connection
+    closed"). Every prior stdio test fed stdin from a regular file or
+    a heredoc-pipe that CLOSES (EOF), masking the bug.
+
+    These spawn the real a2a_mcp_server.py process, write one request
+    over a pipe, and DELIBERATELY keep stdin open. With the buggy
+    read(65536) the assertion times out and fails; with readline() it
+    passes promptly. This is the literal user-facing path, not a
+    mock — see feedback_smoke_test_vendor_truth_not_shape_match.
+    """
+
+    def _spawn(self):
+        import subprocess
+        env = dict(os.environ)
+        env.setdefault("WORKSPACE_ID", "00000000-0000-0000-0000-000000000001")
+        server = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "a2a_mcp_server.py",
+        )
+        return subprocess.Popen(
+            ["python3", server],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=env,
+        )
+
+    def _read_line_with_deadline(self, proc, deadline_s=15):
+        import select
+        import time
+        end = time.time() + deadline_s
+        while time.time() < end:
+            r, _, _ = select.select([proc.stdout], [], [], 1)
+            if r:
+                line = proc.stdout.readline()
+                if line:
+                    return line
+        return b""
+
+    def test_initialize_answered_on_still_open_pipe(self):
+        """One initialize, stdin kept OPEN, response required <15s.
+
+        FAILS (times out -> empty line) on stdin.read(65536).
+        PASSES on stdin.readline().
+        """
+        proc = self._spawn()
+        try:
+            req = json.dumps({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": {"name": "keepopen", "version": "1"},
+                },
+            }) + "\n"
+            proc.stdin.write(req.encode())
+            proc.stdin.flush()
+            # NOTE: stdin is intentionally NOT closed — mirrors a live
+            # MCP client. Closing it here would yield EOF and let the
+            # buggy read(65536) return, hiding the regression.
+
+            line = self._read_line_with_deadline(proc, 15)
+        finally:
+            proc.kill()
+            proc.wait(timeout=5)
+
+        assert line, (
+            "no response within 15s on a still-open pipe — the "
+            "stdin.read(65536) pipe-blocking regression is back "
+            "(this is the exact openclaw peer-visibility outage)"
+        )
+        resp = json.loads(line.decode())
+        assert resp.get("id") == 1, f"unexpected id: {line[:200]!r}"
+        assert "result" in resp, f"no result envelope: {line[:200]!r}"
+        assert resp["result"]["serverInfo"]["name"] == "molecule", (
+            f"wrong serverInfo: {line[:200]!r}"
+        )
+
+    def test_two_sequential_requests_on_open_pipe(self):
+        """initialize THEN tools/list on the same open pipe — proves
+        the loop keeps reading line-by-line, not just the first 64KB
+        chunk. tools/list must include list_peers (the peer-visibility
+        tool the outage was about)."""
+        proc = self._spawn()
+        try:
+            proc.stdin.write((json.dumps({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": "2024-11-05",
+                           "capabilities": {},
+                           "clientInfo": {"name": "x", "version": "1"}},
+            }) + "\n").encode())
+            proc.stdin.flush()
+            init = self._read_line_with_deadline(proc, 15)
+            assert init, "initialize unanswered on open pipe"
+
+            proc.stdin.write((json.dumps({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/list",
+            }) + "\n").encode())
+            proc.stdin.flush()
+            tl = self._read_line_with_deadline(proc, 15)
+        finally:
+            proc.kill()
+            proc.wait(timeout=5)
+
+        assert tl, "tools/list unanswered — loop stopped after one read"
+        resp = json.loads(tl.decode())
+        names = {t["name"] for t in resp["result"]["tools"]}
+        assert "list_peers" in names, (
+            f"list_peers missing from tools/list: {sorted(names)}"
+        )
