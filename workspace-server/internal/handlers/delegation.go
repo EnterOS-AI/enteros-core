@@ -805,13 +805,17 @@ func (h *DelegationHandler) ListDelegations(c *gin.Context) {
 
 // listDelegationsFromLedger queries the durable delegations table.
 // Returns nil on error so the caller can fall back to activity_logs.
+// Includes both outgoing (caller) and incoming (callee) delegations so
+// the canvas shows the full delegation history regardless of which side
+// the workspace played. A "direction" field distinguishes sent vs. received.
 func (h *DelegationHandler) listDelegationsFromLedger(ctx context.Context, workspaceID string) []map[string]interface{} {
 	rows, err := db.DB.QueryContext(ctx, `
 		SELECT d.delegation_id, d.caller_id, d.callee_id, d.task_preview,
 		       d.status, d.result_preview, d.error_detail, d.last_heartbeat,
-		       d.deadline, d.created_at, d.updated_at
+		       d.deadline, d.created_at, d.updated_at,
+		       CASE WHEN d.caller_id = $1 THEN 'sent' ELSE 'received' END AS direction
 		FROM delegations d
-		WHERE d.caller_id = $1
+		WHERE d.caller_id = $1 OR d.callee_id = $1
 		ORDER BY d.created_at DESC
 		LIMIT 50
 	`, workspaceID)
@@ -824,13 +828,13 @@ func (h *DelegationHandler) listDelegationsFromLedger(ctx context.Context, works
 
 	var result []map[string]interface{}
 	for rows.Next() {
-		var delegationID, callerID, calleeID, taskPreview, status string
+		var delegationID, callerID, calleeID, taskPreview, status, direction string
 		var resultPreview, errorDetail sql.NullString
 		var lastHeartbeat, deadline, createdAt, updatedAt *time.Time
 		if err := rows.Scan(
 			&delegationID, &callerID, &calleeID, &taskPreview,
 			&status, &resultPreview, &errorDetail, &lastHeartbeat,
-			&deadline, &createdAt, &updatedAt,
+			&deadline, &createdAt, &updatedAt, &direction,
 		); err != nil {
 			continue
 		}
@@ -838,6 +842,7 @@ func (h *DelegationHandler) listDelegationsFromLedger(ctx context.Context, works
 			"delegation_id": delegationID,
 			"source_id":     callerID,
 			"target_id":     calleeID,
+			"direction":     direction,
 			"summary":       textutil.TruncateBytes(taskPreview, 200),
 			"status":        status,
 			"created_at":    createdAt,
@@ -878,9 +883,9 @@ func (h *DelegationHandler) listDelegationsFromActivityLogs(ctx context.Context,
 		       COALESCE(summary, ''), COALESCE(status, ''), COALESCE(error_detail, ''),
 		       COALESCE(response_body->>'text', response_body::text, ''),
 		       COALESCE(request_body->>'delegation_id', response_body->>'delegation_id', ''),
-		       created_at
+		       created_at, workspace_id
 		FROM activity_logs
-		WHERE workspace_id = $1 AND method IN ('delegate', 'delegate_result')
+		WHERE source_id = $1 AND method IN ('delegate', 'delegate_result')
 		ORDER BY created_at DESC
 		LIMIT 50
 	`, workspaceID)
@@ -891,16 +896,21 @@ func (h *DelegationHandler) listDelegationsFromActivityLogs(ctx context.Context,
 
 	var result []map[string]interface{}
 	for rows.Next() {
-		var id, actType, sourceID, targetID, summary, status, errorDetail, responseBody, delegationID string
+		var id, actType, sourceID, targetID, summary, status, errorDetail, responseBody, delegationID, actWorkspaceID string
 		var createdAt time.Time
-		if err := rows.Scan(&id, &actType, &sourceID, &targetID, &summary, &status, &errorDetail, &responseBody, &delegationID, &createdAt); err != nil {
+		if err := rows.Scan(&id, &actType, &sourceID, &targetID, &summary, &status, &errorDetail, &responseBody, &delegationID, &createdAt, &actWorkspaceID); err != nil {
 			continue
+		}
+		direction := "sent"
+		if actWorkspaceID != sourceID {
+			direction = "received"
 		}
 		entry := map[string]interface{}{
 			"id":         id,
 			"type":       actType,
 			"source_id":  sourceID,
 			"target_id":  targetID,
+			"direction":  direction,
 			"summary":    summary,
 			"status":     status,
 			"created_at": createdAt,

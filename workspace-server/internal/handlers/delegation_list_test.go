@@ -27,7 +27,7 @@ func TestListDelegationsFromLedger_EmptyResult(t *testing.T) {
 	rows := sqlmock.NewRows([]string{
 		"delegation_id", "caller_id", "callee_id", "task_preview",
 		"status", "result_preview", "error_detail",
-		"last_heartbeat", "deadline", "created_at", "updated_at",
+		"last_heartbeat", "deadline", "created_at", "updated_at", "direction",
 	})
 	mock.ExpectQuery("SELECT .+ FROM delegations").
 		WithArgs("ws-1").
@@ -62,11 +62,11 @@ func TestListDelegationsFromLedger_SingleRow(t *testing.T) {
 	rows := sqlmock.NewRows([]string{
 		"delegation_id", "caller_id", "callee_id", "task_preview",
 		"status", "result_preview", "error_detail",
-		"last_heartbeat", "deadline", "created_at", "updated_at",
+		"last_heartbeat", "deadline", "created_at", "updated_at", "direction",
 	}).AddRow(
 		"del-1", "ws-1", "ws-2", "summarise the report",
 		"completed", "the report is about Q1",
-		"", now, now, now, now,
+		"", now, now, now, now, "sent",
 	)
 	mock.ExpectQuery("SELECT .+ FROM delegations").
 		WithArgs("ws-1").
@@ -102,6 +102,9 @@ func TestListDelegationsFromLedger_SingleRow(t *testing.T) {
 	if e["_ledger"] != true {
 		t.Errorf("_ledger marker: got %v, want true", e["_ledger"])
 	}
+	if e["direction"] != "sent" {
+		t.Errorf("direction: got %v, want sent", e["direction"])
+	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("sqlmock expectations: %v", err)
 	}
@@ -120,11 +123,11 @@ func TestListDelegationsFromLedger_MultipleRows(t *testing.T) {
 	rows := sqlmock.NewRows([]string{
 		"delegation_id", "caller_id", "callee_id", "task_preview",
 		"status", "result_preview", "error_detail",
-		"last_heartbeat", "deadline", "created_at", "updated_at",
+		"last_heartbeat", "deadline", "created_at", "updated_at", "direction",
 	}).
-		AddRow("del-a", "ws-1", "ws-2", "task a", "in_progress", "", "", now, now, now, now).
-		AddRow("del-b", "ws-1", "ws-3", "task b", "failed", "", "timeout", now, now, now, now).
-		AddRow("del-c", "ws-1", "ws-4", "task c", "completed", "result c", "", now, now, now, now)
+		AddRow("del-a", "ws-1", "ws-2", "task a", "in_progress", "", "", now, now, now, now, "sent").
+		AddRow("del-b", "ws-1", "ws-3", "task b", "failed", "", "timeout", now, now, now, now, "sent").
+		AddRow("del-c", "ws-1", "ws-4", "task c", "completed", "result c", "", now, now, now, now, "sent")
 	mock.ExpectQuery("SELECT .+ FROM delegations").
 		WithArgs("ws-1").
 		WillReturnRows(rows)
@@ -160,9 +163,9 @@ func TestListDelegationsFromLedger_NullsOmitted(t *testing.T) {
 	rows := sqlmock.NewRows([]string{
 		"delegation_id", "caller_id", "callee_id", "task_preview",
 		"status", "result_preview", "error_detail",
-		"last_heartbeat", "deadline", "created_at", "updated_at",
+		"last_heartbeat", "deadline", "created_at", "updated_at", "direction",
 	}).
-		AddRow("del-1", "ws-1", "ws-2", "task", "queued", nil, nil, nil, nil, now, now)
+		AddRow("del-1", "ws-1", "ws-2", "task", "queued", nil, nil, nil, nil, now, now, "sent")
 	mock.ExpectQuery("SELECT .+ FROM delegations").
 		WithArgs("ws-1").
 		WillReturnRows(rows)
@@ -239,10 +242,10 @@ func TestListDelegationsFromLedger_RowsErr(t *testing.T) {
 	rows := sqlmock.NewRows([]string{
 		"delegation_id", "caller_id", "callee_id", "task_preview",
 		"status", "result_preview", "error_detail",
-		"last_heartbeat", "deadline", "created_at", "updated_at",
+		"last_heartbeat", "deadline", "created_at", "updated_at", "direction",
 	}).
-		AddRow("del-1", "ws-1", "ws-2", "task", "queued", "", "", now, now, now, now).
-		AddRow("del-2", "ws-1", "ws-3", "another task", "queued", "", "", now, now, now, now).
+		AddRow("del-1", "ws-1", "ws-2", "task", "queued", "", "", now, now, now, now, "sent").
+		AddRow("del-2", "ws-1", "ws-3", "another task", "queued", "", "", now, now, now, now, "sent").
 		RowError(1, context.DeadlineExceeded)
 	mock.ExpectQuery("SELECT .+ FROM delegations").
 		WithArgs("ws-1").
@@ -287,7 +290,7 @@ func TestListDelegationsFromActivityLogs_EmptyResult(t *testing.T) {
 	rows := sqlmock.NewRows([]string{
 		"id", "activity_type", "source_id", "target_id",
 		"summary", "status", "error_detail",
-		"response_preview", "delegation_id", "created_at",
+		"response_preview", "delegation_id", "created_at", "workspace_id",
 	})
 	mock.ExpectQuery("SELECT .+ FROM activity_logs").
 		WithArgs("ws-1").
@@ -319,14 +322,14 @@ func TestListDelegationsFromActivityLogs_SingleDelegateRow(t *testing.T) {
 	rows := sqlmock.NewRows([]string{
 		"id", "activity_type", "source_id", "target_id",
 		"summary", "status", "error_detail",
-		"response_preview", "delegation_id", "created_at",
+		"response_preview", "delegation_id", "created_at", "workspace_id",
 	}).AddRow(
 		"act-1", "delegate",
 		"ws-1", "ws-2",
 		"analyse Q1 numbers",
 		"in_progress",
 		"", "", "",
-		now,
+		now, "ws-1",
 	)
 	mock.ExpectQuery("SELECT .+ FROM activity_logs").
 		WithArgs("ws-1").
@@ -359,6 +362,9 @@ func TestListDelegationsFromActivityLogs_SingleDelegateRow(t *testing.T) {
 	if e["status"] != "in_progress" {
 		t.Errorf("status: got %v", e["status"])
 	}
+	if e["direction"] != "sent" {
+		t.Errorf("direction: got %v, want sent", e["direction"])
+	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("sqlmock expectations: %v", err)
 	}
@@ -377,7 +383,7 @@ func TestListDelegationsFromActivityLogs_DelegateResultWithError(t *testing.T) {
 	rows := sqlmock.NewRows([]string{
 		"id", "activity_type", "source_id", "target_id",
 		"summary", "status", "error_detail",
-		"response_preview", "delegation_id", "created_at",
+		"response_preview", "delegation_id", "created_at", "workspace_id",
 	}).AddRow(
 		"act-2", "delegate_result",
 		"ws-1", "ws-2",
@@ -386,7 +392,7 @@ func TestListDelegationsFromActivityLogs_DelegateResultWithError(t *testing.T) {
 		"Callee workspace not reachable",
 		`{"text":"the result body text"}`,
 		"del-abc",
-		now,
+		now, "ws-1",
 	)
 	mock.ExpectQuery("SELECT .+ FROM activity_logs").
 		WithArgs("ws-1").
@@ -463,10 +469,10 @@ func TestListDelegationsFromActivityLogs_RowsErr(t *testing.T) {
 	rows := sqlmock.NewRows([]string{
 		"id", "activity_type", "source_id", "target_id",
 		"summary", "status", "error_detail",
-		"response_preview", "delegation_id", "created_at",
+		"response_preview", "delegation_id", "created_at", "workspace_id",
 	}).
-		AddRow("act-1", "delegate", "ws-1", "ws-2", "task", "queued", "", "", "", now).
-		AddRow("act-2", "delegate", "ws-1", "ws-3", "another task", "queued", "", "", "", now).
+		AddRow("act-1", "delegate", "ws-1", "ws-2", "task", "queued", "", "", "", now, "ws-1").
+		AddRow("act-2", "delegate", "ws-1", "ws-3", "another task", "queued", "", "", "", now, "ws-1").
 		RowError(1, context.DeadlineExceeded)
 	mock.ExpectQuery("SELECT .+ FROM activity_logs").
 		WithArgs("ws-1").
@@ -493,3 +499,115 @@ func TestListDelegationsFromActivityLogs_RowsErr(t *testing.T) {
 // sqlmock.NewRows([]string{}).AddRow(...) to panic in test SETUP. The handler
 // has no recover(), so a scan panic would crash the process — the correct
 // behaviour. Real-DB integration tests cover this path.
+
+// ---------- Direction: received (callee) ----------
+
+func TestListDelegationsFromLedger_CalleeDirection_Received(t *testing.T) {
+	// When the workspace ID appears as callee_id (not caller_id), direction = "received".
+	// The query returns rows where d.caller_id = $1 OR d.callee_id = $1, and the
+	// CASE expression sets direction based on whether caller_id matches.
+	mockDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("failed to create sqlmock: %v", err)
+	}
+	prevDB := db.DB
+	db.DB = mockDB
+	t.Cleanup(func() { db.DB = prevDB; mockDB.Close() })
+
+	now := time.Now()
+	// ws-1 is the callee here (received a delegation from ws-other)
+	rows := sqlmock.NewRows([]string{
+		"delegation_id", "caller_id", "callee_id", "task_preview",
+		"status", "result_preview", "error_detail",
+		"last_heartbeat", "deadline", "created_at", "updated_at", "direction",
+	}).AddRow(
+		"del-received-1", "ws-other", "ws-1", "task from other workspace",
+		"in_progress", "", "",
+		now, now, now, now, "received",
+	)
+	mock.ExpectQuery("SELECT .+ FROM delegations").
+		WithArgs("ws-1").
+		WillReturnRows(rows)
+
+	broadcaster := newTestBroadcaster()
+	wh := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+	dh := NewDelegationHandler(wh, broadcaster)
+
+	got := dh.listDelegationsFromLedger(context.Background(), "ws-1")
+	if len(got) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(got))
+	}
+	e := got[0]
+	if e["delegation_id"] != "del-received-1" {
+		t.Errorf("delegation_id: got %v, want del-received-1", e["delegation_id"])
+	}
+	// source_id is the workspace that initiated the delegation (caller)
+	if e["source_id"] != "ws-other" {
+		t.Errorf("source_id: got %v, want ws-other", e["source_id"])
+	}
+	// target_id is the workspace receiving the delegation (callee)
+	if e["target_id"] != "ws-1" {
+		t.Errorf("target_id: got %v, want ws-1", e["target_id"])
+	}
+	if e["direction"] != "received" {
+		t.Errorf("direction: got %v, want received", e["direction"])
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations: %v", err)
+	}
+}
+
+func TestListDelegationsFromActivityLogs_ReceivedDirection(t *testing.T) {
+	// When workspace_id differs from source_id, direction = "received".
+	// This happens when the workspace received a delegation, not sent one.
+	mockDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("failed to create sqlmock: %v", err)
+	}
+	prevDB := db.DB
+	db.DB = mockDB
+	t.Cleanup(func() { db.DB = prevDB; mockDB.Close() })
+
+	now := time.Now()
+	// ws-1 is receiving a delegation from ws-other (workspace_id != source_id)
+	rows := sqlmock.NewRows([]string{
+		"id", "activity_type", "source_id", "target_id",
+		"summary", "status", "error_detail",
+		"response_preview", "delegation_id", "created_at", "workspace_id",
+	}).AddRow(
+		"act-received-1", "delegate",
+		"ws-other", "ws-1",
+		"Delegating to ws-1",
+		"in_progress",
+		"", "", "",
+		now, "ws-1", // workspace_id = ws-1 (the receiving workspace)
+	)
+	mock.ExpectQuery("SELECT .+ FROM activity_logs").
+		WithArgs("ws-1").
+		WillReturnRows(rows)
+
+	broadcaster := newTestBroadcaster()
+	wh := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+	dh := NewDelegationHandler(wh, broadcaster)
+
+	got := dh.listDelegationsFromActivityLogs(context.Background(), "ws-1")
+	if len(got) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(got))
+	}
+	e := got[0]
+	if e["id"] != "act-received-1" {
+		t.Errorf("id: got %v, want act-received-1", e["id"])
+	}
+	if e["source_id"] != "ws-other" {
+		t.Errorf("source_id: got %v, want ws-other", e["source_id"])
+	}
+	if e["target_id"] != "ws-1" {
+		t.Errorf("target_id: got %v, want ws-1", e["target_id"])
+	}
+	if e["direction"] != "received" {
+		t.Errorf("direction: got %v, want received", e["direction"])
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations: %v", err)
+	}
+}
