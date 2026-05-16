@@ -165,3 +165,43 @@ func TestValidateWorkspaceFields_YAMLCharsAllowedInEmptyName(t *testing.T) {
 		t.Errorf("empty name with valid role: expected nil, got %v", err)
 	}
 }
+
+// ─── validateWorkspaceID ───────────────────────────────────────────────────────
+
+func TestValidateWorkspaceID_ValidUUIDv4(t *testing.T) {
+	if err := validateWorkspaceID("550e8400-e29b-41d4-a716-446655440000"); err != nil {
+		t.Errorf("valid v4 UUID: expected nil, got %v", err)
+	}
+}
+
+func TestValidateWorkspaceID_ValidUUIDv1(t *testing.T) {
+	// UUIDv1 format is also accepted by uuid.Parse.
+	if err := validateWorkspaceID("6ba7b810-9dad-11d1-80b4-00c04fd430c8"); err != nil {
+		t.Errorf("valid v1 UUID: expected nil, got %v", err)
+	}
+}
+
+func TestValidateWorkspaceID_EmptyString(t *testing.T) {
+	if err := validateWorkspaceID(""); err == nil {
+		t.Error("empty string: expected error, got nil")
+	}
+}
+
+func TestValidateWorkspaceID_NotAUuid(t *testing.T) {
+	if err := validateWorkspaceID("not-a-uuid"); err == nil {
+		t.Error("not-a-uuid: expected error, got nil")
+	}
+}
+
+func TestValidateWorkspaceID_WrongLength(t *testing.T) {
+	if err := validateWorkspaceID("550e8400-e29b-41d4-a716"); err == nil {
+		t.Error("short UUID: expected error, got nil")
+	}
+}
+
+func TestValidateWorkspaceID_InvalidCharacters(t *testing.T) {
+	// 'g' is not a valid hex character.
+	if err := validateWorkspaceID("550e8400-e29b-41d4-a716-44665544000g"); err == nil {
+		t.Error("invalid hex char: expected error, got nil")
+	}
+}
