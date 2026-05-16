@@ -30,10 +30,7 @@
     {"name": "openclaw", "repo": "molecule-ai/molecule-ai-workspace-template-openclaw", "ref": "main"},
     {"name": "codex", "repo": "molecule-ai/molecule-ai-workspace-template-codex", "ref": "main"},
     {"name": "langgraph", "repo": "molecule-ai/molecule-ai-workspace-template-langgraph", "ref": "main"},
-    {"name": "crewai", "repo": "molecule-ai/molecule-ai-workspace-template-crewai", "ref": "main"},
-    {"name": "autogen", "repo": "molecule-ai/molecule-ai-workspace-template-autogen", "ref": "main"},
-    {"name": "deepagents", "repo": "molecule-ai/molecule-ai-workspace-template-deepagents", "ref": "main"},
-    {"name": "gemini-cli", "repo": "molecule-ai/molecule-ai-workspace-template-gemini-cli", "ref": "main"}
+    {"name": "autogen", "repo": "molecule-ai/molecule-ai-workspace-template-autogen", "ref": "main"}
   ],
   "org_templates": [
     {"name": "molecule-dev", "repo": "molecule-ai/molecule-ai-org-template-molecule-dev", "ref": "main"},

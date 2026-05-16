@@ -513,7 +513,10 @@ func TestWorkspaceConfig_ResetClaudeSessionFieldPresent(t *testing.T) {
 // we lose the "one bad publish doesn't break every workspace" guarantee.
 func TestSelectImage_PrefersExplicitImage(t *testing.T) {
 	pinned := "ghcr.io/molecule-ai/workspace-template-claude-code@sha256:3d6761a97ed07d7d33cfc19a8fbab81175d9d9179618d493dbc00c5f7ef076a3"
-	got := selectImage(WorkspaceConfig{Runtime: "claude-code", Image: pinned})
+	got, err := selectImage(WorkspaceConfig{Runtime: "claude-code", Image: pinned})
+	if err != nil {
+		t.Fatalf("selectImage with cfg.Image=pinned: unexpected error %v", err)
+	}
 	if got != pinned {
 		t.Errorf("selectImage with cfg.Image=pinned: got %q, want %q", got, pinned)
 	}
@@ -523,28 +526,46 @@ func TestSelectImage_PrefersExplicitImage(t *testing.T) {
 // pin lookup deliberately bypassed via WORKSPACE_IMAGE_LOCAL_OVERRIDE).
 // selectImage must use the legacy runtime→:latest map.
 func TestSelectImage_FallsBackToRuntimeMap(t *testing.T) {
-	got := selectImage(WorkspaceConfig{Runtime: "claude-code", Image: ""})
+	got, err := selectImage(WorkspaceConfig{Runtime: "claude-code", Image: ""})
+	if err != nil {
+		t.Fatalf("selectImage with empty Image: unexpected error %v", err)
+	}
 	want := RuntimeImages["claude-code"]
 	if got != want {
 		t.Errorf("selectImage with empty Image: got %q, want %q", got, want)
 	}
 }
 
-// TestSelectImage_UnknownRuntimeFallsBackToDefault preserves today's
-// behavior — an unrecognized runtime resolves to DefaultImage rather than
-// "" so ContainerCreate gets a usable arg and surfaces a meaningful
-// "No such image" error if the default itself is missing.
-func TestSelectImage_UnknownRuntimeFallsBackToDefault(t *testing.T) {
-	got := selectImage(WorkspaceConfig{Runtime: "no-such-runtime"})
-	if got != DefaultImage {
-		t.Errorf("selectImage with unknown runtime: got %q, want DefaultImage %q", got, DefaultImage)
+// TestSelectImage_NamedUnresolvableRuntimeRejects pins the fail-closed
+// contract (RFC internal#483 / security review 4269 /
+// feedback_platform_must_hardgate_base_contract): a NAMED runtime with no
+// resolvable image must reject with ErrUnresolvableRuntime, NOT silently
+// substitute DefaultImage. Pre-fix this returned langgraph — a user asking
+// for a removed runtime (crewai/deepagents/gemini-cli) silently got a
+// langgraph container. "crewai" is the concrete regression from the
+// security finding.
+func TestSelectImage_NamedUnresolvableRuntimeRejects(t *testing.T) {
+	for _, rt := range []string{"no-such-runtime", "crewai", "deepagents", "gemini-cli"} {
+		got, err := selectImage(WorkspaceConfig{Runtime: rt})
+		if !errors.Is(err, ErrUnresolvableRuntime) {
+			t.Errorf("selectImage(%q): got err %v, want ErrUnresolvableRuntime", rt, err)
+		}
+		if got != "" {
+			t.Errorf("selectImage(%q): got image %q, want \"\" on reject", rt, got)
+		}
+		if err != nil && !strings.Contains(err.Error(), rt) {
+			t.Errorf("selectImage(%q): error must name the offending runtime, got %v", rt, err)
+		}
 	}
 }
 
 // TestSelectImage_EmptyRuntimeFallsBackToDefault: same invariant for the
 // no-runtime-supplied path (legacy callers / older handler code).
 func TestSelectImage_EmptyRuntimeFallsBackToDefault(t *testing.T) {
-	got := selectImage(WorkspaceConfig{})
+	got, err := selectImage(WorkspaceConfig{})
+	if err != nil {
+		t.Fatalf("selectImage with zero cfg: unexpected error %v (empty runtime is a legitimate DefaultImage path)", err)
+	}
 	if got != DefaultImage {
 		t.Errorf("selectImage with zero cfg: got %q, want DefaultImage %q", got, DefaultImage)
 	}
@@ -808,7 +829,7 @@ func TestIsImageNotFoundErr(t *testing.T) {
 		{"nil", nil, false},
 		{"moby no such image", fmtErr(`Error response from daemon: No such image: workspace-template:openclaw`), true},
 		{"no such image lowercase", fmtErr(`error: no such image: foo:bar`), true},
-		{"image not found", fmtErr(`Error: image "workspace-template:crewai" not found`), true},
+		{"image not found", fmtErr(`Error: image "workspace-template:hermes" not found`), true},
 		{"generic not found without image", fmtErr(`container not found`), false},
 		{"unrelated error", fmtErr(`connection refused`), false},
 		{"permission denied", fmtErr(`permission denied`), false},

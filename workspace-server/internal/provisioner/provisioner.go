@@ -35,6 +35,19 @@ import (
 // drift-risk #6.
 var ErrNoBackend = errors.New("provisioner: no backend configured (zero-valued receiver)")
 
+// ErrUnresolvableRuntime is returned by selectImage when a workspace
+// names a runtime that has no resolvable image (not in RuntimeImages and
+// no operator-pinned cfg.Image). RFC internal#483 + security review 4269:
+// previously such a request silently fell through to DefaultImage
+// (langgraph) — a user asking for crewai would get a langgraph container
+// with no signal. The CTO standing directive
+// (feedback_platform_must_hardgate_base_contract) is fail-closed: a
+// named-but-unresolvable runtime must reject with a structured,
+// runtime-naming error so the existing provision-failed notify/log path
+// surfaces it, NOT silently degrade. The genuinely-unspecified (empty)
+// runtime is still a distinct, legitimate path that keeps DefaultImage.
+var ErrUnresolvableRuntime = errors.New("provisioner: requested runtime has no resolvable image")
+
 // RuntimeImages maps runtime names to their Docker image refs.
 // Each standalone template repo publishes its image via the reusable
 // publish-template-image workflow in molecule-ci on every main merge.
@@ -104,20 +117,33 @@ type WorkspaceConfig struct {
 // selectImage resolves the final Docker image ref for a workspace. The handler
 // layer is the source of truth — if it set cfg.Image (the digest-pinned form
 // from runtime_image_pins, #2272), honor that. Otherwise fall back to the
-// runtime→tag lookup in RuntimeImages (legacy `:latest` behavior). When the
-// runtime isn't recognized either, fall back to DefaultImage so Start() still
-// has something to hand Docker — surfacing a "No such image" later is more
-// actionable than a silent "" panic in ContainerCreate.
-func selectImage(cfg WorkspaceConfig) string {
+// runtime→tag lookup in RuntimeImages (legacy `:latest` behavior).
+//
+// Fail-closed contract (RFC internal#483 / security review 4269 /
+// feedback_platform_must_hardgate_base_contract): if the workspace NAMES a
+// runtime that resolves to no image (not in RuntimeImages, no pinned
+// cfg.Image), reject with ErrUnresolvableRuntime instead of silently
+// substituting DefaultImage. Pre-fix, removing crewai/deepagents/gemini-cli
+// from the catalog left those create requests silently provisioning a
+// langgraph container — the user asked for crewai and got langgraph with no
+// signal. The error propagates through Start → markProvisionFailed, which
+// already broadcasts WorkspaceProvisionFailed and records the message.
+//
+// The genuinely-unspecified runtime (empty cfg.Runtime, e.g. an org template
+// that doesn't pin one) is an intended distinct path and still resolves to
+// DefaultImage — only a NAMED-but-unresolvable runtime is rejected.
+func selectImage(cfg WorkspaceConfig) (string, error) {
 	if cfg.Image != "" {
-		return cfg.Image
+		return cfg.Image, nil
 	}
 	if cfg.Runtime != "" {
 		if img, ok := RuntimeImages[cfg.Runtime]; ok {
-			return img
+			return img, nil
 		}
+		return "", fmt.Errorf("%w: runtime %q (known runtimes: %v)",
+			ErrUnresolvableRuntime, cfg.Runtime, knownRuntimes)
 	}
-	return DefaultImage
+	return DefaultImage, nil
 }
 
 // Workspace-access constants for #65. Matches the CHECK constraint on
@@ -336,7 +362,15 @@ func (p *Provisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string, e
 
 	env := buildContainerEnv(cfg)
 
-	image := selectImage(cfg)
+	image, imgErr := selectImage(cfg)
+	if imgErr != nil {
+		// Fail-closed: a named-but-unresolvable runtime must not silently
+		// become DefaultImage (RFC internal#483 / review 4269). The caller's
+		// error path (markProvisionFailed) broadcasts the failure + records
+		// the message so the canvas surfaces it.
+		log.Printf("Provisioner: refusing to start %s: %v", cfg.WorkspaceID, imgErr)
+		return "", imgErr
+	}
 
 	// Local-build mode (issue #63 / Task #194): when MOLECULE_IMAGE_REGISTRY
 	// is unset, the OSS contributor path skips the registry pull entirely

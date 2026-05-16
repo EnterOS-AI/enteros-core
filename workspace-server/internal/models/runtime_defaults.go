@@ -23,8 +23,8 @@ package models
 //   - claude-code: "sonnet" — Anthropic's CLI accepts the short
 //     name and resolves it via the operator's anthropic-oauth or
 //     ANTHROPIC_API_KEY chain.
-//   - everything else (hermes, langgraph, crewai, autogen, deepagents,
-//     codex, openclaw, gemini-cli, external, ""): a fully-qualified
+//   - everything else (hermes, langgraph, autogen, codex, openclaw,
+//     external, ""): a fully-qualified
 //     vendor:model slug that the universal MODEL_PROVIDER chain in
 //     molecule-core PR #247 can route via per-vendor required_env.
 //
