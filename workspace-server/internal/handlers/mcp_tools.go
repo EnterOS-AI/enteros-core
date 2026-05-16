@@ -35,8 +35,8 @@ func insertMCPDelegationRow(ctx context.Context, db *sql.DB, workspaceID, target
 	})
 	_, err := db.ExecContext(ctx, `
 		INSERT INTO activity_logs (workspace_id, activity_type, method, source_id, target_id, summary, request_body, status)
-		VALUES ($1, 'delegation', 'delegate', $2, $3, $4, $5::jsonb, 'pending')
-	`, workspaceID, workspaceID, targetID, "Delegating to "+targetID, string(taskJSON))
+		VALUES ($1, 'delegation', 'delegate', $2, $3, $4, $5::jsonb, $6)
+	`, workspaceID, workspaceID, targetID, "Delegating to "+targetID, string(taskJSON), "pending")
 	return err
 }
 
