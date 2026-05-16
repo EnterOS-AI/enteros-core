@@ -178,12 +178,21 @@ func (p *CPProvisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string,
 	// /admin/liveness and other admin-gated platform endpoints (core#831).
 	// p.adminToken is read from os.Getenv("ADMIN_TOKEN") at provisioner creation;
 	// it is also used for CP→platform HTTP auth but those are separate concerns.
-	env := cfg.EnvVars
-	if p.adminToken != "" {
-		env = make(map[string]string, len(cfg.EnvVars)+1)
-		for k, v := range cfg.EnvVars {
-			env[k] = v
+	//
+	// Forensic #145 hardening: tenant workspaces run on EC2 via this path, so
+	// the SCM-write-token denylist (see buildContainerEnv) is enforced here
+	// too. Always build a filtered copy — never pass cfg.EnvVars through
+	// verbatim — so a latent persona-merged GITEA_TOKEN can't reach the
+	// tenant container regardless of whether ADMIN_TOKEN is set.
+	env := make(map[string]string, len(cfg.EnvVars)+1)
+	for k, v := range cfg.EnvVars {
+		if isSCMWriteTokenKey(k) {
+			log.Printf("CPProvisioner.Start: dropped SCM-write credential %q from tenant workspace env (forensic #145 guard)", k)
+			continue
 		}
+		env[k] = v
+	}
+	if p.adminToken != "" {
 		env["ADMIN_TOKEN"] = p.adminToken
 	}
 	// Collect template files and generated configs, with OFFSEC-010 guards:
@@ -343,6 +352,7 @@ func collectCPConfigFiles(cfg WorkspaceConfig) (map[string]string, error) {
 	}
 	return files, nil
 }
+
 // Stop terminates the workspace's EC2 instance via the control plane.
 //
 // Looks up the actual EC2 instance_id from the workspaces table before
@@ -497,7 +507,9 @@ func (p *CPProvisioner) IsRunning(ctx context.Context, workspaceID string) (bool
 		// Don't leak the body — upstream errors may echo headers.
 		return true, fmt.Errorf("cp provisioner: status: unexpected %d", resp.StatusCode)
 	}
-	var result struct{ State string `json:"state"` }
+	var result struct {
+		State string `json:"state"`
+	}
 	// Cap body read at 64 KiB for parity with Start — a misconfigured
 	// or compromised CP streaming a huge body could otherwise exhaust
 	// memory in this hot path (called reactively per-request from
