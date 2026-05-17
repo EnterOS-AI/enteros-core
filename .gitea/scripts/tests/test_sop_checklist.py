@@ -208,6 +208,22 @@ class TestParseDirectives(unittest.TestCase):
         d = self.parse_ack_revoke("/sop-ack Comprehensive_Testing")
         self.assertEqual(d[0][1], "comprehensive-testing")
 
+    def test_emdash_separator_parsed_correctly(self):
+        # Em-dash (U+2014) between slug and note is common in practice.
+        # /sop-ack Five-Axis — five-axis-review
+        # → slug = five-axis, note = — five-axis-review
+        d = self.parse_ack_revoke("/sop-ack Five-Axis — five-axis-review")
+        self.assertEqual(len(d), 1)
+        self.assertEqual(d[0][1], "five-axis")
+        self.assertIn("five-axis-review", d[0][2])
+
+    def test_emdash_no_note(self):
+        # Em-dash at end of slug: only slug, no note content
+        d = self.parse_ack_revoke("/sop-ack Five-Axis —")
+        self.assertEqual(len(d), 1)
+        self.assertEqual(d[0][1], "five-axis")
+        self.assertEqual(d[0][2], "—")  # em-dash preserved as note
+
 
 # ---------------------------------------------------------------------------
 # section_marker_present
