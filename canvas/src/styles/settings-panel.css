@@ -411,6 +411,12 @@
   color: #f4f4f5;
 }
 
+/* WCAG 2.4.7 — keyboard focus indicator */
+.secrets-tab__add-btn:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: var(--focus-ring-offset);
+}
+
 /* ── Shared UI ─────────────────────────────────────── */
 
 .key-value-field {
@@ -599,6 +605,12 @@
   cursor: pointer;
   margin-left: 8px;
   font-size: 14px;
+}
+
+/* WCAG 2.4.7 — keyboard focus indicator */
+.secrets-tab__clear-search:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: var(--focus-ring-offset);
 }
 
 /* ── Delete confirmation dialog ────────────────────── */
