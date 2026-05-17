@@ -64,7 +64,7 @@ export function FileEditor({
             <button
               onClick={onSave}
               disabled={!isDirty || saving}
-              className="text-[10px] text-accent hover:text-accent disabled:opacity-30"
+              className="text-[10px] text-accent hover:text-accent disabled:opacity-30 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-1"
             >
               {saving ? "Saving..." : "Save"}
             </button>
