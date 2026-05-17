@@ -148,15 +148,38 @@ def latest_statuses_by_context(statuses: list[dict]) -> dict[str, dict]:
     return latest
 
 
+def _is_tier_low_pending_ok(
+    latest_statuses: dict[str, dict],
+    context: str,
+    pr_labels: set[str],
+) -> bool:
+    """Return True if tier:low PR can tolerate sop-checklist pending state.
+
+    Per sop-checklist-config.yaml tier_failure_mode, tier:low uses soft-fail:
+    sop-checklist posts state=pending when acks are satisfied (missing
+    manager/ceo acks are informational only). The queue should accept
+    pending instead of waiting for success.
+    """
+    if "tier:low" not in pr_labels:
+        return False
+    if "sop-checklist" not in context:
+        return False
+    status = latest_statuses.get(context) or {}
+    return status_state(status) == "pending"
+
+
 def required_contexts_green(
     latest_statuses: dict[str, dict],
     contexts: list[str],
+    pr_labels: set[str] | None = None,
 ) -> tuple[bool, list[str]]:
     missing_or_bad: list[str] = []
     for context in contexts:
         status = latest_statuses.get(context)
         state = status_state(status or {})
         if state != "success":
+            if pr_labels and _is_tier_low_pending_ok(latest_statuses, context, pr_labels):
+                continue  # tier:low soft-fail: accept pending sop-checklist
             missing_or_bad.append(f"{context}={state or 'missing'}")
     return not missing_or_bad, missing_or_bad
 
@@ -209,6 +232,7 @@ def evaluate_merge_readiness(
     pr_status: dict,
     required_contexts: list[str],
     pr_has_current_base: bool,
+    pr_labels: set[str] | None = None,
 ) -> MergeDecision:
     # Check push-required contexts explicitly instead of combined state.
     # Combined state can be "failure" due to non-blocking jobs
@@ -228,7 +252,7 @@ def evaluate_merge_readiness(
     # The required_contexts list is the authoritative gate — it includes only
     # the checks that actually block merges.
     latest = latest_statuses_by_context(pr_status.get("statuses") or [])
-    ok, missing_or_bad = required_contexts_green(latest, required_contexts)
+    ok, missing_or_bad = required_contexts_green(latest, required_contexts, pr_labels)
     if not ok:
         return MergeDecision(False, "wait", "required contexts not green: " + ", ".join(missing_or_bad))
     return MergeDecision(True, "merge", "ready")
@@ -253,30 +277,32 @@ def get_combined_status(sha: str) -> dict:
     _, combined = api("GET", f"/repos/{OWNER}/{NAME}/commits/{sha}/status")
     if not isinstance(combined, dict):
         raise ApiError(f"status for {sha} response not object")
-    # Fetch full statuses list; 200 covers >99% of real-world runs.
-    # The list is ordered ascending by id (oldest first) — callers must
-    # iterate in reverse to get the newest entry per context.
-    # Best-effort: large repos (main with 550+ statuses) may time out.
-    # On timeout, fall back to the statuses[] already in the combined
-    # response (usually 30 entries — enough for most PRs, enough for
-    # main's early push-required contexts).
-    #
-    # PR #1428: zero-diff queue fix — added trivial comment to force
-    # pull_request CI trigger (zero-diff PRs skip pull_request workflow).
+    combined_statuses: list[dict] = combined.get("statuses") or []
     try:
-        _, all_statuses = api(
+        _, all_statuses_raw = api(
             "GET",
             f"/repos/{OWNER}/{NAME}/commits/{sha}/statuses",
             query={"limit": "50"},
         )
-        if isinstance(all_statuses, list):
-            combined["statuses"] = all_statuses
+        if isinstance(all_statuses_raw, list):
+            all_statuses: list[dict] = list(all_statuses_raw)
+        else:
+            all_statuses = []
     except (ApiError, urllib.error.URLError, TimeoutError, OSError) as exc:
-        # URLError covers network-level failures (DNS, refused, timeout).
-        # TimeoutError and OSError cover socket-level timeouts.
         sys.stderr.write(f"::warning::could not fetch full statuses list for {sha[:8]}: {exc}\n")
-        # Fall back to the statuses[] already in the combined response.
-        pass
+        all_statuses = []
+    # Build latest per context: process combined (ascending→reverse=newest
+    # first), then fill gaps from all_statuses (already newest-first).
+    latest: dict[str, dict] = {}
+    for status in reversed(sorted(combined_statuses, key=lambda s: s.get("id") or 0)):
+        ctx = status.get("context")
+        if isinstance(ctx, str) and ctx not in latest:
+            latest[ctx] = status
+    for status in all_statuses:
+        ctx = status.get("context")
+        if isinstance(ctx, str) and ctx not in latest:
+            latest[ctx] = status
+    combined["statuses"] = list(latest.values())
     return combined
 
 
@@ -383,11 +409,13 @@ def process_once(*, dry_run: bool = False) -> int:
     commits = get_pull_commits(pr_number)
     current_base = pr_has_current_base(pr, commits, main_sha)
     pr_status = get_combined_status(head_sha)
+    pr_labels = label_names(pr)
     decision = evaluate_merge_readiness(
         main_status=main_status,
         pr_status=pr_status,
         required_contexts=contexts,
         pr_has_current_base=current_base,
+        pr_labels=pr_labels,
     )
 
     print(f"::notice::PR #{pr_number} decision={decision.action}: {decision.reason}")
