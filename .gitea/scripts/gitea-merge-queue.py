@@ -260,6 +260,9 @@ def get_combined_status(sha: str) -> dict:
     # On timeout, fall back to the statuses[] already in the combined
     # response (usually 30 entries — enough for most PRs, enough for
     # main's early push-required contexts).
+    #
+    # PR #1428: zero-diff queue fix — added trivial comment to force
+    # pull_request CI trigger (zero-diff PRs skip pull_request workflow).
     try:
         _, all_statuses = api(
             "GET",
