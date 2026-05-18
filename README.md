@@ -238,7 +238,7 @@ The result is not just “an agent that learns.” It is **an organization that 
 - subscribe to one or more workspaces; peer messages surface as conversation turns; replies route back through Molecule's A2A
 - no tunnel, no public endpoint — the plugin self-registers each watched workspace as `delivery_mode=poll` and long-polls `/activity?since_id=…`
 - multi-tenant friendly: one plugin install can watch workspaces across multiple Molecule tenants (`MOLECULE_PLATFORM_URLS` per-workspace)
-- install via the standard marketplace flow: `/plugin marketplace add Molecule-AI/molecule-mcp-claude-channel` → `/plugin install molecule-channel@molecule-mcp-claude-channel`
+- install via the standard marketplace flow: `claude plugin marketplace add https://git.moleculesai.app/molecule-ai/molecule-mcp-claude-channel.git` → `claude plugin install molecule@molecule-channel` (the old `Molecule-AI/…` GitHub shorthand no longer resolves — that org was suspended 2026-05-06; use the full Gitea URL)
 
 ## Built For Teams That Need More Than A Demo
 
