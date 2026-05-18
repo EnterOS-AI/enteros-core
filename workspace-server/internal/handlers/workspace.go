@@ -198,6 +198,17 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 	// back to its compiled-in Anthropic default and 401s when the user's
 	// key is for a different provider. Non-hermes runtimes are unaffected
 	// (the server still passes model through, they just don't use it).
+	// runtimeExplicitlyRequested is true when the caller expressed intent for
+	// a SPECIFIC runtime — either by passing `runtime` directly, or by naming
+	// a `template` (a template encodes a runtime). When true, we must NOT
+	// silently fall back to langgraph if that intent can't be honored: that
+	// is the molecule-controlplane#188 / #184 contract violation (caller asks
+	// for codex/claude-code, gets a langgraph workspace, 201, no error — a
+	// false success). #188 mandates fail-closed (error+notify) on mismatch,
+	// not an advisory degrade. The legitimate "no template, no runtime →
+	// langgraph default" path (bare {"name":...}) is unaffected.
+	runtimeExplicitlyRequested := payload.Runtime != "" || payload.Template != ""
+	templateRuntimeResolved := payload.Runtime != ""
 	if payload.Template != "" && (payload.Runtime == "" || payload.Model == "") {
 		// #226: payload.Template is attacker-controllable. resolveInsideRoot
 		// rejects absolute paths and any ".." that escapes configsDir so the
@@ -230,6 +241,9 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 			switch {
 			case payload.Runtime == "" && !indented && strings.HasPrefix(stripped, "runtime:") && !strings.HasPrefix(stripped, "runtime_config"):
 				payload.Runtime = strings.TrimSpace(strings.TrimPrefix(stripped, "runtime:"))
+				if payload.Runtime != "" {
+					templateRuntimeResolved = true
+				}
 			case payload.Model == "" && !indented && strings.HasPrefix(stripped, "model:"):
 				// Legacy top-level `model:` — pre-runtime_config templates.
 				payload.Model = strings.Trim(strings.TrimSpace(strings.TrimPrefix(stripped, "model:")), `"'`)
@@ -242,7 +256,27 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 			}
 		}
 	}
+	// Fail-closed (molecule-controlplane#188 / #184): if the caller expressed
+	// intent for a specific runtime (passed `runtime`, or named a `template`)
+	// but we could NOT resolve a concrete runtime from it (template's
+	// config.yaml unreadable, or it has no `runtime:` key), DO NOT silently
+	// substitute langgraph and return 201 — that is the silent contract
+	// violation that produced 5/5 wrong workspaces and a false codex E2E pass.
+	// Return 422 so the caller learns the requested runtime was not honored.
+	// The platform-side CP fix (controlplane#188) is the sibling gate; this
+	// closes the ws-server `Create` boundary the product UI actually hits.
+	if payload.Runtime == "" && runtimeExplicitlyRequested && !templateRuntimeResolved {
+		log.Printf("Create: FAIL-CLOSED (controlplane#188) — template=%q requested but runtime could not be resolved; refusing silent langgraph fallback", payload.Template)
+		c.JSON(http.StatusUnprocessableEntity, gin.H{
+			"error":    "runtime could not be resolved from the requested template; refusing to silently provision langgraph (controlplane#188). Pass an explicit \"runtime\", or use a template whose config.yaml declares one.",
+			"template": payload.Template,
+			"code":     "RUNTIME_UNRESOLVED",
+		})
+		return
+	}
 	if payload.Runtime == "" {
+		// Legitimate default path: no template AND no runtime requested
+		// (bare {"name":...}) — langgraph is the intended default here.
 		payload.Runtime = "langgraph"
 	}
 

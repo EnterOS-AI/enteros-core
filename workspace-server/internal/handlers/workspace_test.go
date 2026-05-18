@@ -718,7 +718,7 @@ func TestWorkspaceList_Empty(t *testing.T) {
 			"parent_id", "active_tasks", "last_error_rate", "last_sample_error",
 			"uptime_seconds", "current_task", "runtime", "workspace_dir", "x", "y", "collapsed",
 			"budget_limit", "monthly_spend",
-		"broadcast_enabled", "talk_to_user_enabled",
+			"broadcast_enabled", "talk_to_user_enabled",
 		}))
 
 	w := httptest.NewRecorder()
@@ -1768,5 +1768,149 @@ runtime_config:
 
 	if w.Code != http.StatusCreated {
 		t.Fatalf("expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// ==================== #188 fail-closed: template/runtime contract ====================
+//
+// molecule-controlplane#188 / #184: if a caller names a `template` (intent
+// for a specific runtime) but the runtime cannot be resolved from it, the
+// server MUST NOT silently provision langgraph and return 201 — that false
+// success produced 5/5 wrong workspaces and a bogus codex E2E pass. These
+// tests pin the fail-closed boundary at the ws-server `Create` handler (the
+// path the product UI hits), and guard the legitimate default path against
+// regression.
+
+// Template requested but its dir/config.yaml is absent → 422, not silent
+// langgraph 201.
+func TestWorkspaceCreate_188_TemplateMissingRuntime_FailsClosed(t *testing.T) {
+	setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	// configsDir is an empty temp dir → resolveInsideRoot succeeds (the path
+	// is inside root) but config.yaml read fails → runtime cannot be resolved.
+	configsDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(configsDir, "ghost-template"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", configsDir)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	body := `{"name":"Ghost","template":"ghost-template"}`
+	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Create(c)
+
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 (fail-closed, controlplane#188), got %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if resp["code"] != "RUNTIME_UNRESOLVED" {
+		t.Errorf("expected code RUNTIME_UNRESOLVED, got %v", resp["code"])
+	}
+}
+
+// Template config.yaml has no `runtime:` key → 422, not silent langgraph.
+func TestWorkspaceCreate_188_TemplateConfigNoRuntimeKey_FailsClosed(t *testing.T) {
+	setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	configsDir := t.TempDir()
+	tdir := filepath.Join(configsDir, "noruntime-template")
+	if err := os.MkdirAll(tdir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// config.yaml exists but declares no runtime.
+	if err := os.WriteFile(filepath.Join(tdir, "config.yaml"), []byte("name: noruntime\n"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", configsDir)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	body := `{"name":"NoRuntime","template":"noruntime-template"}`
+	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Create(c)
+
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 (fail-closed), got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// Regression guard: the legitimate default path (no template, no runtime —
+// bare {"name":...}) MUST still default to langgraph and return 201. The
+// #188 fix must not break this.
+func TestWorkspaceCreate_188_NoTemplateNoRuntime_StillDefaultsLanggraph(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+
+	mock.ExpectBegin()
+	mock.ExpectExec("INSERT INTO workspaces").
+		WithArgs(sqlmock.AnyArg(), "Plain Default", nil, 3, "langgraph", sqlmock.AnyArg(), (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+	mock.ExpectExec("INSERT INTO canvas_layouts").
+		WithArgs(sqlmock.AnyArg(), float64(0), float64(0)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO structure_events").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	body := `{"name":"Plain Default"}`
+	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Create(c)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201 (legitimate default path), got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// Explicit runtime, no template → honored, 201 (no template resolution
+// needed; runtimeExplicitlyRequested true but already resolved).
+func TestWorkspaceCreate_188_ExplicitRuntimeNoTemplate_OK(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+
+	mock.ExpectBegin()
+	mock.ExpectExec("INSERT INTO workspaces").
+		WithArgs(sqlmock.AnyArg(), "Explicit Codex", nil, 3, "codex", sqlmock.AnyArg(), (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+	mock.ExpectExec("INSERT INTO canvas_layouts").
+		WithArgs(sqlmock.AnyArg(), float64(0), float64(0)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO structure_events").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	body := `{"name":"Explicit Codex","runtime":"codex"}`
+	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Create(c)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
 	}
 }
