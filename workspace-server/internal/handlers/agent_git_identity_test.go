@@ -75,6 +75,53 @@ func TestApplyAgentGitIdentity_NilMapIsSafe(t *testing.T) {
 	applyAgentGitIdentity(nil, "PM")
 }
 
+func TestApplyAgentGitIdentity_SetsGitAskpass(t *testing.T) {
+	// GIT_ASKPASS is what wires container-side HTTPS git auth to the
+	// persona credentials (GITEA_USER/GITEA_TOKEN, etc.) that
+	// loadPersonaEnvFile delivers via workspace_secrets. Without this,
+	// `git push` inside the container would fall through to interactive
+	// prompts (impossible) or a missing credential.helper (401).
+	env := map[string]string{}
+	applyAgentGitIdentity(env, "Frontend Engineer")
+	if env["GIT_ASKPASS"] != "/usr/local/bin/molecule-askpass" {
+		t.Errorf("GIT_ASKPASS: got %q, want %q",
+			env["GIT_ASKPASS"], "/usr/local/bin/molecule-askpass")
+	}
+}
+
+func TestApplyAgentGitIdentity_RespectsAskpassOverride(t *testing.T) {
+	// A workspace_secret or env-mutator plugin must be able to point at
+	// a custom askpass helper without us clobbering it. Symmetric with
+	// the GIT_AUTHOR_NAME override test above.
+	env := map[string]string{
+		"GIT_ASKPASS": "/opt/custom/askpass",
+	}
+	applyAgentGitIdentity(env, "Backend Engineer")
+	if env["GIT_ASKPASS"] != "/opt/custom/askpass" {
+		t.Errorf("GIT_ASKPASS should not be overwritten, got %q", env["GIT_ASKPASS"])
+	}
+}
+
+func TestApplyAgentGitIdentity_AskpassSkippedOnEmptyName(t *testing.T) {
+	// The empty-name early-return covers GIT_ASKPASS too — a provisioning
+	// glitch that dropped the workspace name shouldn't half-configure the
+	// container (identity vars empty but askpass wired). All-or-nothing.
+	env := map[string]string{}
+	applyAgentGitIdentity(env, "")
+	if _, ok := env["GIT_ASKPASS"]; ok {
+		t.Errorf("empty name should not set GIT_ASKPASS, got %q", env["GIT_ASKPASS"])
+	}
+}
+
+func TestApplyGitAskpass_NilMapIsSafe(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("applyGitAskpass panicked on nil map: %v", r)
+		}
+	}()
+	applyGitAskpass(nil)
+}
+
 func TestSlugifyForEmail(t *testing.T) {
 	cases := []struct {
 		in, want string
