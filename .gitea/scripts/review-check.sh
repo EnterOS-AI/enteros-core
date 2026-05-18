@@ -100,11 +100,12 @@ printf 'header = "Authorization: token %s"\n' "$GITEA_TOKEN" > "$CURL_AUTH_FILE"
 # (bash trap 'function' EXIT expands variables at trap-fire time, not def time).
 PR_JSON=$(mktemp)
 REVIEWS_JSON=$(mktemp)
+COMMENTS_JSON=$(mktemp)
 TEAM_PROBE_TMP=$(mktemp)
 NA_STATUSES_TMP=""  # declared here so cleanup() always has the var
 
 cleanup() {
-  rm -f "$CURL_AUTH_FILE" "$PR_JSON" "$REVIEWS_JSON" "$TEAM_PROBE_TMP" "${NA_STATUSES_TMP-}"
+  rm -f "$CURL_AUTH_FILE" "$PR_JSON" "$REVIEWS_JSON" "$COMMENTS_JSON" "$TEAM_PROBE_TMP" "${NA_STATUSES_TMP-}"
 }
 trap cleanup EXIT
 
@@ -229,7 +230,58 @@ if [ -z "$CANDIDATES" ]; then
       [ -n "${_rid:-}" ] && echo "::error::  review id=${_rid} by '${_rl}': RE-SUBMIT via POST ${API}/repos/${OWNER}/${NAME}/pulls/${PR_NUMBER}/reviews with {\"event\":\"APPROVED\"} (correct enum) — do NOT edit the DB."
     done
   fi
-  echo "::error::${TEAM}-review awaiting non-author APPROVE from ${TEAM} team (no candidates yet)"
+
+  # --- Fallback (internal#348): check issue comments for agent-approval ---
+  # core-qa-agent and core-security-agent approve via issue comments, NOT
+  # the reviews API. The reviews API returns zero entries for comment-only
+  # approvals. This fallback reads PR issue comments and extracts logins that:
+  #   1. Posted a comment matching the agent-prefix pattern for this gate:
+  #        qa      → "[core-qa-agent] APPROVED"
+  #        security → "[core-security-agent] APPROVED"
+  #      OR posted a generic approval keyword (word-anchored, case-insensitive):
+  #        APPROVED / LGTM / ACCEPTED
+  #   2. Are not the PR author
+  #   3. The team-membership probe below is the authoritative filter.
+  AGENT_PATTERN=""
+  case "$TEAM" in
+    qa)       AGENT_PATTERN="\\[core-qa-agent\\]" ;;
+    security) AGENT_PATTERN="\\[core-security-agent\\]" ;;
+  esac
+  HTTP_CODE=$(curl -sS -o "$COMMENTS_JSON" -w '%{http_code}' \
+    -K "$CURL_AUTH_FILE" "${API}/repos/${OWNER}/${NAME}/issues/${PR_NUMBER}/comments")
+  debug "GET /issues/${PR_NUMBER}/comments → HTTP ${HTTP_CODE}"
+  if [ "$HTTP_CODE" = "200" ]; then
+    # JQ expression: select non-author comments that match either the
+    # agent-prefix pattern (case-insensitive) OR a generic approval keyword.
+    JQ_APPROVALS='
+      .[] |
+      select(.user.login != $author) |
+      . as $cmt |
+      if ($agent_pattern | length) > 0 and ($cmt.body // "" | test($agent_pattern; "i")) then
+        $cmt.user.login
+      elif ($cmt.body // "" | test("\\b(APPROVED|LGTM|ACCEPTED)\\b"; "i")) then
+        $cmt.user.login
+      else
+        empty
+      end
+    '
+    CANDIDATES=$(jq -r \
+      --arg author "$PR_AUTHOR" \
+      --arg agent_pattern "$AGENT_PATTERN" \
+      "$JQ_APPROVALS" \
+      "$COMMENTS_JSON" 2>/dev/null | sort -u)
+    debug "comment-based approval candidates: $(echo "$CANDIDATES" | tr '\n' ' ')"
+
+    if [ -n "$CANDIDATES" ]; then
+      echo "::notice::${TEAM}-review: reviews API found no APPROVED reviews; found $(echo "$CANDIDATES" | wc -w | xargs) comment-based approval candidate(s) — verifying team membership..."
+    fi
+  else
+    debug "could not fetch issue comments (HTTP ${HTTP_CODE})"
+  fi
+fi
+
+if [ -z "${CANDIDATES:-}" ]; then
+  echo "::error::${TEAM}-review awaiting non-author APPROVE from ${TEAM} team (no candidates from reviews API or issue comments)"
   exit 1
 fi
 
