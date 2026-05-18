@@ -458,7 +458,7 @@ export function MobileChat({
           </div>
         )}
         {tab === "my" && historyLoading && (
-          <div style={{ padding: "20px 4px", textAlign: "center", color: p.text3, fontSize: 13 }}>
+          <div role="status" aria-live="polite" style={{ padding: "20px 4px", textAlign: "center", color: p.text3, fontSize: 13 }}>
             Loading chat history…
           </div>
         )}
@@ -493,7 +493,7 @@ export function MobileChat({
           </div>
         )}
         {tab === "my" && !historyLoading && !historyError && messages.length === 0 && (
-          <div style={{ padding: "20px 4px", textAlign: "center", color: p.text3, fontSize: 13 }}>
+          <div role="status" aria-live="polite" style={{ padding: "20px 4px", textAlign: "center", color: p.text3, fontSize: 13 }}>
             Send a message to start chatting.
           </div>
         )}
