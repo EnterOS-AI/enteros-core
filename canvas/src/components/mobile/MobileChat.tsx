@@ -725,6 +725,7 @@ export function MobileChat({
             ref={composerRef}
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
+            aria-label="Message"
             onKeyDown={(e) => {
               // Enter sends; Shift+Enter inserts a newline. Skip when the
               // IME is composing — pressing Enter to commit a Chinese/

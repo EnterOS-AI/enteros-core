@@ -302,6 +302,7 @@ export function MobileSpawn({ dark, onClose }: { dark: boolean; onClose: () => v
           <input
             value={name}
             onChange={(e) => setName(e.target.value)}
+            aria-label="Agent name"
             placeholder={tplId
               ? (templates.find((t) => t.id === tplId)?.name ?? "agent-name")
               : "agent-name"}
