@@ -756,7 +756,12 @@ export function MobileChat({
               border: "none",
               outline: "none",
               background: "transparent",
-              fontSize: 14.5,
+              // iOS Safari/PWA zooms the viewport when a focused textarea
+              // has a computed font-size below 16px. 14.5 triggers that
+              // focus-zoom; the page looks broken until the user pinches
+              // back (#224, same class as desktop #1434 / sibling #225).
+              // 16px is the minimum that keeps focus from zooming.
+              fontSize: 16,
               lineHeight: 1.4,
               color: p.text,
               padding: "6px 0",
