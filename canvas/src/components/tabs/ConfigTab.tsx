@@ -81,7 +81,7 @@ function AgentCardSection({ workspaceId }: { workspaceId: string }) {
             spellCheck={false} rows={12}
             className="w-full bg-surface-card border border-line rounded p-2 text-[10px] font-mono text-ink focus:outline-none focus:border-accent resize-none"
           />
-          {error && <div className="px-2 py-1 bg-red-900/30 border border-red-800 rounded text-[10px] text-bad">{error}</div>}
+          {error && <div role="alert" aria-live="assertive" className="px-2 py-1 bg-red-900/30 border border-red-800 rounded text-[10px] text-bad">{error}</div>}
           <div className="flex gap-2">
             <button type="button" onClick={handleSave} disabled={saving}
               className="px-2 py-1 bg-accent hover:bg-accent-strong text-[10px] rounded text-white disabled:opacity-50 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-1 focus-visible:ring-offset-surface">
@@ -1121,7 +1121,7 @@ export function ConfigTab({ workspaceId }: Props) {
       )}
 
       {error && (
-        <div className="mx-3 mb-2 px-3 py-1.5 bg-red-900/30 border border-red-800 rounded text-xs text-bad">{error}</div>
+        <div role="alert" aria-live="assertive" className="mx-3 mb-2 px-3 py-1.5 bg-red-900/30 border border-red-800 rounded text-xs text-bad">{error}</div>
       )}
       {!error && RUNTIMES_WITH_OWN_CONFIG.has(config.runtime || "") && (
         <div className="mx-3 mb-2 px-3 py-1.5 bg-surface-sunken/50 border border-line rounded text-xs text-ink-mid">
