@@ -340,6 +340,16 @@ _CLI_A2A_COMMAND_KEYWORDS: dict[str, str | None] = {
     "delegate_task_async": "delegate --async",
     "check_task_status": "status",
     "get_workspace_info": "info",
+    # `get_runtime_identity` + `update_agent_card` are MCP-first
+    # capabilities — the CLI subprocess interface doesn't expose them
+    # today. `get_runtime_identity` is env-only and an agent on a
+    # CLI-only runtime can already `echo $MODEL` etc, so there's no
+    # functional gap. `update_agent_card` requires a JSON object
+    # argument that wouldn't survive a positional-arg shell invocation
+    # cleanly. Mapped to None — flip to a keyword if a2a_cli grows
+    # `identity` / `card` subcommands in the future.
+    "get_runtime_identity": None,
+    "update_agent_card": None,
     # `broadcast_message` is not exposed via the CLI subprocess interface
     # today — it's an MCP-first capability. If a2a_cli grows a `broadcast`
     # subcommand, map it here and the alignment test will gate the change.

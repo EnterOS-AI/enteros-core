@@ -19,6 +19,7 @@ package handlers
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -357,6 +358,28 @@ func writeFileViaEIC(ctx context.Context, instanceID, runtime, root, relPath str
 		var stderr bytes.Buffer
 		sshCmd.Stderr = &stderr
 		if err := sshCmd.Run(); err != nil {
+			// When the per-op context deadline (eicFileOpTimeout) fires,
+			// exec.CommandContext SIGKILLs the ssh subprocess and Run()
+			// returns the bare "signal: killed" with empty stderr. That
+			// surfaced to the canvas as an opaque
+			// `500 {"error":"ssh install: signal: killed ()"}` which gave
+			// the operator no idea the workspace was simply mid-provision
+			// with a slow/unready EIC tunnel (internal#423). Detect the
+			// deadline explicitly and return an actionable message instead
+			// — the EIC mechanism, timeout value, and success path are all
+			// unchanged; this only improves the error a stuck write emits.
+			if cerr := ctx.Err(); cerr != nil {
+				reason := "timed out after " + eicFileOpTimeout.String()
+				if errors.Is(cerr, context.Canceled) && !errors.Is(cerr, context.DeadlineExceeded) {
+					reason = "was cancelled"
+				}
+				return fmt.Errorf(
+					"ssh install: EIC tunnel to workspace %s — "+
+						"the workspace may still be provisioning (slow/unready SSH); "+
+						"retry once it is online, or apply provider credentials via "+
+						"Settings → Secrets (encrypted, does not use this file-write path)",
+					reason)
+			}
 			return fmt.Errorf("ssh install: %w (%s)", err, strings.TrimSpace(stderr.String()))
 		}
 		log.Printf("writeFileViaEIC: ws instance=%s runtime=%s root=%s wrote %d bytes → %s",

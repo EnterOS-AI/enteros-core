@@ -643,6 +643,28 @@ func ValidateWorkspaceAccess(access, workspacePath string) error {
 	}
 }
 
+// scmWriteTokenKeys is the explicit denylist of environment variable names
+// that carry a Git SCM *write* credential (push / merge / approve). These
+// must never reach a tenant workspace container — see the forensic #145
+// rationale in buildContainerEnv. Kept as an exact-match set rather than a
+// substring/prefix heuristic so the guard is auditable and can't silently
+// over-strip a legitimately-named var.
+var scmWriteTokenKeys = map[string]struct{}{
+	"GITEA_TOKEN":     {},
+	"GITHUB_TOKEN":    {},
+	"GH_TOKEN":        {}, // gh CLI honours GH_TOKEN as a GITHUB_TOKEN alias
+	"GITLAB_TOKEN":    {},
+	"GL_TOKEN":        {}, // glab CLI alias
+	"BITBUCKET_TOKEN": {},
+}
+
+// isSCMWriteTokenKey reports whether an env var name is a known Git SCM
+// write credential that must be stripped from tenant workspace env.
+func isSCMWriteTokenKey(key string) bool {
+	_, ok := scmWriteTokenKeys[key]
+	return ok
+}
+
 // buildContainerEnv assembles the initial environment variables injected
 // into every workspace container.
 //
@@ -679,6 +701,21 @@ func buildContainerEnv(cfg WorkspaceConfig) []string {
 		env = append(env, fmt.Sprintf("AWARENESS_URL=%s", cfg.AwarenessURL))
 	}
 	for k, v := range cfg.EnvVars {
+		// Forensic #145 hardening: tenant workspace containers run
+		// agent-controlled code and must NEVER receive a Git SCM *write*
+		// credential. Without merge/approve creds in-container the
+		// two-eyes review gate is structurally self-bypass-proof — an
+		// agent that forges an approval has no token to act on it. A
+		// latent path exists (loadPersonaEnvFile merges a per-role
+		// persona `GITEA_TOKEN` into cfg.EnvVars when MOLECULE_PERSONA_ROOT
+		// is set on a tenant host); it is inert today (persona dirs are
+		// operator-host-only) but unguarded. Strip SCM-write tokens here
+		// by construction so the invariant holds regardless of whether
+		// that path ever becomes reachable.
+		if isSCMWriteTokenKey(k) {
+			log.Printf("buildContainerEnv: dropped SCM-write credential %q from workspace env (forensic #145 guard)", k)
+			continue
+		}
 		env = append(env, fmt.Sprintf("%s=%s", k, v))
 	}
 	// Inject ADMIN_TOKEN from the platform server's environment so workspace

@@ -725,10 +725,15 @@ func TestBuildContainerEnv_AwarenessOnlyWhenBothSet(t *testing.T) {
 }
 
 func TestBuildContainerEnv_CustomEnvVarsAppended(t *testing.T) {
+	// NOTE: this test previously asserted GITHUB_TOKEN passed through
+	// verbatim. That assertion encoded the forensic #145 latent leak as
+	// expected behavior. Post-guard, ordinary custom env still flows but
+	// SCM-write credentials are stripped — see
+	// TestBuildContainerEnv_StripsSCMWriteTokens for the negative assertion.
 	cfg := WorkspaceConfig{
 		WorkspaceID: "ws-x",
 		PlatformURL: "http://localhost:8080",
-		EnvVars:     map[string]string{"CUSTOM": "value", "GITHUB_TOKEN": "fake-token-for-test"},
+		EnvVars:     map[string]string{"CUSTOM": "value", "ANTHROPIC_API_KEY": "sk-not-an-scm-token"},
 	}
 	env := buildContainerEnv(cfg)
 	seen := map[string]string{}
@@ -741,13 +746,136 @@ func TestBuildContainerEnv_CustomEnvVarsAppended(t *testing.T) {
 	if seen["CUSTOM"] != "value" {
 		t.Errorf("CUSTOM env missing, got env=%v", env)
 	}
-	if seen["GITHUB_TOKEN"] != "fake-token-for-test" {
-		t.Errorf("GITHUB_TOKEN env missing, got env=%v", env)
+	if seen["ANTHROPIC_API_KEY"] != "sk-not-an-scm-token" {
+		t.Errorf("non-SCM custom env must still pass through, got env=%v", env)
 	}
 	// Built-in defaults still present
 	if seen["MOLECULE_URL"] == "" {
 		t.Errorf("MOLECULE_URL must still be set alongside custom envs")
 	}
+}
+
+// ---------- forensic #145: SCM-write-token denylist guard ----------
+
+// TestBuildContainerEnv_StripsSCMWriteTokens is the core negative
+// assertion: a tenant workspace env constructed via buildContainerEnv MUST
+// NOT contain any Git SCM *write* credential, regardless of how it got into
+// cfg.EnvVars. This proves the two-eyes review gate stays structurally
+// self-bypass-proof — an agent in-container has no merge/approve token to
+// act on a forged approval. See forensic #145.
+//
+// This test FAILS on the pre-guard code (where buildContainerEnv passed
+// cfg.EnvVars through verbatim) and PASSES once the denylist filter is in
+// place — i.e. the guard is proven by construction, not by environment
+// accident.
+func TestBuildContainerEnv_StripsSCMWriteTokens(t *testing.T) {
+	scmTokens := []string{
+		"GITEA_TOKEN", "GITHUB_TOKEN", "GH_TOKEN",
+		"GITLAB_TOKEN", "GL_TOKEN", "BITBUCKET_TOKEN",
+	}
+
+	t.Run("normal path — SCM tokens explicitly set in EnvVars", func(t *testing.T) {
+		envVars := map[string]string{"CUSTOM": "ok", "ANTHROPIC_API_KEY": "sk-keep"}
+		for _, k := range scmTokens {
+			envVars[k] = "leaked-write-credential-" + k
+		}
+		cfg := WorkspaceConfig{
+			WorkspaceID: "ws-tenant",
+			PlatformURL: "http://localhost:8080",
+			Tier:        2,
+			EnvVars:     envVars,
+		}
+		assertNoSCMWriteToken(t, buildContainerEnv(cfg), scmTokens)
+
+		// Sanity: non-SCM custom env is NOT collateral-damaged by the filter.
+		if !envContains(buildContainerEnv(cfg), "CUSTOM=ok") {
+			t.Errorf("filter must not strip non-SCM custom env")
+		}
+		if !envContains(buildContainerEnv(cfg), "ANTHROPIC_API_KEY=sk-keep") {
+			t.Errorf("filter must not strip non-SCM API keys")
+		}
+	})
+
+	t.Run("persona-file path — simulates loadPersonaEnvFile merge", func(t *testing.T) {
+		// The latent path: handlers.loadPersonaEnvFile() merges a per-role
+		// persona env file (carrying GITEA_USER, GITEA_TOKEN, …) into the
+		// workspace env map when MOLECULE_PERSONA_ROOT is set on a tenant
+		// host. We can't invoke that cross-package helper here, but its
+		// observable effect is exactly "a GITEA_TOKEN appears in
+		// cfg.EnvVars". Constructing that condition directly proves the
+		// guard holds even if the latent path becomes reachable.
+		cfg := WorkspaceConfig{
+			WorkspaceID: "ws-tenant",
+			PlatformURL: "http://localhost:8080",
+			Tier:        2,
+			EnvVars: map[string]string{
+				// Persona identity fields that are SAFE to keep (read-only
+				// identity, not a write credential):
+				"GITEA_USER":       "backend-engineer",
+				"GITEA_USER_EMAIL": "backend-engineer@agents.moleculesai.app",
+				// The credential that must be stripped:
+				"GITEA_TOKEN":        "persona-merged-write-pat",
+				"GITEA_TOKEN_SCOPES": "write:repository",
+			},
+		}
+		got := buildContainerEnv(cfg)
+		assertNoSCMWriteToken(t, got, scmTokens)
+		// Non-credential persona identity may still flow through — only the
+		// write token is the denied surface.
+		if !envContains(got, "GITEA_USER=backend-engineer") {
+			t.Errorf("non-credential persona identity (GITEA_USER) should not be stripped")
+		}
+	})
+}
+
+// TestCPProvisionerEnv_StripsSCMWriteTokens covers the tenant-EC2 path:
+// CPProvisioner.Start builds the env map the control plane forwards to the
+// EC2 workspace container. The same forensic #145 denylist must hold there.
+func TestCPProvisionerEnv_StripsSCMWriteTokens(t *testing.T) {
+	// isSCMWriteTokenKey is the single source of truth shared by both
+	// buildContainerEnv (local Docker) and CPProvisioner.Start (tenant EC2).
+	// Assert it classifies every known SCM-write var as denied and leaves
+	// ordinary / read-only-identity vars alone.
+	for _, k := range []string{
+		"GITEA_TOKEN", "GITHUB_TOKEN", "GH_TOKEN",
+		"GITLAB_TOKEN", "GL_TOKEN", "BITBUCKET_TOKEN",
+	} {
+		if !isSCMWriteTokenKey(k) {
+			t.Errorf("isSCMWriteTokenKey(%q) = false, want true (SCM-write credential must be denied)", k)
+		}
+	}
+	for _, k := range []string{
+		"GITEA_USER", "GITEA_USER_EMAIL", "ANTHROPIC_API_KEY",
+		"CUSTOM", "PLATFORM_URL", "ADMIN_TOKEN", "",
+	} {
+		if isSCMWriteTokenKey(k) {
+			t.Errorf("isSCMWriteTokenKey(%q) = true, want false (must not over-strip non-SCM env)", k)
+		}
+	}
+}
+
+func assertNoSCMWriteToken(t *testing.T, env []string, scmTokens []string) {
+	t.Helper()
+	for _, e := range env {
+		key := e
+		if i := strings.IndexByte(e, '='); i >= 0 {
+			key = e[:i]
+		}
+		for _, banned := range scmTokens {
+			if key == banned {
+				t.Errorf("SCM-write credential %q leaked into workspace env (forensic #145 invariant violated): %q", banned, e)
+			}
+		}
+	}
+}
+
+func envContains(env []string, want string) bool {
+	for _, e := range env {
+		if e == want {
+			return true
+		}
+	}
+	return false
 }
 
 // ---------- buildWorkspaceMount — #65 workspace_access ----------
