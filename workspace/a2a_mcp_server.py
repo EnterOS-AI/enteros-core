@@ -172,6 +172,12 @@ async def handle_tool_call(name: str, arguments: dict) -> str:
             arguments.get("message", ""),
             workspace_id=arguments.get("workspace_id") or None,
         )
+    elif name == "get_runtime_identity":
+        return await tool_get_runtime_identity()
+    elif name == "update_agent_card":
+        return await tool_update_agent_card(
+            arguments.get("card"),
+        )
     return f"Unknown tool: {name}"
 
 

@@ -538,11 +538,13 @@ jobs:
   all-required:
     # Aggregator sentinel — RFC internal#219 §2 (Phase 4 — closes internal#286).
     #
-    # Single stable required-status name that branch protection points at;
-    # CI churns underneath in `needs:` without any protection edits. Mirrors
-    # the molecule-controlplane Phase 2a impl shipped in CP PR#112 and
-    # referenced by `internal#286` ("Phase 4 is a single small PR... mirrors
-    # CP's existing one").
+    # Emits `CI / all-required (<event>)` where <event> is the workflow trigger
+    # (e.g. `CI / all-required (pull_request)`, `CI / all-required (push)`).
+    # Branch protection MUST be updated to require the event-suffixed name —
+    # requiring `CI / all-required` (bare, no suffix) silently blocks all merges
+    # because Gitea treats absent status contexts as pending (not skipped), and
+    # no workflow emits the bare name. Fixed: BP now requires
+    # `CI / all-required (pull_request)` per issue #1473.
     #
     # Closes the failure mode where status_check_contexts on molecule-core/main
     # only listed `Secret scan` + `sop-tier-check` (the 2 meta-gates), so real

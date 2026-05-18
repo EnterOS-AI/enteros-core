@@ -52,5 +52,9 @@ jobs:
           # explicitly instead of the combined state avoids false-pause when
           # non-blocking jobs (continue-on-error: true) have failed — those
           # failures pollute combined state but do not gate merges.
+          # NOTE: the event-suffixed context name is intentional — branch protection
+          # MUST require `CI / all-required (pull_request)` (with suffix), NOT the
+          # bare `CI / all-required`. Gitea treats absent contexts as pending, not
+          # skipped; requiring the bare name silently blocks all merges (issue #1473).
           PUSH_REQUIRED_CONTEXTS: CI / all-required (push)
         run: python3 .gitea/scripts/gitea-merge-queue.py

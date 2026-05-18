@@ -58,6 +58,7 @@ TOP_LEVEL_MODULES = {
     "a2a_response",
     "a2a_tools",
     "a2a_tools_delegation",
+    "a2a_tools_identity",
     "a2a_tools_inbox",
     "a2a_tools_memory",
     "a2a_tools_messaging",
