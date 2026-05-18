@@ -17,6 +17,9 @@ Scenarios:
   T8_team_not_member          — team membership → 404 (not a member) → exit 1
   T9_team_403                — team membership → 403 (token not in team) → exit 1
   T14_non_default_base        — open PR targeting staging → script exits 0 (no-op)
+  T15_comments_agent_approval — reviews empty; comments have "[core-qa-agent] APPROVED" → exit 0
+  T16_comments_generic_approval — reviews empty; comments have "APPROVED" by team member → exit 0
+  T17_comments_no_approval   — reviews empty; comments have no approval keywords → exit 1
 
 Usage:
   FIXTURE_STATE_DIR=/tmp/x python3 _review_check_fixture.py 8080
@@ -97,7 +100,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # GET /repos/{owner}/{name}/pulls/{pr_number}/reviews
         m = re.match(r"^/api/v1/repos/([^/]+)/([^/]+)/pulls/(\d+)/reviews$", path)
         if m:
-            if sc in ("T4_reviews_empty", "T5_reviews_only_author"):
+            if sc in ("T4_reviews_empty", "T5_reviews_only_author",
+                      "T15_comments_agent_approval", "T16_comments_generic_approval",
+                      "T17_comments_no_approval"):
                 return self._json(200, [])
             if sc == "T6_reviews_dismissed":
                 return self._json(200, [{
@@ -116,6 +121,28 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 {"state": "APPROVED", "dismissed": False, "user": {"login": "core-devops"}, "commit_id": "abc1234"},
             ])
 
+        # GET /repos/{owner}/{name}/issues/{pr_number}/comments
+        m = re.match(r"^/api/v1/repos/([^/]+)/([^/]+)/issues/(\d+)/comments$", path)
+        if m:
+            if sc == "T15_comments_agent_approval":
+                return self._json(200, [
+                    {"user": {"login": "core-qa-agent"}, "body": "[core-qa-agent] APPROVED this PR. Good changes.", "id": 1},
+                    {"user": {"login": "alice"}, "body": "I authored this PR", "id": 2},
+                    {"user": {"login": "random-user"}, "body": "Looks okay to me", "id": 3},
+                ])
+            if sc == "T16_comments_generic_approval":
+                return self._json(200, [
+                    {"user": {"login": "core-qa-agent"}, "body": "APPROVED — all acceptance criteria met", "id": 1},
+                    {"user": {"login": "alice"}, "body": "-authored", "id": 2},
+                ])
+            if sc == "T17_comments_no_approval":
+                return self._json(200, [
+                    {"user": {"login": "alice"}, "body": "I authored this PR", "id": 1},
+                    {"user": {"login": "random-user"}, "body": "Looks okay to me", "id": 2},
+                ])
+            # Default scenarios (T1–T9, T14): no comments
+            return self._json(200, [])
+
         # GET /teams/{team_id}/members/{username}
         m = re.match(r"^/api/v1/teams/(\d+)/members/([^/]+)$", path)
         if m:
@@ -126,6 +153,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._empty(403)
             # T7_team_member: member
             return self._empty(204)
+
+        # GET /repos/{owner}/{name}/statuses/{sha} — for N/A declaration check
+        m = re.match(r"^/api/v1/repos/([^/]+)/([^/]+)/statuses/([a-f0-9]+)$", path)
+        if m:
+            # All comment-based scenarios have no N/A declarations
+            return self._json(200, [])
 
         return self._json(404, {"path": path, "msg": "fixture: no route"})
 

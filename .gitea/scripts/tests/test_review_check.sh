@@ -334,6 +334,31 @@ assert_contains "T12 jq: core-devops (non-author APPROVED) in candidates" "core-
 assert_eq "T12 jq: alice (author) NOT in candidates" "" "$(echo "$T12_CANDIDATES" | grep '^alice$' || true)"
 assert_eq "T12 jq: carol (dismissed) NOT in candidates" "" "$(echo "$T12_CANDIDATES" | grep '^carol$' || true)"
 
+# T15 — comment-based approval via agent prefix pattern → exit 0
+echo
+echo "== T15 comment agent-prefix approval =="
+T15_OUT=$(run_review_check "T15_comments_agent_approval")
+T15_RC=$(cat "$FIX_STATE_DIR/last_rc")
+assert_eq "T15 exit code 0 (agent-comment approval + team member)" "0" "$T15_RC"
+assert_contains "T15 comment fallback notice" "comment-based approval" "$T15_OUT"
+assert_contains "T15 core-qa-agent APPROVED" "APPROVED by core-qa-agent" "$T15_OUT"
+
+# T16 — comment-based approval via generic APPROVED keyword → exit 0
+echo
+echo "== T16 comment generic keyword approval =="
+T16_OUT=$(run_review_check "T16_comments_generic_approval")
+T16_RC=$(cat "$FIX_STATE_DIR/last_rc")
+assert_eq "T16 exit code 0 (generic-approval comment + team member)" "0" "$T16_RC"
+assert_contains "T16 comment fallback notice" "comment-based approval" "$T16_OUT"
+
+# T17 — no approval keywords in comments → exit 1
+echo
+echo "== T17 comments with no approval keywords =="
+T17_OUT=$(run_review_check "T17_comments_no_approval")
+T17_RC=$(cat "$FIX_STATE_DIR/last_rc")
+assert_eq "T17 exit code 1 (no candidates from comments)" "1" "$T17_RC"
+assert_contains "T17 no candidates error" "no candidates from reviews API or issue comments" "$T17_OUT"
+
 echo
 echo "------"
 echo "PASS=$PASS FAIL=$FAIL"
