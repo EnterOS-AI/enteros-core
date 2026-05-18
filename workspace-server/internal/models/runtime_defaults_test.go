@@ -21,12 +21,9 @@ func TestDefaultModel(t *testing.T) {
 		// as a generic "unknown" failure.
 		{"hermes", "anthropic:claude-opus-4-7"},
 		{"langgraph", "anthropic:claude-opus-4-7"},
-		{"crewai", "anthropic:claude-opus-4-7"},
 		{"autogen", "anthropic:claude-opus-4-7"},
-		{"deepagents", "anthropic:claude-opus-4-7"},
 		{"codex", "anthropic:claude-opus-4-7"},
 		{"openclaw", "anthropic:claude-opus-4-7"},
-		{"gemini-cli", "anthropic:claude-opus-4-7"},
 		{"external", "anthropic:claude-opus-4-7"},
 
 		// Unknown / empty — fall through to universal default rather

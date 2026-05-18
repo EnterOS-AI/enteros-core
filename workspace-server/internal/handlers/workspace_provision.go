@@ -15,6 +15,7 @@ import (
 	"github.com/Molecule-AI/molecule-monorepo/platform/internal/models"
 	"github.com/Molecule-AI/molecule-monorepo/platform/internal/provisioner"
 	"github.com/Molecule-AI/molecule-monorepo/platform/internal/wsauth"
+	"gopkg.in/yaml.v3"
 )
 
 // logProvisionPanic is the deferred recover at the top of every provision
@@ -472,9 +473,10 @@ func configDirName(workspaceID string) string {
 // runtime means bumping both this list and the Docker image tags.
 // knownRuntimes is populated from manifest.json at service init (see
 // runtime_registry.go). The package init order is:
-//   1. var knownRuntimes = fallbackRuntimes
-//   2. init() calls initKnownRuntimes() which replaces it if
-//      manifest.json is readable.
+//  1. var knownRuntimes = fallbackRuntimes
+//  2. init() calls initKnownRuntimes() which replaces it if
+//     manifest.json is readable.
+//
 // The fallback matters for unit tests that don't mount the manifest.
 //
 // "external" is a first-class runtime that intentionally does NOT
@@ -539,6 +541,9 @@ func (h *WorkspaceHandler) ensureDefaultConfig(workspaceID string, payload model
 		// org_import.go; consolidating prevents silent drift.
 		model = models.DefaultModel(runtime)
 	}
+	if runtime == "claude-code" {
+		model = normalizeClaudeCodeModel(model)
+	}
 
 	// Sanitize name/role/model for YAML safety — always double-quote so
 	// a crafted value with a newline or colon can't terminate the scalar
@@ -554,6 +559,11 @@ func (h *WorkspaceHandler) ensureDefaultConfig(workspaceID string, payload model
 	quoteModel := yamlQuote(model)
 	configYAML := fmt.Sprintf("name: %s\ndescription: %s\nversion: 1.0.0\ntier: %d\nruntime: %s\n",
 		quoteName, quoteRole, payload.Tier, runtime)
+	if runtime == "claude-code" {
+		if providersYAML := h.defaultTemplateProvidersYAML(runtime); providersYAML != "" {
+			configYAML += providersYAML + "\n"
+		}
+	}
 
 	// Model always at top level — config.py reads raw["model"] for all runtimes.
 	configYAML += fmt.Sprintf("model: %s\n", quoteModel)
@@ -563,12 +573,70 @@ func (h *WorkspaceHandler) ensureDefaultConfig(workspaceID string, payload model
 	// and preflight already validates that the env vars are present before
 	// the agent loop starts.  Hardcoding token names here caused #1028
 	// (expired CLAUDE_CODE_OAUTH_TOKEN baked into config.yaml).
-	configYAML += "runtime_config:\n  timeout: 0\n"
+	configYAML += "runtime_config:\n"
+	if runtime == "claude-code" {
+		configYAML += fmt.Sprintf("  model: %s\n", quoteModel)
+	}
+	configYAML += "  timeout: 0\n"
 
 	files["config.yaml"] = []byte(configYAML)
 
 	log.Printf("Provisioner: generated %d config files for workspace %s (runtime: %s)", len(files), workspaceID, runtime)
 	return files
+}
+
+func normalizeClaudeCodeModel(model string) string {
+	model = strings.TrimSpace(model)
+	if before, after, ok := strings.Cut(model, "/"); ok && before != "" && after != "" {
+		return after
+	}
+	return model
+}
+
+func (h *WorkspaceHandler) defaultTemplateProvidersYAML(runtime string) string {
+	if h.configsDir == "" {
+		return ""
+	}
+	templateName := runtime + "-default"
+	templatePath, err := resolveInsideRoot(h.configsDir, templateName)
+	if err != nil {
+		log.Printf("Provisioner: default template providers skipped for runtime %s: %v", runtime, err)
+		return ""
+	}
+	data, err := os.ReadFile(filepath.Join(templatePath, "config.yaml"))
+	if err != nil {
+		return ""
+	}
+
+	var root yaml.Node
+	if err := yaml.Unmarshal(data, &root); err != nil {
+		log.Printf("Provisioner: default template providers skipped for runtime %s: invalid YAML: %v", runtime, err)
+		return ""
+	}
+	if len(root.Content) == 0 || root.Content[0].Kind != yaml.MappingNode {
+		return ""
+	}
+
+	mapping := root.Content[0]
+	for i := 0; i+1 < len(mapping.Content); i += 2 {
+		if mapping.Content[i].Value != "providers" {
+			continue
+		}
+		out := yaml.Node{
+			Kind: yaml.MappingNode,
+			Content: []*yaml.Node{
+				{Kind: yaml.ScalarNode, Value: "providers"},
+				mapping.Content[i+1],
+			},
+		}
+		encoded, err := yaml.Marshal(&out)
+		if err != nil {
+			log.Printf("Provisioner: default template providers skipped for runtime %s: marshal failed: %v", runtime, err)
+			return ""
+		}
+		return strings.TrimRight(string(encoded), "\n")
+	}
+	return ""
 }
 
 // deriveProviderFromModelSlug maps a hermes-agent model slug prefix to

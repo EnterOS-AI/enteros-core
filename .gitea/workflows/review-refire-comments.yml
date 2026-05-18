@@ -18,6 +18,10 @@ permissions:
   pull-requests: read
   statuses: write
 
+concurrency:
+  group: ${{ github.repository }}-${{ github.workflow }}-${{ github.event.issue.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   dispatch:
     runs-on: ubuntu-latest

@@ -15,6 +15,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 )
+
 // resolvePromptRef reads a prompt body from either an inline string or a
 // file ref relative to the workspace's files_dir. Inline always wins when
 // both are non-empty (caller-provided inline is more authoritative than a
@@ -176,7 +177,7 @@ func isEnvIdentPart(c byte) bool {
 	return isEnvIdentStart(c) || (c >= '0' && c <= '9')
 }
 
-// loadWorkspaceEnv reads the org root .env and the workspace-specific .env .env and the workspace-specific .env
+// loadWorkspaceEnv reads the org root .env and the workspace-specific .env
 // (workspace overrides org root). Used by both secret injection and channel
 // config expansion.
 //

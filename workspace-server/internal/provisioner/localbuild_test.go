@@ -190,7 +190,7 @@ func TestEnsureLocalImage_RepoNotFound(t *testing.T) {
 	opts.HTTPClient = srv.Client()
 	opts.remoteHeadSha = nil // exercise real HTTP path
 
-	_, err := ensureLocalImageWithOpts(context.Background(), "crewai", opts)
+	_, err := ensureLocalImageWithOpts(context.Background(), "hermes", opts)
 	if err == nil {
 		t.Fatalf("expected error, got nil")
 	}
