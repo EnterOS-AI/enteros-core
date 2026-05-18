@@ -62,6 +62,19 @@ RUN chmod +x ./scripts/molecule-git-token-helper.sh
 COPY scripts/molecule-gh-token-refresh.sh ./scripts/
 RUN chmod +x ./scripts/molecule-gh-token-refresh.sh
 
+# Generic GIT_ASKPASS helper. Reads HTTPS Basic-Auth credentials from env
+# vars (GIT_HTTP_USERNAME / GIT_HTTP_PASSWORD, with GITEA_USER / GITEA_TOKEN
+# as fallback) and emits them on the git credential-prompt protocol so
+# container-side `git` can authenticate to any private HTTPS remote
+# without on-disk .gitconfig / .git-credentials mutation. The platform
+# provisioner sets GIT_ASKPASS=/usr/local/bin/molecule-askpass via
+# applyAgentGitIdentity (workspace-server/internal/handlers/agent_git_identity.go).
+# Filename is the only project-specific marker; the script body contains
+# no vendor literals and is identical to the script shipped in each
+# open-source workspace template (scripts/git-askpass.sh).
+COPY scripts/molecule-askpass /usr/local/bin/molecule-askpass
+RUN chmod +x /usr/local/bin/molecule-askpass
+
 # Dirs and permissions
 RUN mkdir -p /workspace /plugins /home/agent/.claude /home/agent/.config /home/agent/.local \
     /home/agent/.molecule-token-cache && \
