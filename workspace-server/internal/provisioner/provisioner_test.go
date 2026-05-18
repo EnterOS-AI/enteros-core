@@ -1,7 +1,9 @@
 package provisioner
 
 import (
+	"archive/tar"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -59,6 +61,72 @@ func TestValidateConfigSource_TemplateIsDirName(t *testing.T) {
 	}
 	if err := ValidateConfigSource(dir, nil); !errors.Is(err, ErrNoConfigSource) {
 		t.Fatalf("expected ErrNoConfigSource when config.yaml is a dir, got %v", err)
+	}
+}
+
+func TestStartSeedsConfigsBeforeContainerStart(t *testing.T) {
+	src, err := os.ReadFile("provisioner.go")
+	if err != nil {
+		t.Fatalf("read provisioner.go: %v", err)
+	}
+	text := string(src)
+	copyTemplate := strings.Index(text, "p.CopyTemplateToContainer(ctx, resp.ID, cfg.TemplatePath)")
+	writeFiles := strings.Index(text, "p.WriteFilesToContainer(ctx, resp.ID, cfg.ConfigFiles)")
+	start := strings.Index(text, "p.cli.ContainerStart(ctx, resp.ID, container.StartOptions{})")
+
+	if copyTemplate < 0 || writeFiles < 0 || start < 0 {
+		t.Fatalf("expected Start to copy template, write config files, and start container")
+	}
+	if copyTemplate >= start || writeFiles >= start {
+		t.Fatalf("config seeding must happen before ContainerStart: copyTemplate=%d writeFiles=%d start=%d", copyTemplate, writeFiles, start)
+	}
+}
+
+func TestBuildTemplateTar_SkipsSymlinks(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte("name: safe\n"), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	outside := filepath.Join(t.TempDir(), "secret.txt")
+	if err := os.WriteFile(outside, []byte("do-not-copy\n"), 0644); err != nil {
+		t.Fatalf("write outside target: %v", err)
+	}
+	if err := os.Symlink(outside, filepath.Join(dir, "linked-secret.txt")); err != nil {
+		t.Fatalf("create symlink: %v", err)
+	}
+
+	buf, err := buildTemplateTar(dir)
+	if err != nil {
+		t.Fatalf("buildTemplateTar: %v", err)
+	}
+
+	names := map[string]string{}
+	tr := tar.NewReader(buf)
+	for {
+		hdr, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("read tar: %v", err)
+		}
+		body, err := io.ReadAll(tr)
+		if err != nil {
+			t.Fatalf("read body for %s: %v", hdr.Name, err)
+		}
+		names[hdr.Name] = string(body)
+	}
+
+	if got := names["config.yaml"]; got != "name: safe\n" {
+		t.Fatalf("config.yaml body = %q, want safe config", got)
+	}
+	if _, ok := names["linked-secret.txt"]; ok {
+		t.Fatalf("symlink entry was copied into template tar: %#v", names)
+	}
+	for name, body := range names {
+		if strings.Contains(body, "do-not-copy") {
+			t.Fatalf("symlink target leaked through %s: %q", name, body)
+		}
 	}
 }
 
@@ -445,7 +513,10 @@ func TestWorkspaceConfig_ResetClaudeSessionFieldPresent(t *testing.T) {
 // we lose the "one bad publish doesn't break every workspace" guarantee.
 func TestSelectImage_PrefersExplicitImage(t *testing.T) {
 	pinned := "ghcr.io/molecule-ai/workspace-template-claude-code@sha256:3d6761a97ed07d7d33cfc19a8fbab81175d9d9179618d493dbc00c5f7ef076a3"
-	got := selectImage(WorkspaceConfig{Runtime: "claude-code", Image: pinned})
+	got, err := selectImage(WorkspaceConfig{Runtime: "claude-code", Image: pinned})
+	if err != nil {
+		t.Fatalf("selectImage with cfg.Image=pinned: unexpected error %v", err)
+	}
 	if got != pinned {
 		t.Errorf("selectImage with cfg.Image=pinned: got %q, want %q", got, pinned)
 	}
@@ -455,28 +526,46 @@ func TestSelectImage_PrefersExplicitImage(t *testing.T) {
 // pin lookup deliberately bypassed via WORKSPACE_IMAGE_LOCAL_OVERRIDE).
 // selectImage must use the legacy runtime→:latest map.
 func TestSelectImage_FallsBackToRuntimeMap(t *testing.T) {
-	got := selectImage(WorkspaceConfig{Runtime: "claude-code", Image: ""})
+	got, err := selectImage(WorkspaceConfig{Runtime: "claude-code", Image: ""})
+	if err != nil {
+		t.Fatalf("selectImage with empty Image: unexpected error %v", err)
+	}
 	want := RuntimeImages["claude-code"]
 	if got != want {
 		t.Errorf("selectImage with empty Image: got %q, want %q", got, want)
 	}
 }
 
-// TestSelectImage_UnknownRuntimeFallsBackToDefault preserves today's
-// behavior — an unrecognized runtime resolves to DefaultImage rather than
-// "" so ContainerCreate gets a usable arg and surfaces a meaningful
-// "No such image" error if the default itself is missing.
-func TestSelectImage_UnknownRuntimeFallsBackToDefault(t *testing.T) {
-	got := selectImage(WorkspaceConfig{Runtime: "no-such-runtime"})
-	if got != DefaultImage {
-		t.Errorf("selectImage with unknown runtime: got %q, want DefaultImage %q", got, DefaultImage)
+// TestSelectImage_NamedUnresolvableRuntimeRejects pins the fail-closed
+// contract (RFC internal#483 / security review 4269 /
+// feedback_platform_must_hardgate_base_contract): a NAMED runtime with no
+// resolvable image must reject with ErrUnresolvableRuntime, NOT silently
+// substitute DefaultImage. Pre-fix this returned langgraph — a user asking
+// for a removed runtime (crewai/deepagents/gemini-cli) silently got a
+// langgraph container. "crewai" is the concrete regression from the
+// security finding.
+func TestSelectImage_NamedUnresolvableRuntimeRejects(t *testing.T) {
+	for _, rt := range []string{"no-such-runtime", "crewai", "deepagents", "gemini-cli"} {
+		got, err := selectImage(WorkspaceConfig{Runtime: rt})
+		if !errors.Is(err, ErrUnresolvableRuntime) {
+			t.Errorf("selectImage(%q): got err %v, want ErrUnresolvableRuntime", rt, err)
+		}
+		if got != "" {
+			t.Errorf("selectImage(%q): got image %q, want \"\" on reject", rt, got)
+		}
+		if err != nil && !strings.Contains(err.Error(), rt) {
+			t.Errorf("selectImage(%q): error must name the offending runtime, got %v", rt, err)
+		}
 	}
 }
 
 // TestSelectImage_EmptyRuntimeFallsBackToDefault: same invariant for the
 // no-runtime-supplied path (legacy callers / older handler code).
 func TestSelectImage_EmptyRuntimeFallsBackToDefault(t *testing.T) {
-	got := selectImage(WorkspaceConfig{})
+	got, err := selectImage(WorkspaceConfig{})
+	if err != nil {
+		t.Fatalf("selectImage with zero cfg: unexpected error %v (empty runtime is a legitimate DefaultImage path)", err)
+	}
 	if got != DefaultImage {
 		t.Errorf("selectImage with zero cfg: got %q, want DefaultImage %q", got, DefaultImage)
 	}
@@ -868,7 +957,7 @@ func TestIsImageNotFoundErr(t *testing.T) {
 		{"nil", nil, false},
 		{"moby no such image", fmtErr(`Error response from daemon: No such image: workspace-template:openclaw`), true},
 		{"no such image lowercase", fmtErr(`error: no such image: foo:bar`), true},
-		{"image not found", fmtErr(`Error: image "workspace-template:crewai" not found`), true},
+		{"image not found", fmtErr(`Error: image "workspace-template:hermes" not found`), true},
 		{"generic not found without image", fmtErr(`container not found`), false},
 		{"unrelated error", fmtErr(`connection refused`), false},
 		{"permission denied", fmtErr(`permission denied`), false},

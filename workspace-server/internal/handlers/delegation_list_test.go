@@ -145,6 +145,54 @@ func TestListDelegationsFromLedger_MultipleRows(t *testing.T) {
 	}
 }
 
+func TestListDelegationsFromLedger_NullsOmitted(t *testing.T) {
+	// last_heartbeat, deadline, result_preview, error_detail are all NULL.
+	// Handler must not panic and must omit those keys from the map.
+	mockDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("failed to create sqlmock: %v", err)
+	}
+	prevDB := db.DB
+	db.DB = mockDB
+	t.Cleanup(func() { mockDB.Close(); db.DB = prevDB })
+
+	now := time.Now()
+	rows := sqlmock.NewRows([]string{
+		"delegation_id", "caller_id", "callee_id", "task_preview",
+		"status", "result_preview", "error_detail",
+		"last_heartbeat", "deadline", "created_at", "updated_at",
+	}).
+		AddRow("del-1", "ws-1", "ws-2", "task", "queued", nil, nil, nil, nil, now, now)
+	mock.ExpectQuery("SELECT .+ FROM delegations").
+		WithArgs("ws-1").
+		WillReturnRows(rows)
+
+	broadcaster := newTestBroadcaster()
+	wh := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+	dh := NewDelegationHandler(wh, broadcaster)
+
+	got := dh.listDelegationsFromLedger(context.Background(), "ws-1")
+	if len(got) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(got))
+	}
+	e := got[0]
+	if _, ok := e["last_heartbeat"]; ok {
+		t.Error("last_heartbeat should be absent when NULL")
+	}
+	if _, ok := e["deadline"]; ok {
+		t.Error("deadline should be absent when NULL")
+	}
+	if _, ok := e["response_preview"]; ok {
+		t.Error("response_preview should be absent when NULL result_preview")
+	}
+	if _, ok := e["error"]; ok {
+		t.Error("error should be absent when NULL error_detail")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations: %v", err)
+	}
+}
+
 func TestListDelegationsFromLedger_QueryError(t *testing.T) {
 	// Query failure returns nil — graceful fallback, no panic.
 	mockDB, mock, err := sqlmock.New()

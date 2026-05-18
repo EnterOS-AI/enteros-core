@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"net/http"
 	"os"
@@ -257,6 +258,67 @@ func TestEnsureDefaultConfig_ClaudeCode(t *testing.T) {
 	// Should NOT have .auth-token file
 	if _, ok := files[".auth-token"]; ok {
 		t.Error("claude-code should not generate .auth-token file — use env vars via secrets API")
+	}
+}
+
+func TestEnsureDefaultConfig_ClaudeCodeCopiesProviderRegistry(t *testing.T) {
+	broadcaster := newTestBroadcaster()
+	configsDir := t.TempDir()
+	templateDir := filepath.Join(configsDir, "claude-code-default")
+	if err := os.MkdirAll(templateDir, 0o755); err != nil {
+		t.Fatalf("mkdir template: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(templateDir, "config.yaml"), []byte(`
+name: Claude Code Agent
+runtime: claude-code
+providers:
+  - name: anthropic-oauth
+    auth_mode: oauth
+    model_aliases: [sonnet]
+    auth_env: [CLAUDE_CODE_OAUTH_TOKEN]
+  - name: minimax
+    auth_mode: third_party_anthropic_compat
+    model_prefixes: [minimax-]
+    base_url: https://api.minimax.io/anthropic
+    auth_env: [MINIMAX_API_KEY, ANTHROPIC_AUTH_TOKEN]
+runtime_config:
+  model: sonnet
+`), 0o644); err != nil {
+		t.Fatalf("write template: %v", err)
+	}
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", configsDir)
+
+	files := handler.ensureDefaultConfig("ws-code-123", models.CreateWorkspacePayload{
+		Name:    "Code Agent",
+		Tier:    4,
+		Runtime: "claude-code",
+		Model:   "minimax/MiniMax-M2.7",
+	})
+
+	var parsed struct {
+		Model     string `yaml:"model"`
+		Providers []struct {
+			Name          string   `yaml:"name"`
+			ModelPrefixes []string `yaml:"model_prefixes"`
+		} `yaml:"providers"`
+		RuntimeConfig struct {
+			Model string `yaml:"model"`
+		} `yaml:"runtime_config"`
+	}
+	if err := yaml.Unmarshal(files["config.yaml"], &parsed); err != nil {
+		t.Fatalf("generated YAML invalid: %v\n%s", err, files["config.yaml"])
+	}
+	if parsed.Model != "MiniMax-M2.7" {
+		t.Fatalf("top-level model = %q, want MiniMax-M2.7\n%s", parsed.Model, files["config.yaml"])
+	}
+	if parsed.RuntimeConfig.Model != "MiniMax-M2.7" {
+		t.Fatalf("runtime_config.model = %q, want MiniMax-M2.7\n%s", parsed.RuntimeConfig.Model, files["config.yaml"])
+	}
+	if len(parsed.Providers) != 2 {
+		t.Fatalf("providers len = %d, want 2\n%s", len(parsed.Providers), files["config.yaml"])
+	}
+	if parsed.Providers[1].Name != "minimax" || len(parsed.Providers[1].ModelPrefixes) != 1 || parsed.Providers[1].ModelPrefixes[0] != "minimax-" {
+		t.Fatalf("minimax provider registry not preserved: %+v\n%s", parsed.Providers, files["config.yaml"])
 	}
 }
 
@@ -634,6 +696,11 @@ func TestSeedInitialMemories_EmptyMemoriesNil(t *testing.T) {
 // ==================== buildProvisionerConfig ====================
 
 func TestBuildProvisionerConfig_BasicFields(t *testing.T) {
+	mock := setupTestDB(t)
+	mock.ExpectQuery(`SELECT COALESCE\(workspace_dir`).
+		WithArgs("ws-basic").
+		WillReturnRows(sqlmock.NewRows([]string{"workspace_dir", "workspace_access"}).AddRow("", "none"))
+
 	broadcaster := newTestBroadcaster()
 	tmpDir := t.TempDir()
 	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", tmpDir)
@@ -678,6 +745,14 @@ func TestBuildProvisionerConfig_BasicFields(t *testing.T) {
 }
 
 func TestBuildProvisionerConfig_WorkspacePathFromEnv(t *testing.T) {
+	mock := setupTestDB(t)
+	mock.ExpectQuery(`SELECT COALESCE\(workspace_dir`).
+		WithArgs("ws-env").
+		WillReturnError(sql.ErrNoRows)
+	mock.ExpectQuery(`SELECT digest FROM runtime_image_pins`).
+		WithArgs("claude-code").
+		WillReturnError(sql.ErrNoRows)
+
 	broadcaster := newTestBroadcaster()
 	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
 

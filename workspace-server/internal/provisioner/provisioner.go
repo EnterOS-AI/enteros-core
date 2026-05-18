@@ -35,6 +35,19 @@ import (
 // drift-risk #6.
 var ErrNoBackend = errors.New("provisioner: no backend configured (zero-valued receiver)")
 
+// ErrUnresolvableRuntime is returned by selectImage when a workspace
+// names a runtime that has no resolvable image (not in RuntimeImages and
+// no operator-pinned cfg.Image). RFC internal#483 + security review 4269:
+// previously such a request silently fell through to DefaultImage
+// (langgraph) — a user asking for crewai would get a langgraph container
+// with no signal. The CTO standing directive
+// (feedback_platform_must_hardgate_base_contract) is fail-closed: a
+// named-but-unresolvable runtime must reject with a structured,
+// runtime-naming error so the existing provision-failed notify/log path
+// surfaces it, NOT silently degrade. The genuinely-unspecified (empty)
+// runtime is still a distinct, legitimate path that keeps DefaultImage.
+var ErrUnresolvableRuntime = errors.New("provisioner: requested runtime has no resolvable image")
+
 // RuntimeImages maps runtime names to their Docker image refs.
 // Each standalone template repo publishes its image via the reusable
 // publish-template-image workflow in molecule-ci on every main merge.
@@ -104,20 +117,33 @@ type WorkspaceConfig struct {
 // selectImage resolves the final Docker image ref for a workspace. The handler
 // layer is the source of truth — if it set cfg.Image (the digest-pinned form
 // from runtime_image_pins, #2272), honor that. Otherwise fall back to the
-// runtime→tag lookup in RuntimeImages (legacy `:latest` behavior). When the
-// runtime isn't recognized either, fall back to DefaultImage so Start() still
-// has something to hand Docker — surfacing a "No such image" later is more
-// actionable than a silent "" panic in ContainerCreate.
-func selectImage(cfg WorkspaceConfig) string {
+// runtime→tag lookup in RuntimeImages (legacy `:latest` behavior).
+//
+// Fail-closed contract (RFC internal#483 / security review 4269 /
+// feedback_platform_must_hardgate_base_contract): if the workspace NAMES a
+// runtime that resolves to no image (not in RuntimeImages, no pinned
+// cfg.Image), reject with ErrUnresolvableRuntime instead of silently
+// substituting DefaultImage. Pre-fix, removing crewai/deepagents/gemini-cli
+// from the catalog left those create requests silently provisioning a
+// langgraph container — the user asked for crewai and got langgraph with no
+// signal. The error propagates through Start → markProvisionFailed, which
+// already broadcasts WorkspaceProvisionFailed and records the message.
+//
+// The genuinely-unspecified runtime (empty cfg.Runtime, e.g. an org template
+// that doesn't pin one) is an intended distinct path and still resolves to
+// DefaultImage — only a NAMED-but-unresolvable runtime is rejected.
+func selectImage(cfg WorkspaceConfig) (string, error) {
 	if cfg.Image != "" {
-		return cfg.Image
+		return cfg.Image, nil
 	}
 	if cfg.Runtime != "" {
 		if img, ok := RuntimeImages[cfg.Runtime]; ok {
-			return img
+			return img, nil
 		}
+		return "", fmt.Errorf("%w: runtime %q (known runtimes: %v)",
+			ErrUnresolvableRuntime, cfg.Runtime, knownRuntimes)
 	}
-	return DefaultImage
+	return DefaultImage, nil
 }
 
 // Workspace-access constants for #65. Matches the CHECK constraint on
@@ -188,6 +214,24 @@ const containerNamePrefix = "ws-"
 // labeled container whose workspace row no longer exists at all
 // (the wiped-DB case after `docker compose down -v`).
 const LabelManaged = "molecule.platform.managed"
+
+// AgentUID / AgentGID are the uid/gid of the unprivileged `agent` user that
+// every workspace template creates and drops to via `gosu agent` before
+// exec'ing the runtime (the a2a_mcp_server runs under this uid). The value is
+// fixed at 1000:1000 across all templates — see:
+//   - workspace-configs-templates/claude-code-default/Dockerfile (`useradd -u 1000 ... agent`)
+//   - workspace-configs-templates/hermes/Dockerfile               (`useradd -u 1000 ... agent`)
+//   - workspace/entrypoint.sh                                     (`exec gosu agent` — "uid 1000")
+//
+// Files the platform injects into /configs AFTER the entrypoint's
+// `chown -R agent:agent /configs` (the post-start #418 re-injection and the
+// pre-start #1877 volume write) must be owned by this uid/gid, otherwise the
+// agent-uid MCP server hits EACCES reading /configs/.auth_token, sends an
+// empty bearer, and the platform 401s on /registry/{id}/peers (list_peers).
+const (
+	AgentUID = 1000
+	AgentGID = 1000
+)
 
 // managedLabels is the canonical label map applied to every workspace
 // container + volume. Pulled out so a future addition (e.g. instance
@@ -318,7 +362,15 @@ func (p *Provisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string, e
 
 	env := buildContainerEnv(cfg)
 
-	image := selectImage(cfg)
+	image, imgErr := selectImage(cfg)
+	if imgErr != nil {
+		// Fail-closed: a named-but-unresolvable runtime must not silently
+		// become DefaultImage (RFC internal#483 / review 4269). The caller's
+		// error path (markProvisionFailed) broadcasts the failure + records
+		// the message so the canvas surfaces it.
+		log.Printf("Provisioner: refusing to start %s: %v", cfg.WorkspaceID, imgErr)
+		return "", imgErr
+	}
 
 	// Local-build mode (issue #63 / Task #194): when MOLECULE_IMAGE_REGISTRY
 	// is unset, the OSS contributor path skips the registry pull entirely
@@ -810,6 +862,15 @@ func ApplyTierConfig(hostCfg *container.HostConfig, cfg WorkspaceConfig, configM
 
 // CopyTemplateToContainer copies files from a host directory into /configs in the container.
 func (p *Provisioner) CopyTemplateToContainer(ctx context.Context, containerID, templatePath string) error {
+	buf, err := buildTemplateTar(templatePath)
+	if err != nil {
+		return err
+	}
+
+	return p.cli.CopyToContainer(ctx, containerID, "/configs", buf, container.CopyToContainerOptions{})
+}
+
+func buildTemplateTar(templatePath string) (*bytes.Buffer, error) {
 	// Resolve symlinks at the root before walking. filepath.Walk does
 	// NOT follow a symlink that IS the root — it Lstats the path, sees
 	// a symlink (non-directory), and emits exactly one entry without
@@ -831,6 +892,15 @@ func (p *Provisioner) CopyTemplateToContainer(ctx context.Context, containerID, 
 	err := filepath.Walk(templatePath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
+		}
+		// OFFSEC-010: skip symlinks to prevent path traversal via malicious
+		// template symlinks (e.g. template/.ssh → /root/.ssh). filepath.Walk
+		// follows symlinks by default, so without this guard a crafted symlink
+		// inside the template directory could escape to include arbitrary host
+		// files in the tar archive. We intentionally skip rather than error so
+		// a broken symlink in an org template is a silent no-op.
+		if info.Mode()&os.ModeSymlink != 0 {
+			return nil
 		}
 		rel, err := filepath.Rel(templatePath, path)
 		if err != nil {
@@ -872,17 +942,27 @@ func (p *Provisioner) CopyTemplateToContainer(ctx context.Context, containerID, 
 		return nil
 	})
 	if err != nil {
-		return fmt.Errorf("failed to create tar from %s: %w", templatePath, err)
+		return nil, fmt.Errorf("failed to create tar from %s: %w", templatePath, err)
 	}
 	if err := tw.Close(); err != nil {
-		return fmt.Errorf("failed to close tar writer: %w", err)
+		return nil, fmt.Errorf("failed to close tar writer: %w", err)
 	}
 
-	return p.cli.CopyToContainer(ctx, containerID, "/configs", &buf, container.CopyToContainerOptions{})
+	return &buf, nil
 }
 
-// WriteFilesToContainer writes in-memory files into /configs in the container.
-func (p *Provisioner) WriteFilesToContainer(ctx context.Context, containerID string, files map[string][]byte) error {
+// buildConfigFilesTar builds the tar stream that WriteFilesToContainer streams
+// into /configs via CopyToContainer. Every entry is stamped Uid/Gid = agent
+// (AgentUID/AgentGID) so the files land agent-owned after extraction. This is
+// the issue #418 post-start re-injection path: it runs AFTER the template
+// entrypoint's `chown -R agent:agent /configs`, so without explicit ownership
+// in the tar header the files extract as root:root (tar Uid/Gid default 0) and
+// the agent-uid MCP server can no longer read /configs/.auth_token (and
+// /configs/.platform_inbound_secret) → empty bearer → list_peers 401.
+//
+// Pulled out as a pure function so the ownership contract is unit-testable
+// without a live Docker daemon (mirrors buildTemplateTar).
+func buildConfigFilesTar(files map[string][]byte) (*bytes.Buffer, error) {
 	var buf bytes.Buffer
 	tw := tar.NewWriter(&buf)
 
@@ -895,8 +975,10 @@ func (p *Provisioner) WriteFilesToContainer(ctx context.Context, containerID str
 				Typeflag: tar.TypeDir,
 				Name:     dir + "/",
 				Mode:     0755,
+				Uid:      AgentUID,
+				Gid:      AgentGID,
 			}); err != nil {
-				return fmt.Errorf("failed to write tar dir header for %s: %w", dir, err)
+				return nil, fmt.Errorf("failed to write tar dir header for %s: %w", dir, err)
 			}
 			createdDirs[dir] = true
 		}
@@ -905,19 +987,30 @@ func (p *Provisioner) WriteFilesToContainer(ctx context.Context, containerID str
 			Name: name,
 			Mode: 0644,
 			Size: int64(len(data)),
+			Uid:  AgentUID,
+			Gid:  AgentGID,
 		}
 		if err := tw.WriteHeader(header); err != nil {
-			return fmt.Errorf("failed to write tar header for %s: %w", name, err)
+			return nil, fmt.Errorf("failed to write tar header for %s: %w", name, err)
 		}
 		if _, err := tw.Write(data); err != nil {
-			return fmt.Errorf("failed to write tar data for %s: %w", name, err)
+			return nil, fmt.Errorf("failed to write tar data for %s: %w", name, err)
 		}
 	}
 	if err := tw.Close(); err != nil {
-		return fmt.Errorf("failed to close tar writer: %w", err)
+		return nil, fmt.Errorf("failed to close tar writer: %w", err)
 	}
+	return &buf, nil
+}
 
-	return p.cli.CopyToContainer(ctx, containerID, "/configs", &buf, container.CopyToContainerOptions{})
+// WriteFilesToContainer writes in-memory files into /configs in the container,
+// agent-owned (see buildConfigFilesTar).
+func (p *Provisioner) WriteFilesToContainer(ctx context.Context, containerID string, files map[string][]byte) error {
+	buf, err := buildConfigFilesTar(files)
+	if err != nil {
+		return err
+	}
+	return p.cli.CopyToContainer(ctx, containerID, "/configs", buf, container.CopyToContainerOptions{})
 }
 
 // CopyToContainer exposes CopyToContainer from the Docker client for use by other packages.
@@ -1007,13 +1100,28 @@ func (p *Provisioner) ReadFromVolume(ctx context.Context, volumeName, filePath s
 	return clean, nil
 }
 
+// writeAuthTokenVolumeCmd is the shell command the throwaway alpine container
+// runs to seed /vol/.auth_token. alpine runs it as root, so without the
+// explicit `chown 1000:1000` the file stays root:root after the template
+// entrypoint's `chown -R agent:agent /configs` has already run — the agent-uid
+// (AgentUID) MCP server then gets EACCES reading it → empty bearer →
+// list_peers 401. Pulled out as a pure function so the ownership contract is
+// unit-testable without a live Docker daemon. Issue #1877.
+func writeAuthTokenVolumeCmd() string {
+	return fmt.Sprintf(
+		"mkdir -p /vol && printf '%%s' $TOKEN > /vol/.auth_token && chmod 0600 /vol/.auth_token && chown %d:%d /vol/.auth_token",
+		AgentUID, AgentGID,
+	)
+}
+
 // WriteAuthTokenToVolume writes the workspace auth token into the config volume
 // BEFORE the container starts, eliminating the token-injection race window where
 // a restarted container could read a stale token from /configs/.auth_token before
 // WriteFilesToContainer writes the new one. Issue #1877.
 //
 // Uses a throwaway alpine container to write directly to the named volume,
-// bypassing the container lifecycle entirely.
+// bypassing the container lifecycle entirely. The written file is chowned to
+// the agent uid/gid (see writeAuthTokenVolumeCmd).
 func (p *Provisioner) WriteAuthTokenToVolume(ctx context.Context, workspaceID, token string) error {
 	if p == nil || p.cli == nil {
 		return ErrNoBackend
@@ -1021,7 +1129,7 @@ func (p *Provisioner) WriteAuthTokenToVolume(ctx context.Context, workspaceID, t
 	volName := ConfigVolumeName(workspaceID)
 	resp, err := p.cli.ContainerCreate(ctx, &container.Config{
 		Image: "alpine",
-		Cmd:   []string{"sh", "-c", "mkdir -p /vol && printf '%s' $TOKEN > /vol/.auth_token && chmod 0600 /vol/.auth_token"},
+		Cmd:   []string{"sh", "-c", writeAuthTokenVolumeCmd()},
 		Env:   []string{"TOKEN=" + token},
 	}, &container.HostConfig{
 		Binds: []string{volName + ":/vol"},

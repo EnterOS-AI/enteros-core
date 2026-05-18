@@ -551,3 +551,55 @@ class TestEndToEndAckFlow(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+# ---------------------------------------------------------------------------
+# compute_na_state
+# ---------------------------------------------------------------------------
+
+
+class TestComputeNaState(unittest.TestCase):
+    """Tests for /sop-n/a directive evaluation."""
+
+    def test_no_na_declarations(self):
+        cfg = sop.load_config(CONFIG_PATH)
+        na_gates = cfg.get("n/a_gates", {})
+        comments = []
+        na_state = sop.compute_na_state(comments, "alice", na_gates, lambda *_: [])
+        self.assertFalse(na_state["qa-review"]["declared"])
+        self.assertFalse(na_state["security-review"]["declared"])
+
+    def test_na_declared_by_authorized_user(self):
+        cfg = sop.load_config(CONFIG_PATH)
+        na_gates = cfg.get("n/a_gates", {})
+        comments = [_comment("bob", "/sop-n/a qa-review N/A: pure tooling change")]
+        na_state = sop.compute_na_state(comments, "alice", na_gates, lambda g, u: u)
+        self.assertTrue(na_state["qa-review"]["declared"])
+        self.assertEqual(na_state["qa-review"]["decl_ackers"], ["bob"])
+
+    def test_na_declared_by_unauthorized_user_rejected(self):
+        cfg = sop.load_config(CONFIG_PATH)
+        na_gates = cfg.get("n/a_gates", {})
+        comments = [_comment("mallory", "/sop-n/a qa-review N/A: not real team")]
+        na_state = sop.compute_na_state(comments, "alice", na_gates, lambda g, u: [])
+        self.assertFalse(na_state["qa-review"]["declared"])
+        self.assertEqual(na_state["qa-review"]["rejected"]["not_in_team"], ["mallory"])
+
+    def test_author_cannot_self_declare_na(self):
+        cfg = sop.load_config(CONFIG_PATH)
+        na_gates = cfg.get("n/a_gates", {})
+        comments = [_comment("alice", "/sop-n/a qa-review N/A: I am the author")]
+        na_state = sop.compute_na_state(comments, "alice", na_gates, lambda g, u: u)
+        self.assertFalse(na_state["qa-review"]["declared"])
+
+    def test_parse_directives_separates_na_from_ack(self):
+        directives, na_directives = sop.parse_directives(
+            "/sop-ack comprehensive-testing\n/sop-n/a qa-review N/A: no surface",
+            {},
+        )
+        self.assertEqual(len(directives), 1)
+        self.assertEqual(directives[0][0], "sop-ack")
+        self.assertEqual(len(na_directives), 1)
+        self.assertEqual(na_directives[0][0], "sop-n/a")
+        self.assertEqual(na_directives[0][1], "qa-review")
+        self.assertIn("no surface", na_directives[0][2])
