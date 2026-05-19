@@ -125,6 +125,36 @@ func (h *WorkspaceHandler) prepareProvisionContext(
 		return nil, &provisionAbort{Msg: decryptErr}
 	}
 
+	// RFC#523 Layer 1 (task #146): refuse to start a tenant workspace
+	// when any forbidden operator-scope env var is present in the
+	// resolved secret-load env-set. Runs IMMEDIATELY after
+	// loadWorkspaceSecrets and BEFORE applyAgentGitHTTPCreds — the
+	// per-agent persona injection sets a fallback GITEA_USER/GITEA_TOKEN
+	// pair that the buildContainerEnv forensic #145 guard will strip
+	// later. We want THIS layer to catch leaks from the operator-
+	// controlled stores (global_secrets, workspace_secrets) only, not
+	// the deliberate per-agent platform injection that lives downstream.
+	//
+	// Threat model is "an upstream secret-writer accidentally widened
+	// the propagation set" — e.g. an operator pastes GITEA_TOKEN into
+	// a workspace_secrets row. Caught here, surfaced loudly to the
+	// canvas Events tab, fail-closed. The existing forensic #145 guard
+	// in provisioner.buildContainerEnv / CPProvisioner.Start stays as
+	// defense-in-depth: it silently strips at container-env-build time.
+	//
+	// Key names (not values) are echoed in the user-facing error so
+	// the operator can locate and remove the offending row. Per memory
+	// `feedback_passwords_in_chat_are_burned`, key names are not
+	// secret; values would be.
+	if forbidden := findForbiddenTenantEnvKeys(envVars); len(forbidden) > 0 {
+		msg := formatForbiddenTenantEnvError(forbidden)
+		log.Printf("Provisioner: ABORT workspace=%s — forbidden operator-scope env keys present: %v (RFC#523)", workspaceID, forbidden)
+		return nil, &provisionAbort{
+			Msg:   msg,
+			Extra: map[string]interface{}{"error": msg, "forbidden_env_keys": forbidden, "rfc": "523"},
+		}
+	}
+
 	pluginsPath, _ := filepath.Abs(filepath.Join(h.configsDir, "..", "plugins"))
 	awarenessNamespace := h.loadAwarenessNamespace(ctx, workspaceID)
 
