@@ -88,6 +88,11 @@ func (h *SocketHandler) HandleConnect(c *gin.Context) {
 
 	// Wrap WritePump and ReadPump so the gauge is decremented exactly once
 	// when the client's write goroutine exits (WritePump owns conn lifetime).
+	// goAsync-exempt (RFC internal#524 Layer 2.2): WebSocket pumps live
+	// for the duration of the client connection (minutes-hours), not a
+	// single request. Wrapping them in globalGoAsync would block every
+	// test's t.Cleanup until every connected WS client disconnects. No
+	// db.DB access in either pump.
 	go func() {
 		ws.WritePump(client)
 		metrics.TrackWSDisconnect()

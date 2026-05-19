@@ -534,10 +534,14 @@ func (h *OrgHandler) createWorkspaceTree(ws OrgWorkspace, parentID *string, absX
 		// Docker-mode otherwise; the org-import call site doesn't need
 		// to know which.
 		provisionSem <- struct{}{} // acquire
-		go func(wID, tPath string, cFiles map[string][]byte, p models.CreateWorkspacePayload) {
+		// RFC internal#524 Layer 1: route through workspace.goAsync —
+		// provisionWorkspaceAuto inserts/updates the workspaces row in
+		// db.DB and must be drained before any test cleanup swap.
+		wID, tPath, cFiles, p := id, templatePath, configFiles, payload
+		h.workspace.goAsync(func() {
 			defer func() { <-provisionSem }() // release
 			h.workspace.provisionWorkspaceAuto(wID, tPath, cFiles, p)
-		}(id, templatePath, configFiles, payload)
+		})
 	}
 
 	// Insert schedules if defined. Resolve each schedule's prompt body from

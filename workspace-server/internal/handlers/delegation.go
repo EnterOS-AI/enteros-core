@@ -185,10 +185,15 @@ func (h *DelegationHandler) Delegate(c *gin.Context) {
 	delegationCtx, cancelDelegation := context.WithTimeout(
 		context.WithoutCancel(ctx), 30*time.Minute,
 	)
-	go func() {
+	// RFC internal#524 Layer 1: route through workspace.goAsync so the
+	// detached executeDelegation (which writes A2A status rows to db.DB
+	// across multiple stages) is drained before db.DB is restored in a
+	// later test's t.Cleanup. Tracked via the parent workspace handler's
+	// asyncWG.
+	h.workspace.goAsync(func() {
 		defer cancelDelegation()
 		h.executeDelegation(delegationCtx, sourceID, body.TargetID, delegationID, a2aBody)
-	}()
+	})
 
 	// Broadcast event so canvas shows delegation in real-time
 	h.broadcaster.RecordAndBroadcast(ctx, string(events.EventDelegationSent), sourceID, map[string]interface{}{

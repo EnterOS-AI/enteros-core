@@ -278,7 +278,10 @@ func (h *MCPHandler) toolDelegateTaskAsync(ctx context.Context, callerID string,
 
 	// Fire and forget in a detached goroutine. Use a background context so
 	// the call is not cancelled when the HTTP request completes.
-	go func() {
+	// RFC internal#524 Layer 1: globalGoAsync — the detached call reads
+	// db.DB (mcpResolveURL + updateMCPDelegationStatus) and must be
+	// drained by drainTestAsync before any t.Cleanup-driven db.DB swap.
+	globalGoAsync(func() {
 		bgCtx, cancel := context.WithTimeout(context.Background(), mcpAsyncCallTimeout)
 		defer cancel()
 
@@ -322,7 +325,7 @@ func (h *MCPHandler) toolDelegateTaskAsync(ctx context.Context, callerID string,
 		defer func() { _ = resp.Body.Close() }()
 		// Drain response so the connection can be reused.
 		_, _ = io.Copy(io.Discard, resp.Body)
-	}()
+	})
 
 	return fmt.Sprintf(`{"task_id":%q,"status":"dispatched","target_id":%q}`, delegationID, targetID), nil
 }

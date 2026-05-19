@@ -556,7 +556,14 @@ func (h *WorkspaceHandler) proxyA2ARequest(ctx context.Context, workspaceID stri
 	// Track LLM token usage for cost transparency (#593).
 	// Fires in a detached goroutine so token accounting never adds latency
 	// to the critical A2A path.
-	go extractAndUpsertTokenUsage(context.WithoutCancel(ctx), workspaceID, respBody)
+	// RFC internal#524 Layer 1: extractAndUpsertTokenUsage reads db.DB
+	// (INSERT INTO llm_token_usage). Without globalGoAsync, the detached
+	// write races a subsequent test's db.DB swap exactly like the
+	// maybeMarkContainerDead path that 69d9b4e3 fixed.
+	tokCtx := context.WithoutCancel(ctx)
+	wsID := workspaceID
+	tokBody := respBody
+	globalGoAsync(func() { extractAndUpsertTokenUsage(tokCtx, wsID, tokBody) })
 
 	// Non-2xx agent response: the agent received the request but returned an
 	// error status. Return a proxyErr so the caller (DrainQueueForWorkspace)
@@ -931,6 +938,12 @@ func applyIdleTimeout(parent context.Context, b *events.Broadcaster, workspaceID
 	}
 	ctx, cancel := context.WithCancel(parent)
 	sub, unsub := b.SubscribeSSE(workspaceID)
+	// goAsync-exempt (RFC internal#524 Layer 2.2 annotation): this
+	// goroutine owns the parent ctx's cancel and exits only on
+	// ctx.Done() / sub-channel close — wrapping it in globalGoAsync would
+	// deadlock drainTestAsync because the request that owns ctx hasn't
+	// completed when t.Cleanup fires. Does NOT read db.DB; idle-timer
+	// management only.
 	go func() {
 		defer unsub()
 		timer := time.NewTimer(idle)

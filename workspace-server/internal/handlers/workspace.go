@@ -101,6 +101,47 @@ func (h *WorkspaceHandler) waitAsyncForTest() {
 	h.asyncWG.Wait()
 }
 
+// globalAsync tracks goroutines launched by globalGoAsync — the
+// equivalent of WorkspaceHandler.goAsync for sibling handlers that
+// don't carry a *WorkspaceHandler reference (SecretsHandler /
+// PluginsHandler / AdminPluginDriftHandler / ChannelHandler /
+// MCPHandler / RegistryHandler), and for callers of package-level
+// free functions (a2a_proxy_helpers extractAndUpsertTokenUsage).
+//
+// Forward-port of RFC internal#524 Layer 1 deliverable 2: the
+// canonical db.DB race fix lives at workspace.go:goAsync / asyncWG,
+// but ~25 sibling bare-`go` sites still write to db.DB outside any
+// WorkspaceHandler's drain window. globalAsync gives them the same
+// drain hook (waitGlobalAsyncForTest, drained from drainTestAsync)
+// so a test's t.Cleanup db.DB restore cannot race a detached
+// goroutine spawned by any sibling handler.
+//
+// Zero-cost in production (a single sync.WaitGroup Add/Done per
+// fire-and-forget call, no test-only branching).
+var globalAsync sync.WaitGroup
+
+// globalGoAsync schedules fn on a detached goroutine tracked by
+// globalAsync. Use this in package-internal callers that don't have
+// a *WorkspaceHandler receiver to thread h.goAsync through.
+//
+// When a *WorkspaceHandler IS available, prefer h.goAsync — it lets
+// per-handler tests (waitAsyncForTest) wait without disturbing
+// unrelated handlers' inflight work.
+func globalGoAsync(fn func()) {
+	globalAsync.Add(1)
+	go func() {
+		defer globalAsync.Done()
+		fn()
+	}()
+}
+
+// waitGlobalAsyncForTest blocks until every globalGoAsync goroutine
+// finishes. Called from drainTestAsync's cleanup chain in the test
+// harness; production code never calls it.
+func waitGlobalAsyncForTest() {
+	globalAsync.Wait()
+}
+
 func NewWorkspaceHandler(b events.EventEmitter, p *provisioner.Provisioner, platformURL, configsDir string) *WorkspaceHandler {
 	h := &WorkspaceHandler{
 		broadcaster: b,

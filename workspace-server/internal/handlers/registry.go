@@ -819,8 +819,11 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 		if payload.ActiveTasks < maxConcurrent {
 			// context.WithoutCancel: heartbeat handler's ctx is about to
 			// expire as soon as we return. The drain needs to outlive it.
+			// RFC internal#524 Layer 1: drainQueue reads db.DB; route
+			// through globalGoAsync so test cleanup waits for it.
 			drainCtx := context.WithoutCancel(ctx)
-			go h.drainQueue(drainCtx, payload.WorkspaceID)
+			wsID := payload.WorkspaceID
+			globalGoAsync(func() { h.drainQueue(drainCtx, wsID) })
 		}
 	}
 }
