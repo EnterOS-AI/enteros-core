@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -17,6 +18,46 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
+
+// internal#212 — secret-safe scrubber applied to error_detail strings
+// before they cross the canvas WebSocket. Defense in depth: the
+// workspace runtime already runs `_sanitize_for_external` on its side
+// (workspace/executor_helpers.py), but the broadcast layer is the last
+// stop before the string reaches the user's browser, so we re-scrub
+// here in case any caller path forgot.
+//
+// The scrubber is intentionally surgical — it MUST preserve the
+// actionable parts (HTTP status codes, error codes like
+// `oauth_org_not_allowed`, human-readable provider messages) and
+// remove only what looks credential-ish. Over-redacting defeats the
+// whole point of internal#212 (giving the user a reason they can act on).
+
+// Capture (auth-key prefix) (value) so the prefix can be preserved in
+// the output. The keyword anchor prevents false positives on regular
+// text that happens to contain a long alphanumeric run.
+var errorDetailSecretRE = regexp.MustCompile(`(?i)((?:bearer|token|api[_-]?key|sk-proj-|sk-)[ :=]*)[A-Za-z0-9_/.-]{20,}`)
+
+// Stringly-typed JWT-shape: 3 dot-separated base64url segments, second
+// and third at least 16 chars. Matches eyJ-prefixed tokens that the
+// keyword-anchored rule above would miss when they appear bare.
+var errorDetailJWTRE = regexp.MustCompile(`eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}`)
+
+const errorDetailBroadcastCap = 4096
+
+func sanitizeErrorDetailForBroadcast(s string) string {
+	if s == "" {
+		return s
+	}
+	// Cap first — a huge error body shouldn't tax every websocket
+	// client's buffer. 4096 matches the workspace-side _MAX_STDERR
+	// budget (it's actually larger here so the runtime's cap dominates).
+	if len(s) > errorDetailBroadcastCap {
+		s = s[:errorDetailBroadcastCap] + "…[truncated]"
+	}
+	s = errorDetailSecretRE.ReplaceAllString(s, "${1}[REDACTED]")
+	s = errorDetailJWTRE.ReplaceAllString(s, "[REDACTED]")
+	return s
+}
 
 type ActivityHandler struct {
 	broadcaster *events.Broadcaster
@@ -690,6 +731,16 @@ func logActivityExec(ctx context.Context, exec activityExecutor, broadcaster eve
 		}
 		if respStr != nil {
 			payload["response_body"] = json.RawMessage(respJSON)
+		}
+		// internal#212 — surface the secret-safe failure reason on the
+		// live broadcast so the canvas chat-tab error banner can show
+		// the user *why* (provider HTTP status, error code, the
+		// provider's own human message) instead of the opaque
+		// "Agent error (Exception) — see workspace logs for details."
+		// hardcoded fallback. Omitted when nil so the canvas's "has
+		// actionable reason" guard doesn't trip on empty-string keys.
+		if params.ErrorDetail != nil && *params.ErrorDetail != "" {
+			payload["error_detail"] = sanitizeErrorDetailForBroadcast(*params.ErrorDetail)
 		}
 	}
 
