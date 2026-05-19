@@ -9,6 +9,59 @@
 # Pattern matches the legacy monorepo workspace/entrypoint.sh:
 # fix volume ownership as root, then re-exec via gosu as agent (uid 1000).
 
+# --- RFC#523 Layer 2: tenant-workspace forbidden-env guard (task #146) ---
+# Defense-in-depth. The provisioner (workspace-server) has a fail-closed
+# abort at provision time (Layer 1, prepareProvisionContext), and the
+# in-container env-build has a silent strip (forensic #145,
+# provisioner.buildContainerEnv). This guard fires if either upstream
+# layer is bypassed — e.g. someone runs this image standalone with
+# `docker run -e GITEA_TOKEN=...`. Exit 1 with a clear message instead
+# of running with an operator-scope credential in tenant scope.
+#
+# Key names are generic. The MOLECULE_OPERATOR_ prefix is the one
+# molecule-AI-specific literal; this entrypoint lives inside the
+# claude-code template that is internal-only (memory
+# `feedback_open_source_templates_no_hardcoded_org_internals` — claude-
+# code template is internal, separate-published templates must NOT carry
+# org-specific literals). A fork can edit FORBIDDEN_KEYS /
+# FORBIDDEN_PREFIXES for its own operator-scope names without touching
+# the rest of the entrypoint.
+#
+# Skipped when MOLECULE_TENANT_GUARD_DISABLE=1 — for local-dev where the
+# operator host IS the tenant host (e.g. running molecule-runtime on the
+# operator box for debugging). NEVER set this in tenant containers.
+if [ "${MOLECULE_TENANT_GUARD_DISABLE:-0}" != "1" ]; then
+    FORBIDDEN_KEYS="GITEA_TOKEN GITEA_PAT GITHUB_TOKEN GITHUB_PAT GH_TOKEN GITLAB_TOKEN GL_TOKEN BITBUCKET_TOKEN CP_ADMIN_API_TOKEN CP_ADMIN_TOKEN INFISICAL_OPERATOR_TOKEN INFISICAL_BOOTSTRAP_TOKEN RAILWAY_TOKEN RAILWAY_PERSONAL_API_TOKEN HETZNER_TOKEN HETZNER_API_TOKEN"
+    FORBIDDEN_PREFIXES="MOLECULE_OPERATOR_"
+    FOUND=""
+    for k in $FORBIDDEN_KEYS; do
+        # eval is safe here — $k is from a static whitespace-separated
+        # literal list above (no user input). POSIX sh has no
+        # associative arrays, hence the indirect-expansion via eval to
+        # test "is this var set" without caring about its value.
+        eval "v=\${$k+set}"
+        if [ "$v" = "set" ]; then
+            FOUND="$FOUND $k"
+        fi
+    done
+    for prefix in $FORBIDDEN_PREFIXES; do
+        # env | awk is the portable POSIX way to enumerate by prefix.
+        # busybox awk (alpine), gawk (debian), and BSD awk (macOS-test)
+        # all support index(). Doesn't depend on bash arrays / [[ =~ ]].
+        prefix_hits=$(env | awk -F= -v p="$prefix" 'index($1, p)==1 {print $1}')
+        if [ -n "$prefix_hits" ]; then
+            FOUND="$FOUND $prefix_hits"
+        fi
+    done
+    if [ -n "$FOUND" ]; then
+        echo "RFC#523 Layer 2: refusing to start tenant workspace — forbidden operator-scope env var(s) present:$FOUND" >&2
+        echo "These vars are operator-fleet scope and must not reach tenant workspaces." >&2
+        echo "Remove them from workspace_secrets / global_secrets / docker -e and retry." >&2
+        echo "If running this image standalone for local dev with intentional operator scope, set MOLECULE_TENANT_GUARD_DISABLE=1." >&2
+        exit 1
+    fi
+fi
+
 if [ "$(id -u)" = "0" ]; then
     # Configs volume is created by Docker as root; agent needs write access
     # for plugin installs, memory writes, .auth_token rotation, etc.
