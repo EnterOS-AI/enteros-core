@@ -788,7 +788,23 @@ async def main():  # pragma: no cover
     buffer = b""
     while True:
         try:
-            chunk = await loop.run_in_executor(None, stdin.read, 65536)
+            # MUST be readline(), NOT read(65536). MCP is a line-delimited
+            # JSON-RPC stream where the client (openclaw bundle-mcp,
+            # Claude Code, Cursor, ...) sends one small (~150B) request
+            # and keeps stdin OPEN waiting for the response. A fixed-size
+            # `stdin.read(65536)` on a PIPE blocks until either 64KB
+            # accumulate OR EOF — neither happens during a normal MCP
+            # handshake — so the server never parses `initialize` and the
+            # client times out (~30s; openclaw: "MCP error -32000:
+            # Connection closed"). This made the stdio transport unusable
+            # for every pipe-spawned MCP host while passing tests/manual
+            # checks that fed stdin from a regular FILE (where read()
+            # returns immediately at the short file's end). readline()
+            # returns as soon as one newline-terminated line is available,
+            # which is exactly the JSON-RPC framing. Diagnosed 2026-05-15
+            # against a live openclaw workspace; see
+            # molecule-ai-workspace-runtime#61 (same fd-compat lineage).
+            chunk = await loop.run_in_executor(None, stdin.readline)
             if not chunk:
                 break
             buffer += chunk
