@@ -556,13 +556,16 @@ func (h *ChannelHandler) Webhook(c *gin.Context) {
 		return
 	}
 
-	// Process asynchronously — don't block the webhook response
-	go func() {
+	// Process asynchronously — don't block the webhook response.
+	// RFC internal#524 Layer 1: globalGoAsync — HandleInbound traverses
+	// db.DB to resolve workspace + record the channel event; drained by
+	// drainTestAsync before db.DB swap.
+	globalGoAsync(func() {
 		bgCtx := context.Background()
 		if err := h.manager.HandleInbound(bgCtx, ch, msg); err != nil {
 			log.Printf("Channels: async HandleInbound error for workspace %s: %v", ch.WorkspaceID[:12], err)
 		}
-	}()
+	})
 
 	c.JSON(http.StatusOK, gin.H{"status": "accepted"})
 }

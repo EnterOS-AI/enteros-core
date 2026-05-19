@@ -198,12 +198,16 @@ func (h *PluginsHandler) uninstallViaDocker(ctx context.Context, c *gin.Context,
 		log.Printf("Plugin uninstall: failed to delete workspace_plugins row for %s: %v (container cleanup succeeded)", pluginName, err)
 	}
 
-	// Auto-restart (small delay to ensure fs writes are flushed)
+	// Auto-restart (small delay to ensure fs writes are flushed).
+	// RFC internal#524 Layer 1: globalGoAsync so the detached restart
+	// goroutine is drained by drainTestAsync before db.DB swap. See
+	// workspace.go:globalGoAsync for the contract.
 	if h.restartFunc != nil {
-		go func() {
+		wsID := workspaceID
+		globalGoAsync(func() {
 			time.Sleep(2 * time.Second)
-			h.restartFunc(workspaceID)
-		}()
+			h.restartFunc(wsID)
+		})
 	}
 
 	log.Printf("Plugin uninstall: %s from workspace %s (restarting)", pluginName, workspaceID)
@@ -260,10 +264,12 @@ func (h *PluginsHandler) uninstallViaEIC(ctx context.Context, c *gin.Context, wo
 	}
 
 	if h.restartFunc != nil {
-		go func() {
+		// RFC internal#524 Layer 1: see uninstallViaDocker above.
+		wsID := workspaceID
+		globalGoAsync(func() {
 			time.Sleep(2 * time.Second)
-			h.restartFunc(workspaceID)
-		}()
+			h.restartFunc(wsID)
+		})
 	}
 
 	log.Printf("Plugin uninstall: %s from workspace %s (restarting via SaaS path)", pluginName, workspaceID)

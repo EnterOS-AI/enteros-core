@@ -211,6 +211,10 @@ func (h *TerminalHandler) handleLocalConnect(c *gin.Context, workspaceID string)
 	}
 
 	// Bridge: container stdout → WebSocket
+	// goAsync-exempt (RFC internal#524 Layer 2.2): per-WebSocket I/O
+	// bridge — lifetime is the connection, not a request. The handler
+	// blocks on `done` below, so the goroutine is already drained
+	// synchronously. No db.DB access on this path.
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -433,6 +437,8 @@ func (h *TerminalHandler) handleRemoteConnect(c *gin.Context, workspaceID, insta
 	done := make(chan struct{})
 
 	// PTY → WebSocket
+	// goAsync-exempt (RFC internal#524 Layer 2.2): WebSocket-lifetime
+	// I/O bridge; handler blocks on `done` below. No db.DB access.
 	go func() {
 		defer close(done)
 		buf := make([]byte, 4096)
@@ -455,6 +461,7 @@ func (h *TerminalHandler) handleRemoteConnect(c *gin.Context, workspaceID, insta
 	}()
 
 	// WebSocket → PTY (stdin)
+	// goAsync-exempt (RFC internal#524 Layer 2.2): see above.
 	go func() {
 		for {
 			_, msg, rErr := conn.ReadMessage()

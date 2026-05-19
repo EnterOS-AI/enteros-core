@@ -48,6 +48,14 @@ func init() {
 // finish. Called from setupTestDB's cleanup before db.DB is restored so
 // no detached restart/provision goroutine is mid-read of db.DB when the
 // pointer is swapped.
+//
+// Also drains the package-level globalAsync WaitGroup (RFC internal#524
+// Layer 1 deliverable 2) so sibling handlers (SecretsHandler /
+// PluginsHandler / etc.) that route through globalGoAsync rather than
+// h.goAsync are likewise drained before db.DB is swapped. Without this
+// drain a SecretsHandler.Set's restartFunc-via-globalGoAsync could race
+// the db.DB restore exactly the same way maybeMarkContainerDead did
+// before commit 69d9b4e3.
 func drainTestAsync() {
 	liveTestHandlersMu.Lock()
 	handlers := make([]*WorkspaceHandler, len(liveTestHandlers))
@@ -56,6 +64,7 @@ func drainTestAsync() {
 	for _, h := range handlers {
 		h.waitAsyncForTest()
 	}
+	waitGlobalAsyncForTest()
 }
 
 // setupTestDB creates a sqlmock DB and assigns it to the global db.DB.

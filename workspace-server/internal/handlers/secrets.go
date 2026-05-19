@@ -262,9 +262,13 @@ func (h *SecretsHandler) Set(c *gin.Context) {
 		return
 	}
 
-	// Auto-restart workspace to pick up new secret
+	// Auto-restart workspace to pick up new secret.
+	// RFC internal#524 Layer 1: route through globalGoAsync so tests can
+	// drain the detached restart goroutine before db.DB is swapped — see
+	// drainTestAsync in handlers_test.go and the canonical 69d9b4e3 fix.
 	if h.restartFunc != nil {
-		go h.restartFunc(workspaceID)
+		wsID := workspaceID
+		globalGoAsync(func() { h.restartFunc(wsID) })
 	}
 
 	c.JSON(http.StatusOK, gin.H{"status": "saved", "key": body.Key})
@@ -297,9 +301,11 @@ func (h *SecretsHandler) Delete(c *gin.Context) {
 		return
 	}
 
-	// Auto-restart workspace to pick up removed secret
+	// Auto-restart workspace to pick up removed secret.
+	// RFC internal#524 Layer 1: see Set() above for the drain rationale.
 	if h.restartFunc != nil {
-		go h.restartFunc(workspaceID)
+		wsID := workspaceID
+		globalGoAsync(func() { h.restartFunc(wsID) })
 	}
 
 	c.JSON(http.StatusOK, gin.H{"status": "deleted", "key": key})
@@ -379,7 +385,13 @@ func (h *SecretsHandler) SetGlobal(c *gin.Context) {
 	// reach existing workspaces until the container is recreated. Auto-restart
 	// every workspace whose env is affected — i.e. those WITHOUT a
 	// workspace-level override of the same key.
-	go h.restartAllAffectedByGlobalKey(body.Key)
+	//
+	// RFC internal#524 Layer 1: globalGoAsync so tests drain the fan-out
+	// (which itself spawns N more globalGoAsync restart calls below) before
+	// db.DB swap. Without this, the SELECT for affected workspaces races a
+	// subsequent test's db.DB restore.
+	key := body.Key
+	globalGoAsync(func() { h.restartAllAffectedByGlobalKey(key) })
 
 	c.JSON(http.StatusOK, gin.H{"status": "saved", "key": body.Key, "scope": "global"})
 }
@@ -423,7 +435,11 @@ func (h *SecretsHandler) restartAllAffectedByGlobalKey(key string) {
 	}
 	log.Printf("Global secret %s changed: auto-restarting %d workspace(s) to refresh env", key, len(ids))
 	for _, id := range ids {
-		go h.restartFunc(id)
+		// RFC internal#524 Layer 1: per-workspace restart via globalGoAsync
+		// so each restart goroutine is drained before db.DB is swapped in
+		// the test cleanup chain.
+		wsID := id
+		globalGoAsync(func() { h.restartFunc(wsID) })
 	}
 }
 
@@ -450,7 +466,10 @@ func (h *SecretsHandler) DeleteGlobal(c *gin.Context) {
 
 	// Issue #15: propagate deletion to running containers — otherwise they
 	// keep the stale env var until manual restart.
-	go h.restartAllAffectedByGlobalKey(key)
+	// RFC internal#524 Layer 1: globalGoAsync for the same drain rationale
+	// as SetGlobal above.
+	k := key
+	globalGoAsync(func() { h.restartAllAffectedByGlobalKey(k) })
 
 	c.JSON(http.StatusOK, gin.H{"status": "deleted", "key": key, "scope": "global"})
 }
@@ -552,7 +571,9 @@ func (h *SecretsHandler) SetModel(c *gin.Context) {
 	}
 
 	if h.restartFunc != nil {
-		go h.restartFunc(workspaceID)
+		// RFC internal#524 Layer 1: globalGoAsync (see Set()).
+		wsID := workspaceID
+		globalGoAsync(func() { h.restartFunc(wsID) })
 	}
 	if body.Model == "" {
 		c.JSON(http.StatusOK, gin.H{"status": "cleared"})
@@ -669,7 +690,9 @@ func (h *SecretsHandler) SetProvider(c *gin.Context) {
 	}
 
 	if h.restartFunc != nil {
-		go h.restartFunc(workspaceID)
+		// RFC internal#524 Layer 1: globalGoAsync (see Set()).
+		wsID := workspaceID
+		globalGoAsync(func() { h.restartFunc(wsID) })
 	}
 	if body.Provider == "" {
 		c.JSON(http.StatusOK, gin.H{"status": "cleared"})
