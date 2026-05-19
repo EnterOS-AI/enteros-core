@@ -498,14 +498,20 @@ def _build_initialize_result() -> dict:
             "experimental": {"claude/channel": {}},
         },
         # Identifier convention: this server is what users register with
-        # `claude mcp add molecule -- molecule-mcp` (and similar across
-        # other MCP hosts), so the canonical name is "molecule". Earlier
-        # versions reported "a2a-delegation" — accurate to the original
-        # purpose but a mismatch with how operators actually name it.
-        # Mismatch is harmless on tool routing (all MCP hosts dispatch
-        # by the user-supplied registration name, NOT serverInfo.name)
-        # but matters for any future Claude Code allowlist that gates
-        # channel push by hardcoded server name (issue #2934).
+        # `claude mcp add molecule-<workspace-slug> -- molecule-mcp` (and
+        # similar across other MCP hosts). The user-supplied
+        # registration name is workspace-specific so multiple molecule
+        # workspaces can coexist in one MCP-host session (see
+        # workspace-server/internal/handlers/external_connection.go's
+        # mcpServerNameForWorkspace + mc#1535). The serverInfo.name
+        # below is purely a self-describing label — "molecule" stays
+        # generic on purpose. Earlier versions reported "a2a-delegation"
+        # — accurate to the original purpose but a mismatch with how
+        # operators actually name it. Routing is by the user-supplied
+        # registration name on every MCP host, NOT serverInfo.name; the
+        # mismatch is harmless. Matters only for any future Claude Code
+        # allowlist that gates channel push by hardcoded server name
+        # (issue #2934).
         "serverInfo": {"name": "molecule", "version": "1.0.0"},
         # Built per-call (not the module-level constant) so an operator
         # who sets MOLECULE_MCP_POLL_TIMEOUT_SECS after import — e.g.
@@ -788,7 +794,23 @@ async def main():  # pragma: no cover
     buffer = b""
     while True:
         try:
-            chunk = await loop.run_in_executor(None, stdin.read, 65536)
+            # MUST be readline(), NOT read(65536). MCP is a line-delimited
+            # JSON-RPC stream where the client (openclaw bundle-mcp,
+            # Claude Code, Cursor, ...) sends one small (~150B) request
+            # and keeps stdin OPEN waiting for the response. A fixed-size
+            # `stdin.read(65536)` on a PIPE blocks until either 64KB
+            # accumulate OR EOF — neither happens during a normal MCP
+            # handshake — so the server never parses `initialize` and the
+            # client times out (~30s; openclaw: "MCP error -32000:
+            # Connection closed"). This made the stdio transport unusable
+            # for every pipe-spawned MCP host while passing tests/manual
+            # checks that fed stdin from a regular FILE (where read()
+            # returns immediately at the short file's end). readline()
+            # returns as soon as one newline-terminated line is available,
+            # which is exactly the JSON-RPC framing. Diagnosed 2026-05-15
+            # against a live openclaw workspace; see
+            # molecule-ai-workspace-runtime#61 (same fd-compat lineage).
+            chunk = await loop.run_in_executor(None, stdin.readline)
             if not chunk:
                 break
             buffer += chunk
