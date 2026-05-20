@@ -456,84 +456,29 @@ jobs:
           cat /tmp/deploy-reminder.md >> "$GITHUB_STEP_SUMMARY"
 
   # Python Lint & Test — required check, always runs.
+  # Runtime Python moved to molecule-ai-workspace-runtime. Keep this context as
+  # a guard so branch protection still catches attempts to reintroduce an
+  # editable runtime copy under molecule-core/workspace/.
   python-lint:
     name: Python Lint & Test
     runs-on: ubuntu-latest
-    # Phase 4 (RFC #219 §1): confirmed green on main 2026-05-12.
     continue-on-error: false
-    env:
-      WORKSPACE_ID: test
-    defaults:
-      run:
-        working-directory: workspace
     steps:
-      - if: false
-        working-directory: .
-        run: echo "No workspace/** changes — skipping real lint+test; this job always runs to satisfy the required-check name on branch protection."
-      - if: always()
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - if: always()
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
-        with:
-          python-version: '3.11'
-          cache: pip
-          cache-dependency-path: workspace/requirements.txt
-      - if: always()
-        run: pip install -r requirements.txt pytest pytest-asyncio pytest-cov sqlalchemy>=2.0.0
-      # Coverage flags + fail-under floor moved into workspace/pytest.ini
-      # (issue #1817) so local `pytest` and CI use identical config.
-      - if: always()
-        run: python -m pytest --tb=short
-
-      - if: always()
-        name: Per-file critical-path coverage (MCP / inbox / auth)
-        # MCP-critical Python files have a per-file floor on top of the
-        # 86% total floor in pytest.ini. See issue #2790 for full rationale.
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Runtime SSOT guard
         run: |
-          set -e
-          PER_FILE_FLOOR=75
-          CRITICAL_FILES=(
-            "a2a_mcp_server.py"
-            "mcp_cli.py"
-            "a2a_tools.py"
-            "a2a_tools_inbox.py"
-            "inbox.py"
-            "platform_auth.py"
-          )
-
-          # pytest already wrote .coverage; emit a JSON view scoped to
-          # the critical files so jq/python can read the per-file pct
-          # without parsing tabular text.
-          INCLUDES=$(printf '*%s,' "${CRITICAL_FILES[@]}")
-          INCLUDES="${INCLUDES%,}"
-          python -m coverage json -o /tmp/critical-cov.json --include="$INCLUDES"
-
-          FAILED=0
-          for f in "${CRITICAL_FILES[@]}"; do
-            pct=$(jq -r --arg f "$f" '.files | to_entries | map(select(.key == $f)) | .[0].value.summary.percent_covered // "MISSING"' /tmp/critical-cov.json)
-            if [ "$pct" = "MISSING" ]; then
-              echo "::error file=workspace/$f::No coverage data — file may have moved or test exclusion mis-set."
-              FAILED=$((FAILED+1))
-              continue
-            fi
-            echo "$f: ${pct}%"
-            if awk "BEGIN{exit !($pct < $PER_FILE_FLOOR)}"; then
-              echo "::error file=workspace/$f::${pct}% < ${PER_FILE_FLOOR}% per-file floor (MCP critical path). See COVERAGE_FLOOR.md."
-              FAILED=$((FAILED+1))
-            fi
-          done
-
-          if [ "$FAILED" -gt 0 ]; then
-            echo ""
-            echo "$FAILED MCP critical-path file(s) below the ${PER_FILE_FLOOR}% per-file floor."
-            echo "These paths handle multi-tenant routing, auth tokens, and inbox dispatch."
-            echo "A coverage drop here is the same risk shape as Go-side tokens/secrets files"
-            echo "dropping below 10% (see COVERAGE_FLOOR.md). Either:"
-            echo "  (a) add tests to raise coverage back above ${PER_FILE_FLOOR}%, or"
-            echo "  (b) if this is unavoidable historical debt, file an issue and propose"
-            echo "      adjusting the floor with rationale in COVERAGE_FLOOR.md."
+          set -eu
+          if [ -d workspace ]; then
+            echo "::error file=workspace::Runtime source must live in molecule-ai-workspace-runtime, not molecule-core/workspace."
             exit 1
           fi
+          for f in scripts/build_runtime_package.py scripts/test_build_runtime_package.py; do
+            if [ -e "$f" ]; then
+              echo "::error file=$f::Legacy build-from-workspace packaging script must not be restored."
+              exit 1
+            fi
+          done
+          echo "Runtime SSOT guard passed; core consumes the standalone runtime package."
 
   all-required:
     # Aggregator sentinel — RFC internal#219 §2 (Phase 4 — closes internal#286).
