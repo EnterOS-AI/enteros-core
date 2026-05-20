@@ -150,6 +150,106 @@ func TestFindForbiddenTenantEnvKeys_SingleAndMultipleSorted(t *testing.T) {
 	}
 }
 
+// TestFindForbiddenTenantEnvKeysFromGlobals pins the provenance-aware
+// behaviour added 2026-05-20 to fix the RFC#523 Layer 1 over-fire: a
+// user-set workspace_secrets row with key=GITHUB_TOKEN must NOT be
+// flagged, while a global_secrets row of the same key MUST be.
+//
+// Cross-references the empirical bug: CTO 2026-05-20 hit
+// `provision aborted: env var "GITHUB_TOKEN" is operator-scope...`
+// after pasting their own scoped PAT into the canvas Secrets tab
+// (workspace_secrets) — the original blanket check fired on the
+// merged env-set regardless of provenance.
+func TestFindForbiddenTenantEnvKeysFromGlobals_UserSetAllowed(t *testing.T) {
+	// User pasted their own PAT via canvas Secrets tab —
+	// workspace_secrets row only. globalSecretKeys is empty for
+	// this key, so the check MUST not fire.
+	envVars := map[string]string{
+		"GITHUB_TOKEN":      "ghp_FAKEUSERPAT_user_set_via_canvas",
+		"ANTHROPIC_API_KEY": "sk-ant-keep",
+	}
+	globalKeys := map[string]struct{}{} // nothing from global_secrets
+	got := findForbiddenTenantEnvKeysFromGlobals(envVars, globalKeys)
+	if len(got) != 0 {
+		t.Errorf("user-set workspace_secrets with GITHUB_TOKEN: got %v; want empty (provenance-allowed)", got)
+	}
+}
+
+func TestFindForbiddenTenantEnvKeysFromGlobals_OperatorLeakBlocked(t *testing.T) {
+	// Operator-store bleed — GITHUB_TOKEN sourced from global_secrets.
+	// This is the literal RFC#523 §"Threat model" attack vector.
+	// Check MUST fire and name GITHUB_TOKEN.
+	envVars := map[string]string{
+		"GITHUB_TOKEN":      "ghp_OPERATOR_LEAK_from_global_secrets",
+		"ANTHROPIC_API_KEY": "sk-ant-keep",
+	}
+	globalKeys := map[string]struct{}{
+		"GITHUB_TOKEN":      {},
+		"ANTHROPIC_API_KEY": {},
+	}
+	got := findForbiddenTenantEnvKeysFromGlobals(envVars, globalKeys)
+	if len(got) != 1 || got[0] != "GITHUB_TOKEN" {
+		t.Errorf("operator-leak GITHUB_TOKEN in global_secrets: got %v; want [GITHUB_TOKEN]", got)
+	}
+}
+
+func TestFindForbiddenTenantEnvKeysFromGlobals_UserOverrideOfGlobalAllowed(t *testing.T) {
+	// Both stores have the key; loadWorkspaceSecrets drops the global
+	// flag when the workspace row supersedes (caller contract).
+	// Simulate that here: globalKeys does NOT contain GITHUB_TOKEN
+	// because workspace_secrets re-set it. Allowed.
+	envVars := map[string]string{
+		"GITHUB_TOKEN": "ghp_USER_RESET_after_global_was_present",
+	}
+	globalKeys := map[string]struct{}{} // workspace overrode → flag dropped
+	got := findForbiddenTenantEnvKeysFromGlobals(envVars, globalKeys)
+	if len(got) != 0 {
+		t.Errorf("user-override of global GITHUB_TOKEN: got %v; want empty", got)
+	}
+}
+
+func TestFindForbiddenTenantEnvKeysFromGlobals_MultipleOperatorLeaks(t *testing.T) {
+	// Multiple operator-leaked tokens — must return sorted slice.
+	envVars := map[string]string{
+		"GITHUB_TOKEN":           "leak1",
+		"CP_ADMIN_API_TOKEN":     "leak2",
+		"MOLECULE_OPERATOR_HOST": "leak3",
+		"RAILWAY_TOKEN":          "leak4",
+		"ANTHROPIC_API_KEY":      "user-allowed",
+	}
+	globalKeys := map[string]struct{}{
+		"GITHUB_TOKEN":           {},
+		"CP_ADMIN_API_TOKEN":     {},
+		"MOLECULE_OPERATOR_HOST": {},
+		"RAILWAY_TOKEN":          {},
+	}
+	got := findForbiddenTenantEnvKeysFromGlobals(envVars, globalKeys)
+	want := []string{"CP_ADMIN_API_TOKEN", "GITHUB_TOKEN", "MOLECULE_OPERATOR_HOST", "RAILWAY_TOKEN"}
+	if len(got) != len(want) {
+		t.Fatalf("operator-leak multi: got %v; want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("operator-leak multi[%d] = %q; want %q (full got=%v)", i, got[i], want[i], got)
+		}
+	}
+}
+
+func TestFindForbiddenTenantEnvKeysFromGlobals_EmptyInputs(t *testing.T) {
+	if got := findForbiddenTenantEnvKeysFromGlobals(nil, nil); len(got) != 0 {
+		t.Errorf("nil/nil: got %v; want empty", got)
+	}
+	if got := findForbiddenTenantEnvKeysFromGlobals(map[string]string{}, map[string]struct{}{}); len(got) != 0 {
+		t.Errorf("empty/empty: got %v; want empty", got)
+	}
+	// Non-empty envVars but no global provenance — nothing came from
+	// global_secrets, so nothing to block (even if a workspace_secrets
+	// row exists for GITHUB_TOKEN).
+	if got := findForbiddenTenantEnvKeysFromGlobals(map[string]string{"GITHUB_TOKEN": "ghp_user"}, map[string]struct{}{}); len(got) != 0 {
+		t.Errorf("workspace-only GITHUB_TOKEN: got %v; want empty", got)
+	}
+}
+
 func TestFormatForbiddenTenantEnvError_Phrasing(t *testing.T) {
 	// Empty input — defensive total function.
 	if msg := formatForbiddenTenantEnvError(nil); !strings.Contains(msg, "RFC#523") {

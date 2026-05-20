@@ -135,12 +135,63 @@ func isForbiddenTenantEnvKey(key string) bool {
 // message and the structured-extra payload that goes to the
 // canvas Events tab. Sorting makes the message stable across
 // Go's randomized map iteration.
+//
+// PROVENANCE NOTE: this helper checks by env-var name ONLY and is
+// unaware of where each value came from. Production provision code
+// uses findForbiddenTenantEnvKeysFromGlobals instead, restricting
+// the check to keys originating from the operator-controlled
+// global_secrets table — see the doc-comment on that function and
+// the RFC#523 Layer 1 block in prepareProvisionContext. This name-
+// only helper is kept for the workspace_secrets-write CI lint
+// (Layer 3) and for tests that pin the deny-set definition.
 func findForbiddenTenantEnvKeys(envVars map[string]string) []string {
 	if len(envVars) == 0 {
 		return []string{}
 	}
 	found := make([]string, 0)
 	for k := range envVars {
+		if isForbiddenTenantEnvKey(k) {
+			found = append(found, k)
+		}
+	}
+	sort.Strings(found)
+	return found
+}
+
+// findForbiddenTenantEnvKeysFromGlobals is the provenance-aware
+// variant used by RFC#523 Layer 1 in prepareProvisionContext. It
+// restricts the forbidden-key scan to keys whose value originated
+// from the operator-controlled `global_secrets` table.
+//
+// Fixes the over-fire reported by CTO empirical 2026-05-20: a user
+// who explicitly pastes their own scoped GitHub PAT under
+// GITHUB_TOKEN into the canvas Secrets tab (a `workspace_secrets`
+// row) was being blocked alongside the genuine operator-bleed case.
+// RFC#523's threat model (issue molecule-ai/internal#523 §"Threat
+// model") names operator-scope tokens injected via operator-side
+// stores; user-authored workspace_secrets is out of scope.
+//
+// globalSecretKeys is the set returned as the second value from
+// loadWorkspaceSecrets. A key that exists in BOTH stores is treated
+// as workspace_secrets (user override wins) — loadWorkspaceSecrets
+// drops the global flag when the workspace row is read.
+//
+// Empty/nil globalSecretKeys means no operator-side source was
+// loaded (e.g. tests, or table empty); the scan returns no hits.
+// Deterministic sort order, same as findForbiddenTenantEnvKeys.
+func findForbiddenTenantEnvKeysFromGlobals(envVars map[string]string, globalSecretKeys map[string]struct{}) []string {
+	if len(envVars) == 0 || len(globalSecretKeys) == 0 {
+		return []string{}
+	}
+	found := make([]string, 0)
+	for k := range globalSecretKeys {
+		if _, present := envVars[k]; !present {
+			// Defensive: a key flagged as global-origin must also
+			// be in the resolved env-set. If not, skip — the
+			// loadWorkspaceSecrets contract guarantees this never
+			// happens, but the helper stays total.
+			continue
+		}
 		if isForbiddenTenantEnvKey(k) {
 			found = append(found, k)
 		}

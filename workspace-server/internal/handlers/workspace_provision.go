@@ -869,14 +869,31 @@ func applyRuntimeModelEnv(envVars map[string]string, runtime, model string) {
 // Returns nil map + error string on decrypt failure. Shared by both Docker
 // and control plane provisioning paths to avoid duplication.
 //
+// The second return value (globalKeys) records which keys originated from
+// the operator-controlled `global_secrets` table — used by RFC#523 Layer 1
+// to constrain its forbidden-key check to the operator-bleed channel,
+// instead of blanket-blocking by name across BOTH provenance channels (the
+// over-fire that breaks the legitimate user flow of pasting their own
+// GitHub PAT into the canvas Secrets tab → workspace_secrets row). See
+// `feedback_upstream_docs_first_before_hypothesizing`: RFC#523's threat
+// model (issue molecule-ai/internal#523 §"Threat model") names operator-
+// scope tokens being injected via provision-time env / operator-side
+// stores — NOT the user's own scoped PAT they explicitly authorized via
+// the per-workspace Secrets tab.
+//
+// The merged map preserves the existing precedence semantic (workspace
+// rows overwrite global rows on key collision); only the provenance side-
+// channel is new. Existing single-return callers can ignore globalKeys.
+//
 // F1086 / #1206: the returned error string is the SAFE-CANNED message that
 // gets persisted to workspaces.last_sample_error AND broadcast as the
 // WORKSPACE_PROVISION_FAILED payload. Internal detail (the secret key name,
 // the encryption version, the decrypt-error text) is logged here, never
 // returned to the caller, so it can't leak via the canvas event stream
 // (cf. TestProvisionWorkspace_NoInternalErrorsInBroadcast).
-func loadWorkspaceSecrets(ctx context.Context, workspaceID string) (map[string]string, string) {
+func loadWorkspaceSecrets(ctx context.Context, workspaceID string) (map[string]string, map[string]struct{}, string) {
 	envVars := map[string]string{}
+	globalKeys := map[string]struct{}{}
 	globalRows, globalErr := db.DB.QueryContext(ctx,
 		`SELECT key, encrypted_value, encryption_version FROM global_secrets`)
 	if globalErr == nil {
@@ -889,9 +906,10 @@ func loadWorkspaceSecrets(ctx context.Context, workspaceID string) (map[string]s
 				decrypted, decErr := crypto.DecryptVersioned(v, ver)
 				if decErr != nil {
 					log.Printf("Provisioner: FATAL — failed to decrypt global secret %s (version=%d): %v — aborting provision of workspace %s", k, ver, decErr, workspaceID)
-					return nil, "failed to decrypt global secret"
+					return nil, nil, "failed to decrypt global secret"
 				}
 				envVars[k] = string(decrypted)
+				globalKeys[k] = struct{}{}
 			}
 		}
 		if err := globalRows.Err(); err != nil {
@@ -910,16 +928,22 @@ func loadWorkspaceSecrets(ctx context.Context, workspaceID string) (map[string]s
 				decrypted, decErr := crypto.DecryptVersioned(v, ver)
 				if decErr != nil {
 					log.Printf("Provisioner: FATAL — failed to decrypt workspace secret %s (version=%d) for %s: %v — aborting provision", k, ver, workspaceID, decErr)
-					return nil, "failed to decrypt workspace secret"
+					return nil, nil, "failed to decrypt workspace secret"
 				}
 				envVars[k] = string(decrypted)
+				// User-authored workspace_secrets value supersedes any
+				// global_secrets row of the same key — including dropping
+				// the operator-bleed provenance flag. The user explicitly
+				// re-set the value via the canvas Secrets tab, so it is
+				// no longer "the operator-store version."
+				delete(globalKeys, k)
 			}
 		}
 		if err := wsRows.Err(); err != nil {
 			log.Printf("Provisioner: workspace_secrets rows.Err workspace=%s: %v", workspaceID, err)
 		}
 	}
-	return envVars, ""
+	return envVars, globalKeys, ""
 }
 
 // provisionWorkspaceCP provisions a workspace via the control plane API.

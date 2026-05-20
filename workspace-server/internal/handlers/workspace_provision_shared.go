@@ -120,38 +120,52 @@ func (h *WorkspaceHandler) prepareProvisionContext(
 	payload models.CreateWorkspacePayload,
 	resetClaudeSession bool,
 ) (*preparedProvisionContext, *provisionAbort) {
-	envVars, decryptErr := loadWorkspaceSecrets(ctx, workspaceID)
+	envVars, globalSecretKeys, decryptErr := loadWorkspaceSecrets(ctx, workspaceID)
 	if decryptErr != "" {
 		return nil, &provisionAbort{Msg: decryptErr}
 	}
 
-	// RFC#523 Layer 1 (task #146): refuse to start a tenant workspace
-	// when any forbidden operator-scope env var is present in the
-	// resolved secret-load env-set. Runs IMMEDIATELY after
-	// loadWorkspaceSecrets and BEFORE applyAgentGitHTTPCreds — the
-	// per-agent persona injection sets a fallback GITEA_USER/GITEA_TOKEN
-	// pair that the buildContainerEnv forensic #145 guard will strip
-	// later. We want THIS layer to catch leaks from the operator-
-	// controlled stores (global_secrets, workspace_secrets) only, not
-	// the deliberate per-agent platform injection that lives downstream.
+	// RFC#523 Layer 1 (issue molecule-ai/internal#523): refuse to start a
+	// tenant workspace when any forbidden operator-scope env var is
+	// present in the operator-controlled store (global_secrets).
 	//
-	// Threat model is "an upstream secret-writer accidentally widened
-	// the propagation set" — e.g. an operator pastes GITEA_TOKEN into
-	// a workspace_secrets row. Caught here, surfaced loudly to the
-	// canvas Events tab, fail-closed. The existing forensic #145 guard
-	// in provisioner.buildContainerEnv / CPProvisioner.Start stays as
-	// defense-in-depth: it silently strips at container-env-build time.
+	// PROVENANCE-AWARE — fix for the over-fire reported by CTO empirical
+	// 2026-05-20: the original implementation ran this check on the
+	// merged env-set, which conflated two very different sources:
+	//
+	//   1. global_secrets — operator-side store. ANY operator-scope token
+	//      here is an upstream bleed (e.g. tenant_secrets_seed.go pre-
+	//      4f45d37 propagating CP-env GITHUB_TOKEN into every fresh
+	//      tenant's row). RFC#523's literal threat model.
+	//
+	//   2. workspace_secrets — user-set via the canvas Secrets tab,
+	//      authenticated as the workspace owner. If the user pastes
+	//      their own scoped GitHub PAT under GITHUB_TOKEN so the agent
+	//      can push to their personal repos, that is the system working
+	//      as designed — not the leak RFC#523 was written to catch.
+	//
+	// The provenance side-channel from loadWorkspaceSecrets tells us
+	// which keys came from global_secrets (workspace_secrets writes
+	// override and clear the flag, since the user explicitly re-set
+	// the value). We restrict the abort to that set.
+	//
+	// Defense-in-depth NOT removed: provisioner.buildContainerEnv still
+	// runs the forensic #145 silent-strip (lower-confidence late layer),
+	// and workspace/entrypoint.sh has Layer 2 inside the container. If a
+	// real operator-scope token slips into workspace_secrets some other
+	// way, the later layers (and the per-workspace SG, and the per-tenant
+	// VPC isolation) are still in force.
 	//
 	// Key names (not values) are echoed in the user-facing error so
 	// the operator can locate and remove the offending row. Per memory
 	// `feedback_passwords_in_chat_are_burned`, key names are not
 	// secret; values would be.
-	if forbidden := findForbiddenTenantEnvKeys(envVars); len(forbidden) > 0 {
+	if forbidden := findForbiddenTenantEnvKeysFromGlobals(envVars, globalSecretKeys); len(forbidden) > 0 {
 		msg := formatForbiddenTenantEnvError(forbidden)
-		log.Printf("Provisioner: ABORT workspace=%s — forbidden operator-scope env keys present: %v (RFC#523)", workspaceID, forbidden)
+		log.Printf("Provisioner: ABORT workspace=%s — forbidden operator-scope env keys present in global_secrets: %v (RFC#523)", workspaceID, forbidden)
 		return nil, &provisionAbort{
 			Msg:   msg,
-			Extra: map[string]interface{}{"error": msg, "forbidden_env_keys": forbidden, "rfc": "523"},
+			Extra: map[string]interface{}{"error": msg, "forbidden_env_keys": forbidden, "rfc": "523", "source": "global_secrets"},
 		}
 	}
 
