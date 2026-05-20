@@ -29,9 +29,7 @@ ADMIN_BEARER="${MOLECULE_ADMIN_TOKEN:-${ADMIN_TOKEN:-}}"
 ADMIN_AUTH=()
 [ -n "$ADMIN_BEARER" ] && ADMIN_AUTH=(-H "Authorization: Bearer $ADMIN_BEARER")
 WS_A_TOKEN=""
-WS_B_TOKEN=""
 WS_A_AUTH=()
-WS_B_AUTH=()
 
 check() {
   local desc="$1" expected="$2" actual="$3"
@@ -98,10 +96,6 @@ R=$(curl -s -X POST "$BASE/workspaces" "${ADMIN_AUTH[@]}" -H "Content-Type: appl
   -d "{\"name\":\"$WS_B_NAME\",\"tier\":1}")
 check "POST /workspaces (beta)" '"status":"provisioning"' "$R"
 WS_B_ID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))")
-if [ -n "$WS_B_ID" ]; then
-  WS_B_TOKEN=$(e2e_mint_test_token "$WS_B_ID" 2>/dev/null || true)
-  [ -n "$WS_B_TOKEN" ] && WS_B_AUTH=(-H "Authorization: Bearer $WS_B_TOKEN")
-fi
 
 # external/connection returns the install-snippet. The per-workspace
 # fix (mc#1535) derives the MCP name as molecule-<slug>; mc#1536 extends
