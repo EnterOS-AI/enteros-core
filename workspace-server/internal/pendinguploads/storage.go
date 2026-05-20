@@ -37,21 +37,37 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/Molecule-AI/molecule-monorepo/platform/internal/uploads"
 	"github.com/google/uuid"
 )
 
-// Per-file size cap. Mirrors workspace-side ingest_handler
-// (workspace/internal_chat_uploads.py:CHAT_UPLOAD_MAX_FILE_BYTES) and the
-// push-mode chat upload cap (chat_files.go:chatUploadMaxBytes). Pinned at
-// the DB level via the size_bytes CHECK constraint (currently
-// 104857600 per migration 20260519200000_pending_uploads_bump_size_cap);
-// this Go-side constant exists so the Put implementation can reject
-// before round-tripping to Postgres.
+// MaxFileBytes is the per-file size cap enforced by Put / PutBatch
+// before any DB round-trip. Mirrors workspace-side ingest
+// (workspace/internal_chat_uploads.py:CHAT_UPLOAD_MAX_FILE_BYTES) and
+// push-mode chat upload cap (chat_files.go:chatUploadMaxBytes). Also
+// pinned at the DB level via the pending_uploads.size_bytes CHECK
+// constraint (currently <=104857600 per migration
+// 20260519200000_pending_uploads_bump_size_cap); this Go-side const
+// exists so a 100 MB+1 byte payload is rejected before Postgres has
+// to look at it.
 //
-// Kept consistent with push-mode (mc#1588) per CTO directive 2026-05-19.
-// SSOT follow-up: GET /uploads/limits will let every surface read the
-// live cap rather than each pinning its own copy.
-const MaxFileBytes = 100 * 1024 * 1024
+// SSOT (task #320): the value derives from uploads.DefaultUploadLimits()
+// — the single source consumed by GET /uploads/limits. Bumping the cap
+// is a one-line edit in internal/uploads/limits.go; this constant
+// follows. The migration's size_bytes CHECK upper bound must be raised
+// in lockstep (separate migration file) since DB constraints can't read
+// Go vars at runtime.
+//
+// Why "var" instead of "const": Go disallows initializing a const from
+// a function call. The runtime cost is zero (DefaultUploadLimits is a
+// pure literal-builder) and tests can still treat it as effectively
+// immutable — no caller mutates it.
+//
+// Why "int" instead of "int64": the existing API surface is
+// len(content)-comparison + make([]byte, MaxFileBytes+1) call sites,
+// both of which want int. We convert from the int64 SSOT field once,
+// here, rather than thread int64 through every caller.
+var MaxFileBytes = int(uploads.DefaultUploadLimits().PerFileBytes)
 
 // ErrNotFound is returned by Get / MarkFetched / Ack when the row is
 // absent. Callers turn this into HTTP 404. Treat acked + expired rows

@@ -21,6 +21,7 @@ import (
 	"github.com/Molecule-AI/molecule-monorepo/platform/internal/plugins"
 	"github.com/Molecule-AI/molecule-monorepo/platform/internal/provisioner"
 	"github.com/Molecule-AI/molecule-monorepo/platform/internal/supervised"
+	"github.com/Molecule-AI/molecule-monorepo/platform/internal/uploads"
 	"github.com/Molecule-AI/molecule-monorepo/platform/internal/ws"
 	"github.com/docker/docker/client"
 	"github.com/gin-contrib/cors"
@@ -103,6 +104,24 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 	// container image, so no new info is exposed.
 	r.GET("/buildinfo", func(c *gin.Context) {
 		c.JSON(200, gin.H{"git_sha": buildinfo.GitSHA})
+	})
+
+	// Upload limits — public, no auth. Single source of truth for
+	// per-file / per-request / max-attachments caps consumed by the
+	// canvas (chat upload pre-flight), the workspace python ingest
+	// (push + poll), and any future client. Background: task #320 +
+	// the SSOT-follow-up markers in pendinguploads/storage.go +
+	// handlers/chat_files.go + canvas/.../chat/uploads.ts. Existence
+	// reason — mc#1588 raised push-mode caps and mc#1589 had to catch
+	// up the poll-mode + DB CHECK side a day later because the
+	// constants were duplicated across 5 surfaces. Public is
+	// intentional: these are platform constraints every uploader
+	// already learns the hard way via a 413 — exposing them via API
+	// removes the "guess the cap then retry on rejection" UX.
+	// Cached in the binary via uploads.DefaultUploadLimits(); no DB
+	// round-trip per request.
+	r.GET("/uploads/limits", func(c *gin.Context) {
+		c.JSON(200, uploads.DefaultUploadLimits())
 	})
 
 	// /admin/liveness — per-subsystem last-tick timestamps. Operators read this
