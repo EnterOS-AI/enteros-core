@@ -416,10 +416,9 @@ func TestWorkspaceCreate(t *testing.T) {
 }
 
 func TestBuildProvisionerConfig_IncludesAwarenessSettings(t *testing.T) {
-	mock := setupTestDB(t)
-	mock.ExpectQuery(`SELECT digest FROM runtime_image_pins`).
-		WithArgs("claude-code").
-		WillReturnError(sql.ErrNoRows)
+	setupTestDB(t)
+	// runtime_image_pins reader removed by RFC internal#617 / task #335
+	// — CP is the SSOT for runtime image pins. No DB lookup here anymore.
 
 	broadcaster := newTestBroadcaster()
 	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", "/tmp/configs")

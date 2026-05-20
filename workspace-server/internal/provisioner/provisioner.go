@@ -105,19 +105,27 @@ type WorkspaceConfig struct {
 	WorkspaceAccess    string // #65: "none" (default), "read_only", or "read_write"
 	ResetClaudeSession bool   // #12: if true, discard the claude-sessions volume before start (fresh session dir)
 
-	// Image, when non-empty, overrides the runtime→image lookup. The handler
-	// layer sets this to the digest-pinned form (`<base>@sha256:<digest>`)
-	// when an operator has promoted a specific runtime build via the
-	// runtime_image_pins table (#2272 layer 1). Empty = legacy behavior,
-	// fall back to RuntimeImages[Runtime] which resolves to the moving
-	// `:latest` tag.
+	// Image, when non-empty, overrides the runtime→image lookup. CP
+	// (molecule-controlplane) is the single SSOT for runtime image digest
+	// pins via its migrations/027_runtime_image_pins table — the pin is
+	// applied at CP's provisioner layer before the workspace-server even
+	// runs, so under the current architecture this field is always empty
+	// on the workspace-server side. Empty = fall back to RuntimeImages
+	// [Runtime] which resolves to the moving `:latest` tag.
+	//
+	// Historical note: molecule-core's own runtime_image_pins table
+	// (workspace-server/migrations 047) was the original aspirational
+	// design (#2272 layer 1) but never received a writer; RFC internal#617 /
+	// task #335 retired the dead reader + table in favor of CP-as-SSOT.
 	Image string
 }
 
 // selectImage resolves the final Docker image ref for a workspace. The handler
 // layer is the source of truth — if it set cfg.Image (the digest-pinned form
-// from runtime_image_pins, #2272), honor that. Otherwise fall back to the
-// runtime→tag lookup in RuntimeImages (legacy `:latest` behavior).
+// supplied by CP, the SSOT for runtime image pins; molecule-core's own
+// runtime_image_pins reader retired by RFC internal#617 / task #335), honor
+// that. Otherwise fall back to the runtime→tag lookup in RuntimeImages
+// (legacy `:latest` behavior).
 //
 // Fail-closed contract (RFC internal#483 / security review 4269 /
 // feedback_platform_must_hardgate_base_contract): if the workspace NAMES a
@@ -378,7 +386,7 @@ func (p *Provisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string, e
 	// + `docker build`s it locally. Replace the placeholder image ref with
 	// the SHA-pinned tag of the freshly-built image before ContainerCreate.
 	//
-	// Pinned overrides (cfg.Image set, e.g. via runtime_image_pins for
+	// Pinned overrides (cfg.Image set, e.g. via CP's runtime_image_pins for
 	// production thin-AMI launches) bypass this path — they pin a digest
 	// the operator chose explicitly.
 	if cfg.Image == "" && cfg.Runtime != "" {
@@ -1597,3 +1605,4 @@ func parseOCIPlatform(s string) *ocispec.Platform {
 	}
 	return &ocispec.Platform{OS: parts[0], Architecture: parts[1]}
 }
+

@@ -89,11 +89,13 @@ func RegistryHost() string {
 // RuntimeImage returns the canonical image reference for the given runtime,
 // using the current RegistryPrefix() and the moving `:latest` tag.
 //
-// For SHA-pinned references (production thin-AMI launches), the
-// runtime_image_pins lookup in handlers/runtime_image_pin.go strips the
-// `:latest` suffix and appends an immutable `@sha256:<digest>` from the DB.
-// That code path naturally inherits any RegistryPrefix() change because it
-// reads from RuntimeImages[runtime] and only re-formats the tag suffix.
+// SHA-pinned references for production thin-AMI launches are applied by CP
+// (molecule-controlplane) at its provisioner layer using CP's
+// migrations/027_runtime_image_pins table, which is the single SSOT for
+// runtime image pins. The local digest-pin reader that previously lived at
+// handlers/runtime_image_pin.go was retired by RFC internal#617 / task #335
+// (it never had a writer; the table was always empty so the reader hit
+// sql.ErrNoRows and fell through to :latest on every provision).
 //
 // Returns the empty string for unknown runtimes; callers should fall through
 // to DefaultImage in that case (matching legacy behavior).
@@ -117,3 +119,4 @@ func computeRuntimeImages() map[string]string {
 	}
 	return out
 }
+

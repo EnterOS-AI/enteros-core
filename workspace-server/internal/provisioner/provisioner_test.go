@@ -506,11 +506,12 @@ func TestWorkspaceConfig_ResetClaudeSessionFieldPresent(t *testing.T) {
 
 // ---------- selectImage (#2272 layer 1) ----------
 
-// TestSelectImage_PrefersExplicitImage: when the handler resolved a digest
-// pin via runtime_image_pins, cfg.Image is set. selectImage must honor it
-// and ignore the cfg.Runtime → :latest fallback. This is the load-bearing
-// invariant for digest pinning — if it ever silently reverts to :latest,
-// we lose the "one bad publish doesn't break every workspace" guarantee.
+// TestSelectImage_PrefersExplicitImage: when CP (the SSOT for runtime image
+// pins under RFC internal#617 / task #335) supplied a digest pin via
+// cfg.Image, selectImage must honor it and ignore the cfg.Runtime → :latest
+// fallback. This is the load-bearing invariant for digest pinning — if it
+// ever silently reverts to :latest, we lose the "one bad publish doesn't
+// break every workspace" guarantee.
 func TestSelectImage_PrefersExplicitImage(t *testing.T) {
 	pinned := "ghcr.io/molecule-ai/workspace-template-claude-code@sha256:3d6761a97ed07d7d33cfc19a8fbab81175d9d9179618d493dbc00c5f7ef076a3"
 	got, err := selectImage(WorkspaceConfig{Runtime: "claude-code", Image: pinned})
