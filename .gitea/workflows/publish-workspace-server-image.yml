@@ -43,6 +43,14 @@ on:
 # `cancel-in-progress: false`; that is not acceptable for a workflow with a
 # production deploy job. Per-SHA image tags are immutable, and staging-latest is
 # best-effort last-writer-wins metadata.
+#
+# 2026-05-20 retrigger: run #86994 on mc#1589 merge sha 0f0f1ba2 failed at
+# setup-buildx-action with EACCES on PC2 WSL publish runner — the runner's
+# DOCKER_CONFIG=/home/hongming/.docker-ecr/ dir didn't have a buildx/certs
+# subdir writable by the container's UID 1001. Hot-patched the dir perms;
+# this chore push retriggers the workflow. Proper fix (per-runner
+# DOCKER_CONFIG owned by 1001, internal#597 --env HOME=/home/runner pattern)
+# is tracked as a CI-hygiene follow-up — not in scope here.
 
 permissions:
   contents: read
