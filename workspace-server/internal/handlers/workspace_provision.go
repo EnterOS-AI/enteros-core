@@ -261,7 +261,14 @@ func (h *WorkspaceHandler) buildProvisionerConfig(
 	workspaceAccess := payload.WorkspaceAccess
 	if (workspacePath == "" || workspaceAccess == "") && db.DB != nil {
 		var dbDir, dbAccess string
-		if err := db.DB.QueryRow(
+		// QueryRowContext (not QueryRow) so the provision-timeout ctx
+		// propagates here too. Previously ctx flowed in only to be passed
+		// to resolveRuntimeImage; that dead reader was removed by
+		// RFC internal#617 / task #335. Wiring ctx into the surviving DB
+		// query keeps the parameter load-bearing and is a small correctness
+		// nudge (a 10s ProvisionTimeout now actually bounds this lookup).
+		if err := db.DB.QueryRowContext(
+			ctx,
 			`SELECT COALESCE(workspace_dir, ''), COALESCE(workspace_access, 'none') FROM workspaces WHERE id = $1`,
 			workspaceID,
 		).Scan(&dbDir, &dbAccess); err == nil {
@@ -293,7 +300,15 @@ func (h *WorkspaceHandler) buildProvisionerConfig(
 		PlatformURL:        h.platformURL,
 		AwarenessURL:       os.Getenv("AWARENESS_URL"),
 		AwarenessNamespace: awarenessNamespace,
-		Image:              resolveRuntimeImage(ctx, payload.Runtime),
+		// Image left empty — molecule-core's runtime_image_pins table (mig
+		// 047, dead reader removed by RFC internal#617 / task #335) was an
+		// aspirational SSOT that never received a writer. CP's
+		// runtime_image_pins (CP migration 027) is the single SSOT; the
+		// pin is applied at CP's provisioner layer before this code path
+		// runs. Empty here means selectImage() falls back to the legacy
+		// RuntimeImages[Runtime] :latest lookup, which is what the dead
+		// reader's sql.ErrNoRows path was producing already.
+		Image: "",
 	}
 }
 
@@ -970,3 +985,4 @@ func (h *WorkspaceHandler) provisionWorkspaceCP(workspaceID, templatePath string
 
 	log.Printf("CPProvisioner: workspace %s started as machine %s via control plane", workspaceID, machineID)
 }
+

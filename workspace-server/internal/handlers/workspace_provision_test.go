@@ -749,9 +749,8 @@ func TestBuildProvisionerConfig_WorkspacePathFromEnv(t *testing.T) {
 	mock.ExpectQuery(`SELECT COALESCE\(workspace_dir`).
 		WithArgs("ws-env").
 		WillReturnError(sql.ErrNoRows)
-	mock.ExpectQuery(`SELECT digest FROM runtime_image_pins`).
-		WithArgs("claude-code").
-		WillReturnError(sql.ErrNoRows)
+	// runtime_image_pins reader removed by RFC internal#617 / task #335
+	// — CP is the SSOT for runtime image pins. No DB lookup here anymore.
 
 	broadcaster := newTestBroadcaster()
 	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
