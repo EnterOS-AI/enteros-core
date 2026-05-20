@@ -1,4 +1,4 @@
-name: Lint no tenant GITEA/GITHUB token write
+name: Lint no tenant GITEA or GITHUB token write
 
 # Task #146 — CI guardrail companion to RFC#523's `lint-forbidden-env-keys.yml`.
 #
