@@ -75,8 +75,12 @@ permissions:
 env:
   # ECR registry (post-2026-05-06 SSOT for tenant images).
   # publish-workspace-server-image.yml pushes here.
-  IMAGE_NAME: 153263036946.dkr.ecr.us-east-2.amazonaws.com/molecule-ai/platform
-  TENANT_IMAGE_NAME: 153263036946.dkr.ecr.us-east-2.amazonaws.com/molecule-ai/platform-tenant
+  # SSOT-Instance-10 (#333): triplet sourced from org/repo var `ECR_REGISTRY` with
+  # the current prod-account literal as bootstrap fallback. When the org var is set,
+  # the fallback becomes dead code and switching accounts/regions is a one-line
+  # change at the org level. Pattern mirrors `vars.CP_URL || 'literal'` below.
+  IMAGE_NAME: ${{ vars.ECR_REGISTRY || '153263036946.dkr.ecr.us-east-2.amazonaws.com' }}/molecule-ai/platform
+  TENANT_IMAGE_NAME: ${{ vars.ECR_REGISTRY || '153263036946.dkr.ecr.us-east-2.amazonaws.com' }}/molecule-ai/platform-tenant
   # CP endpoint for redeploy-fleet (used in promote step below).
   CP_URL: ${{ vars.CP_URL || 'https://staging-api.moleculesai.app' }}
   GITHUB_SERVER_URL: https://git.moleculesai.app
