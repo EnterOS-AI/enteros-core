@@ -28,12 +28,10 @@ on:
   pull_request:
     paths:
       - '.gitea/workflows/**'
-      - '.github/workflows/**'
   push:
     branches: [main, staging]
     paths:
       - '.gitea/workflows/**'
-      - '.github/workflows/**'
 
 permissions:
   contents: read
@@ -75,8 +73,11 @@ jobs:
           fails = []
           warnings = []
 
+          # Gitea is SSOT for molecule-core CI per task #347 / memory
+          # reference_molecule_core_actions_gitea_only. The legacy
+          # .github/workflows/ tree was deleted in SSOT-Instance-4 (#331).
           roots = []
-          for root in ('.gitea/workflows', '.github/workflows'):
+          for root in ('.gitea/workflows',):
               if os.path.isdir(root):
                   roots.append(root)
 
