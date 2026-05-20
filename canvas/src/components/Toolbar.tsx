@@ -68,14 +68,103 @@ export function Toolbar() {
     return c;
   }, [nodes]);
 
+  /**
+   * Stop All - task #377 fix.
+   *
+   * BEFORE this PR: directly POSTed `/workspaces/:id/restart`, which tears
+   * the container down and back up. That kills in-flight tool subprocesses
+   * (e.g. `bash -c 'sleep 600'`) but is heavy and discards any in-progress
+   * agent state. It also bypasses the runtime-side fast cancel path (task
+   * #377 PR#40 in template-claude-code) - meaning flipping
+   * `MOLECULE_STOP_PROPAGATE=true` would produce zero canary signal because
+   * nothing ever invokes `executor.cancel()` in production.
+   *
+   * AFTER this PR (two-phase polite cancel):
+   *
+   * 1. POST `tasks/cancel` (A2A JSON-RPC) to each active workspace's
+   *    `/workspaces/:id/a2a` proxy. The platform proxies the envelope to
+   *    the workspace runtime; the a2a-sdk framework dispatches `tasks/cancel`
+   *    to `AgentExecutor.cancel()` (a2a-sdk 1.0.3
+   *    `a2a/compat/v0_3/types.py` line 1125 pins the wire literal as
+   *    `Literal["tasks/cancel"]`; A2A protocol spec section 9.4.5 maps the
+   *    abstract `CancelTask` operation to that wire string). The runtime's
+   *    executor cancel path signals the CLI subprocess group with
+   *    SIGTERM/grace/SIGKILL (template-claude-code PR#40 `stop_propagate.py`).
+   *
+   * 2. Poll the canvas store (the platform pushes `TASK_UPDATED` over WS
+   *    on `active_tasks` changes - `canvas-events.ts` line 400) for up to
+   *    `STOP_ALL_DRAIN_TIMEOUT_MS`. A workspace whose `activeTasks` drops
+   *    to 0 is considered drained and is NOT restarted.
+   *
+   * 3. For any workspace that DID NOT drain inside the timeout - runtime
+   *    is on an old image without the cancel path, or the cancel
+   *    propagation is stuck - fall back to the original heavy
+   *    `/workspaces/:id/restart`. The original behavior is preserved as a
+   *    floor so a stuck workspace still gets stopped; the polite path is
+   *    a fast top-up that lets well-behaved workspaces cancel without
+   *    losing context.
+   *
+   * The polite-cancel envelope mirrors `ScheduleTab.handleRunNow` (line 168)
+   * which is the only other place in canvas that POSTs `/workspaces/:id/a2a`
+   * directly. Method string `tasks/cancel` and empty `params` match the
+   * a2a-sdk shape verified above. The proxy adds `jsonrpc:"2.0"` and `id`
+   * via `normalizeA2APayload` server-side, so the canvas envelope omits them.
+   */
   const stopAll = useCallback(async () => {
     setStopping(true);
     const active = nodes.filter((n) => (n.data.activeTasks as number) > 0);
+    const activeIds = active.map((n) => n.id);
+
+    // Phase 1 - polite cancel on every active workspace in parallel.
+    // Errors are swallowed (same shape as the pre-fix /restart
+    // Promise.all): a 4xx/5xx on tasks/cancel just means we fall through
+    // to /restart for that workspace below.
     await Promise.all(
-      active.map((n) =>
-        api.post(`/workspaces/${n.id}/restart`).catch(() => {})
+      activeIds.map((id) =>
+        api
+          .post(`/workspaces/${id}/a2a`, {
+            method: "tasks/cancel",
+            params: {},
+          })
+          .catch(() => {})
       )
     );
+
+    // Phase 2 - poll the store for activeTasks reaching 0, with a hard
+    // timeout. STOP_ALL_DRAIN_TIMEOUT_MS is sized to cover the runtime's
+    // own SIGTERM-grace (5s in template-claude-code stop_propagate.py
+    // `_SIGTERM_GRACE_S`) plus a small WS round-trip buffer for the
+    // TASK_UPDATED push. STOP_ALL_POLL_INTERVAL_MS keeps the poll cheap
+    // (no animation jitter, no busy-wait).
+    const STOP_ALL_DRAIN_TIMEOUT_MS = 8000;
+    const STOP_ALL_POLL_INTERVAL_MS = 250;
+    const deadline = Date.now() + STOP_ALL_DRAIN_TIMEOUT_MS;
+    let undrained = new Set(activeIds);
+    while (undrained.size > 0 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, STOP_ALL_POLL_INTERVAL_MS));
+      const fresh = useCanvasStore.getState().nodes;
+      const stillActive = new Set<string>();
+      for (const id of undrained) {
+        const n = fresh.find((x) => x.id === id);
+        // Missing node (workspace deleted mid-cancel) is treated as
+        // drained - there's nothing left to restart and reporting it as
+        // "still running" would be a lie.
+        if (n && (n.data.activeTasks as number) > 0) stillActive.add(id);
+      }
+      undrained = stillActive;
+    }
+
+    // Phase 3 - hard-restart anything that did not drain. This is the
+    // same call shape as the pre-fix Stop All, so behavior is strictly a
+    // superset: undrained workspaces still get the heavy stop, drained
+    // ones are spared.
+    if (undrained.size > 0) {
+      await Promise.all(
+        Array.from(undrained).map((id) =>
+          api.post(`/workspaces/${id}/restart`).catch(() => {})
+        )
+      );
+    }
     setStopping(false);
   }, [nodes]);
 
