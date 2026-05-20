@@ -1,4 +1,4 @@
-name: Lint no tenant GITEA/GITHUB token write
+name: Lint no tenant GITEA or GITHUB token write
 
 # Task #146 — CI guardrail companion to RFC#523's `lint-forbidden-env-keys.yml`.
 #
@@ -58,6 +58,9 @@ env:
   GITHUB_SERVER_URL: https://git.moleculesai.app
 
 jobs:
+  # bp-exempt: advisory RFC#523 lint; PR review gate is review-driven, not BP-driven.
+  # (Carried with the workflow-name rename in PR mc#1593 so the renamed
+  # context emission satisfies lint_required_context_exists_in_bp Tier 2g.)
   scan:
     name: Scan for repo-host token write into tenant workspace surface
     runs-on: ubuntu-latest
