@@ -70,6 +70,97 @@ var restartDebounceWindow = 60 * time.Second
 // workspace-server yet — that's a separate RFC.
 var restartByIDDropCounter atomic.Uint64
 
+// fileWriteRestartDebounceWindow is the per-workspace coalescing window for
+// the file-write → RestartByID trigger fired by templates.go's WriteFile,
+// DeleteFile, and ReplaceFiles handlers (and template_import.go's variants).
+//
+// Background (internal#624 2026-05-20): canvas Save fires N PUT /files
+// requests in a 30-60s burst (claude-code SEO agent observed 10-17 files in
+// 60s). Each successful write previously fired `goAsync(RestartByID)`. The
+// 60s self-fire debounce in RestartByID itself catches calls 1-60s, but
+// writes at T+65s+ pass the debounce, set pending=true on a still-running
+// coalesceRestart cycle, and drain immediately into cycle 2 — which DELETEs
+// + recreates EC2 mid-burst, returning 500 EC2InstanceStateInvalidException
+// on the in-flight user PUTs.
+//
+// 15s is sized to absorb a canvas Save burst (writes typically land within
+// a 5-10s window) while still letting a deliberate "edit, wait, edit again"
+// pattern restart twice. Bigger than that would silently swallow legitimate
+// rapid-iteration edits; smaller would let burst tails leak through.
+var fileWriteRestartDebounceWindow = 15 * time.Second
+
+// fileWriteRestartLastFireAt records the last time `maybeRestartAfterFileWrite`
+// actually fired a restart for each workspace. sync.Map (not RWMutex+map)
+// because writes happen on every successful file-write handler, reads on
+// every subsequent file-write handler call — both per-workspace — and the
+// keys are sparse + long-lived. Stored as int64 unix-nano so the load/store
+// path can stay lock-free (atomic.Int64 inside sync.Map.Value is fine, but
+// time.Time itself isn't atomically loadable).
+var fileWriteRestartLastFireAt sync.Map // map[workspaceID]*atomic.Int64
+
+// fileWriteRestartDropCounter counts how many file-write restart triggers
+// were silently coalesced. Same observability rationale as
+// restartByIDDropCounter — package-level atomic so tests can assert the
+// drop fired and ops can correlate with "user clicked Save 10 times,
+// only saw 1 restart cycle".
+var fileWriteRestartDropCounter atomic.Uint64
+
+// maybeRestartAfterFileWrite is the call-site debounce wrapper for the 9
+// file-write trigger sites in templates.go + template_import.go. Replaces
+// the direct `goAsync(func() { wh.RestartByID(wsID) })` pattern with a
+// 15s per-workspace coalescing window:
+//
+//   - First call (no prior fire OR last fire >15s ago): records the
+//     current timestamp and fires goAsync(RestartByID).
+//   - Subsequent calls within 15s of the last fire: silently dropped,
+//     drop counter incremented.
+//
+// This is the call-site-layer protection (internal#624 Path A). The drain-
+// loop layer in coalesceRestart (Path B, re-stamping restartStartedAt per
+// iteration) is the platform-layer defense in depth — together they close
+// the file-write tight-loop class regardless of which entry point fires.
+//
+// Stateless on the handler so any handler with access to a WorkspaceHandler
+// can use it; the per-workspace state lives in the package-level sync.Map.
+func (h *WorkspaceHandler) maybeRestartAfterFileWrite(workspaceID string) {
+	now := time.Now().UnixNano()
+
+	// LoadOrStore the per-workspace last-fire stamp. First write for a
+	// brand-new workspace falls through the CompareAndSwap below because
+	// the zero-init value (0) is far enough in the past to satisfy the
+	// "last fire >15s ago" predicate.
+	sv, _ := fileWriteRestartLastFireAt.LoadOrStore(workspaceID, new(atomic.Int64))
+	stamp := sv.(*atomic.Int64)
+
+	// CAS loop: read last, decide, swap. We use CAS instead of Lock/Unlock
+	// because the typical case is "thousands of writes, one restart per
+	// 15s" — uncontended atomic is ~5ns vs ~30ns mutex. Bounded retry
+	// because in the rare contended case (two writes finishing nanoseconds
+	// apart) one will win the swap and the other will see the new stamp,
+	// drop, and bail.
+	for retry := 0; retry < 4; retry++ {
+		last := stamp.Load()
+		elapsed := time.Duration(now - last)
+		if last != 0 && elapsed < fileWriteRestartDebounceWindow {
+			// Within debounce window — drop silently.
+			fileWriteRestartDropCounter.Add(1)
+			log.Printf("maybeRestartAfterFileWrite: %s — coalesced "+
+				"(last fire %s ago < %s window; total dropped=%d)",
+				workspaceID, elapsed.Round(time.Millisecond),
+				fileWriteRestartDebounceWindow,
+				fileWriteRestartDropCounter.Load())
+			return
+		}
+		if stamp.CompareAndSwap(last, now) {
+			break
+		}
+		// Another writer beat us to the stamp update. Re-read and retry;
+		// the retry will almost certainly see the new value and drop.
+	}
+
+	h.goAsync(func() { h.RestartByID(workspaceID) })
+}
+
 // isRestarting reports whether a restart cycle is currently in flight for
 // the workspace. Callers that have their own "container looks dead" probe
 // MUST consult this before triggering a restart, because during the
@@ -513,6 +604,27 @@ func coalesceRestart(workspaceID string, cycle func()) {
 	// inside provisionWorkspace, so any writes that committed since the
 	// last cycle are picked up. Continues until no pending request was
 	// observed at the top of an iteration.
+	//
+	// internal#624 Path B (defense in depth for the file-write tight-loop
+	// class): re-stamp restartStartedAt at the top of every drain iteration
+	// past the first. The original design (stamp only on false→true edge)
+	// treated all drained pending as "one event from the debounce's POV",
+	// which is correct for the secrets-batch use case but lets a file-write
+	// burst at T+65s of a 60s drain pipe straight into another full cycle.
+	// Re-stamping closes that hole — each drained cycle gets its own fresh
+	// debounce window, so any RestartByID arriving during cycle N is
+	// dropped by shouldDebounceRestart instead of accumulating into
+	// pending=true for cycle N+1.
+	//
+	// The original "one cycle picks up everyone who arrived during it"
+	// semantic still holds for the secrets-write path: callers that hit
+	// coalesceRestart during cycle 1 still set pending=true and still get
+	// their effects landed in cycle 2. What changes is that callers
+	// arriving during cycle 2 (via RestartByID) now hit the re-stamped
+	// debounce and are dropped instead of being chained into cycle 3,
+	// which is exactly the chain that produced the 22:08-22:10 thrash on
+	// 3fe84b89.
+	iteration := 0
 	for {
 		state.mu.Lock()
 		if !state.pending {
@@ -520,7 +632,13 @@ func coalesceRestart(workspaceID string, cycle func()) {
 			return // defer clears running
 		}
 		state.pending = false
+		if iteration > 0 {
+			// Re-stamp for drained iterations only; the false→true edge
+			// already stamped at the top of coalesceRestart.
+			state.restartStartedAt = time.Now()
+		}
 		state.mu.Unlock()
+		iteration++
 
 		cycle()
 	}

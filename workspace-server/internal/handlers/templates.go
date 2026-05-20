@@ -570,9 +570,13 @@ func (h *TemplatesHandler) WriteFile(c *gin.Context) {
 		}
 		c.JSON(http.StatusOK, gin.H{"status": "saved", "path": filePath})
 		if h.wh != nil {
-			// RFC internal#524 Layer 1: per-handler goAsync (drains via h.wh.waitAsyncForTest)
-			wsID := workspaceID
-			h.wh.goAsync(func() { h.wh.RestartByID(wsID) })
+			// internal#624: 15s per-workspace debounce around the file-write
+			// → RestartByID trigger. Canvas Save fires N PUTs in a burst;
+			// without this each PUT chains into the coalesceRestart drain
+			// loop and produces back-to-back EC2 recreate cycles. The
+			// helper still uses goAsync internally (drains via
+			// h.wh.waitAsyncForTest), preserving RFC internal#524 Layer 1.
+			h.wh.maybeRestartAfterFileWrite(workspaceID)
 		}
 		return
 	}
@@ -586,9 +590,13 @@ func (h *TemplatesHandler) WriteFile(c *gin.Context) {
 		}
 		c.JSON(http.StatusOK, gin.H{"status": "saved", "path": filePath})
 		if h.wh != nil {
-			// RFC internal#524 Layer 1: per-handler goAsync (drains via h.wh.waitAsyncForTest)
-			wsID := workspaceID
-			h.wh.goAsync(func() { h.wh.RestartByID(wsID) })
+			// internal#624: 15s per-workspace debounce around the file-write
+			// → RestartByID trigger. Canvas Save fires N PUTs in a burst;
+			// without this each PUT chains into the coalesceRestart drain
+			// loop and produces back-to-back EC2 recreate cycles. The
+			// helper still uses goAsync internally (drains via
+			// h.wh.waitAsyncForTest), preserving RFC internal#524 Layer 1.
+			h.wh.maybeRestartAfterFileWrite(workspaceID)
 		}
 		return
 	}
@@ -602,9 +610,13 @@ func (h *TemplatesHandler) WriteFile(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, gin.H{"status": "saved", "path": filePath})
 	if h.wh != nil {
-		// RFC internal#524 Layer 1: per-handler goAsync (drains via h.wh.waitAsyncForTest)
-		wsID := workspaceID
-		h.wh.goAsync(func() { h.wh.RestartByID(wsID) })
+		// internal#624: 15s per-workspace debounce around the file-write
+		// → RestartByID trigger. Canvas Save fires N PUTs in a burst;
+		// without this each PUT chains into the coalesceRestart drain
+		// loop and produces back-to-back EC2 recreate cycles. The
+		// helper still uses goAsync internally (drains via
+		// h.wh.waitAsyncForTest), preserving RFC internal#524 Layer 1.
+		h.wh.maybeRestartAfterFileWrite(workspaceID)
 	}
 }
 
@@ -657,9 +669,13 @@ func (h *TemplatesHandler) DeleteFile(c *gin.Context) {
 		}
 		c.JSON(http.StatusOK, gin.H{"status": "deleted", "path": filePath})
 		if h.wh != nil {
-			// RFC internal#524 Layer 1: per-handler goAsync (drains via h.wh.waitAsyncForTest)
-			wsID := workspaceID
-			h.wh.goAsync(func() { h.wh.RestartByID(wsID) })
+			// internal#624: 15s per-workspace debounce around the file-write
+			// → RestartByID trigger. Canvas Save fires N PUTs in a burst;
+			// without this each PUT chains into the coalesceRestart drain
+			// loop and produces back-to-back EC2 recreate cycles. The
+			// helper still uses goAsync internally (drains via
+			// h.wh.waitAsyncForTest), preserving RFC internal#524 Layer 1.
+			h.wh.maybeRestartAfterFileWrite(workspaceID)
 		}
 		return
 	}
@@ -677,9 +693,13 @@ func (h *TemplatesHandler) DeleteFile(c *gin.Context) {
 		}
 		c.JSON(http.StatusOK, gin.H{"status": "deleted", "path": filePath})
 		if h.wh != nil {
-			// RFC internal#524 Layer 1: per-handler goAsync (drains via h.wh.waitAsyncForTest)
-			wsID := workspaceID
-			h.wh.goAsync(func() { h.wh.RestartByID(wsID) })
+			// internal#624: 15s per-workspace debounce around the file-write
+			// → RestartByID trigger. Canvas Save fires N PUTs in a burst;
+			// without this each PUT chains into the coalesceRestart drain
+			// loop and produces back-to-back EC2 recreate cycles. The
+			// helper still uses goAsync internally (drains via
+			// h.wh.waitAsyncForTest), preserving RFC internal#524 Layer 1.
+			h.wh.maybeRestartAfterFileWrite(workspaceID)
 		}
 		return
 	}
@@ -692,8 +712,12 @@ func (h *TemplatesHandler) DeleteFile(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, gin.H{"status": "deleted", "path": filePath})
 	if h.wh != nil {
-		// RFC internal#524 Layer 1: per-handler goAsync (drains via h.wh.waitAsyncForTest)
-		wsID := workspaceID
-		h.wh.goAsync(func() { h.wh.RestartByID(wsID) })
+		// internal#624: 15s per-workspace debounce around the file-write
+		// → RestartByID trigger. Canvas Save fires N PUTs in a burst;
+		// without this each PUT chains into the coalesceRestart drain
+		// loop and produces back-to-back EC2 recreate cycles. The
+		// helper still uses goAsync internally (drains via
+		// h.wh.waitAsyncForTest), preserving RFC internal#524 Layer 1.
+		h.wh.maybeRestartAfterFileWrite(workspaceID)
 	}
 }
