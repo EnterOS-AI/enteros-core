@@ -375,6 +375,12 @@ jobs:
       - name: Run priority-runtimes E2E (claude-code + hermes — skips when keys absent)
         if: needs.detect-changes.outputs.api == 'true'
         run: bash tests/e2e/test_priority_runtimes_e2e.sh
+      - name: Install standalone runtime parser from Gitea registry
+        if: needs.detect-changes.outputs.api == 'true'
+        run: |
+          python3 -m pip install --no-deps \
+            --index-url https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/ \
+            molecule-ai-workspace-runtime
       - name: Run poll-mode + since_id cursor E2E (#2339)
         if: needs.detect-changes.outputs.api == 'true'
         run: bash tests/e2e/test_poll_mode_e2e.sh
@@ -401,4 +407,3 @@ jobs:
         run: |
           docker rm -f "$PG_CONTAINER" 2>/dev/null || true
           docker rm -f "$REDIS_CONTAINER" 2>/dev/null || true
-

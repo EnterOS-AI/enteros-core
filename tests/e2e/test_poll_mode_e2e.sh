@@ -179,8 +179,14 @@ echo "--- Phase 3.5: Python parser classifies real server response (#2967) ---"
 PARSE_RESULT=$(WORKSPACE_ID="00000000-0000-0000-0000-000000000001" \
   python3 -c "
 import json, sys
-sys.path.insert(0, '$(cd "$(dirname "$0")/../../workspace" && pwd)')
-import a2a_response
+try:
+    from molecule_runtime import a2a_response
+except ModuleNotFoundError as exc:
+    raise SystemExit(
+        'molecule-ai-workspace-runtime is required for poll-mode parser '
+        'coverage; install it from the Gitea package registry before running '
+        'this E2E'
+    ) from exc
 data = json.loads(r'''$A2A_RESP''')
 v = a2a_response.parse(data)
 print(type(v).__name__)
