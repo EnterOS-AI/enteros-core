@@ -41,10 +41,17 @@ import (
 )
 
 // Per-file size cap. Mirrors workspace-side ingest_handler
-// (workspace/internal_chat_uploads.py:198). Pinned at the DB level via
-// the size_bytes CHECK constraint; this Go-side constant exists so the
-// Put implementation can reject before round-tripping to Postgres.
-const MaxFileBytes = 25 * 1024 * 1024
+// (workspace/internal_chat_uploads.py:CHAT_UPLOAD_MAX_FILE_BYTES) and the
+// push-mode chat upload cap (chat_files.go:chatUploadMaxBytes). Pinned at
+// the DB level via the size_bytes CHECK constraint (currently
+// 104857600 per migration 20260519200000_pending_uploads_bump_size_cap);
+// this Go-side constant exists so the Put implementation can reject
+// before round-tripping to Postgres.
+//
+// Kept consistent with push-mode (mc#1588) per CTO directive 2026-05-19.
+// SSOT follow-up: GET /uploads/limits will let every surface read the
+// live cap rather than each pinning its own copy.
+const MaxFileBytes = 100 * 1024 * 1024
 
 // ErrNotFound is returned by Get / MarkFetched / Ack when the row is
 // absent. Callers turn this into HTTP 404. Treat acked + expired rows

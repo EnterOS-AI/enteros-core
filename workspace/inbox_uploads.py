@@ -57,26 +57,35 @@ logger = logging.getLogger(__name__)
 # doesn't ship the in-container HTTP server).
 CHAT_UPLOAD_DIR = "/workspace/.molecule/chat-uploads"
 
-# Per-file safety net. The platform enforces 25 MB on the staging side,
-# but a buggy or hostile platform response shouldn't be able to fill the
-# workspace's disk — refuse to write more than this even if the response
-# claims a larger Content-Length.
-MAX_FILE_BYTES = 25 * 1024 * 1024
+# Per-file safety net. The platform enforces 100 MB on the staging side
+# (workspace-server migration 20260519200000_pending_uploads_bump_size_cap
+# + pendinguploads.MaxFileBytes — bumped from 25 MB per CTO directive
+# 2026-05-19 to match push-mode mc#1588), but a buggy or hostile
+# platform response shouldn't be able to fill the workspace's disk —
+# refuse to write more than this even if the response claims a larger
+# Content-Length.
+MAX_FILE_BYTES = 100 * 1024 * 1024
 
-# Network deadline for the GET. Tuned for a 25 MB transfer over a
-# reasonable consumer link (~5 Mbps gives ~40s for the full payload),
-# plus headroom for TLS + platform auth. Aligned with inbox poller's
-# 10s default for /activity calls — both are user-perceived latency.
-DEFAULT_FETCH_TIMEOUT = 60.0
+# Network deadline for the GET. Tuned for a 100 MB transfer over a
+# reasonable consumer link (~5 Mbps gives ~160s for the full payload),
+# plus headroom for TLS + platform auth. Scaled up from the original
+# 60s (sized for 25 MB) when the per-file cap moved to 100 MB — a fixed
+# 60s would fire BEFORE a legitimate slow uplink finished streaming, the
+# same wrong-reason failure mc#1588 fixed on the canvas side (forensic
+# a99ab0a1 reno-stars). Aligned with platform httpClient.Timeout (1200s
+# in chat_files.go after mc#1588) — laptop pull side gets a smaller
+# value because it's downstream of a fully-staged row, not a live
+# multipart parse.
+DEFAULT_FETCH_TIMEOUT = 240.0
 
 # Concurrency cap for ``BatchFetcher``. Four workers is enough headroom
 # for the realistic "user dragged 3-4 files into chat at once" case
 # while bounding the platform's per-workspace fan-out. The cap matters
 # because the platform's /content endpoint reads bytea from Postgres in
 # a single round-trip per request — N workers = N concurrent DB reads
-# of up to 25 MB each, so a higher cap could pressure platform memory
-# without much UX win (network bandwidth is the bottleneck once the
-# bytes are buffered).
+# of up to 100 MB each (post-mc#1588 cap), so a higher cap could pressure
+# platform memory without much UX win (network bandwidth is the
+# bottleneck once the bytes are buffered).
 DEFAULT_BATCH_FETCH_WORKERS = 4
 
 # Upper bound on how long ``BatchFetcher.wait_all`` blocks the inbox

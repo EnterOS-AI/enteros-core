@@ -572,8 +572,25 @@ func TestPollUpload_PerFileCapPreStorage_413(t *testing.T) {
 	// Pin the early-reject branch (fh.Size > MaxFileBytes) BEFORE we
 	// read the part into memory. Without this, an oversize file
 	// would hit the storage layer's belt-and-suspenders check, which
-	// works but burns ~25 MB of memory + DB round-trip first. Send
-	// 25 MB + 1 byte → 413 with the file size in the response.
+	// works but burns ~100 MB of memory + DB round-trip first.
+	//
+	// Structural precondition: pendinguploads.MaxFileBytes must be
+	// strictly LESS than chatUploadMaxBytes (the body cap on
+	// http.MaxBytesReader at chat_files.go:290) — otherwise a single
+	// oversize part never reaches our handler; the body reader 400s
+	// first. As of 2026-05-19 with the poll-mode bump to 100 MB and
+	// the push-mode bump in mc#1588 also to 100 MB, per-file == body
+	// for single-file uploads and this branch is only reachable in
+	// the multi-file scenario (see TestPollUpload_AtomicRollbackOn
+	// SecondFileTooLarge for that path). When chatUploadMaxBytes is
+	// next bumped above MaxFileBytes (e.g., RFC for the SSOT
+	// GET /uploads/limits endpoint reshapes the layering) this test
+	// can run again.
+	if pendinguploads.MaxFileBytes >= chatUploadMaxBytes {
+		t.Skipf("per-file cap %d >= body cap %d; the body MaxBytesReader 400s before the per-file 413 branch is reachable. Re-enable when body cap > per-file cap.",
+			pendinguploads.MaxFileBytes, chatUploadMaxBytes)
+	}
+
 	mock := setupTestDB(t)
 	setupTestRedis(t)
 
@@ -584,7 +601,7 @@ func TestPollUpload_PerFileCapPreStorage_413(t *testing.T) {
 	h := NewChatFilesHandler(NewTemplatesHandler(t.TempDir(), nil, nil)).
 		WithPendingUploads(store, nil)
 
-	// 25 MB + 1 byte. Single file, large enough to trip the early
+	// MaxFileBytes + 1. Single file, large enough to trip the early
 	// size check.
 	oversize := make([]byte, pendinguploads.MaxFileBytes+1)
 	body, ct := pollUploadFixture(t, map[string][]byte{"big.bin": oversize})
@@ -655,6 +672,25 @@ func TestPollUpload_SanitizesFilenameInResponse(t *testing.T) {
 // real atomicity guarantee is the integration test in
 // pending_uploads_integration_test.go.
 func TestPollUpload_AtomicRollbackOnSecondFileTooLarge(t *testing.T) {
+	// Same structural precondition as
+	// TestPollUpload_PerFileCapPreStorage_413: pendinguploads.MaxFileBytes
+	// < chatUploadMaxBytes. The two-file fixture below sends
+	// MaxFileBytes+1 worth of bytes; when per-file == body cap, that
+	// total trips the body reader first (400) before our handler can
+	// reach the per-file 413 branch.
+	//
+	// Per-call atomicity is still pinned at the storage layer in
+	// TestIntegration_PendingUploads_PutBatch_RollsBackOnAnyError
+	// (workspace-server/internal/handlers/pending_uploads_integration_test.go)
+	// — that test exercises the same all-or-nothing guarantee against
+	// a real Postgres without depending on the body-cap arithmetic
+	// here. Re-enable this handler-level test when body cap exceeds
+	// per-file cap again.
+	if pendinguploads.MaxFileBytes >= chatUploadMaxBytes {
+		t.Skipf("per-file cap %d >= body cap %d; the body MaxBytesReader 400s before the per-file 413 branch is reachable. Storage-level atomicity covered by integration test. Re-enable when body cap > per-file cap.",
+			pendinguploads.MaxFileBytes, chatUploadMaxBytes)
+	}
+
 	mock := setupTestDB(t)
 	setupTestRedis(t)
 
