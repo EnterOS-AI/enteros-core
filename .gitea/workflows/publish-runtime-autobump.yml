@@ -29,6 +29,14 @@ on:
   pull_request:
     paths:
       - "workspace/**"
+      # mc#1578 / a05add29 cure: build_runtime_package.py owns PYPROJECT_TEMPLATE
+      # (deps, classifiers, project metadata). A change there is publish-affecting
+      # even when workspace/** is untouched, so the autobump must fire to claim
+      # the next runtime-v$VERSION tag. Without this, manual tagging races PyPI
+      # (e.g. runtime-v0.1.18 collided with the 2026-04-27 PyPI 0.1.18 publish,
+      # blocking the python-multipart pin from reaching prod).
+      - "scripts/build_runtime_package.py"
+      - "scripts/test_build_runtime_package.py"
   # Bump-and-tag on main/staging push (the actual operational trigger).
   push:
     branches:
@@ -36,6 +44,8 @@ on:
       - staging
     paths:
       - "workspace/**"
+      - "scripts/build_runtime_package.py"
+      - "scripts/test_build_runtime_package.py"
   # Manual dispatch — useful when Gitea Actions API (/actions/*) is
   # unreachable (e.g. act_runner 404 on Gitea 1.22.6) and we cannot
   # re-trigger via curl.
