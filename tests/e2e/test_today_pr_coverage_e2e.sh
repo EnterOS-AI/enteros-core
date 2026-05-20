@@ -81,8 +81,8 @@ WS_A_NAME="e2e-cov-alpha-$$"
 WS_B_NAME="e2e-cov-beta-$$"
 
 R=$(curl -s -X POST "$BASE/workspaces" "${ADMIN_AUTH[@]}" -H "Content-Type: application/json" \
-  -d "{\"name\":\"$WS_A_NAME\",\"tier\":1}")
-check "POST /workspaces (alpha)" '"status":"provisioning"' "$R"
+  -d "{\"name\":\"$WS_A_NAME\",\"runtime\":\"external\",\"external\":true,\"tier\":1}")
+check "POST /workspaces (alpha)" '"status":"awaiting_agent"' "$R"
 WS_A_ID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))")
 if [ -n "$WS_A_ID" ]; then
   WS_A_TOKEN=$(e2e_mint_test_token "$WS_A_ID" 2>/dev/null || true)
@@ -93,8 +93,8 @@ if [ -n "$WS_A_ID" ]; then
 fi
 
 R=$(curl -s -X POST "$BASE/workspaces" "${ADMIN_AUTH[@]}" -H "Content-Type: application/json" \
-  -d "{\"name\":\"$WS_B_NAME\",\"tier\":1}")
-check "POST /workspaces (beta)" '"status":"provisioning"' "$R"
+  -d "{\"name\":\"$WS_B_NAME\",\"runtime\":\"external\",\"external\":true,\"tier\":1}")
+check "POST /workspaces (beta)" '"status":"awaiting_agent"' "$R"
 WS_B_ID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))")
 
 # external/connection returns the install-snippet. The per-workspace
