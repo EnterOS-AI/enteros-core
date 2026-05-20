@@ -141,7 +141,59 @@ jobs:
           /tmp/smoke/bin/pip install --quiet dist/*.whl
           /tmp/smoke/bin/python "$GITHUB_WORKSPACE/scripts/wheel_smoke.py"
 
-      - name: Publish to PyPI
+      # ─────────────────────────────────────────────────────────────────────
+      # RFC#596 (2026-05-19): Gitea PyPI registry as PRIMARY, PyPI as
+      # best-effort fallback. Eliminates the SPOF that caused the
+      # 2026-05-19 P0 (PyPI abuse-block #593 + Railway outage #595).
+      #
+      # Order is inverted intentionally:
+      #   1. Gitea FIRST — must succeed (our internal SSOT).
+      #   2. PyPI SECOND — best-effort, non-fatal on failure (courtesy
+      #      mirror; our consumers don't depend on it after Phase 4
+      #      template Dockerfile updates).
+      #
+      # Endpoint shape (verified live in RFC#596 Phase 5):
+      #   POST https://git.moleculesai.app/api/packages/molecule-ai/pypi/
+      #   HTTP Basic auth: username = gitea username, password = PAT with
+      #   `write:package` scope. Returns 201 Created on success.
+      # ─────────────────────────────────────────────────────────────────────
+
+      - name: Publish to Gitea PyPI registry (PRIMARY)
+        id: gitea_publish
+        working-directory: ${{ runner.temp }}/runtime-build
+        env:
+          # MOLECULE_PYPI_GITEA_PUBLISHER_USER: Gitea username for the publisher
+          # persona (must own a token with `write:package` scope).
+          # Provisioned in RFC#596 Phase 3 (operator-config PR).
+          # NOTE: secret name MUST NOT start with `GITEA_` or `GITHUB_` —
+          # Gitea 1.22.6 reserves those prefixes for built-in env vars and
+          # rejects repo-secret PUT with HTTP 400 / "invalid secret name".
+          # Empirically reproduced 2026-05-19 against
+          # `/repos/molecule-ai/molecule-core/actions/secrets/GITEA_*`.
+          MOLECULE_PYPI_GITEA_PUBLISHER_USER: ${{ secrets.MOLECULE_PYPI_GITEA_PUBLISHER_USER }}
+          # MOLECULE_PYPI_GITEA_PUBLISHER_TOKEN: PAT for the publisher persona,
+          # `write:package` scope on molecule-ai org.
+          # Synced from Infisical /ci/gitea-pypi-publisher (RFC#596 Phase 3).
+          MOLECULE_PYPI_GITEA_PUBLISHER_TOKEN: ${{ secrets.MOLECULE_PYPI_GITEA_PUBLISHER_TOKEN }}
+        run: |
+          set -eu
+          if [ -z "${MOLECULE_PYPI_GITEA_PUBLISHER_TOKEN:-}" ] || [ -z "${MOLECULE_PYPI_GITEA_PUBLISHER_USER:-}" ]; then
+            echo "::error::MOLECULE_PYPI_GITEA_PUBLISHER_USER / MOLECULE_PYPI_GITEA_PUBLISHER_TOKEN secrets are not set."
+            echo "::error::Provision them via the RFC#596 Phase 3 operator-config sync script."
+            echo "::error::Gitea is the PRIMARY index per RFC#596 — publish job aborts here, NOT after PyPI."
+            exit 1
+          fi
+          python -m twine upload \
+            --verbose \
+            --repository-url "https://git.moleculesai.app/api/packages/molecule-ai/pypi/" \
+            --username "$MOLECULE_PYPI_GITEA_PUBLISHER_USER" \
+            --password "$MOLECULE_PYPI_GITEA_PUBLISHER_TOKEN" \
+            dist/*
+          echo "gitea_status=success" >> "$GITHUB_OUTPUT"
+          echo "gitea_url=https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/molecule-ai-workspace-runtime" >> "$GITHUB_OUTPUT"
+
+      - name: Publish to PyPI (FALLBACK, best-effort)
+        id: pypi_publish
         # working-directory matches the preceding Build/Verify steps. Without
         # this, twine runs from the default workspace checkout dir where
         # `dist/` doesn't exist and fails with:
@@ -149,6 +201,11 @@ jobs:
         # Caught on the first-ever successful dispatch of this workflow
         # (run 5097, 2026-05-11 02:08Z) — every other step in the publish
         # job already had this working-directory; Publish was missing it.
+        #
+        # RFC#596: this step is `continue-on-error: true` because PyPI is
+        # NO LONGER the primary index. PyPI 403/timeout/abuse-block does
+        # NOT block the publish — Gitea already has the wheel.
+        continue-on-error: true
         working-directory: ${{ runner.temp }}/runtime-build
         env:
           # PYPI_TOKEN: repository secret scoped to molecule-ai-workspace-runtime.
@@ -157,16 +214,42 @@ jobs:
           PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
         run: |
           if [ -z "$PYPI_TOKEN" ]; then
-            echo "::error::PYPI_TOKEN secret is not set — set it at Settings → Actions → Variables and Secrets → New Secret."
-            echo "::error::Required format: pypi-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
-            exit 1
+            echo "::warning::PYPI_TOKEN secret is not set — skipping PyPI mirror publish (non-fatal per RFC#596)."
+            echo "pypi_status=skipped_no_token" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
-          python -m twine upload \
+          if python -m twine upload \
             --verbose \
             --repository pypi \
             --username __token__ \
             --password "$PYPI_TOKEN" \
-            dist/*
+            dist/*; then
+            echo "pypi_status=success" >> "$GITHUB_OUTPUT"
+          else
+            rc=$?
+            echo "::warning::PyPI mirror publish failed (exit $rc). Non-fatal per RFC#596 — Gitea has the wheel."
+            echo "pypi_status=failed_exit_$rc" >> "$GITHUB_OUTPUT"
+          fi
+          echo "pypi_url=https://pypi.org/project/molecule-ai-workspace-runtime/${{ steps.version.outputs.version }}/" >> "$GITHUB_OUTPUT"
+
+      - name: Publish job summary (Gitea + PyPI status)
+        if: always()
+        run: |
+          {
+            echo "## publish-runtime $(date -u +%FT%TZ)"
+            echo
+            echo "**Version:** \`${{ steps.version.outputs.version }}\`"
+            echo "**Wheel SHA256:** \`${{ steps.wheel_hash.outputs.wheel_sha256 }}\`"
+            echo
+            echo "### Indexes"
+            echo
+            echo "| Index   | Status                                          | URL |"
+            echo "|---------|-------------------------------------------------|-----|"
+            echo "| Gitea (PRIMARY) | ${{ steps.gitea_publish.outputs.gitea_status || 'failed' }} | ${{ steps.gitea_publish.outputs.gitea_url || '—' }} |"
+            echo "| PyPI (fallback) | ${{ steps.pypi_publish.outputs.pypi_status || 'failed' }}  | ${{ steps.pypi_publish.outputs.pypi_url || '—' }} |"
+            echo
+            echo "Per RFC#596: Gitea is the contract. PyPI is best-effort."
+          } >> "$GITHUB_STEP_SUMMARY"
 
   cascade:
     needs: publish
@@ -184,6 +267,12 @@ jobs:
             echo "::error::publish job did not expose wheel_sha256 — cannot verify wheel content. Refusing to fan out cascade."
             exit 1
           fi
+          # NOTE (RFC#596 follow-up): this propagation probe still resolves
+          # against PyPI's default index. After RFC#596 Phase 4 lands and
+          # consumers pull from Gitea first, this probe should be rewritten
+          # to verify the Gitea simple/ endpoint serves the new wheel
+          # (PyPI may be best-effort-failed and the cascade should still
+          # fan out, since templates will pull from Gitea). Tracked in #596.
           python -m venv /tmp/propagation-probe
           PROBE=/tmp/propagation-probe/bin
           $PROBE/pip install --upgrade --quiet pip
@@ -267,7 +356,10 @@ jobs:
           fi
 
           GITEA_URL="${GITEA_URL:-https://git.moleculesai.app}"
-          TEMPLATES="claude-code hermes openclaw codex langgraph crewai autogen deepagents gemini-cli"
+          # Keep in lockstep with manifest.json workspace_templates (suffix-stripped).
+          # Guarded by scripts/check-cascade-list-vs-manifest.sh (cascade-list-drift-gate).
+          # 2026-05-19: pruned crewai/deepagents/gemini-cli — not in manifest.
+          TEMPLATES="claude-code hermes openclaw codex langgraph autogen"
           FAILED=""
           SKIPPED=""
 
