@@ -366,6 +366,9 @@ jobs:
             exit 1
           fi
           echo "Migrations OK"
+      - name: Run today's-PR-coverage E2E (mc#1525/1535/1536/1539/1542 fix-specific assertions)
+        if: needs.detect-changes.outputs.api == 'true'
+        run: bash tests/e2e/test_today_pr_coverage_e2e.sh
       - name: Run E2E API tests
         if: needs.detect-changes.outputs.api == 'true'
         run: bash tests/e2e/test_api.sh
@@ -387,9 +390,6 @@ jobs:
       - name: Run poll-mode chat upload E2E (RFC #2891)
         if: needs.detect-changes.outputs.api == 'true'
         run: bash tests/e2e/test_poll_mode_chat_upload_e2e.sh
-      - name: Run today's-PR-coverage E2E (mc#1525/1535/1536/1539/1542 fix-specific assertions)
-        if: needs.detect-changes.outputs.api == 'true'
-        run: bash tests/e2e/test_today_pr_coverage_e2e.sh
       - name: Dump platform log on failure
         if: failure() && needs.detect-changes.outputs.api == 'true'
         run: cat workspace-server/platform.log || true
