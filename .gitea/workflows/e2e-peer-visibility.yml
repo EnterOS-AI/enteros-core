@@ -68,14 +68,11 @@ name: E2E Peer Visibility (literal MCP list_peers)
 # minutes, not the 30+ min cold-EC2 path), so peer-visibility is part of
 # the local gate that fires before the staging E2E.
 #
-# It is its OWN non-required status context `E2E Peer Visibility (local)`
-# — same non-required-by-design decision as the staging job (red until
-# Hermes-401 #162 / OpenClaw-never-online #165 land; flip-to-required
-# tracked at molecule-core#1296). It is an HONEST gate: NO
-# continue-on-error mask (feedback_fix_root_not_symptom). It is kept a
-# distinct context (not folded into e2e-api.yml's required `E2E API
-# Smoke Test`) precisely so a deliberately-RED-today gate cannot wedge
-# the required local-E2E job or any unrelated merge.
+# It is its OWN non-required status context `E2E Peer Visibility (local)`.
+# The local backend uses external-mode workspaces by default so it tests
+# the literal platform MCP list_peers path without depending on local
+# template container boot/heartbeat. Container-mode runtime boot remains
+# available via PV_LOCAL_PROVISION_MODE=container for targeted debugging.
 
 on:
   push:
@@ -153,9 +150,9 @@ jobs:
   # ephemeral host ports so concurrent host-network act_runner runs don't
   # collide; go build; background platform-server). Its OWN non-required
   # status context `E2E Peer Visibility (local)` — non-required-by-design
-  # exactly like the staging job (red until #162/#165 land;
-  # flip-to-required tracked at molecule-core#1296). HONEST gate, NO
-  # continue-on-error mask (feedback_fix_root_not_symptom). Runs on PR +
+  # exactly like the staging job (flip-to-required tracked at
+  # molecule-core#1296). HONEST gate, NO continue-on-error mask
+  # (feedback_fix_root_not_symptom). Runs on PR +
   # push (local boot is minutes, not the 30+ min cold-EC2 path).
   # bp-required: pending #1296
   peer-visibility-local:
@@ -175,6 +172,7 @@ jobs:
       E2E_ANTHROPIC_API_KEY: ${{ secrets.MOLECULE_STAGING_ANTHROPIC_API_KEY }}
       E2E_OPENAI_API_KEY: ${{ secrets.MOLECULE_STAGING_OPENAI_API_KEY }}
       PV_RUNTIMES: "hermes openclaw claude-code"
+      PV_LOCAL_PROVISION_MODE: external
       ADMIN_TOKEN: local-e2e-admin-token
       MOLECULE_ADMIN_TOKEN: local-e2e-admin-token
     steps:
@@ -265,10 +263,9 @@ jobs:
           echo "::error::Platform did not become healthy in 30s"
           cat workspace-server/platform.log || true; exit 1
       - name: Run LOCAL fresh-provision peer-visibility E2E (literal MCP list_peers)
-        # HONEST gate — NO continue-on-error. Red today (Hermes-401 #162 /
-        # OpenClaw-never-online #165 not yet fixed); green when they land.
-        # Non-required-by-design via its distinct status context until the
-        # molecule-core#1296 flip-to-required.
+        # HONEST gate — NO continue-on-error. The local backend uses
+        # external-mode workspaces so this context tests the literal MCP
+        # peer-visibility path without coupling to template container boot.
         run: bash tests/e2e/test_peer_visibility_mcp_local.sh
       - name: Dump platform log on failure
         if: failure()
