@@ -43,6 +43,8 @@
 # Optional env:
 #   BASE                    default http://localhost:8080
 #   PV_RUNTIMES             space list; default "hermes openclaw claude-code"
+#   PV_PARENT_RUNTIME       parent runtime; default claude-code when keyed,
+#                            otherwise first keyed runtime in PV_RUNTIMES
 #   E2E_PROVISION_TIMEOUT_SECS  per-workspace online budget; default 900
 #                            (hermes cold apt+uv is the slow path locally)
 #   E2E_KEEP_WS             1 → skip teardown (local debugging only)
@@ -167,6 +169,28 @@ runtime_secrets() {
   esac
 }
 
+choose_parent_runtime() {
+  local rt
+  if [ -n "${PV_PARENT_RUNTIME:-}" ]; then
+    runtime_secrets "$PV_PARENT_RUNTIME" >/dev/null || return 1
+    echo "$PV_PARENT_RUNTIME"
+    return 0
+  fi
+
+  if runtime_secrets claude-code >/dev/null; then
+    echo "claude-code"
+    return 0
+  fi
+
+  for rt in $PV_RUNTIMES; do
+    if runtime_secrets "$rt" >/dev/null; then
+      echo "$rt"
+      return 0
+    fi
+  done
+  return 1
+}
+
 # Block until $1 reaches one of $2 (space-separated), or $3 sec elapse.
 wait_for_status() {
   local wsid="$1" want="$2" budget="$3" start=$SECONDS last=""
@@ -185,27 +209,31 @@ except Exception:
   return 1
 }
 
-# ─── 1. Provision parent (claude-code) + one sibling per runtime ───────
-# Same topology as the staging script: a claude-code parent plus one
-# sibling per runtime under test, so each runtime should see all others.
-log "1/5 provisioning parent (claude-code) + one sibling per runtime under test..."
+# ─── 1. Provision parent + one sibling per runtime ──────────────────────
+# Same topology as the staging script: one parent plus one sibling per
+# runtime under test, so each runtime should see all others. Prefer a
+# claude-code parent for staging parity, but local CI is intentionally
+# allowed to be partially keyed; an unkeyed parent can never heartbeat.
+PARENT_RUNTIME=$(choose_parent_runtime) || {
+  echo "::error::No keyed runtime available for parent — cannot run the local peer-visibility gate. Set CLAUDE_CODE_OAUTH_TOKEN and/or E2E_MINIMAX_API_KEY (or ANTHROPIC/OPENAI)." >&2
+  exit 1
+}
+log "1/5 provisioning parent ($PARENT_RUNTIME) + one sibling per runtime under test..."
 
-PARENT_SECRETS=$(runtime_secrets claude-code) || PARENT_SECRETS=""
+PARENT_SECRETS=$(runtime_secrets "$PARENT_RUNTIME") || PARENT_SECRETS=""
 if [ -z "$PARENT_SECRETS" ]; then
-  # Parent still needs to exist as a peer target even without an LLM key;
-  # it never has to answer list_peers itself (it is excluded from the
-  # caller set), so an empty-secrets claude-code shell is sufficient.
-  PARENT_SECRETS="{}"
+  echo "::error::parent runtime $PARENT_RUNTIME has no provider secrets" >&2
+  exit 1
 fi
 P_RESP=$(curl -s -X POST "$BASE/workspaces" "${ADMIN_AUTH[@]}" -H "Content-Type: application/json" \
-  -d "{\"name\":\"${NAME_PREFIX}-parent\",\"runtime\":\"claude-code\",\"tier\":3,\"secrets\":$PARENT_SECRETS}")
+  -d "{\"name\":\"${NAME_PREFIX}-parent\",\"runtime\":\"$PARENT_RUNTIME\",\"tier\":3,\"secrets\":$PARENT_SECRETS}")
 PARENT_ID=$(echo "$P_RESP" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("id",""))' 2>/dev/null)
 if [ -z "$PARENT_ID" ]; then
   echo "::error::parent create failed: $(echo "$P_RESP" | head -c 300)" >&2
   exit 1
 fi
 CREATED_WSIDS+=("$PARENT_ID")
-log "    PARENT_ID=$PARENT_ID"
+log "    PARENT_ID=$PARENT_ID runtime=$PARENT_RUNTIME"
 
 # NOTE: no `declare -A` — this script must also run on a local macOS dev
 # box (bash 3.2, no associative arrays) per feedback_local_must_mimic_
