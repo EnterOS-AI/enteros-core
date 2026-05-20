@@ -22,6 +22,28 @@ interface A2AResponse {
     parts?: A2APart[];
     artifacts?: Array<{ parts: A2APart[] }>;
   };
+  /** Set by ws-server's poll-mode short-circuit in `proxyA2ARequest`
+   *  (a2a_proxy.go:416-431) when the target workspace is registered as
+   *  `delivery_mode=poll` — e.g. an operator's laptop running
+   *  `molecule-mcp-claude-channel`, a hermes/codex MCP bridge, or a
+   *  Cursor MCP client. The HTTP 200 carries the synthetic envelope
+   *  `{status:"queued", delivery_mode:"poll", method:"message/send"}`
+   *  immediately (~50ms), BEFORE the agent has produced a reply.
+   *
+   *  Task #227 routing: when this field is "queued" the caller must NOT
+   *  treat the 200 as "agent done" — there are no `result.parts` yet
+   *  (the reply will arrive separately via the AGENT_MESSAGE WS event
+   *  after the agent's next poll). Keep the spinner up; the eventual
+   *  AGENT_MESSAGE flips `sending` off via the existing useChatSocket
+   *  `onSendComplete` path. Without this distinction the spinner
+   *  disappeared immediately and external/MCP workspaces had no progress
+   *  UX between send and reply. */
+  status?: string;
+  /** Companion to `status` — "poll" when the queued short-circuit fired.
+   *  Defensive: we key the poll-mode-skip decision on status==="queued"
+   *  (the canonical signal) rather than on this field, but it's surfaced
+   *  here so future debugging / tests can assert on the full envelope. */
+  delivery_mode?: string;
 }
 
 export function extractReplyText(resp: A2AResponse): string {
@@ -193,6 +215,30 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
           if (sendTokenRef.current !== myToken) return;
           if (!sendingFromAPIRef.current) {
             sendInFlightRef.current = false;
+            return;
+          }
+          // Task #227 — poll-mode (external/MCP workspace) queued-200
+          // short-circuit. ws-server's `proxyA2ARequest` returns
+          // `{status:"queued", delivery_mode:"poll", ...}` immediately
+          // when the target has no URL (delivery_mode=poll), BEFORE the
+          // agent has produced any reply. There is no `result.parts`
+          // payload here — the actual reply will arrive separately via
+          // the AGENT_MESSAGE WebSocket event after the agent's next
+          // `wait_for_message` poll.
+          //
+          // Keep the spinner up by deliberately NOT calling
+          // releaseSendGuards: the user-facing "thinking" state must
+          // persist until the AGENT_MESSAGE lands (handled by the
+          // useChatSocket `onAgentMessage`/`onSendComplete` path) or an
+          // explicit error fires (`onSendError` from an ACTIVITY_LOGGED
+          // status="error"). Don't synthesise an empty agent bubble.
+          //
+          // sendInFlightRef stays true intentionally — it's the dedup
+          // guard for the user typing two messages back-to-back; for
+          // poll mode the second message would race the first agent's
+          // reply, so blocking is correct (matches push-mode behaviour
+          // where `sending` blocks the textarea).
+          if (resp?.status === "queued") {
             return;
           }
           const replyText = extractReplyText(resp);

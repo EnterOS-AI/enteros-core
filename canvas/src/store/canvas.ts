@@ -106,6 +106,28 @@ export interface WorkspaceNodeData extends Record<string, unknown> {
    *  send_message_to_user / POST /notify return 403 and the canvas
    *  shows a "not enabled" state with a button to re-enable. Default true. */
   talkToUserEnabled?: boolean;
+  /** A2A inbound delivery mode for this workspace — "push" (default —
+   *  synchronous HTTP dispatch by ws-server `proxyA2ARequest`) or "poll"
+   *  (workspace has no URL; ws-server logs the request and the agent
+   *  consumes it via `wait_for_message` / GET /activity?since_id=).
+   *
+   *  Why surfaced to the UI: poll-mode targets (external/MCP workspaces:
+   *  `molecule-mcp-claude-channel` on an operator laptop, hermes/codex
+   *  bridge clients, Cursor MCP) acknowledge a canvas `message/send` with
+   *  a synthetic `{status:"queued"}` 200 within ~50ms. Without this flag
+   *  the chat UI cannot tell that gap from a real round-trip — the
+   *  spinner disappears immediately and the user sees dead silence until
+   *  the agent eventually polls and replies via the AGENT_MESSAGE WS
+   *  event (could be seconds, could be minutes). Task #227 — render a
+   *  "queued — agent will pick up on next poll" state for poll-mode
+   *  sends so external/MCP workspaces have progress UX parity with
+   *  native runtimes (claude-code / codex / hermes / openclaw).
+   *
+   *  Sourced from the GET /workspaces response (`delivery_mode` snake_case
+   *  field, mapped here in canvas-topology.ts). Absent on older platform
+   *  builds — that fallthrough is treated as "push" to match
+   *  ws-server's `lookupDeliveryMode` default. */
+  deliveryMode?: string;
 }
 
 export type PanelTab = "details" | "skills" | "chat" | "terminal" | "config" | "schedule" | "channels" | "files" | "memory" | "traces" | "events" | "activity" | "audit";

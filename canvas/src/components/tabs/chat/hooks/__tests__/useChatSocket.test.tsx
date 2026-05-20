@@ -116,6 +116,77 @@ describe("useChatSocket — surface error_detail to onSendError (internal#212)",
     expect(reason.length).toBeGreaterThan(0);
   });
 
+  // Task #227 — external/MCP (poll-mode) workspace progress UX.
+  //
+  // ws-server's `proxyA2ARequest` poll-mode short-circuit fires the
+  // ACTIVITY_LOGGED a2a_receive with status="ok" and NO duration_ms (no
+  // reply yet — the request is queued for the agent's next poll). Before
+  // task #227 the (status==="ok" && durationMs) guard silently dropped
+  // this row, so the chat UI had ZERO progress signal between "user
+  // typed" and "agent eventually polled and replied". Lock the queued
+  // line in so future refactors don't regress to the silent-drop state.
+  it("emits a 'queued — will pick up on next poll' activity line when a2a_receive status=ok has no duration_ms (poll-mode)", () => {
+    const onActivityLog = vi.fn();
+    renderHook(() =>
+      useChatSocket("ws-self", {
+        onActivityLog,
+      }),
+    );
+
+    expect(capturedHandler).not.toBeNull();
+    act(() => {
+      capturedHandler!({
+        event: "ACTIVITY_LOGGED",
+        workspace_id: "ws-self",
+        payload: {
+          activity_type: "a2a_receive",
+          method: "message/send",
+          status: "ok",
+          target_id: "ws-self",
+          // No duration_ms — this is the queued-for-poll signal.
+        },
+        timestamp: "2026-05-20T00:00:00Z",
+      });
+    });
+
+    expect(onActivityLog).toHaveBeenCalledTimes(1);
+    const line = onActivityLog.mock.calls[0][0] as string;
+    // The line MUST be present (not the empty-string silent-drop pattern)
+    // and MUST mention the queued state so the user has actionable signal.
+    expect(line.length).toBeGreaterThan(0);
+    expect(line.toLowerCase()).toMatch(/queued|poll/);
+  });
+
+  // Pair with the above: poll-mode acknowledgement must NOT prematurely
+  // call onSendComplete — the spinner has to stay up until the actual
+  // AGENT_MESSAGE reply lands. (The reply-success path with duration_ms
+  // still calls onSendComplete; that's the push-mode case.)
+  it("does NOT call onSendComplete on a poll-mode queued a2a_receive (spinner must persist)", () => {
+    const onSendComplete = vi.fn();
+    renderHook(() =>
+      useChatSocket("ws-self", {
+        onSendComplete,
+      }),
+    );
+
+    act(() => {
+      capturedHandler!({
+        event: "ACTIVITY_LOGGED",
+        workspace_id: "ws-self",
+        payload: {
+          activity_type: "a2a_receive",
+          method: "message/send",
+          status: "ok",
+          target_id: "ws-self",
+          // No duration_ms.
+        },
+        timestamp: "2026-05-20T00:00:00Z",
+      });
+    });
+
+    expect(onSendComplete).not.toHaveBeenCalled();
+  });
+
   it("ignores errors targeted at a different workspace's peer", () => {
     // Defense against a race where the WS hub fans out to all clients —
     // each chat panel must only react when target_id matches its own

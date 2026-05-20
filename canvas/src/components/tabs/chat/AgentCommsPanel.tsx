@@ -649,7 +649,17 @@ function WaitingBubbles({ visible }: { visible: CommMessage[] }) {
     if (!prev || m.timestamp > prev.timestamp) tailByPeer.set(m.peerId, m);
   }
   const waitingPeers = Array.from(tailByPeer.values()).filter(
-    (m) => m.flow === "out" && (m.status === "pending" || m.status === "queued"),
+    // Task #227 — also light the indicator for status="dispatched": that's
+    // the platform's marker for a poll-mode delegation that's been
+    // recorded into the peer's inbox but not yet picked up. Without this
+    // arm, external/MCP peer threads showed an outbound bubble and then
+    // dead silence until the eventual reply landed — no parity with the
+    // native push-path "pending" indicator.
+    (m) =>
+      m.flow === "out" &&
+      (m.status === "pending" ||
+        m.status === "queued" ||
+        m.status === "dispatched"),
   );
   if (waitingPeers.length === 0) return null;
   return (
@@ -688,7 +698,9 @@ function WaitingBubbles({ visible }: { visible: CommMessage[] }) {
               <span className="text-[10px]">
                 {m.status === "queued"
                   ? `${m.peerName} is busy — reply will arrive when they're free`
-                  : `Waiting for ${m.peerName}…`}
+                  : m.status === "dispatched"
+                    ? `Queued — ${m.peerName} will pick up on next poll`
+                    : `Waiting for ${m.peerName}…`}
               </span>
             </span>
           </div>

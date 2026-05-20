@@ -342,6 +342,16 @@ export interface WorkspaceData {
   /** Workspace ability flags (migration 20260514). */
   broadcast_enabled?: boolean;
   talk_to_user_enabled?: boolean;
+  /** A2A delivery mode for inbound messages — "push" (default, synchronous
+   *  HTTP dispatch to `url`) or "poll" (queued to activity_logs, agent
+   *  picks up via `wait_for_message` / GET /activity?since_id=). Surfaced
+   *  in the GET /workspaces response since #2339 PR 1; older platform
+   *  versions return it absent so the canvas treats absent as "push" (the
+   *  documented default in `lookupDeliveryMode`). Used by the chat UI to
+   *  render an "agent will pick up on next poll" indicator instead of
+   *  collapsing the spinner the moment the synchronous queued-200 returns
+   *  (task #227 — external/MCP workspaces had no progress UX). */
+  delivery_mode?: string;
 }
 
 let socket: ReconnectingSocket | null = null;
