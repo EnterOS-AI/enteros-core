@@ -235,6 +235,11 @@ jobs:
           set -euo pipefail
 
           TARGET_TAG="staging-${SHA}"
+          # confirm:true ack required by CP /cp/admin/tenants/redeploy-fleet
+          # contract (cp#228 / task #308) for fleet-wide intent. Empty body
+          # / {confirm:false} / {only_slugs:[]} → 400. This caller promotes
+          # the verified staging image across the entire prod fleet (canary
+          # + fan-out), no slug scoping, so confirm:true is correct.
           BODY=$(jq -nc \
             --arg tag "$TARGET_TAG" \
             --argjson soak "${SOAK_SECONDS:-120}" \
@@ -244,7 +249,8 @@ jobs:
               target_tag: $tag,
               soak_seconds: $soak,
               batch_size: $batch,
-              dry_run: $dry
+              dry_run: $dry,
+              confirm: true
             }')
 
           if [ -n "${CANARY_SLUG:-}" ]; then

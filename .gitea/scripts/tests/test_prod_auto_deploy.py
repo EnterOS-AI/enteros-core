@@ -36,7 +36,35 @@ def test_build_plan_defaults_to_staging_sha_target_and_prod_cp():
         "soak_seconds": 60,
         "batch_size": 3,
         "dry_run": False,
+        # cp#228 / task #308: fleet-wide intent must carry confirm:true.
+        "confirm": True,
     }
+
+
+def test_build_plan_always_sets_confirm_true_for_fleet_intent():
+    """Regression guard: every plan body MUST carry confirm:true.
+
+    CP /cp/admin/tenants/redeploy-fleet (cp#228) returns 400 on empty
+    body / {confirm:false} / {only_slugs:[]} to prevent accidental
+    fleet-wide mutation. This caller is fleet-wide intent (canary +
+    fan-out, no slug scoping), so the plan MUST carry confirm:true.
+    Pairs with cp#228's TestRedeployFleet_EmptyBodyReturns400 +
+    TestRedeployFleet_ConfirmTrueProceeds.
+    """
+    plan = prod.build_plan({"GITHUB_SHA": "abcdef1234567890"})
+    assert plan["body"]["confirm"] is True
+
+    # Operator-overridable knobs do NOT drop the ack.
+    plan = prod.build_plan(
+        {
+            "GITHUB_SHA": "abcdef1234567890",
+            "PROD_AUTO_DEPLOY_SOAK_SECONDS": "0",
+            "PROD_AUTO_DEPLOY_BATCH_SIZE": "10",
+            "PROD_AUTO_DEPLOY_DRY_RUN": "true",
+            "PROD_AUTO_DEPLOY_CANARY_SLUG": "",
+        }
+    )
+    assert plan["body"]["confirm"] is True
 
 
 def test_build_plan_rejects_non_prod_cp_without_explicit_override():

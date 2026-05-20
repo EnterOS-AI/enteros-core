@@ -71,6 +71,12 @@ def build_plan(env: dict[str, str]) -> dict:
         "soak_seconds": _int_env(env, "PROD_AUTO_DEPLOY_SOAK_SECONDS", 60, minimum=0),
         "batch_size": _int_env(env, "PROD_AUTO_DEPLOY_BATCH_SIZE", 3),
         "dry_run": truthy_flag(env.get("PROD_AUTO_DEPLOY_DRY_RUN", "")),
+        # confirm:true ack required by CP /cp/admin/tenants/redeploy-fleet
+        # contract (cp#228 / task #308) for fleet-wide intent. Empty body
+        # / {confirm:false} / {only_slugs:[]} → 400. This caller is the
+        # production auto-deploy step that rolls every live tenant (canary
+        # + fan-out), no slug scoping, so confirm:true is correct.
+        "confirm": True,
     }
     if canary_slug:
         body["canary_slug"] = canary_slug

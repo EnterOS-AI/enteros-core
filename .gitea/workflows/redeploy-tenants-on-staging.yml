@@ -123,6 +123,11 @@ jobs:
             exit 1
           fi
 
+          # confirm:true ack required by CP /cp/admin/tenants/redeploy-fleet
+          # contract (cp#228 / task #308) for fleet-wide intent. Empty body
+          # / {confirm:false} / {only_slugs:[]} → 400. Staging IS the
+          # canary, no slug scoping; this rolls the entire staging fleet,
+          # so confirm:true is correct.
           BODY=$(jq -nc \
             --arg tag "$TARGET_TAG" \
             --arg canary "$CANARY_SLUG" \
@@ -134,7 +139,8 @@ jobs:
               canary_slug: $canary,
               soak_seconds: $soak,
               batch_size: $batch,
-              dry_run: $dry
+              dry_run: $dry,
+              confirm: true
             }')
 
           echo "POST $CP_URL/cp/admin/tenants/redeploy-fleet"
