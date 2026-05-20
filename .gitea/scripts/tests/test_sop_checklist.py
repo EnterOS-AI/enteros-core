@@ -815,3 +815,192 @@ class TestHighRiskClassUsesElevatedListInConfig(unittest.TestCase):
                 sop.resolve_required_teams(items[slug], high_risk=True),
                 f"item {slug} should not be affected by risk-class",
             )
+
+
+# ---------------------------------------------------------------------------
+# get_issue_comments — streaming + minimal-dict shape (task #369 / OOM fix)
+# ---------------------------------------------------------------------------
+
+
+class _FakeReq:
+    """Stand-in for GiteaClient._req that serves canned pages."""
+
+    def __init__(self, pages):
+        # pages: list[list[dict]]; one page per call, exhausted in order.
+        self._pages = list(pages)
+        self.calls = []
+
+    def __call__(self, method, path, body=None, ok_codes=(200, 201, 204)):
+        self.calls.append((method, path))
+        if not self._pages:
+            return 200, []
+        return 200, self._pages.pop(0)
+
+
+class TestGetIssueCommentsStreaming(unittest.TestCase):
+    """Verify the OOM-fix invariants — minimal-dict shape + page break."""
+
+    def _client_with_pages(self, pages):
+        client = sop.GiteaClient("git.example.com", "tok")
+        client._req = _FakeReq(pages)  # type: ignore[method-assign]
+        return client
+
+    def test_minimal_dict_shape_drops_large_fields(self):
+        """get_issue_comments must DROP html_url/assets/timestamps/etc. and
+        keep ONLY {user.login, body} — that's the whole OOM-prevention."""
+        full_page = [
+            {
+                "id": 1234,
+                "html_url": "https://example.com/some-huge-url",
+                "pull_request_url": "https://example.com/some-other-huge-url",
+                "issue_url": "https://example.com/yet-another-url",
+                "user": {"login": "bob", "avatar_url": "x" * 4000, "id": 99},
+                "original_author": "",
+                "original_author_id": 0,
+                "body": "/sop-ack comprehensive-testing\n\nlooks good",
+                "assets": ["x" * 1000, "y" * 1000],
+                "created_at": "2026-05-19T01:02:03Z",
+                "updated_at": "2026-05-19T01:02:03Z",
+            }
+        ]
+        client = self._client_with_pages([full_page])
+        out = client.get_issue_comments("o", "r", 1)
+        self.assertEqual(len(out), 1)
+        # Only the two whitelisted keys + nested user.login
+        self.assertEqual(set(out[0].keys()), {"user", "body"})
+        self.assertEqual(set(out[0]["user"].keys()), {"login"})
+        self.assertEqual(out[0]["user"]["login"], "bob")
+        self.assertEqual(out[0]["body"], "/sop-ack comprehensive-testing\n\nlooks good")
+        # Critical: avatar/assets/timestamps/etc. must be gone (~4KB+ each).
+        self.assertNotIn("html_url", out[0])
+        self.assertNotIn("assets", out[0])
+        self.assertNotIn("created_at", out[0])
+
+    def test_pagination_break_on_short_page(self):
+        # Page-size 50; a page of <50 means no more pages.
+        page1 = [{"user": {"login": "u"}, "body": "x"}] * 7
+        client = self._client_with_pages([page1])
+        out = client.get_issue_comments("o", "r", 2)
+        self.assertEqual(len(out), 7)
+        # Should have made exactly 1 _req call (no page-2 probe).
+        self.assertEqual(len(client._req.calls), 1)
+
+    def test_pagination_continues_until_empty(self):
+        # Two full pages + one short page.
+        page1 = [{"user": {"login": "u"}, "body": "x"}] * 50
+        page2 = [{"user": {"login": "u"}, "body": "y"}] * 50
+        page3 = [{"user": {"login": "u"}, "body": "z"}] * 3
+        client = self._client_with_pages([page1, page2, page3])
+        out = client.get_issue_comments("o", "r", 3)
+        self.assertEqual(len(out), 103)
+        self.assertEqual(len(client._req.calls), 3)
+
+    def test_max_comments_caps_collection(self):
+        page1 = [{"user": {"login": "u"}, "body": "x"}] * 50
+        page2 = [{"user": {"login": "u"}, "body": "y"}] * 50
+        page3 = [{"user": {"login": "u"}, "body": "z"}] * 50
+        client = self._client_with_pages([page1, page2, page3])
+        out = client.get_issue_comments("o", "r", 4, max_comments=75)
+        self.assertEqual(len(out), 75)
+        # Stops short: shouldn't have requested page-3.
+        self.assertLessEqual(len(client._req.calls), 2)
+
+    def test_oversized_body_truncated(self):
+        # An individual comment with a multi-MiB body (e.g. pasted CI log)
+        # must NOT pull the whole thing into memory. The directive parser
+        # only needs the first ~8 KiB to find /sop-* markers.
+        huge_body = "/sop-ack comprehensive-testing\n" + ("X" * (4 * 1024 * 1024))
+        page = [{"user": {"login": "bob"}, "body": huge_body}]
+        client = self._client_with_pages([page])
+        out = client.get_issue_comments("o", "r", 99)
+        self.assertEqual(len(out), 1)
+        # Cap is 8 KiB; comment body must be <= 8 KiB after streaming.
+        self.assertLessEqual(len(out[0]["body"]), 8 * 1024)
+        # Marker still discoverable at the start.
+        self.assertTrue(out[0]["body"].startswith("/sop-ack comprehensive-testing"))
+
+    def test_iter_handles_missing_user_or_body(self):
+        # Defensive: Gitea has been seen to return user=null on deleted users.
+        page = [
+            {"user": None, "body": "abandoned-author"},
+            {"user": {"login": "alice"}, "body": None},
+            {"body": "no-user-key"},
+            {"user": {"login": "bob"}, "body": "ok"},
+        ]
+        client = self._client_with_pages([page])
+        out = client.get_issue_comments("o", "r", 5)
+        self.assertEqual(len(out), 4)
+        self.assertEqual(out[0]["user"]["login"], "")
+        self.assertEqual(out[0]["body"], "abandoned-author")
+        self.assertEqual(out[1]["user"]["login"], "alice")
+        self.assertEqual(out[1]["body"], "")
+        self.assertEqual(out[2]["user"]["login"], "")
+        self.assertEqual(out[3]["user"]["login"], "bob")
+
+    def test_minimal_dicts_work_with_compute_ack_state(self):
+        """Round-trip: minimal dicts feed back through compute_ack_state."""
+        page = [{"user": {"login": "bob"}, "body": "/sop-ack comprehensive-testing"}]
+        client = self._client_with_pages([page])
+        comments = client.get_issue_comments("o", "r", 6)
+        items = _items_by_slug()
+        aliases = _numeric_aliases()
+        state = sop.compute_ack_state(
+            comments, "alice", items, aliases, lambda slug, users: list(users)
+        )
+        self.assertEqual(state["comprehensive-testing"]["ackers"], ["bob"])
+
+
+# ---------------------------------------------------------------------------
+# probe() na-gate fallback — fix for #355-class KeyError 'security-review'
+# ---------------------------------------------------------------------------
+
+
+class TestComputeNaStateAcceptsGateNotInItems(unittest.TestCase):
+    """compute_na_state passes the gate NAME to probe(); when the gate is
+    NOT also an items entry (the common case for `security-review`,
+    `qa-review`), probe must fall back to the gate's own required_teams
+    instead of KeyError'ing on items_by_slug[slug].
+
+    This test exercises the public surface (compute_na_state) rather than
+    the inline `probe` closure, because the closure is built inside main().
+    We simulate the fallback by passing a probe that mirrors the production
+    contract — slug may be either an item OR an n/a-gate key, both are valid.
+    """
+
+    def test_na_gate_with_required_teams_resolves_without_keyerror(self):
+        na_gates = {
+            "security-review": {
+                "required_teams": ["security", "managers", "ceo"],
+                "description": "security N/A",
+            },
+        }
+        comments = [
+            {"user": {"login": "carol"}, "body": "/sop-n/a security-review docs-only"},
+        ]
+        # Probe approves any user in the security team; importantly it does
+        # NOT try items_by_slug[slug] for the gate name.
+        called_with = []
+
+        def probe(slug, users):
+            called_with.append(slug)
+            # production probe accepts gate-name OR item-slug; for this test
+            # we just approve everyone.
+            return list(users)
+
+        na_state = sop.compute_na_state(comments, "alice", na_gates, probe)
+        self.assertTrue(na_state["security-review"]["declared"])
+        self.assertEqual(na_state["security-review"]["decl_ackers"], ["carol"])
+        # probe must have been called with the GATE name, not an item slug.
+        self.assertEqual(called_with, ["security-review"])
+
+    def test_na_gate_self_declaration_rejected(self):
+        # Author cannot self-declare N/A — pre-existing invariant; pin it
+        # so the new probe-fallback doesn't regress this.
+        na_gates = {"security-review": {"required_teams": ["security"]}}
+        comments = [
+            {"user": {"login": "alice"}, "body": "/sop-n/a security-review"},
+        ]
+        na_state = sop.compute_na_state(
+            comments, "alice", na_gates, lambda *_: ["alice"]
+        )
+        self.assertFalse(na_state["security-review"]["declared"])

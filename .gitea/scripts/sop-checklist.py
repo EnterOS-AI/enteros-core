@@ -64,11 +64,41 @@ import argparse
 import json
 import os
 import re
+import resource
 import sys
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
+
+# ---------------------------------------------------------------------------
+# Address-space guardrail (RFC#369 / task #369 follow-up to mc#1242-class OOM).
+#
+# `get_issue_comments` paginates the full comment history of a PR. On
+# bot-relay-heavy PRs (e.g. mc#291, mc#1242) this can balloon past the
+# runner's cgroup memory limit and 137 the job. Cap virtual-address-space
+# at 2 GiB so the script OOMs as a `MemoryError` (catchable / surfaceable)
+# rather than a SIGKILL we can't post a status for.
+#
+# 2 GiB is generous — a 5000-comment PR with 1 KiB minimal-dicts (see
+# get_issue_comments below) fits in ~10 MiB, leaving plenty of headroom
+# for the Python runtime + urllib + json buffers.
+#
+# Skipped under pytest / dry-run where RLIMIT_AS would interfere with
+# test runner memory needs (set SOP_CHECKLIST_NO_RLIMIT=1 to opt out).
+if not os.environ.get("SOP_CHECKLIST_NO_RLIMIT"):
+    try:
+        resource.setrlimit(resource.RLIMIT_AS, (2 * 1024**3, 2 * 1024**3))
+    except (ValueError, OSError):
+        # macOS sometimes refuses RLIMIT_AS; not fatal — the Linux runner
+        # is the only place this matters for the OOM-prevention goal.
+        pass
+
+# Per-comment body cap (task #369). The directive parser walks the body
+# line-by-line looking for ^/sop-ack ^/sop-revoke ^/sop-n/a markers — only
+# the first few KiB matter for that. Cap each comment body so a single
+# pasted-log comment can't push us past the cgroup limit.
+_MAX_BODY_BYTES = int(os.environ.get("SOP_CHECKLIST_MAX_BODY_BYTES") or 8 * 1024)
 
 
 # ---------------------------------------------------------------------------
@@ -460,16 +490,35 @@ class GiteaClient:
             raise RuntimeError(f"GET pulls/{pr} → HTTP {code}: {data!r}")
         return data
 
-    def get_issue_comments(
-        self, owner: str, repo: str, issue: int
-    ) -> list[dict[str, Any]]:
-        # Paginate. Gitea default page size 50.
-        out: list[dict[str, Any]] = []
+    def iter_issue_comments(
+        self, owner: str, repo: str, issue: int, page_size: int = 50
+    ) -> Iterator[dict[str, Any]]:
+        """Stream comments page-by-page, yielding ONE minimal-dict per comment.
+
+        Each yielded comment carries ONLY the fields the gate actually reads
+        — `{"user": {"login": str}, "body": str}` — and DROPS the much
+        larger Gitea-API extras (html_url, pull_request_url, issue_url,
+        assets, created_at, updated_at, id, original_author_*).
+
+        Memory motivation (task #369 / mc#1242-class OOM): full Gitea
+        comment dicts are ~2 KiB median + ~3 KiB p95. On PRs with several
+        thousand bot-relay comments the eager `list[full_dict]` shape used
+        previously pushed runner anon-rss past the cgroup limit. The
+        minimal-dict shape is ~10-20x smaller (typically ~50-100B Python
+        overhead + the body string).
+
+        The two downstream consumers (`compute_ack_state`,
+        `compute_na_state`) each iterate the comment list exactly once and
+        read only `body` + `user.login`, so dropping every other field is
+        safe. They still receive `list[dict[str, Any]]`-shaped objects so
+        the test fixtures (which already used the minimal shape) keep
+        working with no fixture changes.
+        """
         page = 1
         while True:
             code, data = self._req(
                 "GET",
-                f"/repos/{owner}/{repo}/issues/{issue}/comments?limit=50&page={page}",
+                f"/repos/{owner}/{repo}/issues/{issue}/comments?limit={page_size}&page={page}",
             )
             if code != 200:
                 raise RuntimeError(
@@ -477,10 +526,41 @@ class GiteaClient:
                 )
             if not data:
                 break
-            out.extend(data)
-            if len(data) < 50:
+            for c in data:
+                # Minimal projection — drop ALL fields the gate doesn't read.
+                user_login = ((c.get("user") or {}).get("login") or "") if isinstance(c, dict) else ""
+                body = (c.get("body") if isinstance(c, dict) else "") or ""
+                # Body-size guardrail: huge comments (e.g. pasted CI logs) can
+                # individually be MiBs. The directive parser only needs the
+                # first ~8 KiB to find /sop-ack /sop-revoke /sop-n/a markers
+                # — anything past that is filler. Truncate at 8 KiB so a
+                # single oversized comment can't OOM the runner.
+                if len(body) > _MAX_BODY_BYTES:
+                    body = body[:_MAX_BODY_BYTES]
+                yield {"user": {"login": user_login}, "body": body}
+            if len(data) < page_size:
                 break
             page += 1
+
+    def get_issue_comments(
+        self,
+        owner: str,
+        repo: str,
+        issue: int,
+        max_comments: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Paginate + collect minimal comment dicts. See `iter_issue_comments`
+        for the per-comment shape and the OOM-prevention rationale.
+
+        `max_comments` (optional, default unbounded): hard cap. When the cap
+        is hit we stop fetching further pages and the caller surfaces a
+        soft 'skipping due to volume' status (see main()).
+        """
+        out: list[dict[str, Any]] = []
+        for c in self.iter_issue_comments(owner, repo, issue):
+            out.append(c)
+            if max_comments is not None and len(out) >= max_comments:
+                break
         return out
 
     def resolve_team_id(self, org: str, team_name: str) -> int | None:
@@ -832,6 +912,17 @@ def main(argv: list[str] | None = None) -> int:
             "thing BP sees is the POSTed status. Useful for local debugging."
         ),
     )
+    p.add_argument(
+        "--max-comments",
+        type=int,
+        default=int(os.environ.get("SOP_CHECKLIST_MAX_COMMENTS") or 5000),
+        help=(
+            "Hard cap on comments fetched from the PR. Above this we post "
+            "a SOFT-pending status with a 'skipping due to volume' note "
+            "instead of OOM'ing the runner (task #369). Override with the "
+            "SOP_CHECKLIST_MAX_COMMENTS env var. Set 0 to disable the cap."
+        ),
+    )
     args = p.parse_args(argv)
 
     token = os.environ.get("GITEA_TOKEN", "")
@@ -865,7 +956,18 @@ def main(argv: list[str] | None = None) -> int:
         print("::error::PR payload missing user.login or head.sha", file=sys.stderr)
         return 1
 
-    comments = client.get_issue_comments(args.owner, args.repo, args.pr)
+    max_comments_cap = args.max_comments if args.max_comments and args.max_comments > 0 else None
+    comments = client.get_issue_comments(
+        args.owner, args.repo, args.pr, max_comments=max_comments_cap
+    )
+
+    # Volume short-circuit: PRs with thousands of bot-relay comments
+    # (the mc#1242-class OOM source) get a soft 'volume-skipped' status
+    # so the gate doesn't churn the runner; reviewers can re-trigger by
+    # editing the PR or filing a fresh PR with the housekeeping comments
+    # split off. Cap-hit means we couldn't see the WHOLE history, so we
+    # can't fairly post failure — pending is the safe default.
+    volume_skipped = bool(max_comments_cap and len(comments) >= max_comments_cap)
 
     # High-risk classification (RFC#450 Option C, governance fix for
     # internal#442). Computed ONCE per PR — used by both the probe
@@ -879,8 +981,34 @@ def main(argv: list[str] | None = None) -> int:
     team_member_cache: dict[tuple[str, int], bool | None] = {}
 
     def probe(slug: str, users: list[str]) -> list[str]:
-        item = items_by_slug[slug]
-        team_names: list[str] = resolve_required_teams(item, high_risk)
+        # `slug` may be either an items-key (compute_ack_state caller) OR
+        # an n/a-gate key (compute_na_state caller). Previously this hard
+        # KeyError'd on the n/a-gate path when slug was e.g. "security-review"
+        # — that's a config gate, not an item — so the gate would crash
+        # instead of falling back to the gate's own required_teams. Fix
+        # task #369 follow-up to issue #355.
+        if slug in items_by_slug:
+            item = items_by_slug[slug]
+            team_names: list[str] = resolve_required_teams(item, high_risk)
+        elif slug in na_gates:
+            # n/a-gate configs carry `required_teams` directly (see
+            # sop-checklist-config.yaml: n/a_gates.<gate>.required_teams).
+            gate_cfg = na_gates[slug] or {}
+            team_names = list(gate_cfg.get("required_teams") or [])
+            if not team_names:
+                print(
+                    f"::warning::n/a-gate '{slug}' has no required_teams; "
+                    "fail-closed (no users will be approved)",
+                    file=sys.stderr,
+                )
+        else:
+            # Unknown slug — fail closed, log so we can find config drift.
+            print(
+                f"::warning::probe() called with slug '{slug}' which is "
+                f"neither an items entry nor an n/a-gate; fail-closed",
+                file=sys.stderr,
+            )
+            return []
         # Resolve names → ids. NOTE: orgs/{org}/teams/search may not be
         # available — fall back to the list endpoint.
         team_ids: list[int] = []
@@ -938,6 +1066,15 @@ def main(argv: list[str] | None = None) -> int:
         # were not required (vs a tier:medium+ PR that truly passed all acks).
         state = "success"
         description = f"[info tier:low] {description}"
+    if volume_skipped:
+        # Above the comment-cap — we may have a partial view. Soft-pend
+        # so neither BP nor the author gets stuck; surface the cap so
+        # reviewers know what's up. No-block at the gate level.
+        state = "pending"
+        description = (
+            f"[volume-skipped] comment-cap={max_comments_cap} hit; please file "
+            f"a fresh PR with bot-relay history split off (#369). {description}"
+        )
 
     # Diagnostics to job log.
     print(
