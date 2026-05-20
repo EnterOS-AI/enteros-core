@@ -8,3 +8,4 @@ export { SearchBar } from './SearchBar';
 export { EmptyState } from './EmptyState';
 export { DeleteConfirmDialog } from './DeleteConfirmDialog';
 export { UnsavedChangesGuard } from './UnsavedChangesGuard';
+export { OrgInfoTab } from './OrgInfoTab';
