@@ -49,6 +49,7 @@ import (
 	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
 	"github.com/Molecule-AI/molecule-monorepo/platform/internal/events"
 	"github.com/Molecule-AI/molecule-monorepo/platform/internal/pendinguploads"
+	"github.com/Molecule-AI/molecule-monorepo/platform/internal/uploads"
 )
 
 // ChatFilesHandler serves file upload + download for chat. Holds a
@@ -112,19 +113,26 @@ func (h *ChatFilesHandler) WithPendingUploads(storage pendinguploads.Storage, br
 }
 
 // chatUploadMaxBytes caps the full multipart request body so a
-// malicious / runaway client can't OOM the proxy hop. 100 MB matches
-// the workspace-side limit; anything larger is rejected at the
-// network boundary before forwarding.
+// malicious / runaway client can't OOM the proxy hop. Derived from the
+// SSOT in internal/uploads (task #320): bumping the cap is one edit in
+// internal/uploads/limits.go, never a synchronized 5-surface bump.
 //
-// CANVAS_MIRROR: keep aligned with canvas/src/components/tabs/chat/
-// uploads.ts MAX_UPLOAD_BYTES. The canvas constant exists so the
-// pre-flight size check can fail immediately (before network I/O)
-// with the actionable "File too large (got X MB) — limit is 100MB"
-// message. Bumping one side without the other yields the wrong-reason
-// surface that motivated this constant pair (CTO 2026-05-19 directive
-// on forensic a99ab0a1: file-size cause MUST surface as file-size,
-// NOT as a downstream timeout).
-const chatUploadMaxBytes = 100 * 1024 * 1024
+// CANVAS_MIRROR: canvas/src/components/tabs/chat/uploads.ts reads the
+// live value via GET /uploads/limits at app init (Phase 2 follow-up;
+// today still a literal 100 MB pinned by an assertion test, which the
+// migration PR will replace). The canvas constant exists so the
+// pre-flight size check can fail immediately (before network I/O) with
+// the actionable "File too large (got X MB) — limit is 100MB" message.
+// Bumping one side without the other yields the wrong-reason surface
+// that motivated this constant pair (CTO 2026-05-19 directive on
+// forensic a99ab0a1: file-size cause MUST surface as file-size, NOT as
+// a downstream timeout). Once the canvas migrates to the live fetch,
+// drift becomes structurally impossible.
+//
+// Why "var" instead of "const": Go disallows initializing a const from
+// a function call. The DefaultUploadLimits() body is pure literals so
+// the runtime cost is zero.
+var chatUploadMaxBytes = uploads.DefaultUploadLimits().PerRequestBytes
 
 // resolveWorkspaceForwardCreds resolves the workspace's URL +
 // platform_inbound_secret for an /internal/* forward, applying
@@ -620,7 +628,7 @@ func (h *ChatFilesHandler) uploadPollMode(c *gin.Context, ctx context.Context, w
 	prepReady := make([]prepped, 0, len(headers))
 	items := make([]pendinguploads.PutItem, 0, len(headers))
 	for _, fh := range headers {
-		if fh.Size > pendinguploads.MaxFileBytes {
+		if fh.Size > int64(pendinguploads.MaxFileBytes) {
 			log.Printf("chat_files uploadPollMode: per-file cap exceeded for %s: %s (%d bytes)",
 				workspaceID, fh.Filename, fh.Size)
 			c.JSON(http.StatusRequestEntityTooLarge, gin.H{

@@ -586,7 +586,7 @@ func TestPollUpload_PerFileCapPreStorage_413(t *testing.T) {
 	// next bumped above MaxFileBytes (e.g., RFC for the SSOT
 	// GET /uploads/limits endpoint reshapes the layering) this test
 	// can run again.
-	if pendinguploads.MaxFileBytes >= chatUploadMaxBytes {
+	if int64(pendinguploads.MaxFileBytes) >= chatUploadMaxBytes {
 		t.Skipf("per-file cap %d >= body cap %d; the body MaxBytesReader 400s before the per-file 413 branch is reachable. Re-enable when body cap > per-file cap.",
 			pendinguploads.MaxFileBytes, chatUploadMaxBytes)
 	}
@@ -686,7 +686,7 @@ func TestPollUpload_AtomicRollbackOnSecondFileTooLarge(t *testing.T) {
 	// a real Postgres without depending on the body-cap arithmetic
 	// here. Re-enable this handler-level test when body cap exceeds
 	// per-file cap again.
-	if pendinguploads.MaxFileBytes >= chatUploadMaxBytes {
+	if int64(pendinguploads.MaxFileBytes) >= chatUploadMaxBytes {
 		t.Skipf("per-file cap %d >= body cap %d; the body MaxBytesReader 400s before the per-file 413 branch is reachable. Storage-level atomicity covered by integration test. Re-enable when body cap > per-file cap.",
 			pendinguploads.MaxFileBytes, chatUploadMaxBytes)
 	}
