@@ -366,6 +366,9 @@ jobs:
             exit 1
           fi
           echo "Migrations OK"
+      - name: Run today's-PR-coverage E2E (mc#1525/1535/1536/1539/1542 fix-specific assertions)
+        if: needs.detect-changes.outputs.api == 'true'
+        run: bash tests/e2e/test_today_pr_coverage_e2e.sh
       - name: Run E2E API tests
         if: needs.detect-changes.outputs.api == 'true'
         run: bash tests/e2e/test_api.sh
@@ -375,15 +378,18 @@ jobs:
       - name: Run priority-runtimes E2E (claude-code + hermes — skips when keys absent)
         if: needs.detect-changes.outputs.api == 'true'
         run: bash tests/e2e/test_priority_runtimes_e2e.sh
+      - name: Install standalone runtime parser from Gitea registry
+        if: needs.detect-changes.outputs.api == 'true'
+        run: |
+          python3 -m pip install --no-deps \
+            --index-url https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/ \
+            molecule-ai-workspace-runtime
       - name: Run poll-mode + since_id cursor E2E (#2339)
         if: needs.detect-changes.outputs.api == 'true'
         run: bash tests/e2e/test_poll_mode_e2e.sh
       - name: Run poll-mode chat upload E2E (RFC #2891)
         if: needs.detect-changes.outputs.api == 'true'
         run: bash tests/e2e/test_poll_mode_chat_upload_e2e.sh
-      - name: Run today's-PR-coverage E2E (mc#1525/1535/1536/1539/1542 fix-specific assertions)
-        if: needs.detect-changes.outputs.api == 'true'
-        run: bash tests/e2e/test_today_pr_coverage_e2e.sh
       - name: Dump platform log on failure
         if: failure() && needs.detect-changes.outputs.api == 'true'
         run: cat workspace-server/platform.log || true
@@ -401,4 +407,3 @@ jobs:
         run: |
           docker rm -f "$PG_CONTAINER" 2>/dev/null || true
           docker rm -f "$REDIS_CONTAINER" 2>/dev/null || true
-

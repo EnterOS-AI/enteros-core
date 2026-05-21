@@ -283,7 +283,7 @@ claude --dangerously-load-development-channels \
 
 // externalUniversalMcpTemplate — runtime-agnostic standalone path.
 // Ships as the `molecule-mcp` console script in the
-// molecule-ai-workspace-runtime PyPI wheel (workspace/mcp_cli.py).
+// molecule-ai-workspace-runtime wheel published to the Gitea package registry.
 // Any MCP-aware runtime (Claude Code, hermes, codex, third-party)
 // registers it once and gets the same 8 universal tools that
 // container-bound runtimes use today: delegate_task, list_peers,
@@ -322,7 +322,7 @@ const externalUniversalMcpTemplate = `# Universal MCP — standalone register + 
 
 # 1. Install the workspace runtime wheel (once per machine — safe to
 #    re-run; subsequent workspaces share the same wheel):
-pip install molecule-ai-workspace-runtime
+pip install --index-url https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/ molecule-ai-workspace-runtime
 
 # 2. Wire molecule-mcp into your agent's MCP config. Claude Code:
 #    NOTE the server name is workspace-specific ("{{MCP_SERVER_NAME}}") so
@@ -344,7 +344,7 @@ claude mcp add {{MCP_SERVER_NAME}} -s user -- env \
 # needed when calling tools through the MCP server.
 
 # Need help?
-#   Where to install: https://pypi.org/project/molecule-ai-workspace-runtime/
+#   Where to install: https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/molecule-ai-workspace-runtime/
 #   Documentation: https://doc.moleculesai.app/docs/guides/mcp-server-setup
 #   Common errors:
 #     • "Tools not appearing in your agent" — run ` + "`claude mcp list`" + ` (or
@@ -359,8 +359,8 @@ claude mcp add {{MCP_SERVER_NAME}} -s user -- env \
 `
 
 // externalPythonTemplate uses molecule-sdk-python's RemoteAgentClient +
-// A2AServer (PR #13 in that repo). Until the SDK cuts a v0.y release
-// to PyPI the snippet pins git+main.
+// A2AServer. Until the SDK is published to the Gitea package registry the
+// snippet pins git+main.
 const externalPythonTemplate = `# pip install 'git+https://git.moleculesai.app/molecule-ai/molecule-sdk-python.git@main'
 
 import asyncio
@@ -396,7 +396,7 @@ if __name__ == "__main__":
     asyncio.run(main())
 
 # Need help?
-#   Where to install: https://pypi.org/project/molecule-ai-workspace-runtime/
+#   Where to install: https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/molecule-ai-workspace-runtime/
 #   Documentation: https://doc.moleculesai.app/docs/guides/external-agent-registration
 #   Common errors:
 #     • 401 from /heartbeat — AUTH_TOKEN expired or wrong workspace_id.
@@ -445,7 +445,7 @@ const externalHermesChannelTemplate = `# Hermes channel — bridges this workspa
 # also supported via the plugin's dual-mode fallback.
 #
 # 1. Install the runtime + plugin:
-pip install molecule-ai-workspace-runtime
+pip install --index-url https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/ molecule-ai-workspace-runtime
 pip install 'git+https://git.moleculesai.app/molecule-ai/hermes-channel-molecule.git'
 
 # 2. Export the workspace credentials:
@@ -528,7 +528,7 @@ const externalCodexTemplate = `# Codex external setup — outbound tools (MCP) +
 
 # 1. Install codex CLI, the workspace runtime, and the bridge daemon:
 npm install -g @openai/codex@latest
-pip install molecule-ai-workspace-runtime
+pip install --index-url https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/ molecule-ai-workspace-runtime
 pip install codex-channel-molecule
 
 # 2. Wire the molecule MCP server into codex's config.toml — this is
@@ -620,7 +620,7 @@ const externalKimiTemplate = `# Kimi CLI external setup — register + heartbeat
 # No public URL needed; runs behind NAT in poll mode.
 
 # 1. Install the workspace runtime wheel (provides HTTP client):
-pip install molecule-ai-workspace-runtime
+pip install --index-url https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/ molecule-ai-workspace-runtime
 
 # 2. Save credentials and the bridge script:
 mkdir -p ~/.molecule-ai/kimi-{{MCP_SERVER_NAME}}
@@ -779,7 +779,7 @@ const externalOpenClawTemplate = `# OpenClaw MCP config — outbound tool path. 
 #    (register-on-startup + 20s heartbeat). Older versions only ship
 #    a2a_mcp_server which does not heartbeat.
 npm install -g openclaw@latest
-pip install "molecule-ai-workspace-runtime>=0.1.999"
+pip install --index-url https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/ "molecule-ai-workspace-runtime>=0.1.999"
 
 # 2. Onboard openclaw against your model provider (one-time setup).
 #    --non-interactive needs an explicit --provider + --model so it

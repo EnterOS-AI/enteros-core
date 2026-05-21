@@ -33,7 +33,10 @@ e2e_mint_test_token() {
     return 2
   fi
   local body
-  body=$(curl -s -w "\n%{http_code}" "$BASE/admin/workspaces/$wid/test-token")
+  local admin_bearer="${MOLECULE_ADMIN_TOKEN:-${ADMIN_TOKEN:-}}"
+  local admin_auth=()
+  [ -n "$admin_bearer" ] && admin_auth=(-H "Authorization: Bearer $admin_bearer")
+  body=$(curl -s -w "\n%{http_code}" "$BASE/admin/workspaces/$wid/test-token" "${admin_auth[@]}")
   local code
   code=$(printf '%s' "$body" | tail -n1)
   local json

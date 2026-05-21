@@ -25,6 +25,13 @@ source "$(dirname "$0")/_lib.sh"  # sets BASE default + helpers
 PASS=0
 FAIL=0
 TIMEOUT="${E2E_TIMEOUT:-60}"
+ADMIN_BEARER="${MOLECULE_ADMIN_TOKEN:-${ADMIN_TOKEN:-}}"
+ADMIN_AUTH=()
+[ -n "$ADMIN_BEARER" ] && ADMIN_AUTH=(-H "Authorization: Bearer $ADMIN_BEARER")
+WS_A_TOKEN=""
+WS_A_AUTH=()
+WS_B_TOKEN=""
+WS_B_AUTH=()
 
 check() {
   local desc="$1" expected="$2" actual="$3"
@@ -75,15 +82,26 @@ echo "--- A. Per-workspace MCP server-name slug uniqueness ---"
 WS_A_NAME="e2e-cov-alpha-$$"
 WS_B_NAME="e2e-cov-beta-$$"
 
-R=$(curl -s -X POST "$BASE/workspaces" -H "Content-Type: application/json" \
-  -d "{\"name\":\"$WS_A_NAME\",\"tier\":1}")
-check "POST /workspaces (alpha)" '"status":"provisioning"' "$R"
+R=$(curl -s -X POST "$BASE/workspaces" "${ADMIN_AUTH[@]}" -H "Content-Type: application/json" \
+  -d "{\"name\":\"$WS_A_NAME\",\"runtime\":\"external\",\"external\":true,\"tier\":1}")
+check "POST /workspaces (alpha)" '"status":"awaiting_agent"' "$R"
 WS_A_ID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))")
+if [ -n "$WS_A_ID" ]; then
+  WS_A_TOKEN=$(e2e_mint_test_token "$WS_A_ID" 2>/dev/null || true)
+  [ -n "$WS_A_TOKEN" ] && WS_A_AUTH=(-H "Authorization: Bearer $WS_A_TOKEN")
+  if [ -z "$ADMIN_BEARER" ] && [ -n "$WS_A_TOKEN" ]; then
+    ADMIN_AUTH=(-H "Authorization: Bearer $WS_A_TOKEN")
+  fi
+fi
 
-R=$(curl -s -X POST "$BASE/workspaces" -H "Content-Type: application/json" \
-  -d "{\"name\":\"$WS_B_NAME\",\"tier\":1}")
-check "POST /workspaces (beta)" '"status":"provisioning"' "$R"
+R=$(curl -s -X POST "$BASE/workspaces" "${ADMIN_AUTH[@]}" -H "Content-Type: application/json" \
+  -d "{\"name\":\"$WS_B_NAME\",\"runtime\":\"external\",\"external\":true,\"tier\":1}")
+check "POST /workspaces (beta)" '"status":"awaiting_agent"' "$R"
 WS_B_ID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))")
+if [ -n "$WS_B_ID" ]; then
+  WS_B_TOKEN=$(e2e_mint_test_token "$WS_B_ID" 2>/dev/null || true)
+  [ -n "$WS_B_TOKEN" ] && WS_B_AUTH=(-H "Authorization: Bearer $WS_B_TOKEN")
+fi
 
 # external/connection returns the install-snippet. The per-workspace
 # fix (mc#1535) derives the MCP name as molecule-<slug>; mc#1536 extends
@@ -91,8 +109,10 @@ WS_B_ID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).ge
 # grep the `claude mcp add` line, and assert the names differ.
 if [ -n "$WS_A_ID" ] && [ -n "$WS_B_ID" ]; then
   SNIPPET_A=$(curl -s --max-time "$TIMEOUT" \
+    "${WS_A_AUTH[@]}" \
     "$BASE/workspaces/$WS_A_ID/external/connection")
   SNIPPET_B=$(curl -s --max-time "$TIMEOUT" \
+    "${WS_B_AUTH[@]}" \
     "$BASE/workspaces/$WS_B_ID/external/connection")
 
   MCP_A=$(echo "$SNIPPET_A" | python3 -c "
@@ -151,7 +171,11 @@ import sys, json, re
 d=json.load(sys.stdin)
 def find(o):
   if isinstance(o,str):
-    m=re.search(r'\[mcp_servers\.([^\]]+)\]',o); return m.group(1) if m else None
+    for m in re.finditer(r'\[mcp_servers\.([^\]]+)\]',o):
+      name=m.group(1)
+      if name.startswith('molecule-') and '<' not in name:
+        return name
+    return None
   if isinstance(o,dict):
     for v in o.values():
       r=find(v)
@@ -168,7 +192,11 @@ import sys, json, re
 d=json.load(sys.stdin)
 def find(o):
   if isinstance(o,str):
-    m=re.search(r'\[mcp_servers\.([^\]]+)\]',o); return m.group(1) if m else None
+    for m in re.finditer(r'\[mcp_servers\.([^\]]+)\]',o):
+      name=m.group(1)
+      if name.startswith('molecule-') and '<' not in name:
+        return name
+    return None
   if isinstance(o,dict):
     for v in o.values():
       r=find(v)
@@ -212,7 +240,7 @@ echo "--- B. GIT_ASKPASS + GIT_HTTP_* env injection (mc#1525 + mc#1542) ---"
 if [ -n "${WS_A_ID:-}" ]; then
   # Wait briefly for provisioning to expose the container.
   for _ in 1 2 3 4 5 6 7 8 9 10; do
-    R=$(curl -s "$BASE/workspaces/$WS_A_ID")
+    R=$(curl -s "${ADMIN_AUTH[@]}" "$BASE/workspaces/$WS_A_ID")
     STATUS=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status',''))" 2>/dev/null)
     [ "$STATUS" = "online" ] && break
     sleep 1
@@ -225,7 +253,7 @@ if [ -n "${WS_A_ID:-}" ]; then
   # acceptable for the dev platform). The point is that the KEYS are
   # propagated by the post-#1542 provisioner — pre-#1542 these keys
   # were absent entirely.
-  DEBUG=$(curl -s "$BASE/admin/workspaces/$WS_A_ID/debug" 2>/dev/null || true)
+  DEBUG=$(curl -s "${ADMIN_AUTH[@]}" "$BASE/admin/workspaces/$WS_A_ID/debug" 2>/dev/null || true)
   if [ -n "$DEBUG" ] && echo "$DEBUG" | grep -q "workspace_secrets"; then
     # Presence-only check: KEY in the secrets map, value MAY be empty
     # in dev where no persona is bound.
@@ -261,6 +289,7 @@ if [ -n "${WS_A_ID:-}" ]; then
   # The expected response shape post-fix is a structured failure (HTTP
   # 4xx or success:false JSON) — NOT a queued task that round-trips.
   R=$(curl -s --max-time 10 -X POST "$BASE/workspaces/$WS_A_ID/delegate" \
+    "${WS_A_AUTH[@]}" \
     -H "Content-Type: application/json" \
     -d "{\"target_workspace_id\":\"$WS_A_ID\",\"task\":\"self-echo-test\"}" 2>&1)
   # Either the API gate (delegation.go) rejects, OR the inbox guard
@@ -281,7 +310,7 @@ if [ -n "${WS_A_ID:-}" ]; then
   # an inboxable peer_agent kind. The /activity endpoint is the inbox
   # poller's source-of-truth.
   sleep 2
-  AL=$(curl -s "$BASE/workspaces/$WS_A_ID/activity" 2>/dev/null || echo '[]')
+  AL=$(curl -s "${WS_A_AUTH[@]}" "$BASE/workspaces/$WS_A_ID/activity" 2>/dev/null || echo '[]')
   # Count rows where source_id == workspace_id AND method != "delegate_result".
   ECHO_COUNT=$(echo "$AL" | python3 -c "
 import sys, json
@@ -315,7 +344,15 @@ echo
 echo "--- Cleanup ---"
 for wid in "${WS_A_ID:-}" "${WS_B_ID:-}"; do
   [ -n "$wid" ] || continue
-  curl -s -X DELETE "$BASE/workspaces/$wid?confirm=true" > /dev/null || true
+  DELETE_AUTH=("${ADMIN_AUTH[@]}")
+  if [ -z "$ADMIN_BEARER" ]; then
+    if [ "$wid" = "${WS_A_ID:-}" ]; then
+      DELETE_AUTH=("${WS_A_AUTH[@]}")
+    elif [ "$wid" = "${WS_B_ID:-}" ]; then
+      DELETE_AUTH=("${WS_B_AUTH[@]}")
+    fi
+  fi
+  curl -s -X DELETE "$BASE/workspaces/$wid?confirm=true" "${DELETE_AUTH[@]}" > /dev/null || true
   echo "deleted $wid"
 done
 

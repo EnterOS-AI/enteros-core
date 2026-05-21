@@ -32,17 +32,22 @@
 #     every other local E2E (test_priority_runtimes_e2e.sh,
 #     test_api.sh) already uses; no new credential/provision flow.
 #
-# It is written to FAIL on today's broken Hermes/OpenClaw behavior and go
-# green only when the in-flight root-cause fixes (Hermes-401 #162,
-# OpenClaw-never-online/MCP-wiring #165) actually land — same gate
-# semantics + exit codes as the staging script. NON-required by design
-# until then (flip-to-required tracked at molecule-core#1296), and NOT
-# masked with continue-on-error (feedback_fix_root_not_symptom).
+# By default the local backend creates external-mode workspace rows and
+# drives the literal MCP path directly. That keeps the local peer-visibility
+# gate focused on platform auth + MCP list_peers semantics instead of local
+# template container boot/heartbeat. Set PV_LOCAL_PROVISION_MODE=container
+# for targeted runtime-boot debugging. NON-required by design until the
+# flip-to-required tracked at molecule-core#1296, and NOT masked with
+# continue-on-error (feedback_fix_root_not_symptom).
 #
 # Required env: none (local stack only).
 # Optional env:
 #   BASE                    default http://localhost:8080
 #   PV_RUNTIMES             space list; default "hermes openclaw claude-code"
+#   PV_LOCAL_PROVISION_MODE default external; set container to also require
+#                            local template containers to boot online
+#   PV_PARENT_RUNTIME       parent runtime; default claude-code when keyed,
+#                            otherwise first keyed runtime in PV_RUNTIMES
 #   E2E_PROVISION_TIMEOUT_SECS  per-workspace online budget; default 900
 #                            (hermes cold apt+uv is the slow path locally)
 #   E2E_KEEP_WS             1 → skip teardown (local debugging only)
@@ -68,6 +73,7 @@ source "$(dirname "$0")/_lib.sh"
 source "$(dirname "$0")/lib/peer_visibility_assert.sh"
 
 PV_RUNTIMES="${PV_RUNTIMES:-hermes openclaw claude-code}"
+PV_LOCAL_PROVISION_MODE="${PV_LOCAL_PROVISION_MODE:-external}"
 PROVISION_TIMEOUT_SECS="${E2E_PROVISION_TIMEOUT_SECS:-900}"
 NAME_PREFIX="PV-Local-$$-$(date +%H%M%S)"
 
@@ -75,6 +81,9 @@ log()  { echo "[$(date +%H:%M:%S)] $*"; }
 ok()   { echo "[$(date +%H:%M:%S)] ✅ $*"; }
 
 CREATED_WSIDS=()
+ADMIN_BEARER="${MOLECULE_ADMIN_TOKEN:-${ADMIN_TOKEN:-}}"
+ADMIN_AUTH=()
+[ -n "$ADMIN_BEARER" ] && ADMIN_AUTH=(-H "Authorization: Bearer $ADMIN_BEARER")
 
 # ─── Scoped teardown ───────────────────────────────────────────────────
 # Deletes ONLY the workspaces THIS run created (tracked in CREATED_WSIDS),
@@ -94,7 +103,7 @@ teardown() {
   log "[teardown] deleting ${#CREATED_WSIDS[@]} workspace(s) this run created (scoped)"
   for wid in ${CREATED_WSIDS[@]+"${CREATED_WSIDS[@]}"}; do
     [ -n "$wid" ] || continue
-    curl -s -X DELETE "$BASE/workspaces/$wid?confirm=true" >/dev/null 2>&1 || true
+    curl -s -X DELETE "$BASE/workspaces/$wid?confirm=true" "${ADMIN_AUTH[@]}" >/dev/null 2>&1 || true
   done
   exit $rc
 }
@@ -103,7 +112,7 @@ trap teardown EXIT INT TERM
 # Pre-sweep workspaces a prior crashed run of THIS script left behind
 # (name prefix match only — never a blanket delete). The trap fires on
 # normal exit, but a kill -9 / SIGPIPE can bypass it.
-PRIOR=$(curl -s "$BASE/workspaces" | python3 -c '
+PRIOR=$(curl -s "$BASE/workspaces" "${ADMIN_AUTH[@]}" | python3 -c '
 import json, sys
 try:
     print(" ".join(w["id"] for w in json.load(sys.stdin) if w.get("name","").startswith("PV-Local-")))
@@ -112,7 +121,7 @@ except Exception:
 ' 2>/dev/null)
 for _wid in $PRIOR; do
   log "Pre-sweeping prior PV-Local workspace: $_wid"
-  curl -s -X DELETE "$BASE/workspaces/$_wid?confirm=true" >/dev/null 2>&1 || true
+  curl -s -X DELETE "$BASE/workspaces/$_wid?confirm=true" "${ADMIN_AUTH[@]}" >/dev/null 2>&1 || true
 done
 
 # ─── Local-stack preflight ─────────────────────────────────────────────
@@ -123,10 +132,10 @@ if ! curl -fsS "$BASE/health" -m 5 >/dev/null 2>&1; then
 fi
 # admin/test-token is the local MCP-bearer mint path; it 404s in
 # production. If it is off, this gate cannot drive the literal call.
-if ! curl -fsS "$BASE/admin/workspaces/preflight-probe/test-token" -m 5 >/dev/null 2>&1; then
+if ! curl -fsS "$BASE/admin/workspaces/preflight-probe/test-token" "${ADMIN_AUTH[@]}" -m 5 >/dev/null 2>&1; then
   # A 404 here is EITHER "no such ws" (fine — endpoint is enabled) OR the
   # endpoint is disabled (MOLECULE_ENV=production). Distinguish by body.
-  PROBE=$(curl -s "$BASE/admin/workspaces/preflight-probe/test-token" -m 5 2>/dev/null)
+  PROBE=$(curl -s "$BASE/admin/workspaces/preflight-probe/test-token" "${ADMIN_AUTH[@]}" -m 5 2>/dev/null)
   if echo "$PROBE" | grep -qi 'production\|disabled\|not found.*endpoint'; then
     echo "::error::GET /admin/workspaces/:id/test-token disabled (MOLECULE_ENV=production?). Cannot mint a local MCP bearer." >&2
     exit 1
@@ -164,6 +173,28 @@ runtime_secrets() {
   esac
 }
 
+choose_parent_runtime() {
+  local rt
+  if [ -n "${PV_PARENT_RUNTIME:-}" ]; then
+    runtime_secrets "$PV_PARENT_RUNTIME" >/dev/null || return 1
+    echo "$PV_PARENT_RUNTIME"
+    return 0
+  fi
+
+  if runtime_secrets claude-code >/dev/null; then
+    echo "claude-code"
+    return 0
+  fi
+
+  for rt in $PV_RUNTIMES; do
+    if runtime_secrets "$rt" >/dev/null; then
+      echo "$rt"
+      return 0
+    fi
+  done
+  return 1
+}
+
 # Block until $1 reaches one of $2 (space-separated), or $3 sec elapse.
 wait_for_status() {
   local wsid="$1" want="$2" budget="$3" start=$SECONDS last=""
@@ -182,27 +213,42 @@ except Exception:
   return 1
 }
 
-# ─── 1. Provision parent (claude-code) + one sibling per runtime ───────
-# Same topology as the staging script: a claude-code parent plus one
-# sibling per runtime under test, so each runtime should see all others.
-log "1/5 provisioning parent (claude-code) + one sibling per runtime under test..."
-
-PARENT_SECRETS=$(runtime_secrets claude-code) || PARENT_SECRETS=""
-if [ -z "$PARENT_SECRETS" ]; then
-  # Parent still needs to exist as a peer target even without an LLM key;
-  # it never has to answer list_peers itself (it is excluded from the
-  # caller set), so an empty-secrets claude-code shell is sufficient.
+# ─── 1. Provision parent + one sibling per runtime ──────────────────────
+# Same topology as the staging script: one parent plus one sibling per
+# runtime under test, so each runtime should see all others. The default
+# local backend uses external-mode rows because the literal MCP list_peers
+# path is platform-local and must not depend on local template boot/heartbeat.
+if [ "$PV_LOCAL_PROVISION_MODE" = "external" ]; then
+  PARENT_RUNTIME="external"
   PARENT_SECRETS="{}"
+  PARENT_EXTRA=',"external":true'
+else
+  # Container mode is still available for local runtime-boot debugging.
+  # Prefer a claude-code parent for staging parity, but local CI is
+  # intentionally allowed to be partially keyed; an unkeyed parent can
+  # never heartbeat.
+  PARENT_RUNTIME=$(choose_parent_runtime) || {
+    echo "::error::No keyed runtime available for parent — cannot run the local peer-visibility gate. Set CLAUDE_CODE_OAUTH_TOKEN and/or E2E_MINIMAX_API_KEY (or ANTHROPIC/OPENAI)." >&2
+    exit 1
+  }
+  PARENT_SECRETS=$(runtime_secrets "$PARENT_RUNTIME") || PARENT_SECRETS=""
+  if [ -z "$PARENT_SECRETS" ]; then
+    echo "::error::parent runtime $PARENT_RUNTIME has no provider secrets" >&2
+    exit 1
+  fi
+  PARENT_EXTRA=""
 fi
-P_RESP=$(curl -s -X POST "$BASE/workspaces" -H "Content-Type: application/json" \
-  -d "{\"name\":\"${NAME_PREFIX}-parent\",\"runtime\":\"claude-code\",\"tier\":3,\"secrets\":$PARENT_SECRETS}")
+log "1/5 provisioning parent ($PARENT_RUNTIME, mode=$PV_LOCAL_PROVISION_MODE) + one sibling per runtime under test..."
+
+P_RESP=$(curl -s -X POST "$BASE/workspaces" "${ADMIN_AUTH[@]}" -H "Content-Type: application/json" \
+  -d "{\"name\":\"${NAME_PREFIX}-parent\",\"runtime\":\"$PARENT_RUNTIME\",\"tier\":3$PARENT_EXTRA,\"secrets\":$PARENT_SECRETS}")
 PARENT_ID=$(echo "$P_RESP" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("id",""))' 2>/dev/null)
 if [ -z "$PARENT_ID" ]; then
   echo "::error::parent create failed: $(echo "$P_RESP" | head -c 300)" >&2
   exit 1
 fi
 CREATED_WSIDS+=("$PARENT_ID")
-log "    PARENT_ID=$PARENT_ID"
+log "    PARENT_ID=$PARENT_ID runtime=$PARENT_RUNTIME"
 
 # NOTE: no `declare -A` — this script must also run on a local macOS dev
 # box (bash 3.2, no associative arrays) per feedback_local_must_mimic_
@@ -231,13 +277,21 @@ _map_get() { # _map_get <mapvarname> <key>  -> stdout value (empty if absent)
 ALL_WS_IDS="$PARENT_ID"
 ACTIVE_RUNTIMES=""
 for rt in $PV_RUNTIMES; do
-  SEC=$(runtime_secrets "$rt") || SEC=""
-  if [ -z "$SEC" ]; then
-    log "    SKIP $rt — no provider key in env (partially-keyed local env; not a failure)"
-    continue
+  if [ "$PV_LOCAL_PROVISION_MODE" = "external" ]; then
+    SEC="{}"
+    CREATE_RUNTIME="external"
+    CREATE_EXTRA=',"external":true'
+  else
+    SEC=$(runtime_secrets "$rt") || SEC=""
+    if [ -z "$SEC" ]; then
+      log "    SKIP $rt — no provider key in env (partially-keyed local env; not a failure)"
+      continue
+    fi
+    CREATE_RUNTIME="$rt"
+    CREATE_EXTRA=""
   fi
-  R=$(curl -s -X POST "$BASE/workspaces" -H "Content-Type: application/json" \
-    -d "{\"name\":\"${NAME_PREFIX}-$rt\",\"runtime\":\"$rt\",\"tier\":2,\"parent_id\":\"$PARENT_ID\",\"secrets\":$SEC}")
+  R=$(curl -s -X POST "$BASE/workspaces" "${ADMIN_AUTH[@]}" -H "Content-Type: application/json" \
+    -d "{\"name\":\"${NAME_PREFIX}-$rt\",\"runtime\":\"$CREATE_RUNTIME\",\"tier\":2,\"parent_id\":\"$PARENT_ID\"$CREATE_EXTRA,\"secrets\":$SEC}")
   WID=$(echo "$R" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("id",""))' 2>/dev/null)
   if [ -z "$WID" ]; then
     echo "::error::$rt workspace create failed: $(echo "$R" | head -c 300)" >&2
@@ -257,32 +311,40 @@ if [ -z "$ACTIVE_RUNTIMES" ]; then
 fi
 
 # ─── 2. Wait for the parent online (it is a peer target) ───────────────
-log "2/5 waiting for parent online (peer target)..."
-PF=$(wait_for_status "$PARENT_ID" "online" "$PROVISION_TIMEOUT_SECS") || true
-if [ "$PF" != "online" ]; then
-  echo "::error::parent ($PARENT_ID) never reached online (last=$PF) within ${PROVISION_TIMEOUT_SECS}s" >&2
-  exit 3
-fi
-ok "    parent online"
-
-# ─── 3. Wait for every sibling online ──────────────────────────────────
-# A runtime that never comes online locally is itself a finding: it
-# reproduces the openclaw-never-online class (#165) on the local stack.
-log "3/5 waiting for all siblings online (up to ${PROVISION_TIMEOUT_SECS}s each — cold boot)..."
 REGRESSED=0
 ONLINE_RUNTIMES=""
-for rt in $ACTIVE_RUNTIMES; do
-  wid="$(_map_get WS_IDS_MAP "$rt")"
-  S=$(wait_for_status "$wid" "online" "$PROVISION_TIMEOUT_SECS") || true
-  if [ "$S" != "online" ]; then
-    echo "  ✗ $rt ($wid): never reached online (last=$S) — reproduces the never-online class locally"
-    _map_set VERDICT_MAP "$rt" "FAIL(never-online:last=$S)"
-    REGRESSED=1
-    continue
+if [ "$PV_LOCAL_PROVISION_MODE" = "external" ]; then
+  log "2/5 external-mode local backend: parent is awaiting_agent; no container-online wait needed"
+  ok "    parent created"
+  log "3/5 external-mode local backend: siblings are awaiting_agent; driving MCP directly"
+  ONLINE_RUNTIMES="$ACTIVE_RUNTIMES"
+else
+  log "2/5 waiting for parent online (peer target)..."
+  PF=$(wait_for_status "$PARENT_ID" "online" "$PROVISION_TIMEOUT_SECS") || true
+  if [ "$PF" != "online" ]; then
+    echo "::error::parent ($PARENT_ID) never reached online (last=$PF) within ${PROVISION_TIMEOUT_SECS}s" >&2
+    exit 3
   fi
-  ok "    $rt online"
-  ONLINE_RUNTIMES="$ONLINE_RUNTIMES $rt"
-done
+  ok "    parent online"
+
+  # ─── 3. Wait for every sibling online ──────────────────────────────────
+  # A runtime that never comes online locally is itself a finding in
+  # container mode. The default external mode keeps this gate focused on
+  # literal MCP peer visibility.
+  log "3/5 waiting for all siblings online (up to ${PROVISION_TIMEOUT_SECS}s each — cold boot)..."
+  for rt in $ACTIVE_RUNTIMES; do
+    wid="$(_map_get WS_IDS_MAP "$rt")"
+    S=$(wait_for_status "$wid" "online" "$PROVISION_TIMEOUT_SECS") || true
+    if [ "$S" != "online" ]; then
+      echo "  ✗ $rt ($wid): never reached online (last=$S) — reproduces the never-online class locally"
+      _map_set VERDICT_MAP "$rt" "FAIL(never-online:last=$S)"
+      REGRESSED=1
+      continue
+    fi
+    ok "    $rt online"
+    ONLINE_RUNTIMES="$ONLINE_RUNTIMES $rt"
+  done
+fi
 
 # ─── 4. THE GATE — literal mcp_molecule_list_peers via POST /:id/mcp ────
 # Shared, byte-identical assertion. Local passes "" for the org id (the

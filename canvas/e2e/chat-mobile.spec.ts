@@ -49,7 +49,7 @@ test.describe("MobileChat", () => {
     await textarea.fill("Mobile test message");
     await page.getByRole("button", { name: /Send/ }).first().click();
 
-    await expect(page.getByText("Mobile test message")).toBeVisible({ timeout: 5_000 });
+    await expect(page.getByText("Mobile test message", { exact: true })).toBeVisible({ timeout: 5_000 });
     await expect(page.getByText("Echo: Mobile test message")).toBeVisible({ timeout: 15_000 });
   });
 
