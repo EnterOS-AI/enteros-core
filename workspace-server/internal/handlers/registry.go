@@ -112,7 +112,7 @@ func (h *RegistryHandler) SetQueueDrainFunc(f QueueDrainFunc) {
 // Go's net.ParseIP.To4() before Contains() runs, so the IPv4 rules above
 // catch those without a separate entry.
 //
-// F1083/#1130 (SSRF on mcpResolveURL / a2a_proxy resolveAgentURL): in
+// F1083/#1130 (SSRF on direct A2A URL resolution): in
 // addition to blocking IP literals, DNS names are now resolved and each
 // returned IP is checked against the blocklist. This closes the gap where
 // an attacker could register agent.example.com pointing to 169.254.169.254.

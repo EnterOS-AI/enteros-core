@@ -84,6 +84,7 @@ type mcpTool struct {
 type MCPHandler struct {
 	database    *sql.DB
 	broadcaster *events.Broadcaster
+	a2aProxy    func(ctx context.Context, workspaceID string, body []byte, callerID string, logActivity bool) (int, []byte, error)
 
 	// memv2 is the v2 memory plugin wiring (RFC #2728). nil-safe:
 	// every v2 tool calls memoryV2Available() first and returns a
@@ -96,6 +97,14 @@ type MCPHandler struct {
 // Pass db.DB and the platform broadcaster at router-setup time.
 func NewMCPHandler(database *sql.DB, broadcaster *events.Broadcaster) *MCPHandler {
 	return &MCPHandler{database: database, broadcaster: broadcaster}
+}
+
+func (h *MCPHandler) proxyA2ARequest(ctx context.Context, workspaceID string, body []byte, callerID string, logActivity bool) (int, []byte, error) {
+	if h.a2aProxy != nil {
+		return h.a2aProxy(ctx, workspaceID, body, callerID, logActivity)
+	}
+	wh := NewWorkspaceHandler(h.broadcaster, nil, "", "")
+	return wh.ProxyA2ARequest(ctx, workspaceID, body, callerID, logActivity)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -53,6 +53,15 @@ func mcpPost(t *testing.T, h *MCPHandler, workspaceID string, body interface{}) 
 	return w
 }
 
+func expectCanCommunicateSiblings(mock sqlmock.Sqlmock, callerID, targetID, parentID string) {
+	mock.ExpectQuery(`SELECT id, parent_id FROM workspaces WHERE id = \$1`).
+		WithArgs(callerID).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "parent_id"}).AddRow(callerID, parentID))
+	mock.ExpectQuery(`SELECT id, parent_id FROM workspaces WHERE id = \$1`).
+		WithArgs(targetID).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "parent_id"}).AddRow(targetID, parentID))
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // initialize
 // ─────────────────────────────────────────────────────────────────────────────
@@ -175,6 +184,98 @@ func TestMCPHandler_ToolsList_ContainsExpectedTools(t *testing.T) {
 		if !names[name] {
 			t.Errorf("tool %q missing from tools/list", name)
 		}
+	}
+}
+
+func TestMCPHandler_DelegateTask_RoutesThroughPlatformA2AProxy(t *testing.T) {
+	h, mock := newMCPHandler(t)
+	callerID := "11111111-1111-1111-1111-111111111111"
+	targetID := "22222222-2222-2222-2222-222222222222"
+	parentID := "33333333-3333-3333-3333-333333333333"
+
+	expectCanCommunicateSiblings(mock, callerID, targetID, parentID)
+	mock.ExpectExec(`(?s)INSERT INTO activity_logs.*'delegation'.*'delegate'`).
+		WithArgs(callerID, callerID, targetID, "Delegating to "+targetID, sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(`UPDATE activity_logs`).
+		WithArgs("dispatched", "", callerID, sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	var gotTarget, gotCaller string
+	h.a2aProxy = func(ctx context.Context, workspaceID string, body []byte, callerID string, logActivity bool) (int, []byte, error) {
+		gotTarget = workspaceID
+		gotCaller = callerID
+		if !logActivity {
+			t.Fatal("delegate_task should log through platform A2A proxy")
+		}
+		if !strings.Contains(string(body), "do work") {
+			t.Fatalf("A2A body missing task text: %s", string(body))
+		}
+		return 200, []byte(`{"result":{"message":{"parts":[{"text":"done"}]}}}`), nil
+	}
+
+	out, err := h.toolDelegateTask(context.Background(), callerID, map[string]interface{}{
+		"workspace_id": targetID,
+		"task":         "do work",
+	}, mcpCallTimeout)
+	if err != nil {
+		t.Fatalf("delegate_task returned error: %v", err)
+	}
+	if out != "done" {
+		t.Fatalf("delegate_task response = %q, want done", out)
+	}
+	if gotTarget != targetID || gotCaller != callerID {
+		t.Fatalf("proxy called with target=%q caller=%q, want target=%q caller=%q", gotTarget, gotCaller, targetID, callerID)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestMCPHandler_DelegateTaskAsync_RoutesThroughPlatformA2AProxy(t *testing.T) {
+	h, mock := newMCPHandler(t)
+	callerID := "11111111-1111-1111-1111-111111111111"
+	targetID := "22222222-2222-2222-2222-222222222222"
+	parentID := "33333333-3333-3333-3333-333333333333"
+
+	expectCanCommunicateSiblings(mock, callerID, targetID, parentID)
+	mock.ExpectExec(`(?s)INSERT INTO activity_logs.*'delegation'.*'delegate'`).
+		WithArgs(callerID, callerID, targetID, "Delegating to "+targetID, sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(`UPDATE activity_logs`).
+		WithArgs("dispatched", "", callerID, sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	called := make(chan struct{}, 1)
+	h.a2aProxy = func(ctx context.Context, workspaceID string, body []byte, proxyCallerID string, logActivity bool) (int, []byte, error) {
+		if workspaceID != targetID || proxyCallerID != callerID {
+			t.Fatalf("unexpected proxy route target=%q caller=%q", workspaceID, proxyCallerID)
+		}
+		if !strings.Contains(string(body), "async work") {
+			t.Fatalf("A2A body missing task text: %s", string(body))
+		}
+		called <- struct{}{}
+		return 200, []byte(`{"result":{"message":{"parts":[{"text":"accepted"}]}}}`), nil
+	}
+
+	out, err := h.toolDelegateTaskAsync(context.Background(), callerID, map[string]interface{}{
+		"workspace_id": targetID,
+		"task":         "async work",
+	})
+	if err != nil {
+		t.Fatalf("delegate_task_async returned error: %v", err)
+	}
+	if !strings.Contains(out, `"status":"dispatched"`) {
+		t.Fatalf("delegate_task_async response = %s", out)
+	}
+	waitGlobalAsyncForTest()
+	select {
+	case <-called:
+	default:
+		t.Fatal("async delegate did not call platform A2A proxy")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
 	}
 }
 
