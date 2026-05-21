@@ -169,7 +169,14 @@ jobs:
       - name: Install Playwright browsers
         if: needs.detect-changes.outputs.canvas == 'true'
         timeout-minutes: 10
-        run: npx playwright install --with-deps chromium
+        run: |
+          PREBAKED_PLAYWRIGHT=/ms-playwright
+          if [ -d "${PREBAKED_PLAYWRIGHT}" ] && find "${PREBAKED_PLAYWRIGHT}" -maxdepth 3 -type f -name 'chrome' | grep -q .; then
+            echo "Using prebaked Playwright Chromium from ${PREBAKED_PLAYWRIGHT}"
+            echo "PLAYWRIGHT_BROWSERS_PATH=${PREBAKED_PLAYWRIGHT}" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          npx playwright install --with-deps chromium
 
       - name: Run staging canvas E2E
         if: needs.detect-changes.outputs.canvas == 'true'

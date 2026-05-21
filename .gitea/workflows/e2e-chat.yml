@@ -230,7 +230,14 @@ jobs:
       - name: Install Playwright browsers
         if: needs.detect-changes.outputs.chat == 'true'
         working-directory: canvas
-        run: npx playwright install --with-deps chromium
+        run: |
+          PREBAKED_PLAYWRIGHT=/ms-playwright
+          if [ -d "${PREBAKED_PLAYWRIGHT}" ] && find "${PREBAKED_PLAYWRIGHT}" -maxdepth 3 -type f -name 'chrome' | grep -q .; then
+            echo "Using prebaked Playwright Chromium from ${PREBAKED_PLAYWRIGHT}"
+            echo "PLAYWRIGHT_BROWSERS_PATH=${PREBAKED_PLAYWRIGHT}" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          npx playwright install --with-deps chromium
 
       - name: Start canvas dev server (background)
         if: needs.detect-changes.outputs.chat == 'true'

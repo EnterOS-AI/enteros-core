@@ -13,8 +13,12 @@ name: gitea-merge-queue
 #   - add `merge-queue-hold` to pause a queued PR without removing it
 
 on:
-  schedule:
-    - cron: '*/5 * * * *'
+  # Schedule moved to operator-config:
+  #   /etc/cron.d/molecule-core-merge-queue ->
+  #   /usr/local/bin/molecule-core-cron-bot.sh merge-queue
+  #
+  # The queue bot still processes one PR per tick, but no longer occupies
+  # one of the shared Actions runners just to poll.
   workflow_dispatch:
 
 permissions:

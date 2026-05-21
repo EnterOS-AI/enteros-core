@@ -319,7 +319,7 @@ jobs:
         with:
           node-version: '22'
       - if: always()
-        run: rm -f package-lock.json && npm install
+        run: npm ci --include=optional --prefer-offline
       - if: always()
         run: npm run build
       - if: always()
