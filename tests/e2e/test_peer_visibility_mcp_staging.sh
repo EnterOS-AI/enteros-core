@@ -228,6 +228,15 @@ print(d.get('auth_token') or d.get('connection', {}).get('auth_token') or '')
 " 2>/dev/null)
   [ -n "$WID" ] || fail "$rt workspace create failed: $(echo "$R" | head -c 300)"
   if [ -z "$WTOK" ]; then
+    TTOK_RESP=$(tenant_call POST "/admin/workspaces/$WID/tokens" 2>/dev/null || true)
+    WTOK=$(echo "$TTOK_RESP" | python3 -c "
+import sys, json
+try: d = json.load(sys.stdin)
+except Exception: print(''); sys.exit(0)
+print(d.get('auth_token') or '')
+" 2>/dev/null)
+  fi
+  if [ -z "$WTOK" ]; then
     TTOK_RESP=$(tenant_call GET "/admin/workspaces/$WID/test-token" 2>/dev/null || true)
     WTOK=$(echo "$TTOK_RESP" | python3 -c "
 import sys, json
