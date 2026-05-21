@@ -686,11 +686,22 @@ func (h *WorkspaceHandler) resolveAgentURL(ctx context.Context, workspaceID stri
 		_ = db.CacheURL(ctx, workspaceID, agentURL)
 	}
 
-	// When the platform runs inside Docker, 127.0.0.1:{host_port} is
-	// unreachable (it's the platform container's own localhost, not the
-	// Docker host). Rewrite to the container's Docker-bridge hostname.
+	// When the platform runs inside Docker, a managed workspace's
+	// 127.0.0.1:{host_port} URL points at the Docker host and must be
+	// rewritten to the workspace container's Docker-bridge hostname.
+	// External runtimes are not managed containers; their local test/runtime
+	// URL is the target and must not be synthesized into ws-<id>:8000.
 	if strings.HasPrefix(agentURL, "http://127.0.0.1:") && h.provisioner != nil && platformInDocker {
-		agentURL = provisioner.InternalURL(workspaceID)
+		var wsRuntime string
+		if err := db.DB.QueryRowContext(ctx,
+			`SELECT COALESCE(runtime, 'langgraph') FROM workspaces WHERE id = $1`,
+			workspaceID,
+		).Scan(&wsRuntime); err != nil {
+			log.Printf("ProxyA2A: runtime lookup before Docker URL rewrite failed for %s: %v", workspaceID, err)
+		}
+		if !isExternalLikeRuntime(wsRuntime) {
+			agentURL = provisioner.InternalURL(workspaceID)
+		}
 	}
 	// SSRF defence: reject private/metadata URLs before making outbound call.
 	if err := isSafeURL(agentURL); err != nil {
