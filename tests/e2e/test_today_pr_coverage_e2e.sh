@@ -171,7 +171,11 @@ import sys, json, re
 d=json.load(sys.stdin)
 def find(o):
   if isinstance(o,str):
-    m=re.search(r'\[mcp_servers\.([^\]]+)\]',o); return m.group(1) if m else None
+    for m in re.finditer(r'\[mcp_servers\.([^\]]+)\]',o):
+      name=m.group(1)
+      if name.startswith('molecule-') and '<' not in name:
+        return name
+    return None
   if isinstance(o,dict):
     for v in o.values():
       r=find(v)
@@ -188,7 +192,11 @@ import sys, json, re
 d=json.load(sys.stdin)
 def find(o):
   if isinstance(o,str):
-    m=re.search(r'\[mcp_servers\.([^\]]+)\]',o); return m.group(1) if m else None
+    for m in re.finditer(r'\[mcp_servers\.([^\]]+)\]',o):
+      name=m.group(1)
+      if name.startswith('molecule-') and '<' not in name:
+        return name
+    return None
   if isinstance(o,dict):
     for v in o.values():
       r=find(v)
