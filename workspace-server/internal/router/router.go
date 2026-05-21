@@ -397,6 +397,8 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		wsAuth.GET("/tokens", tokh.List)
 		wsAuth.POST("/tokens", tokh.Create)
 		wsAuth.DELETE("/tokens/:tokenId", tokh.Revoke)
+		adminTokH := handlers.NewAdminWorkspaceTokenHandler()
+		r.POST("/admin/workspaces/:id/tokens", middleware.AdminAuth(db.DB), adminTokH.Create)
 
 		// Memory
 		memh := handlers.NewMemoryHandler()
