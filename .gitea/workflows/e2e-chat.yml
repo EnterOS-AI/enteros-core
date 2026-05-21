@@ -201,7 +201,6 @@ jobs:
         working-directory: workspace-server
         run: |
           export MOLECULE_ENV=development
-          export MOLECULE_IN_DOCKER=false
           export DATABASE_URL="${DATABASE_URL}"
           export REDIS_URL="${REDIS_URL}"
           export PORT="${PLATFORM_PORT}"
