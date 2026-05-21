@@ -442,6 +442,46 @@ def test_reap_preserves_real_push(sr_module, monkeypatch):
     assert calls == []  # NO POST
 
 
+def test_reap_compensates_cancelled_real_push_status(sr_module, monkeypatch):
+    """Gitea 1.22.6 maps cancelled push runs to failure statuses.
+
+    A real push workflow with description exactly "Has been cancelled"
+    is cancel-cascade noise, not a defect signal. Status-reaper should
+    compensate it even though the workflow has a push trigger.
+    """
+    calls = []
+
+    def fake_api(method, path, *, body=None, query=None, expect_json=True):
+        calls.append((method, path, body))
+        return (201, {})
+
+    monkeypatch.setattr(sr_module, "api", fake_api)
+
+    workflow_map = {"ci": True}
+    combined = {
+        "state": "failure",
+        "statuses": [
+            {
+                "context": "ci / test (push)",
+                "status": "failure",
+                "description": "Has been cancelled",
+                "target_url": "https://example.test/actions/runs/1",
+            }
+        ],
+    }
+
+    counters = sr_module.reap(workflow_map, combined, SHA, dry_run=False)
+
+    assert counters["compensated"] == 1
+    assert counters["compensated_cancelled_push"] == 1
+    assert counters["preserved_real_push"] == 0
+    assert len(calls) == 1
+    assert calls[0][0] == "POST"
+    assert calls[0][1] == f"/repos/owner/repo/statuses/{SHA}"
+    assert calls[0][2]["context"] == "ci / test (push)"
+    assert calls[0][2]["state"] == "success"
+
+
 def test_reap_preserves_unknown_workflow(sr_module, monkeypatch, capsys):
     """Workflow not in map → ::notice:: + skip (conservative)."""
     monkeypatch.setattr(
