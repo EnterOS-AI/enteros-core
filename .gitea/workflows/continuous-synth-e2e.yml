@@ -43,6 +43,18 @@ name: Continuous synthetic E2E (staging)
 
 on:
   schedule:
+    # Every 30 minutes, on :02 and :32. This keeps a recurring SaaS
+    # behavior probe while cutting runner occupancy from this workflow by
+    # roughly two thirds; fast liveness belongs in the lighter smoke/heartbeat
+    # probes, not in a full tenant/workspace synth every 10 minutes.
+    #
+    # Previous cadence was every 10 minutes (:02 :12 :22 :32 :42 :52).
+    # The current operator-host runner pool is the bottleneck, so full
+    # synth E2E is deliberately lower-cadence until it moves to a dedicated
+    # runner host or warm-runtime pool.
+    #
+    # Historical notes from the 10-minute shape:
+    #
     # Every 10 minutes, on :02 :12 :22 :32 :42 :52. Three constraints:
     #   1. Stay off the top-of-hour. GitHub Actions scheduler drops
     #      :00 firings under high load (own docs:
@@ -66,7 +78,7 @@ on:
     # fires = ~30 min cadence; closer to the 20-min target than the
     # current shape and provides a real degradation alarm if drops
     # get worse.
-    - cron: '2,12,22,32,42,52 * * * *'
+    - cron: '2,32 * * * *'
 permissions:
   contents: read
   # No issue-write here — failures surface as red runs in the workflow
