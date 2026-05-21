@@ -9,6 +9,7 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { execFileSync, execSync } from "node:child_process";
 
 const PLATFORM_URL = process.env.E2E_PLATFORM_URL ?? "http://localhost:8080";
 
@@ -73,14 +74,33 @@ export async function seedWorkspace(echoURL: string): Promise<SeededWorkspace> {
     `-c "UPDATE workspaces SET status = 'online', url = '${echoURL}', platform_inbound_secret = '${inboundSecret}' WHERE id = '${ws.id}'"`,
   ].join(" ");
 
-  const { execSync } = await import("node:child_process");
   try {
     execSync(psql, { stdio: "pipe", timeout: 30_000 });
   } catch (err) {
     throw new Error(`DB update failed: ${err}`);
   }
 
+  cacheWorkspaceURL(ws.id, echoURL);
+
   return { id: ws.id, name: wsName, agentURL: echoURL, authToken };
+}
+
+function cacheWorkspaceURL(workspaceId: string, agentURL: string): void {
+  const redisContainer = process.env.REDIS_CONTAINER;
+  if (!redisContainer) return;
+
+  const keys = [`ws:${workspaceId}:url`, `ws:${workspaceId}:internal_url`];
+  for (const key of keys) {
+    try {
+      execFileSync(
+        "docker",
+        ["exec", redisContainer, "redis-cli", "SET", key, agentURL],
+        { stdio: "pipe", timeout: 10_000 },
+      );
+    } catch (err) {
+      throw new Error(`Redis URL cache update failed for ${key}: ${err}`);
+    }
+  }
 }
 
 /**
@@ -141,7 +161,6 @@ export async function seedChatHistory(
 
   const sql = `INSERT INTO chat_messages (id, workspace_id, role, content, created_at) VALUES ${values};`;
 
-  const { execSync } = await import("node:child_process");
   const psql = `PGPASSWORD=${pass} psql -h ${host} -p ${port} -U ${user} -d ${db} -c "${sql}"`;
   execSync(psql, { stdio: "pipe", timeout: 10_000 });
 }
@@ -163,7 +182,6 @@ export async function cleanupWorkspace(workspaceId: string): Promise<void> {
 
   const psql = `PGPASSWORD=${pass} psql -h ${host} -p ${port} -U ${user} -d ${db} -c "DELETE FROM workspaces WHERE id = '${workspaceId}'"`;
 
-  const { execSync } = await import("node:child_process");
   try {
     execSync(psql, { stdio: "pipe", timeout: 30_000 });
   } catch {
