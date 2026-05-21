@@ -47,7 +47,10 @@ export async function seedWorkspace(echoURL: string): Promise<SeededWorkspace> {
     name: string;
     connection?: { auth_token?: string };
   };
-  const authToken = ws.connection?.auth_token;
+  let authToken = ws.connection?.auth_token;
+  if (!authToken) {
+    authToken = await mintTestToken(ws.id);
+  }
   if (!authToken) {
     throw new Error("Workspace created but no auth_token returned");
   }
