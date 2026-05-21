@@ -29,7 +29,8 @@ name: publish-workspace-server-image
 # Optional staging tenant mirror target:
 #   004947743811.dkr.ecr.us-east-2.amazonaws.com/molecule-ai/platform-tenant
 # Required secrets: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AUTO_SYNC_TOKEN
-# Optional secrets: AWS_STAGING_ECR_ACCESS_KEY_ID, AWS_STAGING_ECR_SECRET_ACCESS_KEY
+# Staging ECR grants the primary SSOT-managed publisher principal repository
+# policy access, so no persistent staging AWS access keys are required.
 #
 # mc#711: Docker daemon not accessible on ubuntu-latest runner (molecule-canonical-1
 # shows client-only in `docker info` — daemon not running). DinD mount is present but
@@ -186,9 +187,10 @@ jobs:
             --push .
 
       # Build + push tenant image (Go platform + Next.js canvas in one image).
-      # When staging ECR publisher credentials are configured, push the same
-      # build to the staging account too so fresh staging/E2E tenants can pull
-      # without cross-account ECR permissions.
+      # Push the same build to the staging account too so fresh staging/E2E
+      # tenants can pull without cross-account ECR reads. The staging ECR repo
+      # policy trusts the primary SSOT-managed publisher principal; do not add
+      # separate persistent staging AWS access keys here.
       - name: Build & push tenant image to ECR (staging-<sha> + staging-latest)
         env:
           TENANT_IMAGE_NAME: ${{ env.TENANT_IMAGE_NAME }}
@@ -199,32 +201,22 @@ jobs:
           REPO: ${{ github.repository }}
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_STAGING_ECR_ACCESS_KEY_ID: ${{ secrets.AWS_STAGING_ECR_ACCESS_KEY_ID }}
-          AWS_STAGING_ECR_SECRET_ACCESS_KEY: ${{ secrets.AWS_STAGING_ECR_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: us-east-2
         run: |
           set -euo pipefail
           ECR_REGISTRY="${TENANT_IMAGE_NAME%%/*}"
+          STAGING_ECR_REGISTRY="${STAGING_TENANT_IMAGE_NAME%%/*}"
           aws ecr get-login-password --region us-east-2 | \
             docker login --username AWS --password-stdin "${ECR_REGISTRY}"
+          aws ecr get-login-password --region us-east-2 | \
+            docker login --username AWS --password-stdin "${STAGING_ECR_REGISTRY}"
 
           build_tags=(
             --tag "${TENANT_IMAGE_NAME}:${TAG_SHA}"
             --tag "${TENANT_IMAGE_NAME}:${TAG_LATEST}"
+            --tag "${STAGING_TENANT_IMAGE_NAME}:${TAG_SHA}"
+            --tag "${STAGING_TENANT_IMAGE_NAME}:${TAG_LATEST}"
           )
-          if [ -n "${AWS_STAGING_ECR_ACCESS_KEY_ID:-}" ] && [ -n "${AWS_STAGING_ECR_SECRET_ACCESS_KEY:-}" ]; then
-            STAGING_ECR_REGISTRY="${STAGING_TENANT_IMAGE_NAME%%/*}"
-            AWS_ACCESS_KEY_ID="${AWS_STAGING_ECR_ACCESS_KEY_ID}" \
-            AWS_SECRET_ACCESS_KEY="${AWS_STAGING_ECR_SECRET_ACCESS_KEY}" \
-              aws ecr get-login-password --region us-east-2 | \
-              docker login --username AWS --password-stdin "${STAGING_ECR_REGISTRY}"
-            build_tags+=(
-              --tag "${STAGING_TENANT_IMAGE_NAME}:${TAG_SHA}"
-              --tag "${STAGING_TENANT_IMAGE_NAME}:${TAG_LATEST}"
-            )
-          else
-            echo "::notice::Skipping staging ECR tenant push; AWS_STAGING_ECR_ACCESS_KEY_ID/AWS_STAGING_ECR_SECRET_ACCESS_KEY are not configured."
-          fi
 
           docker buildx build \
             --file ./workspace-server/Dockerfile.tenant \
