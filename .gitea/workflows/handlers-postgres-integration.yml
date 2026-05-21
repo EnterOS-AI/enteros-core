@@ -106,6 +106,7 @@ jobs:
             --profile handlers-postgres \
             --event-name "${{ github.event_name }}" \
             --pr-base-sha "${{ github.event.pull_request.base.sha }}" \
+            --base-ref "${{ github.event.pull_request.base.ref }}" \
             --push-before "${GITHUB_EVENT_BEFORE:-}"
 
   # Single-job-with-per-step-if pattern: always runs to satisfy the

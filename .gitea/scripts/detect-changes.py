@@ -74,12 +74,37 @@ def base_exists(base: str) -> bool:
     return run_git(["cat-file", "-e", base]).returncode == 0
 
 
-def fetch_base(base: str) -> None:
-    run_git(["fetch", "--depth=1", "origin", base])
+def fetch_base(base: str, base_ref: str) -> None:
+    # Gitea may reject fetching an arbitrary unadvertised SHA from a shallow
+    # PR checkout. Fetch the advertised base branch first, then fall back to
+    # the SHA for hosts that allow it.
+    if base_ref:
+        run_git(["fetch", "--depth=1", "origin", base_ref])
+    if not base_exists(base):
+        run_git(["fetch", "--depth=1", "origin", base])
 
 
-def changed_paths(base: str) -> list[str] | None:
-    proc = run_git(["diff", "--name-only", base, "HEAD"])
+def deepen_base_ref(base_ref: str) -> None:
+    if base_ref:
+        run_git(["fetch", "--deepen=200", "origin", base_ref], timeout=60)
+
+
+def merge_base(base: str) -> str | None:
+    proc = run_git(["merge-base", base, "HEAD"])
+    if proc.returncode != 0:
+        return None
+    value = proc.stdout.strip()
+    return value or None
+
+
+def changed_paths(base: str, *, use_merge_base: bool) -> list[str] | None:
+    compare_base = base
+    if use_merge_base:
+        compare_base = merge_base(base) or ""
+        if not compare_base:
+            return None
+
+    proc = run_git(["diff", "--name-only", compare_base, "HEAD"])
     if proc.returncode != 0:
         return None
     return [line for line in proc.stdout.splitlines() if line]
@@ -96,17 +121,27 @@ def write_outputs(values: dict[str, bool], output_path: str | None) -> None:
             print(line)
 
 
-def detect(profile: str, event_name: str, pr_base_sha: str, push_before: str) -> dict[str, bool]:
+def detect(
+    profile: str,
+    event_name: str,
+    pr_base_sha: str,
+    push_before: str,
+    base_ref: str = "",
+) -> dict[str, bool]:
     base = resolve_base(event_name, pr_base_sha, push_before)
     if is_zero_sha(base):
         return all_true(profile)
 
     if not base_exists(base):
-        fetch_base(base)
+        fetch_base(base, base_ref)
     if not base_exists(base):
         return all_true(profile)
 
-    paths = changed_paths(base)
+    use_merge_base = event_name == "pull_request"
+    if use_merge_base and base_ref and merge_base(base) is None:
+        deepen_base_ref(base_ref)
+
+    paths = changed_paths(base, use_merge_base=use_merge_base)
     if paths is None:
         return all_true(profile)
     return classify(profile, paths)
@@ -117,13 +152,20 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--profile", required=True, choices=sorted(PROFILES))
     parser.add_argument("--event-name", default=os.environ.get("GITHUB_EVENT_NAME", ""))
     parser.add_argument("--pr-base-sha", default="")
+    parser.add_argument("--base-ref", default="")
     parser.add_argument("--push-before", default=os.environ.get("GITHUB_EVENT_BEFORE", ""))
     return parser.parse_args(argv)
 
 
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
-    values = detect(args.profile, args.event_name, args.pr_base_sha, args.push_before)
+    values = detect(
+        args.profile,
+        args.event_name,
+        args.pr_base_sha,
+        args.push_before,
+        args.base_ref,
+    )
     write_outputs(values, os.environ.get("GITHUB_OUTPUT"))
     return 0
 

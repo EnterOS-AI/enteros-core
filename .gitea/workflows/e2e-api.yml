@@ -137,6 +137,7 @@ jobs:
             --profile e2e-api \
             --event-name "${{ github.event_name }}" \
             --pr-base-sha "${{ github.event.pull_request.base.sha }}" \
+            --base-ref "${{ github.event.pull_request.base.ref }}" \
             --push-before "${GITHUB_EVENT_BEFORE:-${{ github.event.before }}}"
 
   # ONE job (no job-level `if:`) that always runs and reports under the
