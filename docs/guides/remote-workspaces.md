@@ -125,6 +125,33 @@ The agent appears on the canvas with a **purple REMOTE badge** within seconds. F
 
 ---
 
+## Multi-Tenant Local MCP Bridge
+
+For local MCP-driven agents, use the standalone runtime's `molecule-mcp`
+entrypoint. A single local bridge can serve multiple external workspaces by
+setting `MOLECULE_WORKSPACES`:
+
+```json
+[
+  {
+    "id": "workspace-id-local-to-acme",
+    "token": "...",
+    "platform_url": "https://acme.moleculesai.app"
+  },
+  {
+    "id": "different-workspace-id-local-to-ops",
+    "token": "...",
+    "platform_url": "https://ops.moleculesai.app"
+  }
+]
+```
+
+`platform_url` selects the tenant for registration, heartbeat, inbox polling,
+and outbound A2A routing. `org_id` is not required in this config, and the
+workspace IDs do not need to match across tenants.
+
+---
+
 ## What Phase 30 Covers
 
 | Phase | What shipped | Endpoint |
