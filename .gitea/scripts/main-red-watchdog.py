@@ -61,6 +61,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -88,6 +89,19 @@ API = f"https://{GITEA_HOST}/api/v1" if GITEA_HOST else ""
 # Title prefix — kept short and stable so the idempotency search can
 # match by exact title without parsing.
 TITLE_PREFIX = "[main-red]"
+
+# Settling window (seconds) between initial red detection and the
+# pre-file recheck. The recheck filters out the two largest false-
+# positive classes seen in mc#1597..1630 (task #394, 2026-05-21):
+#   1. HEAD moved on (a new commit landed mid-tick) — the prior red SHA
+#      is no longer authoritative; let the next cron tick re-evaluate.
+#   2. Combined status recovered on the SAME SHA (transient
+#      cancel-cascade rolled forward to success on retry).
+# 90s is well below the hourly cron cadence; a real failure that
+# persists past it is the one we want surfaced.
+# Override with WATCHDOG_RECHECK_DELAY_SECS for tests / local probes
+# (the test suite stubs time.sleep to a no-op).
+RECHECK_DELAY_SECS = int(_env("WATCHDOG_RECHECK_DELAY_SECS", default="90"))
 
 
 def _require_runtime_env() -> None:
@@ -170,6 +184,49 @@ def api(
         # (`feedback_gitea_create_api_unparseable_response`). Caller
         # MUST verify success via a follow-up GET, not by trusting body.
         return status, {"_raw": raw.decode("utf-8", errors="replace")}
+
+
+# --------------------------------------------------------------------------
+# action_run.status resolver — extensibility hook for task #394.
+# --------------------------------------------------------------------------
+def _resolve_action_run_status(target_url: str) -> int | None:
+    """Resolve the underlying Gitea `action_run.status` integer for the
+    run referenced by `target_url`, returning None if the resolver
+    cannot reach an authoritative source from the runner.
+
+    Canonical Gitea 1.22.6 enum (per `models/actions/status.go` +
+    `reference_gitea_action_status_enum_corrected_2026_05_19`):
+        1=Success, 2=Failure, 3=Cancelled, 4=Skipped,
+        5=Waiting,  6=Running, 7=Blocked
+    Only `status == 2` is a real defect; status=3 is cancel-cascade and
+    status=1 is an emission artifact (Gitea wrote a 'failure' commit_status
+    row for a run that actually succeeded — observed empirically on
+    `publish-canvas-image` jobs at SHAs in mc#1597..1630).
+
+    CURRENT STATE (2026-05-20, verified): Gitea 1.22.6 exposes NO REST
+    endpoint for `action_run.status`. Probed:
+        /api/v1/repos/{o}/{r}/actions/runs/{id}   → HTTP 404
+        /api/v1/repos/{o}/{r}/actions/jobs/{id}   → HTTP 404
+        /api/v1/repos/{o}/{r}/actions/tasks/{id}  → HTTP 404
+        /swagger.v1.json paths containing 'actions' → secrets+variables+runners only
+    The SPA backend (`/{repo}/actions/runs/{id}/jobs/{idx}` POST) requires
+    a session CSRF token, unreachable from a runner. The only authoritative
+    source today is direct DB access (`mol_action_status` on op-host,
+    `docker exec molecule-postgres-1 psql ...`), which the runner cannot
+    reach.
+
+    Therefore: this hook returns None on every call. Callers MUST fall
+    back to the description-string filter (existing) plus the HEAD
+    recheck (this PR). When a future Gitea release (>=1.23 expected) or
+    an op-host proxy exposes the endpoint, replace the body of this
+    function with an `api(...)` call — the caller contract is stable.
+
+    See also:
+        - `reference_chronic_red_sweep_cancelled_vs_failed_filter`
+        - `feedback_gitea_status_enum_use_helper_not_raw_int`
+    """
+    _ = target_url  # noqa: F841 — intentional placeholder
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -614,6 +671,56 @@ def run_once(*, dry_run: bool = False) -> int:
     }
 
     if red:
+        # HEAD recheck (task #394 — guards mc#1597..1630 false-positive
+        # cluster). After the initial detection, wait RECHECK_DELAY_SECS
+        # (default 90s; tests stub time.sleep) and re-evaluate:
+        #
+        #   1. Re-fetch HEAD SHA. If HEAD moved, a new commit landed
+        #      mid-tick — the prior red SHA is no longer authoritative
+        #      and the next cron run will re-evaluate against the new
+        #      HEAD. Skip-file.
+        #
+        #   2. If HEAD unchanged, re-fetch the combined status. If it
+        #      recovered (combined state no longer in {failure,error}
+        #      after the cancel-cascade filter), a transient retry
+        #      rolled the run forward. Skip-file.
+        #
+        # Both paths emit a Loki event distinguishable from the real
+        # `main_red_detected` so obs queries can track filter activity.
+        # The settling window is well below the hourly cron cadence —
+        # genuine failures persist past it and are surfaced normally.
+        time.sleep(RECHECK_DELAY_SECS)
+
+        recheck_sha = get_head_sha(WATCH_BRANCH)
+        if recheck_sha != sha:
+            emit_loki_event("main_red_skipped_head_drift", sha, [])
+            print(
+                f"::notice::skip-file (HEAD moved): initial red at "
+                f"{sha[:10]} but HEAD is now {recheck_sha[:10]} on "
+                f"{WATCH_BRANCH}; next cron tick will re-evaluate."
+            )
+            return 0
+
+        recheck_status = get_combined_status(sha)
+        recheck_red, recheck_failed = is_red(recheck_status)
+        if not recheck_red:
+            emit_loki_event("main_red_skipped_recovered", sha, [])
+            print(
+                f"::notice::skip-file (recovered after settling): "
+                f"combined state at {sha[:10]} flipped to "
+                f"{recheck_status.get('state')!r} on recheck; "
+                f"initial red was a transient cancel-cascade."
+            )
+            return 0
+
+        # Still red after settling — file/update. Use the recheck data
+        # as authoritative so the issue body reflects the latest state.
+        failed = recheck_failed
+        debug["recheck_combined_state"] = recheck_status.get("state")
+        debug["recheck_failed_contexts"] = [
+            s.get("context") for s in failed
+        ]
+
         failed_ctxs = [s.get("context") for s in failed if s.get("context")]
         emit_loki_event("main_red_detected", sha, failed_ctxs)
         print(f"::warning::main is RED at {sha[:10]} on {WATCH_BRANCH}: "

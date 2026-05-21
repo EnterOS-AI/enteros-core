@@ -56,6 +56,21 @@ SCRIPT_PATH = (
 )
 
 
+@pytest.fixture(autouse=True)
+def _stub_time_sleep(monkeypatch):
+    """Autouse: stub time.sleep across every test.
+
+    The watchdog's RECHECK_DELAY_SECS (default 90s) is wired into
+    run_once() via time.sleep(). Without this stub, integration-style
+    tests that exercise run_once() would each block for 90s — a
+    pre-fix `pytest -q` ran in ~0.1s; the unstubbed equivalent took
+    >4 minutes (task #394 review evidence). Stubbing here keeps the
+    suite fast and deterministic without requiring every red-path test
+    to remember the patch.
+    """
+    monkeypatch.setattr("time.sleep", lambda s: None)
+
+
 @pytest.fixture(scope="module")
 def wd_module():
     """Import the script as a module under a known env."""
@@ -809,3 +824,214 @@ def test_require_runtime_env_exits_when_missing(wd_module, monkeypatch):
     with pytest.raises(SystemExit) as excinfo:
         wd_module._require_runtime_env()
     assert excinfo.value.code == 2
+
+
+# --------------------------------------------------------------------------
+# Action-run status filter + HEAD-recheck (task #394, mc#1597..1630)
+#
+# The existing cancel-cascade filter matched description=='Has been
+# cancelled' EXACTLY, but a 7-day DB sweep on 2026-05-20 showed that
+# only 76/702 (~11%) of action_run.status=3 (Cancelled) entries carry
+# that string — 89% are written as 'Failing after Ns', indistinguishable
+# from real action_run.status=2 (Failure) at the commit_status layer.
+#
+# Gitea 1.22.6 has NO REST endpoint exposing action_run.status, so the
+# canonical filter (status=2 only) cannot run from a Gitea Actions
+# runner. The next-best signal is the HEAD-recheck: re-fetch HEAD SHA
+# (or its combined status) right before filing. If HEAD moved on or
+# combined state recovered, the prior "red" was a transient
+# cancel-cascade and we skip-file.
+#
+# References:
+#   - reference_chronic_red_sweep_cancelled_vs_failed_filter
+#   - feedback_gitea_status_enum_use_helper_not_raw_int
+#   - reference_gitea_action_status_enum_corrected_2026_05_19
+#   - triage evidence 2026-05-21 04:55 (6 cancellation + 1 emission
+#     artifact across mc#1597,1605,1609,1613,1626,1627,1630)
+# --------------------------------------------------------------------------
+def test_head_recheck_skips_file_when_head_moved(wd_module, monkeypatch, capsys):
+    """When initial tick sees red at SHA_A but HEAD has since moved to
+    SHA_B (next commit landed mid-tick), the watchdog must NOT file.
+    Re-evaluation happens on the next cron tick against the new SHA.
+
+    REGRESSION CLASS: this guards mc#1597..#1630 — 7 false-positives
+    filed in 24h because cancel-cascade fired commit_status=failure
+    rows on SHAs that were already superseded by new merges."""
+    SHA_A = SHA_RED
+    SHA_B = SHA_GREEN
+    failed_ctx = [
+        {"context": "ci/test", "status": "failure",
+         "target_url": "/r/runs/100/jobs/0",
+         "description": "Failing after 12s"},
+    ]
+    # First branches read returns SHA_A; the second (recheck) returns SHA_B
+    # → watchdog detects HEAD drift and skip-files.
+    branches_responses = iter([
+        (200, _branches_response(SHA_A)),
+        (200, _branches_response(SHA_B)),
+    ])
+
+    def fake_api(method, path, *, body=None, query=None, expect_json=True):
+        if method == "GET" and path == "/repos/owner/repo/branches/main":
+            return next(branches_responses)
+        if method == "GET" and path == f"/repos/owner/repo/commits/{SHA_A}/status":
+            return (200, _combined_status("failure", failed_ctx))
+        if method == "POST" and path == "/repos/owner/repo/issues":
+            raise AssertionError(
+                "watchdog filed a phantom issue despite HEAD moving away "
+                "from the red SHA (regression: mc#1597..1630)"
+            )
+        if method == "GET" and path == "/repos/owner/repo/issues":
+            return (200, [])
+        raise AssertionError(f"unexpected api call: {method} {path}")
+
+    # Settling delay is no-op'd by the _stub_time_sleep autouse fixture.
+    monkeypatch.setattr(wd_module, "api", fake_api)
+    wd_module.run_once(dry_run=False)
+    captured = capsys.readouterr()
+    assert "head drift" in captured.out.lower() or "head moved" in captured.out.lower(), (
+        f"expected a notice about HEAD drift, got: {captured.out!r}"
+    )
+
+
+def test_head_recheck_skips_file_when_recheck_status_recovered(
+    wd_module, monkeypatch, capsys,
+):
+    """When initial tick sees red at SHA, but the post-settling recheck
+    on the SAME SHA shows combined status recovered (e.g. transient
+    cancel-cascade rolled forward to success on retry), skip-file.
+
+    This catches the mid-flight cancel-cascade window — the second
+    largest false-positive cluster in mc#1597..1630."""
+    failed_ctx_initial = [
+        {"context": "ci/test", "status": "failure",
+         "target_url": "/r/runs/100/jobs/0",
+         "description": "Failing after 12s"},
+    ]
+    recovered_ctx = [
+        {"context": "ci/test", "status": "success",
+         "target_url": "/r/runs/100/jobs/0",
+         "description": "Successful in 30s"},
+    ]
+    # Same SHA across both branch reads; status flips from failure→success
+    # between the two combined-status reads.
+    status_responses = iter([
+        (200, _combined_status("failure", failed_ctx_initial)),
+        (200, _combined_status("success", recovered_ctx)),
+    ])
+
+    def fake_api(method, path, *, body=None, query=None, expect_json=True):
+        if method == "GET" and path == "/repos/owner/repo/branches/main":
+            return (200, _branches_response(SHA_RED))
+        if method == "GET" and path == f"/repos/owner/repo/commits/{SHA_RED}/status":
+            return next(status_responses)
+        if method == "POST" and path == "/repos/owner/repo/issues":
+            raise AssertionError(
+                "watchdog filed a phantom issue despite combined status "
+                "recovering on recheck (mid-flight cancel-cascade window)"
+            )
+        if method == "GET" and path == "/repos/owner/repo/issues":
+            return (200, [])
+        raise AssertionError(f"unexpected api call: {method} {path}")
+
+    monkeypatch.setattr(wd_module, "api", fake_api)
+    wd_module.run_once(dry_run=False)
+    captured = capsys.readouterr()
+    assert "recovered" in captured.out.lower() or "settled" in captured.out.lower(), (
+        f"expected a notice about post-settling recovery, got: {captured.out!r}"
+    )
+
+
+def test_head_recheck_files_when_still_red_after_settling(
+    wd_module, monkeypatch,
+):
+    """When BOTH the initial detection AND the post-settling recheck
+    show the same SHA still red, file the issue. This is the genuine-
+    failure path the watchdog is designed to surface.
+
+    Locks the over-filter: a future change that always-skips after
+    recheck would dismiss real failures."""
+    failed_ctx = [
+        {"context": "ci/test", "status": "failure",
+         "target_url": "/r/runs/100/jobs/0",
+         "description": "Failing after 12s"},
+    ]
+    post_filed = {"value": False}
+
+    def fake_api(method, path, *, body=None, query=None, expect_json=True):
+        if method == "GET" and path == "/repos/owner/repo/branches/main":
+            return (200, _branches_response(SHA_RED))
+        if method == "GET" and path == f"/repos/owner/repo/commits/{SHA_RED}/status":
+            return (200, _combined_status("failure", failed_ctx))
+        if method == "GET" and path == "/repos/owner/repo/issues":
+            return (200, [])
+        if method == "GET" and path == "/repos/owner/repo/labels":
+            return (200, [{"id": 9, "name": "tier:high"}])
+        if method == "POST" and path == "/repos/owner/repo/issues":
+            post_filed["value"] = True
+            return (201, {"number": 999})
+        if method == "POST" and path == "/repos/owner/repo/issues/999/labels":
+            return (200, [])
+        raise AssertionError(f"unexpected api call: {method} {path}")
+
+    monkeypatch.setattr(wd_module, "api", fake_api)
+    wd_module.run_once(dry_run=False)
+    assert post_filed["value"], (
+        "genuine-failure path was skip-filed — head-recheck over-filter "
+        "regression (would suppress all real main-red alarms)"
+    )
+
+
+def test_head_recheck_skips_when_initial_was_only_cancel_cascade(
+    wd_module, monkeypatch,
+):
+    """Belt-and-braces: combined-status failure caused exclusively by
+    description='Has been cancelled' entries should still be filtered
+    by the EXISTING cancel-cascade filter — head-recheck must not
+    accidentally bypass it. Regression guard for the existing mc#1564
+    fix."""
+    failed_ctx = [
+        {"context": "ci/test", "status": "failure",
+         "description": "Has been cancelled"},
+    ]
+
+    def fake_api(method, path, *, body=None, query=None, expect_json=True):
+        if method == "GET" and path == "/repos/owner/repo/branches/main":
+            return (200, _branches_response(SHA_RED))
+        if method == "GET" and path == f"/repos/owner/repo/commits/{SHA_RED}/status":
+            return (200, _combined_status("failure", failed_ctx))
+        if method == "POST" and path == "/repos/owner/repo/issues":
+            raise AssertionError(
+                "cancel-cascade-only entry must be filtered before any "
+                "head-recheck logic runs"
+            )
+        if method == "GET" and path == "/repos/owner/repo/issues":
+            return (200, [])
+        # No commit-status recheck should happen because is_red() returned False
+        raise AssertionError(f"unexpected api call: {method} {path}")
+
+    monkeypatch.setattr(wd_module, "api", fake_api)
+    wd_module.run_once(dry_run=False)
+    # success: no AssertionError raised, no POST
+
+
+def test_resolve_action_run_status_returns_none_on_no_endpoint(wd_module):
+    """The action_run.status REST endpoint does NOT exist in Gitea
+    1.22.6 (verified empirically 2026-05-20 — /api/v1/.../actions/runs/N
+    returns HTTP 404 across all probe variants). The resolver must
+    return None gracefully so callers fall back to the description-
+    string + head-recheck heuristics.
+
+    This pins the extensibility hook: when a future Gitea release (or
+    an op-host proxy) exposes the endpoint, the resolver implementation
+    can be swapped in without touching the caller contract."""
+    # The function exists and is callable
+    assert hasattr(wd_module, "_resolve_action_run_status")
+    # A typical target_url shape from real Gitea commit_status rows:
+    target_url = "/molecule-ai/molecule-core/actions/runs/75020/jobs/0"
+    # Return None when no endpoint available
+    out = wd_module._resolve_action_run_status(target_url)
+    assert out is None, (
+        "resolver must return None when the action_run.status endpoint "
+        "isn't reachable — callers depend on the None-fallback path"
+    )
