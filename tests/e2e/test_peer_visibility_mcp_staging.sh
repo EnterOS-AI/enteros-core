@@ -54,6 +54,9 @@
 #   E2E_PROVISION_TIMEOUT_SECS  default 1800 (hermes/openclaw cold EC2 budget)
 #   E2E_MINIMAX_API_KEY / E2E_ANTHROPIC_API_KEY / E2E_OPENAI_API_KEY
 #                          LLM provider key injected so the runtime can boot
+#   PV_TOKEN_DIAGNOSTIC_ONLY
+#                          1 -> stop after create/token acquisition. Useful
+#                          to classify Hermes-only vs shared auth-route issues.
 #   E2E_KEEP_ORG           1 → skip teardown (local debugging only)
 #
 # Exit codes:
@@ -232,6 +235,12 @@ for i in $(seq 1 120); do
   curl -fsS "$TENANT_URL/health" -m 5 -k >/dev/null 2>&1 && { log "    /health ok (attempt $i)"; break; }
   sleep 5
 done
+BUILDINFO=$(curl -fsS "$TENANT_URL/buildinfo" -m 10 2>/dev/null || true)
+if [ -n "$BUILDINFO" ]; then
+  log "    tenant buildinfo: $(echo "$BUILDINFO" | head -c 300)"
+else
+  log "    tenant buildinfo unavailable"
+fi
 
 # ─── 4. Provision the parent + one sibling per runtime under test ──────
 # Inject the LLM provider key so each runtime can authenticate at boot.
@@ -256,6 +265,8 @@ log "    PARENT_ID=$PARENT_ID"
 # WS_IDS[runtime]=id ; WS_TOKENS[runtime]=auth_token (the MCP bearer)
 declare -A WS_IDS WS_TOKENS
 ALL_WS_IDS="$PARENT_ID"
+TOKEN_ERRORS=0
+TOKEN_ERROR_SUMMARY=""
 for rt in $PV_RUNTIMES; do
   R=$(tenant_call POST /workspaces \
     -d "{\"name\":\"pv-$rt\",\"runtime\":\"$rt\",\"tier\":2,\"parent_id\":\"$PARENT_ID\",\"secrets\":$SECRETS_JSON}")
@@ -263,7 +274,7 @@ for rt in $PV_RUNTIMES; do
   # External-like runtimes may return connection.auth_token on create.
   # Managed container runtimes usually return only id/status here, then
   # receive their bearer through registry/bootstrap; for this literal MCP
-  # driver we mint an admin test token below.
+  # driver we mint through the production-safe admin token route below.
   WTOK=$(echo "$R" | extract_auth_token)
   [ -n "$WID" ] || fail "$rt workspace create failed: $(echo "$R" | head -c 300)"
   TOKEN_DIAG=""
@@ -275,21 +286,27 @@ for rt in $PV_RUNTIMES; do
     TOKEN_DIAG="POST /admin/workspaces/$WID/tokens -> HTTP $TTOK_CODE body: $(echo "$TTOK_RESP" | redact_token_body)"
     rm -f "$TTOK_FILE"
   fi
-  if [ -z "$WTOK" ]; then
-    TTOK_FILE=$(mktemp)
-    TTOK_CODE=$(tenant_call_capture GET "/admin/workspaces/$WID/test-token" "$TTOK_FILE" 2>/dev/null || echo "curl_error")
-    TTOK_RESP=$(cat "$TTOK_FILE" 2>/dev/null || true)
-    WTOK=$(echo "$TTOK_RESP" | extract_auth_token)
-    TOKEN_DIAG="${TOKEN_DIAG}
-GET /admin/workspaces/$WID/test-token -> HTTP $TTOK_CODE body: $(echo "$TTOK_RESP" | redact_token_body)"
-    rm -f "$TTOK_FILE"
-  fi
-  [ -n "$WTOK" ] || fail "$rt workspace did not return or mint an auth_token — cannot drive its MCP call (create_resp: $(echo "$R" | redact_token_body); token_fallbacks: $TOKEN_DIAG)"
   WS_IDS[$rt]="$WID"
+  if [ -z "$WTOK" ]; then
+    TOKEN_ERRORS=$((TOKEN_ERRORS + 1))
+    TOKEN_ERROR_SUMMARY="${TOKEN_ERROR_SUMMARY}
+[$rt] workspace did not return or mint an auth_token — cannot drive its MCP call (workspace_id=$WID; create_resp: $(echo "$R" | redact_token_body); token_fallbacks: $TOKEN_DIAG)"
+    log "    $rt → $WID (token acquisition failed; continuing to classify other runtimes)"
+    continue
+  fi
   WS_TOKENS[$rt]="$WTOK"
   ALL_WS_IDS="$ALL_WS_IDS $WID"
   log "    $rt → $WID"
 done
+
+if [ "$TOKEN_ERRORS" -gt 0 ]; then
+  fail "token acquisition failed for $TOKEN_ERRORS runtime(s):$TOKEN_ERROR_SUMMARY"
+fi
+
+if [ "${PV_TOKEN_DIAGNOSTIC_ONLY:-0}" = "1" ]; then
+  ok "token diagnostic passed for runtimes: $PV_RUNTIMES"
+  exit 0
+fi
 
 # ─── 5. Wait for every sibling online ──────────────────────────────────
 log "5/6 waiting for all workspaces status=online (up to ${PROVISION_TIMEOUT_SECS}s — cold boot)..."

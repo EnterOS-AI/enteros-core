@@ -86,6 +86,7 @@ on:
       - 'workspace-server/internal/handlers/registry.go'
       - 'workspace-server/internal/handlers/workspace.go'
       - 'tests/e2e/test_peer_visibility_mcp_staging.sh'
+      - 'tests/e2e/test_peer_visibility_token_mint_staging.sh'
       - 'tests/e2e/test_peer_visibility_mcp_local.sh'
       - 'tests/e2e/lib/peer_visibility_assert.sh'
       - '.gitea/workflows/e2e-peer-visibility.yml'
@@ -98,6 +99,7 @@ on:
       - 'workspace-server/internal/handlers/registry.go'
       - 'workspace-server/internal/handlers/workspace.go'
       - 'tests/e2e/test_peer_visibility_mcp_staging.sh'
+      - 'tests/e2e/test_peer_visibility_token_mint_staging.sh'
       - 'tests/e2e/test_peer_visibility_mcp_local.sh'
       - 'tests/e2e/lib/peer_visibility_assert.sh'
       - '.gitea/workflows/e2e-peer-visibility.yml'
@@ -137,8 +139,14 @@ jobs:
           echo "lib/peer_visibility_assert.sh — bash syntax OK"
           bash -n tests/e2e/test_peer_visibility_mcp_staging.sh
           echo "test_peer_visibility_mcp_staging.sh — bash syntax OK"
+          bash -n tests/e2e/test_peer_visibility_token_mint_staging.sh
+          echo "test_peer_visibility_token_mint_staging.sh — bash syntax OK"
           bash -n tests/e2e/test_peer_visibility_mcp_local.sh
           echo "test_peer_visibility_mcp_local.sh — bash syntax OK"
+          if rg -n '/admin/workspaces/.*/test-token|test-token' tests/e2e/test_*staging*.sh; then
+            echo "::error::staging E2E must not use dev-only /admin/workspaces/:id/test-token; use production-safe admin token minting instead"
+            exit 1
+          fi
           echo "Staging fresh-provision MCP list_peers E2E runs on push to"
           echo "main / workflow_dispatch / daily cron (30+ min EC2 boot)."
           echo "The LOCAL backend runs in the peer-visibility-local job"
