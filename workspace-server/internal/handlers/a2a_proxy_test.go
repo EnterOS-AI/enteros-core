@@ -1511,6 +1511,35 @@ func TestResolveAgentURL_DockerRewrite(t *testing.T) {
 	}
 }
 
+func TestResolveAgentURL_ExternalRuntimeLoopbackNotRewrittenInDocker(t *testing.T) {
+	mock := setupTestDB(t)
+	mr := setupTestRedis(t)
+	allowLoopbackForTest(t)
+	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
+	waitForHandlerAsyncBeforeDBCleanup(t, handler)
+	handler.provisioner = &stubLocalProv{}
+
+	restore := setPlatformInDockerForTest(true)
+	defer restore()
+
+	agentURL := "http://127.0.0.1:55555"
+	mr.Set("ws:ws-external:url", agentURL)
+	mock.ExpectQuery("SELECT COALESCE\\(runtime").
+		WithArgs("ws-external").
+		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("external"))
+
+	url, perr := handler.resolveAgentURL(context.Background(), "ws-external")
+	if perr != nil {
+		t.Fatalf("unexpected error: %+v", perr)
+	}
+	if url != agentURL {
+		t.Errorf("external runtime loopback URL must not be rewritten; got %q want %q", url, agentURL)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
 // --- dispatchA2A direct unit tests ---
 
 func TestDispatchA2A_BuildRequestError(t *testing.T) {
