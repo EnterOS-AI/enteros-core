@@ -24,13 +24,19 @@ export interface SeededWorkspace {
  * Create an external workspace and wire it to the echo runtime.
  */
 export async function seedWorkspace(echoURL: string): Promise<SeededWorkspace> {
-  // 1. Create external workspace (no URL — platform will mint an auth token).
+  // 1. Create external workspace pointing at the in-process echo runtime.
   const runId = Math.random().toString(36).slice(2, 8);
   const wsName = `Chat E2E Agent ${runId}`;
   const createRes = await fetch(`${PLATFORM_URL}/workspaces`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name: wsName, tier: 1, external: true, runtime: "external" }),
+    body: JSON.stringify({
+      name: wsName,
+      tier: 1,
+      external: true,
+      runtime: "external",
+      url: echoURL,
+    }),
   });
   if (!createRes.ok) {
     const text = await createRes.text();
