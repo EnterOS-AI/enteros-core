@@ -44,6 +44,8 @@ name: E2E Peer Visibility (literal MCP list_peers)
 #   - No cross-repo `uses:` (feedback_gitea_cross_repo_uses_blocked). The
 #     actions/checkout SHA is the one e2e-staging-canvas.yml already uses
 #     successfully (a mirrored SHA — see #1277/PR#1292 root-cause).
+#   - 2026-05-21 retrigger: verify fresh platform-tenant image after the
+#     publish Buildx DOCKER_CONFIG fix restored staging-latest image updates.
 #   - Per-SHA concurrency, not global (feedback_concurrency_group_per_sha).
 #   - Workflow-level GITHUB_SERVER_URL pinned
 #     (feedback_act_runner_github_server_url).
