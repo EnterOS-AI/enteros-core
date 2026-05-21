@@ -29,6 +29,7 @@ import textwrap
 from pathlib import Path
 
 import pytest  # noqa: F401  (declares the dep)
+import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / ".gitea" / "scripts" / "lint-workflow-yaml.py"
@@ -693,3 +694,22 @@ def test_ci_change_detector_docs_and_meta_scripts_do_not_trigger_surfaces():
         "python": False,
         "scripts": False,
     }
+
+
+def test_ci_platform_go_pr_steps_are_path_scoped():
+    doc = yaml.safe_load(CI_WORKFLOW.read_text(encoding="utf-8"))
+    platform = doc["jobs"]["platform-build"]
+    assert platform.get("needs") == "changes"
+
+    expensive_steps = [
+        step
+        for step in platform["steps"]
+        if step.get("uses")
+        or step.get("run", "").startswith("go ")
+        or "golangci-lint" in step.get("run", "")
+    ]
+    assert expensive_steps
+    for step in expensive_steps:
+        expr = step.get("if", "")
+        assert "github.event_name != 'pull_request'" in expr
+        assert "needs.changes.outputs.platform == 'true'" in expr

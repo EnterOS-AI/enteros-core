@@ -133,6 +133,7 @@ jobs:
   # the name match works on PRs that don't touch workspace-server/).
   platform-build:
     name: Platform (Go)
+    needs: changes
     runs-on: ubuntu-latest
     # mc#774 (closed 2026-05-14): Phase 4 flip of the platform-build job.
     # Phase 4 (#656) originally flipped this to continue-on-error: false based on
@@ -153,29 +154,29 @@ jobs:
       run:
         working-directory: workspace-server
     steps:
-      - if: false
+      - if: ${{ github.event_name == 'pull_request' && needs.changes.outputs.platform != 'true' }}
         working-directory: .
-        run: echo "No platform/** changes — skipping real build steps; this job always runs to satisfy the required-check name on branch protection."
-      - if: always()
+        run: echo "No workspace-server/** changes on this PR — Platform (Go) gate satisfied without running Go build/test/lint."
+      - if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.platform == 'true' }}
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - if: always()
+      - if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.platform == 'true' }}
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: 'stable'
-      - if: always()
+      - if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.platform == 'true' }}
         run: go mod download
-      - if: always()
+      - if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.platform == 'true' }}
         run: go build ./cmd/server
       # CLI (molecli) moved to standalone repo: git.moleculesai.app/molecule-ai/molecule-cli
-      - if: always()
+      - if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.platform == 'true' }}
         run: go vet ./...
-      - if: always()
+      - if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.platform == 'true' }}
         name: Install golangci-lint
         run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
-      - if: always()
+      - if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.platform == 'true' }}
         name: Run golangci-lint
         run: $(go env GOPATH)/bin/golangci-lint run --timeout 3m ./...
-      - if: always()
+      - if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.platform == 'true' }}
         name: Diagnostic — per-package verbose 60s
         run: |
           set +e
@@ -191,7 +192,7 @@ jobs:
           echo "::endgroup::"
         # mc#774: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
         continue-on-error: true
-      - if: always()
+      - if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.platform == 'true' }}
         name: Run tests with race detection and coverage
         # Explicit timeout: cold runner cache causes OOM kills at ~4m39s on the
         # full ./... suite with race detection + coverage. A 10m per-step timeout
@@ -199,7 +200,7 @@ jobs:
         # instead of OOM-killing. The job-level timeout (15m) is a backstop.
         run: go test -race -timeout 10m -coverprofile=coverage.out ./...
 
-      - if: always()
+      - if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.platform == 'true' }}
         name: Per-file coverage report
         # Advisory — lists every source file with its coverage so reviewers
         # can see at-a-glance where gaps are. Sorted ascending so the worst
@@ -213,7 +214,7 @@ jobs:
                    END {for (f in s) printf "%6.1f%%  %s\n", s[f]/c[f], f}' \
             | sort -n
 
-      - if: always()
+      - if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.platform == 'true' }}
         name: Check coverage thresholds
         # Enforces two gates from #1823 Layer 1:
         #   1. Total floor (25% — ratchet plan in COVERAGE_FLOOR.md).
