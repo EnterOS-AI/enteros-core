@@ -125,14 +125,14 @@ func TestPeers_WithParent(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows(peerCols).
 			AddRow("ws-sibling-2", "Sibling Two", "worker", 1, "online", []byte("null"), "http://localhost:8002", "ws-parent", 0))
 
-	// Expect children query
-	mock.ExpectQuery("SELECT w.id, w.name.*WHERE w.parent_id = \\$1 AND w.status").
-		WithArgs("ws-sibling-1").
+	// Expect children query — #383 added explicit `w.id != $2` self-filter
+	mock.ExpectQuery("SELECT w.id, w.name.*WHERE w.parent_id = \\$1 AND w.id != \\$2 AND w.status").
+		WithArgs("ws-sibling-1", "ws-sibling-1").
 		WillReturnRows(sqlmock.NewRows(peerCols))
 
-	// Expect parent query
-	mock.ExpectQuery("SELECT w.id, w.name.*WHERE w.id = \\$1 AND w.status").
-		WithArgs("ws-parent").
+	// Expect parent query — #383 added explicit `w.id != $2` self-filter
+	mock.ExpectQuery("SELECT w.id, w.name.*WHERE w.id = \\$1 AND w.id != \\$2 AND w.status").
+		WithArgs("ws-parent", "ws-sibling-1").
 		WillReturnRows(sqlmock.NewRows(peerCols).
 			AddRow("ws-parent", "Parent PM", "manager", 2, "online", []byte("null"), "http://localhost:8001", nil, 1))
 
@@ -228,9 +228,9 @@ func TestPeers_RootWorkspace_NoPeers(t *testing.T) {
 		WithArgs("ws-root-alone").
 		WillReturnRows(sqlmock.NewRows(peerCols))
 
-	// Children — none
-	mock.ExpectQuery("SELECT w.id, w.name.*WHERE w.parent_id = \\$1").
-		WithArgs("ws-root-alone").
+	// Children — none. #383 added explicit `w.id != $2` self-filter.
+	mock.ExpectQuery("SELECT w.id, w.name.*WHERE w.parent_id = \\$1 AND w.id != \\$2").
+		WithArgs("ws-root-alone", "ws-root-alone").
 		WillReturnRows(sqlmock.NewRows(peerCols))
 
 	// No parent query since parent_id is NULL
@@ -282,12 +282,14 @@ func peersFilterFixture(t *testing.T) (*DiscoveryHandler, sqlmock.Sqlmock) {
 			AddRow("ws-alpha", "Alpha Researcher", "researcher", 1, "online", []byte("null"), "http://a", "ws-pm", 0).
 			AddRow("ws-beta", "Beta Designer", "designer", 1, "online", []byte("null"), "http://b", "ws-pm", 0))
 
-	mock.ExpectQuery("SELECT w.id, w.name.*WHERE w.parent_id = \\$1 AND w.status").
-		WithArgs("ws-self").
+	// #383 — children query gained explicit `w.id != $2` self-filter.
+	mock.ExpectQuery("SELECT w.id, w.name.*WHERE w.parent_id = \\$1 AND w.id != \\$2 AND w.status").
+		WithArgs("ws-self", "ws-self").
 		WillReturnRows(sqlmock.NewRows(cols))
 
-	mock.ExpectQuery("SELECT w.id, w.name.*WHERE w.id = \\$1 AND w.status").
-		WithArgs("ws-pm").
+	// #383 — parent query gained explicit `w.id != $2` self-filter.
+	mock.ExpectQuery("SELECT w.id, w.name.*WHERE w.id = \\$1 AND w.id != \\$2 AND w.status").
+		WithArgs("ws-pm", "ws-self").
 		WillReturnRows(sqlmock.NewRows(cols).
 			AddRow("ws-pm", "PM Workspace", "manager", 2, "online", []byte("null"), "http://pm", nil, 1))
 
@@ -966,8 +968,9 @@ func TestPeers_DevModeFailOpen_AllowsBearerlessRequest(t *testing.T) {
 	mock.ExpectQuery("SELECT w.id.+WHERE w.parent_id IS NULL AND w.id").
 		WithArgs("ws-dev").
 		WillReturnRows(sqlmock.NewRows(peerCols))
-	mock.ExpectQuery("SELECT w.id.+WHERE w.parent_id = \\$1 AND w.status").
-		WithArgs("ws-dev").
+	// #383 — children query gained explicit `w.id != $2` self-filter.
+	mock.ExpectQuery("SELECT w.id.+WHERE w.parent_id = \\$1 AND w.id != \\$2 AND w.status").
+		WithArgs("ws-dev", "ws-dev").
 		WillReturnRows(sqlmock.NewRows(peerCols))
 
 	w := httptest.NewRecorder()
@@ -1029,4 +1032,184 @@ func TestPeers_DevModeFailOpen_ClosedInProduction(t *testing.T) {
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 in production, got %d: %s", w.Code, w.Body.String())
 	}
+}
+
+// ==================== Peers — #383 self never appears in result ====================
+
+// TestPeers_ExcludeSelf_DefenseInDepth verifies the final-line filter in
+// Peers strips any row whose id matches the caller. The pre-DB SQL filters
+// already do this, but a future code path that omits the `w.id != $caller`
+// clause must not be able to smuggle a self-row through. This test
+// simulates that future-defect case by mocking the children query to
+// (incorrectly) return a row whose id matches the caller, and asserts the
+// final filter still drops it.
+//
+// Root cause class for #383: an agent that sees its own row in /peers
+// proceeds to delegate_task to itself, hitting the platform's
+// self-delegation 400 in a tight loop. The fix in discovery.go is
+// defense-in-depth: even if the SQL filter regresses, this handler-level
+// filter prevents the 400-loop from materializing.
+func TestPeers_ExcludeSelf_DefenseInDepth(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewDiscoveryHandler()
+
+	const selfID = "ws-xiaodong"
+
+	// parent_id lookup — workspace has a parent.
+	mock.ExpectQuery("SELECT parent_id FROM workspaces WHERE id =").
+		WithArgs(selfID).
+		WillReturnRows(sqlmock.NewRows([]string{"parent_id"}).AddRow("ws-parent"))
+
+	peerCols := []string{"id", "name", "role", "tier", "status", "agent_card", "url", "parent_id", "active_tasks"}
+
+	// Siblings — returns one legitimate sibling. The SQL filter excludes
+	// self at the source.
+	mock.ExpectQuery("SELECT w.id, w.name.*WHERE w.parent_id = \\$1 AND w.id != \\$2").
+		WithArgs("ws-parent", selfID).
+		WillReturnRows(sqlmock.NewRows(peerCols).
+			AddRow("ws-sibling", "Sibling", "worker", 1, "online", []byte("null"), "http://localhost:8002", "ws-parent", 0))
+
+	// Children — simulates the data-integrity defect class: the DB
+	// (incorrectly) returns the caller's own row in the children set.
+	// In real production this would require a workspace whose
+	// parent_id points to itself — corruption only, but the handler
+	// must not propagate it.
+	mock.ExpectQuery("SELECT w.id, w.name.*WHERE w.parent_id = \\$1 AND w.id != \\$2 AND w.status").
+		WithArgs(selfID, selfID).
+		WillReturnRows(sqlmock.NewRows(peerCols).
+			AddRow(selfID, "Self As Child", "worker", 1, "online", []byte("null"), "http://localhost:8001", selfID, 0).
+			AddRow("ws-child", "Real Child", "worker", 1, "online", []byte("null"), "http://localhost:8003", selfID, 0))
+
+	// Parent — explicit `w.id != $2` clause so the parent path is also
+	// self-filtered. parentID.String = "ws-parent" != selfID, so the
+	// row is included.
+	mock.ExpectQuery("SELECT w.id, w.name.*WHERE w.id = \\$1 AND w.id != \\$2 AND w.status").
+		WithArgs("ws-parent", selfID).
+		WillReturnRows(sqlmock.NewRows(peerCols).
+			AddRow("ws-parent", "Parent", "manager", 2, "online", []byte("null"), "http://localhost:8004", nil, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: selfID}}
+	c.Request = httptest.NewRequest("GET", "/registry/"+selfID+"/peers", nil)
+
+	handler.Peers(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var peers []map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &peers); err != nil {
+		t.Fatalf("failed to parse response: %v", err)
+	}
+
+	// The defense-in-depth filter must drop the self row even though
+	// the (mocked-defective) children query returned it.
+	for _, p := range peers {
+		if id, _ := p["id"].(string); id == selfID {
+			t.Fatalf("peer list contains caller's own id %q — self-delegation defense regressed; full list: %+v", selfID, peers)
+		}
+	}
+
+	// Sanity: the three legitimate peers (sibling, real child, parent)
+	// must all be present. Catches an over-aggressive filter that
+	// strips legitimate rows.
+	expectedIDs := map[string]bool{"ws-sibling": false, "ws-child": false, "ws-parent": false}
+	for _, p := range peers {
+		if id, _ := p["id"].(string); id != "" {
+			if _, ok := expectedIDs[id]; ok {
+				expectedIDs[id] = true
+			}
+		}
+	}
+	for id, found := range expectedIDs {
+		if !found {
+			t.Errorf("legitimate peer %q missing from response; got %+v", id, peers)
+		}
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// TestExcludeSelfFromPeers_Unit exercises the helper directly so the
+// defense-in-depth contract is asserted independently of SQL mocking.
+// Pure-function tests run in microseconds and pin the filter shape
+// (empty input, no-match passthrough, single-row drop, multi-row drop,
+// preserves order) so future edits to the helper can't silently
+// regress to "returns input unchanged".
+func TestExcludeSelfFromPeers_Unit(t *testing.T) {
+	t.Run("empty input returns empty slice", func(t *testing.T) {
+		out := excludeSelfFromPeers(nil, "ws-self")
+		if len(out) != 0 {
+			t.Errorf("expected empty, got %+v", out)
+		}
+	})
+
+	t.Run("no self in list passes through unchanged", func(t *testing.T) {
+		in := []map[string]interface{}{
+			{"id": "ws-a", "name": "A"},
+			{"id": "ws-b", "name": "B"},
+		}
+		out := excludeSelfFromPeers(in, "ws-self")
+		if len(out) != 2 {
+			t.Fatalf("expected 2, got %d (%+v)", len(out), out)
+		}
+		if out[0]["id"] != "ws-a" || out[1]["id"] != "ws-b" {
+			t.Errorf("order not preserved: %+v", out)
+		}
+	})
+
+	t.Run("self row dropped, others preserved", func(t *testing.T) {
+		in := []map[string]interface{}{
+			{"id": "ws-a", "name": "A"},
+			{"id": "ws-self", "name": "Me"},
+			{"id": "ws-b", "name": "B"},
+		}
+		out := excludeSelfFromPeers(in, "ws-self")
+		if len(out) != 2 {
+			t.Fatalf("expected 2, got %d (%+v)", len(out), out)
+		}
+		if out[0]["id"] != "ws-a" || out[1]["id"] != "ws-b" {
+			t.Errorf("expected [ws-a, ws-b], got %+v", out)
+		}
+	})
+
+	t.Run("multiple self rows all dropped", func(t *testing.T) {
+		// Pathological — should never happen, but the contract is
+		// "no row with id==workspaceID survives", not "at most one
+		// such row is dropped". Pin it.
+		in := []map[string]interface{}{
+			{"id": "ws-self", "name": "Me1"},
+			{"id": "ws-a", "name": "A"},
+			{"id": "ws-self", "name": "Me2"},
+		}
+		out := excludeSelfFromPeers(in, "ws-self")
+		if len(out) != 1 {
+			t.Fatalf("expected 1, got %d (%+v)", len(out), out)
+		}
+		if out[0]["id"] != "ws-a" {
+			t.Errorf("expected [ws-a], got %+v", out)
+		}
+	})
+
+	t.Run("row with missing id key is preserved (not a self-collision)", func(t *testing.T) {
+		// A peer row with no "id" key shouldn't be silently dropped
+		// by the self-filter — it's a malformed row class that
+		// belongs to a different defect.
+		in := []map[string]interface{}{
+			{"name": "no-id-row"},
+			{"id": "ws-self", "name": "Me"},
+		}
+		out := excludeSelfFromPeers(in, "ws-self")
+		if len(out) != 1 {
+			t.Fatalf("expected 1, got %d (%+v)", len(out), out)
+		}
+		if out[0]["name"] != "no-id-row" {
+			t.Errorf("expected no-id-row preserved, got %+v", out)
+		}
+	})
 }

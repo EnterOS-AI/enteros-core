@@ -432,9 +432,10 @@ func TestExtended_Peers(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "role", "tier", "status", "agent_card", "url", "parent_id", "active_tasks"}).
 			AddRow("ws-sibling", "Sibling Agent", "worker", 1, "online", []byte("null"), "http://localhost:9001", nil, 0))
 
-	// Expect children query (workspaces with parent_id = ws-peer)
+	// Expect children query (workspaces with parent_id = ws-peer, excluding self)
+	// Query now binds (parent_id, self_id) for the self-filter guard added in #383.
 	mock.ExpectQuery("SELECT w.id, w.name").
-		WithArgs("ws-peer").
+		WithArgs("ws-peer", "ws-peer").
 		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "role", "tier", "status", "agent_card", "url", "parent_id", "active_tasks"}))
 
 	// No parent query since workspace is root-level
