@@ -24,7 +24,8 @@
 #
 # Only PROVISIONING differs from staging:
 #   - staging: POST /cp/admin/orgs (cold EC2 tenant) + per-tenant admin
-#     token + each workspace's auth_token from the POST /workspaces resp.
+#     token + each workspace's MCP bearer from create response or an admin
+#     token-mint fallback.
 #   - local:   POST /workspaces directly against the local stack
 #     (BASE, default http://localhost:8080), MCP bearer minted via
 #     GET /admin/workspaces/:id/test-token (e2e_mint_test_token —
