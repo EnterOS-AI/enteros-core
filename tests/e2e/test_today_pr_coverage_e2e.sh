@@ -30,6 +30,8 @@ ADMIN_AUTH=()
 [ -n "$ADMIN_BEARER" ] && ADMIN_AUTH=(-H "Authorization: Bearer $ADMIN_BEARER")
 WS_A_TOKEN=""
 WS_A_AUTH=()
+WS_B_TOKEN=""
+WS_B_AUTH=()
 
 check() {
   local desc="$1" expected="$2" actual="$3"
@@ -96,6 +98,10 @@ R=$(curl -s -X POST "$BASE/workspaces" "${ADMIN_AUTH[@]}" -H "Content-Type: appl
   -d "{\"name\":\"$WS_B_NAME\",\"runtime\":\"external\",\"external\":true,\"tier\":1}")
 check "POST /workspaces (beta)" '"status":"awaiting_agent"' "$R"
 WS_B_ID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))")
+if [ -n "$WS_B_ID" ]; then
+  WS_B_TOKEN=$(e2e_mint_test_token "$WS_B_ID" 2>/dev/null || true)
+  [ -n "$WS_B_TOKEN" ] && WS_B_AUTH=(-H "Authorization: Bearer $WS_B_TOKEN")
+fi
 
 # external/connection returns the install-snippet. The per-workspace
 # fix (mc#1535) derives the MCP name as molecule-<slug>; mc#1536 extends
@@ -103,10 +109,10 @@ WS_B_ID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).ge
 # grep the `claude mcp add` line, and assert the names differ.
 if [ -n "$WS_A_ID" ] && [ -n "$WS_B_ID" ]; then
   SNIPPET_A=$(curl -s --max-time "$TIMEOUT" \
-    "${ADMIN_AUTH[@]}" \
+    "${WS_A_AUTH[@]}" \
     "$BASE/workspaces/$WS_A_ID/external/connection")
   SNIPPET_B=$(curl -s --max-time "$TIMEOUT" \
-    "${ADMIN_AUTH[@]}" \
+    "${WS_B_AUTH[@]}" \
     "$BASE/workspaces/$WS_B_ID/external/connection")
 
   MCP_A=$(echo "$SNIPPET_A" | python3 -c "
@@ -330,7 +336,15 @@ echo
 echo "--- Cleanup ---"
 for wid in "${WS_A_ID:-}" "${WS_B_ID:-}"; do
   [ -n "$wid" ] || continue
-  curl -s -X DELETE "$BASE/workspaces/$wid?confirm=true" "${ADMIN_AUTH[@]}" > /dev/null || true
+  DELETE_AUTH=("${ADMIN_AUTH[@]}")
+  if [ -z "$ADMIN_BEARER" ]; then
+    if [ "$wid" = "${WS_A_ID:-}" ]; then
+      DELETE_AUTH=("${WS_A_AUTH[@]}")
+    elif [ "$wid" = "${WS_B_ID:-}" ]; then
+      DELETE_AUTH=("${WS_B_AUTH[@]}")
+    fi
+  fi
+  curl -s -X DELETE "$BASE/workspaces/$wid?confirm=true" "${DELETE_AUTH[@]}" > /dev/null || true
   echo "deleted $wid"
 done
 
