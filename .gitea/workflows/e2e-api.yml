@@ -132,31 +132,12 @@ jobs:
         with:
           fetch-depth: 0
       - id: decide
-        # Inline replacement for dorny/paths-filter — same pattern PR#372's
-        # ci.yml port used. Diffs against the PR base or push BEFORE SHA,
-        # then matches against the api-relevant path set.
         run: |
-          BASE="${GITHUB_BASE_REF:-${{ github.event.before }}}"
-          if [ "${{ github.event_name }}" = "pull_request" ] && [ -n "${{ github.event.pull_request.base.sha }}" ]; then
-            BASE="${{ github.event.pull_request.base.sha }}"
-          fi
-          if [ -z "$BASE" ] || echo "$BASE" | grep -qE '^0+$'; then
-            echo "api=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          if ! git cat-file -e "$BASE" 2>/dev/null; then
-            git fetch --depth=1 origin "$BASE" 2>/dev/null || true
-          fi
-          if ! git cat-file -e "$BASE" 2>/dev/null; then
-            echo "api=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          CHANGED=$(git diff --name-only "$BASE" HEAD)
-          if echo "$CHANGED" | grep -qE '^(workspace-server/|tests/e2e/|\.gitea/workflows/e2e-api\.yml$)'; then
-            echo "api=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "api=false" >> "$GITHUB_OUTPUT"
-          fi
+          python3 .gitea/scripts/detect-changes.py \
+            --profile e2e-api \
+            --event-name "${{ github.event_name }}" \
+            --pr-base-sha "${{ github.event.pull_request.base.sha }}" \
+            --push-before "${GITHUB_EVENT_BEFORE:-${{ github.event.before }}}"
 
   # ONE job (no job-level `if:`) that always runs and reports under the
   # required-check name `E2E API Smoke Test`. Real work is gated per-step

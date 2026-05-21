@@ -101,36 +101,12 @@ jobs:
           # not present in the shallow checkout.
           fetch-depth: 2
       - id: filter
-        # Inline replacement for dorny/paths-filter — see e2e-api.yml.
         run: |
-          # Gitea Actions evaluates github.event.before to empty string in shell
-          # scripts. Use GITHUB_EVENT_BEFORE shell env var instead (Gitea
-          # correctly populates it for push events). PR case uses template var.
-          BASE=""
-          if [ "${{ github.event_name }}" = "pull_request" ] && [ -n "${{ github.event.pull_request.base.sha }}" ]; then
-            BASE="${{ github.event.pull_request.base.sha }}"
-          elif [ -n "$GITHUB_EVENT_BEFORE" ]; then
-            BASE="$GITHUB_EVENT_BEFORE"
-          fi
-          if [ -z "$BASE" ] || echo "$BASE" | grep -qE '^0+$'; then
-            echo "handlers=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          # timeout 30 guards against the case where BASE points to a ref that
-          # git can resolve but cat-file hangs (rare on corrupted objects).
-          if ! timeout 30 git cat-file -e "$BASE" 2>/dev/null; then
-            git fetch --depth=1 origin "$BASE" 2>/dev/null || true
-          fi
-          if ! timeout 30 git cat-file -e "$BASE" 2>/dev/null; then
-            echo "handlers=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          CHANGED=$(git diff --name-only "$BASE" HEAD)
-          if echo "$CHANGED" | grep -qE '^(workspace-server/internal/handlers/|workspace-server/internal/wsauth/|workspace-server/migrations/|\.gitea/workflows/handlers-postgres-integration\.yml$)'; then
-            echo "handlers=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "handlers=false" >> "$GITHUB_OUTPUT"
-          fi
+          python3 .gitea/scripts/detect-changes.py \
+            --profile handlers-postgres \
+            --event-name "${{ github.event_name }}" \
+            --pr-base-sha "${{ github.event.pull_request.base.sha }}" \
+            --push-before "${GITHUB_EVENT_BEFORE:-}"
 
   # Single-job-with-per-step-if pattern: always runs to satisfy the
   # required-check name on branch protection; real work gates on the

@@ -26,6 +26,7 @@ import re
 import subprocess
 import sys
 import textwrap
+import importlib.util
 from pathlib import Path
 
 import pytest  # noqa: F401  (declares the dep)
@@ -617,16 +618,24 @@ def test_rule10_docker_info_head_in_separate_step_without_pipefail_passes(tmp_pa
 
 CI_WORKFLOW = REPO_ROOT / ".gitea" / "workflows" / "ci.yml"
 CI_SURFACES = ("platform", "canvas", "python", "scripts")
+DETECT_CHANGES_SCRIPT = REPO_ROOT / ".gitea" / "scripts" / "detect-changes.py"
+
+
+def _load_detect_changes():
+    spec = importlib.util.spec_from_file_location("detect_changes", DETECT_CHANGES_SCRIPT)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
 
 
 def _ci_change_patterns() -> dict[str, re.Pattern[str]]:
-    text = CI_WORKFLOW.read_text(encoding="utf-8")
-    patterns: dict[str, re.Pattern[str]] = {}
-    for surface, pattern in re.findall(
-        r'echo "(platform|canvas|python|scripts)=.*?grep -qE \'([^\']+)\'',
-        text,
-    ):
-        patterns[surface] = re.compile(pattern)
+    detect_changes = _load_detect_changes()
+    patterns = {
+        surface: re.compile(pattern)
+        for surface, pattern in detect_changes.PROFILES["ci"].items()
+    }
     assert set(patterns) == set(CI_SURFACES)
     return patterns
 
