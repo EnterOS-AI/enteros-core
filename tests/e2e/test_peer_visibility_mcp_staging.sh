@@ -40,8 +40,10 @@
 #   drives: POST /cp/admin/orgs (provision), GET
 #   /cp/admin/orgs/:slug/admin-token (per-tenant token), DELETE
 #   /cp/admin/tenants/:slug (teardown). The per-tenant admin token drives
-#   tenant workspace creation; each workspace's OWN auth_token (returned by
-#   POST /workspaces) drives its MCP call.
+#   tenant workspace creation; each workspace's OWN auth_token drives its
+#   MCP call. External-like runtimes may return the token in POST
+#   /workspaces; managed container runtimes usually require the admin token
+#   mint fallback below.
 #
 # Required env:
 #   MOLECULE_ADMIN_TOKEN   CP admin bearer — Railway staging CP_ADMIN_API_TOKEN
@@ -102,6 +104,46 @@ tenant_call() {
     -H "Authorization: Bearer $TENANT_TOKEN" \
     -H "X-Molecule-Org-Id: $ORG_ID" \
     -H "Content-Type: application/json" "$@"
+}
+
+tenant_call_capture() {
+  local method="$1" path="$2" out="$3"; shift 3
+  curl -sS -o "$out" -w "%{http_code}" -X "$method" "$TENANT_URL$path" \
+    -H "Authorization: Bearer $TENANT_TOKEN" \
+    -H "X-Molecule-Org-Id: $ORG_ID" \
+    -H "Content-Type: application/json" "$@"
+}
+
+redact_token_body() {
+  python3 -c '
+import json, re, sys
+raw = sys.stdin.read()
+try:
+    data = json.loads(raw)
+except Exception:
+    print(re.sub(r"(?i)([a-z0-9_]*token)=([^&\\s]+)", r"\1=<redacted>", raw)[:500])
+    raise SystemExit(0)
+
+def scrub(v):
+    if isinstance(v, dict):
+        return {k: ("<redacted>" if "token" in k.lower() else scrub(val)) for k, val in v.items()}
+    if isinstance(v, list):
+        return [scrub(x) for x in v]
+    return v
+
+print(json.dumps(scrub(data), separators=(",", ":"))[:500])
+'
+}
+
+extract_auth_token() {
+  python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print(''); sys.exit(0)
+print(d.get('auth_token') or d.get('connection', {}).get('auth_token') or '')
+" 2>/dev/null
 }
 
 # ─── Scoped teardown ───────────────────────────────────────────────────
@@ -218,34 +260,31 @@ for rt in $PV_RUNTIMES; do
   R=$(tenant_call POST /workspaces \
     -d "{\"name\":\"pv-$rt\",\"runtime\":\"$rt\",\"tier\":2,\"parent_id\":\"$PARENT_ID\",\"secrets\":$SECRETS_JSON}")
   WID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))" 2>/dev/null)
-  # auth_token is top-level for container runtimes; external-like nest it
-  # under connection.auth_token (verified vs staging response shape).
-  WTOK=$(echo "$R" | python3 -c "
-import sys, json
-try: d = json.load(sys.stdin)
-except Exception: print(''); sys.exit(0)
-print(d.get('auth_token') or d.get('connection', {}).get('auth_token') or '')
-" 2>/dev/null)
+  # External-like runtimes may return connection.auth_token on create.
+  # Managed container runtimes usually return only id/status here, then
+  # receive their bearer through registry/bootstrap; for this literal MCP
+  # driver we mint an admin test token below.
+  WTOK=$(echo "$R" | extract_auth_token)
   [ -n "$WID" ] || fail "$rt workspace create failed: $(echo "$R" | head -c 300)"
+  TOKEN_DIAG=""
   if [ -z "$WTOK" ]; then
-    TTOK_RESP=$(tenant_call POST "/admin/workspaces/$WID/tokens" 2>/dev/null || true)
-    WTOK=$(echo "$TTOK_RESP" | python3 -c "
-import sys, json
-try: d = json.load(sys.stdin)
-except Exception: print(''); sys.exit(0)
-print(d.get('auth_token') or '')
-" 2>/dev/null)
+    TTOK_FILE=$(mktemp)
+    TTOK_CODE=$(tenant_call_capture POST "/admin/workspaces/$WID/tokens" "$TTOK_FILE" 2>/dev/null || echo "curl_error")
+    TTOK_RESP=$(cat "$TTOK_FILE" 2>/dev/null || true)
+    WTOK=$(echo "$TTOK_RESP" | extract_auth_token)
+    TOKEN_DIAG="POST /admin/workspaces/$WID/tokens -> HTTP $TTOK_CODE body: $(echo "$TTOK_RESP" | redact_token_body)"
+    rm -f "$TTOK_FILE"
   fi
   if [ -z "$WTOK" ]; then
-    TTOK_RESP=$(tenant_call GET "/admin/workspaces/$WID/test-token" 2>/dev/null || true)
-    WTOK=$(echo "$TTOK_RESP" | python3 -c "
-import sys, json
-try: d = json.load(sys.stdin)
-except Exception: print(''); sys.exit(0)
-print(d.get('auth_token') or '')
-" 2>/dev/null)
+    TTOK_FILE=$(mktemp)
+    TTOK_CODE=$(tenant_call_capture GET "/admin/workspaces/$WID/test-token" "$TTOK_FILE" 2>/dev/null || echo "curl_error")
+    TTOK_RESP=$(cat "$TTOK_FILE" 2>/dev/null || true)
+    WTOK=$(echo "$TTOK_RESP" | extract_auth_token)
+    TOKEN_DIAG="${TOKEN_DIAG}
+GET /admin/workspaces/$WID/test-token -> HTTP $TTOK_CODE body: $(echo "$TTOK_RESP" | redact_token_body)"
+    rm -f "$TTOK_FILE"
   fi
-  [ -n "$WTOK" ] || fail "$rt workspace did not return or mint an auth_token — cannot drive its MCP call (resp: $(echo "$R" | head -c 300))"
+  [ -n "$WTOK" ] || fail "$rt workspace did not return or mint an auth_token — cannot drive its MCP call (create_resp: $(echo "$R" | redact_token_body); token_fallbacks: $TOKEN_DIAG)"
   WS_IDS[$rt]="$WID"
   WS_TOKENS[$rt]="$WTOK"
   ALL_WS_IDS="$ALL_WS_IDS $WID"
