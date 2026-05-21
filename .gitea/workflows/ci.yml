@@ -350,15 +350,16 @@ jobs:
   # Shellcheck (E2E scripts) — required check, always runs.
   shellcheck:
     name: Shellcheck (E2E scripts)
+    needs: changes
     runs-on: ubuntu-latest
     # Phase 4 (RFC #219 §1): confirmed green on main 2026-05-12.
     continue-on-error: false
     steps:
-      - if: false
-        run: echo "No tests/e2e/ or infra/scripts/ changes — skipping real shellcheck; this job always runs to satisfy the required-check name on branch protection."
-      - if: always()
+      - if: ${{ github.event_name == 'pull_request' && needs.changes.outputs.scripts != 'true' }}
+        run: echo "No tests/e2e, scripts, or infra/scripts changes on this PR — Shellcheck gate satisfied without running script checks."
+      - if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.scripts == 'true' }}
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - if: always()
+      - if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.scripts == 'true' }}
         name: Run shellcheck on tests/e2e/*.sh and infra/scripts/*.sh
         # shellcheck is pre-installed on ubuntu-latest runners (via apt).
         # infra/scripts/ is included because setup.sh + nuke.sh gate the
@@ -369,16 +370,16 @@ jobs:
           find tests/e2e infra/scripts -type f -name '*.sh' -print0 \
             | xargs -0 shellcheck --severity=warning
 
-      - if: always()
+      - if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.scripts == 'true' }}
         name: Lint cleanup-trap hygiene (RFC #2873)
         run: bash tests/e2e/lint_cleanup_traps.sh
 
-      - if: always()
+      - if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.scripts == 'true' }}
         name: Run E2E bash unit tests (no live infra)
         run: |
           bash tests/e2e/test_model_slug.sh
 
-      - if: always()
+      - if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.scripts == 'true' }}
         name: Test ECR promote-tenant-image script (mock-driven, no live infra)
         # Covers scripts/promote-tenant-image.sh — the codified
         # :staging-latest → :latest ECR promote + tenant fleet redeploy
@@ -388,7 +389,7 @@ jobs:
         run: |
           bash scripts/test-promote-tenant-image.sh
 
-      - if: always()
+      - if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.scripts == 'true' }}
         name: Shellcheck promote-tenant-image script
         # scripts/ is excluded from the bulk shellcheck pass above (legacy
         # SC3040/SC3043 cleanup pending). Run shellcheck explicitly on
