@@ -104,7 +104,7 @@ teardown() {
   log "[teardown] deleting ${#CREATED_WSIDS[@]} workspace(s) this run created (scoped)"
   for wid in ${CREATED_WSIDS[@]+"${CREATED_WSIDS[@]}"}; do
     [ -n "$wid" ] || continue
-    curl -s -X DELETE "$BASE/workspaces/$wid?confirm=true" "${ADMIN_AUTH[@]}" >/dev/null 2>&1 || true
+    curl -s -X DELETE "$BASE/workspaces/$wid?confirm=true" ${ADMIN_AUTH[@]+"${ADMIN_AUTH[@]}"} >/dev/null 2>&1 || true
   done
   exit $rc
 }
@@ -113,7 +113,7 @@ trap teardown EXIT INT TERM
 # Pre-sweep workspaces a prior crashed run of THIS script left behind
 # (name prefix match only — never a blanket delete). The trap fires on
 # normal exit, but a kill -9 / SIGPIPE can bypass it.
-PRIOR=$(curl -s "$BASE/workspaces" "${ADMIN_AUTH[@]}" | python3 -c '
+PRIOR=$(curl -s "$BASE/workspaces" ${ADMIN_AUTH[@]+"${ADMIN_AUTH[@]}"} | python3 -c '
 import json, sys
 try:
     print(" ".join(w["id"] for w in json.load(sys.stdin) if w.get("name","").startswith("PV-Local-")))
@@ -122,7 +122,7 @@ except Exception:
 ' 2>/dev/null)
 for _wid in $PRIOR; do
   log "Pre-sweeping prior PV-Local workspace: $_wid"
-  curl -s -X DELETE "$BASE/workspaces/$_wid?confirm=true" "${ADMIN_AUTH[@]}" >/dev/null 2>&1 || true
+  curl -s -X DELETE "$BASE/workspaces/$_wid?confirm=true" ${ADMIN_AUTH[@]+"${ADMIN_AUTH[@]}"} >/dev/null 2>&1 || true
 done
 
 # ─── Local-stack preflight ─────────────────────────────────────────────
@@ -133,10 +133,10 @@ if ! curl -fsS "$BASE/health" -m 5 >/dev/null 2>&1; then
 fi
 # admin/test-token is the local MCP-bearer mint path; it 404s in
 # production. If it is off, this gate cannot drive the literal call.
-if ! curl -fsS "$BASE/admin/workspaces/preflight-probe/test-token" "${ADMIN_AUTH[@]}" -m 5 >/dev/null 2>&1; then
+if ! curl -fsS "$BASE/admin/workspaces/preflight-probe/test-token" ${ADMIN_AUTH[@]+"${ADMIN_AUTH[@]}"} -m 5 >/dev/null 2>&1; then
   # A 404 here is EITHER "no such ws" (fine — endpoint is enabled) OR the
   # endpoint is disabled (MOLECULE_ENV=production). Distinguish by body.
-  PROBE=$(curl -s "$BASE/admin/workspaces/preflight-probe/test-token" "${ADMIN_AUTH[@]}" -m 5 2>/dev/null)
+  PROBE=$(curl -s "$BASE/admin/workspaces/preflight-probe/test-token" ${ADMIN_AUTH[@]+"${ADMIN_AUTH[@]}"} -m 5 2>/dev/null)
   if echo "$PROBE" | grep -qi 'production\|disabled\|not found.*endpoint'; then
     echo "::error::GET /admin/workspaces/:id/test-token disabled (MOLECULE_ENV=production?). Cannot mint a local MCP bearer." >&2
     exit 1
@@ -241,7 +241,7 @@ else
 fi
 log "1/5 provisioning parent ($PARENT_RUNTIME, mode=$PV_LOCAL_PROVISION_MODE) + one sibling per runtime under test..."
 
-P_RESP=$(curl -s -X POST "$BASE/workspaces" "${ADMIN_AUTH[@]}" -H "Content-Type: application/json" \
+P_RESP=$(curl -s -X POST "$BASE/workspaces" ${ADMIN_AUTH[@]+"${ADMIN_AUTH[@]}"} -H "Content-Type: application/json" \
   -d "{\"name\":\"${NAME_PREFIX}-parent\",\"runtime\":\"$PARENT_RUNTIME\",\"tier\":3$PARENT_EXTRA,\"secrets\":$PARENT_SECRETS}")
 PARENT_ID=$(echo "$P_RESP" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("id",""))' 2>/dev/null)
 if [ -z "$PARENT_ID" ]; then
@@ -291,7 +291,7 @@ for rt in $PV_RUNTIMES; do
     CREATE_RUNTIME="$rt"
     CREATE_EXTRA=""
   fi
-  R=$(curl -s -X POST "$BASE/workspaces" "${ADMIN_AUTH[@]}" -H "Content-Type: application/json" \
+  R=$(curl -s -X POST "$BASE/workspaces" ${ADMIN_AUTH[@]+"${ADMIN_AUTH[@]}"} -H "Content-Type: application/json" \
     -d "{\"name\":\"${NAME_PREFIX}-$rt\",\"runtime\":\"$CREATE_RUNTIME\",\"tier\":2,\"parent_id\":\"$PARENT_ID\"$CREATE_EXTRA,\"secrets\":$SEC}")
   WID=$(echo "$R" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("id",""))' 2>/dev/null)
   if [ -z "$WID" ]; then
