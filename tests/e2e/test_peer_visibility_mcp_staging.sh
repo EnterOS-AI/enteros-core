@@ -227,7 +227,16 @@ except Exception: print(''); sys.exit(0)
 print(d.get('auth_token') or d.get('connection', {}).get('auth_token') or '')
 " 2>/dev/null)
   [ -n "$WID" ] || fail "$rt workspace create failed: $(echo "$R" | head -c 300)"
-  [ -n "$WTOK" ] || fail "$rt workspace did not return an auth_token — cannot drive its MCP call (resp: $(echo "$R" | head -c 300))"
+  if [ -z "$WTOK" ]; then
+    TTOK_RESP=$(tenant_call GET "/admin/workspaces/$WID/test-token" 2>/dev/null || true)
+    WTOK=$(echo "$TTOK_RESP" | python3 -c "
+import sys, json
+try: d = json.load(sys.stdin)
+except Exception: print(''); sys.exit(0)
+print(d.get('auth_token') or '')
+" 2>/dev/null)
+  fi
+  [ -n "$WTOK" ] || fail "$rt workspace did not return or mint an auth_token — cannot drive its MCP call (resp: $(echo "$R" | head -c 300))"
   WS_IDS[$rt]="$WID"
   WS_TOKENS[$rt]="$WTOK"
   ALL_WS_IDS="$ALL_WS_IDS $WID"
