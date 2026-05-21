@@ -713,3 +713,22 @@ def test_ci_platform_go_pr_steps_are_path_scoped():
         expr = step.get("if", "")
         assert "github.event_name != 'pull_request'" in expr
         assert "needs.changes.outputs.platform == 'true'" in expr
+
+
+def test_ci_canvas_nextjs_pr_steps_are_path_scoped():
+    doc = yaml.safe_load(CI_WORKFLOW.read_text(encoding="utf-8"))
+    canvas = doc["jobs"]["canvas-build"]
+    assert canvas.get("needs") == "changes"
+
+    expensive_steps = [
+        step
+        for step in canvas["steps"]
+        if step.get("uses")
+        or step.get("run", "").startswith("npm ")
+        or step.get("run", "").startswith("npx ")
+    ]
+    assert expensive_steps
+    for step in expensive_steps:
+        expr = step.get("if", "")
+        assert "github.event_name != 'pull_request'" in expr
+        assert "needs.changes.outputs.canvas == 'true'" in expr
