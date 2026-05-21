@@ -10,6 +10,8 @@ FAIL=0
 # as `Authorization: Bearer <token>`. Capture them here.
 ECHO_TOKEN=""
 SUM_TOKEN=""
+ECHO_AUTH=()
+SUM_AUTH=()
 
 # AdminAuth-gated calls need a bearer token once any workspace token
 # exists in the DB. ADMIN_TOKEN is populated after the first workspace
@@ -54,8 +56,8 @@ R=$(acurl "$BASE/workspaces")
 check "GET /workspaces (empty)" '[]' "$R"
 
 # Test 3: Create workspace A (AdminAuth fail-open — no tokens exist yet)
-R=$(curl -s -X POST "$BASE/workspaces" -H "Content-Type: application/json" -d '{"name":"Echo Agent","tier":1}')
-check "POST /workspaces (create echo)" '"status":"provisioning"' "$R"
+R=$(curl -s -X POST "$BASE/workspaces" -H "Content-Type: application/json" -d '{"name":"Echo Agent","tier":1,"runtime":"external","external":true}')
+check "POST /workspaces (create echo)" '"status":"awaiting_agent"' "$R"
 ECHO_ID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
 
 # Mint a test token so all subsequent AdminAuth-gated calls succeed.
@@ -72,8 +74,8 @@ else
 fi
 
 # Test 4: Create workspace B (needs bearer — tokens now exist in DB)
-R=$(acurl -X POST "$BASE/workspaces" -H "Content-Type: application/json" -d '{"name":"Summarizer Agent","tier":1}')
-check "POST /workspaces (create summarizer)" '"status":"provisioning"' "$R"
+R=$(acurl -X POST "$BASE/workspaces" -H "Content-Type: application/json" -d '{"name":"Summarizer Agent","tier":1,"runtime":"external","external":true}')
+check "POST /workspaces (create summarizer)" '"status":"awaiting_agent"' "$R"
 SUM_ID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
 
 # Test 5: List has 2
@@ -90,8 +92,9 @@ check "GET /workspaces/:id (agent_card null)" '"agent_card":null' "$R"
 # endpoint), not the admin token. C18 requires a token issued TO THIS
 # workspace, not just any valid token.
 ECHO_WS_TOKEN=$(curl -s "$BASE/admin/workspaces/$ECHO_ID/test-token" | python3 -c "import sys,json; print(json.load(sys.stdin).get('auth_token',''))" 2>/dev/null || echo "")
+[ -n "$ECHO_WS_TOKEN" ] && ECHO_AUTH=(-H "Authorization: Bearer $ECHO_WS_TOKEN")
 R=$(curl -s -X POST "$BASE/registry/register" -H "Content-Type: application/json" \
-  ${ECHO_WS_TOKEN:+-H "Authorization: Bearer $ECHO_WS_TOKEN"} \
+  "${ECHO_AUTH[@]}" \
   -d "{\"id\":\"$ECHO_ID\",\"url\":\"http://localhost:8001\",\"agent_card\":{\"name\":\"Echo Agent\",\"skills\":[{\"id\":\"echo\",\"name\":\"Echo\"}]}}")
 check "POST /registry/register (echo)" '"status":"registered"' "$R"
 # Extract token from register response; fall back to the test-token we
@@ -101,8 +104,9 @@ if [ -z "$ECHO_TOKEN" ]; then ECHO_TOKEN="$ECHO_WS_TOKEN"; fi
 
 # Test 8: Register summarizer — same pattern: workspace-specific token
 SUM_WS_TOKEN=$(curl -s "$BASE/admin/workspaces/$SUM_ID/test-token" | python3 -c "import sys,json; print(json.load(sys.stdin).get('auth_token',''))" 2>/dev/null || echo "")
+[ -n "$SUM_WS_TOKEN" ] && SUM_AUTH=(-H "Authorization: Bearer $SUM_WS_TOKEN")
 R=$(curl -s -X POST "$BASE/registry/register" -H "Content-Type: application/json" \
-  ${SUM_WS_TOKEN:+-H "Authorization: Bearer $SUM_WS_TOKEN"} \
+  "${SUM_AUTH[@]}" \
   -d "{\"id\":\"$SUM_ID\",\"url\":\"http://localhost:8002\",\"agent_card\":{\"name\":\"Summarizer\",\"skills\":[{\"id\":\"summarize\",\"name\":\"Summarize\"}]}}")
 check "POST /registry/register (summarizer)" '"status":"registered"' "$R"
 SUM_TOKEN=$(echo "$R" | e2e_extract_token)
@@ -358,12 +362,17 @@ else
 fi
 
 # Register the re-imported workspace to verify agent_card round-trips
+NEW_TOKEN=$(curl -s "$BASE/admin/workspaces/$NEW_ID/test-token" | python3 -c "import sys,json; print(json.load(sys.stdin).get('auth_token',''))" 2>/dev/null || echo "")
+NEW_AUTH=()
+[ -n "$NEW_TOKEN" ] && NEW_AUTH=(-H "Authorization: Bearer $NEW_TOKEN")
 R=$(curl -s -X POST "$BASE/registry/register" -H "Content-Type: application/json" \
+  "${NEW_AUTH[@]}" \
   -d "{\"id\":\"$NEW_ID\",\"url\":\"http://localhost:8002\",\"agent_card\":{\"name\":\"Summarizer\",\"skills\":[{\"id\":\"summarize\",\"name\":\"Summarize\"}]}}")
 check "Register re-imported workspace" '"status":"registered"' "$R"
 # Capture the fresh token issued to the re-imported workspace.  SUM_TOKEN was
 # revoked when SUM_ID was deleted above — use this one for cleanup instead.
-NEW_TOKEN=$(echo "$R" | e2e_extract_token)
+REG_NEW_TOKEN=$(echo "$R" | e2e_extract_token)
+[ -n "$REG_NEW_TOKEN" ] && NEW_TOKEN="$REG_NEW_TOKEN"
 
 # Re-export and verify agent_card survives the round-trip (#165 / PR #167 — admin-gated)
 REBUNDLE=$(curl -s "$BASE/bundles/export/$NEW_ID" -H "Authorization: Bearer $NEW_TOKEN")
