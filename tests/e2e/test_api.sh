@@ -12,6 +12,8 @@ ECHO_TOKEN=""
 SUM_TOKEN=""
 ECHO_AUTH=()
 SUM_AUTH=()
+ECHO_URL="https://example.com/echo-agent"
+SUM_URL="https://example.com/summarizer-agent"
 
 # AdminAuth-gated calls need a bearer token once any workspace token
 # exists in the DB. ADMIN_TOKEN is populated after the first workspace
@@ -95,7 +97,7 @@ ECHO_WS_TOKEN=$(curl -s "$BASE/admin/workspaces/$ECHO_ID/test-token" | python3 -
 [ -n "$ECHO_WS_TOKEN" ] && ECHO_AUTH=(-H "Authorization: Bearer $ECHO_WS_TOKEN")
 R=$(curl -s -X POST "$BASE/registry/register" -H "Content-Type: application/json" \
   "${ECHO_AUTH[@]}" \
-  -d "{\"id\":\"$ECHO_ID\",\"url\":\"http://localhost:8001\",\"agent_card\":{\"name\":\"Echo Agent\",\"skills\":[{\"id\":\"echo\",\"name\":\"Echo\"}]}}")
+  -d "{\"id\":\"$ECHO_ID\",\"url\":\"$ECHO_URL\",\"agent_card\":{\"name\":\"Echo Agent\",\"skills\":[{\"id\":\"echo\",\"name\":\"Echo\"}]}}")
 check "POST /registry/register (echo)" '"status":"registered"' "$R"
 # Extract token from register response; fall back to the test-token we
 # already minted (register may not return a new token on re-registration).
@@ -107,7 +109,7 @@ SUM_WS_TOKEN=$(curl -s "$BASE/admin/workspaces/$SUM_ID/test-token" | python3 -c 
 [ -n "$SUM_WS_TOKEN" ] && SUM_AUTH=(-H "Authorization: Bearer $SUM_WS_TOKEN")
 R=$(curl -s -X POST "$BASE/registry/register" -H "Content-Type: application/json" \
   "${SUM_AUTH[@]}" \
-  -d "{\"id\":\"$SUM_ID\",\"url\":\"http://localhost:8002\",\"agent_card\":{\"name\":\"Summarizer\",\"skills\":[{\"id\":\"summarize\",\"name\":\"Summarize\"}]}}")
+  -d "{\"id\":\"$SUM_ID\",\"url\":\"$SUM_URL\",\"agent_card\":{\"name\":\"Summarizer\",\"skills\":[{\"id\":\"summarize\",\"name\":\"Summarize\"}]}}")
 check "POST /registry/register (summarizer)" '"status":"registered"' "$R"
 SUM_TOKEN=$(echo "$R" | e2e_extract_token)
 if [ -z "$SUM_TOKEN" ]; then SUM_TOKEN="$SUM_WS_TOKEN"; fi
@@ -116,7 +118,7 @@ if [ -z "$SUM_TOKEN" ]; then SUM_TOKEN="$SUM_WS_TOKEN"; fi
 R=$(acurl "$BASE/workspaces/$ECHO_ID")
 check "Echo is online" '"status":"online"' "$R"
 check "Echo has agent_card" '"skills"' "$R"
-check "Echo has url" '"url":"http://localhost:8001"' "$R"
+check "Echo has url" "\"url\":\"$ECHO_URL\"" "$R"
 
 # Test 10: Heartbeat
 R=$(curl -s -X POST "$BASE/registry/heartbeat" -H "Content-Type: application/json" -H "Authorization: Bearer $ECHO_TOKEN" \
@@ -182,7 +184,7 @@ curl -s -X POST "$BASE/registry/heartbeat" -H "Content-Type: application/json" -
 # Re-register to force online status in case liveness expired
 curl -s -X POST "$BASE/registry/register" -H "Content-Type: application/json" \
   -H "Authorization: Bearer $ECHO_TOKEN" \
-  -d "{\"id\":\"$ECHO_ID\",\"url\":\"http://localhost:8001\",\"agent_card\":{\"name\":\"Echo Agent v2\",\"skills\":[{\"id\":\"echo\",\"name\":\"Echo\"},{\"id\":\"repeat\",\"name\":\"Repeat\"}]}}" > /dev/null
+  -d "{\"id\":\"$ECHO_ID\",\"url\":\"$ECHO_URL\",\"agent_card\":{\"name\":\"Echo Agent v2\",\"skills\":[{\"id\":\"echo\",\"name\":\"Echo\"},{\"id\":\"repeat\",\"name\":\"Repeat\"}]}}" > /dev/null
 
 # Now send high error rate to trigger degraded
 R=$(curl -s -X POST "$BASE/registry/heartbeat" -H "Content-Type: application/json" -H "Authorization: Bearer $ECHO_TOKEN" \
@@ -367,7 +369,7 @@ NEW_AUTH=()
 [ -n "$NEW_TOKEN" ] && NEW_AUTH=(-H "Authorization: Bearer $NEW_TOKEN")
 R=$(curl -s -X POST "$BASE/registry/register" -H "Content-Type: application/json" \
   "${NEW_AUTH[@]}" \
-  -d "{\"id\":\"$NEW_ID\",\"url\":\"http://localhost:8002\",\"agent_card\":{\"name\":\"Summarizer\",\"skills\":[{\"id\":\"summarize\",\"name\":\"Summarize\"}]}}")
+  -d "{\"id\":\"$NEW_ID\",\"url\":\"$SUM_URL\",\"agent_card\":{\"name\":\"Summarizer\",\"skills\":[{\"id\":\"summarize\",\"name\":\"Summarize\"}]}}")
 check "Register re-imported workspace" '"status":"registered"' "$R"
 # Capture the fresh token issued to the re-imported workspace.  SUM_TOKEN was
 # revoked when SUM_ID was deleted above — use this one for cleanup instead.
