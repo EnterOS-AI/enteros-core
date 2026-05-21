@@ -7,24 +7,19 @@ package handlers
 // and A2A response parsing helpers.
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log"
-	"net/http"
 	"os"
-	"strings"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/provisioner"
 	"github.com/Molecule-AI/molecule-monorepo/platform/internal/registry"
 	"github.com/google/uuid"
 )
+
 // insertMCPDelegationRow writes a delegation activity row so the canvas
 // Agent Comms tab can show the task text for MCP-initiated delegations.
 // Mirrors insertDelegationRow (delegation.go) for the MCP tool path.
@@ -190,15 +185,6 @@ func (h *MCPHandler) toolDelegateTask(ctx context.Context, callerID string, args
 		// Non-fatal: still make the A2A call even if activity log write fails.
 	}
 
-	agentURL, err := mcpResolveURL(ctx, h.database, targetID)
-	if err != nil {
-		return "", err
-	}
-	// SSRF defence: reject private/metadata URLs before making outbound call.
-	if err := isSafeURL(agentURL); err != nil {
-		return "", fmt.Errorf("invalid workspace URL: %w", err)
-	}
-
 	a2aBody, err := json.Marshal(map[string]interface{}{
 		"jsonrpc": "2.0",
 		"id":      uuid.New().String(),
@@ -218,35 +204,16 @@ func (h *MCPHandler) toolDelegateTask(ctx context.Context, callerID string, args
 	reqCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	httpReq, err := http.NewRequestWithContext(reqCtx, "POST", agentURL+"/a2a", bytes.NewReader(a2aBody))
-	if err != nil {
-		return "", fmt.Errorf("failed to create request: %w", err)
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	// X-Workspace-ID identifies this caller to the A2A proxy. The /workspaces/:id/a2a
-	// endpoint is intentionally outside WorkspaceAuth (agents do not hold bearer tokens
-	// to peer workspaces). Access control is enforced by CanCommunicate above, which
-	// already validated callerID → targetID before this request is constructed.
-	// callerID was authenticated by WorkspaceAuth on the MCP bridge entry point,
-	// so this header reflects a verified caller identity, not a spoofable value.
-	httpReq.Header.Set("X-Workspace-ID", callerID)
-
-	resp, err := http.DefaultClient.Do(httpReq)
+	status, body, err := h.proxyA2ARequest(reqCtx, targetID, a2aBody, callerID, true)
 	if err != nil {
 		updateMCPDelegationStatus(ctx, h.database, callerID, delegationID, "failed", err.Error())
-		return "", fmt.Errorf("A2A call failed: %w", err)
+		return "", fmt.Errorf("A2A proxy failed: %w", err)
 	}
-	defer func() { _ = resp.Body.Close() }()
-
-	// A 200/500 from the peer still means the call was dispatched — only
-	// network errors are truly "failed". Status 'dispatched' is correct for
-	// any HTTP response (peer's A2A layer handles the actual processing).
+	if status < 200 || status >= 300 {
+		updateMCPDelegationStatus(ctx, h.database, callerID, delegationID, "failed", fmt.Sprintf("A2A proxy returned status %d", status))
+		return "", fmt.Errorf("A2A proxy returned status %d", status)
+	}
 	updateMCPDelegationStatus(ctx, h.database, callerID, delegationID, "dispatched", "")
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return "", fmt.Errorf("failed to read response: %w", err)
-	}
 
 	return extractA2AText(body), nil
 }
@@ -278,23 +245,12 @@ func (h *MCPHandler) toolDelegateTaskAsync(ctx context.Context, callerID string,
 
 	// Fire and forget in a detached goroutine. Use a background context so
 	// the call is not cancelled when the HTTP request completes.
-	// RFC internal#524 Layer 1: globalGoAsync — the detached call reads
-	// db.DB (mcpResolveURL + updateMCPDelegationStatus) and must be
-	// drained by drainTestAsync before any t.Cleanup-driven db.DB swap.
+	// RFC internal#524 Layer 1: globalGoAsync — the detached call reads db.DB
+	// through the platform A2A proxy and must be drained by drainTestAsync
+	// before any t.Cleanup-driven db.DB swap.
 	globalGoAsync(func() {
 		bgCtx, cancel := context.WithTimeout(context.Background(), mcpAsyncCallTimeout)
 		defer cancel()
-
-		agentURL, err := mcpResolveURL(bgCtx, h.database, targetID)
-		if err != nil {
-			log.Printf("MCPHandler.delegate_task_async: resolve URL for %s: %v", targetID, err)
-			return
-		}
-		// SSRF defence: reject private/metadata URLs before making outbound call.
-		if err := isSafeURL(agentURL); err != nil {
-			log.Printf("MCPHandler.delegate_task_async: unsafe URL for %s: %v", targetID, err)
-			return
-		}
 
 		a2aBody, _ := json.Marshal(map[string]interface{}{
 			"jsonrpc": "2.0",
@@ -309,22 +265,15 @@ func (h *MCPHandler) toolDelegateTaskAsync(ctx context.Context, callerID string,
 			},
 		})
 
-		httpReq, err := http.NewRequestWithContext(bgCtx, "POST", agentURL+"/a2a", bytes.NewReader(a2aBody))
-		if err != nil {
-			log.Printf("MCPHandler.delegate_task_async: create request: %v", err)
+		status, _, err := h.proxyA2ARequest(bgCtx, targetID, a2aBody, callerID, true)
+		if err != nil || status < 200 || status >= 300 {
+			if err != nil {
+				log.Printf("MCPHandler.delegate_task_async: A2A proxy to %s: %v", targetID, err)
+			} else {
+				log.Printf("MCPHandler.delegate_task_async: A2A proxy to %s returned status %d", targetID, status)
+			}
 			return
 		}
-		httpReq.Header.Set("Content-Type", "application/json")
-		httpReq.Header.Set("X-Workspace-ID", callerID)
-
-		resp, err := http.DefaultClient.Do(httpReq)
-		if err != nil {
-			log.Printf("MCPHandler.delegate_task_async: A2A call to %s: %v", targetID, err)
-			return
-		}
-		defer func() { _ = resp.Body.Close() }()
-		// Drain response so the connection can be reused.
-		_, _ = io.Copy(io.Discard, resp.Body)
 	})
 
 	return fmt.Sprintf(`{"task_id":%q,"status":"dispatched","target_id":%q}`, delegationID, targetID), nil
@@ -404,7 +353,6 @@ func (h *MCPHandler) toolSendMessageToUser(ctx context.Context, workspaceID stri
 	}
 	return "Message sent.", nil
 }
-
 
 func (h *MCPHandler) toolCommitMemory(ctx context.Context, workspaceID string, args map[string]interface{}) (string, error) {
 	// PR-6 (RFC #2728) compat shim: when the v2 plugin is wired
@@ -534,56 +482,6 @@ func (h *MCPHandler) toolRecallMemory(ctx context.Context, workspaceID string, a
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-// mcpResolveURL returns a routable URL for a workspace's A2A server.
-//
-// Resolution order:
-//  1. Docker-internal URL cache (set by provisioner; correct when platform is in Docker)
-//  2. Redis URL cache
-//  3. DB `url` column fallback, with 127.0.0.1→Docker bridge rewrite when in Docker
-//
-// SECURITY (F1083 / #1130): all three paths run the returned URL through
-// validateAgentURL to block SSRF targets (private IPs, loopback, cloud metadata).
-func mcpResolveURL(ctx context.Context, database *sql.DB, workspaceID string) (string, error) {
-	if platformInDocker {
-		if url, err := db.GetCachedInternalURL(ctx, workspaceID); err == nil && url != "" {
-			if err := validateAgentURL(url); err != nil {
-				return "", fmt.Errorf("workspace %s: forbidden URL from internal cache: %w", workspaceID, err)
-			}
-			return url, nil
-		}
-	}
-	if url, err := db.GetCachedURL(ctx, workspaceID); err == nil && url != "" {
-		if platformInDocker && strings.HasPrefix(url, "http://127.0.0.1:") {
-			return provisioner.InternalURL(workspaceID), nil
-		}
-		if err := validateAgentURL(url); err != nil {
-			return "", fmt.Errorf("workspace %s: forbidden URL from Redis cache: %w", workspaceID, err)
-		}
-		return url, nil
-	}
-
-	var urlStr sql.NullString
-	var status string
-	if err := database.QueryRowContext(ctx,
-		`SELECT url, status FROM workspaces WHERE id = $1`, workspaceID,
-	).Scan(&urlStr, &status); err != nil {
-		if err == sql.ErrNoRows {
-			return "", fmt.Errorf("workspace %s not found", workspaceID)
-		}
-		return "", fmt.Errorf("workspace lookup failed: %w", err)
-	}
-	if !urlStr.Valid || urlStr.String == "" {
-		return "", fmt.Errorf("workspace %s has no URL (status: %s)", workspaceID, status)
-	}
-	if platformInDocker && strings.HasPrefix(urlStr.String, "http://127.0.0.1:") {
-		return provisioner.InternalURL(workspaceID), nil
-	}
-	if err := validateAgentURL(urlStr.String); err != nil {
-		return "", fmt.Errorf("workspace %s: forbidden URL from DB: %w", workspaceID, err)
-	}
-	return urlStr.String, nil
-}
-
 // extractA2AText extracts human-readable text from an A2A JSON-RPC response body.
 // Falls back to the raw JSON when no text part can be found.
 func extractA2AText(body []byte) string {
@@ -632,4 +530,3 @@ func extractA2AText(body []byte) string {
 	b, _ := json.Marshal(result)
 	return string(b)
 }
-
