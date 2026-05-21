@@ -135,6 +135,18 @@ jobs:
         run: |
           echo "sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
+      # Keep Buildx state inside the job temp dir. The publish runner's
+      # inherited DOCKER_CONFIG can point at a host-owned ECR config path
+      # (/home/hongming/.docker-ecr), which caused setup-buildx-action to
+      # fail before image build with EACCES creating buildx/certs.
+      - name: Prepare writable Docker config
+        run: |
+          set -euo pipefail
+          export DOCKER_CONFIG="$RUNNER_TEMP/docker-config"
+          mkdir -p "$DOCKER_CONFIG/buildx/certs"
+          echo "DOCKER_CONFIG=$DOCKER_CONFIG" >> "$GITHUB_ENV"
+          docker buildx version
+
       # Build + push platform image (inline ECR auth — mirrors the operator-host
       # approach; credentials come from GITHUB_SECRET_AWS_ACCESS_KEY_ID /
       # GITHUB_SECRET_AWS_SECRET_ACCESS_KEY in Gitea Actions).
