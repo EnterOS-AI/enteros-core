@@ -127,7 +127,11 @@ cd workspace-server && go test -race ./...
 cd canvas && npm test
 
 # Workspace runtime (Python)
-cd workspace && python -m pytest -v
+# Runtime code is SSOT in molecule-ai-workspace-runtime, not molecule-core/workspace.
+cd ../molecule-ai-workspace-runtime
+python -m venv .venv && source .venv/bin/activate
+pip install --index-url https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/ -e . pytest pytest-asyncio
+pytest -q
 
 # E2E API tests (requires running platform)
 bash tests/e2e/test_api.sh
@@ -158,6 +162,19 @@ and run CI manually.
 | shellcheck | Shell script linting |
 | review-check-tests | `review-check.sh` evaluator regression suite (13 scenarios) |
 | ops-scripts | Python unittest suite for `scripts/*.py` |
+
+### Workspace runtime SSOT
+
+Runtime code lives in
+[`molecule-ai-workspace-runtime`](https://git.moleculesai.app/molecule-ai/molecule-ai-workspace-runtime).
+Do not reintroduce `molecule-core/workspace/` or vendored `molecule_runtime/`
+copies in consumers. Core and templates consume the published runtime package
+from the Gitea package registry.
+
+For local external MCP agents, multi-workspace config is
+`MOLECULE_WORKSPACES=[{"id":"...","token":"...","platform_url":"..."}]`.
+`platform_url` selects the tenant; `org_id` is not part of this config.
+Workspace IDs can differ across orgs.
 
 ## Local Testing
 
