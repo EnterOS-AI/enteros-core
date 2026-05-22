@@ -91,7 +91,16 @@ jobs:
           # Only the scripts we control under .gitea/scripts. Pilot
           # scope is intentionally narrow — broaden in a follow-up
           # once the lane is proven.
-          mapfile -t TARGETS < <(find .gitea/scripts -maxdepth 2 -type f -name '*.sh' | sort)
+          #
+          # NOTE: macOS ships Bash 3.2 (Apple license), no `mapfile`
+          # (Bash 4+ builtin). Mac mini runner empirically failed at
+          # `mapfile: command not found` (run 79275 / task 145654).
+          # Use the portable `while read` pattern instead — works on
+          # both Bash 3.2 (macOS) and Bash 4+ (Linux).
+          TARGETS=()
+          while IFS= read -r f; do
+            TARGETS+=("$f")
+          done < <(find .gitea/scripts -maxdepth 2 -type f -name '*.sh' | sort)
           if [ "${#TARGETS[@]}" -eq 0 ]; then
             echo "No .sh files found under .gitea/scripts — nothing to check"
             exit 0
