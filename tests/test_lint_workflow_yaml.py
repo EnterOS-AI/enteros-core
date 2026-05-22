@@ -705,7 +705,7 @@ def test_ci_change_detector_docs_and_meta_scripts_do_not_trigger_surfaces():
     }
 
 
-def test_ci_platform_go_pr_steps_are_path_scoped():
+def test_ci_platform_go_steps_are_path_scoped_on_all_events():
     doc = yaml.safe_load(CI_WORKFLOW.read_text(encoding="utf-8"))
     platform = doc["jobs"]["platform-build"]
     assert platform.get("needs") == "changes"
@@ -720,11 +720,11 @@ def test_ci_platform_go_pr_steps_are_path_scoped():
     assert expensive_steps
     for step in expensive_steps:
         expr = step.get("if", "")
-        assert "github.event_name != 'pull_request'" in expr
         assert "needs.changes.outputs.platform == 'true'" in expr
+        assert "github.event_name != 'pull_request'" not in expr
 
 
-def test_ci_canvas_nextjs_pr_steps_are_path_scoped():
+def test_ci_canvas_nextjs_steps_are_path_scoped_on_all_events():
     doc = yaml.safe_load(CI_WORKFLOW.read_text(encoding="utf-8"))
     canvas = doc["jobs"]["canvas-build"]
     assert canvas.get("needs") == "changes"
@@ -739,11 +739,11 @@ def test_ci_canvas_nextjs_pr_steps_are_path_scoped():
     assert expensive_steps
     for step in expensive_steps:
         expr = step.get("if", "")
-        assert "github.event_name != 'pull_request'" in expr
         assert "needs.changes.outputs.canvas == 'true'" in expr
+        assert "github.event_name != 'pull_request'" not in expr
 
 
-def test_ci_shellcheck_pr_steps_are_path_scoped():
+def test_ci_shellcheck_steps_are_path_scoped_on_all_events():
     doc = yaml.safe_load(CI_WORKFLOW.read_text(encoding="utf-8"))
     shellcheck = doc["jobs"]["shellcheck"]
     assert shellcheck.get("needs") == "changes"
@@ -756,5 +756,5 @@ def test_ci_shellcheck_pr_steps_are_path_scoped():
     assert expensive_steps
     for step in expensive_steps:
         expr = step.get("if", "")
-        assert "github.event_name != 'pull_request'" in expr
         assert "needs.changes.outputs.scripts == 'true'" in expr
+        assert "github.event_name != 'pull_request'" not in expr
