@@ -639,12 +639,39 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 		}
 	}
 
-	c.JSON(http.StatusCreated, gin.H{
+	// Mint the workspace's first bearer token and return it inline
+	// (#1644). Pre-fix, callers had to make a separate POST to
+	// /admin/workspaces/:id/tokens (production path, AdminAuth-gated,
+	// but the path-prefix differs in CP-admin deploys so staging E2E
+	// got HTML 404) OR fall back to GET /admin/workspaces/:id/test-token
+	// (dev-only — deliberately 404s on MOLECULE_ENV=production per
+	// admin_test_token.go::TestTokensEnabled, which violates
+	// feedback_no_dev_only_routes_in_e2e). Inlining the first token here
+	// makes the create response the SSOT — every caller (canvas Save,
+	// org_import, E2E, third-party API) gets the bearer they need to
+	// authenticate /activity, /a2a, /memory etc. without an extra
+	// round trip to a separate mint endpoint.
+	//
+	// Failure is non-fatal: the workspace row already committed; the
+	// operator can recover via POST /admin/workspaces/:id/tokens
+	// (canonical admin mint) or POST /workspaces/:id/external/rotate
+	// (already-used for the external pre-register path above). We log
+	// the failure and return 201 without the field — callers that need
+	// the token will get a clear-shaped fallback (auth_token absent
+	// from response = use the admin mint path).
+	resp := gin.H{
 		"id":                  id,
 		"status":              "provisioning",
 		"awareness_namespace": awarenessNamespace,
 		"workspace_access":    workspaceAccess,
-	})
+	}
+	if authToken, tokErr := wsauth.IssueToken(ctx, db.DB, id); tokErr != nil {
+		log.Printf("Create workspace %s: inline auth_token mint failed (non-fatal — caller can use POST /admin/workspaces/:id/tokens): %v", id, tokErr)
+	} else {
+		resp["auth_token"] = authToken
+	}
+
+	c.JSON(http.StatusCreated, resp)
 }
 
 // addProvisionTimeoutMs decorates a workspace response map with the
