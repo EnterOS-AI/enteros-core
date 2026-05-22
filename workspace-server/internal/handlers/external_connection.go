@@ -216,69 +216,102 @@ curl -fsS -X POST "{{PLATFORM_URL}}/registry/register" \
 const externalChannelTemplate = `# Claude Code channel — bridges this workspace's A2A traffic into your
 # Claude Code session. No tunnel/public URL needed (polling-based).
 #
-# Prereq: Bun installed (channel plugins are Bun scripts).
-#   bun --version    # must print a version number
+# Prereq: Bun 1.3+ installed (channel plugins are Bun scripts).
+#   bun --version    # must print a version (1.3.x or newer)
 #
-# 1. Inside Claude Code, install the channel plugin from its GitHub repo.
-#    The plugin is NOT on Anthropic's default allowlist, so a one-time
-#    marketplace-add is needed before install:
+# 1. Inside Claude Code, install the channel plugin. The plugin lives in
+#    Molecule's own Gitea marketplace (not Anthropic's default), so a
+#    one-time marketplace-add is needed before install:
 #
 #      /plugin marketplace add https://git.moleculesai.app/molecule-ai/molecule-mcp-claude-channel.git
 #      /plugin install molecule@molecule-channel
 #
-#    Then either run /reload-plugins or restart Claude Code so the
-#    plugin is registered.
+#    Then /reload-plugins (or restart Claude Code) so the plugin is
+#    registered.
 #
-# 2. Create the per-watched-workspace config file:
+# 2. Create (or extend) the per-host config file. The canonical SSOT
+#    shape is MOLECULE_WORKSPACES_JSON — a JSON array of
+#    {id, token, platform_url} objects. One plugin instance can watch
+#    many workspaces across many tenants; append more objects to the
+#    array (separate them with commas, NOT a newline):
 mkdir -p ~/.claude/channels/molecule
 cat > ~/.claude/channels/molecule/.env <<'EOF'
-MOLECULE_PLATFORM_URL={{PLATFORM_URL}}
-MOLECULE_WORKSPACE_IDS={{WORKSPACE_ID}}
-MOLECULE_WORKSPACE_TOKENS=<paste auth_token from create response>
+MOLECULE_WORKSPACES_JSON=[{"id":"{{WORKSPACE_ID}}","token":"<paste auth_token from create response>","platform_url":"{{PLATFORM_URL}}"}]
 EOF
 chmod 600 ~/.claude/channels/molecule/.env
 
-# 3. Launch Claude Code with the channel enabled. Custom (non-Anthropic-
-#    allowlisted) channels need the --dangerously-load-development-channels
-#    flag to opt in — without it, you'll see "not on the approved channels
-#    allowlist" on startup.
-claude --dangerously-load-development-channels \
-  --channels plugin:molecule@molecule-channel
+# (Legacy single-platform shape — MOLECULE_PLATFORM_URL + comma-separated
+# MOLECULE_WORKSPACE_IDS + MOLECULE_WORKSPACE_TOKENS — is still supported
+# for back-compat but does NOT work across multiple tenant URLs. Use
+# MOLECULE_WORKSPACES_JSON above unless you have a specific reason.)
+
+# 3. Launch Claude Code with the channel enabled. The channel spec is the
+#    VALUE of --dangerously-load-development-channels — NOT a separate
+#    --channels flag (that flag does not exist in current Claude Code;
+#    passing it errors with "entries must be tagged: --channels").
+claude --dangerously-load-development-channels plugin:molecule@molecule-channel
 
 # You should see on stderr:
-#   molecule channel: connected — watching 1 workspace(s) at {{PLATFORM_URL}}
+#   molecule channel: connected — watching N workspace(s) across M platform(s)
+#     targets: <platform_url>: <workspace_id>
 #
-# Inbound A2A messages now surface as conversation turns. Claude's
-# replies route back via the reply_to_workspace MCP tool — no extra
-# wiring on your side.
+# Inbound A2A messages now surface as conversation turns (synthetic
+# <channel ...> tags). Claude's replies route back via the
+# reply_to_workspace / send_message_to_user MCP tools.
+#
+# Multi-workspace note: when watching more than one workspace, every
+# outbound tool call (send_message_to_user, reply_to_workspace,
+# delegate_task, list_peers) MUST pass _as_workspace=<id> so the plugin
+# knows which token to authenticate with. The host returns -32603 if you
+# forget — the synthetic <channel> tag's "watching_as" attribute tells
+# you which id to use.
 #
 # Common errors:
-#   "plugin not installed"            → Step 1 didn't run; run /plugin install
+#   "plugin not installed"            → Step 1 didn't run; run /plugin
+#                                       marketplace add + /plugin install
 #                                       inside Claude Code, then /reload-plugins.
-#   "not on approved channels allowlist" → Add --dangerously-load-development-channels
-#                                       to the launch command (Step 3).
-#   "config-missing"                  → ~/.claude/channels/molecule/.env not
-#                                       readable; re-run Step 2 and check chmod.
+#   "entries must be tagged"          → You passed --channels separately.
+#                                       Put plugin:molecule@molecule-channel
+#                                       directly after
+#                                       --dangerously-load-development-channels.
+#   "not on approved channels allowlist" → Org policy gating. See "managed
+#                                       settings" note below.
+#   "config-missing"                  → ~/.claude/channels/molecule/.env
+#                                       not readable; re-run Step 2 and check
+#                                       chmod 600.
 #
-# Team/Enterprise orgs: the --dangerously-load-development-channels flag is
-# blocked by managed settings. Your admin must set channelsEnabled=true and
-# add the plugin to allowedChannelPlugins in claude.ai admin settings.
+# Team/Enterprise plans: the channel allowlist is gated by org policy
+# AND must be written to the local managed-settings.json file on disk
+# (not the claude.ai web admin UI — there is no web toggle for this).
+# Path per OS:
+#   macOS:   /Library/Application Support/ClaudeCode/managed-settings.json
+#   Linux:   /etc/claude-code/managed-settings.json
+#   Windows: C:\ProgramData\ClaudeCode\managed-settings.json
+# Set channelsEnabled: true and add
+#   { "plugin": "molecule", "marketplace": "molecule-channel" }
+# to allowedChannelPlugins. Restart Claude Code after writing the file.
+# A user-level ~/.claude/settings.json does NOT work on Team/Enterprise
+# — this is the single most common reason a freshly-installed plugin
+# appears to do nothing.
 #
-# Multi-workspace: comma-separate IDs and tokens (same order). See
-# https://git.moleculesai.app/molecule-ai/molecule-mcp-claude-channel for
-# pairing flow, push-mode upgrade, and v0.2 roadmap.
+# Pro/Max plans skip the channelsEnabled gate but still need the
+# allowedChannelPlugins entry in the managed-settings file.
 
 # Need help?
 #   Documentation: https://doc.moleculesai.app/docs/guides/claude-code-channel-plugin
+#   Full README:   https://git.moleculesai.app/molecule-ai/molecule-mcp-claude-channel
 #   Common errors:
 #     • "plugin not installed" — run /plugin marketplace add then
 #       /plugin install lines above; /reload-plugins or restart.
+#     • "entries must be tagged: --channels" — the launch flag form
+#       changed; use --dangerously-load-development-channels plugin:molecule@molecule-channel
+#       (channel spec is the VALUE, not a separate --channels flag).
 #     • "not on the approved channels allowlist" — custom channels need
-#       --dangerously-load-development-channels; team/enterprise orgs
-#       need admin to set channelsEnabled + allowedChannelPlugins.
+#       allowedChannelPlugins in /Library/Application Support/ClaudeCode/managed-settings.json
+#       (macOS) / equivalent on Linux+Windows. NOT a web setting.
 #     • "Inbound messages not arriving" — stderr should show
 #       "molecule channel: connected — watching N workspace(s)";
-#       verify ~/.claude/channels/molecule/.env has PLATFORM_URL + token.
+#       verify ~/.claude/channels/molecule/.env shape is MOLECULE_WORKSPACES_JSON.
 `
 
 // externalUniversalMcpTemplate — runtime-agnostic standalone path.
@@ -670,7 +703,15 @@ def heartbeat(client, url, ws, tok, start):
     r.raise_for_status()
 
 def poll_inbound(client, url, ws, tok, since_id):
-    params = {"since_secs": "30", "limit": "50"}
+    # include=peer_info opts into Layer 1's row-level projection so each
+    # polled activity carries peer_name, peer_role, agent_card_url, and
+    # attachments[] inline (when source_id resolves to a peer / when the
+    # message included a file). Pre-Layer-1 platforms ignore unknown query
+    # params and return the bare row shape, so this is back-compat. Use
+    # the extra fields in your reply logic — e.g. address the sender by
+    # peer_name rather than UUID, or Read attached files via the workspace:
+    # URIs in attachments[].
+    params = {"since_secs": "30", "limit": "50", "include": "peer_info"}
     if since_id:
         params["since_id"] = since_id
     r = client.get(f"{url}/workspaces/{ws}/activity", params=params, headers=hdrs(url, tok))
@@ -737,10 +778,16 @@ python3 ~/.molecule-ai/kimi-{{MCP_SERVER_NAME}}/kimi_bridge.py
 # What the script does:
 #   • Registers the workspace in poll mode (no public URL needed)
 #   • Heartbeats every 20s to keep STATUS = online on the canvas
-#   • Polls /workspaces/:id/activity every 5s for new canvas messages
+#   • Polls /workspaces/:id/activity?include=peer_info every 5s — Layer 1
+#     enrichment surfaces peer_name / peer_role / agent_card_url /
+#     attachments[] inline on each polled row when applicable
 #   • Echo-replies via POST /workspaces/:id/notify
 #
 # To change the reply logic, edit the send_reply() call inside the loop.
+# Each polled item has top-level peer_name / peer_role / agent_card_url
+# fields (peer_agent rows) and attachments[] (any kind) when Layer 1 is
+# enabled on the platform — use them to disambiguate senders and to Read
+# attached files via the workspace: URIs.
 # To send a one-off reply from another terminal:
 #   curl -fsS -X POST "{{PLATFORM_URL}}/workspaces/{{WORKSPACE_ID}}/notify" \
 #     -H "Authorization: Bearer $(cat ~/.molecule-ai/kimi-{{MCP_SERVER_NAME}}/env | grep TOKEN | cut -d= -f2)" \
