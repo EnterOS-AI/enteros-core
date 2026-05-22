@@ -32,6 +32,11 @@
 #                                 mapped to `smoke` for back-compat with
 #                                 any in-flight runner picking up an older
 #                                 workflow checkout)
+#   E2E_AWS_LEAK_CHECK           auto (default) | required | off
+#                                required in CI so teardown cannot report
+#                                clean while slug-tagged EC2 remains alive
+#   E2E_AWS_TERMINATE_LEAKS      1 → terminate slug-tagged leaked EC2 before
+#                                exiting 4
 #   E2E_INTENTIONAL_FAILURE      1 → poison tenant token mid-run so the
 #                                script fails; the EXIT trap MUST still
 #                                tear down cleanly (and exit 4 on leak).
@@ -82,8 +87,12 @@ ok()   { echo "[$(date +%H:%M:%S)] ✅ $*"; }
 # Per-runtime model slug dispatch — see lib/model_slug.sh for the rationale.
 # Extracted so unit tests (tests/e2e/test_model_slug.sh) can pin every branch
 # without booting the full 11-step lifecycle.
+# shellcheck disable=SC1091
 # shellcheck source=lib/model_slug.sh
 source "$(dirname "$0")/lib/model_slug.sh"
+# shellcheck disable=SC1091
+# shellcheck source=lib/aws_leak_check.sh
+source "$(dirname "$0")/lib/aws_leak_check.sh"
 
 CURL_COMMON=(-sS --fail-with-body --max-time 30)
 
@@ -119,12 +128,14 @@ cleanup_org() {
   #      DELETE returns 5xx mid-cascade and the cascade finishes anyway,
   #      and the case where DELETE legitimately exceeds 120s and we want
   #      eventual-consistency confirmation.
-  curl "${CURL_COMMON[@]}" --max-time 120 -X DELETE "$CP_URL/cp/admin/tenants/$SLUG" \
+  if curl "${CURL_COMMON[@]}" --max-time 120 -X DELETE "$CP_URL/cp/admin/tenants/$SLUG" \
     -H "Authorization: Bearer $ADMIN_TOKEN" \
     -H "Content-Type: application/json" \
-    -d "{\"confirm\":\"$SLUG\"}" >/dev/null 2>&1 \
-    && ok "Teardown request accepted" \
-    || log "Teardown returned non-2xx (may already be gone)"
+    -d "{\"confirm\":\"$SLUG\"}" >/dev/null 2>&1; then
+    ok "Teardown request accepted"
+  else
+    log "Teardown returned non-2xx (may already be gone)"
+  fi
 
   local leak_count=1
   local elapsed=0
@@ -144,7 +155,15 @@ cleanup_org() {
     echo "⚠️  LEAK: org $SLUG still present post-teardown after ${elapsed}s (count=$leak_count)" >&2
     exit 4
   fi
-  ok "Teardown clean — no orphan resources for $SLUG (${elapsed}s)"
+  local aws_leak_rc=0
+  e2e_verify_no_ec2_leaks_for_slug "$SLUG" || aws_leak_rc=$?
+  if [ "$aws_leak_rc" != "0" ]; then
+    case "$aws_leak_rc" in
+      2) exit 2 ;;
+      *) exit 4 ;;
+    esac
+  fi
+  ok "Teardown clean — no orphan org or EC2 resources for $SLUG (${elapsed}s)"
 
   # Normalize unexpected upstream exit codes to 1 (generic failure). The
   # script's documented contract (header "Exit codes" section) only emits
