@@ -1,6 +1,7 @@
 package provisioner
 
 import (
+	"os"
 	"strings"
 	"testing"
 )
@@ -77,6 +78,19 @@ func TestT4PrivilegeContract_CoreCapabilitiesPresent(t *testing.T) {
 	}
 }
 
+func TestT4PrivilegeContract_DefaultEgressUsesMoleculeOwnedEndpoint(t *testing.T) {
+	for _, c := range T4PrivilegeContract() {
+		for _, target := range c.RequiredEgress {
+			if strings.Contains(target, "github.com") {
+				t.Errorf("capability %q default egress target must not depend on GitHub mirror/API: %s", c.Name, target)
+			}
+			if strings.Contains(target, "google.com") {
+				t.Errorf("capability %q default egress target must not depend on external Google endpoint: %s", c.Name, target)
+			}
+		}
+	}
+}
+
 // TestT4PrivilegeContract_HardCapabilitiesMajority sanity-checks that
 // the contract is not silently advisory-only. If someone marks
 // everything as "advisory" the gate becomes a no-op without anyone
@@ -139,6 +153,17 @@ func TestAsYAML_EscapesEmbeddedQuotes(t *testing.T) {
 	}
 	if !strings.Contains(y, `\"ok\"`) {
 		t.Errorf("AsYAML did not escape embedded double quotes in Probe; got:\n%s", y)
+	}
+}
+
+func TestGeneratedT4CapabilitiesYAMLMatchesSSOT(t *testing.T) {
+	got, err := os.ReadFile("t4_capabilities.yaml")
+	if err != nil {
+		t.Fatalf("read generated t4_capabilities.yaml: %v", err)
+	}
+	want := AsYAML(T4PrivilegeContract())
+	if string(got) != want {
+		t.Fatal("generated t4_capabilities.yaml drifted from T4PrivilegeContract; regenerate with `go run ./cmd/t4-contract-dump > internal/provisioner/t4_capabilities.yaml`")
 	}
 }
 
