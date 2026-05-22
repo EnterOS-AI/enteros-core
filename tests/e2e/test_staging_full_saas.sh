@@ -350,6 +350,17 @@ tenant_call() {
     "$@"
 }
 
+sanitize_http_body() {
+  python3 -c '
+import re, sys
+s = sys.stdin.read()
+s = re.sub(r"(?i)(Authorization:\s*Bearer\s+)[A-Za-z0-9._~+/=-]+", r"\1[redacted]", s)
+s = re.sub(r"(?i)(\"(?:auth_token|access_token|refresh_token|token|api_key|secret|password)\"\s*:\s*\")[^\"]+\"", r"\1[redacted]\"", s)
+s = re.sub(r"(?i)((?:auth_token|access_token|refresh_token|api_key|secret|password)=)[^&\s]+", r"\1[redacted]", s)
+print(s[:4000])
+'
+}
+
 # ─── 5. Provision parent workspace ─────────────────────────────────────
 # Inject the LLM provider key so the runtime can authenticate at boot.
 # Branch by which secret is set so the script supports multiple paths
@@ -402,9 +413,9 @@ elif [ -n "${E2E_ANTHROPIC_API_KEY:-}" ]; then
   # is still independent of MOLECULE_STAGING_OPENAI_API_KEY, so an OpenAI
   # quota collapse doesn't wedge this path. Pinned to the claude-code
   # runtime: hermes/langgraph use OpenAI-shaped envs and won't honour
-  # ANTHROPIC_API_KEY without further wiring (out of scope for this
-  # branch; if you need a hermes/Anthropic path, dispatch with
-  # E2E_RUNTIME=hermes + E2E_OPENAI_API_KEY pointing at a working key).
+  # ANTHROPIC_API_KEY without further wiring. pick_model_slug maps this
+  # branch to claude-sonnet-4-6 so the claude-code provider registry
+  # selects anthropic-api instead of the OAuth-only sonnet alias.
   SECRETS_JSON=$(python3 -c "
 import json, os
 k = os.environ['E2E_ANTHROPIC_API_KEY']
@@ -429,6 +440,7 @@ print(json.dumps({
 fi
 
 MODEL_SLUG=$(pick_model_slug "$RUNTIME")
+log "    MODEL_SLUG=$MODEL_SLUG"
 
 log "5/11 Provisioning parent workspace (runtime=$RUNTIME)..."
 PARENT_RESP=$(tenant_call POST /workspaces \
@@ -456,7 +468,7 @@ fi
 # deadline fires at 5 min and sets status=failed prematurely; heartbeat
 # then transitions failed → online after install.sh finishes. So:
 #
-#   - 20 min deadline (hermes worst-case + slack)
+#   - 30 min deadline (hermes worst-case + slack)
 #   - 'failed' is a TRANSIENT state we must tolerate — log and keep
 #     polling, only hard-fail at the deadline. Pre-bootstrap-watcher-fix
 #     (controlplane#245) this was a flake generator: workspace went
@@ -467,21 +479,37 @@ WS_TO_CHECK="$PARENT_ID"
 [ -n "$CHILD_ID" ] && WS_TO_CHECK="$WS_TO_CHECK $CHILD_ID"
 for wid in $WS_TO_CHECK; do
   WS_LAST_STATUS=""
+  WS_LAST_URL=""
+  WS_URL_MISSING_LOGGED=0
   WS_FAILED_LOGGED=0
   while true; do
     if [ "$(date +%s)" -gt "$WS_DEADLINE" ]; then
       WS_LAST_ERR=$(tenant_call GET "/workspaces/$wid" 2>/dev/null | \
         python3 -c "import json,sys; print(json.load(sys.stdin).get('last_sample_error',''))" 2>/dev/null || echo "")
-      fail "Workspace $wid never reached online within 20 min (last status=$WS_LAST_STATUS, err=$WS_LAST_ERR)"
+      fail "Workspace $wid never reached online with a routable URL within 30 min (last status=$WS_LAST_STATUS, url=$WS_LAST_URL, err=$WS_LAST_ERR)"
     fi
     WS_JSON=$(tenant_call GET "/workspaces/$wid" 2>/dev/null || echo '{}')
-    WS_STATUS=$(echo "$WS_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))" 2>/dev/null)
+    WS_STATUS=$(echo "$WS_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status') or '')" 2>/dev/null)
+    WS_URL=$(echo "$WS_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('url') or '')" 2>/dev/null)
     if [ "$WS_STATUS" != "$WS_LAST_STATUS" ]; then
       log "    $wid → $WS_STATUS"
       WS_LAST_STATUS="$WS_STATUS"
     fi
+    if [ -n "$WS_URL" ] && [ "$WS_URL" != "$WS_LAST_URL" ]; then
+      log "    $wid url ready: $WS_URL"
+      WS_LAST_URL="$WS_URL"
+    fi
     case "$WS_STATUS" in
-      online) break ;;
+      online)
+        if [ -n "$WS_URL" ]; then
+          break
+        fi
+        if [ "$WS_URL_MISSING_LOGGED" = "0" ]; then
+          log "    $wid online but URL is not assigned yet — waiting for workspace routing readiness"
+          WS_URL_MISSING_LOGGED=1
+        fi
+        sleep 10
+        ;;
       failed)
         # Not a hard fail — bootstrap-watcher frequently marks failed at
         # 5 min on hermes, then heartbeat recovers to online around 10-13
@@ -496,7 +524,7 @@ for wid in $WS_TO_CHECK; do
       *)      sleep 10 ;;
     esac
   done
-  ok "    $wid online"
+  ok "    $wid online and routable"
 done
 
 # ─── 7b. Canvas-terminal diagnose (EIC chain probe) ────────────────────
@@ -631,10 +659,40 @@ print(json.dumps({
 # 90s gives ~3x headroom over observed cold-call P95 (~25-30s).
 # Subsequent A2A turns hit the same workspace and are sub-second, so
 # this only widens the window for step 8/11 of the canary's first turn.
-A2A_RESP=$(tenant_call POST "/workspaces/$PARENT_ID/a2a" \
-  --max-time 90 \
-  -H "Content-Type: application/json" \
-  -d "$A2A_PAYLOAD")
+A2A_TMP=$(mktemp -t synth_a2a.XXXXXX)
+for A2A_ATTEMPT in $(seq 1 12); do
+  : >"$A2A_TMP"
+  set +e
+  A2A_CODE=$(tenant_call POST "/workspaces/$PARENT_ID/a2a" \
+    --max-time 90 \
+    -H "Content-Type: application/json" \
+    -d "$A2A_PAYLOAD" \
+    -o "$A2A_TMP" \
+    -w '%{http_code}' \
+    2>/dev/null)
+  A2A_RC=$?
+  set -e
+  A2A_CODE=${A2A_CODE:-000}
+  A2A_RESP=$(cat "$A2A_TMP" 2>/dev/null || echo "")
+  if [ "$A2A_RC" = "0" ] && [ "$A2A_CODE" -ge 200 ] && [ "$A2A_CODE" -lt 300 ]; then
+    break
+  fi
+
+  A2A_SAFE_BODY=$(printf '%s' "$A2A_RESP" | sanitize_http_body)
+  if [ "$A2A_CODE" = "503" ] && echo "$A2A_SAFE_BODY" | grep -Eqi 'Service Unavailable|workspace agent unreachable|connection refused|no healthy upstream'; then
+    log "    A2A cold-start probe attempt $A2A_ATTEMPT/12 returned 503: $A2A_SAFE_BODY"
+    if [ "$A2A_ATTEMPT" -lt 12 ]; then
+      sleep 10
+      continue
+    fi
+  fi
+  break
+done
+rm -f "$A2A_TMP"
+if [ "$A2A_RC" != "0" ] || [ "$A2A_CODE" -lt 200 ] || [ "$A2A_CODE" -ge 300 ]; then
+  A2A_SAFE_BODY=$(printf '%s' "$A2A_RESP" | sanitize_http_body)
+  fail "A2A POST /workspaces/$PARENT_ID/a2a failed after $A2A_ATTEMPT attempt(s) (curl_rc=$A2A_RC, http=$A2A_CODE): $A2A_SAFE_BODY"
+fi
 AGENT_TEXT=$(echo "$A2A_RESP" | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
