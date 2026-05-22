@@ -168,7 +168,7 @@ func T4PrivilegeContract() []T4Capability {
 		{
 			Name:        "pid_host_visible",
 			Description: "Host PID namespace is shared (--pid=host). The container can see host process 1 (systemd or pid-1 on the EC2 instance). Required for nsenter into host mount/pid namespaces.",
-			Probe:       `[ -d /proc/1/root ] && [ "$(sudo -n nsenter --target 1 --mount --pid -- id -u)" = "0" ]`,
+			Probe:       `[ "$(sudo -n nsenter --target 1 --mount --pid -- id -u)" = "0" ]`,
 			Severity:    SeverityHard,
 			Source:      "provisioner.go applyHostConfig T4 branch (case 4): hostCfg.PidMode = 'host'",
 		},
