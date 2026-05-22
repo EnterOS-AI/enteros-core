@@ -81,6 +81,11 @@ jobs:
       # (dead in org secret store) to CP_STAGING_ADMIN_API_TOKEN per
       # internal#322 — see this PR for the cross-workflow sweep.
       MOLECULE_ADMIN_TOKEN: ${{ secrets.CP_STAGING_ADMIN_API_TOKEN }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: us-east-2
+      E2E_AWS_LEAK_CHECK: required
+      E2E_AWS_TERMINATE_LEAKS: '1'
       # MiniMax is the smoke's PRIMARY LLM auth path post-2026-05-04.
       # Switched from hermes+OpenAI after #2578 (the staging OpenAI key
       # account went over quota and stayed dead for 36+ hours, taking
@@ -129,6 +134,12 @@ jobs:
             echo "::error::CP_STAGING_ADMIN_API_TOKEN not set"
             exit 2
           fi
+          for var in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; do
+            if [ -z "${!var:-}" ]; then
+              echo "::error::$var not set — EC2 leak verification cannot run"
+              exit 2
+            fi
+          done
 
       - name: Verify LLM key present
         run: |

@@ -145,6 +145,11 @@ jobs:
       E2E_KEEP_ORG: ${{ github.event.inputs.keep_org == 'true' && '1' || '' }}
       MOLECULE_CP_URL: ${{ vars.STAGING_CP_URL || 'https://staging-api.moleculesai.app' }}
       MOLECULE_ADMIN_TOKEN: ${{ secrets.CP_STAGING_ADMIN_API_TOKEN }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: us-east-2
+      E2E_AWS_LEAK_CHECK: required
+      E2E_AWS_TERMINATE_LEAKS: '1'
       # MiniMax key is the canary's PRIMARY auth path. claude-code
       # template's `minimax` provider routes ANTHROPIC_BASE_URL to
       # api.minimax.io/anthropic and reads MINIMAX_API_KEY at boot.
@@ -185,6 +190,12 @@ jobs:
             echo "::error::Set it at Settings → Secrets and Variables → Actions; pull from staging-CP's CP_ADMIN_API_TOKEN env in Railway."
             exit 1
           fi
+          for var in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; do
+            if [ -z "${!var:-}" ]; then
+              echo "::error::$var secret missing — EC2 leak verification cannot run"
+              exit 1
+            fi
+          done
 
           # LLM-key requirement is per-runtime: claude-code accepts
           # EITHER MiniMax OR direct-Anthropic (whichever is set first),

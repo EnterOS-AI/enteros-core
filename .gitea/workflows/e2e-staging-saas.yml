@@ -49,6 +49,8 @@ on:
       - 'workspace-server/internal/middleware/**'
       - 'workspace-server/internal/provisioner/**'
       - 'tests/e2e/test_staging_full_saas.sh'
+      - 'tests/e2e/lib/aws_leak_check.sh'
+      - 'tests/e2e/test_aws_leak_check.sh'
       - '.gitea/workflows/e2e-staging-saas.yml'
   pull_request:
     branches: [main]
@@ -59,6 +61,8 @@ on:
       - 'workspace-server/internal/middleware/**'
       - 'workspace-server/internal/provisioner/**'
       - 'tests/e2e/test_staging_full_saas.sh'
+      - 'tests/e2e/lib/aws_leak_check.sh'
+      - 'tests/e2e/test_aws_leak_check.sh'
       - '.gitea/workflows/e2e-staging-saas.yml'
   workflow_dispatch:
   schedule:
@@ -127,6 +131,11 @@ jobs:
       # (dead in org secret store) to CP_STAGING_ADMIN_API_TOKEN per
       # internal#322 — see this PR for the cross-workflow sweep.
       MOLECULE_ADMIN_TOKEN: ${{ secrets.CP_STAGING_ADMIN_API_TOKEN }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: us-east-2
+      E2E_AWS_LEAK_CHECK: required
+      E2E_AWS_TERMINATE_LEAKS: '1'
       # MiniMax is the PRIMARY LLM auth path post-2026-05-04. Switched
       # from hermes+OpenAI default after #2578 (the staging OpenAI key
       # account went over quota and stayed dead for 36+ hours, taking
@@ -165,6 +174,12 @@ jobs:
             echo "::error::CP_STAGING_ADMIN_API_TOKEN secret not set (Railway staging CP_ADMIN_API_TOKEN)"
             exit 2
           fi
+          for var in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; do
+            if [ -z "${!var:-}" ]; then
+              echo "::error::$var not set — EC2 leak verification cannot run"
+              exit 2
+            fi
+          done
           echo "Admin token present ✓"
 
       - name: Verify LLM key present
