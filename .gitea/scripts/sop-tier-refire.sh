@@ -104,10 +104,13 @@ if [ "${SOP_REFIRE_DISABLE_RATE_LIMIT:-}" != "1" ]; then
   fi
 fi
 
-# 3. Invoke sop-tier-check.sh with the env it expects. Capture exit code.
-# The canonical script reads tier label, walks approving reviewers, and
-# evaluates the AND-composition expression — we want the SAME gate, not
-# a different gate.
+# 3. Invoke sop-tier-check.sh with the env it expects.
+# The canonical workflow intentionally fail-opens the job conclusion
+# (`bash .gitea/scripts/sop-tier-check.sh || true`) while Gitea branch
+# protection enforces reviewer approvals separately. Keep the refire path
+# aligned with that workflow status behavior; otherwise /refire-tier-check can
+# post a hard failure that the canonical pull_request_target workflow would
+# not publish.
 #
 # SOP_REFIRE_TIER_CHECK_SCRIPT env var lets tests substitute a mock —
 # sop-tier-check.sh uses bash 4+ associative arrays which trigger a known
@@ -123,7 +126,6 @@ fi
 
 # Re-invoke. Pipe stdout/stderr through so the runner log shows the
 # tier-check decision inline.
-set +e
 GITEA_TOKEN="$GITEA_TOKEN" \
   GITEA_HOST="$GITEA_HOST" \
   REPO="$REPO" \
@@ -131,9 +133,8 @@ GITEA_TOKEN="$GITEA_TOKEN" \
   PR_AUTHOR="$PR_AUTHOR" \
   SOP_DEBUG="${SOP_DEBUG:-0}" \
   SOP_LEGACY_CHECK="${SOP_LEGACY_CHECK:-0}" \
-  bash "$SCRIPT"
-TIER_EXIT=$?
-set -e
+  bash "$SCRIPT" || true
+TIER_EXIT=0
 debug "sop-tier-check.sh exit=$TIER_EXIT"
 
 # 4. POST the resulting status.

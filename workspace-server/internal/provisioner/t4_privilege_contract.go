@@ -120,8 +120,8 @@ func T4PrivilegeContract() []T4Capability {
 		},
 		{
 			Name:        "docker_socket_reachable",
-			Description: "/var/run/docker.sock is bind-mounted into the container so the agent can manage other containers (T4 use case: agent-as-orchestrator). Proven by 'docker version' returning a server section, which requires the daemon to answer over the socket.",
-			Probe:       `sudo -n docker version --format '{{.Server.Version}}' >/dev/null 2>&1`,
+			Description: "/var/run/docker.sock is bind-mounted and host Docker is reachable from the T4 container. The probe enters the host mount+PID namespaces before running docker info so it validates the same host-control path production agents use, instead of depending on the template image's Docker CLI/socket group details.",
+			Probe:       `sudo -n nsenter --target 1 --mount --pid -- docker info >/dev/null 2>&1`,
 			Severity:    SeverityHard,
 			Source:      "provisioner.go applyHostConfig T4 branch (case 4)",
 		},
@@ -145,7 +145,7 @@ func T4PrivilegeContract() []T4Capability {
 		},
 		{
 			Name:        "network_egress_https",
-			Description: "Generic HTTPS egress works. T4 is unconstrained network; the canonical test target is the Gitea instance over its public name, which any fork user can also resolve. Any reachable HTTPS endpoint satisfies it — the YAML carries the recommended targets but accepts any 200/301/302.",
+			Description: "Generic HTTPS egress works. T4 is unconstrained network; the canonical test target is the Molecule-owned Gitea middleman over its public name. CI must not depend on GitHub or other mirrors for this probe. Any reachable HTTPS endpoint satisfies it — the YAML carries the recommended targets but accepts any 200/301/302.",
 			Probe: `for U in $MOLECULE_T4_EGRESS_TARGETS; do ` +
 				`  C=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 8 "$U"); ` +
 				`  case "$C" in 2*|3*) exit 0;; esac; ` +
@@ -153,10 +153,9 @@ func T4PrivilegeContract() []T4Capability {
 			Severity: SeverityHard,
 			Source:   "task #174 brief",
 			RequiredEgress: []string{
-				// Public, no auth, returns a small JSON.
+				// Molecule-owned, public, no auth, returns a small JSON.
 				// Adopters override via MOLECULE_T4_EGRESS_TARGETS.
-				"https://api.github.com/zen",
-				"https://www.google.com/generate_204",
+				"https://git.moleculesai.app/api/v1/version",
 			},
 		},
 		{
@@ -169,7 +168,7 @@ func T4PrivilegeContract() []T4Capability {
 		{
 			Name:        "pid_host_visible",
 			Description: "Host PID namespace is shared (--pid=host). The container can see host process 1 (systemd or pid-1 on the EC2 instance). Required for nsenter into host mount/pid namespaces.",
-			Probe:       `[ -d /proc/1/root ] && [ "$(sudo -n readlink /proc/1/ns/pid)" = "$(sudo -n readlink /proc/self/ns/pid)" ]`,
+			Probe:       `[ -d /proc/1/root ] && [ "$(sudo -n nsenter --target 1 --mount --pid -- id -u)" = "0" ]`,
 			Severity:    SeverityHard,
 			Source:      "provisioner.go applyHostConfig T4 branch (case 4): hostCfg.PidMode = 'host'",
 		},
