@@ -16,7 +16,7 @@ set -uo pipefail
 # Resolve to the lib relative to this test file so the test runs from
 # any cwd (CI, local invocation, repo root).
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=lib/model_slug.sh
+# shellcheck source=tests/e2e/lib/model_slug.sh
 source "$SCRIPT_DIR/lib/model_slug.sh"
 
 PASS=0
@@ -48,7 +48,16 @@ echo
 # ── Per-runtime branches (the load-bearing ones for synth-E2E) ──
 run_test "hermes → slash-form (derive-provider.sh contract)"       hermes      "openai/gpt-4o"
 run_test "langgraph → colon-form (init_chat_model contract)"       langgraph   "openai:gpt-4o"
-run_test "claude-code → bare model name (entry-id form)"           claude-code "sonnet"
+run_test "claude-code → OAuth/default alias"                      claude-code "sonnet"
+
+got=$(unset E2E_MODEL_SLUG E2E_ANTHROPIC_API_KEY; E2E_MINIMAX_API_KEY="mx-test" pick_model_slug claude-code)
+assert_eq "claude-code + MiniMax key → MiniMax model"             "$got" "MiniMax-M2"
+
+got=$(unset E2E_MODEL_SLUG E2E_MINIMAX_API_KEY; E2E_ANTHROPIC_API_KEY="sk-ant-test" pick_model_slug claude-code)
+assert_eq "claude-code + Anthropic API key → Anthropic API model" "$got" "claude-sonnet-4-6"
+
+got=$(unset E2E_MODEL_SLUG; E2E_MINIMAX_API_KEY="mx-priority" E2E_ANTHROPIC_API_KEY="sk-ant-loser" pick_model_slug claude-code)
+assert_eq "claude-code + both keys → MiniMax priority"            "$got" "MiniMax-M2"
 
 # ── Fallback for unknown runtime ──
 # Picks slash-form (hermes-shaped) since hermes is the historical
