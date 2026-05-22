@@ -161,7 +161,7 @@ jobs:
       # and defeats the cost saving. Operators can override via the
       # workflow_dispatch flow (no input wired here yet — runtime
       # override is enough for ad-hoc).
-      E2E_MODEL_SLUG: ${{ github.event.inputs.runtime == 'hermes' && 'openai/gpt-4o' || github.event.inputs.runtime == 'langgraph' && 'openai:gpt-4o' || 'MiniMax-M2.7-highspeed' }}
+      E2E_MODEL_SLUG: ${{ github.event.inputs.runtime == 'hermes' && 'openai/gpt-4o' || github.event.inputs.runtime == 'langgraph' && 'openai:gpt-4o' || 'MiniMax-M2' }}
       E2E_RUN_ID: "${{ github.run_id }}-${{ github.run_attempt }}"
       E2E_KEEP_ORG: ${{ github.event.inputs.keep_org && '1' || '0' }}
 
