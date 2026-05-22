@@ -3,11 +3,26 @@ name: Lint shellcheck (arm64 pilot)
 # Mac-CI dual-track pilot (#233). ADDITIVE / NOT REQUIRED.
 #
 # Validates the arm64 self-hosted lane (no docker.sock, no privileged
-# ops) before any required gate moves onto it. Until a Mac arm64 runner
-# is registered with the `arm64` label, this workflow sits PENDING —
-# that is FINE: `arm64` is NOT in branch_protections required contexts.
+# ops) before any required gate moves onto it.
 #
-# Pairs with internal#543 (RFC: Mac arm64 multi-arch runner-base).
+# Runner label mapping (2026-05-22 fix): the actual Mac mini runner
+# registered in this Gitea ships labels
+#   ["self-hosted","macos-self-hosted-arm64","arm64-darwin"]
+# — no plain `arm64`. The earlier `runs-on: [self-hosted, arm64]`
+# could not match any registered runner so every fire of this workflow
+# was assigned task_id=0 / runner_id=NULL → Gitea cancelled it. The
+# rows showed up as Cancelled in the action status feed (not Failed)
+# but the lane never actually ran. Workflow now selects on
+# `arm64-darwin` which is the canonical Mac-arm64 label per the
+# Mac mini's registration (per internal#494 capability-honest labels).
+#
+# If we later want to add a Linux-arm64 runner to the same lane, add
+# both labels to that runner's registration AND broaden the selector
+# here — don't rename `arm64-darwin` (it's Mac-specific by design and
+# `feedback_pc2_runner_labels_must_stay_narrow` rule applies).
+#
+# Pairs with internal#543 (RFC: Mac arm64 multi-arch runner-base) and
+# internal#494 (multi-arch runner-base capability-honest labels).
 # No paths: filter on purpose (feedback_path_filtered_workflow_cant_be_required).
 
 on:
@@ -25,7 +40,7 @@ permissions:
 jobs:
   shellcheck-arm64:
     name: shellcheck-arm64 (pilot)
-    runs-on: [self-hosted, arm64]
+    runs-on: [self-hosted, arm64-darwin]
     # NOT a required check; safe to sit pending until Mac runner is up.
     # If the Mac runner has trouble pulling actions/checkout we fall
     # back to a plain git clone (see step 'fallback clone').
