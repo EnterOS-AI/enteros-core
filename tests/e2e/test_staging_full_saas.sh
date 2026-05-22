@@ -361,6 +361,64 @@ print(s[:4000])
 '
 }
 
+wait_workspaces_online_routable() {
+  local label="$1"; shift
+  local deadline=$(( $(date +%s) + 1800 ))
+  local wid ws_last_status ws_last_url ws_url_missing_logged ws_failed_logged
+  local ws_json ws_status ws_url ws_last_err
+
+  log "$label"
+  for wid in "$@"; do
+    ws_last_status=""
+    ws_last_url=""
+    ws_url_missing_logged=0
+    ws_failed_logged=0
+    while true; do
+      if [ "$(date +%s)" -gt "$deadline" ]; then
+        ws_last_err=$(tenant_call GET "/workspaces/$wid" 2>/dev/null | \
+          python3 -c "import json,sys; print(json.load(sys.stdin).get('last_sample_error',''))" 2>/dev/null || echo "")
+        fail "Workspace $wid never reached online with a routable URL within 30 min (last status=$ws_last_status, url=$ws_last_url, err=$ws_last_err)"
+      fi
+      ws_json=$(tenant_call GET "/workspaces/$wid" 2>/dev/null || echo '{}')
+      ws_status=$(echo "$ws_json" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status') or '')" 2>/dev/null)
+      ws_url=$(echo "$ws_json" | python3 -c "import json,sys; print(json.load(sys.stdin).get('url') or '')" 2>/dev/null)
+      if [ "$ws_status" != "$ws_last_status" ]; then
+        log "    $wid → $ws_status"
+        ws_last_status="$ws_status"
+      fi
+      if [ -n "$ws_url" ] && [ "$ws_url" != "$ws_last_url" ]; then
+        log "    $wid url ready: $ws_url"
+        ws_last_url="$ws_url"
+      fi
+      case "$ws_status" in
+        online)
+          if [ -n "$ws_url" ]; then
+            break
+          fi
+          if [ "$ws_url_missing_logged" = "0" ]; then
+            log "    $wid online but URL is not assigned yet — waiting for workspace routing readiness"
+            ws_url_missing_logged=1
+          fi
+          sleep 10
+          ;;
+        failed)
+          # Not a hard fail — bootstrap-watcher frequently marks failed at
+          # 5 min on hermes, then heartbeat recovers to online around 10-13
+          # min when install.sh finishes. Log once per workspace so the CI
+          # output isn't spammy.
+          if [ "$ws_failed_logged" = "0" ]; then
+            log "    $wid transiently failed — waiting for heartbeat recovery (bootstrap-watcher deadline, see cp#245)"
+            ws_failed_logged=1
+          fi
+          sleep 10
+          ;;
+        *)      sleep 10 ;;
+      esac
+    done
+    ok "    $wid online and routable"
+  done
+}
+
 # ─── 5. Provision parent workspace ─────────────────────────────────────
 # Inject the LLM provider key so the runtime can authenticate at boot.
 # Branch by which secret is set so the script supports multiple paths
@@ -473,59 +531,9 @@ fi
 #     polling, only hard-fail at the deadline. Pre-bootstrap-watcher-fix
 #     (controlplane#245) this was a flake generator: workspace went
 #     failed→online inside our window but we bailed at the failed read.
-log "7/11 Waiting for workspace(s) to reach status=online (up to 30 min — hermes cold boot)..."
-WS_DEADLINE=$(( $(date +%s) + 1800 ))
-WS_TO_CHECK="$PARENT_ID"
-[ -n "$CHILD_ID" ] && WS_TO_CHECK="$WS_TO_CHECK $CHILD_ID"
-for wid in $WS_TO_CHECK; do
-  WS_LAST_STATUS=""
-  WS_LAST_URL=""
-  WS_URL_MISSING_LOGGED=0
-  WS_FAILED_LOGGED=0
-  while true; do
-    if [ "$(date +%s)" -gt "$WS_DEADLINE" ]; then
-      WS_LAST_ERR=$(tenant_call GET "/workspaces/$wid" 2>/dev/null | \
-        python3 -c "import json,sys; print(json.load(sys.stdin).get('last_sample_error',''))" 2>/dev/null || echo "")
-      fail "Workspace $wid never reached online with a routable URL within 30 min (last status=$WS_LAST_STATUS, url=$WS_LAST_URL, err=$WS_LAST_ERR)"
-    fi
-    WS_JSON=$(tenant_call GET "/workspaces/$wid" 2>/dev/null || echo '{}')
-    WS_STATUS=$(echo "$WS_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status') or '')" 2>/dev/null)
-    WS_URL=$(echo "$WS_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('url') or '')" 2>/dev/null)
-    if [ "$WS_STATUS" != "$WS_LAST_STATUS" ]; then
-      log "    $wid → $WS_STATUS"
-      WS_LAST_STATUS="$WS_STATUS"
-    fi
-    if [ -n "$WS_URL" ] && [ "$WS_URL" != "$WS_LAST_URL" ]; then
-      log "    $wid url ready: $WS_URL"
-      WS_LAST_URL="$WS_URL"
-    fi
-    case "$WS_STATUS" in
-      online)
-        if [ -n "$WS_URL" ]; then
-          break
-        fi
-        if [ "$WS_URL_MISSING_LOGGED" = "0" ]; then
-          log "    $wid online but URL is not assigned yet — waiting for workspace routing readiness"
-          WS_URL_MISSING_LOGGED=1
-        fi
-        sleep 10
-        ;;
-      failed)
-        # Not a hard fail — bootstrap-watcher frequently marks failed at
-        # 5 min on hermes, then heartbeat recovers to online around 10-13
-        # min when install.sh finishes. Log once per workspace so the CI
-        # output isn't spammy.
-        if [ "$WS_FAILED_LOGGED" = "0" ]; then
-          log "    $wid transiently failed — waiting for heartbeat recovery (bootstrap-watcher deadline, see cp#245)"
-          WS_FAILED_LOGGED=1
-        fi
-        sleep 10
-        ;;
-      *)      sleep 10 ;;
-    esac
-  done
-  ok "    $wid online and routable"
-done
+WS_TO_CHECK=("$PARENT_ID")
+[ -n "$CHILD_ID" ] && WS_TO_CHECK+=("$CHILD_ID")
+wait_workspaces_online_routable "7/11 Waiting for workspace(s) to reach status=online (up to 30 min — hermes cold boot)..." "${WS_TO_CHECK[@]}"
 
 # ─── 7b. Canvas-terminal diagnose (EIC chain probe) ────────────────────
 # This step exists because the canvas-terminal failure of 2026-05-03
@@ -551,7 +559,7 @@ done
 # probes docker.Ping + container exec; we still expect ok=true there
 # since local-docker is the alternative production path.
 log "7b/11 Canvas-terminal EIC diagnose probe..."
-for wid in $WS_TO_CHECK; do
+for wid in "${WS_TO_CHECK[@]}"; do
   DIAG_JSON=$(tenant_call GET "/workspaces/$wid/terminal/diagnose" 2>/dev/null || echo '{}')
   DIAG_OK=$(echo "$DIAG_JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); print('true' if d.get('ok') else 'false')" 2>/dev/null || echo "false")
   if [ "$DIAG_OK" = "true" ]; then
@@ -587,7 +595,7 @@ CONFIG_PAYLOAD="${CONFIG_MARKER}
 name: synth-canary
 runtime: ${RUNTIME}
 "
-for wid in $WS_TO_CHECK; do
+for wid in "${WS_TO_CHECK[@]}"; do
   PUT_BODY=$(python3 -c "import json,sys; print(json.dumps({'content': sys.stdin.read()}))" <<< "$CONFIG_PAYLOAD")
   # Capture body to a tempfile so curl's -w '%{http_code}' is the only
   # thing on stdout. The first version used `-w '\n%{http_code}\n'` and
@@ -619,6 +627,12 @@ for wid in $WS_TO_CHECK; do
   # paths are unified, restore the GET-back marker check here.
   ok "    $wid config.yaml PUT OK (HTTP $PUT_CODE)"
 done
+
+# Saving config.yaml follows the same path as Canvas Config Save & Restart.
+# The controlplane can briefly put the workspace back into provisioning and
+# clear its route while the runtime restarts, so A2A must wait on the same
+# externally routable readiness boundary again.
+wait_workspaces_online_routable "7d/11 Waiting for workspace(s) to recover routing after config.yaml PUT..." "${WS_TO_CHECK[@]}"
 
 # ─── 8. A2A round-trip on parent ───────────────────────────────────────
 log "8/11 Sending A2A message to parent — expecting agent response..."
