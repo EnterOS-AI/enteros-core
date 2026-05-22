@@ -893,20 +893,50 @@ print(json.dumps({
     }
 }))
 ")
-  set +e
-  # Raw curl (not tenant_call) because this call carries an extra
-  # X-Source-Workspace-Id header. Must still send X-Molecule-Org-Id
-  # or TenantGuard 404s — previously missing, caused section 10 to
-  # fail rc=22 despite everything upstream being correct (2026-04-21).
-  DELEG_RESP=$(curl "${CURL_COMMON[@]}" -X POST "$TENANT_URL/workspaces/$CHILD_ID/a2a" \
-    -H "Authorization: Bearer $EFFECTIVE_TENANT_TOKEN" \
-    -H "X-Molecule-Org-Id: $ORG_ID" \
-    -H "X-Source-Workspace-Id: $PARENT_ID" \
-    -H "Content-Type: application/json" \
-    -d "$DELEG_PAYLOAD")
-  DELEG_RC=$?
-  set -e
-  [ $DELEG_RC -ne 0 ] && fail "Delegation A2A POST failed (rc=$DELEG_RC)"
+  DELEG_TMP=$(mktemp -t deleg_a2a.XXXXXX)
+  for DELEG_ATTEMPT in $(seq 1 12); do
+    : >"$DELEG_TMP"
+    set +e
+    # Raw curl (not tenant_call) because this call carries an extra
+    # X-Source-Workspace-Id header. Must still send X-Molecule-Org-Id
+    # or TenantGuard 404s — previously missing, caused section 10 to
+    # fail rc=22 despite everything upstream being correct (2026-04-21).
+    DELEG_CODE=$(curl "${CURL_COMMON[@]}" -X POST "$TENANT_URL/workspaces/$CHILD_ID/a2a" \
+      -H "Authorization: Bearer $EFFECTIVE_TENANT_TOKEN" \
+      -H "X-Molecule-Org-Id: $ORG_ID" \
+      -H "X-Source-Workspace-Id: $PARENT_ID" \
+      -H "Content-Type: application/json" \
+      -d "$DELEG_PAYLOAD" \
+      -o "$DELEG_TMP" \
+      -w '%{http_code}' \
+      2>/dev/null)
+    DELEG_RC=$?
+    set -e
+    DELEG_CODE=${DELEG_CODE:-000}
+    DELEG_RESP=$(cat "$DELEG_TMP" 2>/dev/null || echo "")
+    if [ "$DELEG_RC" = "0" ] && [ "$DELEG_CODE" -ge 200 ] && [ "$DELEG_CODE" -lt 300 ]; then
+      break
+    fi
+
+    DELEG_SAFE_BODY=$(printf '%s' "$DELEG_RESP" | sanitize_http_body)
+    if echo "$DELEG_CODE" | grep -Eq '^(502|503|504)$' && echo "$DELEG_SAFE_BODY" | grep -Eqi 'Service Unavailable|Bad Gateway|Gateway Timeout|error code: 502|error code: 504|workspace agent unreachable|connection refused|no healthy upstream|workspace agent busy|native_session'; then
+      log "    Delegation A2A cold-start attempt $DELEG_ATTEMPT/12 returned $DELEG_CODE: $DELEG_SAFE_BODY"
+      if [ "$DELEG_ATTEMPT" -lt 12 ]; then
+        DELEG_SLEEP=10
+        if echo "$DELEG_SAFE_BODY" | grep -Eqi 'workspace agent busy|native_session'; then
+          DELEG_SLEEP=30
+        fi
+        sleep "$DELEG_SLEEP"
+        continue
+      fi
+    fi
+    break
+  done
+  rm -f "$DELEG_TMP"
+  if [ "$DELEG_RC" != "0" ] || [ "$DELEG_CODE" -lt 200 ] || [ "$DELEG_CODE" -ge 300 ]; then
+    DELEG_SAFE_BODY=$(printf '%s' "$DELEG_RESP" | sanitize_http_body)
+    fail "Delegation A2A POST failed after $DELEG_ATTEMPT attempt(s) (curl_rc=$DELEG_RC, http=$DELEG_CODE): $DELEG_SAFE_BODY"
+  fi
   DELEG_TEXT=$(echo "$DELEG_RESP" | python3 -c "
 import json, sys
 try:
