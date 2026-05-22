@@ -679,10 +679,14 @@ for A2A_ATTEMPT in $(seq 1 12); do
   fi
 
   A2A_SAFE_BODY=$(printf '%s' "$A2A_RESP" | sanitize_http_body)
-  if [ "$A2A_CODE" = "503" ] && echo "$A2A_SAFE_BODY" | grep -Eqi 'Service Unavailable|workspace agent unreachable|connection refused|no healthy upstream'; then
-    log "    A2A cold-start probe attempt $A2A_ATTEMPT/12 returned 503: $A2A_SAFE_BODY"
+  if echo "$A2A_CODE" | grep -Eq '^(502|503|504)$' && echo "$A2A_SAFE_BODY" | grep -Eqi 'Service Unavailable|Bad Gateway|Gateway Timeout|error code: 502|error code: 504|workspace agent unreachable|connection refused|no healthy upstream|workspace agent busy|native_session'; then
+    log "    A2A cold-start probe attempt $A2A_ATTEMPT/12 returned $A2A_CODE: $A2A_SAFE_BODY"
     if [ "$A2A_ATTEMPT" -lt 12 ]; then
-      sleep 10
+      A2A_SLEEP=10
+      if echo "$A2A_SAFE_BODY" | grep -Eqi 'workspace agent busy|native_session'; then
+        A2A_SLEEP=30
+      fi
+      sleep "$A2A_SLEEP"
       continue
     fi
   fi
