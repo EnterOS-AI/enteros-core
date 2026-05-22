@@ -21,10 +21,10 @@ capabilities:
     source: "RFC internal#456 §10; memory feedback_hermes_listpeers_401_token_root600_unreadable_by_uid1000"
     probe: "[ -e /configs/.auth_token ] && [ \"$(stat -c '%u' /configs/.auth_token)\" = \"1000\" ]"
   - name: "docker_socket_reachable"
-    description: "/var/run/docker.sock is bind-mounted into the container so the agent can manage other containers (T4 use case: agent-as-orchestrator). Proven by 'docker version' returning a server section, which requires the daemon to answer over the socket."
+    description: "/var/run/docker.sock is bind-mounted and host Docker is reachable from the T4 container. The probe enters the host mount+PID namespaces before running docker info so it validates the same host-control path production agents use, instead of depending on the template image's Docker CLI/socket group details."
     severity: hard
     source: "provisioner.go applyHostConfig T4 branch (case 4)"
-    probe: "sudo -n docker info >/dev/null 2>&1"
+    probe: "sudo -n nsenter --target 1 --mount --pid -- docker info >/dev/null 2>&1"
   - name: "host_fs_write_readback"
     description: "Host filesystem is mounted at /host and the agent can write+read+remove a file there via sudo. Proves real host reach (not just a PID-1 namespace trick on an isolated init)."
     severity: hard
@@ -51,7 +51,7 @@ capabilities:
     description: "Host PID namespace is shared (--pid=host). The container can see host process 1 (systemd or pid-1 on the EC2 instance). Required for nsenter into host mount/pid namespaces."
     severity: hard
     source: "provisioner.go applyHostConfig T4 branch (case 4): hostCfg.PidMode = 'host'"
-    probe: "[ -d /proc/1/root ] && sudo -n nsenter --target 1 --pid -- true"
+    probe: "[ -d /proc/1/root ] && [ \"$(sudo -n nsenter --target 1 --mount --pid -- id -u)\" = \"0\" ]"
   - name: "privileged_flag_observable"
     description: "Container is started with --privileged. Observable from inside via /proc/self/status CapEff containing CAP_SYS_ADMIN. Defense-in-depth for the provisioner emission side."
     severity: advisory

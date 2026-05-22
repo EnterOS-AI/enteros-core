@@ -120,8 +120,8 @@ func T4PrivilegeContract() []T4Capability {
 		},
 		{
 			Name:        "docker_socket_reachable",
-			Description: "/var/run/docker.sock is bind-mounted into the container so the agent can manage other containers (T4 use case: agent-as-orchestrator). Proven by 'docker version' returning a server section, which requires the daemon to answer over the socket.",
-			Probe:       `sudo -n docker info >/dev/null 2>&1`,
+			Description: "/var/run/docker.sock is bind-mounted and host Docker is reachable from the T4 container. The probe enters the host mount+PID namespaces before running docker info so it validates the same host-control path production agents use, instead of depending on the template image's Docker CLI/socket group details.",
+			Probe:       `sudo -n nsenter --target 1 --mount --pid -- docker info >/dev/null 2>&1`,
 			Severity:    SeverityHard,
 			Source:      "provisioner.go applyHostConfig T4 branch (case 4)",
 		},
@@ -168,7 +168,7 @@ func T4PrivilegeContract() []T4Capability {
 		{
 			Name:        "pid_host_visible",
 			Description: "Host PID namespace is shared (--pid=host). The container can see host process 1 (systemd or pid-1 on the EC2 instance). Required for nsenter into host mount/pid namespaces.",
-			Probe:       `[ -d /proc/1/root ] && sudo -n nsenter --target 1 --pid -- true`,
+			Probe:       `[ -d /proc/1/root ] && [ "$(sudo -n nsenter --target 1 --mount --pid -- id -u)" = "0" ]`,
 			Severity:    SeverityHard,
 			Source:      "provisioner.go applyHostConfig T4 branch (case 4): hostCfg.PidMode = 'host'",
 		},
