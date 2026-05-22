@@ -68,27 +68,43 @@ func NewActivityHandler(b *events.Broadcaster) *ActivityHandler {
 }
 
 // extractAttachmentsFromRequestBody walks a JSON-RPC a2a inbound body to
-// surface attachments (file/image/audio parts) as a flat `attachments[]`
-// projection so callers don't have to drill into
-// `request_body.params.message.parts[]` themselves.
+// surface attachments (file/image/audio/video) as a flat `attachments[]`
+// projection so callers don't have to drill into the request_body shape
+// themselves.
 //
-// Shape of an a2a inbound request_body that carries attachments:
+// Two body shapes are walked in order:
 //
-//	{"jsonrpc":"2.0","method":"message/send","params":{
-//	   "message":{"parts":[
-//	     {"kind":"text", "text":"hi"},
-//	     {"kind":"file", "file":{"uri":"workspace:foo.pdf","mime_type":"application/pdf","name":"foo.pdf"}},
-//	     {"kind":"image","file":{"uri":"workspace:bar.png","mime_type":"image/png","name":"bar.png"}},
-//	   ]}}}
+//  1. a2a-sdk v1 message-part envelope (peer_agent inbound):
+//
+//     {"jsonrpc":"2.0","method":"message/send","params":{
+//        "message":{"parts":[
+//          {"kind":"text", "text":"hi"},
+//          {"kind":"file", "file":{"uri":"workspace:foo.pdf","mime_type":"application/pdf","name":"foo.pdf"}},
+//          {"kind":"image","file":{"uri":"workspace:bar.png","mime_type":"image/png","name":"bar.png"}},
+//        ]}}}
+//
+//  2. canvas chat_upload_receive flat manifest (canvas_user upload):
+//
+//     {"uri":"platform-pending:<ws>/<file>",
+//      "name":"pasted.png",
+//      "size":12345,
+//      "file_id":"<uuid>",
+//      "mimeType":"image/png"}
+//
+//     The canvas upload pipe writes a single manifest directly at the
+//     root of request_body (no JSON-RPC envelope) with camelCase
+//     `mimeType`. We normalize to snake_case `mime_type` on the way out
+//     so every downstream adaptor (channel / telegram / codex / hermes)
+//     sees one wire shape regardless of which inbound shape produced it.
 //
 // Returns nil (omit-from-JSON) when the body has no attachments — the
 // `?include=peer_info` envelope projects this as an array iff non-empty.
 //
-// Defensive on every step: any missing key / wrong-shape value returns
-// nil instead of panicking. The activity_logs row could carry literally
-// any JSON in request_body (legacy formats, future formats); we only
-// commit to the documented a2a-sdk v1 message-part shape and silently
-// skip anything else.
+// Defensive on every step: any missing key / wrong-shape value falls
+// through to the next arm or returns nil instead of panicking. The
+// activity_logs row could carry literally any JSON in request_body
+// (legacy formats, future formats); we only commit to the documented
+// shapes and silently skip anything else.
 func extractAttachmentsFromRequestBody(raw []byte) []map[string]interface{} {
 	if len(raw) == 0 {
 		return nil
@@ -97,6 +113,20 @@ func extractAttachmentsFromRequestBody(raw []byte) []map[string]interface{} {
 	if err := json.Unmarshal(raw, &body); err != nil {
 		return nil
 	}
+	if atts := extractAttachmentsFromMessageParts(body); len(atts) > 0 {
+		return atts
+	}
+	if att := extractAttachmentFromFlatUploadManifest(body); att != nil {
+		return []map[string]interface{}{att}
+	}
+	return nil
+}
+
+// extractAttachmentsFromMessageParts handles the a2a-sdk v1 shape:
+// body.params.message.parts[]. Walks file/image/audio parts; honors v1
+// `kind` and v0 `type` discriminators; accepts nested `.file` sub-object
+// or inlined uri/mime_type/name on the part itself.
+func extractAttachmentsFromMessageParts(body map[string]interface{}) []map[string]interface{} {
 	params, ok := body["params"].(map[string]interface{})
 	if !ok {
 		return nil
@@ -159,6 +189,61 @@ func extractAttachmentsFromRequestBody(raw []byte) []map[string]interface{} {
 		return nil
 	}
 	return out
+}
+
+// extractAttachmentFromFlatUploadManifest handles the canvas
+// chat_upload_receive shape: a single upload manifest at the root of
+// request_body with no JSON-RPC envelope. Canvas uses camelCase
+// `mimeType`; we normalize to snake_case `mime_type` on emit so the
+// wire shape matches the message-parts arm. Kind is derived from the
+// mime prefix (image/* → "image", audio/* → "audio", video/* → "video",
+// anything else → "file") because the canvas upload row doesn't carry
+// an explicit discriminator. Returns nil if neither `uri` nor `file_id`
+// is present at the root (i.e. not a flat upload manifest).
+func extractAttachmentFromFlatUploadManifest(body map[string]interface{}) map[string]interface{} {
+	uri, _ := body["uri"].(string)
+	fileID, _ := body["file_id"].(string)
+	if uri == "" && fileID == "" {
+		return nil
+	}
+	mimeType, _ := body["mimeType"].(string)
+	if mimeType == "" {
+		// Defensive: future canvas versions might emit snake_case directly.
+		mimeType, _ = body["mime_type"].(string)
+	}
+	name, _ := body["name"].(string)
+	// Apply the same minimum-info rule as the message-parts arm: a
+	// manifest with neither uri nor name is non-actionable; skip.
+	if uri == "" && name == "" {
+		return nil
+	}
+	att := map[string]interface{}{"kind": kindFromMimeType(mimeType)}
+	if uri != "" {
+		att["uri"] = uri
+	}
+	if mimeType != "" {
+		att["mime_type"] = mimeType
+	}
+	if name != "" {
+		att["name"] = name
+	}
+	return att
+}
+
+// kindFromMimeType derives the attachment `kind` discriminator from a
+// MIME type. Used by the flat-upload-manifest arm where the source row
+// has no explicit kind field.
+func kindFromMimeType(mime string) string {
+	switch {
+	case strings.HasPrefix(mime, "image/"):
+		return "image"
+	case strings.HasPrefix(mime, "audio/"):
+		return "audio"
+	case strings.HasPrefix(mime, "video/"):
+		return "video"
+	default:
+		return "file"
+	}
 }
 
 // includeFlagSet returns true iff `flag` appears in the comma-separated

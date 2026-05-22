@@ -426,6 +426,260 @@ func TestActivityList_IncludePeerInfo_UnknownFlagIgnored(t *testing.T) {
 	}
 }
 
+// ---------- flat upload manifest (chat_upload_receive) tests ----------
+
+func TestKindFromMimeType(t *testing.T) {
+	cases := []struct {
+		mime string
+		want string
+	}{
+		{"image/png", "image"},
+		{"image/jpeg", "image"},
+		{"image/", "image"}, // prefix-only is still image
+		{"audio/mpeg", "audio"},
+		{"audio/wav", "audio"},
+		{"video/mp4", "video"},
+		{"video/webm", "video"},
+		{"application/pdf", "file"},
+		{"text/plain", "file"},
+		{"", "file"},
+		{"unknown", "file"},
+		{"image", "file"}, // no slash → not a prefix match
+	}
+	for _, tc := range cases {
+		if got := kindFromMimeType(tc.mime); got != tc.want {
+			t.Errorf("kindFromMimeType(%q) = %q, want %q", tc.mime, got, tc.want)
+		}
+	}
+}
+
+func TestExtractAttachmentsFromRequestBody_FlatUpload_Image(t *testing.T) {
+	// Canvas chat_upload_receive shape: flat manifest at request_body
+	// root with camelCase mimeType. The empirical example was a PNG
+	// pasted into the canvas; surfaces here with kind=image,
+	// mime_type=image/png (snake-case normalized), uri preserved.
+	body := []byte(`{
+		"uri":"platform-pending:091a9180-/26111d48-",
+		"name":"pasted-2026-05-21T23-12-25-0-0.png",
+		"size":677133,
+		"file_id":"26111d48-",
+		"mimeType":"image/png"
+	}`)
+	atts := extractAttachmentsFromRequestBody(body)
+	if len(atts) != 1 {
+		t.Fatalf("want 1 attachment, got %d: %v", len(atts), atts)
+	}
+	att := atts[0]
+	if att["kind"] != "image" {
+		t.Errorf("kind: want image, got %v", att["kind"])
+	}
+	if att["uri"] != "platform-pending:091a9180-/26111d48-" {
+		t.Errorf("uri: %v", att["uri"])
+	}
+	if att["mime_type"] != "image/png" {
+		t.Errorf("mime_type normalization (camelCase→snake_case) failed: %v", att["mime_type"])
+	}
+	if att["name"] != "pasted-2026-05-21T23-12-25-0-0.png" {
+		t.Errorf("name: %v", att["name"])
+	}
+	// camelCase `mimeType` MUST NOT leak into the projected envelope —
+	// only snake_case `mime_type` is the wire convention.
+	if _, present := att["mimeType"]; present {
+		t.Errorf("camelCase mimeType leaked into envelope: %v", att)
+	}
+	if _, present := att["file_id"]; present {
+		t.Errorf("file_id should not be surfaced on the attachment envelope (it's a canvas-internal id): %v", att)
+	}
+}
+
+func TestExtractAttachmentsFromRequestBody_FlatUpload_Audio(t *testing.T) {
+	body := []byte(`{"uri":"platform-pending:ws/file","name":"voice.mp3","file_id":"abc","mimeType":"audio/mpeg"}`)
+	atts := extractAttachmentsFromRequestBody(body)
+	if len(atts) != 1 || atts[0]["kind"] != "audio" {
+		t.Fatalf("want audio kind, got %v", atts)
+	}
+	if atts[0]["mime_type"] != "audio/mpeg" {
+		t.Errorf("mime_type: %v", atts[0]["mime_type"])
+	}
+}
+
+func TestExtractAttachmentsFromRequestBody_FlatUpload_Video(t *testing.T) {
+	body := []byte(`{"uri":"platform-pending:ws/file","name":"clip.mp4","file_id":"abc","mimeType":"video/mp4"}`)
+	atts := extractAttachmentsFromRequestBody(body)
+	if len(atts) != 1 || atts[0]["kind"] != "video" {
+		t.Fatalf("want video kind, got %v", atts)
+	}
+}
+
+func TestExtractAttachmentsFromRequestBody_FlatUpload_GenericFile(t *testing.T) {
+	// application/pdf has no image/audio/video prefix → kind=file
+	body := []byte(`{"uri":"platform-pending:ws/file","name":"doc.pdf","file_id":"abc","mimeType":"application/pdf"}`)
+	atts := extractAttachmentsFromRequestBody(body)
+	if len(atts) != 1 || atts[0]["kind"] != "file" {
+		t.Fatalf("want file kind, got %v", atts)
+	}
+}
+
+func TestExtractAttachmentsFromRequestBody_FlatUpload_NoMimeFallsToFile(t *testing.T) {
+	// No mimeType at all — kind defaults to "file", mime_type omitted.
+	body := []byte(`{"uri":"platform-pending:ws/file","name":"unknown.bin","file_id":"abc"}`)
+	atts := extractAttachmentsFromRequestBody(body)
+	if len(atts) != 1 {
+		t.Fatalf("want 1 attachment, got %d", len(atts))
+	}
+	if atts[0]["kind"] != "file" {
+		t.Errorf("kind: want file (default), got %v", atts[0]["kind"])
+	}
+	if _, present := atts[0]["mime_type"]; present {
+		t.Errorf("mime_type should be omitted when source has none, got %v", atts[0]["mime_type"])
+	}
+}
+
+func TestExtractAttachmentsFromRequestBody_FlatUpload_SnakeCaseMimeTypeAccepted(t *testing.T) {
+	// Defensive: a future canvas version (or non-canvas caller) that
+	// already emits snake_case mime_type should still be parsed.
+	body := []byte(`{"uri":"u","name":"n.png","mime_type":"image/png"}`)
+	atts := extractAttachmentsFromRequestBody(body)
+	if len(atts) != 1 {
+		t.Fatalf("want 1 attachment, got %d", len(atts))
+	}
+	if atts[0]["mime_type"] != "image/png" || atts[0]["kind"] != "image" {
+		t.Errorf("snake_case mime_type not honored: %v", atts[0])
+	}
+}
+
+func TestExtractAttachmentsFromRequestBody_FlatUpload_FileIDOnlyIsSkipped(t *testing.T) {
+	// file_id alone (no uri AND no name) is non-actionable — the
+	// downstream adaptor can't render a discoverable file from just an
+	// internal canvas id. Skip per the same minimum-info rule the
+	// message-parts arm applies to empty parts.
+	body := []byte(`{"file_id":"orphan-uuid","mimeType":"image/png"}`)
+	if got := extractAttachmentsFromRequestBody(body); got != nil {
+		t.Errorf("file_id-only manifest must be skipped, got %v", got)
+	}
+}
+
+func TestExtractAttachmentsFromRequestBody_FlatUpload_NameOnlyIsKept(t *testing.T) {
+	// Symmetric with the message-parts arm: a name without uri is still
+	// useful (the downstream adaptor can render "user uploaded foo.png").
+	body := []byte(`{"name":"only-name.bin","file_id":"abc","mimeType":"application/octet-stream"}`)
+	atts := extractAttachmentsFromRequestBody(body)
+	if len(atts) != 1 {
+		t.Fatalf("want 1 attachment, got %d", len(atts))
+	}
+	if atts[0]["name"] != "only-name.bin" {
+		t.Errorf("name not preserved: %v", atts[0])
+	}
+	if _, present := atts[0]["uri"]; present {
+		t.Errorf("uri should be omitted when absent in source, got %v", atts[0]["uri"])
+	}
+}
+
+func TestExtractAttachmentsFromRequestBody_MessagePartsTakesPrecedenceOverFlat(t *testing.T) {
+	// If a single request_body somehow has BOTH params.message.parts[]
+	// AND top-level uri/file_id (a pathological inbound), the
+	// message-parts arm wins — that's the documented inbound shape and
+	// it's been the only one historically extracted. The flat arm is a
+	// fallback for shapes that have NO parts.
+	body := []byte(`{
+		"uri":"platform-pending:should-not-win",
+		"file_id":"x",
+		"mimeType":"image/png",
+		"params":{"message":{"parts":[
+			{"kind":"file","file":{"uri":"workspace:should-win.pdf","mime_type":"application/pdf","name":"win.pdf"}}
+		]}}
+	}`)
+	atts := extractAttachmentsFromRequestBody(body)
+	if len(atts) != 1 {
+		t.Fatalf("want 1 attachment (from parts[]), got %d: %v", len(atts), atts)
+	}
+	if atts[0]["uri"] != "workspace:should-win.pdf" {
+		t.Errorf("message-parts arm did not take precedence: %v", atts[0])
+	}
+}
+
+func TestActivityList_IncludePeerInfo_ChatUploadReceiveCanvasRow(t *testing.T) {
+	// Wire-level integration: a canvas chat_upload_receive row (canvas
+	// user pasted an image) with source_id NULL (canvas message), flat
+	// upload manifest at request_body root. The `?include=peer_info`
+	// projection must surface attachments[] populated from the flat-
+	// upload-manifest arm while peer_name / peer_role / agent_card_url
+	// remain absent (canvas row has no peer).
+	mock := setupTestDB(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewActivityHandler(broadcaster)
+
+	mock.ExpectQuery(`LEFT JOIN workspaces w ON w\.id = activity_logs\.source_id`).
+		WithArgs("ws-1", 100).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "workspace_id", "activity_type", "source_id", "target_id",
+			"method", "summary", "request_body", "response_body",
+			"tool_trace", "duration_ms", "status", "error_detail", "created_at",
+			"peer_name", "peer_role",
+		}).
+			// Empirical shape from 2026-05-21 ~23:12Z agents-team canvas paste.
+			AddRow("act-upload", "ws-1", "chat_upload_receive", nil, "ws-1",
+				"chat_upload_receive", "Canvas upload: pasted-2026-05-21T23-12-25-0-0.png",
+				[]byte(`{
+					"uri":"platform-pending:091a9180-b303-4a20-aefe-3a4a675b8aa4/26111d48-aaaa-bbbb-cccc-dddddddddddd",
+					"name":"pasted-2026-05-21T23-12-25-0-0.png",
+					"size":677133,
+					"file_id":"26111d48-aaaa-bbbb-cccc-dddddddddddd",
+					"mimeType":"image/png"
+				}`),
+				nil, nil, nil, "ok", nil, time.Now(),
+				nil, nil))
+
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-1"}}
+	c.Request = httptest.NewRequest("GET", "/workspaces/ws-1/activity?include=peer_info", nil)
+	handler.List(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp []map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(resp) != 1 {
+		t.Fatalf("want 1 row, got %d", len(resp))
+	}
+	r := resp[0]
+	// Canvas row → no peer fields.
+	for _, k := range []string{"peer_name", "peer_role", "agent_card_url"} {
+		if _, present := r[k]; present {
+			t.Errorf("%s must NOT appear on canvas upload row; got %v", k, r[k])
+		}
+	}
+	// attachments[] populated from the flat-upload arm.
+	atts, ok := r["attachments"].([]interface{})
+	if !ok {
+		t.Fatalf("attachments missing or wrong type: %T %v", r["attachments"], r["attachments"])
+	}
+	if len(atts) != 1 {
+		t.Fatalf("want 1 attachment from flat manifest, got %d: %v", len(atts), atts)
+	}
+	att := atts[0].(map[string]interface{})
+	if att["kind"] != "image" {
+		t.Errorf("kind: want image (image/png prefix), got %v", att["kind"])
+	}
+	if att["mime_type"] != "image/png" {
+		t.Errorf("mime_type wire shape: want snake_case image/png, got %v", att["mime_type"])
+	}
+	if att["uri"] != "platform-pending:091a9180-b303-4a20-aefe-3a4a675b8aa4/26111d48-aaaa-bbbb-cccc-dddddddddddd" {
+		t.Errorf("uri preserved verbatim: got %v", att["uri"])
+	}
+	if att["name"] != "pasted-2026-05-21T23-12-25-0-0.png" {
+		t.Errorf("name: %v", att["name"])
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
 // Sanity test using the existing test broadcaster setup — verifies the
 // extractAttachments helper round-trips through json.Marshal cleanly
 // (no map ordering issues, no type-coercion surprises).
