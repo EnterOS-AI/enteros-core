@@ -509,7 +509,7 @@ done
 #   - tenantIngressRules / workspaceIngressRules (CP)
 #   - eicSSHIngressRule helper (CP)
 #   - AuthorizeIngress source-group support (CP awsapi)
-#   - EIC_ENDPOINT_SG_ID Railway env
+#   - MOLECULE_EIC_ENDPOINT_SG_ID Railway env
 #   - handleRemoteConnect's send-ssh-public-key/open-tunnel/ssh chain
 # surfaces within ~20 min of merge instead of waiting for a user report.
 #
@@ -531,7 +531,7 @@ for wid in $WS_TO_CHECK; do
   else
     DIAG_FAIL=$(echo "$DIAG_JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('first_failure','unknown'))" 2>/dev/null || echo "unknown")
     DIAG_DETAIL=$(echo "$DIAG_JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); s=[x for x in d.get('steps',[]) if not x.get('ok')]; step=s[0] if s else {}; print(' — '.join(x for x in [step.get('error',''), step.get('detail','')] if x))" 2>/dev/null || echo "")
-    fail "Workspace $wid terminal diagnose failed at step '$DIAG_FAIL': $DIAG_DETAIL — check tenant SG has tcp/22 from EIC endpoint SG (sg-0785d5c6138220523), EIC_ENDPOINT_SG_ID set in Railway, and EIC endpoint health"
+    fail "Workspace $wid terminal diagnose failed at step '$DIAG_FAIL': $DIAG_DETAIL — check tenant SG has tcp/22 from the configured EIC endpoint SG, MOLECULE_EIC_ENDPOINT_SG_ID is set in Railway, and EIC endpoint health"
   fi
 done
 
