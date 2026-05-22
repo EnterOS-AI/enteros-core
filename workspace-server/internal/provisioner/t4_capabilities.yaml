@@ -51,7 +51,7 @@ capabilities:
     description: "Host PID namespace is shared (--pid=host). The container can see host process 1 (systemd or pid-1 on the EC2 instance). Required for nsenter into host mount/pid namespaces."
     severity: hard
     source: "provisioner.go applyHostConfig T4 branch (case 4): hostCfg.PidMode = 'host'"
-    probe: "[ -d /proc/1/root ] && [ \"$(sudo -n nsenter --target 1 --mount --pid -- id -u)\" = \"0\" ]"
+    probe: "[ \"$(sudo -n nsenter --target 1 --mount --pid -- id -u)\" = \"0\" ]"
   - name: "privileged_flag_observable"
     description: "Container is started with --privileged. Observable from inside via /proc/self/status CapEff containing CAP_SYS_ADMIN. Defense-in-depth for the provisioner emission side."
     severity: advisory
