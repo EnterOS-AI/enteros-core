@@ -513,6 +513,8 @@ export function buildNodesAndEdges(
         parentId: ws.parent_id,
         currentTask: ws.current_task || "",
         runtime: ws.runtime || "",
+        workspaceAccess: ws.workspace_access,
+        maxConcurrentTasks: ws.max_concurrent_tasks ?? null,
         needsRestart: false,
         budgetLimit: ws.budget_limit ?? null,
         budgetUsed: ws.budget_used ?? null,

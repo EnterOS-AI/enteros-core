@@ -88,6 +88,8 @@ export interface WorkspaceNodeData extends Record<string, unknown> {
   parentId: string | null;
   currentTask: string;
   runtime: string;
+  workspaceAccess?: string | null;
+  maxConcurrentTasks?: number | null;
   needsRestart: boolean;
   /** USD spend ceiling set by the user; null = unlimited. Added by issue #541. */
   budgetLimit: number | null;
@@ -130,7 +132,7 @@ export interface WorkspaceNodeData extends Record<string, unknown> {
   deliveryMode?: string;
 }
 
-export type PanelTab = "details" | "skills" | "chat" | "terminal" | "display" | "config" | "schedule" | "channels" | "files" | "memory" | "traces" | "events" | "activity" | "audit";
+export type PanelTab = "details" | "skills" | "chat" | "terminal" | "display" | "container-config" | "config" | "schedule" | "channels" | "files" | "memory" | "traces" | "events" | "activity" | "audit";
 
 export interface ContextMenuState {
   x: number;

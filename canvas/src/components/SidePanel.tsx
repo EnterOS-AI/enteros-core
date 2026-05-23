@@ -9,6 +9,7 @@ import { DetailsTab } from "./tabs/DetailsTab";
 import { SkillsTab } from "./tabs/SkillsTab";
 import { ChatTab } from "./tabs/ChatTab";
 import { ConfigTab } from "./tabs/ConfigTab";
+import { ContainerConfigTab } from "./tabs/ContainerConfigTab";
 import { DisplayTab } from "./tabs/DisplayTab";
 import { TerminalTab } from "./tabs/TerminalTab";
 import { FilesTab } from "./tabs/FilesTab";
@@ -33,6 +34,7 @@ const TABS: { id: PanelTab; label: string; icon: string }[] = [
   { id: "skills", label: "Plugins", icon: "✦" },
   { id: "terminal", label: "Terminal", icon: "▸" },
   { id: "display", label: "Display", icon: "▣" },
+  { id: "container-config", label: "Container", icon: "▤" },
   { id: "config", label: "Config", icon: "⚙" },
   { id: "schedule", label: "Schedule", icon: "⏲" },
   { id: "channels", label: "Channels", icon: "⇌" },
@@ -303,6 +305,7 @@ export function SidePanel() {
         {panelTab === "chat" && <ChatTab key={selectedNodeId} workspaceId={selectedNodeId} data={node.data} />}
         {panelTab === "terminal" && <TerminalTab key={selectedNodeId} workspaceId={selectedNodeId} data={node.data} />}
         {panelTab === "display" && <DisplayTab key={selectedNodeId} workspaceId={selectedNodeId} />}
+        {panelTab === "container-config" && <ContainerConfigTab key={selectedNodeId} data={node.data} />}
         {panelTab === "config" && <ConfigTab key={selectedNodeId} workspaceId={selectedNodeId} />}
         {panelTab === "schedule" && <ScheduleTab key={selectedNodeId} workspaceId={selectedNodeId} />}
         {panelTab === "channels" && <ChannelsTab key={selectedNodeId} workspaceId={selectedNodeId} />}
