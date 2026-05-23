@@ -28,8 +28,8 @@ type proxyDispatchBuildError struct{ err error }
 func (e *proxyDispatchBuildError) Error() string { return e.err.Error() }
 
 // handleA2ADispatchError translates a forward-call failure into a proxyA2AError,
-// runs the reactive container-health check, and (when `logActivity` is true)
-// schedules a detached LogActivity goroutine for the failed attempt.
+// runs the reactive container-health check, and records the outcome. Busy
+// targets that are successfully queued are logged as queued, not failed.
 func (h *WorkspaceHandler) handleA2ADispatchError(ctx context.Context, workspaceID, callerID string, body []byte, a2aMethod string, err error, durationMs int, logActivity bool) (int, []byte, *proxyA2AError) {
 	// Build-time failure (couldn't even create the http.Request) — return
 	// a 500 without the reactive-health / busy-retry paths.
@@ -45,10 +45,10 @@ func (h *WorkspaceHandler) handleA2ADispatchError(ctx context.Context, workspace
 
 	containerDead := h.maybeMarkContainerDead(ctx, workspaceID)
 
-	if logActivity {
-		h.logA2AFailure(ctx, workspaceID, callerID, body, a2aMethod, err, durationMs)
-	}
 	if containerDead {
+		if logActivity {
+			h.logA2AFailure(ctx, workspaceID, callerID, body, a2aMethod, err, durationMs)
+		}
 		return 0, nil, &proxyA2AError{
 			Status:   http.StatusServiceUnavailable,
 			Response: gin.H{"error": "workspace agent unreachable — container restart triggered", "restarting": true},
@@ -108,6 +108,9 @@ func (h *WorkspaceHandler) handleA2ADispatchError(ctx context.Context, workspace
 			ctx, workspaceID, callerID, PriorityTask, body, a2aMethod, idempotencyKey, expiresAt,
 		); qerr == nil {
 			log.Printf("ProxyA2A: target %s busy — enqueued as %s (depth=%d)", workspaceID, qid, depth)
+			if logActivity {
+				h.logA2ABusyQueued(ctx, workspaceID, callerID, body, a2aMethod, durationMs)
+			}
 			respBody, _ := json.Marshal(gin.H{
 				"queued":      true,
 				"queue_id":    qid,
@@ -121,6 +124,9 @@ func (h *WorkspaceHandler) handleA2ADispatchError(ctx context.Context, workspace
 			// make delegation silently disappear.
 			log.Printf("ProxyA2A: enqueue for %s failed (%v) — falling back to 503", workspaceID, qerr)
 		}
+		if logActivity {
+			h.logA2AFailure(ctx, workspaceID, callerID, body, a2aMethod, err, durationMs)
+		}
 		return 0, nil, &proxyA2AError{
 			Status:  http.StatusServiceUnavailable,
 			Headers: map[string]string{"Retry-After": strconv.Itoa(busyRetryAfterSeconds)},
@@ -130,6 +136,9 @@ func (h *WorkspaceHandler) handleA2ADispatchError(ctx context.Context, workspace
 				"retry_after": busyRetryAfterSeconds,
 			},
 		}
+	}
+	if logActivity {
+		h.logA2AFailure(ctx, workspaceID, callerID, body, a2aMethod, err, durationMs)
 	}
 	return 0, nil, &proxyA2AError{
 		Status:   http.StatusBadGateway,
@@ -307,6 +316,33 @@ func (h *WorkspaceHandler) logA2AFailure(ctx context.Context, workspaceID, calle
 			DurationMs:   &durationMs,
 			Status:       "error",
 			ErrorDetail:  &errMsg,
+		})
+	})
+}
+
+// logA2ABusyQueued records that a push attempt reached a live but busy
+// workspace and was durably queued for heartbeat drain.
+func (h *WorkspaceHandler) logA2ABusyQueued(ctx context.Context, workspaceID, callerID string, body []byte, a2aMethod string, durationMs int) {
+	var wsName string
+	db.DB.QueryRowContext(ctx, `SELECT name FROM workspaces WHERE id = $1`, workspaceID).Scan(&wsName)
+	if wsName == "" {
+		wsName = workspaceID
+	}
+	summary := a2aMethod + " → " + wsName + " (queued: target busy)"
+	parent := ctx
+	h.goAsync(func() {
+		logCtx, cancel := context.WithTimeout(context.WithoutCancel(parent), 30*time.Second)
+		defer cancel()
+		LogActivity(logCtx, h.broadcaster, ActivityParams{
+			WorkspaceID:  workspaceID,
+			ActivityType: "a2a_receive",
+			SourceID:     nilIfEmpty(callerID),
+			TargetID:     &workspaceID,
+			Method:       &a2aMethod,
+			Summary:      &summary,
+			RequestBody:  json.RawMessage(body),
+			DurationMs:   &durationMs,
+			Status:       "ok",
 		})
 	})
 }
