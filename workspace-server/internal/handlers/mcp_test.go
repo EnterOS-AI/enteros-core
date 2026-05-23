@@ -1141,6 +1141,8 @@ func TestIsSafeURL_Blocks169_254_Metadata(t *testing.T) {
 }
 
 func TestIsSafeURL_Blocks10xPrivate(t *testing.T) {
+	t.Setenv("MOLECULE_ORG_ID", "")
+	t.Setenv("MOLECULE_DEPLOY_MODE", "self-hosted")
 	err := isSafeURL("http://10.0.0.1/agent")
 	if err == nil {
 		t.Errorf("isSafeURL: expected 10.x.x.x to be blocked, got nil")
@@ -1148,6 +1150,8 @@ func TestIsSafeURL_Blocks10xPrivate(t *testing.T) {
 }
 
 func TestIsSafeURL_Blocks172Private(t *testing.T) {
+	t.Setenv("MOLECULE_ORG_ID", "")
+	t.Setenv("MOLECULE_DEPLOY_MODE", "self-hosted")
 	err := isSafeURL("http://172.16.0.1/agent")
 	if err == nil {
 		t.Errorf("isSafeURL: expected 172.16.0.0/12 to be blocked, got nil")
@@ -1155,6 +1159,8 @@ func TestIsSafeURL_Blocks172Private(t *testing.T) {
 }
 
 func TestIsSafeURL_Blocks192_168Private(t *testing.T) {
+	t.Setenv("MOLECULE_ORG_ID", "")
+	t.Setenv("MOLECULE_DEPLOY_MODE", "self-hosted")
 	err := isSafeURL("http://192.168.1.100/agent")
 	if err == nil {
 		t.Errorf("isSafeURL: expected 192.168.x.x to be blocked, got nil")
@@ -1178,6 +1184,8 @@ func TestIsSafeURL_BlocksInvalidURL(t *testing.T) {
 // ==================== SSRF Defence — isPrivateOrMetadataIP ====================
 
 func TestIsPrivateOrMetadataIP_10Range(t *testing.T) {
+	t.Setenv("MOLECULE_ORG_ID", "")
+	t.Setenv("MOLECULE_DEPLOY_MODE", "self-hosted")
 	tests := []string{"10.0.0.0", "10.255.255.255", "10.1.2.3"}
 	for _, ip := range tests {
 		if !isPrivateOrMetadataIP(net.ParseIP(ip)) {
@@ -1187,6 +1195,8 @@ func TestIsPrivateOrMetadataIP_10Range(t *testing.T) {
 }
 
 func TestIsPrivateOrMetadataIP_172Range(t *testing.T) {
+	t.Setenv("MOLECULE_ORG_ID", "")
+	t.Setenv("MOLECULE_DEPLOY_MODE", "self-hosted")
 	tests := []string{"172.16.0.0", "172.31.255.255", "172.20.1.1"}
 	for _, ip := range tests {
 		if !isPrivateOrMetadataIP(net.ParseIP(ip)) {
@@ -1196,6 +1206,8 @@ func TestIsPrivateOrMetadataIP_172Range(t *testing.T) {
 }
 
 func TestIsPrivateOrMetadataIP_192_168Range(t *testing.T) {
+	t.Setenv("MOLECULE_ORG_ID", "")
+	t.Setenv("MOLECULE_DEPLOY_MODE", "self-hosted")
 	tests := []string{"192.168.0.0", "192.168.255.255", "192.168.1.1"}
 	for _, ip := range tests {
 		if !isPrivateOrMetadataIP(net.ParseIP(ip)) {

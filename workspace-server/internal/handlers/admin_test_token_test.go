@@ -39,6 +39,7 @@ func TestAdminTestToken_EnabledViaFlagEvenInProd(t *testing.T) {
 	mock := setupTestDB(t)
 	t.Setenv("MOLECULE_ENV", "production")
 	t.Setenv("MOLECULE_ENABLE_TEST_TOKENS", "1")
+	t.Setenv("ADMIN_TOKEN", "")
 
 	mock.ExpectQuery("SELECT id FROM workspaces WHERE id =").
 		WithArgs("ws-1").
@@ -58,6 +59,7 @@ func TestAdminTestToken_EnabledViaFlagEvenInProd(t *testing.T) {
 func TestAdminTestToken_WorkspaceNotFound(t *testing.T) {
 	mock := setupTestDB(t)
 	t.Setenv("MOLECULE_ENV", "development")
+	t.Setenv("ADMIN_TOKEN", "")
 
 	mock.ExpectQuery("SELECT id FROM workspaces WHERE id =").
 		WithArgs("missing").
@@ -75,6 +77,7 @@ func TestAdminTestToken_WorkspaceNotFound(t *testing.T) {
 func TestAdminTestToken_HappyPath_TokenValidates(t *testing.T) {
 	mock := setupTestDB(t)
 	t.Setenv("MOLECULE_ENV", "development")
+	t.Setenv("ADMIN_TOKEN", "")
 
 	mock.ExpectQuery("SELECT id FROM workspaces WHERE id =").
 		WithArgs("ws-1").

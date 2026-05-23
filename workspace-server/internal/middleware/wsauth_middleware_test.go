@@ -256,6 +256,7 @@ func TestWorkspaceAuth_WrongWorkspace_Returns401(t *testing.T) {
 // live tokens anywhere) the middleware must let the request through so existing
 // deployments keep working during the Phase-30 rollout.
 func TestAdminAuth_FailOpen_NoTokensGlobally(t *testing.T) {
+	t.Setenv("ADMIN_TOKEN", "")
 	mockDB, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock.New: %v", err)
@@ -375,6 +376,7 @@ func TestAdminAuth_C11_DeleteNoBearer_Returns401(t *testing.T) {
 // TestAdminAuth_ValidBearer_Passes — a valid bearer token (from any workspace)
 // must be accepted for admin routes.
 func TestAdminAuth_ValidBearer_Passes(t *testing.T) {
+	t.Setenv("ADMIN_TOKEN", "")
 	mockDB, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock.New: %v", err)
@@ -418,6 +420,7 @@ func TestAdminAuth_ValidBearer_Passes(t *testing.T) {
 
 // TestAdminAuth_InvalidBearer_Returns401 — wrong token must not grant admin access.
 func TestAdminAuth_InvalidBearer_Returns401(t *testing.T) {
+	t.Setenv("ADMIN_TOKEN", "")
 	mockDB, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock.New: %v", err)
@@ -700,6 +703,7 @@ func TestAdminAuth_Issue180_ApprovalsListing_NoBearer_Returns401(t *testing.T) {
 // fail-open contract: on a fresh install (no tokens anywhere), the middleware
 // must not block the canvas from polling /approvals/pending.
 func TestAdminAuth_Issue180_ApprovalsListing_FailOpen_NoTokens(t *testing.T) {
+	t.Setenv("ADMIN_TOKEN", "")
 	mockDB, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock.New: %v", err)
@@ -1098,6 +1102,7 @@ func TestCanvasOrBearer_TokensExist_CanvasOrigin_Passes(t *testing.T) {
 // issuing workspace has status='removed' must not grant admin access.
 // The JOIN in ValidateAnyToken filters the row out, resulting in ErrNoRows.
 func TestAdminAuth_RemovedWorkspaceToken_Returns401(t *testing.T) {
+	t.Setenv("ADMIN_TOKEN", "")
 	mockDB, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock.New: %v", err)
@@ -1251,6 +1256,7 @@ func TestAdminAuth_623_ForgedCORSOrigin_Returns401(t *testing.T) {
 // TestAdminAuth_623_ValidBearer_WithOrigin_Passes — bearer + matching Origin
 // should still work (the Origin is irrelevant once the bearer validates).
 func TestAdminAuth_623_ValidBearer_WithOrigin_Passes(t *testing.T) {
+	t.Setenv("ADMIN_TOKEN", "")
 	mockDB, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock: %v", err)

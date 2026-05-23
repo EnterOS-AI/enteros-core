@@ -81,6 +81,7 @@ func TestTestTokenRoute_RequiresAdminAuth_WhenTokensExist(t *testing.T) {
 // bootstrap path still works before the first workspace has registered.
 func TestTestTokenRoute_FailOpenOnFreshInstall(t *testing.T) {
 	t.Setenv("MOLECULE_ENV", "development")
+	t.Setenv("ADMIN_TOKEN", "")
 	mock := setupRouterTestDB(t)
 
 	// HasAnyLiveTokenGlobal: no tokens yet — fresh install.

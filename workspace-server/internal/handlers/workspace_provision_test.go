@@ -806,6 +806,8 @@ func TestIssueAndInjectToken_HappyPath(t *testing.T) {
 	mock := setupTestDB(t)
 	broadcaster := newTestBroadcaster()
 	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+	t.Setenv("MOLECULE_ORG_ID", "")
+	t.Setenv("MOLECULE_DEPLOY_MODE", "self-hosted")
 
 	// RevokeAllForWorkspace UPDATE (0 rows — no prior tokens, still succeeds)
 	mock.ExpectExec(`UPDATE workspace_auth_tokens SET revoked_at`).
@@ -843,6 +845,8 @@ func TestIssueAndInjectToken_RotatesExistingToken(t *testing.T) {
 	mock := setupTestDB(t)
 	broadcaster := newTestBroadcaster()
 	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+	t.Setenv("MOLECULE_ORG_ID", "")
+	t.Setenv("MOLECULE_DEPLOY_MODE", "self-hosted")
 
 	// RevokeAllForWorkspace: 1 existing token revoked
 	mock.ExpectExec(`UPDATE workspace_auth_tokens SET revoked_at`).
@@ -909,6 +913,8 @@ func TestIssueAndInjectToken_IssueFailSkipsInjection(t *testing.T) {
 	mock := setupTestDB(t)
 	broadcaster := newTestBroadcaster()
 	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+	t.Setenv("MOLECULE_ORG_ID", "")
+	t.Setenv("MOLECULE_DEPLOY_MODE", "self-hosted")
 
 	mock.ExpectExec(`UPDATE workspace_auth_tokens SET revoked_at`).
 		WithArgs("ws-418-issue-fail").
@@ -935,6 +941,8 @@ func TestIssueAndInjectToken_NilConfigFilesAllocated(t *testing.T) {
 	mock := setupTestDB(t)
 	broadcaster := newTestBroadcaster()
 	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+	t.Setenv("MOLECULE_ORG_ID", "")
+	t.Setenv("MOLECULE_DEPLOY_MODE", "self-hosted")
 
 	mock.ExpectExec(`UPDATE workspace_auth_tokens SET revoked_at`).
 		WithArgs("ws-418-nil-cfg").

@@ -95,6 +95,7 @@ func TestSecurity_GetTemplates_NoAuth_Returns401(t *testing.T) {
 func TestSecurity_GetTemplates_FreshInstall_FailsOpen(t *testing.T) {
 	setupTestDB(t)
 	setupTestRedis(t)
+	t.Setenv("ADMIN_TOKEN", "")
 	authDB, authMock := newFreshInstallAuthDB(t)
 
 	tmpDir := t.TempDir()
@@ -152,6 +153,7 @@ func TestSecurity_GetOrgTemplates_NoAuth_Returns401(t *testing.T) {
 func TestSecurity_GetOrgTemplates_FreshInstall_FailsOpen(t *testing.T) {
 	setupTestDB(t)
 	setupTestRedis(t)
+	t.Setenv("ADMIN_TOKEN", "")
 	authDB, authMock := newFreshInstallAuthDB(t)
 
 	tmpDir := t.TempDir()

@@ -712,6 +712,8 @@ func TestHeartbeat_SkipsRemovedRows(t *testing.T) {
 // ------------------------------------------------------------
 
 func TestValidateAgentURL(t *testing.T) {
+	t.Setenv("MOLECULE_ORG_ID", "")
+	t.Setenv("MOLECULE_DEPLOY_MODE", "self-hosted")
 	cases := []struct {
 		name    string
 		url     string
