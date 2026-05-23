@@ -93,6 +93,9 @@ func sweepOnlineWorkspaces(ctx context.Context, checker ContainerChecker, onOffl
 			ids = append(ids, id)
 		}
 	}
+	if err := rows.Err(); err != nil {
+		log.Printf("Health sweep: rows error: %v", err)
+	}
 
 	for _, id := range ids {
 		running, err := checker.IsRunning(ctx, id)
@@ -158,6 +161,9 @@ func sweepStaleRemoteWorkspaces(ctx context.Context, onOffline OfflineHandler) {
 		if err := rows.Scan(&id); err == nil {
 			ids = append(ids, id)
 		}
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("Health sweep: rows error: %v", err)
 	}
 
 	for _, id := range ids {
