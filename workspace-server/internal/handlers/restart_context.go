@@ -133,24 +133,30 @@ func loadRestartContextData(ctx context.Context, workspaceID string) restartCont
 	// message bus.
 	keySet := map[string]struct{}{}
 	if rows, err := db.DB.QueryContext(ctx, `SELECT key FROM global_secrets`); err == nil {
+		defer rows.Close()
 		for rows.Next() {
 			var k string
 			if rows.Scan(&k) == nil {
 				keySet[k] = struct{}{}
 			}
 		}
-		rows.Close()
+		if err := rows.Err(); err != nil {
+			log.Printf("loadRestartContextData: global_secrets rows.Err: %v", err)
+		}
 	}
 	if rows, err := db.DB.QueryContext(ctx,
 		`SELECT key FROM workspace_secrets WHERE workspace_id = $1`, workspaceID,
 	); err == nil {
+		defer rows.Close()
 		for rows.Next() {
 			var k string
 			if rows.Scan(&k) == nil {
 				keySet[k] = struct{}{}
 			}
 		}
-		rows.Close()
+		if err := rows.Err(); err != nil {
+			log.Printf("loadRestartContextData: workspace_secrets rows.Err: %v", err)
+		}
 	}
 	for k := range keySet {
 		d.EnvKeys = append(d.EnvKeys, k)
