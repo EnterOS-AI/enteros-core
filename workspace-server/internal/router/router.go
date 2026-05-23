@@ -178,6 +178,10 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		// the tenant AWS credentials. Admin-gated because console output
 		// can include user-data snippets we treat as semi-sensitive.
 		wsAdmin.GET("/workspaces/:id/console", wh.Console)
+		// Display sessions will eventually return short-lived proxied DCV
+		// URLs, so keep the endpoint admin-gated from the first unavailable
+		// state rather than widening it later.
+		wsAdmin.GET("/workspaces/:id/display", wh.Display)
 
 		// Admin memory backup/restore (#1051) — bulk export/import of agent
 		// memories for safe Docker rebuilds. Matches workspaces by name on import.

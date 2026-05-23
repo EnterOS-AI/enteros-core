@@ -3,6 +3,7 @@ package handlers
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -168,6 +169,40 @@ func TestWithStoredCompute_LoadsComputeForRestartPayloads(t *testing.T) {
 	}
 	if got.Compute.Volume.RootGB != 100 {
 		t.Errorf("stored compute root_gb = %d, want 100", got.Compute.Volume.RootGB)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+func TestWorkspaceDisplay_NonDisplayWorkspaceReturnsUnavailable(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
+
+	mock.ExpectQuery(`SELECT COALESCE\(compute, '\{\}'::jsonb\) FROM workspaces WHERE id = \$1`).
+		WithArgs("ws-no-display").
+		WillReturnRows(sqlmock.NewRows([]string{"compute"}).AddRow(`{}`))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-no-display"}}
+	c.Request = httptest.NewRequest("GET", "/workspaces/ws-no-display/display", nil)
+
+	handler.Display(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to parse display response: %v", err)
+	}
+	if resp["available"] != false {
+		t.Fatalf("available = %v, want false", resp["available"])
+	}
+	if resp["reason"] != "display_not_enabled" {
+		t.Fatalf("reason = %v, want display_not_enabled", resp["reason"])
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations: %v", err)
