@@ -208,3 +208,111 @@ func TestWorkspaceDisplay_NonDisplayWorkspaceReturnsUnavailable(t *testing.T) {
 		t.Errorf("unmet sqlmock expectations: %v", err)
 	}
 }
+
+func TestWorkspaceDisplay_DisplayConfiguredReturnsSessionUnavailableContract(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
+
+	mock.ExpectQuery(`SELECT COALESCE\(compute, '\{\}'::jsonb\) FROM workspaces WHERE id = \$1`).
+		WithArgs("ws-display").
+		WillReturnRows(sqlmock.NewRows([]string{"compute"}).AddRow(`{"display":{"mode":"desktop-control","protocol":"dcv","width":1920,"height":1080}}`))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-display"}}
+	c.Request = httptest.NewRequest("GET", "/workspaces/ws-display/display", nil)
+
+	handler.Display(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to parse display response: %v", err)
+	}
+	if resp["available"] != false {
+		t.Fatalf("available = %v, want false", resp["available"])
+	}
+	if resp["reason"] != "display_session_unavailable" {
+		t.Fatalf("reason = %v, want display_session_unavailable", resp["reason"])
+	}
+	if resp["status"] != "not_configured" {
+		t.Fatalf("status = %v, want not_configured", resp["status"])
+	}
+	if resp["mode"] != "desktop-control" || resp["protocol"] != "dcv" {
+		t.Fatalf("mode/protocol = %v/%v, want desktop-control/dcv", resp["mode"], resp["protocol"])
+	}
+	if resp["width"] != float64(1920) || resp["height"] != float64(1080) {
+		t.Fatalf("width/height = %v/%v, want 1920/1080", resp["width"], resp["height"])
+	}
+	if _, ok := resp["url"]; ok {
+		t.Fatalf("display response exposed url before session infra exists: %v", resp["url"])
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+func TestWorkspaceDisplay_IgnoresUnrelatedStoredComputeSizingDrift(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
+
+	mock.ExpectQuery(`SELECT COALESCE\(compute, '\{\}'::jsonb\) FROM workspaces WHERE id = \$1`).
+		WithArgs("ws-display-sizing-drift").
+		WillReturnRows(sqlmock.NewRows([]string{"compute"}).AddRow(`{"instance_type":"old.large","display":{"mode":"desktop-control","protocol":"dcv","width":1920,"height":1080}}`))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-display-sizing-drift"}}
+	c.Request = httptest.NewRequest("GET", "/workspaces/ws-display-sizing-drift/display", nil)
+
+	handler.Display(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to parse display response: %v", err)
+	}
+	if resp["reason"] != "display_session_unavailable" {
+		t.Fatalf("reason = %v, want display_session_unavailable", resp["reason"])
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+func TestWorkspaceDisplay_InvalidStoredDisplayConfigReturnsServerError(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
+
+	mock.ExpectQuery(`SELECT COALESCE\(compute, '\{\}'::jsonb\) FROM workspaces WHERE id = \$1`).
+		WithArgs("ws-invalid-display").
+		WillReturnRows(sqlmock.NewRows([]string{"compute"}).AddRow(`{"display":{"mode":"desktop-control","protocol":"vnc"}}`))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-invalid-display"}}
+	c.Request = httptest.NewRequest("GET", "/workspaces/ws-invalid-display/display", nil)
+
+	handler.Display(c)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected status 500, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to parse display response: %v", err)
+	}
+	if resp["error"] != "invalid display config" {
+		t.Fatalf("error = %v, want invalid display config", resp["error"])
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
