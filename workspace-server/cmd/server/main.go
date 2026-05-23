@@ -393,8 +393,9 @@ func main() {
 	// See molecule-core#7.
 	bindHost := resolveBindHost()
 	srv := &http.Server{
-		Addr:    fmt.Sprintf("%s:%s", bindHost, port),
-		Handler: r,
+		Addr:              fmt.Sprintf("%s:%s", bindHost, port),
+		Handler:           r,
+		ReadHeaderTimeout: 5 * time.Second,
 	}
 
 	// Start server in goroutine
