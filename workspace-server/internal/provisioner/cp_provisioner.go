@@ -241,9 +241,14 @@ func (p *CPProvisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string,
 	// Cap body read at 64 KiB — the CP only ever returns small JSON
 	// responses; an unbounded read could be weaponized into log-flood
 	// DoS by a compromised upstream.
-	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	if readErr != nil {
+		return "", fmt.Errorf("cp provisioner: read response body: %w", readErr)
+	}
 	var result cpProvisionResponse
-	json.Unmarshal(respBody, &result)
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		log.Printf("CP provisioner: unmarshal response for workspace %s: %v", cfg.WorkspaceID, err)
+	}
 
 	if resp.StatusCode != http.StatusCreated {
 		// Prefer the structured {"error":"..."} field. Do NOT fall back
@@ -409,7 +414,11 @@ func (p *CPProvisioner) Stop(ctx context.Context, workspaceID string) error {
 		// Read a bounded slice of the body so the error message gives ops
 		// enough to triage without risking a multi-MB log line on a
 		// pathological response. 512 bytes covers any sane error envelope.
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 512))
+		if readErr != nil {
+			return fmt.Errorf("cp provisioner: stop %s: unexpected %d (read body failed: %w)",
+				workspaceID, resp.StatusCode, readErr)
+		}
 		return fmt.Errorf("cp provisioner: stop %s: unexpected %d: %s",
 			workspaceID, resp.StatusCode, strings.TrimSpace(string(body)))
 	}
