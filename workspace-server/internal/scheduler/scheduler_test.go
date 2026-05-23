@@ -703,6 +703,61 @@ func TestDetectResultKind(t *testing.T) {
 			wantKind: "",
 		},
 		{
+			// REGRESSION GUARD: A2A-SDK canonical Message envelope.
+			// Pre-fix, every successful agent reply was mis-flagged as an SDK
+			// error (PM scheduler hit 21 consecutive false-failure ticks before
+			// auto-disable; canvas screenshot 2026-05-23).
+			name:     "clean ok response — result.kind=message (A2A Message envelope)",
+			body:     `{"jsonrpc":"2.0","result":{"kind":"message","parts":[{"kind":"text","text":"hello"}]},"id":"1"}`,
+			wantKind: "",
+		},
+		{
+			name:     "clean ok response — result.result_kind=message",
+			body:     `{"result":{"result_kind":"message","parts":[{"text":"hello"}]}}`,
+			wantKind: "",
+		},
+		{
+			// A2A Task envelope, in-progress — `status.state` discriminator is
+			// `submitted` or `working` → treat as clean (not an SDK error).
+			name:     "clean ok — task envelope state=working",
+			body:     `{"result":{"kind":"task","task_id":"abc","status":{"state":"working"}}}`,
+			wantKind: "",
+		},
+		{
+			name:     "clean ok — task envelope state=submitted",
+			body:     `{"result":{"kind":"task","status":{"state":"submitted"}}}`,
+			wantKind: "",
+		},
+		{
+			name:     "clean ok — task envelope state=completed",
+			body:     `{"result":{"kind":"task","status":{"state":"completed"}}}`,
+			wantKind: "",
+		},
+		{
+			// Conservative: missing status.state → don't fire false-failure.
+			name:     "clean ok — task envelope no status block",
+			body:     `{"result":{"kind":"task","task_id":"abc"}}`,
+			wantKind: "",
+		},
+		{
+			// REGRESSION GUARD: terminal failure states MUST propagate as last_status.
+			// Without taskOKStates gating, the blanket "task" allowlist would have
+			// masked these — CR2 review feedback on #1716.
+			name:     "SDK error — task envelope state=failed",
+			body:     `{"result":{"kind":"task","status":{"state":"failed"}}}`,
+			wantKind: "failed",
+		},
+		{
+			name:     "SDK error — task envelope state=canceled",
+			body:     `{"result":{"kind":"task","status":{"state":"canceled"}}}`,
+			wantKind: "canceled",
+		},
+		{
+			name:     "SDK error — task envelope state=rejected",
+			body:     `{"result":{"kind":"task","status":{"state":"rejected"}}}`,
+			wantKind: "rejected",
+		},
+		{
 			name:     "SDK error — result.kind=rate_limited",
 			body:     `{"result":{"kind":"rate_limited","parts":[{"text":"error"}]}}`,
 			wantKind: "rate_limited",

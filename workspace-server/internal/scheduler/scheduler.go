@@ -832,9 +832,18 @@ func (s *Scheduler) sweepPhantomBusy(ctx context.Context) {
 // exhaustion, SDK internal errors) — the error surfaces only in the response
 // body under result.kind or result.result_kind.
 //
-// Returns an empty string when the response is clean (result_kind is "ok" or
-// absent). Returns the result_kind value when it is a non-ok signal, so callers
-// can propagate it as the schedule's last_status.
+// Returns an empty string when the response is clean (result_kind is "ok",
+// "message" — the A2A-SDK canonical successful Message envelope — or absent).
+// Returns the result_kind value when it is a non-ok signal, so callers can
+// propagate it as the schedule's last_status.
+//
+// Known successful (= treat-as-ok) kinds (resultOKKinds):
+//   - "ok" — explicit success signal
+//   - "message" — A2A-SDK Message envelope (`{"result":{"kind":"message","parts":[...]}}`),
+//     emitted by every successful agent reply. Fix: #1696 originally allow-listed only
+//     "ok" / empty, which mis-flagged every successful agent response as an SDK error
+//     (PM scheduler observed 21 consecutive false-failure ticks before auto-disable;
+//     screenshot 2026-05-23). See [#1696 follow-up].
 //
 // Known non-ok kinds:
 //   - "rate_limited" — LLM API rate-limit hit (Max-plan, etc.)
@@ -842,6 +851,59 @@ func (s *Scheduler) sweepPhantomBusy(ctx context.Context) {
 //   - "sdk_error" — SDK threw an internal error
 //
 // See #1696.
+//
+// resultOKKinds is the allowlist of `result.kind` values that are
+// UNCONDITIONALLY successful (no further parsing needed). Anything
+// outside this set is treated as a non-ok SDK signal, EXCEPT `task`
+// which is gated separately on `result.status.state` (see
+// classifyTaskState — A2A Task can be either in-progress or terminally
+// failed, depending on its status).
+//
+// Add to this list when new always-success envelope kinds are introduced
+// upstream. NEVER add an envelope that can carry a failure sub-state.
+var resultOKKinds = map[string]struct{}{
+	"":        {}, // absent / empty → treat as ok (no signal)
+	"ok":      {}, // explicit success
+	"message": {}, // A2A-SDK Message envelope (always a successful agent reply)
+}
+
+// taskOKStates is the A2A Task `status.state` allowlist for results that
+// have `kind: "task"`. Tasks can be in-progress (submitted/working) or
+// terminally successful (completed) — those are clean signals to the
+// scheduler. Terminal failure states (failed/canceled/rejected) are
+// surfaced as the scheduler's last_status so operators can see the real
+// state. Cf. CR2 review feedback on #1716.
+var taskOKStates = map[string]struct{}{
+	"":          {}, // status.state absent → conservative: don't fire false-failure
+	"submitted": {}, // task accepted, not yet running
+	"working":   {}, // task in progress
+	"completed": {}, // task finished successfully
+}
+
+// classifyTaskState inspects `result.status.state` (or `result.status_state`
+// legacy variant) and returns "" when the state is in taskOKStates (success
+// or in-progress) or the state string when it is a terminal failure that
+// should propagate as last_status.
+func classifyTaskState(result map[string]json.RawMessage) string {
+	rawStatus, ok := result["status"]
+	if !ok {
+		return "" // no status block → no signal, leave clean
+	}
+	var status map[string]json.RawMessage
+	if err := json.Unmarshal(rawStatus, &status); err != nil {
+		return ""
+	}
+	if rawState, ok := status["state"]; ok {
+		var s string
+		if json.Unmarshal(rawState, &s) == nil {
+			if _, isOK := taskOKStates[s]; !isOK {
+				return s
+			}
+		}
+	}
+	return ""
+}
+
 func detectResultKind(body []byte) string {
 	if len(body) == 0 {
 		return ""
@@ -854,18 +916,32 @@ func detectResultKind(body []byte) string {
 	if rawResult, ok := top["result"]; ok {
 		var result map[string]json.RawMessage
 		if err := json.Unmarshal(rawResult, &result); err == nil {
-			// result.kind (canonical JSON-RPC error envelope field).
+			// result.kind (canonical JSON-RPC envelope field).
 			if rawKind, ok := result["kind"]; ok {
 				var k string
-				if json.Unmarshal(rawKind, &k) == nil && k != "" && k != "ok" {
-					return k
+				if json.Unmarshal(rawKind, &k) == nil {
+					// Special-case task: success or failure depends on status.state.
+					if k == "task" {
+						if bad := classifyTaskState(result); bad != "" {
+							return bad
+						}
+						// task with ok / in-progress state → clean
+					} else if _, isOK := resultOKKinds[k]; !isOK {
+						return k
+					}
 				}
 			}
 			// result.result_kind (legacy / alternative field name).
 			if rawKind, ok := result["result_kind"]; ok {
 				var k string
-				if json.Unmarshal(rawKind, &k) == nil && k != "" && k != "ok" {
-					return k
+				if json.Unmarshal(rawKind, &k) == nil {
+					if k == "task" {
+						if bad := classifyTaskState(result); bad != "" {
+							return bad
+						}
+					} else if _, isOK := resultOKKinds[k]; !isOK {
+						return k
+					}
 				}
 			}
 		}
