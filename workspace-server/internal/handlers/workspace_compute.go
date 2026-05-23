@@ -17,6 +17,16 @@ const (
 	workspaceComputeDiskCeilingGB = 500
 )
 
+type workspaceDisplayResponse struct {
+	Available bool   `json:"available"`
+	Reason    string `json:"reason,omitempty"`
+	Mode      string `json:"mode,omitempty"`
+	Protocol  string `json:"protocol,omitempty"`
+	Width     int    `json:"width,omitempty"`
+	Height    int    `json:"height,omitempty"`
+	Status    string `json:"status,omitempty"`
+}
+
 var workspaceComputeInstanceAllowlist = map[string]struct{}{
 	"t3.medium":  {},
 	"t3.large":   {},
@@ -49,6 +59,23 @@ func validateWorkspaceCompute(compute models.WorkspaceCompute) error {
 		return fmt.Errorf("unsupported compute.display.protocol")
 	}
 	if compute.Display.Width < 0 || compute.Display.Height < 0 {
+		return fmt.Errorf("compute.display width/height must be non-negative")
+	}
+	return nil
+}
+
+func validateWorkspaceDisplayConfig(display models.WorkspaceComputeDisplay) error {
+	switch display.Mode {
+	case "", "none", "desktop-control", "gpu-desktop-control":
+	default:
+		return fmt.Errorf("unsupported compute.display.mode")
+	}
+	switch display.Protocol {
+	case "", "dcv":
+	default:
+		return fmt.Errorf("unsupported compute.display.protocol")
+	}
+	if display.Width < 0 || display.Height < 0 {
 		return fmt.Errorf("compute.display width/height must be non-negative")
 	}
 	return nil
@@ -156,21 +183,26 @@ func (h *WorkspaceHandler) Display(c *gin.Context) {
 			c.JSON(500, gin.H{"error": "invalid display config"})
 			return
 		}
+		if err := validateWorkspaceDisplayConfig(compute.Display); err != nil {
+			log.Printf("Display: invalid stored compute for %s: %v", workspaceID, err)
+			c.JSON(500, gin.H{"error": "invalid display config"})
+			return
+		}
 	}
 	if compute.Display.Mode == "" || compute.Display.Mode == "none" {
-		c.JSON(200, gin.H{
-			"available": false,
-			"reason":    "display_not_enabled",
+		c.JSON(200, workspaceDisplayResponse{
+			Available: false,
+			Reason:    "display_not_enabled",
 		})
 		return
 	}
-	c.JSON(200, gin.H{
-		"available": false,
-		"reason":    "display_session_unavailable",
-		"mode":      compute.Display.Mode,
-		"protocol":  compute.Display.Protocol,
-		"width":     compute.Display.Width,
-		"height":    compute.Display.Height,
-		"status":    "not_configured",
+	c.JSON(200, workspaceDisplayResponse{
+		Available: false,
+		Reason:    "display_session_unavailable",
+		Mode:      compute.Display.Mode,
+		Protocol:  compute.Display.Protocol,
+		Width:     compute.Display.Width,
+		Height:    compute.Display.Height,
+		Status:    "not_configured",
 	})
 }
