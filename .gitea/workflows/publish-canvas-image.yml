@@ -73,6 +73,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
+      # Keep Docker auth/buildx state inside the job temp dir. Publish
+      # runners can inherit a HOME/DOCKER_CONFIG path that is host-owned
+      # and not writable from the job container; docker login otherwise
+      # fails before the image build starts.
+      - name: Prepare writable Docker config
+        run: |
+          set -euo pipefail
+          export DOCKER_CONFIG="$RUNNER_TEMP/docker-config"
+          mkdir -p "$DOCKER_CONFIG/buildx/certs"
+          echo "DOCKER_CONFIG=$DOCKER_CONFIG" >> "$GITHUB_ENV"
+
       - name: Log in to ECR
         env:
           IMAGE_NAME: ${{ env.IMAGE_NAME }}
