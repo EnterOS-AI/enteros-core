@@ -182,6 +182,9 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		// URLs, so keep the endpoint admin-gated from the first unavailable
 		// state rather than widening it later.
 		wsAdmin.GET("/workspaces/:id/display", wh.Display)
+		wsAdmin.GET("/workspaces/:id/display/control", wh.DisplayControl)
+		wsAdmin.POST("/workspaces/:id/display/control/acquire", wh.AcquireDisplayControl)
+		wsAdmin.POST("/workspaces/:id/display/control/release", wh.ReleaseDisplayControl)
 
 		// Admin memory backup/restore (#1051) — bulk export/import of agent
 		// memories for safe Docker rebuilds. Matches workspaces by name on import.
