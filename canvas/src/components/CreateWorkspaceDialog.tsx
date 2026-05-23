@@ -33,6 +33,8 @@ interface HermesProvider {
   models: string[];
 }
 
+const DEFAULT_CREATE_MODEL = "anthropic:claude-opus-4-7";
+
 // All providers supported by Hermes runtime via providers.resolve_provider().
 // `defaultModel` is the slug injected into the workspace provision request
 // when the user picks this provider — template-hermes's derive-provider.sh
@@ -68,6 +70,10 @@ export function CreateWorkspaceButton() {
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [workspaces, setWorkspaces] = useState<WorkspaceOption[]>([]);
+  const [displayEnabled, setDisplayEnabled] = useState(false);
+  const [displayInstanceType, setDisplayInstanceType] = useState("t3.xlarge");
+  const [displayRootGB, setDisplayRootGB] = useState("80");
+  const [displayResolution, setDisplayResolution] = useState("1920x1080");
   // Templates fetched from /api/templates — drives the dynamic provider
   // filter below. Same data source ConfigTab uses (PR #2454). When the
   // selected template declares `runtime_config.providers` in its
@@ -223,6 +229,10 @@ export function CreateWorkspaceButton() {
     setParentId("");
     setBudgetLimit("");
     setError(null);
+    setDisplayEnabled(false);
+    setDisplayInstanceType("t3.xlarge");
+    setDisplayRootGB("80");
+    setDisplayResolution("1920x1080");
     setHermesProvider("anthropic");
     setExternalRuntime("external");
     setHermesApiKey("");
@@ -264,6 +274,8 @@ export function CreateWorkspaceButton() {
       const parsedBudget = budgetLimit.trim()
         ? parseFloat(budgetLimit)
         : null;
+      const [displayWidth, displayHeight] = displayResolution.split("x").map((v) => parseInt(v, 10));
+      const parsedRootGB = parseInt(displayRootGB, 10);
 
       const createResp = await api.post<{
         id: string;
@@ -280,6 +292,21 @@ export function CreateWorkspaceButton() {
         tier,
         parent_id: parentId || undefined,
         budget_limit: parsedBudget,
+        ...(!isExternal && !isHermes ? { model: DEFAULT_CREATE_MODEL } : {}),
+        ...(displayEnabled
+          ? {
+              compute: {
+                instance_type: displayInstanceType,
+                volume: { root_gb: Number.isFinite(parsedRootGB) ? parsedRootGB : 80 },
+                display: {
+                  mode: "desktop-control",
+                  protocol: "novnc",
+                  width: Number.isFinite(displayWidth) ? displayWidth : 1920,
+                  height: Number.isFinite(displayHeight) ? displayHeight : 1080,
+                },
+              },
+            }
+          : {}),
         canvas: { x: Math.random() * 400 + 100, y: Math.random() * 300 + 100 },
         // Runtime=external flips the backend into awaiting-agent mode:
         // no container provisioning, token minted, connection payload
@@ -446,6 +473,73 @@ export function CreateWorkspaceButton() {
                 ))}
               </div>
             </div>
+
+            {!isExternal && (
+              <div className="rounded-lg border border-line/50 bg-surface-card/40 p-3">
+                <div className="mb-2 text-[11px] font-medium text-ink-mid">
+                  Container Config
+                </div>
+                <label className="flex items-center justify-between gap-3">
+                  <span className="text-xs font-medium text-ink">Display</span>
+                  <input
+                    type="checkbox"
+                    checked={displayEnabled}
+                    onChange={(e) => setDisplayEnabled(e.target.checked)}
+                    aria-label="Enable display"
+                    className="h-4 w-4"
+                  />
+                </label>
+                {displayEnabled && (
+                  <div className="mt-3 grid grid-cols-2 gap-2">
+                    <div>
+                      <label htmlFor="display-instance-type" className="mb-1 block text-[11px] text-ink-mid">
+                        Instance
+                      </label>
+                      <select
+                        id="display-instance-type"
+                        value={displayInstanceType}
+                        onChange={(e) => setDisplayInstanceType(e.target.value)}
+                        className="w-full bg-surface-card/60 border border-line/50 rounded-lg px-2 py-2 text-xs text-ink focus:outline-none focus:border-accent/60 focus:ring-1 focus:ring-accent/20 transition-colors"
+                      >
+                        <option value="t3.large">t3.large</option>
+                        <option value="t3.xlarge">t3.xlarge</option>
+                        <option value="m6i.xlarge">m6i.xlarge</option>
+                        <option value="c6i.xlarge">c6i.xlarge</option>
+                      </select>
+                    </div>
+                    <div>
+                      <label htmlFor="display-root-gb" className="mb-1 block text-[11px] text-ink-mid">
+                        Disk GB
+                      </label>
+                      <input
+                        id="display-root-gb"
+                        type="number"
+                        min="30"
+                        max="500"
+                        value={displayRootGB}
+                        onChange={(e) => setDisplayRootGB(e.target.value)}
+                        className="w-full bg-surface-card/60 border border-line/50 rounded-lg px-2 py-2 text-xs text-ink focus:outline-none focus:border-accent/60 focus:ring-1 focus:ring-accent/20 transition-colors"
+                      />
+                    </div>
+                    <div className="col-span-2">
+                      <label htmlFor="display-resolution" className="mb-1 block text-[11px] text-ink-mid">
+                        Resolution
+                      </label>
+                      <select
+                        id="display-resolution"
+                        value={displayResolution}
+                        onChange={(e) => setDisplayResolution(e.target.value)}
+                        className="w-full bg-surface-card/60 border border-line/50 rounded-lg px-2 py-2 text-xs text-ink focus:outline-none focus:border-accent/60 focus:ring-1 focus:ring-accent/20 transition-colors"
+                      >
+                        <option value="1920x1080">1920 x 1080</option>
+                        <option value="1600x900">1600 x 900</option>
+                        <option value="1280x720">1280 x 720</option>
+                      </select>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
 
             <div>
               <label className="text-[11px] text-ink-mid block mb-1">

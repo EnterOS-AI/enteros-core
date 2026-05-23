@@ -197,6 +197,12 @@ func TestStart_HappyPath(t *testing.T) {
 		if body.DiskGB != 100 {
 			t.Errorf("disk_gb = %d, want 100", body.DiskGB)
 		}
+		if body.Display.Mode != "desktop-control" || body.Display.Protocol != "novnc" {
+			t.Errorf("display mode/protocol = %q/%q, want desktop-control/novnc", body.Display.Mode, body.Display.Protocol)
+		}
+		if body.Display.Width != 1920 || body.Display.Height != 1080 {
+			t.Errorf("display size = %dx%d, want 1920x1080", body.Display.Width, body.Display.Height)
+		}
 		w.WriteHeader(http.StatusCreated)
 		_, _ = io.WriteString(w, `{"instance_id":"i-abc123","state":"pending"}`)
 	}))
@@ -212,6 +218,7 @@ func TestStart_HappyPath(t *testing.T) {
 	id, err := p.Start(context.Background(), WorkspaceConfig{
 		WorkspaceID: "ws-1", Runtime: "python", Tier: 1, PlatformURL: "http://tenant",
 		InstanceType: "m6i.xlarge", DiskGB: 100,
+		Display: WorkspaceDisplayConfig{Mode: "desktop-control", Protocol: "novnc", Width: 1920, Height: 1080},
 	})
 	if err != nil {
 		t.Fatalf("Start: %v", err)

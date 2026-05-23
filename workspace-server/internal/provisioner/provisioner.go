@@ -97,9 +97,10 @@ type WorkspaceConfig struct {
 	PluginsPath        string            // Host path to plugins directory (mounted at /plugins)
 	WorkspacePath      string            // Host path to bind-mount as /workspace (if empty, uses Docker named volume)
 	Tier               int
-	Runtime            string            // "langgraph" (default) or "claude-code", "codex", "ollama", "custom"
-	InstanceType       string            // Optional CP EC2 instance type override (SaaS only)
-	DiskGB             int32             // Optional CP root volume size override in GiB (SaaS only)
+	Runtime            string // "langgraph" (default) or "claude-code", "codex", "ollama", "custom"
+	InstanceType       string // Optional CP EC2 instance type override (SaaS only)
+	DiskGB             int32  // Optional CP root volume size override in GiB (SaaS only)
+	Display            WorkspaceDisplayConfig
 	EnvVars            map[string]string // Additional env vars (API keys, etc.)
 	PlatformURL        string
 	AwarenessURL       string
@@ -120,6 +121,13 @@ type WorkspaceConfig struct {
 	// design (#2272 layer 1) but never received a writer; RFC internal#617 /
 	// task #335 retired the dead reader + table in favor of CP-as-SSOT.
 	Image string
+}
+
+type WorkspaceDisplayConfig struct {
+	Mode     string `json:"mode,omitempty"`
+	Width    int    `json:"width,omitempty"`
+	Height   int    `json:"height,omitempty"`
+	Protocol string `json:"protocol,omitempty"`
 }
 
 // selectImage resolves the final Docker image ref for a workspace. The handler
