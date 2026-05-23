@@ -104,6 +104,9 @@ func (h *ChannelHandler) List(c *gin.Context) {
 		}
 		result = append(result, entry)
 	}
+	if err := rows.Err(); err != nil {
+		log.Printf("Channels: list rows.Err: %v", err)
+	}
 
 	c.JSON(http.StatusOK, result)
 }
@@ -513,6 +516,9 @@ func (h *ChannelHandler) Webhook(c *gin.Context) {
 		if matchesChatID(row.Config, msg.ChatID) {
 			candidates = append(candidates, row)
 		}
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("Channels: telegram webhook rows.Err: %v", err)
 	}
 
 	if targetSlug != "" {
