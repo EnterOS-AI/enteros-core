@@ -95,6 +95,29 @@ describe("DisplayTab", () => {
     expect(mockPost).not.toHaveBeenCalled();
   });
 
+  it("labels org-token display control locks as automation", async () => {
+    mockGet
+      .mockResolvedValueOnce({
+        available: false,
+        reason: "display_session_unavailable",
+        mode: "desktop-control",
+        status: "not_configured",
+      })
+      .mockResolvedValueOnce({
+        controller: "user",
+        controlled_by: "org-token:abc123",
+        expires_at: "2026-05-23T08:48:27Z",
+      });
+
+    render(<DisplayTab workspaceId="ws-display" />);
+
+    await waitFor(() => {
+      expect(screen.getByText("Controlled by Automation")).toBeTruthy();
+    });
+    expect(screen.queryByText("org-token:abc123")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Take control" })).toBeNull();
+  });
+
   it("refreshes display control state after failed acquisition", async () => {
     mockGet
       .mockResolvedValueOnce({
@@ -151,4 +174,77 @@ describe("DisplayTab", () => {
     expect(screen.queryByRole("button", { name: "Take control" })).toBeNull();
     expect(screen.getByText("Display control unavailable")).toBeTruthy();
   });
+
+  it("does not render raw display status errors", async () => {
+    mockGet.mockRejectedValueOnce(new Error("API GET /workspaces/ws-display/display: 500 secret backend details"));
+
+    render(<DisplayTab workspaceId="ws-display" />);
+
+    await waitFor(() => {
+      expect(screen.getByText("Display status unavailable")).toBeTruthy();
+    });
+    expect(screen.queryByText(/secret backend details/)).toBeNull();
+  });
+
+  it("ignores stale acquire responses after workspace changes", async () => {
+    const acquire = deferred<{ controller: "user"; controlled_by: string; expires_at: string }>();
+    mockGet
+      .mockResolvedValueOnce({
+        available: false,
+        reason: "display_session_unavailable",
+        mode: "desktop-control",
+        status: "not_configured",
+      })
+      .mockResolvedValueOnce({
+        controller: "none",
+      })
+      .mockResolvedValueOnce({
+        available: false,
+        reason: "display_session_unavailable",
+        mode: "desktop-control",
+        status: "not_configured",
+      })
+      .mockResolvedValueOnce({
+        controller: "none",
+      });
+    mockPost.mockReturnValueOnce(acquire.promise);
+
+    const { rerender } = render(<DisplayTab workspaceId="ws-a" />);
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Take control" })).toBeTruthy();
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Take control" }));
+
+    rerender(<DisplayTab workspaceId="ws-b" />);
+
+    await waitFor(() => {
+      expect(mockGet).toHaveBeenCalledWith("/workspaces/ws-b/display/control");
+    });
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Take control" })).toBeTruthy();
+    });
+
+    acquire.resolve({
+      controller: "user",
+      controlled_by: "admin-token",
+      expires_at: "2026-05-23T08:48:27Z",
+    });
+    await acquire.promise;
+
+    await waitFor(() => {
+      expect(screen.queryByText("Controlled by Admin")).toBeNull();
+    });
+    expect(screen.getByRole("button", { name: "Take control" })).toBeTruthy();
+  });
 });
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}

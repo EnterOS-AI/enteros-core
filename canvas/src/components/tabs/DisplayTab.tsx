@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api } from "@/lib/api";
 
 interface DisplayStatus {
@@ -29,30 +29,34 @@ export function DisplayTab({ workspaceId }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [controlError, setControlError] = useState<string | null>(null);
   const [controlBusy, setControlBusy] = useState(false);
+  const requestGeneration = useRef(0);
 
   useEffect(() => {
+    const generation = requestGeneration.current + 1;
+    requestGeneration.current = generation;
     let cancelled = false;
     setStatus(null);
     setControl(null);
     setError(null);
     setControlError(null);
+    setControlBusy(false);
     async function load() {
       try {
         const displayStatus = await api.get<DisplayStatus>(`/workspaces/${workspaceId}/display`);
-        if (cancelled) return;
+        if (cancelled || requestGeneration.current !== generation) return;
         setStatus(displayStatus);
         if (displayStatus.reason === "display_not_enabled") return;
         try {
           const displayControl = await api.get<DisplayControlStatus>(`/workspaces/${workspaceId}/display/control`);
-          if (!cancelled) setControl(displayControl);
+          if (!cancelled && requestGeneration.current === generation) setControl(displayControl);
         } catch (err) {
-          if (!cancelled) {
+          if (!cancelled && requestGeneration.current === generation) {
             setControl(null);
             setControlError("Display control unavailable");
           }
         }
       } catch (err) {
-        if (!cancelled) setError(err instanceof Error ? err.message : "Display status unavailable");
+        if (!cancelled && requestGeneration.current === generation) setError("The display status could not be loaded.");
       }
     }
     load();
@@ -62,24 +66,30 @@ export function DisplayTab({ workspaceId }: Props) {
   }, [workspaceId]);
 
   const acquireControl = async () => {
+    const generation = requestGeneration.current;
+    const controlPath = `/workspaces/${workspaceId}/display/control`;
     setControlBusy(true);
     setControlError(null);
     try {
-      const next = await api.post<DisplayControlStatus>(`/workspaces/${workspaceId}/display/control/acquire`, {
+      const next = await api.post<DisplayControlStatus>(`${controlPath}/acquire`, {
         controller: "user",
         ttl_seconds: 300,
       });
+      if (requestGeneration.current !== generation) return;
       setControl(next);
     } catch (err) {
+      if (requestGeneration.current !== generation) return;
       setControlError("Failed to take control");
       try {
-        const latest = await api.get<DisplayControlStatus>(`/workspaces/${workspaceId}/display/control`);
+        const latest = await api.get<DisplayControlStatus>(controlPath);
+        if (requestGeneration.current !== generation) return;
         setControl(latest);
       } catch {
+        if (requestGeneration.current !== generation) return;
         setControl(null);
       }
     } finally {
-      setControlBusy(false);
+      if (requestGeneration.current === generation) setControlBusy(false);
     }
   };
 
@@ -162,7 +172,9 @@ export function DisplayTab({ workspaceId }: Props) {
                 </div>
               ) : (
                 <div className="text-left">
-                  <div className="h-8 rounded border border-line/40 bg-surface-sunken/30 motion-safe:animate-pulse" />
+                  {!controlError && (
+                    <div className="h-8 rounded border border-line/40 bg-surface-sunken/30 motion-safe:animate-pulse" />
+                  )}
                   {controlError && <p className="mt-2 text-[10px] leading-snug text-red-200">{controlError}</p>}
                 </div>
               )}
@@ -179,5 +191,6 @@ export function DisplayTab({ workspaceId }: Props) {
 function displayControlActorLabel(control: DisplayControlStatus): string {
   if (control.controller === "agent") return "Agent";
   if (control.controlled_by === "admin-token") return "Admin";
+  if (control.controlled_by?.startsWith("org-token:")) return "Automation";
   return "User";
 }
