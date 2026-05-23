@@ -20,8 +20,8 @@ services:
       # Disable provider calls during canary — the runtime returns canned
       # echo-style replies so the harness can assert continuity / file-handling
       # behaviour without burning provider quota. The template image must
-      # honour MOLECULE_CANARY_MODE=1 (added in this PR — see workspace/
-      # a2a_executor.py canary short-circuit).
+      # honour MOLECULE_CANARY_MODE=1 (added in molecule-ai-workspace-runtime
+      # PR #46 — see molecule_runtime/a2a_executor.py canary short-circuit).
       MOLECULE_CANARY_MODE: "1"
       # Anonymous workspace identity so RBAC paths exercise the same code
       # they would in tenant production.
