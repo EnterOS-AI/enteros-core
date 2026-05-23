@@ -1779,6 +1779,58 @@ func TestHandleA2ADispatchError_ContextDeadline(t *testing.T) {
 	}
 }
 
+func TestHandleA2ADispatchError_BusyEnqueueLogsQueuedNotFailure(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
+	waitForHandlerAsyncBeforeDBCleanup(t, handler)
+
+	mock.ExpectQuery(`INSERT INTO a2a_queue`).
+		WithArgs("ws-busy", nil, PriorityTask, "{}", "message/send", nil, nil).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("11111111-1111-1111-1111-111111111111"))
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM a2a_queue`).
+		WithArgs("ws-busy").
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+	mock.ExpectQuery(`SELECT name FROM workspaces WHERE id =`).
+		WithArgs("ws-busy").
+		WillReturnRows(sqlmock.NewRows([]string{"name"}).AddRow("Busy Target"))
+	mock.ExpectExec("INSERT INTO activity_logs").
+		WithArgs(
+			"ws-busy",
+			"a2a_receive",
+			nil,
+			sqlmock.AnyArg(),
+			sqlmock.AnyArg(),
+			sqlmock.AnyArg(),
+			sqlmock.AnyArg(),
+			nil,
+			nil,
+			sqlmock.AnyArg(),
+			"ok",
+			nil,
+		).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	status, body, perr := handler.handleA2ADispatchError(
+		context.Background(), "ws-busy", "", []byte("{}"), "message/send",
+		context.DeadlineExceeded, 180002, true,
+	)
+	if perr != nil {
+		t.Fatalf("expected busy enqueue success, got proxy error: %+v", perr)
+	}
+	if status != http.StatusAccepted {
+		t.Fatalf("got status %d, want 202", status)
+	}
+	if !bytes.Contains(body, []byte(`"queued":true`)) {
+		t.Fatalf("expected queued response body, got %s", string(body))
+	}
+
+	time.Sleep(80 * time.Millisecond)
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations; busy enqueue must log status=ok, not error: %v", err)
+	}
+}
+
 func TestHandleA2ADispatchError_BuildError(t *testing.T) {
 	setupTestDB(t)
 	setupTestRedis(t)
@@ -2354,7 +2406,7 @@ func TestLookupDeliveryMode_ContextCanceled_FailsClosed(t *testing.T) {
 // ==================== a2aClient ResponseHeaderTimeout config ====================
 
 func TestA2AClientResponseHeaderTimeout(t *testing.T) {
-	const defaultTimeout = 180 * time.Second
+	const defaultTimeout = 5 * time.Minute
 
 	// Default (unset env) — a2aClient was initialised at package load time.
 	if a2aClient.Transport.(*http.Transport).ResponseHeaderTimeout != defaultTimeout {
@@ -2378,7 +2430,7 @@ func TestA2AClientResponseHeaderTimeout(t *testing.T) {
 	t.Run("invalid A2A_PROXY_RESPONSE_HEADER_TIMEOUT falls back to default", func(t *testing.T) {
 		t.Setenv("A2A_PROXY_RESPONSE_HEADER_TIMEOUT", "not-a-duration")
 		// Simulate what envx.Duration does with an invalid value.
-		var fallback = 180 * time.Second
+		var fallback = 5 * time.Minute
 		override := fallback
 		if v := os.Getenv("A2A_PROXY_RESPONSE_HEADER_TIMEOUT"); v != "" {
 			if d, err := time.ParseDuration(v); err == nil && d > 0 {

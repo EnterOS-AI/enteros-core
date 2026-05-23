@@ -111,12 +111,13 @@ const maxProxyResponseBody = 10 << 20
 //     a generic 502 page to canvas. 10s is well above realistic intra-region
 //     latencies and well below CF's edge timeout.
 //
-//  3. Transport.ResponseHeaderTimeout — 180s default. From request-body-end
+//  3. Transport.ResponseHeaderTimeout — 5min default. From request-body-end
 //     to response-headers-start. Configurable via
 //     A2A_PROXY_RESPONSE_HEADER_TIMEOUT (envx.Duration). Covers cold-start
 //     first-byte (30-60s OAuth flow above) with enough room for Opus agent
-//     turns (big context + internal delegate_task round-trips routinely exceed
-//     the old 60s ceiling). Body streaming after headers is governed by the
+//     turns and Codex scheduled tasks (big context + internal delegate_task
+//     round-trips routinely exceed the old 60s/180s ceilings). Body streaming
+//     after headers is governed by the
 //     per-request context deadline, NOT this timeout — so multi-minute agent
 //     responses still work fine.
 //
@@ -131,7 +132,7 @@ var a2aClient = &http.Client{
 			Timeout:   10 * time.Second,
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
-		ResponseHeaderTimeout: envx.Duration("A2A_PROXY_RESPONSE_HEADER_TIMEOUT", 180*time.Second),
+		ResponseHeaderTimeout: envx.Duration("A2A_PROXY_RESPONSE_HEADER_TIMEOUT", 5*time.Minute),
 		TLSHandshakeTimeout:   10 * time.Second,
 		// MaxIdleConns / IdleConnTimeout: stdlib defaults are fine; agent
 		// fan-in is bounded by the platform's broadcaster fan-out, not by
