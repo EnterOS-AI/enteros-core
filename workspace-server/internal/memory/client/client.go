@@ -329,7 +329,13 @@ func (c *Client) doJSON(ctx context.Context, method, path string, reqBody interf
 
 func decodeError(resp *http.Response) error {
 	var e contract.Error
-	body, _ := io.ReadAll(resp.Body)
+	body, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		return &contract.Error{
+			Code:    httpStatusToCode(resp.StatusCode),
+			Message: fmt.Sprintf("status %d (read body failed: %v)", resp.StatusCode, readErr),
+		}
+	}
 	if len(body) == 0 {
 		return &contract.Error{
 			Code:    httpStatusToCode(resp.StatusCode),
