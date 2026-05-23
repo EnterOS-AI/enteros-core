@@ -130,7 +130,7 @@ export interface WorkspaceNodeData extends Record<string, unknown> {
   deliveryMode?: string;
 }
 
-export type PanelTab = "details" | "skills" | "chat" | "terminal" | "config" | "schedule" | "channels" | "files" | "memory" | "traces" | "events" | "activity" | "audit";
+export type PanelTab = "details" | "skills" | "chat" | "terminal" | "display" | "config" | "schedule" | "channels" | "files" | "memory" | "traces" | "events" | "activity" | "audit";
 
 export interface ContextMenuState {
   x: number;

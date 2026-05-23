@@ -9,6 +9,7 @@ import (
 
 	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
 	"github.com/Molecule-AI/molecule-monorepo/platform/internal/models"
+	"github.com/gin-gonic/gin"
 )
 
 const (
@@ -125,4 +126,51 @@ func withStoredCompute(ctx context.Context, workspaceID string, payload models.C
 	}
 	payload.Compute = compute
 	return payload
+}
+
+// Display handles GET /workspaces/:id/display.
+//
+// Phase 1 only exposes the product contract and the non-display unavailable
+// state. Future desktop-control work will replace the display-enabled branch
+// with short-lived proxied DCV session details.
+func (h *WorkspaceHandler) Display(c *gin.Context) {
+	workspaceID := c.Param("id")
+	var raw string
+	err := db.DB.QueryRowContext(c.Request.Context(),
+		`SELECT COALESCE(compute, '{}'::jsonb) FROM workspaces WHERE id = $1`,
+		workspaceID,
+	).Scan(&raw)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			c.JSON(404, gin.H{"error": "workspace not found"})
+			return
+		}
+		log.Printf("Display: load compute for %s failed: %v", workspaceID, err)
+		c.JSON(500, gin.H{"error": "failed to load display config"})
+		return
+	}
+	var compute models.WorkspaceCompute
+	if raw != "" && raw != "{}" {
+		if err := json.Unmarshal([]byte(raw), &compute); err != nil {
+			log.Printf("Display: invalid compute JSON for %s: %v", workspaceID, err)
+			c.JSON(500, gin.H{"error": "invalid display config"})
+			return
+		}
+	}
+	if compute.Display.Mode == "" || compute.Display.Mode == "none" {
+		c.JSON(200, gin.H{
+			"available": false,
+			"reason":    "display_not_enabled",
+		})
+		return
+	}
+	c.JSON(200, gin.H{
+		"available": false,
+		"reason":    "display_session_unavailable",
+		"mode":      compute.Display.Mode,
+		"protocol":  compute.Display.Protocol,
+		"width":     compute.Display.Width,
+		"height":    compute.Display.Height,
+		"status":    "not_configured",
+	})
 }

@@ -11,6 +11,7 @@ vi.mock("../tabs/DetailsTab", () => ({ DetailsTab: () => null }));
 vi.mock("../tabs/SkillsTab", () => ({ SkillsTab: () => null }));
 vi.mock("../tabs/ChatTab", () => ({ ChatTab: () => null }));
 vi.mock("../tabs/ConfigTab", () => ({ ConfigTab: () => null }));
+vi.mock("../tabs/DisplayTab", () => ({ DisplayTab: () => null }));
 vi.mock("../tabs/TerminalTab", () => ({ TerminalTab: () => null }));
 vi.mock("../tabs/FilesTab", () => ({ FilesTab: () => null }));
 vi.mock("../MemoryInspectorPanel", () => ({ MemoryInspectorPanel: () => null }));
@@ -74,7 +75,7 @@ import { SidePanel } from "../SidePanel";
 
 const TABS = [
   "chat", "activity", "details", "skills", "terminal",
-  "config", "schedule", "channels", "files", "memory", "traces", "events", "audit",
+  "display", "config", "schedule", "channels", "files", "memory", "traces", "events", "audit",
 ];
 
 describe("SidePanel — ARIA tablist pattern", () => {
@@ -85,10 +86,15 @@ describe("SidePanel — ARIA tablist pattern", () => {
     expect(tablist.getAttribute("aria-label")).toBe("Workspace panel tabs");
   });
 
-  it("renders exactly 13 tab buttons", () => {
+  it("renders exactly 14 tab buttons", () => {
     render(<SidePanel />);
     const tabs = screen.getAllByRole("tab");
-    expect(tabs.length).toBe(13);
+    expect(tabs.length).toBe(14);
+  });
+
+  it("renders the Display tab", () => {
+    render(<SidePanel />);
+    expect(document.getElementById("tab-display")).toBeTruthy();
   });
 
   it("active tab (chat) has aria-selected='true'", () => {
@@ -99,11 +105,11 @@ describe("SidePanel — ARIA tablist pattern", () => {
     expect(chatTab?.getAttribute("aria-selected")).toBe("true");
   });
 
-  it("all other 12 tabs have aria-selected='false'", () => {
+  it("all other 13 tabs have aria-selected='false'", () => {
     render(<SidePanel />);
     const tabs = screen.getAllByRole("tab");
     const inactive = tabs.filter((t) => t.id !== "tab-chat");
-    expect(inactive.length).toBe(12);
+    expect(inactive.length).toBe(13);
     for (const tab of inactive) {
       expect(tab.getAttribute("aria-selected")).toBe("false");
     }
@@ -116,7 +122,7 @@ describe("SidePanel — ARIA tablist pattern", () => {
     const minusOnes = tabs.filter((t) => t.getAttribute("tabindex") === "-1");
     expect(zeros.length).toBe(1);
     expect(zeros[0].id).toBe("tab-chat");
-    expect(minusOnes.length).toBe(12);
+    expect(minusOnes.length).toBe(13);
   });
 
   it("active tab has aria-controls='panel-chat' and id='tab-chat'", () => {
