@@ -550,13 +550,22 @@ func (h *WorkspaceHandler) ensureDefaultConfig(workspaceID string, payload model
 	// via a crafted runtime string (#241).
 	runtime := sanitizeRuntime(payload.Runtime)
 
-	// Generate a minimal config.yaml
+	// Generate a minimal config.yaml.
+	//
+	// SSOT (CTO 2026-05-22): model is REQUIRED user input. The platform
+	// must not provide a default; the runtime must not fall back. The
+	// Create handler is responsible for rejecting empty model BEFORE
+	// reaching provisionWorkspace; this is a defence-in-depth assertion.
+	// If we hit here with an empty model the YAML below would still
+	// render a `model: ""` line — which renders all downstream provider
+	// derivation undefined. Log loudly and let the workspace boot into
+	// not_configured rather than masking the contract violation with a
+	// silently-broken default (the prior `anthropic:claude-opus-4-7`
+	// fallback was the canonical example — every codex workspace
+	// created without an explicit model wedged).
 	model := payload.Model
 	if model == "" {
-		// SSOT: per-runtime defaults live in models/runtime_defaults.go
-		// (see RFC #2873). Was previously duplicated here AND in
-		// org_import.go; consolidating prevents silent drift.
-		model = models.DefaultModel(runtime)
+		log.Printf("ensureDefaultConfig: workspace %s reached provisioning with empty model — Create handler should have rejected this; rendering empty model: \"\" in config.yaml (workspace will boot not_configured)", workspaceID)
 	}
 	if runtime == "claude-code" {
 		model = normalizeClaudeCodeModel(model)

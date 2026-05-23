@@ -188,8 +188,9 @@ import json, os
 print(json.dumps({'CLAUDE_CODE_OAUTH_TOKEN': os.environ['CLAUDE_CODE_OAUTH_TOKEN']}))
 ")
   local resp wsid
+  # model required (CTO 2026-05-22 SSOT) — pass the deleted DefaultModel("claude-code") value.
   resp=$(curl -s -X POST "$BASE/workspaces" -H "Content-Type: application/json" \
-    -d "{\"name\":\"Priority E2E (claude-code)\",\"runtime\":\"claude-code\",\"tier\":1,\"secrets\":$secrets}")
+    -d "{\"name\":\"Priority E2E (claude-code)\",\"runtime\":\"claude-code\",\"model\":\"sonnet\",\"tier\":1,\"secrets\":$secrets}")
   wsid=$(echo "$resp" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("id",""))') || true
   if [ -z "$wsid" ]; then
     fail "create claude-code workspace" "$resp"
@@ -380,8 +381,9 @@ import json, os
 print(json.dumps({'GEMINI_API_KEY': os.environ['E2E_GEMINI_API_KEY']}))
 ")
   local resp wsid
+  # model required (CTO 2026-05-22 SSOT) — gemini-cli routes via the gemini provider.
   resp=$(curl -s -X POST "$BASE/workspaces" -H "Content-Type: application/json" \
-    -d "{\"name\":\"Priority E2E (gemini-cli)\",\"runtime\":\"gemini-cli\",\"tier\":1,\"secrets\":$secrets}")
+    -d "{\"name\":\"Priority E2E (gemini-cli)\",\"runtime\":\"gemini-cli\",\"model\":\"gemini-2.0-flash\",\"tier\":1,\"secrets\":$secrets}")
   wsid=$(echo "$resp" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("id",""))') || true
   if [ -z "$wsid" ]; then fail "create gemini-cli workspace" "$resp"; return 0; fi
   CREATED_WSIDS+=("$wsid")

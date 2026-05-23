@@ -69,10 +69,15 @@ func (h *OrgHandler) createWorkspaceTree(ws OrgWorkspace, parentID *string, absX
 		model = defaults.Model
 	}
 	if model == "" {
-		// SSOT: per-runtime defaults live in models/runtime_defaults.go
-		// (see RFC #2873). Consolidated from a duplicate of the same
-		// branch in workspace_provision.go.
-		model = models.DefaultModel(runtime)
+		// SSOT (CTO 2026-05-22, feedback_workspace_model_required_no_platform_default_dynamic_credential_intake):
+		// model is REQUIRED. The org-import template MUST declare a
+		// model — either per-workspace (`ws.Model`) or via the org
+		// defaults block (`defaults.Model`). If neither is present
+		// the template is malformed and the import must fail-closed
+		// rather than silently provisioning a workspace with a
+		// runtime-incompatible default (the prior `anthropic:claude-opus-4-7`
+		// fallback wedged every codex workspace at adapter init).
+		return fmt.Errorf("org import: workspace %q has no model and the org defaults block does not provide one (runtime=%s) — model is a required field per the workspace-creation contract; either set `model:` on the workspace or under `defaults:`", ws.Name, runtime)
 	}
 	tier := ws.Tier
 	if tier == 0 {

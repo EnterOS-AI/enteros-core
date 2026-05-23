@@ -321,6 +321,51 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 		payload.Runtime = "langgraph"
 	}
 
+	// SSOT (CTO 2026-05-22, feedback_workspace_model_required_no_platform_default_dynamic_credential_intake):
+	// model is REQUIRED user input for SPAWNED-runtime workspaces. The
+	// platform must not provide a default; the runtime must not fall back.
+	// The decision belongs to the user (or to the agent acting on the
+	// user's behalf), never to the platform.
+	//
+	// Empirical trigger: Code Reviewer 5ba15d7e was created with
+	// `{"name":"Code Reviewer","role":"...","runtime":"codex",...}` (no
+	// model). The legacy `DefaultModel(runtime)` fallback in
+	// provisionWorkspace returned `"anthropic:claude-opus-4-7"`. Codex
+	// adapter only supports openai-* providers — it wedged forever with
+	// `codex adapter: workspace config picks provider='anthropic' but
+	// it is not in the providers registry`. PATCH /workspaces/:id
+	// explicitly disallows updating model (the comment literally reads
+	// `model not patchable`), so the only recovery path was SQL UPDATE
+	// or delete+recreate.
+	//
+	// External workspaces are EXEMPT — they intentionally do not spawn
+	// a Docker container or run an adapter; they delegate to a registered
+	// URL (see provision.go: "external is a first-class runtime that
+	// intentionally does NOT spawn a Docker container"). The MODEL_REQUIRED
+	// gate is meaningful for spawned-runtime workspaces where the model
+	// id drives provider selection at adapter init. For external workspaces
+	// the contract is the URL, not the model — requiring it would be
+	// ceremony with no payoff, and would 422 every legitimate "register
+	// my agent at https://..." flow. The SSOT directive concerns
+	// platform-side defaults; an external workspace genuinely has no
+	// "model decision" for the user to make.
+	//
+	// Fail-closed at the Create boundary so the caller learns the
+	// contract immediately — same shape as the controlplane#188
+	// runtime-unresolved gate above. Caller fixes the request, no
+	// EC2 launched, no stuck workspace, no operator paging.
+	isExternal := payload.External || isExternalLikeRuntime(payload.Runtime)
+	if payload.Model == "" && !isExternal {
+		log.Printf("Create: FAIL-CLOSED — model is required (runtime=%q template=%q); refusing the silent DefaultModel fallback per CTO 2026-05-22 SSOT directive", payload.Runtime, payload.Template)
+		c.JSON(http.StatusUnprocessableEntity, gin.H{
+			"error":    "model is required and has no platform-side default — pass an explicit \"model\" in the request body, or use a \"template\" whose config.yaml declares one. See feedback_workspace_model_required_no_platform_default_dynamic_credential_intake for the contract.",
+			"runtime":  payload.Runtime,
+			"template": payload.Template,
+			"code":     "MODEL_REQUIRED",
+		})
+		return
+	}
+
 	ctx := c.Request.Context()
 
 	// Convert empty role to NULL

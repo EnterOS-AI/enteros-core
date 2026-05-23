@@ -241,8 +241,24 @@ else
 fi
 log "1/5 provisioning parent ($PARENT_RUNTIME, mode=$PV_LOCAL_PROVISION_MODE) + one sibling per runtime under test..."
 
+# Map runtime → model per the CTO 2026-05-22 SSOT directive (model is
+# required, no platform default). External runtimes are exempt by the
+# Create-handler gate — for them the URL is the contract — but we still
+# pass model="external:custom" defensively in case a downstream consumer
+# of the create body asserts presence.
+_model_for_runtime() {
+  case "$1" in
+    claude-code) echo "sonnet" ;;
+    codex)       echo "gpt-5.5" ;;
+    kimi)        echo "kimi-coding/kimi-k2-coding-6" ;;
+    minimax)     echo "minimax/MiniMax-M2.7" ;;
+    external)    echo "external:custom" ;;
+    *)           echo "anthropic:claude-opus-4-7" ;;
+  esac
+}
+PARENT_MODEL=$(_model_for_runtime "$PARENT_RUNTIME")
 P_RESP=$(curl -s -X POST "$BASE/workspaces" ${ADMIN_AUTH[@]+"${ADMIN_AUTH[@]}"} -H "Content-Type: application/json" \
-  -d "{\"name\":\"${NAME_PREFIX}-parent\",\"runtime\":\"$PARENT_RUNTIME\",\"tier\":3$PARENT_EXTRA,\"secrets\":$PARENT_SECRETS}")
+  -d "{\"name\":\"${NAME_PREFIX}-parent\",\"runtime\":\"$PARENT_RUNTIME\",\"model\":\"$PARENT_MODEL\",\"tier\":3$PARENT_EXTRA,\"secrets\":$PARENT_SECRETS}")
 PARENT_ID=$(echo "$P_RESP" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("id",""))' 2>/dev/null)
 if [ -z "$PARENT_ID" ]; then
   echo "::error::parent create failed: $(echo "$P_RESP" | head -c 300)" >&2
@@ -291,8 +307,9 @@ for rt in $PV_RUNTIMES; do
     CREATE_RUNTIME="$rt"
     CREATE_EXTRA=""
   fi
+  CREATE_MODEL=$(_model_for_runtime "$CREATE_RUNTIME")
   R=$(curl -s -X POST "$BASE/workspaces" ${ADMIN_AUTH[@]+"${ADMIN_AUTH[@]}"} -H "Content-Type: application/json" \
-    -d "{\"name\":\"${NAME_PREFIX}-$rt\",\"runtime\":\"$CREATE_RUNTIME\",\"tier\":2,\"parent_id\":\"$PARENT_ID\"$CREATE_EXTRA,\"secrets\":$SEC}")
+    -d "{\"name\":\"${NAME_PREFIX}-$rt\",\"runtime\":\"$CREATE_RUNTIME\",\"model\":\"$CREATE_MODEL\",\"tier\":2,\"parent_id\":\"$PARENT_ID\"$CREATE_EXTRA,\"secrets\":$SEC}")
   WID=$(echo "$R" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("id",""))' 2>/dev/null)
   if [ -z "$WID" ]; then
     echo "::error::$rt workspace create failed: $(echo "$R" | head -c 300)" >&2

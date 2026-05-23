@@ -386,7 +386,13 @@ func TestWorkspaceCreate(t *testing.T) {
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 
-	body := `{"name":"Test Agent","canvas":{"x":100,"y":200}}`
+	// Note: model is now required at the Create boundary (CTO 2026-05-22
+	// SSOT directive — see feedback_workspace_model_required_no_platform_default_dynamic_credential_intake
+	// and TestCreate_ModelRequired_Returns422). This test happens to take
+	// the bare-defaults path (no template, no runtime → langgraph), so
+	// the body must declare an explicit model. Using a langgraph-compatible
+	// id; the test doesn't exercise model semantics beyond presence.
+	body := `{"name":"Test Agent","model":"anthropic:claude-opus-4-7","canvas":{"x":100,"y":200}}`
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 

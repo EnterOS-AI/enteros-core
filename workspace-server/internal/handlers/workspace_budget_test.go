@@ -170,7 +170,7 @@ func TestWorkspaceBudget_Create_WithLimit(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
-	body := `{"name":"Budgeted Agent","budget_limit":1000}`
+	body := `{"name":"Budgeted Agent","model":"anthropic:claude-opus-4-7","budget_limit":1000}`
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 	handler.Create(c)

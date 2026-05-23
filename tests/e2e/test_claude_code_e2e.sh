@@ -50,13 +50,16 @@ docker rm $(docker ps -aq --filter "name=ws-") 2>/dev/null || true
 echo ""
 echo "--- Create Workspaces ---"
 
+# model is required at the Create boundary (CTO 2026-05-22 SSOT —
+# feedback_workspace_model_required_no_platform_default_dynamic_credential_intake).
+# Pass the same value the deleted DefaultModel("claude-code") returned.
 ROOT=$(curl -s -X POST $PLATFORM/workspaces -H "Content-Type: application/json" \
-  -d '{"name":"Root Agent","role":"Company coordinator","runtime":"claude-code","tier":3}' \
+  -d '{"name":"Root Agent","role":"Company coordinator","runtime":"claude-code","model":"sonnet","tier":3}' \
   | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
 check_contains "Create root workspace" "-" "$ROOT"
 
 CHILD=$(curl -s -X POST $PLATFORM/workspaces -H "Content-Type: application/json" \
-  -d "{\"name\":\"Child Agent\",\"role\":\"Sub-team member\",\"runtime\":\"claude-code\",\"tier\":2,\"parent_id\":\"$ROOT\"}" \
+  -d "{\"name\":\"Child Agent\",\"role\":\"Sub-team member\",\"runtime\":\"claude-code\",\"model\":\"sonnet\",\"tier\":2,\"parent_id\":\"$ROOT\"}" \
   | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
 check_contains "Create child workspace" "-" "$CHILD"
 

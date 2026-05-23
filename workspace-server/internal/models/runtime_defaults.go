@@ -1,39 +1,31 @@
 package models
 
-// runtime_defaults.go — single source of truth for per-runtime defaults
-// the platform applies when the operator/agent didn't supply a value.
+// runtime_defaults.go — DELETED helper. Intentionally empty.
 //
-// Why this lives in models/ (not handlers/): default selection is a
-// pure data fact about the runtime, not handler logic. Multiple
-// callers (Create-workspace handler, org-import handler, future
-// auto-provision paths) need the same answer; concentrating the
-// rule here means one edit when a runtime's default changes.
+// Previously held `DefaultModel(runtime string) string` which returned
+// "sonnet" for claude-code and "anthropic:claude-opus-4-7" for everything
+// else. That function was a SOFT-FALLBACK bug magnet:
 //
-// Related work (RFC #2873): this is the seed for a future
-// `RuntimeConfig` interface that will also expose `ProvisioningTimeout()`,
-// `CapabilitiesSupported()`, and other per-runtime facts. For now the
-// surface is one helper — extracted from the duplicate branch in
-// workspace_provision.go:537 and org_import.go:54 that diverged silently
-// during refactors before this consolidation.
-
-// DefaultModel returns the model slug to use when a workspace is
-// created without an explicit model and the runtime can't infer one
-// from its own config.
+//   - codex workspaces created without an explicit `model` silently
+//     received `anthropic:claude-opus-4-7`. Codex adapter only supports
+//     openai-* providers, so they wedged in `not_configured` with
+//     `codex adapter: workspace config picks provider='anthropic' but
+//     it is not in the providers registry`. The fallback never matched
+//     a runtime that could actually use it (only langgraph + hermes
+//     could even partially execute anthropic:claude-opus-4-7 without
+//     extra credential plumbing). It existed as a "must return
+//     something" placeholder that turned every silent miss into a
+//     prod incident.
 //
-//   - claude-code: "sonnet" — Anthropic's CLI accepts the short
-//     name and resolves it via the operator's anthropic-oauth or
-//     ANTHROPIC_API_KEY chain.
-//   - everything else (hermes, langgraph, autogen, codex, openclaw,
-//     external, ""): a fully-qualified
-//     vendor:model slug that the universal MODEL_PROVIDER chain in
-//     molecule-core PR #247 can route via per-vendor required_env.
+//   - The fallback hid the contract bug at every callsite: Create
+//     handler, org_import, anywhere a stale CreateWorkspacePayload
+//     bubbled through to provisionWorkspace.
 //
-// The function never returns an empty string; an unknown runtime
-// gets the universal default rather than failing closed (matches the
-// pre-refactor behavior — both call sites used the same fallback).
-func DefaultModel(runtime string) string {
-	if runtime == "claude-code" {
-		return "sonnet"
-	}
-	return "anthropic:claude-opus-4-7"
-}
+// SSOT principle (CTO 2026-05-22T03:42Z, feedback_workspace_model_required_no_platform_default_dynamic_credential_intake):
+// model / provider / provider-credential are REQUIRED user input at
+// create time. The platform must not provide a default. The runtime
+// must not fall back. Decision belongs to the user (or to the agent
+// acting on the user's behalf), never to the platform.
+//
+// Callers that previously fell back to DefaultModel must now fail-closed
+// when model is empty after template-resolution.

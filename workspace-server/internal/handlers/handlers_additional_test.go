@@ -44,7 +44,7 @@ func TestWorkspaceCreate_WithParentID(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
-	body := `{"name":"Child Agent","parent_id":"parent-ws-123"}`
+	body := `{"name":"Child Agent","model":"anthropic:claude-opus-4-7","parent_id":"parent-ws-123"}`
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
@@ -80,7 +80,7 @@ func TestWorkspaceCreate_ExplicitClaudeCodeRuntime(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
-	body := `{"name":"CC Agent","tier":2,"runtime":"claude-code","canvas":{"x":10,"y":20}}`
+	body := `{"name":"CC Agent","tier":2,"runtime":"claude-code","model":"sonnet","canvas":{"x":10,"y":20}}`
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
@@ -301,7 +301,7 @@ func TestWorkspaceCreate_MaxConcurrentTasksOverride(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
-	body := `{"name":"Leader Agent","runtime":"claude-code","max_concurrent_tasks":3}`
+	body := `{"name":"Leader Agent","runtime":"claude-code","model":"sonnet","max_concurrent_tasks":3}`
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 

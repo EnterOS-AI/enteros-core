@@ -193,10 +193,17 @@ func TestEnsureDefaultConfig_Hermes(t *testing.T) {
 	broadcaster := newTestBroadcaster()
 	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
 
+	// Post-CTO-SSOT-directive (2026-05-22): model is required user input;
+	// ensureDefaultConfig no longer fills in a runtime default. The Create
+	// handler gates on empty model and 422s before reaching here, so this
+	// test now passes the model explicitly to exercise the YAML rendering
+	// path — same model value the prior implicit DefaultModel("hermes")
+	// returned.
 	payload := models.CreateWorkspacePayload{
 		Name:    "Test Agent",
 		Tier:    1,
 		Runtime: "hermes",
+		Model:   "anthropic:claude-opus-4-7",
 	}
 
 	files := handler.ensureDefaultConfig("ws-test-123", payload)
@@ -219,7 +226,7 @@ func TestEnsureDefaultConfig_Hermes(t *testing.T) {
 		t.Errorf("config.yaml missing tier, got:\n%s", content)
 	}
 	if !contains(content, `model: "anthropic:claude-opus-4-7"`) {
-		t.Errorf("config.yaml should use default non-claude model, got:\n%s", content)
+		t.Errorf("config.yaml should render the supplied model, got:\n%s", content)
 	}
 }
 
@@ -227,10 +234,14 @@ func TestEnsureDefaultConfig_ClaudeCode(t *testing.T) {
 	broadcaster := newTestBroadcaster()
 	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
 
+	// Post-CTO-SSOT-directive (2026-05-22): model is supplied explicitly
+	// instead of relying on the deleted DefaultModel("claude-code") =
+	// "sonnet" fallback. The Create handler 422s on empty model upstream.
 	payload := models.CreateWorkspacePayload{
 		Name:    "Code Agent",
 		Tier:    2,
 		Runtime: "claude-code",
+		Model:   "sonnet",
 	}
 
 	files := handler.ensureDefaultConfig("ws-code-123", payload)
@@ -407,9 +418,16 @@ func TestEnsureDefaultConfig_EmptyRuntimeDefaultsToClaudeCode(t *testing.T) {
 	broadcaster := newTestBroadcaster()
 	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
 
+	// Post-CTO-SSOT-directive (2026-05-22): ensureDefaultConfig is no
+	// longer the source of the model default — it just renders whatever
+	// the Create handler decided. The "empty runtime → claude-code"
+	// fallback inside sanitizeRuntime() is still in effect; this test
+	// continues to pin that behaviour by supplying the explicit
+	// claude-code model that the Create handler would have required.
 	payload := models.CreateWorkspacePayload{
-		Name: "Default Agent",
-		Tier: 1,
+		Name:  "Default Agent",
+		Tier:  1,
+		Model: "sonnet",
 	}
 
 	files := handler.ensureDefaultConfig("ws-empty-rt", payload)
@@ -418,7 +436,7 @@ func TestEnsureDefaultConfig_EmptyRuntimeDefaultsToClaudeCode(t *testing.T) {
 		t.Errorf("empty runtime should default to claude-code, got:\n%s", configYAML)
 	}
 	if !contains(configYAML, `model: "sonnet"`) {
-		t.Errorf("claude-code default model should be sonnet (quoted), got:\n%s", configYAML)
+		t.Errorf("claude-code workspace should render the supplied model (quoted), got:\n%s", configYAML)
 	}
 }
 

@@ -777,6 +777,103 @@ func TestCreate_FieldValidation_Returns400(t *testing.T) {
 	}
 }
 
+// TestCreate_ModelRequired_Returns422 pins the CTO 2026-05-22 SSOT
+// directive (feedback_workspace_model_required_no_platform_default_dynamic_credential_intake):
+// model is required user input; the platform must not supply a default,
+// the runtime must not fall back. Empirical trigger: Code Reviewer
+// 5ba15d7e was created with `{"name":..., "runtime":"codex", ...}` (no
+// model). The legacy DefaultModel fallback returned "anthropic:claude-opus-4-7"
+// and codex adapter wedged forever — `picks provider='anthropic' but it
+// is not in the providers registry`. The gate at the Create boundary
+// turns that silent stuck-workspace failure into an immediate 422 the
+// caller can react to.
+//
+// Three shapes covered:
+//  1. bare name (no template, no runtime, no model) — formerly defaulted
+//     to langgraph + anthropic; now 422 because model is unspecified.
+//  2. explicit runtime, no model — the Code Reviewer repro shape.
+//  3. explicit runtime+template path, but template (when missing on
+//     disk or unreadable) would leave model empty — exercised here by
+//     pointing at a non-existent template under /tmp/configs.
+func TestCreate_ModelRequired_Returns422(t *testing.T) {
+	setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", "/tmp/configs")
+
+	cases := []struct{ label, body string }{
+		{"bare_name_no_runtime_no_model", `{"name":"x"}`},
+		{"explicit_codex_no_model", `{"name":"Code Reviewer","role":"code reviewer","runtime":"codex","tier":4,"max_concurrent_tasks":1}`},
+		{"explicit_hermes_no_model", `{"name":"researcher","runtime":"hermes"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.label, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(tc.body))
+			c.Request.Header.Set("Content-Type", "application/json")
+			handler.Create(c)
+			if w.Code != http.StatusUnprocessableEntity {
+				t.Errorf("Create(%s): want 422 MODEL_REQUIRED, got %d: %s", tc.label, w.Code, w.Body.String())
+				return
+			}
+			if !bytes.Contains(w.Body.Bytes(), []byte(`"code":"MODEL_REQUIRED"`)) {
+				t.Errorf("Create(%s): want body containing code=MODEL_REQUIRED, got %s", tc.label, w.Body.String())
+			}
+		})
+	}
+}
+
+// TestCreate_ExternalRuntime_NoModel_OK pins the external-runtime
+// exemption from the MODEL_REQUIRED gate. External workspaces
+// intentionally do not spawn a Docker container or run an adapter;
+// they delegate to a registered URL (workspace_provision.go:497-498:
+// "external is a first-class runtime that intentionally does NOT
+// spawn a Docker container"). The model field has no meaning for
+// them — the URL is the contract, and the gate would 422 every
+// legitimate "register my agent at https://..." flow.
+//
+// Both spellings count as external:
+//   1. payload.External == true (the canonical flag, e.g. with any runtime)
+//   2. payload.Runtime == "external" (legacy shape some E2E scripts still use)
+//
+// The isExternalLikeRuntime() helper catches both "external" and any
+// future external-like runtime alias.
+func TestCreate_ExternalRuntime_NoModel_OK(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
+
+	// External=true with explicit runtime — the test_api.sh / Echo Agent shape.
+	mock.ExpectBegin()
+	mock.ExpectExec("INSERT INTO workspaces").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+	mock.ExpectExec("INSERT INTO canvas_layouts").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO structure_events").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`UPDATE workspaces SET status =`).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO workspace_auth_tokens").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO structure_events").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	body := `{"name":"Echo Agent","tier":1,"runtime":"external","external":true}`
+	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	handler.Create(c)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("external workspace without model: want 201, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations not met: %v", err)
+	}
+}
+
 func TestUpdate_FieldValidation_Returns400(t *testing.T) {
 	setupTestDB(t)
 	setupTestRedis(t)

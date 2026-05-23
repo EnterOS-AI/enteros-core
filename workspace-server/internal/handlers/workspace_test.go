@@ -349,7 +349,7 @@ func TestWorkspaceCreate_DBInsertError(t *testing.T) {
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 
-	body := `{"name":"Failing Agent"}`
+	body := `{"name":"Failing Agent","model":"anthropic:claude-opus-4-7"}`
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
@@ -391,7 +391,7 @@ func TestWorkspaceCreate_DefaultsApplied(t *testing.T) {
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 
-	body := `{"name":"Default Agent"}`
+	body := `{"name":"Default Agent","model":"anthropic:claude-opus-4-7"}`
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
@@ -438,7 +438,7 @@ func TestWorkspaceCreate_SaaSHardForcesTier4(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
-	body := `{"name":"SaaS External Agent","runtime":"external","external":true,"url":"https://example.com/agent","tier":2}`
+	body := `{"name":"SaaS External Agent","runtime":"external","model":"external:custom","external":true,"url":"https://example.com/agent","tier":2}`
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
@@ -479,7 +479,7 @@ func TestWorkspaceCreate_WithSecrets_Persists(t *testing.T) {
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 
-	body := `{"name":"Hermes Agent","runtime":"hermes","external":true,"secrets":{"HERMES_API_KEY":"sk-test-123"}}`
+	body := `{"name":"Hermes Agent","runtime":"hermes","model":"anthropic:claude-opus-4-7","external":true,"secrets":{"HERMES_API_KEY":"sk-test-123"}}`
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
@@ -513,7 +513,7 @@ func TestWorkspaceCreate_SecretPersistFails_RollsBack(t *testing.T) {
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 
-	body := `{"name":"Rollback Agent","secrets":{"OPENAI_API_KEY":"sk-fail"}}`
+	body := `{"name":"Rollback Agent","model":"anthropic:claude-opus-4-7","secrets":{"OPENAI_API_KEY":"sk-fail"}}`
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
@@ -548,7 +548,7 @@ func TestWorkspaceCreate_EmptySecrets_OK(t *testing.T) {
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 
-	body := `{"name":"No Secrets Agent","external":true,"secrets":{}}`
+	body := `{"name":"No Secrets Agent","model":"anthropic:claude-opus-4-7","external":true,"secrets":{}}`
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
@@ -587,7 +587,7 @@ func TestWorkspaceCreate_ExternalURL_SSRFSafe(t *testing.T) {
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 
-	body := `{"name":"Ext Agent","runtime":"external","external":true,"url":"http://localhost:8000"}`
+	body := `{"name":"Ext Agent","runtime":"external","model":"external:custom","external":true,"url":"http://localhost:8000"}`
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
@@ -629,7 +629,7 @@ func TestWorkspaceCreate_KimiRuntime_PreservesLabel(t *testing.T) {
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 
-	body := `{"name":"Kimi Agent","runtime":"kimi","tier":3,"canvas":{"x":100,"y":100}}`
+	body := `{"name":"Kimi Agent","runtime":"kimi","model":"kimi-coding/kimi-k2-coding-6","tier":3,"canvas":{"x":100,"y":100}}`
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
@@ -659,7 +659,7 @@ func TestWorkspaceCreate_ExternalURL_SSRFMetadataBlocked(t *testing.T) {
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 
-	body := `{"name":"Bad Agent","runtime":"external","external":true,"url":"http://169.254.169.254/latest/meta-data/"}`
+	body := `{"name":"Bad Agent","runtime":"external","model":"external:custom","external":true,"url":"http://169.254.169.254/latest/meta-data/"}`
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
@@ -690,7 +690,7 @@ func TestWorkspaceCreate_ExternalURL_SSRFLoopbackBlocked(t *testing.T) {
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 
-	body := `{"name":"Bad Loopback","runtime":"external","external":true,"url":"http://127.0.0.1:9000/a2a"}`
+	body := `{"name":"Bad Loopback","runtime":"external","model":"external:custom","external":true,"url":"http://127.0.0.1:9000/a2a"}`
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
@@ -1844,39 +1844,43 @@ func TestWorkspaceCreate_188_TemplateConfigNoRuntimeKey_FailsClosed(t *testing.T
 	}
 }
 
-// Regression guard: the legitimate default path (no template, no runtime —
-// bare {"name":...}) MUST still default to langgraph and return 201. The
-// #188 fix must not break this.
-func TestWorkspaceCreate_188_NoTemplateNoRuntime_StillDefaultsLanggraph(t *testing.T) {
-	mock := setupTestDB(t)
+// Pre-2026-05-22 this test guarded "bare {name} → langgraph 201" — the
+// regression check for controlplane#188 (where an explicit runtime that
+// failed to resolve must NOT silently substitute langgraph) had a sibling
+// to ensure the LEGITIMATE bare default still landed on langgraph.
+//
+// Post-CTO-SSOT-directive (2026-05-22) bare body is 422 MODEL_REQUIRED
+// before reaching the langgraph branch — the gate runs AFTER the
+// langgraph-default assignment so the error body still surfaces
+// runtime=langgraph (helps the caller see "ok, langgraph WOULD have
+// been the runtime, but you still owe me a model"). The bare-body
+// langgraph 201 path no longer exists; what we guard now is the
+// 422-shape diagnostic.
+//
+// Bare-body-with-explicit-model 201 (the new "legitimate default" path)
+// is covered by TestWorkspaceCreate in handlers_test.go — no need to
+// duplicate the mock dance here.
+func TestWorkspaceCreate_188_NoTemplateNoRuntime_NowMODEL_REQUIRED(t *testing.T) {
+	setupTestDB(t)
 	setupTestRedis(t)
 	broadcaster := newTestBroadcaster()
 	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
-
-	mock.ExpectBegin()
-	mock.ExpectExec("INSERT INTO workspaces").
-		WithArgs(sqlmock.AnyArg(), "Plain Default", nil, 3, "langgraph", sqlmock.AnyArg(), (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectCommit()
-	mock.ExpectExec("INSERT INTO canvas_layouts").
-		WithArgs(sqlmock.AnyArg(), float64(0), float64(0)).
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec("INSERT INTO structure_events").
-		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 	body := `{"name":"Plain Default"}`
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
-
 	handler.Create(c)
 
-	if w.Code != http.StatusCreated {
-		t.Fatalf("expected 201 (legitimate default path), got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("bare-body create: expected 422 MODEL_REQUIRED, got %d: %s", w.Code, w.Body.String())
 	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("unmet sqlmock expectations: %v", err)
+	if !bytes.Contains(w.Body.Bytes(), []byte(`"code":"MODEL_REQUIRED"`)) {
+		t.Errorf("bare-body create: expected code=MODEL_REQUIRED in body, got %s", w.Body.String())
+	}
+	if !bytes.Contains(w.Body.Bytes(), []byte(`"runtime":"langgraph"`)) {
+		t.Errorf("bare-body create: expected runtime=\"langgraph\" in 422 body (the gate runs AFTER the langgraph-default assignment so the diagnostic surfaces what runtime WOULD have been used), got %s", w.Body.String())
 	}
 }
 
@@ -1901,7 +1905,7 @@ func TestWorkspaceCreate_188_ExplicitRuntimeNoTemplate_OK(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
-	body := `{"name":"Explicit Codex","runtime":"codex"}`
+	body := `{"name":"Explicit Codex","runtime":"codex","model":"gpt-5.5"}`
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 

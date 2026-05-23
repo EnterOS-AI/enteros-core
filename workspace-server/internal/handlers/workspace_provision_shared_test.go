@@ -756,47 +756,55 @@ func TestWorkspaceCreate_FirstDeploy_PersistsModelAndProvider(t *testing.T) {
 	}
 }
 
-// TestWorkspaceCreate_FirstDeploy_NoModel_NoSecretWritten asserts that
-// when payload.Model is empty, NEITHER MODEL nor LLM_PROVIDER is
-// written. Important: the canvas can omit `model` (template inherits
-// the runtime default later); we must not poison workspace_secrets with
-// empty rows in that case.
-func TestWorkspaceCreate_FirstDeploy_NoModel_NoSecretWritten(t *testing.T) {
+// TestWorkspaceCreate_FirstDeploy_NoModel_Returns422 inverts the prior
+// premise (CTO 2026-05-22 SSOT directive — see
+// feedback_workspace_model_required_no_platform_default_dynamic_credential_intake
+// and TestCreate_ModelRequired_Returns422 in handlers_extended_test.go).
+//
+// Pre-2026-05-22 the canvas was allowed to omit `model` and the workspace
+// would 201 with no workspace_secrets rows for MODEL/LLM_PROVIDER (the
+// thinking being that templates inherit the runtime default later). That
+// "soft fallback" was the load-bearing bug magnet — `DefaultModel(runtime)`
+// would later return `anthropic:claude-opus-4-7`, and codex workspaces
+// wedged forever at adapter init.
+//
+// New contract: empty model is a 422 MODEL_REQUIRED, with NO DB writes
+// at all. The gate fires at the Create boundary before INSERT INTO
+// workspaces. The follow-on workspace_secrets gate (which the original
+// test pinned) is therefore unreachable on the empty-model path — there
+// is no row to mint secrets for.
+func TestWorkspaceCreate_FirstDeploy_NoModel_Returns422(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
 	broadcaster := newTestBroadcaster()
 	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
 
-	mock.ExpectBegin()
-	mock.ExpectExec("INSERT INTO workspaces").
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectCommit()
-	// NO INSERT INTO workspace_secrets here — the gate is payload.Model != "".
+	// NO mock.ExpectBegin / INSERT INTO workspaces — the Create gate
+	// MUST fire before any DB write. If the gate fires late, sqlmock
+	// will surface "call to ExecQuery 'INSERT INTO workspaces' was not
+	// expected" — which is exactly the failure mode we want to flag.
 
-	mock.ExpectExec("INSERT INTO canvas_layouts").
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec("INSERT INTO structure_events").
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec(`UPDATE workspaces SET status =`).
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec("INSERT INTO workspace_auth_tokens").
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec("INSERT INTO structure_events").
-		WillReturnResult(sqlmock.NewResult(0, 1))
-
+	// Body: hermes runtime WITHOUT external:true (the external-runtime
+	// exemption — see TestCreate_ExternalRuntime_NoModel_OK — does NOT
+	// apply here; hermes spawns a real adapter and model selection
+	// matters at adapter init). This is exactly the shape the old
+	// "no-model-no-secret-write" test pinned, minus the external flag.
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
-	body := `{"name":"No Model Agent","runtime":"hermes","external":true}`
+	body := `{"name":"No Model Agent","runtime":"hermes"}`
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
 	handler.Create(c)
 
-	if w.Code != http.StatusCreated {
-		t.Fatalf("expected status 201, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 MODEL_REQUIRED for empty model, got %d: %s", w.Code, w.Body.String())
+	}
+	if !bytes.Contains(w.Body.Bytes(), []byte(`"code":"MODEL_REQUIRED"`)) {
+		t.Errorf("expected code=MODEL_REQUIRED in body, got %s", w.Body.String())
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("sqlmock expectations not met — empty payload.Model should NOT trigger workspace_secrets writes: %v", err)
+		t.Errorf("sqlmock saw an unexpected DB write — the MODEL_REQUIRED gate fired too late: %v", err)
 	}
 }
 
