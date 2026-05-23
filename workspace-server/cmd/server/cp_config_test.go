@@ -30,7 +30,7 @@ func TestRefreshEnvFromCP_AppliesCPResponse(t *testing.T) {
 			t.Errorf("org id header: got %q", got)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"MOLECULE_CP_SHARED_SECRET":"new-secret","MOLECULE_CP_URL":"https://api.moleculesai.app"}`)
+		fmt.Fprint(w, `{"MOLECULE_CP_SHARED_SECRET":"new-secret","MOLECULE_CP_URL":"https://api.moleculesai.app","DISPLAY_SESSION_SIGNING_SECRET":"display-secret"}`)
 	}))
 	defer srv.Close()
 
@@ -44,6 +44,9 @@ func TestRefreshEnvFromCP_AppliesCPResponse(t *testing.T) {
 	}
 	if got := os.Getenv("MOLECULE_CP_SHARED_SECRET"); got != "new-secret" {
 		t.Errorf("SHARED_SECRET: want new-secret, got %q", got)
+	}
+	if got := os.Getenv("DISPLAY_SESSION_SIGNING_SECRET"); got != "display-secret" {
+		t.Errorf("DISPLAY_SESSION_SIGNING_SECRET: want display-secret, got %q", got)
 	}
 }
 

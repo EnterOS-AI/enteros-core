@@ -2,10 +2,15 @@ package handlers
 
 import (
 	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -54,6 +59,7 @@ func TestWorkspaceDisplayControl_NoActiveLockReturnsNone(t *testing.T) {
 
 func TestWorkspaceDisplayControlAcquire_ClaimsUnlockedDisplay(t *testing.T) {
 	mock := setupTestDB(t)
+	t.Setenv("DISPLAY_SESSION_SIGNING_SECRET", "display-session-test-secret")
 	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
 	expiresAt := time.Date(2026, 5, 23, 18, 30, 0, 0, time.UTC)
 
@@ -87,13 +93,39 @@ func TestWorkspaceDisplayControlAcquire_ClaimsUnlockedDisplay(t *testing.T) {
 	if resp["expires_at"] == "" {
 		t.Fatalf("expires_at missing in response: %#v", resp)
 	}
+	sessionURL, ok := resp["session_url"].(string)
+	if !ok || !strings.HasPrefix(sessionURL, "/workspaces/ws-display/display/session/websockify#token=") {
+		t.Fatalf("session_url = %#v, want signed websockify URL fragment", resp["session_url"])
+	}
+	if strings.Contains(sessionURL, "?token=") {
+		t.Fatalf("session_url must not put display token in logged query string: %q", sessionURL)
+	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations: %v", err)
 	}
 }
 
+func TestDisplaySessionToken_RequiresDedicatedSigningSecret(t *testing.T) {
+	t.Setenv("ADMIN_TOKEN", "client-exposed-admin-token")
+	t.Setenv("DISPLAY_SESSION_SIGNING_SECRET", "")
+	expiresAt := time.Now().Add(5 * time.Minute)
+
+	if token := signDisplaySessionToken("ws-display", "admin-token", expiresAt); token != "" {
+		t.Fatalf("signDisplaySessionToken minted token with no dedicated signing secret: %q", token)
+	}
+
+	payload := "ws-display|admin-token|" + strconv.FormatInt(expiresAt.Unix(), 10)
+	mac := hmac.New(sha256.New, []byte(""))
+	_, _ = mac.Write([]byte(payload))
+	forged := base64.RawURLEncoding.EncodeToString([]byte(payload)) + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+	if validateDisplaySessionToken(forged, "ws-display", "admin-token", expiresAt) {
+		t.Fatal("validateDisplaySessionToken accepted empty-secret forged token")
+	}
+}
+
 func TestWorkspaceDisplayControlAcquire_ActiveLockReturnsConflict(t *testing.T) {
 	mock := setupTestDB(t)
+	t.Setenv("DISPLAY_SESSION_SIGNING_SECRET", "display-session-test-secret")
 	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
 	expiresAt := time.Date(2026, 5, 23, 18, 30, 0, 0, time.UTC)
 
@@ -130,6 +162,32 @@ func TestWorkspaceDisplayControlAcquire_ActiveLockReturnsConflict(t *testing.T) 
 	current, ok := resp["current"].(map[string]interface{})
 	if !ok || current["controller"] != "agent" || current["controlled_by"] != "sidecar" {
 		t.Fatalf("current lock = %#v, want agent/sidecar", resp["current"])
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+func TestWorkspaceDisplayControlAcquire_RejectsMissingSessionSigningSecret(t *testing.T) {
+	mock := setupTestDB(t)
+	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
+
+	mock.ExpectQuery(`SELECT COALESCE\(compute, '\{\}'::jsonb\) FROM workspaces WHERE id = \$1`).
+		WithArgs("ws-display").
+		WillReturnRows(sqlmock.NewRows([]string{"compute"}).AddRow(`{"display":{"mode":"desktop-control","protocol":"dcv","width":1920,"height":1080}}`))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-display"}}
+	c.Request = httptest.NewRequest("POST", "/workspaces/ws-display/display/control/acquire", bytes.NewBufferString(`{"controller":"user","ttl_seconds":300}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	attachDisplayControlAdminToken(t, c)
+	t.Setenv("DISPLAY_SESSION_SIGNING_SECRET", "")
+
+	handler.AcquireDisplayControl(c)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected status 503, got %d: %s", w.Code, w.Body.String())
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations: %v", err)
