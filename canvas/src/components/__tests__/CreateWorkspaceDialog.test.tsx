@@ -123,6 +123,46 @@ describe("CreateWorkspaceDialog", () => {
     expect(body.parent_id).toBeUndefined();
   });
 
+  it("omits compute config by default", async () => {
+    await openDialog();
+    fireEvent.change(screen.getByPlaceholderText("e.g. SEO Agent"), {
+      target: { value: "Plain Agent" },
+    });
+
+    const createBtn = screen.getAllByRole("button").find((b) => b.textContent === "Create");
+    fireEvent.click(createBtn!);
+
+    await waitFor(() => expect(mockPost).toHaveBeenCalled());
+    const body = mockPost.mock.calls[0][1] as Record<string, unknown>;
+    expect(body.compute).toBeUndefined();
+    expect(body.model).toBe("anthropic:claude-opus-4-7");
+  });
+
+  it("sends display compute profile when desktop display is enabled", async () => {
+    await openDialog();
+    fireEvent.change(screen.getByPlaceholderText("e.g. SEO Agent"), {
+      target: { value: "Desktop Agent" },
+    });
+    fireEvent.click(screen.getByLabelText("Enable display"));
+
+    const createBtn = screen.getAllByRole("button").find((b) => b.textContent === "Create");
+    fireEvent.click(createBtn!);
+
+    await waitFor(() => expect(mockPost).toHaveBeenCalled());
+    const body = mockPost.mock.calls[0][1] as Record<string, unknown>;
+    expect(body.model).toBe("anthropic:claude-opus-4-7");
+    expect(body.compute).toEqual({
+      instance_type: "t3.xlarge",
+      volume: { root_gb: 80 },
+      display: {
+        mode: "desktop-control",
+        protocol: "novnc",
+        width: 1920,
+        height: 1080,
+      },
+    });
+  });
+
   it("renders gracefully when GET /workspaces fails", async () => {
     mockGet.mockRejectedValueOnce(new Error("Network error"));
     await openDialog();

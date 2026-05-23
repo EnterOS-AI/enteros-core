@@ -71,6 +71,61 @@ describe("DisplayTab", () => {
     });
   });
 
+  it("renders the desktop stream when a display session is available", async () => {
+    mockGet
+      .mockResolvedValueOnce({
+        available: true,
+        mode: "desktop-control",
+        protocol: "dcv",
+        width: 1920,
+        height: 1080,
+        viewer_url: "https://display.example.test/session/ws-display",
+      })
+      .mockResolvedValueOnce({
+        controller: "none",
+      });
+
+    render(<DisplayTab workspaceId="ws-display" />);
+
+    await waitFor(() => {
+      expect(screen.getByTitle("Workspace desktop")).toBeTruthy();
+    });
+    const frame = screen.getByTitle("Workspace desktop") as HTMLIFrameElement;
+    expect(frame.src).toBe("https://display.example.test/session/ws-display");
+    expect(screen.getByRole("button", { name: "Take control" })).toBeTruthy();
+  });
+
+  it("releases user display control", async () => {
+    mockGet
+      .mockResolvedValueOnce({
+        available: true,
+        mode: "desktop-control",
+        protocol: "dcv",
+        viewer_url: "https://display.example.test/session/ws-display",
+      })
+      .mockResolvedValueOnce({
+        controller: "user",
+        controlled_by: "admin-token",
+        expires_at: "2026-05-23T08:48:27Z",
+      });
+    mockPost.mockResolvedValueOnce({
+      controller: "none",
+    });
+
+    render(<DisplayTab workspaceId="ws-display" />);
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Release" })).toBeTruthy();
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Release" }));
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Take control" })).toBeTruthy();
+    });
+    expect(mockPost).toHaveBeenCalledWith("/workspaces/ws-display/display/control/release", {});
+  });
+
   it("renders active display control locks as observe-only", async () => {
     mockGet
       .mockResolvedValueOnce({

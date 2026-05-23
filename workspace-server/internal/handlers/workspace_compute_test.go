@@ -43,6 +43,20 @@ func TestValidateWorkspaceCompute_RejectsOutOfRangeRootVolume(t *testing.T) {
 	}
 }
 
+func TestValidateWorkspaceCompute_RejectsOutOfRangeDisplayDimensions(t *testing.T) {
+	for _, display := range []models.WorkspaceComputeDisplay{
+		{Mode: "desktop-control", Protocol: "novnc", Width: 799, Height: 1080},
+		{Mode: "desktop-control", Protocol: "novnc", Width: 3841, Height: 1080},
+		{Mode: "desktop-control", Protocol: "novnc", Width: 1920, Height: 599},
+		{Mode: "desktop-control", Protocol: "novnc", Width: 1920, Height: 2161},
+	} {
+		compute := models.WorkspaceCompute{Display: display}
+		if err := validateWorkspaceCompute(compute); err == nil {
+			t.Fatalf("validateWorkspaceCompute accepted display size %dx%d", display.Width, display.Height)
+		}
+	}
+}
+
 func TestWorkspaceComputeJSON_OmitsEmptyNestedSections(t *testing.T) {
 	got, err := workspaceComputeJSON(models.WorkspaceCompute{
 		InstanceType: "m6i.xlarge",
@@ -141,6 +155,7 @@ func TestBuildProvisionerConfig_CopiesComputeSizingFromPayload(t *testing.T) {
 			Compute: models.WorkspaceCompute{
 				InstanceType: "m6i.xlarge",
 				Volume:       models.WorkspaceComputeVolume{RootGB: 100},
+				Display:      models.WorkspaceComputeDisplay{Mode: "desktop-control", Protocol: "novnc", Width: 1920, Height: 1080},
 			},
 		},
 		nil,
@@ -153,6 +168,12 @@ func TestBuildProvisionerConfig_CopiesComputeSizingFromPayload(t *testing.T) {
 	}
 	if cfg.DiskGB != 100 {
 		t.Errorf("cfg.DiskGB = %d, want 100", cfg.DiskGB)
+	}
+	if cfg.Display.Mode != "desktop-control" || cfg.Display.Protocol != "novnc" {
+		t.Errorf("cfg.Display mode/protocol = %q/%q, want desktop-control/novnc", cfg.Display.Mode, cfg.Display.Protocol)
+	}
+	if cfg.Display.Width != 1920 || cfg.Display.Height != 1080 {
+		t.Errorf("cfg.Display size = %dx%d, want 1920x1080", cfg.Display.Width, cfg.Display.Height)
 	}
 }
 
@@ -217,7 +238,7 @@ func TestWorkspaceDisplay_DisplayConfiguredReturnsSessionUnavailableContract(t *
 
 	mock.ExpectQuery(`SELECT COALESCE\(compute, '\{\}'::jsonb\) FROM workspaces WHERE id = \$1`).
 		WithArgs("ws-display").
-		WillReturnRows(sqlmock.NewRows([]string{"compute"}).AddRow(`{"display":{"mode":"desktop-control","protocol":"dcv","width":1920,"height":1080}}`))
+		WillReturnRows(sqlmock.NewRows([]string{"compute"}).AddRow(`{"display":{"mode":"desktop-control","protocol":"novnc","width":1920,"height":1080}}`))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -242,14 +263,91 @@ func TestWorkspaceDisplay_DisplayConfiguredReturnsSessionUnavailableContract(t *
 	if resp["status"] != "not_configured" {
 		t.Fatalf("status = %v, want not_configured", resp["status"])
 	}
-	if resp["mode"] != "desktop-control" || resp["protocol"] != "dcv" {
-		t.Fatalf("mode/protocol = %v/%v, want desktop-control/dcv", resp["mode"], resp["protocol"])
+	if resp["mode"] != "desktop-control" || resp["protocol"] != "novnc" {
+		t.Fatalf("mode/protocol = %v/%v, want desktop-control/novnc", resp["mode"], resp["protocol"])
 	}
 	if resp["width"] != float64(1920) || resp["height"] != float64(1080) {
 		t.Fatalf("width/height = %v/%v, want 1920/1080", resp["width"], resp["height"])
 	}
 	if _, ok := resp["url"]; ok {
 		t.Fatalf("display response exposed url before session infra exists: %v", resp["url"])
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+func TestWorkspaceDisplay_DisplayConfiguredWithViewerBaseReturnsAvailableSession(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	t.Setenv("DISPLAY_VIEWER_BASE_URL", "https://display.example.test/sessions")
+	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
+
+	mock.ExpectQuery(`SELECT COALESCE\(compute, '\{\}'::jsonb\) FROM workspaces WHERE id = \$1`).
+		WithArgs("ws-display").
+		WillReturnRows(sqlmock.NewRows([]string{"compute"}).AddRow(`{"display":{"mode":"desktop-control","protocol":"novnc","width":1920,"height":1080}}`))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-display"}}
+	c.Request = httptest.NewRequest("GET", "/workspaces/ws-display/display", nil)
+
+	handler.Display(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to parse display response: %v", err)
+	}
+	if resp["available"] != true {
+		t.Fatalf("available = %v, want true", resp["available"])
+	}
+	if resp["viewer_url"] != "https://display.example.test/sessions/ws-display" {
+		t.Fatalf("viewer_url = %v, want workspace viewer URL", resp["viewer_url"])
+	}
+	if resp["reason"] != nil {
+		t.Fatalf("reason = %v, want omitted", resp["reason"])
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+func TestWorkspaceDisplay_DisplayConfiguredWithInvalidViewerBaseReturnsUnavailable(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	t.Setenv("DISPLAY_VIEWER_BASE_URL", "http://display.example.test/sessions")
+	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
+
+	workspaceID := "ws-display"
+	mock.ExpectQuery(`SELECT COALESCE\(compute, '\{\}'::jsonb\) FROM workspaces WHERE id = \$1`).
+		WithArgs(workspaceID).
+		WillReturnRows(sqlmock.NewRows([]string{"compute"}).AddRow(`{"display":{"mode":"desktop-control","protocol":"novnc","width":1920,"height":1080}}`))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: workspaceID}}
+	c.Request = httptest.NewRequest("GET", "/workspaces/"+workspaceID+"/display", nil)
+
+	handler.Display(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to parse display response: %v", err)
+	}
+	if resp["available"] != false {
+		t.Fatalf("available = %v, want false", resp["available"])
+	}
+	if resp["viewer_url"] != nil {
+		t.Fatalf("viewer_url = %v, want omitted for invalid viewer base", resp["viewer_url"])
+	}
+	if resp["reason"] != "display_session_unavailable" {
+		t.Fatalf("reason = %v, want display_session_unavailable", resp["reason"])
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations: %v", err)
@@ -263,7 +361,7 @@ func TestWorkspaceDisplay_IgnoresUnrelatedStoredComputeSizingDrift(t *testing.T)
 
 	mock.ExpectQuery(`SELECT COALESCE\(compute, '\{\}'::jsonb\) FROM workspaces WHERE id = \$1`).
 		WithArgs("ws-display-sizing-drift").
-		WillReturnRows(sqlmock.NewRows([]string{"compute"}).AddRow(`{"instance_type":"old.large","display":{"mode":"desktop-control","protocol":"dcv","width":1920,"height":1080}}`))
+		WillReturnRows(sqlmock.NewRows([]string{"compute"}).AddRow(`{"instance_type":"old.large","display":{"mode":"desktop-control","protocol":"novnc","width":1920,"height":1080}}`))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)

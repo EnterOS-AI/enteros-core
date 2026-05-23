@@ -6,6 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/url"
+	"os"
+	"strings"
 
 	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
 	"github.com/Molecule-AI/molecule-monorepo/platform/internal/models"
@@ -15,6 +18,10 @@ import (
 const (
 	workspaceComputeDiskFloorGB   = 30
 	workspaceComputeDiskCeilingGB = 500
+	workspaceDisplayMinWidth      = 800
+	workspaceDisplayMaxWidth      = 3840
+	workspaceDisplayMinHeight     = 600
+	workspaceDisplayMaxHeight     = 2160
 )
 
 type workspaceDisplayResponse struct {
@@ -25,6 +32,7 @@ type workspaceDisplayResponse struct {
 	Width     int    `json:"width,omitempty"`
 	Height    int    `json:"height,omitempty"`
 	Status    string `json:"status,omitempty"`
+	ViewerURL string `json:"viewer_url,omitempty"`
 }
 
 var workspaceComputeInstanceAllowlist = map[string]struct{}{
@@ -54,12 +62,12 @@ func validateWorkspaceCompute(compute models.WorkspaceCompute) error {
 		return fmt.Errorf("unsupported compute.display.mode")
 	}
 	switch compute.Display.Protocol {
-	case "", "dcv":
+	case "", "dcv", "novnc":
 	default:
 		return fmt.Errorf("unsupported compute.display.protocol")
 	}
-	if compute.Display.Width < 0 || compute.Display.Height < 0 {
-		return fmt.Errorf("compute.display width/height must be non-negative")
+	if err := validateWorkspaceDisplayDimensions(compute.Display.Width, compute.Display.Height); err != nil {
+		return err
 	}
 	return nil
 }
@@ -71,12 +79,25 @@ func validateWorkspaceDisplayConfig(display models.WorkspaceComputeDisplay) erro
 		return fmt.Errorf("unsupported compute.display.mode")
 	}
 	switch display.Protocol {
-	case "", "dcv":
+	case "", "dcv", "novnc":
 	default:
 		return fmt.Errorf("unsupported compute.display.protocol")
 	}
-	if display.Width < 0 || display.Height < 0 {
+	if err := validateWorkspaceDisplayDimensions(display.Width, display.Height); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateWorkspaceDisplayDimensions(width, height int) error {
+	if width < 0 || height < 0 {
 		return fmt.Errorf("compute.display width/height must be non-negative")
+	}
+	if width != 0 && (width < workspaceDisplayMinWidth || width > workspaceDisplayMaxWidth) {
+		return fmt.Errorf("compute.display.width must be between %d and %d", workspaceDisplayMinWidth, workspaceDisplayMaxWidth)
+	}
+	if height != 0 && (height < workspaceDisplayMinHeight || height > workspaceDisplayMaxHeight) {
+		return fmt.Errorf("compute.display.height must be between %d and %d", workspaceDisplayMinHeight, workspaceDisplayMaxHeight)
 	}
 	return nil
 }
@@ -196,6 +217,18 @@ func (h *WorkspaceHandler) Display(c *gin.Context) {
 		})
 		return
 	}
+	if viewerURL := workspaceDisplayViewerURL(workspaceID); viewerURL != "" {
+		c.JSON(200, workspaceDisplayResponse{
+			Available: true,
+			Mode:      compute.Display.Mode,
+			Protocol:  compute.Display.Protocol,
+			Width:     compute.Display.Width,
+			Height:    compute.Display.Height,
+			Status:    "ready",
+			ViewerURL: viewerURL,
+		})
+		return
+	}
 	c.JSON(200, workspaceDisplayResponse{
 		Available: false,
 		Reason:    "display_session_unavailable",
@@ -205,4 +238,16 @@ func (h *WorkspaceHandler) Display(c *gin.Context) {
 		Height:    compute.Display.Height,
 		Status:    "not_configured",
 	})
+}
+
+func workspaceDisplayViewerURL(workspaceID string) string {
+	base := strings.TrimRight(os.Getenv("DISPLAY_VIEWER_BASE_URL"), "/")
+	if base == "" {
+		return ""
+	}
+	parsed, err := url.Parse(base)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
+		return ""
+	}
+	return base + "/" + url.PathEscape(workspaceID)
 }
