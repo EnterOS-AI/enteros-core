@@ -320,11 +320,13 @@ export interface WorkspaceData {
   url: string;
   parent_id: string | null;
   active_tasks: number;
+  max_concurrent_tasks?: number | null;
   last_error_rate: number;
   last_sample_error: string;
   uptime_seconds: number;
   current_task: string;
   runtime: string;
+  workspace_access?: string | null;
   x: number;
   y: number;
   collapsed: boolean;
