@@ -503,6 +503,32 @@ func TestCascadeDelete_DescendantQueryError(t *testing.T) {
 	// sqlmock verifies all expected queries were executed
 }
 
+func TestCascadeDelete_DescendantRowsError(t *testing.T) {
+	mock, _ := setupWorkspaceCrudTest(t)
+	wsID := "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+
+	// RowError(0, ...) requires a real row at index 0 to be reachable —
+	// sqlmock only invokes nextErr[N] when r.pos-1 == N and the row exists.
+	// AddRow ensures Next() attempts the first row, triggers the error,
+	// and rows.Err() returns the injected error.
+	h := &WorkspaceHandler{}
+	rows := sqlmock.NewRows([]string{"id"}).AddRow("desc-1").RowError(0, sql.ErrConnDone)
+	mock.ExpectQuery(`WITH RECURSIVE descendants AS`).
+		WithArgs(wsID).
+		WillReturnRows(rows)
+
+	deleted, stopErrs, err := h.CascadeDelete(context.Background(), wsID)
+	if err == nil {
+		t.Fatal("CascadeDelete returned nil error; want descendant rows error")
+	}
+	if deleted != nil {
+		t.Errorf("deleted = %v; want nil", deleted)
+	}
+	if stopErrs != nil {
+		t.Errorf("stopErrs = %v; want nil", stopErrs)
+	}
+}
+
 // Note: Full CascadeDelete testing requires mocking StopWorkspace, RemoveVolume,
 // and provisioner calls — covered in integration tests. Unit tests here focus on
 // the validation and pre-condition paths.

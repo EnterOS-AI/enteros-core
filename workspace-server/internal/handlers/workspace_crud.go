@@ -435,13 +435,16 @@ func (h *WorkspaceHandler) CascadeDelete(ctx context.Context, id string) ([]stri
 	if err != nil {
 		return nil, nil, fmt.Errorf("descendant query: %w", err)
 	}
+	defer descRows.Close()
 	for descRows.Next() {
 		var descID string
 		if descRows.Scan(&descID) == nil {
 			descendantIDs = append(descendantIDs, descID)
 		}
 	}
-	descRows.Close()
+	if err := descRows.Err(); err != nil {
+		return nil, nil, fmt.Errorf("CascadeDelete: failed iterating descendants: %w", err)
+	}
 
 	allIDs := append([]string{id}, descendantIDs...)
 
