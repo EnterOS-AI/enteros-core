@@ -246,9 +246,7 @@ func (p *CPProvisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string,
 		return "", fmt.Errorf("cp provisioner: read response body: %w", readErr)
 	}
 	var result cpProvisionResponse
-	if err := json.Unmarshal(respBody, &result); err != nil {
-		log.Printf("CP provisioner: unmarshal response for workspace %s: %v", cfg.WorkspaceID, err)
-	}
+	unmarshalErr := json.Unmarshal(respBody, &result)
 
 	if resp.StatusCode != http.StatusCreated {
 		// Prefer the structured {"error":"..."} field. Do NOT fall back
@@ -260,6 +258,10 @@ func (p *CPProvisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string,
 			errMsg = fmt.Sprintf("<unstructured body, %d bytes>", len(respBody))
 		}
 		return "", fmt.Errorf("cp provisioner: provision failed (%d): %s", resp.StatusCode, errMsg)
+	}
+
+	if unmarshalErr != nil {
+		return "", fmt.Errorf("cp provisioner: decode 201 response: %w", unmarshalErr)
 	}
 
 	log.Printf("CP provisioner: workspace %s → EC2 instance %s (%s)", cfg.WorkspaceID, result.InstanceID, result.State)

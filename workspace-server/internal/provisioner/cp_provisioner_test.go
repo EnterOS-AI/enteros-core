@@ -442,6 +442,26 @@ func TestStart_SymlinkTemplatePathError(t *testing.T) {
 	}
 }
 
+// TestStart_Malformed201SurfacesError — when CP returns 201 Created with
+// unparseable JSON, Start must return an error instead of silently
+// returning an empty instance_id. CR2 blocker from review #5552.
+func TestStart_Malformed201SurfacesError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		_, _ = io.WriteString(w, `{"instance_id": broken-json`)
+	}))
+	defer srv.Close()
+
+	p := &CPProvisioner{baseURL: srv.URL, orgID: "org-1", httpClient: srv.Client()}
+	_, err := p.Start(context.Background(), WorkspaceConfig{WorkspaceID: "ws-1", Runtime: "py"})
+	if err == nil {
+		t.Fatal("expected error on malformed 201, got nil")
+	}
+	if !strings.Contains(err.Error(), "decode 201 response") {
+		t.Errorf("error should mention decode 201 response, got %q", err.Error())
+	}
+}
+
 // TestStop_SendsBothAuthHeaders — verify #118/#130 compliance on the
 // teardown path. Any call to /cp/workspaces/:id must carry both the
 // platform-wide shared secret AND the per-tenant admin token, or the
