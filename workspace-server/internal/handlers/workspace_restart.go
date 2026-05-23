@@ -164,7 +164,7 @@ func (h *WorkspaceHandler) maybeRestartAfterFileWrite(workspaceID string) {
 // isRestarting reports whether a restart cycle is currently in flight for
 // the workspace. Callers that have their own "container looks dead" probe
 // MUST consult this before triggering a restart, because during the
-// 20-30s EC2-pending window the workspace's url='' and IsRunning()=false
+// 20-30s EC2-pending window the workspace's url=” and IsRunning()=false
 // looks identical to a dead container — and any restart-triggering probe
 // (maybeMarkContainerDead from canvas /delegations poll, or the trailing
 // restart-context probe at the end of runRestartCycle) will set
@@ -337,7 +337,7 @@ func (h *WorkspaceHandler) Restart(c *gin.Context) {
 	}
 
 	var configFiles map[string][]byte
-	payload := models.CreateWorkspacePayload{Name: wsName, Tier: tier, Runtime: containerRuntime}
+	payload := withStoredCompute(ctx, id, models.CreateWorkspacePayload{Name: wsName, Tier: tier, Runtime: containerRuntime})
 	log.Printf("Restart: workspace %s (%s) runtime=%q", wsName, id, containerRuntime)
 
 	// #12: ?reset=true (or body.Reset) discards the claude-sessions volume
@@ -791,7 +791,7 @@ func (h *WorkspaceHandler) runRestartCycle(workspaceID string) {
 	})
 
 	// Runtime from DB — no more config file parsing
-	payload := models.CreateWorkspacePayload{Name: wsName, Tier: tier, Runtime: dbRuntime}
+	payload := withStoredCompute(ctx, workspaceID, models.CreateWorkspacePayload{Name: wsName, Tier: tier, Runtime: dbRuntime})
 
 	// Snapshot restart-context data before the new session overwrites
 	// last_heartbeat_at. Issue #19 Layer 1.
@@ -948,7 +948,7 @@ func (h *WorkspaceHandler) Resume(c *gin.Context) {
 		h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceProvisioning), ws.id, map[string]interface{}{
 			"name": ws.name, "tier": ws.tier, "runtime": ws.runtime,
 		})
-		payload := models.CreateWorkspacePayload{Name: ws.name, Tier: ws.tier, Runtime: ws.runtime}
+		payload := withStoredCompute(ctx, ws.id, models.CreateWorkspacePayload{Name: ws.name, Tier: ws.tier, Runtime: ws.runtime})
 		// Resume is provision-only (workspace is paused, no live container
 		// to stop). provisionWorkspaceAuto handles backend routing and the
 		// no-backend mark-failed fallback identically to Create. Pre-

@@ -348,6 +348,10 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid workspace access"})
 		return
 	}
+	if err := validateWorkspaceCompute(payload.Compute); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 
 	// Begin a transaction so the workspace row and any initial secrets are
 	// committed atomically.  A secret-encrypt or DB error rolls back the
@@ -433,6 +437,24 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 	if persistedName != payload.Name {
 		log.Printf("Create workspace %s: name collision auto-suffix %q -> %q", id, payload.Name, persistedName)
 		payload.Name = persistedName
+	}
+
+	if !workspaceComputeIsZero(payload.Compute) {
+		computeJSON, encErr := workspaceComputeJSON(payload.Compute)
+		if encErr != nil {
+			tx.Rollback() //nolint:errcheck
+			log.Printf("Create workspace %s: failed to encode compute config: %v", id, encErr)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to encode compute config"})
+			return
+		}
+		if _, dbErr := tx.ExecContext(ctx,
+			`UPDATE workspaces SET compute = $2::jsonb, updated_at = now() WHERE id = $1`,
+			id, computeJSON); dbErr != nil {
+			tx.Rollback() //nolint:errcheck
+			log.Printf("Create workspace %s: failed to persist compute config: %v", id, dbErr)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save compute config"})
+			return
+		}
 	}
 
 	// Persist initial secrets from the create payload (inside same transaction).
@@ -679,6 +701,7 @@ func scanWorkspaceRow(rows interface {
 	Scan(dest ...interface{}) error
 }) (map[string]interface{}, error) {
 	var id, name, role, status, url, sampleError, currentTask, runtime, workspaceDir string
+	var computeRaw []byte
 	var tier, activeTasks, maxConcurrentTasks, uptimeSeconds int
 	var errorRate, x, y float64
 	var collapsed, broadcastEnabled, talkToUserEnabled bool
@@ -690,7 +713,7 @@ func scanWorkspaceRow(rows interface {
 	err := rows.Scan(&id, &name, &role, &tier, &status, &agentCard, &url,
 		&parentID, &activeTasks, &maxConcurrentTasks, &errorRate, &sampleError, &uptimeSeconds,
 		&currentTask, &runtime, &workspaceDir, &x, &y, &collapsed,
-		&budgetLimit, &monthlySpend, &broadcastEnabled, &talkToUserEnabled)
+		&budgetLimit, &monthlySpend, &broadcastEnabled, &talkToUserEnabled, &computeRaw)
 	if err != nil {
 		return nil, err
 	}
@@ -716,6 +739,11 @@ func scanWorkspaceRow(rows interface {
 		"collapsed":            collapsed,
 		"broadcast_enabled":    broadcastEnabled,
 		"talk_to_user_enabled": talkToUserEnabled,
+	}
+	if len(computeRaw) > 0 && string(computeRaw) != "null" {
+		ws["compute"] = json.RawMessage(computeRaw)
+	} else {
+		ws["compute"] = json.RawMessage(`{}`)
 	}
 
 	// budget_limit: nil when no limit set, int64 otherwise
@@ -752,7 +780,8 @@ const workspaceListQuery = `
 		   COALESCE(w.workspace_dir, ''),
 		   COALESCE(cl.x, 0), COALESCE(cl.y, 0), COALESCE(cl.collapsed, false),
 		   w.budget_limit, COALESCE(w.monthly_spend, 0),
-		   w.broadcast_enabled, w.talk_to_user_enabled
+		   w.broadcast_enabled, w.talk_to_user_enabled,
+		   COALESCE(w.compute, '{}'::jsonb)
 	FROM workspaces w
 	LEFT JOIN canvas_layouts cl ON cl.workspace_id = w.id
 	WHERE w.status != 'removed'
@@ -813,7 +842,8 @@ func (h *WorkspaceHandler) Get(c *gin.Context) {
 			   COALESCE(w.workspace_dir, ''),
 			   COALESCE(cl.x, 0), COALESCE(cl.y, 0), COALESCE(cl.collapsed, false),
 			   w.budget_limit, COALESCE(w.monthly_spend, 0),
-			   w.broadcast_enabled, w.talk_to_user_enabled
+			   w.broadcast_enabled, w.talk_to_user_enabled,
+			   COALESCE(w.compute, '{}'::jsonb)
 		FROM workspaces w
 		LEFT JOIN canvas_layouts cl ON cl.workspace_id = w.id
 		WHERE w.id = $1

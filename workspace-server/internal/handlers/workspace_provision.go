@@ -296,6 +296,8 @@ func (h *WorkspaceHandler) buildProvisionerConfig(
 		WorkspaceAccess:    workspaceAccess,
 		Tier:               payload.Tier,
 		Runtime:            payload.Runtime,
+		InstanceType:       payload.Compute.InstanceType,
+		DiskGB:             int32(payload.Compute.Volume.RootGB),
 		EnvVars:            envVars,
 		PlatformURL:        h.platformURL,
 		AwarenessURL:       os.Getenv("AWARENESS_URL"),
@@ -1009,4 +1011,3 @@ func (h *WorkspaceHandler) provisionWorkspaceCP(workspaceID, templatePath string
 
 	log.Printf("CPProvisioner: workspace %s started as machine %s via control plane", workspaceID, machineID)
 }
-

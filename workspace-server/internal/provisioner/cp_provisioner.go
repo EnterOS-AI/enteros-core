@@ -152,12 +152,14 @@ func (p *CPProvisioner) adminAuthHeaders(req *http.Request) {
 }
 
 type cpProvisionRequest struct {
-	OrgID       string            `json:"org_id"`
-	WorkspaceID string            `json:"workspace_id"`
-	Runtime     string            `json:"runtime"`
-	Tier        int               `json:"tier"`
-	PlatformURL string            `json:"platform_url"`
-	Env         map[string]string `json:"env"`
+	OrgID        string            `json:"org_id"`
+	WorkspaceID  string            `json:"workspace_id"`
+	Runtime      string            `json:"runtime"`
+	Tier         int               `json:"tier"`
+	InstanceType string            `json:"instance_type,omitempty"`
+	DiskGB       int32             `json:"disk_gb,omitempty"`
+	PlatformURL  string            `json:"platform_url"`
+	Env          map[string]string `json:"env"`
 	// ConfigFiles are template + generated config files to write into the
 	// EC2 instance's /configs directory. OFFSEC-010: collected by
 	// collectCPConfigFiles which rejects symlinks and non-regular files
@@ -206,13 +208,15 @@ func (p *CPProvisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string,
 	}
 
 	req := cpProvisionRequest{
-		OrgID:       p.orgID,
-		WorkspaceID: cfg.WorkspaceID,
-		Runtime:     cfg.Runtime,
-		Tier:        cfg.Tier,
-		PlatformURL: cfg.PlatformURL,
-		Env:         env,
-		ConfigFiles: configFiles,
+		OrgID:        p.orgID,
+		WorkspaceID:  cfg.WorkspaceID,
+		Runtime:      cfg.Runtime,
+		Tier:         cfg.Tier,
+		InstanceType: cfg.InstanceType,
+		DiskGB:       cfg.DiskGB,
+		PlatformURL:  cfg.PlatformURL,
+		Env:          env,
+		ConfigFiles:  configFiles,
 	}
 
 	body, err := json.Marshal(req)

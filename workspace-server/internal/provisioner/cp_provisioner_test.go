@@ -191,6 +191,12 @@ func TestStart_HappyPath(t *testing.T) {
 		if body.WorkspaceID != "ws-1" || body.Runtime != "python" {
 			t.Errorf("body mismatch: %+v", body)
 		}
+		if body.InstanceType != "m6i.xlarge" {
+			t.Errorf("instance_type = %q, want m6i.xlarge", body.InstanceType)
+		}
+		if body.DiskGB != 100 {
+			t.Errorf("disk_gb = %d, want 100", body.DiskGB)
+		}
 		w.WriteHeader(http.StatusCreated)
 		_, _ = io.WriteString(w, `{"instance_id":"i-abc123","state":"pending"}`)
 	}))
@@ -205,6 +211,7 @@ func TestStart_HappyPath(t *testing.T) {
 
 	id, err := p.Start(context.Background(), WorkspaceConfig{
 		WorkspaceID: "ws-1", Runtime: "python", Tier: 1, PlatformURL: "http://tenant",
+		InstanceType: "m6i.xlarge", DiskGB: 100,
 	})
 	if err != nil {
 		t.Fatalf("Start: %v", err)
@@ -362,7 +369,7 @@ func TestStart_CollectsConfigFiles(t *testing.T) {
 	p := &CPProvisioner{baseURL: srv.URL, orgID: "org-1", httpClient: srv.Client()}
 	_, err := p.Start(context.Background(), WorkspaceConfig{
 		WorkspaceID:  "ws-1",
-		Runtime:     "python",
+		Runtime:      "python",
 		Tier:         1,
 		PlatformURL:  "http://tenant",
 		TemplatePath: tmpl,
@@ -424,7 +431,7 @@ func TestStart_SymlinkTemplatePathError(t *testing.T) {
 	p := &CPProvisioner{baseURL: "http://unused", orgID: "org-1", httpClient: &http.Client{Timeout: time.Second}}
 	_, err := p.Start(context.Background(), WorkspaceConfig{
 		WorkspaceID:  "ws-1",
-		Runtime:     "python",
+		Runtime:      "python",
 		TemplatePath: symlink, // symlink root → OFFSEC-010 guard should fire
 	})
 	if err == nil {

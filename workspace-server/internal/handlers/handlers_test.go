@@ -456,7 +456,7 @@ func TestWorkspaceList(t *testing.T) {
 	broadcaster := newTestBroadcaster()
 	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", "/tmp/configs")
 
-	// 23 cols: broadcast_enabled + talk_to_user_enabled added after monthly_spend
+	// 24 cols: compute added after talk_to_user_enabled.
 	// (migration 20260514). Column order must match scanWorkspaceRow exactly.
 	columns := []string{
 		"id", "name", "role", "tier", "status", "agent_card", "url",
@@ -464,13 +464,13 @@ func TestWorkspaceList(t *testing.T) {
 		"last_error_rate", "last_sample_error",
 		"uptime_seconds", "current_task", "runtime", "workspace_dir", "x", "y", "collapsed",
 		"budget_limit", "monthly_spend",
-		"broadcast_enabled", "talk_to_user_enabled",
+		"broadcast_enabled", "talk_to_user_enabled", "compute",
 	}
 	rows := sqlmock.NewRows(columns).
 		AddRow("ws-1", "Agent One", "worker", 1, "online", []byte("null"), "http://localhost:8001",
-			nil, 0, 1, 0.0, "", 100, "", "claude-code", "", 10.0, 20.0, false, nil, int64(0), false, true).
+			nil, 0, 1, 0.0, "", 100, "", "claude-code", "", 10.0, 20.0, false, nil, int64(0), false, true, []byte(`{}`)).
 		AddRow("ws-2", "Agent Two", "manager", 2, "provisioning", []byte("null"), "",
-			nil, 0, 1, 0.0, "", 0, "", "langgraph", "", 50.0, 60.0, false, nil, int64(0), false, true)
+			nil, 0, 1, 0.0, "", 0, "", "langgraph", "", 50.0, 60.0, false, nil, int64(0), false, true, []byte(`{}`))
 
 	mock.ExpectQuery("SELECT w.id, w.name").
 		WillReturnRows(rows)
@@ -1184,14 +1184,14 @@ func TestWorkspaceGet_CurrentTask(t *testing.T) {
 		"parent_id", "active_tasks", "max_concurrent_tasks", "last_error_rate", "last_sample_error",
 		"uptime_seconds", "current_task", "runtime", "workspace_dir", "x", "y", "collapsed",
 		"budget_limit", "monthly_spend",
-		"broadcast_enabled", "talk_to_user_enabled",
+		"broadcast_enabled", "talk_to_user_enabled", "compute",
 	}
 	mock.ExpectQuery("SELECT w.id, w.name").
 		WithArgs("dddddddd-0004-0000-0000-000000000000").
 		WillReturnRows(sqlmock.NewRows(columns).AddRow(
 			"dddddddd-0004-0000-0000-000000000000", "Task Worker", "worker", 1, "online", []byte("null"), "http://localhost:9000",
 			nil, 2, 1, 0.0, "", 300, "Analyzing document", "langgraph", "", 10.0, 20.0, false,
-			nil, int64(0), false, true,
+			nil, int64(0), false, true, []byte(`{}`),
 		))
 
 	w := httptest.NewRecorder()
