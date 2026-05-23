@@ -417,6 +417,9 @@ func (h *ScheduleHandler) History(c *gin.Context) {
 		e.Request = json.RawMessage(reqStr)
 		entries = append(entries, e)
 	}
+	if err := rows.Err(); err != nil {
+		log.Printf("ScheduleHistory: rows error: %v", err)
+	}
 
 	c.JSON(http.StatusOK, entries)
 }

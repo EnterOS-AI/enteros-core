@@ -49,6 +49,9 @@ func (h *EventsHandler) List(c *gin.Context) {
 			"created_at":   createdAt,
 		})
 	}
+	if err := rows.Err(); err != nil {
+		log.Printf("Events list rows error: %v", err)
+	}
 	c.JSON(http.StatusOK, events)
 }
 
@@ -86,6 +89,9 @@ func (h *EventsHandler) ListByWorkspace(c *gin.Context) {
 			"payload":      json.RawMessage(payload),
 			"created_at":   createdAt,
 		})
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("WorkspaceEvents list rows error: %v", err)
 	}
 	c.JSON(http.StatusOK, events)
 }
