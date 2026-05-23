@@ -166,6 +166,9 @@ func sweepStuckProvisioning(ctx context.Context, emitter ProvisionTimeoutEmitter
 			ids = append(ids, c)
 		}
 	}
+	if err := rows.Err(); err != nil {
+		log.Printf("Provision-timeout sweep: rows error: %v", err)
+	}
 
 	for _, c := range ids {
 		timeout := provisioningTimeoutFor(c.runtime, lookup)

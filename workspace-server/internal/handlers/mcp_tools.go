@@ -95,14 +95,18 @@ func (h *MCPHandler) toolListPeers(ctx context.Context, workspaceID string) (str
 			cols+` FROM workspaces w WHERE w.parent_id = $1 AND w.id != $2 AND w.status != 'removed'`,
 			parentID.String, workspaceID)
 		if err == nil {
-			_ = scanPeers(rows)
+			if scanErr := scanPeers(rows); scanErr != nil {
+				log.Printf("MCP toolListPeers: sibling scan error: %v", scanErr)
+			}
 		}
 	} else {
 		rows, err := h.database.QueryContext(ctx,
 			cols+` FROM workspaces w WHERE w.parent_id IS NULL AND w.id != $1 AND w.status != 'removed'`,
 			workspaceID)
 		if err == nil {
-			_ = scanPeers(rows)
+			if scanErr := scanPeers(rows); scanErr != nil {
+				log.Printf("MCP toolListPeers: sibling scan error: %v", scanErr)
+			}
 		}
 	}
 
@@ -112,7 +116,9 @@ func (h *MCPHandler) toolListPeers(ctx context.Context, workspaceID string) (str
 			cols+` FROM workspaces w WHERE w.parent_id = $1 AND w.status != 'removed'`,
 			workspaceID)
 		if err == nil {
-			_ = scanPeers(rows)
+			if scanErr := scanPeers(rows); scanErr != nil {
+				log.Printf("MCP toolListPeers: children scan error: %v", scanErr)
+			}
 		}
 	}
 
@@ -122,7 +128,9 @@ func (h *MCPHandler) toolListPeers(ctx context.Context, workspaceID string) (str
 			cols+` FROM workspaces w WHERE w.id = $1 AND w.status != 'removed'`,
 			parentID.String)
 		if err == nil {
-			_ = scanPeers(rows)
+			if scanErr := scanPeers(rows); scanErr != nil {
+				log.Printf("MCP toolListPeers: parent scan error: %v", scanErr)
+			}
 		}
 	}
 

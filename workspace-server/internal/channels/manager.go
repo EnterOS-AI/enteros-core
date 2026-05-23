@@ -156,6 +156,9 @@ func (m *Manager) PausePollersForToken(workspaceID, botToken string) func() {
 			}
 		}
 	}
+	if err := rows.Err(); err != nil {
+		log.Printf("Channels: pause-pollers rows.Err: %v", err)
+	}
 	m.mu.Unlock()
 
 	if len(pausedIDs) == 0 {
@@ -223,6 +226,9 @@ func (m *Manager) Reload(ctx context.Context) {
 			continue
 		}
 		desired[ch.ID] = ch
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("Channels: reload rows.Err: %v", err)
 	}
 
 	m.mu.Lock()
@@ -480,6 +486,9 @@ func (m *Manager) BroadcastToWorkspaceChannels(ctx context.Context, workspaceID,
 				log.Printf("Channels: broadcast to %s failed: %v", channelID[:12], sendErr)
 			}
 		}
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("Channels: broadcast rows.Err: %v", err)
 	}
 }
 

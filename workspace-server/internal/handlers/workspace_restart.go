@@ -858,6 +858,9 @@ func (h *WorkspaceHandler) Pause(c *gin.Context) {
 				toPause = append(toPause, struct{ id, name string }{cid, cname})
 			}
 		}
+		if err := rows.Err(); err != nil {
+			log.Printf("Pause: descendant query rows.Err: %v", err)
+		}
 	}
 
 	// Stop containers and mark all as paused. StopWorkspaceAuto routes
@@ -938,6 +941,9 @@ func (h *WorkspaceHandler) Resume(c *gin.Context) {
 			if rows.Scan(&ws.id, &ws.name, &ws.tier, &ws.runtime) == nil {
 				toResume = append(toResume, ws)
 			}
+		}
+		if err := rows.Err(); err != nil {
+			log.Printf("Resume: descendant query rows.Err: %v", err)
 		}
 	}
 
