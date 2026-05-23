@@ -3,6 +3,7 @@ package pgplugin
 import (
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 	"strings"
 
@@ -246,7 +247,9 @@ func (h *Handler) forget(w http.ResponseWriter, r *http.Request, id string) {
 func writeJSON(w http.ResponseWriter, status int, body interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(body)
+	if err := json.NewEncoder(w).Encode(body); err != nil {
+		log.Printf("pgplugin: JSON encode error: %v", err)
+	}
 }
 
 func writeError(w http.ResponseWriter, status int, code contract.ErrorCode, message string, details map[string]interface{}) {
