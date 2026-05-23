@@ -710,7 +710,19 @@ func buildContainerEnv(cfg WorkspaceConfig) []string {
 		env = append(env, fmt.Sprintf("AWARENESS_NAMESPACE=%s", cfg.AwarenessNamespace))
 		env = append(env, fmt.Sprintf("AWARENESS_URL=%s", cfg.AwarenessURL))
 	}
+	// #1687: track explicit GH_TOKEN / GITHUB_TOKEN so they win over GH_PAT
+	// alias. These are normally stripped by the SCM-write guard below, but
+	// when a user explicitly sets them we preserve the value.
+	var explicitGHToken, explicitGitHubToken string
 	for k, v := range cfg.EnvVars {
+		if k == "GH_TOKEN" {
+			explicitGHToken = v
+			continue
+		}
+		if k == "GITHUB_TOKEN" {
+			explicitGitHubToken = v
+			continue
+		}
 		// Forensic #145 hardening: tenant workspace containers run
 		// agent-controlled code and must NEVER receive a Git SCM *write*
 		// credential. Without merge/approve creds in-container the
@@ -727,6 +739,19 @@ func buildContainerEnv(cfg WorkspaceConfig) []string {
 			continue
 		}
 		env = append(env, fmt.Sprintf("%s=%s", k, v))
+	}
+	// #1687: alias GH_PAT → GH_TOKEN / GITHUB_TOKEN on the READ side
+	// (container env assembly). Explicit values win: only alias when the
+	// key was not set in workspace secrets.
+	if explicitGHToken != "" {
+		env = append(env, fmt.Sprintf("GH_TOKEN=%s", explicitGHToken))
+	} else if pat, hasPAT := cfg.EnvVars["GH_PAT"]; hasPAT && pat != "" {
+		env = append(env, fmt.Sprintf("GH_TOKEN=%s", pat))
+	}
+	if explicitGitHubToken != "" {
+		env = append(env, fmt.Sprintf("GITHUB_TOKEN=%s", explicitGitHubToken))
+	} else if pat, hasPAT := cfg.EnvVars["GH_PAT"]; hasPAT && pat != "" {
+		env = append(env, fmt.Sprintf("GITHUB_TOKEN=%s", pat))
 	}
 	// Inject ADMIN_TOKEN from the platform server's environment so workspace
 	// containers can call /admin/liveness and other admin-gated endpoints
