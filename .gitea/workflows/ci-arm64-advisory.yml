@@ -102,6 +102,7 @@ jobs:
     # See "RUNNER TARGETING" header note for why bare self-hosted is unsafe.
     runs-on: [self-hosted, macos-self-hosted]
     # ADVISORY: never blocks. See safety contract point 3. mc#774
+    # internal#418 — tracked: arm64 advisory pilot, non-gating by design.
     continue-on-error: true
     # event_name gate: functional (only meaningful on push/PR) AND keeps
     # this job out of ci-required-drift.py:ci_job_names() so F1 can never
