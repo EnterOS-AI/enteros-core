@@ -40,10 +40,10 @@
 #   drives: POST /cp/admin/orgs (provision), GET
 #   /cp/admin/orgs/:slug/admin-token (per-tenant token), DELETE
 #   /cp/admin/tenants/:slug (teardown). The per-tenant admin token drives
-#   tenant workspace creation; each workspace's OWN auth_token drives its
-#   MCP call. External-like runtimes may return the token in POST
-#   /workspaces; managed container runtimes usually require the admin token
-#   mint fallback below.
+#   tenant workspace creation; each workspace's OWN auth_token is consumed
+#   inline from the POST /workspaces 201 response to drive its MCP call.
+#   No dev-only admin token-mint routes are used in this E2E
+#   (feedback_no_dev_only_routes_in_e2e).
 #
 # Required env:
 #   MOLECULE_ADMIN_TOKEN   CP admin bearer — Railway staging CP_ADMIN_API_TOKEN
@@ -265,43 +265,18 @@ log "    PARENT_ID=$PARENT_ID"
 # WS_IDS[runtime]=id ; WS_TOKENS[runtime]=auth_token (the MCP bearer)
 declare -A WS_IDS WS_TOKENS
 ALL_WS_IDS="$PARENT_ID"
-TOKEN_ERRORS=0
-TOKEN_ERROR_SUMMARY=""
 for rt in $PV_RUNTIMES; do
   R=$(tenant_call POST /workspaces \
     -d "{\"name\":\"pv-$rt\",\"runtime\":\"$rt\",\"tier\":2,\"parent_id\":\"$PARENT_ID\",\"secrets\":$SECRETS_JSON}")
   WID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))" 2>/dev/null)
-  # External-like runtimes may return connection.auth_token on create.
-  # Managed container runtimes usually return only id/status here, then
-  # receive their bearer through registry/bootstrap; for this literal MCP
-  # driver we mint through the production-safe admin token route below.
   WTOK=$(echo "$R" | extract_auth_token)
-  [ -n "$WID" ] || fail "$rt workspace create failed: $(echo "$R" | head -c 300)"
-  TOKEN_DIAG=""
-  if [ -z "$WTOK" ]; then
-    TTOK_FILE=$(mktemp)
-    TTOK_CODE=$(tenant_call_capture POST "/admin/workspaces/$WID/tokens" "$TTOK_FILE" 2>/dev/null || echo "curl_error")
-    TTOK_RESP=$(cat "$TTOK_FILE" 2>/dev/null || true)
-    WTOK=$(echo "$TTOK_RESP" | extract_auth_token)
-    TOKEN_DIAG="POST /admin/workspaces/$WID/tokens -> HTTP $TTOK_CODE body: $(echo "$TTOK_RESP" | redact_token_body)"
-    rm -f "$TTOK_FILE"
-  fi
+  [ -n "$WID" ] || fail "$rt workspace create failed: $(echo \"$R\" | head -c 300)"
+  [ -n "$WTOK" ] || fail "$rt workspace create did not return an auth_token — cannot drive its MCP call (workspace_id=$WID; create_resp: $(echo \"$R\" | redact_token_body))"
   WS_IDS[$rt]="$WID"
-  if [ -z "$WTOK" ]; then
-    TOKEN_ERRORS=$((TOKEN_ERRORS + 1))
-    TOKEN_ERROR_SUMMARY="${TOKEN_ERROR_SUMMARY}
-[$rt] workspace did not return or mint an auth_token — cannot drive its MCP call (workspace_id=$WID; create_resp: $(echo "$R" | redact_token_body); token_fallbacks: $TOKEN_DIAG)"
-    log "    $rt → $WID (token acquisition failed; continuing to classify other runtimes)"
-    continue
-  fi
   WS_TOKENS[$rt]="$WTOK"
   ALL_WS_IDS="$ALL_WS_IDS $WID"
   log "    $rt → $WID"
 done
-
-if [ "$TOKEN_ERRORS" -gt 0 ]; then
-  fail "token acquisition failed for $TOKEN_ERRORS runtime(s):$TOKEN_ERROR_SUMMARY"
-fi
 
 if [ "${PV_TOKEN_DIAGNOSTIC_ONLY:-0}" = "1" ]; then
   ok "token diagnostic passed for runtimes: $PV_RUNTIMES"

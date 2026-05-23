@@ -24,14 +24,12 @@
 #
 # Only PROVISIONING differs from staging:
 #   - staging: POST /cp/admin/orgs (cold EC2 tenant) + per-tenant admin
-#     token + each workspace's MCP bearer from create response or an admin
-#     token-mint fallback.
+#     token + each workspace's MCP bearer from the POST /workspaces
+#     create response.
 #   - local:   POST /workspaces directly against the local stack
-#     (BASE, default http://localhost:8080), MCP bearer minted via
-#     GET /admin/workspaces/:id/test-token (e2e_mint_test_token —
-#     deterministic, gated by MOLECULE_ENV != production). Same model
-#     every other local E2E (test_priority_runtimes_e2e.sh,
-#     test_api.sh) already uses; no new credential/provision flow.
+#     (BASE, default http://localhost:8080), MCP bearer consumed inline
+#     from the create response (auth_token field). Same model every
+#     other local E2E uses; no new credential/provision flow.
 #
 # By default the local backend creates external-mode workspace rows and
 # drives the literal MCP path directly. That keeps the local peer-visibility
@@ -80,6 +78,17 @@ NAME_PREFIX="PV-Local-$$-$(date +%H%M%S)"
 
 log()  { echo "[$(date +%H:%M:%S)] $*"; }
 ok()   { echo "[$(date +%H:%M:%S)] ✅ $*"; }
+
+extract_auth_token() {
+  python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print(''); sys.exit(0)
+print(d.get('auth_token') or d.get('connection', {}).get('auth_token') or '')
+" 2>/dev/null
+}
 
 CREATED_WSIDS=()
 ADMIN_BEARER="${MOLECULE_ADMIN_TOKEN:-${ADMIN_TOKEN:-}}"
@@ -130,17 +139,6 @@ log "0/5 local stack preflight: $BASE/health"
 if ! curl -fsS "$BASE/health" -m 5 >/dev/null 2>&1; then
   echo "::error::Local stack not healthy at $BASE/health — bring it up (make up) before this gate. Infra, not a workspace bug (feedback_fix_root_not_symptom)." >&2
   exit 1
-fi
-# admin/test-token is the local MCP-bearer mint path; it 404s in
-# production. If it is off, this gate cannot drive the literal call.
-if ! curl -fsS "$BASE/admin/workspaces/preflight-probe/test-token" ${ADMIN_AUTH[@]+"${ADMIN_AUTH[@]}"} -m 5 >/dev/null 2>&1; then
-  # A 404 here is EITHER "no such ws" (fine — endpoint is enabled) OR the
-  # endpoint is disabled (MOLECULE_ENV=production). Distinguish by body.
-  PROBE=$(curl -s "$BASE/admin/workspaces/preflight-probe/test-token" ${ADMIN_AUTH[@]+"${ADMIN_AUTH[@]}"} -m 5 2>/dev/null)
-  if echo "$PROBE" | grep -qi 'production\|disabled\|not found.*endpoint'; then
-    echo "::error::GET /admin/workspaces/:id/test-token disabled (MOLECULE_ENV=production?). Cannot mint a local MCP bearer." >&2
-    exit 1
-  fi
 fi
 ok "    local stack healthy"
 
@@ -260,6 +258,12 @@ PARENT_MODEL=$(_model_for_runtime "$PARENT_RUNTIME")
 P_RESP=$(curl -s -X POST "$BASE/workspaces" ${ADMIN_AUTH[@]+"${ADMIN_AUTH[@]}"} -H "Content-Type: application/json" \
   -d "{\"name\":\"${NAME_PREFIX}-parent\",\"runtime\":\"$PARENT_RUNTIME\",\"model\":\"$PARENT_MODEL\",\"tier\":3$PARENT_EXTRA,\"secrets\":$PARENT_SECRETS}")
 PARENT_ID=$(echo "$P_RESP" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("id",""))' 2>/dev/null)
+# PARENT_TOKEN captured for symmetry with the per-sibling auth-token
+# capture in the runtime loop below + reserved for follow-up steps
+# that need parent-side auth. Current downstream steps reach the parent
+# via admin token, so the variable isn't dereferenced — SC2034.
+# shellcheck disable=SC2034 # captured for downstream parent-auth use; see #1644 follow-up
+PARENT_TOKEN=$(echo "$P_RESP" | extract_auth_token)
 if [ -z "$PARENT_ID" ]; then
   echo "::error::parent create failed: $(echo "$P_RESP" | head -c 300)" >&2
   exit 1
@@ -275,6 +279,8 @@ log "    PARENT_ID=$PARENT_ID runtime=$PARENT_RUNTIME"
 WS_IDS_MAP=""
 # shellcheck disable=SC2034 # map values are updated through portable eval-based helpers.
 VERDICT_MAP=""
+# shellcheck disable=SC2034 # map values are updated through portable eval-based helpers.
+WS_TOKENS_MAP=""
 _map_set() { # _map_set <mapvarname> <key> <value>
   local __m="$1" __k="$2" __v="$3" __cur
   eval "__cur=\$$__m"
@@ -311,11 +317,17 @@ for rt in $PV_RUNTIMES; do
   R=$(curl -s -X POST "$BASE/workspaces" ${ADMIN_AUTH[@]+"${ADMIN_AUTH[@]}"} -H "Content-Type: application/json" \
     -d "{\"name\":\"${NAME_PREFIX}-$rt\",\"runtime\":\"$CREATE_RUNTIME\",\"model\":\"$CREATE_MODEL\",\"tier\":2,\"parent_id\":\"$PARENT_ID\"$CREATE_EXTRA,\"secrets\":$SEC}")
   WID=$(echo "$R" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("id",""))' 2>/dev/null)
+  WTOK=$(echo "$R" | extract_auth_token)
   if [ -z "$WID" ]; then
     echo "::error::$rt workspace create failed: $(echo "$R" | head -c 300)" >&2
     exit 1
   fi
+  if [ -z "$WTOK" ]; then
+    echo "::error::$rt workspace create did not return an auth_token — cannot drive the literal MCP call" >&2
+    exit 1
+  fi
   _map_set WS_IDS_MAP "$rt" "$WID"
+  _map_set WS_TOKENS_MAP "$rt" "$WTOK"
   CREATED_WSIDS+=("$WID")
   ALL_WS_IDS="$ALL_WS_IDS $WID"
   ACTIVE_RUNTIMES="$ACTIVE_RUNTIMES $rt"
@@ -373,10 +385,10 @@ log "4/5 driving the LITERAL list_peers MCP call per online runtime..."
 echo ""
 for rt in $ONLINE_RUNTIMES; do
   wid="$(_map_get WS_IDS_MAP "$rt")"
-  WTOK=$(e2e_mint_test_token "$wid" 2>/dev/null || true)
+  WTOK="$(_map_get WS_TOKENS_MAP "$rt")"
   if [ -z "$WTOK" ]; then
     echo "--- $rt (ws=$wid) ---"
-    echo "  ✗ $rt: could not mint a local MCP bearer (admin/test-token) — cannot drive the literal call"
+    echo "  ✗ $rt: workspace create did not return an auth_token — cannot drive the literal call"
     _map_set VERDICT_MAP "$rt" "FAIL(no-bearer)"
     REGRESSED=1
     echo ""
