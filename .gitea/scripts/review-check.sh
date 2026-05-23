@@ -128,12 +128,17 @@ fi
 PR_AUTHOR=$(jq -r '.user.login // ""' "$PR_JSON")
 PR_HEAD_SHA=$(jq -r '.head.sha // ""' "$PR_JSON")
 PR_BASE_REF=$(jq -r '.base.ref // ""' "$PR_JSON")
+PR_BASE_SHA=$(jq -r '.base.sha // ""' "$PR_JSON")
 PR_STATE=$(jq -r '.state // ""' "$PR_JSON")
 DEFAULT_BRANCH="${DEFAULT_BRANCH:-main}"
 debug "pr_author=${PR_AUTHOR} pr_head=${PR_HEAD_SHA:0:7} pr_base=${PR_BASE_REF} pr_state=${PR_STATE}"
 
 if [ "$PR_STATE" != "open" ]; then
   echo "::notice::PR ${PR_NUMBER} is ${PR_STATE} — exiting 0 (closed PRs do not gate)"
+  exit 0
+fi
+if [ "$PR_HEAD_SHA" = "$PR_BASE_SHA" ]; then
+  echo "::notice::PR ${PR_NUMBER} has no diff (head == base) — exiting 0 (empty PRs do not gate)"
   exit 0
 fi
 if [ "$PR_BASE_REF" != "$DEFAULT_BRANCH" ]; then
