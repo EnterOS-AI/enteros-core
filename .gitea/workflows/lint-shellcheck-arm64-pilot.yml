@@ -25,7 +25,7 @@ permissions:
 jobs:
   shellcheck-arm64:
     name: shellcheck-arm64 (pilot)
-    runs-on: [self-hosted, arm64]
+    runs-on: [self-hosted, arm64-darwin]
     # NOT a required check; safe to sit pending until Mac runner is up.
     # If the Mac runner has trouble pulling actions/checkout we fall
     # back to a plain git clone (see step 'fallback clone').
