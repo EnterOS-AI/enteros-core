@@ -433,6 +433,10 @@ func (s *Scheduler) fireSchedule(ctx context.Context, sched scheduleRow) {
 		lastStatus = "error"
 		lastError = fmt.Sprintf("HTTP %d", statusCode)
 		log.Printf("Scheduler: '%s' non-2xx: %d", sched.Name, statusCode)
+	} else if a2aErr := a2aErrorFromBody(respBody); a2aErr != "" {
+		lastStatus = "error"
+		lastError = fmt.Sprintf("A2A adapter error: %s", a2aErr)
+		log.Printf("Scheduler: '%s' A2A adapter error (HTTP %d): %s", sched.Name, statusCode, a2aErr)
 	} else {
 		log.Printf("Scheduler: '%s' completed (HTTP %d)", sched.Name, statusCode)
 	}
@@ -806,6 +810,32 @@ func isEmptyResponse(body []byte) bool {
 		}
 	}
 	return false
+}
+
+// a2aErrorFromBody extracts an A2A/JSON-RPC error message from a 2xx
+// response body. The adapter SDK may return HTTP 200 with an error
+// payload when it throws internally; this prevents the scheduler from
+// falsely recording last_status='ok'.
+// Issue #1696.
+func a2aErrorFromBody(body []byte) string {
+	if len(body) == 0 {
+		return ""
+	}
+	var resp map[string]interface{}
+	if json.Unmarshal(body, &resp) != nil {
+		return ""
+	}
+	// JSON-RPC style: {"error":{"code":-32603,"message":"..."}}
+	if errObj, ok := resp["error"].(map[string]interface{}); ok {
+		if msg, ok := errObj["message"].(string); ok {
+			return msg
+		}
+	}
+	// Plain style: {"error":"..."}
+	if errStr, ok := resp["error"].(string); ok {
+		return errStr
+	}
+	return ""
 }
 
 // truncation moved to internal/textutil.TruncateBytes (#2962 SSOT).
