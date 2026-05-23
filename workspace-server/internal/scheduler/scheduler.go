@@ -425,6 +425,7 @@ func (s *Scheduler) fireSchedule(ctx context.Context, sched scheduleRow) {
 
 	lastStatus := "ok"
 	lastError := ""
+	resultKind := ""
 	if proxyErr != nil {
 		lastStatus = "error"
 		lastError = fmt.Sprintf("%v", proxyErr)
@@ -438,7 +439,21 @@ func (s *Scheduler) fireSchedule(ctx context.Context, sched scheduleRow) {
 		lastError = fmt.Sprintf("A2A adapter error: %s", a2aErr)
 		log.Printf("Scheduler: '%s' A2A adapter error (HTTP %d): %s", sched.Name, statusCode, a2aErr)
 	} else {
-		log.Printf("Scheduler: '%s' completed (HTTP %d)", sched.Name, statusCode)
+		// HTTP 200 — inspect response body for SDK-layer errors.
+		// The claude-code-sdk adapter returns HTTP 200 even when the inner
+		// LLM call throws (e.g. Max-plan rate-limit, quota exhaustion, SDK
+		// internal errors). Without this check those failures surface as
+		// "completed (HTTP 200)" in last_status while the agent chat shows
+		// errors — a silent failure that hides schedule outages.
+		// See: #1696.
+		resultKind = detectResultKind(respBody)
+		if resultKind != "" && resultKind != "ok" {
+			lastStatus = resultKind
+			lastError = fmt.Sprintf("SDK error: result_kind=%s", resultKind)
+			log.Printf("Scheduler: '%s' SDK error detected — result_kind=%s", sched.Name, resultKind)
+		} else {
+			log.Printf("Scheduler: '%s' completed (HTTP %d)", sched.Name, statusCode)
+		}
 	}
 
 	// #795: detect phantom-producing schedules — cron fires successfully
@@ -481,6 +496,54 @@ func (s *Scheduler) fireSchedule(ctx context.Context, sched scheduleRow) {
 			    updated_at = now()
 			WHERE id = $1`, sched.ID)
 		resetCancel()
+	}
+
+	// #1696: track consecutive SDK errors. When the adapter returns HTTP 200
+	// but the response body signals a non-ok result_kind (rate_limited,
+	// sdk_error, quota_exhausted), we increment a counter. After 3 consecutive
+	// SDK errors we auto-disable the schedule and log it — the schedule is
+	// suffering a persistent LLM-layer failure and firing it again will keep
+	// producing the same errors while burning tokens.
+	//
+	// Only apply when the current lastStatus is a non-ok resultKind (not when
+	// we already have 'error' from proxyErr or non-2xx HTTP status — those have
+	// their own failure semantics). Also skip when lastStatus is 'stale' (the
+	// empty-response escalation path takes priority).
+	var consecSDK int
+	if resultKind != "" && resultKind != "ok" {
+		sdkCtx, sdkCancel := context.WithTimeout(context.Background(), dbQueryTimeout)
+		if err := db.DB.QueryRowContext(sdkCtx, `
+			UPDATE workspace_schedules
+			SET consecutive_sdk_errors = consecutive_sdk_errors + 1,
+			    updated_at = now()
+			WHERE id = $1
+			RETURNING consecutive_sdk_errors`, sched.ID).Scan(&consecSDK); err != nil {
+			log.Printf("Scheduler: '%s' SDK-error bump failed: %v", sched.Name, err)
+		}
+		sdkCancel()
+		if consecSDK >= 3 {
+			log.Printf("Scheduler: '%s' AUTO-DISABLING after %d consecutive SDK errors (workspace %s)",
+				sched.Name, consecSDK, short(sched.WorkspaceID, 12))
+			autoDisableCtx, autoDisableCancel := context.WithTimeout(context.Background(), dbQueryTimeout)
+			_, _ = db.DB.ExecContext(autoDisableCtx, `
+				UPDATE workspace_schedules SET enabled = false, updated_at = now() WHERE id = $1 AND enabled = true`,
+				sched.ID)
+			autoDisableCancel()
+		}
+	} else {
+		// Non-SDK-error run — reset the counter.
+		// Guard: only reset when lastStatus is a clean ok (not 'stale', not
+		// 'error', not resultKind). An 'ok' resultKind means the SDK is fine
+		// and we should clear the streak.
+		if lastStatus == "ok" {
+			resetCtx, resetCancel := context.WithTimeout(context.Background(), dbQueryTimeout)
+			_, _ = db.DB.ExecContext(resetCtx, `
+				UPDATE workspace_schedules
+				SET consecutive_sdk_errors = 0,
+				    updated_at = now()
+				WHERE id = $1`, sched.ID)
+			resetCancel()
+		}
 	}
 
 	nextRun, nextErr := ComputeNextRun(sched.CronExpr, sched.Timezone, time.Now())
@@ -761,6 +824,73 @@ func (s *Scheduler) sweepPhantomBusy(ctx context.Context) {
 	if count > 0 {
 		log.Printf("Scheduler: phantom-busy sweep complete — reset %d workspace(s)", count)
 	}
+}
+
+// detectResultKind inspects an A2A response body for SDK-layer error signals
+// that are invisible at the HTTP level. The claude-code-sdk adapter returns
+// HTTP 200 even when the inner LLM call throws (Max-plan rate-limit, quota
+// exhaustion, SDK internal errors) — the error surfaces only in the response
+// body under result.kind or result.result_kind.
+//
+// Returns an empty string when the response is clean (result_kind is "ok" or
+// absent). Returns the result_kind value when it is a non-ok signal, so callers
+// can propagate it as the schedule's last_status.
+//
+// Known non-ok kinds:
+//   - "rate_limited" — LLM API rate-limit hit (Max-plan, etc.)
+//   - "quota_exhausted" — quota / budget exhausted
+//   - "sdk_error" — SDK threw an internal error
+//
+// See #1696.
+func detectResultKind(body []byte) string {
+	if len(body) == 0 {
+		return ""
+	}
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(body, &top); err != nil {
+		return ""
+	}
+	// Check result.kind first (canonical JSON-RPC shape).
+	if rawResult, ok := top["result"]; ok {
+		var result map[string]json.RawMessage
+		if err := json.Unmarshal(rawResult, &result); err == nil {
+			// result.kind (canonical JSON-RPC error envelope field).
+			if rawKind, ok := result["kind"]; ok {
+				var k string
+				if json.Unmarshal(rawKind, &k) == nil && k != "" && k != "ok" {
+					return k
+				}
+			}
+			// result.result_kind (legacy / alternative field name).
+			if rawKind, ok := result["result_kind"]; ok {
+				var k string
+				if json.Unmarshal(rawKind, &k) == nil && k != "" && k != "ok" {
+					return k
+				}
+			}
+		}
+	}
+	// Top-level error: non-ok HTTP 200 with a structured error in the body.
+	if rawErr, ok := top["error"]; ok {
+		var errMsg string
+		if err := json.Unmarshal(rawErr, &errMsg); err == nil && errMsg != "" {
+			// Distinguish SDK errors from other errors. SDK-layer errors from the
+			// Claude Code runtime include specific markers.
+			lower := strings.ToLower(errMsg)
+			// Check more specific patterns first (max-plan quota > general rate).
+			if strings.Contains(lower, "max-plan") || strings.Contains(lower, "quota") || strings.Contains(lower, "budget") {
+				return "quota_exhausted"
+			}
+			if strings.Contains(lower, "rate limit") || strings.Contains(lower, "rate_limit") {
+				return "rate_limited"
+			}
+			if strings.Contains(lower, "claude code returned an error") || strings.Contains(lower, "sdk error") ||
+				strings.Contains(lower, "api key") || strings.Contains(lower, "authentication") {
+				return "sdk_error"
+			}
+		}
+	}
+	return ""
 }
 
 // isEmptyResponse checks if an A2A response body indicates the agent
