@@ -15,13 +15,46 @@ import (
 	"github.com/Molecule-AI/molecule-monorepo/platform/internal/scheduler"
 )
 
+// ErrorResponse is returned for 4xx/5xx errors. (OpenAPI doc shape — used by swaggo.)
+type ErrorResponse struct {
+	Error string `json:"error"`
+}
+
+// StatusResponse is returned by mutating endpoints that only echo a status verb.
+type StatusResponse struct {
+	Status string `json:"status"`
+}
+
+// CreateScheduleResponse is returned by POST /workspaces/{id}/schedules.
+type CreateScheduleResponse struct {
+	ID        string    `json:"id"`
+	Status    string    `json:"status"`
+	NextRunAt time.Time `json:"next_run_at"`
+}
+
+// RunNowResponse is returned by POST /workspaces/{id}/schedules/{scheduleId}/run.
+type RunNowResponse struct {
+	Status      string `json:"status"`
+	WorkspaceID string `json:"workspace_id"`
+	Prompt      string `json:"prompt"`
+}
+
+// HistoryEntry is one row of /workspaces/{id}/schedules/{scheduleId}/history.
+type HistoryEntry struct {
+	Timestamp   time.Time       `json:"timestamp"`
+	DurationMs  *int            `json:"duration_ms"`
+	Status      *string         `json:"status"`
+	ErrorDetail string          `json:"error_detail"`
+	Request     json.RawMessage `json:"request" swaggertype:"object"`
+}
+
 type ScheduleHandler struct{}
 
 func NewScheduleHandler() *ScheduleHandler {
 	return &ScheduleHandler{}
 }
 
-type scheduleResponse struct {
+type ScheduleResponse struct {
 	ID          string     `json:"id"`
 	WorkspaceID string     `json:"workspace_id"`
 	Name        string     `json:"name"`
@@ -40,6 +73,15 @@ type scheduleResponse struct {
 }
 
 // List returns all schedules for a workspace.
+//
+//	@Summary	List schedules for a workspace
+//	@Tags		schedules
+//	@Produce	json
+//	@Param		id	path		string	true	"Workspace ID"
+//	@Success	200	{array}		ScheduleResponse
+//	@Failure	500	{object}	ErrorResponse
+//	@Router		/workspaces/{id}/schedules [get]
+//	@Security	BearerAuth && OrgSlugAuth
 func (h *ScheduleHandler) List(c *gin.Context) {
 	workspaceID := c.Param("id")
 	ctx := c.Request.Context()
@@ -58,9 +100,9 @@ func (h *ScheduleHandler) List(c *gin.Context) {
 	}
 	defer rows.Close()
 
-	schedules := make([]scheduleResponse, 0)
+	schedules := make([]ScheduleResponse, 0)
 	for rows.Next() {
-		var s scheduleResponse
+		var s ScheduleResponse
 		if err := rows.Scan(
 			&s.ID, &s.WorkspaceID, &s.Name, &s.CronExpr, &s.Timezone,
 			&s.Prompt, &s.Enabled, &s.LastRunAt, &s.NextRunAt, &s.RunCount,
@@ -78,7 +120,7 @@ func (h *ScheduleHandler) List(c *gin.Context) {
 	c.JSON(http.StatusOK, schedules)
 }
 
-type createScheduleRequest struct {
+type CreateScheduleRequest struct {
 	Name     string `json:"name"`
 	CronExpr string `json:"cron_expr" binding:"required"`
 	Timezone string `json:"timezone"`
@@ -87,11 +129,23 @@ type createScheduleRequest struct {
 }
 
 // Create adds a new schedule for a workspace.
+//
+//	@Summary	Create a schedule
+//	@Tags		schedules
+//	@Accept		json
+//	@Produce	json
+//	@Param		id		path		string					true	"Workspace ID"
+//	@Param		body	body		CreateScheduleRequest	true	"Schedule fields"
+//	@Success	201		{object}	CreateScheduleResponse
+//	@Failure	400		{object}	ErrorResponse
+//	@Failure	500		{object}	ErrorResponse
+//	@Router		/workspaces/{id}/schedules [post]
+//	@Security	BearerAuth && OrgSlugAuth
 func (h *ScheduleHandler) Create(c *gin.Context) {
 	workspaceID := c.Param("id")
 	ctx := c.Request.Context()
 
-	var body createScheduleRequest
+	var body CreateScheduleRequest
 	if err := c.ShouldBindJSON(&body); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "cron_expr and prompt are required"})
 		return
@@ -145,7 +199,7 @@ func (h *ScheduleHandler) Create(c *gin.Context) {
 	})
 }
 
-type updateScheduleRequest struct {
+type UpdateScheduleRequest struct {
 	Name     *string `json:"name"`
 	CronExpr *string `json:"cron_expr"`
 	Timezone *string `json:"timezone"`
@@ -155,12 +209,26 @@ type updateScheduleRequest struct {
 
 // Update modifies a schedule. Uses a fixed UPDATE with COALESCE so only
 // provided fields are changed — no dynamic SQL construction.
+//
+//	@Summary	Update a schedule
+//	@Tags		schedules
+//	@Accept		json
+//	@Produce	json
+//	@Param		id			path		string					true	"Workspace ID"
+//	@Param		scheduleId	path		string					true	"Schedule ID"
+//	@Param		body		body		UpdateScheduleRequest	true	"Partial schedule fields (only provided keys are updated)"
+//	@Success	200			{object}	ScheduleResponse
+//	@Failure	400			{object}	ErrorResponse
+//	@Failure	404			{object}	ErrorResponse
+//	@Failure	500			{object}	ErrorResponse
+//	@Router		/workspaces/{id}/schedules/{scheduleId} [patch]
+//	@Security	BearerAuth && OrgSlugAuth
 func (h *ScheduleHandler) Update(c *gin.Context) {
 	scheduleID := c.Param("scheduleId")
 	workspaceID := c.Param("id") // #113: bind to owning workspace to prevent IDOR
 	ctx := c.Request.Context()
 
-	var body updateScheduleRequest
+	var body UpdateScheduleRequest
 	if err := c.ShouldBindJSON(&body); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid JSON"})
 		return
@@ -230,6 +298,17 @@ func (h *ScheduleHandler) Update(c *gin.Context) {
 }
 
 // Delete removes a schedule.
+//
+//	@Summary	Delete a schedule
+//	@Tags		schedules
+//	@Produce	json
+//	@Param		id			path		string	true	"Workspace ID"
+//	@Param		scheduleId	path		string	true	"Schedule ID"
+//	@Success	200			{object}	StatusResponse
+//	@Failure	404			{object}	ErrorResponse
+//	@Failure	500			{object}	ErrorResponse
+//	@Router		/workspaces/{id}/schedules/{scheduleId} [delete]
+//	@Security	BearerAuth && OrgSlugAuth
 func (h *ScheduleHandler) Delete(c *gin.Context) {
 	scheduleID := c.Param("scheduleId")
 	workspaceID := c.Param("id") // #113: bind to owning workspace to prevent IDOR
@@ -252,6 +331,17 @@ func (h *ScheduleHandler) Delete(c *gin.Context) {
 }
 
 // RunNow manually fires a schedule immediately.
+//
+//	@Summary	Fire a schedule manually
+//	@Tags		schedules
+//	@Produce	json
+//	@Param		id			path		string	true	"Workspace ID"
+//	@Param		scheduleId	path		string	true	"Schedule ID"
+//	@Success	200			{object}	RunNowResponse
+//	@Failure	404			{object}	ErrorResponse
+//	@Failure	500			{object}	ErrorResponse
+//	@Router		/workspaces/{id}/schedules/{scheduleId}/run [post]
+//	@Security	BearerAuth && OrgSlugAuth
 func (h *ScheduleHandler) RunNow(c *gin.Context) {
 	scheduleID := c.Param("scheduleId")
 	workspaceID := c.Param("id")
@@ -282,6 +372,16 @@ func (h *ScheduleHandler) RunNow(c *gin.Context) {
 }
 
 // History returns recent runs for a schedule from activity_logs.
+//
+//	@Summary	Get past runs of a schedule
+//	@Tags		schedules
+//	@Produce	json
+//	@Param		id			path		string	true	"Workspace ID"
+//	@Param		scheduleId	path		string	true	"Schedule ID"
+//	@Success	200			{array}		HistoryEntry
+//	@Failure	500			{object}	ErrorResponse
+//	@Router		/workspaces/{id}/schedules/{scheduleId}/history [get]
+//	@Security	BearerAuth && OrgSlugAuth
 func (h *ScheduleHandler) History(c *gin.Context) {
 	scheduleID := c.Param("scheduleId")
 	workspaceID := c.Param("id")
@@ -307,17 +407,9 @@ func (h *ScheduleHandler) History(c *gin.Context) {
 	}
 	defer rows.Close()
 
-	type historyEntry struct {
-		Timestamp   time.Time       `json:"timestamp"`
-		DurationMs  *int            `json:"duration_ms"`
-		Status      *string         `json:"status"`
-		ErrorDetail string          `json:"error_detail"`
-		Request     json.RawMessage `json:"request"`
-	}
-
-	entries := make([]historyEntry, 0)
+	entries := make([]HistoryEntry, 0)
 	for rows.Next() {
-		var e historyEntry
+		var e HistoryEntry
 		var reqStr string
 		if err := rows.Scan(&e.Timestamp, &e.DurationMs, &e.Status, &e.ErrorDetail, &reqStr); err != nil {
 			continue
@@ -329,11 +421,11 @@ func (h *ScheduleHandler) History(c *gin.Context) {
 	c.JSON(http.StatusOK, entries)
 }
 
-// scheduleHealthResponse is the read-only health view of a schedule.
+// ScheduleHealthResponse is the read-only health view of a schedule.
 // It deliberately omits prompt and cron_expr so sensitive task content is
 // never exposed to peer workspaces — only execution-state fields needed to
 // detect silent cron failures are returned (issue #249).
-type scheduleHealthResponse struct {
+type ScheduleHealthResponse struct {
 	ID         string     `json:"id"`
 	Name       string     `json:"name"`
 	Enabled    bool       `json:"enabled"`
@@ -402,9 +494,9 @@ func (h *ScheduleHandler) Health(c *gin.Context) {
 	}
 	defer rows.Close()
 
-	schedules := make([]scheduleHealthResponse, 0)
+	schedules := make([]ScheduleHealthResponse, 0)
 	for rows.Next() {
-		var s scheduleHealthResponse
+		var s ScheduleHealthResponse
 		if err := rows.Scan(
 			&s.ID, &s.Name, &s.Enabled, &s.LastRunAt, &s.NextRunAt,
 			&s.RunCount, &s.LastStatus, &s.LastError,

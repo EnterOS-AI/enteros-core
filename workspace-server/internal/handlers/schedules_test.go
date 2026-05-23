@@ -234,7 +234,7 @@ func TestScheduleHealth_SelfCall_Allowed(t *testing.T) {
 		t.Fatalf("expected 200 for self-call, got %d: %s", w.Code, w.Body.String())
 	}
 
-	var resp []scheduleHealthResponse
+	var resp []ScheduleHealthResponse
 	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("failed to parse response: %v", err)
 	}
@@ -284,7 +284,7 @@ func TestScheduleHealth_CanCommunicatePeer_LegacyNoToken(t *testing.T) {
 		t.Fatalf("expected 200 for peer with no tokens, got %d: %s", w.Code, w.Body.String())
 	}
 
-	var resp []scheduleHealthResponse
+	var resp []ScheduleHealthResponse
 	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("failed to parse response: %v", err)
 	}

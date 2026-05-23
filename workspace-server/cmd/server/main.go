@@ -1,3 +1,26 @@
+// Package main runs the per-tenant workspace-server.
+//
+//	@title			Molecule AI Workspace Server API
+//	@version		1.0
+//	@description	The per-tenant workspace-server HTTP API. Single source of truth for workspace/schedule/agent/secrets/files/memory CRUD. Hand-written clients (canvas, molecule-mcp-server, molecule-cli, molecule-sdk-python) should be replaced by clients generated from this spec — see RFC #1706.
+//	@host			api.moleculesai.app
+//	@BasePath		/
+//	@schemes		https
+//
+//	@securityDefinitions.apikey	BearerAuth
+//	@in							header
+//	@name						Authorization
+//	@description				Bearer token issued by Gitea (org-admin or persona PAT) or by the platform's signup/SSO flow.
+//
+//	@securityDefinitions.apikey	OrgSlugAuth
+//	@in							header
+//	@name						X-Molecule-Org-Slug
+//	@description				Tenant routing header — required on every /workspaces/{id}/* request so the platform edge can route to the correct per-tenant workspace-server. Either X-Molecule-Org-Slug (human-readable, e.g. "agents-team") or X-Molecule-Org-Id (UUID) must be sent; slug is preferred for client code.
+//
+//	@securityDefinitions.apikey	OrgIdAuth
+//	@in							header
+//	@name						X-Molecule-Org-Id
+//	@description				Tenant routing header (UUID form). Alternative to X-Molecule-Org-Slug. At least one of OrgSlugAuth or OrgIdAuth must be sent alongside BearerAuth.
 package main
 
 import (
