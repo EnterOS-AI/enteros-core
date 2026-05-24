@@ -49,7 +49,7 @@ def drift_module():
     module-level reads pass; tests then patch individual globals as
     needed."""
     env = {
-        "GITEA_TOKEN": "test-token",
+        "GITEA_TOKEN": "fixture-token",
         "GITEA_HOST": "git.example.test",
         "REPO": "owner/repo",
         "BRANCHES": "main staging",

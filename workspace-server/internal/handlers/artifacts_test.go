@@ -56,7 +56,7 @@ func newArtifactsMockCFServer(t *testing.T, suffix string, handler http.HandlerF
 	mux.HandleFunc("/namespaces/test-ns"+suffix, handler)
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
-	return artifacts.NewWithBaseURL("cf-test-token", "test-ns", srv.URL)
+	return artifacts.NewWithBaseURL("cf-fixture-token", "test-ns", srv.URL)
 }
 
 // ============================= Create =====================================

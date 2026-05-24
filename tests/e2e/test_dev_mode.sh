@@ -83,10 +83,13 @@ if [ -z "$WS_ID" ]; then
   exit 1
 fi
 
-# Mint a test-token so AdminAuth now sees a live token on record. On
+# Ensure a real workspace token exists so AdminAuth now sees a live token. On
 # pre-fix builds the next /workspaces call would 401 — on post-fix it
 # must stay 200 because MOLECULE_ENV=development + ADMIN_TOKEN unset.
-curl -s -o /dev/null "$BASE/admin/workspaces/$WS_ID/test-token"
+TOKEN=$(echo "$BODY" | e2e_extract_token)
+if [ -z "$TOKEN" ]; then
+  e2e_mint_workspace_token "$WS_ID" >/dev/null
+fi
 
 R=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/workspaces")
 check_http "GET /workspaces (after token minted, no bearer)" "200" "$R"

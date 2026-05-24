@@ -55,7 +55,7 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 	r.Use(cors.New(cors.Config{
 		AllowOrigins:     corsOrigins,
 		AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
-		AllowHeaders:     []string{"Origin", "Content-Type", "X-Workspace-ID", "Authorization"},
+		AllowHeaders:     []string{"Origin", "Content-Type", "X-Workspace-ID", "X-Molecule-Org-Id", "X-Molecule-Org-Slug", "Authorization"},
 		AllowCredentials: true,
 	}))
 
@@ -628,18 +628,6 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		adminAuth := r.Group("", middleware.AdminAuth(db.DB))
 		adminAuth.GET("/admin/plugin-updates-pending", driftH.ListPending)
 		adminAuth.POST("/admin/plugin-updates/:id/apply", driftH.Apply)
-	}
-
-	// Admin — test token minting (issue #6). Hidden in production via TestTokensEnabled().
-	// NOT behind AdminAuth — this is the bootstrap endpoint E2E tests and
-	// fresh installs use to obtain their first admin bearer. Adding AdminAuth
-	// (#612) broke the chicken-and-egg: after first workspace provision creates
-	// a live token in the DB, AdminAuth requires auth for ALL requests, but the
-	// client has no token yet because it needs this endpoint to get one.
-	// The handler itself rejects calls when MOLECULE_ENV=prod (TestTokensEnabled).
-	{
-		tokh := handlers.NewAdminTestTokenHandler()
-		r.GET("/admin/workspaces/:id/test-token", tokh.GetTestToken)
 	}
 
 	// Admin — GitHub App installation token refresh (issue #547).

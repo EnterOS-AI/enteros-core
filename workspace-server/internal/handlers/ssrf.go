@@ -12,7 +12,7 @@ import (
 // devModeAllowsLoopback reports whether the SSRF defence should permit
 // http://127.0.0.1:<port> workspace URLs. True only when MOLECULE_ENV is
 // a dev value — this is the same convention the middleware dev-mode
-// escape hatch uses (handlers/admin_test_token.go, middleware/devmode.go).
+// escape hatch uses.
 //
 // Why: on a self-hosted Docker setup the provisioner publishes each
 // container's A2A port on 127.0.0.1:<ephemeral> and writes that URL

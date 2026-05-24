@@ -78,8 +78,7 @@ func NewGitHubTokenHandler(reg *provisionhook.Registry) *GitHubTokenHandler {
 //	500 {"error": "token refresh failed"}  — provider returned error
 //
 // The 404 vs 403 distinction is intentional: a 404 means the feature is
-// simply not configured, not that the caller is forbidden. This matches
-// the pattern used by GET /admin/workspaces/:id/test-token.
+// simply not configured, not that the caller is forbidden.
 //
 // Callers must retry with exponential back-off on 500 — a transient
 // upstream GitHub API error should not permanently block git operations.

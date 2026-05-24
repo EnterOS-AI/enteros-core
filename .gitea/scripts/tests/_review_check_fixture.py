@@ -20,6 +20,7 @@ Scenarios:
   T15_comments_agent_approval — reviews empty; comments have "[core-qa-agent] APPROVED" → exit 0
   T16_comments_generic_approval — reviews empty; comments have "APPROVED" by team member → exit 0
   T17_comments_no_approval   — reviews empty; comments have no approval keywords → exit 1
+  T18_review_wrong_team_comment_right_team — review candidate 404s, comment candidate passes
 
 Usage:
   FIXTURE_STATE_DIR=/tmp/x python3 _review_check_fixture.py 8080
@@ -140,6 +141,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     {"user": {"login": "alice"}, "body": "I authored this PR", "id": 1},
                     {"user": {"login": "random-user"}, "body": "Looks okay to me", "id": 2},
                 ])
+            if sc == "T18_review_wrong_team_comment_right_team":
+                return self._json(200, [
+                    {"user": {"login": "core-qa-agent"}, "body": "[core-qa-agent] APPROVED after focused review", "id": 1},
+                ])
             # Default scenarios (T1–T9, T14): no comments
             return self._json(200, [])
 
@@ -151,6 +156,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._empty(404)
             if sc == "T9_team_403":
                 return self._empty(403)
+            if sc == "T18_review_wrong_team_comment_right_team" and login == "core-devops":
+                return self._empty(404)
             # T7_team_member: member
             return self._empty(204)
 

@@ -108,13 +108,13 @@ jobs:
         # mc#774: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
         continue-on-error: true
 
-  # Actual E2E: runs on trunk pushes (main + staging). NOT the PR-fire-only
-  # path — pr-validate above posts success for workflow-only PRs.
+  # Actual E2E: runs on trunk pushes and PRs that touch provisioning-critical
+  # paths. pr-validate remains as the lightweight workflow-shape check for PRs,
+  # but it is not a substitute for live staging proof when this workflow or the
+  # staging harness changes.
   e2e-staging-saas:
     name: E2E Staging SaaS
     runs-on: ubuntu-latest
-    # Only runs on trunk pushes. PR paths get pr-validate instead.
-    if: github.event.pull_request.base.ref == ''
     # Phase 3 (RFC #219 §1): surface broken workflows without blocking.
     # mc#774: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
     continue-on-error: true

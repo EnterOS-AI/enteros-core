@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2034
 # Regression tests for .gitea/scripts/review-check.sh (RFC#324 Step 1).
 #
 # Covers:
@@ -16,6 +17,7 @@
 #   T12 — jq filter: non-author APPROVED → in candidate list; dismissed → excluded
 #   T13 — missing required env GITEA_TOKEN → exits 1 with error
 #   T14 — non-default-base PR exits 0 without requiring review
+#   T18 — wrong-team review candidate does not block right-team comment approval
 #
 # Hostile-self-review (per feedback_assert_exact_not_substring):
 # this test MUST FAIL if the script is absent. Verified by running
@@ -138,7 +140,7 @@ fi
 echo
 echo "== T13 missing GITEA_TOKEN =="
 set +e
-T13_OUT=$(PATH="/tmp:$PATH" GITEA_TOKEN= GITEA_HOST=git.example.com REPO=x/y PR_NUMBER=1 TEAM=qa TEAM_ID=1 bash "$SCRIPT" 2>&1 || true)
+T13_OUT=$(PATH="/tmp:$PATH" GITEA_TOKEN='' GITEA_HOST=git.example.com REPO=x/y PR_NUMBER=1 TEAM=qa TEAM_ID=1 bash "$SCRIPT" 2>&1 || true)
 set -e
 assert_contains "T13 exits non-zero when GITEA_TOKEN missing" "GITEA_TOKEN required" "$T13_OUT"
 
@@ -306,12 +308,12 @@ echo
 echo "== T10 CURL_AUTH_FILE =="
 # Verify the token-file logic directly: create a temp file with the
 # same mktemp pattern, write the header with printf, chmod 600, then assert.
-T10_TOKEN="secret-test-token-abc123"
+T10_TOKEN="secret-fixture-token-abc123"
 T10_AUTHFILE=$(mktemp "${TMPDIR:-/tmp}/curl-auth.test.XXXXXX")
 chmod 600 "$T10_AUTHFILE"
 printf 'header = "Authorization: token %s"\n' "$T10_TOKEN" > "$T10_AUTHFILE"
 assert_file_mode "T10a mktemp authfile mode 600 (CURL_AUTH_FILE pattern)" "$T10_AUTHFILE" "600"
-assert_file_contains "T10b printf header format (CURL_AUTH_FILE content)" "$T10_AUTHFILE" "Authorization: token secret-test-token-abc123"
+assert_file_contains "T10b printf header format (CURL_AUTH_FILE content)" "$T10_AUTHFILE" "Authorization: token secret-fixture-token-abc123"
 assert_file_contains "T10c 'header =' curl-config syntax" "$T10_AUTHFILE" 'header = "Authorization: token '
 rm -f "$T10_AUTHFILE"
 
@@ -358,6 +360,17 @@ T17_OUT=$(run_review_check "T17_comments_no_approval")
 T17_RC=$(cat "$FIX_STATE_DIR/last_rc")
 assert_eq "T17 exit code 1 (no candidates from comments)" "1" "$T17_RC"
 assert_contains "T17 no candidates error" "no candidates from reviews API or issue comments" "$T17_OUT"
+
+# T18 — a wrong-team PR review candidate must not suppress a right-team
+# comment approval. This matches PR #1790, where QA had an APPROVED review
+# and security approved via the agent comment convention.
+echo
+echo "== T18 review candidate wrong team, comment candidate right team =="
+T18_OUT=$(run_review_check "T18_review_wrong_team_comment_right_team")
+T18_RC=$(cat "$FIX_STATE_DIR/last_rc")
+assert_eq "T18 exit code 0 (comment approval still considered)" "0" "$T18_RC"
+assert_contains "T18 comment candidate notice" "comment-based approval" "$T18_OUT"
+assert_contains "T18 comment approver accepted" "APPROVED by core-qa-agent" "$T18_OUT"
 
 echo
 echo "------"

@@ -87,7 +87,10 @@ R=$(curl -s -X POST "$BASE/workspaces" "${ADMIN_AUTH[@]}" -H "Content-Type: appl
 check "POST /workspaces (alpha)" '"status":"awaiting_agent"' "$R"
 WS_A_ID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))")
 if [ -n "$WS_A_ID" ]; then
-  WS_A_TOKEN=$(e2e_mint_test_token "$WS_A_ID" 2>/dev/null || true)
+  WS_A_TOKEN=$(echo "$R" | e2e_extract_token)
+  if [ -z "$WS_A_TOKEN" ]; then
+    WS_A_TOKEN=$(e2e_mint_workspace_token "$WS_A_ID" 2>/dev/null || true)
+  fi
   [ -n "$WS_A_TOKEN" ] && WS_A_AUTH=(-H "Authorization: Bearer $WS_A_TOKEN")
   if [ -z "$ADMIN_BEARER" ] && [ -n "$WS_A_TOKEN" ]; then
     ADMIN_AUTH=(-H "Authorization: Bearer $WS_A_TOKEN")
@@ -99,7 +102,10 @@ R=$(curl -s -X POST "$BASE/workspaces" "${ADMIN_AUTH[@]}" -H "Content-Type: appl
 check "POST /workspaces (beta)" '"status":"awaiting_agent"' "$R"
 WS_B_ID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))")
 if [ -n "$WS_B_ID" ]; then
-  WS_B_TOKEN=$(e2e_mint_test_token "$WS_B_ID" 2>/dev/null || true)
+  WS_B_TOKEN=$(echo "$R" | e2e_extract_token)
+  if [ -z "$WS_B_TOKEN" ]; then
+    WS_B_TOKEN=$(e2e_mint_workspace_token "$WS_B_ID" 2>/dev/null || true)
+  fi
   [ -n "$WS_B_TOKEN" ] && WS_B_AUTH=(-H "Authorization: Bearer $WS_B_TOKEN")
 fi
 
@@ -257,12 +263,18 @@ if [ -n "${WS_A_ID:-}" ]; then
   if [ -n "$DEBUG" ] && echo "$DEBUG" | grep -q "workspace_secrets"; then
     # Presence-only check: KEY in the secrets map, value MAY be empty
     # in dev where no persona is bound.
-    echo "$DEBUG" | grep -q '"GIT_HTTP_USERNAME"' \
-      && { echo "PASS: ws-secrets carries GIT_HTTP_USERNAME key (mc#1542)"; PASS=$((PASS+1)); } \
-      || { echo "INFO: GIT_HTTP_USERNAME not in debug secrets (no persona bound in dev) — non-fatal"; }
-    echo "$DEBUG" | grep -q '"GIT_ASKPASS"' \
-      && { echo "PASS: ws-secrets carries GIT_ASKPASS path (mc#1525)"; PASS=$((PASS+1)); } \
-      || { echo "INFO: GIT_ASKPASS path not in debug surface — runtime image may set it directly"; }
+    if echo "$DEBUG" | grep -q '"GIT_HTTP_USERNAME"'; then
+      echo "PASS: ws-secrets carries GIT_HTTP_USERNAME key (mc#1542)"
+      PASS=$((PASS+1))
+    else
+      echo "INFO: GIT_HTTP_USERNAME not in debug secrets (no persona bound in dev) — non-fatal"
+    fi
+    if echo "$DEBUG" | grep -q '"GIT_ASKPASS"'; then
+      echo "PASS: ws-secrets carries GIT_ASKPASS path (mc#1525)"
+      PASS=$((PASS+1))
+    else
+      echo "INFO: GIT_ASKPASS path not in debug surface — runtime image may set it directly"
+    fi
   else
     echo "INFO: admin debug surface unavailable — cannot probe ws-secrets (non-fatal)"
   fi

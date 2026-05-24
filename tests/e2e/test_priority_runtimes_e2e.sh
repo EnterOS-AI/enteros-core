@@ -34,7 +34,7 @@
 #
 # Prereqs:
 #   - workspace-server on http://localhost:8080
-#   - MOLECULE_ENV != production (required for admin/test-token)
+#   - AdminAuth bootstrap or `MOLECULE_ADMIN_TOKEN` for token minting
 #   - For claude-code: CLAUDE_CODE_OAUTH_TOKEN
 #   - For hermes:      E2E_OPENAI_API_KEY  (other providers also OK if you
 #                       set MODEL_SLUG_HERMES + matching secrets directly)
@@ -208,9 +208,12 @@ print(json.dumps({'CLAUDE_CODE_OAUTH_TOKEN': os.environ['CLAUDE_CODE_OAUTH_TOKEN
   pass "claude-code workspace reaches online"
 
   local token
-  token=$(e2e_mint_test_token "$wsid")
+  token=$(echo "$resp" | e2e_extract_token)
   if [ -z "$token" ]; then
-    fail "mint claude-code test token" "no token returned"
+    token=$(e2e_mint_workspace_token "$wsid")
+  fi
+  if [ -z "$token" ]; then
+    fail "resolve claude-code workspace token" "no token returned"
     return 0
   fi
 
@@ -273,9 +276,12 @@ print(json.dumps({
   pass "hermes workspace reaches online"
 
   local token
-  token=$(e2e_mint_test_token "$wsid")
+  token=$(echo "$resp" | e2e_extract_token)
   if [ -z "$token" ]; then
-    fail "mint hermes test token" "no token returned"
+    token=$(e2e_mint_workspace_token "$wsid")
+  fi
+  if [ -z "$token" ]; then
+    fail "resolve hermes workspace token" "no token returned"
     return 0
   fi
 
@@ -340,9 +346,12 @@ print(json.dumps({
   pass "$runtime workspace reaches online"
 
   local token
-  token=$(e2e_mint_test_token "$wsid")
+  token=$(echo "$resp" | e2e_extract_token)
   if [ -z "$token" ]; then
-    fail "mint $runtime test token" "no token returned"
+    token=$(e2e_mint_workspace_token "$wsid")
+  fi
+  if [ -z "$token" ]; then
+    fail "resolve $runtime workspace token" "no token returned"
     return 0
   fi
 

@@ -97,17 +97,19 @@ done
 # Body has no runtime → defaults to claude-code; pass the matching model
 # that the workspace-creation contract now requires.
 R=$(curl -s -X POST "$BASE/workspaces" -H "Content-Type: application/json" \
-  -d '{"name":"Notify E2E","tier":1,"model":"sonnet"}')
+  -d '{"name":"Notify E2E","tier":1,"runtime":"external","external":true,"model":"sonnet"}')
 WSID=$(echo "$R" | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])' 2>/dev/null || true)
 [ -n "$WSID" ] || { echo "Failed to create workspace: $R"; exit 1; }
+TOKEN=$(echo "$R" | e2e_extract_token)
 echo "Created workspace $WSID"
 
 # Mint a bearer token so the wsAuth-grouped endpoints (notify, activity,
-# chat/uploads) accept us. Local dev mode skips auth, but CI enforces it
-# — so we always send the header to keep the test portable. The
-# admin/test-token endpoint is only enabled when MOLECULE_ENV != production.
-TOKEN=$(e2e_mint_test_token "$WSID")
-[ -n "$TOKEN" ] || { echo "Failed to mint test token"; exit 1; }
+# chat/uploads) accept us. Local dev mode skips auth, but CI enforces it,
+# so we always send the header to keep the test portable.
+if [ -z "$TOKEN" ]; then
+  TOKEN=$(e2e_mint_workspace_token "$WSID")
+fi
+[ -n "$TOKEN" ] || { echo "Failed to mint workspace token"; exit 1; }
 AUTH="Authorization: Bearer $TOKEN"
 
 echo ""

@@ -65,7 +65,7 @@ def lint_module(tmp_path, monkeypatch):
     cannot leak global state into each other.
     """
     env = {
-        "GITEA_TOKEN": "test-token",
+        "GITEA_TOKEN": "fixture-token",
         "GITEA_HOST": "git.example.test",
         "REPO": "owner/repo",
         "BRANCH": "main",

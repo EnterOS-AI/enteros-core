@@ -38,7 +38,7 @@ Full contract: `docs/runbooks/admin-auth.md`.
 | GET | /settings/secrets | secrets.go — list global secrets (keys only, values masked) |
 | PUT/POST | /settings/secrets | secrets.go — set a global secret `{key, value}`; auto-restarts every non-paused/non-removed/non-external workspace that does not shadow the key with a workspace-level override |
 | DELETE | /settings/secrets/:key | secrets.go — delete a global secret; same auto-restart fan-out as PUT/POST |
-| GET | /admin/workspaces/:id/test-token | admin_test_token.go — mint a fresh bearer token for E2E scripts; returns 404 unless `MOLECULE_ENV != production` or `MOLECULE_ENABLE_TEST_TOKENS=1` |
+| POST | /admin/workspaces/:id/tokens | admin_workspace_tokens.go — mint a real workspace bearer token; requires `AdminAuth`; plaintext is returned once |
 | GET/POST/DELETE | /admin/secrets[/:key] | secrets.go — legacy aliases for /settings/secrets |
 | WS | /workspaces/:id/terminal | terminal.go |
 | POST/GET | /workspaces/:id/approvals | approvals.go |

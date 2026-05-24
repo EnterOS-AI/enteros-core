@@ -48,7 +48,7 @@ func newTestClient(t *testing.T, mux *http.ServeMux) *artifacts.Client {
 	t.Helper()
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
-	return artifacts.NewWithBaseURL("test-token", "test-ns", srv.URL)
+	return artifacts.NewWithBaseURL("fixture-token", "test-ns", srv.URL)
 }
 
 // ---- CreateRepo ----------------------------------------------------------
@@ -61,7 +61,7 @@ func TestCreateRepo_Success(t *testing.T) {
 			return
 		}
 		// Verify auth header
-		if r.Header.Get("Authorization") != "Bearer test-token" {
+		if r.Header.Get("Authorization") != "Bearer fixture-token" {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}

@@ -188,7 +188,7 @@ func createTestWorkspace(t *testing.T) string {
 	t.Helper()
 	var id string
 	err := db.DB.QueryRow(`
-		INSERT INTO workspaces (name, status, tier) VALUES ('test-token-ws', 'online', 2)
+		INSERT INTO workspaces (name, status, tier) VALUES ('fixture-token-ws', 'online', 2)
 		RETURNING id
 	`).Scan(&id)
 	if err != nil {

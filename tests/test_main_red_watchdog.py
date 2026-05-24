@@ -75,7 +75,7 @@ def _stub_time_sleep(monkeypatch):
 def wd_module():
     """Import the script as a module under a known env."""
     env = {
-        "GITEA_TOKEN": "test-token",
+        "GITEA_TOKEN": "fixture-token",
         "GITEA_HOST": "git.example.test",
         "REPO": "owner/repo",
         "WATCH_BRANCH": "main",
