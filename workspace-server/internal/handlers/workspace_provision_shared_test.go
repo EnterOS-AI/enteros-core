@@ -241,10 +241,10 @@ func TestMintWorkspaceSecrets_PersistsInboundSecretInSaaSMode(t *testing.T) {
 // inherits it automatically.
 func TestPrepareProvisionContext_ParentIDInjection(t *testing.T) {
 	cases := []struct {
-		name       string
-		parentID   *string
-		expectKey  bool
-		expectVal  string
+		name      string
+		parentID  *string
+		expectKey bool
+		expectVal string
 	}{
 		{
 			name:      "parentID nil → no PARENT_ID env",
@@ -333,11 +333,11 @@ func TestPrepareProvisionContext_InjectsGitHTTPCredsFromPersonaToken(t *testing.
 	t.Setenv("MOLECULE_PERSONA_ROOT", root)
 
 	cases := []struct {
-		name          string
-		role          string
-		expectInject  bool
-		expectUser    string
-		expectPass    string
+		name         string
+		role         string
+		expectInject bool
+		expectUser   string
+		expectPass   string
 	}{
 		{
 			name:         "Dev-A slug role → persona token injected as GIT_HTTP_USERNAME/PASSWORD",
@@ -505,10 +505,10 @@ func TestPrepareProvisionContext_WorkspaceSecretWinsOverPersonaToken(t *testing.
 //
 // The four branches:
 //
-//   1. Secret already present → (s, false, nil)
-//   2. Secret missing, mint succeeds → (minted, true, nil)
-//   3. Secret missing, mint fails → ("", false, mint-err)
-//   4. Read fails (non-NoInboundSecret) → ("", false, read-err)
+//  1. Secret already present → (s, false, nil)
+//  2. Secret missing, mint succeeds → (minted, true, nil)
+//  3. Secret missing, mint fails → ("", false, mint-err)
+//  4. Read fails (non-NoInboundSecret) → ("", false, read-err)
 func TestReadOrLazyHealInboundSecret(t *testing.T) {
 	t.Run("secret already present → no heal, no error", func(t *testing.T) {
 		mock := setupTestDB(t)
@@ -961,6 +961,76 @@ func TestApplyRuntimeModelEnv_SetsUniversalMODELForAllRuntimes(t *testing.T) {
 				t.Errorf("HERMES_DEFAULT_MODEL = %q, want %q", got, tc.wantHermesDefault)
 			}
 		})
+	}
+}
+
+func TestApplyPlatformManagedLLMEnv_DefaultsOpenAIProxyWhenNoWorkspaceKey(t *testing.T) {
+	t.Setenv("MOLECULE_LLM_BILLING_MODE", "platform_managed")
+	t.Setenv("MOLECULE_LLM_BASE_URL", "https://api.example.test/api/v1/internal/llm/openai/v1")
+	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
+	t.Setenv("MOLECULE_LLM_USAGE_URL", "https://api.example.test/api/v1/internal/llm/usage")
+	t.Setenv("MOLECULE_LLM_DEFAULT_MODEL", "moonshot/kimi-k2.6")
+
+	envVars := map[string]string{}
+	applyPlatformManagedLLMEnv(envVars, "langgraph", "")
+	applyRuntimeModelEnv(envVars, "langgraph", "")
+
+	if got := envVars["OPENAI_BASE_URL"]; got != "https://api.example.test/api/v1/internal/llm/openai/v1" {
+		t.Fatalf("OPENAI_BASE_URL = %q", got)
+	}
+	if got := envVars["OPENAI_API_KEY"]; got != "tenant-admin-token" {
+		t.Fatalf("OPENAI_API_KEY = %q", got)
+	}
+	if got := envVars["MOLECULE_LLM_USAGE_TOKEN"]; got != "tenant-admin-token" {
+		t.Fatalf("MOLECULE_LLM_USAGE_TOKEN = %q", got)
+	}
+	if got := envVars["MODEL"]; got != "moonshot/kimi-k2.6" {
+		t.Fatalf("MODEL = %q", got)
+	}
+	if got := envVars["MOLECULE_MODEL"]; got != "moonshot/kimi-k2.6" {
+		t.Fatalf("MOLECULE_MODEL = %q", got)
+	}
+}
+
+func TestApplyPlatformManagedLLMEnv_DoesNotOverrideWorkspaceOpenAIKey(t *testing.T) {
+	t.Setenv("MOLECULE_LLM_BILLING_MODE", "platform_managed")
+	t.Setenv("MOLECULE_LLM_BASE_URL", "https://api.example.test/api/v1/internal/llm/openai/v1")
+	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
+
+	envVars := map[string]string{
+		"OPENAI_API_KEY":  "user-openai-key",
+		"OPENAI_BASE_URL": "https://api.openai.com/v1",
+		"MODEL":           "openai/gpt-5.5",
+	}
+	applyPlatformManagedLLMEnv(envVars, "langgraph", "")
+
+	if got := envVars["OPENAI_API_KEY"]; got != "user-openai-key" {
+		t.Fatalf("OPENAI_API_KEY was overwritten: %q", got)
+	}
+	if got := envVars["OPENAI_BASE_URL"]; got != "https://api.openai.com/v1" {
+		t.Fatalf("OPENAI_BASE_URL was overwritten: %q", got)
+	}
+	if got := envVars["MOLECULE_LLM_USAGE_TOKEN"]; got != "tenant-admin-token" {
+		t.Fatalf("MOLECULE_LLM_USAGE_TOKEN = %q", got)
+	}
+	if got := envVars["MODEL"]; got != "openai/gpt-5.5" {
+		t.Fatalf("MODEL = %q", got)
+	}
+}
+
+func TestApplyPlatformManagedLLMEnv_NoopsOutsidePlatformManaged(t *testing.T) {
+	t.Setenv("MOLECULE_LLM_BILLING_MODE", "byok")
+	t.Setenv("MOLECULE_LLM_BASE_URL", "https://api.example.test/api/v1/internal/llm/openai/v1")
+	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
+
+	envVars := map[string]string{}
+	applyPlatformManagedLLMEnv(envVars, "langgraph", "")
+
+	if _, ok := envVars["OPENAI_API_KEY"]; ok {
+		t.Fatalf("OPENAI_API_KEY should not be set outside platform-managed mode")
+	}
+	if _, ok := envVars["MOLECULE_LLM_USAGE_TOKEN"]; ok {
+		t.Fatalf("MOLECULE_LLM_USAGE_TOKEN should not be set outside platform-managed mode")
 	}
 }
 

@@ -30,7 +30,7 @@ func TestRefreshEnvFromCP_AppliesCPResponse(t *testing.T) {
 			t.Errorf("org id header: got %q", got)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"MOLECULE_CP_SHARED_SECRET":"new-secret","MOLECULE_CP_URL":"https://api.moleculesai.app","DISPLAY_SESSION_SIGNING_SECRET":"display-secret"}`)
+		fmt.Fprint(w, `{"MOLECULE_CP_SHARED_SECRET":"new-secret","MOLECULE_CP_URL":"https://api.moleculesai.app","DISPLAY_SESSION_SIGNING_SECRET":"display-secret","MOLECULE_LLM_BASE_URL":"https://api.moleculesai.app/api/v1/internal/llm/openai/v1","MOLECULE_LLM_USAGE_TOKEN":"tenant-admin-token","MOLECULE_LLM_DEFAULT_MODEL":"moonshot/kimi-k2.6"}`)
 	}))
 	defer srv.Close()
 
@@ -47,6 +47,15 @@ func TestRefreshEnvFromCP_AppliesCPResponse(t *testing.T) {
 	}
 	if got := os.Getenv("DISPLAY_SESSION_SIGNING_SECRET"); got != "display-secret" {
 		t.Errorf("DISPLAY_SESSION_SIGNING_SECRET: want display-secret, got %q", got)
+	}
+	if got := os.Getenv("MOLECULE_LLM_BASE_URL"); got != "https://api.moleculesai.app/api/v1/internal/llm/openai/v1" {
+		t.Errorf("MOLECULE_LLM_BASE_URL: got %q", got)
+	}
+	if got := os.Getenv("MOLECULE_LLM_USAGE_TOKEN"); got != "tenant-admin-token" {
+		t.Errorf("MOLECULE_LLM_USAGE_TOKEN: got %q", got)
+	}
+	if got := os.Getenv("MOLECULE_LLM_DEFAULT_MODEL"); got != "moonshot/kimi-k2.6" {
+		t.Errorf("MOLECULE_LLM_DEFAULT_MODEL: got %q", got)
 	}
 }
 

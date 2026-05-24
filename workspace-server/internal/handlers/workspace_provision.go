@@ -912,6 +912,48 @@ func applyRuntimeModelEnv(envVars map[string]string, runtime, model string) {
 	}
 }
 
+// applyPlatformManagedLLMEnv wires the control-plane LLM proxy into a
+// workspace only when the org is in platform-managed mode. Provider keys
+// never enter the tenant; OPENAI_API_KEY is the tenant token for the CP
+// OpenAI-compatible proxy.
+func applyPlatformManagedLLMEnv(envVars map[string]string, _ string, model string) {
+	if strings.ToLower(strings.TrimSpace(os.Getenv("MOLECULE_LLM_BILLING_MODE"))) != "platform_managed" {
+		return
+	}
+	baseURL := firstNonEmptyEnv("MOLECULE_LLM_BASE_URL", "OPENAI_BASE_URL")
+	token := firstNonEmptyEnv("MOLECULE_LLM_USAGE_TOKEN", "OPENAI_API_KEY")
+	if baseURL == "" || token == "" {
+		return
+	}
+
+	envVars["MOLECULE_LLM_BILLING_MODE"] = "platform_managed"
+	envVars["MOLECULE_LLM_BASE_URL"] = baseURL
+	envVars["MOLECULE_LLM_USAGE_TOKEN"] = token
+	if usageURL := strings.TrimSpace(os.Getenv("MOLECULE_LLM_USAGE_URL")); usageURL != "" {
+		envVars["MOLECULE_LLM_USAGE_URL"] = usageURL
+	}
+
+	if strings.TrimSpace(envVars["OPENAI_API_KEY"]) == "" {
+		envVars["OPENAI_API_KEY"] = token
+		envVars["OPENAI_BASE_URL"] = baseURL
+	}
+
+	if model == "" && strings.TrimSpace(envVars["MOLECULE_MODEL"]) == "" && strings.TrimSpace(envVars["MODEL"]) == "" {
+		if defaultModel := strings.TrimSpace(os.Getenv("MOLECULE_LLM_DEFAULT_MODEL")); defaultModel != "" {
+			envVars["MOLECULE_MODEL"] = defaultModel
+		}
+	}
+}
+
+func firstNonEmptyEnv(names ...string) string {
+	for _, name := range names {
+		if v := strings.TrimSpace(os.Getenv(name)); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
 // loadWorkspaceSecrets loads global + workspace-specific secrets into a map.
 // Returns nil map + error string on decrypt failure. Shared by both Docker
 // and control plane provisioning paths to avoid duplication.
