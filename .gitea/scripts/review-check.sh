@@ -12,6 +12,7 @@
 #   ≥ 1 review on the PR where:
 #     • state == APPROVED
 #     • review.dismissed == false
+#     • review.official != false (excludes draft/mis-filed APPROVED reviews)
 #     • review.user.login != PR.user.login (non-author)
 #     • review.user.login ∈ team-members
 #
@@ -201,6 +202,7 @@ fi
 JQ_FILTER='.[]
   | select(.state == "APPROVED")
   | select(.dismissed != true)
+  | select(.official != false)
   | select(.user.login != $author)'
 if [ "${REVIEW_CHECK_STRICT:-}" = "1" ]; then
   JQ_FILTER="${JQ_FILTER}
