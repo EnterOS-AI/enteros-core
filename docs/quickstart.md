@@ -238,7 +238,7 @@ No inbound firewall rules needed — the agent initiates the outbound WebSocket 
 ## What To Try Next
 
 - **Expand to a team:** right-click a workspace and choose `Expand to Team`.
-- **Switch runtime:** use `Config -> Runtime` to move between LangGraph, DeepAgents, Claude Code, CrewAI, AutoGen, and OpenClaw.
+- **Switch runtime:** use `Config -> Runtime` to move between Claude Code, Codex, Hermes, and OpenClaw.
 - **Inspect operations:** check `Activity`, `Traces`, `Events`, and `Terminal`.
 - **Use global keys:** configure one provider once in `Secrets & API Keys -> Global`.
 - **Import a template:** use the template palette or `POST /templates/import`.
@@ -268,7 +268,7 @@ Browser  -->  Canvas (Next.js :3000)
                                 |
                                 v
                        Provisioned workspaces
-                     (LangGraph / Claude Code / CrewAI / AutoGen / etc.)
+                     (Claude Code / Codex / Hermes / OpenClaw)
 ```
 
 For the full system model, see [Architecture](./architecture/architecture.md).

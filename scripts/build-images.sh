@@ -8,7 +8,7 @@ cd "$(dirname "$0")/../workspace-template"
 echo "=== Building base image ==="
 docker build -t workspace-template:base -t workspace-template:latest .
 
-for adapter in langgraph claude_code openclaw deepagents crewai autogen; do
+for adapter in claude_code codex hermes openclaw; do
   DOCKERFILE="adapters/${adapter}/Dockerfile"
   if [ ! -f "$DOCKERFILE" ]; then
     echo "Skipping $adapter (no Dockerfile)"

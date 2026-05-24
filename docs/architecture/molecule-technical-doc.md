@@ -511,7 +511,7 @@ description: ""
 version: "1.0.0"
 tier: 2                                    # 1=sandboxed, 2=standard, 3=privileged, 4=full-host
 model: "anthropic:claude-sonnet-4-6"       # provider:model syntax
-runtime: "langgraph"                       # langgraph | deepagents | claude-code | crewai | autogen | openclaw
+runtime: "claude-code"                     # claude-code | codex | hermes | openclaw
 runtime_config:                            # Runtime-specific settings
   command: "claude"                        # For CLI runtimes
   args: []
@@ -565,15 +565,13 @@ compliance:
   max_task_duration_seconds: 300
 ```
 
-### Six Runtime Adapters
+### Four Runtime Adapters
 
 | Adapter | Core Strength | Image Tag |
 |---------|--------------|-----------|
-| **LangGraph** | Graph-based state machine, tool use, streaming | `workspace-template:langgraph` |
-| **DeepAgents** | Deep planning, multi-step task decomposition | `workspace-template:deepagents` |
 | **Claude Code** | Native coding workflows, CLI continuity, OAuth auth | `workspace-template:claude-code` |
-| **CrewAI** | Role-based crews, structured task orchestration | `workspace-template:crewai` |
-| **AutoGen** | Multi-agent conversations, explicit strategies | `workspace-template:autogen` |
+| **Codex** | OpenAI Codex coding workflows | `workspace-template:codex` |
+| **Hermes** | Hermes agent runtime | `workspace-template:hermes` |
 | **OpenClaw** | CLI-native runtime, own session model | `workspace-template:openclaw` |
 
 **Branch-level WIP**: NemoClaw (NVIDIA T4 + Docker socket) on `feat/nemoclaw-t4-docker`.

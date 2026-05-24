@@ -21,8 +21,8 @@ type ProvisionTimeoutEmitter interface {
 
 // DefaultProvisioningTimeout is how long a workspace may sit in
 // status='provisioning' before the sweeper flips it to 'failed'.
-// Default for non-hermes runtimes (claude-code, langgraph, crewai,
-// autogen, etc.) which cold-boot in <5 min. The container-launch path
+// Default for non-hermes runtimes (claude-code, codex, openclaw, etc.)
+// which cold-boot in <5 min. The container-launch path
 // has its own 3-minute context timeout (provisioner.ProvisionTimeout)
 // but that only bounds the docker API call — a container that started
 // but crashes before /registry/register never triggers that path and

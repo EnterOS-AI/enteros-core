@@ -4,13 +4,11 @@ The `workspace/` directory is Molecule AI's unified runtime image. Every provisi
 
 ## Runtime Matrix In Current `main`
 
-Current `main` ships six adapters:
+Current `main` ships four maintained adapters:
 
-- `langgraph`
-- `deepagents`
 - `claude-code`
-- `crewai`
-- `autogen`
+- `codex`
+- `hermes`
 - `openclaw`
 
 This is the merged runtime surface today. Branch-level experiments such as NemoClaw are separate and should be treated as roadmap/WIP, not merged support.

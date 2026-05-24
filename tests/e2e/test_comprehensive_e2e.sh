@@ -137,14 +137,14 @@ check "Create claude-code workspace" '"status":"provisioning"' "$R"
 RT_CC_ID=$(echo "$R" | jq_extract "['id']")
 
 R=$(curl -s -X POST "$BASE/workspaces" -H "Content-Type: application/json" \
-  -d '{"name":"RT LangGraph","role":"Test","tier":2,"runtime":"langgraph"}')
-check "Create langgraph workspace" '"status":"provisioning"' "$R"
-RT_LG_ID=$(echo "$R" | jq_extract "['id']")
+  -d '{"name":"RT Codex","role":"Test","tier":2,"runtime":"codex"}')
+check "Create codex workspace" '"status":"provisioning"' "$R"
+RT_CX_ID=$(echo "$R" | jq_extract "['id']")
 
 R=$(curl -s -X POST "$BASE/workspaces" -H "Content-Type: application/json" \
-  -d '{"name":"RT CrewAI","role":"Test","tier":2,"runtime":"crewai"}')
-check "Create crewai workspace" '"status":"provisioning"' "$R"
-RT_CR_ID=$(echo "$R" | jq_extract "['id']")
+  -d '{"name":"RT Hermes","role":"Test","tier":2,"runtime":"hermes"}')
+check "Create hermes workspace" '"status":"provisioning"' "$R"
+RT_HM_ID=$(echo "$R" | jq_extract "['id']")
 
 # Wait for containers to start (poll up to 30s for first one to appear)
 if command -v docker &>/dev/null; then
@@ -174,8 +174,8 @@ if command -v docker &>/dev/null; then
   }
 
   _check_image "$RT_CC_ID" "claude-code" "claude-code uses claude-code image"
-  _check_image "$RT_LG_ID" "langgraph" "langgraph uses langgraph image"
-  _check_image "$RT_CR_ID" "crewai" "crewai uses crewai image"
+  _check_image "$RT_CX_ID" "codex" "codex uses codex image"
+  _check_image "$RT_HM_ID" "hermes" "hermes uses hermes image"
 else
   echo "  SKIP: Docker not available — cannot verify container images"
   SKIP=$((SKIP + 3))
@@ -183,7 +183,7 @@ fi
 
 # Verify runtime in agent card after registration
 sleep 5
-for rt_id in $RT_CC_ID $RT_LG_ID $RT_CR_ID; do
+for rt_id in $RT_CC_ID $RT_CX_ID $RT_HM_ID; do
   # Register so we can check agent card
   curl -s -X POST "$BASE/registry/register" -H "Content-Type: application/json" \
     -d "{\"id\":\"$rt_id\",\"url\":\"http://localhost:19999\",\"agent_card\":{\"name\":\"Test\",\"skills\":[]}}" > /dev/null 2>&1
@@ -204,20 +204,20 @@ fi
 
 # Verify runtime change persists on restart (if provisioner supports ExecRead)
 # Write a new runtime to config, restart, check image changes
-R=$(curl -s -X PUT "$BASE/workspaces/$RT_LG_ID/files/config.yaml" \
+R=$(curl -s -X PUT "$BASE/workspaces/$RT_CX_ID/files/config.yaml" \
   -H "Content-Type: application/json" \
-  -d '{"content":"name: RT LangGraph\nruntime: deepagents\nmodel: openai:gpt-4.1-mini\ntier: 2\n"}')
+  -d '{"content":"name: RT Codex\nruntime: openclaw\nmodel: openai:gpt-4.1-mini\ntier: 2\n"}')
 if echo "$R" | grep -qF "saved"; then
-  curl -s -X POST "$BASE/workspaces/$RT_LG_ID/restart" > /dev/null 2>&1
+  curl -s -X POST "$BASE/workspaces/$RT_CX_ID/restart" > /dev/null 2>&1
   # Poll up to 30s for the new container image to appear (restart can take a while)
   if command -v docker &>/dev/null; then
-    short_id="${RT_LG_ID:0:12}"
+    short_id="${RT_CX_ID:0:12}"
     for _ in 1 2 3 4 5 6; do
       sleep 5
       actual=$(docker inspect "ws-${short_id}" --format '{{.Config.Image}}' 2>/dev/null || echo "")
-      if echo "$actual" | grep -qF "deepagents"; then break; fi
+      if echo "$actual" | grep -qF "openclaw"; then break; fi
     done
-    _check_image "$RT_LG_ID" "deepagents" "Runtime change langgraph→deepagents on restart"
+    _check_image "$RT_CX_ID" "openclaw" "Runtime change codex to openclaw on restart"
   else
     echo "  SKIP: Docker not available"
     SKIP=$((SKIP + 1))
@@ -228,7 +228,7 @@ else
 fi
 
 # Clean up runtime test workspaces
-for rt_id in $RT_CC_ID $RT_LG_ID $RT_CR_ID; do
+for rt_id in $RT_CC_ID $RT_CX_ID $RT_HM_ID; do
   curl -s -X DELETE "$BASE/workspaces/$rt_id?confirm=true" > /dev/null 2>&1
   sleep 0.3
 done

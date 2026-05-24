@@ -62,7 +62,7 @@ func (h *OrgHandler) createWorkspaceTree(ws OrgWorkspace, parentID *string, absX
 		runtime = defaults.Runtime
 	}
 	if runtime == "" {
-		runtime = "langgraph"
+		runtime = "claude-code"
 	}
 	model := ws.Model
 	if model == "" {

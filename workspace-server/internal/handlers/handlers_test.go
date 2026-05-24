@@ -368,11 +368,13 @@ func TestWorkspaceCreate(t *testing.T) {
 	// Default tier is 3 (Privileged) — see workspace.go create-handler comment.
 	// delivery_mode defaults to "push" when payload omits it (#2339).
 	mock.ExpectExec("INSERT INTO workspaces").
-		WithArgs(sqlmock.AnyArg(), "Test Agent", nil, 3, "langgraph", (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
+		WithArgs(sqlmock.AnyArg(), "Test Agent", nil, 3, "claude-code", (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// Expect transaction commit (no secrets in this payload)
 	mock.ExpectCommit()
+	mock.ExpectExec("INSERT INTO workspace_secrets").
+		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// Expect canvas_layouts INSERT
 	mock.ExpectExec("INSERT INTO canvas_layouts").
@@ -389,8 +391,8 @@ func TestWorkspaceCreate(t *testing.T) {
 	// Note: model is now required at the Create boundary (CTO 2026-05-22
 	// SSOT directive — see feedback_workspace_model_required_no_platform_default_dynamic_credential_intake
 	// and TestCreate_ModelRequired_Returns422). This test happens to take
-	// the bare-defaults path (no template, no runtime → langgraph), so
-	// the body must declare an explicit model. Using a langgraph-compatible
+	// the bare-defaults path (no template, no runtime → claude-code), so
+	// the body must declare an explicit model. Using a claude-code-compatible
 	// id; the test doesn't exercise model semantics beyond presence.
 	body := `{"name":"Test Agent","model":"anthropic:claude-opus-4-7","canvas":{"x":100,"y":200}}`
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
@@ -462,7 +464,7 @@ func TestWorkspaceList(t *testing.T) {
 		AddRow("ws-1", "Agent One", "worker", 1, "online", []byte("null"), "http://localhost:8001",
 			nil, 0, 1, 0.0, "", 100, "", "claude-code", "", 10.0, 20.0, false, nil, int64(0), false, true, []byte(`{}`)).
 		AddRow("ws-2", "Agent Two", "manager", 2, "provisioning", []byte("null"), "",
-			nil, 0, 1, 0.0, "", 0, "", "langgraph", "", 50.0, 60.0, false, nil, int64(0), false, true, []byte(`{}`))
+			nil, 0, 1, 0.0, "", 0, "", "claude-code", "", 50.0, 60.0, false, nil, int64(0), false, true, []byte(`{}`))
 
 	mock.ExpectQuery("SELECT w.id, w.name").
 		WillReturnRows(rows)
@@ -1182,7 +1184,7 @@ func TestWorkspaceGet_CurrentTask(t *testing.T) {
 		WithArgs("dddddddd-0004-0000-0000-000000000000").
 		WillReturnRows(sqlmock.NewRows(columns).AddRow(
 			"dddddddd-0004-0000-0000-000000000000", "Task Worker", "worker", 1, "online", []byte("null"), "http://localhost:9000",
-			nil, 2, 1, 0.0, "", 300, "Analyzing document", "langgraph", "", 10.0, 20.0, false,
+			nil, 2, 1, 0.0, "", 300, "Analyzing document", "claude-code", "", 10.0, 20.0, false,
 			nil, int64(0), false, true, []byte(`{}`),
 		))
 

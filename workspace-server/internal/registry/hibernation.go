@@ -71,7 +71,7 @@ func hibernateIdleWorkspaces(ctx context.Context, onHibernate HibernateHandler) 
 		  AND hibernation_idle_minutes > 0
 		  AND status IN ('online', 'degraded')
 		  AND active_tasks = 0
-		  AND COALESCE(runtime, 'langgraph') != 'external'
+		  AND COALESCE(runtime, 'claude-code') != 'external'
 		  AND last_heartbeat_at IS NOT NULL
 		  AND last_heartbeat_at < now() - (hibernation_idle_minutes * INTERVAL '1 minute')
 	`)

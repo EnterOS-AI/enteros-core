@@ -63,12 +63,10 @@ export interface Template extends TemplateLike {
  *  id needs a non-identity mapping. */
 export function resolveRuntime(templateId: string): string {
   const runtimeMap: Record<string, string> = {
-    langgraph: "langgraph",
     "claude-code-default": "claude-code",
+    codex: "codex",
+    hermes: "hermes",
     openclaw: "openclaw",
-    deepagents: "deepagents",
-    crewai: "crewai",
-    autogen: "autogen",
   };
   return runtimeMap[templateId] ?? templateId.replace(/-default$/, "");
 }

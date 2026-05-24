@@ -336,10 +336,9 @@ func TestProvisioningTimeout_RuntimeAware(t *testing.T) {
 		want    time.Duration
 	}{
 		{"hermes", HermesProvisioningTimeout},
-		{"langgraph", DefaultProvisioningTimeout},
 		{"claude-code", DefaultProvisioningTimeout},
-		{"crewai", DefaultProvisioningTimeout},
-		{"autogen", DefaultProvisioningTimeout},
+		{"codex", DefaultProvisioningTimeout},
+		{"openclaw", DefaultProvisioningTimeout},
 		{"", DefaultProvisioningTimeout},
 		{"unknown-runtime", DefaultProvisioningTimeout},
 	}
@@ -359,17 +358,17 @@ func TestProvisioningTimeout_RuntimeAware(t *testing.T) {
 //
 // Order pinned:
 //
-//   1. PROVISION_TIMEOUT_SECONDS env beats everything (ops debug).
-//   2. Manifest lookup beats hermes special-case + default.
-//   3. Hermes default applies when lookup returns 0 for hermes.
-//   4. DefaultProvisioningTimeout applies when lookup returns 0 for
-//      anything else.
-//   5. Lookup returning 0 for ANY runtime is "no override" — never
-//      a 0-second timeout (which would kill every workspace instantly).
+//  1. PROVISION_TIMEOUT_SECONDS env beats everything (ops debug).
+//  2. Manifest lookup beats hermes special-case + default.
+//  3. Hermes default applies when lookup returns 0 for hermes.
+//  4. DefaultProvisioningTimeout applies when lookup returns 0 for
+//     anything else.
+//  5. Lookup returning 0 for ANY runtime is "no override" — never
+//     a 0-second timeout (which would kill every workspace instantly).
 func TestProvisioningTimeout_ManifestOverride(t *testing.T) {
 	manifest := map[string]int{
 		"claude-code": 900, // 15 min — what an ops manifest bump would set
-		"langgraph":   1200,
+		"codex":       1200,
 		"hermes":      2400, // 40 min — manifest can override hermes default too
 	}
 	lookup := func(runtime string) int { return manifest[runtime] }
@@ -380,7 +379,7 @@ func TestProvisioningTimeout_ManifestOverride(t *testing.T) {
 		want    time.Duration
 	}{
 		{"manifest override beats default for claude-code", "claude-code", 900 * time.Second},
-		{"manifest override applied for langgraph", "langgraph", 1200 * time.Second},
+		{"manifest override applied for codex", "codex", 1200 * time.Second},
 		{"manifest override beats hermes default", "hermes", 2400 * time.Second},
 		{"unknown runtime + no manifest entry → default", "unknown-runtime", DefaultProvisioningTimeout},
 		{"empty runtime + no manifest entry → default", "", DefaultProvisioningTimeout},

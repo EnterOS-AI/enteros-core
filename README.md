@@ -53,7 +53,7 @@ Molecule AI is the most powerful way to govern an AI agent organization in produ
 It combines the parts that are usually scattered across demos, internal glue code, and framework-specific tooling into one product:
 
 - one org-native control plane for teams, roles, hierarchy, and lifecycle
-- one runtime layer that lets **eight** agent runtimes — LangGraph, DeepAgents, Claude Code, CrewAI, AutoGen, **Hermes**, **Gemini CLI**, and OpenClaw — run side by side behind one workspace contract
+- one runtime layer that lets **four** maintained agent runtimes — Claude Code, Codex, **Hermes**, and OpenClaw — run side by side behind one workspace contract
 - one memory model that keeps recall, sharing, and skill evolution aligned with organizational boundaries (Memory v2 backed by pgvector for semantic recall)
 - one operational surface for observing, pausing, restarting, inspecting, and improving live workspaces
 
@@ -75,7 +75,7 @@ You do not wire collaboration paths by hand. Hierarchy defines the default commu
 
 ### 3. Runtime choice stops being a dead-end decision
 
-LangGraph, DeepAgents, Claude Code, CrewAI, AutoGen, Hermes, Gemini CLI, and OpenClaw can all plug into the same workspace abstraction. Teams can standardize governance without forcing every group onto one runtime.
+Claude Code, Codex, Hermes, and OpenClaw can all plug into the same workspace abstraction. Teams can standardize governance without forcing every group onto one runtime.
 
 ### 4. Memory is treated like infrastructure
 
@@ -112,13 +112,9 @@ Molecule AI is not trying to replace the frameworks below. It is the system that
 
 | Runtime / architecture | Status in current repo | Native strength | What Molecule AI adds |
 |---|---|---|---|
-| **LangGraph** | Shipping on `main` | Graph control, tool use, Python extensibility | Canvas orchestration, hierarchy routing, A2A, memory scopes, operational lifecycle |
-| **DeepAgents** | Shipping on `main` | Deeper planning and decomposition | Same workspace contract, team topology, activity stream, restart behavior |
 | **Claude Code** | Shipping on `main` | Real coding workflows, CLI-native continuity | Secure workspace abstraction, A2A delegation, org boundaries, shared control plane |
-| **CrewAI** | Shipping on `main` | Role-based crews | Persistent workspace identity, policy consistency, shared canvas and registry |
-| **AutoGen** | Shipping on `main` | Assistant/tool orchestration | Standardized deployment, hierarchy-aware collaboration, shared ops plane |
+| **Codex** | Shipping on `main` | OpenAI Codex CLI workflows | Secure workspace abstraction, A2A delegation, org boundaries, shared control plane |
 | **Hermes 4** | Shipping on `main` | Hybrid reasoning, native tools, json_schema (NousResearch/hermes-agent) | Option B upstream hook, A2A bridge to OpenAI-compat API, multi-provider provider derivation |
-| **Gemini CLI** | Shipping on `main` | Google Gemini CLI continuity | Workspace lifecycle, A2A, hierarchy-aware collaboration, shared ops plane |
 | **OpenClaw** | Shipping on `main` | CLI-native runtime with its own session model | Workspace lifecycle, templates, activity logs, topology-aware collaboration |
 | **NemoClaw** | WIP on `feat/nemoclaw-t4-docker` | NVIDIA-oriented runtime path | Planned to join the same abstraction once merged; not yet part of `main` |
 
@@ -209,7 +205,7 @@ The result is not just “an agent that learns.” It is **an organization that 
 ### Runtime
 
 - standalone workspace-template images that install `molecule-ai-workspace-runtime` from the Gitea package registry; thin AMI in production (us-east-2)
-- adapter-driven execution across **8 runtimes** (Claude Code, Hermes, Gemini CLI, LangGraph, DeepAgents, CrewAI, AutoGen, OpenClaw)
+- adapter-driven execution across **4 maintained runtimes** (Claude Code, Codex, Hermes, OpenClaw)
 - Agent Card registration
 - **Memory v2 backed by pgvector** — per-tenant plugin sidecar serving HMA namespaces with FTS + semantic recall
 - plugin-mounted shared rules/skills
@@ -245,7 +241,7 @@ The result is not just “an agent that learns.” It is **an organization that 
 Molecule AI is especially strong when you need to run:
 
 - AI engineering teams with PM / Dev Lead / QA / Research / Ops roles
-- mixed runtime organizations where one team prefers LangGraph and another prefers Claude Code
+- mixed runtime organizations where one team prefers Hermes and another prefers Claude Code
 - long-lived agent organizations that need memory boundaries and reusable procedures
 - internal platforms that want to expose agent teams as structured infrastructure, not ad hoc scripts
 
@@ -260,7 +256,7 @@ Canvas (Next.js 15, warm-paper :3000)  <--HTTP / WS-->  Platform (Go 1.25 :8080)
          +------------------------- shows ------------------------> workspaces, teams, tasks, traces, events
 
 Workspace Runtime (Python ≥3.11, image with adapters)
-  - 8 adapters: LangGraph / DeepAgents / Claude Code / CrewAI / AutoGen / Hermes / Gemini CLI / OpenClaw
+  - 4 adapters: Claude Code / Codex / Hermes / OpenClaw
   - Agent Card + A2A server (typed-SSOT response path, RFC #2967)
   - heartbeat + activity + Memory v2 (pgvector semantic recall via per-tenant plugin sidecar)
   - skills + plugins + hot reload
@@ -328,7 +324,7 @@ Then open `http://localhost:3000`:
 
 ## Current Scope
 
-The current `main` branch ships the core platform, Canvas v4 (warm-paper themed), Memory v2 (pgvector semantic recall), the typed-SSOT A2A response path (RFC #2967), **eight production adapters** (Claude Code, Hermes, Gemini CLI, LangGraph, DeepAgents, CrewAI, AutoGen, OpenClaw), skill lifecycle, and operational surfaces.
+The current `main` branch ships the core platform, Canvas v4 (warm-paper themed), Memory v2 (pgvector semantic recall), the typed-SSOT A2A response path (RFC #2967), **four maintained production adapters** (Claude Code, Codex, Hermes, OpenClaw), skill lifecycle, and operational surfaces.
 
 The companion private repo [`molecule-controlplane`](https://git.moleculesai.app/molecule-ai/molecule-controlplane) provides the SaaS surface — multi-tenant orchestration on EC2 + Neon + Cloudflare Tunnels, KMS envelope encryption, WorkOS auth, Stripe billing, and a `tenant_resources` audit table with a 30-min reconciler.
 

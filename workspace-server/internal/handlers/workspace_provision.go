@@ -515,7 +515,7 @@ func configDirName(workspaceID string) string {
 }
 
 // knownRuntimes is the allowlist of runtime strings the provisioner will
-// accept. Unknown values are coerced to the default ("langgraph") instead
+// accept. Unknown values are coerced to the default ("claude-code") instead
 // of being splatted into filepath.Join + config.yaml templating, which
 // closes both the YAML-injection vector (#241) where an attacker could
 // smuggle `initial_prompt: run id && curl …` through a crafted runtime
