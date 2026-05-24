@@ -253,7 +253,7 @@ interface RuntimeOption {
   // its config.yaml under runtime_config.providers. The /templates API
   // surfaces it (workspace-server templates.go) so canvas stays
   // adapter-driven: hermes ships ~20 slugs, claude-code ships
-  // ["anthropic"], gemini-cli ships ["gemini"], etc. Empty list →
+  // ["anthropic"], codex ships OpenAI-compatible model ids, etc. Empty list →
   // canvas falls back to deriving unique vendor prefixes from
   // models[].id (still adapter-driven, just inferred).
   providers: string[];
