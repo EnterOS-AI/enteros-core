@@ -101,26 +101,24 @@ func installMockDB(t *testing.T) sqlmock.Sqlmock {
 	return mock
 }
 
-// --- cutoverActive ---
+// --- memoryV2Wired ---
 
-func TestCutoverActive(t *testing.T) {
+func TestMemoryV2Wired(t *testing.T) {
 	cases := []struct {
 		name     string
-		envVal   string
 		plugin   adminMemoriesPlugin
 		resolver adminMemoriesResolver
 		want     bool
 	}{
-		{"env unset", "", &stubAdminPlugin{}, adminRootResolver(), false},
-		{"env true but unwired", "true", nil, nil, false},
-		{"env false", "false", &stubAdminPlugin{}, adminRootResolver(), false},
-		{"env true wired", "true", &stubAdminPlugin{}, adminRootResolver(), true},
+		{"both nil", nil, nil, false},
+		{"plugin only", &stubAdminPlugin{}, nil, false},
+		{"resolver only", nil, adminRootResolver(), false},
+		{"both wired", &stubAdminPlugin{}, adminRootResolver(), true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			t.Setenv(envMemoryV2Cutover, tc.envVal)
 			h := &AdminMemoriesHandler{plugin: tc.plugin, resolver: tc.resolver}
-			if got := h.cutoverActive(); got != tc.want {
+			if got := h.memoryV2Wired(); got != tc.want {
 				t.Errorf("got %v, want %v", got, tc.want)
 			}
 		})
@@ -147,7 +145,6 @@ func TestWithMemoryV2APIs_AttachesDeps(t *testing.T) {
 // --- Export via plugin ---
 
 func TestExport_RoutesThroughPluginWhenCutoverActive(t *testing.T) {
-	t.Setenv(envMemoryV2Cutover, "true")
 	mock := installMockDB(t)
 
 	mock.ExpectQuery("WITH RECURSIVE chain").
@@ -191,7 +188,6 @@ func TestExport_RoutesThroughPluginWhenCutoverActive(t *testing.T) {
 }
 
 func TestExport_DeduplicatesByMemoryID(t *testing.T) {
-	t.Setenv(envMemoryV2Cutover, "true")
 	mock := installMockDB(t)
 
 	// Two workspaces, both will see the same team-shared memory.
@@ -222,7 +218,6 @@ func TestExport_DeduplicatesByMemoryID(t *testing.T) {
 }
 
 func TestExport_SkipsWorkspaceWhenResolverFails(t *testing.T) {
-	t.Setenv(envMemoryV2Cutover, "true")
 	mock := installMockDB(t)
 	mock.ExpectQuery("WITH RECURSIVE chain").
 		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "root_id"}).
@@ -244,7 +239,6 @@ func TestExport_SkipsWorkspaceWhenResolverFails(t *testing.T) {
 }
 
 func TestExport_SkipsWorkspaceWhenPluginSearchFails(t *testing.T) {
-	t.Setenv(envMemoryV2Cutover, "true")
 	mock := installMockDB(t)
 	mock.ExpectQuery("WITH RECURSIVE chain").
 		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "root_id"}).
@@ -268,7 +262,6 @@ func TestExport_SkipsWorkspaceWhenPluginSearchFails(t *testing.T) {
 }
 
 func TestExport_WorkspacesQueryFails(t *testing.T) {
-	t.Setenv(envMemoryV2Cutover, "true")
 	mock := installMockDB(t)
 	mock.ExpectQuery("WITH RECURSIVE chain").
 		WillReturnError(errors.New("db dead"))
@@ -287,7 +280,6 @@ func TestExport_WorkspacesQueryFails(t *testing.T) {
 }
 
 func TestExport_EmptyReadable(t *testing.T) {
-	t.Setenv(envMemoryV2Cutover, "true")
 	mock := installMockDB(t)
 	mock.ExpectQuery("WITH RECURSIVE chain").
 		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "root_id"}).
@@ -309,7 +301,6 @@ func TestExport_EmptyReadable(t *testing.T) {
 }
 
 func TestExport_RedactsSecretsInPluginPath(t *testing.T) {
-	t.Setenv(envMemoryV2Cutover, "true")
 	mock := installMockDB(t)
 	mock.ExpectQuery("WITH RECURSIVE chain").
 		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "root_id"}).
@@ -337,7 +328,6 @@ func TestExport_RedactsSecretsInPluginPath(t *testing.T) {
 // --- Import via plugin ---
 
 func TestImport_RoutesThroughPluginWhenCutoverActive(t *testing.T) {
-	t.Setenv(envMemoryV2Cutover, "true")
 	mock := installMockDB(t)
 	mock.ExpectQuery("SELECT id::text FROM workspaces").
 		WithArgs("alpha").
@@ -368,7 +358,6 @@ func TestImport_RoutesThroughPluginWhenCutoverActive(t *testing.T) {
 }
 
 func TestImport_SkipsUnknownWorkspace(t *testing.T) {
-	t.Setenv(envMemoryV2Cutover, "true")
 	mock := installMockDB(t)
 	mock.ExpectQuery("SELECT id::text FROM workspaces").
 		WithArgs("ghost").
@@ -395,7 +384,6 @@ func TestImport_SkipsUnknownWorkspace(t *testing.T) {
 }
 
 func TestImport_PluginUpsertNamespaceError(t *testing.T) {
-	t.Setenv(envMemoryV2Cutover, "true")
 	mock := installMockDB(t)
 	mock.ExpectQuery("SELECT id::text FROM workspaces").
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("root-1"))
@@ -425,7 +413,6 @@ func TestImport_PluginUpsertNamespaceError(t *testing.T) {
 }
 
 func TestImport_PluginCommitError(t *testing.T) {
-	t.Setenv(envMemoryV2Cutover, "true")
 	mock := installMockDB(t)
 	mock.ExpectQuery("SELECT id::text FROM workspaces").
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("root-1"))
@@ -455,7 +442,6 @@ func TestImport_PluginCommitError(t *testing.T) {
 }
 
 func TestImport_RedactsBeforePluginSeesContent(t *testing.T) {
-	t.Setenv(envMemoryV2Cutover, "true")
 	mock := installMockDB(t)
 	mock.ExpectQuery("SELECT id::text FROM workspaces").
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("root-1"))
@@ -482,7 +468,6 @@ func TestImport_RedactsBeforePluginSeesContent(t *testing.T) {
 }
 
 func TestImport_SkipsUnknownScope(t *testing.T) {
-	t.Setenv(envMemoryV2Cutover, "true")
 	mock := installMockDB(t)
 	mock.ExpectQuery("SELECT id::text FROM workspaces").
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("root-1"))
@@ -508,7 +493,6 @@ func TestImport_SkipsUnknownScope(t *testing.T) {
 }
 
 func TestImport_SkipsWhenResolverErrors(t *testing.T) {
-	t.Setenv(envMemoryV2Cutover, "true")
 	mock := installMockDB(t)
 	mock.ExpectQuery("SELECT id::text FROM workspaces").
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("root-1"))
@@ -545,7 +529,6 @@ func TestImport_SkipsWhenResolverErrors(t *testing.T) {
 // + org:root-1. (Children's workspace:<id> namespaces must be
 // included or admin export silently drops their private memories.)
 func TestExport_BatchesPluginCallsByRoot(t *testing.T) {
-	t.Setenv(envMemoryV2Cutover, "true")
 	mock := installMockDB(t)
 
 	mock.ExpectQuery("WITH RECURSIVE chain").
@@ -605,7 +588,6 @@ func (r perWorkspaceResolver) WritableNamespaces(_ context.Context, ws string) (
 // workspace:rootID + team:rootID + org:rootID — every child workspace's
 // private memories were silently dropped from admin export.
 func TestExport_IncludesEveryMembersPrivateNamespace(t *testing.T) {
-	t.Setenv(envMemoryV2Cutover, "true")
 	mock := installMockDB(t)
 
 	mock.ExpectQuery("WITH RECURSIVE chain").
@@ -775,25 +757,43 @@ func TestSkipImport_ErrorMessage(t *testing.T) {
 	}
 }
 
-// --- Confirm legacy paths still work when env is unset ---
+// --- 503 when plugin is not wired (issue #1733) ---
+//
+// The legacy SQL-backed Export/Import path was removed; both endpoints
+// now respond 503 with a clear hint when v2 isn't configured.
 
-func TestExport_LegacyPathWhenCutoverInactive(t *testing.T) {
-	t.Setenv(envMemoryV2Cutover, "")
-	mock := installMockDB(t)
-	mock.ExpectQuery("SELECT am.id, am.content, am.scope, am.namespace").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "content", "scope", "namespace", "created_at", "workspace_name"}))
-
-	h := NewAdminMemoriesHandler().withMemoryV2APIs(&stubAdminPlugin{}, adminRootResolver())
+func TestExport_503WhenPluginNotWired(t *testing.T) {
+	installMockDB(t)
+	h := NewAdminMemoriesHandler() // no WithMemoryV2 → plugin nil
 	gin.SetMode(gin.TestMode)
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 	c.Request = httptest.NewRequest("GET", "/admin/memories/export", nil)
 	h.Export(c)
 
-	if w.Code != http.StatusOK {
-		t.Errorf("code = %d body=%s", w.Code, w.Body.String())
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("code = %d body=%s", w.Code, w.Body.String())
 	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("legacy SQL path not exercised: %v", err)
+	if !strings.Contains(w.Body.String(), "MEMORY_PLUGIN_URL") {
+		t.Errorf("body must hint at MEMORY_PLUGIN_URL: %s", w.Body.String())
+	}
+}
+
+func TestImport_503WhenPluginNotWired(t *testing.T) {
+	installMockDB(t)
+	h := NewAdminMemoriesHandler()
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest("POST", "/admin/memories/import",
+		bytes.NewBufferString(`[]`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	h.Import(c)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("code = %d body=%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "MEMORY_PLUGIN_URL") {
+		t.Errorf("body must hint at MEMORY_PLUGIN_URL: %s", w.Body.String())
 	}
 }

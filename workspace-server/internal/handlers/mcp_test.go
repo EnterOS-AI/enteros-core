@@ -16,6 +16,7 @@ import (
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
+	"github.com/Molecule-AI/molecule-monorepo/platform/internal/memory/contract"
 	"github.com/gin-gonic/gin"
 )
 
@@ -485,65 +486,45 @@ func TestMCPHandler_ListPeers_ReturnsSiblings(t *testing.T) {
 // tools/call — commit_memory
 // ─────────────────────────────────────────────────────────────────────────────
 
-func TestMCPHandler_CommitMemory_LocalScope_Success(t *testing.T) {
+// Issue #1733: the legacy SQL success-path tests for commit_memory and
+// recall_memory have been removed — the v2 plugin is the only backend
+// and its success paths are covered by:
+//   - TestToolCommitMemory_RoutesThroughV2WhenWired (legacy-shim test)
+//   - TestToolRecallMemory_RoutesThroughV2WhenWired (legacy-shim test)
+//   - Every test in mcp_tools_memory_v2_test.go
+// The unwired-path tests live in mcp_tools_memory_legacy_shim_test.go
+// (TestToolCommitMemory_ErrorsWhenV2Unwired and its recall sibling).
+//
+// The two scope-blocked tests below remain because they validate the
+// OFFSEC-001 JSON-RPC scrub layer (mcp.go dispatchRPC), which is
+// orthogonal to the memory backend. After A1 the underlying error
+// shifts from "GLOBAL scope is not permitted" to "memory plugin is
+// not configured" — but the client-visible message stays "tool call
+// failed", which is what the scrub assertion actually proves.
+
+// TestMCPHandler_CommitMemory_GlobalScope_ScrubsInternalError verifies the
+// OFFSEC-001 / #259 scrub contract on the commit_memory tool: the GLOBAL
+// scope block at scopeToWritableNamespace produces an internal error
+// containing the tokens "GLOBAL", "scope", "permitted", "bridge",
+// "LOCAL", "TEAM" — every one of those MUST be scrubbed to the constant
+// "tool call failed" + code -32000 before reaching the JSON-RPC wire.
+//
+// Issue #1747 review fixed the test setup: the handler is now wired
+// with a v2 plugin + resolver stub so the request actually reaches
+// the GLOBAL-block path in commitMemoryLegacyShim →
+// scopeToWritableNamespace. Without that wiring, the handler errors
+// earlier in `memoryV2Available()` with "memory plugin is not
+// configured", and the leaked-tokens assertion below becomes
+// vacuously true — passes even if the entire scrub layer in
+// mcp.go:dispatchRPC is deleted. The wired path is the only one
+// that actually pins the OFFSEC-001 contract.
+func TestMCPHandler_CommitMemory_GlobalScope_ScrubsInternalError(t *testing.T) {
 	h, mock := newMCPHandler(t)
-
-	mock.ExpectExec("INSERT INTO agent_memories").
-		WithArgs(sqlmock.AnyArg(), "ws-1", "important fact", "LOCAL", "ws-1").
-		WillReturnResult(sqlmock.NewResult(1, 1))
-
-	w := mcpPost(t, h, "ws-1", map[string]interface{}{
-		"jsonrpc": "2.0",
-		"id":      9,
-		"method":  "tools/call",
-		"params": map[string]interface{}{
-			"name": "commit_memory",
-			"arguments": map[string]interface{}{
-				"content": "important fact",
-				"scope":   "LOCAL",
-			},
-		},
-	})
-
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
-	}
-	var resp mcpResponse
-	json.Unmarshal(w.Body.Bytes(), &resp)
-	if resp.Error != nil {
-		t.Fatalf("unexpected error: %+v", resp.Error)
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("unmet sqlmock expectations: %v", err)
-	}
-}
-
-// TestMCPHandler_CommitMemory_GlobalScope_Blocked_ScrubsInternalError verifies
-// two contracts at once on the GLOBAL-scope-blocked path:
-//
-//  1. C3 invariant (commit_memory with scope=GLOBAL aborts on the MCP bridge
-//     before touching the DB), AND
-//  2. OFFSEC-001 / #259 scrub contract (commit 7d1a189f): the JSON-RPC error
-//     returned to the client is a CONSTANT — code=-32000, message="tool call
-//     failed" — with the production-internal err.Error() text logged
-//     server-side, never reflected back to the caller.
-//
-// Prior to this rename the test asserted that the client-visible message
-// CONTAINED the substring "GLOBAL", which was the human-readable internal
-// error from toolCommitMemory. mc#664 Class 2 flipped that assertion the
-// right way around: now the test FAILS if the scrub regresses (i.e. if the
-// internal string is ever reflected back to the wire), and PASSES iff the
-// scrubbed constant reaches the client.
-//
-// Coupling note: the constant string "tool call failed" and the code -32000
-// are the same values asserted by
-// TestMCPHandler_dispatchRPC_UnknownTool_ReturnsConstantMessage — both are
-// the OFFSEC-001 contract for the dispatch-failure branch in mcp.go (the
-// third err.Error() leak that 7d1a189f scrubbed). If those constants ever
-// change, both tests must move together.
-func TestMCPHandler_CommitMemory_GlobalScope_Blocked_ScrubsInternalError(t *testing.T) {
-	h, mock := newMCPHandler(t)
-	// No DB expectations — handler must abort before touching the DB (C3).
+	// Wire v2 stubs so toolCommitMemory → commitMemoryLegacyShim
+	// actually runs (without v2, it short-circuits with the
+	// "plugin not configured" error that doesn't contain the
+	// leaked-token strings we're asserting on).
+	h.withMemoryV2APIs(&stubMemoryPlugin{}, rootNamespaceResolver())
 
 	w := mcpPost(t, h, "ws-1", map[string]interface{}{
 		"jsonrpc": "2.0",
@@ -585,7 +566,7 @@ func TestMCPHandler_CommitMemory_GlobalScope_Blocked_ScrubsInternalError(t *test
 	}
 
 	// (3) OFFSEC-001 negative assertions — the internal err.Error() text
-	// from toolCommitMemory ("GLOBAL scope is not permitted via the MCP
+	// from scopeToWritableNamespace ("GLOBAL scope is not permitted via the MCP
 	// bridge — use LOCAL or TEAM") must NOT appear in the client-visible
 	// message. Each token below is a distinct substring of that internal
 	// string; if ANY leaks through, the scrub in mcp.go dispatchRPC has
@@ -610,41 +591,43 @@ func TestMCPHandler_CommitMemory_GlobalScope_Blocked_ScrubsInternalError(t *test
 	}
 }
 
-// TestMCPHandler_CommitMemory_SecretInContent_IsRedactedBeforeInsert verifies
-// the SAFE-T1201 (#838) fix on the MCP bridge path. PR #881 closed the HTTP
-// handler but missed this one — an agent tool-call carrying plain-text
-// credentials must have them scrubbed before the INSERT reaches the DB.
-//
-// The test asserts via the sqlmock `WithArgs` matcher that the content column
-// binds the REDACTED form, not the raw input. sqlmock verifies the exact arg
-// values, so a regression (removing the redactSecrets call) would fail with
-// "argument mismatch" rather than silently persisting the secret.
-func TestMCPHandler_CommitMemory_SecretInContent_IsRedactedBeforeInsert(t *testing.T) {
-	h, mock := newMCPHandler(t)
+// Issue #1733: the legacy SQL-path redaction tests for commit_memory
+// (SecretInContent_IsRedactedBeforeInsert, CleanContent_PassesThrough)
+// have been removed. The v2 plugin path performs the same redaction
+// (mcp_tools_memory_v2.go:122 + :242); its coverage lives in
+// mcp_tools_memory_v2_test.go.
 
-	// Content with three distinct secret patterns covered by redactSecrets:
-	//   - env-var assignment (ANTHROPIC_API_KEY=)
-	//   - Bearer token
-	//   - sk-… prefixed key
+// TestMCPHandler_CommitMemory_LegacyName_RedactionAtPlugin verifies that
+// the LEGACY MCP tool name `commit_memory` (the one most agents
+// actually call — `commit_memory_v2` is the underlying handler the
+// shim delegates to) still redacts secret-shaped content before the
+// payload reaches the v2 plugin. The deleted SQL-path version of this
+// test pinned the same contract against `agent_memories` INSERT
+// arguments; #1747 review (finding N6) noted the legacy-name path
+// had no direct equivalent post-A1. This test fills that gap by
+// capturing the MemoryWrite the stub plugin receives.
+func TestMCPHandler_CommitMemory_LegacyName_RedactionAtPlugin(t *testing.T) {
+	h, _ := newMCPHandler(t)
+
+	var captured contract.MemoryWrite
+	plugin := &stubMemoryPlugin{
+		commitFn: func(_ context.Context, _ string, body contract.MemoryWrite) (*contract.MemoryWriteResponse, error) {
+			captured = body
+			return &contract.MemoryWriteResponse{ID: "mem-x", Namespace: "workspace:root-1"}, nil
+		},
+	}
+	h.withMemoryV2APIs(plugin, rootNamespaceResolver())
+
 	rawContent := "key=ANTHROPIC_API_KEY=sk-ant-xxxxxxxxxxxxxxxx auth=Bearer ghp_yyyyyyyyyyyyy note=sk-proj-zzzzzzzzzzzzzzzzzzzz"
-
-	// Derive what redactSecrets will produce so the sqlmock arg match is
-	// exact. This keeps the test brittle-on-purpose: if redactSecrets's
-	// output shape changes, this test must be re-derived, which surfaces
-	// the change during review.
-	expected, changed := redactSecrets("ws-1", rawContent)
+	wantRedacted, changed := redactSecrets("root-1", rawContent)
 	if !changed {
-		t.Fatalf("precondition failed — redactSecrets must change the test content; got unchanged %q", expected)
+		t.Fatalf("precondition failed — redactSecrets must change the test content; got %q", wantRedacted)
 	}
-	if bytes.Contains([]byte(expected), []byte("sk-ant-xxxxxxxxxxxxxxxx")) {
-		t.Fatalf("precondition failed — redacted content still contains raw secret: %s", expected)
+	if bytes.Contains([]byte(wantRedacted), []byte("sk-ant-xxxxxxxxxxxxxxxx")) {
+		t.Fatalf("precondition failed — redacted content still contains raw secret: %s", wantRedacted)
 	}
 
-	mock.ExpectExec("INSERT INTO agent_memories").
-		WithArgs(sqlmock.AnyArg(), "ws-1", expected, "LOCAL", "ws-1").
-		WillReturnResult(sqlmock.NewResult(1, 1))
-
-	w := mcpPost(t, h, "ws-1", map[string]interface{}{
+	w := mcpPost(t, h, "root-1", map[string]interface{}{
 		"jsonrpc": "2.0",
 		"id":      99,
 		"method":  "tools/call",
@@ -656,52 +639,32 @@ func TestMCPHandler_CommitMemory_SecretInContent_IsRedactedBeforeInsert(t *testi
 			},
 		},
 	})
-
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
 	var resp mcpResponse
-	json.Unmarshal(w.Body.Bytes(), &resp)
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("response is not valid JSON: %v", err)
+	}
 	if resp.Error != nil {
 		t.Fatalf("unexpected JSON-RPC error: %+v", resp.Error)
 	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("sqlmock mismatch — content was NOT redacted before insert: %v", err)
+
+	// The plugin must have seen the REDACTED content, not the raw
+	// secret. If this trips, redaction in the legacy-shim → v2 path
+	// has regressed and credentials are flowing through to the
+	// plugin's memory_records table.
+	if captured.Content == "" {
+		t.Fatal("plugin.CommitMemory was not called — the shim short-circuited before reaching v2")
 	}
-}
-
-// TestMCPHandler_CommitMemory_CleanContent_PassesThrough confirms that the
-// redactor is a no-op on content with no credentials — a regression where
-// redactSecrets corrupted benign content would be a user-visible bug.
-func TestMCPHandler_CommitMemory_CleanContent_PassesThrough(t *testing.T) {
-	h, mock := newMCPHandler(t)
-
-	cleanContent := "the quick brown fox jumps over the lazy dog — no secrets here"
-
-	// Bind the exact string — no wildcards — so that any transformation
-	// (whitespace, case, truncation) would fail the arg match.
-	mock.ExpectExec("INSERT INTO agent_memories").
-		WithArgs(sqlmock.AnyArg(), "ws-1", cleanContent, "TEAM", "ws-1").
-		WillReturnResult(sqlmock.NewResult(1, 1))
-
-	w := mcpPost(t, h, "ws-1", map[string]interface{}{
-		"jsonrpc": "2.0",
-		"id":      100,
-		"method":  "tools/call",
-		"params": map[string]interface{}{
-			"name": "commit_memory",
-			"arguments": map[string]interface{}{
-				"content": cleanContent,
-				"scope":   "TEAM",
-			},
-		},
-	})
-
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	if captured.Content == rawContent {
+		t.Errorf("legacy commit_memory leaked raw secret to plugin: %q", captured.Content)
 	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("clean content should pass through unchanged: %v", err)
+	if captured.Content != wantRedacted {
+		t.Errorf("captured.Content = %q, want redacted %q", captured.Content, wantRedacted)
+	}
+	if bytes.Contains([]byte(captured.Content), []byte("sk-ant-xxxxxxxxxxxxxxxx")) {
+		t.Errorf("captured.Content still contains raw API key fragment: %s", captured.Content)
 	}
 }
 
@@ -709,14 +672,17 @@ func TestMCPHandler_CommitMemory_CleanContent_PassesThrough(t *testing.T) {
 // tools/call — recall_memory
 // ─────────────────────────────────────────────────────────────────────────────
 
-// TestMCPHandler_RecallMemory_GlobalScope_Blocked_ScrubsInternalError verifies
-// C3 (GLOBAL scope blocked on MCP bridge) is enforced and that the OFFSEC-001
-// scrub contract applies: the client-visible error.message is the constant
-// "tool call failed", NOT the descriptive internal reason. The internal reason
-// ("GLOBAL scope is not permitted via the MCP bridge") is logged server-side
-// but must never reach the wire.
-func TestMCPHandler_RecallMemory_GlobalScope_Blocked_ScrubsInternalError(t *testing.T) {
+// TestMCPHandler_RecallMemory_GlobalScope_ScrubsInternalError mirrors the
+// commit_memory scrub test on the recall_memory path. Same #1747 review
+// fix applied: wire v2 stubs so the request reaches the GLOBAL-block
+// path in scopeToReadableNamespaces (which produces the same "GLOBAL
+// scope is not permitted via the MCP bridge" internal error that the
+// leaked-tokens loop below tests for). Without v2 stubs the handler
+// short-circuits on `memoryV2Available()` and the leaked-tokens loop
+// becomes vacuously true.
+func TestMCPHandler_RecallMemory_GlobalScope_ScrubsInternalError(t *testing.T) {
 	h, mock := newMCPHandler(t)
+	h.withMemoryV2APIs(&stubMemoryPlugin{}, rootNamespaceResolver())
 	// No DB expectations — handler must abort before touching the DB.
 
 	w := mcpPost(t, h, "ws-1", map[string]interface{}{
@@ -770,42 +736,11 @@ func TestMCPHandler_RecallMemory_GlobalScope_Blocked_ScrubsInternalError(t *test
 	}
 }
 
-func TestMCPHandler_RecallMemory_LocalScope_Empty(t *testing.T) {
-	h, mock := newMCPHandler(t)
-
-	mock.ExpectQuery("SELECT id, content, scope, created_at").
-		WithArgs("ws-1", "").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "content", "scope", "created_at"}))
-
-	w := mcpPost(t, h, "ws-1", map[string]interface{}{
-		"jsonrpc": "2.0",
-		"id":      12,
-		"method":  "tools/call",
-		"params": map[string]interface{}{
-			"name": "recall_memory",
-			"arguments": map[string]interface{}{
-				"query": "",
-				"scope": "LOCAL",
-			},
-		},
-	})
-
-	var resp mcpResponse
-	json.Unmarshal(w.Body.Bytes(), &resp)
-	if resp.Error != nil {
-		t.Fatalf("unexpected error: %+v", resp.Error)
-	}
-	result, _ := resp.Result.(map[string]interface{})
-	content, _ := result["content"].([]interface{})
-	item, _ := content[0].(map[string]interface{})
-	text, _ := item["text"].(string)
-	if text != "No memories found." {
-		t.Errorf("expected 'No memories found.', got %q", text)
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("unmet sqlmock expectations: %v", err)
-	}
-}
+// Issue #1733: TestMCPHandler_RecallMemory_LocalScope_Empty removed —
+// it asserted on the legacy SQL SELECT path. The v2 empty-result
+// rendering is covered by TestToolRecallMemory_RoutesThroughV2WhenWired
+// (mcp_tools_memory_legacy_shim_test.go) which uses a stub plugin that
+// returns an empty SearchResponse.
 
 // ─────────────────────────────────────────────────────────────────────────────
 // tools/call — send_message_to_user

@@ -23,19 +23,28 @@ CANVAS_PID=$!
 # Memory v2 sidecar (built-in postgres plugin). See Dockerfile entrypoint
 # comment for rationale.
 #
-# Spawn-gating: only start the sidecar when the operator has indicated
-# they want it (MEMORY_V2_CUTOVER=true OR MEMORY_PLUGIN_URL set).
-# Without that signal, the sidecar adds zero value and risks aborting
-# tenant boot via the 30s health gate when the tenant Postgres lacks
+# Spawn-gating: start the sidecar when MEMORY_PLUGIN_URL is set.
+# Without it, the sidecar adds zero value and risks aborting tenant
+# boot via the 30s health gate when the tenant Postgres lacks
 # pgvector. Caught on staging redeploy 2026-05-05:
 #   pq: extension "vector" is not available
 #
 # Defaults (when sidecar IS spawned): MEMORY_PLUGIN_DATABASE_URL
 # falls back to the tenant's DATABASE_URL.
+#
+# MEMORY_V2_CUTOVER is deprecated as of #1747 — the workspace-server
+# binary no longer reads it (v2 is unconditional now; the legacy SQL
+# fallback in mcp_tools.go is gone). The entrypoint still accepts it
+# as a synonym for "operator wants the sidecar" so old CP user-data
+# templates keep working through the rollout. When CP user-data drops
+# the var, this branch can go.
 MEMORY_PLUGIN_PID=""
 memory_plugin_wanted=""
-if [ "$MEMORY_V2_CUTOVER" = "true" ] || [ -n "$MEMORY_PLUGIN_URL" ]; then
+if [ -n "$MEMORY_PLUGIN_URL" ]; then
   memory_plugin_wanted=1
+elif [ "$MEMORY_V2_CUTOVER" = "true" ]; then
+  memory_plugin_wanted=1
+  echo "memory-plugin: ⚠️  MEMORY_V2_CUTOVER is deprecated (#1747) — set MEMORY_PLUGIN_URL instead. Spawning sidecar on the implied default this boot." >&2
 fi
 if [ -z "$MEMORY_PLUGIN_DISABLE" ] && [ -n "$memory_plugin_wanted" ] && [ -n "$DATABASE_URL" ]; then
   : "${MEMORY_PLUGIN_DATABASE_URL:=$DATABASE_URL}"

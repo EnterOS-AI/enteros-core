@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"log"
 	"net/http"
-	"os"
 	"strings"
 	"time"
 
@@ -16,19 +15,12 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// envMemoryV2Cutover gates whether admin export/import routes through
-// the v2 plugin (PR-8 / RFC #2728). When unset, the legacy direct-DB
-// path runs unchanged so operators who haven't enabled the plugin
-// keep working.
-const envMemoryV2Cutover = "MEMORY_V2_CUTOVER"
-
 // AdminMemoriesHandler provides bulk export/import of agent memories for
 // backup and restore across Docker rebuilds (issue #1051).
 //
-// PR-8 (RFC #2728): when wired with the v2 plugin via WithMemoryV2 AND
-// MEMORY_V2_CUTOVER is true, export reads from the plugin's namespaces
-// and import writes through the plugin. Both paths preserve the
-// SAFE-T1201 redaction shipped in F1084 + F1085.
+// Issue #1733: the v2 plugin is the only supported backend. Export
+// reads from the plugin's namespaces; import writes through the plugin.
+// Both paths preserve the SAFE-T1201 redaction shipped in F1084 + F1085.
 type AdminMemoriesHandler struct {
 	plugin   adminMemoriesPlugin
 	resolver adminMemoriesResolver
@@ -69,12 +61,12 @@ func (h *AdminMemoriesHandler) withMemoryV2APIs(plugin adminMemoriesPlugin, reso
 	return h
 }
 
-// cutoverActive reports whether the export/import path should route
-// through the v2 plugin.
-func (h *AdminMemoriesHandler) cutoverActive() bool {
-	if os.Getenv(envMemoryV2Cutover) != "true" {
-		return false
-	}
+// memoryV2Wired reports whether the v2 plugin + resolver are attached.
+// Issue #1733: v2 is now the only path; this replaces the prior
+// cutoverActive() gate (which also checked MEMORY_V2_CUTOVER=true) —
+// the env-flag double-check is gone since there's no legacy fallback
+// to choose against.
+func (h *AdminMemoriesHandler) memoryV2Wired() bool {
 	return h.plugin != nil && h.resolver != nil
 }
 
@@ -97,48 +89,19 @@ type memoryExportEntry struct {
 // before returning so that any credentials stored before SAFE-T1201 (#838)
 // was applied do not leak out via the admin export endpoint.
 //
-// CUTOVER (PR-8 / RFC #2728): when MEMORY_V2_CUTOVER=true and the v2
-// plugin is wired, reads from the plugin instead of agent_memories.
+// Issue #1733: reads exclusively from the v2 plugin. The legacy direct
+// agent_memories scan is gone — operators without a configured plugin
+// get a 503 explaining the required setup.
 func (h *AdminMemoriesHandler) Export(c *gin.Context) {
 	ctx := c.Request.Context()
 
-	if h.cutoverActive() {
-		h.exportViaPlugin(c, ctx)
+	if !h.memoryV2Wired() {
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error": "memory plugin is not configured (set MEMORY_PLUGIN_URL)",
+		})
 		return
 	}
-
-	rows, err := db.DB.QueryContext(ctx, `
-		SELECT am.id, am.content, am.scope, am.namespace, am.created_at,
-		       w.name AS workspace_name
-		FROM agent_memories am
-		JOIN workspaces w ON am.workspace_id = w.id
-		ORDER BY am.created_at
-	`)
-	if err != nil {
-		log.Printf("admin/memories/export: query error: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "export query failed"})
-		return
-	}
-	defer rows.Close()
-
-	memories := make([]memoryExportEntry, 0)
-	for rows.Next() {
-		var m memoryExportEntry
-		if err := rows.Scan(&m.ID, &m.Content, &m.Scope, &m.Namespace, &m.CreatedAt, &m.WorkspaceName); err != nil {
-			log.Printf("admin/memories/export: scan error: %v", err)
-			continue
-		}
-		// F1084 / #1131: redact secrets before returning so pre-SAFE-T1201
-		// memories (stored before redactSecrets was mandatory) don't leak.
-		redacted, _ := redactSecrets(m.WorkspaceName, m.Content)
-		m.Content = redacted
-		memories = append(memories, m)
-	}
-	if err := rows.Err(); err != nil {
-		log.Printf("admin/memories/export: rows error: %v", err)
-	}
-
-	c.JSON(http.StatusOK, memories)
+	h.exportViaPlugin(c, ctx)
 }
 
 // memoryImportEntry is the JSON shape accepted on import. Matches export format.
@@ -160,8 +123,9 @@ type memoryImportEntry struct {
 // with embedded credentials cannot land unredacted in agent_memories (SAFE-T1201
 // parity with the commit_memory MCP bridge path).
 //
-// CUTOVER (PR-8 / RFC #2728): when MEMORY_V2_CUTOVER=true and the v2
-// plugin is wired, writes through the plugin instead of agent_memories.
+// Issue #1733: writes exclusively through the v2 plugin. The legacy
+// direct agent_memories insert path is gone — operators without a
+// configured plugin get a 503 explaining the required setup.
 func (h *AdminMemoriesHandler) Import(c *gin.Context) {
 	ctx := c.Request.Context()
 
@@ -171,85 +135,13 @@ func (h *AdminMemoriesHandler) Import(c *gin.Context) {
 		return
 	}
 
-	if h.cutoverActive() {
-		h.importViaPlugin(c, ctx, entries)
+	if !h.memoryV2Wired() {
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error": "memory plugin is not configured (set MEMORY_PLUGIN_URL)",
+		})
 		return
 	}
-
-	imported := 0
-	skipped := 0
-	errors := 0
-
-	for _, entry := range entries {
-		// 1. Resolve workspace by name
-		var workspaceID string
-		err := db.DB.QueryRowContext(ctx,
-			`SELECT id FROM workspaces WHERE name = $1 LIMIT 1`,
-			entry.WorkspaceName,
-		).Scan(&workspaceID)
-		if err != nil {
-			log.Printf("admin/memories/import: workspace %q not found, skipping", entry.WorkspaceName)
-			skipped++
-			continue
-		}
-
-		// F1085 / #1132: scrub credential patterns before persistence so that
-		// imported memories with secrets don't bypass SAFE-T1201 (#838).
-		// Must run BEFORE the dedup check so the redacted content is what
-		// gets stored — otherwise re-importing the same backup would produce
-		// a duplicate with different (original, unredacted) content.
-		content, _ := redactSecrets(workspaceID, entry.Content)
-
-		// 2. Check for duplicate (same workspace + content + scope) using
-		// the redacted content so that two backups with the same original
-		// secret (same placeholder output) are treated as duplicates.
-		var exists bool
-
-		err = db.DB.QueryRowContext(ctx,
-			`SELECT EXISTS(SELECT 1 FROM agent_memories WHERE workspace_id = $1 AND content = $2 AND scope = $3)`,
-			workspaceID, content, entry.Scope,
-		).Scan(&exists)
-		if err != nil {
-			log.Printf("admin/memories/import: duplicate check error for workspace %q: %v", entry.WorkspaceName, err)
-			errors++
-			continue
-		}
-		if exists {
-			skipped++
-			continue
-		}
-
-		// 3. Insert the memory, preserving original created_at if provided
-		namespace := entry.Namespace
-		if namespace == "" {
-			namespace = "general"
-		}
-
-		if entry.CreatedAt != "" {
-			_, err = db.DB.ExecContext(ctx,
-				`INSERT INTO agent_memories (workspace_id, content, scope, namespace, created_at) VALUES ($1, $2, $3, $4, $5)`,
-				workspaceID, content, entry.Scope, namespace, entry.CreatedAt,
-			)
-		} else {
-			_, err = db.DB.ExecContext(ctx,
-				`INSERT INTO agent_memories (workspace_id, content, scope, namespace) VALUES ($1, $2, $3, $4)`,
-				workspaceID, content, entry.Scope, namespace,
-			)
-		}
-		if err != nil {
-			log.Printf("admin/memories/import: insert error for workspace %q: %v", entry.WorkspaceName, err)
-			errors++
-			continue
-		}
-		imported++
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"imported": imported,
-		"skipped":  skipped,
-		"errors":   errors,
-		"total":    len(entries),
-	})
+	h.importViaPlugin(c, ctx, entries)
 }
 
 // exportViaPlugin reads memories from the v2 plugin and emits them in
