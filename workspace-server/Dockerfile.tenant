@@ -74,20 +74,13 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
     -ldflags "-s -w -X github.com/Molecule-AI/molecule-monorepo/platform/internal/buildinfo.GitSHA=${GIT_SHA}" \
     -o /memory-plugin ./cmd/memory-plugin-postgres
 
-# Memory v1→v2 backfill CLI (issue #1791 Phase A2). Bundled so an
-# operator can migrate the historical agent_memories rows into the v2
-# plugin via:
-#
-#     docker exec molecule-tenant /memory-backfill -dry-run
-#     docker exec molecule-tenant /memory-backfill -apply
-#
-# Idempotent (UUID upsert in the plugin); safe to re-run. See the
-# tool's main.go for full usage. Stays inert until invoked — does not
-# run automatically on boot.
-RUN CGO_ENABLED=0 GOOS=linux go build \
-    -trimpath \
-    -ldflags "-s -w -X github.com/Molecule-AI/molecule-monorepo/platform/internal/buildinfo.GitSHA=${GIT_SHA}" \
-    -o /memory-backfill ./cmd/memory-backfill
+# Phase A2 memory-backfill CLI was bundled here briefly (#1796) to
+# migrate agent_memories rows into the v2 plugin. After Phase A3 (#1809)
+# dropped the source table, the binary is permanently inert — running
+# it now hits `pq: relation "agent_memories" does not exist`. Removed
+# the build to drop ~7MB from the image and remove the foot-gun.
+# Source still lives in cmd/memory-backfill/ for history; safe to
+# delete entirely in a future cleanup PR.
 
 # ── Stage 2: Canvas Next.js standalone ────────────────────────────────
 FROM node:20-alpine@sha256:afdf98210b07b586eb71fa22ba2e432e058e4cd1304d31ed60888755b8c865fb AS canvas-builder
@@ -124,7 +117,6 @@ RUN deluser --remove-home node 2>/dev/null || true; \
 # Go platform binary + Memory v2 sidecar + v1→v2 backfill CLI
 COPY --from=go-builder /platform /platform
 COPY --from=go-builder /memory-plugin /memory-plugin
-COPY --from=go-builder /memory-backfill /memory-backfill
 COPY workspace-server/migrations /migrations
 
 # Templates + plugins (pre-cloned by scripts/clone-manifest.sh in the
@@ -151,7 +143,7 @@ COPY workspace-server/entrypoint-tenant.sh /entrypoint.sh
 # !external (e.g. molecule-dev → dev-lead). Caught on staging-cplead-2
 # 2026-05-10 — see internal incident debrief.
 RUN chmod +x /entrypoint.sh && \
-    chown -R canvas:canvas /canvas /platform /memory-plugin /memory-backfill /migrations /org-templates
+    chown -R canvas:canvas /canvas /platform /memory-plugin /migrations /org-templates
 
 EXPOSE 8080
 # entrypoint.sh starts as root to fix volume perms, then drops to
