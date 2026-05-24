@@ -33,7 +33,6 @@ import re
 import sys
 import urllib.parse
 
-
 STATE_DIR = os.environ.get("FIXTURE_STATE_DIR", "/tmp")
 
 

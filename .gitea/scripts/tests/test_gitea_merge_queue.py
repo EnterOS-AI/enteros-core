@@ -2,7 +2,6 @@ import importlib.util
 import sys
 from pathlib import Path
 
-
 SCRIPT = Path(__file__).resolve().parents[1] / "gitea-merge-queue.py"
 spec = importlib.util.spec_from_file_location("gitea_merge_queue", SCRIPT)
 mq = importlib.util.module_from_spec(spec)

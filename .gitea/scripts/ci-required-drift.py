@@ -547,12 +547,12 @@ def file_or_update(
 
     if dry_run:
         print(f"::notice::[dry-run] would file/update drift issue for {branch}")
-        print(f"::group::[dry-run] title")
+        print("::group::[dry-run] title")
         print(title)
-        print(f"::endgroup::")
-        print(f"::group::[dry-run] body")
+        print("::endgroup::")
+        print("::group::[dry-run] body")
         print(body)
-        print(f"::endgroup::")
+        print("::endgroup::")
         return
 
     existing = find_open_issue(title)

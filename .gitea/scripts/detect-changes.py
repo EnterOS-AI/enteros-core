@@ -15,7 +15,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-
 PROFILES: dict[str, dict[str, str]] = {
     "ci": {
         "platform": r"^workspace-server/",
