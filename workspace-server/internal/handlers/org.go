@@ -804,7 +804,7 @@ func (h *OrgHandler) Import(c *gin.Context) {
 			for i, gm := range tmpl.GlobalMemories {
 				globalSeeds[i] = models.MemorySeed{Content: gm.Content, Scope: "GLOBAL"}
 			}
-			seedInitialMemories(context.Background(), rootID, globalSeeds)
+			h.workspace.seedInitialMemories(context.Background(), rootID, globalSeeds)
 			log.Printf("Org import: seeded %d global memories on root workspace %s", len(globalSeeds), rootID)
 		}
 	}

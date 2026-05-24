@@ -21,6 +21,7 @@ import (
 	"github.com/Molecule-AI/molecule-monorepo/platform/internal/crypto"
 	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
 	"github.com/Molecule-AI/molecule-monorepo/platform/internal/events"
+	"github.com/Molecule-AI/molecule-monorepo/platform/internal/memory/contract"
 	"github.com/Molecule-AI/molecule-monorepo/platform/internal/models"
 	"github.com/Molecule-AI/molecule-monorepo/platform/internal/provisioner"
 	"github.com/Molecule-AI/molecule-monorepo/platform/internal/wsauth"
@@ -74,10 +75,28 @@ type WorkspaceHandler struct {
 	// memory plugin). main.go sets this to plugin.DeleteNamespace
 	// when MEMORY_PLUGIN_URL is configured.
 	namespaceCleanupFn func(ctx context.Context, workspaceID string)
+	// seedMemoryPlugin is the v2 memory plugin client used by
+	// seedInitialMemories (issue #1755) to write workspace-create
+	// `initial_memories` into the plugin instead of the legacy
+	// `agent_memories` table. nil-safe: when nil, seeding logs a loud
+	// warning and skips. After A1 (#1747) there is no SQL fallback —
+	// seeded memories with no plugin wired are simply not persisted.
+	// main.go attaches this alongside namespaceCleanupFn when
+	// MEMORY_PLUGIN_URL is set (memBundle.Plugin).
+	seedMemoryPlugin seedMemoryPluginAPI
 	// asyncWG tracks goroutines launched by goAsync so tests can wait
 	// for async DB users (restart, provision) before asserting results.
 	// Matches the pattern from main commit 1c3b4ff3.
 	asyncWG sync.WaitGroup
+}
+
+// seedMemoryPluginAPI is the slice of the v2 memory plugin client that
+// seedInitialMemories needs. Defining it as an interface here (parallel
+// to memoryPluginAPI in mcp_tools_memory_v2.go) lets tests stub the
+// plugin with a capture-only spy and keeps the handler decoupled from
+// the concrete *client.Client.
+type seedMemoryPluginAPI interface {
+	CommitMemory(ctx context.Context, namespace string, body contract.MemoryWrite) (*contract.MemoryWriteResponse, error)
 }
 
 // newHandlerHook, when non-nil, is invoked for every WorkspaceHandler
@@ -171,6 +190,19 @@ func NewWorkspaceHandler(b events.EventEmitter, p *provisioner.Provisioner, plat
 // purge path treats as a no-op.
 func (h *WorkspaceHandler) WithNamespaceCleanup(fn func(ctx context.Context, workspaceID string)) *WorkspaceHandler {
 	h.namespaceCleanupFn = fn
+	return h
+}
+
+// WithSeedMemoryPlugin wires the v2 memory plugin so
+// seedInitialMemories (issue #1755) routes workspace-create
+// `initial_memories` through the plugin instead of the legacy
+// `agent_memories` table. main.go passes memBundle.Plugin (a
+// `*client.Client`); tests pass a stub matching the
+// seedMemoryPluginAPI interface. Nil-safe: omitting this leaves the
+// field nil and seedInitialMemories logs a warning + skips on each
+// invocation.
+func (h *WorkspaceHandler) WithSeedMemoryPlugin(p seedMemoryPluginAPI) *WorkspaceHandler {
+	h.seedMemoryPlugin = p
 	return h
 }
 
@@ -571,7 +603,7 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 
 	// Seed initial memories from the create payload (issue #1050).
 	// Non-fatal: failures are logged but don't block workspace creation.
-	seedInitialMemories(ctx, id, payload.InitialMemories)
+	h.seedInitialMemories(ctx, id, payload.InitialMemories)
 
 	// Broadcast provisioning event. Include `runtime` so the canvas can
 	// populate the Runtime pill on the side panel immediately — without it

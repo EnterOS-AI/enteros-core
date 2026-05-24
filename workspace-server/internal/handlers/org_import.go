@@ -258,7 +258,7 @@ func (h *OrgHandler) createWorkspaceTree(ws OrgWorkspace, parentID *string, absX
 	if len(wsMemories) == 0 {
 		wsMemories = defaults.InitialMemories
 	}
-	seedInitialMemories(ctx, id, wsMemories)
+	h.workspace.seedInitialMemories(ctx, id, wsMemories)
 
 	// Handle external workspaces
 	if ws.External {

@@ -12,6 +12,7 @@ import (
 
 	"github.com/Molecule-AI/molecule-monorepo/platform/internal/crypto"
 	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
+	"github.com/Molecule-AI/molecule-monorepo/platform/internal/memory/contract"
 	"github.com/Molecule-AI/molecule-monorepo/platform/internal/models"
 	"github.com/Molecule-AI/molecule-monorepo/platform/internal/provisioner"
 	"github.com/Molecule-AI/molecule-monorepo/platform/internal/wsauth"
@@ -184,21 +185,45 @@ func (h *WorkspaceHandler) provisionWorkspaceOpts(workspaceID, templatePath stri
 	// which transitions status to 'online' and broadcasts WORKSPACE_ONLINE
 }
 
-// seedInitialMemories inserts a list of MemorySeed entries into agent_memories
-// for the given workspace. Called during workspace creation and org import to
-// pre-populate memories from config/template. Non-fatal: each insert is
-// attempted independently and failures are logged. Issue #1050.
-// maxMemoryContentLength is the maximum allowed size for a single memory content
-// field. Content exceeding this limit is truncated to prevent storage exhaustion
-// (CWE-400) and OOM on read paths. The limit is intentionally generous — it fits
-// a ~64k context window worth of text — but small enough to prevent abuse.
+// seedInitialMemories writes a list of MemorySeed entries through the v2
+// memory plugin for the given workspace. Called during workspace creation
+// and org import to pre-populate memories from config/template (issue
+// #1050). Non-fatal: each plugin call is attempted independently and
+// failures are logged.
+//
+// Issue #1755: post-A1 (#1747) v2 is the only memory backend; writing
+// into `agent_memories` would be invisible to `recall_memory` (which
+// reads exclusively from the plugin). When the plugin isn't wired
+// (WithSeedMemoryPlugin not called, i.e. `MEMORY_PLUGIN_URL` unset on
+// platform-tenant), seedInitialMemories logs a loud warning and skips
+// — seeded memories simply don't materialise on that operator's
+// deployment. There is no SQL fallback.
+//
+// Scope handling: the v2 plugin's data model has no `scope` column. All
+// seeded memories land in `workspace:<id>` (the workspace's private
+// namespace). Pre-A1 callers wrote TEAM/GLOBAL-scoped memories into
+// `agent_memories` with `namespace=workspace:<id>` anyway, so this is
+// behaviour-preserving for LOCAL and a no-op-shrink for TEAM/GLOBAL
+// (those scopes can be promoted later via an explicit
+// `commit_memory_v2` call by the agent).
+//
+// maxMemoryContentLength is the maximum allowed size for a single
+// memory content field. Content exceeding this limit is truncated to
+// prevent storage exhaustion (CWE-400) and OOM on read paths. The
+// limit is intentionally generous — it fits a ~64k context window
+// worth of text — but small enough to prevent abuse.
 const maxMemoryContentLength = 100_000 // ~100 KiB of text
 
-func seedInitialMemories(ctx context.Context, workspaceID string, memories []models.MemorySeed) {
+func (h *WorkspaceHandler) seedInitialMemories(ctx context.Context, workspaceID string, memories []models.MemorySeed) {
 	if len(memories) == 0 {
 		return
 	}
+	if h.seedMemoryPlugin == nil {
+		log.Printf("seedInitialMemories: ⚠️  skipping %d memories for workspace %s — v2 memory plugin not wired (set MEMORY_PLUGIN_URL on platform-tenant). Seeded memories from this template are not persisted.", len(memories), workspaceID)
+		return
+	}
 	namespace := workspaceMemoryNamespace(workspaceID)
+	seeded := 0
 	for _, mem := range memories {
 		scope := strings.ToUpper(mem.Scope)
 		if scope == "" {
@@ -211,9 +236,10 @@ func seedInitialMemories(ctx context.Context, workspaceID string, memories []mod
 		if mem.Content == "" {
 			continue
 		}
-		// #1066: enforce content length limit to prevent storage exhaustion (CWE-400).
-		// Truncate oversized content rather than rejecting the whole insert so that
-		// template authors get a predictable fallback rather than a silent skip.
+		// #1066: enforce content length limit to prevent storage exhaustion
+		// (CWE-400). Truncate oversized content rather than rejecting the
+		// whole insert so that template authors get a predictable fallback
+		// rather than a silent skip.
 		content := mem.Content
 		if len(content) > maxMemoryContentLength {
 			content = content[:maxMemoryContentLength]
@@ -221,14 +247,25 @@ func seedInitialMemories(ctx context.Context, workspaceID string, memories []mod
 				workspaceID, scope, len(mem.Content), maxMemoryContentLength)
 		}
 		redactedContent, _ := redactSecrets(workspaceID, content)
-		if _, err := db.DB.ExecContext(ctx, `
-			INSERT INTO agent_memories (workspace_id, content, scope, namespace)
-			VALUES ($1, $2, $3, $4)
-		`, workspaceID, redactedContent, scope, namespace); err != nil {
-			log.Printf("seedInitialMemories: failed to insert memory for %s (scope=%s): %v", workspaceID, scope, err)
+		if _, err := h.seedMemoryPlugin.CommitMemory(ctx, namespace, contract.MemoryWrite{
+			Content: redactedContent,
+			// Kind = fact: seeded memories are factual baseline knowledge,
+			// not session summaries or runtime checkpoints.
+			Kind: contract.MemoryKindFact,
+			// Source = runtime: the platform (not the agent) is writing
+			// these on the agent's behalf at provision time. Distinct from
+			// `agent` (commit_memory MCP call) and `user` (canvas write).
+			Source: contract.MemorySourceRuntime,
+		}); err != nil {
+			log.Printf("seedInitialMemories: plugin commit failed for %s (scope=%s): %v", workspaceID, scope, err)
+			continue
 		}
+		seeded++
 	}
-	log.Printf("seedInitialMemories: seeded %d memories for workspace %s", len(memories), workspaceID)
+	if seeded > 0 {
+		log.Printf("seedInitialMemories: seeded %d/%d memories for workspace %s via v2 plugin (namespace=%s)",
+			seeded, len(memories), workspaceID, namespace)
+	}
 }
 
 // workspaceMemoryNamespace returns the canonical v2 memory namespace

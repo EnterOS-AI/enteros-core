@@ -210,6 +210,12 @@ func main() {
 	memBundle := memwiring.Build(db.DB)
 	if memBundle != nil {
 		wh.WithNamespaceCleanup(memBundle.NamespaceCleanupFn())
+		// Issue #1755: route workspace-create `initial_memories` through
+		// the v2 plugin instead of the legacy `agent_memories` table.
+		// Same plugin client the MCP tools use, same namespace
+		// (`workspace:<id>`); writes are visible to subsequent
+		// `recall_memory` calls on the same workspace.
+		wh.WithSeedMemoryPlugin(memBundle.Plugin)
 	}
 
 	// External-plugin env mutators — each plugin contributes 0+ mutators
