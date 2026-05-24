@@ -476,7 +476,11 @@ jobs:
     # jobs settle, leaving branch protection with a permanent pending
     # `CI / all-required` context. Instead, this independent sentinel polls the
     # required commit-status contexts for this SHA and fails if any fail, skip,
-    # or never emit.
+    # or never emit. It runs the same path detector as `changes` and only waits
+    # for path-relevant jobs; Gitea can otherwise leave needs/output-skipped
+    # jobs permanently pending with "Blocked by required conditions". It runs on
+    # the dedicated `ci-meta` lane so the poller does not occupy the same
+    # general runner pool as the jobs it is waiting for.
     #
     # canvas-deploy-reminder is intentionally NOT included in all-required.needs.
     # It is an informational main-push reminder, not a PR quality gate. Keeping
@@ -484,9 +488,24 @@ jobs:
     # sentinel before the `always()` guard can emit a branch-protection status.
     #
     continue-on-error: false
-    runs-on: ubuntu-latest
+    runs-on: ci-meta
     timeout-minutes: 45
     steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+      - id: check
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          python3 .gitea/scripts/detect-changes.py \
+            --profile ci \
+            --event-name "${{ github.event_name }}" \
+            --pr-base-sha "$PR_BASE_SHA" \
+            --base-ref "$PR_BASE_REF" \
+            --push-before "${GITHUB_EVENT_BEFORE:-$PUSH_BEFORE}"
       - name: Wait for required CI contexts
         env:
           GITEA_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -494,6 +513,9 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           COMMIT_SHA: ${{ github.sha }}
           EVENT_NAME: ${{ github.event_name }}
+          REQUIRE_PLATFORM: ${{ steps.check.outputs.platform }}
+          REQUIRE_CANVAS: ${{ steps.check.outputs.canvas }}
+          REQUIRE_SCRIPTS: ${{ steps.check.outputs.scripts }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -511,11 +533,14 @@ jobs:
           event = os.environ["EVENT_NAME"]
           required = [
               f"CI / Detect changes ({event})",
-              f"CI / Platform (Go) ({event})",
-              f"CI / Canvas (Next.js) ({event})",
-              f"CI / Shellcheck (E2E scripts) ({event})",
               f"CI / Python Lint & Test ({event})",
           ]
+          if os.environ.get("REQUIRE_PLATFORM") == "true":
+              required.append(f"CI / Platform (Go) ({event})")
+          if os.environ.get("REQUIRE_CANVAS") == "true":
+              required.append(f"CI / Canvas (Next.js) ({event})")
+          if os.environ.get("REQUIRE_SCRIPTS") == "true":
+              required.append(f"CI / Shellcheck (E2E scripts) ({event})")
           terminal_bad = {"failure", "error"}
           deadline = time.time() + 40 * 60
           last_summary = None
