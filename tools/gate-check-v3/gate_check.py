@@ -6,10 +6,11 @@ Emits structured verdict + human-readable summary. Designed to run as:
   1. CLI:  python gate_check.py --repo org/repo --pr N
   2. Gitea Actions step: runs this script, captures stdout JSON
 
-Signals (MVP — signals 1,2,3,6):
+Signals (MVP — signals 1,2,3,4,6):
   1. Author-aware agent-tag comment scan
   2. REQUEST_CHANGES reviews state machine
   3. Staleness detection (review.commit_id != PR.head_sha)
+  4. Branch divergence / scope-creep guard (base-sha vs target HEAD)
   6. CI required-checks awareness
 
 Exit codes:
@@ -330,6 +331,132 @@ def signal_3_staleness(pr_number: int, repo: str) -> dict:
     }
 
 
+# ── Signal 4: Branch divergence / scope-creep guard ─────────────────────────
+# Detects stale PR branches where the base SHA has drifted behind target HEAD.
+# Distinguishes files that are "inherited" from base divergence (already on
+# target via prior commits) from genuinely new PR work. Prevents misattribution
+# of scope creep when branches are stale (molecule-core#365).
+
+
+def _commits_and_files_behind(
+    owner: str, name: str, base_sha: str, target_branch: str
+) -> tuple[int | None, set[str]]:
+    """Paginate target-branch commits from HEAD back to base_sha.
+    Return (commits_behind_count, set of filenames changed in those commits).
+    Safety-capped at 20 pages (~1000 commits) to avoid runaway pagination.
+    """
+    commits_behind = 0
+    target_files: set[str] = set()
+    page = 1
+    max_pages = 20
+    per_page = 50
+
+    while page <= max_pages:
+        try:
+            commits = api_get(
+                f"/repos/{owner}/{name}/commits?sha={target_branch}&page={page}&limit={per_page}"
+            )
+        except GiteaError:
+            return (None, target_files)
+
+        if not isinstance(commits, list):
+            return (None, target_files)
+
+        for c in commits:
+            if c.get("sha") == base_sha:
+                return (commits_behind, target_files)
+            commits_behind += 1
+            for f in c.get("files", []):
+                fname = f.get("filename") or f.get("name", "")
+                if fname:
+                    target_files.add(fname)
+
+        if len(commits) < per_page:
+            break
+        page += 1
+
+    return (commits_behind if commits_behind > 0 else None, target_files)
+
+
+def signal_4_branch_divergence(
+    pr_number: int, repo: str, pr_data: dict | None = None
+) -> dict:
+    """
+    Compare PR.base.sha to current target-branch HEAD.
+    If diverged, show "inherited from base divergence" vs "actual new work"
+    file fractions using the commits API.
+    Returns: {signal, verdict, diverged, commits_behind, inherited_fraction, ...}
+    """
+    owner, name = repo.split("/", 1)
+
+    if pr_data is None:
+        pr_data = api_get(f"/repos/{owner}/{name}/pulls/{pr_number}")
+
+    base_sha = pr_data["base"]["sha"]
+    target_branch = pr_data["base"]["ref"]
+
+    try:
+        branch_info = api_get(f"/repos/{owner}/{name}/branches/{target_branch}")
+        target_head = branch_info["commit"]["id"]
+    except GiteaError as e:
+        return {"signal": "branch_divergence", "verdict": "N/A", "error": str(e)}
+
+    if base_sha == target_head:
+        return {
+            "signal": "branch_divergence",
+            "verdict": "CLEAR",
+            "diverged": False,
+            "commits_behind": 0,
+            "pr_files_count": 0,
+            "inherited_files": [],
+            "new_work_files": [],
+            "inherited_fraction": 0.0,
+        }
+
+    # Branch is diverged — count commits behind and collect files changed on
+    # target since the PR's base snapshot.
+    commits_behind, target_files = _commits_and_files_behind(
+        owner, name, base_sha, target_branch
+    )
+
+    # Get PR files
+    try:
+        pr_files_data = api_list(f"/repos/{owner}/{name}/pulls/{pr_number}/files")
+        pr_files = {
+            f.get("filename") or f.get("name", "") for f in pr_files_data
+        }
+        pr_files.discard("")
+    except GiteaError:
+        pr_files = set()
+
+    inherited_files = sorted(pr_files & target_files)
+    new_work_files = sorted(pr_files - target_files)
+    total = len(pr_files)
+    inherited_fraction = len(inherited_files) / total if total else 0.0
+
+    # Verdict: WARNING if significant divergence.
+    # Thresholds: >50 % inherited files, or >5 commits behind with any inherited files.
+    if inherited_fraction > 0.5 or (
+        commits_behind and commits_behind > 5 and inherited_files
+    ):
+        verdict = "WARNING"
+    else:
+        verdict = "CLEAR"
+
+    return {
+        "signal": "branch_divergence",
+        "verdict": verdict,
+        "diverged": True,
+        "base_sha": base_sha,
+        "target_head": target_head,
+        "commits_behind": commits_behind,
+        "pr_files_count": total,
+        "inherited_files": inherited_files,
+        "new_work_files": new_work_files,
+        "inherited_fraction": round(inherited_fraction, 2),
+    }
+
+
 # ── Signal 6: CI required-checks awareness ───────────────────────────────────
 
 def signal_6_ci(pr_number: int, repo: str, branch: str | None = None, pr_data: dict | None = None) -> dict:
@@ -410,7 +537,7 @@ def signal_6_ci(pr_number: int, repo: str, branch: str | None = None, pr_data: d
 
 # ── Gate evaluation ───────────────────────────────────────────────────────────
 
-VERDICT_ORDER = {"ERROR": 0, "CI_FAIL": 1, "BLOCKED": 2, "STALE-RC": 3, "CI_PENDING": 4, "N/A": 5, "CLEAR": 6}
+VERDICT_ORDER = {"ERROR": 0, "CI_FAIL": 1, "BLOCKED": 2, "STALE-RC": 3, "CI_PENDING": 4, "N/A": 5, "WARNING": 6, "CLEAR": 7}
 
 
 def compute_verdict(gates: list[dict]) -> tuple[str, list[dict]]:
@@ -441,6 +568,7 @@ def format_comment(repo: str, pr_number: int, verdict: str, gates: list[dict], b
         "agent_tag_comments": "Agent-tag gates",
         "request_changes_reviews": "REQUEST_CHANGES reviews",
         "stale_reviews": "Staleness check",
+        "branch_divergence": "Branch divergence / scope-creep guard",
         "ci_checks": "CI required checks",
     }
 
@@ -476,6 +604,25 @@ def format_comment(repo: str, pr_number: int, verdict: str, gates: list[dict], b
                     lines.append(
                         f"  - @{r['user']} stale (commit={r.get('review_commit','?')[:7]}, age={r.get('age_hours','?')}h)"
                     )
+            elif sig == "branch_divergence":
+                if b.get("diverged"):
+                    lines.append(
+                        f"  - Branch is {b.get('commits_behind', '?')} commits behind target "
+                        f"({b.get('target_head', '?')[:7]})"
+                    )
+                    frac = b.get("inherited_fraction", 0)
+                    lines.append(
+                        f"  - {frac * 100:.0f}% of PR files inherited from base divergence "
+                        f"({len(b.get('inherited_files', []))}/{b.get('pr_files_count', 0)} files)"
+                    )
+                    for f in b.get("inherited_files", [])[:5]:
+                        lines.append(f"    - inherited: `{f}`")
+                    if len(b.get("inherited_files", [])) > 5:
+                        lines.append(
+                            f"    - ... and {len(b.get('inherited_files', [])) - 5} more"
+                        )
+                else:
+                    lines.append("  - Branch is up to date with target")
             elif sig == "agent_tag_comments":
                 for agent, res in b.get("results", {}).items():
                     v = res.get("verdict", "MISSING")
@@ -518,6 +665,7 @@ def run(repo: str, pr_number: int, post_comment: bool = False) -> dict:
             signal_1_comment_scan(pr_number, repo),
             signal_2_reviews(pr_number, repo),
             signal_3_staleness(pr_number, repo),
+            signal_4_branch_divergence(pr_number, repo, pr_data=pr),
             signal_6_ci(pr_number, repo, branch=base_ref, pr_data=pr),
         ]
         verdict, blockers = compute_verdict(gates)

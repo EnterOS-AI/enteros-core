@@ -74,3 +74,147 @@ def test_signal_1_infra_sre_login_alias_resolved_to_core_devops(monkeypatch):
     engineers = result["results"]["core-devops"]
     assert engineers["verdict"] == "APPROVED"
     assert engineers["group"] == "engineers"
+
+
+# ── Signal 4: Branch divergence / scope-creep guard ─────────────────────────
+
+
+def test_signal_4_no_divergence_returns_clear(monkeypatch):
+    """When PR.base.sha equals target branch HEAD, divergence is zero."""
+    mod = load_gate_check()
+
+    shared_sha = "abc123"
+
+    def fake_api_get(path):
+        if path == "/repos/molecule-ai/molecule-core/pulls/100":
+            return {
+                "base": {"sha": shared_sha, "ref": "main"},
+                "head": {"sha": "def456"},
+            }
+        if path == "/repos/molecule-ai/molecule-core/branches/main":
+            return {"commit": {"id": shared_sha}}
+        raise AssertionError(f"unexpected api_get: {path}")
+
+    monkeypatch.setattr(mod, "api_get", fake_api_get)
+
+    result = mod.signal_4_branch_divergence(100, "molecule-ai/molecule-core")
+
+    assert result["verdict"] == "CLEAR"
+    assert result["diverged"] is False
+    assert result["commits_behind"] == 0
+    assert result["inherited_fraction"] == 0.0
+
+
+def test_signal_4_divergence_with_inherited_files_warning(monkeypatch):
+    """Stale branch with overlapping files triggers WARNING and correct fractions."""
+    mod = load_gate_check()
+
+    base_sha = "base000"
+    target_head = "head111"
+
+    def fake_api_get(path):
+        if path == "/repos/molecule-ai/molecule-core/pulls/101":
+            return {
+                "base": {"sha": base_sha, "ref": "main"},
+                "head": {"sha": "pr222"},
+            }
+        if path == "/repos/molecule-ai/molecule-core/branches/main":
+            return {"commit": {"id": target_head}}
+        if path == "/repos/molecule-ai/molecule-core/commits?sha=main&page=1&limit=50":
+            return [
+                {
+                    "sha": target_head,
+                    "files": [
+                        {"filename": "ci.yml"},
+                        {"filename": "README.md"},
+                    ],
+                },
+                {"sha": base_sha, "files": []},
+            ]
+        raise AssertionError(f"unexpected api_get: {path}")
+
+    def fake_api_list(path):
+        if path == "/repos/molecule-ai/molecule-core/pulls/101/files":
+            return [
+                {"filename": "ci.yml"},
+                {"filename": "README.md"},
+                {"filename": "new_feature.go"},
+            ]
+        raise AssertionError(f"unexpected api_list: {path}")
+
+    monkeypatch.setattr(mod, "api_get", fake_api_get)
+    monkeypatch.setattr(mod, "api_list", fake_api_list)
+
+    result = mod.signal_4_branch_divergence(101, "molecule-ai/molecule-core")
+
+    assert result["verdict"] == "WARNING"
+    assert result["diverged"] is True
+    assert result["commits_behind"] == 1
+    assert result["pr_files_count"] == 3
+    assert result["inherited_files"] == ["README.md", "ci.yml"]
+    assert result["new_work_files"] == ["new_feature.go"]
+    assert result["inherited_fraction"] == round(2 / 3, 2)
+
+
+def test_signal_4_divergence_no_inherited_files_clear(monkeypatch):
+    """Stale branch but zero file overlap → still CLEAR (no scope-creep risk)."""
+    mod = load_gate_check()
+
+    base_sha = "base000"
+    target_head = "head111"
+
+    def fake_api_get(path):
+        if path == "/repos/molecule-ai/molecule-core/pulls/102":
+            return {
+                "base": {"sha": base_sha, "ref": "main"},
+                "head": {"sha": "pr222"},
+            }
+        if path == "/repos/molecule-ai/molecule-core/branches/main":
+            return {"commit": {"id": target_head}}
+        if path == "/repos/molecule-ai/molecule-core/commits?sha=main&page=1&limit=50":
+            return [
+                {
+                    "sha": target_head,
+                    "files": [{"filename": "other.go"}],
+                },
+                {"sha": base_sha, "files": []},
+            ]
+        raise AssertionError(f"unexpected api_get: {path}")
+
+    def fake_api_list(path):
+        if path == "/repos/molecule-ai/molecule-core/pulls/102/files":
+            return [{"filename": "new_feature.go"}]
+        raise AssertionError(f"unexpected api_list: {path}")
+
+    monkeypatch.setattr(mod, "api_get", fake_api_get)
+    monkeypatch.setattr(mod, "api_list", fake_api_list)
+
+    result = mod.signal_4_branch_divergence(102, "molecule-ai/molecule-core")
+
+    assert result["verdict"] == "CLEAR"
+    assert result["diverged"] is True
+    assert result["inherited_files"] == []
+    assert result["new_work_files"] == ["new_feature.go"]
+    assert result["inherited_fraction"] == 0.0
+
+
+def test_signal_4_branch_api_error_returns_na(monkeypatch):
+    """If the branch endpoint 404s, signal degrades to N/A rather than crashing."""
+    mod = load_gate_check()
+
+    def fake_api_get(path):
+        if path == "/repos/molecule-ai/molecule-core/pulls/103":
+            return {
+                "base": {"sha": "base000", "ref": "main"},
+                "head": {"sha": "pr222"},
+            }
+        if path == "/repos/molecule-ai/molecule-core/branches/main":
+            raise mod.GiteaError("GET .../branches/main → 404: not found")
+        raise AssertionError(f"unexpected api_get: {path}")
+
+    monkeypatch.setattr(mod, "api_get", fake_api_get)
+
+    result = mod.signal_4_branch_divergence(103, "molecule-ai/molecule-core")
+
+    assert result["verdict"] == "N/A"
+    assert "error" in result

@@ -7,10 +7,11 @@
 #   PR_NUMBER  — set via ${{ github.event.pull_request.number }} from the trigger
 #   POST_COMMENT — "true" to post/update comment on PR
 #
-# Gating logic (MVP signals 1,2,3,6):
+# Gating logic (MVP signals 1,2,3,4,6):
 #   1. Author-aware agent-tag comment scan
 #   2. REQUEST_CHANGES reviews state machine
 #   3. Staleness detection (SOP-12: review.commit_id != PR.head_sha + >1 working day)
+#   4. Branch divergence / scope-creep guard (base-sha vs target HEAD; mc#365)
 #   6. CI required-checks awareness
 #
 # Exit code: 0=CLEAR, 1=BLOCKED, 2=ERROR
