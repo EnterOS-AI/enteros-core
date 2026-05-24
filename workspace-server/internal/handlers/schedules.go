@@ -470,14 +470,19 @@ func (h *ScheduleHandler) Health(c *gin.Context) {
 
 	// Validate the caller's own bearer token (Phase 30.5 contract).
 	// Skip for system callers and self-calls, same as the A2A proxy.
+	// Post-RFC#637: canvas users may read schedule health too.
+	isCanvasUser := false
 	if !isSystemCaller(callerID) && callerID != workspaceID {
-		if err := validateCallerToken(ctx, c, callerID); err != nil {
+		var err error
+		isCanvasUser, err = validateCallerToken(ctx, c, callerID)
+		if err != nil {
 			return // response already written with 401
 		}
 	}
 
 	// CanCommunicate gate — only peers in the org hierarchy may read health.
-	if callerID != workspaceID && !isSystemCaller(callerID) {
+	// Canvas users (human operators) bypass this gate.
+	if callerID != workspaceID && !isSystemCaller(callerID) && !isCanvasUser {
 		if !registry.CanCommunicate(callerID, workspaceID) {
 			log.Printf("ScheduleHealth: access denied %s → %s", callerID, workspaceID)
 			c.JSON(http.StatusForbidden, gin.H{"error": "access denied"})

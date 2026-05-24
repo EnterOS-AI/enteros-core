@@ -107,6 +107,7 @@ func (h *WebhookHandler) GitHub(c *gin.Context) {
 		forwardBody,
 		"webhook:github",
 		true,
+		false,
 	)
 	if proxyErr != nil {
 		c.JSON(proxyErr.Status, proxyErr.Response)
