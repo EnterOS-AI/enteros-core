@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/Molecule-AI/molecule-monorepo/platform/internal/models"
@@ -202,9 +204,9 @@ func TestWorkspaceDisplay_NonDisplayWorkspaceReturnsUnavailable(t *testing.T) {
 	setupTestRedis(t)
 	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
 
-	mock.ExpectQuery(`SELECT COALESCE\(compute, '\{\}'::jsonb\) FROM workspaces WHERE id = \$1`).
+	mock.ExpectQuery(`SELECT COALESCE\(compute, '\{\}'::jsonb\), COALESCE\(instance_id, ''\) FROM workspaces WHERE id = \$1`).
 		WithArgs("ws-no-display").
-		WillReturnRows(sqlmock.NewRows([]string{"compute"}).AddRow(`{}`))
+		WillReturnRows(sqlmock.NewRows([]string{"compute", "instance_id"}).AddRow(`{}`, ""))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -236,9 +238,9 @@ func TestWorkspaceDisplay_DisplayConfiguredReturnsSessionUnavailableContract(t *
 	setupTestRedis(t)
 	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
 
-	mock.ExpectQuery(`SELECT COALESCE\(compute, '\{\}'::jsonb\) FROM workspaces WHERE id = \$1`).
+	mock.ExpectQuery(`SELECT COALESCE\(compute, '\{\}'::jsonb\), COALESCE\(instance_id, ''\) FROM workspaces WHERE id = \$1`).
 		WithArgs("ws-display").
-		WillReturnRows(sqlmock.NewRows([]string{"compute"}).AddRow(`{"display":{"mode":"desktop-control","protocol":"novnc","width":1920,"height":1080}}`))
+		WillReturnRows(sqlmock.NewRows([]string{"compute", "instance_id"}).AddRow(`{"display":{"mode":"desktop-control","protocol":"novnc","width":1920,"height":1080}}`, ""))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -277,15 +279,14 @@ func TestWorkspaceDisplay_DisplayConfiguredReturnsSessionUnavailableContract(t *
 	}
 }
 
-func TestWorkspaceDisplay_DisplayConfiguredWithViewerBaseReturnsAvailableSession(t *testing.T) {
+func TestWorkspaceDisplay_DisplayConfiguredWithInstanceReturnsAvailableSession(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
-	t.Setenv("DISPLAY_VIEWER_BASE_URL", "https://display.example.test/sessions")
 	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
 
-	mock.ExpectQuery(`SELECT COALESCE\(compute, '\{\}'::jsonb\) FROM workspaces WHERE id = \$1`).
+	mock.ExpectQuery(`SELECT COALESCE\(compute, '\{\}'::jsonb\), COALESCE\(instance_id, ''\) FROM workspaces WHERE id = \$1`).
 		WithArgs("ws-display").
-		WillReturnRows(sqlmock.NewRows([]string{"compute"}).AddRow(`{"display":{"mode":"desktop-control","protocol":"novnc","width":1920,"height":1080}}`))
+		WillReturnRows(sqlmock.NewRows([]string{"compute", "instance_id"}).AddRow(`{"display":{"mode":"desktop-control","protocol":"novnc","width":1920,"height":1080}}`, "i-display123"))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -304,8 +305,8 @@ func TestWorkspaceDisplay_DisplayConfiguredWithViewerBaseReturnsAvailableSession
 	if resp["available"] != true {
 		t.Fatalf("available = %v, want true", resp["available"])
 	}
-	if resp["viewer_url"] != "https://display.example.test/sessions/ws-display" {
-		t.Fatalf("viewer_url = %v, want workspace viewer URL", resp["viewer_url"])
+	if resp["viewer_url"] != nil {
+		t.Fatalf("viewer_url = %v, want omitted; stream URL is minted by Take control", resp["viewer_url"])
 	}
 	if resp["reason"] != nil {
 		t.Fatalf("reason = %v, want omitted", resp["reason"])
@@ -315,16 +316,15 @@ func TestWorkspaceDisplay_DisplayConfiguredWithViewerBaseReturnsAvailableSession
 	}
 }
 
-func TestWorkspaceDisplay_DisplayConfiguredWithInvalidViewerBaseReturnsUnavailable(t *testing.T) {
+func TestWorkspaceDisplay_DisplayConfiguredWithoutInstanceReturnsUnavailable(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
-	t.Setenv("DISPLAY_VIEWER_BASE_URL", "http://display.example.test/sessions")
 	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
 
 	workspaceID := "ws-display"
-	mock.ExpectQuery(`SELECT COALESCE\(compute, '\{\}'::jsonb\) FROM workspaces WHERE id = \$1`).
+	mock.ExpectQuery(`SELECT COALESCE\(compute, '\{\}'::jsonb\), COALESCE\(instance_id, ''\) FROM workspaces WHERE id = \$1`).
 		WithArgs(workspaceID).
-		WillReturnRows(sqlmock.NewRows([]string{"compute"}).AddRow(`{"display":{"mode":"desktop-control","protocol":"novnc","width":1920,"height":1080}}`))
+		WillReturnRows(sqlmock.NewRows([]string{"compute", "instance_id"}).AddRow(`{"display":{"mode":"desktop-control","protocol":"novnc","width":1920,"height":1080}}`, ""))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -359,9 +359,9 @@ func TestWorkspaceDisplay_IgnoresUnrelatedStoredComputeSizingDrift(t *testing.T)
 	setupTestRedis(t)
 	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
 
-	mock.ExpectQuery(`SELECT COALESCE\(compute, '\{\}'::jsonb\) FROM workspaces WHERE id = \$1`).
+	mock.ExpectQuery(`SELECT COALESCE\(compute, '\{\}'::jsonb\), COALESCE\(instance_id, ''\) FROM workspaces WHERE id = \$1`).
 		WithArgs("ws-display-sizing-drift").
-		WillReturnRows(sqlmock.NewRows([]string{"compute"}).AddRow(`{"instance_type":"old.large","display":{"mode":"desktop-control","protocol":"novnc","width":1920,"height":1080}}`))
+		WillReturnRows(sqlmock.NewRows([]string{"compute", "instance_id"}).AddRow(`{"instance_type":"old.large","display":{"mode":"desktop-control","protocol":"novnc","width":1920,"height":1080}}`, ""))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -390,9 +390,9 @@ func TestWorkspaceDisplay_InvalidStoredDisplayConfigReturnsServerError(t *testin
 	setupTestRedis(t)
 	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
 
-	mock.ExpectQuery(`SELECT COALESCE\(compute, '\{\}'::jsonb\) FROM workspaces WHERE id = \$1`).
+	mock.ExpectQuery(`SELECT COALESCE\(compute, '\{\}'::jsonb\), COALESCE\(instance_id, ''\) FROM workspaces WHERE id = \$1`).
 		WithArgs("ws-invalid-display").
-		WillReturnRows(sqlmock.NewRows([]string{"compute"}).AddRow(`{"display":{"mode":"desktop-control","protocol":"vnc"}}`))
+		WillReturnRows(sqlmock.NewRows([]string{"compute", "instance_id"}).AddRow(`{"display":{"mode":"desktop-control","protocol":"vnc"}}`, ""))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -410,6 +410,116 @@ func TestWorkspaceDisplay_InvalidStoredDisplayConfigReturnsServerError(t *testin
 	}
 	if resp["error"] != "invalid display config" {
 		t.Fatalf("error = %v, want invalid display config", resp["error"])
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+func TestWorkspaceDisplaySession_ProxiesThroughDisplayForward(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	t.Setenv("DISPLAY_SESSION_SIGNING_SECRET", "display-session-test-secret")
+	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
+
+	var upstreamAuth, upstreamCookie, upstreamProtocol, gotInstanceID string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/websockify" {
+			t.Errorf("upstream path = %q, want /websockify", r.URL.Path)
+		}
+		if r.URL.RawQuery != "" {
+			t.Errorf("upstream raw query = %q, want stripped", r.URL.RawQuery)
+		}
+		upstreamAuth = r.Header.Get("Authorization")
+		upstreamCookie = r.Header.Get("Cookie")
+		upstreamProtocol = r.Header.Get("Sec-WebSocket-Protocol")
+		_, _ = w.Write([]byte("websockify"))
+	}))
+	defer upstream.Close()
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream URL: %v", err)
+	}
+	prevForward := displayForward
+	displayForward = func(_ context.Context, instanceID string, fn func(target *url.URL) error) error {
+		gotInstanceID = instanceID
+		return fn(upstreamURL)
+	}
+	t.Cleanup(func() { displayForward = prevForward })
+
+	mock.ExpectQuery(`SELECT COALESCE\(compute, '\{\}'::jsonb\), COALESCE\(instance_id, ''\) FROM workspaces WHERE id = \$1`).
+		WithArgs("ws-display").
+		WillReturnRows(sqlmock.NewRows([]string{"compute", "instance_id"}).AddRow(
+			`{"display":{"mode":"desktop-control","protocol":"novnc","width":1920,"height":1080}}`,
+			"i-display123",
+		))
+	expiresAt := time.Now().Add(5 * time.Minute).UTC()
+	mock.ExpectQuery(`SELECT controller, controlled_by, expires_at FROM workspace_display_control_locks WHERE workspace_id = \$1 AND expires_at > now\(\)`).
+		WithArgs("ws-display").
+		WillReturnRows(sqlmock.NewRows([]string{"controller", "controlled_by", "expires_at"}).AddRow("user", "admin-token", expiresAt))
+	token := signDisplaySessionToken("ws-display", "admin-token", expiresAt)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{
+		{Key: "id", Value: "ws-display"},
+		{Key: "proxyPath", Value: "/websockify"},
+	}
+	c.Request = httptest.NewRequest("GET", "/workspaces/ws-display/display/session/websockify", nil)
+	c.Request.Header.Set("Authorization", "Bearer should-not-reach-upstream")
+	c.Request.Header.Set("Cookie", "session=should-not-reach-upstream")
+	c.Request.Header.Set("Sec-WebSocket-Protocol", "binary, molecule-display-token."+token)
+
+	handler.DisplaySession(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if gotInstanceID != "i-display123" {
+		t.Fatalf("displayForward instanceID = %q, want i-display123", gotInstanceID)
+	}
+	if w.Body.String() != "websockify" {
+		t.Fatalf("body = %q, want websockify", w.Body.String())
+	}
+	if upstreamAuth != "" || upstreamCookie != "" {
+		t.Fatalf("proxied credentials leaked upstream: auth=%q cookie=%q", upstreamAuth, upstreamCookie)
+	}
+	if upstreamProtocol != "binary" {
+		t.Fatalf("upstream websocket protocol = %q, want binary without display token", upstreamProtocol)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+func TestWorkspaceDisplaySession_NonDisplayWorkspaceDoesNotProxy(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
+
+	prevForward := displayForward
+	displayForward = func(_ context.Context, _ string, _ func(target *url.URL) error) error {
+		t.Fatal("displayForward must not run for non-display workspaces")
+		return nil
+	}
+	t.Cleanup(func() { displayForward = prevForward })
+
+	mock.ExpectQuery(`SELECT COALESCE\(compute, '\{\}'::jsonb\), COALESCE\(instance_id, ''\) FROM workspaces WHERE id = \$1`).
+		WithArgs("ws-no-display").
+		WillReturnRows(sqlmock.NewRows([]string{"compute", "instance_id"}).AddRow(`{}`, "i-display123"))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{
+		{Key: "id", Value: "ws-no-display"},
+		{Key: "proxyPath", Value: "/websockify"},
+	}
+	c.Request = httptest.NewRequest("GET", "/workspaces/ws-no-display/display/session/websockify", nil)
+
+	handler.DisplaySession(c)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected status 404, got %d: %s", w.Code, w.Body.String())
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations: %v", err)

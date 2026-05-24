@@ -6,9 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"net/url"
-	"os"
-	"strings"
 
 	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
 	"github.com/Molecule-AI/molecule-monorepo/platform/internal/models"
@@ -32,7 +29,6 @@ type workspaceDisplayResponse struct {
 	Width     int    `json:"width,omitempty"`
 	Height    int    `json:"height,omitempty"`
 	Status    string `json:"status,omitempty"`
-	ViewerURL string `json:"viewer_url,omitempty"`
 }
 
 var workspaceComputeInstanceAllowlist = map[string]struct{}{
@@ -177,17 +173,13 @@ func withStoredCompute(ctx context.Context, workspaceID string, payload models.C
 }
 
 // Display handles GET /workspaces/:id/display.
-//
-// Phase 1 only exposes the product contract and the non-display unavailable
-// state. Future desktop-control work will replace the display-enabled branch
-// with short-lived proxied DCV session details.
 func (h *WorkspaceHandler) Display(c *gin.Context) {
 	workspaceID := c.Param("id")
-	var raw string
+	var raw, instanceID string
 	err := db.DB.QueryRowContext(c.Request.Context(),
-		`SELECT COALESCE(compute, '{}'::jsonb) FROM workspaces WHERE id = $1`,
+		`SELECT COALESCE(compute, '{}'::jsonb), COALESCE(instance_id, '') FROM workspaces WHERE id = $1`,
 		workspaceID,
-	).Scan(&raw)
+	).Scan(&raw, &instanceID)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			c.JSON(404, gin.H{"error": "workspace not found"})
@@ -217,7 +209,7 @@ func (h *WorkspaceHandler) Display(c *gin.Context) {
 		})
 		return
 	}
-	if viewerURL := workspaceDisplayViewerURL(workspaceID); viewerURL != "" {
+	if instanceID != "" {
 		c.JSON(200, workspaceDisplayResponse{
 			Available: true,
 			Mode:      compute.Display.Mode,
@@ -225,7 +217,6 @@ func (h *WorkspaceHandler) Display(c *gin.Context) {
 			Width:     compute.Display.Width,
 			Height:    compute.Display.Height,
 			Status:    "ready",
-			ViewerURL: viewerURL,
 		})
 		return
 	}
@@ -238,16 +229,4 @@ func (h *WorkspaceHandler) Display(c *gin.Context) {
 		Height:    compute.Display.Height,
 		Status:    "not_configured",
 	})
-}
-
-func workspaceDisplayViewerURL(workspaceID string) string {
-	base := strings.TrimRight(os.Getenv("DISPLAY_VIEWER_BASE_URL"), "/")
-	if base == "" {
-		return ""
-	}
-	parsed, err := url.Parse(base)
-	if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
-		return ""
-	}
-	return base + "/" + url.PathEscape(workspaceID)
 }

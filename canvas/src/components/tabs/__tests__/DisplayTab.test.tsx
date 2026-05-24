@@ -2,12 +2,35 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
-const { mockGet, mockPost } = vi.hoisted(() => ({ mockGet: vi.fn(), mockPost: vi.fn() }));
+const { mockGet, mockPost, mockRFBConstructor } = vi.hoisted(() => ({
+  mockGet: vi.fn(),
+  mockPost: vi.fn(),
+  mockRFBConstructor: vi.fn(),
+}));
 
 vi.mock("@/lib/api", () => ({
   api: {
     get: mockGet,
     post: mockPost,
+  },
+}));
+
+vi.mock("@novnc/novnc", () => ({
+  default: class MockRFB extends EventTarget {
+    scaleViewport = false;
+    resizeSession = false;
+    focusOnClick = false;
+    target: HTMLElement;
+    url: string;
+    options?: { wsProtocols?: string[] };
+    constructor(target: HTMLElement, url: string, options?: { wsProtocols?: string[] }) {
+      super();
+      this.target = target;
+      this.url = url;
+      this.options = options;
+      mockRFBConstructor(target, url, options);
+    }
+    disconnect() {}
   },
 }));
 
@@ -18,6 +41,7 @@ describe("DisplayTab", () => {
     cleanup();
     mockGet.mockReset();
     mockPost.mockReset();
+    mockRFBConstructor.mockReset();
   });
 
   it("renders unavailable state for non-display workspaces", async () => {
@@ -71,15 +95,14 @@ describe("DisplayTab", () => {
     });
   });
 
-  it("renders the desktop stream when a display session is available", async () => {
+  it("waits for takeover before opening a ready display stream", async () => {
     mockGet
       .mockResolvedValueOnce({
         available: true,
         mode: "desktop-control",
-        protocol: "dcv",
+        protocol: "novnc",
         width: 1920,
         height: 1080,
-        viewer_url: "https://display.example.test/session/ws-display",
       })
       .mockResolvedValueOnce({
         controller: "none",
@@ -88,11 +111,50 @@ describe("DisplayTab", () => {
     render(<DisplayTab workspaceId="ws-display" />);
 
     await waitFor(() => {
+      expect(screen.getByText("Take control to open the desktop.")).toBeTruthy();
+    });
+    expect(screen.getByRole("button", { name: "Take control" })).toBeTruthy();
+  });
+
+  it("opens the trusted noVNC client after takeover returns a stream URL", async () => {
+    mockGet
+      .mockResolvedValueOnce({
+        available: true,
+        mode: "desktop-control",
+        protocol: "novnc",
+        width: 1920,
+        height: 1080,
+      })
+      .mockResolvedValueOnce({
+        controller: "none",
+      });
+    mockPost.mockResolvedValueOnce({
+      controller: "user",
+      controlled_by: "admin-token",
+      expires_at: "2026-05-23T08:48:27Z",
+      session_url: "/workspaces/ws-display/display/session/websockify#token=signed",
+    });
+
+    render(<DisplayTab workspaceId="ws-display" />);
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Take control" })).toBeTruthy();
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Take control" }));
+
+    await waitFor(() => {
       expect(screen.getByTitle("Workspace desktop")).toBeTruthy();
     });
-    const frame = screen.getByTitle("Workspace desktop") as HTMLIFrameElement;
-    expect(frame.src).toBe("https://display.example.test/session/ws-display");
-    expect(screen.getByRole("button", { name: "Take control" })).toBeTruthy();
+    expect(mockPost).toHaveBeenCalledWith("/workspaces/ws-display/display/control/acquire", {
+      controller: "user",
+      ttl_seconds: 300,
+    });
+    expect(mockRFBConstructor).toHaveBeenCalledWith(
+      expect.any(HTMLElement),
+      expect.stringContaining("/workspaces/ws-display/display/session/websockify"),
+      { wsProtocols: ["binary", "molecule-display-token.signed"] },
+    );
+    expect(mockRFBConstructor.mock.calls[0][1]).not.toContain("token=");
   });
 
   it("releases user display control", async () => {
@@ -100,8 +162,7 @@ describe("DisplayTab", () => {
       .mockResolvedValueOnce({
         available: true,
         mode: "desktop-control",
-        protocol: "dcv",
-        viewer_url: "https://display.example.test/session/ws-display",
+        protocol: "novnc",
       })
       .mockResolvedValueOnce({
         controller: "user",

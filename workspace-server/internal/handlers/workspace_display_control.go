@@ -2,13 +2,19 @@ package handlers
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"crypto/subtle"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
@@ -27,6 +33,7 @@ type workspaceDisplayControlResponse struct {
 	Controller   string    `json:"controller"`
 	ControlledBy string    `json:"controlled_by,omitempty"`
 	ExpiresAt    time.Time `json:"expires_at"`
+	SessionURL   string    `json:"session_url,omitempty"`
 }
 
 type workspaceDisplayControlNoneResponse struct {
@@ -89,6 +96,10 @@ func (h *WorkspaceHandler) AcquireDisplayControl(c *gin.Context) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "display control requires admin-token or org-token auth"})
 		return
 	}
+	if displaySessionSigningSecret() == "" {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "display session signing secret is not configured"})
+		return
+	}
 	workspaceID := c.Param("id")
 	startedAt := time.Now()
 	emitDisplayControlEvent(c.Request.Context(), "display.control.acquire.started", workspaceID, map[string]any{
@@ -113,6 +124,7 @@ RETURNING controller, controlled_by, expires_at`,
 		workspaceID, req.Controller, controlledBy, req.TTLSeconds,
 	).Scan(&lock.Controller, &lock.ControlledBy, &lock.ExpiresAt)
 	if err == nil {
+		lock.SessionURL = signedDisplaySessionURL(workspaceID, lock.ControlledBy, lock.ExpiresAt)
 		emitDisplayControlEvent(c.Request.Context(), "display.control.acquire.completed", workspaceID, map[string]any{
 			"controller":    lock.Controller,
 			"controlled_by": lock.ControlledBy,
@@ -357,4 +369,51 @@ func emitDisplayControlEvent(ctx context.Context, eventType string, workspaceID 
 	`, eventType, workspaceID, string(payloadJSON)); err != nil {
 		log.Printf("emitDisplayControlEvent: insert %s failed: %v", eventType, err)
 	}
+}
+
+func signedDisplaySessionURL(workspaceID, controlledBy string, expiresAt time.Time) string {
+	token := signDisplaySessionToken(workspaceID, controlledBy, expiresAt)
+	if token == "" {
+		return ""
+	}
+	return fmt.Sprintf("/workspaces/%s/display/session/websockify#token=%s", url.PathEscape(workspaceID), token)
+}
+
+func signDisplaySessionToken(workspaceID, controlledBy string, expiresAt time.Time) string {
+	secret := displaySessionSigningSecret()
+	if secret == "" || workspaceID == "" || controlledBy == "" || expiresAt.IsZero() {
+		return ""
+	}
+	payload := strings.Join([]string{workspaceID, controlledBy, strconv.FormatInt(expiresAt.Unix(), 10)}, "|")
+	mac := hmac.New(sha256.New, []byte(secret))
+	_, _ = mac.Write([]byte(payload))
+	return base64.RawURLEncoding.EncodeToString([]byte(payload)) + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+}
+
+func validateDisplaySessionToken(token, workspaceID, controlledBy string, expiresAt time.Time) bool {
+	secret := displaySessionSigningSecret()
+	parts := strings.Split(token, ".")
+	if secret == "" || len(parts) != 2 || workspaceID == "" || controlledBy == "" || expiresAt.IsZero() || time.Now().After(expiresAt) {
+		return false
+	}
+	payloadBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return false
+	}
+	payload := string(payloadBytes)
+	wantPayload := strings.Join([]string{workspaceID, controlledBy, strconv.FormatInt(expiresAt.Unix(), 10)}, "|")
+	if subtle.ConstantTimeCompare([]byte(payload), []byte(wantPayload)) != 1 {
+		return false
+	}
+	sig, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return false
+	}
+	mac := hmac.New(sha256.New, []byte(secret))
+	_, _ = mac.Write([]byte(payload))
+	return hmac.Equal(sig, mac.Sum(nil))
+}
+
+func displaySessionSigningSecret() string {
+	return os.Getenv("DISPLAY_SESSION_SIGNING_SECRET")
 }

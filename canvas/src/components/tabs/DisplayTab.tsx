@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { api } from "@/lib/api";
+import type RFB from "@novnc/novnc";
 
 interface DisplayStatus {
   available: boolean;
@@ -11,13 +12,13 @@ interface DisplayStatus {
   protocol?: string;
   width?: number;
   height?: number;
-  viewer_url?: string;
 }
 
 interface DisplayControlStatus {
   controller: "none" | "user" | "agent";
   controlled_by?: string;
   expires_at?: string;
+  session_url?: string;
 }
 
 interface Props {
@@ -30,6 +31,7 @@ export function DisplayTab({ workspaceId }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [controlError, setControlError] = useState<string | null>(null);
   const [controlBusy, setControlBusy] = useState(false);
+  const [sessionUrl, setSessionUrl] = useState<string | null>(null);
   const requestGeneration = useRef(0);
 
   useEffect(() => {
@@ -38,6 +40,7 @@ export function DisplayTab({ workspaceId }: Props) {
     let cancelled = false;
     setStatus(null);
     setControl(null);
+    setSessionUrl(null);
     setError(null);
     setControlError(null);
     setControlBusy(false);
@@ -78,6 +81,7 @@ export function DisplayTab({ workspaceId }: Props) {
       });
       if (requestGeneration.current !== generation) return;
       setControl(next);
+      setSessionUrl(next.session_url || null);
     } catch (err) {
       if (requestGeneration.current !== generation) return;
       setControlError("Failed to take control");
@@ -103,6 +107,7 @@ export function DisplayTab({ workspaceId }: Props) {
       const next = await api.post<DisplayControlStatus>(`${controlPath}/release`, {});
       if (requestGeneration.current !== generation) return;
       setControl(next);
+      setSessionUrl(null);
     } catch (err) {
       if (requestGeneration.current !== generation) return;
       setControlError("Failed to release control");
@@ -224,24 +229,19 @@ export function DisplayTab({ workspaceId }: Props) {
           control={control}
           controlBusy={controlBusy}
           controlError={controlError}
+          hasSession={!!sessionUrl}
           onAcquire={acquireControl}
           onRelease={releaseControl}
         />
       </div>
-      {status.viewer_url ? (
-        <iframe
-          title="Workspace desktop"
-          src={status.viewer_url}
-          className="min-h-0 flex-1 border-0 bg-black"
-          allow="clipboard-read; clipboard-write; fullscreen; pointer-lock"
-          referrerPolicy="no-referrer"
-        />
+      {sessionUrl ? (
+        <DesktopStream sessionUrl={sessionUrl} />
       ) : (
         <div className="flex flex-1 items-center justify-center p-8 text-center">
           <div>
-            <h3 className="mb-1.5 text-sm font-medium text-ink">Display session is not ready.</h3>
+            <h3 className="mb-1.5 text-sm font-medium text-ink">Take control to open the desktop.</h3>
             <p className="max-w-xs text-[11px] leading-relaxed text-ink-mid">
-              This workspace has display configuration, but the desktop session URL is not available yet.
+              The display service is ready. Control access opens a short-lived desktop stream.
             </p>
           </div>
         </div>
@@ -254,12 +254,14 @@ function DisplayControlBar({
   control,
   controlBusy,
   controlError,
+  hasSession,
   onAcquire,
   onRelease,
 }: {
   control: DisplayControlStatus | null;
   controlBusy: boolean;
   controlError: string | null;
+  hasSession: boolean;
   onAcquire: () => void;
   onRelease: () => void;
 }) {
@@ -280,7 +282,8 @@ function DisplayControlBar({
           {controlError && <p className="mt-0.5 text-[10px] text-red-200">{controlError}</p>}
         </div>
       )}
-      {control?.controller === "none" && (
+      {(control?.controller === "none" ||
+        (control?.controller === "user" && control.controlled_by === "admin-token" && !hasSession)) && (
         <button
           type="button"
           onClick={onAcquire}
@@ -302,6 +305,63 @@ function DisplayControlBar({
       )}
     </div>
   );
+}
+
+function DesktopStream({ sessionUrl }: { sessionUrl: string }) {
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const [streamError, setStreamError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    let rfb: RFB | null = null;
+
+    async function connect() {
+      setStreamError(null);
+      try {
+        const mod = await import("@novnc/novnc");
+        if (cancelled || !containerRef.current) return;
+        const stream = displayWebSocketConnection(sessionUrl);
+        rfb = new mod.default(containerRef.current, stream.url, {
+          wsProtocols: ["binary", `molecule-display-token.${stream.token}`],
+        });
+        rfb.scaleViewport = true;
+        rfb.resizeSession = true;
+        rfb.focusOnClick = true;
+        rfb.addEventListener("disconnect", (event: Event) => {
+          const detail = (event as CustomEvent<{ clean?: boolean }>).detail;
+          if (!cancelled && !detail?.clean) setStreamError("Desktop stream disconnected.");
+        });
+      } catch {
+        if (!cancelled) setStreamError("Desktop stream could not be opened.");
+      }
+    }
+
+    connect();
+    return () => {
+      cancelled = true;
+      rfb?.disconnect();
+    };
+  }, [sessionUrl]);
+
+  return (
+    <div className="relative min-h-0 flex-1 bg-black">
+      <div ref={containerRef} title="Workspace desktop" className="h-full w-full overflow-hidden bg-black" />
+      {streamError && (
+        <div className="absolute inset-x-4 top-4 rounded border border-red-500/30 bg-red-950/80 px-3 py-2 text-[11px] text-red-100">
+          {streamError}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function displayWebSocketConnection(sessionUrl: string): { url: string; token: string } {
+  const url = new URL(sessionUrl, window.location.href);
+  const token = new URLSearchParams(url.hash.replace(/^#/, "")).get("token") ?? "";
+  if (!token) throw new Error("display session token missing");
+  url.hash = "";
+  url.protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  return { url: url.toString(), token };
 }
 
 function displayControlActorLabel(control: DisplayControlStatus): string {
