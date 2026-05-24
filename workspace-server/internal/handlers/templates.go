@@ -243,10 +243,12 @@ func (h *TemplatesHandler) List(c *gin.Context) {
 				log.Printf("templates list: skip %s: yaml.Unmarshal: %v", id, err)
 				return
 			}
-			runtime := strings.TrimSuffix(strings.TrimSpace(raw.Runtime), "-default")
-			if _, ok := knownRuntimes[runtime]; !ok {
-				log.Printf("templates list: skip %s: unsupported runtime %q", id, raw.Runtime)
-				return
+			if raw.Runtime != "" {
+				runtime := strings.TrimSuffix(strings.TrimSpace(raw.Runtime), "-default")
+				if _, ok := knownRuntimes[runtime]; !ok {
+					log.Printf("templates list: skip %s: unsupported runtime %q", id, raw.Runtime)
+					return
+				}
 			}
 
 			// Model comes from either top-level (legacy) or runtime_config.model (current).
