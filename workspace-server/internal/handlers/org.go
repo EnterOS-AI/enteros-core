@@ -799,13 +799,12 @@ func (h *OrgHandler) Import(c *gin.Context) {
 	if len(tmpl.GlobalMemories) > 0 && len(results) > 0 {
 		rootID, _ := results[0]["id"].(string)
 		if rootID != "" {
-			rootNS := workspaceAwarenessNamespace(rootID)
 			// Force scope to GLOBAL regardless of what the YAML says.
 			globalSeeds := make([]models.MemorySeed, len(tmpl.GlobalMemories))
 			for i, gm := range tmpl.GlobalMemories {
 				globalSeeds[i] = models.MemorySeed{Content: gm.Content, Scope: "GLOBAL"}
 			}
-			seedInitialMemories(context.Background(), rootID, globalSeeds, rootNS)
+			seedInitialMemories(context.Background(), rootID, globalSeeds)
 			log.Printf("Org import: seeded %d global memories on root workspace %s", len(globalSeeds), rootID)
 		}
 	}

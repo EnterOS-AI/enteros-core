@@ -216,7 +216,6 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 	}
 
 	id := uuid.New().String()
-	awarenessNamespace := workspaceAwarenessNamespace(id)
 	if h.IsSaaS() {
 		// SaaS hard gate: every hosted workspace gets its own sibling
 		// EC2 instance, so T4 is the only meaningful runtime boundary.
@@ -448,10 +447,10 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 	// returns the actually-persisted name (which we MUST thread back into
 	// payload + broadcast so the canvas displays what the DB has).
 	const insertWorkspaceSQL = `
-		INSERT INTO workspaces (id, name, role, tier, runtime, awareness_namespace, status, parent_id, workspace_dir, workspace_access, budget_limit, max_concurrent_tasks, delivery_mode)
-		VALUES ($1, $2, $3, $4, $5, $6, 'provisioning', $7, $8, $9, $10, $11, $12)
+		INSERT INTO workspaces (id, name, role, tier, runtime, status, parent_id, workspace_dir, workspace_access, budget_limit, max_concurrent_tasks, delivery_mode)
+		VALUES ($1, $2, $3, $4, $5, 'provisioning', $6, $7, $8, $9, $10, $11)
 	`
-	insertArgs := []any{id, payload.Name, role, payload.Tier, payload.Runtime, awarenessNamespace, payload.ParentID, workspaceDir, workspaceAccess, payload.BudgetLimit, maxConcurrent, deliveryMode}
+	insertArgs := []any{id, payload.Name, role, payload.Tier, payload.Runtime, payload.ParentID, workspaceDir, workspaceAccess, payload.BudgetLimit, maxConcurrent, deliveryMode}
 	persistedName, currentTx, err := insertWorkspaceWithNameRetry(
 		ctx,
 		tx,
@@ -572,7 +571,7 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 
 	// Seed initial memories from the create payload (issue #1050).
 	// Non-fatal: failures are logged but don't block workspace creation.
-	seedInitialMemories(ctx, id, payload.InitialMemories, awarenessNamespace)
+	seedInitialMemories(ctx, id, payload.InitialMemories)
 
 	// Broadcast provisioning event. Include `runtime` so the canvas can
 	// populate the Runtime pill on the side panel immediately — without it
@@ -707,10 +706,9 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusCreated, gin.H{
-		"id":                  id,
-		"status":              "provisioning",
-		"awareness_namespace": awarenessNamespace,
-		"workspace_access":    workspaceAccess,
+		"id":               id,
+		"status":           "provisioning",
+		"workspace_access": workspaceAccess,
 	})
 }
 

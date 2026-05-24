@@ -128,7 +128,7 @@ func (h *WorkspaceHandler) provisionWorkspaceOpts(workspaceID, templatePath stri
 							workspaceID, filepath.Base(runtimeTemplate))
 						templatePath = runtimeTemplate
 						// Rebuild cfg with the recovered template path so Start() sees it.
-						cfg = h.buildProvisionerConfig(ctx, workspaceID, templatePath, configFiles, payload, prepared.EnvVars, prepared.PluginsPath, prepared.AwarenessNamespace)
+						cfg = h.buildProvisionerConfig(ctx, workspaceID, templatePath, configFiles, payload, prepared.EnvVars, prepared.PluginsPath)
 						cfg.ResetClaudeSession = resetClaudeSession
 						recovered = true
 						break
@@ -194,10 +194,11 @@ func (h *WorkspaceHandler) provisionWorkspaceOpts(workspaceID, templatePath stri
 // a ~64k context window worth of text — but small enough to prevent abuse.
 const maxMemoryContentLength = 100_000 // ~100 KiB of text
 
-func seedInitialMemories(ctx context.Context, workspaceID string, memories []models.MemorySeed, awarenessNamespace string) {
+func seedInitialMemories(ctx context.Context, workspaceID string, memories []models.MemorySeed) {
 	if len(memories) == 0 {
 		return
 	}
+	namespace := workspaceMemoryNamespace(workspaceID)
 	for _, mem := range memories {
 		scope := strings.ToUpper(mem.Scope)
 		if scope == "" {
@@ -223,24 +224,18 @@ func seedInitialMemories(ctx context.Context, workspaceID string, memories []mod
 		if _, err := db.DB.ExecContext(ctx, `
 			INSERT INTO agent_memories (workspace_id, content, scope, namespace)
 			VALUES ($1, $2, $3, $4)
-		`, workspaceID, redactedContent, scope, awarenessNamespace); err != nil {
+		`, workspaceID, redactedContent, scope, namespace); err != nil {
 			log.Printf("seedInitialMemories: failed to insert memory for %s (scope=%s): %v", workspaceID, scope, err)
 		}
 	}
 	log.Printf("seedInitialMemories: seeded %d memories for workspace %s", len(memories), workspaceID)
 }
 
-func workspaceAwarenessNamespace(workspaceID string) string {
+// workspaceMemoryNamespace returns the canonical v2 memory namespace
+// string for a workspace. Matches the form produced by
+// internal/memory/namespace/resolver.go for self-reads (issue #1735).
+func workspaceMemoryNamespace(workspaceID string) string {
 	return fmt.Sprintf("workspace:%s", workspaceID)
-}
-
-func (h *WorkspaceHandler) loadAwarenessNamespace(ctx context.Context, workspaceID string) string {
-	var awarenessNamespace string
-	err := db.DB.QueryRowContext(ctx, `SELECT COALESCE(awareness_namespace, '') FROM workspaces WHERE id = $1`, workspaceID).Scan(&awarenessNamespace)
-	if err != nil || awarenessNamespace == "" {
-		return workspaceAwarenessNamespace(workspaceID)
-	}
-	return awarenessNamespace
 }
 
 func (h *WorkspaceHandler) buildProvisionerConfig(
@@ -249,7 +244,7 @@ func (h *WorkspaceHandler) buildProvisionerConfig(
 	configFiles map[string][]byte,
 	payload models.CreateWorkspacePayload,
 	envVars map[string]string,
-	pluginsPath, awarenessNamespace string,
+	pluginsPath string,
 ) provisioner.WorkspaceConfig {
 	// Per-workspace workspace_dir takes priority over global WORKSPACE_DIR env var.
 	// If neither is set, the provisioner creates an isolated Docker volume.
@@ -304,10 +299,8 @@ func (h *WorkspaceHandler) buildProvisionerConfig(
 			Height:   payload.Compute.Display.Height,
 			Protocol: payload.Compute.Display.Protocol,
 		},
-		EnvVars:            envVars,
-		PlatformURL:        h.platformURL,
-		AwarenessURL:       os.Getenv("AWARENESS_URL"),
-		AwarenessNamespace: awarenessNamespace,
+		EnvVars:     envVars,
+		PlatformURL: h.platformURL,
 		// Image left empty — molecule-core's runtime_image_pins table (mig
 		// 047, dead reader removed by RFC internal#617 / task #335) was an
 		// aspirational SSOT that never received a writer. CP's

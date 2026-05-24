@@ -17,7 +17,6 @@ type Workspace struct {
 	Name               string          `json:"name" db:"name"`
 	Role               sql.NullString  `json:"role" db:"role"`
 	Tier               int             `json:"tier" db:"tier"`
-	AwarenessNamespace sql.NullString  `json:"awareness_namespace" db:"awareness_namespace"`
 	Status             string          `json:"status" db:"status"`
 	SourceBundleID     sql.NullString  `json:"source_bundle_id" db:"source_bundle_id"`
 	AgentCard          json.RawMessage `json:"agent_card" db:"agent_card"`
@@ -207,7 +206,8 @@ type CreateWorkspacePayload struct {
 	} `json:"canvas"`
 	// InitialMemories is an optional list of memories to seed into the
 	// workspace immediately after creation. Each entry is inserted into
-	// agent_memories with the workspace's awareness namespace. Issue #1050.
+	// agent_memories under the workspace's v2 memory namespace
+	// ("workspace:<id>"). Issue #1050.
 	InitialMemories []MemorySeed `json:"initial_memories"`
 }
 

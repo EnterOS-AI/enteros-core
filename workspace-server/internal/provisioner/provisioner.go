@@ -103,8 +103,6 @@ type WorkspaceConfig struct {
 	Display            WorkspaceDisplayConfig
 	EnvVars            map[string]string // Additional env vars (API keys, etc.)
 	PlatformURL        string
-	AwarenessURL       string
-	AwarenessNamespace string
 	WorkspaceAccess    string // #65: "none" (default), "read_only", or "read_write"
 	ResetClaudeSession bool   // #12: if true, discard the claude-sessions volume before start (fresh session dir)
 
@@ -713,10 +711,6 @@ func buildContainerEnv(cfg WorkspaceConfig) []string {
 		// standalone template repo. Per-template ENV in the Dockerfile can
 		// still override (Dockerfile ENV is overridden by docker -e at runtime).
 		"PYTHONPATH=/app",
-	}
-	if cfg.AwarenessNamespace != "" && cfg.AwarenessURL != "" {
-		env = append(env, fmt.Sprintf("AWARENESS_NAMESPACE=%s", cfg.AwarenessNamespace))
-		env = append(env, fmt.Sprintf("AWARENESS_URL=%s", cfg.AwarenessURL))
 	}
 	// #1687: track explicit GH_TOKEN / GITHUB_TOKEN so they win over GH_PAT
 	// alias. These are normally stripped by the SCM-write guard below, but

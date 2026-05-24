@@ -692,39 +692,6 @@ func TestBuildContainerEnv_MoleculeAIURLAlwaysMatchesPlatformURL(t *testing.T) {
 	}
 }
 
-func TestBuildContainerEnv_AwarenessOnlyWhenBothSet(t *testing.T) {
-	// Both set → both injected.
-	cfg := WorkspaceConfig{
-		WorkspaceID:        "ws-x",
-		PlatformURL:        "http://localhost:8080",
-		AwarenessURL:       "http://awareness:9000",
-		AwarenessNamespace: "ns-1",
-	}
-	env := buildContainerEnv(cfg)
-	hasNS := false
-	hasURL := false
-	for _, e := range env {
-		if e == "AWARENESS_NAMESPACE=ns-1" {
-			hasNS = true
-		}
-		if e == "AWARENESS_URL=http://awareness:9000" {
-			hasURL = true
-		}
-	}
-	if !hasNS || !hasURL {
-		t.Errorf("both awareness vars must be present: env=%v", env)
-	}
-
-	// Only namespace set → neither injected (must be both-or-nothing).
-	cfg.AwarenessURL = ""
-	env2 := buildContainerEnv(cfg)
-	for _, e := range env2 {
-		if strings.HasPrefix(e, "AWARENESS_") {
-			t.Errorf("awareness vars must NOT be injected when URL is missing: got %q", e)
-		}
-	}
-}
-
 func TestBuildContainerEnv_CustomEnvVarsAppended(t *testing.T) {
 	// NOTE: this test previously asserted GITHUB_TOKEN passed through
 	// verbatim. That assertion encoded the forensic #145 latent leak as

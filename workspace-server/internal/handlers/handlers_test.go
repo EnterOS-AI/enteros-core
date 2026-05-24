@@ -364,11 +364,11 @@ func TestWorkspaceCreate(t *testing.T) {
 	// Expect transaction begin for atomic workspace+secrets creation
 	mock.ExpectBegin()
 
-	// Expect workspace INSERT (uuid is dynamic, use AnyArg for id, runtime, awareness_namespace).
+	// Expect workspace INSERT (uuid is dynamic, use AnyArg for id, runtime).
 	// Default tier is 3 (Privileged) — see workspace.go create-handler comment.
 	// delivery_mode defaults to "push" when payload omits it (#2339).
 	mock.ExpectExec("INSERT INTO workspaces").
-		WithArgs(sqlmock.AnyArg(), "Test Agent", nil, 3, "langgraph", sqlmock.AnyArg(), (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
+		WithArgs(sqlmock.AnyArg(), "Test Agent", nil, 3, "langgraph", (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// Expect transaction commit (no secrets in this payload)
@@ -412,24 +412,17 @@ func TestWorkspaceCreate(t *testing.T) {
 	if resp["id"] == nil || resp["id"] == "" {
 		t.Error("expected non-empty id in response")
 	}
-	if resp["awareness_namespace"] != "workspace:"+resp["id"].(string) {
-		t.Errorf("expected awareness namespace derived from workspace id, got %v", resp["awareness_namespace"])
-	}
 
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations: %v", err)
 	}
 }
 
-func TestBuildProvisionerConfig_IncludesAwarenessSettings(t *testing.T) {
+func TestBuildProvisionerConfig_WorkspacePathFromPayload(t *testing.T) {
 	setupTestDB(t)
-	// runtime_image_pins reader removed by RFC internal#617 / task #335
-	// — CP is the SSOT for runtime image pins. No DB lookup here anymore.
-
 	broadcaster := newTestBroadcaster()
 	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", "/tmp/configs")
 
-	t.Setenv("AWARENESS_URL", "http://awareness:37800")
 	t.Setenv("WORKSPACE_DIR", "/tmp/workspace")
 
 	cfg := handler.buildProvisionerConfig(
@@ -440,17 +433,10 @@ func TestBuildProvisionerConfig_IncludesAwarenessSettings(t *testing.T) {
 		models.CreateWorkspacePayload{Tier: 2, Runtime: "claude-code", WorkspaceDir: "/tmp/workspace", WorkspaceAccess: "read_write"},
 		map[string]string{"OPENAI_API_KEY": "sk-test"},
 		"/tmp/plugins",
-		"workspace:ws-123",
 	)
 
-	if cfg.AwarenessURL != "http://awareness:37800" {
-		t.Fatalf("expected awareness URL to be injected, got %q", cfg.AwarenessURL)
-	}
-	if cfg.AwarenessNamespace != "workspace:ws-123" {
-		t.Fatalf("expected awareness namespace to be injected, got %q", cfg.AwarenessNamespace)
-	}
 	if cfg.WorkspacePath != "/tmp/workspace" {
-		t.Fatalf("expected workspace path from env, got %q", cfg.WorkspacePath)
+		t.Fatalf("expected workspace path from payload, got %q", cfg.WorkspacePath)
 	}
 }
 

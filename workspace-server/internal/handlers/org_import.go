@@ -102,7 +102,6 @@ func (h *OrgHandler) createWorkspaceTree(ws OrgWorkspace, parentID *string, absX
 	}
 
 	id := uuid.New().String()
-	awarenessNS := workspaceAwarenessNamespace(id)
 
 	var role interface{}
 	if ws.Role != "" {
@@ -168,13 +167,13 @@ func (h *OrgHandler) createWorkspaceTree(ws OrgWorkspace, parentID *string, absX
 	// EXACTLY for Postgres to consider the index applicable.
 	var insertedID string
 	err := db.DB.QueryRowContext(ctx, `
-		INSERT INTO workspaces (id, name, role, tier, runtime, awareness_namespace, status, parent_id, workspace_dir, workspace_access, max_concurrent_tasks)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+		INSERT INTO workspaces (id, name, role, tier, runtime, status, parent_id, workspace_dir, workspace_access, max_concurrent_tasks)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 		ON CONFLICT (COALESCE(parent_id, '00000000-0000-0000-0000-000000000000'::uuid), name)
 		WHERE status != 'removed'
 		DO NOTHING
 		RETURNING id
-	`, id, ws.Name, role, tier, runtime, awarenessNS, "provisioning", parentID, workspaceDir, workspaceAccess, maxConcurrent).Scan(&insertedID)
+	`, id, ws.Name, role, tier, runtime, "provisioning", parentID, workspaceDir, workspaceAccess, maxConcurrent).Scan(&insertedID)
 	if errors.Is(err, sql.ErrNoRows) {
 		// Skip path — a non-removed row already exists for
 		// (parent_id, name). Re-select its id; idempotency-friendly
@@ -259,7 +258,7 @@ func (h *OrgHandler) createWorkspaceTree(ws OrgWorkspace, parentID *string, absX
 	if len(wsMemories) == 0 {
 		wsMemories = defaults.InitialMemories
 	}
-	seedInitialMemories(ctx, id, wsMemories, awarenessNS)
+	seedInitialMemories(ctx, id, wsMemories)
 
 	// Handle external workspaces
 	if ws.External {

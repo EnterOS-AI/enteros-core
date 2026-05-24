@@ -162,7 +162,6 @@ func TestBuildProvisionerConfig_CopiesComputeSizingFromPayload(t *testing.T) {
 		},
 		nil,
 		t.TempDir(),
-		"workspace:ws-compute",
 	)
 
 	if cfg.InstanceType != "m6i.xlarge" {

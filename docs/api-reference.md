@@ -103,7 +103,7 @@ Migration files live in `workspace-server/migrations/` (latest: `022_workspace_s
 
 | Table | Description |
 |-------|-------------|
-| `workspaces` | Core entity — status, runtime, `agent_card` JSONB, heartbeat columns, `current_task`, `awareness_namespace`, `workspace_dir` |
+| `workspaces` | Core entity — status, runtime, `agent_card` JSONB, heartbeat columns, `current_task`, `workspace_dir` |
 | `canvas_layouts` | Per-workspace x/y canvas position |
 | `structure_events` | Append-only event log (workspace lifecycle, agent, approval events) |
 | `activity_logs` | A2A communications, task updates, agent logs, errors. `error_detail` is populated by the scheduler so cron run history can surface failure reasons. |

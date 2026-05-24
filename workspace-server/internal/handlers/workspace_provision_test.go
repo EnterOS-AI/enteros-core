@@ -17,9 +17,9 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// ==================== workspaceAwarenessNamespace ====================
+// ==================== workspaceMemoryNamespace ====================
 
-func TestWorkspaceAwarenessNamespace(t *testing.T) {
+func TestWorkspaceMemoryNamespace(t *testing.T) {
 	tests := []struct {
 		workspaceID string
 		expected    string
@@ -31,9 +31,9 @@ func TestWorkspaceAwarenessNamespace(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.workspaceID, func(t *testing.T) {
-			result := workspaceAwarenessNamespace(tt.workspaceID)
+			result := workspaceMemoryNamespace(tt.workspaceID)
 			if result != tt.expected {
-				t.Errorf("workspaceAwarenessNamespace(%q) = %q, want %q", tt.workspaceID, result, tt.expected)
+				t.Errorf("workspaceMemoryNamespace(%q) = %q, want %q", tt.workspaceID, result, tt.expected)
 			}
 		})
 	}
@@ -645,7 +645,7 @@ func TestSeedInitialMemories_TruncatesOversizedContent(t *testing.T) {
 					WillReturnResult(sqlmock.NewResult(1, 1))
 			}
 
-			seedInitialMemories(context.Background(), workspaceID, memories, "test-ns")
+			seedInitialMemories(context.Background(), workspaceID, memories)
 
 			if err := mock.ExpectationsWereMet(); err != nil {
 				t.Errorf("unmet DB expectations: %v", err)
@@ -674,7 +674,7 @@ func TestSeedInitialMemories_RedactsSecrets(t *testing.T) {
 		WithArgs(workspaceID, wantRedacted, "LOCAL", sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 
-	seedInitialMemories(context.Background(), workspaceID, memories, "test-ns")
+	seedInitialMemories(context.Background(), workspaceID, memories)
 
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet DB expectations: %v", err)
@@ -691,7 +691,7 @@ func TestSeedInitialMemories_InvalidScopeSkipped(t *testing.T) {
 		{Content: "this should be skipped", Scope: "NOT_A_REAL_SCOPE"},
 	}
 
-	seedInitialMemories(context.Background(), "ws-bad-scope", memories, "test-ns")
+	seedInitialMemories(context.Background(), "ws-bad-scope", memories)
 
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unexpected DB calls for invalid scope: %v", err)
@@ -704,7 +704,7 @@ func TestSeedInitialMemories_EmptyMemoriesNil(t *testing.T) {
 	mock := setupTestDB(t)
 	mock.ExpectationsWereMet()
 
-	seedInitialMemories(context.Background(), "ws-nil", nil, "test-ns")
+	seedInitialMemories(context.Background(), "ws-nil", nil)
 
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unexpected DB calls for nil slice: %v", err)
@@ -733,7 +733,6 @@ func TestBuildProvisionerConfig_BasicFields(t *testing.T) {
 		models.CreateWorkspacePayload{Tier: 1, Runtime: "langgraph"},
 		map[string]string{"API_KEY": "secret"},
 		pluginsPath,
-		"workspace:ws-basic",
 	)
 
 	if cfg.WorkspaceID != "ws-basic" {
@@ -747,9 +746,6 @@ func TestBuildProvisionerConfig_BasicFields(t *testing.T) {
 	}
 	if cfg.PlatformURL != "http://localhost:8080" {
 		t.Errorf("expected PlatformURL 'http://localhost:8080', got %q", cfg.PlatformURL)
-	}
-	if cfg.AwarenessNamespace != "workspace:ws-basic" {
-		t.Errorf("expected AwarenessNamespace 'workspace:ws-basic', got %q", cfg.AwarenessNamespace)
 	}
 	if cfg.PluginsPath != pluginsPath {
 		t.Errorf("expected PluginsPath %q, got %q", pluginsPath, cfg.PluginsPath)
@@ -775,7 +771,6 @@ func TestBuildProvisionerConfig_WorkspacePathFromEnv(t *testing.T) {
 
 	workspaceDir := t.TempDir()
 	t.Setenv("WORKSPACE_DIR", workspaceDir)
-	t.Setenv("AWARENESS_URL", "http://awareness:37800")
 
 	pluginsPath := t.TempDir()
 	cfg := handler.buildProvisionerConfig(
@@ -786,14 +781,10 @@ func TestBuildProvisionerConfig_WorkspacePathFromEnv(t *testing.T) {
 		models.CreateWorkspacePayload{Tier: 2, Runtime: "claude-code"},
 		nil,
 		pluginsPath,
-		"workspace:ws-env",
 	)
 
 	if cfg.WorkspacePath != workspaceDir {
 		t.Errorf("expected WorkspacePath from env, got %q", cfg.WorkspacePath)
-	}
-	if cfg.AwarenessURL != "http://awareness:37800" {
-		t.Errorf("expected AwarenessURL from env, got %q", cfg.AwarenessURL)
 	}
 }
 
@@ -1007,7 +998,7 @@ func TestSeedInitialMemories_Truncation(t *testing.T) {
 		WithArgs(sqlmock.AnyArg(), expectTruncated, "LOCAL", sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	seedInitialMemories(context.Background(), "ws-1066-test", memories, "test-ns")
+	seedInitialMemories(context.Background(), "ws-1066-test", memories)
 
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("DB expectations not met: %v\n"+
@@ -1027,7 +1018,7 @@ func TestSeedInitialMemories_ContentUnderLimit(t *testing.T) {
 		WithArgs(sqlmock.AnyArg(), "short content", "TEAM", sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	seedInitialMemories(context.Background(), "ws-1066-under", memories, "test-ns")
+	seedInitialMemories(context.Background(), "ws-1066-under", memories)
 
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("DB expectations not met: %v", err)
@@ -1052,7 +1043,7 @@ func TestSeedInitialMemories_ExactlyAtLimit(t *testing.T) {
 		WithArgs(sqlmock.AnyArg(), atLimitContent, "LOCAL", sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	seedInitialMemories(context.Background(), "ws-boundary", memories, "test-ns")
+	seedInitialMemories(context.Background(), "ws-boundary", memories)
 
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("DB expectations not met: %v", err)
@@ -1068,7 +1059,7 @@ func TestSeedInitialMemories_EmptyContent(t *testing.T) {
 	}
 
 	// seedInitialMemories skips empty content at line 234 — no DB call expected.
-	seedInitialMemories(context.Background(), "ws-empty", memories, "test-ns")
+	seedInitialMemories(context.Background(), "ws-empty", memories)
 
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("DB expectations not met: %v", err)
@@ -1092,7 +1083,7 @@ func TestSeedInitialMemories_OversizedWithSecrets(t *testing.T) {
 		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), "GLOBAL", sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	seedInitialMemories(context.Background(), "ws-secrets", memories, "test-ns")
+	seedInitialMemories(context.Background(), "ws-secrets", memories)
 
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("DB expectations not met: %v", err)
