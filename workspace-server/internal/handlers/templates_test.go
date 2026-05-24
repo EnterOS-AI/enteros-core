@@ -86,6 +86,7 @@ func TestTemplatesList_WithTemplates(t *testing.T) {
 	configYaml := `name: Test Agent
 description: A test agent
 tier: 2
+runtime: claude-code
 model: anthropic:claude-sonnet-4-20250514
 skills:
   - web-search
@@ -546,7 +547,7 @@ func TestTemplatesList_OmitsProvidersWhenAbsent(t *testing.T) {
 		t.Fatalf("mkdir: %v", err)
 	}
 	configYaml := `name: Legacy
-runtime: langgraph
+runtime: hermes
 runtime_config:
   model: anthropic:claude-opus-4-7
 skills: []
@@ -582,6 +583,7 @@ func TestTemplatesList_LegacyTopLevelModel(t *testing.T) {
 	}
 	configYaml := `name: Legacy Agent
 tier: 1
+runtime: claude-code
 model: anthropic:claude-sonnet-4-6
 skills: []
 `
@@ -602,8 +604,8 @@ skills: []
 	if len(resp) != 1 || resp[0].Model != "anthropic:claude-sonnet-4-6" {
 		t.Errorf("legacy top-level model not surfaced: %+v", resp)
 	}
-	if resp[0].Runtime != "" {
-		t.Errorf("Runtime should be empty for legacy template, got %q", resp[0].Runtime)
+	if resp[0].Runtime != "claude-code" {
+		t.Errorf("Runtime should be claude-code for legacy template, got %q", resp[0].Runtime)
 	}
 	if len(resp[0].Models) != 0 {
 		t.Errorf("Models should be empty for legacy template, got %+v", resp[0].Models)
