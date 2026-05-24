@@ -273,6 +273,16 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 
 		// Agent Memories (HMA)
 		memsh := handlers.NewMemoriesHandler()
+		// Issue #1791 — Commit routes through the v2 memory plugin
+		// instead of raw SQL into the frozen agent_memories table.
+		// Search/Delete/Update on this handler still read v1; tracked
+		// separately so this PR stays single-axis. When the plugin is
+		// not wired (test fixtures, new operators without
+		// MEMORY_PLUGIN_URL), Commit returns 503 — matches #1747's
+		// no-fallback posture for the MCP path.
+		if memBundle != nil {
+			memsh.WithMemoryV2(memBundle.Plugin, memBundle.Resolver)
+		}
 		wsAuth.POST("/memories", memsh.Commit)
 		wsAuth.GET("/memories", memsh.Search)
 		wsAuth.DELETE("/memories/:memoryId", memsh.Delete)

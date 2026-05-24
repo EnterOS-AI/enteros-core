@@ -12,6 +12,9 @@ import (
 	"strings"
 
 	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
+	"github.com/Molecule-AI/molecule-monorepo/platform/internal/memory/client"
+	"github.com/Molecule-AI/molecule-monorepo/platform/internal/memory/contract"
+	"github.com/Molecule-AI/molecule-monorepo/platform/internal/memory/namespace"
 	"github.com/Molecule-AI/molecule-monorepo/platform/internal/registry"
 	"github.com/gin-gonic/gin"
 )
@@ -87,8 +90,16 @@ type EmbeddingFunc func(ctx context.Context, text string) ([]float32, error)
 type MemoriesHandler struct {
 	// embed generates vector embeddings for semantic search (issue #576).
 	// nil disables the semantic path — all operations degrade gracefully to
-	// the existing FTS/ILIKE path.
+	// the existing FTS/ILIKE path. Read methods (Search/Get) still consult
+	// this; the v2 plugin owns embeddings on its own write path.
 	embed EmbeddingFunc
+
+	// memv2 routes Commit writes through the v2 memory plugin (issue #1791
+	// — Phase A2 step 1). When nil, Commit returns 503; the v1 SQL INSERT
+	// is gone, matching #1747's "plugin is the only backend" posture for
+	// the MCP path. Search/Update/Delete on this handler still read v1
+	// — they're tracked separately so this PR stays single-axis.
+	memv2 *memoryV2Deps
 }
 
 // NewMemoriesHandler constructs a handler with FTS-only mode.
@@ -103,6 +114,28 @@ func (h *MemoriesHandler) WithEmbedding(fn EmbeddingFunc) *MemoriesHandler {
 	if fn != nil {
 		h.embed = fn
 	}
+	return h
+}
+
+// WithMemoryV2 wires the plugin client + namespace resolver so Commit
+// can route writes through the v2 plugin instead of raw SQL into
+// `agent_memories` (issue #1791). Mirrors MCPHandler.WithMemoryV2 so
+// the same boot-time pattern works for both surfaces.
+//
+// Boot-time: main.go calls this after Boot()-ing the plugin client.
+// When this is not called (test fixtures or new operators without
+// MEMORY_PLUGIN_URL), Commit returns 503 with a clear hint.
+func (h *MemoriesHandler) WithMemoryV2(plugin *client.Client, resolver *namespace.Resolver) *MemoriesHandler {
+	h.memv2 = &memoryV2Deps{plugin: plugin, resolver: resolver}
+	return h
+}
+
+// withMemoryV2APIs is the test-only injection path: takes the
+// interfaces directly so unit tests don't have to construct a real
+// *client.Client / namespace.Resolver. Symmetric with
+// MCPHandler.withMemoryV2APIs.
+func (h *MemoriesHandler) withMemoryV2APIs(plugin memoryPluginAPI, resolver namespaceResolverAPI) *MemoriesHandler {
+	h.memv2 = &memoryV2Deps{plugin: plugin, resolver: resolver}
 	return h
 }
 
@@ -187,16 +220,67 @@ func (h *MemoriesHandler) Commit(c *gin.Context) {
 		content = strings.ReplaceAll(content, "[MEMORY ", "[_MEMORY ")
 	}
 
-	var memoryID string
-	err := db.DB.QueryRowContext(ctx, `
-		INSERT INTO agent_memories (workspace_id, content, scope, namespace)
-		VALUES ($1, $2, $3, $4) RETURNING id
-	`, workspaceID, content, body.Scope, namespace).Scan(&memoryID)
+	// v2 plugin is the only write backend (issue #1791 — Phase A2 step 1,
+	// mirrors #1747's no-fallback posture for the MCP path). When the plugin
+	// isn't wired, return 503 with a clear hint rather than silently
+	// dropping the write or falling back to a frozen v1 table no one reads.
+	if h.memv2 == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error": "memory plugin is not configured (set MEMORY_PLUGIN_URL)",
+		})
+		return
+	}
+
+	// Resolve the v1 scope (LOCAL/TEAM/GLOBAL) to the v2 plugin namespace
+	// kind. The resolver picks the actual namespace string at runtime —
+	// we only need the kind here.
+	var wantKind contract.NamespaceKind
+	switch body.Scope {
+	case "LOCAL":
+		wantKind = contract.NamespaceKindWorkspace
+	case "TEAM":
+		wantKind = contract.NamespaceKindTeam
+	case "GLOBAL":
+		wantKind = contract.NamespaceKindOrg
+	}
+	writable, err := h.memv2.resolver.WritableNamespaces(ctx, workspaceID)
 	if err != nil {
-		log.Printf("Commit memory error: %v", err)
+		log.Printf("Commit: resolve writable namespaces for %s failed: %v", workspaceID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to resolve writable namespaces"})
+		return
+	}
+	var nsName string
+	for _, ns := range writable {
+		if ns.Kind == wantKind {
+			nsName = ns.Name
+			break
+		}
+	}
+	if nsName == "" {
+		c.JSON(http.StatusForbidden, gin.H{
+			"error": fmt.Sprintf("no writable namespace of kind %s for workspace %s", wantKind, workspaceID),
+		})
+		return
+	}
+
+	// Plugin write. The plugin owns its own embedding generation (FTS
+	// + vector indices are internal to memory_plugin schema), so we no
+	// longer call h.embed here — that becomes dead weight on this path
+	// and is left in place only for Search/Get which still read v1.
+	resp, err := h.memv2.plugin.CommitMemory(ctx, nsName, contract.MemoryWrite{
+		Content: content,
+		Kind:    contract.MemoryKindFact,
+		// Source=user: HTTP POST /memories is the canvas/operator surface,
+		// not the agent MCP path (which uses MemorySourceAgent). The plugin
+		// uses this for activity-log + audit attribution.
+		Source: contract.MemorySourceUser,
+	})
+	if err != nil {
+		log.Printf("Commit memory error (plugin): %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store memory"})
 		return
 	}
+	memoryID := resp.ID
 
 	// #767 Audit: write a GLOBAL memory audit log entry for forensic replay.
 	// Records a SHA-256 hash of the content — never plaintext — so the audit
@@ -208,10 +292,10 @@ func (h *MemoriesHandler) Commit(c *gin.Context) {
 		sum := sha256.Sum256([]byte(content))
 		auditBody, _ := json.Marshal(map[string]string{
 			"memory_id":      memoryID,
-			"namespace":      namespace,
+			"namespace":      nsName,
 			"content_sha256": hex.EncodeToString(sum[:]),
 		})
-		summary := "GLOBAL memory written: id=" + memoryID + " namespace=" + namespace
+		summary := "GLOBAL memory written: id=" + memoryID + " namespace=" + nsName
 		if _, auditErr := db.DB.ExecContext(ctx, `
 			INSERT INTO activity_logs (workspace_id, activity_type, source_id, summary, request_body, status)
 			VALUES ($1, $2, $3, $4, $5::jsonb, $6)
@@ -220,24 +304,10 @@ func (h *MemoriesHandler) Commit(c *gin.Context) {
 		}
 	}
 
-	// Optionally embed and persist the vector. Non-fatal: the memory is
-	// already stored above; a failed embedding just means this record will
-	// be excluded from future cosine-similarity searches.
-	if h.embed != nil {
-		if vec, embedErr := h.embed(ctx, content); embedErr != nil {
-			log.Printf("Commit: embedding failed workspace=%s memory=%s: %v (stored without embedding)",
-				workspaceID, memoryID, embedErr)
-		} else if fmtVec := formatVector(vec); fmtVec != "" {
-			if _, updateErr := db.DB.ExecContext(ctx,
-				`UPDATE agent_memories SET embedding = $1::vector WHERE id = $2`,
-				fmtVec, memoryID,
-			); updateErr != nil {
-				log.Printf("Commit: embedding UPDATE failed workspace=%s memory=%s: %v",
-					workspaceID, memoryID, updateErr)
-			}
-		}
-	}
-
+	// Preserve the legacy response shape ({id, scope, namespace}) so existing
+	// HTTP callers (canvas, workspace runtimes) see no contract change. The
+	// `namespace` field returns the user-supplied tag, not the v2 plugin
+	// namespace — the latter is an internal storage detail.
 	c.JSON(http.StatusCreated, gin.H{"id": memoryID, "scope": body.Scope, "namespace": namespace})
 }
 
