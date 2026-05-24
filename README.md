@@ -79,7 +79,7 @@ LangGraph, DeepAgents, Claude Code, CrewAI, AutoGen, Hermes, Gemini CLI, and Ope
 
 ### 4. Memory is treated like infrastructure
 
-Molecule AI's HMA approach is designed around organizational boundaries, not just “store more context somewhere.” Durable recall, scoped sharing, awareness namespaces, and skill promotion are all part of one coherent system.
+Molecule AI's HMA approach is designed around organizational boundaries, not just "store more context somewhere." Durable recall, scoped sharing through the v2 memory plugin, and skill promotion are all part of one coherent system.
 
 ### 5. It comes with a real control plane
 
@@ -101,7 +101,7 @@ Registry, heartbeats, restart, pause/resume, activity logs, approvals, terminal 
 | **Role-native workspace abstraction** | Your org structure survives model swaps, framework changes, and team expansion |
 | **Fractal team expansion** | A single specialist can become a managed department without breaking upstream integrations |
 | **Heterogeneous runtime compatibility** | Different teams can keep their preferred agent architecture while sharing one control plane |
-| **HMA + awareness namespaces** | Memory sharing follows hierarchy instead of leaking across the whole system |
+| **HMA + v2 memory plugin** | Memory sharing follows hierarchy instead of leaking across the whole system; one plugin per tenant, namespace-scoped per workspace |
 | **Skill evolution loop** | Durable successful workflows can graduate from memory into reusable, hot-reloadable skills |
 | **WebSocket-first operational UX** | The canvas reflects task state, structure changes, and A2A responses in near real time |
 | **Global secrets with local override** | Centralize provider access, then override only where a workspace needs specialized credentials |
@@ -133,7 +133,7 @@ Most projects stop at “we added memory.” Molecule AI pushes further:
 | Flat store or weak namespaces | Hierarchy-aligned `LOCAL`, `TEAM`, `GLOBAL` scopes |
 | Sharing is easy to overexpose | Sharing is explicit and structure-aware |
 | Memory and procedure get mixed together | Memory stores durable facts; skills store repeatable procedure |
-| Every agent can become over-privileged | Workspace awareness namespaces reduce blast radius |
+| Every agent can become over-privileged | Per-workspace namespaces in the v2 memory plugin reduce blast radius |
 | UI memory and runtime memory blur together | Separate surfaces for scoped agent memory, key/value workspace memory, and recall |
 
 ### The flywheel
@@ -163,7 +163,7 @@ Most agent systems stop at "a smart runtime." Molecule AI pushes further: it giv
 
 | Core mechanism | Molecule AI module(s) | Why it matters |
 |---|---|---|
-| **Durable memory that survives sessions** | `molecule-ai-workspace-runtime/molecule_runtime/builtin_tools/`, `workspace-server/internal/handlers/memories.go` | Memory is not just durable, it is **workspace-scoped** and can route into awareness namespaces tied to the org structure |
+| **Durable memory that survives sessions** | `molecule-ai-workspace-runtime/molecule_runtime/builtin_tools/`, `workspace-server/internal/handlers/memories.go`, `workspace-server/internal/memory/` (v2 plugin client + namespace resolver) | Memory is not just durable, it is **workspace-scoped** — every write lands in the workspace's own `workspace:<id>` namespace, with `team:<root>` and `org:<root>` available for cross-workspace shares via the platform's namespace ACL when an agent explicitly promotes a memory |
 | **Cross-session recall** | `workspace-server/internal/handlers/activity.go` (`/workspaces/:id/session-search`) | Recall spans both activity history and memory rows, so the system can search what happened and what was learned without inventing a separate hidden store |
 | **Skills built from experience** | `molecule-ai-workspace-runtime/molecule_runtime/builtin_tools/memory.py` (`_maybe_log_skill_promotion`) | Promotion from memory into a skill candidate is surfaced as an explicit platform activity, not a silent internal side effect |
 | **Skill improvement during use** | `molecule-ai-workspace-runtime/molecule_runtime/skill_loader/`, `molecule-ai-workspace-runtime/molecule_runtime/main.py` | Skills hot-reload into the live runtime, so improvements become available on the next A2A task without restarting the workspace |
@@ -172,7 +172,7 @@ Most agent systems stop at "a smart runtime." Molecule AI pushes further: it giv
 ### Why this matters in Molecule AI
 
 1. **The learning loop is org-aware, not just session-aware.**
-   Memory can live at `LOCAL`, `TEAM`, or `GLOBAL` scope, and awareness namespaces give each workspace a durable identity boundary.
+   Memory can live at `LOCAL`, `TEAM`, or `GLOBAL` scope, and the v2 plugin's namespace ACL gives each workspace a durable identity boundary.
 
 2. **The learning loop is visible to operators.**
    Promotion events, activity logs, current-task updates, traces, and WebSocket fanout mean self-improvement is part of the control plane, not a hidden black box.
@@ -211,7 +211,7 @@ The result is not just “an agent that learns.” It is **an organization that 
 - standalone workspace-template images that install `molecule-ai-workspace-runtime` from the Gitea package registry; thin AMI in production (us-east-2)
 - adapter-driven execution across **8 runtimes** (Claude Code, Hermes, Gemini CLI, LangGraph, DeepAgents, CrewAI, AutoGen, OpenClaw)
 - Agent Card registration
-- awareness-backed memory integration; **Memory v2 backed by pgvector** for semantic recall
+- **Memory v2 backed by pgvector** — per-tenant plugin sidecar serving HMA namespaces with FTS + semantic recall
 - plugin-mounted shared rules/skills
 - hot-reloadable local skills
 - coordinator-only delegation path
@@ -262,7 +262,7 @@ Canvas (Next.js 15, warm-paper :3000)  <--HTTP / WS-->  Platform (Go 1.25 :8080)
 Workspace Runtime (Python ≥3.11, image with adapters)
   - 8 adapters: LangGraph / DeepAgents / Claude Code / CrewAI / AutoGen / Hermes / Gemini CLI / OpenClaw
   - Agent Card + A2A server (typed-SSOT response path, RFC #2967)
-  - heartbeat + activity + awareness-backed memory (Memory v2 — pgvector semantic recall)
+  - heartbeat + activity + Memory v2 (pgvector semantic recall via per-tenant plugin sidecar)
   - skills + plugins + hot reload
 
 SaaS Control Plane (molecule-controlplane, private)

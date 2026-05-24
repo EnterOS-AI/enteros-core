@@ -47,18 +47,26 @@ It is useful for structured per-workspace state and optional TTL entries. It is 
 
 `GET /workspaces/:id/session-search` provides a thin recall surface over recent activity rows and memory rows. It is for “what just happened in this workspace?” rather than long-term semantic storage.
 
-### 4. Awareness-backed persistence
+### 4. Memory v2 plugin (`memory_records` / `memory_namespaces`)
 
-When the runtime receives:
+This is the production-direction backend, behind the RFC #2728 HTTP
+contract. The plugin runs as a sidecar on each tenant EC2 (auto-spawned
+by `entrypoint-tenant.sh` when `MEMORY_PLUGIN_URL` is set), owns its
+own tables under the `memory_plugin` schema, and serves:
 
-```bash
-AWARENESS_URL=...
-AWARENESS_NAMESPACE=workspace:<id>
-```
+- `POST /workspaces/:id/v2/memories` (canvas `MemoryInspectorPanel`)
+- `GET /workspaces/:id/v2/memories`
+- `DELETE /workspaces/:id/v2/memories/:id`
+- runtime tools `commit_memory_v2`, `search_memory`, `commit_summary`,
+  `forget_memory`
+- legacy MCP tool names `commit_memory` / `recall_memory` via the
+  scope→namespace shim in `mcp_tools_memory_legacy_shim.go`
 
-the same memory tools keep the same interface, but durable memory writes/reads are routed through the workspace's awareness namespace.
-
-This is the current production direction of the memory boundary: stable tool surface, stronger backend isolation.
+Capability negotiation (FTS, embedding, TTL, pin, propagation) is
+declared by the plugin via `GET /v1/health`; workspace-server adapts
+the tool surface to what the plugin actually supports. See
+[`memory-plugin-v1.yaml`](../api-protocol/memory-plugin-v1.yaml) for
+the full wire contract.
 
 ## Access Model
 
@@ -121,7 +129,7 @@ If you need:
 - **org-wide guidance**: use `GLOBAL`
 - **simple UI-visible structured state**: use `workspace_memory`
 - **recent decision/task recall**: use `session-search`
-- **stronger durable isolation**: enable awareness namespaces
+- **semantic / FTS search across memories**: use the v2 plugin endpoints (`/v2/memories?q=…`); they go through the plugin's pgvector + tsvector indexes when the plugin declares the capability
 
 ## Related Docs
 

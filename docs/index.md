@@ -27,7 +27,7 @@ features:
     details: Current main ships adapters for LangGraph, DeepAgents, Claude Code, CrewAI, AutoGen, and OpenClaw under one workspace contract and A2A surface.
     icon: "⚙️"
   - title: Hierarchical Memory
-    details: HMA-style LOCAL, TEAM, and GLOBAL scopes plus workspace-scoped awareness namespaces when awareness is configured.
+    details: HMA-style LOCAL, TEAM, and GLOBAL scopes backed by the v2 memory plugin (per-tenant pgvector sidecar with FTS + semantic recall).
     icon: "🧠"
   - title: Skill Evolution
     details: Local SKILL.md packages, tool loading, plugin-mounted shared capabilities, hot reload, and a documented memory-to-skill promotion path.
@@ -50,7 +50,7 @@ features:
 | **Canvas** | Empty-state deployment, onboarding guide, 10-tab side panel, template palette, bundle import/export, drag-to-nest teams, search, activity and trace views |
 | **Platform** | Workspace CRUD, registry, A2A proxy, team expansion, approvals, secrets, global secrets, memory APIs, files API, terminal, viewport persistence, WebSocket fanout |
 | **Runtime** | One workspace image with six shipping adapters on `main`: LangGraph, DeepAgents, Claude Code, CrewAI, AutoGen, OpenClaw |
-| **Memory** | Scoped agent memories, key/value workspace memory, session-search recall, awareness namespace injection |
+| **Memory** | v2 plugin (pgvector + FTS) serving scoped agent memories under per-workspace namespaces; key/value workspace memory; session-search recall |
 | **Skills** | Local skill packages, plugin-mounted shared skills/rules, audit/install/publish CLI helpers, hot reload |
 
 ## Compatibility Note

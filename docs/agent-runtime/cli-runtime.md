@@ -219,9 +219,9 @@ a2a info                           # Show workspace info
 
 Both approaches use the same backend: platform registry for discovery, A2A protocol for messaging, and access control enforcement (parent↔child, siblings only).
 
-## Workspace Awareness
+## Memory Tools
 
-CLI runtimes keep the same memory tool surface as the Python runtime. When `AWARENESS_URL` and `AWARENESS_NAMESPACE` are injected into the workspace, `commit_memory` and `search_memory` route to the workspace's own awareness namespace instead of the fallback platform memory API. This keeps the agent contract stable while giving each workspace an isolated memory scope.
+CLI runtimes keep the same memory tool surface as the Python runtime: `commit_memory` / `commit_memory_v2` / `search_memory` / `commit_summary` / `forget_memory` are exposed via the workspace's MCP bridge and route through the platform's v2 memory plugin under the workspace's `workspace:<id>` namespace. See [Memory Architecture](../architecture/memory.md) for the backend.
 
 ## Task Status Reporting
 
