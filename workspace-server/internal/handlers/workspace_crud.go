@@ -7,6 +7,7 @@ package handlers
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -161,6 +162,36 @@ func (h *WorkspaceHandler) Update(c *gin.Context) {
 			}
 		}
 	}
+	var computeJSON string
+	computePatch := false
+	if rawCompute, ok := body["compute"]; ok {
+		computePatch = true
+		if rawCompute == nil {
+			computeJSON = "{}"
+		} else {
+			b, err := json.Marshal(rawCompute)
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid compute config"})
+				return
+			}
+			var compute models.WorkspaceCompute
+			if err := json.Unmarshal(b, &compute); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid compute config"})
+				return
+			}
+			if err := validateWorkspaceCompute(compute); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
+			}
+			encoded, err := workspaceComputeJSON(compute)
+			if err != nil {
+				log.Printf("Update compute encode error for %s: %v", id, err)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to encode compute config"})
+				return
+			}
+			computeJSON = encoded
+		}
+	}
 
 	ctx := c.Request.Context()
 
@@ -212,17 +243,28 @@ func (h *WorkspaceHandler) Update(c *gin.Context) {
 			log.Printf("Update collapsed error for %s: %v", id, err)
 		}
 	}
+	needsRestart := false
 	if runtime, ok := body["runtime"]; ok {
 		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET runtime = $2, updated_at = now() WHERE id = $1`, id, runtime); err != nil {
 			log.Printf("Update runtime error for %s: %v", id, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save runtime"})
+			return
 		}
+		needsRestart = true
 	}
-	needsRestart := false
 	if wsDir, ok := body["workspace_dir"]; ok {
 		// ValidateWorkspaceDir was already called above before the existence check;
 		// the UPDATE itself is unconditional.
 		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET workspace_dir = $2, updated_at = now() WHERE id = $1`, id, wsDir); err != nil {
 			log.Printf("Update workspace_dir error for %s: %v", id, err)
+		}
+		needsRestart = true
+	}
+	if computePatch {
+		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET compute = $2::jsonb, updated_at = now() WHERE id = $1`, id, computeJSON); err != nil {
+			log.Printf("Update compute error for %s: %v", id, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save compute config"})
+			return
 		}
 		needsRestart = true
 	}

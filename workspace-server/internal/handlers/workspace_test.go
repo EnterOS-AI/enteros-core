@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -864,6 +865,45 @@ func TestWorkspaceUpdate_RuntimeField(t *testing.T) {
 
 	if w.Code != http.StatusOK {
 		t.Errorf("expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to parse response: %v", err)
+	}
+	if resp["needs_restart"] != true {
+		t.Errorf("expected needs_restart=true, got %v", resp["needs_restart"])
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+func TestWorkspaceUpdate_RuntimeField_DBErrorReturnsServerError(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+
+	mock.ExpectQuery("SELECT EXISTS.*workspaces WHERE id").
+		WithArgs("cccccccc-0006-0000-0000-000000000001").
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+	mock.ExpectExec("UPDATE workspaces SET runtime").
+		WithArgs("cccccccc-0006-0000-0000-000000000001", "hermes").
+		WillReturnError(errors.New("database unavailable"))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "cccccccc-0006-0000-0000-000000000001"}}
+
+	body := `{"runtime":"hermes"}`
+	c.Request = httptest.NewRequest("PATCH", "/workspaces/ws-rt", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Update(c)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("expected status 500, got %d: %s", w.Code, w.Body.String())
 	}
 
 	if err := mock.ExpectationsWereMet(); err != nil {

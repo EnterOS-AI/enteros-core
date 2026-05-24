@@ -1,9 +1,13 @@
 package handlers
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/Molecule-AI/molecule-monorepo/platform/internal/provisioner"
 )
 
 // Tests for resolveRestartTemplate — the pure helper that implements the
@@ -104,6 +108,71 @@ func TestResolveRestartTemplate_ApplyTemplate_RuntimeDefault(t *testing.T) {
 	}
 }
 
+type restartRuntimeProv struct {
+	execReadCalls int
+	config        []byte
+}
+
+func (p *restartRuntimeProv) Start(_ context.Context, _ provisioner.WorkspaceConfig) (string, error) {
+	panic("restartRuntimeProv.Start not implemented")
+}
+func (p *restartRuntimeProv) Stop(_ context.Context, _ string) error {
+	panic("restartRuntimeProv.Stop not implemented")
+}
+func (p *restartRuntimeProv) IsRunning(_ context.Context, _ string) (bool, error) {
+	panic("restartRuntimeProv.IsRunning not implemented")
+}
+func (p *restartRuntimeProv) ExecRead(_ context.Context, _, _ string) ([]byte, error) {
+	p.execReadCalls++
+	return p.config, nil
+}
+func (p *restartRuntimeProv) RemoveVolume(_ context.Context, _ string) error {
+	panic("restartRuntimeProv.RemoveVolume not implemented")
+}
+func (p *restartRuntimeProv) VolumeHasFile(_ context.Context, _, _ string) (bool, error) {
+	panic("restartRuntimeProv.VolumeHasFile not implemented")
+}
+func (p *restartRuntimeProv) WriteAuthTokenToVolume(_ context.Context, _, _ string) error {
+	panic("restartRuntimeProv.WriteAuthTokenToVolume not implemented")
+}
+
+var _ provisioner.LocalProvisionerAPI = (*restartRuntimeProv)(nil)
+
+func TestRestartRuntimeFromConfig_ApplyTemplateTrustsDBRuntime(t *testing.T) {
+	prov := &restartRuntimeProv{config: []byte("runtime: claude-code\n")}
+	h := &WorkspaceHandler{provisioner: prov}
+
+	got := h.restartRuntimeFromConfig(context.Background(), "ws-runtime", "Runtime Workspace", "hermes", true)
+
+	if got != "hermes" {
+		t.Fatalf("runtime = %q, want DB runtime hermes", got)
+	}
+	if prov.execReadCalls != 0 {
+		t.Fatalf("ExecRead calls = %d, want 0 when apply_template=true", prov.execReadCalls)
+	}
+}
+
+func TestRestartRuntimeFromConfig_DefaultRestartPreservesContainerRuntime(t *testing.T) {
+	mock := setupTestDB(t)
+	mock.ExpectExec(`UPDATE workspaces SET runtime = \$1 WHERE id = \$2`).
+		WithArgs("claude-code", "ws-runtime").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	prov := &restartRuntimeProv{config: []byte("runtime: claude-code\n")}
+	h := &WorkspaceHandler{provisioner: prov}
+
+	got := h.restartRuntimeFromConfig(context.Background(), "ws-runtime", "Runtime Workspace", "hermes", false)
+
+	if got != "claude-code" {
+		t.Fatalf("runtime = %q, want container runtime claude-code", got)
+	}
+	if prov.execReadCalls != 1 {
+		t.Fatalf("ExecRead calls = %d, want 1", prov.execReadCalls)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet sqlmock expectations: %v", err)
+	}
+}
+
 // TestResolveRestartTemplate_ApplyTemplate_NoMatch_NoRuntime falls all
 // the way through to the reuse-volume path when neither name nor
 // runtime-default resolves.
@@ -183,7 +252,9 @@ func TestResolveRestartTemplate_Priority_ExplicitBeatsApplyTemplate(t *testing.T
 // An attacker who holds a workspace token can set the runtime field to a
 // path-traversal string (e.g. "../../../etc").  Before the fix, the code
 // did:
-//   runtimeTemplate := filepath.Join(configsDir, dbRuntime+"-default")
+//
+//	runtimeTemplate := filepath.Join(configsDir, dbRuntime+"-default")
+//
 // which on a host with /configs/../../../etc-default would return /etc-default,
 // injecting arbitrary host files into the workspace container.
 //
@@ -198,7 +269,7 @@ func TestResolveRestartTemplate_CWE22_TraversalRuntime_FallsThrough(t *testing.T
 	root := newTemplateDir(t) // no template dirs at all
 
 	for _, tc := range []struct {
-		name     string
+		name      string
 		dbRuntime string
 	}{
 		{"simple traversal", "../../../etc"},
