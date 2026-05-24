@@ -402,7 +402,11 @@ func (h *WorkspaceHandler) Delete(c *gin.Context) {
 		purgeIDs := pq.Array(allIDs)
 		// Order matters: delete from leaf tables first, then workspace row
 		for _, table := range []string{
-			"agent_memories", "activity_logs", "workspace_secrets",
+			// agent_memories removed in Phase A3 (#1792); memory rows now
+			// live in memory_plugin.memory_records. The plugin's
+			// namespace-cascade handles cleanup when the workspace's
+			// namespace is deleted via DeleteNamespace.
+			"activity_logs", "workspace_secrets",
 			"workspace_channels", "workspace_config", "workspace_memory",
 			"workspace_token_usage", "approval_requests", "audit_events",
 			"workflow_checkpoints", "workspace_artifacts", "agents",

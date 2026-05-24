@@ -32,19 +32,18 @@ CANVAS_PID=$!
 # Defaults (when sidecar IS spawned): MEMORY_PLUGIN_DATABASE_URL
 # falls back to the tenant's DATABASE_URL.
 #
-# MEMORY_V2_CUTOVER is deprecated as of #1747 — the workspace-server
-# binary no longer reads it (v2 is unconditional now; the legacy SQL
-# fallback in mcp_tools.go is gone). The entrypoint still accepts it
-# as a synonym for "operator wants the sidecar" so old CP user-data
-# templates keep working through the rollout. When CP user-data drops
-# the var, this branch can go.
+# Phase A3 (#1792): MEMORY_V2_CUTOVER acceptance removed. The variable
+# was deprecated by #1747 (binary stopped reading it) and only kept
+# alive here as a synonym to bridge old CP user-data templates. With
+# A3 dropping the entire v1 surface, the synonym is gone too. CP
+# user-data sets MEMORY_PLUGIN_URL directly; if a stale template
+# without that var ships, the sidecar simply doesn't start and the
+# tenant boots without memory — loud but recoverable, same posture as
+# any other required env missing.
 MEMORY_PLUGIN_PID=""
 memory_plugin_wanted=""
 if [ -n "$MEMORY_PLUGIN_URL" ]; then
   memory_plugin_wanted=1
-elif [ "$MEMORY_V2_CUTOVER" = "true" ]; then
-  memory_plugin_wanted=1
-  echo "memory-plugin: ⚠️  MEMORY_V2_CUTOVER is deprecated (#1747) — set MEMORY_PLUGIN_URL instead. Spawning sidecar on the implied default this boot." >&2
 fi
 if [ -z "$MEMORY_PLUGIN_DISABLE" ] && [ -n "$memory_plugin_wanted" ] && [ -n "$DATABASE_URL" ]; then
   # Schema isolation (issue #1733): when defaulting from the tenant

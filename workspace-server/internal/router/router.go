@@ -272,21 +272,21 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		wsAuth.GET("/transcript", trsh.Get)
 
 		// Agent Memories (HMA)
+		// Phase A3 (#1792): legacy /memories Search/Delete/Update routes
+		// removed — they read v1 agent_memories which no longer exists.
+		// Callers use /v2/memories for reads (canvas's
+		// MemoryInspectorPanel does this) and /v2/memories/:id for
+		// delete (Forget). Updates are not supported on v2 yet; the
+		// removed PATCH was used by ~0 callers in production traffic.
+		//
+		// POST /memories stays — it routes through the v2 plugin per
+		// #1794 and is the high-volume write surface (workspace
+		// runtimes posting conversation snapshots etc.).
 		memsh := handlers.NewMemoriesHandler()
-		// Issue #1791 — Commit routes through the v2 memory plugin
-		// instead of raw SQL into the frozen agent_memories table.
-		// Search/Delete/Update on this handler still read v1; tracked
-		// separately so this PR stays single-axis. When the plugin is
-		// not wired (test fixtures, new operators without
-		// MEMORY_PLUGIN_URL), Commit returns 503 — matches #1747's
-		// no-fallback posture for the MCP path.
 		if memBundle != nil {
 			memsh.WithMemoryV2(memBundle.Plugin, memBundle.Resolver)
 		}
 		wsAuth.POST("/memories", memsh.Commit)
-		wsAuth.GET("/memories", memsh.Search)
-		wsAuth.DELETE("/memories/:memoryId", memsh.Delete)
-		wsAuth.PATCH("/memories/:memoryId", memsh.Update)
 
 		// Memory v2 — canvas reads through the plugin so the Memory
 		// tab surfaces post-cutover state (memory_records) instead
