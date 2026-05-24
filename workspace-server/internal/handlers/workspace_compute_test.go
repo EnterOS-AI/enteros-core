@@ -139,6 +139,69 @@ func TestWorkspaceCreate_WithInvalidCompute_ReturnsBadRequest(t *testing.T) {
 	}
 }
 
+func TestWorkspaceUpdate_WithCompute_PersistsComputeJSONAndRequiresRestart(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
+	wsID := "00000000-0000-0000-0000-000000000123"
+
+	mock.ExpectQuery(`SELECT EXISTS\(SELECT 1 FROM workspaces WHERE id = \$1\)`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+	mock.ExpectExec(`UPDATE workspaces SET compute = \$2::jsonb, updated_at = now\(\) WHERE id = \$1`).
+		WithArgs(wsID, `{"display":{"height":1080,"mode":"desktop-control","protocol":"novnc","width":1920},"instance_type":"t3.xlarge","volume":{"root_gb":80}}`).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: wsID}}
+	body := `{
+		"compute":{
+			"instance_type":"t3.xlarge",
+			"volume":{"root_gb":80},
+			"display":{"mode":"desktop-control","protocol":"novnc","width":1920,"height":1080}
+		}
+	}`
+	c.Request = httptest.NewRequest("PATCH", "/workspaces/"+wsID, bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Update(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to parse response: %v", err)
+	}
+	if resp["needs_restart"] != true {
+		t.Fatalf("needs_restart = %v, want true", resp["needs_restart"])
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+func TestWorkspaceUpdate_WithInvalidCompute_ReturnsBadRequest(t *testing.T) {
+	setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
+	wsID := "00000000-0000-0000-0000-000000000124"
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: wsID}}
+	body := `{"compute":{"instance_type":"p4d.24xlarge"}}`
+	c.Request = httptest.NewRequest("PATCH", "/workspaces/"+wsID, bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Update(c)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
 func TestBuildProvisionerConfig_CopiesComputeSizingFromPayload(t *testing.T) {
 	mock := setupTestDB(t)
 	mock.ExpectQuery(`SELECT COALESCE\(workspace_dir`).

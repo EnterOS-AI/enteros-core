@@ -528,6 +528,7 @@ export function buildNodesAndEdges(
         // A2A delivery mode (task #227). Absent on older ws-server builds
         // — leave undefined so the chat UI's "?? 'push'" fallback applies.
         deliveryMode: ws.delivery_mode,
+        compute: ws.compute,
       },
     };
     if (hasParent) {

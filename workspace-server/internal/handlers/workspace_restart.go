@@ -272,28 +272,25 @@ func (h *WorkspaceHandler) Restart(c *gin.Context) {
 		return
 	}
 
+	// Read template from request body before consulting the existing
+	// config volume. apply_template means the caller just changed the
+	// runtime in the DB and wants the runtime-default template to be
+	// authoritative; in that case, reading the old container config would
+	// roll the DB runtime back before restart.
+	var body struct {
+		Template      string `json:"template"`
+		ApplyTemplate bool   `json:"apply_template"` // force re-apply runtime-default template (e.g. after runtime change)
+		Reset         bool   `json:"reset"`          // #12: discard claude-sessions volume before restart
+		RebuildConfig bool   `json:"rebuild_config"` // #239: re-render config volume from org-template source (recovery path when volume was destroyed)
+	}
+	c.ShouldBindJSON(&body)
+
 	// Read runtime from container's config.yaml before stopping. Docker-
 	// only: in SaaS mode the workspace runs on a remote EC2 and we can't
 	// exec into it, so we trust the DB value (user updates runtime via
 	// the Config tab which writes through to both the DB and the container).
 	containerRuntime := dbRuntime
-	if h.provisioner != nil {
-		containerName := configDirName(id) // ws-{id[:12]}
-		if cfgBytes, readErr := h.provisioner.ExecRead(ctx, containerName, "/configs/config.yaml"); readErr == nil {
-			for _, line := range strings.Split(string(cfgBytes), "\n") {
-				line = strings.TrimSpace(line)
-				if strings.HasPrefix(line, "runtime:") {
-					parsed := strings.TrimSpace(strings.TrimPrefix(line, "runtime:"))
-					if parsed != "" && parsed != containerRuntime {
-						log.Printf("Restart: runtime changed in config.yaml %q→%q for %s", containerRuntime, parsed, wsName)
-						containerRuntime = parsed
-						db.DB.ExecContext(ctx, `UPDATE workspaces SET runtime = $1 WHERE id = $2`, containerRuntime, id)
-					}
-					break
-				}
-			}
-		}
-	}
+	containerRuntime = h.restartRuntimeFromConfig(ctx, id, wsName, dbRuntime, body.ApplyTemplate)
 
 	// Reset to provisioning
 	db.DB.ExecContext(ctx,
@@ -303,15 +300,6 @@ func (h *WorkspaceHandler) Restart(c *gin.Context) {
 		"tier":    tier,
 		"runtime": containerRuntime,
 	})
-
-	// Read template from request body or try to find matching config
-	var body struct {
-		Template      string `json:"template"`
-		ApplyTemplate bool   `json:"apply_template"` // force re-apply runtime-default template (e.g. after runtime change)
-		Reset         bool   `json:"reset"`          // #12: discard claude-sessions volume before restart
-		RebuildConfig bool   `json:"rebuild_config"` // #239: re-render config volume from org-template source (recovery path when volume was destroyed)
-	}
-	c.ShouldBindJSON(&body)
 
 	templatePath, configLabel := resolveRestartTemplate(h.configsDir, wsName, dbRuntime, restartTemplateInput{
 		Template:      body.Template,
@@ -380,6 +368,29 @@ func (h *WorkspaceHandler) Restart(c *gin.Context) {
 	h.goAsync(func() { h.sendRestartContext(id, restartData) })
 
 	c.JSON(http.StatusOK, gin.H{"status": "provisioning", "config_dir": configLabel, "reset_session": resetClaudeSession})
+}
+
+func (h *WorkspaceHandler) restartRuntimeFromConfig(ctx context.Context, id, wsName, dbRuntime string, applyTemplate bool) string {
+	if h.provisioner == nil || applyTemplate {
+		return dbRuntime
+	}
+	containerRuntime := dbRuntime
+	containerName := configDirName(id) // ws-{id[:12]}
+	if cfgBytes, readErr := h.provisioner.ExecRead(ctx, containerName, "/configs/config.yaml"); readErr == nil {
+		for _, line := range strings.Split(string(cfgBytes), "\n") {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "runtime:") {
+				parsed := strings.TrimSpace(strings.TrimPrefix(line, "runtime:"))
+				if parsed != "" && parsed != containerRuntime {
+					log.Printf("Restart: runtime changed in config.yaml %q→%q for %s", containerRuntime, parsed, wsName)
+					containerRuntime = parsed
+					db.DB.ExecContext(ctx, `UPDATE workspaces SET runtime = $1 WHERE id = $2`, containerRuntime, id)
+				}
+				break
+			}
+		}
+	}
+	return containerRuntime
 }
 
 // Hibernate handles POST /workspaces/:id/hibernate

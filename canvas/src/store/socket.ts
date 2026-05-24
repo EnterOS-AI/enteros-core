@@ -354,6 +354,20 @@ export interface WorkspaceData {
    *  collapsing the spinner the moment the synchronous queued-200 returns
    *  (task #227 — external/MCP workspaces had no progress UX). */
   delivery_mode?: string;
+  compute?: WorkspaceCompute;
+}
+
+export interface WorkspaceCompute {
+  instance_type?: string;
+  volume?: {
+    root_gb?: number;
+  };
+  display?: {
+    mode?: string;
+    protocol?: string;
+    width?: number;
+    height?: number;
+  };
 }
 
 let socket: ReconnectingSocket | null = null;
