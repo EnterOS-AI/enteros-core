@@ -24,9 +24,10 @@
  * "no memories yet".
  */
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api } from '@/lib/api';
 import { ConfirmDialog } from '@/components/ConfirmDialog';
+import { useSocketEvent } from '@/hooks/useSocketEvent';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -245,6 +246,60 @@ export function MemoryInspectorPanel({ workspaceId }: Props) {
   useEffect(() => {
     loadEntries();
   }, [loadEntries]);
+
+  // Live-refresh on ACTIVITY_LOGGED events that look like memory writes
+  // for this workspace (#1734). Without this, the user sees a stale
+  // empty state after an agent commits — agent says "wrote memory",
+  // panel keeps showing nothing until they hit Refresh.
+  //
+  // What actually broadcasts ACTIVITY_LOGGED on the server today
+  // (workspace-server/internal/handlers/activity.go LogActivity /
+  // LogActivityTx — those are the only emitters):
+  //
+  //   - `memory_write_global`  — `POST /workspaces/:id/memories` for GLOBAL scope
+  //   - `memory_edit_global`   — `PATCH /workspaces/:id/memories/:id` for GLOBAL scope
+  //   - `memory_delete_global` — `DELETE /workspaces/:id/memories/:id` for GLOBAL scope
+  //   - `agent_log`            — generic catch-all an agent emits via
+  //                              `POST /workspaces/:id/activity`
+  //
+  // The MCP-tool path (`commit_memory`, `commit_memory_v2`,
+  // `commit_summary`) does NOT broadcast on the wire today; it inserts
+  // into agent_memories (pre-A1) or calls the v2 plugin (post-A1) and
+  // never round-trips through LogActivity. Server-side follow-up is
+  // tracked in **#1754** — once the MCP handlers emit `memory_write`
+  // via LogActivity, the `agent_log` arm of the filter below can be
+  // dropped. `memory_write` is included pre-emptively so this code
+  // lights up the moment #1754 lands. Until then, `agent_log` catches
+  // MCP commits over-inclusively; the 300ms debounce bounds the
+  // refetch rate. Issue #1734 review finding.
+  //
+  // The 300ms debounce coalesces bursts so a chatty agent (e.g. an
+  // agent in a long task emitting agent_log every few hundred ms)
+  // doesn't hammer /v2/memories on every keystroke-equivalent.
+  const refetchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => {
+    if (refetchTimerRef.current) clearTimeout(refetchTimerRef.current);
+  }, []);
+  useSocketEvent((msg) => {
+    if (msg.event !== 'ACTIVITY_LOGGED') return;
+    if (msg.workspace_id !== workspaceId) return;
+    const p = (msg.payload || {}) as Record<string, unknown>;
+    const activityType = (p.activity_type as string) || '';
+    switch (activityType) {
+      case 'memory_write':
+      case 'memory_write_global':
+      case 'memory_edit_global':
+      case 'memory_delete_global':
+      case 'agent_log':
+        break;
+      default:
+        return;
+    }
+    if (refetchTimerRef.current) clearTimeout(refetchTimerRef.current);
+    refetchTimerRef.current = setTimeout(() => {
+      loadEntries();
+    }, 300);
+  });
 
   // ── Delete handlers ─────────────────────────────────────────────────────────
 

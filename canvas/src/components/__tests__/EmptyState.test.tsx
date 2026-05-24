@@ -16,7 +16,7 @@
  *   - handleDeployed fires after 500ms delay
  *
  * Uses vi.hoisted + vi.mock to fully isolate the api module, matching
- * the pattern established in ApprovalBanner, MemoryTab, and ScheduleTab tests.
+ * the pattern established in ApprovalBanner and ScheduleTab tests.
  */
 import React from "react";
 import { render, screen, fireEvent, cleanup, act } from "@testing-library/react";

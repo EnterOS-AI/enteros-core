@@ -31,6 +31,17 @@ vi.mock('@/lib/api', () => ({
   },
 }));
 
+// Capture the socket-event handler the panel registers so individual
+// tests can replay an ACTIVITY_LOGGED message without spinning up a
+// real WebSocket. One handler at a time is fine — the panel mounts
+// exactly one useSocketEvent subscriber.
+let __socketHandler: ((msg: unknown) => void) | null = null;
+vi.mock('@/hooks/useSocketEvent', () => ({
+  useSocketEvent: (handler: (msg: unknown) => void) => {
+    __socketHandler = handler;
+  },
+}));
+
 vi.mock('@/components/ConfirmDialog', () => ({
   ConfirmDialog: ({
     open,
@@ -514,5 +525,158 @@ describe('MemoryInspectorPanel — refresh', () => {
       ).length;
       expect(after).toBe(before + 1);
     });
+  });
+});
+
+// Live-refresh subscription wired in #1734 so the panel reacts to
+// ACTIVITY_LOGGED events for memory writes on this workspace without
+// the user clicking Refresh. The hook is mocked at the top of the
+// file to capture the registered handler in __socketHandler.
+describe('MemoryInspectorPanel — live refresh on activity', () => {
+  it('refetches memories when ACTIVITY_LOGGED arrives with activity_type=memory_write for the same workspace', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    stubFetch([MEM_BASIC]);
+    render(<MemoryInspectorPanel workspaceId="ws-1" />);
+    await waitFor(() => screen.getByLabelText('Refresh memories'));
+    expect(__socketHandler).toBeTruthy();
+
+    const before = mockGet.mock.calls.filter((c) =>
+      (c[0] as string).includes('/v2/memories'),
+    ).length;
+
+    __socketHandler!({
+      event: 'ACTIVITY_LOGGED',
+      workspace_id: 'ws-1',
+      payload: { activity_type: 'memory_write' },
+    });
+
+    // 300ms debounce inside the panel — advance the fake timer so the
+    // queued refetch fires.
+    await vi.advanceTimersByTimeAsync(350);
+
+    await waitFor(() => {
+      const after = mockGet.mock.calls.filter((c) =>
+        (c[0] as string).includes('/v2/memories'),
+      ).length;
+      expect(after).toBe(before + 1);
+    });
+    vi.useRealTimers();
+  });
+
+  it('ignores ACTIVITY_LOGGED events from other workspaces', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    stubFetch([MEM_BASIC]);
+    render(<MemoryInspectorPanel workspaceId="ws-1" />);
+    await waitFor(() => screen.getByLabelText('Refresh memories'));
+
+    const before = mockGet.mock.calls.filter((c) =>
+      (c[0] as string).includes('/v2/memories'),
+    ).length;
+
+    __socketHandler!({
+      event: 'ACTIVITY_LOGGED',
+      workspace_id: 'ws-OTHER',
+      payload: { activity_type: 'memory_write' },
+    });
+
+    await vi.advanceTimersByTimeAsync(500);
+
+    const after = mockGet.mock.calls.filter((c) =>
+      (c[0] as string).includes('/v2/memories'),
+    ).length;
+    expect(after).toBe(before);
+    vi.useRealTimers();
+  });
+
+  it('ignores activity types that are not memory-related', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    stubFetch([MEM_BASIC]);
+    render(<MemoryInspectorPanel workspaceId="ws-1" />);
+    await waitFor(() => screen.getByLabelText('Refresh memories'));
+
+    const before = mockGet.mock.calls.filter((c) =>
+      (c[0] as string).includes('/v2/memories'),
+    ).length;
+
+    __socketHandler!({
+      event: 'ACTIVITY_LOGGED',
+      workspace_id: 'ws-1',
+      payload: { activity_type: 'a2a_send' },
+    });
+
+    await vi.advanceTimersByTimeAsync(500);
+
+    const after = mockGet.mock.calls.filter((c) =>
+      (c[0] as string).includes('/v2/memories'),
+    ).length;
+    expect(after).toBe(before);
+    vi.useRealTimers();
+  });
+
+  // Server-side emitters confirmed via grep of workspace-server/internal/handlers
+  // are `memory_write_global`, `memory_edit_global`, `memory_delete_global`
+  // (memories.go `LogActivity` calls for GLOBAL-scope writes). Pin each
+  // so a future filter narrow-down can't silently drop one and let the
+  // panel go stale on its actual production trigger.
+  it.each([
+    'memory_write',          // pre-emptive: not yet emitted by server, see component comment
+    'memory_write_global',   // memories.go:218 (Commit)
+    'memory_edit_global',    // memories.go:617 (Update)
+    'memory_delete_global',  // memories.go (Delete) — paired with the above two
+    'agent_log',             // generic catch-all
+  ])('refetches on activity_type=%s', async (activityType) => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    stubFetch([MEM_BASIC]);
+    render(<MemoryInspectorPanel workspaceId="ws-1" />);
+    await waitFor(() => screen.getByLabelText('Refresh memories'));
+
+    const before = mockGet.mock.calls.filter((c) =>
+      (c[0] as string).includes('/v2/memories'),
+    ).length;
+
+    __socketHandler!({
+      event: 'ACTIVITY_LOGGED',
+      workspace_id: 'ws-1',
+      payload: { activity_type: activityType },
+    });
+
+    await vi.advanceTimersByTimeAsync(350);
+
+    await waitFor(() => {
+      const after = mockGet.mock.calls.filter((c) =>
+        (c[0] as string).includes('/v2/memories'),
+      ).length;
+      expect(after).toBe(before + 1);
+    });
+    vi.useRealTimers();
+  });
+
+  it('coalesces a burst of memory_write events into one refetch', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    stubFetch([MEM_BASIC]);
+    render(<MemoryInspectorPanel workspaceId="ws-1" />);
+    await waitFor(() => screen.getByLabelText('Refresh memories'));
+
+    const before = mockGet.mock.calls.filter((c) =>
+      (c[0] as string).includes('/v2/memories'),
+    ).length;
+
+    for (let i = 0; i < 5; i++) {
+      __socketHandler!({
+        event: 'ACTIVITY_LOGGED',
+        workspace_id: 'ws-1',
+        payload: { activity_type: 'memory_write' },
+      });
+    }
+
+    await vi.advanceTimersByTimeAsync(350);
+
+    await waitFor(() => {
+      const after = mockGet.mock.calls.filter((c) =>
+        (c[0] as string).includes('/v2/memories'),
+      ).length;
+      expect(after).toBe(before + 1);
+    });
+    vi.useRealTimers();
   });
 });
