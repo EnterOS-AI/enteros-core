@@ -5,17 +5,21 @@ package handlers
 
 import (
 	"context"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"log"
 	"net/http"
+	"os"
 	"strconv"
 	"time"
 
 	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
 	"github.com/Molecule-AI/molecule-monorepo/platform/internal/events"
+	"github.com/Molecule-AI/molecule-monorepo/platform/internal/middleware"
 	"github.com/Molecule-AI/molecule-monorepo/platform/internal/models"
+	"github.com/Molecule-AI/molecule-monorepo/platform/internal/orgtoken"
 	"github.com/Molecule-AI/molecule-monorepo/platform/internal/wsauth"
 	"github.com/gin-gonic/gin"
 )
@@ -419,31 +423,53 @@ func nilIfEmpty(s string) *string {
 // (their next /registry/register will mint their first token, after
 // which this branch never fires again for them).
 //
+// Post-RFC#637 addition: when the tokenless workspace is accompanied by
+// canvas or admin auth (same-origin request, admin bearer, or org-level
+// token), the caller is identified as a canvas-user identity rather than
+// a legacy peer agent. The returned isCanvasUser flag lets the A2A proxy
+// bypass CanCommunicate for human users, who sit outside the workspace
+// hierarchy.
+//
 // On auth failure this writes the 401 via c and returns an error so the
 // handler aborts without running the proxy.
-func validateCallerToken(ctx context.Context, c *gin.Context, callerID string) error {
-	hasLive, err := wsauth.HasAnyLiveToken(ctx, db.DB, callerID)
-	if err != nil {
+func validateCallerToken(ctx context.Context, c *gin.Context, callerID string) (isCanvasUser bool, err error) {
+	hasLive, dbErr := wsauth.HasAnyLiveToken(ctx, db.DB, callerID)
+	if dbErr != nil {
 		// Fail-open here matches the heartbeat path — A2A caller auth is
 		// defense-in-depth on top of access-control hierarchy, not the
 		// sole gate on the secret material. A DB hiccup shouldn't take
 		// the whole A2A path down.
-		log.Printf("wsauth: caller HasAnyLiveToken(%s) failed: %v — allowing A2A", callerID, err)
-		return nil
+		log.Printf("wsauth: caller HasAnyLiveToken(%s) failed: %v — allowing A2A", callerID, dbErr)
+		return false, nil
 	}
 	if !hasLive {
-		return nil // legacy / pre-upgrade caller
+		// Tokenless workspace — could be legacy/pre-upgrade caller or
+		// canvas-user identity. Distinguish by request auth signals.
+		if middleware.IsSameOriginCanvas(c) {
+			return true, nil
+		}
+		tok := wsauth.BearerTokenFromHeader(c.GetHeader("Authorization"))
+		if tok != "" {
+			adminSecret := os.Getenv("ADMIN_TOKEN")
+			if adminSecret != "" && subtle.ConstantTimeCompare([]byte(tok), []byte(adminSecret)) == 1 {
+				return true, nil
+			}
+			if _, _, _, err := orgtoken.Validate(ctx, db.DB, tok); err == nil {
+				return true, nil
+			}
+		}
+		return false, nil // legacy / pre-upgrade caller
 	}
 	tok := wsauth.BearerTokenFromHeader(c.GetHeader("Authorization"))
 	if tok == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing caller auth token"})
-		return errInvalidCallerToken
+		return false, errInvalidCallerToken
 	}
 	if err := wsauth.ValidateToken(ctx, db.DB, callerID, tok); err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid caller auth token"})
-		return err
+		return false, err
 	}
-	return nil
+	return false, nil
 }
 
 // errInvalidCallerToken is a sentinel for validateCallerToken's "missing

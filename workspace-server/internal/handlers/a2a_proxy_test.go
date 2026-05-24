@@ -1112,8 +1112,12 @@ func TestValidateCallerToken_LegacyCallerGrandfathered(t *testing.T) {
 	c, _ := gin.CreateTestContext(w)
 	c.Request = httptest.NewRequest("POST", "/workspaces/x/a2a", bytes.NewBufferString("{}"))
 
-	if err := validateCallerToken(context.Background(), c, "ws-legacy"); err != nil {
+	isCanvasUser, err := validateCallerToken(context.Background(), c, "ws-legacy")
+	if err != nil {
 		t.Errorf("legacy caller should grandfather through; got %v", err)
+	}
+	if isCanvasUser {
+		t.Errorf("legacy caller should NOT be identified as canvas user")
 	}
 	if w.Code != 200 {
 		// gin default before c.JSON is 200; we want no error response written
@@ -1136,9 +1140,12 @@ func TestValidateCallerToken_MissingTokenWhenOnFile(t *testing.T) {
 	c.Request = httptest.NewRequest("POST", "/workspaces/x/a2a", bytes.NewBufferString("{}"))
 	// No Authorization header set
 
-	err := validateCallerToken(context.Background(), c, "ws-authed")
+	isCanvasUser, err := validateCallerToken(context.Background(), c, "ws-authed")
 	if err == nil {
 		t.Fatal("expected error for missing token")
+	}
+	if isCanvasUser {
+		t.Errorf("authed workspace with missing token should NOT be canvas user")
 	}
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("expected 401, got %d", w.Code)
@@ -1164,8 +1171,12 @@ func TestValidateCallerToken_InvalidToken(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer wrong")
 	c.Request = req
 
-	if err := validateCallerToken(context.Background(), c, "ws-authed"); err == nil {
+	isCanvasUser, err := validateCallerToken(context.Background(), c, "ws-authed")
+	if err == nil {
 		t.Fatal("expected error for bad token")
+	}
+	if isCanvasUser {
+		t.Errorf("authed workspace with bad token should NOT be canvas user")
 	}
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("expected 401, got %d", w.Code)
@@ -1192,8 +1203,12 @@ func TestValidateCallerToken_ValidToken(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer goodtok")
 	c.Request = req
 
-	if err := validateCallerToken(context.Background(), c, "ws-authed"); err != nil {
+	isCanvasUser, err := validateCallerToken(context.Background(), c, "ws-authed")
+	if err != nil {
 		t.Errorf("valid token should pass; got %v", err)
+	}
+	if isCanvasUser {
+		t.Errorf("authed workspace with valid token should NOT be canvas user")
 	}
 }
 
@@ -1216,11 +1231,83 @@ func TestValidateCallerToken_WrongWorkspaceBindingRejected(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer tok-for-A")
 	c.Request = req
 
-	if err := validateCallerToken(context.Background(), c, "ws-b-attacker"); err == nil {
+	isCanvasUser, err := validateCallerToken(context.Background(), c, "ws-b-attacker")
+	if err == nil {
 		t.Fatal("token from A must not authenticate caller B")
+	}
+	if isCanvasUser {
+		t.Errorf("cross-workspace token replay should NOT be identified as canvas user")
 	}
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("expected 401, got %d", w.Code)
+	}
+}
+
+func TestValidateCallerToken_CanvasUser_AdminToken(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+
+	// Tokenless workspace
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM workspace_auth_tokens`).
+		WithArgs("ws-canvas-admin").
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+
+	t.Setenv("ADMIN_TOKEN", "admin-secret-42")
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	req := httptest.NewRequest("POST", "/workspaces/x/a2a", bytes.NewBufferString("{}"))
+	req.Header.Set("Authorization", "Bearer admin-secret-42")
+	c.Request = req
+
+	isCanvasUser, err := validateCallerToken(context.Background(), c, "ws-canvas-admin")
+	if err != nil {
+		t.Errorf("admin token should identify canvas user; got error: %v", err)
+	}
+	if !isCanvasUser {
+		t.Errorf("admin token bearer should be identified as canvas user")
+	}
+	if w.Code != 200 || w.Body.Len() != 0 {
+		t.Errorf("admin token path should not write a response body; got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestValidateCallerToken_CanvasUser_OrgToken(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+
+	// Tokenless workspace
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM workspace_auth_tokens`).
+		WithArgs("ws-canvas-org").
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+
+	// orgtoken.Validate lookup
+	mock.ExpectQuery(`SELECT id, prefix, org_id FROM org_api_tokens WHERE token_hash = .* AND revoked_at IS NULL`).
+		WithArgs(sqlmock.AnyArg()).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "prefix", "org_id"}).AddRow("orgtok-1", "pref1234", "org-1"))
+	mock.ExpectExec(`UPDATE org_api_tokens SET last_used_at`).
+		WithArgs("orgtok-1").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	req := httptest.NewRequest("POST", "/workspaces/x/a2a", bytes.NewBufferString("{}"))
+	req.Header.Set("Authorization", "Bearer org-token-plaintext-xyz")
+	c.Request = req
+
+	isCanvasUser, err := validateCallerToken(context.Background(), c, "ws-canvas-org")
+	if err != nil {
+		t.Errorf("org token should identify canvas user; got error: %v", err)
+	}
+	if !isCanvasUser {
+		t.Errorf("org token bearer should be identified as canvas user")
+	}
+	if w.Code != 200 || w.Body.Len() != 0 {
+		t.Errorf("org token path should not write a response body; got %d: %s", w.Code, w.Body.String())
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
 	}
 }
 

@@ -229,7 +229,7 @@ func (e *proxyA2AError) Error() string {
 // cron scheduler and other internal callers that need to send A2A messages
 // to workspaces programmatically (not from an HTTP handler).
 func (h *WorkspaceHandler) ProxyA2ARequest(ctx context.Context, workspaceID string, body []byte, callerID string, logActivity bool) (int, []byte, error) {
-	status, resp, proxyErr := h.proxyA2ARequest(ctx, workspaceID, body, callerID, logActivity)
+	status, resp, proxyErr := h.proxyA2ARequest(ctx, workspaceID, body, callerID, logActivity, false)
 	if proxyErr != nil {
 		return status, resp, proxyErr
 	}
@@ -308,13 +308,21 @@ func (h *WorkspaceHandler) ProxyA2A(c *gin.Context) {
 	// The bind is strict: the token must match `callerID`, not
 	// `workspaceID` (the target). A compromised token from workspace A
 	// must never authenticate calls from A pretending to be B.
-	if callerID != "" && callerID != workspaceID {
-		if err := validateCallerToken(ctx, c, callerID); err != nil {
+	//
+	// Post-RFC#637: canvas users now send X-Workspace-ID (their identity
+	// workspace). validateCallerToken detects canvas/admin auth on a
+	// tokenless workspace and returns isCanvasUser=true so the proxy can
+	// bypass CanCommunicate (human users sit outside the hierarchy).
+	isCanvasUser := false
+	if callerID != "" && callerID != workspaceID && !isSystemCaller(callerID) {
+		var err error
+		isCanvasUser, err = validateCallerToken(ctx, c, callerID)
+		if err != nil {
 			return // response already written with 401
 		}
 	}
 
-	status, respBody, proxyErr := h.proxyA2ARequest(ctx, workspaceID, body, callerID, true)
+	status, respBody, proxyErr := h.proxyA2ARequest(ctx, workspaceID, body, callerID, true, isCanvasUser)
 	if proxyErr != nil {
 		for k, v := range proxyErr.Headers {
 			c.Header(k, v)
@@ -353,11 +361,13 @@ func (h *WorkspaceHandler) checkWorkspaceBudget(ctx context.Context, workspaceID
 	return nil
 }
 
-func (h *WorkspaceHandler) proxyA2ARequest(ctx context.Context, workspaceID string, body []byte, callerID string, logActivity bool) (int, []byte, *proxyA2AError) {
+func (h *WorkspaceHandler) proxyA2ARequest(ctx context.Context, workspaceID string, body []byte, callerID string, logActivity bool, isCanvasUser bool) (int, []byte, *proxyA2AError) {
 	// Access control: workspace-to-workspace requests must pass CanCommunicate check.
 	// Canvas requests (callerID == "") and system callers (webhook:*, system:*, test:*)
 	// are trusted. Self-calls (callerID == workspaceID) are always allowed.
-	if callerID != "" && callerID != workspaceID && !isSystemCaller(callerID) {
+	// Post-RFC#637: canvas-user identity workspaces also bypass CanCommunicate
+	// because human users sit outside the org hierarchy.
+	if callerID != "" && callerID != workspaceID && !isSystemCaller(callerID) && !isCanvasUser {
 		if !registry.CanCommunicate(callerID, workspaceID) {
 			log.Printf("ProxyA2A: access denied %s → %s", callerID, workspaceID)
 			return 0, nil, &proxyA2AError{
