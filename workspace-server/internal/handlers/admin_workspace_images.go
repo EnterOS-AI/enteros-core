@@ -44,8 +44,7 @@ func NewWorkspaceImageService(docker *dockerclient.Client) *WorkspaceImageServic
 // AllRuntimes is the canonical list mirroring docs/workspace-runtime-package.md.
 // Update both when a new template is added.
 var AllRuntimes = []string{
-	"claude-code", "langgraph", "autogen",
-	"hermes", "openclaw",
+	"claude-code", "codex", "hermes", "openclaw",
 }
 
 // RefreshResult is the per-call outcome surfaced to HTTP callers AND logged
