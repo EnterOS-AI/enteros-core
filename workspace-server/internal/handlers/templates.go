@@ -204,9 +204,18 @@ func (h *TemplatesHandler) List(c *gin.Context) {
 			return
 		}
 		runtime := strings.TrimSuffix(strings.TrimSpace(raw.Runtime), "-default")
-		if _, ok := knownRuntimes[runtime]; !ok {
-			log.Printf("templates list: skip %s: unsupported runtime %q", id, raw.Runtime)
-			return
+		// Empty runtime is the legacy / pre-runtime_config shape: those
+		// templates declare `model:` at the top level and never set
+		// runtime. TestTemplatesList_LegacyTopLevelModel pins the
+		// backward-compat contract that they keep surfacing. The
+		// narrow-catalog filter (a5211050) applies only when a runtime
+		// is declared — declared runtimes must be in the allowlist;
+		// absent ones fall through unchanged.
+		if runtime != "" {
+			if _, ok := knownRuntimes[runtime]; !ok {
+				log.Printf("templates list: skip %s: unsupported runtime %q", id, raw.Runtime)
+				return
+			}
 		}
 
 		// Model comes from either top-level (legacy) or runtime_config.model (current).
