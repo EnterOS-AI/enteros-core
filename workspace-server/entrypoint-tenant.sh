@@ -47,7 +47,33 @@ elif [ "$MEMORY_V2_CUTOVER" = "true" ]; then
   echo "memory-plugin: ⚠️  MEMORY_V2_CUTOVER is deprecated (#1747) — set MEMORY_PLUGIN_URL instead. Spawning sidecar on the implied default this boot." >&2
 fi
 if [ -z "$MEMORY_PLUGIN_DISABLE" ] && [ -n "$memory_plugin_wanted" ] && [ -n "$DATABASE_URL" ]; then
-  : "${MEMORY_PLUGIN_DATABASE_URL:=$DATABASE_URL}"
+  # Schema isolation (issue #1733): when defaulting from the tenant
+  # DATABASE_URL we co-locate the plugin's tables under a dedicated
+  # `memory_plugin` schema so they never collide with platform-tenant
+  # tables in `public`. The plugin's 000_schema_bootstrap migration
+  # creates the schema; search_path here directs every subsequent CREATE
+  # TABLE / SELECT to land in it.
+  #
+  # The search_path includes `public` as a fallback so the `vector` type
+  # resolves regardless of which schema pgvector was installed into.
+  # Fresh tenants (no prior `CREATE EXTENSION vector`) install the
+  # extension into `memory_plugin` (first writable schema in the path),
+  # keeping the SSOT intent. Tenants where pgvector was already
+  # installed into `public` by a prior boot or operator action keep the
+  # extension where it is and resolve `vector(1536)` via the public
+  # fallback — without this fallback those tenants would crash the
+  # plugin boot with "type vector does not exist" once the migrations
+  # try to create memory_records (#1742 review finding).
+  #
+  # Operators who explicitly set MEMORY_PLUGIN_DATABASE_URL (separate DB
+  # entirely) keep full control — search_path is only injected when we
+  # default from DATABASE_URL.
+  if [ -z "$MEMORY_PLUGIN_DATABASE_URL" ]; then
+    case "$DATABASE_URL" in
+      *\?*) MEMORY_PLUGIN_DATABASE_URL="${DATABASE_URL}&search_path=memory_plugin,public" ;;
+      *)    MEMORY_PLUGIN_DATABASE_URL="${DATABASE_URL}?search_path=memory_plugin,public" ;;
+    esac
+  fi
   : "${MEMORY_PLUGIN_LISTEN_ADDR:=:9100}"
   export MEMORY_PLUGIN_DATABASE_URL MEMORY_PLUGIN_LISTEN_ADDR
   echo "memory-plugin: starting sidecar on $MEMORY_PLUGIN_LISTEN_ADDR" >&2
