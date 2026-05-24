@@ -1,3 +1,6 @@
+//go:build integration
+// +build integration
+
 package handlers
 
 import (
@@ -6,6 +9,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 
 	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
@@ -16,22 +20,31 @@ import (
 
 func init() { gin.SetMode(gin.TestMode) }
 
-// setupTokenTestDB creates an in-memory SQLite-like test or returns early
-// if the real Postgres test DB is available. For unit tests we use the
-// package-level db.DB which handlers rely on.
+// setupTokenTestDB connects to $INTEGRATION_DB_URL (skipping the test if
+// unset), sets the package-global db.DB for the duration of the test, and
+// returns a cleanup func that restores the previous db.DB value.
 func setupTokenTestDB(t *testing.T) func() {
 	t.Helper()
-	if db.DB == nil {
-		t.Skip("db.DB not initialised — run with a test database")
+	url := os.Getenv("INTEGRATION_DB_URL")
+	if url == "" {
+		t.Skip("INTEGRATION_DB_URL not set; skipping (local devs: start a Postgres container and export INTEGRATION_DB_URL)")
 	}
-	// Quick probe — if the DB is closed or unreachable, skip.
-	if err := db.DB.Ping(); err != nil {
-		t.Skipf("db.DB not reachable: %v", err)
+	conn, err := sql.Open("postgres", url)
+	if err != nil {
+		t.Fatalf("open integration DB: %v", err)
 	}
-	return func() {}
+	if err := conn.Ping(); err != nil {
+		t.Fatalf("ping integration DB: %v", err)
+	}
+	prevDB := db.DB
+	db.DB = conn
+	return func() {
+		db.DB = prevDB
+		conn.Close()
+	}
 }
 
-func TestTokenHandler_CreateAndList(t *testing.T) {
+func TestIntegration_TokenHandler_CreateAndList(t *testing.T) {
 	cleanup := setupTokenTestDB(t)
 	defer cleanup()
 
@@ -94,7 +107,7 @@ func TestTokenHandler_CreateAndList(t *testing.T) {
 	}
 }
 
-func TestTokenHandler_Revoke(t *testing.T) {
+func TestIntegration_TokenHandler_Revoke(t *testing.T) {
 	cleanup := setupTokenTestDB(t)
 	defer cleanup()
 
@@ -151,7 +164,7 @@ func TestTokenHandler_Revoke(t *testing.T) {
 	}
 }
 
-func TestTokenHandler_RevokeWrongWorkspace(t *testing.T) {
+func TestIntegration_TokenHandler_RevokeWrongWorkspace(t *testing.T) {
 	cleanup := setupTokenTestDB(t)
 	defer cleanup()
 
