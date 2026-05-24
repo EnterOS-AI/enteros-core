@@ -289,8 +289,7 @@ func (h *WorkspaceHandler) Restart(c *gin.Context) {
 	// only: in SaaS mode the workspace runs on a remote EC2 and we can't
 	// exec into it, so we trust the DB value (user updates runtime via
 	// the Config tab which writes through to both the DB and the container).
-	containerRuntime := dbRuntime
-	containerRuntime = h.restartRuntimeFromConfig(ctx, id, wsName, dbRuntime, body.ApplyTemplate)
+	containerRuntime := h.restartRuntimeFromConfig(ctx, id, wsName, dbRuntime, body.ApplyTemplate)
 
 	// Reset to provisioning
 	db.DB.ExecContext(ctx,
