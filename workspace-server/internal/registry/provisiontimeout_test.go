@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/models"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
 )
 
 // fakeEmitter records every RecordAndBroadcast call so tests can assert

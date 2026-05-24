@@ -18,7 +18,7 @@ import (
 
 	"github.com/lib/pq"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/memory/contract"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/memory/contract"
 )
 
 // ErrNotFound is the typed sentinel for "namespace or memory not

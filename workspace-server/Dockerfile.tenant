@@ -63,7 +63,7 @@ ARG GIT_SHA=dev
 # Mirrors the pattern already in molecule-controlplane/Dockerfile.
 RUN CGO_ENABLED=0 GOOS=linux go build \
     -trimpath \
-    -ldflags "-s -w -X github.com/Molecule-AI/molecule-monorepo/platform/internal/buildinfo.GitSHA=${GIT_SHA}" \
+    -ldflags "-s -w -X git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/buildinfo.GitSHA=${GIT_SHA}" \
     -o /platform ./cmd/server
 # Memory v2 sidecar binary (Memory v2 #2728). Bundled so an operator
 # can activate cutover by flipping MEMORY_V2_CUTOVER=true without
@@ -71,7 +71,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
 # launch logic.
 RUN CGO_ENABLED=0 GOOS=linux go build \
     -trimpath \
-    -ldflags "-s -w -X github.com/Molecule-AI/molecule-monorepo/platform/internal/buildinfo.GitSHA=${GIT_SHA}" \
+    -ldflags "-s -w -X git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/buildinfo.GitSHA=${GIT_SHA}" \
     -o /memory-plugin ./cmd/memory-plugin-postgres
 
 # Phase A2 memory-backfill CLI was bundled here briefly (#1796) to

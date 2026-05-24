@@ -4,7 +4,7 @@ import (
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 )
 
 // setupRouterTestDB initialises db.DB with a sqlmock connection and returns

@@ -4,9 +4,9 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/bundle"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/events"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/provisioner"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/bundle"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
 	"github.com/docker/docker/client"
 	"github.com/gin-gonic/gin"
 )

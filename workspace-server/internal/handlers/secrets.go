@@ -7,10 +7,10 @@ import (
 	"net/http"
 	"regexp"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/audit"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/crypto"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/wsauth"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/audit"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/crypto"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wsauth"
 	"github.com/gin-gonic/gin"
 )
 

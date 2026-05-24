@@ -15,8 +15,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/provlog"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provlog"
 )
 
 // CPProvisionerAPI is the contract WorkspaceHandler uses to talk to the

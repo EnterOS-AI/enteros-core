@@ -4,8 +4,8 @@ import (
 	"log"
 	"net/http"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/orgtoken"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/orgtoken"
 	"github.com/gin-gonic/gin"
 )
 

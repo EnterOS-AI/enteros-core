@@ -17,8 +17,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/channels"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/channels"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 )
 
 // ChannelHandler manages workspace social channel integrations.

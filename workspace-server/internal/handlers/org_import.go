@@ -17,14 +17,14 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/channels"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/crypto"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/events"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/models"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/provisioner"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/provlog"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/scheduler"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/channels"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/crypto"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provlog"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/scheduler"
 	"github.com/google/uuid"
 )
 

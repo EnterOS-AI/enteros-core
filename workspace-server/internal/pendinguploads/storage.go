@@ -37,7 +37,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/uploads"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/uploads"
 	"github.com/google/uuid"
 )
 

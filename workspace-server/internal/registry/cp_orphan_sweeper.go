@@ -41,7 +41,7 @@ import (
 	"log"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 )
 
 // CPOrphanReaper is the dependency the SaaS-mode sweeper takes from

@@ -43,7 +43,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/provisioner"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
 )
 
 // scriptedCPStop returns a fakeCPStop that returns errs[i] on call i, then

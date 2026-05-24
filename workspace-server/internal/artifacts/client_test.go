@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/artifacts"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/artifacts"
 )
 
 // cfEnvelope wraps a result value in the Cloudflare v4 response envelope.

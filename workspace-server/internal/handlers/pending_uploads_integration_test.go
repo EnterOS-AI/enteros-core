@@ -51,7 +51,7 @@ import (
 	"github.com/google/uuid"
 	_ "github.com/lib/pq"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/pendinguploads"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/pendinguploads"
 )
 
 // integrationDB_PendingUploads opens a connection from $INTEGRATION_DB_URL

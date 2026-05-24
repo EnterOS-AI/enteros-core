@@ -2,7 +2,7 @@
 //
 // Set at link time:
 //
-//	go build -ldflags "-X github.com/Molecule-AI/molecule-monorepo/platform/internal/buildinfo.GitSHA=<sha>"
+//	go build -ldflags "-X git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/buildinfo.GitSHA=<sha>"
 //
 // CI passes ${{ github.sha }} via Dockerfile.tenant ARG GIT_SHA; local
 // dev builds default to "dev" so unset never reads as success.

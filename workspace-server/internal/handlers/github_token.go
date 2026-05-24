@@ -51,7 +51,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/pkg/provisionhook"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/pkg/provisionhook"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 )

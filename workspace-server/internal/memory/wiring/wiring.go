@@ -21,8 +21,8 @@ import (
 	"os"
 	"time"
 
-	mclient "github.com/Molecule-AI/molecule-monorepo/platform/internal/memory/client"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/memory/namespace"
+	mclient "git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/memory/client"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/memory/namespace"
 )
 
 // Bundle is the v2 dependency bundle. Pass it through Setup as a

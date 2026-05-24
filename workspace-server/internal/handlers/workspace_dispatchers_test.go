@@ -6,7 +6,7 @@ import (
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/models"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
 )
 
 // ==================== resolveDeliveryMode ====================

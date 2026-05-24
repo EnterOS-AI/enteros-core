@@ -10,7 +10,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/scheduler"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/scheduler"
 )
 
 func TestOrgDefaults_InitialPrompt_YAMLParsing(t *testing.T) {

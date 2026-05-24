@@ -14,7 +14,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 )
 
 // trackedRefValues is the closed set of bare-string values the

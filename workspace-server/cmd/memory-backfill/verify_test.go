@@ -9,7 +9,7 @@ import (
 
 	"github.com/DATA-DOG/go-sqlmock"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/memory/contract"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/memory/contract"
 )
 
 // stubVerifyPlugin records search calls and returns canned results.

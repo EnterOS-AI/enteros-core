@@ -43,8 +43,8 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/events"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/textutil"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/textutil"
 )
 
 // ErrWorkspaceNotFound is returned by AgentMessageWriter.Send when the

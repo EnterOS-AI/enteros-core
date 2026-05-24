@@ -9,8 +9,8 @@ import (
 	"os"
 	"strings"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/orgtoken"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/wsauth"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/orgtoken"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wsauth"
 	"github.com/gin-gonic/gin"
 )
 

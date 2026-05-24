@@ -33,7 +33,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/events"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
 	"github.com/gin-gonic/gin"
 )
 

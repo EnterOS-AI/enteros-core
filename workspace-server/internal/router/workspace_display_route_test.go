@@ -6,9 +6,9 @@ import (
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/handlers"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/middleware"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/handlers"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/middleware"
 	"github.com/gin-gonic/gin"
 )
 

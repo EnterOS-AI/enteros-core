@@ -22,7 +22,7 @@ import (
 	"testing"
 
 	sqlmock "github.com/DATA-DOG/go-sqlmock"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/middleware"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/middleware"
 	"github.com/gin-gonic/gin"
 )
 
