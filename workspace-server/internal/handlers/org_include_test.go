@@ -2,12 +2,23 @@ package handlers
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
 )
+
+// runCmd wraps exec.Command for convenience in tests.
+func runCmd(name string, args ...string) (exitCode int, stdout, stderr string) {
+	cmd := exec.Command(name, args...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return -1, string(out), err.Error()
+	}
+	return 0, string(out), ""
+}
 
 // resolveYAMLIncludes is the preprocessor Phase 3 uses to split org.yaml
 // into per-team / per-role files. These tests cover the happy path,
@@ -191,31 +202,28 @@ func TestResolveYAMLIncludes_SiblingDirAccess(t *testing.T) {
 // resolves cleanly via !include and unmarshal into OrgTemplate produces
 // the full workspace tree. Guards against split regressions landing on
 // main before they can be caught by a deploy.
+//
+// Previously skipped because /org-templates/molecule-dev/ was a stale
+// in-tree copy with a broken !include graph. The extraction completed
+// and the canonical copy now lives at molecule-ai/molecule-ai-org-template-
+// molecule-dev. This test fetches it via HTTPS (no token needed — the repo
+// is public) to exercise the real include resolution on every CI run.
 func TestResolveYAMLIncludes_RealMoleculeDev(t *testing.T) {
-	// The in-tree copy at /org-templates/molecule-dev/ is being removed
-	// in favor of the standalone Molecule-AI/molecule-ai-org-template-
-	// molecule-dev repo (see .gitignore comment). Until that removal
-	// lands, the in-tree copy is stale and its !include graph is broken
-	// (teams/dev.yaml references missing core-platform.yaml etc.), so
-	// this integration test is skipped. Re-enable once the extraction
-	// PR lands and this test is rewritten to fetch the standalone repo
-	// or replaced with a self-contained fixture.
-	t.Skip("org-templates/molecule-dev is being extracted to a standalone repo; see .gitignore comment")
-
-	// Locate the monorepo root from the test file location.
-	// Test runs in platform/internal/handlers/; org template is at
-	// ../../../org-templates/molecule-dev/org.yaml.
-	here, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("getwd: %v", err)
+	tmp := t.TempDir()
+	// Clone the canonical standalone org template. No token needed — the
+	// repo is public on the same Gitea instance.
+	res := runCmd("git", "clone", "--depth", "1",
+		"https://git.moleculesai.app/molecule-ai/molecule-ai-org-template-molecule-dev.git",
+		tmp)
+	if res != 0 {
+		t.Skipf("could not clone standalone org template (skipping integration test): exit %d", res)
 	}
-	orgDir := filepath.Clean(filepath.Join(here, "..", "..", "..", "org-templates", "molecule-dev"))
-	orgFile := filepath.Join(orgDir, "org.yaml")
+	orgFile := filepath.Join(tmp, "org.yaml")
 	data, err := os.ReadFile(orgFile)
 	if err != nil {
-		t.Skipf("molecule-dev/org.yaml not found (skipping integration test): %v", err)
+		t.Skipf("org.yaml not found in standalone clone (skipping integration test): %v", err)
 	}
-	expanded, err := resolveYAMLIncludes(data, orgDir)
+	expanded, err := resolveYAMLIncludes(data, tmp)
 	if err != nil {
 		t.Fatalf("resolveYAMLIncludes on real org.yaml: %v", err)
 	}
