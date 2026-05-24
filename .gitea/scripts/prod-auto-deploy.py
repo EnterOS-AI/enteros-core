@@ -21,10 +21,6 @@ from urllib.parse import quote
 TRUE_VALUES = {"1", "true", "yes", "on", "disabled", "disable"}
 PROD_CP_URL = "https://api.moleculesai.app"
 DEFAULT_REQUIRED_CONTEXTS = [
-    "CI / Platform (Go) (push)",
-    "CI / Canvas (Next.js) (push)",
-    "CI / Shellcheck (E2E scripts) (push)",
-    "CI / Python Lint & Test (push)",
     "CI / all-required (push)",
     "Secret scan / Scan diff for credential-shaped strings (push)",
 ]

@@ -146,3 +146,10 @@ def test_context_is_terminal_failure_rejects_cancelled_and_skipped():
         assert prod.context_is_terminal_failure(state) is True
     for state in ("pending", "missing", "success"):
         assert prod.context_is_terminal_failure(state) is False
+
+
+def test_default_required_contexts_delegate_path_gating_to_all_required():
+    assert prod.required_contexts({}) == [
+        "CI / all-required (push)",
+        "Secret scan / Scan diff for credential-shaped strings (push)",
+    ]
