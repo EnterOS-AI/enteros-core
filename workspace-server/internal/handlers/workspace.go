@@ -273,12 +273,12 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 	// runtimeExplicitlyRequested is true when the caller expressed intent for
 	// a SPECIFIC runtime — either by passing `runtime` directly, or by naming
 	// a `template` (a template encodes a runtime). When true, we must NOT
-	// silently fall back to langgraph if that intent can't be honored: that
+	// silently fall back to the default runtime if that intent can't be honored: that
 	// is the molecule-controlplane#188 / #184 contract violation (caller asks
-	// for codex/claude-code, gets a langgraph workspace, 201, no error — a
+	// for codex/hermes/openclaw, gets a default-runtime workspace, 201, no error — a
 	// false success). #188 mandates fail-closed (error+notify) on mismatch,
 	// not an advisory degrade. The legitimate "no template, no runtime →
-	// langgraph default" path (bare {"name":...}) is unaffected.
+	// default-runtime path (bare {"name":...}) is unaffected.
 	runtimeExplicitlyRequested := payload.Runtime != "" || payload.Template != ""
 	templateRuntimeResolved := payload.Runtime != ""
 	if payload.Template != "" && (payload.Runtime == "" || payload.Model == "") {
@@ -332,15 +332,15 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 	// intent for a specific runtime (passed `runtime`, or named a `template`)
 	// but we could NOT resolve a concrete runtime from it (template's
 	// config.yaml unreadable, or it has no `runtime:` key), DO NOT silently
-	// substitute langgraph and return 201 — that is the silent contract
+	// substitute the default runtime and return 201 — that is the silent contract
 	// violation that produced 5/5 wrong workspaces and a false codex E2E pass.
 	// Return 422 so the caller learns the requested runtime was not honored.
 	// The platform-side CP fix (controlplane#188) is the sibling gate; this
 	// closes the ws-server `Create` boundary the product UI actually hits.
 	if payload.Runtime == "" && runtimeExplicitlyRequested && !templateRuntimeResolved {
-		log.Printf("Create: FAIL-CLOSED (controlplane#188) — template=%q requested but runtime could not be resolved; refusing silent langgraph fallback", payload.Template)
+		log.Printf("Create: FAIL-CLOSED (controlplane#188) — template=%q requested but runtime could not be resolved; refusing silent default-runtime fallback", payload.Template)
 		c.JSON(http.StatusUnprocessableEntity, gin.H{
-			"error":    "runtime could not be resolved from the requested template; refusing to silently provision langgraph (controlplane#188). Pass an explicit \"runtime\", or use a template whose config.yaml declares one.",
+			"error":    "runtime could not be resolved from the requested template; refusing to silently provision the default runtime (controlplane#188). Pass an explicit \"runtime\", or use a template whose config.yaml declares one.",
 			"template": payload.Template,
 			"code":     "RUNTIME_UNRESOLVED",
 		})
@@ -348,8 +348,8 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 	}
 	if payload.Runtime == "" {
 		// Legitimate default path: no template AND no runtime requested
-		// (bare {"name":...}) — langgraph is the intended default here.
-		payload.Runtime = "langgraph"
+		// (bare {"name":...}) — claude-code is the intended default here.
+		payload.Runtime = "claude-code"
 	}
 
 	// SSOT (CTO 2026-05-22, feedback_workspace_model_required_no_platform_default_dynamic_credential_intake):
@@ -851,7 +851,7 @@ const workspaceListQuery = `
 		   w.parent_id, w.active_tasks, COALESCE(w.max_concurrent_tasks, 1),
 		   w.last_error_rate,
 		   COALESCE(w.last_sample_error, ''), w.uptime_seconds,
-		   COALESCE(w.current_task, ''), COALESCE(w.runtime, 'langgraph'),
+		   COALESCE(w.current_task, ''), COALESCE(w.runtime, 'claude-code'),
 		   COALESCE(w.workspace_dir, ''),
 		   COALESCE(cl.x, 0), COALESCE(cl.y, 0), COALESCE(cl.collapsed, false),
 		   w.budget_limit, COALESCE(w.monthly_spend, 0),
@@ -913,7 +913,7 @@ func (h *WorkspaceHandler) Get(c *gin.Context) {
 			   w.parent_id, w.active_tasks, COALESCE(w.max_concurrent_tasks, 1),
 			   w.last_error_rate,
 			   COALESCE(w.last_sample_error, ''), w.uptime_seconds,
-			   COALESCE(w.current_task, ''), COALESCE(w.runtime, 'langgraph'),
+			   COALESCE(w.current_task, ''), COALESCE(w.runtime, 'claude-code'),
 			   COALESCE(w.workspace_dir, ''),
 			   COALESCE(cl.x, 0), COALESCE(cl.y, 0), COALESCE(cl.collapsed, false),
 			   w.budget_limit, COALESCE(w.monthly_spend, 0),

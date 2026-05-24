@@ -94,10 +94,10 @@ done
 
 # model is required at the Create boundary (CTO 2026-05-22 SSOT — see
 # feedback_workspace_model_required_no_platform_default_dynamic_credential_intake).
-# Body had no runtime → defaults to langgraph; pass the langgraph-compatible
-# default that the deleted DefaultModel("") would have returned.
+# Body has no runtime → defaults to claude-code; pass the matching model
+# that the workspace-creation contract now requires.
 R=$(curl -s -X POST "$BASE/workspaces" -H "Content-Type: application/json" \
-  -d '{"name":"Notify E2E","tier":1,"model":"anthropic:claude-opus-4-7"}')
+  -d '{"name":"Notify E2E","tier":1,"model":"sonnet"}')
 WSID=$(echo "$R" | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])' 2>/dev/null || true)
 [ -n "$WSID" ] || { echo "Failed to create workspace: $R"; exit 1; }
 echo "Created workspace $WSID"

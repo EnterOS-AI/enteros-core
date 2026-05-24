@@ -37,7 +37,7 @@ func remoteStaleAfter() time.Duration {
 }
 
 // StartHealthSweep periodically checks all "online" workspaces. For
-// container-backed runtimes (langgraph, claude-code, …) it calls the
+// container-backed runtimes (claude-code, codex, hermes, openclaw) it calls the
 // Docker API via `checker.IsRunning`. For `runtime='external'` (remote
 // agents per Phase 30) it checks heartbeat freshness: a heartbeat older
 // than `REMOTE_LIVENESS_STALE_AFTER` (default 90s) marks the workspace
@@ -79,7 +79,7 @@ func sweepOnlineWorkspaces(ctx context.Context, checker ContainerChecker, onOffl
 	// auto-restart would loop forever (provisioner has no template
 	// for either runtime).
 	rows, err := db.DB.QueryContext(ctx,
-		`SELECT id FROM workspaces WHERE status IN ('online', 'degraded') AND COALESCE(runtime, 'langgraph') NOT IN ('external', 'mock')`)
+		`SELECT id FROM workspaces WHERE status IN ('online', 'degraded') AND COALESCE(runtime, 'claude-code') NOT IN ('external', 'mock')`)
 	if err != nil {
 		log.Printf("Health sweep: query error: %v", err)
 		return
@@ -146,7 +146,7 @@ func sweepStaleRemoteWorkspaces(ctx context.Context, onOffline OfflineHandler) {
 	rows, err := db.DB.QueryContext(ctx, `
 		SELECT id FROM workspaces
 		WHERE status IN ('online', 'degraded')
-		  AND COALESCE(runtime, 'langgraph') = 'external'
+		  AND COALESCE(runtime, 'claude-code') = 'external'
 		  AND COALESCE(last_heartbeat_at, updated_at) < now() - ($1 || ' seconds')::interval
 	`, staleAfterSec)
 	if err != nil {

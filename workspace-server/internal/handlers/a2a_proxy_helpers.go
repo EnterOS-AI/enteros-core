@@ -169,7 +169,7 @@ func (h *WorkspaceHandler) handleA2ADispatchError(ctx context.Context, workspace
 // canvas-chat-to-dead-workspace incident traces to exactly this gap.
 func (h *WorkspaceHandler) maybeMarkContainerDead(ctx context.Context, workspaceID string) bool {
 	var wsRuntime string
-	db.DB.QueryRowContext(ctx, `SELECT COALESCE(runtime, 'langgraph') FROM workspaces WHERE id = $1`, workspaceID).Scan(&wsRuntime)
+	db.DB.QueryRowContext(ctx, `SELECT COALESCE(runtime, 'claude-code') FROM workspaces WHERE id = $1`, workspaceID).Scan(&wsRuntime)
 	if isExternalLikeRuntime(wsRuntime) {
 		return false
 	}

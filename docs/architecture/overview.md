@@ -44,7 +44,7 @@ All three call `onWorkspaceOffline`, which broadcasts `WORKSPACE_OFFLINE` and ca
 
 ### Template Resolution (Workspace Create)
 
-Runtime detection happens **before** the DB insert: if `payload.Runtime` is empty and a template is specified, the handler reads `runtime:` from `configsDir/template/config.yaml` first. If still empty, it defaults to `"langgraph"`. This ensures the correct runtime (e.g. `claude-code`) is persisted in the DB and used for container image selection.
+Runtime detection happens **before** the DB insert: if `payload.Runtime` is empty and a template is specified, the handler reads `runtime:` from `configsDir/template/config.yaml` first. If still empty, it defaults to `"claude-code"`. This ensures the correct runtime is persisted in the DB and used for container image selection.
 
 When the requested template does not exist, the Create handler falls back in order:
 

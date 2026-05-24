@@ -568,7 +568,7 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		var runtime string
 		err := db.DB.QueryRowContext(
 			context.Background(),
-			`SELECT COALESCE(runtime, 'langgraph') FROM workspaces WHERE id = $1`,
+			`SELECT COALESCE(runtime, 'claude-code') FROM workspaces WHERE id = $1`,
 			workspaceID,
 		).Scan(&runtime)
 		return runtime, err

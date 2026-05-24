@@ -38,8 +38,8 @@ var ErrNoBackend = errors.New("provisioner: no backend configured (zero-valued r
 // ErrUnresolvableRuntime is returned by selectImage when a workspace
 // names a runtime that has no resolvable image (not in RuntimeImages and
 // no operator-pinned cfg.Image). RFC internal#483 + security review 4269:
-// previously such a request silently fell through to DefaultImage
-// (langgraph) — a user asking for crewai would get a langgraph container
+// previously such a request silently fell through to DefaultImage — a user
+// asking for a removed runtime would get a different container
 // with no signal. The CTO standing directive
 // (feedback_platform_must_hardgate_base_contract) is fail-closed: a
 // named-but-unresolvable runtime must reject with a structured,
@@ -68,8 +68,7 @@ var ErrUnresolvableRuntime = errors.New("provisioner: requested runtime has no r
 // short-circuit pulls entirely if needed.
 var RuntimeImages = computeRuntimeImages()
 
-// DefaultImage is the fallback workspace Docker image (langgraph is the
-// most common runtime). Computed via RegistryPrefix() so the prefix
+// DefaultImage is the fallback workspace Docker image. Computed via RegistryPrefix() so the prefix
 // override applies to the fallback path too.
 //
 // NOTE: Every runtime MUST have an entry in knownRuntimes (registry.go).
@@ -97,7 +96,7 @@ type WorkspaceConfig struct {
 	PluginsPath        string            // Host path to plugins directory (mounted at /plugins)
 	WorkspacePath      string            // Host path to bind-mount as /workspace (if empty, uses Docker named volume)
 	Tier               int
-	Runtime            string // "langgraph" (default) or "claude-code", "codex", "ollama", "custom"
+	Runtime            string // "claude-code" (default), "codex", "hermes", "openclaw", etc.
 	InstanceType       string // Optional CP EC2 instance type override (SaaS only)
 	DiskGB             int32  // Optional CP root volume size override in GiB (SaaS only)
 	Display            WorkspaceDisplayConfig
@@ -139,9 +138,8 @@ type WorkspaceDisplayConfig struct {
 // feedback_platform_must_hardgate_base_contract): if the workspace NAMES a
 // runtime that resolves to no image (not in RuntimeImages, no pinned
 // cfg.Image), reject with ErrUnresolvableRuntime instead of silently
-// substituting DefaultImage. Pre-fix, removing crewai/deepagents/gemini-cli
-// from the catalog left those create requests silently provisioning a
-// langgraph container — the user asked for crewai and got langgraph with no
+// substituting DefaultImage. Pre-fix, removing a runtime from the catalog left
+// those create requests silently provisioning a fallback container with no
 // signal. The error propagates through Start → markProvisionFailed, which
 // already broadcasts WorkspaceProvisionFailed and records the message.
 //
@@ -707,7 +705,7 @@ func buildContainerEnv(cfg WorkspaceConfig) []string {
 		// /app and set ENV ADAPTER_MODULE=adapter, but molecule-runtime is a
 		// pip console_script entry point so cwd isn't on sys.path automatically.
 		// Setting PYTHONPATH from the provisioner fixes every adapter image
-		// (claude-code, hermes, langgraph, …) without needing to PR each
+		// (claude-code, codex, hermes, openclaw, …) without needing to PR each
 		// standalone template repo. Per-template ENV in the Dockerfile can
 		// still override (Dockerfile ENV is overridden by docker -e at runtime).
 		"PYTHONPATH=/app",

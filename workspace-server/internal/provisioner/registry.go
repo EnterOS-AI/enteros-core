@@ -18,18 +18,15 @@ const defaultRegistryPrefix = "ghcr.io/molecule-ai"
 //
 // Order matters for deterministic test snapshots; keep alphabetical.
 var knownRuntimes = []string{
-	"autogen",
 	"claude-code",
 	"codex",
 	"hermes",
-	"langgraph",
 	"openclaw",
 }
 
 // defaultRuntime is the fallback when a workspace's config doesn't specify a
-// runtime. Picked because LangGraph is the most common in our org templates
-// and has the smallest "first impression" cold-start surface.
-const defaultRuntime = "langgraph"
+// runtime.
+const defaultRuntime = "claude-code"
 
 // RegistryPrefix returns the registry prefix all workspace-template image
 // references should use. Defaults to ghcr.io/molecule-ai (the upstream OSS
@@ -119,4 +116,3 @@ func computeRuntimeImages() map[string]string {
 	}
 	return out
 }
-

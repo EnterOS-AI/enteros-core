@@ -2,14 +2,14 @@
 
 ## Overview
 
-The workspace runtime uses a **pluggable adapter architecture** — each agent infrastructure (Claude Code, OpenClaw, LangGraph, CrewAI, AutoGen, etc.) has its own adapter that bridges the A2A protocol to the infra's native interface.
+The workspace runtime uses a **pluggable adapter architecture** — each maintained agent infrastructure (Claude Code, Codex, Hermes, OpenClaw) has its own adapter that bridges the A2A protocol to the infra's native interface.
 
 Adapters live in `workspace/adapters/<runtime>/` and are auto-discovered at startup. Each adapter implements `BaseAdapter` (from `adapters/base.py`) with `setup()` and `create_executor()` methods.
 
 The runtime is selected via `config.yaml`:
 
 ```yaml
-runtime: claude-code    # or: langgraph, openclaw, deepagents, crewai, autogen
+runtime: claude-code    # or: codex, hermes, openclaw
 runtime_config:
   model: sonnet
   auth_token_file: .auth-token
@@ -18,7 +18,7 @@ runtime_config:
 
 ## How It Works
 
-The unified `workspace-template` Docker image includes both Python (LangGraph) and Node.js (CLI runtimes). At startup, `main.py` checks the `runtime` field in `config.yaml`, discovers the matching adapter in `adapters/<runtime>/`, calls `adapter.setup(config)` then `adapter.create_executor(config)` to get an `AgentExecutor` that handles A2A requests.
+The unified runtime checks the `runtime` field in `config.yaml`, discovers the matching adapter, calls `adapter.setup(config)` then `adapter.create_executor(config)` to get an `AgentExecutor` that handles A2A requests.
 
 ```
 A2A request arrives
@@ -28,7 +28,7 @@ AgentExecutor.execute(context, event_queue)
       |  - extracts user message from A2A parts
       |  - extracts conversation history from params.metadata.history
       |  - sets current_task on heartbeat (shows on canvas card)
-      |  - invokes the runtime (LangGraph graph, CLI subprocess, etc.)
+      |  - invokes the runtime adapter
       v
 Response → A2A event queue → JSON-RPC response
 ```
@@ -37,9 +37,9 @@ Response → A2A event queue → JSON-RPC response
 
 Chat sessions in the Canvas UI send prior messages (up to 20) via `params.metadata.history` in each A2A `message/send` request. Executors extract this history:
 
-- **LangGraph/DeepAgents**: Prepends history as `("human", text)` / `("ai", text)` tuples to the LangGraph message list
-- **CrewAI/AutoGen**: Prepends history as a text prefix in the task description (`"Conversation so far:\n..."`)
 - **Claude Code**: Uses `--resume <session_id>` for native session continuity (history not needed)
+- **Codex**: Uses the Codex runtime's native session state
+- **Hermes**: Uses Hermes' agent runtime session handling
 - **OpenClaw**: Uses `--session-id` for native session continuity
 
 ### Current Task Reporting
@@ -47,10 +47,6 @@ Chat sessions in the Canvas UI send prior messages (up to 20) via `params.metada
 All executors update the workspace's `current_task` via the heartbeat during execution. This shows an amber banner on the canvas card. The shared `set_current_task(heartbeat, task)` function in `a2a_executor.py` handles this for all runtimes.
 
 ## Built-in Adapters
-
-### LangGraph (`runtime: langgraph`) — Default
-
-Full Python agent with LangGraph ReAct pattern. Supports skills, tools, plugins, peer coordination, and team routing.
 
 ### Claude Code (`runtime: claude-code`)
 
@@ -71,35 +67,18 @@ The SDK uses the same Claude Code engine under the hood — plugins, CLAUDE.md d
 
 **Important:** Claude Code refuses to run as root with `--dangerously-skip-permissions`. The Dockerfile creates a non-root `agent` user.
 
-### CrewAI (`runtime: crewai`)
-
-Role-based multi-agent framework. Creates a CrewAI Agent + Task + Crew per request with A2A delegation tools (`delegate_to_peer`, `list_available_peers`).
+### Codex (`runtime: codex`)
 
 ```yaml
-runtime: crewai
-model: openrouter:google/gemini-2.5-flash
+runtime: codex
+model: openai/gpt-5.3-codex
 ```
 
-**Auth:** Uses `OPENROUTER_API_KEY` or `OPENAI_API_KEY` env var.
-
-### AutoGen (`runtime: autogen`)
-
-Microsoft AutoGen AssistantAgent with tool use. Creates an `AssistantAgent` per request with A2A delegation tools.
+### Hermes (`runtime: hermes`)
 
 ```yaml
-runtime: autogen
-model: openai:gpt-4.1-mini
-```
-
-**Auth:** Uses `OPENAI_API_KEY` env var.
-
-### DeepAgents (`runtime: deepagents`)
-
-LangGraph-based agent with deep planning capabilities. Uses the same `LangGraphA2AExecutor` as the default runtime but with a specialized agent setup including delegation, memory, and search tools.
-
-```yaml
-runtime: deepagents
-model: openrouter:google/gemini-2.5-flash
+runtime: hermes
+model: openai/gpt-4o
 ```
 
 ### OpenClaw (`runtime: openclaw`)

@@ -212,7 +212,7 @@ func (h *WorkspaceHandler) Restart(c *gin.Context) {
 	var status, wsName, dbRuntime string
 	var tier int
 	err := db.DB.QueryRowContext(ctx,
-		`SELECT status, name, tier, COALESCE(runtime, 'langgraph') FROM workspaces WHERE id = $1`, id,
+		`SELECT status, name, tier, COALESCE(runtime, 'claude-code') FROM workspaces WHERE id = $1`, id,
 	).Scan(&status, &wsName, &tier, &dbRuntime)
 	if err == sql.ErrNoRows {
 		c.JSON(http.StatusNotFound, gin.H{"error": "workspace not found"})
@@ -744,7 +744,7 @@ func (h *WorkspaceHandler) runRestartCycle(workspaceID string) {
 	var wsName, status, dbRuntime string
 	var tier int
 	err := db.DB.QueryRowContext(ctx,
-		`SELECT name, status, tier, COALESCE(runtime, 'langgraph') FROM workspaces WHERE id = $1 AND status NOT IN ('removed', 'paused', 'hibernated')`, workspaceID,
+		`SELECT name, status, tier, COALESCE(runtime, 'claude-code') FROM workspaces WHERE id = $1 AND status NOT IN ('removed', 'paused', 'hibernated')`, workspaceID,
 	).Scan(&wsName, &status, &tier, &dbRuntime)
 	if err != nil {
 		return // includes paused/hibernated — don't auto-restart those
@@ -897,7 +897,7 @@ func (h *WorkspaceHandler) Resume(c *gin.Context) {
 	var wsName, dbRuntime string
 	var tier int
 	err := db.DB.QueryRowContext(ctx,
-		`SELECT name, tier, COALESCE(runtime, 'langgraph') FROM workspaces WHERE id = $1 AND status = 'paused'`, id,
+		`SELECT name, tier, COALESCE(runtime, 'claude-code') FROM workspaces WHERE id = $1 AND status = 'paused'`, id,
 	).Scan(&wsName, &tier, &dbRuntime)
 	if err == sql.ErrNoRows {
 		c.JSON(http.StatusNotFound, gin.H{"error": "workspace not found or not paused"})
@@ -930,9 +930,9 @@ func (h *WorkspaceHandler) Resume(c *gin.Context) {
 	toResume := []wsInfo{{id, wsName, dbRuntime, tier}}
 	rows, _ := db.DB.QueryContext(ctx,
 		`WITH RECURSIVE descendants AS (
-			SELECT id, name, tier, COALESCE(runtime, 'langgraph') AS runtime FROM workspaces WHERE parent_id = $1 AND status = 'paused'
+			SELECT id, name, tier, COALESCE(runtime, 'claude-code') AS runtime FROM workspaces WHERE parent_id = $1 AND status = 'paused'
 			UNION ALL
-			SELECT w.id, w.name, w.tier, COALESCE(w.runtime, 'langgraph') FROM workspaces w JOIN descendants d ON w.parent_id = d.id WHERE w.status = 'paused'
+			SELECT w.id, w.name, w.tier, COALESCE(w.runtime, 'claude-code') FROM workspaces w JOIN descendants d ON w.parent_id = d.id WHERE w.status = 'paused'
 		) SELECT id, name, tier, runtime FROM descendants`, id)
 	if rows != nil {
 		defer rows.Close()

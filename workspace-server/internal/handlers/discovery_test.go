@@ -404,11 +404,11 @@ func TestPeers_Q_NoMatches_RawBodyIsArrayNotNull(t *testing.T) {
 // role and asserts no panic + correct filter behaviour.
 func TestFilterPeersByQuery_NilRoleRegression(t *testing.T) {
 	cases := []struct {
-		name       string
-		peers      []map[string]interface{}
-		q          string
-		wantLen    int
-		wantIDs    []string
+		name    string
+		peers   []map[string]interface{}
+		q       string
+		wantLen int
+		wantIDs []string
 	}{
 		{
 			name: "nil role matches on name",
@@ -555,7 +555,7 @@ func TestDiscoverWorkspacePeer_Online(t *testing.T) {
 	setupTestRedis(t)
 
 	// name/runtime lookup → non-external
-	mock.ExpectQuery(`SELECT COALESCE\(name,''\), COALESCE\(runtime,'langgraph'\) FROM workspaces WHERE id =`).
+	mock.ExpectQuery(`SELECT COALESCE\(name,''\), COALESCE\(runtime,'claude-code'\) FROM workspaces WHERE id =`).
 		WithArgs("ws-online").
 		WillReturnRows(sqlmock.NewRows([]string{"name", "runtime"}).AddRow("Target", "langgraph"))
 	// No cached internal URL → DB status lookup → online
@@ -583,7 +583,7 @@ func TestDiscoverWorkspacePeer_NotFound(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
 
-	mock.ExpectQuery(`SELECT COALESCE\(name,''\), COALESCE\(runtime,'langgraph'\) FROM workspaces WHERE id =`).
+	mock.ExpectQuery(`SELECT COALESCE\(name,''\), COALESCE\(runtime,'claude-code'\) FROM workspaces WHERE id =`).
 		WithArgs("ws-missing").
 		WillReturnRows(sqlmock.NewRows([]string{"name", "runtime"}).AddRow("", "langgraph"))
 	mock.ExpectQuery(`SELECT status FROM workspaces WHERE id =`).
@@ -605,14 +605,14 @@ func TestDiscoverWorkspacePeer_ExternalRuntime_HandledByExternalURL(t *testing.T
 	mock := setupTestDB(t)
 	setupTestRedis(t)
 
-	mock.ExpectQuery(`SELECT COALESCE\(name,''\), COALESCE\(runtime,'langgraph'\) FROM workspaces WHERE id =`).
+	mock.ExpectQuery(`SELECT COALESCE\(name,''\), COALESCE\(runtime,'claude-code'\) FROM workspaces WHERE id =`).
 		WithArgs("ws-ext").
 		WillReturnRows(sqlmock.NewRows([]string{"name", "runtime"}).AddRow("Ext", "external"))
 	// writeExternalWorkspaceURL's two queries
 	mock.ExpectQuery(`SELECT COALESCE\(url,''\) FROM workspaces WHERE id =`).
 		WithArgs("ws-ext").
 		WillReturnRows(sqlmock.NewRows([]string{"url"}).AddRow("http://external.example"))
-	mock.ExpectQuery(`SELECT COALESCE\(runtime,'langgraph'\) FROM workspaces WHERE id =`).
+	mock.ExpectQuery(`SELECT COALESCE\(runtime,'claude-code'\) FROM workspaces WHERE id =`).
 		WithArgs("ws-caller").
 		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("external"))
 
@@ -630,7 +630,7 @@ func TestDiscoverWorkspacePeer_CachedInternalURLHit(t *testing.T) {
 	mock := setupTestDB(t)
 	mr := setupTestRedis(t)
 
-	mock.ExpectQuery(`SELECT COALESCE\(name,''\), COALESCE\(runtime,'langgraph'\) FROM workspaces WHERE id =`).
+	mock.ExpectQuery(`SELECT COALESCE\(name,''\), COALESCE\(runtime,'claude-code'\) FROM workspaces WHERE id =`).
 		WithArgs("ws-cached").
 		WillReturnRows(sqlmock.NewRows([]string{"name", "runtime"}).AddRow("Cached", "langgraph"))
 	mr.Set("ws:ws-cached:internal_url", "http://ws-cached:8000")
@@ -654,7 +654,7 @@ func TestDiscoverWorkspacePeer_NotReachable(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
 
-	mock.ExpectQuery(`SELECT COALESCE\(name,''\), COALESCE\(runtime,'langgraph'\) FROM workspaces WHERE id =`).
+	mock.ExpectQuery(`SELECT COALESCE\(name,''\), COALESCE\(runtime,'claude-code'\) FROM workspaces WHERE id =`).
 		WithArgs("ws-paused").
 		WillReturnRows(sqlmock.NewRows([]string{"name", "runtime"}).AddRow("Paused", "langgraph"))
 	mock.ExpectQuery(`SELECT status FROM workspaces WHERE id =`).
@@ -681,9 +681,9 @@ func TestWriteExternalWorkspaceURL_Success(t *testing.T) {
 	mock.ExpectQuery(`SELECT COALESCE\(url,''\) FROM workspaces WHERE id =`).
 		WithArgs("ws-ext").
 		WillReturnRows(sqlmock.NewRows([]string{"url"}).AddRow("http://external.example/a2a"))
-	mock.ExpectQuery(`SELECT COALESCE\(runtime,'langgraph'\) FROM workspaces WHERE id =`).
+	mock.ExpectQuery(`SELECT COALESCE\(runtime,'claude-code'\) FROM workspaces WHERE id =`).
 		WithArgs("ws-caller").
-		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("langgraph"))
+		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("claude-code"))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -731,9 +731,9 @@ func TestWriteExternalWorkspaceURL_RewritesLocalhostForDockerCaller(t *testing.T
 		WithArgs("ws-ext").
 		WillReturnRows(sqlmock.NewRows([]string{"url"}).AddRow("http://127.0.0.1:8000/a2a"))
 	// non-external caller runtime → rewrite enabled
-	mock.ExpectQuery(`SELECT COALESCE\(runtime,'langgraph'\) FROM workspaces WHERE id =`).
+	mock.ExpectQuery(`SELECT COALESCE\(runtime,'claude-code'\) FROM workspaces WHERE id =`).
 		WithArgs("ws-caller").
-		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("langgraph"))
+		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("claude-code"))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -818,9 +818,9 @@ func TestWriteExternalWorkspaceURL_RejectsMetadataIPURL(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"url"}).
 			AddRow("http://169.254.169.254/computeMetadata/v1/"))
 	// callerRuntime lookup happens before isSafeURL — must mock it.
-	mock.ExpectQuery(`SELECT COALESCE\(runtime,'langgraph'\) FROM workspaces WHERE id =`).
+	mock.ExpectQuery(`SELECT COALESCE\(runtime,'claude-code'\) FROM workspaces WHERE id =`).
 		WithArgs("ws-caller").
-		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("langgraph"))
+		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("claude-code"))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)

@@ -35,7 +35,7 @@ func TestWorkspaceGet_Success(t *testing.T) {
 		WithArgs("cccccccc-0001-0000-0000-000000000000").
 		WillReturnRows(sqlmock.NewRows(columns).
 			AddRow("cccccccc-0001-0000-0000-000000000000", "My Agent", "worker", 1, "online", []byte(`{"name":"test"}`),
-				"http://localhost:8001", nil, 2, 1, 0.05, "", 3600, "working", "langgraph",
+				"http://localhost:8001", nil, 2, 1, 0.05, "", 3600, "working", "claude-code",
 				"", 10.0, 20.0, false,
 				nil, 0, false, true, []byte(`{}`)))
 
@@ -60,7 +60,7 @@ func TestWorkspaceGet_Success(t *testing.T) {
 	if resp["status"] != "online" {
 		t.Errorf("expected status 'online', got %v", resp["status"])
 	}
-	if resp["runtime"] != "langgraph" {
+	if resp["runtime"] != "claude-code" {
 		t.Errorf("expected runtime 'langgraph', got %v", resp["runtime"])
 	}
 	// current_task is stripped from public GET response (#955)
@@ -125,7 +125,7 @@ func TestWorkspaceGet_RemovedReturns410(t *testing.T) {
 		WithArgs(id).
 		WillReturnRows(sqlmock.NewRows(columns).
 			AddRow(id, "Old Agent", "worker", 1, string(models.StatusRemoved), []byte(`null`),
-				"", nil, 0, 1, 0.0, "", 0, "", "langgraph",
+				"", nil, 0, 1, 0.0, "", 0, "", "claude-code",
 				"", 0.0, 0.0, false,
 				nil, 0, false, true, []byte(`{}`)))
 	mock.ExpectQuery(`SELECT updated_at FROM workspaces`).
@@ -189,7 +189,7 @@ func TestWorkspaceGet_RemovedReturns410WithNullRemovedAtOnTimestampFetchFailure(
 		WithArgs(id).
 		WillReturnRows(sqlmock.NewRows(columns).
 			AddRow(id, "Vanished", "worker", 1, string(models.StatusRemoved), []byte(`null`),
-				"", nil, 0, 1, 0.0, "", 0, "", "langgraph",
+				"", nil, 0, 1, 0.0, "", 0, "", "claude-code",
 				"", 0.0, 0.0, false,
 				nil, 0, false, true, []byte(`{}`)))
 	// Simulate the row vanishing between the two queries.
@@ -252,7 +252,7 @@ func TestWorkspaceGet_RemovedWithIncludeQueryReturns200(t *testing.T) {
 		WithArgs(id).
 		WillReturnRows(sqlmock.NewRows(columns).
 			AddRow(id, "Audit Agent", "worker", 1, string(models.StatusRemoved), []byte(`null`),
-				"", nil, 0, 1, 0.0, "", 0, "", "langgraph",
+				"", nil, 0, 1, 0.0, "", 0, "", "claude-code",
 				"", 0.0, 0.0, false,
 				nil, 0, false, true, []byte(`{}`)))
 	// last_outbound_at follow-up query (existing path)
@@ -342,7 +342,7 @@ func TestWorkspaceCreate_DBInsertError(t *testing.T) {
 	// Transaction begins, workspace INSERT fails, transaction is rolled back.
 	mock.ExpectBegin()
 	mock.ExpectExec("INSERT INTO workspaces").
-		WithArgs(sqlmock.AnyArg(), "Failing Agent", nil, 3, "langgraph", (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
+		WithArgs(sqlmock.AnyArg(), "Failing Agent", nil, 3, "claude-code", (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
 		WillReturnError(sql.ErrConnDone)
 	mock.ExpectRollback()
 
@@ -373,11 +373,13 @@ func TestWorkspaceCreate_DefaultsApplied(t *testing.T) {
 	// Transaction wraps the workspace INSERT (no secrets in this request).
 	mock.ExpectBegin()
 	// Expect workspace INSERT with defaulted tier=3 (Privileged — the
-	// handler default in workspace.go), runtime="langgraph"
+	// handler default in workspace.go), runtime="claude-code"
 	mock.ExpectExec("INSERT INTO workspaces").
-		WithArgs(sqlmock.AnyArg(), "Default Agent", nil, 3, "langgraph", (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
+		WithArgs(sqlmock.AnyArg(), "Default Agent", nil, 3, "claude-code", (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
+	mock.ExpectExec("INSERT INTO workspace_secrets").
+		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// Expect canvas_layouts INSERT (x=0, y=0 — defaults)
 	mock.ExpectExec("INSERT INTO canvas_layouts").
@@ -1429,7 +1431,7 @@ func TestWorkspaceGet_FinancialFieldsStripped(t *testing.T) {
 		WithArgs("cccccccc-0010-0000-0000-000000000000").
 		WillReturnRows(sqlmock.NewRows(columns).
 			AddRow("cccccccc-0010-0000-0000-000000000000", "Finance Test", "worker", 1, "online", []byte(`{}`),
-				"http://localhost:9001", nil, 0, 1, 0.0, "", 0, "", "langgraph",
+				"http://localhost:9001", nil, 0, 1, 0.0, "", 0, "", "claude-code",
 				"", 0.0, 0.0, false,
 				int64(50000), int64(12500), false, true, []byte(`{}`))) // budget_limit=500 USD, spend=125 USD
 
@@ -1489,7 +1491,7 @@ func TestWorkspaceGet_SensitiveFieldsStripped(t *testing.T) {
 				"panic: internal error at /secret/path.go:42",
 				100,
 				"Analyzing customer PII for the Q4 report",
-				"langgraph",
+				"claude-code",
 				"/home/user/secret-projects/client-work",
 				0.0, 0.0, false,
 				nil, 0, false, true, []byte(`{}`)))
@@ -1679,7 +1681,7 @@ func TestWorkspaceCreate_TemplateDefaultsLegacyTopLevelModel(t *testing.T) {
 	}
 	cfg := []byte(`name: Legacy Agent
 tier: 1
-runtime: langgraph
+runtime: hermes
 model: anthropic:claude-sonnet-4-5
 `)
 	if err := os.WriteFile(filepath.Join(templateDir, "config.yaml"), cfg, 0o644); err != nil {
@@ -1695,10 +1697,12 @@ model: anthropic:claude-sonnet-4-5
 	// this assertion should flip back to 1.
 	mock.ExpectExec("INSERT INTO workspaces").
 		WithArgs(
-			sqlmock.AnyArg(), "Legacy Agent", nil, 3, "langgraph",
+			sqlmock.AnyArg(), "Legacy Agent", nil, 3, "hermes",
 			(*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
+	mock.ExpectExec("INSERT INTO workspace_secrets").
+		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec("INSERT INTO canvas_layouts").
 		WithArgs(sqlmock.AnyArg(), float64(0), float64(0)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -1879,8 +1883,8 @@ func TestWorkspaceCreate_188_NoTemplateNoRuntime_NowMODEL_REQUIRED(t *testing.T)
 	if !bytes.Contains(w.Body.Bytes(), []byte(`"code":"MODEL_REQUIRED"`)) {
 		t.Errorf("bare-body create: expected code=MODEL_REQUIRED in body, got %s", w.Body.String())
 	}
-	if !bytes.Contains(w.Body.Bytes(), []byte(`"runtime":"langgraph"`)) {
-		t.Errorf("bare-body create: expected runtime=\"langgraph\" in 422 body (the gate runs AFTER the langgraph-default assignment so the diagnostic surfaces what runtime WOULD have been used), got %s", w.Body.String())
+	if !bytes.Contains(w.Body.Bytes(), []byte(`"runtime":"claude-code"`)) {
+		t.Errorf("bare-body create: expected runtime=\"claude-code\" in 422 body (the gate runs AFTER the default assignment so the diagnostic surfaces what runtime WOULD have been used), got %s", w.Body.String())
 	}
 }
 
