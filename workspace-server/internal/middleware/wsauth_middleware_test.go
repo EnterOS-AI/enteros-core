@@ -284,6 +284,54 @@ func TestAdminAuth_FailOpen_NoTokensGlobally(t *testing.T) {
 	}
 }
 
+func TestAdminAuth_VerifiedCPSession_SetsSessionActor(t *testing.T) {
+	resetSessionCache()
+	srv, hits := mockCPServer(t, http.StatusOK, `{"member":true,"user_id":"u_1","role":"owner","org_id":"org_1"}`)
+	t.Setenv("CP_UPSTREAM_URL", srv.URL)
+	t.Setenv("MOLECULE_ORG_SLUG", "acme")
+	t.Setenv("ADMIN_TOKEN", "admin-secret")
+
+	mockDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer mockDB.Close()
+
+	mock.ExpectQuery(hasAnyLiveTokenGlobalQuery).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+
+	const cookie = "session=valid-browser-session"
+	r := gin.New()
+	r.GET("/workspaces", AdminAuth(mockDB), func(c *gin.Context) {
+		actor, ok := c.Get("cp_session_actor")
+		if !ok {
+			t.Fatalf("expected cp_session_actor in context")
+		}
+		if actor != cpSessionActor(cookie) {
+			t.Fatalf("cp_session_actor = %q, want stable hashed actor", actor)
+		}
+		if actor == cookie {
+			t.Fatalf("cp_session_actor must not expose the raw cookie")
+		}
+		c.JSON(http.StatusOK, gin.H{"ok": true})
+	})
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/workspaces", nil)
+	req.Header.Set("Cookie", cookie)
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for verified CP session, got %d: %s", w.Code, w.Body.String())
+	}
+	if hits.Load() != 1 {
+		t.Fatalf("expected one CP verification request, got %d", hits.Load())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
 // TestAdminAuth_C10_NoBearer_Returns401 — C10 critical path: when at least
 // one workspace has tokens, GET /admin/secrets without a bearer → 401.
 func TestAdminAuth_C10_NoBearer_Returns401(t *testing.T) {

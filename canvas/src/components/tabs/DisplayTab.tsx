@@ -265,6 +265,11 @@ function DisplayControlBar({
   onAcquire: () => void;
   onRelease: () => void;
 }) {
+  const userControl = control?.controller === "user";
+  const adminControl = userControl && control?.controlled_by === "admin-token";
+  const canAcquireUserControl = control?.controller === "none" || (userControl && !hasSession);
+  const canReleaseUserControl = adminControl || (userControl && hasSession);
+
   return (
     <div className="flex min-w-0 items-center gap-3">
       {control && (
@@ -282,8 +287,7 @@ function DisplayControlBar({
           {controlError && <p className="mt-0.5 text-[10px] text-red-200">{controlError}</p>}
         </div>
       )}
-      {(control?.controller === "none" ||
-        (control?.controller === "user" && control.controlled_by === "admin-token" && !hasSession)) && (
+      {canAcquireUserControl && (
         <button
           type="button"
           onClick={onAcquire}
@@ -293,7 +297,7 @@ function DisplayControlBar({
           Take control
         </button>
       )}
-      {control?.controller === "user" && control.controlled_by === "admin-token" && (
+      {canReleaseUserControl && (
         <button
           type="button"
           onClick={onRelease}

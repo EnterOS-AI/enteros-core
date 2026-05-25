@@ -258,6 +258,48 @@ func TestWorkspaceDisplayControlAcquire_RejectsCoarseSessionActor(t *testing.T) 
 	}
 }
 
+func TestWorkspaceDisplayControlAcquire_AcceptsVerifiedBrowserSessionActor(t *testing.T) {
+	mock := setupTestDB(t)
+	t.Setenv("DISPLAY_SESSION_SIGNING_SECRET", "display-session-test-secret")
+	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
+	expiresAt := time.Date(2026, 5, 23, 18, 30, 0, 0, time.UTC)
+
+	mock.ExpectQuery(`SELECT COALESCE\(compute, '\{\}'::jsonb\) FROM workspaces WHERE id = \$1`).
+		WithArgs("ws-display").
+		WillReturnRows(sqlmock.NewRows([]string{"compute"}).AddRow(`{"display":{"mode":"desktop-control","protocol":"dcv","width":1920,"height":1080}}`))
+	mock.ExpectQuery(`INSERT INTO workspace_display_control_locks`).
+		WithArgs("ws-display", "user", "session:abc123", 300).
+		WillReturnRows(sqlmock.NewRows([]string{"controller", "controlled_by", "expires_at"}).
+			AddRow("user", "session:abc123", expiresAt))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-display"}}
+	c.Request = httptest.NewRequest("POST", "/workspaces/ws-display/display/control/acquire", bytes.NewBufferString(`{"controller":"user","ttl_seconds":300}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Set("cp_session_actor", "session:abc123")
+
+	handler.AcquireDisplayControl(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to parse response: %v", err)
+	}
+	if resp["controller"] != "user" || resp["controlled_by"] != "session:abc123" {
+		t.Fatalf("lock response = %#v, want user/session actor", resp)
+	}
+	sessionURL, ok := resp["session_url"].(string)
+	if !ok || !strings.HasPrefix(sessionURL, "/workspaces/ws-display/display/session/websockify#token=") {
+		t.Fatalf("session_url = %#v, want signed websockify URL fragment", resp["session_url"])
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
 func TestWorkspaceDisplayControlRelease_RemovesCallerLock(t *testing.T) {
 	mock := setupTestDB(t)
 	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
