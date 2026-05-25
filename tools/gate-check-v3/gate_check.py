@@ -23,11 +23,9 @@ import json
 import os
 import re
 import sys
-import time
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone
-from typing import Any, Optional
 
 # ── Gitea API client ────────────────────────────────────────────────────────
 
@@ -160,9 +158,9 @@ def signal_1_comment_scan(pr_number: int, repo: str) -> dict:
     # Build reverse map: login -> (group, agent_key)
     login_to_group = {}
     for group, login in relevant_roles.items():
-        for role, l in AGENT_LOGIN_MAP.items():
-            if l == login:
-                login_to_group[l] = (group, f"core-{role}")
+        for role, role_login in AGENT_LOGIN_MAP.items():
+            if role_login == login:
+                login_to_group[role_login] = (group, f"core-{role}")
 
     # Collect all agent-tag matches from comments
     comments = []
