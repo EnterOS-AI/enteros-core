@@ -143,46 +143,30 @@ afterEach(() => {
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 
-/**
- * Drive the always-show-picker flow to completion: deploy() opens the
- * modal, then we click "keys added" to fire the actual POST. Centralised
- * here because as of the always-prompt change, every happy-path test
- * must click through the modal before asserting on POST.
- */
-async function deployThroughPicker<T>(
-  result: { current: ReturnType<typeof useTemplateDeploy> },
-  rerender: () => void,
-  template: Template,
-): Promise<void> {
-  await act(async () => {
-    await result.current.deploy(template);
-  });
-  rerender();
-  render(<>{result.current.modal}</>);
-  await act(async () => {
-    fireEvent.click(screen.getByTestId("modal-keys-added"));
-    // Let the fire-and-forget executeDeploy resolve.
-    await Promise.resolve();
-    await Promise.resolve();
-  });
-}
-
 describe("useTemplateDeploy — happy path", () => {
-  it("preflight ok → modal opens → keys-added → POST /workspaces → onDeployed fires", async () => {
+  it("preflight ok with no key requirements → POST /workspaces directly → onDeployed fires", async () => {
     const onDeployed = vi.fn();
-    const { result, rerender } = renderHook(() =>
+    const { result } = renderHook(() =>
       useTemplateDeploy({ onDeployed }),
     );
 
-    await deployThroughPicker(result, rerender, makeTemplate());
+    await act(async () => {
+      await result.current.deploy(makeTemplate({
+        id: "seo-agent",
+        name: "SEO Agent",
+        model: "MiniMax-M2.7",
+      }));
+    });
 
     expect(mockCheckDeploySecrets).toHaveBeenCalledTimes(1);
     expect(mockApiPost).toHaveBeenCalledWith(
       "/workspaces",
       expect.objectContaining({
-        name: "Claude Code",
-        template: "claude-code-default",
+        name: "SEO Agent",
+        template: "seo-agent",
         tier: 1,
+        model: "MiniMax-M2.7",
+        llm_provider: "minimax",
       }),
     );
     expect(onDeployed).toHaveBeenCalledWith("ws-new");
@@ -192,11 +176,13 @@ describe("useTemplateDeploy — happy path", () => {
 
   it("uses caller-supplied canvasCoords when provided", async () => {
     const canvasCoords = vi.fn(() => ({ x: 42, y: 99 }));
-    const { result, rerender } = renderHook(() =>
+    const { result } = renderHook(() =>
       useTemplateDeploy({ canvasCoords }),
     );
 
-    await deployThroughPicker(result, rerender, makeTemplate());
+    await act(async () => {
+      await result.current.deploy(makeTemplate());
+    });
 
     expect(canvasCoords).toHaveBeenCalledTimes(1);
     expect(mockApiPost).toHaveBeenCalledWith(
@@ -206,9 +192,11 @@ describe("useTemplateDeploy — happy path", () => {
   });
 
   it("falls back to random coords inside [100,500] × [100,400] when canvasCoords omitted", async () => {
-    const { result, rerender } = renderHook(() => useTemplateDeploy());
+    const { result } = renderHook(() => useTemplateDeploy());
 
-    await deployThroughPicker(result, rerender, makeTemplate());
+    await act(async () => {
+      await result.current.deploy(makeTemplate());
+    });
 
     const body = (mockApiPost as Mock).mock.calls[0]?.[1] as {
       canvas: { x: number; y: number };
@@ -458,16 +446,9 @@ describe("useTemplateDeploy — multi-provider always-ask flow", () => {
     );
   });
 
-  it("single-provider template ALSO opens picker when preflight.ok (always-prompt rule)", async () => {
-    // Default preflight mock: ok=true, providers=[]. claude-code is
-    // single-provider, but the always-prompt rule means the user must
-    // still click through the picker to confirm provider+model — even
-    // when keys are saved and the runtime has only one provider option.
-    // Reason: the user needs an explicit chance to override the
-    // template's default model (e.g. opus vs sonnet vs haiku) before
-    // an EC2 boots and burns billing on the wrong tier.
+  it("template with no provider requirements deploys directly on platform-managed defaults", async () => {
     const onDeployed = vi.fn();
-    const { result, rerender } = renderHook(() =>
+    const { result } = renderHook(() =>
       useTemplateDeploy({ onDeployed }),
     );
 
@@ -475,13 +456,18 @@ describe("useTemplateDeploy — multi-provider always-ask flow", () => {
       await result.current.deploy(makeTemplate());
     });
 
-    rerender();
     render(<>{result.current.modal}</>);
 
-    expect(screen.getByTestId("missing-keys-modal")).toBeTruthy();
-    // POST does NOT fire until the user confirms in the picker.
-    expect(mockApiPost).not.toHaveBeenCalled();
-    expect(onDeployed).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("missing-keys-modal")).toBeNull();
+    expect(mockApiPost).toHaveBeenCalledWith(
+      "/workspaces",
+      expect.objectContaining({
+        template: "claude-code-default",
+        model: "claude-sonnet-4-5",
+        llm_provider: "anthropic",
+      }),
+    );
+    expect(onDeployed).toHaveBeenCalledWith("ws-new");
     expect(result.current.deploying).toBeNull();
   });
 
@@ -519,11 +505,13 @@ describe("useTemplateDeploy — POST failure", () => {
   it("POST rejection sets error and clears deploying", async () => {
     mockApiPost.mockRejectedValueOnce(new Error("server 500"));
     const onDeployed = vi.fn();
-    const { result, rerender } = renderHook(() =>
+    const { result } = renderHook(() =>
       useTemplateDeploy({ onDeployed }),
     );
 
-    await deployThroughPicker(result, rerender, makeTemplate());
+    await act(async () => {
+      await result.current.deploy(makeTemplate());
+    });
 
     expect(result.current.error).toBe("server 500");
     expect(result.current.deploying).toBeNull();
@@ -532,9 +520,11 @@ describe("useTemplateDeploy — POST failure", () => {
 
   it("non-Error rejection still surfaces a message (defensive)", async () => {
     mockApiPost.mockRejectedValueOnce("plain string");
-    const { result, rerender } = renderHook(() => useTemplateDeploy());
+    const { result } = renderHook(() => useTemplateDeploy());
 
-    await deployThroughPicker(result, rerender, makeTemplate());
+    await act(async () => {
+      await result.current.deploy(makeTemplate());
+    });
 
     expect(result.current.error).toBe("Deploy failed");
     expect(result.current.deploying).toBeNull();

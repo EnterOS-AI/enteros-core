@@ -176,9 +176,13 @@ type CreateWorkspacePayload struct {
 	Template string `json:"template"` // workspace-configs-templates folder name
 	Tier     int    `json:"tier"`
 	Model    string `json:"model"`
-	Runtime  string `json:"runtime"`  // "claude-code" (default), "codex", etc.
-	External bool   `json:"external"` // true = no Docker container, just a registered URL
-	URL      string `json:"url"`      // for external workspaces: the A2A endpoint URL (push mode only — omit for poll)
+	// LLMProvider is the optional provider slug paired with Model. Runtimes
+	// such as claude-code need a bare model id plus explicit provider slug;
+	// hermes can still derive provider from slash-prefixed model ids.
+	LLMProvider string `json:"llm_provider"`
+	Runtime     string `json:"runtime"`  // "claude-code" (default), "codex", etc.
+	External    bool   `json:"external"` // true = no Docker container, just a registered URL
+	URL         string `json:"url"`      // for external workspaces: the A2A endpoint URL (push mode only — omit for poll)
 	// DeliveryMode: "push" (default) sends inbound A2A to URL synchronously;
 	// "poll" records inbound to activity_logs for the agent to consume via
 	// GET /activity?since_id=. Poll mode does not require a URL. See #2339.

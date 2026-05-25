@@ -33,7 +33,51 @@ interface HermesProvider {
   models: string[];
 }
 
-const DEFAULT_CREATE_MODEL = "anthropic:claude-opus-4-7";
+type LLMAuthMode = "platform" | "api_key" | "oauth";
+
+interface NativeLLMProvider {
+  id: string;
+  label: string;
+  envVar?: string;
+  defaultModel: string;
+  models: string[];
+  authModes: LLMAuthMode[];
+}
+
+export const NATIVE_LLM_PROVIDERS: NativeLLMProvider[] = [
+  {
+    id: "minimax",
+    label: "MiniMax",
+    envVar: "MINIMAX_API_KEY",
+    defaultModel: "MiniMax-M2.7",
+    models: ["MiniMax-M2.7", "MiniMax-M2.7-highspeed", "MiniMax-M2.5"],
+    authModes: ["platform", "api_key"],
+  },
+  {
+    id: "kimi-coding",
+    label: "Kimi",
+    envVar: "KIMI_API_KEY",
+    defaultModel: "kimi-for-coding",
+    models: ["kimi-for-coding", "kimi-k2.5", "kimi-k2"],
+    authModes: ["platform", "api_key"],
+  },
+  {
+    id: "anthropic",
+    label: "Anthropic",
+    envVar: "ANTHROPIC_API_KEY",
+    defaultModel: "claude-sonnet-4-6",
+    models: ["claude-sonnet-4-6", "claude-opus-4-7", "claude-haiku-4-5"],
+    authModes: ["platform", "api_key"],
+  },
+  {
+    id: "anthropic-oauth",
+    label: "Claude OAuth",
+    envVar: "CLAUDE_CODE_OAUTH_TOKEN",
+    defaultModel: "sonnet",
+    models: ["sonnet", "opus", "haiku"],
+    authModes: ["oauth"],
+  },
+];
 const DEFAULT_HEADLESS_INSTANCE_TYPE = "t3.medium";
 const DEFAULT_HEADLESS_ROOT_GB = 30;
 const DEFAULT_DISPLAY_INSTANCE_TYPE = "t3.xlarge";
@@ -105,6 +149,10 @@ export function CreateWorkspaceButton() {
   // (Anthropic), which 401s if the user's key is for a different
   // provider. Hence: require model when template=hermes.
   const [hermesModel, setHermesModel] = useState("");
+  const [llmAuthMode, setLLMAuthMode] = useState<LLMAuthMode>("platform");
+  const [llmProvider, setLLMProvider] = useState("minimax");
+  const [llmModel, setLLMModel] = useState("MiniMax-M2.7");
+  const [llmSecret, setLLMSecret] = useState("");
 
   // Tier picker: on SaaS every workspace gets its own EC2 VM (Full Access
   // by construction), so we hide the T1/T2/T3 Docker-sandbox tiers and
@@ -161,6 +209,14 @@ export function CreateWorkspaceButton() {
   );
 
   const isHermes = template.trim().toLowerCase() === "hermes";
+  const nativeLLMProviders = useMemo(
+    () => NATIVE_LLM_PROVIDERS.filter((p) => p.authModes.includes(llmAuthMode)),
+    [llmAuthMode],
+  );
+  const selectedNativeProvider = useMemo(
+    () => nativeLLMProviders.find((p) => p.id === llmProvider) ?? nativeLLMProviders[0],
+    [llmProvider, nativeLLMProviders],
+  );
 
   // Resolve the selected template's spec from the /templates response.
   // The `template` input is free-text; templates can be matched by id,
@@ -208,6 +264,22 @@ export function CreateWorkspaceButton() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [availableProviders, isHermes]);
 
+  useEffect(() => {
+    if (isHermes) return;
+    if (nativeLLMProviders.length === 0) return;
+    if (!nativeLLMProviders.some((p) => p.id === llmProvider)) {
+      setLLMProvider(nativeLLMProviders[0].id);
+      setLLMModel(nativeLLMProviders[0].defaultModel);
+    }
+  }, [isHermes, llmProvider, nativeLLMProviders]);
+
+  useEffect(() => {
+    if (isHermes || !selectedNativeProvider) return;
+    if (!selectedNativeProvider.models.includes(llmModel)) {
+      setLLMModel(selectedNativeProvider.defaultModel);
+    }
+  }, [isHermes, llmModel, selectedNativeProvider]);
+
   // Auto-fill hermesModel with the provider's defaultModel whenever the
   // provider changes, but only if the user hasn't already typed their own
   // slug. Prevents the empty-model → "auto" → Anthropic-default 401 trap.
@@ -242,6 +314,10 @@ export function CreateWorkspaceButton() {
     setExternalRuntime("external");
     setHermesApiKey("");
     setHermesModel("");
+    setLLMAuthMode("platform");
+    setLLMProvider("minimax");
+    setLLMModel("MiniMax-M2.7");
+    setLLMSecret("");
     api
       .get<WorkspaceOption[]>("/workspaces")
       .then((ws) => setWorkspaces(ws))
@@ -268,12 +344,21 @@ export function CreateWorkspaceButton() {
       setError("Model is required for Hermes workspaces — provider routing depends on the model slug prefix");
       return;
     }
+    if (!isExternal && !isHermes && !llmModel.trim()) {
+      setError("Model is required");
+      return;
+    }
+    if (!isExternal && !isHermes && llmAuthMode !== "platform" && !llmSecret.trim()) {
+      setError(llmAuthMode === "oauth" ? "Claude OAuth token is required" : "API key is required");
+      return;
+    }
     setCreating(true);
     setError(null);
 
     const provider = isHermes
       ? HERMES_PROVIDERS.find((p) => p.id === hermesProvider)
       : undefined;
+    const nativeProvider = !isHermes ? selectedNativeProvider : undefined;
 
     try {
       const parsedBudget = budgetLimit.trim()
@@ -297,7 +382,15 @@ export function CreateWorkspaceButton() {
         tier,
         parent_id: parentId || undefined,
         budget_limit: parsedBudget,
-        ...(!isExternal && !isHermes ? { model: DEFAULT_CREATE_MODEL } : {}),
+        ...(!isExternal && !isHermes && nativeProvider
+          ? {
+              model: llmModel.trim(),
+              llm_provider: nativeProvider.id,
+              ...(llmAuthMode !== "platform" && nativeProvider.envVar
+                ? { secrets: { [nativeProvider.envVar]: llmSecret.trim() } }
+                : {}),
+            }
+          : {}),
         ...(!isExternal
           ? {
               compute: displayEnabled
@@ -449,6 +542,82 @@ export function CreateWorkspaceButton() {
               />
             )}
 
+            {!isExternal && !isHermes && selectedNativeProvider && (
+              <div className="rounded-lg border border-line/50 bg-surface-card/40 p-3 space-y-3">
+                <div className="text-[11px] font-medium text-ink-mid">
+                  LLM
+                </div>
+                <div>
+                  <label htmlFor="llm-auth-mode" className="text-[11px] text-ink-mid block mb-1">
+                    Auth Mode
+                  </label>
+                  <select
+                    id="llm-auth-mode"
+                    value={llmAuthMode}
+                    onChange={(e) => setLLMAuthMode(e.target.value as LLMAuthMode)}
+                    className="w-full bg-surface-card/60 border border-line/50 rounded-lg px-3 py-2 text-sm text-ink focus:outline-none focus:border-accent/60 focus:ring-1 focus:ring-accent/20 transition-colors"
+                  >
+                    <option value="platform">Platform provided</option>
+                    <option value="api_key">API key</option>
+                    <option value="oauth">Claude OAuth</option>
+                  </select>
+                </div>
+                <div>
+                  <label htmlFor="llm-provider-select" className="text-[11px] text-ink-mid block mb-1">
+                    Provider
+                  </label>
+                  <select
+                    id="llm-provider-select"
+                    value={selectedNativeProvider.id}
+                    onChange={(e) => {
+                      const next = nativeLLMProviders.find((p) => p.id === e.target.value);
+                      setLLMProvider(e.target.value);
+                      if (next) setLLMModel(next.defaultModel);
+                    }}
+                    className="w-full bg-surface-card/60 border border-line/50 rounded-lg px-3 py-2 text-sm text-ink focus:outline-none focus:border-accent/60 focus:ring-1 focus:ring-accent/20 transition-colors"
+                  >
+                    {nativeLLMProviders.map((p) => (
+                      <option key={p.id} value={p.id}>
+                        {p.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label htmlFor="llm-model-input" className="text-[11px] text-ink-mid block mb-1">
+                    Model
+                  </label>
+                  <input
+                    id="llm-model-input"
+                    type="text"
+                    value={llmModel}
+                    onChange={(e) => setLLMModel(e.target.value)}
+                    list="llm-model-suggestions"
+                    spellCheck={false}
+                    className="w-full bg-surface-card/60 border border-line/50 rounded-lg px-3 py-2 text-sm text-ink placeholder-ink-soft focus:outline-none focus:border-accent/60 focus:ring-1 focus:ring-accent/20 transition-colors font-mono"
+                  />
+                  <datalist id="llm-model-suggestions">
+                    {selectedNativeProvider.models.map((m) => <option key={m} value={m} />)}
+                  </datalist>
+                </div>
+                {llmAuthMode !== "platform" && (
+                  <div>
+                    <label htmlFor="llm-secret-input" className="text-[11px] text-ink-mid block mb-1">
+                      {llmAuthMode === "oauth" ? "OAuth Token" : "API Key"}
+                    </label>
+                    <input
+                      id="llm-secret-input"
+                      type="password"
+                      value={llmSecret}
+                      onChange={(e) => setLLMSecret(e.target.value)}
+                      autoComplete="off"
+                      className="w-full bg-surface-card/60 border border-line/50 rounded-lg px-3 py-2 text-sm text-ink placeholder-ink-soft focus:outline-none focus:border-accent/60 focus:ring-1 focus:ring-accent/20 transition-colors font-mono"
+                    />
+                  </div>
+                )}
+              </div>
+            )}
+
             <div>
               <div
                 role="radiogroup"
@@ -553,10 +722,11 @@ export function CreateWorkspaceButton() {
             )}
 
             <div>
-              <label className="text-[11px] text-ink-mid block mb-1">
+              <label htmlFor="parent-workspace-select" className="text-[11px] text-ink-mid block mb-1">
                 Parent Workspace
               </label>
               <select
+                id="parent-workspace-select"
                 value={parentId}
                 onChange={(e) => setParentId(e.target.value)}
                 className="w-full bg-surface-card/60 border border-line/50 rounded-lg px-3 py-2 text-sm text-ink focus:outline-none focus:border-accent/60 focus:ring-1 focus:ring-accent/20 transition-colors"
