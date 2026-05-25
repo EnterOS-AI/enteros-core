@@ -70,7 +70,7 @@ def test_diag_memory_root_writable_in_canary_mode(sim: CPSim) -> None:
     key = f"canary-probe-{uuid.uuid4().hex[:8]}"
     try:
         val = sim.probe_memory(key)
-    except Exception as e:
+    except Exception:
         # /mcp may not be exposed on this template — canary 4 will
         # surface the real defect if memory is actually broken.
         if os.environ.get("CANARY_STRICT_MCP") == "1":
