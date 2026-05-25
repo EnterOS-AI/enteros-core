@@ -145,15 +145,13 @@ export function AttachmentPDF({ workspaceId, attachment, onDownload, tone }: Pro
         onClose={() => setOpen(false)}
         ariaLabel={`Preview of ${attachment.name}`}
       >
-        <embed
-          src={state.blobUrl}
-          type="application/pdf"
-          // The lightbox's content slot caps at 95vw / 90vh, so size
-          // 100% within that and let the user scroll inside the PDF
-          // viewer.
-          style={{ width: "95vw", height: "90vh" }}
-          aria-label={attachment.name}
-        />
+        <div className="h-[90vh] w-[95vw] overflow-hidden rounded-lg border border-white/20 bg-white shadow-2xl">
+          <iframe
+            src={`${state.blobUrl}#view=FitH`}
+            title={attachment.name}
+            className="h-full w-full bg-white"
+          />
+        </div>
       </AttachmentLightbox>
     </>
   );

@@ -13,7 +13,7 @@
  * Covers:
  *   - Renders loading skeleton with PdfGlyph + filename text
  *   - Renders preview button with PDF glyph, filename, and "PDF" label
- *   - Opens lightbox with <embed> on button click
+ *   - Opens lightbox with a framed <iframe> viewer on button click
  *   - Lightbox closes on Escape
  *   - tone=user applies blue/accent classes on button
  *   - tone=agent applies neutral border on button
@@ -136,7 +136,7 @@ describe("AttachmentPDF — ready", () => {
     expect(btn?.textContent).toContain("PDF");
   });
 
-  it("opens lightbox with <embed> on button click", async () => {
+  it("opens lightbox with a framed iframe viewer on button click", async () => {
     mockFetchOk("data");
     const att = makeAttachment("report.pdf");
     render(
@@ -158,8 +158,11 @@ describe("AttachmentPDF — ready", () => {
     });
     const dialog = document.querySelector('[role="dialog"]');
     expect(dialog?.getAttribute("aria-label")).toContain("report.pdf");
-    // Lightbox contains an <embed>
-    expect(dialog?.querySelector("embed")).toBeTruthy();
+    const frame = dialog?.querySelector("iframe") as HTMLIFrameElement | null;
+    expect(frame).toBeTruthy();
+    expect(frame?.getAttribute("title")).toBe("report.pdf");
+    expect(frame?.className).toContain("bg-white");
+    expect(dialog?.querySelector("embed")).toBeNull();
   });
 
   it("closes lightbox on Escape key", async () => {
