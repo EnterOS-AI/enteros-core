@@ -9,6 +9,8 @@ import type { WorkspaceCompute } from "@/store/socket";
 const INSTANCE_TYPES = ["t3.medium", "t3.large", "t3.xlarge", "t3.2xlarge", "m6i.large", "m6i.xlarge", "c6i.xlarge"];
 const RUNTIME_OPTIONS = ["claude-code", "codex", "hermes", "openclaw", "langgraph", "kimi", "kimi-cli", "external"];
 const RESOLUTIONS = ["1280x720", "1440x900", "1920x1080", "2560x1440"];
+const DEFAULT_HEADLESS_INSTANCE_TYPE = "t3.medium";
+const DEFAULT_HEADLESS_ROOT_GB = 30;
 
 type Props = {
   workspaceId: string;
@@ -30,15 +32,17 @@ type FormState = {
 };
 
 export function ContainerConfigTab({ workspaceId, data }: Props) {
-  const initial = useMemo(() => formFromData(data), [
-    data.runtime,
-    data.compute?.instance_type,
-    data.compute?.volume?.root_gb,
-    data.compute?.display?.mode,
-    data.compute?.display?.protocol,
-    data.compute?.display?.width,
-    data.compute?.display?.height,
-  ]);
+  const runtime = data.runtime;
+  const instanceType = data.compute?.instance_type;
+  const rootGB = data.compute?.volume?.root_gb;
+  const displayMode = data.compute?.display?.mode;
+  const displayProtocol = data.compute?.display?.protocol;
+  const displayWidth = data.compute?.display?.width;
+  const displayHeight = data.compute?.display?.height;
+  const initial = useMemo(
+    () => formFromData({ runtime, instanceType, rootGB, displayMode, displayProtocol, displayWidth, displayHeight }),
+    [runtime, instanceType, rootGB, displayMode, displayProtocol, displayWidth, displayHeight],
+  );
   const [form, setForm] = useState<FormState>(initial);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -219,18 +223,25 @@ export function ContainerConfigTab({ workspaceId, data }: Props) {
   );
 }
 
-function formFromData(data: Props["data"]): FormState {
-  const display = data.compute?.display;
-  const width = display?.width ?? 1920;
-  const height = display?.height ?? 1080;
+function formFromData(data: {
+  runtime?: string;
+  instanceType?: string;
+  rootGB?: number;
+  displayMode?: string;
+  displayProtocol?: string;
+  displayWidth?: number;
+  displayHeight?: number;
+}): FormState {
+  const width = data.displayWidth ?? 1920;
+  const height = data.displayHeight ?? 1080;
   const resolution = `${width}x${height}`;
   return {
     runtime: data.runtime || "claude-code",
-    instanceType: data.compute?.instance_type || "t3.large",
-    rootGB: String(data.compute?.volume?.root_gb || 50),
-    displayEnabled: !!display?.mode && display.mode !== "none",
-    displayMode: display?.mode && display.mode !== "none" ? display.mode : "desktop-control",
-    displayProtocol: display?.protocol || "novnc",
+    instanceType: data.instanceType || DEFAULT_HEADLESS_INSTANCE_TYPE,
+    rootGB: String(data.rootGB || DEFAULT_HEADLESS_ROOT_GB),
+    displayEnabled: !!data.displayMode && data.displayMode !== "none",
+    displayMode: data.displayMode && data.displayMode !== "none" ? data.displayMode : "desktop-control",
+    displayProtocol: data.displayProtocol || "novnc",
     resolution,
   };
 }

@@ -34,6 +34,10 @@ interface HermesProvider {
 }
 
 const DEFAULT_CREATE_MODEL = "anthropic:claude-opus-4-7";
+const DEFAULT_HEADLESS_INSTANCE_TYPE = "t3.medium";
+const DEFAULT_HEADLESS_ROOT_GB = 30;
+const DEFAULT_DISPLAY_INSTANCE_TYPE = "t3.xlarge";
+const DEFAULT_DISPLAY_ROOT_GB = 80;
 
 // All providers supported by Hermes runtime via providers.resolve_provider().
 // `defaultModel` is the slug injected into the workspace provision request
@@ -71,8 +75,8 @@ export function CreateWorkspaceButton() {
   const [error, setError] = useState<string | null>(null);
   const [workspaces, setWorkspaces] = useState<WorkspaceOption[]>([]);
   const [displayEnabled, setDisplayEnabled] = useState(false);
-  const [displayInstanceType, setDisplayInstanceType] = useState("t3.xlarge");
-  const [displayRootGB, setDisplayRootGB] = useState("80");
+  const [displayInstanceType, setDisplayInstanceType] = useState(DEFAULT_DISPLAY_INSTANCE_TYPE);
+  const [displayRootGB, setDisplayRootGB] = useState(String(DEFAULT_DISPLAY_ROOT_GB));
   const [displayResolution, setDisplayResolution] = useState("1920x1080");
   // Templates fetched from /api/templates — drives the dynamic provider
   // filter below. Same data source ConfigTab uses (PR #2454). When the
@@ -104,8 +108,9 @@ export function CreateWorkspaceButton() {
 
   // Tier picker: on SaaS every workspace gets its own EC2 VM (Full Access
   // by construction), so we hide the T1/T2/T3 Docker-sandbox tiers and
-  // lock to T4 — the full-host access tier, which maps to t3.large at the
-  // CP level. On self-hosted we still offer T1/T2/T3 because the Docker-
+  // lock to T4 — the full-host access tier. The EC2 size is controlled by
+  // the compute profile below. On self-hosted we still offer T1/T2/T3
+  // because the Docker-
   // sandbox distinction is a real choice there; T4 is available too for
   // operators who want the full-host tier.
   //
@@ -230,8 +235,8 @@ export function CreateWorkspaceButton() {
     setBudgetLimit("");
     setError(null);
     setDisplayEnabled(false);
-    setDisplayInstanceType("t3.xlarge");
-    setDisplayRootGB("80");
+    setDisplayInstanceType(DEFAULT_DISPLAY_INSTANCE_TYPE);
+    setDisplayRootGB(String(DEFAULT_DISPLAY_ROOT_GB));
     setDisplayResolution("1920x1080");
     setHermesProvider("anthropic");
     setExternalRuntime("external");
@@ -293,18 +298,24 @@ export function CreateWorkspaceButton() {
         parent_id: parentId || undefined,
         budget_limit: parsedBudget,
         ...(!isExternal && !isHermes ? { model: DEFAULT_CREATE_MODEL } : {}),
-        ...(displayEnabled
+        ...(!isExternal
           ? {
-              compute: {
-                instance_type: displayInstanceType,
-                volume: { root_gb: Number.isFinite(parsedRootGB) ? parsedRootGB : 80 },
-                display: {
-                  mode: "desktop-control",
-                  protocol: "novnc",
-                  width: Number.isFinite(displayWidth) ? displayWidth : 1920,
-                  height: Number.isFinite(displayHeight) ? displayHeight : 1080,
-                },
-              },
+              compute: displayEnabled
+                ? {
+                    instance_type: displayInstanceType,
+                    volume: { root_gb: Number.isFinite(parsedRootGB) ? parsedRootGB : DEFAULT_DISPLAY_ROOT_GB },
+                    display: {
+                      mode: "desktop-control",
+                      protocol: "novnc",
+                      width: Number.isFinite(displayWidth) ? displayWidth : 1920,
+                      height: Number.isFinite(displayHeight) ? displayHeight : 1080,
+                    },
+                  }
+                : {
+                    instance_type: DEFAULT_HEADLESS_INSTANCE_TYPE,
+                    volume: { root_gb: DEFAULT_HEADLESS_ROOT_GB },
+                    display: { mode: "none" },
+                  },
             }
           : {}),
         canvas: { x: Math.random() * 400 + 100, y: Math.random() * 300 + 100 },
