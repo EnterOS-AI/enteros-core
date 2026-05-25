@@ -189,6 +189,23 @@ describe("TemplatePalette — sidebar", () => {
     expect(screen.getByText("Researcher")).toBeTruthy();
   });
 
+  it("hides runtime-default templates from the deployable product template list", async () => {
+    mockGet.mockResolvedValue([
+      { id: "claude-code-default", name: "Claude Code Agent", description: "", tier: 4, skills: [] },
+      { id: "codex", name: "OpenAI Codex CLI", description: "", tier: 4, skills: [] },
+      { id: "hermes", name: "Hermes Agent", description: "", tier: 4, skills: [] },
+      { id: "openclaw", name: "OpenClaw Agent", description: "", tier: 4, skills: [] },
+      { id: "seo-agent", name: "SEO Agent", description: "SEO workspace template", tier: 4, skills: ["seo"] },
+    ]);
+    render(<TemplatePalette />);
+    await openSidebar();
+    expect(screen.getByText("SEO Agent")).toBeTruthy();
+    expect(screen.queryByText("Claude Code Agent")).toBeNull();
+    expect(screen.queryByText("OpenAI Codex CLI")).toBeNull();
+    expect(screen.queryByText("Hermes Agent")).toBeNull();
+    expect(screen.queryByText("OpenClaw Agent")).toBeNull();
+  });
+
   it("shows template description", async () => {
     mockGet.mockResolvedValue(MOCK_TEMPLATES);
     render(<TemplatePalette />);

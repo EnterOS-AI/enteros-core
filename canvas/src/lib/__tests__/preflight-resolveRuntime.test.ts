@@ -8,7 +8,7 @@
  * count bounded.
  */
 import { describe, it, expect } from "vitest";
-import { resolveRuntime } from "../deploy-preflight";
+import { isUserVisibleWorkspaceTemplate, resolveRuntime } from "../deploy-preflight";
 
 describe("resolveRuntime", () => {
   describe("explicit runtime-map entries", () => {
@@ -62,5 +62,17 @@ describe("resolveRuntime", () => {
       // The JS replace only replaces the first match by default
       expect(resolveRuntime("claude-code-default-default")).toBe("claude-code-default");
     });
+  });
+});
+
+describe("isUserVisibleWorkspaceTemplate", () => {
+  it("hides runtime-default templates from product template surfaces", () => {
+    for (const id of ["claude-code-default", "codex", "hermes", "openclaw"]) {
+      expect(isUserVisibleWorkspaceTemplate({ id })).toBe(false);
+    }
+  });
+
+  it("keeps product templates visible", () => {
+    expect(isUserVisibleWorkspaceTemplate({ id: "seo-agent" })).toBe(true);
   });
 });

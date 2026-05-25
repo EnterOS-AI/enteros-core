@@ -49,6 +49,17 @@ export interface Template extends TemplateLike {
   skill_count: number;
 }
 
+const RUNTIME_DEFAULT_TEMPLATE_IDS = new Set([
+  "claude-code-default",
+  "codex",
+  "hermes",
+  "openclaw",
+]);
+
+export function isUserVisibleWorkspaceTemplate(template: Pick<Template, "id">): boolean {
+  return !RUNTIME_DEFAULT_TEMPLATE_IDS.has(template.id);
+}
+
 /** Map from a template id to the runtime name the per-workspace
  *  preflight expects. Used only when the server's `/templates`
  *  response predates the `runtime` field on the summary (legacy
