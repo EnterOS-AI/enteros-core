@@ -49,6 +49,15 @@ const DEFAULT_LLM_MODELS: SelectorModel[] = [
   { id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6", required_env: ["ANTHROPIC_API_KEY"] },
   { id: "sonnet", name: "Claude Sonnet", required_env: ["CLAUDE_CODE_OAUTH_TOKEN"] },
 ];
+const DEFAULT_PLATFORM_MODEL = DEFAULT_LLM_MODELS[0];
+const DEFAULT_RUNTIME = "claude-code";
+const RUNTIME_OPTIONS = [
+  { value: "claude-code", label: "Claude Code" },
+  { value: "codex", label: "OpenAI Codex CLI" },
+  { value: "hermes", label: "Hermes" },
+  { value: "openclaw", label: "OpenClaw" },
+];
+const BASE_RUNTIME_TEMPLATE_IDS = new Set(["claude-code-default", "codex", "hermes", "openclaw"]);
 const DEFAULT_HEADLESS_INSTANCE_TYPE = "t3.medium";
 const DEFAULT_HEADLESS_ROOT_GB = 30;
 const DEFAULT_DISPLAY_INSTANCE_TYPE = "t3.xlarge";
@@ -83,6 +92,7 @@ export function CreateWorkspaceButton() {
   const [open, setOpen] = useState(false);
   const [name, setName] = useState("");
   const [role, setRole] = useState("");
+  const [runtime, setRuntime] = useState(DEFAULT_RUNTIME);
   const [template, setTemplate] = useState("");
   const [parentId, setParentId] = useState("");
   const [budgetLimit, setBudgetLimit] = useState("");
@@ -181,17 +191,59 @@ export function CreateWorkspaceButton() {
     []
   );
 
-  // Resolve the selected template's spec from the /templates response.
-  // The user picks a runtime/template preset from a dropdown; the value
-  // remains the template id because that is the backend create contract.
+  const handleRuntimeChange = useCallback((nextRuntime: string) => {
+    setRuntime(nextRuntime);
+    setTemplate("");
+    setHermesProvider("anthropic");
+    setHermesApiKey("");
+    setHermesModel("");
+    setLLMSelection({ providerId: "platform|", model: DEFAULT_PLATFORM_MODEL.id, envVars: [] });
+    setLLMSecret("");
+  }, []);
+
+  // Resolve the selected workspace template from /templates. Runtime is
+  // deliberately separate: "SEO Agent" is a workspace template, not a
+  // runtime, so it must never appear in the runtime selector.
   const selectedTemplateSpec = useMemo<TemplateSpec | null>(() => {
     if (!template) return null;
     return templateSpecs.find((s) => s.id === template) ?? null;
   }, [template, templateSpecs]);
-  const isHermes = (selectedTemplateSpec?.runtime ?? "").trim().toLowerCase() === "hermes";
+  const selectedRuntimeTemplateSpec = useMemo<TemplateSpec | null>(() => (
+    templateSpecs.find((s) => s.id === runtime && BASE_RUNTIME_TEMPLATE_IDS.has(s.id)) ?? null
+  ), [runtime, templateSpecs]);
+  const isHermes = runtime === "hermes";
+  const visibleTemplateSpecs = useMemo(
+    () => templateSpecs.filter((spec) => {
+      if (BASE_RUNTIME_TEMPLATE_IDS.has(spec.id)) return false;
+      const specRuntime = (spec.runtime ?? DEFAULT_RUNTIME).trim().toLowerCase();
+      return specRuntime === runtime;
+    }),
+    [runtime, templateSpecs],
+  );
   const llmModels = useMemo(
-    () => selectedTemplateSpec?.models?.length ? selectedTemplateSpec.models : DEFAULT_LLM_MODELS,
-    [selectedTemplateSpec],
+    () => {
+      if (!selectedTemplateSpec?.models?.length) return DEFAULT_LLM_MODELS;
+      if (isHermes) {
+        return selectedTemplateSpec.models;
+      }
+      if (selectedTemplateSpec.models.some((model) => model.provider === "platform")) {
+        return selectedTemplateSpec.models;
+      }
+      const templateDefault = selectedTemplateSpec.model?.trim();
+      const defaultModelSpec = templateDefault
+        ? selectedTemplateSpec.models.find((model) => model.id === templateDefault)
+        : undefined;
+      return [
+        {
+          id: templateDefault || DEFAULT_PLATFORM_MODEL.id,
+          name: defaultModelSpec?.name ?? DEFAULT_PLATFORM_MODEL.name,
+          provider: "platform",
+          required_env: [],
+        },
+        ...selectedTemplateSpec.models,
+      ];
+    },
+    [isHermes, selectedTemplateSpec],
   );
   const llmCatalog = useMemo(() => buildProviderCatalog(llmModels), [llmModels]);
   const selectedLLMProvider = useMemo(
@@ -204,7 +256,7 @@ export function CreateWorkspaceButton() {
   // templates that haven't migrated to the explicit `providers:` field
   // (and self-hosted setups without /templates) keep working unchanged.
   const availableProviders = useMemo<HermesProvider[]>(() => {
-    const declared = selectedTemplateSpec?.providers;
+    const declared = selectedTemplateSpec?.providers ?? selectedRuntimeTemplateSpec?.providers;
     if (!declared || declared.length === 0) return HERMES_PROVIDERS;
     const allowed = new Set(declared.map((p) => p.toLowerCase()));
     const filtered = HERMES_PROVIDERS.filter((p) => allowed.has(p.id.toLowerCase()));
@@ -213,7 +265,7 @@ export function CreateWorkspaceButton() {
     // metadata for yet), fall back to the full list rather than render
     // an empty <select>. Better to over-show than to lock the user out.
     return filtered.length > 0 ? filtered : HERMES_PROVIDERS;
-  }, [selectedTemplateSpec]);
+  }, [selectedRuntimeTemplateSpec, selectedTemplateSpec]);
 
   // If the currently-selected provider is filtered out by a template
   // change, snap back to the first available. Without this, the
@@ -267,6 +319,7 @@ export function CreateWorkspaceButton() {
     setName("");
     setRole("");
     setTier(defaultTier);
+    setRuntime(DEFAULT_RUNTIME);
     setTemplate("");
     setParentId("");
     setBudgetLimit("");
@@ -378,7 +431,7 @@ export function CreateWorkspaceButton() {
         // Runtime=external flips the backend into awaiting-agent mode:
         // no container provisioning, token minted, connection payload
         // returned in the response for the modal below.
-        ...(isExternal ? { runtime: externalRuntime } : {}),
+        ...(isExternal ? { runtime: externalRuntime } : { runtime }),
         ...(!isExternal && isHermes && provider
           ? {
               secrets: { [provider.envVar]: hermesApiKey.trim() },
@@ -496,24 +549,42 @@ export function CreateWorkspaceButton() {
             )}
 
             {!isExternal && (
-              <div>
-                <label htmlFor="runtime-template-select" className="text-[11px] text-ink-mid block mb-1">
-                  Runtime
-                </label>
-                <select
-                  id="runtime-template-select"
-                  value={template}
-                  onChange={(e) => setTemplate(e.target.value)}
-                  className="w-full bg-surface-card/60 border border-line/50 rounded-lg px-3 py-2 text-sm text-ink focus:outline-none focus:border-accent/60 focus:ring-1 focus:ring-accent/20 transition-colors"
-                >
-                  <option value="">Claude Code (blank workspace)</option>
-                  {templateSpecs.map((spec) => (
-                    <option key={spec.id} value={spec.id}>
-                      {spec.name || spec.id}
-                      {spec.runtime ? ` (${spec.runtime})` : ""}
-                    </option>
-                  ))}
-                </select>
+              <div className="space-y-3">
+                <div>
+                  <label htmlFor="runtime-select" className="text-[11px] text-ink-mid block mb-1">
+                    Runtime
+                  </label>
+                  <select
+                    id="runtime-select"
+                    value={runtime}
+                    onChange={(e) => handleRuntimeChange(e.target.value)}
+                    className="w-full bg-surface-card/60 border border-line/50 rounded-lg px-3 py-2 text-sm text-ink focus:outline-none focus:border-accent/60 focus:ring-1 focus:ring-accent/20 transition-colors"
+                  >
+                    {RUNTIME_OPTIONS.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label htmlFor="workspace-template-select" className="text-[11px] text-ink-mid block mb-1">
+                    Workspace Template
+                  </label>
+                  <select
+                    id="workspace-template-select"
+                    value={template}
+                    onChange={(e) => setTemplate(e.target.value)}
+                    className="w-full bg-surface-card/60 border border-line/50 rounded-lg px-3 py-2 text-sm text-ink focus:outline-none focus:border-accent/60 focus:ring-1 focus:ring-accent/20 transition-colors"
+                  >
+                    <option value="">Blank workspace</option>
+                    {visibleTemplateSpecs.map((spec) => (
+                      <option key={spec.id} value={spec.id}>
+                        {spec.name || spec.id}
+                      </option>
+                    ))}
+                  </select>
+                </div>
               </div>
             )}
 
@@ -673,7 +744,7 @@ export function CreateWorkspaceButton() {
             </div>
           </div>
 
-          {/* Hermes provider configuration — shown only when template === "hermes" */}
+          {/* Hermes provider configuration — shown only for the Hermes runtime. */}
           {isHermes && (
             <div
               className="mt-4 rounded-xl border border-violet-700/40 bg-violet-950/20 p-4 space-y-3"
