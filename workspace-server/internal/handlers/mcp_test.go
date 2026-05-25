@@ -937,6 +937,75 @@ func TestMCPHandler_SendMessageToUser_PersistsToActivityLog(t *testing.T) {
 	}
 }
 
+func TestMCPHandler_SendMessageToUser_WithAttachments_PersistsFileParts(t *testing.T) {
+	t.Setenv("MOLECULE_MCP_ALLOW_SEND_MESSAGE", "true")
+	h, mock := newMCPHandler(t)
+
+	mock.ExpectQuery("SELECT name, talk_to_user_enabled FROM workspaces").
+		WithArgs("ws-mcp-attach").
+		WillReturnRows(sqlmock.NewRows([]string{"name", "talk_to_user_enabled"}).AddRow("Hermes Agent", true))
+
+	mock.ExpectExec(`INSERT INTO activity_logs.*'a2a_receive'.*'notify'`).
+		WithArgs(
+			"ws-mcp-attach",
+			sqlmock.AnyArg(),
+			jsonMatcher{
+				desc: "MCP send_message_to_user response_body has result + file parts",
+				predicate: func(parsed map[string]any) bool {
+					if parsed["result"] != "see attached" {
+						return false
+					}
+					parts, ok := parsed["parts"].([]any)
+					if !ok || len(parts) != 1 {
+						return false
+					}
+					part, ok := parts[0].(map[string]any)
+					if !ok || part["kind"] != "file" {
+						return false
+					}
+					file, ok := part["file"].(map[string]any)
+					return ok &&
+						file["uri"] == "workspace:/workspace/org_chart_v2.png" &&
+						file["name"] == "org_chart_v2.png" &&
+						file["mimeType"] == "image/png" &&
+						file["size"] == float64(12345)
+				},
+			},
+		).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	w := mcpPost(t, h, "ws-mcp-attach", map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      102,
+		"method":  "tools/call",
+		"params": map[string]interface{}{
+			"name": "send_message_to_user",
+			"arguments": map[string]interface{}{
+				"message": "see attached",
+				"attachments": []map[string]interface{}{
+					{
+						"uri":      "workspace:/workspace/org_chart_v2.png",
+						"name":     "org_chart_v2.png",
+						"mimeType": "image/png",
+						"size":     12345,
+					},
+				},
+			},
+		},
+	})
+
+	var resp mcpResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("response was not valid JSON-RPC: %v\nbody=%s", err, w.Body.String())
+	}
+	if resp.Error != nil {
+		t.Errorf("unexpected JSON-RPC error: %+v", resp.Error)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("MCP attachment response_body drift: %v", err)
+	}
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Parse error
 // ─────────────────────────────────────────────────────────────────────────────

@@ -348,18 +348,68 @@ func (h *MCPHandler) toolSendMessageToUser(ctx context.Context, workspaceID stri
 	// activity.go:Notify is what produced the reno-stars data-loss
 	// regression; both paths now route through the same writer.
 	//
-	// MCP send_message_to_user does not currently surface attachments
-	// (the tool args don't accept them); pass nil. If a future tool
-	// schema adds an attachments arg, build []AgentMessageAttachment
-	// and pass through.
+	attachments, err := parseAgentMessageAttachments(args["attachments"])
+	if err != nil {
+		return "", err
+	}
 	writer := NewAgentMessageWriter(h.database, h.broadcaster)
-	if err := writer.Send(ctx, workspaceID, message, nil); err != nil {
+	if err := writer.Send(ctx, workspaceID, message, attachments); err != nil {
 		if errors.Is(err, ErrWorkspaceNotFound) {
 			return "", fmt.Errorf("workspace not found")
 		}
 		return "", err
 	}
 	return "Message sent.", nil
+}
+
+func parseAgentMessageAttachments(raw interface{}) ([]AgentMessageAttachment, error) {
+	if raw == nil {
+		return nil, nil
+	}
+	items, ok := raw.([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("attachments must be an array")
+	}
+	if len(items) == 0 {
+		return nil, nil
+	}
+	attachments := make([]AgentMessageAttachment, 0, len(items))
+	for i, item := range items {
+		m, ok := item.(map[string]interface{})
+		if !ok {
+			return nil, fmt.Errorf("attachment[%d]: must be an object", i)
+		}
+		uri, _ := m["uri"].(string)
+		name, _ := m["name"].(string)
+		if uri == "" || name == "" {
+			return nil, fmt.Errorf("attachment[%d]: uri and name are required", i)
+		}
+		att := AgentMessageAttachment{
+			URI:  uri,
+			Name: name,
+		}
+		if mimeType, ok := m["mimeType"].(string); ok {
+			att.MimeType = mimeType
+		}
+		if size, ok := numericInt64(m["size"]); ok {
+			att.Size = size
+		}
+		attachments = append(attachments, att)
+	}
+	return attachments, nil
+}
+
+func numericInt64(raw interface{}) (int64, bool) {
+	switch v := raw.(type) {
+	case int:
+		return int64(v), true
+	case int64:
+		return v, true
+	case float64:
+		return int64(v), true
+	default:
+		return 0, false
+	}
 }
 
 func (h *MCPHandler) toolCommitMemory(ctx context.Context, workspaceID string, args map[string]interface{}) (string, error) {
