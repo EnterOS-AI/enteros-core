@@ -64,10 +64,10 @@ var ErrTalkToUserDisabled = errors.New("agent_message: talk_to_user disabled")
 // distinct so the writer's API doesn't import a handler type with HTTP
 // binding tags.
 type AgentMessageAttachment struct {
-	URI      string
-	Name     string
-	MimeType string
-	Size     int64
+	URI      string `json:"uri"`
+	Name     string `json:"name"`
+	MimeType string `json:"mimeType,omitempty"`
+	Size     int64  `json:"size,omitempty"`
 }
 
 // AgentMessageWriter persists + broadcasts agent → user messages. Construct
