@@ -134,7 +134,7 @@ fi
 # ----------------------------------------------------------------------
 # Cleanup
 # ----------------------------------------------------------------------
-curl -s -X DELETE "$BASE/workspaces/$WS_ID?confirm=true" > /dev/null || true
+e2e_delete_workspace "$WS_ID" "Dev-Mode-Test"
 
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="

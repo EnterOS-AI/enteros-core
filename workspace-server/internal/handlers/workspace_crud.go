@@ -325,6 +325,37 @@ func (h *WorkspaceHandler) Delete(c *gin.Context) {
 		return
 	}
 
+	var workspaceName, workspaceStatus string
+	var activeTasks int
+	if err := db.DB.QueryRowContext(ctx,
+		`SELECT name, COALESCE(active_tasks, 0), status FROM workspaces WHERE id = $1`, id,
+	).Scan(&workspaceName, &activeTasks, &workspaceStatus); err != nil {
+		if err == sql.ErrNoRows {
+			c.JSON(http.StatusNotFound, gin.H{"error": "workspace not found"})
+			return
+		}
+		log.Printf("Delete: workspace lookup failed for %s: %v", id, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check workspace"})
+		return
+	}
+	if workspaceStatus == string(models.StatusRemoved) {
+		c.JSON(http.StatusGone, gin.H{"error": "workspace removed", "id": id})
+		return
+	}
+
+	if c.GetHeader("X-Confirm-Name") != workspaceName {
+		childCount, scheduleCount := destructiveDeleteCounts(ctx, id)
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":          "destructive_action_requires_confirmation",
+			"hint":           "Re-send the same request with header X-Confirm-Name: " + workspaceName,
+			"workspace_name": workspaceName,
+			"active_tasks":   activeTasks,
+			"child_count":    childCount,
+			"schedule_count": scheduleCount,
+		})
+		return
+	}
+
 	// Check for children
 	rows, err := db.DB.QueryContext(ctx,
 		`SELECT id, name FROM workspaces WHERE parent_id = $1 AND status != 'removed'`, id)
@@ -448,6 +479,22 @@ func (h *WorkspaceHandler) Delete(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"status": "removed", "cascade_deleted": len(descendantIDs)})
+}
+
+func destructiveDeleteCounts(ctx context.Context, id string) (childCount int, scheduleCount int) {
+	if err := db.DB.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM workspaces WHERE parent_id = $1 AND status != 'removed'`, id,
+	).Scan(&childCount); err != nil {
+		log.Printf("Delete: child count failed for %s: %v", id, err)
+		childCount = 0
+	}
+	if err := db.DB.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM workspace_schedules WHERE workspace_id = $1 AND enabled = true`, id,
+	).Scan(&scheduleCount); err != nil {
+		log.Printf("Delete: schedule count failed for %s: %v", id, err)
+		scheduleCount = 0
+	}
+	return childCount, scheduleCount
 }
 
 // CascadeDelete performs the cascade-removal sequence used by the HTTP

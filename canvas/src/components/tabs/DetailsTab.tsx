@@ -93,7 +93,9 @@ export function DetailsTab({ workspaceId, data }: Props) {
   const handleDelete = async () => {
     setDeleteError(null);
     try {
-      await api.del(`/workspaces/${workspaceId}?confirm=true`);
+      await api.del(`/workspaces/${workspaceId}?confirm=true`, {
+        headers: { "X-Confirm-Name": name },
+      });
       // Mirror the server-side cascade — drop the row + every
       // descendant locally so the canvas reflects the deletion
       // immediately, even when the WS is dead and the per-descendant

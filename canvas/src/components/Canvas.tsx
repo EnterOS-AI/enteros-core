@@ -232,7 +232,10 @@ function CanvasInner() {
     }
     state.beginDelete(subtree);
     try {
-      await api.del(`/workspaces/${id}?confirm=true`);
+      const workspaceName = state.nodes.find((n) => n.id === id)?.data.name ?? "";
+      await api.del(`/workspaces/${id}?confirm=true`, {
+        headers: { "X-Confirm-Name": workspaceName },
+      });
       // Mirror the server-side cascade locally — drop the parent AND
       // every descendant in one atomic update. The per-descendant
       // WORKSPACE_REMOVED WS events still arrive (and are no-ops

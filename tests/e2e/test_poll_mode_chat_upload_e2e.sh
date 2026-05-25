@@ -48,8 +48,8 @@ TMPDIR_E2E=$(mktemp -d -t poll-chat-upload-e2e-XXXXXX)
 
 cleanup() {
   local rc=$?
-  curl -s -X DELETE "$BASE/workspaces/$WS_A?confirm=true" >/dev/null 2>&1 || true
-  curl -s -X DELETE "$BASE/workspaces/$WS_B?confirm=true" >/dev/null 2>&1 || true
+  e2e_delete_workspace "$WS_A" "poll-chat-upload-test-a"
+  e2e_delete_workspace "$WS_B" "poll-chat-upload-test-b"
   rm -rf "$TMPDIR_E2E"
   exit $rc
 }

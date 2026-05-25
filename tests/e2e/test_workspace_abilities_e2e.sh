@@ -31,7 +31,11 @@ RECEIVER_TOKEN=""
 cleanup() {
   for wid in "$SENDER_ID" "$RECEIVER_ID"; do
     if [ -n "$wid" ]; then
-      curl -s -X DELETE "$BASE/workspaces/$wid?confirm=true" > /dev/null || true
+      if [ "$wid" = "$SENDER_ID" ]; then
+        e2e_delete_workspace "$wid" "Abilities Sender"
+      else
+        e2e_delete_workspace "$wid" "Abilities Receiver"
+      fi
     fi
   done
 }
@@ -88,7 +92,7 @@ except Exception:
 ")
   for _wid in $PRIOR; do
     echo "Sweeping leftover '$NAME' workspace: $_wid"
-    curl -s -X DELETE "$BASE/workspaces/$_wid?confirm=true" > /dev/null || true
+    e2e_delete_workspace "$_wid" "$NAME"
   done
 done
 

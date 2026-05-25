@@ -228,10 +228,12 @@ else
 fi
 
 # Clean up runtime test workspaces
-for rt_id in $RT_CC_ID $RT_CX_ID $RT_HM_ID; do
-  curl -s -X DELETE "$BASE/workspaces/$rt_id?confirm=true" > /dev/null 2>&1
-  sleep 0.3
-done
+e2e_delete_workspace "$RT_CC_ID" "RT Claude"
+sleep 0.3
+e2e_delete_workspace "$RT_CX_ID" "RT Codex"
+sleep 0.3
+e2e_delete_workspace "$RT_HM_ID" "RT Hermes"
+sleep 0.3
 
 # ============================================================
 # Section 3: Registry & Heartbeat
@@ -550,16 +552,21 @@ check "Import bundle" '"status"' "$R"
 echo ""
 echo "--- Section 14: Cleanup & Delete ---"
 
-# Delete with children — should require confirmation
+# Delete without name confirmation should be rejected before cascade.
 R=$(curl -s -X DELETE "$BASE/workspaces/$PM_ID")
-check "Delete PM requires confirmation" '"confirmation_required"' "$R"
+check "Delete PM requires name confirmation" '"destructive_action_requires_confirmation"' "$R"
+
+# Delete with name confirmation but without cascade confirmation should
+# still require explicit child confirmation.
+R=$(curl -s -X DELETE "$BASE/workspaces/$PM_ID" -H "X-Confirm-Name: Test PM")
+check "Delete PM requires cascade confirmation" '"confirmation_required"' "$R"
 
 # Delete with confirmation
-R=$(curl -s -X DELETE "$BASE/workspaces/$PM_ID?confirm=true")
+R=$(curl -s -X DELETE "$BASE/workspaces/$PM_ID?confirm=true" -H "X-Confirm-Name: Test PM")
 check "Delete PM cascades" '"cascade_deleted"' "$R"
 
 # Delete outsider
-curl -s -X DELETE "$BASE/workspaces/$OUTSIDER_ID?confirm=true" > /dev/null
+e2e_delete_workspace "$OUTSIDER_ID" "Test Outsider"
 
 # Clean up remaining workspaces (bundle imports, runtime test workspaces, etc.)
 sleep 2
@@ -568,7 +575,7 @@ import json, sys, subprocess, time
 ws = json.load(sys.stdin)
 for w in ws:
     time.sleep(0.5)  # avoid rate limit
-    subprocess.run(['curl', '-s', '-X', 'DELETE', '$BASE/workspaces/' + w['id'] + '?confirm=true'], capture_output=True)
+    subprocess.run(['curl', '-s', '-X', 'DELETE', '$BASE/workspaces/' + w['id'] + '?confirm=true', '-H', 'X-Confirm-Name: ' + w.get('name','')], capture_output=True)
 " 2>/dev/null
 
 # Poll for clean state up to 30s — DB cascade + container stop is async on busy systems

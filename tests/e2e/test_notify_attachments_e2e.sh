@@ -32,7 +32,7 @@ cleanup() {
   # Workspace teardown — best-effort, ignore errors so an unrelated CP
   # outage doesn't shadow a real test failure.
   if [ -n "$WSID" ]; then
-    curl -s -X DELETE "$BASE/workspaces/$WSID?confirm=true" > /dev/null || true
+    e2e_delete_workspace "$WSID" "Notify E2E"
   fi
   # /tmp scratch — pre-fix only ran on success path (the unconditional
   # rm at the bottom of the script). Trap-based path lets the file leak
@@ -89,7 +89,7 @@ except Exception:
 ')
 for _wid in $PRIOR; do
   echo "Sweeping leftover Notify E2E workspace: $_wid"
-  curl -s -X DELETE "$BASE/workspaces/$_wid?confirm=true" > /dev/null || true
+  e2e_delete_workspace "$_wid" "Notify E2E"
 done
 
 # model is required at the Create boundary (CTO 2026-05-22 SSOT — see

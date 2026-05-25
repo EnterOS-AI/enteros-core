@@ -289,7 +289,9 @@ R=$(curl -s "$BASE/workspaces" -H "Authorization: Bearer $ECHO_TOKEN")
 check "current_task in list response" '"current_task"' "$R"
 
 # Test 21: Delete
-R=$(acurl -X DELETE "$BASE/workspaces/$ECHO_ID" -H "Authorization: Bearer $ECHO_TOKEN")
+R=$(acurl -X DELETE "$BASE/workspaces/$ECHO_ID?confirm=true" \
+  -H "Authorization: Bearer $ECHO_TOKEN" \
+  -H "X-Confirm-Name: Echo Agent v2")
 check "DELETE /workspaces/:id" '"status":"removed"' "$R"
 
 R=$(curl -s "$BASE/workspaces" -H "Authorization: Bearer $SUM_TOKEN")
@@ -310,7 +312,9 @@ ORIG_TIER=$(echo "$BUNDLE" | python3 -c "import sys,json; print(json.load(sys.st
 
 # Delete the workspace — use SUM_TOKEN (per-workspace) for WorkspaceAuth
 # and ADMIN_TOKEN for the AdminAuth layer.
-R=$(curl -s -X DELETE "$BASE/workspaces/$SUM_ID" -H "Authorization: Bearer $SUM_TOKEN")
+R=$(curl -s -X DELETE "$BASE/workspaces/$SUM_ID?confirm=true" \
+  -H "Authorization: Bearer $SUM_TOKEN" \
+  -H "X-Confirm-Name: Summarizer Agent")
 check "Delete before re-import" '"status":"removed"' "$R"
 
 # After deleting both workspaces, all per-workspace tokens are revoked.
@@ -381,7 +385,7 @@ REBUNDLE=$(curl -s "$BASE/bundles/export/$NEW_ID" -H "Authorization: Bearer $NEW
 check "Re-exported bundle has agent_card" '"agent_card"' "$REBUNDLE"
 
 # Clean up — use the token just issued to the re-imported workspace
-curl -s -X DELETE "$BASE/workspaces/$NEW_ID" -H "Authorization: Bearer $NEW_TOKEN" > /dev/null
+e2e_delete_workspace "$NEW_ID" "$ORIG_NAME" -H "Authorization: Bearer $NEW_TOKEN"
 
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="

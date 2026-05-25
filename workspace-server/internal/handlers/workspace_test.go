@@ -919,6 +919,8 @@ func TestWorkspaceDelete_ConfirmationRequired(t *testing.T) {
 	broadcaster := newTestBroadcaster()
 	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
 
+	expectWorkspaceDeleteLookup(mock, "cccccccc-0007-0000-0000-000000000000", "Parent Workspace", 0, "running")
+
 	// Children query returns 2 children
 	mock.ExpectQuery("SELECT id, name FROM workspaces WHERE parent_id").
 		WithArgs("cccccccc-0007-0000-0000-000000000000").
@@ -931,6 +933,7 @@ func TestWorkspaceDelete_ConfirmationRequired(t *testing.T) {
 	c.Params = gin.Params{{Key: "id", Value: "cccccccc-0007-0000-0000-000000000000"}}
 	// No ?confirm=true
 	c.Request = httptest.NewRequest("DELETE", "/workspaces/ws-parent", nil)
+	c.Request.Header.Set("X-Confirm-Name", "Parent Workspace")
 
 	handler.Delete(c)
 
@@ -963,6 +966,8 @@ func TestWorkspaceDelete_CascadeWithChildren(t *testing.T) {
 	setupTestRedis(t)
 	broadcaster := newTestBroadcaster()
 	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+
+	expectWorkspaceDeleteLookup(mock, "cccccccc-000a-0000-0000-000000000000", "Parent Delete", 0, "running")
 
 	// Children query returns 1 child
 	mock.ExpectQuery("SELECT id, name FROM workspaces WHERE parent_id").
@@ -999,6 +1004,7 @@ func TestWorkspaceDelete_CascadeWithChildren(t *testing.T) {
 	c, _ := gin.CreateTestContext(w)
 	c.Params = gin.Params{{Key: "id", Value: "cccccccc-000a-0000-0000-000000000000"}}
 	c.Request = httptest.NewRequest("DELETE", "/workspaces/ws-parent-del?confirm=true", nil)
+	c.Request.Header.Set("X-Confirm-Name", "Parent Delete")
 
 	handler.Delete(c)
 
@@ -1034,6 +1040,8 @@ func TestWorkspaceDelete_DisablesSchedules(t *testing.T) {
 
 	wsID := "dddddddd-0001-0000-0000-000000000000"
 
+	expectWorkspaceDeleteLookup(mock, wsID, "Scheduled Workspace", 0, "running")
+
 	// No children
 	mock.ExpectQuery("SELECT id, name FROM workspaces WHERE parent_id").
 		WithArgs(wsID).
@@ -1065,6 +1073,7 @@ func TestWorkspaceDelete_DisablesSchedules(t *testing.T) {
 	c, _ := gin.CreateTestContext(w)
 	c.Params = gin.Params{{Key: "id", Value: wsID}}
 	c.Request = httptest.NewRequest("DELETE", "/workspaces/"+wsID+"?confirm=true", nil)
+	c.Request.Header.Set("X-Confirm-Name", "Scheduled Workspace")
 
 	handler.Delete(c)
 
@@ -1089,6 +1098,8 @@ func TestWorkspaceDelete_CascadeDisablesDescendantSchedules(t *testing.T) {
 	parentID := "dddddddd-0002-0000-0000-000000000000"
 	childID := "dddddddd-0003-0000-0000-000000000000"
 	grandchildID := "dddddddd-0004-0000-0000-000000000000"
+
+	expectWorkspaceDeleteLookup(mock, parentID, "Parent Scheduled Workspace", 0, "running")
 
 	// Children query returns 1 direct child
 	mock.ExpectQuery("SELECT id, name FROM workspaces WHERE parent_id").
@@ -1129,6 +1140,7 @@ func TestWorkspaceDelete_CascadeDisablesDescendantSchedules(t *testing.T) {
 	c, _ := gin.CreateTestContext(w)
 	c.Params = gin.Params{{Key: "id", Value: parentID}}
 	c.Request = httptest.NewRequest("DELETE", "/workspaces/"+parentID+"?confirm=true", nil)
+	c.Request.Header.Set("X-Confirm-Name", "Parent Scheduled Workspace")
 
 	handler.Delete(c)
 
@@ -1162,6 +1174,8 @@ func TestWorkspaceDelete_ScheduleDisableOnlyTargetsDeletedWorkspace(t *testing.T
 	wsA := "dddddddd-0005-0000-0000-000000000000"
 	// wsB is "dddddddd-0006-0000-0000-000000000000" — NOT part of the delete
 
+	expectWorkspaceDeleteLookup(mock, wsA, "Workspace A", 0, "running")
+
 	// No children for workspace A
 	mock.ExpectQuery("SELECT id, name FROM workspaces WHERE parent_id").
 		WithArgs(wsA).
@@ -1192,6 +1206,7 @@ func TestWorkspaceDelete_ScheduleDisableOnlyTargetsDeletedWorkspace(t *testing.T
 	c, _ := gin.CreateTestContext(w)
 	c.Params = gin.Params{{Key: "id", Value: wsA}}
 	c.Request = httptest.NewRequest("DELETE", "/workspaces/"+wsA+"?confirm=true", nil)
+	c.Request.Header.Set("X-Confirm-Name", "Workspace A")
 
 	handler.Delete(c)
 
@@ -1214,6 +1229,8 @@ func TestWorkspaceDelete_ChildrenQueryError(t *testing.T) {
 	broadcaster := newTestBroadcaster()
 	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
 
+	expectWorkspaceDeleteLookup(mock, "cccccccc-000c-0000-0000-000000000000", "Error Workspace", 0, "running")
+
 	mock.ExpectQuery("SELECT id, name FROM workspaces WHERE parent_id").
 		WithArgs("cccccccc-000c-0000-0000-000000000000").
 		WillReturnError(sql.ErrConnDone)
@@ -1222,6 +1239,7 @@ func TestWorkspaceDelete_ChildrenQueryError(t *testing.T) {
 	c, _ := gin.CreateTestContext(w)
 	c.Params = gin.Params{{Key: "id", Value: "cccccccc-000c-0000-0000-000000000000"}}
 	c.Request = httptest.NewRequest("DELETE", "/workspaces/ws-err-del?confirm=true", nil)
+	c.Request.Header.Set("X-Confirm-Name", "Error Workspace")
 
 	handler.Delete(c)
 

@@ -199,7 +199,9 @@ describe("OrgCancelButton — Yes / cascade delete", () => {
     });
 
     // 1) API call hit the cascade-delete endpoint with confirm=true
-    expect(mockApiDel).toHaveBeenCalledWith("/workspaces/ws-root?confirm=true");
+    expect(mockApiDel).toHaveBeenCalledWith("/workspaces/ws-root?confirm=true", {
+      headers: { "X-Confirm-Name": "My Org" },
+    });
 
     // 2) beginDelete locked the WHOLE subtree (root + 2 children) — NOT the unrelated node
     expect(mockState.beginDelete).toHaveBeenCalledTimes(1);

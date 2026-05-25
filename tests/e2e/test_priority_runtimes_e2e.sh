@@ -53,7 +53,7 @@ cleanup() {
   # ${VAR[@]+"…"} form expands to nothing when the array is unset/empty
   # so the loop body is skipped cleanly. Hits the skip-no-keys path.
   for wid in ${CREATED_WSIDS[@]+"${CREATED_WSIDS[@]}"}; do
-    [ -n "$wid" ] && curl -s -X DELETE "$BASE/workspaces/$wid?confirm=true" > /dev/null || true
+    [ -n "$wid" ] && e2e_delete_workspace "$wid" ""
   done
 }
 trap cleanup EXIT
@@ -74,7 +74,7 @@ except Exception:
 ')
 for _wid in $PRIOR; do
   echo "Sweeping prior workspace: $_wid"
-  curl -s -X DELETE "$BASE/workspaces/$_wid?confirm=true" > /dev/null || true
+  e2e_delete_workspace "$_wid" ""
 done
 
 # Block until $1 reaches one of $2 (space-separated states), or $3 sec elapse.
