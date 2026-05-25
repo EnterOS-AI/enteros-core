@@ -77,6 +77,7 @@ func NewTemplatesHandler(configsDir string, dockerCli *client.Client, wh *Worksp
 type modelSpec struct {
 	ID          string   `json:"id" yaml:"id"`
 	Name        string   `json:"name,omitempty" yaml:"name"`
+	Provider    string   `json:"provider,omitempty" yaml:"provider"`
 	RequiredEnv []string `json:"required_env,omitempty" yaml:"required_env"`
 }
 

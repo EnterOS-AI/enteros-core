@@ -155,6 +155,7 @@ runtime_config:
       required_env: [HERMES_API_KEY]
     - id: minimax/minimax-m2.7
       name: MiniMax M2.7 (via OpenRouter)
+      provider: platform
       required_env: [OPENROUTER_API_KEY]
 skills: []
 `
@@ -196,6 +197,9 @@ skills: []
 	}
 	if got.Models[1].ID != "minimax/minimax-m2.7" {
 		t.Errorf("Models[1].ID: got %q", got.Models[1].ID)
+	}
+	if got.Models[1].Provider != "platform" {
+		t.Errorf("Models[1].Provider: got %q", got.Models[1].Provider)
 	}
 	if len(got.Models[1].RequiredEnv) != 1 || got.Models[1].RequiredEnv[0] != "OPENROUTER_API_KEY" {
 		t.Errorf("Models[1] required_env: want [OPENROUTER_API_KEY], got %+v", got.Models[1].RequiredEnv)

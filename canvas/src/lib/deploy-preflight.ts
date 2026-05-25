@@ -21,6 +21,7 @@ import { api } from "./api";
 export interface ModelSpec {
   id: string;
   name?: string;
+  provider?: string;
   required_env?: string[];
 }
 
