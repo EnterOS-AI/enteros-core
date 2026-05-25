@@ -41,6 +41,12 @@ describe("buildCsp — production", () => {
     expect(csp).toContain("object-src 'none'");
   });
 
+  it("allows blob: in frame-src for authenticated PDF previews", () => {
+    const frameSrc = csp.match(/frame-src[^;]*/)?.[0] ?? "";
+    expect(frameSrc).toContain("'self'");
+    expect(frameSrc).toContain("blob:");
+  });
+
   it("locks base-uri to 'self' (prevents base-tag injection)", () => {
     expect(csp).toContain("base-uri 'self'");
   });
