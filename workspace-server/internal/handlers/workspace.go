@@ -347,9 +347,34 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 		return
 	}
 	if payload.Runtime == "" {
-		// Legitimate default path: no template AND no runtime requested
-		// (bare {"name":...}) — claude-code is the intended default here.
-		payload.Runtime = "claude-code"
+		if payload.External {
+			payload.Runtime = "external"
+		} else {
+			// Legitimate default path: no template AND no runtime requested
+			// (bare {"name":...}) — claude-code is the intended default here.
+			payload.Runtime = "claude-code"
+		}
+	}
+
+	if payload.External && !isExternalLikeRuntime(payload.Runtime) {
+		log.Printf("Create: FAIL-CLOSED — external workspace requested with non-external runtime %q", payload.Runtime)
+		c.JSON(http.StatusUnprocessableEntity, gin.H{
+			"error":   "external workspaces must use runtime \"external\", \"kimi\", or \"kimi-cli\"",
+			"runtime": payload.Runtime,
+			"code":    "RUNTIME_UNSUPPORTED",
+		})
+		return
+	}
+	if payload.Runtime != "" && !isExternalLikeRuntime(payload.Runtime) {
+		if _, ok := knownRuntimes[payload.Runtime]; !ok {
+			log.Printf("Create: FAIL-CLOSED — unsupported runtime %q", payload.Runtime)
+			c.JSON(http.StatusUnprocessableEntity, gin.H{
+				"error":   "unsupported workspace runtime",
+				"runtime": payload.Runtime,
+				"code":    "RUNTIME_UNSUPPORTED",
+			})
+			return
+		}
 	}
 
 	// SSOT (CTO 2026-05-22, feedback_workspace_model_required_no_platform_default_dynamic_credential_intake):

@@ -592,7 +592,7 @@ func setModelSecret(ctx context.Context, workspaceID, model string) error {
 // SetModel handles PUT /workspaces/:id/model — writes the model slug
 // into workspace_secrets as MODEL (the key GetModel reads).
 // For hermes, the value is a hermes-native slug like "minimax/MiniMax-M2.7";
-// for langgraph it's the legacy "provider:model" form. Either way it's just
+// for claude-code it's the legacy "provider:model" form. Either way it's just
 // an opaque string the runtime interprets on its next start.
 //
 // Empty string clears the override. Triggers auto-restart so the new

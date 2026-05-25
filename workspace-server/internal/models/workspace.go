@@ -176,7 +176,7 @@ type CreateWorkspacePayload struct {
 	Template string `json:"template"` // workspace-configs-templates folder name
 	Tier     int    `json:"tier"`
 	Model    string `json:"model"`
-	Runtime  string `json:"runtime"`  // "langgraph" (default), "claude-code", etc.
+	Runtime  string `json:"runtime"`  // "claude-code" (default), "codex", etc.
 	External bool   `json:"external"` // true = no Docker container, just a registered URL
 	URL      string `json:"url"`      // for external workspaces: the A2A endpoint URL (push mode only — omit for poll)
 	// DeliveryMode: "push" (default) sends inbound A2A to URL synchronously;

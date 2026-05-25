@@ -386,7 +386,7 @@ skills: []
 
 // TestTemplatesList_OmitsProviderRegistryWhenAbsent pins the omitempty
 // behavior for the new field — templates without a top-level
-// `providers:` block (hermes today, langgraph, etc.) must NOT emit
+// `providers:` block (hermes today, claude-code, etc.) must NOT emit
 // `provider_registry: null`, which would break canvas's array-typed
 // parser (Array.isArray check returns false for null).
 // TestTemplatesList_BothProviderShapesCoexist pins the real production

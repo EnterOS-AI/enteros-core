@@ -152,7 +152,7 @@ jobs:
       # block). See #2578 PR comment for the rationale.
       E2E_ANTHROPIC_API_KEY: ${{ secrets.MOLECULE_STAGING_ANTHROPIC_API_KEY }}
       # OpenAI fallback — kept wired so an operator-dispatched run with
-      # E2E_RUNTIME=hermes or =langgraph via workflow_dispatch can still
+      # E2E_RUNTIME=hermes or =codex via workflow_dispatch can still
       # exercise the OpenAI path.
       E2E_OPENAI_API_KEY: ${{ secrets.MOLECULE_STAGING_OPENAI_API_KEY }}
       E2E_RUNTIME: ${{ github.event.inputs.runtime || 'claude-code' }}
@@ -161,7 +161,7 @@ jobs:
       # and defeats the cost saving. Operators can override via the
       # workflow_dispatch flow (no input wired here yet — runtime
       # override is enough for ad-hoc).
-      E2E_MODEL_SLUG: ${{ github.event.inputs.runtime == 'hermes' && 'openai/gpt-4o' || github.event.inputs.runtime == 'langgraph' && 'openai:gpt-4o' || 'MiniMax-M2' }}
+      E2E_MODEL_SLUG: ${{ github.event.inputs.runtime == 'hermes' && 'openai/gpt-4o' || github.event.inputs.runtime == 'codex' && 'openai/gpt-4o' || 'MiniMax-M2' }}
       E2E_RUN_ID: "${{ github.run_id }}-${{ github.run_attempt }}"
       E2E_KEEP_ORG: ${{ github.event.inputs.keep_org && '1' || '0' }}
 
@@ -185,7 +185,7 @@ jobs:
       - name: Verify LLM key present
         run: |
           # Per-runtime key check — claude-code uses MiniMax; hermes /
-          # langgraph (operator-dispatched only) use OpenAI. Hard-fail
+          # codex (operator-dispatched only) use OpenAI. Hard-fail
           # rather than soft-skip per #2578's lesson — empty key
           # silently falls through to the wrong SECRETS_JSON branch and
           # produces a confusing auth error 5 min later instead of the
@@ -206,7 +206,7 @@ jobs:
                 required_secret_value=""
               fi
               ;;
-            langgraph|hermes)
+            codex|hermes)
               required_secret_name="MOLECULE_STAGING_OPENAI_API_KEY"
               required_secret_value="${E2E_OPENAI_API_KEY:-}"
               ;;

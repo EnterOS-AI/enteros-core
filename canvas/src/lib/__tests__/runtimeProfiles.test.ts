@@ -68,8 +68,7 @@ describe("provisionTimeoutForRuntime", () => {
   });
 
   it("returns 120_000 for any unknown runtime", () => {
-    expect(provisionTimeoutForRuntime("langgraph")).toBe(120_000);
-    expect(provisionTimeoutForRuntime("crewai")).toBe(120_000);
+    expect(provisionTimeoutForRuntime("legacy-runtime")).toBe(120_000);
     expect(provisionTimeoutForRuntime("some-new-runtime")).toBe(120_000);
   });
 
@@ -77,7 +76,7 @@ describe("provisionTimeoutForRuntime", () => {
     const cases: Array<[string | undefined, { provisionTimeoutMs?: number } | undefined]> = [
       [undefined, undefined],
       ["claude-code", undefined],
-      ["langgraph", { provisionTimeoutMs: 500_000 }],
+      ["claude-code", { provisionTimeoutMs: 500_000 }],
       [undefined, { provisionTimeoutMs: 45_000 }],
     ];
     for (const [runtime, overrides] of cases) {
