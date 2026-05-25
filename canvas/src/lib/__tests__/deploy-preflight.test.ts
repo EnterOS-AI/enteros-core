@@ -37,6 +37,11 @@ const CLAUDE_CODE: TemplateLike = {
   required_env: ["OPENAI_API_KEY"],
 };
 
+const OPTIONAL_ONLY: TemplateLike = {
+  runtime: "claude-code",
+  recommended_env: ["GOOGLE_GSC_SITE", "GOOGLE_GA4_PROPERTY_ID"],
+};
+
 const UNKNOWN: TemplateLike = { runtime: "nothing-declared" };
 
 // -----------------------------------------------------------------------------
@@ -154,6 +159,7 @@ describe("checkDeploySecrets", () => {
     const result = await checkDeploySecrets(CLAUDE_CODE);
     expect(result.ok).toBe(true);
     expect(result.missingKeys).toEqual([]);
+    expect(result.optionalKeys).toEqual([]);
     expect(result.runtime).toBe("claude-code");
   });
 
@@ -184,6 +190,7 @@ describe("checkDeploySecrets", () => {
     );
     // Grouped providers preserved for the picker.
     expect(result.providers).toHaveLength(3);
+    expect(result.optionalKeys).toEqual([]);
   });
 
   it("treats has_value=false as not-configured", async () => {
@@ -205,6 +212,22 @@ describe("checkDeploySecrets", () => {
     expect(result.ok).toBe(true);
     expect(result.missingKeys).toEqual([]);
     expect(global.fetch).not.toHaveBeenCalled();
+  });
+
+  it("prompts optional-only env without treating it as missing", async () => {
+    (global.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve([]),
+    } as Response);
+
+    const result = await checkDeploySecrets(OPTIONAL_ONLY);
+    expect(result.ok).toBe(true);
+    expect(result.missingKeys).toEqual([]);
+    expect(result.optionalKeys).toEqual([
+      "GOOGLE_GSC_SITE",
+      "GOOGLE_GA4_PROPERTY_ID",
+    ]);
+    expect(global.fetch).toHaveBeenCalled();
   });
 
   it("uses the workspace-scoped endpoint when workspaceId is provided", async () => {
@@ -244,6 +267,7 @@ describe("checkDeploySecrets", () => {
     const result = await checkDeploySecrets(CLAUDE_CODE);
     expect(result.ok).toBe(false);
     expect(result.missingKeys).toEqual(["OPENAI_API_KEY"]);
+    expect(result.optionalKeys).toEqual([]);
     // Empty Set on fetch failure — useTemplateDeploy relies on this
     // so the picker still opens with every entry rendered as input.
     expect(result.configuredKeys).toEqual(new Set());

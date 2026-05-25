@@ -31,6 +31,8 @@ export interface TemplateLike {
   models?: ModelSpec[];
   /** AND-required env vars declared at runtime_config level. */
   required_env?: string[];
+  /** Optional env vars declared at runtime_config level. */
+  recommended_env?: string[];
 }
 
 /** Full /templates response shape shared by TemplatePalette (sidebar)
@@ -95,6 +97,8 @@ export interface PreflightResult {
   /** Flat list of env var names needed — for the legacy modal path and
    *  for callers that want a single display of "what's missing". */
   missingKeys: string[];
+  /** Optional env vars to offer in the modal without blocking deploy. */
+  optionalKeys: string[];
   /** Grouped provider options derived from the template. When length ≥ 2
    *  the modal renders a picker; length 1 means exactly one provider is
    *  required (AllKeysModal renders the N envVars inline). */
@@ -247,12 +251,14 @@ export async function checkDeploySecrets(
 ): Promise<PreflightResult> {
   const providers = providersFromTemplate(template);
   const runtime = template.runtime;
+  const optionalKeys = Array.from(new Set(template.recommended_env ?? []));
 
-  if (providers.length === 0) {
+  if (providers.length === 0 && optionalKeys.length === 0) {
     // Template declares no env requirements — nothing to preflight.
     return {
       ok: true,
       missingKeys: [],
+      optionalKeys: [],
       providers: [],
       runtime,
       configuredKeys: new Set(),
@@ -274,10 +280,11 @@ export async function checkDeploySecrets(
     configured = new Set();
   }
 
-  if (findSatisfiedProvider(providers, configured)) {
+  if (providers.length === 0 || findSatisfiedProvider(providers, configured)) {
     return {
       ok: true,
       missingKeys: [],
+      optionalKeys,
       providers,
       runtime,
       configuredKeys: configured,
@@ -292,6 +299,7 @@ export async function checkDeploySecrets(
   return {
     ok: false,
     missingKeys,
+    optionalKeys,
     providers,
     runtime,
     configuredKeys: configured,
