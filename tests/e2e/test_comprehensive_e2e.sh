@@ -76,8 +76,8 @@ echo "--- Section 2: Workspace CRUD ---"
 # create; sections that depend on container readiness (RT_* in 2b)
 # still run normally.
 R=$(curl -s -X POST "$BASE/workspaces" -H "Content-Type: application/json" \
-  -d '{"name":"Test PM","role":"Project Manager","tier":2}')
-check "Create PM" '"status":"provisioning"' "$R"
+  -d '{"name":"Test PM","role":"Project Manager","tier":2,"runtime":"external","external":true}')
+check "Create PM" '"status":"awaiting_agent"' "$R"
 PM_ID=$(echo "$R" | jq_extract "['id']")
 echo "  PM_ID=$PM_ID"
 RR=$(curl -s -X POST "$BASE/registry/register" -H "Content-Type: application/json" \
@@ -86,8 +86,8 @@ PM_TOKEN=$(echo "$RR" | e2e_extract_token)
 
 # Create child workspace under PM
 R=$(curl -s -X POST "$BASE/workspaces" -H "Content-Type: application/json" \
-  -d "{\"name\":\"Test Dev\",\"role\":\"Developer\",\"tier\":2,\"parent_id\":\"$PM_ID\"}")
-check "Create Dev (child of PM)" '"status":"provisioning"' "$R"
+  -d "{\"name\":\"Test Dev\",\"role\":\"Developer\",\"tier\":2,\"parent_id\":\"$PM_ID\",\"runtime\":\"external\",\"external\":true}")
+check "Create Dev (child of PM)" '"status":"awaiting_agent"' "$R"
 DEV_ID=$(echo "$R" | jq_extract "['id']")
 RR=$(curl -s -X POST "$BASE/registry/register" -H "Content-Type: application/json" \
   -d "{\"id\":\"$DEV_ID\",\"url\":\"http://localhost:9001\",\"agent_card\":{\"name\":\"Dev Agent\",\"skills\":[],\"version\":\"1.0.0\"}}")
@@ -95,16 +95,16 @@ DEV_TOKEN=$(echo "$RR" | e2e_extract_token)
 
 # Create sibling
 R=$(curl -s -X POST "$BASE/workspaces" -H "Content-Type: application/json" \
-  -d "{\"name\":\"Test QA\",\"role\":\"QA\",\"tier\":1,\"parent_id\":\"$PM_ID\"}")
-check "Create QA (sibling of Dev)" '"status":"provisioning"' "$R"
+  -d "{\"name\":\"Test QA\",\"role\":\"QA\",\"tier\":1,\"parent_id\":\"$PM_ID\",\"runtime\":\"external\",\"external\":true}")
+check "Create QA (sibling of Dev)" '"status":"awaiting_agent"' "$R"
 QA_ID=$(echo "$R" | jq_extract "['id']")
 curl -s -X POST "$BASE/registry/register" -H "Content-Type: application/json" \
   -d "{\"id\":\"$QA_ID\",\"url\":\"http://localhost:9002\",\"agent_card\":{\"name\":\"QA\",\"skills\":[]}}" > /dev/null
 
 # Create unrelated workspace
 R=$(curl -s -X POST "$BASE/workspaces" -H "Content-Type: application/json" \
-  -d '{"name":"Test Outsider","role":"External","tier":1}')
-check "Create Outsider (unrelated)" '"status":"provisioning"' "$R"
+  -d '{"name":"Test Outsider","role":"External","tier":1,"runtime":"external","external":true}')
+check "Create Outsider (unrelated)" '"status":"awaiting_agent"' "$R"
 OUTSIDER_ID=$(echo "$R" | jq_extract "['id']")
 
 # List workspaces
@@ -130,19 +130,24 @@ check "PM position persisted" '"x":100' "$R"
 echo ""
 echo "--- Section 2b: Runtime Assignment ---"
 
+if [ "${RUN_SPAWNED_RUNTIME_LEGACY_E2E:-0}" != "1" ]; then
+  echo "  SKIP: spawned-runtime image checks require local runtime images; set RUN_SPAWNED_RUNTIME_LEGACY_E2E=1 to enable"
+  SKIP=$((SKIP + 5))
+else
+
 # Create workspace with explicit runtime
 R=$(curl -s -X POST "$BASE/workspaces" -H "Content-Type: application/json" \
-  -d '{"name":"RT Claude","role":"Test","tier":2,"runtime":"claude-code"}')
+  -d '{"name":"RT Claude","role":"Test","tier":2,"runtime":"claude-code","model":"sonnet"}')
 check "Create claude-code workspace" '"status":"provisioning"' "$R"
 RT_CC_ID=$(echo "$R" | jq_extract "['id']")
 
 R=$(curl -s -X POST "$BASE/workspaces" -H "Content-Type: application/json" \
-  -d '{"name":"RT Codex","role":"Test","tier":2,"runtime":"codex"}')
+  -d '{"name":"RT Codex","role":"Test","tier":2,"runtime":"codex","model":"openai:gpt-5"}')
 check "Create codex workspace" '"status":"provisioning"' "$R"
 RT_CX_ID=$(echo "$R" | jq_extract "['id']")
 
 R=$(curl -s -X POST "$BASE/workspaces" -H "Content-Type: application/json" \
-  -d '{"name":"RT Hermes","role":"Test","tier":2,"runtime":"hermes"}')
+  -d '{"name":"RT Hermes","role":"Test","tier":2,"runtime":"hermes","model":"openai:gpt-5"}')
 check "Create hermes workspace" '"status":"provisioning"' "$R"
 RT_HM_ID=$(echo "$R" | jq_extract "['id']")
 
@@ -234,6 +239,8 @@ e2e_delete_workspace "$RT_CX_ID" "RT Codex"
 sleep 0.3
 e2e_delete_workspace "$RT_HM_ID" "RT Hermes"
 sleep 0.3
+
+fi
 
 # ============================================================
 # Section 3: Registry & Heartbeat
