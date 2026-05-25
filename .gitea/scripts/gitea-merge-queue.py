@@ -183,7 +183,9 @@ def required_contexts_green(
         status = latest_statuses.get(context)
         state = status_state(status or {})
         if state != "success":
-            if pr_labels and _is_tier_low_pending_ok(latest_statuses, context, pr_labels):
+            if pr_labels and _is_tier_low_pending_ok(
+                latest_statuses, context, pr_labels
+            ):
                 continue  # tier:low soft-fail: accept pending sop-checklist
             missing_or_bad.append(f"{context}={state or 'missing'}")
     return not missing_or_bad, missing_or_bad
