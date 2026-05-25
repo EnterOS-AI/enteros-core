@@ -66,6 +66,13 @@ async function openDialog() {
 
 async function setTemplate(value: string) {
   fireEvent.change(
+    screen.getByLabelText("Workspace Template"),
+    { target: { value } }
+  );
+}
+
+async function setRuntime(value: string) {
+  fireEvent.change(
     screen.getByLabelText("Runtime"),
     { target: { value } }
   );
@@ -165,7 +172,29 @@ describe("CreateWorkspaceDialog", () => {
     });
     expect(body.model).toBe("moonshot/kimi-k2.6");
     expect(body.llm_provider).toBe("platform");
+    expect(body.runtime).toBe("claude-code");
     expect(body.secrets).toBeUndefined();
+  });
+
+  it("keeps runtime and workspace template as separate selectors", async () => {
+    await openDialog();
+
+    const runtimeSelect = screen.getByLabelText("Runtime") as HTMLSelectElement;
+    const runtimeTexts = Array.from(runtimeSelect.options).map((o) => o.text.trim());
+    expect(runtimeTexts).toEqual([
+      "Claude Code",
+      "OpenAI Codex CLI",
+      "Hermes",
+      "OpenClaw",
+    ]);
+    expect(runtimeTexts).not.toContain("SEO Agent");
+
+    await waitFor(() => {
+      const templateSelect = screen.getByLabelText("Workspace Template") as HTMLSelectElement;
+      const templateTexts = Array.from(templateSelect.options).map((o) => o.text.trim());
+      expect(templateTexts).toContain("SEO Agent");
+      expect(templateTexts).not.toContain("Hermes");
+    });
   });
 
   it("does not send managed compute for external agents", async () => {
@@ -278,9 +307,9 @@ describe("CreateWorkspaceDialog — Hermes provider picker", () => {
     expect(document.querySelector("[data-testid='hermes-provider-section']")).toBeNull();
   });
 
-  it("shows hermes provider section when template is 'hermes'", async () => {
+  it("shows hermes provider section when runtime is 'hermes'", async () => {
     await openDialog();
-    await setTemplate("hermes");
+    await setRuntime("hermes");
     await waitFor(() =>
       expect(document.querySelector("[data-testid='hermes-provider-section']")).toBeTruthy()
     );
@@ -288,7 +317,7 @@ describe("CreateWorkspaceDialog — Hermes provider picker", () => {
 
   it("shows hermes provider section for the Hermes runtime preset", async () => {
     await openDialog();
-    await setTemplate("hermes");
+    await setRuntime("hermes");
     await waitFor(() =>
       expect(document.querySelector("[data-testid='hermes-provider-section']")).toBeTruthy()
     );
@@ -296,7 +325,7 @@ describe("CreateWorkspaceDialog — Hermes provider picker", () => {
 
   it("hermes provider dropdown defaults to 'anthropic'", async () => {
     await openDialog();
-    await setTemplate("hermes");
+    await setRuntime("hermes");
     await waitFor(() =>
       expect(document.querySelector("[data-testid='hermes-provider-section']")).toBeTruthy()
     );
@@ -307,7 +336,7 @@ describe("CreateWorkspaceDialog — Hermes provider picker", () => {
 
   it("hermes provider dropdown lists all 15 providers", async () => {
     await openDialog();
-    await setTemplate("hermes");
+    await setRuntime("hermes");
     await waitFor(() =>
       expect(document.querySelector("[data-testid='hermes-provider-section']")).toBeTruthy()
     );
@@ -341,7 +370,7 @@ describe("CreateWorkspaceDialog — Hermes provider picker", () => {
     });
 
     await openDialog();
-    await setTemplate("hermes");
+    await setRuntime("hermes");
     await waitFor(() =>
       expect(document.querySelector("[data-testid='hermes-provider-section']")).toBeTruthy()
     );
@@ -371,7 +400,7 @@ describe("CreateWorkspaceDialog — Hermes provider picker", () => {
     });
 
     await openDialog();
-    await setTemplate("hermes");
+    await setRuntime("hermes");
     await waitFor(() =>
       expect(document.querySelector("[data-testid='hermes-provider-section']")).toBeTruthy()
     );
@@ -397,7 +426,7 @@ describe("CreateWorkspaceDialog — Hermes provider picker", () => {
     });
 
     await openDialog();
-    await setTemplate("hermes");
+    await setRuntime("hermes");
     await waitFor(() =>
       expect(document.querySelector("[data-testid='hermes-provider-section']")).toBeTruthy()
     );
@@ -408,7 +437,7 @@ describe("CreateWorkspaceDialog — Hermes provider picker", () => {
 
   it("hermes API key field is a password input (masked)", async () => {
     await openDialog();
-    await setTemplate("hermes");
+    await setRuntime("hermes");
     await waitFor(() =>
       expect(document.querySelector("[data-testid='hermes-provider-section']")).toBeTruthy()
     );
@@ -422,7 +451,7 @@ describe("CreateWorkspaceDialog — Hermes provider picker", () => {
     fireEvent.change(screen.getByPlaceholderText("e.g. SEO Agent"), {
       target: { value: "Hermes Agent" },
     });
-    await setTemplate("hermes");
+    await setRuntime("hermes");
     await waitFor(() =>
       expect(document.querySelector("[data-testid='hermes-provider-section']")).toBeTruthy()
     );
@@ -443,7 +472,7 @@ describe("CreateWorkspaceDialog — Hermes provider picker", () => {
     fireEvent.change(screen.getByPlaceholderText("e.g. SEO Agent"), {
       target: { value: "Hermes Agent" },
     });
-    await setTemplate("hermes");
+    await setRuntime("hermes");
     await waitFor(() =>
       expect(document.querySelector("[data-testid='hermes-provider-section']")).toBeTruthy()
     );
@@ -458,7 +487,8 @@ describe("CreateWorkspaceDialog — Hermes provider picker", () => {
     await waitFor(() => expect(mockPost).toHaveBeenCalled());
     const body = mockPost.mock.calls[0][1] as Record<string, unknown>;
     expect(body.secrets).toEqual({ ANTHROPIC_API_KEY: "sk-test-anthropic-key" });
-    expect(body.template).toBe("hermes");
+    expect(body.runtime).toBe("hermes");
+    expect(body.template).toBeUndefined();
   });
 
   it("uses the correct env var when a non-default provider is selected", async () => {
@@ -466,7 +496,7 @@ describe("CreateWorkspaceDialog — Hermes provider picker", () => {
     fireEvent.change(screen.getByPlaceholderText("e.g. SEO Agent"), {
       target: { value: "Hermes OpenAI" },
     });
-    await setTemplate("hermes");
+    await setRuntime("hermes");
     await waitFor(() =>
       expect(document.querySelector("[data-testid='hermes-provider-section']")).toBeTruthy()
     );
@@ -503,13 +533,13 @@ describe("CreateWorkspaceDialog — Hermes provider picker", () => {
 
   it("hides hermes section and resets state when template is cleared", async () => {
     await openDialog();
-    await setTemplate("hermes");
+    await setRuntime("hermes");
     await waitFor(() =>
       expect(document.querySelector("[data-testid='hermes-provider-section']")).toBeTruthy()
     );
 
-    // Clear template
-    await setTemplate("");
+    // Switch back to a non-Hermes runtime.
+    await setRuntime("claude-code");
     await waitFor(() =>
       expect(document.querySelector("[data-testid='hermes-provider-section']")).toBeNull()
     );
