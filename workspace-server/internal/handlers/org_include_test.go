@@ -284,3 +284,4 @@ workspaces:
 // TestResolveYAMLIncludes_RealMoleculeDev clones molecule-ai-org-template-molecule-dev
 // via HTTPS and validates the full org include resolution. The exec.LookPath guard
 // ensures the test skips gracefully when git is unavailable in the runtime.
+// CI trigger: 2026-05-25T06:07 UTC
