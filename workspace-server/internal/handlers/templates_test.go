@@ -148,6 +148,7 @@ tier: 2
 runtime: hermes
 runtime_config:
   model: nous-hermes-3-70b
+  recommended_env: [GOOGLE_GSC_SITE, GOOGLE_GA4_PROPERTY_ID]
   models:
     - id: nous-hermes-3-70b
       name: Nous Hermes 3 70B
@@ -198,6 +199,11 @@ skills: []
 	}
 	if len(got.Models[1].RequiredEnv) != 1 || got.Models[1].RequiredEnv[0] != "OPENROUTER_API_KEY" {
 		t.Errorf("Models[1] required_env: want [OPENROUTER_API_KEY], got %+v", got.Models[1].RequiredEnv)
+	}
+	if len(got.RecommendedEnv) != 2 ||
+		got.RecommendedEnv[0] != "GOOGLE_GSC_SITE" ||
+		got.RecommendedEnv[1] != "GOOGLE_GA4_PROPERTY_ID" {
+		t.Errorf("RecommendedEnv: want [GOOGLE_GSC_SITE GOOGLE_GA4_PROPERTY_ID], got %+v", got.RecommendedEnv)
 	}
 }
 

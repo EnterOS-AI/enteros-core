@@ -152,6 +152,7 @@ export function useTemplateDeploy(
           runtime,
           models: template.models,
           required_env: template.required_env,
+          recommended_env: template.recommended_env,
         });
       } catch (e) {
         // Preflight network failure used to strand `deploying` — the
@@ -165,7 +166,11 @@ export function useTemplateDeploy(
         setDeploying(null);
         return;
       }
-      if (preflight.ok && preflight.providers.length === 0) {
+      if (
+        preflight.ok &&
+        preflight.providers.length === 0 &&
+        preflight.optionalKeys.length === 0
+      ) {
         await executeDeploy(template);
         return;
       }
@@ -220,6 +225,7 @@ export function useTemplateDeploy(
     <MissingKeysModal
       open={!!missingKeysInfo}
       missingKeys={missingKeysInfo?.preflight.missingKeys ?? []}
+      optionalKeys={missingKeysInfo?.preflight.optionalKeys ?? []}
       providers={missingKeysInfo?.preflight.providers ?? []}
       runtime={missingKeysInfo?.preflight.runtime ?? ""}
       configuredKeys={missingKeysInfo?.preflight.configuredKeys}

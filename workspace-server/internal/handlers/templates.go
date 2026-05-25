@@ -116,6 +116,10 @@ type templateSummary struct {
 	// preflight uses this as the fallback provider when `models` is empty
 	// so provider picker stays data-driven instead of hardcoded in the UI.
 	RequiredEnv []string `json:"required_env,omitempty"`
+	// RecommendedEnv mirrors runtime_config.recommended_env from the
+	// template's config.yaml. Canvas prompts for these as non-blocking
+	// optional secrets during template deploy.
+	RecommendedEnv []string `json:"recommended_env,omitempty"`
 	// Providers is the runtime's own list of supported provider slugs,
 	// sourced from runtime_config.providers in the template's config.yaml.
 	// The canvas Config tab surfaces this as the Provider override
@@ -188,6 +192,7 @@ func (h *TemplatesHandler) List(c *gin.Context) {
 				Model                   string      `yaml:"model"`
 				Models                  []modelSpec `yaml:"models"`
 				RequiredEnv             []string    `yaml:"required_env"`
+				RecommendedEnv          []string    `yaml:"recommended_env"`
 				Providers               []string    `yaml:"providers"`
 				ProvisionTimeoutSeconds int         `yaml:"provision_timeout_seconds"`
 			} `yaml:"runtime_config"`
@@ -229,6 +234,7 @@ func (h *TemplatesHandler) List(c *gin.Context) {
 			Model:                   model,
 			Models:                  raw.RuntimeConfig.Models,
 			RequiredEnv:             raw.RuntimeConfig.RequiredEnv,
+			RecommendedEnv:          raw.RuntimeConfig.RecommendedEnv,
 			Providers:               raw.RuntimeConfig.Providers,
 			ProviderRegistry:        raw.Providers,
 			Skills:                  raw.Skills,

@@ -63,6 +63,7 @@ vi.mock("@/components/MissingKeysModal", () => ({
     onKeysAdded: (model?: string) => void;
     onCancel: () => void;
     configuredKeys?: Set<string>;
+    optionalKeys?: string[];
     modelSuggestions?: string[];
     initialModel?: string;
     title?: string;
@@ -77,6 +78,9 @@ vi.mock("@/components/MissingKeysModal", () => ({
         </span>
         <span data-testid="modal-initial-model">{props.initialModel ?? ""}</span>
         <span data-testid="modal-title">{props.title ?? ""}</span>
+        <span data-testid="modal-optional-keys">
+          {(props.optionalKeys ?? []).join(",")}
+        </span>
         <button
           data-testid="modal-keys-added"
           onClick={() => props.onKeysAdded()}
@@ -113,6 +117,7 @@ function makeTemplate(over: Partial<Template> = {}): Template {
     runtime: "claude-code",
     models: [],
     required_env: [],
+    recommended_env: [],
     ...over,
   };
 }
@@ -129,6 +134,7 @@ beforeEach(() => {
     missingKeys: [],
     providers: [],
     runtime: "claude-code",
+    optionalKeys: [],
     configuredKeys: new Set(),
   });
   mockApiPost.mockResolvedValue({ id: "ws-new" });
@@ -243,6 +249,7 @@ describe("useTemplateDeploy — preflight failure modes", () => {
       missingKeys: ["ANTHROPIC_API_KEY"],
       providers: [],
       runtime: "claude-code",
+      optionalKeys: [],
       configuredKeys: new Set(),
     });
     const onDeployed = vi.fn();
@@ -271,6 +278,7 @@ describe("useTemplateDeploy — modal lifecycle", () => {
       missingKeys: ["ANTHROPIC_API_KEY"],
       providers: [],
       runtime: "claude-code",
+      optionalKeys: [],
       configuredKeys: new Set(),
     });
     const onDeployed = vi.fn();
@@ -306,6 +314,7 @@ describe("useTemplateDeploy — modal lifecycle", () => {
       missingKeys: ["ANTHROPIC_API_KEY"],
       providers: [],
       runtime: "claude-code",
+      optionalKeys: [],
       configuredKeys: new Set(),
     });
     const { result, rerender } = renderHook(() => useTemplateDeploy());
@@ -359,6 +368,7 @@ describe("useTemplateDeploy — multi-provider always-ask flow", () => {
         { id: "ANTHROPIC_API_KEY", label: "Anthropic", envVars: ["ANTHROPIC_API_KEY"] },
       ],
       runtime: "hermes",
+      optionalKeys: [],
       configuredKeys: new Set(["MINIMAX_API_KEY", "ANTHROPIC_API_KEY"]),
     });
     const { result, rerender } = renderHook(() => useTemplateDeploy());
@@ -392,6 +402,7 @@ describe("useTemplateDeploy — multi-provider always-ask flow", () => {
         { id: "ANTHROPIC_API_KEY", label: "Anthropic", envVars: ["ANTHROPIC_API_KEY"] },
       ],
       runtime: "hermes",
+      optionalKeys: [],
       configuredKeys: new Set(),
     });
     const { result, rerender } = renderHook(() => useTemplateDeploy());
@@ -420,6 +431,7 @@ describe("useTemplateDeploy — multi-provider always-ask flow", () => {
         { id: "ANTHROPIC_API_KEY", label: "Anthropic", envVars: ["ANTHROPIC_API_KEY"] },
       ],
       runtime: "hermes",
+      optionalKeys: [],
       configuredKeys: new Set(),
     });
     const { result, rerender } = renderHook(() => useTemplateDeploy());
@@ -484,6 +496,7 @@ describe("useTemplateDeploy — multi-provider always-ask flow", () => {
         { id: "ANTHROPIC_API_KEY", label: "Anthropic", envVars: ["ANTHROPIC_API_KEY"] },
       ],
       runtime: "hermes",
+      optionalKeys: [],
       configuredKeys: new Set(),
     });
     const { result, rerender } = renderHook(() => useTemplateDeploy());
@@ -497,6 +510,35 @@ describe("useTemplateDeploy — multi-provider always-ask flow", () => {
 
     expect(screen.getByTestId("missing-keys-modal")).toBeTruthy();
     expect(screen.getByTestId("modal-configured-size").textContent).toBe("0");
+    expect(mockApiPost).not.toHaveBeenCalled();
+  });
+
+  it("opens configure modal for optional env prompts even when no required provider key is missing", async () => {
+    mockCheckDeploySecrets.mockResolvedValueOnce({
+      ok: true,
+      missingKeys: [],
+      providers: [],
+      runtime: "claude-code",
+      optionalKeys: ["GOOGLE_GSC_SITE", "GOOGLE_GA4_PROPERTY_ID"],
+      configuredKeys: new Set(),
+    });
+    const { result, rerender } = renderHook(() => useTemplateDeploy());
+
+    await act(async () => {
+      await result.current.deploy(makeTemplate({
+        id: "seo-agent",
+        name: "SEO Agent",
+        recommended_env: ["GOOGLE_GSC_SITE", "GOOGLE_GA4_PROPERTY_ID"],
+      }));
+    });
+
+    rerender();
+    render(<>{result.current.modal}</>);
+
+    expect(screen.getByTestId("missing-keys-modal")).toBeTruthy();
+    expect(screen.getByTestId("modal-optional-keys").textContent).toBe(
+      "GOOGLE_GSC_SITE,GOOGLE_GA4_PROPERTY_ID",
+    );
     expect(mockApiPost).not.toHaveBeenCalled();
   });
 });
