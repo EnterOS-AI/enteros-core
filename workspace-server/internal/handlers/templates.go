@@ -54,6 +54,7 @@ const maxUploadFiles = 200
 
 type TemplatesHandler struct {
 	configsDir string
+	cacheDir   string
 	docker     *client.Client
 	// wh is used by Import and ReplaceFiles to call DefaultTier() so a
 	// generated config.yaml's tier matches the SaaS-vs-self-hosted
@@ -61,6 +62,11 @@ type TemplatesHandler struct {
 	// the caller doesn't import templates that need a fresh config
 	// generated.
 	wh *WorkspaceHandler
+	// refreshCache is nil unless main wires a manifest-backed template
+	// cache refresher. POST /admin/templates/refresh uses this hook so a
+	// template repo merge can update the tenant catalog without rebuilding
+	// the full tenant image.
+	refreshCache func(ctx *gin.Context) (any, error)
 }
 
 // NewTemplatesHandler constructs a TemplatesHandler. wh may be nil for
@@ -69,6 +75,16 @@ type TemplatesHandler struct {
 // generated config.yaml picks the SaaS-aware default tier.
 func NewTemplatesHandler(configsDir string, dockerCli *client.Client, wh *WorkspaceHandler) *TemplatesHandler {
 	return &TemplatesHandler{configsDir: configsDir, docker: dockerCli, wh: wh}
+}
+
+func (h *TemplatesHandler) WithCacheDir(cacheDir string) *TemplatesHandler {
+	h.cacheDir = cacheDir
+	return h
+}
+
+func (h *TemplatesHandler) WithRefreshFunc(fn func(ctx *gin.Context) (any, error)) *TemplatesHandler {
+	h.refreshCache = fn
+	return h
 }
 
 // modelSpec describes a single supported model on a template: its id (sent
@@ -161,6 +177,15 @@ type templateSummary struct {
 // Only resolves to actual templates (not ws-* dirs since those are now Docker volumes).
 // Returns empty string if no matching template is found.
 func (h *TemplatesHandler) resolveTemplateDir(wsName string) string {
+	if h.cacheDir != "" {
+		nameDir := filepath.Join(h.cacheDir, normalizeName(wsName))
+		if _, err := os.Stat(nameDir); err == nil {
+			return nameDir
+		}
+		if tmpl := findTemplateByName(h.cacheDir, wsName); tmpl != "" {
+			return filepath.Join(h.cacheDir, tmpl)
+		}
+	}
 	nameDir := filepath.Join(h.configsDir, normalizeName(wsName))
 	if _, err := os.Stat(nameDir); err == nil {
 		return nameDir
@@ -175,76 +200,102 @@ func (h *TemplatesHandler) resolveTemplateDir(wsName string) string {
 // List handles GET /templates
 func (h *TemplatesHandler) List(c *gin.Context) {
 	templates := make([]templateSummary, 0)
-	walkTemplateConfigs(h.configsDir, func(id string, data []byte) {
-		var raw struct {
-			Name        string   `yaml:"name"`
-			Description string   `yaml:"description"`
-			Tier        int      `yaml:"tier"`
-			Runtime     string   `yaml:"runtime"`
-			Model       string   `yaml:"model"`
-			Skills      []string `yaml:"skills"`
-			// Top-level `providers:` block — structured registry. Distinct
-			// from runtime_config.providers (slug list) below. Both shapes
-			// coexist in production: claude-code ships the structured
-			// registry, hermes still uses the slug list. /templates surfaces
-			// both verbatim so each runtime owns its taxonomy.
-			Providers     []providerRegistryEntry `yaml:"providers"`
-			RuntimeConfig struct {
-				Model                   string      `yaml:"model"`
-				Models                  []modelSpec `yaml:"models"`
-				RequiredEnv             []string    `yaml:"required_env"`
-				RecommendedEnv          []string    `yaml:"recommended_env"`
-				Providers               []string    `yaml:"providers"`
-				ProvisionTimeoutSeconds int         `yaml:"provision_timeout_seconds"`
-			} `yaml:"runtime_config"`
-		}
-		if err := yaml.Unmarshal(data, &raw); err != nil {
-			// Without this log a malformed config.yaml causes the
-			// template to silently disappear from /templates with no
-			// trace — the operator can't tell "excluded due to parse
-			// error" from "never existed." That matters more now that
-			// templates ship richer YAML shapes (top-level providers
-			// registry, models[] with required_env, etc.) where a
-			// type-shape mismatch on one field drops the whole entry.
-			log.Printf("templates list: skip %s: yaml.Unmarshal: %v", id, err)
+	seen := map[string]struct{}{}
+	walk := func(root string) {
+		if root == "" {
 			return
 		}
-		runtime := strings.TrimSuffix(strings.TrimSpace(raw.Runtime), "-default")
-		if _, ok := knownRuntimes[runtime]; !ok {
-			log.Printf("templates list: skip %s: unsupported runtime %q", id, raw.Runtime)
-			return
-		}
+		walkTemplateConfigs(root, func(id string, data []byte) {
+			if _, ok := seen[id]; ok {
+				return
+			}
+			seen[id] = struct{}{}
+			var raw struct {
+				Name        string   `yaml:"name"`
+				Description string   `yaml:"description"`
+				Tier        int      `yaml:"tier"`
+				Runtime     string   `yaml:"runtime"`
+				Model       string   `yaml:"model"`
+				Skills      []string `yaml:"skills"`
+				// Top-level `providers:` block — structured registry. Distinct
+				// from runtime_config.providers (slug list) below. Both shapes
+				// coexist in production: claude-code ships the structured
+				// registry, hermes still uses the slug list. /templates surfaces
+				// both verbatim so each runtime owns its taxonomy.
+				Providers     []providerRegistryEntry `yaml:"providers"`
+				RuntimeConfig struct {
+					Model                   string      `yaml:"model"`
+					Models                  []modelSpec `yaml:"models"`
+					RequiredEnv             []string    `yaml:"required_env"`
+					RecommendedEnv          []string    `yaml:"recommended_env"`
+					Providers               []string    `yaml:"providers"`
+					ProvisionTimeoutSeconds int         `yaml:"provision_timeout_seconds"`
+				} `yaml:"runtime_config"`
+			}
+			if err := yaml.Unmarshal(data, &raw); err != nil {
+				// Without this log a malformed config.yaml causes the
+				// template to silently disappear from /templates with no
+				// trace — the operator can't tell "excluded due to parse
+				// error" from "never existed." That matters more now that
+				// templates ship richer YAML shapes (top-level providers
+				// registry, models[] with required_env, etc.) where a
+				// type-shape mismatch on one field drops the whole entry.
+				log.Printf("templates list: skip %s: yaml.Unmarshal: %v", id, err)
+				return
+			}
+			runtime := strings.TrimSuffix(strings.TrimSpace(raw.Runtime), "-default")
+			if _, ok := knownRuntimes[runtime]; !ok {
+				log.Printf("templates list: skip %s: unsupported runtime %q", id, raw.Runtime)
+				return
+			}
 
-		// Model comes from either top-level (legacy) or runtime_config.model (current).
-		model := raw.Model
-		if model == "" {
-			model = raw.RuntimeConfig.Model
-		}
+			// Model comes from either top-level (legacy) or runtime_config.model (current).
+			model := raw.Model
+			if model == "" {
+				model = raw.RuntimeConfig.Model
+			}
 
-		tier := raw.Tier
-		if h.wh != nil && h.wh.IsSaaS() {
-			tier = h.wh.DefaultTier()
-		}
+			tier := raw.Tier
+			if h.wh != nil && h.wh.IsSaaS() {
+				tier = h.wh.DefaultTier()
+			}
 
-		templates = append(templates, templateSummary{
-			ID:                      id,
-			Name:                    raw.Name,
-			Description:             raw.Description,
-			Tier:                    tier,
-			Runtime:                 raw.Runtime,
-			Model:                   model,
-			Models:                  raw.RuntimeConfig.Models,
-			RequiredEnv:             raw.RuntimeConfig.RequiredEnv,
-			RecommendedEnv:          raw.RuntimeConfig.RecommendedEnv,
-			Providers:               raw.RuntimeConfig.Providers,
-			ProviderRegistry:        raw.Providers,
-			Skills:                  raw.Skills,
-			SkillCount:              len(raw.Skills),
-			ProvisionTimeoutSeconds: raw.RuntimeConfig.ProvisionTimeoutSeconds,
+			templates = append(templates, templateSummary{
+				ID:                      id,
+				Name:                    raw.Name,
+				Description:             raw.Description,
+				Tier:                    tier,
+				Runtime:                 raw.Runtime,
+				Model:                   model,
+				Models:                  raw.RuntimeConfig.Models,
+				RequiredEnv:             raw.RuntimeConfig.RequiredEnv,
+				RecommendedEnv:          raw.RuntimeConfig.RecommendedEnv,
+				Providers:               raw.RuntimeConfig.Providers,
+				ProviderRegistry:        raw.Providers,
+				Skills:                  raw.Skills,
+				SkillCount:              len(raw.Skills),
+				ProvisionTimeoutSeconds: raw.RuntimeConfig.ProvisionTimeoutSeconds,
+			})
 		})
-	})
+	}
+	walk(h.cacheDir)
+	walk(h.configsDir)
 
 	c.JSON(http.StatusOK, templates)
+}
+
+// RefreshCache handles POST /admin/templates/refresh.
+func (h *TemplatesHandler) RefreshCache(c *gin.Context) {
+	if h.refreshCache == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "template cache refresh is not configured"})
+		return
+	}
+	result, err := h.refreshCache(c)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, result)
 }
 
 // ListFiles handles GET /workspaces/:id/files

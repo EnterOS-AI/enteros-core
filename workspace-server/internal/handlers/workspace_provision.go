@@ -485,6 +485,17 @@ func findTemplateByName(configsDir, name string) string {
 	return ""
 }
 
+func resolveWorkspaceTemplatePath(configsDir, cacheDir, template string) (string, error) {
+	if cacheDir != "" {
+		if p, err := resolveInsideRoot(cacheDir, template); err != nil {
+			return "", err
+		} else if _, statErr := os.Stat(p); statErr == nil {
+			return p, nil
+		}
+	}
+	return resolveInsideRoot(configsDir, template)
+}
+
 // resolveOrgTemplate looks for a matching role directory under
 // configsDir/org-templates/ and returns the absolute path and a short label
 // ("org-templates/<dir>"). Used by the restart handler's rebuild_config path
@@ -658,7 +669,7 @@ func (h *WorkspaceHandler) defaultTemplateProvidersYAML(runtime string) string {
 		return ""
 	}
 	templateName := runtime + "-default"
-	templatePath, err := resolveInsideRoot(h.configsDir, templateName)
+	templatePath, err := resolveWorkspaceTemplatePath(h.configsDir, h.cacheDir, templateName)
 	if err != nil {
 		log.Printf("Provisioner: default template providers skipped for runtime %s: %v", runtime, err)
 		return ""

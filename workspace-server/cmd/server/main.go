@@ -50,6 +50,7 @@ import (
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/router"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/scheduler"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/supervised"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/templatecache"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/ws"
 
 	// External plugins — each registers EnvMutator(s) that run at workspace
@@ -58,6 +59,7 @@ import (
 	ghidentity "go.moleculesai.app/plugin/gh-identity/pluginloader"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/pkg/provisionhook"
+	"github.com/gin-gonic/gin"
 )
 
 func main() {
@@ -193,11 +195,28 @@ func main() {
 	port := envOr("PORT", "8080")
 	platformURL := envOr("PLATFORM_URL", fmt.Sprintf("http://host.docker.internal:%s", port))
 	configsDir := envOr("CONFIGS_DIR", findConfigsDir())
+	templateCacheDir := envOr("TEMPLATE_CACHE_DIR", filepath.Join(os.TempDir(), "molecule-template-cache"))
+	manifestPath := findWorkspaceManifestPath()
+	templateToken := templateCacheToken()
+	refreshTemplates := func(ctx context.Context) (templatecache.RefreshReport, error) {
+		return templatecache.RefreshWorkspaceTemplates(ctx, manifestPath, templateCacheDir, templateToken)
+	}
+	if shouldRefreshTemplateCache(templateToken, manifestPath) {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		report, err := refreshTemplates(ctx)
+		cancel()
+		if err != nil {
+			log.Printf("template cache refresh: %v (continuing with baked templates)", err)
+		} else {
+			log.Printf("template cache refresh: refreshed %d workspace templates into %s", len(report.Results), templateCacheDir)
+		}
+	}
 
 	// Init order: wh → onWorkspaceOffline → liveness/healthSweep → router
 	// WorkspaceHandler is created before the router so RestartByID can be wired into
 	// the offline callbacks used by both the liveness monitor and the health sweep.
-	wh := handlers.NewWorkspaceHandler(broadcaster, prov, platformURL, configsDir)
+	wh := handlers.NewWorkspaceHandler(broadcaster, prov, platformURL, configsDir).
+		WithTemplateCacheDir(templateCacheDir)
 	if cpProv != nil {
 		wh.SetCPProvisioner(cpProv)
 	}
@@ -377,7 +396,12 @@ func main() {
 	// require a plugins/ dir on disk (nil in CP/SaaS mode).
 	pluginRegistry := plugins.NewRegistry()
 	pluginRegistry.Register(plugins.NewGithubResolver())
-	r := router.Setup(hub, broadcaster, prov, platformURL, configsDir, wh, channelMgr, memBundle, pluginRegistry)
+	refreshTemplatesHTTP := func(c *gin.Context) (any, error) {
+		ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Minute)
+		defer cancel()
+		return refreshTemplates(ctx)
+	}
+	r := router.Setup(hub, broadcaster, prov, platformURL, configsDir, templateCacheDir, wh, channelMgr, memBundle, pluginRegistry, refreshTemplatesHTTP)
 
 	// Plugin drift sweeper — periodic detection of upstream plugin version drift
 	// (core#123). Scans workspace_plugins rows where tracked_ref != 'none',
@@ -491,6 +515,40 @@ func findConfigsDir() string {
 		}
 	}
 	return "workspace-configs-templates"
+}
+
+func findWorkspaceManifestPath() string {
+	if v := os.Getenv("WORKSPACE_MANIFEST_PATH"); v != "" {
+		return v
+	}
+	for _, p := range []string{"/app/manifest.json", "manifest.json", "../manifest.json", "../../manifest.json"} {
+		if abs, err := filepath.Abs(p); err == nil {
+			if _, err := os.Stat(abs); err == nil {
+				return abs
+			}
+		}
+	}
+	return ""
+}
+
+func templateCacheToken() string {
+	for _, key := range []string{"MOLECULE_TEMPLATE_GITEA_TOKEN", "MOLECULE_GITEA_TOKEN"} {
+		if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func shouldRefreshTemplateCache(token, manifestPath string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("TEMPLATE_CACHE_REFRESH"))) {
+	case "0", "false", "off", "no":
+		return false
+	case "1", "true", "on", "yes":
+		return token != "" && manifestPath != ""
+	default:
+		return token != "" && manifestPath != ""
+	}
 }
 
 func findMigrationsDir() string {

@@ -8,19 +8,10 @@
 # Requires: git, jq (lighter than python3 — ~2MB vs ~50MB in Alpine)
 #
 # Auth (optional):
-#   Post-2026-05-08 (#192): every repo in manifest.json is public on
-#   git.moleculesai.app. Anonymous clone works for the entire registered
-#   set. The OSS-surface contract is recorded in manifest.json's _comment
-#   — Layer-3 customer/private templates (e.g. reno-stars) are NOT in the
-#   manifest; they are handled at provision-time via the per-tenant
-#   credential resolver (internal#102 RFC).
-#
-#   MOLECULE_GITEA_TOKEN is therefore optional today. Kept supported for
-#   two reasons: (a) historical CI configs that still inject
-#   AUTO_SYNC_TOKEN remain harmless, (b) reserved for the case where a
-#   private internal-only template is later registered via a ci-readonly
-#   team grant — review must explicitly sign off on that, since it
-#   violates the public-OSS-surface contract.
+#   Repos in manifest.json may be public or platform-private. CI and
+#   operator refresh jobs should set MOLECULE_GITEA_TOKEN to the
+#   SSOT-managed template read token. Anonymous clone still works for
+#   public entries, but private platform templates depend on the token.
 #
 #   The token (when set) never enters the Docker image: this script runs
 #   in the trusted CI context BEFORE `docker buildx build`, populates
