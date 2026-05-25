@@ -2,10 +2,12 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
-const { mockGet, mockPost, mockRFBConstructor } = vi.hoisted(() => ({
+const { mockGet, mockPost, mockRFBConstructor, mockRFBClipboardPasteFrom, mockRFBFocus } = vi.hoisted(() => ({
   mockGet: vi.fn(),
   mockPost: vi.fn(),
   mockRFBConstructor: vi.fn(),
+  mockRFBClipboardPasteFrom: vi.fn(),
+  mockRFBFocus: vi.fn(),
 }));
 
 vi.mock("@/lib/api", () => ({
@@ -30,6 +32,12 @@ vi.mock("@novnc/novnc", () => ({
       this.options = options;
       mockRFBConstructor(target, url, options);
     }
+    clipboardPasteFrom(text: string) {
+      mockRFBClipboardPasteFrom(text);
+    }
+    focus(options?: FocusOptions) {
+      mockRFBFocus(options);
+    }
     disconnect() {}
   },
 }));
@@ -42,6 +50,8 @@ describe("DisplayTab", () => {
     mockGet.mockReset();
     mockPost.mockReset();
     mockRFBConstructor.mockReset();
+    mockRFBClipboardPasteFrom.mockReset();
+    mockRFBFocus.mockReset();
   });
 
   it("renders unavailable state for non-display workspaces", async () => {
@@ -155,6 +165,43 @@ describe("DisplayTab", () => {
       { wsProtocols: ["binary", "molecule-display-token.signed"] },
     );
     expect(mockRFBConstructor.mock.calls[0][1]).not.toContain("token=");
+  });
+
+  it("forwards browser paste events into the noVNC clipboard", async () => {
+    mockGet
+      .mockResolvedValueOnce({
+        available: true,
+        mode: "desktop-control",
+        protocol: "novnc",
+        width: 1920,
+        height: 1080,
+      })
+      .mockResolvedValueOnce({
+        controller: "none",
+      });
+    mockPost.mockResolvedValueOnce({
+      controller: "user",
+      controlled_by: "admin-token",
+      expires_at: "2026-05-23T08:48:27Z",
+      session_url: "/workspaces/ws-display/display/session/websockify#token=signed",
+    });
+
+    render(<DisplayTab workspaceId="ws-display" />);
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Take control" })).toBeTruthy();
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Take control" }));
+
+    const desktop = await screen.findByTitle("Workspace desktop");
+    fireEvent.paste(desktop, {
+      clipboardData: {
+        getData: (type: string) => (type === "text/plain" ? "Paste Me" : ""),
+      },
+    });
+
+    expect(mockRFBClipboardPasteFrom).toHaveBeenCalledWith("Paste Me");
+    expect(mockRFBFocus).toHaveBeenCalledWith({ preventScroll: true });
   });
 
   it("releases user display control", async () => {

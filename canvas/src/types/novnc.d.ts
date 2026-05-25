@@ -4,6 +4,8 @@ declare module "@novnc/novnc" {
     resizeSession: boolean;
     focusOnClick: boolean;
     constructor(target: HTMLElement, url: string, options?: { wsProtocols?: string[]; [key: string]: unknown });
+    clipboardPasteFrom(text: string): void;
     disconnect(): void;
+    focus(options?: FocusOptions): void;
   }
 }
