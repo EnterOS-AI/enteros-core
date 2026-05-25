@@ -274,7 +274,8 @@ def required_checks_env(audit_doc: dict) -> set[str]:
                     found.append(v)
     if not found:
         sys.stderr.write(
-            f"::error::REQUIRED_CHECKS env not found in any step of {AUDIT_WORKFLOW_PATH}\n"
+            f"::error::REQUIRED_CHECKS env not found in any step of "
+            f"{AUDIT_WORKFLOW_PATH}\n"
         )
         sys.exit(3)
     if len(found) > 1:
@@ -387,7 +388,8 @@ def detect_drift(branch: str) -> tuple[list[str], dict]:
     missing_from_needs = sorted(jobs - needs)
     if missing_from_needs:
         findings.append(
-            "F1 — jobs in ci.yml NOT under sentinel `needs:` (sentinel doesn't gate them):\n"
+            "F1 — jobs in ci.yml NOT under sentinel `needs:` "
+            "(sentinel doesn't gate them):\n"
             + "\n".join(f"  - {n}" for n in missing_from_needs)
         )
 
