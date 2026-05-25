@@ -320,20 +320,18 @@ func putBatchInsertRows(ctx context.Context, tx *sql.Tx, workspaceID uuid.UUID, 
 }
 
 func (p *PostgresStorage) Get(ctx context.Context, fileID uuid.UUID) (Record, error) {
-	// The expires_at + acked_at filter in the WHERE clause means a
-	// caller sees ErrNotFound for absent / acked / expired without
-	// needing per-case branching. Trade-off: we can't differentiate
-	// in metrics, but the workspace's response is the same in all
-	// three cases ("file gone, give up") so the granularity isn't
-	// useful at this layer. Phase 3 dashboards aggregate row-state
-	// counts directly off the table.
+	// The expires_at filter keeps hard-TTL semantics while allowing
+	// acked rows to remain readable during the ack-retention window.
+	// Canvas chat history stores platform-pending: URIs; after the
+	// poll-mode workspace acks the upload, refreshed browser previews
+	// still need to fetch the same bytes until the sweeper reclaims
+	// the acked row.
 	var r Record
 	err := p.db.QueryRowContext(ctx, `
 		SELECT file_id, workspace_id, content, filename, mimetype,
 		       size_bytes, created_at, fetched_at, acked_at, expires_at
 		FROM pending_uploads
 		WHERE file_id = $1
-		  AND acked_at IS NULL
 		  AND expires_at > now()
 	`, fileID).Scan(
 		&r.FileID, &r.WorkspaceID, &r.Content, &r.Filename, &r.Mimetype,
@@ -349,15 +347,14 @@ func (p *PostgresStorage) Get(ctx context.Context, fileID uuid.UUID) (Record, er
 }
 
 func (p *PostgresStorage) MarkFetched(ctx context.Context, fileID uuid.UUID) error {
-	// UPDATE on the same gating predicate as Get — keeps the "absent
-	// or acked or expired = ErrNotFound" contract symmetric. Without
-	// the predicate a workspace could re-stamp fetched_at on an acked
-	// row, which would mislead Phase 3's stuck-fetch dashboard.
+	// UPDATE on the same expiry predicate as Get. This may re-stamp
+	// fetched_at on an acked row when the canvas previews an attachment
+	// after refresh, which is fine: acked_at remains the delivery-time
+	// signal and the sweeper still deletes by acked_at retention.
 	res, err := p.db.ExecContext(ctx, `
 		UPDATE pending_uploads
 		SET fetched_at = now()
 		WHERE file_id = $1
-		  AND acked_at IS NULL
 		  AND expires_at > now()
 	`, fileID)
 	if err != nil {
