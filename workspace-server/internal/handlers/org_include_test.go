@@ -209,6 +209,9 @@ func TestResolveYAMLIncludes_SiblingDirAccess(t *testing.T) {
 // molecule-dev. This test fetches it via HTTPS (no token needed — the repo
 // is public) to exercise the real include resolution on every CI run.
 func TestResolveYAMLIncludes_RealMoleculeDev(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available in this runtime")
+	}
 	tmp := t.TempDir()
 	// Clone the canonical standalone org template. No token needed — the
 	// repo is public on the same Gitea instance.
