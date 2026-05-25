@@ -36,6 +36,27 @@ beforeEach(() => {
 });
 
 describe("ContainerConfigTab", () => {
+  it("defaults missing compute to the cost-efficient headless profile", () => {
+    render(
+      <ContainerConfigTab
+        workspaceId="ws-compute"
+        data={{
+          runtime: "claude-code",
+          status: "online",
+          needsRestart: false,
+          activeTasks: 0,
+          maxConcurrentTasks: null,
+          workspaceAccess: "none",
+          deliveryMode: "push",
+          compute: undefined,
+        }}
+      />,
+    );
+
+    expect(screen.getByLabelText("Instance type")).toHaveProperty("value", "t3.medium");
+    expect(screen.getByLabelText("Root volume")).toHaveProperty("value", "30");
+  });
+
   it("renders persisted compute and status settings", () => {
     render(
       <ContainerConfigTab

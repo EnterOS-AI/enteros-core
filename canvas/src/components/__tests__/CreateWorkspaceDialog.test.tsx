@@ -123,7 +123,7 @@ describe("CreateWorkspaceDialog", () => {
     expect(body.parent_id).toBeUndefined();
   });
 
-  it("omits compute config by default", async () => {
+  it("sends the cost-efficient headless compute profile by default", async () => {
     await openDialog();
     fireEvent.change(screen.getByPlaceholderText("e.g. SEO Agent"), {
       target: { value: "Plain Agent" },
@@ -134,8 +134,28 @@ describe("CreateWorkspaceDialog", () => {
 
     await waitFor(() => expect(mockPost).toHaveBeenCalled());
     const body = mockPost.mock.calls[0][1] as Record<string, unknown>;
-    expect(body.compute).toBeUndefined();
+    expect(body.compute).toEqual({
+      instance_type: "t3.medium",
+      volume: { root_gb: 30 },
+      display: { mode: "none" },
+    });
     expect(body.model).toBe("anthropic:claude-opus-4-7");
+  });
+
+  it("does not send managed compute for external agents", async () => {
+    await openDialog();
+    fireEvent.change(screen.getByPlaceholderText("e.g. SEO Agent"), {
+      target: { value: "External Agent" },
+    });
+    fireEvent.click(screen.getByLabelText(/External agent/));
+
+    const createBtn = screen.getAllByRole("button").find((b) => b.textContent === "Create");
+    fireEvent.click(createBtn!);
+
+    await waitFor(() => expect(mockPost).toHaveBeenCalled());
+    const body = mockPost.mock.calls[0][1] as Record<string, unknown>;
+    expect(body.compute).toBeUndefined();
+    expect(body.runtime).toBe("external");
   });
 
   it("sends display compute profile when desktop display is enabled", async () => {
