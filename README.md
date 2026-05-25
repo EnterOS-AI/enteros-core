@@ -46,6 +46,18 @@
 
 ---
 
+## Quick Start
+
+```bash
+git clone https://git.moleculesai.app/molecule-ai/molecule-monorepo.git
+cd molecule-monorepo
+./scripts/dev-start.sh
+```
+
+Then open [http://localhost:3000](http://localhost:3000), add your model API key in **Config → Secrets & API Keys → Global**, and create a workspace from a template.
+
+See the full [Quickstart Guide](./docs/quickstart.md) for prerequisites, manual setup, and troubleshooting.
+
 ## The Pitch
 
 Molecule AI is the most powerful way to govern an AI agent organization in production.
