@@ -1,12 +1,12 @@
 // @vitest-environment jsdom
 /**
- * AttachmentPDF — inline PDF preview button + click-to-fullscreen lightbox.
+ * AttachmentPDF — inline PDF preview button + click-to-panel lightbox.
  *
  * Per RFC #2991 PR-3: platform-auth URIs fetch bytes → Blob → ObjectURL;
  * external URIs use the raw URL directly. State machine: idle → loading →
  * ready/error. Loading skeleton shown while fetching. Error falls back to
  * AttachmentChip. Clicking the preview button opens AttachmentLightbox with
- * <embed>. Blob URL cleaned up on unmount.
+ * a browser PDF iframe. Blob URL cleaned up on unmount.
  *
  * NOTE: No @testing-library/jest-dom import — use DOM APIs for assertions.
  *
@@ -158,10 +158,12 @@ describe("AttachmentPDF — ready", () => {
     });
     const dialog = document.querySelector('[role="dialog"]');
     expect(dialog?.getAttribute("aria-label")).toContain("report.pdf");
+    expect(dialog?.className).toContain("absolute");
     const frame = dialog?.querySelector("iframe") as HTMLIFrameElement | null;
     expect(frame).toBeTruthy();
     expect(frame?.getAttribute("title")).toBe("report.pdf");
     expect(frame?.className).toContain("bg-white");
+    expect(frame?.parentElement?.className).toContain("w-full");
     expect(dialog?.querySelector("embed")).toBeNull();
   });
 
