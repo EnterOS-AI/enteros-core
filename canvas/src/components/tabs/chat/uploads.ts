@@ -125,6 +125,8 @@ export async function uploadChatFiles(
  *    - `/workspace/...` (bare absolute path inside the container)
  *    - `platform-pending:<wsid>/<file_id>` (poll-mode upload, staged
  *      on platform side; resolves to /pending-uploads/<file_id>/content)
+ *    - `/workspaces/<wsid>/content/<file_id>/content` (legacy platform
+ *      content URL; normalizes to the same pending-upload endpoint)
  *  Everything that looks like an allowed-root container path is
  *  rewritten to the authenticated /chat/download endpoint. HTTP(S)
  *  URIs pass through unchanged so we can also render links to
@@ -163,6 +165,11 @@ export function resolveAttachmentHref(
     }
     return uri;
   }
+  const legacy = parseLegacyPlatformContentUri(uri);
+  if (legacy) {
+    const [wsid, fileID] = legacy;
+    return `${PLATFORM_URL}/workspaces/${encodeURIComponent(wsid)}/pending-uploads/${encodeURIComponent(fileID)}/content`;
+  }
   const containerPath = normalizeWorkspaceUri(uri);
   if (containerPath) {
     return `${PLATFORM_URL}/workspaces/${workspaceId}/chat/download?path=${encodeURIComponent(containerPath)}`;
@@ -175,6 +182,7 @@ export function resolveAttachmentHref(
  *  downloadChatFile rather than letting the browser navigate. */
 export function isPlatformAttachment(uri: string): boolean {
   if (uri.startsWith("platform-pending:")) return true;
+  if (parseLegacyPlatformContentUri(uri)) return true;
   return normalizeWorkspaceUri(uri) !== null;
 }
 
@@ -182,6 +190,12 @@ export function isPlatformAttachment(uri: string): boolean {
  *  or null if the URI isn't a container path. The matching roots
  *  mirror the server's `allowedRoots` allowlist. */
 const ALLOWED_CONTAINER_ROOTS = ["/configs", "/workspace", "/home", "/plugins"];
+
+function parseLegacyPlatformContentUri(uri: string): [string, string] | null {
+  const m = uri.match(/^\/workspaces\/([^/]+)\/content\/([^/]+)\/content(?:[?#].*)?$/);
+  if (!m || !m[1] || !m[2]) return null;
+  return [m[1], m[2]];
+}
 
 function normalizeWorkspaceUri(uri: string): string | null {
   let path: string | null = null;
