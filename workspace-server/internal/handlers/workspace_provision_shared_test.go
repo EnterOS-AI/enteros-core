@@ -964,7 +964,7 @@ func TestApplyRuntimeModelEnv_SetsUniversalMODELForAllRuntimes(t *testing.T) {
 	}
 }
 
-func TestApplyPlatformManagedLLMEnv_DefaultsOpenAIProxyWhenNoWorkspaceKey(t *testing.T) {
+func TestApplyPlatformManagedLLMEnv_NonClaudeRuntimeDefaultsOpenAIProxyWhenNoWorkspaceKey(t *testing.T) {
 	t.Setenv("MOLECULE_LLM_BILLING_MODE", "platform_managed")
 	t.Setenv("MOLECULE_LLM_BASE_URL", "https://api.example.test/api/v1/internal/llm/openai/v1")
 	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
@@ -972,8 +972,8 @@ func TestApplyPlatformManagedLLMEnv_DefaultsOpenAIProxyWhenNoWorkspaceKey(t *tes
 	t.Setenv("MOLECULE_LLM_DEFAULT_MODEL", "moonshot/kimi-k2.6")
 
 	envVars := map[string]string{}
-	applyPlatformManagedLLMEnv(envVars, "claude-code", "")
-	applyRuntimeModelEnv(envVars, "claude-code", "")
+	applyPlatformManagedLLMEnv(envVars, "codex", "")
+	applyRuntimeModelEnv(envVars, "codex", "")
 
 	if got := envVars["OPENAI_BASE_URL"]; got != "https://api.example.test/api/v1/internal/llm/openai/v1" {
 		t.Fatalf("OPENAI_BASE_URL = %q", got)
@@ -1015,6 +1015,75 @@ func TestApplyPlatformManagedLLMEnv_DoesNotOverrideWorkspaceOpenAIKey(t *testing
 	}
 	if got := envVars["MODEL"]; got != "openai/gpt-5.5" {
 		t.Fatalf("MODEL = %q", got)
+	}
+}
+
+func TestApplyPlatformManagedLLMEnv_ClaudeCodeUsesAnthropicProxyWithoutOverwritingOAuth(t *testing.T) {
+	t.Setenv("MOLECULE_LLM_BILLING_MODE", "platform_managed")
+	t.Setenv("MOLECULE_LLM_BASE_URL", "https://api.example.test/api/v1/internal/llm/openai/v1")
+	t.Setenv("MOLECULE_LLM_ANTHROPIC_BASE_URL", "https://api.example.test/api/v1/internal/llm/anthropic/v1")
+	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
+
+	envVars := map[string]string{
+		"CLAUDE_CODE_OAUTH_TOKEN": "user-oauth-token",
+		"MODEL":                   "sonnet",
+	}
+	applyPlatformManagedLLMEnv(envVars, "claude-code", "")
+
+	if got := envVars["CLAUDE_CODE_OAUTH_TOKEN"]; got != "user-oauth-token" {
+		t.Fatalf("CLAUDE_CODE_OAUTH_TOKEN was overwritten: %q", got)
+	}
+	if _, ok := envVars["ANTHROPIC_API_KEY"]; ok {
+		t.Fatalf("ANTHROPIC_API_KEY should not be set when Claude OAuth is present")
+	}
+	if got := envVars["MOLECULE_LLM_ANTHROPIC_BASE_URL"]; got != "https://api.example.test/api/v1/internal/llm/anthropic/v1" {
+		t.Fatalf("MOLECULE_LLM_ANTHROPIC_BASE_URL = %q", got)
+	}
+}
+
+func TestApplyPlatformManagedLLMEnv_ClaudeCodeInjectsAnthropicProxyWhenNoWorkspaceKey(t *testing.T) {
+	t.Setenv("MOLECULE_LLM_BILLING_MODE", "platform_managed")
+	t.Setenv("MOLECULE_LLM_BASE_URL", "https://api.example.test/api/v1/internal/llm/openai/v1")
+	t.Setenv("MOLECULE_LLM_ANTHROPIC_BASE_URL", "https://api.example.test/api/v1/internal/llm/anthropic/v1")
+	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
+
+	envVars := map[string]string{}
+	applyPlatformManagedLLMEnv(envVars, "claude-code", "minimax/MiniMax-M2.7")
+
+	if got := envVars["ANTHROPIC_BASE_URL"]; got != "https://api.example.test/api/v1/internal/llm/anthropic/v1" {
+		t.Fatalf("ANTHROPIC_BASE_URL = %q", got)
+	}
+	if got := envVars["ANTHROPIC_API_KEY"]; got != "tenant-admin-token" {
+		t.Fatalf("ANTHROPIC_API_KEY = %q", got)
+	}
+	if got := envVars["MOLECULE_LLM_USAGE_TOKEN"]; got != "tenant-admin-token" {
+		t.Fatalf("MOLECULE_LLM_USAGE_TOKEN = %q", got)
+	}
+}
+
+func TestApplyPlatformManagedLLMEnv_ClaudeCodeDoesNotOverrideVendorBYOK(t *testing.T) {
+	t.Setenv("MOLECULE_LLM_BILLING_MODE", "platform_managed")
+	t.Setenv("MOLECULE_LLM_BASE_URL", "https://api.example.test/api/v1/internal/llm/openai/v1")
+	t.Setenv("MOLECULE_LLM_ANTHROPIC_BASE_URL", "https://api.example.test/api/v1/internal/llm/anthropic/v1")
+	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
+
+	envVars := map[string]string{
+		"MINIMAX_API_KEY": "user-minimax-key",
+		"MODEL":           "MiniMax-M2.7",
+	}
+	applyPlatformManagedLLMEnv(envVars, "claude-code", "")
+
+	if got := envVars["MINIMAX_API_KEY"]; got != "user-minimax-key" {
+		t.Fatalf("MINIMAX_API_KEY was overwritten: %q", got)
+	}
+	if _, ok := envVars["ANTHROPIC_API_KEY"]; ok {
+		t.Fatalf("ANTHROPIC_API_KEY should not be set when vendor BYOK is present")
+	}
+	if _, ok := envVars["ANTHROPIC_BASE_URL"]; ok {
+		t.Fatalf("ANTHROPIC_BASE_URL should not be set when vendor BYOK is present")
+	}
+	if got := envVars["MOLECULE_LLM_USAGE_TOKEN"]; got != "tenant-admin-token" {
+		t.Fatalf("MOLECULE_LLM_USAGE_TOKEN = %q", got)
 	}
 }
 

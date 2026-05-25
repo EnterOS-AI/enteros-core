@@ -55,6 +55,22 @@ interface MissingKeysInfo {
   preflight: PreflightResult;
 }
 
+function nativeProviderForClaudeCodeModel(model: string): string | undefined {
+  const trimmed = model.trim();
+  const lower = trimmed.toLowerCase();
+  if (!trimmed) return undefined;
+  if (lower.startsWith("minimax")) return "minimax";
+  if (lower.startsWith("kimi")) return "kimi-coding";
+  if (lower.startsWith("claude")) return "anthropic";
+  if (/^(sonnet|opus|haiku)$/.test(lower)) return "anthropic-oauth";
+  return undefined;
+}
+
+function isNativeClaudeCodeRuntime(template: Template): boolean {
+  const runtime = template.runtime ?? resolveRuntime(template.id);
+  return runtime === "claude-code";
+}
+
 export interface UseTemplateDeployResult {
   /** Template id currently being deployed (incl. the preflight
    *  network call), or null when idle. Callers pass this to disable
@@ -97,6 +113,10 @@ export function useTemplateDeploy(
       setDeploying(template.id);
       setError(null);
       try {
+        const selectedModel = model?.trim() || template.model?.trim();
+        const nativeProvider = isNativeClaudeCodeRuntime(template) && selectedModel
+          ? nativeProviderForClaudeCodeModel(selectedModel)
+          : undefined;
         const coords = canvasCoords
           ? canvasCoords()
           : {
@@ -108,7 +128,8 @@ export function useTemplateDeploy(
           template: template.id,
           tier: isSaaSTenant() ? 4 : template.tier,
           canvas: coords,
-          ...(model ? { model } : {}),
+          ...(selectedModel ? { model: selectedModel } : {}),
+          ...(nativeProvider ? { llm_provider: nativeProvider } : {}),
         });
         onDeployed?.(ws.id);
       } catch (e) {
@@ -144,8 +165,13 @@ export function useTemplateDeploy(
         setDeploying(null);
         return;
       }
-      // Always open the picker — every deploy goes through an
-      // explicit confirm-provider/model step. Reasons:
+      if (preflight.ok && preflight.providers.length === 0) {
+        await executeDeploy(template);
+        return;
+      }
+      // Open the picker whenever a template declares provider/key choices.
+      // Templates with no provider requirements deploy directly on the
+      // platform-managed default above. Reasons to keep the picker here:
       //   1. Multi-provider templates (e.g. hermes) need a per-
       //      workspace pick or the adapter falls back to its
       //      compiled-in default and 500s with "No LLM provider
@@ -164,7 +190,7 @@ export function useTemplateDeploy(
       setMissingKeysInfo({ template, preflight });
       setDeploying(null);
     },
-    [],
+    [executeDeploy],
   );
 
   // No useCallback here — consumers call this on every render anyway

@@ -612,7 +612,11 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 		if err := setModelSecret(ctx, id, payload.Model); err != nil {
 			log.Printf("Create workspace %s: failed to persist MODEL_PROVIDER %q: %v (non-fatal)", id, payload.Model, err)
 		}
-		if derived := deriveProviderFromModelSlug(payload.Model); derived != "" {
+		if explicitProvider := strings.TrimSpace(payload.LLMProvider); explicitProvider != "" {
+			if err := setProviderSecret(ctx, id, explicitProvider); err != nil {
+				log.Printf("Create workspace %s: failed to persist LLM_PROVIDER %q: %v (non-fatal)", id, explicitProvider, err)
+			}
+		} else if derived := deriveProviderFromModelSlug(payload.Model); derived != "" {
 			if err := setProviderSecret(ctx, id, derived); err != nil {
 				log.Printf("Create workspace %s: failed to persist LLM_PROVIDER %q: %v (non-fatal)", id, derived, err)
 			}

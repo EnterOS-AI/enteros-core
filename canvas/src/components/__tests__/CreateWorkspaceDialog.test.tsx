@@ -63,7 +63,7 @@ describe("CreateWorkspaceDialog", () => {
 
   it('first option is "None (root level)" with empty value', async () => {
     await openDialog();
-    const select = document.querySelector("select") as HTMLSelectElement;
+    const select = screen.getByLabelText("Parent Workspace") as HTMLSelectElement;
     expect(select).toBeTruthy();
     const firstOption = select.options[0];
     expect(firstOption.value).toBe("");
@@ -73,12 +73,12 @@ describe("CreateWorkspaceDialog", () => {
   it("populates select with workspace names from GET /workspaces", async () => {
     await openDialog();
     await waitFor(() => {
-      const select = document.querySelector("select") as HTMLSelectElement;
+      const select = screen.getByLabelText("Parent Workspace") as HTMLSelectElement;
       const optionValues = Array.from(select.options).map((o) => o.value);
       expect(optionValues).toContain("ws-1");
       expect(optionValues).toContain("ws-2");
     });
-    const select = document.querySelector("select") as HTMLSelectElement;
+    const select = screen.getByLabelText("Parent Workspace") as HTMLSelectElement;
     const optionTexts = Array.from(select.options).map((o) => o.text.trim());
     expect(optionTexts.some((t) => t.includes("Platform Team"))).toBe(true);
     expect(optionTexts.some((t) => t.includes("Research Agent"))).toBe(true);
@@ -87,7 +87,7 @@ describe("CreateWorkspaceDialog", () => {
   it("sends parent_id in POST body when a workspace is selected", async () => {
     await openDialog();
     await waitFor(() => {
-      const select = document.querySelector("select") as HTMLSelectElement;
+      const select = screen.getByLabelText("Parent Workspace") as HTMLSelectElement;
       expect(select.options.length).toBeGreaterThan(1);
     });
 
@@ -95,7 +95,7 @@ describe("CreateWorkspaceDialog", () => {
       target: { value: "My Agent" },
     });
 
-    const select = document.querySelector("select") as HTMLSelectElement;
+    const select = screen.getByLabelText("Parent Workspace") as HTMLSelectElement;
     fireEvent.change(select, { target: { value: "ws-1" } });
 
     const createBtn = screen.getAllByRole("button").find((b) => b.textContent === "Create");
@@ -112,7 +112,7 @@ describe("CreateWorkspaceDialog", () => {
       target: { value: "Root Agent" },
     });
 
-    const select = document.querySelector("select") as HTMLSelectElement;
+    const select = screen.getByLabelText("Parent Workspace") as HTMLSelectElement;
     fireEvent.change(select, { target: { value: "" } });
 
     const createBtn = screen.getAllByRole("button").find((b) => b.textContent === "Create");
@@ -139,7 +139,9 @@ describe("CreateWorkspaceDialog", () => {
       volume: { root_gb: 30 },
       display: { mode: "none" },
     });
-    expect(body.model).toBe("anthropic:claude-opus-4-7");
+    expect(body.model).toBe("MiniMax-M2.7");
+    expect(body.llm_provider).toBe("minimax");
+    expect(body.secrets).toBeUndefined();
   });
 
   it("does not send managed compute for external agents", async () => {
@@ -170,7 +172,8 @@ describe("CreateWorkspaceDialog", () => {
 
     await waitFor(() => expect(mockPost).toHaveBeenCalled());
     const body = mockPost.mock.calls[0][1] as Record<string, unknown>;
-    expect(body.model).toBe("anthropic:claude-opus-4-7");
+    expect(body.model).toBe("MiniMax-M2.7");
+    expect(body.llm_provider).toBe("minimax");
     expect(body.compute).toEqual({
       instance_type: "t3.xlarge",
       volume: { root_gb: 80 },
@@ -183,13 +186,57 @@ describe("CreateWorkspaceDialog", () => {
     });
   });
 
+  it("sends BYOK API key secrets when API key auth mode is selected", async () => {
+    await openDialog();
+    fireEvent.change(screen.getByPlaceholderText("e.g. SEO Agent"), {
+      target: { value: "BYOK Agent" },
+    });
+    fireEvent.change(document.getElementById("llm-auth-mode") as HTMLSelectElement, {
+      target: { value: "api_key" },
+    });
+    fireEvent.change(document.getElementById("llm-secret-input") as HTMLInputElement, {
+      target: { value: "sk-minimax-test" },
+    });
+
+    const createBtn = screen.getAllByRole("button").find((b) => b.textContent === "Create");
+    fireEvent.click(createBtn!);
+
+    await waitFor(() => expect(mockPost).toHaveBeenCalled());
+    const body = mockPost.mock.calls[0][1] as Record<string, unknown>;
+    expect(body.model).toBe("MiniMax-M2.7");
+    expect(body.llm_provider).toBe("minimax");
+    expect(body.secrets).toEqual({ MINIMAX_API_KEY: "sk-minimax-test" });
+  });
+
+  it("sends Claude OAuth token separately from platform-managed mode", async () => {
+    await openDialog();
+    fireEvent.change(screen.getByPlaceholderText("e.g. SEO Agent"), {
+      target: { value: "OAuth Agent" },
+    });
+    fireEvent.change(document.getElementById("llm-auth-mode") as HTMLSelectElement, {
+      target: { value: "oauth" },
+    });
+    fireEvent.change(document.getElementById("llm-secret-input") as HTMLInputElement, {
+      target: { value: "oauth-token" },
+    });
+
+    const createBtn = screen.getAllByRole("button").find((b) => b.textContent === "Create");
+    fireEvent.click(createBtn!);
+
+    await waitFor(() => expect(mockPost).toHaveBeenCalled());
+    const body = mockPost.mock.calls[0][1] as Record<string, unknown>;
+    expect(body.model).toBe("sonnet");
+    expect(body.llm_provider).toBe("anthropic-oauth");
+    expect(body.secrets).toEqual({ CLAUDE_CODE_OAUTH_TOKEN: "oauth-token" });
+  });
+
   it("renders gracefully when GET /workspaces fails", async () => {
     mockGet.mockRejectedValueOnce(new Error("Network error"));
     await openDialog();
 
     // Dialog still renders; select exists with only the root option
     await waitFor(() => {
-      const select = document.querySelector("select") as HTMLSelectElement;
+      const select = screen.getByLabelText("Parent Workspace") as HTMLSelectElement;
       expect(select.options.length).toBe(1);
       expect(select.options[0].value).toBe("");
     });
