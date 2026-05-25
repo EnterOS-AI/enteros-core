@@ -68,7 +68,11 @@ afterEach(() => {
 
 function ShortcutTestComponent() {
   useKeyboardShortcuts();
-  return <div data-testid="canvas-root" />;
+  return (
+    <div data-testid="canvas-root">
+      <div data-testid="display-stream" data-display-stream="true" />
+    </div>
+  );
 }
 
 function renderWithProvider() {
@@ -78,6 +82,13 @@ function renderWithProvider() {
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 describe("Esc — deselect / close context menu", () => {
+  it("does not handle keys targeted at the display stream", () => {
+    mockStoreState.contextMenu = { x: 100, y: 100, nodeId: "n1" };
+    const { getByTestId } = renderWithProvider();
+    fireEvent.keyDown(getByTestId("display-stream"), { key: "Escape" });
+    expect(mockStoreState.closeContextMenu).not.toHaveBeenCalled();
+  });
+
   it("closes the context menu when one is open", () => {
     mockStoreState.contextMenu = { x: 100, y: 100, nodeId: "n1" };
     renderWithProvider();

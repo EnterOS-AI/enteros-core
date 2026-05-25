@@ -313,11 +313,21 @@ function DisplayControlBar({
 
 function DesktopStream({ sessionUrl }: { sessionUrl: string }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
+  const rfbRef = useRef<RFB | null>(null);
   const [streamError, setStreamError] = useState<string | null>(null);
+  const [clipboardStatus, setClipboardStatus] = useState<string | null>(null);
+  const [remoteClipboardText, setRemoteClipboardText] = useState("");
 
   useEffect(() => {
     let cancelled = false;
     let rfb: RFB | null = null;
+    let clipboardTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const setTemporaryClipboardStatus = (message: string) => {
+      setClipboardStatus(message);
+      if (clipboardTimer) clearTimeout(clipboardTimer);
+      clipboardTimer = setTimeout(() => setClipboardStatus(null), 2500);
+    };
 
     async function connect() {
       setStreamError(null);
@@ -328,9 +338,19 @@ function DesktopStream({ sessionUrl }: { sessionUrl: string }) {
         rfb = new mod.default(containerRef.current, stream.url, {
           wsProtocols: ["binary", `molecule-display-token.${stream.token}`],
         });
+        rfbRef.current = rfb;
         rfb.scaleViewport = true;
         rfb.resizeSession = true;
         rfb.focusOnClick = true;
+        rfb.focus({ preventScroll: true });
+        rfb.addEventListener("clipboard", (event: Event) => {
+          const text = (event as CustomEvent<{ text?: string }>).detail?.text ?? "";
+          if (!text) return;
+          setRemoteClipboardText(text);
+          void navigator.clipboard?.writeText(text)
+            .then(() => setTemporaryClipboardStatus("Copied remote clipboard"))
+            .catch(() => setTemporaryClipboardStatus("Remote clipboard ready"));
+        });
         rfb.addEventListener("disconnect", (event: Event) => {
           const detail = (event as CustomEvent<{ clean?: boolean }>).detail;
           if (!cancelled && !detail?.clean) setStreamError("Desktop stream disconnected.");
@@ -343,13 +363,83 @@ function DesktopStream({ sessionUrl }: { sessionUrl: string }) {
     connect();
     return () => {
       cancelled = true;
+      if (clipboardTimer) clearTimeout(clipboardTimer);
+      rfbRef.current = null;
       rfb?.disconnect();
     };
   }, [sessionUrl]);
 
+  useEffect(() => {
+    const onPaste = (event: ClipboardEvent) => {
+      if (!isDisplayEventTarget(containerRef.current, event.target)) return;
+      const text = event.clipboardData?.getData("text/plain") ?? "";
+      if (!text) return;
+      event.preventDefault();
+      rfbRef.current?.clipboardPasteFrom(text);
+      rfbRef.current?.focus({ preventScroll: true });
+      setClipboardStatus("Pasted to desktop");
+    };
+    window.addEventListener("paste", onPaste, true);
+    return () => window.removeEventListener("paste", onPaste, true);
+  }, []);
+
+  const pasteLocalClipboard = async () => {
+    try {
+      const text = await navigator.clipboard?.readText();
+      if (!text) {
+        setClipboardStatus("Clipboard is empty");
+        return;
+      }
+      rfbRef.current?.clipboardPasteFrom(text);
+      rfbRef.current?.focus({ preventScroll: true });
+      setClipboardStatus("Pasted to desktop");
+    } catch {
+      setClipboardStatus("Press Ctrl/Cmd+V while the desktop is focused");
+    }
+  };
+
+  const copyRemoteClipboard = async () => {
+    if (!remoteClipboardText) {
+      setClipboardStatus("No remote clipboard yet");
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(remoteClipboardText);
+      setClipboardStatus("Copied remote clipboard");
+    } catch {
+      setClipboardStatus("Browser blocked clipboard copy");
+    }
+  };
+
   return (
-    <div className="relative min-h-0 flex-1 bg-black">
+    <div
+      data-display-stream="true"
+      className="relative min-h-0 flex-1 bg-black"
+      onMouseDown={() => rfbRef.current?.focus({ preventScroll: true })}
+    >
       <div ref={containerRef} title="Workspace desktop" className="h-full w-full overflow-hidden bg-black" />
+      <div className="absolute right-3 top-3 flex items-center gap-2">
+        {clipboardStatus && (
+          <span className="rounded border border-line/50 bg-black/80 px-2 py-1 text-[10px] text-white">
+            {clipboardStatus}
+          </span>
+        )}
+        <button
+          type="button"
+          onClick={pasteLocalClipboard}
+          className="h-7 rounded border border-line/50 bg-black/75 px-2 text-[10px] font-medium text-white hover:bg-black"
+        >
+          Paste
+        </button>
+        <button
+          type="button"
+          onClick={copyRemoteClipboard}
+          className="h-7 rounded border border-line/50 bg-black/75 px-2 text-[10px] font-medium text-white hover:bg-black disabled:cursor-not-allowed disabled:opacity-50"
+          disabled={!remoteClipboardText}
+        >
+          Copy
+        </button>
+      </div>
       {streamError && (
         <div className="absolute inset-x-4 top-4 rounded border border-red-500/30 bg-red-950/80 px-3 py-2 text-[11px] text-red-100">
           {streamError}
@@ -357,6 +447,13 @@ function DesktopStream({ sessionUrl }: { sessionUrl: string }) {
       )}
     </div>
   );
+}
+
+function isDisplayEventTarget(container: HTMLElement | null, target: EventTarget | null): boolean {
+  if (!container) return false;
+  if (target instanceof Node && container.contains(target)) return true;
+  const active = document.activeElement;
+  return active instanceof Node && container.contains(active);
 }
 
 function displayWebSocketConnection(sessionUrl: string): { url: string; token: string } {
