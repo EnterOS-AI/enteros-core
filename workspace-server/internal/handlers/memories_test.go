@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/memory/contract"
@@ -192,6 +194,114 @@ func TestMemoriesCommit_MissingFields(t *testing.T) {
 }
 
 // ---------- MemoriesHandler: Search ----------
+
+func TestMemoriesSearch_Success(t *testing.T) {
+	setupTestDB(t)
+	setupTestRedis(t)
+	plugin := &stubMemoryPlugin{
+		searchFn: func(_ context.Context, body contract.SearchRequest) (*contract.SearchResponse, error) {
+			return &contract.SearchResponse{
+				Memories: []contract.Memory{
+					{ID: "mem-1", Namespace: "workspace:ws-1", Content: "fact A", CreatedAt: time.Date(2026, 5, 25, 10, 0, 0, 0, time.UTC)},
+					{ID: "mem-2", Namespace: "team:team-1", Content: "fact B", CreatedAt: time.Date(2026, 5, 25, 11, 0, 0, 0, time.UTC)},
+				},
+			}, nil
+		},
+	}
+	resolver := &stubNamespaceResolver{
+		readable: []namespace.Namespace{
+			{Name: "workspace:ws-1", Kind: contract.NamespaceKindWorkspace},
+			{Name: "team:team-1", Kind: contract.NamespaceKindTeam},
+		},
+	}
+	handler := NewMemoriesHandler().withMemoryV2APIs(plugin, resolver)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-1"}}
+	c.Request = httptest.NewRequest("GET", "/", nil)
+
+	handler.Search(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp []map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if len(resp) != 2 {
+		t.Fatalf("expected 2 results, got %d", len(resp))
+	}
+	if resp[0]["id"] != "mem-1" {
+		t.Errorf("expected id mem-1, got %v", resp[0]["id"])
+	}
+	if resp[0]["scope"] != "LOCAL" {
+		t.Errorf("expected scope LOCAL, got %v", resp[0]["scope"])
+	}
+	if resp[1]["scope"] != "TEAM" {
+		t.Errorf("expected scope TEAM, got %v", resp[1]["scope"])
+	}
+}
+
+func TestMemoriesSearch_NoPlugin_503(t *testing.T) {
+	setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewMemoriesHandler()
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-1"}}
+	c.Request = httptest.NewRequest("GET", "/", nil)
+
+	handler.Search(c)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("expected 503, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestMemoriesSearch_ResolverError_500(t *testing.T) {
+	setupTestDB(t)
+	setupTestRedis(t)
+	plugin := &stubMemoryPlugin{}
+	resolver := &stubNamespaceResolver{err: errors.New("resolver down")}
+	handler := NewMemoriesHandler().withMemoryV2APIs(plugin, resolver)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-1"}}
+	c.Request = httptest.NewRequest("GET", "/", nil)
+
+	handler.Search(c)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("expected 500, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestMemoriesSearch_PluginError_502(t *testing.T) {
+	setupTestDB(t)
+	setupTestRedis(t)
+	plugin := &stubMemoryPlugin{
+		searchFn: func(_ context.Context, _ contract.SearchRequest) (*contract.SearchResponse, error) {
+			return nil, errors.New("plugin timeout")
+		},
+	}
+	resolver := &stubNamespaceResolver{
+		readable: []namespace.Namespace{{Name: "workspace:ws-1", Kind: contract.NamespaceKindWorkspace}},
+	}
+	handler := NewMemoriesHandler().withMemoryV2APIs(plugin, resolver)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-1"}}
+	c.Request = httptest.NewRequest("GET", "/", nil)
+
+	handler.Search(c)
+
+	if w.Code != http.StatusBadGateway {
+		t.Errorf("expected 502, got %d: %s", w.Code, w.Body.String())
+	}
+}
 
 // ---------- MemoriesHandler: Delete ----------
 

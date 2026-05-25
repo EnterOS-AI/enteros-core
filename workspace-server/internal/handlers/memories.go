@@ -260,3 +260,60 @@ func (h *MemoriesHandler) Commit(c *gin.Context) {
 	// namespace — the latter is an internal storage detail.
 	c.JSON(http.StatusCreated, gin.H{"id": memoryID, "scope": body.Scope, "namespace": namespace})
 }
+
+// Search handles GET /workspaces/:id/memories (legacy v1 read path).
+//
+// Phase A3 (#1792) removed the original v1 Search because it read the frozen
+// agent_memories table. This shim restores the endpoint for old callers
+// (AwarenessClient, runtime SDKs) by proxying through the v2 plugin and
+// reshaping the response to the legacy contract.
+func (h *MemoriesHandler) Search(c *gin.Context) {
+	workspaceID := c.Param("id")
+	ctx := c.Request.Context()
+
+	if h.memv2 == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error": "memory plugin is not configured (set MEMORY_PLUGIN_URL)",
+		})
+		return
+	}
+
+	readable, err := h.memv2.resolver.ReadableNamespaces(ctx, workspaceID)
+	if err != nil {
+		log.Printf("memories search: resolve readable namespaces for %s failed: %v", workspaceID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to resolve readable namespaces"})
+		return
+	}
+	nsNames := make([]string, len(readable))
+	for i, ns := range readable {
+		nsNames[i] = ns.Name
+	}
+
+	resp, err := h.memv2.plugin.Search(ctx, contract.SearchRequest{
+		Namespaces: nsNames,
+		Limit:      50,
+	})
+	if err != nil {
+		log.Printf("memories search: plugin search for %s failed: %v", workspaceID, err)
+		c.JSON(http.StatusBadGateway, gin.H{"error": "memory plugin search failed"})
+		return
+	}
+
+	type legacyEntry struct {
+		ID        string `json:"id"`
+		Content   string `json:"content"`
+		Scope     string `json:"scope"`
+		CreatedAt string `json:"created_at"`
+	}
+	out := make([]legacyEntry, 0, len(resp.Memories))
+	for _, m := range resp.Memories {
+		scope := namespaceKindToLegacyScope(m.Namespace)
+		out = append(out, legacyEntry{
+			ID:        m.ID,
+			Content:   m.Content,
+			Scope:     scope,
+			CreatedAt: m.CreatedAt.Format("2006-01-02T15:04:05Z"),
+		})
+	}
+	c.JSON(http.StatusOK, out)
+}

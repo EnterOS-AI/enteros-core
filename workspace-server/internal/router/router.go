@@ -282,11 +282,15 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		// POST /memories stays — it routes through the v2 plugin per
 		// #1794 and is the high-volume write surface (workspace
 		// runtimes posting conversation snapshots etc.).
+		// GET /memories restored as a v2 shim (issue #1828) so legacy
+		// SDK callers (AwarenessClient, runtime agents) don't 404 into
+		// the canvas frontend.
 		memsh := handlers.NewMemoriesHandler()
 		if memBundle != nil {
 			memsh.WithMemoryV2(memBundle.Plugin, memBundle.Resolver)
 		}
 		wsAuth.POST("/memories", memsh.Commit)
+		wsAuth.GET("/memories", memsh.Search)
 
 		// Memory v2 — canvas reads through the plugin so the Memory
 		// tab surfaces post-cutover state (memory_records) instead
