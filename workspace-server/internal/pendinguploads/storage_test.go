@@ -50,14 +50,12 @@ const (
 		       size_bytes, created_at, fetched_at, acked_at, expires_at
 		FROM pending_uploads
 		WHERE file_id = $1
-		  AND acked_at IS NULL
 		  AND expires_at > now()
 	`
 	markFetchedSQL = `
 		UPDATE pending_uploads
 		SET fetched_at = now()
 		WHERE file_id = $1
-		  AND acked_at IS NULL
 		  AND expires_at > now()
 	`
 	ackSQL = `
@@ -203,6 +201,36 @@ func TestGet_HappyPath_ReturnsFullRow(t *testing.T) {
 	}
 }
 
+func TestGet_AckedRowWithinRetentionStillReturnsFullRow(t *testing.T) {
+	db, mock := newMockDB(t)
+	store := pendinguploads.NewPostgres(db)
+
+	fid := uuid.New()
+	wsID := uuid.New()
+	now := time.Now().UTC()
+	ackedAt := now.Add(-5 * time.Minute)
+	mock.ExpectQuery(selectSQL).
+		WithArgs(fid).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"file_id", "workspace_id", "content", "filename", "mimetype",
+			"size_bytes", "created_at", "fetched_at", "acked_at", "expires_at",
+		}).AddRow(
+			fid, wsID, []byte("data"), "x.bin", "application/octet-stream",
+			int64(4), now, now, ackedAt, now.Add(24*time.Hour),
+		))
+
+	r, err := store.Get(context.Background(), fid)
+	if err != nil {
+		t.Fatalf("Get acked row: %v", err)
+	}
+	if r.AckedAt == nil || !r.AckedAt.Equal(ackedAt) {
+		t.Fatalf("acked_at not preserved: %+v", r.AckedAt)
+	}
+	if string(r.Content) != "data" {
+		t.Errorf("content mismatch: %q", string(r.Content))
+	}
+}
+
 func TestGet_AbsentRow_ReturnsErrNotFound(t *testing.T) {
 	db, mock := newMockDB(t)
 	store := pendinguploads.NewPostgres(db)
@@ -247,7 +275,7 @@ func TestMarkFetched_HappyPath(t *testing.T) {
 	}
 }
 
-func TestMarkFetched_AbsentOrAckedOrExpired_ReturnsErrNotFound(t *testing.T) {
+func TestMarkFetched_AbsentOrExpired_ReturnsErrNotFound(t *testing.T) {
 	db, mock := newMockDB(t)
 	store := pendinguploads.NewPostgres(db)
 
