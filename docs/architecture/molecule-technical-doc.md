@@ -84,6 +84,8 @@ Six runtime adapters ship production-ready on `main`: LangGraph, DeepAgents, Cla
 
 ## 3. System Architecture
 
+> **Workspace placement contract:** every Molecule org runs as a fully isolated tenant on its own EC2, with workspace-server, memory plugin, Postgres, and Redis all co-located. The platform (controlplane on Railway) handles provisioning, billing, and DNS only — it never holds tenant data. See [`workspace-placement.md`](workspace-placement.md) for the formal RFC.
+
 ### System Boundary Diagram
 
 ```

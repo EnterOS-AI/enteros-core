@@ -6,6 +6,8 @@ Molecule AI's memory model is built around one principle:
 
 That is the purpose of **HMA: Hierarchical Memory Architecture**.
 
+The organizational boundary is enforced **physically**, not at the application layer: each org runs as its own tenant on its own EC2, with its own memory plugin sidecar and its own Postgres. Memory writes are loopback-only — never cross-tenant. See [`workspace-placement.md`](workspace-placement.md) for the architecture contract that makes HMA tenant-isolated by construction.
+
 ## The Three Scopes
 
 | Scope | Meaning | Intended use |
