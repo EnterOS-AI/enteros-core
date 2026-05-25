@@ -45,12 +45,31 @@ e2e_mint_workspace_token() {
   printf '%s' "$json" | python3 -c "import json,sys; print(json.load(sys.stdin)['auth_token'])"
 }
 
-e2e_cleanup_all_workspaces() {
-  for _wid in $(curl -s "$BASE/workspaces" | python3 -c "import json,sys
+e2e_delete_workspace() {
+  local wid="$1"
+  local name="${2:-}"
+  shift 2 || true
+  local curl_args=("$@")
+  if [ -z "$wid" ]; then
+    return 0
+  fi
+  if [ -z "$name" ]; then
+    name=$(curl -s "$BASE/workspaces/$wid" "${curl_args[@]}" | python3 -c "import json,sys
 try:
-  [print(w['id']) for w in json.load(sys.stdin)]
+  print(json.load(sys.stdin).get('name',''))
 except Exception:
-  pass" 2>/dev/null); do
-    curl -s -X DELETE "$BASE/workspaces/$_wid?confirm=true" > /dev/null || true
+  pass" 2>/dev/null || true)
+  fi
+  curl -s -X DELETE "$BASE/workspaces/$wid?confirm=true" \
+    -H "X-Confirm-Name: $name" "${curl_args[@]}" > /dev/null || true
+}
+
+e2e_cleanup_all_workspaces() {
+  curl -s "$BASE/workspaces" | python3 -c "import json,sys
+try:
+  [print(f\"{w.get('id','')}\\t{w.get('name','')}\") for w in json.load(sys.stdin)]
+except Exception:
+  pass" 2>/dev/null | while IFS=$'\t' read -r _wid _name; do
+    e2e_delete_workspace "$_wid" "$_name"
   done
 }

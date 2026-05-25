@@ -21,6 +21,8 @@ func TestExtended_WorkspaceDelete(t *testing.T) {
 	broadcaster := newTestBroadcaster()
 	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", "/tmp/configs")
 
+	expectWorkspaceDeleteLookup(mock, wsDelID, "Delete Me", 0, "running")
+
 	// Expect children query — no children
 	mock.ExpectQuery("SELECT id, name FROM workspaces WHERE parent_id").
 		WithArgs(wsDelID).
@@ -59,6 +61,7 @@ func TestExtended_WorkspaceDelete(t *testing.T) {
 	c, _ := gin.CreateTestContext(w)
 	c.Params = gin.Params{{Key: "id", Value: wsDelID}}
 	c.Request = httptest.NewRequest("DELETE", "/workspaces/"+wsDelID+"?confirm=true", nil)
+	c.Request.Header.Set("X-Confirm-Name", "Delete Me")
 
 	handler.Delete(c)
 

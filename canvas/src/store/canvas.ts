@@ -337,8 +337,11 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
   },
   batchDelete: async () => {
     const ids = Array.from(get().selectedNodeIds);
+    const names = new Map(get().nodes.map((node) => [node.id, node.data.name]));
     const results = await Promise.allSettled(
-      ids.map((id) => api.del(`/workspaces/${id}`))
+      ids.map((id) => api.del(`/workspaces/${id}`, {
+        headers: { "X-Confirm-Name": names.get(id) ?? "" },
+      }))
     );
     const failed: string[] = [];
     results.forEach((r, i) => {

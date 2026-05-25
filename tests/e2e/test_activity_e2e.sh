@@ -235,7 +235,7 @@ R=$(curl -s "$BASE/workspaces/$TEMP_ID/activity")
 check "Activity in correct workspace" 'Temp workspace log' "$R"
 
 # Cleanup
-curl -s -X DELETE "$BASE/workspaces/$TEMP_ID" > /dev/null
+e2e_delete_workspace "$TEMP_ID" "Activity Test Workspace"
 
 # ---------- Edge Cases ----------
 echo ""

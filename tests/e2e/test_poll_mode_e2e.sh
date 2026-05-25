@@ -43,8 +43,8 @@ INVALID_PROBE_ID="$(gen_uuid)"
 cleanup() {
   local rc=$?
   # Best-effort delete; non-fatal if the row was never created.
-  curl -s -X DELETE "$BASE/workspaces/$POLL_WS_ID" >/dev/null || true
-  curl -s -X DELETE "$BASE/workspaces/$CALLER_WS_ID" >/dev/null || true
+  e2e_delete_workspace "$POLL_WS_ID" "poll-mode-test"
+  e2e_delete_workspace "$CALLER_WS_ID" "poll-cross-test"
   exit $rc
 }
 trap cleanup EXIT

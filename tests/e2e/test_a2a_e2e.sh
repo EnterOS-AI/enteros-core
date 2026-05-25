@@ -137,7 +137,7 @@ R=$(curl -s --max-time 10 -X POST "$BASE/workspaces/$OFFLINE_ID/a2a" \
   -d '{"method":"message/send","params":{"message":{"role":"user","parts":[{"type":"text","text":"test"}]}}}')
 check "Offline workspace returns error" '"error"' "$R"
 # Clean up
-curl -s -X DELETE "$BASE/workspaces/$OFFLINE_ID" >/dev/null
+e2e_delete_workspace "$OFFLINE_ID" "Offline Test"
 echo ""
 
 # ========================================

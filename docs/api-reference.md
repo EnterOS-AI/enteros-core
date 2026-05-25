@@ -26,7 +26,7 @@ Full contract: `docs/runbooks/admin-auth.md`.
 |--------|------|---------|
 | GET | /health | inline |
 | GET | /metrics | metrics.Handler() — Prometheus text format; no auth, scrape-safe |
-| POST/GET/PATCH/DELETE | /workspaces[/:id] | workspace.go — `GET /workspaces`, `POST /workspaces`, and `DELETE /workspaces/:id` require `AdminAuth`. `PATCH /workspaces/:id` enforces field-level authz: cosmetic fields (name, role, x, y, canvas) pass through; sensitive fields (tier, parent_id, runtime, workspace_dir) require a valid bearer token when any live token exists. |
+| POST/GET/PATCH/DELETE | /workspaces[/:id] | workspace.go — `GET /workspaces`, `POST /workspaces`, and `DELETE /workspaces/:id` require `AdminAuth`. `DELETE /workspaces/:id` also requires `X-Confirm-Name: <workspace name>`; cascading deletes still require `?confirm=true`. `PATCH /workspaces/:id` enforces field-level authz: cosmetic fields (name, role, x, y, canvas) pass through; sensitive fields (tier, parent_id, runtime, workspace_dir) require a valid bearer token when any live token exists. |
 | GET/PATCH | /workspaces/:id/config | workspace.go |
 | GET/POST | /workspaces/:id/memory | workspace.go |
 | DELETE | /workspaces/:id/memory/:key | workspace.go |

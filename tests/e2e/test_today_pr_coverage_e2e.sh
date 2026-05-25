@@ -364,7 +364,13 @@ for wid in "${WS_A_ID:-}" "${WS_B_ID:-}"; do
       DELETE_AUTH=("${WS_B_AUTH[@]}")
     fi
   fi
-  curl -s -X DELETE "$BASE/workspaces/$wid?confirm=true" "${DELETE_AUTH[@]}" > /dev/null || true
+  if [ "$wid" = "${WS_A_ID:-}" ]; then
+    e2e_delete_workspace "$wid" "$WS_A_NAME" "${DELETE_AUTH[@]}"
+  elif [ "$wid" = "${WS_B_ID:-}" ]; then
+    e2e_delete_workspace "$wid" "$WS_B_NAME" "${DELETE_AUTH[@]}"
+  else
+    e2e_delete_workspace "$wid" "" "${DELETE_AUTH[@]}"
+  fi
   echo "deleted $wid"
 done
 
