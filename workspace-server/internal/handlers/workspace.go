@@ -56,6 +56,7 @@ type WorkspaceHandler struct {
 	cpProv      provisioner.CPProvisionerAPI
 	platformURL string
 	configsDir  string // path to workspace-configs-templates/ (for reading templates)
+	cacheDir    string // optional runtime-refreshed template cache; overrides configsDir by template id
 	// envMutators runs registered EnvMutator plugins right before
 	// container Start, after built-in secret loads. Nil = no plugins
 	// registered; Registry.Run handles a nil receiver as a no-op so the
@@ -183,6 +184,11 @@ func NewWorkspaceHandler(b events.EventEmitter, p *provisioner.Provisioner, plat
 	return h
 }
 
+func (h *WorkspaceHandler) WithTemplateCacheDir(cacheDir string) *WorkspaceHandler {
+	h.cacheDir = cacheDir
+	return h
+}
+
 // WithNamespaceCleanup wires the I5 hook (RFC #2728) so workspace
 // purge can drop the plugin's `workspace:<id>` namespace. main.go
 // passes a closure over plugin.DeleteNamespace; tests pass a stub.
@@ -285,7 +291,7 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 		// #226: payload.Template is attacker-controllable. resolveInsideRoot
 		// rejects absolute paths and any ".." that escapes configsDir so the
 		// provisioner can't be pointed at host directories.
-		candidatePath, resolveErr := resolveInsideRoot(h.configsDir, payload.Template)
+		candidatePath, resolveErr := resolveWorkspaceTemplatePath(h.configsDir, h.cacheDir, payload.Template)
 		if resolveErr != nil {
 			log.Printf("Create: invalid template path %q: %v", payload.Template, resolveErr)
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid template"})
@@ -726,7 +732,7 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 	var templatePath string
 	var configFiles map[string][]byte
 	if payload.Template != "" {
-		candidatePath, resolveErr := resolveInsideRoot(h.configsDir, payload.Template)
+		candidatePath, resolveErr := resolveWorkspaceTemplatePath(h.configsDir, h.cacheDir, payload.Template)
 		if resolveErr != nil {
 			log.Printf("Create provision: rejecting template %q: %v", payload.Template, resolveErr)
 			return

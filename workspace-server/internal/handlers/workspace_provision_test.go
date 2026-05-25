@@ -110,6 +110,32 @@ func TestFindTemplateByName_NotFound(t *testing.T) {
 	}
 }
 
+func TestResolveWorkspaceTemplatePath_PrefersCache(t *testing.T) {
+	bakedDir := t.TempDir()
+	cacheDir := t.TempDir()
+
+	for _, root := range []string{bakedDir, cacheDir} {
+		if err := os.MkdirAll(filepath.Join(root, "seo-agent"), 0755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+	}
+
+	got, err := resolveWorkspaceTemplatePath(bakedDir, cacheDir, "seo-agent")
+	if err != nil {
+		t.Fatalf("resolveWorkspaceTemplatePath: %v", err)
+	}
+	want := filepath.Join(cacheDir, "seo-agent")
+	if got != want {
+		t.Fatalf("want cache path %q, got %q", want, got)
+	}
+}
+
+func TestResolveWorkspaceTemplatePath_RejectsTraversal(t *testing.T) {
+	if _, err := resolveWorkspaceTemplatePath(t.TempDir(), t.TempDir(), "../seo-agent"); err == nil {
+		t.Fatal("expected traversal to be rejected")
+	}
+}
+
 func TestFindTemplateByName_SkipsWsPrefix(t *testing.T) {
 	tmpDir := t.TempDir()
 
