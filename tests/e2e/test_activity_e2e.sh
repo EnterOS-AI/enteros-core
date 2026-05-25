@@ -215,7 +215,7 @@ echo ""
 echo "--- Activity Isolation ---"
 
 # Test 19: Create a second workspace to verify isolation
-R=$(curl -s -X POST "$BASE/workspaces" -H "Content-Type: application/json" -d '{"name":"Activity Test Workspace","tier":1}')
+R=$(curl -s -X POST "$BASE/workspaces" -H "Content-Type: application/json" -d '{"name":"Activity Test Workspace","tier":1,"runtime":"external","external":true}')
 TEMP_ID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
 
 # Test 20: New workspace has empty activity

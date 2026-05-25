@@ -71,7 +71,7 @@ check_http "GET /workspaces (empty DB)" "200" "$R"
 # Create a workspace so tokens land in the DB.
 R=$(curl -s -w "\n%{http_code}" -X POST "$BASE/workspaces" \
   -H "Content-Type: application/json" \
-  -d '{"name":"Dev-Mode-Test","tier":1}')
+  -d '{"name":"Dev-Mode-Test","tier":1,"runtime":"external","external":true}')
 CODE=$(echo "$R" | tail -n1)
 BODY=$(echo "$R" | sed '$d')
 check_http "POST /workspaces (create)" "201" "$CODE"

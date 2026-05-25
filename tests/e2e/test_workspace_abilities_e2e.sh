@@ -97,7 +97,7 @@ except Exception:
 done
 
 R=$(curl -s -X POST "$BASE/workspaces" -H "Content-Type: application/json" \
-  -d '{"name":"Abilities Sender","tier":1}')
+  -d '{"name":"Abilities Sender","tier":1,"runtime":"external","external":true}')
 SENDER_ID=$(echo "$R" | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])' 2>/dev/null || true)
 [ -n "$SENDER_ID" ] || { echo "Failed to create sender workspace: $R"; exit 1; }
 SENDER_TOKEN=$(echo "$R" | e2e_extract_token)
@@ -113,7 +113,7 @@ ADMIN_TOKEN="${MOLECULE_ADMIN_TOKEN:-$SENDER_TOKEN}"
 ADMIN_AUTH="Authorization: Bearer $ADMIN_TOKEN"
 
 R=$(curl -s -X POST "$BASE/workspaces" -H "$ADMIN_AUTH" -H "Content-Type: application/json" \
-  -d '{"name":"Abilities Receiver","tier":1}')
+  -d '{"name":"Abilities Receiver","tier":1,"runtime":"external","external":true}')
 RECEIVER_ID=$(echo "$R" | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])' 2>/dev/null || true)
 [ -n "$RECEIVER_ID" ] || { echo "Failed to create receiver workspace: $R"; exit 1; }
 RECEIVER_TOKEN=$(echo "$R" | e2e_extract_token)
