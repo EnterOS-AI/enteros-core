@@ -166,11 +166,12 @@ export function AttachmentImage({ workspaceId, attachment, onDownload, tone }: P
         open={open}
         onClose={() => setOpen(false)}
         ariaLabel={`Preview of ${attachment.name}`}
+        contained
       >
         <img
           src={state.blobUrl}
           alt={attachment.name}
-          className="max-w-[95vw] max-h-[90vh] object-contain"
+          className="max-w-full max-h-full object-contain"
         />
       </AttachmentLightbox>
     </>

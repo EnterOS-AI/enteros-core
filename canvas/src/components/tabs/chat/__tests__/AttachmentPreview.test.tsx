@@ -237,11 +237,13 @@ describe("AttachmentPreview dispatch", () => {
       expect(screen.getByLabelText(/Open doc\.pdf preview/i)).toBeTruthy();
     });
 
-    // Click → lightbox opens with <embed> inside.
+    // Click → panel-contained lightbox opens with a browser PDF iframe.
     fireEvent.click(screen.getByLabelText(/Open doc\.pdf preview/i));
     const dialog = await screen.findByRole("dialog");
     expect(dialog).toBeTruthy();
-    expect(dialog.querySelector("embed[type='application/pdf']")).not.toBeNull();
+    expect(dialog.className).toContain("absolute");
+    expect(dialog.querySelector("iframe")).not.toBeNull();
+    expect(dialog.querySelector("embed")).toBeNull();
   });
 
   it("kind=pdf fetch fails → falls back to chip", async () => {
