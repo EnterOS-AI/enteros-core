@@ -193,6 +193,7 @@ func (h *WorkspaceHandler) prepareProvisionContext(
 	// continue to rely on workspace_secrets / org-import persona-env
 	// merge for their git auth.
 	applyAgentGitHTTPCreds(envVars, payload.Role)
+	applyPlatformManagedLLMEnv(envVars, payload.Runtime, payload.Model)
 	applyRuntimeModelEnv(envVars, payload.Runtime, payload.Model)
 	if payload.Role != "" {
 		envVars["MOLECULE_AGENT_ROLE"] = payload.Role
