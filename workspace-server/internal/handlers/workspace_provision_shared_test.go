@@ -31,9 +31,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/DATA-DOG/go-sqlmock"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
+	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/gin-gonic/gin"
 )
 
@@ -742,7 +742,7 @@ func TestWorkspaceCreate_FirstDeploy_PersistsModelAndProvider(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
-	body := `{"name":"Hermes Minimax Agent","runtime":"hermes","external":true,"model":"minimax/MiniMax-M2.7"}`
+	body := `{"name":"External Minimax Agent","runtime":"external","external":true,"model":"minimax/MiniMax-M2.7"}`
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
@@ -845,7 +845,7 @@ func TestWorkspaceCreate_FirstDeploy_UnknownModel_OnlyMintModelProvider(t *testi
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
-	body := `{"name":"Unknown Model Agent","runtime":"hermes","external":true,"model":"totally-unknown-model/foo"}`
+	body := `{"name":"Unknown Model Agent","runtime":"external","external":true,"model":"totally-unknown-model/foo"}`
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
@@ -899,14 +899,14 @@ func TestApplyRuntimeModelEnv_SetsUniversalMODELForAllRuntimes(t *testing.T) {
 			wantHermesDefault: "minimax/MiniMax-M2.7",
 		},
 		{
-			name:      "langgraph: picked model populates MODEL + MOLECULE_MODEL (no vendor-specific name)",
-			runtime:   "langgraph",
+			name:      "claude-code: picked model populates MODEL + MOLECULE_MODEL (no vendor-specific name)",
+			runtime:   "claude-code",
 			model:     "anthropic:claude-opus-4-7",
 			wantMODEL: "anthropic:claude-opus-4-7",
 		},
 		{
-			name:      "crewai: picked model populates MODEL + MOLECULE_MODEL (no vendor-specific name)",
-			runtime:   "crewai",
+			name:      "openclaw: picked model populates MODEL + MOLECULE_MODEL (no vendor-specific name)",
+			runtime:   "openclaw",
 			model:     "openai:gpt-4o",
 			wantMODEL: "openai:gpt-4o",
 		},
@@ -972,8 +972,8 @@ func TestApplyPlatformManagedLLMEnv_DefaultsOpenAIProxyWhenNoWorkspaceKey(t *tes
 	t.Setenv("MOLECULE_LLM_DEFAULT_MODEL", "moonshot/kimi-k2.6")
 
 	envVars := map[string]string{}
-	applyPlatformManagedLLMEnv(envVars, "langgraph", "")
-	applyRuntimeModelEnv(envVars, "langgraph", "")
+	applyPlatformManagedLLMEnv(envVars, "claude-code", "")
+	applyRuntimeModelEnv(envVars, "claude-code", "")
 
 	if got := envVars["OPENAI_BASE_URL"]; got != "https://api.example.test/api/v1/internal/llm/openai/v1" {
 		t.Fatalf("OPENAI_BASE_URL = %q", got)
@@ -1002,7 +1002,7 @@ func TestApplyPlatformManagedLLMEnv_DoesNotOverrideWorkspaceOpenAIKey(t *testing
 		"OPENAI_BASE_URL": "https://api.openai.com/v1",
 		"MODEL":           "openai/gpt-5.5",
 	}
-	applyPlatformManagedLLMEnv(envVars, "langgraph", "")
+	applyPlatformManagedLLMEnv(envVars, "claude-code", "")
 
 	if got := envVars["OPENAI_API_KEY"]; got != "user-openai-key" {
 		t.Fatalf("OPENAI_API_KEY was overwritten: %q", got)
@@ -1024,7 +1024,7 @@ func TestApplyPlatformManagedLLMEnv_NoopsOutsidePlatformManaged(t *testing.T) {
 	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
 
 	envVars := map[string]string{}
-	applyPlatformManagedLLMEnv(envVars, "langgraph", "")
+	applyPlatformManagedLLMEnv(envVars, "claude-code", "")
 
 	if _, ok := envVars["OPENAI_API_KEY"]; ok {
 		t.Fatalf("OPENAI_API_KEY should not be set outside platform-managed mode")

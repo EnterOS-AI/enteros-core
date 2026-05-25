@@ -541,12 +541,12 @@ func TestSelectImage_FallsBackToRuntimeMap(t *testing.T) {
 // contract (RFC internal#483 / security review 4269 /
 // feedback_platform_must_hardgate_base_contract): a NAMED runtime with no
 // resolvable image must reject with ErrUnresolvableRuntime, NOT silently
-// substitute DefaultImage. Pre-fix this returned langgraph — a user asking
-// for a removed runtime (crewai/deepagents/gemini-cli) silently got a
-// langgraph container. "crewai" is the concrete regression from the
+// substitute DefaultImage. Pre-fix this returned claude-code — a user asking
+// for a removed runtime silently got a claude-code container. The named
+// legacy runtime below is the concrete regression from the
 // security finding.
 func TestSelectImage_NamedUnresolvableRuntimeRejects(t *testing.T) {
-	for _, rt := range []string{"no-such-runtime", "crewai", "deepagents", "gemini-cli"} {
+	for _, rt := range []string{"no-such-runtime", "legacy-runtime-a", "legacy-runtime-b"} {
 		got, err := selectImage(WorkspaceConfig{Runtime: rt})
 		if !errors.Is(err, ErrUnresolvableRuntime) {
 			t.Errorf("selectImage(%q): got err %v, want ErrUnresolvableRuntime", rt, err)
@@ -1069,9 +1069,9 @@ func TestRuntimeTagFromImage(t *testing.T) {
 		"workspace-template:base":        "base",
 		// Current GHCR form produced by molecule-ci's publish-template-image
 		// workflow and consumed by RuntimeImages.
-		"ghcr.io/molecule-ai/workspace-template-hermes:latest":         "hermes",
-		"ghcr.io/molecule-ai/workspace-template-claude-code:latest":    "claude-code",
-		"ghcr.io/molecule-ai/workspace-template-langgraph:sha-abc1234": "langgraph",
+		"ghcr.io/molecule-ai/workspace-template-hermes:latest":           "hermes",
+		"ghcr.io/molecule-ai/workspace-template-claude-code:latest":      "claude-code",
+		"ghcr.io/molecule-ai/workspace-template-claude-code:sha-abc1234": "claude-code",
 		// Fallbacks for non-standard shapes
 		"myregistry.io/foo:v1.2": "v1.2",
 		"no-colon-at-all":        "no-colon-at-all",
@@ -1116,7 +1116,7 @@ func TestImageTagIsMoving(t *testing.T) {
 		// Pinned tags — must NOT be classified as moving.
 		{"semver tag", "ghcr.io/molecule-ai/workspace-template-hermes:0.8.2", false},
 		{"semver with v prefix", "ghcr.io/molecule-ai/workspace-template-hermes:v1.2.3", false},
-		{"sha-prefixed commit tag", "ghcr.io/molecule-ai/workspace-template-langgraph:sha-abc1234", false},
+		{"sha-prefixed commit tag", "ghcr.io/molecule-ai/workspace-template-claude-code:sha-abc1234", false},
 		{"date-stamped tag", "ghcr.io/molecule-ai/workspace-template-hermes:2026-04-30", false},
 		{"build-id tag", "ghcr.io/molecule-ai/workspace-template-hermes:build-12345", false},
 

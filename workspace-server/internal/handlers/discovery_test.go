@@ -557,7 +557,7 @@ func TestDiscoverWorkspacePeer_Online(t *testing.T) {
 	// name/runtime lookup → non-external
 	mock.ExpectQuery(`SELECT COALESCE\(name,''\), COALESCE\(runtime,'claude-code'\) FROM workspaces WHERE id =`).
 		WithArgs("ws-online").
-		WillReturnRows(sqlmock.NewRows([]string{"name", "runtime"}).AddRow("Target", "langgraph"))
+		WillReturnRows(sqlmock.NewRows([]string{"name", "runtime"}).AddRow("Target", "claude-code"))
 	// No cached internal URL → DB status lookup → online
 	mock.ExpectQuery(`SELECT status FROM workspaces WHERE id =`).
 		WithArgs("ws-online").
@@ -585,7 +585,7 @@ func TestDiscoverWorkspacePeer_NotFound(t *testing.T) {
 
 	mock.ExpectQuery(`SELECT COALESCE\(name,''\), COALESCE\(runtime,'claude-code'\) FROM workspaces WHERE id =`).
 		WithArgs("ws-missing").
-		WillReturnRows(sqlmock.NewRows([]string{"name", "runtime"}).AddRow("", "langgraph"))
+		WillReturnRows(sqlmock.NewRows([]string{"name", "runtime"}).AddRow("", "claude-code"))
 	mock.ExpectQuery(`SELECT status FROM workspaces WHERE id =`).
 		WithArgs("ws-missing").
 		WillReturnError(sql.ErrNoRows)
@@ -632,7 +632,7 @@ func TestDiscoverWorkspacePeer_CachedInternalURLHit(t *testing.T) {
 
 	mock.ExpectQuery(`SELECT COALESCE\(name,''\), COALESCE\(runtime,'claude-code'\) FROM workspaces WHERE id =`).
 		WithArgs("ws-cached").
-		WillReturnRows(sqlmock.NewRows([]string{"name", "runtime"}).AddRow("Cached", "langgraph"))
+		WillReturnRows(sqlmock.NewRows([]string{"name", "runtime"}).AddRow("Cached", "claude-code"))
 	mr.Set("ws:ws-cached:internal_url", "http://ws-cached:8000")
 
 	w := httptest.NewRecorder()
@@ -656,7 +656,7 @@ func TestDiscoverWorkspacePeer_NotReachable(t *testing.T) {
 
 	mock.ExpectQuery(`SELECT COALESCE\(name,''\), COALESCE\(runtime,'claude-code'\) FROM workspaces WHERE id =`).
 		WithArgs("ws-paused").
-		WillReturnRows(sqlmock.NewRows([]string{"name", "runtime"}).AddRow("Paused", "langgraph"))
+		WillReturnRows(sqlmock.NewRows([]string{"name", "runtime"}).AddRow("Paused", "claude-code"))
 	mock.ExpectQuery(`SELECT status FROM workspaces WHERE id =`).
 		WithArgs("ws-paused").
 		WillReturnRows(sqlmock.NewRows([]string{"status"}).AddRow("paused"))

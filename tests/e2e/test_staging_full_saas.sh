@@ -23,7 +23,7 @@
 #   MOLECULE_ADMIN_TOKEN   CP admin bearer — Railway CP_ADMIN_API_TOKEN
 #
 # Optional env:
-#   E2E_RUNTIME                  hermes (default) | claude-code | langgraph
+#   E2E_RUNTIME                  hermes (default) | claude-code | codex | openclaw
 #   E2E_PROVISION_TIMEOUT_SECS   default 900 (15 min cold EC2 budget)
 #   E2E_WORKSPACE_ONLINE_TIMEOUT_SECS  default 3600 (60 min — hermes
 #                                cold-boot worst-case + slack). Raised from
@@ -458,9 +458,9 @@ wait_workspaces_online_routable() {
 #     who already have an Anthropic API key for their own Claude
 #     Code session. Pricier per-token than MiniMax but billing is
 #     still independent of MOLECULE_STAGING_OPENAI_API_KEY. Pinned to the
-#     claude-code runtime — hermes/langgraph use OpenAI-shaped envs.
+#     claude-code runtime — hermes/codex/openclaw use OpenAI-shaped envs.
 #
-#   E2E_OPENAI_API_KEY → langgraph + hermes paths. Kept as fallback
+#   E2E_OPENAI_API_KEY → hermes/codex/openclaw paths. Kept as fallback
 #     for operator dispatches that explicitly want to exercise the
 #     OpenAI path. The HERMES_* fields pin hermes-agent's bridge to
 #     api.openai.com (template-hermes' derive-provider.sh otherwise
@@ -486,7 +486,7 @@ elif [ -n "${E2E_ANTHROPIC_API_KEY:-}" ]; then
   # account just for E2E. Pricier per-token than MiniMax but billing
   # is still independent of MOLECULE_STAGING_OPENAI_API_KEY, so an OpenAI
   # quota collapse doesn't wedge this path. Pinned to the claude-code
-  # runtime: hermes/langgraph use OpenAI-shaped envs and won't honour
+  # runtime: hermes/codex/openclaw use OpenAI-shaped envs and won't honour
   # ANTHROPIC_API_KEY without further wiring. pick_model_slug maps this
   # branch to claude-sonnet-4-6 so the claude-code provider registry
   # selects anthropic-api instead of the OAuth-only sonnet alias.

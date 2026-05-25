@@ -84,7 +84,7 @@ func TestInitialPrompt_ConfigYAML_Injection(t *testing.T) {
 
 func TestInitialPrompt_ConfigYAML_Empty(t *testing.T) {
 	// When initial_prompt is empty, nothing should be appended
-	configYAML := "name: Test\nruntime: langgraph\n"
+	configYAML := "name: Test\nruntime: claude-code\n"
 	initialPrompt := ""
 
 	result := configYAML
@@ -104,7 +104,7 @@ func TestInitialPrompt_ConfigYAML_Empty(t *testing.T) {
 
 func TestOrgDefaults_Model_YAMLParsing(t *testing.T) {
 	raw := `
-runtime: deepagents
+runtime: hermes
 tier: 2
 model: google_genai:gemini-2.5-flash
 `
@@ -119,7 +119,7 @@ model: google_genai:gemini-2.5-flash
 
 func TestOrgDefaults_Model_Empty(t *testing.T) {
 	raw := `
-runtime: langgraph
+runtime: claude-code
 tier: 2
 `
 	var defaults OrgDefaults
@@ -155,7 +155,7 @@ func TestOrgDefaults_Model_WorkspaceOverridesDefault(t *testing.T) {
 	// When both ws and defaults have a model, ws.Model takes precedence.
 	// This verifies the YAML struct correctly captures both values.
 	defaultsRaw := `
-runtime: deepagents
+runtime: hermes
 model: google_genai:gemini-2.5-flash
 `
 	wsRaw := `
@@ -203,12 +203,12 @@ func TestOrgDefaults_Model_FallbackClaudeCode(t *testing.T) {
 	}
 }
 
-func TestOrgDefaults_Model_FallbackDeepAgents(t *testing.T) {
-	// When both ws and defaults models are empty, deepagents runtime → anthropic default
+func TestOrgDefaults_Model_FallbackHermes(t *testing.T) {
+	// When both ws and defaults models are empty, hermes runtime → anthropic default
 	var defaults OrgDefaults
 	var ws OrgWorkspace
 
-	runtime := "deepagents"
+	runtime := "hermes"
 	model := ws.Model
 	if model == "" {
 		model = defaults.Model
@@ -221,14 +221,14 @@ func TestOrgDefaults_Model_FallbackDeepAgents(t *testing.T) {
 		}
 	}
 	if model != "anthropic:claude-opus-4-7" {
-		t.Errorf("deepagents with empty model should get 'anthropic:claude-opus-4-7', got %q", model)
+		t.Errorf("hermes with empty model should get 'anthropic:claude-opus-4-7', got %q", model)
 	}
 }
 
-func TestOrgDefaults_Model_FallbackLangGraph(t *testing.T) {
-	// Langgraph also gets the default anthropic model
+func TestOrgDefaults_Model_FallbackCodex(t *testing.T) {
+	// Non-Claude-Code runtimes get the default anthropic model in this legacy fallback path.
 	model := ""
-	runtime := "langgraph"
+	runtime := "codex"
 	if model == "" {
 		if runtime == "claude-code" {
 			model = "sonnet"
@@ -237,7 +237,7 @@ func TestOrgDefaults_Model_FallbackLangGraph(t *testing.T) {
 		}
 	}
 	if model != "anthropic:claude-opus-4-7" {
-		t.Errorf("langgraph with empty model should get 'anthropic:claude-opus-4-7', got %q", model)
+		t.Errorf("codex with empty model should get 'anthropic:claude-opus-4-7', got %q", model)
 	}
 }
 
@@ -457,8 +457,8 @@ func TestCategoryRouting_UnionWithDefaults(t *testing.T) {
 	}
 	ws := map[string][]string{
 		"performance": {"Backend Engineer"}, // new key, added
-		"ui":          {"Designer"},          // override-replace existing key
-		"infra":       {},                    // empty → drop
+		"ui":          {"Designer"},         // override-replace existing key
+		"infra":       {},                   // empty → drop
 	}
 	got := mergeCategoryRouting(defaults, ws)
 

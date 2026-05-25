@@ -27,7 +27,7 @@ import (
 //   - {"source": "github://owner/repo#v1.2.0"}      → pinned ref
 //   - {"source": "clawhub://sonoscli@1.2.0"}        → when a ClawHub resolver is registered
 //
-// The shape of the plugin (agentskills.io format, MCP server, DeepAgents
+// The shape of the plugin (agentskills.io format, MCP server, workflow
 // sub-agent, …) is orthogonal and handled by the per-runtime adapter
 // inside the workspace at startup.
 func (h *PluginsHandler) Install(c *gin.Context) {

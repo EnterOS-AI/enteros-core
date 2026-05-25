@@ -522,8 +522,6 @@ func configDirName(workspaceID string) string {
 // string, and the path-traversal oracle where `runtime: ../../sensitive`
 // probed host directories for existence.
 //
-// Keep in sync with workspace/build-all.sh — adding a new
-// runtime means bumping both this list and the Docker image tags.
 // knownRuntimes is populated from manifest.json at service init (see
 // runtime_registry.go). The package init order is:
 //  1. var knownRuntimes = fallbackRuntimes
@@ -834,13 +832,13 @@ func deriveProviderFromModelSlug(model string) string {
 //
 // Why per-runtime rather than a generic MOLECULE_MODEL: each runtime
 // installer has its own config schema and naming (hermes writes to
-// ~/.hermes/config.yaml with `model.default`; langgraph reads from
+// ~/.hermes/config.yaml with `model.default`; codex reads from
 // /configs/config.yaml directly; future IoT/robotics targets may have
 // firmware manifests). Keeping the contract owned by the runtime
 // template means adding a new runtime doesn't require edits on the
 // tenant side for each one.
 //
-// For runtimes with no env-based model override (langgraph etc. read
+// For runtimes with no env-based model override (codex etc. read
 // model from /configs/config.yaml which CP user-data generates from
 // payload.Model at boot), this is a no-op — no harm in the switch
 // being empty for those cases.

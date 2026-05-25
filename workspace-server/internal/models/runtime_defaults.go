@@ -11,7 +11,7 @@ package models
 //     openai-* providers, so they wedged in `not_configured` with
 //     `codex adapter: workspace config picks provider='anthropic' but
 //     it is not in the providers registry`. The fallback never matched
-//     a runtime that could actually use it (only langgraph + hermes
+//     a runtime that could actually use it (only claude-code + hermes
 //     could even partially execute anthropic:claude-opus-4-7 without
 //     extra credential plumbing). It existed as a "must return
 //     something" placeholder that turned every silent miss into a

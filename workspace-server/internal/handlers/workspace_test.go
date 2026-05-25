@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/DATA-DOG/go-sqlmock"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
+	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/gin-gonic/gin"
 )
 
@@ -62,7 +62,7 @@ func TestWorkspaceGet_Success(t *testing.T) {
 		t.Errorf("expected status 'online', got %v", resp["status"])
 	}
 	if resp["runtime"] != "claude-code" {
-		t.Errorf("expected runtime 'langgraph', got %v", resp["runtime"])
+		t.Errorf("expected runtime 'claude-code', got %v", resp["runtime"])
 	}
 	// current_task is stripped from public GET response (#955)
 	if _, exists := resp["current_task"]; exists {
@@ -467,7 +467,7 @@ func TestWorkspaceCreate_WithSecrets_Persists(t *testing.T) {
 
 	mock.ExpectBegin()
 	mock.ExpectExec("INSERT INTO workspaces").
-		WithArgs(sqlmock.AnyArg(), "Hermes Agent", nil, 3, "hermes", (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
+		WithArgs(sqlmock.AnyArg(), "External Agent", nil, 3, "external", (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	// Secret inserted inside the same transaction.
 	mock.ExpectExec("INSERT INTO workspace_secrets").
@@ -482,7 +482,7 @@ func TestWorkspaceCreate_WithSecrets_Persists(t *testing.T) {
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 
-	body := `{"name":"Hermes Agent","runtime":"hermes","model":"anthropic:claude-opus-4-7","external":true,"secrets":{"HERMES_API_KEY":"sk-test-123"}}`
+	body := `{"name":"External Agent","runtime":"external","external":true,"secrets":{"HERMES_API_KEY":"sk-test-123"}}`
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
@@ -643,6 +643,96 @@ func TestWorkspaceCreate_KimiRuntime_PreservesLabel(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+func TestWorkspaceCreate_ExternalRejectsContainerRuntimeLabel(t *testing.T) {
+	setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+
+	body := `{"name":"Bad External","external":true,"runtime":"claude-code","tier":3}`
+	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Create(c)
+
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if resp["code"] != "RUNTIME_UNSUPPORTED" {
+		t.Errorf("expected code RUNTIME_UNSUPPORTED, got %v", resp["code"])
+	}
+}
+
+func TestWorkspaceCreate_ExternalFlagDefaultsRuntimeExternal(t *testing.T) {
+	t.Setenv("MOLECULE_DEPLOY_MODE", "self-hosted")
+	t.Setenv("MOLECULE_ORG_ID", "")
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+
+	mock.ExpectBegin()
+	mock.ExpectExec("INSERT INTO workspaces").
+		WithArgs(sqlmock.AnyArg(), "External Agent", nil, 3, "external", (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+	mock.ExpectExec("UPDATE workspaces SET status").
+		WithArgs(models.StatusAwaitingAgent, "external", sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO workspace_auth_tokens").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+
+	body := `{"name":"External Agent","external":true,"tier":3}`
+	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Create(c)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+func TestWorkspaceCreate_UnsupportedRuntimeFailsBeforeInsert(t *testing.T) {
+	setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+
+	body := `{"name":"Legacy Agent","runtime":"legacy-runtime","model":"openai:gpt-4o","tier":3}`
+	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Create(c)
+
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if resp["code"] != "RUNTIME_UNSUPPORTED" {
+		t.Errorf("expected code RUNTIME_UNSUPPORTED, got %v", resp["code"])
 	}
 }
 
@@ -1819,14 +1909,14 @@ runtime_config:
 //
 // molecule-controlplane#188 / #184: if a caller names a `template` (intent
 // for a specific runtime) but the runtime cannot be resolved from it, the
-// server MUST NOT silently provision langgraph and return 201 — that false
+// server MUST NOT silently provision claude-code and return 201 — that false
 // success produced 5/5 wrong workspaces and a bogus codex E2E pass. These
 // tests pin the fail-closed boundary at the ws-server `Create` handler (the
 // path the product UI hits), and guard the legitimate default path against
 // regression.
 
 // Template requested but its dir/config.yaml is absent → 422, not silent
-// langgraph 201.
+// claude-code 201.
 func TestWorkspaceCreate_188_TemplateMissingRuntime_FailsClosed(t *testing.T) {
 	setupTestDB(t)
 	setupTestRedis(t)
@@ -1859,7 +1949,7 @@ func TestWorkspaceCreate_188_TemplateMissingRuntime_FailsClosed(t *testing.T) {
 	}
 }
 
-// Template config.yaml has no `runtime:` key → 422, not silent langgraph.
+// Template config.yaml has no `runtime:` key → 422, not silent claude-code.
 func TestWorkspaceCreate_188_TemplateConfigNoRuntimeKey_FailsClosed(t *testing.T) {
 	setupTestDB(t)
 	setupTestRedis(t)
@@ -1888,17 +1978,17 @@ func TestWorkspaceCreate_188_TemplateConfigNoRuntimeKey_FailsClosed(t *testing.T
 	}
 }
 
-// Pre-2026-05-22 this test guarded "bare {name} → langgraph 201" — the
+// Pre-2026-05-22 this test guarded "bare {name} → claude-code 201" — the
 // regression check for controlplane#188 (where an explicit runtime that
-// failed to resolve must NOT silently substitute langgraph) had a sibling
-// to ensure the LEGITIMATE bare default still landed on langgraph.
+// failed to resolve must NOT silently substitute claude-code) had a sibling
+// to ensure the LEGITIMATE bare default still landed on claude-code.
 //
 // Post-CTO-SSOT-directive (2026-05-22) bare body is 422 MODEL_REQUIRED
-// before reaching the langgraph branch — the gate runs AFTER the
-// langgraph-default assignment so the error body still surfaces
-// runtime=langgraph (helps the caller see "ok, langgraph WOULD have
+// before reaching the claude-code branch — the gate runs AFTER the
+// claude-code-default assignment so the error body still surfaces
+// runtime=claude-code (helps the caller see "ok, claude-code WOULD have
 // been the runtime, but you still owe me a model"). The bare-body
-// langgraph 201 path no longer exists; what we guard now is the
+// claude-code 201 path no longer exists; what we guard now is the
 // 422-shape diagnostic.
 //
 // Bare-body-with-explicit-model 201 (the new "legitimate default" path)

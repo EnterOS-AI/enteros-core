@@ -121,7 +121,7 @@ type templateSummary struct {
 	// The canvas Config tab surfaces this as the Provider override
 	// dropdown (Option B PR-5). Data-driven so each runtime owns its own
 	// taxonomy — hermes-agent supports 20+ providers; claude-code only
-	// "anthropic"; gemini-cli only "gemini" — and a future runtime with
+	// "anthropic" — and a future runtime with
 	// a different vendor list doesn't need a canvas edit. Empty list →
 	// canvas falls back to deriving suggestions from `models[].id` slug
 	// prefixes (still adapter-driven, just inferred).

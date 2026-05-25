@@ -7,7 +7,7 @@ import { useCanvasStore, type WorkspaceNodeData } from "@/store/canvas";
 import type { WorkspaceCompute } from "@/store/socket";
 
 const INSTANCE_TYPES = ["t3.medium", "t3.large", "t3.xlarge", "t3.2xlarge", "m6i.large", "m6i.xlarge", "c6i.xlarge"];
-const RUNTIME_OPTIONS = ["claude-code", "codex", "hermes", "openclaw", "langgraph", "kimi", "kimi-cli", "external"];
+const RUNTIME_OPTIONS = ["claude-code", "codex", "hermes", "openclaw", "kimi", "kimi-cli", "external"];
 const RESOLUTIONS = ["1280x720", "1440x900", "1920x1080", "2560x1440"];
 const DEFAULT_HEADLESS_INSTANCE_TYPE = "t3.medium";
 const DEFAULT_HEADLESS_ROOT_GB = 30;

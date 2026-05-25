@@ -44,7 +44,7 @@ export const plans: Plan[] = [
     price: "$0",
     features: [
       "3 workspaces",
-      "Claude Code, LangGraph, OpenClaw runtimes",
+      "Claude Code, Codex, Hermes, OpenClaw runtimes",
       "Shared Redis + bounded storage",
       "Community support",
     ],

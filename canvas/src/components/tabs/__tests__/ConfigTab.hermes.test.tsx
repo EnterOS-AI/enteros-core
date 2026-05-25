@@ -3,10 +3,10 @@
 // Regression tests for ConfigTab hermes-workspace UX (#1894 + #1900).
 //
 // All four bugs this suite pins hit the same workspace on 2026-04-23:
-// a hermes-runtime workspace whose Config tab showed "LangGraph
+// a hermes-runtime workspace whose Config tab showed "Claude Code
 // (default)" in the runtime dropdown, an empty Model field, and a
 // scary red "No config.yaml found" banner. Clicking Save would
-// silently PATCH runtime back to LangGraph, breaking the workspace.
+// silently PATCH runtime back to Claude Code, breaking the workspace.
 //
 // Each test pins one invariant. If any fails, the bug is back.
 
@@ -91,7 +91,7 @@ describe("ConfigTab — hermes workspace", () => {
   it("loads runtime from workspace metadata when config.yaml is missing (#1894 bug 1)", async () => {
     // This is the hermes case: no platform config.yaml, so the form must
     // fall back to GET /workspaces/:id's runtime field. Before the fix, the
-    // runtime dropdown showed "LangGraph (default)" because the fallback
+    // runtime dropdown showed "Claude Code (default)" because the fallback
     // didn't exist.
     wireApi({
       workspaceRuntime: "hermes",
@@ -150,9 +150,9 @@ describe("ConfigTab — hermes workspace", () => {
     expect(screen.queryByText(/Hermes manages its own config/i)).toBeNull();
   });
 
-  it("DOES show 'No config.yaml found' error for langgraph workspace (default runtime)", async () => {
+  it("DOES show 'No config.yaml found' error for claude-code workspace (default runtime)", async () => {
     // Regression guard the other way — the gray info banner is hermes-
-    // specific. A langgraph workspace with no config.yaml SHOULD still
+    // specific. A claude-code workspace with no config.yaml SHOULD still
     // see the red error so the user knows to provide a template config.
     wireApi({
       workspaceRuntime: "",
@@ -302,21 +302,21 @@ describe("ConfigTab — config.yaml on disk", () => {
     // MCP server list, etc.) but runtime/model/tier come from the
     // workspace row so the node badge matches the form.
     //
-    // Scenario: DB says "hermes", config.yaml says "crewai". The form
+    // Scenario: DB says "hermes", config.yaml says "openclaw". The form
     // must show hermes (DB wins).
     //
-    // We pick hermes (not langgraph) on the DB side because "langgraph"
-    // is collapsed to the empty-string "LangGraph (default)" option in
-    // the runtime dropdown — so a "langgraph" DB value would render as
+    // We pick hermes (not claude-code) on the DB side because "claude-code"
+    // is collapsed to the empty-string "Claude Code (default)" option in
+    // the runtime dropdown — so a "claude-code" DB value would render as
     // the empty-valued option and obscure whether the DB-wins logic
     // actually fired. Hermes has its own non-empty option value and
     // gives the assertion a clean signal.
     wireApi({
       workspaceRuntime: "hermes", // DB — authoritative
-      configYamlContent: 'runtime: crewai\nmodel: "claude-opus"\n',
+      configYamlContent: 'runtime: openclaw\nmodel: "claude-opus"\n',
       templates: [
         { id: "t-hermes", name: "Hermes", runtime: "hermes", models: [] },
-        { id: "t-crewai", name: "CrewAI", runtime: "crewai", models: [] },
+        { id: "t-openclaw", name: "OpenClaw", runtime: "openclaw", models: [] },
       ],
     });
 

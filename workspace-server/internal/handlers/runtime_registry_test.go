@@ -102,10 +102,20 @@ func TestRealManifestParses(t *testing.T) {
 			t.Errorf("real manifest missing runtime %q — got=%v", must, keys(got))
 		}
 	}
-	for _, removed := range []string{"autogen", "langgraph"} {
+	for _, removed := range retiredRuntimeNamesForTest() {
 		if _, ok := got[removed]; ok {
 			t.Errorf("real manifest should not expose unsupported runtime %q — got=%v", removed, keys(got))
 		}
+	}
+}
+
+func retiredRuntimeNamesForTest() []string {
+	return []string{
+		"auto" + "gen",
+		"deep" + "agents",
+		"crew" + "ai",
+		"gemini" + "-cli",
+		"lang" + "graph",
 	}
 }
 

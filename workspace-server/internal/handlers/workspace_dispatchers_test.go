@@ -5,8 +5,8 @@ import (
 	"database/sql"
 	"testing"
 
-	"github.com/DATA-DOG/go-sqlmock"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
+	"github.com/DATA-DOG/go-sqlmock"
 )
 
 // ==================== resolveDeliveryMode ====================
@@ -45,7 +45,7 @@ func TestResolveDeliveryMode_ExistingDeliveryMode(t *testing.T) {
 	mock.ExpectQuery("SELECT delivery_mode, runtime FROM workspaces").
 		WithArgs("ws-poll").
 		WillReturnRows(sqlmock.NewRows([]string{"delivery_mode", "runtime"}).
-			AddRow("poll", "langgraph"))
+			AddRow("poll", "claude-code"))
 
 	ctx := context.Background()
 	got, err := h.resolveDeliveryMode(ctx, "ws-poll", "")
@@ -85,11 +85,11 @@ func TestResolveDeliveryMode_SelfHosted_DefaultsToPush(t *testing.T) {
 	broadcaster := newTestBroadcaster()
 	h := NewRegistryHandler(broadcaster)
 
-	// Row exists; delivery_mode is NULL; runtime = "langgraph"
+	// Row exists; delivery_mode is NULL; runtime = "claude-code"
 	mock.ExpectQuery("SELECT delivery_mode, runtime FROM workspaces").
 		WithArgs("ws-self-hosted").
 		WillReturnRows(sqlmock.NewRows([]string{"delivery_mode", "runtime"}).
-			AddRow(nil, "langgraph"))
+			AddRow(nil, "claude-code"))
 
 	ctx := context.Background()
 	got, err := h.resolveDeliveryMode(ctx, "ws-self-hosted", "")
@@ -147,12 +147,12 @@ func TestResolveDeliveryMode_ExistingDeliveryModeEmptyString(t *testing.T) {
 	broadcaster := newTestBroadcaster()
 	h := NewRegistryHandler(broadcaster)
 
-	// delivery_mode is explicitly empty string (not NULL), runtime = "langgraph"
+	// delivery_mode is explicitly empty string (not NULL), runtime = "claude-code"
 	// → falls through to runtime check → "push" for non-external
 	mock.ExpectQuery("SELECT delivery_mode, runtime FROM workspaces").
 		WithArgs("ws-empty-mode").
 		WillReturnRows(sqlmock.NewRows([]string{"delivery_mode", "runtime"}).
-			AddRow("", "langgraph"))
+			AddRow("", "claude-code"))
 
 	ctx := context.Background()
 	got, err := h.resolveDeliveryMode(ctx, "ws-empty-mode", "")
