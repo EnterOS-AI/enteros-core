@@ -5,6 +5,13 @@ import * as Dialog from "@radix-ui/react-dialog";
 import { api } from "@/lib/api";
 import { isSaaSTenant } from "@/lib/tenant";
 import { ExternalConnectModal, type ExternalConnectionInfo } from "./ExternalConnectModal";
+import {
+  ProviderModelSelector,
+  buildProviderCatalog,
+  findProviderForModel,
+  type SelectorModel,
+  type SelectorValue,
+} from "./ProviderModelSelector";
 
 interface WorkspaceOption {
   id: string;
@@ -22,6 +29,8 @@ interface TemplateSpec {
   id: string;
   name?: string;
   runtime?: string;
+  model?: string;
+  models?: SelectorModel[];
   providers?: string[];
 }
 
@@ -33,50 +42,12 @@ interface HermesProvider {
   models: string[];
 }
 
-type LLMAuthMode = "platform" | "api_key" | "oauth";
-
-interface NativeLLMProvider {
-  id: string;
-  label: string;
-  envVar?: string;
-  defaultModel: string;
-  models: string[];
-  authModes: LLMAuthMode[];
-}
-
-export const NATIVE_LLM_PROVIDERS: NativeLLMProvider[] = [
-  {
-    id: "minimax",
-    label: "MiniMax",
-    envVar: "MINIMAX_API_KEY",
-    defaultModel: "MiniMax-M2.7",
-    models: ["MiniMax-M2.7", "MiniMax-M2.7-highspeed", "MiniMax-M2.5"],
-    authModes: ["platform", "api_key"],
-  },
-  {
-    id: "kimi-coding",
-    label: "Kimi",
-    envVar: "KIMI_API_KEY",
-    defaultModel: "kimi-for-coding",
-    models: ["kimi-for-coding", "kimi-k2.5", "kimi-k2"],
-    authModes: ["platform", "api_key"],
-  },
-  {
-    id: "anthropic",
-    label: "Anthropic",
-    envVar: "ANTHROPIC_API_KEY",
-    defaultModel: "claude-sonnet-4-6",
-    models: ["claude-sonnet-4-6", "claude-opus-4-7", "claude-haiku-4-5"],
-    authModes: ["platform", "api_key"],
-  },
-  {
-    id: "anthropic-oauth",
-    label: "Claude OAuth",
-    envVar: "CLAUDE_CODE_OAUTH_TOKEN",
-    defaultModel: "sonnet",
-    models: ["sonnet", "opus", "haiku"],
-    authModes: ["oauth"],
-  },
+const DEFAULT_LLM_MODELS: SelectorModel[] = [
+  { id: "moonshot/kimi-k2.6", name: "Kimi K2.6", provider: "platform", required_env: [] },
+  { id: "MiniMax-M2.7", name: "MiniMax M2.7", required_env: ["MINIMAX_API_KEY"] },
+  { id: "kimi-k2-turbo-preview", name: "Kimi K2 Turbo Preview", required_env: ["KIMI_API_KEY"] },
+  { id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6", required_env: ["ANTHROPIC_API_KEY"] },
+  { id: "sonnet", name: "Claude Sonnet", required_env: ["CLAUDE_CODE_OAUTH_TOKEN"] },
 ];
 const DEFAULT_HEADLESS_INSTANCE_TYPE = "t3.medium";
 const DEFAULT_HEADLESS_ROOT_GB = 30;
@@ -149,9 +120,11 @@ export function CreateWorkspaceButton() {
   // (Anthropic), which 401s if the user's key is for a different
   // provider. Hence: require model when template=hermes.
   const [hermesModel, setHermesModel] = useState("");
-  const [llmAuthMode, setLLMAuthMode] = useState<LLMAuthMode>("platform");
-  const [llmProvider, setLLMProvider] = useState("minimax");
-  const [llmModel, setLLMModel] = useState("MiniMax-M2.7");
+  const [llmSelection, setLLMSelection] = useState<SelectorValue>({
+    providerId: "platform|",
+    model: "moonshot/kimi-k2.6",
+    envVars: [],
+  });
   const [llmSecret, setLLMSecret] = useState("");
 
   // Tier picker: on SaaS every workspace gets its own EC2 VM (Full Access
@@ -208,32 +181,23 @@ export function CreateWorkspaceButton() {
     []
   );
 
-  const isHermes = template.trim().toLowerCase() === "hermes";
-  const nativeLLMProviders = useMemo(
-    () => NATIVE_LLM_PROVIDERS.filter((p) => p.authModes.includes(llmAuthMode)),
-    [llmAuthMode],
-  );
-  const selectedNativeProvider = useMemo(
-    () => nativeLLMProviders.find((p) => p.id === llmProvider) ?? nativeLLMProviders[0],
-    [llmProvider, nativeLLMProviders],
-  );
-
   // Resolve the selected template's spec from the /templates response.
-  // The `template` input is free-text; templates can be matched by id,
-  // name, or runtime so any of those work. Lower-cased compare keeps
-  // "Hermes" / "hermes" / "HERMES" interchangeable.
+  // The user picks a runtime/template preset from a dropdown; the value
+  // remains the template id because that is the backend create contract.
   const selectedTemplateSpec = useMemo<TemplateSpec | null>(() => {
-    const t = template.trim().toLowerCase();
-    if (!t) return null;
-    return (
-      templateSpecs.find(
-        (s) =>
-          (s.id || "").toLowerCase() === t ||
-          (s.name || "").toLowerCase() === t ||
-          (s.runtime || "").toLowerCase() === t,
-      ) ?? null
-    );
+    if (!template) return null;
+    return templateSpecs.find((s) => s.id === template) ?? null;
   }, [template, templateSpecs]);
+  const isHermes = (selectedTemplateSpec?.runtime ?? "").trim().toLowerCase() === "hermes";
+  const llmModels = useMemo(
+    () => selectedTemplateSpec?.models?.length ? selectedTemplateSpec.models : DEFAULT_LLM_MODELS,
+    [selectedTemplateSpec],
+  );
+  const llmCatalog = useMemo(() => buildProviderCatalog(llmModels), [llmModels]);
+  const selectedLLMProvider = useMemo(
+    () => llmCatalog.find((p) => p.id === llmSelection.providerId) ?? llmCatalog[0],
+    [llmCatalog, llmSelection.providerId],
+  );
 
   // Filter HERMES_PROVIDERS by what the template declares it supports.
   // Empty/missing declared list → fall back to the full catalog so
@@ -265,20 +229,21 @@ export function CreateWorkspaceButton() {
   }, [availableProviders, isHermes]);
 
   useEffect(() => {
-    if (isHermes) return;
-    if (nativeLLMProviders.length === 0) return;
-    if (!nativeLLMProviders.some((p) => p.id === llmProvider)) {
-      setLLMProvider(nativeLLMProviders[0].id);
-      setLLMModel(nativeLLMProviders[0].defaultModel);
-    }
-  }, [isHermes, llmProvider, nativeLLMProviders]);
-
-  useEffect(() => {
-    if (isHermes || !selectedNativeProvider) return;
-    if (!selectedNativeProvider.models.includes(llmModel)) {
-      setLLMModel(selectedNativeProvider.defaultModel);
-    }
-  }, [isHermes, llmModel, selectedNativeProvider]);
+    if (isHermes || llmCatalog.length === 0) return;
+    const templateDefault = selectedTemplateSpec?.model?.trim();
+    const matched = templateDefault ? findProviderForModel(llmCatalog, templateDefault) : null;
+    const next = matched ?? llmCatalog[0];
+    setLLMSelection({
+      providerId: next.id,
+      model: matched && templateDefault
+        ? templateDefault
+        : next.wildcard
+          ? ""
+          : next.models[0]?.id ?? "",
+      envVars: next.envVars,
+    });
+    setLLMSecret("");
+  }, [isHermes, llmCatalog, selectedTemplateSpec?.model]);
 
   // Auto-fill hermesModel with the provider's defaultModel whenever the
   // provider changes, but only if the user hasn't already typed their own
@@ -314,9 +279,7 @@ export function CreateWorkspaceButton() {
     setExternalRuntime("external");
     setHermesApiKey("");
     setHermesModel("");
-    setLLMAuthMode("platform");
-    setLLMProvider("minimax");
-    setLLMModel("MiniMax-M2.7");
+    setLLMSelection({ providerId: "platform|", model: "moonshot/kimi-k2.6", envVars: [] });
     setLLMSecret("");
     api
       .get<WorkspaceOption[]>("/workspaces")
@@ -344,12 +307,12 @@ export function CreateWorkspaceButton() {
       setError("Model is required for Hermes workspaces — provider routing depends on the model slug prefix");
       return;
     }
-    if (!isExternal && !isHermes && !llmModel.trim()) {
+    if (!isExternal && !isHermes && !llmSelection.model.trim()) {
       setError("Model is required");
       return;
     }
-    if (!isExternal && !isHermes && llmAuthMode !== "platform" && !llmSecret.trim()) {
-      setError(llmAuthMode === "oauth" ? "Claude OAuth token is required" : "API key is required");
+    if (!isExternal && !isHermes && selectedLLMProvider?.envVars.length && !llmSecret.trim()) {
+      setError("Provider credential is required");
       return;
     }
     setCreating(true);
@@ -358,7 +321,7 @@ export function CreateWorkspaceButton() {
     const provider = isHermes
       ? HERMES_PROVIDERS.find((p) => p.id === hermesProvider)
       : undefined;
-    const nativeProvider = !isHermes ? selectedNativeProvider : undefined;
+    const nativeProvider = !isHermes ? selectedLLMProvider : undefined;
 
     try {
       const parsedBudget = budgetLimit.trim()
@@ -384,10 +347,10 @@ export function CreateWorkspaceButton() {
         budget_limit: parsedBudget,
         ...(!isExternal && !isHermes && nativeProvider
           ? {
-              model: llmModel.trim(),
-              llm_provider: nativeProvider.id,
-              ...(llmAuthMode !== "platform" && nativeProvider.envVar
-                ? { secrets: { [nativeProvider.envVar]: llmSecret.trim() } }
+              model: llmSelection.model.trim(),
+              llm_provider: nativeProvider.vendor,
+              ...(nativeProvider.envVars.length > 0
+                ? { secrets: { [nativeProvider.envVars[0]]: llmSecret.trim() } }
                 : {}),
             }
           : {}),
@@ -533,77 +496,46 @@ export function CreateWorkspaceButton() {
             )}
 
             {!isExternal && (
-              <InputField
-                label="Template"
-                value={template}
-                onChange={setTemplate}
-                placeholder="e.g. seo-agent (from workspace-configs-templates/)"
-                mono
-              />
+              <div>
+                <label htmlFor="runtime-template-select" className="text-[11px] text-ink-mid block mb-1">
+                  Runtime
+                </label>
+                <select
+                  id="runtime-template-select"
+                  value={template}
+                  onChange={(e) => setTemplate(e.target.value)}
+                  className="w-full bg-surface-card/60 border border-line/50 rounded-lg px-3 py-2 text-sm text-ink focus:outline-none focus:border-accent/60 focus:ring-1 focus:ring-accent/20 transition-colors"
+                >
+                  <option value="">Claude Code (blank workspace)</option>
+                  {templateSpecs.map((spec) => (
+                    <option key={spec.id} value={spec.id}>
+                      {spec.name || spec.id}
+                      {spec.runtime ? ` (${spec.runtime})` : ""}
+                    </option>
+                  ))}
+                </select>
+              </div>
             )}
 
-            {!isExternal && !isHermes && selectedNativeProvider && (
+            {!isExternal && !isHermes && selectedLLMProvider && (
               <div className="rounded-lg border border-line/50 bg-surface-card/40 p-3 space-y-3">
                 <div className="text-[11px] font-medium text-ink-mid">
                   LLM
                 </div>
-                <div>
-                  <label htmlFor="llm-auth-mode" className="text-[11px] text-ink-mid block mb-1">
-                    Auth Mode
-                  </label>
-                  <select
-                    id="llm-auth-mode"
-                    value={llmAuthMode}
-                    onChange={(e) => setLLMAuthMode(e.target.value as LLMAuthMode)}
-                    className="w-full bg-surface-card/60 border border-line/50 rounded-lg px-3 py-2 text-sm text-ink focus:outline-none focus:border-accent/60 focus:ring-1 focus:ring-accent/20 transition-colors"
-                  >
-                    <option value="platform">Platform provided</option>
-                    <option value="api_key">API key</option>
-                    <option value="oauth">Claude OAuth</option>
-                  </select>
-                </div>
-                <div>
-                  <label htmlFor="llm-provider-select" className="text-[11px] text-ink-mid block mb-1">
-                    Provider
-                  </label>
-                  <select
-                    id="llm-provider-select"
-                    value={selectedNativeProvider.id}
-                    onChange={(e) => {
-                      const next = nativeLLMProviders.find((p) => p.id === e.target.value);
-                      setLLMProvider(e.target.value);
-                      if (next) setLLMModel(next.defaultModel);
-                    }}
-                    className="w-full bg-surface-card/60 border border-line/50 rounded-lg px-3 py-2 text-sm text-ink focus:outline-none focus:border-accent/60 focus:ring-1 focus:ring-accent/20 transition-colors"
-                  >
-                    {nativeLLMProviders.map((p) => (
-                      <option key={p.id} value={p.id}>
-                        {p.label}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-                <div>
-                  <label htmlFor="llm-model-input" className="text-[11px] text-ink-mid block mb-1">
-                    Model
-                  </label>
-                  <input
-                    id="llm-model-input"
-                    type="text"
-                    value={llmModel}
-                    onChange={(e) => setLLMModel(e.target.value)}
-                    list="llm-model-suggestions"
-                    spellCheck={false}
-                    className="w-full bg-surface-card/60 border border-line/50 rounded-lg px-3 py-2 text-sm text-ink placeholder-ink-soft focus:outline-none focus:border-accent/60 focus:ring-1 focus:ring-accent/20 transition-colors font-mono"
-                  />
-                  <datalist id="llm-model-suggestions">
-                    {selectedNativeProvider.models.map((m) => <option key={m} value={m} />)}
-                  </datalist>
-                </div>
-                {llmAuthMode !== "platform" && (
+                <ProviderModelSelector
+                  models={llmModels}
+                  value={llmSelection}
+                  onChange={(next) => {
+                    setLLMSelection(next);
+                    setLLMSecret("");
+                  }}
+                  idPrefix="create-workspace-llm"
+                  variant="stack"
+                />
+                {selectedLLMProvider.envVars.length > 0 && (
                   <div>
                     <label htmlFor="llm-secret-input" className="text-[11px] text-ink-mid block mb-1">
-                      {llmAuthMode === "oauth" ? "OAuth Token" : "API Key"}
+                      {selectedLLMProvider.envVars[0]}
                     </label>
                     <input
                       id="llm-secret-input"

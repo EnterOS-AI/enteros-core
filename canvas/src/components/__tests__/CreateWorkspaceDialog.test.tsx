@@ -20,10 +20,34 @@ const SAMPLE_WORKSPACES = [
   { id: "ws-2", name: "Research Agent", tier: 2 },
 ];
 
+const SAMPLE_TEMPLATES = [
+  {
+    id: "seo-agent",
+    name: "SEO Agent",
+    runtime: "claude-code",
+    model: "moonshot/kimi-k2.6",
+    providers: ["platform", "minimax", "kimi-coding", "anthropic", "anthropic-oauth"],
+    models: [
+      { id: "moonshot/kimi-k2.6", name: "Kimi K2.6", provider: "platform", required_env: [] },
+      { id: "MiniMax-M2.7", name: "MiniMax M2.7", required_env: ["MINIMAX_API_KEY"] },
+      { id: "kimi-k2-turbo-preview", name: "Kimi K2 Turbo Preview", required_env: ["KIMI_API_KEY"] },
+      { id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6", required_env: ["ANTHROPIC_API_KEY"] },
+      { id: "sonnet", name: "Claude Sonnet", required_env: ["CLAUDE_CODE_OAUTH_TOKEN"] },
+    ],
+  },
+  { id: "hermes", name: "Hermes", runtime: "hermes" },
+];
+
 beforeEach(() => {
   vi.clearAllMocks();
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  mockGet.mockResolvedValue(SAMPLE_WORKSPACES as any);
+  mockGet.mockImplementation(async (url: string) => {
+    if (url === "/templates") {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      return SAMPLE_TEMPLATES as any;
+    }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return SAMPLE_WORKSPACES as any;
+  });
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   mockPost.mockResolvedValue({} as any);
 });
@@ -42,7 +66,7 @@ async function openDialog() {
 
 async function setTemplate(value: string) {
   fireEvent.change(
-    screen.getByPlaceholderText("e.g. seo-agent (from workspace-configs-templates/)"),
+    screen.getByLabelText("Runtime"),
     { target: { value } }
   );
 }
@@ -139,8 +163,8 @@ describe("CreateWorkspaceDialog", () => {
       volume: { root_gb: 30 },
       display: { mode: "none" },
     });
-    expect(body.model).toBe("MiniMax-M2.7");
-    expect(body.llm_provider).toBe("minimax");
+    expect(body.model).toBe("moonshot/kimi-k2.6");
+    expect(body.llm_provider).toBe("platform");
     expect(body.secrets).toBeUndefined();
   });
 
@@ -172,8 +196,8 @@ describe("CreateWorkspaceDialog", () => {
 
     await waitFor(() => expect(mockPost).toHaveBeenCalled());
     const body = mockPost.mock.calls[0][1] as Record<string, unknown>;
-    expect(body.model).toBe("MiniMax-M2.7");
-    expect(body.llm_provider).toBe("minimax");
+    expect(body.model).toBe("moonshot/kimi-k2.6");
+    expect(body.llm_provider).toBe("platform");
     expect(body.compute).toEqual({
       instance_type: "t3.xlarge",
       volume: { root_gb: 80 },
@@ -191,8 +215,8 @@ describe("CreateWorkspaceDialog", () => {
     fireEvent.change(screen.getByPlaceholderText("e.g. SEO Agent"), {
       target: { value: "BYOK Agent" },
     });
-    fireEvent.change(document.getElementById("llm-auth-mode") as HTMLSelectElement, {
-      target: { value: "api_key" },
+    fireEvent.change(document.querySelector("[data-testid='provider-select']") as HTMLSelectElement, {
+      target: { value: "minimax|MINIMAX_API_KEY" },
     });
     fireEvent.change(document.getElementById("llm-secret-input") as HTMLInputElement, {
       target: { value: "sk-minimax-test" },
@@ -213,8 +237,8 @@ describe("CreateWorkspaceDialog", () => {
     fireEvent.change(screen.getByPlaceholderText("e.g. SEO Agent"), {
       target: { value: "OAuth Agent" },
     });
-    fireEvent.change(document.getElementById("llm-auth-mode") as HTMLSelectElement, {
-      target: { value: "oauth" },
+    fireEvent.change(document.querySelector("[data-testid='provider-select']") as HTMLSelectElement, {
+      target: { value: "anthropic-oauth|CLAUDE_CODE_OAUTH_TOKEN" },
     });
     fireEvent.change(document.getElementById("llm-secret-input") as HTMLInputElement, {
       target: { value: "oauth-token" },
@@ -262,9 +286,9 @@ describe("CreateWorkspaceDialog — Hermes provider picker", () => {
     );
   });
 
-  it("shows hermes provider section for template 'HERMES' (case-insensitive)", async () => {
+  it("shows hermes provider section for the Hermes runtime preset", async () => {
     await openDialog();
-    await setTemplate("HERMES");
+    await setTemplate("hermes");
     await waitFor(() =>
       expect(document.querySelector("[data-testid='hermes-provider-section']")).toBeTruthy()
     );
