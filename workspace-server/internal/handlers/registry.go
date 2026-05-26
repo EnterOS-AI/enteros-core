@@ -530,7 +530,9 @@ func (h *RegistryHandler) Heartbeat(c *gin.Context) {
 
 	// Read previous current_task to detect changes (before the UPDATE)
 	var prevTask string
-	_ = db.DB.QueryRowContext(ctx, `SELECT COALESCE(current_task, '') FROM workspaces WHERE id = $1`, payload.WorkspaceID).Scan(&prevTask)
+	if err := db.DB.QueryRowContext(ctx, `SELECT COALESCE(current_task, '') FROM workspaces WHERE id = $1`, payload.WorkspaceID).Scan(&prevTask); err != nil {
+		log.Printf("registry heartbeat: prev_task query failed for workspace %s: %v", payload.WorkspaceID, err)
+	}
 
 	// #615: Clamp monthly_spend to a safe range before any DB write.
 	// A malicious or buggy agent could report math.MaxInt64, causing
@@ -812,10 +814,12 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 	// timeouts, retry logic, and activity_logs wiring.
 	if h.drainQueue != nil {
 		var maxConcurrent int
-		_ = db.DB.QueryRowContext(ctx,
+		if err := db.DB.QueryRowContext(ctx,
 			`SELECT COALESCE(max_concurrent_tasks, 1) FROM workspaces WHERE id = $1`,
 			payload.WorkspaceID,
-		).Scan(&maxConcurrent)
+		).Scan(&maxConcurrent); err != nil {
+			log.Printf("registry heartbeat: max_concurrent query failed for workspace %s: %v", payload.WorkspaceID, err)
+		}
 		if payload.ActiveTasks < maxConcurrent {
 			// context.WithoutCancel: heartbeat handler's ctx is about to
 			// expire as soon as we return. The drain needs to outlive it.

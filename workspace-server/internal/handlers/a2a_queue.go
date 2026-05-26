@@ -160,10 +160,12 @@ func EnqueueA2A(
 	}
 
 	// Return current queue depth for the caller's visibility.
-	_ = db.DB.QueryRowContext(ctx, `
+	if err := db.DB.QueryRowContext(ctx, `
 		SELECT COUNT(*) FROM a2a_queue
 		WHERE workspace_id = $1 AND status = 'queued'
-	`, workspaceID).Scan(&depth)
+	`, workspaceID).Scan(&depth); err != nil {
+		log.Printf("A2AQueue: depth query failed for workspace %s: %v", workspaceID, err)
+	}
 
 	log.Printf("A2AQueue: enqueued %s for workspace %s (priority=%d, depth=%d)", id, workspaceID, priority, depth)
 	return id, depth, nil
@@ -249,10 +251,12 @@ func MarkQueueItemFailed(ctx context.Context, id, errMsg string) {
 // can see how many ahead of them.
 func QueueDepth(ctx context.Context, workspaceID string) int {
 	var n int
-	_ = db.DB.QueryRowContext(ctx,
+	if err := db.DB.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM a2a_queue WHERE workspace_id = $1 AND status = 'queued'`,
 		workspaceID,
-	).Scan(&n)
+	).Scan(&n); err != nil {
+		log.Printf("A2AQueue: QueueDepth query failed for workspace %s: %v", workspaceID, err)
+	}
 	return n
 }
 

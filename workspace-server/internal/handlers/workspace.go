@@ -996,9 +996,11 @@ func (h *WorkspaceHandler) Get(c *gin.Context) {
 			// the client would otherwise see — the actionable signal
 			// is the 410 + hint, not the timestamp.
 			var removedAt time.Time
-			_ = db.DB.QueryRowContext(c.Request.Context(),
+			if err := db.DB.QueryRowContext(c.Request.Context(),
 				`SELECT updated_at FROM workspaces WHERE id = $1`, id,
-			).Scan(&removedAt)
+			).Scan(&removedAt); err != nil {
+				log.Printf("workspace GET: removed_at query failed for %s: %v", id, err)
+			}
 			body := gin.H{
 				"error": "workspace removed",
 				"id":    id,
