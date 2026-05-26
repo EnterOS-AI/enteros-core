@@ -568,7 +568,7 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 	// nil/empty map is a no-op.  Any failure rolls back the workspace insert
 	// so we never have a workspace row without its intended secrets.
 	for k, v := range payload.Secrets {
-		if rejectPlatformManagedDirectLLMBypass(c, k) {
+		if rejectPlatformManagedDirectLLMBypassForWorkspace(c, id, k) {
 			tx.Rollback() //nolint:errcheck
 			return
 		}

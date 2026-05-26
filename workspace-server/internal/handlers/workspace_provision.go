@@ -922,11 +922,45 @@ func applyRuntimeModelEnv(envVars map[string]string, runtime, model string) {
 }
 
 // applyPlatformManagedLLMEnv wires the control-plane LLM proxy into a
-// workspace only when the org is in platform-managed mode. Provider keys
-// never enter the tenant; provider SDK API-key envs receive the tenant token
-// for the CP proxy only when the workspace has not supplied BYOK/OAuth auth.
-func applyPlatformManagedLLMEnv(envVars map[string]string, runtime string, model string) {
-	if strings.ToLower(strings.TrimSpace(os.Getenv("MOLECULE_LLM_BILLING_MODE"))) != "platform_managed" {
+// workspace only when the RESOLVED billing mode for this workspace is
+// platform_managed. "Resolved" means: the workspace-level override (if any)
+// wins over the org default (delivered via tenant_config in MOLECULE_LLM_BILLING_MODE).
+//
+// Pre-internal#691 this gate read the org-level env var directly, which made
+// it impossible to mix billing modes across workspaces in the same org. The
+// resolver (ResolveLLMBillingMode) is the single source of truth now; the
+// architectural test asserts no remaining code path gates on os.Getenv
+// ("MOLECULE_LLM_BILLING_MODE") for strip-decision purposes — that env value
+// is still read INTO the resolver as the org-default input, but it is never
+// the final decision.
+//
+// Default-closed: any resolver error / NULL JOIN / garbled enum value
+// collapses to platform_managed (see llm_billing_mode.go for the contract).
+// This preserves the existing implicit default exactly while making the
+// per-workspace opt-out path safe.
+//
+// The resolved mode is exported into the workspace container as
+// MOLECULE_LLM_BILLING_MODE_RESOLVED so an in-container debug check can
+// answer "what mode is this workspace running under" without DB queries
+// (RFC Observability hot-spot).
+func applyPlatformManagedLLMEnv(ctx context.Context, envVars map[string]string, workspaceID, runtime, model string) {
+	orgMode := strings.ToLower(strings.TrimSpace(os.Getenv("MOLECULE_LLM_BILLING_MODE")))
+	res, resolveErr := ResolveLLMBillingMode(ctx, workspaceID, orgMode)
+	if resolveErr != nil {
+		// resolveErr != nil ⇒ resolver hit a DB error AND already defaulted
+		// res.ResolvedMode to platform_managed. Log + proceed; the safe default
+		// is already in place, no early return needed.
+		log.Printf("workspace_provision: resolve billing mode workspace=%s err=%v (defaulting to platform_managed)", workspaceID, resolveErr)
+	}
+	log.Printf("workspace_provision: billing mode workspace=%s resolved=%s source=%s org_default=%s", workspaceID, res.ResolvedMode, res.Source, res.OrgDefault)
+	// Observability: surface the resolved mode in the container env so the
+	// agent / debug shell can answer "why is my key being stripped" without
+	// pulling logs or hitting the admin route.
+	envVars["MOLECULE_LLM_BILLING_MODE_RESOLVED"] = res.ResolvedMode
+	if res.ResolvedMode != LLMBillingModePlatformManaged {
+		// byok or disabled — DO NOT strip vendor keys, DO NOT force-route to CP.
+		// Leave envVars alone so CLAUDE_CODE_OAUTH_TOKEN / vendor API keys
+		// pulled from workspace_secrets survive into the container.
 		return
 	}
 	baseURL := firstNonEmptyEnv("MOLECULE_LLM_BASE_URL", "OPENAI_BASE_URL")

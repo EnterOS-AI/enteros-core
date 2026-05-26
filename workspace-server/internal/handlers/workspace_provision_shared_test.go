@@ -972,7 +972,7 @@ func TestApplyPlatformManagedLLMEnv_NonClaudeRuntimeDefaultsOpenAIProxyWhenNoWor
 	t.Setenv("MOLECULE_LLM_DEFAULT_MODEL", "moonshot/kimi-k2.6")
 
 	envVars := map[string]string{}
-	applyPlatformManagedLLMEnv(envVars, "codex", "")
+	applyPlatformManagedLLMEnv(context.Background(), envVars, "", "codex", "")
 	applyRuntimeModelEnv(envVars, "codex", "")
 
 	if got := envVars["OPENAI_BASE_URL"]; got != "https://api.example.test/api/v1/internal/llm/openai/v1" {
@@ -1002,7 +1002,7 @@ func TestApplyPlatformManagedLLMEnv_StripsWorkspaceOpenAIKeyForClaudeCode(t *tes
 		"OPENAI_BASE_URL": "https://api.openai.com/v1",
 		"MODEL":           "openai/gpt-5.5",
 	}
-	applyPlatformManagedLLMEnv(envVars, "claude-code", "")
+	applyPlatformManagedLLMEnv(context.Background(), envVars, "", "claude-code", "")
 
 	if _, ok := envVars["OPENAI_API_KEY"]; ok {
 		t.Fatalf("OPENAI_API_KEY should be stripped for claude-code platform-managed mode")
@@ -1028,7 +1028,7 @@ func TestApplyPlatformManagedLLMEnv_ClaudeCodeUsesAnthropicProxyOverOAuth(t *tes
 		"CLAUDE_CODE_OAUTH_TOKEN": "user-oauth-token",
 		"MODEL":                   "sonnet",
 	}
-	applyPlatformManagedLLMEnv(envVars, "claude-code", "")
+	applyPlatformManagedLLMEnv(context.Background(), envVars, "", "claude-code", "")
 
 	if _, ok := envVars["CLAUDE_CODE_OAUTH_TOKEN"]; ok {
 		t.Fatalf("CLAUDE_CODE_OAUTH_TOKEN should be stripped in platform-managed mode")
@@ -1051,7 +1051,7 @@ func TestApplyPlatformManagedLLMEnv_ClaudeCodeInjectsAnthropicProxyWhenNoWorkspa
 	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
 
 	envVars := map[string]string{}
-	applyPlatformManagedLLMEnv(envVars, "claude-code", "minimax/MiniMax-M2.7")
+	applyPlatformManagedLLMEnv(context.Background(), envVars, "", "claude-code", "minimax/MiniMax-M2.7")
 
 	if got := envVars["ANTHROPIC_BASE_URL"]; got != "https://api.example.test/api/v1/internal/llm/anthropic/v1" {
 		t.Fatalf("ANTHROPIC_BASE_URL = %q", got)
@@ -1074,7 +1074,7 @@ func TestApplyPlatformManagedLLMEnv_ClaudeCodeStripsVendorBYOK(t *testing.T) {
 		"MINIMAX_API_KEY": "user-minimax-key",
 		"MODEL":           "MiniMax-M2.7",
 	}
-	applyPlatformManagedLLMEnv(envVars, "claude-code", "")
+	applyPlatformManagedLLMEnv(context.Background(), envVars, "", "claude-code", "")
 
 	if _, ok := envVars["MINIMAX_API_KEY"]; ok {
 		t.Fatalf("MINIMAX_API_KEY should be stripped in platform-managed mode")
@@ -1096,7 +1096,7 @@ func TestApplyPlatformManagedLLMEnv_NoopsOutsidePlatformManaged(t *testing.T) {
 	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
 
 	envVars := map[string]string{}
-	applyPlatformManagedLLMEnv(envVars, "claude-code", "")
+	applyPlatformManagedLLMEnv(context.Background(), envVars, "", "claude-code", "")
 
 	if _, ok := envVars["OPENAI_API_KEY"]; ok {
 		t.Fatalf("OPENAI_API_KEY should not be set outside platform-managed mode")

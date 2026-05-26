@@ -255,8 +255,22 @@ func TestExtended_SecretsListEmpty(t *testing.T) {
 // ---------- TestSecretsSet (Extended) ----------
 
 func TestExtended_SecretsSet(t *testing.T) {
+	// internal#691: the per-workspace strip gate now defaults to platform_managed
+	// on empty MOLECULE_LLM_BILLING_MODE (closed default). This test's intent is
+	// the happy path of persisting a vendor key, so put the org into byok which
+	// matches the pre-#691 implicit behavior of an unset env.
+	t.Setenv("MOLECULE_LLM_BILLING_MODE", "byok")
 	mock := setupTestDB(t)
 	handler := NewSecretsHandler(nil)
+
+	// internal#691: secrets.Set now consults ResolveLLMBillingMode before the
+	// strip gate. Mock returns no row → resolver falls through to the org
+	// default (byok, set via t.Setenv above) → bypass-list check is skipped
+	// and the write proceeds. This pattern is the test-side mirror of the
+	// real-prod fall-through behavior for a fresh workspace with no override.
+	mock.ExpectQuery(`SELECT llm_billing_mode FROM workspaces WHERE id = \$1`).
+		WithArgs("22222222-2222-2222-2222-222222222222").
+		WillReturnRows(sqlmock.NewRows([]string{"llm_billing_mode"}))
 
 	// Expect INSERT (encrypted value is dynamic, use AnyArg)
 	mock.ExpectExec("INSERT INTO workspace_secrets").

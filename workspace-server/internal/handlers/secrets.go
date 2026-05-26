@@ -48,10 +48,54 @@ func isPlatformManagedDirectLLMBypassKey(key string) bool {
 	return ok
 }
 
+// platformManagedLLMModeForWorkspace replaces the org-level platformManagedLLMMode
+// gate with a per-workspace resolved-mode check (internal#691). The strip-list
+// is enforced ONLY when this specific workspace's resolved mode is
+// platform_managed — a workspace with a byok override is allowed to write its
+// own CLAUDE_CODE_OAUTH_TOKEN / vendor key via the canvas Secrets tab.
+//
+// Default-closed: if the resolver hits a DB error, falls back to
+// platform_managed (the safe-default behavior), so a transient DB failure
+// during a secret write still rejects the bypass-list keys — fail safer not
+// freer. This matches the resolver's documented contract.
+func platformManagedLLMModeForWorkspace(c *gin.Context, workspaceID string) bool {
+	orgMode := strings.ToLower(strings.TrimSpace(os.Getenv("MOLECULE_LLM_BILLING_MODE")))
+	res, err := ResolveLLMBillingMode(c.Request.Context(), workspaceID, orgMode)
+	if err != nil {
+		log.Printf("secrets: resolve billing mode for workspace=%s failed: %v (defaulting to platform_managed for safety)", workspaceID, err)
+	}
+	return strings.EqualFold(res.ResolvedMode, LLMBillingModePlatformManaged)
+}
+
+// platformManagedLLMMode is the legacy org-level gate retained for any test
+// harness still asserting the env-var-only behavior. Production code paths
+// must call platformManagedLLMModeForWorkspace instead so a workspace-level
+// byok override actually takes effect on the secrets-write path.
 func platformManagedLLMMode() bool {
 	return strings.EqualFold(strings.TrimSpace(os.Getenv("MOLECULE_LLM_BILLING_MODE")), "platform_managed")
 }
 
+// rejectPlatformManagedDirectLLMBypassForWorkspace is the per-workspace
+// successor to rejectPlatformManagedDirectLLMBypass (internal#691). The
+// strip-list ONLY applies when this specific workspace resolves to
+// platform_managed; byok/disabled workspaces can write their own vendor keys.
+func rejectPlatformManagedDirectLLMBypassForWorkspace(c *gin.Context, workspaceID, key string) bool {
+	if !platformManagedLLMModeForWorkspace(c, workspaceID) || !isPlatformManagedDirectLLMBypassKey(key) {
+		return false
+	}
+	c.JSON(http.StatusBadRequest, gin.H{
+		"error":        "direct vendor key writes are blocked for platform-managed workspaces; use MODEL/LLM_PROVIDER or the platform LLM proxy env instead, or set this workspace's billing mode to 'byok' via /admin/workspaces/:id/llm-billing-mode",
+		"key":          key,
+		"workspace_id": workspaceID,
+	})
+	return true
+}
+
+// rejectPlatformManagedDirectLLMBypass is the legacy org-level shim. Retained
+// only for backwards compatibility with any external/test caller still on the
+// old shape; new code MUST use the per-workspace variant above. Production
+// code paths (the secrets.go handlers + workspace.go create-secret path) all
+// switched in internal#691.
 func rejectPlatformManagedDirectLLMBypass(c *gin.Context, key string) bool {
 	if !platformManagedLLMMode() || !isPlatformManagedDirectLLMBypassKey(key) {
 		return false
@@ -285,7 +329,7 @@ func (h *SecretsHandler) Set(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
 		return
 	}
-	if rejectPlatformManagedDirectLLMBypass(c, body.Key) {
+	if rejectPlatformManagedDirectLLMBypassForWorkspace(c, workspaceID, body.Key) {
 		return
 	}
 

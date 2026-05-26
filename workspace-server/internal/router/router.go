@@ -173,6 +173,12 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		// so the canvas flips to failed in seconds instead of waiting
 		// for the 10-minute provision-timeout sweeper.
 		wsAdmin.POST("/admin/workspaces/:id/bootstrap-failed", wh.BootstrapFailed)
+		// Per-workspace LLM billing mode override (internal#691). Used by
+		// CP's /cp/admin/workspaces/:id/llm-billing-mode proxy + (via that
+		// proxy) by the canvas Config-tab "LLM Billing" section. Default-
+		// closed resolver lives in handlers/llm_billing_mode.go.
+		wsAdmin.GET("/admin/workspaces/:id/llm-billing-mode", handlers.GetWorkspaceLLMBillingMode)
+		wsAdmin.PUT("/admin/workspaces/:id/llm-billing-mode", handlers.PutWorkspaceLLMBillingMode)
 		// Proxy to CP's serial-console endpoint so the canvas's "View
 		// Logs" button can render the actual boot trace without handing
 		// the tenant AWS credentials. Admin-gated because console output

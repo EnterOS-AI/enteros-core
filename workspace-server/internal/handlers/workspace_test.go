@@ -501,6 +501,10 @@ func TestWorkspaceCreate_WithSecrets_Persists(t *testing.T) {
 // while persisting a secret causes the entire transaction to roll back and
 // the handler to return 500.  The workspace row must NOT be committed.
 func TestWorkspaceCreate_SecretPersistFails_RollsBack(t *testing.T) {
+	// internal#691: see TestExtended_SecretsSet — same default-closed reasoning.
+	// This test is asserting the rollback path on DB failure, not the strip gate;
+	// keep the org in byok so the OPENAI_API_KEY write reaches the INSERT.
+	t.Setenv("MOLECULE_LLM_BILLING_MODE", "byok")
 	mock := setupTestDB(t)
 	setupTestRedis(t)
 	broadcaster := newTestBroadcaster()
@@ -509,6 +513,14 @@ func TestWorkspaceCreate_SecretPersistFails_RollsBack(t *testing.T) {
 	mock.ExpectBegin()
 	mock.ExpectExec("INSERT INTO workspaces").
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	// internal#691: Create() now resolves billing mode per-workspace before
+	// the secret-strip gate. The workspace row was just inserted in the same
+	// transaction so it isn't readable from a separate query yet; the
+	// resolver expects the SELECT and the mock returns no row → falls back
+	// to the org default (byok, set above) so the OPENAI_API_KEY write
+	// reaches the INSERT-and-fail path this test exercises.
+	mock.ExpectQuery(`SELECT llm_billing_mode FROM workspaces WHERE id = \$1`).
+		WillReturnRows(sqlmock.NewRows([]string{"llm_billing_mode"}))
 	mock.ExpectExec("INSERT INTO workspace_secrets").
 		WillReturnError(sql.ErrConnDone) // DB failure while writing secret
 	mock.ExpectRollback() // workspace insert must be rolled back
