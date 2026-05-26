@@ -761,6 +761,25 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 		configFiles = h.ensureDefaultConfig(id, payload)
 	}
 
+	// Seed schedules declared in the workspace template's config.yaml.
+	// Mirrors the org/import path (org_import.go) so a workspace created
+	// directly from a workspace template lands with the same schedule
+	// grid the org/import path would have produced. Idempotent across
+	// re-imports via orgImportScheduleSQL's ON CONFLICT clause; runtime-
+	// added rows are preserved (Issue #24 contract).
+	//
+	// Non-fatal: a broken schedules: block must never block workspace
+	// provisioning — the workspace row already committed above, and the
+	// schedule grid is recoverable via /workspaces/{id}/schedules POSTs.
+	if templatePath != "" {
+		if templateScheds, parseErr := parseTemplateSchedules(templatePath); parseErr != nil {
+			log.Printf("Create %s: parsing template schedules: %v (continuing)", id, parseErr)
+		} else if len(templateScheds) > 0 {
+			seeded := seedTemplateSchedules(ctx, id, templatePath, templateScheds)
+			log.Printf("Create %s: seeded %d/%d template schedules", id, seeded, len(templateScheds))
+		}
+	}
+
 	// Auto-provision — pick backend: control plane (SaaS) or Docker (self-hosted).
 	// Routing AND the no-backend mark-failed path are both inside
 	// provisionWorkspaceAuto (single source of truth). The Create-specific
