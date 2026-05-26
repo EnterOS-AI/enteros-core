@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, fireEvent, waitFor, cleanup } from "@testing-library/react";
-import { CreateWorkspaceButton, HERMES_PROVIDERS } from "../CreateWorkspaceDialog";
+import { CreateWorkspaceButton } from "../CreateWorkspaceDialog";
 
 vi.mock("@/lib/api", () => ({
   api: {
@@ -22,6 +22,22 @@ const SAMPLE_WORKSPACES = [
 
 const SAMPLE_TEMPLATES = [
   {
+    id: "claude-code-default",
+    name: "Claude Code Agent",
+    runtime: "claude-code",
+    model: "moonshot/kimi-k2.6",
+    providers: ["platform", "minimax", "kimi-coding", "anthropic", "anthropic-oauth"],
+    models: [
+      { id: "moonshot/kimi-k2.6", name: "Kimi K2.6", provider: "platform", required_env: [] },
+      { id: "MiniMax-M2.7", name: "MiniMax M2.7", required_env: ["MINIMAX_API_KEY"] },
+      { id: "kimi-k2-turbo-preview", name: "Kimi K2 Turbo Preview", required_env: ["KIMI_API_KEY"] },
+      { id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6", required_env: ["ANTHROPIC_API_KEY"] },
+      { id: "sonnet", name: "Claude Sonnet", required_env: ["CLAUDE_CODE_OAUTH_TOKEN"] },
+      { id: "opus", name: "Claude Opus", required_env: ["CLAUDE_CODE_OAUTH_TOKEN"] },
+      { id: "haiku", name: "Claude Haiku", required_env: ["CLAUDE_CODE_OAUTH_TOKEN"] },
+    ],
+  },
+  {
     id: "seo-agent",
     name: "SEO Agent",
     runtime: "claude-code",
@@ -33,9 +49,22 @@ const SAMPLE_TEMPLATES = [
       { id: "kimi-k2-turbo-preview", name: "Kimi K2 Turbo Preview", required_env: ["KIMI_API_KEY"] },
       { id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6", required_env: ["ANTHROPIC_API_KEY"] },
       { id: "sonnet", name: "Claude Sonnet", required_env: ["CLAUDE_CODE_OAUTH_TOKEN"] },
+      { id: "opus", name: "Claude Opus", required_env: ["CLAUDE_CODE_OAUTH_TOKEN"] },
+      { id: "haiku", name: "Claude Haiku", required_env: ["CLAUDE_CODE_OAUTH_TOKEN"] },
     ],
   },
-  { id: "hermes", name: "Hermes", runtime: "hermes" },
+  {
+    id: "hermes",
+    name: "Hermes",
+    runtime: "hermes",
+    model: "openai/gpt-4o",
+    providers: ["openai", "anthropic", "platform"],
+    models: [
+      { id: "openai/gpt-4o", name: "GPT-4o", required_env: ["OPENAI_API_KEY"] },
+      { id: "anthropic/claude-sonnet-4-5", name: "Claude Sonnet 4.5", required_env: ["ANTHROPIC_API_KEY"] },
+      { id: "moonshot/kimi-k2.6", name: "Kimi K2.6", provider: "platform", required_env: [] },
+    ],
+  },
 ];
 
 beforeEach(() => {
@@ -269,6 +298,9 @@ describe("CreateWorkspaceDialog", () => {
     fireEvent.change(document.querySelector("[data-testid='provider-select']") as HTMLSelectElement, {
       target: { value: "anthropic-oauth|CLAUDE_CODE_OAUTH_TOKEN" },
     });
+    fireEvent.change(document.querySelector("[data-testid='model-select']") as HTMLSelectElement, {
+      target: { value: "sonnet" },
+    });
     fireEvent.change(document.getElementById("llm-secret-input") as HTMLInputElement, {
       target: { value: "oauth-token" },
     });
@@ -281,6 +313,18 @@ describe("CreateWorkspaceDialog", () => {
     expect(body.model).toBe("sonnet");
     expect(body.llm_provider).toBe("anthropic-oauth");
     expect(body.secrets).toEqual({ CLAUDE_CODE_OAUTH_TOKEN: "oauth-token" });
+  });
+
+  it("lists all Claude Code subscription aliases for blank workspaces", async () => {
+    await openDialog();
+
+    fireEvent.change(document.querySelector("[data-testid='provider-select']") as HTMLSelectElement, {
+      target: { value: "anthropic-oauth|CLAUDE_CODE_OAUTH_TOKEN" },
+    });
+
+    const modelSelect = document.querySelector("[data-testid='model-select']") as HTMLSelectElement;
+    const optionValues = Array.from(modelSelect.options).map((option) => option.value);
+    expect(optionValues).toEqual(expect.arrayContaining(["sonnet", "opus", "haiku"]));
   });
 
   it("renders gracefully when GET /workspaces fails", async () => {
@@ -297,226 +341,103 @@ describe("CreateWorkspaceDialog", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Hermes provider picker tests
+// Dynamic runtime provider picker tests
 // ---------------------------------------------------------------------------
 
-describe("CreateWorkspaceDialog — Hermes provider picker", () => {
-  it("does NOT show hermes provider section for non-hermes templates", async () => {
+describe("CreateWorkspaceDialog — dynamic runtime provider picker", () => {
+  it("does not render the old Hermes-only provider section", async () => {
     await openDialog();
-    await setTemplate("seo-agent");
+    await setRuntime("hermes");
     expect(document.querySelector("[data-testid='hermes-provider-section']")).toBeNull();
   });
 
-  it("shows hermes provider section when runtime is 'hermes'", async () => {
+  it("derives Hermes provider and model options from the /templates runtime row", async () => {
     await openDialog();
     await setRuntime("hermes");
-    await waitFor(() =>
-      expect(document.querySelector("[data-testid='hermes-provider-section']")).toBeTruthy()
-    );
+
+    const providerSelect = document.querySelector("[data-testid='provider-select']") as HTMLSelectElement;
+    await waitFor(() => expect(providerSelect.options.length).toBe(4));
+
+    const providerValues = Array.from(providerSelect.options).map((option) => option.value);
+    expect(providerValues).toEqual(expect.arrayContaining([
+      "platform|",
+      "openai|OPENAI_API_KEY",
+      "anthropic|ANTHROPIC_API_KEY",
+    ]));
+    expect(providerValues).not.toContain("gemini|GEMINI_API_KEY");
   });
 
-  it("shows hermes provider section for the Hermes runtime preset", async () => {
+  it("uses the template-declared default provider/model for Hermes", async () => {
     await openDialog();
     await setRuntime("hermes");
-    await waitFor(() =>
-      expect(document.querySelector("[data-testid='hermes-provider-section']")).toBeTruthy()
-    );
+
+    await waitFor(() => {
+      const providerSelect = document.querySelector("[data-testid='provider-select']") as HTMLSelectElement;
+      expect(providerSelect.value).toBe("platform|");
+    });
+    const modelSelect = document.querySelector("[data-testid='model-select']") as HTMLSelectElement;
+    expect(modelSelect.value).toBe("moonshot/kimi-k2.6");
   });
 
-  it("hermes provider dropdown defaults to 'anthropic'", async () => {
+  it("prompts for the provider credential required by the selected Hermes model", async () => {
     await openDialog();
     await setRuntime("hermes");
-    await waitFor(() =>
-      expect(document.querySelector("[data-testid='hermes-provider-section']")).toBeTruthy()
-    );
-    const providerSelect = document.getElementById("hermes-provider-select") as HTMLSelectElement;
-    expect(providerSelect).toBeTruthy();
-    expect(providerSelect.value).toBe("anthropic");
-  });
 
-  it("hermes provider dropdown lists all 15 providers", async () => {
-    await openDialog();
-    await setRuntime("hermes");
-    await waitFor(() =>
-      expect(document.querySelector("[data-testid='hermes-provider-section']")).toBeTruthy()
-    );
-    const providerSelect = document.getElementById("hermes-provider-select") as HTMLSelectElement;
-    expect(providerSelect.options.length).toBe(HERMES_PROVIDERS.length);
-    const ids = Array.from(providerSelect.options).map((o) => o.value);
-    expect(ids).toContain("anthropic");
-    expect(ids).toContain("openai");
-    expect(ids).toContain("gemini");
-    expect(ids).toContain("deepseek");
-    expect(ids).toContain("hermes");
-  });
-
-  // Pins the dynamic-providers behavior: when the matched template's
-  // /templates row declares `providers`, the dropdown filters to that
-  // subset instead of showing the full HERMES_PROVIDERS catalog. Same
-  // data source ConfigTab uses (PR #2454) — keeps the modal and the
-  // settings tab honest about which providers a template supports.
-  it("hermes provider dropdown filters to template-declared providers when /templates ships them", async () => {
-    // Per-URL mock: /workspaces returns the existing fixture, /templates
-    // returns a hermes row that only allows anthropic + minimax + openai.
-    mockGet.mockImplementation(async (url: string) => {
-      if (url === "/templates") {
-        return [
-          { id: "hermes", name: "Hermes", runtime: "hermes", providers: ["anthropic", "minimax", "openai"] },
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        ] as any;
-      }
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      return SAMPLE_WORKSPACES as any;
+    fireEvent.change(document.querySelector("[data-testid='provider-select']") as HTMLSelectElement, {
+      target: { value: "openai|OPENAI_API_KEY" },
     });
 
-    await openDialog();
-    await setRuntime("hermes");
-    await waitFor(() =>
-      expect(document.querySelector("[data-testid='hermes-provider-section']")).toBeTruthy()
-    );
-    const providerSelect = document.getElementById("hermes-provider-select") as HTMLSelectElement;
-    // Filtered list arrives async after /templates fetch resolves —
-    // keep waiting until the dropdown shrinks below the full catalog.
-    await waitFor(() => expect(providerSelect.options.length).toBe(3));
-    const ids = Array.from(providerSelect.options).map((o) => o.value);
-    expect(ids).toEqual(expect.arrayContaining(["anthropic", "minimax", "openai"]));
-    expect(ids).not.toContain("gemini");
-    expect(ids).not.toContain("deepseek");
-  });
-
-  // Back-compat: a template that hasn't migrated to runtime_config.providers
-  // (older templates, self-hosted setups without /templates server) keeps
-  // showing the full provider catalog. Operators picking from those
-  // templates can't be locked out of providers we know hermes supports.
-  it("hermes provider dropdown falls back to all providers when template declares no providers list", async () => {
-    mockGet.mockImplementation(async (url: string) => {
-      if (url === "/templates") {
-        // No `providers` field — empty/missing → fall back to full catalog.
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        return [{ id: "hermes", name: "Hermes", runtime: "hermes" }] as any;
-      }
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      return SAMPLE_WORKSPACES as any;
-    });
-
-    await openDialog();
-    await setRuntime("hermes");
-    await waitFor(() =>
-      expect(document.querySelector("[data-testid='hermes-provider-section']")).toBeTruthy()
-    );
-    const providerSelect = document.getElementById("hermes-provider-select") as HTMLSelectElement;
-    expect(providerSelect.options.length).toBe(HERMES_PROVIDERS.length);
-  });
-
-  // Defensive: a template's declared list with NO matches against our
-  // static catalog (e.g. a brand-new provider id we don't have label/
-  // envVar metadata for yet) must not render an empty <select> — the
-  // operator can't pick a provider, the form locks. Component falls
-  // back to the full catalog so the user can still proceed.
-  it("hermes provider dropdown falls back to all providers when template declares only unknown providers", async () => {
-    mockGet.mockImplementation(async (url: string) => {
-      if (url === "/templates") {
-        return [
-          { id: "hermes", name: "Hermes", runtime: "hermes", providers: ["totally-new-provider-2030"] },
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        ] as any;
-      }
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      return SAMPLE_WORKSPACES as any;
-    });
-
-    await openDialog();
-    await setRuntime("hermes");
-    await waitFor(() =>
-      expect(document.querySelector("[data-testid='hermes-provider-section']")).toBeTruthy()
-    );
-    const providerSelect = document.getElementById("hermes-provider-select") as HTMLSelectElement;
-    // Stays at full catalog length — no flapping to 0 then back.
-    expect(providerSelect.options.length).toBe(HERMES_PROVIDERS.length);
-  });
-
-  it("hermes API key field is a password input (masked)", async () => {
-    await openDialog();
-    await setRuntime("hermes");
-    await waitFor(() =>
-      expect(document.querySelector("[data-testid='hermes-provider-section']")).toBeTruthy()
-    );
-    const keyInput = document.getElementById("hermes-api-key-input") as HTMLInputElement;
+    const keyInput = document.getElementById("llm-secret-input") as HTMLInputElement;
     expect(keyInput).toBeTruthy();
     expect(keyInput.type).toBe("password");
   });
 
-  it("shows an error if hermes template is set but API key is empty on submit", async () => {
+  it("shows an error if the selected runtime provider requires a credential", async () => {
     await openDialog();
     fireEvent.change(screen.getByPlaceholderText("e.g. SEO Agent"), {
       target: { value: "Hermes Agent" },
     });
     await setRuntime("hermes");
-    await waitFor(() =>
-      expect(document.querySelector("[data-testid='hermes-provider-section']")).toBeTruthy()
-    );
+    fireEvent.change(document.querySelector("[data-testid='provider-select']") as HTMLSelectElement, {
+      target: { value: "openai|OPENAI_API_KEY" },
+    });
 
-    // Submit without API key
     const createBtn = screen.getAllByRole("button").find((b) => b.textContent === "Create");
     fireEvent.click(createBtn!);
 
     await waitFor(() => {
       const alert = screen.getByRole("alert");
-      expect(alert.textContent).toContain("API key");
+      expect(alert.textContent).toContain("Provider credential");
     });
     expect(mockPost).not.toHaveBeenCalled();
   });
 
-  it("includes secrets in POST body with correct env var for selected provider", async () => {
-    await openDialog();
-    fireEvent.change(screen.getByPlaceholderText("e.g. SEO Agent"), {
-      target: { value: "Hermes Agent" },
-    });
-    await setRuntime("hermes");
-    await waitFor(() =>
-      expect(document.querySelector("[data-testid='hermes-provider-section']")).toBeTruthy()
-    );
-
-    // Fill in the API key
-    const keyInput = document.getElementById("hermes-api-key-input") as HTMLInputElement;
-    fireEvent.change(keyInput, { target: { value: "sk-test-anthropic-key" } });
-
-    const createBtn = screen.getAllByRole("button").find((b) => b.textContent === "Create");
-    fireEvent.click(createBtn!);
-
-    await waitFor(() => expect(mockPost).toHaveBeenCalled());
-    const body = mockPost.mock.calls[0][1] as Record<string, unknown>;
-    expect(body.secrets).toEqual({ ANTHROPIC_API_KEY: "sk-test-anthropic-key" });
-    expect(body.runtime).toBe("hermes");
-    expect(body.template).toBeUndefined();
-  });
-
-  it("uses the correct env var when a non-default provider is selected", async () => {
+  it("includes runtime-derived provider/model/secrets in POST body", async () => {
     await openDialog();
     fireEvent.change(screen.getByPlaceholderText("e.g. SEO Agent"), {
       target: { value: "Hermes OpenAI" },
     });
     await setRuntime("hermes");
-    await waitFor(() =>
-      expect(document.querySelector("[data-testid='hermes-provider-section']")).toBeTruthy()
-    );
-
-    // Switch to openai
-    const providerSelect = document.getElementById("hermes-provider-select") as HTMLSelectElement;
-    fireEvent.change(providerSelect, { target: { value: "openai" } });
-
-    const keyInput = document.getElementById("hermes-api-key-input") as HTMLInputElement;
-    fireEvent.change(keyInput, { target: { value: "sk-openai-test" } });
+    fireEvent.change(document.querySelector("[data-testid='provider-select']") as HTMLSelectElement, {
+      target: { value: "openai|OPENAI_API_KEY" },
+    });
+    fireEvent.change(document.getElementById("llm-secret-input") as HTMLInputElement, {
+      target: { value: "sk-openai-test" },
+    });
 
     const createBtn = screen.getAllByRole("button").find((b) => b.textContent === "Create");
     fireEvent.click(createBtn!);
 
     await waitFor(() => expect(mockPost).toHaveBeenCalled());
     const body = mockPost.mock.calls[0][1] as Record<string, unknown>;
+    expect(body.runtime).toBe("hermes");
+    expect(body.template).toBeUndefined();
+    expect(body.model).toBe("openai/gpt-4o");
+    expect(body.llm_provider).toBe("openai");
     expect(body.secrets).toEqual({ OPENAI_API_KEY: "sk-openai-test" });
   });
 
-  it("does NOT include secrets field when template is not hermes", async () => {
+  it("does NOT include secrets field when provider is platform-managed", async () => {
     await openDialog();
     fireEvent.change(screen.getByPlaceholderText("e.g. SEO Agent"), {
       target: { value: "Normal Agent" },
@@ -529,20 +450,6 @@ describe("CreateWorkspaceDialog — Hermes provider picker", () => {
     await waitFor(() => expect(mockPost).toHaveBeenCalled());
     const body = mockPost.mock.calls[0][1] as Record<string, unknown>;
     expect(body.secrets).toBeUndefined();
-  });
-
-  it("hides hermes section and resets state when template is cleared", async () => {
-    await openDialog();
-    await setRuntime("hermes");
-    await waitFor(() =>
-      expect(document.querySelector("[data-testid='hermes-provider-section']")).toBeTruthy()
-    );
-
-    // Switch back to a non-Hermes runtime.
-    await setRuntime("claude-code");
-    await waitFor(() =>
-      expect(document.querySelector("[data-testid='hermes-provider-section']")).toBeNull()
-    );
   });
 });
 

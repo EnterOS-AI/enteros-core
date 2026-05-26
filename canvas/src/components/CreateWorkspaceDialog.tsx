@@ -34,22 +34,6 @@ interface TemplateSpec {
   providers?: string[];
 }
 
-interface HermesProvider {
-  id: string;
-  label: string;
-  envVar: string;
-  defaultModel: string;
-  models: string[];
-}
-
-const DEFAULT_LLM_MODELS: SelectorModel[] = [
-  { id: "moonshot/kimi-k2.6", name: "Kimi K2.6", provider: "platform", required_env: [] },
-  { id: "MiniMax-M2.7", name: "MiniMax M2.7", required_env: ["MINIMAX_API_KEY"] },
-  { id: "kimi-k2-turbo-preview", name: "Kimi K2 Turbo Preview", required_env: ["KIMI_API_KEY"] },
-  { id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6", required_env: ["ANTHROPIC_API_KEY"] },
-  { id: "sonnet", name: "Claude Sonnet", required_env: ["CLAUDE_CODE_OAUTH_TOKEN"] },
-];
-const DEFAULT_PLATFORM_MODEL = DEFAULT_LLM_MODELS[0];
 const DEFAULT_RUNTIME = "claude-code";
 const RUNTIME_OPTIONS = [
   { value: "claude-code", label: "Claude Code" },
@@ -62,31 +46,6 @@ const DEFAULT_HEADLESS_INSTANCE_TYPE = "t3.medium";
 const DEFAULT_HEADLESS_ROOT_GB = 30;
 const DEFAULT_DISPLAY_INSTANCE_TYPE = "t3.xlarge";
 const DEFAULT_DISPLAY_ROOT_GB = 80;
-
-// All providers supported by Hermes runtime via providers.resolve_provider().
-// `defaultModel` is the slug injected into the workspace provision request
-// when the user picks this provider — template-hermes's derive-provider.sh
-// maps the prefix back to the provider name at install time, so this is
-// the canonical handshake. `models` are additional suggestions surfaced in
-// the datalist so the user can pick a different size without typing the
-// whole slug.
-export const HERMES_PROVIDERS: HermesProvider[] = [
-  { id: "anthropic",  label: "Anthropic (Claude)",    envVar: "ANTHROPIC_API_KEY",  defaultModel: "anthropic/claude-sonnet-4-5",   models: ["anthropic/claude-opus-4-5", "anthropic/claude-sonnet-4-5", "anthropic/claude-haiku-4-5"] },
-  { id: "openai",     label: "OpenAI",                envVar: "OPENAI_API_KEY",     defaultModel: "openai/gpt-4o",                 models: ["openai/gpt-4o", "openai/gpt-4o-mini", "openai/o3-mini"] },
-  { id: "openrouter", label: "OpenRouter",            envVar: "OPENROUTER_API_KEY", defaultModel: "openrouter/auto",               models: ["openrouter/auto", "openrouter/anthropic/claude-sonnet-4", "openrouter/meta-llama/llama-3.3-70b"] },
-  { id: "xai",        label: "xAI (Grok)",            envVar: "XAI_API_KEY",        defaultModel: "xai/grok-4",                    models: ["xai/grok-4", "xai/grok-4-mini"] },
-  { id: "gemini",     label: "Google Gemini",         envVar: "GEMINI_API_KEY",     defaultModel: "gemini/gemini-2.5-pro",         models: ["gemini/gemini-2.5-pro", "gemini/gemini-2.5-flash"] },
-  { id: "qwen",       label: "Qwen (Alibaba)",        envVar: "QWEN_API_KEY",       defaultModel: "alibaba/qwen3-max",             models: ["alibaba/qwen3-max", "alibaba/qwen3-coder"] },
-  { id: "glm",        label: "GLM (Zhipu AI)",        envVar: "GLM_API_KEY",        defaultModel: "zai/glm-4.6",                   models: ["zai/glm-4.6", "zai/glm-4.5-air"] },
-  { id: "kimi",       label: "Kimi (Moonshot)",       envVar: "KIMI_API_KEY",       defaultModel: "kimi-coding/kimi-k2",           models: ["kimi-coding/kimi-k2", "kimi-coding/kimi-k1.5"] },
-  { id: "minimax",    label: "MiniMax",               envVar: "MINIMAX_API_KEY",    defaultModel: "minimax/MiniMax-M2.7",          models: ["minimax/MiniMax-M2.7", "minimax/MiniMax-M2.7-highspeed", "minimax/MiniMax-M1"] },
-  { id: "deepseek",   label: "DeepSeek",              envVar: "DEEPSEEK_API_KEY",   defaultModel: "deepseek/deepseek-chat",        models: ["deepseek/deepseek-chat", "deepseek/deepseek-reasoner"] },
-  { id: "groq",       label: "Groq",                  envVar: "GROQ_API_KEY",       defaultModel: "openrouter/groq/llama-3.3-70b", models: ["openrouter/groq/llama-3.3-70b"] },
-  { id: "mistral",    label: "Mistral",               envVar: "MISTRAL_API_KEY",    defaultModel: "openrouter/mistralai/mistral-large", models: ["openrouter/mistralai/mistral-large"] },
-  { id: "together",   label: "Together AI",           envVar: "TOGETHER_API_KEY",   defaultModel: "openrouter/meta-llama/llama-3.3-70b", models: ["openrouter/meta-llama/llama-3.3-70b"] },
-  { id: "fireworks",  label: "Fireworks AI",          envVar: "FIREWORKS_API_KEY",  defaultModel: "openrouter/meta-llama/llama-3.3-70b", models: ["openrouter/meta-llama/llama-3.3-70b"] },
-  { id: "hermes",     label: "Hermes / Nous (legacy)", envVar: "HERMES_API_KEY",    defaultModel: "nousresearch/Hermes-3-Llama-3.1-405B", models: ["nousresearch/Hermes-3-Llama-3.1-405B", "nousresearch/Hermes-4-14B"] },
-];
 
 export function CreateWorkspaceButton() {
   const [open, setOpen] = useState(false);
@@ -107,32 +66,20 @@ export function CreateWorkspaceButton() {
   // filter below. Same data source ConfigTab uses (PR #2454). When the
   // selected template declares `runtime_config.providers` in its
   // config.yaml, the modal surfaces only those providers in the
-  // <select>. Empty/missing list falls back to the full HERMES_PROVIDERS
-  // catalog so older templates without the field keep working.
+  // <select>. Provider/model options are derived from template models.
   const [templateSpecs, setTemplateSpecs] = useState<TemplateSpec[]>([]);
   // External-runtime path: skip docker provision, mint a workspace_auth_token,
   // and surface the connection snippet in a modal after create. When
-  // isExternal is true the template / model / hermes-provider fields are
-  // hidden (they're meaningless for BYO-compute agents).
+  // isExternal is true the template and model fields are hidden (they're
+  // meaningless for BYO-compute agents).
   const [isExternal, setIsExternal] = useState(false);
   const [externalRuntime, setExternalRuntime] = useState("external");
   const [externalConnection, setExternalConnection] =
     useState<ExternalConnectionInfo | null>(null);
 
-  // Hermes-specific state
-  const [hermesProvider, setHermesProvider] = useState("anthropic");
-  const [hermesApiKey, setHermesApiKey] = useState("");
-  // Model slug is sent to CP as `model` and plumbed to the workspace EC2
-  // as HERMES_DEFAULT_MODEL env var. template-hermes's derive-provider.sh
-  // reads the prefix (`minimax/…`, `anthropic/…`) to set
-  // HERMES_INFERENCE_PROVIDER at install time. Missing model → provider
-  // falls back to "auto" and hermes picks its compiled-in default
-  // (Anthropic), which 401s if the user's key is for a different
-  // provider. Hence: require model when template=hermes.
-  const [hermesModel, setHermesModel] = useState("");
   const [llmSelection, setLLMSelection] = useState<SelectorValue>({
-    providerId: "platform|",
-    model: "moonshot/kimi-k2.6",
+    providerId: "",
+    model: "",
     envVars: [],
   });
   const [llmSecret, setLLMSecret] = useState("");
@@ -194,10 +141,7 @@ export function CreateWorkspaceButton() {
   const handleRuntimeChange = useCallback((nextRuntime: string) => {
     setRuntime(nextRuntime);
     setTemplate("");
-    setHermesProvider("anthropic");
-    setHermesApiKey("");
-    setHermesModel("");
-    setLLMSelection({ providerId: "platform|", model: DEFAULT_PLATFORM_MODEL.id, envVars: [] });
+    setLLMSelection({ providerId: "", model: "", envVars: [] });
     setLLMSecret("");
   }, []);
 
@@ -209,9 +153,12 @@ export function CreateWorkspaceButton() {
     return templateSpecs.find((s) => s.id === template) ?? null;
   }, [template, templateSpecs]);
   const selectedRuntimeTemplateSpec = useMemo<TemplateSpec | null>(() => (
-    templateSpecs.find((s) => s.id === runtime && BASE_RUNTIME_TEMPLATE_IDS.has(s.id)) ?? null
+    templateSpecs.find((s) => {
+      if (!BASE_RUNTIME_TEMPLATE_IDS.has(s.id)) return false;
+      const specRuntime = (s.runtime ?? s.id).trim().toLowerCase();
+      return s.id === runtime || specRuntime === runtime;
+    }) ?? null
   ), [runtime, templateSpecs]);
-  const isHermes = runtime === "hermes";
   const visibleTemplateSpecs = useMemo(
     () => templateSpecs.filter((spec) => {
       if (BASE_RUNTIME_TEMPLATE_IDS.has(spec.id)) return false;
@@ -222,28 +169,11 @@ export function CreateWorkspaceButton() {
   );
   const llmModels = useMemo(
     () => {
-      if (!selectedTemplateSpec?.models?.length) return DEFAULT_LLM_MODELS;
-      if (isHermes) {
-        return selectedTemplateSpec.models;
-      }
-      if (selectedTemplateSpec.models.some((model) => model.provider === "platform")) {
-        return selectedTemplateSpec.models;
-      }
-      const templateDefault = selectedTemplateSpec.model?.trim();
-      const defaultModelSpec = templateDefault
-        ? selectedTemplateSpec.models.find((model) => model.id === templateDefault)
-        : undefined;
-      return [
-        {
-          id: templateDefault || DEFAULT_PLATFORM_MODEL.id,
-          name: defaultModelSpec?.name ?? DEFAULT_PLATFORM_MODEL.name,
-          provider: "platform",
-          required_env: [],
-        },
-        ...selectedTemplateSpec.models,
-      ];
+      const sourceSpec = selectedTemplateSpec ?? selectedRuntimeTemplateSpec;
+      if (!sourceSpec?.models?.length) return [];
+      return sourceSpec.models;
     },
-    [isHermes, selectedTemplateSpec],
+    [selectedRuntimeTemplateSpec, selectedTemplateSpec],
   );
   const llmCatalog = useMemo(() => buildProviderCatalog(llmModels), [llmModels]);
   const selectedLLMProvider = useMemo(
@@ -251,67 +181,22 @@ export function CreateWorkspaceButton() {
     [llmCatalog, llmSelection.providerId],
   );
 
-  // Filter HERMES_PROVIDERS by what the template declares it supports.
-  // Empty/missing declared list → fall back to the full catalog so
-  // templates that haven't migrated to the explicit `providers:` field
-  // (and self-hosted setups without /templates) keep working unchanged.
-  const availableProviders = useMemo<HermesProvider[]>(() => {
-    const declared = selectedTemplateSpec?.providers ?? selectedRuntimeTemplateSpec?.providers;
-    if (!declared || declared.length === 0) return HERMES_PROVIDERS;
-    const allowed = new Set(declared.map((p) => p.toLowerCase()));
-    const filtered = HERMES_PROVIDERS.filter((p) => allowed.has(p.id.toLowerCase()));
-    // Defensive: if the template's declared list doesn't match anything
-    // in our static catalog (e.g. brand-new provider id we don't have
-    // metadata for yet), fall back to the full list rather than render
-    // an empty <select>. Better to over-show than to lock the user out.
-    return filtered.length > 0 ? filtered : HERMES_PROVIDERS;
-  }, [selectedRuntimeTemplateSpec, selectedTemplateSpec]);
-
-  // If the currently-selected provider is filtered out by a template
-  // change, snap back to the first available. Without this, the
-  // hermesProvider state could refer to a provider not in the dropdown
-  // — confusing UI + the API key field's envVar would be wrong.
   useEffect(() => {
-    if (!isHermes) return;
-    if (availableProviders.length === 0) return;
-    if (!availableProviders.some((p) => p.id === hermesProvider)) {
-      setHermesProvider(availableProviders[0].id);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [availableProviders, isHermes]);
-
-  useEffect(() => {
-    if (isHermes || llmCatalog.length === 0) return;
-    const templateDefault = selectedTemplateSpec?.model?.trim();
-    const matched = templateDefault ? findProviderForModel(llmCatalog, templateDefault) : null;
-    const next = matched ?? llmCatalog[0];
+    if (llmCatalog.length === 0) return;
+    const sourceDefault = (selectedTemplateSpec ?? selectedRuntimeTemplateSpec)?.model?.trim();
+    const platformProvider = llmCatalog.find((p) => p.vendor === "platform");
+    const matched = sourceDefault ? findProviderForModel(llmCatalog, sourceDefault) : null;
+    const next = platformProvider ?? matched ?? llmCatalog[0];
+    const defaultModel = next.models.find((model) => model.id === sourceDefault)?.id
+      ?? next.models[0]?.id
+      ?? "";
     setLLMSelection({
       providerId: next.id,
-      model: matched && templateDefault
-        ? templateDefault
-        : next.wildcard
-          ? ""
-          : next.models[0]?.id ?? "",
+      model: next.wildcard ? "" : defaultModel,
       envVars: next.envVars,
     });
     setLLMSecret("");
-  }, [isHermes, llmCatalog, selectedTemplateSpec?.model]);
-
-  // Auto-fill hermesModel with the provider's defaultModel whenever the
-  // provider changes, but only if the user hasn't already typed their own
-  // slug. Prevents the empty-model → "auto" → Anthropic-default 401 trap.
-  useEffect(() => {
-    if (!isHermes) return;
-    const p = HERMES_PROVIDERS.find((x) => x.id === hermesProvider);
-    if (!p) return;
-    // Replace model only if current value matches another provider's
-    // default (user hasn't customized it) OR is empty.
-    const isUntouched =
-      hermesModel === "" ||
-      HERMES_PROVIDERS.some((x) => x.defaultModel === hermesModel);
-    if (isUntouched) setHermesModel(p.defaultModel);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hermesProvider, isHermes]);
+  }, [llmCatalog, selectedRuntimeTemplateSpec, selectedTemplateSpec]);
 
   // Reset form and load workspaces whenever dialog opens
   useEffect(() => {
@@ -328,11 +213,8 @@ export function CreateWorkspaceButton() {
     setDisplayInstanceType(DEFAULT_DISPLAY_INSTANCE_TYPE);
     setDisplayRootGB(String(DEFAULT_DISPLAY_ROOT_GB));
     setDisplayResolution("1920x1080");
-    setHermesProvider("anthropic");
     setExternalRuntime("external");
-    setHermesApiKey("");
-    setHermesModel("");
-    setLLMSelection({ providerId: "platform|", model: "moonshot/kimi-k2.6", envVars: [] });
+    setLLMSelection({ providerId: "", model: "", envVars: [] });
     setLLMSecret("");
     api
       .get<WorkspaceOption[]>("/workspaces")
@@ -341,7 +223,7 @@ export function CreateWorkspaceButton() {
     api
       .get<TemplateSpec[]>("/templates")
       .then((rows) => setTemplateSpecs(Array.isArray(rows) ? rows : []))
-      .catch(() => { /* keep empty — HERMES_PROVIDERS fallback below */ });
+      .catch(() => { /* keep empty; create stays blocked until the catalog loads */ });
     // defaultTier is stable for the session (derived from window.location),
     // safe to omit from deps.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -352,29 +234,18 @@ export function CreateWorkspaceButton() {
       setError("Name is required");
       return;
     }
-    if (isHermes && !hermesApiKey.trim()) {
-      setError("API key is required for Hermes workspaces");
-      return;
-    }
-    if (isHermes && !hermesModel.trim()) {
-      setError("Model is required for Hermes workspaces — provider routing depends on the model slug prefix");
-      return;
-    }
-    if (!isExternal && !isHermes && !llmSelection.model.trim()) {
+    if (!isExternal && !llmSelection.model.trim()) {
       setError("Model is required");
       return;
     }
-    if (!isExternal && !isHermes && selectedLLMProvider?.envVars.length && !llmSecret.trim()) {
+    if (!isExternal && selectedLLMProvider?.envVars.length && !llmSecret.trim()) {
       setError("Provider credential is required");
       return;
     }
     setCreating(true);
     setError(null);
 
-    const provider = isHermes
-      ? HERMES_PROVIDERS.find((p) => p.id === hermesProvider)
-      : undefined;
-    const nativeProvider = !isHermes ? selectedLLMProvider : undefined;
+    const nativeProvider = selectedLLMProvider;
 
     try {
       const parsedBudget = budgetLimit.trim()
@@ -398,7 +269,7 @@ export function CreateWorkspaceButton() {
         tier,
         parent_id: parentId || undefined,
         budget_limit: parsedBudget,
-        ...(!isExternal && !isHermes && nativeProvider
+        ...(!isExternal && nativeProvider
           ? {
               model: llmSelection.model.trim(),
               llm_provider: nativeProvider.vendor,
@@ -432,12 +303,6 @@ export function CreateWorkspaceButton() {
         // no container provisioning, token minted, connection payload
         // returned in the response for the modal below.
         ...(isExternal ? { runtime: externalRuntime } : { runtime }),
-        ...(!isExternal && isHermes && provider
-          ? {
-              secrets: { [provider.envVar]: hermesApiKey.trim() },
-              model: hermesModel.trim(),
-            }
-          : {}),
       });
       // External path: keep the create dialog open just long enough to
       // hand control to the connect modal, then close. The connect
@@ -588,7 +453,7 @@ export function CreateWorkspaceButton() {
               </div>
             )}
 
-            {!isExternal && !isHermes && selectedLLMProvider && (
+            {!isExternal && selectedLLMProvider && (
               <div className="rounded-lg border border-line/50 bg-surface-card/40 p-3 space-y-3">
                 <div className="text-[11px] font-medium text-ink-mid">
                   LLM
@@ -743,100 +608,6 @@ export function CreateWorkspaceButton() {
               </select>
             </div>
           </div>
-
-          {/* Hermes provider configuration — shown only for the Hermes runtime. */}
-          {isHermes && (
-            <div
-              className="mt-4 rounded-xl border border-violet-700/40 bg-violet-950/20 p-4 space-y-3"
-              data-testid="hermes-provider-section"
-            >
-              <p className="text-[11px] font-semibold text-violet-400 uppercase tracking-wide">
-                Hermes Provider
-              </p>
-              <p className="text-[11px] text-ink-mid -mt-1">
-                Choose the AI provider and paste your API key. The key is
-                stored as an encrypted workspace secret.
-              </p>
-
-              <div>
-                <label
-                  htmlFor="hermes-provider-select"
-                  className="text-[11px] text-ink-mid block mb-1"
-                >
-                  Provider
-                </label>
-                <select
-                  id="hermes-provider-select"
-                  value={hermesProvider}
-                  onChange={(e) => setHermesProvider(e.target.value)}
-                  aria-label="Hermes provider"
-                  className="w-full bg-surface-card/60 border border-line/50 rounded-lg px-3 py-2 text-sm text-ink focus:outline-none focus:border-violet-500/60 focus:ring-1 focus:ring-violet-500/20 transition-colors"
-                >
-                  {availableProviders.map((p) => (
-                    <option key={p.id} value={p.id}>
-                      {p.label}
-                    </option>
-                  ))}
-                </select>
-              </div>
-
-              <div>
-                <label
-                  htmlFor="hermes-api-key-input"
-                  className="text-[11px] text-ink-mid block mb-1"
-                >
-                  API Key{" "}
-                  <span aria-hidden="true" className="text-bad">
-                    *
-                  </span>
-                  <span className="sr-only"> (required)</span>
-                </label>
-                <input
-                  id="hermes-api-key-input"
-                  type="password"
-                  value={hermesApiKey}
-                  onChange={(e) => setHermesApiKey(e.target.value)}
-                  placeholder="sk-…"
-                  aria-label="Hermes API key"
-                  autoComplete="off"
-                  className="w-full bg-surface-card/60 border border-line/50 rounded-lg px-3 py-2 text-sm text-ink placeholder-ink-soft focus:outline-none focus:border-violet-500/60 focus:ring-1 focus:ring-violet-500/20 transition-colors font-mono"
-                />
-              </div>
-
-              <div>
-                <label
-                  htmlFor="hermes-model-input"
-                  className="text-[11px] text-ink-mid block mb-1"
-                >
-                  Model{" "}
-                  <span aria-hidden="true" className="text-bad">
-                    *
-                  </span>
-                  <span className="sr-only"> (required)</span>
-                </label>
-                <input
-                  id="hermes-model-input"
-                  type="text"
-                  value={hermesModel}
-                  onChange={(e) => setHermesModel(e.target.value)}
-                  placeholder="e.g. minimax/MiniMax-M2.7"
-                  aria-label="Hermes model slug"
-                  autoComplete="off"
-                  spellCheck={false}
-                  list="hermes-model-suggestions"
-                  className="w-full bg-surface-card/60 border border-line/50 rounded-lg px-3 py-2 text-sm text-ink placeholder-ink-soft focus:outline-none focus:border-violet-500/60 focus:ring-1 focus:ring-violet-500/20 transition-colors font-mono"
-                />
-                <datalist id="hermes-model-suggestions">
-                  {HERMES_PROVIDERS.find((p) => p.id === hermesProvider)?.models.map(
-                    (m) => <option key={m} value={m} />,
-                  )}
-                </datalist>
-                <p className="text-[10px] text-ink-mid mt-1">
-                  Slug determines which provider hermes routes to at install time.
-                </p>
-              </div>
-            </div>
-          )}
 
           {error && (
             <div
