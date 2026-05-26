@@ -398,7 +398,10 @@ func (p *CPProvisioner) Stop(ctx context.Context, workspaceID string) error {
 		return ErrNoBackend
 	}
 	url := fmt.Sprintf("%s/cp/workspaces/%s?instance_id=%s", p.baseURL, workspaceID, instanceID)
-	req, _ := http.NewRequestWithContext(ctx, "DELETE", url, nil)
+	req, err := http.NewRequestWithContext(ctx, "DELETE", url, nil)
+	if err != nil {
+		return fmt.Errorf("cp provisioner: stop: build request: %w", err)
+	}
 	p.provisionAuthHeaders(req)
 	resp, err := p.httpClient.Do(req)
 	if err != nil {
@@ -513,7 +516,10 @@ func (p *CPProvisioner) IsRunning(ctx context.Context, workspaceID string) (bool
 		return false, ErrNoBackend
 	}
 	url := fmt.Sprintf("%s/cp/workspaces/%s/status?instance_id=%s", p.baseURL, workspaceID, instanceID)
-	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return true, fmt.Errorf("cp provisioner: status: build request: %w", err)
+	}
 	p.provisionAuthHeaders(req)
 	resp, err := p.httpClient.Do(req)
 	if err != nil {
@@ -547,7 +553,10 @@ func (p *CPProvisioner) IsRunning(ctx context.Context, workspaceID string) (bool
 // to render to the user.
 func (p *CPProvisioner) GetConsoleOutput(ctx context.Context, workspaceID string) (string, error) {
 	url := fmt.Sprintf("%s/cp/admin/workspaces/%s/console", p.baseURL, workspaceID)
-	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return "", fmt.Errorf("cp provisioner: console: build request: %w", err)
+	}
 	p.adminAuthHeaders(req)
 	resp, err := p.httpClient.Do(req)
 	if err != nil {

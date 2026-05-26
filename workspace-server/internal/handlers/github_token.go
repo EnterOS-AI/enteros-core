@@ -155,7 +155,10 @@ func generateAppInstallationToken() (string, time.Time, error) {
 	if err != nil {
 		return "", time.Time{}, fmt.Errorf("sign JWT: %w", err)
 	}
-	req, _ := http.NewRequest("POST", fmt.Sprintf("https://api.github.com/app/installations/%d/access_tokens", installID), nil)
+	req, err := http.NewRequest("POST", fmt.Sprintf("https://api.github.com/app/installations/%d/access_tokens", installID), nil)
+	if err != nil {
+		return "", time.Time{}, fmt.Errorf("build request: %w", err)
+	}
 	req.Header.Set("Authorization", "Bearer "+signed)
 	req.Header.Set("Accept", "application/vnd.github+json")
 	client := &http.Client{Timeout: 30 * time.Second}
