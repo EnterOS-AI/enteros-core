@@ -246,7 +246,13 @@ func (h *ChannelHandler) Update(c *gin.Context) {
 		return
 	}
 
-	if n, _ := result.RowsAffected(); n == 0 {
+	n, err := result.RowsAffected()
+	if err != nil {
+		log.Printf("Channel update RowsAffected error channel=%s workspace=%s: %v", channelID, workspaceID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "update failed"})
+		return
+	}
+	if n == 0 {
 		c.JSON(http.StatusNotFound, gin.H{"error": "channel not found"})
 		return
 	}
@@ -271,7 +277,13 @@ func (h *ChannelHandler) Delete(c *gin.Context) {
 		return
 	}
 
-	if n, _ := result.RowsAffected(); n == 0 {
+	n, err := result.RowsAffected()
+	if err != nil {
+		log.Printf("Channel delete RowsAffected error channel=%s workspace=%s: %v", channelID, workspaceID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "delete failed"})
+		return
+	}
+	if n == 0 {
 		c.JSON(http.StatusNotFound, gin.H{"error": "channel not found"})
 		return
 	}
