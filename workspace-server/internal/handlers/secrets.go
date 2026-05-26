@@ -19,8 +19,28 @@ import (
 var uuidRegex = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
 var platformManagedDirectLLMBypassKeys = map[string]struct{}{
-	"HERMES_CUSTOM_API_KEY":  {},
-	"HERMES_CUSTOM_BASE_URL": {},
+	"AI_GATEWAY_API_KEY":      {},
+	"ANTHROPIC_API_KEY":       {},
+	"ANTHROPIC_AUTH_TOKEN":    {},
+	"ARCEEAI_API_KEY":         {},
+	"CLAUDE_CODE_OAUTH_TOKEN": {},
+	"DASHSCOPE_API_KEY":       {},
+	"DEEPSEEK_API_KEY":        {},
+	"GEMINI_API_KEY":          {},
+	"GLM_API_KEY":             {},
+	"HERMES_CUSTOM_API_KEY":   {},
+	"HERMES_CUSTOM_BASE_URL":  {},
+	"HF_TOKEN":                {},
+	"KIMI_API_KEY":            {},
+	"KIMI_CN_API_KEY":         {},
+	"MINIMAX_API_KEY":         {},
+	"MINIMAX_CN_API_KEY":      {},
+	"NOUS_API_KEY":            {},
+	"OPENAI_API_KEY":          {},
+	"OPENAI_BASE_URL":         {},
+	"OPENROUTER_API_KEY":      {},
+	"XAI_API_KEY":             {},
+	"ZAI_API_KEY":             {},
 }
 
 func isPlatformManagedDirectLLMBypassKey(key string) bool {

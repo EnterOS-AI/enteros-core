@@ -14,9 +14,9 @@ import (
 
 	"errors"
 
-	"github.com/DATA-DOG/go-sqlmock"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/memory/contract"
+	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/gin-gonic/gin"
 )
 
@@ -196,7 +196,7 @@ func TestMCPHandler_DelegateTask_RoutesThroughPlatformA2AProxy(t *testing.T) {
 
 	expectCanCommunicateSiblings(mock, callerID, targetID, parentID)
 	mock.ExpectExec(`(?s)INSERT INTO activity_logs.*'delegation'.*'delegate'`).
-		WithArgs(callerID, callerID, targetID, "Delegating to "+targetID, sqlmock.AnyArg()).
+		WithArgs(callerID, callerID, targetID, "Delegating to "+targetID, sqlmock.AnyArg(), "pending").
 		WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectExec(`UPDATE activity_logs`).
 		WithArgs("dispatched", "", callerID, sqlmock.AnyArg()).
@@ -241,7 +241,7 @@ func TestMCPHandler_DelegateTaskAsync_RoutesThroughPlatformA2AProxy(t *testing.T
 
 	expectCanCommunicateSiblings(mock, callerID, targetID, parentID)
 	mock.ExpectExec(`(?s)INSERT INTO activity_logs.*'delegation'.*'delegate'`).
-		WithArgs(callerID, callerID, targetID, "Delegating to "+targetID, sqlmock.AnyArg()).
+		WithArgs(callerID, callerID, targetID, "Delegating to "+targetID, sqlmock.AnyArg(), "pending").
 		WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectExec(`UPDATE activity_logs`).
 		WithArgs("dispatched", "", callerID, sqlmock.AnyArg()).
