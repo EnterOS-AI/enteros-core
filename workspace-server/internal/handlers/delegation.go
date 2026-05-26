@@ -261,10 +261,12 @@ func lookupIdempotentDelegation(ctx context.Context, c *gin.Context, sourceID, i
 		return false
 	}
 	if existingStatus == "failed" {
-		_, _ = db.DB.ExecContext(ctx, `
+		if _, err := db.DB.ExecContext(ctx, `
 			DELETE FROM activity_logs
 			 WHERE workspace_id = $1 AND idempotency_key = $2 AND status = 'failed'
-		`, sourceID, idempotencyKey)
+		`, sourceID, idempotencyKey); err != nil {
+			log.Printf("delegation: failed to clean up failed idempotency row for %s/%s: %v", sourceID, idempotencyKey, err)
+		}
 		return false
 	}
 	c.JSON(http.StatusOK, gin.H{
