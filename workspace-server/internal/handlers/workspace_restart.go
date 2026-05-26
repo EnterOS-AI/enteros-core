@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"database/sql"
+	"io"
 	"log"
 	"net/http"
 	"runtime/debug"
@@ -283,7 +284,10 @@ func (h *WorkspaceHandler) Restart(c *gin.Context) {
 		Reset         bool   `json:"reset"`          // #12: discard claude-sessions volume before restart
 		RebuildConfig bool   `json:"rebuild_config"` // #239: re-render config volume from org-template source (recovery path when volume was destroyed)
 	}
-	c.ShouldBindJSON(&body)
+	if err := c.ShouldBindJSON(&body); err != nil && err != io.EOF {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid JSON body"})
+		return
+	}
 
 	// Read runtime from container's config.yaml before stopping. Docker-
 	// only: in SaaS mode the workspace runs on a remote EC2 and we can't
@@ -292,8 +296,10 @@ func (h *WorkspaceHandler) Restart(c *gin.Context) {
 	containerRuntime := h.restartRuntimeFromConfig(ctx, id, wsName, dbRuntime, body.ApplyTemplate)
 
 	// Reset to provisioning
-	db.DB.ExecContext(ctx,
-		`UPDATE workspaces SET status = $1, url = '', updated_at = now() WHERE id = $2`, models.StatusProvisioning, id)
+	if _, err := db.DB.ExecContext(ctx,
+		`UPDATE workspaces SET status = $1, url = '', updated_at = now() WHERE id = $2`, models.StatusProvisioning, id); err != nil {
+		log.Printf("Restart: failed to set provisioning status for %s: %v", id, err)
+	}
 	h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceProvisioning), id, map[string]interface{}{
 		"name":    wsName,
 		"tier":    tier,
@@ -383,7 +389,9 @@ func (h *WorkspaceHandler) restartRuntimeFromConfig(ctx context.Context, id, wsN
 				if parsed != "" && parsed != containerRuntime {
 					log.Printf("Restart: runtime changed in config.yaml %q→%q for %s", containerRuntime, parsed, wsName)
 					containerRuntime = parsed
-					db.DB.ExecContext(ctx, `UPDATE workspaces SET runtime = $1 WHERE id = $2`, containerRuntime, id)
+					if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET runtime = $1 WHERE id = $2`, containerRuntime, id); err != nil {
+						log.Printf("Restart: failed to persist runtime %q for %s: %v", containerRuntime, id, err)
+					}
 				}
 				break
 			}
@@ -798,8 +806,10 @@ func (h *WorkspaceHandler) runRestartCycle(workspaceID string) {
 
 	h.stopForRestart(ctx, workspaceID)
 
-	db.DB.ExecContext(ctx,
-		`UPDATE workspaces SET status = $1, url = '', updated_at = now() WHERE id = $2`, models.StatusProvisioning, workspaceID)
+	if _, err := db.DB.ExecContext(ctx,
+		`UPDATE workspaces SET status = $1, url = '', updated_at = now() WHERE id = $2`, models.StatusProvisioning, workspaceID); err != nil {
+		log.Printf("Auto-restart: failed to set provisioning status for %s: %v", workspaceID, err)
+	}
 	h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceProvisioning), workspaceID, map[string]interface{}{
 		"name": wsName, "tier": tier, "runtime": dbRuntime,
 	})
@@ -890,8 +900,10 @@ func (h *WorkspaceHandler) Pause(c *gin.Context) {
 		if err := h.StopWorkspaceAuto(ctx, ws.id); err != nil {
 			log.Printf("Pause: stop %s failed: %v — orphan sweeper will reconcile", ws.id, err)
 		}
-		db.DB.ExecContext(ctx,
-			`UPDATE workspaces SET status = $1, url = '', updated_at = now() WHERE id = $2`, models.StatusPaused, ws.id)
+		if _, err := db.DB.ExecContext(ctx,
+			`UPDATE workspaces SET status = $1, url = '', updated_at = now() WHERE id = $2`, models.StatusPaused, ws.id); err != nil {
+			log.Printf("Pause: failed to set paused status for %s: %v", ws.id, err)
+		}
 		db.ClearWorkspaceKeys(ctx, ws.id)
 		h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspacePaused), ws.id, map[string]interface{}{
 			"name": ws.name,
@@ -963,8 +975,10 @@ func (h *WorkspaceHandler) Resume(c *gin.Context) {
 
 	// Re-provision all
 	for _, ws := range toResume {
-		db.DB.ExecContext(ctx,
-			`UPDATE workspaces SET status = $1, updated_at = now() WHERE id = $2`, models.StatusProvisioning, ws.id)
+		if _, err := db.DB.ExecContext(ctx,
+			`UPDATE workspaces SET status = $1, updated_at = now() WHERE id = $2`, models.StatusProvisioning, ws.id); err != nil {
+			log.Printf("Resume: failed to set provisioning status for %s: %v", ws.id, err)
+		}
 		h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceProvisioning), ws.id, map[string]interface{}{
 			"name": ws.name, "tier": ws.tier, "runtime": ws.runtime,
 		})
