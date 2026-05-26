@@ -1,8 +1,12 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
+
+	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -189,5 +193,117 @@ func TestExtractA2AText_PriorityArtifactsOverMessage(t *testing.T) {
 	want := "from artifacts"
 	if got != want {
 		t.Errorf("artifacts should take priority: got %q, want %q", got, want)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// insertMCPDelegationRow tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+func TestInsertMCPDelegationRow_Success(t *testing.T) {
+	mockDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("failed to create sqlmock: %v", err)
+	}
+	prevDB := db.DB
+	db.DB = mockDB
+	t.Cleanup(func() { db.DB = prevDB; mockDB.Close() })
+
+	mock.ExpectExec(`INSERT INTO activity_logs`).
+		WithArgs("ws-src", "ws-src", "ws-tgt", "Delegating to ws-tgt", sqlmock.AnyArg(), "pending").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	err = insertMCPDelegationRow(context.Background(), mockDB, "ws-src", "ws-tgt", "del-123", "summarise the report")
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations: %v", err)
+	}
+}
+
+func TestInsertMCPDelegationRow_DBError(t *testing.T) {
+	mockDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("failed to create sqlmock: %v", err)
+	}
+	prevDB := db.DB
+	db.DB = mockDB
+	t.Cleanup(func() { db.DB = prevDB; mockDB.Close() })
+
+	mock.ExpectExec(`INSERT INTO activity_logs`).
+		WithArgs("ws-src", "ws-src", "ws-tgt", sqlmock.AnyArg(), sqlmock.AnyArg(), "pending").
+		WillReturnError(context.DeadlineExceeded)
+
+	err = insertMCPDelegationRow(context.Background(), mockDB, "ws-src", "ws-tgt", "del-456", "check the logs")
+	if err == nil {
+		t.Error("expected error, got nil")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations: %v", err)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// updateMCPDelegationStatus tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+func TestUpdateMCPDelegationStatus_Success(t *testing.T) {
+	mockDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("failed to create sqlmock: %v", err)
+	}
+	prevDB := db.DB
+	db.DB = mockDB
+	t.Cleanup(func() { db.DB = prevDB; mockDB.Close() })
+
+	mock.ExpectExec(`UPDATE activity_logs`).
+		WithArgs("completed", "", "ws-src", "del-789").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// Should not panic, should not error
+	updateMCPDelegationStatus(context.Background(), mockDB, "ws-src", "del-789", "completed", "")
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations: %v", err)
+	}
+}
+
+func TestUpdateMCPDelegationStatus_WithErrorDetail(t *testing.T) {
+	mockDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("failed to create sqlmock: %v", err)
+	}
+	prevDB := db.DB
+	db.DB = mockDB
+	t.Cleanup(func() { db.DB = prevDB; mockDB.Close() })
+
+	mock.ExpectExec(`UPDATE activity_logs`).
+		WithArgs("failed", "timeout", "ws-src", "del-000").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	updateMCPDelegationStatus(context.Background(), mockDB, "ws-src", "del-000", "failed", "timeout")
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations: %v", err)
+	}
+}
+
+func TestUpdateMCPDelegationStatus_DBError_LoggedNotReturned(t *testing.T) {
+	mockDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("failed to create sqlmock: %v", err)
+	}
+	prevDB := db.DB
+	db.DB = mockDB
+	t.Cleanup(func() { db.DB = prevDB; mockDB.Close() })
+
+	mock.ExpectExec(`UPDATE activity_logs`).
+		WithArgs("failed", sqlmock.AnyArg(), "ws-src", "del-abc").
+		WillReturnError(context.DeadlineExceeded)
+
+	// Function returns no value — error is logged, not propagated.
+	// Verify it does not panic.
+	updateMCPDelegationStatus(context.Background(), mockDB, "ws-src", "del-abc", "failed", "connection refused")
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations: %v", err)
 	}
 }
