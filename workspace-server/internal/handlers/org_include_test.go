@@ -215,7 +215,7 @@ func TestResolveYAMLIncludes_RealMoleculeDev(t *testing.T) {
 	tmp := t.TempDir()
 	// Clone the canonical standalone org template. No token needed — the
 	// repo is public on the same Gitea instance.
-	res := runCmd("git", "clone", "--depth", "1",
+	res, _, _ := runCmd("git", "clone", "--depth", "1",
 		"https://git.moleculesai.app/molecule-ai/molecule-ai-org-template-molecule-dev.git",
 		tmp)
 	if res != 0 {
@@ -234,17 +234,18 @@ func TestResolveYAMLIncludes_RealMoleculeDev(t *testing.T) {
 	if err := yaml.Unmarshal(expanded, &tmpl); err != nil {
 		t.Fatalf("unmarshal expanded yaml: %v", err)
 	}
-	// Sanity: should have PM + Marketing Lead at top, and PM should have
-	// at least Research Lead, Dev Lead, Documentation Specialist, Triage
-	// Operator as children (the Phase 3 split targets).
-	if len(tmpl.Workspaces) < 2 {
-		t.Fatalf("expected ≥2 top-level workspaces, got %d", len(tmpl.Workspaces))
+	// Sanity: should have PM + Marketing Lead + Dev Lead (via !external) at
+	// top. PM's direct children were slimmed in Phase 3d: Dev Lead and its
+	// subtree moved to molecule-dev-department, so PM now has Research Lead
+	// as its only direct child.
+	if len(tmpl.Workspaces) < 3 {
+		t.Fatalf("expected ≥3 top-level workspaces, got %d", len(tmpl.Workspaces))
 	}
 	names := map[string]bool{}
 	for _, w := range tmpl.Workspaces {
 		names[w.Name] = true
 	}
-	for _, want := range []string{"PM", "Marketing Lead"} {
+	for _, want := range []string{"PM", "Marketing Lead", "Dev Lead"} {
 		if !names[want] {
 			t.Errorf("expected top-level workspace %q, not found", want)
 		}
@@ -256,8 +257,8 @@ func TestResolveYAMLIncludes_RealMoleculeDev(t *testing.T) {
 			break
 		}
 	}
-	if pm == nil || len(pm.Children) < 4 {
-		t.Errorf("PM should have ≥4 children after include resolution, got %d", len(pm.Children))
+	if pm == nil || len(pm.Children) < 1 {
+		t.Errorf("PM should have ≥1 child after include resolution, got %d", len(pm.Children))
 	}
 }
 
