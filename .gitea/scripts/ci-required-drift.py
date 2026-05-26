@@ -385,8 +385,12 @@ def detect_drift(branch: str) -> tuple[list[str], dict]:
     contexts = set(protection.get("status_check_contexts") or [])
 
     # ----- F1: job exists in CI but not under sentinel.needs -----
+    # Post-#1766 contract: the sentinel may deliberately have no `needs:`
+    # and instead poll path-relevant statuses dynamically. In that case
+    # F1 is a false positive — skip it. F1b (typos in existing needs)
+    # is naturally skipped when needs is empty.
     missing_from_needs = sorted(jobs - needs)
-    if missing_from_needs:
+    if missing_from_needs and needs:
         findings.append(
             "F1 — jobs in ci.yml NOT under sentinel `needs:` "
             "(sentinel doesn't gate them):\n"
@@ -512,8 +516,11 @@ def render_body(branch: str, findings: list[str], debug: dict) -> str:
             "",
             "## Resolution",
             "",
-            "- **F1 / F1b**: add the missing job to `all-required.needs:` "
-            "in `.gitea/workflows/ci.yml`, or remove the stale entry.",
+            "- **F1 / F1b**: if the sentinel job has a `needs:` block, add "
+            "the missing job to it in `.gitea/workflows/ci.yml`, or remove "
+            "the stale entry. If the sentinel deliberately has no `needs:` "
+            "(path-aware polling sentinel per post-#1766 contract), this "
+            "finding is expected and F1 is skipped.",
             "- **F2**: rename the protection context to match an emitter, "
             "or remove it from `status_check_contexts` "
             "(PATCH `/api/v1/repos/{owner}/{repo}/branch_protections/{branch}`).",
