@@ -3,6 +3,7 @@ package bundle
 import (
 	"context"
 	"fmt"
+	"log"
 	"strings"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
@@ -72,7 +73,9 @@ func Import(
 		}
 	}
 	// Store runtime in DB
-	_, _ = db.DB.ExecContext(ctx, `UPDATE workspaces SET runtime = $1 WHERE id = $2`, bundleRuntime, wsID)
+	if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET runtime = $1 WHERE id = $2`, bundleRuntime, wsID); err != nil {
+		log.Printf("bundle import: failed to store runtime for workspace %s: %v", wsID, err)
+	}
 
 	// Provision the container if provisioner is available
 	if prov != nil {
@@ -92,7 +95,9 @@ func Import(
 			if err != nil {
 				markFailed(provCtx, wsID, broadcaster, err)
 			} else if url != "" {
-				db.DB.ExecContext(provCtx, `UPDATE workspaces SET url = $1 WHERE id = $2`, url, wsID)
+				if _, err := db.DB.ExecContext(provCtx, `UPDATE workspaces SET url = $1 WHERE id = $2`, url, wsID); err != nil {
+					log.Printf("bundle import: failed to store URL for workspace %s: %v", wsID, err)
+				}
 			}
 		}()
 	}
@@ -139,9 +144,11 @@ func markFailed(ctx context.Context, wsID string, broadcaster *events.Broadcaste
 	// markProvisionFailed in workspace-server/internal/handlers/
 	// workspace_provision_shared.go.
 	msg := err.Error()
-	db.DB.ExecContext(ctx,
+	if _, dbErr := db.DB.ExecContext(ctx,
 		`UPDATE workspaces SET status = $1, last_sample_error = $2, updated_at = now() WHERE id = $3`,
-		models.StatusFailed, msg, wsID)
+		models.StatusFailed, msg, wsID); dbErr != nil {
+		log.Printf("bundle import: failed to mark workspace %s as failed: %v", wsID, dbErr)
+	}
 	broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceProvisionFailed), wsID, map[string]interface{}{
 		"error": msg,
 	})

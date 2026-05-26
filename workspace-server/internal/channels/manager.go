@@ -392,11 +392,13 @@ func (m *Manager) HandleInbound(ctx context.Context, ch ChannelRow, msg *Inbound
 
 	// Update stats in DB
 	if db.DB != nil {
-		db.DB.ExecContext(ctx, `
+		if _, err := db.DB.ExecContext(ctx, `
 			UPDATE workspace_channels
 			SET last_message_at = now(), message_count = message_count + 1, updated_at = now()
 			WHERE id = $1
-		`, ch.ID)
+		`, ch.ID); err != nil {
+			log.Printf("Channels: inbound stats update failed for channel %s: %v", ch.ID, err)
+		}
 	}
 
 	// Broadcast event
@@ -437,11 +439,13 @@ func (m *Manager) SendOutbound(ctx context.Context, channelID string, text strin
 	}
 
 	if db.DB != nil {
-		db.DB.ExecContext(ctx, `
+		if _, err := db.DB.ExecContext(ctx, `
 			UPDATE workspace_channels
 			SET last_message_at = now(), message_count = message_count + 1, updated_at = now()
 			WHERE id = $1
-		`, channelID)
+		`, channelID); err != nil {
+			log.Printf("Channels: outbound stats update failed for channel %s: %v", channelID, err)
+		}
 	}
 
 	if m.broadcaster != nil {
