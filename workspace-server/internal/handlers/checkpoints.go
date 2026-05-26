@@ -229,7 +229,12 @@ func (h *CheckpointsHandler) Delete(c *gin.Context) {
 		return
 	}
 
-	n, _ := result.RowsAffected()
+	n, err := result.RowsAffected()
+	if err != nil {
+		log.Printf("Delete checkpoints RowsAffected error workspace=%s wf=%s: %v", workspaceID, workflowID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete checkpoints"})
+		return
+	}
 	if n == 0 {
 		c.JSON(http.StatusNotFound, gin.H{"error": "no checkpoints found for workflow"})
 		return
