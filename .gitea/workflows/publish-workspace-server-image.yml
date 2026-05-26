@@ -239,12 +239,13 @@ jobs:
     # Publish/release lane (internal#462) — production deploy of a merged
     # fix; reserved capacity, never queued behind PR-CI.
     runs-on: publish
-    timeout-minutes: 75
+    timeout-minutes: 90
     env:
       CP_URL: ${{ vars.PROD_CP_URL || 'https://api.moleculesai.app' }}
       CP_ADMIN_API_TOKEN: ${{ secrets.CP_ADMIN_API_TOKEN }}
       GITEA_HOST: git.moleculesai.app
       GITEA_TOKEN: ${{ secrets.PROD_AUTO_DEPLOY_CONTROL_TOKEN || secrets.AUTO_SYNC_TOKEN }}
+      CI_STATUS_TIMEOUT_SECONDS: "3600"
       PROD_AUTO_DEPLOY_DISABLED: ${{ vars.PROD_AUTO_DEPLOY_DISABLED || secrets.PROD_AUTO_DEPLOY_DISABLED || '' }}
       PROD_AUTO_DEPLOY_CANARY_SLUG: ${{ vars.PROD_AUTO_DEPLOY_CANARY_SLUG || 'hongming' }}
       PROD_AUTO_DEPLOY_SOAK_SECONDS: ${{ vars.PROD_AUTO_DEPLOY_SOAK_SECONDS || '60' }}
