@@ -3,8 +3,6 @@ import sys
 from pathlib import Path
 from unittest.mock import patch
 
-import pytest
-
 SCRIPT = Path(__file__).resolve().parents[1] / "ci-required-drift.py"
 spec = importlib.util.spec_from_file_location("ci_required_drift", SCRIPT)
 drift = importlib.util.module_from_spec(spec)

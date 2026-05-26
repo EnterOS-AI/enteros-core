@@ -606,7 +606,7 @@ def test_head_drift_closes_stale_issue_for_prior_sha(wd_module, monkeypatch):
                 {"context": "ci/test", "status": "success"},
             ])),
         ],
-        (f"GET", f"/repos/owner/repo/commits/{SHA_NEW}/status"): [
+        ("GET", f"/repos/owner/repo/commits/{SHA_NEW}/status"): [
             (200, _combined_status("success", [
                 {"context": "ci/test", "status": "success"},
             ])),
