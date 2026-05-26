@@ -34,7 +34,10 @@ func (h *ApprovalsHandler) Create(c *gin.Context) {
 		return
 	}
 
-	ctxJSON, _ := json.Marshal(body.Context)
+	ctxJSON, marshalErr := json.Marshal(body.Context)
+	if marshalErr != nil {
+		log.Printf("Approvals create %s: json.Marshal context failed: %v", workspaceID, marshalErr)
+	}
 	if ctxJSON == nil {
 		ctxJSON = []byte("{}")
 	}

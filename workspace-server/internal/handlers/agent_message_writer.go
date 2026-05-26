@@ -164,7 +164,10 @@ func (w *AgentMessageWriter) Send(
 		}
 		respPayload["parts"] = fileParts
 	}
-	respJSON, _ := json.Marshal(respPayload)
+	respJSON, marshalErr := json.Marshal(respPayload)
+	if marshalErr != nil {
+		log.Printf("AgentMessageWriter %s: json.Marshal respPayload failed: %v", workspaceID, marshalErr)
+	}
 	preview := textutil.TruncateRunes(message, 80)
 	if _, err := w.db.ExecContext(ctx, `
 		INSERT INTO activity_logs (workspace_id, activity_type, method, summary, response_body, status)

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -159,7 +160,10 @@ func (s *SlackAdapter) sendBotMessage(ctx context.Context, config map[string]int
 			payload["icon_emoji"] = iconEmoji
 		}
 
-		body, _ := json.Marshal(payload)
+		body, marshalErr := json.Marshal(payload)
+		if marshalErr != nil {
+			log.Printf("slack SendMessage: json.Marshal payload failed: %v", marshalErr)
+		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://slack.com/api/chat.postMessage", bytes.NewReader(body))
 		if err != nil {
 			return fmt.Errorf("slack: build request: %w", err)

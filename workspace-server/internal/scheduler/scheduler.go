@@ -406,7 +406,7 @@ func (s *Scheduler) fireSchedule(ctx context.Context, sched scheduleRow) {
 
 	msgID := fmt.Sprintf("cron-%s-%s", short(sched.ID, 8), uuid.New().String()[:8])
 
-	a2aBody, _ := json.Marshal(map[string]interface{}{
+	a2aBody, marshalErr := json.Marshal(map[string]interface{}{
 		"method": "message/send",
 		"params": map[string]interface{}{
 			"message": map[string]interface{}{
@@ -416,6 +416,9 @@ func (s *Scheduler) fireSchedule(ctx context.Context, sched scheduleRow) {
 			},
 		},
 	})
+	if marshalErr != nil {
+		log.Printf("Scheduler '%s': json.Marshal a2aBody failed: %v", sched.Name, marshalErr)
+	}
 
 	log.Printf("Scheduler: firing '%s' → workspace %s", sched.Name, short(sched.WorkspaceID, 12))
 
@@ -592,12 +595,15 @@ func (s *Scheduler) fireSchedule(ctx context.Context, sched scheduleRow) {
 	// #2026: sanitize the truncated prompt — even UTF-8-safe truncate() can
 	// carry pre-existing invalid bytes from an agent-edited template. jsonb
 	// columns reject invalid UTF-8 and hold the transaction open.
-	cronMeta, _ := json.Marshal(map[string]interface{}{
+	cronMeta, marshalErr := json.Marshal(map[string]interface{}{
 		"schedule_id":   sched.ID,
 		"schedule_name": sched.Name,
 		"cron_expr":     sched.CronExpr,
 		"prompt":        sanitizeUTF8(textutil.TruncateBytes(sched.Prompt, 200)),
 	})
+	if marshalErr != nil {
+		log.Printf("Scheduler '%s': json.Marshal cronMeta failed: %v", sched.Name, marshalErr)
+	}
 	// #152: persist lastError into error_detail on the activity_logs row
 	// so GET /workspaces/:id/schedules/:id/history can surface why a run
 	// failed (previously dropped — history returned status without any
@@ -678,13 +684,16 @@ func (s *Scheduler) recordSkipped(ctx context.Context, sched scheduleRow, active
 	}
 	skipUpdCancel()
 
-	cronMeta, _ := json.Marshal(map[string]interface{}{
+	cronMeta, marshalErr := json.Marshal(map[string]interface{}{
 		"schedule_id":   sched.ID,
 		"schedule_name": sched.Name,
 		"cron_expr":     sched.CronExpr,
 		"skipped":       true,
 		"active_tasks":  activeTasks,
 	})
+	if marshalErr != nil {
+		log.Printf("Scheduler '%s': json.Marshal cronMeta failed: %v", sched.Name, marshalErr)
+	}
 	// #2026: bounded Background() context on the skipped activity log INSERT
 	// for the same reason as the fireSchedule activity_logs INSERT above.
 	skipInsCtx, skipInsCancel := context.WithTimeout(context.Background(), dbQueryTimeout)
