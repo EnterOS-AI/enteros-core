@@ -282,6 +282,7 @@ workspaces:
 		t.Errorf("no-op changed semantics; orig=%+v expanded=%+v", orig, expanded)
 	}
 }
+
 // TestResolveYAMLIncludes_RealMoleculeDev clones molecule-ai-org-template-molecule-dev
 // via HTTPS and validates the full org include resolution. The exec.LookPath guard
 // ensures the test skips gracefully when git is unavailable in the runtime.
