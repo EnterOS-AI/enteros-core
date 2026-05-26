@@ -67,7 +67,10 @@ func (h *ChannelHandler) List(c *gin.Context) {
 		}
 
 		var config map[string]interface{}
-		json.Unmarshal(configJSON, &config)
+		if err := json.Unmarshal(configJSON, &config); err != nil {
+			log.Printf("Channels: unmarshal config for channel %s: %v", id, err)
+			continue
+		}
 		// #319: decrypt sensitive fields first so the mask operates on
 		// plaintext (first-4 / last-4 of the real token, not the ciphertext
 		// prefix). Decrypt errors are logged but non-fatal — List must keep
@@ -86,7 +89,10 @@ func (h *ChannelHandler) List(c *gin.Context) {
 		}
 
 		var allowed []string
-		json.Unmarshal(allowedJSON, &allowed)
+		if err := json.Unmarshal(allowedJSON, &allowed); err != nil {
+			log.Printf("Channels: unmarshal allowed_users for channel %s: %v", id, err)
+			continue
+		}
 
 		entry := map[string]interface{}{
 			"id":            id,
@@ -499,8 +505,14 @@ func (h *ChannelHandler) Webhook(c *gin.Context) {
 		if err := rows.Scan(&row.ID, &row.WorkspaceID, &row.ChannelType, &configJSON, &row.Enabled, &allowedJSON); err != nil {
 			continue
 		}
-		json.Unmarshal(configJSON, &row.Config)
-		json.Unmarshal(allowedJSON, &row.AllowedUsers)
+		if err := json.Unmarshal(configJSON, &row.Config); err != nil {
+			log.Printf("Channels: unmarshal config for webhook row %s: %v", row.ID, err)
+			continue
+		}
+		if err := json.Unmarshal(allowedJSON, &row.AllowedUsers); err != nil {
+			log.Printf("Channels: unmarshal allowed_users for webhook row %s: %v", row.ID, err)
+			continue
+		}
 		if err := channels.DecryptSensitiveFields(row.Config); err != nil {
 			log.Printf("Channels: decrypt webhook row %s: %v", row.ID, err)
 			continue

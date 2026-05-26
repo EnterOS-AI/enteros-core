@@ -515,7 +515,10 @@ func (m *Manager) FetchWorkspaceChannelContext(ctx context.Context, workspaceID 
 		return ""
 	}
 	var config map[string]interface{}
-	json.Unmarshal(configJSON, &config)
+	if err := json.Unmarshal(configJSON, &config); err != nil {
+		log.Printf("ChannelManager: unmarshal config: %v", err)
+		return ""
+	}
 	if err := DecryptSensitiveFields(config); err != nil {
 		return ""
 	}
