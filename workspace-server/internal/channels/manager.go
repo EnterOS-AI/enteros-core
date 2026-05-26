@@ -508,14 +508,20 @@ func (m *Manager) FetchWorkspaceChannelContext(ctx context.Context, workspaceID 
 	}
 	defer rows.Close()
 	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			log.Printf("ChannelManager: FetchWorkspaceChannelContext rows error for %s: %v", workspaceID, err)
+		}
 		return ""
 	}
 	var configJSON []byte
-	if rows.Scan(&configJSON) != nil {
+	if err := rows.Scan(&configJSON); err != nil {
+		log.Printf("ChannelManager: FetchWorkspaceChannelContext scan error for %s: %v", workspaceID, err)
 		return ""
 	}
 	var config map[string]interface{}
-	json.Unmarshal(configJSON, &config)
+	if err := json.Unmarshal(configJSON, &config); err != nil {
+		log.Printf("ChannelManager: unmarshal config: %v", err)
+	}
 	if err := DecryptSensitiveFields(config); err != nil {
 		return ""
 	}
