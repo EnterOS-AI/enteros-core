@@ -434,7 +434,12 @@ func (h *WorkspaceHandler) stitchDrainResponseToDelegation(ctx context.Context, 
 		log.Printf("A2AQueue drain stitch: update failed for delegation %s: %v", delegationID, err)
 		return
 	}
-	if rows, _ := res.RowsAffected(); rows == 0 {
+	rows, err := res.RowsAffected()
+	if err != nil {
+		log.Printf("A2AQueue drain stitch: RowsAffected error for delegation %s: %v", delegationID, err)
+		return
+	}
+	if rows == 0 {
 		log.Printf("A2AQueue drain stitch: no delegate_result row for delegation %s (queued-row may not exist yet)", delegationID)
 		return
 	}

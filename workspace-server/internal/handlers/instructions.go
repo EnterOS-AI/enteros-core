@@ -169,7 +169,13 @@ func (h *InstructionsHandler) Update(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "update failed"})
 		return
 	}
-	if n, _ := result.RowsAffected(); n == 0 {
+	n, err := result.RowsAffected()
+	if err != nil {
+		log.Printf("Instructions update RowsAffected error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "update failed"})
+		return
+	}
+	if n == 0 {
 		c.JSON(http.StatusNotFound, gin.H{"error": "instruction not found"})
 		return
 	}
@@ -186,7 +192,13 @@ func (h *InstructionsHandler) Delete(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "delete failed"})
 		return
 	}
-	if n, _ := result.RowsAffected(); n == 0 {
+	n, err := result.RowsAffected()
+	if err != nil {
+		log.Printf("Instructions delete RowsAffected error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "delete failed"})
+		return
+	}
+	if n == 0 {
 		c.JSON(http.StatusNotFound, gin.H{"error": "instruction not found"})
 		return
 	}

@@ -190,7 +190,11 @@ func sweepStuckProvisioning(ctx context.Context, emitter ProvisionTimeoutEmitter
 			log.Printf("Provision-timeout sweep: failed to flip %s to failed: %v", c.id, err)
 			continue
 		}
-		affected, _ := res.RowsAffected()
+		affected, err := res.RowsAffected()
+		if err != nil {
+			log.Printf("Provision-timeout sweep: RowsAffected error for %s: %v", c.id, err)
+			continue
+		}
 		if affected == 0 {
 			// Raced with restart / register — no harm, just skip.
 			continue

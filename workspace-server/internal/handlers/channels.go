@@ -26,6 +26,10 @@ type ChannelHandler struct {
 	manager *channels.Manager
 }
 
+// channelSlugRe matches valid agent slugs used in [slug] routing.
+// Compiled once at init to avoid recompilation on every webhook call.
+var channelSlugRe = regexp.MustCompile(`^[a-zA-Z0-9 _-]+$`)
+
 // NewChannelHandler creates a channel handler with the given manager.
 func NewChannelHandler(manager *channels.Manager) *ChannelHandler {
 	return &ChannelHandler{manager: manager}
@@ -242,7 +246,13 @@ func (h *ChannelHandler) Update(c *gin.Context) {
 		return
 	}
 
-	if n, _ := result.RowsAffected(); n == 0 {
+	n, err := result.RowsAffected()
+	if err != nil {
+		log.Printf("Channel update RowsAffected error channel=%s workspace=%s: %v", channelID, workspaceID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "update failed"})
+		return
+	}
+	if n == 0 {
 		c.JSON(http.StatusNotFound, gin.H{"error": "channel not found"})
 		return
 	}
@@ -267,7 +277,13 @@ func (h *ChannelHandler) Delete(c *gin.Context) {
 		return
 	}
 
-	if n, _ := result.RowsAffected(); n == 0 {
+	n, err := result.RowsAffected()
+	if err != nil {
+		log.Printf("Channel delete RowsAffected error channel=%s workspace=%s: %v", channelID, workspaceID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "delete failed"})
+		return
+	}
+	if n == 0 {
 		c.JSON(http.StatusNotFound, gin.H{"error": "channel not found"})
 		return
 	}
@@ -468,11 +484,10 @@ func (h *ChannelHandler) Webhook(c *gin.Context) {
 	// in a shared channel and route to a specific agent.
 	targetSlug := ""
 	routedText := msg.Text
-	validSlugRe := regexp.MustCompile(`^[a-zA-Z0-9 _-]+$`)
 	if len(msg.Text) > 2 && msg.Text[0] == '[' {
 		if idx := strings.Index(msg.Text, "]"); idx > 1 && idx < 40 {
 			candidate := strings.ToLower(strings.TrimSpace(msg.Text[1:idx]))
-			if validSlugRe.MatchString(candidate) {
+			if channelSlugRe.MatchString(candidate) {
 				targetSlug = candidate
 				routedText = strings.TrimSpace(msg.Text[idx+1:])
 				if routedText == "" {

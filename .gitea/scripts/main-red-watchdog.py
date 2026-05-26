@@ -90,6 +90,15 @@ API = f"https://{GITEA_HOST}/api/v1" if GITEA_HOST else ""
 # match by exact title without parsing.
 TITLE_PREFIX = "[main-red]"
 
+# Contexts that are scheduled or non-required — their pending/failure
+# state should not block stale-issue closeout (mc#1789).
+SCHEDULED_CONTEXT_PATTERNS = (
+    "Staging SaaS smoke",
+    "Continuous synthetic E2E",
+    "main-red-watchdog",
+    "ci-arm64-advisory",
+)
+
 # Settling window (seconds) between initial red detection and the
 # pre-file recheck. The recheck filters out the two largest false-
 # positive classes seen in mc#1597..1630 (task #394, 2026-05-21):
@@ -265,6 +274,11 @@ def get_combined_status(sha: str) -> dict:
     return body
 
 
+def _entry_state(s: dict) -> str:
+    """Per-entry status key in Gitea 1.22.6 is `status`; fall back to `state`."""
+    return s.get("status") or s.get("state") or ""
+
+
 def is_red(status: dict) -> tuple[bool, list[dict]]:
     """Return (is_red, failed_statuses).
 
@@ -312,9 +326,6 @@ def is_red(status: dict) -> tuple[bool, list[dict]]:
     # "no per-context entries were in a red state" fallback even when
     # the combined-state correctly flagged red. See
     # `feedback_smoke_test_vendor_truth_not_shape_match`.
-    def _entry_state(s: dict) -> str:
-        return s.get("status") or s.get("state") or ""
-
     def _is_cancel_cascade(s: dict) -> bool:
         """status=3 entry per Gitea 1.22.6 description-string contract.
         Match exactly (after strip) — substring match would catch
@@ -353,6 +364,15 @@ def title_for(sha: str) -> str:
     return f"{TITLE_PREFIX} {REPO}: {sha[:10]}"
 
 
+def _is_scheduled_context(context: str) -> bool:
+    """Return True if `context` is a known scheduled/non-required job.
+
+    These contexts run on a schedule and should not block stale-issue
+    closeout when main's required CI has recovered (mc#1789).
+    """
+    return any(pattern.lower() in context.lower() for pattern in SCHEDULED_CONTEXT_PATTERNS)
+
+
 def list_open_red_issues() -> list[dict]:
     """All open issues whose title starts with `[main-red] {repo}: `.
 
@@ -362,23 +382,34 @@ def list_open_red_issues() -> list[dict]:
     file-or-update path to POST a duplicate — exactly the regression
     class the helper-raises contract closes.
 
-    Gitea issue search returns at most 50/page; we only need open
-    `[main-red]` issues which are by design ≤ 1 at any time per repo,
-    so a single page is enough.
+    Pagination is exhausted (mc#1789). The old "by design ≤ 1" invariant
+    was false — backlog can exceed 50 open issues.
     """
-    _, results = api(
-        "GET",
-        f"/repos/{OWNER}/{NAME}/issues",
-        query={"state": "open", "type": "issues", "limit": "50"},
-    )
-    if not isinstance(results, list):
-        raise ApiError(
-            f"issue search returned non-list body (got {type(results).__name__})"
-        )
     prefix = f"{TITLE_PREFIX} {REPO}: "
-    return [i for i in results if isinstance(i, dict)
+    all_issues: list[dict] = []
+    page = 1
+    limit = 50
+    while True:
+        _, results = api(
+            "GET",
+            f"/repos/{OWNER}/{NAME}/issues",
+            query={"state": "open", "type": "issues", "limit": str(limit), "page": str(page)},
+        )
+        if not isinstance(results, list):
+            raise ApiError(
+                f"issue search returned non-list body (got {type(results).__name__})"
+            )
+        matched = [
+            i for i in results
+            if isinstance(i, dict)
             and isinstance(i.get("title"), str)
-            and i["title"].startswith(prefix)]
+            and i["title"].startswith(prefix)
+        ]
+        all_issues.extend(matched)
+        if len(results) < limit:
+            break
+        page += 1
+    return all_issues
 
 
 def find_open_issue_for_sha(sha: str) -> dict | None:
@@ -745,23 +776,60 @@ def run_once(*, dry_run: bool = False) -> int:
               f"{len(failed)} failed context(s)")
         file_or_update_red(sha, failed, debug, dry_run=dry_run)
     else:
-        # Green (or pending — pending is treated as not-red so we don't
-        # spam during the post-merge CI window). Close any stale issues
-        # from earlier SHAs only when we're actually green; pending
-        # means CI hasn't finished and the prior issue might still be
-        # accurate.
-        if status.get("state") == "success":
+        # Green or pending-with-no-real-failures. Close stale issues
+        # from earlier SHAs when required CI has recovered.
+        #
+        # mc#1789: main often sits at combined `pending` because
+        # scheduled/non-required contexts (Staging SaaS smoke,
+        # Continuous synthetic E2E, main-red-watchdog itself,
+        # ci-arm64-advisory) are still running. We close stale issues
+        # as long as no *non-scheduled* context has failed and no
+        # *non-scheduled* context is still pending — i.e. required CI
+        # is effectively green.
+        #
+        # The success-only gate is preserved for the canonical green
+        # path; the extended check below only fires when combined is
+        # `pending` but all required work is done.
+        combined_state = status.get("state")
+        if combined_state == "success":
+            should_close = True
+            close_reason = "GREEN"
+        else:
+            statuses = status.get("statuses") or []
+            non_scheduled_pending = [
+                s for s in statuses
+                if isinstance(s, dict)
+                and (_entry_state(s) == "pending")
+                and not _is_scheduled_context(s.get("context", ""))
+            ]
+            non_scheduled_failed = [
+                s for s in statuses
+                if isinstance(s, dict)
+                and (_entry_state(s) in {"failure", "error"})
+                and not _is_scheduled_context(s.get("context", ""))
+            ]
+            # Cancel-cascade already filtered by is_red(); red=False
+            # here means no real failures. We additionally check that
+            # no non-scheduled context is still pending.
+            should_close = not non_scheduled_pending and not non_scheduled_failed
+            close_reason = "pending-but-required-green"
+
+        if should_close:
             closed = close_open_red_issues_for_other_shas(sha, dry_run=dry_run)
             if closed:
                 emit_loki_event(
                     "main_returned_to_green", sha,
                     [],
                 )
-            print(f"::notice::main is GREEN at {sha[:10]} on {WATCH_BRANCH} "
-                  f"(closed {closed} stale issue(s))")
+            print(
+                f"::notice::main is {close_reason} at {sha[:10]} on {WATCH_BRANCH} "
+                f"(closed {closed} stale issue(s))"
+            )
         else:
-            print(f"::notice::main is PENDING at {sha[:10]} on {WATCH_BRANCH} "
-                  f"(combined state={status.get('state')!r}; no action)")
+            print(
+                f"::notice::main has pending-or-failed required CI at {sha[:10]} "
+                f"on {WATCH_BRANCH} (combined state={combined_state!r}; no action)"
+            )
     return 0
 
 

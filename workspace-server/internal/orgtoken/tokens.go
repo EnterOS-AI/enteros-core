@@ -192,7 +192,10 @@ func Revoke(ctx context.Context, db *sql.DB, id string) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("orgtoken: revoke: %w", err)
 	}
-	n, _ := res.RowsAffected()
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("orgtoken: revoke RowsAffected: %w", err)
+	}
 	return n > 0, nil
 }
 
