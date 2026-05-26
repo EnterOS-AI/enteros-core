@@ -149,11 +149,13 @@ func main() {
 				result, err := db.DB.ExecContext(ctx, `DELETE FROM activity_logs WHERE created_at < now() - ($1 || ' days')::interval`, retentionDays)
 				if err != nil {
 					log.Printf("Activity log cleanup error: %v", err)
-				n, err := result.RowsAffected()
-				if err != nil {
-					log.Printf("Activity log cleanup RowsAffected error: %v", err)
-				} else if n > 0 {
-					log.Printf("Activity log cleanup: purged %d old entries", n)
+				} else {
+					n, err := result.RowsAffected()
+					if err != nil {
+						log.Printf("Activity log cleanup RowsAffected error: %v", err)
+					} else if n > 0 {
+						log.Printf("Activity log cleanup: purged %d old entries", n)
+					}
 				}
 			}
 		}
