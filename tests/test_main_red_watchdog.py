@@ -37,7 +37,6 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
-import sys
 import urllib.error
 from pathlib import Path
 from unittest import mock
@@ -566,7 +565,6 @@ def test_auto_close_skips_when_main_pending(wd_module, monkeypatch):
     """main pending (CI still running) at NEW_SHA → leave old issue alone.
     Pending could resolve to red, so closing prematurely would lose the
     breadcrumb of the prior red."""
-    old_title = f"[main-red] owner/repo: {SHA_RED[:10]}"
     stub = _make_stub_api({
         ("GET", "/repos/owner/repo/branches/main"): (200, _branches_response(SHA_GREEN)),
         ("GET", f"/repos/owner/repo/commits/{SHA_GREEN}/status"): (
@@ -889,7 +887,7 @@ def test_emit_loki_event_prints_json_line(wd_module, capsys, monkeypatch):
     captured = capsys.readouterr()
     assert "main-red-watchdog event:" in captured.out
     # Find the JSON payload after the prefix and verify it parses
-    line = [l for l in captured.out.splitlines() if "main-red-watchdog event:" in l][0]
+    line = [ln for ln in captured.out.splitlines() if "main-red-watchdog event:" in ln][0]
     payload = json.loads(line.split("main-red-watchdog event:", 1)[1].strip())
     assert payload["event_type"] == "main_red_detected"
     assert payload["repo"] == "owner/repo"

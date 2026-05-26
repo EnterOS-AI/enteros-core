@@ -153,7 +153,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--event-name", default=os.environ.get("GITHUB_EVENT_NAME", ""))
     parser.add_argument("--pr-base-sha", default="")
     parser.add_argument("--base-ref", default="")
-    parser.add_argument("--push-before", default=os.environ.get("GITHUB_EVENT_BEFORE", ""))
+    parser.add_argument(
+        "--push-before",
+        default=os.environ.get("GITHUB_EVENT_BEFORE", ""),
+    )
     return parser.parse_args(argv)
 
 

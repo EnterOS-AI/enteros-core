@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import os
 import sys
-import tempfile
 import unittest
 
 # Resolve sibling script regardless of where pytest is invoked from.

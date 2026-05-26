@@ -274,7 +274,8 @@ def required_checks_env(audit_doc: dict) -> set[str]:
                     found.append(v)
     if not found:
         sys.stderr.write(
-            f"::error::REQUIRED_CHECKS env not found in any step of {AUDIT_WORKFLOW_PATH}\n"
+            f"::error::REQUIRED_CHECKS env not found in any step of "
+            f"{AUDIT_WORKFLOW_PATH}\n"
         )
         sys.exit(3)
     if len(found) > 1:
@@ -387,7 +388,8 @@ def detect_drift(branch: str) -> tuple[list[str], dict]:
     missing_from_needs = sorted(jobs - needs)
     if missing_from_needs:
         findings.append(
-            "F1 — jobs in ci.yml NOT under sentinel `needs:` (sentinel doesn't gate them):\n"
+            "F1 — jobs in ci.yml NOT under sentinel `needs:` "
+            "(sentinel doesn't gate them):\n"
             + "\n".join(f"  - {n}" for n in missing_from_needs)
         )
 
@@ -397,7 +399,8 @@ def detect_drift(branch: str) -> tuple[list[str], dict]:
     stale_needs = sorted(needs - jobs_all)
     if stale_needs:
         findings.append(
-            "F1b — sentinel `needs:` lists jobs NOT present in ci.yml (typo or removed job):\n"
+            "F1b — sentinel `needs:` lists jobs NOT present in ci.yml "
+            "(typo or removed job):\n"
             + "\n".join(f"  - {n}" for n in stale_needs)
         )
 
@@ -405,7 +408,9 @@ def detect_drift(branch: str) -> tuple[list[str], dict]:
     # Compute the contexts the CI YAML actually produces. The sentinel
     # is in (B) intentionally (`ci / all-required (pull_request)`); we
     # whitelist it explicitly.
-    emitted_contexts = {expected_context(j) for j in jobs} | {expected_context(SENTINEL_JOB)}
+    emitted_contexts = {
+        expected_context(j) for j in jobs
+    } | {expected_context(SENTINEL_JOB)}
     # Contexts NOT produced by ci.yml may still come from other
     # workflows in the repo (Secret scan etc). We can't enumerate
     # every workflow's emissions cheaply; instead, flag only contexts
@@ -418,8 +423,9 @@ def detect_drift(branch: str) -> tuple[list[str], dict]:
     )
     if stale_protection:
         findings.append(
-            "F2 — protection `status_check_contexts` entries with `ci / ` prefix that NO "
-            "job in ci.yml emits (stale name → silent advisory gate):\n"
+            "F2 — protection `status_check_contexts` entries with `ci / ` "
+            "prefix that NO job in ci.yml emits "
+            "(stale name → silent advisory gate):\n"
             + "\n".join(f"  - {c}" for c in stale_protection)
         )
 
@@ -494,7 +500,8 @@ def render_body(branch: str, findings: list[str], debug: dict) -> str:
         f"# Drift detected on `{REPO}/{branch}`",
         "",
         "Auto-filed by `.gitea/workflows/ci-required-drift.yml` "
-        "(RFC [internal#219](https://git.moleculesai.app/molecule-ai/internal/issues/219) §4 + §6).",
+        "(RFC [internal#219]"
+        "(https://git.moleculesai.app/molecule-ai/internal/issues/219) §4 + §6).",
         "",
         "## Findings",
         "",
@@ -547,12 +554,12 @@ def file_or_update(
 
     if dry_run:
         print(f"::notice::[dry-run] would file/update drift issue for {branch}")
-        print(f"::group::[dry-run] title")
+        print("::group::[dry-run] title")
         print(title)
-        print(f"::endgroup::")
-        print(f"::group::[dry-run] body")
+        print("::endgroup::")
+        print("::group::[dry-run] body")
         print(body)
-        print(f"::endgroup::")
+        print("::endgroup::")
         return
 
     existing = find_open_issue(title)
