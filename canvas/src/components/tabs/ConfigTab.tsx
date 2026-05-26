@@ -6,6 +6,7 @@ import { useCanvasStore } from "@/store/canvas";
 import { type ConfigData, DEFAULT_CONFIG, TextInput, NumberInput, Toggle, TagList, Section } from "./config/form-inputs";
 import { parseYaml, toYaml } from "./config/yaml-utils";
 import { SecretsSection } from "./config/secrets-section";
+import { LLMBillingSection } from "./config/llm-billing-section";
 import { ExternalConnectionSection } from "./ExternalConnectionSection";
 import {
   ProviderModelSelector,
@@ -1107,6 +1108,8 @@ export function ConfigTab({ workspaceId }: Props) {
               <NumberInput label="Timeout (s)" value={config.sandbox?.timeout ?? 30} onChange={(v) => updateNested("sandbox" as keyof ConfigData, "timeout", v)} min={5} />
             </div>
           </Section>
+
+          <LLMBillingSection workspaceId={workspaceId} />
 
           <SecretsSection
             workspaceId={workspaceId}
