@@ -2,7 +2,7 @@
 # Standalone runner for Issue 4 reproduction (RFC #2251) — exists alongside
 # `measure-coordinator-task-bounds.sh` to support arbitrary template + secret
 # combinations without modifying the canonical harness. The canonical harness
-# stays focused on its v1 contract (claude-code-default + langgraph + OpenRouter);
+# stays focused on its v1 contract (claude-code-default + claude-code + OpenRouter);
 # this runner wraps the same workspace-server API calls but takes everything as
 # env-var inputs so a Hermes/MiniMax run can share the measurement code path.
 #

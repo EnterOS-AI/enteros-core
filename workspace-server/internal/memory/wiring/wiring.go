@@ -21,8 +21,8 @@ import (
 	"os"
 	"time"
 
-	mclient "github.com/Molecule-AI/molecule-monorepo/platform/internal/memory/client"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/memory/namespace"
+	mclient "git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/memory/client"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/memory/namespace"
 )
 
 // Bundle is the v2 dependency bundle. Pass it through Setup as a
@@ -39,41 +39,30 @@ type Bundle struct {
 // Build returns a wired Bundle if MEMORY_PLUGIN_URL is set, else nil.
 //
 // It probes /v1/health at boot — when the plugin is unreachable, we
-// log a warning but STILL return the bundle. The MCP layer's
-// circuit breaker handles ongoing unavailability; we don't want to
-// block workspace-server boot just because the memory plugin is
-// briefly down.
+// log a warning but STILL return the bundle. The MCP layer's circuit
+// breaker handles ongoing unavailability.
 //
-// Silent-misconfig guard: if MEMORY_V2_CUTOVER=true is set without
-// MEMORY_PLUGIN_URL, the cutoverActive() check in handlers silently
-// returns false and the legacy SQL path serves every request. The
-// operator sees no errors, no warnings, and assumes the cutover is
-// live. Log a LOUD WARN at boot when the env is half-configured so
-// the misconfig is visible in the boot log, not detectable only by
-// observing that the legacy table is still being written to.
+// Issue #1733: when MEMORY_PLUGIN_URL is unset the bundle is nil and
+// every memory MCP tool returns a clear "plugin not configured" error
+// (mcp_tools.go). There is no longer a silent SQL fallback to
+// agent_memories, so the previous half-configured-cutover guard is
+// gone — a missing URL fails loudly on first memory call instead of
+// quietly serving stale legacy data.
+//
+// MEMORY_V2_CUTOVER is left intact as a deployment marker (CP user-data
+// reads it before spawning the sidecar in entrypoint-tenant.sh); we no
+// longer branch on it inside the platform binary.
 func Build(db *sql.DB) *Bundle {
-	cutover := os.Getenv("MEMORY_V2_CUTOVER") == "true"
 	pluginURL := os.Getenv("MEMORY_PLUGIN_URL")
-
 	if pluginURL == "" {
-		if cutover {
-			log.Printf("memory-plugin: ⚠️  MEMORY_V2_CUTOVER=true but MEMORY_PLUGIN_URL is unset — cutover is INACTIVE, legacy SQL path is serving every request. Either unset MEMORY_V2_CUTOVER or point MEMORY_PLUGIN_URL at a reachable plugin server.")
-		}
+		log.Printf("memory-plugin: MEMORY_PLUGIN_URL is unset — v2 memory MCP tools (commit_memory, recall_memory, admin export/import) will return 'plugin not configured' to callers. Set MEMORY_PLUGIN_URL to activate.")
 		return nil
 	}
 	plugin := mclient.New(mclient.Config{})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if hr, err := plugin.Boot(ctx); err != nil {
-		// Log even louder when cutover is on — an unreachable plugin
-		// during cutover means writes that the operator THINKS are
-		// going to v2 will silently fall back to legacy via the
-		// circuit breaker on each request. Make it impossible to miss.
-		if cutover {
-			log.Printf("memory-plugin: ⚠️  MEMORY_V2_CUTOVER=true and MEMORY_PLUGIN_URL=%s but /v1/health probe failed (%v). Cutover writes will fall back to legacy via circuit breaker. Verify the plugin server is reachable.", pluginURL, err)
-		} else {
-			log.Printf("memory-plugin: /v1/health probe failed (will retry per-request): %v", err)
-		}
+		log.Printf("memory-plugin: ⚠️  /v1/health probe failed at boot (%v). MCP memory calls will error until the plugin becomes reachable. Verify MEMORY_PLUGIN_URL=%s.", err, pluginURL)
 	} else {
 		log.Printf("memory-plugin: ok, capabilities=%v", hr.Capabilities)
 	}

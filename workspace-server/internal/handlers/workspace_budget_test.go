@@ -23,7 +23,7 @@ import (
 	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/models"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
 	"github.com/gin-gonic/gin"
 )
 
@@ -33,7 +33,7 @@ var wsColumns = []string{
 	"parent_id", "active_tasks", "max_concurrent_tasks", "last_error_rate", "last_sample_error",
 	"uptime_seconds", "current_task", "runtime", "workspace_dir", "x", "y", "collapsed",
 	"budget_limit", "monthly_spend",
-	"broadcast_enabled", "talk_to_user_enabled",
+	"broadcast_enabled", "talk_to_user_enabled", "compute",
 }
 
 // ==================== GET — financial fields stripped from open endpoint ====================
@@ -51,12 +51,13 @@ func TestWorkspaceBudget_Get_NilLimit(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows(wsColumns).
 			AddRow("dddddddd-0005-0000-0000-000000000000", "Free Agent", "worker", 1, "online",
 				[]byte(`{}`), "http://localhost:9001",
-				nil, 0, 1, 0.0, "", 0, "", "langgraph", "",
+				nil, 0, 1, 0.0, "", 0, "", "claude-code", "",
 				0.0, 0.0, false,
 				nil,   // budget_limit NULL
 				0,     // monthly_spend 0
 				false, // broadcast_enabled
-				true)) // talk_to_user_enabled
+				true,  // talk_to_user_enabled
+				[]byte(`{}`)))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -96,11 +97,12 @@ func TestWorkspaceBudget_Get_WithLimit(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows(wsColumns).
 			AddRow("dddddddd-0006-0000-0000-000000000000", "Capped Agent", "worker", 1, "online",
 				[]byte(`{}`), "http://localhost:9002",
-				nil, 0, 1, 0.0, "", 0, "", "langgraph", "",
+				nil, 0, 1, 0.0, "", 0, "", "claude-code", "",
 				0.0, 0.0, false,
 				int64(500),  // budget_limit = $5.00 in DB
 				int64(123),  // monthly_spend = $1.23 in DB
-				false, true)) // broadcast_enabled, talk_to_user_enabled
+				false, true, // broadcast_enabled, talk_to_user_enabled
+				[]byte(`{}`)))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -145,21 +147,22 @@ func TestWorkspaceBudget_Create_WithLimit(t *testing.T) {
 	mock.ExpectBegin()
 	mock.ExpectExec("INSERT INTO workspaces").
 		WithArgs(
-			sqlmock.AnyArg(), // id
-			"Budgeted Agent", // name
-			nil,              // role
-			3,                // tier (default, workspace.go create-handler)
-			"langgraph",      // runtime
-			sqlmock.AnyArg(), // awareness_namespace
-			(*string)(nil),   // parent_id
-			nil,              // workspace_dir
-			"none",           // workspace_access
-			&budgetVal,       // budget_limit ($10)
+			sqlmock.AnyArg(),                 // id
+			"Budgeted Agent",                 // name
+			nil,                              // role
+			3,                                // tier (default, workspace.go create-handler)
+			"claude-code",                    // runtime
+			(*string)(nil),                   // parent_id
+			nil,                              // workspace_dir
+			"none",                           // workspace_access
+			&budgetVal,                       // budget_limit ($10)
 			models.DefaultMaxConcurrentTasks, // max_concurrent_tasks default
-			"push",           // delivery_mode default (#2339)
+			"push",                           // delivery_mode default (#2339)
 		).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
+	mock.ExpectExec("INSERT INTO workspace_secrets").
+		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec("INSERT INTO canvas_layouts").
 		WithArgs(sqlmock.AnyArg(), float64(0), float64(0)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -168,7 +171,7 @@ func TestWorkspaceBudget_Create_WithLimit(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
-	body := `{"name":"Budgeted Agent","budget_limit":1000}`
+	body := `{"name":"Budgeted Agent","model":"anthropic:claude-opus-4-7","budget_limit":1000}`
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 	handler.Create(c)

@@ -11,8 +11,8 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
 	sqlmock "github.com/DATA-DOG/go-sqlmock"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/models"
 	"github.com/gin-gonic/gin"
 )
 
@@ -80,7 +80,7 @@ func TestRestartHandler_AncestorPausedBlocksRestart(t *testing.T) {
 	mock.ExpectQuery("SELECT status, name, tier, COALESCE").
 		WithArgs("ws-grandchild").
 		WillReturnRows(sqlmock.NewRows([]string{"status", "name", "tier", "runtime"}).
-			AddRow("offline", "Grandchild Agent", 1, "langgraph"))
+			AddRow("offline", "Grandchild Agent", 1, "claude-code"))
 
 	// isParentPaused: get parent_id of grandchild -> child
 	mock.ExpectQuery("SELECT parent_id FROM workspaces WHERE id =").
@@ -233,7 +233,7 @@ func TestRestartHandler_NilProvisionerReturns503(t *testing.T) {
 	mock.ExpectQuery("SELECT status, name, tier, COALESCE").
 		WithArgs("ws-no-prov").
 		WillReturnRows(sqlmock.NewRows([]string{"status", "name", "tier", "runtime"}).
-			AddRow("offline", "Test Agent", 1, "langgraph"))
+			AddRow("offline", "Test Agent", 1, "claude-code"))
 
 	// isParentPaused: no parent
 	mock.ExpectQuery("SELECT parent_id FROM workspaces WHERE id =").
@@ -415,7 +415,7 @@ func TestResumeHandler_NilProvisionerReturns503(t *testing.T) {
 	mock.ExpectQuery("SELECT name, tier, COALESCE").
 		WithArgs("ws-resume-noprov").
 		WillReturnRows(sqlmock.NewRows([]string{"name", "tier", "runtime"}).
-			AddRow("Test Agent", 1, "langgraph"))
+			AddRow("Test Agent", 1, "claude-code"))
 
 	// provisioner nil check happens BEFORE isParentPaused, so no parent query expected
 

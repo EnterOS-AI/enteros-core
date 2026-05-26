@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -11,8 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
 	"github.com/DATA-DOG/go-sqlmock"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/models"
 	"github.com/gin-gonic/gin"
 )
 
@@ -29,15 +30,15 @@ func TestWorkspaceGet_Success(t *testing.T) {
 		"parent_id", "active_tasks", "max_concurrent_tasks", "last_error_rate", "last_sample_error",
 		"uptime_seconds", "current_task", "runtime", "workspace_dir", "x", "y", "collapsed",
 		"budget_limit", "monthly_spend",
-		"broadcast_enabled", "talk_to_user_enabled",
+		"broadcast_enabled", "talk_to_user_enabled", "compute",
 	}
 	mock.ExpectQuery("SELECT w.id, w.name").
 		WithArgs("cccccccc-0001-0000-0000-000000000000").
 		WillReturnRows(sqlmock.NewRows(columns).
 			AddRow("cccccccc-0001-0000-0000-000000000000", "My Agent", "worker", 1, "online", []byte(`{"name":"test"}`),
-				"http://localhost:8001", nil, 2, 1, 0.05, "", 3600, "working", "langgraph",
+				"http://localhost:8001", nil, 2, 1, 0.05, "", 3600, "working", "claude-code",
 				"", 10.0, 20.0, false,
-				nil, 0, false, true))
+				nil, 0, false, true, []byte(`{}`)))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -60,8 +61,8 @@ func TestWorkspaceGet_Success(t *testing.T) {
 	if resp["status"] != "online" {
 		t.Errorf("expected status 'online', got %v", resp["status"])
 	}
-	if resp["runtime"] != "langgraph" {
-		t.Errorf("expected runtime 'langgraph', got %v", resp["runtime"])
+	if resp["runtime"] != "claude-code" {
+		t.Errorf("expected runtime 'claude-code', got %v", resp["runtime"])
 	}
 	// current_task is stripped from public GET response (#955)
 	if _, exists := resp["current_task"]; exists {
@@ -119,15 +120,15 @@ func TestWorkspaceGet_RemovedReturns410(t *testing.T) {
 		"parent_id", "active_tasks", "max_concurrent_tasks", "last_error_rate", "last_sample_error",
 		"uptime_seconds", "current_task", "runtime", "workspace_dir", "x", "y", "collapsed",
 		"budget_limit", "monthly_spend",
-		"broadcast_enabled", "talk_to_user_enabled",
+		"broadcast_enabled", "talk_to_user_enabled", "compute",
 	}
 	mock.ExpectQuery("SELECT w.id, w.name").
 		WithArgs(id).
 		WillReturnRows(sqlmock.NewRows(columns).
 			AddRow(id, "Old Agent", "worker", 1, string(models.StatusRemoved), []byte(`null`),
-				"", nil, 0, 1, 0.0, "", 0, "", "langgraph",
+				"", nil, 0, 1, 0.0, "", 0, "", "claude-code",
 				"", 0.0, 0.0, false,
-				nil, 0, false, true))
+				nil, 0, false, true, []byte(`{}`)))
 	mock.ExpectQuery(`SELECT updated_at FROM workspaces`).
 		WithArgs(id).
 		WillReturnRows(sqlmock.NewRows([]string{"updated_at"}).AddRow(removedAt))
@@ -183,15 +184,15 @@ func TestWorkspaceGet_RemovedReturns410WithNullRemovedAtOnTimestampFetchFailure(
 		"parent_id", "active_tasks", "max_concurrent_tasks", "last_error_rate", "last_sample_error",
 		"uptime_seconds", "current_task", "runtime", "workspace_dir", "x", "y", "collapsed",
 		"budget_limit", "monthly_spend",
-		"broadcast_enabled", "talk_to_user_enabled",
+		"broadcast_enabled", "talk_to_user_enabled", "compute",
 	}
 	mock.ExpectQuery("SELECT w.id, w.name").
 		WithArgs(id).
 		WillReturnRows(sqlmock.NewRows(columns).
 			AddRow(id, "Vanished", "worker", 1, string(models.StatusRemoved), []byte(`null`),
-				"", nil, 0, 1, 0.0, "", 0, "", "langgraph",
+				"", nil, 0, 1, 0.0, "", 0, "", "claude-code",
 				"", 0.0, 0.0, false,
-				nil, 0, false, true))
+				nil, 0, false, true, []byte(`{}`)))
 	// Simulate the row vanishing between the two queries.
 	mock.ExpectQuery(`SELECT updated_at FROM workspaces`).
 		WithArgs(id).
@@ -246,15 +247,15 @@ func TestWorkspaceGet_RemovedWithIncludeQueryReturns200(t *testing.T) {
 		"parent_id", "active_tasks", "max_concurrent_tasks", "last_error_rate", "last_sample_error",
 		"uptime_seconds", "current_task", "runtime", "workspace_dir", "x", "y", "collapsed",
 		"budget_limit", "monthly_spend",
-		"broadcast_enabled", "talk_to_user_enabled",
+		"broadcast_enabled", "talk_to_user_enabled", "compute",
 	}
 	mock.ExpectQuery("SELECT w.id, w.name").
 		WithArgs(id).
 		WillReturnRows(sqlmock.NewRows(columns).
 			AddRow(id, "Audit Agent", "worker", 1, string(models.StatusRemoved), []byte(`null`),
-				"", nil, 0, 1, 0.0, "", 0, "", "langgraph",
+				"", nil, 0, 1, 0.0, "", 0, "", "claude-code",
 				"", 0.0, 0.0, false,
-				nil, 0, false, true))
+				nil, 0, false, true, []byte(`{}`)))
 	// last_outbound_at follow-up query (existing path)
 	mock.ExpectQuery(`SELECT last_outbound_at FROM workspaces`).
 		WithArgs(id).
@@ -342,14 +343,14 @@ func TestWorkspaceCreate_DBInsertError(t *testing.T) {
 	// Transaction begins, workspace INSERT fails, transaction is rolled back.
 	mock.ExpectBegin()
 	mock.ExpectExec("INSERT INTO workspaces").
-		WithArgs(sqlmock.AnyArg(), "Failing Agent", nil, 3, "langgraph", sqlmock.AnyArg(), (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
+		WithArgs(sqlmock.AnyArg(), "Failing Agent", nil, 3, "claude-code", (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
 		WillReturnError(sql.ErrConnDone)
 	mock.ExpectRollback()
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 
-	body := `{"name":"Failing Agent"}`
+	body := `{"name":"Failing Agent","model":"anthropic:claude-opus-4-7"}`
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
@@ -373,11 +374,13 @@ func TestWorkspaceCreate_DefaultsApplied(t *testing.T) {
 	// Transaction wraps the workspace INSERT (no secrets in this request).
 	mock.ExpectBegin()
 	// Expect workspace INSERT with defaulted tier=3 (Privileged — the
-	// handler default in workspace.go), runtime="langgraph"
+	// handler default in workspace.go), runtime="claude-code"
 	mock.ExpectExec("INSERT INTO workspaces").
-		WithArgs(sqlmock.AnyArg(), "Default Agent", nil, 3, "langgraph", sqlmock.AnyArg(), (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
+		WithArgs(sqlmock.AnyArg(), "Default Agent", nil, 3, "claude-code", (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
+	mock.ExpectExec("INSERT INTO workspace_secrets").
+		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// Expect canvas_layouts INSERT (x=0, y=0 — defaults)
 	mock.ExpectExec("INSERT INTO canvas_layouts").
@@ -391,7 +394,7 @@ func TestWorkspaceCreate_DefaultsApplied(t *testing.T) {
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 
-	body := `{"name":"Default Agent"}`
+	body := `{"name":"Default Agent","model":"anthropic:claude-opus-4-7"}`
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
@@ -423,7 +426,7 @@ func TestWorkspaceCreate_SaaSHardForcesTier4(t *testing.T) {
 
 	mock.ExpectBegin()
 	mock.ExpectExec("INSERT INTO workspaces").
-		WithArgs(sqlmock.AnyArg(), "SaaS External Agent", nil, 4, "external", sqlmock.AnyArg(), (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
+		WithArgs(sqlmock.AnyArg(), "SaaS External Agent", nil, 4, "external", (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 	mock.ExpectExec("INSERT INTO canvas_layouts").
@@ -438,7 +441,7 @@ func TestWorkspaceCreate_SaaSHardForcesTier4(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
-	body := `{"name":"SaaS External Agent","runtime":"external","external":true,"url":"https://example.com/agent","tier":2}`
+	body := `{"name":"SaaS External Agent","runtime":"external","model":"external:custom","external":true,"url":"https://example.com/agent","tier":2}`
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
@@ -464,7 +467,7 @@ func TestWorkspaceCreate_WithSecrets_Persists(t *testing.T) {
 
 	mock.ExpectBegin()
 	mock.ExpectExec("INSERT INTO workspaces").
-		WithArgs(sqlmock.AnyArg(), "Hermes Agent", nil, 3, "hermes", sqlmock.AnyArg(), (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
+		WithArgs(sqlmock.AnyArg(), "External Agent", nil, 3, "external", (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	// Secret inserted inside the same transaction.
 	mock.ExpectExec("INSERT INTO workspace_secrets").
@@ -479,7 +482,7 @@ func TestWorkspaceCreate_WithSecrets_Persists(t *testing.T) {
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 
-	body := `{"name":"Hermes Agent","runtime":"hermes","external":true,"secrets":{"HERMES_API_KEY":"sk-test-123"}}`
+	body := `{"name":"External Agent","runtime":"external","external":true,"secrets":{"HERMES_API_KEY":"sk-test-123"}}`
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
@@ -513,7 +516,7 @@ func TestWorkspaceCreate_SecretPersistFails_RollsBack(t *testing.T) {
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 
-	body := `{"name":"Rollback Agent","secrets":{"OPENAI_API_KEY":"sk-fail"}}`
+	body := `{"name":"Rollback Agent","model":"anthropic:claude-opus-4-7","secrets":{"OPENAI_API_KEY":"sk-fail"}}`
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
@@ -548,7 +551,7 @@ func TestWorkspaceCreate_EmptySecrets_OK(t *testing.T) {
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 
-	body := `{"name":"No Secrets Agent","external":true,"secrets":{}}`
+	body := `{"name":"No Secrets Agent","model":"anthropic:claude-opus-4-7","external":true,"secrets":{}}`
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
@@ -576,7 +579,7 @@ func TestWorkspaceCreate_ExternalURL_SSRFSafe(t *testing.T) {
 
 	mock.ExpectBegin()
 	mock.ExpectExec("INSERT INTO workspaces").
-		WithArgs(sqlmock.AnyArg(), "Ext Agent", nil, 3, "external", sqlmock.AnyArg(), (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
+		WithArgs(sqlmock.AnyArg(), "Ext Agent", nil, 3, "external", (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 	// External URL update (localhost is explicitly allowed by validateAgentURL).
@@ -587,7 +590,7 @@ func TestWorkspaceCreate_ExternalURL_SSRFSafe(t *testing.T) {
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 
-	body := `{"name":"Ext Agent","runtime":"external","external":true,"url":"http://localhost:8000"}`
+	body := `{"name":"Ext Agent","runtime":"external","model":"external:custom","external":true,"url":"http://localhost:8000"}`
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
@@ -615,7 +618,7 @@ func TestWorkspaceCreate_KimiRuntime_PreservesLabel(t *testing.T) {
 
 	mock.ExpectBegin()
 	mock.ExpectExec("INSERT INTO workspaces").
-		WithArgs(sqlmock.AnyArg(), "Kimi Agent", nil, 3, "kimi", sqlmock.AnyArg(), (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
+		WithArgs(sqlmock.AnyArg(), "Kimi Agent", nil, 3, "kimi", (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 	// Pre-register flow: awaiting_agent + runtime preserved as "kimi"
@@ -629,7 +632,7 @@ func TestWorkspaceCreate_KimiRuntime_PreservesLabel(t *testing.T) {
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 
-	body := `{"name":"Kimi Agent","runtime":"kimi","tier":3,"canvas":{"x":100,"y":100}}`
+	body := `{"name":"Kimi Agent","runtime":"kimi","model":"kimi-coding/kimi-k2-coding-6","tier":3,"canvas":{"x":100,"y":100}}`
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
@@ -640,6 +643,96 @@ func TestWorkspaceCreate_KimiRuntime_PreservesLabel(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+func TestWorkspaceCreate_ExternalRejectsContainerRuntimeLabel(t *testing.T) {
+	setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+
+	body := `{"name":"Bad External","external":true,"runtime":"claude-code","tier":3}`
+	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Create(c)
+
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if resp["code"] != "RUNTIME_UNSUPPORTED" {
+		t.Errorf("expected code RUNTIME_UNSUPPORTED, got %v", resp["code"])
+	}
+}
+
+func TestWorkspaceCreate_ExternalFlagDefaultsRuntimeExternal(t *testing.T) {
+	t.Setenv("MOLECULE_DEPLOY_MODE", "self-hosted")
+	t.Setenv("MOLECULE_ORG_ID", "")
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+
+	mock.ExpectBegin()
+	mock.ExpectExec("INSERT INTO workspaces").
+		WithArgs(sqlmock.AnyArg(), "External Agent", nil, 3, "external", (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+	mock.ExpectExec("UPDATE workspaces SET status").
+		WithArgs(models.StatusAwaitingAgent, "external", sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO workspace_auth_tokens").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+
+	body := `{"name":"External Agent","external":true,"tier":3}`
+	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Create(c)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+func TestWorkspaceCreate_UnsupportedRuntimeFailsBeforeInsert(t *testing.T) {
+	setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+
+	body := `{"name":"Legacy Agent","runtime":"legacy-runtime","model":"openai:gpt-4o","tier":3}`
+	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Create(c)
+
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if resp["code"] != "RUNTIME_UNSUPPORTED" {
+		t.Errorf("expected code RUNTIME_UNSUPPORTED, got %v", resp["code"])
 	}
 }
 
@@ -659,7 +752,7 @@ func TestWorkspaceCreate_ExternalURL_SSRFMetadataBlocked(t *testing.T) {
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 
-	body := `{"name":"Bad Agent","runtime":"external","external":true,"url":"http://169.254.169.254/latest/meta-data/"}`
+	body := `{"name":"Bad Agent","runtime":"external","model":"external:custom","external":true,"url":"http://169.254.169.254/latest/meta-data/"}`
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
@@ -690,7 +783,7 @@ func TestWorkspaceCreate_ExternalURL_SSRFLoopbackBlocked(t *testing.T) {
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 
-	body := `{"name":"Bad Loopback","runtime":"external","external":true,"url":"http://127.0.0.1:9000/a2a"}`
+	body := `{"name":"Bad Loopback","runtime":"external","model":"external:custom","external":true,"url":"http://127.0.0.1:9000/a2a"}`
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
@@ -718,7 +811,7 @@ func TestWorkspaceList_Empty(t *testing.T) {
 			"parent_id", "active_tasks", "last_error_rate", "last_sample_error",
 			"uptime_seconds", "current_task", "runtime", "workspace_dir", "x", "y", "collapsed",
 			"budget_limit", "monthly_spend",
-			"broadcast_enabled", "talk_to_user_enabled",
+			"broadcast_enabled", "talk_to_user_enabled", "compute",
 		}))
 
 	w := httptest.NewRecorder()
@@ -863,6 +956,45 @@ func TestWorkspaceUpdate_RuntimeField(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Errorf("expected status 200, got %d: %s", w.Code, w.Body.String())
 	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to parse response: %v", err)
+	}
+	if resp["needs_restart"] != true {
+		t.Errorf("expected needs_restart=true, got %v", resp["needs_restart"])
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+func TestWorkspaceUpdate_RuntimeField_DBErrorReturnsServerError(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+
+	mock.ExpectQuery("SELECT EXISTS.*workspaces WHERE id").
+		WithArgs("cccccccc-0006-0000-0000-000000000001").
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+	mock.ExpectExec("UPDATE workspaces SET runtime").
+		WithArgs("cccccccc-0006-0000-0000-000000000001", "hermes").
+		WillReturnError(errors.New("database unavailable"))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "cccccccc-0006-0000-0000-000000000001"}}
+
+	body := `{"runtime":"hermes"}`
+	c.Request = httptest.NewRequest("PATCH", "/workspaces/ws-rt", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Update(c)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("expected status 500, got %d: %s", w.Code, w.Body.String())
+	}
 
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations: %v", err)
@@ -877,6 +1009,8 @@ func TestWorkspaceDelete_ConfirmationRequired(t *testing.T) {
 	broadcaster := newTestBroadcaster()
 	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
 
+	expectWorkspaceDeleteLookup(mock, "cccccccc-0007-0000-0000-000000000000", "Parent Workspace", 0, "running")
+
 	// Children query returns 2 children
 	mock.ExpectQuery("SELECT id, name FROM workspaces WHERE parent_id").
 		WithArgs("cccccccc-0007-0000-0000-000000000000").
@@ -889,6 +1023,7 @@ func TestWorkspaceDelete_ConfirmationRequired(t *testing.T) {
 	c.Params = gin.Params{{Key: "id", Value: "cccccccc-0007-0000-0000-000000000000"}}
 	// No ?confirm=true
 	c.Request = httptest.NewRequest("DELETE", "/workspaces/ws-parent", nil)
+	c.Request.Header.Set("X-Confirm-Name", "Parent Workspace")
 
 	handler.Delete(c)
 
@@ -921,6 +1056,8 @@ func TestWorkspaceDelete_CascadeWithChildren(t *testing.T) {
 	setupTestRedis(t)
 	broadcaster := newTestBroadcaster()
 	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+
+	expectWorkspaceDeleteLookup(mock, "cccccccc-000a-0000-0000-000000000000", "Parent Delete", 0, "running")
 
 	// Children query returns 1 child
 	mock.ExpectQuery("SELECT id, name FROM workspaces WHERE parent_id").
@@ -957,6 +1094,7 @@ func TestWorkspaceDelete_CascadeWithChildren(t *testing.T) {
 	c, _ := gin.CreateTestContext(w)
 	c.Params = gin.Params{{Key: "id", Value: "cccccccc-000a-0000-0000-000000000000"}}
 	c.Request = httptest.NewRequest("DELETE", "/workspaces/ws-parent-del?confirm=true", nil)
+	c.Request.Header.Set("X-Confirm-Name", "Parent Delete")
 
 	handler.Delete(c)
 
@@ -992,6 +1130,8 @@ func TestWorkspaceDelete_DisablesSchedules(t *testing.T) {
 
 	wsID := "dddddddd-0001-0000-0000-000000000000"
 
+	expectWorkspaceDeleteLookup(mock, wsID, "Scheduled Workspace", 0, "running")
+
 	// No children
 	mock.ExpectQuery("SELECT id, name FROM workspaces WHERE parent_id").
 		WithArgs(wsID).
@@ -1023,6 +1163,7 @@ func TestWorkspaceDelete_DisablesSchedules(t *testing.T) {
 	c, _ := gin.CreateTestContext(w)
 	c.Params = gin.Params{{Key: "id", Value: wsID}}
 	c.Request = httptest.NewRequest("DELETE", "/workspaces/"+wsID+"?confirm=true", nil)
+	c.Request.Header.Set("X-Confirm-Name", "Scheduled Workspace")
 
 	handler.Delete(c)
 
@@ -1047,6 +1188,8 @@ func TestWorkspaceDelete_CascadeDisablesDescendantSchedules(t *testing.T) {
 	parentID := "dddddddd-0002-0000-0000-000000000000"
 	childID := "dddddddd-0003-0000-0000-000000000000"
 	grandchildID := "dddddddd-0004-0000-0000-000000000000"
+
+	expectWorkspaceDeleteLookup(mock, parentID, "Parent Scheduled Workspace", 0, "running")
 
 	// Children query returns 1 direct child
 	mock.ExpectQuery("SELECT id, name FROM workspaces WHERE parent_id").
@@ -1087,6 +1230,7 @@ func TestWorkspaceDelete_CascadeDisablesDescendantSchedules(t *testing.T) {
 	c, _ := gin.CreateTestContext(w)
 	c.Params = gin.Params{{Key: "id", Value: parentID}}
 	c.Request = httptest.NewRequest("DELETE", "/workspaces/"+parentID+"?confirm=true", nil)
+	c.Request.Header.Set("X-Confirm-Name", "Parent Scheduled Workspace")
 
 	handler.Delete(c)
 
@@ -1120,6 +1264,8 @@ func TestWorkspaceDelete_ScheduleDisableOnlyTargetsDeletedWorkspace(t *testing.T
 	wsA := "dddddddd-0005-0000-0000-000000000000"
 	// wsB is "dddddddd-0006-0000-0000-000000000000" — NOT part of the delete
 
+	expectWorkspaceDeleteLookup(mock, wsA, "Workspace A", 0, "running")
+
 	// No children for workspace A
 	mock.ExpectQuery("SELECT id, name FROM workspaces WHERE parent_id").
 		WithArgs(wsA).
@@ -1150,6 +1296,7 @@ func TestWorkspaceDelete_ScheduleDisableOnlyTargetsDeletedWorkspace(t *testing.T
 	c, _ := gin.CreateTestContext(w)
 	c.Params = gin.Params{{Key: "id", Value: wsA}}
 	c.Request = httptest.NewRequest("DELETE", "/workspaces/"+wsA+"?confirm=true", nil)
+	c.Request.Header.Set("X-Confirm-Name", "Workspace A")
 
 	handler.Delete(c)
 
@@ -1172,6 +1319,8 @@ func TestWorkspaceDelete_ChildrenQueryError(t *testing.T) {
 	broadcaster := newTestBroadcaster()
 	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
 
+	expectWorkspaceDeleteLookup(mock, "cccccccc-000c-0000-0000-000000000000", "Error Workspace", 0, "running")
+
 	mock.ExpectQuery("SELECT id, name FROM workspaces WHERE parent_id").
 		WithArgs("cccccccc-000c-0000-0000-000000000000").
 		WillReturnError(sql.ErrConnDone)
@@ -1180,6 +1329,7 @@ func TestWorkspaceDelete_ChildrenQueryError(t *testing.T) {
 	c, _ := gin.CreateTestContext(w)
 	c.Params = gin.Params{{Key: "id", Value: "cccccccc-000c-0000-0000-000000000000"}}
 	c.Request = httptest.NewRequest("DELETE", "/workspaces/ws-err-del?confirm=true", nil)
+	c.Request.Header.Set("X-Confirm-Name", "Error Workspace")
 
 	handler.Delete(c)
 
@@ -1422,16 +1572,16 @@ func TestWorkspaceGet_FinancialFieldsStripped(t *testing.T) {
 		"parent_id", "active_tasks", "max_concurrent_tasks", "last_error_rate", "last_sample_error",
 		"uptime_seconds", "current_task", "runtime", "workspace_dir", "x", "y", "collapsed",
 		"budget_limit", "monthly_spend",
-		"broadcast_enabled", "talk_to_user_enabled",
+		"broadcast_enabled", "talk_to_user_enabled", "compute",
 	}
 	// Populate with non-zero financial values to confirm they are stripped.
 	mock.ExpectQuery("SELECT w.id, w.name").
 		WithArgs("cccccccc-0010-0000-0000-000000000000").
 		WillReturnRows(sqlmock.NewRows(columns).
 			AddRow("cccccccc-0010-0000-0000-000000000000", "Finance Test", "worker", 1, "online", []byte(`{}`),
-				"http://localhost:9001", nil, 0, 1, 0.0, "", 0, "", "langgraph",
+				"http://localhost:9001", nil, 0, 1, 0.0, "", 0, "", "claude-code",
 				"", 0.0, 0.0, false,
-				int64(50000), int64(12500), false, true)) // budget_limit=500 USD, spend=125 USD
+				int64(50000), int64(12500), false, true, []byte(`{}`))) // budget_limit=500 USD, spend=125 USD
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -1479,7 +1629,7 @@ func TestWorkspaceGet_SensitiveFieldsStripped(t *testing.T) {
 		"parent_id", "active_tasks", "max_concurrent_tasks", "last_error_rate", "last_sample_error",
 		"uptime_seconds", "current_task", "runtime", "workspace_dir", "x", "y", "collapsed",
 		"budget_limit", "monthly_spend",
-		"broadcast_enabled", "talk_to_user_enabled",
+		"broadcast_enabled", "talk_to_user_enabled", "compute",
 	}
 	mock.ExpectQuery("SELECT w.id, w.name").
 		WithArgs("cccccccc-0955-0000-0000-000000000000").
@@ -1489,10 +1639,10 @@ func TestWorkspaceGet_SensitiveFieldsStripped(t *testing.T) {
 				"panic: internal error at /secret/path.go:42",
 				100,
 				"Analyzing customer PII for the Q4 report",
-				"langgraph",
+				"claude-code",
 				"/home/user/secret-projects/client-work",
 				0.0, 0.0, false,
-				nil, 0, false, true))
+				nil, 0, false, true, []byte(`{}`)))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -1639,7 +1789,7 @@ runtime_config:
 	mock.ExpectExec("INSERT INTO workspaces").
 		WithArgs(
 			sqlmock.AnyArg(), "Hermes Agent", nil, 3, "hermes",
-			sqlmock.AnyArg(), (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
+			(*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 	mock.ExpectExec("INSERT INTO canvas_layouts").
@@ -1679,7 +1829,7 @@ func TestWorkspaceCreate_TemplateDefaultsLegacyTopLevelModel(t *testing.T) {
 	}
 	cfg := []byte(`name: Legacy Agent
 tier: 1
-runtime: langgraph
+runtime: hermes
 model: anthropic:claude-sonnet-4-5
 `)
 	if err := os.WriteFile(filepath.Join(templateDir, "config.yaml"), cfg, 0o644); err != nil {
@@ -1695,10 +1845,12 @@ model: anthropic:claude-sonnet-4-5
 	// this assertion should flip back to 1.
 	mock.ExpectExec("INSERT INTO workspaces").
 		WithArgs(
-			sqlmock.AnyArg(), "Legacy Agent", nil, 3, "langgraph",
-			sqlmock.AnyArg(), (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
+			sqlmock.AnyArg(), "Legacy Agent", nil, 3, "hermes",
+			(*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
+	mock.ExpectExec("INSERT INTO workspace_secrets").
+		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec("INSERT INTO canvas_layouts").
 		WithArgs(sqlmock.AnyArg(), float64(0), float64(0)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -1749,7 +1901,7 @@ runtime_config:
 	mock.ExpectExec("INSERT INTO workspaces").
 		WithArgs(
 			sqlmock.AnyArg(), "Custom Hermes", nil, 3, "hermes",
-			sqlmock.AnyArg(), (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
+			(*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 	mock.ExpectExec("INSERT INTO canvas_layouts").
@@ -1775,14 +1927,14 @@ runtime_config:
 //
 // molecule-controlplane#188 / #184: if a caller names a `template` (intent
 // for a specific runtime) but the runtime cannot be resolved from it, the
-// server MUST NOT silently provision langgraph and return 201 — that false
+// server MUST NOT silently provision claude-code and return 201 — that false
 // success produced 5/5 wrong workspaces and a bogus codex E2E pass. These
 // tests pin the fail-closed boundary at the ws-server `Create` handler (the
 // path the product UI hits), and guard the legitimate default path against
 // regression.
 
 // Template requested but its dir/config.yaml is absent → 422, not silent
-// langgraph 201.
+// claude-code 201.
 func TestWorkspaceCreate_188_TemplateMissingRuntime_FailsClosed(t *testing.T) {
 	setupTestDB(t)
 	setupTestRedis(t)
@@ -1815,7 +1967,7 @@ func TestWorkspaceCreate_188_TemplateMissingRuntime_FailsClosed(t *testing.T) {
 	}
 }
 
-// Template config.yaml has no `runtime:` key → 422, not silent langgraph.
+// Template config.yaml has no `runtime:` key → 422, not silent claude-code.
 func TestWorkspaceCreate_188_TemplateConfigNoRuntimeKey_FailsClosed(t *testing.T) {
 	setupTestDB(t)
 	setupTestRedis(t)
@@ -1844,39 +1996,43 @@ func TestWorkspaceCreate_188_TemplateConfigNoRuntimeKey_FailsClosed(t *testing.T
 	}
 }
 
-// Regression guard: the legitimate default path (no template, no runtime —
-// bare {"name":...}) MUST still default to langgraph and return 201. The
-// #188 fix must not break this.
-func TestWorkspaceCreate_188_NoTemplateNoRuntime_StillDefaultsLanggraph(t *testing.T) {
-	mock := setupTestDB(t)
+// Pre-2026-05-22 this test guarded "bare {name} → claude-code 201" — the
+// regression check for controlplane#188 (where an explicit runtime that
+// failed to resolve must NOT silently substitute claude-code) had a sibling
+// to ensure the LEGITIMATE bare default still landed on claude-code.
+//
+// Post-CTO-SSOT-directive (2026-05-22) bare body is 422 MODEL_REQUIRED
+// before reaching the claude-code branch — the gate runs AFTER the
+// claude-code-default assignment so the error body still surfaces
+// runtime=claude-code (helps the caller see "ok, claude-code WOULD have
+// been the runtime, but you still owe me a model"). The bare-body
+// claude-code 201 path no longer exists; what we guard now is the
+// 422-shape diagnostic.
+//
+// Bare-body-with-explicit-model 201 (the new "legitimate default" path)
+// is covered by TestWorkspaceCreate in handlers_test.go — no need to
+// duplicate the mock dance here.
+func TestWorkspaceCreate_188_NoTemplateNoRuntime_NowMODEL_REQUIRED(t *testing.T) {
+	setupTestDB(t)
 	setupTestRedis(t)
 	broadcaster := newTestBroadcaster()
 	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
-
-	mock.ExpectBegin()
-	mock.ExpectExec("INSERT INTO workspaces").
-		WithArgs(sqlmock.AnyArg(), "Plain Default", nil, 3, "langgraph", sqlmock.AnyArg(), (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectCommit()
-	mock.ExpectExec("INSERT INTO canvas_layouts").
-		WithArgs(sqlmock.AnyArg(), float64(0), float64(0)).
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec("INSERT INTO structure_events").
-		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 	body := `{"name":"Plain Default"}`
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
-
 	handler.Create(c)
 
-	if w.Code != http.StatusCreated {
-		t.Fatalf("expected 201 (legitimate default path), got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("bare-body create: expected 422 MODEL_REQUIRED, got %d: %s", w.Code, w.Body.String())
 	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("unmet sqlmock expectations: %v", err)
+	if !bytes.Contains(w.Body.Bytes(), []byte(`"code":"MODEL_REQUIRED"`)) {
+		t.Errorf("bare-body create: expected code=MODEL_REQUIRED in body, got %s", w.Body.String())
+	}
+	if !bytes.Contains(w.Body.Bytes(), []byte(`"runtime":"claude-code"`)) {
+		t.Errorf("bare-body create: expected runtime=\"claude-code\" in 422 body (the gate runs AFTER the default assignment so the diagnostic surfaces what runtime WOULD have been used), got %s", w.Body.String())
 	}
 }
 
@@ -1890,7 +2046,7 @@ func TestWorkspaceCreate_188_ExplicitRuntimeNoTemplate_OK(t *testing.T) {
 
 	mock.ExpectBegin()
 	mock.ExpectExec("INSERT INTO workspaces").
-		WithArgs(sqlmock.AnyArg(), "Explicit Codex", nil, 3, "codex", sqlmock.AnyArg(), (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
+		WithArgs(sqlmock.AnyArg(), "Explicit Codex", nil, 3, "codex", (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 	mock.ExpectExec("INSERT INTO canvas_layouts").
@@ -1901,7 +2057,7 @@ func TestWorkspaceCreate_188_ExplicitRuntimeNoTemplate_OK(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
-	body := `{"name":"Explicit Codex","runtime":"codex"}`
+	body := `{"name":"Explicit Codex","runtime":"codex","model":"gpt-5.5"}`
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 

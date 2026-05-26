@@ -109,8 +109,9 @@ curl -X POST http://localhost:8080/registry/register \
 # Response: {"auth_token": "...", ...}
 ```
 
-For development, the test-token endpoint is also available (disabled in production):
+Tenant admins can mint a real workspace token through the production-safe admin route:
 ```bash
-curl http://localhost:8080/admin/workspaces/<id>/test-token
+curl -X POST http://localhost:8080/admin/workspaces/<id>/tokens \
+  -H "Authorization: Bearer <ADMIN_TOKEN>"
 # Response: {"auth_token": "...", "workspace_id": "..."}
 ```

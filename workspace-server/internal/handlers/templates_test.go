@@ -86,6 +86,7 @@ func TestTemplatesList_WithTemplates(t *testing.T) {
 	configYaml := `name: Test Agent
 description: A test agent
 tier: 2
+runtime: claude-code
 model: anthropic:claude-sonnet-4-20250514
 skills:
   - web-search
@@ -132,6 +133,71 @@ skills:
 	}
 }
 
+func TestTemplatesList_CacheOverridesBakedTemplate(t *testing.T) {
+	setupTestDB(t)
+	setupTestRedis(t)
+
+	bakedDir := t.TempDir()
+	cacheDir := t.TempDir()
+
+	mustWriteTemplate := func(root, id, body string) {
+		t.Helper()
+		dir := filepath.Join(root, id)
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(body), 0644); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+	}
+
+	mustWriteTemplate(bakedDir, "seo-agent", `name: SEO Agent
+description: stale
+tier: 4
+runtime: claude-code
+model: old
+runtime_config:
+  recommended_env: [TELEGRAM_BOT_TOKEN]
+skills: []
+`)
+	mustWriteTemplate(cacheDir, "seo-agent", `name: SEO Agent
+description: fresh
+tier: 4
+runtime: claude-code
+model: moonshot/kimi-k2.6
+runtime_config:
+  required_env: [TENANT_NAME]
+  recommended_env: [GOOGLE_GSC_SITE]
+skills: []
+`)
+
+	handler := NewTemplatesHandler(bakedDir, nil, nil).WithCacheDir(cacheDir)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest("GET", "/templates", nil)
+	handler.List(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp []templateSummary
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(resp) != 1 {
+		t.Fatalf("expected 1 template, got %d", len(resp))
+	}
+	if resp[0].Description != "fresh" {
+		t.Fatalf("cache template should override baked copy, got description %q", resp[0].Description)
+	}
+	if !reflect.DeepEqual(resp[0].RequiredEnv, []string{"TENANT_NAME"}) {
+		t.Fatalf("RequiredEnv = %+v", resp[0].RequiredEnv)
+	}
+	if reflect.DeepEqual(resp[0].RecommendedEnv, []string{"TELEGRAM_BOT_TOKEN"}) {
+		t.Fatalf("stale baked recommended_env leaked through: %+v", resp[0].RecommendedEnv)
+	}
+}
+
 func TestTemplatesList_RuntimeAndModelsRegistry(t *testing.T) {
 	setupTestDB(t)
 	setupTestRedis(t)
@@ -147,12 +213,14 @@ tier: 2
 runtime: hermes
 runtime_config:
   model: nous-hermes-3-70b
+  recommended_env: [GOOGLE_GSC_SITE, GOOGLE_GA4_PROPERTY_ID]
   models:
     - id: nous-hermes-3-70b
       name: Nous Hermes 3 70B
       required_env: [HERMES_API_KEY]
     - id: minimax/minimax-m2.7
       name: MiniMax M2.7 (via OpenRouter)
+      provider: platform
       required_env: [OPENROUTER_API_KEY]
 skills: []
 `
@@ -195,8 +263,16 @@ skills: []
 	if got.Models[1].ID != "minimax/minimax-m2.7" {
 		t.Errorf("Models[1].ID: got %q", got.Models[1].ID)
 	}
+	if got.Models[1].Provider != "platform" {
+		t.Errorf("Models[1].Provider: got %q", got.Models[1].Provider)
+	}
 	if len(got.Models[1].RequiredEnv) != 1 || got.Models[1].RequiredEnv[0] != "OPENROUTER_API_KEY" {
 		t.Errorf("Models[1] required_env: want [OPENROUTER_API_KEY], got %+v", got.Models[1].RequiredEnv)
+	}
+	if len(got.RecommendedEnv) != 2 ||
+		got.RecommendedEnv[0] != "GOOGLE_GSC_SITE" ||
+		got.RecommendedEnv[1] != "GOOGLE_GA4_PROPERTY_ID" {
+		t.Errorf("RecommendedEnv: want [GOOGLE_GSC_SITE GOOGLE_GA4_PROPERTY_ID], got %+v", got.RecommendedEnv)
 	}
 }
 
@@ -385,7 +461,7 @@ skills: []
 
 // TestTemplatesList_OmitsProviderRegistryWhenAbsent pins the omitempty
 // behavior for the new field — templates without a top-level
-// `providers:` block (hermes today, langgraph, etc.) must NOT emit
+// `providers:` block (hermes today, claude-code, etc.) must NOT emit
 // `provider_registry: null`, which would break canvas's array-typed
 // parser (Array.isArray check returns false for null).
 // TestTemplatesList_BothProviderShapesCoexist pins the real production
@@ -546,7 +622,7 @@ func TestTemplatesList_OmitsProvidersWhenAbsent(t *testing.T) {
 		t.Fatalf("mkdir: %v", err)
 	}
 	configYaml := `name: Legacy
-runtime: langgraph
+runtime: hermes
 runtime_config:
   model: anthropic:claude-opus-4-7
 skills: []
@@ -582,6 +658,7 @@ func TestTemplatesList_LegacyTopLevelModel(t *testing.T) {
 	}
 	configYaml := `name: Legacy Agent
 tier: 1
+runtime: claude-code
 model: anthropic:claude-sonnet-4-6
 skills: []
 `
@@ -600,10 +677,10 @@ skills: []
 		t.Fatalf("parse: %v", err)
 	}
 	if len(resp) != 1 || resp[0].Model != "anthropic:claude-sonnet-4-6" {
-		t.Errorf("legacy top-level model not surfaced: %+v", resp)
+		t.Fatalf("legacy top-level model not surfaced: %+v", resp)
 	}
-	if resp[0].Runtime != "" {
-		t.Errorf("Runtime should be empty for legacy template, got %q", resp[0].Runtime)
+	if resp[0].Runtime != "claude-code" {
+		t.Errorf("Runtime should be claude-code for legacy template, got %q", resp[0].Runtime)
 	}
 	if len(resp[0].Models) != 0 {
 		t.Errorf("Models should be empty for legacy template, got %+v", resp[0].Models)

@@ -57,6 +57,7 @@ export function OrgCancelButton({ rootId, rootName, workspaceCount }: Props) {
     try {
       await api.del<{ status: string }>(
         `/workspaces/${rootId}?confirm=true`,
+        { headers: { "X-Confirm-Name": rootName } },
       );
       showToast(`Cancelled deployment of "${rootName}"`, "success");
       // Optimistic local removal — workspace-server broadcasts

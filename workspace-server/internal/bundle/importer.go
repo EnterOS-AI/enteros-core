@@ -5,10 +5,10 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/events"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/models"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/provisioner"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
 	"github.com/google/uuid"
 )
 
@@ -60,8 +60,8 @@ func Import(
 	// Build config files in memory for the provisioner
 	configFiles := buildBundleConfigFiles(b)
 
-	// Extract runtime from config.yaml in the bundle
-	bundleRuntime := "langgraph"
+	// Extract runtime from config.yaml in the bundle.
+	bundleRuntime := "claude-code"
 	if configYaml, ok := b.Prompts["config.yaml"]; ok {
 		for _, line := range strings.Split(configYaml, "\n") {
 			line = strings.TrimSpace(line)

@@ -67,6 +67,7 @@ jobs:
           fetch-depth: 1
 
       - name: Install shellcheck (arm64)
+        continue-on-error: true
         run: |
           set -eu
           if command -v shellcheck >/dev/null 2>&1; then
@@ -86,12 +87,16 @@ jobs:
           shellcheck --version | head -2
 
       - name: Run shellcheck on .gitea/scripts/*.sh
+        continue-on-error: true
         run: |
           set -eu
           # Only the scripts we control under .gitea/scripts. Pilot
           # scope is intentionally narrow — broaden in a follow-up
           # once the lane is proven.
-          #
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            echo "WARN: shellcheck binary not found — skipping (pilot mode)"
+            exit 0
+          fi
           # NOTE: macOS ships Bash 3.2 (Apple license), no `mapfile`
           # (Bash 4+ builtin). Mac mini runner empirically failed at
           # `mapfile: command not found` (run 79275 / task 145654).

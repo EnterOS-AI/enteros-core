@@ -11,10 +11,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/events"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/models"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/provlog"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provlog"
 	"github.com/gin-gonic/gin"
 )
 
@@ -164,7 +164,7 @@ func (h *WorkspaceHandler) maybeRestartAfterFileWrite(workspaceID string) {
 // isRestarting reports whether a restart cycle is currently in flight for
 // the workspace. Callers that have their own "container looks dead" probe
 // MUST consult this before triggering a restart, because during the
-// 20-30s EC2-pending window the workspace's url='' and IsRunning()=false
+// 20-30s EC2-pending window the workspace's url=” and IsRunning()=false
 // looks identical to a dead container — and any restart-triggering probe
 // (maybeMarkContainerDead from canvas /delegations poll, or the trailing
 // restart-context probe at the end of runRestartCycle) will set
@@ -212,7 +212,7 @@ func (h *WorkspaceHandler) Restart(c *gin.Context) {
 	var status, wsName, dbRuntime string
 	var tier int
 	err := db.DB.QueryRowContext(ctx,
-		`SELECT status, name, tier, COALESCE(runtime, 'langgraph') FROM workspaces WHERE id = $1`, id,
+		`SELECT status, name, tier, COALESCE(runtime, 'claude-code') FROM workspaces WHERE id = $1`, id,
 	).Scan(&status, &wsName, &tier, &dbRuntime)
 	if err == sql.ErrNoRows {
 		c.JSON(http.StatusNotFound, gin.H{"error": "workspace not found"})
@@ -272,28 +272,24 @@ func (h *WorkspaceHandler) Restart(c *gin.Context) {
 		return
 	}
 
+	// Read template from request body before consulting the existing
+	// config volume. apply_template means the caller just changed the
+	// runtime in the DB and wants the runtime-default template to be
+	// authoritative; in that case, reading the old container config would
+	// roll the DB runtime back before restart.
+	var body struct {
+		Template      string `json:"template"`
+		ApplyTemplate bool   `json:"apply_template"` // force re-apply runtime-default template (e.g. after runtime change)
+		Reset         bool   `json:"reset"`          // #12: discard claude-sessions volume before restart
+		RebuildConfig bool   `json:"rebuild_config"` // #239: re-render config volume from org-template source (recovery path when volume was destroyed)
+	}
+	c.ShouldBindJSON(&body)
+
 	// Read runtime from container's config.yaml before stopping. Docker-
 	// only: in SaaS mode the workspace runs on a remote EC2 and we can't
 	// exec into it, so we trust the DB value (user updates runtime via
 	// the Config tab which writes through to both the DB and the container).
-	containerRuntime := dbRuntime
-	if h.provisioner != nil {
-		containerName := configDirName(id) // ws-{id[:12]}
-		if cfgBytes, readErr := h.provisioner.ExecRead(ctx, containerName, "/configs/config.yaml"); readErr == nil {
-			for _, line := range strings.Split(string(cfgBytes), "\n") {
-				line = strings.TrimSpace(line)
-				if strings.HasPrefix(line, "runtime:") {
-					parsed := strings.TrimSpace(strings.TrimPrefix(line, "runtime:"))
-					if parsed != "" && parsed != containerRuntime {
-						log.Printf("Restart: runtime changed in config.yaml %q→%q for %s", containerRuntime, parsed, wsName)
-						containerRuntime = parsed
-						db.DB.ExecContext(ctx, `UPDATE workspaces SET runtime = $1 WHERE id = $2`, containerRuntime, id)
-					}
-					break
-				}
-			}
-		}
-	}
+	containerRuntime := h.restartRuntimeFromConfig(ctx, id, wsName, dbRuntime, body.ApplyTemplate)
 
 	// Reset to provisioning
 	db.DB.ExecContext(ctx,
@@ -303,15 +299,6 @@ func (h *WorkspaceHandler) Restart(c *gin.Context) {
 		"tier":    tier,
 		"runtime": containerRuntime,
 	})
-
-	// Read template from request body or try to find matching config
-	var body struct {
-		Template      string `json:"template"`
-		ApplyTemplate bool   `json:"apply_template"` // force re-apply runtime-default template (e.g. after runtime change)
-		Reset         bool   `json:"reset"`          // #12: discard claude-sessions volume before restart
-		RebuildConfig bool   `json:"rebuild_config"` // #239: re-render config volume from org-template source (recovery path when volume was destroyed)
-	}
-	c.ShouldBindJSON(&body)
 
 	templatePath, configLabel := resolveRestartTemplate(h.configsDir, wsName, dbRuntime, restartTemplateInput{
 		Template:      body.Template,
@@ -337,7 +324,7 @@ func (h *WorkspaceHandler) Restart(c *gin.Context) {
 	}
 
 	var configFiles map[string][]byte
-	payload := models.CreateWorkspacePayload{Name: wsName, Tier: tier, Runtime: containerRuntime}
+	payload := withStoredCompute(ctx, id, models.CreateWorkspacePayload{Name: wsName, Tier: tier, Runtime: containerRuntime})
 	log.Printf("Restart: workspace %s (%s) runtime=%q", wsName, id, containerRuntime)
 
 	// #12: ?reset=true (or body.Reset) discards the claude-sessions volume
@@ -380,6 +367,29 @@ func (h *WorkspaceHandler) Restart(c *gin.Context) {
 	h.goAsync(func() { h.sendRestartContext(id, restartData) })
 
 	c.JSON(http.StatusOK, gin.H{"status": "provisioning", "config_dir": configLabel, "reset_session": resetClaudeSession})
+}
+
+func (h *WorkspaceHandler) restartRuntimeFromConfig(ctx context.Context, id, wsName, dbRuntime string, applyTemplate bool) string {
+	if h.provisioner == nil || applyTemplate {
+		return dbRuntime
+	}
+	containerRuntime := dbRuntime
+	containerName := configDirName(id) // ws-{id[:12]}
+	if cfgBytes, readErr := h.provisioner.ExecRead(ctx, containerName, "/configs/config.yaml"); readErr == nil {
+		for _, line := range strings.Split(string(cfgBytes), "\n") {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "runtime:") {
+				parsed := strings.TrimSpace(strings.TrimPrefix(line, "runtime:"))
+				if parsed != "" && parsed != containerRuntime {
+					log.Printf("Restart: runtime changed in config.yaml %q→%q for %s", containerRuntime, parsed, wsName)
+					containerRuntime = parsed
+					db.DB.ExecContext(ctx, `UPDATE workspaces SET runtime = $1 WHERE id = $2`, containerRuntime, id)
+				}
+				break
+			}
+		}
+	}
+	return containerRuntime
 }
 
 // Hibernate handles POST /workspaces/:id/hibernate
@@ -744,7 +754,7 @@ func (h *WorkspaceHandler) runRestartCycle(workspaceID string) {
 	var wsName, status, dbRuntime string
 	var tier int
 	err := db.DB.QueryRowContext(ctx,
-		`SELECT name, status, tier, COALESCE(runtime, 'langgraph') FROM workspaces WHERE id = $1 AND status NOT IN ('removed', 'paused', 'hibernated')`, workspaceID,
+		`SELECT name, status, tier, COALESCE(runtime, 'claude-code') FROM workspaces WHERE id = $1 AND status NOT IN ('removed', 'paused', 'hibernated')`, workspaceID,
 	).Scan(&wsName, &status, &tier, &dbRuntime)
 	if err != nil {
 		return // includes paused/hibernated — don't auto-restart those
@@ -791,7 +801,7 @@ func (h *WorkspaceHandler) runRestartCycle(workspaceID string) {
 	})
 
 	// Runtime from DB — no more config file parsing
-	payload := models.CreateWorkspacePayload{Name: wsName, Tier: tier, Runtime: dbRuntime}
+	payload := withStoredCompute(ctx, workspaceID, models.CreateWorkspacePayload{Name: wsName, Tier: tier, Runtime: dbRuntime})
 
 	// Snapshot restart-context data before the new session overwrites
 	// last_heartbeat_at. Issue #19 Layer 1.
@@ -858,6 +868,9 @@ func (h *WorkspaceHandler) Pause(c *gin.Context) {
 				toPause = append(toPause, struct{ id, name string }{cid, cname})
 			}
 		}
+		if err := rows.Err(); err != nil {
+			log.Printf("Pause: descendant query rows.Err: %v", err)
+		}
 	}
 
 	// Stop containers and mark all as paused. StopWorkspaceAuto routes
@@ -894,7 +907,7 @@ func (h *WorkspaceHandler) Resume(c *gin.Context) {
 	var wsName, dbRuntime string
 	var tier int
 	err := db.DB.QueryRowContext(ctx,
-		`SELECT name, tier, COALESCE(runtime, 'langgraph') FROM workspaces WHERE id = $1 AND status = 'paused'`, id,
+		`SELECT name, tier, COALESCE(runtime, 'claude-code') FROM workspaces WHERE id = $1 AND status = 'paused'`, id,
 	).Scan(&wsName, &tier, &dbRuntime)
 	if err == sql.ErrNoRows {
 		c.JSON(http.StatusNotFound, gin.H{"error": "workspace not found or not paused"})
@@ -927,9 +940,9 @@ func (h *WorkspaceHandler) Resume(c *gin.Context) {
 	toResume := []wsInfo{{id, wsName, dbRuntime, tier}}
 	rows, _ := db.DB.QueryContext(ctx,
 		`WITH RECURSIVE descendants AS (
-			SELECT id, name, tier, COALESCE(runtime, 'langgraph') AS runtime FROM workspaces WHERE parent_id = $1 AND status = 'paused'
+			SELECT id, name, tier, COALESCE(runtime, 'claude-code') AS runtime FROM workspaces WHERE parent_id = $1 AND status = 'paused'
 			UNION ALL
-			SELECT w.id, w.name, w.tier, COALESCE(w.runtime, 'langgraph') FROM workspaces w JOIN descendants d ON w.parent_id = d.id WHERE w.status = 'paused'
+			SELECT w.id, w.name, w.tier, COALESCE(w.runtime, 'claude-code') FROM workspaces w JOIN descendants d ON w.parent_id = d.id WHERE w.status = 'paused'
 		) SELECT id, name, tier, runtime FROM descendants`, id)
 	if rows != nil {
 		defer rows.Close()
@@ -938,6 +951,9 @@ func (h *WorkspaceHandler) Resume(c *gin.Context) {
 			if rows.Scan(&ws.id, &ws.name, &ws.tier, &ws.runtime) == nil {
 				toResume = append(toResume, ws)
 			}
+		}
+		if err := rows.Err(); err != nil {
+			log.Printf("Resume: descendant query rows.Err: %v", err)
 		}
 	}
 
@@ -948,7 +964,7 @@ func (h *WorkspaceHandler) Resume(c *gin.Context) {
 		h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceProvisioning), ws.id, map[string]interface{}{
 			"name": ws.name, "tier": ws.tier, "runtime": ws.runtime,
 		})
-		payload := models.CreateWorkspacePayload{Name: ws.name, Tier: ws.tier, Runtime: ws.runtime}
+		payload := withStoredCompute(ctx, ws.id, models.CreateWorkspacePayload{Name: ws.name, Tier: ws.tier, Runtime: ws.runtime})
 		// Resume is provision-only (workspace is paused, no live container
 		// to stop). provisionWorkspaceAuto handles backend routing and the
 		// no-backend mark-failed fallback identically to Create. Pre-

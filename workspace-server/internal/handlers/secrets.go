@@ -5,16 +5,43 @@ import (
 	"database/sql"
 	"log"
 	"net/http"
+	"os"
 	"regexp"
+	"strings"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/audit"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/crypto"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/wsauth"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/audit"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/crypto"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wsauth"
 	"github.com/gin-gonic/gin"
 )
 
 var uuidRegex = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+
+var platformManagedDirectLLMBypassKeys = map[string]struct{}{
+	"HERMES_CUSTOM_API_KEY":  {},
+	"HERMES_CUSTOM_BASE_URL": {},
+}
+
+func isPlatformManagedDirectLLMBypassKey(key string) bool {
+	_, ok := platformManagedDirectLLMBypassKeys[strings.ToUpper(strings.TrimSpace(key))]
+	return ok
+}
+
+func platformManagedLLMMode() bool {
+	return strings.EqualFold(strings.TrimSpace(os.Getenv("MOLECULE_LLM_BILLING_MODE")), "platform_managed")
+}
+
+func rejectPlatformManagedDirectLLMBypass(c *gin.Context, key string) bool {
+	if !platformManagedLLMMode() || !isPlatformManagedDirectLLMBypassKey(key) {
+		return false
+	}
+	c.JSON(http.StatusBadRequest, gin.H{
+		"error": "direct Hermes custom provider secrets are blocked for platform-managed LLM workspaces; use MODEL/LLM_PROVIDER or the platform LLM proxy env instead",
+		"key":   key,
+	})
+	return true
+}
 
 type SecretsHandler struct {
 	restartFunc func(workspaceID string) // Optional: auto-restart after secret change
@@ -238,6 +265,9 @@ func (h *SecretsHandler) Set(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
 		return
 	}
+	if rejectPlatformManagedDirectLLMBypass(c, body.Key) {
+		return
+	}
 
 	// Encrypt the value (AES-256-GCM if SECRETS_ENCRYPTION_KEY is set, plaintext otherwise)
 	encrypted, err := crypto.Encrypt([]byte(body.Value))
@@ -378,6 +408,9 @@ func (h *SecretsHandler) SetGlobal(c *gin.Context) {
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+	if rejectPlatformManagedDirectLLMBypass(c, body.Key) {
 		return
 	}
 
@@ -592,7 +625,7 @@ func setModelSecret(ctx context.Context, workspaceID, model string) error {
 // SetModel handles PUT /workspaces/:id/model — writes the model slug
 // into workspace_secrets as MODEL (the key GetModel reads).
 // For hermes, the value is a hermes-native slug like "minimax/MiniMax-M2.7";
-// for langgraph it's the legacy "provider:model" form. Either way it's just
+// for claude-code it's the legacy "provider:model" form. Either way it's just
 // an opaque string the runtime interprets on its next start.
 //
 // Empty string clears the override. Triggers auto-restart so the new

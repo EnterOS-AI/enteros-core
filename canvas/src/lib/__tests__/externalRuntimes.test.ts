@@ -28,8 +28,8 @@ describe("isExternalLikeRuntime", () => {
       "docker",
       "local",
       "agent",
-      "crewai",
-      "langgraph",
+      "legacy-runtime",
+      "codex",
       "openclaw",
       "custom-runtime",
     ])("%q returns false", (runtime) => {

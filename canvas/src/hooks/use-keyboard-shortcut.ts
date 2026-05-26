@@ -15,6 +15,8 @@ export function useKeyboardShortcut(
     if (!enabled) return;
 
     function handler(e: KeyboardEvent) {
+      const target = e.target as HTMLElement;
+      if (target.closest?.('[data-display-stream="true"]')) return;
       if (e.key !== key) return;
       if (meta && !e.metaKey) return;
       if (ctrl && !e.ctrlKey) return;

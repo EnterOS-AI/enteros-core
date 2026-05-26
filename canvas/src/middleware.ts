@@ -12,7 +12,9 @@ import type { NextRequest } from "next/server";
  *   • style-src retains 'unsafe-inline': React Flow positions nodes via
  *     element-level style="" attributes which cannot be nonce'd; CSS injection
  *     is significantly lower risk than script injection and is acceptable here.
- *   • object-src / base-uri / frame-ancestors locked to 'none'/'self'.
+ *   • object-src locked to 'none'; frame-src allows self + blob: for
+ *     browser-native PDF previews backed by authenticated Blob URLs.
+ *   • base-uri / frame-ancestors locked to 'self'/'none'.
  *   • upgrade-insecure-requests forces HTTPS on mixed-content.
  *
  * Development — permissive policy:
@@ -61,6 +63,7 @@ export function buildCsp(nonce: string, isDev: boolean): string {
     "img-src 'self' blob: data:",
     "font-src 'self'",
     "object-src 'none'",
+    "frame-src 'self' blob:",
     "base-uri 'self'",
     "form-action 'self'",
     "frame-ancestors 'none'",

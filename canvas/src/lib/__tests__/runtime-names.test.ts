@@ -13,11 +13,9 @@ import { runtimeDisplayName } from "../runtime-names";
 describe("runtimeDisplayName", () => {
   it.each([
     ["claude-code", "Claude Code"],
-    ["langgraph", "LangGraph"],
-    ["deepagents", "DeepAgents"],
+    ["codex", "Codex"],
+    ["hermes", "Hermes"],
     ["openclaw", "OpenClaw"],
-    ["crewai", "CrewAI"],
-    ["autogen", "AutoGen"],
   ])("known runtime %q maps to %q", (input, expected) => {
     expect(runtimeDisplayName(input)).toBe(expected);
   });
@@ -25,7 +23,6 @@ describe("runtimeDisplayName", () => {
   it("unknown runtime falls back to the input string verbatim", () => {
     // A future runtime not yet in the lookup map should render with
     // its own id — better than a generic placeholder for ops debugging.
-    expect(runtimeDisplayName("hermes")).toBe("hermes");
     expect(runtimeDisplayName("custom-runtime-9000")).toBe(
       "custom-runtime-9000",
     );
@@ -43,6 +40,6 @@ describe("runtimeDisplayName", () => {
     // the input "for safety" doesn't silently change behavior — the
     // upstream slug is already normalized lowercase.
     expect(runtimeDisplayName("Claude-Code")).toBe("Claude-Code");
-    expect(runtimeDisplayName("LANGGRAPH")).toBe("LANGGRAPH");
+    expect(runtimeDisplayName("CODEX")).toBe("CODEX");
   });
 });

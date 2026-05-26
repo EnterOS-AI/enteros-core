@@ -17,7 +17,7 @@ SUM_URL="https://example.com/summarizer-agent"
 
 # AdminAuth-gated calls need a bearer token once any workspace token
 # exists in the DB. ADMIN_TOKEN is populated after the first workspace
-# create + test-token mint. acurl = "authenticated curl".
+# create + real token mint. acurl = "authenticated curl".
 ADMIN_TOKEN=""
 acurl() {
   if [ -n "$ADMIN_TOKEN" ]; then
@@ -62,13 +62,10 @@ R=$(curl -s -X POST "$BASE/workspaces" -H "Content-Type: application/json" -d '{
 check "POST /workspaces (create echo)" '"status":"awaiting_agent"' "$R"
 ECHO_ID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
 
-# Mint a test token so all subsequent AdminAuth-gated calls succeed.
-# The test-token endpoint is NOT behind AdminAuth (always accessible
-# when MOLECULE_ENV != production), so this works even on first boot.
-# Debug: show what the test-token endpoint returns
-TEST_TOKEN_RAW=$(curl -s "$BASE/admin/workspaces/$ECHO_ID/test-token")
-echo "  test-token response: $TEST_TOKEN_RAW"
-ADMIN_TOKEN=$(echo "$TEST_TOKEN_RAW" | python3 -c "import sys,json; print(json.load(sys.stdin).get('auth_token',''))" 2>/dev/null || echo "")
+ADMIN_TOKEN=$(echo "$R" | e2e_extract_token)
+if [ -z "$ADMIN_TOKEN" ]; then
+  ADMIN_TOKEN=$(e2e_mint_workspace_token "$ECHO_ID" 2>/dev/null || echo "")
+fi
 if [ -n "$ADMIN_TOKEN" ]; then
   echo "  (acquired admin token: ${ADMIN_TOKEN:0:8}...)"
 else
@@ -90,22 +87,25 @@ R=$(acurl "$BASE/workspaces/$ECHO_ID")
 check "GET /workspaces/:id" '"name":"Echo Agent"' "$R"
 check "GET /workspaces/:id (agent_card null)" '"agent_card":null' "$R"
 
-# Test 7: Register echo — use workspace-specific token (from test-token
+# Test 7: Register echo — use workspace-specific token (from real admin
 # endpoint), not the admin token. C18 requires a token issued TO THIS
 # workspace, not just any valid token.
-ECHO_WS_TOKEN=$(curl -s "$BASE/admin/workspaces/$ECHO_ID/test-token" | python3 -c "import sys,json; print(json.load(sys.stdin).get('auth_token',''))" 2>/dev/null || echo "")
+ECHO_WS_TOKEN="$ADMIN_TOKEN"
 [ -n "$ECHO_WS_TOKEN" ] && ECHO_AUTH=(-H "Authorization: Bearer $ECHO_WS_TOKEN")
 R=$(curl -s -X POST "$BASE/registry/register" -H "Content-Type: application/json" \
   "${ECHO_AUTH[@]}" \
   -d "{\"id\":\"$ECHO_ID\",\"url\":\"$ECHO_URL\",\"agent_card\":{\"name\":\"Echo Agent\",\"skills\":[{\"id\":\"echo\",\"name\":\"Echo\"}]}}")
 check "POST /registry/register (echo)" '"status":"registered"' "$R"
-# Extract token from register response; fall back to the test-token we
+# Extract token from register response; fall back to the workspace token we
 # already minted (register may not return a new token on re-registration).
 ECHO_TOKEN=$(echo "$R" | e2e_extract_token)
 if [ -z "$ECHO_TOKEN" ]; then ECHO_TOKEN="$ECHO_WS_TOKEN"; fi
 
 # Test 8: Register summarizer — same pattern: workspace-specific token
-SUM_WS_TOKEN=$(curl -s "$BASE/admin/workspaces/$SUM_ID/test-token" | python3 -c "import sys,json; print(json.load(sys.stdin).get('auth_token',''))" 2>/dev/null || echo "")
+SUM_WS_TOKEN=$(echo "$R" | e2e_extract_token)
+if [ -z "$SUM_WS_TOKEN" ]; then
+  SUM_WS_TOKEN=$(e2e_mint_workspace_token "$SUM_ID" 2>/dev/null || echo "")
+fi
 [ -n "$SUM_WS_TOKEN" ] && SUM_AUTH=(-H "Authorization: Bearer $SUM_WS_TOKEN")
 R=$(curl -s -X POST "$BASE/registry/register" -H "Content-Type: application/json" \
   "${SUM_AUTH[@]}" \
@@ -289,7 +289,9 @@ R=$(curl -s "$BASE/workspaces" -H "Authorization: Bearer $ECHO_TOKEN")
 check "current_task in list response" '"current_task"' "$R"
 
 # Test 21: Delete
-R=$(acurl -X DELETE "$BASE/workspaces/$ECHO_ID" -H "Authorization: Bearer $ECHO_TOKEN")
+R=$(acurl -X DELETE "$BASE/workspaces/$ECHO_ID?confirm=true" \
+  -H "Authorization: Bearer $ECHO_TOKEN" \
+  -H "X-Confirm-Name: Echo Agent v2")
 check "DELETE /workspaces/:id" '"status":"removed"' "$R"
 
 R=$(curl -s "$BASE/workspaces" -H "Authorization: Bearer $SUM_TOKEN")
@@ -310,14 +312,13 @@ ORIG_TIER=$(echo "$BUNDLE" | python3 -c "import sys,json; print(json.load(sys.st
 
 # Delete the workspace — use SUM_TOKEN (per-workspace) for WorkspaceAuth
 # and ADMIN_TOKEN for the AdminAuth layer.
-R=$(curl -s -X DELETE "$BASE/workspaces/$SUM_ID" -H "Authorization: Bearer $SUM_TOKEN")
+R=$(curl -s -X DELETE "$BASE/workspaces/$SUM_ID?confirm=true" \
+  -H "Authorization: Bearer $SUM_TOKEN" \
+  -H "X-Confirm-Name: Summarizer Agent")
 check "Delete before re-import" '"status":"removed"' "$R"
 
-# After deleting the last workspace, all per-workspace tokens are revoked.
-# But the test-token we minted earlier may still be in the DB as a live
-# row (test-token endpoint issues tokens that aren't workspace-scoped
-# for revocation). Clear ADMIN_TOKEN so acurl falls back to no-auth,
-# which works when HasAnyLiveTokenGlobal = false (fail-open).
+# After deleting both workspaces, all per-workspace tokens are revoked.
+# Clear the now-revoked admin bearer so acurl can use fresh-install fail-open.
 ADMIN_TOKEN=""
 R=$(acurl "$BASE/workspaces")
 COUNT=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))")
@@ -364,7 +365,10 @@ else
 fi
 
 # Register the re-imported workspace to verify agent_card round-trips
-NEW_TOKEN=$(curl -s "$BASE/admin/workspaces/$NEW_ID/test-token" | python3 -c "import sys,json; print(json.load(sys.stdin).get('auth_token',''))" 2>/dev/null || echo "")
+NEW_TOKEN=$(echo "$R" | e2e_extract_token)
+if [ -z "$NEW_TOKEN" ]; then
+  NEW_TOKEN=$(e2e_mint_workspace_token "$NEW_ID" 2>/dev/null || echo "")
+fi
 NEW_AUTH=()
 [ -n "$NEW_TOKEN" ] && NEW_AUTH=(-H "Authorization: Bearer $NEW_TOKEN")
 R=$(curl -s -X POST "$BASE/registry/register" -H "Content-Type: application/json" \
@@ -381,7 +385,7 @@ REBUNDLE=$(curl -s "$BASE/bundles/export/$NEW_ID" -H "Authorization: Bearer $NEW
 check "Re-exported bundle has agent_card" '"agent_card"' "$REBUNDLE"
 
 # Clean up — use the token just issued to the re-imported workspace
-curl -s -X DELETE "$BASE/workspaces/$NEW_ID" -H "Authorization: Bearer $NEW_TOKEN" > /dev/null
+e2e_delete_workspace "$NEW_ID" "$ORIG_NAME" -H "Authorization: Bearer $NEW_TOKEN"
 
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="

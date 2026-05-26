@@ -49,7 +49,7 @@ export async function seedWorkspace(echoURL: string): Promise<SeededWorkspace> {
   };
   let authToken = ws.connection?.auth_token;
   if (!authToken) {
-    authToken = await mintTestToken(ws.id);
+    authToken = await mintWorkspaceToken(ws.id);
   }
   if (!authToken) {
     throw new Error("Workspace created but no auth_token returned");
@@ -202,12 +202,18 @@ export async function cleanupWorkspace(workspaceId: string): Promise<void> {
  * Mint a workspace auth token so the canvas can make authenticated API
  * calls (WorkspaceAuth middleware).
  */
-export async function mintTestToken(workspaceId: string): Promise<string> {
-  const res = await fetch(
-    `${PLATFORM_URL}/admin/workspaces/${workspaceId}/test-token`,
-  );
+export async function mintWorkspaceToken(workspaceId: string): Promise<string> {
+  const headers: Record<string, string> = {};
+  const adminToken = process.env.E2E_ADMIN_TOKEN ?? process.env.ADMIN_TOKEN;
+  if (adminToken) {
+    headers.Authorization = `Bearer ${adminToken}`;
+  }
+  const res = await fetch(`${PLATFORM_URL}/admin/workspaces/${workspaceId}/tokens`, {
+    method: "POST",
+    headers,
+  });
   if (!res.ok) {
-    throw new Error(`Failed to mint test token: ${res.status}`);
+    throw new Error(`Failed to mint workspace token: ${res.status}`);
   }
   const data = (await res.json()) as { auth_token: string };
   return data.auth_token;

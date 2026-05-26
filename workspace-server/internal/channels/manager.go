@@ -9,8 +9,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/events"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
 )
 
 const (
@@ -156,6 +156,9 @@ func (m *Manager) PausePollersForToken(workspaceID, botToken string) func() {
 			}
 		}
 	}
+	if err := rows.Err(); err != nil {
+		log.Printf("Channels: pause-pollers rows.Err: %v", err)
+	}
 	m.mu.Unlock()
 
 	if len(pausedIDs) == 0 {
@@ -204,8 +207,16 @@ func (m *Manager) Reload(ctx context.Context) {
 			log.Printf("Channels: reload scan error: %v", err)
 			continue
 		}
-		_ = json.Unmarshal(configJSON, &ch.Config)
-		_ = json.Unmarshal(allowedJSON, &ch.AllowedUsers)
+		if err := json.Unmarshal(configJSON, &ch.Config); err != nil {
+			log.Printf("Channels: reload config unmarshal error for %s: %v", truncID(ch.ID), err)
+			continue
+		}
+		if len(allowedJSON) > 0 {
+			if err := json.Unmarshal(allowedJSON, &ch.AllowedUsers); err != nil {
+				log.Printf("Channels: reload allowed_users unmarshal error for %s: %v", truncID(ch.ID), err)
+				continue
+			}
+		}
 		// #319: decrypt at the boundary between DB (ciphertext) and the
 		// in-memory config adapters consume. A decrypt failure logs and
 		// skips the channel — downstream getUpdates would fail anyway
@@ -215,6 +226,9 @@ func (m *Manager) Reload(ctx context.Context) {
 			continue
 		}
 		desired[ch.ID] = ch
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("Channels: reload rows.Err: %v", err)
 	}
 
 	m.mu.Lock()
@@ -473,6 +487,9 @@ func (m *Manager) BroadcastToWorkspaceChannels(ctx context.Context, workspaceID,
 			}
 		}
 	}
+	if err := rows.Err(); err != nil {
+		log.Printf("Channels: broadcast rows.Err: %v", err)
+	}
 }
 
 // FetchWorkspaceChannelContext returns recent Slack channel messages formatted
@@ -555,8 +572,14 @@ func (m *Manager) loadChannel(ctx context.Context, channelID string) (ChannelRow
 	if err != nil {
 		return ch, fmt.Errorf("channel %s not found: %w", channelID, err)
 	}
-	json.Unmarshal(configJSON, &ch.Config)
-	json.Unmarshal(allowedJSON, &ch.AllowedUsers)
+	if err := json.Unmarshal(configJSON, &ch.Config); err != nil {
+		return ch, fmt.Errorf("channel %s config unmarshal: %w", channelID, err)
+	}
+	if len(allowedJSON) > 0 {
+		if err := json.Unmarshal(allowedJSON, &ch.AllowedUsers); err != nil {
+			return ch, fmt.Errorf("channel %s allowed_users unmarshal: %w", channelID, err)
+		}
+	}
 	// #319: decrypt bot_token / webhook_secret — SendOutbound and adapter
 	// methods downstream read them as plaintext strings.
 	if err := DecryptSensitiveFields(ch.Config); err != nil {

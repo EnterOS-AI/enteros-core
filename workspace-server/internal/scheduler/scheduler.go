@@ -13,11 +13,11 @@ import (
 	"github.com/google/uuid"
 	cronlib "github.com/robfig/cron/v3"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/events"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/metrics"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/supervised"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/textutil"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/metrics"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/supervised"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/textutil"
 )
 
 const (
@@ -425,6 +425,7 @@ func (s *Scheduler) fireSchedule(ctx context.Context, sched scheduleRow) {
 
 	lastStatus := "ok"
 	lastError := ""
+	resultKind := ""
 	if proxyErr != nil {
 		lastStatus = "error"
 		lastError = fmt.Sprintf("%v", proxyErr)
@@ -433,8 +434,26 @@ func (s *Scheduler) fireSchedule(ctx context.Context, sched scheduleRow) {
 		lastStatus = "error"
 		lastError = fmt.Sprintf("HTTP %d", statusCode)
 		log.Printf("Scheduler: '%s' non-2xx: %d", sched.Name, statusCode)
+	} else if a2aErr := a2aErrorFromBody(respBody); a2aErr != "" {
+		lastStatus = "error"
+		lastError = fmt.Sprintf("A2A adapter error: %s", a2aErr)
+		log.Printf("Scheduler: '%s' A2A adapter error (HTTP %d): %s", sched.Name, statusCode, a2aErr)
 	} else {
-		log.Printf("Scheduler: '%s' completed (HTTP %d)", sched.Name, statusCode)
+		// HTTP 200 — inspect response body for SDK-layer errors.
+		// The claude-code-sdk adapter returns HTTP 200 even when the inner
+		// LLM call throws (e.g. Max-plan rate-limit, quota exhaustion, SDK
+		// internal errors). Without this check those failures surface as
+		// "completed (HTTP 200)" in last_status while the agent chat shows
+		// errors — a silent failure that hides schedule outages.
+		// See: #1696.
+		resultKind = detectResultKind(respBody)
+		if resultKind != "" && resultKind != "ok" {
+			lastStatus = resultKind
+			lastError = fmt.Sprintf("SDK error: result_kind=%s", resultKind)
+			log.Printf("Scheduler: '%s' SDK error detected — result_kind=%s", sched.Name, resultKind)
+		} else {
+			log.Printf("Scheduler: '%s' completed (HTTP %d)", sched.Name, statusCode)
+		}
 	}
 
 	// #795: detect phantom-producing schedules — cron fires successfully
@@ -477,6 +496,54 @@ func (s *Scheduler) fireSchedule(ctx context.Context, sched scheduleRow) {
 			    updated_at = now()
 			WHERE id = $1`, sched.ID)
 		resetCancel()
+	}
+
+	// #1696: track consecutive SDK errors. When the adapter returns HTTP 200
+	// but the response body signals a non-ok result_kind (rate_limited,
+	// sdk_error, quota_exhausted), we increment a counter. After 3 consecutive
+	// SDK errors we auto-disable the schedule and log it — the schedule is
+	// suffering a persistent LLM-layer failure and firing it again will keep
+	// producing the same errors while burning tokens.
+	//
+	// Only apply when the current lastStatus is a non-ok resultKind (not when
+	// we already have 'error' from proxyErr or non-2xx HTTP status — those have
+	// their own failure semantics). Also skip when lastStatus is 'stale' (the
+	// empty-response escalation path takes priority).
+	var consecSDK int
+	if resultKind != "" && resultKind != "ok" {
+		sdkCtx, sdkCancel := context.WithTimeout(context.Background(), dbQueryTimeout)
+		if err := db.DB.QueryRowContext(sdkCtx, `
+			UPDATE workspace_schedules
+			SET consecutive_sdk_errors = consecutive_sdk_errors + 1,
+			    updated_at = now()
+			WHERE id = $1
+			RETURNING consecutive_sdk_errors`, sched.ID).Scan(&consecSDK); err != nil {
+			log.Printf("Scheduler: '%s' SDK-error bump failed: %v", sched.Name, err)
+		}
+		sdkCancel()
+		if consecSDK >= 3 {
+			log.Printf("Scheduler: '%s' AUTO-DISABLING after %d consecutive SDK errors (workspace %s)",
+				sched.Name, consecSDK, short(sched.WorkspaceID, 12))
+			autoDisableCtx, autoDisableCancel := context.WithTimeout(context.Background(), dbQueryTimeout)
+			_, _ = db.DB.ExecContext(autoDisableCtx, `
+				UPDATE workspace_schedules SET enabled = false, updated_at = now() WHERE id = $1 AND enabled = true`,
+				sched.ID)
+			autoDisableCancel()
+		}
+	} else {
+		// Non-SDK-error run — reset the counter.
+		// Guard: only reset when lastStatus is a clean ok (not 'stale', not
+		// 'error', not resultKind). An 'ok' resultKind means the SDK is fine
+		// and we should clear the streak.
+		if lastStatus == "ok" {
+			resetCtx, resetCancel := context.WithTimeout(context.Background(), dbQueryTimeout)
+			_, _ = db.DB.ExecContext(resetCtx, `
+				UPDATE workspace_schedules
+				SET consecutive_sdk_errors = 0,
+				    updated_at = now()
+				WHERE id = $1`, sched.ID)
+			resetCancel()
+		}
 	}
 
 	nextRun, nextErr := ComputeNextRun(sched.CronExpr, sched.Timezone, time.Now())
@@ -759,6 +826,149 @@ func (s *Scheduler) sweepPhantomBusy(ctx context.Context) {
 	}
 }
 
+// detectResultKind inspects an A2A response body for SDK-layer error signals
+// that are invisible at the HTTP level. The claude-code-sdk adapter returns
+// HTTP 200 even when the inner LLM call throws (Max-plan rate-limit, quota
+// exhaustion, SDK internal errors) — the error surfaces only in the response
+// body under result.kind or result.result_kind.
+//
+// Returns an empty string when the response is clean (result_kind is "ok",
+// "message" — the A2A-SDK canonical successful Message envelope — or absent).
+// Returns the result_kind value when it is a non-ok signal, so callers can
+// propagate it as the schedule's last_status.
+//
+// Known successful (= treat-as-ok) kinds (resultOKKinds):
+//   - "ok" — explicit success signal
+//   - "message" — A2A-SDK Message envelope (`{"result":{"kind":"message","parts":[...]}}`),
+//     emitted by every successful agent reply. Fix: #1696 originally allow-listed only
+//     "ok" / empty, which mis-flagged every successful agent response as an SDK error
+//     (PM scheduler observed 21 consecutive false-failure ticks before auto-disable;
+//     screenshot 2026-05-23). See [#1696 follow-up].
+//
+// Known non-ok kinds:
+//   - "rate_limited" — LLM API rate-limit hit (Max-plan, etc.)
+//   - "quota_exhausted" — quota / budget exhausted
+//   - "sdk_error" — SDK threw an internal error
+//
+// See #1696.
+//
+// resultOKKinds is the allowlist of `result.kind` values that are
+// UNCONDITIONALLY successful (no further parsing needed). Anything
+// outside this set is treated as a non-ok SDK signal, EXCEPT `task`
+// which is gated separately on `result.status.state` (see
+// classifyTaskState — A2A Task can be either in-progress or terminally
+// failed, depending on its status).
+//
+// Add to this list when new always-success envelope kinds are introduced
+// upstream. NEVER add an envelope that can carry a failure sub-state.
+var resultOKKinds = map[string]struct{}{
+	"":        {}, // absent / empty → treat as ok (no signal)
+	"ok":      {}, // explicit success
+	"message": {}, // A2A-SDK Message envelope (always a successful agent reply)
+}
+
+// taskOKStates is the A2A Task `status.state` allowlist for results that
+// have `kind: "task"`. Tasks can be in-progress (submitted/working) or
+// terminally successful (completed) — those are clean signals to the
+// scheduler. Terminal failure states (failed/canceled/rejected) are
+// surfaced as the scheduler's last_status so operators can see the real
+// state. Cf. CR2 review feedback on #1716.
+var taskOKStates = map[string]struct{}{
+	"":          {}, // status.state absent → conservative: don't fire false-failure
+	"submitted": {}, // task accepted, not yet running
+	"working":   {}, // task in progress
+	"completed": {}, // task finished successfully
+}
+
+// classifyTaskState inspects `result.status.state` (or `result.status_state`
+// legacy variant) and returns "" when the state is in taskOKStates (success
+// or in-progress) or the state string when it is a terminal failure that
+// should propagate as last_status.
+func classifyTaskState(result map[string]json.RawMessage) string {
+	rawStatus, ok := result["status"]
+	if !ok {
+		return "" // no status block → no signal, leave clean
+	}
+	var status map[string]json.RawMessage
+	if err := json.Unmarshal(rawStatus, &status); err != nil {
+		return ""
+	}
+	if rawState, ok := status["state"]; ok {
+		var s string
+		if json.Unmarshal(rawState, &s) == nil {
+			if _, isOK := taskOKStates[s]; !isOK {
+				return s
+			}
+		}
+	}
+	return ""
+}
+
+func detectResultKind(body []byte) string {
+	if len(body) == 0 {
+		return ""
+	}
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(body, &top); err != nil {
+		return ""
+	}
+	// Check result.kind first (canonical JSON-RPC shape).
+	if rawResult, ok := top["result"]; ok {
+		var result map[string]json.RawMessage
+		if err := json.Unmarshal(rawResult, &result); err == nil {
+			// result.kind (canonical JSON-RPC envelope field).
+			if rawKind, ok := result["kind"]; ok {
+				var k string
+				if json.Unmarshal(rawKind, &k) == nil {
+					// Special-case task: success or failure depends on status.state.
+					if k == "task" {
+						if bad := classifyTaskState(result); bad != "" {
+							return bad
+						}
+						// task with ok / in-progress state → clean
+					} else if _, isOK := resultOKKinds[k]; !isOK {
+						return k
+					}
+				}
+			}
+			// result.result_kind (legacy / alternative field name).
+			if rawKind, ok := result["result_kind"]; ok {
+				var k string
+				if json.Unmarshal(rawKind, &k) == nil {
+					if k == "task" {
+						if bad := classifyTaskState(result); bad != "" {
+							return bad
+						}
+					} else if _, isOK := resultOKKinds[k]; !isOK {
+						return k
+					}
+				}
+			}
+		}
+	}
+	// Top-level error: non-ok HTTP 200 with a structured error in the body.
+	if rawErr, ok := top["error"]; ok {
+		var errMsg string
+		if err := json.Unmarshal(rawErr, &errMsg); err == nil && errMsg != "" {
+			// Distinguish SDK errors from other errors. SDK-layer errors from the
+			// Claude Code runtime include specific markers.
+			lower := strings.ToLower(errMsg)
+			// Check more specific patterns first (max-plan quota > general rate).
+			if strings.Contains(lower, "max-plan") || strings.Contains(lower, "quota") || strings.Contains(lower, "budget") {
+				return "quota_exhausted"
+			}
+			if strings.Contains(lower, "rate limit") || strings.Contains(lower, "rate_limit") {
+				return "rate_limited"
+			}
+			if strings.Contains(lower, "claude code returned an error") || strings.Contains(lower, "sdk error") ||
+				strings.Contains(lower, "api key") || strings.Contains(lower, "authentication") {
+				return "sdk_error"
+			}
+		}
+	}
+	return ""
+}
+
 // isEmptyResponse checks if an A2A response body indicates the agent
 // produced no meaningful output. Catches "(no response generated)" from
 // the workspace runtime + genuinely empty/null responses. Used by the
@@ -806,6 +1016,32 @@ func isEmptyResponse(body []byte) bool {
 		}
 	}
 	return false
+}
+
+// a2aErrorFromBody extracts an A2A/JSON-RPC error message from a 2xx
+// response body. The adapter SDK may return HTTP 200 with an error
+// payload when it throws internally; this prevents the scheduler from
+// falsely recording last_status='ok'.
+// Issue #1696.
+func a2aErrorFromBody(body []byte) string {
+	if len(body) == 0 {
+		return ""
+	}
+	var resp map[string]interface{}
+	if json.Unmarshal(body, &resp) != nil {
+		return ""
+	}
+	// JSON-RPC style: {"error":{"code":-32603,"message":"..."}}
+	if errObj, ok := resp["error"].(map[string]interface{}); ok {
+		if msg, ok := errObj["message"].(string); ok {
+			return msg
+		}
+	}
+	// Plain style: {"error":"..."}
+	if errStr, ok := resp["error"].(string); ok {
+		return errStr
+	}
+	return ""
 }
 
 // truncation moved to internal/textutil.TruncateBytes (#2962 SSOT).

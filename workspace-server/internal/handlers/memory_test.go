@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -71,6 +72,34 @@ func TestMemoryList_DBError(t *testing.T) {
 
 	if w.Code != http.StatusInternalServerError {
 		t.Errorf("expected 500, got %d", w.Code)
+	}
+}
+
+// TestMemoryList_RowsErr_Returns500 verifies that a rows.Err() set during
+// iteration causes the handler to return 500 rather than partial results.
+func TestMemoryList_RowsErr_Returns500(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewMemoryHandler()
+
+	cols := []string{"key", "value", "version", "expires_at", "updated_at"}
+	mock.ExpectQuery("SELECT key, value, version, expires_at, updated_at").
+		WithArgs("ws-rowerr").
+		WillReturnRows(sqlmock.NewRows(cols).
+			AddRow("ok-key", []byte(`"val"`), int64(1), nil, time.Now()).
+			RowError(0, errors.New("storage engine fault")))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-rowerr"}}
+	c.Request = httptest.NewRequest("GET", "/workspaces/ws-rowerr/memory", nil)
+	handler.List(c)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("rows.Err() must yield 500, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
 	}
 }
 

@@ -27,9 +27,9 @@ create_workspace() {
     local tenant="$1" name="$2" tier="$3" parent="${4:-}"
     local body
     if [ -n "$parent" ]; then
-        body="{\"name\":\"$name\",\"tier\":$tier,\"parent_id\":\"$parent\",\"runtime\":\"langgraph\"}"
+        body="{\"name\":\"$name\",\"tier\":$tier,\"parent_id\":\"$parent\",\"runtime\":\"claude-code\",\"model\":\"sonnet\"}"
     else
-        body="{\"name\":\"$name\",\"tier\":$tier,\"runtime\":\"langgraph\"}"
+        body="{\"name\":\"$name\",\"tier\":$tier,\"runtime\":\"claude-code\",\"model\":\"sonnet\"}"
     fi
     local id
     if [ "$tenant" = "alpha" ]; then

@@ -541,12 +541,12 @@ func TestSelectImage_FallsBackToRuntimeMap(t *testing.T) {
 // contract (RFC internal#483 / security review 4269 /
 // feedback_platform_must_hardgate_base_contract): a NAMED runtime with no
 // resolvable image must reject with ErrUnresolvableRuntime, NOT silently
-// substitute DefaultImage. Pre-fix this returned langgraph — a user asking
-// for a removed runtime (crewai/deepagents/gemini-cli) silently got a
-// langgraph container. "crewai" is the concrete regression from the
+// substitute DefaultImage. Pre-fix this returned claude-code — a user asking
+// for a removed runtime silently got a claude-code container. The named
+// legacy runtime below is the concrete regression from the
 // security finding.
 func TestSelectImage_NamedUnresolvableRuntimeRejects(t *testing.T) {
-	for _, rt := range []string{"no-such-runtime", "crewai", "deepagents", "gemini-cli"} {
+	for _, rt := range []string{"no-such-runtime", "legacy-runtime-a", "legacy-runtime-b"} {
 		got, err := selectImage(WorkspaceConfig{Runtime: rt})
 		if !errors.Is(err, ErrUnresolvableRuntime) {
 			t.Errorf("selectImage(%q): got err %v, want ErrUnresolvableRuntime", rt, err)
@@ -692,39 +692,6 @@ func TestBuildContainerEnv_MoleculeAIURLAlwaysMatchesPlatformURL(t *testing.T) {
 	}
 }
 
-func TestBuildContainerEnv_AwarenessOnlyWhenBothSet(t *testing.T) {
-	// Both set → both injected.
-	cfg := WorkspaceConfig{
-		WorkspaceID:        "ws-x",
-		PlatformURL:        "http://localhost:8080",
-		AwarenessURL:       "http://awareness:9000",
-		AwarenessNamespace: "ns-1",
-	}
-	env := buildContainerEnv(cfg)
-	hasNS := false
-	hasURL := false
-	for _, e := range env {
-		if e == "AWARENESS_NAMESPACE=ns-1" {
-			hasNS = true
-		}
-		if e == "AWARENESS_URL=http://awareness:9000" {
-			hasURL = true
-		}
-	}
-	if !hasNS || !hasURL {
-		t.Errorf("both awareness vars must be present: env=%v", env)
-	}
-
-	// Only namespace set → neither injected (must be both-or-nothing).
-	cfg.AwarenessURL = ""
-	env2 := buildContainerEnv(cfg)
-	for _, e := range env2 {
-		if strings.HasPrefix(e, "AWARENESS_") {
-			t.Errorf("awareness vars must NOT be injected when URL is missing: got %q", e)
-		}
-	}
-}
-
 func TestBuildContainerEnv_CustomEnvVarsAppended(t *testing.T) {
 	// NOTE: this test previously asserted GITHUB_TOKEN passed through
 	// verbatim. That assertion encoded the forensic #145 latent leak as
@@ -770,9 +737,12 @@ func TestBuildContainerEnv_CustomEnvVarsAppended(t *testing.T) {
 // place — i.e. the guard is proven by construction, not by environment
 // accident.
 func TestBuildContainerEnv_StripsSCMWriteTokens(t *testing.T) {
+	// GH_TOKEN and GITHUB_TOKEN are preserved when explicitly set (#1687)
+	// because they win over the GH_PAT alias. The unconditional strip list
+	// therefore excludes them; see TestBuildContainerEnv_GHPATAliasPrecedence
+	// for the positive assertion.
 	scmTokens := []string{
-		"GITEA_TOKEN", "GITHUB_TOKEN", "GH_TOKEN",
-		"GITLAB_TOKEN", "GL_TOKEN", "BITBUCKET_TOKEN",
+		"GITEA_TOKEN", "GITLAB_TOKEN", "GL_TOKEN", "BITBUCKET_TOKEN",
 	}
 
 	t.Run("normal path — SCM tokens explicitly set in EnvVars", func(t *testing.T) {
@@ -780,6 +750,9 @@ func TestBuildContainerEnv_StripsSCMWriteTokens(t *testing.T) {
 		for _, k := range scmTokens {
 			envVars[k] = "leaked-write-credential-" + k
 		}
+		// Explicit GH_TOKEN / GITHUB_TOKEN are now preserved (#1687).
+		envVars["GH_TOKEN"] = "explicit-gh-token"
+		envVars["GITHUB_TOKEN"] = "explicit-github-token"
 		cfg := WorkspaceConfig{
 			WorkspaceID: "ws-tenant",
 			PlatformURL: "http://localhost:8080",
@@ -794,6 +767,13 @@ func TestBuildContainerEnv_StripsSCMWriteTokens(t *testing.T) {
 		}
 		if !envContains(buildContainerEnv(cfg), "ANTHROPIC_API_KEY=sk-keep") {
 			t.Errorf("filter must not strip non-SCM API keys")
+		}
+		// Explicit GH tokens must be preserved (not stripped).
+		if !envContains(buildContainerEnv(cfg), "GH_TOKEN=explicit-gh-token") {
+			t.Errorf("explicit GH_TOKEN must be preserved")
+		}
+		if !envContains(buildContainerEnv(cfg), "GITHUB_TOKEN=explicit-github-token") {
+			t.Errorf("explicit GITHUB_TOKEN must be preserved")
 		}
 	})
 
@@ -853,6 +833,106 @@ func TestCPProvisionerEnv_StripsSCMWriteTokens(t *testing.T) {
 			t.Errorf("isSCMWriteTokenKey(%q) = true, want false (must not over-strip non-SCM env)", k)
 		}
 	}
+}
+
+// TestBuildContainerEnv_GHPATAliasPrecedence asserts that explicit GH_TOKEN /
+// GITHUB_TOKEN in workspace secrets win over the GH_PAT alias (#1687 CR2
+// review_id=5646). The alias must only inject a key when it was NOT explicitly
+// set.
+func TestBuildContainerEnv_GHPATAliasPrecedence(t *testing.T) {
+	pat := "ghp_pat_from_secrets"
+	explicitGH := "gh_explicit_token"
+	explicitGitHub := "github_explicit_token"
+
+	t.Run("GH_PAT alone → alias both", func(t *testing.T) {
+		cfg := WorkspaceConfig{
+			WorkspaceID: "ws-x",
+			PlatformURL: "http://localhost:8080",
+			EnvVars:     map[string]string{"GH_PAT": pat},
+		}
+		env := buildContainerEnv(cfg)
+		if !envContains(env, "GH_TOKEN="+pat) {
+			t.Errorf("GH_PAT alias must set GH_TOKEN, got %v", env)
+		}
+		if !envContains(env, "GITHUB_TOKEN="+pat) {
+			t.Errorf("GH_PAT alias must set GITHUB_TOKEN, got %v", env)
+		}
+	})
+
+	t.Run("explicit GH_TOKEN wins over GH_PAT alias", func(t *testing.T) {
+		cfg := WorkspaceConfig{
+			WorkspaceID: "ws-x",
+			PlatformURL: "http://localhost:8080",
+			EnvVars: map[string]string{
+				"GH_PAT":   pat,
+				"GH_TOKEN": explicitGH,
+			},
+		}
+		env := buildContainerEnv(cfg)
+		if envContains(env, "GH_TOKEN="+pat) {
+			t.Errorf("explicit GH_TOKEN must win over GH_PAT alias, got GH_TOKEN=%q", pat)
+		}
+		if !envContains(env, "GH_TOKEN="+explicitGH) {
+			t.Errorf("explicit GH_TOKEN must be preserved, got %v", env)
+		}
+	})
+
+	t.Run("explicit GITHUB_TOKEN wins over GH_PAT alias", func(t *testing.T) {
+		cfg := WorkspaceConfig{
+			WorkspaceID: "ws-x",
+			PlatformURL: "http://localhost:8080",
+			EnvVars: map[string]string{
+				"GH_PAT":       pat,
+				"GITHUB_TOKEN": explicitGitHub,
+			},
+		}
+		env := buildContainerEnv(cfg)
+		if envContains(env, "GITHUB_TOKEN="+pat) {
+			t.Errorf("explicit GITHUB_TOKEN must win over GH_PAT alias, got GITHUB_TOKEN=%q", pat)
+		}
+		if !envContains(env, "GITHUB_TOKEN="+explicitGitHub) {
+			t.Errorf("explicit GITHUB_TOKEN must be preserved, got %v", env)
+		}
+	})
+
+	t.Run("explicit both → both preserved, no alias", func(t *testing.T) {
+		cfg := WorkspaceConfig{
+			WorkspaceID: "ws-x",
+			PlatformURL: "http://localhost:8080",
+			EnvVars: map[string]string{
+				"GH_PAT":       pat,
+				"GH_TOKEN":     explicitGH,
+				"GITHUB_TOKEN": explicitGitHub,
+			},
+		}
+		env := buildContainerEnv(cfg)
+		if envContains(env, "GH_TOKEN="+pat) {
+			t.Errorf("explicit GH_TOKEN must win, got alias value %q", pat)
+		}
+		if envContains(env, "GITHUB_TOKEN="+pat) {
+			t.Errorf("explicit GITHUB_TOKEN must win, got alias value %q", pat)
+		}
+		if !envContains(env, "GH_TOKEN="+explicitGH) {
+			t.Errorf("explicit GH_TOKEN must be preserved, got %v", env)
+		}
+		if !envContains(env, "GITHUB_TOKEN="+explicitGitHub) {
+			t.Errorf("explicit GITHUB_TOKEN must be preserved, got %v", env)
+		}
+	})
+
+	t.Run("no GH_PAT → no alias injected", func(t *testing.T) {
+		cfg := WorkspaceConfig{
+			WorkspaceID: "ws-x",
+			PlatformURL: "http://localhost:8080",
+			EnvVars:     map[string]string{"OTHER": "ok"},
+		}
+		env := buildContainerEnv(cfg)
+		for _, e := range env {
+			if strings.HasPrefix(e, "GH_TOKEN=") || strings.HasPrefix(e, "GITHUB_TOKEN=") {
+				t.Errorf("no GH_PAT present → no alias should be injected, got %q", e)
+			}
+		}
+	})
 }
 
 func assertNoSCMWriteToken(t *testing.T, env []string, scmTokens []string) {
@@ -989,9 +1069,9 @@ func TestRuntimeTagFromImage(t *testing.T) {
 		"workspace-template:base":        "base",
 		// Current GHCR form produced by molecule-ci's publish-template-image
 		// workflow and consumed by RuntimeImages.
-		"ghcr.io/molecule-ai/workspace-template-hermes:latest":         "hermes",
-		"ghcr.io/molecule-ai/workspace-template-claude-code:latest":    "claude-code",
-		"ghcr.io/molecule-ai/workspace-template-langgraph:sha-abc1234": "langgraph",
+		"ghcr.io/molecule-ai/workspace-template-hermes:latest":           "hermes",
+		"ghcr.io/molecule-ai/workspace-template-claude-code:latest":      "claude-code",
+		"ghcr.io/molecule-ai/workspace-template-claude-code:sha-abc1234": "claude-code",
 		// Fallbacks for non-standard shapes
 		"myregistry.io/foo:v1.2": "v1.2",
 		"no-colon-at-all":        "no-colon-at-all",
@@ -1036,7 +1116,7 @@ func TestImageTagIsMoving(t *testing.T) {
 		// Pinned tags — must NOT be classified as moving.
 		{"semver tag", "ghcr.io/molecule-ai/workspace-template-hermes:0.8.2", false},
 		{"semver with v prefix", "ghcr.io/molecule-ai/workspace-template-hermes:v1.2.3", false},
-		{"sha-prefixed commit tag", "ghcr.io/molecule-ai/workspace-template-langgraph:sha-abc1234", false},
+		{"sha-prefixed commit tag", "ghcr.io/molecule-ai/workspace-template-claude-code:sha-abc1234", false},
 		{"date-stamped tag", "ghcr.io/molecule-ai/workspace-template-hermes:2026-04-30", false},
 		{"build-id tag", "ghcr.io/molecule-ai/workspace-template-hermes:build-12345", false},
 

@@ -8,8 +8,8 @@ package handlers
 // workspace/build-all.sh and manifest.json's workspace_templates.
 // That drift produced two visible bugs:
 //
-//   - "gemini-cli" existed in manifest.json but not the Go map, so
-//     the UI/workspace-create rejected it and fell back to langgraph.
+//   - a template existed in manifest.json but not the Go map, so
+//     the UI/workspace-create rejected it and fell back to claude-code.
 //   - "claude-code-default" in manifest vs "claude-code" in Go —
 //     operators typing the manifest name got silently coerced.
 //

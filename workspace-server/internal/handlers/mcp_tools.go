@@ -16,7 +16,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/registry"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/registry"
 	"github.com/google/uuid"
 )
 
@@ -95,14 +95,18 @@ func (h *MCPHandler) toolListPeers(ctx context.Context, workspaceID string) (str
 			cols+` FROM workspaces w WHERE w.parent_id = $1 AND w.id != $2 AND w.status != 'removed'`,
 			parentID.String, workspaceID)
 		if err == nil {
-			_ = scanPeers(rows)
+			if scanErr := scanPeers(rows); scanErr != nil {
+				log.Printf("MCP toolListPeers: sibling scan error: %v", scanErr)
+			}
 		}
 	} else {
 		rows, err := h.database.QueryContext(ctx,
 			cols+` FROM workspaces w WHERE w.parent_id IS NULL AND w.id != $1 AND w.status != 'removed'`,
 			workspaceID)
 		if err == nil {
-			_ = scanPeers(rows)
+			if scanErr := scanPeers(rows); scanErr != nil {
+				log.Printf("MCP toolListPeers: sibling scan error: %v", scanErr)
+			}
 		}
 	}
 
@@ -112,7 +116,9 @@ func (h *MCPHandler) toolListPeers(ctx context.Context, workspaceID string) (str
 			cols+` FROM workspaces w WHERE w.parent_id = $1 AND w.status != 'removed'`,
 			workspaceID)
 		if err == nil {
-			_ = scanPeers(rows)
+			if scanErr := scanPeers(rows); scanErr != nil {
+				log.Printf("MCP toolListPeers: children scan error: %v", scanErr)
+			}
 		}
 	}
 
@@ -122,7 +128,9 @@ func (h *MCPHandler) toolListPeers(ctx context.Context, workspaceID string) (str
 			cols+` FROM workspaces w WHERE w.id = $1 AND w.status != 'removed'`,
 			parentID.String)
 		if err == nil {
-			_ = scanPeers(rows)
+			if scanErr := scanPeers(rows); scanErr != nil {
+				log.Printf("MCP toolListPeers: parent scan error: %v", scanErr)
+			}
 		}
 	}
 
@@ -340,12 +348,12 @@ func (h *MCPHandler) toolSendMessageToUser(ctx context.Context, workspaceID stri
 	// activity.go:Notify is what produced the reno-stars data-loss
 	// regression; both paths now route through the same writer.
 	//
-	// MCP send_message_to_user does not currently surface attachments
-	// (the tool args don't accept them); pass nil. If a future tool
-	// schema adds an attachments arg, build []AgentMessageAttachment
-	// and pass through.
+	attachments, err := parseAgentMessageAttachments(args["attachments"])
+	if err != nil {
+		return "", err
+	}
 	writer := NewAgentMessageWriter(h.database, h.broadcaster)
-	if err := writer.Send(ctx, workspaceID, message, nil); err != nil {
+	if err := writer.Send(ctx, workspaceID, message, attachments); err != nil {
 		if errors.Is(err, ErrWorkspaceNotFound) {
 			return "", fmt.Errorf("workspace not found")
 		}
@@ -354,128 +362,75 @@ func (h *MCPHandler) toolSendMessageToUser(ctx context.Context, workspaceID stri
 	return "Message sent.", nil
 }
 
+func parseAgentMessageAttachments(raw interface{}) ([]AgentMessageAttachment, error) {
+	if raw == nil {
+		return nil, nil
+	}
+	items, ok := raw.([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("attachments must be an array")
+	}
+	if len(items) == 0 {
+		return nil, nil
+	}
+	attachments := make([]AgentMessageAttachment, 0, len(items))
+	for i, item := range items {
+		m, ok := item.(map[string]interface{})
+		if !ok {
+			return nil, fmt.Errorf("attachment[%d]: must be an object", i)
+		}
+		uri, _ := m["uri"].(string)
+		name, _ := m["name"].(string)
+		if uri == "" || name == "" {
+			return nil, fmt.Errorf("attachment[%d]: uri and name are required", i)
+		}
+		att := AgentMessageAttachment{
+			URI:  uri,
+			Name: name,
+		}
+		if mimeType, ok := m["mimeType"].(string); ok {
+			att.MimeType = mimeType
+		}
+		if size, ok := numericInt64(m["size"]); ok {
+			att.Size = size
+		}
+		attachments = append(attachments, att)
+	}
+	return attachments, nil
+}
+
+func numericInt64(raw interface{}) (int64, bool) {
+	switch v := raw.(type) {
+	case int:
+		return int64(v), true
+	case int64:
+		return v, true
+	case float64:
+		return int64(v), true
+	default:
+		return 0, false
+	}
+}
+
 func (h *MCPHandler) toolCommitMemory(ctx context.Context, workspaceID string, args map[string]interface{}) (string, error) {
-	// PR-6 (RFC #2728) compat shim: when the v2 plugin is wired
-	// (MEMORY_PLUGIN_URL set), translate legacy scope→namespace and
-	// delegate. Otherwise fall through to the legacy DB path so
-	// operators who haven't enabled the plugin yet keep working.
-	if h.memoryV2Available() == nil {
-		return h.commitMemoryLegacyShim(ctx, workspaceID, args)
+	// Issue #1733 — v2 memory plugin is now the only path. The legacy
+	// SQL fallback on `agent_memories` is gone; an unconfigured plugin
+	// returns a clear error to the agent rather than silently writing
+	// into a stale table no one reads.
+	if err := h.memoryV2Available(); err != nil {
+		return "", err
 	}
-
-	content, _ := args["content"].(string)
-	scope, _ := args["scope"].(string)
-	if content == "" {
-		return "", fmt.Errorf("content is required")
-	}
-	if scope == "" {
-		scope = "LOCAL"
-	}
-
-	// C3: GLOBAL scope is blocked on the MCP bridge.
-	if scope == "GLOBAL" {
-		return "", fmt.Errorf("GLOBAL scope is not permitted via the MCP bridge — use LOCAL or TEAM")
-	}
-	if scope != "LOCAL" && scope != "TEAM" {
-		return "", fmt.Errorf("scope must be LOCAL or TEAM")
-	}
-
-	memoryID := uuid.New().String()
-	// SAFE-T1201 (#838): scrub known credential patterns before persistence so
-	// plain-text API keys pulled in via tool responses can't land in the
-	// memories table (and leak into shared TEAM scope). Reuses redactSecrets
-	// already shipped for the HTTP path in PR #881 — this was the MCP-bridge
-	// sibling the original fix missed. Runs on every write regardless of scope.
-	content, _ = redactSecrets(workspaceID, content)
-	_, err := h.database.ExecContext(ctx, `
-		INSERT INTO agent_memories (id, workspace_id, content, scope, namespace)
-		VALUES ($1, $2, $3, $4, $5)
-	`, memoryID, workspaceID, content, scope, workspaceID)
-	if err != nil {
-		log.Printf("MCPHandler.commit_memory workspace=%s: %v", workspaceID, err)
-		return "", fmt.Errorf("failed to save memory")
-	}
-
-	return fmt.Sprintf(`{"id":%q,"scope":%q}`, memoryID, scope), nil
+	return h.commitMemoryLegacyShim(ctx, workspaceID, args)
 }
 
 func (h *MCPHandler) toolRecallMemory(ctx context.Context, workspaceID string, args map[string]interface{}) (string, error) {
-	// PR-6 (RFC #2728) compat shim: when the v2 plugin is wired,
-	// route through it. Otherwise fall through to legacy DB path.
-	if h.memoryV2Available() == nil {
-		return h.recallMemoryLegacyShim(ctx, workspaceID, args)
+	// Issue #1733 — v2 memory plugin is now the only path. Same shape
+	// as toolCommitMemory: an unconfigured plugin is an error, not a
+	// quiet read from a frozen v1 table.
+	if err := h.memoryV2Available(); err != nil {
+		return "", err
 	}
-
-	query, _ := args["query"].(string)
-	scope, _ := args["scope"].(string)
-
-	// C3: GLOBAL scope is blocked on the MCP bridge.
-	if scope == "GLOBAL" {
-		return "", fmt.Errorf("GLOBAL scope is not permitted via the MCP bridge — use LOCAL, TEAM, or empty")
-	}
-
-	var rows *sql.Rows
-	var err error
-
-	switch scope {
-	case "LOCAL":
-		rows, err = h.database.QueryContext(ctx, `
-			SELECT id, content, scope, created_at
-			FROM agent_memories
-			WHERE workspace_id = $1 AND scope = 'LOCAL'
-			  AND ($2 = '' OR content ILIKE '%' || $2 || '%')
-			ORDER BY created_at DESC LIMIT 50
-		`, workspaceID, query)
-	case "TEAM":
-		// Team scope: parent + all siblings.
-		rows, err = h.database.QueryContext(ctx, `
-			SELECT m.id, m.content, m.scope, m.created_at
-			FROM agent_memories m
-			JOIN workspaces w ON w.id = m.workspace_id
-			WHERE m.scope = 'TEAM'
-			  AND w.status != 'removed'
-			  AND (w.id = $1 OR w.parent_id = (SELECT parent_id FROM workspaces WHERE id = $1 AND parent_id IS NOT NULL))
-			  AND ($2 = '' OR m.content ILIKE '%' || $2 || '%')
-			ORDER BY m.created_at DESC LIMIT 50
-		`, workspaceID, query)
-	default:
-		// Empty scope → LOCAL only for the MCP bridge (GLOBAL excluded per C3).
-		rows, err = h.database.QueryContext(ctx, `
-			SELECT id, content, scope, created_at
-			FROM agent_memories
-			WHERE workspace_id = $1 AND scope IN ('LOCAL', 'TEAM')
-			  AND ($2 = '' OR content ILIKE '%' || $2 || '%')
-			ORDER BY created_at DESC LIMIT 50
-		`, workspaceID, query)
-	}
-	if err != nil {
-		return "", fmt.Errorf("memory search failed: %w", err)
-	}
-	defer rows.Close()
-
-	type memEntry struct {
-		ID        string `json:"id"`
-		Content   string `json:"content"`
-		Scope     string `json:"scope"`
-		CreatedAt string `json:"created_at"`
-	}
-	var results []memEntry
-	for rows.Next() {
-		var e memEntry
-		if err := rows.Scan(&e.ID, &e.Content, &e.Scope, &e.CreatedAt); err != nil {
-			continue
-		}
-		results = append(results, e)
-	}
-	if err := rows.Err(); err != nil {
-		return "", fmt.Errorf("memory scan error: %w", err)
-	}
-
-	if len(results) == 0 {
-		return "No memories found.", nil
-	}
-	b, _ := json.MarshalIndent(results, "", "  ")
-	return string(b), nil
+	return h.recallMemoryLegacyShim(ctx, workspaceID, args)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

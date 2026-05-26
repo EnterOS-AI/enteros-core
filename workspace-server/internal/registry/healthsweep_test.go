@@ -7,8 +7,8 @@ import (
 	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/models"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
 	"github.com/alicebob/miniredis/v2"
 	"github.com/redis/go-redis/v9"
 )
@@ -163,7 +163,7 @@ func TestSweepStaleRemoteWorkspaces_MarksStaleAwaitingAgent(t *testing.T) {
 	setupTestRedis(t)
 
 	// Two stale remote workspaces returned by the query
-	mock.ExpectQuery(`FROM workspaces\s+WHERE status IN \('online', 'degraded'\)\s+AND COALESCE\(runtime, 'langgraph'\) = 'external'\s+AND COALESCE\(last_heartbeat_at, updated_at\) < now\(\) - `).
+	mock.ExpectQuery(`FROM workspaces\s+WHERE status IN \('online', 'degraded'\)\s+AND COALESCE\(runtime, 'claude-code'\) = 'external'\s+AND COALESCE\(last_heartbeat_at, updated_at\) < now\(\) - `).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).
 			AddRow("ws-stale-1").
 			AddRow("ws-stale-2"))
@@ -193,7 +193,7 @@ func TestSweepStaleRemoteWorkspaces_NoStaleWorkspaces(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
 
-	mock.ExpectQuery(`FROM workspaces\s+WHERE status IN \('online', 'degraded'\)\s+AND COALESCE\(runtime, 'langgraph'\) = 'external'`).
+	mock.ExpectQuery(`FROM workspaces\s+WHERE status IN \('online', 'degraded'\)\s+AND COALESCE\(runtime, 'claude-code'\) = 'external'`).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}))
 
 	called := 0
@@ -277,7 +277,7 @@ func TestStartHealthSweep_NilCheckerRunsRemoteSweep(t *testing.T) {
 
 	// The goroutine will tick once every 50ms; we give it 200ms then
 	// cancel. sqlmock will satisfy any number of calls.
-	mock.ExpectQuery(`FROM workspaces\s+WHERE status IN \('online', 'degraded'\)\s+AND COALESCE\(runtime, 'langgraph'\) = 'external'`).
+	mock.ExpectQuery(`FROM workspaces\s+WHERE status IN \('online', 'degraded'\)\s+AND COALESCE\(runtime, 'claude-code'\) = 'external'`).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}))
 
 	ctx, cancel := context.WithCancel(context.Background())

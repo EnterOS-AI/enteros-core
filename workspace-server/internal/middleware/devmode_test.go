@@ -18,8 +18,7 @@ func TestIsDevModeFailOpen_DevModeNoAdminToken_True(t *testing.T) {
 }
 
 func TestIsDevModeFailOpen_DevModeShortAlias_True(t *testing.T) {
-	// "dev" is a valid alias for "development" — matches the convention
-	// in handlers/admin_test_token.go.
+	// "dev" is a valid alias for "development".
 	t.Setenv("MOLECULE_ENV", "dev")
 	t.Setenv("ADMIN_TOKEN", "")
 	if !isDevModeFailOpen() {

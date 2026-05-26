@@ -15,7 +15,7 @@
 # Required env:
 #   BASE                   default http://localhost:8080
 #                          override to https://<id>.<tenant>.staging...
-#   WORKSPACE_RUNTIME      default langgraph (any internal runtime)
+#   WORKSPACE_RUNTIME      default claude-code (any maintained internal runtime)
 #
 # Exit codes:
 #   0  upload + read-back round-trip succeeded
@@ -26,7 +26,7 @@
 set -uo pipefail
 
 BASE="${BASE:-http://localhost:8080}"
-RUNTIME="${WORKSPACE_RUNTIME:-langgraph}"
+RUNTIME="${WORKSPACE_RUNTIME:-claude-code}"
 
 PARENT=""
 PARENT_TOK=""
@@ -39,6 +39,7 @@ cleanup() {
     set +e
     if [ -n "$PARENT" ]; then
         curl -sS -X DELETE "$BASE/workspaces/$PARENT?confirm=true&purge=true" \
+            -H "X-Confirm-Name: e2e-chat-upload" \
             ${PARENT_TOK:+-H "Authorization: Bearer $PARENT_TOK"} >/dev/null 2>&1
     fi
     exit $rc
@@ -49,9 +50,10 @@ trap cleanup EXIT INT TERM
 echo "[1/5] POST /workspaces (runtime=$RUNTIME)..."
 P_RESP=$(curl -sS -X POST "$BASE/workspaces" \
     -H "Content-Type: application/json" \
-    -d "{\"name\":\"e2e-chat-upload\",\"runtime\":\"$RUNTIME\",\"tier\":2}")
+    -d "{\"name\":\"e2e-chat-upload\",\"runtime\":\"$RUNTIME\",\"tier\":2,\"model\":\"sonnet\"}")
 PARENT=$(echo "$P_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))" 2>/dev/null)
 [ -n "$PARENT" ] || { echo "  ✗ workspace create failed: $P_RESP"; exit 1; }
+PARENT_TOK=$(echo "$P_RESP" | e2e_extract_token)
 echo "  ✓ workspace=$PARENT"
 
 # ─── 2. Wait for online ────────────────────────────────────────────────
@@ -68,10 +70,12 @@ echo "  ✓ online"
 
 # Mint a workspace bearer for the test (the auth needed to call
 # /workspaces/:id/chat/uploads, which is wsAuth-gated).
-PARENT_TOK=$(e2e_mint_test_token "$PARENT") || {
-    echo "  ✗ couldn't mint test token (MOLECULE_ENV=production?)"
-    exit 1
-}
+if [ -z "$PARENT_TOK" ]; then
+    PARENT_TOK=$(e2e_mint_workspace_token "$PARENT") || {
+        echo "  ✗ couldn't mint workspace token"
+        exit 1
+    }
+fi
 
 # ─── 3. Upload a fixture ───────────────────────────────────────────────
 echo "[3/5] POST /workspaces/$PARENT/chat/uploads ..."

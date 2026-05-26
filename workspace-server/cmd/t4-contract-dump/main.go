@@ -23,7 +23,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/provisioner"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
 )
 
 func main() {

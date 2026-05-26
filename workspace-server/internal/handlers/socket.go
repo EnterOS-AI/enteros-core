@@ -6,10 +6,10 @@ import (
 	"os"
 	"strings"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/metrics"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/ws"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/wsauth"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/metrics"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/ws"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wsauth"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 )

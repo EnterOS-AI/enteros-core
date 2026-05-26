@@ -95,7 +95,7 @@ func TestMCPRateLimiter_NoToken_Returns401(t *testing.T) {
 func TestMCPRateLimiter_SetsRateLimitHeaders(t *testing.T) {
 	r := newMCPTestRouter(t, 10, time.Minute)
 	w := httptest.NewRecorder()
-	r.ServeHTTP(w, mcpReq("header-test-token"))
+	r.ServeHTTP(w, mcpReq("header-fixture-token"))
 
 	if w.Header().Get("X-RateLimit-Limit") != "10" {
 		t.Errorf("X-RateLimit-Limit: got %q, want 10", w.Header().Get("X-RateLimit-Limit"))
@@ -110,7 +110,7 @@ func TestMCPRateLimiter_SetsRateLimitHeaders(t *testing.T) {
 
 func TestMCPRateLimiter_ResetsAfterInterval(t *testing.T) {
 	r := newMCPTestRouter(t, 1, 50*time.Millisecond)
-	token := "reset-test-token"
+	token := "reset-fixture-token"
 
 	// Exhaust the bucket.
 	w1 := httptest.NewRecorder()

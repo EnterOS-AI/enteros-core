@@ -9,7 +9,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/handlers"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/handlers"
 )
 
 // fakeRefresher records every Refresh call and lets tests inject errors.

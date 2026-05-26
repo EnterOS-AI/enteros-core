@@ -25,11 +25,17 @@ PASS=0
 FAIL=0
 SENDER_ID=""
 RECEIVER_ID=""
+SENDER_TOKEN=""
+RECEIVER_TOKEN=""
 
 cleanup() {
   for wid in "$SENDER_ID" "$RECEIVER_ID"; do
     if [ -n "$wid" ]; then
-      curl -s -X DELETE "$BASE/workspaces/$wid?confirm=true" > /dev/null || true
+      if [ "$wid" = "$SENDER_ID" ]; then
+        e2e_delete_workspace "$wid" "Abilities Sender"
+      else
+        e2e_delete_workspace "$wid" "Abilities Receiver"
+      fi
     fi
   done
 }
@@ -86,31 +92,34 @@ except Exception:
 ")
   for _wid in $PRIOR; do
     echo "Sweeping leftover '$NAME' workspace: $_wid"
-    curl -s -X DELETE "$BASE/workspaces/$_wid?confirm=true" > /dev/null || true
+    e2e_delete_workspace "$_wid" "$NAME"
   done
 done
 
 R=$(curl -s -X POST "$BASE/workspaces" -H "Content-Type: application/json" \
-  -d '{"name":"Abilities Sender","tier":1}')
+  -d '{"name":"Abilities Sender","tier":1,"runtime":"external","external":true}')
 SENDER_ID=$(echo "$R" | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])' 2>/dev/null || true)
 [ -n "$SENDER_ID" ] || { echo "Failed to create sender workspace: $R"; exit 1; }
+SENDER_TOKEN=$(echo "$R" | e2e_extract_token)
 echo "Created sender   workspace: $SENDER_ID"
-
-R=$(curl -s -X POST "$BASE/workspaces" -H "Content-Type: application/json" \
-  -d '{"name":"Abilities Receiver","tier":1}')
-RECEIVER_ID=$(echo "$R" | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])' 2>/dev/null || true)
-[ -n "$RECEIVER_ID" ] || { echo "Failed to create receiver workspace: $R"; exit 1; }
-echo "Created receiver workspace: $RECEIVER_ID"
-
-# Mint workspace-scoped bearer tokens (test-only endpoint, disabled in prod).
-SENDER_TOKEN=$(e2e_mint_test_token "$SENDER_ID")
-[ -n "$SENDER_TOKEN" ] || { echo "Failed to mint sender token"; exit 1; }
-SENDER_AUTH="Authorization: Bearer $SENDER_TOKEN"
 
 # Admin token — any live workspace bearer satisfies AdminAuth in local dev.
 # In production-like envs, set MOLECULE_ADMIN_TOKEN.
+if [ -z "$SENDER_TOKEN" ]; then
+  SENDER_TOKEN=$(e2e_mint_workspace_token "$SENDER_ID")
+fi
+[ -n "$SENDER_TOKEN" ] || { echo "Failed to mint sender token"; exit 1; }
 ADMIN_TOKEN="${MOLECULE_ADMIN_TOKEN:-$SENDER_TOKEN}"
 ADMIN_AUTH="Authorization: Bearer $ADMIN_TOKEN"
+
+R=$(curl -s -X POST "$BASE/workspaces" -H "$ADMIN_AUTH" -H "Content-Type: application/json" \
+  -d '{"name":"Abilities Receiver","tier":1,"runtime":"external","external":true}')
+RECEIVER_ID=$(echo "$R" | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])' 2>/dev/null || true)
+[ -n "$RECEIVER_ID" ] || { echo "Failed to create receiver workspace: $R"; exit 1; }
+RECEIVER_TOKEN=$(echo "$R" | e2e_extract_token)
+echo "Created receiver workspace: $RECEIVER_ID"
+
+SENDER_AUTH="Authorization: Bearer $SENDER_TOKEN"
 
 # ─────────────────────────────────────────────────────────────────────────────
 echo ""
@@ -206,7 +215,9 @@ fi
 
 echo ""
 echo "--- 2d: Receiver activity log has broadcast_receive entry ---"
-RECEIVER_TOKEN=$(e2e_mint_test_token "$RECEIVER_ID")
+if [ -z "$RECEIVER_TOKEN" ]; then
+  RECEIVER_TOKEN=$(e2e_mint_workspace_token "$RECEIVER_ID")
+fi
 [ -n "$RECEIVER_TOKEN" ] || { echo "Failed to mint receiver token"; exit 1; }
 RECEIVER_AUTH="Authorization: Bearer $RECEIVER_TOKEN"
 

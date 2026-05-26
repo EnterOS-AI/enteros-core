@@ -392,7 +392,7 @@ func remoteHeadShaProd(ctx context.Context, opts *LocalBuildOptions, runtime str
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode == http.StatusNotFound {
-		return "", fmt.Errorf("repo not found at %s — runtime %q may not be mirrored to Gitea (only claude-code/hermes/langgraph/autogen today)", apiURL, runtime)
+		return "", fmt.Errorf("repo not found at %s — runtime %q may not be mirrored to Gitea (expected one of claude-code, codex, hermes, openclaw)", apiURL, runtime)
 	}
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 		return "", fmt.Errorf("auth failure (%d) at %s — verify MOLECULE_GITEA_TOKEN if private repo", resp.StatusCode, apiURL)

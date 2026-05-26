@@ -23,8 +23,13 @@
 #   MOLECULE_ADMIN_TOKEN   CP admin bearer — Railway CP_ADMIN_API_TOKEN
 #
 # Optional env:
-#   E2E_RUNTIME                  hermes (default) | claude-code | langgraph
+#   E2E_RUNTIME                  hermes (default) | claude-code | codex | openclaw
 #   E2E_PROVISION_TIMEOUT_SECS   default 900 (15 min cold EC2 budget)
+#   E2E_WORKSPACE_ONLINE_TIMEOUT_SECS  default 3600 (60 min — hermes
+#                                cold-boot worst-case + slack). Raised from
+#                                1800 (#1646) because flaky tenant-provisioning
+#                                latency (not a code regression) causes
+#                                alternating pass/fail on identical SHAs.
 #   E2E_KEEP_ORG                 1 → skip teardown (debugging only)
 #   E2E_RUN_ID                   Slug suffix; CI: ${GITHUB_RUN_ID}
 #   E2E_MODE                     full (default) | smoke
@@ -56,6 +61,7 @@ CP_URL="${MOLECULE_CP_URL:-https://staging-api.moleculesai.app}"
 ADMIN_TOKEN="${MOLECULE_ADMIN_TOKEN:?MOLECULE_ADMIN_TOKEN required — Railway staging CP_ADMIN_API_TOKEN}"
 RUNTIME="${E2E_RUNTIME:-hermes}"
 PROVISION_TIMEOUT_SECS="${E2E_PROVISION_TIMEOUT_SECS:-900}"
+WORKSPACE_ONLINE_TIMEOUT_SECS="${E2E_WORKSPACE_ONLINE_TIMEOUT_SECS:-3600}"
 RUN_ID_SUFFIX="${E2E_RUN_ID:-$(date +%H%M%S)-$$}"
 MODE="${E2E_MODE:-full}"
 # `canary` is a legacy alias for `smoke` retained for back-compat with
@@ -95,6 +101,14 @@ source "$(dirname "$0")/lib/model_slug.sh"
 source "$(dirname "$0")/lib/aws_leak_check.sh"
 
 CURL_COMMON=(-sS --fail-with-body --max-time 30)
+E2E_TMP_FILES=()
+
+e2e_tmp() {
+  local f
+  f=$(mktemp "$1")
+  E2E_TMP_FILES+=("$f")
+  printf '%s' "$f"
+}
 
 # ─── cleanup trap ───────────────────────────────────────────────────────
 CLEANUP_DONE=0
@@ -106,6 +120,8 @@ cleanup_org() {
 
   if [ "$CLEANUP_DONE" = "1" ]; then return 0; fi
   CLEANUP_DONE=1
+
+  rm -f "${E2E_TMP_FILES[@]}" 2>/dev/null || true
 
   if [ "${E2E_KEEP_ORG:-0}" = "1" ]; then
     log "E2E_KEEP_ORG=1 — skipping teardown. Manually delete $SLUG when done."
@@ -363,7 +379,7 @@ print(s[:4000])
 
 wait_workspaces_online_routable() {
   local label="$1"; shift
-  local deadline=$(( $(date +%s) + 1800 ))
+  local deadline=$(( $(date +%s) + WORKSPACE_ONLINE_TIMEOUT_SECS ))
   local wid ws_last_status ws_last_url ws_url_missing_logged ws_failed_logged
   local ws_json ws_status ws_url ws_last_err
 
@@ -377,7 +393,7 @@ wait_workspaces_online_routable() {
       if [ "$(date +%s)" -gt "$deadline" ]; then
         ws_last_err=$(tenant_call GET "/workspaces/$wid" 2>/dev/null | \
           python3 -c "import json,sys; print(json.load(sys.stdin).get('last_sample_error',''))" 2>/dev/null || echo "")
-        fail "Workspace $wid never reached online with a routable URL within 30 min (last status=$ws_last_status, url=$ws_last_url, err=$ws_last_err)"
+        fail "Workspace $wid never reached online with a routable URL within ${WORKSPACE_ONLINE_TIMEOUT_SECS}s (~$((WORKSPACE_ONLINE_TIMEOUT_SECS/60)) min) (last status=$ws_last_status, url=$ws_last_url, err=$ws_last_err)"
       fi
       ws_json=$(tenant_call GET "/workspaces/$wid" 2>/dev/null || echo '{}')
       ws_status=$(echo "$ws_json" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status') or '')" 2>/dev/null)
@@ -442,9 +458,9 @@ wait_workspaces_online_routable() {
 #     who already have an Anthropic API key for their own Claude
 #     Code session. Pricier per-token than MiniMax but billing is
 #     still independent of MOLECULE_STAGING_OPENAI_API_KEY. Pinned to the
-#     claude-code runtime — hermes/langgraph use OpenAI-shaped envs.
+#     claude-code runtime — hermes/codex/openclaw use OpenAI-shaped envs.
 #
-#   E2E_OPENAI_API_KEY → langgraph + hermes paths. Kept as fallback
+#   E2E_OPENAI_API_KEY → hermes/codex/openclaw paths. Kept as fallback
 #     for operator dispatches that explicitly want to exercise the
 #     OpenAI path. The HERMES_* fields pin hermes-agent's bridge to
 #     api.openai.com (template-hermes' derive-provider.sh otherwise
@@ -470,7 +486,7 @@ elif [ -n "${E2E_ANTHROPIC_API_KEY:-}" ]; then
   # account just for E2E. Pricier per-token than MiniMax but billing
   # is still independent of MOLECULE_STAGING_OPENAI_API_KEY, so an OpenAI
   # quota collapse doesn't wedge this path. Pinned to the claude-code
-  # runtime: hermes/langgraph use OpenAI-shaped envs and won't honour
+  # runtime: hermes/codex/openclaw use OpenAI-shaped envs and won't honour
   # ANTHROPIC_API_KEY without further wiring. pick_model_slug maps this
   # branch to claude-sonnet-4-6 so the claude-code provider registry
   # selects anthropic-api instead of the OAuth-only sonnet alias.
@@ -526,14 +542,84 @@ fi
 # deadline fires at 5 min and sets status=failed prematurely; heartbeat
 # then transitions failed → online after install.sh finishes. So:
 #
-#   - 30 min deadline (hermes worst-case + slack)
+#   - ${WORKSPACE_ONLINE_TIMEOUT_SECS}s (~$((WORKSPACE_ONLINE_TIMEOUT_SECS/60)) min)
+#     deadline (hermes worst-case + slack). Configurable via
+#     E2E_WORKSPACE_ONLINE_TIMEOUT_SECS (#1646).
 #   - 'failed' is a TRANSIENT state we must tolerate — log and keep
 #     polling, only hard-fail at the deadline. Pre-bootstrap-watcher-fix
 #     (controlplane#245) this was a flake generator: workspace went
 #     failed→online inside our window but we bailed at the failed read.
 WS_TO_CHECK=("$PARENT_ID")
 [ -n "$CHILD_ID" ] && WS_TO_CHECK+=("$CHILD_ID")
-wait_workspaces_online_routable "7/11 Waiting for workspace(s) to reach status=online (up to 30 min — hermes cold boot)..." "${WS_TO_CHECK[@]}"
+wait_workspaces_online_routable "7/11 Waiting for workspace(s) to reach status=online (up to $((WORKSPACE_ONLINE_TIMEOUT_SECS/60)) min — hermes cold boot)..." "${WS_TO_CHECK[@]}"
+
+# ─── 7a. Real chat image upload/download round-trip ───────────────────
+# This deliberately uses the production workflow: tenant admin/session auth
+# uploads an image through the same /chat/uploads path the canvas uses. The
+# byte-for-byte download check proves the platform delivered image bytes, not
+# just metadata/name plumbing.
+log "7a/11 Real image upload/download round-trip..."
+PNG_FIXTURE=$(e2e_tmp /tmp/molecule-e2e-image.XXXXXX.png)
+printf '%s' 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAFgwJ/lCqT+wAAAABJRU5ErkJggg==' | base64 -d > "$PNG_FIXTURE"
+PNG_SHA=$(sha256sum "$PNG_FIXTURE" | awk '{print $1}')
+for wid in "${WS_TO_CHECK[@]}"; do
+  UP_TMP=$(e2e_tmp /tmp/e2e_upload.XXXXXX)
+  UP_CODE=$(curl "${CURL_COMMON[@]}" -X POST "$TENANT_URL/workspaces/$wid/chat/uploads" \
+    -H "Authorization: Bearer $EFFECTIVE_TENANT_TOKEN" \
+    -H "X-Molecule-Org-Id: $ORG_ID" \
+    -F "files=@$PNG_FIXTURE;filename=e2e-smoke.png;type=image/png" \
+    -o "$UP_TMP" \
+    -w '%{http_code}' \
+    2>/dev/null || echo "000")
+  if [ "$UP_CODE" != "200" ] && [ "$UP_CODE" != "201" ]; then
+    fail "Workspace $wid image upload returned $UP_CODE: $(head -c 500 "$UP_TMP" | sanitize_http_body)"
+  fi
+  UP_URI=$(python3 -c "
+import json, sys
+d=json.load(open(sys.argv[1]))
+def walk(x):
+    if isinstance(x, dict):
+        if x.get('uri'):
+            print(x['uri']); raise SystemExit
+        for v in x.values(): walk(v)
+    elif isinstance(x, list):
+        for v in x: walk(v)
+walk(d)
+" "$UP_TMP" 2>/dev/null || echo "")
+  UP_MIME=$(python3 -c "
+import json, sys
+d=json.load(open(sys.argv[1]))
+def walk(x):
+    if isinstance(x, dict) and x.get('uri'):
+        print(x.get('mimeType') or x.get('mime') or ''); raise SystemExit
+    if isinstance(x, dict):
+        for v in x.values(): walk(v)
+    elif isinstance(x, list):
+        for v in x: walk(v)
+walk(d)
+" "$UP_TMP" 2>/dev/null || echo "")
+  rm -f "$UP_TMP"
+  [ -n "$UP_URI" ] || fail "Workspace $wid upload response had no workspace URI"
+  [ "$UP_MIME" = "image/png" ] || fail "Workspace $wid upload returned mime=$UP_MIME, want image/png"
+
+  DOWNLOAD_PATH="$UP_URI"
+  case "$DOWNLOAD_PATH" in workspace:*) DOWNLOAD_PATH="${DOWNLOAD_PATH#workspace:}" ;; esac
+  DL_TMP=$(e2e_tmp /tmp/e2e_download.XXXXXX.png)
+  DL_CODE=$(curl "${CURL_COMMON[@]}" "$TENANT_URL/workspaces/$wid/chat/download?path=$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=""))' "$DOWNLOAD_PATH")" \
+    -H "Authorization: Bearer $EFFECTIVE_TENANT_TOKEN" \
+    -H "X-Molecule-Org-Id: $ORG_ID" \
+    -o "$DL_TMP" \
+    -w '%{http_code}' \
+    2>/dev/null || echo "000")
+  if [ "$DL_CODE" != "200" ]; then
+    fail "Workspace $wid image download returned $DL_CODE: $(head -c 300 "$DL_TMP" | sanitize_http_body)"
+  fi
+  DL_SHA=$(sha256sum "$DL_TMP" | awk '{print $1}')
+  rm -f "$DL_TMP"
+  [ "$DL_SHA" = "$PNG_SHA" ] || fail "Workspace $wid image download SHA mismatch: upload=$PNG_SHA download=$DL_SHA"
+  ok "    $wid image upload/download OK ($UP_MIME, sha256=$DL_SHA)"
+done
+rm -f "$PNG_FIXTURE"
 
 # ─── 7b. Canvas-terminal diagnose (EIC chain probe) ────────────────────
 # This step exists because the canvas-terminal failure of 2026-05-03

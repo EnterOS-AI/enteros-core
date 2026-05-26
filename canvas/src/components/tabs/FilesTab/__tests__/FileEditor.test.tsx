@@ -29,8 +29,8 @@ afterEach(() => {
 
 const defaultProps = {
   selectedFile: "/configs/agent.yaml",
-  fileContent: "name: test\nruntime: langgraph",
-  editContent: "name: test\nruntime: langgraph",
+  fileContent: "name: test\nruntime: claude-code",
+  editContent: "name: test\nruntime: claude-code",
   setEditContent: vi.fn(),
   loadingFile: false,
   saving: false,
@@ -197,12 +197,12 @@ describe("FileEditor — textarea", () => {
     render(
       <FileEditor
         {...defaultProps}
-        editContent="runtime: langgraph"
+        editContent="runtime: claude-code"
       />,
     );
     const ta = document.querySelector("textarea");
     expect(ta).toBeTruthy();
-    expect(ta?.value).toBe("runtime: langgraph");
+    expect(ta?.value).toBe("runtime: claude-code");
   });
 
   it("textarea is readOnly when root is not /configs", () => {
@@ -210,7 +210,7 @@ describe("FileEditor — textarea", () => {
       <FileEditor
         {...defaultProps}
         root="/workspace"
-        editContent="runtime: langgraph"
+        editContent="runtime: claude-code"
       />,
     );
     const ta = document.querySelector("textarea");
@@ -222,7 +222,7 @@ describe("FileEditor — textarea", () => {
       <FileEditor
         {...defaultProps}
         root="/configs"
-        editContent="runtime: langgraph"
+        editContent="runtime: claude-code"
       />,
     );
     const ta = document.querySelector("textarea");
