@@ -16,7 +16,6 @@ import re
 from pathlib import Path
 from typing import NamedTuple
 
-
 SELF = ".gitea/workflows/lint-curl-status-capture.yml"
 
 
