@@ -26,6 +26,10 @@ type ChannelHandler struct {
 	manager *channels.Manager
 }
 
+// channelSlugRe matches valid agent slugs used in [slug] routing.
+// Compiled once at init to avoid recompilation on every webhook call.
+var channelSlugRe = regexp.MustCompile(`^[a-zA-Z0-9 _-]+$`)
+
 // NewChannelHandler creates a channel handler with the given manager.
 func NewChannelHandler(manager *channels.Manager) *ChannelHandler {
 	return &ChannelHandler{manager: manager}
@@ -464,11 +468,10 @@ func (h *ChannelHandler) Webhook(c *gin.Context) {
 	// in a shared channel and route to a specific agent.
 	targetSlug := ""
 	routedText := msg.Text
-	validSlugRe := regexp.MustCompile(`^[a-zA-Z0-9 _-]+$`)
 	if len(msg.Text) > 2 && msg.Text[0] == '[' {
 		if idx := strings.Index(msg.Text, "]"); idx > 1 && idx < 40 {
 			candidate := strings.ToLower(strings.TrimSpace(msg.Text[1:idx]))
-			if validSlugRe.MatchString(candidate) {
+			if channelSlugRe.MatchString(candidate) {
 				targetSlug = candidate
 				routedText = strings.TrimSpace(msg.Text[idx+1:])
 				if routedText == "" {
