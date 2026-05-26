@@ -24,8 +24,8 @@ import (
 // `ADMIN_TOKEN` (a random secret, checked by Tier-2 above) and
 // `MOLECULE_ENV=production`. Either one being set makes this helper
 // return false, so the fail-open branch is unreachable in production.
-// The convention matches `handlers/admin_test_token.go`, which gates
-// the e2e test-token mint on `MOLECULE_ENV != "production"`.
+// Real token minting goes through AdminAuth, so local development keeps a
+// narrow fail-open mode for browser/API smoke tests without an admin secret.
 
 // devModeEnvValues is the set of MOLECULE_ENV values that count as
 // "explicit dev mode". Production callers don't set any of these.

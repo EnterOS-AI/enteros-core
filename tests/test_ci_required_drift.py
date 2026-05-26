@@ -18,9 +18,7 @@ No network. No live Gitea calls.
 from __future__ import annotations
 
 import importlib.util
-import json
 import os
-import sys
 import textwrap
 from pathlib import Path
 from unittest import mock
@@ -49,7 +47,7 @@ def drift_module():
     module-level reads pass; tests then patch individual globals as
     needed."""
     env = {
-        "GITEA_TOKEN": "test-token",
+        "GITEA_TOKEN": "fixture-token",
         "GITEA_HOST": "git.example.test",
         "REPO": "owner/repo",
         "BRANCHES": "main staging",

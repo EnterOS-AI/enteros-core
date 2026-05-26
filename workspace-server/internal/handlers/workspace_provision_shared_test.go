@@ -31,9 +31,9 @@ import (
 	"strings"
 	"testing"
 
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
 	"github.com/DATA-DOG/go-sqlmock"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/models"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/provisioner"
 	"github.com/gin-gonic/gin"
 )
 
@@ -241,10 +241,10 @@ func TestMintWorkspaceSecrets_PersistsInboundSecretInSaaSMode(t *testing.T) {
 // inherits it automatically.
 func TestPrepareProvisionContext_ParentIDInjection(t *testing.T) {
 	cases := []struct {
-		name       string
-		parentID   *string
-		expectKey  bool
-		expectVal  string
+		name      string
+		parentID  *string
+		expectKey bool
+		expectVal string
 	}{
 		{
 			name:      "parentID nil → no PARENT_ID env",
@@ -333,11 +333,11 @@ func TestPrepareProvisionContext_InjectsGitHTTPCredsFromPersonaToken(t *testing.
 	t.Setenv("MOLECULE_PERSONA_ROOT", root)
 
 	cases := []struct {
-		name          string
-		role          string
-		expectInject  bool
-		expectUser    string
-		expectPass    string
+		name         string
+		role         string
+		expectInject bool
+		expectUser   string
+		expectPass   string
 	}{
 		{
 			name:         "Dev-A slug role → persona token injected as GIT_HTTP_USERNAME/PASSWORD",
@@ -505,10 +505,10 @@ func TestPrepareProvisionContext_WorkspaceSecretWinsOverPersonaToken(t *testing.
 //
 // The four branches:
 //
-//   1. Secret already present → (s, false, nil)
-//   2. Secret missing, mint succeeds → (minted, true, nil)
-//   3. Secret missing, mint fails → ("", false, mint-err)
-//   4. Read fails (non-NoInboundSecret) → ("", false, read-err)
+//  1. Secret already present → (s, false, nil)
+//  2. Secret missing, mint succeeds → (minted, true, nil)
+//  3. Secret missing, mint fails → ("", false, mint-err)
+//  4. Read fails (non-NoInboundSecret) → ("", false, read-err)
 func TestReadOrLazyHealInboundSecret(t *testing.T) {
 	t.Run("secret already present → no heal, no error", func(t *testing.T) {
 		mock := setupTestDB(t)
@@ -742,7 +742,7 @@ func TestWorkspaceCreate_FirstDeploy_PersistsModelAndProvider(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
-	body := `{"name":"Hermes Minimax Agent","runtime":"hermes","external":true,"model":"minimax/MiniMax-M2.7"}`
+	body := `{"name":"External Minimax Agent","runtime":"external","external":true,"model":"minimax/MiniMax-M2.7"}`
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
@@ -845,7 +845,7 @@ func TestWorkspaceCreate_FirstDeploy_UnknownModel_OnlyMintModelProvider(t *testi
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
-	body := `{"name":"Unknown Model Agent","runtime":"hermes","external":true,"model":"totally-unknown-model/foo"}`
+	body := `{"name":"Unknown Model Agent","runtime":"external","external":true,"model":"totally-unknown-model/foo"}`
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
@@ -899,14 +899,14 @@ func TestApplyRuntimeModelEnv_SetsUniversalMODELForAllRuntimes(t *testing.T) {
 			wantHermesDefault: "minimax/MiniMax-M2.7",
 		},
 		{
-			name:      "langgraph: picked model populates MODEL + MOLECULE_MODEL (no vendor-specific name)",
-			runtime:   "langgraph",
+			name:      "claude-code: picked model populates MODEL + MOLECULE_MODEL (no vendor-specific name)",
+			runtime:   "claude-code",
 			model:     "anthropic:claude-opus-4-7",
 			wantMODEL: "anthropic:claude-opus-4-7",
 		},
 		{
-			name:      "crewai: picked model populates MODEL + MOLECULE_MODEL (no vendor-specific name)",
-			runtime:   "crewai",
+			name:      "openclaw: picked model populates MODEL + MOLECULE_MODEL (no vendor-specific name)",
+			runtime:   "openclaw",
 			model:     "openai:gpt-4o",
 			wantMODEL: "openai:gpt-4o",
 		},
@@ -961,6 +961,145 @@ func TestApplyRuntimeModelEnv_SetsUniversalMODELForAllRuntimes(t *testing.T) {
 				t.Errorf("HERMES_DEFAULT_MODEL = %q, want %q", got, tc.wantHermesDefault)
 			}
 		})
+	}
+}
+
+func TestApplyPlatformManagedLLMEnv_NonClaudeRuntimeDefaultsOpenAIProxyWhenNoWorkspaceKey(t *testing.T) {
+	t.Setenv("MOLECULE_LLM_BILLING_MODE", "platform_managed")
+	t.Setenv("MOLECULE_LLM_BASE_URL", "https://api.example.test/api/v1/internal/llm/openai/v1")
+	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
+	t.Setenv("MOLECULE_LLM_USAGE_URL", "https://api.example.test/api/v1/internal/llm/usage")
+	t.Setenv("MOLECULE_LLM_DEFAULT_MODEL", "moonshot/kimi-k2.6")
+
+	envVars := map[string]string{}
+	applyPlatformManagedLLMEnv(envVars, "codex", "")
+	applyRuntimeModelEnv(envVars, "codex", "")
+
+	if got := envVars["OPENAI_BASE_URL"]; got != "https://api.example.test/api/v1/internal/llm/openai/v1" {
+		t.Fatalf("OPENAI_BASE_URL = %q", got)
+	}
+	if got := envVars["OPENAI_API_KEY"]; got != "tenant-admin-token" {
+		t.Fatalf("OPENAI_API_KEY = %q", got)
+	}
+	if got := envVars["MOLECULE_LLM_USAGE_TOKEN"]; got != "tenant-admin-token" {
+		t.Fatalf("MOLECULE_LLM_USAGE_TOKEN = %q", got)
+	}
+	if got := envVars["MODEL"]; got != "moonshot/kimi-k2.6" {
+		t.Fatalf("MODEL = %q", got)
+	}
+	if got := envVars["MOLECULE_MODEL"]; got != "moonshot/kimi-k2.6" {
+		t.Fatalf("MOLECULE_MODEL = %q", got)
+	}
+}
+
+func TestApplyPlatformManagedLLMEnv_DoesNotOverrideWorkspaceOpenAIKey(t *testing.T) {
+	t.Setenv("MOLECULE_LLM_BILLING_MODE", "platform_managed")
+	t.Setenv("MOLECULE_LLM_BASE_URL", "https://api.example.test/api/v1/internal/llm/openai/v1")
+	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
+
+	envVars := map[string]string{
+		"OPENAI_API_KEY":  "user-openai-key",
+		"OPENAI_BASE_URL": "https://api.openai.com/v1",
+		"MODEL":           "openai/gpt-5.5",
+	}
+	applyPlatformManagedLLMEnv(envVars, "claude-code", "")
+
+	if got := envVars["OPENAI_API_KEY"]; got != "user-openai-key" {
+		t.Fatalf("OPENAI_API_KEY was overwritten: %q", got)
+	}
+	if got := envVars["OPENAI_BASE_URL"]; got != "https://api.openai.com/v1" {
+		t.Fatalf("OPENAI_BASE_URL was overwritten: %q", got)
+	}
+	if got := envVars["MOLECULE_LLM_USAGE_TOKEN"]; got != "tenant-admin-token" {
+		t.Fatalf("MOLECULE_LLM_USAGE_TOKEN = %q", got)
+	}
+	if got := envVars["MODEL"]; got != "openai/gpt-5.5" {
+		t.Fatalf("MODEL = %q", got)
+	}
+}
+
+func TestApplyPlatformManagedLLMEnv_ClaudeCodeUsesAnthropicProxyWithoutOverwritingOAuth(t *testing.T) {
+	t.Setenv("MOLECULE_LLM_BILLING_MODE", "platform_managed")
+	t.Setenv("MOLECULE_LLM_BASE_URL", "https://api.example.test/api/v1/internal/llm/openai/v1")
+	t.Setenv("MOLECULE_LLM_ANTHROPIC_BASE_URL", "https://api.example.test/api/v1/internal/llm/anthropic/v1")
+	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
+
+	envVars := map[string]string{
+		"CLAUDE_CODE_OAUTH_TOKEN": "user-oauth-token",
+		"MODEL":                   "sonnet",
+	}
+	applyPlatformManagedLLMEnv(envVars, "claude-code", "")
+
+	if got := envVars["CLAUDE_CODE_OAUTH_TOKEN"]; got != "user-oauth-token" {
+		t.Fatalf("CLAUDE_CODE_OAUTH_TOKEN was overwritten: %q", got)
+	}
+	if _, ok := envVars["ANTHROPIC_API_KEY"]; ok {
+		t.Fatalf("ANTHROPIC_API_KEY should not be set when Claude OAuth is present")
+	}
+	if got := envVars["MOLECULE_LLM_ANTHROPIC_BASE_URL"]; got != "https://api.example.test/api/v1/internal/llm/anthropic/v1" {
+		t.Fatalf("MOLECULE_LLM_ANTHROPIC_BASE_URL = %q", got)
+	}
+}
+
+func TestApplyPlatformManagedLLMEnv_ClaudeCodeInjectsAnthropicProxyWhenNoWorkspaceKey(t *testing.T) {
+	t.Setenv("MOLECULE_LLM_BILLING_MODE", "platform_managed")
+	t.Setenv("MOLECULE_LLM_BASE_URL", "https://api.example.test/api/v1/internal/llm/openai/v1")
+	t.Setenv("MOLECULE_LLM_ANTHROPIC_BASE_URL", "https://api.example.test/api/v1/internal/llm/anthropic/v1")
+	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
+
+	envVars := map[string]string{}
+	applyPlatformManagedLLMEnv(envVars, "claude-code", "minimax/MiniMax-M2.7")
+
+	if got := envVars["ANTHROPIC_BASE_URL"]; got != "https://api.example.test/api/v1/internal/llm/anthropic/v1" {
+		t.Fatalf("ANTHROPIC_BASE_URL = %q", got)
+	}
+	if got := envVars["ANTHROPIC_API_KEY"]; got != "tenant-admin-token" {
+		t.Fatalf("ANTHROPIC_API_KEY = %q", got)
+	}
+	if got := envVars["MOLECULE_LLM_USAGE_TOKEN"]; got != "tenant-admin-token" {
+		t.Fatalf("MOLECULE_LLM_USAGE_TOKEN = %q", got)
+	}
+}
+
+func TestApplyPlatformManagedLLMEnv_ClaudeCodeDoesNotOverrideVendorBYOK(t *testing.T) {
+	t.Setenv("MOLECULE_LLM_BILLING_MODE", "platform_managed")
+	t.Setenv("MOLECULE_LLM_BASE_URL", "https://api.example.test/api/v1/internal/llm/openai/v1")
+	t.Setenv("MOLECULE_LLM_ANTHROPIC_BASE_URL", "https://api.example.test/api/v1/internal/llm/anthropic/v1")
+	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
+
+	envVars := map[string]string{
+		"MINIMAX_API_KEY": "user-minimax-key",
+		"MODEL":           "MiniMax-M2.7",
+	}
+	applyPlatformManagedLLMEnv(envVars, "claude-code", "")
+
+	if got := envVars["MINIMAX_API_KEY"]; got != "user-minimax-key" {
+		t.Fatalf("MINIMAX_API_KEY was overwritten: %q", got)
+	}
+	if _, ok := envVars["ANTHROPIC_API_KEY"]; ok {
+		t.Fatalf("ANTHROPIC_API_KEY should not be set when vendor BYOK is present")
+	}
+	if _, ok := envVars["ANTHROPIC_BASE_URL"]; ok {
+		t.Fatalf("ANTHROPIC_BASE_URL should not be set when vendor BYOK is present")
+	}
+	if got := envVars["MOLECULE_LLM_USAGE_TOKEN"]; got != "tenant-admin-token" {
+		t.Fatalf("MOLECULE_LLM_USAGE_TOKEN = %q", got)
+	}
+}
+
+func TestApplyPlatformManagedLLMEnv_NoopsOutsidePlatformManaged(t *testing.T) {
+	t.Setenv("MOLECULE_LLM_BILLING_MODE", "byok")
+	t.Setenv("MOLECULE_LLM_BASE_URL", "https://api.example.test/api/v1/internal/llm/openai/v1")
+	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
+
+	envVars := map[string]string{}
+	applyPlatformManagedLLMEnv(envVars, "claude-code", "")
+
+	if _, ok := envVars["OPENAI_API_KEY"]; ok {
+		t.Fatalf("OPENAI_API_KEY should not be set outside platform-managed mode")
+	}
+	if _, ok := envVars["MOLECULE_LLM_USAGE_TOKEN"]; ok {
+		t.Fatalf("MOLECULE_LLM_USAGE_TOKEN should not be set outside platform-managed mode")
 	}
 }
 

@@ -21,8 +21,8 @@ import (
 	"strings"
 	"testing"
 
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/middleware"
 	sqlmock "github.com/DATA-DOG/go-sqlmock"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/middleware"
 	"github.com/gin-gonic/gin"
 )
 
@@ -403,12 +403,12 @@ func TestSecurity_Create_RoleWithCR_Returns400(t *testing.T) {
 // tighten or loosen the constraint by ±1.
 func TestSecurity_ValidateWorkspaceFields_BoundaryValues(t *testing.T) {
 	cases := []struct {
-		label           string
-		name            string
-		role            string
-		model           string
-		runtime         string
-		wantErr         bool
+		label   string
+		name    string
+		role    string
+		model   string
+		runtime string
+		wantErr bool
 	}{
 		// Exact maximum lengths — must PASS.
 		{"name_at_255", strings.Repeat("a", 255), "", "", "", false},
@@ -426,7 +426,7 @@ func TestSecurity_ValidateWorkspaceFields_BoundaryValues(t *testing.T) {
 		{"model_newline", "", "", "a\nb", "", true},
 		{"runtime_newline", "", "", "", "a\nb", true},
 		// Fully valid — must PASS.
-		{"all_valid", "My Agent", "You are a helpful agent.", "claude-opus-4-7", "langgraph", false},
+		{"all_valid", "My Agent", "You are a helpful agent.", "claude-opus-4-7", "claude-code", false},
 	}
 
 	for _, tc := range cases {

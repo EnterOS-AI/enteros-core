@@ -305,7 +305,9 @@ export function SidePanel() {
         {panelTab === "chat" && <ChatTab key={selectedNodeId} workspaceId={selectedNodeId} data={node.data} />}
         {panelTab === "terminal" && <TerminalTab key={selectedNodeId} workspaceId={selectedNodeId} data={node.data} />}
         {panelTab === "display" && <DisplayTab key={selectedNodeId} workspaceId={selectedNodeId} />}
-        {panelTab === "container-config" && <ContainerConfigTab key={selectedNodeId} data={node.data} />}
+        {panelTab === "container-config" && selectedNodeId && (
+          <ContainerConfigTab key={selectedNodeId} workspaceId={selectedNodeId} data={node.data} />
+        )}
         {panelTab === "config" && <ConfigTab key={selectedNodeId} workspaceId={selectedNodeId} />}
         {panelTab === "schedule" && <ScheduleTab key={selectedNodeId} workspaceId={selectedNodeId} />}
         {panelTab === "channels" && <ChannelsTab key={selectedNodeId} workspaceId={selectedNodeId} />}

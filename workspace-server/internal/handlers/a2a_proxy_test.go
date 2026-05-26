@@ -16,8 +16,8 @@ import (
 	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/models"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/provisioner"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
 	"github.com/gin-gonic/gin"
 )
 
@@ -280,7 +280,7 @@ func TestProxyA2A_Upstream502_TriggersContainerDeadCheck(t *testing.T) {
 	mock.ExpectExec("INSERT INTO activity_logs").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	// maybeMarkContainerDead's runtime lookup, then the offline-flip UPDATE.
-	mock.ExpectQuery(`SELECT COALESCE\(runtime, 'langgraph'\) FROM workspaces WHERE id =`).
+	mock.ExpectQuery(`SELECT COALESCE\(runtime, 'claude-code'\) FROM workspaces WHERE id =`).
 		WithArgs("ws-tunnel-dead").
 		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("hermes"))
 	mock.ExpectExec(`UPDATE workspaces SET status =`).
@@ -340,7 +340,7 @@ func TestProxyA2A_Upstream502_AliveAgent_PropagatesAsIs(t *testing.T) {
 	expectBudgetCheck(mock, "ws-alive-502")
 	mock.ExpectExec("INSERT INTO activity_logs").WillReturnResult(sqlmock.NewResult(0, 1))
 	// IsRunning runtime lookup runs but no UPDATE follows (running=true).
-	mock.ExpectQuery(`SELECT COALESCE\(runtime, 'langgraph'\) FROM workspaces WHERE id =`).
+	mock.ExpectQuery(`SELECT COALESCE\(runtime, 'claude-code'\) FROM workspaces WHERE id =`).
 		WithArgs("ws-alive-502").
 		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("hermes"))
 
@@ -1954,9 +1954,9 @@ func TestMaybeMarkContainerDead_NilProvisioner(t *testing.T) {
 	setupTestRedis(t)
 	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
 
-	mock.ExpectQuery(`SELECT COALESCE\(runtime, 'langgraph'\) FROM workspaces WHERE id =`).
+	mock.ExpectQuery(`SELECT COALESCE\(runtime, 'claude-code'\) FROM workspaces WHERE id =`).
 		WithArgs("ws-nilprov").
-		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("langgraph"))
+		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("claude-code"))
 
 	if got := handler.maybeMarkContainerDead(context.Background(), "ws-nilprov"); got {
 		t.Error("expected false when provisioner is nil")
@@ -1977,7 +1977,7 @@ func TestMaybeMarkContainerDead_CPOnly_NotRunning(t *testing.T) {
 	cp := &fakeCPProv{running: false}
 	handler.SetCPProvisioner(cp)
 
-	mock.ExpectQuery(`SELECT COALESCE\(runtime, 'langgraph'\) FROM workspaces WHERE id =`).
+	mock.ExpectQuery(`SELECT COALESCE\(runtime, 'claude-code'\) FROM workspaces WHERE id =`).
 		WithArgs("ws-saas-dead").
 		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("hermes"))
 	mock.ExpectExec(`UPDATE workspaces SET status =`).
@@ -2006,7 +2006,7 @@ func TestMaybeMarkContainerDead_CPOnly_Running(t *testing.T) {
 	cp := &fakeCPProv{running: true}
 	handler.SetCPProvisioner(cp)
 
-	mock.ExpectQuery(`SELECT COALESCE\(runtime, 'langgraph'\) FROM workspaces WHERE id =`).
+	mock.ExpectQuery(`SELECT COALESCE\(runtime, 'claude-code'\) FROM workspaces WHERE id =`).
 		WithArgs("ws-saas-alive").
 		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("hermes"))
 
@@ -2107,7 +2107,7 @@ func TestMaybeMarkContainerDead_ExternalRuntime(t *testing.T) {
 	setupTestRedis(t)
 	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
 
-	mock.ExpectQuery(`SELECT COALESCE\(runtime, 'langgraph'\) FROM workspaces WHERE id =`).
+	mock.ExpectQuery(`SELECT COALESCE\(runtime, 'claude-code'\) FROM workspaces WHERE id =`).
 		WithArgs("ws-ext").
 		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("external"))
 

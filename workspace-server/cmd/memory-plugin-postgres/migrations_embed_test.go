@@ -34,13 +34,49 @@ func TestMigrationsEmbedded_ContainsCreateTable(t *testing.T) {
 			t.Errorf("read embedded %q: %v", e.Name(), err)
 			continue
 		}
-		if !strings.Contains(string(data), "CREATE TABLE") {
-			t.Errorf("embedded %q has no CREATE TABLE — wrong file embedded?", e.Name())
+		// Each file must contain at least one DDL statement we expect to see
+		// — guards against truncated / empty files that would silently embed.
+		if !containsAnyDDL(string(data)) {
+			t.Errorf("embedded %q contains no recognized DDL (CREATE TABLE/SCHEMA/EXTENSION/INDEX) — wrong or truncated file?", e.Name())
 		}
 	}
 	if !seenUp {
 		t.Fatal("no *.up.sql in embedded migrations — runtime would have no schema to apply")
 	}
+
+	// Per-file invariants (issue #1742 review finding). The previous global
+	// "at least one file has CREATE TABLE somewhere" check let a future
+	// rewrite of 001_memory_v2.up.sql silently regress to schema-only as
+	// long as any other file declared a table. Pin the load-bearing DDL
+	// per filename so a wrong-or-truncated 001 fails this test loudly.
+	assertFileContains(t, "000_schema_bootstrap.up.sql", "CREATE SCHEMA")
+	assertFileContains(t, "001_memory_v2.up.sql", "CREATE TABLE")
+	assertFileContains(t, "001_memory_v2.up.sql", "memory_records")
+	assertFileContains(t, "001_memory_v2.up.sql", "memory_namespaces")
+}
+
+// assertFileContains fails the test if the embedded migration `name`
+// either can't be read or doesn't contain `needle`. Pulled out so each
+// per-file pin reads as one line.
+func assertFileContains(t *testing.T, name, needle string) {
+	t.Helper()
+	data, err := migrationsFS.ReadFile("migrations/" + name)
+	if err != nil {
+		t.Errorf("required migration %q not embedded: %v", name, err)
+		return
+	}
+	if !strings.Contains(string(data), needle) {
+		t.Errorf("migration %q must contain %q — wrong or truncated file?", name, needle)
+	}
+}
+
+func containsAnyDDL(sql string) bool {
+	for _, kw := range []string{"CREATE TABLE", "CREATE SCHEMA", "CREATE EXTENSION", "CREATE INDEX", "CREATE OR REPLACE", "ALTER TABLE"} {
+		if strings.Contains(sql, kw) {
+			return true
+		}
+	}
+	return false
 }
 
 // TestRunMigrationsFromEmbed_OrderingIsAlphabetic pins that we apply

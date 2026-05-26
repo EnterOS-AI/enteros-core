@@ -18,7 +18,7 @@ import (
 	dockerclient "github.com/docker/docker/client"
 	"github.com/gin-gonic/gin"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/provisioner"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
 )
 
 // WorkspaceImageService is the production-side end of the runtime CD chain.

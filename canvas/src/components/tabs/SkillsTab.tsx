@@ -32,7 +32,7 @@ interface PluginInfo {
   author: string;
   tags: string[];
   skills: string[];
-  // Declared supported runtimes (e.g. ["claude_code", "deepagents"]).
+  // Declared supported runtimes (e.g. ["claude_code", "hermes"]).
   // Empty / absent = "unspecified, try it".
   runtimes?: string[];
   // Only present on /workspaces/:id/plugins responses — true if the

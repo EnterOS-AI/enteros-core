@@ -28,12 +28,14 @@ function hasChildren(nodeId: string, nodes: Node<WorkspaceNodeData>[]): boolean 
 export function useKeyboardShortcuts() {
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      const tag = (e.target as HTMLElement).tagName;
+      const target = e.target as HTMLElement;
+      if (target.closest?.('[data-display-stream="true"]')) return;
+      const tag = target.tagName;
       const inInput =
         tag === "INPUT" ||
         tag === "TEXTAREA" ||
         tag === "SELECT" ||
-        (e.target as HTMLElement).isContentEditable;
+        target.isContentEditable;
 
       if (e.key === "Escape") {
         const state = useCanvasStore.getState();

@@ -21,6 +21,8 @@ func TestExtended_WorkspaceDelete(t *testing.T) {
 	broadcaster := newTestBroadcaster()
 	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", "/tmp/configs")
 
+	expectWorkspaceDeleteLookup(mock, wsDelID, "Delete Me", 0, "running")
+
 	// Expect children query — no children
 	mock.ExpectQuery("SELECT id, name FROM workspaces WHERE parent_id").
 		WithArgs(wsDelID).
@@ -59,6 +61,7 @@ func TestExtended_WorkspaceDelete(t *testing.T) {
 	c, _ := gin.CreateTestContext(w)
 	c.Params = gin.Params{{Key: "id", Value: wsDelID}}
 	c.Request = httptest.NewRequest("DELETE", "/workspaces/"+wsDelID+"?confirm=true", nil)
+	c.Request.Header.Set("X-Confirm-Name", "Delete Me")
 
 	handler.Delete(c)
 
@@ -187,7 +190,7 @@ func TestExtended_WorkspaceRestart_NoProvisioner(t *testing.T) {
 	// Expect SELECT for workspace existence check (includes runtime column)
 	mock.ExpectQuery("SELECT status, name, tier").
 		WithArgs("ws-restart").
-		WillReturnRows(sqlmock.NewRows([]string{"status", "name", "tier", "runtime"}).AddRow("offline", "Restarting Agent", 1, "langgraph"))
+		WillReturnRows(sqlmock.NewRows([]string{"status", "name", "tier", "runtime"}).AddRow("offline", "Restarting Agent", 1, "claude-code"))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -290,6 +293,26 @@ func TestExtended_SecretsSet(t *testing.T) {
 	}
 }
 
+func TestExtended_SecretsSetRejectsHermesCustomProviderInPlatformManagedMode(t *testing.T) {
+	t.Setenv("MOLECULE_LLM_BILLING_MODE", "platform_managed")
+	_ = setupTestDB(t)
+	handler := NewSecretsHandler(nil)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "22222222-2222-2222-2222-222222222222"}}
+
+	body := `{"key":"HERMES_CUSTOM_BASE_URL","value":"https://api.moonshot.ai/v1"}`
+	c.Request = httptest.NewRequest("POST", "/workspaces/22222222-2222-2222-2222-222222222222/secrets", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Set(c)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
 // ---------- TestSecretsDelete (Extended) ----------
 
 func TestExtended_SecretsDelete(t *testing.T) {
@@ -351,7 +374,7 @@ func TestExtended_DiscoverWithCallerID(t *testing.T) {
 	// Discover handler looks up workspace name + runtime
 	mock.ExpectQuery("SELECT COALESCE").
 		WithArgs("ws-target").
-		WillReturnRows(sqlmock.NewRows([]string{"name", "runtime"}).AddRow("Target Agent", "langgraph"))
+		WillReturnRows(sqlmock.NewRows([]string{"name", "runtime"}).AddRow("Target Agent", "claude-code"))
 
 	// No cached internal URL (Redis empty), so falls through to DB status check
 	mock.ExpectQuery("SELECT status FROM workspaces WHERE id =").
@@ -731,7 +754,7 @@ func TestValidateWorkspaceFields_Lengths(t *testing.T) {
 		name, role, model, runtime string
 		wantErr                    bool
 	}{
-		{"ok", "ok", "ok role", "gpt-4", "langgraph", false},
+		{"ok", "ok", "ok role", "gpt-4", "claude-code", false},
 		{"name_too_long", long256, "", "", "", true},
 		{"role_too_long", "", long1001, "", "", true},
 		{"model_too_long", "", "", long101, "", true},
@@ -790,7 +813,7 @@ func TestCreate_FieldValidation_Returns400(t *testing.T) {
 //
 // Three shapes covered:
 //  1. bare name (no template, no runtime, no model) — formerly defaulted
-//     to langgraph + anthropic; now 422 because model is unspecified.
+//     to claude-code + anthropic; now 422 because model is unspecified.
 //  2. explicit runtime, no model — the Code Reviewer repro shape.
 //  3. explicit runtime+template path, but template (when missing on
 //     disk or unreadable) would leave model empty — exercised here by
@@ -833,8 +856,8 @@ func TestCreate_ModelRequired_Returns422(t *testing.T) {
 // legitimate "register my agent at https://..." flow.
 //
 // Both spellings count as external:
-//   1. payload.External == true (the canonical flag, e.g. with any runtime)
-//   2. payload.Runtime == "external" (legacy shape some E2E scripts still use)
+//  1. payload.External == true (the canonical flag, e.g. with any runtime)
+//  2. payload.Runtime == "external" (legacy shape some E2E scripts still use)
 //
 // The isExternalLikeRuntime() helper catches both "external" and any
 // future external-like runtime alias.

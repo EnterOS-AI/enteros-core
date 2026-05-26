@@ -20,10 +20,34 @@ const SAMPLE_WORKSPACES = [
   { id: "ws-2", name: "Research Agent", tier: 2 },
 ];
 
+const SAMPLE_TEMPLATES = [
+  {
+    id: "seo-agent",
+    name: "SEO Agent",
+    runtime: "claude-code",
+    model: "moonshot/kimi-k2.6",
+    providers: ["platform", "minimax", "kimi-coding", "anthropic", "anthropic-oauth"],
+    models: [
+      { id: "moonshot/kimi-k2.6", name: "Kimi K2.6", provider: "platform", required_env: [] },
+      { id: "MiniMax-M2.7", name: "MiniMax M2.7", required_env: ["MINIMAX_API_KEY"] },
+      { id: "kimi-k2-turbo-preview", name: "Kimi K2 Turbo Preview", required_env: ["KIMI_API_KEY"] },
+      { id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6", required_env: ["ANTHROPIC_API_KEY"] },
+      { id: "sonnet", name: "Claude Sonnet", required_env: ["CLAUDE_CODE_OAUTH_TOKEN"] },
+    ],
+  },
+  { id: "hermes", name: "Hermes", runtime: "hermes" },
+];
+
 beforeEach(() => {
   vi.clearAllMocks();
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  mockGet.mockResolvedValue(SAMPLE_WORKSPACES as any);
+  mockGet.mockImplementation(async (url: string) => {
+    if (url === "/templates") {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      return SAMPLE_TEMPLATES as any;
+    }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return SAMPLE_WORKSPACES as any;
+  });
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   mockPost.mockResolvedValue({} as any);
 });
@@ -42,7 +66,14 @@ async function openDialog() {
 
 async function setTemplate(value: string) {
   fireEvent.change(
-    screen.getByPlaceholderText("e.g. seo-agent (from workspace-configs-templates/)"),
+    screen.getByLabelText("Workspace Template"),
+    { target: { value } }
+  );
+}
+
+async function setRuntime(value: string) {
+  fireEvent.change(
+    screen.getByLabelText("Runtime"),
     { target: { value } }
   );
 }
@@ -63,7 +94,7 @@ describe("CreateWorkspaceDialog", () => {
 
   it('first option is "None (root level)" with empty value', async () => {
     await openDialog();
-    const select = document.querySelector("select") as HTMLSelectElement;
+    const select = screen.getByLabelText("Parent Workspace") as HTMLSelectElement;
     expect(select).toBeTruthy();
     const firstOption = select.options[0];
     expect(firstOption.value).toBe("");
@@ -73,12 +104,12 @@ describe("CreateWorkspaceDialog", () => {
   it("populates select with workspace names from GET /workspaces", async () => {
     await openDialog();
     await waitFor(() => {
-      const select = document.querySelector("select") as HTMLSelectElement;
+      const select = screen.getByLabelText("Parent Workspace") as HTMLSelectElement;
       const optionValues = Array.from(select.options).map((o) => o.value);
       expect(optionValues).toContain("ws-1");
       expect(optionValues).toContain("ws-2");
     });
-    const select = document.querySelector("select") as HTMLSelectElement;
+    const select = screen.getByLabelText("Parent Workspace") as HTMLSelectElement;
     const optionTexts = Array.from(select.options).map((o) => o.text.trim());
     expect(optionTexts.some((t) => t.includes("Platform Team"))).toBe(true);
     expect(optionTexts.some((t) => t.includes("Research Agent"))).toBe(true);
@@ -87,7 +118,7 @@ describe("CreateWorkspaceDialog", () => {
   it("sends parent_id in POST body when a workspace is selected", async () => {
     await openDialog();
     await waitFor(() => {
-      const select = document.querySelector("select") as HTMLSelectElement;
+      const select = screen.getByLabelText("Parent Workspace") as HTMLSelectElement;
       expect(select.options.length).toBeGreaterThan(1);
     });
 
@@ -95,7 +126,7 @@ describe("CreateWorkspaceDialog", () => {
       target: { value: "My Agent" },
     });
 
-    const select = document.querySelector("select") as HTMLSelectElement;
+    const select = screen.getByLabelText("Parent Workspace") as HTMLSelectElement;
     fireEvent.change(select, { target: { value: "ws-1" } });
 
     const createBtn = screen.getAllByRole("button").find((b) => b.textContent === "Create");
@@ -112,7 +143,7 @@ describe("CreateWorkspaceDialog", () => {
       target: { value: "Root Agent" },
     });
 
-    const select = document.querySelector("select") as HTMLSelectElement;
+    const select = screen.getByLabelText("Parent Workspace") as HTMLSelectElement;
     fireEvent.change(select, { target: { value: "" } });
 
     const createBtn = screen.getAllByRole("button").find((b) => b.textContent === "Create");
@@ -123,7 +154,7 @@ describe("CreateWorkspaceDialog", () => {
     expect(body.parent_id).toBeUndefined();
   });
 
-  it("omits compute config by default", async () => {
+  it("sends the cost-efficient headless compute profile by default", async () => {
     await openDialog();
     fireEvent.change(screen.getByPlaceholderText("e.g. SEO Agent"), {
       target: { value: "Plain Agent" },
@@ -134,8 +165,52 @@ describe("CreateWorkspaceDialog", () => {
 
     await waitFor(() => expect(mockPost).toHaveBeenCalled());
     const body = mockPost.mock.calls[0][1] as Record<string, unknown>;
+    expect(body.compute).toEqual({
+      instance_type: "t3.medium",
+      volume: { root_gb: 30 },
+      display: { mode: "none" },
+    });
+    expect(body.model).toBe("moonshot/kimi-k2.6");
+    expect(body.llm_provider).toBe("platform");
+    expect(body.runtime).toBe("claude-code");
+    expect(body.secrets).toBeUndefined();
+  });
+
+  it("keeps runtime and workspace template as separate selectors", async () => {
+    await openDialog();
+
+    const runtimeSelect = screen.getByLabelText("Runtime") as HTMLSelectElement;
+    const runtimeTexts = Array.from(runtimeSelect.options).map((o) => o.text.trim());
+    expect(runtimeTexts).toEqual([
+      "Claude Code",
+      "OpenAI Codex CLI",
+      "Hermes",
+      "OpenClaw",
+    ]);
+    expect(runtimeTexts).not.toContain("SEO Agent");
+
+    await waitFor(() => {
+      const templateSelect = screen.getByLabelText("Workspace Template") as HTMLSelectElement;
+      const templateTexts = Array.from(templateSelect.options).map((o) => o.text.trim());
+      expect(templateTexts).toContain("SEO Agent");
+      expect(templateTexts).not.toContain("Hermes");
+    });
+  });
+
+  it("does not send managed compute for external agents", async () => {
+    await openDialog();
+    fireEvent.change(screen.getByPlaceholderText("e.g. SEO Agent"), {
+      target: { value: "External Agent" },
+    });
+    fireEvent.click(screen.getByLabelText(/External agent/));
+
+    const createBtn = screen.getAllByRole("button").find((b) => b.textContent === "Create");
+    fireEvent.click(createBtn!);
+
+    await waitFor(() => expect(mockPost).toHaveBeenCalled());
+    const body = mockPost.mock.calls[0][1] as Record<string, unknown>;
     expect(body.compute).toBeUndefined();
-    expect(body.model).toBe("anthropic:claude-opus-4-7");
+    expect(body.runtime).toBe("external");
   });
 
   it("sends display compute profile when desktop display is enabled", async () => {
@@ -150,7 +225,8 @@ describe("CreateWorkspaceDialog", () => {
 
     await waitFor(() => expect(mockPost).toHaveBeenCalled());
     const body = mockPost.mock.calls[0][1] as Record<string, unknown>;
-    expect(body.model).toBe("anthropic:claude-opus-4-7");
+    expect(body.model).toBe("moonshot/kimi-k2.6");
+    expect(body.llm_provider).toBe("platform");
     expect(body.compute).toEqual({
       instance_type: "t3.xlarge",
       volume: { root_gb: 80 },
@@ -163,13 +239,57 @@ describe("CreateWorkspaceDialog", () => {
     });
   });
 
+  it("sends BYOK API key secrets when API key auth mode is selected", async () => {
+    await openDialog();
+    fireEvent.change(screen.getByPlaceholderText("e.g. SEO Agent"), {
+      target: { value: "BYOK Agent" },
+    });
+    fireEvent.change(document.querySelector("[data-testid='provider-select']") as HTMLSelectElement, {
+      target: { value: "minimax|MINIMAX_API_KEY" },
+    });
+    fireEvent.change(document.getElementById("llm-secret-input") as HTMLInputElement, {
+      target: { value: "sk-minimax-test" },
+    });
+
+    const createBtn = screen.getAllByRole("button").find((b) => b.textContent === "Create");
+    fireEvent.click(createBtn!);
+
+    await waitFor(() => expect(mockPost).toHaveBeenCalled());
+    const body = mockPost.mock.calls[0][1] as Record<string, unknown>;
+    expect(body.model).toBe("MiniMax-M2.7");
+    expect(body.llm_provider).toBe("minimax");
+    expect(body.secrets).toEqual({ MINIMAX_API_KEY: "sk-minimax-test" });
+  });
+
+  it("sends Claude OAuth token separately from platform-managed mode", async () => {
+    await openDialog();
+    fireEvent.change(screen.getByPlaceholderText("e.g. SEO Agent"), {
+      target: { value: "OAuth Agent" },
+    });
+    fireEvent.change(document.querySelector("[data-testid='provider-select']") as HTMLSelectElement, {
+      target: { value: "anthropic-oauth|CLAUDE_CODE_OAUTH_TOKEN" },
+    });
+    fireEvent.change(document.getElementById("llm-secret-input") as HTMLInputElement, {
+      target: { value: "oauth-token" },
+    });
+
+    const createBtn = screen.getAllByRole("button").find((b) => b.textContent === "Create");
+    fireEvent.click(createBtn!);
+
+    await waitFor(() => expect(mockPost).toHaveBeenCalled());
+    const body = mockPost.mock.calls[0][1] as Record<string, unknown>;
+    expect(body.model).toBe("sonnet");
+    expect(body.llm_provider).toBe("anthropic-oauth");
+    expect(body.secrets).toEqual({ CLAUDE_CODE_OAUTH_TOKEN: "oauth-token" });
+  });
+
   it("renders gracefully when GET /workspaces fails", async () => {
     mockGet.mockRejectedValueOnce(new Error("Network error"));
     await openDialog();
 
     // Dialog still renders; select exists with only the root option
     await waitFor(() => {
-      const select = document.querySelector("select") as HTMLSelectElement;
+      const select = screen.getByLabelText("Parent Workspace") as HTMLSelectElement;
       expect(select.options.length).toBe(1);
       expect(select.options[0].value).toBe("");
     });
@@ -187,17 +307,17 @@ describe("CreateWorkspaceDialog — Hermes provider picker", () => {
     expect(document.querySelector("[data-testid='hermes-provider-section']")).toBeNull();
   });
 
-  it("shows hermes provider section when template is 'hermes'", async () => {
+  it("shows hermes provider section when runtime is 'hermes'", async () => {
     await openDialog();
-    await setTemplate("hermes");
+    await setRuntime("hermes");
     await waitFor(() =>
       expect(document.querySelector("[data-testid='hermes-provider-section']")).toBeTruthy()
     );
   });
 
-  it("shows hermes provider section for template 'HERMES' (case-insensitive)", async () => {
+  it("shows hermes provider section for the Hermes runtime preset", async () => {
     await openDialog();
-    await setTemplate("HERMES");
+    await setRuntime("hermes");
     await waitFor(() =>
       expect(document.querySelector("[data-testid='hermes-provider-section']")).toBeTruthy()
     );
@@ -205,7 +325,7 @@ describe("CreateWorkspaceDialog — Hermes provider picker", () => {
 
   it("hermes provider dropdown defaults to 'anthropic'", async () => {
     await openDialog();
-    await setTemplate("hermes");
+    await setRuntime("hermes");
     await waitFor(() =>
       expect(document.querySelector("[data-testid='hermes-provider-section']")).toBeTruthy()
     );
@@ -216,7 +336,7 @@ describe("CreateWorkspaceDialog — Hermes provider picker", () => {
 
   it("hermes provider dropdown lists all 15 providers", async () => {
     await openDialog();
-    await setTemplate("hermes");
+    await setRuntime("hermes");
     await waitFor(() =>
       expect(document.querySelector("[data-testid='hermes-provider-section']")).toBeTruthy()
     );
@@ -250,7 +370,7 @@ describe("CreateWorkspaceDialog — Hermes provider picker", () => {
     });
 
     await openDialog();
-    await setTemplate("hermes");
+    await setRuntime("hermes");
     await waitFor(() =>
       expect(document.querySelector("[data-testid='hermes-provider-section']")).toBeTruthy()
     );
@@ -280,7 +400,7 @@ describe("CreateWorkspaceDialog — Hermes provider picker", () => {
     });
 
     await openDialog();
-    await setTemplate("hermes");
+    await setRuntime("hermes");
     await waitFor(() =>
       expect(document.querySelector("[data-testid='hermes-provider-section']")).toBeTruthy()
     );
@@ -306,7 +426,7 @@ describe("CreateWorkspaceDialog — Hermes provider picker", () => {
     });
 
     await openDialog();
-    await setTemplate("hermes");
+    await setRuntime("hermes");
     await waitFor(() =>
       expect(document.querySelector("[data-testid='hermes-provider-section']")).toBeTruthy()
     );
@@ -317,7 +437,7 @@ describe("CreateWorkspaceDialog — Hermes provider picker", () => {
 
   it("hermes API key field is a password input (masked)", async () => {
     await openDialog();
-    await setTemplate("hermes");
+    await setRuntime("hermes");
     await waitFor(() =>
       expect(document.querySelector("[data-testid='hermes-provider-section']")).toBeTruthy()
     );
@@ -331,7 +451,7 @@ describe("CreateWorkspaceDialog — Hermes provider picker", () => {
     fireEvent.change(screen.getByPlaceholderText("e.g. SEO Agent"), {
       target: { value: "Hermes Agent" },
     });
-    await setTemplate("hermes");
+    await setRuntime("hermes");
     await waitFor(() =>
       expect(document.querySelector("[data-testid='hermes-provider-section']")).toBeTruthy()
     );
@@ -352,7 +472,7 @@ describe("CreateWorkspaceDialog — Hermes provider picker", () => {
     fireEvent.change(screen.getByPlaceholderText("e.g. SEO Agent"), {
       target: { value: "Hermes Agent" },
     });
-    await setTemplate("hermes");
+    await setRuntime("hermes");
     await waitFor(() =>
       expect(document.querySelector("[data-testid='hermes-provider-section']")).toBeTruthy()
     );
@@ -367,7 +487,8 @@ describe("CreateWorkspaceDialog — Hermes provider picker", () => {
     await waitFor(() => expect(mockPost).toHaveBeenCalled());
     const body = mockPost.mock.calls[0][1] as Record<string, unknown>;
     expect(body.secrets).toEqual({ ANTHROPIC_API_KEY: "sk-test-anthropic-key" });
-    expect(body.template).toBe("hermes");
+    expect(body.runtime).toBe("hermes");
+    expect(body.template).toBeUndefined();
   });
 
   it("uses the correct env var when a non-default provider is selected", async () => {
@@ -375,7 +496,7 @@ describe("CreateWorkspaceDialog — Hermes provider picker", () => {
     fireEvent.change(screen.getByPlaceholderText("e.g. SEO Agent"), {
       target: { value: "Hermes OpenAI" },
     });
-    await setTemplate("hermes");
+    await setRuntime("hermes");
     await waitFor(() =>
       expect(document.querySelector("[data-testid='hermes-provider-section']")).toBeTruthy()
     );
@@ -412,13 +533,13 @@ describe("CreateWorkspaceDialog — Hermes provider picker", () => {
 
   it("hides hermes section and resets state when template is cleared", async () => {
     await openDialog();
-    await setTemplate("hermes");
+    await setRuntime("hermes");
     await waitFor(() =>
       expect(document.querySelector("[data-testid='hermes-provider-section']")).toBeTruthy()
     );
 
-    // Clear template
-    await setTemplate("");
+    // Switch back to a non-Hermes runtime.
+    await setRuntime("claude-code");
     await waitFor(() =>
       expect(document.querySelector("[data-testid='hermes-provider-section']")).toBeNull()
     );

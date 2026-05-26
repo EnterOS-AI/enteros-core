@@ -49,7 +49,7 @@ export interface RuntimeProfile {
 }
 
 /** The floor every runtime inherits unless it overrides. Calibrated for
- *  docker-local fast runtimes (claude-code, langgraph, crewai) where cold
+ *  docker-local fast runtimes (claude-code, codex, openclaw) where cold
  *  boot is 30-90s. */
 export const DEFAULT_RUNTIME_PROFILE: Required<
   Pick<RuntimeProfile, "provisionTimeoutMs">

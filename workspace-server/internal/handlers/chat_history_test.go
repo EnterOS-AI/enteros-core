@@ -22,7 +22,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/messagestore"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/messagestore"
 	"github.com/gin-gonic/gin"
 )
 

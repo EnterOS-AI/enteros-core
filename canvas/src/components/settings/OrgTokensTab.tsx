@@ -175,7 +175,7 @@ export function OrgTokensTab() {
       )}
 
       {error && (
-        <div className="px-3 py-2 bg-red-950/40 border border-red-800/50 rounded-lg text-[10px] text-bad">
+        <div role="alert" aria-live="assertive" className="px-3 py-2 bg-red-950/40 border border-red-800/50 rounded-lg text-[10px] text-bad">
           {error}
         </div>
       )}

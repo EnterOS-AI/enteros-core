@@ -9,11 +9,11 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/middleware"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/provisioner"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/registry"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/wsauth"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/middleware"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/registry"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wsauth"
 	"github.com/gin-gonic/gin"
 )
 
@@ -128,7 +128,7 @@ func discoverHostPeer(ctx context.Context, c *gin.Context, targetID string) {
 // of `callerID` and writes the JSON response (or an appropriate 404/503 error).
 func discoverWorkspacePeer(ctx context.Context, c *gin.Context, callerID, targetID string) {
 	var wsName, wsRuntime string
-	db.DB.QueryRowContext(ctx, `SELECT COALESCE(name,''), COALESCE(runtime,'langgraph') FROM workspaces WHERE id = $1`, targetID).Scan(&wsName, &wsRuntime)
+	db.DB.QueryRowContext(ctx, `SELECT COALESCE(name,''), COALESCE(runtime,'claude-code') FROM workspaces WHERE id = $1`, targetID).Scan(&wsName, &wsRuntime)
 
 	// External workspaces: return their registered URL.
 	// Rewrite 127.0.0.1/localhost → host.docker.internal ONLY when the
@@ -180,7 +180,7 @@ func writeExternalWorkspaceURL(ctx context.Context, c *gin.Context, callerID, ta
 	}
 	outURL := wsURL
 	var callerRuntime string
-	db.DB.QueryRowContext(ctx, `SELECT COALESCE(runtime,'langgraph') FROM workspaces WHERE id = $1`, callerID).Scan(&callerRuntime)
+	db.DB.QueryRowContext(ctx, `SELECT COALESCE(runtime,'claude-code') FROM workspaces WHERE id = $1`, callerID).Scan(&callerRuntime)
 	if !isExternalLikeRuntime(callerRuntime) {
 		outURL = strings.Replace(outURL, "127.0.0.1", "host.docker.internal", 1)
 		outURL = strings.Replace(outURL, "localhost", "host.docker.internal", 1)
@@ -203,8 +203,8 @@ func writeExternalWorkspaceURL(ctx context.Context, c *gin.Context, callerID, ta
 
 // Peers handles GET /registry/:id/peers
 //
-// Optional ``?q=<substring>`` filters the result by case-insensitive
-// substring match against ``name`` or ``role`` (#1038). Filtering is done
+// Optional “?q=<substring>“ filters the result by case-insensitive
+// substring match against “name“ or “role“ (#1038). Filtering is done
 // in Go after the DB read — keeps the SQL identical to the no-filter path
 // (no injection risk, no DB-driver collation surprises) at the cost of
 // loading the unfiltered set first. Acceptable because the peer set is
@@ -301,8 +301,8 @@ func (h *DiscoveryHandler) Peers(c *gin.Context) {
 	c.JSON(http.StatusOK, peers)
 }
 
-// excludeSelfFromPeers strips any peer entry whose ``id`` equals
-// ``workspaceID`` (the caller's own row). Final-line defense for #383
+// excludeSelfFromPeers strips any peer entry whose “id“ equals
+// “workspaceID“ (the caller's own row). Final-line defense for #383
 // (self-delegation 400-loop on external workspaces): a peer-list that
 // includes the requester's own row is the root mechanism by which an
 // agent ends up delegating to itself. The pre-DB filters in Peers
@@ -337,8 +337,8 @@ func filterPeersByQuery(peers []map[string]interface{}, q string) []map[string]i
 	needle := strings.ToLower(q)
 	out := make([]map[string]interface{}, 0, len(peers))
 	for _, p := range peers {
-		name, _ := p["name"].(string)  // nil → "" — safe on empty-role rows
-		role, _ := p["role"].(string)  // nil → "" — queryPeerMaps sets nil when DB role is empty
+		name, _ := p["name"].(string) // nil → "" — safe on empty-role rows
+		role, _ := p["role"].(string) // nil → "" — queryPeerMaps sets nil when DB role is empty
 		if strings.Contains(strings.ToLower(name), needle) ||
 			strings.Contains(strings.ToLower(role), needle) {
 			out = append(out, p)

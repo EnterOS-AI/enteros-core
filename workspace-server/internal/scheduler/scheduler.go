@@ -13,11 +13,11 @@ import (
 	"github.com/google/uuid"
 	cronlib "github.com/robfig/cron/v3"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/events"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/metrics"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/supervised"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/textutil"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/metrics"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/supervised"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/textutil"
 )
 
 const (

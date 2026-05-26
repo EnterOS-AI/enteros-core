@@ -18,13 +18,14 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/crypto"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/events"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/models"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/provisioner"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/wsauth"
-	"github.com/Molecule-AI/molecule-monorepo/platform/pkg/provisionhook"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/crypto"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/memory/contract"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wsauth"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/pkg/provisionhook"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
@@ -55,6 +56,7 @@ type WorkspaceHandler struct {
 	cpProv      provisioner.CPProvisionerAPI
 	platformURL string
 	configsDir  string // path to workspace-configs-templates/ (for reading templates)
+	cacheDir    string // optional runtime-refreshed template cache; overrides configsDir by template id
 	// envMutators runs registered EnvMutator plugins right before
 	// container Start, after built-in secret loads. Nil = no plugins
 	// registered; Registry.Run handles a nil receiver as a no-op so the
@@ -74,10 +76,28 @@ type WorkspaceHandler struct {
 	// memory plugin). main.go sets this to plugin.DeleteNamespace
 	// when MEMORY_PLUGIN_URL is configured.
 	namespaceCleanupFn func(ctx context.Context, workspaceID string)
+	// seedMemoryPlugin is the v2 memory plugin client used by
+	// seedInitialMemories (issue #1755) to write workspace-create
+	// `initial_memories` into the plugin instead of the legacy
+	// `agent_memories` table. nil-safe: when nil, seeding logs a loud
+	// warning and skips. After A1 (#1747) there is no SQL fallback —
+	// seeded memories with no plugin wired are simply not persisted.
+	// main.go attaches this alongside namespaceCleanupFn when
+	// MEMORY_PLUGIN_URL is set (memBundle.Plugin).
+	seedMemoryPlugin seedMemoryPluginAPI
 	// asyncWG tracks goroutines launched by goAsync so tests can wait
 	// for async DB users (restart, provision) before asserting results.
 	// Matches the pattern from main commit 1c3b4ff3.
 	asyncWG sync.WaitGroup
+}
+
+// seedMemoryPluginAPI is the slice of the v2 memory plugin client that
+// seedInitialMemories needs. Defining it as an interface here (parallel
+// to memoryPluginAPI in mcp_tools_memory_v2.go) lets tests stub the
+// plugin with a capture-only spy and keeps the handler decoupled from
+// the concrete *client.Client.
+type seedMemoryPluginAPI interface {
+	CommitMemory(ctx context.Context, namespace string, body contract.MemoryWrite) (*contract.MemoryWriteResponse, error)
 }
 
 // newHandlerHook, when non-nil, is invoked for every WorkspaceHandler
@@ -164,6 +184,11 @@ func NewWorkspaceHandler(b events.EventEmitter, p *provisioner.Provisioner, plat
 	return h
 }
 
+func (h *WorkspaceHandler) WithTemplateCacheDir(cacheDir string) *WorkspaceHandler {
+	h.cacheDir = cacheDir
+	return h
+}
+
 // WithNamespaceCleanup wires the I5 hook (RFC #2728) so workspace
 // purge can drop the plugin's `workspace:<id>` namespace. main.go
 // passes a closure over plugin.DeleteNamespace; tests pass a stub.
@@ -171,6 +196,19 @@ func NewWorkspaceHandler(b events.EventEmitter, p *provisioner.Provisioner, plat
 // purge path treats as a no-op.
 func (h *WorkspaceHandler) WithNamespaceCleanup(fn func(ctx context.Context, workspaceID string)) *WorkspaceHandler {
 	h.namespaceCleanupFn = fn
+	return h
+}
+
+// WithSeedMemoryPlugin wires the v2 memory plugin so
+// seedInitialMemories (issue #1755) routes workspace-create
+// `initial_memories` through the plugin instead of the legacy
+// `agent_memories` table. main.go passes memBundle.Plugin (a
+// `*client.Client`); tests pass a stub matching the
+// seedMemoryPluginAPI interface. Nil-safe: omitting this leaves the
+// field nil and seedInitialMemories logs a warning + skips on each
+// invocation.
+func (h *WorkspaceHandler) WithSeedMemoryPlugin(p seedMemoryPluginAPI) *WorkspaceHandler {
+	h.seedMemoryPlugin = p
 	return h
 }
 
@@ -216,7 +254,6 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 	}
 
 	id := uuid.New().String()
-	awarenessNamespace := workspaceAwarenessNamespace(id)
 	if h.IsSaaS() {
 		// SaaS hard gate: every hosted workspace gets its own sibling
 		// EC2 instance, so T4 is the only meaningful runtime boundary.
@@ -242,19 +279,19 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 	// runtimeExplicitlyRequested is true when the caller expressed intent for
 	// a SPECIFIC runtime — either by passing `runtime` directly, or by naming
 	// a `template` (a template encodes a runtime). When true, we must NOT
-	// silently fall back to langgraph if that intent can't be honored: that
+	// silently fall back to the default runtime if that intent can't be honored: that
 	// is the molecule-controlplane#188 / #184 contract violation (caller asks
-	// for codex/claude-code, gets a langgraph workspace, 201, no error — a
+	// for codex/hermes/openclaw, gets a default-runtime workspace, 201, no error — a
 	// false success). #188 mandates fail-closed (error+notify) on mismatch,
 	// not an advisory degrade. The legitimate "no template, no runtime →
-	// langgraph default" path (bare {"name":...}) is unaffected.
+	// default-runtime path (bare {"name":...}) is unaffected.
 	runtimeExplicitlyRequested := payload.Runtime != "" || payload.Template != ""
 	templateRuntimeResolved := payload.Runtime != ""
 	if payload.Template != "" && (payload.Runtime == "" || payload.Model == "") {
 		// #226: payload.Template is attacker-controllable. resolveInsideRoot
 		// rejects absolute paths and any ".." that escapes configsDir so the
 		// provisioner can't be pointed at host directories.
-		candidatePath, resolveErr := resolveInsideRoot(h.configsDir, payload.Template)
+		candidatePath, resolveErr := resolveWorkspaceTemplatePath(h.configsDir, h.cacheDir, payload.Template)
 		if resolveErr != nil {
 			log.Printf("Create: invalid template path %q: %v", payload.Template, resolveErr)
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid template"})
@@ -301,24 +338,49 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 	// intent for a specific runtime (passed `runtime`, or named a `template`)
 	// but we could NOT resolve a concrete runtime from it (template's
 	// config.yaml unreadable, or it has no `runtime:` key), DO NOT silently
-	// substitute langgraph and return 201 — that is the silent contract
+	// substitute the default runtime and return 201 — that is the silent contract
 	// violation that produced 5/5 wrong workspaces and a false codex E2E pass.
 	// Return 422 so the caller learns the requested runtime was not honored.
 	// The platform-side CP fix (controlplane#188) is the sibling gate; this
 	// closes the ws-server `Create` boundary the product UI actually hits.
 	if payload.Runtime == "" && runtimeExplicitlyRequested && !templateRuntimeResolved {
-		log.Printf("Create: FAIL-CLOSED (controlplane#188) — template=%q requested but runtime could not be resolved; refusing silent langgraph fallback", payload.Template)
+		log.Printf("Create: FAIL-CLOSED (controlplane#188) — template=%q requested but runtime could not be resolved; refusing silent default-runtime fallback", payload.Template)
 		c.JSON(http.StatusUnprocessableEntity, gin.H{
-			"error":    "runtime could not be resolved from the requested template; refusing to silently provision langgraph (controlplane#188). Pass an explicit \"runtime\", or use a template whose config.yaml declares one.",
+			"error":    "runtime could not be resolved from the requested template; refusing to silently provision the default runtime (controlplane#188). Pass an explicit \"runtime\", or use a template whose config.yaml declares one.",
 			"template": payload.Template,
 			"code":     "RUNTIME_UNRESOLVED",
 		})
 		return
 	}
 	if payload.Runtime == "" {
-		// Legitimate default path: no template AND no runtime requested
-		// (bare {"name":...}) — langgraph is the intended default here.
-		payload.Runtime = "langgraph"
+		if payload.External {
+			payload.Runtime = "external"
+		} else {
+			// Legitimate default path: no template AND no runtime requested
+			// (bare {"name":...}) — claude-code is the intended default here.
+			payload.Runtime = "claude-code"
+		}
+	}
+
+	if payload.External && !isExternalLikeRuntime(payload.Runtime) {
+		log.Printf("Create: FAIL-CLOSED — external workspace requested with non-external runtime %q", payload.Runtime)
+		c.JSON(http.StatusUnprocessableEntity, gin.H{
+			"error":   "external workspaces must use runtime \"external\", \"kimi\", or \"kimi-cli\"",
+			"runtime": payload.Runtime,
+			"code":    "RUNTIME_UNSUPPORTED",
+		})
+		return
+	}
+	if payload.Runtime != "" && !isExternalLikeRuntime(payload.Runtime) {
+		if _, ok := knownRuntimes[payload.Runtime]; !ok {
+			log.Printf("Create: FAIL-CLOSED — unsupported runtime %q", payload.Runtime)
+			c.JSON(http.StatusUnprocessableEntity, gin.H{
+				"error":   "unsupported workspace runtime",
+				"runtime": payload.Runtime,
+				"code":    "RUNTIME_UNSUPPORTED",
+			})
+			return
+		}
 	}
 
 	// SSOT (CTO 2026-05-22, feedback_workspace_model_required_no_platform_default_dynamic_credential_intake):
@@ -448,10 +510,10 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 	// returns the actually-persisted name (which we MUST thread back into
 	// payload + broadcast so the canvas displays what the DB has).
 	const insertWorkspaceSQL = `
-		INSERT INTO workspaces (id, name, role, tier, runtime, awareness_namespace, status, parent_id, workspace_dir, workspace_access, budget_limit, max_concurrent_tasks, delivery_mode)
-		VALUES ($1, $2, $3, $4, $5, $6, 'provisioning', $7, $8, $9, $10, $11, $12)
+		INSERT INTO workspaces (id, name, role, tier, runtime, status, parent_id, workspace_dir, workspace_access, budget_limit, max_concurrent_tasks, delivery_mode)
+		VALUES ($1, $2, $3, $4, $5, 'provisioning', $6, $7, $8, $9, $10, $11)
 	`
-	insertArgs := []any{id, payload.Name, role, payload.Tier, payload.Runtime, awarenessNamespace, payload.ParentID, workspaceDir, workspaceAccess, payload.BudgetLimit, maxConcurrent, deliveryMode}
+	insertArgs := []any{id, payload.Name, role, payload.Tier, payload.Runtime, payload.ParentID, workspaceDir, workspaceAccess, payload.BudgetLimit, maxConcurrent, deliveryMode}
 	persistedName, currentTx, err := insertWorkspaceWithNameRetry(
 		ctx,
 		tx,
@@ -506,6 +568,10 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 	// nil/empty map is a no-op.  Any failure rolls back the workspace insert
 	// so we never have a workspace row without its intended secrets.
 	for k, v := range payload.Secrets {
+		if rejectPlatformManagedDirectLLMBypass(c, k) {
+			tx.Rollback() //nolint:errcheck
+			return
+		}
 		encrypted, encErr := crypto.Encrypt([]byte(v))
 		if encErr != nil {
 			tx.Rollback() //nolint:errcheck
@@ -556,7 +622,11 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 		if err := setModelSecret(ctx, id, payload.Model); err != nil {
 			log.Printf("Create workspace %s: failed to persist MODEL_PROVIDER %q: %v (non-fatal)", id, payload.Model, err)
 		}
-		if derived := deriveProviderFromModelSlug(payload.Model); derived != "" {
+		if explicitProvider := strings.TrimSpace(payload.LLMProvider); explicitProvider != "" {
+			if err := setProviderSecret(ctx, id, explicitProvider); err != nil {
+				log.Printf("Create workspace %s: failed to persist LLM_PROVIDER %q: %v (non-fatal)", id, explicitProvider, err)
+			}
+		} else if derived := deriveProviderFromModelSlug(payload.Model); derived != "" {
 			if err := setProviderSecret(ctx, id, derived); err != nil {
 				log.Printf("Create workspace %s: failed to persist LLM_PROVIDER %q: %v (non-fatal)", id, derived, err)
 			}
@@ -572,7 +642,7 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 
 	// Seed initial memories from the create payload (issue #1050).
 	// Non-fatal: failures are logged but don't block workspace creation.
-	seedInitialMemories(ctx, id, payload.InitialMemories, awarenessNamespace)
+	h.seedInitialMemories(ctx, id, payload.InitialMemories)
 
 	// Broadcast provisioning event. Include `runtime` so the canvas can
 	// populate the Runtime pill on the side panel immediately — without it
@@ -666,7 +736,7 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 	var templatePath string
 	var configFiles map[string][]byte
 	if payload.Template != "" {
-		candidatePath, resolveErr := resolveInsideRoot(h.configsDir, payload.Template)
+		candidatePath, resolveErr := resolveWorkspaceTemplatePath(h.configsDir, h.cacheDir, payload.Template)
 		if resolveErr != nil {
 			log.Printf("Create provision: rejecting template %q: %v", payload.Template, resolveErr)
 			return
@@ -707,10 +777,9 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusCreated, gin.H{
-		"id":                  id,
-		"status":              "provisioning",
-		"awareness_namespace": awarenessNamespace,
-		"workspace_access":    workspaceAccess,
+		"id":               id,
+		"status":           "provisioning",
+		"workspace_access": workspaceAccess,
 	})
 }
 
@@ -821,7 +890,7 @@ const workspaceListQuery = `
 		   w.parent_id, w.active_tasks, COALESCE(w.max_concurrent_tasks, 1),
 		   w.last_error_rate,
 		   COALESCE(w.last_sample_error, ''), w.uptime_seconds,
-		   COALESCE(w.current_task, ''), COALESCE(w.runtime, 'langgraph'),
+		   COALESCE(w.current_task, ''), COALESCE(w.runtime, 'claude-code'),
 		   COALESCE(w.workspace_dir, ''),
 		   COALESCE(cl.x, 0), COALESCE(cl.y, 0), COALESCE(cl.collapsed, false),
 		   w.budget_limit, COALESCE(w.monthly_spend, 0),
@@ -883,7 +952,7 @@ func (h *WorkspaceHandler) Get(c *gin.Context) {
 			   w.parent_id, w.active_tasks, COALESCE(w.max_concurrent_tasks, 1),
 			   w.last_error_rate,
 			   COALESCE(w.last_sample_error, ''), w.uptime_seconds,
-			   COALESCE(w.current_task, ''), COALESCE(w.runtime, 'langgraph'),
+			   COALESCE(w.current_task, ''), COALESCE(w.runtime, 'claude-code'),
 			   COALESCE(w.workspace_dir, ''),
 			   COALESCE(cl.x, 0), COALESCE(cl.y, 0), COALESCE(cl.collapsed, false),
 			   w.budget_limit, COALESCE(w.monthly_spend, 0),

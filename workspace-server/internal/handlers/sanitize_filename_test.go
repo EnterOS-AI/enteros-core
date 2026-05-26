@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/handlers"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/handlers"
 )
 
 // SanitizeFilename mirrors workspace/internal_chat_uploads.py's

@@ -27,7 +27,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/memory/contract"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/memory/contract"
 )
 
 // scopeToWritableNamespace maps a legacy scope value to the namespace

@@ -17,7 +17,6 @@ type Workspace struct {
 	Name               string          `json:"name" db:"name"`
 	Role               sql.NullString  `json:"role" db:"role"`
 	Tier               int             `json:"tier" db:"tier"`
-	AwarenessNamespace sql.NullString  `json:"awareness_namespace" db:"awareness_namespace"`
 	Status             string          `json:"status" db:"status"`
 	SourceBundleID     sql.NullString  `json:"source_bundle_id" db:"source_bundle_id"`
 	AgentCard          json.RawMessage `json:"agent_card" db:"agent_card"`
@@ -177,9 +176,13 @@ type CreateWorkspacePayload struct {
 	Template string `json:"template"` // workspace-configs-templates folder name
 	Tier     int    `json:"tier"`
 	Model    string `json:"model"`
-	Runtime  string `json:"runtime"`  // "langgraph" (default), "claude-code", etc.
-	External bool   `json:"external"` // true = no Docker container, just a registered URL
-	URL      string `json:"url"`      // for external workspaces: the A2A endpoint URL (push mode only — omit for poll)
+	// LLMProvider is the optional provider slug paired with Model. Runtimes
+	// such as claude-code need a bare model id plus explicit provider slug;
+	// hermes can still derive provider from slash-prefixed model ids.
+	LLMProvider string `json:"llm_provider"`
+	Runtime     string `json:"runtime"`  // "claude-code" (default), "codex", etc.
+	External    bool   `json:"external"` // true = no Docker container, just a registered URL
+	URL         string `json:"url"`      // for external workspaces: the A2A endpoint URL (push mode only — omit for poll)
 	// DeliveryMode: "push" (default) sends inbound A2A to URL synchronously;
 	// "poll" records inbound to activity_logs for the agent to consume via
 	// GET /activity?since_id=. Poll mode does not require a URL. See #2339.
@@ -207,7 +210,8 @@ type CreateWorkspacePayload struct {
 	} `json:"canvas"`
 	// InitialMemories is an optional list of memories to seed into the
 	// workspace immediately after creation. Each entry is inserted into
-	// agent_memories with the workspace's awareness namespace. Issue #1050.
+	// agent_memories under the workspace's v2 memory namespace
+	// ("workspace:<id>"). Issue #1050.
 	InitialMemories []MemorySeed `json:"initial_memories"`
 }
 

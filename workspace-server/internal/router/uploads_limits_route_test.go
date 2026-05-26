@@ -6,8 +6,8 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/pendinguploads"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/uploads"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/pendinguploads"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/uploads"
 	"github.com/gin-gonic/gin"
 )
 

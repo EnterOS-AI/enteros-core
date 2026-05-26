@@ -5,6 +5,13 @@ import * as Dialog from "@radix-ui/react-dialog";
 import { api } from "@/lib/api";
 import { isSaaSTenant } from "@/lib/tenant";
 import { ExternalConnectModal, type ExternalConnectionInfo } from "./ExternalConnectModal";
+import {
+  ProviderModelSelector,
+  buildProviderCatalog,
+  findProviderForModel,
+  type SelectorModel,
+  type SelectorValue,
+} from "./ProviderModelSelector";
 
 interface WorkspaceOption {
   id: string;
@@ -22,6 +29,8 @@ interface TemplateSpec {
   id: string;
   name?: string;
   runtime?: string;
+  model?: string;
+  models?: SelectorModel[];
   providers?: string[];
 }
 
@@ -33,7 +42,26 @@ interface HermesProvider {
   models: string[];
 }
 
-const DEFAULT_CREATE_MODEL = "anthropic:claude-opus-4-7";
+const DEFAULT_LLM_MODELS: SelectorModel[] = [
+  { id: "moonshot/kimi-k2.6", name: "Kimi K2.6", provider: "platform", required_env: [] },
+  { id: "MiniMax-M2.7", name: "MiniMax M2.7", required_env: ["MINIMAX_API_KEY"] },
+  { id: "kimi-k2-turbo-preview", name: "Kimi K2 Turbo Preview", required_env: ["KIMI_API_KEY"] },
+  { id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6", required_env: ["ANTHROPIC_API_KEY"] },
+  { id: "sonnet", name: "Claude Sonnet", required_env: ["CLAUDE_CODE_OAUTH_TOKEN"] },
+];
+const DEFAULT_PLATFORM_MODEL = DEFAULT_LLM_MODELS[0];
+const DEFAULT_RUNTIME = "claude-code";
+const RUNTIME_OPTIONS = [
+  { value: "claude-code", label: "Claude Code" },
+  { value: "codex", label: "OpenAI Codex CLI" },
+  { value: "hermes", label: "Hermes" },
+  { value: "openclaw", label: "OpenClaw" },
+];
+const BASE_RUNTIME_TEMPLATE_IDS = new Set(["claude-code-default", "codex", "hermes", "openclaw"]);
+const DEFAULT_HEADLESS_INSTANCE_TYPE = "t3.medium";
+const DEFAULT_HEADLESS_ROOT_GB = 30;
+const DEFAULT_DISPLAY_INSTANCE_TYPE = "t3.xlarge";
+const DEFAULT_DISPLAY_ROOT_GB = 80;
 
 // All providers supported by Hermes runtime via providers.resolve_provider().
 // `defaultModel` is the slug injected into the workspace provision request
@@ -64,6 +92,7 @@ export function CreateWorkspaceButton() {
   const [open, setOpen] = useState(false);
   const [name, setName] = useState("");
   const [role, setRole] = useState("");
+  const [runtime, setRuntime] = useState(DEFAULT_RUNTIME);
   const [template, setTemplate] = useState("");
   const [parentId, setParentId] = useState("");
   const [budgetLimit, setBudgetLimit] = useState("");
@@ -71,8 +100,8 @@ export function CreateWorkspaceButton() {
   const [error, setError] = useState<string | null>(null);
   const [workspaces, setWorkspaces] = useState<WorkspaceOption[]>([]);
   const [displayEnabled, setDisplayEnabled] = useState(false);
-  const [displayInstanceType, setDisplayInstanceType] = useState("t3.xlarge");
-  const [displayRootGB, setDisplayRootGB] = useState("80");
+  const [displayInstanceType, setDisplayInstanceType] = useState(DEFAULT_DISPLAY_INSTANCE_TYPE);
+  const [displayRootGB, setDisplayRootGB] = useState(String(DEFAULT_DISPLAY_ROOT_GB));
   const [displayResolution, setDisplayResolution] = useState("1920x1080");
   // Templates fetched from /api/templates — drives the dynamic provider
   // filter below. Same data source ConfigTab uses (PR #2454). When the
@@ -101,11 +130,18 @@ export function CreateWorkspaceButton() {
   // (Anthropic), which 401s if the user's key is for a different
   // provider. Hence: require model when template=hermes.
   const [hermesModel, setHermesModel] = useState("");
+  const [llmSelection, setLLMSelection] = useState<SelectorValue>({
+    providerId: "platform|",
+    model: "moonshot/kimi-k2.6",
+    envVars: [],
+  });
+  const [llmSecret, setLLMSecret] = useState("");
 
   // Tier picker: on SaaS every workspace gets its own EC2 VM (Full Access
   // by construction), so we hide the T1/T2/T3 Docker-sandbox tiers and
-  // lock to T4 — the full-host access tier, which maps to t3.large at the
-  // CP level. On self-hosted we still offer T1/T2/T3 because the Docker-
+  // lock to T4 — the full-host access tier. The EC2 size is controlled by
+  // the compute profile below. On self-hosted we still offer T1/T2/T3
+  // because the Docker-
   // sandbox distinction is a real choice there; T4 is available too for
   // operators who want the full-host tier.
   //
@@ -155,31 +191,72 @@ export function CreateWorkspaceButton() {
     []
   );
 
-  const isHermes = template.trim().toLowerCase() === "hermes";
+  const handleRuntimeChange = useCallback((nextRuntime: string) => {
+    setRuntime(nextRuntime);
+    setTemplate("");
+    setHermesProvider("anthropic");
+    setHermesApiKey("");
+    setHermesModel("");
+    setLLMSelection({ providerId: "platform|", model: DEFAULT_PLATFORM_MODEL.id, envVars: [] });
+    setLLMSecret("");
+  }, []);
 
-  // Resolve the selected template's spec from the /templates response.
-  // The `template` input is free-text; templates can be matched by id,
-  // name, or runtime so any of those work. Lower-cased compare keeps
-  // "Hermes" / "hermes" / "HERMES" interchangeable.
+  // Resolve the selected workspace template from /templates. Runtime is
+  // deliberately separate: "SEO Agent" is a workspace template, not a
+  // runtime, so it must never appear in the runtime selector.
   const selectedTemplateSpec = useMemo<TemplateSpec | null>(() => {
-    const t = template.trim().toLowerCase();
-    if (!t) return null;
-    return (
-      templateSpecs.find(
-        (s) =>
-          (s.id || "").toLowerCase() === t ||
-          (s.name || "").toLowerCase() === t ||
-          (s.runtime || "").toLowerCase() === t,
-      ) ?? null
-    );
+    if (!template) return null;
+    return templateSpecs.find((s) => s.id === template) ?? null;
   }, [template, templateSpecs]);
+  const selectedRuntimeTemplateSpec = useMemo<TemplateSpec | null>(() => (
+    templateSpecs.find((s) => s.id === runtime && BASE_RUNTIME_TEMPLATE_IDS.has(s.id)) ?? null
+  ), [runtime, templateSpecs]);
+  const isHermes = runtime === "hermes";
+  const visibleTemplateSpecs = useMemo(
+    () => templateSpecs.filter((spec) => {
+      if (BASE_RUNTIME_TEMPLATE_IDS.has(spec.id)) return false;
+      const specRuntime = (spec.runtime ?? DEFAULT_RUNTIME).trim().toLowerCase();
+      return specRuntime === runtime;
+    }),
+    [runtime, templateSpecs],
+  );
+  const llmModels = useMemo(
+    () => {
+      if (!selectedTemplateSpec?.models?.length) return DEFAULT_LLM_MODELS;
+      if (isHermes) {
+        return selectedTemplateSpec.models;
+      }
+      if (selectedTemplateSpec.models.some((model) => model.provider === "platform")) {
+        return selectedTemplateSpec.models;
+      }
+      const templateDefault = selectedTemplateSpec.model?.trim();
+      const defaultModelSpec = templateDefault
+        ? selectedTemplateSpec.models.find((model) => model.id === templateDefault)
+        : undefined;
+      return [
+        {
+          id: templateDefault || DEFAULT_PLATFORM_MODEL.id,
+          name: defaultModelSpec?.name ?? DEFAULT_PLATFORM_MODEL.name,
+          provider: "platform",
+          required_env: [],
+        },
+        ...selectedTemplateSpec.models,
+      ];
+    },
+    [isHermes, selectedTemplateSpec],
+  );
+  const llmCatalog = useMemo(() => buildProviderCatalog(llmModels), [llmModels]);
+  const selectedLLMProvider = useMemo(
+    () => llmCatalog.find((p) => p.id === llmSelection.providerId) ?? llmCatalog[0],
+    [llmCatalog, llmSelection.providerId],
+  );
 
   // Filter HERMES_PROVIDERS by what the template declares it supports.
   // Empty/missing declared list → fall back to the full catalog so
   // templates that haven't migrated to the explicit `providers:` field
   // (and self-hosted setups without /templates) keep working unchanged.
   const availableProviders = useMemo<HermesProvider[]>(() => {
-    const declared = selectedTemplateSpec?.providers;
+    const declared = selectedTemplateSpec?.providers ?? selectedRuntimeTemplateSpec?.providers;
     if (!declared || declared.length === 0) return HERMES_PROVIDERS;
     const allowed = new Set(declared.map((p) => p.toLowerCase()));
     const filtered = HERMES_PROVIDERS.filter((p) => allowed.has(p.id.toLowerCase()));
@@ -188,7 +265,7 @@ export function CreateWorkspaceButton() {
     // metadata for yet), fall back to the full list rather than render
     // an empty <select>. Better to over-show than to lock the user out.
     return filtered.length > 0 ? filtered : HERMES_PROVIDERS;
-  }, [selectedTemplateSpec]);
+  }, [selectedRuntimeTemplateSpec, selectedTemplateSpec]);
 
   // If the currently-selected provider is filtered out by a template
   // change, snap back to the first available. Without this, the
@@ -202,6 +279,23 @@ export function CreateWorkspaceButton() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [availableProviders, isHermes]);
+
+  useEffect(() => {
+    if (isHermes || llmCatalog.length === 0) return;
+    const templateDefault = selectedTemplateSpec?.model?.trim();
+    const matched = templateDefault ? findProviderForModel(llmCatalog, templateDefault) : null;
+    const next = matched ?? llmCatalog[0];
+    setLLMSelection({
+      providerId: next.id,
+      model: matched && templateDefault
+        ? templateDefault
+        : next.wildcard
+          ? ""
+          : next.models[0]?.id ?? "",
+      envVars: next.envVars,
+    });
+    setLLMSecret("");
+  }, [isHermes, llmCatalog, selectedTemplateSpec?.model]);
 
   // Auto-fill hermesModel with the provider's defaultModel whenever the
   // provider changes, but only if the user hasn't already typed their own
@@ -225,18 +319,21 @@ export function CreateWorkspaceButton() {
     setName("");
     setRole("");
     setTier(defaultTier);
+    setRuntime(DEFAULT_RUNTIME);
     setTemplate("");
     setParentId("");
     setBudgetLimit("");
     setError(null);
     setDisplayEnabled(false);
-    setDisplayInstanceType("t3.xlarge");
-    setDisplayRootGB("80");
+    setDisplayInstanceType(DEFAULT_DISPLAY_INSTANCE_TYPE);
+    setDisplayRootGB(String(DEFAULT_DISPLAY_ROOT_GB));
     setDisplayResolution("1920x1080");
     setHermesProvider("anthropic");
     setExternalRuntime("external");
     setHermesApiKey("");
     setHermesModel("");
+    setLLMSelection({ providerId: "platform|", model: "moonshot/kimi-k2.6", envVars: [] });
+    setLLMSecret("");
     api
       .get<WorkspaceOption[]>("/workspaces")
       .then((ws) => setWorkspaces(ws))
@@ -263,12 +360,21 @@ export function CreateWorkspaceButton() {
       setError("Model is required for Hermes workspaces — provider routing depends on the model slug prefix");
       return;
     }
+    if (!isExternal && !isHermes && !llmSelection.model.trim()) {
+      setError("Model is required");
+      return;
+    }
+    if (!isExternal && !isHermes && selectedLLMProvider?.envVars.length && !llmSecret.trim()) {
+      setError("Provider credential is required");
+      return;
+    }
     setCreating(true);
     setError(null);
 
     const provider = isHermes
       ? HERMES_PROVIDERS.find((p) => p.id === hermesProvider)
       : undefined;
+    const nativeProvider = !isHermes ? selectedLLMProvider : undefined;
 
     try {
       const parsedBudget = budgetLimit.trim()
@@ -292,26 +398,40 @@ export function CreateWorkspaceButton() {
         tier,
         parent_id: parentId || undefined,
         budget_limit: parsedBudget,
-        ...(!isExternal && !isHermes ? { model: DEFAULT_CREATE_MODEL } : {}),
-        ...(displayEnabled
+        ...(!isExternal && !isHermes && nativeProvider
           ? {
-              compute: {
-                instance_type: displayInstanceType,
-                volume: { root_gb: Number.isFinite(parsedRootGB) ? parsedRootGB : 80 },
-                display: {
-                  mode: "desktop-control",
-                  protocol: "novnc",
-                  width: Number.isFinite(displayWidth) ? displayWidth : 1920,
-                  height: Number.isFinite(displayHeight) ? displayHeight : 1080,
-                },
-              },
+              model: llmSelection.model.trim(),
+              llm_provider: nativeProvider.vendor,
+              ...(nativeProvider.envVars.length > 0
+                ? { secrets: { [nativeProvider.envVars[0]]: llmSecret.trim() } }
+                : {}),
+            }
+          : {}),
+        ...(!isExternal
+          ? {
+              compute: displayEnabled
+                ? {
+                    instance_type: displayInstanceType,
+                    volume: { root_gb: Number.isFinite(parsedRootGB) ? parsedRootGB : DEFAULT_DISPLAY_ROOT_GB },
+                    display: {
+                      mode: "desktop-control",
+                      protocol: "novnc",
+                      width: Number.isFinite(displayWidth) ? displayWidth : 1920,
+                      height: Number.isFinite(displayHeight) ? displayHeight : 1080,
+                    },
+                  }
+                : {
+                    instance_type: DEFAULT_HEADLESS_INSTANCE_TYPE,
+                    volume: { root_gb: DEFAULT_HEADLESS_ROOT_GB },
+                    display: { mode: "none" },
+                  },
             }
           : {}),
         canvas: { x: Math.random() * 400 + 100, y: Math.random() * 300 + 100 },
         // Runtime=external flips the backend into awaiting-agent mode:
         // no container provisioning, token minted, connection payload
         // returned in the response for the modal below.
-        ...(isExternal ? { runtime: externalRuntime } : {}),
+        ...(isExternal ? { runtime: externalRuntime } : { runtime }),
         ...(!isExternal && isHermes && provider
           ? {
               secrets: { [provider.envVar]: hermesApiKey.trim() },
@@ -429,13 +549,76 @@ export function CreateWorkspaceButton() {
             )}
 
             {!isExternal && (
-              <InputField
-                label="Template"
-                value={template}
-                onChange={setTemplate}
-                placeholder="e.g. seo-agent (from workspace-configs-templates/)"
-                mono
-              />
+              <div className="space-y-3">
+                <div>
+                  <label htmlFor="runtime-select" className="text-[11px] text-ink-mid block mb-1">
+                    Runtime
+                  </label>
+                  <select
+                    id="runtime-select"
+                    value={runtime}
+                    onChange={(e) => handleRuntimeChange(e.target.value)}
+                    className="w-full bg-surface-card/60 border border-line/50 rounded-lg px-3 py-2 text-sm text-ink focus:outline-none focus:border-accent/60 focus:ring-1 focus:ring-accent/20 transition-colors"
+                  >
+                    {RUNTIME_OPTIONS.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label htmlFor="workspace-template-select" className="text-[11px] text-ink-mid block mb-1">
+                    Workspace Template
+                  </label>
+                  <select
+                    id="workspace-template-select"
+                    value={template}
+                    onChange={(e) => setTemplate(e.target.value)}
+                    className="w-full bg-surface-card/60 border border-line/50 rounded-lg px-3 py-2 text-sm text-ink focus:outline-none focus:border-accent/60 focus:ring-1 focus:ring-accent/20 transition-colors"
+                  >
+                    <option value="">Blank workspace</option>
+                    {visibleTemplateSpecs.map((spec) => (
+                      <option key={spec.id} value={spec.id}>
+                        {spec.name || spec.id}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+            )}
+
+            {!isExternal && !isHermes && selectedLLMProvider && (
+              <div className="rounded-lg border border-line/50 bg-surface-card/40 p-3 space-y-3">
+                <div className="text-[11px] font-medium text-ink-mid">
+                  LLM
+                </div>
+                <ProviderModelSelector
+                  models={llmModels}
+                  value={llmSelection}
+                  onChange={(next) => {
+                    setLLMSelection(next);
+                    setLLMSecret("");
+                  }}
+                  idPrefix="create-workspace-llm"
+                  variant="stack"
+                />
+                {selectedLLMProvider.envVars.length > 0 && (
+                  <div>
+                    <label htmlFor="llm-secret-input" className="text-[11px] text-ink-mid block mb-1">
+                      {selectedLLMProvider.envVars[0]}
+                    </label>
+                    <input
+                      id="llm-secret-input"
+                      type="password"
+                      value={llmSecret}
+                      onChange={(e) => setLLMSecret(e.target.value)}
+                      autoComplete="off"
+                      className="w-full bg-surface-card/60 border border-line/50 rounded-lg px-3 py-2 text-sm text-ink placeholder-ink-soft focus:outline-none focus:border-accent/60 focus:ring-1 focus:ring-accent/20 transition-colors font-mono"
+                    />
+                  </div>
+                )}
+              </div>
             )}
 
             <div>
@@ -542,10 +725,11 @@ export function CreateWorkspaceButton() {
             )}
 
             <div>
-              <label className="text-[11px] text-ink-mid block mb-1">
+              <label htmlFor="parent-workspace-select" className="text-[11px] text-ink-mid block mb-1">
                 Parent Workspace
               </label>
               <select
+                id="parent-workspace-select"
                 value={parentId}
                 onChange={(e) => setParentId(e.target.value)}
                 className="w-full bg-surface-card/60 border border-line/50 rounded-lg px-3 py-2 text-sm text-ink focus:outline-none focus:border-accent/60 focus:ring-1 focus:ring-accent/20 transition-colors"
@@ -560,7 +744,7 @@ export function CreateWorkspaceButton() {
             </div>
           </div>
 
-          {/* Hermes provider configuration — shown only when template === "hermes" */}
+          {/* Hermes provider configuration — shown only for the Hermes runtime. */}
           {isHermes && (
             <div
               className="mt-4 rounded-xl border border-violet-700/40 bg-violet-950/20 p-4 space-y-3"

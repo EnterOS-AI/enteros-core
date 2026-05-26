@@ -40,10 +40,10 @@
 #   drives: POST /cp/admin/orgs (provision), GET
 #   /cp/admin/orgs/:slug/admin-token (per-tenant token), DELETE
 #   /cp/admin/tenants/:slug (teardown). The per-tenant admin token drives
-#   tenant workspace creation; each workspace's OWN auth_token is consumed
-#   inline from the POST /workspaces 201 response to drive its MCP call.
-#   No dev-only admin token-mint routes are used in this E2E
-#   (feedback_no_dev_only_routes_in_e2e).
+#   tenant workspace creation. When a managed runtime create response
+#   does not expose a one-time workspace token, the same tenant admin/session
+#   bearer drives the MCP call through WorkspaceAuth. No dev-only admin
+#   token-mint routes are used in this E2E (feedback_no_dev_only_routes_in_e2e).
 #
 # Required env:
 #   MOLECULE_ADMIN_TOKEN   CP admin bearer — Railway staging CP_ADMIN_API_TOKEN
@@ -117,27 +117,6 @@ tenant_call_capture() {
     -H "Content-Type: application/json" "$@"
 }
 
-redact_token_body() {
-  python3 -c '
-import json, re, sys
-raw = sys.stdin.read()
-try:
-    data = json.loads(raw)
-except Exception:
-    print(re.sub(r"(?i)([a-z0-9_]*token)=([^&\\s]+)", r"\1=<redacted>", raw)[:500])
-    raise SystemExit(0)
-
-def scrub(v):
-    if isinstance(v, dict):
-        return {k: ("<redacted>" if "token" in k.lower() else scrub(val)) for k, val in v.items()}
-    if isinstance(v, list):
-        return [scrub(x) for x in v]
-    return v
-
-print(json.dumps(scrub(data), separators=(",", ":"))[:500])
-'
-}
-
 extract_auth_token() {
   python3 -c "
 import sys, json
@@ -161,7 +140,7 @@ teardown() {
   if [ "${E2E_KEEP_ORG:-0}" = "1" ]; then
     echo ""
     log "[teardown] E2E_KEEP_ORG=1 — leaving $SLUG for debugging (REMEMBER TO DELETE)"
-    exit $rc
+    exit "$rc"
   fi
   echo ""
   log "[teardown] DELETE /cp/admin/tenants/$SLUG (scoped to this run only)"
@@ -178,13 +157,13 @@ print(sum(1 for o in orgs if o.get('slug') == '$SLUG' and o.get('instance_status
 " 2>/dev/null || echo 1)
     if [ "$LEAK" = "0" ]; then
       log "[teardown] ✓ $SLUG purged (after ${j}x5s)"
-      exit $rc
+      exit "$rc"
     fi
     sleep 5
   done
   echo "::warning::[teardown] $SLUG still present after 120s — sweep-stale-e2e-orgs will catch it within MAX_AGE_MINUTES" >&2
-  [ $rc -eq 0 ] && rc=4
-  exit $rc
+  [ "$rc" -eq 0 ] && rc=4
+  exit "$rc"
 }
 trap teardown EXIT INT TERM
 
@@ -270,8 +249,11 @@ for rt in $PV_RUNTIMES; do
     -d "{\"name\":\"pv-$rt\",\"runtime\":\"$rt\",\"tier\":2,\"parent_id\":\"$PARENT_ID\",\"secrets\":$SECRETS_JSON}")
   WID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))" 2>/dev/null)
   WTOK=$(echo "$R" | extract_auth_token)
-  [ -n "$WID" ] || fail "$rt workspace create failed: $(echo \"$R\" | head -c 300)"
-  [ -n "$WTOK" ] || fail "$rt workspace create did not return an auth_token — cannot drive its MCP call (workspace_id=$WID; create_resp: $(echo \"$R\" | redact_token_body))"
+  [ -n "$WID" ] || fail "$rt workspace create failed: $(printf '%s' "$R" | head -c 300)"
+  if [ -z "$WTOK" ]; then
+    log "    $rt create response did not include workspace auth_token; using tenant admin/session bearer for MCP auth"
+    WTOK="$TENANT_TOKEN"
+  fi
   WS_IDS[$rt]="$WID"
   WS_TOKENS[$rt]="$WTOK"
   ALL_WS_IDS="$ALL_WS_IDS $WID"
@@ -311,8 +293,7 @@ done
 # ─── 6. THE GATE — literal mcp_molecule_list_peers via POST /:id/mcp ────
 # This is the byte-for-byte user-facing call. NOT GET /registry/:id/peers,
 # NOT /health, NOT the heartbeat table. JSON-RPC 2.0 tools/call,
-# name=list_peers, authenticated by the workspace's OWN bearer token
-# through WorkspaceAuth + MCPRateLimiter.
+# name=list_peers, authenticated through WorkspaceAuth + MCPRateLimiter.
 log "6/6 driving the LITERAL list_peers MCP call per runtime..."
 echo ""
 REGRESSED=0

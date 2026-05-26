@@ -5,7 +5,7 @@ import (
 	"log"
 	"sync"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/models"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
 	"github.com/gorilla/websocket"
 )
 

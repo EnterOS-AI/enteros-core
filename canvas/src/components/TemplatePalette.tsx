@@ -5,7 +5,7 @@ import { flushSync } from "react-dom";
 import { api } from "@/lib/api";
 import { useCanvasStore } from "@/store/canvas";
 import type { WorkspaceData } from "@/store/socket";
-import { type Template } from "@/lib/deploy-preflight";
+import { isUserVisibleWorkspaceTemplate, type Template } from "@/lib/deploy-preflight";
 import { useTemplateDeploy } from "@/hooks/useTemplateDeploy";
 import {
   OrgImportPreflightModal,
@@ -446,7 +446,7 @@ export function TemplatePalette() {
     setLoading(true);
     try {
       const data = await api.get<Template[]>("/templates");
-      setTemplates(data);
+      setTemplates(data.filter(isUserVisibleWorkspaceTemplate));
     } catch {
       setTemplates([]);
     } finally {

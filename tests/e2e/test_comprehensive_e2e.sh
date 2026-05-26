@@ -76,8 +76,8 @@ echo "--- Section 2: Workspace CRUD ---"
 # create; sections that depend on container readiness (RT_* in 2b)
 # still run normally.
 R=$(curl -s -X POST "$BASE/workspaces" -H "Content-Type: application/json" \
-  -d '{"name":"Test PM","role":"Project Manager","tier":2}')
-check "Create PM" '"status":"provisioning"' "$R"
+  -d '{"name":"Test PM","role":"Project Manager","tier":2,"runtime":"external","external":true}')
+check "Create PM" '"status":"awaiting_agent"' "$R"
 PM_ID=$(echo "$R" | jq_extract "['id']")
 echo "  PM_ID=$PM_ID"
 RR=$(curl -s -X POST "$BASE/registry/register" -H "Content-Type: application/json" \
@@ -86,8 +86,8 @@ PM_TOKEN=$(echo "$RR" | e2e_extract_token)
 
 # Create child workspace under PM
 R=$(curl -s -X POST "$BASE/workspaces" -H "Content-Type: application/json" \
-  -d "{\"name\":\"Test Dev\",\"role\":\"Developer\",\"tier\":2,\"parent_id\":\"$PM_ID\"}")
-check "Create Dev (child of PM)" '"status":"provisioning"' "$R"
+  -d "{\"name\":\"Test Dev\",\"role\":\"Developer\",\"tier\":2,\"parent_id\":\"$PM_ID\",\"runtime\":\"external\",\"external\":true}")
+check "Create Dev (child of PM)" '"status":"awaiting_agent"' "$R"
 DEV_ID=$(echo "$R" | jq_extract "['id']")
 RR=$(curl -s -X POST "$BASE/registry/register" -H "Content-Type: application/json" \
   -d "{\"id\":\"$DEV_ID\",\"url\":\"http://localhost:9001\",\"agent_card\":{\"name\":\"Dev Agent\",\"skills\":[],\"version\":\"1.0.0\"}}")
@@ -95,16 +95,16 @@ DEV_TOKEN=$(echo "$RR" | e2e_extract_token)
 
 # Create sibling
 R=$(curl -s -X POST "$BASE/workspaces" -H "Content-Type: application/json" \
-  -d "{\"name\":\"Test QA\",\"role\":\"QA\",\"tier\":1,\"parent_id\":\"$PM_ID\"}")
-check "Create QA (sibling of Dev)" '"status":"provisioning"' "$R"
+  -d "{\"name\":\"Test QA\",\"role\":\"QA\",\"tier\":1,\"parent_id\":\"$PM_ID\",\"runtime\":\"external\",\"external\":true}")
+check "Create QA (sibling of Dev)" '"status":"awaiting_agent"' "$R"
 QA_ID=$(echo "$R" | jq_extract "['id']")
 curl -s -X POST "$BASE/registry/register" -H "Content-Type: application/json" \
   -d "{\"id\":\"$QA_ID\",\"url\":\"http://localhost:9002\",\"agent_card\":{\"name\":\"QA\",\"skills\":[]}}" > /dev/null
 
 # Create unrelated workspace
 R=$(curl -s -X POST "$BASE/workspaces" -H "Content-Type: application/json" \
-  -d '{"name":"Test Outsider","role":"External","tier":1}')
-check "Create Outsider (unrelated)" '"status":"provisioning"' "$R"
+  -d '{"name":"Test Outsider","role":"External","tier":1,"runtime":"external","external":true}')
+check "Create Outsider (unrelated)" '"status":"awaiting_agent"' "$R"
 OUTSIDER_ID=$(echo "$R" | jq_extract "['id']")
 
 # List workspaces
@@ -130,21 +130,26 @@ check "PM position persisted" '"x":100' "$R"
 echo ""
 echo "--- Section 2b: Runtime Assignment ---"
 
+if [ "${RUN_SPAWNED_RUNTIME_LEGACY_E2E:-0}" != "1" ]; then
+  echo "  SKIP: spawned-runtime image checks require local runtime images; set RUN_SPAWNED_RUNTIME_LEGACY_E2E=1 to enable"
+  SKIP=$((SKIP + 5))
+else
+
 # Create workspace with explicit runtime
 R=$(curl -s -X POST "$BASE/workspaces" -H "Content-Type: application/json" \
-  -d '{"name":"RT Claude","role":"Test","tier":2,"runtime":"claude-code"}')
+  -d '{"name":"RT Claude","role":"Test","tier":2,"runtime":"claude-code","model":"sonnet"}')
 check "Create claude-code workspace" '"status":"provisioning"' "$R"
 RT_CC_ID=$(echo "$R" | jq_extract "['id']")
 
 R=$(curl -s -X POST "$BASE/workspaces" -H "Content-Type: application/json" \
-  -d '{"name":"RT LangGraph","role":"Test","tier":2,"runtime":"langgraph"}')
-check "Create langgraph workspace" '"status":"provisioning"' "$R"
-RT_LG_ID=$(echo "$R" | jq_extract "['id']")
+  -d '{"name":"RT Codex","role":"Test","tier":2,"runtime":"codex","model":"openai:gpt-5"}')
+check "Create codex workspace" '"status":"provisioning"' "$R"
+RT_CX_ID=$(echo "$R" | jq_extract "['id']")
 
 R=$(curl -s -X POST "$BASE/workspaces" -H "Content-Type: application/json" \
-  -d '{"name":"RT CrewAI","role":"Test","tier":2,"runtime":"crewai"}')
-check "Create crewai workspace" '"status":"provisioning"' "$R"
-RT_CR_ID=$(echo "$R" | jq_extract "['id']")
+  -d '{"name":"RT Hermes","role":"Test","tier":2,"runtime":"hermes","model":"openai:gpt-5"}')
+check "Create hermes workspace" '"status":"provisioning"' "$R"
+RT_HM_ID=$(echo "$R" | jq_extract "['id']")
 
 # Wait for containers to start (poll up to 30s for first one to appear)
 if command -v docker &>/dev/null; then
@@ -174,8 +179,8 @@ if command -v docker &>/dev/null; then
   }
 
   _check_image "$RT_CC_ID" "claude-code" "claude-code uses claude-code image"
-  _check_image "$RT_LG_ID" "langgraph" "langgraph uses langgraph image"
-  _check_image "$RT_CR_ID" "crewai" "crewai uses crewai image"
+  _check_image "$RT_CX_ID" "codex" "codex uses codex image"
+  _check_image "$RT_HM_ID" "hermes" "hermes uses hermes image"
 else
   echo "  SKIP: Docker not available — cannot verify container images"
   SKIP=$((SKIP + 3))
@@ -183,7 +188,7 @@ fi
 
 # Verify runtime in agent card after registration
 sleep 5
-for rt_id in $RT_CC_ID $RT_LG_ID $RT_CR_ID; do
+for rt_id in $RT_CC_ID $RT_CX_ID $RT_HM_ID; do
   # Register so we can check agent card
   curl -s -X POST "$BASE/registry/register" -H "Content-Type: application/json" \
     -d "{\"id\":\"$rt_id\",\"url\":\"http://localhost:19999\",\"agent_card\":{\"name\":\"Test\",\"skills\":[]}}" > /dev/null 2>&1
@@ -204,20 +209,20 @@ fi
 
 # Verify runtime change persists on restart (if provisioner supports ExecRead)
 # Write a new runtime to config, restart, check image changes
-R=$(curl -s -X PUT "$BASE/workspaces/$RT_LG_ID/files/config.yaml" \
+R=$(curl -s -X PUT "$BASE/workspaces/$RT_CX_ID/files/config.yaml" \
   -H "Content-Type: application/json" \
-  -d '{"content":"name: RT LangGraph\nruntime: deepagents\nmodel: openai:gpt-4.1-mini\ntier: 2\n"}')
+  -d '{"content":"name: RT Codex\nruntime: openclaw\nmodel: openai:gpt-4.1-mini\ntier: 2\n"}')
 if echo "$R" | grep -qF "saved"; then
-  curl -s -X POST "$BASE/workspaces/$RT_LG_ID/restart" > /dev/null 2>&1
+  curl -s -X POST "$BASE/workspaces/$RT_CX_ID/restart" > /dev/null 2>&1
   # Poll up to 30s for the new container image to appear (restart can take a while)
   if command -v docker &>/dev/null; then
-    short_id="${RT_LG_ID:0:12}"
+    short_id="${RT_CX_ID:0:12}"
     for _ in 1 2 3 4 5 6; do
       sleep 5
       actual=$(docker inspect "ws-${short_id}" --format '{{.Config.Image}}' 2>/dev/null || echo "")
-      if echo "$actual" | grep -qF "deepagents"; then break; fi
+      if echo "$actual" | grep -qF "openclaw"; then break; fi
     done
-    _check_image "$RT_LG_ID" "deepagents" "Runtime change langgraph→deepagents on restart"
+    _check_image "$RT_CX_ID" "openclaw" "Runtime change codex to openclaw on restart"
   else
     echo "  SKIP: Docker not available"
     SKIP=$((SKIP + 1))
@@ -228,10 +233,14 @@ else
 fi
 
 # Clean up runtime test workspaces
-for rt_id in $RT_CC_ID $RT_LG_ID $RT_CR_ID; do
-  curl -s -X DELETE "$BASE/workspaces/$rt_id?confirm=true" > /dev/null 2>&1
-  sleep 0.3
-done
+e2e_delete_workspace "$RT_CC_ID" "RT Claude"
+sleep 0.3
+e2e_delete_workspace "$RT_CX_ID" "RT Codex"
+sleep 0.3
+e2e_delete_workspace "$RT_HM_ID" "RT Hermes"
+sleep 0.3
+
+fi
 
 # ============================================================
 # Section 3: Registry & Heartbeat
@@ -550,16 +559,21 @@ check "Import bundle" '"status"' "$R"
 echo ""
 echo "--- Section 14: Cleanup & Delete ---"
 
-# Delete with children — should require confirmation
+# Delete without name confirmation should be rejected before cascade.
 R=$(curl -s -X DELETE "$BASE/workspaces/$PM_ID")
-check "Delete PM requires confirmation" '"confirmation_required"' "$R"
+check "Delete PM requires name confirmation" '"destructive_action_requires_confirmation"' "$R"
+
+# Delete with name confirmation but without cascade confirmation should
+# still require explicit child confirmation.
+R=$(curl -s -X DELETE "$BASE/workspaces/$PM_ID" -H "X-Confirm-Name: Test PM")
+check "Delete PM requires cascade confirmation" '"confirmation_required"' "$R"
 
 # Delete with confirmation
-R=$(curl -s -X DELETE "$BASE/workspaces/$PM_ID?confirm=true")
+R=$(curl -s -X DELETE "$BASE/workspaces/$PM_ID?confirm=true" -H "X-Confirm-Name: Test PM")
 check "Delete PM cascades" '"cascade_deleted"' "$R"
 
 # Delete outsider
-curl -s -X DELETE "$BASE/workspaces/$OUTSIDER_ID?confirm=true" > /dev/null
+e2e_delete_workspace "$OUTSIDER_ID" "Test Outsider"
 
 # Clean up remaining workspaces (bundle imports, runtime test workspaces, etc.)
 sleep 2
@@ -568,7 +582,7 @@ import json, sys, subprocess, time
 ws = json.load(sys.stdin)
 for w in ws:
     time.sleep(0.5)  # avoid rate limit
-    subprocess.run(['curl', '-s', '-X', 'DELETE', '$BASE/workspaces/' + w['id'] + '?confirm=true'], capture_output=True)
+    subprocess.run(['curl', '-s', '-X', 'DELETE', '$BASE/workspaces/' + w['id'] + '?confirm=true', '-H', 'X-Confirm-Name: ' + w.get('name','')], capture_output=True)
 " 2>/dev/null
 
 # Poll for clean state up to 30s — DB cascade + container stop is async on busy systems

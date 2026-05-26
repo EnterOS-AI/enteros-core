@@ -10,6 +10,8 @@
 set -euo pipefail
 
 PLATFORM="http://localhost:8080"
+export BASE="$PLATFORM"
+source "$(dirname "$0")/_lib.sh"
 PASS=0
 FAIL=0
 ERRORS=""
@@ -38,9 +40,7 @@ else
 fi
 
 # --- Clean existing workspaces ---
-for id in $(curl -s $PLATFORM/workspaces | python3 -c "import sys,json; [print(w['id']) for w in json.load(sys.stdin)]" 2>/dev/null); do
-  curl -s -X DELETE "$PLATFORM/workspaces/$id" > /dev/null
-done
+e2e_cleanup_all_workspaces
 # shellcheck disable=SC2046  # Intentional word-split over container IDs
 docker stop $(docker ps -q --filter "name=ws-") 2>/dev/null || true
 # shellcheck disable=SC2046

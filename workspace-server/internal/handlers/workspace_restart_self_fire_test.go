@@ -105,7 +105,7 @@ func TestMaybeMarkContainerDead_SkippedWhileRestarting(t *testing.T) {
 	// Workspace row read inside maybeMarkContainerDead — this happens
 	// BEFORE the isRestarting gate in the current implementation, so
 	// allow exactly one SELECT runtime row.
-	mock.ExpectQuery(`SELECT COALESCE\(runtime, 'langgraph'\) FROM workspaces WHERE id =`).
+	mock.ExpectQuery(`SELECT COALESCE\(runtime, 'claude-code'\) FROM workspaces WHERE id =`).
 		WithArgs(wsID).
 		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("claude-code"))
 

@@ -1,5 +1,5 @@
 {
-  "_comment": "OSS surface registry — every repo listed here MUST be public on git.moleculesai.app. Layer-3 customer/private templates are NOT registered here; they are handled at provision-time via the per-tenant credential resolver (see internal#102 RFC). 'main' refs are pinned to tags before broad rollout.",
+  "_comment": "Platform template registry. Repos may be public or platform-private; CI and runtime template-cache refresh clone them with the SSOT-managed template read token, then strip .git metadata before use. Customer/private tenant templates remain outside this platform manifest. 'main' refs are pinned to tags before broad rollout.",
   "version": 1,
   "plugins": [
     {"name": "browser-automation", "repo": "molecule-ai/molecule-ai-plugin-browser-automation", "ref": "main"},
@@ -28,7 +28,8 @@
     {"name": "claude-code-default", "repo": "molecule-ai/molecule-ai-workspace-template-claude-code", "ref": "main"},
     {"name": "hermes", "repo": "molecule-ai/molecule-ai-workspace-template-hermes", "ref": "main"},
     {"name": "openclaw", "repo": "molecule-ai/molecule-ai-workspace-template-openclaw", "ref": "main"},
-    {"name": "codex", "repo": "molecule-ai/molecule-ai-workspace-template-codex", "ref": "main"}
+    {"name": "codex", "repo": "molecule-ai/molecule-ai-workspace-template-codex", "ref": "main"},
+    {"name": "seo-agent", "repo": "molecule-ai/molecule-ai-workspace-template-seo-agent", "ref": "main"}
   ],
   "org_templates": [
     {"name": "molecule-dev", "repo": "molecule-ai/molecule-ai-org-template-molecule-dev", "ref": "main"},
@@ -38,4 +39,3 @@
     {"name": "ux-ab-lab", "repo": "molecule-ai/molecule-ai-org-template-ux-ab-lab", "ref": "main"}
   ]
 }
-// Triggered by Integration Tester at 2026-05-10T08:52Z

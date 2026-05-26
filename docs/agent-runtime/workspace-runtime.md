@@ -4,13 +4,11 @@ The `workspace/` directory is Molecule AI's unified runtime image. Every provisi
 
 ## Runtime Matrix In Current `main`
 
-Current `main` ships six adapters:
+Current `main` ships four maintained adapters:
 
-- `langgraph`
-- `deepagents`
 - `claude-code`
-- `crewai`
-- `autogen`
+- `codex`
+- `hermes`
 - `openclaw`
 
 This is the merged runtime surface today. Branch-level experiments such as NemoClaw are separate and should be treated as roadmap/WIP, not merged support.
@@ -27,7 +25,7 @@ Adapter-specific behavior is documented in [Agent Runtime Adapters](./cli-runtim
 - serving A2A over HTTP
 - registering with the platform and sending heartbeats
 - reporting activity and task state
-- integrating with awareness-backed memory when configured
+- proxying durable memory tools through the v2 memory plugin
 - hot-reloading skills while the workspace is running
 
 ## Environment Model
@@ -39,8 +37,6 @@ WORKSPACE_ID=ws-123
 WORKSPACE_CONFIG_PATH=/configs
 PLATFORM_URL=http://platform:8080
 PARENT_ID=
-AWARENESS_URL=http://awareness:37800
-AWARENESS_NAMESPACE=workspace:ws-123
 LANGFUSE_HOST=http://langfuse-web:3000
 LANGFUSE_PUBLIC_KEY=...
 LANGFUSE_SECRET_KEY=...
@@ -49,8 +45,7 @@ LANGFUSE_SECRET_KEY=...
 Important behavior:
 
 - `WORKSPACE_CONFIG_PATH` points at the mounted config directory for that workspace.
-- `AWARENESS_URL` + `AWARENESS_NAMESPACE` enable workspace-scoped awareness-backed memory.
-- If awareness is absent, runtime memory tools fall back to the platform memory endpoints for compatibility.
+- Memory MCP tools route through the platform's v2 memory plugin (see Memory Architecture doc); there is no per-workspace memory env var anymore — the plugin sidecar is provisioned at the tenant EC2 boundary.
 
 ## Startup Sequence
 
@@ -82,8 +77,7 @@ At a high level, `workspace/main.py` does this:
 | `skills/loader.py` | Parses `SKILL.md`, loads tool modules, returns loaded skill metadata |
 | `skills/watcher.py` | Hot reload path for skill changes |
 | `plugins.py` | Scans mounted plugins for shared rules, prompt fragments, and extra skills |
-| `tools/memory.py` | Agent memory tools |
-| `tools/awareness_client.py` | Awareness-backed persistence wrapper |
+| `tools/memory.py` | Agent memory tools (route through the platform's v2 memory plugin via the workspace-server proxy) |
 | `coordinator.py` | Coordinator-only delegation path for team leads |
 
 ## Skills, Plugins, And Hot Reload
@@ -103,23 +97,28 @@ Hot reload matters because the runtime is designed to keep a workspace alive whi
 
 The watcher rescans the skill package, rebuilds the agent tool surface, and updates the Agent Card so peers and the canvas reflect the new capabilities.
 
-## Awareness And Memory Integration
+## Memory Integration
 
 The runtime keeps the agent-facing contract stable:
 
-- `commit_memory(content, scope)`
-- `search_memory(query, scope)`
+- `commit_memory(content, scope)` — legacy MCP name, routed through the
+  v2 plugin's scope→namespace shim
+- `commit_memory_v2(content, namespace)` — direct v2 surface
+- `search_memory(query, namespace?)` — v2 plugin search with FTS +
+  semantic scoring when the plugin declares the capability
 
-When awareness is configured:
+All writes land in the workspace's `workspace:<workspace_id>` namespace
+unless the agent passes an explicit one. Cross-workspace namespaces
+(`team:<root>`, `org:<root>`) follow the platform's namespace ACL
+(`internal/memory/namespace/resolver.go`). There is no per-workspace
+memory env var on the runtime side — the plugin lives on the tenant
+EC2 at `localhost:9100`, spawned by `entrypoint-tenant.sh` when
+`MEMORY_PLUGIN_URL` is present in the tenant-server's env (CP
+user-data injects it during tenant provisioning). The workspace-server
+proxies all memory calls through that sidecar.
 
-- the tools route durable facts to the workspace's own awareness namespace
-- the namespace defaults to `workspace:<workspace_id>` unless explicitly overridden
-
-When awareness is not configured:
-
-- the same tools fall back to the platform memory endpoints
-
-That design lets the platform improve the backend memory boundary without forcing every agent prompt or tool signature to change.
+See [Memory Architecture](../architecture/memory.md) for the full
+backend story.
 
 ## Coordinator Enforcement
 

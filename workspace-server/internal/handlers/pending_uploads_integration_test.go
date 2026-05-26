@@ -51,7 +51,7 @@ import (
 	"github.com/google/uuid"
 	_ "github.com/lib/pq"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/pendinguploads"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/pendinguploads"
 )
 
 // integrationDB_PendingUploads opens a connection from $INTEGRATION_DB_URL
@@ -124,13 +124,17 @@ func TestIntegration_PendingUploads_PutGetAckRoundTrip(t *testing.T) {
 		t.Errorf("FetchedAt should be set after MarkFetched")
 	}
 
-	// Ack flips acked_at; subsequent Gets return ErrNotFound (acked rows
-	// are filtered out at the SELECT predicate).
+	// Ack flips acked_at. Acked rows remain readable during retention so
+	// refreshed canvas previews can resolve platform-pending: attachment URIs.
 	if err := store.Ack(ctx, fileID); err != nil {
 		t.Fatalf("Ack: %v", err)
 	}
-	if _, err := store.Get(ctx, fileID); err != pendinguploads.ErrNotFound {
-		t.Errorf("Get after Ack: got %v, want ErrNotFound", err)
+	rec3, err := store.Get(ctx, fileID)
+	if err != nil {
+		t.Fatalf("Get after Ack: %v", err)
+	}
+	if rec3.AckedAt == nil {
+		t.Errorf("AckedAt should be set after Ack")
 	}
 
 	// Idempotent re-ack succeeds.

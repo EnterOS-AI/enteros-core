@@ -7,7 +7,7 @@ import {
 } from "@xyflow/react";
 import { api } from "@/lib/api";
 import { showToast } from "@/components/Toaster";
-import type { WorkspaceData, WSMessage } from "./socket";
+import type { WorkspaceCompute, WorkspaceData, WSMessage } from "./socket";
 import { handleCanvasEvent } from "./canvas-events";
 import { markDeleted, wasRecentlyDeleted } from "./deleteTombstones";
 import {
@@ -130,6 +130,14 @@ export interface WorkspaceNodeData extends Record<string, unknown> {
    *  builds — that fallthrough is treated as "push" to match
    *  ws-server's `lookupDeliveryMode` default. */
   deliveryMode?: string;
+  /** Desired EC2/container shape persisted in workspaces.compute. Applied
+   *  at next restart/reprovision, and used to determine Display tab
+   *  availability. */
+  compute?: WorkspaceCompute;
+  /** Runtime image changed through Container Config; next restart must
+   *  re-apply the runtime-default template instead of reusing the old
+   *  config volume. UI-only, cleared after restart. */
+  applyTemplateOnRestart?: boolean;
 }
 
 export type PanelTab = "details" | "skills" | "chat" | "terminal" | "display" | "container-config" | "config" | "schedule" | "channels" | "files" | "memory" | "traces" | "events" | "activity" | "audit";
@@ -168,7 +176,7 @@ interface CanvasState {
   setPanelTab: (tab: PanelTab) => void;
   getSelectedNode: () => Node<WorkspaceNodeData> | null;
   updateNodeData: (id: string, data: Partial<WorkspaceNodeData>) => void;
-  restartWorkspace: (id: string) => Promise<void>;
+  restartWorkspace: (id: string, options?: { applyTemplate?: boolean }) => Promise<void>;
   removeNode: (id: string) => void;
   /** Remove a node AND every descendant in one atomic update. Mirrors
    *  the server-side cascade — `DELETE /workspaces/:id?confirm=true`
@@ -329,8 +337,11 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
   },
   batchDelete: async () => {
     const ids = Array.from(get().selectedNodeIds);
+    const names = new Map(get().nodes.map((node) => [node.id, node.data.name]));
     const results = await Promise.allSettled(
-      ids.map((id) => api.del(`/workspaces/${id}`))
+      ids.map((id) => api.del(`/workspaces/${id}`, {
+        headers: { "X-Confirm-Name": names.get(id) ?? "" },
+      }))
     );
     const failed: string[] = [];
     results.forEach((r, i) => {
@@ -821,9 +832,10 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
     });
   },
 
-  restartWorkspace: async (id) => {
-    await api.post(`/workspaces/${id}/restart`);
-    get().updateNodeData(id, { needsRestart: false });
+  restartWorkspace: async (id, options) => {
+    const body = options?.applyTemplate ? { apply_template: true } : undefined;
+    await api.post(`/workspaces/${id}/restart`, body);
+    get().updateNodeData(id, { needsRestart: false, applyTemplateOnRestart: false });
   },
 
   removeNode: (id) => {

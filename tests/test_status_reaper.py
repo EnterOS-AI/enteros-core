@@ -40,7 +40,6 @@ Dependencies: stdlib + pytest + PyYAML. No network.
 from __future__ import annotations
 
 import importlib.util
-import json
 import os
 import sys
 from pathlib import Path
@@ -64,7 +63,7 @@ SCRIPT_PATH = (
 def sr_module():
     """Import the script as a module under a known env."""
     env = {
-        "GITEA_TOKEN": "test-token",
+        "GITEA_TOKEN": "fixture-token",
         "GITEA_HOST": "git.example.test",
         "REPO": "owner/repo",
         "WATCH_BRANCH": "main",
@@ -853,7 +852,6 @@ def test_reap_skips_combined_success_shas(sr_module, monkeypatch):
     Mock 2 SHAs with combined=success + 1 with combined=failure → only
     the failure-SHA's statuses get the per-context loop applied.
     """
-    per_context_iterated_for: list[str] = []
     posts: list[tuple[str, dict]] = []
 
     failure_statuses = [

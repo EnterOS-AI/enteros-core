@@ -26,7 +26,7 @@ Full contract: `docs/runbooks/admin-auth.md`.
 |--------|------|---------|
 | GET | /health | inline |
 | GET | /metrics | metrics.Handler() — Prometheus text format; no auth, scrape-safe |
-| POST/GET/PATCH/DELETE | /workspaces[/:id] | workspace.go — `GET /workspaces`, `POST /workspaces`, and `DELETE /workspaces/:id` require `AdminAuth`. `PATCH /workspaces/:id` enforces field-level authz: cosmetic fields (name, role, x, y, canvas) pass through; sensitive fields (tier, parent_id, runtime, workspace_dir) require a valid bearer token when any live token exists. |
+| POST/GET/PATCH/DELETE | /workspaces[/:id] | workspace.go — `GET /workspaces`, `POST /workspaces`, and `DELETE /workspaces/:id` require `AdminAuth`. `DELETE /workspaces/:id` also requires `X-Confirm-Name: <workspace name>`; cascading deletes still require `?confirm=true`. `PATCH /workspaces/:id` enforces field-level authz: cosmetic fields (name, role, x, y, canvas) pass through; sensitive fields (tier, parent_id, runtime, workspace_dir) require a valid bearer token when any live token exists. |
 | GET/PATCH | /workspaces/:id/config | workspace.go |
 | GET/POST | /workspaces/:id/memory | workspace.go |
 | DELETE | /workspaces/:id/memory/:key | workspace.go |
@@ -38,7 +38,7 @@ Full contract: `docs/runbooks/admin-auth.md`.
 | GET | /settings/secrets | secrets.go — list global secrets (keys only, values masked) |
 | PUT/POST | /settings/secrets | secrets.go — set a global secret `{key, value}`; auto-restarts every non-paused/non-removed/non-external workspace that does not shadow the key with a workspace-level override |
 | DELETE | /settings/secrets/:key | secrets.go — delete a global secret; same auto-restart fan-out as PUT/POST |
-| GET | /admin/workspaces/:id/test-token | admin_test_token.go — mint a fresh bearer token for E2E scripts; returns 404 unless `MOLECULE_ENV != production` or `MOLECULE_ENABLE_TEST_TOKENS=1` |
+| POST | /admin/workspaces/:id/tokens | admin_workspace_tokens.go — mint a real workspace bearer token; requires `AdminAuth`; plaintext is returned once |
 | GET/POST/DELETE | /admin/secrets[/:key] | secrets.go — legacy aliases for /settings/secrets |
 | WS | /workspaces/:id/terminal | terminal.go |
 | POST/GET | /workspaces/:id/approvals | approvals.go |
@@ -103,7 +103,7 @@ Migration files live in `workspace-server/migrations/` (latest: `022_workspace_s
 
 | Table | Description |
 |-------|-------------|
-| `workspaces` | Core entity — status, runtime, `agent_card` JSONB, heartbeat columns, `current_task`, `awareness_namespace`, `workspace_dir` |
+| `workspaces` | Core entity — status, runtime, `agent_card` JSONB, heartbeat columns, `current_task`, `workspace_dir` |
 | `canvas_layouts` | Per-workspace x/y canvas position |
 | `structure_events` | Append-only event log (workspace lifecycle, agent, approval events) |
 | `activity_logs` | A2A communications, task updates, agent logs, errors. `error_detail` is populated by the scheduler so cron run history can surface failure reasons. |

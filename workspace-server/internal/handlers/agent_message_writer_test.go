@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"database/sql/driver"
 	"encoding/json"
@@ -9,8 +10,8 @@ import (
 	"testing"
 	"unicode/utf8"
 
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"github.com/DATA-DOG/go-sqlmock"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
 )
 
 // AgentMessageWriter is the SSOT for agent → user chat delivery
@@ -301,6 +302,30 @@ func TestAgentMessageWriter_Send_BroadcastsAgentMessageEvent(t *testing.T) {
 	}
 	if pl["attachments"] == nil {
 		t.Error("payload.attachments missing on attachment-bearing send")
+	}
+	payloadJSON, err := json.Marshal(pl)
+	if err != nil {
+		t.Fatalf("marshal broadcast payload: %v", err)
+	}
+	var wire struct {
+		Attachments []struct {
+			URI      string `json:"uri"`
+			Name     string `json:"name"`
+			MimeType string `json:"mimeType,omitempty"`
+			Size     int64  `json:"size,omitempty"`
+		} `json:"attachments"`
+	}
+	if err := json.Unmarshal(payloadJSON, &wire); err != nil {
+		t.Fatalf("unmarshal broadcast payload: %v", err)
+	}
+	if len(wire.Attachments) != 1 {
+		t.Fatalf("payload.attachments length = %d, want 1; json=%s", len(wire.Attachments), string(payloadJSON))
+	}
+	if wire.Attachments[0].URI != "workspace://a.txt" || wire.Attachments[0].Name != "a.txt" {
+		t.Fatalf("payload.attachments[0] = %+v, want lowercase uri/name fields; json=%s", wire.Attachments[0], string(payloadJSON))
+	}
+	if bytes.Contains(payloadJSON, []byte(`"URI"`)) || bytes.Contains(payloadJSON, []byte(`"Name"`)) {
+		t.Fatalf("broadcast payload used Go field names instead of canvas wire names: %s", string(payloadJSON))
 	}
 }
 

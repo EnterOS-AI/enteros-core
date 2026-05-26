@@ -113,7 +113,7 @@ teardown() {
   log "[teardown] deleting ${#CREATED_WSIDS[@]} workspace(s) this run created (scoped)"
   for wid in ${CREATED_WSIDS[@]+"${CREATED_WSIDS[@]}"}; do
     [ -n "$wid" ] || continue
-    curl -s -X DELETE "$BASE/workspaces/$wid?confirm=true" ${ADMIN_AUTH[@]+"${ADMIN_AUTH[@]}"} >/dev/null 2>&1 || true
+    e2e_delete_workspace "$wid" "" ${ADMIN_AUTH[@]+"${ADMIN_AUTH[@]}"}
   done
   exit $rc
 }
@@ -131,7 +131,7 @@ except Exception:
 ' 2>/dev/null)
 for _wid in $PRIOR; do
   log "Pre-sweeping prior PV-Local workspace: $_wid"
-  curl -s -X DELETE "$BASE/workspaces/$_wid?confirm=true" ${ADMIN_AUTH[@]+"${ADMIN_AUTH[@]}"} >/dev/null 2>&1 || true
+  e2e_delete_workspace "$_wid" "" ${ADMIN_AUTH[@]+"${ADMIN_AUTH[@]}"}
 done
 
 # ─── Local-stack preflight ─────────────────────────────────────────────

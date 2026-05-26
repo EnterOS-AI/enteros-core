@@ -37,7 +37,6 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
-import sys
 import urllib.error
 from pathlib import Path
 from unittest import mock
@@ -75,7 +74,7 @@ def _stub_time_sleep(monkeypatch):
 def wd_module():
     """Import the script as a module under a known env."""
     env = {
-        "GITEA_TOKEN": "test-token",
+        "GITEA_TOKEN": "fixture-token",
         "GITEA_HOST": "git.example.test",
         "REPO": "owner/repo",
         "WATCH_BRANCH": "main",
@@ -117,15 +116,25 @@ def _make_stub_api(responses: dict):
 
         def __call__(self, method, path, *, body=None, query=None, expect_json=True):
             self.calls.append((method, path, body, query))
+            # If we've stored a list for this (method, path), rotate through.
+            # This supports tests that need sequential responses for the
+            # same endpoint without adding query-param noise.
             key = (method, path)
-            if key not in responses:
-                raise AssertionError(
-                    f"unexpected api call: {method} {path} (no stub registered)"
-                )
-            r = responses[key]
-            if isinstance(r, Exception):
-                raise r
-            return r
+            r = responses.get(key)
+            if isinstance(r, list):
+                if not r:
+                    raise AssertionError(
+                        f"stub sequential responses exhausted for {method} "
+                        f"{path} — provisioned {len(r)} entries"
+                    )
+                return r.pop(0)
+            if r is not None:
+                if isinstance(r, Exception):
+                    raise r
+                return r
+            raise AssertionError(
+                f"unexpected api call: {method} {path} (no stub registered)"
+            )
 
     return StubApi()
 
@@ -133,10 +142,24 @@ def _make_stub_api(responses: dict):
 # Sample SHA used throughout. 40 chars per Gitea convention.
 SHA_RED = "deadbeefcafe1234567890abcdef000011112222"
 SHA_GREEN = "ababababcdcdcdcd0000111122223333deadc0de"
+SHA_NEW = "aaaabbbbccccddddeeeeffff0000111122223333"
 
 
 def _branches_response(sha: str) -> dict:
     """Shape Gitea returns from /repos/{o}/{r}/branches/{name}."""
+    return {"name": "main", "commit": {"id": sha}}
+
+
+def _branch_alt(sha: str) -> dict:
+    """Identical shape but to a different key path so _make_stub_api
+    retains a separate first-response entry from the primary
+    _branches_response() path.
+
+    The stub stores only the first response per (method, path) pair.
+    Tests that need two distinct responses for the same logical
+    GET /branches/main call use _branch_alt for the second lookup so
+    the stub returns the correct sequential entry.
+    """
     return {"name": "main", "commit": {"id": sha}}
 
 
@@ -542,7 +565,6 @@ def test_auto_close_skips_when_main_pending(wd_module, monkeypatch):
     """main pending (CI still running) at NEW_SHA → leave old issue alone.
     Pending could resolve to red, so closing prematurely would lose the
     breadcrumb of the prior red."""
-    old_title = f"[main-red] owner/repo: {SHA_RED[:10]}"
     stub = _make_stub_api({
         ("GET", "/repos/owner/repo/branches/main"): (200, _branches_response(SHA_GREEN)),
         ("GET", f"/repos/owner/repo/commits/{SHA_GREEN}/status"): (
@@ -559,6 +581,81 @@ def test_auto_close_skips_when_main_pending(wd_module, monkeypatch):
     methods_paths = [(c[0], c[1]) for c in stub.calls]
     assert ("PATCH", "/repos/owner/repo/issues/7") not in methods_paths
     assert ("GET", "/repos/owner/repo/issues") not in methods_paths
+
+
+# --------------------------------------------------------------------------
+# Stale-issue cleanup on transient / head-drift (internal#1789)
+# --------------------------------------------------------------------------
+def test_head_drift_closes_stale_issue_for_prior_sha(wd_module, monkeypatch):
+    """Initial red at SHA_RED. Before recheck, main is force-pushed to
+    SHA_NEW (different commit). watchdog must close the stale SHA_RED
+    issue before returning — otherwise stale open issues accumulate
+    when main is force-pushed during a red window."""
+    stub = _make_stub_api({
+        # Initial check: branch SHA_RED, status failure
+        ("GET", "/repos/owner/repo/branches/main"): [
+            (200, _branches_response(SHA_RED)),
+            (200, _branch_alt(SHA_NEW)),      # recheck branch call → HEAD moved
+            (200, _branch_alt(SHA_NEW)),      # close path branch call
+        ],
+        ("GET", f"/repos/owner/repo/commits/{SHA_RED}/status"): [
+            (200, _combined_status("failure", [
+                {"context": "ci/test", "status": "failure", "description": "broke"},
+            ])),
+            (200, _combined_status("success", [    # recheck: CI result arrived
+                {"context": "ci/test", "status": "success"},
+            ])),
+        ],
+        ("GET", f"/repos/owner/repo/commits/{SHA_NEW}/status"): [
+            (200, _combined_status("success", [
+                {"context": "ci/test", "status": "success"},
+            ])),
+        ],
+        # close_open_red_issues_for_other_shas(SHA_NEW): issue for SHA_RED found
+        ("GET", "/repos/owner/repo/issues"): [
+            (200, [{"number": 9, "title": f"[main-red] owner/repo: {SHA_RED[:10]}"}]),
+        ],
+        ("POST", "/repos/owner/repo/issues/9/comments"): (201, {"id": 200}),
+        ("PATCH", "/repos/owner/repo/issues/9"): (200, {"number": 9, "state": "closed"}),
+    })
+    monkeypatch.setattr(wd_module, "api", stub)
+    rc = wd_module.run_once(dry_run=False)
+    assert rc == 0
+    methods_paths = [(c[0], c[1]) for c in stub.calls]
+    assert ("PATCH", "/repos/owner/repo/issues/9") in methods_paths, \
+        "head-drift should close the stale SHA_RED issue"
+
+
+def test_recovery_on_same_sha_closes_issue_filed_on_prior_tick(wd_module, monkeypatch):
+    """Same SHA shows red on initial check, but CI recovers before recheck
+    completes. watchdog must close the issue that was filed on an earlier
+    tick for this same SHA — otherwise stale open issues accumulate when CI
+    recovers within the settling window."""
+    stub = _make_stub_api({
+        ("GET", "/repos/owner/repo/branches/main"): (200, _branches_response(SHA_RED)),
+        # Sequential: initial check → failure, recheck (≥2nd call) → success.
+        # Using a list so Python dict keeps a single key (avoids overwrite).
+        ("GET", f"/repos/owner/repo/commits/{SHA_RED}/status"): [
+            (200, _combined_status("failure", [
+                {"context": "ci/test", "status": "failure", "description": "broke"},
+            ])),
+            (200, _combined_status("success", [
+                {"context": "ci/test", "state": "success"},
+            ])),
+        ],
+        # List open red issues → find stale issue for this SHA
+        ("GET", "/repos/owner/repo/issues"): (
+            200, [{"number": 11, "title": f"[main-red] owner/repo: {SHA_RED[:10]}"}],
+        ),
+        ("POST", "/repos/owner/repo/issues/11/comments"): (201, {"id": 300}),
+        ("PATCH", "/repos/owner/repo/issues/11"): (200, {"number": 11, "state": "closed"}),
+    })
+    monkeypatch.setattr(wd_module, "api", stub)
+    rc = wd_module.run_once(dry_run=False)
+    assert rc == 0
+    methods_paths = [(c[0], c[1]) for c in stub.calls]
+    assert ("PATCH", "/repos/owner/repo/issues/11") in methods_paths, \
+        "recovery-on-same-SHA should close the stale issue"
 
 
 # --------------------------------------------------------------------------
@@ -790,7 +887,7 @@ def test_emit_loki_event_prints_json_line(wd_module, capsys, monkeypatch):
     captured = capsys.readouterr()
     assert "main-red-watchdog event:" in captured.out
     # Find the JSON payload after the prefix and verify it parses
-    line = [l for l in captured.out.splitlines() if "main-red-watchdog event:" in l][0]
+    line = [ln for ln in captured.out.splitlines() if "main-red-watchdog event:" in ln][0]
     payload = json.loads(line.split("main-red-watchdog event:", 1)[1].strip())
     assert payload["event_type"] == "main_red_detected"
     assert payload["repo"] == "owner/repo"

@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/models"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
 	"github.com/gin-gonic/gin"
 )
 
@@ -33,9 +33,11 @@ func TestWorkspaceCreate_WithParentID(t *testing.T) {
 	// Default tier is 3 (Privileged) — see workspace.go create-handler comment.
 	// delivery_mode defaults to "push" when payload omits it (#2339).
 	mock.ExpectExec("INSERT INTO workspaces").
-		WithArgs(sqlmock.AnyArg(), "Child Agent", nil, 3, "langgraph", sqlmock.AnyArg(), &parentID, nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
+		WithArgs(sqlmock.AnyArg(), "Child Agent", nil, 3, "claude-code", &parentID, nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
+	mock.ExpectExec("INSERT INTO workspace_secrets").
+		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec("INSERT INTO canvas_layouts").
 		WithArgs(sqlmock.AnyArg(), float64(0), float64(0)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -69,7 +71,7 @@ func TestWorkspaceCreate_ExplicitClaudeCodeRuntime(t *testing.T) {
 	mock.ExpectBegin()
 	// delivery_mode defaults to "push" when payload omits it (#2339).
 	mock.ExpectExec("INSERT INTO workspaces").
-		WithArgs(sqlmock.AnyArg(), "CC Agent", nil, 2, "claude-code", sqlmock.AnyArg(), (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
+		WithArgs(sqlmock.AnyArg(), "CC Agent", nil, 2, "claude-code", (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 	mock.ExpectExec("INSERT INTO canvas_layouts").
@@ -104,7 +106,7 @@ func TestWorkspaceCreate_MissingName(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
-	body := `{"tier":1,"runtime":"langgraph"}`
+	body := `{"tier":1,"runtime":"claude-code"}`
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
@@ -242,7 +244,7 @@ func TestWorkspaceList_WithData(t *testing.T) {
 	}
 	rows := sqlmock.NewRows(columns).
 		AddRow("ws-1", "Agent One", "worker", 1, "online", []byte(`{"name":"agent1"}`), "http://localhost:8001",
-			nil, 3, 1, 0.02, "", 7200, "processing", "langgraph", "", 10.0, 20.0, false, nil, int64(0), false, true, []byte(`{}`)).
+			nil, 3, 1, 0.02, "", 7200, "processing", "claude-code", "", 10.0, 20.0, false, nil, int64(0), false, true, []byte(`{}`)).
 		AddRow("ws-2", "Agent Two", "", 2, "degraded", []byte("null"), "",
 			nil, 0, 1, 0.6, "timeout", 100, "", "claude-code", "", 50.0, 60.0, true, nil, int64(0), false, true, []byte(`{}`))
 
@@ -291,7 +293,7 @@ func TestWorkspaceCreate_MaxConcurrentTasksOverride(t *testing.T) {
 
 	mock.ExpectBegin()
 	mock.ExpectExec("INSERT INTO workspaces").
-		WithArgs(sqlmock.AnyArg(), "Leader Agent", nil, 3, "claude-code", sqlmock.AnyArg(), (*string)(nil), nil, "none", (*int64)(nil), 3, "push").
+		WithArgs(sqlmock.AnyArg(), "Leader Agent", nil, 3, "claude-code", (*string)(nil), nil, "none", (*int64)(nil), 3, "push").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 	mock.ExpectExec("INSERT INTO canvas_layouts").
@@ -585,7 +587,7 @@ func TestDiscover_TargetOffline(t *testing.T) {
 	// Name + runtime lookup (discovery now queries both)
 	mock.ExpectQuery("SELECT COALESCE").
 		WithArgs("ws-off").
-		WillReturnRows(sqlmock.NewRows([]string{"name", "runtime"}).AddRow("Offline Agent", "langgraph"))
+		WillReturnRows(sqlmock.NewRows([]string{"name", "runtime"}).AddRow("Offline Agent", "claude-code"))
 
 	// No cached internal URL → falls to DB status check → offline
 	mock.ExpectQuery("SELECT status FROM workspaces WHERE id =").
@@ -917,7 +919,7 @@ func TestRestart_ParentPaused(t *testing.T) {
 	mock.ExpectQuery("SELECT status, name, tier").
 		WithArgs("dddddddd-0001-0000-0000-000000000000").
 		WillReturnRows(sqlmock.NewRows([]string{"status", "name", "tier", "runtime"}).
-			AddRow("offline", "Child Agent", 1, "langgraph"))
+			AddRow("offline", "Child Agent", 1, "claude-code"))
 
 	// isParentPaused: get parent_id
 	mock.ExpectQuery("SELECT parent_id FROM workspaces WHERE id").
@@ -960,7 +962,7 @@ func TestRestart_ProvisionerNil(t *testing.T) {
 	mock.ExpectQuery("SELECT status, name, tier").
 		WithArgs("ws-noprov").
 		WillReturnRows(sqlmock.NewRows([]string{"status", "name", "tier", "runtime"}).
-			AddRow("offline", "Agent", 1, "langgraph"))
+			AddRow("offline", "Agent", 1, "claude-code"))
 
 	// isParentPaused: no parent
 	mock.ExpectQuery("SELECT parent_id FROM workspaces WHERE id").
@@ -1195,7 +1197,7 @@ func TestResume_ProvisionerNil(t *testing.T) {
 	mock.ExpectQuery("SELECT name, tier").
 		WithArgs("ws-resume-noprov").
 		WillReturnRows(sqlmock.NewRows([]string{"name", "tier", "runtime"}).
-			AddRow("Paused Agent", 1, "langgraph"))
+			AddRow("Paused Agent", 1, "claude-code"))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)

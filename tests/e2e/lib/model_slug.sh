@@ -10,15 +10,6 @@
 #                                    "gpt-4o" falls through to Anthropic
 #                                    default + 401, see PR #1714.)
 #
-#   langgraph   → "openai:gpt-4o"  (colon-form: langchain init_chat_model
-#                                    requires "<provider>:<model>".
-#                                    Slash-form was misinterpreted as
-#                                    OpenRouter routing → fell through
-#                                    without auth, surfaced 2026-05-03
-#                                    after the a2a-sdk v1 contract bugs
-#                                    PR #2558+#2563+#2567 cleared the
-#                                    masking layers.)
-#
 #   claude-code → auth-aware:
 #                  E2E_MINIMAX_API_KEY    → "MiniMax-M2"
 #                  E2E_ANTHROPIC_API_KEY  → "claude-sonnet-4-6"
@@ -51,7 +42,6 @@ pick_model_slug() {
   fi
   case "$runtime" in
     hermes)      printf 'openai/gpt-4o' ;;
-    langgraph)   printf 'openai:gpt-4o' ;;
     claude-code)
       if [ -n "${E2E_MINIMAX_API_KEY:-}" ]; then
         printf 'MiniMax-M2'

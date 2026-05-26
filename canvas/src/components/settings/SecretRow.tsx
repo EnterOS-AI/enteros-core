@@ -152,7 +152,7 @@ export function SecretRow({ secret, workspaceId }: SecretRowProps) {
             className="secret-row__action-btn"
             title="Edit"
           >
-            ✏
+            <span aria-hidden="true">✏</span>
           </button>
           <button
             type="button"
@@ -161,7 +161,7 @@ export function SecretRow({ secret, workspaceId }: SecretRowProps) {
             className="secret-row__action-btn secret-row__action-btn--delete"
             title="Delete"
           >
-            🗑
+            <span aria-hidden="true">🗑</span>
           </button>
         </div>
       </div>

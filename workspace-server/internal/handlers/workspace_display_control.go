@@ -17,9 +17,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/models"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/wsauth"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wsauth"
 	"github.com/gin-gonic/gin"
 )
 
@@ -337,11 +337,14 @@ func displayControlActor(c *gin.Context) (string, bool) {
 			return actorOrgTokenPrefix + s, true
 		}
 	}
+	if v, ok := c.Get("cp_session_actor"); ok {
+		if s, ok := v.(string); ok && s != "" {
+			return s, true
+		}
+	}
 	if displayControlIsAdminToken(c) {
 		return actorAdminToken, true
 	}
-	// Browser session auth is intentionally observe-only until AdminAuth
-	// exposes a stable per-user or per-session identity in gin.Context.
 	return "", false
 }
 

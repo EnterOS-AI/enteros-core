@@ -26,7 +26,7 @@
 #   B. Org-header mismatch — alpha-org header at beta's URL → 404.
 #   C. Reverse — beta-org header at alpha's URL → 404.
 #   D. Right URL, wrong org header (typo) → 404.
-#   E. Bearer present but no org header → 404 (TenantGuard rejects).
+#   E. Bearer present but no org header → 400 with an actionable JSON error.
 #   F. Per-tenant DB isolation — alpha's /workspaces enumerates only
 #      alpha workspaces; beta's only beta. Confirms cf-proxy + TenantGuard
 #      really did partition the request to the right backing DB.
@@ -44,8 +44,12 @@ if [ ! -f .seed.env ]; then
 fi
 # shellcheck source=/dev/null
 source .seed.env
-# shellcheck source=../_curl.sh
+# shellcheck disable=SC1091
 source "$HARNESS_ROOT/_curl.sh"
+# shellcheck disable=SC2153
+: "${ALPHA_HOST:?}"
+# shellcheck disable=SC2153
+: "${BETA_HOST:?}"
 
 PASS=0
 FAIL=0
@@ -121,15 +125,27 @@ GARBAGE=$(curl -sS -o /dev/null -w '%{http_code}' \
     "$BASE/workspaces")
 assert_status "D1: garbage org id at alpha URL → 404" "404" "$GARBAGE"
 
-# ─── Phase E: bearer present but no org header at all → 404 ────────────
+# ─── Phase E: bearer present but no org header at all → 400 ────────────
 echo ""
-echo "[replay] E. valid bearer but missing X-Molecule-Org-Id → 404"
+echo "[replay] E. valid bearer but missing X-Molecule-Org-Id → 400"
 
 NO_ORG=$(curl -sS -o /dev/null -w '%{http_code}' \
     -H "Host: ${ALPHA_HOST}" \
     -H "Authorization: Bearer ${ALPHA_ADMIN_TOKEN}" \
     "$BASE/workspaces")
-assert_status "E1: missing X-Molecule-Org-Id → 404" "404" "$NO_ORG"
+assert_status "E1: missing X-Molecule-Org-Id → 400" "400" "$NO_ORG"
+
+NO_ORG_BODY=$(curl -sS \
+    -H "Host: ${ALPHA_HOST}" \
+    -H "Authorization: Bearer ${ALPHA_ADMIN_TOKEN}" \
+    "$BASE/workspaces")
+if echo "$NO_ORG_BODY" | jq -e '.code == "TENANT_ORG_HEADER_REQUIRED" and .required_header == "X-Molecule-Org-Id"' >/dev/null; then
+    printf "  PASS E2: missing-header body names the required tenant header\n"
+    PASS=$((PASS + 1))
+else
+    printf "  FAIL E2: missing-header body should explain X-Molecule-Org-Id\n    body: %s\n" "$NO_ORG_BODY" >&2
+    FAIL=$((FAIL + 1))
+fi
 
 # ─── Phase F: per-tenant DB isolation via list_workspaces ──────────────
 echo ""
