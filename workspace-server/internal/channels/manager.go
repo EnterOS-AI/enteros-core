@@ -82,7 +82,10 @@ func NewManager(proxy A2AProxy, broadcaster Broadcaster) *Manager {
 			log.Printf("Channels: failed to disable telegram chat_id=%s: %v", chatID, err)
 			return
 		}
-		if rows, _ := res.RowsAffected(); rows > 0 {
+		rows, err := res.RowsAffected()
+		if err != nil {
+			log.Printf("Channels: disable telegram RowsAffected error chat_id=%s: %v", chatID, err)
+		} else if rows > 0 {
 			log.Printf("Channels: disabled %d telegram channel(s) for chat_id=%s (bot removed)", rows, chatID)
 			// Reload so the in-memory poller map drops the now-disabled row.
 			m.Reload(ctx)
