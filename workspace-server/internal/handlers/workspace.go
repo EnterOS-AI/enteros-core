@@ -761,25 +761,6 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 		configFiles = h.ensureDefaultConfig(id, payload)
 	}
 
-	// Seed schedules declared in the workspace template's config.yaml.
-	// Mirrors the org/import path (org_import.go) so a workspace created
-	// directly from a workspace template lands with the same schedule
-	// grid the org/import path would have produced. Idempotent across
-	// re-imports via orgImportScheduleSQL's ON CONFLICT clause; runtime-
-	// added rows are preserved (Issue #24 contract).
-	//
-	// Non-fatal: a broken schedules: block must never block workspace
-	// provisioning — the workspace row already committed above, and the
-	// schedule grid is recoverable via /workspaces/{id}/schedules POSTs.
-	if templatePath != "" {
-		if templateScheds, parseErr := parseTemplateSchedules(templatePath); parseErr != nil {
-			log.Printf("Create %s: parsing template schedules: %v (continuing)", id, parseErr)
-		} else if len(templateScheds) > 0 {
-			seeded := seedTemplateSchedules(ctx, id, templatePath, templateScheds)
-			log.Printf("Create %s: seeded %d/%d template schedules", id, seeded, len(templateScheds))
-		}
-	}
-
 	// Auto-provision — pick backend: control plane (SaaS) or Docker (self-hosted).
 	// Routing AND the no-backend mark-failed path are both inside
 	// provisionWorkspaceAuto (single source of truth). The Create-specific
@@ -788,7 +769,8 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 	// runtime/model/tier as JSON — the Config tab needs that to render
 	// even on failed workspaces, so Create owns this Create-only side
 	// effect rather than coupling Auto to a UI concern.
-	if !h.provisionWorkspaceAuto(id, templatePath, configFiles, payload) {
+	provisionOK := h.provisionWorkspaceAuto(id, templatePath, configFiles, payload)
+	if !provisionOK {
 		cfgJSON := fmt.Sprintf(`{"name":%q,"runtime":%q,"tier":%d,"template":%q}`,
 			payload.Name, payload.Runtime, payload.Tier, payload.Template)
 		if _, err := db.DB.ExecContext(ctx, `
@@ -796,6 +778,32 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 			ON CONFLICT (workspace_id) DO UPDATE SET data = $2::jsonb
 		`, id, cfgJSON); err != nil {
 			log.Printf("Create: workspace_config persist failed for %s: %v", id, err)
+		}
+	}
+
+	// Seed schedules declared in the workspace template's config.yaml
+	// AFTER provisionWorkspaceAuto succeeds so the scheduler never
+	// fires cron rows against a workspace whose backend never wired
+	// (review feedback PR #1929#1). Async EC2 provisioning may still
+	// fail downstream; scheduler.go is expected to handle non-online
+	// status as a no-op tick. Idempotent across re-creates via
+	// orgImportScheduleSQL's ON CONFLICT clause; runtime-added rows
+	// are preserved (Issue #24 contract). Restart does not re-seed
+	// (so user-deleted template rows stay deleted).
+	//
+	// Non-fatal: a broken schedules: block must never block workspace
+	// provisioning — the workspace row is already live and the grid
+	// is recoverable via POST /workspaces/{id}/schedules.
+	if provisionOK && templatePath != "" {
+		if templateScheds, parseErr := parseTemplateSchedules(templatePath); parseErr != nil {
+			log.Printf("Create %s: parsing template schedules: %v (continuing)", id, parseErr)
+		} else if len(templateScheds) > 0 {
+			seeded, skipped := seedTemplateSchedules(ctx, id, templatePath, templateScheds)
+			if skipped > 0 {
+				log.Printf("Create %s: template schedule partial-seed: seeded=%d skipped=%d total=%d", id, seeded, skipped, len(templateScheds))
+			} else {
+				log.Printf("Create %s: seeded %d/%d template schedules", id, seeded, len(templateScheds))
+			}
 		}
 	}
 

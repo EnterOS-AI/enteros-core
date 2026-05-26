@@ -106,3 +106,36 @@ schedules:
 		t.Fatal("expected parse error on malformed YAML, got nil")
 	}
 }
+
+// TestParseTemplateSchedules_RejectsOversizeFile gates against the
+// billion-laughs / anchor-bomb DoS class: a hostile config.yaml over
+// the 1 MiB cap must be refused before yaml.Unmarshal runs.
+func TestParseTemplateSchedules_RejectsOversizeFile(t *testing.T) {
+	dir := t.TempDir()
+	// One byte over the cap — fastest path to the gate.
+	pad := make([]byte, maxTemplateConfigYAMLBytes+1)
+	for i := range pad {
+		pad[i] = '#'
+	}
+	mustWriteFile(t, filepath.Join(dir, "config.yaml"), string(pad))
+	if _, err := parseTemplateSchedules(dir); err == nil {
+		t.Fatal("expected oversize-file error, got nil")
+	}
+}
+
+// TestParseTemplateSchedules_RejectsTooManySchedules gates against a
+// hostile config.yaml that flips one row into a 10k-row insert storm.
+func TestParseTemplateSchedules_RejectsTooManySchedules(t *testing.T) {
+	dir := t.TempDir()
+	var b []byte
+	b = append(b, []byte("schedules:\n")...)
+	// maxTemplateSchedules+1 minimal entries — they don't have to be
+	// valid as schedules because the gate trips before resolution.
+	for i := 0; i <= maxTemplateSchedules; i++ {
+		b = append(b, []byte("  - name: s\n    cron_expr: \"* * * * *\"\n    prompt: x\n")...)
+	}
+	mustWriteFile(t, filepath.Join(dir, "config.yaml"), string(b))
+	if _, err := parseTemplateSchedules(dir); err == nil {
+		t.Fatal("expected schedule-count error, got nil")
+	}
+}
