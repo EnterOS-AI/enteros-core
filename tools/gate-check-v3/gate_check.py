@@ -265,11 +265,18 @@ def signal_2_reviews(pr_number: int, repo: str) -> dict:
 
     blocking = []
     for r in reviews:
-        if r.get("state") == "REQUEST_CHANGES" and not r.get("dismissed", False):
+        if (
+            r.get("state") == "REQUEST_CHANGES"
+            and not r.get("dismissed", False)
+            and r.get("official") is not False
+        ):
+            login = (r.get("user") or {}).get("login", "")
+            if not login:
+                continue
             blocking.append(
                 {
                     "review_id": r["id"],
-                    "user": r["user"]["login"],
+                    "user": login,
                     "commit_id": r.get("commit_id", ""),
                     "created_at": r.get("submitted_at") or r.get("created_at", ""),
                 }

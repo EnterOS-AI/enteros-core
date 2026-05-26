@@ -121,6 +121,61 @@ def test_signal_1_null_user_in_review_does_not_crash(monkeypatch):
     assert result["results"]["core-devops"]["verdict"] == "APPROVED"
 
 
+# ── Signal 2: Draft REQUEST_CHANGES guard ───────────────────────────────────
+
+
+def test_signal_2_draft_request_changes_does_not_block(monkeypatch):
+    """official=False REQUEST_CHANGES is a draft/pending review and must NOT
+    block the gate (matching review-check.sh post-#1818 official-filter)."""
+    mod = load_gate_check()
+
+    def fake_api_list(path):
+        if path == "/repos/molecule-ai/molecule-core/pulls/902/reviews":
+            return [
+                {
+                    "id": 1,
+                    "user": {"login": "agent-reviewer"},
+                    "state": "REQUEST_CHANGES",
+                    "official": False,
+                    "dismissed": False,
+                    "submitted_at": "2026-05-13T10:00:00Z",
+                }
+            ]
+        raise AssertionError(f"unexpected api_list: {path}")
+
+    monkeypatch.setattr(mod, "api_list", fake_api_list)
+
+    result = mod.signal_2_reviews(902, "molecule-ai/molecule-core")
+    assert result["verdict"] == "CLEAR"
+    assert result["blocking_reviews"] == []
+
+
+def test_signal_2_null_user_in_request_changes_does_not_crash(monkeypatch):
+    """Regression: Gitea may return user=null on a REQUEST_CHANGES review.
+    signal_2_reviews must survive this without AttributeError."""
+    mod = load_gate_check()
+
+    def fake_api_list(path):
+        if path == "/repos/molecule-ai/molecule-core/pulls/903/reviews":
+            return [
+                {
+                    "id": 1,
+                    "user": None,
+                    "state": "REQUEST_CHANGES",
+                    "official": True,
+                    "dismissed": False,
+                    "submitted_at": "2026-05-13T10:00:00Z",
+                }
+            ]
+        raise AssertionError(f"unexpected api_list: {path}")
+
+    monkeypatch.setattr(mod, "api_list", fake_api_list)
+
+    result = mod.signal_2_reviews(903, "molecule-ai/molecule-core")
+    assert result["verdict"] == "CLEAR"
+    assert result["blocking_reviews"] == []
+
+
 # ── Signal 4: Branch divergence / scope-creep guard ─────────────────────────
 
 
