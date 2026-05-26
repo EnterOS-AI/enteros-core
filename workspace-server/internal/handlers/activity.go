@@ -8,15 +8,56 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/events"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
+
+// internal#212 — secret-safe scrubber applied to error_detail strings
+// before they cross the canvas WebSocket. Defense in depth: the
+// workspace runtime already runs `_sanitize_for_external` on its side
+// (workspace/executor_helpers.py), but the broadcast layer is the last
+// stop before the string reaches the user's browser, so we re-scrub
+// here in case any caller path forgot.
+//
+// The scrubber is intentionally surgical — it MUST preserve the
+// actionable parts (HTTP status codes, error codes like
+// `oauth_org_not_allowed`, human-readable provider messages) and
+// remove only what looks credential-ish. Over-redacting defeats the
+// whole point of internal#212 (giving the user a reason they can act on).
+
+// Capture (auth-key prefix) (value) so the prefix can be preserved in
+// the output. The keyword anchor prevents false positives on regular
+// text that happens to contain a long alphanumeric run.
+var errorDetailSecretRE = regexp.MustCompile(`(?i)((?:bearer|token|api[_-]?key|sk-proj-|sk-)[ :=]*)[A-Za-z0-9_/.-]{20,}`)
+
+// Stringly-typed JWT-shape: 3 dot-separated base64url segments, second
+// and third at least 16 chars. Matches eyJ-prefixed tokens that the
+// keyword-anchored rule above would miss when they appear bare.
+var errorDetailJWTRE = regexp.MustCompile(`eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}`)
+
+const errorDetailBroadcastCap = 4096
+
+func sanitizeErrorDetailForBroadcast(s string) string {
+	if s == "" {
+		return s
+	}
+	// Cap first — a huge error body shouldn't tax every websocket
+	// client's buffer. 4096 matches the workspace-side _MAX_STDERR
+	// budget (it's actually larger here so the runtime's cap dominates).
+	if len(s) > errorDetailBroadcastCap {
+		s = s[:errorDetailBroadcastCap] + "…[truncated]"
+	}
+	s = errorDetailSecretRE.ReplaceAllString(s, "${1}[REDACTED]")
+	s = errorDetailJWTRE.ReplaceAllString(s, "[REDACTED]")
+	return s
+}
 
 type ActivityHandler struct {
 	broadcaster *events.Broadcaster
@@ -26,7 +67,213 @@ func NewActivityHandler(b *events.Broadcaster) *ActivityHandler {
 	return &ActivityHandler{broadcaster: b}
 }
 
-// List handles GET /workspaces/:id/activity?type=&source=&limit=&since_secs=&since_id=
+// extractAttachmentsFromRequestBody walks a JSON-RPC a2a inbound body to
+// surface attachments (file/image/audio/video) as a flat `attachments[]`
+// projection so callers don't have to drill into the request_body shape
+// themselves.
+//
+// Two body shapes are walked in order:
+//
+//  1. a2a-sdk v1 message-part envelope (peer_agent inbound):
+//
+//     {"jsonrpc":"2.0","method":"message/send","params":{
+//        "message":{"parts":[
+//          {"kind":"text", "text":"hi"},
+//          {"kind":"file", "file":{"uri":"workspace:foo.pdf","mime_type":"application/pdf","name":"foo.pdf"}},
+//          {"kind":"image","file":{"uri":"workspace:bar.png","mime_type":"image/png","name":"bar.png"}},
+//        ]}}}
+//
+//  2. canvas chat_upload_receive flat manifest (canvas_user upload):
+//
+//     {"uri":"platform-pending:<ws>/<file>",
+//      "name":"pasted.png",
+//      "size":12345,
+//      "file_id":"<uuid>",
+//      "mimeType":"image/png"}
+//
+//     The canvas upload pipe writes a single manifest directly at the
+//     root of request_body (no JSON-RPC envelope) with camelCase
+//     `mimeType`. We normalize to snake_case `mime_type` on the way out
+//     so every downstream adaptor (channel / telegram / codex / hermes)
+//     sees one wire shape regardless of which inbound shape produced it.
+//
+// Returns nil (omit-from-JSON) when the body has no attachments — the
+// `?include=peer_info` envelope projects this as an array iff non-empty.
+//
+// Defensive on every step: any missing key / wrong-shape value falls
+// through to the next arm or returns nil instead of panicking. The
+// activity_logs row could carry literally any JSON in request_body
+// (legacy formats, future formats); we only commit to the documented
+// shapes and silently skip anything else.
+func extractAttachmentsFromRequestBody(raw []byte) []map[string]interface{} {
+	if len(raw) == 0 {
+		return nil
+	}
+	var body map[string]interface{}
+	if err := json.Unmarshal(raw, &body); err != nil {
+		return nil
+	}
+	if atts := extractAttachmentsFromMessageParts(body); len(atts) > 0 {
+		return atts
+	}
+	if att := extractAttachmentFromFlatUploadManifest(body); att != nil {
+		return []map[string]interface{}{att}
+	}
+	return nil
+}
+
+// extractAttachmentsFromMessageParts handles the a2a-sdk v1 shape:
+// body.params.message.parts[]. Walks file/image/audio parts; honors v1
+// `kind` and v0 `type` discriminators; accepts nested `.file` sub-object
+// or inlined uri/mime_type/name on the part itself.
+func extractAttachmentsFromMessageParts(body map[string]interface{}) []map[string]interface{} {
+	params, ok := body["params"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	message, ok := params["message"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	parts, ok := message["parts"].([]interface{})
+	if !ok {
+		return nil
+	}
+	out := make([]map[string]interface{}, 0)
+	for _, p := range parts {
+		part, ok := p.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		// a2a-sdk v1 uses "kind"; older v0 callers sent "type". Accept
+		// both for the discriminator — same defensive read pattern as
+		// the runtime-side extract_text helper.
+		kind, _ := part["kind"].(string)
+		if kind == "" {
+			kind, _ = part["type"].(string)
+		}
+		if kind != "file" && kind != "image" && kind != "audio" {
+			continue
+		}
+		// The file sub-object holds uri/mime_type/name. The a2a-sdk v1
+		// shape nests under "file"; some legacy payloads inlined the
+		// fields onto the part itself. Support both.
+		var fileObj map[string]interface{}
+		if f, ok := part["file"].(map[string]interface{}); ok {
+			fileObj = f
+		} else {
+			fileObj = part
+		}
+		uri, _ := fileObj["uri"].(string)
+		mimeType, _ := fileObj["mime_type"].(string)
+		name, _ := fileObj["name"].(string)
+		// At minimum we need either a uri or a name to be useful.
+		// Empty-part entries are skipped (they're a malformed inbound
+		// — surface nothing rather than emit a no-info placeholder).
+		if uri == "" && name == "" {
+			continue
+		}
+		att := map[string]interface{}{"kind": kind}
+		if uri != "" {
+			att["uri"] = uri
+		}
+		if mimeType != "" {
+			att["mime_type"] = mimeType
+		}
+		if name != "" {
+			att["name"] = name
+		}
+		out = append(out, att)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// extractAttachmentFromFlatUploadManifest handles the canvas
+// chat_upload_receive shape: a single upload manifest at the root of
+// request_body with no JSON-RPC envelope. Canvas uses camelCase
+// `mimeType`; we normalize to snake_case `mime_type` on emit so the
+// wire shape matches the message-parts arm. Kind is derived from the
+// mime prefix (image/* → "image", audio/* → "audio", video/* → "video",
+// anything else → "file") because the canvas upload row doesn't carry
+// an explicit discriminator. Returns nil if neither `uri` nor `file_id`
+// is present at the root (i.e. not a flat upload manifest).
+func extractAttachmentFromFlatUploadManifest(body map[string]interface{}) map[string]interface{} {
+	uri, _ := body["uri"].(string)
+	fileID, _ := body["file_id"].(string)
+	if uri == "" && fileID == "" {
+		return nil
+	}
+	mimeType, _ := body["mimeType"].(string)
+	if mimeType == "" {
+		// Defensive: future canvas versions might emit snake_case directly.
+		mimeType, _ = body["mime_type"].(string)
+	}
+	name, _ := body["name"].(string)
+	// Apply the same minimum-info rule as the message-parts arm: a
+	// manifest with neither uri nor name is non-actionable; skip.
+	if uri == "" && name == "" {
+		return nil
+	}
+	att := map[string]interface{}{"kind": kindFromMimeType(mimeType)}
+	if uri != "" {
+		att["uri"] = uri
+	}
+	if mimeType != "" {
+		att["mime_type"] = mimeType
+	}
+	if name != "" {
+		att["name"] = name
+	}
+	return att
+}
+
+// kindFromMimeType derives the attachment `kind` discriminator from a
+// MIME type. Used by the flat-upload-manifest arm where the source row
+// has no explicit kind field.
+func kindFromMimeType(mime string) string {
+	switch {
+	case strings.HasPrefix(mime, "image/"):
+		return "image"
+	case strings.HasPrefix(mime, "audio/"):
+		return "audio"
+	case strings.HasPrefix(mime, "video/"):
+		return "video"
+	default:
+		return "file"
+	}
+}
+
+// includeFlagSet returns true iff `flag` appears in the comma-separated
+// `?include=` query value. Whitespace around entries is tolerated.
+// Empty `include` returns false (existing back-compat shape).
+//
+// The comma-separable form lets future fields ("attachments_only",
+// "tool_trace_expanded", etc.) slot in without further URL-param creep.
+func includeFlagSet(includeQuery, flag string) bool {
+	if includeQuery == "" || flag == "" {
+		return false
+	}
+	for _, raw := range strings.Split(includeQuery, ",") {
+		if strings.TrimSpace(raw) == flag {
+			return true
+		}
+	}
+	return false
+}
+
+// List handles GET /workspaces/:id/activity?type=&source=&limit=&since_secs=&since_id=&include=
+//
+// The `include` query param is comma-separable; today the only flag is
+// `peer_info`, which enriches a2a_receive rows with `peer_name`,
+// `peer_role`, `agent_card_url`, and an `attachments[]` projection (see
+// extractAttachmentsFromRequestBody). It's additive + opt-in — existing
+// callers that don't pass `?include=peer_info` see the unchanged shape.
+// Surface for the layered enrichment that lets Claude Code channel
+// pushes carry full sender identity instead of bare UUIDs (sibling
+// repos: molecule-ai-workspace-runtime + molecule-mcp-claude-channel).
 //
 // since_secs filters to activity_logs.created_at >= NOW() - INTERVAL '$N seconds'.
 // Optional, additive — callers that don't pass it get today's behavior (the
@@ -61,6 +308,8 @@ func (h *ActivityHandler) List(c *gin.Context) {
 	sinceSecsStr := c.Query("since_secs")
 	sinceID := c.Query("since_id")
 	beforeTSStr := c.Query("before_ts") // optional RFC3339 — return rows strictly older than this timestamp
+	include := c.Query("include")       // comma-separated; today's only flag is "peer_info"
+	includePeerInfo := includeFlagSet(include, "peer_info")
 
 	// Validate peer_id as a UUID at the trust boundary so a malformed
 	// caller (the agent or a downstream MCP tool) can't smuggle SQL
@@ -151,22 +400,60 @@ func (h *ActivityHandler) List(c *gin.Context) {
 		usingCursor = true
 	}
 
-	// Build query with optional filters
-	query := `SELECT id, workspace_id, activity_type, source_id, target_id, method,
-			   summary, request_body, response_body, tool_trace, duration_ms, status, error_detail, created_at
-		FROM activity_logs WHERE workspace_id = $1`
+	// Build query with optional filters. When ?include=peer_info is set,
+	// LEFT JOIN workspaces ON activity_logs.source_id = w.id so we can
+	// surface w.name + w.role on the row. LEFT (not INNER) is required
+	// for two reasons:
+	//   1. Canvas rows have source_id IS NULL — those must still appear
+	//      in the result set (with NULL peer_name/peer_role).
+	//   2. A peer workspace may have been deleted since the row was
+	//      written (no FK constraint on activity_logs.source_id) —
+	//      LEFT JOIN preserves the activity row with NULL peer fields
+	//      rather than silently dropping the row.
+	//
+	// agent_card_url is NOT pulled from the workspaces table; it's
+	// computed server-side from externalPlatformURL + source_id at
+	// projection time (mirrors molecule-ai-workspace-runtime
+	// a2a_client._agent_card_url_for which constructs
+	// {PLATFORM_URL}/registry/discover/{peer_id}).
+	//
+	// Column qualification (`activity_logs.<col>`) is added ONLY when
+	// the JOIN is present — disambiguates `id` / `created_at` which
+	// exist in both tables. When the JOIN is absent, unqualified
+	// column references preserve the exact wire-shape existing callers
+	// + existing test fixtures expect (back-compat).
+	actCol := ""
+	if includePeerInfo {
+		actCol = "activity_logs."
+	}
+	selectClause := `SELECT ` + actCol + `id, ` + actCol + `workspace_id, ` + actCol + `activity_type, ` +
+		actCol + `source_id, ` + actCol + `target_id, ` + actCol + `method, ` +
+		actCol + `summary, ` + actCol + `request_body, ` + actCol + `response_body, ` +
+		actCol + `tool_trace, ` + actCol + `duration_ms, ` + actCol + `status, ` +
+		actCol + `error_detail, ` + actCol + `created_at`
+	fromClause := ` FROM activity_logs`
+	if includePeerInfo {
+		selectClause += `, w.name AS peer_name, w.role AS peer_role`
+		fromClause += ` LEFT JOIN workspaces w ON w.id = activity_logs.source_id`
+	}
+	query := selectClause + fromClause + ` WHERE ` + actCol + `workspace_id = $1`
 	args := []interface{}{workspaceID}
 	argIdx := 2
 
+	// WHERE/ORDER column refs use the same `actCol` qualifier prefix
+	// computed above — empty string when no JOIN (back-compat with
+	// existing wire shape + sqlmock-regex test fixtures), or
+	// `activity_logs.` when LEFT JOIN'd (disambiguates `id` /
+	// `created_at` between the two tables).
 	if activityType != "" {
-		query += fmt.Sprintf(" AND activity_type = $%d", argIdx)
+		query += fmt.Sprintf(" AND "+actCol+"activity_type = $%d", argIdx)
 		args = append(args, activityType)
 		argIdx++
 	}
 	if source == "canvas" {
-		query += " AND source_id IS NULL"
+		query += " AND " + actCol + "source_id IS NULL"
 	} else if source == "agent" {
-		query += " AND source_id IS NOT NULL"
+		query += " AND " + actCol + "source_id IS NOT NULL"
 	} else if source != "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "source must be 'canvas' or 'agent'"})
 		return
@@ -183,7 +470,7 @@ func (h *ActivityHandler) List(c *gin.Context) {
 		// and avoids duplicate parameter binding (some drivers reject the
 		// same arg slot reused, ours is fine but the explicit form is
 		// clearer to read and matches the rest of the builder.)
-		query += fmt.Sprintf(" AND (source_id = $%d OR target_id = $%d)", argIdx, argIdx)
+		query += fmt.Sprintf(" AND ("+actCol+"source_id = $%d OR "+actCol+"target_id = $%d)", argIdx, argIdx)
 		args = append(args, peerID)
 		argIdx++
 	}
@@ -191,7 +478,7 @@ func (h *ActivityHandler) List(c *gin.Context) {
 		// Strictly older — never replay a row with the exact same
 		// timestamp, mirrors the `created_at > cursorTime` shape
 		// `since_id` uses for forward paging.
-		query += fmt.Sprintf(" AND created_at < $%d", argIdx)
+		query += fmt.Sprintf(" AND "+actCol+"created_at < $%d", argIdx)
 		args = append(args, beforeTS)
 		argIdx++
 	}
@@ -200,13 +487,13 @@ func (h *ActivityHandler) List(c *gin.Context) {
 		// interpolated into the SQL string. `make_interval(secs => $N)`
 		// avoids the lib/pq quirk where INTERVAL '$N seconds' won't
 		// substitute a placeholder inside the literal.
-		query += fmt.Sprintf(" AND created_at >= NOW() - make_interval(secs => $%d)", argIdx)
+		query += fmt.Sprintf(" AND "+actCol+"created_at >= NOW() - make_interval(secs => $%d)", argIdx)
 		args = append(args, sinceSecs)
 		argIdx++
 	}
 	if usingCursor {
 		// Strictly after — never replay the cursor row itself.
-		query += fmt.Sprintf(" AND created_at > $%d", argIdx)
+		query += fmt.Sprintf(" AND "+actCol+"created_at > $%d", argIdx)
 		args = append(args, cursorTime)
 		argIdx++
 	}
@@ -216,9 +503,9 @@ func (h *ActivityHandler) List(c *gin.Context) {
 	// since_id) keeps DESC — that's the canvas/UI shape and changing it
 	// would surprise existing callers.
 	if usingCursor {
-		query += fmt.Sprintf(" ORDER BY created_at ASC LIMIT $%d", argIdx)
+		query += fmt.Sprintf(" ORDER BY "+actCol+"created_at ASC LIMIT $%d", argIdx)
 	} else {
-		query += fmt.Sprintf(" ORDER BY created_at DESC LIMIT $%d", argIdx)
+		query += fmt.Sprintf(" ORDER BY "+actCol+"created_at DESC LIMIT $%d", argIdx)
 	}
 	args = append(args, limit)
 
@@ -231,6 +518,14 @@ func (h *ActivityHandler) List(c *gin.Context) {
 	}
 	defer rows.Close()
 
+	// agent_card_url base computed once per request so we don't pay the
+	// header-read cost per row. Only meaningful when includePeerInfo is
+	// set; the empty string here is harmless when the flag is off.
+	var platformBase string
+	if includePeerInfo {
+		platformBase = externalPlatformURL(c)
+	}
+
 	activities := make([]map[string]interface{}, 0)
 	for rows.Next() {
 		var id, wsID, actType, status string
@@ -238,10 +533,23 @@ func (h *ActivityHandler) List(c *gin.Context) {
 		var reqBody, respBody, toolTrace []byte
 		var durationMs *int
 		var createdAt time.Time
+		// LEFT JOIN'd peer columns — pointer-string so a NULL row
+		// (canvas message OR deleted peer workspace) decodes as nil
+		// rather than empty-string. Only scanned when includePeerInfo
+		// is set (matched against the SELECT clause above).
+		var peerName, peerRole *string
 
-		if err := rows.Scan(&id, &wsID, &actType, &sourceID, &targetID, &method,
-			&summary, &reqBody, &respBody, &toolTrace, &durationMs, &status, &errorDetail, &createdAt); err != nil {
-			log.Printf("Activity scan error: %v", err)
+		var scanErr error
+		if includePeerInfo {
+			scanErr = rows.Scan(&id, &wsID, &actType, &sourceID, &targetID, &method,
+				&summary, &reqBody, &respBody, &toolTrace, &durationMs, &status, &errorDetail, &createdAt,
+				&peerName, &peerRole)
+		} else {
+			scanErr = rows.Scan(&id, &wsID, &actType, &sourceID, &targetID, &method,
+				&summary, &reqBody, &respBody, &toolTrace, &durationMs, &status, &errorDetail, &createdAt)
+		}
+		if scanErr != nil {
+			log.Printf("Activity scan error: %v", scanErr)
 			continue
 		}
 
@@ -267,6 +575,39 @@ func (h *ActivityHandler) List(c *gin.Context) {
 		if toolTrace != nil {
 			entry["tool_trace"] = json.RawMessage(toolTrace)
 		}
+
+		// peer_info enrichment (per ?include=peer_info). Only emit the
+		// new fields when the flag is set — back-compat for callers
+		// that don't request it.
+		if includePeerInfo {
+			// peer_name / peer_role: emit only when present (canvas
+			// rows have source_id IS NULL → peer_name is NULL by JOIN;
+			// also a peer workspace may have been deleted since the
+			// row was written → same NULL outcome). Omit-when-absent
+			// matches the Layer 3 adaptor's "spread when present"
+			// pattern; canvas_user rows legitimately have no peer_*.
+			if peerName != nil && *peerName != "" {
+				entry["peer_name"] = *peerName
+			}
+			if peerRole != nil && *peerRole != "" {
+				entry["peer_role"] = *peerRole
+			}
+			// agent_card_url: constructed server-side from
+			// externalPlatformURL + source_id. Mirrors the runtime-
+			// side helper a2a_client._agent_card_url_for which builds
+			// {PLATFORM_URL}/registry/discover/{peer_id}. Only set
+			// when source_id is present + non-empty.
+			if sourceID != nil && *sourceID != "" && platformBase != "" {
+				entry["agent_card_url"] = platformBase + "/registry/discover/" + *sourceID
+			}
+			// attachments: flatten file/image/audio parts from the
+			// request_body. nil when none — only project when
+			// non-empty so the omit-when-absent rule holds.
+			if atts := extractAttachmentsFromRequestBody(reqBody); len(atts) > 0 {
+				entry["attachments"] = atts
+			}
+		}
+
 		activities = append(activities, entry)
 	}
 	if err := rows.Err(); err != nil {
@@ -315,9 +656,17 @@ func parseSessionSearchParams(c *gin.Context) (string, int) {
 	return query, limit
 }
 
-// buildSessionSearchQuery composes the UNION-ALL SQL across activity_logs and
-// agent_memories with an optional ILIKE filter, returning the SQL string and
-// positional args ready for QueryContext.
+// buildSessionSearchQuery composes the session-search SQL over
+// activity_logs, returning the SQL string and positional args ready
+// for QueryContext.
+//
+// Phase A3 (#1792): the agent_memories UNION branch was removed when
+// the v1 table was dropped. Memory items no longer appear in session
+// search; the canvas MemoryInspectorPanel queries /v2/memories
+// directly for memory-tab content, so the UNION here only served
+// callers that wanted activity + memory blended results — that
+// surface is unused in production (verified via traffic audit
+// 2026-05-24).
 func buildSessionSearchQuery(workspaceID, query string, limit int) (string, []interface{}) {
 	sqlQuery := `
 		WITH session_items AS (
@@ -333,20 +682,6 @@ func buildSessionSearchQuery(workspaceID, query string, limit int) (string, []in
 				response_body,
 				created_at
 			FROM activity_logs
-			WHERE workspace_id = $1
-			UNION ALL
-			SELECT
-				'memory' AS kind,
-				id,
-				workspace_id,
-				scope AS label,
-				content,
-				'' AS method,
-				'' AS status,
-				NULL::jsonb AS request_body,
-				NULL::jsonb AS response_body,
-				created_at
-			FROM agent_memories
 			WHERE workspace_id = $1
 		)
 		SELECT kind, id, workspace_id, label, content, method, status, request_body, response_body, created_at
@@ -690,6 +1025,16 @@ func logActivityExec(ctx context.Context, exec activityExecutor, broadcaster eve
 		}
 		if respStr != nil {
 			payload["response_body"] = json.RawMessage(respJSON)
+		}
+		// internal#212 — surface the secret-safe failure reason on the
+		// live broadcast so the canvas chat-tab error banner can show
+		// the user *why* (provider HTTP status, error code, the
+		// provider's own human message) instead of the opaque
+		// "Agent error (Exception) — see workspace logs for details."
+		// hardcoded fallback. Omitted when nil so the canvas's "has
+		// actionable reason" guard doesn't trip on empty-string keys.
+		if params.ErrorDetail != nil && *params.ErrorDetail != "" {
+			payload["error_detail"] = sanitizeErrorDetailForBroadcast(*params.ErrorDetail)
 		}
 	}
 

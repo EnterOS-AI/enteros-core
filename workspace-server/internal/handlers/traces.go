@@ -51,6 +51,10 @@ func (h *TracesHandler) List(c *gin.Context) {
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read response body"})
+		return
+	}
 	c.Data(resp.StatusCode, "application/json", body)
 }

@@ -23,6 +23,8 @@ interface Props {
   /** Grouped provider options derived from the template's models[] /
    *  required_env. When length ≥ 2 the modal shows a radio picker. */
   providers?: ProviderChoice[];
+  /** Optional keys to offer in the deploy modal without blocking Deploy. */
+  optionalKeys?: string[];
   /** Runtime slug — used only for the "The <runtime> runtime …"
    *  headline; behavior is driven by providers/missingKeys. */
   runtime: string;
@@ -94,13 +96,13 @@ export function MissingKeysModal({
   open,
   missingKeys,
   providers,
+  optionalKeys,
   runtime,
   onKeysAdded,
   onCancel,
   onOpenSettings,
   workspaceId,
   configuredKeys,
-  modelSuggestions,
   models,
   initialModel,
   title,
@@ -114,13 +116,13 @@ export function MissingKeysModal({
       <ProviderPickerModal
         open={open}
         providers={pickerProviders}
+        optionalKeys={optionalKeys ?? []}
         runtime={runtime}
         onKeysAdded={onKeysAdded}
         onCancel={onCancel}
         onOpenSettings={onOpenSettings}
         workspaceId={workspaceId}
         configuredKeys={configuredKeys}
-        modelSuggestions={modelSuggestions}
         models={models}
         initialModel={initialModel}
         title={title}
@@ -138,11 +140,15 @@ export function MissingKeysModal({
     <AllKeysModal
       open={open}
       missingKeys={keys}
+      optionalKeys={optionalKeys ?? []}
       runtime={runtime}
       onKeysAdded={onKeysAdded}
       onCancel={onCancel}
       onOpenSettings={onOpenSettings}
       workspaceId={workspaceId}
+      configuredKeys={configuredKeys}
+      title={title}
+      description={description}
     />
   );
 }
@@ -170,13 +176,13 @@ export function providerIdForModel(
 function ProviderPickerModal({
   open,
   providers,
+  optionalKeys,
   runtime,
   onKeysAdded,
   onCancel,
   onOpenSettings,
   workspaceId,
   configuredKeys,
-  modelSuggestions,
   models,
   initialModel,
   title,
@@ -184,13 +190,13 @@ function ProviderPickerModal({
 }: {
   open: boolean;
   providers: ProviderChoice[];
+  optionalKeys: string[];
   runtime: string;
   onKeysAdded: (model?: string) => void;
   onCancel: () => void;
   onOpenSettings?: () => void;
   workspaceId?: string;
   configuredKeys?: Set<string>;
-  modelSuggestions?: string[];
   models?: ModelSpec[];
   initialModel?: string;
   title?: string;
@@ -250,16 +256,9 @@ function ProviderPickerModal({
 
   const [selectorValue, setSelectorValue] = useState<SelectorValue>(initial);
   const [entries, setEntries] = useState<KeyEntry[]>([]);
+  const [optionalEntries, setOptionalEntries] = useState<KeyEntry[]>([]);
   const firstInputRef = useRef<HTMLInputElement>(null);
 
-  // Legacy compat: map the selector value back into the old `selected`/
-  // `model` shape for the rest of the modal body (footer copy, etc.).
-  const selected = useMemo(
-    () =>
-      providers.find((p) => p.id === selectorValue.providerId) ??
-      providers[0],
-    [providers, selectorValue.providerId],
-  );
   const model = selectorValue.model;
   const showModelInput = catalog.length > 0;
 
@@ -282,7 +281,18 @@ function ProviderPickerModal({
         error: null,
       })),
     );
-  }, [open, selectorValue.envVars, configuredKeys]);
+    setOptionalEntries(
+      optionalKeys
+        .filter((key) => !selectorValue.envVars.includes(key))
+        .map((key) => ({
+          key,
+          value: "",
+          saved: configuredKeys?.has(key) ?? false,
+          saving: false,
+          error: null,
+        })),
+    );
+  }, [open, selectorValue.envVars, configuredKeys, optionalKeys]);
 
   useEffect(() => {
     if (!open) return;
@@ -334,6 +344,43 @@ function ProviderPickerModal({
       }
     },
     [entries, updateEntry, workspaceId],
+  );
+
+  const updateOptionalEntry = useCallback(
+    (index: number, updates: Partial<KeyEntry>) => {
+      setOptionalEntries((prev) =>
+        prev.map((e, i) => (i === index ? { ...e, ...updates } : e)),
+      );
+    },
+    [],
+  );
+
+  const handleSaveOptionalKey = useCallback(
+    async (index: number) => {
+      const entry = optionalEntries[index];
+      if (!entry.value.trim()) return;
+      updateOptionalEntry(index, { saving: true, error: null });
+      try {
+        if (workspaceId) {
+          await api.put(`/workspaces/${workspaceId}/secrets`, {
+            key: entry.key,
+            value: entry.value.trim(),
+          });
+        } else {
+          await api.put("/settings/secrets", {
+            key: entry.key,
+            value: entry.value.trim(),
+          });
+        }
+        updateOptionalEntry(index, { saved: true, saving: false });
+      } catch (e) {
+        updateOptionalEntry(index, {
+          saving: false,
+          error: e instanceof Error ? e.message : "Failed to save",
+        });
+      }
+    },
+    [optionalEntries, updateOptionalEntry, workspaceId],
   );
 
   if (!open) return null;
@@ -460,11 +507,67 @@ function ProviderPickerModal({
                 )}
 
                 {entry.error && (
-                  <div className="mt-1.5 text-[10px] text-bad">{entry.error}</div>
+                  <div role="alert" aria-live="assertive" className="mt-1.5 text-[10px] text-bad">{entry.error}</div>
                 )}
               </div>
             ))}
           </div>
+
+          {optionalEntries.length > 0 && (
+            <div className="space-y-2">
+              <div className="text-[10px] uppercase tracking-wide text-ink-mid font-semibold">
+                Optional
+              </div>
+              {optionalEntries.map((entry, index) => (
+                <div
+                  key={entry.key}
+                  className="bg-surface-card/30 rounded-lg px-3 py-2.5 border border-line/40"
+                >
+                  <div className="flex items-center justify-between mb-1.5">
+                    <div>
+                      <div className="text-[11px] text-ink-mid font-medium">
+                        {getKeyLabel(entry.key)}
+                      </div>
+                      <div className="text-[9px] font-mono text-ink-mid">{entry.key}</div>
+                    </div>
+                    {entry.saved && (
+                      <span className="text-[9px] text-good bg-emerald-900/30 px-1.5 py-0.5 rounded flex items-center gap-1">
+                        Saved
+                      </span>
+                    )}
+                  </div>
+                  {!entry.saved && (
+                    <div className="flex gap-2 mt-2">
+                      <input
+                        value={entry.value}
+                        onChange={(e) => updateOptionalEntry(index, { value: e.target.value.trimStart() })}
+                        placeholder={entry.key.includes("API_KEY") ? "sk-..." : "Enter value"}
+                        type="password"
+                        aria-label={`Optional value for ${entry.key}`}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter" && entry.value.trim()) {
+                            handleSaveOptionalKey(index);
+                          }
+                        }}
+                        className="flex-1 bg-surface-sunken border border-line rounded px-2 py-1.5 text-[11px] text-ink font-mono focus:outline-none focus:border-accent focus:ring-1 focus:ring-accent/20 transition-colors"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => handleSaveOptionalKey(index)}
+                        disabled={!entry.value.trim() || entry.saving}
+                        className="px-3 py-1.5 bg-surface-card hover:bg-surface-card/80 text-[11px] rounded text-ink border border-line disabled:opacity-30 transition-colors shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-1"
+                      >
+                        {entry.saving ? "..." : "Save"}
+                      </button>
+                    </div>
+                  )}
+                  {entry.error && (
+                    <div role="alert" aria-live="assertive" className="mt-1.5 text-[10px] text-bad">{entry.error}</div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
         </div>
 
         <div className="px-5 py-3 border-t border-line bg-surface/50 flex items-center justify-between gap-2">
@@ -512,21 +615,30 @@ function ProviderPickerModal({
 function AllKeysModal({
   open,
   missingKeys,
+  optionalKeys,
   runtime,
   onKeysAdded,
   onCancel,
   onOpenSettings,
   workspaceId,
+  configuredKeys,
+  title,
+  description,
 }: {
   open: boolean;
   missingKeys: string[];
+  optionalKeys: string[];
   runtime: string;
   onKeysAdded: () => void;
   onCancel: () => void;
   onOpenSettings?: () => void;
   workspaceId?: string;
+  configuredKeys?: Set<string>;
+  title?: string;
+  description?: string;
 }) {
   const [entries, setEntries] = useState<KeyEntry[]>([]);
+  const [optionalEntries, setOptionalEntries] = useState<KeyEntry[]>([]);
   const [globalError, setGlobalError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -535,13 +647,24 @@ function AllKeysModal({
       missingKeys.map((key) => ({
         key,
         value: "",
-        saved: false,
+        saved: configuredKeys?.has(key) ?? false,
         saving: false,
         error: null,
       })),
     );
+    setOptionalEntries(
+      optionalKeys
+        .filter((key) => !missingKeys.includes(key))
+        .map((key) => ({
+          key,
+          value: "",
+          saved: configuredKeys?.has(key) ?? false,
+          saving: false,
+          error: null,
+        })),
+    );
     setGlobalError(null);
-  }, [open, missingKeys]);
+  }, [open, missingKeys, optionalKeys, configuredKeys]);
 
   useEffect(() => {
     if (!open) return;
@@ -589,6 +712,45 @@ function AllKeysModal({
       }
     },
     [entries, updateEntry, workspaceId],
+  );
+
+  const updateOptionalEntry = useCallback(
+    (index: number, updates: Partial<KeyEntry>) => {
+      setOptionalEntries((prev) =>
+        prev.map((entry, i) => (i === index ? { ...entry, ...updates } : entry)),
+      );
+    },
+    [],
+  );
+
+  const handleSaveOptionalKey = useCallback(
+    async (index: number) => {
+      const entry = optionalEntries[index];
+      if (!entry.value.trim()) return;
+
+      updateOptionalEntry(index, { saving: true, error: null });
+
+      try {
+        if (workspaceId) {
+          await api.put(`/workspaces/${workspaceId}/secrets`, {
+            key: entry.key,
+            value: entry.value.trim(),
+          });
+        } else {
+          await api.put("/settings/secrets", {
+            key: entry.key,
+            value: entry.value.trim(),
+          });
+        }
+        updateOptionalEntry(index, { saved: true, saving: false });
+      } catch (e) {
+        updateOptionalEntry(index, {
+          saving: false,
+          error: e instanceof Error ? e.message : "Failed to save",
+        });
+      }
+    },
+    [optionalEntries, updateOptionalEntry, workspaceId],
   );
 
   const handleAddKeysAndDeploy = useCallback(() => {
@@ -656,12 +818,16 @@ function AllKeysModal({
               </svg>
             </div>
             <h3 id="missing-keys-title" className="text-sm font-semibold text-ink">
-              Missing API Keys
+              {title ?? "Missing API Keys"}
             </h3>
           </div>
           <p className="text-[12px] text-ink-mid leading-relaxed">
-            The <span className="text-warm font-medium">{runtimeLabel}</span>{" "}
-            runtime requires the following keys to be configured before deploying.
+            {description ?? (
+              <>
+                The <span className="text-warm font-medium">{runtimeLabel}</span>{" "}
+                runtime requires the following keys to be configured before deploying.
+              </>
+            )}
           </p>
         </div>
 
@@ -719,8 +885,64 @@ function AllKeysModal({
             </div>
           ))}
 
+          {optionalEntries.length > 0 && (
+            <div className="space-y-2">
+              <div className="text-[10px] uppercase tracking-wide text-ink-mid font-semibold">
+                Optional
+              </div>
+              {optionalEntries.map((entry, index) => (
+                <div
+                  key={entry.key}
+                  className="bg-surface-card/30 rounded-lg px-3 py-2.5 border border-line/40"
+                >
+                  <div className="flex items-center justify-between mb-1">
+                    <div>
+                      <div className="text-[11px] text-ink-mid font-medium">
+                        {getKeyLabel(entry.key)}
+                      </div>
+                      <div className="text-[9px] font-mono text-ink-mid">{entry.key}</div>
+                    </div>
+                    {entry.saved && (
+                      <span className="text-[9px] text-good bg-emerald-900/30 px-1.5 py-0.5 rounded">
+                        Saved
+                      </span>
+                    )}
+                  </div>
+
+                  {!entry.saved && (
+                    <div className="flex gap-2 mt-2">
+                      <input
+                        value={entry.value}
+                        onChange={(e) => updateOptionalEntry(index, { value: e.target.value.trimStart() })}
+                        placeholder={entry.key.includes("API_KEY") ? "sk-..." : "Enter value"}
+                        type="password"
+                        aria-label={`Optional value for ${entry.key}`}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter" && entry.value.trim()) {
+                            handleSaveOptionalKey(index);
+                          }
+                        }}
+                        className="flex-1 bg-surface-sunken border border-line rounded px-2 py-1.5 text-[11px] text-ink font-mono focus:outline-none focus:border-accent focus:ring-1 focus:ring-accent/20 transition-colors"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => handleSaveOptionalKey(index)}
+                        disabled={!entry.value.trim() || entry.saving}
+                        className="px-3 py-1.5 bg-surface-card hover:bg-surface-card/80 text-[11px] rounded text-ink border border-line disabled:opacity-30 transition-colors shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-1"
+                      >
+                        {entry.saving ? "..." : "Save"}
+                      </button>
+                    </div>
+                  )}
+
+                  {entry.error && <div className="mt-1.5 text-[10px] text-bad">{entry.error}</div>}
+                </div>
+              ))}
+            </div>
+          )}
+
           {globalError && (
-            <div className="px-3 py-2 bg-red-950/40 border border-red-800/50 rounded-lg text-[11px] text-bad">
+            <div role="alert" aria-live="assertive" className="px-3 py-2 bg-red-950/40 border border-red-800/50 rounded-lg text-[11px] text-bad">
               {globalError}
             </div>
           )}

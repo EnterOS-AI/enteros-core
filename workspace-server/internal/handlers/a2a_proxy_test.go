@@ -16,8 +16,8 @@ import (
 	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/models"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/provisioner"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
 	"github.com/gin-gonic/gin"
 )
 
@@ -280,7 +280,7 @@ func TestProxyA2A_Upstream502_TriggersContainerDeadCheck(t *testing.T) {
 	mock.ExpectExec("INSERT INTO activity_logs").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	// maybeMarkContainerDead's runtime lookup, then the offline-flip UPDATE.
-	mock.ExpectQuery(`SELECT COALESCE\(runtime, 'langgraph'\) FROM workspaces WHERE id =`).
+	mock.ExpectQuery(`SELECT COALESCE\(runtime, 'claude-code'\) FROM workspaces WHERE id =`).
 		WithArgs("ws-tunnel-dead").
 		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("hermes"))
 	mock.ExpectExec(`UPDATE workspaces SET status =`).
@@ -340,7 +340,7 @@ func TestProxyA2A_Upstream502_AliveAgent_PropagatesAsIs(t *testing.T) {
 	expectBudgetCheck(mock, "ws-alive-502")
 	mock.ExpectExec("INSERT INTO activity_logs").WillReturnResult(sqlmock.NewResult(0, 1))
 	// IsRunning runtime lookup runs but no UPDATE follows (running=true).
-	mock.ExpectQuery(`SELECT COALESCE\(runtime, 'langgraph'\) FROM workspaces WHERE id =`).
+	mock.ExpectQuery(`SELECT COALESCE\(runtime, 'claude-code'\) FROM workspaces WHERE id =`).
 		WithArgs("ws-alive-502").
 		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("hermes"))
 
@@ -1112,8 +1112,12 @@ func TestValidateCallerToken_LegacyCallerGrandfathered(t *testing.T) {
 	c, _ := gin.CreateTestContext(w)
 	c.Request = httptest.NewRequest("POST", "/workspaces/x/a2a", bytes.NewBufferString("{}"))
 
-	if err := validateCallerToken(context.Background(), c, "ws-legacy"); err != nil {
+	isCanvasUser, err := validateCallerToken(context.Background(), c, "ws-legacy")
+	if err != nil {
 		t.Errorf("legacy caller should grandfather through; got %v", err)
+	}
+	if isCanvasUser {
+		t.Errorf("legacy caller should NOT be identified as canvas user")
 	}
 	if w.Code != 200 {
 		// gin default before c.JSON is 200; we want no error response written
@@ -1136,9 +1140,12 @@ func TestValidateCallerToken_MissingTokenWhenOnFile(t *testing.T) {
 	c.Request = httptest.NewRequest("POST", "/workspaces/x/a2a", bytes.NewBufferString("{}"))
 	// No Authorization header set
 
-	err := validateCallerToken(context.Background(), c, "ws-authed")
+	isCanvasUser, err := validateCallerToken(context.Background(), c, "ws-authed")
 	if err == nil {
 		t.Fatal("expected error for missing token")
+	}
+	if isCanvasUser {
+		t.Errorf("authed workspace with missing token should NOT be canvas user")
 	}
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("expected 401, got %d", w.Code)
@@ -1164,8 +1171,12 @@ func TestValidateCallerToken_InvalidToken(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer wrong")
 	c.Request = req
 
-	if err := validateCallerToken(context.Background(), c, "ws-authed"); err == nil {
+	isCanvasUser, err := validateCallerToken(context.Background(), c, "ws-authed")
+	if err == nil {
 		t.Fatal("expected error for bad token")
+	}
+	if isCanvasUser {
+		t.Errorf("authed workspace with bad token should NOT be canvas user")
 	}
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("expected 401, got %d", w.Code)
@@ -1192,8 +1203,12 @@ func TestValidateCallerToken_ValidToken(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer goodtok")
 	c.Request = req
 
-	if err := validateCallerToken(context.Background(), c, "ws-authed"); err != nil {
+	isCanvasUser, err := validateCallerToken(context.Background(), c, "ws-authed")
+	if err != nil {
 		t.Errorf("valid token should pass; got %v", err)
+	}
+	if isCanvasUser {
+		t.Errorf("authed workspace with valid token should NOT be canvas user")
 	}
 }
 
@@ -1216,11 +1231,83 @@ func TestValidateCallerToken_WrongWorkspaceBindingRejected(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer tok-for-A")
 	c.Request = req
 
-	if err := validateCallerToken(context.Background(), c, "ws-b-attacker"); err == nil {
+	isCanvasUser, err := validateCallerToken(context.Background(), c, "ws-b-attacker")
+	if err == nil {
 		t.Fatal("token from A must not authenticate caller B")
+	}
+	if isCanvasUser {
+		t.Errorf("cross-workspace token replay should NOT be identified as canvas user")
 	}
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("expected 401, got %d", w.Code)
+	}
+}
+
+func TestValidateCallerToken_CanvasUser_AdminToken(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+
+	// Tokenless workspace
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM workspace_auth_tokens`).
+		WithArgs("ws-canvas-admin").
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+
+	t.Setenv("ADMIN_TOKEN", "admin-secret-42")
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	req := httptest.NewRequest("POST", "/workspaces/x/a2a", bytes.NewBufferString("{}"))
+	req.Header.Set("Authorization", "Bearer admin-secret-42")
+	c.Request = req
+
+	isCanvasUser, err := validateCallerToken(context.Background(), c, "ws-canvas-admin")
+	if err != nil {
+		t.Errorf("admin token should identify canvas user; got error: %v", err)
+	}
+	if !isCanvasUser {
+		t.Errorf("admin token bearer should be identified as canvas user")
+	}
+	if w.Code != 200 || w.Body.Len() != 0 {
+		t.Errorf("admin token path should not write a response body; got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestValidateCallerToken_CanvasUser_OrgToken(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+
+	// Tokenless workspace
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM workspace_auth_tokens`).
+		WithArgs("ws-canvas-org").
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+
+	// orgtoken.Validate lookup
+	mock.ExpectQuery(`SELECT id, prefix, org_id FROM org_api_tokens WHERE token_hash = .* AND revoked_at IS NULL`).
+		WithArgs(sqlmock.AnyArg()).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "prefix", "org_id"}).AddRow("orgtok-1", "pref1234", "org-1"))
+	mock.ExpectExec(`UPDATE org_api_tokens SET last_used_at`).
+		WithArgs("orgtok-1").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	req := httptest.NewRequest("POST", "/workspaces/x/a2a", bytes.NewBufferString("{}"))
+	req.Header.Set("Authorization", "Bearer org-token-plaintext-xyz")
+	c.Request = req
+
+	isCanvasUser, err := validateCallerToken(context.Background(), c, "ws-canvas-org")
+	if err != nil {
+		t.Errorf("org token should identify canvas user; got error: %v", err)
+	}
+	if !isCanvasUser {
+		t.Errorf("org token bearer should be identified as canvas user")
+	}
+	if w.Code != 200 || w.Body.Len() != 0 {
+		t.Errorf("org token path should not write a response body; got %d: %s", w.Code, w.Body.String())
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
 	}
 }
 
@@ -1511,6 +1598,35 @@ func TestResolveAgentURL_DockerRewrite(t *testing.T) {
 	}
 }
 
+func TestResolveAgentURL_ExternalRuntimeLoopbackNotRewrittenInDocker(t *testing.T) {
+	mock := setupTestDB(t)
+	mr := setupTestRedis(t)
+	allowLoopbackForTest(t)
+	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
+	waitForHandlerAsyncBeforeDBCleanup(t, handler)
+	handler.provisioner = &stubLocalProv{}
+
+	restore := setPlatformInDockerForTest(true)
+	defer restore()
+
+	agentURL := "http://127.0.0.1:55555"
+	mr.Set("ws:ws-external:url", agentURL)
+	mock.ExpectQuery("SELECT COALESCE\\(runtime").
+		WithArgs("ws-external").
+		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("external"))
+
+	url, perr := handler.resolveAgentURL(context.Background(), "ws-external")
+	if perr != nil {
+		t.Fatalf("unexpected error: %+v", perr)
+	}
+	if url != agentURL {
+		t.Errorf("external runtime loopback URL must not be rewritten; got %q want %q", url, agentURL)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
 // --- dispatchA2A direct unit tests ---
 
 func TestDispatchA2A_BuildRequestError(t *testing.T) {
@@ -1750,6 +1866,58 @@ func TestHandleA2ADispatchError_ContextDeadline(t *testing.T) {
 	}
 }
 
+func TestHandleA2ADispatchError_BusyEnqueueLogsQueuedNotFailure(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
+	waitForHandlerAsyncBeforeDBCleanup(t, handler)
+
+	mock.ExpectQuery(`INSERT INTO a2a_queue`).
+		WithArgs("ws-busy", nil, PriorityTask, "{}", "message/send", nil, nil).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("11111111-1111-1111-1111-111111111111"))
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM a2a_queue`).
+		WithArgs("ws-busy").
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+	mock.ExpectQuery(`SELECT name FROM workspaces WHERE id =`).
+		WithArgs("ws-busy").
+		WillReturnRows(sqlmock.NewRows([]string{"name"}).AddRow("Busy Target"))
+	mock.ExpectExec("INSERT INTO activity_logs").
+		WithArgs(
+			"ws-busy",
+			"a2a_receive",
+			nil,
+			sqlmock.AnyArg(),
+			sqlmock.AnyArg(),
+			sqlmock.AnyArg(),
+			sqlmock.AnyArg(),
+			nil,
+			nil,
+			sqlmock.AnyArg(),
+			"ok",
+			nil,
+		).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	status, body, perr := handler.handleA2ADispatchError(
+		context.Background(), "ws-busy", "", []byte("{}"), "message/send",
+		context.DeadlineExceeded, 180002, true,
+	)
+	if perr != nil {
+		t.Fatalf("expected busy enqueue success, got proxy error: %+v", perr)
+	}
+	if status != http.StatusAccepted {
+		t.Fatalf("got status %d, want 202", status)
+	}
+	if !bytes.Contains(body, []byte(`"queued":true`)) {
+		t.Fatalf("expected queued response body, got %s", string(body))
+	}
+
+	time.Sleep(80 * time.Millisecond)
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations; busy enqueue must log status=ok, not error: %v", err)
+	}
+}
+
 func TestHandleA2ADispatchError_BuildError(t *testing.T) {
 	setupTestDB(t)
 	setupTestRedis(t)
@@ -1786,9 +1954,9 @@ func TestMaybeMarkContainerDead_NilProvisioner(t *testing.T) {
 	setupTestRedis(t)
 	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
 
-	mock.ExpectQuery(`SELECT COALESCE\(runtime, 'langgraph'\) FROM workspaces WHERE id =`).
+	mock.ExpectQuery(`SELECT COALESCE\(runtime, 'claude-code'\) FROM workspaces WHERE id =`).
 		WithArgs("ws-nilprov").
-		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("langgraph"))
+		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("claude-code"))
 
 	if got := handler.maybeMarkContainerDead(context.Background(), "ws-nilprov"); got {
 		t.Error("expected false when provisioner is nil")
@@ -1809,7 +1977,7 @@ func TestMaybeMarkContainerDead_CPOnly_NotRunning(t *testing.T) {
 	cp := &fakeCPProv{running: false}
 	handler.SetCPProvisioner(cp)
 
-	mock.ExpectQuery(`SELECT COALESCE\(runtime, 'langgraph'\) FROM workspaces WHERE id =`).
+	mock.ExpectQuery(`SELECT COALESCE\(runtime, 'claude-code'\) FROM workspaces WHERE id =`).
 		WithArgs("ws-saas-dead").
 		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("hermes"))
 	mock.ExpectExec(`UPDATE workspaces SET status =`).
@@ -1838,7 +2006,7 @@ func TestMaybeMarkContainerDead_CPOnly_Running(t *testing.T) {
 	cp := &fakeCPProv{running: true}
 	handler.SetCPProvisioner(cp)
 
-	mock.ExpectQuery(`SELECT COALESCE\(runtime, 'langgraph'\) FROM workspaces WHERE id =`).
+	mock.ExpectQuery(`SELECT COALESCE\(runtime, 'claude-code'\) FROM workspaces WHERE id =`).
 		WithArgs("ws-saas-alive").
 		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("hermes"))
 
@@ -1939,7 +2107,7 @@ func TestMaybeMarkContainerDead_ExternalRuntime(t *testing.T) {
 	setupTestRedis(t)
 	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
 
-	mock.ExpectQuery(`SELECT COALESCE\(runtime, 'langgraph'\) FROM workspaces WHERE id =`).
+	mock.ExpectQuery(`SELECT COALESCE\(runtime, 'claude-code'\) FROM workspaces WHERE id =`).
 		WithArgs("ws-ext").
 		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("external"))
 
@@ -2325,7 +2493,7 @@ func TestLookupDeliveryMode_ContextCanceled_FailsClosed(t *testing.T) {
 // ==================== a2aClient ResponseHeaderTimeout config ====================
 
 func TestA2AClientResponseHeaderTimeout(t *testing.T) {
-	const defaultTimeout = 180 * time.Second
+	const defaultTimeout = 5 * time.Minute
 
 	// Default (unset env) — a2aClient was initialised at package load time.
 	if a2aClient.Transport.(*http.Transport).ResponseHeaderTimeout != defaultTimeout {
@@ -2349,7 +2517,7 @@ func TestA2AClientResponseHeaderTimeout(t *testing.T) {
 	t.Run("invalid A2A_PROXY_RESPONSE_HEADER_TIMEOUT falls back to default", func(t *testing.T) {
 		t.Setenv("A2A_PROXY_RESPONSE_HEADER_TIMEOUT", "not-a-duration")
 		// Simulate what envx.Duration does with an invalid value.
-		var fallback = 180 * time.Second
+		var fallback = 5 * time.Minute
 		override := fallback
 		if v := os.Getenv("A2A_PROXY_RESPONSE_HEADER_TIMEOUT"); v != "" {
 			if d, err := time.ParseDuration(v); err == nil && d > 0 {

@@ -119,7 +119,6 @@ func TestHostPluginPath_PerRuntime(t *testing.T) {
 	}{
 		{"claude-code", "browser-automation", "/configs/plugins/browser-automation"},
 		{"hermes", "browser-automation", "/home/ubuntu/.hermes/plugins/browser-automation"},
-		{"langgraph", "browser-automation", "/opt/configs/plugins/browser-automation"},
 		// Unknown / empty runtime falls back to /configs (containerized
 		// user-data layout) so a future runtime added to workspaces table
 		// without a workspaceFilePathPrefix entry doesn't blow up the

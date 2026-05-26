@@ -171,6 +171,8 @@ export function MobileSpawn({ dark, onClose }: { dark: boolean; onClose: () => v
         <div style={{ padding: "0 14px" }}>
           {loadingTemplates ? (
             <div
+              role="status"
+              aria-live="polite"
               style={{
                 padding: "24px 8px",
                 textAlign: "center",
@@ -316,7 +318,12 @@ export function MobileSpawn({ dark, onClose }: { dark: boolean; onClose: () => v
               border: `0.5px solid ${p.border}`,
               borderRadius: 12,
               fontFamily: MOBILE_FONT_MONO,
-              fontSize: 13.5,
+              // iOS Safari/PWA zooms the viewport when a focused input has
+              // a computed font-size below 16px; the layout jumps and the
+              // page looks broken until the user pinches back (#224 / #225,
+              // same class as desktop #1434). 16px is the minimum that
+              // suppresses that focus-zoom.
+              fontSize: 16,
               color: p.text,
               outline: "none",
               boxSizing: "border-box",

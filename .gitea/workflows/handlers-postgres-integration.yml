@@ -77,7 +77,16 @@ env:
 jobs:
   detect-changes:
     name: detect-changes
-    runs-on: ubuntu-latest
+    # mc#1529 §1: pin to `docker-host` so the integration job runs on the
+    # operator-host runners (molecule-runner-*), which carry the
+    # `molecule-core-net` bridge network this workflow depends on. PC2
+    # runners (hongming-pc-runner-*) also advertise ubuntu-latest but
+    # don't have that network — the previous `runs-on: ubuntu-latest`
+    # rolled the dice and hard-failed the bridge-inspect step ~30% of
+    # the time. detect-changes itself doesn't need the bridge, but keeping
+    # both jobs on the same label avoids workspace-volume cross-host
+    # surprises and keeps the routing rule discoverable in one place.
+    runs-on: docker-host
     # mc#774 Phase 3 (RFC §1): surface broken workflows without blocking.
     # mc#774: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
     continue-on-error: true
@@ -92,36 +101,13 @@ jobs:
           # not present in the shallow checkout.
           fetch-depth: 2
       - id: filter
-        # Inline replacement for dorny/paths-filter — see e2e-api.yml.
         run: |
-          # Gitea Actions evaluates github.event.before to empty string in shell
-          # scripts. Use GITHUB_EVENT_BEFORE shell env var instead (Gitea
-          # correctly populates it for push events). PR case uses template var.
-          BASE=""
-          if [ "${{ github.event_name }}" = "pull_request" ] && [ -n "${{ github.event.pull_request.base.sha }}" ]; then
-            BASE="${{ github.event.pull_request.base.sha }}"
-          elif [ -n "$GITHUB_EVENT_BEFORE" ]; then
-            BASE="$GITHUB_EVENT_BEFORE"
-          fi
-          if [ -z "$BASE" ] || echo "$BASE" | grep -qE '^0+$'; then
-            echo "handlers=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          # timeout 30 guards against the case where BASE points to a ref that
-          # git can resolve but cat-file hangs (rare on corrupted objects).
-          if ! timeout 30 git cat-file -e "$BASE" 2>/dev/null; then
-            git fetch --depth=1 origin "$BASE" 2>/dev/null || true
-          fi
-          if ! timeout 30 git cat-file -e "$BASE" 2>/dev/null; then
-            echo "handlers=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          CHANGED=$(git diff --name-only "$BASE" HEAD)
-          if echo "$CHANGED" | grep -qE '^(workspace-server/internal/handlers/|workspace-server/internal/wsauth/|workspace-server/migrations/|\.gitea/workflows/handlers-postgres-integration\.yml$)'; then
-            echo "handlers=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "handlers=false" >> "$GITHUB_OUTPUT"
-          fi
+          python3 .gitea/scripts/detect-changes.py \
+            --profile handlers-postgres \
+            --event-name "${{ github.event_name }}" \
+            --pr-base-sha "${{ github.event.pull_request.base.sha }}" \
+            --base-ref "${{ github.event.pull_request.base.ref }}" \
+            --push-before "${GITHUB_EVENT_BEFORE:-}"
 
   # Single-job-with-per-step-if pattern: always runs to satisfy the
   # required-check name on branch protection; real work gates on the
@@ -129,7 +115,9 @@ jobs:
   integration:
     name: Handlers Postgres Integration
     needs: detect-changes
-    runs-on: ubuntu-latest
+    # mc#1529 §1: must run on operator-host (where `molecule-core-net`
+    # exists). See detect-changes for the full routing rationale.
+    runs-on: docker-host
     # mc#774 Phase 3 (RFC §1): surface broken workflows without blocking.
     # mc#774: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
     continue-on-error: true

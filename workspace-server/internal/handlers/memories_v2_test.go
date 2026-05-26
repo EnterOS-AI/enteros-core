@@ -27,8 +27,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/memory/contract"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/memory/namespace"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/memory/contract"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/memory/namespace"
 	"github.com/gin-gonic/gin"
 )
 

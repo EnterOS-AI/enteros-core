@@ -49,11 +49,11 @@ R=$(curl -s -X POST "$PLATFORM/workspaces" -H 'Content-Type: application/json' \
 PM_ID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
 check "Create PM (claude-code)" "provisioning" "$R"
 
-# Research Agent — LangGraph + Gemini Flash
+# Research Agent — Claude Code + Gemini Flash
 R=$(curl -s -X POST "$PLATFORM/workspaces" -H 'Content-Type: application/json' \
-  -d '{"name":"Researcher","role":"Deep research and analysis","tier":2,"template":"langgraph"}')
+  -d '{"name":"Researcher","role":"Deep research and analysis","tier":2,"template":"claude-code-default"}')
 RES_ID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
-check "Create Researcher (langgraph)" "provisioning" "$R"
+check "Create Researcher (claude-code)" "provisioning" "$R"
 
 # Dev Agent — OpenClaw + Gemini Flash
 R=$(curl -s -X POST "$PLATFORM/workspaces" -H 'Content-Type: application/json' \
@@ -61,11 +61,11 @@ R=$(curl -s -X POST "$PLATFORM/workspaces" -H 'Content-Type: application/json' \
 DEV_ID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
 check "Create Developer (openclaw)" "provisioning" "$R"
 
-# Analyst — DeepAgents + Gemini Flash
+# Analyst — Hermes + Gemini Flash
 R=$(curl -s -X POST "$PLATFORM/workspaces" -H 'Content-Type: application/json' \
-  -d '{"name":"Analyst","role":"Data analysis and reporting","tier":2,"template":"deepagents"}')
+  -d '{"name":"Analyst","role":"Data analysis and reporting","tier":2,"template":"hermes"}')
 ANA_ID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
-check "Create Analyst (deepagents)" "provisioning" "$R"
+check "Create Analyst (hermes)" "provisioning" "$R"
 
 echo ""
 echo "  PM:         $PM_ID"

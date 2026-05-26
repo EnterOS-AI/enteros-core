@@ -18,7 +18,7 @@ import (
 	"testing"
 )
 
-const moduleInternalPrefix = "github.com/Molecule-AI/molecule-monorepo/platform/internal/"
+const moduleInternalPrefix = "git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/"
 
 func TestDBHasNoInternalDependencies(t *testing.T) {
 	t.Parallel()

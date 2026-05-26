@@ -10,6 +10,8 @@
 set -euo pipefail
 
 PLATFORM="http://localhost:8080"
+export BASE="$PLATFORM"
+source "$(dirname "$0")/_lib.sh"
 PASS=0
 FAIL=0
 ERRORS=""
@@ -38,9 +40,7 @@ else
 fi
 
 # --- Clean existing workspaces ---
-for id in $(curl -s $PLATFORM/workspaces | python3 -c "import sys,json; [print(w['id']) for w in json.load(sys.stdin)]" 2>/dev/null); do
-  curl -s -X DELETE "$PLATFORM/workspaces/$id" > /dev/null
-done
+e2e_cleanup_all_workspaces
 # shellcheck disable=SC2046  # Intentional word-split over container IDs
 docker stop $(docker ps -q --filter "name=ws-") 2>/dev/null || true
 # shellcheck disable=SC2046
@@ -50,13 +50,16 @@ docker rm $(docker ps -aq --filter "name=ws-") 2>/dev/null || true
 echo ""
 echo "--- Create Workspaces ---"
 
+# model is required at the Create boundary (CTO 2026-05-22 SSOT —
+# feedback_workspace_model_required_no_platform_default_dynamic_credential_intake).
+# Pass the same value the deleted DefaultModel("claude-code") returned.
 ROOT=$(curl -s -X POST $PLATFORM/workspaces -H "Content-Type: application/json" \
-  -d '{"name":"Root Agent","role":"Company coordinator","runtime":"claude-code","tier":3}' \
+  -d '{"name":"Root Agent","role":"Company coordinator","runtime":"claude-code","model":"sonnet","tier":3}' \
   | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
 check_contains "Create root workspace" "-" "$ROOT"
 
 CHILD=$(curl -s -X POST $PLATFORM/workspaces -H "Content-Type: application/json" \
-  -d "{\"name\":\"Child Agent\",\"role\":\"Sub-team member\",\"runtime\":\"claude-code\",\"tier\":2,\"parent_id\":\"$ROOT\"}" \
+  -d "{\"name\":\"Child Agent\",\"role\":\"Sub-team member\",\"runtime\":\"claude-code\",\"model\":\"sonnet\",\"tier\":2,\"parent_id\":\"$ROOT\"}" \
   | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
 check_contains "Create child workspace" "-" "$CHILD"
 

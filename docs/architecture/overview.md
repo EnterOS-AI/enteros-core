@@ -17,7 +17,7 @@ Canvas (Next.js :3000) ←WebSocket→ Platform (Go :8080) ←HTTP→ Postgres +
 
 - **Workspace Server** (`workspace-server/`): Go/Gin control plane — workspace CRUD, registry, discovery, WebSocket hub, liveness monitoring.
 - **Canvas** (`canvas/`): Next.js 15 + React Flow (@xyflow/react v12) + Zustand + Tailwind — visual workspace graph.
-- **Workspace Runtime** (`workspace/`): Shared runtime published as [`molecule-ai-workspace-runtime`](https://pypi.org/project/molecule-ai-workspace-runtime/) on PyPI. Supports LangGraph, Claude Code, OpenClaw, DeepAgents, CrewAI, AutoGen. Each adapter lives in its own standalone template repo (e.g. `molecule-ai-workspace-template-claude-code`). See `docs/workspace-runtime-package.md` for the full picture.
+- **Workspace Runtime**: Shared runtime published from [`molecule-ai-workspace-runtime`](https://git.moleculesai.app/molecule-ai/molecule-ai-workspace-runtime) to the Molecule AI Gitea package registry. Supports LangGraph, Claude Code, OpenClaw, Hermes, Codex, and AutoGen. Each adapter lives in its own standalone template repo (e.g. `molecule-ai-workspace-template-claude-code`). See `docs/workspace-runtime-package.md` for the full picture.
 - **molecli** (`workspace-server/cmd/cli/`): Go TUI dashboard (Bubbletea + Lipgloss) — real-time workspace monitoring, event log, health overview, delete/filter operations.
 
 ## Key Architectural Patterns
@@ -44,7 +44,7 @@ All three call `onWorkspaceOffline`, which broadcasts `WORKSPACE_OFFLINE` and ca
 
 ### Template Resolution (Workspace Create)
 
-Runtime detection happens **before** the DB insert: if `payload.Runtime` is empty and a template is specified, the handler reads `runtime:` from `configsDir/template/config.yaml` first. If still empty, it defaults to `"langgraph"`. This ensures the correct runtime (e.g. `claude-code`) is persisted in the DB and used for container image selection.
+Runtime detection happens **before** the DB insert: if `payload.Runtime` is empty and a template is specified, the handler reads `runtime:` from `configsDir/template/config.yaml` first. If still empty, it defaults to `"claude-code"`. This ensures the correct runtime is persisted in the DB and used for container image selection.
 
 When the requested template does not exist, the Create handler falls back in order:
 

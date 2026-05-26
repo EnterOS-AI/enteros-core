@@ -44,6 +44,13 @@ func expectWorkspaceLiveTokenCount(mock sqlmock.Sqlmock, count int) {
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(count))
 }
 
+func expectWorkspaceDeleteLookup(mock sqlmock.Sqlmock, id, name string, activeTasks int, status string) {
+	mock.ExpectQuery(`SELECT name, COALESCE\(active_tasks, 0\), status FROM workspaces WHERE id = \$1`).
+		WithArgs(id).
+		WillReturnRows(sqlmock.NewRows([]string{"name", "active_tasks", "status"}).
+			AddRow(name, activeTasks, status))
+}
+
 // ---------- State ----------
 
 func TestState_LegacyWorkspaceNoLiveToken(t *testing.T) {
@@ -304,12 +311,15 @@ func TestDelete_HasChildrenWithoutConfirm(t *testing.T) {
 	h := newWorkspaceCrudHandler(t)
 	r.DELETE("/workspaces/:id", h.Delete)
 
+	expectWorkspaceDeleteLookup(mock, wsID, "Parent Workspace", 0, "running")
+
 	mock.ExpectQuery(`SELECT id, name FROM workspaces WHERE parent_id = \$1 AND status != 'removed'`).
 		WithArgs(wsID).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "name"}).
 			AddRow("child-1", "Child Workspace"))
 
 	req, _ := http.NewRequest("DELETE", "/workspaces/"+wsID, nil)
+	req.Header.Set("X-Confirm-Name", "Parent Workspace")
 	// No ?confirm=true
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
@@ -330,17 +340,59 @@ func TestDelete_HasChildrenWithoutConfirm(t *testing.T) {
 	}
 }
 
+func TestDelete_LeafWithoutConfirmName(t *testing.T) {
+	wsID := "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+	mock, r := setupWorkspaceCrudTest(t)
+	h := newWorkspaceCrudHandler(t)
+	r.DELETE("/workspaces/:id", h.Delete)
+
+	expectWorkspaceDeleteLookup(mock, wsID, "SEO Agent", 3, "running")
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM workspaces WHERE parent_id = \$1 AND status != 'removed'`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM workspace_schedules WHERE workspace_id = \$1 AND enabled = true`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(11))
+
+	req, _ := http.NewRequest("DELETE", "/workspaces/"+wsID, nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to unmarshal: %v", err)
+	}
+	if resp["error"] != "destructive_action_requires_confirmation" {
+		t.Errorf("error should require destructive confirmation, got %v", resp["error"])
+	}
+	if resp["workspace_name"] != "SEO Agent" {
+		t.Errorf("workspace_name should be surfaced for confirmation")
+	}
+	if resp["active_tasks"] != float64(3) {
+		t.Errorf("active_tasks should be 3, got %v", resp["active_tasks"])
+	}
+	if resp["schedule_count"] != float64(11) {
+		t.Errorf("schedule_count should be 11, got %v", resp["schedule_count"])
+	}
+}
+
 func TestDelete_ChildrenCheckQueryError(t *testing.T) {
 	wsID := "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 	mock, r := setupWorkspaceCrudTest(t)
 	h := newWorkspaceCrudHandler(t)
 	r.DELETE("/workspaces/:id", h.Delete)
 
+	expectWorkspaceDeleteLookup(mock, wsID, "Workspace", 0, "running")
 	mock.ExpectQuery(`SELECT id, name FROM workspaces WHERE parent_id = \$1 AND status != 'removed'`).
 		WithArgs(wsID).
 		WillReturnError(sql.ErrConnDone)
 
 	req, _ := http.NewRequest("DELETE", "/workspaces/"+wsID, nil)
+	req.Header.Set("X-Confirm-Name", "Workspace")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -501,6 +553,32 @@ func TestCascadeDelete_DescendantQueryError(t *testing.T) {
 		t.Errorf("stopErrs = %v; want nil", stopErrs)
 	}
 	// sqlmock verifies all expected queries were executed
+}
+
+func TestCascadeDelete_DescendantRowsError(t *testing.T) {
+	mock, _ := setupWorkspaceCrudTest(t)
+	wsID := "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+
+	// RowError(0, ...) requires a real row at index 0 to be reachable —
+	// sqlmock only invokes nextErr[N] when r.pos-1 == N and the row exists.
+	// AddRow ensures Next() attempts the first row, triggers the error,
+	// and rows.Err() returns the injected error.
+	h := &WorkspaceHandler{}
+	rows := sqlmock.NewRows([]string{"id"}).AddRow("desc-1").RowError(0, sql.ErrConnDone)
+	mock.ExpectQuery(`WITH RECURSIVE descendants AS`).
+		WithArgs(wsID).
+		WillReturnRows(rows)
+
+	deleted, stopErrs, err := h.CascadeDelete(context.Background(), wsID)
+	if err == nil {
+		t.Fatal("CascadeDelete returned nil error; want descendant rows error")
+	}
+	if deleted != nil {
+		t.Errorf("deleted = %v; want nil", deleted)
+	}
+	if stopErrs != nil {
+		t.Errorf("stopErrs = %v; want nil", stopErrs)
+	}
 }
 
 // Note: Full CascadeDelete testing requires mocking StopWorkspace, RemoveVolume,

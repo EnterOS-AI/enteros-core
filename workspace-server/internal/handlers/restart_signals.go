@@ -26,8 +26,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/provisioner"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
 )
 
 const (

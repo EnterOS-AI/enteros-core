@@ -478,7 +478,7 @@ export function MobileChat({
         }}
       >
         {tab === "my" && historyLoading && (
-          <div style={{ padding: "20px 4px", textAlign: "center", color: p.text3, fontSize: 13 }}>
+          <div role="status" aria-live="polite" style={{ padding: "20px 4px", textAlign: "center", color: p.text3, fontSize: 13 }}>
             Loading chat history…
           </div>
         )}
@@ -515,7 +515,7 @@ export function MobileChat({
           </div>
         )}
         {tab === "my" && !historyLoading && !historyError && messages.length === 0 && (
-          <div style={{ padding: "20px 4px", textAlign: "center", color: p.text3, fontSize: 13 }}>
+          <div role="status" aria-live="polite" style={{ padding: "20px 4px", textAlign: "center", color: p.text3, fontSize: 13 }}>
             Send a message to start chatting.
           </div>
         )}
@@ -756,7 +756,12 @@ export function MobileChat({
               border: "none",
               outline: "none",
               background: "transparent",
-              fontSize: 14.5,
+              // iOS Safari/PWA zooms the viewport when a focused textarea
+              // has a computed font-size below 16px. 14.5 triggers that
+              // focus-zoom; the page looks broken until the user pinches
+              // back (#224, same class as desktop #1434 / sibling #225).
+              // 16px is the minimum that keeps focus from zooming.
+              fontSize: 16,
               lineHeight: 1.4,
               color: p.text,
               padding: "6px 0",

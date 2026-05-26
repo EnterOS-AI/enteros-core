@@ -108,7 +108,20 @@ env:
 
 jobs:
   detect-changes:
-    runs-on: ubuntu-latest
+    # mc#1529 follow-on: pin to `docker-host` so the e2e-api lane lands
+    # on Linux operator-host runners (molecule-runner-*) that carry the
+    # `molecule-core-net` bridge network + a working `aws ecr get-login-
+    # password | docker login` path. The bare `ubuntu-latest` label is
+    # also accepted by hongming-pc-runner-* (Windows act_runner v1.0.3),
+    # where the docker.sock-bound steps below fail non-deterministically
+    # (e.g. `docker run -d --name pg-e2e-api-...` with port-bind +
+    # `docker exec ... pg_isready` cannot work against a Windows daemon).
+    # detect-changes itself doesn't bind docker.sock, but pinning here too
+    # keeps both jobs on the same lane so we don't re-roll the dice on
+    # workspace-volume cross-host surprises and the routing rule is
+    # discoverable in one place. Mirror of mc#1543 (handlers-postgres-
+    # integration). See internal#512 for the class defect.
+    runs-on: docker-host
     # Phase 3 (RFC #219 §1): surface broken workflows without blocking.
     # mc#774: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
     continue-on-error: true
@@ -119,31 +132,13 @@ jobs:
         with:
           fetch-depth: 0
       - id: decide
-        # Inline replacement for dorny/paths-filter — same pattern PR#372's
-        # ci.yml port used. Diffs against the PR base or push BEFORE SHA,
-        # then matches against the api-relevant path set.
         run: |
-          BASE="${GITHUB_BASE_REF:-${{ github.event.before }}}"
-          if [ "${{ github.event_name }}" = "pull_request" ] && [ -n "${{ github.event.pull_request.base.sha }}" ]; then
-            BASE="${{ github.event.pull_request.base.sha }}"
-          fi
-          if [ -z "$BASE" ] || echo "$BASE" | grep -qE '^0+$'; then
-            echo "api=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          if ! git cat-file -e "$BASE" 2>/dev/null; then
-            git fetch --depth=1 origin "$BASE" 2>/dev/null || true
-          fi
-          if ! git cat-file -e "$BASE" 2>/dev/null; then
-            echo "api=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          CHANGED=$(git diff --name-only "$BASE" HEAD)
-          if echo "$CHANGED" | grep -qE '^(workspace-server/|tests/e2e/|\.gitea/workflows/e2e-api\.yml$)'; then
-            echo "api=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "api=false" >> "$GITHUB_OUTPUT"
-          fi
+          python3 .gitea/scripts/detect-changes.py \
+            --profile e2e-api \
+            --event-name "${{ github.event_name }}" \
+            --pr-base-sha "${{ github.event.pull_request.base.sha }}" \
+            --base-ref "${{ github.event.pull_request.base.ref }}" \
+            --push-before "${GITHUB_EVENT_BEFORE:-${{ github.event.before }}}"
 
   # ONE job (no job-level `if:`) that always runs and reports under the
   # required-check name `E2E API Smoke Test`. Real work is gated per-step
@@ -160,7 +155,10 @@ jobs:
   e2e-api:
     needs: detect-changes
     name: E2E API Smoke Test
-    runs-on: ubuntu-latest
+    # mc#1529 follow-on: must run on operator-host Linux runners (where
+    # docker.sock + `molecule-core-net` + `aws ecr ...` work). See
+    # detect-changes for the full rationale.
+    runs-on: docker-host
     # Phase 3 (RFC #219 §1): surface broken workflows without blocking.
     # mc#774: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
     continue-on-error: true
@@ -350,6 +348,9 @@ jobs:
             exit 1
           fi
           echo "Migrations OK"
+      - name: Run today's-PR-coverage E2E (mc#1525/1535/1536/1539/1542 fix-specific assertions)
+        if: needs.detect-changes.outputs.api == 'true'
+        run: bash tests/e2e/test_today_pr_coverage_e2e.sh
       - name: Run E2E API tests
         if: needs.detect-changes.outputs.api == 'true'
         run: bash tests/e2e/test_api.sh
@@ -359,6 +360,12 @@ jobs:
       - name: Run priority-runtimes E2E (claude-code + hermes — skips when keys absent)
         if: needs.detect-changes.outputs.api == 'true'
         run: bash tests/e2e/test_priority_runtimes_e2e.sh
+      - name: Install standalone runtime parser from Gitea registry
+        if: needs.detect-changes.outputs.api == 'true'
+        run: |
+          python3 -m pip install --no-deps \
+            --index-url https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/ \
+            molecule-ai-workspace-runtime
       - name: Run poll-mode + since_id cursor E2E (#2339)
         if: needs.detect-changes.outputs.api == 'true'
         run: bash tests/e2e/test_poll_mode_e2e.sh
@@ -382,4 +389,3 @@ jobs:
         run: |
           docker rm -f "$PG_CONTAINER" 2>/dev/null || true
           docker rm -f "$REDIS_CONTAINER" 2>/dev/null || true
-

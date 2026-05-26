@@ -6,7 +6,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/buildinfo"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/buildinfo"
 	"github.com/gin-gonic/gin"
 )
 

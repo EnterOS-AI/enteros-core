@@ -263,6 +263,20 @@ describe("MobileChat — composer", () => {
     const sendBtn = container.querySelector('[aria-label="Send"]') as HTMLButtonElement;
     expect(sendBtn.disabled).toBe(true);
   });
+
+  // Regression #224: the composer textarea must render with font-size
+  // ≥ 16px. iOS Safari and PWAs auto-zoom the viewport when a focused
+  // input has a computed font-size below 16px — the layout jumps and
+  // the page looks broken until the user pinches back. Same class as
+  // desktop #1434 / sibling MobileSpawn #225.
+  it("composer textarea renders at font-size 16px or greater (iOS focus-zoom regression #224)", () => {
+    const { container } = renderChat(mockAgentId);
+    const textarea = container.querySelector("textarea") as HTMLTextAreaElement;
+    expect(textarea).toBeTruthy();
+    const fs = Number.parseFloat(textarea.style.fontSize);
+    expect(Number.isFinite(fs)).toBe(true);
+    expect(fs).toBeGreaterThanOrEqual(16);
+  });
 });
 
 // ─── Tabs ─────────────────────────────────────────────────────────────────────

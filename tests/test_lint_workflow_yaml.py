@@ -26,9 +26,11 @@ import re
 import subprocess
 import sys
 import textwrap
+import importlib.util
 from pathlib import Path
 
 import pytest  # noqa: F401  (declares the dep)
+import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / ".gitea" / "scripts" / "lint-workflow-yaml.py"
@@ -616,16 +618,24 @@ def test_rule10_docker_info_head_in_separate_step_without_pipefail_passes(tmp_pa
 
 CI_WORKFLOW = REPO_ROOT / ".gitea" / "workflows" / "ci.yml"
 CI_SURFACES = ("platform", "canvas", "python", "scripts")
+DETECT_CHANGES_SCRIPT = REPO_ROOT / ".gitea" / "scripts" / "detect-changes.py"
+
+
+def _load_detect_changes():
+    spec = importlib.util.spec_from_file_location("detect_changes", DETECT_CHANGES_SCRIPT)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
 
 
 def _ci_change_patterns() -> dict[str, re.Pattern[str]]:
-    text = CI_WORKFLOW.read_text(encoding="utf-8")
-    patterns: dict[str, re.Pattern[str]] = {}
-    for surface, pattern in re.findall(
-        r'echo "(platform|canvas|python|scripts)=.*?grep -qE \'([^\']+)\'',
-        text,
-    ):
-        patterns[surface] = re.compile(pattern)
+    detect_changes = _load_detect_changes()
+    patterns = {
+        surface: re.compile(pattern)
+        for surface, pattern in detect_changes.PROFILES["ci"].items()
+    }
     assert set(patterns) == set(CI_SURFACES)
     return patterns
 
@@ -693,3 +703,58 @@ def test_ci_change_detector_docs_and_meta_scripts_do_not_trigger_surfaces():
         "python": False,
         "scripts": False,
     }
+
+
+def test_ci_platform_go_steps_are_path_scoped_on_all_events():
+    doc = yaml.safe_load(CI_WORKFLOW.read_text(encoding="utf-8"))
+    platform = doc["jobs"]["platform-build"]
+    assert platform.get("needs") == "changes"
+
+    expensive_steps = [
+        step
+        for step in platform["steps"]
+        if step.get("uses")
+        or step.get("run", "").startswith("go ")
+        or "golangci-lint" in step.get("run", "")
+    ]
+    assert expensive_steps
+    for step in expensive_steps:
+        expr = step.get("if", "")
+        assert "needs.changes.outputs.platform == 'true'" in expr
+        assert "github.event_name != 'pull_request'" not in expr
+
+
+def test_ci_canvas_nextjs_steps_are_path_scoped_on_all_events():
+    doc = yaml.safe_load(CI_WORKFLOW.read_text(encoding="utf-8"))
+    canvas = doc["jobs"]["canvas-build"]
+    assert canvas.get("needs") == "changes"
+
+    expensive_steps = [
+        step
+        for step in canvas["steps"]
+        if step.get("uses")
+        or step.get("run", "").startswith("npm ")
+        or step.get("run", "").startswith("npx ")
+    ]
+    assert expensive_steps
+    for step in expensive_steps:
+        expr = step.get("if", "")
+        assert "needs.changes.outputs.canvas == 'true'" in expr
+        assert "github.event_name != 'pull_request'" not in expr
+
+
+def test_ci_shellcheck_steps_are_path_scoped_on_all_events():
+    doc = yaml.safe_load(CI_WORKFLOW.read_text(encoding="utf-8"))
+    shellcheck = doc["jobs"]["shellcheck"]
+    assert shellcheck.get("needs") == "changes"
+
+    expensive_steps = [
+        step
+        for step in shellcheck["steps"]
+        if step.get("uses") or step.get("run", "").startswith(("bash ", "find ", "shellcheck "))
+    ]
+    assert expensive_steps
+    for step in expensive_steps:
+        expr = step.get("if", "")
+        assert "needs.changes.outputs.scripts == 'true'" in expr
+        assert "github.event_name != 'pull_request'" not in expr

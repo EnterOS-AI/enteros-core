@@ -21,6 +21,8 @@ func TestExtended_WorkspaceDelete(t *testing.T) {
 	broadcaster := newTestBroadcaster()
 	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", "/tmp/configs")
 
+	expectWorkspaceDeleteLookup(mock, wsDelID, "Delete Me", 0, "running")
+
 	// Expect children query — no children
 	mock.ExpectQuery("SELECT id, name FROM workspaces WHERE parent_id").
 		WithArgs(wsDelID).
@@ -59,6 +61,7 @@ func TestExtended_WorkspaceDelete(t *testing.T) {
 	c, _ := gin.CreateTestContext(w)
 	c.Params = gin.Params{{Key: "id", Value: wsDelID}}
 	c.Request = httptest.NewRequest("DELETE", "/workspaces/"+wsDelID+"?confirm=true", nil)
+	c.Request.Header.Set("X-Confirm-Name", "Delete Me")
 
 	handler.Delete(c)
 
@@ -187,7 +190,7 @@ func TestExtended_WorkspaceRestart_NoProvisioner(t *testing.T) {
 	// Expect SELECT for workspace existence check (includes runtime column)
 	mock.ExpectQuery("SELECT status, name, tier").
 		WithArgs("ws-restart").
-		WillReturnRows(sqlmock.NewRows([]string{"status", "name", "tier", "runtime"}).AddRow("offline", "Restarting Agent", 1, "langgraph"))
+		WillReturnRows(sqlmock.NewRows([]string{"status", "name", "tier", "runtime"}).AddRow("offline", "Restarting Agent", 1, "claude-code"))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -290,6 +293,26 @@ func TestExtended_SecretsSet(t *testing.T) {
 	}
 }
 
+func TestExtended_SecretsSetRejectsHermesCustomProviderInPlatformManagedMode(t *testing.T) {
+	t.Setenv("MOLECULE_LLM_BILLING_MODE", "platform_managed")
+	_ = setupTestDB(t)
+	handler := NewSecretsHandler(nil)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "22222222-2222-2222-2222-222222222222"}}
+
+	body := `{"key":"HERMES_CUSTOM_BASE_URL","value":"https://api.moonshot.ai/v1"}`
+	c.Request = httptest.NewRequest("POST", "/workspaces/22222222-2222-2222-2222-222222222222/secrets", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Set(c)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
 // ---------- TestSecretsDelete (Extended) ----------
 
 func TestExtended_SecretsDelete(t *testing.T) {
@@ -351,7 +374,7 @@ func TestExtended_DiscoverWithCallerID(t *testing.T) {
 	// Discover handler looks up workspace name + runtime
 	mock.ExpectQuery("SELECT COALESCE").
 		WithArgs("ws-target").
-		WillReturnRows(sqlmock.NewRows([]string{"name", "runtime"}).AddRow("Target Agent", "langgraph"))
+		WillReturnRows(sqlmock.NewRows([]string{"name", "runtime"}).AddRow("Target Agent", "claude-code"))
 
 	// No cached internal URL (Redis empty), so falls through to DB status check
 	mock.ExpectQuery("SELECT status FROM workspaces WHERE id =").
@@ -432,9 +455,10 @@ func TestExtended_Peers(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "role", "tier", "status", "agent_card", "url", "parent_id", "active_tasks"}).
 			AddRow("ws-sibling", "Sibling Agent", "worker", 1, "online", []byte("null"), "http://localhost:9001", nil, 0))
 
-	// Expect children query (workspaces with parent_id = ws-peer)
+	// Expect children query (workspaces with parent_id = ws-peer, excluding self)
+	// Query now binds (parent_id, self_id) for the self-filter guard added in #383.
 	mock.ExpectQuery("SELECT w.id, w.name").
-		WithArgs("ws-peer").
+		WithArgs("ws-peer", "ws-peer").
 		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "role", "tier", "status", "agent_card", "url", "parent_id", "active_tasks"}))
 
 	// No parent query since workspace is root-level
@@ -730,7 +754,7 @@ func TestValidateWorkspaceFields_Lengths(t *testing.T) {
 		name, role, model, runtime string
 		wantErr                    bool
 	}{
-		{"ok", "ok", "ok role", "gpt-4", "langgraph", false},
+		{"ok", "ok", "ok role", "gpt-4", "claude-code", false},
 		{"name_too_long", long256, "", "", "", true},
 		{"role_too_long", "", long1001, "", "", true},
 		{"model_too_long", "", "", long101, "", true},
@@ -773,6 +797,103 @@ func TestCreate_FieldValidation_Returns400(t *testing.T) {
 				t.Errorf("Create(%s): want 400, got %d: %s", tc.label, w.Code, w.Body.String())
 			}
 		})
+	}
+}
+
+// TestCreate_ModelRequired_Returns422 pins the CTO 2026-05-22 SSOT
+// directive (feedback_workspace_model_required_no_platform_default_dynamic_credential_intake):
+// model is required user input; the platform must not supply a default,
+// the runtime must not fall back. Empirical trigger: Code Reviewer
+// 5ba15d7e was created with `{"name":..., "runtime":"codex", ...}` (no
+// model). The legacy DefaultModel fallback returned "anthropic:claude-opus-4-7"
+// and codex adapter wedged forever — `picks provider='anthropic' but it
+// is not in the providers registry`. The gate at the Create boundary
+// turns that silent stuck-workspace failure into an immediate 422 the
+// caller can react to.
+//
+// Three shapes covered:
+//  1. bare name (no template, no runtime, no model) — formerly defaulted
+//     to claude-code + anthropic; now 422 because model is unspecified.
+//  2. explicit runtime, no model — the Code Reviewer repro shape.
+//  3. explicit runtime+template path, but template (when missing on
+//     disk or unreadable) would leave model empty — exercised here by
+//     pointing at a non-existent template under /tmp/configs.
+func TestCreate_ModelRequired_Returns422(t *testing.T) {
+	setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", "/tmp/configs")
+
+	cases := []struct{ label, body string }{
+		{"bare_name_no_runtime_no_model", `{"name":"x"}`},
+		{"explicit_codex_no_model", `{"name":"Code Reviewer","role":"code reviewer","runtime":"codex","tier":4,"max_concurrent_tasks":1}`},
+		{"explicit_hermes_no_model", `{"name":"researcher","runtime":"hermes"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.label, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(tc.body))
+			c.Request.Header.Set("Content-Type", "application/json")
+			handler.Create(c)
+			if w.Code != http.StatusUnprocessableEntity {
+				t.Errorf("Create(%s): want 422 MODEL_REQUIRED, got %d: %s", tc.label, w.Code, w.Body.String())
+				return
+			}
+			if !bytes.Contains(w.Body.Bytes(), []byte(`"code":"MODEL_REQUIRED"`)) {
+				t.Errorf("Create(%s): want body containing code=MODEL_REQUIRED, got %s", tc.label, w.Body.String())
+			}
+		})
+	}
+}
+
+// TestCreate_ExternalRuntime_NoModel_OK pins the external-runtime
+// exemption from the MODEL_REQUIRED gate. External workspaces
+// intentionally do not spawn a Docker container or run an adapter;
+// they delegate to a registered URL (workspace_provision.go:497-498:
+// "external is a first-class runtime that intentionally does NOT
+// spawn a Docker container"). The model field has no meaning for
+// them — the URL is the contract, and the gate would 422 every
+// legitimate "register my agent at https://..." flow.
+//
+// Both spellings count as external:
+//  1. payload.External == true (the canonical flag, e.g. with any runtime)
+//  2. payload.Runtime == "external" (legacy shape some E2E scripts still use)
+//
+// The isExternalLikeRuntime() helper catches both "external" and any
+// future external-like runtime alias.
+func TestCreate_ExternalRuntime_NoModel_OK(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
+
+	// External=true with explicit runtime — the test_api.sh / Echo Agent shape.
+	mock.ExpectBegin()
+	mock.ExpectExec("INSERT INTO workspaces").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+	mock.ExpectExec("INSERT INTO canvas_layouts").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO structure_events").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`UPDATE workspaces SET status =`).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO workspace_auth_tokens").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO structure_events").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	body := `{"name":"Echo Agent","tier":1,"runtime":"external","external":true}`
+	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	handler.Create(c)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("external workspace without model: want 201, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations not met: %v", err)
 	}
 }
 

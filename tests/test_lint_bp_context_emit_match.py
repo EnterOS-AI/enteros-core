@@ -55,9 +55,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
-import sys
 from pathlib import Path
-from unittest import mock
 
 import pytest
 
@@ -164,7 +162,7 @@ def test_bp_orphan_context_fails(envset, monkeypatch, capsys):
         "  all-required:\n    runs-on: x\n    steps:\n      - run: echo hi\n",
     )
     m = _import_lint()
-    posted = _stub_api(
+    _stub_api(
         monkeypatch,
         m,
         ("ok", {"status_check_contexts": [

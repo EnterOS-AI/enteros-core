@@ -34,8 +34,8 @@ import (
 	"log"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/models"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/provlog"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provlog"
 )
 
 // HasProvisioner reports whether either backend (CP or local Docker) is

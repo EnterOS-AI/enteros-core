@@ -123,7 +123,7 @@ func TestIsKnownRuntime(t *testing.T) {
 	}
 	for _, bad := range []string{
 		"", "unknown", "WORKSPACE-TEMPLATE-FAKE", "../../../etc/passwd",
-		"langgraph;rm -rf /", "claude-code\n", " langgraph",
+		"claude-code;rm -rf /", "claude-code\n", " claude-code",
 	} {
 		if IsKnownRuntime(bad) {
 			t.Errorf("IsKnownRuntime(%q) = true, want false (untrusted input)", bad)

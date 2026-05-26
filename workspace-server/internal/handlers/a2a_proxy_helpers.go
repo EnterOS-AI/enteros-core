@@ -5,18 +5,22 @@ package handlers
 
 import (
 	"context"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"log"
 	"net/http"
+	"os"
 	"strconv"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/events"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/models"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/wsauth"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/middleware"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/orgtoken"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wsauth"
 	"github.com/gin-gonic/gin"
 )
 
@@ -28,8 +32,8 @@ type proxyDispatchBuildError struct{ err error }
 func (e *proxyDispatchBuildError) Error() string { return e.err.Error() }
 
 // handleA2ADispatchError translates a forward-call failure into a proxyA2AError,
-// runs the reactive container-health check, and (when `logActivity` is true)
-// schedules a detached LogActivity goroutine for the failed attempt.
+// runs the reactive container-health check, and records the outcome. Busy
+// targets that are successfully queued are logged as queued, not failed.
 func (h *WorkspaceHandler) handleA2ADispatchError(ctx context.Context, workspaceID, callerID string, body []byte, a2aMethod string, err error, durationMs int, logActivity bool) (int, []byte, *proxyA2AError) {
 	// Build-time failure (couldn't even create the http.Request) — return
 	// a 500 without the reactive-health / busy-retry paths.
@@ -45,10 +49,10 @@ func (h *WorkspaceHandler) handleA2ADispatchError(ctx context.Context, workspace
 
 	containerDead := h.maybeMarkContainerDead(ctx, workspaceID)
 
-	if logActivity {
-		h.logA2AFailure(ctx, workspaceID, callerID, body, a2aMethod, err, durationMs)
-	}
 	if containerDead {
+		if logActivity {
+			h.logA2AFailure(ctx, workspaceID, callerID, body, a2aMethod, err, durationMs)
+		}
 		return 0, nil, &proxyA2AError{
 			Status:   http.StatusServiceUnavailable,
 			Response: gin.H{"error": "workspace agent unreachable — container restart triggered", "restarting": true},
@@ -71,35 +75,30 @@ func (h *WorkspaceHandler) handleA2ADispatchError(ctx context.Context, workspace
 	// with 202 status here was the original cycle 53 bug — callers saw
 	// proxyErr != nil and logged "delegation failed: proxy a2a error".
 	if isUpstreamBusyError(err) {
-		// Capability primitive #5 — see project memory
-		// `project_runtime_native_pluggable.md`. When the target workspace's
-		// adapter has declared provides_native_session=True, the SDK
-		// owns its own queue/session state (claude-agent-sdk's streaming
-		// session, hermes-agent's in-container event log, etc.). Adding
-		// the platform's a2a_queue layer on top would double-buffer the
-		// same in-flight state — and worse, the platform queue's drain
-		// timing has no relationship to the SDK's actual readiness, so
-		// the queued request might dispatch while the SDK is STILL busy.
+		// #1684 / Reno Stars: native_session adapters previously took a
+		// 503-no-enqueue path here, on the assumption that the SDK owned
+		// an inbound queue and the platform a2a_queue would double-buffer.
+		// In practice, the common native_session SDKs (claude-agent-sdk,
+		// codex app-server, hermes-agent) do NOT have an inbound queue —
+		// new turns can only be pushed via the same HTTP POST that just
+		// returned busy. So cron fires (and any A2A retry) bounce 503
+		// every tick until the SDK voluntarily yields. Reno Stars #1684
+		// observed 12 consecutive `*/30` cron fires lost over 6h while a
+		// single native_session held the slot.
 		//
-		// For native_session targets, return 503 + Retry-After directly.
-		// The caller's adapter handles retry on its own schedule, and
-		// the SDK's own queue absorbs the in-flight request when it does.
-		// Observability is preserved: logA2AFailure already ran above;
-		// activity_logs records the busy event; the broadcaster fires.
-		if runtimeOverrides.HasCapability(workspaceID, "session") {
-			log.Printf("ProxyA2A: target %s busy and declares native_session — skip enqueue, return 503", workspaceID)
-			return 0, nil, &proxyA2AError{
-				Status:  http.StatusServiceUnavailable,
-				Headers: map[string]string{"Retry-After": strconv.Itoa(busyRetryAfterSeconds)},
-				Response: gin.H{
-					"error":          "workspace agent busy — adapter handles retry (native_session)",
-					"busy":           true,
-					"retry_after":    busyRetryAfterSeconds,
-					"native_session": true,
-				},
-			}
-		}
-
+		// The original concern — "drain timing has no relationship to SDK
+		// readiness" — turns out to be unfounded: heartbeat→drain is
+		// gated by `payload.ActiveTasks < maxConcurrent` in
+		// registry.go:Heartbeat, so drain only fires when the workspace
+		// itself reports spare capacity. That IS the session-ended
+		// signal. The native_session SDK reports ActiveTasks=1 while in a
+		// turn, ActiveTasks=0 when idle, and the next heartbeat after
+		// idle triggers DrainQueueForWorkspace.
+		//
+		// So we collapse the two branches: both native_session and
+		// non-native callers enqueue here. The native_session SDK's own
+		// in-flight POST stays unaffected; the queued item drains on the
+		// next post-idle heartbeat.
 		idempotencyKey := extractIdempotencyKey(body)
 		// Honor params.expires_in_seconds when the caller specifies one. Zero
 		// (the unset default) → expiresAt = nil → infinite TTL preserved by
@@ -113,6 +112,9 @@ func (h *WorkspaceHandler) handleA2ADispatchError(ctx context.Context, workspace
 			ctx, workspaceID, callerID, PriorityTask, body, a2aMethod, idempotencyKey, expiresAt,
 		); qerr == nil {
 			log.Printf("ProxyA2A: target %s busy — enqueued as %s (depth=%d)", workspaceID, qid, depth)
+			if logActivity {
+				h.logA2ABusyQueued(ctx, workspaceID, callerID, body, a2aMethod, durationMs)
+			}
 			respBody, _ := json.Marshal(gin.H{
 				"queued":      true,
 				"queue_id":    qid,
@@ -126,6 +128,9 @@ func (h *WorkspaceHandler) handleA2ADispatchError(ctx context.Context, workspace
 			// make delegation silently disappear.
 			log.Printf("ProxyA2A: enqueue for %s failed (%v) — falling back to 503", workspaceID, qerr)
 		}
+		if logActivity {
+			h.logA2AFailure(ctx, workspaceID, callerID, body, a2aMethod, err, durationMs)
+		}
 		return 0, nil, &proxyA2AError{
 			Status:  http.StatusServiceUnavailable,
 			Headers: map[string]string{"Retry-After": strconv.Itoa(busyRetryAfterSeconds)},
@@ -135,6 +140,9 @@ func (h *WorkspaceHandler) handleA2ADispatchError(ctx context.Context, workspace
 				"retry_after": busyRetryAfterSeconds,
 			},
 		}
+	}
+	if logActivity {
+		h.logA2AFailure(ctx, workspaceID, callerID, body, a2aMethod, err, durationMs)
 	}
 	return 0, nil, &proxyA2AError{
 		Status:   http.StatusBadGateway,
@@ -161,11 +169,26 @@ func (h *WorkspaceHandler) handleA2ADispatchError(ctx context.Context, workspace
 // canvas-chat-to-dead-workspace incident traces to exactly this gap.
 func (h *WorkspaceHandler) maybeMarkContainerDead(ctx context.Context, workspaceID string) bool {
 	var wsRuntime string
-	db.DB.QueryRowContext(ctx, `SELECT COALESCE(runtime, 'langgraph') FROM workspaces WHERE id = $1`, workspaceID).Scan(&wsRuntime)
+	db.DB.QueryRowContext(ctx, `SELECT COALESCE(runtime, 'claude-code') FROM workspaces WHERE id = $1`, workspaceID).Scan(&wsRuntime)
 	if isExternalLikeRuntime(wsRuntime) {
 		return false
 	}
 	if !h.HasProvisioner() {
+		return false
+	}
+	// Restart-aware short-circuit: during the 20-30s EC2-pending window of
+	// an in-flight restart, the workspace's url='' and IsRunning() returns
+	// false → looks indistinguishable from a dead container. Pre-fix this
+	// fired a fresh RestartByID for the just-launched instance, which
+	// coalesceRestart's pending-flag drained by running ANOTHER full
+	// stop+provision cycle (= ec2_stopped of the still-pending instance
+	// → re-provision). That's the 4x reprov thrash class. Skip the
+	// container-dead path while a restart is in flight; the in-flight
+	// restart's own provisionWorkspaceAutoSync will surface a real failure
+	// (markProvisionFailed) if the new container never comes up. Issue
+	// internal#544.
+	if isRestarting(workspaceID) {
+		log.Printf("ProxyA2A: maybeMarkContainerDead skipped for %s — restart already in flight (self-fire guard)", workspaceID)
 		return false
 	}
 
@@ -223,6 +246,18 @@ func (h *WorkspaceHandler) maybeMarkContainerDead(ctx context.Context, workspace
 // shape post-EC2-replace (see molecule-controlplane#20 incident
 // 2026-05-07) where the reconciler hasn't respawned the agent yet.
 func (h *WorkspaceHandler) preflightContainerHealth(ctx context.Context, workspaceID string) *proxyA2AError {
+	// Restart-aware short-circuit (mirror of maybeMarkContainerDead): if a
+	// restart cycle is in flight for this workspace, do not run the
+	// IsRunning probe — it would observe the EC2-pending state as "not
+	// running" and trigger RestartByID for an already-restarting workspace,
+	// closing the self-fire loop. Returning nil lets the optimistic
+	// forward proceed; the upstream Do() call will fail with a connection
+	// error or 502, and the *post-restart* reactive path can decide what
+	// to do once the cycle has actually completed. Issue internal#544.
+	if isRestarting(workspaceID) {
+		log.Printf("ProxyA2A preflight: %s — skipped, restart already in flight (self-fire guard)", workspaceID)
+		return nil
+	}
 	running, err := h.provisioner.IsRunning(ctx, workspaceID)
 	if err != nil {
 		// Transient daemon error. Provisioner.IsRunning returns (true, err)
@@ -285,6 +320,33 @@ func (h *WorkspaceHandler) logA2AFailure(ctx context.Context, workspaceID, calle
 			DurationMs:   &durationMs,
 			Status:       "error",
 			ErrorDetail:  &errMsg,
+		})
+	})
+}
+
+// logA2ABusyQueued records that a push attempt reached a live but busy
+// workspace and was durably queued for heartbeat drain.
+func (h *WorkspaceHandler) logA2ABusyQueued(ctx context.Context, workspaceID, callerID string, body []byte, a2aMethod string, durationMs int) {
+	var wsName string
+	db.DB.QueryRowContext(ctx, `SELECT name FROM workspaces WHERE id = $1`, workspaceID).Scan(&wsName)
+	if wsName == "" {
+		wsName = workspaceID
+	}
+	summary := a2aMethod + " → " + wsName + " (queued: target busy)"
+	parent := ctx
+	h.goAsync(func() {
+		logCtx, cancel := context.WithTimeout(context.WithoutCancel(parent), 30*time.Second)
+		defer cancel()
+		LogActivity(logCtx, h.broadcaster, ActivityParams{
+			WorkspaceID:  workspaceID,
+			ActivityType: "a2a_receive",
+			SourceID:     nilIfEmpty(callerID),
+			TargetID:     &workspaceID,
+			Method:       &a2aMethod,
+			Summary:      &summary,
+			RequestBody:  json.RawMessage(body),
+			DurationMs:   &durationMs,
+			Status:       "ok",
 		})
 	})
 }
@@ -361,31 +423,53 @@ func nilIfEmpty(s string) *string {
 // (their next /registry/register will mint their first token, after
 // which this branch never fires again for them).
 //
+// Post-RFC#637 addition: when the tokenless workspace is accompanied by
+// canvas or admin auth (same-origin request, admin bearer, or org-level
+// token), the caller is identified as a canvas-user identity rather than
+// a legacy peer agent. The returned isCanvasUser flag lets the A2A proxy
+// bypass CanCommunicate for human users, who sit outside the workspace
+// hierarchy.
+//
 // On auth failure this writes the 401 via c and returns an error so the
 // handler aborts without running the proxy.
-func validateCallerToken(ctx context.Context, c *gin.Context, callerID string) error {
-	hasLive, err := wsauth.HasAnyLiveToken(ctx, db.DB, callerID)
-	if err != nil {
+func validateCallerToken(ctx context.Context, c *gin.Context, callerID string) (isCanvasUser bool, err error) {
+	hasLive, dbErr := wsauth.HasAnyLiveToken(ctx, db.DB, callerID)
+	if dbErr != nil {
 		// Fail-open here matches the heartbeat path — A2A caller auth is
 		// defense-in-depth on top of access-control hierarchy, not the
 		// sole gate on the secret material. A DB hiccup shouldn't take
 		// the whole A2A path down.
-		log.Printf("wsauth: caller HasAnyLiveToken(%s) failed: %v — allowing A2A", callerID, err)
-		return nil
+		log.Printf("wsauth: caller HasAnyLiveToken(%s) failed: %v — allowing A2A", callerID, dbErr)
+		return false, nil
 	}
 	if !hasLive {
-		return nil // legacy / pre-upgrade caller
+		// Tokenless workspace — could be legacy/pre-upgrade caller or
+		// canvas-user identity. Distinguish by request auth signals.
+		if middleware.IsSameOriginCanvas(c) {
+			return true, nil
+		}
+		tok := wsauth.BearerTokenFromHeader(c.GetHeader("Authorization"))
+		if tok != "" {
+			adminSecret := os.Getenv("ADMIN_TOKEN")
+			if adminSecret != "" && subtle.ConstantTimeCompare([]byte(tok), []byte(adminSecret)) == 1 {
+				return true, nil
+			}
+			if _, _, _, err := orgtoken.Validate(ctx, db.DB, tok); err == nil {
+				return true, nil
+			}
+		}
+		return false, nil // legacy / pre-upgrade caller
 	}
 	tok := wsauth.BearerTokenFromHeader(c.GetHeader("Authorization"))
 	if tok == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing caller auth token"})
-		return errInvalidCallerToken
+		return false, errInvalidCallerToken
 	}
 	if err := wsauth.ValidateToken(ctx, db.DB, callerID, tok); err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid caller auth token"})
-		return err
+		return false, err
 	}
-	return nil
+	return false, nil
 }
 
 // errInvalidCallerToken is a sentinel for validateCallerToken's "missing

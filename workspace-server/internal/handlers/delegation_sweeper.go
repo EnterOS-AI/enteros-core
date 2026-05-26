@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 )
 
 // delegation_sweeper.go — RFC #2829 PR-3: stuck-task sweeper.

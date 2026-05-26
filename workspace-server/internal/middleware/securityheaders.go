@@ -23,7 +23,7 @@ var apiPrefixes = []string{
 	"/settings",
 	"/bundles",
 	"/org",
-	"/orgs",   // #610 — per-org plugin allowlist routes
+	"/orgs", // #610 — per-org plugin allowlist routes
 	"/templates",
 	"/plugins",
 	"/webhooks",
@@ -95,6 +95,7 @@ func SecurityHeaders() gin.HandlerFunc {
 					"script-src 'self' 'unsafe-inline'; "+
 					"style-src 'self' 'unsafe-inline'; "+
 					"img-src 'self' data: blob:; "+
+					"frame-src 'self' blob:; "+
 					"connect-src 'self' ws: wss:; "+
 					"font-src 'self' data:")
 		}

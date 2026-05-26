@@ -46,7 +46,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 )
 
 // integrationDB is imported from delegation_ledger_integration_test.go.

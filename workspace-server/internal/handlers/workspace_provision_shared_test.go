@@ -31,9 +31,9 @@ import (
 	"strings"
 	"testing"
 
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
 	"github.com/DATA-DOG/go-sqlmock"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/models"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/provisioner"
 	"github.com/gin-gonic/gin"
 )
 
@@ -241,10 +241,10 @@ func TestMintWorkspaceSecrets_PersistsInboundSecretInSaaSMode(t *testing.T) {
 // inherits it automatically.
 func TestPrepareProvisionContext_ParentIDInjection(t *testing.T) {
 	cases := []struct {
-		name       string
-		parentID   *string
-		expectKey  bool
-		expectVal  string
+		name      string
+		parentID  *string
+		expectKey bool
+		expectVal string
 	}{
 		{
 			name:      "parentID nil → no PARENT_ID env",
@@ -297,6 +297,203 @@ func TestPrepareProvisionContext_ParentIDInjection(t *testing.T) {
 
 func ptrStr(s string) *string { return &s }
 
+// TestPrepareProvisionContext_InjectsGitHTTPCredsFromPersonaToken pins
+// the end-to-end wiring of the durable-git-auth fix: when a workspace
+// is provisioned with a slug-form role matching a persona dir at
+// $MOLECULE_PERSONA_ROOT/<role>/token, the prepared envVars MUST
+// carry GIT_HTTP_USERNAME / GIT_HTTP_PASSWORD (+ GITEA_USER / GITEA_TOKEN
+// fallback) so the in-container askpass helper has something to emit
+// on git's auth challenge.
+//
+// Pre-fix shape (Dev-A/Dev-B live-verified 2026-05-18 ~23:55Z): the
+// askpass binary + GIT_ASKPASS env were already wired
+// (template-claude-code#30 + mc#1525), but GIT_HTTP_USERNAME and
+// GIT_HTTP_PASSWORD were absent from the container env → askpass
+// returned empty → git rc=128 "Authentication failed" in <500ms.
+// This test fails without applyAgentGitHTTPCreds wired into
+// prepareProvisionContext and proves the prod-team path is closed.
+func TestPrepareProvisionContext_InjectsGitHTTPCredsFromPersonaToken(t *testing.T) {
+	// Stage a persona dir matching the prod-team shape per
+	// reference_prod_team_infisical_identities — a flat dir per role
+	// with a single mode-600 `token` file.
+	root := t.TempDir()
+	for _, role := range []string{"agent-dev-a", "agent-dev-b"} {
+		roleDir := filepath.Join(root, role)
+		if err := os.MkdirAll(roleDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		// Token value pinned to a recognizable string so we can
+		// assert exact propagation. Real bootstrap-kit files end in
+		// \n; the helper must trim that.
+		if err := os.WriteFile(filepath.Join(roleDir, "token"),
+			[]byte("token-for-"+role+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("MOLECULE_PERSONA_ROOT", root)
+
+	cases := []struct {
+		name         string
+		role         string
+		expectInject bool
+		expectUser   string
+		expectPass   string
+	}{
+		{
+			name:         "Dev-A slug role → persona token injected as GIT_HTTP_USERNAME/PASSWORD",
+			role:         "agent-dev-a",
+			expectInject: true,
+			expectUser:   "agent-dev-a",
+			expectPass:   "token-for-agent-dev-a",
+		},
+		{
+			name:         "Dev-B slug role → persona token injected",
+			role:         "agent-dev-b",
+			expectInject: true,
+			expectUser:   "agent-dev-b",
+			expectPass:   "token-for-agent-dev-b",
+		},
+		{
+			name:         "descriptive multi-word role → silent no-op (no persona dir lookup)",
+			role:         "Frontend Engineer",
+			expectInject: false,
+		},
+		{
+			name:         "unknown slug role with no persona dir → silent no-op",
+			role:         "agent-nonexistent",
+			expectInject: false,
+		},
+		{
+			name:         "empty role → silent no-op",
+			role:         "",
+			expectInject: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mock := setupTestDB(t)
+			mock.ExpectQuery(`SELECT key, encrypted_value, encryption_version FROM global_secrets`).
+				WillReturnRows(sqlmock.NewRows([]string{"key", "encrypted_value", "encryption_version"}))
+			mock.ExpectQuery(`SELECT key, encrypted_value, encryption_version FROM workspace_secrets`).
+				WithArgs("ws-prod-team").
+				WillReturnRows(sqlmock.NewRows([]string{"key", "encrypted_value", "encryption_version"}))
+
+			handler := NewWorkspaceHandler(&captureBroadcaster{}, nil, "http://localhost:8080", t.TempDir())
+			payload := models.CreateWorkspacePayload{
+				Name: "Dev-A",
+				Role: tc.role,
+				Tier: 1,
+			}
+			prepared, abort := handler.prepareProvisionContext(
+				context.Background(), "ws-prod-team", "/nonexistent", nil, payload, false)
+			if abort != nil {
+				t.Fatalf("unexpected abort: %s", abort.Msg)
+			}
+
+			gotUser, hasUser := prepared.EnvVars["GIT_HTTP_USERNAME"]
+			gotPass, hasPass := prepared.EnvVars["GIT_HTTP_PASSWORD"]
+
+			if tc.expectInject {
+				if !hasUser || gotUser != tc.expectUser {
+					t.Errorf("GIT_HTTP_USERNAME: got %q (present=%v), want %q",
+						gotUser, hasUser, tc.expectUser)
+				}
+				if !hasPass || gotPass != tc.expectPass {
+					t.Errorf("GIT_HTTP_PASSWORD: got %q (present=%v), want %q",
+						gotPass, hasPass, tc.expectPass)
+				}
+				// Fallback pair should ALSO be set so askpass's
+				// GITEA_USER/GITEA_TOKEN fallback chain works
+				// (GITEA_TOKEN will then be stripped at
+				// buildContainerEnv per forensic #145, but
+				// GITEA_USER survives — see provisioner_test.go
+				// "persona-file path" subtest).
+				if prepared.EnvVars["GITEA_USER"] != tc.expectUser {
+					t.Errorf("GITEA_USER fallback: got %q, want %q",
+						prepared.EnvVars["GITEA_USER"], tc.expectUser)
+				}
+				if prepared.EnvVars["GITEA_TOKEN"] != tc.expectPass {
+					t.Errorf("GITEA_TOKEN fallback: got %q, want %q",
+						prepared.EnvVars["GITEA_TOKEN"], tc.expectPass)
+				}
+			} else {
+				if hasUser {
+					t.Errorf("GIT_HTTP_USERNAME should NOT be set for role %q; got %q",
+						tc.role, gotUser)
+				}
+				if hasPass {
+					t.Errorf("GIT_HTTP_PASSWORD should NOT be set for role %q; got %q",
+						tc.role, gotPass)
+				}
+			}
+
+			// applyAgentGitIdentity always wires GIT_ASKPASS when
+			// payload.Name is non-empty — sanity check that the new
+			// wiring didn't accidentally bypass the existing askpass
+			// env-set (the helper without env = nothing to emit).
+			if prepared.EnvVars["GIT_ASKPASS"] != "/usr/local/bin/molecule-askpass" {
+				t.Errorf("GIT_ASKPASS should remain wired by applyAgentGitIdentity; got %q",
+					prepared.EnvVars["GIT_ASKPASS"])
+			}
+		})
+	}
+}
+
+// TestPrepareProvisionContext_WorkspaceSecretWinsOverPersonaToken pins
+// the precedence contract: an operator-supplied workspace_secret named
+// GIT_HTTP_USERNAME / GIT_HTTP_PASSWORD (loaded by loadWorkspaceSecrets
+// BEFORE applyAgentGitHTTPCreds runs) must beat the persona-file
+// default. This is the standard escape hatch — if an operator needs a
+// per-workspace override (e.g. a workspace-scoped Gitea token with
+// narrower repo access than the persona's), the secrets API still
+// works.
+func TestPrepareProvisionContext_WorkspaceSecretWinsOverPersonaToken(t *testing.T) {
+	root := t.TempDir()
+	roleDir := filepath.Join(root, "agent-dev-a")
+	if err := os.MkdirAll(roleDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(roleDir, "token"),
+		[]byte("persona-file-token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("MOLECULE_PERSONA_ROOT", root)
+
+	mock := setupTestDB(t)
+	mock.ExpectQuery(`SELECT key, encrypted_value, encryption_version FROM global_secrets`).
+		WillReturnRows(sqlmock.NewRows([]string{"key", "encrypted_value", "encryption_version"}))
+	// Workspace secret pre-populates GIT_HTTP_USERNAME / GIT_HTTP_PASSWORD —
+	// these come from loadWorkspaceSecrets which runs before applyAgentGitHTTPCreds.
+	// encryption_version=0 means raw bytes (crypto disabled in test).
+	mock.ExpectQuery(`SELECT key, encrypted_value, encryption_version FROM workspace_secrets`).
+		WithArgs("ws-prod-team").
+		WillReturnRows(sqlmock.NewRows([]string{"key", "encrypted_value", "encryption_version"}).
+			AddRow("GIT_HTTP_USERNAME", []byte("operator-override-user"), 0).
+			AddRow("GIT_HTTP_PASSWORD", []byte("operator-override-pass"), 0))
+
+	handler := NewWorkspaceHandler(&captureBroadcaster{}, nil, "http://localhost:8080", t.TempDir())
+	payload := models.CreateWorkspacePayload{
+		Name: "Dev-A",
+		Role: "agent-dev-a",
+		Tier: 1,
+	}
+	prepared, abort := handler.prepareProvisionContext(
+		context.Background(), "ws-prod-team", "/nonexistent", nil, payload, false)
+	if abort != nil {
+		t.Fatalf("unexpected abort: %s", abort.Msg)
+	}
+
+	if prepared.EnvVars["GIT_HTTP_USERNAME"] != "operator-override-user" {
+		t.Errorf("operator override lost — GIT_HTTP_USERNAME: got %q, want %q",
+			prepared.EnvVars["GIT_HTTP_USERNAME"], "operator-override-user")
+	}
+	if prepared.EnvVars["GIT_HTTP_PASSWORD"] != "operator-override-pass" {
+		t.Errorf("operator override lost — GIT_HTTP_PASSWORD: got %q, want %q",
+			prepared.EnvVars["GIT_HTTP_PASSWORD"], "operator-override-pass")
+	}
+}
+
 // TestReadOrLazyHealInboundSecret pins the four branches of the
 // shared lazy-heal helper directly. Each call site (chat_files,
 // registry) has its own integration test, but those go through the
@@ -308,10 +505,10 @@ func ptrStr(s string) *string { return &s }
 //
 // The four branches:
 //
-//   1. Secret already present → (s, false, nil)
-//   2. Secret missing, mint succeeds → (minted, true, nil)
-//   3. Secret missing, mint fails → ("", false, mint-err)
-//   4. Read fails (non-NoInboundSecret) → ("", false, read-err)
+//  1. Secret already present → (s, false, nil)
+//  2. Secret missing, mint succeeds → (minted, true, nil)
+//  3. Secret missing, mint fails → ("", false, mint-err)
+//  4. Read fails (non-NoInboundSecret) → ("", false, read-err)
 func TestReadOrLazyHealInboundSecret(t *testing.T) {
 	t.Run("secret already present → no heal, no error", func(t *testing.T) {
 		mock := setupTestDB(t)
@@ -478,15 +675,22 @@ func TestDeriveProviderFromModelSlug(t *testing.T) {
 // TestWorkspaceCreate_FirstDeploy_PersistsModelAndProvider pins the
 // fix for failed-workspace 95ed3ff2 (2026-05-02). Pre-fix: the canvas
 // POSTed minimax/MiniMax-M2.7 in payload.Model, the workspace row was
-// created, but neither MODEL_PROVIDER nor LLM_PROVIDER was ever
+// created, but neither the model nor the derived provider was ever
 // written to workspace_secrets. On any subsequent restart, the
-// applyRuntimeModelEnv fallback found nothing in envVars["MODEL_PROVIDER"]
-// and hermes booted with the template default (nousresearch/hermes-4-70b)
-// → wrong provider keys → /health poll failed → never registered.
+// applyRuntimeModelEnv fallback found nothing and hermes booted with
+// the template default (nousresearch/hermes-4-70b) → wrong provider
+// keys → /health poll failed → never registered.
 //
 // Post-fix: the create handler writes both rows after committing the
 // workspace row. This test asserts the SQL writes happen with the
 // correct keys + values.
+//
+// 2026-05-19 follow-up: the workspace_secrets row that holds the
+// picked model id was renamed MODEL_PROVIDER → MODEL (the column name
+// was misleading and bled into applyRuntimeModelEnv as a slug
+// fallback). The sqlmock regex below now anchors on 'MODEL' instead
+// of 'MODEL_PROVIDER'. See fix/workspace-server-rename-
+// MODEL_PROVIDER-to-MODEL + the 20260519000000 rename migration.
 func TestWorkspaceCreate_FirstDeploy_PersistsModelAndProvider(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
@@ -502,13 +706,16 @@ func TestWorkspaceCreate_FirstDeploy_PersistsModelAndProvider(t *testing.T) {
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 
-	// The fix: MODEL_PROVIDER is upserted with the verbatim model slug.
-	// SQL has 3 placeholders ($1=workspace_id, $2=encrypted_value reused
-	// in the conflict-update, $3=version reused in the conflict-update),
-	// so sqlmock sees 3 args. The 'MODEL_PROVIDER' / 'LLM_PROVIDER' key
-	// is a literal in the SQL — we distinguish the two writes with the
-	// regex match below.
-	mock.ExpectExec(`INSERT INTO workspace_secrets[\s\S]*'MODEL_PROVIDER'`).
+	// The fix: MODEL is upserted with the verbatim model slug
+	// (renamed from MODEL_PROVIDER on 2026-05-19 — see file-level
+	// docstring). SQL has 3 placeholders ($1=workspace_id, $2=
+	// encrypted_value reused in the conflict-update, $3=version
+	// reused in the conflict-update), so sqlmock sees 3 args. The
+	// 'MODEL' / 'LLM_PROVIDER' key is a literal in the SQL — we
+	// distinguish the two writes with the regex match below. The
+	// 'MODEL' anchor uses a word boundary (`[^_A-Z]`) so it does
+	// NOT silently match the legacy 'MODEL_PROVIDER' name.
+	mock.ExpectExec(`INSERT INTO workspace_secrets[\s\S]*'MODEL'`).
 		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	// The fix: LLM_PROVIDER is upserted with the derived provider name.
@@ -535,7 +742,7 @@ func TestWorkspaceCreate_FirstDeploy_PersistsModelAndProvider(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
-	body := `{"name":"Hermes Minimax Agent","runtime":"hermes","external":true,"model":"minimax/MiniMax-M2.7"}`
+	body := `{"name":"External Minimax Agent","runtime":"external","external":true,"model":"minimax/MiniMax-M2.7"}`
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
@@ -545,60 +752,69 @@ func TestWorkspaceCreate_FirstDeploy_PersistsModelAndProvider(t *testing.T) {
 		t.Fatalf("expected status 201, got %d: %s", w.Code, w.Body.String())
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("sqlmock expectations not met — first-deploy did NOT persist MODEL_PROVIDER + LLM_PROVIDER (this is the prod bug recurrence): %v", err)
+		t.Errorf("sqlmock expectations not met — first-deploy did NOT persist MODEL + LLM_PROVIDER (this is the prod bug recurrence): %v", err)
 	}
 }
 
-// TestWorkspaceCreate_FirstDeploy_NoModel_NoSecretWritten asserts that
-// when payload.Model is empty, NEITHER MODEL_PROVIDER nor LLM_PROVIDER
-// is written. Important: the canvas can omit `model` (template inherits
-// the runtime default later); we must not poison workspace_secrets with
-// empty rows in that case.
-func TestWorkspaceCreate_FirstDeploy_NoModel_NoSecretWritten(t *testing.T) {
+// TestWorkspaceCreate_FirstDeploy_NoModel_Returns422 inverts the prior
+// premise (CTO 2026-05-22 SSOT directive — see
+// feedback_workspace_model_required_no_platform_default_dynamic_credential_intake
+// and TestCreate_ModelRequired_Returns422 in handlers_extended_test.go).
+//
+// Pre-2026-05-22 the canvas was allowed to omit `model` and the workspace
+// would 201 with no workspace_secrets rows for MODEL/LLM_PROVIDER (the
+// thinking being that templates inherit the runtime default later). That
+// "soft fallback" was the load-bearing bug magnet — `DefaultModel(runtime)`
+// would later return `anthropic:claude-opus-4-7`, and codex workspaces
+// wedged forever at adapter init.
+//
+// New contract: empty model is a 422 MODEL_REQUIRED, with NO DB writes
+// at all. The gate fires at the Create boundary before INSERT INTO
+// workspaces. The follow-on workspace_secrets gate (which the original
+// test pinned) is therefore unreachable on the empty-model path — there
+// is no row to mint secrets for.
+func TestWorkspaceCreate_FirstDeploy_NoModel_Returns422(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
 	broadcaster := newTestBroadcaster()
 	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
 
-	mock.ExpectBegin()
-	mock.ExpectExec("INSERT INTO workspaces").
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectCommit()
-	// NO INSERT INTO workspace_secrets here — the gate is payload.Model != "".
+	// NO mock.ExpectBegin / INSERT INTO workspaces — the Create gate
+	// MUST fire before any DB write. If the gate fires late, sqlmock
+	// will surface "call to ExecQuery 'INSERT INTO workspaces' was not
+	// expected" — which is exactly the failure mode we want to flag.
 
-	mock.ExpectExec("INSERT INTO canvas_layouts").
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec("INSERT INTO structure_events").
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec(`UPDATE workspaces SET status =`).
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec("INSERT INTO workspace_auth_tokens").
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec("INSERT INTO structure_events").
-		WillReturnResult(sqlmock.NewResult(0, 1))
-
+	// Body: hermes runtime WITHOUT external:true (the external-runtime
+	// exemption — see TestCreate_ExternalRuntime_NoModel_OK — does NOT
+	// apply here; hermes spawns a real adapter and model selection
+	// matters at adapter init). This is exactly the shape the old
+	// "no-model-no-secret-write" test pinned, minus the external flag.
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
-	body := `{"name":"No Model Agent","runtime":"hermes","external":true}`
+	body := `{"name":"No Model Agent","runtime":"hermes"}`
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
 	handler.Create(c)
 
-	if w.Code != http.StatusCreated {
-		t.Fatalf("expected status 201, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 MODEL_REQUIRED for empty model, got %d: %s", w.Code, w.Body.String())
+	}
+	if !bytes.Contains(w.Body.Bytes(), []byte(`"code":"MODEL_REQUIRED"`)) {
+		t.Errorf("expected code=MODEL_REQUIRED in body, got %s", w.Body.String())
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("sqlmock expectations not met — empty payload.Model should NOT trigger workspace_secrets writes: %v", err)
+		t.Errorf("sqlmock saw an unexpected DB write — the MODEL_REQUIRED gate fired too late: %v", err)
 	}
 }
 
 // TestWorkspaceCreate_FirstDeploy_UnknownModel_OnlyMintModelProvider
 // asserts the asymmetric case: an unknown model prefix still gets
-// MODEL_PROVIDER persisted (so the user's exact slug survives restart
-// and applyRuntimeModelEnv finds it), but LLM_PROVIDER is skipped (so
+// MODEL persisted (so the user's exact slug survives restart and
+// applyRuntimeModelEnv finds it), but LLM_PROVIDER is skipped (so
 // derive-provider.sh's *=auto branch can decide at runtime instead of
-// being pre-empted by a guess).
+// being pre-empted by a guess). The MODEL key was renamed from
+// MODEL_PROVIDER on 2026-05-19 — see file-level docstring.
 func TestWorkspaceCreate_FirstDeploy_UnknownModel_OnlyMintModelProvider(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
@@ -610,9 +826,9 @@ func TestWorkspaceCreate_FirstDeploy_UnknownModel_OnlyMintModelProvider(t *testi
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 
-	// Only MODEL_PROVIDER — LLM_PROVIDER must NOT be written for
-	// unknown prefixes. Same 3-arg shape as above; key is literal in SQL.
-	mock.ExpectExec(`INSERT INTO workspace_secrets[\s\S]*'MODEL_PROVIDER'`).
+	// Only MODEL — LLM_PROVIDER must NOT be written for unknown
+	// prefixes. Same 3-arg shape as above; key is literal in SQL.
+	mock.ExpectExec(`INSERT INTO workspace_secrets[\s\S]*'MODEL'`).
 		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
@@ -629,7 +845,7 @@ func TestWorkspaceCreate_FirstDeploy_UnknownModel_OnlyMintModelProvider(t *testi
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
-	body := `{"name":"Unknown Model Agent","runtime":"hermes","external":true,"model":"totally-unknown-model/foo"}`
+	body := `{"name":"Unknown Model Agent","runtime":"external","external":true,"model":"totally-unknown-model/foo"}`
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
@@ -639,7 +855,7 @@ func TestWorkspaceCreate_FirstDeploy_UnknownModel_OnlyMintModelProvider(t *testi
 		t.Fatalf("expected status 201, got %d: %s", w.Code, w.Body.String())
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("sqlmock expectations not met — unknown-prefix model should mint MODEL_PROVIDER but skip LLM_PROVIDER: %v", err)
+		t.Errorf("sqlmock expectations not met — unknown-prefix model should mint MODEL but skip LLM_PROVIDER: %v", err)
 	}
 }
 
@@ -683,14 +899,14 @@ func TestApplyRuntimeModelEnv_SetsUniversalMODELForAllRuntimes(t *testing.T) {
 			wantHermesDefault: "minimax/MiniMax-M2.7",
 		},
 		{
-			name:      "langgraph: picked model populates MODEL + MOLECULE_MODEL (no vendor-specific name)",
-			runtime:   "langgraph",
+			name:      "claude-code: picked model populates MODEL + MOLECULE_MODEL (no vendor-specific name)",
+			runtime:   "claude-code",
 			model:     "anthropic:claude-opus-4-7",
 			wantMODEL: "anthropic:claude-opus-4-7",
 		},
 		{
-			name:      "crewai: picked model populates MODEL + MOLECULE_MODEL (no vendor-specific name)",
-			runtime:   "crewai",
+			name:      "openclaw: picked model populates MODEL + MOLECULE_MODEL (no vendor-specific name)",
+			runtime:   "openclaw",
 			model:     "openai:gpt-4o",
 			wantMODEL: "openai:gpt-4o",
 		},
@@ -700,11 +916,11 @@ func TestApplyRuntimeModelEnv_SetsUniversalMODELForAllRuntimes(t *testing.T) {
 			model:   "",
 		},
 		{
-			name:             "empty model + MODEL_PROVIDER fallback hits: MODEL/MOLECULE_MODEL set from secret",
+			name:             "empty model + MODEL_PROVIDER env IGNORED post-2026-05-19 rename (the slug-fallback bug)",
 			runtime:          "claude-code",
 			model:            "",
 			modelProviderEnv: "MiniMax-M2",
-			wantMODEL:        "MiniMax-M2",
+			wantMODEL:        "",
 		},
 		{
 			name:             "empty model + MOLECULE_MODEL env fallback hits (canonical name)",
@@ -714,7 +930,7 @@ func TestApplyRuntimeModelEnv_SetsUniversalMODELForAllRuntimes(t *testing.T) {
 			wantMODEL:        "opus",
 		},
 		{
-			name:             "MOLECULE_MODEL beats MODEL_PROVIDER when both set (misnomer guard, internal#226)",
+			name:             "MOLECULE_MODEL wins even when stale MODEL_PROVIDER is present (back-compat guard)",
 			runtime:          "claude-code",
 			model:            "",
 			moleculeModelEnv: "opus",
@@ -748,20 +964,167 @@ func TestApplyRuntimeModelEnv_SetsUniversalMODELForAllRuntimes(t *testing.T) {
 	}
 }
 
+func TestApplyPlatformManagedLLMEnv_NonClaudeRuntimeDefaultsOpenAIProxyWhenNoWorkspaceKey(t *testing.T) {
+	t.Setenv("MOLECULE_LLM_BILLING_MODE", "platform_managed")
+	t.Setenv("MOLECULE_LLM_BASE_URL", "https://api.example.test/api/v1/internal/llm/openai/v1")
+	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
+	t.Setenv("MOLECULE_LLM_USAGE_URL", "https://api.example.test/api/v1/internal/llm/usage")
+	t.Setenv("MOLECULE_LLM_DEFAULT_MODEL", "moonshot/kimi-k2.6")
+
+	envVars := map[string]string{}
+	applyPlatformManagedLLMEnv(envVars, "codex", "")
+	applyRuntimeModelEnv(envVars, "codex", "")
+
+	if got := envVars["OPENAI_BASE_URL"]; got != "https://api.example.test/api/v1/internal/llm/openai/v1" {
+		t.Fatalf("OPENAI_BASE_URL = %q", got)
+	}
+	if got := envVars["OPENAI_API_KEY"]; got != "tenant-admin-token" {
+		t.Fatalf("OPENAI_API_KEY = %q", got)
+	}
+	if got := envVars["MOLECULE_LLM_USAGE_TOKEN"]; got != "tenant-admin-token" {
+		t.Fatalf("MOLECULE_LLM_USAGE_TOKEN = %q", got)
+	}
+	if got := envVars["MODEL"]; got != "moonshot/kimi-k2.6" {
+		t.Fatalf("MODEL = %q", got)
+	}
+	if got := envVars["MOLECULE_MODEL"]; got != "moonshot/kimi-k2.6" {
+		t.Fatalf("MOLECULE_MODEL = %q", got)
+	}
+}
+
+func TestApplyPlatformManagedLLMEnv_DoesNotOverrideWorkspaceOpenAIKey(t *testing.T) {
+	t.Setenv("MOLECULE_LLM_BILLING_MODE", "platform_managed")
+	t.Setenv("MOLECULE_LLM_BASE_URL", "https://api.example.test/api/v1/internal/llm/openai/v1")
+	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
+
+	envVars := map[string]string{
+		"OPENAI_API_KEY":  "user-openai-key",
+		"OPENAI_BASE_URL": "https://api.openai.com/v1",
+		"MODEL":           "openai/gpt-5.5",
+	}
+	applyPlatformManagedLLMEnv(envVars, "claude-code", "")
+
+	if got := envVars["OPENAI_API_KEY"]; got != "user-openai-key" {
+		t.Fatalf("OPENAI_API_KEY was overwritten: %q", got)
+	}
+	if got := envVars["OPENAI_BASE_URL"]; got != "https://api.openai.com/v1" {
+		t.Fatalf("OPENAI_BASE_URL was overwritten: %q", got)
+	}
+	if got := envVars["MOLECULE_LLM_USAGE_TOKEN"]; got != "tenant-admin-token" {
+		t.Fatalf("MOLECULE_LLM_USAGE_TOKEN = %q", got)
+	}
+	if got := envVars["MODEL"]; got != "openai/gpt-5.5" {
+		t.Fatalf("MODEL = %q", got)
+	}
+}
+
+func TestApplyPlatformManagedLLMEnv_ClaudeCodeUsesAnthropicProxyWithoutOverwritingOAuth(t *testing.T) {
+	t.Setenv("MOLECULE_LLM_BILLING_MODE", "platform_managed")
+	t.Setenv("MOLECULE_LLM_BASE_URL", "https://api.example.test/api/v1/internal/llm/openai/v1")
+	t.Setenv("MOLECULE_LLM_ANTHROPIC_BASE_URL", "https://api.example.test/api/v1/internal/llm/anthropic/v1")
+	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
+
+	envVars := map[string]string{
+		"CLAUDE_CODE_OAUTH_TOKEN": "user-oauth-token",
+		"MODEL":                   "sonnet",
+	}
+	applyPlatformManagedLLMEnv(envVars, "claude-code", "")
+
+	if got := envVars["CLAUDE_CODE_OAUTH_TOKEN"]; got != "user-oauth-token" {
+		t.Fatalf("CLAUDE_CODE_OAUTH_TOKEN was overwritten: %q", got)
+	}
+	if _, ok := envVars["ANTHROPIC_API_KEY"]; ok {
+		t.Fatalf("ANTHROPIC_API_KEY should not be set when Claude OAuth is present")
+	}
+	if got := envVars["MOLECULE_LLM_ANTHROPIC_BASE_URL"]; got != "https://api.example.test/api/v1/internal/llm/anthropic/v1" {
+		t.Fatalf("MOLECULE_LLM_ANTHROPIC_BASE_URL = %q", got)
+	}
+}
+
+func TestApplyPlatformManagedLLMEnv_ClaudeCodeInjectsAnthropicProxyWhenNoWorkspaceKey(t *testing.T) {
+	t.Setenv("MOLECULE_LLM_BILLING_MODE", "platform_managed")
+	t.Setenv("MOLECULE_LLM_BASE_URL", "https://api.example.test/api/v1/internal/llm/openai/v1")
+	t.Setenv("MOLECULE_LLM_ANTHROPIC_BASE_URL", "https://api.example.test/api/v1/internal/llm/anthropic/v1")
+	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
+
+	envVars := map[string]string{}
+	applyPlatformManagedLLMEnv(envVars, "claude-code", "minimax/MiniMax-M2.7")
+
+	if got := envVars["ANTHROPIC_BASE_URL"]; got != "https://api.example.test/api/v1/internal/llm/anthropic/v1" {
+		t.Fatalf("ANTHROPIC_BASE_URL = %q", got)
+	}
+	if got := envVars["ANTHROPIC_API_KEY"]; got != "tenant-admin-token" {
+		t.Fatalf("ANTHROPIC_API_KEY = %q", got)
+	}
+	if got := envVars["MOLECULE_LLM_USAGE_TOKEN"]; got != "tenant-admin-token" {
+		t.Fatalf("MOLECULE_LLM_USAGE_TOKEN = %q", got)
+	}
+}
+
+func TestApplyPlatformManagedLLMEnv_ClaudeCodeDoesNotOverrideVendorBYOK(t *testing.T) {
+	t.Setenv("MOLECULE_LLM_BILLING_MODE", "platform_managed")
+	t.Setenv("MOLECULE_LLM_BASE_URL", "https://api.example.test/api/v1/internal/llm/openai/v1")
+	t.Setenv("MOLECULE_LLM_ANTHROPIC_BASE_URL", "https://api.example.test/api/v1/internal/llm/anthropic/v1")
+	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
+
+	envVars := map[string]string{
+		"MINIMAX_API_KEY": "user-minimax-key",
+		"MODEL":           "MiniMax-M2.7",
+	}
+	applyPlatformManagedLLMEnv(envVars, "claude-code", "")
+
+	if got := envVars["MINIMAX_API_KEY"]; got != "user-minimax-key" {
+		t.Fatalf("MINIMAX_API_KEY was overwritten: %q", got)
+	}
+	if _, ok := envVars["ANTHROPIC_API_KEY"]; ok {
+		t.Fatalf("ANTHROPIC_API_KEY should not be set when vendor BYOK is present")
+	}
+	if _, ok := envVars["ANTHROPIC_BASE_URL"]; ok {
+		t.Fatalf("ANTHROPIC_BASE_URL should not be set when vendor BYOK is present")
+	}
+	if got := envVars["MOLECULE_LLM_USAGE_TOKEN"]; got != "tenant-admin-token" {
+		t.Fatalf("MOLECULE_LLM_USAGE_TOKEN = %q", got)
+	}
+}
+
+func TestApplyPlatformManagedLLMEnv_NoopsOutsidePlatformManaged(t *testing.T) {
+	t.Setenv("MOLECULE_LLM_BILLING_MODE", "byok")
+	t.Setenv("MOLECULE_LLM_BASE_URL", "https://api.example.test/api/v1/internal/llm/openai/v1")
+	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
+
+	envVars := map[string]string{}
+	applyPlatformManagedLLMEnv(envVars, "claude-code", "")
+
+	if _, ok := envVars["OPENAI_API_KEY"]; ok {
+		t.Fatalf("OPENAI_API_KEY should not be set outside platform-managed mode")
+	}
+	if _, ok := envVars["MOLECULE_LLM_USAGE_TOKEN"]; ok {
+		t.Fatalf("MOLECULE_LLM_USAGE_TOKEN should not be set outside platform-managed mode")
+	}
+}
+
 // TestApplyRuntimeModelEnv_PersonaEnvMODELSecretPreserved locks in the
 // 2026-05-08 fix that prevents the MODEL_PROVIDER-as-slug fallback from
-// silently overwriting a per-persona MODEL workspace_secret on restart.
+// silently overwriting a per-persona MODEL workspace_secret on restart,
+// EXTENDED for the 2026-05-19 root-cause fix that drops the
+// MODEL_PROVIDER fallback entirely.
 //
 // Pre-fix bug recurrence guard: when the persona env file (loaded into
 // workspace_secrets at /org/import time) declares both MODEL=<id> and
 // MODEL_PROVIDER=<slug>, the restart path used to overwrite envVars["MODEL"]
-// with the MODEL_PROVIDER slug because applyRuntimeModelEnv'\''s
+// with the MODEL_PROVIDER slug because applyRuntimeModelEnv's
 // payload.Model fallback consulted MODEL_PROVIDER first. Symptom: dev-tree
 // workspaces booted fine on first /org/import, then on next restart the
-// model id became literal "minimax" and the workspace template'\''s adapter
+// model id became literal "minimax" and the workspace template's adapter
 // failed to match any registry prefix, fell through to anthropic-oauth,
 // and wedged at SDK initialize. Caught during Phase 4 verification of
 // template-claude-code PR #9.
+//
+// 2026-05-19 follow-up: the MODEL_PROVIDER fallback is now removed.
+// MODEL is the only env-var source for the picked model id.
+// MODEL_PROVIDER is intentionally NOT consulted — a stale MODEL_PROVIDER
+// row left over from before the 20260519000000 migration must NOT leak
+// into envVars["MODEL"]. Verified by the third case below.
 func TestApplyRuntimeModelEnv_PersonaEnvMODELSecretPreserved(t *testing.T) {
 	cases := []struct {
 		name      string
@@ -770,7 +1133,7 @@ func TestApplyRuntimeModelEnv_PersonaEnvMODELSecretPreserved(t *testing.T) {
 		wantMODEL string
 	}{
 		{
-			name:      "MODEL secret wins over MODEL_PROVIDER slug (persona-env shape on restart)",
+			name:      "MODEL secret wins; stale MODEL_PROVIDER ignored (persona-env shape on restart)",
 			envMODEL:  "MiniMax-M2.7-highspeed",
 			envMP:     "minimax",
 			wantMODEL: "MiniMax-M2.7-highspeed",
@@ -782,10 +1145,10 @@ func TestApplyRuntimeModelEnv_PersonaEnvMODELSecretPreserved(t *testing.T) {
 			wantMODEL: "opus",
 		},
 		{
-			name:      "MODEL absent → fall back to MODEL_PROVIDER (legacy canvas Save+Restart shape)",
+			name:      "MODEL absent → MODEL_PROVIDER no longer fallback (2026-05-19 fix): nothing set",
 			envMODEL:  "",
 			envMP:     "MiniMax-M2.7",
-			wantMODEL: "MiniMax-M2.7",
+			wantMODEL: "",
 		},
 		{
 			name:      "Both absent → no MODEL set",
@@ -810,5 +1173,50 @@ func TestApplyRuntimeModelEnv_PersonaEnvMODELSecretPreserved(t *testing.T) {
 					got, tc.wantMODEL, tc.envMODEL, tc.envMP)
 			}
 		})
+	}
+}
+
+// TestApplyRuntimeModelEnv_StaleMODELPROVIDERNeverLeaksIntoMODEL is the
+// 2026-05-19 root-cause pin: workspaces that were live BEFORE the
+// 20260519000000_workspace_secrets_model_provider_rename migration ran
+// may still have a MODEL_PROVIDER row in workspace_secrets that lands
+// in envVars (the loader doesn't filter — anything in workspace_secrets
+// gets passed through). Post-fix, applyRuntimeModelEnv MUST NOT consult
+// that key for any purpose — neither as a fallback for the picked model
+// id nor as an indirect overwrite of MODEL. Asserts the read-out shape:
+//
+//   - envVars["MODEL"] stays empty when no other source provided one
+//   - envVars["MOLECULE_MODEL"] stays empty
+//   - envVars["HERMES_DEFAULT_MODEL"] stays empty
+//   - envVars["MODEL_PROVIDER"] itself is left as-is (we don't actively
+//     scrub it — the rename migration does that on the DB side)
+//
+// Pairs with workspace_provision.go applyRuntimeModelEnv (line 817
+// fallback removed) and secrets.go (workspace_secrets key MODEL).
+func TestApplyRuntimeModelEnv_StaleMODELPROVIDERNeverLeaksIntoMODEL(t *testing.T) {
+	envVars := map[string]string{
+		"MODEL_PROVIDER": "minimax", // legacy slug — the prod-bug shape
+	}
+	applyRuntimeModelEnv(envVars, "claude-code", "")
+	if got, ok := envVars["MODEL"]; ok {
+		t.Errorf("MODEL must not be set from MODEL_PROVIDER fallback (post-2026-05-19 fix); got=%q", got)
+	}
+	if got, ok := envVars["MOLECULE_MODEL"]; ok {
+		t.Errorf("MOLECULE_MODEL must not be set from MODEL_PROVIDER fallback; got=%q", got)
+	}
+	if got, ok := envVars["HERMES_DEFAULT_MODEL"]; ok {
+		t.Errorf("HERMES_DEFAULT_MODEL must not be set from MODEL_PROVIDER fallback; got=%q", got)
+	}
+	if got := envVars["MODEL_PROVIDER"]; got != "minimax" {
+		t.Errorf("MODEL_PROVIDER must be passed through untouched (DB-side rename handles cleanup); got=%q", got)
+	}
+
+	// Hermes-runtime variant — same shape, same expectation.
+	envVarsH := map[string]string{
+		"MODEL_PROVIDER": "minimax",
+	}
+	applyRuntimeModelEnv(envVarsH, "hermes", "")
+	if _, ok := envVarsH["HERMES_DEFAULT_MODEL"]; ok {
+		t.Errorf("hermes runtime must not leak MODEL_PROVIDER into HERMES_DEFAULT_MODEL")
 	}
 }

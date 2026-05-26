@@ -1,16 +1,18 @@
 package middleware
 
 import (
+	"crypto/sha256"
 	"crypto/subtle"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"log"
 	"net/http"
 	"os"
 	"strings"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/orgtoken"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/wsauth"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/orgtoken"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wsauth"
 	"github.com/gin-gonic/gin"
 )
 
@@ -196,6 +198,7 @@ func AdminAuth(database *sql.DB) gin.HandlerFunc {
 		// bearer-only path unchanged.
 		if cookieHeader := c.GetHeader("Cookie"); cookieHeader != "" {
 			if ok, _ := VerifiedCPSession(cookieHeader); ok {
+				c.Set("cp_session_actor", cpSessionActor(cookieHeader))
 				c.Next()
 				return
 			}
@@ -258,6 +261,11 @@ func AdminAuth(database *sql.DB) gin.HandlerFunc {
 		}
 		c.Next()
 	}
+}
+
+func cpSessionActor(cookieHeader string) string {
+	sum := sha256.Sum256([]byte(tenantSlug() + "\x00" + cookieHeader))
+	return "session:" + hex.EncodeToString(sum[:])[:16]
 }
 
 // CanvasOrBearer is a softer admin-auth variant used ONLY for cosmetic

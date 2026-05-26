@@ -7,24 +7,19 @@ package handlers
 // and A2A response parsing helpers.
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log"
-	"net/http"
 	"os"
-	"strings"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/provisioner"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/registry"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/registry"
 	"github.com/google/uuid"
 )
+
 // insertMCPDelegationRow writes a delegation activity row so the canvas
 // Agent Comms tab can show the task text for MCP-initiated delegations.
 // Mirrors insertDelegationRow (delegation.go) for the MCP tool path.
@@ -100,14 +95,18 @@ func (h *MCPHandler) toolListPeers(ctx context.Context, workspaceID string) (str
 			cols+` FROM workspaces w WHERE w.parent_id = $1 AND w.id != $2 AND w.status != 'removed'`,
 			parentID.String, workspaceID)
 		if err == nil {
-			_ = scanPeers(rows)
+			if scanErr := scanPeers(rows); scanErr != nil {
+				log.Printf("MCP toolListPeers: sibling scan error: %v", scanErr)
+			}
 		}
 	} else {
 		rows, err := h.database.QueryContext(ctx,
 			cols+` FROM workspaces w WHERE w.parent_id IS NULL AND w.id != $1 AND w.status != 'removed'`,
 			workspaceID)
 		if err == nil {
-			_ = scanPeers(rows)
+			if scanErr := scanPeers(rows); scanErr != nil {
+				log.Printf("MCP toolListPeers: sibling scan error: %v", scanErr)
+			}
 		}
 	}
 
@@ -117,7 +116,9 @@ func (h *MCPHandler) toolListPeers(ctx context.Context, workspaceID string) (str
 			cols+` FROM workspaces w WHERE w.parent_id = $1 AND w.status != 'removed'`,
 			workspaceID)
 		if err == nil {
-			_ = scanPeers(rows)
+			if scanErr := scanPeers(rows); scanErr != nil {
+				log.Printf("MCP toolListPeers: children scan error: %v", scanErr)
+			}
 		}
 	}
 
@@ -127,7 +128,9 @@ func (h *MCPHandler) toolListPeers(ctx context.Context, workspaceID string) (str
 			cols+` FROM workspaces w WHERE w.id = $1 AND w.status != 'removed'`,
 			parentID.String)
 		if err == nil {
-			_ = scanPeers(rows)
+			if scanErr := scanPeers(rows); scanErr != nil {
+				log.Printf("MCP toolListPeers: parent scan error: %v", scanErr)
+			}
 		}
 	}
 
@@ -190,15 +193,6 @@ func (h *MCPHandler) toolDelegateTask(ctx context.Context, callerID string, args
 		// Non-fatal: still make the A2A call even if activity log write fails.
 	}
 
-	agentURL, err := mcpResolveURL(ctx, h.database, targetID)
-	if err != nil {
-		return "", err
-	}
-	// SSRF defence: reject private/metadata URLs before making outbound call.
-	if err := isSafeURL(agentURL); err != nil {
-		return "", fmt.Errorf("invalid workspace URL: %w", err)
-	}
-
 	a2aBody, err := json.Marshal(map[string]interface{}{
 		"jsonrpc": "2.0",
 		"id":      uuid.New().String(),
@@ -218,35 +212,16 @@ func (h *MCPHandler) toolDelegateTask(ctx context.Context, callerID string, args
 	reqCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	httpReq, err := http.NewRequestWithContext(reqCtx, "POST", agentURL+"/a2a", bytes.NewReader(a2aBody))
-	if err != nil {
-		return "", fmt.Errorf("failed to create request: %w", err)
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	// X-Workspace-ID identifies this caller to the A2A proxy. The /workspaces/:id/a2a
-	// endpoint is intentionally outside WorkspaceAuth (agents do not hold bearer tokens
-	// to peer workspaces). Access control is enforced by CanCommunicate above, which
-	// already validated callerID → targetID before this request is constructed.
-	// callerID was authenticated by WorkspaceAuth on the MCP bridge entry point,
-	// so this header reflects a verified caller identity, not a spoofable value.
-	httpReq.Header.Set("X-Workspace-ID", callerID)
-
-	resp, err := http.DefaultClient.Do(httpReq)
+	status, body, err := h.proxyA2ARequest(reqCtx, targetID, a2aBody, callerID, true)
 	if err != nil {
 		updateMCPDelegationStatus(ctx, h.database, callerID, delegationID, "failed", err.Error())
-		return "", fmt.Errorf("A2A call failed: %w", err)
+		return "", fmt.Errorf("A2A proxy failed: %w", err)
 	}
-	defer func() { _ = resp.Body.Close() }()
-
-	// A 200/500 from the peer still means the call was dispatched — only
-	// network errors are truly "failed". Status 'dispatched' is correct for
-	// any HTTP response (peer's A2A layer handles the actual processing).
+	if status < 200 || status >= 300 {
+		updateMCPDelegationStatus(ctx, h.database, callerID, delegationID, "failed", fmt.Sprintf("A2A proxy returned status %d", status))
+		return "", fmt.Errorf("A2A proxy returned status %d", status)
+	}
 	updateMCPDelegationStatus(ctx, h.database, callerID, delegationID, "dispatched", "")
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return "", fmt.Errorf("failed to read response: %w", err)
-	}
 
 	return extractA2AText(body), nil
 }
@@ -278,20 +253,12 @@ func (h *MCPHandler) toolDelegateTaskAsync(ctx context.Context, callerID string,
 
 	// Fire and forget in a detached goroutine. Use a background context so
 	// the call is not cancelled when the HTTP request completes.
-	go func() {
+	// RFC internal#524 Layer 1: globalGoAsync — the detached call reads db.DB
+	// through the platform A2A proxy and must be drained by drainTestAsync
+	// before any t.Cleanup-driven db.DB swap.
+	globalGoAsync(func() {
 		bgCtx, cancel := context.WithTimeout(context.Background(), mcpAsyncCallTimeout)
 		defer cancel()
-
-		agentURL, err := mcpResolveURL(bgCtx, h.database, targetID)
-		if err != nil {
-			log.Printf("MCPHandler.delegate_task_async: resolve URL for %s: %v", targetID, err)
-			return
-		}
-		// SSRF defence: reject private/metadata URLs before making outbound call.
-		if err := isSafeURL(agentURL); err != nil {
-			log.Printf("MCPHandler.delegate_task_async: unsafe URL for %s: %v", targetID, err)
-			return
-		}
 
 		a2aBody, _ := json.Marshal(map[string]interface{}{
 			"jsonrpc": "2.0",
@@ -306,23 +273,16 @@ func (h *MCPHandler) toolDelegateTaskAsync(ctx context.Context, callerID string,
 			},
 		})
 
-		httpReq, err := http.NewRequestWithContext(bgCtx, "POST", agentURL+"/a2a", bytes.NewReader(a2aBody))
-		if err != nil {
-			log.Printf("MCPHandler.delegate_task_async: create request: %v", err)
+		status, _, err := h.proxyA2ARequest(bgCtx, targetID, a2aBody, callerID, true)
+		if err != nil || status < 200 || status >= 300 {
+			if err != nil {
+				log.Printf("MCPHandler.delegate_task_async: A2A proxy to %s: %v", targetID, err)
+			} else {
+				log.Printf("MCPHandler.delegate_task_async: A2A proxy to %s returned status %d", targetID, status)
+			}
 			return
 		}
-		httpReq.Header.Set("Content-Type", "application/json")
-		httpReq.Header.Set("X-Workspace-ID", callerID)
-
-		resp, err := http.DefaultClient.Do(httpReq)
-		if err != nil {
-			log.Printf("MCPHandler.delegate_task_async: A2A call to %s: %v", targetID, err)
-			return
-		}
-		defer func() { _ = resp.Body.Close() }()
-		// Drain response so the connection can be reused.
-		_, _ = io.Copy(io.Discard, resp.Body)
-	}()
+	})
 
 	return fmt.Sprintf(`{"task_id":%q,"status":"dispatched","target_id":%q}`, delegationID, targetID), nil
 }
@@ -388,12 +348,12 @@ func (h *MCPHandler) toolSendMessageToUser(ctx context.Context, workspaceID stri
 	// activity.go:Notify is what produced the reno-stars data-loss
 	// regression; both paths now route through the same writer.
 	//
-	// MCP send_message_to_user does not currently surface attachments
-	// (the tool args don't accept them); pass nil. If a future tool
-	// schema adds an attachments arg, build []AgentMessageAttachment
-	// and pass through.
+	attachments, err := parseAgentMessageAttachments(args["attachments"])
+	if err != nil {
+		return "", err
+	}
 	writer := NewAgentMessageWriter(h.database, h.broadcaster)
-	if err := writer.Send(ctx, workspaceID, message, nil); err != nil {
+	if err := writer.Send(ctx, workspaceID, message, attachments); err != nil {
 		if errors.Is(err, ErrWorkspaceNotFound) {
 			return "", fmt.Errorf("workspace not found")
 		}
@@ -402,184 +362,80 @@ func (h *MCPHandler) toolSendMessageToUser(ctx context.Context, workspaceID stri
 	return "Message sent.", nil
 }
 
+func parseAgentMessageAttachments(raw interface{}) ([]AgentMessageAttachment, error) {
+	if raw == nil {
+		return nil, nil
+	}
+	items, ok := raw.([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("attachments must be an array")
+	}
+	if len(items) == 0 {
+		return nil, nil
+	}
+	attachments := make([]AgentMessageAttachment, 0, len(items))
+	for i, item := range items {
+		m, ok := item.(map[string]interface{})
+		if !ok {
+			return nil, fmt.Errorf("attachment[%d]: must be an object", i)
+		}
+		uri, _ := m["uri"].(string)
+		name, _ := m["name"].(string)
+		if uri == "" || name == "" {
+			return nil, fmt.Errorf("attachment[%d]: uri and name are required", i)
+		}
+		att := AgentMessageAttachment{
+			URI:  uri,
+			Name: name,
+		}
+		if mimeType, ok := m["mimeType"].(string); ok {
+			att.MimeType = mimeType
+		}
+		if size, ok := numericInt64(m["size"]); ok {
+			att.Size = size
+		}
+		attachments = append(attachments, att)
+	}
+	return attachments, nil
+}
+
+func numericInt64(raw interface{}) (int64, bool) {
+	switch v := raw.(type) {
+	case int:
+		return int64(v), true
+	case int64:
+		return v, true
+	case float64:
+		return int64(v), true
+	default:
+		return 0, false
+	}
+}
 
 func (h *MCPHandler) toolCommitMemory(ctx context.Context, workspaceID string, args map[string]interface{}) (string, error) {
-	// PR-6 (RFC #2728) compat shim: when the v2 plugin is wired
-	// (MEMORY_PLUGIN_URL set), translate legacy scope→namespace and
-	// delegate. Otherwise fall through to the legacy DB path so
-	// operators who haven't enabled the plugin yet keep working.
-	if h.memoryV2Available() == nil {
-		return h.commitMemoryLegacyShim(ctx, workspaceID, args)
+	// Issue #1733 — v2 memory plugin is now the only path. The legacy
+	// SQL fallback on `agent_memories` is gone; an unconfigured plugin
+	// returns a clear error to the agent rather than silently writing
+	// into a stale table no one reads.
+	if err := h.memoryV2Available(); err != nil {
+		return "", err
 	}
-
-	content, _ := args["content"].(string)
-	scope, _ := args["scope"].(string)
-	if content == "" {
-		return "", fmt.Errorf("content is required")
-	}
-	if scope == "" {
-		scope = "LOCAL"
-	}
-
-	// C3: GLOBAL scope is blocked on the MCP bridge.
-	if scope == "GLOBAL" {
-		return "", fmt.Errorf("GLOBAL scope is not permitted via the MCP bridge — use LOCAL or TEAM")
-	}
-	if scope != "LOCAL" && scope != "TEAM" {
-		return "", fmt.Errorf("scope must be LOCAL or TEAM")
-	}
-
-	memoryID := uuid.New().String()
-	// SAFE-T1201 (#838): scrub known credential patterns before persistence so
-	// plain-text API keys pulled in via tool responses can't land in the
-	// memories table (and leak into shared TEAM scope). Reuses redactSecrets
-	// already shipped for the HTTP path in PR #881 — this was the MCP-bridge
-	// sibling the original fix missed. Runs on every write regardless of scope.
-	content, _ = redactSecrets(workspaceID, content)
-	_, err := h.database.ExecContext(ctx, `
-		INSERT INTO agent_memories (id, workspace_id, content, scope, namespace)
-		VALUES ($1, $2, $3, $4, $5)
-	`, memoryID, workspaceID, content, scope, workspaceID)
-	if err != nil {
-		log.Printf("MCPHandler.commit_memory workspace=%s: %v", workspaceID, err)
-		return "", fmt.Errorf("failed to save memory")
-	}
-
-	return fmt.Sprintf(`{"id":%q,"scope":%q}`, memoryID, scope), nil
+	return h.commitMemoryLegacyShim(ctx, workspaceID, args)
 }
 
 func (h *MCPHandler) toolRecallMemory(ctx context.Context, workspaceID string, args map[string]interface{}) (string, error) {
-	// PR-6 (RFC #2728) compat shim: when the v2 plugin is wired,
-	// route through it. Otherwise fall through to legacy DB path.
-	if h.memoryV2Available() == nil {
-		return h.recallMemoryLegacyShim(ctx, workspaceID, args)
+	// Issue #1733 — v2 memory plugin is now the only path. Same shape
+	// as toolCommitMemory: an unconfigured plugin is an error, not a
+	// quiet read from a frozen v1 table.
+	if err := h.memoryV2Available(); err != nil {
+		return "", err
 	}
-
-	query, _ := args["query"].(string)
-	scope, _ := args["scope"].(string)
-
-	// C3: GLOBAL scope is blocked on the MCP bridge.
-	if scope == "GLOBAL" {
-		return "", fmt.Errorf("GLOBAL scope is not permitted via the MCP bridge — use LOCAL, TEAM, or empty")
-	}
-
-	var rows *sql.Rows
-	var err error
-
-	switch scope {
-	case "LOCAL":
-		rows, err = h.database.QueryContext(ctx, `
-			SELECT id, content, scope, created_at
-			FROM agent_memories
-			WHERE workspace_id = $1 AND scope = 'LOCAL'
-			  AND ($2 = '' OR content ILIKE '%' || $2 || '%')
-			ORDER BY created_at DESC LIMIT 50
-		`, workspaceID, query)
-	case "TEAM":
-		// Team scope: parent + all siblings.
-		rows, err = h.database.QueryContext(ctx, `
-			SELECT m.id, m.content, m.scope, m.created_at
-			FROM agent_memories m
-			JOIN workspaces w ON w.id = m.workspace_id
-			WHERE m.scope = 'TEAM'
-			  AND w.status != 'removed'
-			  AND (w.id = $1 OR w.parent_id = (SELECT parent_id FROM workspaces WHERE id = $1 AND parent_id IS NOT NULL))
-			  AND ($2 = '' OR m.content ILIKE '%' || $2 || '%')
-			ORDER BY m.created_at DESC LIMIT 50
-		`, workspaceID, query)
-	default:
-		// Empty scope → LOCAL only for the MCP bridge (GLOBAL excluded per C3).
-		rows, err = h.database.QueryContext(ctx, `
-			SELECT id, content, scope, created_at
-			FROM agent_memories
-			WHERE workspace_id = $1 AND scope IN ('LOCAL', 'TEAM')
-			  AND ($2 = '' OR content ILIKE '%' || $2 || '%')
-			ORDER BY created_at DESC LIMIT 50
-		`, workspaceID, query)
-	}
-	if err != nil {
-		return "", fmt.Errorf("memory search failed: %w", err)
-	}
-	defer rows.Close()
-
-	type memEntry struct {
-		ID        string `json:"id"`
-		Content   string `json:"content"`
-		Scope     string `json:"scope"`
-		CreatedAt string `json:"created_at"`
-	}
-	var results []memEntry
-	for rows.Next() {
-		var e memEntry
-		if err := rows.Scan(&e.ID, &e.Content, &e.Scope, &e.CreatedAt); err != nil {
-			continue
-		}
-		results = append(results, e)
-	}
-	if err := rows.Err(); err != nil {
-		return "", fmt.Errorf("memory scan error: %w", err)
-	}
-
-	if len(results) == 0 {
-		return "No memories found.", nil
-	}
-	b, _ := json.MarshalIndent(results, "", "  ")
-	return string(b), nil
+	return h.recallMemoryLegacyShim(ctx, workspaceID, args)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
-
-// mcpResolveURL returns a routable URL for a workspace's A2A server.
-//
-// Resolution order:
-//  1. Docker-internal URL cache (set by provisioner; correct when platform is in Docker)
-//  2. Redis URL cache
-//  3. DB `url` column fallback, with 127.0.0.1→Docker bridge rewrite when in Docker
-//
-// SECURITY (F1083 / #1130): all three paths run the returned URL through
-// validateAgentURL to block SSRF targets (private IPs, loopback, cloud metadata).
-func mcpResolveURL(ctx context.Context, database *sql.DB, workspaceID string) (string, error) {
-	if platformInDocker {
-		if url, err := db.GetCachedInternalURL(ctx, workspaceID); err == nil && url != "" {
-			if err := validateAgentURL(url); err != nil {
-				return "", fmt.Errorf("workspace %s: forbidden URL from internal cache: %w", workspaceID, err)
-			}
-			return url, nil
-		}
-	}
-	if url, err := db.GetCachedURL(ctx, workspaceID); err == nil && url != "" {
-		if platformInDocker && strings.HasPrefix(url, "http://127.0.0.1:") {
-			return provisioner.InternalURL(workspaceID), nil
-		}
-		if err := validateAgentURL(url); err != nil {
-			return "", fmt.Errorf("workspace %s: forbidden URL from Redis cache: %w", workspaceID, err)
-		}
-		return url, nil
-	}
-
-	var urlStr sql.NullString
-	var status string
-	if err := database.QueryRowContext(ctx,
-		`SELECT url, status FROM workspaces WHERE id = $1`, workspaceID,
-	).Scan(&urlStr, &status); err != nil {
-		if err == sql.ErrNoRows {
-			return "", fmt.Errorf("workspace %s not found", workspaceID)
-		}
-		return "", fmt.Errorf("workspace lookup failed: %w", err)
-	}
-	if !urlStr.Valid || urlStr.String == "" {
-		return "", fmt.Errorf("workspace %s has no URL (status: %s)", workspaceID, status)
-	}
-	if platformInDocker && strings.HasPrefix(urlStr.String, "http://127.0.0.1:") {
-		return provisioner.InternalURL(workspaceID), nil
-	}
-	if err := validateAgentURL(urlStr.String); err != nil {
-		return "", fmt.Errorf("workspace %s: forbidden URL from DB: %w", workspaceID, err)
-	}
-	return urlStr.String, nil
-}
 
 // extractA2AText extracts human-readable text from an A2A JSON-RPC response body.
 // Falls back to the raw JSON when no text part can be found.
@@ -629,4 +485,3 @@ func extractA2AText(body []byte) string {
 	b, _ := json.Marshal(result)
 	return string(b)
 }
-

@@ -290,7 +290,9 @@ describe("DetailsTab — delete workflow", () => {
     ) as HTMLButtonElement;
     fireEvent(confirmBtn, new MouseEvent("click", { bubbles: true }));
     await flush();
-    expect(mockApi.del).toHaveBeenCalledWith("/workspaces/ws-1?confirm=true");
+    expect(mockApi.del).toHaveBeenCalledWith("/workspaces/ws-1?confirm=true", {
+      headers: { "X-Confirm-Name": "Test Workspace" },
+    });
     expect(mockRemoveSubtree).toHaveBeenCalledWith("ws-1");
     expect(mockSelectNode).toHaveBeenCalledWith(null);
   });

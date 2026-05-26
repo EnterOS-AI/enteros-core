@@ -641,6 +641,15 @@ def main(argv: list[str] | None = None) -> int:
 
     base_workflows = workflows_at_sha(BASE_SHA)
     head_workflows = workflows_at_sha(HEAD_SHA)
+    # Ignore workflow files that are identical on both sides — old branches
+    # that haven't rebased onto main carry stale copies of workflows that
+    # were updated later. Comparing those stale copies against the current
+    # base produces false-positive "flips".
+    base_workflows = {
+        p: t for p, t in base_workflows.items()
+        if p in head_workflows and head_workflows[p] != t
+    }
+    head_workflows = {p: t for p, t in head_workflows.items() if p in base_workflows}
     flips = detect_flips(base_workflows, head_workflows)
 
     if not flips:

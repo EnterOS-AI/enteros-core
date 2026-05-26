@@ -14,7 +14,7 @@ def load_reaper():
     assert spec.loader is not None
     spec.loader.exec_module(mod)
     mod.API = "https://git.example.test/api/v1"
-    mod.GITEA_TOKEN = "test-token"
+    mod.GITEA_TOKEN = "fixture-token"
     mod.API_TIMEOUT_SEC = 1
     mod.API_RETRIES = 3
     mod.API_RETRY_SLEEP_SEC = 0

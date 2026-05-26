@@ -16,8 +16,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/envx"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/plugins"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/envx"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/plugins"
 	"github.com/gin-gonic/gin"
 )
 
@@ -320,7 +320,10 @@ func (h *PluginsHandler) deliverToContainer(ctx context.Context, workspaceID str
 			if kind == classifyKindSkillContentOnly {
 				log.Printf("Plugin install: %s → workspace %s — SKILL-content-only update, SKIPPING restart", r.PluginName, workspaceID)
 			} else {
-				go h.restartFunc(workspaceID)
+				// RFC internal#524 Layer 1: drain via globalGoAsync (see
+				// workspace.go:globalGoAsync).
+				wsID := workspaceID
+				globalGoAsync(func() { h.restartFunc(wsID) })
 			}
 		}
 		return nil
@@ -334,7 +337,9 @@ func (h *PluginsHandler) deliverToContainer(ctx context.Context, workspaceID str
 			})
 		}
 		if h.restartFunc != nil {
-			go h.restartFunc(workspaceID)
+			// RFC internal#524 Layer 1: see Docker path above.
+			wsID := workspaceID
+			globalGoAsync(func() { h.restartFunc(wsID) })
 		}
 		return nil
 	}

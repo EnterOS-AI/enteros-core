@@ -55,7 +55,7 @@ test.describe("Desktop ChatTab", () => {
     await textarea.fill("What is the weather?");
     await page.getByRole("button", { name: /Send/ }).first().click();
 
-    await expect(page.getByText("What is the weather?")).toBeVisible({ timeout: 5_000 });
+    await expect(page.getByText("What is the weather?", { exact: true })).toBeVisible({ timeout: 5_000 });
     await expect(page.getByText("Echo: What is the weather?")).toBeVisible({ timeout: 15_000 });
   });
 

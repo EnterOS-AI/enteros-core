@@ -10,20 +10,18 @@
 #                                    "gpt-4o" falls through to Anthropic
 #                                    default + 401, see PR #1714.)
 #
-#   langgraph   → "openai:gpt-4o"  (colon-form: langchain init_chat_model
-#                                    requires "<provider>:<model>".
-#                                    Slash-form was misinterpreted as
-#                                    OpenRouter routing → fell through
-#                                    without auth, surfaced 2026-05-03
-#                                    after the a2a-sdk v1 contract bugs
-#                                    PR #2558+#2563+#2567 cleared the
-#                                    masking layers.)
+#   claude-code → auth-aware:
+#                  E2E_MINIMAX_API_KEY    → "MiniMax-M2"
+#                  E2E_ANTHROPIC_API_KEY  → "claude-sonnet-4-6"
+#                  otherwise              → "sonnet"
 #
-#   claude-code → "sonnet"         (entry-id form: claude-code template's
-#                                    config.yaml uses bare model names,
-#                                    auth comes via CLAUDE_CODE_OAUTH_TOKEN
-#                                    or ANTHROPIC_API_KEY rather than the
-#                                    slug.)
+#                  claude-code provider routing is model-driven. The bare
+#                  "sonnet" alias selects the OAuth provider, so it is only a
+#                  good default when the canary is using Claude Code OAuth or
+#                  intentionally exercising the missing-auth path. MiniMax and
+#                  direct Anthropic API keys need model IDs that resolve to
+#                  their provider entries, otherwise the workspace boots
+#                  reachable but the first A2A call hits the wrong auth path.
 #
 # When E2E_MODEL_SLUG is set, it overrides this dispatch — useful when an
 # operator dispatches the workflow to test a specific slug.
@@ -44,8 +42,15 @@ pick_model_slug() {
   fi
   case "$runtime" in
     hermes)      printf 'openai/gpt-4o' ;;
-    langgraph)   printf 'openai:gpt-4o' ;;
-    claude-code) printf 'sonnet' ;;
+    claude-code)
+      if [ -n "${E2E_MINIMAX_API_KEY:-}" ]; then
+        printf 'MiniMax-M2'
+      elif [ -n "${E2E_ANTHROPIC_API_KEY:-}" ]; then
+        printf 'claude-sonnet-4-6'
+      else
+        printf 'sonnet'
+      fi
+      ;;
     *)           printf 'openai/gpt-4o' ;;  # safest fallback (matches hermes)
   esac
 }

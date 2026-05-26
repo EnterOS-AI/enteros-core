@@ -283,7 +283,7 @@ def _ensure_labels(repo: str, names: list[str]) -> list[int]:
     if status != "ok" or not isinstance(labels, list):
         return []
     out: list[int] = []
-    by_name = {l["name"]: l["id"] for l in labels if isinstance(l, dict)}
+    by_name = {label["name"]: label["id"] for label in labels if isinstance(label, dict)}
     for n in names:
         if n in by_name:
             out.append(by_name[n])

@@ -22,7 +22,7 @@ import (
 	"log"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"github.com/lib/pq"
 )
 

@@ -40,11 +40,11 @@ import (
 	"log"
 	"path/filepath"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/events"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/models"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/provisioner"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/wsauth"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wsauth"
 )
 
 // readOrLazyHealInboundSecret reads the workspace's
@@ -85,10 +85,9 @@ func readOrLazyHealInboundSecret(ctx context.Context, workspaceID, opLabel strin
 // prepareProvisionContext when the caller proceeds; nil + non-empty
 // abort message when the caller must mark the workspace failed.
 type preparedProvisionContext struct {
-	EnvVars            map[string]string
-	PluginsPath        string
-	AwarenessNamespace string
-	Config             provisioner.WorkspaceConfig
+	EnvVars     map[string]string
+	PluginsPath string
+	Config      provisioner.WorkspaceConfig
 }
 
 // provisionAbort describes why prepareProvisionContext refused to
@@ -120,17 +119,81 @@ func (h *WorkspaceHandler) prepareProvisionContext(
 	payload models.CreateWorkspacePayload,
 	resetClaudeSession bool,
 ) (*preparedProvisionContext, *provisionAbort) {
-	envVars, decryptErr := loadWorkspaceSecrets(ctx, workspaceID)
+	envVars, globalSecretKeys, decryptErr := loadWorkspaceSecrets(ctx, workspaceID)
 	if decryptErr != "" {
 		return nil, &provisionAbort{Msg: decryptErr}
 	}
 
+	// RFC#523 Layer 1 (issue molecule-ai/internal#523): refuse to start a
+	// tenant workspace when any forbidden operator-scope env var is
+	// present in the operator-controlled store (global_secrets).
+	//
+	// PROVENANCE-AWARE — fix for the over-fire reported by CTO empirical
+	// 2026-05-20: the original implementation ran this check on the
+	// merged env-set, which conflated two very different sources:
+	//
+	//   1. global_secrets — operator-side store. ANY operator-scope token
+	//      here is an upstream bleed (e.g. tenant_secrets_seed.go pre-
+	//      4f45d37 propagating CP-env GITHUB_TOKEN into every fresh
+	//      tenant's row). RFC#523's literal threat model.
+	//
+	//   2. workspace_secrets — user-set via the canvas Secrets tab,
+	//      authenticated as the workspace owner. If the user pastes
+	//      their own scoped GitHub PAT under GITHUB_TOKEN so the agent
+	//      can push to their personal repos, that is the system working
+	//      as designed — not the leak RFC#523 was written to catch.
+	//
+	// The provenance side-channel from loadWorkspaceSecrets tells us
+	// which keys came from global_secrets (workspace_secrets writes
+	// override and clear the flag, since the user explicitly re-set
+	// the value). We restrict the abort to that set.
+	//
+	// Defense-in-depth NOT removed: provisioner.buildContainerEnv still
+	// runs the forensic #145 silent-strip (lower-confidence late layer),
+	// and workspace/entrypoint.sh has Layer 2 inside the container. If a
+	// real operator-scope token slips into workspace_secrets some other
+	// way, the later layers (and the per-workspace SG, and the per-tenant
+	// VPC isolation) are still in force.
+	//
+	// Key names (not values) are echoed in the user-facing error so
+	// the operator can locate and remove the offending row. Per memory
+	// `feedback_passwords_in_chat_are_burned`, key names are not
+	// secret; values would be.
+	if forbidden := findForbiddenTenantEnvKeysFromGlobals(envVars, globalSecretKeys); len(forbidden) > 0 {
+		msg := formatForbiddenTenantEnvError(forbidden)
+		log.Printf("Provisioner: ABORT workspace=%s — forbidden operator-scope env keys present in global_secrets: %v (RFC#523)", workspaceID, forbidden)
+		return nil, &provisionAbort{
+			Msg:   msg,
+			Extra: map[string]interface{}{"error": msg, "forbidden_env_keys": forbidden, "rfc": "523", "source": "global_secrets"},
+		}
+	}
+
 	pluginsPath, _ := filepath.Abs(filepath.Join(h.configsDir, "..", "plugins"))
-	awarenessNamespace := h.loadAwarenessNamespace(ctx, workspaceID)
 
 	// Per-agent git identity (#1957) — must run after secret loads so
 	// a workspace_secret named GIT_AUTHOR_NAME can override.
 	applyAgentGitIdentity(envVars, payload.Name)
+	// Per-agent git HTTP credential injection — bridges the gap that
+	// PR template-claude-code#30 + mc#1525 left open: the askpass binary
+	// + GIT_ASKPASS env are wired in-image, but until now no code path
+	// in workspace-server actually read the persona's git token from
+	// the operator-host bootstrap dir and exported it as
+	// GIT_HTTP_USERNAME / GIT_HTTP_PASSWORD. Without this, the askpass
+	// helper invokes with an empty password env and git fails the
+	// auth challenge in ~500ms (live-verified for Dev-A/Dev-B
+	// 2026-05-18 ~23:55Z).
+	//
+	// Runs AFTER applyAgentGitIdentity so workspace_secrets named
+	// GIT_HTTP_USERNAME / GIT_HTTP_PASSWORD (operator-supplied,
+	// loaded earlier by loadWorkspaceSecrets) win over the
+	// persona-file default. Uses payload.Role as the persona key —
+	// this matches the slug-form convention agent-dev-a /
+	// agent-dev-b / agent-pm. Descriptive multi-word roles
+	// ("Frontend Engineer") take the silent-no-op branch and
+	// continue to rely on workspace_secrets / org-import persona-env
+	// merge for their git auth.
+	applyAgentGitHTTPCreds(envVars, payload.Role)
+	applyPlatformManagedLLMEnv(envVars, payload.Runtime, payload.Model)
 	applyRuntimeModelEnv(envVars, payload.Runtime, payload.Model)
 	if payload.Role != "" {
 		envVars["MOLECULE_AGENT_ROLE"] = payload.Role
@@ -167,14 +230,13 @@ func (h *WorkspaceHandler) prepareProvisionContext(
 		}
 	}
 
-	cfg := h.buildProvisionerConfig(ctx, workspaceID, templatePath, configFiles, payload, envVars, pluginsPath, awarenessNamespace)
+	cfg := h.buildProvisionerConfig(ctx, workspaceID, templatePath, configFiles, payload, envVars, pluginsPath)
 	cfg.ResetClaudeSession = resetClaudeSession
 
 	return &preparedProvisionContext{
-		EnvVars:            envVars,
-		PluginsPath:        pluginsPath,
-		AwarenessNamespace: awarenessNamespace,
-		Config:             cfg,
+		EnvVars:     envVars,
+		PluginsPath: pluginsPath,
+		Config:      cfg,
 	}, nil
 }
 

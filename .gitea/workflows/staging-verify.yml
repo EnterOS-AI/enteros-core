@@ -75,8 +75,12 @@ permissions:
 env:
   # ECR registry (post-2026-05-06 SSOT for tenant images).
   # publish-workspace-server-image.yml pushes here.
-  IMAGE_NAME: 153263036946.dkr.ecr.us-east-2.amazonaws.com/molecule-ai/platform
-  TENANT_IMAGE_NAME: 153263036946.dkr.ecr.us-east-2.amazonaws.com/molecule-ai/platform-tenant
+  # SSOT-Instance-10 (#333): triplet sourced from org/repo var `ECR_REGISTRY` with
+  # the current prod-account literal as bootstrap fallback. When the org var is set,
+  # the fallback becomes dead code and switching accounts/regions is a one-line
+  # change at the org level. Pattern mirrors `vars.CP_URL || 'literal'` below.
+  IMAGE_NAME: ${{ vars.ECR_REGISTRY || '153263036946.dkr.ecr.us-east-2.amazonaws.com' }}/molecule-ai/platform
+  TENANT_IMAGE_NAME: ${{ vars.ECR_REGISTRY || '153263036946.dkr.ecr.us-east-2.amazonaws.com' }}/molecule-ai/platform-tenant
   # CP endpoint for redeploy-fleet (used in promote step below).
   CP_URL: ${{ vars.CP_URL || 'https://staging-api.moleculesai.app' }}
   GITHUB_SERVER_URL: https://git.moleculesai.app
@@ -235,6 +239,11 @@ jobs:
           set -euo pipefail
 
           TARGET_TAG="staging-${SHA}"
+          # confirm:true ack required by CP /cp/admin/tenants/redeploy-fleet
+          # contract (cp#228 / task #308) for fleet-wide intent. Empty body
+          # / {confirm:false} / {only_slugs:[]} → 400. This caller promotes
+          # the verified staging image across the entire prod fleet (canary
+          # + fan-out), no slug scoping, so confirm:true is correct.
           BODY=$(jq -nc \
             --arg tag "$TARGET_TAG" \
             --argjson soak "${SOAK_SECONDS:-120}" \
@@ -244,7 +253,8 @@ jobs:
               target_tag: $tag,
               soak_seconds: $soak,
               batch_size: $batch,
-              dry_run: $dry
+              dry_run: $dry,
+              confirm: true
             }')
 
           if [ -n "${CANARY_SLUG:-}" ]; then

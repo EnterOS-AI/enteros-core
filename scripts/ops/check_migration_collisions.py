@@ -91,6 +91,10 @@ def _gitea_get(path: str, params: dict[str, str] | None = None) -> bytes | None:
         req.add_header("Authorization", f"token {token}")
     req.add_header("Accept", "application/json")
     try:
+        # S310 (信任boundary): this function IS the outbound HTTP client for
+        # Gitea API calls. The call is intentional and controlled — we build
+        # the request ourselves and handle errors explicitly. Timeout=20s
+        # prevents indefinite hangs.
         with urllib.request.urlopen(req, timeout=20) as resp:  # noqa: S310
             return resp.read()
     except urllib.error.HTTPError as e:
@@ -281,8 +285,8 @@ def main() -> int:
     for prefix, peers in sorted(open_pr_collisions.items()):
         peer_str = ", ".join(f"#{p['number']} ({p['headRefName']})" for p in peers)
         print(f"::error::migration prefix {prefix:03d} also claimed by open PR(s): {peer_str}")
-        print(f"::error::rebase coordination needed — only one PR can land a given prefix; "
-              f"renumber yours or theirs")
+        print("::error::rebase coordination needed — only one PR can land a given prefix; "
+              "renumber yours or theirs")
     return 1
 
 

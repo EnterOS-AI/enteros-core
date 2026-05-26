@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2016,SC2329
 # review-check — evaluate whether a PR satisfies a single team-review gate.
 #
 # RFC#324 Step 1 of 5 — qa-review + security-review check workflows.
@@ -11,6 +12,7 @@
 #   ≥ 1 review on the PR where:
 #     • state == APPROVED
 #     • review.dismissed == false
+#     • review.official != false (excludes draft/mis-filed APPROVED reviews)
 #     • review.user.login != PR.user.login (non-author)
 #     • review.user.login ∈ team-members
 #
@@ -100,11 +102,12 @@ printf 'header = "Authorization: token %s"\n' "$GITEA_TOKEN" > "$CURL_AUTH_FILE"
 # (bash trap 'function' EXIT expands variables at trap-fire time, not def time).
 PR_JSON=$(mktemp)
 REVIEWS_JSON=$(mktemp)
+COMMENTS_JSON=$(mktemp)
 TEAM_PROBE_TMP=$(mktemp)
 NA_STATUSES_TMP=""  # declared here so cleanup() always has the var
 
 cleanup() {
-  rm -f "$CURL_AUTH_FILE" "$PR_JSON" "$REVIEWS_JSON" "$TEAM_PROBE_TMP" "${NA_STATUSES_TMP-}"
+  rm -f "$CURL_AUTH_FILE" "$PR_JSON" "$REVIEWS_JSON" "$COMMENTS_JSON" "$TEAM_PROBE_TMP" "${NA_STATUSES_TMP-}"
 }
 trap cleanup EXIT
 
@@ -127,12 +130,17 @@ fi
 PR_AUTHOR=$(jq -r '.user.login // ""' "$PR_JSON")
 PR_HEAD_SHA=$(jq -r '.head.sha // ""' "$PR_JSON")
 PR_BASE_REF=$(jq -r '.base.ref // ""' "$PR_JSON")
+PR_BASE_SHA=$(jq -r '.base.sha // ""' "$PR_JSON")
 PR_STATE=$(jq -r '.state // ""' "$PR_JSON")
 DEFAULT_BRANCH="${DEFAULT_BRANCH:-main}"
 debug "pr_author=${PR_AUTHOR} pr_head=${PR_HEAD_SHA:0:7} pr_base=${PR_BASE_REF} pr_state=${PR_STATE}"
 
 if [ "$PR_STATE" != "open" ]; then
   echo "::notice::PR ${PR_NUMBER} is ${PR_STATE} — exiting 0 (closed PRs do not gate)"
+  exit 0
+fi
+if [ "$PR_HEAD_SHA" = "$PR_BASE_SHA" ]; then
+  echo "::notice::PR ${PR_NUMBER} has no diff (head == base) — exiting 0 (empty PRs do not gate)"
   exit 0
 fi
 if [ "$PR_BASE_REF" != "$DEFAULT_BRANCH" ]; then
@@ -194,6 +202,7 @@ fi
 JQ_FILTER='.[]
   | select(.state == "APPROVED")
   | select(.dismissed != true)
+  | select(.official != false)
   | select(.user.login != $author)'
 if [ "${REVIEW_CHECK_STRICT:-}" = "1" ]; then
   JQ_FILTER="${JQ_FILTER}
@@ -202,10 +211,10 @@ fi
 JQ_FILTER="${JQ_FILTER}
   | .user.login"
 
-CANDIDATES=$(jq -r --arg author "$PR_AUTHOR" --arg head "$PR_HEAD_SHA" "$JQ_FILTER" "$REVIEWS_JSON" | sort -u)
-debug "candidate non-author approvers: $(echo "$CANDIDATES" | tr '\n' ' ')"
+REVIEW_CANDIDATES=$(jq -r --arg author "$PR_AUTHOR" --arg head "$PR_HEAD_SHA" "$JQ_FILTER" "$REVIEWS_JSON" | sort -u)
+debug "candidate non-author approvers: $(echo "$REVIEW_CANDIDATES" | tr '\n' ' ')"
 
-if [ -z "$CANDIDATES" ]; then
+if [ -z "$REVIEW_CANDIDATES" ]; then
   # --- Guardrail (internal#503): explain the most common false
   # "no candidates" red. Gitea's review event enum is EXACTLY
   # APPROVED/REQUEST_CHANGES/COMMENT/PENDING. A wrong value ("APPROVE",
@@ -229,7 +238,55 @@ if [ -z "$CANDIDATES" ]; then
       [ -n "${_rid:-}" ] && echo "::error::  review id=${_rid} by '${_rl}': RE-SUBMIT via POST ${API}/repos/${OWNER}/${NAME}/pulls/${PR_NUMBER}/reviews with {\"event\":\"APPROVED\"} (correct enum) — do NOT edit the DB."
     done
   fi
-  echo "::error::${TEAM}-review awaiting non-author APPROVE from ${TEAM} team (no candidates yet)"
+
+fi
+
+# --- Fallback/extension (internal#348): check issue comments for agent-approval ---
+# core-qa-agent and core-security-agent can approve via issue comments. Always
+# include comment candidates, even if the reviews API returned approvals for a
+# different team; team membership below is the authoritative filter.
+COMMENT_CANDIDATES=""
+AGENT_PATTERN=""
+case "$TEAM" in
+  qa)       AGENT_PATTERN="\\[core-qa-agent\\]" ;;
+  security) AGENT_PATTERN="\\[core-security-agent\\]" ;;
+esac
+HTTP_CODE=$(curl -sS -o "$COMMENTS_JSON" -w '%{http_code}' \
+  -K "$CURL_AUTH_FILE" "${API}/repos/${OWNER}/${NAME}/issues/${PR_NUMBER}/comments")
+debug "GET /issues/${PR_NUMBER}/comments → HTTP ${HTTP_CODE}"
+if [ "$HTTP_CODE" = "200" ]; then
+  # JQ expression: select non-author comments that match either the
+  # agent-prefix pattern (case-insensitive) OR a generic approval keyword.
+  JQ_APPROVALS='
+    .[] |
+    select(.user.login != $author) |
+    . as $cmt |
+    if ($agent_pattern | length) > 0 and ($cmt.body // "" | test($agent_pattern; "i")) then
+      $cmt.user.login
+    elif ($cmt.body // "" | test("\\b(APPROVED|LGTM|ACCEPTED)\\b"; "i")) then
+      $cmt.user.login
+    else
+      empty
+    end
+  '
+  COMMENT_CANDIDATES=$(jq -r \
+    --arg author "$PR_AUTHOR" \
+    --arg agent_pattern "$AGENT_PATTERN" \
+    "$JQ_APPROVALS" \
+    "$COMMENTS_JSON" 2>/dev/null | sort -u)
+  debug "comment-based approval candidates: $(echo "$COMMENT_CANDIDATES" | tr '\n' ' ')"
+
+  if [ -n "$COMMENT_CANDIDATES" ]; then
+    echo "::notice::${TEAM}-review: found $(echo "$COMMENT_CANDIDATES" | wc -w | xargs) comment-based approval candidate(s) — verifying team membership..."
+  fi
+else
+  debug "could not fetch issue comments (HTTP ${HTTP_CODE})"
+fi
+
+CANDIDATES=$(printf '%s\n%s\n' "$REVIEW_CANDIDATES" "$COMMENT_CANDIDATES" | sed '/^$/d' | sort -u)
+
+if [ -z "${CANDIDATES:-}" ]; then
+  echo "::error::${TEAM}-review awaiting non-author APPROVE from ${TEAM} team (no candidates from reviews API or issue comments)"
   exit 1
 fi
 
@@ -249,12 +306,15 @@ for U in $CANDIDATES; do
       exit 0
       ;;
     403)
-      # Token owner is not in the team being probed; the API refuses to
-      # confirm membership. This is the RFC#324 follow-up token-scope gap.
-      # Fail closed — never grant approval on a 403; surface clearly.
-      echo "::error::team-probe for ${U} in ${TEAM} returned 403 (token owner not in ${TEAM} team — RFC#324 token-scope follow-up). Cannot confirm membership; failing closed."
+      # Token owner is not in the team being probed; Gitea 1.22.6 refuses
+      # to confirm membership in this case. Do NOT hard-fail the gate on a
+      # 403 — doing so would fail the entire gate if ANY candidate triggers
+      # a 403, even when other valid team-members exist. Instead skip this
+      # candidate and continue checking others. If all candidates produce
+      # 403 (token owner can't query any of them) the final exit fires.
+      echo "::warning::team-probe for ${U} in ${TEAM} returned 403 (token owner not in ${TEAM} team — skipping; cannot confirm membership)"
       cat "$TEAM_PROBE_TMP" >&2
-      exit 1
+      continue
       ;;
     404)
       debug "${U} not a member of ${TEAM}"

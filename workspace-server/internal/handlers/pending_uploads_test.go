@@ -14,8 +14,8 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/handlers"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/pendinguploads"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/handlers"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/pendinguploads"
 )
 
 // fakeStorage is an in-memory pendinguploads.Storage. Lets handler

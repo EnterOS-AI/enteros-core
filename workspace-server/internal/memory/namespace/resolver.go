@@ -17,7 +17,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/memory/contract"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/memory/contract"
 )
 
 // Max parent_id chain depth we will walk before bailing out. Today's

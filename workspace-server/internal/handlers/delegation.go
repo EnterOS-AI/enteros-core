@@ -10,9 +10,9 @@ import (
 	"runtime"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/events"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/textutil"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/textutil"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
@@ -122,8 +122,22 @@ func (h *DelegationHandler) Delegate(c *gin.Context) {
 
 	// #548 — prevent self-delegation: a workspace delegating to itself
 	// acquires _run_lock twice on the same mutex, deadlocking permanently.
+	//
+	// #383 — the error message is the agent-visible string when this 400
+	// fires on the SDK's _delegate_sync_via_polling path. The previous
+	// terse "self-delegation not permitted" was correct but indistinct
+	// from a transient rate-limit or auth failure, so the LLM would
+	// re-attempt every 2-3s in a tight loop (chloe-dong tenant external
+	// workspace, 2026-05-20). The expanded message is explicit about
+	// (a) what just happened, (b) why it cannot succeed, (c) what to do
+	// instead — so the agent's retry heuristic recognizes the path as
+	// terminal and stops.
 	if sourceID == body.TargetID {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "self-delegation not permitted"})
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":  "self-delegation not permitted",
+			"reason": "the source workspace and target workspace are the same; you cannot delegate a task to yourself",
+			"hint":   "do the work yourself, or pick a different peer via list_peers — retrying with the same target_id will fail every time",
+		})
 		return
 	}
 
@@ -185,10 +199,15 @@ func (h *DelegationHandler) Delegate(c *gin.Context) {
 	delegationCtx, cancelDelegation := context.WithTimeout(
 		context.WithoutCancel(ctx), 30*time.Minute,
 	)
-	go func() {
+	// RFC internal#524 Layer 1: route through workspace.goAsync so the
+	// detached executeDelegation (which writes A2A status rows to db.DB
+	// across multiple stages) is drained before db.DB is restored in a
+	// later test's t.Cleanup. Tracked via the parent workspace handler's
+	// asyncWG.
+	h.workspace.goAsync(func() {
 		defer cancelDelegation()
 		h.executeDelegation(delegationCtx, sourceID, body.TargetID, delegationID, a2aBody)
-	}()
+	})
 
 	// Broadcast event so canvas shows delegation in real-time
 	h.broadcaster.RecordAndBroadcast(ctx, string(events.EventDelegationSent), sourceID, map[string]interface{}{
@@ -370,7 +389,7 @@ func (h *DelegationHandler) executeDelegation(ctx context.Context, sourceID, tar
 	})
 	log.Printf("Delegation %s: step=proxying_a2a_request", delegationID)
 
-	status, respBody, proxyErr := h.workspace.proxyA2ARequest(ctx, targetID, a2aBody, sourceID, true)
+	status, respBody, proxyErr := h.workspace.proxyA2ARequest(ctx, targetID, a2aBody, sourceID, true, false)
 	log.Printf("Delegation %s: step=proxy_done status=%d bodyLen=%d err=%v", delegationID, status, len(respBody), proxyErr)
 
 	// When proxyA2ARequest returns an error but we have a non-empty response body
@@ -399,7 +418,7 @@ func (h *DelegationHandler) executeDelegation(ctx context.Context, sourceID, tar
 		case <-ctx.Done():
 			// outer timeout hit before retry window elapsed
 		case <-time.After(delegationRetryDelay):
-			status, respBody, proxyErr = h.workspace.proxyA2ARequest(ctx, targetID, a2aBody, sourceID, true)
+			status, respBody, proxyErr = h.workspace.proxyA2ARequest(ctx, targetID, a2aBody, sourceID, true, false)
 		}
 	}
 
