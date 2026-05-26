@@ -402,6 +402,31 @@ describe("MissingKeysModal — add keys and deploy", () => {
     expect(onKeysAdded).toHaveBeenCalled();
   });
 
+  it("shows optional keys without blocking deploy", () => {
+    const onKeysAdded = vi.fn();
+    render(
+      <MissingKeysModal
+        open={true}
+        missingKeys={[]}
+        optionalKeys={["GOOGLE_GSC_SITE"]}
+        runtime="claude-code"
+        title="Configure Workspace"
+        onKeysAdded={onKeysAdded}
+        onCancel={vi.fn()}
+      />
+    );
+
+    expect(screen.getByText("Optional")).toBeTruthy();
+    expect(screen.getAllByText("GOOGLE_GSC_SITE").length).toBeGreaterThan(0);
+    const deployBtn = Array.from(document.querySelectorAll("button")).find(
+      (b) => b.textContent?.trim() === "Deploy",
+    );
+    expect(deployBtn).toBeTruthy();
+    expect(deployBtn!.disabled).toBe(false);
+    act(() => { fireEvent.click(deployBtn!); });
+    expect(onKeysAdded).toHaveBeenCalled();
+  });
+
   it("shows global error when not all keys saved", async () => {
     const onKeysAdded = vi.fn();
     render(

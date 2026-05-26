@@ -43,8 +43,8 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/events"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/textutil"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/textutil"
 )
 
 // ErrWorkspaceNotFound is returned by AgentMessageWriter.Send when the
@@ -64,10 +64,10 @@ var ErrTalkToUserDisabled = errors.New("agent_message: talk_to_user disabled")
 // distinct so the writer's API doesn't import a handler type with HTTP
 // binding tags.
 type AgentMessageAttachment struct {
-	URI      string
-	Name     string
-	MimeType string
-	Size     int64
+	URI      string `json:"uri"`
+	Name     string `json:"name"`
+	MimeType string `json:"mimeType,omitempty"`
+	Size     int64  `json:"size,omitempty"`
 }
 
 // AgentMessageWriter persists + broadcasts agent → user messages. Construct

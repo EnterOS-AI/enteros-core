@@ -513,6 +513,8 @@ export function buildNodesAndEdges(
         parentId: ws.parent_id,
         currentTask: ws.current_task || "",
         runtime: ws.runtime || "",
+        workspaceAccess: ws.workspace_access,
+        maxConcurrentTasks: ws.max_concurrent_tasks ?? null,
         needsRestart: false,
         budgetLimit: ws.budget_limit ?? null,
         budgetUsed: ws.budget_used ?? null,
@@ -526,6 +528,7 @@ export function buildNodesAndEdges(
         // A2A delivery mode (task #227). Absent on older ws-server builds
         // — leave undefined so the chat UI's "?? 'push'" fallback applies.
         deliveryMode: ws.delivery_mode,
+        compute: ws.compute,
       },
     };
     if (hasParent) {

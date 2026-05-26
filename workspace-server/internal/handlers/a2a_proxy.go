@@ -20,13 +20,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/envx"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/events"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/models"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/provisioner"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/registry"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/wsauth"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/envx"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/registry"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wsauth"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
@@ -111,12 +111,13 @@ const maxProxyResponseBody = 10 << 20
 //     a generic 502 page to canvas. 10s is well above realistic intra-region
 //     latencies and well below CF's edge timeout.
 //
-//  3. Transport.ResponseHeaderTimeout — 180s default. From request-body-end
+//  3. Transport.ResponseHeaderTimeout — 5min default. From request-body-end
 //     to response-headers-start. Configurable via
 //     A2A_PROXY_RESPONSE_HEADER_TIMEOUT (envx.Duration). Covers cold-start
 //     first-byte (30-60s OAuth flow above) with enough room for Opus agent
-//     turns (big context + internal delegate_task round-trips routinely exceed
-//     the old 60s ceiling). Body streaming after headers is governed by the
+//     turns and Codex scheduled tasks (big context + internal delegate_task
+//     round-trips routinely exceed the old 60s/180s ceilings). Body streaming
+//     after headers is governed by the
 //     per-request context deadline, NOT this timeout — so multi-minute agent
 //     responses still work fine.
 //
@@ -131,7 +132,7 @@ var a2aClient = &http.Client{
 			Timeout:   10 * time.Second,
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
-		ResponseHeaderTimeout: envx.Duration("A2A_PROXY_RESPONSE_HEADER_TIMEOUT", 180*time.Second),
+		ResponseHeaderTimeout: envx.Duration("A2A_PROXY_RESPONSE_HEADER_TIMEOUT", 5*time.Minute),
 		TLSHandshakeTimeout:   10 * time.Second,
 		// MaxIdleConns / IdleConnTimeout: stdlib defaults are fine; agent
 		// fan-in is bounded by the platform's broadcaster fan-out, not by
@@ -228,7 +229,7 @@ func (e *proxyA2AError) Error() string {
 // cron scheduler and other internal callers that need to send A2A messages
 // to workspaces programmatically (not from an HTTP handler).
 func (h *WorkspaceHandler) ProxyA2ARequest(ctx context.Context, workspaceID string, body []byte, callerID string, logActivity bool) (int, []byte, error) {
-	status, resp, proxyErr := h.proxyA2ARequest(ctx, workspaceID, body, callerID, logActivity)
+	status, resp, proxyErr := h.proxyA2ARequest(ctx, workspaceID, body, callerID, logActivity, false)
 	if proxyErr != nil {
 		return status, resp, proxyErr
 	}
@@ -307,13 +308,21 @@ func (h *WorkspaceHandler) ProxyA2A(c *gin.Context) {
 	// The bind is strict: the token must match `callerID`, not
 	// `workspaceID` (the target). A compromised token from workspace A
 	// must never authenticate calls from A pretending to be B.
-	if callerID != "" && callerID != workspaceID {
-		if err := validateCallerToken(ctx, c, callerID); err != nil {
+	//
+	// Post-RFC#637: canvas users now send X-Workspace-ID (their identity
+	// workspace). validateCallerToken detects canvas/admin auth on a
+	// tokenless workspace and returns isCanvasUser=true so the proxy can
+	// bypass CanCommunicate (human users sit outside the hierarchy).
+	isCanvasUser := false
+	if callerID != "" && callerID != workspaceID && !isSystemCaller(callerID) {
+		var err error
+		isCanvasUser, err = validateCallerToken(ctx, c, callerID)
+		if err != nil {
 			return // response already written with 401
 		}
 	}
 
-	status, respBody, proxyErr := h.proxyA2ARequest(ctx, workspaceID, body, callerID, true)
+	status, respBody, proxyErr := h.proxyA2ARequest(ctx, workspaceID, body, callerID, true, isCanvasUser)
 	if proxyErr != nil {
 		for k, v := range proxyErr.Headers {
 			c.Header(k, v)
@@ -352,11 +361,13 @@ func (h *WorkspaceHandler) checkWorkspaceBudget(ctx context.Context, workspaceID
 	return nil
 }
 
-func (h *WorkspaceHandler) proxyA2ARequest(ctx context.Context, workspaceID string, body []byte, callerID string, logActivity bool) (int, []byte, *proxyA2AError) {
+func (h *WorkspaceHandler) proxyA2ARequest(ctx context.Context, workspaceID string, body []byte, callerID string, logActivity bool, isCanvasUser bool) (int, []byte, *proxyA2AError) {
 	// Access control: workspace-to-workspace requests must pass CanCommunicate check.
 	// Canvas requests (callerID == "") and system callers (webhook:*, system:*, test:*)
 	// are trusted. Self-calls (callerID == workspaceID) are always allowed.
-	if callerID != "" && callerID != workspaceID && !isSystemCaller(callerID) {
+	// Post-RFC#637: canvas-user identity workspaces also bypass CanCommunicate
+	// because human users sit outside the org hierarchy.
+	if callerID != "" && callerID != workspaceID && !isSystemCaller(callerID) && !isCanvasUser {
 		if !registry.CanCommunicate(callerID, workspaceID) {
 			log.Printf("ProxyA2A: access denied %s → %s", callerID, workspaceID)
 			return 0, nil, &proxyA2AError{
@@ -694,7 +705,7 @@ func (h *WorkspaceHandler) resolveAgentURL(ctx context.Context, workspaceID stri
 	if strings.HasPrefix(agentURL, "http://127.0.0.1:") && h.provisioner != nil && platformInDocker {
 		var wsRuntime string
 		if err := db.DB.QueryRowContext(ctx,
-			`SELECT COALESCE(runtime, 'langgraph') FROM workspaces WHERE id = $1`,
+			`SELECT COALESCE(runtime, 'claude-code') FROM workspaces WHERE id = $1`,
 			workspaceID,
 		).Scan(&wsRuntime); err != nil {
 			log.Printf("ProxyA2A: runtime lookup before Docker URL rewrite failed for %s: %v", workspaceID, err)

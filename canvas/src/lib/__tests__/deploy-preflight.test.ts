@@ -32,9 +32,14 @@ const hermesModels: ModelSpec[] = [
 
 const HERMES: TemplateLike = { runtime: "hermes", models: hermesModels };
 
-const LANGGRAPH: TemplateLike = {
-  runtime: "langgraph",
+const CLAUDE_CODE: TemplateLike = {
+  runtime: "claude-code",
   required_env: ["OPENAI_API_KEY"],
+};
+
+const OPTIONAL_ONLY: TemplateLike = {
+  runtime: "claude-code",
+  recommended_env: ["GOOGLE_GSC_SITE", "GOOGLE_GA4_PROPERTY_ID"],
 };
 
 const UNKNOWN: TemplateLike = { runtime: "nothing-declared" };
@@ -69,7 +74,7 @@ describe("providersFromTemplate", () => {
   });
 
   it("falls back to top-level required_env when no models[] are declared", () => {
-    const providers = providersFromTemplate(LANGGRAPH);
+    const providers = providersFromTemplate(CLAUDE_CODE);
     expect(providers).toHaveLength(1);
     expect(providers[0].envVars).toEqual(["OPENAI_API_KEY"]);
   });
@@ -151,10 +156,11 @@ describe("checkDeploySecrets", () => {
         ]),
     } as Response);
 
-    const result = await checkDeploySecrets(LANGGRAPH);
+    const result = await checkDeploySecrets(CLAUDE_CODE);
     expect(result.ok).toBe(true);
     expect(result.missingKeys).toEqual([]);
-    expect(result.runtime).toBe("langgraph");
+    expect(result.optionalKeys).toEqual([]);
+    expect(result.runtime).toBe("claude-code");
   });
 
   it("returns ok=true on a multi-provider template when ANY provider is configured", async () => {
@@ -184,6 +190,7 @@ describe("checkDeploySecrets", () => {
     );
     // Grouped providers preserved for the picker.
     expect(result.providers).toHaveLength(3);
+    expect(result.optionalKeys).toEqual([]);
   });
 
   it("treats has_value=false as not-configured", async () => {
@@ -195,7 +202,7 @@ describe("checkDeploySecrets", () => {
         ]),
     } as Response);
 
-    const result = await checkDeploySecrets(LANGGRAPH);
+    const result = await checkDeploySecrets(CLAUDE_CODE);
     expect(result.ok).toBe(false);
     expect(result.missingKeys).toEqual(["OPENAI_API_KEY"]);
   });
@@ -207,6 +214,22 @@ describe("checkDeploySecrets", () => {
     expect(global.fetch).not.toHaveBeenCalled();
   });
 
+  it("prompts optional-only env without treating it as missing", async () => {
+    (global.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve([]),
+    } as Response);
+
+    const result = await checkDeploySecrets(OPTIONAL_ONLY);
+    expect(result.ok).toBe(true);
+    expect(result.missingKeys).toEqual([]);
+    expect(result.optionalKeys).toEqual([
+      "GOOGLE_GSC_SITE",
+      "GOOGLE_GA4_PROPERTY_ID",
+    ]);
+    expect(global.fetch).toHaveBeenCalled();
+  });
+
   it("uses the workspace-scoped endpoint when workspaceId is provided", async () => {
     (global.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
       ok: true,
@@ -216,7 +239,7 @@ describe("checkDeploySecrets", () => {
         ]),
     } as Response);
 
-    await checkDeploySecrets(LANGGRAPH, "ws-123");
+    await checkDeploySecrets(CLAUDE_CODE, "ws-123");
     expect(global.fetch).toHaveBeenCalledWith(
       expect.stringContaining("/workspaces/ws-123/secrets"),
       expect.any(Object),
@@ -229,7 +252,7 @@ describe("checkDeploySecrets", () => {
       json: () => Promise.resolve([]),
     } as Response);
 
-    await checkDeploySecrets(LANGGRAPH);
+    await checkDeploySecrets(CLAUDE_CODE);
     expect(global.fetch).toHaveBeenCalledWith(
       expect.stringContaining("/settings/secrets"),
       expect.any(Object),
@@ -241,9 +264,10 @@ describe("checkDeploySecrets", () => {
       new Error("Network error"),
     );
 
-    const result = await checkDeploySecrets(LANGGRAPH);
+    const result = await checkDeploySecrets(CLAUDE_CODE);
     expect(result.ok).toBe(false);
     expect(result.missingKeys).toEqual(["OPENAI_API_KEY"]);
+    expect(result.optionalKeys).toEqual([]);
     // Empty Set on fetch failure — useTemplateDeploy relies on this
     // so the picker still opens with every entry rendered as input.
     expect(result.configuredKeys).toEqual(new Set());

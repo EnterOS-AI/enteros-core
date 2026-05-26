@@ -242,10 +242,13 @@ export function ProvisioningTimeout({
   const handleCancelConfirm = useCallback(async () => {
     if (!confirmingCancel) return;
     const workspaceId = confirmingCancel;
+    const workspaceName = timedOut.find((e) => e.workspaceId === workspaceId)?.workspaceName ?? "";
     setConfirmingCancel(null);
     setCancelling((prev) => new Set(prev).add(workspaceId));
     try {
-      await api.del(`/workspaces/${workspaceId}`);
+      await api.del(`/workspaces/${workspaceId}`, {
+        headers: { "X-Confirm-Name": workspaceName },
+      });
       setTimedOut((prev) => prev.filter((e) => e.workspaceId !== workspaceId));
       trackingRef.current.delete(workspaceId);
       showToast("Deployment cancelled", "info");

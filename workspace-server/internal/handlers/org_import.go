@@ -17,14 +17,14 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/channels"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/crypto"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/events"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/models"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/provisioner"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/provlog"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/scheduler"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/channels"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/crypto"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provlog"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/scheduler"
 	"github.com/google/uuid"
 )
 
@@ -62,17 +62,22 @@ func (h *OrgHandler) createWorkspaceTree(ws OrgWorkspace, parentID *string, absX
 		runtime = defaults.Runtime
 	}
 	if runtime == "" {
-		runtime = "langgraph"
+		runtime = "claude-code"
 	}
 	model := ws.Model
 	if model == "" {
 		model = defaults.Model
 	}
 	if model == "" {
-		// SSOT: per-runtime defaults live in models/runtime_defaults.go
-		// (see RFC #2873). Consolidated from a duplicate of the same
-		// branch in workspace_provision.go.
-		model = models.DefaultModel(runtime)
+		// SSOT (CTO 2026-05-22, feedback_workspace_model_required_no_platform_default_dynamic_credential_intake):
+		// model is REQUIRED. The org-import template MUST declare a
+		// model — either per-workspace (`ws.Model`) or via the org
+		// defaults block (`defaults.Model`). If neither is present
+		// the template is malformed and the import must fail-closed
+		// rather than silently provisioning a workspace with a
+		// runtime-incompatible default (the prior `anthropic:claude-opus-4-7`
+		// fallback wedged every codex workspace at adapter init).
+		return fmt.Errorf("org import: workspace %q has no model and the org defaults block does not provide one (runtime=%s) — model is a required field per the workspace-creation contract; either set `model:` on the workspace or under `defaults:`", ws.Name, runtime)
 	}
 	tier := ws.Tier
 	if tier == 0 {
@@ -97,7 +102,6 @@ func (h *OrgHandler) createWorkspaceTree(ws OrgWorkspace, parentID *string, absX
 	}
 
 	id := uuid.New().String()
-	awarenessNS := workspaceAwarenessNamespace(id)
 
 	var role interface{}
 	if ws.Role != "" {
@@ -163,13 +167,13 @@ func (h *OrgHandler) createWorkspaceTree(ws OrgWorkspace, parentID *string, absX
 	// EXACTLY for Postgres to consider the index applicable.
 	var insertedID string
 	err := db.DB.QueryRowContext(ctx, `
-		INSERT INTO workspaces (id, name, role, tier, runtime, awareness_namespace, status, parent_id, workspace_dir, workspace_access, max_concurrent_tasks)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+		INSERT INTO workspaces (id, name, role, tier, runtime, status, parent_id, workspace_dir, workspace_access, max_concurrent_tasks)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 		ON CONFLICT (COALESCE(parent_id, '00000000-0000-0000-0000-000000000000'::uuid), name)
 		WHERE status != 'removed'
 		DO NOTHING
 		RETURNING id
-	`, id, ws.Name, role, tier, runtime, awarenessNS, "provisioning", parentID, workspaceDir, workspaceAccess, maxConcurrent).Scan(&insertedID)
+	`, id, ws.Name, role, tier, runtime, "provisioning", parentID, workspaceDir, workspaceAccess, maxConcurrent).Scan(&insertedID)
 	if errors.Is(err, sql.ErrNoRows) {
 		// Skip path — a non-removed row already exists for
 		// (parent_id, name). Re-select its id; idempotency-friendly
@@ -254,7 +258,7 @@ func (h *OrgHandler) createWorkspaceTree(ws OrgWorkspace, parentID *string, absX
 	if len(wsMemories) == 0 {
 		wsMemories = defaults.InitialMemories
 	}
-	seedInitialMemories(ctx, id, wsMemories, awarenessNS)
+	h.workspace.seedInitialMemories(ctx, id, wsMemories)
 
 	// Handle external workspaces
 	if ws.External {

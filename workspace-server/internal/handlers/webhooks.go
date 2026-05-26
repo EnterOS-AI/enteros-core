@@ -12,8 +12,8 @@ import (
 	"os"
 	"strings"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/events"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
 	"github.com/gin-gonic/gin"
 )
 
@@ -107,6 +107,7 @@ func (h *WebhookHandler) GitHub(c *gin.Context) {
 		forwardBody,
 		"webhook:github",
 		true,
+		false,
 	)
 	if proxyErr != nil {
 		c.JSON(proxyErr.Status, proxyErr.Response)

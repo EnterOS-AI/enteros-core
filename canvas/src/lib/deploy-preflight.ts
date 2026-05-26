@@ -21,6 +21,7 @@ import { api } from "./api";
 export interface ModelSpec {
   id: string;
   name?: string;
+  provider?: string;
   required_env?: string[];
 }
 
@@ -31,6 +32,8 @@ export interface TemplateLike {
   models?: ModelSpec[];
   /** AND-required env vars declared at runtime_config level. */
   required_env?: string[];
+  /** Optional env vars declared at runtime_config level. */
+  recommended_env?: string[];
 }
 
 /** Full /templates response shape shared by TemplatePalette (sidebar)
@@ -49,6 +52,17 @@ export interface Template extends TemplateLike {
   skill_count: number;
 }
 
+const RUNTIME_DEFAULT_TEMPLATE_IDS = new Set([
+  "claude-code-default",
+  "codex",
+  "hermes",
+  "openclaw",
+]);
+
+export function isUserVisibleWorkspaceTemplate(template: Pick<Template, "id">): boolean {
+  return !RUNTIME_DEFAULT_TEMPLATE_IDS.has(template.id);
+}
+
 /** Map from a template id to the runtime name the per-workspace
  *  preflight expects. Used only when the server's `/templates`
  *  response predates the `runtime` field on the summary (legacy
@@ -63,12 +77,10 @@ export interface Template extends TemplateLike {
  *  id needs a non-identity mapping. */
 export function resolveRuntime(templateId: string): string {
   const runtimeMap: Record<string, string> = {
-    langgraph: "langgraph",
     "claude-code-default": "claude-code",
+    codex: "codex",
+    hermes: "hermes",
     openclaw: "openclaw",
-    deepagents: "deepagents",
-    crewai: "crewai",
-    autogen: "autogen",
   };
   return runtimeMap[templateId] ?? templateId.replace(/-default$/, "");
 }
@@ -86,6 +98,8 @@ export interface PreflightResult {
   /** Flat list of env var names needed — for the legacy modal path and
    *  for callers that want a single display of "what's missing". */
   missingKeys: string[];
+  /** Optional env vars to offer in the modal without blocking deploy. */
+  optionalKeys: string[];
   /** Grouped provider options derived from the template. When length ≥ 2
    *  the modal renders a picker; length 1 means exactly one provider is
    *  required (AllKeysModal renders the N envVars inline). */
@@ -238,12 +252,14 @@ export async function checkDeploySecrets(
 ): Promise<PreflightResult> {
   const providers = providersFromTemplate(template);
   const runtime = template.runtime;
+  const optionalKeys = Array.from(new Set(template.recommended_env ?? []));
 
-  if (providers.length === 0) {
+  if (providers.length === 0 && optionalKeys.length === 0) {
     // Template declares no env requirements — nothing to preflight.
     return {
       ok: true,
       missingKeys: [],
+      optionalKeys: [],
       providers: [],
       runtime,
       configuredKeys: new Set(),
@@ -265,10 +281,11 @@ export async function checkDeploySecrets(
     configured = new Set();
   }
 
-  if (findSatisfiedProvider(providers, configured)) {
+  if (providers.length === 0 || findSatisfiedProvider(providers, configured)) {
     return {
       ok: true,
       missingKeys: [],
+      optionalKeys,
       providers,
       runtime,
       configuredKeys: configured,
@@ -283,6 +300,7 @@ export async function checkDeploySecrets(
   return {
     ok: false,
     missingKeys,
+    optionalKeys,
     providers,
     runtime,
     configuredKeys: configured,

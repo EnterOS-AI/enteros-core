@@ -253,7 +253,7 @@ interface RuntimeOption {
   // its config.yaml under runtime_config.providers. The /templates API
   // surfaces it (workspace-server templates.go) so canvas stays
   // adapter-driven: hermes ships ~20 slugs, claude-code ships
-  // ["anthropic"], gemini-cli ships ["gemini"], etc. Empty list →
+  // ["anthropic"], codex ships OpenAI-compatible model ids, etc. Empty list →
   // canvas falls back to deriving unique vendor prefixes from
   // models[].id (still adapter-driven, just inferred).
   providers: string[];
@@ -301,16 +301,13 @@ export function deriveProvidersFromModels(models: ModelSpec[]): string[] {
 // config.yaml` on the container is a separate runtime-internal file,
 // not this one.
 const RUNTIMES_WITH_OWN_CONFIG = new Set<string>(["external", "kimi", "kimi-cli", "openclaw"]);
+const SUPPORTED_RUNTIME_VALUES = new Set(["claude-code", "codex", "openclaw", "hermes"]);
 
 const FALLBACK_RUNTIME_OPTIONS: RuntimeOption[] = [
-  { value: "", label: "LangGraph (default)", models: [], providers: [] },
   { value: "claude-code", label: "Claude Code", models: [], providers: [] },
-  { value: "crewai", label: "CrewAI", models: [], providers: [] },
-  { value: "autogen", label: "AutoGen", models: [], providers: [] },
-  { value: "deepagents", label: "DeepAgents", models: [], providers: [] },
+  { value: "codex", label: "Codex", models: [], providers: [] },
   { value: "openclaw", label: "OpenClaw", models: [], providers: [] },
   { value: "hermes", label: "Hermes", models: [], providers: [] },
-  { value: "gemini-cli", label: "Gemini CLI", models: [], providers: [] },
 ];
 
 export function ConfigTab({ workspaceId }: Props) {
@@ -499,10 +496,9 @@ export function ConfigTab({ workspaceId }: Props) {
       .then((rows) => {
         if (cancelled || !Array.isArray(rows)) return;
         const byRuntime = new Map<string, RuntimeOption>();
-        byRuntime.set("", { value: "", label: "LangGraph (default)", models: [], providers: [] });
         for (const r of rows) {
           const v = (r.runtime || "").trim();
-          if (!v || v === "langgraph") continue;
+          if (!SUPPORTED_RUNTIME_VALUES.has(v)) continue;
           // Last template wins if two templates share a runtime — rare, and the
           // one with the richer models list is probably newer.
           const existing = byRuntime.get(v);
@@ -512,7 +508,7 @@ export function ConfigTab({ workspaceId }: Props) {
             byRuntime.set(v, { value: v, label: r.name || v, models, providers });
           }
         }
-        if (byRuntime.size > 1) setRuntimeOptions(Array.from(byRuntime.values()));
+        if (byRuntime.size > 0) setRuntimeOptions(Array.from(byRuntime.values()));
       })
       .catch(() => { /* keep fallback */ });
     return () => { cancelled = true; };

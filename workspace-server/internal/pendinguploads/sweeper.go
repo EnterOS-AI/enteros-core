@@ -30,7 +30,7 @@ import (
 	"log"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/metrics"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/metrics"
 )
 
 // SweepInterval is the cadence of the GC loop. 5 minutes is a balance

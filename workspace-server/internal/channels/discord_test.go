@@ -3,6 +3,7 @@ package channels
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -12,6 +13,17 @@ import (
 )
 
 // ==================== DiscordAdapter unit tests ====================
+
+// fatalClient is a deterministic httpClient stub that always returns a
+// fixed error. Used to test that error messages from SendMessage do not
+// contain the Discord webhook token.
+type fatalClient struct {
+	err error
+}
+
+func (c *fatalClient) Do(*http.Request) (*http.Response, error) {
+	return nil, c.err
+}
 
 func TestDiscordAdapter_Type(t *testing.T) {
 	a := &DiscordAdapter{}
@@ -288,17 +300,36 @@ func TestSplitMessage_LongMessage(t *testing.T) {
 }
 
 // TestDiscordAdapter_SendMessage_ErrorDoesNotLeakToken verifies that when the
-// HTTP call to the Discord webhook fails (e.g. DNS error), the returned error
+// HTTP call to the Discord webhook fails (network error), the returned error
 // message does NOT contain the webhook URL — which embeds the Discord token.
 // Regression test for the MEDIUM security finding in PR #659.
+//
+// This test uses a deterministic httptest.Server (connection refused) rather
+// than a live network call, so it always exercises the error path regardless
+// of environment routing.
 func TestDiscordAdapter_SendMessage_ErrorDoesNotLeakToken(t *testing.T) {
-	a := &DiscordAdapter{}
-	// Use a valid-looking webhook URL with a fake token so we can check it
-	// doesn't appear in the error string.
 	fakeToken := "SUPER_SECRET_DISCORD_TOKEN_12345"
 	webhookURL := discordWebhookPrefix + "123456789/" + fakeToken
 
-	// Point at an unroutable address to force a dial error.
+	// httptest.Server with no handler → connection refused / immediate close.
+	// Deterministic in all environments; no skip condition.
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("server handler called — should have been unreachable")
+	}))
+	defer ts.Close()
+
+	// Point the webhook URL at the test server so DiscordAdapter sends there.
+	// We intercept the *request* (not the URL) by swapping the client's base URL.
+	// The adapter always resolves webhookURL from config, so we set up a
+	// test server that refuses connections on the real discord.com domain
+	// by having the adapter's HTTP client hit an unreachable host.
+	//
+	// Simpler: construct a URL with the fake token that won't route anywhere,
+	// but use a mock httpClient to control the error exactly.
+	a := &DiscordAdapter{
+		client: &fatalClient{err: fmt.Errorf("connection refused")},
+	}
+
 	err := a.SendMessage(
 		context.Background(),
 		map[string]interface{}{"webhook_url": webhookURL},
@@ -307,11 +338,13 @@ func TestDiscordAdapter_SendMessage_ErrorDoesNotLeakToken(t *testing.T) {
 	)
 
 	if err == nil {
-		// In some environments the request might actually succeed; that's fine.
-		t.Skip("request unexpectedly succeeded — skipping token-leak check")
+		t.Fatal("expected error from fatalClient")
 	}
 	if strings.Contains(err.Error(), fakeToken) {
 		t.Errorf("error message leaks Discord webhook token: %q", err.Error())
+	}
+	if strings.Contains(err.Error(), "123456789") {
+		t.Errorf("error message leaks webhook ID: %q", err.Error())
 	}
 }
 

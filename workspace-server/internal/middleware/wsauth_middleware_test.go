@@ -256,6 +256,7 @@ func TestWorkspaceAuth_WrongWorkspace_Returns401(t *testing.T) {
 // live tokens anywhere) the middleware must let the request through so existing
 // deployments keep working during the Phase-30 rollout.
 func TestAdminAuth_FailOpen_NoTokensGlobally(t *testing.T) {
+	t.Setenv("ADMIN_TOKEN", "")
 	mockDB, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock.New: %v", err)
@@ -277,6 +278,54 @@ func TestAdminAuth_FailOpen_NoTokensGlobally(t *testing.T) {
 
 	if w.Code != http.StatusOK {
 		t.Errorf("C10 fail-open (no global tokens): expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+func TestAdminAuth_VerifiedCPSession_SetsSessionActor(t *testing.T) {
+	resetSessionCache()
+	srv, hits := mockCPServer(t, http.StatusOK, `{"member":true,"user_id":"u_1","role":"owner","org_id":"org_1"}`)
+	t.Setenv("CP_UPSTREAM_URL", srv.URL)
+	t.Setenv("MOLECULE_ORG_SLUG", "acme")
+	t.Setenv("ADMIN_TOKEN", "admin-secret")
+
+	mockDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer mockDB.Close()
+
+	mock.ExpectQuery(hasAnyLiveTokenGlobalQuery).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+
+	const cookie = "session=valid-browser-session"
+	r := gin.New()
+	r.GET("/workspaces", AdminAuth(mockDB), func(c *gin.Context) {
+		actor, ok := c.Get("cp_session_actor")
+		if !ok {
+			t.Fatalf("expected cp_session_actor in context")
+		}
+		if actor != cpSessionActor(cookie) {
+			t.Fatalf("cp_session_actor = %q, want stable hashed actor", actor)
+		}
+		if actor == cookie {
+			t.Fatalf("cp_session_actor must not expose the raw cookie")
+		}
+		c.JSON(http.StatusOK, gin.H{"ok": true})
+	})
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/workspaces", nil)
+	req.Header.Set("Cookie", cookie)
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for verified CP session, got %d: %s", w.Code, w.Body.String())
+	}
+	if hits.Load() != 1 {
+		t.Fatalf("expected one CP verification request, got %d", hits.Load())
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations: %v", err)
@@ -375,6 +424,7 @@ func TestAdminAuth_C11_DeleteNoBearer_Returns401(t *testing.T) {
 // TestAdminAuth_ValidBearer_Passes — a valid bearer token (from any workspace)
 // must be accepted for admin routes.
 func TestAdminAuth_ValidBearer_Passes(t *testing.T) {
+	t.Setenv("ADMIN_TOKEN", "")
 	mockDB, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock.New: %v", err)
@@ -418,6 +468,7 @@ func TestAdminAuth_ValidBearer_Passes(t *testing.T) {
 
 // TestAdminAuth_InvalidBearer_Returns401 — wrong token must not grant admin access.
 func TestAdminAuth_InvalidBearer_Returns401(t *testing.T) {
+	t.Setenv("ADMIN_TOKEN", "")
 	mockDB, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock.New: %v", err)
@@ -700,6 +751,7 @@ func TestAdminAuth_Issue180_ApprovalsListing_NoBearer_Returns401(t *testing.T) {
 // fail-open contract: on a fresh install (no tokens anywhere), the middleware
 // must not block the canvas from polling /approvals/pending.
 func TestAdminAuth_Issue180_ApprovalsListing_FailOpen_NoTokens(t *testing.T) {
+	t.Setenv("ADMIN_TOKEN", "")
 	mockDB, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock.New: %v", err)
@@ -1098,6 +1150,7 @@ func TestCanvasOrBearer_TokensExist_CanvasOrigin_Passes(t *testing.T) {
 // issuing workspace has status='removed' must not grant admin access.
 // The JOIN in ValidateAnyToken filters the row out, resulting in ErrNoRows.
 func TestAdminAuth_RemovedWorkspaceToken_Returns401(t *testing.T) {
+	t.Setenv("ADMIN_TOKEN", "")
 	mockDB, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock.New: %v", err)
@@ -1251,6 +1304,7 @@ func TestAdminAuth_623_ForgedCORSOrigin_Returns401(t *testing.T) {
 // TestAdminAuth_623_ValidBearer_WithOrigin_Passes — bearer + matching Origin
 // should still work (the Origin is irrelevant once the bearer validates).
 func TestAdminAuth_623_ValidBearer_WithOrigin_Passes(t *testing.T) {
+	t.Setenv("ADMIN_TOKEN", "")
 	mockDB, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock: %v", err)

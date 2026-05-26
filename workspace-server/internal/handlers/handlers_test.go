@@ -13,11 +13,11 @@ import (
 	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/events"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/models"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/ws"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/wsauth"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/ws"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wsauth"
 	"github.com/alicebob/miniredis/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/redis/go-redis/v9"
@@ -364,15 +364,17 @@ func TestWorkspaceCreate(t *testing.T) {
 	// Expect transaction begin for atomic workspace+secrets creation
 	mock.ExpectBegin()
 
-	// Expect workspace INSERT (uuid is dynamic, use AnyArg for id, runtime, awareness_namespace).
+	// Expect workspace INSERT (uuid is dynamic, use AnyArg for id, runtime).
 	// Default tier is 3 (Privileged) — see workspace.go create-handler comment.
 	// delivery_mode defaults to "push" when payload omits it (#2339).
 	mock.ExpectExec("INSERT INTO workspaces").
-		WithArgs(sqlmock.AnyArg(), "Test Agent", nil, 3, "langgraph", sqlmock.AnyArg(), (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
+		WithArgs(sqlmock.AnyArg(), "Test Agent", nil, 3, "claude-code", (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// Expect transaction commit (no secrets in this payload)
 	mock.ExpectCommit()
+	mock.ExpectExec("INSERT INTO workspace_secrets").
+		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// Expect canvas_layouts INSERT
 	mock.ExpectExec("INSERT INTO canvas_layouts").
@@ -386,7 +388,13 @@ func TestWorkspaceCreate(t *testing.T) {
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 
-	body := `{"name":"Test Agent","canvas":{"x":100,"y":200}}`
+	// Note: model is now required at the Create boundary (CTO 2026-05-22
+	// SSOT directive — see feedback_workspace_model_required_no_platform_default_dynamic_credential_intake
+	// and TestCreate_ModelRequired_Returns422). This test happens to take
+	// the bare-defaults path (no template, no runtime → claude-code), so
+	// the body must declare an explicit model. Using a claude-code-compatible
+	// id; the test doesn't exercise model semantics beyond presence.
+	body := `{"name":"Test Agent","model":"anthropic:claude-opus-4-7","canvas":{"x":100,"y":200}}`
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
@@ -405,9 +413,6 @@ func TestWorkspaceCreate(t *testing.T) {
 	}
 	if resp["id"] == nil || resp["id"] == "" {
 		t.Error("expected non-empty id in response")
-	}
-	if resp["awareness_namespace"] != "workspace:"+resp["id"].(string) {
-		t.Errorf("expected awareness namespace derived from workspace id, got %v", resp["awareness_namespace"])
 	}
 
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -486,14 +491,12 @@ func TestWorkspaceCreate_ReturnsAuthToken_201(t *testing.T) {
 }
 
 func TestBuildProvisionerConfig_IncludesAwarenessSettings(t *testing.T) {
-	setupTestDB(t)
-	// runtime_image_pins reader removed by RFC internal#617 / task #335
-	// — CP is the SSOT for runtime image pins. No DB lookup here anymore.
 
+func TestBuildProvisionerConfig_WorkspacePathFromPayload(t *testing.T) {
+	setupTestDB(t)
 	broadcaster := newTestBroadcaster()
 	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", "/tmp/configs")
 
-	t.Setenv("AWARENESS_URL", "http://awareness:37800")
 	t.Setenv("WORKSPACE_DIR", "/tmp/workspace")
 
 	cfg := handler.buildProvisionerConfig(
@@ -504,17 +507,10 @@ func TestBuildProvisionerConfig_IncludesAwarenessSettings(t *testing.T) {
 		models.CreateWorkspacePayload{Tier: 2, Runtime: "claude-code", WorkspaceDir: "/tmp/workspace", WorkspaceAccess: "read_write"},
 		map[string]string{"OPENAI_API_KEY": "sk-test"},
 		"/tmp/plugins",
-		"workspace:ws-123",
 	)
 
-	if cfg.AwarenessURL != "http://awareness:37800" {
-		t.Fatalf("expected awareness URL to be injected, got %q", cfg.AwarenessURL)
-	}
-	if cfg.AwarenessNamespace != "workspace:ws-123" {
-		t.Fatalf("expected awareness namespace to be injected, got %q", cfg.AwarenessNamespace)
-	}
 	if cfg.WorkspacePath != "/tmp/workspace" {
-		t.Fatalf("expected workspace path from env, got %q", cfg.WorkspacePath)
+		t.Fatalf("expected workspace path from payload, got %q", cfg.WorkspacePath)
 	}
 }
 
@@ -526,7 +522,7 @@ func TestWorkspaceList(t *testing.T) {
 	broadcaster := newTestBroadcaster()
 	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", "/tmp/configs")
 
-	// 23 cols: broadcast_enabled + talk_to_user_enabled added after monthly_spend
+	// 24 cols: compute added after talk_to_user_enabled.
 	// (migration 20260514). Column order must match scanWorkspaceRow exactly.
 	columns := []string{
 		"id", "name", "role", "tier", "status", "agent_card", "url",
@@ -534,13 +530,13 @@ func TestWorkspaceList(t *testing.T) {
 		"last_error_rate", "last_sample_error",
 		"uptime_seconds", "current_task", "runtime", "workspace_dir", "x", "y", "collapsed",
 		"budget_limit", "monthly_spend",
-		"broadcast_enabled", "talk_to_user_enabled",
+		"broadcast_enabled", "talk_to_user_enabled", "compute",
 	}
 	rows := sqlmock.NewRows(columns).
 		AddRow("ws-1", "Agent One", "worker", 1, "online", []byte("null"), "http://localhost:8001",
-			nil, 0, 1, 0.0, "", 100, "", "claude-code", "", 10.0, 20.0, false, nil, int64(0), false, true).
+			nil, 0, 1, 0.0, "", 100, "", "claude-code", "", 10.0, 20.0, false, nil, int64(0), false, true, []byte(`{}`)).
 		AddRow("ws-2", "Agent Two", "manager", 2, "provisioning", []byte("null"), "",
-			nil, 0, 1, 0.0, "", 0, "", "langgraph", "", 50.0, 60.0, false, nil, int64(0), false, true)
+			nil, 0, 1, 0.0, "", 0, "", "claude-code", "", 50.0, 60.0, false, nil, int64(0), false, true, []byte(`{}`))
 
 	mock.ExpectQuery("SELECT w.id, w.name").
 		WillReturnRows(rows)
@@ -1254,14 +1250,14 @@ func TestWorkspaceGet_CurrentTask(t *testing.T) {
 		"parent_id", "active_tasks", "max_concurrent_tasks", "last_error_rate", "last_sample_error",
 		"uptime_seconds", "current_task", "runtime", "workspace_dir", "x", "y", "collapsed",
 		"budget_limit", "monthly_spend",
-		"broadcast_enabled", "talk_to_user_enabled",
+		"broadcast_enabled", "talk_to_user_enabled", "compute",
 	}
 	mock.ExpectQuery("SELECT w.id, w.name").
 		WithArgs("dddddddd-0004-0000-0000-000000000000").
 		WillReturnRows(sqlmock.NewRows(columns).AddRow(
 			"dddddddd-0004-0000-0000-000000000000", "Task Worker", "worker", 1, "online", []byte("null"), "http://localhost:9000",
-			nil, 2, 1, 0.0, "", 300, "Analyzing document", "langgraph", "", 10.0, 20.0, false,
-			nil, int64(0), false, true,
+			nil, 2, 1, 0.0, "", 300, "Analyzing document", "claude-code", "", 10.0, 20.0, false,
+			nil, int64(0), false, true, []byte(`{}`),
 		))
 
 	w := httptest.NewRecorder()

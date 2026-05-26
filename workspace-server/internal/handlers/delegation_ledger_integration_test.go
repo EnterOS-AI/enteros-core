@@ -41,7 +41,7 @@ import (
 	"testing"
 	"time"
 
-	mdb "github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
+	mdb "git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	_ "github.com/lib/pq"
 )
 

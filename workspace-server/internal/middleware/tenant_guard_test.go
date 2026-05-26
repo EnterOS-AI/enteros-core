@@ -3,6 +3,7 @@ package middleware
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -64,11 +65,16 @@ func TestTenantGuard_MismatchedHeaderIs404(t *testing.T) {
 	}
 }
 
-// Set + missing header → 404.
-func TestTenantGuard_MissingHeaderIs404(t *testing.T) {
+// Set + missing header → actionable 400. This is a client integration error,
+// not a cross-tenant probe, so the API should tell operators what to fix.
+func TestTenantGuard_MissingHeaderIs400(t *testing.T) {
 	r := newGuardedRouter("org-abc")
-	if w := doRequest(r, "/workspaces", ""); w.Code != 404 {
-		t.Errorf("missing header: expected 404, got %d", w.Code)
+	w := doRequest(r, "/workspaces", "")
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("missing header: expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "TENANT_ORG_HEADER_REQUIRED") {
+		t.Errorf("missing header body should explain the required header, got %q", w.Body.String())
 	}
 }
 
@@ -219,8 +225,8 @@ func TestTenantGuard_SameOriginCanvasInactiveWithoutEnv(t *testing.T) {
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
-	if w.Code != 404 {
-		t.Errorf("same-origin canvas without CANVAS_PROXY_URL: expected 404, got %d", w.Code)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("same-origin canvas without CANVAS_PROXY_URL: expected 400 missing-header response, got %d", w.Code)
 	}
 }
 
@@ -235,7 +241,7 @@ func TestTenantGuard_AllowlistIsExactMatch(t *testing.T) {
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
-	if w.Code != http.StatusNotFound {
-		t.Errorf("expected /health/debug to be guarded (404), got %d", w.Code)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected /health/debug to be guarded with missing-header 400, got %d", w.Code)
 	}
 }

@@ -9,8 +9,8 @@ import (
 	"strings"
 	"testing"
 
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
 	"github.com/DATA-DOG/go-sqlmock"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/models"
 	"github.com/gin-gonic/gin"
 )
 
@@ -712,6 +712,8 @@ func TestHeartbeat_SkipsRemovedRows(t *testing.T) {
 // ------------------------------------------------------------
 
 func TestValidateAgentURL(t *testing.T) {
+	t.Setenv("MOLECULE_ORG_ID", "")
+	t.Setenv("MOLECULE_DEPLOY_MODE", "self-hosted")
 	cases := []struct {
 		name    string
 		url     string
@@ -1609,7 +1611,7 @@ func TestRegister_PollMode_PreservesExistingValue(t *testing.T) {
 	// resolveDeliveryMode: row exists with delivery_mode=poll.
 	mock.ExpectQuery(`SELECT delivery_mode, runtime FROM workspaces WHERE id`).
 		WithArgs(wsID).
-		WillReturnRows(sqlmock.NewRows([]string{"delivery_mode", "runtime"}).AddRow("poll", "langgraph"))
+		WillReturnRows(sqlmock.NewRows([]string{"delivery_mode", "runtime"}).AddRow("poll", "claude-code"))
 
 	// Upsert carries the resolved poll mode forward — even though
 	// payload didn't restate it. URL still empty (poll-mode shape).
@@ -1781,7 +1783,7 @@ func TestRegister_KimiRuntime_DefaultsToPoll(t *testing.T) {
 }
 
 // TestRegister_NonExternalRuntime_StillDefaultsToPush guards the
-// inverse: a non-external runtime (langgraph, hermes, etc.) with
+// inverse: a non-external runtime (claude-code, hermes, etc.) with
 // empty delivery_mode keeps the historical push default. Catches
 // any future "all empty modes default to poll" overshoot.
 func TestRegister_NonExternalRuntime_StillDefaultsToPush(t *testing.T) {
@@ -1790,7 +1792,7 @@ func TestRegister_NonExternalRuntime_StillDefaultsToPush(t *testing.T) {
 	broadcaster := newTestBroadcaster()
 	handler := NewRegistryHandler(broadcaster)
 
-	const wsID = "ws-langgraph-default-push"
+	const wsID = "ws-claude-code-default-push"
 
 	mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM workspace_auth_tokens").
 		WithArgs(wsID).
@@ -1799,7 +1801,7 @@ func TestRegister_NonExternalRuntime_StillDefaultsToPush(t *testing.T) {
 	mock.ExpectQuery(`SELECT delivery_mode, runtime FROM workspaces WHERE id`).
 		WithArgs(wsID).
 		WillReturnRows(sqlmock.NewRows([]string{"delivery_mode", "runtime"}).
-			AddRow(sql.NullString{}, "langgraph"))
+			AddRow(sql.NullString{}, "claude-code"))
 
 	mock.ExpectExec("INSERT INTO workspaces").
 		WithArgs(wsID, wsID, "http://localhost:8000", `{"name":"a"}`, "push").

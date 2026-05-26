@@ -40,11 +40,11 @@ import (
 	"log"
 	"path/filepath"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/events"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/models"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/provisioner"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/wsauth"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wsauth"
 )
 
 // readOrLazyHealInboundSecret reads the workspace's
@@ -85,10 +85,9 @@ func readOrLazyHealInboundSecret(ctx context.Context, workspaceID, opLabel strin
 // prepareProvisionContext when the caller proceeds; nil + non-empty
 // abort message when the caller must mark the workspace failed.
 type preparedProvisionContext struct {
-	EnvVars            map[string]string
-	PluginsPath        string
-	AwarenessNamespace string
-	Config             provisioner.WorkspaceConfig
+	EnvVars     map[string]string
+	PluginsPath string
+	Config      provisioner.WorkspaceConfig
 }
 
 // provisionAbort describes why prepareProvisionContext refused to
@@ -170,7 +169,6 @@ func (h *WorkspaceHandler) prepareProvisionContext(
 	}
 
 	pluginsPath, _ := filepath.Abs(filepath.Join(h.configsDir, "..", "plugins"))
-	awarenessNamespace := h.loadAwarenessNamespace(ctx, workspaceID)
 
 	// Per-agent git identity (#1957) — must run after secret loads so
 	// a workspace_secret named GIT_AUTHOR_NAME can override.
@@ -195,6 +193,7 @@ func (h *WorkspaceHandler) prepareProvisionContext(
 	// continue to rely on workspace_secrets / org-import persona-env
 	// merge for their git auth.
 	applyAgentGitHTTPCreds(envVars, payload.Role)
+	applyPlatformManagedLLMEnv(envVars, payload.Runtime, payload.Model)
 	applyRuntimeModelEnv(envVars, payload.Runtime, payload.Model)
 	if payload.Role != "" {
 		envVars["MOLECULE_AGENT_ROLE"] = payload.Role
@@ -231,14 +230,13 @@ func (h *WorkspaceHandler) prepareProvisionContext(
 		}
 	}
 
-	cfg := h.buildProvisionerConfig(ctx, workspaceID, templatePath, configFiles, payload, envVars, pluginsPath, awarenessNamespace)
+	cfg := h.buildProvisionerConfig(ctx, workspaceID, templatePath, configFiles, payload, envVars, pluginsPath)
 	cfg.ResetClaudeSession = resetClaudeSession
 
 	return &preparedProvisionContext{
-		EnvVars:            envVars,
-		PluginsPath:        pluginsPath,
-		AwarenessNamespace: awarenessNamespace,
-		Config:             cfg,
+		EnvVars:     envVars,
+		PluginsPath: pluginsPath,
+		Config:      cfg,
 	}, nil
 }
 

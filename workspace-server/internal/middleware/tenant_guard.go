@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"net/http"
 	"os"
 	"strings"
 
@@ -10,7 +11,9 @@ import (
 // flyReplaySrcHeader is the header Fly injects on requests it replays via
 // the `fly-replay: ...;state=...` mechanism. Format is a semicolon-
 // separated list of k=v pairs, e.g.
-//   instance=91854...;region=ord;t=1700000000000;state=<uuid>
+//
+//	instance=91854...;region=ord;t=1700000000000;state=<uuid>
+//
 // Control plane puts the bare UUID in state (no prefix) because Fly's
 // proxy returns 502 "replay malformed" on any second `=` in the value.
 // We read the whole state= segment as the org id.
@@ -31,7 +34,10 @@ const flyReplaySrcHeader = "Fly-Replay-Src"
 //
 // The guard intentionally knows nothing about orgs, signup, billing, or
 // provisioning. Those live in the private control-plane repo. All this code
-// does is: "am I the tenant for this request? if not, 404."
+// does is: "am I the tenant for this request? if not, reject it."
+// Missing tenant identity is an actionable client error. Wrong tenant identity
+// still returns 404 so cross-tenant probes cannot distinguish "wrong tenant"
+// from "no such route".
 
 // tenantOrgIDHeader is the HTTP header the control-plane router sets when it
 // uses fly-replay to route a request to a tenant machine. Case-insensitive at
@@ -119,8 +125,20 @@ func TenantGuardWithOrgID(configuredOrgID string) gin.HandlerFunc {
 			c.Next()
 			return
 		}
-		// 404 not 403 — existence of this tenant must not be inferable by
-		// probing other orgs' machines.
+		// Missing identity is an actionable API client error. This is the
+		// common operator/molecli failure mode: a valid bearer reaches the right
+		// hostname but omits the required SaaS routing header.
+		if c.GetHeader(tenantOrgIDHeader) == "" && c.GetHeader(flyReplaySrcHeader) == "" {
+			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
+				"error":           "missing tenant routing header",
+				"code":            "TENANT_ORG_HEADER_REQUIRED",
+				"required_header": tenantOrgIDHeader,
+				"detail":          "SaaS tenant API requests must include X-Molecule-Org-Id matching the organization UUID.",
+			})
+			return
+		}
+		// Wrong identity remains 404, not 403 — existence of this tenant must
+		// not be inferable by probing other orgs' machines.
 		c.AbortWithStatus(404)
 	}
 }

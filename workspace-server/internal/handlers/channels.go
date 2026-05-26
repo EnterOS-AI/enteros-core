@@ -17,8 +17,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/channels"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/channels"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 )
 
 // ChannelHandler manages workspace social channel integrations.
@@ -103,6 +103,9 @@ func (h *ChannelHandler) List(c *gin.Context) {
 			entry["last_message_at"] = lastMsg.Time
 		}
 		result = append(result, entry)
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("Channels: list rows.Err: %v", err)
 	}
 
 	c.JSON(http.StatusOK, result)
@@ -513,6 +516,9 @@ func (h *ChannelHandler) Webhook(c *gin.Context) {
 		if matchesChatID(row.Config, msg.ChatID) {
 			candidates = append(candidates, row)
 		}
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("Channels: telegram webhook rows.Err: %v", err)
 	}
 
 	if targetSlug != "" {

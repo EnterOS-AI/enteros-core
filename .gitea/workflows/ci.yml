@@ -98,10 +98,10 @@ jobs:
             --base-ref "$PR_BASE_REF" \
             --push-before "${GITHUB_EVENT_BEFORE:-$PUSH_BEFORE}"
 
-  # Platform (Go) — Go build/vet/test/lint + coverage gates. The always-run
-  # + per-step gating shape preserves the GitHub-side required-check name
-  # contract (so when this Gitea port becomes a required check in Phase 4,
-  # the name match works on PRs that don't touch workspace-server/).
+  # Platform (Go) — Go build/vet/test/lint + coverage gates. The job always
+  # emits the required context, but expensive steps are path-scoped on every
+  # event so docs/E2E/Canvas-only main pushes do not block deploy on unrelated
+  # Go bootstrap work.
   platform-build:
     name: Platform (Go)
     needs: changes
@@ -125,29 +125,29 @@ jobs:
       run:
         working-directory: workspace-server
     steps:
-      - if: ${{ github.event_name == 'pull_request' && needs.changes.outputs.platform != 'true' }}
+      - if: ${{ needs.changes.outputs.platform != 'true' }}
         working-directory: .
-        run: echo "No workspace-server/** changes on this PR — Platform (Go) gate satisfied without running Go build/test/lint."
-      - if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.platform == 'true' }}
+        run: echo "No workspace-server/** changes — Platform (Go) gate satisfied without running Go build/test/lint."
+      - if: ${{ needs.changes.outputs.platform == 'true' }}
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.platform == 'true' }}
+      - if: ${{ needs.changes.outputs.platform == 'true' }}
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: 'stable'
-      - if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.platform == 'true' }}
+      - if: ${{ needs.changes.outputs.platform == 'true' }}
         run: go mod download
-      - if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.platform == 'true' }}
+      - if: ${{ needs.changes.outputs.platform == 'true' }}
         run: go build ./cmd/server
       # CLI (molecli) moved to standalone repo: git.moleculesai.app/molecule-ai/molecule-cli
-      - if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.platform == 'true' }}
+      - if: ${{ needs.changes.outputs.platform == 'true' }}
         run: go vet ./...
-      - if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.platform == 'true' }}
+      - if: ${{ needs.changes.outputs.platform == 'true' }}
         name: Install golangci-lint
         run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
-      - if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.platform == 'true' }}
+      - if: ${{ needs.changes.outputs.platform == 'true' }}
         name: Run golangci-lint
         run: $(go env GOPATH)/bin/golangci-lint run --timeout 3m ./...
-      - if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.platform == 'true' }}
+      - if: ${{ needs.changes.outputs.platform == 'true' }}
         name: Diagnostic — per-package verbose 60s
         run: |
           set +e
@@ -163,7 +163,7 @@ jobs:
           echo "::endgroup::"
         # mc#774: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
         continue-on-error: true
-      - if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.platform == 'true' }}
+      - if: ${{ needs.changes.outputs.platform == 'true' }}
         name: Run tests with race detection and coverage
         # Explicit timeout: cold runner cache causes OOM kills at ~4m39s on the
         # full ./... suite with race detection + coverage. A 10m per-step timeout
@@ -171,7 +171,7 @@ jobs:
         # instead of OOM-killing. The job-level timeout (15m) is a backstop.
         run: go test -race -timeout 10m -coverprofile=coverage.out ./...
 
-      - if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.platform == 'true' }}
+      - if: ${{ needs.changes.outputs.platform == 'true' }}
         name: Per-file coverage report
         # Advisory — lists every source file with its coverage so reviewers
         # can see at-a-glance where gaps are. Sorted ascending so the worst
@@ -185,7 +185,7 @@ jobs:
                    END {for (f in s) printf "%6.1f%%  %s\n", s[f]/c[f], f}' \
             | sort -n
 
-      - if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.platform == 'true' }}
+      - if: ${{ needs.changes.outputs.platform == 'true' }}
         name: Check coverage thresholds
         # Enforces two gates from #1823 Layer 1:
         #   1. Total floor (25% — ratchet plan in COVERAGE_FLOOR.md).
@@ -239,7 +239,7 @@ jobs:
               # Strip the package-import prefix so we can match .coverage-allowlist.txt
               # entries written as paths relative to workspace-server/.
               # Handle both module paths: platform/workspace-server/... and platform/...
-              rel=$(echo "$file" | sed 's|^github.com/molecule-ai/molecule-monorepo/platform/workspace-server/||; s|^github.com/molecule-ai/molecule-monorepo/platform/||')
+              rel=$(echo "$file" | sed 's|^git.moleculesai.app/molecule-ai/molecule-core/workspace-server/workspace-server/||; s|^git.moleculesai.app/molecule-ai/molecule-core/workspace-server/||')
 
               if echo "$ALLOWLIST" | grep -qxF "$rel"; then
                 echo "::warning file=workspace-server/$rel::Critical file at ${pct}% coverage (allowlisted, #1823) — fix before expiry."
@@ -282,20 +282,20 @@ jobs:
       run:
         working-directory: canvas
     steps:
-      - if: ${{ github.event_name == 'pull_request' && needs.changes.outputs.canvas != 'true' }}
+      - if: ${{ needs.changes.outputs.canvas != 'true' }}
         working-directory: .
-        run: echo "No canvas/** changes on this PR — Canvas (Next.js) gate satisfied without running npm build/test."
-      - if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.canvas == 'true' }}
+        run: echo "No canvas/** changes — Canvas (Next.js) gate satisfied without running npm build/test."
+      - if: ${{ needs.changes.outputs.canvas == 'true' }}
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.canvas == 'true' }}
+      - if: ${{ needs.changes.outputs.canvas == 'true' }}
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
           node-version: '22'
-      - if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.canvas == 'true' }}
+      - if: ${{ needs.changes.outputs.canvas == 'true' }}
         run: npm ci --include=optional --prefer-offline
-      - if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.canvas == 'true' }}
+      - if: ${{ needs.changes.outputs.canvas == 'true' }}
         run: npm run build
-      - if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.canvas == 'true' }}
+      - if: ${{ needs.changes.outputs.canvas == 'true' }}
         name: Run tests with coverage
         # Coverage instrumentation is configured in canvas/vitest.config.ts
         # (provider: v8, reporters: text + html + json-summary). Step 2 of
@@ -304,7 +304,7 @@ jobs:
         # tracked in #1815) after the team sees what current coverage is.
         run: npx vitest run --coverage
       - name: Upload coverage summary as artifact
-        if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.canvas == 'true' }}
+        if: ${{ needs.changes.outputs.canvas == 'true' }}
         # Pinned to v3 for Gitea act_runner v0.6 compatibility — v4+ uses
         # the GHES 3.10+ artifact protocol that Gitea 1.22.x does NOT
         # implement, surfacing as `GHESNotSupportedError: @actions/artifact
@@ -318,7 +318,7 @@ jobs:
           retention-days: 7
           if-no-files-found: warn
 
-  # Shellcheck (E2E scripts) — required check, always runs.
+  # Shellcheck (E2E scripts) — required context, path-scoped heavy steps.
   shellcheck:
     name: Shellcheck (E2E scripts)
     needs: changes
@@ -326,11 +326,11 @@ jobs:
     # Phase 4 (RFC #219 §1): confirmed green on main 2026-05-12.
     continue-on-error: false
     steps:
-      - if: ${{ github.event_name == 'pull_request' && needs.changes.outputs.scripts != 'true' }}
-        run: echo "No tests/e2e, scripts, or infra/scripts changes on this PR — Shellcheck gate satisfied without running script checks."
-      - if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.scripts == 'true' }}
+      - if: ${{ needs.changes.outputs.scripts != 'true' }}
+        run: echo "No tests/e2e, scripts, or infra/scripts changes — Shellcheck gate satisfied without running script checks."
+      - if: ${{ needs.changes.outputs.scripts == 'true' }}
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.scripts == 'true' }}
+      - if: ${{ needs.changes.outputs.scripts == 'true' }}
         name: Run shellcheck on tests/e2e/*.sh and infra/scripts/*.sh
         # shellcheck is pre-installed on ubuntu-latest runners (via apt).
         # infra/scripts/ is included because setup.sh + nuke.sh gate the
@@ -341,16 +341,16 @@ jobs:
           find tests/e2e infra/scripts -type f -name '*.sh' -print0 \
             | xargs -0 shellcheck --severity=warning
 
-      - if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.scripts == 'true' }}
+      - if: ${{ needs.changes.outputs.scripts == 'true' }}
         name: Lint cleanup-trap hygiene (RFC #2873)
         run: bash tests/e2e/lint_cleanup_traps.sh
 
-      - if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.scripts == 'true' }}
+      - if: ${{ needs.changes.outputs.scripts == 'true' }}
         name: Run E2E bash unit tests (no live infra)
         run: |
           bash tests/e2e/test_model_slug.sh
 
-      - if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.scripts == 'true' }}
+      - if: ${{ needs.changes.outputs.scripts == 'true' }}
         name: Test ECR promote-tenant-image script (mock-driven, no live infra)
         # Covers scripts/promote-tenant-image.sh — the codified
         # :staging-latest → :latest ECR promote + tenant fleet redeploy
@@ -360,7 +360,7 @@ jobs:
         run: |
           bash scripts/test-promote-tenant-image.sh
 
-      - if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.scripts == 'true' }}
+      - if: ${{ needs.changes.outputs.scripts == 'true' }}
         name: Shellcheck promote-tenant-image script
         # scripts/ is excluded from the bulk shellcheck pass above (legacy
         # SC3040/SC3043 cleanup pending). Run shellcheck explicitly on
@@ -476,7 +476,11 @@ jobs:
     # jobs settle, leaving branch protection with a permanent pending
     # `CI / all-required` context. Instead, this independent sentinel polls the
     # required commit-status contexts for this SHA and fails if any fail, skip,
-    # or never emit.
+    # or never emit. It runs the same path detector as `changes` and only waits
+    # for path-relevant jobs; Gitea can otherwise leave needs/output-skipped
+    # jobs permanently pending with "Blocked by required conditions". It runs on
+    # the dedicated `ci-meta` lane so the poller does not occupy the same
+    # general runner pool as the jobs it is waiting for.
     #
     # canvas-deploy-reminder is intentionally NOT included in all-required.needs.
     # It is an informational main-push reminder, not a PR quality gate. Keeping
@@ -484,9 +488,24 @@ jobs:
     # sentinel before the `always()` guard can emit a branch-protection status.
     #
     continue-on-error: false
-    runs-on: ubuntu-latest
+    runs-on: ci-meta
     timeout-minutes: 45
     steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+      - id: check
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          python3 .gitea/scripts/detect-changes.py \
+            --profile ci \
+            --event-name "${{ github.event_name }}" \
+            --pr-base-sha "$PR_BASE_SHA" \
+            --base-ref "$PR_BASE_REF" \
+            --push-before "${GITHUB_EVENT_BEFORE:-$PUSH_BEFORE}"
       - name: Wait for required CI contexts
         env:
           GITEA_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -494,6 +513,9 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           COMMIT_SHA: ${{ github.sha }}
           EVENT_NAME: ${{ github.event_name }}
+          REQUIRE_PLATFORM: ${{ steps.check.outputs.platform }}
+          REQUIRE_CANVAS: ${{ steps.check.outputs.canvas }}
+          REQUIRE_SCRIPTS: ${{ steps.check.outputs.scripts }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -511,11 +533,14 @@ jobs:
           event = os.environ["EVENT_NAME"]
           required = [
               f"CI / Detect changes ({event})",
-              f"CI / Platform (Go) ({event})",
-              f"CI / Canvas (Next.js) ({event})",
-              f"CI / Shellcheck (E2E scripts) ({event})",
               f"CI / Python Lint & Test ({event})",
           ]
+          if os.environ.get("REQUIRE_PLATFORM") == "true":
+              required.append(f"CI / Platform (Go) ({event})")
+          if os.environ.get("REQUIRE_CANVAS") == "true":
+              required.append(f"CI / Canvas (Next.js) ({event})")
+          if os.environ.get("REQUIRE_SCRIPTS") == "true":
+              required.append(f"CI / Shellcheck (E2E scripts) ({event})")
           terminal_bad = {"failure", "error"}
           deadline = time.time() + 40 * 60
           last_summary = None

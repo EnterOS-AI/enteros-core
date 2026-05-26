@@ -118,7 +118,7 @@ jobs:
     timeout-minutes: 20
     env:
       # claude-code default: cold-start ~5 min (comparable to langgraph),
-      # but uses MiniMax-M2.7-highspeed via the template's third-party-
+      # but uses MiniMax-M2 via the template's third-party-
       # Anthropic-compat path (workspace-configs-templates/claude-code-
       # default/config.yaml:64-69). MiniMax is ~5-10x cheaper than
       # gpt-4.1-mini per token AND avoids the recurring OpenAI quota-
@@ -131,9 +131,9 @@ jobs:
       # on the per-runtime default ("sonnet" → routes to direct
       # Anthropic, defeats the cost saving). Operators can override
       # via workflow_dispatch by setting a different E2E_MODEL_SLUG
-      # input if they need to exercise a specific model. M2.7-highspeed
-      # is "Token Plan only" but cheap-per-token and fast.
-      E2E_MODEL_SLUG: ${{ github.event.inputs.model_slug || 'MiniMax-M2.7-highspeed' }}
+      # input if they need to exercise a specific model. MiniMax-M2 is the
+      # stable staging MiniMax path used by the full-SaaS smoke.
+      E2E_MODEL_SLUG: ${{ github.event.inputs.model_slug || 'MiniMax-M2' }}
       # Bound to 10 min so a stuck provision fails the run instead of
       # holding up the next cron firing. 15-min default in the script
       # is for the on-PR full lifecycle where we have more headroom.

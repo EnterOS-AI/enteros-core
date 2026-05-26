@@ -4,7 +4,7 @@ import { useState, useEffect, useCallback } from "react";
 import { api } from "@/lib/api";
 import { useCanvasStore } from "@/store/canvas";
 import { OrgTemplatesSection } from "./TemplatePalette";
-import { type Template } from "@/lib/deploy-preflight";
+import { isUserVisibleWorkspaceTemplate, type Template } from "@/lib/deploy-preflight";
 import { useTemplateDeploy } from "@/hooks/useTemplateDeploy";
 import { Spinner } from "./Spinner";
 import { TIER_CONFIG } from "@/lib/design-tokens";
@@ -18,7 +18,7 @@ export function EmptyState() {
   useEffect(() => {
     api
       .get<Template[]>("/templates")
-      .then((t) => setTemplates(t))
+      .then((t) => setTemplates(t.filter(isUserVisibleWorkspaceTemplate)))
       .catch(() => setTemplates([]))
       .finally(() => setLoading(false));
   }, []);

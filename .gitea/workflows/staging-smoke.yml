@@ -112,9 +112,9 @@ jobs:
       E2E_RUNTIME: claude-code
       # Pin the smoke to a specific MiniMax model rather than relying
       # on the per-runtime default (which could resolve to "sonnet" →
-      # direct Anthropic and defeat the cost saving). M2.7-highspeed
-      # is "Token Plan only" but cheap-per-token and fast.
-      E2E_MODEL_SLUG: MiniMax-M2.7-highspeed
+      # direct Anthropic and defeat the cost saving). MiniMax-M2 is the
+      # stable staging MiniMax path used by the full-SaaS smoke.
+      E2E_MODEL_SLUG: MiniMax-M2
       E2E_RUN_ID: "smoke-${{ github.run_id }}"
       # Debug-only: when an operator dispatches with keep_on_failure=true,
       # the smoke script's E2E_KEEP_ORG=1 path skips teardown so the

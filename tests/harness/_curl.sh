@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Sourceable helper for harness replays. Centralises the
 # curl-against-cf-proxy pattern so scripts don't depend on /etc/hosts.
 #
@@ -118,11 +119,11 @@ curl_beta_creds_at_alpha() {
 
 # ─── Workspace-scoped (per-workspace bearer) ──────────────────────────
 
-# Workspace-scoped request to alpha — uses a per-workspace bearer
-# minted from /admin/workspaces/:id/test-token. Caller must export
-# WORKSPACE_TOKEN.
+# Workspace-scoped request to alpha — uses a real per-workspace bearer minted
+# through the admin token route, not the local-dev fixture-token route. Caller
+# must export WORKSPACE_TOKEN.
 curl_workspace() {
-    : "${WORKSPACE_TOKEN:?WORKSPACE_TOKEN must be set — mint via /admin/workspaces/:id/test-token}"
+    : "${WORKSPACE_TOKEN:?WORKSPACE_TOKEN must be set — mint via POST /admin/workspaces/:id/tokens}"
     curl -sS \
         -H "Host: ${TENANT_HOST}" \
         -H "Authorization: Bearer ${WORKSPACE_TOKEN}" \

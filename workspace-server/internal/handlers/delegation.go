@@ -10,9 +10,9 @@ import (
 	"runtime"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/events"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/textutil"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/textutil"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
@@ -389,7 +389,7 @@ func (h *DelegationHandler) executeDelegation(ctx context.Context, sourceID, tar
 	})
 	log.Printf("Delegation %s: step=proxying_a2a_request", delegationID)
 
-	status, respBody, proxyErr := h.workspace.proxyA2ARequest(ctx, targetID, a2aBody, sourceID, true)
+	status, respBody, proxyErr := h.workspace.proxyA2ARequest(ctx, targetID, a2aBody, sourceID, true, false)
 	log.Printf("Delegation %s: step=proxy_done status=%d bodyLen=%d err=%v", delegationID, status, len(respBody), proxyErr)
 
 	// When proxyA2ARequest returns an error but we have a non-empty response body
@@ -418,7 +418,7 @@ func (h *DelegationHandler) executeDelegation(ctx context.Context, sourceID, tar
 		case <-ctx.Done():
 			// outer timeout hit before retry window elapsed
 		case <-time.After(delegationRetryDelay):
-			status, respBody, proxyErr = h.workspace.proxyA2ARequest(ctx, targetID, a2aBody, sourceID, true)
+			status, respBody, proxyErr = h.workspace.proxyA2ARequest(ctx, targetID, a2aBody, sourceID, true, false)
 		}
 	}
 

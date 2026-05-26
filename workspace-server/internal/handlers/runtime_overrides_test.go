@@ -22,7 +22,7 @@ func TestRuntimeOverrideCache_SetAndGet(t *testing.T) {
 	// Sibling workspace unaffected — pin against the trap where a
 	// shared map without proper keying would leak overrides across
 	// workspaces (a hard-to-debug "claude-code's longer timeout
-	// somehow applied to langgraph too").
+	// somehow applied to claude-code too").
 	if _, ok := c.IdleTimeout("ws-b"); ok {
 		t.Fatal("override for ws-a leaked to ws-b")
 	}

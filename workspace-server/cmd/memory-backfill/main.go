@@ -32,9 +32,9 @@ import (
 
 	_ "github.com/lib/pq"
 
-	mclient "github.com/Molecule-AI/molecule-monorepo/platform/internal/memory/client"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/memory/contract"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/memory/namespace"
+	mclient "git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/memory/client"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/memory/contract"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/memory/namespace"
 )
 
 const defaultLimit = 1000000 // effectively unlimited; cap keeps SQL pageable

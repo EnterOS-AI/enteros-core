@@ -1,3 +1,26 @@
+// Package main runs the per-tenant workspace-server.
+//
+//	@title			Molecule AI Workspace Server API
+//	@version		1.0
+//	@description	The per-tenant workspace-server HTTP API. Single source of truth for workspace/schedule/agent/secrets/files/memory CRUD. Hand-written clients (canvas, molecule-mcp-server, molecule-cli, molecule-sdk-python) should be replaced by clients generated from this spec — see RFC #1706.
+//	@host			api.moleculesai.app
+//	@BasePath		/
+//	@schemes		https
+//
+//	@securityDefinitions.apikey	BearerAuth
+//	@in							header
+//	@name						Authorization
+//	@description				Bearer token issued by Gitea (org-admin or persona PAT) or by the platform's signup/SSO flow.
+//
+//	@securityDefinitions.apikey	OrgSlugAuth
+//	@in							header
+//	@name						X-Molecule-Org-Slug
+//	@description				Tenant routing header — required on every /workspaces/{id}/* request so the platform edge can route to the correct per-tenant workspace-server. Either X-Molecule-Org-Slug (human-readable, e.g. "agents-team") or X-Molecule-Org-Id (UUID) must be sent; slug is preferred for client code.
+//
+//	@securityDefinitions.apikey	OrgIdAuth
+//	@in							header
+//	@name						X-Molecule-Org-Id
+//	@description				Tenant routing header (UUID form). Alternative to X-Molecule-Org-Slug. At least one of OrgSlugAuth or OrgIdAuth must be sent alongside BearerAuth.
 package main
 
 import (
@@ -12,29 +35,31 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/channels"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/crypto"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/events"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/handlers"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/imagewatch"
-	memwiring "github.com/Molecule-AI/molecule-monorepo/platform/internal/memory/wiring"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/middleware"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/pendinguploads"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/plugins"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/provisioner"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/registry"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/router"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/scheduler"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/supervised"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/ws"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/channels"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/crypto"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/handlers"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/imagewatch"
+	memwiring "git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/memory/wiring"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/middleware"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/pendinguploads"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/plugins"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/registry"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/router"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/scheduler"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/supervised"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/templatecache"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/ws"
 
 	// External plugins — each registers EnvMutator(s) that run at workspace
 	// provision time. Loaded via soft-dep gates in main() so self-hosters
 	// without per-agent identity configured keep working.
 	ghidentity "go.moleculesai.app/plugin/gh-identity/pluginloader"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/pkg/provisionhook"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/pkg/provisionhook"
+	"github.com/gin-gonic/gin"
 )
 
 func main() {
@@ -170,11 +195,28 @@ func main() {
 	port := envOr("PORT", "8080")
 	platformURL := envOr("PLATFORM_URL", fmt.Sprintf("http://host.docker.internal:%s", port))
 	configsDir := envOr("CONFIGS_DIR", findConfigsDir())
+	templateCacheDir := envOr("TEMPLATE_CACHE_DIR", filepath.Join(os.TempDir(), "molecule-template-cache"))
+	manifestPath := findWorkspaceManifestPath()
+	templateToken := templateCacheToken()
+	refreshTemplates := func(ctx context.Context) (templatecache.RefreshReport, error) {
+		return templatecache.RefreshWorkspaceTemplates(ctx, manifestPath, templateCacheDir, templateToken)
+	}
+	if shouldRefreshTemplateCache(templateToken, manifestPath) {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		report, err := refreshTemplates(ctx)
+		cancel()
+		if err != nil {
+			log.Printf("template cache refresh: %v (continuing with baked templates)", err)
+		} else {
+			log.Printf("template cache refresh: refreshed %d workspace templates into %s", len(report.Results), templateCacheDir)
+		}
+	}
 
 	// Init order: wh → onWorkspaceOffline → liveness/healthSweep → router
 	// WorkspaceHandler is created before the router so RestartByID can be wired into
 	// the offline callbacks used by both the liveness monitor and the health sweep.
-	wh := handlers.NewWorkspaceHandler(broadcaster, prov, platformURL, configsDir)
+	wh := handlers.NewWorkspaceHandler(broadcaster, prov, platformURL, configsDir).
+		WithTemplateCacheDir(templateCacheDir)
 	if cpProv != nil {
 		wh.SetCPProvisioner(cpProv)
 	}
@@ -187,6 +229,12 @@ func main() {
 	memBundle := memwiring.Build(db.DB)
 	if memBundle != nil {
 		wh.WithNamespaceCleanup(memBundle.NamespaceCleanupFn())
+		// Issue #1755: route workspace-create `initial_memories` through
+		// the v2 plugin instead of the legacy `agent_memories` table.
+		// Same plugin client the MCP tools use, same namespace
+		// (`workspace:<id>`); writes are visible to subsequent
+		// `recall_memory` calls on the same workspace.
+		wh.WithSeedMemoryPlugin(memBundle.Plugin)
 	}
 
 	// External-plugin env mutators — each plugin contributes 0+ mutators
@@ -348,7 +396,12 @@ func main() {
 	// require a plugins/ dir on disk (nil in CP/SaaS mode).
 	pluginRegistry := plugins.NewRegistry()
 	pluginRegistry.Register(plugins.NewGithubResolver())
-	r := router.Setup(hub, broadcaster, prov, platformURL, configsDir, wh, channelMgr, memBundle, pluginRegistry)
+	refreshTemplatesHTTP := func(c *gin.Context) (any, error) {
+		ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Minute)
+		defer cancel()
+		return refreshTemplates(ctx)
+	}
+	r := router.Setup(hub, broadcaster, prov, platformURL, configsDir, templateCacheDir, wh, channelMgr, memBundle, pluginRegistry, refreshTemplatesHTTP)
 
 	// Plugin drift sweeper — periodic detection of upstream plugin version drift
 	// (core#123). Scans workspace_plugins rows where tracked_ref != 'none',
@@ -370,16 +423,14 @@ func main() {
 	// See molecule-core#7.
 	bindHost := resolveBindHost()
 	srv := &http.Server{
-		Addr:    fmt.Sprintf("%s:%s", bindHost, port),
-		Handler: r,
+		Addr:              fmt.Sprintf("%s:%s", bindHost, port),
+		Handler:           r,
+		ReadHeaderTimeout: 5 * time.Second,
 	}
 
 	// Start server in goroutine
 	go func() {
 		log.Printf("Platform starting on %s:%s (dev-mode-fail-open=%v)", bindHost, port, middleware.IsDevModeFailOpen())
-		if handlers.TestTokensEnabled() {
-			log.Printf("NOTE: /admin/workspaces/:id/test-token is ENABLED (MOLECULE_ENV=%q — set MOLECULE_ENV=production in staging/prod to lock this route)", os.Getenv("MOLECULE_ENV"))
-		}
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Server failed: %v", err)
 		}
@@ -464,6 +515,40 @@ func findConfigsDir() string {
 		}
 	}
 	return "workspace-configs-templates"
+}
+
+func findWorkspaceManifestPath() string {
+	if v := os.Getenv("WORKSPACE_MANIFEST_PATH"); v != "" {
+		return v
+	}
+	for _, p := range []string{"/app/manifest.json", "manifest.json", "../manifest.json", "../../manifest.json"} {
+		if abs, err := filepath.Abs(p); err == nil {
+			if _, err := os.Stat(abs); err == nil {
+				return abs
+			}
+		}
+	}
+	return ""
+}
+
+func templateCacheToken() string {
+	for _, key := range []string{"MOLECULE_TEMPLATE_GITEA_TOKEN", "MOLECULE_GITEA_TOKEN"} {
+		if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func shouldRefreshTemplateCache(token, manifestPath string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("TEMPLATE_CACHE_REFRESH"))) {
+	case "0", "false", "off", "no":
+		return false
+	case "1", "true", "on", "yes":
+		return token != "" && manifestPath != ""
+	default:
+		return token != "" && manifestPath != ""
+	}
 }
 
 func findMigrationsDir() string {

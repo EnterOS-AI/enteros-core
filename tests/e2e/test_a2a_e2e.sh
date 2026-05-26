@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BASE="http://localhost:8080"
+BASE="${BASE:-http://localhost:8080}"
 PASS=0
 FAIL=0
 TIMEOUT="${A2A_TIMEOUT:-120}"  # seconds per A2A call (override via A2A_TIMEOUT env var)
+
+# shellcheck source=_lib.sh
+source "$(dirname "$0")/_lib.sh"
 
 check() {
   local desc="$1"
@@ -130,14 +133,14 @@ echo ""
 # ========================================
 echo "--- Test 6: Offline workspace ---"
 # Create a workspace but don't provision it
-R=$(curl -s -X POST "$BASE/workspaces" -H "Content-Type: application/json" -d '{"name":"Offline Test","tier":1}')
+R=$(curl -s -X POST "$BASE/workspaces" -H "Content-Type: application/json" -d '{"name":"Offline Test","tier":1,"runtime":"external","external":true}')
 OFFLINE_ID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
 R=$(curl -s --max-time 10 -X POST "$BASE/workspaces/$OFFLINE_ID/a2a" \
   -H "Content-Type: application/json" \
   -d '{"method":"message/send","params":{"message":{"role":"user","parts":[{"type":"text","text":"test"}]}}}')
 check "Offline workspace returns error" '"error"' "$R"
 # Clean up
-curl -s -X DELETE "$BASE/workspaces/$OFFLINE_ID" >/dev/null
+e2e_delete_workspace "$OFFLINE_ID" "Offline Test"
 echo ""
 
 # ========================================

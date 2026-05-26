@@ -7,9 +7,9 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/events"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/models"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
 )
 
 // ProvisionTimeoutEmitter is the narrow broadcaster dependency the sweeper
@@ -21,8 +21,8 @@ type ProvisionTimeoutEmitter interface {
 
 // DefaultProvisioningTimeout is how long a workspace may sit in
 // status='provisioning' before the sweeper flips it to 'failed'.
-// Default for non-hermes runtimes (claude-code, langgraph, crewai,
-// autogen, etc.) which cold-boot in <5 min. The container-launch path
+// Default for non-hermes runtimes (claude-code, codex, openclaw, etc.)
+// which cold-boot in <5 min. The container-launch path
 // has its own 3-minute context timeout (provisioner.ProvisionTimeout)
 // but that only bounds the docker API call — a container that started
 // but crashes before /registry/register never triggers that path and
@@ -165,6 +165,9 @@ func sweepStuckProvisioning(ctx context.Context, emitter ProvisionTimeoutEmitter
 		if err := rows.Scan(&c.id, &c.runtime, &c.ageSec); err == nil {
 			ids = append(ids, c)
 		}
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("Provision-timeout sweep: rows error: %v", err)
 	}
 
 	for _, c := range ids {

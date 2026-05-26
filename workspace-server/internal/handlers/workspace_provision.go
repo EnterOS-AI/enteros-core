@@ -10,11 +10,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/crypto"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/models"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/provisioner"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/wsauth"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/crypto"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/memory/contract"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wsauth"
 	"gopkg.in/yaml.v3"
 )
 
@@ -128,7 +129,7 @@ func (h *WorkspaceHandler) provisionWorkspaceOpts(workspaceID, templatePath stri
 							workspaceID, filepath.Base(runtimeTemplate))
 						templatePath = runtimeTemplate
 						// Rebuild cfg with the recovered template path so Start() sees it.
-						cfg = h.buildProvisionerConfig(ctx, workspaceID, templatePath, configFiles, payload, prepared.EnvVars, prepared.PluginsPath, prepared.AwarenessNamespace)
+						cfg = h.buildProvisionerConfig(ctx, workspaceID, templatePath, configFiles, payload, prepared.EnvVars, prepared.PluginsPath)
 						cfg.ResetClaudeSession = resetClaudeSession
 						recovered = true
 						break
@@ -184,20 +185,45 @@ func (h *WorkspaceHandler) provisionWorkspaceOpts(workspaceID, templatePath stri
 	// which transitions status to 'online' and broadcasts WORKSPACE_ONLINE
 }
 
-// seedInitialMemories inserts a list of MemorySeed entries into agent_memories
-// for the given workspace. Called during workspace creation and org import to
-// pre-populate memories from config/template. Non-fatal: each insert is
-// attempted independently and failures are logged. Issue #1050.
-// maxMemoryContentLength is the maximum allowed size for a single memory content
-// field. Content exceeding this limit is truncated to prevent storage exhaustion
-// (CWE-400) and OOM on read paths. The limit is intentionally generous — it fits
-// a ~64k context window worth of text — but small enough to prevent abuse.
+// seedInitialMemories writes a list of MemorySeed entries through the v2
+// memory plugin for the given workspace. Called during workspace creation
+// and org import to pre-populate memories from config/template (issue
+// #1050). Non-fatal: each plugin call is attempted independently and
+// failures are logged.
+//
+// Issue #1755: post-A1 (#1747) v2 is the only memory backend; writing
+// into `agent_memories` would be invisible to `recall_memory` (which
+// reads exclusively from the plugin). When the plugin isn't wired
+// (WithSeedMemoryPlugin not called, i.e. `MEMORY_PLUGIN_URL` unset on
+// platform-tenant), seedInitialMemories logs a loud warning and skips
+// — seeded memories simply don't materialise on that operator's
+// deployment. There is no SQL fallback.
+//
+// Scope handling: the v2 plugin's data model has no `scope` column. All
+// seeded memories land in `workspace:<id>` (the workspace's private
+// namespace). Pre-A1 callers wrote TEAM/GLOBAL-scoped memories into
+// `agent_memories` with `namespace=workspace:<id>` anyway, so this is
+// behaviour-preserving for LOCAL and a no-op-shrink for TEAM/GLOBAL
+// (those scopes can be promoted later via an explicit
+// `commit_memory_v2` call by the agent).
+//
+// maxMemoryContentLength is the maximum allowed size for a single
+// memory content field. Content exceeding this limit is truncated to
+// prevent storage exhaustion (CWE-400) and OOM on read paths. The
+// limit is intentionally generous — it fits a ~64k context window
+// worth of text — but small enough to prevent abuse.
 const maxMemoryContentLength = 100_000 // ~100 KiB of text
 
-func seedInitialMemories(ctx context.Context, workspaceID string, memories []models.MemorySeed, awarenessNamespace string) {
+func (h *WorkspaceHandler) seedInitialMemories(ctx context.Context, workspaceID string, memories []models.MemorySeed) {
 	if len(memories) == 0 {
 		return
 	}
+	if h.seedMemoryPlugin == nil {
+		log.Printf("seedInitialMemories: ⚠️  skipping %d memories for workspace %s — v2 memory plugin not wired (set MEMORY_PLUGIN_URL on platform-tenant). Seeded memories from this template are not persisted.", len(memories), workspaceID)
+		return
+	}
+	namespace := workspaceMemoryNamespace(workspaceID)
+	seeded := 0
 	for _, mem := range memories {
 		scope := strings.ToUpper(mem.Scope)
 		if scope == "" {
@@ -210,9 +236,10 @@ func seedInitialMemories(ctx context.Context, workspaceID string, memories []mod
 		if mem.Content == "" {
 			continue
 		}
-		// #1066: enforce content length limit to prevent storage exhaustion (CWE-400).
-		// Truncate oversized content rather than rejecting the whole insert so that
-		// template authors get a predictable fallback rather than a silent skip.
+		// #1066: enforce content length limit to prevent storage exhaustion
+		// (CWE-400). Truncate oversized content rather than rejecting the
+		// whole insert so that template authors get a predictable fallback
+		// rather than a silent skip.
 		content := mem.Content
 		if len(content) > maxMemoryContentLength {
 			content = content[:maxMemoryContentLength]
@@ -220,27 +247,32 @@ func seedInitialMemories(ctx context.Context, workspaceID string, memories []mod
 				workspaceID, scope, len(mem.Content), maxMemoryContentLength)
 		}
 		redactedContent, _ := redactSecrets(workspaceID, content)
-		if _, err := db.DB.ExecContext(ctx, `
-			INSERT INTO agent_memories (workspace_id, content, scope, namespace)
-			VALUES ($1, $2, $3, $4)
-		`, workspaceID, redactedContent, scope, awarenessNamespace); err != nil {
-			log.Printf("seedInitialMemories: failed to insert memory for %s (scope=%s): %v", workspaceID, scope, err)
+		if _, err := h.seedMemoryPlugin.CommitMemory(ctx, namespace, contract.MemoryWrite{
+			Content: redactedContent,
+			// Kind = fact: seeded memories are factual baseline knowledge,
+			// not session summaries or runtime checkpoints.
+			Kind: contract.MemoryKindFact,
+			// Source = runtime: the platform (not the agent) is writing
+			// these on the agent's behalf at provision time. Distinct from
+			// `agent` (commit_memory MCP call) and `user` (canvas write).
+			Source: contract.MemorySourceRuntime,
+		}); err != nil {
+			log.Printf("seedInitialMemories: plugin commit failed for %s (scope=%s): %v", workspaceID, scope, err)
+			continue
 		}
+		seeded++
 	}
-	log.Printf("seedInitialMemories: seeded %d memories for workspace %s", len(memories), workspaceID)
+	if seeded > 0 {
+		log.Printf("seedInitialMemories: seeded %d/%d memories for workspace %s via v2 plugin (namespace=%s)",
+			seeded, len(memories), workspaceID, namespace)
+	}
 }
 
-func workspaceAwarenessNamespace(workspaceID string) string {
+// workspaceMemoryNamespace returns the canonical v2 memory namespace
+// string for a workspace. Matches the form produced by
+// internal/memory/namespace/resolver.go for self-reads (issue #1735).
+func workspaceMemoryNamespace(workspaceID string) string {
 	return fmt.Sprintf("workspace:%s", workspaceID)
-}
-
-func (h *WorkspaceHandler) loadAwarenessNamespace(ctx context.Context, workspaceID string) string {
-	var awarenessNamespace string
-	err := db.DB.QueryRowContext(ctx, `SELECT COALESCE(awareness_namespace, '') FROM workspaces WHERE id = $1`, workspaceID).Scan(&awarenessNamespace)
-	if err != nil || awarenessNamespace == "" {
-		return workspaceAwarenessNamespace(workspaceID)
-	}
-	return awarenessNamespace
 }
 
 func (h *WorkspaceHandler) buildProvisionerConfig(
@@ -249,7 +281,7 @@ func (h *WorkspaceHandler) buildProvisionerConfig(
 	configFiles map[string][]byte,
 	payload models.CreateWorkspacePayload,
 	envVars map[string]string,
-	pluginsPath, awarenessNamespace string,
+	pluginsPath string,
 ) provisioner.WorkspaceConfig {
 	// Per-workspace workspace_dir takes priority over global WORKSPACE_DIR env var.
 	// If neither is set, the provisioner creates an isolated Docker volume.
@@ -288,18 +320,24 @@ func (h *WorkspaceHandler) buildProvisionerConfig(
 	}
 
 	return provisioner.WorkspaceConfig{
-		WorkspaceID:        workspaceID,
-		TemplatePath:       templatePath,
-		ConfigFiles:        configFiles,
-		PluginsPath:        pluginsPath,
-		WorkspacePath:      workspacePath,
-		WorkspaceAccess:    workspaceAccess,
-		Tier:               payload.Tier,
-		Runtime:            payload.Runtime,
-		EnvVars:            envVars,
-		PlatformURL:        h.platformURL,
-		AwarenessURL:       os.Getenv("AWARENESS_URL"),
-		AwarenessNamespace: awarenessNamespace,
+		WorkspaceID:     workspaceID,
+		TemplatePath:    templatePath,
+		ConfigFiles:     configFiles,
+		PluginsPath:     pluginsPath,
+		WorkspacePath:   workspacePath,
+		WorkspaceAccess: workspaceAccess,
+		Tier:            payload.Tier,
+		Runtime:         payload.Runtime,
+		InstanceType:    payload.Compute.InstanceType,
+		DiskGB:          int32(payload.Compute.Volume.RootGB),
+		Display: provisioner.WorkspaceDisplayConfig{
+			Mode:     payload.Compute.Display.Mode,
+			Width:    payload.Compute.Display.Width,
+			Height:   payload.Compute.Display.Height,
+			Protocol: payload.Compute.Display.Protocol,
+		},
+		EnvVars:     envVars,
+		PlatformURL: h.platformURL,
 		// Image left empty — molecule-core's runtime_image_pins table (mig
 		// 047, dead reader removed by RFC internal#617 / task #335) was an
 		// aspirational SSOT that never received a writer. CP's
@@ -447,6 +485,17 @@ func findTemplateByName(configsDir, name string) string {
 	return ""
 }
 
+func resolveWorkspaceTemplatePath(configsDir, cacheDir, template string) (string, error) {
+	if cacheDir != "" {
+		if p, err := resolveInsideRoot(cacheDir, template); err != nil {
+			return "", err
+		} else if _, statErr := os.Stat(p); statErr == nil {
+			return p, nil
+		}
+	}
+	return resolveInsideRoot(configsDir, template)
+}
+
 // resolveOrgTemplate looks for a matching role directory under
 // configsDir/org-templates/ and returns the absolute path and a short label
 // ("org-templates/<dir>"). Used by the restart handler's rebuild_config path
@@ -477,15 +526,13 @@ func configDirName(workspaceID string) string {
 }
 
 // knownRuntimes is the allowlist of runtime strings the provisioner will
-// accept. Unknown values are coerced to the default ("langgraph") instead
+// accept. Unknown values are coerced to the default ("claude-code") instead
 // of being splatted into filepath.Join + config.yaml templating, which
 // closes both the YAML-injection vector (#241) where an attacker could
 // smuggle `initial_prompt: run id && curl …` through a crafted runtime
 // string, and the path-traversal oracle where `runtime: ../../sensitive`
 // probed host directories for existence.
 //
-// Keep in sync with workspace/build-all.sh — adding a new
-// runtime means bumping both this list and the Docker image tags.
 // knownRuntimes is populated from manifest.json at service init (see
 // runtime_registry.go). The package init order is:
 //  1. var knownRuntimes = fallbackRuntimes
@@ -548,13 +595,22 @@ func (h *WorkspaceHandler) ensureDefaultConfig(workspaceID string, payload model
 	// via a crafted runtime string (#241).
 	runtime := sanitizeRuntime(payload.Runtime)
 
-	// Generate a minimal config.yaml
+	// Generate a minimal config.yaml.
+	//
+	// SSOT (CTO 2026-05-22): model is REQUIRED user input. The platform
+	// must not provide a default; the runtime must not fall back. The
+	// Create handler is responsible for rejecting empty model BEFORE
+	// reaching provisionWorkspace; this is a defence-in-depth assertion.
+	// If we hit here with an empty model the YAML below would still
+	// render a `model: ""` line — which renders all downstream provider
+	// derivation undefined. Log loudly and let the workspace boot into
+	// not_configured rather than masking the contract violation with a
+	// silently-broken default (the prior `anthropic:claude-opus-4-7`
+	// fallback was the canonical example — every codex workspace
+	// created without an explicit model wedged).
 	model := payload.Model
 	if model == "" {
-		// SSOT: per-runtime defaults live in models/runtime_defaults.go
-		// (see RFC #2873). Was previously duplicated here AND in
-		// org_import.go; consolidating prevents silent drift.
-		model = models.DefaultModel(runtime)
+		log.Printf("ensureDefaultConfig: workspace %s reached provisioning with empty model — Create handler should have rejected this; rendering empty model: \"\" in config.yaml (workspace will boot not_configured)", workspaceID)
 	}
 	if runtime == "claude-code" {
 		model = normalizeClaudeCodeModel(model)
@@ -613,7 +669,7 @@ func (h *WorkspaceHandler) defaultTemplateProvidersYAML(runtime string) string {
 		return ""
 	}
 	templateName := runtime + "-default"
-	templatePath, err := resolveInsideRoot(h.configsDir, templateName)
+	templatePath, err := resolveWorkspaceTemplatePath(h.configsDir, h.cacheDir, templateName)
 	if err != nil {
 		log.Printf("Provisioner: default template providers skipped for runtime %s: %v", runtime, err)
 		return ""
@@ -787,13 +843,13 @@ func deriveProviderFromModelSlug(model string) string {
 //
 // Why per-runtime rather than a generic MOLECULE_MODEL: each runtime
 // installer has its own config schema and naming (hermes writes to
-// ~/.hermes/config.yaml with `model.default`; langgraph reads from
+// ~/.hermes/config.yaml with `model.default`; codex reads from
 // /configs/config.yaml directly; future IoT/robotics targets may have
 // firmware manifests). Keeping the contract owned by the runtime
 // template means adding a new runtime doesn't require edits on the
 // tenant side for each one.
 //
-// For runtimes with no env-based model override (langgraph etc. read
+// For runtimes with no env-based model override (codex etc. read
 // model from /configs/config.yaml which CP user-data generates from
 // payload.Model at boot), this is a no-op — no harm in the switch
 // being empty for those cases.
@@ -863,6 +919,77 @@ func applyRuntimeModelEnv(envVars map[string]string, runtime, model string) {
 		// provider isn't explicitly set.
 		envVars["HERMES_DEFAULT_MODEL"] = model
 	}
+}
+
+// applyPlatformManagedLLMEnv wires the control-plane LLM proxy into a
+// workspace only when the org is in platform-managed mode. Provider keys
+// never enter the tenant; provider SDK API-key envs receive the tenant token
+// for the CP proxy only when the workspace has not supplied BYOK/OAuth auth.
+func applyPlatformManagedLLMEnv(envVars map[string]string, runtime string, model string) {
+	if strings.ToLower(strings.TrimSpace(os.Getenv("MOLECULE_LLM_BILLING_MODE"))) != "platform_managed" {
+		return
+	}
+	baseURL := firstNonEmptyEnv("MOLECULE_LLM_BASE_URL", "OPENAI_BASE_URL")
+	anthropicBaseURL := firstNonEmptyEnv("MOLECULE_LLM_ANTHROPIC_BASE_URL", "ANTHROPIC_BASE_URL")
+	token := firstNonEmptyEnv("MOLECULE_LLM_USAGE_TOKEN", "OPENAI_API_KEY")
+	if baseURL == "" || token == "" {
+		return
+	}
+
+	envVars["MOLECULE_LLM_BILLING_MODE"] = "platform_managed"
+	envVars["MOLECULE_LLM_BASE_URL"] = baseURL
+	envVars["MOLECULE_LLM_USAGE_TOKEN"] = token
+	if anthropicBaseURL != "" {
+		envVars["MOLECULE_LLM_ANTHROPIC_BASE_URL"] = anthropicBaseURL
+	}
+	if usageURL := strings.TrimSpace(os.Getenv("MOLECULE_LLM_USAGE_URL")); usageURL != "" {
+		envVars["MOLECULE_LLM_USAGE_URL"] = usageURL
+	}
+
+	if strings.TrimSpace(envVars["OPENAI_API_KEY"]) == "" && !runtimeUsesAnthropicNativeProxy(runtime) {
+		envVars["OPENAI_API_KEY"] = token
+		envVars["OPENAI_BASE_URL"] = baseURL
+	}
+	if runtimeUsesAnthropicNativeProxy(runtime) && anthropicBaseURL != "" && workspaceHasNoAnthropicAuth(envVars) {
+		envVars["ANTHROPIC_API_KEY"] = token
+		envVars["ANTHROPIC_BASE_URL"] = anthropicBaseURL
+	}
+
+	if model == "" && strings.TrimSpace(envVars["MOLECULE_MODEL"]) == "" && strings.TrimSpace(envVars["MODEL"]) == "" {
+		if defaultModel := strings.TrimSpace(os.Getenv("MOLECULE_LLM_DEFAULT_MODEL")); defaultModel != "" {
+			envVars["MOLECULE_MODEL"] = defaultModel
+		}
+	}
+}
+
+func runtimeUsesAnthropicNativeProxy(runtime string) bool {
+	return strings.TrimSpace(strings.ToLower(runtime)) == "claude-code"
+}
+
+func workspaceHasNoAnthropicAuth(envVars map[string]string) bool {
+	for _, key := range []string{
+		"CLAUDE_CODE_OAUTH_TOKEN",
+		"ANTHROPIC_API_KEY",
+		"ANTHROPIC_AUTH_TOKEN",
+		"MINIMAX_API_KEY",
+		"KIMI_API_KEY",
+		"GLM_API_KEY",
+		"DEEPSEEK_API_KEY",
+	} {
+		if strings.TrimSpace(envVars[key]) != "" {
+			return false
+		}
+	}
+	return true
+}
+
+func firstNonEmptyEnv(names ...string) string {
+	for _, name := range names {
+		if v := strings.TrimSpace(os.Getenv(name)); v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // loadWorkspaceSecrets loads global + workspace-specific secrets into a map.
@@ -1009,4 +1136,3 @@ func (h *WorkspaceHandler) provisionWorkspaceCP(workspaceID, templatePath string
 
 	log.Printf("CPProvisioner: workspace %s started as machine %s via control plane", workspaceID, machineID)
 }
-

@@ -18,7 +18,7 @@ import (
 
 	"github.com/lib/pq"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/memory/contract"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/memory/contract"
 )
 
 // ErrNotFound is the typed sentinel for "namespace or memory not
@@ -349,8 +349,23 @@ func scanMemory(row interface {
 }
 
 func marshalMetadata(m map[string]interface{}) ([]byte, error) {
+	// Returning Go nil here previously made lib/pq send the parameter
+	// as a bytea-typed NULL placeholder that PostgreSQL refused to
+	// implicitly cast into the jsonb column. The resulting INSERT
+	// failed with `pq: invalid input syntax for type json`, which
+	// surfaced first as "scan namespace" errors from the QueryRow
+	// path (the row never gets created so RETURNING produces no rows;
+	// the QueryRow error propagates through Scan). Caught 2026-05-24
+	// during the Phase A2 backfill — UpsertNamespace failed on every
+	// call, then the client's circuit breaker opened and ALL plugin
+	// writes started failing. The same hazard exists on the
+	// memory_records.propagation column (also marshalled via this
+	// helper). Sending the JSON literal `null` keeps the parameter
+	// typed as a valid jsonb value regardless of pq's auto-conversion
+	// heuristics — semantically identical to NULL for our consumers
+	// (they treat empty propagation/metadata as absent).
 	if m == nil {
-		return nil, nil
+		return []byte(`null`), nil
 	}
 	b, err := json.Marshal(m)
 	if err != nil {

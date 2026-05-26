@@ -16,7 +16,7 @@
  *   - handleDeployed fires after 500ms delay
  *
  * Uses vi.hoisted + vi.mock to fully isolate the api module, matching
- * the pattern established in ApprovalBanner, MemoryTab, and ScheduleTab tests.
+ * the pattern established in ApprovalBanner and ScheduleTab tests.
  */
 import React from "react";
 import { render, screen, fireEvent, cleanup, act } from "@testing-library/react";
@@ -96,12 +96,12 @@ vi.mock("@/lib/design-tokens", () => ({
 // ─── Fixtures ─────────────────────────────────────────────────────────────────
 
 const TEMPLATE = {
-  id: "tpl-1",
-  name: "Claude Code Agent",
-  description: "A general-purpose coding assistant",
+  id: "seo-agent",
+  name: "SEO Agent",
+  description: "SEO workspace template",
   tier: 2,
   skill_count: 3,
-  model: "claude-opus-4-5",
+  model: "MiniMax-M2.7",
 };
 
 function template(overrides: Partial<typeof TEMPLATE> = {}): typeof TEMPLATE {
@@ -159,7 +159,7 @@ describe("EmptyState — loading", () => {
   it("does not render template buttons while loading", async () => {
     renderEmpty();
     await flush();
-    expect(screen.queryByText("Claude Code Agent")).toBeNull();
+    expect(screen.queryByText("SEO Agent")).toBeNull();
   });
 });
 
@@ -183,8 +183,8 @@ describe("EmptyState — templates", () => {
   it("renders template buttons with name and description", async () => {
     renderEmpty();
     await flush();
-    expect(screen.getByText("Claude Code Agent")).toBeTruthy();
-    expect(screen.getByText("A general-purpose coding assistant")).toBeTruthy();
+    expect(screen.getByText("SEO Agent")).toBeTruthy();
+    expect(screen.getByText("SEO workspace template")).toBeTruthy();
   });
 
   it("renders tier badge and skill count", async () => {
@@ -198,25 +198,42 @@ describe("EmptyState — templates", () => {
   it("renders model name when present", async () => {
     renderEmpty();
     await flush();
-    expect(screen.getByText(/claude-opus/i)).toBeTruthy();
+    expect(screen.getByText(/MiniMax-M2.7/i)).toBeTruthy();
   });
 
   it("calls deploy with the template on click", async () => {
     renderEmpty();
     await flush();
-    fireEvent.click(screen.getByText("Claude Code Agent"));
+    fireEvent.click(screen.getByText("SEO Agent"));
     expect(_deploy.deployFn).toHaveBeenCalledWith(template());
   });
 
+  it("hides runtime-default templates from the product template grid", async () => {
+    mockApiGet.mockResolvedValue([
+      template({ id: "claude-code-default", name: "Claude Code Agent" }),
+      template({ id: "codex", name: "OpenAI Codex CLI" }),
+      template({ id: "hermes", name: "Hermes Agent" }),
+      template({ id: "openclaw", name: "OpenClaw Agent" }),
+      template(),
+    ]);
+    renderEmpty();
+    await flush();
+    expect(screen.getByText("SEO Agent")).toBeTruthy();
+    expect(screen.queryByText("Claude Code Agent")).toBeNull();
+    expect(screen.queryByText("OpenAI Codex CLI")).toBeNull();
+    expect(screen.queryByText("Hermes Agent")).toBeNull();
+    expect(screen.queryByText("OpenClaw Agent")).toBeNull();
+  });
+
   it("shows 'Deploying...' on the button of the template being deployed", async () => {
-    _deploy.deploying = "tpl-1";
+    _deploy.deploying = "seo-agent";
     renderEmpty();
     await flush();
     expect(screen.getByText("Deploying...")).toBeTruthy();
   });
 
   it("disables the template button of the deploying template", async () => {
-    _deploy.deploying = "tpl-1";
+    _deploy.deploying = "seo-agent";
     renderEmpty();
     await flush();
     const btn = screen.getByText("Deploying...").closest("button") as HTMLButtonElement;
@@ -224,7 +241,7 @@ describe("EmptyState — templates", () => {
   });
 
   it("disables 'create blank' while a template is deploying", async () => {
-    _deploy.deploying = "tpl-1";
+    _deploy.deploying = "seo-agent";
     renderEmpty();
     await flush();
     expect(screen.getByRole("button", { name: "+ Create blank workspace" }).disabled).toBe(true);
@@ -245,7 +262,7 @@ describe("EmptyState — fetch failure / empty templates", () => {
   it("does not render template grid when GET /templates returns []", async () => {
     renderEmpty();
     await flush();
-    expect(screen.queryByText("Claude Code Agent")).toBeNull();
+    expect(screen.queryByText("SEO Agent")).toBeNull();
   });
 
   it("renders 'create blank' button when templates list is empty", async () => {
@@ -258,7 +275,7 @@ describe("EmptyState — fetch failure / empty templates", () => {
     mockApiGet.mockReset().mockRejectedValue(new Error("Network failure"));
     renderEmpty();
     await flush();
-    expect(screen.queryByText("Claude Code Agent")).toBeNull();
+    expect(screen.queryByText("SEO Agent")).toBeNull();
   });
 });
 
@@ -316,7 +333,7 @@ describe("EmptyState — create blank", () => {
     await flush();
     fireEvent.click(screen.getByRole("button", { name: "+ Create blank workspace" }));
     await act(async () => { await Promise.resolve(); });
-    expect((screen.getByText("Claude Code Agent").closest("button") as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByText("SEO Agent").closest("button") as HTMLButtonElement).disabled).toBe(true);
   });
 
   it("shows error banner when POST /workspaces fails", async () => {

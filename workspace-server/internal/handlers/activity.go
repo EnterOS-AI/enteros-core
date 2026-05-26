@@ -13,8 +13,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/events"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
@@ -656,9 +656,17 @@ func parseSessionSearchParams(c *gin.Context) (string, int) {
 	return query, limit
 }
 
-// buildSessionSearchQuery composes the UNION-ALL SQL across activity_logs and
-// agent_memories with an optional ILIKE filter, returning the SQL string and
-// positional args ready for QueryContext.
+// buildSessionSearchQuery composes the session-search SQL over
+// activity_logs, returning the SQL string and positional args ready
+// for QueryContext.
+//
+// Phase A3 (#1792): the agent_memories UNION branch was removed when
+// the v1 table was dropped. Memory items no longer appear in session
+// search; the canvas MemoryInspectorPanel queries /v2/memories
+// directly for memory-tab content, so the UNION here only served
+// callers that wanted activity + memory blended results — that
+// surface is unused in production (verified via traffic audit
+// 2026-05-24).
 func buildSessionSearchQuery(workspaceID, query string, limit int) (string, []interface{}) {
 	sqlQuery := `
 		WITH session_items AS (
@@ -674,20 +682,6 @@ func buildSessionSearchQuery(workspaceID, query string, limit int) (string, []in
 				response_body,
 				created_at
 			FROM activity_logs
-			WHERE workspace_id = $1
-			UNION ALL
-			SELECT
-				'memory' AS kind,
-				id,
-				workspace_id,
-				scope AS label,
-				content,
-				'' AS method,
-				'' AS status,
-				NULL::jsonb AS request_body,
-				NULL::jsonb AS response_body,
-				created_at
-			FROM agent_memories
 			WHERE workspace_id = $1
 		)
 		SELECT kind, id, workspace_id, label, content, method, status, request_body, response_body, created_at

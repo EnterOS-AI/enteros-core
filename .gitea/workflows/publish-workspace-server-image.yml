@@ -234,15 +234,18 @@ jobs:
     name: Production auto-deploy
     needs: build-and-push
     if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    # Side-effect deploy only; image publish success is the durable artifact. mc#774
+    continue-on-error: true
     # Publish/release lane (internal#462) — production deploy of a merged
     # fix; reserved capacity, never queued behind PR-CI.
     runs-on: publish
-    timeout-minutes: 75
+    timeout-minutes: 90
     env:
       CP_URL: ${{ vars.PROD_CP_URL || 'https://api.moleculesai.app' }}
       CP_ADMIN_API_TOKEN: ${{ secrets.CP_ADMIN_API_TOKEN }}
       GITEA_HOST: git.moleculesai.app
       GITEA_TOKEN: ${{ secrets.PROD_AUTO_DEPLOY_CONTROL_TOKEN || secrets.AUTO_SYNC_TOKEN }}
+      CI_STATUS_TIMEOUT_SECONDS: "3600"
       PROD_AUTO_DEPLOY_DISABLED: ${{ vars.PROD_AUTO_DEPLOY_DISABLED || secrets.PROD_AUTO_DEPLOY_DISABLED || '' }}
       PROD_AUTO_DEPLOY_CANARY_SLUG: ${{ vars.PROD_AUTO_DEPLOY_CANARY_SLUG || 'hongming' }}
       PROD_AUTO_DEPLOY_SOAK_SECONDS: ${{ vars.PROD_AUTO_DEPLOY_SOAK_SECONDS || '60' }}
@@ -301,26 +304,19 @@ jobs:
           python3 .gitea/scripts/prod-auto-deploy.py assert-enabled
           PLAN="$RUNNER_TEMP/prod-auto-deploy-plan.json"
           TARGET_TAG="$(jq -r '.target_tag' "$PLAN")"
-          BODY="$(jq -c '.body' "$PLAN")"
-
-          echo "POST $CP_URL/cp/admin/tenants/redeploy-fleet"
-          echo "  target_tag: $TARGET_TAG"
-          echo "  body: $BODY"
 
           HTTP_RESPONSE="$RUNNER_TEMP/prod-redeploy-response.json"
-          HTTP_CODE_FILE="$RUNNER_TEMP/prod-redeploy-http-code.txt"
           set +e
-          curl -sS -o "$HTTP_RESPONSE" -w '%{http_code}' \
-            -m 1200 \
-            -H "Authorization: Bearer $CP_ADMIN_API_TOKEN" \
-            -H "Content-Type: application/json" \
-            -X POST "$CP_URL/cp/admin/tenants/redeploy-fleet" \
-            -d "$BODY" > "$HTTP_CODE_FILE"
+          python3 .gitea/scripts/prod-auto-deploy.py rollout \
+            --plan "$PLAN" \
+            --response "$HTTP_RESPONSE"
+          ROLLOUT_EXIT=$?
           set -e
 
-          HTTP_CODE="$(cat "$HTTP_CODE_FILE" 2>/dev/null || echo "000")"
-          [ -z "$HTTP_CODE" ] && HTTP_CODE="000"
-          echo "HTTP $HTTP_CODE"
+          if [ ! -s "$HTTP_RESPONSE" ]; then
+            jq -nc --arg error "rollout command exited $ROLLOUT_EXIT before writing a response" \
+              '{ok:false, results:[], error:$error}' > "$HTTP_RESPONSE"
+          fi
           jq '{ok, result_count: (.results // [] | length)}' "$HTTP_RESPONSE" || true
 
           {
@@ -328,7 +324,6 @@ jobs:
             echo ""
             echo "**Commit:** \`${GITHUB_SHA:0:7}\`"
             echo "**Target tag:** \`$TARGET_TAG\`"
-            echo "**HTTP:** $HTTP_CODE"
             echo ""
             echo "### Per-tenant result"
             echo ""
@@ -337,14 +332,14 @@ jobs:
             jq -r '.results[]? | "| \(.slug) | \(.phase) | \(.ssm_status // "-") | \(.ssm_exit_code) | \(.healthz_ok) | \((.error // "") != "") |"' "$HTTP_RESPONSE" || true
           } >> "$GITHUB_STEP_SUMMARY"
 
-          if [ "$HTTP_CODE" != "200" ]; then
-            echo "::error::redeploy-fleet returned HTTP $HTTP_CODE"
-            exit 1
-          fi
           OK="$(jq -r '.ok' "$HTTP_RESPONSE")"
           if [ "$OK" != "true" ]; then
             echo "::error::redeploy-fleet reported ok=false; production rollout halted."
             exit 1
+          fi
+          if [ "$ROLLOUT_EXIT" -ne 0 ]; then
+            echo "::error::redeploy-fleet rollout failed with exit code $ROLLOUT_EXIT."
+            exit "$ROLLOUT_EXIT"
           fi
 
       - name: Verify reachable tenants report this SHA

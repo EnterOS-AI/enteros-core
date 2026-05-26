@@ -15,9 +15,11 @@ test("FilesTab renders after split", async ({ page, request }) => {
   // Clean slate
   const { workspaces } = await request
     .get("http://localhost:8080/workspaces")
-    .then(async (r) => ({ workspaces: (await r.json()) as Array<{ id: string }> }));
+    .then(async (r) => ({ workspaces: (await r.json()) as Array<{ id: string; name: string }> }));
   for (const w of workspaces) {
-    await request.delete(`http://localhost:8080/workspaces/${w.id}?confirm=true`);
+    await request.delete(`http://localhost:8080/workspaces/${w.id}?confirm=true`, {
+      headers: { "X-Confirm-Name": w.name },
+    });
   }
 
   // Create a workspace
@@ -80,5 +82,7 @@ test("FilesTab renders after split", async ({ page, request }) => {
   await expect(editorEmpty.first()).toBeVisible({ timeout: 5_000 });
 
   // Cleanup
-  await request.delete(`http://localhost:8080/workspaces/${wsId}?confirm=true`);
+  await request.delete(`http://localhost:8080/workspaces/${wsId}?confirm=true`, {
+    headers: { "X-Confirm-Name": "FilesTab Smoke" },
+  });
 });

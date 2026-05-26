@@ -34,7 +34,7 @@ ARG GIT_SHA=dev
 # Mirrors the pattern already in molecule-controlplane/Dockerfile.
 RUN CGO_ENABLED=0 GOOS=linux go build \
     -trimpath \
-    -ldflags "-s -w -X github.com/Molecule-AI/molecule-monorepo/platform/internal/buildinfo.GitSHA=${GIT_SHA}" \
+    -ldflags "-s -w -X git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/buildinfo.GitSHA=${GIT_SHA}" \
     -o /platform ./cmd/server
 # Bundle the built-in memory-plugin-postgres binary so an operator can
 # activate Memory v2 by setting MEMORY_V2_CUTOVER=true + (default)
@@ -43,7 +43,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
 # Stays inert until the operator flips the cutover env var.
 RUN CGO_ENABLED=0 GOOS=linux go build \
     -trimpath \
-    -ldflags "-s -w -X github.com/Molecule-AI/molecule-monorepo/platform/internal/buildinfo.GitSHA=${GIT_SHA}" \
+    -ldflags "-s -w -X git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/buildinfo.GitSHA=${GIT_SHA}" \
     -o /memory-plugin ./cmd/memory-plugin-postgres
 
 FROM alpine:3.20@sha256:c64c687cbea9300178b30c95835354e34c4e4febc4badfe27102879de0483b5e
@@ -71,6 +71,7 @@ RUN apk add --no-cache ca-certificates docker-cli docker-cli-buildx git tzdata w
 COPY --from=builder /platform /platform
 COPY --from=builder /memory-plugin /memory-plugin
 COPY workspace-server/migrations /migrations
+COPY manifest.json /app/manifest.json
 # Templates + plugins (pre-cloned by scripts/clone-manifest.sh in the
 # trusted CI / operator-host context, .git already stripped). The Gitea
 # token used to clone them never enters this image — same shape as

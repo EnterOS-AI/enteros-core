@@ -16,8 +16,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/envx"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/plugins"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/envx"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/plugins"
 	"github.com/gin-gonic/gin"
 )
 

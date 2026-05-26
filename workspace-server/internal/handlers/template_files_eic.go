@@ -48,13 +48,10 @@ import (
 var workspaceFilePathPrefix = map[string]string{
 	"hermes":      "/home/ubuntu/.hermes",
 	"claude-code": "/configs",
-	"langgraph":   "/opt/configs",
 	"external":    "/opt/configs",
 	// Default for unknown / future runtimes is /configs — matches the
-	// containerized user-data layout. The `langgraph` / `external`
-	// entries pre-date the unified user-data path and are retained
-	// until a migration audit confirms what the running tenants of
-	// those runtimes actually have on disk.
+	// containerized user-data layout. The `external` entry pre-dates the
+	// unified user-data path and does not map to a spawned runtime.
 }
 
 // resolveWorkspaceFilePath translates (runtime, root, relPath) into an

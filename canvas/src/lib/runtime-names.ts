@@ -4,11 +4,9 @@
 
 const RUNTIME_NAMES: Record<string, string> = {
   "claude-code": "Claude Code",
-  langgraph: "LangGraph",
-  deepagents: "DeepAgents",
+  codex: "Codex",
+  hermes: "Hermes",
   openclaw: "OpenClaw",
-  crewai: "CrewAI",
-  autogen: "AutoGen",
   kimi: "Kimi",
   "kimi-cli": "Kimi CLI",
 };

@@ -25,7 +25,7 @@ import (
 	"testing"
 )
 
-const moduleInternalPrefix = "github.com/Molecule-AI/molecule-monorepo/platform/internal/"
+const moduleInternalPrefix = "git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/"
 
 var provisionerForbiddenImports = []string{
 	moduleInternalPrefix + "handlers",

@@ -78,11 +78,11 @@ describe("walkEntry — file entry", () => {
   });
 
   it("populates the File object with correct content", async () => {
-    const { entry, file } = makeFile("config.yaml", "runtime: langgraph");
+    const { entry, file } = makeFile("config.yaml", "runtime: claude-code");
     const out: CollectedEntry[] = [];
     await walkEntry(entry as never, "", out);
     expect(out[0]!.file).toBe(file);
-    expect(await out[0]!.file.text()).toBe("runtime: langgraph");
+    expect(await out[0]!.file.text()).toBe("runtime: claude-code");
   });
 
   it("appends to existing entries array (non-destructive)", async () => {

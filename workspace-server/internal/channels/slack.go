@@ -171,8 +171,11 @@ func (s *SlackAdapter) sendBotMessage(ctx context.Context, config map[string]int
 		if err != nil {
 			return fmt.Errorf("slack: send: %w", err)
 		}
-		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		_ = resp.Body.Close()
+		if readErr != nil {
+			return fmt.Errorf("slack: read response body: %w", readErr)
+		}
 		var result struct {
 			OK    bool   `json:"ok"`
 			Error string `json:"error"`
@@ -208,9 +211,13 @@ func (s *SlackAdapter) sendWebhookMessage(ctx context.Context, config map[string
 	if err != nil {
 		return fmt.Errorf("slack: send: %w", err)
 	}
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			return fmt.Errorf("slack: webhook returned %d (read body failed: %v)", resp.StatusCode, readErr)
+		}
 		return fmt.Errorf("slack: webhook returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	return nil
@@ -524,8 +531,11 @@ func FetchChannelHistory(ctx context.Context, botToken, channelID string, limit 
 	if err != nil {
 		return nil, err
 	}
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 65536))
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, 65536))
 	_ = resp.Body.Close()
+	if readErr != nil {
+		return nil, fmt.Errorf("slack: read history response: %w", readErr)
+	}
 
 	var result struct {
 		OK       bool                  `json:"ok"`

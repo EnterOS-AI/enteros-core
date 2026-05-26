@@ -20,9 +20,9 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/events"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/textutil"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/textutil"
 )
 
 // extractIdempotencyKey pulls params.message.messageId out of an A2A JSON-RPC
@@ -333,7 +333,7 @@ func (h *WorkspaceHandler) DrainQueueForWorkspace(ctx context.Context, workspace
 	}
 	// logActivity=false: the original EnqueueA2A callsite already logged
 	// the dispatch attempt; re-logging here would double-count events.
-	status, respBody, proxyErr := h.proxyA2ARequest(ctx, workspaceID, item.Body, callerID, false)
+	status, respBody, proxyErr := h.proxyA2ARequest(ctx, workspaceID, item.Body, callerID, false, false)
 
 	// 202 Accepted = the dispatch was itself queued again (target still busy).
 	// That's not a failure — the queued item just stays queued naturally on

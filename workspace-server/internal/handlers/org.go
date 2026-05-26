@@ -15,11 +15,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/channels"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/events"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/models"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/provisioner"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/channels"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
 	"github.com/gin-gonic/gin"
 	"github.com/lib/pq"
 	"gopkg.in/yaml.v3"
@@ -799,13 +799,12 @@ func (h *OrgHandler) Import(c *gin.Context) {
 	if len(tmpl.GlobalMemories) > 0 && len(results) > 0 {
 		rootID, _ := results[0]["id"].(string)
 		if rootID != "" {
-			rootNS := workspaceAwarenessNamespace(rootID)
 			// Force scope to GLOBAL regardless of what the YAML says.
 			globalSeeds := make([]models.MemorySeed, len(tmpl.GlobalMemories))
 			for i, gm := range tmpl.GlobalMemories {
 				globalSeeds[i] = models.MemorySeed{Content: gm.Content, Scope: "GLOBAL"}
 			}
-			seedInitialMemories(context.Background(), rootID, globalSeeds, rootNS)
+			h.workspace.seedInitialMemories(context.Background(), rootID, globalSeeds)
 			log.Printf("Org import: seeded %d global memories on root workspace %s", len(globalSeeds), rootID)
 		}
 	}

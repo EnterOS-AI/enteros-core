@@ -57,6 +57,7 @@ func TestSecurityHeaders(t *testing.T) {
 		"script-src 'self' 'unsafe-inline'",
 		"style-src 'self' 'unsafe-inline'",
 		"img-src 'self' data: blob:",
+		"frame-src 'self' blob:",
 		"connect-src 'self' ws: wss:",
 		"font-src 'self' data:",
 	} {
@@ -195,6 +196,9 @@ func TestCSPCanvasRoutesGetPermissivePolicy(t *testing.T) {
 			if strings.Contains(csp, "'unsafe-eval'") {
 				t.Errorf("canvas path %q: CSP must not contain 'unsafe-eval', got %q", path, csp)
 			}
+			if !strings.Contains(csp, "frame-src 'self' blob:") {
+				t.Errorf("canvas path %q: CSP should allow blob: frames for PDF previews, got %q", path, csp)
+			}
 		})
 	}
 }
@@ -267,7 +271,7 @@ func TestIsAPIPath(t *testing.T) {
 		{"/ws", true},
 		{"/events", true},
 		{"/approvals", true},
-		{"/orgs", true},                          // #610 allowlist routes
+		{"/orgs", true}, // #610 allowlist routes
 		{"/orgs/org-1/plugins/allowlist", true},
 		// Sub-paths
 		{"/workspaces/abc-123", true},
