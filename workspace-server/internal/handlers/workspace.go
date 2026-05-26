@@ -677,7 +677,9 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 			// Preserve BYO-compute runtime label (kimi, kimi-cli, external) —
 			// don't coerce to generic "external" so the canvas can show the
 			// correct runtime name in the node card.
-			db.DB.ExecContext(ctx, `UPDATE workspaces SET url = $1, status = $2, runtime = $3, updated_at = now() WHERE id = $4`, payload.URL, models.StatusOnline, normalizeExternalRuntime(payload.Runtime), id)
+			if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET url = $1, status = $2, runtime = $3, updated_at = now() WHERE id = $4`, payload.URL, models.StatusOnline, normalizeExternalRuntime(payload.Runtime), id); err != nil {
+				log.Printf("External workspace: failed to update URL/status for %s: %v", id, err)
+			}
 			if err := db.CacheURL(ctx, id, payload.URL); err != nil {
 				log.Printf("External workspace: failed to cache URL for %s: %v", id, err)
 			}
@@ -690,7 +692,9 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 			// from the external agent (with this token + its URL)
 			// flips the row to online.
 			// Preserve BYO-compute runtime label (kimi, kimi-cli, external).
-			db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1, runtime = $2, updated_at = now() WHERE id = $3`, models.StatusAwaitingAgent, normalizeExternalRuntime(payload.Runtime), id)
+			if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1, runtime = $2, updated_at = now() WHERE id = $3`, models.StatusAwaitingAgent, normalizeExternalRuntime(payload.Runtime), id); err != nil {
+				log.Printf("External workspace: failed to update status for %s: %v", id, err)
+			}
 			tok, tokErr := wsauth.IssueToken(ctx, db.DB, id)
 			if tokErr != nil {
 				log.Printf("External workspace %s: token issuance failed: %v", id, tokErr)
