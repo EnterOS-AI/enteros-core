@@ -677,7 +677,7 @@ skills: []
 		t.Fatalf("parse: %v", err)
 	}
 	if len(resp) != 1 || resp[0].Model != "anthropic:claude-sonnet-4-6" {
-		t.Errorf("legacy top-level model not surfaced: %+v", resp)
+		t.Fatalf("legacy top-level model not surfaced: %+v", resp)
 	}
 	if resp[0].Runtime != "claude-code" {
 		t.Errorf("Runtime should be claude-code for legacy template, got %q", resp[0].Runtime)
