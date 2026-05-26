@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"io"
 	"log"
 	"net/http"
 
@@ -68,7 +69,10 @@ type createOrgTokenResponse struct {
 func (h *OrgTokenHandler) Create(c *gin.Context) {
 	var req createOrgTokenRequest
 	// Optional body — an empty POST should still work (unnamed token).
-	_ = c.ShouldBindJSON(&req)
+	if err := c.ShouldBindJSON(&req); err != nil && err != io.EOF {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid JSON body"})
+		return
+	}
 	if len(req.Name) > 100 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "name too long (max 100 chars)"})
 		return
