@@ -153,7 +153,12 @@ func (h *TokenHandler) Revoke(c *gin.Context) {
 		return
 	}
 
-	rows, _ := result.RowsAffected()
+	rows, err := result.RowsAffected()
+	if err != nil {
+		log.Printf("tokens: revoke RowsAffected error token=%s workspace=%s: %v", tokenID, workspaceID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to revoke token"})
+		return
+	}
 	if rows == 0 {
 		c.JSON(http.StatusNotFound, gin.H{"error": "token not found or already revoked"})
 		return
