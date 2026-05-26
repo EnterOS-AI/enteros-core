@@ -177,7 +177,7 @@ def signal_1_comment_scan(pr_number: int, repo: str) -> dict:
     try:
         reviews = api_list(f"/repos/{owner}/{name}/pulls/{pr_number}/reviews")
         for r in reviews:
-            login = r.get("user", {}).get("login", "")
+            login = (r.get("user") or {}).get("login", "")
             canonical = LOGIN_ALIASES.get(login, login)
             if canonical in login_to_group and r.get("state") == "APPROVED":
                 comments.append(
@@ -198,7 +198,7 @@ def signal_1_comment_scan(pr_number: int, repo: str) -> dict:
         matches = []
         for c in comments:
             body = c.get("body", "") or ""
-            user_login = c.get("user", {}).get("login", "")
+            user_login = (c.get("user") or {}).get("login", "")
             # Resolve LOGIN_ALIASES so alternate logins satisfy the canonical gate
             user_login = LOGIN_ALIASES.get(user_login, user_login)
             if user_login != login:
