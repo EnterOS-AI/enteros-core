@@ -293,6 +293,26 @@ func TestExtended_SecretsSet(t *testing.T) {
 	}
 }
 
+func TestExtended_SecretsSetRejectsHermesCustomProviderInPlatformManagedMode(t *testing.T) {
+	t.Setenv("MOLECULE_LLM_BILLING_MODE", "platform_managed")
+	_ = setupTestDB(t)
+	handler := NewSecretsHandler(nil)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "22222222-2222-2222-2222-222222222222"}}
+
+	body := `{"key":"HERMES_CUSTOM_BASE_URL","value":"https://api.moonshot.ai/v1"}`
+	c.Request = httptest.NewRequest("POST", "/workspaces/22222222-2222-2222-2222-222222222222/secrets", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Set(c)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
 // ---------- TestSecretsDelete (Extended) ----------
 
 func TestExtended_SecretsDelete(t *testing.T) {
