@@ -80,7 +80,10 @@ func (h *WorkspaceHandler) gracefulPreRestart(ctx context.Context, workspaceID s
 			},
 			"id": nil,
 		}
-		body, _ := json.Marshal(payload)
+		body, marshalErr := json.Marshal(payload)
+		if marshalErr != nil {
+			log.Printf("A2AGracefulRestart %s: json.Marshal payload failed: %v", workspaceID, marshalErr)
+		}
 
 		req, reqErr := http.NewRequestWithContext(signalCtx, http.MethodPost, url, bytes.NewReader(body))
 		if reqErr != nil {

@@ -344,7 +344,10 @@ func computeAuditHMAC(key []byte, ev *auditEventRow) string {
 		"timestamp":            ev.Timestamp.UTC().Format("2006-01-02T15:04:05Z"),
 	}
 
-	payload, _ := json.Marshal(canonical) // compact, sorted keys
+	payload, marshalErr := json.Marshal(canonical) // compact, sorted keys
+	if marshalErr != nil {
+		log.Printf("auditChainHash: json.Marshal canonical failed: %v", marshalErr)
+	}
 	mac := hmac.New(sha256.New, key)
 	mac.Write(payload)
 	return hex.EncodeToString(mac.Sum(nil))

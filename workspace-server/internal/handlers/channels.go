@@ -169,8 +169,14 @@ func (h *ChannelHandler) Create(c *gin.Context) {
 		return
 	}
 
-	configJSON, _ := json.Marshal(body.Config)
-	allowedJSON, _ := json.Marshal(body.AllowedUsers)
+	configJSON, marshalErr := json.Marshal(body.Config)
+	if marshalErr != nil {
+		log.Printf("Channels create %s: json.Marshal config failed: %v", workspaceID, marshalErr)
+	}
+	allowedJSON, marshalErr := json.Marshal(body.AllowedUsers)
+	if marshalErr != nil {
+		log.Printf("Channels create %s: json.Marshal allowed_users failed: %v", workspaceID, marshalErr)
+	}
 	enabled := true
 	if body.Enabled != nil {
 		enabled = *body.Enabled
@@ -225,11 +231,17 @@ func (h *ChannelHandler) Update(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "encrypt failed"})
 			return
 		}
-		j, _ := json.Marshal(body.Config)
+		j, marshalErr := json.Marshal(body.Config)
+		if marshalErr != nil {
+			log.Printf("Channels update %s: json.Marshal config failed: %v", workspaceID, marshalErr)
+		}
 		configArg = string(j)
 	}
 	if body.AllowedUsers != nil {
-		j, _ := json.Marshal(body.AllowedUsers)
+		j, marshalErr := json.Marshal(body.AllowedUsers)
+		if marshalErr != nil {
+			log.Printf("Channels update %s: json.Marshal allowed_users failed: %v", workspaceID, marshalErr)
+		}
 		allowedArg = string(j)
 	}
 

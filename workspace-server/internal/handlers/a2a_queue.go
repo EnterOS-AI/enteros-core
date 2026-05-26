@@ -419,10 +419,13 @@ func (h *WorkspaceHandler) stitchDrainResponseToDelegation(ctx context.Context, 
 		return
 	}
 	responseText := extractResponseText(respBody)
-	respJSON, _ := json.Marshal(map[string]interface{}{
+	respJSON, marshalErr := json.Marshal(map[string]interface{}{
 		"text":          responseText,
 		"delegation_id": delegationID,
 	})
+	if marshalErr != nil {
+		log.Printf("a2aQueue stitch %s: json.Marshal respJSON failed: %v", delegationID, marshalErr)
+	}
 	res, err := db.DB.ExecContext(ctx, `
 		UPDATE activity_logs
 		   SET status        = 'completed',

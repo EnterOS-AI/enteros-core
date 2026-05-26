@@ -240,11 +240,14 @@ func (h *MemoriesHandler) Commit(c *gin.Context) {
 		// Hash the sanitised content so the audit trail reflects what was
 		// actually persisted (not the raw, potentially secret-bearing input).
 		sum := sha256.Sum256([]byte(content))
-		auditBody, _ := json.Marshal(map[string]string{
+		auditBody, marshalErr := json.Marshal(map[string]string{
 			"memory_id":      memoryID,
 			"namespace":      nsName,
 			"content_sha256": hex.EncodeToString(sum[:]),
 		})
+		if marshalErr != nil {
+			log.Printf("Commit %s: json.Marshal auditBody failed: %v", workspaceID, marshalErr)
+		}
 		summary := "GLOBAL memory written: id=" + memoryID + " namespace=" + nsName
 		if _, auditErr := db.DB.ExecContext(ctx, `
 			INSERT INTO activity_logs (workspace_id, activity_type, source_id, summary, request_body, status)

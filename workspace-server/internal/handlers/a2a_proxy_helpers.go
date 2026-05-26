@@ -115,12 +115,15 @@ func (h *WorkspaceHandler) handleA2ADispatchError(ctx context.Context, workspace
 			if logActivity {
 				h.logA2ABusyQueued(ctx, workspaceID, callerID, body, a2aMethod, durationMs)
 			}
-			respBody, _ := json.Marshal(gin.H{
+			respBody, marshalErr := json.Marshal(gin.H{
 				"queued":      true,
 				"queue_id":    qid,
 				"queue_depth": depth,
 				"message":     "workspace agent busy — request queued, will dispatch when capacity available",
 			})
+			if marshalErr != nil {
+				log.Printf("ProxyA2A %s: json.Marshal respBody failed: %v", workspaceID, marshalErr)
+			}
 			return http.StatusAccepted, respBody, nil
 		} else {
 			// Queue insert failed — fall through to legacy 503 behavior

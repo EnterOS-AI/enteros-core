@@ -25,6 +25,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/memory/contract"
@@ -190,7 +191,10 @@ func (h *MCPHandler) recallMemoryLegacyShim(ctx context.Context, workspaceID str
 	if len(out) == 0 {
 		return "No memories found.", nil
 	}
-	b, _ := json.MarshalIndent(out, "", "  ")
+	b, marshalErr := json.MarshalIndent(out, "", "  ")
+	if marshalErr != nil {
+		log.Printf("toolRecallMemory: json.MarshalIndent out failed: %v", marshalErr)
+	}
 	return string(b), nil
 }
 

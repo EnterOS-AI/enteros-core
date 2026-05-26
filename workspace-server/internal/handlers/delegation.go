@@ -57,10 +57,16 @@ func pushDelegationResultToInbox(ctx context.Context, sourceID, delegationID, st
 		"text":          responsePreview,
 		"delegation_id": delegationID,
 	}
-	respJSON, _ := json.Marshal(respPayload)
-	reqJSON, _ := json.Marshal(map[string]interface{}{
+	respJSON, marshalErr := json.Marshal(respPayload)
+	if marshalErr != nil {
+		log.Printf("Delegation %s: json.Marshal respPayload failed: %v", delegationID, marshalErr)
+	}
+	reqJSON, marshalErr := json.Marshal(map[string]interface{}{
 		"delegation_id": delegationID,
 	})
+	if marshalErr != nil {
+		log.Printf("Delegation %s: json.Marshal reqPayload failed: %v", delegationID, marshalErr)
+	}
 	logStatus := "ok"
 	if status == "failed" {
 		logStatus = "error"
@@ -165,7 +171,7 @@ func (h *DelegationHandler) Delegate(c *gin.Context) {
 	// check_task_status returned status='queued' forever even after a
 	// real reply landed). messageId mirrors delegation_id so the
 	// platform's idempotency-key extraction also keys off the same id.
-	a2aBody, _ := json.Marshal(map[string]interface{}{
+	a2aBody, marshalErr := json.Marshal(map[string]interface{}{
 		"method": "message/send",
 		"params": map[string]interface{}{
 			"message": map[string]interface{}{
@@ -176,6 +182,9 @@ func (h *DelegationHandler) Delegate(c *gin.Context) {
 			},
 		},
 	})
+	if marshalErr != nil {
+		log.Printf("Delegation %s: json.Marshal a2aBody failed: %v", delegationID, marshalErr)
+	}
 
 	// Fire-and-forget: send A2A in a background goroutine.
 	//
@@ -304,16 +313,22 @@ const (
 // insertDelegationRow stores the pending delegation row. See
 // insertDelegationOutcome for the three possible return values.
 func insertDelegationRow(ctx context.Context, c *gin.Context, sourceID string, body delegateRequest, delegationID string) insertDelegationOutcome {
-	taskJSON, _ := json.Marshal(map[string]interface{}{
+	taskJSON, marshalErr := json.Marshal(map[string]interface{}{
 		"task":          body.Task,
 		"delegation_id": delegationID,
 	})
+	if marshalErr != nil {
+		log.Printf("Delegation %s: json.Marshal taskJSON failed: %v", delegationID, marshalErr)
+	}
 	// Store delegation_id in response_body so agent check_delegation_status
 	// (which reads response_body->>delegation_id) can locate this row even
 	// when request_body hasn't propagated yet. Fixes mc#984.
-	respJSON, _ := json.Marshal(map[string]interface{}{
+	respJSON, marshalErr := json.Marshal(map[string]interface{}{
 		"delegation_id": delegationID,
 	})
+	if marshalErr != nil {
+		log.Printf("Delegation %s: json.Marshal respJSON failed: %v", delegationID, marshalErr)
+	}
 	var idemArg interface{}
 	if body.IdempotencyKey != "" {
 		idemArg = body.IdempotencyKey
@@ -484,10 +499,13 @@ handleSuccess:
 		// dispatch eventually succeeds. Without the key, the drain finds
 		// the row by (workspace_id, target_id, method) but can't tell
 		// multiple-queued-delegations-to-same-target apart.
-		queuedJSON, _ := json.Marshal(map[string]interface{}{
+		queuedJSON, marshalErr := json.Marshal(map[string]interface{}{
 			"delegation_id": delegationID,
 			"queued":        true,
 		})
+		if marshalErr != nil {
+			log.Printf("Delegation %s: json.Marshal queuedJSON failed: %v", delegationID, marshalErr)
+		}
 		if _, err := db.DB.ExecContext(ctx, `
 			INSERT INTO activity_logs (workspace_id, activity_type, method, source_id, target_id, summary, response_body, status)
 			VALUES ($1, 'delegation', 'delegate_result', $2, $3, $4, $5::jsonb, 'queued')
@@ -507,10 +525,13 @@ handleSuccess:
 
 	log.Printf("Delegation %s: step=inserting_success_log", delegationID)
 	// Store success (response_body must be JSONB, include delegation_id)
-	respJSON, _ := json.Marshal(map[string]interface{}{
+	respJSON, marshalErr := json.Marshal(map[string]interface{}{
 		"text":          responseText,
 		"delegation_id": delegationID,
 	})
+	if marshalErr != nil {
+		log.Printf("Delegation %s: json.Marshal respJSON failed: %v", delegationID, marshalErr)
+	}
 	if _, err := db.DB.ExecContext(ctx, `
 		INSERT INTO activity_logs (workspace_id, activity_type, method, source_id, target_id, summary, response_body, status)
 		VALUES ($1, 'delegation', 'delegate_result', $2, $3, $4, $5::jsonb, 'completed')
@@ -592,15 +613,21 @@ func (h *DelegationHandler) Record(c *gin.Context) {
 		return
 	}
 
-	taskJSON, _ := json.Marshal(map[string]interface{}{
+	taskJSON, marshalErr := json.Marshal(map[string]interface{}{
 		"task":          body.Task,
 		"delegation_id": body.DelegationID,
 	})
+	if marshalErr != nil {
+		log.Printf("Delegation %s: json.Marshal taskJSON failed: %v", body.DelegationID, marshalErr)
+	}
 	// Store delegation_id in response_body so agent check_delegation_status
 	// can locate this row. Fixes mc#984.
-	respJSON, _ := json.Marshal(map[string]interface{}{
+	respJSON, marshalErr := json.Marshal(map[string]interface{}{
 		"delegation_id": body.DelegationID,
 	})
+	if marshalErr != nil {
+		log.Printf("Delegation %s: json.Marshal respJSON failed: %v", body.DelegationID, marshalErr)
+	}
 	if _, err := db.DB.ExecContext(ctx, `
 		INSERT INTO activity_logs (workspace_id, activity_type, method, source_id, target_id, summary, request_body, response_body, status)
 		VALUES ($1, 'delegation', 'delegate', $2, $3, $4, $5::jsonb, $6::jsonb, 'dispatched')
@@ -664,10 +691,13 @@ func (h *DelegationHandler) UpdateStatus(c *gin.Context) {
 	h.updateDelegationStatus(ctx, sourceID, delegationID, body.Status, body.Error)
 
 	if body.Status == "completed" {
-		respJSON, _ := json.Marshal(map[string]interface{}{
+		respJSON, marshalErr := json.Marshal(map[string]interface{}{
 			"text":          body.ResponsePreview,
 			"delegation_id": delegationID,
 		})
+		if marshalErr != nil {
+			log.Printf("Delegation UpdateStatus %s: json.Marshal respJSON failed: %v", delegationID, marshalErr)
+		}
 		if _, err := db.DB.ExecContext(ctx, `
 			INSERT INTO activity_logs (workspace_id, activity_type, method, source_id, summary, response_body, status)
 			VALUES ($1, 'delegation', 'delegate_result', $2, $3, $4::jsonb, 'completed')

@@ -24,10 +24,13 @@ import (
 // Agent Comms tab can show the task text for MCP-initiated delegations.
 // Mirrors insertDelegationRow (delegation.go) for the MCP tool path.
 func insertMCPDelegationRow(ctx context.Context, db *sql.DB, workspaceID, targetID, delegationID, task string) error {
-	taskJSON, _ := json.Marshal(map[string]interface{}{
+	taskJSON, marshalErr := json.Marshal(map[string]interface{}{
 		"task":          task,
 		"delegation_id": delegationID,
 	})
+	if marshalErr != nil {
+		log.Printf("insertMCPDelegationRow %s: json.Marshal taskJSON failed: %v", delegationID, marshalErr)
+	}
 	_, err := db.ExecContext(ctx, `
 		INSERT INTO activity_logs (workspace_id, activity_type, method, source_id, target_id, summary, request_body, status)
 		VALUES ($1, 'delegation', 'delegate', $2, $3, $4, $5::jsonb, 'pending')
@@ -138,7 +141,10 @@ func (h *MCPHandler) toolListPeers(ctx context.Context, workspaceID string) (str
 		return "No peers found.", nil
 	}
 
-	b, _ := json.MarshalIndent(peers, "", "  ")
+	b, marshalErr := json.MarshalIndent(peers, "", "  ")
+	if marshalErr != nil {
+		log.Printf("toolListPeers: json.MarshalIndent peers failed: %v", marshalErr)
+	}
 	return string(b), nil
 }
 
@@ -168,7 +174,10 @@ func (h *MCPHandler) toolGetWorkspaceInfo(ctx context.Context, workspaceID strin
 	if parentID.Valid {
 		info["parent_id"] = parentID.String
 	}
-	b, _ := json.MarshalIndent(info, "", "  ")
+	b, marshalErr := json.MarshalIndent(info, "", "  ")
+	if marshalErr != nil {
+		log.Printf("toolGetWorkspaceInfo %s: json.MarshalIndent info failed: %v", workspaceID, marshalErr)
+	}
 	return string(b), nil
 }
 
@@ -260,7 +269,7 @@ func (h *MCPHandler) toolDelegateTaskAsync(ctx context.Context, callerID string,
 		bgCtx, cancel := context.WithTimeout(context.Background(), mcpAsyncCallTimeout)
 		defer cancel()
 
-		a2aBody, _ := json.Marshal(map[string]interface{}{
+		a2aBody, marshalErr := json.Marshal(map[string]interface{}{
 			"jsonrpc": "2.0",
 			"id":      delegationID,
 			"method":  "message/send",
@@ -272,6 +281,9 @@ func (h *MCPHandler) toolDelegateTaskAsync(ctx context.Context, callerID string,
 				},
 			},
 		})
+		if marshalErr != nil {
+			log.Printf("toolDelegateTask %s: json.Marshal a2aBody failed: %v", delegationID, marshalErr)
+		}
 
 		status, _, err := h.proxyA2ARequest(bgCtx, targetID, a2aBody, callerID, true)
 		if err != nil || status < 200 || status >= 300 {
@@ -327,7 +339,10 @@ func (h *MCPHandler) toolCheckTaskStatus(ctx context.Context, callerID string, a
 	if len(responseBody) > 0 {
 		result["result"] = extractA2AText(responseBody)
 	}
-	b, _ := json.MarshalIndent(result, "", "  ")
+	b, marshalErr := json.MarshalIndent(result, "", "  ")
+	if marshalErr != nil {
+		log.Printf("toolCheckTaskStatus: json.MarshalIndent result failed: %v", marshalErr)
+	}
 	return string(b), nil
 }
 
@@ -482,6 +497,9 @@ func extractA2AText(body []byte) string {
 	}
 
 	// Fallback: marshal result as JSON.
-	b, _ := json.Marshal(result)
+	b, marshalErr := json.Marshal(result)
+	if marshalErr != nil {
+		log.Printf("extractA2AText: json.Marshal result failed: %v", marshalErr)
+	}
 	return string(b)
 }
