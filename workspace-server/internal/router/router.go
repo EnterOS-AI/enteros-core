@@ -36,7 +36,7 @@ import (
 // (main.go) gets the same pluginResolver instance so it can share scheme
 // enumeration if a deployment registers extra schemes externally. A nil
 // pluginResolver is harmless: plgh still works with its built-in defaults.
-func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provisioner, platformURL, configsDir string, wh *handlers.WorkspaceHandler, channelMgr *channels.Manager, memBundle *memwiring.Bundle, pluginResolver plugins.PluginResolver) *gin.Engine {
+func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provisioner, platformURL, configsDir string, templateCacheDir string, wh *handlers.WorkspaceHandler, channelMgr *channels.Manager, memBundle *memwiring.Bundle, pluginResolver plugins.PluginResolver, refreshTemplates func(ctx *gin.Context) (any, error)) *gin.Engine {
 	r := gin.Default()
 
 	// Issue #179 — trust no reverse-proxy headers. Without this call Gin's
@@ -282,11 +282,15 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		// POST /memories stays — it routes through the v2 plugin per
 		// #1794 and is the high-volume write surface (workspace
 		// runtimes posting conversation snapshots etc.).
+		// GET /memories restored as a v2 shim (issue #1828) so legacy
+		// SDK callers (AwarenessClient, runtime agents) don't 404 into
+		// the canvas frontend.
 		memsh := handlers.NewMemoriesHandler()
 		if memBundle != nil {
 			memsh.WithMemoryV2(memBundle.Plugin, memBundle.Resolver)
 		}
 		wsAuth.POST("/memories", memsh.Commit)
+		wsAuth.GET("/memories", memsh.Search)
 
 		// Memory v2 — canvas reads through the plugin so the Memory
 		// tab surfaces post-cutover state (memory_records) instead
@@ -666,7 +670,9 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 
 	// Templates — wh threaded so generateDefaultConfig picks the
 	// SaaS-aware default tier in Import + ReplaceFiles (#2910 PR-B).
-	tmplh := handlers.NewTemplatesHandler(configsDir, dockerCli, wh)
+	tmplh := handlers.NewTemplatesHandler(configsDir, dockerCli, wh).
+		WithCacheDir(templateCacheDir).
+		WithRefreshFunc(refreshTemplates)
 	// #686: GET /templates lists all template names+metadata from configsDir.
 	// Open access lets unauthenticated callers enumerate org configurations and
 	// installed plugins. AdminAuth-gate it alongside POST /templates/import.
@@ -676,6 +682,7 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		tmplAdmin := r.Group("", middleware.AdminAuth(db.DB))
 		tmplAdmin.GET("/templates", tmplh.List)
 		tmplAdmin.POST("/templates/import", tmplh.Import)
+		tmplAdmin.POST("/admin/templates/refresh", tmplh.RefreshCache)
 	}
 	wsAuth.PUT("/files", tmplh.ReplaceFiles)
 	wsAuth.GET("/files", tmplh.ListFiles)

@@ -224,12 +224,14 @@ export function Toolbar() {
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       if (e.key !== "?") return;
-      const tag = (e.target as HTMLElement).tagName;
+      const target = e.target as HTMLElement;
+      if (target.closest?.('[data-display-stream="true"]')) return;
+      const tag = target.tagName;
       const inInput =
         tag === "INPUT" ||
         tag === "TEXTAREA" ||
         tag === "SELECT" ||
-        (e.target as HTMLElement).isContentEditable;
+        target.isContentEditable;
       if (inInput) return;
       // Don't fire when a modal/dialog is already mounted (canvas modals,
       // side panel, etc. use z-50 or above).

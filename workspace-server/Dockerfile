@@ -71,6 +71,7 @@ RUN apk add --no-cache ca-certificates docker-cli docker-cli-buildx git tzdata w
 COPY --from=builder /platform /platform
 COPY --from=builder /memory-plugin /memory-plugin
 COPY workspace-server/migrations /migrations
+COPY manifest.json /app/manifest.json
 # Templates + plugins (pre-cloned by scripts/clone-manifest.sh in the
 # trusted CI / operator-host context, .git already stripped). The Gitea
 # token used to clone them never enters this image — same shape as

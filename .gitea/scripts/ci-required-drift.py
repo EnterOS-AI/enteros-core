@@ -274,7 +274,8 @@ def required_checks_env(audit_doc: dict) -> set[str]:
                     found.append(v)
     if not found:
         sys.stderr.write(
-            f"::error::REQUIRED_CHECKS env not found in any step of {AUDIT_WORKFLOW_PATH}\n"
+            f"::error::REQUIRED_CHECKS env not found in any step of "
+            f"{AUDIT_WORKFLOW_PATH}\n"
         )
         sys.exit(3)
     if len(found) > 1:
@@ -384,10 +385,15 @@ def detect_drift(branch: str) -> tuple[list[str], dict]:
     contexts = set(protection.get("status_check_contexts") or [])
 
     # ----- F1: job exists in CI but not under sentinel.needs -----
+    # Post-#1766 contract: the sentinel may deliberately have no `needs:`
+    # and instead poll path-relevant statuses dynamically. In that case
+    # F1 is a false positive — skip it. F1b (typos in existing needs)
+    # is naturally skipped when needs is empty.
     missing_from_needs = sorted(jobs - needs)
-    if missing_from_needs:
+    if missing_from_needs and needs:
         findings.append(
-            "F1 — jobs in ci.yml NOT under sentinel `needs:` (sentinel doesn't gate them):\n"
+            "F1 — jobs in ci.yml NOT under sentinel `needs:` "
+            "(sentinel doesn't gate them):\n"
             + "\n".join(f"  - {n}" for n in missing_from_needs)
         )
 
@@ -397,7 +403,8 @@ def detect_drift(branch: str) -> tuple[list[str], dict]:
     stale_needs = sorted(needs - jobs_all)
     if stale_needs:
         findings.append(
-            "F1b — sentinel `needs:` lists jobs NOT present in ci.yml (typo or removed job):\n"
+            "F1b — sentinel `needs:` lists jobs NOT present in ci.yml "
+            "(typo or removed job):\n"
             + "\n".join(f"  - {n}" for n in stale_needs)
         )
 
@@ -405,7 +412,9 @@ def detect_drift(branch: str) -> tuple[list[str], dict]:
     # Compute the contexts the CI YAML actually produces. The sentinel
     # is in (B) intentionally (`ci / all-required (pull_request)`); we
     # whitelist it explicitly.
-    emitted_contexts = {expected_context(j) for j in jobs} | {expected_context(SENTINEL_JOB)}
+    emitted_contexts = {
+        expected_context(j) for j in jobs
+    } | {expected_context(SENTINEL_JOB)}
     # Contexts NOT produced by ci.yml may still come from other
     # workflows in the repo (Secret scan etc). We can't enumerate
     # every workflow's emissions cheaply; instead, flag only contexts
@@ -418,8 +427,9 @@ def detect_drift(branch: str) -> tuple[list[str], dict]:
     )
     if stale_protection:
         findings.append(
-            "F2 — protection `status_check_contexts` entries with `ci / ` prefix that NO "
-            "job in ci.yml emits (stale name → silent advisory gate):\n"
+            "F2 — protection `status_check_contexts` entries with `ci / ` "
+            "prefix that NO job in ci.yml emits "
+            "(stale name → silent advisory gate):\n"
             + "\n".join(f"  - {c}" for c in stale_protection)
         )
 
@@ -494,7 +504,8 @@ def render_body(branch: str, findings: list[str], debug: dict) -> str:
         f"# Drift detected on `{REPO}/{branch}`",
         "",
         "Auto-filed by `.gitea/workflows/ci-required-drift.yml` "
-        "(RFC [internal#219](https://git.moleculesai.app/molecule-ai/internal/issues/219) §4 + §6).",
+        "(RFC [internal#219]"
+        "(https://git.moleculesai.app/molecule-ai/internal/issues/219) §4 + §6).",
         "",
         "## Findings",
         "",
@@ -505,8 +516,11 @@ def render_body(branch: str, findings: list[str], debug: dict) -> str:
             "",
             "## Resolution",
             "",
-            "- **F1 / F1b**: add the missing job to `all-required.needs:` "
-            "in `.gitea/workflows/ci.yml`, or remove the stale entry.",
+            "- **F1 / F1b**: if the sentinel job has a `needs:` block, add "
+            "the missing job to it in `.gitea/workflows/ci.yml`, or remove "
+            "the stale entry. If the sentinel deliberately has no `needs:` "
+            "(path-aware polling sentinel per post-#1766 contract), this "
+            "finding is expected and F1 is skipped.",
             "- **F2**: rename the protection context to match an emitter, "
             "or remove it from `status_check_contexts` "
             "(PATCH `/api/v1/repos/{owner}/{repo}/branch_protections/{branch}`).",
@@ -547,12 +561,12 @@ def file_or_update(
 
     if dry_run:
         print(f"::notice::[dry-run] would file/update drift issue for {branch}")
-        print(f"::group::[dry-run] title")
+        print("::group::[dry-run] title")
         print(title)
-        print(f"::endgroup::")
-        print(f"::group::[dry-run] body")
+        print("::endgroup::")
+        print("::group::[dry-run] body")
         print(body)
-        print(f"::endgroup::")
+        print("::endgroup::")
         return
 
     existing = find_open_issue(title)

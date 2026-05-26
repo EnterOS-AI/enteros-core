@@ -12,6 +12,7 @@
 #   ≥ 1 review on the PR where:
 #     • state == APPROVED
 #     • review.dismissed == false
+#     • review.official != false (excludes draft/mis-filed APPROVED reviews)
 #     • review.user.login != PR.user.login (non-author)
 #     • review.user.login ∈ team-members
 #
@@ -201,6 +202,7 @@ fi
 JQ_FILTER='.[]
   | select(.state == "APPROVED")
   | select(.dismissed != true)
+  | select(.official != false)
   | select(.user.login != $author)'
 if [ "${REVIEW_CHECK_STRICT:-}" = "1" ]; then
   JQ_FILTER="${JQ_FILTER}
@@ -304,12 +306,15 @@ for U in $CANDIDATES; do
       exit 0
       ;;
     403)
-      # Token owner is not in the team being probed; the API refuses to
-      # confirm membership. This is the RFC#324 follow-up token-scope gap.
-      # Fail closed — never grant approval on a 403; surface clearly.
-      echo "::error::team-probe for ${U} in ${TEAM} returned 403 (token owner not in ${TEAM} team — RFC#324 token-scope follow-up). Cannot confirm membership; failing closed."
+      # Token owner is not in the team being probed; Gitea 1.22.6 refuses
+      # to confirm membership in this case. Do NOT hard-fail the gate on a
+      # 403 — doing so would fail the entire gate if ANY candidate triggers
+      # a 403, even when other valid team-members exist. Instead skip this
+      # candidate and continue checking others. If all candidates produce
+      # 403 (token owner can't query any of them) the final exit fires.
+      echo "::warning::team-probe for ${U} in ${TEAM} returned 403 (token owner not in ${TEAM} team — skipping; cannot confirm membership)"
       cat "$TEAM_PROBE_TMP" >&2
-      exit 1
+      continue
       ;;
     404)
       debug "${U} not a member of ${TEAM}"

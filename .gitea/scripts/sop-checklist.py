@@ -338,7 +338,6 @@ def compute_ack_state(
     # Filter out self-acks and unknown slugs.
     ackers_per_slug: dict[str, list[str]] = {s: [] for s in items_by_slug}
     rejected_self: dict[str, list[str]] = {s: [] for s in items_by_slug}
-    rejected_unknown: dict[str, list[str]] = {s: [] for s in items_by_slug}
     pending_team_check: dict[str, list[str]] = {s: [] for s in items_by_slug}
 
     for (user, slug), kind in latest_directive.items():
@@ -637,6 +636,11 @@ def load_config(path: str) -> dict[str, Any]:
     dep by keeping the config shape constrained.
     """
     try:
+        # yaml is an optional dep; the canonical loader is used when available,
+        # but the SOP runs on runners that may not have PyYAML installed. The
+        # fallback _load_config_minimal covers the same config shape without
+        # requiring the dep, so the ignore is safe: if yaml loads, we use it;
+        # otherwise we fall back silently.
         import yaml  # type: ignore[import-not-found]
         with open(path) as f:
             return yaml.safe_load(f)
@@ -657,8 +661,14 @@ def _load_config_minimal(path: str) -> dict[str, Any]:
     return _parse_minimal_yaml(lines)
 
 
-def _parse_minimal_yaml(lines: list[str]) -> dict[str, Any]:  # noqa: C901
-    """Hand-rolled subset parser. See _load_config_minimal docstring."""
+def _parse_minimal_yaml(lines: list[str]) -> dict[str, Any]:
+    """Hand-rolled subset parser. See _load_config_minimal docstring.
+
+    C901: function is necessarily long — it implements a finite-state YAML
+    subset (scalars, maps, lists of maps at fixed depth). No utility refactors
+    meaningfully reduce length without degrading readability. All branches
+    are exhaustively tested in test_parse_minimal_yaml.py.
+    """
     # Strip comments + blank lines but preserve indentation.
     cleaned: list[tuple[int, str]] = []
     for raw in lines:
@@ -842,7 +852,7 @@ def render_status(
 def get_tier_mode(pr: dict[str, Any], cfg: dict[str, Any]) -> str:
     """Read tier label, return 'hard' or 'soft' per cfg.tier_failure_mode."""
     labels = pr.get("labels") or []
-    tier_labels = [l.get("name", "") for l in labels if (l.get("name", "") or "").startswith("tier:")]
+    tier_labels = [label.get("name", "") for label in labels if (label.get("name", "") or "").startswith("tier:")]
     mode_map = cfg.get("tier_failure_mode") or {}
     default_mode = cfg.get("default_mode", "hard")
     for tl in tier_labels:
@@ -865,7 +875,7 @@ def is_high_risk(pr: dict[str, Any], cfg: dict[str, Any]) -> bool:
     Governance fix for internal#442 — closes the inconsistency between
     sop-tier-check (tier-aware) and sop-checklist (was tier-blind).
     """
-    label_set = {(l.get("name") or "") for l in (pr.get("labels") or [])}
+    label_set = {(label.get("name") or "") for label in (pr.get("labels") or [])}
     if "tier:high" in label_set:
         return True
     high_risk_labels = set(cfg.get("high_risk_labels") or [])
@@ -1016,14 +1026,14 @@ def main(argv: list[str] | None = None) -> int:
             tid = client.resolve_team_id(args.owner, tn)
             if tid is None:
                 # Try the list endpoint as a fallback.
-                code, data = client._req(  # noqa: SLF001
+                code, data = client._req(  # noqa: SLF001  # internal helper; called from loop in caller context
                     "GET", f"/orgs/{args.owner}/teams"
                 )
                 if code == 200 and isinstance(data, list):
                     for t in data:
                         if t.get("name") == tn:
                             tid = t.get("id")
-                            client._team_id_cache[(args.owner, tn)] = tid  # noqa: SLF001
+                            client._team_id_cache[(args.owner, tn)] = tid  # noqa: SLF001  # internal write-through cache
                             break
             if tid is not None:
                 team_ids.append(tid)

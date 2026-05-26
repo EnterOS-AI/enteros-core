@@ -18,6 +18,11 @@ const (
 	discordHTTPTimeout   = 10 * time.Second
 )
 
+// httpClient abstracts http.Client for test injection.
+type httpClient interface {
+	Do(req *http.Request) (*http.Response, error)
+}
+
 // DiscordAdapter implements ChannelAdapter for Discord.
 //
 // Outbound messages are sent via Discord Incoming Webhooks. The webhook URL
@@ -33,7 +38,11 @@ const (
 //
 // StartPolling returns nil immediately — Discord does not support long-polling;
 // use the Interactions webhook route instead.
-type DiscordAdapter struct{}
+type DiscordAdapter struct {
+	// client allows dependency injection for testing. If nil, the default
+	// http.Client is used at call time (safe for production use).
+	client httpClient
+}
 
 func (d *DiscordAdapter) Type() string        { return "discord" }
 func (d *DiscordAdapter) DisplayName() string { return "Discord" }
@@ -95,7 +104,10 @@ func (d *DiscordAdapter) SendMessage(ctx context.Context, config map[string]inte
 	// Split long messages into chunks at word boundaries where possible.
 	chunks := splitMessage(text, maxLen)
 
-	client := &http.Client{Timeout: discordHTTPTimeout}
+	client := d.client
+	if client == nil {
+		client = &http.Client{Timeout: discordHTTPTimeout}
+	}
 	for _, chunk := range chunks {
 		payload, err := json.Marshal(map[string]string{"content": chunk})
 		if err != nil {

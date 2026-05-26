@@ -118,6 +118,7 @@ RUN deluser --remove-home node 2>/dev/null || true; \
 COPY --from=go-builder /platform /platform
 COPY --from=go-builder /memory-plugin /memory-plugin
 COPY workspace-server/migrations /migrations
+COPY manifest.json /app/manifest.json
 
 # Templates + plugins (pre-cloned by scripts/clone-manifest.sh in the
 # trusted CI / operator-host context, .git already stripped — see

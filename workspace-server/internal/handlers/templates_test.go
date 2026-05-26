@@ -133,6 +133,71 @@ skills:
 	}
 }
 
+func TestTemplatesList_CacheOverridesBakedTemplate(t *testing.T) {
+	setupTestDB(t)
+	setupTestRedis(t)
+
+	bakedDir := t.TempDir()
+	cacheDir := t.TempDir()
+
+	mustWriteTemplate := func(root, id, body string) {
+		t.Helper()
+		dir := filepath.Join(root, id)
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(body), 0644); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+	}
+
+	mustWriteTemplate(bakedDir, "seo-agent", `name: SEO Agent
+description: stale
+tier: 4
+runtime: claude-code
+model: old
+runtime_config:
+  recommended_env: [TELEGRAM_BOT_TOKEN]
+skills: []
+`)
+	mustWriteTemplate(cacheDir, "seo-agent", `name: SEO Agent
+description: fresh
+tier: 4
+runtime: claude-code
+model: moonshot/kimi-k2.6
+runtime_config:
+  required_env: [TENANT_NAME]
+  recommended_env: [GOOGLE_GSC_SITE]
+skills: []
+`)
+
+	handler := NewTemplatesHandler(bakedDir, nil, nil).WithCacheDir(cacheDir)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest("GET", "/templates", nil)
+	handler.List(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp []templateSummary
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(resp) != 1 {
+		t.Fatalf("expected 1 template, got %d", len(resp))
+	}
+	if resp[0].Description != "fresh" {
+		t.Fatalf("cache template should override baked copy, got description %q", resp[0].Description)
+	}
+	if !reflect.DeepEqual(resp[0].RequiredEnv, []string{"TENANT_NAME"}) {
+		t.Fatalf("RequiredEnv = %+v", resp[0].RequiredEnv)
+	}
+	if reflect.DeepEqual(resp[0].RecommendedEnv, []string{"TELEGRAM_BOT_TOKEN"}) {
+		t.Fatalf("stale baked recommended_env leaked through: %+v", resp[0].RecommendedEnv)
+	}
+}
+
 func TestTemplatesList_RuntimeAndModelsRegistry(t *testing.T) {
 	setupTestDB(t)
 	setupTestRedis(t)
@@ -612,7 +677,7 @@ skills: []
 		t.Fatalf("parse: %v", err)
 	}
 	if len(resp) != 1 || resp[0].Model != "anthropic:claude-sonnet-4-6" {
-		t.Errorf("legacy top-level model not surfaced: %+v", resp)
+		t.Fatalf("legacy top-level model not surfaced: %+v", resp)
 	}
 	if resp[0].Runtime != "claude-code" {
 		t.Errorf("Runtime should be claude-code for legacy template, got %q", resp[0].Runtime)

@@ -33,7 +33,6 @@ import re
 import sys
 import urllib.parse
 
-
 STATE_DIR = os.environ.get("FIXTURE_STATE_DIR", "/tmp")
 
 
@@ -81,7 +80,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # GET /repos/{owner}/{name}/pulls/{pr_number}
         m = re.match(r"^/api/v1/repos/([^/]+)/([^/]+)/pulls/(\d+)$", path)
         if m:
-            owner, name, pr_num = m.group(1), m.group(2), m.group(3)
+            pr_num = m.group(3)
             if sc == "T2_pr_closed":
                 return self._json(200, {
                     "number": int(pr_num),
@@ -151,7 +150,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # GET /teams/{team_id}/members/{username}
         m = re.match(r"^/api/v1/teams/(\d+)/members/([^/]+)$", path)
         if m:
-            team_id, login = m.group(1), m.group(2)
+            login = m.group(2)
             if sc == "T8_team_not_member":
                 return self._empty(404)
             if sc == "T9_team_403":
