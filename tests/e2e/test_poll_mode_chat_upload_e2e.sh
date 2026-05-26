@@ -4,9 +4,10 @@
 # Round-trip: register a workspace as poll-mode (no callback URL) → POST a
 # multi-file chat upload → verify each file becomes (a) one
 # `chat_upload_receive` activity row and (b) one /pending-uploads row → fetch
-# the bytes back via the poll endpoint → ack → verify the row 404s on
-# subsequent fetch. Also pins cross-workspace bleed protection: workspace B
-# cannot read workspace A's pending uploads even with its own valid bearer.
+# the bytes back via the poll endpoint → ack → verify the row stays readable
+# during retention for refreshed canvas previews. Also pins cross-workspace
+# bleed protection: workspace B cannot read workspace A's pending uploads even
+# with its own valid bearer.
 #
 # Why this exists separately from test_chat_upload_e2e.sh: that script
 # covers the PUSH path (the workspace's own /internal/chat/uploads/ingest).
@@ -48,8 +49,8 @@ TMPDIR_E2E=$(mktemp -d -t poll-chat-upload-e2e-XXXXXX)
 
 cleanup() {
   local rc=$?
-  curl -s -X DELETE "$BASE/workspaces/$WS_A?confirm=true" >/dev/null 2>&1 || true
-  curl -s -X DELETE "$BASE/workspaces/$WS_B?confirm=true" >/dev/null 2>&1 || true
+  e2e_delete_workspace "$WS_A" "poll-chat-upload-test-a"
+  e2e_delete_workspace "$WS_B" "poll-chat-upload-test-b"
   rm -rf "$TMPDIR_E2E"
   exit $rc
 }
@@ -218,14 +219,16 @@ case "$RE_ACK1_CODE" in
     ;;
 esac
 
-# ---------- Phase 7: GET content after ack returns 404 ----------
+# ---------- Phase 7: GET content after ack remains readable ----------
 echo ""
-echo "--- Phase 7: Acked file 404s on subsequent fetch ---"
+echo "--- Phase 7: Acked file remains readable during retention ---"
 
 POST_ACK=$(curl -s -w '\n%{http_code}' --max-time "$TIMEOUT" -H "Authorization: Bearer $TOK_A" \
   "$BASE/workspaces/$WS_A/pending-uploads/$FID1/content")
 POST_ACK_CODE=$(printf '%s' "$POST_ACK" | tail -n1)
-check_eq "acked alpha returns HTTP 404" "404" "$POST_ACK_CODE"
+POST_ACK_BODY=$(printf '%s' "$POST_ACK" | sed '$d')
+check_eq "acked alpha returns HTTP 200" "200" "$POST_ACK_CODE"
+check_eq "acked alpha bytes still readable" "$EXPECTED1" "$POST_ACK_BODY"
 
 # ---------- Phase 8: cross-workspace bleed protection ----------
 echo ""

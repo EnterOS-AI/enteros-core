@@ -103,8 +103,6 @@ env:
   required:
     - ANTHROPIC_API_KEY
   optional:
-    - AWARENESS_URL
-    - AWARENESS_NAMESPACE
     - ANTHROPIC_BASE_URL
     - OPENAI_BASE_URL
     - GSC_CLIENT_ID

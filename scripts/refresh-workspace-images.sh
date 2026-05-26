@@ -32,7 +32,7 @@ log()  { echo -e "${GREEN}[refresh]${NC} $1" >&2; }
 warn() { echo -e "${YELLOW}[refresh]${NC} $1" >&2; }
 err()  { echo -e "${RED}[refresh]${NC} $1" >&2; }
 
-ALL_RUNTIMES=(claude-code langgraph crewai autogen deepagents hermes gemini-cli openclaw)
+ALL_RUNTIMES=(claude-code codex hermes openclaw)
 RUNTIMES=("${ALL_RUNTIMES[@]}")
 RECREATE=true
 

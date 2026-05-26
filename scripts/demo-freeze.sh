@@ -86,13 +86,9 @@ esac
 # RuntimeImages — keep this list in sync if a runtime is added.
 TEMPLATES=(
   "claude-code"
+  "codex"
   "hermes"
   "openclaw"
-  "langgraph"
-  "deepagents"
-  "crewai"
-  "autogen"
-  "gemini-cli"
 )
 
 # Pre-flight: required tooling.

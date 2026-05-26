@@ -16,9 +16,9 @@ name: E2E Staging Canvas (Playwright)
 # e2e-staging-saas.yml (which tests the API shape) by exercising the
 # actual browser + canvas bundle against live staging.
 #
-# Triggers: push to main/staging or PR touching canvas sources + this workflow,
-# manual dispatch, and weekly cron to catch browser/runtime drift even
-# when canvas is quiet.
+# Triggers: push to main, PR touching canvas sources + this workflow only
+# after the PR enters `merge-queue`, manual dispatch, and scheduled cron to
+# catch browser/runtime drift even when canvas is quiet.
 # Added staging to push/pull_request branches so the auto-promote gate
 # check (--event push --branch staging) can see a completed run for this
 # workflow — mirrors what PR #1891 does for e2e-api.yml.
@@ -37,9 +37,10 @@ on:
   pull_request:
     branches: [main]
   schedule:
-    # Weekly on Sunday 08:00 UTC — catches Chrome / Playwright / Next.js
+    # Nightly at 08:00 UTC — catches Chrome / Playwright / Next.js
     # release-note-shaped regressions that don't ride in with a PR.
-    - cron: '0 8 * * 0'
+    - cron: '0 8 * * *'
+  workflow_dispatch:
 
 concurrency:
   # Per-SHA grouping (changed 2026-04-28 from a single global group). The
@@ -79,10 +80,13 @@ jobs:
         with:
           fetch-depth: 0
       - id: decide
+        env:
+          GITEA_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          QUEUE_LABEL: merge-queue
         # Inline replacement for dorny/paths-filter — see e2e-api.yml.
-        # Cron triggers always run real work (no diff context).
+        # Cron and manual triggers always run real work (no diff context).
         run: |
-          if [ "${{ github.event_name }}" = "schedule" ]; then
+          if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "canvas=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -102,9 +106,26 @@ jobs:
             exit 0
           fi
           CHANGED=$(git diff --name-only "$BASE" HEAD)
-          if echo "$CHANGED" | grep -qE '^(canvas/|\.gitea/workflows/e2e-staging-canvas\.yml$)'; then
+          if ! echo "$CHANGED" | grep -qE '^(canvas/|\.gitea/workflows/e2e-staging-canvas\.yml$)'; then
+            echo "canvas=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "canvas=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          authfile=$(mktemp)
+          chmod 600 "$authfile"
+          printf 'header = "Authorization: token %s"\n' "$GITEA_TOKEN" > "$authfile"
+          labels=$(curl -fsS -K "$authfile" \
+            "${{ github.server_url }}/api/v1/repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels" \
+            | python3 -c 'import json,sys; print("\n".join(label.get("name","") for label in json.load(sys.stdin)))')
+          rm -f "$authfile"
+          if printf '%s\n' "$labels" | grep -qx "$QUEUE_LABEL"; then
             echo "canvas=true" >> "$GITHUB_OUTPUT"
           else
+            echo "PR is not in merge-queue; skipping heavy E2E Staging Canvas for normal PR path."
             echo "canvas=false" >> "$GITHUB_OUTPUT"
           fi
 
@@ -169,7 +190,14 @@ jobs:
       - name: Install Playwright browsers
         if: needs.detect-changes.outputs.canvas == 'true'
         timeout-minutes: 10
-        run: npx playwright install --with-deps chromium
+        run: |
+          PREBAKED_PLAYWRIGHT=/ms-playwright
+          if [ -d "${PREBAKED_PLAYWRIGHT}" ] && find "${PREBAKED_PLAYWRIGHT}" -maxdepth 3 -type f -name 'chrome' | grep -q .; then
+            echo "Using prebaked Playwright Chromium from ${PREBAKED_PLAYWRIGHT}"
+            echo "PLAYWRIGHT_BROWSERS_PATH=${PREBAKED_PLAYWRIGHT}" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          npx playwright install --with-deps chromium
 
       - name: Run staging canvas E2E
         if: needs.detect-changes.outputs.canvas == 'true'

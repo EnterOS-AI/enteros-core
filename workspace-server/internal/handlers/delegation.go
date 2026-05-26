@@ -10,9 +10,9 @@ import (
 	"runtime"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/events"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/textutil"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/textutil"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
@@ -122,8 +122,22 @@ func (h *DelegationHandler) Delegate(c *gin.Context) {
 
 	// #548 — prevent self-delegation: a workspace delegating to itself
 	// acquires _run_lock twice on the same mutex, deadlocking permanently.
+	//
+	// #383 — the error message is the agent-visible string when this 400
+	// fires on the SDK's _delegate_sync_via_polling path. The previous
+	// terse "self-delegation not permitted" was correct but indistinct
+	// from a transient rate-limit or auth failure, so the LLM would
+	// re-attempt every 2-3s in a tight loop (chloe-dong tenant external
+	// workspace, 2026-05-20). The expanded message is explicit about
+	// (a) what just happened, (b) why it cannot succeed, (c) what to do
+	// instead — so the agent's retry heuristic recognizes the path as
+	// terminal and stops.
 	if sourceID == body.TargetID {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "self-delegation not permitted"})
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":  "self-delegation not permitted",
+			"reason": "the source workspace and target workspace are the same; you cannot delegate a task to yourself",
+			"hint":   "do the work yourself, or pick a different peer via list_peers — retrying with the same target_id will fail every time",
+		})
 		return
 	}
 
@@ -163,8 +177,37 @@ func (h *DelegationHandler) Delegate(c *gin.Context) {
 		},
 	})
 
-	// Fire-and-forget: send A2A in background goroutine
-	go h.executeDelegation(ctx, sourceID, body.TargetID, delegationID, a2aBody)
+	// Fire-and-forget: send A2A in a background goroutine.
+	//
+	// internal#497 — the goroutine MUST NOT inherit the HTTP request's
+	// cancellation. `ctx` here is c.Request.Context(); the handler returns
+	// 202 a few lines below, which cancels that context immediately. Before
+	// this fix (regression ce2db75f) executeDelegation ran on the
+	// request-scoped ctx, so every DB op + proxy call in the detached
+	// goroutine failed `context canceled` the instant the 202 was written.
+	// That silently broke 100% of A2A peer delegations fleet-wide since
+	// 2026-05-12 (poll-mode peers never got their a2a_receive inbox row;
+	// lookupDeliveryMode swallowed the ctx error and defaulted to push).
+	//
+	// context.WithoutCancel detaches cancellation/deadline while PRESERVING
+	// all context values (trace/correlation/tenant ids that proxyA2ARequest
+	// and the broadcaster read off ctx) — this is the established pattern in
+	// this package (a2a_proxy.go:850, a2a_proxy_helpers.go:525,
+	// registry.go:822). The 30-minute ceiling matches the prior internal
+	// budget executeDelegation used before ce2db75f and the proxy's own
+	// absolute agent-dispatch ceiling (a2a_proxy.go forwardCtx).
+	delegationCtx, cancelDelegation := context.WithTimeout(
+		context.WithoutCancel(ctx), 30*time.Minute,
+	)
+	// RFC internal#524 Layer 1: route through workspace.goAsync so the
+	// detached executeDelegation (which writes A2A status rows to db.DB
+	// across multiple stages) is drained before db.DB is restored in a
+	// later test's t.Cleanup. Tracked via the parent workspace handler's
+	// asyncWG.
+	h.workspace.goAsync(func() {
+		defer cancelDelegation()
+		h.executeDelegation(delegationCtx, sourceID, body.TargetID, delegationID, a2aBody)
+	})
 
 	// Broadcast event so canvas shows delegation in real-time
 	h.broadcaster.RecordAndBroadcast(ctx, string(events.EventDelegationSent), sourceID, map[string]interface{}{
@@ -346,7 +389,7 @@ func (h *DelegationHandler) executeDelegation(ctx context.Context, sourceID, tar
 	})
 	log.Printf("Delegation %s: step=proxying_a2a_request", delegationID)
 
-	status, respBody, proxyErr := h.workspace.proxyA2ARequest(ctx, targetID, a2aBody, sourceID, true)
+	status, respBody, proxyErr := h.workspace.proxyA2ARequest(ctx, targetID, a2aBody, sourceID, true, false)
 	log.Printf("Delegation %s: step=proxy_done status=%d bodyLen=%d err=%v", delegationID, status, len(respBody), proxyErr)
 
 	// When proxyA2ARequest returns an error but we have a non-empty response body
@@ -375,7 +418,7 @@ func (h *DelegationHandler) executeDelegation(ctx context.Context, sourceID, tar
 		case <-ctx.Done():
 			// outer timeout hit before retry window elapsed
 		case <-time.After(delegationRetryDelay):
-			status, respBody, proxyErr = h.workspace.proxyA2ARequest(ctx, targetID, a2aBody, sourceID, true)
+			status, respBody, proxyErr = h.workspace.proxyA2ARequest(ctx, targetID, a2aBody, sourceID, true, false)
 		}
 	}
 

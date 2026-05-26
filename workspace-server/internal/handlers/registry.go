@@ -14,10 +14,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/events"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/models"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/wsauth"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wsauth"
 	"github.com/gin-gonic/gin"
 )
 
@@ -112,7 +112,7 @@ func (h *RegistryHandler) SetQueueDrainFunc(f QueueDrainFunc) {
 // Go's net.ParseIP.To4() before Contains() runs, so the IPv4 rules above
 // catch those without a separate entry.
 //
-// F1083/#1130 (SSRF on mcpResolveURL / a2a_proxy resolveAgentURL): in
+// F1083/#1130 (SSRF on direct A2A URL resolution): in
 // addition to blocking IP literals, DNS names are now resolved and each
 // returned IP is checked against the blocklist. This closes the gap where
 // an attacker could register agent.example.com pointing to 169.254.169.254.
@@ -327,7 +327,33 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 		}
 	}
 
-	agentCardStr := string(payload.AgentCard)
+	// Reconcile the runtime-supplied card's identity fields against the
+	// trusted workspaces row before storing. The runtime builds its card
+	// from config.name, which the CP-regenerated /configs/config.yaml
+	// sets to the workspace UUID — so without this the stored card
+	// served at /.well-known/agent-card.json and returned to peers via
+	// agent_card_url has name = UUID, description = "", role = null even
+	// though the operator-controlled workspaces.name holds the friendly
+	// name the canvas shows. We only FILL gaps from the DB (never
+	// downgrade a card that already carries a real name); identity stays
+	// platform-controlled — the agent cannot self-set these. Best-effort:
+	// a lookup failure leaves the card exactly as the runtime sent it
+	// (no-worse-than-before). See agent_card_reconcile.go.
+	reconciledCard := payload.AgentCard
+	{
+		var dbName, dbRole sql.NullString
+		if qErr := db.DB.QueryRowContext(ctx,
+			`SELECT name, role FROM workspaces WHERE id = $1`, payload.ID,
+		).Scan(&dbName, &dbRole); qErr == nil {
+			if rc, did := reconcileAgentCardIdentity(
+				payload.AgentCard, payload.ID, dbName.String, dbRole.String,
+			); did {
+				reconciledCard = rc
+				log.Printf("Registry register: reconciled agent_card identity for %s from workspaces row", payload.ID)
+			}
+		}
+	}
+	agentCardStr := string(reconciledCard)
 
 	// urlForUpsert: poll-mode workspaces don't need a URL. Empty input
 	// becomes NULL via sql.NullString so the row's URL stays clean (the
@@ -413,10 +439,12 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 		}
 	}
 
-	// Broadcast WORKSPACE_ONLINE
+	// Broadcast WORKSPACE_ONLINE — use the reconciled card so the canvas
+	// Agent Card view live-updates with the friendly name, matching what
+	// was just persisted (not the runtime's raw UUID-name card).
 	if err := h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceOnline), payload.ID, map[string]interface{}{
 		"url":           cachedURL,
-		"agent_card":    payload.AgentCard,
+		"agent_card":    reconciledCard,
 		"delivery_mode": effectiveMode,
 	}); err != nil {
 		log.Printf("Registry broadcast error: %v", err)
@@ -791,8 +819,11 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 		if payload.ActiveTasks < maxConcurrent {
 			// context.WithoutCancel: heartbeat handler's ctx is about to
 			// expire as soon as we return. The drain needs to outlive it.
+			// RFC internal#524 Layer 1: drainQueue reads db.DB; route
+			// through globalGoAsync so test cleanup waits for it.
 			drainCtx := context.WithoutCancel(ctx)
-			go h.drainQueue(drainCtx, payload.WorkspaceID)
+			wsID := payload.WorkspaceID
+			globalGoAsync(func() { h.drainQueue(drainCtx, wsID) })
 		}
 	}
 }

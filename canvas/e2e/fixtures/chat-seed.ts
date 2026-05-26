@@ -9,6 +9,7 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { execFileSync, execSync } from "node:child_process";
 
 const PLATFORM_URL = process.env.E2E_PLATFORM_URL ?? "http://localhost:8080";
 
@@ -23,13 +24,19 @@ export interface SeededWorkspace {
  * Create an external workspace and wire it to the echo runtime.
  */
 export async function seedWorkspace(echoURL: string): Promise<SeededWorkspace> {
-  // 1. Create external workspace (no URL — platform will mint an auth token).
+  // 1. Create external workspace pointing at the in-process echo runtime.
   const runId = Math.random().toString(36).slice(2, 8);
   const wsName = `Chat E2E Agent ${runId}`;
   const createRes = await fetch(`${PLATFORM_URL}/workspaces`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name: wsName, tier: 1, external: true, runtime: "external" }),
+    body: JSON.stringify({
+      name: wsName,
+      tier: 1,
+      external: true,
+      runtime: "external",
+      url: echoURL,
+    }),
   });
   if (!createRes.ok) {
     const text = await createRes.text();
@@ -40,7 +47,10 @@ export async function seedWorkspace(echoURL: string): Promise<SeededWorkspace> {
     name: string;
     connection?: { auth_token?: string };
   };
-  const authToken = ws.connection?.auth_token;
+  let authToken = ws.connection?.auth_token;
+  if (!authToken) {
+    authToken = await mintWorkspaceToken(ws.id);
+  }
   if (!authToken) {
     throw new Error("Workspace created but no auth_token returned");
   }
@@ -73,14 +83,33 @@ export async function seedWorkspace(echoURL: string): Promise<SeededWorkspace> {
     `-c "UPDATE workspaces SET status = 'online', url = '${echoURL}', platform_inbound_secret = '${inboundSecret}' WHERE id = '${ws.id}'"`,
   ].join(" ");
 
-  const { execSync } = await import("node:child_process");
   try {
     execSync(psql, { stdio: "pipe", timeout: 30_000 });
   } catch (err) {
     throw new Error(`DB update failed: ${err}`);
   }
 
+  cacheWorkspaceURL(ws.id, echoURL);
+
   return { id: ws.id, name: wsName, agentURL: echoURL, authToken };
+}
+
+function cacheWorkspaceURL(workspaceId: string, agentURL: string): void {
+  const redisContainer = process.env.REDIS_CONTAINER;
+  if (!redisContainer) return;
+
+  const keys = [`ws:${workspaceId}:url`, `ws:${workspaceId}:internal_url`];
+  for (const key of keys) {
+    try {
+      execFileSync(
+        "docker",
+        ["exec", redisContainer, "redis-cli", "SET", key, agentURL],
+        { stdio: "pipe", timeout: 10_000 },
+      );
+    } catch (err) {
+      throw new Error(`Redis URL cache update failed for ${key}: ${err}`);
+    }
+  }
 }
 
 /**
@@ -141,7 +170,6 @@ export async function seedChatHistory(
 
   const sql = `INSERT INTO chat_messages (id, workspace_id, role, content, created_at) VALUES ${values};`;
 
-  const { execSync } = await import("node:child_process");
   const psql = `PGPASSWORD=${pass} psql -h ${host} -p ${port} -U ${user} -d ${db} -c "${sql}"`;
   execSync(psql, { stdio: "pipe", timeout: 10_000 });
 }
@@ -163,7 +191,6 @@ export async function cleanupWorkspace(workspaceId: string): Promise<void> {
 
   const psql = `PGPASSWORD=${pass} psql -h ${host} -p ${port} -U ${user} -d ${db} -c "DELETE FROM workspaces WHERE id = '${workspaceId}'"`;
 
-  const { execSync } = await import("node:child_process");
   try {
     execSync(psql, { stdio: "pipe", timeout: 30_000 });
   } catch {
@@ -175,12 +202,18 @@ export async function cleanupWorkspace(workspaceId: string): Promise<void> {
  * Mint a workspace auth token so the canvas can make authenticated API
  * calls (WorkspaceAuth middleware).
  */
-export async function mintTestToken(workspaceId: string): Promise<string> {
-  const res = await fetch(
-    `${PLATFORM_URL}/admin/workspaces/${workspaceId}/test-token`,
-  );
+export async function mintWorkspaceToken(workspaceId: string): Promise<string> {
+  const headers: Record<string, string> = {};
+  const adminToken = process.env.E2E_ADMIN_TOKEN ?? process.env.ADMIN_TOKEN;
+  if (adminToken) {
+    headers.Authorization = `Bearer ${adminToken}`;
+  }
+  const res = await fetch(`${PLATFORM_URL}/admin/workspaces/${workspaceId}/tokens`, {
+    method: "POST",
+    headers,
+  });
   if (!res.ok) {
-    throw new Error(`Failed to mint test token: ${res.status}`);
+    throw new Error(`Failed to mint workspace token: ${res.status}`);
   }
   const data = (await res.json()) as { auth_token: string };
   return data.auth_token;

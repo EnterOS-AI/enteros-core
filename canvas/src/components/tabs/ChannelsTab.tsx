@@ -262,7 +262,7 @@ export function ChannelsTab({ workspaceId }: Props) {
       </div>
 
       {error && (
-        <div className="px-3 py-1.5 bg-red-900/30 border border-red-800 rounded text-xs text-bad">
+        <div role="alert" aria-live="assertive" className="px-3 py-1.5 bg-red-900/30 border border-red-800 rounded text-xs text-bad">
           {error}
         </div>
       )}
@@ -369,7 +369,7 @@ export function ChannelsTab({ workspaceId }: Props) {
             onClick={handleCreate}
             // Was bg-accent-strong hover:bg-accent — accent is the
             // LIGHTER variant; same AA contrast trap fixed in
-            // ScheduleTab/MemoryTab/OnboardingWizard.
+            // ScheduleTab/OnboardingWizard.
             className="w-full text-xs py-1.5 rounded bg-accent hover:bg-accent-strong text-white transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
           >
             Connect Channel

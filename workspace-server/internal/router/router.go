@@ -8,20 +8,21 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/buildinfo"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/channels"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/events"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/handlers"
-	memwiring "github.com/Molecule-AI/molecule-monorepo/platform/internal/memory/wiring"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/messagestore"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/metrics"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/middleware"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/pendinguploads"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/plugins"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/provisioner"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/supervised"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/ws"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/buildinfo"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/channels"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/handlers"
+	memwiring "git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/memory/wiring"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/messagestore"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/metrics"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/middleware"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/pendinguploads"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/plugins"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/supervised"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/uploads"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/ws"
 	"github.com/docker/docker/client"
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
@@ -35,7 +36,7 @@ import (
 // (main.go) gets the same pluginResolver instance so it can share scheme
 // enumeration if a deployment registers extra schemes externally. A nil
 // pluginResolver is harmless: plgh still works with its built-in defaults.
-func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provisioner, platformURL, configsDir string, wh *handlers.WorkspaceHandler, channelMgr *channels.Manager, memBundle *memwiring.Bundle, pluginResolver plugins.PluginResolver) *gin.Engine {
+func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provisioner, platformURL, configsDir string, templateCacheDir string, wh *handlers.WorkspaceHandler, channelMgr *channels.Manager, memBundle *memwiring.Bundle, pluginResolver plugins.PluginResolver, refreshTemplates func(ctx *gin.Context) (any, error)) *gin.Engine {
 	r := gin.Default()
 
 	// Issue #179 — trust no reverse-proxy headers. Without this call Gin's
@@ -54,7 +55,7 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 	r.Use(cors.New(cors.Config{
 		AllowOrigins:     corsOrigins,
 		AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
-		AllowHeaders:     []string{"Origin", "Content-Type", "X-Workspace-ID", "Authorization"},
+		AllowHeaders:     []string{"Origin", "Content-Type", "X-Workspace-ID", "X-Molecule-Org-Id", "X-Molecule-Org-Slug", "Authorization"},
 		AllowCredentials: true,
 	}))
 
@@ -103,6 +104,24 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 	// container image, so no new info is exposed.
 	r.GET("/buildinfo", func(c *gin.Context) {
 		c.JSON(200, gin.H{"git_sha": buildinfo.GitSHA})
+	})
+
+	// Upload limits — public, no auth. Single source of truth for
+	// per-file / per-request / max-attachments caps consumed by the
+	// canvas (chat upload pre-flight), the workspace python ingest
+	// (push + poll), and any future client. Background: task #320 +
+	// the SSOT-follow-up markers in pendinguploads/storage.go +
+	// handlers/chat_files.go + canvas/.../chat/uploads.ts. Existence
+	// reason — mc#1588 raised push-mode caps and mc#1589 had to catch
+	// up the poll-mode + DB CHECK side a day later because the
+	// constants were duplicated across 5 surfaces. Public is
+	// intentional: these are platform constraints every uploader
+	// already learns the hard way via a 413 — exposing them via API
+	// removes the "guess the cap then retry on rejection" UX.
+	// Cached in the binary via uploads.DefaultUploadLimits(); no DB
+	// round-trip per request.
+	r.GET("/uploads/limits", func(c *gin.Context) {
+		c.JSON(200, uploads.DefaultUploadLimits())
 	})
 
 	// /admin/liveness — per-subsystem last-tick timestamps. Operators read this
@@ -159,6 +178,14 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		// the tenant AWS credentials. Admin-gated because console output
 		// can include user-data snippets we treat as semi-sensitive.
 		wsAdmin.GET("/workspaces/:id/console", wh.Console)
+		// Display sessions will eventually return short-lived proxied DCV
+		// URLs, so keep the endpoint admin-gated from the first unavailable
+		// state rather than widening it later.
+		wsAdmin.GET("/workspaces/:id/display", wh.Display)
+		wsAdmin.GET("/workspaces/:id/display/session/*proxyPath", wh.DisplaySession)
+		wsAdmin.GET("/workspaces/:id/display/control", wh.DisplayControl)
+		wsAdmin.POST("/workspaces/:id/display/control/acquire", wh.AcquireDisplayControl)
+		wsAdmin.POST("/workspaces/:id/display/control/release", wh.ReleaseDisplayControl)
 
 		// Admin memory backup/restore (#1051) — bulk export/import of agent
 		// memories for safe Docker rebuilds. Matches workspaces by name on import.
@@ -245,11 +272,25 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		wsAuth.GET("/transcript", trsh.Get)
 
 		// Agent Memories (HMA)
+		// Phase A3 (#1792): legacy /memories Search/Delete/Update routes
+		// removed — they read v1 agent_memories which no longer exists.
+		// Callers use /v2/memories for reads (canvas's
+		// MemoryInspectorPanel does this) and /v2/memories/:id for
+		// delete (Forget). Updates are not supported on v2 yet; the
+		// removed PATCH was used by ~0 callers in production traffic.
+		//
+		// POST /memories stays — it routes through the v2 plugin per
+		// #1794 and is the high-volume write surface (workspace
+		// runtimes posting conversation snapshots etc.).
+		// GET /memories restored as a v2 shim (issue #1828) so legacy
+		// SDK callers (AwarenessClient, runtime agents) don't 404 into
+		// the canvas frontend.
 		memsh := handlers.NewMemoriesHandler()
+		if memBundle != nil {
+			memsh.WithMemoryV2(memBundle.Plugin, memBundle.Resolver)
+		}
 		wsAuth.POST("/memories", memsh.Commit)
 		wsAuth.GET("/memories", memsh.Search)
-		wsAuth.DELETE("/memories/:memoryId", memsh.Delete)
-		wsAuth.PATCH("/memories/:memoryId", memsh.Update)
 
 		// Memory v2 — canvas reads through the plugin so the Memory
 		// tab surfaces post-cutover state (memory_records) instead
@@ -378,6 +419,8 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		wsAuth.GET("/tokens", tokh.List)
 		wsAuth.POST("/tokens", tokh.Create)
 		wsAuth.DELETE("/tokens/:tokenId", tokh.Revoke)
+		adminTokH := handlers.NewAdminWorkspaceTokenHandler()
+		r.POST("/admin/workspaces/:id/tokens", middleware.AdminAuth(db.DB), adminTokH.Create)
 
 		// Memory
 		memh := handlers.NewMemoryHandler()
@@ -539,7 +582,7 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		var runtime string
 		err := db.DB.QueryRowContext(
 			context.Background(),
-			`SELECT COALESCE(runtime, 'langgraph') FROM workspaces WHERE id = $1`,
+			`SELECT COALESCE(runtime, 'claude-code') FROM workspaces WHERE id = $1`,
 			workspaceID,
 		).Scan(&runtime)
 		return runtime, err
@@ -591,18 +634,6 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		adminAuth.POST("/admin/plugin-updates/:id/apply", driftH.Apply)
 	}
 
-	// Admin — test token minting (issue #6). Hidden in production via TestTokensEnabled().
-	// NOT behind AdminAuth — this is the bootstrap endpoint E2E tests and
-	// fresh installs use to obtain their first admin bearer. Adding AdminAuth
-	// (#612) broke the chicken-and-egg: after first workspace provision creates
-	// a live token in the DB, AdminAuth requires auth for ALL requests, but the
-	// client has no token yet because it needs this endpoint to get one.
-	// The handler itself rejects calls when MOLECULE_ENV=prod (TestTokensEnabled).
-	{
-		tokh := handlers.NewAdminTestTokenHandler()
-		r.GET("/admin/workspaces/:id/test-token", tokh.GetTestToken)
-	}
-
 	// Admin — GitHub App installation token refresh (issue #547).
 	// Long-running workspaces (>60 min) use this endpoint to refresh
 	// GH_TOKEN without restarting. Returns the current installation token
@@ -639,7 +670,9 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 
 	// Templates — wh threaded so generateDefaultConfig picks the
 	// SaaS-aware default tier in Import + ReplaceFiles (#2910 PR-B).
-	tmplh := handlers.NewTemplatesHandler(configsDir, dockerCli, wh)
+	tmplh := handlers.NewTemplatesHandler(configsDir, dockerCli, wh).
+		WithCacheDir(templateCacheDir).
+		WithRefreshFunc(refreshTemplates)
 	// #686: GET /templates lists all template names+metadata from configsDir.
 	// Open access lets unauthenticated callers enumerate org configurations and
 	// installed plugins. AdminAuth-gate it alongside POST /templates/import.
@@ -649,6 +682,7 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		tmplAdmin := r.Group("", middleware.AdminAuth(db.DB))
 		tmplAdmin.GET("/templates", tmplh.List)
 		tmplAdmin.POST("/templates/import", tmplh.Import)
+		tmplAdmin.POST("/admin/templates/refresh", tmplh.RefreshCache)
 	}
 	wsAuth.PUT("/files", tmplh.ReplaceFiles)
 	wsAuth.GET("/files", tmplh.ListFiles)

@@ -26,8 +26,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/provisioner"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
 )
 
 const (
@@ -56,8 +56,10 @@ const (
 // (an externally routable address) is used directly.
 func (h *WorkspaceHandler) gracefulPreRestart(ctx context.Context, workspaceID string) {
 	// Non-blocking send — don't stall the restart cycle.
-	// Run in a detached goroutine so the caller (runRestartCycle) can
-	// proceed to stopForRestart without waiting.
+	// Run in a tracked async goroutine (goAsync, not bare `go`) so the
+	// caller (runRestartCycle) can proceed to stopForRestart without
+	// waiting, while the test harness can still drain it before swapping
+	// the global db.DB (resolveAgentURLForRestartSignal reads db.DB).
 	h.goAsync(func() {
 		signalCtx, cancel := context.WithTimeout(context.Background(), restartSignalTimeout)
 		defer cancel()

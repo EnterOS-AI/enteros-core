@@ -47,6 +47,11 @@ jobs:
       # (dead in org secret store) to CP_STAGING_ADMIN_API_TOKEN per
       # internal#322 — see this PR for the cross-workflow sweep.
       MOLECULE_ADMIN_TOKEN: ${{ secrets.CP_STAGING_ADMIN_API_TOKEN }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: us-east-2
+      E2E_AWS_LEAK_CHECK: required
+      E2E_AWS_TERMINATE_LEAKS: '1'
       E2E_MODE: smoke
       E2E_RUNTIME: hermes
       E2E_RUN_ID: "sanity-${{ github.run_id }}"
@@ -61,6 +66,12 @@ jobs:
             echo "::error::CP_STAGING_ADMIN_API_TOKEN not set"
             exit 2
           fi
+          for var in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; do
+            if [ -z "${!var:-}" ]; then
+              echo "::error::$var not set — EC2 leak verification cannot run"
+              exit 2
+            fi
+          done
 
       # Inverted assertion: the run MUST fail. If it passes, the
       # E2E_INTENTIONAL_FAILURE path is broken.

@@ -28,6 +28,7 @@ import { useId, useMemo } from "react";
 export interface SelectorModel {
   id: string;
   name?: string;
+  provider?: string;
   required_env?: string[];
 }
 
@@ -88,6 +89,7 @@ interface Props {
 /** Vendor keys → human label. Add new vendors here when templates pick
  *  up new model families. */
 const VENDOR_LABELS: Record<string, string> = {
+  "platform": "Platform",
   "anthropic-oauth": "Claude Code subscription",
   anthropic: "Anthropic API",
   minimax: "MiniMax",
@@ -118,6 +120,8 @@ const VENDOR_LABELS: Record<string, string> = {
 
 /** Optional per-vendor tooltip shown on hover. */
 const VENDOR_TOOLTIPS: Record<string, string> = {
+  "platform":
+    "Use the Molecule platform-managed LLM proxy. No vendor API key is required.",
   "anthropic-oauth":
     "Use your Claude.ai (Pro/Max/Team) subscription via OAuth. Run `claude login` in the workspace terminal to mint the token, then paste it here. No API spend.",
   anthropic:
@@ -165,6 +169,9 @@ const BARE_VENDOR_PATTERNS: Array<{ test: (id: string) => boolean; vendor: strin
 /** Infer a vendor key from a model spec. Combines id-prefix and env
  *  signals. Exported for tests. */
 export function inferVendor(model: SelectorModel): string {
+  const explicitProvider = model.provider?.trim().toLowerCase();
+  if (explicitProvider) return explicitProvider;
+
   const id = model.id || "";
   const envSet = new Set(model.required_env ?? []);
 

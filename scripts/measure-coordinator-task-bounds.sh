@@ -196,7 +196,7 @@ Auth:         $([ -n "$ADMIN_TOKEN" ] && echo "Bearer ***${ADMIN_TOKEN: -4}" || 
 
 Would provision:
   PM (coordinator, tier=2, template=claude-code-default)
-  Researcher (child, tier=2, template=langgraph)
+  Researcher (child, tier=2, template=claude-code-default)
 
 Would send synthesis-heavy task: $SYNTHESIS_DEPTH delegations + 600w
 synthesis. Coordinator A2A timeout: ${A2A_TIMEOUT}s.
@@ -220,7 +220,7 @@ emit "pm_provisioned" "{\"workspace_id\":\"$PM_ID\"}"
 
 emit "provisioning_child" null
 R=$(api -X POST "$PLATFORM/workspaces" -H 'Content-Type: application/json' \
-  -d '{"name":"Researcher","role":"Returns short research findings","tier":2,"template":"langgraph"}')
+  -d '{"name":"Researcher","role":"Returns short research findings","tier":2,"template":"claude-code-default"}')
 CHILD_ID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))")
 [ -n "$CHILD_ID" ] || { echo "ERROR: child create failed: $R" >&2; exit 1; }
 emit "child_provisioned" "{\"workspace_id\":\"$CHILD_ID\"}"

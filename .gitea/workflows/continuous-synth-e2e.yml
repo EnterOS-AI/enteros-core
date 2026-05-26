@@ -43,6 +43,18 @@ name: Continuous synthetic E2E (staging)
 
 on:
   schedule:
+    # Every 30 minutes, on :02 and :32. This keeps a recurring SaaS
+    # behavior probe while cutting runner occupancy from this workflow by
+    # roughly two thirds; fast liveness belongs in the lighter smoke/heartbeat
+    # probes, not in a full tenant/workspace synth every 10 minutes.
+    #
+    # Previous cadence was every 10 minutes (:02 :12 :22 :32 :42 :52).
+    # The current operator-host runner pool is the bottleneck, so full
+    # synth E2E is deliberately lower-cadence until it moves to a dedicated
+    # runner host or warm-runtime pool.
+    #
+    # Historical notes from the 10-minute shape:
+    #
     # Every 10 minutes, on :02 :12 :22 :32 :42 :52. Three constraints:
     #   1. Stay off the top-of-hour. GitHub Actions scheduler drops
     #      :00 firings under high load (own docs:
@@ -66,7 +78,7 @@ on:
     # fires = ~30 min cadence; closer to the 20-min target than the
     # current shape and provides a real degradation alarm if drops
     # get worse.
-    - cron: '2,12,22,32,42,52 * * * *'
+    - cron: '2,32 * * * *'
 permissions:
   contents: read
   # No issue-write here — failures surface as red runs in the workflow
@@ -106,7 +118,7 @@ jobs:
     timeout-minutes: 20
     env:
       # claude-code default: cold-start ~5 min (comparable to langgraph),
-      # but uses MiniMax-M2.7-highspeed via the template's third-party-
+      # but uses MiniMax-M2 via the template's third-party-
       # Anthropic-compat path (workspace-configs-templates/claude-code-
       # default/config.yaml:64-69). MiniMax is ~5-10x cheaper than
       # gpt-4.1-mini per token AND avoids the recurring OpenAI quota-
@@ -119,9 +131,9 @@ jobs:
       # on the per-runtime default ("sonnet" → routes to direct
       # Anthropic, defeats the cost saving). Operators can override
       # via workflow_dispatch by setting a different E2E_MODEL_SLUG
-      # input if they need to exercise a specific model. M2.7-highspeed
-      # is "Token Plan only" but cheap-per-token and fast.
-      E2E_MODEL_SLUG: ${{ github.event.inputs.model_slug || 'MiniMax-M2.7-highspeed' }}
+      # input if they need to exercise a specific model. MiniMax-M2 is the
+      # stable staging MiniMax path used by the full-SaaS smoke.
+      E2E_MODEL_SLUG: ${{ github.event.inputs.model_slug || 'MiniMax-M2' }}
       # Bound to 10 min so a stuck provision fails the run instead of
       # holding up the next cron firing. 15-min default in the script
       # is for the on-PR full lifecycle where we have more headroom.
@@ -133,6 +145,11 @@ jobs:
       E2E_KEEP_ORG: ${{ github.event.inputs.keep_org == 'true' && '1' || '' }}
       MOLECULE_CP_URL: ${{ vars.STAGING_CP_URL || 'https://staging-api.moleculesai.app' }}
       MOLECULE_ADMIN_TOKEN: ${{ secrets.CP_STAGING_ADMIN_API_TOKEN }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: us-east-2
+      E2E_AWS_LEAK_CHECK: required
+      E2E_AWS_TERMINATE_LEAKS: '1'
       # MiniMax key is the canary's PRIMARY auth path. claude-code
       # template's `minimax` provider routes ANTHROPIC_BASE_URL to
       # api.minimax.io/anthropic and reads MINIMAX_API_KEY at boot.
@@ -173,6 +190,12 @@ jobs:
             echo "::error::Set it at Settings → Secrets and Variables → Actions; pull from staging-CP's CP_ADMIN_API_TOKEN env in Railway."
             exit 1
           fi
+          for var in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; do
+            if [ -z "${!var:-}" ]; then
+              echo "::error::$var secret missing — EC2 leak verification cannot run"
+              exit 1
+            fi
+          done
 
           # LLM-key requirement is per-runtime: claude-code accepts
           # EITHER MiniMax OR direct-Anthropic (whichever is set first),

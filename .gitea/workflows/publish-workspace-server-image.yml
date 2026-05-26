@@ -25,8 +25,12 @@ name: publish-workspace-server-image
 #   staging-<sha>. Set repo variable or secret PROD_AUTO_DEPLOY_DISABLED=true
 #   to stop production rollout while keeping image publishing enabled.
 #
-# ECR target: 153263036946.dkr.ecr.us-east-2.amazonaws.com/molecule-ai/*
+# Primary ECR target: 153263036946.dkr.ecr.us-east-2.amazonaws.com/molecule-ai/*
+# Optional staging tenant mirror target:
+#   004947743811.dkr.ecr.us-east-2.amazonaws.com/molecule-ai/platform-tenant
 # Required secrets: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AUTO_SYNC_TOKEN
+# Staging ECR grants the primary SSOT-managed publisher principal repository
+# policy access, so no persistent staging AWS access keys are required.
 #
 # mc#711: Docker daemon not accessible on ubuntu-latest runner (molecule-canonical-1
 # shows client-only in `docker info` — daemon not running). DinD mount is present but
@@ -43,14 +47,29 @@ on:
 # `cancel-in-progress: false`; that is not acceptable for a workflow with a
 # production deploy job. Per-SHA image tags are immutable, and staging-latest is
 # best-effort last-writer-wins metadata.
+#
+# 2026-05-20 retrigger: run #86994 on mc#1589 merge sha 0f0f1ba2 failed at
+# setup-buildx-action with EACCES on PC2 WSL publish runner — the runner's
+# DOCKER_CONFIG=/home/hongming/.docker-ecr/ dir didn't have a buildx/certs
+# subdir writable by the container's UID 1001. Hot-patched the dir perms;
+# this chore push retriggers the workflow. Proper fix (per-runner
+# DOCKER_CONFIG owned by 1001, internal#597 --env HOME=/home/runner pattern)
+# is tracked as a CI-hygiene follow-up — not in scope here.
 
 permissions:
   contents: read
   packages: write
 
 env:
-  IMAGE_NAME: 153263036946.dkr.ecr.us-east-2.amazonaws.com/molecule-ai/platform
-  TENANT_IMAGE_NAME: 153263036946.dkr.ecr.us-east-2.amazonaws.com/molecule-ai/platform-tenant
+  # SSOT-Instance-10 (#333): ECR registry triplet (account.dkr.ecr.region.amazonaws.com)
+  # sourced from org/repo var `ECR_REGISTRY` with the current prod-account literal as
+  # bootstrap fallback. When the org var is set, the fallback becomes dead code and
+  # switching accounts/regions is a one-line change at the org level (instead of
+  # touching every workflow). Pattern mirrors `vars.CP_URL || 'literal'` already in
+  # use below in this repo's staging-verify.yml.
+  IMAGE_NAME: ${{ vars.ECR_REGISTRY || '153263036946.dkr.ecr.us-east-2.amazonaws.com' }}/molecule-ai/platform
+  TENANT_IMAGE_NAME: ${{ vars.ECR_REGISTRY || '153263036946.dkr.ecr.us-east-2.amazonaws.com' }}/molecule-ai/platform-tenant
+  STAGING_TENANT_IMAGE_NAME: ${{ vars.STAGING_ECR_REGISTRY || '004947743811.dkr.ecr.us-east-2.amazonaws.com' }}/molecule-ai/platform-tenant
 
 jobs:
   build-and-push:
@@ -121,6 +140,18 @@ jobs:
         run: |
           echo "sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
+      # Keep Buildx state inside the job temp dir. The publish runner's
+      # inherited DOCKER_CONFIG can point at a host-owned ECR config path
+      # (/home/hongming/.docker-ecr), which caused setup-buildx-action to
+      # fail before image build with EACCES creating buildx/certs.
+      - name: Prepare writable Docker config
+        run: |
+          set -euo pipefail
+          export DOCKER_CONFIG="$RUNNER_TEMP/docker-config"
+          mkdir -p "$DOCKER_CONFIG/buildx/certs"
+          echo "DOCKER_CONFIG=$DOCKER_CONFIG" >> "$GITHUB_ENV"
+          docker buildx version
+
       # Build + push platform image (inline ECR auth — mirrors the operator-host
       # approach; credentials come from GITHUB_SECRET_AWS_ACCESS_KEY_ID /
       # GITHUB_SECRET_AWS_SECRET_ACCESS_KEY in Gitea Actions).
@@ -156,9 +187,14 @@ jobs:
             --push .
 
       # Build + push tenant image (Go platform + Next.js canvas in one image).
+      # Push the same build to the staging account too so fresh staging/E2E
+      # tenants can pull without cross-account ECR reads. The staging ECR repo
+      # policy trusts the primary SSOT-managed publisher principal; do not add
+      # separate persistent staging AWS access keys here.
       - name: Build & push tenant image to ECR (staging-<sha> + staging-latest)
         env:
           TENANT_IMAGE_NAME: ${{ env.TENANT_IMAGE_NAME }}
+          STAGING_TENANT_IMAGE_NAME: ${{ env.STAGING_TENANT_IMAGE_NAME }}
           TAG_SHA: staging-${{ steps.tags.outputs.sha }}
           TAG_LATEST: staging-latest
           GIT_SHA: ${{ github.sha }}
@@ -169,8 +205,19 @@ jobs:
         run: |
           set -euo pipefail
           ECR_REGISTRY="${TENANT_IMAGE_NAME%%/*}"
+          STAGING_ECR_REGISTRY="${STAGING_TENANT_IMAGE_NAME%%/*}"
           aws ecr get-login-password --region us-east-2 | \
             docker login --username AWS --password-stdin "${ECR_REGISTRY}"
+          aws ecr get-login-password --region us-east-2 | \
+            docker login --username AWS --password-stdin "${STAGING_ECR_REGISTRY}"
+
+          build_tags=(
+            --tag "${TENANT_IMAGE_NAME}:${TAG_SHA}"
+            --tag "${TENANT_IMAGE_NAME}:${TAG_LATEST}"
+            --tag "${STAGING_TENANT_IMAGE_NAME}:${TAG_SHA}"
+            --tag "${STAGING_TENANT_IMAGE_NAME}:${TAG_LATEST}"
+          )
+
           docker buildx build \
             --file ./workspace-server/Dockerfile.tenant \
             --build-arg NEXT_PUBLIC_PLATFORM_URL= \
@@ -179,8 +226,7 @@ jobs:
             --label "org.opencontainers.image.revision=${GIT_SHA}" \
             --label "org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             --label "molecule.workflow.run_id=${GITHUB_RUN_ID}" \
-            --tag "${TENANT_IMAGE_NAME}:${TAG_SHA}" \
-            --tag "${TENANT_IMAGE_NAME}:${TAG_LATEST}" \
+            "${build_tags[@]}" \
             --push .
 
   # bp-exempt: production deploy side-effect; merge is gated by CI / all-required and this job waits for push CI before acting.
@@ -188,15 +234,18 @@ jobs:
     name: Production auto-deploy
     needs: build-and-push
     if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    # Side-effect deploy only; image publish success is the durable artifact. mc#774
+    continue-on-error: true
     # Publish/release lane (internal#462) — production deploy of a merged
     # fix; reserved capacity, never queued behind PR-CI.
     runs-on: publish
-    timeout-minutes: 75
+    timeout-minutes: 90
     env:
       CP_URL: ${{ vars.PROD_CP_URL || 'https://api.moleculesai.app' }}
       CP_ADMIN_API_TOKEN: ${{ secrets.CP_ADMIN_API_TOKEN }}
       GITEA_HOST: git.moleculesai.app
       GITEA_TOKEN: ${{ secrets.PROD_AUTO_DEPLOY_CONTROL_TOKEN || secrets.AUTO_SYNC_TOKEN }}
+      CI_STATUS_TIMEOUT_SECONDS: "3600"
       PROD_AUTO_DEPLOY_DISABLED: ${{ vars.PROD_AUTO_DEPLOY_DISABLED || secrets.PROD_AUTO_DEPLOY_DISABLED || '' }}
       PROD_AUTO_DEPLOY_CANARY_SLUG: ${{ vars.PROD_AUTO_DEPLOY_CANARY_SLUG || 'hongming' }}
       PROD_AUTO_DEPLOY_SOAK_SECONDS: ${{ vars.PROD_AUTO_DEPLOY_SOAK_SECONDS || '60' }}
@@ -255,26 +304,19 @@ jobs:
           python3 .gitea/scripts/prod-auto-deploy.py assert-enabled
           PLAN="$RUNNER_TEMP/prod-auto-deploy-plan.json"
           TARGET_TAG="$(jq -r '.target_tag' "$PLAN")"
-          BODY="$(jq -c '.body' "$PLAN")"
-
-          echo "POST $CP_URL/cp/admin/tenants/redeploy-fleet"
-          echo "  target_tag: $TARGET_TAG"
-          echo "  body: $BODY"
 
           HTTP_RESPONSE="$RUNNER_TEMP/prod-redeploy-response.json"
-          HTTP_CODE_FILE="$RUNNER_TEMP/prod-redeploy-http-code.txt"
           set +e
-          curl -sS -o "$HTTP_RESPONSE" -w '%{http_code}' \
-            -m 1200 \
-            -H "Authorization: Bearer $CP_ADMIN_API_TOKEN" \
-            -H "Content-Type: application/json" \
-            -X POST "$CP_URL/cp/admin/tenants/redeploy-fleet" \
-            -d "$BODY" > "$HTTP_CODE_FILE"
+          python3 .gitea/scripts/prod-auto-deploy.py rollout \
+            --plan "$PLAN" \
+            --response "$HTTP_RESPONSE"
+          ROLLOUT_EXIT=$?
           set -e
 
-          HTTP_CODE="$(cat "$HTTP_CODE_FILE" 2>/dev/null || echo "000")"
-          [ -z "$HTTP_CODE" ] && HTTP_CODE="000"
-          echo "HTTP $HTTP_CODE"
+          if [ ! -s "$HTTP_RESPONSE" ]; then
+            jq -nc --arg error "rollout command exited $ROLLOUT_EXIT before writing a response" \
+              '{ok:false, results:[], error:$error}' > "$HTTP_RESPONSE"
+          fi
           jq '{ok, result_count: (.results // [] | length)}' "$HTTP_RESPONSE" || true
 
           {
@@ -282,7 +324,6 @@ jobs:
             echo ""
             echo "**Commit:** \`${GITHUB_SHA:0:7}\`"
             echo "**Target tag:** \`$TARGET_TAG\`"
-            echo "**HTTP:** $HTTP_CODE"
             echo ""
             echo "### Per-tenant result"
             echo ""
@@ -291,14 +332,14 @@ jobs:
             jq -r '.results[]? | "| \(.slug) | \(.phase) | \(.ssm_status // "-") | \(.ssm_exit_code) | \(.healthz_ok) | \((.error // "") != "") |"' "$HTTP_RESPONSE" || true
           } >> "$GITHUB_STEP_SUMMARY"
 
-          if [ "$HTTP_CODE" != "200" ]; then
-            echo "::error::redeploy-fleet returned HTTP $HTTP_CODE"
-            exit 1
-          fi
           OK="$(jq -r '.ok' "$HTTP_RESPONSE")"
           if [ "$OK" != "true" ]; then
             echo "::error::redeploy-fleet reported ok=false; production rollout halted."
             exit 1
+          fi
+          if [ "$ROLLOUT_EXIT" -ne 0 ]; then
+            echo "::error::redeploy-fleet rollout failed with exit code $ROLLOUT_EXIT."
+            exit "$ROLLOUT_EXIT"
           fi
 
       - name: Verify reachable tenants report this SHA

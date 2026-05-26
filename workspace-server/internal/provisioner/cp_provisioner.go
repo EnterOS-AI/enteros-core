@@ -15,8 +15,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/provlog"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provlog"
 )
 
 // CPProvisionerAPI is the contract WorkspaceHandler uses to talk to the
@@ -152,12 +152,15 @@ func (p *CPProvisioner) adminAuthHeaders(req *http.Request) {
 }
 
 type cpProvisionRequest struct {
-	OrgID       string            `json:"org_id"`
-	WorkspaceID string            `json:"workspace_id"`
-	Runtime     string            `json:"runtime"`
-	Tier        int               `json:"tier"`
-	PlatformURL string            `json:"platform_url"`
-	Env         map[string]string `json:"env"`
+	OrgID        string                 `json:"org_id"`
+	WorkspaceID  string                 `json:"workspace_id"`
+	Runtime      string                 `json:"runtime"`
+	Tier         int                    `json:"tier"`
+	InstanceType string                 `json:"instance_type,omitempty"`
+	DiskGB       int32                  `json:"disk_gb,omitempty"`
+	Display      WorkspaceDisplayConfig `json:"display,omitempty"`
+	PlatformURL  string                 `json:"platform_url"`
+	Env          map[string]string      `json:"env"`
 	// ConfigFiles are template + generated config files to write into the
 	// EC2 instance's /configs directory. OFFSEC-010: collected by
 	// collectCPConfigFiles which rejects symlinks and non-regular files
@@ -178,12 +181,21 @@ func (p *CPProvisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string,
 	// /admin/liveness and other admin-gated platform endpoints (core#831).
 	// p.adminToken is read from os.Getenv("ADMIN_TOKEN") at provisioner creation;
 	// it is also used for CP→platform HTTP auth but those are separate concerns.
-	env := cfg.EnvVars
-	if p.adminToken != "" {
-		env = make(map[string]string, len(cfg.EnvVars)+1)
-		for k, v := range cfg.EnvVars {
-			env[k] = v
+	//
+	// Forensic #145 hardening: tenant workspaces run on EC2 via this path, so
+	// the SCM-write-token denylist (see buildContainerEnv) is enforced here
+	// too. Always build a filtered copy — never pass cfg.EnvVars through
+	// verbatim — so a latent persona-merged GITEA_TOKEN can't reach the
+	// tenant container regardless of whether ADMIN_TOKEN is set.
+	env := make(map[string]string, len(cfg.EnvVars)+1)
+	for k, v := range cfg.EnvVars {
+		if isSCMWriteTokenKey(k) {
+			log.Printf("CPProvisioner.Start: dropped SCM-write credential %q from tenant workspace env (forensic #145 guard)", k)
+			continue
 		}
+		env[k] = v
+	}
+	if p.adminToken != "" {
 		env["ADMIN_TOKEN"] = p.adminToken
 	}
 	// Collect template files and generated configs, with OFFSEC-010 guards:
@@ -197,13 +209,16 @@ func (p *CPProvisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string,
 	}
 
 	req := cpProvisionRequest{
-		OrgID:       p.orgID,
-		WorkspaceID: cfg.WorkspaceID,
-		Runtime:     cfg.Runtime,
-		Tier:        cfg.Tier,
-		PlatformURL: cfg.PlatformURL,
-		Env:         env,
-		ConfigFiles: configFiles,
+		OrgID:        p.orgID,
+		WorkspaceID:  cfg.WorkspaceID,
+		Runtime:      cfg.Runtime,
+		Tier:         cfg.Tier,
+		InstanceType: cfg.InstanceType,
+		DiskGB:       cfg.DiskGB,
+		Display:      cfg.Display,
+		PlatformURL:  cfg.PlatformURL,
+		Env:          env,
+		ConfigFiles:  configFiles,
 	}
 
 	body, err := json.Marshal(req)
@@ -228,9 +243,12 @@ func (p *CPProvisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string,
 	// Cap body read at 64 KiB — the CP only ever returns small JSON
 	// responses; an unbounded read could be weaponized into log-flood
 	// DoS by a compromised upstream.
-	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	if readErr != nil {
+		return "", fmt.Errorf("cp provisioner: read response body: %w", readErr)
+	}
 	var result cpProvisionResponse
-	json.Unmarshal(respBody, &result)
+	unmarshalErr := json.Unmarshal(respBody, &result)
 
 	if resp.StatusCode != http.StatusCreated {
 		// Prefer the structured {"error":"..."} field. Do NOT fall back
@@ -242,6 +260,10 @@ func (p *CPProvisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string,
 			errMsg = fmt.Sprintf("<unstructured body, %d bytes>", len(respBody))
 		}
 		return "", fmt.Errorf("cp provisioner: provision failed (%d): %s", resp.StatusCode, errMsg)
+	}
+
+	if unmarshalErr != nil {
+		return "", fmt.Errorf("cp provisioner: decode 201 response: %w", unmarshalErr)
 	}
 
 	log.Printf("CP provisioner: workspace %s → EC2 instance %s (%s)", cfg.WorkspaceID, result.InstanceID, result.State)
@@ -396,7 +418,11 @@ func (p *CPProvisioner) Stop(ctx context.Context, workspaceID string) error {
 		// Read a bounded slice of the body so the error message gives ops
 		// enough to triage without risking a multi-MB log line on a
 		// pathological response. 512 bytes covers any sane error envelope.
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 512))
+		if readErr != nil {
+			return fmt.Errorf("cp provisioner: stop %s: unexpected %d (read body failed: %w)",
+				workspaceID, resp.StatusCode, readErr)
+		}
 		return fmt.Errorf("cp provisioner: stop %s: unexpected %d: %s",
 			workspaceID, resp.StatusCode, strings.TrimSpace(string(body)))
 	}

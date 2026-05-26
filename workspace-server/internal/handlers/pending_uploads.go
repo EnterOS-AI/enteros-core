@@ -31,7 +31,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/pendinguploads"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/pendinguploads"
 )
 
 // PendingUploadsHandler serves the workspace-side fetch + ack endpoints.
@@ -61,8 +61,12 @@ func NewPendingUploadsHandler(storage pendinguploads.Storage) *PendingUploadsHan
 //   - file_id not found
 //   - file_id belongs to a different workspace (cross-workspace bleed
 //     protection)
-//   - row already acked (workspace's bug — should not re-fetch after ack)
 //   - row past expires_at (Phase 3 sweep would delete shortly anyway)
+//
+// Acked rows are intentionally still readable until the sweeper's
+// ack-retention window elapses. Canvas chat history persists
+// platform-pending: URIs; after a poll-mode workspace acks the handoff,
+// a browser refresh still needs to preview/download the attachment.
 func (h *PendingUploadsHandler) GetContent(c *gin.Context) {
 	workspaceID := c.Param("id")
 	if err := validateWorkspaceID(workspaceID); err != nil {
@@ -78,7 +82,7 @@ func (h *PendingUploadsHandler) GetContent(c *gin.Context) {
 
 	rec, err := h.storage.Get(c.Request.Context(), fileID)
 	if errors.Is(err, pendinguploads.ErrNotFound) {
-		c.JSON(http.StatusNotFound, gin.H{"error": "pending upload not found, expired, or already acked"})
+		c.JSON(http.StatusNotFound, gin.H{"error": "pending upload not found or expired"})
 		return
 	}
 	if err != nil {
@@ -181,4 +185,3 @@ func (h *PendingUploadsHandler) Ack(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, gin.H{"acked": true})
 }
-

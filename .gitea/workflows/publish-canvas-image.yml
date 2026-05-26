@@ -42,7 +42,13 @@ permissions:
   packages: write
 
 env:
-  IMAGE_NAME: 153263036946.dkr.ecr.us-east-2.amazonaws.com/molecule-ai/canvas
+  # SSOT-Instance-10 (#333): ECR registry triplet (account.dkr.ecr.region.amazonaws.com)
+  # sourced from org/repo var `ECR_REGISTRY` with the current prod-account literal as
+  # bootstrap fallback. When the org var is set, the fallback becomes dead code and
+  # switching accounts/regions is a one-line change at the org level (instead of
+  # touching every workflow). Pattern mirrors `vars.CP_URL || 'literal'` already in
+  # use below in this repo's staging-verify.yml.
+  IMAGE_NAME: ${{ vars.ECR_REGISTRY || '153263036946.dkr.ecr.us-east-2.amazonaws.com' }}/molecule-ai/canvas
   GITHUB_SERVER_URL: https://git.moleculesai.app
 
 jobs:
@@ -66,6 +72,17 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # Keep Docker auth/buildx state inside the job temp dir. Publish
+      # runners can inherit a HOME/DOCKER_CONFIG path that is host-owned
+      # and not writable from the job container; docker login otherwise
+      # fails before the image build starts.
+      - name: Prepare writable Docker config
+        run: |
+          set -euo pipefail
+          export DOCKER_CONFIG="$RUNNER_TEMP/docker-config"
+          mkdir -p "$DOCKER_CONFIG/buildx/certs"
+          echo "DOCKER_CONFIG=$DOCKER_CONFIG" >> "$GITHUB_ENV"
 
       - name: Log in to ECR
         env:

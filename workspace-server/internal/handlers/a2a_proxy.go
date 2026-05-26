@@ -20,13 +20,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/envx"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/events"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/models"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/provisioner"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/registry"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/wsauth"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/envx"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/registry"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wsauth"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
@@ -111,12 +111,13 @@ const maxProxyResponseBody = 10 << 20
 //     a generic 502 page to canvas. 10s is well above realistic intra-region
 //     latencies and well below CF's edge timeout.
 //
-//  3. Transport.ResponseHeaderTimeout — 180s default. From request-body-end
+//  3. Transport.ResponseHeaderTimeout — 5min default. From request-body-end
 //     to response-headers-start. Configurable via
 //     A2A_PROXY_RESPONSE_HEADER_TIMEOUT (envx.Duration). Covers cold-start
 //     first-byte (30-60s OAuth flow above) with enough room for Opus agent
-//     turns (big context + internal delegate_task round-trips routinely exceed
-//     the old 60s ceiling). Body streaming after headers is governed by the
+//     turns and Codex scheduled tasks (big context + internal delegate_task
+//     round-trips routinely exceed the old 60s/180s ceilings). Body streaming
+//     after headers is governed by the
 //     per-request context deadline, NOT this timeout — so multi-minute agent
 //     responses still work fine.
 //
@@ -131,7 +132,7 @@ var a2aClient = &http.Client{
 			Timeout:   10 * time.Second,
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
-		ResponseHeaderTimeout: envx.Duration("A2A_PROXY_RESPONSE_HEADER_TIMEOUT", 180*time.Second),
+		ResponseHeaderTimeout: envx.Duration("A2A_PROXY_RESPONSE_HEADER_TIMEOUT", 5*time.Minute),
 		TLSHandshakeTimeout:   10 * time.Second,
 		// MaxIdleConns / IdleConnTimeout: stdlib defaults are fine; agent
 		// fan-in is bounded by the platform's broadcaster fan-out, not by
@@ -228,7 +229,7 @@ func (e *proxyA2AError) Error() string {
 // cron scheduler and other internal callers that need to send A2A messages
 // to workspaces programmatically (not from an HTTP handler).
 func (h *WorkspaceHandler) ProxyA2ARequest(ctx context.Context, workspaceID string, body []byte, callerID string, logActivity bool) (int, []byte, error) {
-	status, resp, proxyErr := h.proxyA2ARequest(ctx, workspaceID, body, callerID, logActivity)
+	status, resp, proxyErr := h.proxyA2ARequest(ctx, workspaceID, body, callerID, logActivity, false)
 	if proxyErr != nil {
 		return status, resp, proxyErr
 	}
@@ -307,13 +308,21 @@ func (h *WorkspaceHandler) ProxyA2A(c *gin.Context) {
 	// The bind is strict: the token must match `callerID`, not
 	// `workspaceID` (the target). A compromised token from workspace A
 	// must never authenticate calls from A pretending to be B.
-	if callerID != "" && callerID != workspaceID {
-		if err := validateCallerToken(ctx, c, callerID); err != nil {
+	//
+	// Post-RFC#637: canvas users now send X-Workspace-ID (their identity
+	// workspace). validateCallerToken detects canvas/admin auth on a
+	// tokenless workspace and returns isCanvasUser=true so the proxy can
+	// bypass CanCommunicate (human users sit outside the hierarchy).
+	isCanvasUser := false
+	if callerID != "" && callerID != workspaceID && !isSystemCaller(callerID) {
+		var err error
+		isCanvasUser, err = validateCallerToken(ctx, c, callerID)
+		if err != nil {
 			return // response already written with 401
 		}
 	}
 
-	status, respBody, proxyErr := h.proxyA2ARequest(ctx, workspaceID, body, callerID, true)
+	status, respBody, proxyErr := h.proxyA2ARequest(ctx, workspaceID, body, callerID, true, isCanvasUser)
 	if proxyErr != nil {
 		for k, v := range proxyErr.Headers {
 			c.Header(k, v)
@@ -352,11 +361,13 @@ func (h *WorkspaceHandler) checkWorkspaceBudget(ctx context.Context, workspaceID
 	return nil
 }
 
-func (h *WorkspaceHandler) proxyA2ARequest(ctx context.Context, workspaceID string, body []byte, callerID string, logActivity bool) (int, []byte, *proxyA2AError) {
+func (h *WorkspaceHandler) proxyA2ARequest(ctx context.Context, workspaceID string, body []byte, callerID string, logActivity bool, isCanvasUser bool) (int, []byte, *proxyA2AError) {
 	// Access control: workspace-to-workspace requests must pass CanCommunicate check.
 	// Canvas requests (callerID == "") and system callers (webhook:*, system:*, test:*)
 	// are trusted. Self-calls (callerID == workspaceID) are always allowed.
-	if callerID != "" && callerID != workspaceID && !isSystemCaller(callerID) {
+	// Post-RFC#637: canvas-user identity workspaces also bypass CanCommunicate
+	// because human users sit outside the org hierarchy.
+	if callerID != "" && callerID != workspaceID && !isSystemCaller(callerID) && !isCanvasUser {
 		if !registry.CanCommunicate(callerID, workspaceID) {
 			log.Printf("ProxyA2A: access denied %s → %s", callerID, workspaceID)
 			return 0, nil, &proxyA2AError{
@@ -399,7 +410,21 @@ func (h *WorkspaceHandler) proxyA2ARequest(ctx context.Context, workspaceID stri
 	// (no Do(), no maybeMarkContainerDead). The response is a synthetic
 	// {status:"queued"} envelope so the caller (canvas, another workspace)
 	// knows delivery is acknowledged but pending consumption.
-	if lookupDeliveryMode(ctx, workspaceID) == models.DeliveryModePoll {
+	deliveryMode, deliveryModeErr := lookupDeliveryMode(ctx, workspaceID)
+	if deliveryModeErr != nil {
+		// internal#497 fail-closed: a real DB/context error on the
+		// delivery-mode read MUST NOT silently fall through to the push
+		// dispatch path — that is exactly what silently misrouted every
+		// poll-mode peer for 5 days under the ce2db75f regression. Surface
+		// a structured error so the delegation is marked failed (loud +
+		// retryable) instead of dispatched to the wrong path.
+		log.Printf("ProxyA2A: delivery-mode lookup failed for %s: %v — failing closed", workspaceID, deliveryModeErr)
+		return 0, nil, &proxyA2AError{
+			Status:   http.StatusServiceUnavailable,
+			Response: gin.H{"error": "delivery-mode lookup failed; refusing to dispatch to avoid silent misrouting"},
+		}
+	}
+	if deliveryMode == models.DeliveryModePoll {
 		if logActivity {
 			h.logA2AReceiveQueued(ctx, workspaceID, callerID, body, a2aMethod)
 		}
@@ -542,7 +567,14 @@ func (h *WorkspaceHandler) proxyA2ARequest(ctx context.Context, workspaceID stri
 	// Track LLM token usage for cost transparency (#593).
 	// Fires in a detached goroutine so token accounting never adds latency
 	// to the critical A2A path.
-	go extractAndUpsertTokenUsage(context.WithoutCancel(ctx), workspaceID, respBody)
+	// RFC internal#524 Layer 1: extractAndUpsertTokenUsage reads db.DB
+	// (INSERT INTO llm_token_usage). Without globalGoAsync, the detached
+	// write races a subsequent test's db.DB swap exactly like the
+	// maybeMarkContainerDead path that 69d9b4e3 fixed.
+	tokCtx := context.WithoutCancel(ctx)
+	wsID := workspaceID
+	tokBody := respBody
+	globalGoAsync(func() { extractAndUpsertTokenUsage(tokCtx, wsID, tokBody) })
 
 	// Non-2xx agent response: the agent received the request but returned an
 	// error status. Return a proxyErr so the caller (DrainQueueForWorkspace)
@@ -665,11 +697,22 @@ func (h *WorkspaceHandler) resolveAgentURL(ctx context.Context, workspaceID stri
 		_ = db.CacheURL(ctx, workspaceID, agentURL)
 	}
 
-	// When the platform runs inside Docker, 127.0.0.1:{host_port} is
-	// unreachable (it's the platform container's own localhost, not the
-	// Docker host). Rewrite to the container's Docker-bridge hostname.
+	// When the platform runs inside Docker, a managed workspace's
+	// 127.0.0.1:{host_port} URL points at the Docker host and must be
+	// rewritten to the workspace container's Docker-bridge hostname.
+	// External runtimes are not managed containers; their local test/runtime
+	// URL is the target and must not be synthesized into ws-<id>:8000.
 	if strings.HasPrefix(agentURL, "http://127.0.0.1:") && h.provisioner != nil && platformInDocker {
-		agentURL = provisioner.InternalURL(workspaceID)
+		var wsRuntime string
+		if err := db.DB.QueryRowContext(ctx,
+			`SELECT COALESCE(runtime, 'claude-code') FROM workspaces WHERE id = $1`,
+			workspaceID,
+		).Scan(&wsRuntime); err != nil {
+			log.Printf("ProxyA2A: runtime lookup before Docker URL rewrite failed for %s: %v", workspaceID, err)
+		}
+		if !isExternalLikeRuntime(wsRuntime) {
+			agentURL = provisioner.InternalURL(workspaceID)
+		}
 	}
 	// SSRF defence: reject private/metadata URLs before making outbound call.
 	if err := isSafeURL(agentURL); err != nil {
@@ -917,6 +960,12 @@ func applyIdleTimeout(parent context.Context, b *events.Broadcaster, workspaceID
 	}
 	ctx, cancel := context.WithCancel(parent)
 	sub, unsub := b.SubscribeSSE(workspaceID)
+	// goAsync-exempt (RFC internal#524 Layer 2.2 annotation): this
+	// goroutine owns the parent ctx's cancel and exits only on
+	// ctx.Done() / sub-channel close — wrapping it in globalGoAsync would
+	// deadlock drainTestAsync because the request that owns ctx hasn't
+	// completed when t.Cleanup fires. Does NOT read db.DB; idle-timer
+	// management only.
 	go func() {
 		defer unsub()
 		timer := time.NewTimer(idle)

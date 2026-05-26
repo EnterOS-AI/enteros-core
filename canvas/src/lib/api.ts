@@ -23,6 +23,7 @@ const DEFAULT_TIMEOUT_MS = 35_000;
 
 export interface RequestOptions {
   timeoutMs?: number;
+  headers?: Record<string, string>;
 }
 
 /**
@@ -76,6 +77,7 @@ async function request<T>(
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     ...platformAuthHeaders(),
+    ...(options?.headers ?? {}),
   };
   // Re-read slug locally for the 401 handler below — `headers` already
   // has it, but the 401 branch needs the bare value to gate the

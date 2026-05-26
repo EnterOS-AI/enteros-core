@@ -5,15 +5,43 @@ import (
 	"database/sql"
 	"log"
 	"net/http"
+	"os"
 	"regexp"
+	"strings"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/crypto"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/wsauth"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/audit"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/crypto"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wsauth"
 	"github.com/gin-gonic/gin"
 )
 
 var uuidRegex = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+
+var platformManagedDirectLLMBypassKeys = map[string]struct{}{
+	"HERMES_CUSTOM_API_KEY":  {},
+	"HERMES_CUSTOM_BASE_URL": {},
+}
+
+func isPlatformManagedDirectLLMBypassKey(key string) bool {
+	_, ok := platformManagedDirectLLMBypassKeys[strings.ToUpper(strings.TrimSpace(key))]
+	return ok
+}
+
+func platformManagedLLMMode() bool {
+	return strings.EqualFold(strings.TrimSpace(os.Getenv("MOLECULE_LLM_BILLING_MODE")), "platform_managed")
+}
+
+func rejectPlatformManagedDirectLLMBypass(c *gin.Context, key string) bool {
+	if !platformManagedLLMMode() || !isPlatformManagedDirectLLMBypassKey(key) {
+		return false
+	}
+	c.JSON(http.StatusBadRequest, gin.H{
+		"error": "direct Hermes custom provider secrets are blocked for platform-managed LLM workspaces; use MODEL/LLM_PROVIDER or the platform LLM proxy env instead",
+		"key":   key,
+	})
+	return true
+}
 
 type SecretsHandler struct {
 	restartFunc func(workspaceID string) // Optional: auto-restart after secret change
@@ -237,6 +265,9 @@ func (h *SecretsHandler) Set(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
 		return
 	}
+	if rejectPlatformManagedDirectLLMBypass(c, body.Key) {
+		return
+	}
 
 	// Encrypt the value (AES-256-GCM if SECRETS_ENCRYPTION_KEY is set, plaintext otherwise)
 	encrypted, err := crypto.Encrypt([]byte(body.Value))
@@ -262,9 +293,24 @@ func (h *SecretsHandler) Set(c *gin.Context) {
 		return
 	}
 
-	// Auto-restart workspace to pick up new secret
+	// Phase 1 audit: structured event for the security trail. Inline (not
+	// goroutine) so the event is durable before we ack the user; emit is
+	// best-effort and never errors out of the request path.
+	audit.Emit(c.Request.Context(), "secret.set", map[string]any{
+		"workspace_id": workspaceID,
+		"key":          body.Key,
+		"value_hash":   audit.HashValuePrefix(body.Value, 8),
+		"scope":        "workspace",
+		"operation":    "set",
+	})
+
+	// Auto-restart workspace to pick up new secret.
+	// RFC internal#524 Layer 1: route through globalGoAsync so tests can
+	// drain the detached restart goroutine before db.DB is swapped — see
+	// drainTestAsync in handlers_test.go and the canonical 69d9b4e3 fix.
 	if h.restartFunc != nil {
-		go h.restartFunc(workspaceID)
+		wsID := workspaceID
+		globalGoAsync(func() { h.restartFunc(wsID) })
 	}
 
 	c.JSON(http.StatusOK, gin.H{"status": "saved", "key": body.Key})
@@ -297,9 +343,20 @@ func (h *SecretsHandler) Delete(c *gin.Context) {
 		return
 	}
 
-	// Auto-restart workspace to pick up removed secret
+	// Phase 1 audit: structured event for the security trail. Only on
+	// real deletes (rows>0) — a 404 is not a state change.
+	audit.Emit(c.Request.Context(), "secret.delete", map[string]any{
+		"workspace_id": workspaceID,
+		"key":          key,
+		"scope":        "workspace",
+		"operation":    "delete",
+	})
+
+	// Auto-restart workspace to pick up removed secret.
+	// RFC internal#524 Layer 1: see Set() above for the drain rationale.
 	if h.restartFunc != nil {
-		go h.restartFunc(workspaceID)
+		wsID := workspaceID
+		globalGoAsync(func() { h.restartFunc(wsID) })
 	}
 
 	c.JSON(http.StatusOK, gin.H{"status": "deleted", "key": key})
@@ -353,6 +410,9 @@ func (h *SecretsHandler) SetGlobal(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
 		return
 	}
+	if rejectPlatformManagedDirectLLMBypass(c, body.Key) {
+		return
+	}
 
 	encrypted, err := crypto.Encrypt([]byte(body.Value))
 	if err != nil {
@@ -379,7 +439,22 @@ func (h *SecretsHandler) SetGlobal(c *gin.Context) {
 	// reach existing workspaces until the container is recreated. Auto-restart
 	// every workspace whose env is affected — i.e. those WITHOUT a
 	// workspace-level override of the same key.
-	go h.restartAllAffectedByGlobalKey(body.Key)
+	//
+	// RFC internal#524 Layer 1: globalGoAsync so tests drain the fan-out
+	// (which itself spawns N more globalGoAsync restart calls below) before
+	// db.DB swap. Without this, the SELECT for affected workspaces races a
+	// subsequent test's db.DB restore.
+	key := body.Key
+	globalGoAsync(func() { h.restartAllAffectedByGlobalKey(key) })
+
+	// Phase 1 audit: admin-scope secret write — high-value security event.
+	auditCtx := audit.WithActorKind(c.Request.Context(), audit.ActorAdmin)
+	audit.Emit(auditCtx, "secret.set", map[string]any{
+		"key":        body.Key,
+		"value_hash": audit.HashValuePrefix(body.Value, 8),
+		"scope":      "global",
+		"operation":  "set",
+	})
 
 	c.JSON(http.StatusOK, gin.H{"status": "saved", "key": body.Key, "scope": "global"})
 }
@@ -423,7 +498,11 @@ func (h *SecretsHandler) restartAllAffectedByGlobalKey(key string) {
 	}
 	log.Printf("Global secret %s changed: auto-restarting %d workspace(s) to refresh env", key, len(ids))
 	for _, id := range ids {
-		go h.restartFunc(id)
+		// RFC internal#524 Layer 1: per-workspace restart via globalGoAsync
+		// so each restart goroutine is drained before db.DB is swapped in
+		// the test cleanup chain.
+		wsID := id
+		globalGoAsync(func() { h.restartFunc(wsID) })
 	}
 }
 
@@ -450,7 +529,18 @@ func (h *SecretsHandler) DeleteGlobal(c *gin.Context) {
 
 	// Issue #15: propagate deletion to running containers — otherwise they
 	// keep the stale env var until manual restart.
-	go h.restartAllAffectedByGlobalKey(key)
+	// RFC internal#524 Layer 1: globalGoAsync for the same drain rationale
+	// as SetGlobal above.
+	k := key
+	globalGoAsync(func() { h.restartAllAffectedByGlobalKey(k) })
+
+	// Phase 1 audit: admin-scope secret delete.
+	auditCtx := audit.WithActorKind(c.Request.Context(), audit.ActorAdmin)
+	audit.Emit(auditCtx, "secret.delete", map[string]any{
+		"key":       key,
+		"scope":     "global",
+		"operation": "delete",
+	})
 
 	c.JSON(http.StatusOK, gin.H{"status": "deleted", "key": key, "scope": "global"})
 }
@@ -461,11 +551,24 @@ func (h *SecretsHandler) GetModel(c *gin.Context) {
 	workspaceID := c.Param("id")
 	ctx := c.Request.Context()
 
-	// Check if MODEL_PROVIDER secret exists
+	// Check if MODEL secret exists.
+	//
+	// Historical note: this row was named MODEL_PROVIDER pre-2026-05-19
+	// (see ab12af50 + a7e8892 root-cause analysis). The column name
+	// MODEL_PROVIDER was misleading — it never held a provider slug,
+	// only the picked model id (e.g. "minimax/MiniMax-M2.7"). The
+	// misnomer caused workspace-server's applyRuntimeModelEnv to
+	// overwrite a legitimate persona-env MODEL with whatever literal
+	// string lived in MODEL_PROVIDER (often "minimax" or "claude-code"
+	// — not a valid model id), wedging adapters at SDK initialize.
+	// CP-side slot-separation (cp#213 + cp#220) already corrected the
+	// CP-side analogue; this is the workspace-server companion. A
+	// migration in 20260519000000_workspace_secrets_model_provider_rename.up.sql
+	// moves any legacy rows to the new key on rollout.
 	var modelBytes []byte
 	var modelVersion int
 	err := db.DB.QueryRowContext(ctx,
-		`SELECT encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = $1 AND key = 'MODEL_PROVIDER'`,
+		`SELECT encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = $1 AND key = 'MODEL'`,
 		workspaceID).Scan(&modelBytes, &modelVersion)
 	if err == sql.ErrNoRows {
 		c.JSON(http.StatusOK, gin.H{"model": "", "source": "default"})
@@ -485,18 +588,23 @@ func (h *SecretsHandler) GetModel(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"model": string(decrypted), "source": "workspace_secrets"})
 }
 
-// setModelSecret writes (or clears, when value=="") the MODEL_PROVIDER
-// workspace secret. Extracted from SetModel so non-handler call sites
-// (notably WorkspaceHandler.Create — first-deploy path that persists the
+// setModelSecret writes (or clears, when value=="") the MODEL workspace
+// secret. Extracted from SetModel so non-handler call sites (notably
+// WorkspaceHandler.Create — first-deploy path that persists the
 // canvas-selected model so applyRuntimeModelEnv's restart fallback finds
 // it) can reuse the encryption + upsert logic without inlining the SQL.
+//
+// The row was previously keyed MODEL_PROVIDER (misnomer — it never held
+// a provider, only a model id). Renamed to MODEL on 2026-05-19; the
+// 20260519000000_workspace_secrets_model_provider_rename migration moves
+// any legacy rows on rollout.
 //
 // Returns nil on success. Caller is responsible for any restart trigger;
 // the gin handler re-adds that after a successful write.
 func setModelSecret(ctx context.Context, workspaceID, model string) error {
 	if model == "" {
 		_, err := db.DB.ExecContext(ctx,
-			`DELETE FROM workspace_secrets WHERE workspace_id = $1 AND key = 'MODEL_PROVIDER'`,
+			`DELETE FROM workspace_secrets WHERE workspace_id = $1 AND key = 'MODEL'`,
 			workspaceID)
 		return err
 	}
@@ -507,7 +615,7 @@ func setModelSecret(ctx context.Context, workspaceID, model string) error {
 	version := crypto.CurrentEncryptionVersion()
 	_, err = db.DB.ExecContext(ctx, `
 		INSERT INTO workspace_secrets (workspace_id, key, encrypted_value, encryption_version)
-		VALUES ($1, 'MODEL_PROVIDER', $2, $3)
+		VALUES ($1, 'MODEL', $2, $3)
 		ON CONFLICT (workspace_id, key) DO UPDATE
 			SET encrypted_value = $2, encryption_version = $3, updated_at = now()
 	`, workspaceID, encrypted, version)
@@ -515,9 +623,9 @@ func setModelSecret(ctx context.Context, workspaceID, model string) error {
 }
 
 // SetModel handles PUT /workspaces/:id/model — writes the model slug
-// into workspace_secrets as MODEL_PROVIDER (the key GetModel reads).
+// into workspace_secrets as MODEL (the key GetModel reads).
 // For hermes, the value is a hermes-native slug like "minimax/MiniMax-M2.7";
-// for langgraph it's the legacy "provider:model" form. Either way it's just
+// for claude-code it's the legacy "provider:model" form. Either way it's just
 // an opaque string the runtime interprets on its next start.
 //
 // Empty string clears the override. Triggers auto-restart so the new
@@ -552,7 +660,9 @@ func (h *SecretsHandler) SetModel(c *gin.Context) {
 	}
 
 	if h.restartFunc != nil {
-		go h.restartFunc(workspaceID)
+		// RFC internal#524 Layer 1: globalGoAsync (see Set()).
+		wsID := workspaceID
+		globalGoAsync(func() { h.restartFunc(wsID) })
 	}
 	if body.Model == "" {
 		c.JSON(http.StatusOK, gin.H{"status": "cleared"})
@@ -669,7 +779,9 @@ func (h *SecretsHandler) SetProvider(c *gin.Context) {
 	}
 
 	if h.restartFunc != nil {
-		go h.restartFunc(workspaceID)
+		// RFC internal#524 Layer 1: globalGoAsync (see Set()).
+		wsID := workspaceID
+		globalGoAsync(func() { h.restartFunc(wsID) })
 	}
 	if body.Provider == "" {
 		c.JSON(http.StatusOK, gin.H{"status": "cleared"})

@@ -43,7 +43,7 @@ vi.mock("../uploads", () => ({
 
 // Mock platformAuthHeaders so fetch gets auth headers
 vi.mock("@/lib/api", () => ({
-  platformAuthHeaders: () => ({ Authorization: "Bearer test-token" }),
+  platformAuthHeaders: () => ({ Authorization: "Bearer fixture-token" }),
 }));
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────

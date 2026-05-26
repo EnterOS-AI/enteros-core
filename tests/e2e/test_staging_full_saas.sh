@@ -23,8 +23,13 @@
 #   MOLECULE_ADMIN_TOKEN   CP admin bearer — Railway CP_ADMIN_API_TOKEN
 #
 # Optional env:
-#   E2E_RUNTIME                  hermes (default) | claude-code | langgraph
+#   E2E_RUNTIME                  hermes (default) | claude-code | codex | openclaw
 #   E2E_PROVISION_TIMEOUT_SECS   default 900 (15 min cold EC2 budget)
+#   E2E_WORKSPACE_ONLINE_TIMEOUT_SECS  default 3600 (60 min — hermes
+#                                cold-boot worst-case + slack). Raised from
+#                                1800 (#1646) because flaky tenant-provisioning
+#                                latency (not a code regression) causes
+#                                alternating pass/fail on identical SHAs.
 #   E2E_KEEP_ORG                 1 → skip teardown (debugging only)
 #   E2E_RUN_ID                   Slug suffix; CI: ${GITHUB_RUN_ID}
 #   E2E_MODE                     full (default) | smoke
@@ -32,6 +37,11 @@
 #                                 mapped to `smoke` for back-compat with
 #                                 any in-flight runner picking up an older
 #                                 workflow checkout)
+#   E2E_AWS_LEAK_CHECK           auto (default) | required | off
+#                                required in CI so teardown cannot report
+#                                clean while slug-tagged EC2 remains alive
+#   E2E_AWS_TERMINATE_LEAKS      1 → terminate slug-tagged leaked EC2 before
+#                                exiting 4
 #   E2E_INTENTIONAL_FAILURE      1 → poison tenant token mid-run so the
 #                                script fails; the EXIT trap MUST still
 #                                tear down cleanly (and exit 4 on leak).
@@ -51,6 +61,7 @@ CP_URL="${MOLECULE_CP_URL:-https://staging-api.moleculesai.app}"
 ADMIN_TOKEN="${MOLECULE_ADMIN_TOKEN:?MOLECULE_ADMIN_TOKEN required — Railway staging CP_ADMIN_API_TOKEN}"
 RUNTIME="${E2E_RUNTIME:-hermes}"
 PROVISION_TIMEOUT_SECS="${E2E_PROVISION_TIMEOUT_SECS:-900}"
+WORKSPACE_ONLINE_TIMEOUT_SECS="${E2E_WORKSPACE_ONLINE_TIMEOUT_SECS:-3600}"
 RUN_ID_SUFFIX="${E2E_RUN_ID:-$(date +%H%M%S)-$$}"
 MODE="${E2E_MODE:-full}"
 # `canary` is a legacy alias for `smoke` retained for back-compat with
@@ -82,10 +93,22 @@ ok()   { echo "[$(date +%H:%M:%S)] ✅ $*"; }
 # Per-runtime model slug dispatch — see lib/model_slug.sh for the rationale.
 # Extracted so unit tests (tests/e2e/test_model_slug.sh) can pin every branch
 # without booting the full 11-step lifecycle.
+# shellcheck disable=SC1091
 # shellcheck source=lib/model_slug.sh
 source "$(dirname "$0")/lib/model_slug.sh"
+# shellcheck disable=SC1091
+# shellcheck source=lib/aws_leak_check.sh
+source "$(dirname "$0")/lib/aws_leak_check.sh"
 
 CURL_COMMON=(-sS --fail-with-body --max-time 30)
+E2E_TMP_FILES=()
+
+e2e_tmp() {
+  local f
+  f=$(mktemp "$1")
+  E2E_TMP_FILES+=("$f")
+  printf '%s' "$f"
+}
 
 # ─── cleanup trap ───────────────────────────────────────────────────────
 CLEANUP_DONE=0
@@ -97,6 +120,8 @@ cleanup_org() {
 
   if [ "$CLEANUP_DONE" = "1" ]; then return 0; fi
   CLEANUP_DONE=1
+
+  rm -f "${E2E_TMP_FILES[@]}" 2>/dev/null || true
 
   if [ "${E2E_KEEP_ORG:-0}" = "1" ]; then
     log "E2E_KEEP_ORG=1 — skipping teardown. Manually delete $SLUG when done."
@@ -119,12 +144,14 @@ cleanup_org() {
   #      DELETE returns 5xx mid-cascade and the cascade finishes anyway,
   #      and the case where DELETE legitimately exceeds 120s and we want
   #      eventual-consistency confirmation.
-  curl "${CURL_COMMON[@]}" --max-time 120 -X DELETE "$CP_URL/cp/admin/tenants/$SLUG" \
+  if curl "${CURL_COMMON[@]}" --max-time 120 -X DELETE "$CP_URL/cp/admin/tenants/$SLUG" \
     -H "Authorization: Bearer $ADMIN_TOKEN" \
     -H "Content-Type: application/json" \
-    -d "{\"confirm\":\"$SLUG\"}" >/dev/null 2>&1 \
-    && ok "Teardown request accepted" \
-    || log "Teardown returned non-2xx (may already be gone)"
+    -d "{\"confirm\":\"$SLUG\"}" >/dev/null 2>&1; then
+    ok "Teardown request accepted"
+  else
+    log "Teardown returned non-2xx (may already be gone)"
+  fi
 
   local leak_count=1
   local elapsed=0
@@ -144,7 +171,15 @@ cleanup_org() {
     echo "⚠️  LEAK: org $SLUG still present post-teardown after ${elapsed}s (count=$leak_count)" >&2
     exit 4
   fi
-  ok "Teardown clean — no orphan resources for $SLUG (${elapsed}s)"
+  local aws_leak_rc=0
+  e2e_verify_no_ec2_leaks_for_slug "$SLUG" || aws_leak_rc=$?
+  if [ "$aws_leak_rc" != "0" ]; then
+    case "$aws_leak_rc" in
+      2) exit 2 ;;
+      *) exit 4 ;;
+    esac
+  fi
+  ok "Teardown clean — no orphan org or EC2 resources for $SLUG (${elapsed}s)"
 
   # Normalize unexpected upstream exit codes to 1 (generic failure). The
   # script's documented contract (header "Exit codes" section) only emits
@@ -331,6 +366,75 @@ tenant_call() {
     "$@"
 }
 
+sanitize_http_body() {
+  python3 -c '
+import re, sys
+s = sys.stdin.read()
+s = re.sub(r"(?i)(Authorization:\s*Bearer\s+)[A-Za-z0-9._~+/=-]+", r"\1[redacted]", s)
+s = re.sub(r"(?i)(\"(?:auth_token|access_token|refresh_token|token|api_key|secret|password)\"\s*:\s*\")[^\"]+\"", r"\1[redacted]\"", s)
+s = re.sub(r"(?i)((?:auth_token|access_token|refresh_token|api_key|secret|password)=)[^&\s]+", r"\1[redacted]", s)
+print(s[:4000])
+'
+}
+
+wait_workspaces_online_routable() {
+  local label="$1"; shift
+  local deadline=$(( $(date +%s) + WORKSPACE_ONLINE_TIMEOUT_SECS ))
+  local wid ws_last_status ws_last_url ws_url_missing_logged ws_failed_logged
+  local ws_json ws_status ws_url ws_last_err
+
+  log "$label"
+  for wid in "$@"; do
+    ws_last_status=""
+    ws_last_url=""
+    ws_url_missing_logged=0
+    ws_failed_logged=0
+    while true; do
+      if [ "$(date +%s)" -gt "$deadline" ]; then
+        ws_last_err=$(tenant_call GET "/workspaces/$wid" 2>/dev/null | \
+          python3 -c "import json,sys; print(json.load(sys.stdin).get('last_sample_error',''))" 2>/dev/null || echo "")
+        fail "Workspace $wid never reached online with a routable URL within ${WORKSPACE_ONLINE_TIMEOUT_SECS}s (~$((WORKSPACE_ONLINE_TIMEOUT_SECS/60)) min) (last status=$ws_last_status, url=$ws_last_url, err=$ws_last_err)"
+      fi
+      ws_json=$(tenant_call GET "/workspaces/$wid" 2>/dev/null || echo '{}')
+      ws_status=$(echo "$ws_json" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status') or '')" 2>/dev/null)
+      ws_url=$(echo "$ws_json" | python3 -c "import json,sys; print(json.load(sys.stdin).get('url') or '')" 2>/dev/null)
+      if [ "$ws_status" != "$ws_last_status" ]; then
+        log "    $wid → $ws_status"
+        ws_last_status="$ws_status"
+      fi
+      if [ -n "$ws_url" ] && [ "$ws_url" != "$ws_last_url" ]; then
+        log "    $wid url ready: $ws_url"
+        ws_last_url="$ws_url"
+      fi
+      case "$ws_status" in
+        online)
+          if [ -n "$ws_url" ]; then
+            break
+          fi
+          if [ "$ws_url_missing_logged" = "0" ]; then
+            log "    $wid online but URL is not assigned yet — waiting for workspace routing readiness"
+            ws_url_missing_logged=1
+          fi
+          sleep 10
+          ;;
+        failed)
+          # Not a hard fail — bootstrap-watcher frequently marks failed at
+          # 5 min on hermes, then heartbeat recovers to online around 10-13
+          # min when install.sh finishes. Log once per workspace so the CI
+          # output isn't spammy.
+          if [ "$ws_failed_logged" = "0" ]; then
+            log "    $wid transiently failed — waiting for heartbeat recovery (bootstrap-watcher deadline, see cp#245)"
+            ws_failed_logged=1
+          fi
+          sleep 10
+          ;;
+        *)      sleep 10 ;;
+      esac
+    done
+    ok "    $wid online and routable"
+  done
+}
+
 # ─── 5. Provision parent workspace ─────────────────────────────────────
 # Inject the LLM provider key so the runtime can authenticate at boot.
 # Branch by which secret is set so the script supports multiple paths
@@ -354,9 +458,9 @@ tenant_call() {
 #     who already have an Anthropic API key for their own Claude
 #     Code session. Pricier per-token than MiniMax but billing is
 #     still independent of MOLECULE_STAGING_OPENAI_API_KEY. Pinned to the
-#     claude-code runtime — hermes/langgraph use OpenAI-shaped envs.
+#     claude-code runtime — hermes/codex/openclaw use OpenAI-shaped envs.
 #
-#   E2E_OPENAI_API_KEY → langgraph + hermes paths. Kept as fallback
+#   E2E_OPENAI_API_KEY → hermes/codex/openclaw paths. Kept as fallback
 #     for operator dispatches that explicitly want to exercise the
 #     OpenAI path. The HERMES_* fields pin hermes-agent's bridge to
 #     api.openai.com (template-hermes' derive-provider.sh otherwise
@@ -382,10 +486,10 @@ elif [ -n "${E2E_ANTHROPIC_API_KEY:-}" ]; then
   # account just for E2E. Pricier per-token than MiniMax but billing
   # is still independent of MOLECULE_STAGING_OPENAI_API_KEY, so an OpenAI
   # quota collapse doesn't wedge this path. Pinned to the claude-code
-  # runtime: hermes/langgraph use OpenAI-shaped envs and won't honour
-  # ANTHROPIC_API_KEY without further wiring (out of scope for this
-  # branch; if you need a hermes/Anthropic path, dispatch with
-  # E2E_RUNTIME=hermes + E2E_OPENAI_API_KEY pointing at a working key).
+  # runtime: hermes/codex/openclaw use OpenAI-shaped envs and won't honour
+  # ANTHROPIC_API_KEY without further wiring. pick_model_slug maps this
+  # branch to claude-sonnet-4-6 so the claude-code provider registry
+  # selects anthropic-api instead of the OAuth-only sonnet alias.
   SECRETS_JSON=$(python3 -c "
 import json, os
 k = os.environ['E2E_ANTHROPIC_API_KEY']
@@ -410,6 +514,7 @@ print(json.dumps({
 fi
 
 MODEL_SLUG=$(pick_model_slug "$RUNTIME")
+log "    MODEL_SLUG=$MODEL_SLUG"
 
 log "5/11 Provisioning parent workspace (runtime=$RUNTIME)..."
 PARENT_RESP=$(tenant_call POST /workspaces \
@@ -437,48 +542,84 @@ fi
 # deadline fires at 5 min and sets status=failed prematurely; heartbeat
 # then transitions failed → online after install.sh finishes. So:
 #
-#   - 20 min deadline (hermes worst-case + slack)
+#   - ${WORKSPACE_ONLINE_TIMEOUT_SECS}s (~$((WORKSPACE_ONLINE_TIMEOUT_SECS/60)) min)
+#     deadline (hermes worst-case + slack). Configurable via
+#     E2E_WORKSPACE_ONLINE_TIMEOUT_SECS (#1646).
 #   - 'failed' is a TRANSIENT state we must tolerate — log and keep
 #     polling, only hard-fail at the deadline. Pre-bootstrap-watcher-fix
 #     (controlplane#245) this was a flake generator: workspace went
 #     failed→online inside our window but we bailed at the failed read.
-log "7/11 Waiting for workspace(s) to reach status=online (up to 30 min — hermes cold boot)..."
-WS_DEADLINE=$(( $(date +%s) + 1800 ))
-WS_TO_CHECK="$PARENT_ID"
-[ -n "$CHILD_ID" ] && WS_TO_CHECK="$WS_TO_CHECK $CHILD_ID"
-for wid in $WS_TO_CHECK; do
-  WS_LAST_STATUS=""
-  WS_FAILED_LOGGED=0
-  while true; do
-    if [ "$(date +%s)" -gt "$WS_DEADLINE" ]; then
-      WS_LAST_ERR=$(tenant_call GET "/workspaces/$wid" 2>/dev/null | \
-        python3 -c "import json,sys; print(json.load(sys.stdin).get('last_sample_error',''))" 2>/dev/null || echo "")
-      fail "Workspace $wid never reached online within 20 min (last status=$WS_LAST_STATUS, err=$WS_LAST_ERR)"
-    fi
-    WS_JSON=$(tenant_call GET "/workspaces/$wid" 2>/dev/null || echo '{}')
-    WS_STATUS=$(echo "$WS_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))" 2>/dev/null)
-    if [ "$WS_STATUS" != "$WS_LAST_STATUS" ]; then
-      log "    $wid → $WS_STATUS"
-      WS_LAST_STATUS="$WS_STATUS"
-    fi
-    case "$WS_STATUS" in
-      online) break ;;
-      failed)
-        # Not a hard fail — bootstrap-watcher frequently marks failed at
-        # 5 min on hermes, then heartbeat recovers to online around 10-13
-        # min when install.sh finishes. Log once per workspace so the CI
-        # output isn't spammy.
-        if [ "$WS_FAILED_LOGGED" = "0" ]; then
-          log "    $wid transiently failed — waiting for heartbeat recovery (bootstrap-watcher deadline, see cp#245)"
-          WS_FAILED_LOGGED=1
-        fi
-        sleep 10
-        ;;
-      *)      sleep 10 ;;
-    esac
-  done
-  ok "    $wid online"
+WS_TO_CHECK=("$PARENT_ID")
+[ -n "$CHILD_ID" ] && WS_TO_CHECK+=("$CHILD_ID")
+wait_workspaces_online_routable "7/11 Waiting for workspace(s) to reach status=online (up to $((WORKSPACE_ONLINE_TIMEOUT_SECS/60)) min — hermes cold boot)..." "${WS_TO_CHECK[@]}"
+
+# ─── 7a. Real chat image upload/download round-trip ───────────────────
+# This deliberately uses the production workflow: tenant admin/session auth
+# uploads an image through the same /chat/uploads path the canvas uses. The
+# byte-for-byte download check proves the platform delivered image bytes, not
+# just metadata/name plumbing.
+log "7a/11 Real image upload/download round-trip..."
+PNG_FIXTURE=$(e2e_tmp /tmp/molecule-e2e-image.XXXXXX.png)
+printf '%s' 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAFgwJ/lCqT+wAAAABJRU5ErkJggg==' | base64 -d > "$PNG_FIXTURE"
+PNG_SHA=$(sha256sum "$PNG_FIXTURE" | awk '{print $1}')
+for wid in "${WS_TO_CHECK[@]}"; do
+  UP_TMP=$(e2e_tmp /tmp/e2e_upload.XXXXXX)
+  UP_CODE=$(curl "${CURL_COMMON[@]}" -X POST "$TENANT_URL/workspaces/$wid/chat/uploads" \
+    -H "Authorization: Bearer $EFFECTIVE_TENANT_TOKEN" \
+    -H "X-Molecule-Org-Id: $ORG_ID" \
+    -F "files=@$PNG_FIXTURE;filename=e2e-smoke.png;type=image/png" \
+    -o "$UP_TMP" \
+    -w '%{http_code}' \
+    2>/dev/null || echo "000")
+  if [ "$UP_CODE" != "200" ] && [ "$UP_CODE" != "201" ]; then
+    fail "Workspace $wid image upload returned $UP_CODE: $(head -c 500 "$UP_TMP" | sanitize_http_body)"
+  fi
+  UP_URI=$(python3 -c "
+import json, sys
+d=json.load(open(sys.argv[1]))
+def walk(x):
+    if isinstance(x, dict):
+        if x.get('uri'):
+            print(x['uri']); raise SystemExit
+        for v in x.values(): walk(v)
+    elif isinstance(x, list):
+        for v in x: walk(v)
+walk(d)
+" "$UP_TMP" 2>/dev/null || echo "")
+  UP_MIME=$(python3 -c "
+import json, sys
+d=json.load(open(sys.argv[1]))
+def walk(x):
+    if isinstance(x, dict) and x.get('uri'):
+        print(x.get('mimeType') or x.get('mime') or ''); raise SystemExit
+    if isinstance(x, dict):
+        for v in x.values(): walk(v)
+    elif isinstance(x, list):
+        for v in x: walk(v)
+walk(d)
+" "$UP_TMP" 2>/dev/null || echo "")
+  rm -f "$UP_TMP"
+  [ -n "$UP_URI" ] || fail "Workspace $wid upload response had no workspace URI"
+  [ "$UP_MIME" = "image/png" ] || fail "Workspace $wid upload returned mime=$UP_MIME, want image/png"
+
+  DOWNLOAD_PATH="$UP_URI"
+  case "$DOWNLOAD_PATH" in workspace:*) DOWNLOAD_PATH="${DOWNLOAD_PATH#workspace:}" ;; esac
+  DL_TMP=$(e2e_tmp /tmp/e2e_download.XXXXXX.png)
+  DL_CODE=$(curl "${CURL_COMMON[@]}" "$TENANT_URL/workspaces/$wid/chat/download?path=$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=""))' "$DOWNLOAD_PATH")" \
+    -H "Authorization: Bearer $EFFECTIVE_TENANT_TOKEN" \
+    -H "X-Molecule-Org-Id: $ORG_ID" \
+    -o "$DL_TMP" \
+    -w '%{http_code}' \
+    2>/dev/null || echo "000")
+  if [ "$DL_CODE" != "200" ]; then
+    fail "Workspace $wid image download returned $DL_CODE: $(head -c 300 "$DL_TMP" | sanitize_http_body)"
+  fi
+  DL_SHA=$(sha256sum "$DL_TMP" | awk '{print $1}')
+  rm -f "$DL_TMP"
+  [ "$DL_SHA" = "$PNG_SHA" ] || fail "Workspace $wid image download SHA mismatch: upload=$PNG_SHA download=$DL_SHA"
+  ok "    $wid image upload/download OK ($UP_MIME, sha256=$DL_SHA)"
 done
+rm -f "$PNG_FIXTURE"
 
 # ─── 7b. Canvas-terminal diagnose (EIC chain probe) ────────────────────
 # This step exists because the canvas-terminal failure of 2026-05-03
@@ -490,7 +631,7 @@ done
 #   - tenantIngressRules / workspaceIngressRules (CP)
 #   - eicSSHIngressRule helper (CP)
 #   - AuthorizeIngress source-group support (CP awsapi)
-#   - EIC_ENDPOINT_SG_ID Railway env
+#   - MOLECULE_EIC_ENDPOINT_SG_ID Railway env
 #   - handleRemoteConnect's send-ssh-public-key/open-tunnel/ssh chain
 # surfaces within ~20 min of merge instead of waiting for a user report.
 #
@@ -504,7 +645,7 @@ done
 # probes docker.Ping + container exec; we still expect ok=true there
 # since local-docker is the alternative production path.
 log "7b/11 Canvas-terminal EIC diagnose probe..."
-for wid in $WS_TO_CHECK; do
+for wid in "${WS_TO_CHECK[@]}"; do
   DIAG_JSON=$(tenant_call GET "/workspaces/$wid/terminal/diagnose" 2>/dev/null || echo '{}')
   DIAG_OK=$(echo "$DIAG_JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); print('true' if d.get('ok') else 'false')" 2>/dev/null || echo "false")
   if [ "$DIAG_OK" = "true" ]; then
@@ -512,7 +653,7 @@ for wid in $WS_TO_CHECK; do
   else
     DIAG_FAIL=$(echo "$DIAG_JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('first_failure','unknown'))" 2>/dev/null || echo "unknown")
     DIAG_DETAIL=$(echo "$DIAG_JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); s=[x for x in d.get('steps',[]) if not x.get('ok')]; step=s[0] if s else {}; print(' — '.join(x for x in [step.get('error',''), step.get('detail','')] if x))" 2>/dev/null || echo "")
-    fail "Workspace $wid terminal diagnose failed at step '$DIAG_FAIL': $DIAG_DETAIL — check tenant SG has tcp/22 from EIC endpoint SG (sg-0785d5c6138220523), EIC_ENDPOINT_SG_ID set in Railway, and EIC endpoint health"
+    fail "Workspace $wid terminal diagnose failed at step '$DIAG_FAIL': $DIAG_DETAIL — check tenant SG has tcp/22 from the configured EIC endpoint SG, MOLECULE_EIC_ENDPOINT_SG_ID is set in Railway, and EIC endpoint health"
   fi
 done
 
@@ -540,7 +681,7 @@ CONFIG_PAYLOAD="${CONFIG_MARKER}
 name: synth-canary
 runtime: ${RUNTIME}
 "
-for wid in $WS_TO_CHECK; do
+for wid in "${WS_TO_CHECK[@]}"; do
   PUT_BODY=$(python3 -c "import json,sys; print(json.dumps({'content': sys.stdin.read()}))" <<< "$CONFIG_PAYLOAD")
   # Capture body to a tempfile so curl's -w '%{http_code}' is the only
   # thing on stdout. The first version used `-w '\n%{http_code}\n'` and
@@ -572,6 +713,12 @@ for wid in $WS_TO_CHECK; do
   # paths are unified, restore the GET-back marker check here.
   ok "    $wid config.yaml PUT OK (HTTP $PUT_CODE)"
 done
+
+# Saving config.yaml follows the same path as Canvas Config Save & Restart.
+# The controlplane can briefly put the workspace back into provisioning and
+# clear its route while the runtime restarts, so A2A must wait on the same
+# externally routable readiness boundary again.
+wait_workspaces_online_routable "7d/11 Waiting for workspace(s) to recover routing after config.yaml PUT..." "${WS_TO_CHECK[@]}"
 
 # ─── 8. A2A round-trip on parent ───────────────────────────────────────
 log "8/11 Sending A2A message to parent — expecting agent response..."
@@ -612,10 +759,44 @@ print(json.dumps({
 # 90s gives ~3x headroom over observed cold-call P95 (~25-30s).
 # Subsequent A2A turns hit the same workspace and are sub-second, so
 # this only widens the window for step 8/11 of the canary's first turn.
-A2A_RESP=$(tenant_call POST "/workspaces/$PARENT_ID/a2a" \
-  --max-time 90 \
-  -H "Content-Type: application/json" \
-  -d "$A2A_PAYLOAD")
+A2A_TMP=$(mktemp -t synth_a2a.XXXXXX)
+for A2A_ATTEMPT in $(seq 1 12); do
+  : >"$A2A_TMP"
+  set +e
+  A2A_CODE=$(tenant_call POST "/workspaces/$PARENT_ID/a2a" \
+    --max-time 90 \
+    -H "Content-Type: application/json" \
+    -d "$A2A_PAYLOAD" \
+    -o "$A2A_TMP" \
+    -w '%{http_code}' \
+    2>/dev/null)
+  A2A_RC=$?
+  set -e
+  A2A_CODE=${A2A_CODE:-000}
+  A2A_RESP=$(cat "$A2A_TMP" 2>/dev/null || echo "")
+  if [ "$A2A_RC" = "0" ] && [ "$A2A_CODE" -ge 200 ] && [ "$A2A_CODE" -lt 300 ]; then
+    break
+  fi
+
+  A2A_SAFE_BODY=$(printf '%s' "$A2A_RESP" | sanitize_http_body)
+  if echo "$A2A_CODE" | grep -Eq '^(502|503|504)$' && echo "$A2A_SAFE_BODY" | grep -Eqi 'Service Unavailable|Bad Gateway|Gateway Timeout|error code: 502|error code: 504|workspace agent unreachable|connection refused|no healthy upstream|workspace agent busy|native_session'; then
+    log "    A2A cold-start probe attempt $A2A_ATTEMPT/12 returned $A2A_CODE: $A2A_SAFE_BODY"
+    if [ "$A2A_ATTEMPT" -lt 12 ]; then
+      A2A_SLEEP=10
+      if echo "$A2A_SAFE_BODY" | grep -Eqi 'workspace agent busy|native_session'; then
+        A2A_SLEEP=30
+      fi
+      sleep "$A2A_SLEEP"
+      continue
+    fi
+  fi
+  break
+done
+rm -f "$A2A_TMP"
+if [ "$A2A_RC" != "0" ] || [ "$A2A_CODE" -lt 200 ] || [ "$A2A_CODE" -ge 300 ]; then
+  A2A_SAFE_BODY=$(printf '%s' "$A2A_RESP" | sanitize_http_body)
+  fail "A2A POST /workspaces/$PARENT_ID/a2a failed after $A2A_ATTEMPT attempt(s) (curl_rc=$A2A_RC, http=$A2A_CODE): $A2A_SAFE_BODY"
+fi
 AGENT_TEXT=$(echo "$A2A_RESP" | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
@@ -812,20 +993,50 @@ print(json.dumps({
     }
 }))
 ")
-  set +e
-  # Raw curl (not tenant_call) because this call carries an extra
-  # X-Source-Workspace-Id header. Must still send X-Molecule-Org-Id
-  # or TenantGuard 404s — previously missing, caused section 10 to
-  # fail rc=22 despite everything upstream being correct (2026-04-21).
-  DELEG_RESP=$(curl "${CURL_COMMON[@]}" -X POST "$TENANT_URL/workspaces/$CHILD_ID/a2a" \
-    -H "Authorization: Bearer $EFFECTIVE_TENANT_TOKEN" \
-    -H "X-Molecule-Org-Id: $ORG_ID" \
-    -H "X-Source-Workspace-Id: $PARENT_ID" \
-    -H "Content-Type: application/json" \
-    -d "$DELEG_PAYLOAD")
-  DELEG_RC=$?
-  set -e
-  [ $DELEG_RC -ne 0 ] && fail "Delegation A2A POST failed (rc=$DELEG_RC)"
+  DELEG_TMP=$(mktemp -t deleg_a2a.XXXXXX)
+  for DELEG_ATTEMPT in $(seq 1 12); do
+    : >"$DELEG_TMP"
+    set +e
+    # Raw curl (not tenant_call) because this call carries an extra
+    # X-Source-Workspace-Id header. Must still send X-Molecule-Org-Id
+    # or TenantGuard 404s — previously missing, caused section 10 to
+    # fail rc=22 despite everything upstream being correct (2026-04-21).
+    DELEG_CODE=$(curl "${CURL_COMMON[@]}" -X POST "$TENANT_URL/workspaces/$CHILD_ID/a2a" \
+      -H "Authorization: Bearer $EFFECTIVE_TENANT_TOKEN" \
+      -H "X-Molecule-Org-Id: $ORG_ID" \
+      -H "X-Source-Workspace-Id: $PARENT_ID" \
+      -H "Content-Type: application/json" \
+      -d "$DELEG_PAYLOAD" \
+      -o "$DELEG_TMP" \
+      -w '%{http_code}' \
+      2>/dev/null)
+    DELEG_RC=$?
+    set -e
+    DELEG_CODE=${DELEG_CODE:-000}
+    DELEG_RESP=$(cat "$DELEG_TMP" 2>/dev/null || echo "")
+    if [ "$DELEG_RC" = "0" ] && [ "$DELEG_CODE" -ge 200 ] && [ "$DELEG_CODE" -lt 300 ]; then
+      break
+    fi
+
+    DELEG_SAFE_BODY=$(printf '%s' "$DELEG_RESP" | sanitize_http_body)
+    if echo "$DELEG_CODE" | grep -Eq '^(502|503|504)$' && echo "$DELEG_SAFE_BODY" | grep -Eqi 'Service Unavailable|Bad Gateway|Gateway Timeout|error code: 502|error code: 504|workspace agent unreachable|connection refused|no healthy upstream|workspace agent busy|native_session'; then
+      log "    Delegation A2A cold-start attempt $DELEG_ATTEMPT/12 returned $DELEG_CODE: $DELEG_SAFE_BODY"
+      if [ "$DELEG_ATTEMPT" -lt 12 ]; then
+        DELEG_SLEEP=10
+        if echo "$DELEG_SAFE_BODY" | grep -Eqi 'workspace agent busy|native_session'; then
+          DELEG_SLEEP=30
+        fi
+        sleep "$DELEG_SLEEP"
+        continue
+      fi
+    fi
+    break
+  done
+  rm -f "$DELEG_TMP"
+  if [ "$DELEG_RC" != "0" ] || [ "$DELEG_CODE" -lt 200 ] || [ "$DELEG_CODE" -ge 300 ]; then
+    DELEG_SAFE_BODY=$(printf '%s' "$DELEG_RESP" | sanitize_http_body)
+    fail "Delegation A2A POST failed after $DELEG_ATTEMPT attempt(s) (curl_rc=$DELEG_RC, http=$DELEG_CODE): $DELEG_SAFE_BODY"
+  fi
   DELEG_TEXT=$(echo "$DELEG_RESP" | python3 -c "
 import json, sys
 try:

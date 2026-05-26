@@ -11,18 +11,25 @@ import (
 
 	"github.com/DATA-DOG/go-sqlmock"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/memory/contract"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/memory/contract"
 )
 
 // --- marshalMetadata corner cases ---
 
 func TestMarshalMetadata_Nil(t *testing.T) {
+	// Post-fix (2026-05-24): nil input must return the JSON literal
+	// `null` (4 bytes), NOT Go nil. Returning Go nil made lib/pq send
+	// a bytea NULL parameter that PostgreSQL refused to implicitly
+	// cast into the target jsonb column, breaking every UpsertNamespace
+	// and CommitMemory call with `pq: invalid input syntax for type
+	// json`. The Phase A2 backfill exposed it (production saw every
+	// POST /memories return 500 immediately post-tenant-recycle).
 	got, err := marshalMetadata(nil)
 	if err != nil {
 		t.Errorf("err = %v", err)
 	}
-	if got != nil {
-		t.Errorf("got = %v, want nil", got)
+	if string(got) != "null" {
+		t.Errorf("got = %q (%v), want %q", string(got), got, "null")
 	}
 }
 

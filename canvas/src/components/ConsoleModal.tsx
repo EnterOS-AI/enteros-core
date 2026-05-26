@@ -128,7 +128,7 @@ export function ConsoleModal({ workspaceId, workspaceName, open, onClose }: Prop
 
         <div className="flex-1 overflow-auto bg-black/80 p-4">
           {loading && (
-            <div className="text-[12px] text-ink-mid" data-testid="console-loading">
+            <div role="status" aria-live="polite" className="text-[12px] text-ink-mid" data-testid="console-loading">
               Loading console output…
             </div>
           )}

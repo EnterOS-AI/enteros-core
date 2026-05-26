@@ -119,7 +119,10 @@ func (l *LarkAdapter) SendMessage(ctx context.Context, config map[string]interfa
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		return fmt.Errorf("lark: read response body: %w", readErr)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("lark: webhook returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}

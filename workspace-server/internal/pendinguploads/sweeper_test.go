@@ -10,8 +10,8 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/metrics"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/pendinguploads"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/metrics"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/pendinguploads"
 )
 
 // fakeSweepStorage is a minimal Storage that records every Sweep call

@@ -27,7 +27,7 @@ of the following:
 
 | Endpoint | Impact |
 |----------|--------|
-| `GET /admin/workspaces/:id/test-token` | Mint a fresh bearer token for any workspace |
+| `POST /admin/workspaces/:id/tokens` | Mint a fresh real bearer token for any workspace |
 | `DELETE /workspaces/:id` | Delete any workspace and auto-revoke its tokens |
 | `PUT /settings/secrets` / `POST /admin/secrets` | Overwrite any global secret (env-poisons every agent on restart) |
 | `DELETE /settings/secrets/:key` / `DELETE /admin/secrets/:key` | Delete any global secret; same fan-out restart |
@@ -68,8 +68,9 @@ malicious workspace with a pre-configured `initial_prompt` and elevated secrets.
 - **`ValidateAnyToken` removed-workspace JOIN** — tokens belonging to deleted
   workspaces are filtered at the DB layer (PR #682 defense-in-depth) so
   post-deletion token replay is blocked.
-- **`MOLECULE_ENV=production` gate** — hides the `/admin/workspaces/:id/test-token`
-  endpoint in production deployments unless `MOLECULE_ENABLE_TEST_TOKENS=1`.
+- **Production token mint route** — production and staging automation use
+  `POST /admin/workspaces/:id/tokens`; development-only shortcuts are not part
+  of the production contract.
 
 ## Phase-H remediation plan
 

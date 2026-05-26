@@ -10,8 +10,8 @@ import (
 
 	"github.com/DATA-DOG/go-sqlmock"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/memory/contract"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/memory/namespace"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/memory/contract"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/memory/namespace"
 )
 
 // --- scopeToWritableNamespace ---
@@ -512,41 +512,38 @@ func TestToolRecallMemory_RoutesThroughV2WhenWired(t *testing.T) {
 	}
 }
 
-func TestToolCommitMemory_FallsThroughToLegacyWhenV2Unwired(t *testing.T) {
-	// V2 NOT wired (no withMemoryV2APIs call). Should hit the legacy
-	// SQL path and write to agent_memories directly.
-	db, mock, _ := sqlmock.New()
+// Issue #1733: v2 is the only path; commit/recall return a clear error
+// (not a silent SQL fallback) when MEMORY_PLUGIN_URL is unset.
+
+func TestToolCommitMemory_ErrorsWhenV2Unwired(t *testing.T) {
+	db, _, _ := sqlmock.New()
 	defer db.Close()
-	mock.ExpectExec("INSERT INTO agent_memories").
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	h := &MCPHandler{database: db}
+	h := &MCPHandler{database: db} // no withMemoryV2APIs → memv2 nil
 
 	_, err := h.toolCommitMemory(context.Background(), "root-1", map[string]interface{}{
 		"content": "x",
 		"scope":   "LOCAL",
 	})
-	if err != nil {
-		t.Fatalf("err: %v", err)
+	if err == nil {
+		t.Fatal("expected error when v2 unwired, got nil")
 	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("legacy SQL path not exercised: %v", err)
+	if !strings.Contains(err.Error(), "MEMORY_PLUGIN_URL") {
+		t.Errorf("error must hint at MEMORY_PLUGIN_URL: %v", err)
 	}
 }
 
-func TestToolRecallMemory_FallsThroughToLegacyWhenV2Unwired(t *testing.T) {
-	db, mock, _ := sqlmock.New()
+func TestToolRecallMemory_ErrorsWhenV2Unwired(t *testing.T) {
+	db, _, _ := sqlmock.New()
 	defer db.Close()
-	mock.ExpectQuery("SELECT id, content, scope, created_at").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "content", "scope", "created_at"}))
 	h := &MCPHandler{database: db}
 
 	_, err := h.toolRecallMemory(context.Background(), "root-1", map[string]interface{}{
 		"scope": "LOCAL",
 	})
-	if err != nil {
-		t.Fatalf("err: %v", err)
+	if err == nil {
+		t.Fatal("expected error when v2 unwired, got nil")
 	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("legacy SQL path not exercised: %v", err)
+	if !strings.Contains(err.Error(), "MEMORY_PLUGIN_URL") {
+		t.Errorf("error must hint at MEMORY_PLUGIN_URL: %v", err)
 	}
 }

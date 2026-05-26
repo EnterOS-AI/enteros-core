@@ -106,7 +106,7 @@ jobs:
               [[ "$file" == *_test.go ]] && continue
               [[ "$file" == *"$path"* ]] || continue
               awk "BEGIN{exit !(\$pct < 10)}" || continue
-              rel=$(echo "$file" | sed 's|^github.com/molecule-ai/molecule-monorepo/platform/workspace-server/||; s|^github.com/molecule-ai/molecule-monorepo/platform/||')
+              rel=$(echo "$file" | sed 's|^git.moleculesai.app/molecule-ai/molecule-core/workspace-server/workspace-server/||; s|^git.moleculesai.app/molecule-ai/molecule-core/workspace-server/||')
               if echo "$ALLOWLIST" | grep -qxF "$rel"; then
                 continue
               fi

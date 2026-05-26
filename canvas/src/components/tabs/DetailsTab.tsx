@@ -93,7 +93,9 @@ export function DetailsTab({ workspaceId, data }: Props) {
   const handleDelete = async () => {
     setDeleteError(null);
     try {
-      await api.del(`/workspaces/${workspaceId}?confirm=true`);
+      await api.del(`/workspaces/${workspaceId}?confirm=true`, {
+        headers: { "X-Confirm-Name": name },
+      });
       // Mirror the server-side cascade — drop the row + every
       // descendant locally so the canvas reflects the deletion
       // immediately, even when the WS is dead and the per-descendant
@@ -157,7 +159,7 @@ export function DetailsTab({ workspaceId, data }: Props) {
               </select>
             </Field>
             {saveError && (
-              <div className="px-3 py-1.5 bg-red-900/30 border border-red-800 rounded text-xs text-bad">
+              <div role="alert" aria-live="assertive" className="px-3 py-1.5 bg-red-900/30 border border-red-800 rounded text-xs text-bad">
                 {saveError}
               </div>
             )}
@@ -203,7 +205,7 @@ export function DetailsTab({ workspaceId, data }: Props) {
             {isRestartable && (
               <div className="pt-2">
                 {restartError && (
-                  <div className="mb-2 px-3 py-1.5 bg-red-900/30 border border-red-800 rounded text-xs text-bad">
+                  <div role="alert" aria-live="assertive" className="mb-2 px-3 py-1.5 bg-red-900/30 border border-red-800 rounded text-xs text-bad">
                     {restartError}
                   </div>
                 )}
@@ -307,7 +309,7 @@ export function DetailsTab({ workspaceId, data }: Props) {
       {/* Delete */}
       <Section title="Danger Zone">
         {deleteError && (
-          <div className="mb-2 px-3 py-1.5 bg-red-900/30 border border-red-800 rounded text-xs text-bad">
+          <div role="alert" aria-live="assertive" className="mb-2 px-3 py-1.5 bg-red-900/30 border border-red-800 rounded text-xs text-bad">
             {deleteError}
           </div>
         )}

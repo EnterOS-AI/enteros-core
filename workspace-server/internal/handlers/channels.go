@@ -17,8 +17,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/channels"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/channels"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 )
 
 // ChannelHandler manages workspace social channel integrations.
@@ -103,6 +103,9 @@ func (h *ChannelHandler) List(c *gin.Context) {
 			entry["last_message_at"] = lastMsg.Time
 		}
 		result = append(result, entry)
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("Channels: list rows.Err: %v", err)
 	}
 
 	c.JSON(http.StatusOK, result)
@@ -514,6 +517,9 @@ func (h *ChannelHandler) Webhook(c *gin.Context) {
 			candidates = append(candidates, row)
 		}
 	}
+	if err := rows.Err(); err != nil {
+		log.Printf("Channels: telegram webhook rows.Err: %v", err)
+	}
 
 	if targetSlug != "" {
 		// [slug] routing — match against config username (lowercased)
@@ -556,13 +562,16 @@ func (h *ChannelHandler) Webhook(c *gin.Context) {
 		return
 	}
 
-	// Process asynchronously — don't block the webhook response
-	go func() {
+	// Process asynchronously — don't block the webhook response.
+	// RFC internal#524 Layer 1: globalGoAsync — HandleInbound traverses
+	// db.DB to resolve workspace + record the channel event; drained by
+	// drainTestAsync before db.DB swap.
+	globalGoAsync(func() {
 		bgCtx := context.Background()
 		if err := h.manager.HandleInbound(bgCtx, ch, msg); err != nil {
 			log.Printf("Channels: async HandleInbound error for workspace %s: %v", ch.WorkspaceID[:12], err)
 		}
-	}()
+	})
 
 	c.JSON(http.StatusOK, gin.H{"status": "accepted"})
 }

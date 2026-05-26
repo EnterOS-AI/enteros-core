@@ -57,24 +57,24 @@ See `CLAUDE.md` for a full list of environment variables and their purposes.
 
 This repo is scoped to **code** (canvas, workspace, workspace-server, related
 infra). Public content (blog posts, marketing copy, OG images, SEO briefs,
-DevRel demos) lives in [`Molecule-AI/docs`](https://git.moleculesai.app/molecule-ai/docs).
+DevRel demos) lives in [`molecule-ai/docs`](https://git.moleculesai.app/molecule-ai/docs).
 The `Block forbidden paths` CI gate fails any PR that writes to `marketing/`
-or other removed paths — open against `Molecule-AI/docs` instead.
+or other removed paths — open against `molecule-ai/docs` instead.
 
 | Content type | Target |
 |---|---|
-| Blog posts | `Molecule-AI/docs` → `content/blog/<YYYY-MM-DD-slug>/` |
-| Doc pages | `Molecule-AI/docs` → `content/docs/` |
-| Marketing copy / PMM positioning | `Molecule-AI/docs` → `marketing/` |
-| OG images, visual assets | `Molecule-AI/docs` → `app/` or `marketing/` |
-| SEO briefs | `Molecule-AI/docs` → `marketing/` |
-| DevRel demos (runnable code) | Standalone repo under `Molecule-AI/`, OR embedded in `Molecule-AI/docs` |
-| Launch checklists, internal tracking | GitHub Issues — **not** committed files |
+| Blog posts | `molecule-ai/docs` → `content/blog/<YYYY-MM-DD-slug>/` |
+| Doc pages | `molecule-ai/docs` → `content/docs/` |
+| Marketing copy / PMM positioning | `molecule-ai/docs` → `marketing/` |
+| OG images, visual assets | `molecule-ai/docs` → `app/` or `marketing/` |
+| SEO briefs | `molecule-ai/docs` → `marketing/` |
+| DevRel demos (runnable code) | Standalone repo under `molecule-ai/`, OR embedded in `molecule-ai/docs` |
+| Launch checklists, internal tracking | Gitea Issues — **not** committed files |
 | Engineering docs (`docs/adr/`, `docs/architecture/`, `docs/incidents/`) | This repo (internal, not published) |
 | Live product pages (e.g. `canvas/src/app/pricing/page.tsx`) | This repo (these are app code, not marketing copy) |
 
 If a PR fails the `Block forbidden paths` check, the contents belong in
-`Molecule-AI/docs`. No CI drag, no Canvas E2E, content lands in minutes.
+`molecule-ai/docs`. No CI drag, no Canvas E2E, content lands in minutes.
 
 ## Development Workflow
 
@@ -106,7 +106,7 @@ causing a render loop when any node position changed.
 
 #### Auto-merge & the "extra commit" trap
 
-**Two system guards protect against pushing commits after auto-merge has been enabled.** Don't try to work around them — they exist because we shipped a half-merged PR on 2026-04-27 (`#2174` merged with only its first commit; the second was orphaned on a branch GitHub had already deleted).
+**Two system guards protect against pushing commits after auto-merge has been enabled.** Don't try to work around them — they exist because we shipped a half-merged PR on 2026-04-27 (`#2174` merged with only its first commit; the second was orphaned on a branch the host had already deleted).
 
 1. **Repo-wide:** "Automatically delete head branches" is on. Once a PR merges, the branch is deleted server-side. Any subsequent `git push` to that branch fails with `remote rejected — no such branch`.
 
@@ -127,7 +127,11 @@ cd workspace-server && go test -race ./...
 cd canvas && npm test
 
 # Workspace runtime (Python)
-cd workspace && python -m pytest -v
+# Runtime code is SSOT in molecule-ai-workspace-runtime, not molecule-core/workspace.
+cd ../molecule-ai-workspace-runtime
+python -m venv .venv && source .venv/bin/activate
+pip install --index-url https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/ -e . pytest pytest-asyncio
+pytest -q
 
 # E2E API tests (requires running platform)
 bash tests/e2e/test_api.sh
@@ -145,7 +149,7 @@ Fix violations before committing — the hook will reject the commit.
 
 ### CI Pipeline
 
-CI runs on GitHub Actions with a self-hosted runner. External contributors:
+CI runs on Gitea Actions with self-hosted runners. External contributors:
 PRs from forks will not trigger CI automatically. A maintainer will review
 and run CI manually.
 
@@ -158,6 +162,19 @@ and run CI manually.
 | shellcheck | Shell script linting |
 | review-check-tests | `review-check.sh` evaluator regression suite (13 scenarios) |
 | ops-scripts | Python unittest suite for `scripts/*.py` |
+
+### Workspace runtime SSOT
+
+Runtime code lives in
+[`molecule-ai-workspace-runtime`](https://git.moleculesai.app/molecule-ai/molecule-ai-workspace-runtime).
+Do not reintroduce `molecule-core/workspace/` or vendored `molecule_runtime/`
+copies in consumers. Core and templates consume the published runtime package
+from the Gitea package registry.
+
+For local external MCP agents, multi-workspace config is
+`MOLECULE_WORKSPACES=[{"id":"...","token":"...","platform_url":"..."}]`.
+`platform_url` selects the tenant; `org_id` is not part of this config.
+Workspace IDs can differ across orgs.
 
 ## Local Testing
 
@@ -190,9 +207,9 @@ Runs the full regression suite against a fixture HTTP server. No network access 
 Code in this repo lands in molecule-core. Some related runtime artifacts
 live in their own repos:
 
-- [`Molecule-AI/molecule-ai-workspace-runtime`](https://git.moleculesai.app/molecule-ai/molecule-ai-workspace-runtime) — Python adapter SDK (`molecule_runtime`) that runs inside containerized Molecule workspaces. Bridges Claude Code SDK / hermes / langgraph / etc. → A2A queue.
-- [`Molecule-AI/molecule-sdk-python`](https://git.moleculesai.app/molecule-ai/molecule-sdk-python) — `A2AServer` + `RemoteAgentClient` for external agents that register over the public `/registry/register` flow.
-- [`molecule-ai/molecule-mcp-claude-channel`](https://git.moleculesai.app/molecule-ai/molecule-mcp-claude-channel) — Claude Code channel plugin. Bridges A2A traffic into a running Claude Code session via MCP `notifications/claude/channel`. Polling-based (no tunnel required); install via the marketplace flow: `claude plugin marketplace add https://git.moleculesai.app/molecule-ai/molecule-mcp-claude-channel.git` then `claude plugin install molecule@molecule-channel`. (The old `claude --channels plugin:molecule@Molecule-AI/…` one-liner is dead — `--channels` is not a real flag and the GitHub `Molecule-AI` org was suspended 2026-05-06; see the channel repo README for the full setup guide.)
+- [`molecule-ai/molecule-ai-workspace-runtime`](https://git.moleculesai.app/molecule-ai/molecule-ai-workspace-runtime) — Python adapter SDK (`molecule_runtime`) that runs inside containerized Molecule workspaces. Bridges Claude Code SDK / hermes / langgraph / etc. → A2A queue.
+- [`molecule-ai/molecule-sdk-python`](https://git.moleculesai.app/molecule-ai/molecule-sdk-python) — `A2AServer` + `RemoteAgentClient` for external agents that register over the public `/registry/register` flow.
+- [`molecule-ai/molecule-mcp-claude-channel`](https://git.moleculesai.app/molecule-ai/molecule-mcp-claude-channel) — Claude Code channel plugin. Bridges A2A traffic into a running Claude Code session via MCP `notifications/claude/channel`. Polling-based (no tunnel required); install inside Claude Code via `/plugin marketplace add https://git.moleculesai.app/molecule-ai/molecule-mcp-claude-channel.git` → `/plugin install molecule@molecule-channel`, then launch with `claude --dangerously-load-development-channels=plugin:molecule@molecule-channel`.
 
 When extending the **A2A surface** in molecule-core (`workspace-server/internal/handlers/a2a_proxy.go` etc.), consider whether the change has a downstream impact on the runtime SDK or the channel plugin — they're versioned independently but share the wire shape.
 
@@ -206,7 +223,7 @@ See `CLAUDE.md` for detailed architecture documentation, including:
 
 ## Reporting Issues
 
-Use GitHub Issues with a clear title and reproduction steps. Include:
+Use Gitea Issues with a clear title and reproduction steps. Include:
 - What you expected
 - What actually happened
 - Platform/OS version
@@ -214,8 +231,9 @@ Use GitHub Issues with a clear title and reproduction steps. Include:
 
 ## Security
 
-If you discover a security vulnerability, please report it privately via
-GitHub Security Advisories rather than opening a public issue.
+If you discover a security vulnerability, please report it privately by
+opening an issue against `molecule-ai/internal` (a private repo only
+maintainers can see) rather than filing a public issue here.
 
 ## License
 

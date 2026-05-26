@@ -33,12 +33,14 @@ trap '[[ -n "$TMPDIR_FOR_CASE" && -d "$TMPDIR_FOR_CASE" ]] && rm -rf "$TMPDIR_FO
 
 # Build a synthetic repo at $1 with apply.sh listing $2 (one name per
 # line) as the staging required set + zero main required, then write
-# whatever .github/workflows/* files the test case adds.
+# whatever .gitea/workflows/* files the test case adds. (Pre-SSOT-4
+# this was .github/workflows; molecule-core switched to Gitea-SSOT in
+# task #331 and the script now reads from .gitea/workflows/.)
 make_fake_repo() {
   local root="$1"
   local checks="$2"
   mkdir -p "$root/tools/branch-protection"
-  mkdir -p "$root/.github/workflows"
+  mkdir -p "$root/.gitea/workflows"
   cat > "$root/tools/branch-protection/apply.sh" <<EOF
 #!/usr/bin/env bash
 # Stub apply.sh — only the heredoc-shaped check lists matter for the
@@ -54,7 +56,7 @@ EOF2
 EOF
   chmod +x "$root/tools/branch-protection/apply.sh"
   # Place the script-under-test alongside its sibling apply.sh so the
-  # script's REPO_ROOT walk finds the synthetic .github/workflows/.
+  # script's REPO_ROOT walk finds the synthetic .gitea/workflows/.
   cp "$SCRIPT_UNDER_TEST" "$root/tools/branch-protection/check_name_parity.sh"
 }
 
@@ -67,7 +69,7 @@ run_case() {
   local expected_stderr_substring="$6"
   TMPDIR_FOR_CASE=$(mktemp -d)
   make_fake_repo "$TMPDIR_FOR_CASE" "$checks"
-  printf '%s' "$workflow_yaml" > "$TMPDIR_FOR_CASE/.github/workflows/$workflow_filename"
+  printf '%s' "$workflow_yaml" > "$TMPDIR_FOR_CASE/.gitea/workflows/$workflow_filename"
   local stderr_file
   stderr_file=$(mktemp)
   local actual_exit=0

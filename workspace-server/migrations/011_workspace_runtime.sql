@@ -1,2 +1,2 @@
 ALTER TABLE workspaces
-ADD COLUMN IF NOT EXISTS runtime TEXT DEFAULT 'langgraph';
+ADD COLUMN IF NOT EXISTS runtime TEXT DEFAULT 'claude-code';

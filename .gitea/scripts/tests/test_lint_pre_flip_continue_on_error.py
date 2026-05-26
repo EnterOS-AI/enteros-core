@@ -15,7 +15,6 @@ Mirrors the pattern in scripts/ops/test_check_migration_collisions.py
 from __future__ import annotations
 
 import importlib.util
-import os
 import sys
 import unittest
 from pathlib import Path

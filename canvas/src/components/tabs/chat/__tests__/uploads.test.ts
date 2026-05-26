@@ -113,6 +113,31 @@ describe("resolveAttachmentHref — platform-pending: scheme (poll-mode uploads)
   });
 });
 
+describe("resolveAttachmentHref — legacy platform content URLs", () => {
+  const chatWs = "chat-ws-aaaaaaaa";
+  const sourceWs = "d76977b1-d620-4f42-a57e-111111111111";
+  const fileID = "e2dfaf2e-1111-4abc-9999-222222222222";
+
+  it("rewrites /workspaces/<ws>/content/<file>/content to the authenticated pending-upload endpoint", () => {
+    const url = resolveAttachmentHref(
+      chatWs,
+      `/workspaces/${sourceWs}/content/${fileID}/content`,
+    );
+    expect(url).toContain(`/workspaces/${sourceWs}/pending-uploads/${fileID}/content`);
+    expect(url).not.toContain(`/workspaces/${chatWs}/`);
+  });
+
+  it("treats legacy content URLs as platform attachments so previews fetch with auth headers", () => {
+    expect(isPlatformAttachment(`/workspaces/${sourceWs}/content/${fileID}/content`)).toBe(true);
+  });
+
+  it("passes malformed legacy content URLs through unchanged", () => {
+    const malformed = `/workspaces/${sourceWs}/content//content`;
+    expect(resolveAttachmentHref(chatWs, malformed)).toBe(malformed);
+    expect(isPlatformAttachment(malformed)).toBe(false);
+  });
+});
+
 describe("isPlatformAttachment", () => {
   it("returns true for platform-pending: URIs", () => {
     expect(isPlatformAttachment("platform-pending:abc/file")).toBe(true);

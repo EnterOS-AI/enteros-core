@@ -81,7 +81,7 @@ function AgentCardSection({ workspaceId }: { workspaceId: string }) {
             spellCheck={false} rows={12}
             className="w-full bg-surface-card border border-line rounded p-2 text-[10px] font-mono text-ink focus:outline-none focus:border-accent resize-none"
           />
-          {error && <div className="px-2 py-1 bg-red-900/30 border border-red-800 rounded text-[10px] text-bad">{error}</div>}
+          {error && <div role="alert" aria-live="assertive" className="px-2 py-1 bg-red-900/30 border border-red-800 rounded text-[10px] text-bad">{error}</div>}
           <div className="flex gap-2">
             <button type="button" onClick={handleSave} disabled={saving}
               className="px-2 py-1 bg-accent hover:bg-accent-strong text-[10px] rounded text-white disabled:opacity-50 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-1 focus-visible:ring-offset-surface">
@@ -109,6 +109,130 @@ function AgentCardSection({ workspaceId }: { workspaceId: string }) {
   );
 }
 
+// --- Agent Abilities Section ---
+//
+// Always-visible on/off controls for the two workspace-level ability flags
+// (broadcast_enabled, talk_to_user_enabled). Both are mutated through the
+// same admin endpoint the ChatTab recovery banner already uses
+// (PATCH /workspaces/:id/abilities) and reflected into the canvas store node
+// data (broadcastEnabled / talkToUserEnabled) so every surface that reads
+// useCanvasStore.nodes stays consistent without a full re-hydrate.
+//
+// Before this section there was NO canvas control for either flag: the
+// backend was fully wired (workspace_abilities.go / workspace_broadcast.go /
+// agent_message_writer.go, see commit 29b4bffb + internal#510/#511) but the
+// only frontend affordance was the ChatTab recovery banner, which renders
+// solely when talk_to_user_enabled===false and so is invisible under the
+// TRUE default and never existed at all for broadcast.
+function AgentAbilitiesSection({ workspaceId }: { workspaceId: string }) {
+  // Read the live ability flags off the canvas store node — the platform
+  // event stream hydrates these (canvas-topology.ts maps the workspace row's
+  // broadcast_enabled/talk_to_user_enabled onto node data), so this stays in
+  // sync with the recovery banner and avoids a duplicate GET. Mirrors the
+  // store-read pattern used by AgentCardSection above.
+  const node = useCanvasStore((s) =>
+    s.nodes?.find?.((n) => n.id === workspaceId),
+  );
+  // Defaults match the backend column defaults + canvas-topology mapping:
+  // broadcast_enabled defaults FALSE, talk_to_user_enabled defaults TRUE.
+  const broadcastEnabled = node?.data.broadcastEnabled ?? false;
+  const talkToUserEnabled = node?.data.talkToUserEnabled ?? true;
+
+  // Track an in-flight PATCH per field so a double-click can't fire two
+  // racing writes, and surface a one-line error if the server rejects.
+  const [pending, setPending] = useState<null | "broadcast" | "talk">(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const patchAbility = async (
+    which: "broadcast" | "talk",
+    body: { broadcast_enabled: boolean } | { talk_to_user_enabled: boolean },
+    optimistic: Partial<{ broadcastEnabled: boolean; talkToUserEnabled: boolean }>,
+  ) => {
+    setError(null);
+    setPending(which);
+    // Optimistic store update — the toggle flips immediately; on failure we
+    // roll back to the server-truth value the store last held.
+    const prev = {
+      broadcastEnabled,
+      talkToUserEnabled,
+    };
+    useCanvasStore.getState().updateNodeData(workspaceId, optimistic);
+    try {
+      await api.patch(`/workspaces/${workspaceId}/abilities`, body);
+    } catch (e) {
+      // Roll back the optimistic change to last-known server truth.
+      useCanvasStore.getState().updateNodeData(workspaceId, {
+        broadcastEnabled: prev.broadcastEnabled,
+        talkToUserEnabled: prev.talkToUserEnabled,
+      });
+      setError(
+        e instanceof Error ? e.message : "Failed to update ability — try again",
+      );
+    } finally {
+      setPending(null);
+    }
+  };
+
+  return (
+    <Section title="Agent Abilities">
+      <p className="text-[10px] text-ink-mid px-1 pb-1">
+        Workspace-level permissions for this agent. Changes apply immediately
+        (no restart required).
+      </p>
+      <div className="space-y-2">
+        <div>
+          <Toggle
+            label="Talk to user"
+            checked={talkToUserEnabled}
+            onChange={(v) =>
+              pending
+                ? undefined
+                : patchAbility(
+                    "talk",
+                    { talk_to_user_enabled: v },
+                    { talkToUserEnabled: v },
+                  )
+            }
+          />
+          <p className="text-[10px] text-ink-mid mt-0.5 ml-6">
+            When off, the agent&apos;s <code className="font-mono">send_message_to_user</code>{" "}
+            and <code className="font-mono">POST /notify</code> calls are
+            rejected (403) — it must route updates through a parent workspace.
+          </p>
+        </div>
+        <div>
+          <Toggle
+            label="Broadcast to peers"
+            checked={broadcastEnabled}
+            onChange={(v) =>
+              pending
+                ? undefined
+                : patchAbility(
+                    "broadcast",
+                    { broadcast_enabled: v },
+                    { broadcastEnabled: v },
+                  )
+            }
+          />
+          <p className="text-[10px] text-ink-mid mt-0.5 ml-6">
+            When on, the agent may <code className="font-mono">POST /broadcast</code>{" "}
+            to message all non-removed agent workspaces in the org. Off by
+            default — only privileged orchestrators should hold this.
+          </p>
+        </div>
+      </div>
+      {pending && (
+        <div className="mt-2 text-[10px] text-ink-mid">Saving…</div>
+      )}
+      {error && (
+        <div role="alert" aria-live="assertive" className="mt-2 px-2 py-1 bg-red-900/30 border border-red-800 rounded text-[10px] text-bad">
+          {error}
+        </div>
+      )}
+    </Section>
+  );
+}
+
 // --- Main ConfigTab ---
 
 interface ModelSpec {
@@ -129,7 +253,7 @@ interface RuntimeOption {
   // its config.yaml under runtime_config.providers. The /templates API
   // surfaces it (workspace-server templates.go) so canvas stays
   // adapter-driven: hermes ships ~20 slugs, claude-code ships
-  // ["anthropic"], gemini-cli ships ["gemini"], etc. Empty list →
+  // ["anthropic"], codex ships OpenAI-compatible model ids, etc. Empty list →
   // canvas falls back to deriving unique vendor prefixes from
   // models[].id (still adapter-driven, just inferred).
   providers: string[];
@@ -177,16 +301,13 @@ export function deriveProvidersFromModels(models: ModelSpec[]): string[] {
 // config.yaml` on the container is a separate runtime-internal file,
 // not this one.
 const RUNTIMES_WITH_OWN_CONFIG = new Set<string>(["external", "kimi", "kimi-cli", "openclaw"]);
+const SUPPORTED_RUNTIME_VALUES = new Set(["claude-code", "codex", "openclaw", "hermes"]);
 
 const FALLBACK_RUNTIME_OPTIONS: RuntimeOption[] = [
-  { value: "", label: "LangGraph (default)", models: [], providers: [] },
   { value: "claude-code", label: "Claude Code", models: [], providers: [] },
-  { value: "crewai", label: "CrewAI", models: [], providers: [] },
-  { value: "autogen", label: "AutoGen", models: [], providers: [] },
-  { value: "deepagents", label: "DeepAgents", models: [], providers: [] },
+  { value: "codex", label: "Codex", models: [], providers: [] },
   { value: "openclaw", label: "OpenClaw", models: [], providers: [] },
   { value: "hermes", label: "Hermes", models: [], providers: [] },
-  { value: "gemini-cli", label: "Gemini CLI", models: [], providers: [] },
 ];
 
 export function ConfigTab({ workspaceId }: Props) {
@@ -375,10 +496,9 @@ export function ConfigTab({ workspaceId }: Props) {
       .then((rows) => {
         if (cancelled || !Array.isArray(rows)) return;
         const byRuntime = new Map<string, RuntimeOption>();
-        byRuntime.set("", { value: "", label: "LangGraph (default)", models: [], providers: [] });
         for (const r of rows) {
           const v = (r.runtime || "").trim();
-          if (!v || v === "langgraph") continue;
+          if (!SUPPORTED_RUNTIME_VALUES.has(v)) continue;
           // Last template wins if two templates share a runtime — rare, and the
           // one with the richer models list is probably newer.
           const existing = byRuntime.get(v);
@@ -388,7 +508,7 @@ export function ConfigTab({ workspaceId }: Props) {
             byRuntime.set(v, { value: v, label: r.name || v, models, providers });
           }
         }
-        if (byRuntime.size > 1) setRuntimeOptions(Array.from(byRuntime.values()));
+        if (byRuntime.size > 0) setRuntimeOptions(Array.from(byRuntime.values()));
       })
       .catch(() => { /* keep fallback */ });
     return () => { cancelled = true; };
@@ -795,6 +915,7 @@ export function ConfigTab({ workspaceId }: Props) {
                   <label className="text-[10px] text-ink-mid block mb-1">Model</label>
                   <input
                     type="text"
+                    aria-label="Model"
                     value={currentModelId}
                     onChange={(e) => {
                       const v = e.target.value;
@@ -884,6 +1005,8 @@ export function ConfigTab({ workspaceId }: Props) {
               </div>
             )}
           </Section>
+
+          <AgentAbilitiesSection workspaceId={workspaceId} />
 
           {/* Claude Settings — shown for claude-code runtime or claude/anthropic model names */}
           {(config.runtime === "claude-code" ||
@@ -995,7 +1118,7 @@ export function ConfigTab({ workspaceId }: Props) {
       )}
 
       {error && (
-        <div className="mx-3 mb-2 px-3 py-1.5 bg-red-900/30 border border-red-800 rounded text-xs text-bad">{error}</div>
+        <div role="alert" aria-live="assertive" className="mx-3 mb-2 px-3 py-1.5 bg-red-900/30 border border-red-800 rounded text-xs text-bad">{error}</div>
       )}
       {!error && RUNTIMES_WITH_OWN_CONFIG.has(config.runtime || "") && (
         <div className="mx-3 mb-2 px-3 py-1.5 bg-surface-sunken/50 border border-line rounded text-xs text-ink-mid">

@@ -2,12 +2,10 @@
 # Regression test for tests/e2e/lib/model_slug.sh.
 #
 # PR #2571 fixed a synth-E2E masking bug where MODEL_SLUG was hardcoded
-# to "openai/gpt-4o" (slash-form) but langgraph's init_chat_model needs
-# "openai:gpt-4o" (colon-form). Fix shipped as a per-runtime case
-# statement. Without this regression test, dropping any branch of the
-# case (or flipping a slug format) would silently revert behavior — the
-# E2E only fails as "Could not resolve authentication method" at the
-# very first message, after a successful tenant + workspace provision.
+# to "openai/gpt-4o" (slash-form). Without this regression test, dropping
+# any branch of the case (or flipping a slug format) would silently revert
+# behavior — the E2E only fails as "Could not resolve authentication method"
+# at the very first message, after a successful tenant + workspace provision.
 #
 # Each branch must FAIL the test if the dispatch behavior changes, not
 # just produce some non-empty string.
@@ -16,7 +14,7 @@ set -uo pipefail
 # Resolve to the lib relative to this test file so the test runs from
 # any cwd (CI, local invocation, repo root).
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=lib/model_slug.sh
+# shellcheck source=tests/e2e/lib/model_slug.sh
 source "$SCRIPT_DIR/lib/model_slug.sh"
 
 PASS=0
@@ -47,8 +45,17 @@ echo
 
 # ── Per-runtime branches (the load-bearing ones for synth-E2E) ──
 run_test "hermes → slash-form (derive-provider.sh contract)"       hermes      "openai/gpt-4o"
-run_test "langgraph → colon-form (init_chat_model contract)"       langgraph   "openai:gpt-4o"
-run_test "claude-code → bare model name (entry-id form)"           claude-code "sonnet"
+run_test "codex → slash-form fallback"                             codex       "openai/gpt-4o"
+run_test "claude-code → OAuth/default alias"                      claude-code "sonnet"
+
+got=$(unset E2E_MODEL_SLUG E2E_ANTHROPIC_API_KEY; E2E_MINIMAX_API_KEY="mx-test" pick_model_slug claude-code)
+assert_eq "claude-code + MiniMax key → MiniMax model"             "$got" "MiniMax-M2"
+
+got=$(unset E2E_MODEL_SLUG E2E_MINIMAX_API_KEY; E2E_ANTHROPIC_API_KEY="sk-ant-test" pick_model_slug claude-code)
+assert_eq "claude-code + Anthropic API key → Anthropic API model" "$got" "claude-sonnet-4-6"
+
+got=$(unset E2E_MODEL_SLUG; E2E_MINIMAX_API_KEY="mx-priority" E2E_ANTHROPIC_API_KEY="sk-ant-loser" pick_model_slug claude-code)
+assert_eq "claude-code + both keys → MiniMax priority"            "$got" "MiniMax-M2"
 
 # ── Fallback for unknown runtime ──
 # Picks slash-form (hermes-shaped) since hermes is the historical
@@ -65,8 +72,8 @@ echo
 echo "Test: pick_model_slug — E2E_MODEL_SLUG override"
 echo
 
-got=$(E2E_MODEL_SLUG="anthropic:claude-opus-4-7" pick_model_slug langgraph)
-assert_eq "override beats langgraph default"                      "$got" "anthropic:claude-opus-4-7"
+got=$(E2E_MODEL_SLUG="anthropic:claude-opus-4-7" pick_model_slug codex)
+assert_eq "override beats codex default"                          "$got" "anthropic:claude-opus-4-7"
 
 got=$(E2E_MODEL_SLUG="custom/whatever" pick_model_slug hermes)
 assert_eq "override beats hermes default"                         "$got" "custom/whatever"
@@ -79,8 +86,8 @@ assert_eq "override beats claude-code default"                    "$got" "some-b
 # it because changing this behavior (e.g. via -v test) would silently
 # break the dispatch when an operator passes "" to clear an inherited
 # env var.
-got=$(E2E_MODEL_SLUG="" pick_model_slug langgraph)
-assert_eq "empty-string override falls through to dispatch"       "$got" "openai:gpt-4o"
+got=$(E2E_MODEL_SLUG="" pick_model_slug codex)
+assert_eq "empty-string override falls through to dispatch"       "$got" "openai/gpt-4o"
 
 echo
 echo "─────────────────────────────────────────────────"

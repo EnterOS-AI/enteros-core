@@ -201,15 +201,13 @@ describe("CreateWorkspaceDialog — WCAG SC 1.3.1 label/input association", () =
     expect(label?.textContent).toContain("Budget limit");
   });
 
-  it("Template input has a <label> whose htmlFor matches the input id", async () => {
+  it("Workspace Template select has a <label> whose htmlFor matches the select id", async () => {
     await openDialog();
-    const templateInput = screen.getByPlaceholderText(
-      "e.g. seo-agent (from workspace-configs-templates/)"
-    ) as HTMLInputElement;
-    expect(templateInput.id).toBeTruthy();
-    const label = document.querySelector(`label[for="${templateInput.id}"]`);
+    const templateSelect = screen.getByLabelText("Workspace Template") as HTMLSelectElement;
+    expect(templateSelect.id).toBeTruthy();
+    const label = document.querySelector(`label[for="${templateSelect.id}"]`);
     expect(label).toBeTruthy();
-    expect(label?.textContent).toContain("Template");
+    expect(label?.textContent).toContain("Workspace Template");
   });
 
   it("each InputField generates a distinct id (no id collisions)", async () => {
@@ -218,13 +216,16 @@ describe("CreateWorkspaceDialog — WCAG SC 1.3.1 label/input association", () =
       screen.getByPlaceholderText("e.g. SEO Agent"),
       screen.getByPlaceholderText("e.g. SEO Specialist"),
       screen.getByPlaceholderText("e.g. 100"),
-      screen.getByPlaceholderText("e.g. seo-agent (from workspace-configs-templates/)"),
     ] as HTMLInputElement[];
+    const selects = [
+      screen.getByLabelText("Runtime"),
+      screen.getByLabelText("Workspace Template"),
+    ] as HTMLSelectElement[];
 
-    const ids = inputs.map((i) => i.id).filter(Boolean);
+    const ids = [...inputs, ...selects].map((i) => i.id).filter(Boolean);
     const unique = new Set(ids);
     expect(unique.size).toBe(ids.length); // no duplicates
-    expect(ids.length).toBe(4);
+    expect(ids.length).toBe(5);
   });
 
   it("Name label text contains the required asterisk indicator", async () => {
