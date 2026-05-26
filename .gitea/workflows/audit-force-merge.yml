@@ -54,5 +54,6 @@ jobs:
           # read-only by design (least-privilege).
           REQUIRED_CHECKS: |
             CI / all-required (pull_request)
-            sop-checklist / all-items-acked (pull_request)
+            E2E API Smoke Test / E2E API Smoke Test (pull_request)
+            Handlers Postgres Integration / Handlers Postgres Integration (pull_request)
         run: bash .gitea/scripts/audit-force-merge.sh
