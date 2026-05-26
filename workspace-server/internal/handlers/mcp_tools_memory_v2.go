@@ -48,6 +48,7 @@ type memoryV2Deps struct {
 // call. Defining an interface here lets handler tests stub the plugin
 // without spinning up an HTTP server.
 type memoryPluginAPI interface {
+	UpsertNamespace(ctx context.Context, name string, body contract.NamespaceUpsert) (*contract.Namespace, error)
 	CommitMemory(ctx context.Context, namespace string, body contract.MemoryWrite) (*contract.MemoryWriteResponse, error)
 	Search(ctx context.Context, body contract.SearchRequest) (*contract.SearchResponse, error)
 	ForgetMemory(ctx context.Context, id string, body contract.ForgetRequest) error
@@ -117,6 +118,9 @@ func (h *MCPHandler) toolCommitMemoryV2(ctx context.Context, workspaceID string,
 	if !ok {
 		return "", fmt.Errorf("workspace %s cannot write to namespace %s", workspaceID, ns)
 	}
+	if _, err := h.memv2.plugin.UpsertNamespace(ctx, ns, contract.NamespaceUpsert{Kind: kindFromNamespace(ns)}); err != nil {
+		return "", fmt.Errorf("plugin upsert namespace: %w", err)
+	}
 
 	// SAFE-T1201: scrub credential-shaped strings BEFORE the plugin sees
 	// them. Non-negotiable; see memories.go:180.
@@ -168,6 +172,19 @@ func (h *MCPHandler) toolCommitMemoryV2(ctx context.Context, workspaceID string,
 		log.Printf("toolCommitMemoryV2 %s: json.Marshal resp failed: %v", workspaceID, marshalErr)
 	}
 	return string(out), nil
+}
+
+func kindFromNamespace(ns string) contract.NamespaceKind {
+	switch {
+	case strings.HasPrefix(ns, "workspace:"):
+		return contract.NamespaceKindWorkspace
+	case strings.HasPrefix(ns, "team:"):
+		return contract.NamespaceKindTeam
+	case strings.HasPrefix(ns, "org:"):
+		return contract.NamespaceKindOrg
+	default:
+		return contract.NamespaceKindCustom
+	}
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
