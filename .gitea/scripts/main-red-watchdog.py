@@ -578,6 +578,7 @@ def close_open_red_issues_for_other_shas(
     current_sha: str,
     *,
     dry_run: bool = False,
+    close_same_sha: bool = False,
 ) -> int:
     """When main is green at current_sha, close any open `[main-red]`
     issues whose title references a different SHA. Returns the number
@@ -586,15 +587,25 @@ def close_open_red_issues_for_other_shas(
     Lineage note: we only close issues whose title prefix matches; if
     a human renamed the issue or added a suffix this won't touch it.
     That's intentional — manual editorial state takes precedence.
+
+    Args:
+        close_same_sha: set True when the caller already knows main is
+            green at current_sha (e.g. recovery block) and wants to close
+            the open issue for THIS SHA too. Defaults False so the
+            green-path callers never accidentally close an issue they just
+            filed on the same tick.
     """
     target_title = title_for(current_sha)
     open_red = list_open_red_issues()
     closed = 0
     for issue in open_red:
         if issue.get("title") == target_title:
-            # Same SHA — caller should not have invoked this if main is
-            # green. Skip defensively.
-            continue
+            if not close_same_sha:
+                # Same SHA — caller should not have invoked this if main is
+                # green. Skip defensively (guards against green-path callers
+                # that accidentally pass the SHA they just filed for).
+                continue
+            # close_same_sha=True: close even this SHA's issue (recovery path)
         num = issue.get("number")
         if not isinstance(num, int):
             continue
@@ -699,6 +710,10 @@ def run_once(*, dry_run: bool = False) -> int:
                 f"{sha[:10]} but HEAD is now {recheck_sha[:10]} on "
                 f"{WATCH_BRANCH}; next cron tick will re-evaluate."
             )
+            # HEAD drifted — close any stale main-red issue for the prior SHA
+            # before returning, so we don't leave stale open issues when main
+            # is no longer pointing at the red commit.
+            close_open_red_issues_for_other_shas(recheck_sha, dry_run=dry_run)
             return 0
 
         recheck_status = get_combined_status(sha)
@@ -711,6 +726,9 @@ def run_once(*, dry_run: bool = False) -> int:
                 f"{recheck_status.get('state')!r} on recheck; "
                 f"initial red was a transient cancel-cascade."
             )
+            # CI recovered on the same SHA — close any stale main-red issue
+            # that was filed on a prior tick for this SHA.
+            close_open_red_issues_for_other_shas(sha, dry_run=dry_run, close_same_sha=True)
             return 0
 
         # Still red after settling — file/update. Use the recheck data
