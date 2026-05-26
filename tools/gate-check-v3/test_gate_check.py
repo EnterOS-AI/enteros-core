@@ -74,3 +74,48 @@ def test_signal_1_infra_sre_login_alias_resolved_to_core_devops(monkeypatch):
     engineers = result["results"]["core-devops"]
     assert engineers["verdict"] == "APPROVED"
     assert engineers["group"] == "engineers"
+
+
+def test_signal_1_null_user_in_review_does_not_crash(monkeypatch):
+    """Regression: Gitea may return reviews with user=null (deleted/bot edge case).
+    signal_1_comment_scan must survive this without AttributeError."""
+    mod = load_gate_check()
+
+    def fake_api_get(path):
+        if path == "/repos/molecule-ai/molecule-core/pulls/901":
+            return {
+                "number": 901,
+                "labels": [{"name": "tier:low"}],
+            }
+        raise AssertionError(f"unexpected api_get: {path}")
+
+    def fake_api_list(path):
+        if path == "/repos/molecule-ai/molecule-core/issues/901/comments":
+            return []
+        if path == "/repos/molecule-ai/molecule-core/pulls/901/comments":
+            return []
+        if path == "/repos/molecule-ai/molecule-core/pulls/901/reviews":
+            return [
+                {
+                    "id": 1,
+                    "user": None,  # <-- the regression trigger
+                    "state": "APPROVED",
+                    "submitted_at": "2026-05-13T10:00:00Z",
+                },
+                {
+                    "id": 2,
+                    "user": {"login": "core-devops"},
+                    "state": "APPROVED",
+                    "submitted_at": "2026-05-13T10:01:00Z",
+                },
+            ]
+        raise AssertionError(f"unexpected api_list: {path}")
+
+    monkeypatch.setattr(mod, "api_get", fake_api_get)
+    monkeypatch.setattr(mod, "api_list", fake_api_list)
+
+    result = mod.signal_1_comment_scan(901, "molecule-ai/molecule-core")
+
+    # Should not crash; the valid review from core-devops still satisfies engineers gate
+    assert result["verdict"] == "CLEAR"
+    assert result["results"]["core-devops"]["verdict"] == "APPROVED"
