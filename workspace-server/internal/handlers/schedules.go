@@ -288,7 +288,12 @@ func (h *ScheduleHandler) Update(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update schedule"})
 		return
 	}
-	n, _ := result.RowsAffected()
+	n, err := result.RowsAffected()
+	if err != nil {
+		log.Printf("Schedules.Update: RowsAffected error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update schedule"})
+		return
+	}
 	if n == 0 {
 		c.JSON(http.StatusNotFound, gin.H{"error": "schedule not found"})
 		return
@@ -321,7 +326,12 @@ func (h *ScheduleHandler) Delete(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete schedule"})
 		return
 	}
-	n, _ := result.RowsAffected()
+	n, err := result.RowsAffected()
+	if err != nil {
+		log.Printf("Schedules.Delete: RowsAffected error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete schedule"})
+		return
+	}
 	if n == 0 {
 		c.JSON(http.StatusNotFound, gin.H{"error": "schedule not found"})
 		return
