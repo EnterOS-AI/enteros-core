@@ -868,12 +868,15 @@ func (h *WorkspaceHandler) Pause(c *gin.Context) {
 
 	// Collect this workspace + all descendants to pause
 	toPause := []struct{ id, name string }{{id, wsName}}
-	rows, _ := db.DB.QueryContext(ctx,
+	rows, err := db.DB.QueryContext(ctx,
 		`WITH RECURSIVE descendants AS (
 			SELECT id, name FROM workspaces WHERE parent_id = $1 AND status NOT IN ('removed', 'paused')
 			UNION ALL
 			SELECT w.id, w.name FROM workspaces w JOIN descendants d ON w.parent_id = d.id WHERE w.status NOT IN ('removed', 'paused')
 		) SELECT id, name FROM descendants`, id)
+	if err != nil {
+		log.Printf("Pause: descendant query failed for %s: %v", id, err)
+	}
 	if rows != nil {
 		defer rows.Close()
 		for rows.Next() {
@@ -954,12 +957,15 @@ func (h *WorkspaceHandler) Resume(c *gin.Context) {
 		tier              int
 	}
 	toResume := []wsInfo{{id, wsName, dbRuntime, tier}}
-	rows, _ := db.DB.QueryContext(ctx,
+	rows, err := db.DB.QueryContext(ctx,
 		`WITH RECURSIVE descendants AS (
 			SELECT id, name, tier, COALESCE(runtime, 'claude-code') AS runtime FROM workspaces WHERE parent_id = $1 AND status = 'paused'
 			UNION ALL
 			SELECT w.id, w.name, w.tier, COALESCE(w.runtime, 'claude-code') FROM workspaces w JOIN descendants d ON w.parent_id = d.id WHERE w.status = 'paused'
 		) SELECT id, name, tier, runtime FROM descendants`, id)
+	if err != nil {
+		log.Printf("Resume: descendant query failed for %s: %v", id, err)
+	}
 	if rows != nil {
 		defer rows.Close()
 		for rows.Next() {
