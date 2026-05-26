@@ -200,7 +200,12 @@ func (h *ApprovalsHandler) Decide(c *gin.Context) {
 		return
 	}
 
-	rows, _ := result.RowsAffected()
+	rows, err := result.RowsAffected()
+	if err != nil {
+		log.Printf("Approval decision RowsAffected error approval=%s workspace=%s: %v", approvalID, workspaceID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update"})
+		return
+	}
 	if rows == 0 {
 		c.JSON(http.StatusNotFound, gin.H{"error": "approval not found or already decided"})
 		return
