@@ -110,10 +110,15 @@ func WorkspaceAuth(database *sql.DB) gin.HandlerFunc {
 			c.Next()
 			return
 		}
-		// Same-origin canvas on tenant image — Referer matches Host.
-		if isSameOriginCanvas(c) {
-			c.Next()
-			return
+		// SaaS-canvas path: a browser cookie is acceptable only after the
+		// control plane confirms membership in this tenant. Referer/Origin
+		// are forgeable and must never authenticate workspace data routes.
+		if cookieHeader := c.GetHeader("Cookie"); cookieHeader != "" {
+			if ok, _ := VerifiedCPSession(cookieHeader); ok {
+				c.Set("cp_session_actor", cpSessionActor(cookieHeader))
+				c.Next()
+				return
+			}
 		}
 		// Local-dev escape hatch — see devmode.go. Unreachable on SaaS
 		// (hosted tenants always have ADMIN_TOKEN + MOLECULE_ENV=production).

@@ -217,9 +217,7 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 	{
 		// #680: PATCH /workspaces/:id moved under WorkspaceAuth (#680 IDOR fix).
 		// WorkspaceAuth enforces that the caller holds a valid bearer token for
-		// this specific workspace — both auth AND ownership in one check. Cosmetic
-		// updates (x/y drag-reposition, inline rename) from the combined tenant
-		// image canvas still pass via the isSameOriginCanvas bypass in WorkspaceAuth.
+		// this specific workspace, or a control-plane-verified tenant session.
 		wsAuth.PATCH("", wh.Update)
 
 		// Lifecycle
