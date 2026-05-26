@@ -466,7 +466,11 @@ func (h *WorkspaceHandler) HibernateWorkspace(ctx context.Context, workspaceID s
 		log.Printf("Hibernate: atomic claim failed for %s: %v", workspaceID, err)
 		return
 	}
-	rowsAffected, _ := result.RowsAffected()
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		log.Printf("Hibernate: RowsAffected error for %s: %v", workspaceID, err)
+		return
+	}
 	if rowsAffected == 0 {
 		// Either already hibernating/hibernated/paused/removed, or active_tasks > 0 —
 		// safe to abort without side-effects.
