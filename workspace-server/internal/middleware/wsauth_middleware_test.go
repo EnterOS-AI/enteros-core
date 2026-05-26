@@ -75,6 +75,90 @@ func TestWorkspaceAuth_351_NoBearer_Returns401_NoDBCalls(t *testing.T) {
 	}
 }
 
+// TestWorkspaceAuth_ForgedSameOriginHeaders_Returns401 pins the production
+// boundary for combined tenant images: Referer/Origin are forgeable request
+// headers and must not authenticate workspace data routes.
+func TestWorkspaceAuth_ForgedSameOriginHeaders_Returns401(t *testing.T) {
+	t.Setenv("MOLECULE_ENV", "production")
+	t.Setenv("ADMIN_TOKEN", "admin-secret")
+	prev := canvasProxyActive
+	canvasProxyActive = true
+	defer func() { canvasProxyActive = prev }()
+
+	mockDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer mockDB.Close()
+
+	r := gin.New()
+	r.GET("/workspaces/:id/secrets", WorkspaceAuth(mockDB), func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"ok": true})
+	})
+	r.DELETE("/workspaces/:id/secrets/:key", WorkspaceAuth(mockDB), func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"ok": true})
+	})
+
+	for _, tt := range []struct {
+		name   string
+		method string
+		path   string
+	}{
+		{"list secrets", http.MethodGet, "/workspaces/ws-forged/secrets"},
+		{"delete secret", http.MethodDelete, "/workspaces/ws-forged/secrets/HERMES_CUSTOM_API_KEY"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			req, _ := http.NewRequest(tt.method, tt.path, nil)
+			req.Host = "tenant.example.test"
+			req.Header.Set("Referer", "https://tenant.example.test/")
+			req.Header.Set("Origin", "https://tenant.example.test")
+			r.ServeHTTP(w, req)
+			if w.Code != http.StatusUnauthorized {
+				t.Fatalf("forged same-origin headers: expected 401, got %d: %s", w.Code, w.Body.String())
+			}
+		})
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+func TestWorkspaceAuth_VerifiedTenantSessionCookie_AllowsCanvas(t *testing.T) {
+	resetSessionCache()
+	t.Setenv("MOLECULE_ENV", "production")
+	t.Setenv("ADMIN_TOKEN", "admin-secret")
+	t.Setenv("MOLECULE_ORG_SLUG", "tenant-a")
+	srv, _ := mockCPServer(t, http.StatusOK, `{"member":true,"user_id":"u_1","role":"owner","org_id":"org_1"}`)
+	t.Setenv("CP_UPSTREAM_URL", srv.URL)
+
+	mockDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer mockDB.Close()
+
+	r := gin.New()
+	r.GET("/workspaces/:id/secrets", WorkspaceAuth(mockDB), func(c *gin.Context) {
+		if _, ok := c.Get("cp_session_actor"); !ok {
+			t.Errorf("cp_session_actor was not set")
+		}
+		c.JSON(http.StatusOK, gin.H{"ok": true})
+	})
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/workspaces/ws-session/secrets", nil)
+	req.Header.Set("Cookie", "molecule_session=valid")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("verified tenant session: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
 // TestWorkspaceAuth_C4_C8_NoBearer_Returns401 — C4/C8 critical path:
 // when a workspace has live tokens and the caller sends NO bearer token,
 // the middleware must return 401.  This was the confirmed attack vector —
