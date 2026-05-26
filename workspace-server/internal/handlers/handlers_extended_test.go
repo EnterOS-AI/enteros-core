@@ -302,7 +302,7 @@ func TestExtended_SecretsSetRejectsHermesCustomProviderInPlatformManagedMode(t *
 	c, _ := gin.CreateTestContext(w)
 	c.Params = gin.Params{{Key: "id", Value: "22222222-2222-2222-2222-222222222222"}}
 
-	body := `{"key":"HERMES_CUSTOM_BASE_URL","value":"https://api.moonshot.ai/v1"}`
+	body := `{"key":"KIMI_API_KEY","value":"sk-test-moonshot"}`
 	c.Request = httptest.NewRequest("POST", "/workspaces/22222222-2222-2222-2222-222222222222/secrets", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 

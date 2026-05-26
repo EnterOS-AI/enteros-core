@@ -935,6 +935,7 @@ func applyPlatformManagedLLMEnv(envVars map[string]string, runtime string, model
 	if baseURL == "" || token == "" {
 		return
 	}
+	stripPlatformManagedLLMBypassEnv(envVars)
 
 	envVars["MOLECULE_LLM_BILLING_MODE"] = "platform_managed"
 	envVars["MOLECULE_LLM_BASE_URL"] = baseURL
@@ -946,11 +947,11 @@ func applyPlatformManagedLLMEnv(envVars map[string]string, runtime string, model
 		envVars["MOLECULE_LLM_USAGE_URL"] = usageURL
 	}
 
-	if strings.TrimSpace(envVars["OPENAI_API_KEY"]) == "" && !runtimeUsesAnthropicNativeProxy(runtime) {
+	if !runtimeUsesAnthropicNativeProxy(runtime) {
 		envVars["OPENAI_API_KEY"] = token
 		envVars["OPENAI_BASE_URL"] = baseURL
 	}
-	if runtimeUsesAnthropicNativeProxy(runtime) && anthropicBaseURL != "" && workspaceHasNoAnthropicAuth(envVars) {
+	if runtimeUsesAnthropicNativeProxy(runtime) && anthropicBaseURL != "" {
 		envVars["ANTHROPIC_API_KEY"] = token
 		envVars["ANTHROPIC_BASE_URL"] = anthropicBaseURL
 	}
@@ -962,25 +963,14 @@ func applyPlatformManagedLLMEnv(envVars map[string]string, runtime string, model
 	}
 }
 
-func runtimeUsesAnthropicNativeProxy(runtime string) bool {
-	return strings.TrimSpace(strings.ToLower(runtime)) == "claude-code"
+func stripPlatformManagedLLMBypassEnv(envVars map[string]string) {
+	for key := range platformManagedDirectLLMBypassKeys {
+		delete(envVars, key)
+	}
 }
 
-func workspaceHasNoAnthropicAuth(envVars map[string]string) bool {
-	for _, key := range []string{
-		"CLAUDE_CODE_OAUTH_TOKEN",
-		"ANTHROPIC_API_KEY",
-		"ANTHROPIC_AUTH_TOKEN",
-		"MINIMAX_API_KEY",
-		"KIMI_API_KEY",
-		"GLM_API_KEY",
-		"DEEPSEEK_API_KEY",
-	} {
-		if strings.TrimSpace(envVars[key]) != "" {
-			return false
-		}
-	}
-	return true
+func runtimeUsesAnthropicNativeProxy(runtime string) bool {
+	return strings.TrimSpace(strings.ToLower(runtime)) == "claude-code"
 }
 
 func firstNonEmptyEnv(names ...string) string {
