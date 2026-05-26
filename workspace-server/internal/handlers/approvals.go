@@ -80,10 +80,12 @@ func (h *ApprovalsHandler) ListAll(c *gin.Context) {
 	ctx := c.Request.Context()
 
 	// Auto-expire stale approvals (older than 10 min)
-	db.DB.ExecContext(ctx, `
+	if _, err := db.DB.ExecContext(ctx, `
 		UPDATE approval_requests SET status = 'denied', decided_by = 'auto-expired', decided_at = now()
 		WHERE status = 'pending' AND created_at < now() - interval '10 minutes'
-	`)
+	`); err != nil {
+		log.Printf("approvals: auto-expire failed: %v", err)
+	}
 
 	rows, err := db.DB.QueryContext(ctx, `
 		SELECT a.id, a.workspace_id, w.name, a.action, a.reason, a.status, a.created_at
