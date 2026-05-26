@@ -33,7 +33,7 @@ def scenario() -> str:
     p = os.path.join(STATE_DIR, "scenario")
     if not os.path.isfile(p):
         return "T1_success"
-    with open(p) as f:
+    with open(p, encoding="utf-8") as f:
         return f.read().strip()
 
 

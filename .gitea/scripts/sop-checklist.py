@@ -642,7 +642,7 @@ def load_config(path: str) -> dict[str, Any]:
         # requiring the dep, so the ignore is safe: if yaml loads, we use it;
         # otherwise we fall back silently.
         import yaml  # type: ignore[import-not-found]
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             return yaml.safe_load(f)
     except ImportError:
         return _load_config_minimal(path)
@@ -656,7 +656,7 @@ def _load_config_minimal(path: str) -> dict[str, Any]:
     item map: scalars + lists of scalars. Does NOT support nested lists,
     YAML anchors, multi-doc, or flow style.
     """
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         lines = f.readlines()
     return _parse_minimal_yaml(lines)
 
