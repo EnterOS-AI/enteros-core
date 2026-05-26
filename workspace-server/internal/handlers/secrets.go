@@ -337,6 +337,8 @@ func (h *SecretsHandler) Delete(c *gin.Context) {
 	rows, err := result.RowsAffected()
 	if err != nil {
 		log.Printf("DeleteWorkspace: RowsAffected error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete secret"})
+		return
 	}
 	if rows == 0 {
 		c.JSON(http.StatusNotFound, gin.H{"error": "secret not found"})
@@ -521,6 +523,8 @@ func (h *SecretsHandler) DeleteGlobal(c *gin.Context) {
 	rows, err := result.RowsAffected()
 	if err != nil {
 		log.Printf("DeleteGlobal: RowsAffected error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete"})
+		return
 	}
 	if rows == 0 {
 		c.JSON(http.StatusNotFound, gin.H{"error": "secret not found"})
