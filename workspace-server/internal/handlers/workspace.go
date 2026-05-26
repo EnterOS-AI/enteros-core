@@ -797,10 +797,9 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 	// the token will get a clear-shaped fallback (auth_token absent
 	// from response = use the admin mint path).
 	resp := gin.H{
-		"id":                  id,
-		"status":              "provisioning",
-		"awareness_namespace": awarenessNamespace,
-		"workspace_access":    workspaceAccess,
+		"id":               id,
+		"status":           "provisioning",
+		"workspace_access": workspaceAccess,
 	}
 	if authToken, tokErr := wsauth.IssueToken(ctx, db.DB, id); tokErr != nil {
 		log.Printf("Create workspace %s: inline auth_token mint failed (non-fatal — caller can use POST /admin/workspaces/:id/tokens): %v", id, tokErr)
