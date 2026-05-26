@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"log"
 	"net/http"
+	"os"
 	"regexp"
+	"strings"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/audit"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/crypto"
@@ -15,6 +17,31 @@ import (
 )
 
 var uuidRegex = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+
+var platformManagedDirectLLMBypassKeys = map[string]struct{}{
+	"HERMES_CUSTOM_API_KEY":  {},
+	"HERMES_CUSTOM_BASE_URL": {},
+}
+
+func isPlatformManagedDirectLLMBypassKey(key string) bool {
+	_, ok := platformManagedDirectLLMBypassKeys[strings.ToUpper(strings.TrimSpace(key))]
+	return ok
+}
+
+func platformManagedLLMMode() bool {
+	return strings.EqualFold(strings.TrimSpace(os.Getenv("MOLECULE_LLM_BILLING_MODE")), "platform_managed")
+}
+
+func rejectPlatformManagedDirectLLMBypass(c *gin.Context, key string) bool {
+	if !platformManagedLLMMode() || !isPlatformManagedDirectLLMBypassKey(key) {
+		return false
+	}
+	c.JSON(http.StatusBadRequest, gin.H{
+		"error": "direct Hermes custom provider secrets are blocked for platform-managed LLM workspaces; use MODEL/LLM_PROVIDER or the platform LLM proxy env instead",
+		"key":   key,
+	})
+	return true
+}
 
 type SecretsHandler struct {
 	restartFunc func(workspaceID string) // Optional: auto-restart after secret change
@@ -238,6 +265,9 @@ func (h *SecretsHandler) Set(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
 		return
 	}
+	if rejectPlatformManagedDirectLLMBypass(c, body.Key) {
+		return
+	}
 
 	// Encrypt the value (AES-256-GCM if SECRETS_ENCRYPTION_KEY is set, plaintext otherwise)
 	encrypted, err := crypto.Encrypt([]byte(body.Value))
@@ -378,6 +408,9 @@ func (h *SecretsHandler) SetGlobal(c *gin.Context) {
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+	if rejectPlatformManagedDirectLLMBypass(c, body.Key) {
 		return
 	}
 
