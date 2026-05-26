@@ -394,9 +394,13 @@ func (h *WebhookHandler) handleCronTriggerEvent(c *gin.Context, eventType string
 			log.Printf("Webhook: cron trigger (issues/opened) DB error: %v", err)
 			return true, fmt.Errorf("failed to trigger schedules: %w", err)
 		}
-		affected, _ := result.RowsAffected()
-		log.Printf("Webhook: issues/opened in %s #%d by %s — triggered %d pick-up-work schedule(s)",
-			payload.Repository.FullName, payload.Issue.Number, payload.Sender.Login, affected)
+		affected, err := result.RowsAffected()
+		if err != nil {
+			log.Printf("Webhook: issues/opened RowsAffected error: %v", err)
+		} else {
+			log.Printf("Webhook: issues/opened in %s #%d by %s — triggered %d pick-up-work schedule(s)",
+				payload.Repository.FullName, payload.Issue.Number, payload.Sender.Login, affected)
+		}
 
 		c.JSON(http.StatusOK, gin.H{
 			"status":             "triggered",
@@ -429,9 +433,13 @@ func (h *WebhookHandler) handleCronTriggerEvent(c *gin.Context, eventType string
 			log.Printf("Webhook: cron trigger (pull_request_review/submitted) DB error: %v", err)
 			return true, fmt.Errorf("failed to trigger schedules: %w", err)
 		}
-		affected, _ := result.RowsAffected()
-		log.Printf("Webhook: pull_request_review/submitted in %s PR #%d by %s (state=%s) — triggered %d review schedule(s)",
-			payload.Repository.FullName, payload.PullRequest.Number, payload.Sender.Login, payload.Review.State, affected)
+		affected, err := result.RowsAffected()
+		if err != nil {
+			log.Printf("Webhook: pull_request_review/submitted RowsAffected error: %v", err)
+		} else {
+			log.Printf("Webhook: pull_request_review/submitted in %s PR #%d by %s (state=%s) — triggered %d review schedule(s)",
+				payload.Repository.FullName, payload.PullRequest.Number, payload.Sender.Login, payload.Review.State, affected)
+		}
 
 		c.JSON(http.StatusOK, gin.H{
 			"status":             "triggered",
