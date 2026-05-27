@@ -202,7 +202,9 @@ func (p *CPProvisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string,
 	// - Rejects symlinks at the template root (prevents bypass via symlink traversal)
 	// - Skips symlinks during WalkDir (prevents /etc/passwd etc. inclusion)
 	// - Validates all paths are relative and non-escaping
-	// - Caps total size at 12 KiB to prevent payload bloat
+	// - Caps total size at cpConfigFilesMaxBytes (a transport-DoS guard,
+	//   not the retired 12 KiB user-data ceiling — config now ships off
+	//   user-data via the CP's Secrets-Manager seeding path)
 	configFiles, err := collectCPConfigFiles(cfg)
 	if err != nil {
 		return "", fmt.Errorf("cp provisioner: collect config files: %w", err)
@@ -277,7 +279,27 @@ func (p *CPProvisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string,
 	return result.InstanceID, nil
 }
 
-const cpConfigFilesMaxBytes = 12 << 10
+// cpConfigFilesMaxBytes bounds the aggregate config bundle this tenant
+// ships to the control plane. It is a transport-DoS guard, NOT the old
+// EC2-user-data ceiling.
+//
+// History: this was 12 KiB (12<<10) because the CP embedded the bundle in
+// EC2 user-data, which AWS caps at 16 KiB (the cap left ~4 KiB for bootstrap
+// overhead). That ceiling failed real customers — the jrs-auto SEO Agent's
+// config (long SEO system prompt + SERVICES_REPO_WEBSITE + a 12-schedule
+// block baked into config.yaml) exceeds 12 KiB, so Start() rejected it
+// client-side with "config files exceed 12288 bytes" and the workspace
+// could never provision.
+//
+// Config delivery now goes OFF user-data: the CP stages the bundle to AWS
+// Secrets Manager (molecule/workspace/<id>/config) at provision time and the
+// workspace fetches it into /configs at boot (mirrors the proven tenant
+// bootstrap-secrets pattern). The bundle travels here only inside the JSON
+// HTTP request body to the CP, which has no 16 KiB limit. The remaining
+// bound exists purely so a buggy/hostile tenant can't stream an unbounded
+// body and OOM the CP provision path — set generous (256 KiB) so legitimate
+// growth (more schedules, longer prompts, more skills) never re-hits a wall.
+const cpConfigFilesMaxBytes = 256 << 10
 
 // isCPTemplateConfigFile restricts which files from a template directory are
 // eligible for transport to the control plane. Only config.yaml (the runtime
