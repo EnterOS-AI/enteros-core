@@ -172,10 +172,14 @@ func (h *ChannelHandler) Create(c *gin.Context) {
 	configJSON, marshalErr := json.Marshal(body.Config)
 	if marshalErr != nil {
 		log.Printf("Channels create %s: json.Marshal config failed: %v", workspaceID, marshalErr)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "marshal config failed"})
+		return
 	}
 	allowedJSON, marshalErr := json.Marshal(body.AllowedUsers)
 	if marshalErr != nil {
 		log.Printf("Channels create %s: json.Marshal allowed_users failed: %v", workspaceID, marshalErr)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "marshal allowed_users failed"})
+		return
 	}
 	enabled := true
 	if body.Enabled != nil {
@@ -234,6 +238,8 @@ func (h *ChannelHandler) Update(c *gin.Context) {
 		j, marshalErr := json.Marshal(body.Config)
 		if marshalErr != nil {
 			log.Printf("Channels update %s: json.Marshal config failed: %v", workspaceID, marshalErr)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "marshal config failed"})
+			return
 		}
 		configArg = string(j)
 	}
@@ -241,6 +247,8 @@ func (h *ChannelHandler) Update(c *gin.Context) {
 		j, marshalErr := json.Marshal(body.AllowedUsers)
 		if marshalErr != nil {
 			log.Printf("Channels update %s: json.Marshal allowed_users failed: %v", workspaceID, marshalErr)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "marshal allowed_users failed"})
+			return
 		}
 		allowedArg = string(j)
 	}

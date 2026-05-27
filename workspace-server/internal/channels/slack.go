@@ -163,6 +163,7 @@ func (s *SlackAdapter) sendBotMessage(ctx context.Context, config map[string]int
 		body, marshalErr := json.Marshal(payload)
 		if marshalErr != nil {
 			log.Printf("slack SendMessage: json.Marshal payload failed: %v", marshalErr)
+			return fmt.Errorf("slack: marshal payload: %w", marshalErr)
 		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://slack.com/api/chat.postMessage", bytes.NewReader(body))
 		if err != nil {
