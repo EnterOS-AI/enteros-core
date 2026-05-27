@@ -1,0 +1,59 @@
+# umbrella-reaper — auto-recovery for stale CI umbrella statuses on open PRs.
+#
+# Tracking: molecule-core#1780.
+#
+# Problem: when `CI / all-required (pull_request)` reports failure due to
+# a propagation/timing race despite all 5 required sub-jobs being success,
+# branch protection blocks the merge. Operators currently recover manually
+# per docs/runbooks/ci-umbrella-stale-compensating-status.md.
+#
+# This workflow automates that recovery: every 10 minutes it scans open
+# PRs and posts a compensating success status when the umbrella is stale
+# but all sub-jobs are verified green.
+#
+# Trust boundary: the script only reads PR lists + statuses and POSTs to
+# /statuses/{sha}. It never checks out PR HEAD code. The Gitea token has
+# write:repository scope for statuses only.
+#
+# Sibling: .gitea/workflows/status-reaper.yml (default-branch push-suffix
+# compensation). Same persona provisioning model.
+
+name: umbrella-reaper
+
+on:
+  # Run every 10 minutes — frequent enough to catch propagation races
+  # before human reviewers notice, but not so frequent that it hammers
+  # the API. The script is idempotent (Gitea de-dups by context).
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# NOTE: NO `concurrency:` block is intentional — same reasoning as
+# status-reaper.yml. Gitea 1.22.6 doesn't honor cancel-in-progress for
+# queued ticks; the POST is idempotent so concurrent ticks are safe.
+
+jobs:
+  reap:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Check out repo at default-branch HEAD
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+
+      - name: Compensate stale PR umbrella statuses
+        env:
+          GITEA_TOKEN: ${{ secrets.UMBRELLA_REAPER_TOKEN || secrets.GITHUB_TOKEN }}
+          GITEA_HOST: git.moleculesai.app
+          REPO: ${{ github.repository }}
+          PR_LIMIT: "50"
+        run: python3 .gitea/scripts/umbrella-reaper.py
