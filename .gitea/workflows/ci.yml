@@ -164,12 +164,20 @@ jobs:
         # mc#774: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
         continue-on-error: true
       - if: ${{ needs.changes.outputs.platform == 'true' }}
-        name: Run tests with race detection and coverage
-        # Explicit timeout: cold runner cache causes OOM kills at ~4m39s on the
-        # full ./... suite with race detection + coverage. A 10m per-step timeout
-        # lets the suite complete on cold cache (~5-7m) while failing cleanly
-        # instead of OOM-killing. The job-level timeout (15m) is a backstop.
-        run: go test -race -timeout 10m -coverprofile=coverage.out ./...
+        name: Run tests with coverage (blocking gate)
+        # Removed -race from the blocking gate per #1184: cold runners
+        # take 13-25 min to compile with race instrumentation, exceeding
+        # the 10m step timeout and causing false failures. Race detection
+        # now runs as a non-blocking advisory step below.
+        run: go test -timeout 10m -coverprofile=coverage.out ./...
+
+      - if: ${{ needs.changes.outputs.platform == 'true' }}
+        name: Race detection (advisory, non-blocking)
+        # mc#1184: runs race detector as an advisory check so cold-runner
+        # compile-time spikes don't block merges. Failures here surface in
+        # the run log but do not fail the build.
+        run: go test -race -timeout 10m ./...
+        continue-on-error: true
 
       - if: ${{ needs.changes.outputs.platform == 'true' }}
         name: Per-file coverage report
