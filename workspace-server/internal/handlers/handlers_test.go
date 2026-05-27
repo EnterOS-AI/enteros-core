@@ -447,7 +447,7 @@ func TestWorkspaceCreate_ReturnsAuthToken_201(t *testing.T) {
 
 	mock.ExpectBegin()
 	mock.ExpectExec("INSERT INTO workspaces").
-		WithArgs(sqlmock.AnyArg(), "Token Holder", nil, 3, "langgraph", sqlmock.AnyArg(), (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
+		WithArgs(sqlmock.AnyArg(), "Token Holder", nil, 3, "claude-code", (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 	mock.ExpectExec("INSERT INTO canvas_layouts").

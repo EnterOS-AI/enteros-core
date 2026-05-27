@@ -440,8 +440,9 @@ func TestWorkspaceCreate_SaaSHardForcesTier4(t *testing.T) {
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec("INSERT INTO structure_events").
 		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec("INSERT INTO workspace_auth_tokens").
-		WillReturnResult(sqlmock.NewResult(0, 1))
+	// External workspaces return early with connectionToken in the
+	// connection payload; they do NOT reach the inline auth_token mint
+	// at the bottom of Create (non-external path only).
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -606,8 +607,7 @@ func TestWorkspaceCreate_ExternalURL_SSRFSafe(t *testing.T) {
 	mock.ExpectExec("UPDATE workspaces SET url").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	// CacheURL is non-fatal — uses Redis (db.RDB, set by setupTestRedis), not the DB.
-	mock.ExpectExec("INSERT INTO workspace_auth_tokens").
-		WillReturnResult(sqlmock.NewResult(0, 1))
+	// External workspaces return early before the inline auth_token mint.
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
