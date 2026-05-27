@@ -149,6 +149,7 @@ func (h *MCPHandler) toolListPeers(ctx context.Context, workspaceID string) (str
 	b, marshalErr := json.MarshalIndent(peers, "", "  ")
 	if marshalErr != nil {
 		log.Printf("toolListPeers: json.MarshalIndent peers failed: %v", marshalErr)
+		return "", fmt.Errorf("marshal response: %w", marshalErr)
 	}
 	return string(b), nil
 }
@@ -182,6 +183,7 @@ func (h *MCPHandler) toolGetWorkspaceInfo(ctx context.Context, workspaceID strin
 	b, marshalErr := json.MarshalIndent(info, "", "  ")
 	if marshalErr != nil {
 		log.Printf("toolGetWorkspaceInfo %s: json.MarshalIndent info failed: %v", workspaceID, marshalErr)
+		return "", fmt.Errorf("marshal response: %w", marshalErr)
 	}
 	return string(b), nil
 }
@@ -338,8 +340,12 @@ func (h *MCPHandler) toolCheckTaskStatus(ctx context.Context, callerID string, a
 
 	result := map[string]interface{}{
 		"task_id":   taskID,
-		"status":    status.String,
 		"target_id": targetID,
+	}
+	if status.Valid {
+		result["status"] = status.String
+	} else {
+		result["status"] = "unknown"
 	}
 	if errorDetail.Valid && errorDetail.String != "" {
 		result["error"] = errorDetail.String
@@ -350,6 +356,7 @@ func (h *MCPHandler) toolCheckTaskStatus(ctx context.Context, callerID string, a
 	b, marshalErr := json.MarshalIndent(result, "", "  ")
 	if marshalErr != nil {
 		log.Printf("toolCheckTaskStatus: json.MarshalIndent result failed: %v", marshalErr)
+		return "", fmt.Errorf("marshal response: %w", marshalErr)
 	}
 	return string(b), nil
 }

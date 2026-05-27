@@ -160,13 +160,14 @@ func (h *ScheduleHandler) Create(c *gin.Context) {
 	}
 
 	// Validate timezone
-	if _, err := time.LoadLocation(body.Timezone); err != nil {
+	loc, err := time.LoadLocation(body.Timezone)
+	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid timezone: " + body.Timezone})
 		return
 	}
 
 	// Validate and compute next run
-	nextRun, err := scheduler.ComputeNextRun(body.CronExpr, body.Timezone, time.Now())
+	nextRun, err := scheduler.ComputeNextRun(body.CronExpr, body.Timezone, time.Now().In(loc))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
 		return
@@ -260,11 +261,12 @@ func (h *ScheduleHandler) Update(c *gin.Context) {
 		if body.Timezone != nil {
 			tz = *body.Timezone
 		}
-		if _, err := time.LoadLocation(tz); err != nil {
+		loc, err := time.LoadLocation(tz)
+		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid timezone: " + tz})
 			return
 		}
-		nextRun, err := scheduler.ComputeNextRun(cronExpr, tz, time.Now())
+		nextRun, err := scheduler.ComputeNextRun(cronExpr, tz, time.Now().In(loc))
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
 			return

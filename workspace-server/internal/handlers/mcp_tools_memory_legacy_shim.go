@@ -194,6 +194,7 @@ func (h *MCPHandler) recallMemoryLegacyShim(ctx context.Context, workspaceID str
 	b, marshalErr := json.MarshalIndent(out, "", "  ")
 	if marshalErr != nil {
 		log.Printf("toolRecallMemory: json.MarshalIndent out failed: %v", marshalErr)
+		return "", fmt.Errorf("marshal response: %w", marshalErr)
 	}
 	return string(b), nil
 }

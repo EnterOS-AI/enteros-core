@@ -166,6 +166,7 @@ func (h *MCPHandler) toolCommitMemoryV2(ctx context.Context, workspaceID string,
 	out, marshalErr := json.Marshal(resp)
 	if marshalErr != nil {
 		log.Printf("toolCommitMemoryV2 %s: json.Marshal resp failed: %v", workspaceID, marshalErr)
+		return "", fmt.Errorf("marshal response: %w", marshalErr)
 	}
 	return string(out), nil
 }
@@ -223,6 +224,7 @@ func (h *MCPHandler) toolSearchMemory(ctx context.Context, workspaceID string, a
 	out, marshalErr := json.Marshal(resp)
 	if marshalErr != nil {
 		log.Printf("toolSearchMemory %s: json.Marshal resp failed: %v", workspaceID, marshalErr)
+		return "", fmt.Errorf("marshal response: %w", marshalErr)
 	}
 	return string(out), nil
 }
@@ -281,6 +283,7 @@ func (h *MCPHandler) toolCommitSummary(ctx context.Context, workspaceID string, 
 	out, marshalErr := json.Marshal(resp)
 	if marshalErr != nil {
 		log.Printf("toolCommitSummary %s: json.Marshal resp failed: %v", workspaceID, marshalErr)
+		return "", fmt.Errorf("marshal response: %w", marshalErr)
 	}
 	return string(out), nil
 }
@@ -300,6 +303,7 @@ func (h *MCPHandler) toolListWritableNamespaces(ctx context.Context, workspaceID
 	b, marshalErr := json.MarshalIndent(ns, "", "  ")
 	if marshalErr != nil {
 		log.Printf("toolListWritableNamespaces %s: json.MarshalIndent ns failed: %v", workspaceID, marshalErr)
+		return "", fmt.Errorf("marshal response: %w", marshalErr)
 	}
 	return string(b), nil
 }
@@ -315,6 +319,7 @@ func (h *MCPHandler) toolListReadableNamespaces(ctx context.Context, workspaceID
 	b, marshalErr := json.MarshalIndent(ns, "", "  ")
 	if marshalErr != nil {
 		log.Printf("toolListReadableNamespaces %s: json.MarshalIndent ns failed: %v", workspaceID, marshalErr)
+		return "", fmt.Errorf("marshal response: %w", marshalErr)
 	}
 	return string(b), nil
 }

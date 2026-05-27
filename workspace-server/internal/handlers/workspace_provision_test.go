@@ -1616,3 +1616,28 @@ func (*mockResolver) Scheme() string { return "" }
 func (m *mockResolver) Fetch(_ context.Context, _, _ string) (string, error) {
 	return m.fetchName, m.fetchErr
 }
+
+// TestRuntimeUsesAnthropicNativeProxy_CaseAndWhitespace proves the
+// strings.EqualFold hardening: the runtime check now matches "claude-code"
+// case-insensitively (and after trimming whitespace) instead of relying on
+// a lowercased exact compare.
+func TestRuntimeUsesAnthropicNativeProxy_CaseAndWhitespace(t *testing.T) {
+	cases := []struct {
+		runtime string
+		want    bool
+	}{
+		{"claude-code", true},
+		{"Claude-Code", true},
+		{"CLAUDE-CODE", true},
+		{"  claude-code  ", true},
+		{"\tClaude-Code\n", true},
+		{"claude-code-x", false},
+		{"codex", false},
+		{"", false},
+	}
+	for _, c := range cases {
+		if got := runtimeUsesAnthropicNativeProxy(c.runtime); got != c.want {
+			t.Errorf("runtimeUsesAnthropicNativeProxy(%q) = %v, want %v", c.runtime, got, c.want)
+		}
+	}
+}

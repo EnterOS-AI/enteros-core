@@ -336,6 +336,36 @@ func TestMCPHandler_DelegateTaskAsync_MarshalFailureDoesNotCallProxy(t *testing.
 	}
 }
 
+// TestMCPHandler_CheckTaskStatus_NullStatusDefaultsToUnknown proves the
+// extracted #1933 hardening: when the activity_logs row has a NULL status,
+// check_task_status reports "unknown" instead of an empty string (the old
+// status.String zero value).
+func TestMCPHandler_CheckTaskStatus_NullStatusDefaultsToUnknown(t *testing.T) {
+	h, mock := newMCPHandler(t)
+	callerID := "11111111-1111-1111-1111-111111111111"
+	targetID := "22222222-2222-2222-2222-222222222222"
+	taskID := "task-abc"
+
+	mock.ExpectQuery(`(?s)SELECT status, error_detail, response_body.*FROM activity_logs`).
+		WithArgs(callerID, targetID, taskID).
+		WillReturnRows(sqlmock.NewRows([]string{"status", "error_detail", "response_body"}).
+			AddRow(nil, nil, nil))
+
+	out, err := h.toolCheckTaskStatus(context.Background(), callerID, map[string]interface{}{
+		"workspace_id": targetID,
+		"task_id":      taskID,
+	})
+	if err != nil {
+		t.Fatalf("check_task_status returned error: %v", err)
+	}
+	if !strings.Contains(out, `"status": "unknown"`) {
+		t.Fatalf("expected status \"unknown\" for NULL status row, got: %s", out)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // notifications/initialized
 // ─────────────────────────────────────────────────────────────────────────────
