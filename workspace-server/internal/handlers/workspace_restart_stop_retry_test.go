@@ -248,8 +248,13 @@ func TestRestart_CPStopOnlyInsideRetryHelper(t *testing.T) {
 		if !ok || fn.Body == nil || fn.Recv == nil {
 			continue
 		}
-		// cpStopWithRetry is the ONE allowed home for h.cpProv.Stop.
-		if fn.Name.Name == "cpStopWithRetry" {
+		// cpStopWithRetryErr is the ONE allowed home for h.cpProv.Stop —
+		// the bounded-retry loop. cpStopWithRetry is the void-returning
+		// wrapper (restart path) that delegates to it; the delete path uses
+		// cpStopWithRetryErr directly via stopWorkspaceForDelete to capture
+		// the terminal error (task #15). Both wrappers are exempt from this
+		// gate; any OTHER direct cpProv.Stop is the silent-leak regression.
+		if fn.Name.Name == "cpStopWithRetry" || fn.Name.Name == "cpStopWithRetryErr" {
 			continue
 		}
 		ast.Inspect(fn.Body, func(n ast.Node) bool {
