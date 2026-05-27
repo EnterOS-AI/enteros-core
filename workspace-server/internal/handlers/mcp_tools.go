@@ -97,20 +97,19 @@ func (h *MCPHandler) toolListPeers(ctx context.Context, workspaceID string) (str
 
 	const cols = `SELECT w.id, w.name, COALESCE(w.role,''), w.status, w.tier`
 
-	// Siblings
+	// Siblings — workspaces sharing the caller's parent.
+	//
+	// #1953 cross-tenant isolation: the OLD else-branch returned every
+	// workspace with parent_id IS NULL when the caller was itself an org root,
+	// i.e. every other tenant's org root (the workspaces table has no org_id
+	// column). That leaked peer identities across tenants via MCP list_peers.
+	// An org root has no siblings inside its own org, so the org-root caller
+	// now gets no siblings; its peers are its children, enumerated below. Only
+	// the parent_id-bound branch enumerates siblings, scoped to one tenant.
 	if parentID.Valid {
 		rows, err := h.database.QueryContext(ctx,
 			cols+` FROM workspaces w WHERE w.parent_id = $1 AND w.id != $2 AND w.status != 'removed'`,
 			parentID.String, workspaceID)
-		if err == nil {
-			if scanErr := scanPeers(rows); scanErr != nil {
-				log.Printf("MCP toolListPeers: sibling scan error: %v", scanErr)
-			}
-		}
-	} else {
-		rows, err := h.database.QueryContext(ctx,
-			cols+` FROM workspaces w WHERE w.parent_id IS NULL AND w.id != $1 AND w.status != 'removed'`,
-			workspaceID)
 		if err == nil {
 			if scanErr := scanPeers(rows); scanErr != nil {
 				log.Printf("MCP toolListPeers: sibling scan error: %v", scanErr)

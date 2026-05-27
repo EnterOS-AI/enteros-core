@@ -140,7 +140,14 @@ func buildHTTPResponse(statusCode int, body string) []byte {
 }
 
 // setupIntegrationFixtures inserts the rows executeDelegation requires:
-//   - workspaces: source and target (siblings, parent_id=NULL so CanCommunicate=true)
+//   - workspaces: source (org root) + target as its CHILD, so both live in the
+//     SAME org. CanCommunicate=true (parent↔child) AND the #1953 sameOrg() guard
+//     in proxyA2ARequest passes (both resolve to the same org root). A real
+//     delegation happens INSIDE one org. (Previously both were parent_id=NULL —
+//     two DISTINCT org roots — which only "communicated" via CanCommunicate's
+//     root-sibling rule; #1953 added a sameOrg() guard that now denies routing
+//     between two org roots as cross-tenant, so the success-path tests below
+//     must use a same-org source/target pair.)
 //   - activity_logs: the 'delegate' row that updateDelegationStatus UPDATE will find
 //   - delegations: the ledger row that recordLedgerStatus will UPDATE
 //
@@ -148,13 +155,14 @@ func buildHTTPResponse(statusCode int, body string) []byte {
 func setupIntegrationFixtures(t *testing.T, conn *sql.DB) func() {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	sourceID := integrationTestSourceID // org root (parent_id NULL); target hangs off it
 	for _, ws := range []struct {
 		id       string
 		name     string
 		parentID *string
 	}{
 		{integrationTestSourceID, "test-source", nil},
-		{integrationTestTargetID, "test-target", nil},
+		{integrationTestTargetID, "test-target", &sourceID}, // child of source → same org
 	} {
 		if _, err := conn.ExecContext(ctx,
 			`INSERT INTO workspaces (id, name, parent_id) VALUES ($1::uuid, $2, $3) ON CONFLICT (id) DO NOTHING`,
@@ -507,6 +515,94 @@ func TestIntegration_ExecuteDelegation_RedisDown_FallsBackToDB(t *testing.T) {
 	}
 	if errDet == "" {
 		t.Error("error_detail should be set on failure due to unreachable target")
+	}
+}
+
+// TestIntegration_SameOrg_RealCTE_ResolvesAncestorChain is the regression gate
+// for the org_scope.go recursive-CTE bug (#1953 follow-up). The sqlmock unit
+// tests feed sameOrg() a pre-computed root_id row, so they CANNOT catch a wrong
+// CTE — they assume it already returns the right value. Only a real Postgres
+// run exercises orgRootSubtreeCTE itself.
+//
+// The bug: the CTE carried `id AS root_id` from the recursive SEED, so a
+// non-root workspace resolved to ITSELF instead of its topmost ancestor. That
+// made sameOrg() return false for two genuinely same-org workspaces and 403 a
+// legitimate same-org a2a route (over-block). This test seeds a real
+// root → child → grandchild chain plus a separate org root, and asserts:
+//   - every node in the chain resolves to the SAME org root (root, child, grandchild)
+//   - two workspaces in the same chain are sameOrg (incl. grandchild ↔ root)
+//   - a workspace in a DIFFERENT chain is NOT sameOrg (cross-tenant stays closed)
+func TestIntegration_SameOrg_RealCTE_ResolvesAncestorChain(t *testing.T) {
+	conn := integrationDB(t)
+
+	const (
+		rootA       = "11111111-1111-1111-1111-111111111111"
+		childA      = "22222222-2222-2222-2222-222222222222"
+		grandchildA = "33333333-3333-3333-3333-333333333333"
+		rootB       = "44444444-4444-4444-4444-444444444444"
+	)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	t.Cleanup(func() {
+		c2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel2()
+		// Delete leaf-first to respect the parent_id self-FK.
+		for _, id := range []string{grandchildA, childA, rootA, rootB} {
+			conn.ExecContext(c2, `DELETE FROM workspaces WHERE id = $1`, id)
+		}
+	})
+
+	// Insert parent-before-child to satisfy the self-referential FK.
+	seed := []struct {
+		id, name string
+		parent   *string
+	}{
+		{rootA, "org-a-root", nil},
+		{childA, "org-a-child", strPtr(rootA)},
+		{grandchildA, "org-a-grandchild", strPtr(childA)},
+		{rootB, "org-b-root", nil},
+	}
+	for _, s := range seed {
+		if _, err := conn.ExecContext(ctx,
+			`INSERT INTO workspaces (id, name, parent_id) VALUES ($1::uuid, $2, $3) ON CONFLICT (id) DO NOTHING`,
+			s.id, s.name, s.parent); err != nil {
+			t.Fatalf("seed %s: %v", s.name, err)
+		}
+	}
+
+	// Every node in chain A must resolve to rootA via the REAL CTE.
+	for _, id := range []string{rootA, childA, grandchildA} {
+		got, err := orgRootID(ctx, conn, id)
+		if err != nil {
+			t.Fatalf("orgRootID(%s): %v", id, err)
+		}
+		if got != rootA {
+			t.Errorf("orgRootID(%s) = %q, want rootA %q (CTE must walk to topmost ancestor)", id, got, rootA)
+		}
+	}
+
+	// Same-org positives — including the grandchild↔root pair that the buggy
+	// CTE got wrong.
+	for _, pair := range [][2]string{{childA, grandchildA}, {rootA, grandchildA}, {rootA, childA}} {
+		ok, err := sameOrg(ctx, conn, pair[0], pair[1])
+		if err != nil {
+			t.Fatalf("sameOrg(%s,%s): %v", pair[0], pair[1], err)
+		}
+		if !ok {
+			t.Errorf("sameOrg(%s,%s) = false, want true (same org chain)", pair[0], pair[1])
+		}
+	}
+
+	// Cross-org negative — isolation must stay closed.
+	for _, pair := range [][2]string{{rootA, rootB}, {grandchildA, rootB}, {childA, rootB}} {
+		ok, err := sameOrg(ctx, conn, pair[0], pair[1])
+		if err != nil {
+			t.Fatalf("sameOrg(%s,%s): %v", pair[0], pair[1], err)
+		}
+		if ok {
+			t.Errorf("sameOrg(%s,%s) = true, want false (different orgs — cross-tenant must stay denied)", pair[0], pair[1])
+		}
 	}
 }
 
