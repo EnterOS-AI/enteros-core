@@ -288,6 +288,40 @@ export function deriveProvidersFromModels(models: ModelSpec[]): string[] {
   return out;
 }
 
+// billingModeForProvider — maps a selected PROVIDER (vendor key) to the
+// LLM billing_mode it implies (internal#703 Gap 2).
+//
+// Today, picking a non-Platform provider in the Config tab writes the
+// credential env (CLAUDE_CODE_OAUTH_TOKEN / vendor key) but leaves
+// llm_billing_mode at its resolved default (`platform_managed`). The CP
+// tenant_config endpoint then keeps injecting the platform proxy base
+// URLs, so the OAuth token / vendor key is never actually used — BYOK
+// silently no-ops (the live SEO-Agent symptom in #703). The workspace-
+// server even hard-blocks vendor-key writes on platform_managed
+// workspaces (secrets.go:87), pointing the user at this exact billing-
+// mode switch. Wiring the provider change to also set billing_mode is
+// the UI half that makes BYOK take (the CP/workspace-server backend half
+// is being fixed in parallel — internal#703 Gap 1).
+//
+// Mapping:
+//   - "platform" (the Platform-managed proxy) OR "" (no explicit
+//     provider override → inherit, defaults to platform) → "platform_managed".
+//   - any other vendor key ("anthropic-oauth" = Claude Code subscription
+//     OAuth, "anthropic" = Anthropic API key, "minimax", "openrouter",
+//     etc.) → "byok".
+//
+// Returns the billing_mode string the PUT body should carry. The valid
+// set is fixed by workspace-server's recognizer (platform_managed | byok
+// | disabled); "disabled" is never auto-selected by a provider choice —
+// it's an explicit operator action via the LLM Billing section.
+export type LLMBillingMode = "platform_managed" | "byok";
+
+export function billingModeForProvider(provider: string): LLMBillingMode {
+  const v = provider.trim().toLowerCase();
+  if (v === "" || v === "platform") return "platform_managed";
+  return "byok";
+}
+
 // Fallback used when /templates can't be fetched (offline, older backend).
 // Keep in sync with manifest.json workspace_templates as a defensive default.
 // Model + env suggestions only flow when the backend is reachable.
@@ -702,6 +736,36 @@ export function ConfigTab({ workspaceId }: Props) {
         }
       }
 
+      // Provider → billing_mode linkage (internal#703 Gap 2). When the
+      // provider actually changed AND its implied billing_mode differs
+      // from the previously-selected provider's, push the new mode to
+      // the per-tenant llm-billing-mode endpoint (same path the LLM
+      // Billing section uses). Without this, selecting a non-Platform
+      // provider leaves billing_mode=platform_managed → CP keeps
+      // injecting the platform proxy → BYOK never takes.
+      //
+      // Gated on (a) the provider PUT having succeeded — no point setting
+      // byok if the credential write failed — and (b) the mode actually
+      // changing, so an unrelated provider tweak between two BYOK vendors
+      // (e.g. minimax → openrouter) doesn't re-issue a redundant
+      // platform_managed→byok PUT and trigger a needless restart.
+      let billingModeSaveError: string | null = null;
+      if (providerChanged && !providerSaveError) {
+        const nextMode = billingModeForProvider(provider);
+        const prevMode = billingModeForProvider(originalProvider);
+        if (nextMode !== prevMode) {
+          try {
+            await api.put(
+              `/admin/workspaces/${workspaceId}/llm-billing-mode`,
+              { mode: nextMode },
+            );
+          } catch (e) {
+            billingModeSaveError =
+              e instanceof Error ? e.message : "Billing mode update was rejected";
+          }
+        }
+      }
+
       setOriginalYaml(content);
       if (rawMode) {
         const parsed = parseYaml(content);
@@ -721,16 +785,22 @@ export function ConfigTab({ workspaceId }: Props) {
       } else if (!restart) {
         useCanvasStore.getState().updateNodeData(workspaceId, { needsRestart: !providerWillAutoRestart });
       }
-      // Aggregate partial-save errors. Both modelSaveError and
-      // providerSaveError describe rejected updates from independent
-      // endpoints — show whichever fired so the user knows which
-      // field reverts on next reload (otherwise they'd see "Saved" and
-      // be confused why Provider snapped back).
+      // Aggregate partial-save errors. modelSaveError, providerSaveError,
+      // and billingModeSaveError describe rejected updates from
+      // independent endpoints — show whichever fired so the user knows
+      // which field reverts on next reload (otherwise they'd see "Saved"
+      // and be confused why Provider snapped back). The billing-mode case
+      // is the most important to surface: the provider credential saved
+      // but BYOK won't actually take until billing_mode flips, so a
+      // silent failure here is exactly the #703 "selecting a provider has
+      // no effect" symptom.
       const partialError = providerSaveError
         ? `Other fields saved, but provider update failed: ${providerSaveError}`
-        : modelSaveError
-          ? `Other fields saved, but model update failed: ${modelSaveError}`
-          : null;
+        : billingModeSaveError
+          ? `Provider saved, but switching billing mode failed — your own provider key/OAuth may not take effect until billing mode is set: ${billingModeSaveError}`
+          : modelSaveError
+            ? `Other fields saved, but model update failed: ${modelSaveError}`
+            : null;
       if (partialError) {
         setError(partialError);
       } else {
