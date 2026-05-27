@@ -376,14 +376,14 @@ func TestExtended_DiscoverWithCallerID(t *testing.T) {
 	handler := NewDiscoveryHandler()
 
 	// CanCommunicate needs to look up both workspaces
-	// Caller: root-level (no parent)
+	// Share a parent so communication is allowed under post-#1955 rules
+	sharedParent := "ws-parent"
 	mock.ExpectQuery("SELECT id, parent_id FROM workspaces WHERE id =").
 		WithArgs("ws-caller").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "parent_id"}).AddRow("ws-caller", nil))
-	// Target: also root-level (no parent) — root-level siblings are allowed
+		WillReturnRows(sqlmock.NewRows([]string{"id", "parent_id"}).AddRow("ws-caller", sharedParent))
 	mock.ExpectQuery("SELECT id, parent_id FROM workspaces WHERE id =").
 		WithArgs("ws-target").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "parent_id"}).AddRow("ws-target", nil))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "parent_id"}).AddRow("ws-target", sharedParent))
 
 	// Discover handler looks up workspace name + runtime
 	mock.ExpectQuery("SELECT COALESCE").
@@ -517,13 +517,14 @@ func TestExtended_CheckAccess(t *testing.T) {
 	handler := NewDiscoveryHandler()
 
 	// CanCommunicate will look up both workspaces
-	// Both root-level — should be allowed
+	// Share a parent so communication is allowed under post-#1955 rules
+	sharedParent := "ws-parent"
 	mock.ExpectQuery("SELECT id, parent_id FROM workspaces WHERE id =").
 		WithArgs("ws-a").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "parent_id"}).AddRow("ws-a", nil))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "parent_id"}).AddRow("ws-a", sharedParent))
 	mock.ExpectQuery("SELECT id, parent_id FROM workspaces WHERE id =").
 		WithArgs("ws-b").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "parent_id"}).AddRow("ws-b", nil))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "parent_id"}).AddRow("ws-b", sharedParent))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
