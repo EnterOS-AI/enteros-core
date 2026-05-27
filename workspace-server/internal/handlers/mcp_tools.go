@@ -20,6 +20,11 @@ import (
 	"github.com/google/uuid"
 )
 
+// marshalA2ABody marshals the JSON-RPC body for an async A2A dispatch.
+// Indirected through a package var so tests can force the (otherwise
+// near-impossible) marshal-failure path and assert the early return.
+var marshalA2ABody = json.Marshal
+
 // insertMCPDelegationRow writes a delegation activity row so the canvas
 // Agent Comms tab can show the task text for MCP-initiated delegations.
 // Mirrors insertDelegationRow (delegation.go) for the MCP tool path.
@@ -269,7 +274,7 @@ func (h *MCPHandler) toolDelegateTaskAsync(ctx context.Context, callerID string,
 		bgCtx, cancel := context.WithTimeout(context.Background(), mcpAsyncCallTimeout)
 		defer cancel()
 
-		a2aBody, marshalErr := json.Marshal(map[string]interface{}{
+		a2aBody, marshalErr := marshalA2ABody(map[string]interface{}{
 			"jsonrpc": "2.0",
 			"id":      delegationID,
 			"method":  "message/send",
@@ -283,6 +288,9 @@ func (h *MCPHandler) toolDelegateTaskAsync(ctx context.Context, callerID string,
 		})
 		if marshalErr != nil {
 			log.Printf("toolDelegateTask %s: json.Marshal a2aBody failed: %v", delegationID, marshalErr)
+			// Bail out: proceeding would call proxyA2ARequest with a
+			// nil/empty body, dispatching a malformed A2A request.
+			return
 		}
 
 		status, _, err := h.proxyA2ARequest(bgCtx, targetID, a2aBody, callerID, true)
