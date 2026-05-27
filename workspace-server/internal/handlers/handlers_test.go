@@ -492,8 +492,6 @@ func TestWorkspaceCreate_ReturnsAuthToken_201(t *testing.T) {
 	}
 }
 
-func TestBuildProvisionerConfig_IncludesAwarenessSettings(t *testing.T) {
-
 func TestBuildProvisionerConfig_WorkspacePathFromPayload(t *testing.T) {
 	setupTestDB(t)
 	broadcaster := newTestBroadcaster()
