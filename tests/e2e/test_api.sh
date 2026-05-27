@@ -73,7 +73,15 @@ else
 fi
 
 # Test 4: Create workspace B (needs bearer — tokens now exist in DB)
-R=$(acurl -X POST "$BASE/workspaces" -H "Content-Type: application/json" -d '{"name":"Summarizer Agent","tier":1,"runtime":"external","external":true}')
+# #1953 cross-tenant isolation: Summarizer is created as a CHILD of Echo so the
+# two live in the SAME org (Echo is the org root; Summarizer hangs off it via
+# parent_id). The peer-discovery tests below assert same-org peer enumeration
+# (Echo sees its child, the child sees its parent). Previously both were created
+# parent_id=NULL — two DISTINCT org roots — and "peers" only listed each other
+# via the `WHERE parent_id IS NULL` branch that returned every tenant's org root.
+# That branch WAS the cross-tenant leak (#1953) and is now removed, so two org
+# roots no longer see each other; the assertions must run inside one org.
+R=$(acurl -X POST "$BASE/workspaces" -H "Content-Type: application/json" -d "{\"name\":\"Summarizer Agent\",\"tier\":1,\"runtime\":\"external\",\"external\":true,\"parent_id\":\"$ECHO_ID\"}")
 check "POST /workspaces (create summarizer)" '"status":"awaiting_agent"' "$R"
 SUM_ID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
 
@@ -133,21 +141,23 @@ check "Heartbeat updated uptime" '"uptime_seconds":120' "$R"
 R=$(curl -s "$BASE/registry/discover/$ECHO_ID")
 check "GET /registry/discover/:id (missing caller rejected)" 'X-Workspace-ID header is required' "$R"
 
-# Test 12: Discover (from sibling — allowed)
+# Test 12: Discover (from same-org child — allowed)
 R=$(curl -s "$BASE/registry/discover/$ECHO_ID" -H "X-Workspace-ID: $SUM_ID" -H "Authorization: Bearer $SUM_TOKEN")
-check "GET /registry/discover/:id (sibling)" '"url"' "$R"
+check "GET /registry/discover/:id (same-org)" '"url"' "$R"
 
-# Test 13: Peers (root siblings see each other)
+# Test 13: Peers — same-org parent/child see each other (#1953). Echo is the org
+# root and lists its child Summarizer; Summarizer lists its parent Echo. A
+# cross-org workspace would NOT appear here (see cross_tenant_isolation_test.go).
 R=$(curl -s "$BASE/registry/$ECHO_ID/peers" -H "Authorization: Bearer $ECHO_TOKEN")
 check "GET /registry/:id/peers (has summarizer)" '"Summarizer' "$R"
 
 R=$(curl -s "$BASE/registry/$SUM_ID/peers" -H "Authorization: Bearer $SUM_TOKEN")
 check "GET /registry/:id/peers (has echo)" '"Echo Agent"' "$R"
 
-# Test 14: Check access (root siblings)
+# Test 14: Check access (same-org parent↔child — allowed)
 R=$(curl -s -X POST "$BASE/registry/check-access" -H "Content-Type: application/json" \
   -d "{\"caller_id\":\"$ECHO_ID\",\"target_id\":\"$SUM_ID\"}")
-check "POST /registry/check-access (siblings allowed)" '"allowed":true' "$R"
+check "POST /registry/check-access (same-org allowed)" '"allowed":true' "$R"
 
 # Test 15: PATCH workspace (update position)
 R=$(acurl -X PATCH "$BASE/workspaces/$ECHO_ID" -H "Content-Type: application/json" -d '{"x":100,"y":200}')

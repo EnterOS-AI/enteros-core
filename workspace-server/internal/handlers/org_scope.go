@@ -37,19 +37,28 @@ var errNoOrgRoot = errors.New("org root not found for workspace")
 //
 //	$1 = workspace id to resolve
 //
-// Selecting root_id WHERE parent_id IS NULL yields exactly one row: the topmost
-// ancestor (the org root). A workspace that IS an org root resolves to itself.
+// The recursive member walks UP the parent_id chain: each step joins to the row
+// whose id is the current row's parent_id. The topmost ancestor is the single
+// chain row with parent_id IS NULL — and THAT row's own `id` is the org root.
+//
+// We select that parentless row's `id` (aliased root_id). We must NOT carry a
+// fixed `id AS root_id` from the recursive seed: that value is just the input
+// workspace id, so a non-root caller (e.g. a child delegating to a sibling)
+// would resolve to ITSELF instead of its org root, and sameOrg() would wrongly
+// report two genuinely same-org workspaces as different orgs and 403 a
+// legitimate a2a route. A workspace that already IS an org root has a one-row
+// chain whose id == itself, so it correctly resolves to itself.
 const orgRootSubtreeCTE = `
 	WITH RECURSIVE org_chain AS (
-		SELECT id, parent_id, id AS root_id
+		SELECT id, parent_id
 		FROM workspaces
 		WHERE id = $1
 		UNION ALL
-		SELECT w.id, w.parent_id, c.root_id
+		SELECT w.id, w.parent_id
 		FROM workspaces w
 		JOIN org_chain c ON w.id = c.parent_id
 	)
-	SELECT root_id FROM org_chain WHERE parent_id IS NULL LIMIT 1
+	SELECT id AS root_id FROM org_chain WHERE parent_id IS NULL LIMIT 1
 `
 
 // orgRootID resolves the org root of `workspaceID` by walking the parent_id
