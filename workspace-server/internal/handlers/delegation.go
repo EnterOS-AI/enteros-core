@@ -431,10 +431,12 @@ func (h *DelegationHandler) executeDelegation(ctx context.Context, sourceID, tar
 	if proxyErr != nil && isTransientProxyError(proxyErr) && len(respBody) == 0 {
 		log.Printf("Delegation %s: first attempt failed (%s) — retrying in %s after reactive URL refresh",
 			delegationID, proxyErr.Error(), delegationRetryDelay)
+		timer := time.NewTimer(delegationRetryDelay)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			// outer timeout hit before retry window elapsed
-		case <-time.After(delegationRetryDelay):
+		case <-timer.C:
 			status, respBody, proxyErr = h.workspace.proxyA2ARequest(ctx, targetID, a2aBody, sourceID, true, false)
 		}
 	}
