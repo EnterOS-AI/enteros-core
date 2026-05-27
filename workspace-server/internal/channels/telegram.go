@@ -482,12 +482,14 @@ func (t *TelegramAdapter) StartPolling(ctx context.Context, config map[string]in
 				if apiErr.Code == 429 {
 					retryAfter := time.Duration(apiErr.RetryAfter) * time.Second
 					log.Printf("Channels: Telegram poll rate-limited, sleeping %s", retryAfter)
+					timer := time.NewTimer(retryAfter)
 					select {
 					case <-ctx.Done():
+						timer.Stop()
 						return nil
-					case <-time.After(retryAfter):
-						continue
+					case <-timer.C:
 					}
+					continue
 				}
 				if apiErr.Code == 401 {
 					invalidateBot(token)
@@ -495,12 +497,14 @@ func (t *TelegramAdapter) StartPolling(ctx context.Context, config map[string]in
 				}
 			}
 			log.Printf("Channels: Telegram poll error: %v", err)
+			timer := time.NewTimer(telegramPollInterval)
 			select {
 			case <-ctx.Done():
+				timer.Stop()
 				return nil
-			case <-time.After(telegramPollInterval):
-				continue
+			case <-timer.C:
 			}
+			continue
 		}
 
 		for _, update := range updates {

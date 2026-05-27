@@ -763,12 +763,14 @@ func (h *WorkspaceHandler) cpStopWithRetryErr(ctx context.Context, workspaceID, 
 		}
 		// Sleep with ctx awareness so a cancelled ctx exits early instead
 		// of stalling the goroutine through the remaining backoff.
+		timer := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			log.Printf("%s: cpProv.Stop(%s) abandoned mid-retry: ctx cancelled (last_err=%v)",
 				source, workspaceID, lastErr)
 			return ctx.Err()
-		case <-time.After(delay):
+		case <-timer.C:
 		}
 		delay *= 2
 	}

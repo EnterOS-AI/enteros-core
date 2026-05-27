@@ -177,10 +177,12 @@ func waitForWorkspaceOnline(ctx context.Context, workspaceID string, timeout tim
 		).Scan(&status); err == nil && status == "online" {
 			return true
 		}
+		timer := time.NewTimer(restartContextOnlinePollInterval)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return false
-		case <-time.After(restartContextOnlinePollInterval):
+		case <-timer.C:
 		}
 	}
 	return false
@@ -213,10 +215,12 @@ func waitForFreshHeartbeat(ctx context.Context, workspaceID string, restartStart
 			lastHB.Valid && lastHB.Time.After(restartStartTs) {
 			return true
 		}
+		timer := time.NewTimer(restartContextOnlinePollInterval)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return false
-		case <-time.After(restartContextOnlinePollInterval):
+		case <-timer.C:
 		}
 	}
 	return false
