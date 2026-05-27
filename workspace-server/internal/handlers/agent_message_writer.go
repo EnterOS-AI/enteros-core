@@ -167,6 +167,7 @@ func (w *AgentMessageWriter) Send(
 	respJSON, marshalErr := json.Marshal(respPayload)
 	if marshalErr != nil {
 		log.Printf("AgentMessageWriter %s: json.Marshal respPayload failed: %v", workspaceID, marshalErr)
+		return nil
 	}
 	preview := textutil.TruncateRunes(message, 80)
 	if _, err := w.db.ExecContext(ctx, `

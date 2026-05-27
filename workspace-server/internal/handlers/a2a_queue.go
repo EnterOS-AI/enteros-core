@@ -425,6 +425,7 @@ func (h *WorkspaceHandler) stitchDrainResponseToDelegation(ctx context.Context, 
 	})
 	if marshalErr != nil {
 		log.Printf("a2aQueue stitch %s: json.Marshal respJSON failed: %v", delegationID, marshalErr)
+		return
 	}
 	res, err := db.DB.ExecContext(ctx, `
 		UPDATE activity_logs

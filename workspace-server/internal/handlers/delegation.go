@@ -60,12 +60,14 @@ func pushDelegationResultToInbox(ctx context.Context, sourceID, delegationID, st
 	respJSON, marshalErr := json.Marshal(respPayload)
 	if marshalErr != nil {
 		log.Printf("Delegation %s: json.Marshal respPayload failed: %v", delegationID, marshalErr)
+		return
 	}
 	reqJSON, marshalErr := json.Marshal(map[string]interface{}{
 		"delegation_id": delegationID,
 	})
 	if marshalErr != nil {
 		log.Printf("Delegation %s: json.Marshal reqPayload failed: %v", delegationID, marshalErr)
+		return
 	}
 	logStatus := "ok"
 	if status == "failed" {
@@ -319,6 +321,7 @@ func insertDelegationRow(ctx context.Context, c *gin.Context, sourceID string, b
 	})
 	if marshalErr != nil {
 		log.Printf("Delegation %s: json.Marshal taskJSON failed: %v", delegationID, marshalErr)
+		return insertTrackingUnavailable
 	}
 	// Store delegation_id in response_body so agent check_delegation_status
 	// (which reads response_body->>delegation_id) can locate this row even
@@ -328,6 +331,7 @@ func insertDelegationRow(ctx context.Context, c *gin.Context, sourceID string, b
 	})
 	if marshalErr != nil {
 		log.Printf("Delegation %s: json.Marshal respJSON failed: %v", delegationID, marshalErr)
+		return insertTrackingUnavailable
 	}
 	var idemArg interface{}
 	if body.IdempotencyKey != "" {
@@ -505,12 +509,13 @@ handleSuccess:
 		})
 		if marshalErr != nil {
 			log.Printf("Delegation %s: json.Marshal queuedJSON failed: %v", delegationID, marshalErr)
-		}
-		if _, err := db.DB.ExecContext(ctx, `
-			INSERT INTO activity_logs (workspace_id, activity_type, method, source_id, target_id, summary, response_body, status)
-			VALUES ($1, 'delegation', 'delegate_result', $2, $3, $4, $5::jsonb, 'queued')
-		`, sourceID, sourceID, targetID, "Delegation queued — target at capacity", string(queuedJSON)); err != nil {
-			log.Printf("Delegation %s: failed to insert queued log: %v", delegationID, err)
+		} else {
+			if _, err := db.DB.ExecContext(ctx, `
+				INSERT INTO activity_logs (workspace_id, activity_type, method, source_id, target_id, summary, response_body, status)
+				VALUES ($1, 'delegation', 'delegate_result', $2, $3, $4, $5::jsonb, 'queued')
+			`, sourceID, sourceID, targetID, "Delegation queued — target at capacity", string(queuedJSON)); err != nil {
+				log.Printf("Delegation %s: failed to insert queued log: %v", delegationID, err)
+			}
 		}
 		h.broadcaster.RecordAndBroadcast(ctx, string(events.EventDelegationStatus), sourceID, map[string]interface{}{
 			"delegation_id": delegationID, "target_id": targetID, "status": "queued",
@@ -531,12 +536,13 @@ handleSuccess:
 	})
 	if marshalErr != nil {
 		log.Printf("Delegation %s: json.Marshal respJSON failed: %v", delegationID, marshalErr)
-	}
-	if _, err := db.DB.ExecContext(ctx, `
-		INSERT INTO activity_logs (workspace_id, activity_type, method, source_id, target_id, summary, response_body, status)
-		VALUES ($1, 'delegation', 'delegate_result', $2, $3, $4, $5::jsonb, 'completed')
-	`, sourceID, sourceID, targetID, "Delegation completed ("+textutil.TruncateBytes(responseText, 80)+")", string(respJSON)); err != nil {
-		log.Printf("Delegation %s: failed to insert success log: %v", delegationID, err)
+	} else {
+		if _, err := db.DB.ExecContext(ctx, `
+			INSERT INTO activity_logs (workspace_id, activity_type, method, source_id, target_id, summary, response_body, status)
+			VALUES ($1, 'delegation', 'delegate_result', $2, $3, $4, $5::jsonb, 'completed')
+		`, sourceID, sourceID, targetID, "Delegation completed ("+textutil.TruncateBytes(responseText, 80)+")", string(respJSON)); err != nil {
+			log.Printf("Delegation %s: failed to insert success log: %v", delegationID, err)
+		}
 	}
 	log.Printf("Delegation %s: step=recording_ledger_completed", delegationID)
 
@@ -619,6 +625,8 @@ func (h *DelegationHandler) Record(c *gin.Context) {
 	})
 	if marshalErr != nil {
 		log.Printf("Delegation %s: json.Marshal taskJSON failed: %v", body.DelegationID, marshalErr)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to marshal task"})
+		return
 	}
 	// Store delegation_id in response_body so agent check_delegation_status
 	// can locate this row. Fixes mc#984.
@@ -627,6 +635,8 @@ func (h *DelegationHandler) Record(c *gin.Context) {
 	})
 	if marshalErr != nil {
 		log.Printf("Delegation %s: json.Marshal respJSON failed: %v", body.DelegationID, marshalErr)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to marshal response"})
+		return
 	}
 	if _, err := db.DB.ExecContext(ctx, `
 		INSERT INTO activity_logs (workspace_id, activity_type, method, source_id, target_id, summary, request_body, response_body, status)
@@ -697,12 +707,13 @@ func (h *DelegationHandler) UpdateStatus(c *gin.Context) {
 		})
 		if marshalErr != nil {
 			log.Printf("Delegation UpdateStatus %s: json.Marshal respJSON failed: %v", delegationID, marshalErr)
-		}
-		if _, err := db.DB.ExecContext(ctx, `
-			INSERT INTO activity_logs (workspace_id, activity_type, method, source_id, summary, response_body, status)
-			VALUES ($1, 'delegation', 'delegate_result', $2, $3, $4::jsonb, 'completed')
-		`, sourceID, sourceID, "Delegation completed ("+textutil.TruncateBytes(body.ResponsePreview, 80)+")", string(respJSON)); err != nil {
-			log.Printf("Delegation UpdateStatus: result insert failed for %s: %v", delegationID, err)
+		} else {
+			if _, err := db.DB.ExecContext(ctx, `
+				INSERT INTO activity_logs (workspace_id, activity_type, method, source_id, summary, response_body, status)
+				VALUES ($1, 'delegation', 'delegate_result', $2, $3, $4::jsonb, 'completed')
+			`, sourceID, sourceID, "Delegation completed ("+textutil.TruncateBytes(body.ResponsePreview, 80)+")", string(respJSON)); err != nil {
+				log.Printf("Delegation UpdateStatus: result insert failed for %s: %v", delegationID, err)
+			}
 		}
 		h.broadcaster.RecordAndBroadcast(ctx, string(events.EventDelegationComplete), sourceID, map[string]interface{}{
 			"delegation_id":    delegationID,

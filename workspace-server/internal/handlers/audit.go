@@ -347,6 +347,7 @@ func computeAuditHMAC(key []byte, ev *auditEventRow) string {
 	payload, marshalErr := json.Marshal(canonical) // compact, sorted keys
 	if marshalErr != nil {
 		log.Printf("auditChainHash: json.Marshal canonical failed: %v", marshalErr)
+		return ""
 	}
 	mac := hmac.New(sha256.New, key)
 	mac.Write(payload)

@@ -247,13 +247,14 @@ func (h *MemoriesHandler) Commit(c *gin.Context) {
 		})
 		if marshalErr != nil {
 			log.Printf("Commit %s: json.Marshal auditBody failed: %v", workspaceID, marshalErr)
-		}
-		summary := "GLOBAL memory written: id=" + memoryID + " namespace=" + nsName
-		if _, auditErr := db.DB.ExecContext(ctx, `
-			INSERT INTO activity_logs (workspace_id, activity_type, source_id, summary, request_body, status)
-			VALUES ($1, $2, $3, $4, $5::jsonb, $6)
-		`, workspaceID, "memory_write_global", workspaceID, summary, string(auditBody), "ok"); auditErr != nil {
-			log.Printf("Commit: GLOBAL memory audit log failed for %s/%s: %v", workspaceID, memoryID, auditErr)
+		} else {
+			summary := "GLOBAL memory written: id=" + memoryID + " namespace=" + nsName
+			if _, auditErr := db.DB.ExecContext(ctx, `
+				INSERT INTO activity_logs (workspace_id, activity_type, source_id, summary, request_body, status)
+				VALUES ($1, $2, $3, $4, $5::jsonb, $6)
+			`, workspaceID, "memory_write_global", workspaceID, summary, string(auditBody), "ok"); auditErr != nil {
+				log.Printf("Commit: GLOBAL memory audit log failed for %s/%s: %v", workspaceID, memoryID, auditErr)
+			}
 		}
 	}
 
