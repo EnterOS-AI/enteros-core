@@ -2887,6 +2887,94 @@ func TestProxyA2A_PollMode_CanvasUserWithVerifiedSession(t *testing.T) {
 	}
 }
 
+// TestProxyA2A_PollMode_CanvasUserCallerID_PropagatesToActivityLog pins
+// the specific contract that broke in molecule-core#1675 (2026-05-22):
+// canvas chat messages from a user with an identity workspace (RFC#637
+// canvas-user-identity rollout) MUST write an activity_logs row whose
+// source_id matches the canvas user's workspace UUID, NOT NULL so the
+// channel plugin's poll path can deliver them as `<channel kind="canvas_user">`
+// tags to the bound Claude Code session, AND the canvas chat-history can
+// re-render the user's own message on reopen.
+//
+// The sibling test TestProxyA2A_PollMode_CanvasUserWithVerifiedSession
+// covers the verified-session cookie path. THIS test covers the admin-token
+// path (molecli / break-glass) which also classifies as canvas-user and
+// bypasses CanCommunicate.
+func TestProxyA2A_PollMode_CanvasUserCallerID_PropagatesToActivityLog(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+
+	const targetWS = "ws-canvas-target-1675"
+	const canvasUserWS = "344a2623-50bf-4ab9-9732-220779305c8f" // shape from #1675 evidence
+
+	// isGenuineCanvasUser checks ADMIN_TOKEN first, so HasAnyLiveToken is
+	// never reached. No SELECT COUNT(*) expectation needed.
+	expectBudgetCheck(mock, targetWS)
+	mock.ExpectQuery("SELECT delivery_mode FROM workspaces WHERE id").
+		WithArgs(targetWS).
+		WillReturnRows(sqlmock.NewRows([]string{"delivery_mode"}).AddRow("poll"))
+
+	// logA2AReceiveQueued looks up the workspace name for the summary.
+	mock.ExpectQuery("SELECT name FROM workspaces WHERE id").
+		WithArgs(targetWS).
+		WillReturnRows(sqlmock.NewRows([]string{"name"}).AddRow("Canvas Target"))
+
+	// CRITICAL: the activity_logs INSERT MUST happen, and its source_id
+	// argument MUST match the canvas user's workspace UUID. The previous
+	// behaviour (sqlmock.ExpectExec with no WithArgs) accepted any args
+	// which is exactly how the regression in #1675 escaped CI: the INSERT
+	// fired, but with source_id=NULL because callerID propagation was
+	// bypassed somewhere upstream. Pin the source_id position explicitly.
+	mock.ExpectExec("INSERT INTO activity_logs").
+		WithArgs(
+			targetWS,                  // workspace_id
+			"a2a_receive",             // activity_type
+			canvasUserWS,              // source_id (NOT NULL the contract this test exists to pin)
+			targetWS,                  // target_id
+			"message/send",            // method
+			sqlmock.AnyArg(),          // summary
+			sqlmock.AnyArg(),          // request_body
+			sqlmock.AnyArg(),          // response_body (nil for queued)
+			sqlmock.AnyArg(),          // tool_trace
+			sqlmock.AnyArg(),          // duration_ms
+			"ok",                      // status
+			sqlmock.AnyArg(),          // error_detail
+		).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: targetWS}}
+	// X-Workspace-ID is the canonical way canvas Next.js identifies the
+	// signed-in user's identity workspace to the platform (per RFC#637).
+	c.Request = httptest.NewRequest("POST", "/workspaces/"+targetWS+"/a2a",
+		bytes.NewBufferString(`{"jsonrpc":"2.0","id":"canvas-1","method":"message/send","params":{"message":{"role":"user","parts":[{"text":"hello from canvas"}]}}}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Request.Header.Set("X-Workspace-ID", canvasUserWS)
+	c.Request.Header.Set("Authorization", "Bearer test-admin-secret-1675")
+
+	t.Setenv("ADMIN_TOKEN", "test-admin-secret-1675")
+
+	handler.ProxyA2A(c)
+	time.Sleep(50 * time.Millisecond)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 queued, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("response is not valid JSON: %v", err)
+	}
+	if resp["status"] != "queued" {
+		t.Errorf("response.status = %v, want %q", resp["status"], "queued")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations the activity INSERT may have been skipped OR fired with a different source_id (the #1675 regression shape): %v", err)
+	}
+}
+
 // TestProxyA2A_ForgedSameOrigin_CannotBypassCanCommunicate is the security
 // crux of the #1673 fix and the reason PR #1944 was held. In the combined-
 // tenant SaaS image (CANVAS_PROXY_URL set, CP session verification configured),
