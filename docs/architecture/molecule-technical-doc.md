@@ -1,7 +1,7 @@
 # Molecule AI — Comprehensive Technical Documentation
 
 > Definitive technical reference for the Molecule AI Agent Team platform.
-> Based on a full non-invasive scan of the [molecule-monorepo](https://git.moleculesai.app/molecule-ai/molecule-monorepo) repository.
+> Based on a full non-invasive scan of the [molecule-core](https://git.moleculesai.app/molecule-ai/molecule-core) repository.
 
 ---
 
@@ -1131,11 +1131,11 @@ Molecule AI's workspace abstraction is **runtime-agnostic by design**. A workspa
 
 ## Links
 
-- **GitHub**: https://git.moleculesai.app/molecule-ai/molecule-monorepo
-- **Architecture Docs**: https://git.moleculesai.app/molecule-ai/molecule-monorepo/src/branch/main/docs/architecture
-- **API Protocol**: https://git.moleculesai.app/molecule-ai/molecule-monorepo/src/branch/main/docs/api-protocol
-- **Agent Runtime**: https://git.moleculesai.app/molecule-ai/molecule-monorepo/src/branch/main/docs/agent-runtime
-- **Product Docs**: https://git.moleculesai.app/molecule-ai/molecule-monorepo/src/branch/main/docs/product
+- **GitHub**: https://git.moleculesai.app/molecule-ai/molecule-core
+- **Architecture Docs**: https://git.moleculesai.app/molecule-ai/molecule-core/src/branch/main/docs/architecture
+- **API Protocol**: https://git.moleculesai.app/molecule-ai/molecule-core/src/branch/main/docs/api-protocol
+- **Agent Runtime**: https://git.moleculesai.app/molecule-ai/molecule-core/src/branch/main/docs/agent-runtime
+- **Product Docs**: https://git.moleculesai.app/molecule-ai/molecule-core/src/branch/main/docs/product
 
 ---
 
