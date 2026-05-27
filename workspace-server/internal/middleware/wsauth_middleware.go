@@ -412,3 +412,40 @@ func isSameOriginCanvas(c *gin.Context) bool {
 	origin := c.GetHeader("Origin")
 	return origin == "https://"+host || origin == "http://"+host
 }
+
+// cpSessionConfigured reports whether this platform is wired for upstream
+// session-cookie verification — i.e. it runs as a SaaS tenant image with
+// both CP_UPSTREAM_URL and MOLECULE_ORG_SLUG set. When false (self-hosted /
+// dev), VerifiedCPSession can never succeed, so callers that want a
+// non-forgeable canvas signal in SaaS while still working in dev can use
+// this to decide whether the forgeable same-origin fallback is acceptable.
+func cpSessionConfigured() bool {
+	return os.Getenv("CP_UPSTREAM_URL") != "" && tenantSlug() != ""
+}
+
+// CPSessionConfigured is the exported form of cpSessionConfigured for callers
+// outside this package (e.g. the A2A proxy's canvas-user classification).
+func CPSessionConfigured() bool {
+	return cpSessionConfigured()
+}
+
+// IsVerifiedCanvasSession returns true ONLY when the request carries a WorkOS
+// session cookie that the control plane confirms belongs to a member of THIS
+// tenant's org (via /cp/auth/tenant-member). Unlike IsSameOriginCanvas — whose
+// Host/Referer/Origin inputs are trivially forgeable by any container on the
+// Docker network and which is therefore documented as cosmetic-only (see
+// AdminAuth / CanvasOrBearer comments above, #623/#194) — this is a real,
+// upstream-verified authentication boundary. It is the correct gate for
+// non-cosmetic actions such as A2A dispatch on behalf of a canvas user.
+//
+// Returns false (no network call) in self-hosted / dev deployments where
+// CP_UPSTREAM_URL / MOLECULE_ORG_SLUG are unset; callers should treat that as
+// "no verified canvas session available" and fall back accordingly.
+func IsVerifiedCanvasSession(c *gin.Context) bool {
+	cookie := c.GetHeader("Cookie")
+	if cookie == "" {
+		return false
+	}
+	valid, _ := VerifiedCPSession(cookie)
+	return valid
+}
