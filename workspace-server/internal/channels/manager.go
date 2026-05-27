@@ -335,6 +335,7 @@ func (m *Manager) HandleInbound(ctx context.Context, ch ChannelRow, msg *Inbound
 	})
 	if marshalErr != nil {
 		log.Printf("Channels %s: json.Marshal a2aBody failed: %v", ch.ChannelType, marshalErr)
+		return fmt.Errorf("marshal a2a body: %w", marshalErr)
 	}
 
 	callerID := "channel:" + ch.ChannelType
@@ -676,6 +677,7 @@ func (m *Manager) appendHistory(ctx context.Context, key string, username, userM
 	})
 	if marshalErr != nil {
 		log.Printf("appendHistory %s: json.Marshal entry failed: %v", key, marshalErr)
+		return
 	}
 	db.RDB.LPush(ctx, key, string(entry))
 	db.RDB.LTrim(ctx, key, 0, int64(maxHistoryEntries-1))

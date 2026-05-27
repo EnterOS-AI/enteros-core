@@ -418,6 +418,7 @@ func (s *Scheduler) fireSchedule(ctx context.Context, sched scheduleRow) {
 	})
 	if marshalErr != nil {
 		log.Printf("Scheduler '%s': json.Marshal a2aBody failed: %v", sched.Name, marshalErr)
+		return
 	}
 
 	log.Printf("Scheduler: firing '%s' → workspace %s", sched.Name, short(sched.WorkspaceID, 12))
@@ -603,23 +604,24 @@ func (s *Scheduler) fireSchedule(ctx context.Context, sched scheduleRow) {
 	})
 	if marshalErr != nil {
 		log.Printf("Scheduler '%s': json.Marshal cronMeta failed: %v", sched.Name, marshalErr)
+	} else {
+		// #152: persist lastError into error_detail on the activity_logs row
+		// so GET /workspaces/:id/schedules/:id/history can surface why a run
+		// failed (previously dropped — history returned status without any
+		// error context, making root-cause debugging impossible).
+		// #2026: bounded Background() context — this INSERT was observed wedging
+		// indefinitely on invalid-UTF-8 jsonb payloads, blocking wg.Wait() in
+		// tick() and stalling the whole scheduler. Now: 10s deadline, survives
+		// outer ctx cancellation, and every string is UTF-8 sanitized.
+		insertCtx, insertCancel := context.WithTimeout(context.Background(), dbQueryTimeout)
+		if _, insErr := db.DB.ExecContext(insertCtx, `
+			INSERT INTO activity_logs (workspace_id, activity_type, source_id, method, summary, request_body, status, error_detail, created_at)
+			VALUES ($1, 'cron_run', NULL, 'cron', $2, $3::jsonb, $4, $5, now())
+		`, sched.WorkspaceID, sanitizeUTF8("Cron: "+sched.Name), string(cronMeta), lastStatus, sanitizeUTF8(lastError)); insErr != nil {
+			log.Printf("Scheduler: activity_logs insert failed for '%s' (%s): %v", sched.Name, sched.ID, insErr)
+		}
+		insertCancel()
 	}
-	// #152: persist lastError into error_detail on the activity_logs row
-	// so GET /workspaces/:id/schedules/:id/history can surface why a run
-	// failed (previously dropped — history returned status without any
-	// error context, making root-cause debugging impossible).
-	// #2026: bounded Background() context — this INSERT was observed wedging
-	// indefinitely on invalid-UTF-8 jsonb payloads, blocking wg.Wait() in
-	// tick() and stalling the whole scheduler. Now: 10s deadline, survives
-	// outer ctx cancellation, and every string is UTF-8 sanitized.
-	insertCtx, insertCancel := context.WithTimeout(context.Background(), dbQueryTimeout)
-	if _, insErr := db.DB.ExecContext(insertCtx, `
-		INSERT INTO activity_logs (workspace_id, activity_type, source_id, method, summary, request_body, status, error_detail, created_at)
-		VALUES ($1, 'cron_run', NULL, 'cron', $2, $3::jsonb, $4, $5, now())
-	`, sched.WorkspaceID, sanitizeUTF8("Cron: "+sched.Name), string(cronMeta), lastStatus, sanitizeUTF8(lastError)); insErr != nil {
-		log.Printf("Scheduler: activity_logs insert failed for '%s' (%s): %v", sched.Name, sched.ID, insErr)
-	}
-	insertCancel()
 
 	if s.broadcaster != nil {
 		s.broadcaster.RecordAndBroadcast(ctx, string(events.EventCronExecuted), sched.WorkspaceID, map[string]interface{}{
@@ -693,17 +695,18 @@ func (s *Scheduler) recordSkipped(ctx context.Context, sched scheduleRow, active
 	})
 	if marshalErr != nil {
 		log.Printf("Scheduler '%s': json.Marshal cronMeta failed: %v", sched.Name, marshalErr)
+	} else {
+		// #2026: bounded Background() context on the skipped activity log INSERT
+		// for the same reason as the fireSchedule activity_logs INSERT above.
+		skipInsCtx, skipInsCancel := context.WithTimeout(context.Background(), dbQueryTimeout)
+		if _, err := db.DB.ExecContext(skipInsCtx, `
+			INSERT INTO activity_logs (workspace_id, activity_type, source_id, method, summary, request_body, status, error_detail, created_at)
+			VALUES ($1, 'cron_run', NULL, 'cron', $2, $3::jsonb, 'skipped', $4, now())
+		`, sched.WorkspaceID, sanitizeUTF8("Cron skipped: "+sched.Name), string(cronMeta), sanitizeUTF8(reason)); err != nil {
+			log.Printf("Scheduler: '%s' skip activity log failed: %v", sched.Name, err)
+		}
+		skipInsCancel()
 	}
-	// #2026: bounded Background() context on the skipped activity log INSERT
-	// for the same reason as the fireSchedule activity_logs INSERT above.
-	skipInsCtx, skipInsCancel := context.WithTimeout(context.Background(), dbQueryTimeout)
-	if _, err := db.DB.ExecContext(skipInsCtx, `
-		INSERT INTO activity_logs (workspace_id, activity_type, source_id, method, summary, request_body, status, error_detail, created_at)
-		VALUES ($1, 'cron_run', NULL, 'cron', $2, $3::jsonb, 'skipped', $4, now())
-	`, sched.WorkspaceID, sanitizeUTF8("Cron skipped: "+sched.Name), string(cronMeta), sanitizeUTF8(reason)); err != nil {
-		log.Printf("Scheduler: '%s' skip activity log failed: %v", sched.Name, err)
-	}
-	skipInsCancel()
 
 	if s.broadcaster != nil {
 		_ = s.broadcaster.RecordAndBroadcast(ctx, string(events.EventCronSkipped), sched.WorkspaceID, map[string]interface{}{
