@@ -299,32 +299,40 @@ R=$(curl -s "$BASE/workspaces" -H "Authorization: Bearer $ECHO_TOKEN")
 check "current_task in list response" '"current_task"' "$R"
 
 # Test 21: Delete
-R=$(acurl -X DELETE "$BASE/workspaces/$ECHO_ID?confirm=true" \
-  -H "Authorization: Bearer $ECHO_TOKEN" \
-  -H "X-Confirm-Name: Echo Agent v2")
-check "DELETE /workspaces/:id" '"status":"removed"' "$R"
-
-R=$(curl -s "$BASE/workspaces" -H "Authorization: Bearer $SUM_TOKEN")
-COUNT=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))")
-check "List after delete (count=1)" "1" "$COUNT"
-
-# Test 22: Bundle round-trip — export → delete → import → verify same config
-echo ""
-echo "--- Bundle Round-Trip Test ---"
-
-# Export the summarizer workspace (#165 / PR #167 — admin-gated)
+# #1953: Summarizer is now a CHILD of Echo (same-org, for the peer-discovery
+# tests above). DELETE on the *parent* (Echo) cascade-removes its descendants
+# (CascadeDelete walks the recursive `parent_id` CTE), so deleting Echo first
+# would also remove Summarizer and the "one survives" assertion would see 0.
+# Delete the CHILD (Summarizer) here instead: a child delete does NOT cascade
+# upward, so the parent Echo survives and count=1 holds. The bundle round-trip
+# below needs Summarizer's exported config, so capture it BEFORE this delete.
 BUNDLE=$(curl -s "$BASE/bundles/export/$SUM_ID" -H "Authorization: Bearer $SUM_TOKEN")
 check "GET /bundles/export/:id" '"name":"Summarizer Agent"' "$BUNDLE"
-
-# Capture original config for comparison
 ORIG_NAME=$(echo "$BUNDLE" | python3 -c "import sys,json; print(json.load(sys.stdin)['name'])")
 ORIG_TIER=$(echo "$BUNDLE" | python3 -c "import sys,json; print(json.load(sys.stdin)['tier'])")
 
-# Delete the workspace — use SUM_TOKEN (per-workspace) for WorkspaceAuth
-# and ADMIN_TOKEN for the AdminAuth layer.
-R=$(curl -s -X DELETE "$BASE/workspaces/$SUM_ID?confirm=true" \
+R=$(acurl -X DELETE "$BASE/workspaces/$SUM_ID?confirm=true" \
   -H "Authorization: Bearer $SUM_TOKEN" \
   -H "X-Confirm-Name: Summarizer Agent")
+check "DELETE /workspaces/:id" '"status":"removed"' "$R"
+
+# Parent Echo must survive a child delete — list as Echo and expect count=1.
+R=$(curl -s "$BASE/workspaces" -H "Authorization: Bearer $ECHO_TOKEN")
+COUNT=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))")
+check "List after delete (count=1)" "1" "$COUNT"
+
+# Test 22: Bundle round-trip — export → delete → import → verify same config.
+# Summarizer's bundle was captured above; now delete the parent Echo (the only
+# remaining workspace) so the import lands in a clean org, then re-import the
+# Summarizer bundle.
+echo ""
+echo "--- Bundle Round-Trip Test ---"
+
+# Delete the remaining parent Echo — use ECHO_TOKEN (per-workspace) for
+# WorkspaceAuth and ADMIN_TOKEN for the AdminAuth layer.
+R=$(acurl -X DELETE "$BASE/workspaces/$ECHO_ID?confirm=true" \
+  -H "Authorization: Bearer $ECHO_TOKEN" \
+  -H "X-Confirm-Name: Echo Agent v2")
 check "Delete before re-import" '"status":"removed"' "$R"
 
 # After deleting both workspaces, all per-workspace tokens are revoked.
