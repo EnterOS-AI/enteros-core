@@ -605,6 +605,151 @@ def file_or_update_red(
         sys.stderr.write(f"::warning::label '{RED_LABEL}' not found on repo\n")
 
 
+def close_stale_red_issues(
+    current_sha: str,
+    current_status: dict,
+    *,
+    dry_run: bool = False,
+) -> int:
+    """Close open [main-red] issues whose specific failing contexts have
+    all recovered on `current_sha`, even though `main` is still red for
+    other reasons (mc#1789).
+
+    When main stays red across consecutive SHAs for *different* causes,
+    `close_open_red_issues_for_other_shas` never fires (it only runs when
+    main is green). This function prevents stale issues from accumulating
+    indefinitely by comparing per-context recovery across SHAs.
+
+    An issue is considered stale when every context that was in a failed
+    state on the issue's SHA is now either `success` on the current HEAD
+    or absent (workflow removed / renamed). Issues whose original SHA had
+    a combined-red-with-no-detail (empty statuses list) are skipped — we
+    cannot verify recovery without per-context data.
+
+    Returns the number of issues closed.
+    """
+    open_red = list_open_red_issues()
+    if not open_red:
+        return 0
+
+    current_statuses = current_status.get("statuses") or []
+    closed = 0
+
+    for issue in open_red:
+        title = issue.get("title", "")
+        prefix = f"{TITLE_PREFIX} {REPO}: "
+        if not title.startswith(prefix):
+            continue
+        short_sha = title[len(prefix):]
+        if short_sha == current_sha[:10]:
+            continue
+
+        # Query status for the old SHA. Short SHA should resolve; if it
+        # doesn't (GC'd, force-pushed, ambiguous), skip conservatively.
+        try:
+            old_status = get_combined_status(short_sha)
+        except ApiError:
+            continue
+
+        old_red, old_failed = is_red(old_status)
+        if not old_red:
+            # Open issue for a now-green SHA — close it via the normal path.
+            num = issue.get("number")
+            if isinstance(num, int):
+                comment = (
+                    f"Commit `{short_sha}` is no longer red. Closing as the "
+                    f"failure context has recovered or expired."
+                )
+                if dry_run:
+                    print(
+                        f"::notice::[dry-run] would close issue #{num} "
+                        f"({title}) — old SHA is now green"
+                    )
+                    closed += 1
+                    continue
+                api(
+                    "POST",
+                    f"/repos/{OWNER}/{NAME}/issues/{num}/comments",
+                    body={"body": comment},
+                )
+                api(
+                    "PATCH",
+                    f"/repos/{OWNER}/{NAME}/issues/{num}",
+                    body={"state": "closed"},
+                )
+                print(
+                    f"::notice::Closed stale main-red issue #{num} "
+                    f"(old SHA {short_sha} is now green)"
+                )
+                closed += 1
+            continue
+
+        if not old_failed:
+            # Combined red with no per-context detail — can't verify recovery.
+            continue
+
+        # Verify every failed context from the old SHA has recovered.
+        all_recovered = True
+        recovered_ctxs: list[str] = []
+        still_failing_ctxs: list[str] = []
+        for s in old_failed:
+            ctx = s.get("context", "")
+            if not ctx:
+                continue
+            current_match = None
+            for cs in current_statuses:
+                if isinstance(cs, dict) and cs.get("context") == ctx:
+                    current_match = cs
+                    break
+            if current_match is None:
+                recovered_ctxs.append(ctx)
+            elif _entry_state(current_match) == "success":
+                recovered_ctxs.append(ctx)
+            else:
+                all_recovered = False
+                still_failing_ctxs.append(ctx)
+
+        if not all_recovered:
+            continue
+
+        num = issue.get("number")
+        if not isinstance(num, int):
+            continue
+
+        comment = (
+            f"The failing contexts from this SHA (`{short_sha}`) have "
+            f"recovered on current HEAD `{current_sha[:10]}`: "
+            f"{', '.join(recovered_ctxs)}. "
+            f"Main is still red for other reasons; see the current "
+            f"`[main-red]` issue for `{current_sha[:10]}`."
+        )
+        if dry_run:
+            print(
+                f"::notice::[dry-run] would close stale issue #{num} "
+                f"({title}) — contexts recovered"
+            )
+            closed += 1
+            continue
+
+        api(
+            "POST",
+            f"/repos/{OWNER}/{NAME}/issues/{num}/comments",
+            body={"body": comment},
+        )
+        api(
+            "PATCH",
+            f"/repos/{OWNER}/{NAME}/issues/{num}",
+            body={"state": "closed"},
+        )
+        print(
+            f"::notice::Closed stale main-red issue #{num} "
+            f"(contexts recovered at {current_sha[:10]})"
+        )
+        closed += 1
+
+    return closed
+
+
 def close_open_red_issues_for_other_shas(
     current_sha: str,
     *,
@@ -775,6 +920,13 @@ def run_once(*, dry_run: bool = False) -> int:
         print(f"::warning::main is RED at {sha[:10]} on {WATCH_BRANCH}: "
               f"{len(failed)} failed context(s)")
         file_or_update_red(sha, failed, debug, dry_run=dry_run)
+        stale_closed = close_stale_red_issues(sha, recheck_status, dry_run=dry_run)
+        if stale_closed:
+            emit_loki_event("main_red_stale_closed", sha, [])
+            print(
+                f"::notice::Closed {stale_closed} stale main-red issue(s) "
+                f"whose contexts recovered at {sha[:10]}"
+            )
     else:
         # Green or pending-with-no-real-failures. Close stale issues
         # from earlier SHAs when required CI has recovered.
