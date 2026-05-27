@@ -574,7 +574,12 @@ func (h *WorkspaceHandler) CascadeDelete(ctx context.Context, id string) ([]stri
 
 	var stopErrs []error
 	stopAndRemove := func(wsID string) {
-		if err := h.StopWorkspaceAuto(cleanupCtx, wsID); err != nil {
+		// Delete-path stop uses bounded retry (matches the restart path) and
+		// records a durable structure_events row on exhaustion so a leaked /
+		// pending EC2 is queryable and handed off to the CP-orphan-sweeper —
+		// rather than the bare one-shot StopWorkspaceAuto that produced the
+		// silent-leak class (task #15 / workspace-ec2-leak).
+		if err := h.stopWorkspaceForDelete(cleanupCtx, wsID); err != nil {
 			log.Printf("CascadeDelete %s stop failed: %v — leaving cleanup for orphan sweeper", wsID, err)
 			stopErrs = append(stopErrs, fmt.Errorf("stop %s: %w", wsID, err))
 			return

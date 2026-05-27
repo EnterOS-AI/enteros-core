@@ -721,8 +721,31 @@ var cpStopRetryBaseDelay = 1 * time.Second
 //
 // Returns nothing — caller's contract is unchanged.
 func (h *WorkspaceHandler) cpStopWithRetry(ctx context.Context, workspaceID, source string) {
+	// Restart's contract is "make the workspace alive again": it proceeds
+	// with reprovision regardless of the Stop outcome, so it discards the
+	// terminal error. The delete path needs the error (it must keep the
+	// row recoverable for the orphan-sweeper + emit a durable event), so
+	// the actual retry loop lives in cpStopWithRetryErr below.
+	_ = h.cpStopWithRetryErr(ctx, workspaceID, source)
+}
+
+// cpStopWithRetryErr is the shared bounded-retry core for cpProv.Stop.
+// It returns the terminal error so callers that need to react to a leak
+// (the DELETE path's stopWorkspaceForDelete) can do so, while
+// cpStopWithRetry keeps its void contract for the restart paths.
+//
+// Behaviour (unchanged from the original cpStopWithRetry loop):
+//   - cpProv nil          → nil (no-op; nothing to stop).
+//   - success on attempt N → nil; logs a retry-success line when N > 1.
+//   - ctx cancelled mid-retry → returns ctx.Err(); logs an "abandoned"
+//     line and deliberately does NOT emit LEAK-SUSPECT (operator-initiated
+//     drain is a different signal than "we tried hard and failed").
+//   - all attempts fail   → returns the LAST attempt's error and emits the
+//     stable `LEAK-SUSPECT cpProv.Stop ...` log line so the CP-side orphan
+//     reconciler can correlate by workspace_id.
+func (h *WorkspaceHandler) cpStopWithRetryErr(ctx context.Context, workspaceID, source string) error {
 	if h.cpProv == nil {
-		return
+		return nil
 	}
 	var lastErr error
 	delay := cpStopRetryBaseDelay
@@ -732,7 +755,7 @@ func (h *WorkspaceHandler) cpStopWithRetry(ctx context.Context, workspaceID, sou
 			if attempt > 1 {
 				log.Printf("%s: cpProv.Stop(%s) succeeded on attempt %d", source, workspaceID, attempt)
 			}
-			return
+			return nil
 		}
 		lastErr = err
 		if attempt == cpStopRetryAttempts {
@@ -744,7 +767,7 @@ func (h *WorkspaceHandler) cpStopWithRetry(ctx context.Context, workspaceID, sou
 		case <-ctx.Done():
 			log.Printf("%s: cpProv.Stop(%s) abandoned mid-retry: ctx cancelled (last_err=%v)",
 				source, workspaceID, lastErr)
-			return
+			return ctx.Err()
 		case <-time.After(delay):
 		}
 		delay *= 2
@@ -753,6 +776,7 @@ func (h *WorkspaceHandler) cpStopWithRetry(ctx context.Context, workspaceID, sou
 	// so logs are greppable / parseable for the CP-side orphan reconciler.
 	log.Printf("LEAK-SUSPECT cpProv.Stop workspace_id=%s source=%s attempts=%d last_err=%q",
 		workspaceID, source, cpStopRetryAttempts, lastErr.Error())
+	return lastErr
 }
 
 // runRestartCycle does the actual stop+provision work for one restart
