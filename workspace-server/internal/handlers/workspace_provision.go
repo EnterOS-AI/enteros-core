@@ -1004,7 +1004,7 @@ func stripPlatformManagedLLMBypassEnv(envVars map[string]string) {
 }
 
 func runtimeUsesAnthropicNativeProxy(runtime string) bool {
-	return strings.TrimSpace(strings.ToLower(runtime)) == "claude-code"
+	return strings.EqualFold(strings.TrimSpace(runtime), "claude-code")
 }
 
 func firstNonEmptyEnv(names ...string) string {

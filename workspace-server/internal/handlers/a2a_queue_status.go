@@ -153,7 +153,15 @@ func queueRowAuthFields(ctx context.Context, queueID string) (callerID, workspac
 	if err != nil {
 		return "", "", err
 	}
-	return callerNS.String, workspaceNS.String, nil
+	callerID = ""
+	if callerNS.Valid {
+		callerID = callerNS.String
+	}
+	workspaceID = ""
+	if workspaceNS.Valid {
+		workspaceID = workspaceNS.String
+	}
+	return callerID, workspaceID, nil
 }
 
 // GetA2AQueueStatus handles GET /workspaces/:id/a2a/queue/:queue_id.

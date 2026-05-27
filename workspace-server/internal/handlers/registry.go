@@ -345,8 +345,16 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 		if qErr := db.DB.QueryRowContext(ctx,
 			`SELECT name, role FROM workspaces WHERE id = $1`, payload.ID,
 		).Scan(&dbName, &dbRole); qErr == nil {
+			name := ""
+			if dbName.Valid {
+				name = dbName.String
+			}
+			role := ""
+			if dbRole.Valid {
+				role = dbRole.String
+			}
 			if rc, did := reconcileAgentCardIdentity(
-				payload.AgentCard, payload.ID, dbName.String, dbRole.String,
+				payload.AgentCard, payload.ID, name, role,
 			); did {
 				reconciledCard = rc
 				log.Printf("Registry register: reconciled agent_card identity for %s from workspaces row", payload.ID)

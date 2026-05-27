@@ -167,6 +167,9 @@ func generateAppInstallationToken() (string, time.Time, error) {
 		return "", time.Time{}, err
 	}
 	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusCreated {
+		return "", time.Time{}, fmt.Errorf("github token endpoint returned status %d", resp.StatusCode)
+	}
 	var result struct {
 		Token     string    `json:"token"`
 		ExpiresAt time.Time `json:"expires_at"`
