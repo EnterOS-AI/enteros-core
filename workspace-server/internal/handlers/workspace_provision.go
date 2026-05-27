@@ -953,14 +953,24 @@ func applyPlatformManagedLLMEnv(ctx context.Context, envVars map[string]string, 
 		log.Printf("workspace_provision: resolve billing mode workspace=%s err=%v (defaulting to platform_managed)", workspaceID, resolveErr)
 	}
 	log.Printf("workspace_provision: billing mode workspace=%s resolved=%s source=%s org_default=%s", workspaceID, res.ResolvedMode, res.Source, res.OrgDefault)
+	// internal#703: MOLECULE_LLM_BILLING_MODE in the container must reflect the
+	// RESOLVED per-workspace mode, not a hardcoded literal. Pre-fix this var was
+	// only emitted (hardcoded "platform_managed") on the strip path below, so a
+	// byok/disabled container never carried a truthful billing-mode value — only
+	// MOLECULE_LLM_BILLING_MODE_RESOLVED. Emit both here, resolver-driven, for
+	// every mode so the value is correct on the byok/disabled early-return path
+	// too (and downstream consumers / debug shells see byok, not platform_managed).
+	envVars["MOLECULE_LLM_BILLING_MODE"] = res.ResolvedMode
 	// Observability: surface the resolved mode in the container env so the
 	// agent / debug shell can answer "why is my key being stripped" without
 	// pulling logs or hitting the admin route.
 	envVars["MOLECULE_LLM_BILLING_MODE_RESOLVED"] = res.ResolvedMode
 	if res.ResolvedMode != LLMBillingModePlatformManaged {
-		// byok or disabled — DO NOT strip vendor keys, DO NOT force-route to CP.
+		// byok or disabled — DO NOT strip vendor keys, DO NOT force-route to CP,
+		// DO NOT override the workspace own ANTHROPIC_BASE_URL / OAuth token.
 		// Leave envVars alone so CLAUDE_CODE_OAUTH_TOKEN / vendor API keys
-		// pulled from workspace_secrets survive into the container.
+		// pulled from workspace_secrets survive into the container, and the
+		// workspace talks to its own provider directly (internal#703).
 		return
 	}
 	baseURL := firstNonEmptyEnv("MOLECULE_LLM_BASE_URL", "OPENAI_BASE_URL")
@@ -971,7 +981,8 @@ func applyPlatformManagedLLMEnv(ctx context.Context, envVars map[string]string, 
 	}
 	stripPlatformManagedLLMBypassEnv(envVars)
 
-	envVars["MOLECULE_LLM_BILLING_MODE"] = "platform_managed"
+	// MOLECULE_LLM_BILLING_MODE is already set to res.ResolvedMode (==
+	// platform_managed on this path) above (internal#703); no hardcode here.
 	envVars["MOLECULE_LLM_BASE_URL"] = baseURL
 	envVars["MOLECULE_LLM_USAGE_TOKEN"] = token
 	if anthropicBaseURL != "" {
