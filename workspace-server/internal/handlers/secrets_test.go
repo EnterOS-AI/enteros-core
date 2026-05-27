@@ -865,6 +865,12 @@ func TestSecretsValues_LegacyWorkspaceGrandfathered(t *testing.T) {
 		WithArgs(testWsID).
 		WillReturnRows(sqlmock.NewRows([]string{"key", "encrypted_value", "encryption_version"}).
 			AddRow("WS_KEY", []byte("ws_plainvalue"), 0))
+	// internal#711: Values now resolves billing mode to gate the global LLM-cred
+	// merge. Neither key here is a platform-managed LLM bypass key, so the mode
+	// is immaterial to the assertions — but the resolver query must be mocked.
+	mock.ExpectQuery(`SELECT llm_billing_mode FROM workspaces WHERE id = \$1`).
+		WithArgs(testWsID).
+		WillReturnRows(sqlmock.NewRows([]string{"llm_billing_mode"}).AddRow(LLMBillingModePlatformManaged))
 
 	w := httptest.NewRecorder()
 	c := secretsValuesRequest(w, "") // no auth — grandfathered
@@ -942,6 +948,12 @@ func TestSecretsValues_ValidTokenReturnsDecryptedMerge(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"key", "encrypted_value", "encryption_version"}).
 			AddRow("ONLY_WS", []byte("ws_val"), 0).
 			AddRow("SHARED_KEY", []byte("ws_wins"), 0))
+	// internal#711: billing-mode resolver query. None of these keys is a
+	// platform-managed LLM bypass key, so the resolved mode does not affect the
+	// merge assertions; platform_managed keeps the existing pass-through.
+	mock.ExpectQuery(`SELECT llm_billing_mode FROM workspaces WHERE id = \$1`).
+		WithArgs(testWsID).
+		WillReturnRows(sqlmock.NewRows([]string{"llm_billing_mode"}).AddRow(LLMBillingModePlatformManaged))
 
 	w := httptest.NewRecorder()
 	c := secretsValuesRequest(w, "Bearer good-token")
@@ -960,6 +972,68 @@ func TestSecretsValues_ValidTokenReturnsDecryptedMerge(t *testing.T) {
 	}
 	if body["SHARED_KEY"] != "ws_wins" {
 		t.Errorf("workspace should override global: got %q", body["SHARED_KEY"])
+	}
+}
+
+// TestSecretsValues_ByokStripsGlobalLLMCred is the internal#711 regression
+// guard for the remote-pull injection vector. A non-platform (byok) workspace
+// that pulls its secrets via GET /workspaces/:id/secrets/values must NOT
+// receive the platform's scope:global CLAUDE_CODE_OAUTH_TOKEN — that key is
+// of global_secrets provenance and is dropped by the provider-aware gate.
+// Its OWN ANTHROPIC_API_KEY (a workspace_secrets row) survives, and unrelated
+// non-LLM global secrets are untouched.
+func TestSecretsValues_ByokStripsGlobalLLMCred(t *testing.T) {
+	mock := setupTestDB(t)
+	handler := NewSecretsHandler(nil)
+
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM workspace_auth_tokens`).
+		WithArgs(testWsID).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+	mock.ExpectQuery(`SELECT t\.id, t\.workspace_id.*FROM workspace_auth_tokens t.*JOIN workspaces`).
+		WithArgs(sqlmock.AnyArg()).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "workspace_id"}).AddRow("tok-1", testWsID))
+	mock.ExpectExec(`UPDATE workspace_auth_tokens SET last_used_at`).
+		WithArgs("tok-1").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	// global_secrets holds the platform's scope:global OAuth token + a
+	// non-LLM operator global (should be untouched).
+	mock.ExpectQuery(`SELECT key, encrypted_value, encryption_version FROM global_secrets`).
+		WillReturnRows(sqlmock.NewRows([]string{"key", "encrypted_value", "encryption_version"}).
+			AddRow("CLAUDE_CODE_OAUTH_TOKEN", []byte("PLATFORM-GLOBAL-OAUTH"), 0).
+			AddRow("SENTRY_DSN", []byte("https://sentry.example/123"), 0))
+	// The workspace brought its OWN Anthropic API key via the Secrets tab.
+	mock.ExpectQuery(`SELECT key, encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id`).
+		WithArgs(testWsID).
+		WillReturnRows(sqlmock.NewRows([]string{"key", "encrypted_value", "encryption_version"}).
+			AddRow("ANTHROPIC_API_KEY", []byte("CUSTOMER-OWN-ANTHROPIC-KEY"), 0))
+	// Resolver: this workspace is byok.
+	mock.ExpectQuery(`SELECT llm_billing_mode FROM workspaces WHERE id = \$1`).
+		WithArgs(testWsID).
+		WillReturnRows(sqlmock.NewRows([]string{"llm_billing_mode"}).AddRow(LLMBillingModeBYOK))
+
+	w := httptest.NewRecorder()
+	c := secretsValuesRequest(w, "Bearer good-token")
+	handler.Values(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var body map[string]string
+	_ = json.Unmarshal(w.Body.Bytes(), &body)
+	// 1. Platform global OAuth token stripped — the leak is closed on the pull path.
+	if got, ok := body["CLAUDE_CODE_OAUTH_TOKEN"]; ok {
+		t.Fatalf("CLAUDE_CODE_OAUTH_TOKEN = %q present — platform scope:global token must be stripped for byok pull", got)
+	}
+	// 2. The workspace's own LLM key survives.
+	if body["ANTHROPIC_API_KEY"] != "CUSTOMER-OWN-ANTHROPIC-KEY" {
+		t.Fatalf("ANTHROPIC_API_KEY = %q, want the workspace's own key preserved", body["ANTHROPIC_API_KEY"])
+	}
+	// 3. Unrelated non-LLM global secrets are untouched.
+	if body["SENTRY_DSN"] != "https://sentry.example/123" {
+		t.Fatalf("SENTRY_DSN = %q, want non-LLM globals untouched", body["SENTRY_DSN"])
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
 	}
 }
 
