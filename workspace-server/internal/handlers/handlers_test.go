@@ -384,6 +384,8 @@ func TestWorkspaceCreate(t *testing.T) {
 	// Expect RecordAndBroadcast INSERT for WORKSPACE_PROVISIONING
 	mock.ExpectExec("INSERT INTO structure_events").
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO workspace_auth_tokens").
+		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -417,6 +419,76 @@ func TestWorkspaceCreate(t *testing.T) {
 
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// TestWorkspaceCreate_ReturnsAuthToken_201 pins the inline-auth_token
+// behaviour added for #1644. Pre-fix, the 201 response was
+// {id, status, awareness_namespace, workspace_access} — callers had to
+// make a separate POST to /admin/workspaces/:id/tokens (AdminAuth-gated,
+// path-prefix differs in CP-admin deploys) OR fall back to the dev-only
+// GET /admin/workspaces/:id/test-token (deliberately 404s on
+// MOLECULE_ENV=production per feedback_no_dev_only_routes_in_e2e).
+//
+// Post-fix: every Create response includes an `auth_token` field with
+// the freshly-minted plaintext bearer (returned once, never recoverable).
+// This is the SSOT path — production E2E + canvas + org_import all
+// get the bearer they need in the same round trip.
+//
+// Failure path is non-fatal: if the IssueToken DB call fails, the 201
+// still goes out without auth_token + a fallback log line. That branch
+// is exercised by sqlmock returning a non-INSERT-INTO-workspace_auth_tokens
+// path here — the test asserts presence on the happy path.
+func TestWorkspaceCreate_ReturnsAuthToken_201(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", "/tmp/configs")
+
+	mock.ExpectBegin()
+	mock.ExpectExec("INSERT INTO workspaces").
+		WithArgs(sqlmock.AnyArg(), "Token Holder", nil, 3, "langgraph", sqlmock.AnyArg(), (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+	mock.ExpectExec("INSERT INTO canvas_layouts").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO structure_events").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	// The inline mint added in #1644 Part B — wsauth.IssueToken issues
+	// a new bearer via INSERT INTO workspace_auth_tokens (workspace_id,
+	// token_hash, prefix). This is the assertion that the new code path
+	// reaches the DB.
+	mock.ExpectExec("INSERT INTO workspace_auth_tokens").
+		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	body := `{"name":"Token Holder","model":"anthropic:claude-opus-4-7"}`
+	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Create(c)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("parse response: %v", err)
+	}
+	tok, ok := resp["auth_token"].(string)
+	if !ok || tok == "" {
+		t.Fatalf("expected non-empty auth_token in 201 response (the #1644 SSOT inline mint), got: %s", w.Body.String())
+	}
+	// Sanity: tokens are base64-RawURL encoded 32-byte payloads (per
+	// wsauth/tokens.go::tokenPayloadBytes), so a meaningful lower bound
+	// is ~40 chars. If this fails, IssueToken's contract drifted.
+	if len(tok) < 40 {
+		t.Errorf("auth_token suspiciously short (%d chars) — wsauth.IssueToken contract drift?", len(tok))
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations — inline mint path may have skipped IssueToken: %v", err)
 	}
 }
 
