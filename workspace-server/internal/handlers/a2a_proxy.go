@@ -375,6 +375,30 @@ func (h *WorkspaceHandler) proxyA2ARequest(ctx context.Context, workspaceID stri
 				Response: gin.H{"error": "access denied: workspaces cannot communicate per hierarchy rules"},
 			}
 		}
+
+		// #1953 cross-tenant isolation. CanCommunicate alone does NOT enforce
+		// org boundaries: its "root-level siblings — both have no parent" rule
+		// treats every tenant's org root as a sibling, so a caller that is an
+		// org root could resolve and route a2a to another tenant's org root
+		// (and resolveAgentURL accepts ANY workspace id with no org check).
+		// Gate on the SAME parent_id-chain org scoping the OFFSEC-015 broadcast
+		// fix uses: reject before resolveAgentURL when caller and target are in
+		// different orgs. Fail-closed — a DB error denies cross-org routing.
+		ok, err := sameOrg(ctx, db.DB, callerID, workspaceID)
+		if err != nil {
+			log.Printf("ProxyA2A: org-scope check failed %s → %s: %v — denying", callerID, workspaceID, err)
+			return 0, nil, &proxyA2AError{
+				Status:   http.StatusForbidden,
+				Response: gin.H{"error": "access denied: org isolation check failed"},
+			}
+		}
+		if !ok {
+			log.Printf("ProxyA2A: cross-org routing denied %s → %s (#1953)", callerID, workspaceID)
+			return 0, nil, &proxyA2AError{
+				Status:   http.StatusForbidden,
+				Response: gin.H{"error": "access denied: target workspace is in a different org"},
+			}
+		}
 	}
 
 	// Budget enforcement: reject A2A calls when the workspace has exceeded its

@@ -223,10 +223,10 @@ func TestPeers_RootWorkspace_NoPeers(t *testing.T) {
 
 	peerCols := []string{"id", "name", "role", "tier", "status", "agent_card", "url", "parent_id", "active_tasks"}
 
-	// Siblings (other root-level workspaces) — none
-	mock.ExpectQuery("SELECT w.id, w.name.*WHERE w.parent_id IS NULL AND w.id != \\$1").
-		WithArgs("ws-root-alone").
-		WillReturnRows(sqlmock.NewRows(peerCols))
+	// #1953: an org-root caller (parent_id IS NULL) now issues NO sibling
+	// query at all. The old `WHERE w.parent_id IS NULL` sibling read returned
+	// EVERY tenant's org root (cross-tenant leak); an org root has no siblings
+	// inside its own org, so the handler skips the sibling read entirely.
 
 	// Children — none. #383 added explicit `w.id != $2` self-filter.
 	mock.ExpectQuery("SELECT w.id, w.name.*WHERE w.parent_id = \\$1 AND w.id != \\$2").

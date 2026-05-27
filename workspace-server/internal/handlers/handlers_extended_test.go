@@ -453,6 +453,14 @@ func TestExtended_DiscoverMissingHeader(t *testing.T) {
 
 // ---------- TestPeers (Extended) ----------
 
+// TestExtended_Peers verifies a root-level (org-root) workspace's peer view.
+//
+// #1953: previously a root-level caller issued `WHERE w.parent_id IS NULL`
+// for siblings, which returned EVERY other tenant's org root as a "peer"
+// (cross-tenant leak, since the workspaces table has no org_id column). After
+// the fix an org root has no cross-tenant siblings; its only peers are its own
+// children. This test asserts the child is returned and that NO sibling query
+// is issued (no `parent_id IS NULL` read).
 func TestExtended_Peers(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
@@ -463,17 +471,14 @@ func TestExtended_Peers(t *testing.T) {
 		WithArgs("ws-peer").
 		WillReturnRows(sqlmock.NewRows([]string{"parent_id"}).AddRow(nil))
 
-	// Expect root-level siblings query (parent IS NULL, excluding self)
-	mock.ExpectQuery("SELECT w.id, w.name").
-		WithArgs("ws-peer").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "role", "tier", "status", "agent_card", "url", "parent_id", "active_tasks"}).
-			AddRow("ws-sibling", "Sibling Agent", "worker", 1, "online", []byte("null"), "http://localhost:9001", nil, 0))
+	// NO root-level sibling query is issued for an org-root caller anymore.
 
-	// Expect children query (workspaces with parent_id = ws-peer, excluding self)
-	// Query now binds (parent_id, self_id) for the self-filter guard added in #383.
+	// Children query (workspaces with parent_id = ws-peer, excluding self).
+	// Query binds (parent_id, self_id) for the self-filter guard added in #383.
 	mock.ExpectQuery("SELECT w.id, w.name").
 		WithArgs("ws-peer", "ws-peer").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "role", "tier", "status", "agent_card", "url", "parent_id", "active_tasks"}))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "role", "tier", "status", "agent_card", "url", "parent_id", "active_tasks"}).
+			AddRow("ws-child", "Child Agent", "worker", 1, "online", []byte("null"), "http://localhost:9001", "ws-peer", 0))
 
 	// No parent query since workspace is root-level
 
@@ -493,10 +498,10 @@ func TestExtended_Peers(t *testing.T) {
 		t.Fatalf("failed to parse response: %v", err)
 	}
 	if len(resp) != 1 {
-		t.Fatalf("expected 1 peer, got %d", len(resp))
+		t.Fatalf("expected 1 peer (the child), got %d", len(resp))
 	}
-	if resp[0]["name"] != "Sibling Agent" {
-		t.Errorf("expected peer name 'Sibling Agent', got %v", resp[0]["name"])
+	if resp[0]["name"] != "Child Agent" {
+		t.Errorf("expected peer name 'Child Agent', got %v", resp[0]["name"])
 	}
 
 	if err := mock.ExpectationsWereMet(); err != nil {

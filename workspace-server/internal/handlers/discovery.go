@@ -237,7 +237,17 @@ func (h *DiscoveryHandler) Peers(c *gin.Context) {
 
 	var peers []map[string]interface{}
 
-	// Siblings
+	// Siblings — workspaces sharing the caller's parent.
+	//
+	// #1953 cross-tenant isolation: the OLD code's else-branch handled the
+	// org-root caller (parent_id IS NULL) by returning EVERY workspace with
+	// parent_id IS NULL — i.e. every other tenant's org root, since the
+	// workspaces table has no org_id column. That leaked peer identities/URLs
+	// across tenants. An org root has no siblings inside its own org (each
+	// tenant is a distinct org root), so the org-root caller now gets an empty
+	// sibling set; its real peers are its children, returned below. Only the
+	// parent_id-bound branch enumerates siblings, and that is already scoped to
+	// one parent (one tenant).
 	if parentID.Valid {
 		siblings, _ := queryPeerMaps(`
 			SELECT w.id, w.name, COALESCE(w.role, ''), w.tier, w.status,
@@ -245,14 +255,6 @@ func (h *DiscoveryHandler) Peers(c *gin.Context) {
 				   w.parent_id, w.active_tasks
 			FROM workspaces w WHERE w.parent_id = $1 AND w.id != $2 AND w.status != 'removed'`,
 			parentID.String, workspaceID)
-		peers = append(peers, siblings...)
-	} else {
-		siblings, _ := queryPeerMaps(`
-			SELECT w.id, w.name, COALESCE(w.role, ''), w.tier, w.status,
-				   COALESCE(w.agent_card, 'null'::jsonb), COALESCE(w.url, ''),
-				   w.parent_id, w.active_tasks
-			FROM workspaces w WHERE w.parent_id IS NULL AND w.id != $1 AND w.status != 'removed'`,
-			workspaceID)
 		peers = append(peers, siblings...)
 	}
 
