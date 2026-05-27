@@ -258,6 +258,7 @@ def test_run_once_failure_does_not_close(monkeypatch):
 
     monkeypatch.setattr(wd, "file_or_update_red", capture_file)
     monkeypatch.setattr(wd, "close_open_red_issues_for_other_shas", lambda *a, **k: 0)
+    monkeypatch.setattr(wd, "close_stale_red_issues", lambda *a, **k: 0)
 
     assert wd.run_once(dry_run=True) == 0
     assert filed == ["abc123"]
