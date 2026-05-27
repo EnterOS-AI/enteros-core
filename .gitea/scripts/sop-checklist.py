@@ -1033,7 +1033,7 @@ def main(argv: list[str] | None = None) -> int:
                     for t in data:
                         if t.get("name") == tn:
                             tid = t.get("id")
-                            client._team_id_cache[(args.owner, tn)] = tid  # noqa: SLF001  # internal write-through cache
+                            client._team_id_cache[(args.owner, tn)] = tid  # noqa: SLF001  # write-through cache; intentional side-effect for reuse across calls
                             break
             if tid is not None:
                 team_ids.append(tid)
