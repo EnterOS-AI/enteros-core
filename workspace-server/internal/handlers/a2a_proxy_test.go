@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -1244,13 +1245,12 @@ func TestValidateCallerToken_WrongWorkspaceBindingRejected(t *testing.T) {
 }
 
 func TestValidateCallerToken_CanvasUser_AdminToken(t *testing.T) {
-	mock := setupTestDB(t)
+	setupTestDB(t)
 	setupTestRedis(t)
 
-	// Tokenless workspace
-	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM workspace_auth_tokens`).
-		WithArgs("ws-canvas-admin").
-		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+	// #1673/#1944: the genuine-canvas-user check (admin bearer here) now runs
+	// BEFORE HasAnyLiveToken, so no SELECT COUNT(*) is issued — the human's
+	// credential, not the caller workspace's token state, decides canvas-user.
 
 	t.Setenv("ADMIN_TOKEN", "admin-secret-42")
 
@@ -1276,10 +1276,9 @@ func TestValidateCallerToken_CanvasUser_OrgToken(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
 
-	// Tokenless workspace
-	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM workspace_auth_tokens`).
-		WithArgs("ws-canvas-org").
-		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+	// #1673/#1944: the genuine-canvas-user check (org token here) now runs
+	// BEFORE HasAnyLiveToken, so the first DB query is orgtoken.Validate's
+	// lookup — there is no SELECT COUNT(*) expectation anymore.
 
 	// orgtoken.Validate lookup
 	mock.ExpectQuery(`SELECT id, prefix, org_id FROM org_api_tokens WHERE token_hash = .* AND revoked_at IS NULL`).
@@ -2338,6 +2337,197 @@ func TestProxyA2A_PollMode_ShortCircuits_NoSSRF_NoDispatch(t *testing.T) {
 
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// stubVerifiedCPSession points VerifiedCPSession at a stub control-plane that
+// confirms the given cookie belongs to a tenant-member, so tests can exercise
+// the genuine (non-forgeable) canvas-session path end-to-end without a live CP.
+// It sets CP_UPSTREAM_URL + MOLECULE_ORG_SLUG for the test's lifetime; the
+// real middleware.VerifiedCPSession HTTP+cache code path runs unchanged.
+func stubVerifiedCPSession(t *testing.T, member bool) {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if member {
+			fmt.Fprint(w, `{"member":true,"user_id":"user-canvas-1"}`)
+		} else {
+			w.WriteHeader(http.StatusForbidden)
+			fmt.Fprint(w, `{"member":false}`)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	t.Setenv("CP_UPSTREAM_URL", srv.URL)
+	t.Setenv("MOLECULE_ORG_SLUG", "test-tenant")
+}
+
+// TestProxyA2A_PollMode_CanvasUserWithVerifiedSession is the #1673 regression
+// guard. A poll-mode canvas-user identity workspace that HAS acquired live
+// tokens (the exact condition that made #1673 fire) sends a canvas message
+// carrying a control-plane-verified session cookie but no bearer token. The
+// fix must classify it as a canvas user BEFORE the HasAnyLiveToken peer-token
+// contract, so the request is queued (200) and logA2AReceiveQueued writes the
+// activity_logs row — instead of the pre-fix silent 401 that dropped the
+// message before any row landed (breaking canvas chat + chat-history).
+//
+// Runs in a subprocess with CANVAS_PROXY_URL set so middleware.canvasProxyActive
+// is true at package-init time (matching the combined-tenant image), proving the
+// fix does not depend on disabling same-origin detection.
+func TestProxyA2A_PollMode_CanvasUserWithVerifiedSession(t *testing.T) {
+	if os.Getenv("CANVAS_PROXY_URL") == "" {
+		cmd := exec.Command(os.Args[0], "-test.run=^TestProxyA2A_PollMode_CanvasUserWithVerifiedSession$", "-test.v")
+		cmd.Env = append(os.Environ(), "CANVAS_PROXY_URL=http://localhost")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("subprocess test failed: %v\n%s", err, out)
+		}
+		return
+	}
+
+	stubVerifiedCPSession(t, true)
+
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+
+	const wsTarget = "ws-poll-canvas-target"
+	const wsCanvasUser = "ws-canvas-user-344a"
+
+	// CRUCIAL: no SELECT COUNT(*) FROM workspace_auth_tokens expectation. The
+	// genuine-canvas-user check (verified session) must short-circuit BEFORE
+	// HasAnyLiveToken — that is the #1673 regression path. An identity
+	// workspace that already holds live tokens must NOT fall into the
+	// hasLive=true bearer-required branch.
+
+	// isCanvasUser=true → CanCommunicate is skipped (no parent_id lookups).
+	expectBudgetCheck(mock, wsTarget)
+	mock.ExpectQuery("SELECT delivery_mode FROM workspaces WHERE id").
+		WithArgs(wsTarget).
+		WillReturnRows(sqlmock.NewRows([]string{"delivery_mode"}).AddRow("poll"))
+	// logA2AReceiveQueued must fire synchronously and write the row.
+	mock.ExpectExec("INSERT INTO activity_logs").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: wsTarget}}
+
+	body := `{"jsonrpc":"2.0","id":"canvas-1","method":"message/send","params":{"message":{"role":"user","parts":[{"text":"hello from canvas"}]}}}`
+	req := httptest.NewRequest("POST", "/workspaces/"+wsTarget+"/a2a", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Workspace-ID", wsCanvasUser)
+	// Verified canvas session cookie (the genuine, non-forgeable signal).
+	req.Header.Set("Cookie", "wos-session=valid-canvas-session-cookie")
+	// Same-origin headers, present as a real canvas request would send them —
+	// but they are NOT what authorizes the bypass here (the verified session is).
+	req.Host = "localhost"
+	req.Header.Set("Referer", "https://localhost/")
+	c.Request = req
+
+	handler.ProxyA2A(c)
+
+	time.Sleep(50 * time.Millisecond)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 (queued) for canvas-user with verified session, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("response is not valid JSON: %v", err)
+	}
+	if resp["status"] != "queued" {
+		t.Errorf("response.status = %v, want %q", resp["status"], "queued")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations (activity_logs row must be written): %v", err)
+	}
+}
+
+// TestProxyA2A_ForgedSameOrigin_CannotBypassCanCommunicate is the security
+// crux of the #1673 fix and the reason PR #1944 was held. In the combined-
+// tenant SaaS image (CANVAS_PROXY_URL set, CP session verification configured),
+// an attacker forges a same-origin request — correct Host + a matching
+// `Referer: https://<host>/` — and supplies an arbitrary X-Workspace-ID naming
+// a workspace it does not control, targeting a workspace it is NOT authorized
+// to reach. It presents NO verified session cookie, NO admin token, NO org
+// token.
+//
+// PR #1944's same-origin bypass would have classified this as a canvas user and
+// skipped CanCommunicate, granting cross-workspace A2A — a privilege
+// escalation. The safe fix must instead fall through to the standard
+// peer-token contract and CanCommunicate, which rejects the cross-hierarchy
+// call with 403. This test proves the escalation is closed.
+func TestProxyA2A_ForgedSameOrigin_CannotBypassCanCommunicate(t *testing.T) {
+	if os.Getenv("CANVAS_PROXY_URL") == "" {
+		cmd := exec.Command(os.Args[0], "-test.run=^TestProxyA2A_ForgedSameOrigin_CannotBypassCanCommunicate$", "-test.v")
+		cmd.Env = append(os.Environ(), "CANVAS_PROXY_URL=http://localhost")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("subprocess test failed: %v\n%s", err, out)
+		}
+		return
+	}
+
+	// SaaS image with CP session verification configured. The stub CP rejects
+	// any cookie as a non-member; the attacker sends none anyway. This asserts
+	// that with verification configured, same-origin alone is NOT a canvas
+	// signal (CPSessionConfigured()==true disables the dev fallback).
+	stubVerifiedCPSession(t, false)
+
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+
+	const wsTarget = "ws-victim-target"
+	const wsForgedCaller = "ws-attacker-caller"
+
+	// validateCallerToken: not a genuine canvas user (no verified session, no
+	// admin/org token, and the dev same-origin fallback is disabled in SaaS).
+	// So it consults the peer-token contract: HasAnyLiveToken for the forged
+	// caller. Return 0 → tokenless legacy peer → grandfathered through token
+	// validation (isCanvasUser stays false). The request must then still be
+	// gated by CanCommunicate.
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM workspace_auth_tokens`).
+		WithArgs(wsForgedCaller).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+
+	// CanCommunicate MUST run (the escalation guard) and DENY: caller and
+	// target sit under different parents.
+	mockCanCommunicate(mock, wsForgedCaller, wsTarget, false)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: wsTarget}}
+
+	body := `{"jsonrpc":"2.0","id":"exploit-1","method":"message/send","params":{"message":{"role":"user","parts":[{"text":"cross-workspace exploit"}]}}}`
+	req := httptest.NewRequest("POST", "/workspaces/"+wsTarget+"/a2a", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	// Arbitrary caller workspace the attacker does not own.
+	req.Header.Set("X-Workspace-ID", wsForgedCaller)
+	// Forged same-origin signals (the #1944 bypass vector).
+	req.Host = "localhost"
+	req.Header.Set("Referer", "https://localhost/")
+	req.Header.Set("Origin", "https://localhost")
+	// No Cookie / Authorization — no genuine canvas credential.
+	c.Request = req
+
+	handler.ProxyA2A(c)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("ESCALATION NOT CLOSED: forged same-origin + arbitrary X-Workspace-ID "+
+			"reached an unauthorized target with status %d (want 403): %s", w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("body not JSON: %v", err)
+	}
+	if !strings.Contains(fmt.Sprint(resp["error"]), "access denied") {
+		t.Errorf("expected an access-denied error from CanCommunicate, got %v", resp["error"])
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations — CanCommunicate must have been consulted: %v", err)
 	}
 }
 
