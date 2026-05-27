@@ -1106,6 +1106,112 @@ func TestApplyPlatformManagedLLMEnv_NoopsOutsidePlatformManaged(t *testing.T) {
 	}
 }
 
+// TestApplyPlatformManagedLLMEnv_ClaudeCodeByokKeepsOwnProviderEnv is the
+// internal#703 regression guard: a per-workspace byok override (org-level
+// MOLECULE_LLM_BILLING_MODE left at the platform_managed bootstrap floor)
+// must resolve to byok and leave the workspace own provider env intact —
+// the CP-injected proxy ANTHROPIC_BASE_URL / usage token must NOT be forced,
+// the OAuth token must NOT be stripped, and MOLECULE_LLM_BILLING_MODE in the
+// container must read the RESOLVED mode (byok), not the hardcoded literal.
+//
+// This is the discriminating test for the byok end-to-end fix: pre-fix the
+// strip path was the only emitter of MOLECULE_LLM_BILLING_MODE (hardcoded
+// "platform_managed"), so a byok container carried no truthful billing mode.
+func TestApplyPlatformManagedLLMEnv_ClaudeCodeByokKeepsOwnProviderEnv(t *testing.T) {
+	const wsID = "77777777-7777-7777-7777-777777777777"
+	mock := setupTestDB(t)
+	mock.ExpectQuery(`SELECT llm_billing_mode FROM workspaces WHERE id = \$1`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"llm_billing_mode"}).AddRow(LLMBillingModeBYOK))
+
+	// Org-level env left at the bootstrap floor — the per-workspace override
+	// is what must flip this workspace to byok (the realistic prod shape).
+	t.Setenv("MOLECULE_LLM_BILLING_MODE", LLMBillingModePlatformManaged)
+	t.Setenv("MOLECULE_LLM_BASE_URL", "https://api.example.test/api/v1/internal/llm/openai/v1")
+	t.Setenv("MOLECULE_LLM_ANTHROPIC_BASE_URL", "https://api.example.test/api/v1/internal/llm/anthropic")
+	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
+
+	// The workspace brought its own Claude Code OAuth token (BYOK via the
+	// subscription provider). It must survive untouched.
+	envVars := map[string]string{
+		"CLAUDE_CODE_OAUTH_TOKEN": "user-oauth-token",
+		"MODEL":                   "sonnet",
+	}
+	applyPlatformManagedLLMEnv(context.Background(), envVars, wsID, "claude-code", "")
+
+	// 1. OAuth token intact — not stripped.
+	if got := envVars["CLAUDE_CODE_OAUTH_TOKEN"]; got != "user-oauth-token" {
+		t.Fatalf("CLAUDE_CODE_OAUTH_TOKEN = %q, want it left intact for byok", got)
+	}
+	// 2. No CP proxy base URL / usage token forced onto the workspace.
+	if got, ok := envVars["ANTHROPIC_BASE_URL"]; ok {
+		t.Fatalf("ANTHROPIC_BASE_URL must NOT be injected for byok, got %q", got)
+	}
+	if got, ok := envVars["ANTHROPIC_API_KEY"]; ok {
+		t.Fatalf("ANTHROPIC_API_KEY must NOT be injected for byok, got %q", got)
+	}
+	if got, ok := envVars["MOLECULE_LLM_ANTHROPIC_BASE_URL"]; ok {
+		t.Fatalf("MOLECULE_LLM_ANTHROPIC_BASE_URL must NOT be injected for byok, got %q", got)
+	}
+	if got, ok := envVars["MOLECULE_LLM_USAGE_TOKEN"]; ok {
+		t.Fatalf("MOLECULE_LLM_USAGE_TOKEN must NOT be injected for byok, got %q", got)
+	}
+	// 3. Billing mode in the container reflects the RESOLVED mode (byok).
+	if got := envVars["MOLECULE_LLM_BILLING_MODE"]; got != LLMBillingModeBYOK {
+		t.Fatalf("MOLECULE_LLM_BILLING_MODE = %q, want %q (resolver-driven, not hardcoded)", got, LLMBillingModeBYOK)
+	}
+	if got := envVars["MOLECULE_LLM_BILLING_MODE_RESOLVED"]; got != LLMBillingModeBYOK {
+		t.Fatalf("MOLECULE_LLM_BILLING_MODE_RESOLVED = %q, want %q", got, LLMBillingModeBYOK)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// TestApplyPlatformManagedLLMEnv_PlatformManagedStillEmitsResolvedMode is the
+// no-regression companion: a workspace that resolves to platform_managed must
+// still strip + force the proxy AND emit MOLECULE_LLM_BILLING_MODE=
+// platform_managed (now resolver-driven, internal#703). Proves the byok fix
+// did not alter the platform_managed contract.
+func TestApplyPlatformManagedLLMEnv_PlatformManagedStillEmitsResolvedMode(t *testing.T) {
+	const wsID = "88888888-8888-8888-8888-888888888888"
+	mock := setupTestDB(t)
+	mock.ExpectQuery(`SELECT llm_billing_mode FROM workspaces WHERE id = \$1`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"llm_billing_mode"}).AddRow(LLMBillingModePlatformManaged))
+
+	t.Setenv("MOLECULE_LLM_BILLING_MODE", LLMBillingModePlatformManaged)
+	t.Setenv("MOLECULE_LLM_BASE_URL", "https://api.example.test/api/v1/internal/llm/openai/v1")
+	t.Setenv("MOLECULE_LLM_ANTHROPIC_BASE_URL", "https://api.example.test/api/v1/internal/llm/anthropic")
+	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
+
+	envVars := map[string]string{
+		"CLAUDE_CODE_OAUTH_TOKEN": "user-oauth-token",
+		"MODEL":                   "sonnet",
+	}
+	applyPlatformManagedLLMEnv(context.Background(), envVars, wsID, "claude-code", "")
+
+	// OAuth stripped, proxy forced — unchanged platform_managed contract.
+	if _, ok := envVars["CLAUDE_CODE_OAUTH_TOKEN"]; ok {
+		t.Fatalf("CLAUDE_CODE_OAUTH_TOKEN should be stripped for platform_managed")
+	}
+	if got := envVars["ANTHROPIC_BASE_URL"]; got != "https://api.example.test/api/v1/internal/llm/anthropic" {
+		t.Fatalf("ANTHROPIC_BASE_URL = %q, want proxy forced for platform_managed", got)
+	}
+	if got := envVars["ANTHROPIC_API_KEY"]; got != "tenant-admin-token" {
+		t.Fatalf("ANTHROPIC_API_KEY = %q, want usage token for platform_managed", got)
+	}
+	if got := envVars["MOLECULE_LLM_BILLING_MODE"]; got != LLMBillingModePlatformManaged {
+		t.Fatalf("MOLECULE_LLM_BILLING_MODE = %q, want %q", got, LLMBillingModePlatformManaged)
+	}
+	if got := envVars["MOLECULE_LLM_BILLING_MODE_RESOLVED"]; got != LLMBillingModePlatformManaged {
+		t.Fatalf("MOLECULE_LLM_BILLING_MODE_RESOLVED = %q, want %q", got, LLMBillingModePlatformManaged)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
 // TestApplyRuntimeModelEnv_PersonaEnvMODELSecretPreserved locks in the
 // 2026-05-08 fix that prevents the MODEL_PROVIDER-as-slug fallback from
 // silently overwriting a per-persona MODEL workspace_secret on restart,
