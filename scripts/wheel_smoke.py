@@ -27,9 +27,9 @@ def smoke_imports_and_invariants() -> None:
     import-rewrite mistakes (the 0.1.16 incident, where main.py loaded but
     main_sync was missing because the build script dropped a re-export).
     """
-    from molecule_runtime.main import main_sync  # noqa: F401
-    from molecule_runtime import a2a_client, a2a_tools  # noqa: F401
-    from molecule_runtime.builtin_tools import memory  # noqa: F401
+    from molecule_runtime.main import main_sync  # noqa: F401  # smoke-test re-export regression (mc#1769)
+    from molecule_runtime import a2a_client, a2a_tools  # noqa: F401  # smoke-test re-export regression (mc#1769)
+    from molecule_runtime.builtin_tools import memory  # noqa: F401  # smoke-test re-export regression (mc#1769)
     from molecule_runtime.adapters import get_adapter, BaseAdapter, AdapterConfig
 
     # cli_main + mcp_cli.main are the molecule-mcp console-script entry
@@ -38,8 +38,8 @@ def smoke_imports_and_invariants() -> None:
     # rewrite here would break every external operator's MCP install on
     # the next wheel publish. Pin both names because pyproject points
     # at mcp_cli.main, which then imports a2a_mcp_server.cli_main.
-    from molecule_runtime.a2a_mcp_server import cli_main  # noqa: F401
-    from molecule_runtime.mcp_cli import main as mcp_cli_main  # noqa: F401
+    from molecule_runtime.a2a_mcp_server import cli_main  # noqa: F401  # smoke-test re-export regression (mc#1769)
+    from molecule_runtime.mcp_cli import main as mcp_cli_main  # noqa: F401  # smoke-test re-export regression (mc#1769)
     assert callable(cli_main), "a2a_mcp_server.cli_main must be callable"
     assert callable(mcp_cli_main), "mcp_cli.main must be callable"
 
@@ -48,7 +48,7 @@ def smoke_imports_and_invariants() -> None:
     # imports + activates these at startup; if a wheel ships without
     # them, the standalone agent silently loses the wait_for_message /
     # inbox_peek / inbox_pop tools and reverts to outbound-only.
-    from molecule_runtime.inbox import (  # noqa: F401
+    from molecule_runtime.inbox import (  # noqa: F401  # smoke-test re-export regression (mc#1769)
         InboxState,
         activate as inbox_activate,
         get_state as inbox_get_state,

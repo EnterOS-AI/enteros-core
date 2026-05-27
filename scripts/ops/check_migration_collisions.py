@@ -93,9 +93,7 @@ def _gitea_get(path: str, params: dict[str, str] | None = None) -> bytes | None:
     try:
         # S310 (信任boundary): this function IS the outbound HTTP client for
         # Gitea API calls. The call is intentional and controlled — we build
-        # the request ourselves and handle errors explicitly. Timeout=20s
-        # prevents indefinite hangs.
-        with urllib.request.urlopen(req, timeout=20) as resp:  # noqa: S310
+        with urllib.request.urlopen(req, timeout=20) as resp:  # noqa: S310  # explicit timeout + error handling; bandit false positive
             return resp.read()
     except urllib.error.HTTPError as e:
         sys.stderr.write(f"Gitea API HTTP {e.code} on {path}: {e.reason}\n")

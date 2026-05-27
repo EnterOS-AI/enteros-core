@@ -639,9 +639,7 @@ def load_config(path: str) -> dict[str, Any]:
         # yaml is an optional dep; the canonical loader is used when available,
         # but the SOP runs on runners that may not have PyYAML installed. The
         # fallback _load_config_minimal covers the same config shape without
-        # requiring the dep, so the ignore is safe: if yaml loads, we use it;
-        # otherwise we fall back silently.
-        import yaml  # type: ignore[import-not-found]
+        import yaml  # type: ignore[import-not-found]  # optional dep; fall back silently if absent
         with open(path, encoding="utf-8") as f:
             return yaml.safe_load(f)
     except ImportError:
