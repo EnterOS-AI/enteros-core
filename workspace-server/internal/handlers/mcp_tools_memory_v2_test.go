@@ -20,11 +20,18 @@ import (
 // --- stubs ---
 
 type stubMemoryPlugin struct {
+	upsertFn func(ctx context.Context, name string, body contract.NamespaceUpsert) (*contract.Namespace, error)
 	commitFn func(ctx context.Context, ns string, body contract.MemoryWrite) (*contract.MemoryWriteResponse, error)
 	searchFn func(ctx context.Context, body contract.SearchRequest) (*contract.SearchResponse, error)
 	forgetFn func(ctx context.Context, id string, body contract.ForgetRequest) error
 }
 
+func (s *stubMemoryPlugin) UpsertNamespace(ctx context.Context, name string, body contract.NamespaceUpsert) (*contract.Namespace, error) {
+	if s.upsertFn != nil {
+		return s.upsertFn(ctx, name, body)
+	}
+	return &contract.Namespace{Name: name, Kind: body.Kind}, nil
+}
 func (s *stubMemoryPlugin) CommitMemory(ctx context.Context, ns string, body contract.MemoryWrite) (*contract.MemoryWriteResponse, error) {
 	if s.commitFn != nil {
 		return s.commitFn(ctx, ns, body)
@@ -159,7 +166,15 @@ func TestMemoryV2Available(t *testing.T) {
 func TestCommitMemoryV2_HappyPathDefaultNamespace(t *testing.T) {
 	db, _, _ := sqlmock.New()
 	defer db.Close()
+	gotUpsertNS := ""
 	h := newV2Handler(t, db, &stubMemoryPlugin{
+		upsertFn: func(_ context.Context, name string, body contract.NamespaceUpsert) (*contract.Namespace, error) {
+			gotUpsertNS = name
+			if body.Kind != contract.NamespaceKindWorkspace {
+				t.Errorf("upsert kind = %q, want workspace", body.Kind)
+			}
+			return &contract.Namespace{Name: name, Kind: body.Kind}, nil
+		},
 		commitFn: func(_ context.Context, ns string, body contract.MemoryWrite) (*contract.MemoryWriteResponse, error) {
 			if ns != "workspace:root-1" {
 				t.Errorf("ns = %q, want default workspace:root-1", ns)
@@ -179,6 +194,9 @@ func TestCommitMemoryV2_HappyPathDefaultNamespace(t *testing.T) {
 	}
 	if !strings.Contains(got, `"id":"mem-1"`) {
 		t.Errorf("got = %s", got)
+	}
+	if gotUpsertNS != "workspace:root-1" {
+		t.Errorf("upsert namespace = %q, want workspace:root-1", gotUpsertNS)
 	}
 }
 
