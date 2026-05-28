@@ -355,3 +355,134 @@ def test_rollout_from_plan_file_writes_partial_response_on_failure(tmp_path):
     assert response_path.read_text(encoding="utf-8").strip()
     assert '"ok": false' in response_path.read_text(encoding="utf-8")
     assert '"slug": "hongming"' in response_path.read_text(encoding="utf-8")
+
+
+# ──────────────────────────────────────────────────────────────────────
+# No-silent-skip coverage gate (internal#724)
+# ──────────────────────────────────────────────────────────────────────
+
+
+def test_rollout_stragglers_flags_tenant_not_on_target():
+    # b SSM-succeeded but its container is on the old tag → straggler.
+    stragglers = prod.rollout_stragglers(
+        ["a", "b", "c"],
+        [
+            {"slug": "a", "verified_on_target": True},
+            {"slug": "b", "verified_on_target": False, "running_image": "platform-tenant:staging-old"},
+            {"slug": "c", "verified_on_target": True},
+        ],
+    )
+    assert stragglers == ["b"]
+
+
+def test_rollout_stragglers_flags_enumerated_tenant_with_no_result():
+    # agents-team class: enumerated but no batch ever produced a row for it.
+    stragglers = prod.rollout_stragglers(
+        ["a", "agents-team"],
+        [{"slug": "a", "verified_on_target": True}],
+    )
+    assert stragglers == ["agents-team"]
+
+
+def test_rollout_stragglers_missing_key_is_backward_compatible():
+    # Older CP without verified_on_target → treat as verified (no spurious fail).
+    stragglers = prod.rollout_stragglers(
+        ["a", "b"],
+        [{"slug": "a", "healthz_ok": True}, {"slug": "b", "healthz_ok": True}],
+    )
+    assert stragglers == []
+
+
+def test_rollout_stragglers_ignores_dry_run_rows():
+    stragglers = prod.rollout_stragglers(
+        ["a"], [{"slug": "a", "ssm_status": "DryRun"}]
+    )
+    # dry-run row is skipped, so "a" has no verifying row → straggler.
+    assert stragglers == ["a"]
+
+
+def test_scoped_rollout_fails_when_a_tenant_stays_on_old_tag():
+    # Every per-tenant call returns ok=True, but agents-team is NOT
+    # verified_on_target. The rollout must still fail loudly — this is
+    # the exact "reported success, one tenant silently skipped" bug.
+    def fake_redeploy(_cp_url, _token, body):
+        rows = []
+        for slug in body["only_slugs"]:
+            rows.append({"slug": slug, "verified_on_target": slug != "agents-team"})
+        return 200, {"ok": True, "results": rows}
+
+    try:
+        prod.execute_scoped_rollout(
+            {
+                "cp_url": "https://api.moleculesai.app",
+                "body": {
+                    "target_tag": "staging-new",
+                    "batch_size": 5,
+                    "dry_run": False,
+                    "confirm": True,
+                },
+            },
+            token="secret",
+            list_slugs=lambda _u, _t, _b: ["reno-stars", "agents-team", "hongming"],
+            redeploy=fake_redeploy,
+            sleep=lambda _s: None,
+        )
+    except prod.RolloutFailed as exc:
+        assert "incomplete rollout" in str(exc)
+        assert exc.response["stragglers"] == ["agents-team"]
+        assert exc.response["ok"] is False
+    else:
+        raise AssertionError("expected an incomplete rollout to fail loudly")
+
+
+def test_scoped_rollout_passes_when_all_tenants_verified_on_target():
+    def fake_redeploy(_cp_url, _token, body):
+        return 200, {
+            "ok": True,
+            "results": [{"slug": s, "verified_on_target": True} for s in body["only_slugs"]],
+        }
+
+    aggregate = prod.execute_scoped_rollout(
+        {
+            "cp_url": "https://api.moleculesai.app",
+            "body": {
+                "target_tag": "staging-new",
+                "batch_size": 5,
+                "dry_run": False,
+                "confirm": True,
+            },
+        },
+        token="secret",
+        list_slugs=lambda _u, _t, _b: ["reno-stars", "agents-team", "hongming"],
+        redeploy=fake_redeploy,
+        sleep=lambda _s: None,
+    )
+    assert aggregate["ok"] is True
+    assert "stragglers" not in aggregate
+
+
+def test_scoped_rollout_dry_run_does_not_assert_coverage():
+    # A dry run proves nothing landed; coverage must NOT be asserted or
+    # every plan would fail.
+    def fake_redeploy(_cp_url, _token, body):
+        return 200, {
+            "ok": True,
+            "results": [{"slug": s, "ssm_status": "DryRun"} for s in body["only_slugs"]],
+        }
+
+    aggregate = prod.execute_scoped_rollout(
+        {
+            "cp_url": "https://api.moleculesai.app",
+            "body": {
+                "target_tag": "staging-new",
+                "batch_size": 5,
+                "dry_run": True,
+                "confirm": True,
+            },
+        },
+        token="secret",
+        list_slugs=lambda _u, _t, _b: ["a", "b"],
+        redeploy=fake_redeploy,
+        sleep=lambda _s: None,
+    )
+    assert aggregate["ok"] is True
