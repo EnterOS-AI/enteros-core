@@ -36,10 +36,12 @@ import (
 
 // GetWorkspaceLLMBillingMode handles GET /admin/workspaces/:id/llm-billing-mode.
 //
-// Reads the workspace override + the org-level default (from the same
-// MOLECULE_LLM_BILLING_MODE env var the provisioner reads at strip-gate time —
-// keeps the two paths consistent so the GET result matches what the strip
-// gate would compute) and returns the structured resolution.
+// internal#718 P2-B: the resolution now DERIVES the provider from the
+// workspace's stored (runtime, model) via the registry (org rung retired). The
+// passed orgMode is ignored by the resolver; it is left here only to avoid
+// churning the call signature. The returned resolution matches what the
+// provision-time strip gate computes (same derived resolver), so operators see
+// the real platform-vs-byok decision + the derived provider in ProviderSelection.
 func GetWorkspaceLLMBillingMode(c *gin.Context) {
 	workspaceID := strings.TrimSpace(c.Param("id"))
 	if !uuidRegex.MatchString(workspaceID) {
