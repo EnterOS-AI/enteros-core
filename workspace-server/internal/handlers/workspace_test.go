@@ -1786,7 +1786,7 @@ func TestWorkspaceCreate_TemplateDefaultsMissingRuntimeAndModel(t *testing.T) {
 tier: 2
 runtime: hermes
 runtime_config:
-  model: nousresearch/hermes-4-70b
+  model: moonshot/kimi-k2.6
 `)
 	if err := os.WriteFile(filepath.Join(templateDir, "config.yaml"), cfg, 0o644); err != nil {
 		t.Fatalf("write cfg: %v", err)
@@ -1841,7 +1841,7 @@ func TestWorkspaceCreate_TemplateDefaultsLegacyTopLevelModel(t *testing.T) {
 	cfg := []byte(`name: Legacy Agent
 tier: 1
 runtime: hermes
-model: anthropic:claude-sonnet-4-5
+model: moonshot/kimi-k2.5
 `)
 	if err := os.WriteFile(filepath.Join(templateDir, "config.yaml"), cfg, 0o644); err != nil {
 		t.Fatalf("write cfg: %v", err)
@@ -1896,7 +1896,7 @@ func TestWorkspaceCreate_CallerModelOverridesTemplateDefault(t *testing.T) {
 	}
 	cfg := []byte(`runtime: hermes
 runtime_config:
-  model: nousresearch/hermes-4-70b
+  model: moonshot/kimi-k2.6
 `)
 	if err := os.WriteFile(filepath.Join(templateDir, "config.yaml"), cfg, 0o644); err != nil {
 		t.Fatalf("write cfg: %v", err)
@@ -1923,7 +1923,11 @@ runtime_config:
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
-	body := `{"name":"Custom Hermes","template":"hermes-template","model":"minimax/MiniMax-M2.7"}`
+	// Caller overrides with a different hermes-valid model — registry permits
+	// both moonshot/kimi-k2.5 and moonshot/kimi-k2.6 for hermes (P4 PR-1 native
+	// set). The template default would have been moonshot/kimi-k2.6; caller
+	// picks kimi-k2.5 explicitly to prove the override actually fires.
+	body := `{"name":"Custom Hermes","template":"hermes-template","model":"moonshot/kimi-k2.5"}`
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
@@ -2047,28 +2051,19 @@ func TestWorkspaceCreate_188_NoTemplateNoRuntime_NowMODEL_REQUIRED(t *testing.T)
 	}
 }
 
-// internal#718 P2-B: only-registered validation in P2 WARN-mode. A known
-// (registry) runtime with a model NOT in its registered set is allowed to
-// proceed (201) but flagged with the X-Molecule-Model-Unregistered response
-// header + a queryable warning log. (Hard-reject is gated on P3/P4 vocabulary
-// convergence — see the create handler comment; flipping to 422 there is a
-// one-line change once the legacy colon-form model vocabulary is reconciled.)
-func TestWorkspaceCreate_718_UnregisteredModelWarnsButProceeds(t *testing.T) {
+// internal#718 P4 PR-2: only-registered validation HARD-REJECT. A known
+// (registry) runtime with a model NOT in its registered set is rejected at the
+// create boundary with 422 UNREGISTERED_MODEL_FOR_RUNTIME — no DB rows touched,
+// no provisioning attempt, no wedged workspace. Replaces P2-B's WARN-mode
+// header.
+func TestWorkspaceCreate_718_P4_UnregisteredModelHardReject422(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
 	broadcaster := newTestBroadcaster()
 	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
 
-	mock.ExpectBegin()
-	mock.ExpectExec("INSERT INTO workspaces").
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectCommit()
-	mock.ExpectExec("INSERT INTO workspace_secrets").
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec("INSERT INTO canvas_layouts").
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec("INSERT INTO structure_events").
-		WillReturnResult(sqlmock.NewResult(0, 1))
+	// No DB expectations: the 422 fires BEFORE BeginTx, so any unexpected
+	// INSERT will fail the test via ExpectationsWereMet.
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -2077,16 +2072,32 @@ func TestWorkspaceCreate_718_UnregisteredModelWarnsButProceeds(t *testing.T) {
 	c.Request.Header.Set("Content-Type", "application/json")
 	handler.Create(c)
 
-	if w.Code != http.StatusCreated {
-		t.Fatalf("unregistered-model create (warn-mode): expected 201, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("unregistered-model create: expected 422, got %d: %s", w.Code, w.Body.String())
 	}
-	if w.Header().Get("X-Molecule-Model-Unregistered") != "true" {
-		t.Errorf("expected X-Molecule-Model-Unregistered=true header on unregistered model, got %q", w.Header().Get("X-Molecule-Model-Unregistered"))
+	if !bytes.Contains(w.Body.Bytes(), []byte(`"code":"UNREGISTERED_MODEL_FOR_RUNTIME"`)) {
+		t.Errorf("expected code=UNREGISTERED_MODEL_FOR_RUNTIME in 422 body, got %s", w.Body.String())
+	}
+	if !bytes.Contains(w.Body.Bytes(), []byte(`"runtime":"claude-code"`)) {
+		t.Errorf("expected runtime=claude-code echoed in 422 body, got %s", w.Body.String())
+	}
+	if !bytes.Contains(w.Body.Bytes(), []byte(`"model":"totally-made-up-xyz"`)) {
+		t.Errorf("expected model echoed in 422 body, got %s", w.Body.String())
+	}
+	// The legacy WARN header must NOT fire — there is no "proceeded with
+	// warning" path anymore.
+	if w.Header().Get("X-Molecule-Model-Unregistered") != "" {
+		t.Errorf("P4 hard-reject must not emit the legacy WARN header, got %q", w.Header().Get("X-Molecule-Model-Unregistered"))
+	}
+
+	// Strict mock check: no DB ops should have happened.
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unexpected DB activity on hard-reject path: %v", err)
 	}
 }
 
-// A REGISTERED model on a registry runtime sets NO unregistered header.
-func TestWorkspaceCreate_718_RegisteredModelNoWarnHeader(t *testing.T) {
+// A REGISTERED model on a registry runtime proceeds with 201 and no unregistered header.
+func TestWorkspaceCreate_718_P4_RegisteredModelProceeds(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
 	broadcaster := newTestBroadcaster()
@@ -2115,7 +2126,41 @@ func TestWorkspaceCreate_718_RegisteredModelNoWarnHeader(t *testing.T) {
 		t.Fatalf("registered-model create: expected 201, got %d: %s", w.Code, w.Body.String())
 	}
 	if w.Header().Get("X-Molecule-Model-Unregistered") != "" {
-		t.Errorf("registered model must NOT set the unregistered header, got %q", w.Header().Get("X-Molecule-Model-Unregistered"))
+		t.Errorf("registered model must NOT set the legacy unregistered header, got %q", w.Header().Get("X-Molecule-Model-Unregistered"))
+	}
+}
+
+// internal#718 P4 PR-2: the legacy colon-namespaced BYOK vocabulary
+// 'anthropic:claude-opus-4-7' is now a FIRST-CLASS registered claude-code model
+// (P4 PR-1 reconciled the colon-vocab into the registry). The hard-reject must
+// NOT 422 this legitimate live-corpus form — verifying the reconcile + flip work
+// together. This is the canonical regression guard for the colon-vocab path.
+func TestWorkspaceCreate_718_P4_LegacyColonVocabAccepted(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+
+	mock.ExpectBegin()
+	mock.ExpectExec("INSERT INTO workspaces").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+	mock.ExpectExec("INSERT INTO workspace_secrets").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO canvas_layouts").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO structure_events").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	body := `{"name":"Legacy Colon","runtime":"claude-code","model":"anthropic:claude-opus-4-7"}`
+	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	handler.Create(c)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("legacy colon-form create (P4 PR-1 reconciled): expected 201, got %d: %s", w.Code, w.Body.String())
 	}
 }
 
