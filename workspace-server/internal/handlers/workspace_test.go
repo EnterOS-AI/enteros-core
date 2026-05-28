@@ -501,10 +501,12 @@ func TestWorkspaceCreate_WithSecrets_Persists(t *testing.T) {
 // while persisting a secret causes the entire transaction to roll back and
 // the handler to return 500.  The workspace row must NOT be committed.
 func TestWorkspaceCreate_SecretPersistFails_RollsBack(t *testing.T) {
-	// internal#691: see TestExtended_SecretsSet — same default-closed reasoning.
-	// This test is asserting the rollback path on DB failure, not the strip gate;
-	// keep the org in byok so the OPENAI_API_KEY write reaches the INSERT.
-	t.Setenv("MOLECULE_LLM_BILLING_MODE", "byok")
+	// internal#718 P2-B: this test asserts the rollback path on DB failure, not
+	// the strip gate. The create-time secret gate keys off the DERIVED mode now
+	// (org rung retired). An explicit byok override makes the workspace byok in a
+	// single resolver read (precedence-1 short-circuit), so the OPENAI_API_KEY
+	// write is allowed and reaches the INSERT-and-fail path this test exercises.
+	t.Setenv("MOLECULE_LLM_BILLING_MODE", "platform_managed") // org env ignored now
 	mock := setupTestDB(t)
 	setupTestRedis(t)
 	broadcaster := newTestBroadcaster()
@@ -513,14 +515,11 @@ func TestWorkspaceCreate_SecretPersistFails_RollsBack(t *testing.T) {
 	mock.ExpectBegin()
 	mock.ExpectExec("INSERT INTO workspaces").
 		WillReturnResult(sqlmock.NewResult(0, 1))
-	// internal#691: Create() now resolves billing mode per-workspace before
-	// the secret-strip gate. The workspace row was just inserted in the same
-	// transaction so it isn't readable from a separate query yet; the
-	// resolver expects the SELECT and the mock returns no row → falls back
-	// to the org default (byok, set above) so the OPENAI_API_KEY write
-	// reaches the INSERT-and-fail path this test exercises.
+	// Create() resolves billing mode per-workspace before the secret-strip gate.
+	// An explicit byok override short-circuits the resolver (precedence 1) so the
+	// OPENAI_API_KEY write is allowed and reaches the INSERT-and-fail path.
 	mock.ExpectQuery(`SELECT llm_billing_mode FROM workspaces WHERE id = \$1`).
-		WillReturnRows(sqlmock.NewRows([]string{"llm_billing_mode"}))
+		WillReturnRows(sqlmock.NewRows([]string{"llm_billing_mode"}).AddRow(LLMBillingModeBYOK))
 	mock.ExpectExec("INSERT INTO workspace_secrets").
 		WillReturnError(sql.ErrConnDone) // DB failure while writing secret
 	mock.ExpectRollback() // workspace insert must be rolled back
@@ -2045,6 +2044,111 @@ func TestWorkspaceCreate_188_NoTemplateNoRuntime_NowMODEL_REQUIRED(t *testing.T)
 	}
 	if !bytes.Contains(w.Body.Bytes(), []byte(`"runtime":"claude-code"`)) {
 		t.Errorf("bare-body create: expected runtime=\"claude-code\" in 422 body (the gate runs AFTER the default assignment so the diagnostic surfaces what runtime WOULD have been used), got %s", w.Body.String())
+	}
+}
+
+// internal#718 P2-B: only-registered validation in P2 WARN-mode. A known
+// (registry) runtime with a model NOT in its registered set is allowed to
+// proceed (201) but flagged with the X-Molecule-Model-Unregistered response
+// header + a queryable warning log. (Hard-reject is gated on P3/P4 vocabulary
+// convergence — see the create handler comment; flipping to 422 there is a
+// one-line change once the legacy colon-form model vocabulary is reconciled.)
+func TestWorkspaceCreate_718_UnregisteredModelWarnsButProceeds(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+
+	mock.ExpectBegin()
+	mock.ExpectExec("INSERT INTO workspaces").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+	mock.ExpectExec("INSERT INTO workspace_secrets").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO canvas_layouts").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO structure_events").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	body := `{"name":"Bad Model","runtime":"claude-code","model":"totally-made-up-xyz"}`
+	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	handler.Create(c)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("unregistered-model create (warn-mode): expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+	if w.Header().Get("X-Molecule-Model-Unregistered") != "true" {
+		t.Errorf("expected X-Molecule-Model-Unregistered=true header on unregistered model, got %q", w.Header().Get("X-Molecule-Model-Unregistered"))
+	}
+}
+
+// A REGISTERED model on a registry runtime sets NO unregistered header.
+func TestWorkspaceCreate_718_RegisteredModelNoWarnHeader(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+
+	mock.ExpectBegin()
+	mock.ExpectExec("INSERT INTO workspaces").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+	mock.ExpectExec("INSERT INTO workspace_secrets").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO canvas_layouts").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO structure_events").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	// claude-opus-4-7 IS a registered claude-code model (anthropic-api).
+	body := `{"name":"Good Model","runtime":"claude-code","model":"claude-opus-4-7"}`
+	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	handler.Create(c)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("registered-model create: expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+	if w.Header().Get("X-Molecule-Model-Unregistered") != "" {
+		t.Errorf("registered model must NOT set the unregistered header, got %q", w.Header().Get("X-Molecule-Model-Unregistered"))
+	}
+}
+
+// internal#718 P2-B: a runtime NOT in the registry (mock — a known core runtime
+// absent from the first-party provider registry) fails OPEN — the
+// only-registered gate does not block it (federation / non-first-party path
+// unchanged). It proceeds past the gate to the normal create flow.
+func TestWorkspaceCreate_718_NonRegistryRuntimeFailsOpen(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+
+	mock.ExpectBegin()
+	mock.ExpectExec("INSERT INTO workspaces").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+	mock.ExpectExec("INSERT INTO canvas_layouts").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO structure_events").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	// "mock" is a known core runtime but NOT in the first-party registry;
+	// any model passes the only-registered gate (fail-open).
+	body := `{"name":"Mock Agent","runtime":"mock","model":"canned-replies"}`
+	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	handler.Create(c)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("non-registry runtime should fail open (201), got %d: %s", w.Code, w.Body.String())
 	}
 }
 

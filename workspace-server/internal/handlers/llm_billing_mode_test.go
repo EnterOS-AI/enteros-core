@@ -1,10 +1,12 @@
 package handlers
 
-// llm_billing_mode_test.go — table-driven tests for the per-workspace
-// resolver (internal#691). The cases below enumerate every documented
-// branch in the default-closed contract; if one of them flips behavior
-// later the test names will tell the reviewer exactly which RFC clause
-// regressed.
+// llm_billing_mode_test.go — tests for the LEGACY-signature resolver
+// ResolveLLMBillingMode after internal#718 P2-B. The org rung is RETIRED: the
+// legacy shim now reads the explicit override first, then DERIVES the provider
+// from the workspace's stored (runtime, model) via the registry (no org
+// default). The dedicated derived-resolver cases live in
+// llm_billing_mode_derived_test.go; this file pins the legacy shim's DB-read
+// sequence + that it routes through the derived semantics.
 
 import (
 	"context"
@@ -14,35 +16,56 @@ import (
 	"github.com/DATA-DOG/go-sqlmock"
 )
 
-func TestResolveLLMBillingMode_TableDriven(t *testing.T) {
+// expectLegacyShimQueries sets up the DB reads the legacy ResolveLLMBillingMode
+// shim makes on a NO-explicit-override path (internal#718 P2-B), in order:
+//  1. override read (NULL) — the shim's own precedence-1 check,
+//  2. workspaces.runtime read,
+//  3. workspace_secrets scan (MODEL + auth-env names),
+//  4. override read AGAIN (NULL) — the derived resolver re-checks it so it is a
+//     complete, independently-callable SSOT.
+//
+// model=="" means no MODEL secret row.
+func expectLegacyShimQueries(m sqlmock.Sqlmock, wsID, runtime, model string) {
+	nullOverride := func() {
+		m.ExpectQuery(`SELECT llm_billing_mode FROM workspaces WHERE id = \$1`).
+			WithArgs(wsID).
+			WillReturnRows(sqlmock.NewRows([]string{"llm_billing_mode"}).AddRow(nil))
+	}
+	nullOverride()
+	m.ExpectQuery(`SELECT runtime FROM workspaces WHERE id = \$1`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow(runtime))
+	secretRows := sqlmock.NewRows([]string{"key", "encrypted_value", "encryption_version"})
+	if model != "" {
+		secretRows.AddRow("MODEL", []byte(model), 0) // version 0 = plaintext
+	}
+	m.ExpectQuery(`SELECT key, encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1`).
+		WithArgs(wsID).
+		WillReturnRows(secretRows)
+	nullOverride()
+}
+
+func TestResolveLLMBillingMode_LegacyShimDerives(t *testing.T) {
 	ctx := context.Background()
 	const wsID = "11111111-1111-1111-1111-111111111111"
 
 	type want struct {
-		mode   string
-		source BillingModeSource
-		// hasOverride asserts whether the resolver surfaced the override
-		// value in the result (nil pointer = clean inherit, non-nil = the
-		// row was present even if it ultimately fell through because it
-		// was garbled). Lets us distinguish "row missing, fell through"
-		// from "row present but garbled, fell through" — both resolve to
-		// the same mode but the resolver tells operators which case it was.
+		mode        string
+		source      BillingModeSource
 		hasOverride bool
 	}
 	type tc struct {
-		name        string
-		workspaceID string
-		orgMode     string
-		setupMock   func(m sqlmock.Sqlmock)
-		want        want
-		wantErr     bool
+		name      string
+		setupMock func(m sqlmock.Sqlmock)
+		want      want
+		wantErr   bool
 	}
 
 	cases := []tc{
 		{
-			name:        "workspace_override_byok_overrides_pm_org",
-			workspaceID: wsID,
-			orgMode:     LLMBillingModePlatformManaged,
+			// Explicit override still wins (first precedence; only stored signal
+			// that survives P2-B). No runtime/secrets read needed.
+			name: "explicit_override_byok_wins",
 			setupMock: func(m sqlmock.Sqlmock) {
 				m.ExpectQuery(`SELECT llm_billing_mode FROM workspaces WHERE id = \$1`).
 					WithArgs(wsID).
@@ -51,106 +74,60 @@ func TestResolveLLMBillingMode_TableDriven(t *testing.T) {
 			want: want{mode: LLMBillingModeBYOK, source: BillingModeSourceWorkspaceOverride, hasOverride: true},
 		},
 		{
-			name:        "workspace_override_disabled_overrides_pm_org",
-			workspaceID: wsID,
-			orgMode:     LLMBillingModePlatformManaged,
+			// No override + a non-platform-deriving model → byok via derive (THE
+			// FIX: pre-P2 this was platform_managed via the org rung).
+			name: "no_override_derives_byok_from_model",
 			setupMock: func(m sqlmock.Sqlmock) {
-				m.ExpectQuery(`SELECT llm_billing_mode FROM workspaces WHERE id = \$1`).
-					WithArgs(wsID).
-					WillReturnRows(sqlmock.NewRows([]string{"llm_billing_mode"}).AddRow(LLMBillingModeDisabled))
+				expectLegacyShimQueries(m, wsID, "claude-code", "kimi-for-coding")
 			},
-			want: want{mode: LLMBillingModeDisabled, source: BillingModeSourceWorkspaceOverride, hasOverride: true},
+			want: want{mode: LLMBillingModeBYOK, source: BillingModeSourceDerivedProvider, hasOverride: false},
 		},
 		{
-			name:        "workspace_override_null_inherits_byok_org",
-			workspaceID: wsID,
-			orgMode:     LLMBillingModeBYOK,
+			// No override + a platform-namespaced model → platform_managed (UNCHANGED).
+			name: "no_override_derives_platform_from_model",
 			setupMock: func(m sqlmock.Sqlmock) {
-				m.ExpectQuery(`SELECT llm_billing_mode FROM workspaces WHERE id = \$1`).
-					WithArgs(wsID).
-					WillReturnRows(sqlmock.NewRows([]string{"llm_billing_mode"}).AddRow(nil))
+				expectLegacyShimQueries(m, wsID, "claude-code", "anthropic/claude-opus-4-7")
 			},
-			want: want{mode: LLMBillingModeBYOK, source: BillingModeSourceOrgDefault, hasOverride: false},
+			want: want{mode: LLMBillingModePlatformManaged, source: BillingModeSourceDerivedProvider, hasOverride: false},
 		},
 		{
-			name:        "workspace_override_null_inherits_pm_org",
-			workspaceID: wsID,
-			orgMode:     LLMBillingModePlatformManaged,
+			// No override + no model → derived_default → platform_managed (unset → platform).
+			name: "no_override_no_model_platform_default",
 			setupMock: func(m sqlmock.Sqlmock) {
-				m.ExpectQuery(`SELECT llm_billing_mode FROM workspaces WHERE id = \$1`).
-					WithArgs(wsID).
-					WillReturnRows(sqlmock.NewRows([]string{"llm_billing_mode"}).AddRow(nil))
+				expectLegacyShimQueries(m, wsID, "claude-code", "")
 			},
-			want: want{mode: LLMBillingModePlatformManaged, source: BillingModeSourceOrgDefault, hasOverride: false},
+			want: want{mode: LLMBillingModePlatformManaged, source: BillingModeSourceDerivedDefault, hasOverride: false},
 		},
 		{
-			name:        "workspace_override_garbled_falls_through_to_pm_org_DEFAULT_CLOSED",
-			workspaceID: wsID,
-			orgMode:     LLMBillingModePlatformManaged,
+			// Garbled override is NOT honored — falls through to derive
+			// (default-closed). Here no model → platform default.
+			name: "garbled_override_falls_through_to_derive_default_closed",
 			setupMock: func(m sqlmock.Sqlmock) {
-				// CHECK constraint would normally prevent this but if a future
-				// migration loosens it (or a direct UPDATE bypasses it on a
-				// non-PG driver in a test stub), a garbled value MUST NOT
-				// be honored as if it were valid. This is the default-closed
-				// safety axis the RFC calls out.
+				// override read 1 (garbled → not honored), runtime, secrets,
+				// override read 2 (garbled again, derived resolver re-check).
+				m.ExpectQuery(`SELECT llm_billing_mode FROM workspaces WHERE id = \$1`).
+					WithArgs(wsID).
+					WillReturnRows(sqlmock.NewRows([]string{"llm_billing_mode"}).AddRow("byokk"))
+				m.ExpectQuery(`SELECT runtime FROM workspaces WHERE id = \$1`).
+					WithArgs(wsID).
+					WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("claude-code"))
+				m.ExpectQuery(`SELECT key, encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1`).
+					WithArgs(wsID).
+					WillReturnRows(sqlmock.NewRows([]string{"key", "encrypted_value", "encryption_version"}))
 				m.ExpectQuery(`SELECT llm_billing_mode FROM workspaces WHERE id = \$1`).
 					WithArgs(wsID).
 					WillReturnRows(sqlmock.NewRows([]string{"llm_billing_mode"}).AddRow("byokk"))
 			},
-			want: want{mode: LLMBillingModePlatformManaged, source: BillingModeSourceOrgDefault, hasOverride: true},
+			want: want{mode: LLMBillingModePlatformManaged, source: BillingModeSourceDerivedDefault, hasOverride: false},
 		},
 		{
-			name:        "workspace_override_garbled_org_garbled_constant_fallback",
-			workspaceID: wsID,
-			orgMode:     "garbled-or-empty",
-			setupMock: func(m sqlmock.Sqlmock) {
-				m.ExpectQuery(`SELECT llm_billing_mode FROM workspaces WHERE id = \$1`).
-					WithArgs(wsID).
-					WillReturnRows(sqlmock.NewRows([]string{"llm_billing_mode"}).AddRow("nonsense"))
-			},
-			// Both layers garbled → constant fallback. Source is constant_fallback
-			// so operators can see the org-default-was-also-bad case explicitly.
-			want: want{mode: LLMBillingModePlatformManaged, source: BillingModeSourceConstantFallback, hasOverride: true},
-		},
-		{
-			name:        "workspace_row_missing_falls_through_to_org_byok",
-			workspaceID: wsID,
-			orgMode:     LLMBillingModeBYOK,
-			setupMock: func(m sqlmock.Sqlmock) {
-				m.ExpectQuery(`SELECT llm_billing_mode FROM workspaces WHERE id = \$1`).
-					WithArgs(wsID).
-					WillReturnRows(sqlmock.NewRows([]string{"llm_billing_mode"}))
-			},
-			want: want{mode: LLMBillingModeBYOK, source: BillingModeSourceOrgDefault, hasOverride: false},
-		},
-		{
-			name:        "workspace_id_empty_pre_provision_org_only",
-			workspaceID: "",
-			orgMode:     LLMBillingModeBYOK,
-			setupMock:   func(m sqlmock.Sqlmock) { /* no DB read expected — empty ws id short-circuits */ },
-			want:        want{mode: LLMBillingModeBYOK, source: BillingModeSourceOrgDefault, hasOverride: false},
-		},
-		{
-			name:        "workspace_id_empty_org_garbled_constant_fallback",
-			workspaceID: "",
-			orgMode:     "",
-			setupMock:   func(m sqlmock.Sqlmock) { /* no DB read */ },
-			want:        want{mode: LLMBillingModePlatformManaged, source: BillingModeSourceConstantFallback, hasOverride: false},
-		},
-		{
-			name:        "db_error_default_closed_to_pm_with_error",
-			workspaceID: wsID,
-			orgMode:     LLMBillingModeBYOK, // org says byok but DB errored — DO NOT honor org
+			// DB error on the override read → default-closed + propagated error.
+			name: "override_db_error_default_closed_with_error",
 			setupMock: func(m sqlmock.Sqlmock) {
 				m.ExpectQuery(`SELECT llm_billing_mode FROM workspaces WHERE id = \$1`).
 					WithArgs(wsID).
 					WillReturnError(errors.New("connection refused"))
 			},
-			// Critical: even though orgMode=byok, a DB error means we can't
-			// confirm the workspace doesn't have an override, so we default
-			// to the closed mode. This is the safer of the two failures —
-			// silently flipping to org-byok on a DB error would leak the
-			// OAuth-keeping behavior to workspaces whose row says NULL.
 			want:    want{mode: LLMBillingModePlatformManaged, source: BillingModeSourceConstantFallback, hasOverride: false},
 			wantErr: true,
 		},
@@ -161,7 +138,8 @@ func TestResolveLLMBillingMode_TableDriven(t *testing.T) {
 			mock := setupTestDB(t)
 			c.setupMock(mock)
 
-			res, err := ResolveLLMBillingMode(ctx, c.workspaceID, c.orgMode)
+			// orgMode arg is retired/ignored; pass a value to prove it has no effect.
+			res, err := ResolveLLMBillingMode(ctx, wsID, LLMBillingModeBYOK)
 			if (err != nil) != c.wantErr {
 				t.Fatalf("err: got %v wantErr=%v", err, c.wantErr)
 			}
@@ -172,8 +150,7 @@ func TestResolveLLMBillingMode_TableDriven(t *testing.T) {
 				t.Errorf("source: got %q want %q", res.Source, c.want.source)
 			}
 			if (res.WorkspaceOverride != nil) != c.want.hasOverride {
-				t.Errorf("hasOverride: got %v want %v (override=%v)",
-					res.WorkspaceOverride != nil, c.want.hasOverride, res.WorkspaceOverride)
+				t.Errorf("hasOverride: got %v want %v", res.WorkspaceOverride != nil, c.want.hasOverride)
 			}
 			if err := mock.ExpectationsWereMet(); err != nil {
 				t.Errorf("sqlmock expectations: %v", err)
@@ -182,18 +159,45 @@ func TestResolveLLMBillingMode_TableDriven(t *testing.T) {
 	}
 }
 
+// TestResolveLLMBillingMode_EmptyWorkspaceID_PlatformDefault: pre-provision
+// (no workspace id) defaults closed with no DB read (org rung retired, so the
+// old "org_only" behavior is gone — it's now the platform default).
+func TestResolveLLMBillingMode_EmptyWorkspaceID_PlatformDefault(t *testing.T) {
+	ctx := context.Background()
+	mock := setupTestDB(t) // no DB read expected
+	res, err := ResolveLLMBillingMode(ctx, "", LLMBillingModeBYOK)
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if res.ResolvedMode != LLMBillingModePlatformManaged {
+		t.Errorf("empty ws id must default platform_managed, got %q", res.ResolvedMode)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations: %v", err)
+	}
+}
+
 // TestResolveLLMBillingMode_ResolvedModeIsAlwaysValid asserts the resolver's
 // post-condition: the returned mode is ALWAYS one of the three known enum
-// values, never an empty string and never a garbled passthrough. The strip
-// gate downstream relies on this so it can switch on res.ResolvedMode
-// without a separate is-valid check on every call site.
+// values. The strip gate downstream relies on this so it can switch on
+// res.ResolvedMode without a separate is-valid check on every call site.
 func TestResolveLLMBillingMode_ResolvedModeIsAlwaysValid(t *testing.T) {
 	ctx := context.Background()
 	const wsID = "22222222-2222-2222-2222-222222222222"
 
-	// Throw a pathological row at the resolver: garbled override + garbled
-	// org default. Resolved mode must still be a recognized enum.
+	// Garbled override + no derivable model: must still resolve a known enum
+	// (platform_managed, default-closed). Query order: override(garbled),
+	// runtime, secrets, override(garbled again — derived resolver re-check).
 	mock := setupTestDB(t)
+	mock.ExpectQuery(`SELECT llm_billing_mode FROM workspaces WHERE id = \$1`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"llm_billing_mode"}).AddRow("totally-bogus"))
+	mock.ExpectQuery(`SELECT runtime FROM workspaces WHERE id = \$1`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("claude-code"))
+	mock.ExpectQuery(`SELECT key, encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"key", "encrypted_value", "encryption_version"}))
 	mock.ExpectQuery(`SELECT llm_billing_mode FROM workspaces WHERE id = \$1`).
 		WithArgs(wsID).
 		WillReturnRows(sqlmock.NewRows([]string{"llm_billing_mode"}).AddRow("totally-bogus"))
@@ -206,7 +210,7 @@ func TestResolveLLMBillingMode_ResolvedModeIsAlwaysValid(t *testing.T) {
 		t.Errorf("post-condition violated: resolved mode %q is not a known enum value", res.ResolvedMode)
 	}
 	if res.ResolvedMode != LLMBillingModePlatformManaged {
-		t.Errorf("default-closed contract: garbled-x-garbled must resolve to platform_managed, got %q", res.ResolvedMode)
+		t.Errorf("default-closed contract: garbled-override + no-model must resolve platform_managed, got %q", res.ResolvedMode)
 	}
 }
 

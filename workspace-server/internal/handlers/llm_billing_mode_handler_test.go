@@ -29,13 +29,42 @@ func init() {
 
 const testWSID = "44444444-4444-4444-4444-444444444444"
 
-func TestGetWorkspaceLLMBillingMode_HappyPath_InheritsOrgDefault(t *testing.T) {
-	t.Setenv("MOLECULE_LLM_BILLING_MODE", LLMBillingModeBYOK)
+// expectDeriveShimQueries sets up the three reads the legacy-signature
+// ResolveLLMBillingMode shim makes on a no-explicit-override path
+// (internal#718 P2-B): the override read (NULL here), the workspaces.runtime
+// read, and the workspace_secrets scan (for MODEL + auth-env names). model==""
+// means no MODEL secret row.
+func expectDeriveShimQueries(m sqlmock.Sqlmock, wsID, runtime, model string) {
+	nullOverride := func() {
+		m.ExpectQuery(`SELECT llm_billing_mode FROM workspaces WHERE id = \$1`).
+			WithArgs(wsID).
+			WillReturnRows(sqlmock.NewRows([]string{"llm_billing_mode"}).AddRow(nil))
+	}
+	// Order: override(NULL) shim check, runtime, secrets, override(NULL) again
+	// (the derived resolver re-checks the override as a complete SSOT).
+	nullOverride()
+	m.ExpectQuery(`SELECT runtime FROM workspaces WHERE id = \$1`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow(runtime))
+	secretRows := sqlmock.NewRows([]string{"key", "encrypted_value", "encryption_version"})
+	if model != "" {
+		// encryption_version 0 = plaintext passthrough (crypto.DecryptVersioned).
+		secretRows.AddRow("MODEL", []byte(model), 0)
+	}
+	m.ExpectQuery(`SELECT key, encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1`).
+		WithArgs(wsID).
+		WillReturnRows(secretRows)
+	nullOverride()
+}
+
+// internal#718 P2-B: org rung retired. A no-override workspace's mode is now
+// DERIVED from its stored (runtime, model). A claude-code workspace with a
+// non-platform-deriving model (kimi-for-coding) resolves byok via
+// derived_provider — NOT the old "inherit org default".
+func TestGetWorkspaceLLMBillingMode_HappyPath_DerivesByokFromModel(t *testing.T) {
+	t.Setenv("MOLECULE_LLM_BILLING_MODE", LLMBillingModeBYOK) // org env ignored now
 	mock := setupTestDB(t)
-	// Workspace has no override → resolver returns org_default = byok.
-	mock.ExpectQuery(`SELECT llm_billing_mode FROM workspaces WHERE id = \$1`).
-		WithArgs(testWSID).
-		WillReturnRows(sqlmock.NewRows([]string{"llm_billing_mode"}).AddRow(nil))
+	expectDeriveShimQueries(mock, testWSID, "claude-code", "kimi-for-coding")
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -54,11 +83,14 @@ func TestGetWorkspaceLLMBillingMode_HappyPath_InheritsOrgDefault(t *testing.T) {
 	if res.ResolvedMode != LLMBillingModeBYOK {
 		t.Errorf("resolved mode: got %q want %q", res.ResolvedMode, LLMBillingModeBYOK)
 	}
-	if res.Source != BillingModeSourceOrgDefault {
-		t.Errorf("source: got %q want %q", res.Source, BillingModeSourceOrgDefault)
+	if res.Source != BillingModeSourceDerivedProvider {
+		t.Errorf("source: got %q want %q", res.Source, BillingModeSourceDerivedProvider)
 	}
 	if res.WorkspaceOverride != nil {
 		t.Errorf("expected nil override, got %v", *res.WorkspaceOverride)
+	}
+	if res.ProviderSelection == nil || *res.ProviderSelection != "kimi-coding" {
+		t.Errorf("expected derived provider kimi-coding, got %v", res.ProviderSelection)
 	}
 }
 
@@ -117,9 +149,9 @@ func TestPutWorkspaceLLMBillingMode_ExplicitNullClearsOverride(t *testing.T) {
 	mock.ExpectExec(`UPDATE workspaces SET llm_billing_mode = NULL WHERE id = \$1`).
 		WithArgs(testWSID).
 		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectQuery(`SELECT llm_billing_mode FROM workspaces WHERE id = \$1`).
-		WithArgs(testWSID).
-		WillReturnRows(sqlmock.NewRows([]string{"llm_billing_mode"}).AddRow(nil))
+	// After clear, the post-write re-resolution DERIVES (internal#718 P2-B):
+	// no override + no MODEL secret → derived_default → platform_managed.
+	expectDeriveShimQueries(mock, testWSID, "claude-code", "")
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -142,8 +174,8 @@ func TestPutWorkspaceLLMBillingMode_ExplicitNullClearsOverride(t *testing.T) {
 	if res.ResolvedMode != LLMBillingModePlatformManaged {
 		t.Errorf("post-clear resolved: got %q want %q", res.ResolvedMode, LLMBillingModePlatformManaged)
 	}
-	if res.Source != BillingModeSourceOrgDefault {
-		t.Errorf("post-clear source: got %q want %q", res.Source, BillingModeSourceOrgDefault)
+	if res.Source != BillingModeSourceDerivedDefault {
+		t.Errorf("post-clear source: got %q want %q", res.Source, BillingModeSourceDerivedDefault)
 	}
 	if res.WorkspaceOverride != nil {
 		t.Errorf("post-clear override should be nil, got %v", *res.WorkspaceOverride)
