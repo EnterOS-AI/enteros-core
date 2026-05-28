@@ -357,6 +357,14 @@ jobs:
         name: Run E2E bash unit tests (no live infra)
         run: |
           bash tests/e2e/test_model_slug.sh
+          # molecule-core#1995 (#1994 follow-on): fail-direction proof for
+          # the A2A real-completion + byok-routing assertion helpers
+          # (lib/completion_assert.sh). Offline (no LLM, no network): it
+          # asserts an error-as-text payload FAILS the real-completion gate
+          # — the exact trap the historical shape-only `"kind":"text"`
+          # check missed. If a refactor weakens the gate to a shape check,
+          # this step goes red on every PR.
+          bash tests/e2e/test_completion_assert_unit.sh
 
       - if: ${{ needs.changes.outputs.scripts == 'true' }}
         name: Test ECR promote-tenant-image script (mock-driven, no live infra)
