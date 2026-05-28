@@ -428,30 +428,51 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 		return
 	}
 
-	// internal#718 P2-B: ONLY-REGISTERED validation at the create boundary.
+	// internal#718 P4 PR-2: ONLY-REGISTERED validation at the create boundary —
+	// FLIPPED from WARN to HARD-REJECT (was the P2-B WARN-mode signal).
+	//
 	// For a runtime the provider registry knows (first-party:
 	// claude-code/codex/hermes/openclaw) this checks the (runtime, model) pair
 	// against the registry's native model set. Fails OPEN for runtimes the
 	// registry doesn't know (langgraph/external/kimi/mock/federated) so
-	// non-first-party flows are UNCHANGED. Skipped for external workspaces.
+	// non-first-party / federated flows are UNCHANGED. Skipped for external
+	// workspaces (the URL is the contract, not the model — see MODEL_REQUIRED
+	// rationale above).
 	//
-	// P2 ENFORCEMENT MODE = WARN, not hard-reject (deliberate, scoped). The
-	// legacy colon-namespaced BYOK model vocabulary ("anthropic:claude-opus-4-7"
-	// etc.) is still live across the create/import/template corpus and is NOT
-	// yet reconciled into the registry's exact-id model sets — that convergence
-	// is P3 (canvas only-offers-registered) + P4 (template codegen). Hard-
-	// rejecting an unregistered (runtime, model) now would 422 those legitimate
-	// existing flows, a large behavior change outside P2's scope (P2's behavior
-	// delta is the billing/credential flip, below). So P2 surfaces the
-	// unregistered pair as a queryable warning + an X-Molecule-Model-Unregistered
-	// response header (operator/canvas signal) and lets create proceed; the gate
-	// flips to hard-reject (uncomment the 422 below) once P3/P4 land the
-	// vocabulary convergence. The registry model set is code-generated from the
-	// canonical providers.yaml (PR-A), so the check stays in sync with the SSOT.
+	// THE FLIP (was WARN, now 422):
+	//   * P2-B carried the gate in WARN mode (X-Molecule-Model-Unregistered
+	//     response header + log line, create proceeds) because the legacy
+	//     colon-namespaced BYOK vocabulary ('anthropic:claude-opus-4-7' etc.)
+	//     was live across the create corpus but not yet in the registry's
+	//     exact-id model sets — hard-rejecting would have 422'd legitimate
+	//     existing flows.
+	//   * P4 PR-1 reconciled that colon vocab into the registry as
+	//     first-class native-set entries (each runtime native set now lists
+	//     both bare/slash AND colon forms for the BYOK ids the live corpus
+	//     uses; openclaw's pre-existing colon-form precedent extended to
+	//     claude-code). DeriveProvider / Manifest.ModelsForRuntime now
+	//     resolves every legitimate model in the corpus.
+	//   * With the reconcile landed, an unregistered (runtime, model) pair
+	//     is a real misconfiguration — the corpus has no legitimate model
+	//     this validator now rejects. We flip to 422
+	//     UNREGISTERED_MODEL_FOR_RUNTIME so the caller fails LOUDLY at the
+	//     boundary instead of provisioning a workspace that will wedge at
+	//     adapter init (the codex 'anthropic:claude-opus-4-7' wedge class
+	//     the MODEL_REQUIRED gate also targets).
+	//
+	// The registry model set is code-generated from the canonical
+	// providers.yaml (P2-A artifact); the check stays in sync with the SSOT
+	// via the verify-providers-gen + sync-providers-yaml CI gates.
 	if !isExternal {
 		if ok, why := validateRegisteredModelForRuntime(payload.Runtime, payload.Model); !ok {
-			log.Printf("Create: WARN unregistered model (runtime=%q model=%q): %s [internal#718 P2 warn-mode; hard-reject gated on P3/P4 vocabulary convergence]", payload.Runtime, payload.Model, why)
-			c.Header("X-Molecule-Model-Unregistered", "true")
+			log.Printf("Create: 422 UNREGISTERED_MODEL_FOR_RUNTIME (runtime=%q model=%q): %s [internal#718 P4 PR-2 hard-reject]", payload.Runtime, payload.Model, why)
+			c.JSON(http.StatusUnprocessableEntity, gin.H{
+				"error":   why,
+				"runtime": payload.Runtime,
+				"model":   payload.Model,
+				"code":    "UNREGISTERED_MODEL_FOR_RUNTIME",
+			})
+			return
 		}
 	}
 

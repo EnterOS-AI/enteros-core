@@ -126,7 +126,7 @@ func TestWorkspaceCreate_WithInvalidCompute_ReturnsBadRequest(t *testing.T) {
 	c, _ := gin.CreateTestContext(w)
 	body := `{
 		"name":"Oversized Agent",
-		"model":"gpt-4",
+		"model":"claude-opus-4-7",
 		"compute":{"instance_type":"p4d.24xlarge"}
 	}`
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
