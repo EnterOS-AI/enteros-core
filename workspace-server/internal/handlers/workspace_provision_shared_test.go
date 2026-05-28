@@ -646,103 +646,49 @@ func TestReadOrLazyHealInboundSecret(t *testing.T) {
 	})
 }
 
-// TestDeriveProviderFromModelSlug pins the slug→provider mapping shared
-// with workspace-configs-templates/hermes/scripts/derive-provider.sh.
-// Sync-test: when a new prefix is added to the shell script, add it
-// here too. The two intentional differences from the shell version
-// (nousresearch/openai both → "openrouter" at provision time;
-// unknown/no-prefix → "" instead of "auto") are exercised explicitly.
-func TestDeriveProviderFromModelSlug(t *testing.T) {
-	t.Parallel()
-	cases := []struct {
-		name  string
-		model string
-		want  string
-	}{
-		{"minimax", "minimax/MiniMax-M2.7-highspeed", "minimax"},
-		{"minimax-cn keeps cn suffix", "minimax-cn/MiniMax-M2.7", "minimax-cn"},
-		{"anthropic", "anthropic/claude-sonnet-4-6", "anthropic"},
-		{"gemini", "gemini/gemini-2.5-pro", "gemini"},
-		{"deepseek", "deepseek/deepseek-v3", "deepseek"},
-		{"zai", "zai/glm-4.6", "zai"},
-		{"kimi-coding", "kimi-coding/kimi-k2", "kimi-coding"},
-		{"kimi-coding-cn keeps cn suffix", "kimi-coding-cn/kimi-k2", "kimi-coding-cn"},
-		{"alibaba via dashscope alias", "dashscope/qwen3", "alibaba"},
-		{"alibaba via qwen alias", "qwen/qwen3-coder", "alibaba"},
-		{"xiaomi via mimo alias", "mimo/mimo-vl", "xiaomi"},
-		{"arcee via arcee-ai alias", "arcee-ai/arcee-blitz", "arcee"},
-		{"nvidia via nim alias", "nim/llama-3.3-nemotron-super", "nvidia"},
-		{"ollama-cloud", "ollama-cloud/qwen3", "ollama-cloud"},
-		{"huggingface via hf alias", "hf/Qwen/Qwen3", "huggingface"},
-		{"ai-gateway", "ai-gateway/anthropic-claude-sonnet-4-6", "ai-gateway"},
-		{"kilocode", "kilocode/kilo-1", "kilocode"},
-		{"opencode-zen", "opencode-zen/zen-1", "opencode-zen"},
-		{"opencode-go", "opencode-go/code-1", "opencode-go"},
-		{"openrouter passthrough", "openrouter/anthropic/claude-sonnet-4-6", "openrouter"},
-		{"custom passthrough", "custom/my-private-endpoint", "custom"},
-		// Runtime-only override candidates default to openrouter at
-		// provision time (derive-provider.sh upgrades to nous/custom at
-		// boot if HERMES_API_KEY/OPENAI_API_KEY are present).
-		{"nousresearch defaults to openrouter at provision time", "nousresearch/hermes-4-70b", "openrouter"},
-		{"openai defaults to openrouter at provision time", "openai/gpt-5", "openrouter"},
-		// hermes-agent v0.12.0 / 2026-04-30 provider list — the drift gate
-		// in derive_provider_drift_test.go pins parity with the shell case
-		// statement.
-		{"xai", "xai/grok-4", "xai"},
-		{"xai via grok alias", "grok/grok-4", "xai"},
-		{"bedrock", "bedrock/anthropic.claude-sonnet-4-6", "bedrock"},
-		{"bedrock via aws alias", "aws/anthropic.claude-sonnet-4-6", "bedrock"},
-		{"tencent", "tencent/hunyuan-coder", "tencent-tokenhub"},
-		{"tencent-tokenhub passthrough", "tencent-tokenhub/hunyuan-coder", "tencent-tokenhub"},
-		{"gmi", "gmi/gmi-coder-1", "gmi"},
-		{"qwen-oauth", "qwen-oauth/qwen3-coder", "qwen-oauth"},
-		{"lmstudio", "lmstudio/qwen3-coder", "lmstudio"},
-		{"lmstudio via lm-studio alias", "lm-studio/qwen3-coder", "lmstudio"},
-		{"minimax-oauth", "minimax-oauth/MiniMax-M2.7", "minimax-oauth"},
-		{"alibaba-coding-plan", "alibaba-coding-plan/qwen3-coder", "alibaba-coding-plan"},
-		{"google-gemini-cli", "google-gemini-cli/gemini-2.5-pro", "google-gemini-cli"},
-		{"openai-codex", "openai-codex/gpt-5-codex", "openai-codex"},
-		{"copilot-acp", "copilot-acp/claude-sonnet-4-6", "copilot-acp"},
-		{"copilot", "copilot/claude-sonnet-4-6", "copilot"},
-		// Unknowns return "" so the caller skips the LLM_PROVIDER write
-		// and lets derive-provider.sh's *=auto branch decide at runtime.
-		{"unknown prefix returns empty", "totally-unknown-model/foo", ""},
-		{"empty input returns empty", "", ""},
-		{"no slash returns empty", "no-slash-here", ""},
-		{"leading slash returns empty", "/leading-slash", ""},
-	}
-	for _, tc := range cases {
-		tc := tc
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			got := deriveProviderFromModelSlug(tc.model)
-			if got != tc.want {
-				t.Errorf("deriveProviderFromModelSlug(%q) = %q, want %q", tc.model, got, tc.want)
-			}
-		})
-	}
-}
+// internal#718 P4 closure: TestDeriveProviderFromModelSlug was the
+// table-driven sync test that pinned deriveProviderFromModelSlug
+// (retire-list #3) against
+// workspace-configs-templates/hermes/scripts/derive-provider.sh.
+//
+// Both the Go function and this test (with its 35+ slug→provider
+// cases) are retired. The slug→provider mapping is now covered by
+// providers.Manifest.DeriveProvider against the registry SSOT
+// (TestDeriveProvider_RealManifest in
+// internal/providers/derive_provider_test.go). The shell script
+// remains the in-container fallback; its byte-identity with the
+// registry view of hermes is a P4 follow-up gated on registry data
+// growth (see PR-2 codegen of hermes config.yaml from the registry).
+//
+// TestWorkspaceCreate_FirstDeploy_PersistsModelAndProvider, which
+// asserted that Create writes BOTH MODEL and LLM_PROVIDER rows, is
+// replaced by TestWorkspaceCreate_FirstDeploy_OnlyPersistsMODEL
+// below — the LLM_PROVIDER half of the contract is retired.
+//
+// TestWorkspaceCreate_FirstDeploy_UnknownModel_OnlyMintModelProvider
+// is subsumed by the same: with LLM_PROVIDER never written, the
+// known-vs-unknown distinction at Create disappears.
 
-// TestWorkspaceCreate_FirstDeploy_PersistsModelAndProvider pins the
-// fix for failed-workspace 95ed3ff2 (2026-05-02). Pre-fix: the canvas
-// POSTed minimax/MiniMax-M2.7 in payload.Model, the workspace row was
-// created, but neither the model nor the derived provider was ever
-// written to workspace_secrets. On any subsequent restart, the
-// applyRuntimeModelEnv fallback found nothing and hermes booted with
-// the template default (nousresearch/hermes-4-70b) → wrong provider
-// keys → /health poll failed → never registered.
+// TestWorkspaceCreate_FirstDeploy_OnlyPersistsMODEL pins the post-P4
+// contract: WorkspaceHandler.Create writes the MODEL workspace_secret
+// (so the canvas-picked model survives restart and applyRuntimeModelEnv
+// finds it via the fallback chain) and writes NOTHING ELSE in the
+// secret-mint window. Specifically: NO LLM_PROVIDER row is written,
+// regardless of payload.LLMProvider or the slug-prefix.
 //
-// Post-fix: the create handler writes both rows after committing the
-// workspace row. This test asserts the SQL writes happen with the
-// correct keys + values.
+// Pre-P4 the create handler also wrote LLM_PROVIDER via setProviderSecret
+// — either from payload.LLMProvider verbatim or from
+// deriveProviderFromModelSlug(payload.Model). Both code paths were
+// retired in internal#718 P4 closure together with the LLM_PROVIDER
+// workspace_secret itself (no consumer remains; the provider is derived
+// at every decision point from (runtime, model) via the registry).
 //
-// 2026-05-19 follow-up: the workspace_secrets row that holds the
-// picked model id was renamed MODEL_PROVIDER → MODEL (the column name
-// was misleading and bled into applyRuntimeModelEnv as a slug
-// fallback). The sqlmock regex below now anchors on 'MODEL' instead
-// of 'MODEL_PROVIDER'. See fix/workspace-server-rename-
-// MODEL_PROVIDER-to-MODEL + the 20260519000000 rename migration.
-func TestWorkspaceCreate_FirstDeploy_PersistsModelAndProvider(t *testing.T) {
+// sqlmock failure on this expectation set is the canonical regression
+// signal: if a future PR re-introduces an LLM_PROVIDER write at create,
+// sqlmock surfaces "ExpectExec was not called" for any added insert.
+// The "MODEL anchor uses no LLM_PROVIDER" assertion below is the
+// stronger version of the same gate.
+func TestWorkspaceCreate_FirstDeploy_OnlyPersistsMODEL(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
 	broadcaster := newTestBroadcaster()
@@ -757,43 +703,35 @@ func TestWorkspaceCreate_FirstDeploy_PersistsModelAndProvider(t *testing.T) {
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 
-	// The fix: MODEL is upserted with the verbatim model slug
-	// (renamed from MODEL_PROVIDER on 2026-05-19 — see file-level
-	// docstring). SQL has 3 placeholders ($1=workspace_id, $2=
-	// encrypted_value reused in the conflict-update, $3=version
-	// reused in the conflict-update), so sqlmock sees 3 args. The
-	// 'MODEL' / 'LLM_PROVIDER' key is a literal in the SQL — we
-	// distinguish the two writes with the regex match below. The
-	// 'MODEL' anchor uses a word boundary (`[^_A-Z]`) so it does
-	// NOT silently match the legacy 'MODEL_PROVIDER' name.
+	// MODEL upsert — the only post-commit workspace_secrets write that
+	// survived the P4 closure. The 'MODEL' key is literal in the SQL.
 	mock.ExpectExec(`INSERT INTO workspace_secrets[\s\S]*'MODEL'`).
-		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	// The fix: LLM_PROVIDER is upserted with the derived provider name.
-	mock.ExpectExec(`INSERT INTO workspace_secrets[\s\S]*'LLM_PROVIDER'`).
 		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// Post-mint side effects (canvas layout + structure_events broadcast
 	// + the external-workspace UPDATE/IssueToken chain). Order matches
-	// workspace.go.
+	// workspace.go. CRITICALLY: no second `INSERT INTO workspace_secrets`
+	// is expected — sqlmock fails if Create attempts an LLM_PROVIDER
+	// write.
 	mock.ExpectExec("INSERT INTO canvas_layouts").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec("INSERT INTO structure_events").
 		WillReturnResult(sqlmock.NewResult(0, 1))
-	// External branch with no URL: status → awaiting_agent + IssueToken.
 	mock.ExpectExec(`UPDATE workspaces SET status =`).
 		WillReturnResult(sqlmock.NewResult(0, 1))
-	// wsauth.IssueToken inserts into workspace_auth_tokens.
 	mock.ExpectExec("INSERT INTO workspace_auth_tokens").
 		WillReturnResult(sqlmock.NewResult(0, 1))
-	// awaiting_agent broadcast.
 	mock.ExpectExec("INSERT INTO structure_events").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
-	body := `{"name":"External Minimax Agent","runtime":"external","external":true,"model":"minimax/MiniMax-M2.7"}`
+	// Body carries an explicit llm_provider AND a slug-prefixed model — both
+	// of which would have triggered an LLM_PROVIDER write pre-P4. The
+	// payload field is preserved for backward-compat (older canvases
+	// still send it) but the value is intentionally ignored by Create.
+	body := `{"name":"External Minimax Agent","runtime":"external","external":true,"model":"minimax/MiniMax-M2.7","llm_provider":"minimax"}`
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
@@ -803,7 +741,7 @@ func TestWorkspaceCreate_FirstDeploy_PersistsModelAndProvider(t *testing.T) {
 		t.Fatalf("expected status 201, got %d: %s", w.Code, w.Body.String())
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("sqlmock expectations not met — first-deploy did NOT persist MODEL + LLM_PROVIDER (this is the prod bug recurrence): %v", err)
+		t.Errorf("sqlmock expectations not met — Create wrote an unexpected workspace_secrets row (likely a re-introduced LLM_PROVIDER write): %v", err)
 	}
 }
 
@@ -859,56 +797,12 @@ func TestWorkspaceCreate_FirstDeploy_NoModel_Returns422(t *testing.T) {
 	}
 }
 
-// TestWorkspaceCreate_FirstDeploy_UnknownModel_OnlyMintModelProvider
-// asserts the asymmetric case: an unknown model prefix still gets
-// MODEL persisted (so the user's exact slug survives restart and
-// applyRuntimeModelEnv finds it), but LLM_PROVIDER is skipped (so
-// derive-provider.sh's *=auto branch can decide at runtime instead of
-// being pre-empted by a guess). The MODEL key was renamed from
-// MODEL_PROVIDER on 2026-05-19 — see file-level docstring.
-func TestWorkspaceCreate_FirstDeploy_UnknownModel_OnlyMintModelProvider(t *testing.T) {
-	mock := setupTestDB(t)
-	setupTestRedis(t)
-	broadcaster := newTestBroadcaster()
-	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
-
-	mock.ExpectBegin()
-	mock.ExpectExec("INSERT INTO workspaces").
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectCommit()
-
-	// Only MODEL — LLM_PROVIDER must NOT be written for unknown
-	// prefixes. Same 3-arg shape as above; key is literal in SQL.
-	mock.ExpectExec(`INSERT INTO workspace_secrets[\s\S]*'MODEL'`).
-		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
-		WillReturnResult(sqlmock.NewResult(0, 1))
-
-	mock.ExpectExec("INSERT INTO canvas_layouts").
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec("INSERT INTO structure_events").
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec(`UPDATE workspaces SET status =`).
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec("INSERT INTO workspace_auth_tokens").
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec("INSERT INTO structure_events").
-		WillReturnResult(sqlmock.NewResult(0, 1))
-
-	w := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(w)
-	body := `{"name":"Unknown Model Agent","runtime":"external","external":true,"model":"totally-unknown-model/foo"}`
-	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
-	c.Request.Header.Set("Content-Type", "application/json")
-
-	handler.Create(c)
-
-	if w.Code != http.StatusCreated {
-		t.Fatalf("expected status 201, got %d: %s", w.Code, w.Body.String())
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("sqlmock expectations not met — unknown-prefix model should mint MODEL but skip LLM_PROVIDER: %v", err)
-	}
-}
+// internal#718 P4 closure: the asymmetric "known prefix → both
+// MODEL+LLM_PROVIDER; unknown prefix → MODEL only" contract is moot —
+// Create never writes LLM_PROVIDER for ANY model now. The equivalent
+// coverage is TestWorkspaceCreate_FirstDeploy_OnlyPersistsMODEL above
+// (uses a slug-prefixed model that pre-P4 WOULD have triggered an
+// LLM_PROVIDER write; sqlmock fails if Create attempts one).
 
 // TestApplyRuntimeModelEnv_SetsUniversalMODELForAllRuntimes pins the
 // fix for Bug B (2026-05-02): canvas-selected model was silently dropped

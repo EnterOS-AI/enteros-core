@@ -710,131 +710,21 @@ func (h *WorkspaceHandler) defaultTemplateProvidersYAML(runtime string) string {
 	return ""
 }
 
-// deriveProviderFromModelSlug maps a hermes-agent model slug prefix to
-// its provider name — a Go translation of the case statement in
-// workspace-configs-templates/hermes/scripts/derive-provider.sh that we
-// can run at provision time so LLM_PROVIDER lands in workspace_secrets
-// (and from there, into /configs/config.yaml via CP user-data) before
-// the container ever boots.
+// internal#718 P4 closure — `deriveProviderFromModelSlug` (retire-list #3)
+// has been removed together with its only caller (WorkspaceHandler.Create's
+// setProviderSecret write) and the LLM_PROVIDER workspace_secret it
+// populated.
 //
-// Returns "" when the prefix isn't recognized OR when the runtime-only
-// override would be needed to pick a provider — the caller skips the
-// LLM_PROVIDER write in that case so derive-provider.sh keeps the final
-// say at boot. derive-provider.sh remains the source of truth: this is
-// strictly a *gating* hint that survives restarts and gives CP a YAML
-// field to populate. Without it, "Save+Restart" would lose the user's
-// provider choice every time CP regenerates the config.
-//
-// Two intentional differences from the shell version:
-//
-//  1. nousresearch/* and openai/* both return "openrouter" here. The
-//     shell script special-cases "prefer nous if HERMES_API_KEY set" /
-//     "prefer custom if OPENAI_API_KEY set", but those depend on
-//     runtime env that may not yet be loaded at provision time. We pick
-//     the safe default ("openrouter" reaches both Hermes 3 and OpenAI
-//     models without extra config); derive-provider.sh's runtime check
-//     can still upgrade to nous/custom when the keys are present.
-//
-//  2. Unknown prefixes return "" instead of "auto". Persisting "auto"
-//     would block a future "Save+Restart" with a known prefix from
-//     re-deriving — the CP YAML field is sticky once written. Returning
-//     "" means the caller skips the write and the runtime falls through
-//     to derive-provider.sh's *=auto branch on its own.
-//
-// Cover the same prefix list as derive-provider.sh's case statement;
-// keep both files in sync when a new provider is added (table-driven
-// test in workspace_provision_shared_test.go pins the mapping).
-func deriveProviderFromModelSlug(model string) string {
-	if model == "" {
-		return ""
-	}
-	idx := strings.Index(model, "/")
-	if idx <= 0 {
-		return ""
-	}
-	prefix := model[:idx]
-	switch prefix {
-	// Direct-SDK providers (clean 1:1 prefix→provider mapping).
-	case "minimax":
-		return "minimax"
-	case "minimax-cn":
-		return "minimax-cn"
-	case "anthropic":
-		return "anthropic"
-	case "gemini":
-		return "gemini"
-	case "deepseek":
-		return "deepseek"
-	case "zai":
-		return "zai"
-	case "kimi-coding":
-		return "kimi-coding"
-	case "kimi-coding-cn":
-		return "kimi-coding-cn"
-	case "alibaba", "dashscope", "qwen":
-		return "alibaba"
-	case "xiaomi", "mimo":
-		return "xiaomi"
-	case "arcee", "arcee-ai":
-		return "arcee"
-	case "nvidia", "nim":
-		return "nvidia"
-	case "ollama-cloud":
-		return "ollama-cloud"
-	case "huggingface", "hf":
-		return "huggingface"
-	case "ai-gateway", "aigateway":
-		return "ai-gateway"
-	case "kilocode":
-		return "kilocode"
-	case "opencode-zen":
-		return "opencode-zen"
-	case "opencode-go":
-		return "opencode-go"
-	// Aggregator + explicit catch-alls.
-	case "openrouter":
-		return "openrouter"
-	case "custom":
-		return "custom"
-	// Runtime-only override candidates. derive-provider.sh's
-	// HERMES_API_KEY / OPENAI_API_KEY checks happen at boot; we pick the
-	// safe default (openrouter reaches both Hermes 3 and OpenAI without
-	// extra config) and let the script upgrade to nous/custom at runtime.
-	case "nousresearch", "openai":
-		return "openrouter"
-	// Additional 1:1 prefix→provider mappings — kept aligned with upstream's
-	// HERMES_INFERENCE_PROVIDER list (NousResearch/hermes-agent v0.12.0,
-	// 2026-04-30) and the additional case clauses in derive-provider.sh.
-	// The drift gate in derive_provider_drift_test.go enforces parity.
-	case "xai", "grok":
-		return "xai"
-	case "bedrock", "aws":
-		return "bedrock"
-	case "tencent", "tencent-tokenhub":
-		return "tencent-tokenhub"
-	case "gmi":
-		return "gmi"
-	case "qwen-oauth":
-		return "qwen-oauth"
-	case "lmstudio", "lm-studio":
-		return "lmstudio"
-	case "minimax-oauth":
-		return "minimax-oauth"
-	case "alibaba-coding-plan":
-		return "alibaba-coding-plan"
-	case "google-gemini-cli":
-		return "google-gemini-cli"
-	case "openai-codex":
-		return "openai-codex"
-	case "copilot-acp":
-		return "copilot-acp"
-	case "copilot":
-		return "copilot"
-	}
-	// Unknown prefix → don't persist a guess. derive-provider.sh's
-	// *=auto fallback handles it at runtime.
-	return ""
-}
+// The hand-rolled prefix switch was a Go mirror of
+// workspace-configs-templates/hermes/scripts/derive-provider.sh kept in
+// sync via a drift test. The replacement is providers.Manifest.DeriveProvider
+// (synced in P2-A), which derives the provider from (runtime, model)
+// against the registry SSOT at every decision point — billing (P2-B),
+// CP user-data emission (this PR's CP-side commit), validation
+// (P3 PR-C). The shell script in the hermes template continues to be the
+// runtime fallback for unregistered models; codegen of the template's
+// providers block from the registry is the P4 follow-up gated on
+// registry data growth.
 
 // applyRuntimeModelEnv exposes the workspace's selected model via an
 // env var the target runtime's install.sh / start.sh knows to read.
@@ -1176,6 +1066,14 @@ func loadWorkspaceSecrets(ctx context.Context, workspaceID string) (map[string]s
 			var v []byte
 			var ver int
 			if globalRows.Scan(&k, &v, &ver) == nil {
+				// internal#718 P4 closure: LLM_PROVIDER is retired even
+				// at the global rung. The same provider-from-(runtime,model)
+				// derivation runs per-workspace, so a global default
+				// would be pure ghost. Symmetric with the workspace_secrets
+				// drop below.
+				if k == "LLM_PROVIDER" {
+					continue
+				}
 				decrypted, decErr := crypto.DecryptVersioned(v, ver)
 				if decErr != nil {
 					log.Printf("Provisioner: FATAL — failed to decrypt global secret %s (version=%d): %v — aborting provision of workspace %s", k, ver, decErr, workspaceID)
@@ -1198,6 +1096,18 @@ func loadWorkspaceSecrets(ctx context.Context, workspaceID string) (map[string]s
 			var v []byte
 			var ver int
 			if wsRows.Scan(&k, &v, &ver) == nil {
+				// internal#718 P4 closure: LLM_PROVIDER is a retired
+				// secret key. Migration 20260528000000 deletes any
+				// straggler rows; this drop is defence-in-depth so a
+				// rolling deploy (new code, old DB) never re-emits the
+				// retired key into the provisioner env (which would
+				// reach the CP-side resolveModelAndProvider — now
+				// itself retired, but the env contract belongs to
+				// core). Idempotent: a fresh tenant has zero
+				// LLM_PROVIDER rows and this branch is unreached.
+				if k == "LLM_PROVIDER" {
+					continue
+				}
 				decrypted, decErr := crypto.DecryptVersioned(v, ver)
 				if decErr != nil {
 					log.Printf("Provisioner: FATAL — failed to decrypt workspace secret %s (version=%d) for %s: %v — aborting provision", k, ver, workspaceID, decErr)
