@@ -355,15 +355,24 @@ export function ConfigTab({ workspaceId }: Props) {
   const [rawMode, setRawMode] = useState(false);
   const [rawDraft, setRawDraft] = useState("");
   const [runtimeOptions, setRuntimeOptions] = useState<RuntimeOption[]>(FALLBACK_RUNTIME_OPTIONS);
-  // Provider override (Option B PR-5): stored separately from config.yaml
-  // because the value lives in workspace_secrets (encrypted), not in the
-  // platform-managed config.yaml. The two endpoints are GET/PUT
-  // /workspaces/:id/provider on workspace-server (handlers/secrets.go).
-  // Empty = "auto-derive from model slug prefix" — pre-Option-B behavior
-  // and what most users want. Setting to a non-empty value writes
-  // LLM_PROVIDER into workspace_secrets and triggers an auto-restart so
-  // the workspace boots with the new provider in env (and via CP user-
-  // data, written into /configs/config.yaml on next provision too).
+  // internal#718 P4 closure: the explicit provider override
+  // (LLM_PROVIDER workspace_secret, surfaced via GET/PUT
+  // /workspaces/:id/provider) has been RETIRED. The provider is
+  // derived at every decision point from (runtime, model) via the
+  // registry — no stored row remains. The `provider` / `originalProvider`
+  // state and the provider dropdown survive in this component for
+  // backwards-compat (display only) but are no longer persisted:
+  //   - loadConfig no longer GETs /workspaces/:id/provider (the
+  //     endpoint returns 410 Gone). The state initializes to ""
+  //     and stays there.
+  //   - handleSave no longer PUTs /workspaces/:id/provider.
+  //   - The dropdown still updates the local `provider` state so the
+  //     user can preview the derived value; the value never leaves
+  //     the browser.
+  // This is the canvas-side complement to the backend retirement of
+  // SetProvider/GetProvider/setProviderSecret. Older canvases that
+  // still call PUT /provider hit the 410 Gone with a structured
+  // PROVIDER_ENDPOINT_RETIRED code — loud failure, no silent miss.
   const [provider, setProvider] = useState("");
   const [originalProvider, setOriginalProvider] = useState("");
   // Track the model the form first rendered, so handleSave can detect
@@ -414,26 +423,23 @@ export function ConfigTab({ workspaceId }: Props) {
     //
     // See GH #1894 for the workspace-row-as-source-of-truth rationale
     // that motivated splitting from a single config.yaml read.
-    const [wsRes, modelRes, providerRes] = await Promise.all([
+    // internal#718 P4 closure: the GET /workspaces/:id/provider leg is
+    // RETIRED — the endpoint returns 410 Gone. Provider is now derived
+    // from (runtime, model) via the registry; no stored value exists
+    // to load. Always seed the local state to "" so the dropdown
+    // initializes to "auto-derive".
+    const [wsRes, modelRes] = await Promise.all([
       api.get<{ runtime?: string; tier?: number }>(`/workspaces/${workspaceId}`)
         .catch(() => ({} as { runtime?: string; tier?: number })),
       api.get<{ model?: string }>(`/workspaces/${workspaceId}/model`)
         .catch(() => ({} as { model?: string })),
-      api.get<{ provider?: string }>(`/workspaces/${workspaceId}/provider`)
-        .catch(() => null),
     ]);
     const wsMetadataRuntime = (wsRes.runtime || "").trim();
     const wsMetadataModel = (modelRes.model || "").trim();
     const wsMetadataTier: number | null =
       typeof wsRes.tier === "number" ? wsRes.tier : null;
-    if (providerRes !== null) {
-      const loadedProvider = (providerRes.provider || "").trim();
-      setProvider(loadedProvider);
-      setOriginalProvider(loadedProvider);
-    } else {
-      setProvider("");
-      setOriginalProvider("");
-    }
+    setProvider("");
+    setOriginalProvider("");
     // originalModel is set further down once the YAML has been parsed —
     // we want it to reflect what the form ACTUALLY rendered, which may
     // be the YAML's runtime_config.model fallback when MODEL_PROVIDER
@@ -718,53 +724,27 @@ export function ConfigTab({ workspaceId }: Props) {
         }
       }
 
-      // Provider override save (Option B PR-5). PUT only when the user
-      // changed the dropdown — otherwise an unrelated Save (e.g. tier
-      // edit) would re-write the provider unchanged and the server-
-      // side auto-restart would fire on every Save, costing the user a
-      // ~30s reboot for a no-op change. Server endpoint accepts an
-      // empty string to clear the override (deletes the
-      // workspace_secrets row); we forward whatever the form holds.
-      let providerSaveError: string | null = null;
-      const providerChanged = provider !== originalProvider;
-      if (providerChanged) {
-        try {
-          await api.put(`/workspaces/${workspaceId}/provider`, { provider });
-          setOriginalProvider(provider);
-        } catch (e) {
-          providerSaveError = e instanceof Error ? e.message : "Provider update was rejected";
-        }
-      }
+      // internal#718 P4 closure: provider override save is RETIRED. The
+      // /workspaces/:id/provider endpoint returns 410 Gone; the provider
+      // is derived from (runtime, model) at every decision point via the
+      // registry. The local dropdown state still updates so the user can
+      // see the predicted provider, but it never round-trips to the
+      // server. Variables retained as locals (set to constants) so the
+      // downstream restart-suppress logic below has clear semantics
+      // and the diff against the prior shape stays small.
+      const providerSaveError: string | null = null;
+      const providerChanged = false;
 
-      // Provider → billing_mode linkage (internal#703 Gap 2). When the
-      // provider actually changed AND its implied billing_mode differs
-      // from the previously-selected provider's, push the new mode to
-      // the per-tenant llm-billing-mode endpoint (same path the LLM
-      // Billing section uses). Without this, selecting a non-Platform
-      // provider leaves billing_mode=platform_managed → CP keeps
-      // injecting the platform proxy → BYOK never takes.
-      //
-      // Gated on (a) the provider PUT having succeeded — no point setting
-      // byok if the credential write failed — and (b) the mode actually
-      // changing, so an unrelated provider tweak between two BYOK vendors
-      // (e.g. minimax → openrouter) doesn't re-issue a redundant
-      // platform_managed→byok PUT and trigger a needless restart.
-      let billingModeSaveError: string | null = null;
-      if (providerChanged && !providerSaveError) {
-        const nextMode = billingModeForProvider(provider);
-        const prevMode = billingModeForProvider(originalProvider);
-        if (nextMode !== prevMode) {
-          try {
-            await api.put(
-              `/admin/workspaces/${workspaceId}/llm-billing-mode`,
-              { mode: nextMode },
-            );
-          } catch (e) {
-            billingModeSaveError =
-              e instanceof Error ? e.message : "Billing mode update was rejected";
-          }
-        }
-      }
+      // internal#718 P4 closure: provider → billing_mode linkage is also
+      // RETIRED. P2-B (#1972) moved the billing decision to
+      // ResolveLLMBillingModeDerived, which DERIVES the provider from
+      // (runtime, model) at every read. The canvas can no longer
+      // override it via a separate PUT, by design — the runtime+model
+      // selection IS the billing-mode selection. The
+      // /admin/workspaces/:id/llm-billing-mode endpoint still exists
+      // as the operator override surface (workspaces.llm_billing_mode
+      // column); it is no longer driven by the provider dropdown.
+      const billingModeSaveError: string | null = null;
 
       setOriginalYaml(content);
       if (rawMode) {
@@ -773,27 +753,22 @@ export function ConfigTab({ workspaceId }: Props) {
       } else {
         setRawDraft(content);
       }
-      // SetProvider on the server already triggers an auto-restart for
-      // the workspace whenever the value actually changed (see
-      // workspace-server/internal/handlers/secrets.go:SetProvider). If
-      // the user also clicked Save+Restart we'd kick off a SECOND
-      // restart here and the two would race in the canvas store —
-      // suppress the redundant call and rely on the server-side one.
-      const providerWillAutoRestart = providerChanged && !providerSaveError;
+      // internal#718 P4 closure: providerWillAutoRestart is always
+      // false now (provider PUT is retired; no server-side auto-restart
+      // can fire). Save+Restart flows through the canvas store
+      // restart path the same way it did pre-#718 for non-provider
+      // edits.
+      const providerWillAutoRestart = providerChanged && !providerSaveError
       if (restart && !providerWillAutoRestart) {
         await useCanvasStore.getState().restartWorkspace(workspaceId);
       } else if (!restart) {
         useCanvasStore.getState().updateNodeData(workspaceId, { needsRestart: !providerWillAutoRestart });
       }
-      // Aggregate partial-save errors. modelSaveError, providerSaveError,
-      // and billingModeSaveError describe rejected updates from
-      // independent endpoints — show whichever fired so the user knows
-      // which field reverts on next reload (otherwise they'd see "Saved"
-      // and be confused why Provider snapped back). The billing-mode case
-      // is the most important to surface: the provider credential saved
-      // but BYOK won't actually take until billing_mode flips, so a
-      // silent failure here is exactly the #703 "selecting a provider has
-      // no effect" symptom.
+      // Aggregate partial-save errors. With provider+billing-mode PUTs
+      // retired, only modelSaveError can fire from the secret-mint side
+      // — the provider/billing branches are dead code retained as
+      // constant nils to keep the diff small. They are surfaced
+      // defensively in case a future re-enablement needs the wiring.
       const partialError = providerSaveError
         ? `Other fields saved, but provider update failed: ${providerSaveError}`
         : billingModeSaveError
