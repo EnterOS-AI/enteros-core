@@ -11,8 +11,12 @@ import { ExternalConnectionSection } from "./ExternalConnectionSection";
 import {
   ProviderModelSelector,
   buildProviderCatalog,
+  buildProviderCatalogFromRegistry,
   findProviderForModel,
   type SelectorValue,
+  type ProviderEntry,
+  type RegistryProvider,
+  type RegistryModel,
 } from "../ProviderModelSelector";
 import { isExternalLikeRuntime } from "@/lib/externalRuntimes";
 
@@ -258,6 +262,17 @@ interface RuntimeOption {
   // canvas falls back to deriving unique vendor prefixes from
   // models[].id (still adapter-driven, just inferred).
   providers: string[];
+  // registryBacked / registryProviders / registryModels come from the
+  // registry-served GET /templates fields (internal#718 P3). When
+  // registryBacked is true, the selectable provider+model list is built from
+  // the registry (registryProviders/registryModels) — display labels +
+  // billing mode + derived provider come from the provider-registry SSOT, not
+  // the canvas VENDOR_LABELS / billingModeForProvider vocabularies. When
+  // false (non-registry runtime / older backend), the canvas falls back to
+  // the template-served models[] + its inferVendor heuristic.
+  registryBacked: boolean;
+  registryProviders: RegistryProvider[];
+  registryModels: RegistryModel[];
 }
 
 // deriveProvidersFromModels — when a template doesn't ship an explicit
@@ -322,6 +337,32 @@ export function billingModeForProvider(provider: string): LLMBillingMode {
   return "byok";
 }
 
+// billingModeForSelectedProvider — internal#718 P3 (retire-list #5): the
+// billing mode the Config tab shows/sends for the selected PROVIDER, sourced
+// from the registry-served catalog when available rather than the hardcoded
+// billingModeForProvider rule.
+//
+// When the runtime is registry-backed, GET /templates serves each provider's
+// DERIVED billing_mode (platform_managed for the closed platform provider,
+// byok otherwise) on the ProviderEntry. We read it off the catalog so the UI
+// reflects the registry SSOT — the same predicate billing/credential emission
+// keys off the derived provider.
+//
+// Falls back to billingModeForProvider when: no catalog (non-registry runtime
+// / older backend), or the provider string isn't carried by the catalog
+// (e.g. a stale saved value). The fallback keeps the legacy behavior intact
+// for everything the registry doesn't yet speak to.
+export function billingModeForSelectedProvider(
+  provider: string,
+  catalog?: ProviderEntry[],
+): LLMBillingMode {
+  if (catalog && catalog.length > 0) {
+    const entry = catalog.find((p) => p.vendor === provider.trim());
+    if (entry?.billingMode) return entry.billingMode;
+  }
+  return billingModeForProvider(provider);
+}
+
 // Fallback used when /templates can't be fetched (offline, older backend).
 // Keep in sync with manifest.json workspace_templates as a defensive default.
 // Model + env suggestions only flow when the backend is reachable.
@@ -339,10 +380,10 @@ const RUNTIMES_WITH_OWN_CONFIG = new Set<string>(["external", "kimi", "kimi-cli"
 const SUPPORTED_RUNTIME_VALUES = new Set(["claude-code", "codex", "openclaw", "hermes"]);
 
 const FALLBACK_RUNTIME_OPTIONS: RuntimeOption[] = [
-  { value: "claude-code", label: "Claude Code", models: [], providers: [] },
-  { value: "codex", label: "Codex", models: [], providers: [] },
-  { value: "openclaw", label: "OpenClaw", models: [], providers: [] },
-  { value: "hermes", label: "Hermes", models: [], providers: [] },
+  { value: "claude-code", label: "Claude Code", models: [], providers: [], registryBacked: false, registryProviders: [], registryModels: [] },
+  { value: "codex", label: "Codex", models: [], providers: [], registryBacked: false, registryProviders: [], registryModels: [] },
+  { value: "openclaw", label: "OpenClaw", models: [], providers: [], registryBacked: false, registryProviders: [], registryModels: [] },
+  { value: "hermes", label: "Hermes", models: [], providers: [], registryBacked: false, registryProviders: [], registryModels: [] },
 ];
 
 export function ConfigTab({ workspaceId }: Props) {
@@ -533,7 +574,18 @@ export function ConfigTab({ workspaceId }: Props) {
 
   useEffect(() => {
     let cancelled = false;
-    api.get<Array<{ id: string; name?: string; runtime?: string; models?: ModelSpec[]; providers?: string[] }>>("/templates")
+    api.get<Array<{
+      id: string;
+      name?: string;
+      runtime?: string;
+      models?: ModelSpec[];
+      providers?: string[];
+      // internal#718 P3 registry-served fields (additive; absent on older
+      // backends and for non-registry runtimes).
+      registry_backed?: boolean;
+      registry_providers?: RegistryProvider[];
+      registry_models?: RegistryModel[];
+    }>>("/templates")
       .then((rows) => {
         if (cancelled || !Array.isArray(rows)) return;
         const byRuntime = new Map<string, RuntimeOption>();
@@ -545,8 +597,23 @@ export function ConfigTab({ workspaceId }: Props) {
           const existing = byRuntime.get(v);
           const models = Array.isArray(r.models) ? r.models : [];
           const providers = Array.isArray(r.providers) ? r.providers : [];
-          if (!existing || models.length > existing.models.length) {
-            byRuntime.set(v, { value: v, label: r.name || v, models, providers });
+          const registryProviders = Array.isArray(r.registry_providers) ? r.registry_providers : [];
+          const registryModels = Array.isArray(r.registry_models) ? r.registry_models : [];
+          const registryBacked = r.registry_backed === true && registryModels.length > 0;
+          // Prefer the richer payload: a registry-backed entry, then more
+          // template models. Keeps the "last/richer template wins" intent.
+          const score = (o: RuntimeOption) => (o.registryBacked ? 1000 : 0) + o.models.length;
+          const candidate: RuntimeOption = {
+            value: v,
+            label: r.name || v,
+            models,
+            providers,
+            registryBacked,
+            registryProviders,
+            registryModels,
+          };
+          if (!existing || score(candidate) > score(existing)) {
+            byRuntime.set(v, candidate);
           }
         }
         if (byRuntime.size > 0) setRuntimeOptions(Array.from(byRuntime.values()));
@@ -557,7 +624,13 @@ export function ConfigTab({ workspaceId }: Props) {
 
   // Models + env hints for the currently-selected runtime.
   const selectedRuntime = runtimeOptions.find((o) => o.value === (config.runtime || "")) ?? null;
-  const availableModels: ModelSpec[] = selectedRuntime?.models ?? [];
+  // Memoised so its identity is stable across renders — it feeds several
+  // useMemo dependency arrays below (registry/legacy catalog, selector models)
+  // and a fresh `[]` literal each render would defeat their memoisation.
+  const availableModels: ModelSpec[] = useMemo(
+    () => selectedRuntime?.models ?? [],
+    [selectedRuntime?.models],
+  );
   // Provider suggestions for the legacy free-text input fallback (used
   // when /templates returned no models for this runtime, e.g. hermes
   // workspaces). Prefer the runtime's declarative providers list,
@@ -571,9 +644,37 @@ export function ConfigTab({ workspaceId }: Props) {
 
   // Vendor-aware catalog shared with the selector. Memoised so the
   // catalog identity is stable across renders (selector relies on it).
+  //
+  // internal#718 P3: when the runtime is registry-backed, build the catalog
+  // FROM the registry-served providers/models (display labels + billing +
+  // derived provider from the provider-registry SSOT) instead of re-inferring
+  // vendor from model-id prefixes. Falls back to the inferVendor heuristic
+  // for non-registry runtimes / older backends.
+  const registryBacked = selectedRuntime?.registryBacked ?? false;
   const providerCatalog = useMemo(
-    () => buildProviderCatalog(availableModels),
-    [availableModels],
+    () =>
+      registryBacked
+        ? buildProviderCatalogFromRegistry(
+            selectedRuntime?.registryProviders ?? [],
+            selectedRuntime?.registryModels ?? [],
+          )
+        : buildProviderCatalog(availableModels),
+    [registryBacked, selectedRuntime?.registryProviders, selectedRuntime?.registryModels, availableModels],
+  );
+  // Models fed to the selector dropdown: the registry-served native set for a
+  // registry-backed runtime (so the dropdown can render no unregistered
+  // option), else the template-served models.
+  const selectorModels: ModelSpec[] = useMemo(
+    () =>
+      registryBacked
+        ? (selectedRuntime?.registryModels ?? []).map((m) => ({
+            id: m.id,
+            name: m.name,
+            // carry the derived provider so the selector buckets correctly
+            ...(m.provider ? { provider: m.provider } : {}),
+          }))
+        : availableModels,
+    [registryBacked, selectedRuntime?.registryModels, availableModels],
   );
 
   // Derive the selector's current value from the form state. Provider
@@ -893,9 +994,10 @@ export function ConfigTab({ workspaceId }: Props) {
                 — empty = "auto-derive from model slug" was the pre-PR-5
                 behavior; selecting any provider here writes LLM_PROVIDER
                 and triggers an auto-restart. */}
-            {availableModels.length > 0 ? (
+            {selectorModels.length > 0 ? (
               <ProviderModelSelector
-                models={availableModels}
+                models={selectorModels}
+                catalog={registryBacked ? providerCatalog : undefined}
                 value={selectorValue}
                 onChange={(next) => {
                   setSelectorValue(next);
@@ -908,7 +1010,7 @@ export function ConfigTab({ workspaceId }: Props) {
                   setConfig((prev) => {
                     const v = next.model;
                     const prevModelId = prev.runtime_config?.model || prev.model || "";
-                    const prevSpec = availableModels.find((m) => m.id === prevModelId) ?? null;
+                    const prevSpec = selectorModels.find((m) => m.id === prevModelId) ?? null;
                     const prevRequired = prev.runtime_config?.required_env ?? [];
                     const wasTemplateDriven =
                       prevRequired.length === 0 ||

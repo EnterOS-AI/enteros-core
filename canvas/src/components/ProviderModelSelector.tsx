@@ -49,6 +49,33 @@ export interface ProviderEntry {
   wildcard: boolean;
   /** Optional tooltip text (rendered as native title=). */
   tooltip?: string;
+  /** Billing mode the DERIVED provider implies, when this entry came from the
+   *  registry-backed payload (internal#718 P3): "platform_managed" | "byok".
+   *  Undefined for entries built by the legacy inferVendor heuristic. */
+  billingMode?: "platform_managed" | "byok";
+}
+
+/** RegistryProvider mirrors one entry of GET /templates `registry_providers`
+ *  (workspace-server registryProviderView): the registry's native provider for
+ *  a runtime, with its display label, auth-env NAMES, and billing mode. This is
+ *  the SSOT the dropdown labels come from — the canvas drops VENDOR_LABELS for
+ *  registry-backed runtimes (internal#718 P3, retire-list #4). */
+export interface RegistryProvider {
+  name: string;
+  display_name?: string;
+  auth_env?: string[];
+  billing_mode?: "platform_managed" | "byok";
+  deprecated?: boolean;
+}
+
+/** RegistryModel mirrors one entry of GET /templates `registry_models`: a
+ *  native model id annotated with its DERIVED provider (registry name) and the
+ *  billing_mode that provider implies. */
+export interface RegistryModel {
+  id: string;
+  name?: string;
+  provider?: string;
+  billing_mode?: "platform_managed" | "byok";
 }
 
 export interface SelectorValue {
@@ -68,6 +95,13 @@ interface Props {
   models: SelectorModel[];
   value: SelectorValue;
   onChange: (next: SelectorValue) => void;
+  /** Optional pre-built provider catalog. When provided, the selector uses it
+   *  verbatim instead of re-inferring one from `models` via
+   *  buildProviderCatalog — the registry-backed path (internal#718 P3), where
+   *  the parent builds the catalog from the registry-served providers/models
+   *  so dropdown labels + billing come from the provider-registry SSOT rather
+   *  than the inferVendor heuristic. Omitted = legacy heuristic over `models`. */
+  catalog?: ProviderEntry[];
   /** Display variant. "grid" = label+control side-by-side (used in ConfigTab
    *  Runtime section). "stack" = vertical (used in MissingKeysModal). */
   variant?: "grid" | "stack";
@@ -251,6 +285,66 @@ export function buildProviderCatalog(models: SelectorModel[]): ProviderEntry[] {
   return Array.from(buckets.values());
 }
 
+/** Build the provider catalog from a REGISTRY-BACKED GET /templates payload
+ *  (registry_providers + registry_models) — internal#718 P3, retire-list #4.
+ *
+ *  Unlike buildProviderCatalog (which RE-INFERS vendor from model-id prefixes
+ *  + env via inferVendor/VENDOR_LABELS/BARE_VENDOR_PATTERNS), this trusts the
+ *  registry: each model carries its DERIVED `provider` (a registry provider
+ *  name) and the dropdown label/billing/auth come from the matching
+ *  `registry_providers` entry. The canvas can render no provider/model the
+ *  registry did not serve ("only registered selectable"), and the billing-mode
+ *  shown reflects the derived provider rather than a hardcoded rule.
+ *
+ *  A provider with no served model is omitted (no empty buckets). Models whose
+ *  `provider` doesn't match a registry_providers entry still get a bucket
+ *  keyed by the raw provider name (defensive — should not happen for a
+ *  well-formed registry payload), so a model is never silently dropped. */
+export function buildProviderCatalogFromRegistry(
+  registryProviders: RegistryProvider[],
+  registryModels: RegistryModel[],
+): ProviderEntry[] {
+  const byName = new Map<string, RegistryProvider>();
+  for (const p of registryProviders) byName.set(p.name, p);
+
+  // Bucket models by their derived provider name, preserving registry order.
+  const buckets = new Map<string, ProviderEntry>();
+  for (const m of registryModels) {
+    const vendor = (m.provider ?? "").trim();
+    if (!vendor) continue; // un-annotated registry model — skip from the
+    // provider cascade (selectable elsewhere via free-text); it has no
+    // derived provider to bucket under.
+    const meta = byName.get(vendor);
+    const wildcard = m.id.includes("*");
+    let entry = buckets.get(vendor);
+    if (!entry) {
+      entry = {
+        id: `registry|${vendor}`,
+        vendor,
+        label: meta?.display_name || vendor,
+        envVars: meta?.auth_env ?? [],
+        models: [],
+        wildcard,
+        billingMode: meta?.billing_mode ?? m.billing_mode,
+        tooltip: VENDOR_TOOLTIPS[vendor],
+      };
+      buckets.set(vendor, entry);
+    }
+    entry.models.push({ id: m.id, name: m.name, provider: vendor });
+    entry.wildcard = entry.wildcard || wildcard;
+  }
+
+  // Decorate label with model-count when ≥2 concrete models share the bucket,
+  // matching buildProviderCatalog's UX.
+  for (const e of buckets.values()) {
+    if (!e.wildcard && e.models.length > 1) {
+      e.label = `${e.label} (${e.models.length} models)`;
+    }
+  }
+
+  return Array.from(buckets.values());
+}
+
 /** Find the provider entry that contains a given model id. Used by
  *  callers to back-derive the provider when only the model is known
  *  (e.g. ConfigTab loading from saved state). */
@@ -283,6 +377,7 @@ export function ProviderModelSelector({
   models,
   value,
   onChange,
+  catalog: catalogProp,
   variant = "stack",
   allowCustomModelEscape = false,
   disabled = false,
@@ -293,7 +388,12 @@ export function ProviderModelSelector({
   const providerSelectId = `${baseId}-provider`;
   const modelSelectId = `${baseId}-model`;
 
-  const catalog = useMemo(() => buildProviderCatalog(models), [models]);
+  // Registry-backed path (internal#718 P3): use the parent-supplied catalog
+  // verbatim; otherwise re-infer one from `models` via the legacy heuristic.
+  const catalog = useMemo(
+    () => catalogProp ?? buildProviderCatalog(models),
+    [catalogProp, models],
+  );
   const selected = useMemo(
     () => catalog.find((p) => p.id === value.providerId) ?? null,
     [catalog, value.providerId],
