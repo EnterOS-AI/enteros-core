@@ -15,7 +15,6 @@ func TestValidateRegisteredModelForRuntime(t *testing.T) {
 		runtime string
 		model   string
 		wantOK  bool // true = allowed (registered OR runtime-not-in-registry)
-		wantWhy string
 	}
 	cases := []tc{
 		{
