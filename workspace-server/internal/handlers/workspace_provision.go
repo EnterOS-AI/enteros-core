@@ -773,12 +773,7 @@ func applyRuntimeModelEnv(envVars map[string]string, runtime, model string) {
 	// can no longer confuse a provider slug for a model id. CP-side
 	// slot-separation (cp#213 + cp#220) merged the analogous fix on
 	// the CP side; this is the workspace-server companion.
-	if model == "" {
-		model = envVars["MOLECULE_MODEL"]
-	}
-	if model == "" {
-		model = envVars["MODEL"]
-	}
+	model = effectiveModelForBilling(model, envVars)
 	if model == "" {
 		return
 	}
@@ -809,6 +804,31 @@ func applyRuntimeModelEnv(envVars map[string]string, runtime, model string) {
 		// provider isn't explicitly set.
 		envVars["HERMES_DEFAULT_MODEL"] = model
 	}
+}
+
+// effectiveModelForBilling resolves the picked model id from an explicit
+// argument with the SAME fallback chain applyRuntimeModelEnv uses to set the
+// container MODEL env: explicit arg → envVars["MOLECULE_MODEL"] →
+// envVars["MODEL"] (the workspace_secret). It is the single source of truth
+// for "what model is this workspace going to run", shared by both
+// applyRuntimeModelEnv (which exports it to the container) and
+// applyPlatformManagedLLMEnv (which derives the billing mode from it).
+//
+// molecule-core#1994: the billing resolver MUST consult the same effective
+// model the container will actually run. Pre-fix it used the raw payload.Model
+// only, which is "" on a re-provision (the payload is rebuilt from the DB with
+// no Model), so it derived from an empty model → defaulted closed to
+// platform_managed and diverged from the read endpoint (which reads the stored
+// MODEL secret). Returns "" only when no model is resolvable anywhere — the
+// legitimate "unset → platform default" case the resolver fails closed on.
+func effectiveModelForBilling(model string, envVars map[string]string) string {
+	if model == "" {
+		model = envVars["MOLECULE_MODEL"]
+	}
+	if model == "" {
+		model = envVars["MODEL"]
+	}
+	return model
 }
 
 // applyPlatformManagedLLMEnv wires the control-plane LLM proxy into a
@@ -889,7 +909,20 @@ func applyPlatformManagedLLMEnv(ctx context.Context, envVars map[string]string, 
 	// disambiguation input the registry uses to split oauth-vs-api). The org-env
 	// MOLECULE_LLM_BILLING_MODE is NO LONGER read into the decision (retired).
 	availableAuthEnv := availableAuthEnvNames(envVars)
-	res, resolveErr := ResolveLLMBillingModeDerived(ctx, workspaceID, runtime, model, availableAuthEnv)
+	// molecule-core#1994: derive billing mode from the EFFECTIVE model, not the
+	// raw payload.Model. On a re-provision (restart/resume/auto-restart) the
+	// payload is rebuilt from the DB with Name+Tier+Runtime only — payload.Model
+	// is "" (workspace_restart.go via withStoredCompute, which backfills Compute
+	// but NOT Model). With an empty model DeriveProvider errors → the resolver
+	// defaults closed to platform_managed and bakes the CP proxy, DIVERGING from
+	// the read endpoint (which reads the stored MODEL workspace_secret and derives
+	// byok). The stored model already lives in the merged envVars (loaded by
+	// loadWorkspaceSecrets); resolve it with the SAME fallback chain
+	// applyRuntimeModelEnv uses so the provision-path derive inputs match the
+	// read-path's — keeping the two resolvers in parity (the #1994 regression
+	// guard test asserts this).
+	effectiveModel := effectiveModelForBilling(model, envVars)
+	res, resolveErr := ResolveLLMBillingModeDerived(ctx, workspaceID, runtime, effectiveModel, availableAuthEnv)
 	if resolveErr != nil {
 		// resolveErr != nil ⇒ resolver hit a DB error AND already defaulted
 		// res.ResolvedMode to platform_managed. Log + proceed; the safe default
