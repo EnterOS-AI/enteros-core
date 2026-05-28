@@ -79,12 +79,13 @@ jobs:
             echo "Provision AUTO_SYNC_TOKEN (read scope on molecule-controlplane) to enable live canonical-drift detection."
             exit 0
           fi
-          CANON_URL="${API_ROOT}/repos/molecule-ai/molecule-controlplane/contents/internal/providers/providers.yaml?ref=main"
-          # The contents endpoint returns base64-encoded content; --raw media type
-          # yields the file bytes directly. Use the raw accept header.
+          CANON_URL="${API_ROOT}/repos/molecule-ai/molecule-controlplane/raw/internal/providers/providers.yaml?ref=main"
+          # Use the /raw endpoint: it returns the file bytes directly. (The
+          # /contents endpoint ignores Accept: application/vnd.gitea.raw on
+          # Gitea 1.22.6 and returns the JSON+base64 envelope, which made this
+          # diff a permanent false RED.)
           curl -fsS \
             -H "Authorization: token ${AUTO_SYNC_TOKEN}" \
-            -H "Accept: application/vnd.gitea.raw" \
             "${CANON_URL}" -o /tmp/canonical-providers.yaml
           LOCAL=workspace-server/internal/providers/providers.yaml
           if diff -u /tmp/canonical-providers.yaml "$LOCAL"; then
