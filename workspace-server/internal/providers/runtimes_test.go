@@ -78,20 +78,29 @@ func TestModelsForRuntime_ExactModelIDs(t *testing.T) {
 	cases := map[string][]string{
 		// claude-code: anthropic (oauth aliases + versioned API ids +
 		// platform-namespaced) + kimi (kimi-coding gateway + platform) +
-		// minimax (BYOK + platform-namespaced).
+		// minimax (BYOK + platform-namespaced). internal#718 P4 PR-1 added
+		// the legacy colon-namespaced BYOK spelling (`vendor:model`) as
+		// first-class registry entries — the live workspace-create corpus
+		// uses both bare and colon forms across ~44 test files +
+		// canvas/ConfigTab default + the openclaw template (precedent).
 		"claude-code": {
-			// anthropic OAuth aliases
+			// anthropic OAuth aliases (bare + legacy colon-namespaced)
 			"sonnet", "opus", "haiku",
-			// anthropic API versioned
-			"claude-sonnet-4-6", "claude-opus-4-7", "claude-haiku-4-5",
+			"anthropic:sonnet", "anthropic:opus", "anthropic:haiku",
+			// anthropic API versioned (bare + legacy colon-namespaced BYOK)
+			"claude-sonnet-4-6", "claude-opus-4-7", "claude-haiku-4-5", "claude-sonnet-4-5",
+			"anthropic:claude-sonnet-4-6", "anthropic:claude-opus-4-7",
+			"anthropic:claude-haiku-4-5", "anthropic:claude-sonnet-4-5",
 			// anthropic via platform proxy (namespaced)
 			"anthropic/claude-opus-4-7", "anthropic/claude-sonnet-4-6",
-			// kimi (kimi-coding gateway)
+			// kimi (kimi-coding gateway, bare + legacy colon-namespaced BYOK)
 			"kimi-for-coding", "kimi-k2.5", "kimi-k2",
+			"moonshot:kimi-k2.6", "moonshot:kimi-k2.5",
 			// kimi via platform proxy
 			"moonshot/kimi-k2.6", "moonshot/kimi-k2.5",
-			// minimax BYOK
+			// minimax BYOK (bare + legacy colon-namespaced)
 			"MiniMax-M2", "MiniMax-M2.7", "MiniMax-M2.7-highspeed",
+			"minimax:MiniMax-M2", "minimax:MiniMax-M2.7", "minimax:MiniMax-M2.7-highspeed",
 			// minimax via platform proxy
 			"minimax/MiniMax-M2.7", "minimax/MiniMax-M2.7-highspeed",
 		},

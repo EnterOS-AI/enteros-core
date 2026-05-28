@@ -593,28 +593,73 @@ runtimes:
   # claude-code: native Anthropic-API / Claude-Code endpoints. Anthropic is
   # split across two manifest providers (oauth + api) because the runtime
   # exposes both auth paths natively; both count as "anthropic".
+  #
+  # internal#718 P4 PR-1 (2026-05-27): the colon-namespaced BYOK form
+  # `vendor:model` is the legacy spelling for explicit BYOK selection that
+  # predates the slash-namespaced platform form `vendor/model`. Both forms
+  # are LIVE across the workspace-create corpus (~44 test files +
+  # canvas/ConfigTab default + the openclaw template's native list).
+  # PRECEDENT: the openclaw runtime below already lists colon-form ids
+  # (`moonshot:kimi-k2.6`) as the BYOK kimi-coding native set — the
+  # adapter understands the colon form. P4 PR-1 extends the same precedent
+  # to claude-code so `DeriveProvider` / `Manifest.ModelsForRuntime`
+  # returns true for every legitimate BYOK model in the corpus. The
+  # canonical slash form (`anthropic/claude-opus-4-7`) is the
+  # platform-managed routing form (proxy upstream lookup); the colon
+  # form is the legacy BYOK selection form. Both are first-class
+  # registry entries on the runtime's native provider set.
   claude-code:
     providers:
       - name: anthropic-oauth
-        models: [sonnet, opus, haiku]
+        # Colon-form aliases (`anthropic:sonnet`, ...) are the legacy BYOK
+        # spelling for the OAuth alias path that the live corpus carries.
+        # Per the same P4 PR-1 precedent (see colon-form comment above),
+        # these are first-class registry entries — DeriveProvider resolves
+        # them to anthropic-oauth deterministically.
+        models:
+          - sonnet
+          - opus
+          - haiku
+          - anthropic:sonnet
+          - anthropic:opus
+          - anthropic:haiku
       - name: anthropic-api
-        # BYOK versioned API ids (platform-namespaced ids live under `platform`)
+        # BYOK versioned API ids — bare form is the canonical id the
+        # Anthropic SDK accepts on the wire; colon form is the legacy
+        # BYOK selection spelling used across the create/test corpus
+        # (internal#718 P4 PR-1). Both forms route to anthropic-api.
         models:
           - claude-sonnet-4-6
           - claude-opus-4-7
           - claude-haiku-4-5
+          - claude-sonnet-4-5
+          - anthropic:claude-sonnet-4-6
+          - anthropic:claude-opus-4-7
+          - anthropic:claude-haiku-4-5
+          - anthropic:claude-sonnet-4-5
       - name: kimi-coding
-        # BYOK kimi-coding gateway ids (platform-namespaced under `platform`)
+        # BYOK kimi-coding gateway ids — bare form is the canonical id
+        # the gateway routes; the colon form `moonshot:kimi-k2.*` is the
+        # legacy BYOK selection form (already in use on the openclaw
+        # native set below). claude-code's adapter accepts both
+        # (internal#718 P4 PR-1).
         models:
           - kimi-for-coding
           - kimi-k2.5
           - kimi-k2
+          - moonshot:kimi-k2.6
+          - moonshot:kimi-k2.5
       - name: minimax
-        # BYOK MiniMax ids (platform-namespaced ids live under `platform`)
+        # BYOK MiniMax ids — bare form is the canonical id; colon form is
+        # the legacy BYOK selection spelling carried in the create corpus
+        # and the openclaw template (internal#718 P4 PR-1).
         models:
           - MiniMax-M2
           - MiniMax-M2.7
           - MiniMax-M2.7-highspeed
+          - minimax:MiniMax-M2
+          - minimax:MiniMax-M2.7
+          - minimax:MiniMax-M2.7-highspeed
       # Platform-managed (no tenant key; Molecule owns billing). The
       # vendor/model-namespaced ids the proxy resolves to the upstream vendor.
       # Canonical for the template's `provider: platform` model entries — the
