@@ -428,6 +428,33 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 		return
 	}
 
+	// internal#718 P2-B: ONLY-REGISTERED validation at the create boundary.
+	// For a runtime the provider registry knows (first-party:
+	// claude-code/codex/hermes/openclaw) this checks the (runtime, model) pair
+	// against the registry's native model set. Fails OPEN for runtimes the
+	// registry doesn't know (langgraph/external/kimi/mock/federated) so
+	// non-first-party flows are UNCHANGED. Skipped for external workspaces.
+	//
+	// P2 ENFORCEMENT MODE = WARN, not hard-reject (deliberate, scoped). The
+	// legacy colon-namespaced BYOK model vocabulary ("anthropic:claude-opus-4-7"
+	// etc.) is still live across the create/import/template corpus and is NOT
+	// yet reconciled into the registry's exact-id model sets — that convergence
+	// is P3 (canvas only-offers-registered) + P4 (template codegen). Hard-
+	// rejecting an unregistered (runtime, model) now would 422 those legitimate
+	// existing flows, a large behavior change outside P2's scope (P2's behavior
+	// delta is the billing/credential flip, below). So P2 surfaces the
+	// unregistered pair as a queryable warning + an X-Molecule-Model-Unregistered
+	// response header (operator/canvas signal) and lets create proceed; the gate
+	// flips to hard-reject (uncomment the 422 below) once P3/P4 land the
+	// vocabulary convergence. The registry model set is code-generated from the
+	// canonical providers.yaml (PR-A), so the check stays in sync with the SSOT.
+	if !isExternal {
+		if ok, why := validateRegisteredModelForRuntime(payload.Runtime, payload.Model); !ok {
+			log.Printf("Create: WARN unregistered model (runtime=%q model=%q): %s [internal#718 P2 warn-mode; hard-reject gated on P3/P4 vocabulary convergence]", payload.Runtime, payload.Model, why)
+			c.Header("X-Molecule-Model-Unregistered", "true")
+		}
+	}
+
 	ctx := c.Request.Context()
 
 	// Convert empty role to NULL

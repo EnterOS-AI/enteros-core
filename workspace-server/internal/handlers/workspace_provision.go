@@ -981,18 +981,32 @@ func applyRuntimeModelEnv(envVars map[string]string, runtime, model string) {
 type platformLLMEnvResult struct {
 	ResolvedMode     string
 	HasUsableLLMCred bool
+	// Source records which layer decided the mode (internal#718 P2-B):
+	// derived_provider (registry derivation), derived_default (derive failed →
+	// platform default), workspace_override (explicit operator pin), or
+	// constant_fallback (DB error). Surfaced for observability + asserted by the
+	// behavior-delta tests so a regression of "derived, not stored" flips red.
+	Source BillingModeSource
 }
 
 func applyPlatformManagedLLMEnv(ctx context.Context, envVars map[string]string, globalKeys map[string]struct{}, workspaceID, runtime, model string) platformLLMEnvResult {
-	orgMode := strings.ToLower(strings.TrimSpace(os.Getenv("MOLECULE_LLM_BILLING_MODE")))
-	res, resolveErr := ResolveLLMBillingMode(ctx, workspaceID, orgMode)
+	// internal#718 P2-B: the platform-vs-byok decision now DERIVES the provider
+	// from (runtime, model) via the registry and keys off IsPlatform(derived) —
+	// NOT a stored LLM_PROVIDER and NOT the org rung. This path already carries
+	// runtime + model + the workspace env, so it calls the DERIVED resolver
+	// directly (no DB round-trip for runtime/model). availableAuthEnv is the set
+	// of recognized provider auth-env-var NAMES present in envVars (the same
+	// disambiguation input the registry uses to split oauth-vs-api). The org-env
+	// MOLECULE_LLM_BILLING_MODE is NO LONGER read into the decision (retired).
+	availableAuthEnv := availableAuthEnvNames(envVars)
+	res, resolveErr := ResolveLLMBillingModeDerived(ctx, workspaceID, runtime, model, availableAuthEnv)
 	if resolveErr != nil {
 		// resolveErr != nil ⇒ resolver hit a DB error AND already defaulted
 		// res.ResolvedMode to platform_managed. Log + proceed; the safe default
 		// is already in place, no early return needed.
 		log.Printf("workspace_provision: resolve billing mode workspace=%s err=%v (defaulting to platform_managed)", workspaceID, resolveErr)
 	}
-	log.Printf("workspace_provision: billing mode workspace=%s resolved=%s source=%s org_default=%s", workspaceID, res.ResolvedMode, res.Source, res.OrgDefault)
+	log.Printf("workspace_provision: billing mode workspace=%s resolved=%s source=%s derived_provider=%s", workspaceID, res.ResolvedMode, res.Source, derefOrEmpty(res.ProviderSelection))
 	// internal#703: MOLECULE_LLM_BILLING_MODE in the container must reflect the
 	// RESOLVED per-workspace mode, not a hardcoded literal. Pre-fix this var was
 	// only emitted (hardcoded "platform_managed") on the strip path below, so a
@@ -1023,6 +1037,7 @@ func applyPlatformManagedLLMEnv(ctx context.Context, envVars map[string]string, 
 		return platformLLMEnvResult{
 			ResolvedMode:     res.ResolvedMode,
 			HasUsableLLMCred: hasAnyPlatformManagedLLMKey(envVars),
+			Source:           res.Source,
 		}
 	}
 	baseURL := firstNonEmptyEnv("MOLECULE_LLM_BASE_URL", "OPENAI_BASE_URL")
@@ -1034,7 +1049,7 @@ func applyPlatformManagedLLMEnv(ctx context.Context, envVars map[string]string, 
 		// here — but we report HasUsableLLMCred from whatever survived so the
 		// caller's fail-closed branch (non-platform only) is never reached on
 		// this path.
-		return platformLLMEnvResult{ResolvedMode: res.ResolvedMode, HasUsableLLMCred: true}
+		return platformLLMEnvResult{ResolvedMode: res.ResolvedMode, HasUsableLLMCred: true, Source: res.Source}
 	}
 	stripPlatformManagedLLMBypassEnv(envVars)
 
@@ -1066,7 +1081,7 @@ func applyPlatformManagedLLMEnv(ctx context.Context, envVars map[string]string, 
 	// platform_managed: the CP proxy usage token (injected as ANTHROPIC_API_KEY
 	// / OPENAI_API_KEY above) IS the usable credential, so the workspace is
 	// never fail-closed on this path.
-	return platformLLMEnvResult{ResolvedMode: res.ResolvedMode, HasUsableLLMCred: true}
+	return platformLLMEnvResult{ResolvedMode: res.ResolvedMode, HasUsableLLMCred: true, Source: res.Source}
 }
 
 func stripPlatformManagedLLMBypassEnv(envVars map[string]string) {

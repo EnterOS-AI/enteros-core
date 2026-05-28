@@ -1141,19 +1141,37 @@ func TestApplyPlatformManagedLLMEnv_ClaudeCodeStripsVendorBYOK(t *testing.T) {
 	}
 }
 
+// internal#718 P2-B: byok is now DERIVED, not org-env-driven. A claude-code
+// workspace with NO explicit override + a non-platform-deriving model
+// (kimi-for-coding → kimi-coding) resolves byok and must NOT get the CP proxy
+// creds injected. (Pre-P2 this was driven by the org env MOLECULE_LLM_BILLING_MODE
+// with an empty workspace id; that mechanism is retired.)
 func TestApplyPlatformManagedLLMEnv_NoopsOutsidePlatformManaged(t *testing.T) {
-	t.Setenv("MOLECULE_LLM_BILLING_MODE", "byok")
+	const wsID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+	mock := setupTestDB(t)
+	// No explicit override → derive from (claude-code, kimi-for-coding) → byok.
+	mock.ExpectQuery(`SELECT llm_billing_mode FROM workspaces WHERE id = \$1`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"llm_billing_mode"}).AddRow(nil))
+
+	t.Setenv("MOLECULE_LLM_BILLING_MODE", "platform_managed") // org env ignored now
 	t.Setenv("MOLECULE_LLM_BASE_URL", "https://api.example.test/api/v1/internal/llm/openai/v1")
 	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
 
 	envVars := map[string]string{}
-	applyPlatformManagedLLMEnv(context.Background(), envVars, nil, "", "claude-code", "")
+	res := applyPlatformManagedLLMEnv(context.Background(), envVars, nil, wsID, "claude-code", "kimi-for-coding")
 
+	if res.ResolvedMode != LLMBillingModeBYOK {
+		t.Fatalf("resolved mode = %q, want byok (derived from non-platform model)", res.ResolvedMode)
+	}
 	if _, ok := envVars["OPENAI_API_KEY"]; ok {
 		t.Fatalf("OPENAI_API_KEY should not be set outside platform-managed mode")
 	}
 	if _, ok := envVars["MOLECULE_LLM_USAGE_TOKEN"]; ok {
 		t.Fatalf("MOLECULE_LLM_USAGE_TOKEN should not be set outside platform-managed mode")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
 	}
 }
 
@@ -1268,6 +1286,136 @@ func TestApplyPlatformManagedLLMEnv_ByokStripsGlobalOriginOAuthToken(t *testing.
 	}
 	if res.HasUsableLLMCred {
 		t.Fatalf("HasUsableLLMCred = true, want false (only the stripped platform global token was present)")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// =========================================================================
+// internal#718 P2-B BEHAVIOR DELTA — billing/credential decision DERIVES the
+// provider (no stored LLM_PROVIDER, no override). These three tests are the
+// explicit delta the RFC calls out, exercised through the real provision path
+// (applyPlatformManagedLLMEnv) with the registry derivation driving the mode:
+//   - platform-derived → platform_managed → platform creds (UNCHANGED)
+//   - non-platform-derived → byok → #1963 strip + fail-closed (THE FIX)
+//   - unset model → platform default (CTO-confirmed)
+// All use NO explicit override (override read returns NULL) so the DERIVATION
+// is what decides — this is what supersedes #1966's stored-LLM_PROVIDER read.
+// =========================================================================
+
+// PLATFORM-DERIVED → UNCHANGED. A claude-code workspace with a platform-
+// namespaced model (anthropic/claude-opus-4-7) derives to the closed `platform`
+// provider → platform_managed → CP proxy creds injected, exactly as before.
+func TestApplyPlatformManagedLLMEnv_DERIVED_PlatformModelKeepsPlatformCreds(t *testing.T) {
+	const wsID = "11111111-2222-3333-4444-555555555555"
+	mock := setupTestDB(t)
+	mock.ExpectQuery(`SELECT llm_billing_mode FROM workspaces WHERE id = \$1`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"llm_billing_mode"}).AddRow(nil)) // NO override → derive
+
+	t.Setenv("MOLECULE_LLM_BILLING_MODE", LLMBillingModeBYOK) // org env IGNORED now
+	t.Setenv("MOLECULE_LLM_BASE_URL", "https://api.example.test/api/v1/internal/llm/openai/v1")
+	t.Setenv("MOLECULE_LLM_ANTHROPIC_BASE_URL", "https://api.example.test/api/v1/internal/llm/anthropic")
+	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
+
+	envVars := map[string]string{}
+	res := applyPlatformManagedLLMEnv(context.Background(), envVars, nil, wsID, "claude-code", "anthropic/claude-opus-4-7")
+
+	if res.ResolvedMode != LLMBillingModePlatformManaged {
+		t.Fatalf("platform-derived model must resolve platform_managed, got %q (source=%s)", res.ResolvedMode, res.Source)
+	}
+	if res.Source != BillingModeSourceDerivedProvider {
+		t.Errorf("source: got %q want derived_provider", res.Source)
+	}
+	// Platform path injects the CP proxy creds (UNCHANGED behavior).
+	if got := envVars["ANTHROPIC_API_KEY"]; got != "tenant-admin-token" {
+		t.Errorf("platform path must inject the CP proxy token as ANTHROPIC_API_KEY, got %q", got)
+	}
+	if !res.HasUsableLLMCred {
+		t.Errorf("platform path always has a usable cred (the proxy token)")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// NON-PLATFORM-DERIVED → byok + STRIP + FAIL-CLOSED signal (THE FIX, the Reno
+// billing-leak class). A claude-code workspace with a non-platform model
+// (kimi-for-coding → kimi-coding) and NO override + NO own cred, inheriting only
+// the platform's scope:global OAuth token, now DERIVES byok → #1963 strips the
+// global token → HasUsableLLMCred=false → caller fails closed. Pre-P2 this same
+// workspace resolved platform_managed (via the never-written org rung) and ran
+// on the platform's credits. This is the discriminating delta test.
+func TestApplyPlatformManagedLLMEnv_DERIVED_NonPlatformModelStripsAndFailsClosed(t *testing.T) {
+	const wsID = "99999999-8888-7777-6666-555555555555"
+	mock := setupTestDB(t)
+	mock.ExpectQuery(`SELECT llm_billing_mode FROM workspaces WHERE id = \$1`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"llm_billing_mode"}).AddRow(nil)) // NO override → derive
+
+	t.Setenv("MOLECULE_LLM_BILLING_MODE", LLMBillingModePlatformManaged) // org env IGNORED now
+	t.Setenv("MOLECULE_LLM_BASE_URL", "https://api.example.test/api/v1/internal/llm/openai/v1")
+	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
+
+	// Only LLM cred is the platform's scope:global OAuth token (globalKeys).
+	envVars := map[string]string{
+		"CLAUDE_CODE_OAUTH_TOKEN": "PLATFORM-GLOBAL-OAUTH-TOKEN",
+	}
+	globalKeys := map[string]struct{}{"CLAUDE_CODE_OAUTH_TOKEN": {}}
+
+	res := applyPlatformManagedLLMEnv(context.Background(), envVars, globalKeys, wsID, "claude-code", "kimi-for-coding")
+
+	// 1. DERIVED byok (NOT the old platform_managed default).
+	if res.ResolvedMode != LLMBillingModeBYOK {
+		t.Fatalf("non-platform-derived model must resolve byok, got %q (source=%s) — THE FIX regressed", res.ResolvedMode, res.Source)
+	}
+	if res.Source != BillingModeSourceDerivedProvider {
+		t.Errorf("source: got %q want derived_provider", res.Source)
+	}
+	// 2. #1963 strip: the platform global OAuth token is removed (leak closed).
+	if got, ok := envVars["CLAUDE_CODE_OAUTH_TOKEN"]; ok {
+		t.Fatalf("CLAUDE_CODE_OAUTH_TOKEN = %q present — must be stripped for a derived-byok workspace (Reno leak)", got)
+	}
+	// 3. No CP proxy creds forced.
+	if got, ok := envVars["ANTHROPIC_API_KEY"]; ok {
+		t.Fatalf("ANTHROPIC_API_KEY must NOT be injected for byok, got %q", got)
+	}
+	// 4. No usable cred → caller (prepareProvisionContext) fails closed.
+	if res.HasUsableLLMCred {
+		t.Fatalf("HasUsableLLMCred = true, want false (only the stripped platform global token was present)")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// UNSET model → PLATFORM DEFAULT (CTO-confirmed "unset → platform default").
+// No model means nothing to derive; the workspace defaults closed to
+// platform_managed and keeps the platform creds (UNCHANGED for the no-model case).
+func TestApplyPlatformManagedLLMEnv_DERIVED_UnsetModelPlatformDefault(t *testing.T) {
+	const wsID = "00000000-1111-2222-3333-444444444444"
+	mock := setupTestDB(t)
+	mock.ExpectQuery(`SELECT llm_billing_mode FROM workspaces WHERE id = \$1`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"llm_billing_mode"}).AddRow(nil)) // NO override
+
+	t.Setenv("MOLECULE_LLM_BILLING_MODE", LLMBillingModeBYOK) // org env IGNORED now
+	t.Setenv("MOLECULE_LLM_BASE_URL", "https://api.example.test/api/v1/internal/llm/openai/v1")
+	t.Setenv("MOLECULE_LLM_ANTHROPIC_BASE_URL", "https://api.example.test/api/v1/internal/llm/anthropic")
+	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
+
+	envVars := map[string]string{}
+	res := applyPlatformManagedLLMEnv(context.Background(), envVars, nil, wsID, "claude-code", "")
+
+	if res.ResolvedMode != LLMBillingModePlatformManaged {
+		t.Fatalf("unset model must default platform_managed, got %q (source=%s)", res.ResolvedMode, res.Source)
+	}
+	if res.Source != BillingModeSourceDerivedDefault {
+		t.Errorf("source: got %q want derived_default", res.Source)
+	}
+	if got := envVars["ANTHROPIC_API_KEY"]; got != "tenant-admin-token" {
+		t.Errorf("unset-model platform default must inject the CP proxy token, got %q", got)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations: %v", err)
