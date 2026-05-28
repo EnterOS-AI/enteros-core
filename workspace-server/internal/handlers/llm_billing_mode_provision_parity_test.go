@@ -67,12 +67,8 @@ func TestApplyPlatformManagedLLMEnv_ReProvisionUsesStoredModel(t *testing.T) {
 		"CLAUDE_CODE_OAUTH_TOKEN": "RENO-OWN-OAUTH", // workspace_secrets origin
 		"ANTHROPIC_BASE_URL":      "https://api.moleculesai.app/api/v1/internal/llm/anthropic",
 	}
-	// globalKeys is EMPTY — the oauth is the workspace's own (workspace_secrets),
-	// so it is NOT global-origin and must survive the strip.
-	globalKeys := map[string]struct{}{}
-
 	// payload.Model == "" — exactly the re-provision shape.
-	res := applyPlatformManagedLLMEnv(ctx, envVars, globalKeys, wsID, "claude-code", "")
+	res := applyPlatformManagedLLMEnv(ctx, envVars, wsID, "claude-code", "")
 
 	if res.ResolvedMode != LLMBillingModeBYOK {
 		t.Fatalf("re-provision with stored MODEL=opus must resolve byok, got %q (source=%s) — the #1994 divergence", res.ResolvedMode, res.Source)
@@ -153,7 +149,7 @@ func TestApplyPlatformManagedLLMEnv_ReadProvisionParity(t *testing.T) {
 		"MODEL":                   "opus",
 		"CLAUDE_CODE_OAUTH_TOKEN": "RENO-OWN-OAUTH",
 	}
-	provRes := applyPlatformManagedLLMEnv(ctx, provEnv, map[string]struct{}{}, wsID, "claude-code", "")
+	provRes := applyPlatformManagedLLMEnv(ctx, provEnv, wsID, "claude-code", "")
 	if err := provMock.ExpectationsWereMet(); err != nil {
 		t.Errorf("provision-path sqlmock expectations: %v", err)
 	}
@@ -183,7 +179,7 @@ func TestApplyPlatformManagedLLMEnv_DefaultPreservation(t *testing.T) {
 
 	// No MODEL anywhere, no auth env — nothing to derive.
 	envVars := map[string]string{}
-	res := applyPlatformManagedLLMEnv(ctx, envVars, map[string]struct{}{}, wsID, "claude-code", "")
+	res := applyPlatformManagedLLMEnv(ctx, envVars, wsID, "claude-code", "")
 
 	if res.ResolvedMode != LLMBillingModePlatformManaged {
 		t.Fatalf("no model + no cred must default platform_managed (CTO: default stays platform), got %q (source=%s)", res.ResolvedMode, res.Source)
@@ -199,37 +195,46 @@ func TestApplyPlatformManagedLLMEnv_DefaultPreservation(t *testing.T) {
 	}
 }
 
-// TestApplyPlatformManagedLLMEnv_ByokGlobalOnlyOAuthStillFailsClosed is the
-// #711 regression guard against the #1994 fix over-reaching. The CUSTOMER must
-// supply their OWN oauth (workspace_secrets). A workspace whose ONLY oauth is
-// the PLATFORM's global-origin token (globalKeys) must STILL strip it and fail
-// closed — the fix must not "materialize the global-origin oauth" (that would
-// re-introduce the original drain). Here MODEL=opus derives byok, the only
-// oauth is global-origin → stripped → no usable cred.
-func TestApplyPlatformManagedLLMEnv_ByokGlobalOnlyOAuthStillFailsClosed(t *testing.T) {
+// TestApplyPlatformManagedLLMEnv_ByokGlobalScopeOAuthSurvives is the
+// molecule-core#1994 (corrected-model) inversion of the former internal#711
+// strip test. `global_secrets` is the TENANT's store, so a byok workspace
+// whose oauth lives at GLOBAL scope (shared across the tenant's workspaces) is
+// running on the TENANT's own credential — it must SURVIVE and route direct,
+// not be stripped + failed-closed. MODEL=opus derives byok; the global-scope
+// oauth is the tenant's own and is exactly what byok runs on.
+//
+// Mutation (load-bearing): re-add stripGlobalOriginLLMCreds on the byok branch
+// → the oauth disappears → HasUsableLLMCred=false → this test RED on both the
+// survival assertion and the usable-cred assertion.
+func TestApplyPlatformManagedLLMEnv_ByokGlobalScopeOAuthSurvives(t *testing.T) {
 	ctx := context.Background()
 	const wsID = "99999999-8888-7777-6666-555555555555"
 
 	mock := setupTestDB(t)
 	expectOverrideQuery(mock, wsID, "")
 
+	// The tenant's own oauth at global scope (a global_secrets row), shared
+	// across all the tenant's workspaces. There is no separate workspace row.
 	envVars := map[string]string{
 		"MODEL":                   "opus",
-		"CLAUDE_CODE_OAUTH_TOKEN": "PLATFORM-GLOBAL-OAUTH",
+		"CLAUDE_CODE_OAUTH_TOKEN": "TENANT-OWN-GLOBAL-OAUTH",
 	}
-	// The oauth is GLOBAL-origin (the platform's token).
-	globalKeys := map[string]struct{}{"CLAUDE_CODE_OAUTH_TOKEN": {}}
 
-	res := applyPlatformManagedLLMEnv(ctx, envVars, globalKeys, wsID, "claude-code", "")
+	res := applyPlatformManagedLLMEnv(ctx, envVars, wsID, "claude-code", "")
 
 	if res.ResolvedMode != LLMBillingModeBYOK {
-		t.Fatalf("opus derives byok regardless of cred provenance; got %q", res.ResolvedMode)
+		t.Fatalf("opus derives byok; got %q", res.ResolvedMode)
 	}
-	if res.HasUsableLLMCred {
-		t.Errorf("#711: a global-origin platform oauth must be stripped on byok → no usable cred, got HasUsableLLMCred=true (drain would ship)")
+	// The tenant's own global-scope oauth SURVIVES — byok runs on it, direct.
+	if envVars["CLAUDE_CODE_OAUTH_TOKEN"] != "TENANT-OWN-GLOBAL-OAUTH" {
+		t.Errorf("tenant's own global-scope oauth must survive on byok; got %q", envVars["CLAUDE_CODE_OAUTH_TOKEN"])
 	}
-	if _, present := envVars["CLAUDE_CODE_OAUTH_TOKEN"]; present {
-		t.Errorf("#711: global-origin oauth must be stripped, but it survived: %q", envVars["CLAUDE_CODE_OAUTH_TOKEN"])
+	if !res.HasUsableLLMCred {
+		t.Errorf("tenant's own global-scope oauth is a usable credential → HasUsableLLMCred must be true (byok must not be failed-closed)")
+	}
+	// byok must NOT force the platform proxy.
+	if _, present := envVars["MOLECULE_LLM_USAGE_TOKEN"]; present {
+		t.Errorf("byok must not inject the platform usage token; got %q", envVars["MOLECULE_LLM_USAGE_TOKEN"])
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("sqlmock expectations: %v", err)
