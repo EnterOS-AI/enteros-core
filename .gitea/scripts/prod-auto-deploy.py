@@ -208,6 +208,61 @@ def _raise_for_redeploy_result(status: int, body: dict, slugs: list[str]) -> Non
         )
 
 
+def rollout_stragglers(enumerated: list[str], results: list[dict]) -> list[str]:
+    """Return every enumerated tenant NOT proven on the target build.
+
+    A straggler is any tenant the rollout was supposed to cover that the
+    CP could not verify is running the target image tag — whether it
+    errored, was skipped, or SSM-succeeded onto the wrong image
+    (internal#724). CP marks each per-tenant result row with
+    ``verified_on_target`` (the REDEPLOY_RUNNING_IMAGE docker-inspect
+    proof). A tenant enumerated for the rollout but absent from the
+    result set (no batch ever ran it) is also a straggler — that is the
+    exact agents-team silent-skip class.
+
+    Backward-compat: an OLDER CP that doesn't emit ``verified_on_target``
+    yet returns rows without the key. Treat a missing key as verified so
+    this surfacing degrades to the previous (ok-based) behavior against an
+    un-upgraded CP, rather than failing every deploy spuriously. Once the
+    CP fix is deployed the key is always present and real stragglers are
+    caught.
+    """
+
+    verified: set[str] = set()
+    for row in results:
+        if str(row.get("ssm_status") or "") == "DryRun":
+            continue
+        slug = str(row.get("slug") or "").strip()
+        if not slug:
+            continue
+        # Missing key (old CP) => assume verified; present key is authoritative.
+        if "verified_on_target" not in row or row.get("verified_on_target"):
+            verified.add(slug)
+    return sorted(s for s in dict.fromkeys(enumerated) if s not in verified)
+
+
+def assert_full_coverage(enumerated: list[str], aggregate: dict, dry_run: bool) -> None:
+    """Fail the rollout if any enumerated tenant is not on the target build.
+
+    This is the no-silent-skip gate (internal#724). A dry run proves
+    nothing landed, so coverage is not asserted for it.
+    """
+
+    if dry_run:
+        return
+    stragglers = rollout_stragglers(enumerated, aggregate.get("results") or [])
+    if stragglers:
+        msg = (
+            f"incomplete rollout: {len(stragglers)} tenant(s) not verified on target "
+            f"after redeploy-fleet: {', '.join(stragglers)} "
+            f"(enumerated {len(set(enumerated))})"
+        )
+        aggregate["ok"] = False
+        aggregate["error"] = msg
+        aggregate["stragglers"] = stragglers
+        raise RolloutFailed(msg, aggregate)
+
+
 def execute_scoped_rollout(
     plan: dict,
     token: str,
@@ -253,6 +308,14 @@ def execute_scoped_rollout(
             aggregate["ok"] = False
             aggregate["error"] = str(exc)
             raise RolloutFailed(str(exc), aggregate) from exc
+
+    # No-silent-skip coverage gate (internal#724): every enumerated tenant
+    # must be PROVEN on the target build. A per-tenant HTTP-200/ok response
+    # is not proof — a tenant that SSM-succeeded but stayed on the old tag,
+    # or one enumerated but never batched, is a straggler. Surfacing it as
+    # a RolloutFailed makes the deploy step exit non-zero instead of
+    # silently reporting success (the exact agents-team failure mode).
+    assert_full_coverage(all_slugs, aggregate, dry_run)
 
     return aggregate
 
