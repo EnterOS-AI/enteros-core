@@ -773,12 +773,7 @@ func applyRuntimeModelEnv(envVars map[string]string, runtime, model string) {
 	// can no longer confuse a provider slug for a model id. CP-side
 	// slot-separation (cp#213 + cp#220) merged the analogous fix on
 	// the CP side; this is the workspace-server companion.
-	if model == "" {
-		model = envVars["MOLECULE_MODEL"]
-	}
-	if model == "" {
-		model = envVars["MODEL"]
-	}
+	model = effectiveModelForBilling(model, envVars)
 	if model == "" {
 		return
 	}
@@ -811,6 +806,31 @@ func applyRuntimeModelEnv(envVars map[string]string, runtime, model string) {
 	}
 }
 
+// effectiveModelForBilling resolves the picked model id from an explicit
+// argument with the SAME fallback chain applyRuntimeModelEnv uses to set the
+// container MODEL env: explicit arg → envVars["MOLECULE_MODEL"] →
+// envVars["MODEL"] (the workspace_secret). It is the single source of truth
+// for "what model is this workspace going to run", shared by both
+// applyRuntimeModelEnv (which exports it to the container) and
+// applyPlatformManagedLLMEnv (which derives the billing mode from it).
+//
+// molecule-core#1994: the billing resolver MUST consult the same effective
+// model the container will actually run. Pre-fix it used the raw payload.Model
+// only, which is "" on a re-provision (the payload is rebuilt from the DB with
+// no Model), so it derived from an empty model → defaulted closed to
+// platform_managed and diverged from the read endpoint (which reads the stored
+// MODEL secret). Returns "" only when no model is resolvable anywhere — the
+// legitimate "unset → platform default" case the resolver fails closed on.
+func effectiveModelForBilling(model string, envVars map[string]string) string {
+	if model == "" {
+		model = envVars["MOLECULE_MODEL"]
+	}
+	if model == "" {
+		model = envVars["MODEL"]
+	}
+	return model
+}
+
 // applyPlatformManagedLLMEnv wires the control-plane LLM proxy into a
 // workspace only when the RESOLVED billing mode for this workspace is
 // platform_managed. "Resolved" means: the workspace-level override (if any)
@@ -834,40 +854,41 @@ func applyRuntimeModelEnv(envVars map[string]string, runtime, model string) {
 // answer "what mode is this workspace running under" without DB queries
 // (RFC Observability hot-spot).
 //
-// internal#711 — PROVIDER-AWARE GLOBAL-LLM-CRED GATE. The platform's
-// LLM credentials (CLAUDE_CODE_OAUTH_TOKEN + the rest of the
-// platformManagedDirectLLMBypassKeys set) live in `global_secrets` and
-// are merged into EVERY workspace's env by loadWorkspaceSecrets — that
-// merge is provenance-blind. Pre-fix, the non-platform (byok/disabled)
-// early-return left envVars untouched, so a BYOK / subscription
-// workspace that brought NO LLM credential of its own still inherited
-// the platform's scope:global CLAUDE_CODE_OAUTH_TOKEN and ran Opus on
-// the platform's (Molecule's) Anthropic credits (Reno Stars SEO +
-// Marketing agents, confirmed live 2026-05-27).
+// molecule-core#1994 (credential-handling follow-on, CTO-confirmed model).
+// `global_secrets` is the TENANT's own secret store, shared across all of
+// that tenant's workspaces — it is NOT the platform's. The platform's own
+// LLM credential is the CP proxy usage token (MOLECULE_LLM_USAGE_TOKEN),
+// injected SEPARATELY on the platform_managed path below; it is never stored
+// in any tenant's global_secrets.
 //
-// The gate: on the non-platform path we strip every platform-managed
-// LLM key whose PROVENANCE is `global_secrets` (the globalKeys set).
-// A workspace's OWN LLM credential — set via the canvas Secrets tab,
-// i.e. a `workspace_secrets` row — has had its global provenance flag
-// dropped by loadWorkspaceSecrets, so it is NOT in globalKeys and
-// survives. Net effect: platform global LLM creds reach a workspace
-// ONLY when its resolved mode is platform_managed; a non-platform
-// workspace resolves to its own (workspace-scoped) credential or none.
+// Consequently the byok/disabled branch does NOT strip the tenant's
+// global-origin LLM creds. Under the corrected model the tenant's own
+// credential — whether at global scope (a global_secrets row, e.g. the key
+// they configured via the org-import required-env preflight / the settings
+// Secrets tab) or at workspace scope (a workspace_secrets row) — is exactly
+// what byok must run on, direct. The earlier internal#711 strip rested on the
+// inverted premise that a global-scope LLM cred was "the platform's own"; it
+// was wrong and it killed legitimate byok workspaces (MISSING_BYOK_CREDENTIAL
+// for tenants whose oauth lived at global scope — Reno Stars Marketing agent,
+// confirmed live 2026-05-28). Removing the strip is only safe because the
+// platform's own credential is never co-mingled into a tenant's global_secrets
+// (guarded at the write boundary: SetGlobal rejects bypass-list keys for a
+// platform-managed tenant; the platform proxy token is read from server env
+// only, never persisted to a tenant store).
 //
-// The boolean return reports whether, after the gate, the workspace
-// still has at least one usable LLM credential. The caller
-// (prepareProvisionContext) uses it to FAIL CLOSED — a non-platform
-// workspace with no usable LLM credential is aborted with a clear
-// MISSING_BYOK_CREDENTIAL error at provision time rather than being
-// started on (now-stripped) platform creds.
+// The boolean return still reports whether the workspace has at least one
+// usable LLM credential. The caller (prepareProvisionContext) uses it to FAIL
+// CLOSED — a byok workspace with no usable LLM credential at ANY scope is
+// aborted with a clear MISSING_BYOK_CREDENTIAL error at provision time rather
+// than started credential-less.
 // platformLLMEnvResult is the structured outcome of applyPlatformManagedLLMEnv.
 // ResolvedMode is the per-workspace billing/provider mode the resolver
-// landed on. HasUsableLLMCred reports whether — AFTER the provider-aware
-// global-cred gate — the workspace still has at least one platform-managed
-// LLM credential key in its env (its own, workspace-scoped one). Only the
-// non-platform path consults HasUsableLLMCred for the fail-closed decision;
-// the platform_managed path always returns true (it forces the CP proxy
-// usage token, which IS the usable credential).
+// landed on. HasUsableLLMCred reports whether the workspace has at least one
+// platform-managed-shaped LLM credential key in its env — the tenant's own,
+// at global or workspace scope. Only the non-platform (byok) path consults
+// HasUsableLLMCred for the fail-closed decision; the platform_managed path
+// always returns true (it forces the CP proxy usage token, which IS the
+// usable credential).
 type platformLLMEnvResult struct {
 	ResolvedMode     string
 	HasUsableLLMCred bool
@@ -879,7 +900,7 @@ type platformLLMEnvResult struct {
 	Source BillingModeSource
 }
 
-func applyPlatformManagedLLMEnv(ctx context.Context, envVars map[string]string, globalKeys map[string]struct{}, workspaceID, runtime, model string) platformLLMEnvResult {
+func applyPlatformManagedLLMEnv(ctx context.Context, envVars map[string]string, workspaceID, runtime, model string) platformLLMEnvResult {
 	// internal#718 P2-B: the platform-vs-byok decision now DERIVES the provider
 	// from (runtime, model) via the registry and keys off IsPlatform(derived) —
 	// NOT a stored LLM_PROVIDER and NOT the org rung. This path already carries
@@ -889,7 +910,20 @@ func applyPlatformManagedLLMEnv(ctx context.Context, envVars map[string]string, 
 	// disambiguation input the registry uses to split oauth-vs-api). The org-env
 	// MOLECULE_LLM_BILLING_MODE is NO LONGER read into the decision (retired).
 	availableAuthEnv := availableAuthEnvNames(envVars)
-	res, resolveErr := ResolveLLMBillingModeDerived(ctx, workspaceID, runtime, model, availableAuthEnv)
+	// molecule-core#1994: derive billing mode from the EFFECTIVE model, not the
+	// raw payload.Model. On a re-provision (restart/resume/auto-restart) the
+	// payload is rebuilt from the DB with Name+Tier+Runtime only — payload.Model
+	// is "" (workspace_restart.go via withStoredCompute, which backfills Compute
+	// but NOT Model). With an empty model DeriveProvider errors → the resolver
+	// defaults closed to platform_managed and bakes the CP proxy, DIVERGING from
+	// the read endpoint (which reads the stored MODEL workspace_secret and derives
+	// byok). The stored model already lives in the merged envVars (loaded by
+	// loadWorkspaceSecrets); resolve it with the SAME fallback chain
+	// applyRuntimeModelEnv uses so the provision-path derive inputs match the
+	// read-path's — keeping the two resolvers in parity (the #1994 regression
+	// guard test asserts this).
+	effectiveModel := effectiveModelForBilling(model, envVars)
+	res, resolveErr := ResolveLLMBillingModeDerived(ctx, workspaceID, runtime, effectiveModel, availableAuthEnv)
 	if resolveErr != nil {
 		// resolveErr != nil ⇒ resolver hit a DB error AND already defaulted
 		// res.ResolvedMode to platform_managed. Log + proceed; the safe default
@@ -911,19 +945,19 @@ func applyPlatformManagedLLMEnv(ctx context.Context, envVars map[string]string, 
 	envVars["MOLECULE_LLM_BILLING_MODE_RESOLVED"] = res.ResolvedMode
 	if res.ResolvedMode != LLMBillingModePlatformManaged {
 		// byok or disabled — DO NOT force-route to CP, DO NOT override the
-		// workspace's own ANTHROPIC_BASE_URL / OAuth token.
+		// workspace's own ANTHROPIC_BASE_URL / OAuth token, and DO NOT strip
+		// the tenant's own LLM credentials.
 		//
-		// internal#711: but DO strip platform-origin LLM credentials. The
-		// platform's scope:global CLAUDE_CODE_OAUTH_TOKEN (+ the rest of the
-		// bypass-key set) was merged into envVars by loadWorkspaceSecrets
-		// from global_secrets; without this strip a BYOK workspace that
-		// brought no LLM credential of its own would inherit the platform's
-		// global token and bill the platform's Anthropic credits. The strip
-		// is PROVENANCE-AWARE: only keys still flagged as global_secrets
-		// origin are removed; a workspace's own LLM cred (a workspace_secrets
-		// row — provenance flag already dropped by loadWorkspaceSecrets)
-		// survives so the workspace talks to its own provider directly.
-		stripGlobalOriginLLMCreds(envVars, globalKeys)
+		// molecule-core#1994 (corrected model): `global_secrets` is the
+		// TENANT's store, not the platform's. The tenant's own credential —
+		// at global OR workspace scope — is exactly what byok runs on, direct.
+		// We leave envVars untouched here and report whether a usable LLM
+		// credential survived so the caller can fail closed when there is
+		// genuinely none (no platform-managed-shaped key at any scope). The
+		// platform's own credential is never in a tenant's global_secrets
+		// (guarded at the SetGlobal write boundary + the proxy token is
+		// server-env-only), so leaving the tenant's globals in place cannot
+		// re-open the platform-credit drain.
 		return platformLLMEnvResult{
 			ResolvedMode:     res.ResolvedMode,
 			HasUsableLLMCred: hasAnyPlatformManagedLLMKey(envVars),
@@ -980,32 +1014,11 @@ func stripPlatformManagedLLMBypassEnv(envVars map[string]string) {
 	}
 }
 
-// stripGlobalOriginLLMCreds removes platform-managed LLM credential keys
-// (CLAUDE_CODE_OAUTH_TOKEN + the rest of platformManagedDirectLLMBypassKeys)
-// from envVars ONLY when they originated from the operator-controlled
-// `global_secrets` table (i.e. their key is present in globalKeys).
-//
-// internal#711 provider-aware gate. A platform global LLM credential is the
-// platform's own credential and must never be the credential a non-platform
-// (byok / subscription) workspace runs on. loadWorkspaceSecrets drops the
-// global-provenance flag for any key the workspace re-set via the canvas
-// Secrets tab (a workspace_secrets row), so a workspace's OWN LLM credential
-// is NOT in globalKeys and survives this strip — only the inherited platform
-// global creds are removed.
-func stripGlobalOriginLLMCreds(envVars map[string]string, globalKeys map[string]struct{}) {
-	for key := range platformManagedDirectLLMBypassKeys {
-		if _, fromGlobal := globalKeys[key]; fromGlobal {
-			delete(envVars, key)
-		}
-	}
-}
-
-// hasAnyPlatformManagedLLMKey reports whether envVars still carries at least
-// one non-empty platform-managed LLM credential key after the provider-aware
-// gate. Used by the non-platform fail-closed branch: a byok/subscription
-// workspace with no surviving (workspace-scoped) LLM credential must be
-// aborted with MISSING_BYOK_CREDENTIAL rather than started credential-less or
-// on stripped platform creds.
+// hasAnyPlatformManagedLLMKey reports whether envVars carries at least one
+// non-empty platform-managed-shaped LLM credential key (the tenant's own, at
+// global or workspace scope). Used by the byok fail-closed branch: a byok
+// workspace with no LLM credential at ANY scope must be aborted with
+// MISSING_BYOK_CREDENTIAL rather than started credential-less.
 func hasAnyPlatformManagedLLMKey(envVars map[string]string) bool {
 	for key := range platformManagedDirectLLMBypassKeys {
 		if strings.TrimSpace(envVars[key]) != "" {

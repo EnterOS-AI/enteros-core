@@ -245,11 +245,6 @@ func (h *SecretsHandler) Values(c *gin.Context) {
 	// provisioner path in workspace_provision.go so env-vars look identical
 	// whether the workspace was bootstrapped locally or remotely).
 	out := map[string]string{}
-	// Provenance side-channel (internal#711): which keys in `out` originated
-	// from global_secrets and were NOT overridden by a workspace_secrets row.
-	// Used by the provider-aware gate below so a non-platform workspace's
-	// remote pull never receives the platform's scope:global LLM credential.
-	globalKeys := map[string]struct{}{}
 	// Track decrypt failures so we can refuse the response with a list
 	// instead of returning a partial bundle that boots a broken agent.
 	var failedKeys []string
@@ -275,7 +270,6 @@ func (h *SecretsHandler) Values(c *gin.Context) {
 					continue
 				}
 				out[k] = string(decrypted)
-				globalKeys[k] = struct{}{}
 			}
 		}
 		if err := globalRows.Err(); err != nil {
@@ -300,10 +294,6 @@ func (h *SecretsHandler) Values(c *gin.Context) {
 					continue
 				}
 				out[k] = string(decrypted) // workspace override wins over global
-				// User explicitly re-set this via the canvas Secrets tab — it is
-				// no longer "the operator-store version", so drop the global
-				// provenance flag (mirrors loadWorkspaceSecrets).
-				delete(globalKeys, k)
 			}
 		}
 		if err := wsRows.Err(); err != nil {
@@ -319,32 +309,16 @@ func (h *SecretsHandler) Values(c *gin.Context) {
 		return
 	}
 
-	// internal#711: provider-aware gate on the remote-pull path. A workspace
-	// whose resolved billing mode is NOT platform_managed (byok / subscription)
-	// must NOT receive the platform's scope:global LLM credentials
-	// (CLAUDE_CODE_OAUTH_TOKEN + the rest of the bypass-key set). Those keys
-	// were merged from global_secrets above; here we drop any that are still
-	// of global provenance (a workspace override survives, since its flag was
-	// cleared). Symmetric with applyPlatformManagedLLMEnv's strip on the
-	// provision/restart env path — both injection vectors are now gated.
-	//
-	// Default-closed: ResolveLLMBillingMode collapses any DB error / NULL /
-	// garbled value to platform_managed, so a transient failure leaves the
-	// existing (global-inheriting) behavior in place rather than stripping a
-	// platform_managed workspace's creds.
-	orgMode := strings.ToLower(strings.TrimSpace(os.Getenv("MOLECULE_LLM_BILLING_MODE")))
-	res, resolveErr := ResolveLLMBillingMode(ctx, workspaceID, orgMode)
-	if resolveErr != nil {
-		log.Printf("secrets.Values: resolve billing mode workspace=%s err=%v (defaulting to platform_managed)", workspaceID, resolveErr)
-	}
-	if res.ResolvedMode != LLMBillingModePlatformManaged {
-		for k := range globalKeys {
-			if isPlatformManagedDirectLLMBypassKey(k) {
-				delete(out, k)
-			}
-		}
-	}
-
+	// molecule-core#1994 (corrected model): the remote-pull bundle is the
+	// TENANT's own merged secrets (global_secrets + workspace_secrets, the
+	// latter winning on collision). `global_secrets` is the tenant's store, not
+	// the platform's, so a byok workspace's pull MUST include the tenant's own
+	// global-scope LLM credential — that is exactly what it runs on, direct.
+	// The earlier internal#711 byok strip here rested on the inverted "global =
+	// platform's own" premise and is removed; the platform's own proxy token is
+	// never in a tenant's global_secrets (it lives in server env only and is
+	// injected separately on the platform_managed provision path), so there is
+	// nothing platform-owned to withhold on this path.
 	c.JSON(http.StatusOK, out)
 }
 

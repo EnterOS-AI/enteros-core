@@ -494,32 +494,34 @@ func TestPrepareProvisionContext_WorkspaceSecretWinsOverPersonaToken(t *testing.
 	}
 }
 
-// TestPrepareProvisionContext_ByokWithOnlyGlobalOAuthFailsClosed is the
-// internal#711 end-to-end guard for the live Reno Stars leak. A byok
-// workspace whose ONLY LLM credential is the platform's scope:global
-// CLAUDE_CODE_OAUTH_TOKEN (inherited from global_secrets, no workspace
-// override) must:
+// TestPrepareProvisionContext_ByokWithTenantGlobalOAuthSucceeds is the
+// molecule-core#1994 (corrected-model) end-to-end inversion of the former
+// internal#711 fail-closed test, for the live Reno Stars byok agents. A byok
+// workspace whose LLM credential is the TENANT's own scope:global
+// CLAUDE_CODE_OAUTH_TOKEN (a global_secrets row, no workspace override) must:
 //
-//  1. have that platform token STRIPPED from the prepared env (no leak), and
-//  2. ABORT the provision with the MISSING_BYOK_CREDENTIAL code rather than
-//     start the workspace on the platform's credits.
+//  1. KEEP that oauth in the prepared container env (it is the tenant's own
+//     credential — exactly what byok runs on, direct), and
+//  2. NOT abort — the provision proceeds.
 //
-// This is the discriminating end-to-end test: pre-fix prepared.EnvVars would
-// carry CLAUDE_CODE_OAUTH_TOKEN=<platform token> and the provision would
-// succeed, running Opus on Molecule's Anthropic credits.
-func TestPrepareProvisionContext_ByokWithOnlyGlobalOAuthFailsClosed(t *testing.T) {
+// Pre-fix (internal#711) prepared.EnvVars stripped the global oauth and the
+// provision aborted MISSING_BYOK_CREDENTIAL → the agent was dead. This is the
+// discriminating end-to-end guard for the fix.
+func TestPrepareProvisionContext_ByokWithTenantGlobalOAuthSucceeds(t *testing.T) {
 	const wsID = "352e3c2b-0546-4e9c-b487-1e2ff1cf29fc" // Reno Stars SEO agent
 	t.Setenv("MOLECULE_LLM_BILLING_MODE", LLMBillingModePlatformManaged)
 
 	mock := setupTestDB(t)
-	// global_secrets carries the platform's scope:global OAuth token.
+	// global_secrets carries the TENANT's own scope:global OAuth token + the
+	// stored MODEL (so the resolver derives byok from opus).
 	mock.ExpectQuery(`SELECT key, encrypted_value, encryption_version FROM global_secrets`).
 		WillReturnRows(sqlmock.NewRows([]string{"key", "encrypted_value", "encryption_version"}).
-			AddRow("CLAUDE_CODE_OAUTH_TOKEN", []byte("PLATFORM-GLOBAL-OAUTH"), 0))
-	// Workspace set NO secrets of its own.
+			AddRow("CLAUDE_CODE_OAUTH_TOKEN", []byte("TENANT-OWN-GLOBAL-OAUTH"), 0))
+	// Workspace set its own MODEL (no LLM cred of its own — relies on global).
 	mock.ExpectQuery(`SELECT key, encrypted_value, encryption_version FROM workspace_secrets`).
 		WithArgs(wsID).
-		WillReturnRows(sqlmock.NewRows([]string{"key", "encrypted_value", "encryption_version"}))
+		WillReturnRows(sqlmock.NewRows([]string{"key", "encrypted_value", "encryption_version"}).
+			AddRow("MODEL", []byte("opus"), 0))
 	// Resolver: workspace override = byok.
 	mock.ExpectQuery(`SELECT llm_billing_mode FROM workspaces WHERE id = \$1`).
 		WithArgs(wsID).
@@ -534,8 +536,57 @@ func TestPrepareProvisionContext_ByokWithOnlyGlobalOAuthFailsClosed(t *testing.T
 	prepared, abort := handler.prepareProvisionContext(
 		context.Background(), wsID, "/nonexistent", nil, payload, false)
 
+	if abort != nil {
+		t.Fatalf("expected provision to proceed (byok on tenant's own global oauth), got abort=%v", abort.Extra)
+	}
+	if prepared == nil {
+		t.Fatalf("prepared context is nil despite no abort")
+	}
+	// The tenant's own global oauth must be present in the container env.
+	if prepared.EnvVars["CLAUDE_CODE_OAUTH_TOKEN"] != "TENANT-OWN-GLOBAL-OAUTH" {
+		t.Fatalf("CLAUDE_CODE_OAUTH_TOKEN = %q, want the tenant's own global oauth preserved for byok",
+			prepared.EnvVars["CLAUDE_CODE_OAUTH_TOKEN"])
+	}
+	// byok must not have been routed through the platform proxy.
+	if _, ok := prepared.EnvVars["MOLECULE_LLM_USAGE_TOKEN"]; ok {
+		t.Fatalf("byok provision must NOT inject the platform usage token")
+	}
+	if got := prepared.EnvVars["MOLECULE_LLM_BILLING_MODE_RESOLVED"]; got != LLMBillingModeBYOK {
+		t.Fatalf("MOLECULE_LLM_BILLING_MODE_RESOLVED = %q, want byok", got)
+	}
+}
+
+// TestPrepareProvisionContext_ByokNoCredentialAtAnyScopeFailsClosed is the
+// companion: the fail-closed abort is UNCHANGED for a byok workspace with no
+// LLM credential at ANY scope (no global row, no workspace row). It still
+// aborts MISSING_BYOK_CREDENTIAL rather than starting credential-less.
+func TestPrepareProvisionContext_ByokNoCredentialAtAnyScopeFailsClosed(t *testing.T) {
+	const wsID = "352e3c2b-0546-4e9c-b487-1e2ff1cf29fc"
+	t.Setenv("MOLECULE_LLM_BILLING_MODE", LLMBillingModePlatformManaged)
+
+	mock := setupTestDB(t)
+	// No global LLM cred — only the stored MODEL so the resolver derives byok.
+	mock.ExpectQuery(`SELECT key, encrypted_value, encryption_version FROM global_secrets`).
+		WillReturnRows(sqlmock.NewRows([]string{"key", "encrypted_value", "encryption_version"}))
+	mock.ExpectQuery(`SELECT key, encrypted_value, encryption_version FROM workspace_secrets`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"key", "encrypted_value", "encryption_version"}).
+			AddRow("MODEL", []byte("opus"), 0))
+	mock.ExpectQuery(`SELECT llm_billing_mode FROM workspaces WHERE id = \$1`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"llm_billing_mode"}).AddRow(LLMBillingModeBYOK))
+
+	handler := NewWorkspaceHandler(&captureBroadcaster{}, nil, "http://localhost:8080", t.TempDir())
+	payload := models.CreateWorkspacePayload{
+		Name:    "Reno Stars SEO",
+		Runtime: "claude-code",
+		Tier:    1,
+	}
+	prepared, abort := handler.prepareProvisionContext(
+		context.Background(), wsID, "/nonexistent", nil, payload, false)
+
 	if abort == nil {
-		t.Fatalf("expected MISSING_BYOK_CREDENTIAL abort, got success (prepared=%v) — the leak would still ship", prepared)
+		t.Fatalf("expected MISSING_BYOK_CREDENTIAL abort, got success (prepared=%v)", prepared)
 	}
 	if code, _ := abort.Extra["code"].(string); code != "MISSING_BYOK_CREDENTIAL" {
 		t.Fatalf("abort.Extra[code] = %v, want MISSING_BYOK_CREDENTIAL", abort.Extra["code"])
@@ -917,7 +968,7 @@ func TestApplyPlatformManagedLLMEnv_NonClaudeRuntimeDefaultsOpenAIProxyWhenNoWor
 	t.Setenv("MOLECULE_LLM_DEFAULT_MODEL", "moonshot/kimi-k2.6")
 
 	envVars := map[string]string{}
-	applyPlatformManagedLLMEnv(context.Background(), envVars, nil, "", "codex", "")
+	applyPlatformManagedLLMEnv(context.Background(), envVars, "", "codex", "")
 	applyRuntimeModelEnv(envVars, "codex", "")
 
 	if got := envVars["OPENAI_BASE_URL"]; got != "https://api.example.test/api/v1/internal/llm/openai/v1" {
@@ -947,7 +998,7 @@ func TestApplyPlatformManagedLLMEnv_StripsWorkspaceOpenAIKeyForClaudeCode(t *tes
 		"OPENAI_BASE_URL": "https://api.openai.com/v1",
 		"MODEL":           "openai/gpt-5.5",
 	}
-	applyPlatformManagedLLMEnv(context.Background(), envVars, nil, "", "claude-code", "")
+	applyPlatformManagedLLMEnv(context.Background(), envVars, "", "claude-code", "")
 
 	if _, ok := envVars["OPENAI_API_KEY"]; ok {
 		t.Fatalf("OPENAI_API_KEY should be stripped for claude-code platform-managed mode")
@@ -973,7 +1024,7 @@ func TestApplyPlatformManagedLLMEnv_ClaudeCodeUsesAnthropicProxyOverOAuth(t *tes
 		"CLAUDE_CODE_OAUTH_TOKEN": "user-oauth-token",
 		"MODEL":                   "sonnet",
 	}
-	applyPlatformManagedLLMEnv(context.Background(), envVars, nil, "", "claude-code", "")
+	applyPlatformManagedLLMEnv(context.Background(), envVars, "", "claude-code", "")
 
 	if _, ok := envVars["CLAUDE_CODE_OAUTH_TOKEN"]; ok {
 		t.Fatalf("CLAUDE_CODE_OAUTH_TOKEN should be stripped in platform-managed mode")
@@ -996,7 +1047,7 @@ func TestApplyPlatformManagedLLMEnv_ClaudeCodeInjectsAnthropicProxyWhenNoWorkspa
 	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
 
 	envVars := map[string]string{}
-	applyPlatformManagedLLMEnv(context.Background(), envVars, nil, "", "claude-code", "minimax/MiniMax-M2.7")
+	applyPlatformManagedLLMEnv(context.Background(), envVars, "", "claude-code", "minimax/MiniMax-M2.7")
 
 	if got := envVars["ANTHROPIC_BASE_URL"]; got != "https://api.example.test/api/v1/internal/llm/anthropic/v1" {
 		t.Fatalf("ANTHROPIC_BASE_URL = %q", got)
@@ -1019,7 +1070,7 @@ func TestApplyPlatformManagedLLMEnv_ClaudeCodeStripsVendorBYOK(t *testing.T) {
 		"MINIMAX_API_KEY": "user-minimax-key",
 		"MODEL":           "MiniMax-M2.7",
 	}
-	applyPlatformManagedLLMEnv(context.Background(), envVars, nil, "", "claude-code", "")
+	applyPlatformManagedLLMEnv(context.Background(), envVars, "", "claude-code", "")
 
 	if _, ok := envVars["MINIMAX_API_KEY"]; ok {
 		t.Fatalf("MINIMAX_API_KEY should be stripped in platform-managed mode")
@@ -1053,7 +1104,7 @@ func TestApplyPlatformManagedLLMEnv_NoopsOutsidePlatformManaged(t *testing.T) {
 	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
 
 	envVars := map[string]string{}
-	res := applyPlatformManagedLLMEnv(context.Background(), envVars, nil, wsID, "claude-code", "kimi-for-coding")
+	res := applyPlatformManagedLLMEnv(context.Background(), envVars, wsID, "claude-code", "kimi-for-coding")
 
 	if res.ResolvedMode != LLMBillingModeBYOK {
 		t.Fatalf("resolved mode = %q, want byok (derived from non-platform model)", res.ResolvedMode)
@@ -1100,7 +1151,7 @@ func TestApplyPlatformManagedLLMEnv_ClaudeCodeByokKeepsOwnProviderEnv(t *testing
 		"CLAUDE_CODE_OAUTH_TOKEN": "user-oauth-token",
 		"MODEL":                   "sonnet",
 	}
-	applyPlatformManagedLLMEnv(context.Background(), envVars, nil, wsID, "claude-code", "")
+	applyPlatformManagedLLMEnv(context.Background(), envVars, wsID, "claude-code", "")
 
 	// 1. OAuth token intact — not stripped.
 	if got := envVars["CLAUDE_CODE_OAUTH_TOKEN"]; got != "user-oauth-token" {
@@ -1131,19 +1182,19 @@ func TestApplyPlatformManagedLLMEnv_ClaudeCodeByokKeepsOwnProviderEnv(t *testing
 	}
 }
 
-// TestApplyPlatformManagedLLMEnv_ByokStripsGlobalOriginOAuthToken is the
-// internal#711 regression guard for the live 2026-05-27 leak (Reno Stars SEO
-// + Marketing claude-code agents). A non-platform (byok) workspace that
-// brought NO LLM credential of its own, but which inherited the platform's
-// scope:global CLAUDE_CODE_OAUTH_TOKEN from global_secrets (provenance =
-// globalKeys), must have that platform token STRIPPED — not run on it.
+// TestApplyPlatformManagedLLMEnv_ByokGlobalScopeOAuthSurvivesAndRunsDirect is
+// the molecule-core#1994 (corrected-model) inversion of the former
+// internal#711 strip test, exercised through applyPlatformManagedLLMEnv. The
+// live failure this guards: the Reno Stars Marketing/SEO byok agents whose
+// Claude oauth lives at GLOBAL scope (the tenant's own credential, shared
+// across the tenant's workspaces) were stripped + failed-closed under the
+// inverted "global == platform's own" premise → MISSING_BYOK_CREDENTIAL →
+// dead. Under the corrected model `global_secrets` is the TENANT's store, so
+// that oauth is exactly what byok runs on: it must SURVIVE and route direct.
 //
-// Pre-fix the byok early-return left envVars untouched, so the platform's
-// global OAuth token survived into the container and the agent ran Opus on
-// the platform's Anthropic credits. The fix gates the global-cred merge on
-// provider==platform: a non-platform workspace keeps only its own
-// (workspace_secrets) creds, of which there are none here.
-func TestApplyPlatformManagedLLMEnv_ByokStripsGlobalOriginOAuthToken(t *testing.T) {
+// Mutation (load-bearing): re-add stripGlobalOriginLLMCreds on the byok branch
+// → the oauth disappears → this test RED on both survival + HasUsableLLMCred.
+func TestApplyPlatformManagedLLMEnv_ByokGlobalScopeOAuthSurvivesAndRunsDirect(t *testing.T) {
 	const wsID = "352e3c2b-0546-4e9c-b487-1e2ff1cf29fc" // Reno Stars SEO agent
 	mock := setupTestDB(t)
 	mock.ExpectQuery(`SELECT llm_billing_mode FROM workspaces WHERE id = \$1`).
@@ -1155,31 +1206,32 @@ func TestApplyPlatformManagedLLMEnv_ByokStripsGlobalOriginOAuthToken(t *testing.
 	t.Setenv("MOLECULE_LLM_ANTHROPIC_BASE_URL", "https://api.example.test/api/v1/internal/llm/anthropic")
 	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
 
-	// The ONLY LLM credential in env is the platform's scope:global OAuth
-	// token, merged from global_secrets (so its key is in globalKeys). The
-	// workspace set none of its own.
+	// The tenant's own oauth at GLOBAL scope (a global_secrets row). The
+	// workspace set no separate row of its own; it relies on the tenant global.
 	envVars := map[string]string{
-		"CLAUDE_CODE_OAUTH_TOKEN": "PLATFORM-GLOBAL-OAUTH-TOKEN",
+		"CLAUDE_CODE_OAUTH_TOKEN": "TENANT-OWN-GLOBAL-OAUTH",
 		"MODEL":                   "opus",
 	}
-	globalKeys := map[string]struct{}{"CLAUDE_CODE_OAUTH_TOKEN": {}}
 
-	res := applyPlatformManagedLLMEnv(context.Background(), envVars, globalKeys, wsID, "claude-code", "")
+	res := applyPlatformManagedLLMEnv(context.Background(), envVars, wsID, "claude-code", "")
 
-	// 1. The platform global OAuth token must be STRIPPED — the leak is closed.
-	if got, ok := envVars["CLAUDE_CODE_OAUTH_TOKEN"]; ok {
-		t.Fatalf("CLAUDE_CODE_OAUTH_TOKEN = %q present — platform scope:global token must be stripped for a byok workspace", got)
+	// 1. The tenant's own global-scope oauth SURVIVES — byok runs on it.
+	if envVars["CLAUDE_CODE_OAUTH_TOKEN"] != "TENANT-OWN-GLOBAL-OAUTH" {
+		t.Fatalf("CLAUDE_CODE_OAUTH_TOKEN = %q, want the tenant's own global-scope token preserved for byok", envVars["CLAUDE_CODE_OAUTH_TOKEN"])
 	}
 	// 2. No CP proxy creds forced (byok = workspace talks to its own provider).
 	if got, ok := envVars["ANTHROPIC_API_KEY"]; ok {
 		t.Fatalf("ANTHROPIC_API_KEY must NOT be injected for byok, got %q", got)
 	}
-	// 3. Resolver reports byok with NO usable LLM credential → caller fails closed.
+	if _, ok := envVars["MOLECULE_LLM_USAGE_TOKEN"]; ok {
+		t.Fatalf("MOLECULE_LLM_USAGE_TOKEN must NOT be injected for byok")
+	}
+	// 3. byok WITH a usable credential → caller does NOT fail closed.
 	if res.ResolvedMode != LLMBillingModeBYOK {
 		t.Fatalf("ResolvedMode = %q, want %q", res.ResolvedMode, LLMBillingModeBYOK)
 	}
-	if res.HasUsableLLMCred {
-		t.Fatalf("HasUsableLLMCred = true, want false (only the stripped platform global token was present)")
+	if !res.HasUsableLLMCred {
+		t.Fatalf("HasUsableLLMCred = false, want true (tenant's own global-scope oauth is the usable credential)")
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations: %v", err)
@@ -1214,7 +1266,7 @@ func TestApplyPlatformManagedLLMEnv_DERIVED_PlatformModelKeepsPlatformCreds(t *t
 	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
 
 	envVars := map[string]string{}
-	res := applyPlatformManagedLLMEnv(context.Background(), envVars, nil, wsID, "claude-code", "anthropic/claude-opus-4-7")
+	res := applyPlatformManagedLLMEnv(context.Background(), envVars, wsID, "claude-code", "anthropic/claude-opus-4-7")
 
 	if res.ResolvedMode != LLMBillingModePlatformManaged {
 		t.Fatalf("platform-derived model must resolve platform_managed, got %q (source=%s)", res.ResolvedMode, res.Source)
@@ -1234,14 +1286,15 @@ func TestApplyPlatformManagedLLMEnv_DERIVED_PlatformModelKeepsPlatformCreds(t *t
 	}
 }
 
-// NON-PLATFORM-DERIVED → byok + STRIP + FAIL-CLOSED signal (THE FIX, the Reno
-// billing-leak class). A claude-code workspace with a non-platform model
-// (kimi-for-coding → kimi-coding) and NO override + NO own cred, inheriting only
-// the platform's scope:global OAuth token, now DERIVES byok → #1963 strips the
-// global token → HasUsableLLMCred=false → caller fails closed. Pre-P2 this same
-// workspace resolved platform_managed (via the never-written org rung) and ran
-// on the platform's credits. This is the discriminating delta test.
-func TestApplyPlatformManagedLLMEnv_DERIVED_NonPlatformModelStripsAndFailsClosed(t *testing.T) {
+// NON-PLATFORM-DERIVED + NO CREDENTIAL AT ALL → byok + FAIL-CLOSED. This is
+// the legitimate remaining fail-closed path under the corrected model
+// (molecule-core#1994): a claude-code workspace with a non-platform model
+// (kimi-for-coding → byok) and NO override and NO LLM credential at ANY scope
+// (no global row, no workspace row) has nothing to run on → HasUsableLLMCred=
+// false → caller (prepareProvisionContext) aborts MISSING_BYOK_CREDENTIAL. The
+// fail-closed branch is unchanged by the strip removal; only its trigger
+// narrowed from "no workspace-scoped cred" to "no cred at any scope".
+func TestApplyPlatformManagedLLMEnv_DERIVED_ByokNoCredentialFailsClosed(t *testing.T) {
 	const wsID = "99999999-8888-7777-6666-555555555555"
 	mock := setupTestDB(t)
 	mock.ExpectQuery(`SELECT llm_billing_mode FROM workspaces WHERE id = \$1`).
@@ -1252,32 +1305,25 @@ func TestApplyPlatformManagedLLMEnv_DERIVED_NonPlatformModelStripsAndFailsClosed
 	t.Setenv("MOLECULE_LLM_BASE_URL", "https://api.example.test/api/v1/internal/llm/openai/v1")
 	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
 
-	// Only LLM cred is the platform's scope:global OAuth token (globalKeys).
-	envVars := map[string]string{
-		"CLAUDE_CODE_OAUTH_TOKEN": "PLATFORM-GLOBAL-OAUTH-TOKEN",
-	}
-	globalKeys := map[string]struct{}{"CLAUDE_CODE_OAUTH_TOKEN": {}}
+	// No LLM credential at all — neither global nor workspace scope.
+	envVars := map[string]string{}
 
-	res := applyPlatformManagedLLMEnv(context.Background(), envVars, globalKeys, wsID, "claude-code", "kimi-for-coding")
+	res := applyPlatformManagedLLMEnv(context.Background(), envVars, wsID, "claude-code", "kimi-for-coding")
 
 	// 1. DERIVED byok (NOT the old platform_managed default).
 	if res.ResolvedMode != LLMBillingModeBYOK {
-		t.Fatalf("non-platform-derived model must resolve byok, got %q (source=%s) — THE FIX regressed", res.ResolvedMode, res.Source)
+		t.Fatalf("non-platform-derived model must resolve byok, got %q (source=%s)", res.ResolvedMode, res.Source)
 	}
 	if res.Source != BillingModeSourceDerivedProvider {
 		t.Errorf("source: got %q want derived_provider", res.Source)
 	}
-	// 2. #1963 strip: the platform global OAuth token is removed (leak closed).
-	if got, ok := envVars["CLAUDE_CODE_OAUTH_TOKEN"]; ok {
-		t.Fatalf("CLAUDE_CODE_OAUTH_TOKEN = %q present — must be stripped for a derived-byok workspace (Reno leak)", got)
-	}
-	// 3. No CP proxy creds forced.
+	// 2. No CP proxy creds forced.
 	if got, ok := envVars["ANTHROPIC_API_KEY"]; ok {
 		t.Fatalf("ANTHROPIC_API_KEY must NOT be injected for byok, got %q", got)
 	}
-	// 4. No usable cred → caller (prepareProvisionContext) fails closed.
+	// 3. No usable cred at any scope → caller fails closed.
 	if res.HasUsableLLMCred {
-		t.Fatalf("HasUsableLLMCred = true, want false (only the stripped platform global token was present)")
+		t.Fatalf("HasUsableLLMCred = true, want false (no LLM credential present at any scope)")
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations: %v", err)
@@ -1300,7 +1346,7 @@ func TestApplyPlatformManagedLLMEnv_DERIVED_UnsetModelPlatformDefault(t *testing
 	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
 
 	envVars := map[string]string{}
-	res := applyPlatformManagedLLMEnv(context.Background(), envVars, nil, wsID, "claude-code", "")
+	res := applyPlatformManagedLLMEnv(context.Background(), envVars, wsID, "claude-code", "")
 
 	if res.ResolvedMode != LLMBillingModePlatformManaged {
 		t.Fatalf("unset model must default platform_managed, got %q (source=%s)", res.ResolvedMode, res.Source)
@@ -1316,14 +1362,13 @@ func TestApplyPlatformManagedLLMEnv_DERIVED_UnsetModelPlatformDefault(t *testing
 	}
 }
 
-// TestApplyPlatformManagedLLMEnv_ByokKeepsWorkspaceOwnOAuthEvenWithGlobal is
-// the discriminating companion to the strip test: a byok workspace that DID
-// set its own CLAUDE_CODE_OAUTH_TOKEN via the canvas Secrets tab (a
-// workspace_secrets row) keeps it. loadWorkspaceSecrets drops the global
-// provenance flag on a workspace override, so the key is NOT in globalKeys
-// and the provenance-aware strip leaves it alone. Proves the fix strips only
-// platform-origin creds, never the customer's own.
-func TestApplyPlatformManagedLLMEnv_ByokKeepsWorkspaceOwnOAuthEvenWithGlobal(t *testing.T) {
+// TestApplyPlatformManagedLLMEnv_ByokKeepsWorkspaceOwnOAuth is the
+// workspace-scope companion to the global-scope survival test: a byok
+// workspace that set its own CLAUDE_CODE_OAUTH_TOKEN via the canvas Secrets
+// tab (a workspace_secrets row) keeps it and runs direct. Under the corrected
+// model (molecule-core#1994) the tenant's credential survives at EITHER scope;
+// this pins the workspace-scope half.
+func TestApplyPlatformManagedLLMEnv_ByokKeepsWorkspaceOwnOAuth(t *testing.T) {
 	const wsID = "6b66de8d-9337-4fb4-be8d-6d49dca0d809" // Reno Stars Marketing agent
 	mock := setupTestDB(t)
 	mock.ExpectQuery(`SELECT llm_billing_mode FROM workspaces WHERE id = \$1`).
@@ -1334,15 +1379,13 @@ func TestApplyPlatformManagedLLMEnv_ByokKeepsWorkspaceOwnOAuthEvenWithGlobal(t *
 	t.Setenv("MOLECULE_LLM_BASE_URL", "https://api.example.test/api/v1/internal/llm/openai/v1")
 	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
 
-	// Workspace set its OWN OAuth token — loadWorkspaceSecrets would have
-	// dropped its global provenance flag, so globalKeys does NOT contain it.
+	// Workspace set its OWN OAuth token (a workspace_secrets row).
 	envVars := map[string]string{
 		"CLAUDE_CODE_OAUTH_TOKEN": "CUSTOMER-OWN-OAUTH-TOKEN",
 		"MODEL":                   "opus",
 	}
-	globalKeys := map[string]struct{}{} // not from global_secrets
 
-	res := applyPlatformManagedLLMEnv(context.Background(), envVars, globalKeys, wsID, "claude-code", "")
+	res := applyPlatformManagedLLMEnv(context.Background(), envVars, wsID, "claude-code", "")
 
 	if got := envVars["CLAUDE_CODE_OAUTH_TOKEN"]; got != "CUSTOMER-OWN-OAUTH-TOKEN" {
 		t.Fatalf("CLAUDE_CODE_OAUTH_TOKEN = %q, want the workspace's own token left intact", got)
@@ -1358,13 +1401,18 @@ func TestApplyPlatformManagedLLMEnv_ByokKeepsWorkspaceOwnOAuthEvenWithGlobal(t *
 	}
 }
 
-// TestApplyPlatformManagedLLMEnv_DisabledStripsGlobalButReportsNoCred proves
-// that "disabled" mode also strips the platform's global LLM creds (the leak
-// is closed for disabled too), and reports HasUsableLLMCred=false. The
-// caller's fail-closed abort is scoped to byok only, so a disabled workspace
-// with no LLM cred still boots (for terminal / non-LLM work); here we pin the
-// function-level strip + report.
-func TestApplyPlatformManagedLLMEnv_DisabledStripsGlobalButReportsNoCred(t *testing.T) {
+// TestApplyPlatformManagedLLMEnv_DisabledKeepsTenantGlobalNoProxy proves the
+// corrected-model behavior for "disabled": the tenant's own global-scope LLM
+// cred is NOT stripped and the CP proxy is NOT forced. "disabled" means the
+// workspace runs no platform-billed LLM, but the tenant's own credential is
+// still the tenant's to keep; the caller's fail-closed abort is byok-only so a
+// disabled workspace boots regardless. The previous internal#711 behavior
+// stripped the global cred here on the same inverted premise; that strip is
+// removed.
+//
+// Mutation (load-bearing): re-add stripGlobalOriginLLMCreds on the non-platform
+// branch → the oauth disappears → this test RED on the survival assertion.
+func TestApplyPlatformManagedLLMEnv_DisabledKeepsTenantGlobalNoProxy(t *testing.T) {
 	const wsID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 	mock := setupTestDB(t)
 	mock.ExpectQuery(`SELECT llm_billing_mode FROM workspaces WHERE id = \$1`).
@@ -1374,20 +1422,21 @@ func TestApplyPlatformManagedLLMEnv_DisabledStripsGlobalButReportsNoCred(t *test
 	t.Setenv("MOLECULE_LLM_BILLING_MODE", LLMBillingModePlatformManaged)
 
 	envVars := map[string]string{
-		"CLAUDE_CODE_OAUTH_TOKEN": "PLATFORM-GLOBAL-OAUTH-TOKEN",
+		"CLAUDE_CODE_OAUTH_TOKEN": "TENANT-OWN-GLOBAL-OAUTH",
 	}
-	globalKeys := map[string]struct{}{"CLAUDE_CODE_OAUTH_TOKEN": {}}
 
-	res := applyPlatformManagedLLMEnv(context.Background(), envVars, globalKeys, wsID, "claude-code", "")
+	res := applyPlatformManagedLLMEnv(context.Background(), envVars, wsID, "claude-code", "")
 
-	if _, ok := envVars["CLAUDE_CODE_OAUTH_TOKEN"]; ok {
-		t.Fatalf("CLAUDE_CODE_OAUTH_TOKEN must be stripped for disabled mode too")
+	// The tenant's own global cred survives (not stripped).
+	if envVars["CLAUDE_CODE_OAUTH_TOKEN"] != "TENANT-OWN-GLOBAL-OAUTH" {
+		t.Fatalf("tenant's own global cred must survive for disabled mode; got %q", envVars["CLAUDE_CODE_OAUTH_TOKEN"])
+	}
+	// No proxy forced for disabled.
+	if _, ok := envVars["MOLECULE_LLM_USAGE_TOKEN"]; ok {
+		t.Fatalf("disabled must not inject the platform usage token")
 	}
 	if res.ResolvedMode != LLMBillingModeDisabled {
 		t.Fatalf("ResolvedMode = %q, want %q", res.ResolvedMode, LLMBillingModeDisabled)
-	}
-	if res.HasUsableLLMCred {
-		t.Fatalf("HasUsableLLMCred = true, want false")
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations: %v", err)
@@ -1395,10 +1444,11 @@ func TestApplyPlatformManagedLLMEnv_DisabledStripsGlobalButReportsNoCred(t *test
 }
 
 // TestApplyPlatformManagedLLMEnv_PlatformManagedStillReceivesGlobalCreds is
-// the no-regression guard for the OTHER side of the gate (internal#711): a
-// platform-managed workspace MUST still receive the platform's creds. Here
-// the proxy IS configured, so the contract is the existing one — the global
-// OAuth token is replaced by the proxy usage token (HasUsableLLMCred=true).
+// the no-regression guard for the metered platform_managed path
+// (molecule-core#1994): a platform-managed workspace MUST still strip any
+// direct oauth and route through the CP proxy. The direct OAuth token is
+// replaced by the proxy usage token (HasUsableLLMCred=true). This path is
+// UNCHANGED by the byok strip removal — only the byok/disabled branch changed.
 func TestApplyPlatformManagedLLMEnv_PlatformManagedStillReceivesGlobalCreds(t *testing.T) {
 	const wsID = "99999999-9999-9999-9999-999999999999"
 	mock := setupTestDB(t)
@@ -1412,12 +1462,11 @@ func TestApplyPlatformManagedLLMEnv_PlatformManagedStillReceivesGlobalCreds(t *t
 	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
 
 	envVars := map[string]string{
-		"CLAUDE_CODE_OAUTH_TOKEN": "PLATFORM-GLOBAL-OAUTH-TOKEN",
+		"CLAUDE_CODE_OAUTH_TOKEN": "DIRECT-OAUTH-TOKEN",
 		"MODEL":                   "opus",
 	}
-	globalKeys := map[string]struct{}{"CLAUDE_CODE_OAUTH_TOKEN": {}}
 
-	res := applyPlatformManagedLLMEnv(context.Background(), envVars, globalKeys, wsID, "claude-code", "")
+	res := applyPlatformManagedLLMEnv(context.Background(), envVars, wsID, "claude-code", "")
 
 	// Platform-managed routes through the CP proxy: OAuth stripped, proxy creds forced.
 	if _, ok := envVars["CLAUDE_CODE_OAUTH_TOKEN"]; ok {
@@ -1458,7 +1507,7 @@ func TestApplyPlatformManagedLLMEnv_PlatformManagedStillEmitsResolvedMode(t *tes
 		"CLAUDE_CODE_OAUTH_TOKEN": "user-oauth-token",
 		"MODEL":                   "sonnet",
 	}
-	applyPlatformManagedLLMEnv(context.Background(), envVars, nil, wsID, "claude-code", "")
+	applyPlatformManagedLLMEnv(context.Background(), envVars, wsID, "claude-code", "")
 
 	// OAuth stripped, proxy forced — unchanged platform_managed contract.
 	if _, ok := envVars["CLAUDE_CODE_OAUTH_TOKEN"]; ok {

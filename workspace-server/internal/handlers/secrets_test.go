@@ -840,14 +840,20 @@ func TestSecretsValues_ValidTokenReturnsDecryptedMerge(t *testing.T) {
 	}
 }
 
-// TestSecretsValues_ByokStripsGlobalLLMCred is the internal#711 regression
-// guard for the remote-pull injection vector. A non-platform (byok) workspace
-// that pulls its secrets via GET /workspaces/:id/secrets/values must NOT
-// receive the platform's scope:global CLAUDE_CODE_OAUTH_TOKEN — that key is
-// of global_secrets provenance and is dropped by the provider-aware gate.
-// Its OWN ANTHROPIC_API_KEY (a workspace_secrets row) survives, and unrelated
-// non-LLM global secrets are untouched.
-func TestSecretsValues_ByokStripsGlobalLLMCred(t *testing.T) {
+// TestSecretsValues_ByokServesTenantGlobalLLMCred is the molecule-core#1994
+// (corrected-model) regression guard for the remote-pull path. `global_secrets`
+// is the TENANT's store, so a byok workspace's pull MUST include the tenant's
+// own global-scope LLM credential — that is exactly what byok runs on, direct.
+//
+// Pre-fix (internal#711) this path STRIPPED the global-origin oauth on byok,
+// resting on the inverted premise that a global LLM cred was "the platform's
+// own"; that killed legitimate byok workspaces whose oauth lived at global
+// scope. The strip is removed: the merged bundle (tenant globals + workspace
+// overrides) is served verbatim.
+//
+// Mutation: re-add the byok global-LLM-cred strip in secrets.go Values() →
+// CLAUDE_CODE_OAUTH_TOKEN disappears from the body → this test RED.
+func TestSecretsValues_ByokServesTenantGlobalLLMCred(t *testing.T) {
 	mock := setupTestDB(t)
 	handler := NewSecretsHandler(nil)
 
@@ -860,21 +866,18 @@ func TestSecretsValues_ByokStripsGlobalLLMCred(t *testing.T) {
 	mock.ExpectExec(`UPDATE workspace_auth_tokens SET last_used_at`).
 		WithArgs("tok-1").
 		WillReturnResult(sqlmock.NewResult(0, 1))
-	// global_secrets holds the platform's scope:global OAuth token + a
-	// non-LLM operator global (should be untouched).
+	// global_secrets holds the TENANT's own global-scope OAuth token (shared
+	// across all the tenant's workspaces) + a non-LLM global.
 	mock.ExpectQuery(`SELECT key, encrypted_value, encryption_version FROM global_secrets`).
 		WillReturnRows(sqlmock.NewRows([]string{"key", "encrypted_value", "encryption_version"}).
-			AddRow("CLAUDE_CODE_OAUTH_TOKEN", []byte("PLATFORM-GLOBAL-OAUTH"), 0).
+			AddRow("CLAUDE_CODE_OAUTH_TOKEN", []byte("TENANT-OWN-GLOBAL-OAUTH"), 0).
 			AddRow("SENTRY_DSN", []byte("https://sentry.example/123"), 0))
-	// The workspace brought its OWN Anthropic API key via the Secrets tab.
+	// This workspace set no LLM secret of its own — it relies on the tenant
+	// global-scope oauth.
 	mock.ExpectQuery(`SELECT key, encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id`).
 		WithArgs(testWsID).
 		WillReturnRows(sqlmock.NewRows([]string{"key", "encrypted_value", "encryption_version"}).
-			AddRow("ANTHROPIC_API_KEY", []byte("CUSTOMER-OWN-ANTHROPIC-KEY"), 0))
-	// Resolver: this workspace is byok.
-	mock.ExpectQuery(`SELECT llm_billing_mode FROM workspaces WHERE id = \$1`).
-		WithArgs(testWsID).
-		WillReturnRows(sqlmock.NewRows([]string{"llm_billing_mode"}).AddRow(LLMBillingModeBYOK))
+			AddRow("MODEL", []byte("opus"), 0))
 
 	w := httptest.NewRecorder()
 	c := secretsValuesRequest(w, "Bearer good-token")
@@ -885,13 +888,13 @@ func TestSecretsValues_ByokStripsGlobalLLMCred(t *testing.T) {
 	}
 	var body map[string]string
 	_ = json.Unmarshal(w.Body.Bytes(), &body)
-	// 1. Platform global OAuth token stripped — the leak is closed on the pull path.
-	if got, ok := body["CLAUDE_CODE_OAUTH_TOKEN"]; ok {
-		t.Fatalf("CLAUDE_CODE_OAUTH_TOKEN = %q present — platform scope:global token must be stripped for byok pull", got)
+	// 1. The tenant's own global-scope OAuth token SURVIVES — byok runs on it.
+	if body["CLAUDE_CODE_OAUTH_TOKEN"] != "TENANT-OWN-GLOBAL-OAUTH" {
+		t.Fatalf("CLAUDE_CODE_OAUTH_TOKEN = %q, want the tenant's own global-scope token served for byok pull", body["CLAUDE_CODE_OAUTH_TOKEN"])
 	}
-	// 2. The workspace's own LLM key survives.
-	if body["ANTHROPIC_API_KEY"] != "CUSTOMER-OWN-ANTHROPIC-KEY" {
-		t.Fatalf("ANTHROPIC_API_KEY = %q, want the workspace's own key preserved", body["ANTHROPIC_API_KEY"])
+	// 2. The workspace's own non-LLM secret survives.
+	if body["MODEL"] != "opus" {
+		t.Fatalf("MODEL = %q, want opus preserved", body["MODEL"])
 	}
 	// 3. Unrelated non-LLM global secrets are untouched.
 	if body["SENTRY_DSN"] != "https://sentry.example/123" {
@@ -974,6 +977,49 @@ func TestSetGlobal_AutoRestartsAffectedWorkspaces(t *testing.T) {
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations: %v", err)
 	}
+}
+
+// TestSetGlobal_RejectsPlatformBypassKeyOnPlatformManagedTenant is the
+// molecule-core#1994 co-mingling GUARD regression. Removing the byok strip is
+// only safe if the platform's own credential is never written into a tenant's
+// global_secrets. SetGlobal is the in-code write boundary: on a tenant whose
+// resolved LLM mode is platform_managed (the metered default), a direct
+// vendor / oauth bypass-list key MUST be rejected (400) and NOT persisted —
+// the tenant is supposed to route through the CP proxy, not carry a direct
+// platform-shaped credential at global scope. This is what keeps a
+// platform-origin token out of global_secrets going forward.
+//
+// (On a byok/disabled tenant the same write is ALLOWED — that key is the
+// tenant's OWN credential, which the corrected model expects at global scope.
+// TestSetGlobal_AutoRestartsAffectedWorkspaces covers that allowed path.)
+//
+// Mutation: drop the rejectPlatformManagedDirectLLMBypass guard from SetGlobal
+// → the write reaches the INSERT (no 400) → this test RED.
+func TestSetGlobal_RejectsPlatformBypassKeyOnPlatformManagedTenant(t *testing.T) {
+	setupTestDB(t)
+	handler := NewSecretsHandler(nil)
+
+	// Org/tenant default is platform_managed — the metered path. A direct
+	// vendor key write into global_secrets must be refused here.
+	t.Setenv("MOLECULE_LLM_BILLING_MODE", LLMBillingModePlatformManaged)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	body := `{"key":"CLAUDE_CODE_OAUTH_TOKEN","value":"sk-ant-oat01-platform-shaped"}`
+	c.Request = httptest.NewRequest("POST", "/admin/secrets", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.SetGlobal(c)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 (bypass-list key rejected for platform_managed tenant), got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "blocked") {
+		t.Errorf("response should explain the block; got %s", w.Body.String())
+	}
+	// No INSERT was expected on the mock — sqlmock would error on an
+	// unexpected ExecContext, so reaching here with a 400 proves the write
+	// was refused before the DB.
 }
 
 // TestDeleteGlobal_AutoRestartsAffectedWorkspaces covers the delete branch of #15.

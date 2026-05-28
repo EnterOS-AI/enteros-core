@@ -193,33 +193,31 @@ func (h *WorkspaceHandler) prepareProvisionContext(
 	// continue to rely on workspace_secrets / org-import persona-env
 	// merge for their git auth.
 	applyAgentGitHTTPCreds(envVars, payload.Role)
-	// internal#711: provider-aware LLM-credential resolution. On a non-platform
-	// (byok/subscription) workspace this strips the platform's scope:global LLM
-	// creds inherited from global_secrets and reports whether the workspace
-	// still has a usable (workspace-scoped) LLM credential of its own.
-	llmRes := applyPlatformManagedLLMEnv(ctx, envVars, globalSecretKeys, workspaceID, payload.Runtime, payload.Model)
-	// Fail closed for a BYOK workspace with no usable LLM credential: do NOT
-	// start it on the platform's (now-stripped) global creds. Mirror the
-	// "model+provider+credential REQUIRED at create" spirit (internal#711)
-	// with an actionable error surfaced at provision time.
+	// molecule-core#1994: per-workspace LLM billing-mode resolution + env wiring.
+	// On platform_managed it forces the CP proxy usage token; on byok/disabled
+	// it leaves the tenant's own creds (global OR workspace scope) untouched and
+	// reports whether a usable LLM credential is present.
+	llmRes := applyPlatformManagedLLMEnv(ctx, envVars, workspaceID, payload.Runtime, payload.Model)
+	// Fail closed for a BYOK workspace with no usable LLM credential at ANY
+	// scope: do NOT start it credential-less. Mirror the "model+provider+
+	// credential REQUIRED at create" spirit with an actionable error surfaced
+	// at provision time.
 	//
 	// Scoped to byok specifically (NOT disabled): "byok" means "the user
 	// intends to run an LLM on their own credential" — a missing one is a
 	// misconfiguration worth surfacing loudly. "disabled" means "this
 	// workspace runs no platform-billed LLM at all" (terminal / file work, or
-	// a runtime that talks to a non-bypass-key endpoint); stripping the
-	// inherited platform globals is sufficient there and aborting would
-	// regress a legitimate no-LLM workspace. The strip above already ran for
-	// both non-platform modes.
+	// a runtime that talks to a non-bypass-key endpoint), so aborting would
+	// regress a legitimate no-LLM workspace.
 	//
-	// The bypass-key check is intentionally broad — any surviving bypass key
-	// (the workspace's own, of workspace_secrets provenance) clears it.
+	// The bypass-key check is intentionally broad — any present bypass key
+	// (the tenant's own, at global or workspace scope) clears it.
 	if llmRes.ResolvedMode == LLMBillingModeBYOK && !llmRes.HasUsableLLMCred {
 		msg := formatMissingBYOKCredentialError(llmRes.ResolvedMode)
-		log.Printf("Provisioner: ABORT workspace=%s — byok billing mode has no usable LLM credential (MISSING_BYOK_CREDENTIAL, internal#711)", workspaceID)
+		log.Printf("Provisioner: ABORT workspace=%s — byok billing mode has no usable LLM credential (MISSING_BYOK_CREDENTIAL, molecule-core#1994)", workspaceID)
 		return nil, &provisionAbort{
 			Msg:   msg,
-			Extra: map[string]interface{}{"error": msg, "code": "MISSING_BYOK_CREDENTIAL", "billing_mode": llmRes.ResolvedMode, "issue": "711"},
+			Extra: map[string]interface{}{"error": msg, "code": "MISSING_BYOK_CREDENTIAL", "billing_mode": llmRes.ResolvedMode, "issue": "1994"},
 		}
 	}
 	applyRuntimeModelEnv(envVars, payload.Runtime, payload.Model)
