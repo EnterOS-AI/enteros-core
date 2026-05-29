@@ -18,8 +18,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/DATA-DOG/go-sqlmock"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/alicebob/miniredis/v2"
 )
 
@@ -209,10 +209,12 @@ func drainSetup(t *testing.T, workspaceID string) (sqlmock.Sqlmock, *WorkspaceHa
 // Named distinctly from handlers_test.go's expectBudgetCheck (which uses MatchPsql
 // escaped-regex and cannot be reused with QueryMatcherEqual tests).
 func expectQueueBudgetCheck(mock sqlmock.Sqlmock, workspaceID string) {
+	// Multi-period (#49): exact-match the budget_limits read; "{}" → no limits →
+	// checkWorkspaceBudget returns early (no spend query).
 	mock.ExpectQuery(
-		"SELECT budget_limit, COALESCE(monthly_spend, 0) FROM workspaces WHERE id = $1",
+		"SELECT COALESCE(budget_limits, '{}'::jsonb) FROM workspaces WHERE id = $1",
 	).WithArgs(workspaceID).
-		WillReturnRows(sqlmock.NewRows([]string{"budget_limit", "monthly_spend"}))
+		WillReturnRows(sqlmock.NewRows([]string{"budget_limits"}).AddRow([]byte("{}")))
 }
 
 // seedRedisURL puts the agent server URL into the Redis cache so resolveAgentURL

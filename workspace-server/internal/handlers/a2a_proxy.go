@@ -334,28 +334,39 @@ func (h *WorkspaceHandler) ProxyA2A(c *gin.Context) {
 	c.Data(status, "application/json", respBody)
 }
 
-// checkWorkspaceBudget returns a proxyA2AError with 402 when the workspace
-// has a budget_limit set and monthly_spend has reached or exceeded it.
-// DB errors are logged and treated as fail-open — a budget check failure
-// must not block legitimate A2A traffic.
+// checkWorkspaceBudget returns a proxyA2AError with 402 when the workspace has
+// exceeded ANY of its configured per-period budget limits (hourly/daily/weekly/
+// monthly — see budget_periods.go). Per-period spend is the rolling-window sum
+// over the workspace_spend_events ledger. DB errors are logged and treated as
+// fail-open — a budget check failure must not block legitimate A2A traffic.
 func (h *WorkspaceHandler) checkWorkspaceBudget(ctx context.Context, workspaceID string) *proxyA2AError {
-	var budgetLimit sql.NullInt64
-	var monthlySpend int64
-	err := db.DB.QueryRowContext(ctx,
-		`SELECT budget_limit, COALESCE(monthly_spend, 0) FROM workspaces WHERE id = $1`,
+	var limitsRaw []byte
+	if err := db.DB.QueryRowContext(ctx,
+		`SELECT COALESCE(budget_limits, '{}'::jsonb) FROM workspaces WHERE id = $1`,
 		workspaceID,
-	).Scan(&budgetLimit, &monthlySpend)
-	if err != nil {
+	).Scan(&limitsRaw); err != nil {
 		if err != sql.ErrNoRows {
 			log.Printf("ProxyA2A: budget check failed for %s: %v", workspaceID, err)
 		}
 		return nil // fail-open
 	}
-	if budgetLimit.Valid && monthlySpend >= budgetLimit.Int64 {
-		log.Printf("ProxyA2A: budget exceeded for %s (spend=%d limit=%d)", workspaceID, monthlySpend, budgetLimit.Int64)
+	limits := parseBudgetLimits(limitsRaw)
+	if len(limits) == 0 {
+		return nil // no limits configured
+	}
+	spend, err := spendByPeriod(ctx, db.DB, workspaceID)
+	if err != nil {
+		log.Printf("ProxyA2A: budget spend query failed for %s: %v", workspaceID, err)
+		return nil // fail-open
+	}
+	if over := exceededPeriods(limits, spend); len(over) > 0 {
+		log.Printf("ProxyA2A: budget exceeded for %s (periods=%v limits=%v spend=%v)", workspaceID, over, limits, spend)
 		return &proxyA2AError{
-			Status:   http.StatusPaymentRequired,
-			Response: gin.H{"error": "workspace budget limit exceeded"},
+			Status: http.StatusPaymentRequired,
+			Response: gin.H{
+				"error":            "workspace budget limit exceeded",
+				"exceeded_periods": over,
+			},
 		}
 	}
 	return nil
