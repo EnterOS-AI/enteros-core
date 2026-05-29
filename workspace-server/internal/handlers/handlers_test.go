@@ -12,12 +12,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/DATA-DOG/go-sqlmock"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/ws"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wsauth"
+	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/alicebob/miniredis/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/redis/go-redis/v9"
@@ -158,9 +158,11 @@ func allowLoopbackForTest(t *testing.T) {
 // handler in the 2026-04-18 restructure but the tests never caught up,
 // leaving Platform (Go) CI red for weeks.
 func expectBudgetCheck(mock sqlmock.Sqlmock, workspaceID string) {
-	mock.ExpectQuery(`SELECT budget_limit, COALESCE\(monthly_spend, 0\) FROM workspaces WHERE id = \$1`).
+	// Multi-period (#49): checkWorkspaceBudget reads budget_limits jsonb. An
+	// empty map → no limits → returns early (no spend query), enforcement skipped.
+	mock.ExpectQuery(`SELECT COALESCE\(budget_limits`).
 		WithArgs(workspaceID).
-		WillReturnRows(sqlmock.NewRows([]string{"budget_limit", "monthly_spend"}))
+		WillReturnRows(sqlmock.NewRows([]string{"budget_limits"}).AddRow([]byte("{}")))
 }
 
 // ---------- TestRegisterHandler ----------
