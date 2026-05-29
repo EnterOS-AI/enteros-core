@@ -444,3 +444,72 @@ func TestAdminSchedulesHealth_ResponseFields(t *testing.T) {
 		t.Fatalf("unmet expectations: %v", err)
 	}
 }
+
+// ==================== Orphans + ReapOrphans (internal#2006) ====================
+
+// TestAdminSchedulesOrphans verifies the monitor surface lists schedules bound
+// to a removed/missing workspace (the recreate-orphan failure mode).
+func TestAdminSchedulesOrphans(t *testing.T) {
+	mock := setupTestDB(t)
+	handler := NewAdminSchedulesHealthHandler()
+
+	mock.ExpectQuery(`LEFT JOIN workspaces`).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"workspace_id", "ws_status", "id", "name", "source", "enabled", "cron_expr",
+		}).AddRow("dead-ws", "removed", "sched-1", "minimax-autonomous-tick", "runtime", false, "*/5 * * * *"))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest("GET", "/admin/schedules/orphans", nil)
+
+	handler.Orphans(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp []orphanScheduleEntry
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("parse response: %v", err)
+	}
+	if len(resp) != 1 {
+		t.Fatalf("expected 1 orphan, got %d", len(resp))
+	}
+	if resp[0].ScheduleName != "minimax-autonomous-tick" || resp[0].WorkspaceStatus != "removed" || resp[0].Source != "runtime" {
+		t.Errorf("unexpected orphan entry: %+v", resp[0])
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// TestReapOrphans verifies the cleaner re-points runtime schedules onto a live
+// successor then disables any remaining dead-bound schedules, returning counts.
+func TestReapOrphans(t *testing.T) {
+	mock := setupTestDB(t)
+	handler := NewAdminSchedulesHealthHandler()
+
+	mock.ExpectExec(`UPDATE workspace_schedules s\s+SET workspace_id`).
+		WillReturnResult(sqlmock.NewResult(0, 2))
+	mock.ExpectExec(`UPDATE workspace_schedules s\s+SET enabled = false`).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest("POST", "/admin/schedules/reap-orphans", nil)
+
+	handler.ReapOrphans(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]int64
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("parse response: %v", err)
+	}
+	if resp["repointed"] != 2 || resp["disabled"] != 1 {
+		t.Errorf("expected repointed=2 disabled=1, got %+v", resp)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
