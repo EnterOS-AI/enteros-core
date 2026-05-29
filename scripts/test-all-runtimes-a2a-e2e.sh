@@ -208,6 +208,9 @@ for runtime in "${!WS_IDS[@]}"; do
   [ -z "$id" ] && continue
   max=60
   [ "$runtime" = "hermes" ] && max=120
+  # google-adk's first cold boot pulls a large fresh ADK image — give it
+  # a hermes-class window so a slow first pull doesn't read as "failed".
+  [ "$runtime" = "google-adk" ] && max=180
   if wait_online "$id" "$runtime" "$max"; then
     check "$runtime online" "ok" "ok"
   else
