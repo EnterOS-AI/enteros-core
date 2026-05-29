@@ -900,7 +900,17 @@ type platformLLMEnvResult struct {
 	Source BillingModeSource
 }
 
-func applyPlatformManagedLLMEnv(ctx context.Context, envVars map[string]string, workspaceID, runtime, model string) platformLLMEnvResult {
+// globalKeys is the provenance side-channel from loadWorkspaceSecrets: the set
+// of env keys that originated from the operator-controlled global_secrets table
+// (a workspace_secrets row of the same name overrides and clears the flag). It
+// is consumed ONLY on the byok/disabled branch's provider-matched strip
+// (internal#728 Bug 1): a global-origin LLM bypass cred that does NOT match the
+// resolved provider's auth_env is stripped so a greedy runtime (claude-code
+// prefers CLAUDE_CODE_OAUTH_TOKEN) cannot route a non-anthropic model to the
+// wrong upstream. May be nil (no global-origin keys / unknown provenance) — a
+// nil set strips nothing, preserving the pre-#728 behavior for callers that do
+// not thread provenance.
+func applyPlatformManagedLLMEnv(ctx context.Context, envVars map[string]string, workspaceID, runtime, model string, globalKeys map[string]struct{}) platformLLMEnvResult {
 	// internal#718 P2-B: the platform-vs-byok decision now DERIVES the provider
 	// from (runtime, model) via the registry and keys off IsPlatform(derived) —
 	// NOT a stored LLM_PROVIDER and NOT the org rung. This path already carries
@@ -945,19 +955,43 @@ func applyPlatformManagedLLMEnv(ctx context.Context, envVars map[string]string, 
 	envVars["MOLECULE_LLM_BILLING_MODE_RESOLVED"] = res.ResolvedMode
 	if res.ResolvedMode != LLMBillingModePlatformManaged {
 		// byok or disabled — DO NOT force-route to CP, DO NOT override the
-		// workspace's own ANTHROPIC_BASE_URL / OAuth token, and DO NOT strip
-		// the tenant's own LLM credentials.
+		// workspace's own ANTHROPIC_BASE_URL, and DO NOT strip the tenant's own
+		// (provider-matching) LLM credentials.
 		//
 		// molecule-core#1994 (corrected model): `global_secrets` is the
 		// TENANT's store, not the platform's. The tenant's own credential —
 		// at global OR workspace scope — is exactly what byok runs on, direct.
-		// We leave envVars untouched here and report whether a usable LLM
-		// credential survived so the caller can fail closed when there is
-		// genuinely none (no platform-managed-shaped key at any scope). The
-		// platform's own credential is never in a tenant's global_secrets
+		// The platform's own credential is never in a tenant's global_secrets
 		// (guarded at the SetGlobal write boundary + the proxy token is
 		// server-env-only), so leaving the tenant's globals in place cannot
 		// re-open the platform-credit drain.
+		//
+		// internal#728 Bug 1 (provider-matched credential injection): #1994
+		// removed the BLANKET strip, which was correct for the platform-key
+		// co-mingling it targeted but left EVERY claude-code workspace
+		// inheriting the tenant-global CLAUDE_CODE_OAUTH_TOKEN. A claude-code
+		// runtime greedily prefers that oauth (`llm-auth: detected oauth` →
+		// api.anthropic.com), so a workspace whose RESOLVED provider is NOT
+		// anthropic-oauth (minimax, kimi-byok, …) routes its non-Anthropic
+		// model to Anthropic and errors (`Claude Code returned an error
+		// result`; DevB MiniMax-M2.7 live-confirmed 2026-05-28).
+		//
+		// The precise, provider-AWARE replacement for the over-removed strip:
+		// keep ONLY the global-origin bypass creds whose env-var name is in the
+		// RESOLVED provider's auth_env; strip the rest. This is NOT a return to
+		// the blanket strip — it is keyed off the derived provider:
+		//   - minimax (auth_env: MINIMAX_API_KEY, ANTHROPIC_AUTH_TOKEN,
+		//     ANTHROPIC_API_KEY) → global-origin CLAUDE_CODE_OAUTH_TOKEN is
+		//     NOT a match → stripped (fixes DevB).
+		//   - anthropic-oauth (auth_env: CLAUDE_CODE_OAUTH_TOKEN) → the
+		//     global-origin oauth IS a match → kept (PM/reno opus byok NOT
+		//     regressed — the #1994 ByokGlobalScopeOAuthSurvives guard holds).
+		// WORKSPACE-origin creds (the user explicitly set them via the canvas
+		// Secrets tab → NOT in globalKeys) are NEVER stripped here, even when
+		// they don't match: the user authored them deliberately (JRS kimi
+		// workspace-key, reno's own oauth). Only the inherited operator-store
+		// channel is provider-gated.
+		stripNonMatchingGlobalOriginLLMCreds(envVars, globalKeys, runtime, effectiveModel, availableAuthEnv)
 		return platformLLMEnvResult{
 			ResolvedMode:     res.ResolvedMode,
 			HasUsableLLMCred: hasAnyPlatformManagedLLMKey(envVars),
@@ -1026,6 +1060,66 @@ func hasAnyPlatformManagedLLMKey(envVars map[string]string) bool {
 		}
 	}
 	return false
+}
+
+// stripNonMatchingGlobalOriginLLMCreds is the byok-branch provider-matched
+// credential injection (internal#728 Bug 1). It removes from envVars every
+// platform-managed LLM bypass key that:
+//
+//  1. originated from the operator-controlled global_secrets store
+//     (present in globalKeys — a workspace_secrets row of the same name
+//     overrides + clears the flag, so user-authored creds are exempt), AND
+//  2. is NOT in the RESOLVED provider's auth_env set.
+//
+// The motivating regression: #1994 dropped the blanket strip, so a claude-code
+// workspace resolving to `minimax` still inherited the tenant-global
+// CLAUDE_CODE_OAUTH_TOKEN; the runtime prefers that oauth and routes the
+// MiniMax model to api.anthropic.com → error. Keeping only the resolved
+// provider's own auth_env keys (minimax: MINIMAX_API_KEY/ANTHROPIC_AUTH_TOKEN/
+// ANTHROPIC_API_KEY — not the oauth) removes the stray oauth while preserving
+// anthropic-oauth's CLAUDE_CODE_OAUTH_TOKEN for an opus byok workspace.
+//
+// Fail-OPEN by design: if the provider cannot be derived (empty model /
+// unknown runtime / ambiguous) or the registry is unavailable, we strip
+// NOTHING — we never strip a credential we cannot prove is non-matching, so a
+// derive miss can never fail-close a legitimate byok workspace (mirrors the
+// resolver's own default-closed-to-platform contract: the worst case is we
+// keep a stray cred, never that we remove the only usable one). The earlier
+// internal#711 blanket strip's fail-direction (remove first) was the bug;
+// this strip's fail-direction is keep-first.
+func stripNonMatchingGlobalOriginLLMCreds(envVars map[string]string, globalKeys map[string]struct{}, runtime, model string, availableAuthEnv []string) {
+	if len(globalKeys) == 0 {
+		return // no operator-store-origin keys to consider — nothing to strip.
+	}
+	manifest, err := providerRegistry()
+	if err != nil || manifest == nil {
+		return // registry unavailable — fail open, strip nothing.
+	}
+	provider, dErr := manifest.DeriveProvider(runtime, model, availableAuthEnv)
+	if dErr != nil {
+		return // underivable provider — fail open, strip nothing.
+	}
+	// The resolved provider's accepted auth-env-var NAMES (case-insensitive
+	// for parity with isPlatformManagedDirectLLMBypassKey, which upper-cases).
+	keep := make(map[string]struct{}, len(provider.AuthEnv))
+	for _, e := range provider.AuthEnv {
+		keep[strings.ToUpper(strings.TrimSpace(e))] = struct{}{}
+	}
+	for key := range globalKeys {
+		upper := strings.ToUpper(strings.TrimSpace(key))
+		if _, isBypass := platformManagedDirectLLMBypassKeys[upper]; !isBypass {
+			continue // not an LLM bypass cred (e.g. a non-LLM operator secret) — leave it.
+		}
+		if _, matches := keep[upper]; matches {
+			continue // matches the resolved provider's auth_env — this is what byok runs on.
+		}
+		// Global-origin LLM bypass cred that does NOT match the resolved
+		// provider — the stray that a greedy runtime would mis-prefer. Strip.
+		if _, present := envVars[key]; present {
+			log.Printf("workspace_provision: byok provider-matched strip — removing global-origin LLM cred %s (resolved provider=%s does not accept it)", key, provider.Name)
+			delete(envVars, key)
+		}
+	}
 }
 
 func runtimeUsesAnthropicNativeProxy(runtime string) bool {
