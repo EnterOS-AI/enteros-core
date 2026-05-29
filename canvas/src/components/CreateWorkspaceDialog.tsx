@@ -38,10 +38,11 @@ const DEFAULT_RUNTIME = "claude-code";
 const RUNTIME_OPTIONS = [
   { value: "claude-code", label: "Claude Code" },
   { value: "codex", label: "OpenAI Codex CLI" },
+  { value: "google-adk", label: "Google ADK" },
   { value: "hermes", label: "Hermes" },
   { value: "openclaw", label: "OpenClaw" },
 ];
-const BASE_RUNTIME_TEMPLATE_IDS = new Set(["claude-code-default", "codex", "hermes", "openclaw"]);
+const BASE_RUNTIME_TEMPLATE_IDS = new Set(["claude-code-default", "codex", "google-adk", "hermes", "openclaw"]);
 const DEFAULT_HEADLESS_INSTANCE_TYPE = "t3.medium";
 const DEFAULT_HEADLESS_ROOT_GB = 30;
 const DEFAULT_DISPLAY_INSTANCE_TYPE = "t3.xlarge";
