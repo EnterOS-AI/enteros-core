@@ -67,14 +67,6 @@ func platformManagedLLMModeForWorkspace(c *gin.Context, workspaceID string) bool
 	return strings.EqualFold(res.ResolvedMode, LLMBillingModePlatformManaged)
 }
 
-// platformManagedLLMMode is the legacy org-level gate retained for any test
-// harness still asserting the env-var-only behavior. Production code paths
-// must call platformManagedLLMModeForWorkspace instead so a workspace-level
-// byok override actually takes effect on the secrets-write path.
-func platformManagedLLMMode() bool {
-	return strings.EqualFold(strings.TrimSpace(os.Getenv("MOLECULE_LLM_BILLING_MODE")), "platform_managed")
-}
-
 // rejectPlatformManagedDirectLLMBypassForWorkspace is the per-workspace
 // successor to rejectPlatformManagedDirectLLMBypass (internal#691). The
 // strip-list ONLY applies when this specific workspace resolves to
@@ -87,22 +79,6 @@ func rejectPlatformManagedDirectLLMBypassForWorkspace(c *gin.Context, workspaceI
 		"error":        "direct vendor key writes are blocked for platform-managed workspaces; use MODEL/LLM_PROVIDER or the platform LLM proxy env instead, or set this workspace's billing mode to 'byok' via /admin/workspaces/:id/llm-billing-mode",
 		"key":          key,
 		"workspace_id": workspaceID,
-	})
-	return true
-}
-
-// rejectPlatformManagedDirectLLMBypass is the legacy org-level shim. Retained
-// only for backwards compatibility with any external/test caller still on the
-// old shape; new code MUST use the per-workspace variant above. Production
-// code paths (the secrets.go handlers + workspace.go create-secret path) all
-// switched in internal#691.
-func rejectPlatformManagedDirectLLMBypass(c *gin.Context, key string) bool {
-	if !platformManagedLLMMode() || !isPlatformManagedDirectLLMBypassKey(key) {
-		return false
-	}
-	c.JSON(http.StatusBadRequest, gin.H{
-		"error": "direct Hermes custom provider secrets are blocked for platform-managed LLM workspaces; use MODEL/LLM_PROVIDER or the platform LLM proxy env instead",
-		"key":   key,
 	})
 	return true
 }
@@ -486,9 +462,15 @@ func (h *SecretsHandler) SetGlobal(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
 		return
 	}
-	if rejectPlatformManagedDirectLLMBypass(c, body.Key) {
-		return
-	}
+	// internal#718: the org-level LLM billing rung was retired — billing is
+	// resolved per-workspace, not per-org. A global secret is the tenant's OWN
+	// shared credential; the provision-time provider-matched strip
+	// (workspace_provision) removes any global cred a given workspace's resolved
+	// provider does not accept, so a platform-managed workspace can never USE a
+	// non-matching global vendor/oauth key. The legacy org-env SetGlobal gate
+	// (keyed off the retired MOLECULE_LLM_BILLING_MODE) is therefore removed;
+	// per-workspace writes still enforce the strip-list via
+	// rejectPlatformManagedDirectLLMBypassForWorkspace.
 
 	encrypted, err := crypto.Encrypt([]byte(body.Value))
 	if err != nil {

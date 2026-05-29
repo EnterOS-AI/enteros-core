@@ -979,47 +979,59 @@ func TestSetGlobal_AutoRestartsAffectedWorkspaces(t *testing.T) {
 	}
 }
 
-// TestSetGlobal_RejectsPlatformBypassKeyOnPlatformManagedTenant is the
-// molecule-core#1994 co-mingling GUARD regression. Removing the byok strip is
-// only safe if the platform's own credential is never written into a tenant's
-// global_secrets. SetGlobal is the in-code write boundary: on a tenant whose
-// resolved LLM mode is platform_managed (the metered default), a direct
-// vendor / oauth bypass-list key MUST be rejected (400) and NOT persisted —
-// the tenant is supposed to route through the CP proxy, not carry a direct
-// platform-shaped credential at global scope. This is what keeps a
-// platform-origin token out of global_secrets going forward.
+// TestSetGlobal_AllowsTenantOwnedVendorKeyDespiteLegacyOrgEnv pins the
+// internal#718 correction: the org-level LLM billing rung is RETIRED (billing
+// is resolved per-workspace, not per-org). A global secret is the tenant's OWN
+// shared credential and is always writable at global scope; the provision-time
+// provider-matched strip (workspace_provision) keeps any platform-managed
+// workspace from USING a non-matching global cred, and per-workspace secret
+// writes still enforce the strip-list via the per-workspace guard. So even with
+// the legacy MOLECULE_LLM_BILLING_MODE env still set to platform_managed, a
+// global vendor/oauth key write MUST SUCCEED (200) and persist — the retired
+// org rung no longer gates it.
 //
-// (On a byok/disabled tenant the same write is ALLOWED — that key is the
-// tenant's OWN credential, which the corrected model expects at global scope.
-// TestSetGlobal_AutoRestartsAffectedWorkspaces covers that allowed path.)
-//
-// Mutation: drop the rejectPlatformManagedDirectLLMBypass guard from SetGlobal
-// → the write reaches the INSERT (no 400) → this test RED.
-func TestSetGlobal_RejectsPlatformBypassKeyOnPlatformManagedTenant(t *testing.T) {
-	setupTestDB(t)
-	handler := NewSecretsHandler(nil)
+// Mutation: re-add the org-level rejectPlatformManagedDirectLLMBypass guard to
+// SetGlobal → the write 400s before the INSERT → this test RED.
+func TestSetGlobal_AllowsTenantOwnedVendorKeyDespiteLegacyOrgEnv(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
 
-	// Org/tenant default is platform_managed — the metered path. A direct
-	// vendor key write into global_secrets must be refused here.
+	restarted := make(chan string, 2)
+	handler := NewSecretsHandler(func(id string) { restarted <- id })
+
+	// Legacy org env still platform_managed — it must no longer gate the write.
 	t.Setenv("MOLECULE_LLM_BILLING_MODE", LLMBillingModePlatformManaged)
+
+	mock.ExpectExec("INSERT INTO global_secrets").
+		WithArgs("CLAUDE_CODE_OAUTH_TOKEN", sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery("SELECT id FROM workspaces").
+		WithArgs("CLAUDE_CODE_OAUTH_TOKEN").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("ws-a"))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
-	body := `{"key":"CLAUDE_CODE_OAUTH_TOKEN","value":"sk-ant-oat01-platform-shaped"}`
+	body := `{"key":"CLAUDE_CODE_OAUTH_TOKEN","value":"sk-ant-oat01-tenant-own"}`
 	c.Request = httptest.NewRequest("POST", "/admin/secrets", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
 	handler.SetGlobal(c)
 
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 (bypass-list key rejected for platform_managed tenant), got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 (global write allowed; org rung retired), got %d: %s", w.Code, w.Body.String())
 	}
-	if !strings.Contains(w.Body.String(), "blocked") {
-		t.Errorf("response should explain the block; got %s", w.Body.String())
+	// Wait on the async restart fan-out so its SELECT drains before db swap.
+	select {
+	case id := <-restarted:
+		if id != "ws-a" {
+			t.Errorf("expected ws-a restarted, got %s", id)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("auto-restart not fired for affected workspace")
 	}
-	// No INSERT was expected on the mock — sqlmock would error on an
-	// unexpected ExecContext, so reaching here with a 400 proves the write
-	// was refused before the DB.
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
 }
 
 // TestDeleteGlobal_AutoRestartsAffectedWorkspaces covers the delete branch of #15.
