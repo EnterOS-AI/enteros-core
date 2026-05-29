@@ -67,8 +67,10 @@ func TestApplyPlatformManagedLLMEnv_ReProvisionUsesStoredModel(t *testing.T) {
 		"CLAUDE_CODE_OAUTH_TOKEN": "RENO-OWN-OAUTH", // workspace_secrets origin
 		"ANTHROPIC_BASE_URL":      "https://api.moleculesai.app/api/v1/internal/llm/anthropic",
 	}
-	// payload.Model == "" — exactly the re-provision shape.
-	res := applyPlatformManagedLLMEnv(ctx, envVars, wsID, "claude-code", "")
+	// payload.Model == "" — exactly the re-provision shape. The oauth is
+	// workspace_secrets-origin (NOT in globalKeys) → exempt from the #728
+	// provider-matched strip regardless of provider match.
+	res := applyPlatformManagedLLMEnv(ctx, envVars, wsID, "claude-code", "", nil)
 
 	if res.ResolvedMode != LLMBillingModeBYOK {
 		t.Fatalf("re-provision with stored MODEL=opus must resolve byok, got %q (source=%s) — the #1994 divergence", res.ResolvedMode, res.Source)
@@ -149,7 +151,7 @@ func TestApplyPlatformManagedLLMEnv_ReadProvisionParity(t *testing.T) {
 		"MODEL":                   "opus",
 		"CLAUDE_CODE_OAUTH_TOKEN": "RENO-OWN-OAUTH",
 	}
-	provRes := applyPlatformManagedLLMEnv(ctx, provEnv, wsID, "claude-code", "")
+	provRes := applyPlatformManagedLLMEnv(ctx, provEnv, wsID, "claude-code", "", nil)
 	if err := provMock.ExpectationsWereMet(); err != nil {
 		t.Errorf("provision-path sqlmock expectations: %v", err)
 	}
@@ -179,7 +181,7 @@ func TestApplyPlatformManagedLLMEnv_DefaultPreservation(t *testing.T) {
 
 	// No MODEL anywhere, no auth env — nothing to derive.
 	envVars := map[string]string{}
-	res := applyPlatformManagedLLMEnv(ctx, envVars, wsID, "claude-code", "")
+	res := applyPlatformManagedLLMEnv(ctx, envVars, wsID, "claude-code", "", nil)
 
 	if res.ResolvedMode != LLMBillingModePlatformManaged {
 		t.Fatalf("no model + no cred must default platform_managed (CTO: default stays platform), got %q (source=%s)", res.ResolvedMode, res.Source)
@@ -219,8 +221,13 @@ func TestApplyPlatformManagedLLMEnv_ByokGlobalScopeOAuthSurvives(t *testing.T) {
 		"MODEL":                   "opus",
 		"CLAUDE_CODE_OAUTH_TOKEN": "TENANT-OWN-GLOBAL-OAUTH",
 	}
+	// Provenance: the oauth is GLOBAL-origin (internal#728). It must STILL
+	// survive — opus derives anthropic-oauth, whose auth_env IS
+	// CLAUDE_CODE_OAUTH_TOKEN, so the provider-matched strip keeps it. This is
+	// the PM/reno opus-byok regression guard against #728's strip.
+	globalKeys := map[string]struct{}{"CLAUDE_CODE_OAUTH_TOKEN": {}}
 
-	res := applyPlatformManagedLLMEnv(ctx, envVars, wsID, "claude-code", "")
+	res := applyPlatformManagedLLMEnv(ctx, envVars, wsID, "claude-code", "", globalKeys)
 
 	if res.ResolvedMode != LLMBillingModeBYOK {
 		t.Fatalf("opus derives byok; got %q", res.ResolvedMode)
@@ -253,5 +260,115 @@ func TestReProvisionPayloadOmitsModel(t *testing.T) {
 	p := models.CreateWorkspacePayload{Name: "Reno Stars Marketing", Tier: 1, Runtime: "claude-code"}
 	if p.Model != "" {
 		t.Fatalf("re-provision payload model expected empty (the #1994 trigger), got %q", p.Model)
+	}
+}
+
+// --- internal#728 Bug 1: provider-matched credential injection ---------------
+
+// TestApplyPlatformManagedLLMEnv_MinimaxStripsStrayGlobalOAuth is the direct
+// repro of DevB (Dev Engineer B, MiniMax-M2.7, claude-code; live-confirmed
+// 2026-05-28). config.yaml correctly resolves provider=minimax, but the
+// container inherits the tenant-GLOBAL CLAUDE_CODE_OAUTH_TOKEN; the claude-code
+// runtime greedily prefers it (`llm-auth: detected oauth`) and routes
+// MiniMax-M2.7 → api.anthropic.com → `Claude Code returned an error result`.
+//
+// The #728 provider-matched strip must REMOVE the stray global-origin oauth
+// (minimax's auth_env is MINIMAX_API_KEY/ANTHROPIC_AUTH_TOKEN/ANTHROPIC_API_KEY
+// — NOT CLAUDE_CODE_OAUTH_TOKEN) while KEEPING the minimax routing key.
+//
+// Mutation (load-bearing): remove the stripNonMatchingGlobalOriginLLMCreds
+// call (revert to #1994's blanket keep) → the oauth survives → this test RED on
+// the oauth-absent assertion. Make the strip provider-UNAWARE (strip all
+// global bypass keys) → MINIMAX_API_KEY also vanishes → RED on the
+// minimax-routing assertion. Make it provenance-UNAWARE (strip by name
+// regardless of origin) → the workspace-origin exemption test below goes RED.
+func TestApplyPlatformManagedLLMEnv_MinimaxStripsStrayGlobalOAuth(t *testing.T) {
+	ctx := context.Background()
+	const wsID = "22222222-3333-4444-5555-666666666666" // agents-team Dev Engineer B
+
+	mock := setupTestDB(t)
+	expectOverrideQuery(mock, wsID, "")
+
+	// The container env on a re-provision: the MiniMax routing key + the stray
+	// tenant-global oauth (both global_secrets origin) + the stored model.
+	envVars := map[string]string{
+		"MODEL":                   "MiniMax-M2.7",
+		"MINIMAX_API_KEY":         "MINIMAX-TENANT-KEY",
+		"CLAUDE_CODE_OAUTH_TOKEN": "STRAY-TENANT-GLOBAL-OAUTH",
+	}
+	// Both creds are global_secrets origin (the tenant configured them at org
+	// scope; no per-workspace override re-set them).
+	globalKeys := map[string]struct{}{
+		"MINIMAX_API_KEY":         {},
+		"CLAUDE_CODE_OAUTH_TOKEN": {},
+	}
+
+	res := applyPlatformManagedLLMEnv(ctx, envVars, wsID, "claude-code", "", globalKeys)
+
+	if res.ResolvedMode != LLMBillingModeBYOK {
+		t.Fatalf("MiniMax-M2.7 must derive minimax → byok, got %q (source=%s)", res.ResolvedMode, res.Source)
+	}
+	if res.Source != BillingModeSourceDerivedProvider {
+		t.Errorf("source: got %q want derived_provider (MiniMax-M2.7 → minimax)", res.Source)
+	}
+	// THE FIX: the stray global oauth that does NOT match minimax's auth_env
+	// must be gone, so the runtime cannot prefer it and mis-route to Anthropic.
+	if v, present := envVars["CLAUDE_CODE_OAUTH_TOKEN"]; present {
+		t.Errorf("stray global-origin CLAUDE_CODE_OAUTH_TOKEN must be STRIPPED for a minimax-resolving workspace (the DevB bug); still present=%q", v)
+	}
+	// The minimax routing key (IS in minimax's auth_env) must remain.
+	if envVars["MINIMAX_API_KEY"] != "MINIMAX-TENANT-KEY" {
+		t.Errorf("minimax routing key must SURVIVE (it matches the resolved provider's auth_env); got %q", envVars["MINIMAX_API_KEY"])
+	}
+	if !res.HasUsableLLMCred {
+		t.Errorf("MINIMAX_API_KEY is a usable credential → HasUsableLLMCred must stay true (not failed-closed)")
+	}
+	if _, present := envVars["MOLECULE_LLM_USAGE_TOKEN"]; present {
+		t.Errorf("byok must not inject the platform usage token")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations: %v", err)
+	}
+}
+
+// TestApplyPlatformManagedLLMEnv_WorkspaceOriginCredExemptFromStrip pins the
+// provenance guard: a CLAUDE_CODE_OAUTH_TOKEN the USER set via the canvas
+// Secrets tab (workspace_secrets origin → NOT in globalKeys) must NEVER be
+// stripped, even on a minimax-resolving workspace where it doesn't match the
+// derived provider's auth_env. The user authored it deliberately; the #728
+// strip is scoped to the inherited operator-store channel only.
+//
+// Mutation: drop the `if _, isBypass...; continue` / globalKeys gate (strip by
+// name regardless of origin) → the user's oauth vanishes → RED.
+func TestApplyPlatformManagedLLMEnv_WorkspaceOriginCredExemptFromStrip(t *testing.T) {
+	ctx := context.Background()
+	const wsID = "33333333-4444-5555-6666-777777777777"
+
+	mock := setupTestDB(t)
+	expectOverrideQuery(mock, wsID, "")
+
+	envVars := map[string]string{
+		"MODEL":                   "MiniMax-M2.7",
+		"MINIMAX_API_KEY":         "MINIMAX-TENANT-KEY",
+		"CLAUDE_CODE_OAUTH_TOKEN": "USER-AUTHORED-OAUTH",
+	}
+	// MINIMAX_API_KEY is global-origin; the oauth is WORKSPACE-origin (the user
+	// re-set it via the Secrets tab, so loadWorkspaceSecrets cleared its
+	// global-origin flag) → exempt.
+	globalKeys := map[string]struct{}{"MINIMAX_API_KEY": {}}
+
+	res := applyPlatformManagedLLMEnv(ctx, envVars, wsID, "claude-code", "", globalKeys)
+
+	if res.ResolvedMode != LLMBillingModeBYOK {
+		t.Fatalf("MiniMax-M2.7 derives byok; got %q", res.ResolvedMode)
+	}
+	if envVars["CLAUDE_CODE_OAUTH_TOKEN"] != "USER-AUTHORED-OAUTH" {
+		t.Errorf("workspace-origin (user-authored) oauth must NOT be stripped even when it doesn't match the provider; got %q", envVars["CLAUDE_CODE_OAUTH_TOKEN"])
+	}
+	if envVars["MINIMAX_API_KEY"] != "MINIMAX-TENANT-KEY" {
+		t.Errorf("matching minimax key must survive; got %q", envVars["MINIMAX_API_KEY"])
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations: %v", err)
 	}
 }

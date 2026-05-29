@@ -968,7 +968,7 @@ func TestApplyPlatformManagedLLMEnv_NonClaudeRuntimeDefaultsOpenAIProxyWhenNoWor
 	t.Setenv("MOLECULE_LLM_DEFAULT_MODEL", "moonshot/kimi-k2.6")
 
 	envVars := map[string]string{}
-	applyPlatformManagedLLMEnv(context.Background(), envVars, "", "codex", "")
+	applyPlatformManagedLLMEnv(context.Background(), envVars, "", "codex", "", nil)
 	applyRuntimeModelEnv(envVars, "codex", "")
 
 	if got := envVars["OPENAI_BASE_URL"]; got != "https://api.example.test/api/v1/internal/llm/openai/v1" {
@@ -998,7 +998,7 @@ func TestApplyPlatformManagedLLMEnv_StripsWorkspaceOpenAIKeyForClaudeCode(t *tes
 		"OPENAI_BASE_URL": "https://api.openai.com/v1",
 		"MODEL":           "openai/gpt-5.5",
 	}
-	applyPlatformManagedLLMEnv(context.Background(), envVars, "", "claude-code", "")
+	applyPlatformManagedLLMEnv(context.Background(), envVars, "", "claude-code", "", nil)
 
 	if _, ok := envVars["OPENAI_API_KEY"]; ok {
 		t.Fatalf("OPENAI_API_KEY should be stripped for claude-code platform-managed mode")
@@ -1024,7 +1024,7 @@ func TestApplyPlatformManagedLLMEnv_ClaudeCodeUsesAnthropicProxyOverOAuth(t *tes
 		"CLAUDE_CODE_OAUTH_TOKEN": "user-oauth-token",
 		"MODEL":                   "sonnet",
 	}
-	applyPlatformManagedLLMEnv(context.Background(), envVars, "", "claude-code", "")
+	applyPlatformManagedLLMEnv(context.Background(), envVars, "", "claude-code", "", nil)
 
 	if _, ok := envVars["CLAUDE_CODE_OAUTH_TOKEN"]; ok {
 		t.Fatalf("CLAUDE_CODE_OAUTH_TOKEN should be stripped in platform-managed mode")
@@ -1047,7 +1047,7 @@ func TestApplyPlatformManagedLLMEnv_ClaudeCodeInjectsAnthropicProxyWhenNoWorkspa
 	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
 
 	envVars := map[string]string{}
-	applyPlatformManagedLLMEnv(context.Background(), envVars, "", "claude-code", "minimax/MiniMax-M2.7")
+	applyPlatformManagedLLMEnv(context.Background(), envVars, "", "claude-code", "minimax/MiniMax-M2.7", nil)
 
 	if got := envVars["ANTHROPIC_BASE_URL"]; got != "https://api.example.test/api/v1/internal/llm/anthropic/v1" {
 		t.Fatalf("ANTHROPIC_BASE_URL = %q", got)
@@ -1070,7 +1070,7 @@ func TestApplyPlatformManagedLLMEnv_ClaudeCodeStripsVendorBYOK(t *testing.T) {
 		"MINIMAX_API_KEY": "user-minimax-key",
 		"MODEL":           "MiniMax-M2.7",
 	}
-	applyPlatformManagedLLMEnv(context.Background(), envVars, "", "claude-code", "")
+	applyPlatformManagedLLMEnv(context.Background(), envVars, "", "claude-code", "", nil)
 
 	if _, ok := envVars["MINIMAX_API_KEY"]; ok {
 		t.Fatalf("MINIMAX_API_KEY should be stripped in platform-managed mode")
@@ -1104,7 +1104,7 @@ func TestApplyPlatformManagedLLMEnv_NoopsOutsidePlatformManaged(t *testing.T) {
 	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
 
 	envVars := map[string]string{}
-	res := applyPlatformManagedLLMEnv(context.Background(), envVars, wsID, "claude-code", "kimi-for-coding")
+	res := applyPlatformManagedLLMEnv(context.Background(), envVars, wsID, "claude-code", "kimi-for-coding", nil)
 
 	if res.ResolvedMode != LLMBillingModeBYOK {
 		t.Fatalf("resolved mode = %q, want byok (derived from non-platform model)", res.ResolvedMode)
@@ -1151,7 +1151,7 @@ func TestApplyPlatformManagedLLMEnv_ClaudeCodeByokKeepsOwnProviderEnv(t *testing
 		"CLAUDE_CODE_OAUTH_TOKEN": "user-oauth-token",
 		"MODEL":                   "sonnet",
 	}
-	applyPlatformManagedLLMEnv(context.Background(), envVars, wsID, "claude-code", "")
+	applyPlatformManagedLLMEnv(context.Background(), envVars, wsID, "claude-code", "", nil)
 
 	// 1. OAuth token intact — not stripped.
 	if got := envVars["CLAUDE_CODE_OAUTH_TOKEN"]; got != "user-oauth-token" {
@@ -1213,7 +1213,7 @@ func TestApplyPlatformManagedLLMEnv_ByokGlobalScopeOAuthSurvivesAndRunsDirect(t 
 		"MODEL":                   "opus",
 	}
 
-	res := applyPlatformManagedLLMEnv(context.Background(), envVars, wsID, "claude-code", "")
+	res := applyPlatformManagedLLMEnv(context.Background(), envVars, wsID, "claude-code", "", nil)
 
 	// 1. The tenant's own global-scope oauth SURVIVES — byok runs on it.
 	if envVars["CLAUDE_CODE_OAUTH_TOKEN"] != "TENANT-OWN-GLOBAL-OAUTH" {
@@ -1266,7 +1266,7 @@ func TestApplyPlatformManagedLLMEnv_DERIVED_PlatformModelKeepsPlatformCreds(t *t
 	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
 
 	envVars := map[string]string{}
-	res := applyPlatformManagedLLMEnv(context.Background(), envVars, wsID, "claude-code", "anthropic/claude-opus-4-7")
+	res := applyPlatformManagedLLMEnv(context.Background(), envVars, wsID, "claude-code", "anthropic/claude-opus-4-7", nil)
 
 	if res.ResolvedMode != LLMBillingModePlatformManaged {
 		t.Fatalf("platform-derived model must resolve platform_managed, got %q (source=%s)", res.ResolvedMode, res.Source)
@@ -1308,7 +1308,7 @@ func TestApplyPlatformManagedLLMEnv_DERIVED_ByokNoCredentialFailsClosed(t *testi
 	// No LLM credential at all — neither global nor workspace scope.
 	envVars := map[string]string{}
 
-	res := applyPlatformManagedLLMEnv(context.Background(), envVars, wsID, "claude-code", "kimi-for-coding")
+	res := applyPlatformManagedLLMEnv(context.Background(), envVars, wsID, "claude-code", "kimi-for-coding", nil)
 
 	// 1. DERIVED byok (NOT the old platform_managed default).
 	if res.ResolvedMode != LLMBillingModeBYOK {
@@ -1346,7 +1346,7 @@ func TestApplyPlatformManagedLLMEnv_DERIVED_UnsetModelPlatformDefault(t *testing
 	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
 
 	envVars := map[string]string{}
-	res := applyPlatformManagedLLMEnv(context.Background(), envVars, wsID, "claude-code", "")
+	res := applyPlatformManagedLLMEnv(context.Background(), envVars, wsID, "claude-code", "", nil)
 
 	if res.ResolvedMode != LLMBillingModePlatformManaged {
 		t.Fatalf("unset model must default platform_managed, got %q (source=%s)", res.ResolvedMode, res.Source)
@@ -1385,7 +1385,7 @@ func TestApplyPlatformManagedLLMEnv_ByokKeepsWorkspaceOwnOAuth(t *testing.T) {
 		"MODEL":                   "opus",
 	}
 
-	res := applyPlatformManagedLLMEnv(context.Background(), envVars, wsID, "claude-code", "")
+	res := applyPlatformManagedLLMEnv(context.Background(), envVars, wsID, "claude-code", "", nil)
 
 	if got := envVars["CLAUDE_CODE_OAUTH_TOKEN"]; got != "CUSTOMER-OWN-OAUTH-TOKEN" {
 		t.Fatalf("CLAUDE_CODE_OAUTH_TOKEN = %q, want the workspace's own token left intact", got)
@@ -1425,7 +1425,7 @@ func TestApplyPlatformManagedLLMEnv_DisabledKeepsTenantGlobalNoProxy(t *testing.
 		"CLAUDE_CODE_OAUTH_TOKEN": "TENANT-OWN-GLOBAL-OAUTH",
 	}
 
-	res := applyPlatformManagedLLMEnv(context.Background(), envVars, wsID, "claude-code", "")
+	res := applyPlatformManagedLLMEnv(context.Background(), envVars, wsID, "claude-code", "", nil)
 
 	// The tenant's own global cred survives (not stripped).
 	if envVars["CLAUDE_CODE_OAUTH_TOKEN"] != "TENANT-OWN-GLOBAL-OAUTH" {
@@ -1466,7 +1466,7 @@ func TestApplyPlatformManagedLLMEnv_PlatformManagedStillReceivesGlobalCreds(t *t
 		"MODEL":                   "opus",
 	}
 
-	res := applyPlatformManagedLLMEnv(context.Background(), envVars, wsID, "claude-code", "")
+	res := applyPlatformManagedLLMEnv(context.Background(), envVars, wsID, "claude-code", "", nil)
 
 	// Platform-managed routes through the CP proxy: OAuth stripped, proxy creds forced.
 	if _, ok := envVars["CLAUDE_CODE_OAUTH_TOKEN"]; ok {
@@ -1507,7 +1507,7 @@ func TestApplyPlatformManagedLLMEnv_PlatformManagedStillEmitsResolvedMode(t *tes
 		"CLAUDE_CODE_OAUTH_TOKEN": "user-oauth-token",
 		"MODEL":                   "sonnet",
 	}
-	applyPlatformManagedLLMEnv(context.Background(), envVars, wsID, "claude-code", "")
+	applyPlatformManagedLLMEnv(context.Background(), envVars, wsID, "claude-code", "", nil)
 
 	// OAuth stripped, proxy forced — unchanged platform_managed contract.
 	if _, ok := envVars["CLAUDE_CODE_OAUTH_TOKEN"]; ok {

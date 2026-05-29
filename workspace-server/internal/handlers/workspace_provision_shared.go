@@ -195,9 +195,16 @@ func (h *WorkspaceHandler) prepareProvisionContext(
 	applyAgentGitHTTPCreds(envVars, payload.Role)
 	// molecule-core#1994: per-workspace LLM billing-mode resolution + env wiring.
 	// On platform_managed it forces the CP proxy usage token; on byok/disabled
-	// it leaves the tenant's own creds (global OR workspace scope) untouched and
-	// reports whether a usable LLM credential is present.
-	llmRes := applyPlatformManagedLLMEnv(ctx, envVars, workspaceID, payload.Runtime, payload.Model)
+	// it keeps the tenant's own provider-MATCHING creds (global OR workspace
+	// scope) and reports whether a usable LLM credential is present.
+	//
+	// internal#728 Bug 1: globalSecretKeys (loadWorkspaceSecrets provenance)
+	// lets the byok branch strip ONLY operator-store-origin LLM creds that do
+	// NOT match the resolved provider's auth_env — so a non-anthropic-oauth
+	// claude-code workspace no longer inherits the stray tenant-global
+	// CLAUDE_CODE_OAUTH_TOKEN the runtime would greedily prefer. User-authored
+	// workspace_secrets (provenance flag cleared) are exempt.
+	llmRes := applyPlatformManagedLLMEnv(ctx, envVars, workspaceID, payload.Runtime, payload.Model, globalSecretKeys)
 	// Fail closed for a BYOK workspace with no usable LLM credential at ANY
 	// scope: do NOT start it credential-less. Mirror the "model+provider+
 	// credential REQUIRED at create" spirit with an actionable error surfaced
