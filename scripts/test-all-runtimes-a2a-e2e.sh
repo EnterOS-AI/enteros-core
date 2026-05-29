@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# E2E test: A2A round-trip parity across all four runtimes.
+# E2E test: A2A round-trip parity across all five runtimes.
 #
-# Validates that for each of {claude-code, hermes, codex, openclaw}:
+# Validates that for each of {claude-code, hermes, codex, openclaw, google-adk}:
 #   1. A workspace can be provisioned + brought online
 #   2. The adapter responds to A2A message/send
 #   3. The reply contains expected content (echo of the prompt)
 #   4. A SECOND message preserves session state where the runtime
-#      supports it (currently: hermes via plugin path)
+#      supports it (currently: hermes via plugin path; google-adk via
+#      ADK InMemorySessionService keyed on A2A context_id)
 #
 # Targets a SaaS tenant subdomain. Provisions workspaces in the calling
 # tenant, runs the round-trip, deletes them on success.
@@ -16,6 +17,10 @@
 #       (e.g. https://demo-tenant.staging.moleculesai.app)
 #   - $OPENROUTER_API_KEY (or $HERMES_API_KEY) for non-claude runtimes
 #   - $OPENAI_API_KEY for claude-code peer
+#   - $GOOGLE_API_KEY (AI Studio) for google-adk — the org disallows API
+#       keys in PROD (Vertex+ADC there), but CI auths Gemini with an
+#       AI-Studio key (config model google_genai:gemini-2.5-pro). Vertex
+#       stays supported; this is the keyed CI path only.
 #   - SaaS edge requires Origin header — see auto-memory
 #       reference_saas_waf_origin_header.md
 #
@@ -24,12 +29,13 @@
 #       ./scripts/test-all-runtimes-a2a-e2e.sh
 #
 # Skip individual runtimes:
-#   SKIP_HERMES=1 SKIP_OPENCLAW=1 ./scripts/test-all-runtimes-a2a-e2e.sh
+#   SKIP_HERMES=1 SKIP_OPENCLAW=1 SKIP_GOOGLE_ADK=1 ./scripts/test-all-runtimes-a2a-e2e.sh
 set -euo pipefail
 
 PLATFORM="${PLATFORM:-${1:-http://localhost:8080}}"
 HERMES_PROVIDER_KEY="${OPENROUTER_API_KEY:-${HERMES_API_KEY:-}}"
 PEER_OPENAI_KEY="${OPENAI_API_KEY:-}"
+GOOGLE_ADK_KEY="${GOOGLE_API_KEY:-}"
 # SaaS auth chain — TENANT_ADMIN_TOKEN + TENANT_ORG_ID required when
 # hitting *.moleculesai.app (per-tenant ADMIN_TOKEN, NOT
 # CP_ADMIN_API_TOKEN). Optional for localhost.
@@ -46,6 +52,10 @@ esac
 
 if [ -z "$HERMES_PROVIDER_KEY" ] && [ -z "${SKIP_HERMES:-}${SKIP_CODEX:-}${SKIP_OPENCLAW:-}" ]; then
   echo "FAIL: set OPENROUTER_API_KEY or HERMES_API_KEY for non-claude runtimes"
+  exit 2
+fi
+if [ -z "$GOOGLE_ADK_KEY" ] && [ -z "${SKIP_GOOGLE_ADK:-}" ]; then
+  echo "FAIL: set GOOGLE_API_KEY (AI Studio) for google-adk, or SKIP_GOOGLE_ADK=1"
   exit 2
 fi
 
@@ -143,7 +153,7 @@ echo "=========================================="
 echo ""
 
 # -------------------------------------------------------
-# 1. Provision the four runtimes (skip via SKIP_* flags)
+# 1. Provision the five runtimes (skip via SKIP_* flags)
 # -------------------------------------------------------
 echo "--- 1. Provision workspaces ---"
 if [ -z "${SKIP_CLAUDE_CODE:-}" ]; then
@@ -162,6 +172,10 @@ if [ -z "${SKIP_OPENCLAW:-}" ]; then
   WS_IDS[openclaw]=$(provision "ParityOpenClaw" "openclaw" "openclaw peer")
   echo "  openclaw:    ${WS_IDS[openclaw]}"
 fi
+if [ -z "${SKIP_GOOGLE_ADK:-}" ]; then
+  WS_IDS[google-adk]=$(provision "ParityGoogleADK" "google-adk" "google-adk peer")
+  echo "  google-adk:  ${WS_IDS[google-adk]}"
+fi
 
 # -------------------------------------------------------
 # 2. Set provider keys
@@ -176,6 +190,12 @@ done
 if [ -n "${WS_IDS[claude-code]:-}" ] && [ -n "$PEER_OPENAI_KEY" ]; then
   set_secret "${WS_IDS[claude-code]}" "OPENAI_API_KEY" "$PEER_OPENAI_KEY"
   echo "  claude-code: OPENAI_API_KEY set"
+fi
+if [ -n "${WS_IDS[google-adk]:-}" ] && [ -n "$GOOGLE_ADK_KEY" ]; then
+  # AI-Studio path: the adapter reads GOOGLE_API_KEY natively when the
+  # config model is google_genai:gemini-2.5-pro (see _routing.resolve_model).
+  set_secret "${WS_IDS[google-adk]}" "GOOGLE_API_KEY" "$GOOGLE_ADK_KEY"
+  echo "  google-adk:  GOOGLE_API_KEY set"
 fi
 
 # -------------------------------------------------------
@@ -200,7 +220,7 @@ done
 # -------------------------------------------------------
 echo ""
 echo "--- 4. A2A round-trip (first message) ---"
-for runtime in claude-code hermes codex openclaw; do
+for runtime in claude-code hermes codex openclaw google-adk; do
   id="${WS_IDS[$runtime]:-}"
   [ -z "$id" ] && continue
   reply=$(a2a_send "$id" "Reply with just the word OK so we know you got this.")
@@ -213,7 +233,7 @@ done
 # -------------------------------------------------------
 echo ""
 echo "--- 5. Session continuity (second message recalls first) ---"
-for runtime in claude-code hermes codex openclaw; do
+for runtime in claude-code hermes codex openclaw google-adk; do
   id="${WS_IDS[$runtime]:-}"
   [ -z "$id" ] && continue
   # Set up: tell the agent a name.
