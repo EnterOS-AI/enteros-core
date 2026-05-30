@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/DATA-DOG/go-sqlmock"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
+	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/gin-gonic/gin"
 )
 
@@ -33,6 +33,23 @@ func TestValidateWorkspaceCompute_RejectsUnknownInstanceType(t *testing.T) {
 
 	if err := validateWorkspaceCompute(compute); err == nil {
 		t.Fatal("validateWorkspaceCompute accepted unsupported instance type")
+	}
+}
+
+// internal#734: data_persistence enum. "" (auto), "persist", "ephemeral" are
+// the only accepted values; anything else is a clear 400 before the CP call.
+func TestValidateWorkspaceCompute_DataPersistence(t *testing.T) {
+	for _, ok := range []string{"", "persist", "ephemeral"} {
+		c := models.WorkspaceCompute{DataPersistence: ok}
+		if err := validateWorkspaceCompute(c); err != nil {
+			t.Errorf("data_persistence=%q must be accepted: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"persistent", "off", "none", "Ephemeral", "true"} {
+		c := models.WorkspaceCompute{DataPersistence: bad}
+		if err := validateWorkspaceCompute(c); err == nil {
+			t.Errorf("data_persistence=%q must be rejected", bad)
+		}
 	}
 }
 

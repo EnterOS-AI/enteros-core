@@ -45,7 +45,7 @@ func TestStopWorkspaceForDelete_CPRetriesTransientThenSucceeds(t *testing.T) {
 	}}
 	h := &WorkspaceHandler{cpProv: stub}
 
-	err := h.stopWorkspaceForDelete(context.Background(), "ws-del-1")
+	err := h.stopWorkspaceForDelete(context.Background(), "ws-del-1", false)
 	if err != nil {
 		t.Fatalf("expected nil error on eventual success, got %v", err)
 	}
@@ -73,7 +73,7 @@ func TestStopWorkspaceForDelete_CPExhaustsEmitsDurableEventAndReturnsError(t *te
 	mock.ExpectExec("INSERT INTO structure_events").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	err := h.stopWorkspaceForDelete(context.Background(), "ws-doomed")
+	err := h.stopWorkspaceForDelete(context.Background(), "ws-doomed", false)
 	if err == nil {
 		t.Fatal("expected terminal error on retry exhaustion, got nil")
 	}
@@ -96,7 +96,7 @@ func TestStopWorkspaceForDelete_CPExhaustsEmitsDurableEventAndReturnsError(t *te
 
 func TestStopWorkspaceForDelete_NoBackendIsNoOp(t *testing.T) {
 	h := &WorkspaceHandler{} // cpProv nil, provisioner nil
-	if err := h.stopWorkspaceForDelete(context.Background(), "ws-x"); err != nil {
+	if err := h.stopWorkspaceForDelete(context.Background(), "ws-x", false); err != nil {
 		t.Errorf("expected nil no-op with no backend, got %v", err)
 	}
 }

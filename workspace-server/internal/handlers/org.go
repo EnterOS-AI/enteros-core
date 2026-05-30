@@ -875,7 +875,9 @@ func (h *OrgHandler) Import(c *gin.Context) {
 				rows.Close()
 
 				for _, oid := range orphanIDs {
-					descendantIDs, stopErrs, err := h.workspace.CascadeDelete(ctx, oid)
+					// erase=false: a reconcile is not a user-requested erase —
+					// never prune data volumes on the import-reconcile path (internal#734).
+					descendantIDs, stopErrs, err := h.workspace.CascadeDelete(ctx, oid, false)
 					if err != nil {
 						log.Printf("Org import reconcile: CascadeDelete(%s) failed: %v", oid, err)
 						reconcileErrs = append(reconcileErrs, fmt.Sprintf("delete %s: %v", oid, err))

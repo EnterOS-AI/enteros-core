@@ -368,6 +368,9 @@ export interface WorkspaceCompute {
     width?: number;
     height?: number;
   };
+  // internal#734: per-workspace durable-data choice. "persist" | "ephemeral" |
+  // undefined (auto). Controls whether the data volume survives recreate.
+  data_persistence?: string;
 }
 
 let socket: ReconnectingSocket | null = null;
