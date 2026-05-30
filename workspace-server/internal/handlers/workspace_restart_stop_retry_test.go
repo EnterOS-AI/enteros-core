@@ -72,6 +72,13 @@ func (s *scriptedCPStop) Stop(ctx context.Context, _ string) error {
 	}
 	return nil
 }
+
+// StopAndPrune delegates to Stop so the retry/error scripting is identical —
+// the prune flag only changes the URL the real provisioner builds, not the
+// retry behavior these tests exercise.
+func (s *scriptedCPStop) StopAndPrune(ctx context.Context, id string) error {
+	return s.Stop(ctx, id)
+}
 func (s *scriptedCPStop) Start(_ context.Context, _ provisioner.WorkspaceConfig) (string, error) {
 	return "", nil
 }

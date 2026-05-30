@@ -521,7 +521,7 @@ func TestValidateWorkspaceDir_Empty(t *testing.T) {
 
 func TestCascadeDelete_InvalidUUID(t *testing.T) {
 	h := &WorkspaceHandler{}
-	descendants, stopErrs, err := h.CascadeDelete(context.Background(), "not-a-uuid")
+	descendants, stopErrs, err := h.CascadeDelete(context.Background(), "not-a-uuid", false)
 	if err == nil {
 		t.Error("expected error for invalid UUID")
 	}
@@ -542,7 +542,7 @@ func TestCascadeDelete_DescendantQueryError(t *testing.T) {
 		WithArgs(wsID).
 		WillReturnError(sql.ErrConnDone)
 
-	deleted, stopErrs, err := h.CascadeDelete(context.Background(), wsID)
+	deleted, stopErrs, err := h.CascadeDelete(context.Background(), wsID, false)
 	if err == nil {
 		t.Error("CascadeDelete returned nil error; want descendant query error")
 	}
@@ -569,7 +569,7 @@ func TestCascadeDelete_DescendantRowsError(t *testing.T) {
 		WithArgs(wsID).
 		WillReturnRows(rows)
 
-	deleted, stopErrs, err := h.CascadeDelete(context.Background(), wsID)
+	deleted, stopErrs, err := h.CascadeDelete(context.Background(), wsID, false)
 	if err == nil {
 		t.Fatal("CascadeDelete returned nil error; want descendant rows error")
 	}

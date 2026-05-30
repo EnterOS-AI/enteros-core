@@ -32,6 +32,9 @@ import (
 type CPProvisionerAPI interface {
 	Start(ctx context.Context, cfg WorkspaceConfig) (string, error)
 	Stop(ctx context.Context, workspaceID string) error
+	// StopAndPrune is Stop + "erase the durable data volume" (internal#734),
+	// for the permanent-delete-with-erase flow ONLY. Restart/recreate use Stop.
+	StopAndPrune(ctx context.Context, workspaceID string) error
 	GetConsoleOutput(ctx context.Context, workspaceID string) (string, error)
 	// IsRunning reports whether the workspace's compute (EC2 instance) is
 	// currently in the running state. Surfaced on the interface (rather than
@@ -403,6 +406,20 @@ func collectCPConfigFiles(cfg WorkspaceConfig) (map[string]string, error) {
 // blocking the next provision with InvalidGroup.Duplicate — a full
 // "Save & Restart" crash on SaaS.
 func (p *CPProvisioner) Stop(ctx context.Context, workspaceID string) error {
+	return p.stopInternal(ctx, workspaceID, false)
+}
+
+// StopAndPrune terminates the workspace's compute AND requests that its durable
+// data volume (browser profile / cookies / downloads / agent memory) be erased
+// (internal#734). Used ONLY by the permanent-delete flow when the user chose to
+// erase saved data — NEVER by restart/recreate (which call Stop), so a recreate
+// can never trigger a prune. CP enforces this defensively too (the prune is a
+// short-grace mark-then-sweep gated on the workspace being genuinely gone).
+func (p *CPProvisioner) StopAndPrune(ctx context.Context, workspaceID string) error {
+	return p.stopInternal(ctx, workspaceID, true)
+}
+
+func (p *CPProvisioner) stopInternal(ctx context.Context, workspaceID string, prune bool) error {
 	if p == nil {
 		return ErrNoBackend
 	}
@@ -425,6 +442,10 @@ func (p *CPProvisioner) Stop(ctx context.Context, workspaceID string) error {
 		return ErrNoBackend
 	}
 	url := fmt.Sprintf("%s/cp/workspaces/%s?instance_id=%s", p.baseURL, workspaceID, instanceID)
+	if prune {
+		// internal#734: ask CP to erase the data volume on this delete.
+		url += "&prune=true"
+	}
 	req, err := http.NewRequestWithContext(ctx, "DELETE", url, nil)
 	if err != nil {
 		return fmt.Errorf("cp provisioner: stop: build request: %w", err)

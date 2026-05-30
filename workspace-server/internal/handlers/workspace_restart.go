@@ -726,7 +726,7 @@ func (h *WorkspaceHandler) cpStopWithRetry(ctx context.Context, workspaceID, sou
 	// terminal error. The delete path needs the error (it must keep the
 	// row recoverable for the orphan-sweeper + emit a durable event), so
 	// the actual retry loop lives in cpStopWithRetryErr below.
-	_ = h.cpStopWithRetryErr(ctx, workspaceID, source)
+	_ = h.cpStopWithRetryErr(ctx, workspaceID, source, false) // restart/hibernate never prunes
 }
 
 // cpStopWithRetryErr is the shared bounded-retry core for cpProv.Stop.
@@ -743,14 +743,24 @@ func (h *WorkspaceHandler) cpStopWithRetry(ctx context.Context, workspaceID, sou
 //   - all attempts fail   → returns the LAST attempt's error and emits the
 //     stable `LEAK-SUSPECT cpProv.Stop ...` log line so the CP-side orphan
 //     reconciler can correlate by workspace_id.
-func (h *WorkspaceHandler) cpStopWithRetryErr(ctx context.Context, workspaceID, source string) error {
+//
+// cpStopWithRetryErr terminates the workspace's CP-managed compute with bounded
+// retry. prune=true (internal#734) additionally requests CP erase the durable
+// data volume — set ONLY by the permanent-delete-with-erase path, NEVER by
+// restart/hibernate (those pass false), so a recreate can never prune.
+func (h *WorkspaceHandler) cpStopWithRetryErr(ctx context.Context, workspaceID, source string, prune bool) error {
 	if h.cpProv == nil {
 		return nil
 	}
 	var lastErr error
 	delay := cpStopRetryBaseDelay
 	for attempt := 1; attempt <= cpStopRetryAttempts; attempt++ {
-		err := h.cpProv.Stop(ctx, workspaceID)
+		var err error
+		if prune {
+			err = h.cpProv.StopAndPrune(ctx, workspaceID)
+		} else {
+			err = h.cpProv.Stop(ctx, workspaceID)
+		}
 		if err == nil {
 			if attempt > 1 {
 				log.Printf("%s: cpProv.Stop(%s) succeeded on attempt %d", source, workspaceID, attempt)

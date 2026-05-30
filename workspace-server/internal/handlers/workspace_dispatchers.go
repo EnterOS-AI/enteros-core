@@ -235,9 +235,13 @@ func (h *WorkspaceHandler) StopWorkspaceAuto(ctx context.Context, workspaceID st
 // container won't heal on retry (matches RestartWorkspaceAuto's Docker
 // rationale); the orphan-container sweeper (registry/orphan_sweeper.go) is
 // the Docker-side backstop.
-func (h *WorkspaceHandler) stopWorkspaceForDelete(ctx context.Context, workspaceID string) error {
+// stopWorkspaceForDelete terminates a workspace's compute on the delete path.
+// erase=true (internal#734) means the user asked to erase saved data, so the CP
+// teardown prunes the durable data volume. The local-docker path always removes
+// its volume via CascadeDelete's RemoveVolume, so erase is a CP-only concern.
+func (h *WorkspaceHandler) stopWorkspaceForDelete(ctx context.Context, workspaceID string, erase bool) error {
 	if h.cpProv != nil {
-		if err := h.cpStopWithRetryErr(ctx, workspaceID, "Delete"); err != nil {
+		if err := h.cpStopWithRetryErr(ctx, workspaceID, "Delete", erase); err != nil {
 			h.emitDeleteTerminateRetryExhausted(ctx, workspaceID, err)
 			return err
 		}
