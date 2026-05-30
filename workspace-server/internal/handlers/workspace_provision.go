@@ -330,6 +330,7 @@ func (h *WorkspaceHandler) buildProvisionerConfig(
 		Runtime:         payload.Runtime,
 		InstanceType:    payload.Compute.InstanceType,
 		DiskGB:          int32(payload.Compute.Volume.RootGB),
+		DataPersistence: payload.Compute.DataPersistence,
 		Display: provisioner.WorkspaceDisplayConfig{
 			Mode:     payload.Compute.Display.Mode,
 			Width:    payload.Compute.Display.Width,
