@@ -26,6 +26,7 @@ import (
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/rescue"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/rescuestore"
 )
 
 func init() {
@@ -37,6 +38,15 @@ func init() {
 	rescue.Redact = func(workspaceID, content string) string {
 		out, _ := redactSecrets(workspaceID, content)
 		return out
+	}
+	// Part 3: persist the redacted bundle to the queryable store on
+	// capture so GET /workspaces/:id/rescue can serve it without obs/Loki
+	// read creds. db.DB is resolved per-call (rescuestore guards a nil
+	// handle) so wiring at init() is safe even before InitPostgres has
+	// run; a capture before the DB is up logs + skips the persist rather
+	// than failing the boot-failure path.
+	rescue.PersistBundle = func(ctx context.Context, b rescue.Bundle) error {
+		return rescuestore.NewPostgres(db.DB).Persist(ctx, b)
 	}
 }
 

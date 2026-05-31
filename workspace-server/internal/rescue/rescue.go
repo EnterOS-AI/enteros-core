@@ -167,6 +167,44 @@ type Input struct {
 	Reason string
 }
 
+// Section is one labelled, already-redacted chunk of the persisted
+// rescue bundle. It mirrors what ship() emits to Loki per-section, but
+// is the unit the queryable store (and the read endpoint) returns.
+// `Redacted` is false only for collection-failure markers (the section
+// command couldn't run); true sections passed through the secret-scan.
+type Section struct {
+	Name     string `json:"name"`
+	Content  string `json:"content"`
+	Redacted bool   `json:"redacted"`
+}
+
+// Bundle is the full, already-redacted post-mortem bundle for ONE
+// boot-failure capture — the unit persisted to the queryable store on
+// capture (RFC internal#742 Part 3) and served by
+// GET /workspaces/:id/rescue. Sections are in fixed reading order
+// (config → boot logs → container state → resolved routing env).
+type Bundle struct {
+	WorkspaceID string    `json:"workspace_id"`
+	OrgID       string    `json:"org_id"`
+	InstanceID  string    `json:"instance_id"`
+	Reason      string    `json:"reason"`
+	Sections    []Section `json:"sections"`
+}
+
+// PersistBundle writes the fully-collected, already-redacted bundle to
+// the queryable per-tenant store (rescue_bundles table) so the rescue
+// READ endpoint can serve it without obs/Loki read creds (RFC
+// internal#742 Part 3 read-path decision — see the migration header).
+//
+// Wired at boot from the handlers package (which owns db.DB) to keep
+// internal/rescue a leaf: it must NOT import internal/db, or registry —
+// which imports rescue — would inherit a db dependency it can call
+// without a cycle, but more importantly the leaf stays trivially
+// testable with a fake. nil until wired: a capture with no store wired
+// still ships to Loki (Part 2 behavior preserved) and logs that it
+// skipped the DB persist, rather than failing the capture.
+var PersistBundle func(ctx context.Context, b Bundle) error
+
 // Capture collects the fixed rescue bundle off the failed instance,
 // redacts each section, and ships it to Loki under
 // {kind="rescue", org=<OrgID>, workspace_id=<WorkspaceID>}.
@@ -210,21 +248,57 @@ func Capture(ctx context.Context, in Input) {
 	log.Printf("rescue: capturing bundle ws=%s instance=%s reason=%s", in.WorkspaceID, in.InstanceID, in.Reason)
 
 	collected := 0
+	// Accumulate the per-section result alongside shipping each to Loki,
+	// so the same already-redacted content is persisted to the queryable
+	// store as one bundle row after the loop. Shipping stays per-section
+	// (Part 2 Loki behavior unchanged); persistence is the single
+	// bundle the read endpoint serves.
+	bundle := Bundle{
+		WorkspaceID: in.WorkspaceID,
+		OrgID:       in.OrgID,
+		InstanceID:  in.InstanceID,
+		Reason:      in.Reason,
+		Sections:    make([]Section, 0, len(bundleSections)),
+	}
 	for _, sec := range bundleSections {
 		raw, err := RunRemote(ctx, in.InstanceID, sec.command)
 		if err != nil {
 			// One section failing (e.g. ssh blip mid-collection) must not
 			// abort the rest — ship a marker for it and continue.
 			log.Printf("rescue: section %q failed for ws=%s: %v", sec.name, in.WorkspaceID, err)
-			ship(ctx, in, sec.name, fmt.Sprintf("(rescue: section collection failed: %v)", err), false)
+			marker := fmt.Sprintf("(rescue: section collection failed: %v)", err)
+			ship(ctx, in, sec.name, marker, false)
+			bundle.Sections = append(bundle.Sections, Section{Name: sec.name, Content: marker, Redacted: false})
 			continue
 		}
 		redacted := Redact(in.WorkspaceID, raw)
 		ship(ctx, in, sec.name, redacted, true)
+		bundle.Sections = append(bundle.Sections, Section{Name: sec.name, Content: redacted, Redacted: true})
 		collected++
 	}
 
 	log.Printf("rescue: shipped %d/%d sections ws=%s instance=%s kind=%s", collected, len(bundleSections), in.WorkspaceID, in.InstanceID, LokiKind)
+
+	// Persist the redacted bundle to the queryable store so the rescue
+	// READ endpoint can serve it without obs/Loki read creds. Best-effort
+	// and last: a persist failure (or no store wired) must NOT undo the
+	// Loki ship that already succeeded, and never panics the failure path.
+	persistBundle(ctx, bundle)
+}
+
+// persistBundle writes the collected bundle to the queryable store if a
+// store is wired. Best-effort: a nil store (operator hasn't wired the
+// READ path) or a DB error is logged and swallowed — the Loki ship is
+// the durable cross-tenant copy, and the failure path must never be
+// disturbed by the post-mortem read store.
+func persistBundle(ctx context.Context, b Bundle) {
+	if PersistBundle == nil {
+		log.Printf("rescue: store not wired — bundle for ws=%s shipped to Loki only (no queryable copy)", b.WorkspaceID)
+		return
+	}
+	if err := PersistBundle(ctx, b); err != nil {
+		log.Printf("rescue: persist bundle for ws=%s failed (shipped to Loki regardless): %v", b.WorkspaceID, err)
+	}
 }
 
 // ship emits one rescue section to Loki via the audit shipper. The

@@ -703,6 +703,14 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 	wsAuth.PUT("/files/*path", tmplh.WriteFile)
 	wsAuth.DELETE("/files/*path", tmplh.DeleteFile)
 
+	// Rescue read (RFC internal#742 Part 3) — latest post-mortem bundle
+	// for a boot-failed/terminated workspace, so "why won't my agent
+	// boot" is answerable without a live instance. Same WorkspaceAuth
+	// gate as /files/*; the handler org-scopes the store read by
+	// MOLECULE_ORG_ID so a sibling org cannot read another org's bundle.
+	rescueReadH := handlers.NewRescueReadHandler()
+	wsAuth.GET("/rescue", rescueReadH.GetRescue)
+
 	// Chat attachments — file upload (user → agent) and binary-safe
 	// streaming download (agent → user). Namespaced under /chat/ so
 	// the security model is obviously distinct from /files/* (which
