@@ -377,11 +377,18 @@ export function billingModeForSelectedProvider(
 // config.yaml` on the container is a separate runtime-internal file,
 // not this one.
 const RUNTIMES_WITH_OWN_CONFIG = new Set<string>(["external", "kimi", "kimi-cli", "openclaw"]);
-const SUPPORTED_RUNTIME_VALUES = new Set(["claude-code", "codex", "openclaw", "hermes"]);
+// The runtime picker is SSOT-driven: options come from GET /templates,
+// which workspace-server already gates to the manifest.json maintained set
+// (loadRuntimesFromManifest). A hand-maintained frontend allowlist silently
+// dropped runtimes the backend added (google-adk shipped in manifest but was
+// filtered out, so its workspaces rendered the wrong default option). A
+// template may still opt OUT of the picker via `displayable: false` on its
+// /templates row. See project_canvas_runtime_dropdown_ssot_fix.
 
 const FALLBACK_RUNTIME_OPTIONS: RuntimeOption[] = [
   { value: "claude-code", label: "Claude Code", models: [], providers: [], registryBacked: false, registryProviders: [], registryModels: [] },
   { value: "codex", label: "Codex", models: [], providers: [], registryBacked: false, registryProviders: [], registryModels: [] },
+  { value: "google-adk", label: "Google ADK", models: [], providers: [], registryBacked: false, registryProviders: [], registryModels: [] },
   { value: "openclaw", label: "OpenClaw", models: [], providers: [], registryBacked: false, registryProviders: [], registryModels: [] },
   { value: "hermes", label: "Hermes", models: [], providers: [], registryBacked: false, registryProviders: [], registryModels: [] },
 ];
@@ -585,13 +592,16 @@ export function ConfigTab({ workspaceId }: Props) {
       registry_backed?: boolean;
       registry_providers?: RegistryProvider[];
       registry_models?: RegistryModel[];
+      displayable?: boolean;
     }>>("/templates")
       .then((rows) => {
         if (cancelled || !Array.isArray(rows)) return;
         const byRuntime = new Map<string, RuntimeOption>();
         for (const r of rows) {
           const v = (r.runtime || "").trim();
-          if (!SUPPORTED_RUNTIME_VALUES.has(v)) continue;
+          if (!v) continue;
+          // Honor an explicit opt-out; absent/true means show it.
+          if (r.displayable === false) continue;
           // Last template wins if two templates share a runtime — rare, and the
           // one with the richer models list is probably newer.
           const existing = byRuntime.get(v);

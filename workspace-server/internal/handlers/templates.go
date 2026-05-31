@@ -224,6 +224,15 @@ type templateSummary struct {
 	// 0 = template hasn't declared one, falls through to canvas's
 	// runtime-profile default.
 	ProvisionTimeoutSeconds int `json:"provision_timeout_seconds,omitempty"`
+	// Displayable lets a template opt OUT of the canvas runtime picker
+	// declaratively (config.yaml `displayable: false`) while still being a
+	// provisionable runtime. nil/absent or true → shown; only an explicit
+	// false hides it. The canvas runtime dropdown is SSOT-driven off this
+	// list (no hardcoded frontend allowlist), so this is the single place a
+	// runtime is hidden from the picker. Pointer so "unset" is distinct from
+	// "false" and omitempty keeps the payload unchanged for existing
+	// templates that never declare it.
+	Displayable *bool `json:"displayable,omitempty"`
 }
 
 // resolveTemplateDir finds the template directory for a workspace on the host.
@@ -270,6 +279,7 @@ func (h *TemplatesHandler) List(c *gin.Context) {
 				Runtime     string   `yaml:"runtime"`
 				Model       string   `yaml:"model"`
 				Skills      []string `yaml:"skills"`
+				Displayable *bool    `yaml:"displayable"`
 				// Top-level `providers:` block — structured registry. Distinct
 				// from runtime_config.providers (slug list) below. Both shapes
 				// coexist in production: claude-code ships the structured
@@ -334,6 +344,7 @@ func (h *TemplatesHandler) List(c *gin.Context) {
 				Skills:                  raw.Skills,
 				SkillCount:              len(raw.Skills),
 				ProvisionTimeoutSeconds: raw.RuntimeConfig.ProvisionTimeoutSeconds,
+				Displayable:             raw.Displayable,
 			}
 
 			// internal#718 P3: serve the SELECTABLE provider/model list from

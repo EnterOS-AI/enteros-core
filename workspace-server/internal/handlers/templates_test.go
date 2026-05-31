@@ -1554,3 +1554,86 @@ skills: []
 		t.Errorf("template Providers unchanged: got %v", got.Providers)
 	}
 }
+
+// TestTemplatesList_DisplayableFlag verifies the SSOT-driven runtime-picker
+// opt-out: a template's config.yaml `displayable: false` surfaces as a
+// non-nil false on the /templates row (canvas hides it), while an absent
+// flag stays nil (canvas shows it) and an explicit true surfaces as true.
+// This is the backend half of removing the hardcoded frontend allowlist —
+// the picker trusts this list, so hiding a runtime must be declarative here.
+func TestTemplatesList_DisplayableFlag(t *testing.T) {
+	setupTestDB(t)
+	setupTestRedis(t)
+
+	tmpDir := t.TempDir()
+
+	mk := func(dir, yaml string) {
+		d := filepath.Join(tmpDir, dir)
+		if err := os.MkdirAll(d, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(d, "config.yaml"), []byte(yaml), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// absent → nil
+	mk("adk-shown", "name: ADK Shown\nruntime: claude-code\n")
+	// explicit false → hidden marker
+	mk("adk-hidden", "name: ADK Hidden\nruntime: claude-code\ndisplayable: false\n")
+	// explicit true → shown marker
+	mk("adk-explicit", "name: ADK Explicit\nruntime: claude-code\ndisplayable: true\n")
+
+	handler := NewTemplatesHandler(tmpDir, nil, nil)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest("GET", "/templates", nil)
+	handler.List(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp []templateSummary
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	byID := map[string]templateSummary{}
+	for _, s := range resp {
+		byID[s.ID] = s
+	}
+
+	if s, ok := byID["adk-shown"]; !ok {
+		t.Fatal("adk-shown missing")
+	} else if s.Displayable != nil {
+		t.Errorf("adk-shown: expected nil Displayable (absent), got %v", *s.Displayable)
+	}
+
+	if s, ok := byID["adk-hidden"]; !ok {
+		t.Fatal("adk-hidden missing")
+	} else if s.Displayable == nil || *s.Displayable != false {
+		t.Errorf("adk-hidden: expected non-nil false Displayable, got %v", s.Displayable)
+	}
+
+	if s, ok := byID["adk-explicit"]; !ok {
+		t.Fatal("adk-explicit missing")
+	} else if s.Displayable == nil || *s.Displayable != true {
+		t.Errorf("adk-explicit: expected non-nil true Displayable, got %v", s.Displayable)
+	}
+
+	// JSON contract: omitempty drops the field entirely when nil so existing
+	// templates' payloads are byte-unchanged; present when set.
+	var rawRows []map[string]json.RawMessage
+	if err := json.Unmarshal(w.Body.Bytes(), &rawRows); err != nil {
+		t.Fatalf("raw parse: %v", err)
+	}
+	for _, row := range rawRows {
+		id := ""
+		_ = json.Unmarshal(row["id"], &id)
+		_, present := row["displayable"]
+		if id == "adk-shown" && present {
+			t.Error("adk-shown: displayable key should be omitted when nil")
+		}
+		if (id == "adk-hidden" || id == "adk-explicit") && !present {
+			t.Errorf("%s: displayable key should be present when set", id)
+		}
+	}
+}
