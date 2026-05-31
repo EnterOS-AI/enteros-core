@@ -91,6 +91,18 @@ func (h *WorkspaceHandler) BootstrapFailed(c *gin.Context) {
 		"log_tail": tail,
 		"source":   "bootstrap_watcher",
 	})
+
+	// RFC internal#742 Part 2: this is one of the two boot-failure
+	// verdict points. We've just flipped a still-running (but
+	// unconfigured) workspace EC2 to `failed`; the control plane will
+	// reap the instance shortly. Capture a forensic rescue bundle off
+	// the live box NOW, before it's torn down, so a wedged workspace is
+	// post-mortem-inspectable. Best-effort + non-blocking: runs in its
+	// own goroutine with its own timeout, detached from this request's
+	// context (which is cancelled the instant this handler returns).
+	// Failure to capture never changes the boot-failure handling.
+	captureRescueBundle(id, "bootstrap_watcher")
+
 	log.Printf("BootstrapFailed: marked %s failed (tail=%d bytes, err=%q)", id, len(tail), errMsg)
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }

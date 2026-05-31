@@ -349,6 +349,17 @@ func main() {
 		codexauth.StartCodexAuthRefresher(c, db.DB)
 	})
 
+	// RFC internal#742 Part 2: wire the boot-failure rescue capture into
+	// the provision-timeout sweep's failure verdict. When the sweep flips
+	// a stuck workspace to `failed`, this hook captures a forensic rescue
+	// bundle off the still-running (but boot-failed) EC2 and ships it to
+	// obs/Loki before the control plane reaps the instance. Best-effort +
+	// non-blocking (handlers.BootFailureRescueHook dispatches on its own
+	// goroutine + timeout). The handler-side boot-failure path
+	// (WorkspaceHandler.BootstrapFailed) wires its own capture inline.
+	registry.BootFailureRescueHook = handlers.BootFailureRescueHook
+
+
 	// Provision-timeout sweep — flips workspaces that have been stuck in
 	// status='provisioning' past the timeout window to 'failed' and emits
 	// WORKSPACE_PROVISION_TIMEOUT. Without this the UI banner is cosmetic
