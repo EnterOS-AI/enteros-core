@@ -54,7 +54,17 @@ func (p Provider) IsPlatform() bool {
 //     native provider ref's Models list, that provider wins outright — this
 //     resolves the kimi namespace split (moonshot/kimi-k2.6 -> platform vs
 //     bare kimi-for-coding -> kimi-coding) deterministically and overrides
-//     any broader prefix match.
+//     any broader prefix match. If the SAME id is exact-listed by MORE THAN
+//     ONE native arm — the legitimate "one model id, two auth arms" shape (the
+//     codex gpt-* family is offered on BOTH the openai-subscription OAuth arm
+//     and the openai-api direct-key arm, mirroring claude-code's anthropic
+//     oauth+api split) — disambiguate by available auth env exactly as the
+//     prefix step (5) does: keep the arms whose auth_env intersects
+//     availableAuthEnv; if exactly one survives it wins. With no auth context
+//     (or an unresolved tie), the FIRST-declared native arm wins — the
+//     deterministic default (codex lists openai-subscription first, so a
+//     gpt-* id with no auth context defaults to the subscription, matching the
+//     codex adapter's resolve-provider precedence #1).
 //  4. Otherwise, fall back to model_prefix_match among the native providers.
 //  5. If >1 native provider still matches, disambiguate by auth env: keep
 //     only the providers whose auth_env intersects availableAuthEnv. If
@@ -85,11 +95,14 @@ func (m *Manifest) DeriveProvider(runtime, model string, availableAuthEnv []stri
 	}
 
 	// Step 3: exact model-id match against each native provider ref's Models.
-	// Authoritative — a verbatim id beats any prefix. If two native refs both
-	// list the same id, that is a manifest ambiguity we surface rather than
-	// silently pick (LoadManifest already forbids a provider ref appearing
-	// twice in one runtime, but two DIFFERENT providers listing the same id
-	// is not load-rejected, so guard it here).
+	// Authoritative — a verbatim id beats any prefix. `exact` is collected in
+	// native-declaration order. When ONE native arm lists the id, it wins
+	// outright. When MORE THAN ONE lists it (the codex oauth-vs-key "one id,
+	// two auth arms" shape), it is disambiguated by available auth env, with
+	// the first-declared arm as the deterministic default (handled below) —
+	// NOT a load error, since a model legitimately offered on two auth arms is
+	// a feature, not a typo. (LoadManifest still forbids the SAME provider ref
+	// appearing twice in one runtime.)
 	var exact []Provider
 	for _, ref := range native.Providers {
 		for _, mid := range ref.Models {
@@ -105,9 +118,19 @@ func (m *Manifest) DeriveProvider(runtime, model string, availableAuthEnv []stri
 		return exact[0], nil
 	}
 	if len(exact) > 1 {
-		return Provider{}, fmt.Errorf(
-			"providers: model %q for runtime %q is exact-listed by %d native providers (%s) — manifest ambiguity",
-			model, runtime, len(exact), strings.Join(providerNames(exact), ", "))
+		// The same id is exact-listed by >1 native arm — the legitimate
+		// "one model id, two auth arms" shape (codex gpt-* on both the
+		// openai-subscription OAuth arm and the openai-api direct-key arm,
+		// mirroring claude-code's anthropic oauth+api split). Disambiguate by
+		// available auth env exactly as the prefix step does. `exact` is in
+		// native-declaration order, so the first-declared arm is the
+		// deterministic default when auth env does not resolve it.
+		if p, ok := disambiguateByAuthEnv(exact, availableAuthEnv); ok {
+			return p, nil
+		}
+		// No auth context (or an unresolved tie): the first-declared native
+		// arm is the default (codex declares openai-subscription first).
+		return exact[0], nil
 	}
 
 	// Step 4: prefix match among native providers only.
@@ -132,26 +155,11 @@ func (m *Manifest) DeriveProvider(runtime, model string, availableAuthEnv []stri
 	}
 
 	// Step 5: >1 prefix match — disambiguate by available auth env.
-	if len(availableAuthEnv) > 0 {
-		avail := make(map[string]struct{}, len(availableAuthEnv))
-		for _, e := range availableAuthEnv {
-			avail[e] = struct{}{}
-		}
-		var byAuth []Provider
-		for _, p := range matched {
-			for _, want := range p.AuthEnv {
-				if _, ok := avail[want]; ok {
-					byAuth = append(byAuth, p)
-					break
-				}
-			}
-		}
-		if len(byAuth) == 1 {
-			return byAuth[0], nil
-		}
-		if len(byAuth) > 1 {
-			matched = byAuth // narrowed but still ambiguous; report the narrowed set
-		}
+	if p, ok := disambiguateByAuthEnv(matched, availableAuthEnv); ok {
+		return p, nil
+	}
+	if narrowed := authEnvMatches(matched, availableAuthEnv); len(narrowed) > 1 {
+		matched = narrowed // narrowed but still ambiguous; report the narrowed set
 	}
 
 	// Step 6: still ambiguous -> error (never silently pick).
@@ -245,6 +253,41 @@ func (m *Manifest) ResolveUpstream(model string) (Upstream, error) {
 
 	return Upstream{}, fmt.Errorf(
 		"providers: %q is not an upstream-namespaced model id (vendor/model); bare ids are vestigial at the proxy and resolve via the legacy fallback", model)
+}
+
+// authEnvMatches returns the subset of candidates whose AuthEnv intersects
+// availableAuthEnv, preserving the input order. A nil/empty availableAuthEnv
+// yields nil (the tie-break cannot fire).
+func authEnvMatches(candidates []Provider, availableAuthEnv []string) []Provider {
+	if len(availableAuthEnv) == 0 {
+		return nil
+	}
+	avail := make(map[string]struct{}, len(availableAuthEnv))
+	for _, e := range availableAuthEnv {
+		avail[e] = struct{}{}
+	}
+	var out []Provider
+	for _, p := range candidates {
+		for _, want := range p.AuthEnv {
+			if _, ok := avail[want]; ok {
+				out = append(out, p)
+				break
+			}
+		}
+	}
+	return out
+}
+
+// disambiguateByAuthEnv returns the single candidate whose AuthEnv intersects
+// availableAuthEnv when EXACTLY one does, else ok=false. Used by both the
+// exact-id step (codex oauth-vs-key arms exact-listing the same gpt-* id) and
+// the prefix step to split an auth-distinguished provider overlap.
+func disambiguateByAuthEnv(candidates []Provider, availableAuthEnv []string) (Provider, bool) {
+	byAuth := authEnvMatches(candidates, availableAuthEnv)
+	if len(byAuth) == 1 {
+		return byAuth[0], true
+	}
+	return Provider{}, false
 }
 
 // providerNames returns the sorted names of a provider slice for stable,

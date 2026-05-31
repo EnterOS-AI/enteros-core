@@ -16,7 +16,7 @@ const SchemaVersion = 1
 // Fingerprint is a stable content hash of the generated projection (schema
 // version + provider catalog + runtime native sets). It changes iff the
 // registry DATA changes (comment-only YAML edits do not churn it).
-const Fingerprint = "cbd39dfe934302e0"
+const Fingerprint = "1100bc3e42a5f425"
 
 // GenProvider is the generated projection of one provider catalog entry —
 // the subset a downstream consumer needs to derive + display a provider.
@@ -46,7 +46,8 @@ type GenRuntimeRef struct {
 var Providers = []GenProvider{
 	{Name: "anthropic-api", DisplayName: "Anthropic API", Protocol: "anthropic", AuthMode: "anthropic_api", AuthEnv: []string{"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"}, ModelPrefixMatch: "^claude", IsPlatform: false, UpstreamVendor: "anthropic"},
 	{Name: "anthropic-oauth", DisplayName: "Claude Code subscription", Protocol: "anthropic", AuthMode: "oauth", AuthEnv: []string{"CLAUDE_CODE_OAUTH_TOKEN"}, ModelPrefixMatch: "^(sonnet|opus|haiku)$", IsPlatform: false},
-	{Name: "openai", DisplayName: "OpenAI", Protocol: "openai", AuthMode: "anthropic_api", AuthEnv: []string{"OPENAI_API_KEY"}, ModelPrefixMatch: "^gpt-", IsPlatform: false, UpstreamVendor: "openai"},
+	{Name: "openai-subscription", DisplayName: "OpenAI Codex subscription", Protocol: "openai", AuthMode: "oauth", AuthEnv: []string{"CODEX_AUTH_JSON", "CODEX_CHATGPT_AUTH_JSON"}, ModelPrefixMatch: "^gpt-", IsPlatform: false},
+	{Name: "openai-api", DisplayName: "OpenAI API", Protocol: "openai", AuthMode: "anthropic_api", AuthEnv: []string{"OPENAI_API_KEY"}, ModelPrefixMatch: "^openai-api[:/]", IsPlatform: false, UpstreamVendor: "openai"},
 	{Name: "moonshot", DisplayName: "Moonshot (Kimi)", Protocol: "openai", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"MOONSHOT_API_KEY", "KIMI_API_KEY"}, ModelPrefixMatch: "^moonshot[:/-]", IsPlatform: false, UpstreamVendor: "moonshot"},
 	{Name: "minimax", DisplayName: "MiniMax", Protocol: "openai", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"MINIMAX_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"}, ModelPrefixMatch: "(?i)^minimax-m", IsPlatform: false, UpstreamVendor: "minimax"},
 	{Name: "platform", DisplayName: "Platform", Protocol: "anthropic", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"ANTHROPIC_API_KEY", "MOLECULE_LLM_USAGE_TOKEN"}, ModelPrefixMatch: "^platform/", IsPlatform: true},
@@ -55,6 +56,7 @@ var Providers = []GenProvider{
 	{Name: "kimi-coding", DisplayName: "Moonshot Kimi (coding-tuned)", Protocol: "anthropic", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"KIMI_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"}, ModelPrefixMatch: "^kimi-", IsPlatform: false},
 	{Name: "deepseek", DisplayName: "DeepSeek", Protocol: "anthropic", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"DEEPSEEK_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"}, ModelPrefixMatch: "^deepseek-", IsPlatform: false},
 	{Name: "google", DisplayName: "Google Gemini", Protocol: "openai", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"GEMINI_API_KEY", "GOOGLE_API_KEY"}, ModelPrefixMatch: "^gemini-", IsPlatform: false},
+	{Name: "vertex", DisplayName: "Google Vertex AI (keyless ADC)", Protocol: "openai", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"GOOGLE_APPLICATION_CREDENTIALS"}, ModelPrefixMatch: "^vertex:", IsPlatform: false},
 	{Name: "alibaba", DisplayName: "Alibaba Qwen (DashScope)", Protocol: "openai", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"DASHSCOPE_API_KEY", "ALIBABA_API_KEY"}, ModelPrefixMatch: "^qwen-", IsPlatform: false},
 	{Name: "nousresearch", DisplayName: "Nous Research (Hermes)", Protocol: "openai", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"NOUSRESEARCH_API_KEY"}, ModelPrefixMatch: "^nousresearch/", IsPlatform: false},
 	{Name: "openrouter", DisplayName: "OpenRouter (any model)", Protocol: "openai", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"OPENROUTER_API_KEY"}, ModelPrefixMatch: "^openrouter/", IsPlatform: false},
@@ -82,8 +84,13 @@ var Runtimes = map[string][]GenRuntimeRef{
 		{Name: "platform", Models: []string{"anthropic/claude-opus-4-7", "anthropic/claude-sonnet-4-6", "moonshot/kimi-k2.6", "moonshot/kimi-k2.5", "minimax/MiniMax-M2.7", "minimax/MiniMax-M2.7-highspeed"}},
 	},
 	"codex": {
-		{Name: "openai", Models: []string{"gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.2"}},
+		{Name: "openai-subscription", Models: []string{"gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.2"}},
+		{Name: "openai-api", Models: []string{"gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.2"}},
 		{Name: "platform", Models: []string{"openai/gpt-5.4", "openai/gpt-5.4-mini"}},
+	},
+	"google-adk": {
+		{Name: "vertex", Models: []string{"vertex:gemini-2.5-pro"}},
+		{Name: "google", Models: []string{"gemini-2.5-pro"}},
 	},
 	"hermes": {
 		{Name: "kimi-coding", Models: []string{"kimi-coding/kimi-k2"}},

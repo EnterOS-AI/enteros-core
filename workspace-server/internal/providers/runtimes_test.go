@@ -19,13 +19,17 @@ import (
 //
 //	claude-code -> anthropic (oauth+api), kimi (kimi-coding), minimax, platform
 //	hermes      -> kimi (kimi-coding), platform
-//	codex       -> openai, platform
+//	codex       -> openai (subscription + api), platform
 //	openclaw    -> kimi (kimi-coding), platform
 var runtimeNativeProviders = map[string][]string{
 	"claude-code": {"anthropic-api", "anthropic-oauth", "kimi-coding", "minimax", "platform"},
 	"hermes":      {"kimi-coding", "platform"},
-	"codex":       {"openai", "platform"}, // platform openai via the proxy Responses surface
-	"openclaw":    {"kimi-coding", "platform"},
+	// codex's OpenAI BYOK is split across the OAuth subscription arm
+	// (openai-subscription) and the direct-key arm (openai-api), mirroring
+	// claude-code's anthropic oauth+api split; platform openai via the proxy
+	// Responses surface.
+	"codex":    {"openai-subscription", "openai-api", "platform"},
+	"openclaw": {"kimi-coding", "platform"},
 }
 
 func sortedCopy(in []string) []string {

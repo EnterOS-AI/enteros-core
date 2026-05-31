@@ -110,30 +110,85 @@ providers:
     model_aliases: [sonnet, opus, haiku]
 
   # ===========================================================================
-  # OpenAI — proxy default arm + DB catalog + canvas. NOT in the adapter
-  # template (claude-code template is Anthropic-protocol only).
+  # OpenAI / Codex — SPLIT into two providers, mirroring the anthropic-api /
+  # anthropic-oauth pair above. The codex runtime authenticates via EITHER a
+  # ChatGPT/Codex subscription (OAuth-style auth.json blob — the CLI talks to
+  # OpenAI directly, never the proxy) OR a direct OpenAI API key. The codex
+  # template/adapter registry
+  # (git.moleculesai.app/molecule-ai/molecule-ai-workspace-template-codex
+  # config.yaml `providers:`) uses the SPLIT names `openai-subscription`
+  # (auth_mode chatgpt_subscription) + `openai-api` (auth_mode openai_api); it
+  # does NOT accept a bare `openai`. The previous single `openai` SSOT entry
+  # derived bare `openai` for (codex, gpt-*), which the adapter rejected with
+  # "picks provider='openai' but it is not in the providers registry. Known
+  # providers: openai-subscription, openai-api" — leaving codex agents NOT
+  # CONFIGURED. The split below converges the SSOT onto the adapter's vocabulary.
+  #
+  # openai-subscription is the OAuth arm (mirror of anthropic-oauth): auth_mode
+  # oauth, NO upstream_vendor (OAuth never traverses the proxy — the CLI dials
+  # OpenAI directly), base_url null, the ChatGPT-OAuth auth.json env. It is the
+  # codex DEFAULT (the template adapter's resolve-provider precedence #1 picks
+  # the subscription when CODEX_AUTH_JSON is present), so it owns the bare gpt-*
+  # family by prefix + exact-list and DeriveProvider(codex, gpt-5.5) -> here.
   # ===========================================================================
-  - name: openai
-    display_name: "OpenAI"
+  - name: openai-subscription
+    display_name: "OpenAI Codex subscription"
     vendor_logo: "openai"
     protocol: openai
-    auth_mode: anthropic_api  # OpenAI is openai-protocol; auth is a bearer API key.
+    auth_mode: oauth  # ChatGPT/Codex subscription — auth.json blob, not a bearer key.
+    base_url_template: null  # OAuth: the codex CLI talks to OpenAI directly (no proxy).
+    base_url_anthropic: null  # OpenAI exposes only the OpenAI protocol surface.
+    # The codex template's chatgpt_subscription auth_env, verbatim from the
+    # deployed config.yaml: CODEX_AUTH_JSON wins over the older
+    # CODEX_CHATGPT_AUTH_JSON alias when both are set.
+    auth_env: [CODEX_AUTH_JSON, CODEX_CHATGPT_AUTH_JSON]
+    auth_token_env: CODEX_AUTH_JSON
+    # Canvas matches /^gpt-/i. This is the codex DEFAULT arm, so it owns the
+    # bare gpt-* prefix (the codex runtime exact-lists the gpt-* ids under it).
+    model_prefix_match: "^gpt-"
+    model_aliases: []
+    # NO upstream_vendor — OAuth never traverses the proxy (mirror of
+    # anthropic-oauth). The proxy's `openai/` namespace token + Responses
+    # surface resolve to openai-api below (which carries upstream_vendor:
+    # openai), keeping proxy routing + billing byte-identical.
+
+  # ===========================================================================
+  # OpenAI API key — the BYOK direct-key arm AND the proxy arm (mirror of
+  # anthropic-api). Carries upstream_vendor: openai so ResolveUpstream still
+  # maps the `openai/` namespace token to THIS entry and the proxy's OpenAI
+  # Responses surface (codex platform-managed) routes upstream vendor "openai"
+  # exactly as before — proxy + billing are byte-identical to the pre-split
+  # `openai` entry. Its catalog model_prefix_match is a DISJOINT sentinel
+  # (`^openai-api[:/]`) so the bare gpt-* family stays owned by
+  # openai-subscription and the catalog overlap guard (no slug may match two
+  # providers) stays green — exactly as anthropic-oauth's `^(sonnet|opus|
+  # haiku)$` is disjoint from anthropic-api's `^claude`.
+  # ===========================================================================
+  - name: openai-api
+    display_name: "OpenAI API"
+    vendor_logo: "openai"
+    protocol: openai
+    auth_mode: anthropic_api  # openai-protocol; auth is a bearer API key (mirror of anthropic-api).
     base_url_template: "https://api.openai.com/v1"
     base_url_anthropic: null  # OpenAI exposes only the OpenAI protocol surface.
     auth_env: [OPENAI_API_KEY]
     auth_token_env: OPENAI_API_KEY
-    # Proxy treats openai as the DEFAULT (catch-all) arm of inferLLMProvider;
-    # there is no explicit prefix today. Canvas matches /^gpt-/i. Encode the
-    # canvas prefix so the explicit slugs route; the proxy's catch-all
-    # behavior is a routing decision for PR-3, not the manifest.
-    model_prefix_match: "^gpt-"
+    # DISJOINT sentinel prefix: openai-api is selected explicitly (the
+    # provisioner's LLM_PROVIDER=openai-api) or via the `openai/` proxy
+    # namespace (ResolveUpstream uses upstream_vendor, NOT this prefix). The
+    # bare gpt-* family is owned by openai-subscription (the codex default), so
+    # this prefix must NOT also claim `^gpt-` or the catalog overlap guard
+    # (TestNoAmbiguousModelMatch) would flag gpt-5.5 as matching two providers.
+    model_prefix_match: "^openai-api[:/]"
     model_aliases: []
     # internal#718 P1 (CONVERGED): the proxy's upstream-vendor key. ResolveUpstream
-    # maps the `openai/` namespace token to THIS entry. openai is ALSO the proxy's
-    # historical catch-all (the switch's `default:` arm) for bare/unknown ids —
-    # but the catch-all is a VESTIGIAL bare-id behavior (no live bare traffic), so
-    # it lives in the retained legacy fallback (inferLLMProviderLegacy), NOT as a
-    # registry data flag. Live `openai/<m>` ids resolve here by namespace.
+    # maps the `openai/` namespace token to THIS entry, then dials its
+    # base_url_template + auth (the SINGLE source). openai is ALSO the proxy's
+    # historical catch-all (the legacy switch's `default:` arm) for bare/unknown
+    # ids — a VESTIGIAL bare-id behavior (no live bare traffic) retained in
+    # inferLLMProviderLegacy, NOT a registry flag. Live `openai/<m>` ids resolve
+    # here by namespace. The openai-subscription OAuth arm carries NO
+    # upstream_vendor (OAuth never traverses the proxy).
     upstream_vendor: openai
 
   # ===========================================================================
@@ -357,6 +412,26 @@ providers:
     model_prefix_match: "^gemini-"
     model_aliases: []
 
+  # Google Vertex AI — KEYLESS arm (mirrors the anthropic-oauth / anthropic-api
+  # and openai-subscription / openai-api split: same vendor, distinct auth).
+  # google-adk serves Gemini via Vertex using Application Default Credentials
+  # over Workload Identity Federation (AWS EC2 role -> GCP STS -> SA), injected
+  # by the provisioner (cp#416 + envs.yaml vertex block) as a NON-SECRET
+  # external_account cred-config at GOOGLE_APPLICATION_CREDENTIALS. No API key.
+  # Distinct `vertex:` model namespace keeps it unambiguous vs the API-key
+  # `google` vendor's ^gemini- (TestNoAmbiguousModelMatch).
+  - name: vertex
+    display_name: "Google Vertex AI (keyless ADC)"
+    vendor_logo: "google"
+    protocol: openai
+    auth_mode: third_party_anthropic_compat
+    base_url_template: null
+    base_url_anthropic: null
+    auth_env: [GOOGLE_APPLICATION_CREDENTIALS]
+    auth_token_env: ANTHROPIC_AUTH_TOKEN
+    model_prefix_match: "^vertex:"
+    model_aliases: []
+
   - name: alibaba
     display_name: "Alibaba Qwen (DashScope)"
     vendor_logo: "alibaba"
@@ -561,7 +636,8 @@ providers:
 # AUTHORITATIVE MATRIX (provider level), encoded EXACTLY below:
 #   claude-code -> anthropic (oauth + api), kimi (kimi-coding), minimax
 #   hermes      -> kimi (kimi-coding)
-#   codex       -> openai
+#   codex       -> openai (subscription + api — the split openai-subscription /
+#                  openai-api pair, mirroring anthropic oauth+api)
 #   openclaw    -> kimi (kimi-coding)
 #
 # Each runtime entry lists native provider NAMES (referencing `providers:`
@@ -689,12 +765,39 @@ runtimes:
           - moonshot/kimi-k2.6
           - moonshot/kimi-k2.5
 
-  # codex: OpenAI — BYOK (subscription + API key, both map to the `openai`
-  # manifest provider) + platform-managed (the `platform` ref below, served
-  # via the proxy Responses surface).
+  # codex: OpenAI — BYOK split across TWO native providers
+  # (openai-subscription + openai-api), mirroring claude-code's anthropic
+  # oauth+api split, PLUS platform-managed (the `platform` ref below, served via
+  # the proxy Responses surface).
+  #
+  # The split fixes the prod "picks provider='openai' but it is not in the
+  # providers registry. Known providers: openai-subscription, openai-api" wedge:
+  # the codex template/adapter registry uses the SPLIT names, never bare
+  # `openai`, so the SSOT must derive one of them. openai-subscription is the
+  # DEFAULT (the adapter's resolve-provider precedence #1 picks the ChatGPT/Codex
+  # subscription when CODEX_AUTH_JSON is present), so it is listed FIRST and owns
+  # the bare gpt-* family — DeriveProvider(codex, gpt-5.5) -> openai-subscription.
+  # openai-api is referenced too (the direct-OPENAI_API_KEY BYOK arm); the same
+  # gpt-* ids are exact-listed under both arms and DeriveProvider disambiguates
+  # by available auth env (OPENAI_API_KEY -> openai-api; the subscription
+  # auth.json env or no auth context -> the first-declared default,
+  # openai-subscription) — the identical oauth-vs-key disambiguation
+  # claude-code's anthropic pair uses.
   codex:
     providers:
-      - name: openai
+      # DEFAULT arm (listed first): ChatGPT/Codex subscription via OAuth.
+      - name: openai-subscription
+        models:
+          - gpt-5.5
+          - gpt-5.4
+          - gpt-5.4-mini
+          - gpt-5.3-codex
+          - gpt-5.3-codex-spark
+          - gpt-5.2
+      # Direct OpenAI API-key BYOK arm. Same gpt-* family; selected over the
+      # subscription default when OPENAI_API_KEY is the available auth env (or
+      # via the explicit provisioner LLM_PROVIDER=openai-api).
+      - name: openai-api
         models:
           - gpt-5.5
           - gpt-5.4
@@ -730,3 +833,19 @@ runtimes:
         models:
           - moonshot/kimi-k2.6
           - moonshot/kimi-k2.5
+
+
+  # google-adk: Gemini via Vertex AI, keyless ADC (Workload Identity
+  # Federation; provisioner cp#416 + envs.yaml). The google vendor entry
+  # in the top-level providers: list supplies auth/model-prefix metadata;
+  # this runtimes entry declares the selectable model set.
+  google-adk:
+    providers:
+      # Keyless Vertex (org-compliant default): Gemini via Vertex AI + ADC/WIF.
+      - name: vertex
+        models:
+          - vertex:gemini-2.5-pro
+      # API-key BYOK arm: AI Studio GEMINI_API_KEY/GOOGLE_API_KEY.
+      - name: google
+        models:
+          - gemini-2.5-pro

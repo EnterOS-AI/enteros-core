@@ -113,9 +113,13 @@ func TestMatchesModel(t *testing.T) {
 		{"MiniMax-M2.7", "minimax"},
 		{"MiniMax-M2", "minimax"},
 		{"minimax-m2.5", "minimax"},
-		// OpenAI — DB gpt-5.x + canvas /^gpt-/.
-		{"gpt-5.5", "openai"},
-		{"gpt-5.4-mini", "openai"},
+		// OpenAI — the bare gpt-* family is owned by the codex DEFAULT arm
+		// openai-subscription (the OAuth subscription); openai-api uses a
+		// disjoint sentinel prefix so the catalog overlap guard stays green
+		// (mirror of anthropic-oauth's alias-only regex vs anthropic-api's
+		// ^claude). canvas /^gpt-/.
+		{"gpt-5.5", "openai-subscription"},
+		{"gpt-5.4-mini", "openai-subscription"},
 		// Xiaomi MiMo — adapter mimo- + canvas /^mimo-/.
 		{"mimo-v2.5-pro", "xiaomi-mimo"},
 		// Z.ai GLM — adapter glm- + canvas /^GLM-/ (mixed case).
@@ -203,5 +207,111 @@ func TestMatchesModelZeroValue(t *testing.T) {
 	empty := Provider{}
 	if empty.MatchesModel("anything") {
 		t.Error("Provider with an empty regex must never match")
+	}
+}
+
+// TestGoogleADKRuntimeRegistered locks the providers.yaml SSOT entry for the
+// google-adk runtime (Gemini via Vertex AI, keyless ADC). The runtime picker
+// + GET /templates enrichment read this matrix as SSOT; a missing entry
+// silently degrades the ADK runtime's model/provider surface. See
+// project_canvas_runtime_dropdown_ssot_fix.
+func TestGoogleADKRuntimeRegistered(t *testing.T) {
+	m, err := LoadManifest()
+	if err != nil {
+		t.Fatalf("LoadManifest() error = %v", err)
+	}
+	models, err := m.ModelsForRuntime("google-adk")
+	if err != nil {
+		t.Fatalf("ModelsForRuntime(google-adk) error = %v", err)
+	}
+	hasModel := false
+	for _, id := range models {
+		if id == "gemini-2.5-pro" {
+			hasModel = true
+		}
+	}
+	if !hasModel {
+		t.Errorf("google-adk models missing gemini-2.5-pro; got %v", models)
+	}
+	provs, err := m.ProvidersForRuntime("google-adk")
+	if err != nil {
+		t.Fatalf("ProvidersForRuntime(google-adk) error = %v", err)
+	}
+	hasProv := false
+	for _, p := range provs {
+		if p.Name == "google" {
+			hasProv = true
+		}
+	}
+	if !hasProv {
+		t.Errorf("google-adk providers missing google vendor; got %d providers", len(provs))
+	}
+}
+
+// TestVertexProviderRegistered locks the keyless Vertex provider variant in the
+// providers.yaml SSOT. google-adk serves Gemini via Vertex AI with ADC/WIF
+// (no API key); the registry must model that as a first-class "vertex" provider
+// (auth_env GOOGLE_APPLICATION_CREDENTIALS, ^vertex: namespace) distinct from
+// the API-key "google" vendor, and the google-adk runtime must offer both arms.
+// See project_canvas_runtime_dropdown_ssot_fix.
+func TestVertexProviderRegistered(t *testing.T) {
+	ps, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	var vertex *Provider
+	for i := range ps {
+		if ps[i].Name == "vertex" {
+			vertex = &ps[i]
+		}
+	}
+	if vertex == nil {
+		t.Fatal("vertex provider not registered in providers.yaml")
+	}
+	// Keyless: ADC env, not an API key.
+	hasADC := false
+	for _, e := range vertex.AuthEnv {
+		if e == "GOOGLE_APPLICATION_CREDENTIALS" {
+			hasADC = true
+		}
+	}
+	if !hasADC {
+		t.Errorf("vertex auth_env should be keyless GOOGLE_APPLICATION_CREDENTIALS; got %v", vertex.AuthEnv)
+	}
+	// Owns the vertex: namespace, NOT ^gemini- (which the API-key google vendor owns).
+	if !vertex.MatchesModel("vertex:gemini-2.5-pro") {
+		t.Errorf("vertex provider should match vertex:gemini-2.5-pro")
+	}
+	if vertex.MatchesModel("gemini-2.5-pro") {
+		t.Errorf("vertex provider must NOT claim the bare gemini- namespace (owned by google vendor)")
+	}
+
+	m, err := LoadManifest()
+	if err != nil {
+		t.Fatalf("LoadManifest() error = %v", err)
+	}
+	provs, err := m.ProvidersForRuntime("google-adk")
+	if err != nil {
+		t.Fatalf("ProvidersForRuntime(google-adk) error = %v", err)
+	}
+	names := map[string]bool{}
+	for _, p := range provs {
+		names[p.Name] = true
+	}
+	if !names["vertex"] {
+		t.Errorf("google-adk runtime should offer the keyless vertex arm; got %v", names)
+	}
+	if !names["google"] {
+		t.Errorf("google-adk runtime should keep the API-key google arm; got %v", names)
+	}
+	models, _ := m.ModelsForRuntime("google-adk")
+	hasVertexModel := false
+	for _, id := range models {
+		if id == "vertex:gemini-2.5-pro" {
+			hasVertexModel = true
+		}
+	}
+	if !hasVertexModel {
+		t.Errorf("google-adk models should include vertex:gemini-2.5-pro; got %v", models)
 	}
 }

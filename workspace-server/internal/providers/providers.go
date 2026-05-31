@@ -1,27 +1,18 @@
-// Package providers is the molecule-core SIDE of the LLM provider registry
-// SSOT (internal#718 P2-A, CTO 2026-05-27 "Distribution = SDK via codegen +
-// verify-CI"). It is a load-time mirror of the canonical loader that lives in
-// molecule-controlplane internal/providers — same parse, same validation, same
-// DeriveProvider/IsPlatform/ResolveUpstream API.
+// Package providers is the SSOT baseline for the LLM provider registry.
 //
-// CANONICAL SSOT = molecule-controlplane internal/providers/providers.yaml.
-// This package embeds a SYNCED COPY of that file (providers.yaml here is a
-// byte-for-byte mirror of the canonical, NOT a second authoring surface). The
-// CTO-decided distribution model for a multi-repo registry is
-// "codegen-checked-into-each-repo + verify-CI": every consumer repo carries the
-// generated projection and a drift gate, so a registry change in CP must be
-// re-synced here (the sync-providers-yaml verify gate goes RED if this copy
-// drifts from the canonical). molecule-core has no Go module dependency on
-// controlplane, so a synced+gated copy is the blessed path (a shared Go module
-// is not viable across the two repos today).
+// RFC: molecule-ai/molecule-controlplane#340 "Canonical Providers
+// Manifest". This package is PR-1: it embeds and parses providers.yaml
+// (the git-tracked baseline that transcribes the union of the proxy
+// switch, the canvas VENDOR_LABELS, the adapter config.yaml `providers:`
+// block, and the DB llm_price_catalog). NOTHING imports it yet — the
+// consumers (internal/handlers/llm_proxy.go, the canvas dropdown, and
+// the workspace-template adapters) are migrated in later PRs. Reverting
+// PR-1 = delete this package; zero runtime behavior change.
 //
-// P2-A is ADDITIVE, ZERO behavior change (the P0 shape mirrored): the loader +
-// DeriveProvider land here, plus the generated artifact (cmd/gen-providers) and
-// the verify-providers-gen drift gate, but NO production code path imports this
-// package yet. P2-B wires the billing/credential decision onto DeriveProvider.
-//
-// Distribution model mirrors molecule-controlplane internal/providers: go:embed
-// the YAML into the binary so a boot-time Load never touches the network.
+// Distribution model mirrors internal/envs (RFC internal#213 §6.5.4
+// Option C): go:embed the YAML into the binary so a boot-time Load never
+// touches the network. A future DB override layer (RFC §3 (c)) can merge
+// on top of the embedded baseline without breaking this package's API.
 package providers
 
 import (
@@ -311,9 +302,24 @@ func (m *Manifest) ModelsForRuntime(rt string) ([]string, error) {
 	if !ok {
 		return nil, fmt.Errorf("providers: unknown runtime %q", rt)
 	}
+	// De-duplicate while preserving first-seen order. A single model id may be
+	// exact-listed under MORE THAN ONE native arm — the legitimate "one model
+	// id, two auth arms" shape (codex's gpt-* family is offered on both the
+	// openai-subscription OAuth arm and the openai-api direct-key arm, mirroring
+	// claude-code's anthropic oauth+api split). The canvas surfaces each id
+	// once (the auth path is chosen at runtime by which key is present), so the
+	// flattened native model set must not repeat it. A no-op for every runtime
+	// whose arms list disjoint ids.
 	var out []string
+	seen := make(map[string]struct{})
 	for _, ref := range native.Providers {
-		out = append(out, ref.Models...)
+		for _, mid := range ref.Models {
+			if _, dup := seen[mid]; dup {
+				continue
+			}
+			seen[mid] = struct{}{}
+			out = append(out, mid)
+		}
 	}
 	return out, nil
 }
