@@ -58,7 +58,18 @@ func TestDeriveProvider_RealManifest(t *testing.T) {
 		{"claude-code api sonnet versioned", "claude-code", "claude-sonnet-4-6", []string{"ANTHROPIC_API_KEY"}, "anthropic-api"},
 
 		// --- other runtimes' native sets --------------------------------
-		{"codex byok gpt-5.5", "codex", "gpt-5.5", []string{"OPENAI_API_KEY"}, "openai"},
+		// codex OpenAI is split across openai-subscription (OAuth — the
+		// DEFAULT) + openai-api (direct key), mirroring the anthropic
+		// oauth+api split. The codex template/adapter registry uses these
+		// SPLIT names, never bare `openai` (the prod "picks provider='openai'
+		// but it is not in the providers registry" wedge this fixes). The
+		// shared gpt-* ids are exact-listed under BOTH arms and disambiguated
+		// by available auth env, defaulting to the first-declared arm
+		// (openai-subscription) when no auth context resolves it.
+		{"codex byok gpt-5.5 with OPENAI_API_KEY -> api", "codex", "gpt-5.5", []string{"OPENAI_API_KEY"}, "openai-api"},
+		{"codex byok gpt-5.5 with CODEX_AUTH_JSON -> subscription", "codex", "gpt-5.5", []string{"CODEX_AUTH_JSON"}, "openai-subscription"},
+		{"codex byok gpt-5.5 no auth -> subscription (default)", "codex", "gpt-5.5", nil, "openai-subscription"},
+		{"codex byok gpt-5.4-mini no auth -> subscription (default)", "codex", "gpt-5.4-mini", nil, "openai-subscription"},
 		{"claude-code minimax", "claude-code", "MiniMax-M2.7", []string{"MINIMAX_API_KEY"}, "minimax"},
 		{"openclaw byok colon", "openclaw", "moonshot:kimi-k2.6", []string{"KIMI_API_KEY"}, "kimi-coding"},
 	}
@@ -334,9 +345,13 @@ func TestResolveUpstream_RealManifest(t *testing.T) {
 		{"platform moonshot colon (openclaw)", "moonshot:kimi-k2.6", "moonshot", "kimi-k2.6", "moonshot", false},
 		// anthropic namespace resolves to the anthropic-api ENTRY (name != vendor).
 		{"platform anthropic ns", "anthropic/claude-opus-4-7", "anthropic", "claude-opus-4-7", "anthropic-api", false},
-		{"platform openai ns", "openai/gpt-5.4", "openai", "gpt-5.4", "openai", false},
+		// openai namespace resolves to the openai-api ENTRY (name != vendor),
+		// mirroring anthropic/ -> anthropic-api: the OAuth subscription arm
+		// carries NO upstream_vendor (OAuth never traverses the proxy), so the
+		// `openai/` namespace + Responses surface route through openai-api.
+		{"platform openai ns", "openai/gpt-5.4", "openai", "gpt-5.4", "openai-api", false},
 		{"platform minimax ns", "minimax/MiniMax-M2.7", "minimax", "MiniMax-M2.7", "minimax", false},
-		{"openai ns gpt-4o", "openai/gpt-4o", "openai", "gpt-4o", "openai", false},
+		{"openai ns gpt-4o", "openai/gpt-4o", "openai", "gpt-4o", "openai-api", false},
 		// --- bare ids are VESTIGIAL at the proxy: ResolveUpstream errors (the
 		//     proxy falls back to its legacy switch for these). No live bare traffic.
 		{"bare kimi -> err (vestigial, legacy fallback)", "kimi-k2.6", "", "", "", true},
@@ -417,7 +432,7 @@ func TestResolveUpstream_ResolvesToProviderEntry(t *testing.T) {
 		{"moonshot/kimi-k2.6", "moonshot", "https://api.moonshot.ai/v1", "https://api.moonshot.ai/anthropic/v1", "MOONSHOT_API_KEY"},
 		{"anthropic/claude-opus-4-7", "anthropic-api", "https://api.anthropic.com/v1", "https://api.anthropic.com/v1", "ANTHROPIC_API_KEY"},
 		{"minimax/MiniMax-M2.7", "minimax", "https://api.minimax.io/v1", "https://api.minimax.io/anthropic/v1", "MINIMAX_API_KEY"},
-		{"openai/gpt-5.4", "openai", "https://api.openai.com/v1", "", "OPENAI_API_KEY"},
+		{"openai/gpt-5.4", "openai-api", "https://api.openai.com/v1", "", "OPENAI_API_KEY"},
 	}
 	for _, tc := range cases {
 		up, err := m.ResolveUpstream(tc.model)
@@ -505,9 +520,12 @@ func TestResolveUpstream_OnlyRoutingEntriesCarryVendor(t *testing.T) {
 	}
 	want := map[string]string{
 		"anthropic": "anthropic-api",
-		"openai":    "openai",
-		"moonshot":  "moonshot",
-		"minimax":   "minimax",
+		// openai's upstream_vendor lives on the openai-api entry (the proxy
+		// arm); the openai-subscription OAuth arm carries none — OAuth never
+		// traverses the proxy (mirror of anthropic-oauth).
+		"openai":   "openai-api",
+		"moonshot": "moonshot",
+		"minimax":  "minimax",
 	}
 	if len(got) != len(want) {
 		t.Fatalf("upstream_vendor entries = %v, want exactly %v", got, want)
@@ -515,6 +533,88 @@ func TestResolveUpstream_OnlyRoutingEntriesCarryVendor(t *testing.T) {
 	for v, name := range want {
 		if got[v] != name {
 			t.Errorf("upstream_vendor %q -> entry %q, want %q", v, got[v], name)
+		}
+	}
+}
+
+// codexTemplateProviderRegistry is the set of provider names the DEPLOYED codex
+// workspace template/adapter accepts in its `providers:` registry
+// (git.moleculesai.app/molecule-ai/molecule-ai-workspace-template-codex
+// config.yaml — the source of truth for the codex adapter's vocabulary). The
+// adapter REJECTS any provider name not in this set with the prod error:
+//
+//	ValueError: codex adapter: workspace config picks provider='openai' but it
+//	is not in the providers registry. Known providers: openai-subscription,
+//	openai-api
+//
+// `minimax-token-plan` + `platform` are also in the template but are NOT in the
+// codex NATIVE matrix (token-plan is pruned — the vendor's /v1/responses leg
+// 404s; platform is core-only billing), so the BYOK arms the SSOT derives must
+// be a SUBSET of {openai-subscription, openai-api}. `platform` is the legitimate
+// platform-managed exception (it is in both the template and the native set).
+var codexTemplateProviderRegistry = map[string]struct{}{
+	"openai-subscription": {},
+	"openai-api":          {},
+	"minimax-token-plan":  {},
+	"platform":            {},
+}
+
+// TestCodexDerivesOnlyTemplateRegistryProviders is the DRIFT GATE that the
+// pre-fix gate MISSED: it caught the claude-code/kimi SSOT↔template divergence
+// but NOT codex's (the SSOT derived bare `openai`, which the codex adapter
+// rejects). It asserts that for EVERY model the codex runtime natively exposes,
+// DeriveProvider resolves to a provider name the deployed codex template's
+// `providers:` registry actually accepts — so a future SSOT edit that derives a
+// codex-adapter-unknown provider (a bare `openai` regression, a typo'd arm)
+// fails RED here instead of wedging codex agents as NOT CONFIGURED in prod.
+func TestCodexDerivesOnlyTemplateRegistryProviders(t *testing.T) {
+	m, err := LoadManifest()
+	if err != nil {
+		t.Fatalf("LoadManifest() error = %v", err)
+	}
+	models, err := m.ModelsForRuntime("codex")
+	if err != nil {
+		t.Fatalf("ModelsForRuntime(codex) error = %v", err)
+	}
+	if len(models) == 0 {
+		t.Fatal("codex native model set is empty — nothing to gate")
+	}
+	// Exercise both auth contexts the codex adapter resolves: the OAuth
+	// subscription (CODEX_AUTH_JSON) and the direct key (OPENAI_API_KEY), plus
+	// the no-auth default. Every resulting provider name MUST be one the codex
+	// template registry accepts (never bare `openai`).
+	authContexts := [][]string{
+		nil,                          // no auth -> default (subscription)
+		{"CODEX_AUTH_JSON"},          // ChatGPT/Codex subscription
+		{"OPENAI_API_KEY"},           // direct OpenAI key
+		{"MOLECULE_LLM_USAGE_TOKEN"}, // platform-managed
+	}
+	for _, model := range models {
+		for _, authEnv := range authContexts {
+			p, derr := m.DeriveProvider("codex", model, authEnv)
+			if derr != nil {
+				// A platform/-namespaced id requires the platform auth env to
+				// disambiguate; an unrelated auth context legitimately can't
+				// resolve it. Only a CLEAN derivation must be in-registry.
+				continue
+			}
+			if _, ok := codexTemplateProviderRegistry[p.Name]; !ok {
+				t.Errorf("codex model %q (authEnv=%v) derived provider %q, which the codex template registry REJECTS (known: openai-subscription, openai-api, minimax-token-plan, platform) — SSOT↔template drift, the exact prod wedge",
+					model, authEnv, p.Name)
+			}
+		}
+	}
+	// And pin the load-bearing default explicitly: the bare gpt-* family with
+	// no auth context defaults to the OAuth subscription (the codex adapter's
+	// resolve-provider precedence #1), never bare `openai`.
+	for _, model := range []string{"gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.2"} {
+		p, derr := m.DeriveProvider("codex", model, nil)
+		if derr != nil {
+			t.Errorf("codex default derivation for %q errored: %v", model, derr)
+			continue
+		}
+		if p.Name != "openai-subscription" {
+			t.Errorf("codex default for %q = %q, want openai-subscription (the OAuth subscription default)", model, p.Name)
 		}
 	}
 }

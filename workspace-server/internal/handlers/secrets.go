@@ -24,6 +24,7 @@ var platformManagedDirectLLMBypassKeys = map[string]struct{}{
 	"ANTHROPIC_AUTH_TOKEN":    {},
 	"ARCEEAI_API_KEY":         {},
 	"CLAUDE_CODE_OAUTH_TOKEN": {},
+	"CODEX_AUTH_JSON":         {},
 	"DASHSCOPE_API_KEY":       {},
 	"DEEPSEEK_API_KEY":        {},
 	"GEMINI_API_KEY":          {},
