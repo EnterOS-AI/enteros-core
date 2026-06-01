@@ -42,6 +42,7 @@ type trackingCPProv struct {
 	mu       sync.Mutex
 	started  []string
 	stopped  []string
+	pruned   []string // internal#734: workspaces stopped via StopAndPrune
 	startErr error
 	stopErr  error
 }
@@ -58,6 +59,13 @@ func (r *trackingCPProv) Start(_ context.Context, cfg provisioner.WorkspaceConfi
 func (r *trackingCPProv) Stop(_ context.Context, workspaceID string) error {
 	r.mu.Lock()
 	r.stopped = append(r.stopped, workspaceID)
+	r.mu.Unlock()
+	return r.stopErr
+}
+func (r *trackingCPProv) StopAndPrune(_ context.Context, workspaceID string) error {
+	r.mu.Lock()
+	r.stopped = append(r.stopped, workspaceID)
+	r.pruned = append(r.pruned, workspaceID)
 	r.mu.Unlock()
 	return r.stopErr
 }

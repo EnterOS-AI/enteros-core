@@ -357,6 +357,14 @@ jobs:
         name: Run E2E bash unit tests (no live infra)
         run: |
           bash tests/e2e/test_model_slug.sh
+          # molecule-core#1995 (#1994 follow-on): fail-direction proof for
+          # the A2A real-completion + byok-routing assertion helpers
+          # (lib/completion_assert.sh). Offline (no LLM, no network): it
+          # asserts an error-as-text payload FAILS the real-completion gate
+          # — the exact trap the historical shape-only `"kind":"text"`
+          # check missed. If a refactor weakens the gate to a shape check,
+          # this step goes red on every PR.
+          bash tests/e2e/test_completion_assert_unit.sh
 
       - if: ${{ needs.changes.outputs.scripts == 'true' }}
         name: Test ECR promote-tenant-image script (mock-driven, no live infra)
@@ -467,10 +475,10 @@ jobs:
     #
     # Emits `CI / all-required (<event>)` where <event> is the workflow trigger
     # (e.g. `CI / all-required (pull_request)`, `CI / all-required (push)`).
-    # Branch protection MUST be updated to require the event-suffixed name —
+    # Branch protection requires the event-suffixed name —
     # requiring `CI / all-required` (bare, no suffix) silently blocks all merges
     # because Gitea treats absent status contexts as pending (not skipped), and
-    # no workflow emits the bare name. Fixed: BP now requires
+    # no workflow emits the bare name. BP requires
     # `CI / all-required (pull_request)` per issue #1473.
     #
     # Closes the failure mode where status_check_contexts on molecule-core/main
@@ -479,129 +487,91 @@ jobs:
     # red silently merged through. See internal#286 for the three concrete
     # tonight-of-2026-05-11 incidents that prompted the emergency bump.
     #
-    # This job deliberately has no `needs:`. Gitea 1.22/act_runner can mark a
-    # job-level `if: always()` + `needs:` sentinel as skipped before upstream
-    # jobs settle, leaving branch protection with a permanent pending
-    # `CI / all-required` context. Instead, this independent sentinel polls the
-    # required commit-status contexts for this SHA and fails if any fail, skip,
-    # or never emit. It runs the same path detector as `changes` and only waits
-    # for path-relevant jobs; Gitea can otherwise leave needs/output-skipped
-    # jobs permanently pending with "Blocked by required conditions". It runs on
-    # the dedicated `ci-meta` lane so the poller does not occupy the same
-    # general runner pool as the jobs it is waiting for.
+    # ── 2026-06-01 CI-scheduler-overload fix (fix/ci-scheduler-fanout) ──
+    # PREVIOUS shape: a poll-gate that ran detect-changes then LOOPED on
+    # `GET /commits/{sha}/statuses` every 15s for up to 40 min, occupying a
+    # `ci-meta` executor slot the entire time it waited for upstream jobs.
+    # With only 2 ci-meta runners, that poll-loop squatted half the lane on
+    # every PR — a confirmed throughput sink in the live RCA (two concurrent
+    # `JOB-all-required` containers observed pinning the lane). The polling
+    # design existed only to dodge the Gitea `needs:` + `if: always()` bug,
+    # where an always()-guarded sentinel could be marked skipped before
+    # upstream jobs settled (leaving BP pending forever).
     #
-    # canvas-deploy-reminder is intentionally NOT included in all-required.needs.
-    # It is an informational main-push reminder, not a PR quality gate. Keeping
-    # it in this dependency list lets a skipped reminder skip the required
-    # sentinel before the `always()` guard can emit a branch-protection status.
+    # NEW shape: a plain `needs:` aggregator with NO polling loop. This is
+    # safe here — and was NOT safe at the time the poller was written —
+    # because every aggregated CI job now gates its real work PER-STEP
+    # (`if: needs.changes.outputs.* != 'true'`) rather than at the JOB level.
+    # A per-step-gated job always reaches a terminal SUCCESS (it no-ops its
+    # expensive steps but the job itself still completes), so it is never
+    # `skipped`. Plain `needs:` (WITHOUT `if: always()`) works correctly on
+    # Gitea 1.22.6 / act_runner v0.6.1 — only `needs:` + `if: always()` is
+    # broken (feedback_gitea_needs_works_only_ifalways_broken). We therefore
+    # use plain `needs:` + an explicit per-need result check (NOT
+    # `if: always()`); if any need fails/errors, Gitea never starts this job
+    # and BP sees `CI / all-required` go red via the failed dependency
+    # propagation — exactly the gate we want, with zero runner-squat.
     #
+    # The `needs:` list MUST stay in lockstep with ci-required-drift.py's
+    # F1 check (`ci_job_names()` = every job MINUS the sentinel MINUS jobs
+    # whose `if:` gates on github.event_name/github.ref). canvas-deploy-
+    # reminder is event-gated (`if: github.ref == refs/heads/{main,staging}`)
+    # so it is intentionally EXCLUDED — it skips on PRs and a `needs:` on a
+    # skipped job would never let the sentinel run. If a new always-running
+    # CI job is added, add it here too or ci-required-drift F1 will flag it.
+    #
+    # Stays on the dedicated `ci-meta` lane (no docker work, so the
+    # docker-host-pin lint does not apply), but now the job is sub-second:
+    # it only inspects already-settled `needs.*.result` values, so it frees
+    # the slot immediately instead of holding it for the whole CI duration.
+    #
+    needs:
+      - changes
+      - platform-build
+      - canvas-build
+      - shellcheck
+      - python-lint
     continue-on-error: false
     runs-on: ci-meta
-    timeout-minutes: 45
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          fetch-depth: 0
-      - id: check
+      - name: Verify all aggregated CI jobs succeeded
+        # NO polling, NO API call, NO checkout. Because this job lists the
+        # aggregated jobs under `needs:` (without `if: always()`), Gitea only
+        # starts it once every need has reached SUCCESS — a failed/errored
+        # need short-circuits the job and propagates red to the
+        # `CI / all-required` context. This explicit check is a
+        # belt-and-suspenders assertion + a readable run summary; the real
+        # gating is the `needs:` edge itself.
         env:
-          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
-          PUSH_BEFORE: ${{ github.event.before }}
-        run: |
-          python3 .gitea/scripts/detect-changes.py \
-            --profile ci \
-            --event-name "${{ github.event_name }}" \
-            --pr-base-sha "$PR_BASE_SHA" \
-            --base-ref "$PR_BASE_REF" \
-            --push-before "${GITHUB_EVENT_BEFORE:-$PUSH_BEFORE}"
-      - name: Wait for required CI contexts
-        env:
-          GITEA_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          API_ROOT: ${{ github.server_url }}/api/v1
-          REPOSITORY: ${{ github.repository }}
-          COMMIT_SHA: ${{ github.sha }}
-          EVENT_NAME: ${{ github.event_name }}
-          REQUIRE_PLATFORM: ${{ steps.check.outputs.platform }}
-          REQUIRE_CANVAS: ${{ steps.check.outputs.canvas }}
-          REQUIRE_SCRIPTS: ${{ steps.check.outputs.scripts }}
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          PLATFORM_RESULT: ${{ needs.platform-build.result }}
+          CANVAS_RESULT: ${{ needs.canvas-build.result }}
+          SHELLCHECK_RESULT: ${{ needs.shellcheck.result }}
+          PYTHON_LINT_RESULT: ${{ needs.python-lint.result }}
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          import json
-          import os
-          import sys
-          import time
-          import urllib.error
-          import urllib.request
-
-          token = os.environ["GITEA_TOKEN"]
-          api_root = os.environ["API_ROOT"].rstrip("/")
-          repo = os.environ["REPOSITORY"]
-          sha = os.environ["COMMIT_SHA"]
-          event = os.environ["EVENT_NAME"]
-          required = [
-              f"CI / Detect changes ({event})",
-              f"CI / Python Lint & Test ({event})",
-          ]
-          if os.environ.get("REQUIRE_PLATFORM") == "true":
-              required.append(f"CI / Platform (Go) ({event})")
-          if os.environ.get("REQUIRE_CANVAS") == "true":
-              required.append(f"CI / Canvas (Next.js) ({event})")
-          if os.environ.get("REQUIRE_SCRIPTS") == "true":
-              required.append(f"CI / Shellcheck (E2E scripts) ({event})")
-          terminal_bad = {"failure", "error"}
-          deadline = time.time() + 40 * 60
-          last_summary = None
-
-          def fetch_statuses():
-              statuses = []
-              for page in range(1, 6):
-                  url = f"{api_root}/repos/{repo}/commits/{sha}/statuses?page={page}&limit=100"
-                  req = urllib.request.Request(url, headers={"Authorization": f"token {token}"})
-                  with urllib.request.urlopen(req, timeout=10) as resp:
-                      chunk = json.load(resp)
-                  if not chunk:
-                      break
-                  statuses.extend(chunk)
-              latest = {}
-              for item in statuses:
-                  ctx = item.get("context")
-                  if not ctx:
-                      continue
-                  prev = latest.get(ctx)
-                  if prev is None or (item.get("updated_at") or item.get("created_at") or "") >= (prev.get("updated_at") or prev.get("created_at") or ""):
-                      latest[ctx] = item
-              return latest
-
-          while True:
-              try:
-                  latest = fetch_statuses()
-              except (TimeoutError, OSError, urllib.error.URLError) as exc:
-                  if time.time() >= deadline:
-                      print(f"FAIL: status polling did not recover before deadline: {exc}", file=sys.stderr)
-                      sys.exit(1)
-                  print(f"WARN: status poll failed, retrying: {exc}", flush=True)
-                  time.sleep(15)
-                  continue
-              states = {ctx: (latest.get(ctx) or {}).get("status") or (latest.get(ctx) or {}).get("state") or "missing" for ctx in required}
-              summary = ", ".join(f"{ctx}={state}" for ctx, state in states.items())
-              if summary != last_summary:
-                  print(summary, flush=True)
-                  last_summary = summary
-              bad = {ctx: state for ctx, state in states.items() if state in terminal_bad}
-              if bad:
-                  print("FAIL: required CI context failed:", file=sys.stderr)
-                  for ctx, state in bad.items():
-                      desc = (latest.get(ctx) or {}).get("description") or ""
-                      print(f"  - {ctx}: {state} {desc}", file=sys.stderr)
-                  sys.exit(1)
-              if all(state == "success" for state in states.values()):
-                  print(f"OK: all {len(required)} required CI contexts succeeded")
-                  sys.exit(0)
-              if time.time() >= deadline:
-                  print("FAIL: timed out waiting for required CI contexts:", file=sys.stderr)
-                  for ctx, state in states.items():
-                      print(f"  - {ctx}: {state}", file=sys.stderr)
-                  sys.exit(1)
-              time.sleep(15)
-          PY
+          fail=0
+          check() {
+            name="$1"; result="$2"
+            printf 'CI / %s = %s\n' "$name" "$result"
+            # `success` is the only green terminal state we accept. A plain
+            # `needs:` job is only started when all needs succeed, so reaching
+            # this step already implies success — but assert explicitly so a
+            # future `if: always()` reintroduction (which WOULD let non-success
+            # through) fails loudly instead of silently passing the gate.
+            if [ "$result" != "success" ]; then
+              echo "::error::aggregated CI job '${name}' did not succeed (result=${result})"
+              fail=1
+            fi
+          }
+          check "Detect changes"        "$CHANGES_RESULT"
+          check "Platform (Go)"         "$PLATFORM_RESULT"
+          check "Canvas (Next.js)"      "$CANVAS_RESULT"
+          check "Shellcheck (E2E scripts)" "$SHELLCHECK_RESULT"
+          check "Python Lint & Test"    "$PYTHON_LINT_RESULT"
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::all-required: one or more aggregated CI jobs did not succeed"
+            exit 1
+          fi
+          echo "OK: all aggregated CI jobs succeeded — CI / all-required green."

@@ -16,9 +16,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/DATA-DOG/go-sqlmock"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
+	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/gin-gonic/gin"
 )
 
@@ -2114,6 +2114,10 @@ func (f *fakeCPProv) Start(_ context.Context, _ provisioner.WorkspaceConfig) (st
 	return "", nil
 }
 func (f *fakeCPProv) Stop(_ context.Context, _ string) error {
+	f.stopCalls++
+	return nil
+}
+func (f *fakeCPProv) StopAndPrune(_ context.Context, _ string) error {
 	f.stopCalls++
 	return nil
 }

@@ -399,7 +399,13 @@ func (h *WorkspaceHandler) Delete(c *gin.Context) {
 	// disable, broadcast). The HTTP-specific bits — direct-children 409
 	// gate above, ?purge=true hard-delete below, response shaping —
 	// stay in this handler.
-	descendantIDs, stopErrs, err := h.CascadeDelete(ctx, id)
+	// internal#734: the user can ask to erase saved data (browser profile /
+	// cookies / downloads / agent memory) on delete. Opt-in — default keeps the
+	// data on its volume for the orphan-sweeper grace. Only a genuine
+	// permanent-delete reaches here (restart/reconcile use other paths), so this
+	// is the one place prune may be requested.
+	erase := c.Query("erase_data") == "true"
+	descendantIDs, stopErrs, err := h.CascadeDelete(ctx, id, erase)
 	if err != nil {
 		// Audit 2026-05-09 (Core-Security): raw `err.Error()` here was
 		// exposed to HTTP clients verbatim, including wrapped lib/pq
@@ -515,7 +521,13 @@ func destructiveDeleteCounts(ctx context.Context, id string) (childCount int, sc
 // Caller is responsible for the children-confirmation gate (the HTTP handler
 // returns 409 when children exist + ?confirm=true is missing); this helper
 // always cascades.
-func (h *WorkspaceHandler) CascadeDelete(ctx context.Context, id string) ([]string, []error, error) {
+// CascadeDelete tears down a workspace and its descendants (stop compute,
+// remove volumes, revoke tokens, disable schedules, broadcast). erase=true
+// (internal#734) means the user asked to erase saved data, so the CP compute
+// teardown prunes each workspace's durable data volume; the HTTP delete passes
+// the user's choice, the org-import reconcile passes false (a reconcile is not
+// a user-erase).
+func (h *WorkspaceHandler) CascadeDelete(ctx context.Context, id string, erase bool) ([]string, []error, error) {
 	if err := validateWorkspaceID(id); err != nil {
 		return nil, nil, err
 	}
@@ -579,7 +591,7 @@ func (h *WorkspaceHandler) CascadeDelete(ctx context.Context, id string) ([]stri
 		// pending EC2 is queryable and handed off to the CP-orphan-sweeper —
 		// rather than the bare one-shot StopWorkspaceAuto that produced the
 		// silent-leak class (task #15 / workspace-ec2-leak).
-		if err := h.stopWorkspaceForDelete(cleanupCtx, wsID); err != nil {
+		if err := h.stopWorkspaceForDelete(cleanupCtx, wsID, erase); err != nil {
 			log.Printf("CascadeDelete %s stop failed: %v — leaving cleanup for orphan sweeper", wsID, err)
 			stopErrs = append(stopErrs, fmt.Errorf("stop %s: %w", wsID, err))
 			return

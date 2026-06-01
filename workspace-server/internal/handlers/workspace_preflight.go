@@ -75,3 +75,21 @@ func formatMissingEnvError(missing []string) string {
 		strings.Join(missing, ", "),
 	)
 }
+
+// formatMissingBYOKCredentialError builds the user-facing message for a
+// provision failure caused by a non-platform (byok/subscription) workspace
+// that has no usable LLM credential of its own (internal#711). The platform's
+// scope:global LLM credentials are NOT a valid fallback for a non-platform
+// workspace — resolving to them would bill the platform's Anthropic credits —
+// so the provision fails closed here rather than starting the workspace on
+// stripped/absent creds. Rendered verbatim in the canvas Events tab.
+func formatMissingBYOKCredentialError(mode string) string {
+	return fmt.Sprintf(
+		"this workspace's LLM billing mode is %q (not platform-managed) but it has no LLM credential of its own. "+
+			"Add a workspace-scoped credential (e.g. CLAUDE_CODE_OAUTH_TOKEN or your provider's API key) under "+
+			"Config → Secrets, or switch the workspace to platform-managed billing via "+
+			"/admin/workspaces/:id/llm-billing-mode, then retry. The platform's shared LLM credentials are not "+
+			"used for non-platform workspaces.",
+		mode,
+	)
+}

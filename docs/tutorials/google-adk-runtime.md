@@ -1,74 +1,69 @@
 # Running a Google ADK Workspace on Molecule AI
 
-Google's Agent Development Kit (ADK) is now a first-class runtime on Molecule AI. This tutorial walks you from zero to a running ADK agent workspace — one that persists per-conversation session state and sits alongside your Claude Code and Gemini CLI workers in the same A2A network.
+> **Status (2026-05-29):** the `google-adk` runtime is **landing**, not yet on
+> `main`. It's implemented in the template repo
+> [`molecule-ai-workspace-template-google-adk`](https://git.moleculesai.app/molecule-ai/molecule-ai-workspace-template-google-adk)
+> (PR **#1**) with platform registration in molecule-core PR **#2003** and the
+> validator allowlist in molecule-ci PR **#26**. Design + approval: RFC
+> [`internal#730`](https://git.moleculesai.app/molecule-ai/internal/issues/730).
+> Remove this banner once those PRs merge.
+>
+> **Doc-accuracy note:** a prior version of this page claimed ADK was "already
+> first-class" and cited "PR #550" — that PR is unrelated (a MemoryTab test
+> suite). No `google-adk` adapter existed at that time. This rewrite reflects
+> the real implementation.
 
-## What you'll need
+Google's Agent Development Kit (ADK) runs as a Molecule AI workspace runtime:
+ADK is the **agent engine** (`LlmAgent` + `Runner`), and the workspace
+participates in Molecule's A2A org like any other runtime.
 
-- A Molecule AI account with at least one provisioned tenant
-- A `GOOGLE_API_KEY` from [aistudio.google.com](https://aistudio.google.com) (or Vertex AI credentials — see below)
-- `curl` + `jq`
+## How it actually works
 
-## Setup
+- **ADK = engine only.** The adapter builds an ADK `LlmAgent` from the
+  workspace config (model + system prompt + tools) and drives its `Runner`.
+  It installs `google-adk[mcp]==2.1.0` and **never** the `[a2a]` extra — ADK's
+  a2a layer pins `a2a-sdk<0.4`, which is incompatible with the platform's
+  `a2a-sdk>=1.0`. (Verified: `google-adk[mcp]==2.1.0` + `a2a-sdk 1.0.3` coexist.)
+- **A2A** is provided by the platform's a2a-1.x server; a Molecule-authored
+  executor bridges ADK's `Runner` event stream onto it, one ADK session per
+  A2A `context_id`.
+- **Tools** reach the agent via ADK's native `McpToolset` pointed at the
+  workspace's `a2a_mcp_server` — the same MCP surface the CLI runtimes use
+  (`delegate_task`, `commit_memory`, `list_peers`, …). No LangChain.
+
+## Auth — Vertex AI via ADC (keyless), or an AI Studio key
+
+The runtime supports both google-genai auth paths:
+
+- **Vertex AI + Application Default Credentials (recommended; required if your
+  org disallows API keys).** Set `model: vertex:gemini-2.5-pro` and provide
+  `GOOGLE_CLOUD_PROJECT`; the adapter sets `GOOGLE_GENAI_USE_VERTEXAI=1` and
+  google-genai authenticates via ADC — no API key. (Locally:
+  `gcloud auth application-default login`.)
+- **AI Studio API key** (where your org permits API keys): set
+  `model: google_genai:gemini-2.5-pro` and `GOOGLE_API_KEY`.
+
+## Create a workspace
 
 ```bash
-# 1. Store your Google API key as a global secret
-curl -s -X PUT http://localhost:8080/settings/secrets \
-  -H "Content-Type: application/json" \
-  -d '{"key":"GOOGLE_API_KEY","value":"YOUR-AI-STUDIO-KEY"}' | jq .
-
-# 2. Create a google-adk workspace
-WS=$(curl -s -X POST http://localhost:8080/workspaces \
+# Vertex AI + ADC (keyless)
+curl -s -X POST http://localhost:8080/workspaces \
   -H "Content-Type: application/json" \
   -d '{
     "name": "adk-agent",
     "role": "Google ADK inference worker",
     "runtime": "google-adk",
-    "model": "google:gemini-2.0-flash"
-  }' | jq -r '.id')
-echo "Workspace: $WS"
-
-# 3. Wait for ready (~30s)
-until curl -s http://localhost:8080/workspaces/$WS | jq -r '.status' | grep -q ready; do
-  echo "Waiting..."; sleep 5
-done
-
-# 4. Send your first task
-curl -s -X POST http://localhost:8080/workspaces/$WS/a2a \
-  -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":"1","method":"message/send",
-       "params":{"message":{"role":"user","parts":[{"kind":"text",
-       "text":"Summarise the ADK architecture in 3 bullet points."}]}}}' \
-  | jq '.result.parts[0].text'
-
-# 5. Multi-turn — session state is preserved across calls
-curl -s -X POST http://localhost:8080/workspaces/$WS/a2a \
-  -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":"2","method":"message/send",
-       "params":{"message":{"role":"user","parts":[{"kind":"text",
-       "text":"Now give me a one-line TL;DR of what you just said."}]}}}' \
-  | jq '.result.parts[0].text'
-
-# 6. Vertex AI alternative — set these instead of GOOGLE_API_KEY
-# curl -X PUT .../secrets -d '{"key":"GOOGLE_GENAI_USE_VERTEXAI","value":"1"}'
-# curl -X PUT .../secrets -d '{"key":"GOOGLE_CLOUD_PROJECT","value":"my-project"}'
-# curl -X PUT .../secrets -d '{"key":"GOOGLE_CLOUD_LOCATION","value":"us-central1"}'
+    "model": "vertex:gemini-2.5-pro",
+    "runtime_config": {"required_env": ["GOOGLE_CLOUD_PROJECT"]}
+  }'
 ```
 
-## Expected output
-
-After step 4, ADK streams the Gemini response through its event bus, filters for `is_final_response()` events, and returns the agent's reply as a standard A2A text part. Step 5 should reference the prior answer — the adapter ties each A2A `context_id` to an `InMemorySessionService` session, so conversation state is isolated per task context and survives across calls within the same session.
-
-## How it works
-
-The `google-adk` adapter wraps Google ADK's runner/session model behind the same `AgentExecutor` interface used by every other Molecule AI runtime. On each turn, `GoogleADKA2AExecutor` calls `runner.run_async()` with the incoming message wrapped in a `google.genai.types.Content` object, then drains the event stream until it collects a final-response event. The `google:` model prefix is stripped before being passed to ADK — so `google:gemini-2.0-flash` in your workspace config becomes `gemini-2.0-flash` in the ADK `LlmAgent`. Error class names are sanitized before leaving the executor; raw Google SDK stack traces never reach the A2A caller.
-
-## Mixed-runtime teams
-
-ADK workspaces participate in the same A2A network as Claude Code, Gemini CLI, Hermes, and LangGraph workers. An orchestrator can delegate long-context summarisation to a `google-adk` worker (Gemini 1.5 Pro's 1M token window) while routing tool-use tasks to a `claude-code` worker — with no provider-specific code in the orchestrator itself. Add an ADK peer with `POST /workspaces`, set `GOOGLE_API_KEY`, and it's available for `delegate_task` immediately.
+Send it a task via the A2A proxy (`POST /workspaces/:id/a2a`, JSON-RPC
+`message/send`) and it replies through the ADK `Runner`. Verified end-to-end:
+a Gemini 2.5 round-trip on Vertex via ADC returns through the built image.
 
 ## Related
-
-- PR #550: [feat(adapters): add google-adk runtime adapter](https://git.moleculesai.app/molecule-ai/molecule-core/pull/550)
+- Template + adapter: [`molecule-ai-workspace-template-google-adk`](https://git.moleculesai.app/molecule-ai/molecule-ai-workspace-template-google-adk) (PR #1)
+- Platform registration: molecule-core PR #2003 · validator: molecule-ci PR #26
+- Design/approval: RFC [`internal#730`](https://git.moleculesai.app/molecule-ai/internal/issues/730)
 - [Google ADK (adk-python)](https://github.com/google/adk-python)
-- [Gemini CLI runtime tutorial](./gemini-cli-runtime.md)
-- [Platform API reference](../api-reference.md)

@@ -330,6 +330,7 @@ func (h *WorkspaceHandler) buildProvisionerConfig(
 		Runtime:         payload.Runtime,
 		InstanceType:    payload.Compute.InstanceType,
 		DiskGB:          int32(payload.Compute.Volume.RootGB),
+		DataPersistence: payload.Compute.DataPersistence,
 		Display: provisioner.WorkspaceDisplayConfig{
 			Mode:     payload.Compute.Display.Mode,
 			Width:    payload.Compute.Display.Width,
@@ -710,131 +711,21 @@ func (h *WorkspaceHandler) defaultTemplateProvidersYAML(runtime string) string {
 	return ""
 }
 
-// deriveProviderFromModelSlug maps a hermes-agent model slug prefix to
-// its provider name — a Go translation of the case statement in
-// workspace-configs-templates/hermes/scripts/derive-provider.sh that we
-// can run at provision time so LLM_PROVIDER lands in workspace_secrets
-// (and from there, into /configs/config.yaml via CP user-data) before
-// the container ever boots.
+// internal#718 P4 closure — `deriveProviderFromModelSlug` (retire-list #3)
+// has been removed together with its only caller (WorkspaceHandler.Create's
+// setProviderSecret write) and the LLM_PROVIDER workspace_secret it
+// populated.
 //
-// Returns "" when the prefix isn't recognized OR when the runtime-only
-// override would be needed to pick a provider — the caller skips the
-// LLM_PROVIDER write in that case so derive-provider.sh keeps the final
-// say at boot. derive-provider.sh remains the source of truth: this is
-// strictly a *gating* hint that survives restarts and gives CP a YAML
-// field to populate. Without it, "Save+Restart" would lose the user's
-// provider choice every time CP regenerates the config.
-//
-// Two intentional differences from the shell version:
-//
-//  1. nousresearch/* and openai/* both return "openrouter" here. The
-//     shell script special-cases "prefer nous if HERMES_API_KEY set" /
-//     "prefer custom if OPENAI_API_KEY set", but those depend on
-//     runtime env that may not yet be loaded at provision time. We pick
-//     the safe default ("openrouter" reaches both Hermes 3 and OpenAI
-//     models without extra config); derive-provider.sh's runtime check
-//     can still upgrade to nous/custom when the keys are present.
-//
-//  2. Unknown prefixes return "" instead of "auto". Persisting "auto"
-//     would block a future "Save+Restart" with a known prefix from
-//     re-deriving — the CP YAML field is sticky once written. Returning
-//     "" means the caller skips the write and the runtime falls through
-//     to derive-provider.sh's *=auto branch on its own.
-//
-// Cover the same prefix list as derive-provider.sh's case statement;
-// keep both files in sync when a new provider is added (table-driven
-// test in workspace_provision_shared_test.go pins the mapping).
-func deriveProviderFromModelSlug(model string) string {
-	if model == "" {
-		return ""
-	}
-	idx := strings.Index(model, "/")
-	if idx <= 0 {
-		return ""
-	}
-	prefix := model[:idx]
-	switch prefix {
-	// Direct-SDK providers (clean 1:1 prefix→provider mapping).
-	case "minimax":
-		return "minimax"
-	case "minimax-cn":
-		return "minimax-cn"
-	case "anthropic":
-		return "anthropic"
-	case "gemini":
-		return "gemini"
-	case "deepseek":
-		return "deepseek"
-	case "zai":
-		return "zai"
-	case "kimi-coding":
-		return "kimi-coding"
-	case "kimi-coding-cn":
-		return "kimi-coding-cn"
-	case "alibaba", "dashscope", "qwen":
-		return "alibaba"
-	case "xiaomi", "mimo":
-		return "xiaomi"
-	case "arcee", "arcee-ai":
-		return "arcee"
-	case "nvidia", "nim":
-		return "nvidia"
-	case "ollama-cloud":
-		return "ollama-cloud"
-	case "huggingface", "hf":
-		return "huggingface"
-	case "ai-gateway", "aigateway":
-		return "ai-gateway"
-	case "kilocode":
-		return "kilocode"
-	case "opencode-zen":
-		return "opencode-zen"
-	case "opencode-go":
-		return "opencode-go"
-	// Aggregator + explicit catch-alls.
-	case "openrouter":
-		return "openrouter"
-	case "custom":
-		return "custom"
-	// Runtime-only override candidates. derive-provider.sh's
-	// HERMES_API_KEY / OPENAI_API_KEY checks happen at boot; we pick the
-	// safe default (openrouter reaches both Hermes 3 and OpenAI without
-	// extra config) and let the script upgrade to nous/custom at runtime.
-	case "nousresearch", "openai":
-		return "openrouter"
-	// Additional 1:1 prefix→provider mappings — kept aligned with upstream's
-	// HERMES_INFERENCE_PROVIDER list (NousResearch/hermes-agent v0.12.0,
-	// 2026-04-30) and the additional case clauses in derive-provider.sh.
-	// The drift gate in derive_provider_drift_test.go enforces parity.
-	case "xai", "grok":
-		return "xai"
-	case "bedrock", "aws":
-		return "bedrock"
-	case "tencent", "tencent-tokenhub":
-		return "tencent-tokenhub"
-	case "gmi":
-		return "gmi"
-	case "qwen-oauth":
-		return "qwen-oauth"
-	case "lmstudio", "lm-studio":
-		return "lmstudio"
-	case "minimax-oauth":
-		return "minimax-oauth"
-	case "alibaba-coding-plan":
-		return "alibaba-coding-plan"
-	case "google-gemini-cli":
-		return "google-gemini-cli"
-	case "openai-codex":
-		return "openai-codex"
-	case "copilot-acp":
-		return "copilot-acp"
-	case "copilot":
-		return "copilot"
-	}
-	// Unknown prefix → don't persist a guess. derive-provider.sh's
-	// *=auto fallback handles it at runtime.
-	return ""
-}
+// The hand-rolled prefix switch was a Go mirror of
+// workspace-configs-templates/hermes/scripts/derive-provider.sh kept in
+// sync via a drift test. The replacement is providers.Manifest.DeriveProvider
+// (synced in P2-A), which derives the provider from (runtime, model)
+// against the registry SSOT at every decision point — billing (P2-B),
+// CP user-data emission (this PR's CP-side commit), validation
+// (P3 PR-C). The shell script in the hermes template continues to be the
+// runtime fallback for unregistered models; codegen of the template's
+// providers block from the registry is the P4 follow-up gated on
+// registry data growth.
 
 // applyRuntimeModelEnv exposes the workspace's selected model via an
 // env var the target runtime's install.sh / start.sh knows to read.
@@ -883,12 +774,7 @@ func applyRuntimeModelEnv(envVars map[string]string, runtime, model string) {
 	// can no longer confuse a provider slug for a model id. CP-side
 	// slot-separation (cp#213 + cp#220) merged the analogous fix on
 	// the CP side; this is the workspace-server companion.
-	if model == "" {
-		model = envVars["MOLECULE_MODEL"]
-	}
-	if model == "" {
-		model = envVars["MODEL"]
-	}
+	model = effectiveModelForBilling(model, envVars)
 	if model == "" {
 		return
 	}
@@ -921,6 +807,31 @@ func applyRuntimeModelEnv(envVars map[string]string, runtime, model string) {
 	}
 }
 
+// effectiveModelForBilling resolves the picked model id from an explicit
+// argument with the SAME fallback chain applyRuntimeModelEnv uses to set the
+// container MODEL env: explicit arg → envVars["MOLECULE_MODEL"] →
+// envVars["MODEL"] (the workspace_secret). It is the single source of truth
+// for "what model is this workspace going to run", shared by both
+// applyRuntimeModelEnv (which exports it to the container) and
+// applyPlatformManagedLLMEnv (which derives the billing mode from it).
+//
+// molecule-core#1994: the billing resolver MUST consult the same effective
+// model the container will actually run. Pre-fix it used the raw payload.Model
+// only, which is "" on a re-provision (the payload is rebuilt from the DB with
+// no Model), so it derived from an empty model → defaulted closed to
+// platform_managed and diverged from the read endpoint (which reads the stored
+// MODEL secret). Returns "" only when no model is resolvable anywhere — the
+// legitimate "unset → platform default" case the resolver fails closed on.
+func effectiveModelForBilling(model string, envVars map[string]string) string {
+	if model == "" {
+		model = envVars["MOLECULE_MODEL"]
+	}
+	if model == "" {
+		model = envVars["MODEL"]
+	}
+	return model
+}
+
 // applyPlatformManagedLLMEnv wires the control-plane LLM proxy into a
 // workspace only when the RESOLVED billing mode for this workspace is
 // platform_managed. "Resolved" means: the workspace-level override (if any)
@@ -943,16 +854,94 @@ func applyRuntimeModelEnv(envVars map[string]string, runtime, model string) {
 // MOLECULE_LLM_BILLING_MODE_RESOLVED so an in-container debug check can
 // answer "what mode is this workspace running under" without DB queries
 // (RFC Observability hot-spot).
-func applyPlatformManagedLLMEnv(ctx context.Context, envVars map[string]string, workspaceID, runtime, model string) {
-	orgMode := strings.ToLower(strings.TrimSpace(os.Getenv("MOLECULE_LLM_BILLING_MODE")))
-	res, resolveErr := ResolveLLMBillingMode(ctx, workspaceID, orgMode)
+//
+// molecule-core#1994 (credential-handling follow-on, CTO-confirmed model).
+// `global_secrets` is the TENANT's own secret store, shared across all of
+// that tenant's workspaces — it is NOT the platform's. The platform's own
+// LLM credential is the CP proxy usage token (MOLECULE_LLM_USAGE_TOKEN),
+// injected SEPARATELY on the platform_managed path below; it is never stored
+// in any tenant's global_secrets.
+//
+// Consequently the byok/disabled branch does NOT strip the tenant's
+// global-origin LLM creds. Under the corrected model the tenant's own
+// credential — whether at global scope (a global_secrets row, e.g. the key
+// they configured via the org-import required-env preflight / the settings
+// Secrets tab) or at workspace scope (a workspace_secrets row) — is exactly
+// what byok must run on, direct. The earlier internal#711 strip rested on the
+// inverted premise that a global-scope LLM cred was "the platform's own"; it
+// was wrong and it killed legitimate byok workspaces (MISSING_BYOK_CREDENTIAL
+// for tenants whose oauth lived at global scope — Reno Stars Marketing agent,
+// confirmed live 2026-05-28). Removing the strip is only safe because the
+// platform's own credential is never co-mingled into a tenant's global_secrets
+// (guarded at the write boundary: SetGlobal rejects bypass-list keys for a
+// platform-managed tenant; the platform proxy token is read from server env
+// only, never persisted to a tenant store).
+//
+// The boolean return still reports whether the workspace has at least one
+// usable LLM credential. The caller (prepareProvisionContext) uses it to FAIL
+// CLOSED — a byok workspace with no usable LLM credential at ANY scope is
+// aborted with a clear MISSING_BYOK_CREDENTIAL error at provision time rather
+// than started credential-less.
+// platformLLMEnvResult is the structured outcome of applyPlatformManagedLLMEnv.
+// ResolvedMode is the per-workspace billing/provider mode the resolver
+// landed on. HasUsableLLMCred reports whether the workspace has at least one
+// platform-managed-shaped LLM credential key in its env — the tenant's own,
+// at global or workspace scope. Only the non-platform (byok) path consults
+// HasUsableLLMCred for the fail-closed decision; the platform_managed path
+// always returns true (it forces the CP proxy usage token, which IS the
+// usable credential).
+type platformLLMEnvResult struct {
+	ResolvedMode     string
+	HasUsableLLMCred bool
+	// Source records which layer decided the mode (internal#718 P2-B):
+	// derived_provider (registry derivation), derived_default (derive failed →
+	// platform default), workspace_override (explicit operator pin), or
+	// constant_fallback (DB error). Surfaced for observability + asserted by the
+	// behavior-delta tests so a regression of "derived, not stored" flips red.
+	Source BillingModeSource
+}
+
+// globalKeys is the provenance side-channel from loadWorkspaceSecrets: the set
+// of env keys that originated from the operator-controlled global_secrets table
+// (a workspace_secrets row of the same name overrides and clears the flag). It
+// is consumed ONLY on the byok/disabled branch's provider-matched strip
+// (internal#728 Bug 1): a global-origin LLM bypass cred that does NOT match the
+// resolved provider's auth_env is stripped so a greedy runtime (claude-code
+// prefers CLAUDE_CODE_OAUTH_TOKEN) cannot route a non-anthropic model to the
+// wrong upstream. May be nil (no global-origin keys / unknown provenance) — a
+// nil set strips nothing, preserving the pre-#728 behavior for callers that do
+// not thread provenance.
+func applyPlatformManagedLLMEnv(ctx context.Context, envVars map[string]string, workspaceID, runtime, model string, globalKeys map[string]struct{}) platformLLMEnvResult {
+	// internal#718 P2-B: the platform-vs-byok decision now DERIVES the provider
+	// from (runtime, model) via the registry and keys off IsPlatform(derived) —
+	// NOT a stored LLM_PROVIDER and NOT the org rung. This path already carries
+	// runtime + model + the workspace env, so it calls the DERIVED resolver
+	// directly (no DB round-trip for runtime/model). availableAuthEnv is the set
+	// of recognized provider auth-env-var NAMES present in envVars (the same
+	// disambiguation input the registry uses to split oauth-vs-api). The org-env
+	// MOLECULE_LLM_BILLING_MODE is NO LONGER read into the decision (retired).
+	availableAuthEnv := availableAuthEnvNames(envVars)
+	// molecule-core#1994: derive billing mode from the EFFECTIVE model, not the
+	// raw payload.Model. On a re-provision (restart/resume/auto-restart) the
+	// payload is rebuilt from the DB with Name+Tier+Runtime only — payload.Model
+	// is "" (workspace_restart.go via withStoredCompute, which backfills Compute
+	// but NOT Model). With an empty model DeriveProvider errors → the resolver
+	// defaults closed to platform_managed and bakes the CP proxy, DIVERGING from
+	// the read endpoint (which reads the stored MODEL workspace_secret and derives
+	// byok). The stored model already lives in the merged envVars (loaded by
+	// loadWorkspaceSecrets); resolve it with the SAME fallback chain
+	// applyRuntimeModelEnv uses so the provision-path derive inputs match the
+	// read-path's — keeping the two resolvers in parity (the #1994 regression
+	// guard test asserts this).
+	effectiveModel := effectiveModelForBilling(model, envVars)
+	res, resolveErr := ResolveLLMBillingModeDerived(ctx, workspaceID, runtime, effectiveModel, availableAuthEnv)
 	if resolveErr != nil {
 		// resolveErr != nil ⇒ resolver hit a DB error AND already defaulted
 		// res.ResolvedMode to platform_managed. Log + proceed; the safe default
 		// is already in place, no early return needed.
 		log.Printf("workspace_provision: resolve billing mode workspace=%s err=%v (defaulting to platform_managed)", workspaceID, resolveErr)
 	}
-	log.Printf("workspace_provision: billing mode workspace=%s resolved=%s source=%s org_default=%s", workspaceID, res.ResolvedMode, res.Source, res.OrgDefault)
+	log.Printf("workspace_provision: billing mode workspace=%s resolved=%s source=%s derived_provider=%s", workspaceID, res.ResolvedMode, res.Source, derefOrEmpty(res.ProviderSelection))
 	// internal#703: MOLECULE_LLM_BILLING_MODE in the container must reflect the
 	// RESOLVED per-workspace mode, not a hardcoded literal. Pre-fix this var was
 	// only emitted (hardcoded "platform_managed") on the strip path below, so a
@@ -966,18 +955,60 @@ func applyPlatformManagedLLMEnv(ctx context.Context, envVars map[string]string, 
 	// pulling logs or hitting the admin route.
 	envVars["MOLECULE_LLM_BILLING_MODE_RESOLVED"] = res.ResolvedMode
 	if res.ResolvedMode != LLMBillingModePlatformManaged {
-		// byok or disabled — DO NOT strip vendor keys, DO NOT force-route to CP,
-		// DO NOT override the workspace own ANTHROPIC_BASE_URL / OAuth token.
-		// Leave envVars alone so CLAUDE_CODE_OAUTH_TOKEN / vendor API keys
-		// pulled from workspace_secrets survive into the container, and the
-		// workspace talks to its own provider directly (internal#703).
-		return
+		// byok or disabled — DO NOT force-route to CP, DO NOT override the
+		// workspace's own ANTHROPIC_BASE_URL, and DO NOT strip the tenant's own
+		// (provider-matching) LLM credentials.
+		//
+		// molecule-core#1994 (corrected model): `global_secrets` is the
+		// TENANT's store, not the platform's. The tenant's own credential —
+		// at global OR workspace scope — is exactly what byok runs on, direct.
+		// The platform's own credential is never in a tenant's global_secrets
+		// (guarded at the SetGlobal write boundary + the proxy token is
+		// server-env-only), so leaving the tenant's globals in place cannot
+		// re-open the platform-credit drain.
+		//
+		// internal#728 Bug 1 (provider-matched credential injection): #1994
+		// removed the BLANKET strip, which was correct for the platform-key
+		// co-mingling it targeted but left EVERY claude-code workspace
+		// inheriting the tenant-global CLAUDE_CODE_OAUTH_TOKEN. A claude-code
+		// runtime greedily prefers that oauth (`llm-auth: detected oauth` →
+		// api.anthropic.com), so a workspace whose RESOLVED provider is NOT
+		// anthropic-oauth (minimax, kimi-byok, …) routes its non-Anthropic
+		// model to Anthropic and errors (`Claude Code returned an error
+		// result`; DevB MiniMax-M2.7 live-confirmed 2026-05-28).
+		//
+		// The precise, provider-AWARE replacement for the over-removed strip:
+		// keep ONLY the global-origin bypass creds whose env-var name is in the
+		// RESOLVED provider's auth_env; strip the rest. This is NOT a return to
+		// the blanket strip — it is keyed off the derived provider:
+		//   - minimax (auth_env: MINIMAX_API_KEY, ANTHROPIC_AUTH_TOKEN,
+		//     ANTHROPIC_API_KEY) → global-origin CLAUDE_CODE_OAUTH_TOKEN is
+		//     NOT a match → stripped (fixes DevB).
+		//   - anthropic-oauth (auth_env: CLAUDE_CODE_OAUTH_TOKEN) → the
+		//     global-origin oauth IS a match → kept (PM/reno opus byok NOT
+		//     regressed — the #1994 ByokGlobalScopeOAuthSurvives guard holds).
+		// WORKSPACE-origin creds (the user explicitly set them via the canvas
+		// Secrets tab → NOT in globalKeys) are NEVER stripped here, even when
+		// they don't match: the user authored them deliberately (JRS kimi
+		// workspace-key, reno's own oauth). Only the inherited operator-store
+		// channel is provider-gated.
+		stripNonMatchingGlobalOriginLLMCreds(envVars, globalKeys, runtime, effectiveModel, availableAuthEnv)
+		return platformLLMEnvResult{
+			ResolvedMode:     res.ResolvedMode,
+			HasUsableLLMCred: hasAnyPlatformManagedLLMKey(envVars),
+			Source:           res.Source,
+		}
 	}
 	baseURL := firstNonEmptyEnv("MOLECULE_LLM_BASE_URL", "OPENAI_BASE_URL")
 	anthropicBaseURL := firstNonEmptyEnv("MOLECULE_LLM_ANTHROPIC_BASE_URL", "ANTHROPIC_BASE_URL")
 	token := firstNonEmptyEnv("MOLECULE_LLM_USAGE_TOKEN", "OPENAI_API_KEY")
 	if baseURL == "" || token == "" {
-		return
+		// Proxy not configured (boot race / misconfig). On the platform_managed
+		// path the workspace IS entitled to platform creds, so we do NOT strip
+		// here — but we report HasUsableLLMCred from whatever survived so the
+		// caller's fail-closed branch (non-platform only) is never reached on
+		// this path.
+		return platformLLMEnvResult{ResolvedMode: res.ResolvedMode, HasUsableLLMCred: true, Source: res.Source}
 	}
 	stripPlatformManagedLLMBypassEnv(envVars)
 
@@ -1006,11 +1037,89 @@ func applyPlatformManagedLLMEnv(ctx context.Context, envVars map[string]string, 
 			envVars["MOLECULE_MODEL"] = defaultModel
 		}
 	}
+	// platform_managed: the CP proxy usage token (injected as ANTHROPIC_API_KEY
+	// / OPENAI_API_KEY above) IS the usable credential, so the workspace is
+	// never fail-closed on this path.
+	return platformLLMEnvResult{ResolvedMode: res.ResolvedMode, HasUsableLLMCred: true, Source: res.Source}
 }
 
 func stripPlatformManagedLLMBypassEnv(envVars map[string]string) {
 	for key := range platformManagedDirectLLMBypassKeys {
 		delete(envVars, key)
+	}
+}
+
+// hasAnyPlatformManagedLLMKey reports whether envVars carries at least one
+// non-empty platform-managed-shaped LLM credential key (the tenant's own, at
+// global or workspace scope). Used by the byok fail-closed branch: a byok
+// workspace with no LLM credential at ANY scope must be aborted with
+// MISSING_BYOK_CREDENTIAL rather than started credential-less.
+func hasAnyPlatformManagedLLMKey(envVars map[string]string) bool {
+	for key := range platformManagedDirectLLMBypassKeys {
+		if strings.TrimSpace(envVars[key]) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// stripNonMatchingGlobalOriginLLMCreds is the byok-branch provider-matched
+// credential injection (internal#728 Bug 1). It removes from envVars every
+// platform-managed LLM bypass key that:
+//
+//  1. originated from the operator-controlled global_secrets store
+//     (present in globalKeys — a workspace_secrets row of the same name
+//     overrides + clears the flag, so user-authored creds are exempt), AND
+//  2. is NOT in the RESOLVED provider's auth_env set.
+//
+// The motivating regression: #1994 dropped the blanket strip, so a claude-code
+// workspace resolving to `minimax` still inherited the tenant-global
+// CLAUDE_CODE_OAUTH_TOKEN; the runtime prefers that oauth and routes the
+// MiniMax model to api.anthropic.com → error. Keeping only the resolved
+// provider's own auth_env keys (minimax: MINIMAX_API_KEY/ANTHROPIC_AUTH_TOKEN/
+// ANTHROPIC_API_KEY — not the oauth) removes the stray oauth while preserving
+// anthropic-oauth's CLAUDE_CODE_OAUTH_TOKEN for an opus byok workspace.
+//
+// Fail-OPEN by design: if the provider cannot be derived (empty model /
+// unknown runtime / ambiguous) or the registry is unavailable, we strip
+// NOTHING — we never strip a credential we cannot prove is non-matching, so a
+// derive miss can never fail-close a legitimate byok workspace (mirrors the
+// resolver's own default-closed-to-platform contract: the worst case is we
+// keep a stray cred, never that we remove the only usable one). The earlier
+// internal#711 blanket strip's fail-direction (remove first) was the bug;
+// this strip's fail-direction is keep-first.
+func stripNonMatchingGlobalOriginLLMCreds(envVars map[string]string, globalKeys map[string]struct{}, runtime, model string, availableAuthEnv []string) {
+	if len(globalKeys) == 0 {
+		return // no operator-store-origin keys to consider — nothing to strip.
+	}
+	manifest, err := providerRegistry()
+	if err != nil || manifest == nil {
+		return // registry unavailable — fail open, strip nothing.
+	}
+	provider, dErr := manifest.DeriveProvider(runtime, model, availableAuthEnv)
+	if dErr != nil {
+		return // underivable provider — fail open, strip nothing.
+	}
+	// The resolved provider's accepted auth-env-var NAMES (case-insensitive
+	// for parity with isPlatformManagedDirectLLMBypassKey, which upper-cases).
+	keep := make(map[string]struct{}, len(provider.AuthEnv))
+	for _, e := range provider.AuthEnv {
+		keep[strings.ToUpper(strings.TrimSpace(e))] = struct{}{}
+	}
+	for key := range globalKeys {
+		upper := strings.ToUpper(strings.TrimSpace(key))
+		if _, isBypass := platformManagedDirectLLMBypassKeys[upper]; !isBypass {
+			continue // not an LLM bypass cred (e.g. a non-LLM operator secret) — leave it.
+		}
+		if _, matches := keep[upper]; matches {
+			continue // matches the resolved provider's auth_env — this is what byok runs on.
+		}
+		// Global-origin LLM bypass cred that does NOT match the resolved
+		// provider — the stray that a greedy runtime would mis-prefer. Strip.
+		if _, present := envVars[key]; present {
+			log.Printf("workspace_provision: byok provider-matched strip — removing global-origin LLM cred %s (resolved provider=%s does not accept it)", key, provider.Name)
+			delete(envVars, key)
+		}
 	}
 }
 
@@ -1065,6 +1174,14 @@ func loadWorkspaceSecrets(ctx context.Context, workspaceID string) (map[string]s
 			var v []byte
 			var ver int
 			if globalRows.Scan(&k, &v, &ver) == nil {
+				// internal#718 P4 closure: LLM_PROVIDER is retired even
+				// at the global rung. The same provider-from-(runtime,model)
+				// derivation runs per-workspace, so a global default
+				// would be pure ghost. Symmetric with the workspace_secrets
+				// drop below.
+				if k == "LLM_PROVIDER" {
+					continue
+				}
 				decrypted, decErr := crypto.DecryptVersioned(v, ver)
 				if decErr != nil {
 					log.Printf("Provisioner: FATAL — failed to decrypt global secret %s (version=%d): %v — aborting provision of workspace %s", k, ver, decErr, workspaceID)
@@ -1087,6 +1204,18 @@ func loadWorkspaceSecrets(ctx context.Context, workspaceID string) (map[string]s
 			var v []byte
 			var ver int
 			if wsRows.Scan(&k, &v, &ver) == nil {
+				// internal#718 P4 closure: LLM_PROVIDER is a retired
+				// secret key. Migration 20260528000000 deletes any
+				// straggler rows; this drop is defence-in-depth so a
+				// rolling deploy (new code, old DB) never re-emits the
+				// retired key into the provisioner env (which would
+				// reach the CP-side resolveModelAndProvider — now
+				// itself retired, but the env contract belongs to
+				// core). Idempotent: a fresh tenant has zero
+				// LLM_PROVIDER rows and this branch is unreached.
+				if k == "LLM_PROVIDER" {
+					continue
+				}
 				decrypted, decErr := crypto.DecryptVersioned(v, ver)
 				if decErr != nil {
 					log.Printf("Provisioner: FATAL — failed to decrypt workspace secret %s (version=%d) for %s: %v — aborting provision", k, ver, workspaceID, decErr)

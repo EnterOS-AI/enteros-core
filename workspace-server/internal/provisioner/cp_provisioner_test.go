@@ -1096,3 +1096,41 @@ func TestCollectCPConfigFiles_RejectsRootSymlink(t *testing.T) {
 		t.Errorf("expected symlink-related error, got: %v", err)
 	}
 }
+
+// internal#734 (F1): the prune signal must reach CP ONLY via StopAndPrune.
+// Stop must NEVER append prune=true (restart/recreate use Stop, and a prune on
+// a recreate = data loss). Captures the DELETE URL and asserts the contract.
+func TestStopVsStopAndPrune_PruneQueryParam(t *testing.T) {
+	primeInstanceIDLookup(t, map[string]string{"ws-keep": "i-keep", "ws-erase": "i-erase"})
+
+	var gotURL string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotURL = r.URL.String()
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"status":"terminated"}`)
+	}))
+	defer srv.Close()
+	p := &CPProvisioner{baseURL: srv.URL, orgID: "org-1", httpClient: srv.Client()}
+
+	// Stop → no prune.
+	if err := p.Stop(context.Background(), "ws-keep"); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if strings.Contains(gotURL, "prune=true") {
+		t.Errorf("Stop must NOT send prune=true (recreate-safety); url=%s", gotURL)
+	}
+	if !strings.Contains(gotURL, "instance_id=i-keep") {
+		t.Errorf("Stop url missing instance_id; url=%s", gotURL)
+	}
+
+	// StopAndPrune → prune=true.
+	if err := p.StopAndPrune(context.Background(), "ws-erase"); err != nil {
+		t.Fatalf("StopAndPrune: %v", err)
+	}
+	if !strings.Contains(gotURL, "prune=true") {
+		t.Errorf("StopAndPrune MUST send prune=true; url=%s", gotURL)
+	}
+	if !strings.Contains(gotURL, "instance_id=i-erase") {
+		t.Errorf("StopAndPrune url missing instance_id; url=%s", gotURL)
+	}
+}

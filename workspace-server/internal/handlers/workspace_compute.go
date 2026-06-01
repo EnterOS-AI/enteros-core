@@ -65,6 +65,14 @@ func validateWorkspaceCompute(compute models.WorkspaceCompute) error {
 	if err := validateWorkspaceDisplayDimensions(compute.Display.Width, compute.Display.Height); err != nil {
 		return err
 	}
+	// internal#734: the durable-data choice. CP re-validates the same enum at
+	// its provision edge (IsValidDataPersistence → 400); validating here too
+	// gives the user a clear workspace-server error before the CP round-trip.
+	switch compute.DataPersistence {
+	case "", "persist", "ephemeral":
+	default:
+		return fmt.Errorf("unsupported compute.data_persistence (want persist|ephemeral)")
+	}
 	return nil
 }
 

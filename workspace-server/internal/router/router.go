@@ -444,8 +444,15 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		wsAuth.DELETE("/secrets/:key", sech.Delete)
 		wsAuth.GET("/model", sech.GetModel)
 		wsAuth.PUT("/model", sech.SetModel)
-		wsAuth.GET("/provider", sech.GetProvider)
-		wsAuth.PUT("/provider", sech.SetProvider)
+		// internal#718 P4 closure: /provider endpoint is retired —
+		// the LLM_PROVIDER workspace_secret no longer exists and the
+		// provider is derived from (runtime, model) via the registry
+		// at every decision point. handlers.ProviderEndpointGone returns 410
+		// with a structured body so older canvases that still call
+		// PUT /provider on Save surface a loud failure rather than
+		// silently writing into a vanished row.
+		wsAuth.GET("/provider", handlers.ProviderEndpointGone)
+		wsAuth.PUT("/provider", handlers.ProviderEndpointGone)
 
 		// Token usage metrics — cost transparency (#593).
 		// WorkspaceAuth middleware (on wsAuth) binds the bearer to :id.
@@ -532,6 +539,8 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 	{
 		asHealth := handlers.NewAdminSchedulesHealthHandler()
 		r.GET("/admin/schedules/health", middleware.AdminAuth(db.DB), asHealth.Health)
+		r.GET("/admin/schedules/orphans", middleware.AdminAuth(db.DB), asHealth.Orphans)
+		r.POST("/admin/schedules/reap-orphans", middleware.AdminAuth(db.DB), asHealth.ReapOrphans)
 	}
 
 	// Admin — stale a2a_queue cleanup (issue #1947). Marks queued items older

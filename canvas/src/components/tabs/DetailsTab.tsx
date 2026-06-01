@@ -29,6 +29,7 @@ export function DetailsTab({ workspaceId, data }: Props) {
   const [peers, setPeers] = useState<PeerData[]>([]);
   const [saving, setSaving] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [eraseData, setEraseData] = useState(false); // internal#734: erase saved data on delete
   const [peersError, setPeersError] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
@@ -93,7 +94,10 @@ export function DetailsTab({ workspaceId, data }: Props) {
   const handleDelete = async () => {
     setDeleteError(null);
     try {
-      await api.del(`/workspaces/${workspaceId}?confirm=true`, {
+      // internal#734: erase_data=true asks the server to prune this workspace's
+      // durable data volume (cookies / downloads / memory). Default off keeps it
+      // for the orphan-sweeper grace.
+      await api.del(`/workspaces/${workspaceId}?confirm=true${eraseData ? "&erase_data=true" : ""}`, {
         headers: { "X-Confirm-Name": name },
       });
       // Mirror the server-side cascade — drop the row + every
@@ -323,6 +327,19 @@ export function DetailsTab({ workspaceId, data }: Props) {
             <h3 id="delete-confirm-title" className="text-xs font-medium text-bad">
               Confirm deletion
             </h3>
+            <label className="flex items-start gap-2 text-[11px] text-ink-mid">
+              <input
+                type="checkbox"
+                aria-label="Also erase saved data"
+                checked={eraseData}
+                onChange={(e) => setEraseData(e.target.checked)}
+                className="mt-0.5 h-3.5 w-3.5 accent-red-600"
+              />
+              <span>
+                Also erase saved data (cookies, downloads, agent memory). Cannot be undone.
+                Unchecked keeps it recoverable briefly.
+              </span>
+            </label>
             <div className="flex gap-2">
               <button
                 type="button"
@@ -339,6 +356,7 @@ export function DetailsTab({ workspaceId, data }: Props) {
                 onClick={() => {
                   setConfirmDelete(false);
                   setDeleteError(null);
+                  setEraseData(false);
                   // Return focus to the trigger so keyboard users aren't stranded
                   deleteButtonRef.current?.focus();
                 }}

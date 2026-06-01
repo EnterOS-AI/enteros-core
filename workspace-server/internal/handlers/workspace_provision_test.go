@@ -1399,6 +1399,9 @@ func (s *stubFailingCPProv) Start(_ context.Context, _ provisioner.WorkspaceConf
 func (s *stubFailingCPProv) Stop(_ context.Context, _ string) error {
 	panic("stubFailingCPProv.Stop not expected on the provisionWorkspaceCP failure path")
 }
+func (s *stubFailingCPProv) StopAndPrune(_ context.Context, _ string) error {
+	panic("stubFailingCPProv.StopAndPrune not expected on the provisionWorkspaceCP failure path")
+}
 
 func (s *stubFailingCPProv) GetConsoleOutput(_ context.Context, _ string) (string, error) {
 	panic("stubFailingCPProv.GetConsoleOutput not expected on the provisionWorkspaceCP failure path")

@@ -12,15 +12,25 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// Multi-period budget (#49): GET/PATCH now read workspaces.budget_limits (jsonb)
+// and compute per-period spend from the workspace_spend_events ledger
+// (spendByPeriod — matched here by the "FROM workspace_spend_events" fragment).
+// The legacy budget_limit/monthly_spend response fields are still emitted
+// (monthly period) for rollout back-compat, and the legacy {"budget_limit":N}
+// PATCH shape still works.
+
+// spendRows builds the 4-column row spendByPeriod scans (hourly,daily,weekly,monthly).
+func spendRows(h, d, w, m int64) *sqlmock.Rows {
+	return sqlmock.NewRows([]string{"h", "d", "w", "mo"}).AddRow(h, d, w, m)
+}
+
 // ==================== GET /workspaces/:id/budget ====================
 
-// TestBudgetGet_NotFound verifies that GET /budget returns 404 for an unknown
-// workspace ID (ErrNoRows from the budget query).
 func TestBudgetGet_NotFound(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
 
-	mock.ExpectQuery(`SELECT budget_limit, COALESCE\(monthly_spend, 0\)`).
+	mock.ExpectQuery(`SELECT COALESCE\(budget_limits`).
 		WithArgs("ws-not-there").
 		WillReturnError(sql.ErrNoRows)
 
@@ -29,8 +39,7 @@ func TestBudgetGet_NotFound(t *testing.T) {
 	c.Params = gin.Params{{Key: "id", Value: "ws-not-there"}}
 	c.Request = httptest.NewRequest("GET", "/workspaces/ws-not-there/budget", nil)
 
-	h := NewBudgetHandler()
-	h.GetBudget(c)
+	NewBudgetHandler().GetBudget(c)
 
 	if w.Code != http.StatusNotFound {
 		t.Errorf("expected 404, got %d: %s", w.Code, w.Body.String())
@@ -40,12 +49,11 @@ func TestBudgetGet_NotFound(t *testing.T) {
 	}
 }
 
-// TestBudgetGet_DBError verifies that a non-ErrNoRows DB error returns 500.
 func TestBudgetGet_DBError(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
 
-	mock.ExpectQuery(`SELECT budget_limit, COALESCE\(monthly_spend, 0\)`).
+	mock.ExpectQuery(`SELECT COALESCE\(budget_limits`).
 		WithArgs("ws-db-err").
 		WillReturnError(sql.ErrConnDone)
 
@@ -54,8 +62,7 @@ func TestBudgetGet_DBError(t *testing.T) {
 	c.Params = gin.Params{{Key: "id", Value: "ws-db-err"}}
 	c.Request = httptest.NewRequest("GET", "/workspaces/ws-db-err/budget", nil)
 
-	h := NewBudgetHandler()
-	h.GetBudget(c)
+	NewBudgetHandler().GetBudget(c)
 
 	if w.Code != http.StatusInternalServerError {
 		t.Errorf("expected 500, got %d: %s", w.Code, w.Body.String())
@@ -65,24 +72,23 @@ func TestBudgetGet_DBError(t *testing.T) {
 	}
 }
 
-// TestBudgetGet_NoLimit verifies that budget_limit and budget_remaining are
-// null when the workspace has no budget ceiling configured.
 func TestBudgetGet_NoLimit(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
 
-	mock.ExpectQuery(`SELECT budget_limit, COALESCE\(monthly_spend, 0\)`).
+	mock.ExpectQuery(`SELECT COALESCE\(budget_limits`).
 		WithArgs("ws-free").
-		WillReturnRows(sqlmock.NewRows([]string{"budget_limit", "monthly_spend"}).
-			AddRow(nil, int64(42)))
+		WillReturnRows(sqlmock.NewRows([]string{"budget_limits"}).AddRow([]byte(`{}`)))
+	mock.ExpectQuery(`FROM workspace_spend_events`).
+		WithArgs("ws-free").
+		WillReturnRows(spendRows(0, 0, 0, 42))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 	c.Params = gin.Params{{Key: "id", Value: "ws-free"}}
 	c.Request = httptest.NewRequest("GET", "/workspaces/ws-free/budget", nil)
 
-	h := NewBudgetHandler()
-	h.GetBudget(c)
+	NewBudgetHandler().GetBudget(c)
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
@@ -105,24 +111,23 @@ func TestBudgetGet_NoLimit(t *testing.T) {
 	}
 }
 
-// TestBudgetGet_WithLimit verifies that budget_limit, monthly_spend, and
-// budget_remaining are all returned correctly when a ceiling is set.
 func TestBudgetGet_WithLimit(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
 
-	mock.ExpectQuery(`SELECT budget_limit, COALESCE\(monthly_spend, 0\)`).
+	mock.ExpectQuery(`SELECT COALESCE\(budget_limits`).
 		WithArgs("ws-capped").
-		WillReturnRows(sqlmock.NewRows([]string{"budget_limit", "monthly_spend"}).
-			AddRow(int64(500), int64(123)))
+		WillReturnRows(sqlmock.NewRows([]string{"budget_limits"}).AddRow([]byte(`{"monthly":500}`)))
+	mock.ExpectQuery(`FROM workspace_spend_events`).
+		WithArgs("ws-capped").
+		WillReturnRows(spendRows(0, 0, 0, 123))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 	c.Params = gin.Params{{Key: "id", Value: "ws-capped"}}
 	c.Request = httptest.NewRequest("GET", "/workspaces/ws-capped/budget", nil)
 
-	h := NewBudgetHandler()
-	h.GetBudget(c)
+	NewBudgetHandler().GetBudget(c)
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
@@ -137,7 +142,6 @@ func TestBudgetGet_WithLimit(t *testing.T) {
 	if resp["monthly_spend"] != float64(123) {
 		t.Errorf("expected monthly_spend=123, got %v", resp["monthly_spend"])
 	}
-	// budget_remaining = 500 - 123 = 377
 	if resp["budget_remaining"] != float64(377) {
 		t.Errorf("expected budget_remaining=377, got %v", resp["budget_remaining"])
 	}
@@ -146,24 +150,23 @@ func TestBudgetGet_WithLimit(t *testing.T) {
 	}
 }
 
-// TestBudgetGet_OverBudget verifies that budget_remaining can be negative
-// when monthly_spend has already exceeded budget_limit.
 func TestBudgetGet_OverBudget(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
 
-	mock.ExpectQuery(`SELECT budget_limit, COALESCE\(monthly_spend, 0\)`).
+	mock.ExpectQuery(`SELECT COALESCE\(budget_limits`).
 		WithArgs("ws-over").
-		WillReturnRows(sqlmock.NewRows([]string{"budget_limit", "monthly_spend"}).
-			AddRow(int64(100), int64(150)))
+		WillReturnRows(sqlmock.NewRows([]string{"budget_limits"}).AddRow([]byte(`{"monthly":100}`)))
+	mock.ExpectQuery(`FROM workspace_spend_events`).
+		WithArgs("ws-over").
+		WillReturnRows(spendRows(0, 0, 0, 150))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 	c.Params = gin.Params{{Key: "id", Value: "ws-over"}}
 	c.Request = httptest.NewRequest("GET", "/workspaces/ws-over/budget", nil)
 
-	h := NewBudgetHandler()
-	h.GetBudget(c)
+	NewBudgetHandler().GetBudget(c)
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
@@ -172,7 +175,6 @@ func TestBudgetGet_OverBudget(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("parse response: %v", err)
 	}
-	// budget_remaining = 100 - 150 = -50 (negative, but we store actual value)
 	if resp["budget_remaining"] != float64(-50) {
 		t.Errorf("expected budget_remaining=-50, got %v", resp["budget_remaining"])
 	}
@@ -181,10 +183,59 @@ func TestBudgetGet_OverBudget(t *testing.T) {
 	}
 }
 
+// TestBudgetGet_MultiPeriod pins the new per-period shape: each period reports
+// its own limit/spend/remaining, and an over-budget sub-period is visible.
+func TestBudgetGet_MultiPeriod(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+
+	mock.ExpectQuery(`SELECT COALESCE\(budget_limits`).
+		WithArgs("ws-mp").
+		WillReturnRows(sqlmock.NewRows([]string{"budget_limits"}).
+			AddRow([]byte(`{"hourly":100,"daily":1000}`)))
+	mock.ExpectQuery(`FROM workspace_spend_events`).
+		WithArgs("ws-mp").
+		WillReturnRows(spendRows(120, 300, 300, 300)) // hourly over (120>=100)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-mp"}}
+	c.Request = httptest.NewRequest("GET", "/workspaces/ws-mp/budget", nil)
+
+	NewBudgetHandler().GetBudget(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Periods map[string]struct {
+			Limit     *int64 `json:"limit"`
+			Spend     int64  `json:"spend"`
+			Remaining *int64 `json:"remaining"`
+		} `json:"periods"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("parse response: %v", err)
+	}
+	if resp.Periods["hourly"].Limit == nil || *resp.Periods["hourly"].Limit != 100 {
+		t.Errorf("hourly.limit: want 100, got %v", resp.Periods["hourly"].Limit)
+	}
+	if resp.Periods["hourly"].Spend != 120 {
+		t.Errorf("hourly.spend: want 120, got %d", resp.Periods["hourly"].Spend)
+	}
+	if r := resp.Periods["hourly"].Remaining; r == nil || *r != -20 {
+		t.Errorf("hourly.remaining: want -20, got %v", r)
+	}
+	if resp.Periods["weekly"].Limit != nil {
+		t.Errorf("weekly.limit: want null (unset), got %v", resp.Periods["weekly"].Limit)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations not met: %v", err)
+	}
+}
+
 // ==================== PATCH /workspaces/:id/budget ====================
 
-// TestBudgetPatch_MissingField verifies that PATCH /budget with no budget_limit
-// field in the body returns 400.
 func TestBudgetPatch_MissingField(t *testing.T) {
 	setupTestDB(t)
 	setupTestRedis(t)
@@ -196,15 +247,13 @@ func TestBudgetPatch_MissingField(t *testing.T) {
 		bytes.NewBufferString(`{"other_field":123}`))
 	c.Request.Header.Set("Content-Type", "application/json")
 
-	h := NewBudgetHandler()
-	h.PatchBudget(c)
+	NewBudgetHandler().PatchBudget(c)
 
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("expected 400, got %d: %s", w.Code, w.Body.String())
 	}
 }
 
-// TestBudgetPatch_InvalidBody verifies that a malformed JSON body returns 400.
 func TestBudgetPatch_InvalidBody(t *testing.T) {
 	setupTestDB(t)
 	setupTestRedis(t)
@@ -216,15 +265,13 @@ func TestBudgetPatch_InvalidBody(t *testing.T) {
 		bytes.NewBufferString(`not json`))
 	c.Request.Header.Set("Content-Type", "application/json")
 
-	h := NewBudgetHandler()
-	h.PatchBudget(c)
+	NewBudgetHandler().PatchBudget(c)
 
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("expected 400, got %d: %s", w.Code, w.Body.String())
 	}
 }
 
-// TestBudgetPatch_NegativeValue verifies that a negative budget_limit is rejected.
 func TestBudgetPatch_NegativeValue(t *testing.T) {
 	setupTestDB(t)
 	setupTestRedis(t)
@@ -236,15 +283,13 @@ func TestBudgetPatch_NegativeValue(t *testing.T) {
 		bytes.NewBufferString(`{"budget_limit":-1}`))
 	c.Request.Header.Set("Content-Type", "application/json")
 
-	h := NewBudgetHandler()
-	h.PatchBudget(c)
+	NewBudgetHandler().PatchBudget(c)
 
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("expected 400 for negative budget_limit, got %d: %s", w.Code, w.Body.String())
 	}
 }
 
-// TestBudgetPatch_InvalidType verifies that a non-numeric budget_limit returns 400.
 func TestBudgetPatch_InvalidType(t *testing.T) {
 	setupTestDB(t)
 	setupTestRedis(t)
@@ -256,16 +301,32 @@ func TestBudgetPatch_InvalidType(t *testing.T) {
 		bytes.NewBufferString(`{"budget_limit":"not-a-number"}`))
 	c.Request.Header.Set("Content-Type", "application/json")
 
-	h := NewBudgetHandler()
-	h.PatchBudget(c)
+	NewBudgetHandler().PatchBudget(c)
 
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("expected 400 for string budget_limit, got %d: %s", w.Code, w.Body.String())
 	}
 }
 
-// TestBudgetPatch_WorkspaceNotFound verifies that PATCH /budget returns 404
-// when the workspace doesn't exist.
+// TestBudgetPatch_UnknownPeriod rejects an unsupported period key.
+func TestBudgetPatch_UnknownPeriod(t *testing.T) {
+	setupTestDB(t)
+	setupTestRedis(t)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-badperiod"}}
+	c.Request = httptest.NewRequest("PATCH", "/workspaces/ws-badperiod/budget",
+		bytes.NewBufferString(`{"budget_limits":{"yearly":100}}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	NewBudgetHandler().PatchBudget(c)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for unknown period, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
 func TestBudgetPatch_WorkspaceNotFound(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
@@ -281,8 +342,7 @@ func TestBudgetPatch_WorkspaceNotFound(t *testing.T) {
 		bytes.NewBufferString(`{"budget_limit":500}`))
 	c.Request.Header.Set("Content-Type", "application/json")
 
-	h := NewBudgetHandler()
-	h.PatchBudget(c)
+	NewBudgetHandler().PatchBudget(c)
 
 	if w.Code != http.StatusNotFound {
 		t.Errorf("expected 404, got %d: %s", w.Code, w.Body.String())
@@ -292,25 +352,20 @@ func TestBudgetPatch_WorkspaceNotFound(t *testing.T) {
 	}
 }
 
-// TestBudgetPatch_SetLimit verifies that PATCH /budget with a positive value
-// updates the DB and returns the new budget state.
+// TestBudgetPatch_SetLimit (legacy monthly shape) updates + returns new state.
 func TestBudgetPatch_SetLimit(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
 
-	// Existence probe
 	mock.ExpectQuery(`SELECT EXISTS.*status != 'removed'`).
 		WithArgs("ws-set-limit").
 		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
-	// UPDATE
-	mock.ExpectExec(`UPDATE workspaces SET budget_limit`).
-		WithArgs("ws-set-limit", int64(500)).
+	mock.ExpectExec(`UPDATE workspaces SET budget_limits`).
+		WithArgs("ws-set-limit", sqlmock.AnyArg(), int64(500)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
-	// Re-read for response
-	mock.ExpectQuery(`SELECT budget_limit, COALESCE\(monthly_spend, 0\) FROM workspaces WHERE id`).
+	mock.ExpectQuery(`FROM workspace_spend_events`).
 		WithArgs("ws-set-limit").
-		WillReturnRows(sqlmock.NewRows([]string{"budget_limit", "monthly_spend"}).
-			AddRow(int64(500), int64(200)))
+		WillReturnRows(spendRows(0, 0, 0, 200))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -319,8 +374,7 @@ func TestBudgetPatch_SetLimit(t *testing.T) {
 		bytes.NewBufferString(`{"budget_limit":500}`))
 	c.Request.Header.Set("Content-Type", "application/json")
 
-	h := NewBudgetHandler()
-	h.PatchBudget(c)
+	NewBudgetHandler().PatchBudget(c)
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
@@ -335,7 +389,6 @@ func TestBudgetPatch_SetLimit(t *testing.T) {
 	if resp["monthly_spend"] != float64(200) {
 		t.Errorf("expected monthly_spend=200, got %v", resp["monthly_spend"])
 	}
-	// budget_remaining = 500 - 200 = 300
 	if resp["budget_remaining"] != float64(300) {
 		t.Errorf("expected budget_remaining=300, got %v", resp["budget_remaining"])
 	}
@@ -344,8 +397,59 @@ func TestBudgetPatch_SetLimit(t *testing.T) {
 	}
 }
 
-// TestBudgetPatch_ClearLimit verifies that PATCH /budget with budget_limit=null
-// clears the ceiling, making budget_limit and budget_remaining null in the response.
+// TestBudgetPatch_SetMultiPeriod sets several periods at once and verifies the
+// per-period response.
+func TestBudgetPatch_SetMultiPeriod(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+
+	mock.ExpectQuery(`SELECT EXISTS.*status != 'removed'`).
+		WithArgs("ws-mp-set").
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+	// no monthly in payload → legacy budget_limit column set to NULL
+	mock.ExpectExec(`UPDATE workspaces SET budget_limits`).
+		WithArgs("ws-mp-set", sqlmock.AnyArg(), nil).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery(`FROM workspace_spend_events`).
+		WithArgs("ws-mp-set").
+		WillReturnRows(spendRows(10, 20, 30, 40))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-mp-set"}}
+	c.Request = httptest.NewRequest("PATCH", "/workspaces/ws-mp-set/budget",
+		bytes.NewBufferString(`{"budget_limits":{"hourly":100,"daily":200,"monthly":null}}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	NewBudgetHandler().PatchBudget(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Periods map[string]struct {
+			Limit *int64 `json:"limit"`
+			Spend int64  `json:"spend"`
+		} `json:"periods"`
+		BudgetLimit *int64 `json:"budget_limit"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("parse response: %v", err)
+	}
+	if resp.Periods["hourly"].Limit == nil || *resp.Periods["hourly"].Limit != 100 {
+		t.Errorf("hourly.limit want 100, got %v", resp.Periods["hourly"].Limit)
+	}
+	if resp.Periods["daily"].Limit == nil || *resp.Periods["daily"].Limit != 200 {
+		t.Errorf("daily.limit want 200, got %v", resp.Periods["daily"].Limit)
+	}
+	if resp.BudgetLimit != nil {
+		t.Errorf("monthly cleared → budget_limit should be null, got %v", *resp.BudgetLimit)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations not met: %v", err)
+	}
+}
+
 func TestBudgetPatch_ClearLimit(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
@@ -353,15 +457,12 @@ func TestBudgetPatch_ClearLimit(t *testing.T) {
 	mock.ExpectQuery(`SELECT EXISTS.*status != 'removed'`).
 		WithArgs("ws-clear-limit").
 		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
-	// UPDATE with NULL
-	mock.ExpectExec(`UPDATE workspaces SET budget_limit`).
-		WithArgs("ws-clear-limit", nil).
+	mock.ExpectExec(`UPDATE workspaces SET budget_limits`).
+		WithArgs("ws-clear-limit", sqlmock.AnyArg(), nil).
 		WillReturnResult(sqlmock.NewResult(0, 1))
-	// Re-read — budget_limit is now NULL
-	mock.ExpectQuery(`SELECT budget_limit, COALESCE\(monthly_spend, 0\) FROM workspaces WHERE id`).
+	mock.ExpectQuery(`FROM workspace_spend_events`).
 		WithArgs("ws-clear-limit").
-		WillReturnRows(sqlmock.NewRows([]string{"budget_limit", "monthly_spend"}).
-			AddRow(nil, int64(50)))
+		WillReturnRows(spendRows(0, 0, 0, 50))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -370,8 +471,7 @@ func TestBudgetPatch_ClearLimit(t *testing.T) {
 		bytes.NewBufferString(`{"budget_limit":null}`))
 	c.Request.Header.Set("Content-Type", "application/json")
 
-	h := NewBudgetHandler()
-	h.PatchBudget(c)
+	NewBudgetHandler().PatchBudget(c)
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
@@ -391,8 +491,6 @@ func TestBudgetPatch_ClearLimit(t *testing.T) {
 	}
 }
 
-// TestBudgetPatch_UpdateDBError verifies that a DB error during the UPDATE
-// returns 500.
 func TestBudgetPatch_UpdateDBError(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
@@ -400,8 +498,8 @@ func TestBudgetPatch_UpdateDBError(t *testing.T) {
 	mock.ExpectQuery(`SELECT EXISTS.*status != 'removed'`).
 		WithArgs("ws-patch-dberr").
 		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
-	mock.ExpectExec(`UPDATE workspaces SET budget_limit`).
-		WithArgs("ws-patch-dberr", int64(500)).
+	mock.ExpectExec(`UPDATE workspaces SET budget_limits`).
+		WithArgs("ws-patch-dberr", sqlmock.AnyArg(), int64(500)).
 		WillReturnError(sql.ErrConnDone)
 
 	w := httptest.NewRecorder()
@@ -411,8 +509,7 @@ func TestBudgetPatch_UpdateDBError(t *testing.T) {
 		bytes.NewBufferString(`{"budget_limit":500}`))
 	c.Request.Header.Set("Content-Type", "application/json")
 
-	h := NewBudgetHandler()
-	h.PatchBudget(c)
+	NewBudgetHandler().PatchBudget(c)
 
 	if w.Code != http.StatusInternalServerError {
 		t.Errorf("expected 500 on UPDATE error, got %d: %s", w.Code, w.Body.String())
@@ -422,8 +519,8 @@ func TestBudgetPatch_UpdateDBError(t *testing.T) {
 	}
 }
 
-// TestBudgetPatch_ZeroLimit verifies that budget_limit=0 is accepted (it means
-// every A2A call is blocked — useful to pause a workspace's LLM spend entirely).
+// TestBudgetPatch_ZeroLimit verifies budget_limit=0 is accepted + stored (0 =
+// block-all: every period call is blocked — pauses the workspace's spend).
 func TestBudgetPatch_ZeroLimit(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
@@ -431,13 +528,12 @@ func TestBudgetPatch_ZeroLimit(t *testing.T) {
 	mock.ExpectQuery(`SELECT EXISTS.*status != 'removed'`).
 		WithArgs("ws-zero-limit").
 		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
-	mock.ExpectExec(`UPDATE workspaces SET budget_limit`).
-		WithArgs("ws-zero-limit", int64(0)).
+	mock.ExpectExec(`UPDATE workspaces SET budget_limits`).
+		WithArgs("ws-zero-limit", sqlmock.AnyArg(), int64(0)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectQuery(`SELECT budget_limit, COALESCE\(monthly_spend, 0\) FROM workspaces WHERE id`).
+	mock.ExpectQuery(`FROM workspace_spend_events`).
 		WithArgs("ws-zero-limit").
-		WillReturnRows(sqlmock.NewRows([]string{"budget_limit", "monthly_spend"}).
-			AddRow(int64(0), int64(0)))
+		WillReturnRows(spendRows(0, 0, 0, 0))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -446,11 +542,17 @@ func TestBudgetPatch_ZeroLimit(t *testing.T) {
 		bytes.NewBufferString(`{"budget_limit":0}`))
 	c.Request.Header.Set("Content-Type", "application/json")
 
-	h := NewBudgetHandler()
-	h.PatchBudget(c)
+	NewBudgetHandler().PatchBudget(c)
 
 	if w.Code != http.StatusOK {
-		t.Errorf("expected 200 for zero budget_limit, got %d: %s", w.Code, w.Body.String())
+		t.Fatalf("expected 200 for zero budget_limit, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("parse response: %v", err)
+	}
+	if resp["budget_limit"] != float64(0) {
+		t.Errorf("expected budget_limit=0 (block-all), got %v", resp["budget_limit"])
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("sqlmock expectations not met: %v", err)

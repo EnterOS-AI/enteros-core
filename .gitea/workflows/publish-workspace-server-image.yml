@@ -327,13 +327,27 @@ jobs:
             echo ""
             echo "### Per-tenant result"
             echo ""
-            echo "| Slug | Phase | SSM Status | Exit | Healthz | Error present |"
-            echo "|------|-------|------------|------|---------|---------------|"
-            jq -r '.results[]? | "| \(.slug) | \(.phase) | \(.ssm_status // "-") | \(.ssm_exit_code) | \(.healthz_ok) | \((.error // "") != "") |"' "$HTTP_RESPONSE" || true
+            echo "| Slug | Phase | SSM Status | Exit | Healthz | On target | Error present |"
+            echo "|------|-------|------------|------|---------|-----------|---------------|"
+            jq -r '.results[]? | "| \(.slug) | \(.phase) | \(.ssm_status // "-") | \(.ssm_exit_code) | \(.healthz_ok) | \(.verified_on_target) | \((.error // "") != "") |"' "$HTTP_RESPONSE" || true
+            # internal#724: stragglers are tenants enumerated but not proven
+            # on the target build. Surface them loudly — a non-empty list
+            # means the rollout did NOT fully land.
+            STRAGGLERS="$(jq -r '(.stragglers // []) | join(", ")' "$HTTP_RESPONSE")"
+            if [ -n "$STRAGGLERS" ]; then
+              echo ""
+              echo "### ⚠ Stragglers (NOT on target tag \`$TARGET_TAG\`)"
+              echo ""
+              echo "\`$STRAGGLERS\`"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
           OK="$(jq -r '.ok' "$HTTP_RESPONSE")"
           if [ "$OK" != "true" ]; then
+            STRAGGLERS="$(jq -r '(.stragglers // []) | join(", ")' "$HTTP_RESPONSE")"
+            if [ -n "$STRAGGLERS" ]; then
+              echo "::error::incomplete rollout — tenants not on target tag $TARGET_TAG: $STRAGGLERS"
+            fi
             echo "::error::redeploy-fleet reported ok=false; production rollout halted."
             exit 1
           fi

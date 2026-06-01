@@ -29,7 +29,14 @@ type FormState = {
   displayMode: string;
   displayProtocol: string;
   resolution: string;
+  dataPersistence: string; // "" (auto) | "persist" | "ephemeral" — internal#734
 };
+
+// internal#734: per-workspace durable-data choice. "" = auto (desktop-control
+// keeps data, others follow the org default). Human labels for the selector.
+const DATA_PERSISTENCE_OPTIONS = ["", "persist", "ephemeral"];
+const dataPersistenceLabel = (v: string): string =>
+  v === "persist" ? "Always keep (persist)" : v === "ephemeral" ? "Don't keep (ephemeral)" : "Auto";
 
 export function ContainerConfigTab({ workspaceId, data }: Props) {
   const runtime = data.runtime;
@@ -39,9 +46,10 @@ export function ContainerConfigTab({ workspaceId, data }: Props) {
   const displayProtocol = data.compute?.display?.protocol;
   const displayWidth = data.compute?.display?.width;
   const displayHeight = data.compute?.display?.height;
+  const dataPersistence = data.compute?.data_persistence;
   const initial = useMemo(
-    () => formFromData({ runtime, instanceType, rootGB, displayMode, displayProtocol, displayWidth, displayHeight }),
-    [runtime, instanceType, rootGB, displayMode, displayProtocol, displayWidth, displayHeight],
+    () => formFromData({ runtime, instanceType, rootGB, displayMode, displayProtocol, displayWidth, displayHeight, dataPersistence }),
+    [runtime, instanceType, rootGB, displayMode, displayProtocol, displayWidth, displayHeight, dataPersistence],
   );
   const [form, setForm] = useState<FormState>(initial);
   const [saving, setSaving] = useState(false);
@@ -84,6 +92,8 @@ export function ContainerConfigTab({ workspaceId, data }: Props) {
           display: form.displayEnabled
             ? { mode: form.displayMode, protocol: form.displayProtocol, width, height }
             : { mode: "none" },
+          // internal#734: omit when "auto" so the wire/default behavior is unchanged.
+          ...(form.dataPersistence ? { data_persistence: form.dataPersistence } : {}),
         };
 
         const resp = await api.patch<{ needs_restart?: boolean }>(`/workspaces/${workspaceId}`, {
@@ -176,6 +186,18 @@ export function ContainerConfigTab({ workspaceId, data }: Props) {
               onChange={(resolution) => setForm((s) => ({ ...s, resolution }))}
             />
           )}
+          <SelectField
+            id="data-persistence"
+            label="Saved data (cookies, downloads, memory)"
+            value={form.dataPersistence}
+            options={DATA_PERSISTENCE_OPTIONS}
+            optionLabel={dataPersistenceLabel}
+            onChange={(dataPersistence) => setForm((s) => ({ ...s, dataPersistence }))}
+          />
+          <p className="-mt-1 text-[10px] leading-snug text-ink-soft">
+            Whether this workspace&apos;s data survives a restart/recreate. Auto keeps it for
+            browser (desktop) workspaces; Ephemeral never keeps it (privacy).
+          </p>
         </div>
 
         <div className="mt-4 flex items-center justify-end gap-2">
@@ -231,6 +253,7 @@ function formFromData(data: {
   displayProtocol?: string;
   displayWidth?: number;
   displayHeight?: number;
+  dataPersistence?: string;
 }): FormState {
   const width = data.displayWidth ?? 1920;
   const height = data.displayHeight ?? 1080;
@@ -243,6 +266,7 @@ function formFromData(data: {
     displayMode: data.displayMode && data.displayMode !== "none" ? data.displayMode : "desktop-control",
     displayProtocol: data.displayProtocol || "novnc",
     resolution,
+    dataPersistence: data.dataPersistence || "",
   };
 }
 

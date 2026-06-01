@@ -428,6 +428,54 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 		return
 	}
 
+	// internal#718 P4 PR-2: ONLY-REGISTERED validation at the create boundary —
+	// FLIPPED from WARN to HARD-REJECT (was the P2-B WARN-mode signal).
+	//
+	// For a runtime the provider registry knows (first-party:
+	// claude-code/codex/hermes/openclaw) this checks the (runtime, model) pair
+	// against the registry's native model set. Fails OPEN for runtimes the
+	// registry doesn't know (langgraph/external/kimi/mock/federated) so
+	// non-first-party / federated flows are UNCHANGED. Skipped for external
+	// workspaces (the URL is the contract, not the model — see MODEL_REQUIRED
+	// rationale above).
+	//
+	// THE FLIP (was WARN, now 422):
+	//   * P2-B carried the gate in WARN mode (X-Molecule-Model-Unregistered
+	//     response header + log line, create proceeds) because the legacy
+	//     colon-namespaced BYOK vocabulary ('anthropic:claude-opus-4-7' etc.)
+	//     was live across the create corpus but not yet in the registry's
+	//     exact-id model sets — hard-rejecting would have 422'd legitimate
+	//     existing flows.
+	//   * P4 PR-1 reconciled that colon vocab into the registry as
+	//     first-class native-set entries (each runtime native set now lists
+	//     both bare/slash AND colon forms for the BYOK ids the live corpus
+	//     uses; openclaw's pre-existing colon-form precedent extended to
+	//     claude-code). DeriveProvider / Manifest.ModelsForRuntime now
+	//     resolves every legitimate model in the corpus.
+	//   * With the reconcile landed, an unregistered (runtime, model) pair
+	//     is a real misconfiguration — the corpus has no legitimate model
+	//     this validator now rejects. We flip to 422
+	//     UNREGISTERED_MODEL_FOR_RUNTIME so the caller fails LOUDLY at the
+	//     boundary instead of provisioning a workspace that will wedge at
+	//     adapter init (the codex 'anthropic:claude-opus-4-7' wedge class
+	//     the MODEL_REQUIRED gate also targets).
+	//
+	// The registry model set is code-generated from the canonical
+	// providers.yaml (P2-A artifact); the check stays in sync with the SSOT
+	// via the verify-providers-gen + sync-providers-yaml CI gates.
+	if !isExternal {
+		if ok, why := validateRegisteredModelForRuntime(payload.Runtime, payload.Model); !ok {
+			log.Printf("Create: 422 UNREGISTERED_MODEL_FOR_RUNTIME (runtime=%q model=%q): %s [internal#718 P4 PR-2 hard-reject]", payload.Runtime, payload.Model, why)
+			c.JSON(http.StatusUnprocessableEntity, gin.H{
+				"error":   why,
+				"runtime": payload.Runtime,
+				"model":   payload.Model,
+				"code":    "UNREGISTERED_MODEL_FOR_RUNTIME",
+			})
+			return
+		}
+	}
+
 	ctx := c.Request.Context()
 
 	// Convert empty role to NULL
@@ -599,37 +647,38 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 		return
 	}
 
-	// Persist canvas-selected model + derived provider as workspace
-	// secrets so they survive restart and are picked up by CP user-data
-	// when regenerating /configs/config.yaml. Without this, the
-	// applyRuntimeModelEnv fallback chain (workspace_provision.go)
-	// cannot recover the user's choice on a Restart payload (which
-	// rebuilds from the workspaces row, where there is no model column),
-	// and hermes silently boots with the template-default model. See
-	// failed-workspace 95ed3ff2 (2026-05-02): canvas POSTed
-	// minimax/MiniMax-M2.7-highspeed, MODEL_PROVIDER was never written,
-	// container fell through to nousresearch/hermes-4-70b, derive-
-	// provider.sh produced the wrong provider, hermes gateway 401'd,
-	// /health poll failed, molecule-runtime never registered.
+	// Persist canvas-selected model as the MODEL workspace_secret so it
+	// survives restart and is picked up by CP user-data when regenerating
+	// /configs/config.yaml. Without this, the applyRuntimeModelEnv
+	// fallback chain (workspace_provision.go) cannot recover the user's
+	// choice on a Restart payload (which rebuilds from the workspaces
+	// row, where there is no model column), and hermes silently boots
+	// with the template-default model. See failed-workspace 95ed3ff2
+	// (2026-05-02): canvas POSTed minimax/MiniMax-M2.7-highspeed,
+	// MODEL_PROVIDER was never written, container fell through to
+	// nousresearch/hermes-4-70b, derive-provider.sh produced the wrong
+	// provider, hermes gateway 401'd, /health poll failed,
+	// molecule-runtime never registered.
 	//
-	// Both writes are non-fatal: a failure here logs and continues so
-	// the workspace row stays consistent. The runtime can still boot
-	// (with the template default) and a later Save+Restart will re-
-	// persist via the SecretsHandler endpoints. The DB error path here
-	// is rare (the same DB just committed a workspace row a microsecond
-	// ago) so failing the create response would be unfriendly.
+	// internal#718 P4 closure: the prior `setProviderSecret` write
+	// (LLM_PROVIDER row, derived from the canvas-supplied
+	// payload.LLMProvider OR from deriveProviderFromModelSlug) has been
+	// REMOVED. The provider is now DERIVED at every decision point from
+	// (runtime, model) via the registry — billing (P2-B), CP user-data
+	// (this PR's CP-side commit replaces resolveModelAndProvider's
+	// env["LLM_PROVIDER"] read with a DeriveProvider call), and
+	// validation (P3 PR-C provisioner). Storing it is pure write-ghost
+	// with no remaining consumer. `payload.LLMProvider` is preserved on
+	// the request struct for backward-compatibility with older canvases
+	// that still send it; the value is intentionally ignored here.
+	//
+	// The setModelSecret write is non-fatal: a failure here logs and
+	// continues so the workspace row stays consistent. The runtime can
+	// still boot (with the template default) and a later
+	// Save+Restart will re-persist via the SecretsHandler endpoints.
 	if payload.Model != "" {
 		if err := setModelSecret(ctx, id, payload.Model); err != nil {
 			log.Printf("Create workspace %s: failed to persist MODEL_PROVIDER %q: %v (non-fatal)", id, payload.Model, err)
-		}
-		if explicitProvider := strings.TrimSpace(payload.LLMProvider); explicitProvider != "" {
-			if err := setProviderSecret(ctx, id, explicitProvider); err != nil {
-				log.Printf("Create workspace %s: failed to persist LLM_PROVIDER %q: %v (non-fatal)", id, explicitProvider, err)
-			}
-		} else if derived := deriveProviderFromModelSlug(payload.Model); derived != "" {
-			if err := setProviderSecret(ctx, id, derived); err != nil {
-				log.Printf("Create workspace %s: failed to persist LLM_PROVIDER %q: %v (non-fatal)", id, derived, err)
-			}
 		}
 	}
 

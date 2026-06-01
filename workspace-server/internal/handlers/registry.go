@@ -538,7 +538,8 @@ func (h *RegistryHandler) Heartbeat(c *gin.Context) {
 
 	// Read previous current_task to detect changes (before the UPDATE)
 	var prevTask string
-	if err := db.DB.QueryRowContext(ctx, `SELECT COALESCE(current_task, '') FROM workspaces WHERE id = $1`, payload.WorkspaceID).Scan(&prevTask); err != nil {
+	var prevSpend int64
+	if err := db.DB.QueryRowContext(ctx, `SELECT COALESCE(current_task, ''), COALESCE(monthly_spend, 0) FROM workspaces WHERE id = $1`, payload.WorkspaceID).Scan(&prevTask, &prevSpend); err != nil {
 		log.Printf("registry heartbeat: prev_task query failed for workspace %s: %v", payload.WorkspaceID, err)
 	}
 
@@ -554,6 +555,25 @@ func (h *RegistryHandler) Heartbeat(c *gin.Context) {
 	}
 	if payload.MonthlySpend > maxMonthlySpend {
 		payload.MonthlySpend = maxMonthlySpend
+	}
+
+	// Multi-period budget (#49): record the spend INCREMENT into the
+	// workspace_spend_events ledger so the server can compute rolling per-period
+	// windows (hourly/daily/weekly/monthly) — see budget_periods.go. The agent
+	// still reports a cumulative monthly figure; we derive the delta vs the
+	// last-seen cumulative (prevSpend). A DECREASE means the agent reset its
+	// monthly cumulative (new month) → treat the new value as fresh spend.
+	// Best-effort: a ledger failure must never break the heartbeat.
+	if payload.MonthlySpend > 0 {
+		delta := payload.MonthlySpend - prevSpend
+		if delta < 0 {
+			delta = payload.MonthlySpend
+		}
+		if delta > 0 {
+			if err := recordSpendDelta(ctx, db.DB, payload.WorkspaceID, delta); err != nil {
+				log.Printf("registry heartbeat: spend-ledger insert failed for workspace %s: %v", payload.WorkspaceID, err)
+			}
+		}
 	}
 
 	// Update heartbeat columns. #73 guard: exclude 'removed' rows so a
