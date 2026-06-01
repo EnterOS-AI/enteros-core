@@ -252,6 +252,9 @@ func scanAuditRows(rows *sql.Rows) ([]auditEventRow, error) {
 		}
 		result = append(result, ev)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 	return result, nil
 }
 

@@ -377,6 +377,9 @@ func readWorkspaceDeriveInputs(ctx context.Context, workspaceID string) (runtime
 			availableAuthEnv = append(availableAuthEnv, k)
 		}
 	}
+	if err := rows.Err(); err != nil {
+		log.Printf("llm_billing_mode: read secrets rows error for %s: %v (deriving with partial model/auth-env)", workspaceID, err)
+	}
 	return runtime, model, availableAuthEnv
 }
 
