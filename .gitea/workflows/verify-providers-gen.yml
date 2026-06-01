@@ -35,8 +35,26 @@ name: verify-providers-gen
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+    # CI-scheduler-overload fix (fix/ci-scheduler-fanout, 2026-06-01):
+    # this gate only verifies that the generated providers artifact is in
+    # sync with the schema SSOT. Its verdict can ONLY change when one of
+    # the codegen inputs/outputs changes, so firing the Go toolchain on
+    # every unrelated PR (docs, canvas, scripts) is pure fan-out cost.
+    # Scoped to the codegen surface. SAFE because this workflow is NOT a
+    # branch-protection status_check_context (see header §ENFORCEMENT
+    # GATING) — lint-required-no-paths only forbids paths filters on
+    # REQUIRED workflows; this is advisory, so a paths filter is allowed.
+    # Mirrors the sibling sync-providers-yaml.yml scoping convention.
+    paths:
+      - 'workspace-server/internal/providers/**'
+      - 'workspace-server/cmd/gen-providers/**'
+      - '.gitea/workflows/verify-providers-gen.yml'
   push:
     branches: [main, staging]
+    paths:
+      - 'workspace-server/internal/providers/**'
+      - 'workspace-server/cmd/gen-providers/**'
+      - '.gitea/workflows/verify-providers-gen.yml'
 
 env:
   GITHUB_SERVER_URL: https://git.moleculesai.app
