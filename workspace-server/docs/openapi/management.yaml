@@ -125,12 +125,18 @@ components:
         DELETE /workspaces/:id (deprovision) additionally requires a per-tenant
         admin_token + X-Molecule-Org-Id (issue #118) — see `tenantAdminToken`.
     tenantAdminToken:
-      type: http
-      scheme: bearer
+      type: apiKey
+      in: header
+      name: X-Molecule-Admin-Token
       description: |
         Per-tenant admin_token, presented to CP deprovision alongside the
         provision shared secret so a leaked shared secret can't terminate
-        OTHER tenants' workspaces (issue #118). Sent with X-Molecule-Org-Id.
+        OTHER tenants' workspaces (issue #118). Carried in the
+        `X-Molecule-Admin-Token` header (NOT Authorization) — the handler
+        (controlplane internal/handlers/workspace_provision.go
+        authenticateTenant) reads this header and derives the org from the
+        token (SELECT org_id FROM org_instances WHERE admin_token = $1), so no
+        X-Molecule-Org-Id is needed on deprovision.
     orgApiKey:
       type: http
       scheme: bearer
@@ -303,7 +309,14 @@ components:
       description: Org provisioning progress (GET /api/v1/orgs/:slug/provision-status).
       properties:
         status: { type: string, enum: [provisioning, running, failed] }
-        stage: { type: string, enum: [launching, installing, starting, configuring_https, ready] }
+        stage:
+          type: string
+          description: |
+            UI checklist step. `failed` is emitted on a failed/deprovisioning/
+            deprovisioned instance; `ready` on a healthy instance; the rest are
+            the boot-progress stages (controlplane internal/handlers/orgs.go +
+            orgs_progress.go bootProgressOrder/estimateBootProgress).
+          enum: [launching, installing, starting, configuring_https, ready, failed]
         progress: { type: integer, minimum: 0, maximum: 100 }
         message: { type: string }
         eta_seconds: { type: integer }
@@ -481,19 +494,60 @@ components:
         parent_id: { type: [string, "null"], format: uuid }
       additionalProperties: true
 
+    PeriodBudget:
+      type: object
+      description: |
+        Per-period budget view (workspace-server budget.go periodBudget):
+        configured ceiling (null = no limit), rolling-window spend, and
+        remaining headroom (null when no limit; may go negative).
+      properties:
+        limit: { type: [integer, "null"], format: int64, description: "USD cents; null = no limit." }
+        spend: { type: integer, format: int64, description: "Rolling-window spend, USD cents." }
+        remaining: { type: [integer, "null"], format: int64, description: "limit - spend; null when no limit; may be negative." }
+      required: [spend]
+
     BudgetResponse:
       type: object
+      description: |
+        Canonical budget view (workspace-server budget.go budgetResponse), same
+        shape for GET and PATCH. `periods` is the multi-period SSOT; the
+        top-level `budget_limit`/`monthly_spend`/`budget_remaining` are
+        back-compat mirrors of the monthly period for pre-multi-period clients.
       properties:
-        budget_limit: { type: [integer, "null"], format: int64, description: "USD cents; null = no limit." }
-        monthly_spend: { type: integer, format: int64 }
-        budget_remaining: { type: [integer, "null"], format: int64 }
+        periods:
+          type: object
+          description: |
+            Per-period budgets keyed by period name. Canonical multi-period
+            view (internal#734 / budget_periods.go).
+          additionalProperties: { $ref: "#/components/schemas/PeriodBudget" }
+          propertyNames: { enum: [hourly, daily, weekly, monthly] }
+        budget_limit: { type: [integer, "null"], format: int64, description: "Back-compat: monthly limit (USD cents); null = no limit." }
+        monthly_spend: { type: integer, format: int64, description: "Back-compat: monthly rolling spend (USD cents)." }
+        budget_remaining: { type: [integer, "null"], format: int64, description: "Back-compat: monthly remaining (USD cents); null = no limit." }
 
     PatchBudgetRequest:
       type: object
-      description: budget_limit required; null clears the limit, integer (USD cents, >=0) sets it.
+      description: |
+        Set workspace budget limits. `budget_limits` is canonical (multi-period
+        map); legacy scalar `budget_limit` is kept for back-compat. Exactly one
+        of the two must be present (an empty body is a 400). A per-period value
+        of null/absent clears that period; a non-negative int (USD cents) sets
+        it. When `budget_limit` is used, it sets the monthly period and is kept
+        synced to the budget_limits monthly key server-side.
+      minProperties: 1
       properties:
-        budget_limit: { type: [integer, "null"], format: int64 }
-      required: [budget_limit]
+        budget_limits:
+          type: object
+          description: |
+            CANONICAL. Period → USD-cents-or-null. Allowed keys: hourly, daily,
+            weekly, monthly (an unknown key is a 400).
+          additionalProperties: { type: [integer, "null"], format: int64, minimum: 0 }
+          propertyNames: { enum: [hourly, daily, weekly, monthly] }
+        budget_limit:
+          type: [integer, "null"]
+          format: int64
+          minimum: 0
+          description: "Legacy single-monthly limit (USD cents, >=0); null clears it."
 
     BillingModeResponse:
       type: object
@@ -1119,6 +1173,91 @@ paths:
               schema: { type: array, items: { type: object, additionalProperties: true } }
         "401": { $ref: "#/components/responses/Unauthorized" }
 
+  /api/v1/admin/workspaces/{id}/llm-billing-mode:
+    parameters: [{ $ref: "#/components/parameters/WorkspaceId" }]
+    get:
+      tags: [cp-admin]
+      summary: Get a workspace LLM billing mode (CP-admin proxy)
+      description: |
+        CP-side operator proxy to the per-tenant
+        /admin/workspaces/:id/llm-billing-mode. **Requires `?org_slug=`** — CP
+        has no workspace_id→org_id index, so the slug tells CP which tenant to
+        dispatch to (controlplane internal/handlers/admin_workspace_billing_mode.go).
+      operationId: adminGetWorkspaceBillingMode
+      security: [{ cpAdminBearer: [] }]
+      parameters:
+        - name: org_slug
+          in: query
+          required: true
+          description: Org slug — resolves which tenant CP proxies to.
+          schema: { type: string, pattern: "^[a-z][a-z0-9-]{2,31}$" }
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BillingModeResponse" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404":
+          description: Slug doesn't resolve to an org.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "502":
+          description: Per-tenant call failed (auth/network/parse).
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "503":
+          description: Billing-mode client unwired on this CP (dev / no Secrets).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    put:
+      tags: [cp-admin]
+      summary: Set/clear a workspace LLM billing mode (CP-admin proxy)
+      description: |
+        CP-side operator proxy. **Requires `?org_slug=`.** Body
+        {"mode": "byok"|"platform_managed"|"disabled"|null}; mode is validated
+        against the credits enum BEFORE the per-tenant call.
+      operationId: adminPutWorkspaceBillingMode
+      security: [{ cpAdminBearer: [] }]
+      parameters:
+        - name: org_slug
+          in: query
+          required: true
+          description: Org slug — resolves which tenant CP proxies to.
+          schema: { type: string, pattern: "^[a-z][a-z0-9-]{2,31}$" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PutBillingModeRequest" }
+      responses:
+        "200":
+          description: Updated.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BillingModeResponse" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404":
+          description: Slug doesn't resolve to an org.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "502":
+          description: Per-tenant call failed (auth/network/parse).
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "503":
+          description: Billing-mode client unwired on this CP (dev / no Secrets).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
   # ------------------------------------------------------------- CP: PROVISION
   /api/v1/workspaces/provision:
     post:
@@ -1159,18 +1298,24 @@ paths:
       tags: [cp-provision]
       summary: Deprovision (terminate) a workspace EC2 + DNS
       description: |
-        Requires the provision shared secret AND a per-tenant admin_token +
-        X-Molecule-Org-Id (issue #118) so a leaked shared secret can't kill
-        other tenants' workspaces. `?prune=` controls data-volume pruning.
+        Requires the provision shared secret AND a per-tenant admin_token
+        (X-Molecule-Admin-Token, issue #118) so a leaked shared secret can't
+        kill other tenants' workspaces. The org is derived from the admin token
+        server-side, so no X-Molecule-Org-Id header is read here. `?prune=`
+        controls data-volume pruning.
       operationId: deprovisionWorkspace
       security:
         - provisionSecret: []
           tenantAdminToken: []
-          orgRoutingHeaderId: []
       parameters:
         - name: prune
           in: query
           required: false
+          description: |
+            Only the literal string `true` triggers a PERMANENT data delete
+            (the data volume is tagged for immediate erase — destructive,
+            internal#734). Any other value (including absent) terminates the
+            instance but preserves the data volume for the grace-period sweep.
           schema: { type: boolean }
       responses:
         "200":
@@ -1263,13 +1408,13 @@ paths:
     parameters: [{ $ref: "#/components/parameters/WorkspaceId" }]
     get:
       tags: [tenant-workspaces]
-      summary: Get a workspace
+      summary: Get a workspace (INTENTIONALLY UNAUTHENTICATED)
+      description: |
+        Intentionally open — registered outside every auth group
+        (workspace-server internal/router/router.go) so canvas nodes can fetch
+        their own state without a token (WorkspaceNode polling + health checks).
       operationId: tenantGetWorkspace
-      security:
-        - orgApiKey: []
-          orgRoutingHeaderId: []
-        - workspaceToken: []
-          orgRoutingHeaderId: []
+      security: []
       parameters:
         - { $ref: "#/components/parameters/OrgIdHeader" }
         - { $ref: "#/components/parameters/OrgSlugHeader" }
@@ -1279,7 +1424,6 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Workspace" }
-        "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
     delete:
       tags: [tenant-workspaces]
