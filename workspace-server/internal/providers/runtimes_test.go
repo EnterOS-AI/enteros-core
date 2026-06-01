@@ -103,10 +103,10 @@ func TestModelsForRuntime_ExactModelIDs(t *testing.T) {
 			// kimi via platform proxy
 			"moonshot/kimi-k2.6", "moonshot/kimi-k2.5",
 			// minimax BYOK (bare + legacy colon-namespaced)
-			"MiniMax-M2", "MiniMax-M2.7", "MiniMax-M2.7-highspeed",
-			"minimax:MiniMax-M2", "minimax:MiniMax-M2.7", "minimax:MiniMax-M2.7-highspeed",
+			"MiniMax-M2", "MiniMax-M2.7", "MiniMax-M2.7-highspeed", "MiniMax-M3",
+			"minimax:MiniMax-M2", "minimax:MiniMax-M2.7", "minimax:MiniMax-M2.7-highspeed", "minimax:MiniMax-M3",
 			// minimax via platform proxy
-			"minimax/MiniMax-M2.7", "minimax/MiniMax-M2.7-highspeed",
+			"minimax/MiniMax-M2.7", "minimax/MiniMax-M2.7-highspeed", "minimax/MiniMax-M3",
 		},
 		// hermes: kimi (BYOK gateway) + platform-managed kimi.
 		"hermes": {
