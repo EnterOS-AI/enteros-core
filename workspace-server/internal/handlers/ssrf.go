@@ -79,7 +79,7 @@ func isSafeURL(rawURL string) error {
 	}
 	addrs, err := net.LookupHost(host)
 	if err != nil {
-		return fmt.Errorf("DNS resolution blocked for hostname: %s (%v)", host, err)
+		return fmt.Errorf("DNS resolution blocked for hostname: %s (%w)", host, err)
 	}
 	if len(addrs) == 0 {
 		return fmt.Errorf("DNS returned no addresses for: %s", host)
