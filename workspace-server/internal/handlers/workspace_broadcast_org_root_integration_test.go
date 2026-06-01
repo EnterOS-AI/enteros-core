@@ -102,21 +102,21 @@ func TestIntegration_BroadcastOrgRoot_NonRootSenderResolvesToRoot(t *testing.T) 
 	// root — parent_id NULL.
 	if _, err := conn.ExecContext(ctx, `
 		INSERT INTO workspaces (id, name, tier, runtime, status, parent_id)
-		VALUES ($1, $2, 2, 'claude-code', 'running', NULL)
+		VALUES ($1, $2, 2, 'claude-code', 'online', NULL)
 	`, rootID, prefix+"-root"); err != nil {
 		t.Fatalf("seed root: %v", err)
 	}
 	// mid — child of root.
 	if _, err := conn.ExecContext(ctx, `
 		INSERT INTO workspaces (id, name, tier, runtime, status, parent_id)
-		VALUES ($1, $2, 2, 'claude-code', 'running', $3)
+		VALUES ($1, $2, 2, 'claude-code', 'online', $3)
 	`, midID, prefix+"-mid", rootID); err != nil {
 		t.Fatalf("seed mid: %v", err)
 	}
 	// leaf — child of mid (a non-root, non-direct-child sender).
 	if _, err := conn.ExecContext(ctx, `
 		INSERT INTO workspaces (id, name, tier, runtime, status, parent_id)
-		VALUES ($1, $2, 2, 'claude-code', 'running', $3)
+		VALUES ($1, $2, 2, 'claude-code', 'online', $3)
 	`, leafID, prefix+"-leaf", midID); err != nil {
 		t.Fatalf("seed leaf: %v", err)
 	}
