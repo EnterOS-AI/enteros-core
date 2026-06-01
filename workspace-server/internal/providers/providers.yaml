@@ -348,8 +348,8 @@ providers:
     vendor_logo: "moonshot"
     protocol: anthropic
     auth_mode: third_party_anthropic_compat
-    base_url_template: "https://api.kimi.com/coding/"
-    base_url_anthropic: "https://api.kimi.com/coding/"
+    base_url_template: "https://api.kimi.com/coding/v1"
+    base_url_anthropic: "https://api.kimi.com/coding/v1"
     auth_env: [KIMI_API_KEY, ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN]
     # x-api-key header (NOT bearer) per kimi.com's Claude Code integration doc.
     auth_token_env: ANTHROPIC_API_KEY
@@ -403,7 +403,7 @@ providers:
     vendor_logo: "google"
     protocol: openai
     auth_mode: third_party_anthropic_compat
-    base_url_template: null
+    base_url_template: "https://generativelanguage.googleapis.com/v1beta/openai"
     base_url_anthropic: null
     auth_env: [GEMINI_API_KEY, GOOGLE_API_KEY]
     auth_token_env: ANTHROPIC_AUTH_TOKEN
