@@ -417,7 +417,9 @@ func (h *PluginsHandler) stripPluginMarkersFromMemory(ctx context.Context, conta
 		`awk 'BEGIN{skip=0; blanks=0} /^%s/{skip=1; blanks=0; next} skip==1 && /^[[:space:]]*$/{blanks++; if(blanks>=2){skip=0; print; next} next} /^# Plugin: /{if(skip==1)skip=0} skip==1{next} {print}' /configs/CLAUDE.md > /tmp/claude.new && mv /tmp/claude.new /configs/CLAUDE.md`,
 		regexpEscapeForAwk(marker),
 	)
-	_, _ = h.execAsRoot(ctx, containerName, []string{"bash", "-c", script})
+	if _, awkErr := h.execAsRoot(ctx, containerName, []string{"bash", "-c", script}); awkErr != nil {
+		log.Printf("Plugin uninstall: failed to strip markers from CLAUDE.md for %s in %s: %v", pluginName, workspaceID, awkErr)
+	}
 }
 
 // regexpEscapeForAwk escapes characters that have special meaning inside an
