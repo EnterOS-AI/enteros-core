@@ -37,8 +37,11 @@ package handlers
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
+	"os"
 	"path/filepath"
+	"strings"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
@@ -263,6 +266,22 @@ func (h *WorkspaceHandler) prepareProvisionContext(
 		}
 	}
 
+	// Preflight: runtime-seed match (issue #2027). Fail LOUD when a workspace
+	// NAMED a runtime but the config.yaml we're about to seed declares a
+	// different top-level runtime — the symmetric counterpart to selectImage's
+	// ErrUnresolvableRuntime guard, on the config/template side. Pre-fix, when a
+	// runtime's workspace template wasn't in the tenant cache at provision time
+	// (or sanitizeRuntime coerced an unknown runtime), seeding silently fell
+	// back to the claude-code-default template: the image+env said e.g.
+	// google-adk but the seeded config said claude-code, so the agent booted
+	// mislabeled and personaless yet looked 'online' and returned canned
+	// non-answers. Refusing loudly turns that silent wrong-agent into a visible
+	// WORKSPACE_PROVISION_FAILED the operator can act on.
+	if abort := runtimeSeedMismatchAbort(payload.Runtime, templatePath, configFiles); abort != nil {
+		log.Printf("Provisioner: ABORT workspace=%s — %s", workspaceID, abort.Msg)
+		return nil, abort
+	}
+
 	cfg := h.buildProvisionerConfig(ctx, workspaceID, templatePath, configFiles, payload, envVars, pluginsPath)
 	cfg.ResetClaudeSession = resetClaudeSession
 
@@ -271,6 +290,76 @@ func (h *WorkspaceHandler) prepareProvisionContext(
 		PluginsPath: pluginsPath,
 		Config:      cfg,
 	}, nil
+}
+
+// runtimeSeedMismatchAbort returns a non-nil abort when a workspace NAMED a
+// runtime but the config.yaml about to be seeded declares a *different*
+// top-level runtime — the fail-loud counterpart to selectImage's
+// ErrUnresolvableRuntime (issue #2027). It catches the silent
+// claude-code-default substitution that occurs when a runtime's workspace
+// template isn't cached at provision time (or sanitizeRuntime coerced an
+// unknown runtime to claude-code): both surface as a seeded config whose
+// runtime contradicts the requested one.
+//
+// Pure (modulo reading the template dir's config.yaml). An empty
+// requestedRuntime (unspecified / org-template default path) or an
+// indeterminate seeded runtime (e.g. CP mode with no local config bytes) is
+// allowed — we only fail on a concrete, contradictory signal, never on
+// absence of one.
+func runtimeSeedMismatchAbort(requestedRuntime, templatePath string, configFiles map[string][]byte) *provisionAbort {
+	if requestedRuntime == "" {
+		return nil
+	}
+	seeded := seededConfigRuntime(templatePath, configFiles)
+	if seeded == "" || seeded == requestedRuntime {
+		return nil
+	}
+	msg := fmt.Sprintf(
+		"runtime seed mismatch: workspace requested runtime %q but the seeded config.yaml declares %q — the %q workspace template was not available at provision time (silent %q fallback). Refusing to launch a mislabeled agent; refresh the template cache (POST /admin/templates/refresh) and re-provision.",
+		requestedRuntime, seeded, requestedRuntime, seeded,
+	)
+	return &provisionAbort{
+		Msg: msg,
+		Extra: map[string]interface{}{
+			"error":             msg,
+			"requested_runtime": requestedRuntime,
+			"seeded_runtime":    seeded,
+			"issue":             "2027",
+		},
+	}
+}
+
+// seededConfigRuntime extracts the top-level `runtime:` from the config.yaml
+// that will be seeded into the workspace — preferring the in-memory
+// configFiles, falling back to the template directory on disk. Returns ""
+// when no config.yaml is available or it declares no top-level runtime.
+func seededConfigRuntime(templatePath string, configFiles map[string][]byte) string {
+	if data, ok := configFiles["config.yaml"]; ok {
+		return parseTopLevelRuntime(data)
+	}
+	if templatePath != "" {
+		if data, err := os.ReadFile(filepath.Join(templatePath, "config.yaml")); err == nil {
+			return parseTopLevelRuntime(data)
+		}
+	}
+	return ""
+}
+
+// parseTopLevelRuntime returns the value of the top-level `runtime:` key in a
+// config.yaml, ignoring the nested `runtime_config:` block. A small dedicated
+// line scanner (mirrors the one the Create handler uses to read a template's
+// runtime) so the provision-time guard needs no YAML dependency.
+func parseTopLevelRuntime(data []byte) string {
+	for _, raw := range strings.Split(string(data), "\n") {
+		trimmed := strings.TrimLeft(raw, " \t")
+		if len(raw) > len(trimmed) {
+			continue // indented — inside a nested block (e.g. runtime_config:)
+		}
+		if strings.HasPrefix(trimmed, "runtime:") && !strings.HasPrefix(trimmed, "runtime_config") {
+			return strings.Trim(strings.TrimSpace(strings.TrimPrefix(trimmed, "runtime:")), `"'`)
+		}
+	}
+	return ""
 }
 
 // mintWorkspaceSecrets issues + persists the workspace auth token
