@@ -16,7 +16,7 @@ const SchemaVersion = 1
 // Fingerprint is a stable content hash of the generated projection (schema
 // version + provider catalog + runtime native sets). It changes iff the
 // registry DATA changes (comment-only YAML edits do not churn it).
-const Fingerprint = "1100bc3e42a5f425"
+const Fingerprint = "8f733b112695b926"
 
 // GenProvider is the generated projection of one provider catalog entry —
 // the subset a downstream consumer needs to derive + display a provider.
@@ -80,8 +80,8 @@ var Runtimes = map[string][]GenRuntimeRef{
 		{Name: "anthropic-oauth", Models: []string{"sonnet", "opus", "haiku", "anthropic:sonnet", "anthropic:opus", "anthropic:haiku"}},
 		{Name: "anthropic-api", Models: []string{"claude-sonnet-4-6", "claude-opus-4-7", "claude-haiku-4-5", "claude-sonnet-4-5", "anthropic:claude-sonnet-4-6", "anthropic:claude-opus-4-7", "anthropic:claude-haiku-4-5", "anthropic:claude-sonnet-4-5"}},
 		{Name: "kimi-coding", Models: []string{"kimi-for-coding", "kimi-k2.5", "kimi-k2", "moonshot:kimi-k2.6", "moonshot:kimi-k2.5"}},
-		{Name: "minimax", Models: []string{"MiniMax-M2", "MiniMax-M2.7", "MiniMax-M2.7-highspeed", "minimax:MiniMax-M2", "minimax:MiniMax-M2.7", "minimax:MiniMax-M2.7-highspeed"}},
-		{Name: "platform", Models: []string{"anthropic/claude-opus-4-7", "anthropic/claude-sonnet-4-6", "moonshot/kimi-k2.6", "moonshot/kimi-k2.5", "minimax/MiniMax-M2.7", "minimax/MiniMax-M2.7-highspeed"}},
+		{Name: "minimax", Models: []string{"MiniMax-M2", "MiniMax-M2.7", "MiniMax-M2.7-highspeed", "MiniMax-M3", "minimax:MiniMax-M2", "minimax:MiniMax-M2.7", "minimax:MiniMax-M2.7-highspeed", "minimax:MiniMax-M3"}},
+		{Name: "platform", Models: []string{"anthropic/claude-opus-4-7", "anthropic/claude-sonnet-4-6", "moonshot/kimi-k2.6", "moonshot/kimi-k2.5", "minimax/MiniMax-M2.7", "minimax/MiniMax-M2.7-highspeed", "minimax/MiniMax-M3"}},
 	},
 	"codex": {
 		{Name: "openai-subscription", Models: []string{"gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.2"}},
