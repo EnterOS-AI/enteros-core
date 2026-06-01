@@ -377,6 +377,9 @@ func readWorkspaceDeriveInputs(ctx context.Context, workspaceID string) (runtime
 			availableAuthEnv = append(availableAuthEnv, k)
 		}
 	}
+	if err := rows.Err(); err != nil {
+		log.Printf("llm_billing_mode: read secrets rows error for %s: %v (deriving with partial model/auth-env)", workspaceID, err)
+	}
 	return runtime, model, availableAuthEnv
 }
 
@@ -453,7 +456,10 @@ func SetWorkspaceLLMBillingMode(ctx context.Context, workspaceID, mode string) e
 		if err != nil {
 			return fmt.Errorf("clear workspace llm_billing_mode for %s: %w", workspaceID, err)
 		}
-		n, _ := res.RowsAffected()
+		n, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("clear workspace llm_billing_mode rows affected %s: %w", workspaceID, err)
+		}
 		if n == 0 {
 			return sql.ErrNoRows
 		}
@@ -470,7 +476,10 @@ func SetWorkspaceLLMBillingMode(ctx context.Context, workspaceID, mode string) e
 	if err != nil {
 		return fmt.Errorf("set workspace llm_billing_mode for %s: %w", workspaceID, err)
 	}
-	n, _ := res.RowsAffected()
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("set workspace llm_billing_mode rows affected %s: %w", workspaceID, err)
+	}
 	if n == 0 {
 		return sql.ErrNoRows
 	}

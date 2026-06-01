@@ -243,7 +243,12 @@ func (h *AdminSchedulesHealthHandler) ReapOrphans(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "re-point failed"})
 		return
 	}
-	repointedN, _ := repointed.RowsAffected()
+	repointedN, err := repointed.RowsAffected()
+	if err != nil {
+		log.Printf("ReapOrphans: repointed rows affected: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "re-point failed"})
+		return
+	}
 
 	// 2. Disable any remaining schedules still bound to a removed/missing
 	//    workspace (no live successor, or template schedules on a dead row).
@@ -261,7 +266,12 @@ func (h *AdminSchedulesHealthHandler) ReapOrphans(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "disable failed"})
 		return
 	}
-	disabledN, _ := disabled.RowsAffected()
+	disabledN, err := disabled.RowsAffected()
+	if err != nil {
+		log.Printf("ReapOrphans: disabled rows affected: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "disable failed"})
+		return
+	}
 
 	log.Printf("ReapOrphans: re-pointed %d, disabled %d orphaned schedule(s)", repointedN, disabledN)
 	c.JSON(http.StatusOK, gin.H{"repointed": repointedN, "disabled": disabledN})

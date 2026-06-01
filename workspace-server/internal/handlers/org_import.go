@@ -750,7 +750,12 @@ func (h *OrgHandler) migrateRuntimeSchedulesFromRemovedPredecessor(ctx context.C
 		log.Printf("Org import: schedule migration %s -> %s (%q) failed: %v", predID, newID, name, err)
 		return
 	}
-	if n, _ := res.RowsAffected(); n > 0 {
+	n, err := res.RowsAffected()
+	if err != nil {
+		log.Printf("Org import: schedule migration rows affected %s -> %s: %v", predID, newID, err)
+		return
+	}
+	if n > 0 {
 		log.Printf("Org import: migrated %d runtime schedule(s) from removed predecessor %s to new workspace %s (%q)", n, predID, newID, name)
 	}
 }
