@@ -414,6 +414,56 @@ func TestChatUpload_WorkspaceUnreachable(t *testing.T) {
 	}
 }
 
+func TestChatUpload_RejectsMetadataWorkspaceURL(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	restore := setSSRFCheckForTest(true)
+	t.Cleanup(restore)
+
+	wsID := "00000000-0000-0000-0000-000000000047"
+	expectURL(mock, wsID, "http://169.254.169.254/latest/meta-data")
+
+	h := NewChatFilesHandler(NewTemplatesHandler(t.TempDir(), nil, nil))
+	body, ct := uploadFixture(t)
+	c, w := makeUploadRequest(t, wsID, body, ct)
+	h.Upload(c)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for metadata workspace URL, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "workspace URL not allowed") {
+		t.Errorf("expected unsafe URL error, got: %s", w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations not met: %v", err)
+	}
+}
+
+func TestChatUpload_RejectsNonHTTPWorkspaceURL(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	restore := setSSRFCheckForTest(true)
+	t.Cleanup(restore)
+
+	wsID := "00000000-0000-0000-0000-000000000048"
+	expectURL(mock, wsID, "file:///etc/passwd")
+
+	h := NewChatFilesHandler(NewTemplatesHandler(t.TempDir(), nil, nil))
+	body, ct := uploadFixture(t)
+	c, w := makeUploadRequest(t, wsID, body, ct)
+	h.Upload(c)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for non-HTTP workspace URL, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "workspace URL not allowed") {
+		t.Errorf("expected unsafe URL error, got: %s", w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations not met: %v", err)
+	}
+}
+
 // TestChatUpload_BodyUnderCap_Forwards pins the lower edge of the new
 // 100 MB body cap (CTO 2026-05-19 directive on forensic a99ab0a1).
 // A multipart payload comfortably under the cap must reach the
@@ -643,6 +693,54 @@ func TestChatDownload_NoInboundSecret_LazyHealFailure(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), "RFC #2312") {
 		t.Errorf("expected detail to reference RFC #2312 on lazy-heal failure, got: %s", w.Body.String())
+	}
+}
+
+func TestChatDownload_RejectsMetadataWorkspaceURL(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	restore := setSSRFCheckForTest(true)
+	t.Cleanup(restore)
+
+	wsID := "00000000-0000-0000-0000-000000000054"
+	expectURL(mock, wsID, "http://169.254.169.254/latest/meta-data")
+
+	h := NewChatFilesHandler(NewTemplatesHandler(t.TempDir(), nil, nil))
+	c, w := makeDownloadRequest(t, wsID, "/workspace/foo.txt")
+	h.Download(c)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for metadata workspace URL, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "workspace URL not allowed") {
+		t.Errorf("expected unsafe URL error, got: %s", w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations not met: %v", err)
+	}
+}
+
+func TestChatDownload_RejectsNonHTTPWorkspaceURL(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	restore := setSSRFCheckForTest(true)
+	t.Cleanup(restore)
+
+	wsID := "00000000-0000-0000-0000-000000000055"
+	expectURL(mock, wsID, "file:///etc/passwd")
+
+	h := NewChatFilesHandler(NewTemplatesHandler(t.TempDir(), nil, nil))
+	c, w := makeDownloadRequest(t, wsID, "/workspace/foo.txt")
+	h.Download(c)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for non-HTTP workspace URL, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "workspace URL not allowed") {
+		t.Errorf("expected unsafe URL error, got: %s", w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations not met: %v", err)
 	}
 }
 

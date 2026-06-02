@@ -196,10 +196,15 @@ func resolveWorkspaceForwardCreds(c *gin.Context, ctx context.Context, workspace
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "workspace url not registered yet"})
 		return "", "", false
 	}
-	// Trust note: workspaces.url passes validateAgentURL at /registry/
-	// register write time, blocking SSRF-shaped URLs. We rely on that
-	// upstream gate rather than re-validating here. Tracked at #2316
-	// for follow-up: forward-time re-validation as defense-in-depth.
+	// Defense-in-depth for #2316: workspaces.url is validated at
+	// registration time, but the DB row can be stale/tampered and the
+	// SSRF policy can tighten. Re-validate immediately before attaching
+	// the inbound secret to an outbound forward.
+	if err := isSafeURL(wsURL); err != nil {
+		log.Printf("chat_files %s: unsafe workspace URL for %s rejected: %v", op, workspaceID, err)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "workspace URL not allowed"})
+		return "", "", false
+	}
 
 	secret, healed, err := readOrLazyHealInboundSecret(ctx, workspaceID, "chat_files "+op)
 	if err != nil {
