@@ -9,6 +9,12 @@
 #   Triggers on:
 #     - `pull_request_target`: opened, synchronize, reopened
 #         → initial status posts when PR opens / re-pushes
+#     - `pull_request_review`: submitted
+#         → re-evaluate when a review is submitted so the gate flips
+#           immediately (no wait for the next push or slash-command).
+#           The status CONTEXT NAME this path posts MUST byte-match the
+#           branch-protection required context — Gitea maps both event
+#           types to the same `(pull_request)` check-run suffix.
 #     - comment refires are handled by `review-refire-comments.yml`
 #         → a single issue_comment dispatcher prevents every SOP/review
 #           comment from enqueueing separate qa/security/tier jobs on
@@ -85,6 +91,8 @@ name: qa-review
 on:
   pull_request_target:
     types: [opened, synchronize, reopened]
+  pull_request_review:
+    types: [submitted]
 
 permissions:
   contents: read
@@ -96,10 +104,13 @@ jobs:
   approved:
     # Gate the job:
     #   - On pull_request_target events: always run.
+    #   - On pull_request_review events: run so the gate flips when a
+    #     team member submits an APPROVE review (no push needed).
     # Comment-triggered refires live in review-refire-comments.yml. Keeping
     # this workflow PR-only avoids comment-triggered queue storms.
     if: |
-      github.event_name == 'pull_request_target'
+      github.event_name == 'pull_request_target' ||
+      github.event_name == 'pull_request_review'
     runs-on: ubuntu-latest
     steps:
       - name: Privilege check (A1.1 — INFORMATIONAL log only, NOT a gate)

@@ -6,12 +6,19 @@
 #
 # See `qa-review.yml` header for the full A1-α / A1.1 / A4 / A5 design
 # rationale; everything below is identical in shape.
+#
+# A1-α addendum (internal#760): `pull_request_review` trigger added so the
+# security gate flips immediately when a team member submits an APPROVE
+# review. The status CONTEXT NAME MUST byte-match the branch-protection
+# required context — Gitea maps both event types to `(pull_request)`.
 
 name: security-review
 
 on:
   pull_request_target:
     types: [opened, synchronize, reopened]
+  pull_request_review:
+    types: [submitted]
 
 permissions:
   contents: read
@@ -21,10 +28,15 @@ permissions:
 jobs:
   # bp-exempt: PR security review bot signal; required merge state is enforced by CI / all-required.
   approved:
+    # Gate the job:
+    #   - On pull_request_target events: always run.
+    #   - On pull_request_review events: run so the gate flips when a
+    #     team member submits an APPROVE review (no push needed).
     # Comment-triggered refires live in review-refire-comments.yml. Keeping
     # this workflow PR-only avoids comment-triggered queue storms.
     if: |
-      github.event_name == 'pull_request_target'
+      github.event_name == 'pull_request_target' ||
+      github.event_name == 'pull_request_review'
     runs-on: ubuntu-latest
     steps:
       - name: Privilege check (A1.1 — INFORMATIONAL log only, NOT a gate)
