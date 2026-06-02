@@ -179,9 +179,14 @@ jobs:
         # for this event, but branch-protection requires (pull_request_target).
         # We explicitly POST the BP-required context so the gate flips.
         # Trust boundary: same BASE-ref script result, no PR-head code.
+        #
+        # TOKEN SCOPE FIX (RC 8324): uses secrets.GITHUB_TOKEN directly.
+        # SOP_TIER_CHECK_TOKEN lacks statuses:write scope → POST /statuses
+        # returns 403. The workflow permissions block already grants
+        # statuses:write to the auto-injected GITHUB_TOKEN.
         if: github.event_name == 'pull_request_review_approved' && always()
         env:
-          GITEA_TOKEN: ${{ secrets.SOP_TIER_CHECK_TOKEN || secrets.GITHUB_TOKEN }}
+          GITEA_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITEA_HOST: git.moleculesai.app
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
@@ -205,10 +210,10 @@ jobs:
 
           if [ "$EVAL_OUTCOME" = "success" ]; then
             status_state="success"
-            description="Approved via pull_request_review trigger"
+            description="Approved via pull_request_review_approved trigger"
           else
             status_state="failure"
-            description="Review check failed via pull_request_review trigger"
+            description="Review check failed via pull_request_review_approved trigger"
           fi
 
           body=$(jq -nc \
