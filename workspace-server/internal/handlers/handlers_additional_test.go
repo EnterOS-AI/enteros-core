@@ -576,13 +576,14 @@ func TestDiscover_TargetOffline(t *testing.T) {
 	setupTestRedis(t)
 	handler := NewDiscoveryHandler()
 
-	// Both root-level, access allowed
+	// Share a parent so communication is allowed under post-#1955 rules
+	sharedParent := "ws-parent"
 	mock.ExpectQuery("SELECT id, parent_id FROM workspaces WHERE id =").
 		WithArgs("ws-caller").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "parent_id"}).AddRow("ws-caller", nil))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "parent_id"}).AddRow("ws-caller", sharedParent))
 	mock.ExpectQuery("SELECT id, parent_id FROM workspaces WHERE id =").
 		WithArgs("ws-off").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "parent_id"}).AddRow("ws-off", nil))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "parent_id"}).AddRow("ws-off", sharedParent))
 
 	// Name + runtime lookup (discovery now queries both)
 	mock.ExpectQuery("SELECT COALESCE").
@@ -622,13 +623,14 @@ func TestCheckAccess_SiblingsAllowed(t *testing.T) {
 	setupTestRedis(t)
 	handler := NewDiscoveryHandler()
 
-	// Both root-level siblings → allowed
+	// Share a parent so communication is allowed under post-#1955 rules
+	sharedParent := "ws-parent"
 	mock.ExpectQuery("SELECT id, parent_id FROM workspaces WHERE id =").
 		WithArgs("ws-a").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "parent_id"}).AddRow("ws-a", nil))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "parent_id"}).AddRow("ws-a", sharedParent))
 	mock.ExpectQuery("SELECT id, parent_id FROM workspaces WHERE id =").
 		WithArgs("ws-b").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "parent_id"}).AddRow("ws-b", nil))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "parent_id"}).AddRow("ws-b", sharedParent))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)

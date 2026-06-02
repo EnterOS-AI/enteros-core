@@ -294,23 +294,15 @@ func TestProxyA2A_CrossTenant_RoutingDenied(t *testing.T) {
 	// A URL exists for the target; the guard must deny BEFORE it is used.
 	mr.Set(fmt.Sprintf("ws:%s:url", target), "http://localhost:1")
 
-	// CanCommunicate: both root-level (parent_id NULL) → its weak "root-level
-	// siblings" rule ALLOWS this. The org guard must catch it afterward.
+	// Post-#1955: CanCommunicate no longer has the root-sibling bypass.
+	// Both root-level (parent_id NULL) but unrelated org roots → hierarchy
+	// check DENIES with 403 BEFORE the org-scope guard or resolveAgentURL.
 	mock.ExpectQuery("SELECT id, parent_id FROM workspaces WHERE id = ").
 		WithArgs(caller).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "parent_id"}).AddRow(caller, nil))
 	mock.ExpectQuery("SELECT id, parent_id FROM workspaces WHERE id = ").
 		WithArgs(target).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "parent_id"}).AddRow(target, nil))
-
-	// #1953 org-scope guard: caller resolves to org-a-root, target to org-b-root
-	// → different orgs → 403. (Each org root resolves to itself.)
-	mock.ExpectQuery("WITH RECURSIVE org_chain AS").
-		WithArgs(caller).
-		WillReturnRows(sqlmock.NewRows([]string{"root_id"}).AddRow(caller))
-	mock.ExpectQuery("WITH RECURSIVE org_chain AS").
-		WithArgs(target).
-		WillReturnRows(sqlmock.NewRows([]string{"root_id"}).AddRow(target))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -329,8 +321,8 @@ func TestProxyA2A_CrossTenant_RoutingDenied(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("body not JSON: %v", err)
 	}
-	if msg, _ := resp["error"].(string); !strings.Contains(msg, "different org") {
-		t.Errorf("expected cross-org denial message, got %v", resp["error"])
+	if msg, _ := resp["error"].(string); !strings.Contains(msg, "cannot communicate") {
+		t.Errorf("expected hierarchy denial message, got %v", resp["error"])
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations: %v", err)

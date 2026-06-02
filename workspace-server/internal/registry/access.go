@@ -99,11 +99,6 @@ func CanCommunicate(callerID, targetID string) bool {
 		*caller.ParentID == *target.ParentID {
 		return true
 	}
-	// Root-level siblings — both have no parent
-	if caller.ParentID == nil && target.ParentID == nil {
-		return true
-	}
-
 	// Direct parent → child (fast path; avoids the ancestor walk)
 	if target.ParentID != nil && caller.ID == *target.ParentID {
 		return true

@@ -63,14 +63,16 @@ func TestCanCommunicate_Siblings(t *testing.T) {
 	}
 }
 
-func TestCanCommunicate_RootSiblings(t *testing.T) {
+func TestCanCommunicate_Denied_RootSiblings(t *testing.T) {
 	mock := setupMockDB(t)
-	// Both at root level (no parent)
+	// Two unrelated org roots (both parent_id = NULL) must NOT communicate.
+	// This is the regression test for #1955: without an org_id column, two
+	// root workspaces have no shared ancestor, so they must be denied.
 	expectLookup(mock, "ws-a", nil)
 	expectLookup(mock, "ws-b", nil)
 
-	if !CanCommunicate("ws-a", "ws-b") {
-		t.Error("root-level siblings should communicate")
+	if CanCommunicate("ws-a", "ws-b") {
+		t.Error("unrelated root-level workspaces should NOT communicate")
 	}
 }
 

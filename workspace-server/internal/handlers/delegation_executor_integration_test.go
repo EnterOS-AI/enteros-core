@@ -55,6 +55,7 @@ import (
 const integrationTestDelegationID = "del-159-test-integration"
 const integrationTestSourceID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 const integrationTestTargetID = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+const integrationTestParentID = "cccccccc-cccc-cccc-cccc-cccccccccccc"
 
 // rawHTTPServer starts a TCP listener, serves one HTTP response, and closes.
 // It runs in a background goroutine so the test can proceed immediately after
