@@ -40,7 +40,7 @@ jobs:
     # this workflow PR-only avoids comment-triggered queue storms.
     if: |
       github.event_name == 'pull_request_target' ||
-      (github.event_name == 'pull_request_review' && github.event.review.state == 'approved')
+      (github.event_name == 'pull_request_review' && github.event.review.state == 'APPROVED')
     runs-on: ubuntu-latest
     steps:
       - name: Privilege check (A1.1 — INFORMATIONAL log only, NOT a gate)
