@@ -40,9 +40,9 @@ func TestGHCRAuthHeader_EncodesDockerEnginePayload(t *testing.T) {
 	if got == "" {
 		t.Fatal("expected non-empty auth header")
 	}
-	raw, err := base64.URLEncoding.DecodeString(got)
+	raw, err := base64.StdEncoding.DecodeString(got)
 	if err != nil {
-		t.Fatalf("auth header is not valid base64-url: %v", err)
+		t.Fatalf("auth header is not valid base64: %v", err)
 	}
 	var payload map[string]string
 	if err := json.Unmarshal(raw, &payload); err != nil {
@@ -73,9 +73,9 @@ func TestGHCRAuthHeader_RespectsRegistryEnv(t *testing.T) {
 	if got == "" {
 		t.Fatal("expected non-empty auth header")
 	}
-	raw, err := base64.URLEncoding.DecodeString(got)
+	raw, err := base64.StdEncoding.DecodeString(got)
 	if err != nil {
-		t.Fatalf("auth header is not valid base64-url: %v", err)
+		t.Fatalf("auth header is not valid base64: %v", err)
 	}
 	var payload map[string]string
 	if err := json.Unmarshal(raw, &payload); err != nil {
@@ -100,7 +100,7 @@ func TestGHCRAuthHeader_TrimsWhitespace(t *testing.T) {
 	t.Setenv("GHCR_USER", "  alice  ")
 	t.Setenv("GHCR_TOKEN", "\tfake-tok-value\n")
 	got := ghcrAuthHeader()
-	raw, _ := base64.URLEncoding.DecodeString(got)
+	raw, _ := base64.StdEncoding.DecodeString(got)
 	var payload map[string]string
 	_ = json.Unmarshal(raw, &payload)
 	if payload["username"] != "alice" {
