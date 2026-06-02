@@ -815,3 +815,78 @@ func TestChatDownload_404FromWorkspacePropagated(t *testing.T) {
 		t.Errorf("expected 404 propagated, got %d", w.Code)
 	}
 }
+
+// SSRF defense-in-depth tests for #2316 — forward-time URL validation in
+// resolveWorkspaceForwardCreds. Upload + Download share the helper; both
+// paths are pinned so a partial regression (one handler drifting away from
+// the shared helper) fails in CI.
+
+func TestChatUpload_RejectsMetadataURL(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	setSSRFCheckForTest(true)
+
+	wsID := "00000000-0000-0000-0000-000000000060"
+	expectURL(mock, wsID, "http://169.254.169.254/latest/meta-data/")
+
+	h := NewChatFilesHandler(NewTemplatesHandler(t.TempDir(), nil, nil))
+	body, ct := uploadFixture(t)
+	c, w := makeUploadRequest(t, wsID, body, ct)
+	h.Upload(c)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for metadata URL in upload, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestChatUpload_RejectsNonHTTPScheme(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	setSSRFCheckForTest(true)
+
+	wsID := "00000000-0000-0000-0000-000000000061"
+	expectURL(mock, wsID, "file:///etc/passwd")
+
+	h := NewChatFilesHandler(NewTemplatesHandler(t.TempDir(), nil, nil))
+	body, ct := uploadFixture(t)
+	c, w := makeUploadRequest(t, wsID, body, ct)
+	h.Upload(c)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for file:// scheme in upload, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestChatDownload_RejectsMetadataURL(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	setSSRFCheckForTest(true)
+
+	wsID := "00000000-0000-0000-0000-000000000062"
+	expectURL(mock, wsID, "http://169.254.169.254/latest/meta-data/")
+
+	h := NewChatFilesHandler(NewTemplatesHandler(t.TempDir(), nil, nil))
+	c, w := makeDownloadRequest(t, wsID, "/workspace/foo.txt")
+	h.Download(c)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for metadata URL in download, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestChatDownload_RejectsNonHTTPScheme(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	setSSRFCheckForTest(true)
+
+	wsID := "00000000-0000-0000-0000-000000000063"
+	expectURL(mock, wsID, "file:///etc/passwd")
+
+	h := NewChatFilesHandler(NewTemplatesHandler(t.TempDir(), nil, nil))
+	c, w := makeDownloadRequest(t, wsID, "/workspace/foo.txt")
+	h.Download(c)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for file:// scheme in download, got %d: %s", w.Code, w.Body.String())
+	}
+}
