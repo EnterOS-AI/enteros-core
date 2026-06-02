@@ -7,22 +7,24 @@
 # See `qa-review.yml` header for the full A1-α / A1.1 / A4 / A5 design
 # rationale; everything below is identical in shape.
 #
-# A1-α addendum (internal#760): `pull_request_review` trigger added so the
-# security gate flips immediately when a team member submits an APPROVE
-# review. CR2 live verification (REQUEST_CHANGES 8302) confirmed Gitea
-# 1.22.6 posts `security-review / approved (pull_request_review)` for this
-# event, while branch-protection requires `(pull_request_target)`. Therefore
-# the pull_request_review path EXPLICITLY POSTS the required context via
-# the API rather than relying on the job's auto-published context name.
-# Trust boundary preserved (BASE ref, no PR-head).
+# A1-α addendum (internal#760): `pull_request_review_approved` trigger
+# added so the security gate flips immediately when a team member submits
+# an APPROVE review. Gitea Actions uses the specific event name
+# `pull_request_review_approved` (not the GitHub-style `pull_request_review`
+# catch-all). Verified via Gitea source code audit (go-gitea/gitea main,
+# modules/webhook/type.go + services/actions/notifier.go). The event
+# payload carries `review.type="pull_request_review_approved"`; there is
+# no `review.state` field. Branch-protection requires the
+# `(pull_request_target)` context variant, so the
+# pull_request_review_approved path EXPLICITLY POSTS the required context
+# via the API. Trust boundary preserved (BASE ref, no PR-head).
 
 name: security-review
 
 on:
   pull_request_target:
     types: [opened, synchronize, reopened]
-  pull_request_review:
-    types: [submitted]
+  pull_request_review_approved:
 
 permissions:
   contents: read
@@ -30,32 +32,16 @@ permissions:
   statuses: write
 
 jobs:
-  # DIAGNOSTIC (RC 8321): dump the exact pull_request_review payload shape
-  # so we can write a correct job-level guard. CR2 will trigger this via a
-  # review submission; the log reveals the JSON path Gitea 1.22.6 actually
-  # uses for review.state. Removed after guard is fixed.
-  diagnostic:
-    runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request_review'
-    steps:
-      - name: Dump github.event JSON
-        run: |
-          echo "EVENT_NAME=${{ github.event_name }}"
-          echo "REVIEW_STATE=${{ github.event.review.state }}"
-          echo "ACTION=${{ github.event.action }}"
-          echo "FULL_EVENT=${{ toJSON(github.event) }}"
-
   # bp-exempt: PR security review bot signal; required merge state is enforced by CI / all-required.
   approved:
     # Gate the job:
     #   - On pull_request_target events: always run.
-    #   - On pull_request_review events: run so the gate flips when a
-    #     team member submits an APPROVE review (no push needed).
-    # Comment-triggered refires live in review-refire-comments.yml. Keeping
-    # this workflow PR-only avoids comment-triggered queue storms.
+    #   - On pull_request_review_approved events: run so the gate flips
+    #     immediately when a team member submits an APPROVE review.
+    # Comment-triggered refires live in sop-checklist.yml review-refire job.
     if: |
       github.event_name == 'pull_request_target' ||
-      (github.event_name == 'pull_request_review' && github.event.review.state == 'APPROVED')
+      github.event_name == 'pull_request_review_approved'
     runs-on: ubuntu-latest
     steps:
       - name: Privilege check (A1.1 — INFORMATIONAL log only, NOT a gate)
@@ -101,12 +87,12 @@ jobs:
           REVIEW_CHECK_STRICT: '0'
         run: bash .gitea/scripts/review-check.sh
 
-      - name: Post required status context on pull_request_review
-        # CR2 8302: Gitea 1.22.6 auto-publishes (pull_request_review) context
+      - name: Post required status context on pull_request_review_approved
+        # Gitea Actions auto-publishes (pull_request_review_approved) context
         # for this event, but branch-protection requires (pull_request_target).
         # We explicitly POST the BP-required context so the gate flips.
         # Trust boundary: same BASE-ref script result, no PR-head code.
-        if: github.event_name == 'pull_request_review' && always()
+        if: github.event_name == 'pull_request_review_approved' && always()
         env:
           GITEA_TOKEN: ${{ secrets.SOP_TIER_CHECK_TOKEN || secrets.GITHUB_TOKEN }}
           GITEA_HOST: git.moleculesai.app
