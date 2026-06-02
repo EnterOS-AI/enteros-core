@@ -199,6 +199,11 @@ func (s *Scheduler) Start(ctx context.Context) {
 	// entry/exit — those are kept as redundant signals but this pulse is the
 	// one that guarantees liveness freshness regardless of tick state.
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("PANIC recovered in scheduler heartbeat goroutine: %v", r)
+			}
+		}()
 		pulseTicker := time.NewTicker(10 * time.Second)
 		defer pulseTicker.Stop()
 		for {
@@ -638,6 +643,11 @@ func (s *Scheduler) fireSchedule(ctx context.Context, sched scheduleRow) {
 		summary := s.extractResponseSummary(respBody)
 		if summary != "" {
 			go func(wsID, text string) {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("PANIC recovered in broadcast summary goroutine: %v", r)
+					}
+				}()
 				postCtx, postCancel := context.WithTimeout(context.Background(), 30*time.Second)
 				defer postCancel()
 				s.channels.BroadcastToWorkspaceChannels(postCtx, wsID, text)
