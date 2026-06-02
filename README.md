@@ -49,8 +49,8 @@
 ## Quick Start
 
 ```bash
-git clone https://git.moleculesai.app/molecule-ai/molecule-monorepo.git
-cd molecule-monorepo
+git clone https://git.moleculesai.app/molecule-ai/molecule-core.git
+cd molecule-core
 ./scripts/dev-start.sh
 ```
 

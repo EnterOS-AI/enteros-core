@@ -13,7 +13,7 @@
 #
 # Invocation (from template-hermes repo's CI):
 #
-#     bash /path/to/molecule-monorepo/tools/check-template-parity.sh \
+#     bash /path/to/molecule-core/tools/check-template-parity.sh \
 #          install.sh start.sh
 #
 # Or inline via curl:
