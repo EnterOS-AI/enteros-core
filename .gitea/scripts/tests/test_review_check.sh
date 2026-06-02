@@ -372,6 +372,16 @@ assert_eq "T18 exit code 0 (comment approval still considered)" "0" "$T18_RC"
 assert_contains "T18 comment candidate notice" "comment-based approval" "$T18_OUT"
 assert_contains "T18 comment approver accepted" "APPROVED by core-qa-agent" "$T18_OUT"
 
+# T19 — ai-sop-ack member APPROVED review must NOT count toward qa-review
+# or security-review (R1 hardening refinement, msg 1388c76f).
+echo
+echo "== T19 ai-sop-ack APPROVED review excluded from team gate =="
+T19_OUT=$(run_review_check "T19_ai_sop_ack_approved")
+T19_RC=$(cat "$FIX_STATE_DIR/last_rc")
+assert_eq "T19 exit code 1 (ai-sop-ack not in qa/security team)" "1" "$T19_RC"
+assert_contains "T19 ai-reviewer excluded from team" "candidates: ai-reviewer" "$T19_OUT"
+assert_contains "T19 none are in team error" "none are in team" "$T19_OUT"
+
 echo
 echo "------"
 echo "PASS=$PASS FAIL=$FAIL"

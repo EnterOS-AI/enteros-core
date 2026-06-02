@@ -1003,3 +1003,186 @@ class TestComputeNaStateAcceptsGateNotInItems(unittest.TestCase):
             comments, "alice", na_gates, lambda *_: ["alice"]
         )
         self.assertFalse(na_state["security-review"]["declared"])
+
+
+# ---------------------------------------------------------------------------
+# internal#760 ceremony — ai-sop-ack team + ai_ack_eligible per-item flag
+# ---------------------------------------------------------------------------
+
+
+class TestAIAckEligibleConfig(unittest.TestCase):
+    """CTO-controlled allowlist (msg 1388c76f):
+      ai_ack_eligible: comprehensive-testing, local-postgres-e2e, staging-smoke,
+                       five-axis-review, memory-consulted
+      human-only:      root-cause, no-backwards-compat
+    """
+
+    def test_ai_ack_eligible_items(self):
+        cfg = sop.load_config(CONFIG_PATH)
+        items_by_slug = {it["slug"]: it for it in cfg["items"]}
+        eligible = {
+            "comprehensive-testing",
+            "local-postgres-e2e",
+            "staging-smoke",
+            "five-axis-review",
+            "memory-consulted",
+        }
+        for slug in eligible:
+            self.assertTrue(
+                items_by_slug[slug].get("ai_ack_eligible"),
+                f"{slug} must be ai_ack_eligible",
+            )
+
+    def test_human_only_items(self):
+        cfg = sop.load_config(CONFIG_PATH)
+        items_by_slug = {it["slug"]: it for it in cfg["items"]}
+        human_only = {"root-cause", "no-backwards-compat"}
+        for slug in human_only:
+            self.assertFalse(
+                items_by_slug[slug].get("ai_ack_eligible", False),
+                f"{slug} must NOT be ai_ack_eligible (human-only)",
+            )
+
+    def test_testing_class_slugs_constant(self):
+        """_TESTING_CLASS_SLUGS must match the three testing items."""
+        self.assertEqual(
+            sop._TESTING_CLASS_SLUGS,
+            {"comprehensive-testing", "local-postgres-e2e", "staging-smoke"},
+        )
+
+
+class TestAIAckEligibilityProbe(unittest.TestCase):
+    """The probe closure in main() delegates to compute_ack_state.
+    We simulate the AI-ack path by injecting a probe that behaves like
+    the production probe (human team first, then ai-sop-ack fallback).
+    """
+
+    def setUp(self):
+        self.items = _items_by_slug()
+        self.aliases = _numeric_aliases()
+
+    def _probe_human_then_ai(self, human_users, ai_users):
+        """Return users in human_users immediately; users in ai_users only
+        if the item is ai_ack_eligible."""
+        def probe(slug, users):
+            item = self.items.get(slug, {})
+            approved = []
+            for u in users:
+                if u in human_users:
+                    approved.append(u)
+                elif u in ai_users and item.get("ai_ack_eligible"):
+                    approved.append(u)
+            return approved
+        return probe
+
+    def test_ai_ack_passes_for_eligible_item(self):
+        comments = [_comment("ai-bot", "/sop-ack five-axis-review")]
+        probe = self._probe_human_then_ai(human_users=set(), ai_users={"ai-bot"})
+        state = sop.compute_ack_state(
+            comments, "alice", self.items, self.aliases, probe
+        )
+        self.assertEqual(state["five-axis-review"]["ackers"], ["ai-bot"])
+
+    def test_ai_ack_rejected_for_human_only_item(self):
+        comments = [_comment("ai-bot", "/sop-ack root-cause")]
+        probe = self._probe_human_then_ai(human_users=set(), ai_users={"ai-bot"})
+        state = sop.compute_ack_state(
+            comments, "alice", self.items, self.aliases, probe
+        )
+        self.assertEqual(state["root-cause"]["ackers"], [])
+        self.assertIn("ai-bot", state["root-cause"]["rejected"]["not_in_team"])
+
+    def test_human_ack_still_works_for_ai_eligible_item(self):
+        comments = [_comment("bob", "/sop-ack comprehensive-testing")]
+        probe = self._probe_human_then_ai(human_users={"bob"}, ai_users=set())
+        state = sop.compute_ack_state(
+            comments, "alice", self.items, self.aliases, probe
+        )
+        self.assertEqual(state["comprehensive-testing"]["ackers"], ["bob"])
+
+    def test_ai_ack_rejected_for_testing_item_when_ci_red(self):
+        # Simulate the production probe that checks CI status for testing items.
+        # When CI is not green, ai-sop-ack member is rejected.
+        def probe(slug, users):
+            item = self.items.get(slug, {})
+            approved = []
+            for u in users:
+                if u == "ai-bot" and item.get("ai_ack_eligible"):
+                    # Testing items require CI green; simulate CI red.
+                    if slug in sop._TESTING_CLASS_SLUGS:
+                        continue  # rejected: CI not green
+                    approved.append(u)
+            return approved
+
+        comments = [_comment("ai-bot", "/sop-ack comprehensive-testing")]
+        state = sop.compute_ack_state(
+            comments, "alice", self.items, self.aliases, probe
+        )
+        self.assertEqual(state["comprehensive-testing"]["ackers"], [])
+
+    def test_ai_ack_passes_for_testing_item_when_ci_green(self):
+        # Simulate CI green → AI ack passes.
+        def probe(slug, users):
+            item = self.items.get(slug, {})
+            approved = []
+            for u in users:
+                if u == "ai-bot" and item.get("ai_ack_eligible"):
+                    if slug in sop._TESTING_CLASS_SLUGS:
+                        # CI is green → allow
+                        pass
+                    approved.append(u)
+            return approved
+
+        comments = [_comment("ai-bot", "/sop-ack comprehensive-testing")]
+        state = sop.compute_ack_state(
+            comments, "alice", self.items, self.aliases, probe
+        )
+        self.assertEqual(state["comprehensive-testing"]["ackers"], ["ai-bot"])
+
+
+class TestGetCIStatus(unittest.TestCase):
+    """Verify get_ci_status reads the correct context from commit statuses."""
+
+    def _client_with_statuses(self, statuses):
+        client = sop.GiteaClient("git.example.com", "tok")
+
+        def fake_req(method, path, body=None, ok_codes=(200, 201, 204)):
+            return 200, statuses
+
+        client._req = fake_req  # type: ignore[method-assign]
+        return client
+
+    def test_ci_green_returns_success(self):
+        client = self._client_with_statuses([
+            {"context": "CI / all-required (pull_request)", "state": "success"},
+        ])
+        self.assertEqual(
+            sop.get_ci_status(client, "o", "r", "sha1"), "success"
+        )
+
+    def test_ci_red_returns_failure(self):
+        client = self._client_with_statuses([
+            {"context": "CI / all-required (pull_request)", "state": "failure"},
+        ])
+        self.assertEqual(
+            sop.get_ci_status(client, "o", "r", "sha1"), "failure"
+        )
+
+    def test_missing_context_returns_missing(self):
+        client = self._client_with_statuses([
+            {"context": "some-other-context", "state": "success"},
+        ])
+        self.assertEqual(
+            sop.get_ci_status(client, "o", "r", "sha1"), "missing"
+        )
+
+    def test_api_error_returns_unknown(self):
+        client = sop.GiteaClient("git.example.com", "tok")
+
+        def fake_req(method, path, body=None, ok_codes=(200, 201, 204)):
+            return 500, {"error": "boom"}
+
+        client._req = fake_req  # type: ignore[method-assign]
+        self.assertEqual(
+            sop.get_ci_status(client, "o", "r", "sha1"), "unknown"
+        )
