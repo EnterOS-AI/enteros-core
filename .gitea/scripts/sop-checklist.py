@@ -902,6 +902,10 @@ def resolve_required_teams(item: dict[str, Any], high_risk: bool) -> list[str]:
 # Slugs that require CI / all-required green before an AI ack is valid.
 _TESTING_CLASS_SLUGS = {"comprehensive-testing", "local-postgres-e2e", "staging-smoke"}
 
+# Human-only carve-out: these items can NEVER be acked by AI, regardless
+# of config drift. Any item in this set MUST NOT have ai_ack_eligible.
+_HUMAN_ONLY_SLUGS = {"root-cause", "no-backwards-compat"}
+
 
 def get_ci_status(client: GiteaClient, owner: str, repo: str, sha: str) -> str:
     """Return the state of CI / all-required (pull_request) for `sha`.
@@ -1108,6 +1112,12 @@ def main(argv: list[str] | None = None) -> int:
             # 2) AI-sop-ack team membership check (only for items that allow it).
             if slug in items_by_slug:
                 item = items_by_slug[slug]
+                # Defensive: human-only carve-out is enforced in code, not just
+                # config. Even if ai_ack_eligible were mistakenly added to a
+                # migration/schema item, the AI path is rejected here.
+                if slug in _HUMAN_ONLY_SLUGS:
+                    rejected_ai_ineligible.append(u)
+                    continue
                 if item.get("ai_ack_eligible") and ai_sop_ack_team_id is not None:
                     cache_key = (u, ai_sop_ack_team_id)
                     if cache_key not in team_member_cache:

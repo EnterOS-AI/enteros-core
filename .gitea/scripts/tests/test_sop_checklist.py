@@ -1050,6 +1050,31 @@ class TestAIAckEligibleConfig(unittest.TestCase):
             {"comprehensive-testing", "local-postgres-e2e", "staging-smoke"},
         )
 
+    def test_human_only_slugs_constant(self):
+        """_HUMAN_ONLY_SLUGS encodes the migration/schema carve-out.
+
+        If this set changes, the CTO must approve the widening.
+        """
+        self.assertEqual(
+            sop._HUMAN_ONLY_SLUGS,
+            {"root-cause", "no-backwards-compat"},
+        )
+
+    def test_human_only_invariant_enforced_in_code_and_config(self):
+        """Every slug in _HUMAN_ONLY_SLUGS must be human-only in config.
+
+        This test fails if a migration/schema-class item accidentally
+        acquires ai_ack_eligible via config drift.
+        """
+        cfg = sop.load_config(CONFIG_PATH)
+        items_by_slug = {it["slug"]: it for it in cfg["items"]}
+        for slug in sop._HUMAN_ONLY_SLUGS:
+            self.assertIn(slug, items_by_slug, f"{slug} must exist in config")
+            self.assertFalse(
+                items_by_slug[slug].get("ai_ack_eligible", False),
+                f"{slug} is in _HUMAN_ONLY_SLUGS and must NEVER be ai_ack_eligible",
+            )
+
 
 class TestAIAckEligibilityProbe(unittest.TestCase):
     """The probe closure in main() delegates to compute_ack_state.
