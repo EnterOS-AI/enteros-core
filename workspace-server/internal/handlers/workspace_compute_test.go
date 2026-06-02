@@ -108,6 +108,8 @@ func TestWorkspaceCreate_WithCompute_PersistsComputeJSON(t *testing.T) {
 	mock.ExpectCommit()
 	mock.ExpectExec("INSERT INTO canvas_layouts").
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO workspace_auth_tokens").
+		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
