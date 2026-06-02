@@ -1132,7 +1132,7 @@ func TestPause_WithDescendants(t *testing.T) {
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 	c.Params = gin.Params{{Key: "id", Value: "ws-team"}}
-	c.Request = httptest.NewRequest("POST", "/workspaces/ws-team/pause", nil)
+	c.Request = httptest.NewRequest("POST", "/workspaces/ws-team/pause?cascade=true", nil)
 
 	handler.Pause(c)
 
