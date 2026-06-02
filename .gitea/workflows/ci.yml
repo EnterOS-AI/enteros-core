@@ -106,7 +106,7 @@ jobs:
     name: Platform (Go)
     needs: changes
     runs-on: ubuntu-latest
-    # mc#774 (closed 2026-05-14): Phase 4 flip of the platform-build job.
+    # mc#1982 (closed 2026-05-14): Phase 4 flip of the platform-build job.
     # Phase 4 (#656) originally flipped this to continue-on-error: false based on
     # Phase-3-masked "green on main 2026-05-12". Two failure classes then surfaced:
     #   (1) 4x delegation_test.go sqlmock gaps (PR #669 / #634 fix-forward, closed).
@@ -161,7 +161,7 @@ jobs:
           echo "::group::pendinguploads exit=$pu_exit (last 100 lines)"
           tail -100 /tmp/test-pu.log
           echo "::endgroup::"
-        # mc#774: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
+        # mc#1982: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
         continue-on-error: true
       - if: ${{ needs.changes.outputs.platform == 'true' }}
         name: Run tests with coverage (blocking gate)
@@ -392,7 +392,7 @@ jobs:
   canvas-deploy-reminder:
     name: Canvas Deploy Reminder
     runs-on: docker-host
-    # mc#774 root-fix: added job-level `if:` so ci-required-drift.py's
+    # mc#1982 root-fix: added job-level `if:` so ci-required-drift.py's
     # ci_job_names() detects this as github.ref-gated and skips it from F1.
     # The step-level exit 0 handles the "not main push" case; the job-level
     # `if:` makes the gating explicit so the drift script sees it.

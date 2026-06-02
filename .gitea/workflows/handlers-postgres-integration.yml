@@ -87,8 +87,8 @@ jobs:
     # both jobs on the same label avoids workspace-volume cross-host
     # surprises and keeps the routing rule discoverable in one place.
     runs-on: docker-host
-    # mc#774 Phase 3 (RFC §1): surface broken workflows without blocking.
-    # mc#774: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
+    # mc#1982 Phase 3 (RFC §1): surface broken workflows without blocking.
+    # mc#1982: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
     continue-on-error: true
     outputs:
       handlers: ${{ steps.filter.outputs.handlers }}
@@ -118,8 +118,8 @@ jobs:
     # mc#1529 §1: must run on operator-host (where `molecule-core-net`
     # exists). See detect-changes for the full routing rationale.
     runs-on: docker-host
-    # mc#774 Phase 3 (RFC §1): surface broken workflows without blocking.
-    # mc#774: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
+    # mc#1982 Phase 3 (RFC §1): surface broken workflows without blocking.
+    # mc#1982: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
     continue-on-error: true
     env:
       # Unique name per run so concurrent jobs don't collide on the

@@ -234,7 +234,7 @@ jobs:
     name: Production auto-deploy
     needs: build-and-push
     if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-    # Side-effect deploy only; image publish success is the durable artifact. mc#774
+    # Side-effect deploy only; image publish success is the durable artifact. mc#1982
     continue-on-error: true
     # Publish/release lane (internal#462) — production deploy of a merged
     # fix; reserved capacity, never queued behind PR-CI.
