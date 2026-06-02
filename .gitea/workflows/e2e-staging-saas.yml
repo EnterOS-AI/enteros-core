@@ -49,6 +49,7 @@ on:
       - 'workspace-server/internal/middleware/**'
       - 'workspace-server/internal/provisioner/**'
       - 'tests/e2e/test_staging_full_saas.sh'
+      - 'tests/e2e/lib/completion_assert.sh'
       - 'tests/e2e/lib/aws_leak_check.sh'
       - 'tests/e2e/test_aws_leak_check.sh'
       - '.gitea/workflows/e2e-staging-saas.yml'
@@ -61,6 +62,7 @@ on:
       - 'workspace-server/internal/middleware/**'
       - 'workspace-server/internal/provisioner/**'
       - 'tests/e2e/test_staging_full_saas.sh'
+      - 'tests/e2e/lib/completion_assert.sh'
       - 'tests/e2e/lib/aws_leak_check.sh'
       - 'tests/e2e/test_aws_leak_check.sh'
       - '.gitea/workflows/e2e-staging-saas.yml'
@@ -92,20 +94,20 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 1
-        # mc#774: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
+        # mc#1982: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
         continue-on-error: true
 
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: "3.11"
-        # mc#774: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
+        # mc#1982: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
         continue-on-error: true
 
       - name: YAML validation (best-effort)
         run: |
           echo "e2e-staging-saas.yml — PR validation: workflow YAML is valid."
           echo "E2E step runs only when provisioning-critical files change."
-        # mc#774: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
+        # mc#1982: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
         continue-on-error: true
 
   # Actual E2E: runs on trunk pushes and PRs that touch provisioning-critical
@@ -116,7 +118,7 @@ jobs:
     name: E2E Staging SaaS
     runs-on: ubuntu-latest
     # Phase 3 (RFC #219 §1): surface broken workflows without blocking.
-    # mc#774: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
+    # mc#1982: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
     continue-on-error: true
     timeout-minutes: 45
     permissions:
@@ -155,13 +157,18 @@ jobs:
       # E2E_RUNTIME=hermes or =codex via workflow_dispatch can still
       # exercise the OpenAI path.
       E2E_OPENAI_API_KEY: ${{ secrets.MOLECULE_STAGING_OPENAI_API_KEY }}
+      # google-adk (operator-dispatched only) auths Gemini with an
+      # AI-Studio key. Org policy disallows API keys in PROD (Vertex+ADC
+      # there); CI uses the keyed AI-Studio path with config model
+      # google_genai:gemini-2.5-pro. Vertex remains the supported prod path.
+      E2E_GOOGLE_API_KEY: ${{ secrets.MOLECULE_STAGING_GOOGLE_API_KEY }}
       E2E_RUNTIME: ${{ github.event.inputs.runtime || 'claude-code' }}
       # Pin the model when running on the default claude-code path —
       # the per-runtime default ("sonnet") routes to direct Anthropic
       # and defeats the cost saving. Operators can override via the
       # workflow_dispatch flow (no input wired here yet — runtime
       # override is enough for ad-hoc).
-      E2E_MODEL_SLUG: ${{ github.event.inputs.runtime == 'hermes' && 'openai/gpt-4o' || github.event.inputs.runtime == 'codex' && 'openai/gpt-4o' || 'MiniMax-M2' }}
+      E2E_MODEL_SLUG: ${{ github.event.inputs.runtime == 'hermes' && 'openai/gpt-4o' || github.event.inputs.runtime == 'codex' && 'openai/gpt-4o' || github.event.inputs.runtime == 'google-adk' && 'google_genai:gemini-2.5-pro' || 'MiniMax-M2' }}
       E2E_RUN_ID: "${{ github.run_id }}-${{ github.run_attempt }}"
       E2E_KEEP_ORG: ${{ github.event.inputs.keep_org && '1' || '0' }}
 
@@ -209,6 +216,10 @@ jobs:
             codex|hermes)
               required_secret_name="MOLECULE_STAGING_OPENAI_API_KEY"
               required_secret_value="${E2E_OPENAI_API_KEY:-}"
+              ;;
+            google-adk)
+              required_secret_name="MOLECULE_STAGING_GOOGLE_API_KEY"
+              required_secret_value="${E2E_GOOGLE_API_KEY:-}"
               ;;
             *)
               echo "::warning::Unknown E2E_RUNTIME='${E2E_RUNTIME}' — skipping LLM-key check"

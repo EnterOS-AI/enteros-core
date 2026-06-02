@@ -10,9 +10,9 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/DATA-DOG/go-sqlmock"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
+	"github.com/DATA-DOG/go-sqlmock"
 )
 
 // Issue #2486 reproduction harness: 7 simultaneous claude-code provisions
@@ -70,6 +70,9 @@ func (r *recordingCPProv) Start(_ context.Context, cfg provisioner.WorkspaceConf
 
 func (r *recordingCPProv) Stop(_ context.Context, _ string) error {
 	panic("recordingCPProv.Stop not expected in concurrent-repro test")
+}
+func (r *recordingCPProv) StopAndPrune(_ context.Context, _ string) error {
+	panic("recordingCPProv.StopAndPrune not expected in concurrent-repro test")
 }
 
 func (r *recordingCPProv) GetConsoleOutput(_ context.Context, _ string) (string, error) {

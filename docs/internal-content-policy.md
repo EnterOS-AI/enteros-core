@@ -1,6 +1,6 @@
 # Internal content policy
 
-The `Molecule-AI/molecule-monorepo` repo is **public**. Anything internal
+The `Molecule-AI/molecule-core` repo is **public**. Anything internal
 (positioning, competitive briefs, sales playbooks, PMM/press drip, draft
 campaigns, raw research notes, ops runbooks, retrospectives) lives in
 **`Molecule-AI/internal`**.
@@ -18,14 +18,14 @@ This page is the canonical decision tree.
 | Draft campaign asset (still iterating, not yet customer-visible) | `Molecule-AI/internal/marketing/campaigns/` |
 | Roadmap discussion, planning doc, retrospective | `Molecule-AI/internal/PLAN.md` or `Molecule-AI/internal/retrospectives/` |
 | Runbook, ops procedure, incident postmortem | `Molecule-AI/internal/runbooks/` |
-| **Public-ready** blog post (final draft, ready to ship to docs site) | `Molecule-AI/molecule-monorepo/docs/blog/` |
-| **Public-ready** tutorial / quickstart | `Molecule-AI/molecule-monorepo/docs/tutorials/` |
-| Public DevRel content (code samples, demos for users) | `Molecule-AI/molecule-monorepo/docs/devrel/` |
-| API reference, architecture docs for external developers | `Molecule-AI/molecule-monorepo/docs/api/` |
+| **Public-ready** blog post (final draft, ready to ship to docs site) | `Molecule-AI/molecule-core/docs/blog/` |
+| **Public-ready** tutorial / quickstart | `Molecule-AI/molecule-core/docs/tutorials/` |
+| Public DevRel content (code samples, demos for users) | `Molecule-AI/molecule-core/docs/devrel/` |
+| API reference, architecture docs for external developers | `Molecule-AI/molecule-core/docs/api/` |
 | Code, tests, infrastructure | wherever is appropriate inside this repo |
 
 **Rule of thumb:** *"Would I be comfortable if a competitor / journalist / customer
-read this verbatim today?"* — yes → `monorepo/docs/`. No / not yet → `internal/`.
+read this verbatim today?"* — yes → `molecule-core/docs/`. No / not yet → `internal/`.
 
 ## Why
 
@@ -82,7 +82,7 @@ git push -u origin HEAD
 gh pr create --base main --fill
 ```
 
-Yes, this is more steps than `cd molecule-monorepo && git add research/foo.md`.
+Yes, this is more steps than `cd molecule-core && git add research/foo.md`.
 That cost is intentional: the friction is the point. Public space and
 internal space are different products with different audiences and
 different durability guarantees.

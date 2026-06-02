@@ -29,6 +29,7 @@
     {"name": "hermes", "repo": "molecule-ai/molecule-ai-workspace-template-hermes", "ref": "main"},
     {"name": "openclaw", "repo": "molecule-ai/molecule-ai-workspace-template-openclaw", "ref": "main"},
     {"name": "codex", "repo": "molecule-ai/molecule-ai-workspace-template-codex", "ref": "main"},
+    {"name": "google-adk", "repo": "molecule-ai/molecule-ai-workspace-template-google-adk", "ref": "main"},
     {"name": "seo-agent", "repo": "molecule-ai/molecule-ai-workspace-template-seo-agent", "ref": "main"}
   ],
   "org_templates": [

@@ -5,6 +5,7 @@
 const RUNTIME_NAMES: Record<string, string> = {
   "claude-code": "Claude Code",
   codex: "Codex",
+  "google-adk": "Google ADK",
   hermes: "Hermes",
   openclaw: "OpenClaw",
   kimi: "Kimi",

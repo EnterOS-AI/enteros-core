@@ -36,6 +36,7 @@ import (
 	"time"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/channels"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/codexauth"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/crypto"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
@@ -332,6 +333,20 @@ func main() {
 	// nothing actually deletes a row, just makes it un-fetchable.
 	go supervised.RunWithRecover(ctx, "pending-uploads-sweeper", func(c context.Context) {
 		pendinguploads.StartSweeper(c, pendinguploads.NewPostgres(db.DB), 0)
+	})
+
+	// Codex shared-OAuth central refresher — the SINGLE owner of the rotating
+	// refresh_token for the global codex (ChatGPT/Codex subscription) credential
+	// (global_secrets key CODEX_AUTH_JSON). Multiple codex workspaces share ONE
+	// ChatGPT-Pro OAuth token; OpenAI's refresh_token is single-use, so letting
+	// each per-agent app-server refresh on its own 401 burned the seed within
+	// seconds (a refresh storm). This goroutine is structurally single-flight
+	// (one goroutine + a package mutex), refreshes only within a safety margin
+	// of expiry, POSTs the refresh_token at most once per due cycle, and writes
+	// the rotated blob back — workspaces now only GET the current token (see the
+	// codex template's codex_auth_sync.sh). INERT when no CODEX_AUTH_JSON exists.
+	go supervised.RunWithRecover(ctx, "codex-auth-refresher", func(c context.Context) {
+		codexauth.StartCodexAuthRefresher(c, db.DB)
 	})
 
 	// Provision-timeout sweep — flips workspaces that have been stuck in

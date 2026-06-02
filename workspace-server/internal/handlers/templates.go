@@ -95,6 +95,38 @@ type modelSpec struct {
 	Name        string   `json:"name,omitempty" yaml:"name"`
 	Provider    string   `json:"provider,omitempty" yaml:"provider"`
 	RequiredEnv []string `json:"required_env,omitempty" yaml:"required_env"`
+	// BillingMode is the billing source the DERIVED provider implies:
+	// "platform_managed" (the closed core-only platform provider; Molecule
+	// owns the upstream key + the bill) or "byok" (any other provider; the
+	// tenant supplies its own key). Set ONLY on registry-served models
+	// (RegistryModels) where DeriveProvider resolved an owning provider;
+	// empty on template-served models. internal#718 P3 — the canvas reads
+	// this to show the billing-mode of the DERIVED provider instead of its
+	// hardcoded billingModeForProvider rule.
+	BillingMode string `json:"billing_mode,omitempty" yaml:"-"`
+}
+
+// registryProviderView is the canvas-facing projection of a single registry
+// Provider entry for a registry-known runtime: the stable name, the dropdown
+// display label, the auth-env-var NAMES (never values), and the billing mode
+// the provider implies. Sourced from the provider registry
+// (internal/providers) so the canvas drops its hardcoded VENDOR_LABELS map
+// and billingModeForProvider rule (internal#718 P3, retire-list #4/#5).
+type registryProviderView struct {
+	// Name is the registry provider key (e.g. "anthropic-oauth", "platform").
+	Name string `json:"name"`
+	// DisplayName is the canvas dropdown label (registry Provider.DisplayName).
+	DisplayName string `json:"display_name,omitempty"`
+	// AuthEnv is the env-var NAMES any one of which satisfies auth for this
+	// provider (registry Provider.AuthEnv). Names only, never secret values.
+	AuthEnv []string `json:"auth_env,omitempty"`
+	// BillingMode is "platform_managed" for the closed platform provider,
+	// "byok" otherwise — keyed off the registry IsPlatform predicate so the
+	// canvas shows the DERIVED provider's billing source.
+	BillingMode string `json:"billing_mode,omitempty"`
+	// Deprecated mirrors the registry's deprecated flag so the canvas can
+	// grey the provider out without breaking saved configs.
+	Deprecated bool `json:"deprecated,omitempty"`
 }
 
 // providerRegistryEntry mirrors a row from a template's top-level
@@ -162,8 +194,29 @@ type templateSummary struct {
 	// (omitempty); the canvas's existing per-model fallback continues
 	// to work for them.
 	ProviderRegistry []providerRegistryEntry `json:"provider_registry,omitempty"`
-	Skills           []string                `json:"skills"`
-	SkillCount       int                     `json:"skill_count"`
+	// RegistryBacked is true when this template's runtime is known to the
+	// provider registry (internal/providers runtimes: block) and the
+	// RegistryProviders / RegistryModels fields below were populated from it.
+	// The canvas treats a registry-backed payload as AUTHORITATIVE for the
+	// selectable provider+model list (it drops its prefix-inference fallback)
+	// — "only registered selectable" follows because the canvas can render
+	// no option the registry did not serve. False = the runtime is not in the
+	// registry (federation / external / mock); the canvas keeps using the
+	// template-served Models/Providers + its heuristic. internal#718 P3.
+	RegistryBacked bool `json:"registry_backed,omitempty"`
+	// RegistryProviders is the runtime's NATIVE provider set from the
+	// registry (ProvidersForRuntime), each with its display label, auth-env
+	// names, and billing mode. Empty when !RegistryBacked. This is the SSOT
+	// the canvas Provider dropdown consumes instead of VENDOR_LABELS.
+	RegistryProviders []registryProviderView `json:"registry_providers,omitempty"`
+	// RegistryModels is the runtime's NATIVE model set from the registry
+	// (ModelsForRuntime), each annotated with its DERIVED provider and the
+	// billing mode that provider implies. Empty when !RegistryBacked. This is
+	// the SSOT the canvas Model dropdown consumes — a template can no longer
+	// surface a model the registry does not list for the runtime.
+	RegistryModels []modelSpec `json:"registry_models,omitempty"`
+	Skills         []string    `json:"skills"`
+	SkillCount     int         `json:"skill_count"`
 	// ProvisionTimeoutSeconds lets a slow runtime declare its expected
 	// cold-boot duration in its template manifest. Canvas's
 	// ProvisioningTimeout banner respects this per-workspace via the
@@ -171,6 +224,15 @@ type templateSummary struct {
 	// 0 = template hasn't declared one, falls through to canvas's
 	// runtime-profile default.
 	ProvisionTimeoutSeconds int `json:"provision_timeout_seconds,omitempty"`
+	// Displayable lets a template opt OUT of the canvas runtime picker
+	// declaratively (config.yaml `displayable: false`) while still being a
+	// provisionable runtime. nil/absent or true → shown; only an explicit
+	// false hides it. The canvas runtime dropdown is SSOT-driven off this
+	// list (no hardcoded frontend allowlist), so this is the single place a
+	// runtime is hidden from the picker. Pointer so "unset" is distinct from
+	// "false" and omitempty keeps the payload unchanged for existing
+	// templates that never declare it.
+	Displayable *bool `json:"displayable,omitempty"`
 }
 
 // resolveTemplateDir finds the template directory for a workspace on the host.
@@ -217,6 +279,7 @@ func (h *TemplatesHandler) List(c *gin.Context) {
 				Runtime     string   `yaml:"runtime"`
 				Model       string   `yaml:"model"`
 				Skills      []string `yaml:"skills"`
+				Displayable *bool    `yaml:"displayable"`
 				// Top-level `providers:` block — structured registry. Distinct
 				// from runtime_config.providers (slug list) below. Both shapes
 				// coexist in production: claude-code ships the structured
@@ -243,9 +306,13 @@ func (h *TemplatesHandler) List(c *gin.Context) {
 				log.Printf("templates list: skip %s: yaml.Unmarshal: %v", id, err)
 				return
 			}
+			// normalizedRuntime strips the "-default" vanilla-variant suffix
+			// (claude-code-default → claude-code). Hoisted out of the
+			// known-runtime guard so the registry enrichment below can key off
+			// the same normalised name the guard validated.
+			normalizedRuntime := strings.TrimSuffix(strings.TrimSpace(raw.Runtime), "-default")
 			if raw.Runtime != "" {
-				runtime := strings.TrimSuffix(strings.TrimSpace(raw.Runtime), "-default")
-				if _, ok := knownRuntimes[runtime]; !ok {
+				if _, ok := knownRuntimes[normalizedRuntime]; !ok {
 					log.Printf("templates list: skip %s: unsupported runtime %q", id, raw.Runtime)
 					return
 				}
@@ -262,7 +329,7 @@ func (h *TemplatesHandler) List(c *gin.Context) {
 				tier = h.wh.DefaultTier()
 			}
 
-			templates = append(templates, templateSummary{
+			summary := templateSummary{
 				ID:                      id,
 				Name:                    raw.Name,
 				Description:             raw.Description,
@@ -277,7 +344,18 @@ func (h *TemplatesHandler) List(c *gin.Context) {
 				Skills:                  raw.Skills,
 				SkillCount:              len(raw.Skills),
 				ProvisionTimeoutSeconds: raw.RuntimeConfig.ProvisionTimeoutSeconds,
-			})
+				Displayable:             raw.Displayable,
+			}
+
+			// internal#718 P3: serve the SELECTABLE provider/model list from
+			// the provider registry for a registry-known runtime. Additive —
+			// the template-served Models/Providers above stay for non-registry
+			// runtimes + older canvases; this adds the authoritative
+			// registry_backed/registry_providers/registry_models block the
+			// current canvas prefers. Fail-open for unknown runtimes.
+			enrichFromRegistry(&summary, normalizedRuntime)
+
+			templates = append(templates, summary)
 		})
 	}
 	walk(h.cacheDir)

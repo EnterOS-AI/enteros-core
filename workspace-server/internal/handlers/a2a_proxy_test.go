@@ -16,9 +16,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/DATA-DOG/go-sqlmock"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
+	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/gin-gonic/gin"
 )
 
@@ -437,6 +437,10 @@ func TestProxyA2A_CallerIDPropagated(t *testing.T) {
 		WithArgs("ws-target").
 		WillReturnRows(sqlmock.NewRows([]string{"id", "parent_id"}).AddRow("ws-target", "ws-parent"))
 
+	// #1953 cross-tenant guard: same-org check after CanCommunicate. Both
+	// workspaces resolve to the same org root → routing allowed.
+	mockSameOrg(mock, "ws-caller", "ws-target", true)
+
 	expectBudgetCheck(mock, "ws-target")
 
 	// Expect activity log with source_id set
@@ -463,6 +467,24 @@ func TestProxyA2A_CallerIDPropagated(t *testing.T) {
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations: %v", err)
 	}
+}
+
+// mockSameOrg sets up the two org-root recursive-CTE expectations that the
+// #1953 cross-tenant guard in proxyA2ARequest runs after CanCommunicate passes.
+// sameOrg=true returns the SAME root_id for both caller and target (same tenant);
+// sameOrg=false returns different root_ids (cross-tenant → routing must be denied).
+func mockSameOrg(mock sqlmock.Sqlmock, caller, target string, sameOrg bool) {
+	callerRoot := "org-root-shared"
+	targetRoot := "org-root-shared"
+	if !sameOrg {
+		targetRoot = "org-root-other-tenant"
+	}
+	mock.ExpectQuery("WITH RECURSIVE org_chain AS").
+		WithArgs(caller).
+		WillReturnRows(sqlmock.NewRows([]string{"root_id"}).AddRow(callerRoot))
+	mock.ExpectQuery("WITH RECURSIVE org_chain AS").
+		WithArgs(target).
+		WillReturnRows(sqlmock.NewRows([]string{"root_id"}).AddRow(targetRoot))
 }
 
 // mockCanCommunicate sets up sqlmock expectations for CanCommunicate(caller, target).
@@ -658,6 +680,9 @@ func TestProxyA2A_CallerIDDerivedFromBearer(t *testing.T) {
 	mock.ExpectQuery("SELECT id, parent_id FROM workspaces WHERE id = ").
 		WithArgs("ws-target").
 		WillReturnRows(sqlmock.NewRows([]string{"id", "parent_id"}).AddRow("ws-target", "ws-parent"))
+
+	// 3b. #1953 cross-tenant guard — same org root → routing allowed.
+	mockSameOrg(mock, "ws-caller", "ws-target", true)
 
 	expectBudgetCheck(mock, "ws-target")
 
@@ -2089,6 +2114,10 @@ func (f *fakeCPProv) Start(_ context.Context, _ provisioner.WorkspaceConfig) (st
 	return "", nil
 }
 func (f *fakeCPProv) Stop(_ context.Context, _ string) error {
+	f.stopCalls++
+	return nil
+}
+func (f *fakeCPProv) StopAndPrune(_ context.Context, _ string) error {
 	f.stopCalls++
 	return nil
 }

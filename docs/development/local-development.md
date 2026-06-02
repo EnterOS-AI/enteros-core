@@ -82,7 +82,7 @@ DATABASE_URL=postgres://dev:dev@postgres:5432/molecule?sslmode=prefer
 REDIS_URL=redis://redis:6379
 PORT=8080
 SECRETS_ENCRYPTION_KEY=dev-key-change-in-production
-WORKSPACE_DIR=/path/to/molecule-monorepo   # Optional global fallback; prefer per-workspace workspace_dir in org.yaml or API
+WORKSPACE_DIR=/path/to/molecule-core   # Optional global fallback; prefer per-workspace workspace_dir in org.yaml or API
 ```
 
 ### Canvas (Next.js)

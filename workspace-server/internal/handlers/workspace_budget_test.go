@@ -22,8 +22,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/DATA-DOG/go-sqlmock"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
+	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/gin-gonic/gin"
 )
 
@@ -168,6 +168,8 @@ func TestWorkspaceBudget_Create_WithLimit(t *testing.T) {
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec("INSERT INTO structure_events").
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO workspace_auth_tokens").
+		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -259,11 +261,13 @@ func TestWorkspaceBudget_A2A_ExceededReturns402(t *testing.T) {
 	// Cache a URL so resolveAgentURL doesn't need a DB query after budget check
 	mr.Set(fmt.Sprintf("ws:%s:url", "ws-over-budget"), "http://localhost:9999")
 
-	// Budget check query: spend = limit → exceeded
-	mock.ExpectQuery("SELECT budget_limit, COALESCE").
+	// Budget check: monthly limit 500, monthly spend 500 → exceeded → 402
+	mock.ExpectQuery(`SELECT COALESCE\(budget_limits`).
 		WithArgs("ws-over-budget").
-		WillReturnRows(sqlmock.NewRows([]string{"budget_limit", "monthly_spend"}).
-			AddRow(int64(500), int64(500)))
+		WillReturnRows(sqlmock.NewRows([]string{"budget_limits"}).AddRow([]byte(`{"monthly":500}`)))
+	mock.ExpectQuery(`FROM workspace_spend_events`).
+		WithArgs("ws-over-budget").
+		WillReturnRows(spendRows(0, 0, 0, 500))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -295,10 +299,12 @@ func TestWorkspaceBudget_A2A_AboveLimitReturns402(t *testing.T) {
 	mr.Set(fmt.Sprintf("ws:%s:url", "ws-way-over"), "http://localhost:9999")
 
 	// spend > limit
-	mock.ExpectQuery("SELECT budget_limit, COALESCE").
+	mock.ExpectQuery(`SELECT COALESCE\(budget_limits`).
 		WithArgs("ws-way-over").
-		WillReturnRows(sqlmock.NewRows([]string{"budget_limit", "monthly_spend"}).
-			AddRow(int64(100), int64(9999)))
+		WillReturnRows(sqlmock.NewRows([]string{"budget_limits"}).AddRow([]byte(`{"monthly":100}`)))
+	mock.ExpectQuery(`FROM workspace_spend_events`).
+		WithArgs("ws-way-over").
+		WillReturnRows(spendRows(0, 0, 0, 9999))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -334,11 +340,13 @@ func TestWorkspaceBudget_A2A_UnderLimitPassesThrough(t *testing.T) {
 
 	mr.Set(fmt.Sprintf("ws:%s:url", "ws-under-budget"), agentServer.URL)
 
-	// Budget check: spend (100) < limit (500) → pass-through
-	mock.ExpectQuery("SELECT budget_limit, COALESCE").
+	// Budget check: monthly spend (100) < limit (500) → pass-through
+	mock.ExpectQuery(`SELECT COALESCE\(budget_limits`).
 		WithArgs("ws-under-budget").
-		WillReturnRows(sqlmock.NewRows([]string{"budget_limit", "monthly_spend"}).
-			AddRow(int64(500), int64(100)))
+		WillReturnRows(sqlmock.NewRows([]string{"budget_limits"}).AddRow([]byte(`{"monthly":500}`)))
+	mock.ExpectQuery(`FROM workspace_spend_events`).
+		WithArgs("ws-under-budget").
+		WillReturnRows(spendRows(0, 0, 0, 100))
 
 	// Activity log INSERT from logA2ASuccess
 	mock.ExpectExec("INSERT INTO activity_logs").
@@ -380,11 +388,11 @@ func TestWorkspaceBudget_A2A_NilLimitPassesThrough(t *testing.T) {
 
 	mr.Set(fmt.Sprintf("ws:%s:url", "ws-no-limit"), agentServer.URL)
 
-	// budget_limit NULL → no enforcement regardless of monthly_spend
-	mock.ExpectQuery("SELECT budget_limit, COALESCE").
+	// no limits configured → checkWorkspaceBudget returns early (no spend query),
+	// enforcement skipped regardless of spend
+	mock.ExpectQuery(`SELECT COALESCE\(budget_limits`).
 		WithArgs("ws-no-limit").
-		WillReturnRows(sqlmock.NewRows([]string{"budget_limit", "monthly_spend"}).
-			AddRow(nil, int64(999999))) // huge spend but no limit set
+		WillReturnRows(sqlmock.NewRows([]string{"budget_limits"}).AddRow([]byte(`{}`)))
 
 	mock.ExpectExec("INSERT INTO activity_logs").
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -425,7 +433,7 @@ func TestWorkspaceBudget_A2A_DBErrorFailOpen(t *testing.T) {
 	mr.Set(fmt.Sprintf("ws:%s:url", "ws-db-err-budget"), agentServer.URL)
 
 	// Budget check fails with DB error → fail-open (request proceeds)
-	mock.ExpectQuery("SELECT budget_limit, COALESCE").
+	mock.ExpectQuery(`SELECT COALESCE\(budget_limits`).
 		WithArgs("ws-db-err-budget").
 		WillReturnError(sql.ErrConnDone)
 

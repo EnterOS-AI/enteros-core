@@ -141,7 +141,7 @@ func requireCallerOwnsOrg(c *gin.Context) (string, error) {
 	orgID, err := orgtoken.OrgIDByTokenID(c.Request.Context(), db.DB, tokID)
 	if err != nil {
 		// DB error — deny by default rather than risk cross-org access.
-		return "", fmt.Errorf("allowlist: requireCallerOwnsOrg: %v", err)
+		return "", fmt.Errorf("allowlist: requireCallerOwnsOrg: %w", err)
 	}
 	return orgID, nil
 }

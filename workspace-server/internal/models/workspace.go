@@ -168,6 +168,12 @@ type WorkspaceCompute struct {
 	InstanceType string                  `json:"instance_type,omitempty"`
 	Volume       WorkspaceComputeVolume  `json:"volume,omitempty"`
 	Display      WorkspaceComputeDisplay `json:"display,omitempty"`
+	// DataPersistence is the per-workspace durable-data choice (internal#734):
+	// "persist" keeps the workspace's data volume (browser profile / cookies /
+	// downloads / agent memory) across recreate; "ephemeral" uses no durable
+	// disk (wiped each recreate — privacy); "" = auto (desktop-control persists,
+	// others follow the org flag). Forwarded verbatim to CP's data_persistence.
+	DataPersistence string `json:"data_persistence,omitempty"`
 }
 
 type CreateWorkspacePayload struct {

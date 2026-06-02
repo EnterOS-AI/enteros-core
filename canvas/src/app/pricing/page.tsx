@@ -41,7 +41,7 @@ export default function PricingPage() {
         <p className="mt-2 text-ink-mid">
           We publish the{" "}
           <a
-            href="https://git.moleculesai.app/molecule-ai/molecule-monorepo"
+            href="https://git.moleculesai.app/molecule-ai/molecule-core"
             className="text-accent underline hover:text-accent"
           >
             full source on GitHub

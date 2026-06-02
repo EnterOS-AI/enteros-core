@@ -6,8 +6,8 @@
 # RFC#351 Step 2 of 6 (implementation MVP).
 #
 # Invoked by .gitea/workflows/sop-checklist.yml on:
-#   - pull_request_target: [opened, edited, synchronize, reopened]
-#   - issue_comment:       [created, edited, deleted]
+#   - pull_request_target: [opened, edited, synchronize, reopened, labeled, unlabeled]
+#   - issue_comment:       [created]  # edited/deleted omitted (Gitea 1.22.6 job-parsing quirk)
 #
 # Flow:
 #   1. Load .gitea/sop-checklist-config.yaml (from BASE ref — trusted).
@@ -639,10 +639,8 @@ def load_config(path: str) -> dict[str, Any]:
         # yaml is an optional dep; the canonical loader is used when available,
         # but the SOP runs on runners that may not have PyYAML installed. The
         # fallback _load_config_minimal covers the same config shape without
-        # requiring the dep, so the ignore is safe: if yaml loads, we use it;
-        # otherwise we fall back silently.
-        import yaml  # type: ignore[import-not-found]
-        with open(path) as f:
+        import yaml  # type: ignore[import-not-found]  # optional dep; fall back silently if absent
+        with open(path, encoding="utf-8") as f:
             return yaml.safe_load(f)
     except ImportError:
         return _load_config_minimal(path)
@@ -656,7 +654,7 @@ def _load_config_minimal(path: str) -> dict[str, Any]:
     item map: scalars + lists of scalars. Does NOT support nested lists,
     YAML anchors, multi-doc, or flow style.
     """
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         lines = f.readlines()
     return _parse_minimal_yaml(lines)
 
@@ -1033,7 +1031,7 @@ def main(argv: list[str] | None = None) -> int:
                     for t in data:
                         if t.get("name") == tn:
                             tid = t.get("id")
-                            client._team_id_cache[(args.owner, tn)] = tid  # noqa: SLF001  # internal write-through cache
+                            client._team_id_cache[(args.owner, tn)] = tid  # noqa: SLF001  # write-through cache; intentional side-effect for reuse across calls
                             break
             if tid is not None:
                 team_ids.append(tid)

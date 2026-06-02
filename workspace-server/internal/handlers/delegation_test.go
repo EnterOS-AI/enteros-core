@@ -1059,13 +1059,25 @@ func expectExecuteDelegationBase(mock sqlmock.Sqlmock) {
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// CanCommunicate: getWorkspaceRef(source) + getWorkspaceRef(target).
-	// Both are root-level workspaces (parent_id=NULL) → root-level siblings → allowed.
+	// Source and target are siblings under one shared parent (one tenant) →
+	// CanCommunicate allowed. (#1953: they must NOT both be parent_id=NULL —
+	// two distinct org roots are now treated as DIFFERENT orgs and routing
+	// between them is denied. A real delegation happens inside one org.)
 	mock.ExpectQuery("SELECT id, parent_id FROM workspaces WHERE id = ").
 		WithArgs(testDeliverySourceID).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "parent_id"}).AddRow(testDeliverySourceID, nil))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "parent_id"}).AddRow(testDeliverySourceID, "ws-org-root-159"))
 	mock.ExpectQuery("SELECT id, parent_id FROM workspaces WHERE id = ").
 		WithArgs(testDeliveryTargetID).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "parent_id"}).AddRow(testDeliveryTargetID, nil))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "parent_id"}).AddRow(testDeliveryTargetID, "ws-org-root-159"))
+
+	// #1953 cross-tenant guard: same-org check after CanCommunicate. Both
+	// resolve to the same org root → routing allowed.
+	mock.ExpectQuery("WITH RECURSIVE org_chain AS").
+		WithArgs(testDeliverySourceID).
+		WillReturnRows(sqlmock.NewRows([]string{"root_id"}).AddRow("ws-org-root-159"))
+	mock.ExpectQuery("WITH RECURSIVE org_chain AS").
+		WithArgs(testDeliveryTargetID).
+		WillReturnRows(sqlmock.NewRows([]string{"root_id"}).AddRow("ws-org-root-159"))
 
 	// resolveAgentURL: test callers always set the URL in Redis (mr.Set ws:{id}:url),
 	// so resolveAgentURL gets a cache hit and never falls back to DB.

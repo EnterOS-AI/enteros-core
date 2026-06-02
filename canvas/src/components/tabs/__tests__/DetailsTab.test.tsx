@@ -297,6 +297,25 @@ describe("DetailsTab — delete workflow", () => {
     expect(mockSelectNode).toHaveBeenCalledWith(null);
   });
 
+  // internal#734: checking "also erase saved data" adds &erase_data=true so the
+  // server prunes the data volume. Default (unchecked) must NOT send it.
+  it("checking erase-saved-data sends erase_data=true on delete", async () => {
+    mockApi.del.mockResolvedValue(undefined);
+    render(<DetailsTab workspaceId="ws-1" data={data()} />);
+    await flush();
+    fireEvent.click(screen.getByRole("button", { name: /delete workspace/i }));
+    await flush();
+    fireEvent.click(screen.getByRole("checkbox", { name: /erase saved data/i }));
+    const confirmBtn = Array.from(document.querySelectorAll("button")).find(
+      (b) => b.textContent === "Confirm Delete",
+    ) as HTMLButtonElement;
+    fireEvent(confirmBtn, new MouseEvent("click", { bubbles: true }));
+    await flush();
+    expect(mockApi.del).toHaveBeenCalledWith("/workspaces/ws-1?confirm=true&erase_data=true", {
+      headers: { "X-Confirm-Name": "Test Workspace" },
+    });
+  });
+
   it("cancelling delete returns to view mode", async () => {
     mockApi.del.mockResolvedValue(undefined);
     render(<DetailsTab workspaceId="ws-1" data={data()} />);

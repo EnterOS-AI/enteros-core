@@ -99,6 +99,12 @@ source "$(dirname "$0")/lib/model_slug.sh"
 # shellcheck disable=SC1091
 # shellcheck source=lib/aws_leak_check.sh
 source "$(dirname "$0")/lib/aws_leak_check.sh"
+# shellcheck disable=SC1091
+# shellcheck source=lib/completion_assert.sh
+# molecule-core#1995 (#1994 follow-on): real-completion + per-provider
+# liveness + byok-routing assertion helpers. Adds gates that FAIL on an
+# error-as-text payload (the trap the shape-only A2A checks missed).
+source "$(dirname "$0")/lib/completion_assert.sh"
 
 CURL_COMMON=(-sS --fail-with-body --max-time 30)
 E2E_TMP_FILES=()
@@ -866,6 +872,182 @@ if ! echo "$AGENT_TEXT" | tr '[:lower:]' '[:upper:]' | grep -qF "PONG"; then
 fi
 
 ok "A2A parent round-trip succeeded: \"${AGENT_TEXT:0:80}\""
+
+# ─── 8b. Real-completion known-answer round-trip (CORE GATE, #1994) ────
+# The existing PONG check + generic error grep above already do a lot, but
+# this stanza is the canonical real-completion gate the #1994 follow-on
+# adds: a DETERMINISTIC known-answer prompt asserted via
+# a2a_assert_real_completion, which FAILS on an error-as-text payload
+# ({"kind":"text","text":"Agent error (Exception) ..."}). That payload
+# matches the historical shape-only check `"kind":"text"` and so passed CI
+# on a fully broken agent (drained-key / byok-misroute, 2026-05-2x). This
+# gate makes that case RED. Reuses the same cold-start retry-on-transient
+# (502/503/504) loop the PONG probe uses — retry-once-on-network, never on
+# agent-error. Single round-trip → the one place we spend a non-trivial
+# token budget (default backend MiniMax — cheap token plan).
+KA_PAYLOAD=$(python3 -c "
+import json, uuid
+print(json.dumps({
+    'jsonrpc': '2.0',
+    'method': 'message/send',
+    'id': 'e2e-known-answer-1',
+    'params': {
+        'message': {
+            'role': 'user',
+            'messageId': f'e2e-{uuid.uuid4().hex[:8]}',
+            'parts': [{'kind': 'text', 'text': 'Reply with exactly the word PINEAPPLE and nothing else.'}]
+        }
+    }
+}))
+")
+KA_TMP=$(mktemp -t known_answer_a2a.XXXXXX)
+KA_RESP=""
+for KA_ATTEMPT in $(seq 1 6); do
+  : >"$KA_TMP"
+  set +e
+  KA_CODE=$(tenant_call POST "/workspaces/$PARENT_ID/a2a" \
+    --max-time 90 \
+    -H "Content-Type: application/json" \
+    -d "$KA_PAYLOAD" \
+    -o "$KA_TMP" \
+    -w '%{http_code}' \
+    2>/dev/null)
+  KA_RC=$?
+  set -e
+  KA_CODE=${KA_CODE:-000}
+  KA_RESP=$(cat "$KA_TMP" 2>/dev/null || echo "")
+  if [ "$KA_RC" = "0" ] && [ "$KA_CODE" -ge 200 ] && [ "$KA_CODE" -lt 300 ]; then
+    break
+  fi
+  KA_SAFE_BODY=$(printf '%s' "$KA_RESP" | sanitize_http_body)
+  # Retry ONLY on transient transport errors — never on an agent-level
+  # error (those must surface and fail the gate).
+  if echo "$KA_CODE" | grep -Eq '^(502|503|504)$' && echo "$KA_SAFE_BODY" | grep -Eqi 'Service Unavailable|Bad Gateway|Gateway Timeout|workspace agent unreachable|connection refused|no healthy upstream|workspace agent busy|native_session'; then
+    log "    known-answer A2A transient $KA_CODE attempt $KA_ATTEMPT/6: $KA_SAFE_BODY"
+    if [ "$KA_ATTEMPT" -lt 6 ]; then sleep 10; continue; fi
+  fi
+  break
+done
+rm -f "$KA_TMP"
+if [ "$KA_RC" != "0" ] || [ "$KA_CODE" -lt 200 ] || [ "$KA_CODE" -ge 300 ]; then
+  KA_SAFE_BODY=$(printf '%s' "$KA_RESP" | sanitize_http_body)
+  fail "Known-answer A2A POST failed after $KA_ATTEMPT attempt(s) (curl_rc=$KA_RC, http=$KA_CODE): $KA_SAFE_BODY"
+fi
+KA_TEXT=$(echo "$KA_RESP" | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    parts = d.get('result', {}).get('parts', [])
+    print(parts[0].get('text', '') if parts else '')
+except Exception:
+    print('')
+" 2>/dev/null || echo "")
+# CORE GATE: contains PINEAPPLE (real round-trip) AND no error-as-text.
+a2a_assert_real_completion "$KA_TEXT" "PINEAPPLE" "A2A known-answer (parent, $RUNTIME/$MODEL_SLUG)"
+
+# ─── 8c. byok-routing regression guard (#1994) ─────────────────────────
+# The parent was provisioned with the customer's OWN vendor key
+# (MINIMAX_API_KEY / ANTHROPIC_API_KEY in SECRETS_JSON) → it must resolve
+# BYOK, not platform_managed. #1994 was exactly the inverse: a byok
+# workspace baked platform_managed on (re-)provision → routed through the
+# platform proxy → drained the platform LLM key. We read the SAME derived
+# resolver the provision-time strip gate uses
+# (GET /admin/workspaces/:id/llm-billing-mode) and assert resolved_mode!=
+# platform_managed. A regression flips it RED.
+#
+# Only meaningful when the parent actually carries a byok credential; the
+# OpenAI/hermes path uses a different env shape, and the no-key path is
+# legitimately platform_managed (the CTO default). Gate on the same
+# E2E_*_API_KEY presence the SECRETS_JSON branch keyed off.
+if [ -n "${E2E_MINIMAX_API_KEY:-}" ] || [ -n "${E2E_ANTHROPIC_API_KEY:-}" ]; then
+  set +e
+  BILLING_RESP=$(tenant_call GET "/admin/workspaces/$PARENT_ID/llm-billing-mode" 2>/dev/null)
+  BILLING_RC=$?
+  set -e
+  if [ "$BILLING_RC" != "0" ] || [ -z "$BILLING_RESP" ]; then
+    fail "byok-routing guard: GET /admin/workspaces/$PARENT_ID/llm-billing-mode failed (rc=$BILLING_RC). Body: ${BILLING_RESP:0:200}"
+  fi
+  assert_byok_not_platform_proxy "$BILLING_RESP" "byok-guard (parent, $RUNTIME/$MODEL_SLUG)"
+else
+  log "8c.  byok-routing guard skipped — parent carries no own-vendor key (OpenAI/no-key path is legitimately platform_managed)."
+fi
+
+# ─── 8d. Per-offered-provider liveness matrix (SSOT-driven, #1994 class) ─
+# For each platform-servable model the providers.yaml SSOT
+# (runtimes.<runtime>.providers[platform].models) declares for this
+# runtime, send a minimal max_tokens-bounded "say ok" probe and assert a
+# NON-ERROR completion. Purpose: exercise each offered provider's AUTH +
+# ROUTING path so a drained key / wrong base-URL / byok-misroute fails the
+# gate (the #1994 class). Providers/models come from the SSOT — not a
+# hardcoded list — so the matrix tracks providers.yaml automatically.
+#
+# This lane provisions ONE parent workspace with ONE configured key, so we
+# can only truly drive the providers that key authenticates. Probing a
+# model whose provider key is absent in this lane is reported SKIP (rc=75),
+# not FAIL — keeping the gate deterministic + low-flake. The matrix still
+# proves the configured provider's full auth+routing path end-to-end, and
+# logs the offered set so over/under-offer drift is visible in the CI log.
+provider_liveness_probe() {
+  local model_id="$1"
+  # Map the SSOT platform model id (e.g. minimax/MiniMax-M2.7) to the
+  # vendor namespace token to decide whether THIS lane has its key.
+  local vendor="${model_id%%/*}"
+  case "$vendor" in
+    minimax)   [ -n "${E2E_MINIMAX_API_KEY:-}" ]   || return 75 ;;
+    anthropic) [ -n "${E2E_ANTHROPIC_API_KEY:-}" ] || return 75 ;;
+    openai)    [ -n "${E2E_OPENAI_API_KEY:-}" ]    || return 75 ;;
+    *)         return 75 ;;  # kimi/moonshot etc. — no key wired in this lane
+  esac
+  local probe_payload
+  probe_payload=$(python3 -c "
+import json, uuid
+print(json.dumps({
+    'jsonrpc': '2.0',
+    'method': 'message/send',
+    'id': 'e2e-liveness-' + uuid.uuid4().hex[:6],
+    'params': {
+        'message': {
+            'role': 'user',
+            'messageId': f'e2e-{uuid.uuid4().hex[:8]}',
+            'parts': [{'kind': 'text', 'text': 'Reply with exactly: ok'}],
+        },
+        'configuration': {'max_tokens': 4}
+    }
+}))
+")
+  local tmp code rc resp
+  tmp=$(mktemp -t liveness_a2a.XXXXXX)
+  set +e
+  code=$(tenant_call POST "/workspaces/$PARENT_ID/a2a" \
+    --max-time 60 \
+    -H "Content-Type: application/json" \
+    -d "$probe_payload" \
+    -o "$tmp" -w '%{http_code}' 2>/dev/null)
+  rc=$?
+  set -e
+  resp=$(cat "$tmp" 2>/dev/null || echo "")
+  rm -f "$tmp"
+  if [ "$rc" != "0" ] || [ "${code:-000}" -lt 200 ] || [ "${code:-000}" -ge 300 ]; then
+    log "      probe $model_id: HTTP ${code:-000} rc=$rc"
+    return 1
+  fi
+  local text
+  text=$(echo "$resp" | python3 -c "
+import json,sys
+try:
+    d=json.load(sys.stdin); p=d.get('result',{}).get('parts',[])
+    print(p[0].get('text','') if p else '')
+except Exception: print('')" 2>/dev/null || echo "")
+  if [ -z "$text" ] || a2a_completion_error_marker "$text" >/dev/null; then
+    log "      probe $model_id: error-as-text or empty: ${text:0:120}"
+    return 1
+  fi
+  return 0
+}
+if ! provider_liveness_matrix "$RUNTIME" provider_liveness_probe; then
+  fail "Per-provider liveness matrix: at least one offered provider failed its auth+routing probe (see matrix above). This is the #1994 class — a drained key / wrong base-URL / byok-misroute."
+fi
+ok "Per-provider liveness matrix passed (all probed offered providers completed without error)"
 
 # ─── 9. HMA + peers + activity (full mode) ─────────────────────────────
 if [ "$MODE" = "full" ]; then

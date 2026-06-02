@@ -8,6 +8,34 @@ TIMEOUT="${A2A_TIMEOUT:-120}"  # seconds per A2A call (override via A2A_TIMEOUT 
 
 # shellcheck source=_lib.sh
 source "$(dirname "$0")/_lib.sh"
+# molecule-core#1995 (#1994 follow-on): real-completion assertion helpers.
+# Adds a NEGATIVE error-as-text check on top of the shape checks below, so a
+# broken agent that returns its error AS a text part
+# ({"kind":"text","text":"Agent error (Exception) ..."}) — which STILL
+# matches the shape check `"kind":"text"` — now FAILS instead of passing.
+# shellcheck source=lib/completion_assert.sh
+source "$(dirname "$0")/lib/completion_assert.sh"
+
+# check_no_error_as_text <desc> <agent_text>
+# Additive negative gate: PASS only if the agent text carries NO
+# error-as-text marker (Agent error / Exception / error result /
+# MISSING_BYOK_CREDENTIAL). Uses the same scanner as the staging
+# real-completion gate so the trap is closed consistently across lanes.
+check_no_error_as_text() {
+  local desc="$1"
+  local text="$2"
+  local hit
+  if hit=$(a2a_completion_error_marker "$text"); then
+    echo "FAIL: $desc"
+    echo "  agent returned an error-AS-text payload (matched '$hit') — a broken"
+    echo "  agent that surfaces its error as a text part is NOT a real reply."
+    echo "  got: $(echo "$text" | head -3)"
+    FAIL=$((FAIL + 1))
+  else
+    echo "PASS: $desc"
+    PASS=$((PASS + 1))
+  fi
+}
 
 check() {
   local desc="$1"
@@ -81,6 +109,8 @@ check "JSON-RPC response has result" '"result"' "$R"
 check "Response has agent role" '"role":"agent"' "$R"
 check "Response has text part" '"kind":"text"' "$R"
 TEXT=$(echo "$R" | python3 -c "import sys,json; r=json.load(sys.stdin); print(r['result']['parts'][0]['text'][:200])" 2>/dev/null || echo "PARSE_ERROR")
+# Negative gate (#1994): the text part must not BE an error.
+check_no_error_as_text "Echo reply is not an error-as-text payload" "$TEXT"
 echo "  Agent said: $TEXT"
 echo ""
 
@@ -92,6 +122,11 @@ R=$(a2a_send "$SEO_ID" "What SEO skills do you have?")
 check "SEO agent responds" '"result"' "$R"
 check "SEO response has text" '"kind":"text"' "$R"
 TEXT=$(echo "$R" | python3 -c "import sys,json; r=json.load(sys.stdin); print(r['result']['parts'][0]['text'][:200])" 2>/dev/null || echo "PARSE_ERROR")
+# Negative gate (#1994): a broken SEO agent that returns "Agent error
+# (Exception) ..." AS text still matches the `"kind":"text"` shape check
+# above — THAT is the gap that let drained-key/byok-misroute failures pass
+# CI. This makes that case FAIL.
+check_no_error_as_text "SEO reply is not an error-as-text payload" "$TEXT"
 echo "  SEO Agent said: $TEXT"
 echo ""
 

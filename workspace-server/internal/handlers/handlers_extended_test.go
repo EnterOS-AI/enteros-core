@@ -255,22 +255,20 @@ func TestExtended_SecretsListEmpty(t *testing.T) {
 // ---------- TestSecretsSet (Extended) ----------
 
 func TestExtended_SecretsSet(t *testing.T) {
-	// internal#691: the per-workspace strip gate now defaults to platform_managed
-	// on empty MOLECULE_LLM_BILLING_MODE (closed default). This test's intent is
-	// the happy path of persisting a vendor key, so put the org into byok which
-	// matches the pre-#691 implicit behavior of an unset env.
-	t.Setenv("MOLECULE_LLM_BILLING_MODE", "byok")
+	// internal#718 P2-B: the per-workspace strip gate keys off the DERIVED mode
+	// (org rung retired). This test's intent is the happy path of persisting a
+	// vendor key on a byok workspace; the realistic way a workspace is byok for
+	// a direct vendor-key write is an explicit operator override (the escape
+	// hatch the reject error itself points to: PUT /admin/.../llm-billing-mode).
+	// The override short-circuits the resolver to byok in a single read, so the
+	// bypass-list check is skipped and the write proceeds.
+	t.Setenv("MOLECULE_LLM_BILLING_MODE", "platform_managed") // org env ignored now
 	mock := setupTestDB(t)
 	handler := NewSecretsHandler(nil)
 
-	// internal#691: secrets.Set now consults ResolveLLMBillingMode before the
-	// strip gate. Mock returns no row → resolver falls through to the org
-	// default (byok, set via t.Setenv above) → bypass-list check is skipped
-	// and the write proceeds. This pattern is the test-side mirror of the
-	// real-prod fall-through behavior for a fresh workspace with no override.
 	mock.ExpectQuery(`SELECT llm_billing_mode FROM workspaces WHERE id = \$1`).
 		WithArgs("22222222-2222-2222-2222-222222222222").
-		WillReturnRows(sqlmock.NewRows([]string{"llm_billing_mode"}))
+		WillReturnRows(sqlmock.NewRows([]string{"llm_billing_mode"}).AddRow(LLMBillingModeBYOK))
 
 	// Expect INSERT (encrypted value is dynamic, use AnyArg)
 	mock.ExpectExec("INSERT INTO workspace_secrets").
@@ -376,14 +374,14 @@ func TestExtended_DiscoverWithCallerID(t *testing.T) {
 	handler := NewDiscoveryHandler()
 
 	// CanCommunicate needs to look up both workspaces
-	// Caller: root-level (no parent)
+	// Share a parent so communication is allowed under post-#1955 rules
+	sharedParent := "ws-parent"
 	mock.ExpectQuery("SELECT id, parent_id FROM workspaces WHERE id =").
 		WithArgs("ws-caller").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "parent_id"}).AddRow("ws-caller", nil))
-	// Target: also root-level (no parent) — root-level siblings are allowed
+		WillReturnRows(sqlmock.NewRows([]string{"id", "parent_id"}).AddRow("ws-caller", sharedParent))
 	mock.ExpectQuery("SELECT id, parent_id FROM workspaces WHERE id =").
 		WithArgs("ws-target").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "parent_id"}).AddRow("ws-target", nil))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "parent_id"}).AddRow("ws-target", sharedParent))
 
 	// Discover handler looks up workspace name + runtime
 	mock.ExpectQuery("SELECT COALESCE").
@@ -453,6 +451,14 @@ func TestExtended_DiscoverMissingHeader(t *testing.T) {
 
 // ---------- TestPeers (Extended) ----------
 
+// TestExtended_Peers verifies a root-level (org-root) workspace's peer view.
+//
+// #1953: previously a root-level caller issued `WHERE w.parent_id IS NULL`
+// for siblings, which returned EVERY other tenant's org root as a "peer"
+// (cross-tenant leak, since the workspaces table has no org_id column). After
+// the fix an org root has no cross-tenant siblings; its only peers are its own
+// children. This test asserts the child is returned and that NO sibling query
+// is issued (no `parent_id IS NULL` read).
 func TestExtended_Peers(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
@@ -463,17 +469,14 @@ func TestExtended_Peers(t *testing.T) {
 		WithArgs("ws-peer").
 		WillReturnRows(sqlmock.NewRows([]string{"parent_id"}).AddRow(nil))
 
-	// Expect root-level siblings query (parent IS NULL, excluding self)
-	mock.ExpectQuery("SELECT w.id, w.name").
-		WithArgs("ws-peer").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "role", "tier", "status", "agent_card", "url", "parent_id", "active_tasks"}).
-			AddRow("ws-sibling", "Sibling Agent", "worker", 1, "online", []byte("null"), "http://localhost:9001", nil, 0))
+	// NO root-level sibling query is issued for an org-root caller anymore.
 
-	// Expect children query (workspaces with parent_id = ws-peer, excluding self)
-	// Query now binds (parent_id, self_id) for the self-filter guard added in #383.
+	// Children query (workspaces with parent_id = ws-peer, excluding self).
+	// Query binds (parent_id, self_id) for the self-filter guard added in #383.
 	mock.ExpectQuery("SELECT w.id, w.name").
 		WithArgs("ws-peer", "ws-peer").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "role", "tier", "status", "agent_card", "url", "parent_id", "active_tasks"}))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "role", "tier", "status", "agent_card", "url", "parent_id", "active_tasks"}).
+			AddRow("ws-child", "Child Agent", "worker", 1, "online", []byte("null"), "http://localhost:9001", "ws-peer", 0))
 
 	// No parent query since workspace is root-level
 
@@ -493,10 +496,10 @@ func TestExtended_Peers(t *testing.T) {
 		t.Fatalf("failed to parse response: %v", err)
 	}
 	if len(resp) != 1 {
-		t.Fatalf("expected 1 peer, got %d", len(resp))
+		t.Fatalf("expected 1 peer (the child), got %d", len(resp))
 	}
-	if resp[0]["name"] != "Sibling Agent" {
-		t.Errorf("expected peer name 'Sibling Agent', got %v", resp[0]["name"])
+	if resp[0]["name"] != "Child Agent" {
+		t.Errorf("expected peer name 'Child Agent', got %v", resp[0]["name"])
 	}
 
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -512,13 +515,14 @@ func TestExtended_CheckAccess(t *testing.T) {
 	handler := NewDiscoveryHandler()
 
 	// CanCommunicate will look up both workspaces
-	// Both root-level — should be allowed
+	// Share a parent so communication is allowed under post-#1955 rules
+	sharedParent := "ws-parent"
 	mock.ExpectQuery("SELECT id, parent_id FROM workspaces WHERE id =").
 		WithArgs("ws-a").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "parent_id"}).AddRow("ws-a", nil))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "parent_id"}).AddRow("ws-a", sharedParent))
 	mock.ExpectQuery("SELECT id, parent_id FROM workspaces WHERE id =").
 		WithArgs("ws-b").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "parent_id"}).AddRow("ws-b", nil))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "parent_id"}).AddRow("ws-b", sharedParent))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)

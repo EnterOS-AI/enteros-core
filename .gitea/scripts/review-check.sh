@@ -296,7 +296,15 @@ fi
 #   403     → token owner is not in this team (Gitea 1.22.6 'Must be a team
 #             member' constraint — see follow-up issue for token-provisioning)
 #   404     → not a member
+# Track whether every candidate returned 403 (token owner not in team).
+# When this happens the root cause is a token-provisioning issue, not a
+# reviewer-eligibility issue — surface it clearly so ops don't waste time
+# verifying team roster (Bug C / RFC#324 follow-up).
+_ALL_CANDIDATES_403="yes"
+_CANDIDATE_COUNT=0
+
 for U in $CANDIDATES; do
+  _CANDIDATE_COUNT=$((_CANDIDATE_COUNT + 1))
   CODE=$(curl -sS -o "$TEAM_PROBE_TMP" -w '%{http_code}' \
     -K "$CURL_AUTH_FILE" "${API}/teams/${TEAM_ID}/members/${U}")
   debug "probe ${U} in team ${TEAM} (id=${TEAM_ID}) → HTTP ${CODE}"
@@ -317,14 +325,20 @@ for U in $CANDIDATES; do
       continue
       ;;
     404)
+      _ALL_CANDIDATES_403="no"
       debug "${U} not a member of ${TEAM}"
       ;;
     *)
+      _ALL_CANDIDATES_403="no"
       echo "::warning::team-probe for ${U} in ${TEAM} returned unexpected HTTP ${CODE}"
       cat "$TEAM_PROBE_TMP" >&2
       ;;
   esac
 done
 
-echo "::error::${TEAM}-review awaiting non-author APPROVE from ${TEAM} team (candidates: $(echo "$CANDIDATES" | tr '\n' ',' | sed 's/,$//') — none are in team)"
+if [ "$_ALL_CANDIDATES_403" = "yes" ] && [ "$_CANDIDATE_COUNT" -gt 0 ]; then
+  echo "::error::${TEAM}-review FAILED — every candidate returned 403 (token owner is not a member of the ${TEAM} team). This is a TOKEN PROVISIONING issue, not a reviewer-eligibility issue. Add the token owner to the '${TEAM}' Gitea team (id=${TEAM_ID}) or use a token whose owner is already in that team."
+else
+  echo "::error::${TEAM}-review awaiting non-author APPROVE from ${TEAM} team (candidates: $(echo "$CANDIDATES" | tr '\n' ',' | sed 's/,$//') — none are in team)"
+fi
 exit 1

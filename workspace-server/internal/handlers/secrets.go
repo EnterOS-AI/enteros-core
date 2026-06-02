@@ -24,6 +24,7 @@ var platformManagedDirectLLMBypassKeys = map[string]struct{}{
 	"ANTHROPIC_AUTH_TOKEN":    {},
 	"ARCEEAI_API_KEY":         {},
 	"CLAUDE_CODE_OAUTH_TOKEN": {},
+	"CODEX_AUTH_JSON":         {},
 	"DASHSCOPE_API_KEY":       {},
 	"DEEPSEEK_API_KEY":        {},
 	"GEMINI_API_KEY":          {},
@@ -67,14 +68,6 @@ func platformManagedLLMModeForWorkspace(c *gin.Context, workspaceID string) bool
 	return strings.EqualFold(res.ResolvedMode, LLMBillingModePlatformManaged)
 }
 
-// platformManagedLLMMode is the legacy org-level gate retained for any test
-// harness still asserting the env-var-only behavior. Production code paths
-// must call platformManagedLLMModeForWorkspace instead so a workspace-level
-// byok override actually takes effect on the secrets-write path.
-func platformManagedLLMMode() bool {
-	return strings.EqualFold(strings.TrimSpace(os.Getenv("MOLECULE_LLM_BILLING_MODE")), "platform_managed")
-}
-
 // rejectPlatformManagedDirectLLMBypassForWorkspace is the per-workspace
 // successor to rejectPlatformManagedDirectLLMBypass (internal#691). The
 // strip-list ONLY applies when this specific workspace resolves to
@@ -87,22 +80,6 @@ func rejectPlatformManagedDirectLLMBypassForWorkspace(c *gin.Context, workspaceI
 		"error":        "direct vendor key writes are blocked for platform-managed workspaces; use MODEL/LLM_PROVIDER or the platform LLM proxy env instead, or set this workspace's billing mode to 'byok' via /admin/workspaces/:id/llm-billing-mode",
 		"key":          key,
 		"workspace_id": workspaceID,
-	})
-	return true
-}
-
-// rejectPlatformManagedDirectLLMBypass is the legacy org-level shim. Retained
-// only for backwards compatibility with any external/test caller still on the
-// old shape; new code MUST use the per-workspace variant above. Production
-// code paths (the secrets.go handlers + workspace.go create-secret path) all
-// switched in internal#691.
-func rejectPlatformManagedDirectLLMBypass(c *gin.Context, key string) bool {
-	if !platformManagedLLMMode() || !isPlatformManagedDirectLLMBypassKey(key) {
-		return false
-	}
-	c.JSON(http.StatusBadRequest, gin.H{
-		"error": "direct Hermes custom provider secrets are blocked for platform-managed LLM workspaces; use MODEL/LLM_PROVIDER or the platform LLM proxy env instead",
-		"key":   key,
 	})
 	return true
 }
@@ -309,6 +286,16 @@ func (h *SecretsHandler) Values(c *gin.Context) {
 		return
 	}
 
+	// molecule-core#1994 (corrected model): the remote-pull bundle is the
+	// TENANT's own merged secrets (global_secrets + workspace_secrets, the
+	// latter winning on collision). `global_secrets` is the tenant's store, not
+	// the platform's, so a byok workspace's pull MUST include the tenant's own
+	// global-scope LLM credential — that is exactly what it runs on, direct.
+	// The earlier internal#711 byok strip here rested on the inverted "global =
+	// platform's own" premise and is removed; the platform's own proxy token is
+	// never in a tenant's global_secrets (it lives in server env only and is
+	// injected separately on the platform_managed provision path), so there is
+	// nothing platform-owned to withhold on this path.
 	c.JSON(http.StatusOK, out)
 }
 
@@ -476,9 +463,15 @@ func (h *SecretsHandler) SetGlobal(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
 		return
 	}
-	if rejectPlatformManagedDirectLLMBypass(c, body.Key) {
-		return
-	}
+	// internal#718: the org-level LLM billing rung was retired — billing is
+	// resolved per-workspace, not per-org. A global secret is the tenant's OWN
+	// shared credential; the provision-time provider-matched strip
+	// (workspace_provision) removes any global cred a given workspace's resolved
+	// provider does not accept, so a platform-managed workspace can never USE a
+	// non-matching global vendor/oauth key. The legacy org-env SetGlobal gate
+	// (keyed off the retired MOLECULE_LLM_BILLING_MODE) is therefore removed;
+	// per-workspace writes still enforce the strip-list via
+	// rejectPlatformManagedDirectLLMBypassForWorkspace.
 
 	encrypted, err := crypto.Encrypt([]byte(body.Value))
 	if err != nil {
@@ -739,121 +732,19 @@ func (h *SecretsHandler) SetModel(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "saved", "model": body.Model})
 }
 
-// GetProvider handles GET /workspaces/:id/provider
-// Returns the explicit LLM provider override stored as the LLM_PROVIDER
-// workspace secret. Mirror of GetModel — same shape, same response keys
-// (provider/source) to keep canvas wiring symmetric.
+// internal#718 P4 closure: GetProvider, SetProvider, and the shared
+// setProviderSecret helper were retired together with the
+// LLM_PROVIDER workspace_secret. The provider is now DERIVED at every
+// decision point from (runtime, model) via the registry
+// (internal/providers.Manifest.DeriveProvider), so storing it is
+// pure write-ghost — no consumer remains.
 //
-// Why a sibling endpoint rather than overloading PUT /model: the new
-// `provider` field (Option B, PR #2441) is orthogonal to the model
-// slug. A user might keep the same model alias and switch providers
-// (e.g., route the same alias through a different gateway), or keep
-// the same provider and switch models. Co-storing them under one
-// endpoint forces a single Save+Restart round-trip per change; two
-// endpoints let the canvas update each independently.
-func (h *SecretsHandler) GetProvider(c *gin.Context) {
-	workspaceID := c.Param("id")
-	ctx := c.Request.Context()
-
-	var bytesVal []byte
-	var version int
-	err := db.DB.QueryRowContext(ctx,
-		`SELECT encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = $1 AND key = 'LLM_PROVIDER'`,
-		workspaceID).Scan(&bytesVal, &version)
-	if err == sql.ErrNoRows {
-		c.JSON(http.StatusOK, gin.H{"provider": "", "source": "default"})
-		return
-	}
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "query failed"})
-		return
-	}
-
-	decrypted, err := crypto.DecryptVersioned(bytesVal, version)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to decrypt"})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{"provider": string(decrypted), "source": "workspace_secrets"})
-}
-
-// setProviderSecret writes (or clears, when value=="") the LLM_PROVIDER
-// workspace secret. Extracted from SetProvider so non-handler call sites
-// (notably WorkspaceHandler.Create — first-deploy path that derives
-// LLM_PROVIDER from the canvas-selected model slug so CP user-data picks
-// it up as a YAML field in /configs/config.yaml AND it survives across
-// restarts when CP regenerates the config) can reuse the encryption +
-// upsert logic without inlining the SQL.
+// Route registrations in internal/router/router.go now point both
+// GET and PUT /workspaces/:id/provider at providerEndpointGone, which
+// returns 410 Gone with a structured body so older canvases that
+// still call PUT /provider on Save surface a loud failure rather
+// than silently writing a vanished row.
 //
-// Returns nil on success. Caller is responsible for any restart trigger;
-// the gin handler re-adds that after a successful write.
-func setProviderSecret(ctx context.Context, workspaceID, provider string) error {
-	if provider == "" {
-		_, err := db.DB.ExecContext(ctx,
-			`DELETE FROM workspace_secrets WHERE workspace_id = $1 AND key = 'LLM_PROVIDER'`,
-			workspaceID)
-		return err
-	}
-	encrypted, err := crypto.Encrypt([]byte(provider))
-	if err != nil {
-		return err
-	}
-	version := crypto.CurrentEncryptionVersion()
-	_, err = db.DB.ExecContext(ctx, `
-		INSERT INTO workspace_secrets (workspace_id, key, encrypted_value, encryption_version)
-		VALUES ($1, 'LLM_PROVIDER', $2, $3)
-		ON CONFLICT (workspace_id, key) DO UPDATE
-			SET encrypted_value = $2, encryption_version = $3, updated_at = now()
-	`, workspaceID, encrypted, version)
-	return err
-}
-
-// SetProvider handles PUT /workspaces/:id/provider — writes the provider
-// slug into workspace_secrets as LLM_PROVIDER. Empty string clears the
-// override. Triggers auto-restart so the new env is in effect on the
-// next boot — without this the canvas Save+Restart can race the
-// already-restarting container and miss the window.
-//
-// CP user-data (controlplane PR #364) reads LLM_PROVIDER from env and
-// writes it into /configs/config.yaml at boot, so the choice survives
-// restart. Without that PR this endpoint still works but the value is
-// only sticky when the workspace_secrets row is read on every restart
-// (the secret-load path) — slower failure mode, same eventual behavior.
-func (h *SecretsHandler) SetProvider(c *gin.Context) {
-	workspaceID := c.Param("id")
-	if !uuidRegex.MatchString(workspaceID) {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid workspace ID"})
-		return
-	}
-	ctx := c.Request.Context()
-
-	var body struct {
-		Provider string `json:"provider"`
-	}
-	if err := c.ShouldBindJSON(&body); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
-		return
-	}
-
-	if err := setProviderSecret(ctx, workspaceID, body.Provider); err != nil {
-		log.Printf("SetProvider error: %v", err)
-		if body.Provider == "" {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clear provider"})
-		} else {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save provider"})
-		}
-		return
-	}
-
-	if h.restartFunc != nil {
-		// RFC internal#524 Layer 1: globalGoAsync (see Set()).
-		wsID := workspaceID
-		globalGoAsync(func() { h.restartFunc(wsID) })
-	}
-	if body.Provider == "" {
-		c.JSON(http.StatusOK, gin.H{"status": "cleared"})
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{"status": "saved", "provider": body.Provider})
-}
+// Migration 20260528000000_drop_llm_provider_workspace_secret.up.sql
+// removes any straggler rows in workspace_secrets (key='LLM_PROVIDER')
+// so the table is in the same state as a freshly-provisioned tenant.

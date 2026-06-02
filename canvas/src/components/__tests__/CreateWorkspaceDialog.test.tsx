@@ -213,6 +213,7 @@ describe("CreateWorkspaceDialog", () => {
     expect(runtimeTexts).toEqual([
       "Claude Code",
       "OpenAI Codex CLI",
+      "Google ADK",
       "Hermes",
       "OpenClaw",
     ]);
