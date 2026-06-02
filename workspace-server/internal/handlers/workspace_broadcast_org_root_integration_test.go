@@ -95,6 +95,14 @@ func TestIntegration_BroadcastOrgRoot_NonRootSenderResolvesToRoot(t *testing.T) 
 		}
 	})
 
+	// Pre-test hygiene: if a prior run crashed or was killed, its rows may
+	// still be in the shared integration DB. Remove them before inserting so
+	// the unique index workspaces_parent_name_uniq does not conflict.
+	if _, err := conn.ExecContext(ctx,
+		`DELETE FROM workspaces WHERE name LIKE $1`, prefix+"%"); err != nil {
+		t.Logf("pre-test cleanup (non-fatal): %v", err)
+	}
+
 	rootID := uuid.New().String()
 	midID := uuid.New().String()
 	leafID := uuid.New().String()
