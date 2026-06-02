@@ -217,7 +217,12 @@ func (h *TerminalHandler) handleLocalConnect(c *gin.Context, workspaceID string)
 	// synchronously. No db.DB access on this path.
 	done := make(chan struct{})
 	go func() {
-		defer close(done)
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("Terminal: PANIC in stdout bridge: %v", r)
+			}
+			close(done)
+		}()
 		buf := make([]byte, 4096)
 		for {
 			n, err := resp.Reader.Read(buf)
@@ -440,7 +445,12 @@ func (h *TerminalHandler) handleRemoteConnect(c *gin.Context, workspaceID, insta
 	// goAsync-exempt (RFC internal#524 Layer 2.2): WebSocket-lifetime
 	// I/O bridge; handler blocks on `done` below. No db.DB access.
 	go func() {
-		defer close(done)
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("Terminal: PANIC in PTY bridge: %v", r)
+			}
+			close(done)
+		}()
 		buf := make([]byte, 4096)
 		for {
 			n, err := ptmx.Read(buf)
@@ -463,6 +473,11 @@ func (h *TerminalHandler) handleRemoteConnect(c *gin.Context, workspaceID, insta
 	// WebSocket → PTY (stdin)
 	// goAsync-exempt (RFC internal#524 Layer 2.2): see above.
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("Terminal: PANIC in stdin loop: %v", r)
+			}
+		}()
 		for {
 			_, msg, rErr := conn.ReadMessage()
 			if rErr != nil {

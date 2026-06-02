@@ -116,6 +116,11 @@ func sessionCachePut(key string, ok bool) {
 
 func init() {
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("session_auth: PANIC in cache sweeper: %v", r)
+			}
+		}()
 		// Jitter startup so restarts don't align sweeps.
 		time.Sleep(time.Duration(rand.Int64N(int64(sessionCacheSweepEvery))))
 		t := time.NewTicker(sessionCacheSweepEvery)

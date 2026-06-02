@@ -3,6 +3,7 @@ package middleware
 
 import (
 	"context"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -35,6 +36,11 @@ func NewRateLimiter(rate int, interval time.Duration, ctx context.Context) *Rate
 		interval: interval,
 	}
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("ratelimit: PANIC in bucket cleanup: %v", r)
+			}
+		}()
 		ticker := time.NewTicker(5 * time.Minute)
 		defer ticker.Stop()
 		for {

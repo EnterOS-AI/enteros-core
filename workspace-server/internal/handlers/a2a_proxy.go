@@ -1002,7 +1002,12 @@ func applyIdleTimeout(parent context.Context, b *events.Broadcaster, workspaceID
 	// completed when t.Cleanup fires. Does NOT read db.DB; idle-timer
 	// management only.
 	go func() {
-		defer unsub()
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("a2a_proxy: PANIC in SSE idle watcher for %s: %v", workspaceID, r)
+			}
+			unsub()
+		}()
 		timer := time.NewTimer(idle)
 		defer timer.Stop()
 		for {
