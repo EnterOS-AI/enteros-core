@@ -104,6 +104,21 @@ permissions:
   statuses: write
 
 jobs:
+  # DIAGNOSTIC (RC 8321): dump the exact pull_request_review payload shape
+  # so we can write a correct job-level guard. CR2 will trigger this via a
+  # review submission; the log reveals the JSON path Gitea 1.22.6 actually
+  # uses for review.state. Removed after guard is fixed.
+  diagnostic:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request_review'
+    steps:
+      - name: Dump github.event JSON
+        run: |
+          echo "EVENT_NAME=${{ github.event_name }}"
+          echo "REVIEW_STATE=${{ github.event.review.state }}"
+          echo "ACTION=${{ github.event.action }}"
+          echo "FULL_EVENT=${{ toJSON(github.event) }}"
+
   # bp-exempt: PR review bot signal; required merge state is enforced by CI / all-required.
   approved:
     # Gate the job:
