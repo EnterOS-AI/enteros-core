@@ -81,19 +81,17 @@ func (p *Postgres) Persist(ctx context.Context, b rescue.Bundle) error {
 	return nil
 }
 
-// GetLatest returns the newest bundle for workspaceID, optionally
-// org-scoped. The (workspace_id, captured_at DESC, id DESC) index serves
-// this directly. sql.ErrNoRows maps to (nil, nil) so the handler 404s.
+// GetLatest returns the newest bundle for workspaceID, org-scoped. The
+// (workspace_id, captured_at DESC, id DESC) index serves this directly.
+// sql.ErrNoRows maps to (nil, nil) so the handler 404s.
 func (p *Postgres) GetLatest(ctx context.Context, workspaceID, orgID string) (*StoredBundle, error) {
 	if p.db == nil {
 		return nil, fmt.Errorf("rescuestore: nil db")
 	}
+	if orgID == "" {
+		return nil, fmt.Errorf("rescuestore: org_id required")
+	}
 
-	// org_id filter is applied only when an org is configured. The
-	// `($2 = '' OR org_id = $2)` form keeps it a single prepared query:
-	// empty orgID (self-hosted / unset MOLECULE_ORG_ID) matches any row;
-	// a set orgID requires the row's org to match, so a bundle written
-	// under a different org is never returned.
 	var (
 		instanceID  string
 		reason      string
@@ -104,7 +102,7 @@ func (p *Postgres) GetLatest(ctx context.Context, workspaceID, orgID string) (*S
 		`SELECT instance_id, reason, captured_at, sections
 		   FROM rescue_bundles
 		  WHERE workspace_id = $1
-		    AND ($2 = '' OR org_id = $2)
+		    AND org_id = $2
 		  ORDER BY captured_at DESC, id DESC
 		  LIMIT 1`,
 		workspaceID, orgID,

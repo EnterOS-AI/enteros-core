@@ -154,16 +154,14 @@ func TestGetLatest_NoRowsReturnsNil(t *testing.T) {
 	}
 }
 
-// TestGetLatest_OrgScopingArg: the org id is passed as the $2 filter arg,
-// so a row in a sibling org is excluded by the query itself. We assert
-// the arg binding (the `($2 = ” OR org_id = $2)` predicate is in the
-// SQL); a mismatched org → no row → nil (same as no-rows).
+// TestGetLatest_OrgScopingArg: the org id is passed as the $2 filter arg
+// with strict equality, so a row in a sibling org is excluded by the query
+// itself. A mismatched org → no row → nil (same as no-rows).
 func TestGetLatest_OrgScopingArg(t *testing.T) {
 	dbh, mock := newMock(t)
-	// Tenant org-B asks for ws-1 (owned by org-9). The Postgres predicate
-	// filters it out → ErrNoRows → nil. We model that by scripting the
-	// query for ("ws-1","org-B") to return no rows.
-	mock.ExpectQuery(regexp.QuoteMeta(`AND ($2 = '' OR org_id = $2)`)).
+	// Tenant org-B asks for ws-1 (owned by org-9). The strict predicate
+	// filters it out → ErrNoRows → nil.
+	mock.ExpectQuery(regexp.QuoteMeta(`AND org_id = $2`)).
 		WithArgs("ws-1", "org-B").
 		WillReturnError(sql.ErrNoRows)
 
@@ -173,6 +171,16 @@ func TestGetLatest_OrgScopingArg(t *testing.T) {
 	}
 	if got != nil {
 		t.Fatal("sibling-org read returned a bundle; want nil")
+	}
+}
+
+// TestGetLatest_EmptyOrgIDRejected: an empty orgID must fail closed with
+// an error rather than disabling the org filter (#2020).
+func TestGetLatest_EmptyOrgIDRejected(t *testing.T) {
+	dbh, _ := newMock(t)
+	_, err := NewPostgres(dbh).GetLatest(context.Background(), "ws-1", "")
+	if err == nil {
+		t.Fatal("GetLatest(empty orgID) should error")
 	}
 }
 

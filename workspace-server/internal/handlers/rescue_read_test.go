@@ -175,16 +175,20 @@ func TestGetRescue_OrgScopingPassedToStore(t *testing.T) {
 	}
 }
 
-// TestGetRescue_EmptyOrgEnvPassesEmptyFilter — self-hosted / unset
-// MOLECULE_ORG_ID passes "" so the store returns any row for the ws.
-func TestGetRescue_EmptyOrgEnvPassesEmptyFilter(t *testing.T) {
+// TestGetRescue_EmptyOrgEnvRejected — empty MOLECULE_ORG_ID is a
+// fail-closed security violation (#2020). The handler must 503 before
+// calling the store, so the org filter cannot be bypassed.
+func TestGetRescue_EmptyOrgEnvRejected(t *testing.T) {
 	fake := &fakeRescueStore{ret: sampleStored()}
 	w := doRescueGet(t, "ws-1", "", fake)
 	if fake.gotOrgID != "" {
-		t.Errorf("store got org_id = %q, want empty (unset MOLECULE_ORG_ID)", fake.gotOrgID)
+		t.Errorf("store was called with org_id = %q; want no call when env empty", fake.gotOrgID)
 	}
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", w.Code)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body=%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "platform_misconfigured") {
+		t.Fatalf("body = %s, want platform_misconfigured code", w.Body.String())
 	}
 }
 

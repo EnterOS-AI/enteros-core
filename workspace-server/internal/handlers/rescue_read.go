@@ -103,11 +103,18 @@ func (h *RescueReadHandler) GetRescue(c *gin.Context) {
 		return
 	}
 
-	// org_id is the tenant's configured org (one tenant = one org). When
-	// unset (self-hosted / dev), pass "" so the store returns any row for
-	// the workspace; when set, the store requires org_id to match so a
-	// sibling org's row is never served.
+	// org_id is the tenant's configured org (one tenant = one org).
+	// Fail closed: an empty org_id disables org isolation and must not
+	// reach the store (#2020).
 	orgID := os.Getenv("MOLECULE_ORG_ID")
+	if orgID == "" {
+		log.Printf("GetRescue: missing MOLECULE_ORG_ID for ws=%s", workspaceID)
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error": "rescue org not configured",
+			"code":  "platform_misconfigured",
+		})
+		return
+	}
 
 	stored, err := h.store.GetLatest(ctx, workspaceID, orgID)
 	if err != nil {
