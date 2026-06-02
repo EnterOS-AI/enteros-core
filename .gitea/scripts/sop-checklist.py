@@ -6,8 +6,8 @@
 # RFC#351 Step 2 of 6 (implementation MVP).
 #
 # Invoked by .gitea/workflows/sop-checklist.yml on:
-#   - pull_request_target: [opened, edited, synchronize, reopened]
-#   - issue_comment:       [created, edited, deleted]
+#   - pull_request_target: [opened, edited, synchronize, reopened, labeled, unlabeled]
+#   - issue_comment:       [created]  # edited/deleted omitted (Gitea 1.22.6 job-parsing quirk)
 #
 # Flow:
 #   1. Load .gitea/sop-checklist-config.yaml (from BASE ref — trusted).
