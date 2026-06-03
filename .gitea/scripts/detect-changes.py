@@ -26,6 +26,10 @@ PROFILES: dict[str, dict[str, str]] = {
         "handlers": (
             r"^workspace-server/internal/handlers/"
             r"|^workspace-server/internal/wsauth/"
+            # #2149: the scheduler real-PG integration tests run in this same
+            # workflow (they reuse its migrated Postgres), so changes to the
+            # scheduler package must trigger the job too.
+            r"|^workspace-server/internal/scheduler/"
             r"|^workspace-server/migrations/"
             r"|^\.gitea/workflows/handlers-postgres-integration\.yml$"
         ),
@@ -174,3 +178,4 @@ def main(argv: list[str]) -> int:
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv[1:]))
+
