@@ -199,9 +199,124 @@ func TestIntegration_ActivityReport_ValidType(t *testing.T) {
 	}
 }
 
-// TODO(#2151): Activity List filter matrix (type, source, since_secs, since_id, peer_id, include=peer_info, before_ts)
-// TODO(#2151): SessionSearch basic + empty query
-// TODO(#2151): Notify with attachments validation
+func TestIntegration_ActivityList_FilterByType(t *testing.T) {
+	conn := integrationDB_ActivityDelegationA2A(t)
+	wsID := seedWorkspace(t, conn, "test-2151-activity-filter")
+	seedActivityLog(t, conn, wsID, "agent_log", "method1", "ok", nil, nil)
+	seedActivityLog(t, conn, wsID, "a2a_receive", "method2", "ok", nil, nil)
+
+	h := NewActivityHandler(nil)
+	c, w := newTestGinContext()
+	c.Params = gin.Params{{Key: "id", Value: wsID}}
+	c.Request = httptest.NewRequest(http.MethodGet, "/workspaces/"+wsID+"/activity?type=agent_log", nil)
+	h.List(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("List returned %d, want 200", w.Code)
+	}
+	var resp []map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(resp) != 1 {
+		t.Fatalf("expected 1 activity, got %d", len(resp))
+	}
+	if resp[0]["activity_type"] != "agent_log" {
+		t.Fatalf("expected agent_log, got %v", resp[0]["activity_type"])
+	}
+}
+
+func TestIntegration_SessionSearch_Basic(t *testing.T) {
+	conn := integrationDB_ActivityDelegationA2A(t)
+	wsID := seedWorkspace(t, conn, "test-2151-session-search")
+	seedActivityLog(t, conn, wsID, "agent_log", "test_method", "ok", nil, nil)
+
+	h := NewActivityHandler(nil)
+	c, w := newTestGinContext()
+	c.Params = gin.Params{{Key: "id", Value: wsID}}
+	c.Request = httptest.NewRequest(http.MethodGet, "/workspaces/"+wsID+"/session?q=test", nil)
+	h.SessionSearch(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("SessionSearch returned %d, want 200", w.Code)
+	}
+	var resp []map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(resp) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(resp))
+	}
+}
+
+func TestIntegration_SessionSearch_EmptyQuery(t *testing.T) {
+	conn := integrationDB_ActivityDelegationA2A(t)
+	wsID := seedWorkspace(t, conn, "test-2151-session-empty")
+	seedActivityLog(t, conn, wsID, "agent_log", "method", "ok", nil, nil)
+
+	h := NewActivityHandler(nil)
+	c, w := newTestGinContext()
+	c.Params = gin.Params{{Key: "id", Value: wsID}}
+	c.Request = httptest.NewRequest(http.MethodGet, "/workspaces/"+wsID+"/session", nil)
+	h.SessionSearch(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("SessionSearch returned %d, want 200", w.Code)
+	}
+	var resp []map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(resp) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(resp))
+	}
+}
+
+func TestIntegration_Notify_Basic(t *testing.T) {
+	conn := integrationDB_ActivityDelegationA2A(t)
+	wsID := seedWorkspace(t, conn, "test-2151-notify-basic")
+
+	h := NewActivityHandler(noOpEmitter{})
+	c, w := newTestGinContext()
+	c.Params = gin.Params{{Key: "id", Value: wsID}}
+	c.Request = httptest.NewRequest(http.MethodPost, "/workspaces/"+wsID+"/notify", strings.NewReader(`{
+		"message": "hello user"
+	}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	h.Notify(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("Notify returned %d, want 200", w.Code)
+	}
+	var count int
+	if err := conn.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM activity_logs WHERE workspace_id = $1 AND method = 'notify'`, wsID).Scan(&count); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected 1 notify row, got %d", count)
+	}
+}
+
+func TestIntegration_Notify_InvalidAttachment(t *testing.T) {
+	conn := integrationDB_ActivityDelegationA2A(t)
+	wsID := seedWorkspace(t, conn, "test-2151-notify-attach")
+
+	h := NewActivityHandler(noOpEmitter{})
+	c, w := newTestGinContext()
+	c.Params = gin.Params{{Key: "id", Value: wsID}}
+	c.Request = httptest.NewRequest(http.MethodPost, "/workspaces/"+wsID+"/notify", strings.NewReader(`{
+		"message": "hi",
+		"attachments": [{"uri":"","name":""}]
+	}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	h.Notify(c)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("Notify with empty attachment returned %d, want 400", w.Code)
+	}
+}
+
+// TODO(#2151): Activity List full filter matrix (source, since_secs, since_id, peer_id, include=peer_info, before_ts)
 
 // ---------- Delegation handler integration tests ----------
 
@@ -237,9 +352,253 @@ func TestIntegration_DelegationList_Basic(t *testing.T) {
 	}
 }
 
-// TODO(#2151): Delegate endpoint (idempotency, self-delegation guard, success path)
-// TODO(#2151): Record endpoint
-// TODO(#2151): UpdateStatus endpoint
+func TestIntegration_Delegate_SelfDelegationGuard(t *testing.T) {
+	conn := integrationDB_ActivityDelegationA2A(t)
+	wsID := seedWorkspace(t, conn, "test-2151-delegate-self")
+
+	wh := &WorkspaceHandler{broadcaster: noOpEmitter{}}
+	dh := NewDelegationHandler(wh, noOpEmitter{})
+	c, w := newTestGinContext()
+	c.Params = gin.Params{{Key: "id", Value: wsID}}
+	c.Request = httptest.NewRequest(http.MethodPost, "/workspaces/"+wsID+"/delegate", strings.NewReader(`{
+		"target_id": "`+wsID+`",
+		"task": "do something"
+	}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	dh.Delegate(c)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("Delegate self-delegation returned %d, want 400", w.Code)
+	}
+}
+
+func TestIntegration_Delegate_Idempotency(t *testing.T) {
+	conn := integrationDB_ActivityDelegationA2A(t)
+	wsID := seedWorkspace(t, conn, "test-2151-delegate-idem")
+	targetID := seedWorkspace(t, conn, "test-2151-delegate-idem-target")
+
+	taskJSON, _ := json.Marshal(map[string]interface{}{"task": "hello", "delegation_id": "del-idem-1"})
+	respJSON, _ := json.Marshal(map[string]interface{}{"delegation_id": "del-idem-1"})
+	if _, err := conn.ExecContext(context.Background(), `
+		INSERT INTO activity_logs (workspace_id, activity_type, method, source_id, target_id, summary, request_body, response_body, status, idempotency_key)
+		VALUES ($1, 'delegation', 'delegate', $1, $2, 'Delegating to test', $3::jsonb, $4::jsonb, 'pending', 'idem-key-delegate')
+	`, wsID, targetID, string(taskJSON), string(respJSON)); err != nil {
+		t.Fatalf("seed idempotent delegation: %v", err)
+	}
+
+	wh := &WorkspaceHandler{broadcaster: noOpEmitter{}}
+	dh := NewDelegationHandler(wh, noOpEmitter{})
+	c, w := newTestGinContext()
+	c.Params = gin.Params{{Key: "id", Value: wsID}}
+	c.Request = httptest.NewRequest(http.MethodPost, "/workspaces/"+wsID+"/delegate", strings.NewReader(`{
+		"target_id": "`+targetID+`",
+		"task": "do something",
+		"idempotency_key": "idem-key-delegate"
+	}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	dh.Delegate(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("Delegate idempotency returned %d, want 200", w.Code)
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp["idempotent_hit"] != true {
+		t.Fatalf("expected idempotent_hit=true, got %v", resp["idempotent_hit"])
+	}
+	if resp["delegation_id"] != "del-idem-1" {
+		t.Fatalf("expected delegation_id=del-idem-1, got %v", resp["delegation_id"])
+	}
+}
+
+func TestIntegration_Delegate_SuccessPath(t *testing.T) {
+	conn := integrationDB_ActivityDelegationA2A(t)
+	wsID := seedWorkspace(t, conn, "test-2151-delegate-ok")
+	targetID := seedWorkspace(t, conn, "test-2151-delegate-ok-target")
+
+	wh := &WorkspaceHandler{broadcaster: noOpEmitter{}}
+	dh := NewDelegationHandler(wh, noOpEmitter{})
+	c, w := newTestGinContext()
+	c.Params = gin.Params{{Key: "id", Value: wsID}}
+	c.Request = httptest.NewRequest(http.MethodPost, "/workspaces/"+wsID+"/delegate", strings.NewReader(`{
+		"target_id": "`+targetID+`",
+		"task": "do something"
+	}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	dh.Delegate(c)
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("Delegate returned %d, want 202", w.Code)
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	delegationID, ok := resp["delegation_id"].(string)
+	if !ok || delegationID == "" {
+		t.Fatal("expected non-empty delegation_id")
+	}
+
+	// Verify a row exists for this delegation (status may have been updated by the background goroutine)
+	var count int
+	if err := conn.QueryRowContext(context.Background(), `
+		SELECT COUNT(*) FROM activity_logs
+		WHERE workspace_id = $1 AND method = 'delegate' AND request_body->>'delegation_id' = $2
+	`, wsID, delegationID).Scan(&count); err != nil {
+		t.Fatalf("select delegation row: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected 1 delegation row, got %d", count)
+	}
+
+	// Drain the background goroutine so it doesn't race with the next test's db.DB swap
+	wh.waitAsyncForTest()
+}
+
+func TestIntegration_Record_Basic(t *testing.T) {
+	conn := integrationDB_ActivityDelegationA2A(t)
+	wsID := seedWorkspace(t, conn, "test-2151-record-basic")
+	targetID := seedWorkspace(t, conn, "test-2151-record-target")
+
+	wh := &WorkspaceHandler{broadcaster: noOpEmitter{}}
+	dh := NewDelegationHandler(wh, noOpEmitter{})
+	c, w := newTestGinContext()
+	c.Params = gin.Params{{Key: "id", Value: wsID}}
+	c.Request = httptest.NewRequest(http.MethodPost, "/workspaces/"+wsID+"/delegations/record", strings.NewReader(`{
+		"target_id": "`+targetID+`",
+		"task": "recorded task",
+		"delegation_id": "del-record-1"
+	}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	dh.Record(c)
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("Record returned %d, want 202", w.Code)
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp["status"] != "recorded" {
+		t.Fatalf("expected status recorded, got %v", resp["status"])
+	}
+
+	var status string
+	if err := conn.QueryRowContext(context.Background(), `
+		SELECT status FROM activity_logs
+		WHERE workspace_id = $1 AND method = 'delegate' AND request_body->>'delegation_id' = 'del-record-1'
+	`, wsID).Scan(&status); err != nil {
+		t.Fatalf("select record row: %v", err)
+	}
+	if status != "dispatched" {
+		t.Fatalf("expected status dispatched, got %s", status)
+	}
+}
+
+func TestIntegration_UpdateStatus_Completed(t *testing.T) {
+	conn := integrationDB_ActivityDelegationA2A(t)
+	wsID := seedWorkspace(t, conn, "test-2151-update-completed")
+	targetID := seedWorkspace(t, conn, "test-2151-update-completed-target")
+
+	taskJSON, _ := json.Marshal(map[string]interface{}{"task": "hello", "delegation_id": "del-update-1"})
+	respJSON, _ := json.Marshal(map[string]interface{}{"delegation_id": "del-update-1"})
+	if _, err := conn.ExecContext(context.Background(), `
+		INSERT INTO activity_logs (workspace_id, activity_type, method, source_id, target_id, summary, request_body, response_body, status)
+		VALUES ($1, 'delegation', 'delegate', $1, $2, 'Delegating to test', $3::jsonb, $4::jsonb, 'dispatched')
+	`, wsID, targetID, string(taskJSON), string(respJSON)); err != nil {
+		t.Fatalf("seed delegation: %v", err)
+	}
+
+	wh := &WorkspaceHandler{broadcaster: noOpEmitter{}}
+	dh := NewDelegationHandler(wh, noOpEmitter{})
+	c, w := newTestGinContext()
+	c.Params = gin.Params{{Key: "id", Value: wsID}, {Key: "delegation_id", Value: "del-update-1"}}
+	c.Request = httptest.NewRequest(http.MethodPost, "/workspaces/"+wsID+"/delegations/del-update-1/update", strings.NewReader(`{
+		"status": "completed",
+		"response_preview": "done"
+	}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	dh.UpdateStatus(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("UpdateStatus returned %d, want 200", w.Code)
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp["status"] != "completed" {
+		t.Fatalf("expected status completed, got %v", resp["status"])
+	}
+
+	var status string
+	if err := conn.QueryRowContext(context.Background(), `
+		SELECT status FROM activity_logs
+		WHERE workspace_id = $1 AND method = 'delegate' AND request_body->>'delegation_id' = 'del-update-1'
+	`, wsID).Scan(&status); err != nil {
+		t.Fatalf("select: %v", err)
+	}
+	if status != "completed" {
+		t.Fatalf("expected status completed, got %s", status)
+	}
+
+	var count int
+	if err := conn.QueryRowContext(context.Background(), `
+		SELECT COUNT(*) FROM activity_logs
+		WHERE workspace_id = $1 AND method = 'delegate_result' AND status = 'completed'
+	`, wsID).Scan(&count); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected 1 delegate_result row, got %d", count)
+	}
+}
+
+func TestIntegration_UpdateStatus_Failed(t *testing.T) {
+	conn := integrationDB_ActivityDelegationA2A(t)
+	wsID := seedWorkspace(t, conn, "test-2151-update-failed")
+	targetID := seedWorkspace(t, conn, "test-2151-update-failed-target")
+
+	taskJSON, _ := json.Marshal(map[string]interface{}{"task": "hello", "delegation_id": "del-update-fail-1"})
+	respJSON, _ := json.Marshal(map[string]interface{}{"delegation_id": "del-update-fail-1"})
+	if _, err := conn.ExecContext(context.Background(), `
+		INSERT INTO activity_logs (workspace_id, activity_type, method, source_id, target_id, summary, request_body, response_body, status)
+		VALUES ($1, 'delegation', 'delegate', $1, $2, 'Delegating to test', $3::jsonb, $4::jsonb, 'dispatched')
+	`, wsID, targetID, string(taskJSON), string(respJSON)); err != nil {
+		t.Fatalf("seed delegation: %v", err)
+	}
+
+	wh := &WorkspaceHandler{broadcaster: noOpEmitter{}}
+	dh := NewDelegationHandler(wh, noOpEmitter{})
+	c, w := newTestGinContext()
+	c.Params = gin.Params{{Key: "id", Value: wsID}, {Key: "delegation_id", Value: "del-update-fail-1"}}
+	c.Request = httptest.NewRequest(http.MethodPost, "/workspaces/"+wsID+"/delegations/del-update-fail-1/update", strings.NewReader(`{
+		"status": "failed",
+		"error": "something went wrong"
+	}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	dh.UpdateStatus(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("UpdateStatus returned %d, want 200", w.Code)
+	}
+
+	var status string
+	if err := conn.QueryRowContext(context.Background(), `
+		SELECT status FROM activity_logs
+		WHERE workspace_id = $1 AND method = 'delegate' AND request_body->>'delegation_id' = 'del-update-fail-1'
+	`, wsID).Scan(&status); err != nil {
+		t.Fatalf("select: %v", err)
+	}
+	if status != "failed" {
+		t.Fatalf("expected status failed, got %s", status)
+	}
+}
+
+// TODO(#2151): Activity List remaining filters (source, since_secs, since_id, peer_id, include=peer_info, before_ts)
+// TODO(#2151): A2A Queue Status endpoint (auth rules, 404 vs 403, response body inclusion)
 
 // ---------- A2A Queue integration tests ----------
 
