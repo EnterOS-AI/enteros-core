@@ -53,8 +53,11 @@ class TestQaReviewDirectTrigger:
     def test_job_guard_requires_approved_state(self):
         wf = load_workflow("qa-review.yml")
         guard = _job_guard_string(wf)
-        assert "github.event.review.state == 'APPROVED'" in guard or "github.event.review.state == 'approved'" in guard, (
-            "job guard must check review.state for APPROVED"
+        assert "github.event.review.state == 'APPROVED'" in guard, (
+            "job guard must check review.state for 'APPROVED'"
+        )
+        assert "github.event.review.state == 'approved'" in guard, (
+            "job guard must check review.state for 'approved' (case fallback per #2135)"
         )
 
     def test_post_step_uses_status_post_token(self):
@@ -91,8 +94,11 @@ class TestSecurityReviewDirectTrigger:
     def test_job_guard_requires_approved_state(self):
         wf = load_workflow("security-review.yml")
         guard = _job_guard_string(wf)
-        assert "github.event.review.state == 'APPROVED'" in guard or "github.event.review.state == 'approved'" in guard, (
-            "job guard must check review.state for APPROVED"
+        assert "github.event.review.state == 'APPROVED'" in guard, (
+            "job guard must check review.state for 'APPROVED'"
+        )
+        assert "github.event.review.state == 'approved'" in guard, (
+            "job guard must check review.state for 'approved' (case fallback per #2135)"
         )
 
     def test_post_step_uses_status_post_token(self):
@@ -110,6 +116,20 @@ class TestSecurityReviewDirectTrigger:
         run = post.get("run", "")
         assert '"security-review / approved (pull_request_target)"' in run, (
             "POST step must emit exact BP-required context name"
+        )
+
+
+class TestRefireScriptContextName:
+    """review-refire-status.sh must emit the BP-required (pull_request_target) context."""
+
+    def test_refire_script_context_is_pull_request_target(self):
+        script = ROOT / "scripts" / "review-refire-status.sh"
+        content = script.read_text()
+        assert 'CONTEXT="${TEAM}-review / approved (pull_request_target)"' in content, (
+            "refire script CONTEXT must be the exact BP-required (pull_request_target) variant"
+        )
+        assert 'approved (pull_request)"' not in content, (
+            "refire script must NOT post bare (pull_request) context"
         )
 
 

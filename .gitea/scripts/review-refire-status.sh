@@ -13,7 +13,9 @@ set -euo pipefail
 OWNER="${REPO%%/*}"
 NAME="${REPO##*/}"
 API="https://${GITEA_HOST}/api/v1"
-CONTEXT="${TEAM}-review / approved (pull_request)"
+# Branch-protection requires the (pull_request_target) context variant.
+# The refire path must post the EXACT BP-required name so the gate flips.
+CONTEXT="${TEAM}-review / approved (pull_request_target)"
 TARGET_URL="https://${GITEA_HOST}/${OWNER}/${NAME}/pulls/${PR_NUMBER}"
 
 authfile=$(mktemp)
