@@ -130,11 +130,8 @@ func TestPatchAbilities_BothFields(t *testing.T) {
 	mock.ExpectQuery(`SELECT EXISTS\(SELECT 1 FROM workspaces WHERE id = \$1 AND status != 'removed'\)`).
 		WithArgs(wsUUID1).
 		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
-	mock.ExpectExec(`UPDATE workspaces SET broadcast_enabled = \$2, updated_at = now\(\) WHERE id = \$1`).
-		WithArgs(wsUUID1, true).
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec(`UPDATE workspaces SET talk_to_user_enabled = \$2, updated_at = now\(\) WHERE id = \$1`).
-		WithArgs(wsUUID1, true).
+	mock.ExpectExec(`UPDATE workspaces SET broadcast_enabled = \$2, talk_to_user_enabled = \$3, updated_at = now\(\) WHERE id = \$1`).
+		WithArgs(wsUUID1, true, true).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	w := patchAbilitiesReq(t, wsUUID1, `{"broadcast_enabled":true,"talk_to_user_enabled":true}`)
@@ -182,19 +179,25 @@ func TestPatchAbilities_TalkToUserUpdateError(t *testing.T) {
 	}
 }
 
-func TestPatchAbilities_BothFields_BroadcastFails(t *testing.T) {
+// TestPatchAbilities_BothFields_UpdateError — regression for #2131. When
+// both fields are supplied the handler uses a single combined UPDATE. A
+// failure of that UPDATE must leave the workspace unchanged (atomic).
+func TestPatchAbilities_BothFields_UpdateError(t *testing.T) {
 	mock, cleanup := withMockDB(t)
 	defer cleanup()
 
 	mock.ExpectQuery(`SELECT EXISTS\(SELECT 1 FROM workspaces WHERE id = \$1 AND status != 'removed'\)`).
 		WithArgs(wsUUID1).
 		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
-	mock.ExpectExec(`UPDATE workspaces SET broadcast_enabled = \$2, updated_at = now\(\) WHERE id = \$1`).
-		WithArgs(wsUUID1, true).
+	mock.ExpectExec(`UPDATE workspaces SET broadcast_enabled = \$2, talk_to_user_enabled = \$3, updated_at = now\(\) WHERE id = \$1`).
+		WithArgs(wsUUID1, true, true).
 		WillReturnError(errors.New("disk full"))
 
 	w := patchAbilitiesReq(t, wsUUID1, `{"broadcast_enabled":true,"talk_to_user_enabled":true}`)
 	if w.Code != http.StatusInternalServerError {
 		t.Fatalf("expected 500, got %d: %s", w.Code, w.Body.String())
 	}
+	// Because only one UPDATE is issued, there is no partial-mutation
+	// path to assert against; sqlmock implicitly verifies no second
+	// exec occurred.
 }
