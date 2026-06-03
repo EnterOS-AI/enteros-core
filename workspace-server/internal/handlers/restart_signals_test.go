@@ -275,13 +275,14 @@ func TestGracefulPreRestart_URLResolutionError(t *testing.T) {
 		WorkspaceHandler: newHandlerWithTestDeps(t),
 		errToReturn:      context.DeadlineExceeded,
 	}
-	// Register async wait FIRST so LIFO order is: db restore → Redis → async wait.
-	// This ensures goroutines (which access both DB and Redis) complete before
+	_ = setupTestDB(t)
+	_ = setupTestRedis(t) // empty → URL resolution will fail in resolveAgentURLForRestartSignal
+
+	// Must be registered AFTER setupTestDB so LIFO order is: async wait → db.DB restore.
+	// This ensures goroutines (which access both DB and Redis) are drained before
 	// any cleanup fires. setupTestRedis comes after newHandlerWithTestDeps
 	// so the handler holds the correct Redis client reference.
 	waitForHandlerAsyncBeforeDBCleanup(t, hWrapper.WorkspaceHandler)
-	_ = setupTestDB(t)
-	_ = setupTestRedis(t) // empty → URL resolution will fail in resolveAgentURLForRestartSignal
 
 	hWrapper.gracefulPreRestart(context.Background(), "ws-url-err-111")
 	time.Sleep(200 * time.Millisecond)
