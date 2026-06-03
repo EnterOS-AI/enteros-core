@@ -25,6 +25,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -316,7 +317,263 @@ func TestIntegration_Notify_InvalidAttachment(t *testing.T) {
 	}
 }
 
-// TODO(#2151): Activity List full filter matrix (source, since_secs, since_id, peer_id, include=peer_info, before_ts)
+func TestIntegration_ActivityList_FilterBySourceCanvas(t *testing.T) {
+	conn := integrationDB_ActivityDelegationA2A(t)
+	wsID := seedWorkspace(t, conn, "test-2151-source-canvas")
+	seedActivityLog(t, conn, wsID, "agent_log", "m1", "ok", nil, nil)           // canvas (source_id IS NULL)
+	peerID := seedWorkspace(t, conn, "test-2151-peer-canvas")
+	seedActivityLog(t, conn, wsID, "a2a_receive", "m2", "ok", &peerID, nil) // agent
+
+	h := NewActivityHandler(nil)
+	c, w := newTestGinContext()
+	c.Params = gin.Params{{Key: "id", Value: wsID}}
+	c.Request = httptest.NewRequest(http.MethodGet, "/workspaces/"+wsID+"/activity?source=canvas", nil)
+	h.List(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("List returned %d, want 200", w.Code)
+	}
+	var resp []map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(resp) != 1 {
+		t.Fatalf("expected 1 canvas row, got %d", len(resp))
+	}
+	if resp[0]["method"] != "m1" {
+		t.Fatalf("expected method m1, got %v", resp[0]["method"])
+	}
+}
+
+func TestIntegration_ActivityList_FilterBySourceAgent(t *testing.T) {
+	conn := integrationDB_ActivityDelegationA2A(t)
+	wsID := seedWorkspace(t, conn, "test-2151-source-agent")
+	seedActivityLog(t, conn, wsID, "agent_log", "m1", "ok", nil, nil)
+	peerID := seedWorkspace(t, conn, "test-2151-peer-agent")
+	seedActivityLog(t, conn, wsID, "a2a_receive", "m2", "ok", &peerID, nil)
+
+	h := NewActivityHandler(nil)
+	c, w := newTestGinContext()
+	c.Params = gin.Params{{Key: "id", Value: wsID}}
+	c.Request = httptest.NewRequest(http.MethodGet, "/workspaces/"+wsID+"/activity?source=agent", nil)
+	h.List(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("List returned %d, want 200", w.Code)
+	}
+	var resp []map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(resp) != 1 {
+		t.Fatalf("expected 1 agent row, got %d", len(resp))
+	}
+	if resp[0]["method"] != "m2" {
+		t.Fatalf("expected method m2, got %v", resp[0]["method"])
+	}
+}
+
+func TestIntegration_ActivityList_InvalidSource(t *testing.T) {
+	conn := integrationDB_ActivityDelegationA2A(t)
+	wsID := seedWorkspace(t, conn, "test-2151-invalid-source")
+
+	h := NewActivityHandler(nil)
+	c, w := newTestGinContext()
+	c.Params = gin.Params{{Key: "id", Value: wsID}}
+	c.Request = httptest.NewRequest(http.MethodGet, "/workspaces/"+wsID+"/activity?source=invalid", nil)
+	h.List(c)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("List returned %d, want 400", w.Code)
+	}
+}
+
+func TestIntegration_ActivityList_SinceSecs(t *testing.T) {
+	conn := integrationDB_ActivityDelegationA2A(t)
+	wsID := seedWorkspace(t, conn, "test-2151-since-secs")
+	seedActivityLog(t, conn, wsID, "agent_log", "old", "ok", nil, nil)
+
+	h := NewActivityHandler(nil)
+	c, w := newTestGinContext()
+	c.Params = gin.Params{{Key: "id", Value: wsID}}
+	c.Request = httptest.NewRequest(http.MethodGet, "/workspaces/"+wsID+"/activity?since_secs=1", nil)
+	h.List(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("List returned %d, want 200", w.Code)
+	}
+	var resp []map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	// The seed row was inserted just now, so it should be within 1 second.
+	if len(resp) != 1 {
+		t.Fatalf("expected 1 row within 1s, got %d", len(resp))
+	}
+}
+
+func TestIntegration_ActivityList_SinceIDCursor(t *testing.T) {
+	conn := integrationDB_ActivityDelegationA2A(t)
+	wsID := seedWorkspace(t, conn, "test-2151-since-id")
+	id1 := seedActivityLog(t, conn, wsID, "agent_log", "first", "ok", nil, nil)
+	seedActivityLog(t, conn, wsID, "agent_log", "second", "ok", nil, nil)
+
+	h := NewActivityHandler(nil)
+	c, w := newTestGinContext()
+	c.Params = gin.Params{{Key: "id", Value: wsID}}
+	c.Request = httptest.NewRequest(http.MethodGet, "/workspaces/"+wsID+"/activity?since_id="+id1, nil)
+	h.List(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("List returned %d, want 200", w.Code)
+	}
+	var resp []map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(resp) != 1 {
+		t.Fatalf("expected 1 row after cursor, got %d", len(resp))
+	}
+	if resp[0]["method"] != "second" {
+		t.Fatalf("expected method 'second', got %v", resp[0]["method"])
+	}
+}
+
+func TestIntegration_ActivityList_SinceIDCursorGone(t *testing.T) {
+	conn := integrationDB_ActivityDelegationA2A(t)
+	wsID := seedWorkspace(t, conn, "test-2151-since-id-gone")
+	otherWS := seedWorkspace(t, conn, "test-2151-other-cursor")
+	cursorID := seedActivityLog(t, conn, otherWS, "agent_log", "cursor", "ok", nil, nil)
+
+	h := NewActivityHandler(nil)
+	c, w := newTestGinContext()
+	c.Params = gin.Params{{Key: "id", Value: wsID}}
+	c.Request = httptest.NewRequest(http.MethodGet, "/workspaces/"+wsID+"/activity?since_id="+cursorID, nil)
+	h.List(c)
+
+	if w.Code != http.StatusGone {
+		t.Fatalf("List returned %d, want 410", w.Code)
+	}
+}
+
+func TestIntegration_ActivityList_PeerID(t *testing.T) {
+	conn := integrationDB_ActivityDelegationA2A(t)
+	wsID := seedWorkspace(t, conn, "test-2151-peer-id")
+	peerID := seedWorkspace(t, conn, "test-2151-peer-target")
+	seedActivityLog(t, conn, wsID, "agent_log", "no-peer", "ok", nil, nil)
+	seedActivityLog(t, conn, wsID, "a2a_send", "peer-source", "ok", &peerID, nil)
+	seedActivityLog(t, conn, wsID, "a2a_receive", "peer-target", "ok", nil, &peerID)
+
+	h := NewActivityHandler(nil)
+	c, w := newTestGinContext()
+	c.Params = gin.Params{{Key: "id", Value: wsID}}
+	c.Request = httptest.NewRequest(http.MethodGet, "/workspaces/"+wsID+"/activity?peer_id="+peerID, nil)
+	h.List(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("List returned %d, want 200", w.Code)
+	}
+	var resp []map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(resp) != 2 {
+		t.Fatalf("expected 2 peer rows, got %d", len(resp))
+	}
+}
+
+func TestIntegration_ActivityList_InvalidPeerID(t *testing.T) {
+	conn := integrationDB_ActivityDelegationA2A(t)
+	wsID := seedWorkspace(t, conn, "test-2151-invalid-peer")
+
+	h := NewActivityHandler(nil)
+	c, w := newTestGinContext()
+	c.Params = gin.Params{{Key: "id", Value: wsID}}
+	c.Request = httptest.NewRequest(http.MethodGet, "/workspaces/"+wsID+"/activity?peer_id=not-a-uuid", nil)
+	h.List(c)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("List returned %d, want 400", w.Code)
+	}
+}
+
+func TestIntegration_ActivityList_IncludePeerInfo(t *testing.T) {
+	conn := integrationDB_ActivityDelegationA2A(t)
+	wsID := seedWorkspace(t, conn, "test-2151-include-peer")
+	peerID := seedWorkspace(t, conn, "test-2151-peer-enriched")
+	seedActivityLog(t, conn, wsID, "a2a_receive", "m1", "ok", &peerID, nil)
+
+	h := NewActivityHandler(nil)
+	c, w := newTestGinContext()
+	c.Params = gin.Params{{Key: "id", Value: wsID}}
+	c.Request = httptest.NewRequest(http.MethodGet, "/workspaces/"+wsID+"/activity?include=peer_info", nil)
+	h.List(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("List returned %d, want 200", w.Code)
+	}
+	var resp []map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(resp) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(resp))
+	}
+	if _, ok := resp[0]["peer_name"]; !ok {
+		t.Fatalf("expected peer_name in response")
+	}
+	if _, ok := resp[0]["peer_role"]; !ok {
+		t.Fatalf("expected peer_role in response")
+	}
+}
+
+func TestIntegration_ActivityList_BeforeTS(t *testing.T) {
+	conn := integrationDB_ActivityDelegationA2A(t)
+	wsID := seedWorkspace(t, conn, "test-2151-before-ts")
+	seedActivityLog(t, conn, wsID, "agent_log", "old", "ok", nil, nil)
+
+	// Wait a tiny bit so the next row has a different timestamp
+	time.Sleep(50 * time.Millisecond)
+	seedActivityLog(t, conn, wsID, "agent_log", "new", "ok", nil, nil)
+
+	// Use the current time as before_ts — only the "old" row should appear
+	beforeTS := time.Now().UTC().Add(-10 * time.Millisecond).Format(time.RFC3339)
+
+	h := NewActivityHandler(nil)
+	c, w := newTestGinContext()
+	c.Params = gin.Params{{Key: "id", Value: wsID}}
+	c.Request = httptest.NewRequest(http.MethodGet, "/workspaces/"+wsID+"/activity?before_ts="+url.QueryEscape(beforeTS), nil)
+	h.List(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("List returned %d, want 200", w.Code)
+	}
+	var resp []map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(resp) != 1 {
+		t.Fatalf("expected 1 row before ts, got %d", len(resp))
+	}
+	if resp[0]["method"] != "old" {
+		t.Fatalf("expected method 'old', got %v", resp[0]["method"])
+	}
+}
+
+func TestIntegration_ActivityList_InvalidBeforeTS(t *testing.T) {
+	conn := integrationDB_ActivityDelegationA2A(t)
+	wsID := seedWorkspace(t, conn, "test-2151-invalid-before")
+
+	h := NewActivityHandler(nil)
+	c, w := newTestGinContext()
+	c.Params = gin.Params{{Key: "id", Value: wsID}}
+	c.Request = httptest.NewRequest(http.MethodGet, "/workspaces/"+wsID+"/activity?before_ts=not-a-timestamp", nil)
+	h.List(c)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("List returned %d, want 400", w.Code)
+	}
+}
 
 // ---------- Delegation handler integration tests ----------
 
@@ -597,9 +854,6 @@ func TestIntegration_UpdateStatus_Failed(t *testing.T) {
 	}
 }
 
-// TODO(#2151): Activity List remaining filters (source, since_secs, since_id, peer_id, include=peer_info, before_ts)
-// TODO(#2151): A2A Queue Status endpoint (auth rules, 404 vs 403, response body inclusion)
-
 // ---------- A2A Queue integration tests ----------
 
 func TestIntegration_A2AQueue_EnqueueAndDepth(t *testing.T) {
@@ -628,10 +882,13 @@ func TestIntegration_A2AQueue_EnqueueAndDepth(t *testing.T) {
 		t.Fatalf("expected status queued, got %s", status)
 	}
 
-	// Verify depth
-	d := QueueDepth(context.Background(), wsID)
+	// Verify depth via direct query (QueueDepth helper removed in dead-code sweep)
+	var d int
+	if err := conn.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM a2a_queue WHERE workspace_id = $1 AND status = 'queued'`, wsID).Scan(&d); err != nil {
+		t.Fatalf("depth count: %v", err)
+	}
 	if d != 1 {
-		t.Fatalf("expected QueueDepth 1, got %d", d)
+		t.Fatalf("expected queue depth 1, got %d", d)
 	}
 }
 
@@ -748,4 +1005,132 @@ func TestIntegration_A2AQueue_DropStaleQueueItems(t *testing.T) {
 	}
 }
 
-// TODO(#2151): A2A Queue Status endpoint (auth rules, 404 vs 403, response body inclusion)
+// ---------- A2A Queue Status endpoint integration tests ----------
+
+func TestIntegration_A2AQueueStatus_CallerMatchesCallerID(t *testing.T) {
+	conn := integrationDB_ActivityDelegationA2A(t)
+	wsID := seedWorkspace(t, conn, "test-2151-status-caller-ws")
+	callerID := seedWorkspace(t, conn, "test-2151-status-caller")
+	body := []byte(`{"test":true}`)
+	qid := seedA2AQueueItem(t, conn, wsID, callerID, PriorityTask, body, "queued")
+
+	wh := &WorkspaceHandler{broadcaster: noOpEmitter{}}
+	c, w := newTestGinContext()
+	c.Params = gin.Params{{Key: "id", Value: wsID}, {Key: "queue_id", Value: qid}}
+	c.Request.Header.Set("X-Workspace-ID", callerID)
+	wh.GetA2AQueueStatus(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("GetA2AQueueStatus returned %d, want 200", w.Code)
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp["queue_id"] != qid {
+		t.Fatalf("expected queue_id %s, got %v", qid, resp["queue_id"])
+	}
+	// Verify sensitive fields excluded
+	if _, ok := resp["body"]; ok {
+		t.Fatal("response should not include body")
+	}
+	if _, ok := resp["caller_id"]; ok {
+		t.Fatal("response should not include caller_id")
+	}
+}
+
+func TestIntegration_A2AQueueStatus_CallerMatchesWorkspaceID(t *testing.T) {
+	conn := integrationDB_ActivityDelegationA2A(t)
+	wsID := seedWorkspace(t, conn, "test-2151-status-ws")
+	callerID := seedWorkspace(t, conn, "test-2151-status-ws-caller")
+	body := []byte(`{"test":true}`)
+	qid := seedA2AQueueItem(t, conn, wsID, callerID, PriorityTask, body, "queued")
+
+	wh := &WorkspaceHandler{broadcaster: noOpEmitter{}}
+	c, w := newTestGinContext()
+	c.Params = gin.Params{{Key: "id", Value: wsID}, {Key: "queue_id", Value: qid}}
+	c.Request.Header.Set("X-Workspace-ID", wsID)
+	wh.GetA2AQueueStatus(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("GetA2AQueueStatus returned %d, want 200", w.Code)
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp["queue_id"] != qid {
+		t.Fatalf("expected queue_id %s, got %v", qid, resp["queue_id"])
+	}
+}
+
+func TestIntegration_A2AQueueStatus_OrgTokenBypass(t *testing.T) {
+	conn := integrationDB_ActivityDelegationA2A(t)
+	wsID := seedWorkspace(t, conn, "test-2151-status-org")
+	callerID := seedWorkspace(t, conn, "test-2151-status-org-caller")
+	body := []byte(`{"test":true}`)
+	qid := seedA2AQueueItem(t, conn, wsID, callerID, PriorityTask, body, "queued")
+
+	wh := &WorkspaceHandler{broadcaster: noOpEmitter{}}
+	c, w := newTestGinContext()
+	c.Params = gin.Params{{Key: "id", Value: wsID}, {Key: "queue_id", Value: qid}}
+	c.Set("org_token_id", "test-org-token")
+	wh.GetA2AQueueStatus(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("GetA2AQueueStatus returned %d, want 200", w.Code)
+	}
+}
+
+func TestIntegration_A2AQueueStatus_MismatchedCaller(t *testing.T) {
+	conn := integrationDB_ActivityDelegationA2A(t)
+	wsID := seedWorkspace(t, conn, "test-2151-status-mismatch-ws")
+	callerID := seedWorkspace(t, conn, "test-2151-status-mismatch-caller")
+	otherWS := seedWorkspace(t, conn, "test-2151-status-mismatch-other")
+	body := []byte(`{"test":true}`)
+	qid := seedA2AQueueItem(t, conn, wsID, callerID, PriorityTask, body, "queued")
+
+	wh := &WorkspaceHandler{broadcaster: noOpEmitter{}}
+	c, w := newTestGinContext()
+	c.Params = gin.Params{{Key: "id", Value: wsID}, {Key: "queue_id", Value: qid}}
+	c.Request.Header.Set("X-Workspace-ID", otherWS)
+	wh.GetA2AQueueStatus(c)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("GetA2AQueueStatus returned %d, want 404", w.Code)
+	}
+}
+
+func TestIntegration_A2AQueueStatus_MissingIdentity(t *testing.T) {
+	conn := integrationDB_ActivityDelegationA2A(t)
+	wsID := seedWorkspace(t, conn, "test-2151-status-no-id")
+	callerID := seedWorkspace(t, conn, "test-2151-status-no-id-caller")
+	body := []byte(`{"test":true}`)
+	qid := seedA2AQueueItem(t, conn, wsID, callerID, PriorityTask, body, "queued")
+
+	wh := &WorkspaceHandler{broadcaster: noOpEmitter{}}
+	c, w := newTestGinContext()
+	c.Params = gin.Params{{Key: "id", Value: wsID}, {Key: "queue_id", Value: qid}}
+	// No X-Workspace-ID, no org_token_id
+	wh.GetA2AQueueStatus(c)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("GetA2AQueueStatus returned %d, want 404", w.Code)
+	}
+}
+
+func TestIntegration_A2AQueueStatus_NonExistentQueueID(t *testing.T) {
+	conn := integrationDB_ActivityDelegationA2A(t)
+	wsID := seedWorkspace(t, conn, "test-2151-status-missing")
+	callerID := seedWorkspace(t, conn, "test-2151-status-missing-caller")
+
+	wh := &WorkspaceHandler{broadcaster: noOpEmitter{}}
+	c, w := newTestGinContext()
+	c.Params = gin.Params{{Key: "id", Value: wsID}, {Key: "queue_id", Value: uuid.New().String()}}
+	c.Request.Header.Set("X-Workspace-ID", callerID)
+	wh.GetA2AQueueStatus(c)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("GetA2AQueueStatus returned %d, want 404", w.Code)
+	}
+}
