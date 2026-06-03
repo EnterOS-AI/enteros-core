@@ -88,8 +88,9 @@ jobs:
     # surprises and keeps the routing rule discoverable in one place.
     runs-on: docker-host
     # mc#1982 Phase 3 (RFC §1): surface broken workflows without blocking.
-    # mc#1982: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
-    continue-on-error: true
+    # mc#1982: mask removed. If regressions appear, root-fix the underlying
+    # test — do NOT renew the mask silently.
+    continue-on-error: false
     outputs:
       handlers: ${{ steps.filter.outputs.handlers }}
     steps:
@@ -119,8 +120,9 @@ jobs:
     # exists). See detect-changes for the full routing rationale.
     runs-on: docker-host
     # mc#1982 Phase 3 (RFC §1): surface broken workflows without blocking.
-    # mc#1982: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
-    continue-on-error: true
+    # mc#1982: mask removed. If regressions appear, root-fix the underlying
+    # test — do NOT renew the mask silently.
+    continue-on-error: false
     env:
       # Unique name per run so concurrent jobs don't collide on the
       # bridge network. ${RUN_ID}-${RUN_ATTEMPT} is unique even across
