@@ -136,13 +136,13 @@ func integrationDB(t *testing.T) *sql.DB {
 }
 
 // insertWorkspace inserts a workspace row and returns its UUID. active is the
-// initial active_tasks value; status defaults to 'active'.
+// initial active_tasks value; status defaults to 'online' (valid workspace_status enum).
 func insertWorkspace(t *testing.T, conn *sql.DB, name string, active int) string {
 	t.Helper()
 	var id string
 	err := conn.QueryRowContext(context.Background(), `
 		INSERT INTO workspaces (name, status, active_tasks, max_concurrent_tasks)
-		VALUES ($1, 'active', $2, 1)
+		VALUES ($1, 'online', $2, 1)
 		RETURNING id
 	`, name, active).Scan(&id)
 	if err != nil {
