@@ -17,6 +17,7 @@ package handlers
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -54,4 +55,96 @@ func validateRegisteredModelForRuntime(runtime, model string) (bool, string) {
 	return false, fmt.Sprintf(
 		"model %q is not a registered model for runtime %q; pick one of the runtime's registered models (provider-registry SSOT, internal#718)",
 		model, runtime)
+}
+
+// validateDerivedProviderInRegistry (issue #2172) is the provider-side companion
+// to validateRegisteredModelForRuntime. The model-side check asks "is this
+// (runtime, model) in the registry?"; the provider-side check asks "is the
+// provider this model DERIVES to — the same one the adapter will resolve at
+// boot — a known provider in providers.yaml?"
+//
+// Live trigger (adk-demo Assistant, 2026-06-03): workspace config
+// `model=moonshot/kimi-k2.6` (claude-code) → adapter derives `provider=moonshot`
+// → `ValueError: provider=moonshot not in providers registry` at BOOT. The
+// save was accepted (no validation at the API boundary), and the failure only
+// surfaced when the agent tried to register. CI never saw it. The drift gate
+// (RFC#580) validates TEMPLATES against the registry, NOT per-workspace
+// configs; the existing model-side check rejects a model the runtime doesn't
+// own but says nothing about the DERIVED provider's registry membership.
+//
+// Returns:
+//
+//	(true,  "")     — pass: model is empty (MODEL_REQUIRED owns it), the
+//	                  runtime is not in the registry (fail-open for
+//	                  federated / non-first-party runtimes — mirror of the
+//	                  model-side check's federation contract), the registry
+//	                  failed to load (build-time gate owns it), OR the
+//	                  derived provider name is a known provider in the
+//	                  registry's `providers:` list.
+//	(false, reason) — reject: a known (runtime, model) pair derives to a
+//	                  provider name absent from the providers list. This is
+//	                  the structural class the adk-demo boot failure belongs
+//	                  to — the registry's `runtimes:` block references a
+//	                  provider not declared in `providers:`, which by
+//	                  construction is a registry-data bug. Catching it at
+//	                  config-SAVE keeps it out of the agent-boot path.
+//
+// Defense-in-depth: by construction, a model in a runtime's native provider set
+// has a provider that IS in the catalog (the runtime ref names a provider from
+// the providers list). So the rejection path is primarily a registry-consistency
+// guard. The real value is the FAIL-LOUD semantics — any future drift between
+// `providers:` and `runtimes:` fails the create call with a clear pointer to
+// the missing provider, instead of silently wedging the agent at boot.
+func validateDerivedProviderInRegistry(runtime, model string) (bool, string) {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return true, "" // MODEL_REQUIRED owns this.
+	}
+	m, err := providerRegistry()
+	if err != nil || m == nil {
+		// Registry unavailable (build-time defect the gates catch). Fail open —
+		// do not block create on a registry-load failure.
+		return true, ""
+	}
+	// DeriveProvider is fail-closed for unknown runtimes. Mirror the
+	// model-side check's federation contract: a runtime the registry does
+	// NOT know (langgraph / external / kimi / mock / federated) is allowed
+	// to pass through. DeriveProvider's `unknown runtime` error IS that
+	// signal — treat it as fail-open, identical to ModelsForRuntime's
+	// not-found behavior above.
+	p, err := m.DeriveProvider(runtime, model, nil)
+	if err != nil {
+		// Either the runtime is unknown (fail-open by contract) OR the model
+		// is not native to the runtime (the model-side validator already
+		// rejected this — DeriveProvider's error here means
+		// validateRegisteredModelForRuntime should have caught it. Don't
+		// double-reject: pass through and let the model-side response own
+		// the message).
+		return true, ""
+	}
+	// Defense-in-depth: confirm the DERIVED provider is a known entry in the
+	// providers list. By construction it should be (DeriveProvider only
+	// returns a Provider that was looked up by name from `providers:`), but
+	// a future federation merge could introduce a runtime ref pointing at a
+	// contributed provider absent from the core catalog. Reject loudly here
+	// rather than letting the save reach the agent-boot path and wedge with
+	// "provider=X not in providers registry" (the original adk-demo class).
+	for _, candidate := range m.Providers {
+		if candidate.Name == p.Name {
+			return true, ""
+		}
+	}
+	// Build a sorted, comma-separated list of valid provider names so the
+	// operator/caller sees the actionable list (the boot-time error message
+	// the adk-demo class produced does NOT include this — the fix is to
+	// surface it at the API boundary, where the caller can fix the request
+	// without a stuck workspace + operator page).
+	valid := make([]string, 0, len(m.Providers))
+	for _, c := range m.Providers {
+		valid = append(valid, c.Name)
+	}
+	sort.Strings(valid)
+	return false, fmt.Sprintf(
+		"derived provider %q (for model %q on runtime %q) is not in the providers registry; pick a model whose derived provider is one of: %s",
+		p.Name, model, runtime, strings.Join(valid, ", "))
 }
