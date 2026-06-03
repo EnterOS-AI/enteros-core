@@ -21,6 +21,7 @@ Scenarios:
   T16_comments_generic_approval — reviews empty; comments have "APPROVED" by team member → exit 0
   T17_comments_no_approval   — reviews empty; comments have no approval keywords → exit 1
   T18_review_wrong_team_comment_right_team — review candidate 404s, comment candidate passes
+  T19_ai_sop_ack_approved — ai-sop-ack member APPROVED review → team probe 404 → exit 1
 
 Usage:
   FIXTURE_STATE_DIR=/tmp/x python3 _review_check_fixture.py 8080
@@ -116,6 +117,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     {"state": "CHANGES_REQUESTED", "dismissed": False, "user": {"login": "bob"}, "commit_id": "abc1234"},
                     {"state": "APPROVED", "dismissed": False, "user": {"login": "core-devops"}, "commit_id": "abc1234"},
                 ])
+            if sc == "T19_ai_sop_ack_approved":
+                # ai-sop-ack member submitted APPROVED review — must NOT count
+                # toward qa-review (team_id=20) or security-review (team_id=21).
+                return self._json(200, [
+                    {"state": "APPROVED", "dismissed": False, "user": {"login": "ai-reviewer"}, "commit_id": "abc1234"},
+                ])
             # Default: one non-author APPROVED
             return self._json(200, [
                 {"state": "APPROVED", "dismissed": False, "user": {"login": "core-devops"}, "commit_id": "abc1234"},
@@ -156,6 +163,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if sc == "T9_team_403":
                 return self._empty(403)
             if sc == "T18_review_wrong_team_comment_right_team" and login == "core-devops":
+                return self._empty(404)
+            if sc == "T19_ai_sop_ack_approved" and login == "ai-reviewer":
+                # ai-sop-ack member is NOT in qa (20) or security (21).
                 return self._empty(404)
             # T7_team_member: member
             return self._empty(204)
