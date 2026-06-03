@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -56,6 +57,138 @@ func TestRefreshEnvFromCP_AppliesCPResponse(t *testing.T) {
 	}
 	if got := os.Getenv("MOLECULE_LLM_DEFAULT_MODEL"); got != "moonshot/kimi-k2.6" {
 		t.Errorf("MOLECULE_LLM_DEFAULT_MODEL: got %q", got)
+	}
+}
+
+// TestRefreshEnvFromCP_ManagedTenantRequiresLLMKeys: watch-fail-first
+// per Researcher Task #46. When running as a managed tenant
+// (MOLECULE_ORG_ID + ADMIN_TOKEN set), missing LLM proxy env vars
+// after refreshEnvFromCP MUST surface as MISSING_CP_LLM_ENV, not be
+// silently accepted. Without this guard, a CP that loses its LLM
+// creds (e.g. during an incident) would let a tenant boot and then
+// fail later at first LLM call — worse than a loud refusal here.
+func TestRefreshEnvFromCP_ManagedTenantRequiresLLMKeys(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Stub CP returns a CP response WITHOUT any of the required
+		// LLM keys — simulates the failure mode where the CP side
+		// dropped or never had the LLM creds for this org.
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"MOLECULE_CP_SHARED_SECRET":"x","MOLECULE_CP_URL":"https://api.moleculesai.app"}`)
+	}))
+	defer srv.Close()
+
+	t.Setenv("MOLECULE_ORG_ID", "org-managed-1")
+	t.Setenv("ADMIN_TOKEN", "admin-tok")
+	t.Setenv("MOLECULE_CP_URL", srv.URL)
+	// Clear all LLM keys to simulate the boot-without-LLM-env failure mode.
+	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "")
+	t.Setenv("MOLECULE_LLM_USAGE_URL", "")
+	t.Setenv("MOLECULE_LLM_BASE_URL", "")
+	t.Setenv("MOLECULE_LLM_ANTHROPIC_BASE_URL", "")
+
+	// refreshEnvFromCP itself should succeed — CP is reachable, returned 200.
+	if err := refreshEnvFromCP(); err != nil {
+		t.Fatalf("refreshEnvFromCP: %v", err)
+	}
+	// The boot assertion must catch the missing LLM keys.
+	err := assertManagedTenantHasLLMEnv()
+	if err == nil {
+		t.Fatal("expected MISSING_CP_LLM_ENV error for managed tenant without LLM keys, got nil")
+	}
+	if !strings.Contains(err.Error(), "MISSING_CP_LLM_ENV") {
+		t.Errorf("expected error to contain MISSING_CP_LLM_ENV, got: %v", err)
+	}
+}
+
+// TestRefreshEnvFromCP_ManagedTenantHappyPath: when the CP returns
+// all 4 LLM-proxy keys, the gate must PASS — no MISSING_CP_LLM_ENV
+// for a properly-configured managed tenant. Watch-fail counterpart
+// to TestRefreshEnvFromCP_ManagedTenantRequiresLLMKeys: if THIS test
+// ever fires MISSING_CP_LLM_ENV on the byte-correct key set, the
+// requiredLLMEnvVars list has drifted from the CP emission again.
+// Per Researcher REQUEST_CHANGES TEST ADEQUACY note.
+func TestRefreshEnvFromCP_ManagedTenantHappyPath(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// Return ALL 4 LLM-proxy keys — names byte-matched to
+		// tenant_config.go:140-144 CP emission.
+		fmt.Fprint(w, `{"MOLECULE_LLM_USAGE_TOKEN":"tok-1","MOLECULE_LLM_USAGE_URL":"https://llm.example.com/usage","MOLECULE_LLM_BASE_URL":"https://llm.example.com","MOLECULE_LLM_ANTHROPIC_BASE_URL":"https://llm.example.com/anthropic"}`)
+	}))
+	defer srv.Close()
+
+	t.Setenv("MOLECULE_ORG_ID", "org-managed-happy")
+	t.Setenv("ADMIN_TOKEN", "admin-tok")
+	t.Setenv("MOLECULE_CP_URL", srv.URL)
+	// Pre-clear so we can verify the refresh actually populated them.
+	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "")
+	t.Setenv("MOLECULE_LLM_USAGE_URL", "")
+	t.Setenv("MOLECULE_LLM_BASE_URL", "")
+	t.Setenv("MOLECULE_LLM_ANTHROPIC_BASE_URL", "")
+
+	if err := refreshEnvFromCP(); err != nil {
+		t.Fatalf("refreshEnvFromCP: %v", err)
+	}
+	// Sanity: refresh actually applied the keys.
+	if got := os.Getenv("MOLECULE_LLM_USAGE_TOKEN"); got != "tok-1" {
+		t.Errorf("refresh did not apply USAGE_TOKEN: got %q", got)
+	}
+	// The boot assertion must pass — no MISSING_CP_LLM_ENV.
+	if err := assertManagedTenantHasLLMEnv(); err != nil {
+		t.Errorf("managed happy path must not MISSING_CP_LLM_ENV, got: %v", err)
+	}
+}
+
+// TestRefreshEnvFromCP_ManagedTenantPartialEnv: when the CP returns
+// 3 of 4 LLM-proxy keys (one missing), the gate must STILL catch it
+// and the error must name the missing key. Per Researcher
+// REQUEST_CHANGES TEST ADEQUACY note — partial-env coverage is
+// critical because the production failure mode is usually "one
+// key dropped" not "all keys dropped".
+func TestRefreshEnvFromCP_ManagedTenantPartialEnv(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// 3 of 4 — MOLECULE_LLM_ANTHROPIC_BASE_URL is missing.
+		fmt.Fprint(w, `{"MOLECULE_LLM_USAGE_TOKEN":"tok-1","MOLECULE_LLM_USAGE_URL":"https://llm.example.com/usage","MOLECULE_LLM_BASE_URL":"https://llm.example.com"}`)
+	}))
+	defer srv.Close()
+
+	t.Setenv("MOLECULE_ORG_ID", "org-managed-partial")
+	t.Setenv("ADMIN_TOKEN", "admin-tok")
+	t.Setenv("MOLECULE_CP_URL", srv.URL)
+	// Pre-clear all 4 so the 3 that come back from CP are the only
+	// ones set; the 4th (MOLECULE_LLM_ANTHROPIC_BASE_URL) stays empty.
+	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "")
+	t.Setenv("MOLECULE_LLM_USAGE_URL", "")
+	t.Setenv("MOLECULE_LLM_BASE_URL", "")
+	t.Setenv("MOLECULE_LLM_ANTHROPIC_BASE_URL", "")
+
+	if err := refreshEnvFromCP(); err != nil {
+		t.Fatalf("refreshEnvFromCP: %v", err)
+	}
+	err := assertManagedTenantHasLLMEnv()
+	if err == nil {
+		t.Fatal("expected MISSING_CP_LLM_ENV for partial env (3 of 4 keys), got nil")
+	}
+	if !strings.Contains(err.Error(), "MISSING_CP_LLM_ENV") {
+		t.Errorf("expected error to contain MISSING_CP_LLM_ENV, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "MOLECULE_LLM_ANTHROPIC_BASE_URL") {
+		t.Errorf("expected error to name the missing key MOLECULE_LLM_ANTHROPIC_BASE_URL, got: %v", err)
+	}
+}
+
+// TestAssertManagedTenantHasLLMEnv_NotManagedIsNoop: self-hosted
+// (no orgID/adminToken) must NOT block on missing LLM keys — dev
+// ergonomics matter and the assertion's contract is "managed only".
+func TestAssertManagedTenantHasLLMEnv_NotManagedIsNoop(t *testing.T) {
+	t.Setenv("MOLECULE_ORG_ID", "")
+	t.Setenv("ADMIN_TOKEN", "")
+	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "")
+	t.Setenv("MOLECULE_LLM_USAGE_URL", "")
+	t.Setenv("MOLECULE_LLM_BASE_URL", "")
+	t.Setenv("MOLECULE_LLM_ANTHROPIC_BASE_URL", "")
+	if err := assertManagedTenantHasLLMEnv(); err != nil {
+		t.Errorf("self-hosted (not managed) must not block, got: %v", err)
 	}
 }
 
