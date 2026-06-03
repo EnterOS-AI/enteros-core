@@ -517,7 +517,9 @@ func (t *TelegramAdapter) StartPolling(ctx context.Context, config map[string]in
 
 				// Acknowledge the button press (removes loading spinner)
 				ackCfg := tgbotapi.NewCallback(cb.ID, "Received")
-				bot.Send(ackCfg)
+				if _, err := bot.Send(ackCfg); err != nil {
+					log.Printf("telegram: failed to send callback ack: %v", err)
+				}
 
 				// Update the message to show what was clicked
 				decision := "approved"
@@ -529,7 +531,9 @@ func (t *TelegramAdapter) StartPolling(ctx context.Context, config map[string]in
 					cb.Message.MessageID,
 					cb.Message.Text+"\n\n✅ CEO "+decision,
 				)
-				bot.Send(editMsg)
+				if _, err := bot.Send(editMsg); err != nil {
+					log.Printf("telegram: failed to send edit message: %v", err)
+				}
 
 				// Route the decision as an inbound message to the agent
 				inbound := &InboundMessage{

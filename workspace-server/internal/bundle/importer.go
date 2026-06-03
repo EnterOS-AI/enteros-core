@@ -149,9 +149,11 @@ func markFailed(ctx context.Context, wsID string, broadcaster *events.Broadcaste
 		models.StatusFailed, msg, wsID); dbErr != nil {
 		log.Printf("bundle import: failed to mark workspace %s as failed: %v", wsID, dbErr)
 	}
-	broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceProvisionFailed), wsID, map[string]interface{}{
+	if bcErr := broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceProvisionFailed), wsID, map[string]interface{}{
 		"error": msg,
-	})
+	}); bcErr != nil {
+		log.Printf("bundle import: failed to broadcast provision failed for %s: %v", wsID, bcErr)
+	}
 }
 
 func nilIfEmpty(s string) interface{} {

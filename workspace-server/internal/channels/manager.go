@@ -407,12 +407,14 @@ func (m *Manager) HandleInbound(ctx context.Context, ch ChannelRow, msg *Inbound
 
 	// Broadcast event
 	if m.broadcaster != nil {
-		m.broadcaster.RecordAndBroadcast(ctx, string(events.EventChannelMessage), ch.WorkspaceID, map[string]interface{}{
+		if err := m.broadcaster.RecordAndBroadcast(ctx, string(events.EventChannelMessage), ch.WorkspaceID, map[string]interface{}{
 			"channel_id":   ch.ID,
 			"channel_type": ch.ChannelType,
 			"username":     msg.Username,
 			"direction":    "inbound",
-		})
+		}); err != nil {
+			log.Printf("Channels: failed to broadcast inbound event: %v", err)
+		}
 	}
 
 	return nil
@@ -453,11 +455,13 @@ func (m *Manager) SendOutbound(ctx context.Context, channelID string, text strin
 	}
 
 	if m.broadcaster != nil {
-		m.broadcaster.RecordAndBroadcast(ctx, string(events.EventChannelMessage), ch.WorkspaceID, map[string]interface{}{
+		if err := m.broadcaster.RecordAndBroadcast(ctx, string(events.EventChannelMessage), ch.WorkspaceID, map[string]interface{}{
 			"channel_id":   ch.ID,
 			"channel_type": ch.ChannelType,
 			"direction":    "outbound",
-		})
+		}); err != nil {
+			log.Printf("Channels: failed to broadcast outbound event: %v", err)
+		}
 	}
 
 	return nil
