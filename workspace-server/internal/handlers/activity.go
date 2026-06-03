@@ -60,10 +60,10 @@ func sanitizeErrorDetailForBroadcast(s string) string {
 }
 
 type ActivityHandler struct {
-	broadcaster *events.Broadcaster
+	broadcaster events.EventEmitter
 }
 
-func NewActivityHandler(b *events.Broadcaster) *ActivityHandler {
+func NewActivityHandler(b events.EventEmitter) *ActivityHandler {
 	return &ActivityHandler{broadcaster: b}
 }
 

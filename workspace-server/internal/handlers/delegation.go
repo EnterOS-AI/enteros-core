@@ -102,10 +102,10 @@ func pushDelegationResultToInbox(ctx context.Context, sourceID, delegationID, st
 // and the A2A request runs in the background.
 type DelegationHandler struct {
 	workspace   *WorkspaceHandler
-	broadcaster *events.Broadcaster
+	broadcaster events.EventEmitter
 }
 
-func NewDelegationHandler(wh *WorkspaceHandler, b *events.Broadcaster) *DelegationHandler {
+func NewDelegationHandler(wh *WorkspaceHandler, b events.EventEmitter) *DelegationHandler {
 	return &DelegationHandler{workspace: wh, broadcaster: b}
 }
 
