@@ -1003,12 +1003,13 @@ func applyPlatformManagedLLMEnv(ctx context.Context, envVars map[string]string, 
 	anthropicBaseURL := firstNonEmptyEnv("MOLECULE_LLM_ANTHROPIC_BASE_URL", "ANTHROPIC_BASE_URL")
 	token := firstNonEmptyEnv("MOLECULE_LLM_USAGE_TOKEN", "OPENAI_API_KEY")
 	if baseURL == "" || token == "" {
-		// Proxy not configured (boot race / misconfig). On the platform_managed
-		// path the workspace IS entitled to platform creds, so we do NOT strip
-		// here — but we report HasUsableLLMCred from whatever survived so the
-		// caller's fail-closed branch (non-platform only) is never reached on
-		// this path.
-		return platformLLMEnvResult{ResolvedMode: res.ResolvedMode, HasUsableLLMCred: true, Source: res.Source}
+		// Proxy not configured (boot race / misconfig). The platform_managed
+		// path REQUIRES the CP proxy env to inject a usable credential.
+		// Reporting HasUsableLLMCred=true here would start the workspace
+		// credential-less — the adk-demo dark-wedge class (#2162).
+		// Return false so the caller's fail-closed branch aborts with
+		// MISSING_PLATFORM_PROXY.
+		return platformLLMEnvResult{ResolvedMode: res.ResolvedMode, HasUsableLLMCred: false, Source: res.Source}
 	}
 	stripPlatformManagedLLMBypassEnv(envVars)
 

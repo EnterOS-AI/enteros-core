@@ -372,3 +372,78 @@ func TestApplyPlatformManagedLLMEnv_WorkspaceOriginCredExemptFromStrip(t *testin
 		t.Errorf("sqlmock expectations: %v", err)
 	}
 }
+
+// TestApplyPlatformManagedLLMEnv_MissingProxyEnvFailClosed is the #2162
+// regression guard. A platform-managed workspace whose CP proxy env is absent
+// must NOT start credential-less. The empty-proxy path must return
+// HasUsableLLMCred=false so the caller aborts with MISSING_PLATFORM_PROXY.
+//
+// Mutation: revert the early-return from HasUsableLLMCred=false to true
+// → workspace starts with zero credential → "container started but never
+// called /registry/register" (600s provision-timeout sweep) → this test RED.
+func TestApplyPlatformManagedLLMEnv_MissingProxyEnvFailClosed(t *testing.T) {
+	ctx := context.Background()
+	const wsID = "29b95be9-811e-4857-be36-1dafdbf4f697" // adk-demo failure workspace
+
+	mock := setupTestDB(t)
+	expectOverrideQuery(mock, wsID, "")
+
+	// No proxy env present — simulates the boot-race / misconfig path.
+	envVars := map[string]string{}
+	res := applyPlatformManagedLLMEnv(ctx, envVars, wsID, "claude-code", "moonshot/kimi-k2.6", nil)
+
+	if res.ResolvedMode != LLMBillingModePlatformManaged {
+		t.Fatalf("platform-managed model must stay platform_managed, got %q (source=%s)", res.ResolvedMode, res.Source)
+	}
+	// THE FIX: must NOT report usable credential when none was injected.
+	if res.HasUsableLLMCred {
+		t.Fatalf("empty proxy env → HasUsableLLMCred must be false (fail-closed), got true — the #2162 dark-wedge class")
+	}
+	// No credential env must be present.
+	if _, present := envVars["ANTHROPIC_API_KEY"]; present {
+		t.Errorf("empty proxy env must NOT inject ANTHROPIC_API_KEY")
+	}
+	if _, present := envVars["MOLECULE_LLM_USAGE_TOKEN"]; present {
+		t.Errorf("empty proxy env must NOT inject MOLECULE_LLM_USAGE_TOKEN")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations: %v", err)
+	}
+}
+
+// TestApplyPlatformManagedLLMEnv_ProxyEnvPresentInjectsCredential is the
+// positive-path pair to the #2162 regression guard: when the CP proxy env IS
+// present, the platform-managed path must inject ANTHROPIC_API_KEY +
+// ANTHROPIC_BASE_URL for an Anthropic-native runtime and report
+// HasUsableLLMCred=true.
+func TestApplyPlatformManagedLLMEnv_ProxyEnvPresentInjectsCredential(t *testing.T) {
+	ctx := context.Background()
+	const wsID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+	mock := setupTestDB(t)
+	expectOverrideQuery(mock, wsID, "")
+
+	envVars := map[string]string{}
+	// Simulate the CP proxy env being present (as it is in production).
+	t.Setenv("MOLECULE_LLM_BASE_URL", "https://api.moleculesai.app/api/v1/internal/llm/openai/v1")
+	t.Setenv("MOLECULE_LLM_ANTHROPIC_BASE_URL", "https://api.moleculesai.app/api/v1/internal/llm/anthropic/v1")
+	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "PLATFORM-PROXY-TOKEN")
+
+	res := applyPlatformManagedLLMEnv(ctx, envVars, wsID, "claude-code", "moonshot/kimi-k2.6", nil)
+
+	if res.ResolvedMode != LLMBillingModePlatformManaged {
+		t.Fatalf("expected platform_managed, got %q", res.ResolvedMode)
+	}
+	if !res.HasUsableLLMCred {
+		t.Fatalf("proxy env present → HasUsableLLMCred must be true, got false")
+	}
+	if envVars["ANTHROPIC_API_KEY"] != "PLATFORM-PROXY-TOKEN" {
+		t.Errorf("ANTHROPIC_API_KEY must be injected with the platform proxy token; got %q", envVars["ANTHROPIC_API_KEY"])
+	}
+	if envVars["ANTHROPIC_BASE_URL"] != "https://api.moleculesai.app/api/v1/internal/llm/anthropic/v1" {
+		t.Errorf("ANTHROPIC_BASE_URL must be injected with the platform anthropic proxy; got %q", envVars["ANTHROPIC_BASE_URL"])
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations: %v", err)
+	}
+}
