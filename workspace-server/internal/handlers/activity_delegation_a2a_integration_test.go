@@ -537,9 +537,11 @@ func TestIntegration_ActivityList_BeforeTS(t *testing.T) {
 	seedActivityLog(t, conn, wsID, "agent_log", "old", "ok", nil, nil)
 
 	// Capture a timestamp between the two rows so only "old" is before it.
-	time.Sleep(50 * time.Millisecond)
-	beforeTS := time.Now().UTC().Format(time.RFC3339)
-	time.Sleep(50 * time.Millisecond)
+	// Use nanosecond precision and a generous gap to avoid second-truncation
+	// or clock-skew between Go time.Now() and Postgres now().
+	time.Sleep(200 * time.Millisecond)
+	beforeTS := time.Now().UTC().Format(time.RFC3339Nano)
+	time.Sleep(200 * time.Millisecond)
 	seedActivityLog(t, conn, wsID, "agent_log", "new", "ok", nil, nil)
 
 	h := NewActivityHandler(nil)
@@ -960,8 +962,14 @@ func TestIntegration_A2AQueue_MarkCompletedAndFailed(t *testing.T) {
 		t.Fatalf("expected completed, got %s", status)
 	}
 
-	// Seed another item to test failed path with max attempts
+	// Seed another item to test failed path with max attempts.
+	// Pre-set attempts=5 so the first MarkQueueItemFailed sees attempts>=5
+	// and transitions straight to failed (MarkQueueItemFailed increments
+	// attempts on dispatch via DequeueNext, but we call it directly here).
 	qid2 := seedA2AQueueItem(t, conn, wsID, "00000000-0000-0000-0000-000000000001", PriorityTask, body, "dispatched")
+	if _, err := conn.ExecContext(context.Background(), `UPDATE a2a_queue SET attempts = 5 WHERE id = $1`, qid2); err != nil {
+		t.Fatalf("set attempts: %v", err)
+	}
 	for i := 0; i < 6; i++ {
 		MarkQueueItemFailed(context.Background(), qid2, "transient error")
 	}
