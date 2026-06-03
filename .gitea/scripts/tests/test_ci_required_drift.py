@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import sys
 from pathlib import Path
 from unittest.mock import patch
@@ -34,6 +35,76 @@ def _make_audit_doc(required_checks: list[str]) -> dict:
             }
         }
     }
+
+
+def _make_audit_doc_json(required_checks_json: dict) -> dict:
+    return {
+        "jobs": {
+            "audit": {
+                "steps": [
+                    {"env": {"REQUIRED_CHECKS_JSON": json.dumps(required_checks_json)}}
+                ]
+            }
+        }
+    }
+
+
+# ---------------------------------------------------------------------------
+# required_checks_env — dual-variant parsing
+# ---------------------------------------------------------------------------
+
+def test_required_checks_env_prefers_json_over_legacy():
+    doc = {
+        "jobs": {
+            "audit": {
+                "steps": [
+                    {
+                        "env": {
+                            "REQUIRED_CHECKS_JSON": json.dumps(
+                                {"main": ["ctx-a"], "staging": ["ctx-b"]}
+                            ),
+                            "REQUIRED_CHECKS": "ctx-legacy\nctx-old",
+                        }
+                    }
+                ]
+            }
+        }
+    }
+    assert drift.required_checks_env(doc, "main") == {"ctx-a"}
+    assert drift.required_checks_env(doc, "staging") == {"ctx-b"}
+
+
+def test_required_checks_env_falls_back_to_legacy():
+    doc = _make_audit_doc(["legacy-ctx"])
+    assert drift.required_checks_env(doc, "main") == {"legacy-ctx"}
+
+
+def test_required_checks_env_json_missing_branch_fails():
+    doc = _make_audit_doc_json({"staging": ["ctx-b"]})
+    try:
+        drift.required_checks_env(doc, "main")
+    except SystemExit as exc:
+        assert exc.code == 3
+    else:
+        raise AssertionError("expected SystemExit(3)")
+
+
+def test_required_checks_env_json_malformed_fails():
+    doc = {
+        "jobs": {
+            "audit": {
+                "steps": [
+                    {"env": {"REQUIRED_CHECKS_JSON": "not-json"}}
+                ]
+            }
+        }
+    }
+    try:
+        drift.required_checks_env(doc, "main")
+    except SystemExit as exc:
+        assert exc.code == 3
+    else:
+        raise AssertionError("expected SystemExit(3)")
 
 
 # ---------------------------------------------------------------------------
