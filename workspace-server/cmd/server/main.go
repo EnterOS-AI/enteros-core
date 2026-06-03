@@ -82,6 +82,16 @@ func main() {
 		log.Printf("CP env refresh: %v (continuing with baked-in env)", err)
 	}
 
+	// Managed-tenant boot assertion (cp#469 — tenant proxy-env delivery).
+	// If we're a managed SaaS tenant (orgID + adminToken set), all required
+	// LLM proxy env vars must be present after refresh. Missing keys block
+	// the tenant from booting with broken LLM creds — silent-fail is worse
+	// than a loud refusal. Self-hosted (no orgID/adminToken) short-circuits
+	// inside the assertion, so this never fires for dev.
+	if err := assertManagedTenantHasLLMEnv(); err != nil {
+		log.Fatalf("Managed tenant boot assertion: %v", err)
+	}
+
 	// Secrets encryption. In MOLECULE_ENV=prod, boot refuses to start
 	// without a valid SECRETS_ENCRYPTION_KEY (fail-secure — Top-5 #5).
 	// In any other environment, missing keys just log a warning and
@@ -358,7 +368,6 @@ func main() {
 	// goroutine + timeout). The handler-side boot-failure path
 	// (WorkspaceHandler.BootstrapFailed) wires its own capture inline.
 	registry.BootFailureRescueHook = handlers.BootFailureRescueHook
-
 
 	// Provision-timeout sweep — flips workspaces that have been stuck in
 	// status='provisioning' past the timeout window to 'failed' and emits
