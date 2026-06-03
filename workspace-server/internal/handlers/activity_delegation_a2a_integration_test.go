@@ -38,7 +38,7 @@ import (
 )
 
 // integrationDB_ActivityDelegationA2A opens a connection from
-// $INTEGRATION_DB_URL (skipping the test if unset), wipes the tables
+// $INTEGRATION_DB_URL (failing the test if unset), wipes the tables
 // used by these tests, hot-swaps the package-level db.DB, and registers
 // a Cleanup that restores the previous db.DB + closes the connection.
 //
@@ -47,7 +47,7 @@ func integrationDB_ActivityDelegationA2A(t *testing.T) *sql.DB {
 	t.Helper()
 	url := os.Getenv("INTEGRATION_DB_URL")
 	if url == "" {
-		t.Skip("INTEGRATION_DB_URL not set; skipping (local devs: see file header)")
+		t.Fatal("INTEGRATION_DB_URL not set; failing (local devs: see file header)")
 	}
 	conn, err := sql.Open("postgres", url)
 	if err != nil {
