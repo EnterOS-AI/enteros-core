@@ -134,6 +134,7 @@ func newTestGinContext() (*gin.Context, *httptest.ResponseRecorder) {
 	gin.SetMode(gin.TestMode)
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/", nil)
 	return c, w
 }
 
@@ -532,12 +533,11 @@ func TestIntegration_ActivityList_BeforeTS(t *testing.T) {
 	wsID := seedWorkspace(t, conn, "test-2151-before-ts")
 	seedActivityLog(t, conn, wsID, "agent_log", "old", "ok", nil, nil)
 
-	// Wait a tiny bit so the next row has a different timestamp
+	// Capture a timestamp between the two rows so only "old" is before it.
+	time.Sleep(50 * time.Millisecond)
+	beforeTS := time.Now().UTC().Format(time.RFC3339)
 	time.Sleep(50 * time.Millisecond)
 	seedActivityLog(t, conn, wsID, "agent_log", "new", "ok", nil, nil)
-
-	// Use the current time as before_ts — only the "old" row should appear
-	beforeTS := time.Now().UTC().Add(-10 * time.Millisecond).Format(time.RFC3339)
 
 	h := NewActivityHandler(nil)
 	c, w := newTestGinContext()
@@ -896,7 +896,7 @@ func TestIntegration_A2AQueue_DequeueNext(t *testing.T) {
 	conn := integrationDB_ActivityDelegationA2A(t)
 	wsID := seedWorkspace(t, conn, "test-2151-a2a-dequeue")
 	body := []byte(`{"test":true}`)
-	seedA2AQueueItem(t, conn, wsID, "", PriorityTask, body, "queued")
+	seedA2AQueueItem(t, conn, wsID, "00000000-0000-0000-0000-000000000001", PriorityTask, body, "queued")
 
 	item, err := DequeueNext(context.Background(), wsID)
 	if err != nil {
@@ -946,7 +946,7 @@ func TestIntegration_A2AQueue_MarkCompletedAndFailed(t *testing.T) {
 	conn := integrationDB_ActivityDelegationA2A(t)
 	wsID := seedWorkspace(t, conn, "test-2151-a2a-lifecycle")
 	body := []byte(`{"test":true}`)
-	qid := seedA2AQueueItem(t, conn, wsID, "", PriorityTask, body, "dispatched")
+	qid := seedA2AQueueItem(t, conn, wsID, "00000000-0000-0000-0000-000000000001", PriorityTask, body, "dispatched")
 
 	MarkQueueItemCompleted(context.Background(), qid)
 	var status string
