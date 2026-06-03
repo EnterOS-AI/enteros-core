@@ -294,8 +294,14 @@ func TestIntegration_TickFiresAndWritesBack(t *testing.T) {
 // INSERT and held the transaction open — stalling the whole scheduler.
 // fireSchedule now sanitizeUTF8()s every string before the `$3::jsonb` insert.
 //
-// This inserts a schedule whose prompt contains an orphan continuation byte
-// (0x80) and a bare 0xff, runs tick(), and asserts:
+// Postgres TEXT columns (workspace_schedules.prompt) also reject invalid UTF-8
+// in a UTF-8 database, so we cannot INSERT the bad bytes through the fixture.
+// Instead we insert a valid prompt, then call fireSchedule directly with a
+// scheduleRow whose Prompt field contains the invalid bytes — this simulates
+// the real regression path (e.g. truncation splitting a multi-byte rune, or
+// an agent-edited template arriving via a path that bypasses DB validation).
+//
+// Assertions:
 //   - the fire still completed (write-back UPDATE landed)
 //   - the cron_run activity_logs row was inserted (the jsonb cast accepted
 //     the SANITIZED payload — the INSERT did not wedge)
@@ -308,16 +314,26 @@ func TestIntegration_InvalidUTF8PromptSanitizedIntoJsonb(t *testing.T) {
 	conn := integrationDB(t)
 
 	wsID := insertWorkspace(t, conn, "utf8-ws", 0)
+	// Insert with valid UTF-8 — Postgres TEXT rejects 0x80/0xff.
+	schedID := insertSchedule(t, conn, wsID, "utf8-job", "0 * * * *", "valid prompt")
+
 	// Prompt with invalid UTF-8: orphan continuation byte + bare 0xff.
 	badPrompt := "audit \x80 report \xff end"
-	schedID := insertSchedule(t, conn, wsID, "utf8-job", "0 * * * *", badPrompt)
+	row := scheduleRow{
+		ID:          schedID,
+		WorkspaceID: wsID,
+		Name:        "utf8-job",
+		CronExpr:    "0 * * * *",
+		Timezone:    "UTC",
+		Prompt:      badPrompt,
+	}
 
 	proxy := &recordingProxy{
 		status: 200,
 		body:   []byte(`{"result":{"kind":"message","parts":[{"kind":"text","text":"ok"}]}}`),
 	}
 	s := New(proxy, nil)
-	s.tick(context.Background())
+	s.fireSchedule(context.Background(), row)
 
 	if proxy.fires != 1 {
 		t.Fatalf("proxy fires = %d, want 1", proxy.fires)
