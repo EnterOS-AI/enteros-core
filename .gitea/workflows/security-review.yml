@@ -93,13 +93,14 @@ jobs:
         # We explicitly POST the BP-required context so the gate flips.
         # Trust boundary: same BASE-ref script result, no PR-head code.
         #
-        # TOKEN SCOPE FIX (RC 8324): uses secrets.GITHUB_TOKEN directly.
-        # SOP_TIER_CHECK_TOKEN lacks statuses:write scope → POST /statuses
-        # returns 403. The workflow permissions block already grants
-        # statuses:write to the auto-injected GITHUB_TOKEN.
+        # TOKEN FIX (RC 8326): uses STATUS_POST_TOKEN (CTO-granted,
+        # msg d52cc72a). Dedicated narrow-scoped write:repository token
+        # for the explicit status POST. Evaluator step stays on
+        # SOP_TIER_CHECK_TOKEN (read-only) per deliberate security
+        # separation: eval computes, POST writes, never the same cred.
         if: github.event_name == 'pull_request_review_approved' && always()
         env:
-          GITEA_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITEA_TOKEN: ${{ secrets.STATUS_POST_TOKEN }}
           GITEA_HOST: git.moleculesai.app
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
