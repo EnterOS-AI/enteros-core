@@ -29,8 +29,11 @@
 #                          account:cloudflare_tunnel:edit scope.
 #                          (Same secret as sweep-cf-orphans, but the
 #                          token must include the tunnel scope.)
+#     (falls back to CLOUDFLARE_API_TOKEN if CF_API_TOKEN is unset;
+#      the workflow YAML maps both secret names into CF_API_TOKEN)
 #   CF_ACCOUNT_ID       — the account that owns the tunnels (visible
 #                          in dash.cloudflare.com URL path)
+#     (falls back to CLOUDFLARE_ACCOUNT_ID if CF_ACCOUNT_ID is unset)
 #   CP_ADMIN_API_TOKEN — CP admin bearer for api.moleculesai.app
 #   CP_STAGING_ADMIN_API_TOKEN — CP admin bearer for staging-api.moleculesai.app
 #
@@ -70,6 +73,12 @@ need() {
     exit 1
   fi
 }
+# Fallback: operator-host canonical names → CI-scoped names.
+# The workflow YAML already maps both, but direct script invocation
+# (e.g. local ops) may only have the canonical names set.
+CF_API_TOKEN="${CF_API_TOKEN:-${CLOUDFLARE_API_TOKEN:-}}"
+CF_ACCOUNT_ID="${CF_ACCOUNT_ID:-${CLOUDFLARE_ACCOUNT_ID:-}}"
+
 need CF_API_TOKEN
 need CF_ACCOUNT_ID
 need CP_ADMIN_API_TOKEN
