@@ -43,12 +43,12 @@ import (
 
 	"github.com/gin-gonic/gin"
 	_ "github.com/lib/pq"
-	mdb "github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 )
 
 // integrationDB_Budget opens the integration PG connection, wipes our
-// test rows, and hot-swaps the package-level mdb.DB. NOT SAFE for
-// t.Parallel() — the global mdb.DB is shared.
+// test rows, and hot-swaps the package-level db.DB. NOT SAFE for
+// t.Parallel() — the global db.DB is shared.
 func integrationDB_Budget(t *testing.T) *sql.DB {
 	t.Helper()
 	url := os.Getenv("INTEGRATION_DB_URL")
@@ -66,11 +66,11 @@ func integrationDB_Budget(t *testing.T) *sql.DB {
 		`DELETE FROM workspaces WHERE id LIKE 'integ-bud-%'`); err != nil {
 		t.Fatalf("cleanup: %v", err)
 	}
-	prev := mdb.DB
-	mdb.DB = conn
+	prev := db.DB
+	db.DB = conn
 	t.Cleanup(func() {
 		conn.ExecContext(context.Background(), `DELETE FROM workspaces WHERE id LIKE 'integ-bud-%'`)
-		mdb.DB = prev
+		db.DB = prev
 		conn.Close()
 	})
 	return conn

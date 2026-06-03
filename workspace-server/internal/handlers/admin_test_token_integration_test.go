@@ -39,12 +39,12 @@ import (
 
 	"github.com/gin-gonic/gin"
 	_ "github.com/lib/pq"
-	mdb "github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 )
 
 // integrationDB_AdminTestToken opens the integration PG connection, wipes
 // the workspaces + workspace_auth_tokens tables for our test rows, and
-// hot-swaps the package-level mdb.DB so the handler sees the same conn.
+// hot-swaps the package-level db.DB so the handler sees the same conn.
 // NOT SAFE FOR t.Parallel() — each test must own the global.
 func integrationDB_AdminTestToken(t *testing.T) *sql.DB {
 	t.Helper()
@@ -67,12 +67,12 @@ func integrationDB_AdminTestToken(t *testing.T) *sql.DB {
 		`DELETE FROM workspaces WHERE id LIKE 'integ-adm-%'`); err != nil {
 		t.Fatalf("cleanup workspaces: %v", err)
 	}
-	prev := mdb.DB
-	mdb.DB = conn
+	prev := db.DB
+	db.DB = conn
 	t.Cleanup(func() {
 		conn.ExecContext(context.Background(), `DELETE FROM workspace_auth_tokens WHERE workspace_id LIKE 'integ-adm-%'`)
 		conn.ExecContext(context.Background(), `DELETE FROM workspaces WHERE id LIKE 'integ-adm-%'`)
-		mdb.DB = prev
+		db.DB = prev
 		conn.Close()
 	})
 	return conn
