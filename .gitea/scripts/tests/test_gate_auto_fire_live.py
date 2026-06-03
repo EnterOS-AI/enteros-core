@@ -115,18 +115,37 @@ def _find_suitable_pr() -> dict:
     pytest.skip("No open PR found whose head contains the pull_request_review trigger")
 
 
-def _submit_approved_review(pr_number: int) -> None:
-    code, _ = _api(
+def _submit_approved_review(pr_number: int) -> dict:
+    code, review = _api(
         "POST",
         f"/repos/{REPO}/pulls/{pr_number}/reviews",
-        {"body": "Live-fire test APPROVED review", "event": "APPROVE"},
+        {"body": "Live-fire test APPROVED review", "event": "APPROVED"},
     )
     # 200 = created, 422 = review already exists (idempotent enough for our purposes)
     if code not in (200, 201, 422):
         pytest.fail(f"POST /pulls/{pr_number}/reviews returned HTTP {code}")
+    return review
 
 
-def _poll_status_contexts(sha: str, timeout_sec: int = LIVEFIRE_TIMEOUT_SEC) -> dict[str, str]:
+def _get_status_updated_at(sha: str) -> dict[str, str]:
+    """Return mapping context -> updated_at for required contexts on this SHA."""
+    code, statuses = _api("GET", f"/repos/{REPO}/statuses/{sha}?limit=100")
+    if code != 200:
+        return {}
+    result: dict[str, str] = {}
+    for st in statuses:
+        ctx = st.get("context", "")
+        if ctx in REQUIRED_CONTEXTS:
+            result[ctx] = st.get("updated_at", st.get("created_at", ""))
+    return result
+
+
+def _poll_fresh_statuses(
+    sha: str,
+    prior_updated_at: dict[str, str],
+    timeout_sec: int = LIVEFIRE_TIMEOUT_SEC,
+) -> dict[str, str]:
+    """Poll until required contexts appear with updated_at fresher than prior."""
     deadline = time.monotonic() + timeout_sec
     found: dict[str, str] = {}
     while time.monotonic() < deadline:
@@ -135,7 +154,10 @@ def _poll_status_contexts(sha: str, timeout_sec: int = LIVEFIRE_TIMEOUT_SEC) -> 
             for st in statuses:
                 ctx = st.get("context", "")
                 if ctx in REQUIRED_CONTEXTS:
-                    found[ctx] = st.get("state", st.get("status", ""))
+                    updated_at = st.get("updated_at", st.get("created_at", ""))
+                    # Fresh if the context was absent before, OR its timestamp changed.
+                    if ctx not in prior_updated_at or updated_at != prior_updated_at[ctx]:
+                        found[ctx] = st.get("state", st.get("status", ""))
         if all(ctx in found for ctx in REQUIRED_CONTEXTS):
             return found
         time.sleep(5)
@@ -145,27 +167,29 @@ def _poll_status_contexts(sha: str, timeout_sec: int = LIVEFIRE_TIMEOUT_SEC) -> 
 @skip_no_token
 class TestGateAutoFireLive:
     def test_auto_fire_posts_required_contexts(self):
-        """Submit APPROVED review; assert BP-required contexts appear within timeout."""
+        """Submit APPROVED review; assert BP-required contexts appear fresh within timeout."""
         pr = _find_suitable_pr()
         pr_number = pr["number"]
         head_sha = pr["head"]["sha"]
 
-        # Pre-check: ensure contexts are not already present from a previous run.
-        # We tolerate stale contexts; the test looks for a fresh appearance.
+        # Capture pre-existing status timestamps so we can prove FRESH contexts
+        # were posted after the review submission (not stale from a prior run).
+        prior_updated_at = _get_status_updated_at(head_sha)
+
         _submit_approved_review(pr_number)
 
-        found = _poll_status_contexts(head_sha)
+        found = _poll_fresh_statuses(head_sha, prior_updated_at)
 
         missing = [ctx for ctx in REQUIRED_CONTEXTS if ctx not in found]
         if missing:
             pytest.fail(
-                f"After {LIVEFIRE_TIMEOUT_SEC}s, contexts still missing: {missing}. "
-                f"Found: {found}. "
+                f"After {LIVEFIRE_TIMEOUT_SEC}s, fresh contexts still missing: {missing}. "
+                f"Found: {found}. Prior timestamps: {prior_updated_at}. "
                 f"PR #{pr_number} head={head_sha}. "
                 f"This indicates the pull_request_review trigger did not fire at runtime."
             )
 
-        # The contexts appeared — that's the proof of auto-fire.
+        # The contexts appeared fresh — that's the proof of auto-fire.
         # We do NOT assert success vs failure; the evaluator decides that.
         # The point of #2159 is that the workflows QUEUE and POST at all.
         for ctx, state in found.items():
