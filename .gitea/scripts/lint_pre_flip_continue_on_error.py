@@ -466,12 +466,40 @@ def fetch_log(target_url: str) -> str | None:
 
 def grep_fail_markers(log_text: str) -> list[str]:
     """Return up to 5 sample matching lines for any FAIL_PATTERNS hit.
-    Empty list = clean log."""
+    Empty list = clean log.
+
+    Heuristic: skip lines where the marker appears inside script source
+    (e.g. ``echo "::error::..."`` in a ``::group::Run`` block) rather
+    than actual execution output. The Gitea Actions log prints the raw
+    script before executing it; ``echo "::error::"`` lines in that
+    display are false positives.
+    """
     matches: list[str] = []
+    in_run_group = False
+    group_depth = 0
     for line in log_text.splitlines():
+        stripped = line.strip()
+        # Track Gitea Actions group markers so we can skip the
+        # ``::group::Run`` script-source display blocks.
+        if stripped.startswith("::group::Run"):
+            in_run_group = True
+            group_depth = 1
+            continue
+        if stripped == "::endgroup::":
+            if in_run_group:
+                in_run_group = False
+                group_depth = 0
+            continue
+        if in_run_group:
+            continue
         for pat in FAIL_PATTERNS:
             if pat in line:
-                # Truncate to keep error output bounded.
+                # Additional false-positive guard: ``echo "::error::"``
+                # is script source, not a runtime error emission.
+                if pat == "::error::":
+                    prefix = line[: line.index(pat)].strip()
+                    if prefix.endswith('echo') or prefix.endswith("echo '") or prefix.endswith('echo "'):
+                        break
                 matches.append(line.strip()[:240])
                 break
         if len(matches) >= 5:

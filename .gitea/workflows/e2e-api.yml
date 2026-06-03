@@ -123,8 +123,9 @@ jobs:
     # integration). See internal#512 for the class defect.
     runs-on: docker-host
     # Phase 3 (RFC #219 §1): surface broken workflows without blocking.
-    # mc#1982: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
-    continue-on-error: true
+    # mc#1982: mask removed. If regressions appear, root-fix the underlying
+    # test — do NOT renew the mask silently.
+    continue-on-error: false
     outputs:
       api: ${{ steps.decide.outputs.api }}
     steps:
@@ -160,8 +161,9 @@ jobs:
     # detect-changes for the full rationale.
     runs-on: docker-host
     # Phase 3 (RFC #219 §1): surface broken workflows without blocking.
-    # mc#1982: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
-    continue-on-error: true
+    # mc#1982: mask removed. If regressions appear, root-fix the underlying
+    # test — do NOT renew the mask silently.
+    continue-on-error: false
     timeout-minutes: 15
     env:
       # Unique per-run container names so concurrent runs on the host-
