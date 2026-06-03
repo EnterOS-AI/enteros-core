@@ -57,18 +57,18 @@ func integrationDB_AdminSchedulesHealth(t *testing.T) *sql.DB {
 		t.Fatalf("ping: %v", err)
 	}
 	if _, err := conn.ExecContext(context.Background(),
-		`DELETE FROM workspace_schedules WHERE workspace_id LIKE 'integ-ash-%'`); err != nil {
+		`DELETE FROM workspace_schedules WHERE workspace_id IN (SELECT id FROM workspaces WHERE name LIKE 'integ-ash-%')`); err != nil {
 		t.Fatalf("cleanup schedules: %v", err)
 	}
 	if _, err := conn.ExecContext(context.Background(),
-		`DELETE FROM workspaces WHERE id LIKE 'integ-ash-%'`); err != nil {
+		`DELETE FROM workspaces WHERE name LIKE 'integ-ash-%'`); err != nil {
 		t.Fatalf("cleanup workspaces: %v", err)
 	}
 	prev := db.DB
 	db.DB = conn
 	t.Cleanup(func() {
-		conn.ExecContext(context.Background(), `DELETE FROM workspace_schedules WHERE workspace_id LIKE 'integ-ash-%'`)
-		conn.ExecContext(context.Background(), `DELETE FROM workspaces WHERE id LIKE 'integ-ash-%'`)
+		conn.ExecContext(context.Background(), `DELETE FROM workspace_schedules WHERE workspace_id IN (SELECT id FROM workspaces WHERE name LIKE 'integ-ash-%')`)
+		conn.ExecContext(context.Background(), `DELETE FROM workspaces WHERE name LIKE 'integ-ash-%'`)
 		db.DB = prev
 		conn.Close()
 	})
@@ -109,11 +109,14 @@ func TestIntegration_AdminSchedulesHealth_ClassifiesRows(t *testing.T) {
 	handler := NewAdminSchedulesHealthHandler()
 
 	// Two visible workspaces + one removed (must NOT appear in results).
-	wsOK := "integ-ash-ws-ok"
-	wsStale := "integ-ash-ws-stale"
-	wsRemoved := "integ-ash-ws-removed"
-	seedWorkspace_AdminSchedulesHealth(t, conn, wsOK, "running")
-	seedWorkspace_AdminSchedulesHealth(t, conn, wsStale, "running")
+	// IDs are derived from the human-readable name via integUUID so the
+	// schema (UUID-typed id column) is satisfied while failure logs still
+	// print a recognizable name.
+	wsOK := integUUID("integ-ash-ws-ok")
+	wsStale := integUUID("integ-ash-ws-stale")
+	wsRemoved := integUUID("integ-ash-ws-removed")
+	seedWorkspace_AdminSchedulesHealth(t, conn, wsOK, "online")
+	seedWorkspace_AdminSchedulesHealth(t, conn, wsStale, "online")
 	seedWorkspace_AdminSchedulesHealth(t, conn, wsRemoved, "removed")
 
 	// --- never_run: last_run_at IS NULL ---

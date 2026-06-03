@@ -63,13 +63,13 @@ func integrationDB_Budget(t *testing.T) *sql.DB {
 		t.Fatalf("ping: %v", err)
 	}
 	if _, err := conn.ExecContext(context.Background(),
-		`DELETE FROM workspaces WHERE id LIKE 'integ-bud-%'`); err != nil {
+		`DELETE FROM workspaces WHERE name LIKE 'integ-bud-%'`); err != nil {
 		t.Fatalf("cleanup: %v", err)
 	}
 	prev := db.DB
 	db.DB = conn
 	t.Cleanup(func() {
-		conn.ExecContext(context.Background(), `DELETE FROM workspaces WHERE id LIKE 'integ-bud-%'`)
+		conn.ExecContext(context.Background(), `DELETE FROM workspaces WHERE name LIKE 'integ-bud-%'`)
 		db.DB = prev
 		conn.Close()
 	})
@@ -77,8 +77,9 @@ func integrationDB_Budget(t *testing.T) *sql.DB {
 }
 
 // seedWorkspace_Budget inserts a workspaces row with optional budget_limit
-// (nil = NULL) and a fixed monthly_spend. The status is always 'running' —
-// the removed-status case uses a separate helper.
+// (nil = NULL) and a fixed monthly_spend. The status is hardcoded to
+// 'online' (a valid workspace_status enum value — see migration 043).
+// The removed-status case uses a separate helper.
 func seedWorkspace_Budget(t *testing.T, conn *sql.DB, id string, budgetLimit *int64, monthlySpend int64) {
 	t.Helper()
 	var lim interface{} = nil
@@ -87,7 +88,7 @@ func seedWorkspace_Budget(t *testing.T, conn *sql.DB, id string, budgetLimit *in
 	}
 	if _, err := conn.ExecContext(context.Background(),
 		`INSERT INTO workspaces (id, name, status, budget_limit, monthly_spend)
-		 VALUES ($1, $2, 'running', $3, $4)`,
+		 VALUES ($1, $2, 'online', $3, $4)`,
 		id, "integ-bud-"+id, lim, monthlySpend); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
@@ -125,10 +126,10 @@ func TestIntegration_Budget_GetPatchPersistsAndValidates(t *testing.T) {
 	conn := integrationDB_Budget(t)
 	handler := NewBudgetHandler()
 
-	wsA := "integ-bud-ws-a"
-	wsB := "integ-bud-ws-b"
-	wsRemoved := "integ-bud-ws-removed"
-	wsGhost := "integ-bud-ws-ghost"
+	wsA := integUUID("integ-bud-ws-a")
+	wsB := integUUID("integ-bud-ws-b")
+	wsRemoved := integUUID("integ-bud-ws-removed")
+	wsGhost := integUUID("integ-bud-ws-ghost")
 
 	// Case A: no budget set (budget_limit NULL)
 	// Case B: under budget (limit 10000, spend 2500 → remaining 7500)
@@ -137,7 +138,7 @@ func TestIntegration_Budget_GetPatchPersistsAndValidates(t *testing.T) {
 	seedWorkspace_Budget(t, conn, wsA, nil, 0)
 	seedWorkspace_Budget(t, conn, wsB, int64Ptr(10000), 2500)
 	overLim := int64(1000)
-	seedWorkspace_Budget(t, conn, wsA+"over", &overLim, 1500)
+	seedWorkspace_Budget(t, conn, integUUID("integ-bud-ws-a-over"), &overLim, 1500)
 	// removed-workspace case
 	if _, err := conn.ExecContext(context.Background(),
 		`INSERT INTO workspaces (id, name, status, budget_limit, monthly_spend)

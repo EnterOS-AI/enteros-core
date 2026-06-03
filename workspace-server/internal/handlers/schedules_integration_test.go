@@ -62,9 +62,9 @@ func integrationDB_Schedules(t *testing.T) *sql.DB {
 	// Wipe in FK order: activity_logs first (references workspaces), then
 	// workspace_schedules (references workspaces), then workspaces.
 	for _, stmt := range []string{
-		`DELETE FROM activity_logs WHERE workspace_id LIKE 'integ-sch-%'`,
-		`DELETE FROM workspace_schedules WHERE workspace_id LIKE 'integ-sch-%'`,
-		`DELETE FROM workspaces WHERE id LIKE 'integ-sch-%'`,
+		`DELETE FROM activity_logs WHERE workspace_id IN (SELECT id FROM workspaces WHERE name LIKE 'integ-sch-%')`,
+		`DELETE FROM workspace_schedules WHERE workspace_id IN (SELECT id FROM workspaces WHERE name LIKE 'integ-sch-%')`,
+		`DELETE FROM workspaces WHERE name LIKE 'integ-sch-%'`,
 	} {
 		if _, err := conn.ExecContext(context.Background(), stmt); err != nil {
 			t.Fatalf("cleanup %q: %v", stmt, err)
@@ -73,9 +73,9 @@ func integrationDB_Schedules(t *testing.T) *sql.DB {
 	prev := db.DB
 	db.DB = conn
 	t.Cleanup(func() {
-		conn.ExecContext(context.Background(), `DELETE FROM activity_logs WHERE workspace_id LIKE 'integ-sch-%'`)
-		conn.ExecContext(context.Background(), `DELETE FROM workspace_schedules WHERE workspace_id LIKE 'integ-sch-%'`)
-		conn.ExecContext(context.Background(), `DELETE FROM workspaces WHERE id LIKE 'integ-sch-%'`)
+		conn.ExecContext(context.Background(), `DELETE FROM activity_logs WHERE workspace_id IN (SELECT id FROM workspaces WHERE name LIKE 'integ-sch-%')`)
+		conn.ExecContext(context.Background(), `DELETE FROM workspace_schedules WHERE workspace_id IN (SELECT id FROM workspaces WHERE name LIKE 'integ-sch-%')`)
+		conn.ExecContext(context.Background(), `DELETE FROM workspaces WHERE name LIKE 'integ-sch-%'`)
 		db.DB = prev
 		conn.Close()
 	})
@@ -85,7 +85,7 @@ func integrationDB_Schedules(t *testing.T) *sql.DB {
 func seedWorkspace_Schedules(t *testing.T, conn *sql.DB, id string) {
 	t.Helper()
 	if _, err := conn.ExecContext(context.Background(),
-		`INSERT INTO workspaces (id, name, status) VALUES ($1, $2, 'running')`,
+		`INSERT INTO workspaces (id, name, status) VALUES ($1, $2, 'online')`,
 		id, "integ-sch-"+id); err != nil {
 		t.Fatalf("seed workspace: %v", err)
 	}
@@ -132,8 +132,8 @@ func TestIntegration_Schedules_CRUDRunHistoryHealth_RoundTrip(t *testing.T) {
 	conn := integrationDB_Schedules(t)
 	handler := NewScheduleHandler()
 
-	wsA := "integ-sch-ws-a"
-	wsB := "integ-sch-ws-b"
+	wsA := integUUID("integ-sch-ws-a")
+	wsB := integUUID("integ-sch-ws-b")
 	seedWorkspace_Schedules(t, conn, wsA)
 	seedWorkspace_Schedules(t, conn, wsB)
 

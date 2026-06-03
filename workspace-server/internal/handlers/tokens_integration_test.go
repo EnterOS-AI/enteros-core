@@ -60,18 +60,18 @@ func integrationDB_Tokens(t *testing.T) *sql.DB {
 		t.Fatalf("ping: %v", err)
 	}
 	if _, err := conn.ExecContext(context.Background(),
-		`DELETE FROM workspace_auth_tokens WHERE workspace_id LIKE 'integ-tok-%'`); err != nil {
+		`DELETE FROM workspace_auth_tokens WHERE workspace_id IN (SELECT id FROM workspaces WHERE name LIKE 'integ-tok-%')`); err != nil {
 		t.Fatalf("cleanup tokens: %v", err)
 	}
 	if _, err := conn.ExecContext(context.Background(),
-		`DELETE FROM workspaces WHERE id LIKE 'integ-tok-%'`); err != nil {
+		`DELETE FROM workspaces WHERE name LIKE 'integ-tok-%'`); err != nil {
 		t.Fatalf("cleanup workspaces: %v", err)
 	}
 	prev := db.DB
 	db.DB = conn
 	t.Cleanup(func() {
-		conn.ExecContext(context.Background(), `DELETE FROM workspace_auth_tokens WHERE workspace_id LIKE 'integ-tok-%'`)
-		conn.ExecContext(context.Background(), `DELETE FROM workspaces WHERE id LIKE 'integ-tok-%'`)
+		conn.ExecContext(context.Background(), `DELETE FROM workspace_auth_tokens WHERE workspace_id IN (SELECT id FROM workspaces WHERE name LIKE 'integ-tok-%')`)
+		conn.ExecContext(context.Background(), `DELETE FROM workspaces WHERE name LIKE 'integ-tok-%'`)
 		db.DB = prev
 		conn.Close()
 	})
@@ -81,7 +81,7 @@ func integrationDB_Tokens(t *testing.T) *sql.DB {
 func seedWorkspace_Tokens(t *testing.T, conn *sql.DB, id string) {
 	t.Helper()
 	if _, err := conn.ExecContext(context.Background(),
-		`INSERT INTO workspaces (id, name, status) VALUES ($1, $2, 'running')`,
+		`INSERT INTO workspaces (id, name, status) VALUES ($1, $2, 'online')`,
 		id, "integ-tok-"+id); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
@@ -105,8 +105,8 @@ func TestIntegration_Tokens_CreateListRevoke_RoundTrip(t *testing.T) {
 	conn := integrationDB_Tokens(t)
 	handler := NewTokenHandler()
 
-	wsA := "integ-tok-ws-a"
-	wsB := "integ-tok-ws-b"
+	wsA := integUUID("integ-tok-ws-a")
+	wsB := integUUID("integ-tok-ws-b")
 	seedWorkspace_Tokens(t, conn, wsA)
 	seedWorkspace_Tokens(t, conn, wsB)
 
@@ -234,7 +234,7 @@ func TestIntegration_Tokens_CreateListRevoke_RoundTrip(t *testing.T) {
 	}
 
 	// --- Case 5: max-active-cap (50) — seed 50, then 51st → 429 ---
-	wsCap := "integ-tok-ws-cap"
+	wsCap := integUUID("integ-tok-ws-cap")
 	seedWorkspace_Tokens(t, conn, wsCap)
 	// Insert 50 active tokens directly to avoid hammering IssueToken 50 times.
 	for i := 0; i < maxTokensPerWorkspace; i++ {
