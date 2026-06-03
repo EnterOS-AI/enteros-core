@@ -502,6 +502,9 @@ func TestIntegration_ActivityList_IncludePeerInfo(t *testing.T) {
 	conn := integrationDB_ActivityDelegationA2A(t)
 	wsID := seedWorkspace(t, conn, "test-2151-include-peer")
 	peerID := seedWorkspace(t, conn, "test-2151-peer-enriched")
+	if _, err := conn.ExecContext(context.Background(), `UPDATE workspaces SET role = $1 WHERE id = $2`, "test-peer", peerID); err != nil {
+		t.Fatalf("set peer role: %v", err)
+	}
 	seedActivityLog(t, conn, wsID, "a2a_receive", "m1", "ok", &peerID, nil)
 
 	h := NewActivityHandler(nil)
@@ -958,7 +961,7 @@ func TestIntegration_A2AQueue_MarkCompletedAndFailed(t *testing.T) {
 	}
 
 	// Seed another item to test failed path with max attempts
-	qid2 := seedA2AQueueItem(t, conn, wsID, "", PriorityTask, body, "dispatched")
+	qid2 := seedA2AQueueItem(t, conn, wsID, "00000000-0000-0000-0000-000000000001", PriorityTask, body, "dispatched")
 	for i := 0; i < 6; i++ {
 		MarkQueueItemFailed(context.Background(), qid2, "transient error")
 	}
