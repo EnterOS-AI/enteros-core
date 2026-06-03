@@ -39,7 +39,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 	_ "github.com/lib/pq"
-	mdb "github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
+
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 )
 
 func integrationDB_AdminSchedulesHealth(t *testing.T) *sql.DB {
@@ -63,12 +64,12 @@ func integrationDB_AdminSchedulesHealth(t *testing.T) *sql.DB {
 		`DELETE FROM workspaces WHERE id LIKE 'integ-ash-%'`); err != nil {
 		t.Fatalf("cleanup workspaces: %v", err)
 	}
-	prev := mdb.DB
-	mdb.DB = conn
+	prev := db.DB
+	db.DB = conn
 	t.Cleanup(func() {
 		conn.ExecContext(context.Background(), `DELETE FROM workspace_schedules WHERE workspace_id LIKE 'integ-ash-%'`)
 		conn.ExecContext(context.Background(), `DELETE FROM workspaces WHERE id LIKE 'integ-ash-%'`)
-		mdb.DB = prev
+		db.DB = prev
 		conn.Close()
 	})
 	return conn
