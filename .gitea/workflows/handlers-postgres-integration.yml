@@ -264,7 +264,7 @@ jobs:
             echo "::error::INTEGRATION_DB_URL is empty — postgres-start step did not export the connection string"
             exit 1
           fi
-          echo "INTEGRATION_DB_URL is set (${INTEGRATION_DB_URL%%@*}@...)"
+          echo "INTEGRATION_DB_URL is set"
 
       - if: needs.detect-changes.outputs.handlers == 'true'
         name: Run integration tests
