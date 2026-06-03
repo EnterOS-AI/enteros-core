@@ -243,7 +243,8 @@ jobs:
           # MUST exist for the integration tests to be meaningful. Hard-
           # fail if any didn't land — that would be a real regression we
           # want loud.
-          for tbl in delegations workspaces activity_logs pending_uploads; do
+          # workspace_schedules added for the #2149 scheduler integration tests.
+          for tbl in delegations workspaces activity_logs pending_uploads workspace_schedules; do
             if ! psql -h "${PG_HOST}" -U postgres -d molecule -tA \
                 -c "SELECT 1 FROM information_schema.tables WHERE table_name = '$tbl'" \
                 | grep -q 1; then
@@ -260,6 +261,16 @@ jobs:
           # points at the per-run bridge IP, not 127.0.0.1, so concurrent
           # workflow runs don't fight over a host-net 5432 port.
           go test -tags=integration -timeout 5m -v ./internal/handlers/ -run "^TestIntegration_"
+
+      - if: needs.detect-changes.outputs.handlers == 'true'
+        name: Run scheduler integration tests (#2149)
+        run: |
+          # #2149: real-PG regression coverage for the scheduler firing loop
+          # (tick → A2A fire → write-back of last_run_at/next_run_at/run_count/
+          # activity_logs jsonb incl. invalid-UTF-8 sanitization + sweepPhantomBusy).
+          # Reuses the same migrated Postgres (workspace_schedules / activity_logs
+          # / workspaces all landed by the migration replay step above).
+          go test -tags=integration -timeout 5m -v ./internal/scheduler/ -run "^TestIntegration_"
 
       - if: failure() && needs.detect-changes.outputs.handlers == 'true'
         name: Diagnostic dump on failure
