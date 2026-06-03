@@ -43,7 +43,6 @@ package handlers
 import (
 	"context"
 	"database/sql"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -63,10 +62,7 @@ import (
 // but kept separate so each table's wipe step is local to its tests.
 func integrationDB_PendingUploads(t *testing.T) *sql.DB {
 	t.Helper()
-	url := os.Getenv("INTEGRATION_DB_URL")
-	if url == "" {
-		t.Skip("INTEGRATION_DB_URL not set; skipping (local devs: see file header)")
-	}
+	url := requireIntegrationDBURL(t)
 	conn, err := sql.Open("postgres", url)
 	if err != nil {
 		t.Fatalf("open: %v", err)
