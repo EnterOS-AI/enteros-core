@@ -177,7 +177,7 @@ func TestIntegration_Schedules_CRUDRunHistoryHealth_RoundTrip(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("LIST: status want 200, got %d: %s", w.Code, w.Body.String())
 	}
-	var listed []scheduleResponse
+	var listed []ScheduleResponse
 	json.Unmarshal(w.Body.Bytes(), &listed)
 	if len(listed) != 1 {
 		t.Errorf("LIST: want 1 schedule for wsA, got %d", len(listed))
@@ -318,14 +318,14 @@ func TestIntegration_Schedules_CRUDRunHistoryHealth_RoundTrip(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("HEALTH self: status want 200, got %d: %s", w.Code, w.Body.String())
 	}
-	var health []scheduleHealthResponse
+	var health []ScheduleHealthResponse
 	json.Unmarshal(w.Body.Bytes(), &health)
 	if len(health) != 1 {
 		t.Errorf("HEALTH self: want 1 entry for wsA, got %d", len(health))
 	}
 	if len(health) > 0 {
 		// Must NOT include Prompt or CronExpr (per the comment on
-		// scheduleHealthResponse — issue #249).
+		// ScheduleHealthResponse — issue #249).
 		rawJSON := w.Body.String()
 		if bytes.Contains([]byte(rawJSON), []byte("run backup")) {
 			t.Errorf("HEALTH self: response leaked prompt (issue #249)")
