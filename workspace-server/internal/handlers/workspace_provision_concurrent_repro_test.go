@@ -98,6 +98,11 @@ func (r *recordingCPProv) startedSet() map[string]struct{} {
 func TestProvisionWorkspaceCP_ConcurrentBurst_NoSilentDrop(t *testing.T) {
 	const numWorkspaces = 7
 
+	// Supply the CP proxy env so the platform-managed default does not abort
+	// with MISSING_PLATFORM_PROXY (molecule-core#2162).
+	t.Setenv("MOLECULE_LLM_BASE_URL", "https://api.example.test/api/v1/internal/llm/openai/v1")
+	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
+
 	mock := setupTestDB(t)
 
 	// Every goroutine runs prepareProvisionContext → mintWorkspaceSecrets

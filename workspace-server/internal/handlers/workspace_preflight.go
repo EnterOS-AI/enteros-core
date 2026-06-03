@@ -93,3 +93,16 @@ func formatMissingBYOKCredentialError(mode string) string {
 		mode,
 	)
 }
+
+// formatMissingPlatformProxyError builds the user-facing message for a
+// provision failure caused by a platform-managed workspace whose control-plane
+// proxy environment is absent (#2162). The platform-managed path requires
+// MOLECULE_LLM_BASE_URL + MOLECULE_LLM_USAGE_TOKEN (or their OPENAI_*
+// fallbacks) to inject a usable credential; without them the workspace must
+// NOT start credential-less.
+func formatMissingPlatformProxyError() string {
+	return "this workspace is configured for platform-managed LLM billing but the control-plane proxy is not ready. " +
+		"The required platform proxy env (MOLECULE_LLM_BASE_URL + MOLECULE_LLM_USAGE_TOKEN) is absent. " +
+		"This is usually a transient boot-race; retry in 30 seconds. If it persists, verify the platform proxy " +
+		"is configured for this tenant/runtime and contact the platform team."
+}
