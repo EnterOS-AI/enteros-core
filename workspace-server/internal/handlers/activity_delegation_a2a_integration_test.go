@@ -26,6 +26,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -159,8 +160,46 @@ func TestIntegration_ActivityList_Basic(t *testing.T) {
 	}
 }
 
+func TestIntegration_ActivityReport_SourceIDSpoofGuard(t *testing.T) {
+	conn := integrationDB_ActivityDelegationA2A(t)
+	wsID := seedWorkspace(t, conn, "test-2151-activity-spoof")
+	otherWS := seedWorkspace(t, conn, "test-2151-activity-victim")
+
+	h := NewActivityHandler(noOpEmitter{})
+	c, w := newTestGinContext()
+	c.Params = gin.Params{{Key: "id", Value: wsID}}
+	c.Request = httptest.NewRequest(http.MethodPost, "/workspaces/"+wsID+"/activity", strings.NewReader(`{
+		"activity_type": "agent_log",
+		"source_id": "`+otherWS+`"
+	}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	h.Report(c)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("Report with spoofed source_id returned %d, want 403", w.Code)
+	}
+}
+
+func TestIntegration_ActivityReport_ValidType(t *testing.T) {
+	conn := integrationDB_ActivityDelegationA2A(t)
+	wsID := seedWorkspace(t, conn, "test-2151-activity-valid")
+
+	h := NewActivityHandler(noOpEmitter{})
+	c, w := newTestGinContext()
+	c.Params = gin.Params{{Key: "id", Value: wsID}}
+	c.Request = httptest.NewRequest(http.MethodPost, "/workspaces/"+wsID+"/activity", strings.NewReader(`{
+		"activity_type": "agent_log",
+		"summary": "test"
+	}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	h.Report(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("Report valid activity returned %d, want 200", w.Code)
+	}
+}
+
 // TODO(#2151): Activity List filter matrix (type, source, since_secs, since_id, peer_id, include=peer_info, before_ts)
-// TODO(#2151): Activity Report + source_id spoof guard
 // TODO(#2151): SessionSearch basic + empty query
 // TODO(#2151): Notify with attachments validation
 
@@ -261,7 +300,93 @@ func TestIntegration_A2AQueue_DequeueNext(t *testing.T) {
 	}
 }
 
+func TestIntegration_A2AQueue_IdempotencyConflict(t *testing.T) {
+	conn := integrationDB_ActivityDelegationA2A(t)
+	wsID := seedWorkspace(t, conn, "test-2151-a2a-idem")
+	callerID := seedWorkspace(t, conn, "test-2151-a2a-idem-caller")
+	body := []byte(`{"method":"message/send","params":{"message":{"text":"hi"}}}`)
+
+	id1, depth1, err := EnqueueA2A(context.Background(), wsID, callerID, PriorityTask, body, "message/send", "idem-key-1", nil)
+	if err != nil {
+		t.Fatalf("EnqueueA2A first: %v", err)
+	}
+	if depth1 != 1 {
+		t.Fatalf("expected depth 1, got %d", depth1)
+	}
+
+	id2, depth2, err := EnqueueA2A(context.Background(), wsID, callerID, PriorityTask, body, "message/send", "idem-key-1", nil)
+	if err != nil {
+		t.Fatalf("EnqueueA2A second: %v", err)
+	}
+	if id1 != id2 {
+		t.Fatalf("idempotency mismatch: %s vs %s", id1, id2)
+	}
+	if depth2 != 1 {
+		t.Fatalf("expected depth still 1 after idempotent re-enqueue, got %d", depth2)
+	}
+}
+
+func TestIntegration_A2AQueue_MarkCompletedAndFailed(t *testing.T) {
+	conn := integrationDB_ActivityDelegationA2A(t)
+	wsID := seedWorkspace(t, conn, "test-2151-a2a-lifecycle")
+	body := []byte(`{"test":true}`)
+	qid := seedA2AQueueItem(t, conn, wsID, "", PriorityTask, body, "dispatched")
+
+	MarkQueueItemCompleted(context.Background(), qid)
+	var status string
+	if err := conn.QueryRowContext(context.Background(), `SELECT status FROM a2a_queue WHERE id = $1`, qid).Scan(&status); err != nil {
+		t.Fatalf("select after completed: %v", err)
+	}
+	if status != "completed" {
+		t.Fatalf("expected completed, got %s", status)
+	}
+
+	// Seed another item to test failed path with max attempts
+	qid2 := seedA2AQueueItem(t, conn, wsID, "", PriorityTask, body, "dispatched")
+	for i := 0; i < 6; i++ {
+		MarkQueueItemFailed(context.Background(), qid2, "transient error")
+	}
+	var status2 string
+	var lastErr string
+	if err := conn.QueryRowContext(context.Background(), `SELECT status, last_error FROM a2a_queue WHERE id = $1`, qid2).Scan(&status2, &lastErr); err != nil {
+		t.Fatalf("select after failed: %v", err)
+	}
+	if status2 != "failed" {
+		t.Fatalf("expected failed after max attempts, got %s", status2)
+	}
+	if lastErr == "" {
+		t.Fatal("expected last_error set")
+	}
+}
+
+func TestIntegration_A2AQueue_DropStaleQueueItems(t *testing.T) {
+	conn := integrationDB_ActivityDelegationA2A(t)
+	wsID := seedWorkspace(t, conn, "test-2151-a2a-stale")
+	body := []byte(`{"test":true}`)
+
+	// Insert a stale queued item by backdating enqueued_at
+	if _, err := conn.ExecContext(context.Background(), `
+		INSERT INTO a2a_queue (id, workspace_id, priority, body, status, enqueued_at)
+		VALUES (gen_random_uuid(), $1, $2, $3::jsonb, 'queued', now() - interval '10 minutes')
+	`, wsID, PriorityTask, string(body)); err != nil {
+		t.Fatalf("seed stale item: %v", err)
+	}
+
+	dropped, err := DropStaleQueueItems(context.Background(), wsID, 5)
+	if err != nil {
+		t.Fatalf("DropStaleQueueItems: %v", err)
+	}
+	if dropped != 1 {
+		t.Fatalf("expected 1 dropped, got %d", dropped)
+	}
+
+	var count int
+	if err := conn.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM a2a_queue WHERE workspace_id = $1 AND status = 'queued'`, wsID).Scan(&count); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected 0 queued items after drop, got %d", count)
+	}
+}
+
 // TODO(#2151): A2A Queue Status endpoint (auth rules, 404 vs 403, response body inclusion)
-// TODO(#2151): A2A Queue idempotency conflict
-// TODO(#2151): A2A Queue MarkQueueItemCompleted / Failed
-// TODO(#2151): A2A Queue DropStaleQueueItems
