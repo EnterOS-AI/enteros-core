@@ -373,6 +373,36 @@ jobs:
         run: |
           set -euo pipefail
           RESP="$RUNNER_TEMP/prod-redeploy-response.json"
+
+          # Superseded-job guard. This workflow has no `concurrency:` (header
+          # explains why: Gitea 1.22.6 cancels queued prod deploys). So two
+          # close main pushes run BOTH deploy-production jobs. The newer one
+          # rolls the fleet to its (newer) build first; this older job's strict
+          # equality check below would then see tenants on the NEWER SHA and
+          # false-red "$slug is stale" even though the fleet is AHEAD, not
+          # behind (git SHAs aren't ordered; /buildinfo exposes only git_sha).
+          #
+          # If main's current head is no longer THIS job's SHA, a newer commit
+          # has landed and this deploy is superseded — the newest job's verify
+          # is authoritative. Skip strict verify and succeed. exit 0 => newer
+          # head printed (superseded); exit 10 => still the latest, proceed to
+          # the strict verify so a genuinely-behind tenant still fails loudly.
+          set +e
+          NEWER_HEAD="$(python3 .gitea/scripts/prod-auto-deploy.py check-superseded)"
+          SUPERSEDED_EXIT=$?
+          set -e
+          if [ "$SUPERSEDED_EXIT" -eq 0 ] && [ -n "$NEWER_HEAD" ]; then
+            echo "::notice::Superseded deploy: main head is now ${NEWER_HEAD:0:7} (this job deployed ${GITHUB_SHA:0:7}). The fleet is at or ahead of this build; the newer deploy job's verify is authoritative. Skipping strict SHA verify."
+            {
+              echo ""
+              echo "### Buildinfo verification skipped — superseded deploy"
+              echo ""
+              echo "This deploy job's SHA \`${GITHUB_SHA:0:7}\` is no longer the head of \`main\` (now \`${NEWER_HEAD:0:7}\`)."
+              echo "A newer deploy job is rolling the fleet forward; its verify is authoritative."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
           mapfile -t SLUGS < <(jq -r '.results[]? | .slug' "$RESP")
           if [ ${#SLUGS[@]} -eq 0 ]; then
             echo "::error::No tenants returned from redeploy-fleet; refusing to mark production deploy verified."

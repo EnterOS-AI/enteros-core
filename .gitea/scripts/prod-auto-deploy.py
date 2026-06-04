@@ -364,6 +364,71 @@ def _api_json_optional(url: str, token: str) -> tuple[int, dict | None]:
         return exc.code, None
 
 
+def current_branch_head(env: dict[str, str]) -> str | None:
+    """Return the SHA at the tip of the deploy branch (main) per Gitea, or None.
+
+    Used to detect a *superseded* deploy job (see `superseded_by`). Fail-safe:
+    any read error / missing token returns None so the caller treats the job as
+    NOT superseded and the strict /buildinfo verify still runs. We never let an
+    unreadable head silently green a deploy.
+    """
+
+    token = env.get("GITEA_TOKEN", "").strip()
+    if not token:
+        return None
+    host = env.get("GITEA_HOST", "git.moleculesai.app")
+    repo = env.get("GITHUB_REPOSITORY", "molecule-ai/molecule-core")
+    # Deploy lane is on: push:main; the branch is always main here, but read it
+    # from the ref name when present so a future branch rename doesn't break us.
+    branch = env.get("GITHUB_REF_NAME", "").strip() or "main"
+    url = f"https://{host}/api/v1/repos/{repo}/branches/{quote(branch, safe='')}"
+    status, body = _api_json_optional(url, token)
+    if status != 200 or not isinstance(body, dict):
+        return None
+    commit = body.get("commit")
+    if isinstance(commit, dict):
+        head = commit.get("id") or commit.get("sha")
+        if isinstance(head, str) and head.strip():
+            return head.strip()
+    return None
+
+
+def superseded_by(env: dict[str, str]) -> str | None:
+    """Return the newer head SHA if THIS deploy job has been superseded, else None.
+
+    This workflow runs with no `concurrency:` (intentional — Gitea 1.22.6 cancels
+    queued runs, which is unacceptable for a prod deploy). When two main pushes
+    land close together, BOTH deploy-production jobs run. The newer push rolls the
+    fleet forward first; the OLDER job's strict /buildinfo verify then sees tenants
+    on the NEWER SHA and false-reds with "$slug is stale" — even though the fleet
+    is AHEAD, not behind. Git SHAs aren't ordered, so the verify can't tell ahead
+    from behind on its own (and /buildinfo exposes only git_sha, no build time).
+
+    Resolve it at the source of truth for ordering — the branch ref: if main's
+    current head is a DIFFERENT SHA than the one this job is deploying, a newer
+    commit has landed and this job is superseded; the newest job's verify is the
+    authoritative one. We return that head SHA so the caller can log it and exit
+    success early, skipping the strict-equality verify for this stale job.
+
+    Fail-safe: returns None (NOT superseded) when the head can't be read or equals
+    our SHA, so a genuinely-behind tenant under the LATEST deploy job still fails
+    the strict verify loudly. This never suppresses a real-stale signal — it only
+    excuses a job that is no longer the latest from asserting exact equality.
+    """
+
+    sha = env.get("GITHUB_SHA", "").strip()
+    if not sha:
+        return None
+    head = current_branch_head(env)
+    if not head:
+        return None
+    # SHA lengths can differ (short vs full); compare on the shorter prefix.
+    n = min(len(head), len(sha))
+    if head[:n].lower() == sha[:n].lower():
+        return None
+    return head
+
+
 def live_disable_flag(env: dict[str, str]) -> str:
     """Return a live disable value from Gitea variables when readable.
 
@@ -442,6 +507,14 @@ def main() -> int:
     sub.add_parser("plan", help="print production deploy plan as JSON")
     sub.add_parser("assert-enabled", help="fail if production deploy is currently disabled")
     sub.add_parser("wait-ci", help="block until required CI context is green")
+    sub.add_parser(
+        "check-superseded",
+        help=(
+            "exit 0 if a newer commit has landed on the deploy branch (this job "
+            "is superseded; prints the newer head SHA), exit 10 if this job is "
+            "still the latest"
+        ),
+    )
     rollout_parser = sub.add_parser("rollout", help="execute canary-first scoped production rollout")
     rollout_parser.add_argument("--plan", required=True, help="path to prod-auto-deploy plan JSON")
     rollout_parser.add_argument("--response", required=True, help="path to write aggregate response JSON")
@@ -457,6 +530,16 @@ def main() -> int:
         if args.command == "wait-ci":
             wait_for_ci_context(dict(os.environ))
             return 0
+        if args.command == "check-superseded":
+            newer = superseded_by(dict(os.environ))
+            if newer:
+                print(newer)
+                return 0
+            # Exit 10 (not 0, not 1): "this job is still the latest". The
+            # workflow treats only exit 0 as superseded; 10 means proceed to
+            # the strict verify. A non-zero code here is informational, not a
+            # failure — the workflow step swallows it.
+            return 10
         if args.command == "rollout":
             rollout_from_plan_file(args.plan, args.response, dict(os.environ))
             return 0
