@@ -283,12 +283,12 @@ export default async function globalSetup(_config: FullConfig): Promise<void> {
   // Hermes cold-boot takes 10-13 min on slow apt days (apt + uv + hermes
   // install + npm browser-tools). The controlplane bootstrap-watcher
   // deadline fires at 5 min and sets status=failed prematurely; heartbeat
-  // then transitions failed → online after install.sh finishes. So
-  // 'failed' is a TRANSIENT state we must tolerate — log once and keep
-  // polling, only hard-fail at the deadline. Pre-fix this was a flake
-  // generator: workspace went failed→online inside our window but we
-  // bailed at the failed read. See test_staging_full_saas.sh step 7/11
-  // and issue #2632.
+  // then transitions failed → online after install.sh finishes. The ONLY
+  // failed shape we tolerate is the pre-start credential-abort
+  // (uptime_seconds=0, no last_sample_error) — the agent never ran. Real
+  // boot regressions (image pull error, panic, PYTHONPATH, etc.) still
+  // hard-throw immediately so triage gets detail without waiting for a
+  // polling timeout. See test_staging_full_saas.sh step 7/11 and issue #2632.
   //
   // That distinction became load-bearing on 2026-06-03: workspace-server
   // #2162 (fix(provision): platform-managed workspace must fail-closed when
@@ -311,10 +311,10 @@ export default async function globalSetup(_config: FullConfig): Promise<void> {
   // the node + tabs render, proceed. We do NOT mask a real boot regression:
   // any `failed` carrying a last_sample_error, OR a non-zero uptime (the
   // agent started then crashed — image pull, panic, PYTHONPATH, etc.),
-  // is logged and we keep polling (the transient-failed tolerance from #2632).
+  // still hard-throws immediately so triage gets boot_stage / last_error /
+  // image fields without waiting for a polling timeout.
   // Genuine *infra* provision failure is already caught loud one step
   // earlier at the org level (instance_status === "failed").
-  let wsFailedLogged = false;
   await waitFor<boolean>(
     async () => {
       const r = await jsonFetch(`${tenantURL}/workspaces/${workspaceId}`, {
@@ -341,21 +341,11 @@ export default async function globalSetup(_config: FullConfig): Promise<void> {
           );
           return true;
         }
-        if (!wsFailedLogged) {
-          // last_sample_error is often empty when the failure happens before
-          // the agent emits a sample (e.g. boot crash, image pull error,
-          // missing PYTHONPATH, OpenAI quota at startup). Dumping the full
-          // body gives triage the boot_stage / last_error / image fields it
-          // needs without a second probe. Otherwise this propagates as a
-          // bare "Workspace failed: " — the exact useless message that
-          // sent #2632 to the issue tracker.
-          const detail = sampleErr
-            ? sampleErr
-            : `(no last_sample_error) full body: ${JSON.stringify(r.body)}`;
-          console.log(`[staging-setup] workspace ${workspaceId} transiently failed — waiting for heartbeat recovery (bootstrap-watcher deadline, see cp#245). detail: ${detail}`);
-          wsFailedLogged = true;
-        }
-        return null;
+        // Real boot regression — hard-throw immediately with full detail.
+        const detail = sampleErr
+          ? sampleErr
+          : `(no last_sample_error) full body: ${JSON.stringify(r.body)}`;
+        throw new Error(`Workspace failed: ${detail}`);
       }
       return null;
     },
