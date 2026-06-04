@@ -474,6 +474,32 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 			})
 			return
 		}
+		// issue #2172 (provider-side companion): once the (runtime, model)
+		// pair is known to be registered, confirm the DERIVED provider
+		// (the one the adapter will resolve at boot) is a known provider
+		// in the providers.yaml catalog. Live trigger (adk-demo Assistant,
+		// 2026-06-03): the model-side check passed for a registry-resident
+		// model whose derived provider name was NOT in the providers list,
+		// so the save was accepted and the agent wedged at boot with
+		// "provider=X not in providers registry". This check is a
+		// defense-in-depth registry-consistency guard: by construction a
+		// model in a runtime's native set derives to a provider that IS in
+		// the catalog, so the rejection path is primarily a registry-data
+		// invariant — any future drift between `providers:` and `runtimes:`
+		// fails the create with a clear pointer to the missing provider
+		// rather than silently wedging the agent. Fails open for runtimes
+		// the registry doesn't know (langgraph/external/kimi/mock/federated
+		// — the federation contract the model-side check also honors).
+		if ok, why := validateDerivedProviderInRegistry(payload.Runtime, payload.Model); !ok {
+			log.Printf("Create: 422 DERIVED_PROVIDER_NOT_IN_REGISTRY (runtime=%q model=%q): %s [issue #2172 hard-reject]", payload.Runtime, payload.Model, why)
+			c.JSON(http.StatusUnprocessableEntity, gin.H{
+				"error":   why,
+				"runtime": payload.Runtime,
+				"model":   payload.Model,
+				"code":    "DERIVED_PROVIDER_NOT_IN_REGISTRY",
+			})
+			return
+		}
 	}
 
 	ctx := c.Request.Context()
