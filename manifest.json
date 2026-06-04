@@ -34,8 +34,6 @@
   ],
   "org_templates": [
     {"name": "molecule-dev", "repo": "molecule-ai/molecule-ai-org-template-molecule-dev", "ref": "main"},
-    {"name": "free-beats-all", "repo": "molecule-ai/molecule-ai-org-template-free-beats-all", "ref": "main"},
-    {"name": "medo-smoke", "repo": "molecule-ai/molecule-ai-org-template-medo-smoke", "ref": "main"},
     {"name": "molecule-worker-gemini", "repo": "molecule-ai/molecule-ai-org-template-molecule-worker-gemini", "ref": "main"},
     {"name": "ux-ab-lab", "repo": "molecule-ai/molecule-ai-org-template-ux-ab-lab", "ref": "main"}
   ]
