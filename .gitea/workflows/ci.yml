@@ -25,10 +25,9 @@
 #      sufficient for `actions/checkout` against this same repo.
 #
 #   4. Docs — no docs/scripts reference github.com URLs that need swapping.
-#      The canvas-deploy-reminder step writes a `ghcr.io/...` image
-#      reference into the step summary text — that's documentation prose
-#      pointing at the ECR-mirrored canvas image and stays unchanged for
-#      this port (a separate cleanup if ghcr→ECR sweep is in scope).
+#      The canvas-deploy-status step (core#2226, formerly canvas-deploy-reminder)
+#      writes the canvas ordered-deploy status into the step summary; it points
+#      at the ECR canvas image and the publish workflow, no ghcr.io prose.
 #
 # Cross-links:
 #   - RFC: internal#219 (CI/CD hard-gate hardening)
@@ -389,61 +388,61 @@ jobs:
 
   # mc#959 root-fix (sre)
 
-  canvas-deploy-reminder:
-    name: Canvas Deploy Reminder
+  canvas-deploy-status:
+    # core#2226: replaces the old advisory "Canvas Deploy Reminder". The canvas
+    # image now has a real ORDERED auto-deploy (publish-canvas-image.yml:
+    # build → push :staging-<sha> → wait green main CI → promote :latest by
+    # digest), and docker-compose pins via CANVAS_IMAGE_TAG. There is no longer
+    # a manual "go run docker compose pull by hand" step to remind operators
+    # about — so this job just records, on a canvas-touching main push, that the
+    # ordered deploy is handling it (and where to watch), instead of prescribing
+    # a manual action that determinism made obsolete.
+    name: Canvas Deploy Status
     runs-on: docker-host
-    # mc#1982 root-fix: added job-level `if:` so ci-required-drift.py's
-    # ci_job_names() detects this as github.ref-gated and skips it from F1.
-    # The step-level exit 0 handles the "not main push" case; the job-level
-    # `if:` makes the gating explicit so the drift script sees it.
-    # Runs on both main and staging pushes; step exits 0 when not applicable.
+    # Job-level `if:` so ci-required-drift.py's ci_job_names() detects this as
+    # github.ref-gated and skips it from the required-context F1 set (mc#1982).
+    # Step-level exit 0 handles the "not a canvas main push" case.
     if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/staging' }}
     needs: [changes, canvas-build]
     steps:
-      - name: Write deploy reminder to step summary
+      - name: Record canvas ordered-deploy status
         env:
           COMMIT_SHA: ${{ github.sha }}
           CANVAS_CHANGED: ${{ needs.changes.outputs.canvas }}
           EVENT_NAME: ${{ github.event_name }}
           REF_NAME: ${{ github.ref }}
-          # github.server_url resolves via the workflow-level env override
-          # to the Gitea instance, so the RUN_URL points at the Gitea run
-          # page (not github.com). See feedback_act_runner_github_server_url.
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          # github.server_url resolves via the workflow-level env override to the
+          # Gitea instance, so RUN_URL points at the Gitea run page (not github.com).
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions
         run: |
           set -euo pipefail
           if [ "$CANVAS_CHANGED" != "true" ] || [ "$EVENT_NAME" != "push" ] || [ "$REF_NAME" != "refs/heads/main" ]; then
-            echo "Canvas deploy reminder not applicable for event=$EVENT_NAME ref=$REF_NAME canvas_changed=$CANVAS_CHANGED."
+            echo "Canvas deploy status not applicable for event=$EVENT_NAME ref=$REF_NAME canvas_changed=$CANVAS_CHANGED."
             exit 0
           fi
 
           # Write body to a temp file — avoids backtick escaping in shell.
-          cat > /tmp/deploy-reminder.md << 'BODY'
-          ## Canvas build passed — deploy required
+          cat > /tmp/deploy-status.md << 'BODY'
+          ## Canvas ordered deploy in progress — no manual action required
 
-          The `publish-canvas-image` workflow is now building a fresh Docker image
-          (`ghcr.io/molecule-ai/canvas:latest`) in the background.
+          This canvas-touching main push triggers `publish-canvas-image`, which now
+          runs an ORDERED, CI-gated deploy (core#2226) — the same shape as the
+          platform's deploy-production:
 
-          Once it completes (~3–5 min), apply on the host machine with:
-          ```bash
-          cd <runner-workspace>
-          git pull origin main
-          docker compose pull canvas && docker compose up -d canvas
-          ```
+          1. Build → push `molecule-ai/canvas:staging-<sha>` + `:staging-latest`.
+          2. Wait for green main CI on this SHA.
+          3. Promote `:latest` to the verified `:staging-<sha>` by digest.
 
-          If you need to rebuild from local source instead (e.g. testing unreleased
-          changes or a new `NEXT_PUBLIC_*` URL), use:
-          ```bash
-          docker compose build canvas && docker compose up -d canvas
-          ```
+          Tenants/hosts pin via `CANVAS_IMAGE_TAG` (default `latest` = the last
+          CI-green build), so a deploy is reproducible — no hand-run
+          `docker compose pull` needed. Watch the run in the canvas publish workflow.
           BODY
-          printf '\n> Posted automatically by CI · commit `%s` · [build log](%s)\n' \
-            "$COMMIT_SHA" "$RUN_URL" >> /tmp/deploy-reminder.md
+          printf '\n> Posted automatically by CI · commit `%s` · [publish workflow](%s)\n' \
+            "$COMMIT_SHA" "$RUN_URL" >> /tmp/deploy-status.md
 
-          # Gitea has no commit-comments API; write to GITHUB_STEP_SUMMARY,
-          # which both GitHub Actions and Gitea Actions render as the
-          # workflow run's summary page. (#75 / PR-D)
-          cat /tmp/deploy-reminder.md >> "$GITHUB_STEP_SUMMARY"
+          # Gitea has no commit-comments API; write to GITHUB_STEP_SUMMARY, which
+          # both GitHub and Gitea Actions render as the run's summary page.
+          cat /tmp/deploy-status.md >> "$GITHUB_STEP_SUMMARY"
 
   # Python Lint & Test — required check, always runs.
   # Runtime Python moved to molecule-ai-workspace-runtime. Keep this context as
