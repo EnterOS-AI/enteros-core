@@ -60,6 +60,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # bp-required: pending #718 — soak-then-promote, not in BP yet.
   compare:
     name: Compare synced providers.yaml against controlplane canonical
     runs-on: ubuntu-latest
