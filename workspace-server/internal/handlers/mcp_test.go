@@ -285,6 +285,121 @@ func TestMCPHandler_DelegateTaskAsync_RoutesThroughPlatformA2AProxy(t *testing.T
 // goroutine returns early and never calls proxyA2ARequest with a nil/empty
 // body. Before the fix the goroutine logged the error and fell through,
 // dispatching a malformed A2A request.
+
+func TestMCPHandler_DelegateTask_WithAttachments(t *testing.T) {
+	h, mock := newMCPHandler(t)
+	callerID := "11111111-1111-1111-1111-111111111111"
+	targetID := "22222222-2222-2222-2222-222222222222"
+	parentID := "33333333-3333-3333-3333-333333333333"
+
+	expectCanCommunicateSiblings(mock, callerID, targetID, parentID)
+	mock.ExpectExec(`(?s)INSERT INTO activity_logs.*'delegation'.*'delegate'`).
+		WithArgs(callerID, callerID, targetID, "Delegating to "+targetID, sqlmock.AnyArg(), "pending").
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(`UPDATE activity_logs`).
+		WithArgs("dispatched", "", callerID, sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	h.a2aProxy = func(ctx context.Context, workspaceID string, body []byte, proxyCallerID string, logActivity bool) (int, []byte, error) {
+		if workspaceID != targetID || proxyCallerID != callerID {
+			t.Fatalf("unexpected proxy route target=%q caller=%q", workspaceID, proxyCallerID)
+		}
+		bodyStr := string(body)
+		if !strings.Contains(bodyStr, `"text":"review this video"`) {
+			t.Fatalf("A2A body missing task text: %s", bodyStr)
+		}
+		if !strings.Contains(bodyStr, `"kind":"video"`) {
+			t.Fatalf("A2A body missing video attachment kind: %s", bodyStr)
+		}
+		if !strings.Contains(bodyStr, `"uri":"workspace:/tmp/clip.mp4"`) {
+			t.Fatalf("A2A body missing attachment uri: %s", bodyStr)
+		}
+		if !strings.Contains(bodyStr, `"mime_type":"video/mp4"`) {
+			t.Fatalf("A2A body missing attachment mime_type: %s", bodyStr)
+		}
+		return 200, []byte(`{"result":{"message":{"parts":[{"text":"done"}]}}}`), nil
+	}
+
+	out, err := h.toolDelegateTask(context.Background(), callerID, map[string]interface{}{
+		"workspace_id": targetID,
+		"task":         "review this video",
+		"attachments": []interface{}{
+			map[string]interface{}{
+				"uri":      "workspace:/tmp/clip.mp4",
+				"name":     "clip.mp4",
+				"mimeType": "video/mp4",
+				"size":     12345,
+			},
+		},
+	}, mcpCallTimeout)
+	if err != nil {
+		t.Fatalf("delegate_task returned error: %v", err)
+	}
+	if out != "done" {
+		t.Fatalf("delegate_task response = %q, want done", out)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestMCPHandler_DelegateTaskAsync_WithAttachments(t *testing.T) {
+	h, mock := newMCPHandler(t)
+	callerID := "11111111-1111-1111-1111-111111111111"
+	targetID := "22222222-2222-2222-2222-222222222222"
+	parentID := "33333333-3333-3333-3333-333333333333"
+
+	expectCanCommunicateSiblings(mock, callerID, targetID, parentID)
+	mock.ExpectExec(`(?s)INSERT INTO activity_logs.*'delegation'.*'delegate'`).
+		WithArgs(callerID, callerID, targetID, "Delegating to "+targetID, sqlmock.AnyArg(), "pending").
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(`UPDATE activity_logs`).
+		WithArgs("dispatched", "", callerID, sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	called := make(chan []byte, 1)
+	h.a2aProxy = func(ctx context.Context, workspaceID string, body []byte, proxyCallerID string, logActivity bool) (int, []byte, error) {
+		if workspaceID != targetID || proxyCallerID != callerID {
+			t.Fatalf("unexpected proxy route target=%q caller=%q", workspaceID, proxyCallerID)
+		}
+		called <- body
+		return 200, []byte(`{"result":{"message":{"parts":[{"text":"accepted"}]}}}`), nil
+	}
+
+	out, err := h.toolDelegateTaskAsync(context.Background(), callerID, map[string]interface{}{
+		"workspace_id": targetID,
+		"task":         "async work with image",
+		"attachments": []interface{}{
+			map[string]interface{}{
+				"uri":      "workspace:/tmp/screenshot.png",
+				"name":     "screenshot.png",
+				"mimeType": "image/png",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("delegate_task_async returned error: %v", err)
+	}
+	if !strings.Contains(out, `"status":"dispatched"`) {
+		t.Fatalf("delegate_task_async response = %s", out)
+	}
+	waitGlobalAsyncForTest()
+	select {
+	case body := <-called:
+		bodyStr := string(body)
+		if !strings.Contains(bodyStr, `"kind":"image"`) {
+			t.Fatalf("A2A body missing image attachment kind: %s", bodyStr)
+		}
+		if !strings.Contains(bodyStr, `"uri":"workspace:/tmp/screenshot.png"`) {
+			t.Fatalf("A2A body missing attachment uri: %s", bodyStr)
+		}
+	default:
+		t.Fatal("async delegate did not call platform A2A proxy")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
 func TestMCPHandler_DelegateTaskAsync_MarshalFailureDoesNotCallProxy(t *testing.T) {
 	h, mock := newMCPHandler(t)
 	callerID := "11111111-1111-1111-1111-111111111111"

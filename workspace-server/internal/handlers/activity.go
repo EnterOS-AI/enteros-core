@@ -152,7 +152,7 @@ func extractAttachmentsFromMessageParts(body map[string]interface{}) []map[strin
 		if kind == "" {
 			kind, _ = part["type"].(string)
 		}
-		if kind != "file" && kind != "image" && kind != "audio" {
+		if kind != "file" && kind != "image" && kind != "audio" && kind != "video" {
 			continue
 		}
 		// The file sub-object holds uri/mime_type/name. The a2a-sdk v1
