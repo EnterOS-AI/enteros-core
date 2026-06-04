@@ -23,6 +23,7 @@ Environment:
 import base64
 import json
 import os
+import re
 import time
 import urllib.error
 import urllib.request
@@ -127,27 +128,39 @@ def _submit_approved_review(pr_number: int) -> dict:
     return review
 
 
-def _get_status_updated_at(sha: str) -> dict[str, str]:
-    """Return mapping context -> updated_at for required contexts on this SHA."""
+def _get_status_snapshot(sha: str) -> dict[str, dict]:
+    """Return mapping context -> {id, updated_at, target_url} for required contexts."""
     code, statuses = _api("GET", f"/repos/{REPO}/statuses/{sha}?limit=100")
     if code != 200:
         return {}
-    result: dict[str, str] = {}
+    result: dict[str, dict] = {}
     for st in statuses:
         ctx = st.get("context", "")
         if ctx in REQUIRED_CONTEXTS:
-            result[ctx] = st.get("updated_at", st.get("created_at", ""))
+            result[ctx] = {
+                "id": st.get("id"),
+                "updated_at": st.get("updated_at", st.get("created_at", "")),
+                "target_url": st.get("target_url"),
+            }
     return result
+
+
+def _extract_run_id(target_url: str | None) -> str | None:
+    """Extract the Actions run_id from a status target_url."""
+    if not target_url:
+        return None
+    m = re.search(r"/actions/runs/(\d+)", target_url)
+    return m.group(1) if m else None
 
 
 def _poll_fresh_statuses(
     sha: str,
-    prior_updated_at: dict[str, str],
+    prior_snapshot: dict[str, dict],
     timeout_sec: int = LIVEFIRE_TIMEOUT_SEC,
-) -> dict[str, str]:
-    """Poll until required contexts appear with updated_at fresher than prior."""
+) -> dict[str, dict]:
+    """Poll until required contexts appear fresh (newer timestamp, id, or run)."""
     deadline = time.monotonic() + timeout_sec
-    found: dict[str, str] = {}
+    found: dict[str, dict] = {}
     while time.monotonic() < deadline:
         code, statuses = _api("GET", f"/repos/{REPO}/statuses/{sha}?limit=100")
         if code == 200:
@@ -155,9 +168,23 @@ def _poll_fresh_statuses(
                 ctx = st.get("context", "")
                 if ctx in REQUIRED_CONTEXTS:
                     updated_at = st.get("updated_at", st.get("created_at", ""))
-                    # Fresh if the context was absent before, OR its timestamp changed.
-                    if ctx not in prior_updated_at or updated_at != prior_updated_at[ctx]:
-                        found[ctx] = st.get("state", st.get("status", ""))
+                    status_id = st.get("id")
+                    target_url = st.get("target_url")
+                    prior = prior_snapshot.get(ctx, {})
+                    # Fresh if timestamp changed, id changed, or target_url changed.
+                    is_fresh = (
+                        ctx not in prior_snapshot
+                        or updated_at != prior.get("updated_at", "")
+                        or status_id != prior.get("id")
+                        or target_url != prior.get("target_url")
+                    )
+                    if is_fresh:
+                        found[ctx] = {
+                            "state": st.get("state", st.get("status", "")),
+                            "updated_at": updated_at,
+                            "id": status_id,
+                            "target_url": target_url,
+                        }
         if all(ctx in found for ctx in REQUIRED_CONTEXTS):
             return found
         time.sleep(5)
@@ -172,19 +199,24 @@ class TestGateAutoFireLive:
         pr_number = pr["number"]
         head_sha = pr["head"]["sha"]
 
-        # Capture pre-existing status timestamps so we can prove FRESH contexts
+        # Capture pre-existing status snapshot so we can prove FRESH contexts
         # were posted after the review submission (not stale from a prior run).
-        prior_updated_at = _get_status_updated_at(head_sha)
+        prior_snapshot = _get_status_snapshot(head_sha)
+        prior_run_ids = {
+            _extract_run_id(s["target_url"])
+            for s in prior_snapshot.values()
+            if _extract_run_id(s["target_url"])
+        }
 
-        _submit_approved_review(pr_number)
+        review = _submit_approved_review(pr_number)
 
-        found = _poll_fresh_statuses(head_sha, prior_updated_at)
+        found = _poll_fresh_statuses(head_sha, prior_snapshot)
 
         missing = [ctx for ctx in REQUIRED_CONTEXTS if ctx not in found]
         if missing:
             pytest.fail(
                 f"After {LIVEFIRE_TIMEOUT_SEC}s, fresh contexts still missing: {missing}. "
-                f"Found: {found}. Prior timestamps: {prior_updated_at}. "
+                f"Found: {found}. Prior snapshot: {prior_snapshot}. "
                 f"PR #{pr_number} head={head_sha}. "
                 f"This indicates the pull_request_review trigger did not fire at runtime."
             )
@@ -192,7 +224,21 @@ class TestGateAutoFireLive:
         # The contexts appeared fresh — that's the proof of auto-fire.
         # We do NOT assert success vs failure; the evaluator decides that.
         # The point of #2159 is that the workflows QUEUE and POST at all.
-        for ctx, state in found.items():
+        for ctx, info in found.items():
+            state = info["state"]
             assert state in ("pending", "success", "failure"), (
                 f"Unexpected state {state!r} for {ctx}"
             )
+
+            # CR2 Finding 1: prove a NEW workflow run was triggered, not just
+            # an in-place status update. Gitea 1.22.6 lacks REST /actions/runs/*
+            # endpoints, so we use the run_id embedded in the status target_url
+            # as a proxy for distinct run_id.
+            run_id = _extract_run_id(info.get("target_url"))
+            if run_id and run_id in prior_run_ids:
+                pytest.fail(
+                    f"Context {ctx!r} has target_url run_id {run_id} which existed "
+                    f"BEFORE the review was submitted. This means the status was "
+                    f"updated in-place by an existing run, not by a new workflow "
+                    f"run triggered from the pull_request_review event."
+                )

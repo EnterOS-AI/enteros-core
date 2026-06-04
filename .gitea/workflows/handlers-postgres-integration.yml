@@ -255,6 +255,19 @@ jobs:
           done
 
       - if: needs.detect-changes.outputs.handlers == 'true'
+        name: Preflight — INTEGRATION_DB_URL must be present
+        run: |
+          # Belt-and-suspenders: if the postgres-start step failed to
+          # export INTEGRATION_DB_URL, fail loud BEFORE go test can
+          # t.Skip its way to a green build. Closes the workflow-level
+          # fail-open gap identified in PR #2166 blocker #2.
+          if [ -z "${INTEGRATION_DB_URL:-}" ]; then
+            echo "::error::INTEGRATION_DB_URL is empty — postgres-start step did not export the connection string"
+            exit 1
+          fi
+          echo "INTEGRATION_DB_URL is set"
+
+      - if: needs.detect-changes.outputs.handlers == 'true'
         name: Run integration tests
         run: |
           # INTEGRATION_DB_URL is exported by the start-postgres step;

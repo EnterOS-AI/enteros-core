@@ -242,16 +242,36 @@ jobs:
       - name: Wait for /health
         if: needs.detect-changes.outputs.chat == 'true'
         run: |
-          for i in $(seq 1 30); do
+          # Readiness signal: the platform binds /health only AFTER the full
+          # migration chain has been applied on cold start (it prints
+          # "Platform starting on :PORT" at that point). So a 200 from /health
+          # is the real "migrations done + server listening" signal.
+          #
+          # The migration chain grows every release, so a fixed ~30s budget is
+          # brittle by construction. Use a generous wall-clock budget that
+          # comfortably exceeds cold-start + full-migration time, polling fast.
+          # Robust to a growing chain WITHOUT masking a dead platform: if the
+          # background platform-server process has exited, fail loudly at once.
+          DEADLINE_SECS=180          # cold-start + full migration chain headroom
+          PLATFORM_PID="$(cat workspace-server/platform.pid 2>/dev/null || true)"
+          start=$(date +%s)
+          while :; do
             if curl -sf "http://127.0.0.1:${PLATFORM_PORT}/health" > /dev/null; then
-              echo "Platform up after ${i}s"
+              echo "Platform healthy after $(( $(date +%s) - start ))s"
               exit 0
+            fi
+            if [ -n "$PLATFORM_PID" ] && ! kill -0 "$PLATFORM_PID" 2>/dev/null; then
+              echo "::error::platform-server (pid ${PLATFORM_PID}) exited before /health became reachable — see log below"
+              cat workspace-server/platform.log || true
+              exit 1
+            fi
+            if [ "$(( $(date +%s) - start ))" -ge "$DEADLINE_SECS" ]; then
+              echo "::error::Platform did not become healthy within ${DEADLINE_SECS}s — see log below"
+              cat workspace-server/platform.log || true
+              exit 1
             fi
             sleep 1
           done
-          echo "::error::Platform did not become healthy in 30s"
-          cat workspace-server/platform.log || true
-          exit 1
 
       - name: Install canvas dependencies
         if: needs.detect-changes.outputs.chat == 'true'
@@ -292,7 +312,12 @@ jobs:
           # every 2s.
           READY=""
           for i in $(seq 1 60); do
-            CODE=$(curl -s -o /dev/null -w '%{http_code}' "http://localhost:${CANVAS_PORT}/?m=chat" 2>/dev/null || echo 000)
+            # Tempfile-routed -w + set +e/-e prevents curl-exit-code
+            # pollution of the captured status (lint-curl-status-capture.yml).
+            set +e
+            curl -s -o /dev/null -w '%{http_code}' "http://localhost:${CANVAS_PORT}/?m=chat" > /tmp/canvas-ready.code
+            set -e
+            CODE=$(cat /tmp/canvas-ready.code 2>/dev/null || echo "000")
             if [ "$CODE" -ge 200 ] && [ "$CODE" -lt 400 ]; then
               echo "Canvas (chat route compiled) up after ~$((i*2))s (HTTP ${CODE})"
               READY=1
