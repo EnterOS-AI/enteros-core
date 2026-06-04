@@ -54,6 +54,54 @@ func mcpPost(t *testing.T, h *MCPHandler, workspaceID string, body interface{}) 
 	return w
 }
 
+// assertA2ASendMessageSchema validates that body is a schema-valid A2A
+// SendMessageRequest with role="user", messageId, and non-empty parts.
+// Issue #2251 contract test: delegate_task must always produce this shape.
+func assertA2ASendMessageSchema(t *testing.T, body []byte, wantTask string) {
+	t.Helper()
+	var envelope map[string]interface{}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		t.Fatalf("A2A body is not valid JSON: %v", err)
+	}
+	if envelope["jsonrpc"] != "2.0" {
+		t.Errorf("jsonrpc = %v, want 2.0", envelope["jsonrpc"])
+	}
+	if envelope["method"] != "message/send" {
+		t.Errorf("method = %v, want message/send", envelope["method"])
+	}
+
+	params, ok := envelope["params"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("params missing or not a map: %T", envelope["params"])
+	}
+	msg, ok := params["message"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("message missing or not a map: %T", params["message"])
+	}
+
+	if msg["role"] != "user" {
+		t.Errorf("message.role = %v, want \"user\"", msg["role"])
+	}
+	if msg["messageId"] == "" {
+		t.Error("message.messageId is empty")
+	}
+
+	parts, ok := msg["parts"].([]interface{})
+	if !ok || len(parts) == 0 {
+		t.Fatalf("message.parts missing or empty: %T", msg["parts"])
+	}
+	firstPart, ok := parts[0].(map[string]interface{})
+	if !ok {
+		t.Fatalf("first part is not a map: %T", parts[0])
+	}
+	if firstPart["type"] != "text" {
+		t.Errorf("first part type = %v, want text", firstPart["type"])
+	}
+	if firstPart["text"] != wantTask {
+		t.Errorf("first part text = %v, want %q", firstPart["text"], wantTask)
+	}
+}
+
 func expectCanCommunicateSiblings(mock sqlmock.Sqlmock, callerID, targetID, parentID string) {
 	mock.ExpectQuery(`SELECT id, parent_id FROM workspaces WHERE id = \$1`).
 		WithArgs(callerID).
@@ -209,9 +257,7 @@ func TestMCPHandler_DelegateTask_RoutesThroughPlatformA2AProxy(t *testing.T) {
 		if !logActivity {
 			t.Fatal("delegate_task should log through platform A2A proxy")
 		}
-		if !strings.Contains(string(body), "do work") {
-			t.Fatalf("A2A body missing task text: %s", string(body))
-		}
+		assertA2ASendMessageSchema(t, body, "do work")
 		return 200, []byte(`{"result":{"message":{"parts":[{"text":"done"}]}}}`), nil
 	}
 
@@ -252,9 +298,7 @@ func TestMCPHandler_DelegateTaskAsync_RoutesThroughPlatformA2AProxy(t *testing.T
 		if workspaceID != targetID || proxyCallerID != callerID {
 			t.Fatalf("unexpected proxy route target=%q caller=%q", workspaceID, proxyCallerID)
 		}
-		if !strings.Contains(string(body), "async work") {
-			t.Fatalf("A2A body missing task text: %s", string(body))
-		}
+		assertA2ASendMessageSchema(t, body, "async work")
 		called <- struct{}{}
 		return 200, []byte(`{"result":{"message":{"parts":[{"text":"accepted"}]}}}`), nil
 	}
@@ -304,10 +348,8 @@ func TestMCPHandler_DelegateTask_WithAttachments(t *testing.T) {
 		if workspaceID != targetID || proxyCallerID != callerID {
 			t.Fatalf("unexpected proxy route target=%q caller=%q", workspaceID, proxyCallerID)
 		}
+		assertA2ASendMessageSchema(t, body, "review this video")
 		bodyStr := string(body)
-		if !strings.Contains(bodyStr, `"text":"review this video"`) {
-			t.Fatalf("A2A body missing task text: %s", bodyStr)
-		}
 		if !strings.Contains(bodyStr, `"kind":"video"`) {
 			t.Fatalf("A2A body missing video attachment kind: %s", bodyStr)
 		}
@@ -386,6 +428,7 @@ func TestMCPHandler_DelegateTaskAsync_WithAttachments(t *testing.T) {
 	waitGlobalAsyncForTest()
 	select {
 	case body := <-called:
+		assertA2ASendMessageSchema(t, body, "async work with image")
 		bodyStr := string(body)
 		if !strings.Contains(bodyStr, `"kind":"image"`) {
 			t.Fatalf("A2A body missing image attachment kind: %s", bodyStr)

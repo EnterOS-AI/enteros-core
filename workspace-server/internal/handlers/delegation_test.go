@@ -1762,3 +1762,73 @@ func TestListDelegations_LedgerFailedIncludesErrorDetail(t *testing.T) {
 		t.Errorf("unmet sqlmock expectations: %v", err)
 	}
 }
+
+// ---------- buildDelegateA2ABody: schema-valid SendMessageRequest ----------
+
+// TestBuildDelegateA2ABody_SchemaValidSendMessageRequest pins the contract
+// requested by issue #2251: delegate_task must produce a schema-valid A2A
+// SendMessageRequest with role="user", messageId, parts, and metadata.
+func TestBuildDelegateA2ABody_SchemaValidSendMessageRequest(t *testing.T) {
+	delegationID := "del-2251-test"
+	task := "write a contract test"
+
+	body, err := buildDelegateA2ABody(delegationID, task)
+	if err != nil {
+		t.Fatalf("buildDelegateA2ABody failed: %v", err)
+	}
+
+	var envelope map[string]interface{}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		t.Fatalf("body is not valid JSON: %v", err)
+	}
+
+	// Top-level envelope shape
+	if envelope["method"] != "message/send" {
+		t.Errorf("method = %v, want message/send", envelope["method"])
+	}
+
+	params, ok := envelope["params"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("params missing or not a map: %T", envelope["params"])
+	}
+
+	msg, ok := params["message"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("message missing or not a map: %T", params["message"])
+	}
+
+	// Issue #2251: role is required
+	if msg["role"] != "user" {
+		t.Errorf("message.role = %v, want \"user\"", msg["role"])
+	}
+
+	// messageId must be present and match delegationID
+	if msg["messageId"] != delegationID {
+		t.Errorf("message.messageId = %v, want %s", msg["messageId"], delegationID)
+	}
+
+	// parts must be a non-empty list with a text part
+	parts, ok := msg["parts"].([]interface{})
+	if !ok || len(parts) == 0 {
+		t.Fatalf("message.parts missing or empty: %T", msg["parts"])
+	}
+	firstPart, ok := parts[0].(map[string]interface{})
+	if !ok {
+		t.Fatalf("first part is not a map: %T", parts[0])
+	}
+	if firstPart["type"] != "text" {
+		t.Errorf("first part type = %v, want text", firstPart["type"])
+	}
+	if firstPart["text"] != task {
+		t.Errorf("first part text = %v, want %q", firstPart["text"], task)
+	}
+
+	// metadata.delegation_id must match
+	meta, ok := msg["metadata"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("metadata missing or not a map: %T", msg["metadata"])
+	}
+	if meta["delegation_id"] != delegationID {
+		t.Errorf("metadata.delegation_id = %v, want %s", meta["delegation_id"], delegationID)
+	}
+}
