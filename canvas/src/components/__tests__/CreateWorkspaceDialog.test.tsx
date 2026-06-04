@@ -455,6 +455,128 @@ describe("CreateWorkspaceDialog — dynamic runtime provider picker", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Registry-backed provider catalog (RFC#340 Fix C)
+//
+// Regression guard for the mis-bucketing bug: when a registry-backed
+// claude-code template serves `moonshot/kimi-k2.6` whose DERIVED provider is
+// `platform`, the dialog must build the dropdown from registry_providers/
+// registry_models (buildProviderCatalogFromRegistry) — NOT the legacy
+// inferVendor heuristic which slash-splits the id into "moonshot". The
+// distinguishing trait of this fixture: the plain `models[]` array does NOT
+// carry an explicit `provider` field, so the LEGACY path would bucket the
+// model under "moonshot" and send llm_provider:"moonshot". Only the
+// registry-backed path yields the Platform bucket + llm_provider:"platform".
+// ---------------------------------------------------------------------------
+
+// claude-code template whose plain models[] is UN-annotated (no explicit
+// provider). The derived-provider annotation lives ONLY in registry_models.
+const REGISTRY_TEMPLATE = {
+  id: "claude-code-default",
+  name: "Claude Code Agent",
+  runtime: "claude-code",
+  model: "moonshot/kimi-k2.6",
+  // Legacy fields — note: NO explicit provider on the platform model, so the
+  // legacy inferVendor path would slash-split it into "moonshot".
+  providers: ["platform", "minimax", "anthropic"],
+  models: [
+    { id: "moonshot/kimi-k2.6", name: "Kimi K2.6", required_env: [] },
+    { id: "MiniMax-M2.7", name: "MiniMax M2.7", required_env: ["MINIMAX_API_KEY"] },
+    { id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6", required_env: ["ANTHROPIC_API_KEY"] },
+  ],
+  // Registry-served SSOT (internal#718 P3). DeriveProvider resolved
+  // moonshot/kimi-k2.6 → "platform"; MiniMax-M2.7 → "minimax".
+  registry_backed: true,
+  registry_providers: [
+    { name: "platform", display_name: "Platform", auth_env: [], billing_mode: "platform_managed" },
+    { name: "minimax", display_name: "MiniMax", auth_env: ["MINIMAX_API_KEY"], billing_mode: "byok" },
+    { name: "anthropic", display_name: "Anthropic API", auth_env: ["ANTHROPIC_API_KEY"], billing_mode: "byok" },
+  ],
+  registry_models: [
+    { id: "moonshot/kimi-k2.6", name: "Kimi K2.6", provider: "platform", billing_mode: "platform_managed" },
+    { id: "MiniMax-M2.7", name: "MiniMax M2.7", provider: "minimax", billing_mode: "byok" },
+    { id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6", provider: "anthropic", billing_mode: "byok" },
+  ],
+};
+
+describe("CreateWorkspaceDialog — registry-backed provider catalog (RFC#340 Fix C)", () => {
+  beforeEach(() => {
+    mockGet.mockImplementation(async (url: string) => {
+      if (url === "/templates") {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        return [REGISTRY_TEMPLATE] as any;
+      }
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      return SAMPLE_WORKSPACES as any;
+    });
+  });
+
+  it("shows the Platform provider bucket for the registry-backed claude-code runtime", async () => {
+    await openDialog();
+    const providerSelect = await waitFor(() => {
+      const sel = document.querySelector("[data-testid='provider-select']") as HTMLSelectElement;
+      expect(sel).toBeTruthy();
+      return sel;
+    });
+    const labels = Array.from(providerSelect.options).map((o) => o.text.trim());
+    // Registry display_name "Platform" appears — NOT "moonshot" from the
+    // legacy slash-split heuristic.
+    expect(labels).toContain("Platform");
+    expect(labels).not.toContain("moonshot");
+    // Bucket id is the registry-keyed id, vendor is the bare provider name.
+    const values = Array.from(providerSelect.options).map((o) => o.value);
+    expect(values).toContain("registry|platform");
+  });
+
+  it("sends llm_provider: platform (not moonshot) for moonshot/kimi-k2.6", async () => {
+    await openDialog();
+    fireEvent.change(screen.getByPlaceholderText("e.g. SEO Agent"), {
+      target: { value: "Kimi Agent" },
+    });
+    // Wait for the registry default to settle on the Platform bucket + model.
+    await waitFor(() => {
+      const modelSelect = document.querySelector("[data-testid='model-select']") as HTMLSelectElement;
+      expect(modelSelect?.value).toBe("moonshot/kimi-k2.6");
+    });
+
+    const createBtn = screen.getAllByRole("button").find((b) => b.textContent === "Create");
+    fireEvent.click(createBtn!);
+
+    await waitFor(() => expect(mockPost).toHaveBeenCalled());
+    const body = mockPost.mock.calls[0][1] as Record<string, unknown>;
+    expect(body.model).toBe("moonshot/kimi-k2.6");
+    expect(body.llm_provider).toBe("platform");
+    // Platform is auth-env-free → no BYOK secret.
+    expect(body.secrets).toBeUndefined();
+  });
+
+  it("buckets MiniMax-M2.7 under its derived provider and sends llm_provider: minimax", async () => {
+    await openDialog();
+    fireEvent.change(screen.getByPlaceholderText("e.g. SEO Agent"), {
+      target: { value: "MiniMax Agent" },
+    });
+    await waitFor(() => {
+      const sel = document.querySelector("[data-testid='provider-select']") as HTMLSelectElement;
+      expect(Array.from(sel.options).map((o) => o.value)).toContain("registry|minimax");
+    });
+    fireEvent.change(document.querySelector("[data-testid='provider-select']") as HTMLSelectElement, {
+      target: { value: "registry|minimax" },
+    });
+    fireEvent.change(document.getElementById("llm-secret-input") as HTMLInputElement, {
+      target: { value: "sk-minimax-test" },
+    });
+
+    const createBtn = screen.getAllByRole("button").find((b) => b.textContent === "Create");
+    fireEvent.click(createBtn!);
+
+    await waitFor(() => expect(mockPost).toHaveBeenCalled());
+    const body = mockPost.mock.calls[0][1] as Record<string, unknown>;
+    expect(body.model).toBe("MiniMax-M2.7");
+    expect(body.llm_provider).toBe("minimax");
+    expect(body.secrets).toEqual({ MINIMAX_API_KEY: "sk-minimax-test" });
+  });
+});
+
+// ---------------------------------------------------------------------------
 // budget_limit field tests (#541)
 // ---------------------------------------------------------------------------
 
