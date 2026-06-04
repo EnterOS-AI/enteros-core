@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "@/lib/api";
 import type RFB from "@novnc/novnc";
 
@@ -75,34 +75,40 @@ export function DisplayTab({ workspaceId }: Props) {
     };
   }, [workspaceId]);
 
-  // Renew the display-control lease while we hold it. The lock is a 300s lease
-  // with no server-side auto-renewal, so without this the control (and the
-  // session token) silently expire mid-session — the user appears "kicked"
-  // every ~5 minutes. Re-acquiring as the same holder extends the lease
-  // server-side; we refresh the reconnect token in latestSessionUrlRef but do
-  // NOT swap the live stream's sessionUrl (that would reconnect the desktop).
+  // Acquire (or re-acquire) the display-control lease as the current holder.
+  // Re-acquiring extends the 300s server-side lock AND returns a freshly-signed
+  // session URL (token bound to the new expires_at). Used both to renew the
+  // lease on a timer and to mint a non-stale token for each reconnect — a
+  // cached URL can be past its ~300s expiry, which would make a reconnect 401.
+  const reacquireSession = useCallback(async (): Promise<string | null> => {
+    const generation = requestGeneration.current;
+    try {
+      const next = await api.post<DisplayControlStatus>(
+        `/workspaces/${workspaceId}/display/control/acquire`,
+        { controller: "user", ttl_seconds: 300 },
+      );
+      if (requestGeneration.current !== generation) return null;
+      setControl(next);
+      if (next.session_url) latestSessionUrlRef.current = next.session_url;
+      return next.session_url ?? null;
+    } catch {
+      // Transient failure, or another holder took over: the live stream keeps
+      // running on its existing connection; a reconnect re-evaluates control.
+      return null;
+    }
+  }, [workspaceId]);
+
+  // Renew the lease while we hold it. The lock is a 300s lease with no
+  // server-side auto-renewal, so without this the control (and the session
+  // token) silently expire mid-session — the user appears "kicked" every ~5
+  // minutes. We renew well inside the TTL and do not touch the live stream.
   useEffect(() => {
     if (!sessionUrl) return;
-    const generation = requestGeneration.current;
-    const controlPath = `/workspaces/${workspaceId}/display/control`;
-    const renewMs = 120_000; // well under the 300s TTL
-    const timer = setInterval(async () => {
-      try {
-        const next = await api.post<DisplayControlStatus>(`${controlPath}/acquire`, {
-          controller: "user",
-          ttl_seconds: 300,
-        });
-        if (requestGeneration.current !== generation) return;
-        setControl(next);
-        if (next.session_url) latestSessionUrlRef.current = next.session_url;
-      } catch {
-        // Transient renewal failure (or another holder took over): the live
-        // stream keeps running on its existing connection; surfaced control
-        // state stays as-is until the next tick or an explicit re-acquire.
-      }
-    }, renewMs);
+    const timer = setInterval(() => {
+      void reacquireSession();
+    }, 120_000);
     return () => clearInterval(timer);
-  }, [sessionUrl, workspaceId]);
+  }, [sessionUrl, reacquireSession]);
 
   const acquireControl = async () => {
     const generation = requestGeneration.current;
@@ -272,7 +278,11 @@ export function DisplayTab({ workspaceId }: Props) {
         />
       </div>
       {sessionUrl ? (
-        <DesktopStream sessionUrl={sessionUrl} latestSessionUrlRef={latestSessionUrlRef} />
+        <DesktopStream
+          sessionUrl={sessionUrl}
+          latestSessionUrlRef={latestSessionUrlRef}
+          reacquireSession={reacquireSession}
+        />
       ) : (
         <div className="flex flex-1 items-center justify-center p-8 text-center">
           <div>
@@ -351,9 +361,11 @@ function DisplayControlBar({
 function DesktopStream({
   sessionUrl,
   latestSessionUrlRef,
+  reacquireSession,
 }: {
   sessionUrl: string;
   latestSessionUrlRef: { current: string | null };
+  reacquireSession: () => Promise<string | null>;
 }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const rfbRef = useRef<RFB | null>(null);
@@ -376,13 +388,15 @@ function DesktopStream({
     let retryTimer: ReturnType<typeof setTimeout> | null = null;
     const maxAttempts = 10;
 
-    async function connect() {
+    async function connect(reacquire = false) {
       setStreamError(null);
       try {
+        // On a reconnect, mint a fresh lease + token first — the original token
+        // is only ~300s, so a cached URL can be expired and would 401. The
+        // initial connect already holds a fresh token from acquireControl.
+        if (reacquire) await reacquireSession();
         const mod = await import("@novnc/novnc");
         if (cancelled || !containerRef.current) return;
-        // Use the freshest signed URL (kept current by the lease-renewal timer)
-        // so a reconnect after the original token's window still authenticates.
         const stream = displayWebSocketConnection(latestSessionUrlRef.current || sessionUrl);
         rfb = new mod.default(containerRef.current, stream.url, {
           wsProtocols: ["binary", `molecule-display-token.${stream.token}`],
@@ -415,7 +429,7 @@ function DesktopStream({
             attempts += 1;
             setStreamError(`Reconnecting to desktop… (attempt ${attempts})`);
             retryTimer = setTimeout(() => {
-              if (!cancelled) void connect();
+              if (!cancelled) void connect(true);
             }, Math.min(1000 * attempts, 5000));
           } else {
             setStreamError("Desktop stream disconnected.");
@@ -434,7 +448,7 @@ function DesktopStream({
       rfbRef.current = null;
       rfb?.disconnect();
     };
-  }, [sessionUrl]);
+  }, [sessionUrl, reacquireSession, latestSessionUrlRef]);
 
   useEffect(() => {
     const onPaste = (event: ClipboardEvent) => {
