@@ -1041,7 +1041,7 @@ print(json.dumps({
             'messageId': f'e2e-{uuid.uuid4().hex[:8]}',
             'parts': [{'kind': 'text', 'text': 'Reply with exactly: ok'}],
         },
-        'configuration': {'max_tokens': 4}
+        'configuration': {'max_tokens': 32}
     }
 }))
 ")
