@@ -67,6 +67,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # bp-required: pending #718 — soak-then-promote, not in BP yet.
   verify:
     name: Regenerate providers artifact and fail on drift
     runs-on: ubuntu-latest
