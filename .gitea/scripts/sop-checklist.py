@@ -1228,10 +1228,13 @@ def main(argv: list[str] | None = None) -> int:
                 )
 
         na_desc = ", ".join(sorted(na_descs)) if na_descs else "(none)"
-        na_status_state = "success" if na_descs else "pending"
+        # internal#818: na-declarations is an informational context, not a merge
+        # gate. An empty declaration list is a terminal success state — pending
+        # here poisons the PR combined status.
+        na_status_state = "success"
         # review-check.sh reads the description to discover which gates are N/A.
         # Include the gate names so it can grep for them.
-        na_description = f"N/A: {na_desc}" if na_descs else "N/A: (none)"
+        na_description = f"N/A: {na_desc}"
 
         if not args.dry_run:
             client.post_status(

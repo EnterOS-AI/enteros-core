@@ -1299,3 +1299,108 @@ class TestGetCIStatus(unittest.TestCase):
         self.assertEqual(
             sop.get_ci_status(client, "o", "r", "sha1"), "unknown"
         )
+
+
+# ---------------------------------------------------------------------------
+# internal#818 — na-declarations status must be terminal success
+# ---------------------------------------------------------------------------
+
+
+class TestNaDeclarationsStatusTerminal(unittest.TestCase):
+    """Regression for internal#818: the na-declarations context is
+    informational, not a merge gate.  An empty N/A declaration list must
+    post `success` (not `pending`) so it does not poison the PR combined
+    status."""
+
+    def _run_with_fake_client(self, fake_client_class):
+        """Swap GiteaClient temporarily and invoke main() with a fake token."""
+        orig_client = sop.GiteaClient
+        orig_token = os.environ.get("GITEA_TOKEN")
+        try:
+            sop.GiteaClient = fake_client_class
+            os.environ["GITEA_TOKEN"] = "fake-token"
+            return sop.main([
+                "--owner", "o", "--repo", "r", "--pr", "1",
+                "--config", CONFIG_PATH,
+                "--gitea-host", "git.example.com",
+            ])
+        finally:
+            sop.GiteaClient = orig_client
+            if orig_token is None:
+                os.environ.pop("GITEA_TOKEN", None)
+            else:
+                os.environ["GITEA_TOKEN"] = orig_token
+
+    def test_empty_na_descriptions_posts_success(self):
+        posted = []
+
+        class FakeClient(sop.GiteaClient):
+            def get_pr(self, owner, repo, pr):
+                return {
+                    "state": "open",
+                    "user": {"login": "alice"},
+                    "head": {"sha": "abc123"},
+                    "labels": [],
+                }
+
+            def get_issue_comments(self, owner, repo, issue, max_comments=None):
+                return []
+
+            def resolve_team_id(self, org, team_name):
+                return None
+
+            def is_team_member(self, team_id, login):
+                return False
+
+            def post_status(self, owner, repo, sha, state, context,
+                            description, target_url=""):
+                posted.append({
+                    "state": state,
+                    "context": context,
+                    "description": description,
+                })
+
+        rc = self._run_with_fake_client(FakeClient)
+        self.assertEqual(rc, 0)
+        na_posts = [p for p in posted if "na-declarations" in p["context"]]
+        self.assertEqual(len(na_posts), 1, f"expected one na-declarations post, got {posted}")
+        self.assertEqual(na_posts[0]["state"], "success")
+        self.assertEqual(na_posts[0]["description"], "N/A: (none)")
+
+    def test_populated_na_descriptions_posts_success(self):
+        posted = []
+
+        class FakeClient(sop.GiteaClient):
+            def get_pr(self, owner, repo, pr):
+                return {
+                    "state": "open",
+                    "user": {"login": "alice"},
+                    "head": {"sha": "abc123"},
+                    "labels": [],
+                }
+
+            def get_issue_comments(self, owner, repo, issue, max_comments=None):
+                return [
+                    {"user": {"login": "bob"}, "body": "/sop-n/a qa-review N/A: docs-only"},
+                ]
+
+            def resolve_team_id(self, org, team_name):
+                return 1
+
+            def is_team_member(self, team_id, login):
+                return True
+
+            def post_status(self, owner, repo, sha, state, context,
+                            description, target_url=""):
+                posted.append({
+                    "state": state,
+                    "context": context,
+                    "description": description,
+                })
+
+        rc = self._run_with_fake_client(FakeClient)
+        self.assertEqual(rc, 0)
+        na_posts = [p for p in posted if "na-declarations" in p["context"]]
+        self.assertEqual(len(na_posts), 1)
+        self.assertEqual(na_posts[0]["state"], "success")
+        self.assertIn("qa-review", na_posts[0]["description"])
