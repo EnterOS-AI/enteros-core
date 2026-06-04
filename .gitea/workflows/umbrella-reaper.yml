@@ -3,13 +3,13 @@
 # Tracking: molecule-core#1780.
 #
 # Problem: when `CI / all-required (pull_request)` reports failure due to
-# a propagation/timing race despite all 5 required sub-jobs being success,
+# a propagation/timing race despite all required sub-jobs being success,
 # branch protection blocks the merge. Operators currently recover manually
 # per docs/runbooks/ci-umbrella-stale-compensating-status.md.
 #
-# This workflow automates that recovery: every 10 minutes it scans open
-# PRs and posts a compensating success status when the umbrella is stale
-# but all sub-jobs are verified green.
+# This workflow automates that recovery: it scans open PRs and posts a
+# compensating success status when the umbrella is stale but all sub-jobs
+# are verified green.
 #
 # Trust boundary: the script only reads PR lists + statuses and POSTs to
 # /statuses/{sha}. It never checks out PR HEAD code. The Gitea token has
@@ -20,12 +20,17 @@
 
 name: umbrella-reaper
 
+# IMPORTANT — Schedule moved to operator-config:
+#   /etc/cron.d/molecule-core-umbrella-reaper ->
+#   /usr/local/bin/molecule-core-cron-bot.sh umbrella-reaper
+#
+# This keeps the compensation cadence but stops a maintenance bot from
+# consuming Gitea Actions runner slots during PR merge waves.
+# Gitea 1.22.6 parser quirk per
+# `feedback_gitea_workflow_dispatch_inputs_unsupported`: do NOT add an
+# `inputs:` block here. Gitea 1.22.6 rejects the whole workflow as
+# "unknown on type" when `workflow_dispatch.inputs.X` is present.
 on:
-  # Run every 10 minutes — frequent enough to catch propagation races
-  # before human reviewers notice, but not so frequent that it hammers
-  # the API. The script is idempotent (Gitea de-dups by context).
-  schedule:
-    - cron: "*/10 * * * *"
   workflow_dispatch:
 
 permissions:
@@ -50,9 +55,12 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Install PyYAML
+        run: python -m pip install --quiet 'PyYAML==6.0.2'
+
       - name: Compensate stale PR umbrella statuses
         env:
-          GITEA_TOKEN: ${{ secrets.UMBRELLA_REAPER_TOKEN || secrets.GITHUB_TOKEN }}
+          GITEA_TOKEN: ${{ secrets.UMBRELLA_REAPER_TOKEN }}
           GITEA_HOST: git.moleculesai.app
           REPO: ${{ github.repository }}
           PR_LIMIT: "50"

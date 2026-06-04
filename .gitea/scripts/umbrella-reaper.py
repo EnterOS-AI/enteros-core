@@ -38,11 +38,75 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 from typing import Any
+
+
+def _load_required_sub_jobs_from_ci_yml(workflows_dir: str) -> list[str]:
+    """Parse ci.yml and extract the all-required sentinel's sub-job contexts.
+
+    Supports two shapes of the all-required job run block:
+      1. Legacy Python f-string list (pre-2026-06-01):
+         f"CI / Detect changes ({event})"
+      2. Current shell-script shape (post-2026-06-01 scheduler fix):
+         check "Detect changes"        "$CHANGES_RESULT"
+
+    Raises RuntimeError if ci.yml is missing, has no all-required job, or the
+    run block cannot be parsed.
+    """
+    ci_path = Path(workflows_dir) / "ci.yml"
+    if not ci_path.exists():
+        raise RuntimeError(f"ci.yml not found at {ci_path}")
+
+    # PyYAML is installed by the workflow (same as status-reaper.py).
+    import yaml
+
+    with ci_path.open() as f:
+        doc = yaml.safe_load(f)
+
+    jobs = doc.get("jobs", {})
+    all_required = jobs.get("all-required")
+    if not isinstance(all_required, dict):
+        raise RuntimeError("ci.yml missing 'all-required' job")
+
+    steps = all_required.get("steps", [])
+    run_block = ""
+    for step in steps:
+        if isinstance(step, dict):
+            run_text = step.get("run", "")
+            if run_text:
+                run_block = run_text
+                break
+
+    if not run_block:
+        raise RuntimeError("all-required job missing run block")
+
+    # Determine event suffix from the umbrella context we are watching.
+    if UMBRELLA_CONTEXT.endswith(" (pull_request)"):
+        suffix = "(pull_request)"
+    elif UMBRELLA_CONTEXT.endswith(" (push)"):
+        suffix = "(push)"
+    else:
+        m = re.search(r' \(([^)]+)\)$', UMBRELLA_CONTEXT)
+        suffix = m.group(1) if m else "pull_request"
+
+    # Try legacy f-string format first.
+    if "({event})" in run_block:
+        matches = re.findall(r'f["\'](.*?\(\{event\}\))["\']', run_block)
+        if matches:
+            return [m.replace("({event})", suffix) for m in matches]
+
+    # Try current shell-script format: check "Name" "$RESULT"
+    matches = re.findall(r'check\s+"([^"]+)"', run_block)
+    if matches:
+        return [f"CI / {name} {suffix}" for name in matches]
+
+    raise RuntimeError("unable to derive required sub-jobs from all-required run block")
 
 
 # --------------------------------------------------------------------------
@@ -63,20 +127,25 @@ UMBRELLA_CONTEXT = _env("UMBRELLA_CONTEXT", default="CI / all-required (pull_req
 
 # Required sub-job contexts. The umbrella is only compensated when ALL of
 # these are "success" on the same SHA. Order does not matter.
-REQUIRED_SUB_JOBS = [
-    ctx.strip()
-    for ctx in _env(
-        "REQUIRED_SUB_JOBS",
-        default=(
-            "CI / Detect changes (pull_request);"
-            "CI / Platform (Go) (pull_request);"
-            "CI / Canvas (Next.js) (pull_request);"
-            "CI / Shellcheck (E2E scripts) (pull_request);"
-            "CI / Python Lint & Test (pull_request)"
-        ),
-    ).split(";")
-    if ctx.strip()
-]
+#
+# Derive from ci.yml at runtime to prevent drift (CR2 blocker #1).
+# The env var REQUIRED_SUB_JOBS overrides derivation for emergency
+# tuning or local testing.
+_REQUIRED_SUB_JOBS_OVERRIDE = _env("REQUIRED_SUB_JOBS")
+if _REQUIRED_SUB_JOBS_OVERRIDE:
+    REQUIRED_SUB_JOBS = [
+        ctx.strip()
+        for ctx in _REQUIRED_SUB_JOBS_OVERRIDE.split(";")
+        if ctx.strip()
+    ]
+else:
+    try:
+        REQUIRED_SUB_JOBS = _load_required_sub_jobs_from_ci_yml(".gitea/workflows")
+    except Exception as exc:
+        sys.stderr.write(
+            f"::error::Failed to derive REQUIRED_SUB_JOBS from ci.yml: {exc}\n"
+        )
+        sys.exit(1)
 
 OWNER, NAME = (REPO.split("/", 1) + [""])[:2] if REPO else ("", "")
 API = f"https://{GITEA_HOST}/api/v1" if GITEA_HOST else ""
@@ -177,18 +246,21 @@ def _entry_state(s: dict) -> str:
     return s.get("status") or s.get("state") or ""
 
 
-def process_pr(pr: dict) -> None:
+def process_pr(pr: dict) -> bool:
+    """Process a single PR. Returns True if the tick succeeded for this PR
+    (including no-op skips), False if a compensating POST failed.
+    """
     num = pr.get("number")
     sha = pr.get("head", {}).get("sha")
     if not sha:
         print(f"::warning::PR #{num}: missing head.sha; skipping")
-        return
+        return True
 
     try:
         status = get_combined_status(sha)
     except ApiError as e:
         print(f"::warning::PR #{num}: status fetch failed: {e}")
-        return
+        return True
 
     statuses = status.get("statuses") or []
     umbrella_entry = None
@@ -206,12 +278,12 @@ def process_pr(pr: dict) -> None:
 
     if umbrella_entry is None:
         print(f"::notice::PR #{num}: no umbrella context '{UMBRELLA_CONTEXT}'; skipping")
-        return
+        return True
 
     umbrella_state = _entry_state(umbrella_entry)
     if umbrella_state != "failure":
         print(f"::notice::PR #{num}: umbrella is '{umbrella_state}'; skipping")
-        return
+        return True
 
     # Verify ALL required sub-jobs are present and success
     missing = [ctx for ctx in REQUIRED_SUB_JOBS if ctx not in subjob_states]
@@ -220,7 +292,7 @@ def process_pr(pr: dict) -> None:
             f"::notice::PR #{num}: umbrella=failure, but missing sub-jobs: {missing}; "
             "skipping (sub-jobs may still be running)"
         )
-        return
+        return True
 
     not_success = [ctx for ctx in REQUIRED_SUB_JOBS if subjob_states[ctx] != "success"]
     if not_success:
@@ -228,7 +300,7 @@ def process_pr(pr: dict) -> None:
             f"::notice::PR #{num}: umbrella=failure, but sub-jobs not all success: "
             f"{[(ctx, subjob_states[ctx]) for ctx in not_success]}; skipping"
         )
-        return
+        return True
 
     # All checks pass — post compensating status
     desc = (
@@ -239,19 +311,33 @@ def process_pr(pr: dict) -> None:
     try:
         post_status(sha, UMBRELLA_CONTEXT, desc)
         print(f"::notice::PR #{num}: posted compensating success for {UMBRELLA_CONTEXT}")
+        return True
     except ApiError as e:
         print(f"::error::PR #{num}: failed to post compensating status: {e}")
+        return False
 
 
-def main() -> None:
+def main() -> int:
     _require_runtime_env()
+
+    # Drift guard: ci.yml derivation already happened at module load, but
+    # we sanity-check it is non-empty so the loop below doesn't trivially
+    # no-op because of a parse bug.
+    if not REQUIRED_SUB_JOBS:
+        sys.stderr.write("::error::REQUIRED_SUB_JOBS is empty; bailing out\n")
+        return 1
+
     prs = list_open_prs(limit=PR_LIMIT)
     print(f"::notice::Scanning {len(prs)} open PRs for stale umbrella statuses")
     compensated = 0
+    failed = 0
     for pr in prs:
-        process_pr(pr)
-    print(f"::notice::umbrella-reaper complete")
+        ok = process_pr(pr)
+        if not ok:
+            failed += 1
+    print(f"::notice::umbrella-reaper complete (failed POSTs={failed})")
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
