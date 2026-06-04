@@ -241,7 +241,14 @@ export default async function globalSetup(_config: FullConfig): Promise<void> {
       name: "E2E Canvas Test",
       runtime: "hermes",
       tier: 2,
-      model: "gpt-4o",
+      // Provider-registry SSOT (internal#718) registers ONLY Kimi models for
+      // the hermes runtime — `moonshot/kimi-k2.6` is the platform-managed
+      // entry (workspace-server/internal/providers/providers.yaml, hermes ->
+      // platform). The old `gpt-4o` was never a registered hermes model and
+      // now 422s UNREGISTERED_MODEL_FOR_RUNTIME (core#2225). This workspace
+      // defaults closed to platform_managed (see the boot-shape note below),
+      // so a platform-namespaced model id is the registry-correct choice.
+      model: "moonshot/kimi-k2.6",
     }),
   });
   if (ws.status >= 400 || !ws.body?.id) {
@@ -264,7 +271,7 @@ export default async function globalSetup(_config: FullConfig): Promise<void> {
   // CP proxy env absent) made a platform_managed workspace ABORT AT BOOT
   // with MISSING_PLATFORM_PROXY when MOLECULE_LLM_BASE_URL /
   // MOLECULE_LLM_USAGE_TOKEN are not present in the tenant's env. The
-  // canvas E2E creates a bare hermes/gpt-4o workspace, which defaults
+  // canvas E2E creates a bare hermes/moonshot platform workspace, which defaults
   // closed to platform_managed (workspace_provision.go:~1009), and the
   // staging tenant does not carry the CP proxy env — so the agent never
   // starts. Pre-#2162 this same workspace booted credential-less (the bug
