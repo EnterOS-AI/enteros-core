@@ -414,12 +414,22 @@ describe("DisplayTab", () => {
         height: 1080,
       })
       .mockResolvedValueOnce({ controller: "none" });
-    mockPost.mockResolvedValue({
-      controller: "user",
-      controlled_by: "admin-token",
-      expires_at: "2026-05-23T08:48:27Z",
-      session_url: "/workspaces/ws-display/display/session/websockify#token=signed",
-    });
+    // Initial acquire returns token "signed"; the reconnect re-acquire mints a
+    // FRESH token "signed2" (the lock/token is only ~300s — reconnecting with a
+    // cached, possibly-expired token would 401 and never recover).
+    mockPost
+      .mockResolvedValueOnce({
+        controller: "user",
+        controlled_by: "admin-token",
+        expires_at: "2026-05-23T08:48:27Z",
+        session_url: "/workspaces/ws-display/display/session/websockify#token=signed",
+      })
+      .mockResolvedValue({
+        controller: "user",
+        controlled_by: "admin-token",
+        expires_at: "2026-05-23T08:53:27Z",
+        session_url: "/workspaces/ws-display/display/session/websockify#token=signed2",
+      });
 
     render(<DisplayTab workspaceId="ws-display" />);
     await waitFor(() => {
@@ -429,10 +439,11 @@ describe("DisplayTab", () => {
     await waitFor(() => {
       expect(rfbInstances.length).toBe(1);
     });
+    expect(mockRFBConstructor.mock.calls[0][2].wsProtocols).toContain("molecule-display-token.signed");
 
     // An idle/network drop closes the websocket uncleanly. The client must
-    // reconnect (using the freshest signed URL) instead of giving up — this is
-    // the "disconnects every ~5 min and stays dead" report.
+    // re-acquire a fresh token and reconnect instead of giving up — this is the
+    // "disconnects every ~5 min and stays dead" report.
     rfbInstances[0].dispatchEvent(new CustomEvent("disconnect", { detail: { clean: false } }));
     await waitFor(
       () => {
@@ -440,6 +451,8 @@ describe("DisplayTab", () => {
       },
       { timeout: 3000 },
     );
+    // Reconnect dialed with the FRESH token, not the stale original.
+    expect(mockRFBConstructor.mock.calls[1][2].wsProtocols).toContain("molecule-display-token.signed2");
 
     // A clean disconnect (the user released control) must NOT reconnect.
     rfbInstances[1].dispatchEvent(new CustomEvent("disconnect", { detail: { clean: true } }));
