@@ -16,7 +16,7 @@ const SchemaVersion = 1
 // Fingerprint is a stable content hash of the generated projection (schema
 // version + provider catalog + runtime native sets). It changes iff the
 // registry DATA changes (comment-only YAML edits do not churn it).
-const Fingerprint = "5a741b326b6f812c"
+const Fingerprint = "ec6b93409e7b9cf8"
 
 // GenProvider is the generated projection of one provider catalog entry —
 // the subset a downstream consumer needs to derive + display a provider.
@@ -71,6 +71,11 @@ var Providers = []GenProvider{
 	{Name: "nvidia", DisplayName: "NVIDIA NIM", Protocol: "openai", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"NVIDIA_API_KEY"}, ModelPrefixMatch: "^nvidia[:/]", IsPlatform: false},
 	{Name: "arcee", DisplayName: "Arcee", Protocol: "openai", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"ARCEE_API_KEY"}, ModelPrefixMatch: "^arcee[:/]", IsPlatform: false},
 	{Name: "custom", DisplayName: "Custom OpenAI-compat endpoint", Protocol: "openai", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"CUSTOM_API_KEY", "OPENAI_API_KEY"}, ModelPrefixMatch: "^custom[:/]", IsPlatform: false},
+	{Name: "byok-anthropic", DisplayName: "Anthropic (BYOK)", Protocol: "anthropic", AuthMode: "anthropic_api", AuthEnv: []string{"ANTHROPIC_API_KEY"}, ModelPrefixMatch: "^anthropic/", IsPlatform: false},
+	{Name: "byok-openai", DisplayName: "OpenAI (BYOK)", Protocol: "openai", AuthMode: "anthropic_api", AuthEnv: []string{"OPENAI_API_KEY"}, ModelPrefixMatch: "^openai[:/]", IsPlatform: false},
+	{Name: "byok-gemini", DisplayName: "Google Gemini (BYOK)", Protocol: "openai", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"GEMINI_API_KEY", "GOOGLE_API_KEY"}, ModelPrefixMatch: "^gemini/", IsPlatform: false},
+	{Name: "byok-minimax", DisplayName: "MiniMax (BYOK)", Protocol: "openai", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"MINIMAX_API_KEY"}, ModelPrefixMatch: "(?i)^(minimax[:/]|codex-minimax-)", IsPlatform: false},
+	{Name: "groq", DisplayName: "Groq", Protocol: "openai", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"GROQ_API_KEY"}, ModelPrefixMatch: "^groq:", IsPlatform: false},
 }
 
 // Runtimes maps each runtime to its native provider+model set, runtime names
@@ -90,6 +95,7 @@ var Runtimes = map[string][]GenRuntimeRef{
 		{Name: "openai-subscription", Models: []string{"gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.2"}},
 		{Name: "openai-api", Models: []string{"gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.2"}},
 		{Name: "platform", Models: []string{"openai/gpt-5.4", "openai/gpt-5.4-mini"}},
+		{Name: "byok-minimax", Models: []string{}},
 	},
 	"google-adk": {
 		{Name: "platform", Models: []string{"platform:gemini-2.5-pro", "platform:gemini-2.5-flash"}},
@@ -114,11 +120,18 @@ var Runtimes = map[string][]GenRuntimeRef{
 		{Name: "zai", Models: []string{}},
 		{Name: "xiaomi-mimo", Models: []string{}},
 		{Name: "alibaba", Models: []string{}},
+		{Name: "byok-anthropic", Models: []string{}},
+		{Name: "byok-gemini", Models: []string{}},
+		{Name: "byok-openai", Models: []string{}},
+		{Name: "byok-minimax", Models: []string{}},
 	},
 	"openclaw": {
 		{Name: "kimi-coding", Models: []string{"moonshot:kimi-k2.6", "moonshot:kimi-k2.5"}},
 		{Name: "platform", Models: []string{"moonshot/kimi-k2.6", "moonshot/kimi-k2.5"}},
 		{Name: "openrouter", Models: []string{}},
 		{Name: "custom", Models: []string{}},
+		{Name: "byok-openai", Models: []string{}},
+		{Name: "byok-minimax", Models: []string{}},
+		{Name: "groq", Models: []string{}},
 	},
 }

@@ -38,14 +38,18 @@ var runtimeNativeProviders = map[string][]string{
 	"hermes": {"kimi-coding", "platform",
 		"openrouter", "huggingface", "ai-gateway", "opencode-zen", "opencode-go",
 		"kilocode", "custom", "nvidia", "arcee", "ollama-cloud", "minimax-cn",
-		"nousresearch", "deepseek", "zai", "xiaomi-mimo", "alibaba"},
+		"nousresearch", "deepseek", "zai", "xiaomi-mimo", "alibaba",
+		// cp#529 dedicated BYOK-vendor name-only arms (shared-vendor namespaced ids).
+		"byok-anthropic", "byok-gemini", "byok-openai", "byok-minimax"},
 	// codex's OpenAI BYOK is split across the OAuth subscription arm
 	// (openai-subscription) and the direct-key arm (openai-api), mirroring
 	// claude-code's anthropic oauth+api split; platform openai via the proxy
-	// Responses surface. No name-only BYOK arms (its templates offer no
-	// passthrough ids).
-	"codex":    {"openai-subscription", "openai-api", "platform"},
-	"openclaw": {"kimi-coding", "platform", "openrouter", "custom"},
+	// Responses surface. cp#529 adds the byok-minimax name-only arm so the
+	// template's BYOK MiniMax token-plan id (codex-minimax-m2.7) resolves.
+	"codex":    {"openai-subscription", "openai-api", "platform", "byok-minimax"},
+	"openclaw": {"kimi-coding", "platform", "openrouter", "custom",
+		// cp#529 dedicated BYOK-vendor name-only arms (openai:/minimax:/groq:).
+		"byok-openai", "byok-minimax", "groq"},
 }
 
 func sortedCopy(in []string) []string {

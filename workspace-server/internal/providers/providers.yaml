@@ -627,6 +627,108 @@ providers:
     model_prefix_match: "^custom[:/]"
     model_aliases: []
 
+  # ===========================================================================
+  # DEDICATED BYOK-VENDOR providers (cp#529). These exist so the NAMESPACED
+  # BYOK ids the hermes/openclaw/codex templates offer for the SHARED upstream
+  # vendors (anthropic, openai, gemini, minimax, groq) become routable with the
+  # TENANT's OWN vendor key — WITHOUT routing them through the platform-shared
+  # `platform` provider (which would bill the platform's key: a money bug).
+  #
+  # Each is NON-PLATFORM (name != "platform") -> IsPlatform()==false -> BYOK
+  # billing: the workspace env supplies the vendor key, never the platform key.
+  #
+  # COLLISION-FREE BY CONSTRUCTION: every matcher is NAMESPACED (anchored on the
+  # `vendor/` slash form or `vendor:` colon form) so it is DISJOINT from the
+  # platform vendors' BARE matchers (anthropic-api `^claude`, openai-subscription
+  # `^gpt-`, openai-api `^openai-api[:/]`, minimax `(?i)^minimax-m`,
+  # google `^gemini-`, minimax-cn `^minimax-cn[:/]`). DeriveProvider's overlap
+  # guard (no slug may match two native providers) stays green — verified for all
+  # 20 residual ids (cp#529).
+  #
+  # These siblings of the platform/upstream vendor entries point at the SAME
+  # PUBLIC upstream base URLs, but carry NO upstream_vendor (they are BYOK
+  # passthroughs, not proxy upstream targets — the proxy never dials a tenant's
+  # own key) and use the namespaced matchers above instead of the bare proxy
+  # prefixes.
+  # ===========================================================================
+  - name: byok-anthropic
+    display_name: "Anthropic (BYOK)"
+    vendor_logo: "anthropic"
+    protocol: anthropic
+    auth_mode: anthropic_api
+    base_url_template: "https://api.anthropic.com/v1"
+    base_url_anthropic: "https://api.anthropic.com/v1"
+    auth_env: [ANTHROPIC_API_KEY]
+    auth_token_env: ANTHROPIC_API_KEY
+    # Namespaced BYOK form `anthropic/<model>` (hermes). DISJOINT from
+    # anthropic-api's bare `^claude` and anthropic-oauth's alias set.
+    model_prefix_match: "^anthropic/"
+    model_aliases: []
+
+  - name: byok-openai
+    display_name: "OpenAI (BYOK)"
+    vendor_logo: "openai"
+    protocol: openai
+    auth_mode: anthropic_api  # openai-protocol; auth is a bearer API key.
+    base_url_template: "https://api.openai.com/v1"
+    base_url_anthropic: null
+    auth_env: [OPENAI_API_KEY]
+    auth_token_env: OPENAI_API_KEY
+    # Namespaced BYOK forms `openai/<model>` (hermes) + `openai:<model>`
+    # (openclaw). DISJOINT from openai-subscription's bare `^gpt-` and
+    # openai-api's `^openai-api[:/]` (the dash after `openai` keeps the two
+    # apart: `openai:` / `openai/` never start with `openai-api`).
+    model_prefix_match: "^openai[:/]"
+    model_aliases: []
+
+  - name: byok-gemini
+    display_name: "Google Gemini (BYOK)"
+    vendor_logo: "google"
+    protocol: openai
+    auth_mode: third_party_anthropic_compat
+    base_url_template: "https://generativelanguage.googleapis.com/v1beta/openai"
+    base_url_anthropic: null
+    auth_env: [GEMINI_API_KEY, GOOGLE_API_KEY]
+    auth_token_env: ANTHROPIC_AUTH_TOKEN
+    # Namespaced BYOK form `gemini/<model>` (hermes). DISJOINT from the `google`
+    # vendor's bare `^gemini-` and `vertex`'s `^vertex:`.
+    model_prefix_match: "^gemini/"
+    model_aliases: []
+
+  - name: byok-minimax
+    display_name: "MiniMax (BYOK)"
+    vendor_logo: "minimax"
+    protocol: openai
+    auth_mode: third_party_anthropic_compat
+    base_url_template: "https://api.minimax.io/v1"
+    base_url_anthropic: null
+    auth_env: [MINIMAX_API_KEY]
+    auth_token_env: ANTHROPIC_AUTH_TOKEN
+    # Namespaced BYOK forms `minimax:<model>` (openclaw) + `minimax/<model>`
+    # (hermes), PLUS the codex-runtime alias `codex-minimax-m2.7` (the codex
+    # template's `minimax-token-plan` route — same upstream api.minimax.io,
+    # tenant MINIMAX_API_KEY). The `codex-minimax-` leg is NARROWLY anchored so
+    # it resolves that one codex id WITHOUT a broad matcher: it is DISJOINT from
+    # `minimax` (?i)^minimax-m (which needs `minimax-m`, not `codex-`) and from
+    # `minimax-cn` ^minimax-cn[:/]. Verified collision-free for all 20 residual
+    # ids + codex-minimax-m2.7 (cp#529).
+    model_prefix_match: "(?i)^(minimax[:/]|codex-minimax-)"
+    model_aliases: []
+
+  - name: groq
+    display_name: "Groq"
+    vendor_logo: "groq"
+    protocol: openai
+    auth_mode: third_party_anthropic_compat
+    base_url_template: "https://api.groq.com/openai/v1"
+    base_url_anthropic: null
+    auth_env: [GROQ_API_KEY]
+    auth_token_env: ANTHROPIC_AUTH_TOKEN
+    # Namespaced BYOK form `groq:<model>` (openclaw). No other provider matches
+    # the `groq:` prefix.
+    model_prefix_match: "^groq:"
+    model_aliases: []
+
 # =============================================================================
 # RUNTIME NATIVE SUPPORT MATRIX  (RFC #340 — CTO correction 2026-05-26)
 # =============================================================================
@@ -792,11 +894,6 @@ runtimes:
       # bare-vendor providers into its NATIVE prefix-routing set so the BYOK
       # ids the hermes template offers (openrouter/…, huggingface/…, deepseek/…,
       # zai:…, etc.) resolve via DeriveProvider. ALL tenant-key (BYOK).
-      # GUARDRAIL: the platform-shared vendors (openai/gemini/minimax/anthropic
-      # and groq) are DELIBERATELY ABSENT here — wiring them would route a
-      # customer model through the platform's key (a money bug); so hermes ids
-      # like anthropic/claude-*, gemini/*, openai/*, minimax/*, groq:* remain
-      # unroutable (residual drift) until dedicated BYOK-vendor providers exist.
       - name: openrouter
       - name: huggingface
       - name: ai-gateway
@@ -813,6 +910,17 @@ runtimes:
       - name: zai
       - name: xiaomi-mimo
       - name: alibaba
+      # DEDICATED BYOK-VENDOR arms (cp#529): the namespaced ids hermes offers for
+      # the SHARED upstream vendors (anthropic/claude-*, gemini/*, openai/*,
+      # minimax/*) NOW resolve to these tenant-key BYOK-vendor providers — NOT
+      # the platform-shared `platform` provider (which would bill the platform's
+      # key). NAME-ONLY (no models) → no platform-menu change, prefix-routing
+      # only, BYOK-billed. This converts the last 12 hermes residual ids from
+      # cp#529 drift to routable.
+      - name: byok-anthropic
+      - name: byok-gemini
+      - name: byok-openai
+      - name: byok-minimax
 
   # codex: OpenAI — BYOK split across TWO native providers
   # (openai-subscription + openai-api), mirroring claude-code's anthropic
@@ -864,6 +972,14 @@ runtimes:
         models:
           - openai/gpt-5.4
           - openai/gpt-5.4-mini
+      # NAME-ONLY BYOK arm (cp#529): the codex template offers a BYOK MiniMax
+      # token-plan model `codex-minimax-m2.7` (its `minimax-token-plan` provider:
+      # base_url api.minimax.io, tenant MINIMAX_API_KEY, model_id_override
+      # codex-MiniMax-M2.7). It resolves to byok-minimax via the narrowly-anchored
+      # `codex-minimax-` leg of byok-minimax's matcher (same upstream, tenant key)
+      # — NOT a broad matcher. NAME-ONLY → no platform-menu change, BYOK-billed.
+      # Converts the last codex residual id from cp#529 drift to routable.
+      - name: byok-minimax
 
   # openclaw: native Kimi only. openclaw's moonshot: model prefix + a
   # KIMI_API_KEY (sk-kimi-*) routes to api.kimi.com/coding (kimi-for-coding),
@@ -886,11 +1002,17 @@ runtimes:
       # but wire openclaw's CONFIRMED-NON-PLATFORM passthroughs into its NATIVE
       # prefix-routing set so the BYOK colon/slash ids the openclaw template
       # offers (openrouter:…, custom:…) resolve via DeriveProvider. BYOK only.
-      # GUARDRAIL: the platform-shared openclaw ids openai:*, minimax:*, groq:*
-      # are DELIBERATELY ABSENT (groq has no provider at all) — they stay
-      # unroutable residual drift rather than billing the platform's key.
       - name: openrouter
       - name: custom
+      # DEDICATED BYOK-VENDOR arms (cp#529): openclaw's default model is
+      # `minimax:MiniMax-M2.7`, plus it offers `openai:*` and `groq:*` BYOK ids.
+      # These NOW resolve to the tenant-key BYOK-vendor providers (NOT the
+      # platform key). NAME-ONLY → prefix-routing only, BYOK-billed. This converts
+      # the last 7 openclaw residual ids from cp#529 drift to routable AND makes
+      # the runtime's DEFAULT model (minimax:MiniMax-M2.7) resolve.
+      - name: byok-openai
+      - name: byok-minimax
+      - name: groq
 
 
   # google-adk: Gemini via Vertex AI, keyless ADC (Workload Identity
