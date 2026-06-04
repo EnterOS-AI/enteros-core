@@ -115,6 +115,19 @@ jobs:
           echo "Docker daemon OK"
           echo "::endgroup::"
 
+      # Pre-flight: verify every repo in manifest.json actually exists.
+      #
+      # Why: deleting a template repo without updating manifest.json breaks
+      # clone-manifest.sh with a generic git 404, which looks like a
+      # transient network error and wastes debug time. We catch it here
+      # with a per-entry ::error:: annotation naming the missing repo
+      # (issue #2192). This is the push-time complement to PR #2186's
+      # PR-time manifest-entry-existence gate.
+      - name: Validate manifest entries exist
+        run: |
+          set -euo pipefail
+          bash scripts/check-manifest-repos-exist.sh manifest.json
+
       # Pre-clone manifest deps before docker build.
       #
       # Why: workspace-template-* repos on Gitea are private. The pre-fix
