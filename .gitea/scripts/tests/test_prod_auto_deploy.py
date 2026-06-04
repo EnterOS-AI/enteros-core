@@ -486,3 +486,88 @@ def test_scoped_rollout_dry_run_does_not_assert_coverage():
         sleep=lambda _s: None,
     )
     assert aggregate["ok"] is True
+
+
+# --- Superseded-deploy guard (false-stale fix) -----------------------------
+#
+# Scenario this fixes: no `concurrency:` on the prod-deploy workflow means two
+# close main pushes run BOTH deploy-production jobs. eb31bcf (Fix A) and 286338
+# (Fix C) merge back-to-back; the 286338 job rolls the fleet to staging-2863380
+# first; the OLDER eb31bcf job's strict verify then sees tenants on 2863380 and
+# false-reds "stale" though the fleet is AHEAD. superseded_by detects that main's
+# head is no longer eb31bcf and lets the older job succeed without weakening the
+# behind-tenant signal for whichever job IS the latest.
+
+
+def test_superseded_by_returns_newer_head_when_main_moved_ahead(monkeypatch):
+    # eb31bcf job: main head is now 2863380 -> superseded, return the newer head.
+    monkeypatch.setattr(prod, "current_branch_head", lambda _env: "2863380fullhash")
+    newer = prod.superseded_by({"GITHUB_SHA": "eb31bcffullhash"})
+    assert newer == "2863380fullhash"
+
+
+def test_superseded_by_none_when_this_job_is_still_head(monkeypatch):
+    # 2863380 job (the latest): head == our SHA -> NOT superseded -> strict verify
+    # runs, so a genuinely-behind tenant still fails loudly.
+    monkeypatch.setattr(prod, "current_branch_head", lambda _env: "2863380fullhash")
+    assert prod.superseded_by({"GITHUB_SHA": "2863380fullhash"}) is None
+
+
+def test_superseded_by_matches_on_short_vs_full_sha_prefix(monkeypatch):
+    # GITHUB_SHA is full; Gitea may return a different-length id. Equal prefixes
+    # must NOT count as superseded (avoid false-skipping the real latest job).
+    monkeypatch.setattr(prod, "current_branch_head", lambda _env: "2863380")
+    assert prod.superseded_by({"GITHUB_SHA": "2863380fullhash"}) is None
+    monkeypatch.setattr(prod, "current_branch_head", lambda _env: "2863380FULLHASH")
+    assert prod.superseded_by({"GITHUB_SHA": "2863380fullhash"}) is None
+
+
+def test_superseded_by_fail_safe_returns_none_when_head_unreadable(monkeypatch):
+    # Fail-safe: unreadable head (no token / API error) must NOT be treated as
+    # superseded, so the strict verify still runs and never silently greens.
+    monkeypatch.setattr(prod, "current_branch_head", lambda _env: None)
+    assert prod.superseded_by({"GITHUB_SHA": "eb31bcffullhash"}) is None
+
+
+def test_superseded_by_none_without_github_sha(monkeypatch):
+    monkeypatch.setattr(prod, "current_branch_head", lambda _env: "2863380fullhash")
+    assert prod.superseded_by({}) is None
+
+
+def test_current_branch_head_parses_gitea_branch_commit_id(monkeypatch):
+    captured = {}
+
+    def fake_optional(url, _token):
+        captured["url"] = url
+        return 200, {"name": "main", "commit": {"id": "2863380fullhash"}}
+
+    monkeypatch.setattr(prod, "_api_json_optional", fake_optional)
+    head = prod.current_branch_head(
+        {"GITEA_TOKEN": "secret", "GITHUB_REPOSITORY": "molecule-ai/molecule-core"}
+    )
+    assert head == "2863380fullhash"
+    assert captured["url"].endswith("/repos/molecule-ai/molecule-core/branches/main")
+
+
+def test_current_branch_head_uses_ref_name_branch(monkeypatch):
+    captured = {}
+
+    def fake_optional(url, _token):
+        captured["url"] = url
+        return 200, {"commit": {"sha": "deadbeef"}}
+
+    monkeypatch.setattr(prod, "_api_json_optional", fake_optional)
+    head = prod.current_branch_head(
+        {"GITEA_TOKEN": "secret", "GITHUB_REF_NAME": "release"}
+    )
+    assert head == "deadbeef"
+    assert captured["url"].endswith("/branches/release")
+
+
+def test_current_branch_head_none_without_token():
+    assert prod.current_branch_head({}) is None
+
+
+def test_current_branch_head_none_on_non_200(monkeypatch):
+    monkeypatch.setattr(prod, "_api_json_optional", lambda _u, _t: (500, None))
+    assert prod.current_branch_head({"GITEA_TOKEN": "secret"}) is None
