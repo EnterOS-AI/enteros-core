@@ -115,12 +115,13 @@ func TestValidateRegisteredModelForRuntime(t *testing.T) {
 			wantOK:  false,
 		},
 		{
-			// A platform-shared namespaced id that MUST remain unroutable on
-			// hermes (billing guardrail: openai vendor not wired) → still 422.
-			name:    "platform_shared_openai_namespaced_still_rejected",
+			// A namespaced vendor id NOW routable on hermes via the dedicated
+			// byok-openai provider (cp#529 BYOK-vendor arms): routes with the
+			// tenant's OPENAI_API_KEY → BYOK billing, never the platform key.
+			name:    "byok_openai_namespaced_routable_now_allowed",
 			runtime: "hermes",
 			model:   "openai/gpt-4o",
-			wantOK:  false,
+			wantOK:  true,
 		},
 	}
 	for _, c := range cases {
