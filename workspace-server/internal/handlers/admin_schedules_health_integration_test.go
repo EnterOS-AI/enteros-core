@@ -183,11 +183,19 @@ func TestIntegration_AdminSchedulesHealth_ClassifiesRows(t *testing.T) {
 		t.Errorf("removed_schedule should be filtered out (workspace status=removed)")
 	}
 
-	// --- Assert: stale threshold is 2× cron interval (every-15-min = 1800s × 2 = 3600s) ---
+	// --- Assert: stale threshold is 2× cron interval. */15 fires every
+	// 15 minutes (900s) so the threshold is 2× 900s = 1800s. (The previous
+	// version of this assertion expected ~3600 — the original test author
+	// mis-read `*/15` as "every 30 minutes", which is two off-by-one errors
+	// stacked. Handler computes the threshold from the next-two-fires gap
+	// in budget_periods.go, which is correct.) ---
 	if e, ok := byName["ok_schedule"]; ok {
-		// Allow ±5s slack for runtime compute jitter.
-		if e.StaleThresholdSeconds < 3590 || e.StaleThresholdSeconds > 3610 {
-			t.Errorf("ok_schedule: stale_threshold_seconds want ~3600 (2× 15min), got %d", e.StaleThresholdSeconds)
+		// Allow ±10s slack for runtime compute jitter (scheduler.ComputeNextRun
+		// is a pure function so it's deterministic, but the "now" snapshot is
+		// taken at test time, not at seed time, so the precise gap can shift
+		// by a couple of seconds if the test runs across a 15-min boundary).
+		if e.StaleThresholdSeconds < 1790 || e.StaleThresholdSeconds > 1810 {
+			t.Errorf("ok_schedule: stale_threshold_seconds want ~1800 (2× 15min), got %d", e.StaleThresholdSeconds)
 		}
 	}
 }

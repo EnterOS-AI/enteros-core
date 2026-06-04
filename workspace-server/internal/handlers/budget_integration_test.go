@@ -24,6 +24,7 @@
 //	sleep 4
 //	psql ... < workspace-server/migrations/001_workspaces.sql
 //	psql ... < workspace-server/migrations/027_workspace_budget.up.sql
+//	psql ... < workspace-server/migrations/20260529000000_workspace_multiperiod_budget.up.sql
 //	cd workspace-server
 //	INTEGRATION_DB_URL="postgres://postgres:test@localhost:55432/molecule?sslmode=disable" \
 //	  go test -tags=integration ./internal/handlers/ -run Integration_Budget -v
@@ -62,13 +63,20 @@ func integrationDB_Budget(t *testing.T) *sql.DB {
 	if err := conn.Ping(); err != nil {
 		t.Fatalf("ping: %v", err)
 	}
-	if _, err := conn.ExecContext(context.Background(),
-		`DELETE FROM workspaces WHERE name LIKE 'integ-bud-%'`); err != nil {
-		t.Fatalf("cleanup: %v", err)
+	for _, stmt := range []string{
+		// Wipe ledger rows first (workspace_id is TEXT, no FK, but
+		// grouping the cleanup with workspaces makes intent clear).
+		`DELETE FROM workspace_spend_events WHERE workspace_id IN (SELECT id FROM workspaces WHERE name LIKE 'integ-bud-%')`,
+		`DELETE FROM workspaces WHERE name LIKE 'integ-bud-%'`,
+	} {
+		if _, err := conn.ExecContext(context.Background(), stmt); err != nil {
+			t.Fatalf("cleanup %q: %v", stmt, err)
+		}
 	}
 	prev := db.DB
 	db.DB = conn
 	t.Cleanup(func() {
+		conn.ExecContext(context.Background(), `DELETE FROM workspace_spend_events WHERE workspace_id IN (SELECT id FROM workspaces WHERE name LIKE 'integ-bud-%')`)
 		conn.ExecContext(context.Background(), `DELETE FROM workspaces WHERE name LIKE 'integ-bud-%'`)
 		db.DB = prev
 		conn.Close()
@@ -76,21 +84,44 @@ func integrationDB_Budget(t *testing.T) *sql.DB {
 	return conn
 }
 
-// seedWorkspace_Budget inserts a workspaces row with optional budget_limit
-// (nil = NULL) and a fixed monthly_spend. The status is hardcoded to
-// 'online' (a valid workspace_status enum value — see migration 043).
+// seedWorkspace_Budget inserts a workspaces row with the per-period
+// budget_limits JSONB (the SSOT since migration 20260529000000) and,
+// if monthlySpend > 0, a corresponding workspace_spend_events ledger
+// row so the handler's rolling-window SUM picks it up. The legacy
+// budget_limit / monthly_spend BIGINT columns are no longer the SSOT —
+// the handler reads the JSONB + the ledger. The status is hardcoded
+// to 'online' (a valid workspace_status enum value — see migration 043).
 // The removed-status case uses a separate helper.
 func seedWorkspace_Budget(t *testing.T, conn *sql.DB, id string, budgetLimit *int64, monthlySpend int64) {
 	t.Helper()
-	var lim interface{} = nil
+	// Render the JSONB shape the handler expects: {"monthly":N} when a
+	// limit is configured, {} otherwise. Absent keys = no limit (the
+	// default) so we only mention periods that have a configured ceiling.
+	limits := map[string]int64{}
 	if budgetLimit != nil {
-		lim = *budgetLimit
+		limits["monthly"] = *budgetLimit
+	}
+	limitsJSON, err := json.Marshal(limits)
+	if err != nil {
+		t.Fatalf("seed: marshal limits: %v", err)
 	}
 	if _, err := conn.ExecContext(context.Background(),
-		`INSERT INTO workspaces (id, name, status, budget_limit, monthly_spend)
-		 VALUES ($1, $2, 'online', $3, $4)`,
-		id, "integ-bud-"+id, lim, monthlySpend); err != nil {
+		`INSERT INTO workspaces (id, name, status, budget_limits)
+		 VALUES ($1, $2, 'online', $3::jsonb)`,
+		id, "integ-bud-"+id, string(limitsJSON)); err != nil {
 		t.Fatalf("seed: %v", err)
+	}
+	// Record the monthly spend as a single ledger event with the full
+	// delta. spendByPeriod sums delta_cents over the rolling window —
+	// a single recent row (default occurred_at=now()) lands inside all
+	// four windows (1h/24h/7d/30d), so the monthly figure the test
+	// expects shows up regardless of which window the assertion targets.
+	if monthlySpend > 0 {
+		if _, err := conn.ExecContext(context.Background(),
+			`INSERT INTO workspace_spend_events (workspace_id, delta_cents) VALUES ($1, $2)`,
+			id, monthlySpend); err != nil {
+			t.Fatalf("seed spend: %v", err)
+		}
 	}
 }
 
@@ -128,6 +159,7 @@ func TestIntegration_Budget_GetPatchPersistsAndValidates(t *testing.T) {
 
 	wsA := integUUID("integ-bud-ws-a")
 	wsB := integUUID("integ-bud-ws-b")
+	wsAOver := integUUID("integ-bud-ws-a-over")
 	wsRemoved := integUUID("integ-bud-ws-removed")
 	wsGhost := integUUID("integ-bud-ws-ghost")
 
@@ -138,11 +170,12 @@ func TestIntegration_Budget_GetPatchPersistsAndValidates(t *testing.T) {
 	seedWorkspace_Budget(t, conn, wsA, nil, 0)
 	seedWorkspace_Budget(t, conn, wsB, int64Ptr(10000), 2500)
 	overLim := int64(1000)
-	seedWorkspace_Budget(t, conn, integUUID("integ-bud-ws-a-over"), &overLim, 1500)
-	// removed-workspace case
+	seedWorkspace_Budget(t, conn, wsAOver, &overLim, 1500)
+	// removed-workspace case (status='removed' so the handler's
+	// `WHERE status != 'removed'` existence check rejects it with 404).
 	if _, err := conn.ExecContext(context.Background(),
-		`INSERT INTO workspaces (id, name, status, budget_limit, monthly_spend)
-		 VALUES ($1, 'integ-bud-removed', 'removed', NULL, 0)`, wsRemoved); err != nil {
+		`INSERT INTO workspaces (id, name, status, budget_limits)
+		 VALUES ($1, 'integ-bud-removed', 'removed', '{}'::jsonb)`, wsRemoved); err != nil {
 		t.Fatalf("seed removed: %v", err)
 	}
 
@@ -191,7 +224,7 @@ func TestIntegration_Budget_GetPatchPersistsAndValidates(t *testing.T) {
 	}
 
 	// --- Case 3: GET — over budget → remaining is NEGATIVE (per budget.go doc) ---
-	w = doGet_Budget(t, handler, wsA+"over")
+	w = doGet_Budget(t, handler, wsAOver)
 	if w.Code != http.StatusOK {
 		t.Fatalf("GET over: status want 200, got %d: %s", w.Code, w.Body.String())
 	}
