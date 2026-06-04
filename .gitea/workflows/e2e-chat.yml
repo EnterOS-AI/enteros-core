@@ -278,16 +278,33 @@ jobs:
           export NEXT_PUBLIC_WS_URL="ws://127.0.0.1:${PLATFORM_PORT}/ws"
           npx next dev --turbopack -p "${CANVAS_PORT}" > canvas.log 2>&1 &
           echo $! > canvas.pid
-          for i in $(seq 1 30); do
-            if curl -sf "http://localhost:${CANVAS_PORT}" > /dev/null 2>&1; then
-              echo "Canvas up after ${i}s"
-              exit 0
+          # Readiness must wait for the actual chat route to *compile*, not
+          # just for the dev server to bind the port. `next dev --turbopack`
+          # accepts the TCP connection well before it has compiled a route
+          # on first request, so a bare `curl /` can 200 (or hang) while the
+          # page the tests load is still building. We therefore probe the
+          # real route the specs navigate to (`/?m=chat`) and require a 2xx,
+          # which only happens once Turbopack has finished the first
+          # compile. The previous 30s budget was also too tight for a cold
+          # Turbopack first-compile on a loaded operator-host runner — the
+          # `Canvas did not start in 30s` flake. Raise to 120s (job
+          # timeout-minutes is 15, so this is comfortably bounded) and probe
+          # every 2s.
+          READY=""
+          for i in $(seq 1 60); do
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' "http://localhost:${CANVAS_PORT}/?m=chat" 2>/dev/null || echo 000)
+            if [ "$CODE" -ge 200 ] && [ "$CODE" -lt 400 ]; then
+              echo "Canvas (chat route compiled) up after ~$((i*2))s (HTTP ${CODE})"
+              READY=1
+              break
             fi
-            sleep 1
+            sleep 2
           done
-          echo "::error::Canvas did not start in 30s"
-          cat canvas.log || true
-          exit 1
+          if [ -z "$READY" ]; then
+            echo "::error::Canvas chat route did not compile in 120s (last HTTP ${CODE})"
+            cat canvas.log || true
+            exit 1
+          fi
 
       - name: Run Playwright E2E tests
         if: needs.detect-changes.outputs.chat == 'true'
