@@ -8,7 +8,8 @@ pair diverges.
 Sources:
   A. `.gitea/workflows/ci.yml` jobs  (CI source — the actual job set)
   B. `status_check_contexts` in branch_protections (the merge gate)
-  C. `REQUIRED_CHECKS` env in audit-force-merge.yml (the audit env)
+  C. `REQUIRED_CHECKS_JSON` (preferred) or `REQUIRED_CHECKS` (legacy)
+     env in audit-force-merge.yml (the audit env)
 
 Three failure classes:
   F1  Job in (A) is not under the sentinel's `needs:` — sentinel
@@ -250,13 +251,21 @@ def sentinel_needs(ci_doc: dict) -> set[str]:
     return set(needs)
 
 
-def required_checks_env(audit_doc: dict) -> set[str]:
-    """Pull the REQUIRED_CHECKS env value from audit-force-merge.yml.
+def required_checks_env(audit_doc: dict, branch: str) -> set[str]:
+    """Pull the required-checks env value from audit-force-merge.yml.
+
     Walks the YAML AST per `feedback_behavior_based_ast_gates`: we do
-    NOT grep for `REQUIRED_CHECKS:` — that breaks under reformatting,
+    NOT grep for env keys — that breaks under reformatting,
     multi-job workflows, or a future move of the env to a different
-    step. Instead, look inside every job's every step's `env:` map."""
-    found: list[str] = []
+    step. Instead, look inside every job's every step's `env:` map.
+
+    Supports two variants:
+      - REQUIRED_CHECKS_JSON (preferred): JSON dict keyed by branch name.
+        We extract the array for the target branch.
+      - REQUIRED_CHECKS (legacy): newline-separated list of context names.
+    """
+    found_json: list[str] = []
+    found_legacy: list[str] = []
     jobs = audit_doc.get("jobs", {})
     if not isinstance(jobs, dict):
         sys.stderr.write(f"::warning::{AUDIT_WORKFLOW_PATH} has no jobs: mapping\n")
@@ -268,27 +277,67 @@ def required_checks_env(audit_doc: dict) -> set[str]:
             if not isinstance(step, dict):
                 continue
             step_env = step.get("env") or {}
-            if isinstance(step_env, dict) and "REQUIRED_CHECKS" in step_env:
-                v = step_env["REQUIRED_CHECKS"]
-                if isinstance(v, str):
-                    found.append(v)
-    if not found:
-        sys.stderr.write(
-            f"::error::REQUIRED_CHECKS env not found in any step of "
-            f"{AUDIT_WORKFLOW_PATH}\n"
-        )
-        sys.exit(3)
-    if len(found) > 1:
-        # Defensive: refuse to guess which one is canonical.
-        sys.stderr.write(
-            f"::error::REQUIRED_CHECKS env present in {len(found)} steps; ambiguous\n"
-        )
-        sys.exit(3)
-    raw = found[0]
-    # YAML block-scalars (`|`) leave a trailing newline + blanks; trim
-    # consistently with audit-force-merge.sh's parser so both sides
-    # produce identical sets.
-    return {line.strip() for line in raw.splitlines() if line.strip()}
+            if isinstance(step_env, dict):
+                if "REQUIRED_CHECKS_JSON" in step_env:
+                    v = step_env["REQUIRED_CHECKS_JSON"]
+                    if isinstance(v, str):
+                        found_json.append(v)
+                if "REQUIRED_CHECKS" in step_env:
+                    v = step_env["REQUIRED_CHECKS"]
+                    if isinstance(v, str):
+                        found_legacy.append(v)
+
+    # JSON variant takes precedence.
+    if found_json:
+        if len(found_json) > 1:
+            sys.stderr.write(
+                f"::error::REQUIRED_CHECKS_JSON env present in {len(found_json)} steps; ambiguous\n"
+            )
+            sys.exit(3)
+        try:
+            parsed = json.loads(found_json[0])
+        except json.JSONDecodeError as e:
+            sys.stderr.write(
+                f"::error::REQUIRED_CHECKS_JSON is not valid JSON: {e}\n"
+            )
+            sys.exit(3)
+        if not isinstance(parsed, dict):
+            sys.stderr.write(
+                f"::error::REQUIRED_CHECKS_JSON parsed to {type(parsed).__name__}, expected dict\n"
+            )
+            sys.exit(3)
+        branch_checks = parsed.get(branch)
+        if branch_checks is None:
+            sys.stderr.write(
+                f"::error::REQUIRED_CHECKS_JSON has no entry for branch '{branch}'\n"
+            )
+            sys.exit(3)
+        if not isinstance(branch_checks, list):
+            sys.stderr.write(
+                f"::error::REQUIRED_CHECKS_JSON['{branch}'] is {type(branch_checks).__name__}, expected list\n"
+            )
+            sys.exit(3)
+        return {str(item).strip() for item in branch_checks if str(item).strip()}
+
+    # Legacy variant fallback.
+    if found_legacy:
+        if len(found_legacy) > 1:
+            # Defensive: refuse to guess which one is canonical.
+            sys.stderr.write(
+                f"::error::REQUIRED_CHECKS env present in {len(found_legacy)} steps; ambiguous\n"
+            )
+            sys.exit(3)
+        raw = found_legacy[0]
+        # YAML block-scalars (`|`) leave a trailing newline + blanks; trim
+        # consistently with audit-force-merge.sh's parser so both sides
+        # produce identical sets.
+        return {line.strip() for line in raw.splitlines() if line.strip()}
+
+    sys.stderr.write(
+        f"::error::Neither REQUIRED_CHECKS_JSON nor REQUIRED_CHECKS env found in any step of "
+        f"{AUDIT_WORKFLOW_PATH}\n"
+    )
+    sys.exit(3)
 
 
 # --------------------------------------------------------------------------
@@ -330,7 +379,7 @@ def detect_drift(branch: str) -> tuple[list[str], dict]:
     jobs = ci_job_names(ci_doc)
     jobs_all = ci_jobs_all(ci_doc)
     needs = sentinel_needs(ci_doc)
-    env_set = required_checks_env(audit_doc)
+    env_set = required_checks_env(audit_doc, branch)
 
     # Protection
     # api() raises ApiError on non-2xx. Transient 5xx should fail loud.
@@ -524,7 +573,7 @@ def render_body(branch: str, findings: list[str], debug: dict) -> str:
             "- **F2**: rename the protection context to match an emitter, "
             "or remove it from `status_check_contexts` "
             "(PATCH `/api/v1/repos/{owner}/{repo}/branch_protections/{branch}`).",
-            "- **F3a / F3b**: bring `REQUIRED_CHECKS` env in "
+            "- **F3a / F3b**: bring `REQUIRED_CHECKS_JSON` (or `REQUIRED_CHECKS` legacy) env in "
             "`.gitea/workflows/audit-force-merge.yml` into set-equality with "
             "`status_check_contexts` (single PR, both files).",
             "",
