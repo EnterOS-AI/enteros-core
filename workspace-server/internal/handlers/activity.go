@@ -700,7 +700,8 @@ func buildSessionSearchQuery(workspaceID, query string, limit int) (string, []in
 				COALESCE(status, '') AS status,
 				request_body,
 				response_body,
-				created_at
+				created_at,
+				seq
 			FROM activity_logs
 			WHERE workspace_id = $1
 		)
@@ -724,7 +725,10 @@ func buildSessionSearchQuery(workspaceID, query string, limit int) (string, []in
 
 	// Deterministic order: created_at alone is not unique (same-microsecond
 	// rows), so tie-break on the monotonic seq — same fix as the since_id feed
-	// (§ No flakes: no unstable sorts, even on an unused surface).
+	// (§ No flakes: no unstable sorts, even on an unused surface). `seq` is
+	// projected through the session_items CTE above so this outer ORDER BY can
+	// reference it — the outer SELECT can only sort on the CTE's output columns,
+	// not on activity_logs directly.
 	sqlQuery += ` ORDER BY created_at DESC, seq DESC LIMIT $` + strconv.Itoa(len(args)+1)
 	args = append(args, limit)
 	return sqlQuery, args
