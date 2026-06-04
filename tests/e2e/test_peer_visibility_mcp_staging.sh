@@ -234,9 +234,30 @@ elif [ -n "${E2E_OPENAI_API_KEY:-}" ]; then
   SECRETS_JSON=$(python3 -c "import json,os;k=os.environ['E2E_OPENAI_API_KEY'];print(json.dumps({'OPENAI_API_KEY':k,'OPENAI_BASE_URL':'https://api.openai.com/v1','MODEL_PROVIDER':'openai:gpt-4o','HERMES_INFERENCE_PROVIDER':'custom','HERMES_CUSTOM_BASE_URL':'https://api.openai.com/v1','HERMES_CUSTOM_API_KEY':k,'HERMES_CUSTOM_API_MODE':'chat_completions'}))")
 fi
 
+# Workspace-create now enforces the MODEL_REQUIRED contract: there is NO
+# platform-side default model for a runtime (feedback_workspace_model_required_
+# no_platform_default). Every create MUST carry an explicit `model`, or the CP
+# rejects it with MODEL_REQUIRED before this gate's peer-visibility assertion
+# can run. We pick a PLATFORM-MANAGED id (Molecule owns billing — no tenant key
+# needed; this gate only needs the workspace to boot + list peers, not heavy
+# LLM work), validated against the controlplane providers SSOT
+# (internal/providers/providers.yaml runtimes.<rt>.providers[platform].models):
+#   claude-code → anthropic/claude-sonnet-4-6   (platform claude model)
+#   hermes/openclaw → moonshot/kimi-k2.6         (their only platform family)
+# E2E_MODEL_SLUG overrides for operator-dispatched runs.
+pv_platform_model_for_runtime() {
+  if [ -n "${E2E_MODEL_SLUG:-}" ]; then printf '%s' "$E2E_MODEL_SLUG"; return 0; fi
+  case "$1" in
+    claude-code) printf 'anthropic/claude-sonnet-4-6' ;;
+    hermes|openclaw) printf 'moonshot/kimi-k2.6' ;;
+    *) printf 'moonshot/kimi-k2.6' ;;
+  esac
+}
+
 log "4/6 provisioning parent (claude-code) + one sibling per runtime under test..."
+PARENT_MODEL=$(pv_platform_model_for_runtime claude-code)
 P_RESP=$(tenant_call POST /workspaces \
-  -d "{\"name\":\"pv-parent\",\"runtime\":\"claude-code\",\"tier\":3,\"secrets\":$SECRETS_JSON}")
+  -d "{\"name\":\"pv-parent\",\"runtime\":\"claude-code\",\"model\":\"$PARENT_MODEL\",\"tier\":3,\"secrets\":$SECRETS_JSON}")
 PARENT_ID=$(echo "$P_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))" 2>/dev/null)
 [ -n "$PARENT_ID" ] || fail "parent create failed: $(echo "$P_RESP" | head -c 300)"
 log "    PARENT_ID=$PARENT_ID"
@@ -245,8 +266,9 @@ log "    PARENT_ID=$PARENT_ID"
 declare -A WS_IDS WS_TOKENS
 ALL_WS_IDS="$PARENT_ID"
 for rt in $PV_RUNTIMES; do
+  RT_MODEL=$(pv_platform_model_for_runtime "$rt")
   R=$(tenant_call POST /workspaces \
-    -d "{\"name\":\"pv-$rt\",\"runtime\":\"$rt\",\"tier\":2,\"parent_id\":\"$PARENT_ID\",\"secrets\":$SECRETS_JSON}")
+    -d "{\"name\":\"pv-$rt\",\"runtime\":\"$rt\",\"model\":\"$RT_MODEL\",\"tier\":2,\"parent_id\":\"$PARENT_ID\",\"secrets\":$SECRETS_JSON}")
   WID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))" 2>/dev/null)
   WTOK=$(echo "$R" | extract_auth_token)
   [ -n "$WID" ] || fail "$rt workspace create failed: $(printf '%s' "$R" | head -c 300)"
