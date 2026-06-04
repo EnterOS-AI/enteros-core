@@ -546,6 +546,11 @@ func TestSecretsSetModel_Upsert(t *testing.T) {
 	restartCalled := make(chan string, 1)
 	handler := NewSecretsHandler(func(id string) { restartCalled <- id })
 
+	// Runtime lookup (issue #2172) — model is non-empty so validation fires.
+	mock.ExpectQuery(`SELECT runtime FROM workspaces WHERE id = \$1`).
+		WithArgs("00000000-0000-0000-0000-000000000001").
+		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("claude-code"))
+
 	// Pin the literal 'MODEL' key in the SQL so a regression to the
 	// pre-2026-05-19 'MODEL_PROVIDER' column name shows up here.
 	mock.ExpectExec(`INSERT INTO workspace_secrets[\s\S]*'MODEL'`).
@@ -623,6 +628,99 @@ func TestSecretsSetModel_InvalidID(t *testing.T) {
 	}
 }
 
+// TestSecretsSetModel_UnregisteredModel_422 guards that a model not in the
+// runtime's native set is rejected at save (issue #2172 continuation).
+func TestSecretsSetModel_UnregisteredModel_422(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewSecretsHandler(nil)
+
+	mock.ExpectQuery(`SELECT runtime FROM workspaces WHERE id = \$1`).
+		WithArgs("00000000-0000-0000-0000-000000000003").
+		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("claude-code"))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "00000000-0000-0000-0000-000000000003"}}
+	c.Request = httptest.NewRequest("PUT", "/workspaces/00000000-0000-0000-0000-000000000003/model",
+		strings.NewReader(`{"model":"totally-made-up-model-xyz"}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.SetModel(c)
+
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422, got %d: %s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "UNREGISTERED_MODEL_FOR_RUNTIME") {
+		t.Errorf("expected code UNREGISTERED_MODEL_FOR_RUNTIME in body, got: %s", body)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// TestSecretsSetModel_UnknownRuntimeFailOpen_200 verifies the federation
+// contract: a runtime absent from the registry (langgraph) passes through
+// without validation so non-first-party runtimes are not blocked.
+func TestSecretsSetModel_UnknownRuntimeFailOpen_200(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewSecretsHandler(nil)
+
+	mock.ExpectQuery(`SELECT runtime FROM workspaces WHERE id = \$1`).
+		WithArgs("00000000-0000-0000-0000-000000000004").
+		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("langgraph"))
+
+	mock.ExpectExec(`INSERT INTO workspace_secrets[\s\S]*'MODEL'`).
+		WithArgs("00000000-0000-0000-0000-000000000004", sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "00000000-0000-0000-0000-000000000004"}}
+	c.Request = httptest.NewRequest("PUT", "/workspaces/00000000-0000-0000-0000-000000000004/model",
+		strings.NewReader(`{"model":"any-arbitrary-model"}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.SetModel(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// TestSecretsSetModel_WorkspaceNotFound_404 verifies 404 when the runtime
+// lookup finds no workspace row.
+func TestSecretsSetModel_WorkspaceNotFound_404(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewSecretsHandler(nil)
+
+	mock.ExpectQuery(`SELECT runtime FROM workspaces WHERE id = \$1`).
+		WithArgs("00000000-0000-0000-0000-000000000005").
+		WillReturnError(sql.ErrNoRows)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "00000000-0000-0000-0000-000000000005"}}
+	c.Request = httptest.NewRequest("PUT", "/workspaces/00000000-0000-0000-0000-000000000005/model",
+		strings.NewReader(`{"model":"claude-sonnet-4-6"}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.SetModel(c)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
 // TestSecretsModel_RoundTrip_KeyIsMODELNotMODEL_PROVIDER pins the
 // 2026-05-19 rename: writes via SetModel land under workspace_secrets
 // key='MODEL', and reads via GetModel hit the same key. A regression
@@ -636,6 +734,10 @@ func TestSecretsModel_RoundTrip_KeyIsMODELNotMODEL_PROVIDER(t *testing.T) {
 	handler := NewSecretsHandler(func(string) {})
 
 	// 1. SetModel — must hit key='MODEL' in the INSERT.
+	// Runtime lookup (issue #2172) — model is non-empty so validation fires.
+	mock.ExpectQuery(`SELECT runtime FROM workspaces WHERE id = \$1`).
+		WithArgs("00000000-0000-0000-0000-000000000099").
+		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("codex"))
 	mock.ExpectExec(`INSERT INTO workspace_secrets[\s\S]*'MODEL'[\s\S]*ON CONFLICT`).
 		WithArgs("00000000-0000-0000-0000-000000000099", sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(1, 1))
