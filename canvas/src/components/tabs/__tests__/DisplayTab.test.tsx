@@ -2,12 +2,13 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
-const { mockGet, mockPost, mockRFBConstructor, mockRFBClipboardPasteFrom, mockRFBFocus } = vi.hoisted(() => ({
+const { mockGet, mockPost, mockRFBConstructor, mockRFBClipboardPasteFrom, mockRFBFocus, rfbInstances } = vi.hoisted(() => ({
   mockGet: vi.fn(),
   mockPost: vi.fn(),
   mockRFBConstructor: vi.fn(),
   mockRFBClipboardPasteFrom: vi.fn(),
   mockRFBFocus: vi.fn(),
+  rfbInstances: [] as EventTarget[],
 }));
 
 vi.mock("@/lib/api", () => ({
@@ -31,6 +32,7 @@ vi.mock("@novnc/novnc", () => ({
       this.url = url;
       this.options = options;
       mockRFBConstructor(target, url, options);
+      rfbInstances.push(this);
     }
     clipboardPasteFrom(text: string) {
       mockRFBClipboardPasteFrom(text);
@@ -52,6 +54,7 @@ describe("DisplayTab", () => {
     mockRFBConstructor.mockReset();
     mockRFBClipboardPasteFrom.mockReset();
     mockRFBFocus.mockReset();
+    rfbInstances.length = 0;
   });
 
   it("renders unavailable state for non-display workspaces", async () => {
@@ -399,6 +402,49 @@ describe("DisplayTab", () => {
       expect(screen.queryByText("Controlled by Admin")).toBeNull();
     });
     expect(screen.getByRole("button", { name: "Take control" })).toBeTruthy();
+  });
+
+  it("auto-reconnects the desktop stream after an unclean disconnect but not a clean one", async () => {
+    mockGet
+      .mockResolvedValueOnce({
+        available: true,
+        mode: "desktop-control",
+        protocol: "novnc",
+        width: 1920,
+        height: 1080,
+      })
+      .mockResolvedValueOnce({ controller: "none" });
+    mockPost.mockResolvedValue({
+      controller: "user",
+      controlled_by: "admin-token",
+      expires_at: "2026-05-23T08:48:27Z",
+      session_url: "/workspaces/ws-display/display/session/websockify#token=signed",
+    });
+
+    render(<DisplayTab workspaceId="ws-display" />);
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Take control" })).toBeTruthy();
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Take control" }));
+    await waitFor(() => {
+      expect(rfbInstances.length).toBe(1);
+    });
+
+    // An idle/network drop closes the websocket uncleanly. The client must
+    // reconnect (using the freshest signed URL) instead of giving up — this is
+    // the "disconnects every ~5 min and stays dead" report.
+    rfbInstances[0].dispatchEvent(new CustomEvent("disconnect", { detail: { clean: false } }));
+    await waitFor(
+      () => {
+        expect(rfbInstances.length).toBe(2);
+      },
+      { timeout: 3000 },
+    );
+
+    // A clean disconnect (the user released control) must NOT reconnect.
+    rfbInstances[1].dispatchEvent(new CustomEvent("disconnect", { detail: { clean: true } }));
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+    expect(rfbInstances.length).toBe(2);
   });
 });
 
