@@ -844,11 +844,24 @@ runtimes:
   # this runtimes entry declares the selectable model set.
   google-adk:
     providers:
-      # Keyless Vertex (org-compliant default): Gemini via Vertex AI + ADC/WIF.
-      - name: vertex
+      # Platform-managed (keyless, metered) Gemini via the Molecule LLM proxy ->
+      # Vertex AI (server-side WIF mint; NO credential on the tenant box — the
+      # keyless-Vertex leak fix). Resolves to the closed `platform` provider ->
+      # IsPlatform=true -> platform_managed billing + required_env=[] (derived).
+      # The org-compliant default. The runtime translates the `platform:` select
+      # id to the bare wire id the proxy routes to Vertex.
+      - name: platform
         models:
-          - vertex:gemini-2.5-pro
-      # API-key BYOK arm: AI Studio GEMINI_API_KEY/GOOGLE_API_KEY.
+          - platform:gemini-2.5-pro
+          - platform:gemini-2.5-flash
+      # API-key BYOK arm: AI Studio (the tenant's OWN GOOGLE_API_KEY).
       - name: google
         models:
           - gemini-2.5-pro
+          - gemini-2.5-flash
+      # DEPRECATED transitional: vertex: ids stay registered until templates
+      # move to platform: (superseded by the platform arm above). Remove in a
+      # cleanup once no template references vertex:gemini-*.
+      - name: vertex
+        models:
+          - vertex:gemini-2.5-pro
