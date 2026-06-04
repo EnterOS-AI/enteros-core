@@ -263,6 +263,19 @@ jobs:
       PROD_AUTO_DEPLOY_DRY_RUN: ${{ vars.PROD_AUTO_DEPLOY_DRY_RUN || '' }}
       PROD_ALLOW_NON_PROD_CP_URL: ${{ vars.PROD_ALLOW_NON_PROD_CP_URL || '' }}
     steps:
+      # The publish runner's default HOME (/home/hongming) is not writable, so
+      # git/docker credential saves fail (`Error saving credentials: mkdir
+      # /home/hongming: permission denied`) and halt the production rollout
+      # (#2193). Point HOME + DOCKER_CONFIG at the writable job temp dir —
+      # mirrors build-and-push's "Prepare writable Docker config" fix above.
+      - name: Prepare writable HOME + Docker config
+        run: |
+          set -euo pipefail
+          H="$RUNNER_TEMP/auto-deploy-home"
+          mkdir -p "$H/.docker"
+          echo "HOME=$H" >> "$GITHUB_ENV"
+          echo "DOCKER_CONFIG=$H/.docker" >> "$GITHUB_ENV"
+
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
