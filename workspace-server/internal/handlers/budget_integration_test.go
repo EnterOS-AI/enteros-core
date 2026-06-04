@@ -66,7 +66,12 @@ func integrationDB_Budget(t *testing.T) *sql.DB {
 	for _, stmt := range []string{
 		// Wipe ledger rows first (workspace_id is TEXT, no FK, but
 		// grouping the cleanup with workspaces makes intent clear).
-		`DELETE FROM workspace_spend_events WHERE workspace_id IN (SELECT id FROM workspaces WHERE name LIKE 'integ-bud-%')`,
+		// Cast `id::text` because workspace_spend_events.workspace_id
+		// is TEXT while workspaces.id is UUID — without the cast,
+		// Postgres rejects the IN comparison with `operator does not
+		// exist: text = uuid`. The other test files don't hit this
+		// because their join tables also store workspace_id as TEXT.
+		`DELETE FROM workspace_spend_events WHERE workspace_id IN (SELECT id::text FROM workspaces WHERE name LIKE 'integ-bud-%')`,
 		`DELETE FROM workspaces WHERE name LIKE 'integ-bud-%'`,
 	} {
 		if _, err := conn.ExecContext(context.Background(), stmt); err != nil {
@@ -76,7 +81,7 @@ func integrationDB_Budget(t *testing.T) *sql.DB {
 	prev := db.DB
 	db.DB = conn
 	t.Cleanup(func() {
-		conn.ExecContext(context.Background(), `DELETE FROM workspace_spend_events WHERE workspace_id IN (SELECT id FROM workspaces WHERE name LIKE 'integ-bud-%')`)
+		conn.ExecContext(context.Background(), `DELETE FROM workspace_spend_events WHERE workspace_id IN (SELECT id::text FROM workspaces WHERE name LIKE 'integ-bud-%')`)
 		conn.ExecContext(context.Background(), `DELETE FROM workspaces WHERE name LIKE 'integ-bud-%'`)
 		db.DB = prev
 		conn.Close()
