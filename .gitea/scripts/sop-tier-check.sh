@@ -114,6 +114,19 @@ if [ -z "$WHOAMI" ]; then
 fi
 echo "::notice::token resolves to user: $WHOAMI"
 
+# 0.5 Read PR head SHA so we can reject stale approvals after head moves
+# (internal#816). Reviews carry the commit_id they were submitted against.
+HEAD_SHA=$(curl -sS -H "$AUTH" "${API}/repos/${OWNER}/${NAME}/pulls/${PR_NUMBER}" | jq -r '.head.sha // ""') || true
+if [ -z "$HEAD_SHA" ]; then
+  echo "::error::Failed to fetch PR head SHA — token may be invalid."
+  if [ "${SOP_FAIL_OPEN:-}" = "1" ]; then
+    echo "::warning::SOP_FAIL_OPEN=1 — exiting 0 so CI does not block."
+    exit 0
+  fi
+  exit 1
+fi
+debug "pr-head-sha=$HEAD_SHA"
+
 # 1. Read tier label. || true ensures set -euo pipefail does not abort the
 # script if curl or jq fails (e.g. 401 from empty token).
 LABELS=$(curl -sS -H "$AUTH" "${API}/repos/${OWNER}/${NAME}/issues/${PR_NUMBER}/labels" | jq -r '.[].name') || true
@@ -265,7 +278,7 @@ if [ $_REVIEWS_EXIT -ne 0 ] || [ -z "$REVIEWS" ]; then
   fi
   exit 1
 fi
-APPROVERS=$(echo "$REVIEWS" | jq -r '[.[] | select(.state=="APPROVED") | .user.login] | unique | .[]') || true
+APPROVERS=$(echo "$REVIEWS" | jq -r --arg head_sha "$HEAD_SHA" '[.[] | select(.state=="APPROVED" and .commit_id == $head_sha) | .user.login] | unique | .[]') || true
 if [ -z "$APPROVERS" ]; then
   echo "::error::No approving reviews on this PR. Set SOP_DEBUG=1 and re-run for diagnostics."
   exit 1
