@@ -869,9 +869,3 @@ runtimes:
         models:
           - gemini-2.5-pro
           - gemini-2.5-flash
-      # DEPRECATED transitional: vertex: ids stay registered until templates
-      # move to platform: (superseded by the platform arm above). Remove in a
-      # cleanup once no template references vertex:gemini-*.
-      - name: vertex
-        models:
-          - vertex:gemini-2.5-pro
