@@ -403,7 +403,12 @@ function DesktopStream({
         });
         rfbRef.current = rfb;
         rfb.scaleViewport = true;
-        rfb.resizeSession = true;
+        // Do NOT request a server-side resize: the workspace display runs a
+        // fixed Xorg modeline and x11vnc rejects SetDesktopSize ("Resize is
+        // administratively prohibited"), which spams the console on every
+        // (re)connect. scaleViewport already fits the fixed framebuffer to the
+        // container client-side, so we don't need the server to resize.
+        rfb.resizeSession = false;
         rfb.focusOnClick = true;
         rfb.focus({ preventScroll: true });
         rfb.addEventListener("connect", () => {
