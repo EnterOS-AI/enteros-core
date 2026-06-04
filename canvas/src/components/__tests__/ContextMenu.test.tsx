@@ -385,7 +385,7 @@ describe("ContextMenu — item actions", () => {
     render(<ContextMenu />);
     fireEvent.click(screen.getByRole("menuitem", { name: /pause/i }));
     await act(async () => { /* flush */ });
-    expect(mockPost).toHaveBeenCalledWith("/workspaces/n1/pause", {});
+    expect(mockPost).toHaveBeenCalledWith("/workspaces/n1/pause?cascade=true", {});
     expect(mockStoreState.updateNodeData).toHaveBeenCalledWith("n1", { status: "paused" });
   });
 
@@ -395,7 +395,7 @@ describe("ContextMenu — item actions", () => {
     render(<ContextMenu />);
     fireEvent.click(screen.getByRole("menuitem", { name: /resume/i }));
     await act(async () => { /* flush */ });
-    expect(mockPost).toHaveBeenCalledWith("/workspaces/n1/resume", {});
+    expect(mockPost).toHaveBeenCalledWith("/workspaces/n1/resume?cascade=true", {});
   });
 });
 
