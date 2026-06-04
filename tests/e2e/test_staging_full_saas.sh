@@ -476,7 +476,19 @@ wait_workspaces_online_routable() {
 # All empty → '{}' (workspace will fail at first turn with an
 # expected, actionable auth error rather than masking the test).
 SECRETS_JSON='{}'
-if [ -n "${E2E_MINIMAX_API_KEY:-}" ]; then
+# Platform-managed path (E2E_LLM_PATH=platform) — the moonshot/kimi
+# NOT_CONFIGURED regression (RFC#340 Fix A #2187). Molecule owns billing via the
+# CP LLM proxy, so the workspace needs NO tenant key: provision with empty
+# secrets and let the workspace boot purely on (a) the proxy env the control
+# plane injects + (b) the manifest-derived `provider: platform` Fix A stamps into
+# the generated config.yaml. This is the path that booted NOT_CONFIGURED in prod
+# precisely because the BYOK branches below never exercise it. We deliberately
+# skip the key-injection branches so a stray E2E_*_API_KEY in the runner env
+# cannot silently convert this into a BYOK run and mask the regression.
+if [ "${E2E_LLM_PATH:-}" = "platform" ]; then
+  log "    LLM path: PLATFORM-MANAGED (no tenant key; proxy + Fix A provider stamp)"
+  SECRETS_JSON='{}'
+elif [ -n "${E2E_MINIMAX_API_KEY:-}" ]; then
   SECRETS_JSON=$(python3 -c "
 import json, os
 k = os.environ['E2E_MINIMAX_API_KEY']

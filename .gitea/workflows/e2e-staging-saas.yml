@@ -48,8 +48,10 @@ on:
       - 'workspace-server/internal/handlers/a2a_proxy.go'
       - 'workspace-server/internal/middleware/**'
       - 'workspace-server/internal/provisioner/**'
+      - 'workspace-server/internal/providers/providers.yaml'
       - 'tests/e2e/test_staging_full_saas.sh'
       - 'tests/e2e/lib/completion_assert.sh'
+      - 'tests/e2e/lib/model_slug.sh'
       - 'tests/e2e/lib/aws_leak_check.sh'
       - 'tests/e2e/test_aws_leak_check.sh'
       - '.gitea/workflows/e2e-staging-saas.yml'
@@ -61,8 +63,10 @@ on:
       - 'workspace-server/internal/handlers/a2a_proxy.go'
       - 'workspace-server/internal/middleware/**'
       - 'workspace-server/internal/provisioner/**'
+      - 'workspace-server/internal/providers/providers.yaml'
       - 'tests/e2e/test_staging_full_saas.sh'
       - 'tests/e2e/lib/completion_assert.sh'
+      - 'tests/e2e/lib/model_slug.sh'
       - 'tests/e2e/lib/aws_leak_check.sh'
       - 'tests/e2e/test_aws_leak_check.sh'
       - '.gitea/workflows/e2e-staging-saas.yml'
@@ -313,5 +317,150 @@ jobs:
           done
           if [ ${#leaks[@]} -gt 0 ]; then
             echo "::warning::saas teardown left ${#leaks[@]} leak(s): ${leaks[*]}"
+          fi
+          exit 0
+
+  # ── PLATFORM-MANAGED BOOT REGRESSION (moonshot/kimi NOT_CONFIGURED) ──────────
+  #
+  # The REAL-boot complement to the deterministic unit suite
+  # (workspace_provision_platform_boot_test.go). Provisions a REAL staging
+  # claude-code workspace on the PLATFORM-managed path — provider=platform,
+  # model=moonshot/kimi-k2.6, NO tenant LLM key — and asserts it reaches
+  # status=online (NOT not_configured) and a completion returns 200, via the same
+  # online-wait + completion-assert the BYOK job uses.
+  #
+  # Why a SEPARATE job (not a matrix leg of e2e-staging-saas): the platform path
+  # injects NO secret and pins a different model, so its env block diverges from
+  # the BYOK job's. A dedicated job keeps each path's "verify key present" preflight
+  # honest (BYOK requires a key; platform requires its ABSENCE not to matter) and
+  # gives the regression its own named commit-status for branch protection.
+  #
+  # Add `E2E Staging Platform Boot` to branch protection after 3 consecutive
+  # green runs on main (de-flake window; this path shares the cp#245
+  # boot-timeout flake surface the BYOK job has, so it must prove stable before
+  # it can BLOCK — see the gate-making plan in the PR body).
+  # bp-required: pending #2187
+  e2e-staging-platform-boot:
+    name: E2E Staging Platform Boot
+    runs-on: ubuntu-latest
+    # Phase 3 (RFC #219 §1): surface without blocking until the de-flake window
+    # closes. mc#1982: do NOT renew this mask silently — the gate-making plan
+    # tracks the flip to false under #2187.
+    continue-on-error: true
+    timeout-minutes: 45
+    permissions:
+      contents: read
+
+    env:
+      MOLECULE_CP_URL: https://staging-api.moleculesai.app
+      MOLECULE_ADMIN_TOKEN: ${{ secrets.CP_STAGING_ADMIN_API_TOKEN }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: us-east-2
+      E2E_AWS_LEAK_CHECK: required
+      E2E_AWS_TERMINATE_LEAKS: '1'
+      # The regression combo: claude-code + platform-managed + moonshot/kimi-k2.6.
+      # NO E2E_*_API_KEY is set — platform-managed billing is owned by Molecule via
+      # the CP LLM proxy. The harness's E2E_LLM_PATH=platform branch sends empty
+      # secrets and pin-selects the platform model.
+      E2E_RUNTIME: claude-code
+      E2E_LLM_PATH: platform
+      # Smoke mode: a single parent workspace is enough to prove online +
+      # completion for the platform path (the A2A/delegation matrix is the BYOK
+      # job's job). Override E2E_DEFAULT_PLATFORM_MODEL via workflow_dispatch to
+      # exercise another platform model id.
+      E2E_MODE: smoke
+      E2E_RUN_ID: "platform-${{ github.run_id }}-${{ github.run_attempt }}"
+      E2E_KEEP_ORG: ${{ github.event.inputs.keep_org && '1' || '0' }}
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Verify admin token present
+        run: |
+          if [ -z "$MOLECULE_ADMIN_TOKEN" ]; then
+            echo "::error::CP_STAGING_ADMIN_API_TOKEN secret not set (Railway staging CP_ADMIN_API_TOKEN)"
+            exit 2
+          fi
+          for var in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; do
+            if [ -z "${!var:-}" ]; then
+              echo "::error::$var not set — EC2 leak verification cannot run"
+              exit 2
+            fi
+          done
+          echo "Admin token present ✓"
+
+      - name: Assert NO BYOK key leaks into the platform run
+        run: |
+          # The whole point of this job is the platform-managed path. A stray
+          # E2E_*_API_KEY in the runner env would (via the harness) still be
+          # skipped by the E2E_LLM_PATH=platform branch — but assert their
+          # absence loudly here so a future env edit can't silently convert this
+          # into a masked BYOK run that no longer exercises the regression.
+          for var in E2E_MINIMAX_API_KEY E2E_ANTHROPIC_API_KEY E2E_OPENAI_API_KEY; do
+            if [ -n "${!var:-}" ]; then
+              echo "::warning::$var is set in this platform-boot job's env — the harness ignores it on E2E_LLM_PATH=platform, but it should not be wired here."
+            fi
+          done
+          echo "Platform-managed path: no tenant LLM key required ✓"
+
+      - name: CP staging health preflight
+        run: |
+          code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 10 "$MOLECULE_CP_URL/health")
+          if [ "$code" != "200" ]; then
+            echo "::error::Staging CP unhealthy (got HTTP $code). Skipping — not a workspace bug."
+            exit 1
+          fi
+          echo "Staging CP healthy ✓"
+
+      - name: Run platform-managed boot E2E (online + completion)
+        id: e2e
+        run: bash tests/e2e/test_staging_full_saas.sh
+
+      - name: Teardown safety net (runs on cancel/failure)
+        if: always()
+        env:
+          ADMIN_TOKEN: ${{ secrets.CP_STAGING_ADMIN_API_TOKEN }}
+        run: |
+          set +e
+          orgs=$(curl -sS "$MOLECULE_CP_URL/cp/admin/orgs" \
+            -H "Authorization: Bearer $ADMIN_TOKEN" 2>/dev/null \
+            | python3 -c "
+          import json, sys, os, datetime
+          run_id = os.environ.get('GITHUB_RUN_ID', '')
+          d = json.load(sys.stdin)
+          today = datetime.date.today()
+          yesterday = today - datetime.timedelta(days=1)
+          dates = (today.strftime('%Y%m%d'), yesterday.strftime('%Y%m%d'))
+          # smoke mode slugs are e2e-smoke-YYYYMMDD-platform-<run_id>-...
+          if run_id:
+              prefixes = tuple(f'e2e-smoke-{d}-platform-{run_id}-' for d in dates)
+          else:
+              prefixes = tuple(f'e2e-smoke-{d}-platform-' for d in dates)
+          candidates = [o['slug'] for o in d.get('orgs', [])
+                        if any(o.get('slug','').startswith(p) for p in prefixes)
+                        and o.get('instance_status') not in ('purged',)]
+          print('\n'.join(candidates))
+          " 2>/dev/null)
+          leaks=()
+          for slug in $orgs; do
+            echo "Safety-net teardown: $slug"
+            set +e
+            curl -sS -o /tmp/plat-cleanup.out -w "%{http_code}" \
+              -X DELETE "$MOLECULE_CP_URL/cp/admin/tenants/$slug" \
+              -H "Authorization: Bearer $ADMIN_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "{\"confirm\":\"$slug\"}" >/tmp/plat-cleanup.code
+            set -e
+            code=$(cat /tmp/plat-cleanup.code 2>/dev/null || echo "000")
+            if [ "$code" = "200" ] || [ "$code" = "204" ]; then
+              echo "[teardown] deleted $slug (HTTP $code)"
+            else
+              echo "::warning::platform-boot teardown for $slug returned HTTP $code — sweep-stale-e2e-orgs will catch it within ~45 min. Body: $(head -c 300 /tmp/plat-cleanup.out 2>/dev/null)"
+              leaks+=("$slug")
+            fi
+          done
+          if [ ${#leaks[@]} -gt 0 ]; then
+            echo "::warning::platform-boot teardown left ${#leaks[@]} leak(s): ${leaks[*]}"
           fi
           exit 0
