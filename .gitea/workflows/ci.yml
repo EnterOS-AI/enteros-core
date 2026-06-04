@@ -399,10 +399,9 @@ jobs:
     # a manual action that determinism made obsolete.
     name: Canvas Deploy Status
     runs-on: docker-host
-    # Job-level `if:` so ci-required-drift.py's ci_job_names() detects this as
-    # github.ref-gated and skips it from the required-context F1 set (mc#1982).
+    # Per-step no-op (not job-level `if:`) so the job reaches SUCCESS on PRs
+    # instead of skipped — skipped poisons the PR combined status (internal#817).
     # Step-level exit 0 handles the "not a canvas main push" case.
-    if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/staging' }}
     needs: [changes, canvas-build]
     steps:
       - name: Record canvas ordered-deploy status
@@ -514,9 +513,8 @@ jobs:
     # The `needs:` list MUST stay in lockstep with ci-required-drift.py's
     # F1 check (`ci_job_names()` = every job MINUS the sentinel MINUS jobs
     # whose `if:` gates on github.event_name/github.ref). canvas-deploy-
-    # reminder is event-gated (`if: github.ref == refs/heads/{main,staging}`)
-    # so it is intentionally EXCLUDED — it skips on PRs and a `needs:` on a
-    # skipped job would never let the sentinel run. If a new always-running
+    # status is per-step-gated (not job-level `if:`) so it reaches SUCCESS
+    # on PRs and is included here — internal#817. If a new always-running
     # CI job is added, add it here too or ci-required-drift F1 will flag it.
     #
     # Stays on the dedicated `ci-meta` lane (no docker work, so the
@@ -530,6 +528,7 @@ jobs:
       - canvas-build
       - shellcheck
       - python-lint
+      - canvas-deploy-status
     continue-on-error: false
     runs-on: ci-meta
     timeout-minutes: 5
@@ -548,6 +547,7 @@ jobs:
           CANVAS_RESULT: ${{ needs.canvas-build.result }}
           SHELLCHECK_RESULT: ${{ needs.shellcheck.result }}
           PYTHON_LINT_RESULT: ${{ needs.python-lint.result }}
+          CANVAS_DEPLOY_RESULT: ${{ needs.canvas-deploy-status.result }}
         run: |
           set -euo pipefail
           fail=0
@@ -569,6 +569,7 @@ jobs:
           check "Canvas (Next.js)"      "$CANVAS_RESULT"
           check "Shellcheck (E2E scripts)" "$SHELLCHECK_RESULT"
           check "Python Lint & Test"    "$PYTHON_LINT_RESULT"
+          check "Canvas Deploy Status"  "$CANVAS_DEPLOY_RESULT"
           if [ "$fail" -ne 0 ]; then
             echo "::error::all-required: one or more aggregated CI jobs did not succeed"
             exit 1
