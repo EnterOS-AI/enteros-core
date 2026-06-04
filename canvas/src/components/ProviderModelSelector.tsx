@@ -55,21 +55,6 @@ export interface ProviderEntry {
   billingMode?: "platform_managed" | "byok";
 }
 
-/** A provider is "platform-managed" when the Molecule platform proxies the LLM
- *  call and injects its own usage credential — the tenant admin_token, surfaced
- *  to the workspace as MOLECULE_LLM_USAGE_TOKEN by the CP provisioner
- *  (controlplane ec2.go: `MOLECULE_LLM_USAGE_TOKEN="$ADMIN_TOKEN"`). The user
- *  supplies NO key for these: the credential is internal plumbing, not a user
- *  input. Detected by vendor==="platform" (the platform proxy provider, which
- *  declares MOLECULE_LLM_USAGE_TOKEN in its AuthEnv) OR
- *  billingMode==="platform_managed" (registry-backed, internal#718 P3). BYOK
- *  providers return false and DO require a user-supplied credential. */
-export function isPlatformManagedProvider(
-  p?: Pick<ProviderEntry, "vendor" | "billingMode"> | null,
-): boolean {
-  return p?.vendor === "platform" || p?.billingMode === "platform_managed";
-}
-
 /** RegistryProvider mirrors one entry of GET /templates `registry_providers`
  *  (workspace-server registryProviderView): the registry's native provider for
  *  a runtime, with its display label, auth-env NAMES, and billing mode. This is

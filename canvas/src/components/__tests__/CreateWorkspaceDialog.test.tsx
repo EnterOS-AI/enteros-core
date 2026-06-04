@@ -527,6 +527,25 @@ const REGISTRY_TEMPLATE = {
   ],
 };
 
+// Registry-backed platform provider WITH a non-empty auth_env — this matches
+// the PRODUCTION provider view, which ships the raw AuthEnv
+// ([MOLECULE_LLM_USAGE_TOKEN]). REGISTRY_TEMPLATE above uses auth_env:[] so it
+// never exercises suppression; this one drives the billingMode==="platform_
+// managed" branch end-to-end through buildProviderCatalogFromRegistry. (#2245)
+const REGISTRY_TEMPLATE_PLATFORM_AUTHENV = {
+  ...REGISTRY_TEMPLATE,
+  registry_providers: [
+    {
+      name: "platform",
+      display_name: "Platform",
+      auth_env: ["MOLECULE_LLM_USAGE_TOKEN"],
+      billing_mode: "platform_managed",
+    },
+    { name: "minimax", display_name: "MiniMax", auth_env: ["MINIMAX_API_KEY"], billing_mode: "byok" },
+    { name: "anthropic", display_name: "Anthropic API", auth_env: ["ANTHROPIC_API_KEY"], billing_mode: "byok" },
+  ],
+};
+
 describe("CreateWorkspaceDialog — registry-backed provider catalog (RFC#340 Fix C)", () => {
   beforeEach(() => {
     mockGet.mockImplementation(async (url: string) => {
@@ -602,6 +621,41 @@ describe("CreateWorkspaceDialog — registry-backed provider catalog (RFC#340 Fi
     expect(body.model).toBe("MiniMax-M2.7");
     expect(body.llm_provider).toBe("minimax");
     expect(body.secrets).toEqual({ MINIMAX_API_KEY: "sk-minimax-test" });
+  });
+
+  it("suppresses the credential for a registry-backed platform provider that declares an auth_env — billingMode path (#2245)", async () => {
+    // Override the default REGISTRY_TEMPLATE (auth_env:[]) with the production-
+    // shaped one whose platform provider declares MOLECULE_LLM_USAGE_TOKEN.
+    mockGet.mockImplementation(async (url: string) => {
+      if (url === "/templates") {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        return [REGISTRY_TEMPLATE_PLATFORM_AUTHENV] as any;
+      }
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      return SAMPLE_WORKSPACES as any;
+    });
+    await openDialog();
+    fireEvent.change(screen.getByPlaceholderText("e.g. SEO Agent"), {
+      target: { value: "Registry Platform Agent" },
+    });
+    // Platform is the default bucket; even with a non-empty auth_env the key
+    // field must NOT render (suppressed via billingMode==="platform_managed").
+    await waitFor(() => {
+      const sel = document.querySelector("[data-testid='provider-select']") as HTMLSelectElement;
+      expect(sel?.value).toBe("registry|platform");
+    });
+    expect(screen.getByText("Platform-managed — no API key required.")).toBeTruthy();
+    expect(document.getElementById("llm-secret-input")).toBeNull();
+
+    const createBtn = screen.getAllByRole("button").find((b) => b.textContent === "Create");
+    fireEvent.click(createBtn!);
+
+    await waitFor(() => expect(mockPost).toHaveBeenCalled());
+    expect(screen.queryByText("Provider credential is required")).toBeNull();
+    const body = mockPost.mock.calls[0][1] as Record<string, unknown>;
+    expect(body.llm_provider).toBe("platform");
+    // The provisioner-injected MOLECULE_LLM_USAGE_TOKEN must NOT be clobbered.
+    expect(body.secrets).toBeUndefined();
   });
 });
 
