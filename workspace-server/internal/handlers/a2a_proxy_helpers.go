@@ -383,23 +383,48 @@ func (h *WorkspaceHandler) logA2ASuccess(ctx context.Context, workspaceID, calle
 	}
 	summary := a2aMethod + " → " + wsNameForLog
 	toolTrace := extractToolTrace(respBody)
-	parent := ctx
-	h.goAsync(func() {
-		logCtx, cancel := context.WithTimeout(context.WithoutCancel(parent), 30*time.Second)
-		defer cancel()
-		LogActivity(logCtx, h.broadcaster, ActivityParams{
-			WorkspaceID:  workspaceID,
-			ActivityType: "a2a_receive",
-			SourceID:     nilIfEmpty(callerID),
-			TargetID:     &workspaceID,
-			Method:       &a2aMethod,
-			Summary:      &summary,
-			RequestBody:  json.RawMessage(body),
-			ResponseBody: json.RawMessage(respBody),
-			ToolTrace:    toolTrace,
-			DurationMs:   &durationMs,
-			Status:       logStatus,
-		})
+
+	// DATA-LOSS FIX (internal#470 / #1347 push-mode sibling): this
+	// a2a_receive row is the ONLY durable record of a push-mode chat
+	// round-trip — request_body carries the user's message, response_body
+	// carries the agent's reply, and chat-history hydration
+	// (messagestore.PostgresMessageStore) reads BOTH back to rebuild the
+	// transcript on canvas reopen / reload. It MUST be written
+	// SYNCHRONOUSLY, before proxyA2ARequest returns and ProxyA2A flushes
+	// the 200 to the canvas — otherwise the canvas sees the reply
+	// acknowledged (and rendered optimistically) while the row is still
+	// racing in a detached goroutine, and a reload (or a workspace-server
+	// restart / deploy / OOM) between the 200 and the goroutine's commit
+	// loses the message permanently on reopen.
+	//
+	// This mirrors the discipline already applied to the poll-mode ingest
+	// path (logA2AReceiveQueued / persistUserMessageAtIngest); the
+	// push-mode counterpart was left async, which the E2E Chat
+	// "history persists across reload" test surfaced as an intermittent
+	// red (the reload out-raced the INSERT).
+	//
+	//   - context.WithoutCancel: a client disconnect on chat-exit (which
+	//     cancels the inbound request ctx) MUST NOT abort this write.
+	//   - SYNCHRONOUS (no goAsync): the row must be durable before the 200.
+	//   - Best-effort: LogActivity logs+swallows INSERT errors internally,
+	//     so a DB hiccup never blocks or fails the user's send — behaviour
+	//     for that one request is never worse than the pre-fix async path.
+	//   - The post-commit ACTIVITY_LOGGED broadcast still fires inside
+	//     LogActivity; the durable row is the truth the canvas re-reads.
+	logCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	LogActivity(logCtx, h.broadcaster, ActivityParams{
+		WorkspaceID:  workspaceID,
+		ActivityType: "a2a_receive",
+		SourceID:     nilIfEmpty(callerID),
+		TargetID:     &workspaceID,
+		Method:       &a2aMethod,
+		Summary:      &summary,
+		RequestBody:  json.RawMessage(body),
+		ResponseBody: json.RawMessage(respBody),
+		ToolTrace:    toolTrace,
+		DurationMs:   &durationMs,
+		Status:       logStatus,
 	})
 
 	if callerID == "" && statusCode < 400 {
