@@ -870,6 +870,24 @@ fi
 if echo "$AGENT_TEXT" | grep -qiE "exceeded your current quota|insufficient_quota"; then
   fail "A2A — PROVIDER QUOTA EXHAUSTED (NOT a platform regression). Operator action: top up MOLECULE_STAGING_OPENAI_API_KEY billing or rotate to a higher-quota org at Settings → Secrets and Variables → Actions. Tracked in #2578. Raw: $AGENT_TEXT"
 fi
+# Empty-completion class — the agent runtime reached the LLM and got a
+# 2xx back, but the assistant turn carried NO text part (empty content,
+# or tool_calls/reasoning-only with no surfaced text), so the runtime
+# returns the literal "Error: message contained no text content." as its
+# reply text. Steps 0-7 passing means the platform is healthy (CP up,
+# tenant provisioned, workspace online + routable, A2A delivery e2e); the
+# break is the configured completion BACKEND returning an empty turn — a
+# model/provider-side regression, NOT a workspace-server or harness bug,
+# and NOT NOT_CONFIGURED (that fails earlier, at boot). Name it explicitly
+# so the canary alert points at the model, not the platform: a generic
+# "error-shaped response" misdirects triage to workspace-server. Observed
+# 2026-06-03/04 across every staging canary on MODEL_SLUG=MiniMax-M2 (the
+# canary default since #2710) — 100% on the parent's first cold turn,
+# identical on main's scheduled synthetic E2E and on PRs (so it is an
+# environmental backend regression, never PR-introduced).
+if echo "$AGENT_TEXT" | grep -qiF "message contained no text content"; then
+  fail "A2A — EMPTY COMPLETION (backend regression, NOT a platform/workspace-server bug). The configured model (MODEL_SLUG=${MODEL_SLUG:-?}) returned a 2xx completion with no text part; the runtime surfaced 'message contained no text content.'. Operator action: check the staging LLM backend / proxy for the canary model (MiniMax-M2 since #2710) — empty assistant turns, not an auth/quota/boot fault. Raw: $AGENT_TEXT"
+fi
 # Generic catch-all — falls through if none of the known regressions hit.
 if echo "$AGENT_TEXT" | grep -qiE "error|exception"; then
   fail "A2A returned an error-shaped response: $AGENT_TEXT"
