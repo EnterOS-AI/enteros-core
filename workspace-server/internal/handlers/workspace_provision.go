@@ -613,6 +613,32 @@ func (h *WorkspaceHandler) ensureDefaultConfig(workspaceID string, payload model
 	if model == "" {
 		log.Printf("ensureDefaultConfig: workspace %s reached provisioning with empty model — Create handler should have rejected this; rendering empty model: \"\" in config.yaml (workspace will boot not_configured)", workspaceID)
 	}
+
+	// Derive the provider from the providers manifest and stamp it into the
+	// generated config BEFORE claude-code model normalization strips the
+	// slash-prefix. DeriveProvider needs the FULL, un-normalized model id
+	// (e.g. "moonshot/kimi-k2.6") for the exact-id match that resolves the
+	// canvas claude-code case to provider=platform — normalizing to
+	// "kimi-k2.6" first would lose that match.
+	//
+	// Why this exists (RFC#340 Fix A): a canvas-created claude-code workspace
+	// with model "moonshot/kimi-k2.6" booted NOT_CONFIGURED — the adapter
+	// derived provider="moonshot" (slash-split of the model id) which is not
+	// in the providers registry. CP bakes `provider: platform` via heredoc,
+	// but the cp#329 config-bundle fetch overwrites /configs/config.yaml with
+	// THIS (previously providerless) bundle version, so molecule-runtime
+	// config.py re-derived the wrong provider. Stamping the manifest-derived
+	// provider here (mirroring CP's buildModelProviderYAML shape) makes the
+	// config the adapter reads carry the canonical provider.
+	//
+	// Reuses the SAME manifest path the config-SAVE validators use
+	// (providerRegistry() + Manifest.DeriveProvider; see
+	// model_registry_validation.go). On a derive MISS (unknown/unregistered
+	// model, or registry unavailable) provider is left empty and the field is
+	// omitted below — preserving today's behavior; never fail provisioning on
+	// a derive miss.
+	derivedProvider := deriveDefaultConfigProvider(runtime, model)
+
 	if runtime == "claude-code" {
 		model = normalizeClaudeCodeModel(model)
 	}
@@ -640,6 +666,14 @@ func (h *WorkspaceHandler) ensureDefaultConfig(workspaceID string, payload model
 	// Model always at top level — config.py reads raw["model"] for all runtimes.
 	configYAML += fmt.Sprintf("model: %s\n", quoteModel)
 
+	// Stamp the manifest-derived provider at top level (mirroring CP's
+	// buildModelProviderYAML). Omitted entirely on a derive miss so the prior
+	// behavior — no `provider:` key, runtime re-derives — is preserved for
+	// unregistered models (requirement #3).
+	if derivedProvider != "" {
+		configYAML += fmt.Sprintf("provider: '%s'\n", yamlEscapeSingleQuotedProvider(derivedProvider))
+	}
+
 	// Add runtime_config. required_env is intentionally omitted — the
 	// platform injects secrets at container-start time via the secrets API,
 	// and preflight already validates that the env vars are present before
@@ -649,12 +683,58 @@ func (h *WorkspaceHandler) ensureDefaultConfig(workspaceID string, payload model
 	if runtime == "claude-code" {
 		configYAML += fmt.Sprintf("  model: %s\n", quoteModel)
 	}
+	// Mirror the top-level provider under runtime_config (CP writes both).
+	if derivedProvider != "" {
+		configYAML += fmt.Sprintf("  provider: '%s'\n", yamlEscapeSingleQuotedProvider(derivedProvider))
+	}
 	configYAML += "  timeout: 0\n"
 
 	files["config.yaml"] = []byte(configYAML)
 
 	log.Printf("Provisioner: generated %d config files for workspace %s (runtime: %s)", len(files), workspaceID, runtime)
 	return files
+}
+
+// deriveDefaultConfigProvider resolves the provider name the adapter should
+// see for (runtime, model) using the SAME providers manifest the config-SAVE
+// validators use (providerRegistry() + Manifest.DeriveProvider; see
+// model_registry_validation.go). It is intentionally fail-OPEN: any miss
+// (empty model, registry unavailable, unknown runtime, or a model the runtime
+// does not own) returns "" so the caller omits the `provider:` field and the
+// generated config keeps its pre-fix shape. It NEVER fails provisioning.
+//
+// `model` must be the FULL, un-normalized id (e.g. "moonshot/kimi-k2.6") so
+// DeriveProvider's exact-id match resolves the canvas claude-code case to
+// provider=platform. The availableAuthEnv arg is nil here — config-generation
+// has no per-workspace auth context yet (secrets are injected at container
+// start), matching the validators' nil call.
+func deriveDefaultConfigProvider(runtime, model string) string {
+	if strings.TrimSpace(model) == "" {
+		return ""
+	}
+	m, err := providerRegistry()
+	if err != nil || m == nil {
+		// Registry unavailable (a build-time defect the gen/sync gates catch).
+		// Fail open — do not stamp a provider, do not block provisioning.
+		return ""
+	}
+	p, err := m.DeriveProvider(runtime, model, nil)
+	if err != nil {
+		// Unknown runtime (federation / non-first-party) or a model the
+		// runtime does not own. Either way, omit the provider and let the
+		// runtime fall back to its prior derivation — preserving today's
+		// behavior for unregistered models.
+		return ""
+	}
+	return p.Name
+}
+
+// yamlEscapeSingleQuotedProvider escapes a value for a YAML single-quoted
+// scalar, mirroring CP's buildModelProviderYAML (a literal single quote is
+// doubled). Provider names are registry-controlled identifiers, so this is a
+// defense-in-depth measure rather than a hot path.
+func yamlEscapeSingleQuotedProvider(v string) string {
+	return strings.ReplaceAll(v, "'", "''")
 }
 
 func normalizeClaudeCodeModel(model string) string {

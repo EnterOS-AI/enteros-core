@@ -363,6 +363,74 @@ runtime_config:
 	}
 }
 
+// TestEnsureDefaultConfig_StampsDerivedProvider pins RFC#340 Fix A: a
+// canvas-created claude-code workspace with model "moonshot/kimi-k2.6" must
+// have the manifest-derived provider stamped into config.yaml at BOTH the top
+// level and under runtime_config, so the cp#329 config-bundle the adapter
+// reads no longer leaves the runtime to slash-split "moonshot/..." → an
+// unregistered provider="moonshot" (the original NOT_CONFIGURED boot). The
+// canonical manifest exact-id-matches "moonshot/kimi-k2.6" to provider=platform.
+func TestEnsureDefaultConfig_StampsDerivedProvider(t *testing.T) {
+	broadcaster := newTestBroadcaster()
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+
+	files := handler.ensureDefaultConfig("ws-moonshot", models.CreateWorkspacePayload{
+		Name:    "Kimi Agent",
+		Tier:    2,
+		Runtime: "claude-code",
+		Model:   "moonshot/kimi-k2.6",
+	})
+
+	var parsed struct {
+		Model         string `yaml:"model"`
+		Provider      string `yaml:"provider"`
+		RuntimeConfig struct {
+			Model    string `yaml:"model"`
+			Provider string `yaml:"provider"`
+		} `yaml:"runtime_config"`
+	}
+	if err := yaml.Unmarshal(files["config.yaml"], &parsed); err != nil {
+		t.Fatalf("generated YAML invalid: %v\n%s", err, files["config.yaml"])
+	}
+	if parsed.Provider != "platform" {
+		t.Errorf("top-level provider = %q, want platform\n%s", parsed.Provider, files["config.yaml"])
+	}
+	if parsed.RuntimeConfig.Provider != "platform" {
+		t.Errorf("runtime_config.provider = %q, want platform\n%s", parsed.RuntimeConfig.Provider, files["config.yaml"])
+	}
+	// The claude-code model normalization still strips the slash prefix.
+	if parsed.Model != "kimi-k2.6" {
+		t.Errorf("top-level model = %q, want kimi-k2.6\n%s", parsed.Model, files["config.yaml"])
+	}
+}
+
+// TestEnsureDefaultConfig_DeriveMissOmitsProvider pins requirement #3: a model
+// the providers manifest does NOT recognize for the runtime (a derive miss)
+// must NOT write any `provider:` key — neither top-level nor under
+// runtime_config — preserving the pre-fix behavior (no empty `provider:`,
+// provisioning never fails on a miss). "gpt-4o" is not a registered
+// claude-code model, so DeriveProvider errors and the field is omitted.
+func TestEnsureDefaultConfig_DeriveMissOmitsProvider(t *testing.T) {
+	broadcaster := newTestBroadcaster()
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+
+	files := handler.ensureDefaultConfig("ws-derivemiss", models.CreateWorkspacePayload{
+		Name:    "Unregistered Agent",
+		Tier:    1,
+		Runtime: "claude-code",
+		Model:   "gpt-4o",
+	})
+
+	content := string(files["config.yaml"])
+	if strings.Contains(content, "provider:") {
+		t.Errorf("derive miss must NOT write any provider: key, got:\n%s", content)
+	}
+	// Sanity: a derive miss must still produce a valid, model-bearing config.
+	if !strings.Contains(content, `model: "gpt-4o"`) {
+		t.Errorf("derive miss should still render the model, got:\n%s", content)
+	}
+}
+
 func TestEnsureDefaultConfig_CustomModel(t *testing.T) {
 	broadcaster := newTestBroadcaster()
 	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
