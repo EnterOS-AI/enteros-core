@@ -722,7 +722,10 @@ func buildSessionSearchQuery(workspaceID, query string, limit int) (string, []in
 		args = append(args, "%"+query+"%")
 	}
 
-	sqlQuery += ` ORDER BY created_at DESC LIMIT $` + strconv.Itoa(len(args)+1)
+	// Deterministic order: created_at alone is not unique (same-microsecond
+	// rows), so tie-break on the monotonic seq — same fix as the since_id feed
+	// (§ No flakes: no unstable sorts, even on an unused surface).
+	sqlQuery += ` ORDER BY created_at DESC, seq DESC LIMIT $` + strconv.Itoa(len(args)+1)
 	args = append(args, limit)
 	return sqlQuery, args
 }
