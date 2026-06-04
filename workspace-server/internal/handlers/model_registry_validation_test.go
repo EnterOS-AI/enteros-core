@@ -79,6 +79,49 @@ func TestValidateRegisteredModelForRuntime(t *testing.T) {
 			model:   "",
 			wantOK:  true,
 		},
+		// ---- cp#529 routability-aware allow path -------------------------------
+		{
+			// BYOK passthrough id: NOT on hermes's platform menu, but the
+			// openrouter name-only native arm prefix-owns it → DeriveProvider
+			// resolves → ALLOWED (no platform billing — openrouter is BYOK).
+			name:    "byok_passthrough_routable_now_allowed",
+			runtime: "hermes",
+			model:   "openrouter/anthropic/claude-3.5-sonnet",
+			wantOK:  true,
+		},
+		{
+			// BYOK namespaced vendor id: deepseek's widened ^deepseek[-:/]
+			// matches the vendor/ form on a name-only hermes arm → allowed.
+			name:    "byok_namespaced_vendor_routable_now_allowed",
+			runtime: "hermes",
+			model:   "deepseek/deepseek-chat",
+			wantOK:  true,
+		},
+		{
+			// claude-code bare GLM- BYOK id: zai name-only arm + (?i)^(glm-|…)
+			// matches → DeriveProvider resolves → allowed.
+			name:    "claude_code_bare_glm_byok_routable_now_allowed",
+			runtime: "claude-code",
+			model:   "GLM-4.6",
+			wantOK:  true,
+		},
+		{
+			// Genuinely UNROUTABLE id: no native hermes arm prefix-owns bare
+			// gpt-4o (the platform-shared openai vendor is NOT wired into hermes
+			// — billing guardrail), so DeriveProvider errors → still 422.
+			name:    "genuinely_unroutable_still_rejected",
+			runtime: "hermes",
+			model:   "gpt-4o",
+			wantOK:  false,
+		},
+		{
+			// A platform-shared namespaced id that MUST remain unroutable on
+			// hermes (billing guardrail: openai vendor not wired) → still 422.
+			name:    "platform_shared_openai_namespaced_still_rejected",
+			runtime: "hermes",
+			model:   "openai/gpt-4o",
+			wantOK:  false,
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -109,58 +152,58 @@ func TestValidateDerivedProviderInRegistry(t *testing.T) {
 		// provider that IS in the providers list. These are the live corpus
 		// entries; the test pins the registry-consistency invariant.
 		{
-			name:   "claude_code_anthropic_api_native",
+			name:    "claude_code_anthropic_api_native",
 			runtime: "claude-code",
 			model:   "claude-sonnet-4-6",
-			wantOK: true,
+			wantOK:  true,
 		},
 		{
-			name:   "claude_code_kimi_coding_native",
+			name:    "claude_code_kimi_coding_native",
 			runtime: "claude-code",
 			model:   "kimi-for-coding",
-			wantOK: true,
+			wantOK:  true,
 		},
 		{
-			name:   "claude_code_minimax_native",
+			name:    "claude_code_minimax_native",
 			runtime: "claude-code",
 			model:   "MiniMax-M2.7",
-			wantOK: true,
+			wantOK:  true,
 		},
 		{
-			name:   "claude_code_platform_namespaced",
+			name:    "claude_code_platform_namespaced",
 			runtime: "claude-code",
 			model:   "moonshot/kimi-k2.6",
-			wantOK: true,
+			wantOK:  true,
 		},
 		{
-			name:   "codex_openai_subscription_default_arm",
+			name:    "codex_openai_subscription_default_arm",
 			runtime: "codex",
 			model:   "gpt-5.5",
-			wantOK: true,
+			wantOK:  true,
 		},
 		{
-			name:   "codex_platform_namespaced",
+			name:    "codex_platform_namespaced",
 			runtime: "codex",
 			model:   "openai/gpt-5.4-mini",
-			wantOK: true,
+			wantOK:  true,
 		},
 		{
-			name:   "hermes_kimi_coding",
+			name:    "hermes_kimi_coding",
 			runtime: "hermes",
 			model:   "kimi-coding/kimi-k2",
-			wantOK: true,
+			wantOK:  true,
 		},
 		{
-			name:   "hermes_platform_namespaced",
+			name:    "hermes_platform_namespaced",
 			runtime: "hermes",
 			model:   "moonshot/kimi-k2.6",
-			wantOK: true,
+			wantOK:  true,
 		},
 		{
-			name:   "openclaw_kimi_coding",
+			name:    "openclaw_kimi_coding",
 			runtime: "openclaw",
 			model:   "moonshot:kimi-k2.6",
-			wantOK: true,
+			wantOK:  true,
 		},
 		// FAIL — model-side validator catches this, but the provider-side
 		// gate is called AFTER it in Create and inherits the fail-open
@@ -168,30 +211,30 @@ func TestValidateDerivedProviderInRegistry(t *testing.T) {
 		// errors → allow, letting the model-side response own the message).
 		// This is the deliberate "don't double-reject" decision.
 		{
-			name:   "unregistered_model_pass_through_to_model_side",
+			name:    "unregistered_model_pass_through_to_model_side",
 			runtime: "claude-code",
 			model:   "totally-made-up-model-xyz",
-			wantOK: true, // pass-through: model-side validator owns the rejection
+			wantOK:  true, // pass-through: model-side validator owns the rejection
 		},
 		// Federation contract — mirror of the model-side test above.
 		{
-			name:   "langgraph_runtime_failopen",
+			name:    "langgraph_runtime_failopen",
 			runtime: "langgraph",
 			model:   "anything-goes",
-			wantOK: true,
+			wantOK:  true,
 		},
 		{
-			name:   "external_runtime_failopen",
+			name:    "external_runtime_failopen",
 			runtime: "external",
 			model:   "whatever",
-			wantOK: true,
+			wantOK:  true,
 		},
 		// Empty model — MODEL_REQUIRED owns it; allow.
 		{
-			name:   "empty_model_allowed_other_gate_owns_it",
+			name:    "empty_model_allowed_other_gate_owns_it",
 			runtime: "claude-code",
 			model:   "",
-			wantOK: true,
+			wantOK:  true,
 		},
 	}
 	for _, c := range cases {

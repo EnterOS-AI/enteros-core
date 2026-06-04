@@ -317,7 +317,7 @@ providers:
     # Adapter prefix "mimo-"; canvas /^mimo-/i. proxy routing TBD (PR-3).
     # NOTE: canvas has a duplicate "xiaomi" VENDOR_LABELS key aliasing the
     # same vendor — collapsed into this one entry.
-    model_prefix_match: "^mimo-"
+    model_prefix_match: "(?i)^(mimo-|xiaomi[:/])"
     model_aliases: []
 
   # ===========================================================================
@@ -334,7 +334,7 @@ providers:
     auth_token_env: ANTHROPIC_AUTH_TOKEN
     # Adapter prefix "glm-" (lowercased match catches GLM-4.6); canvas /^GLM-/i.
     # canvas-only + adapter-only today; proxy routing TBD (PR-3).
-    model_prefix_match: "(?i)^glm-"
+    model_prefix_match: "(?i)^(glm-|zai[:/])"
     model_aliases: []
 
   # ===========================================================================
@@ -385,7 +385,7 @@ providers:
     auth_token_env: ANTHROPIC_AUTH_TOKEN
     # Adapter prefix "deepseek-"; canvas /^deepseek-/i. adapter+canvas only;
     # proxy routing TBD (PR-3).
-    model_prefix_match: "^deepseek-"
+    model_prefix_match: "^deepseek[-:/]"
     model_aliases: []
 
   # ===========================================================================
@@ -452,7 +452,7 @@ providers:
     auth_env: [DASHSCOPE_API_KEY, ALIBABA_API_KEY]
     auth_token_env: ANTHROPIC_AUTH_TOKEN
     # canvas-only today; proxy routing TBD. canvas /^qwen-/i.
-    model_prefix_match: "^qwen-"
+    model_prefix_match: "(?i)^(qwen|alibaba[:/])"
     model_aliases: []
 
   - name: nousresearch
@@ -466,7 +466,7 @@ providers:
     auth_token_env: ANTHROPIC_AUTH_TOKEN
     # canvas-only today; proxy routing TBD. Slash-prefix id
     # (e.g. nousresearch/hermes-4-70b).
-    model_prefix_match: "^nousresearch/"
+    model_prefix_match: "^nousresearch[:/]"
     model_aliases: []
 
   - name: openrouter
@@ -479,7 +479,7 @@ providers:
     auth_env: [OPENROUTER_API_KEY]
     auth_token_env: ANTHROPIC_AUTH_TOKEN
     # canvas-only today; proxy routing TBD. Wildcard: openrouter/<model>.
-    model_prefix_match: "^openrouter/"
+    model_prefix_match: "^openrouter[:/]"
     model_aliases: []
 
   - name: huggingface
@@ -492,7 +492,7 @@ providers:
     auth_env: [HUGGINGFACE_API_KEY, HF_TOKEN]
     auth_token_env: ANTHROPIC_AUTH_TOKEN
     # canvas-only today; proxy routing TBD. Wildcard: huggingface/<model>.
-    model_prefix_match: "^huggingface/"
+    model_prefix_match: "^huggingface[:/]"
     model_aliases: []
 
   - name: ai-gateway
@@ -505,7 +505,7 @@ providers:
     auth_env: [AI_GATEWAY_API_KEY]
     auth_token_env: ANTHROPIC_AUTH_TOKEN
     # canvas-only today; proxy routing TBD.
-    model_prefix_match: "^ai-gateway/"
+    model_prefix_match: "^ai-gateway[:/]"
     model_aliases: []
 
   - name: opencode-zen
@@ -518,7 +518,7 @@ providers:
     auth_env: [OPENCODE_ZEN_API_KEY]
     auth_token_env: ANTHROPIC_AUTH_TOKEN
     # canvas-only today; proxy routing TBD.
-    model_prefix_match: "^opencode-zen/"
+    model_prefix_match: "^opencode-zen[:/]"
     model_aliases: []
 
   - name: opencode-go
@@ -531,7 +531,7 @@ providers:
     auth_env: [OPENCODE_GO_API_KEY]
     auth_token_env: ANTHROPIC_AUTH_TOKEN
     # canvas-only today; proxy routing TBD.
-    model_prefix_match: "^opencode-go/"
+    model_prefix_match: "^opencode-go[:/]"
     model_aliases: []
 
   - name: kilocode
@@ -544,7 +544,7 @@ providers:
     auth_env: [KILOCODE_API_KEY]
     auth_token_env: ANTHROPIC_AUTH_TOKEN
     # canvas-only today; proxy routing TBD.
-    model_prefix_match: "^kilocode/"
+    model_prefix_match: "^kilocode[:/]"
     model_aliases: []
 
   - name: minimax-cn
@@ -559,7 +559,7 @@ providers:
     # canvas-only today; proxy routing TBD. China endpoint sibling of `minimax`
     # (api.minimaxi.com). Matched only by the explicit slash-prefix so it does
     # NOT collide with `minimax`'s (?i)^minimax- in the overlap guard.
-    model_prefix_match: "^minimax-cn/"
+    model_prefix_match: "^minimax-cn[:/]"
     model_aliases: []
 
   - name: ollama-cloud
@@ -572,7 +572,7 @@ providers:
     auth_env: [OLLAMA_CLOUD_API_KEY]
     auth_token_env: ANTHROPIC_AUTH_TOKEN
     # canvas-only today; proxy routing TBD.
-    model_prefix_match: "^ollama-cloud/"
+    model_prefix_match: "^ollama-cloud[:/]"
     model_aliases: []
 
   - name: ollama
@@ -598,7 +598,7 @@ providers:
     auth_env: [NVIDIA_API_KEY]
     auth_token_env: ANTHROPIC_AUTH_TOKEN
     # canvas-only today; proxy routing TBD.
-    model_prefix_match: "^nvidia/"
+    model_prefix_match: "^nvidia[:/]"
     model_aliases: []
 
   - name: arcee
@@ -611,7 +611,7 @@ providers:
     auth_env: [ARCEE_API_KEY]
     auth_token_env: ANTHROPIC_AUTH_TOKEN
     # canvas-only today; proxy routing TBD.
-    model_prefix_match: "^arcee/"
+    model_prefix_match: "^arcee[:/]"
     model_aliases: []
 
   - name: custom
@@ -624,7 +624,7 @@ providers:
     auth_env: [CUSTOM_API_KEY, OPENAI_API_KEY]
     auth_token_env: ANTHROPIC_AUTH_TOKEN
     # canvas-only today; proxy routing TBD. Wildcard free-text: custom/<model>.
-    model_prefix_match: "^custom/"
+    model_prefix_match: "^custom[:/]"
     model_aliases: []
 
 # =============================================================================
@@ -762,6 +762,16 @@ runtimes:
           - minimax/MiniMax-M2.7
           - minimax/MiniMax-M2.7-highspeed
           - minimax/MiniMax-M3
+      # NAME-ONLY BYOK arms (cp#529): zero model ids → add NOTHING to the
+      # platform menu (ModelsForRuntime), but wire these CONFIRMED-NON-PLATFORM
+      # providers into claude-code's NATIVE prefix-routing set so the bare BYOK
+      # ids the claude-code template offers (GLM-*, deepseek-*, mimo-*) resolve
+      # via DeriveProvider. BILLING-SAFE: zai/deepseek/xiaomi-mimo are tenant-key
+      # (BYOK) providers — never platform-shared — so routing through them bills
+      # the tenant's own key, never the platform's.
+      - name: zai
+      - name: deepseek
+      - name: xiaomi-mimo
 
   # hermes: native Kimi only (kimi-coding gateway). hermes-agent owns its own
   # broad provider matrix, but the CTO native matrix for the Molecule
@@ -777,6 +787,32 @@ runtimes:
         models:
           - moonshot/kimi-k2.6
           - moonshot/kimi-k2.5
+      # NAME-ONLY BYOK arms (cp#529): zero model ids → no addition to the
+      # platform menu, but wire hermes's CONFIRMED-NON-PLATFORM passthrough +
+      # bare-vendor providers into its NATIVE prefix-routing set so the BYOK
+      # ids the hermes template offers (openrouter/…, huggingface/…, deepseek/…,
+      # zai:…, etc.) resolve via DeriveProvider. ALL tenant-key (BYOK).
+      # GUARDRAIL: the platform-shared vendors (openai/gemini/minimax/anthropic
+      # and groq) are DELIBERATELY ABSENT here — wiring them would route a
+      # customer model through the platform's key (a money bug); so hermes ids
+      # like anthropic/claude-*, gemini/*, openai/*, minimax/*, groq:* remain
+      # unroutable (residual drift) until dedicated BYOK-vendor providers exist.
+      - name: openrouter
+      - name: huggingface
+      - name: ai-gateway
+      - name: opencode-zen
+      - name: opencode-go
+      - name: kilocode
+      - name: custom
+      - name: nvidia
+      - name: arcee
+      - name: ollama-cloud
+      - name: minimax-cn
+      - name: nousresearch
+      - name: deepseek
+      - name: zai
+      - name: xiaomi-mimo
+      - name: alibaba
 
   # codex: OpenAI — BYOK split across TWO native providers
   # (openai-subscription + openai-api), mirroring claude-code's anthropic
@@ -846,6 +882,15 @@ runtimes:
         models:
           - moonshot/kimi-k2.6
           - moonshot/kimi-k2.5
+      # NAME-ONLY BYOK arms (cp#529): zero model ids → no platform-menu change,
+      # but wire openclaw's CONFIRMED-NON-PLATFORM passthroughs into its NATIVE
+      # prefix-routing set so the BYOK colon/slash ids the openclaw template
+      # offers (openrouter:…, custom:…) resolve via DeriveProvider. BYOK only.
+      # GUARDRAIL: the platform-shared openclaw ids openai:*, minimax:*, groq:*
+      # are DELIBERATELY ABSENT (groq has no provider at all) — they stay
+      # unroutable residual drift rather than billing the platform's key.
+      - name: openrouter
+      - name: custom
 
 
   # google-adk: Gemini via Vertex AI, keyless ADC (Workload Identity

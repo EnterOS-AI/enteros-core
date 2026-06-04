@@ -16,7 +16,7 @@ const SchemaVersion = 1
 // Fingerprint is a stable content hash of the generated projection (schema
 // version + provider catalog + runtime native sets). It changes iff the
 // registry DATA changes (comment-only YAML edits do not churn it).
-const Fingerprint = "ae33546c8fba3474"
+const Fingerprint = "5a741b326b6f812c"
 
 // GenProvider is the generated projection of one provider catalog entry —
 // the subset a downstream consumer needs to derive + display a provider.
@@ -51,26 +51,26 @@ var Providers = []GenProvider{
 	{Name: "moonshot", DisplayName: "Moonshot (Kimi)", Protocol: "openai", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"MOONSHOT_API_KEY", "KIMI_API_KEY"}, ModelPrefixMatch: "^moonshot[:/-]", IsPlatform: false, UpstreamVendor: "moonshot"},
 	{Name: "minimax", DisplayName: "MiniMax", Protocol: "openai", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"MINIMAX_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"}, ModelPrefixMatch: "(?i)^minimax-m", IsPlatform: false, UpstreamVendor: "minimax"},
 	{Name: "platform", DisplayName: "Platform", Protocol: "anthropic", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"MOLECULE_LLM_USAGE_TOKEN"}, ModelPrefixMatch: "^platform/", IsPlatform: true},
-	{Name: "xiaomi-mimo", DisplayName: "Xiaomi MiMo", Protocol: "anthropic", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"}, ModelPrefixMatch: "^mimo-", IsPlatform: false},
-	{Name: "zai", DisplayName: "Z.ai (GLM)", Protocol: "anthropic", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"GLM_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"}, ModelPrefixMatch: "(?i)^glm-", IsPlatform: false},
+	{Name: "xiaomi-mimo", DisplayName: "Xiaomi MiMo", Protocol: "anthropic", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"}, ModelPrefixMatch: "(?i)^(mimo-|xiaomi[:/])", IsPlatform: false},
+	{Name: "zai", DisplayName: "Z.ai (GLM)", Protocol: "anthropic", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"GLM_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"}, ModelPrefixMatch: "(?i)^(glm-|zai[:/])", IsPlatform: false},
 	{Name: "kimi-coding", DisplayName: "Moonshot Kimi (coding-tuned)", Protocol: "anthropic", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"KIMI_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"}, ModelPrefixMatch: "^kimi-", IsPlatform: false},
-	{Name: "deepseek", DisplayName: "DeepSeek", Protocol: "anthropic", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"DEEPSEEK_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"}, ModelPrefixMatch: "^deepseek-", IsPlatform: false},
+	{Name: "deepseek", DisplayName: "DeepSeek", Protocol: "anthropic", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"DEEPSEEK_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"}, ModelPrefixMatch: "^deepseek[-:/]", IsPlatform: false},
 	{Name: "google", DisplayName: "Google Gemini", Protocol: "openai", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"GEMINI_API_KEY", "GOOGLE_API_KEY"}, ModelPrefixMatch: "^gemini-", IsPlatform: false},
 	{Name: "vertex", DisplayName: "Google Vertex AI (keyless ADC)", Protocol: "openai", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"GOOGLE_APPLICATION_CREDENTIALS"}, ModelPrefixMatch: "^vertex:", IsPlatform: false},
-	{Name: "alibaba", DisplayName: "Alibaba Qwen (DashScope)", Protocol: "openai", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"DASHSCOPE_API_KEY", "ALIBABA_API_KEY"}, ModelPrefixMatch: "^qwen-", IsPlatform: false},
-	{Name: "nousresearch", DisplayName: "Nous Research (Hermes)", Protocol: "openai", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"NOUSRESEARCH_API_KEY"}, ModelPrefixMatch: "^nousresearch/", IsPlatform: false},
-	{Name: "openrouter", DisplayName: "OpenRouter (any model)", Protocol: "openai", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"OPENROUTER_API_KEY"}, ModelPrefixMatch: "^openrouter/", IsPlatform: false},
-	{Name: "huggingface", DisplayName: "Hugging Face Inference", Protocol: "openai", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"HUGGINGFACE_API_KEY", "HF_TOKEN"}, ModelPrefixMatch: "^huggingface/", IsPlatform: false},
-	{Name: "ai-gateway", DisplayName: "Vercel AI Gateway", Protocol: "openai", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"AI_GATEWAY_API_KEY"}, ModelPrefixMatch: "^ai-gateway/", IsPlatform: false},
-	{Name: "opencode-zen", DisplayName: "OpenCode Zen", Protocol: "openai", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"OPENCODE_ZEN_API_KEY"}, ModelPrefixMatch: "^opencode-zen/", IsPlatform: false},
-	{Name: "opencode-go", DisplayName: "OpenCode Go", Protocol: "openai", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"OPENCODE_GO_API_KEY"}, ModelPrefixMatch: "^opencode-go/", IsPlatform: false},
-	{Name: "kilocode", DisplayName: "Kilo Code", Protocol: "openai", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"KILOCODE_API_KEY"}, ModelPrefixMatch: "^kilocode/", IsPlatform: false},
-	{Name: "minimax-cn", DisplayName: "MiniMax China", Protocol: "openai", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"MINIMAX_API_KEY", "ANTHROPIC_AUTH_TOKEN"}, ModelPrefixMatch: "^minimax-cn/", IsPlatform: false},
-	{Name: "ollama-cloud", DisplayName: "Ollama Cloud", Protocol: "openai", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"OLLAMA_CLOUD_API_KEY"}, ModelPrefixMatch: "^ollama-cloud/", IsPlatform: false},
+	{Name: "alibaba", DisplayName: "Alibaba Qwen (DashScope)", Protocol: "openai", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"DASHSCOPE_API_KEY", "ALIBABA_API_KEY"}, ModelPrefixMatch: "(?i)^(qwen|alibaba[:/])", IsPlatform: false},
+	{Name: "nousresearch", DisplayName: "Nous Research (Hermes)", Protocol: "openai", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"NOUSRESEARCH_API_KEY"}, ModelPrefixMatch: "^nousresearch[:/]", IsPlatform: false},
+	{Name: "openrouter", DisplayName: "OpenRouter (any model)", Protocol: "openai", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"OPENROUTER_API_KEY"}, ModelPrefixMatch: "^openrouter[:/]", IsPlatform: false},
+	{Name: "huggingface", DisplayName: "Hugging Face Inference", Protocol: "openai", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"HUGGINGFACE_API_KEY", "HF_TOKEN"}, ModelPrefixMatch: "^huggingface[:/]", IsPlatform: false},
+	{Name: "ai-gateway", DisplayName: "Vercel AI Gateway", Protocol: "openai", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"AI_GATEWAY_API_KEY"}, ModelPrefixMatch: "^ai-gateway[:/]", IsPlatform: false},
+	{Name: "opencode-zen", DisplayName: "OpenCode Zen", Protocol: "openai", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"OPENCODE_ZEN_API_KEY"}, ModelPrefixMatch: "^opencode-zen[:/]", IsPlatform: false},
+	{Name: "opencode-go", DisplayName: "OpenCode Go", Protocol: "openai", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"OPENCODE_GO_API_KEY"}, ModelPrefixMatch: "^opencode-go[:/]", IsPlatform: false},
+	{Name: "kilocode", DisplayName: "Kilo Code", Protocol: "openai", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"KILOCODE_API_KEY"}, ModelPrefixMatch: "^kilocode[:/]", IsPlatform: false},
+	{Name: "minimax-cn", DisplayName: "MiniMax China", Protocol: "openai", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"MINIMAX_API_KEY", "ANTHROPIC_AUTH_TOKEN"}, ModelPrefixMatch: "^minimax-cn[:/]", IsPlatform: false},
+	{Name: "ollama-cloud", DisplayName: "Ollama Cloud", Protocol: "openai", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"OLLAMA_CLOUD_API_KEY"}, ModelPrefixMatch: "^ollama-cloud[:/]", IsPlatform: false},
 	{Name: "ollama", DisplayName: "Ollama (self-hosted)", Protocol: "openai", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"OLLAMA_HOST"}, ModelPrefixMatch: "^ollama/", IsPlatform: false},
-	{Name: "nvidia", DisplayName: "NVIDIA NIM", Protocol: "openai", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"NVIDIA_API_KEY"}, ModelPrefixMatch: "^nvidia/", IsPlatform: false},
-	{Name: "arcee", DisplayName: "Arcee", Protocol: "openai", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"ARCEE_API_KEY"}, ModelPrefixMatch: "^arcee/", IsPlatform: false},
-	{Name: "custom", DisplayName: "Custom OpenAI-compat endpoint", Protocol: "openai", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"CUSTOM_API_KEY", "OPENAI_API_KEY"}, ModelPrefixMatch: "^custom/", IsPlatform: false},
+	{Name: "nvidia", DisplayName: "NVIDIA NIM", Protocol: "openai", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"NVIDIA_API_KEY"}, ModelPrefixMatch: "^nvidia[:/]", IsPlatform: false},
+	{Name: "arcee", DisplayName: "Arcee", Protocol: "openai", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"ARCEE_API_KEY"}, ModelPrefixMatch: "^arcee[:/]", IsPlatform: false},
+	{Name: "custom", DisplayName: "Custom OpenAI-compat endpoint", Protocol: "openai", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"CUSTOM_API_KEY", "OPENAI_API_KEY"}, ModelPrefixMatch: "^custom[:/]", IsPlatform: false},
 }
 
 // Runtimes maps each runtime to its native provider+model set, runtime names
@@ -82,6 +82,9 @@ var Runtimes = map[string][]GenRuntimeRef{
 		{Name: "kimi-coding", Models: []string{"kimi-for-coding", "kimi-k2.5", "kimi-k2", "moonshot:kimi-k2.6", "moonshot:kimi-k2.5"}},
 		{Name: "minimax", Models: []string{"MiniMax-M2", "MiniMax-M2.7", "MiniMax-M2.7-highspeed", "MiniMax-M3", "minimax:MiniMax-M2", "minimax:MiniMax-M2.7", "minimax:MiniMax-M2.7-highspeed", "minimax:MiniMax-M3"}},
 		{Name: "platform", Models: []string{"anthropic/claude-opus-4-7", "anthropic/claude-sonnet-4-6", "moonshot/kimi-k2.6", "moonshot/kimi-k2.5", "minimax/MiniMax-M2.7", "minimax/MiniMax-M2.7-highspeed", "minimax/MiniMax-M3"}},
+		{Name: "zai", Models: []string{}},
+		{Name: "deepseek", Models: []string{}},
+		{Name: "xiaomi-mimo", Models: []string{}},
 	},
 	"codex": {
 		{Name: "openai-subscription", Models: []string{"gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.2"}},
@@ -95,9 +98,27 @@ var Runtimes = map[string][]GenRuntimeRef{
 	"hermes": {
 		{Name: "kimi-coding", Models: []string{"kimi-coding/kimi-k2"}},
 		{Name: "platform", Models: []string{"moonshot/kimi-k2.6", "moonshot/kimi-k2.5"}},
+		{Name: "openrouter", Models: []string{}},
+		{Name: "huggingface", Models: []string{}},
+		{Name: "ai-gateway", Models: []string{}},
+		{Name: "opencode-zen", Models: []string{}},
+		{Name: "opencode-go", Models: []string{}},
+		{Name: "kilocode", Models: []string{}},
+		{Name: "custom", Models: []string{}},
+		{Name: "nvidia", Models: []string{}},
+		{Name: "arcee", Models: []string{}},
+		{Name: "ollama-cloud", Models: []string{}},
+		{Name: "minimax-cn", Models: []string{}},
+		{Name: "nousresearch", Models: []string{}},
+		{Name: "deepseek", Models: []string{}},
+		{Name: "zai", Models: []string{}},
+		{Name: "xiaomi-mimo", Models: []string{}},
+		{Name: "alibaba", Models: []string{}},
 	},
 	"openclaw": {
 		{Name: "kimi-coding", Models: []string{"moonshot:kimi-k2.6", "moonshot:kimi-k2.5"}},
 		{Name: "platform", Models: []string{"moonshot/kimi-k2.6", "moonshot/kimi-k2.5"}},
+		{Name: "openrouter", Models: []string{}},
+		{Name: "custom", Models: []string{}},
 	},
 }
