@@ -2,6 +2,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, fireEvent, waitFor, cleanup } from "@testing-library/react";
 import { CreateWorkspaceButton } from "../CreateWorkspaceDialog";
+import { isPlatformManagedProvider } from "../ProviderModelSelector";
 
 vi.mock("@/lib/api", () => ({
   api: {
@@ -63,6 +64,34 @@ const SAMPLE_TEMPLATES = [
       { id: "openai/gpt-4o", name: "GPT-4o", required_env: ["OPENAI_API_KEY"] },
       { id: "anthropic/claude-sonnet-4-5", name: "Claude Sonnet 4.5", required_env: ["ANTHROPIC_API_KEY"] },
       { id: "moonshot/kimi-k2.6", name: "Kimi K2.6", provider: "platform", required_env: [] },
+    ],
+  },
+  // #2245 fixtures. The real registry `platform` provider declares
+  // MOLECULE_LLM_USAGE_TOKEN in its auth_env — the default mock above masks the
+  // bug by using required_env:[]. This template gives the platform provider a
+  // non-empty auth env (matching production) so the credential-suppression
+  // logic is actually exercised.
+  {
+    id: "platform-managed-test",
+    name: "Platform Managed Test",
+    runtime: "claude-code",
+    model: "moonshot/kimi-k2.6",
+    providers: ["platform", "minimax"],
+    models: [
+      { id: "moonshot/kimi-k2.6", name: "Kimi K2.6", provider: "platform", required_env: ["MOLECULE_LLM_USAGE_TOKEN"] },
+      { id: "MiniMax-M2.7", name: "MiniMax M2.7", required_env: ["MINIMAX_API_KEY"] },
+    ],
+  },
+  // BYOK-only template (no platform provider) — the credential requirement
+  // MUST still hold for these (no-regression guard).
+  {
+    id: "byok-only-test",
+    name: "BYOK Only Test",
+    runtime: "claude-code",
+    model: "openai/gpt-4o",
+    providers: ["openai"],
+    models: [
+      { id: "openai/gpt-4o", name: "GPT-4o", required_env: ["OPENAI_API_KEY"] },
     ],
   },
 ];
@@ -655,5 +684,72 @@ describe("CreateWorkspaceDialog — budget_limit field", () => {
     await openDialog();
     const budgetInput = screen.getByPlaceholderText("e.g. 100") as HTMLInputElement;
     expect(budgetInput.value).toBe("");
+  });
+});
+
+describe("CreateWorkspaceDialog — platform-managed credential suppression (#2245)", () => {
+  describe("isPlatformManagedProvider", () => {
+    it("is true for the platform proxy vendor", () => {
+      expect(isPlatformManagedProvider({ vendor: "platform" })).toBe(true);
+    });
+    it("is true for a registry billingMode of platform_managed", () => {
+      expect(
+        isPlatformManagedProvider({ vendor: "minimax", billingMode: "platform_managed" }),
+      ).toBe(true);
+    });
+    it("is false for a BYOK provider", () => {
+      expect(isPlatformManagedProvider({ vendor: "anthropic", billingMode: "byok" })).toBe(false);
+      expect(isPlatformManagedProvider({ vendor: "minimax" })).toBe(false);
+    });
+    it("is false for null/undefined", () => {
+      expect(isPlatformManagedProvider(null)).toBe(false);
+      expect(isPlatformManagedProvider(undefined)).toBe(false);
+    });
+  });
+
+  it("platform-managed provider with a declared auth env requires NO credential, hides the key field, and sends NO secret", async () => {
+    await openDialog();
+    await setTemplate("platform-managed-test");
+    fireEvent.change(screen.getByPlaceholderText("e.g. SEO Agent"), {
+      target: { value: "Platform Agent" },
+    });
+
+    // The credential input must NOT render for platform-managed; a "no key
+    // required" note appears instead.
+    await waitFor(() =>
+      expect(screen.getByText("Platform-managed — no API key required.")).toBeTruthy(),
+    );
+    expect(screen.queryByLabelText("MOLECULE_LLM_USAGE_TOKEN")).toBeNull();
+
+    const createBtn = screen.getAllByRole("button").find((b) => b.textContent === "Create");
+    fireEvent.click(createBtn!);
+
+    await waitFor(() => expect(mockPost).toHaveBeenCalled());
+    // No validation error, and the provisioner-injected token is NOT clobbered
+    // by an empty secret.
+    expect(screen.queryByText("Provider credential is required")).toBeNull();
+    const body = mockPost.mock.calls[0][1] as Record<string, unknown>;
+    expect(body.llm_provider).toBe("platform");
+    expect(body.secrets).toBeUndefined();
+  });
+
+  it("BYOK provider still requires a credential and renders the key field (no-regression)", async () => {
+    await openDialog();
+    await setTemplate("byok-only-test");
+    fireEvent.change(screen.getByPlaceholderText("e.g. SEO Agent"), {
+      target: { value: "BYOK Agent" },
+    });
+
+    // The credential field IS rendered for BYOK...
+    await waitFor(() => expect(screen.getByLabelText("OPENAI_API_KEY")).toBeTruthy());
+
+    const createBtn = screen.getAllByRole("button").find((b) => b.textContent === "Create");
+    fireEvent.click(createBtn!);
+
+    // ...and create stays blocked until it's filled.
+    await waitFor(() =>
+      expect(screen.getByText("Provider credential is required")).toBeTruthy(),
+    );
+    expect(mockPost).not.toHaveBeenCalled();
   });
 });
