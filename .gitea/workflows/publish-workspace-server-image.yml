@@ -16,14 +16,24 @@ name: publish-workspace-server-image
 #
 # Image tags produced:
 #   :staging-<sha> — per-commit digest, stable for canary verify
-#   :staging-latest — tracks most recent build on this branch
+#   :staging-latest — tracks most recent BUILD on this branch (set by the
+#                     build job, last-writer-wins, NOT prod-gated)
+#   :latest — tracks the most recent PROD-PROMOTED build. Re-pointed by the
+#             deploy-production job ONLY after green main CI + canary +
+#             fleet rollout + /buildinfo verification pass. So :latest ==
+#             "current prod image", never the raw build. (Added 2026-06-03
+#             after a stale :latest — last moved 2026-05-10 — reverted a
+#             production tenant on a no-arg redeploy.)
 #
 # Production auto-deploy:
 #   After both platform and tenant images are pushed, deploy-production waits
 #   for strict required push contexts on the same SHA to go green, then
 #   calls the production CP redeploy-fleet endpoint with target_tag=
-#   staging-<sha>. Set repo variable or secret PROD_AUTO_DEPLOY_DISABLED=true
-#   to stop production rollout while keeping image publishing enabled.
+#   staging-<sha>. On success (rollout + buildinfo verified) it re-points
+#   :latest to the same SHA. Set repo variable or secret
+#   PROD_AUTO_DEPLOY_DISABLED=true to stop production rollout while keeping
+#   image publishing enabled — in which case :latest is NOT advanced either
+#   (correct: an unpromoted build must not become :latest).
 #
 # Primary ECR target: 153263036946.dkr.ecr.us-east-2.amazonaws.com/molecule-ai/*
 # Optional staging tenant mirror target:
@@ -409,3 +419,65 @@ jobs:
           if [ "$STALE_COUNT" -gt 0 ] || [ "$UNHEALTHY_COUNT" -gt 0 ] || [ "$UNREACHABLE_COUNT" -gt 0 ]; then
             exit 1
           fi
+
+      # Re-point :latest to the just-promoted image — ONLY after the
+      # production rollout + buildinfo verification above have passed.
+      #
+      # WHY HERE (promote point), not at build time:
+      #   The platform-tenant ECR `:latest` tag was last moved 2026-05-10
+      #   and went 3.5 weeks stale because the build step only pushes
+      #   :staging-<sha> + :staging-latest and never re-points :latest. A
+      #   no-arg POST /cp/admin/tenants/:slug/redeploy (whose default tag
+      #   fell through to "latest") then pulled the 3.5-week-old image and
+      #   REVERTED the tenant (incident: molecule-adk-demo, 2026-06-03).
+      #
+      #   The defense-in-depth half of this fix changes that redeploy
+      #   default to :staging-latest, but :latest itself must also be
+      #   kept meaningful. We make :latest track the PROD-BLESSED build,
+      #   not the raw build: by living at the end of deploy-production —
+      #   after `wait-ci` (green main CI), the canary-first batched fleet
+      #   rollout, AND the /buildinfo SHA verification — :latest only ever
+      #   advances to a SHA that is actually green and confirmed running
+      #   across the live fleet. So `:latest` == "current prod image",
+      #   and any consumer that pulls :latest (legacy callers, manual
+      #   `docker pull`, a redeploy that somehow still resolves "latest")
+      #   gets the blessed image instead of whatever happened to build.
+      #
+      #   Re-tag is digest-level (imagetools create), so no rebuild and
+      #   :latest is byte-identical to :staging-<sha> for this commit.
+      - name: Promote :latest to the verified prod image
+        if: ${{ steps.plan.outputs.enabled == 'true' }}
+        env:
+          TENANT_IMAGE_NAME: ${{ env.TENANT_IMAGE_NAME }}
+          STAGING_TENANT_IMAGE_NAME: ${{ env.STAGING_TENANT_IMAGE_NAME }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: us-east-2
+        run: |
+          set -euo pipefail
+          SHA_TAG="staging-${GITHUB_SHA::7}"
+          PROD_ECR_REGISTRY="${TENANT_IMAGE_NAME%%/*}"
+          STAGING_ECR_REGISTRY="${STAGING_TENANT_IMAGE_NAME%%/*}"
+
+          aws ecr get-login-password --region us-east-2 | \
+            docker login --username AWS --password-stdin "${PROD_ECR_REGISTRY}"
+          aws ecr get-login-password --region us-east-2 | \
+            docker login --username AWS --password-stdin "${STAGING_ECR_REGISTRY}"
+
+          # imagetools create copies the source manifest to the new tag by
+          # digest (no pull/rebuild). :latest now points at the exact image
+          # that just passed the prod gate.
+          docker buildx imagetools create \
+            --tag "${TENANT_IMAGE_NAME}:latest" \
+            "${TENANT_IMAGE_NAME}:${SHA_TAG}"
+          docker buildx imagetools create \
+            --tag "${STAGING_TENANT_IMAGE_NAME}:latest" \
+            "${STAGING_TENANT_IMAGE_NAME}:${SHA_TAG}"
+
+          {
+            echo ""
+            echo "### :latest promoted"
+            echo ""
+            echo "Re-pointed \`platform-tenant:latest\` → \`${SHA_TAG}\` (prod + staging ECR)."
+            echo ":latest now tracks the prod-blessed, fleet-verified image."
+          } >> "$GITHUB_STEP_SUMMARY"
