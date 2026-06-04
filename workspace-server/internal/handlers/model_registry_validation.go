@@ -24,13 +24,23 @@ import (
 // validateRegisteredModelForRuntime reports whether (runtime, model) is
 // selectable per the provider registry. Returns:
 //
-//	(true,  "")     — allowed: model is registered for this runtime, OR the
-//	                  runtime is not in the registry (fail-open), OR model=="".
-//	(false, reason) — rejected: the runtime IS registered but the model is not
-//	                  in its native ModelsForRuntime set.
+//	(true,  "")     — allowed: model is on the runtime's platform menu
+//	                  (ModelsForRuntime) OR DeriveProvider(runtime, model)
+//	                  RESOLVES a native provider (the cp#529 routability-aware
+//	                  BYOK path), OR the runtime is not in the registry
+//	                  (fail-open), OR model=="".
+//	(false, reason) — rejected: the runtime IS registered, the model is not on
+//	                  its platform menu, AND no native provider prefix-owns it
+//	                  (genuinely unroutable).
 //
 // model=="" is allowed here: the MODEL_REQUIRED gate owns the empty-model case,
 // so this validator must not double-reject it.
+//
+// ROUTABILITY-AWARE (cp#529, CTO Option C): the final predicate is an OR —
+// `model ∈ ModelsForRuntime(runtime)` OR `DeriveProvider(runtime, model, nil)`
+// resolves. The platform menu carries platform-billed ids; the DeriveProvider
+// path covers BYOK ids that prefix-match a name-only native arm (no platform
+// billing). The drift checker in molecule-controlplane mirrors this exact OR.
 func validateRegisteredModelForRuntime(runtime, model string) (bool, string) {
 	model = strings.TrimSpace(model)
 	if model == "" {
@@ -51,6 +61,24 @@ func validateRegisteredModelForRuntime(runtime, model string) (bool, string) {
 		if mid == model {
 			return true, ""
 		}
+	}
+	// ROUTABILITY-AWARE allow path (cp#529, CTO-approved Option C). The model is
+	// NOT on the runtime's platform menu (ModelsForRuntime) — but a model can be
+	// legitimately SELECTABLE without being a platform-menu id: a BYOK id whose
+	// prefix matches one of the runtime's NATIVE provider arms (a name-only arm
+	// added in providers.yaml) resolves to a concrete provider via DeriveProvider
+	// even though it carries no platform billing. Allow it iff DeriveProvider
+	// resolves a provider for (runtime, model). A genuinely-unroutable id (no
+	// native provider prefix-owns it) still falls through to the 422 below.
+	//
+	// BILLING GUARDRAIL: only CONFIRMED-NON-PLATFORM (BYOK) providers are wired as
+	// name-only arms in providers.yaml (never platform/anthropic-*/openai-*/
+	// moonshot/minimax/google/vertex), so a DeriveProvider-resolved id reached by
+	// THIS path can never bill the platform's key for a customer's model. The
+	// platform-menu ids that DO carry platform billing are already allowed by the
+	// exact-membership loop above; this path only ever resolves to a BYOK arm.
+	if _, derr := m.DeriveProvider(runtime, model, nil); derr == nil {
+		return true, ""
 	}
 	return false, fmt.Sprintf(
 		"model %q is not a registered model for runtime %q; pick one of the runtime's registered models (provider-registry SSOT, internal#718)",
