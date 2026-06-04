@@ -159,15 +159,28 @@ services:
 
   # --- Canvas ---
   canvas:
-    # The publish-canvas-image CI workflow pushes a fresh image to GHCR on
-    # every canvas/** merge to main. To update the running container:
-    #   docker compose pull canvas && docker compose up -d canvas
-    # First-time local setup or testing unreleased changes — build from source:
-    #   docker compose build canvas && docker compose up -d canvas
+    # The publish-canvas-image CI workflow runs an ORDERED deploy (core#2226):
+    # build → push :staging-<sha> + :staging-latest → (after green main CI)
+    # re-point :latest to the verified :staging-<sha> by digest. So both tags
+    # below resolve to a CI-green, reproducible build, never a raw/red one.
+    #
+    # Reproducible deploy: pin CANVAS_IMAGE_TAG to the immutable per-commit tag
+    # the ordered deploy produced, e.g.
+    #   CANVAS_IMAGE_TAG=staging-<sha> docker compose pull canvas && docker compose up -d canvas
+    # This makes a tenant/host deploy reproducible (resolves the standing
+    # `TODO: pin canvas ECR image digest`). Unset it and the default `latest`
+    # is the prod-blessed tag the ordered deploy keeps pointed at the last
+    # green build — still deterministic vs. the old raw `:latest`.
+    #
+    # To pin by content digest instead of tag (fully immutable):
+    #   aws ecr describe-images --repository-name molecule-ai/canvas \
+    #     --image-tags staging-<sha> --region us-east-2 \
+    #     --query 'imageDetails[0].imageDigest' --output text
+    # then set CANVAS_IMAGE_TAG=staging-<sha>@<digest> (compose passes it through).
+    #
     # Note: ECR images require AWS auth — `aws ecr get-login-password --region us-east-2 | docker login --username AWS --password-stdin 153263036946.dkr.ecr.us-east-2.amazonaws.com` before pull.
-    # Digest-pin requires: aws ecr describe-images --repository-name molecule-ai/canvas --image-tags latest --query 'imageDetails[0].imageDigest'
-    # TODO: pin canvas ECR image digest once AWS creds are available in CI.
-    image: 153263036946.dkr.ecr.us-east-2.amazonaws.com/molecule-ai/canvas:latest
+    # Local dev keeps working via the `build:` context below (docker compose build canvas).
+    image: 153263036946.dkr.ecr.us-east-2.amazonaws.com/molecule-ai/canvas:${CANVAS_IMAGE_TAG:-latest}
     build:
       context: ./canvas
       dockerfile: Dockerfile
