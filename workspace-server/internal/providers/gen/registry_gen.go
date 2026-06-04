@@ -16,7 +16,7 @@ const SchemaVersion = 1
 // Fingerprint is a stable content hash of the generated projection (schema
 // version + provider catalog + runtime native sets). It changes iff the
 // registry DATA changes (comment-only YAML edits do not churn it).
-const Fingerprint = "8f733b112695b926"
+const Fingerprint = "a491f5ff8a17ef59"
 
 // GenProvider is the generated projection of one provider catalog entry —
 // the subset a downstream consumer needs to derive + display a provider.
@@ -50,7 +50,7 @@ var Providers = []GenProvider{
 	{Name: "openai-api", DisplayName: "OpenAI API", Protocol: "openai", AuthMode: "anthropic_api", AuthEnv: []string{"OPENAI_API_KEY"}, ModelPrefixMatch: "^openai-api[:/]", IsPlatform: false, UpstreamVendor: "openai"},
 	{Name: "moonshot", DisplayName: "Moonshot (Kimi)", Protocol: "openai", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"MOONSHOT_API_KEY", "KIMI_API_KEY"}, ModelPrefixMatch: "^moonshot[:/-]", IsPlatform: false, UpstreamVendor: "moonshot"},
 	{Name: "minimax", DisplayName: "MiniMax", Protocol: "openai", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"MINIMAX_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"}, ModelPrefixMatch: "(?i)^minimax-m", IsPlatform: false, UpstreamVendor: "minimax"},
-	{Name: "platform", DisplayName: "Platform", Protocol: "anthropic", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"ANTHROPIC_API_KEY", "MOLECULE_LLM_USAGE_TOKEN"}, ModelPrefixMatch: "^platform/", IsPlatform: true},
+	{Name: "platform", DisplayName: "Platform", Protocol: "anthropic", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"MOLECULE_LLM_USAGE_TOKEN"}, ModelPrefixMatch: "^platform/", IsPlatform: true},
 	{Name: "xiaomi-mimo", DisplayName: "Xiaomi MiMo", Protocol: "anthropic", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"}, ModelPrefixMatch: "^mimo-", IsPlatform: false},
 	{Name: "zai", DisplayName: "Z.ai (GLM)", Protocol: "anthropic", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"GLM_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"}, ModelPrefixMatch: "(?i)^glm-", IsPlatform: false},
 	{Name: "kimi-coding", DisplayName: "Moonshot Kimi (coding-tuned)", Protocol: "anthropic", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"KIMI_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"}, ModelPrefixMatch: "^kimi-", IsPlatform: false},
@@ -89,8 +89,9 @@ var Runtimes = map[string][]GenRuntimeRef{
 		{Name: "platform", Models: []string{"openai/gpt-5.4", "openai/gpt-5.4-mini"}},
 	},
 	"google-adk": {
+		{Name: "platform", Models: []string{"platform:gemini-2.5-pro", "platform:gemini-2.5-flash"}},
+		{Name: "google", Models: []string{"gemini-2.5-pro", "gemini-2.5-flash"}},
 		{Name: "vertex", Models: []string{"vertex:gemini-2.5-pro"}},
-		{Name: "google", Models: []string{"gemini-2.5-pro"}},
 	},
 	"hermes": {
 		{Name: "kimi-coding", Models: []string{"kimi-coding/kimi-k2"}},

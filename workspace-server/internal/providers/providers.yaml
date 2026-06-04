@@ -292,7 +292,7 @@ providers:
     # PR-1 simplification when only claude-code referenced platform.
     base_url_template: "https://api.moleculesai.app/api/v1/internal/llm/openai/v1"
     base_url_anthropic: "https://api.moleculesai.app/api/v1/internal/llm/anthropic/v1"
-    auth_env: [ANTHROPIC_API_KEY, MOLECULE_LLM_USAGE_TOKEN]
+    auth_env: [MOLECULE_LLM_USAGE_TOKEN]
     auth_token_env: ANTHROPIC_API_KEY
     # Adapter routes kimi- / moonshot/ through platform by default. No bare
     # vendor prefix of its own; it multiplexes other vendors' slugs. Match
@@ -412,14 +412,24 @@ providers:
     model_prefix_match: "^gemini-"
     model_aliases: []
 
-  # Google Vertex AI — KEYLESS arm (mirrors the anthropic-oauth / anthropic-api
-  # and openai-subscription / openai-api split: same vendor, distinct auth).
-  # google-adk serves Gemini via Vertex using Application Default Credentials
-  # over Workload Identity Federation (AWS EC2 role -> GCP STS -> SA), injected
-  # by the provisioner (cp#416 + envs.yaml vertex block) as a NON-SECRET
-  # external_account cred-config at GOOGLE_APPLICATION_CREDENTIALS. No API key.
-  # Distinct `vertex:` model namespace keeps it unambiguous vs the API-key
-  # `google` vendor's ^gemini- (TestNoAmbiguousModelMatch).
+  # Google Vertex AI — served via the Molecule CP LLM proxy (NOT on-box ADC).
+  # google-adk routes ALL Gemini through the proxy, which mints a Vertex token
+  # server-side over Workload Identity Federation (AWS -> GCP STS -> SA; see
+  # internal/vertexauth + llm_proxy.go google/vertex case) and meters usage to
+  # org credits. The former on-box ADC delivery (a NON-SECRET external_account
+  # cred-config written to /configs/gcp-adc.json via GOOGLE_APPLICATION_CREDENTIALS,
+  # injected by the provisioner) was REMOVED: a tenant has EC2 root and could
+  # have used that credential to call Vertex DIRECTLY, bypassing metering
+  # (keyless-Vertex billing leak — task #64 / RFC internal#763; provisioner
+  # force-off + template routes vertex: through the proxy). The `vertex:`
+  # namespace + this entry remain for proxy routing/billing of Vertex-upstream
+  # requests, distinct from the API-key `google` vendor's ^gemini-
+  # (TestNoAmbiguousModelMatch).
+  #
+  # NOTE: display_name ("keyless ADC") and auth_env (GOOGLE_APPLICATION_CREDENTIALS)
+  # are now VESTIGIAL — no consumer reads auth_env post-leak-fix, but it must stay
+  # non-empty (providers.go validate). Left as-is to keep this a comment-only,
+  # regen-free change; retiring them is a registry-regen follow-up.
   - name: vertex
     display_name: "Google Vertex AI (keyless ADC)"
     vendor_logo: "google"
@@ -844,11 +854,24 @@ runtimes:
   # this runtimes entry declares the selectable model set.
   google-adk:
     providers:
-      # Keyless Vertex (org-compliant default): Gemini via Vertex AI + ADC/WIF.
-      - name: vertex
+      # Platform-managed (keyless, metered) Gemini via the Molecule LLM proxy ->
+      # Vertex AI (server-side WIF mint; NO credential on the tenant box — the
+      # keyless-Vertex leak fix). Resolves to the closed `platform` provider ->
+      # IsPlatform=true -> platform_managed billing + required_env=[] (derived).
+      # The org-compliant default. The runtime translates the `platform:` select
+      # id to the bare wire id the proxy routes to Vertex.
+      - name: platform
         models:
-          - vertex:gemini-2.5-pro
-      # API-key BYOK arm: AI Studio GEMINI_API_KEY/GOOGLE_API_KEY.
+          - platform:gemini-2.5-pro
+          - platform:gemini-2.5-flash
+      # API-key BYOK arm: AI Studio (the tenant's OWN GOOGLE_API_KEY).
       - name: google
         models:
           - gemini-2.5-pro
+          - gemini-2.5-flash
+      # DEPRECATED transitional: vertex: ids stay registered until templates
+      # move to platform: (superseded by the platform arm above). Remove in a
+      # cleanup once no template references vertex:gemini-*.
+      - name: vertex
+        models:
+          - vertex:gemini-2.5-pro
