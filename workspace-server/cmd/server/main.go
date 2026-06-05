@@ -337,6 +337,25 @@ func main() {
 		})
 	}
 
+	// CP-mode instance-state reconciler — authoritative EC2-liveness pass
+	// for SaaS workspaces (core#2261). Every other liveness sweep keys off
+	// a PROXY (Redis TTL, agent heartbeat, local Docker, or
+	// runtime='external'); a SaaS claude-code workspace whose EC2 was
+	// terminated/stopped falls through ALL of them and stays status='online'
+	// pointing at a dead instance_id forever (root cause: core#2247). This
+	// loop asks the ONE authoritative question the others lack —
+	// cpProv.IsRunning (CP DescribeInstances-equivalent) — for each online
+	// SaaS row, and on a CLEAN "not running" feeds it into the SAME
+	// onWorkspaceOffline closure the other sweeps use (status flip +
+	// RestartByID reprovision, existing volume). Fail-safe: IsRunning is
+	// (true, err) on any transient error, so a CP blip never flips a healthy
+	// workspace.
+	if cpProv != nil {
+		go supervised.RunWithRecover(ctx, "cp-instance-reconciler", func(c context.Context) {
+			registry.StartCPInstanceReconciler(c, cpProv, onWorkspaceOffline, 60*time.Second)
+		})
+	}
+
 	// Pending-uploads GC sweep — deletes acked rows past their retention
 	// window plus unacked rows past expires_at. Without this the
 	// pending_uploads table grows unbounded; even with the 24h hard TTL,
