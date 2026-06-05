@@ -11,7 +11,10 @@
 #                                    default + 401, see PR #1714.)
 #
 #   claude-code → auth-aware:
-#                  E2E_MINIMAX_API_KEY    → "MiniMax-M2"
+#                  E2E_MINIMAX_API_KEY    → "minimax:MiniMax-M2.7"
+#                                           (colon-namespaced BYOK id; bare
+#                                            "MiniMax-M2" 400s on a deploy-skewed
+#                                            staging registry — #2263)
 #                  E2E_ANTHROPIC_API_KEY  → "claude-sonnet-4-6"
 #                  otherwise              → "sonnet"
 #
@@ -82,7 +85,17 @@ pick_model_slug() {
     hermes)      printf 'openai/gpt-4o' ;;
     claude-code)
       if [ -n "${E2E_MINIMAX_API_KEY:-}" ]; then
-        printf 'MiniMax-M2'
+        # Namespaced (colon) BYOK id, not bare "MiniMax-M2" (#2263 deploy-skew):
+        # bare ids can lag the deployed staging ws-server's compiled registry,
+        # so workspace-create's validateRegisteredModelForRuntime 400s the bare
+        # form on an older image. The colon-namespaced `minimax:MiniMax-M2.7`
+        # resolves the same way the proven-working sibling `moonshot/kimi-k2.6`
+        # does. It stays in the BYOK `minimax` arm (providers.yaml:851), so
+        # DeriveProvider -> provider_selection=minimax (BYOK) and the #1994
+        # byok-not-platform guard (test_staging_full_saas.sh:1000) still passes —
+        # unlike the slash/platform form `minimax/MiniMax-M2.7`, which resolves
+        # to provider=platform and would trip that guard.
+        printf 'minimax:MiniMax-M2.7'
       elif [ -n "${E2E_ANTHROPIC_API_KEY:-}" ]; then
         printf 'claude-sonnet-4-6'
       else

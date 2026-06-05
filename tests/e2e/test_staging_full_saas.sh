@@ -886,7 +886,7 @@ fi
 # identical on main's scheduled synthetic E2E and on PRs (so it is an
 # environmental backend regression, never PR-introduced).
 if echo "$AGENT_TEXT" | grep -qiF "message contained no text content"; then
-  fail "A2A — EMPTY COMPLETION (backend regression, NOT a platform/workspace-server bug). The configured model (MODEL_SLUG=${MODEL_SLUG:-?}) returned a 2xx completion with no text part; the runtime surfaced 'message contained no text content.'. Operator action: check the staging LLM backend / proxy for the canary model (MiniMax-M2 since #2710) — empty assistant turns, not an auth/quota/boot fault. Raw: $AGENT_TEXT"
+  fail "A2A — EMPTY COMPLETION (backend regression, NOT a platform/workspace-server bug). The configured model (MODEL_SLUG=${MODEL_SLUG:-?}) returned a 2xx completion with no text part; the runtime surfaced 'message contained no text content.'. Operator action: check the staging LLM backend / proxy for the canary model (the claude-code default is minimax:MiniMax-M2.7 since #2263; was bare MiniMax-M2 #2710) — empty assistant turns, not an auth/quota/boot fault. Raw: $AGENT_TEXT"
 fi
 # Generic catch-all — falls through if none of the known regressions hit.
 if echo "$AGENT_TEXT" | grep -qiE "error|exception"; then
@@ -952,7 +952,14 @@ for KA_ATTEMPT in $(seq 1 6); do
   KA_SAFE_BODY=$(printf '%s' "$KA_RESP" | sanitize_http_body)
   # Retry ONLY on transient transport errors — never on an agent-level
   # error (those must surface and fail the gate).
-  if echo "$KA_CODE" | grep -Eq '^(502|503|504)$' && echo "$KA_SAFE_BODY" | grep -Eqi 'Service Unavailable|Bad Gateway|Gateway Timeout|workspace agent unreachable|connection refused|no healthy upstream|workspace agent busy|native_session'; then
+  # #2263: include the Cloudflare-shaped literal `error code: 502/504` token so a
+  # bare edge/gateway 502 (no "Bad Gateway" body) is retried here the same way the
+  # cold-start PONG probe (line ~800) and the delegation loop (line ~1234) already
+  # do. Without it, a single un-retried edge 502 right after a healthy round-trip
+  # fell through to break and failed the gate on the first attempt (Platform Boot
+  # job, task 268859). Bounded by the existing 6-attempt / sleep-10 loop — no new
+  # sleep-as-fix; this only widens the transient-match to the sibling pattern.
+  if echo "$KA_CODE" | grep -Eq '^(502|503|504)$' && echo "$KA_SAFE_BODY" | grep -Eqi 'Service Unavailable|Bad Gateway|Gateway Timeout|error code: 502|error code: 504|workspace agent unreachable|connection refused|no healthy upstream|workspace agent busy|native_session'; then
     log "    known-answer A2A transient $KA_CODE attempt $KA_ATTEMPT/6: $KA_SAFE_BODY"
     if [ "$KA_ATTEMPT" -lt 6 ]; then sleep 10; continue; fi
   fi

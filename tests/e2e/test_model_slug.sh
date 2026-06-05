@@ -49,13 +49,13 @@ run_test "codex → slash-form fallback"                             codex      
 run_test "claude-code → OAuth/default alias"                      claude-code "sonnet"
 
 got=$(unset E2E_MODEL_SLUG E2E_ANTHROPIC_API_KEY; E2E_MINIMAX_API_KEY="mx-test" pick_model_slug claude-code)
-assert_eq "claude-code + MiniMax key → MiniMax model"             "$got" "MiniMax-M2"
+assert_eq "claude-code + MiniMax key → MiniMax model"             "$got" "minimax:MiniMax-M2.7"
 
 got=$(unset E2E_MODEL_SLUG E2E_MINIMAX_API_KEY; E2E_ANTHROPIC_API_KEY="sk-ant-test" pick_model_slug claude-code)
 assert_eq "claude-code + Anthropic API key → Anthropic API model" "$got" "claude-sonnet-4-6"
 
 got=$(unset E2E_MODEL_SLUG; E2E_MINIMAX_API_KEY="mx-priority" E2E_ANTHROPIC_API_KEY="sk-ant-loser" pick_model_slug claude-code)
-assert_eq "claude-code + both keys → MiniMax priority"            "$got" "MiniMax-M2"
+assert_eq "claude-code + both keys → MiniMax priority"            "$got" "minimax:MiniMax-M2.7"
 
 # ── Fallback for unknown runtime ──
 # Picks slash-form (hermes-shaped) since hermes is the historical
