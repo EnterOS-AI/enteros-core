@@ -222,7 +222,7 @@ class TestParseDirectives(unittest.TestCase):
         d = self.parse_ack_revoke("/sop-ack Five-Axis —")
         self.assertEqual(len(d), 1)
         self.assertEqual(d[0][1], "five-axis")
-        self.assertEqual(d[0][2], "—")  # em-dash preserved as note
+        self.assertEqual(d[0][2], "")  # em-dash is separator-only → empty note
 
 
 # ---------------------------------------------------------------------------
