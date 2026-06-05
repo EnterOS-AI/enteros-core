@@ -50,7 +50,11 @@
 # Optional env (mirrors the full-saas harness where they overlap):
 #   E2E_RUNTIME                        claude-code (default)
 #   E2E_PROVISION_TIMEOUT_SECS         default 900 (cold EC2 budget)
-#   E2E_WORKSPACE_ONLINE_TIMEOUT_SECS  default 3600 (cold-boot worst-case)
+#   E2E_WORKSPACE_ONLINE_TIMEOUT_SECS  default 900 (15min). A workspace that
+#                     cannot reach online in 15min is a staging/boot problem,
+#                     not slow cold-boot — fail fast so the trap tears down the
+#                     EC2 instead of hanging ~1h and leaking a running instance
+#                     (observed: run 216031 hung 32min with a live e2e-rec EC2).
 #   E2E_RECONCILE_OFFLINE_TIMEOUT_SECS default 180 (PRIMARY: leave 'online'.
 #                                      Reconciler cadence is 60s — 3 cycles +
 #                                      AWS terminate-visibility slack.)
@@ -82,7 +86,7 @@ CP_URL="${MOLECULE_CP_URL:-https://staging-api.moleculesai.app}"
 ADMIN_TOKEN="${MOLECULE_ADMIN_TOKEN:?MOLECULE_ADMIN_TOKEN required — Railway staging CP_ADMIN_API_TOKEN}"
 RUNTIME="${E2E_RUNTIME:-claude-code}"
 PROVISION_TIMEOUT_SECS="${E2E_PROVISION_TIMEOUT_SECS:-900}"
-WORKSPACE_ONLINE_TIMEOUT_SECS="${E2E_WORKSPACE_ONLINE_TIMEOUT_SECS:-3600}"
+WORKSPACE_ONLINE_TIMEOUT_SECS="${E2E_WORKSPACE_ONLINE_TIMEOUT_SECS:-900}"
 # PRIMARY bound: the reconciler ticks every 60s; it needs one cycle to see
 # the dead instance after AWS makes the terminate visible to DescribeInstances
 # (typically seconds, but can lag). 180s = ~3 cycles + slack.
