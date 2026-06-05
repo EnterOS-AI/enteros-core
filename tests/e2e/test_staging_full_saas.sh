@@ -710,9 +710,21 @@ if [ -n "$PROVISION_TEMPLATE" ]; then
 else
   log "5/11 Provisioning parent workspace (runtime=$RUNTIME)..."
 fi
+# tenant_call inherits CURL_COMMON's --fail-with-body, so a non-2xx create
+# (e.g. the 422 RUNTIME_UNSUPPORTED below) makes curl exit 22. Capturing it
+# bare as $(tenant_call ...) propagates that 22 through the command
+# substitution and, under `set -euo pipefail`, ABORTS the whole script right
+# here — before the `fail "... Response: ..."` handler below can print the
+# body. The result was an opaque `curl: (22) ... error: 422` + teardown with
+# no body (run 220702, main f78fef4c, step "5/11 Provisioning parent
+# workspace"). set +e / `|| true` keeps the 22 from tripping `set -e`; curl
+# still WROTE the body to stdout (that's what --fail-with-body does), so
+# PARENT_RESP holds the 422 JSON and the id-check below surfaces WHY.
+set +e
 PARENT_RESP=$(tenant_call POST /workspaces \
   -H "Content-Type: application/json" \
   -d "$(build_create_payload 'E2E Parent')")
+set -e
 # Surface the workspace-create error CLEARLY instead of dying on a Python
 # KeyError when the response has no 'id'. The load-bearing cases this names:
 #   - google-adk: RUNTIME_UNSUPPORTED 422 if google-adk is absent from the
@@ -733,9 +745,14 @@ log "    PARENT_ID=$PARENT_ID"
 CHILD_ID=""
 if [ "$MODE" = "full" ]; then
   log "6/11 Provisioning child workspace..."
+  # Same --fail-with-body / set -e abort guard as the parent create above:
+  # let a non-2xx return the body so the id-check below surfaces it instead
+  # of the script dying opaquely on curl exit 22.
+  set +e
   CHILD_RESP=$(tenant_call POST /workspaces \
     -H "Content-Type: application/json" \
     -d "$(build_create_payload 'E2E Child' "$PARENT_ID")")
+  set -e
   CHILD_ID=$(echo "$CHILD_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('id',''))" 2>/dev/null || echo "")
   if [ -z "$CHILD_ID" ]; then
     fail "Child workspace create returned no 'id' (runtime=$RUNTIME, template=${PROVISION_TEMPLATE:-<none>}). Response: $(printf '%s' "$CHILD_RESP" | sanitize_http_body)"
