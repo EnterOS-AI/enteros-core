@@ -345,5 +345,75 @@ export default async function globalSetup(_config: FullConfig): Promise<void> {
   process.env.STAGING_TENANT_URL = tenantURL;
   process.env.STAGING_WORKSPACE_ID = workspaceId;
   process.env.STAGING_TENANT_TOKEN = tenantToken;
+  // The ephemeral org's UUID — exported so specs that route through the CP
+  // edge can send X-Molecule-Org-Id (workspace-server TenantGuard). The tabs
+  // harness hits the tenant box same-origin and doesn't need it, but the
+  // take-control gate (staging-display.spec.ts) does.
+  process.env.STAGING_ORG_ID = orgID;
   console.log(`[staging-setup] Ready — ${stateFile}`);
+
+  // 8. (core#2261 Gap 1) Resolve the STANDING desktop-capable org, if one is
+  // configured, for the live take-control e2e (staging-display.spec.ts).
+  //
+  // This block is FULLY env-gated and additive: it provisions NOTHING and is
+  // a no-op unless STAGING_DISPLAY_SLUG is set. We deliberately do NOT spin a
+  // desktop workspace inside this shared setup — a desktop AMI boots in
+  // ~12-15 min and would tax every tabs run. Instead an operator stands up
+  // one always-on desktop org once (a CTO cost item) and points
+  // STAGING_DISPLAY_SLUG + STAGING_DISPLAY_WORKSPACE_ID at it. Here we just
+  // resolve that standing org's tenant URL, admin token, and org id so the
+  // display spec can reach it. Fail-closed: if STAGING_DISPLAY_SLUG is set but
+  // we can't resolve its token/id, we THROW — the gate must never silently
+  // fall back to the (non-desktop) ephemeral org and pass.
+  const displaySlug = process.env.STAGING_DISPLAY_SLUG;
+  if (displaySlug) {
+    console.log(`[staging-setup] Resolving standing desktop org: ${displaySlug}`);
+
+    // org id for the standing slug (admin-orgs row carries it + status).
+    const orgsRes = await jsonFetch(`${CP_URL}/cp/admin/orgs`, { headers: adminAuth });
+    if (orgsRes.status !== 200) {
+      throw new Error(
+        `STAGING_DISPLAY_SLUG=${displaySlug} set, but GET /cp/admin/orgs returned ` +
+          `${orgsRes.status} — cannot resolve the standing desktop org for the ` +
+          `take-control gate.`,
+      );
+    }
+    const displayRow = (orgsRes.body?.orgs || []).find(
+      (o: any) => o.slug === displaySlug,
+    );
+    if (!displayRow?.id) {
+      throw new Error(
+        `STAGING_DISPLAY_SLUG=${displaySlug} not found in /cp/admin/orgs — the ` +
+          `standing desktop org for the take-control gate does not exist. Provision ` +
+          `it (one always-on desktop EC2) or unset STAGING_DISPLAY_SLUG/` +
+          `STAGING_DISPLAY_WORKSPACE_ID to skip the gate.`,
+      );
+    }
+    if (displayRow.instance_status !== "running") {
+      throw new Error(
+        `Standing desktop org ${displaySlug} is '${displayRow.instance_status}', ` +
+          `not 'running' — the take-control gate needs a live desktop tenant. ` +
+          `full row: ${JSON.stringify(displayRow)}`,
+      );
+    }
+
+    const displayTokRes = await jsonFetch(
+      `${CP_URL}/cp/admin/orgs/${displaySlug}/admin-token`,
+      { headers: adminAuth },
+    );
+    if (displayTokRes.status !== 200 || !displayTokRes.body?.admin_token) {
+      throw new Error(
+        `admin-token fetch for standing desktop org ${displaySlug} returned ` +
+          `${displayTokRes.status}: ${JSON.stringify(displayTokRes.body)}`,
+      );
+    }
+
+    process.env.STAGING_DISPLAY_ORG_ID = displayRow.id;
+    process.env.STAGING_DISPLAY_TENANT_URL = `https://${displaySlug}.${TENANT_DOMAIN}`;
+    process.env.STAGING_DISPLAY_TENANT_TOKEN = displayTokRes.body.admin_token;
+    console.log(
+      `[staging-setup] Standing desktop org resolved: ${displaySlug} ` +
+        `(org_id=${displayRow.id}, url=${process.env.STAGING_DISPLAY_TENANT_URL})`,
+    );
+  }
 }
