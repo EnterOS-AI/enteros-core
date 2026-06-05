@@ -175,6 +175,11 @@ jobs:
       E2E_MODEL_SLUG: ${{ github.event.inputs.runtime == 'hermes' && 'openai/gpt-4o' || github.event.inputs.runtime == 'codex' && 'openai/gpt-4o' || github.event.inputs.runtime == 'google-adk' && 'google_genai:gemini-2.5-pro' || 'MiniMax-M2' }}
       E2E_RUN_ID: "${{ github.run_id }}-${{ github.run_attempt }}"
       E2E_KEEP_ORG: ${{ github.event.inputs.keep_org && '1' || '0' }}
+      # Fail-closed-on-skip: in CI the harness MUST prove ≥1 full
+      # provision→online→A2A cycle. If it reaches the end having validated
+      # nothing (a future short-circuit / skip path), it exits 5 rather than
+      # reporting a false green. Mirrors CP serving-e2e SERVING_E2E_REQUIRE_LIVE.
+      E2E_REQUIRE_LIVE: '1'
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -372,6 +377,10 @@ jobs:
       E2E_MODE: smoke
       E2E_RUN_ID: "platform-${{ github.run_id }}-${{ github.run_attempt }}"
       E2E_KEEP_ORG: ${{ github.event.inputs.keep_org && '1' || '0' }}
+      # Fail-closed-on-skip (see BYOK job). smoke mode still runs steps 2/4/7/8b,
+      # so all four required milestones (provisioned/tenant_online/
+      # workspace_online/a2a_roundtrip) fire — the guard is valid for this lane too.
+      E2E_REQUIRE_LIVE: '1'
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
