@@ -641,16 +641,19 @@ for r in (d.get("workspaces") or d.get("results") or []):
 ####################################################################
 # NOTE: this is now a BEST-EFFORT arm, not the REQUIRE-LIVE backbone.
 # mock (run_mock above) is the guaranteed, no-key validation that keeps
-# the gate honest. MiniMax-create is fragile in CI: the namespaced model
-# id minimax:MiniMax-M2.7 is NOT in claude-code's native model set and
-# does NOT resolve via DeriveProvider (its only prefix-owner, byok-minimax,
-# is not wired as a claude-code runtime arm), so the create is rejected
-# 422 UNREGISTERED_MODEL_FOR_RUNTIME before any provisioning (RCA core
-# registry_gen.go Runtimes["claude-code"]). Rather than red the REQUIRED
-# gate on that registry-skew (or on any transient MiniMax provisioning /
-# model-registration issue), this arm reports a best-effort MISS via
-# bestfail() and lets mock carry the validation. If MiniMax DOES come up
-# it validates as a bonus real-LLM check.
+# the gate honest. This arm uses the BARE registered BYOK id `MiniMax-M2.7`
+# (NOT the colon `minimax:MiniMax-M2.7`): on claude-code the colon form is
+# INTENTIONALLY unregistered — the claude-code adapter cannot strip the
+# `minimax:` prefix, so DeriveProvider rejects it 422
+# UNREGISTERED_MODEL_FOR_RUNTIME before any provisioning (provider-registry
+# SSOT, internal#718; pinned by derive_provider_matrix_test.go's
+# colon-vs-slash-vs-bare triple, and observed on real staging job 295075).
+# The bare id is in claude-code's `minimax` arm (registry_gen.go:88
+# Models=[MiniMax-M2,MiniMax-M2.7,MiniMax-M2.7-highspeed,MiniMax-M3]) and
+# derives provider=minimax (BYOK via MINIMAX_API_KEY), so create-validation
+# accepts it. This arm stays BEST-EFFORT (bestfail, non-gating) for transient
+# MiniMax provisioning / backend issues — mock carries the REQUIRED gate; if
+# MiniMax DOES come up it validates as a bonus real-LLM check.
 # Drives the claude-code runtime against MiniMax (BYOK) using the
 # already-present Gitea secret MOLECULE_STAGING_MINIMAX_API_KEY,
 # surfaced into the env as E2E_MINIMAX_API_KEY (same name + secret the
@@ -663,12 +666,12 @@ for r in (d.get("workspaces") or d.get("results") or []):
 #     and routes ANTHROPIC_BASE_URL → api.minimax.io/anthropic. So the
 #     ONLY tenant secret needed is {"MINIMAX_API_KEY": <key>} — exactly
 #     the SECRETS_JSON branch test_staging_full_saas.sh uses.
-#   - Model id is the NAMESPACED colon-form `minimax:MiniMax-M2.7`, the
-#     registered BYOK arm for claude-code (registry_gen.go Runtimes
-#     ["claude-code"]["minimax"]). Per core#2263 the BARE `MiniMax-M2`
-#     id can 400 on a registry-skewed ws-server build; the namespaced
-#     form resolves the way kimi's `moonshot/…` does, so it's the
-#     robust choice for the gate.
+#   - Model id is the BARE `MiniMax-M2.7`, the registered BYOK arm for
+#     claude-code (registry_gen.go:88 Runtimes["claude-code"]["minimax"]
+#     Models). DeriveProvider routes bare → provider=minimax (BYOK). The
+#     colon-namespaced `minimax:MiniMax-M2.7` is UNREGISTERED on claude-code
+#     (the adapter can't strip `minimax:`; internal#718) and 422s create —
+#     it is only the correct BYOK id on openclaw/hermes, which DO strip it.
 run_minimax() {
   echo ""
   echo "=== minimax (claude-code BYOK) happy path ==="
@@ -685,16 +688,18 @@ import json, os
 print(json.dumps({'MINIMAX_API_KEY': os.environ['E2E_MINIMAX_API_KEY']}))
 ")
   local resp wsid
-  # Namespaced BYOK model id (core#2263): bare MiniMax-M2 can 400 on a
-  # registry-skewed ws-server build; minimax:MiniMax-M2.7 is the
-  # registered claude-code BYOK arm and resolves like kimi's moonshot/…
+  # BARE registered BYOK model id `MiniMax-M2.7` (registry_gen.go:88). The
+  # colon form `minimax:MiniMax-M2.7` is UNREGISTERED on claude-code (adapter
+  # can't strip `minimax:`; internal#718) and 422s create — bare derives
+  # provider=minimax (BYOK via MINIMAX_API_KEY) and passes create-validation.
   resp=$(curl -s -X POST "$BASE/workspaces" ${ADMIN_AUTH[@]+"${ADMIN_AUTH[@]}"} -H "Content-Type: application/json" \
-    -d "{\"name\":\"Priority E2E (minimax)\",\"runtime\":\"claude-code\",\"model\":\"minimax:MiniMax-M2.7\",\"tier\":1,\"secrets\":$secrets}")
+    -d "{\"name\":\"Priority E2E (minimax)\",\"runtime\":\"claude-code\",\"model\":\"MiniMax-M2.7\",\"tier\":1,\"secrets\":$secrets}")
   wsid=$(echo "$resp" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("id",""))') || true
   if [ -z "$wsid" ]; then
-    # BEST-EFFORT: MiniMax-create is fragile (see header — the namespaced
-    # model id is registry-skewed → 422). Do NOT red the gate; mock is the
-    # required backbone. Report the create response so the skew is visible.
+    # BEST-EFFORT: real MiniMax create/provision can still miss on transient
+    # backend / provisioning issues (the bare model id itself is registered —
+    # see header). Do NOT red the gate; mock is the required backbone. Report
+    # the create response so any miss is visible.
     bestfail "create minimax workspace (best-effort; mock carries the gate)" "$resp"
     return 0
   fi
