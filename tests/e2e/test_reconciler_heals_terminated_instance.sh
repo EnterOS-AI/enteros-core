@@ -382,6 +382,10 @@ log "    WS_ID=$WS_ID"
 log "    Waiting for workspace to reach status=online (up to $((WORKSPACE_ONLINE_TIMEOUT_SECS/60)) min)..."
 ONLINE_DEADLINE=$(( $(date +%s) + WORKSPACE_ONLINE_TIMEOUT_SECS ))
 ORIGINAL_INSTANCE_ID=""
+ONLINE_SINCE=""
+# Grace before falling back to the AWS workspace tag when the tenant API
+# does not surface instance_id (observed on staging).
+INSTANCE_ID_GRACE_SECS="${E2E_INSTANCE_ID_GRACE_SECS:-45}"
 WS_LAST_STATUS=""
 while true; do
   if [ "$(date +%s)" -gt "$ONLINE_DEADLINE" ]; then
@@ -394,11 +398,27 @@ while true; do
     WS_LAST_STATUS="$WS_STATUS"
   fi
   if [ "$WS_STATUS" = "online" ]; then
+    [ -z "$ONLINE_SINCE" ] && ONLINE_SINCE=$(date +%s)
     ORIGINAL_INSTANCE_ID=$(ws_field "$WS_ID" "instance_id")
     if [ -n "$ORIGINAL_INSTANCE_ID" ]; then
       break
     fi
-    # online but instance_id not surfaced yet — keep polling briefly.
+    # The workspace is online but the tenant API does not surface instance_id
+    # (observed on staging — the DB has it, the API response omits it). After a
+    # short grace, fall back to the AWS workspace-instance tag so the kill step
+    # can proceed. The reconciler reads instance_id from the DB and acts on the
+    # real EC2 regardless of what the API surfaces, so the AWS-tag instance is
+    # the correct kill target. Without this fallback the loop spins to the online
+    # deadline and fails with a misleading "never reached online".
+    if [ $(( $(date +%s) - ONLINE_SINCE )) -ge "$INSTANCE_ID_GRACE_SECS" ]; then
+      # ws-tenant-<slug>-<wsid...> is the workspace EC2 (vs tenant-<slug>).
+      ORIGINAL_INSTANCE_ID=$(e2e_ec2_instances_for_slug "$SLUG" 2>/dev/null \
+        | awk '$2 ~ /^ws-tenant-/ {print $1}' | sort -u | head -1)
+      if [ -n "$ORIGINAL_INSTANCE_ID" ]; then
+        log "    instance_id not surfaced by API after ${INSTANCE_ID_GRACE_SECS}s — using AWS workspace tag: $ORIGINAL_INSTANCE_ID"
+        break
+      fi
+    fi
     log "    $WS_ID online but instance_id not populated yet — waiting"
   fi
   # 'failed' is transient on cold boot (bootstrap-watcher deadline vs heartbeat
