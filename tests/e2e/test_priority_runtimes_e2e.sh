@@ -47,33 +47,34 @@
 # asserts the gate's exit code — no platform, no provisioning, no network.
 # So the false-green can't silently come back: a revert of the guard fails CI.
 #
-# CI POSTURE (deferred live arm — see .gitea/workflows/e2e-api.yml):
-# The live e2e-api job does NOT set E2E_REQUIRE_LIVE, because CI cannot
-# currently provision ANY runtime end-to-end (MiniMax create → 422
-# UNREGISTERED_MODEL_FOR_RUNTIME; the mock org-import arm fails create in CI;
-# claude-code needs an LLM key CI lacks). Forcing E2E_REQUIRE_LIVE=1 there
-# would make the REQUIRED `E2E API Smoke Test` gate permanently RED for
-# everyone. So in CI this script still runs its DB/migration/platform-health
-# arms green, and the zero-validated→RED logic is gated by the bash unit test
-# above instead. Wiring a real live-completion arm into CI (a runtime that
-# actually provisions without a secret CI can't supply) is tracked as a
-# FOLLOW-UP, not this PR.
+# CI POSTURE (REQUIRE-LIVE ON — see .gitea/workflows/e2e-api.yml):
+# The live e2e-api job SETS E2E_REQUIRE_LIVE=1. The `mock` arm is the
+# CI-provisionable live-completion arm: it org-imports a mock workspace
+# (→online→canned A2A reply) with NO external secret. The only thing that
+# previously blocked it in CI was admin auth — POST /org/import and POST
+# /admin/workspaces/:id/tokens are AdminAuth-gated, and the job set no admin
+# token, so every admin call 401'd ("admin auth required"). The job now sets
+# ADMIN_TOKEN on the platform AND exports the matching MOLECULE_ADMIN_TOKEN
+# the scripts send, so mock validates end-to-end and VALIDATED>=1 holds on a
+# healthy platform — the REQUIRED `E2E API Smoke Test` gate now HONESTLY
+# validates a runtime. If the mock plumbing or the admin-auth wiring breaks,
+# the gate goes RED (not false-green). The zero-validated→RED decision is also
+# regression-gated WITHOUT provisioning by the bash unit test above, so a
+# revert of that logic still fails CI.
 #
 # LIVE ARMS (run when their prerequisite is present; opportunistic):
-#   - `mock` (run_mock) is the no-key arm: a virtual workspace (no
-#     container, no EC2, no provider) whose org-import path is INTENDED to
-#     short-circuit to status='online' with a canned A2A reply. NOTE: in the
-#     current CI substrate the mock org-import `create` step FAILS, so mock
-#     does NOT validate in CI today — it is a local/dev arm and a candidate
-#     for the deferred live-completion follow-up, not a CI backbone.
+#   - `mock` (run_mock) is the no-key REQUIRE-LIVE backbone: a virtual
+#     workspace (no container, no EC2, no provider) whose org-import path
+#     short-circuits to status='online' with a canned A2A reply. It validates
+#     in CI now that the e2e-api job wires an admin token (org-import + token
+#     mint are AdminAuth-gated), so it is the guaranteed >=1 validation.
 #   - MiniMax (E2E_MINIMAX_API_KEY, from MOLECULE_STAGING_MINIMAX_API_KEY) is
 #     an OPPORTUNISTIC best-effort real-LLM arm: registry-fragile in CI (422
 #     UNREGISTERED_MODEL_FOR_RUNTIME — see run_minimax header), so a miss is
 #     a best-effort MISS via bestfail() and does NOT red the gate.
-# Because NO arm can currently provision end-to-end in CI, the CI e2e-api job
-# does NOT force E2E_REQUIRE_LIVE (it would red the REQUIRED gate forever).
-# The zero-validated→RED logic is instead regression-gated by the bash unit
-# test (see above). A CI-provisionable live arm is the deferred follow-up.
+# The CI e2e-api job sets E2E_REQUIRE_LIVE=1: mock guarantees a validation, so
+# the REQUIRED gate is honest (RED if the mock plumbing/admin-auth breaks). The
+# zero-validated→RED logic is also regression-gated by the bash unit test above.
 #
 # Usage:
 #   # Enforce REQUIRE-LIVE locally (need >=1 arm to actually validate):
@@ -544,8 +545,17 @@ run_mock() {
   # mock never USES the model, so any non-empty value satisfies the
   # contract. The org-import path does not run the Create handler's
   # registry model-validation, so "mock" is accepted as-is.
+  # POST /org/import is AdminAuth-gated (router.go:778). When the platform has
+  # ADMIN_TOKEN set (as the e2e-api CI job now does), an unauthenticated import
+  # 401s with {"error":"admin auth required"}. Send the same admin bearer the
+  # mint helper uses (MOLECULE_ADMIN_TOKEN, ADMIN_TOKEN fallback) — guarded so a
+  # bootstrap/dev platform with no admin token (fail-open) still works.
+  local admin_bearer="${MOLECULE_ADMIN_TOKEN:-${ADMIN_TOKEN:-}}"
+  local admin_auth=()
+  [ -n "$admin_bearer" ] && admin_auth=(-H "Authorization: Bearer $admin_bearer")
   local import_resp wsid
   import_resp=$(curl -s -X POST "$BASE/org/import" -H "Content-Type: application/json" \
+    ${admin_auth[@]+"${admin_auth[@]}"} \
     -d '{
       "template": {
         "name": "Priority E2E Mock Org",
@@ -555,26 +565,30 @@ run_mock() {
         ]
       }
     }')
-  # org-import returns {"results":[{"id":...,"name":...}, ...]} (plus
-  # reconcile counters). Pull the id of the single workspace we declared.
+  # org-import returns {"org":..., "count":N, "workspaces":[{"id":...,
+  # "name":...,"tier":...}, ...]} (handlers/org.go:898-901). Pull the id of
+  # the single workspace we declared. (Older "results" key fallback kept for
+  # forward/back compat in case the response shape is ever versioned.)
   wsid=$(echo "$import_resp" | python3 -c '
 import json, sys
 try:
     d = json.load(sys.stdin)
 except Exception:
     sys.exit(0)
-for r in (d.get("results") or []):
+for r in (d.get("workspaces") or d.get("results") or []):
     if r.get("name") == "Priority E2E (mock)" and r.get("id"):
         print(r["id"]); break
 ') || true
   if [ -z "$wsid" ]; then
-    # CI's e2e-api platform cannot org-import a mock workspace (observed in
-    # CI: create returns no id). Treat as a best-effort MISS, not a hard FAIL,
-    # so it never reds the required gate — the false-green LOGIC is gated by
-    # tests/e2e/test_require_live_priority_gate_unit.sh, not by a live arm CI
-    # can't run. Where the platform CAN create a mock (local / future CI), the
-    # online/token/reply checks below still hard-fail on a real mock break.
-    bestfail "create mock workspace (org-import; CI cannot create mock — best-effort)" "$import_resp"
+    # mock org-import is the REQUIRE-LIVE backbone and is EXPECTED to succeed in
+    # CI now that the e2e-api job wires an admin token (ADMIN_TOKEN on the
+    # platform + MOLECULE_ADMIN_TOKEN sent above). A missing id here is a REAL
+    # break (admin-auth wiring, org-import create, or the mock short-circuit) and
+    # MUST red the gate — so this is a hard fail(), not a best-effort miss. Under
+    # E2E_REQUIRE_LIVE=1 a FAIL also forces a non-zero exit via
+    # evaluate_require_live_gate. Surface the response so the break is visible
+    # (e.g. {"error":"admin auth required"} would mean the token wiring regressed).
+    fail "create mock workspace (org-import)" "$import_resp"
     return 0
   fi
   CREATED_WSIDS+=("$wsid")

@@ -53,15 +53,21 @@ e2e_delete_workspace() {
   if [ -z "$wid" ]; then
     return 0
   fi
+  # ${curl_args[@]+"…"} guard: under `set -u` an empty array expands to an
+  # "unbound variable" error on bash <4.4 (macOS 3.2, some Linux). This form
+  # expands to nothing when the array is empty. Callers from the priority-
+  # runtimes EXIT trap pass no extra curl args, so the array IS empty there —
+  # without the guard the trap aborts non-zero AFTER the gate already passed,
+  # turning a validated run RED. (Same idiom already used for CREATED_WSIDS.)
   if [ -z "$name" ]; then
-    name=$(curl -s "$BASE/workspaces/$wid" "${curl_args[@]}" | python3 -c "import json,sys
+    name=$(curl -s "$BASE/workspaces/$wid" ${curl_args[@]+"${curl_args[@]}"} | python3 -c "import json,sys
 try:
   print(json.load(sys.stdin).get('name',''))
 except Exception:
   pass" 2>/dev/null || true)
   fi
   curl -s -X DELETE "$BASE/workspaces/$wid?confirm=true" \
-    -H "X-Confirm-Name: $name" "${curl_args[@]}" > /dev/null || true
+    -H "X-Confirm-Name: $name" ${curl_args[@]+"${curl_args[@]}"} > /dev/null || true
 }
 
 e2e_cleanup_all_workspaces() {
