@@ -49,6 +49,10 @@ func TestDiscover_WorkspaceNotFound_WithCaller(t *testing.T) {
 	setupTestRedis(t)
 	handler := NewDiscoveryHandler()
 
+	// validateDiscoveryCaller probes HasAnyLiveToken(callerID) first;
+	// grandfather (count=0) so the bearer-less request is allowed through.
+	seedDiscoveryGrandfather(mock, "ws-caller")
+
 	// CanCommunicate will need DB lookups — both workspace name lookups
 	// For the access check: caller lookup succeeds, target lookup fails
 	mock.ExpectQuery("SELECT id, parent_id FROM workspaces WHERE id =").
@@ -113,6 +117,9 @@ func TestPeers_WithParent(t *testing.T) {
 	setupTestRedis(t)
 	handler := NewDiscoveryHandler()
 
+	// validateDiscoveryCaller probes HasAnyLiveToken(:id) first; grandfather.
+	seedDiscoveryGrandfather(mock, "ws-sibling-1")
+
 	// Expect parent_id lookup for the requesting workspace
 	mock.ExpectQuery("SELECT parent_id FROM workspaces WHERE id =").
 		WithArgs("ws-sibling-1").
@@ -165,6 +172,9 @@ func TestPeers_NotFound(t *testing.T) {
 	setupTestRedis(t)
 	handler := NewDiscoveryHandler()
 
+	// validateDiscoveryCaller probes HasAnyLiveToken(:id) first; grandfather.
+	seedDiscoveryGrandfather(mock, "ws-ghost")
+
 	// Workspace not found
 	mock.ExpectQuery("SELECT parent_id FROM workspaces WHERE id =").
 		WithArgs("ws-ghost").
@@ -191,6 +201,11 @@ func TestPeers_DBError(t *testing.T) {
 	setupTestRedis(t)
 	handler := NewDiscoveryHandler()
 
+	// Auth probe grandfathers; this test targets a DB error on the
+	// *handler-body* parent_id query → 500 (distinct from the auth-probe
+	// DB error which now fails closed with 503).
+	seedDiscoveryGrandfather(mock, "ws-dberr")
+
 	mock.ExpectQuery("SELECT parent_id FROM workspaces WHERE id =").
 		WithArgs("ws-dberr").
 		WillReturnError(sql.ErrConnDone)
@@ -215,6 +230,9 @@ func TestPeers_RootWorkspace_NoPeers(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
 	handler := NewDiscoveryHandler()
+
+	// validateDiscoveryCaller probes HasAnyLiveToken(:id) first; grandfather.
+	seedDiscoveryGrandfather(mock, "ws-root-alone")
 
 	// Root workspace (parent_id is NULL)
 	mock.ExpectQuery("SELECT parent_id FROM workspaces WHERE id =").
@@ -269,6 +287,9 @@ func peersFilterFixture(t *testing.T) (*DiscoveryHandler, sqlmock.Sqlmock) {
 	t.Helper()
 	mock := setupTestDB(t)
 	setupTestRedis(t)
+
+	// validateDiscoveryCaller probes HasAnyLiveToken(:id) first; grandfather.
+	seedDiscoveryGrandfather(mock, "ws-self")
 
 	mock.ExpectQuery("SELECT parent_id FROM workspaces WHERE id =").
 		WithArgs("ws-self").
@@ -947,6 +968,24 @@ func peersAuthFixtureHasLiveToken(mock sqlmock.Sqlmock, workspaceID string) {
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
 }
 
+// seedDiscoveryGrandfather seeds the FIRST query validateDiscoveryCaller
+// issues (HasAnyLiveToken → 0 = legacy / pre-upgrade) so a bearer-less
+// discovery request grandfathers through and the test can exercise the
+// handler body.
+//
+// (harden/no-fail-open-auth) Before this branch, validateDiscoveryCaller
+// returned nil (allow) when the HasAnyLiveToken probe ERRORED — so these
+// handler-body tests never had to seed the probe at all; the unmatched
+// COUNT query erred and the fail-open swallowed it. Now that the DB-error
+// path fails CLOSED (503), the probe must be seeded explicitly. count=0 is
+// the legitimate grandfather path (no live tokens for this workspace yet),
+// which is what these pre-existing tests intend.
+func seedDiscoveryGrandfather(mock sqlmock.Sqlmock, workspaceID string) {
+	mock.ExpectQuery("SELECT COUNT.+workspace_auth_tokens").
+		WithArgs(workspaceID).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+}
+
 func TestPeers_DevMode_BearerlessRequest_FailsClosed(t *testing.T) {
 	// (harden/no-fail-open-auth) Exact old-hatch conditions:
 	// MOLECULE_ENV=development AND ADMIN_TOKEN empty, with a live token in
@@ -1025,6 +1064,70 @@ func TestPeers_DevModeFailOpen_ClosedInProduction(t *testing.T) {
 	}
 }
 
+// TestPeers_AuthProbeDBError_FailsClosed pins the removal of
+// validateDiscoveryCaller's fail-open-on-DB-error branch
+// (harden/no-fail-open-auth). When the HasAnyLiveToken auth probe ERRORS, the
+// request must NOT be allowed through — it now returns 503 (availability
+// tradeoff that grants NO access). Before this branch the function returned nil
+// (allow) on a DB hiccup, so the request reached the peer queries.
+//
+// Watch-it-fail: restore `if err != nil { log; return nil }` in
+// validateDiscoveryCaller → this flips 503→(200/handler path) and fails.
+func TestPeers_AuthProbeDBError_FailsClosed(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewDiscoveryHandler()
+
+	// The FIRST query validateDiscoveryCaller issues (HasAnyLiveToken) errors.
+	// No further expectations: a fail-closed 503 must be written before the
+	// peer-list queries run.
+	mock.ExpectQuery("SELECT COUNT.+workspace_auth_tokens").
+		WithArgs("ws-dberr-auth").
+		WillReturnError(sql.ErrConnDone)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-dberr-auth"}}
+	c.Request = httptest.NewRequest("GET", "/registry/ws-dberr-auth/peers", nil)
+
+	handler.Peers(c)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("auth-probe DB error must fail CLOSED: expected 503, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// TestDiscover_AuthProbeDBError_FailsClosed is the Discover-endpoint companion
+// to TestPeers_AuthProbeDBError_FailsClosed: a HasAnyLiveToken error on the
+// caller's discovery request fails CLOSED with 503 (was: fail-open allow).
+func TestDiscover_AuthProbeDBError_FailsClosed(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewDiscoveryHandler()
+
+	mock.ExpectQuery("SELECT COUNT.+workspace_auth_tokens").
+		WithArgs("ws-caller").
+		WillReturnError(sql.ErrConnDone)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-target"}}
+	c.Request = httptest.NewRequest("GET", "/registry/discover/ws-target", nil)
+	c.Request.Header.Set("X-Workspace-ID", "ws-caller")
+
+	handler.Discover(c)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("Discover auth-probe DB error must fail CLOSED: expected 503, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
 // ==================== Peers — #383 self never appears in result ====================
 
 // TestPeers_ExcludeSelf_DefenseInDepth verifies the final-line filter in
@@ -1046,6 +1149,9 @@ func TestPeers_ExcludeSelf_DefenseInDepth(t *testing.T) {
 	handler := NewDiscoveryHandler()
 
 	const selfID = "ws-xiaodong"
+
+	// validateDiscoveryCaller probes HasAnyLiveToken(:id) first; grandfather.
+	seedDiscoveryGrandfather(mock, selfID)
 
 	// parent_id lookup — workspace has a parent.
 	mock.ExpectQuery("SELECT parent_id FROM workspaces WHERE id =").

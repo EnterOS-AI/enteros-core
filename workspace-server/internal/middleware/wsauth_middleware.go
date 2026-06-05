@@ -272,34 +272,46 @@ func cpSessionActor(cookieHeader string) string {
 // Accepts either:
 //
 //  1. A valid bearer token (same contract as AdminAuth) — covers molecli,
-//     agent-to-platform calls, and anyone using the API directly.
-//  2. A browser Origin header that matches CORS_ORIGINS (canvas itself).
-//     This is NOT a strict auth boundary — curl can forge Origin — but for
-//     cosmetic-only routes the trade-off is acceptable. Non-cosmetic routes
-//     MUST NOT use this middleware (see #194 review on why it would re-open
-//     #164 CRITICAL if applied to /bundles/import).
+//     agent-to-platform calls, the browser canvas (which now sends
+//     Authorization: Bearer $NEXT_PUBLIC_ADMIN_TOKEN on every platform
+//     call — see canvas/src/lib/api.ts platformAuthHeaders), and anyone
+//     using the API directly.
+//  2. A same-origin canvas request (Referer/Host match), but ONLY when the
+//     combined-tenant canvas proxy is active (CANVAS_PROXY_URL set). This is
+//     a real same-origin check the browser cannot forge cross-origin (see
+//     isSameOriginCanvas / IsVerifiedCanvasSession, #623/#194) — NOT the
+//     trivially-forgeable cross-origin Origin header. The forgeable
+//     CORS_ORIGINS Origin-match path was REMOVED under the CTO
+//     "nothing fail-open" directive (a no-bearer request passing purely on a
+//     spoofable Origin is effectively open even for a cosmetic route, and is
+//     no longer needed now that the canvas always sends a bearer).
 //
-// Lazy-bootstrap fail-open preserved: zero-token installs pass everything
-// through so fresh self-hosted / dev sessions aren't bricked.
+// Non-cosmetic routes MUST NOT use this middleware (see #194 review on why it
+// would re-open #164 CRITICAL if applied to /bundles/import).
+//
+// (harden/no-fail-open-auth) Two former fail-open branches are REMOVED:
+//   - DB-error on HasAnyLiveTokenGlobal used to `c.Next()` (allow); it now
+//     fails CLOSED with 503 (availability tradeoff that grants NO access).
+//   - The lazy-bootstrap pass (`!hasLive ⇒ c.Next()`) used to let a
+//     zero-token install through EVERYTHING; it is gone. Bootstrap is now via
+//     ADMIN_TOKEN (provisioned by scripts/dev-start.sh for local dev,
+//     operator/SaaS-set in production) — local mimics production.
 func CanvasOrBearer(database *sql.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		ctx := c.Request.Context()
 
-		hasLive, err := wsauth.HasAnyLiveTokenGlobal(ctx, database)
-		if err != nil {
-			log.Printf("wsauth: CanvasOrBearer HasAnyLiveTokenGlobal failed: %v — allowing request", err)
-			c.Next()
-			return
-		}
-		if !hasLive {
-			c.Next()
+		// Probe global token state for the (no-bearer) same-origin path
+		// below. Fail CLOSED on a datastore error — an availability tradeoff
+		// that does NOT grant access (was: log + c.Next() fail-open).
+		if _, err := wsauth.HasAnyLiveTokenGlobal(ctx, database); err != nil {
+			abortAuthLookupError(c, "CanvasOrBearer: HasAnyLiveTokenGlobal", err)
 			return
 		}
 
 		// Path 1: bearer present → bearer MUST validate. Do not fall through
-		// to Origin on an invalid bearer — an attacker with a revoked /
-		// expired token + a matching Origin would otherwise bypass auth.
-		// Empty bearer → skip to Origin path (canvas never sends one).
+		// to the same-origin path on an invalid bearer — an attacker with a
+		// revoked / expired token would otherwise bypass auth.
+		// Empty bearer → fall to the same-origin canvas path.
 		if tok := wsauth.BearerTokenFromHeader(c.GetHeader("Authorization")); tok != "" {
 			// Admin token accepted for canvas dashboard
 			adminSecret := os.Getenv("ADMIN_TOKEN")
@@ -315,13 +327,10 @@ func CanvasOrBearer(database *sql.DB) gin.HandlerFunc {
 			return
 		}
 
-		// Path 2: canvas origin match (cross-origin canvas).
-		if canvasOriginAllowed(c.GetHeader("Origin")) {
-			c.Next()
-			return
-		}
-
-		// Path 3: same-origin canvas (tenant image).
+		// Path 2: same-origin canvas (combined-tenant image). Gated behind
+		// canvasProxyActive (CANVAS_PROXY_URL) and a non-forgeable
+		// Referer/Host same-origin check — NOT the spoofable cross-origin
+		// Origin header (that path was removed, see doc comment above).
 		if isSameOriginCanvas(c) {
 			c.Next()
 			return
@@ -331,30 +340,14 @@ func CanvasOrBearer(database *sql.DB) gin.HandlerFunc {
 	}
 }
 
-// canvasOriginAllowed returns true if origin matches any entry in the
-// CORS_ORIGINS env var (comma-separated) or the localhost defaults.
-// Exact-match only; no prefix or wildcard logic — that's handled by the
-// real CORS middleware upstream. The intent here is "did this request come
-// from the canvas page the user is already logged into?" — a binary check.
-func canvasOriginAllowed(origin string) bool {
-	if origin == "" {
-		return false
-	}
-	allowed := []string{"http://localhost:3000", "http://localhost:3001"}
-	if v := os.Getenv("CORS_ORIGINS"); v != "" {
-		for _, o := range strings.Split(v, ",") {
-			if o = strings.TrimSpace(o); o != "" {
-				allowed = append(allowed, o)
-			}
-		}
-	}
-	for _, a := range allowed {
-		if a == origin {
-			return true
-		}
-	}
-	return false
-}
+// (harden/no-fail-open-auth) canvasOriginAllowed was REMOVED. It matched a
+// request's (trivially forgeable, cross-origin) Origin header against
+// CORS_ORIGINS and was the basis of CanvasOrBearer's no-bearer Origin-match
+// pass — effectively open to any curl that sets a matching Origin. Under the
+// CTO "nothing fail-open" directive that path is gone; the canvas now always
+// sends a bearer (NEXT_PUBLIC_ADMIN_TOKEN), so nothing legitimate relied on it.
+// The CORS *response-header* allowlist is handled by the real CORS middleware
+// upstream, unaffected by this removal.
 
 // isSameOriginCanvas returns true when the request appears to come from the
 // canvas UI served by the same Go process (tenant image). In this topology,

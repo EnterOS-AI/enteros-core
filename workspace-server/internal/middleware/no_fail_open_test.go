@@ -116,6 +116,84 @@ func TestWorkspaceAuth_NoFailOpen_UnderOldHatchConditions(t *testing.T) {
 	}
 }
 
+// TestCanvasOrBearer_NoFailOpen_UnderOldHatchConditions is the regression gate
+// for the two fail-open branches removed from CanvasOrBearer
+// (harden/no-fail-open-auth, "nothing fail-open" pass 2):
+//
+//	(a) lazy-bootstrap pass: `if !hasLive { c.Next(); return }` — a zero-token
+//	    install used to pass EVERYTHING through. Now a bearer-less request on a
+//	    fresh install (HasAnyLiveTokenGlobal → 0) fails CLOSED with 401.
+//	(b) fail-open-on-DB-error: `if err != nil { log; c.Next(); return }` — a
+//	    HasAnyLiveTokenGlobal error used to ALLOW. Now it fails CLOSED with 503.
+//
+// Watch-it-fail: restore either short-circuit in CanvasOrBearer and the
+// matching sub-case flips (401→200 / 503→200) and fails.
+func TestCanvasOrBearer_NoFailOpen_UnderOldHatchConditions(t *testing.T) {
+	// (a) Fresh install (0 live tokens), no bearer, no ADMIN_TOKEN → 401.
+	t.Run("zero_token_install_no_bearer_fails_closed_401", func(t *testing.T) {
+		t.Setenv("ADMIN_TOKEN", "")
+		t.Setenv("CORS_ORIGINS", "")
+
+		mockDB, mock, err := sqlmock.New()
+		if err != nil {
+			t.Fatalf("sqlmock.New: %v", err)
+		}
+		defer mockDB.Close()
+
+		mock.ExpectQuery(hasAnyLiveTokenGlobalQuery).
+			WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+
+		handlerCalled := false
+		r := gin.New()
+		r.PUT("/canvas/viewport", CanvasOrBearer(mockDB), func(c *gin.Context) {
+			handlerCalled = true
+			c.JSON(http.StatusOK, gin.H{"ok": true})
+		})
+
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest(http.MethodPut, "/canvas/viewport", nil)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusUnauthorized {
+			t.Errorf("CanvasOrBearer lazy-bootstrap fail-open removed: zero-token install must 401, got %d: %s",
+				w.Code, w.Body.String())
+		}
+		if handlerCalled {
+			t.Error("handler reached on a fresh-install bearer-less request — lazy-bootstrap fail-open not removed")
+		}
+	})
+
+	// (b) Auth datastore error → 503 (NOT allow).
+	t.Run("db_error_fails_closed_503", func(t *testing.T) {
+		mockDB, mock, err := sqlmock.New()
+		if err != nil {
+			t.Fatalf("sqlmock.New: %v", err)
+		}
+		defer mockDB.Close()
+
+		mock.ExpectQuery(hasAnyLiveTokenGlobalQuery).
+			WillReturnError(http.ErrAbortHandler) // any non-nil error suffices
+
+		handlerCalled := false
+		r := gin.New()
+		r.PUT("/canvas/viewport", CanvasOrBearer(mockDB), func(c *gin.Context) {
+			handlerCalled = true
+			c.JSON(http.StatusOK, gin.H{"ok": true})
+		})
+
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest(http.MethodPut, "/canvas/viewport", nil)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusServiceUnavailable {
+			t.Errorf("CanvasOrBearer DB-error fail-open removed: must 503, got %d: %s", w.Code, w.Body.String())
+		}
+		if handlerCalled {
+			t.Error("handler reached on a datastore-error request — DB-error fail-open not removed")
+		}
+	})
+}
+
 // TestNoFailOpenAuthHelperReexists is a source-guard: it asserts that no
 // fail-open auth helper (the removed isDevModeFailOpen / IsDevModeFailOpen)
 // has crept back into the middleware package as real code. The replacement

@@ -1,24 +1,30 @@
 #!/usr/bin/env bash
-# E2E regression suite for the local-dev escape hatches added in
-# fix/quickstart-bugless. These cover the exact user-facing breakages
-# that dropped out of the partial squash-merge of PR #1871:
+# E2E regression suite asserting that "dev mode" is fail-CLOSED.
 #
-#   1. GET /workspaces returns 200 with no bearer after tokens exist in
-#      the DB — exercises the AdminAuth Tier-1b dev-mode hatch
-#      (middleware/devmode.go::isDevModeFailOpen).
-#   2. GET /workspaces/:id/activity returns 200 with no bearer — the
-#      same hatch applied to WorkspaceAuth.
-#   3. POST /workspaces/:id/a2a doesn't 502-SSRF on a loopback workspace
-#      URL — exercises handlers/ssrf.go::devModeAllowsLoopback.
-#   4. GET /org/templates returns the curated set populated by
-#      clone-manifest.sh — exercises infra/scripts/setup.sh + the
-#      ListTemplates failure logging in handlers/org.go.
+# History: this file used to assert the local-dev fail-open escape hatches
+# (GET /workspaces 200 with NO bearer, /workspaces/:id/activity 200 with no
+# bearer) added in fix/quickstart-bugless. Under the CTO "nothing should be
+# fail-open" directive (harden/no-fail-open-auth) those hatches were REMOVED:
+# auth is fail-CLOSED in EVERY environment, local dev included. This suite now
+# pins the inverse contract — bearer-less admin/workspace requests 401, and the
+# SAME requests with the dev ADMIN_TOKEN bearer succeed.
 #
-# Requires: platform running on :8080 with MOLECULE_ENV=development and
-#           ADMIN_TOKEN unset. Matches the README quickstart env.
+# What it verifies:
+#   1. GET /workspaces 401s with NO bearer once tokens exist (was: 200 via the
+#      removed AdminAuth Tier-1b dev-mode hatch); 200 WITH the admin bearer.
+#   2. GET /workspaces/:id/activity (and /delegations, /approvals/pending) 401
+#      with no bearer (was: 200 via the WorkspaceAuth hatch); 200 WITH bearer.
+#   3. GET /org/templates returns the curated set populated by clone-manifest.sh
+#      (unauth-readable bootstrap surface — unchanged).
+#
+# Requires: platform running on :8080 with MOLECULE_ENV=development AND
+#           ADMIN_TOKEN set (the dev value), with MOLECULE_ADMIN_TOKEN (or
+#           ADMIN_TOKEN) exported here so the suite can present the bearer.
+#           scripts/dev-start.sh provisions ADMIN_TOKEN locally; the e2e-api CI
+#           job sets it on the platform and exports the matching bearer.
 #
 # Usage:
-#   bash tests/e2e/test_dev_mode.sh
+#   MOLECULE_ADMIN_TOKEN=dev-local-admin-token bash tests/e2e/test_dev_mode.sh
 set -euo pipefail
 
 # shellcheck source=_lib.sh
@@ -46,35 +52,44 @@ check_http() {
   fi
 }
 
-echo "=== Dev-mode escape-hatch regression tests ==="
+echo "=== Dev-mode fail-CLOSED regression tests ==="
 echo ""
 
-# Pre-test: ensure MOLECULE_ENV=development and no ADMIN_TOKEN are in the
-# platform's env. The request path doesn't let us read the platform's
-# env directly, but we can verify the hatch is active by confirming the
-# expected behaviour under the conditions the test otherwise sets up.
+# The platform is fail-closed in every environment now, so the suite MUST have
+# the admin bearer to drive the authenticated (200) assertions. Without it we
+# cannot create / clean up workspaces — bail loudly rather than silently skip.
+ADMIN_BEARER="${MOLECULE_ADMIN_TOKEN:-${ADMIN_TOKEN:-}}"
+if [ -z "$ADMIN_BEARER" ]; then
+  echo "FAIL: MOLECULE_ADMIN_TOKEN/ADMIN_TOKEN not set — auth is fail-closed in"
+  echo "      every environment, so this suite needs the dev ADMIN_TOKEN bearer."
+  echo "      e.g. MOLECULE_ADMIN_TOKEN=dev-local-admin-token bash $0"
+  exit 1
+fi
+ADMIN_AUTH=(-H "Authorization: Bearer $ADMIN_BEARER")
 
 e2e_cleanup_all_workspaces
 
 # ----------------------------------------------------------------------
-# Section 1 — AdminAuth dev-mode hatch
+# Section 1 — AdminAuth is fail-CLOSED (dev-mode hatch removed)
 # ----------------------------------------------------------------------
-# Before fix: once any workspace had tokens in the DB, GET /workspaces
-# closed to unauthenticated callers and the Canvas broke. The hatch
-# keeps it open specifically in dev mode.
+echo "--- Section 1: AdminAuth fail-closed ---"
 
-echo "--- Section 1: AdminAuth dev-mode hatch ---"
-
+# No bearer → 401 in dev mode (the removed hatch used to return 200).
 R=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/workspaces")
-check_http "GET /workspaces (empty DB)" "200" "$R"
+check_http "GET /workspaces (no bearer) is fail-CLOSED" "401" "$R"
 
-# Create a workspace so tokens land in the DB.
+# With the dev admin bearer → 200.
+R=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/workspaces" "${ADMIN_AUTH[@]}")
+check_http "GET /workspaces (with admin bearer)" "200" "$R"
+
+# Create a workspace (authenticated) so tokens land in the DB.
 R=$(curl -s -w "\n%{http_code}" -X POST "$BASE/workspaces" \
+  "${ADMIN_AUTH[@]}" \
   -H "Content-Type: application/json" \
   -d '{"name":"Dev-Mode-Test","tier":1,"runtime":"external","external":true}')
 CODE=$(echo "$R" | tail -n1)
 BODY=$(echo "$R" | sed '$d')
-check_http "POST /workspaces (create)" "201" "$CODE"
+check_http "POST /workspaces (create, with admin bearer)" "201" "$CODE"
 
 WS_ID=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))" 2>/dev/null || true)
 if [ -z "$WS_ID" ]; then
@@ -83,43 +98,55 @@ if [ -z "$WS_ID" ]; then
   exit 1
 fi
 
-# Ensure a real workspace token exists so AdminAuth now sees a live token. On
-# pre-fix builds the next /workspaces call would 401 — on post-fix it
-# must stay 200 because MOLECULE_ENV=development + ADMIN_TOKEN unset.
+# Ensure a real workspace token exists so AdminAuth sees a live token globally.
 TOKEN=$(echo "$BODY" | e2e_extract_token)
 if [ -z "$TOKEN" ]; then
   e2e_mint_workspace_token "$WS_ID" >/dev/null
 fi
 
+# With tokens now in the DB, the bearer-less call STILL 401s (no lazy-bootstrap
+# / dev-mode fall-through), and the authenticated call still 200s.
 R=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/workspaces")
-check_http "GET /workspaces (after token minted, no bearer)" "200" "$R"
+check_http "GET /workspaces (after token minted, no bearer) is fail-CLOSED" "401" "$R"
+
+R=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/workspaces" "${ADMIN_AUTH[@]}")
+check_http "GET /workspaces (after token minted, with admin bearer)" "200" "$R"
 
 # ----------------------------------------------------------------------
-# Section 2 — WorkspaceAuth dev-mode hatch
+# Section 2 — WorkspaceAuth is fail-CLOSED (dev-mode hatch removed)
 # ----------------------------------------------------------------------
-# Before fix: /workspaces/:id/activity 401'd once tokens existed —
-# the Canvas side panel's chat history load broke.
-
 echo ""
-echo "--- Section 2: WorkspaceAuth dev-mode hatch ---"
+echo "--- Section 2: WorkspaceAuth fail-closed ---"
 
+# No bearer → 401 (the removed hatch used to return 200).
 R=$(curl -s -o /dev/null -w "%{http_code}" \
   "$BASE/workspaces/$WS_ID/activity?type=a2a_receive&limit=50")
-check_http "GET /workspaces/:id/activity (no bearer)" "200" "$R"
+check_http "GET /workspaces/:id/activity (no bearer) is fail-CLOSED" "401" "$R"
 
 R=$(curl -s -o /dev/null -w "%{http_code}" \
   "$BASE/workspaces/$WS_ID/delegations")
-check_http "GET /workspaces/:id/delegations (no bearer)" "200" "$R"
+check_http "GET /workspaces/:id/delegations (no bearer) is fail-CLOSED" "401" "$R"
 
 R=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/approvals/pending")
-check_http "GET /approvals/pending (no bearer)" "200" "$R"
+check_http "GET /approvals/pending (no bearer) is fail-CLOSED" "401" "$R"
+
+# Same requests WITH the admin bearer → 200.
+R=$(curl -s -o /dev/null -w "%{http_code}" \
+  "$BASE/workspaces/$WS_ID/activity?type=a2a_receive&limit=50" "${ADMIN_AUTH[@]}")
+check_http "GET /workspaces/:id/activity (with admin bearer)" "200" "$R"
+
+R=$(curl -s -o /dev/null -w "%{http_code}" \
+  "$BASE/workspaces/$WS_ID/delegations" "${ADMIN_AUTH[@]}")
+check_http "GET /workspaces/:id/delegations (with admin bearer)" "200" "$R"
+
+R=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/approvals/pending" "${ADMIN_AUTH[@]}")
+check_http "GET /approvals/pending (with admin bearer)" "200" "$R"
 
 # ----------------------------------------------------------------------
 # Section 3 — Template registry populated by setup.sh
 # ----------------------------------------------------------------------
-# Before fix: setup.sh didn't run clone-manifest.sh so the template
-# palette was empty and the molecule-dev in-tree copy was broken.
-
+# GET /org/templates is an unauthenticated bootstrap surface (the template
+# palette must render before the user has a credential) — unchanged.
 echo ""
 echo "--- Section 3: Template registry ---"
 

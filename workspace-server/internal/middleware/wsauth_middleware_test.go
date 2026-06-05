@@ -1116,7 +1116,16 @@ func TestAdminAuth_Issue120_PatchWorkspace_NoBearer_Returns401(t *testing.T) {
 // Accepts bearer or a matching Origin header. MUST NOT be used anywhere a
 // forged request would leak data or create resources.
 
-func TestCanvasOrBearer_NoTokens_FailOpen(t *testing.T) {
+// TestCanvasOrBearer_NoTokens_FailsClosed pins the removal of the
+// lazy-bootstrap fail-open (harden/no-fail-open-auth): a zero-token install
+// must NOT pass everything through. A bearer-less request on a fresh install
+// (HasAnyLiveTokenGlobal → 0) now 401s. Bootstrap is via ADMIN_TOKEN
+// (scripts/dev-start.sh provisions it for local dev; operator/SaaS sets it in
+// production) — not a zero-config fail-open.
+//
+// Watch-it-fail: restore `if !hasLive { c.Next(); return }` in CanvasOrBearer
+// → this flips 401→200 and fails.
+func TestCanvasOrBearer_NoTokens_FailsClosed(t *testing.T) {
 	mockDB, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock: %v", err)
@@ -1126,8 +1135,10 @@ func TestCanvasOrBearer_NoTokens_FailOpen(t *testing.T) {
 	mock.ExpectQuery(hasAnyLiveTokenGlobalQuery).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
 
+	handlerCalled := false
 	r := gin.New()
 	r.PUT("/canvas/viewport", CanvasOrBearer(mockDB), func(c *gin.Context) {
+		handlerCalled = true
 		c.JSON(http.StatusOK, gin.H{"ok": true})
 	})
 
@@ -1135,8 +1146,11 @@ func TestCanvasOrBearer_NoTokens_FailOpen(t *testing.T) {
 	req, _ := http.NewRequest(http.MethodPut, "/canvas/viewport", nil)
 	r.ServeHTTP(w, req)
 
-	if w.Code != http.StatusOK {
-		t.Errorf("bootstrap fail-open: got %d, want 200 (%s)", w.Code, w.Body.String())
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("zero-token install must fail CLOSED (lazy-bootstrap fail-open removed): got %d, want 401 (%s)", w.Code, w.Body.String())
+	}
+	if handlerCalled {
+		t.Error("handler reached on a fresh-install bearer-less request — lazy-bootstrap fail-open not removed")
 	}
 }
 
@@ -1207,7 +1221,16 @@ func TestCanvasOrBearer_TokensExist_WrongOrigin_Returns401(t *testing.T) {
 	}
 }
 
-func TestCanvasOrBearer_TokensExist_CanvasOrigin_Passes(t *testing.T) {
+// TestCanvasOrBearer_TokensExist_ForgeableOrigin_NoBearer_FailsClosed pins the
+// removal of the cross-origin Origin-match cosmetic path
+// (harden/no-fail-open-auth). A no-bearer request whose forgeable Origin header
+// matches CORS_ORIGINS used to pass; it now 401s. The canvas always sends a
+// bearer (NEXT_PUBLIC_ADMIN_TOKEN), so legitimate traffic is unaffected, and a
+// curl that forges Origin can no longer reach even a cosmetic route.
+//
+// Watch-it-fail: restore `if canvasOriginAllowed(c.GetHeader("Origin")) {
+// c.Next(); return }` in CanvasOrBearer → this flips 401→200 and fails.
+func TestCanvasOrBearer_TokensExist_ForgeableOrigin_NoBearer_FailsClosed(t *testing.T) {
 	mockDB, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock: %v", err)
@@ -1219,18 +1242,24 @@ func TestCanvasOrBearer_TokensExist_CanvasOrigin_Passes(t *testing.T) {
 
 	t.Setenv("CORS_ORIGINS", "https://acme.moleculesai.app,https://bob.moleculesai.app")
 
+	handlerCalled := false
 	r := gin.New()
 	r.PUT("/canvas/viewport", CanvasOrBearer(mockDB), func(c *gin.Context) {
+		handlerCalled = true
 		c.JSON(http.StatusOK, gin.H{"ok": true})
 	})
 
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest(http.MethodPut, "/canvas/viewport", nil)
+	// A matching-but-forgeable Origin with NO bearer must NOT pass anymore.
 	req.Header.Set("Origin", "https://acme.moleculesai.app")
 	r.ServeHTTP(w, req)
 
-	if w.Code != http.StatusOK {
-		t.Errorf("canvas origin: got %d, want 200 (%s)", w.Code, w.Body.String())
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("no-bearer request on a forgeable matching Origin must fail CLOSED (Origin-match path removed): got %d, want 401 (%s)", w.Code, w.Body.String())
+	}
+	if handlerCalled {
+		t.Error("handler reached on a no-bearer forgeable-Origin request — Origin-match fail-open not removed")
 	}
 }
 
@@ -1310,21 +1339,9 @@ func TestCanvasOrBearer_WrongOrigin_Blocked(t *testing.T) {
 	}
 }
 
-func TestCanvasOriginAllowed_EmptyOriginRejected(t *testing.T) {
-	if canvasOriginAllowed("") {
-		t.Error("empty Origin must not pass")
-	}
-}
-
-func TestCanvasOriginAllowed_LocalhostDefault(t *testing.T) {
-	t.Setenv("CORS_ORIGINS", "")
-	if !canvasOriginAllowed("http://localhost:3000") {
-		t.Error("localhost:3000 should be allowed by default")
-	}
-	if canvasOriginAllowed("http://evil.example.com") {
-		t.Error("random origin should not be allowed")
-	}
-}
+// (harden/no-fail-open-auth) TestCanvasOriginAllowed_* were REMOVED along with
+// the canvasOriginAllowed helper they exercised — the forgeable cross-origin
+// Origin-match cosmetic path no longer exists in CanvasOrBearer.
 
 // ── Issue #623 regression ─────────────────────────────────────────────────────
 // AdminAuth must NOT accept forged Origin headers. Any container on the Docker
