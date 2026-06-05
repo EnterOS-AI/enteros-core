@@ -397,8 +397,27 @@ jobs:
       - name: Run notify-with-attachments E2E
         if: needs.detect-changes.outputs.api == 'true'
         run: bash tests/e2e/test_notify_attachments_e2e.sh
-      - name: Run priority-runtimes E2E (claude-code + hermes — skips when keys absent)
+      - name: "Run priority-runtimes E2E (REQUIRE-LIVE: >=1 runtime must validate)"
+        # REQUIRE-LIVE guard (mirrors CP serving-e2e SERVING_E2E_REQUIRE_LIVE):
+        # E2E_REQUIRE_LIVE=1 makes the script exit NON-zero if zero runtimes
+        # were actually validated end-to-end. Previously every runtime SKIPPED
+        # here (no secrets in env), so PASS=0/FAIL=0 exited 0 and this REQUIRED
+        # gate was false-green — validating nothing. The secret below gives the
+        # gate a live arm.
+        #
+        # LIVE ARM — uses the ALREADY-PRESENT MOLECULE_STAGING_MINIMAX_API_KEY
+        # Gitea secret (the same secret the staging-smoke and continuous-synth
+        # canaries use). Surfaced as E2E_MINIMAX_API_KEY, it drives the
+        # claude-code runtime against MiniMax (BYOK, model minimax:MiniMax-M2.7).
+        # ZERO new credentials are required. CLAUDE_CODE_OAUTH_TOKEN /
+        # E2E_OPENAI_API_KEY are NOT configured on this repo, so they are NOT
+        # referenced here — wiring an absent secret would just RED the gate.
+        # If the MiniMax key is ever unset the job goes RED (by design) — a
+        # missing live arm is a real gap, not a skip.
         if: needs.detect-changes.outputs.api == 'true'
+        env:
+          E2E_REQUIRE_LIVE: '1'
+          E2E_MINIMAX_API_KEY: ${{ secrets.MOLECULE_STAGING_MINIMAX_API_KEY }}
         run: bash tests/e2e/test_priority_runtimes_e2e.sh
       - name: Install standalone runtime parser from Gitea registry
         if: needs.detect-changes.outputs.api == 'true'
