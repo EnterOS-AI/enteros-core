@@ -474,12 +474,12 @@ func main() {
 
 	// HTTP server with graceful shutdown.
 	//
-	// Bind host: in dev-mode (no ADMIN_TOKEN, MOLECULE_ENV=dev|development)
-	// the AdminAuth chain fails open by design; pairing that with a wildcard
-	// bind would expose unauth /workspaces to any same-LAN peer. Default to
-	// loopback when fail-open is active. Operators who need LAN exposure set
-	// BIND_ADDR=0.0.0.0 explicitly. Production (ADMIN_TOKEN set) is unchanged.
-	// See molecule-core#7.
+	// Bind host: in local dev (MOLECULE_ENV=dev|development) default the
+	// listener to loopback as defense-in-depth — a dev box shouldn't be
+	// reachable from the LAN. This is NOT an auth lever (auth is fail-closed
+	// in every env now); it's strictly the safer default. Operators who need
+	// LAN exposure set BIND_ADDR=0.0.0.0 explicitly. Production binds all
+	// interfaces (existing shape). See molecule-core#7.
 	bindHost := resolveBindHost()
 	srv := &http.Server{
 		Addr:              fmt.Sprintf("%s:%s", bindHost, port),
@@ -489,7 +489,7 @@ func main() {
 
 	// Start server in goroutine
 	go func() {
-		log.Printf("Platform starting on %s:%s (dev-mode-fail-open=%v)", bindHost, port, middleware.IsDevModeFailOpen())
+		log.Printf("Platform starting on %s:%s (local-dev-env=%v)", bindHost, port, middleware.IsLocalDevEnv())
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Server failed: %v", err)
 		}
@@ -528,20 +528,20 @@ func envOr(key, fallback string) string {
 //
 // Precedence:
 //  1. BIND_ADDR — explicit operator override (any value, including "0.0.0.0").
-//  2. dev-mode fail-open active → "127.0.0.1" (loopback only).
+//  2. local dev (MOLECULE_ENV=dev|development) → "127.0.0.1" (loopback only).
 //  3. otherwise → "" (Go binds every interface; existing prod/self-host shape).
 //
-// Coupling the loopback default to middleware.IsDevModeFailOpen() means the
-// two safety levers — bind narrowness and auth strength — move together. A
-// production deploy (ADMIN_TOKEN set) keeps binding to all interfaces because
-// the auth chain is doing its job; a dev Mac (no ADMIN_TOKEN, MOLECULE_ENV=dev)
-// is reachable only via loopback because the auth chain is fail-open. See
-// molecule-core#7 for the original LAN exposure finding.
+// NOTE (harden/no-fail-open-auth): this is a defense-in-depth default, NOT an
+// auth lever. Auth is fail-closed in every environment now, so the loopback
+// default no longer compensates for a weak auth chain — it simply keeps a dev
+// box off the LAN by default. It is keyed on MOLECULE_ENV alone (decoupled
+// from ADMIN_TOKEN), because dev now provisions an ADMIN_TOKEN yet should
+// still default to loopback. See molecule-core#7 for the original LAN finding.
 func resolveBindHost() string {
 	if v := os.Getenv("BIND_ADDR"); v != "" {
 		return v
 	}
-	if middleware.IsDevModeFailOpen() {
+	if middleware.IsLocalDevEnv() {
 		return "127.0.0.1"
 	}
 	return ""

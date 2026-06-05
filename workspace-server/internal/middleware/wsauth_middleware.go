@@ -120,12 +120,12 @@ func WorkspaceAuth(database *sql.DB) gin.HandlerFunc {
 				return
 			}
 		}
-		// Local-dev escape hatch — see devmode.go. Unreachable on SaaS
-		// (hosted tenants always have ADMIN_TOKEN + MOLECULE_ENV=production).
-		if isDevModeFailOpen() {
-			c.Next()
-			return
-		}
+		// No bearer, no verified CP session: fail CLOSED in EVERY
+		// environment (harden/no-fail-open-auth). The old local-dev
+		// escape hatch that let bearer-less requests through when
+		// ADMIN_TOKEN was unset + MOLECULE_ENV=dev has been removed —
+		// local dev now authenticates with a provisioned ADMIN_TOKEN
+		// (see scripts/dev-start.sh).
 		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "missing workspace auth token"})
 	}
 }
@@ -133,11 +133,18 @@ func WorkspaceAuth(database *sql.DB) gin.HandlerFunc {
 // AdminAuth returns a Gin middleware for global/admin routes (e.g.
 // /settings/secrets, /admin/secrets) that have no per-workspace scope.
 //
+// FAIL-CLOSED in every environment (harden/no-fail-open-auth): there is no
+// bearer-less path through this middleware. A request reaches the handler
+// ONLY by presenting a valid credential (verified CP session cookie, org
+// token, ADMIN_TOKEN, or — deprecated — a live workspace token). The former
+// "Tier-1 lazy-bootstrap fail-open" (no live tokens + no ADMIN_TOKEN ⇒ pass)
+// has been removed: it let an attacker pre-empt the first user by POSTing
+// /org/import before any token was minted (C4 SaaS-launch finding). A fresh
+// install must set ADMIN_TOKEN to reach admin routes.
+//
 // # Credential tier (evaluated in order)
 //
-//  1. Lazy-bootstrap fail-open: if no live workspace token exists anywhere on
-//     the platform (fresh install / pre-Phase-30 upgrade), every request passes
-//     through so existing deployments keep working.
+//  1. Verified CP session cookie (SaaS canvas) — upstream-confirmed.
 //
 //  2. ADMIN_TOKEN env var (recommended, closes #684): when set, the bearer
 //     MUST equal this value exactly (constant-time comparison). Workspace
@@ -163,31 +170,15 @@ func AdminAuth(database *sql.DB) gin.HandlerFunc {
 		ctx := c.Request.Context()
 		adminSecret := os.Getenv("ADMIN_TOKEN")
 
-		hasLive, err := wsauth.HasAnyLiveTokenGlobal(ctx, database)
-		if err != nil {
+		// (harden/no-fail-open-auth) Both former fail-open branches have
+		// been REMOVED here:
+		//   - Tier-1 lazy-bootstrap (no live tokens + no ADMIN_TOKEN ⇒ pass)
+		//   - Tier-1b local-dev escape hatch (isDevModeFailOpen ⇒ pass)
+		// Admin auth is now fail-CLOSED in every environment. We still probe
+		// HasAnyLiveTokenGlobal so a datastore outage returns a structured
+		// 503 (not a silent pass), but its result no longer opens any path.
+		if _, err := wsauth.HasAnyLiveTokenGlobal(ctx, database); err != nil {
 			abortAuthLookupError(c, "AdminAuth: HasAnyLiveTokenGlobal", err)
-			return
-		}
-		if !hasLive {
-			// Tier 1: fail-open is ONLY safe when ADMIN_TOKEN is unset
-			// (self-hosted dev, pre-Phase-30 upgrade). Hosted SaaS always
-			// sets ADMIN_TOKEN at provision time, and C4 (SaaS-launch
-			// blocker) showed that without this guard an attacker can
-			// pre-empt the first user by POSTing /org/import before any
-			// token gets minted. When ADMIN_TOKEN is set we fall through
-			// into the same bearer-check path Tier-2 uses below.
-			if adminSecret == "" {
-				c.Next()
-				return
-			}
-		}
-
-		// Tier 1b: Local-dev escape hatch — see devmode.go. Lets the
-		// Canvas dashboard keep working after the first workspace token
-		// lands in the DB on `go run ./cmd/server`. Unreachable on SaaS
-		// (hosted tenants always have ADMIN_TOKEN + MOLECULE_ENV=production).
-		if isDevModeFailOpen() {
-			c.Next()
 			return
 		}
 

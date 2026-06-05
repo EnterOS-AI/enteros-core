@@ -435,15 +435,13 @@ func validateDiscoveryCaller(ctx context.Context, c *gin.Context, workspaceID st
 	if !hasLive {
 		return nil // legacy / pre-upgrade
 	}
-	// Tier-1b dev-mode hatch — same escape hatch AdminAuth and
-	// WorkspaceAuth apply on a local Docker setup. Without this, the
-	// canvas Details tab can never load peers for a workspace that has
-	// registered its live token, producing the 401 the user sees.
-	// Gated by MOLECULE_ENV=development + empty ADMIN_TOKEN, so SaaS
-	// production stays strict.
-	if middleware.IsDevModeFailOpen() {
-		return nil
-	}
+	// (harden/no-fail-open-auth) The former dev-mode escape hatch that
+	// returned nil (allow) here when MOLECULE_ENV=dev + ADMIN_TOKEN unset
+	// has been REMOVED. Discovery callers must present a verified CP
+	// session or a valid bearer in every environment. Local dev now
+	// authenticates the Canvas with a provisioned ADMIN_TOKEN /
+	// NEXT_PUBLIC_ADMIN_TOKEN (see scripts/dev-start.sh), so the Details
+	// tab loads peers with a real credential rather than via fail-open.
 
 	// Try session cookie auth first (SaaS canvas path).
 	// verifiedCPSession returns (valid, presented):

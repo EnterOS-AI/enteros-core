@@ -927,13 +927,14 @@ func TestDiscoverHostPeer_Smoke_Success(t *testing.T) {
 	}
 }
 
-// ==================== Peers auth — dev-mode fail-open gate ====================
+// ==================== Peers auth — fail-CLOSED gate ====================
 //
-// validateDiscoveryCaller applies a Tier-1b dev-mode hatch so the canvas
-// user session (which holds no workspace-scoped bearer) can still load
-// the Details → PEERS list on a local Docker setup. The gate must pass
-// ONLY when MOLECULE_ENV is development AND ADMIN_TOKEN is empty.
-// These tests pin that contract against accidental polarity flips.
+// (harden/no-fail-open-auth) validateDiscoveryCaller USED to apply a
+// Tier-1b dev-mode hatch that let the bearer-less canvas session load the
+// Details → PEERS list when MOLECULE_ENV=development AND ADMIN_TOKEN empty.
+// That hatch has been REMOVED — discovery callers must present a verified
+// CP session or a valid bearer in every environment. These tests pin the
+// fail-closed contract against accidental re-introduction.
 
 // peersAuthFixtureHasLiveToken seeds the mock rows required for the
 // Peers handler to reach the auth branch: HasAnyLiveToken → true (a
@@ -946,10 +947,12 @@ func peersAuthFixtureHasLiveToken(mock sqlmock.Sqlmock, workspaceID string) {
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
 }
 
-func TestPeers_DevModeFailOpen_AllowsBearerlessRequest(t *testing.T) {
-	// Dev mode: MOLECULE_ENV=development AND ADMIN_TOKEN empty. Canvas
-	// sends no bearer token; validateDiscoveryCaller must return nil
-	// (allow) and the handler must proceed to return the peer list.
+func TestPeers_DevMode_BearerlessRequest_FailsClosed(t *testing.T) {
+	// (harden/no-fail-open-auth) Exact old-hatch conditions:
+	// MOLECULE_ENV=development AND ADMIN_TOKEN empty, with a live token in
+	// the DB. The bearer-less canvas-style request must now 401 — the
+	// dev-mode hatch that returned nil (allow) here is gone. Local dev
+	// authenticates via a provisioned ADMIN_TOKEN (scripts/dev-start.sh).
 	t.Setenv("MOLECULE_ENV", "development")
 	t.Setenv("ADMIN_TOKEN", "")
 
@@ -957,21 +960,9 @@ func TestPeers_DevModeFailOpen_AllowsBearerlessRequest(t *testing.T) {
 	setupTestRedis(t)
 	handler := NewDiscoveryHandler()
 
+	// Only the HasAnyLiveToken probe runs; auth 401s before the peer
+	// queries, so no further expectations are seeded.
 	peersAuthFixtureHasLiveToken(mock, "ws-dev")
-
-	// Root workspace → children+parent queries still fire but the
-	// parent_id lookup comes first.
-	mock.ExpectQuery("SELECT parent_id FROM workspaces WHERE id =").
-		WithArgs("ws-dev").
-		WillReturnRows(sqlmock.NewRows([]string{"parent_id"}).AddRow(nil))
-	peerCols := []string{"id", "name", "role", "tier", "status", "agent_card", "url", "parent_id", "active_tasks"}
-	mock.ExpectQuery("SELECT w.id.+WHERE w.parent_id IS NULL AND w.id").
-		WithArgs("ws-dev").
-		WillReturnRows(sqlmock.NewRows(peerCols))
-	// #383 — children query gained explicit `w.id != $2` self-filter.
-	mock.ExpectQuery("SELECT w.id.+WHERE w.parent_id = \\$1 AND w.id != \\$2 AND w.status").
-		WithArgs("ws-dev", "ws-dev").
-		WillReturnRows(sqlmock.NewRows(peerCols))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -980,8 +971,8 @@ func TestPeers_DevModeFailOpen_AllowsBearerlessRequest(t *testing.T) {
 
 	handler.Peers(c)
 
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200 under dev-mode hatch, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 (fail-closed) under old dev-mode hatch conditions, got %d: %s", w.Code, w.Body.String())
 	}
 }
 
