@@ -337,10 +337,26 @@ export default async function globalSetup(_config: FullConfig): Promise<void> {
 
   // 7. Hand state off to tests + teardown — overwrite the slug-only
   // bootstrap state with the full state spec tests need.
-  writeFileSync(
-    stateFile,
-    JSON.stringify({ slug, tenantURL, workspaceId, tenantToken }, null, 2),
-  );
+  //
+  // FAIL-CLOSED handoff: every field the spec reads must be non-empty. If
+  // any is missing here, the spec's env-presence guard would throw with a
+  // generic "did setup run?" message that hides WHICH field was lost. Catch
+  // it at the source — a partial provision must hard-fail setup, never hand
+  // off a half-built state that the spec then has to diagnose (or worse,
+  // skip). This is the loud, fail-closed contract: STAGING was requested,
+  // so an incomplete provision is an error, not a skip.
+  const handoff = { slug, tenantURL, workspaceId, tenantToken };
+  const missingFields = Object.entries(handoff)
+    .filter(([, v]) => !v)
+    .map(([k]) => k);
+  if (missingFields.length > 0) {
+    throw new Error(
+      `[staging-setup] provision incomplete — empty handoff field(s): ` +
+        `${missingFields.join(", ")}. Refusing to hand off a partial state ` +
+        `that would surface downstream as an opaque spec failure.`,
+    );
+  }
+  writeFileSync(stateFile, JSON.stringify(handoff, null, 2));
   process.env.STAGING_SLUG = slug;
   process.env.STAGING_TENANT_URL = tenantURL;
   process.env.STAGING_WORKSPACE_ID = workspaceId;
