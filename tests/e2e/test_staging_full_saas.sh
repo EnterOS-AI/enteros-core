@@ -47,6 +47,15 @@
 #                                tear down cleanly (and exit 4 on leak).
 #                                Used by a dedicated sanity workflow
 #                                that verifies the safety net.
+#   E2E_REQUIRE_LIVE             1 → fail-closed-on-skip guard (CI sets this).
+#                                When set, the run MUST actually complete
+#                                ≥1 full provision→online→A2A cycle. A run
+#                                that reaches the end without having proven
+#                                a real round-trip (e.g. a future refactor
+#                                short-circuits a stage, or a skip path
+#                                swallows the lifecycle) exits 5 rather than
+#                                reporting a false green. Mirrors CP
+#                                serving-e2e's SERVING_E2E_REQUIRE_LIVE.
 #
 # Exit codes:
 #   0  happy path
@@ -54,6 +63,37 @@
 #   2  missing required env
 #   3  provisioning timed out
 #   4  teardown left orphan resources
+#   5  E2E_REQUIRE_LIVE set but the run validated no real lifecycle (no
+#      false-green-on-skip)
+#
+# ─────────────────────────────────────────────────────────────────────────
+# PROMOTION-READINESS (harden/e2e-staging-saas-failclosed):
+#   This harness is being hardened so `E2E Staging SaaS` + `E2E Staging
+#   Platform Boot` can become HARD merge-gates. continue-on-error is NOT
+#   flipped here — that promotion is the CTO's irreversible branch-protection
+#   call. What this branch makes fail-closed (was false-green / un-named
+#   flake before):
+#     • Provision/online waits are bounded readiness-POLLS, not fixed sleeps;
+#       each hard-fails with a named mechanism + last-seen signal on deadline,
+#       never a silent timeout (cp#245 boot-timeout class).
+#     • Peer-discovery (9b) asserts a real 2xx, not just "not 404" — a 5xx /
+#       000 / empty no longer reads as "reachable".
+#     • Activity-log (9b) is ASSERTED reachable (2xx + parseable), not
+#       logged-and-ignored behind `|| echo '[]'`.
+#     • Child activity provenance (10) is asserted (was soft-logged).
+#     • E2E_REQUIRE_LIVE=1 (CI) makes the run exit 5 if it reached the end
+#       without proving a real provision→online→A2A round-trip — no
+#       false-green-on-skip.
+#   STILL BLOCKS making it REQUIRED (must clear before the CTO flips
+#   continue-on-error→false in .gitea/workflows/e2e-staging-saas.yml):
+#     • De-flake window: N consecutive green runs on main for BOTH jobs
+#       (platform-boot shares the cp#245 boot surface — #2187 tracks its
+#       flip). This harness removes the harness-side flake mechanisms; the
+#       remaining surface is real-infra (EC2 cold boot, CF DNS) latency,
+#       already bounded by the readiness polls above.
+#     • Branch-protection required-context wiring is a repo-settings change,
+#       not a code change in this PR.
+# ─────────────────────────────────────────────────────────────────────────
 
 set -euo pipefail
 
@@ -89,6 +129,41 @@ SLUG=$(echo "$SLUG" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-' | head -c 32
 log()  { echo "[$(date +%H:%M:%S)] $*"; }
 fail() { echo "[$(date +%H:%M:%S)] ❌ $*" >&2; exit 1; }
 ok()   { echo "[$(date +%H:%M:%S)] ✅ $*"; }
+
+# ─── fail-closed-on-skip live-lifecycle guard ───────────────────────────
+# E2E_REQUIRE_LIVE=1 (set by CI) asserts this run ACTUALLY exercised a full
+# provision→online→A2A cycle. Each load-bearing lifecycle stage stamps a
+# milestone via live_milestone(); at the very end, require_live_or_die()
+# checks every required milestone fired. Mechanism: without this, a future
+# refactor that short-circuits a stage — or a skip/early-return path that
+# swallows the lifecycle — would let the script reach its final `ok` and
+# report GREEN having validated nothing. Mirrors CP serving-e2e's
+# SERVING_E2E_REQUIRE_LIVE (skip-if-absent must be LOUD, never silent green).
+REQUIRE_LIVE="${E2E_REQUIRE_LIVE:-0}"
+LIVE_MILESTONES=""
+live_milestone() {
+  # Idempotent set-membership append. Space-delimited; names are tokens.
+  case " $LIVE_MILESTONES " in
+    *" $1 "*) ;;
+    *) LIVE_MILESTONES="$LIVE_MILESTONES $1" ;;
+  esac
+}
+require_live_or_die() {
+  # No-op unless CI demanded a live run.
+  [ "$REQUIRE_LIVE" = "1" ] || return 0
+  local required="provisioned tenant_online workspace_online a2a_roundtrip"
+  local m missing=""
+  for m in $required; do
+    case " $LIVE_MILESTONES " in
+      *" $m "*) ;;
+      *) missing="$missing $m" ;;
+    esac
+  done
+  if [ -n "$missing" ]; then
+    echo "[$(date +%H:%M:%S)] ❌ E2E_REQUIRE_LIVE=1 but the run did NOT prove a full live lifecycle — missing milestone(s):${missing}. Reached:${LIVE_MILESTONES:-<none>}. This is a false-green-on-skip guard: a run that validates no real provision→online→A2A cycle MUST NOT report green." >&2
+    exit 5
+  fi
+}
 
 # Per-runtime model slug dispatch — see lib/model_slug.sh for the rationale.
 # Extracted so unit tests (tests/e2e/test_model_slug.sh) can pin every branch
@@ -197,7 +272,7 @@ cleanup_org() {
   # case statement, and opens a false-positive priority-high
   # "safety net broken" issue (#2159, 2026-04-27).
   case "$entry_rc" in
-    0|1|2|3|4) ;;          # contracted codes — let bash use entry_rc
+    0|1|2|3|4|5) ;;        # contracted codes — let bash use entry_rc
     *) exit 1 ;;            # anything else is a generic failure
   esac
 }
@@ -295,6 +370,7 @@ print('(no org row found for slug=$SLUG — DB drift?)')
   esac
 done
 ok "Tenant provisioning complete"
+live_milestone provisioned
 
 # Derive tenant domain from CP hostname so the same harness works in
 # both prod (api.moleculesai.app → moleculesai.app) and staging
@@ -351,6 +427,7 @@ while true; do
   sleep 5
 done
 ok "Tenant reachable at $TENANT_URL"
+live_milestone tenant_online
 
 # Sanity-test path: once the tenant is provisioned, poisoning the
 # tenant token proves the EXIT trap + leak assertion still fire.
@@ -570,6 +647,7 @@ fi
 WS_TO_CHECK=("$PARENT_ID")
 [ -n "$CHILD_ID" ] && WS_TO_CHECK+=("$CHILD_ID")
 wait_workspaces_online_routable "7/11 Waiting for workspace(s) to reach status=online (up to $((WORKSPACE_ONLINE_TIMEOUT_SECS/60)) min — hermes cold boot)..." "${WS_TO_CHECK[@]}"
+live_milestone workspace_online
 
 # ─── 7a. Real chat image upload/download round-trip ───────────────────
 # This deliberately uses the production workflow: tenant admin/session auth
@@ -981,6 +1059,11 @@ except Exception:
 " 2>/dev/null || echo "")
 # CORE GATE: contains PINEAPPLE (real round-trip) AND no error-as-text.
 a2a_assert_real_completion "$KA_TEXT" "PINEAPPLE" "A2A known-answer (parent, $RUNTIME/$MODEL_SLUG)"
+# Real, deterministic LLM round-trip proven — the load-bearing milestone for
+# the fail-closed-on-skip guard. Stamped AFTER a2a_assert_real_completion (not
+# after the looser PONG check) so the milestone means a verified completion,
+# not just a 2xx-with-text.
+live_milestone a2a_roundtrip
 
 # ─── 8c. byok-routing regression guard (#1994) ─────────────────────────
 # The parent was provisioned with the customer's OWN vendor key
@@ -1106,18 +1189,50 @@ print(json.dumps({
   ok "HMA memory write+read roundtripped"
 
   log "9b.  Peer discovery + activity log smoke..."
+  # FAIL-CLOSED: assert a real 2xx, not merely "not 404". The previous
+  # `[ "$PEERS_CODE" = "404" ] && fail` only caught the route-missing case —
+  # a 5xx, 000 (connection failure), or empty capture ALL fell through to
+  # "reachable" (false-green: a broken-but-present route read as healthy).
+  # Mechanism: route the http_code into its own tempfile (no stderr capture,
+  # which the old `2>&1 | head -1` could pollute with a curl error line) and
+  # require 2xx explicitly.
+  PEERS_TMP=$(e2e_tmp /tmp/e2e_peers.XXXXXX)
   set +e
-  tenant_call GET "/registry/$PARENT_ID/peers" -o /dev/null -w "%{http_code}\n" 2>&1 | head -1 > /tmp/peers_code.txt
+  PEERS_CODE=$(tenant_call GET "/registry/$PARENT_ID/peers" \
+    -o "$PEERS_TMP" -w "%{http_code}" 2>/dev/null)
+  PEERS_RC=$?
   set -e
-  PEERS_CODE=$(cat /tmp/peers_code.txt)
-  [ "$PEERS_CODE" = "404" ] && fail "Peers endpoint missing (404) — route regression"
+  PEERS_CODE=${PEERS_CODE:-000}
+  if [ "$PEERS_CODE" = "404" ]; then
+    fail "Peers endpoint missing (404) — route regression. /registry/$PARENT_ID/peers"
+  fi
+  if [ "$PEERS_RC" != "0" ] || [ "$PEERS_CODE" -lt 200 ] || [ "$PEERS_CODE" -ge 300 ]; then
+    fail "Peers endpoint unhealthy (curl_rc=$PEERS_RC, http=$PEERS_CODE) — not a clean 2xx, so 'reachable' would be a false-green. Body: $(head -c 200 "$PEERS_TMP" 2>/dev/null | sanitize_http_body)"
+  fi
   ok "Peers endpoint reachable (HTTP $PEERS_CODE)"
 
-  ACTIVITY=$(tenant_call GET "/activity?workspace_id=$PARENT_ID&limit=5" 2>/dev/null || echo '[]')
-  ACTIVITY_COUNT=$(echo "$ACTIVITY" | python3 -c "import json,sys
-d=json.load(sys.stdin)
-print(len(d if isinstance(d, list) else d.get('events', [])))" 2>/dev/null || echo 0)
-  log "    Activity events observed: $ACTIVITY_COUNT"
+  # FAIL-CLOSED: the activity-log read was `|| echo '[]'` then the count was
+  # only LOGGED, never asserted — a 5xx / network failure silently became an
+  # empty list and the step exited 0 having validated nothing (false-green:
+  # "validated nothing" class). Assert the endpoint returns a 2xx and a
+  # parseable activity shape. We do NOT assert count>0 (the parent may
+  # legitimately have 0 events this early — that's a real, valid state), but
+  # we DO require the call to have actually succeeded and returned valid JSON.
+  ACTIVITY_TMP=$(e2e_tmp /tmp/e2e_activity.XXXXXX)
+  set +e
+  ACTIVITY_CODE=$(tenant_call GET "/activity?workspace_id=$PARENT_ID&limit=5" \
+    -o "$ACTIVITY_TMP" -w "%{http_code}" 2>/dev/null)
+  ACTIVITY_RC=$?
+  set -e
+  ACTIVITY_CODE=${ACTIVITY_CODE:-000}
+  if [ "$ACTIVITY_RC" != "0" ] || [ "$ACTIVITY_CODE" -lt 200 ] || [ "$ACTIVITY_CODE" -ge 300 ]; then
+    fail "Activity-log endpoint unhealthy (curl_rc=$ACTIVITY_RC, http=$ACTIVITY_CODE) — was previously swallowed by '|| echo []' and reported as 0 events (false-green). Body: $(head -c 200 "$ACTIVITY_TMP" 2>/dev/null | sanitize_http_body)"
+  fi
+  ACTIVITY_COUNT=$(python3 -c "import json,sys
+d=json.load(open(sys.argv[1]))
+print(len(d if isinstance(d, list) else d.get('events', [])))" "$ACTIVITY_TMP" 2>/dev/null) \
+    || fail "Activity-log returned HTTP $ACTIVITY_CODE but body was not parseable JSON (events array / {events:[...]}). Body: $(head -c 200 "$ACTIVITY_TMP" 2>/dev/null | sanitize_http_body)"
+  log "    Activity events observed: $ACTIVITY_COUNT (endpoint 2xx + parseable ✓)"
 
   # ─── 9c. Workspace KV memory Edit round-trip ─────────────────────────
   # Pins the Edit affordance added to the canvas Memory tab. The UI calls
@@ -1268,14 +1383,44 @@ except Exception:
   [ -z "$DELEG_TEXT" ] && fail "Delegation returned no text. Raw: ${DELEG_RESP:0:200}"
   ok "Delegation proxy works (child responded: \"${DELEG_TEXT:0:60}\")"
 
-  CHILD_ACT=$(tenant_call GET "/activity?workspace_id=$CHILD_ID&limit=20" 2>/dev/null || echo '[]')
-  if echo "$CHILD_ACT" | grep -q "$PARENT_ID"; then
+  # FAIL-CLOSED via bounded readiness-POLL (was soft-logged false-green).
+  # The activity pipeline is async, so an immediate single read can miss the
+  # parent reference — but "did not reference parent" was previously just
+  # LOGGED and the step passed regardless, so a genuinely broken provenance
+  # pipeline (parent never recorded as source) read as success. Mechanism:
+  # poll the child activity log for the parent id for a bounded window
+  # (E2E_CHILD_ACTIVITY_TIMEOUT_SECS, default 60s) — this is the real
+  # readiness signal (provenance row materialised), not a fixed sleep — and
+  # hard-fail with a named mechanism if it never appears.
+  CHILD_ACT_DEADLINE=$(( $(date +%s) + ${E2E_CHILD_ACTIVITY_TIMEOUT_SECS:-60} ))
+  CHILD_ACT_SEEN=0
+  CHILD_ACT_LASTCODE="000"
+  while true; do
+    CHILD_ACT_TMP=$(e2e_tmp /tmp/e2e_child_act.XXXXXX)
+    set +e
+    CHILD_ACT_CODE=$(tenant_call GET "/activity?workspace_id=$CHILD_ID&limit=20" \
+      -o "$CHILD_ACT_TMP" -w "%{http_code}" 2>/dev/null)
+    set -e
+    CHILD_ACT_LASTCODE=${CHILD_ACT_CODE:-000}
+    if grep -q "$PARENT_ID" "$CHILD_ACT_TMP" 2>/dev/null; then
+      CHILD_ACT_SEEN=1
+      break
+    fi
+    [ "$(date +%s)" -ge "$CHILD_ACT_DEADLINE" ] && break
+    sleep 5
+  done
+  if [ "$CHILD_ACT_SEEN" = "1" ]; then
     ok "Child activity log records parent as source"
   else
-    log "Child activity log did not reference parent (pipeline may be async)"
+    fail "Child activity log never referenced parent $PARENT_ID within ${E2E_CHILD_ACTIVITY_TIMEOUT_SECS:-60}s (last http=$CHILD_ACT_LASTCODE) — delegation-provenance pipeline regression (parent not recorded as source). Previously soft-logged → false-green."
   fi
 fi
 
 # ─── 11. Teardown runs via trap ────────────────────────────────────────
+# Fail-closed-on-skip: before declaring PASS, assert (when CI demanded a live
+# run) that every load-bearing lifecycle milestone actually fired. A run that
+# reaches here without provision→online→A2A having truly happened exits 5
+# instead of reporting green. Teardown still runs (EXIT trap) on that exit.
+require_live_or_die
 log "11/11 All checks passed. Teardown runs via EXIT trap."
 ok "═══ STAGING $MODE-SAAS E2E PASSED ═══"

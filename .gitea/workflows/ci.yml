@@ -364,6 +364,14 @@ jobs:
           # check missed. If a refactor weakens the gate to a shape check,
           # this step goes red on every PR.
           bash tests/e2e/test_completion_assert_unit.sh
+          # harden/e2e-staging-saas-failclosed: fail-direction proof for the
+          # E2E_REQUIRE_LIVE fail-closed-on-skip guard in
+          # test_staging_full_saas.sh. Offline (no LLM/network/provisioning):
+          # asserts the guard exits 5 when a live lifecycle did NOT run and
+          # passes when all milestones fired — so a refactor that lets the
+          # staging gate report green without a real provision→online→A2A
+          # cycle goes red on every PR.
+          bash tests/e2e/test_require_live_guard_unit.sh
 
       - if: ${{ needs.changes.outputs.scripts == 'true' }}
         name: Test ECR promote-tenant-image script (mock-driven, no live infra)
