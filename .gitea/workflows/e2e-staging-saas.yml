@@ -172,7 +172,16 @@ jobs:
       # and defeats the cost saving. Operators can override via the
       # workflow_dispatch flow (no input wired here yet — runtime
       # override is enough for ad-hoc).
-      E2E_MODEL_SLUG: ${{ github.event.inputs.runtime == 'hermes' && 'openai/gpt-4o' || github.event.inputs.runtime == 'codex' && 'openai/gpt-4o' || github.event.inputs.runtime == 'google-adk' && 'google_genai:gemini-2.5-pro' || 'MiniMax-M2' }}
+      #
+      # #2263 deploy-skew: the claude-code default is the COLON-namespaced BYOK
+      # id `minimax:MiniMax-M2.7`, NOT bare `MiniMax-M2`. The deployed staging
+      # ws-server's compiled registry can lag source; validateRegisteredModelForRuntime
+      # 400s the bare form on an older image (the sibling Platform Boot job, on
+      # the SAME image, succeeds with namespaced `moonshot/kimi-k2.6`). The colon
+      # form stays in the BYOK `minimax` arm (providers.yaml:851) so it resolves
+      # provider=minimax (BYOK) and the #1994 byok-not-platform guard still
+      # passes — the slash/platform form `minimax/MiniMax-M2.7` would not.
+      E2E_MODEL_SLUG: ${{ github.event.inputs.runtime == 'hermes' && 'openai/gpt-4o' || github.event.inputs.runtime == 'codex' && 'openai/gpt-4o' || github.event.inputs.runtime == 'google-adk' && 'google_genai:gemini-2.5-pro' || 'minimax:MiniMax-M2.7' }}
       E2E_RUN_ID: "${{ github.run_id }}-${{ github.run_attempt }}"
       E2E_KEEP_ORG: ${{ github.event.inputs.keep_org && '1' || '0' }}
 
