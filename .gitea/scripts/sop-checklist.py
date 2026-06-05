@@ -200,6 +200,11 @@ def parse_directives(
         else:
             canonical = normalize_slug(slug_source, numeric_aliases)
         note_from_group = (m.group(3) or "").strip()
+        # The em-dash (U+2014) is a visual separator; the regex puts it
+        # in group(3) because it is outside the slug character class.
+        # Strip it so "/sop-ack slug — note" yields just "note".
+        if note_from_group.startswith("—"):
+            note_from_group = note_from_group[1:].strip()
         # Combine note_from_slug (em-dash split) with note_from_group
         # (trailing text after the slug captured by the regex group).
         combined_note = (note_from_slug + " " + note_from_group).strip()
