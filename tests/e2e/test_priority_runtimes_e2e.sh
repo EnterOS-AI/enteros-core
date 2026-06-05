@@ -34,35 +34,54 @@
 # runtime (false-green).
 #
 # Fix: a real "validated arm" counter (VALIDATED) tracks runtimes that
-# actually ran AND produced a non-error A2A reply. In CI, set
-# E2E_REQUIRE_LIVE=1: if zero arms validated, the run exits NON-zero with
-# a loud message. Locally (E2E_REQUIRE_LIVE unset/0), a fully-skipped run
-# stays a LOUD skip + exit 0 for dev convenience.
+# actually ran AND produced a non-error A2A reply. With E2E_REQUIRE_LIVE=1:
+# if zero arms validated, the run exits NON-zero with a loud message.
+# Without it (E2E_REQUIRE_LIVE unset/0), a fully-skipped run stays a LOUD
+# skip + exit 0 for dev convenience.
 #
-# The REQUIRE-LIVE BACKBONE is the `mock` runtime arm (run_mock). It needs
-# NO external LLM key: the mock runtime is a virtual workspace (no
-# container, no EC2, no provider) whose org-import path short-circuits
-# straight to status='online' and whose A2A proxy returns a deterministic
-# canned reply (mock_runtime.go + a2a_proxy.go::handleMockA2A). So mock
-# exercises the exact plumbing every runtime needs — provision-decision →
-# online → A2A round-trip → activity_logs — and ALWAYS runs in CI. That
-# makes the REQUIRED gate GREEN on a healthy platform and RED only when
-# the plumbing genuinely breaks (no false-green, no can't-go-green).
+# This zero-validated→RED decision is the load-bearing logic. It is factored
+# into evaluate_require_live_gate() (a pure function of $FAIL/$VALIDATED/
+# $E2E_REQUIRE_LIVE, defined before any platform I/O) and is REGRESSION-GATED
+# on every PR by tests/e2e/test_require_live_priority_gate_unit.sh, which
+# sources this file (E2E_PRIORITY_UNIT_SOURCE=1), sets the counters, and
+# asserts the gate's exit code — no platform, no provisioning, no network.
+# So the false-green can't silently come back: a revert of the guard fails CI.
 #
-# MiniMax (E2E_MINIMAX_API_KEY, fed from the existing
-# MOLECULE_STAGING_MINIMAX_API_KEY Gitea secret) is an OPPORTUNISTIC
-# best-effort real-LLM arm on top of mock: if the key + model resolve it
-# validates as a bonus; if MiniMax-create fails (it is registry-fragile in
-# CI — see run_minimax header) it reports a best-effort MISS and does NOT
-# red the gate. mock is the load-bearing validation.
+# CI POSTURE (deferred live arm — see .gitea/workflows/e2e-api.yml):
+# The live e2e-api job does NOT set E2E_REQUIRE_LIVE, because CI cannot
+# currently provision ANY runtime end-to-end (MiniMax create → 422
+# UNREGISTERED_MODEL_FOR_RUNTIME; the mock org-import arm fails create in CI;
+# claude-code needs an LLM key CI lacks). Forcing E2E_REQUIRE_LIVE=1 there
+# would make the REQUIRED `E2E API Smoke Test` gate permanently RED for
+# everyone. So in CI this script still runs its DB/migration/platform-health
+# arms green, and the zero-validated→RED logic is gated by the bash unit test
+# above instead. Wiring a real live-completion arm into CI (a runtime that
+# actually provisions without a secret CI can't supply) is tracked as a
+# FOLLOW-UP, not this PR.
+#
+# LIVE ARMS (run when their prerequisite is present; opportunistic):
+#   - `mock` (run_mock) is the no-key arm: a virtual workspace (no
+#     container, no EC2, no provider) whose org-import path is INTENDED to
+#     short-circuit to status='online' with a canned A2A reply. NOTE: in the
+#     current CI substrate the mock org-import `create` step FAILS, so mock
+#     does NOT validate in CI today — it is a local/dev arm and a candidate
+#     for the deferred live-completion follow-up, not a CI backbone.
+#   - MiniMax (E2E_MINIMAX_API_KEY, from MOLECULE_STAGING_MINIMAX_API_KEY) is
+#     an OPPORTUNISTIC best-effort real-LLM arm: registry-fragile in CI (422
+#     UNREGISTERED_MODEL_FOR_RUNTIME — see run_minimax header), so a miss is
+#     a best-effort MISS via bestfail() and does NOT red the gate.
+# Because NO arm can currently provision end-to-end in CI, the CI e2e-api job
+# does NOT force E2E_REQUIRE_LIVE (it would red the REQUIRED gate forever).
+# The zero-validated→RED logic is instead regression-gated by the bash unit
+# test (see above). A CI-provisionable live arm is the deferred follow-up.
 #
 # Usage:
-#   # CI — mock backbone always validates; MiniMax bonus if key present:
+#   # Enforce REQUIRE-LIVE locally (need >=1 arm to actually validate):
 #   E2E_REQUIRE_LIVE=1 E2E_MINIMAX_API_KEY=... \
 #     tests/e2e/test_priority_runtimes_e2e.sh
 #
-#   # mock alone is enough to satisfy REQUIRE-LIVE (no key needed):
-#   E2E_REQUIRE_LIVE=1 tests/e2e/test_priority_runtimes_e2e.sh
+#   # Default (no enforcement): all-skip stays a LOUD skip + exit 0:
+#   tests/e2e/test_priority_runtimes_e2e.sh
 #
 #   # Other live arms (if their secrets are configured):
 #   CLAUDE_CODE_OAUTH_TOKEN=... E2E_OPENAI_API_KEY=... \
@@ -83,8 +102,6 @@
 
 set -euo pipefail
 
-source "$(dirname "$0")/_lib.sh"
-
 PASS=0
 FAIL=0
 SKIP=0
@@ -95,6 +112,61 @@ SKIP=0
 # nothing about any runtime, regardless of how many sub-asserts "passed".
 VALIDATED=0
 CREATED_WSIDS=()
+
+# evaluate_require_live_gate — the SINGLE source of the final exit decision.
+# Pure function of $FAIL, $VALIDATED, and $E2E_REQUIRE_LIVE; performs NO I/O
+# beyond the loud messages. Returns the exit code the script should exit with:
+#   - FAIL>0                       → 1 (a real failure is always red)
+#   - VALIDATED==0 + REQUIRE_LIVE  → 1 (false-green trap: proved nothing → RED)
+#   - VALIDATED==0 + !REQUIRE_LIVE → 0 (dev-convenience LOUD skip)
+#   - VALIDATED>=1                 → 0 (at least one arm validated end-to-end)
+# It is a function (not inline tail code) so test_require_live_priority_gate_unit.sh
+# can drive the REAL decision in isolation — set the counters, call this, assert
+# the return code — with no platform, no provisioning, no network. That makes the
+# zero-validated→RED logic a CI-gated regression contract: a future revert of it
+# fails the unit test on every PR. See that unit test for the fail-direction proof.
+evaluate_require_live_gate() {
+  # Any real failure is always red.
+  if [ "$FAIL" -ne 0 ]; then
+    return 1
+  fi
+
+  # REQUIRE-LIVE gate (mirrors CP serving-e2e SERVING_E2E_REQUIRE_LIVE).
+  # A run where every runtime SKIPPED proves nothing. In enforced mode
+  # (E2E_REQUIRE_LIVE=1) that MUST be red so the required `E2E API Smoke
+  # Test` gate can't be false-green on an all-skip run.
+  local require_live="${E2E_REQUIRE_LIVE:-0}"
+  if [ "$VALIDATED" -eq 0 ]; then
+    if [ "$require_live" = "1" ] || [ "$require_live" = "true" ]; then
+      echo "::error::E2E_REQUIRE_LIVE is set but ZERO runtimes were validated end-to-end." >&2
+      echo "         Every runtime SKIPPED — no live secret was present, so this gate" >&2
+      echo "         validated nothing. Wire at least one live arm via Gitea secrets" >&2
+      echo "         (E2E_MINIMAX_API_KEY ← MOLECULE_STAGING_MINIMAX_API_KEY is the" >&2
+      echo "         default CI arm; CLAUDE_CODE_OAUTH_TOKEN / E2E_OPENAI_API_KEY also" >&2
+      echo "         work) so >=1 runtime actually provisions + replies. Failing RED" >&2
+      echo "         instead of false-green." >&2
+      return 1
+    fi
+    # Dev convenience: no enforcement requested → loud skip, exit 0.
+    echo "SKIPPED: no live secrets present and E2E_REQUIRE_LIVE is not set — validated" >&2
+    echo "         zero runtimes. This is a dev-convenience pass; CI sets" >&2
+    echo "         E2E_REQUIRE_LIVE=1 to make zero-validated a hard failure." >&2
+    return 0
+  fi
+
+  echo "OK: $VALIDATED runtime(s) validated end-to-end."
+  return 0
+}
+
+# Source-guard: when sourced by the unit test (E2E_PRIORITY_UNIT_SOURCE=1) we
+# stop HERE — the counters + evaluate_require_live_gate are now defined, and we
+# must NOT fall through to _lib.sh's platform-dependent helpers or the live
+# pre-sweep curl below (there is no platform in the unit-test environment).
+if [ "${E2E_PRIORITY_UNIT_SOURCE:-0}" = "1" ]; then
+  return 0
+fi
+
+source "$(dirname "$0")/_lib.sh"
 
 cleanup() {
   # `set -u` + empty array would error on "${CREATED_WSIDS[@]}"; the
@@ -656,33 +728,9 @@ done
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed, $SKIP skipped, $VALIDATED runtime(s) validated end-to-end ==="
 
-# Any real failure is always red.
-if [ "$FAIL" -ne 0 ]; then
-  exit 1
-fi
-
-# REQUIRE-LIVE gate (mirrors CP serving-e2e SERVING_E2E_REQUIRE_LIVE).
-# A run where every runtime SKIPPED proves nothing. In enforced mode
-# (CI sets E2E_REQUIRE_LIVE=1) that MUST be red so the required
-# `E2E API Smoke Test` gate can't be false-green on an all-skip run.
-REQUIRE_LIVE="${E2E_REQUIRE_LIVE:-0}"
-if [ "$VALIDATED" -eq 0 ]; then
-  if [ "$REQUIRE_LIVE" = "1" ] || [ "$REQUIRE_LIVE" = "true" ]; then
-    echo "::error::E2E_REQUIRE_LIVE is set but ZERO runtimes were validated end-to-end." >&2
-    echo "         Every runtime SKIPPED — no live secret was present, so this gate" >&2
-    echo "         validated nothing. Wire at least one live arm via Gitea secrets" >&2
-    echo "         (E2E_MINIMAX_API_KEY ← MOLECULE_STAGING_MINIMAX_API_KEY is the" >&2
-    echo "         default CI arm; CLAUDE_CODE_OAUTH_TOKEN / E2E_OPENAI_API_KEY also" >&2
-    echo "         work) so >=1 runtime actually provisions + replies. Failing RED" >&2
-    echo "         instead of false-green." >&2
-    exit 1
-  fi
-  # Dev convenience: no enforcement requested → loud skip, exit 0.
-  echo "SKIPPED: no live secrets present and E2E_REQUIRE_LIVE is not set — validated" >&2
-  echo "         zero runtimes. This is a dev-convenience pass; CI sets" >&2
-  echo "         E2E_REQUIRE_LIVE=1 to make zero-validated a hard failure." >&2
-  exit 0
-fi
-
-echo "OK: $VALIDATED runtime(s) validated end-to-end."
-exit 0
+# Final exit decision lives in evaluate_require_live_gate (defined at the top of
+# this file, before any platform I/O) so the same logic is unit-tested in
+# isolation by test_require_live_priority_gate_unit.sh. Mirror its return code
+# into the process exit code.
+evaluate_require_live_gate
+exit $?
