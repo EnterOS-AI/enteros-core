@@ -40,9 +40,25 @@
 #   E2E_INTENTIONAL_FAILURE     1 → break a step on purpose to verify
 #                               the EXIT trap still tears down (mirrors
 #                               the full-saas harness's safety net).
+#   E2E_REQUIRE_LIVE            1 → fail-closed if the harness exits 0
+#                               WITHOUT having driven all four
+#                               awaiting_agent transitions. CI sets this
+#                               so a future skip / early-return can never
+#                               masquerade as a green run. Mirrors CP
+#                               serving-e2e SERVING_E2E_REQUIRE_LIVE.
+#   E2E_STALE_POLL_DEADLINE_SECS  default 240. Upper bound for the
+#                               heartbeat-staleness READINESS poll (step
+#                               6). Replaces the old fixed sleep+one-shot
+#                               assert that raced the sweep cadence.
+#   E2E_TRANSIENT_RETRIES      default 8. Bounded retries for register /
+#                               re-register against transient edge errors
+#                               (502/503/504 from Caddy during cold TLS /
+#                               agent boot). Mirrors the full-saas
+#                               cold-start retry loop — NOT a bare sleep.
 #
 # Exit codes: 0 happy, 1 generic, 2 missing env, 3 provision timeout,
-# 4 teardown leak.
+# 4 teardown leak, 5 REQUIRE_LIVE violation (exited 0 having validated
+# nothing).
 
 set -euo pipefail
 
@@ -51,6 +67,13 @@ ADMIN_TOKEN="${MOLECULE_ADMIN_TOKEN:?MOLECULE_ADMIN_TOKEN required — Railway s
 PROVISION_TIMEOUT_SECS="${E2E_PROVISION_TIMEOUT_SECS:-900}"
 RUN_ID_SUFFIX="${E2E_RUN_ID:-$(date +%H%M%S)-$$}"
 STALE_WAIT_SECS="${E2E_STALE_WAIT_SECS:-180}"
+# Readiness-poll deadline for the sweep transition (step 6). Must exceed
+# STALE_WAIT_SECS (the no-heartbeat window) by at least one sweep
+# interval so a slightly-late sweep tick is polled-for, not misread as a
+# stuck 'online'. 240 = 180s window + 60s sweep-cadence headroom.
+STALE_POLL_DEADLINE_SECS="${E2E_STALE_POLL_DEADLINE_SECS:-240}"
+TRANSIENT_RETRIES="${E2E_TRANSIENT_RETRIES:-8}"
+REQUIRE_LIVE="${E2E_REQUIRE_LIVE:-0}"
 
 SLUG="e2e-ext-$(date +%Y%m%d)-${RUN_ID_SUFFIX}"
 SLUG=$(echo "$SLUG" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-' | head -c 32)
@@ -58,6 +81,66 @@ SLUG=$(echo "$SLUG" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-' | head -c 32
 log()  { echo "[$(date +%H:%M:%S)] $*"; }
 fail() { echo "[$(date +%H:%M:%S)] ❌ $*" >&2; exit 1; }
 ok()   { echo "[$(date +%H:%M:%S)] ✅ $*"; }
+
+# REQUIRE_LIVE bookkeeping: count the four awaiting_agent transitions the
+# test is contracted to prove. The EXIT trap fails-closed (exit 5) if the
+# script reaches a clean exit without all four — so a silent skip, an
+# early `return 0`, or a refactor that drops a step can never show green.
+TRANSITIONS_VERIFIED=0
+EXPECTED_TRANSITIONS=4
+require_transition() {  # $1 = human label
+  TRANSITIONS_VERIFIED=$((TRANSITIONS_VERIFIED + 1))
+  log "    [require-live] transition ${TRANSITIONS_VERIFIED}/${EXPECTED_TRANSITIONS} proven: $1"
+}
+
+# Redact bearer tokens from any HTTP body before logging (mirrors the
+# full-saas sanitize_http_body so transient-error logs never leak creds).
+sanitize_http_body() {
+  sed -E 's/(Bearer|token)[[:space:]]+[A-Za-z0-9._-]+/\1 REDACTED/g'
+}
+
+# Bounded retry-on-transient for POST /registry/register. The tenant edge
+# (Caddy) returns 502/503/504 with an identifiable body while TLS / the
+# workspace agent finishes cold-booting — a single shot here was the
+# un-named flake (a transient edge error misread as a register failure).
+# This mirrors the full-saas cold-start loop (test_staging_full_saas.sh
+# ~L780-816): retry ONLY on a transient TRANSPORT class (5xx + body
+# match), bounded by TRANSIENT_RETRIES, and FAIL CLOSED (non-zero) once
+# the budget is spent. It deliberately does NOT retry on a 4xx — that's a
+# real contract bug (e.g. wrong payload field) and must stay red.
+# Sets REGISTER_RESP (body + trailing "HTTP_CODE=NNN" line) on success;
+# returns non-zero (caller `fail`s) when the bounded budget is exhausted.
+register_with_retry() {  # $1 = step label, $2 = request body
+  local label="$1" body="$2"
+  local attempt code resp safe
+  for attempt in $(seq 1 "$TRANSIENT_RETRIES"); do
+    set +e
+    resp=$(curl -sS --max-time 30 -w "\nHTTP_CODE=%{http_code}" -X POST \
+      "$TENANT_URL/registry/register" \
+      -H "Authorization: Bearer $WS_AUTH_TOKEN" \
+      -H "X-Molecule-Org-Id: $ORG_ID" \
+      -H "Content-Type: application/json" \
+      -d "$body")
+    set -e
+    code=$(printf '%s' "$resp" | sed -n 's/^HTTP_CODE=//p' | tail -n1)
+    code=${code:-000}
+    if [ "$code" = "200" ]; then
+      REGISTER_RESP="$resp"
+      return 0
+    fi
+    safe=$(printf '%s' "$resp" | sanitize_http_body | head -c 300)
+    # Retry ONLY on a transient transport class; a 4xx is a real bug.
+    if echo "$code" | grep -Eq '^(502|503|504)$' \
+       && echo "$safe" | grep -Eqi 'Service Unavailable|Bad Gateway|Gateway Timeout|error code: 502|error code: 504|workspace agent unreachable|connection refused|no healthy upstream'; then
+      log "    ${label} transient $code attempt ${attempt}/${TRANSIENT_RETRIES}: $safe"
+      [ "$attempt" -lt "$TRANSIENT_RETRIES" ] && { sleep 10; continue; }
+    fi
+    # Non-transient (4xx, or unrecognized 5xx body): stop and fail closed.
+    REGISTER_RESP="$resp"
+    return 1
+  done
+  return 1
+}
 
 CURL_COMMON=(-sS --fail-with-body --max-time 30)
 
@@ -98,8 +181,19 @@ cleanup_org() {
   fi
   ok "Teardown clean — no orphan resources for $SLUG (${elapsed}s)"
 
+  # REQUIRE_LIVE fail-closed gate. Only meaningful on an OTHERWISE-CLEAN
+  # exit (entry_rc==0): a script that completed all steps but somehow did
+  # not register all four transitions (a skip, an early return, a dropped
+  # assertion in a refactor) must NOT report success. A non-zero entry_rc
+  # already carries its own failure semantics — don't mask it with 5.
+  if [ "$entry_rc" = "0" ] && [ "${REQUIRE_LIVE}" = "1" ] \
+     && [ "$TRANSITIONS_VERIFIED" -lt "$EXPECTED_TRANSITIONS" ]; then
+    echo "❌ REQUIRE_LIVE: exited 0 but only ${TRANSITIONS_VERIFIED}/${EXPECTED_TRANSITIONS} awaiting_agent transitions were proven — refusing to report green." >&2
+    exit 5
+  fi
+
   case "$entry_rc" in
-    0|1|2|3|4) ;;
+    0|1|2|3|4|5) ;;
     *) exit 1 ;;
   esac
 }
@@ -248,6 +342,7 @@ GET_RESP=$(tenant_call GET "/workspaces/$WS_ID")
 DB_STATUS=$(echo "$GET_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))")
 [ "$DB_STATUS" != "awaiting_agent" ] && fail "DB row status=$DB_STATUS (expected awaiting_agent — migration 046 likely not applied)"
 ok "DB row stored as awaiting_agent (proof migration 046 applied)"
+require_transition "create: provisioning → awaiting_agent (DB-verified)"
 
 # ─── 5. Register the workspace (transitions to online) ──────────────────
 # Pre-fix this path was actually fine because it writes 'online', a value
@@ -277,20 +372,20 @@ log "5/8 Registering workspace via /registry/register..."
 #   url           — accepted but not dispatched-to in poll mode, so
 #                   example.invalid is a valid sentinel.
 REGISTER_BODY=$(printf '{"id":"%s","url":"https://example.invalid:443","delivery_mode":"poll","agent_card":{"name":"e2e-ext","skills":[{"id":"echo","name":"Echo"}]}}' "$WS_ID")
-# Disable --fail-with-body for this one call so a 4xx surfaces the response
-# body (the bare CURL_COMMON would `set -e`-kill before we could log it).
-REGISTER_RESP=$(curl -sS --max-time 30 -w "\nHTTP_CODE=%{http_code}" -X POST "$TENANT_URL/registry/register" \
-  -H "Authorization: Bearer $WS_AUTH_TOKEN" \
-  -H "X-Molecule-Org-Id: $ORG_ID" \
-  -H "Content-Type: application/json" \
-  -d "$REGISTER_BODY") || true
-log "    register response: $(echo "$REGISTER_RESP" | head -c 300)"
-echo "$REGISTER_RESP" | grep -q "HTTP_CODE=200" || fail "register returned non-200 — see body above"
+# Bounded retry-on-transient (see register_with_retry). The previous
+# single-shot here would `fail` on a cold-boot 502 from the tenant edge —
+# an un-named transient misread as a register break. The helper retries
+# ONLY that class and fails closed on a real 4xx or an exhausted budget.
+REGISTER_RESP=""
+register_with_retry "register" "$REGISTER_BODY" \
+  || fail "register returned non-200 after bounded retries — body: $(printf '%s' "$REGISTER_RESP" | sanitize_http_body | head -c 300)"
+log "    register response: $(echo "$REGISTER_RESP" | sanitize_http_body | head -c 300)"
 
 GET_RESP=$(tenant_call GET "/workspaces/$WS_ID")
 ONLINE_STATUS=$(echo "$GET_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))")
 [ "$ONLINE_STATUS" != "online" ] && fail "Expected online after register, got $ONLINE_STATUS"
 ok "Workspace transitioned to online"
+require_transition "register: awaiting_agent → online"
 
 # Confirm the register handler echoed back delivery_mode=poll. We read
 # this from the register RESPONSE, not the workspace GET response, because
@@ -310,38 +405,63 @@ fi
 # This is the SECOND silent-failure path (registry/healthsweep.go's
 # sweepStaleRemoteWorkspaces). Pre-migration-046 the heartbeat-staleness
 # UPDATE silently failed and the workspace stuck on 'online' forever
-# even though no agent was alive. We wait the full window + a sweep
-# interval and assert the row transitions back to 'awaiting_agent'.
-log "6/8 Waiting ${STALE_WAIT_SECS}s for heartbeat-staleness sweep (no heartbeat sent)..."
+# even though no agent was alive.
+#
+# FLAKE FIX (named: sweep-cadence race). The old code did a FIXED
+# `sleep $STALE_WAIT_SECS` then a SINGLE assert. The staleness sweep is a
+# periodic tick (REMOTE_LIVENESS_STALE_AFTER + a sweep interval); if the
+# tick that flips the row lands even one second after the fixed sleep, the
+# one-shot GET reads 'online' and the test fails — a real transition,
+# misread as a flake because the assert was racing the sweep cadence.
+# Replace with: sleep through the mandatory no-heartbeat window ONCE (the
+# sweep cannot fire before the window elapses, so polling earlier is
+# pointless), then READINESS-POLL for the awaiting_agent transition up to
+# STALE_POLL_DEADLINE_SECS, hard-failing with a clear message at the
+# deadline. Deterministic: a slow-but-working sweep passes; a genuinely
+# stuck 'online' still fails (now with how long we actually waited).
+log "6/8 Waiting ${STALE_WAIT_SECS}s no-heartbeat window, then polling for sweep (up to ${STALE_POLL_DEADLINE_SECS}s total)..."
+[ "$STALE_POLL_DEADLINE_SECS" -le "$STALE_WAIT_SECS" ] && \
+  fail "Misconfigured: STALE_POLL_DEADLINE_SECS ($STALE_POLL_DEADLINE_SECS) must exceed STALE_WAIT_SECS ($STALE_WAIT_SECS) by at least one sweep interval"
 sleep "$STALE_WAIT_SECS"
 
-GET_RESP=$(tenant_call GET "/workspaces/$WS_ID")
-STALE_STATUS=$(echo "$GET_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))")
-[ "$STALE_STATUS" != "awaiting_agent" ] && \
-  fail "After ${STALE_WAIT_SECS}s with no heartbeat, expected status=awaiting_agent (sweep transition), got $STALE_STATUS — migration 046 likely not applied OR sweep not running"
+STALE_DEADLINE=$(( $(date +%s) + (STALE_POLL_DEADLINE_SECS - STALE_WAIT_SECS) ))
+STALE_STATUS=""
+while true; do
+  GET_RESP=$(tenant_call GET "/workspaces/$WS_ID")
+  STALE_STATUS=$(echo "$GET_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))")
+  [ "$STALE_STATUS" = "awaiting_agent" ] && break
+  if [ "$(date +%s)" -gt "$STALE_DEADLINE" ]; then
+    fail "After ${STALE_POLL_DEADLINE_SECS}s with no heartbeat, status still '$STALE_STATUS' (expected awaiting_agent sweep transition) — migration 046 likely not applied OR sweep not running"
+  fi
+  sleep 10
+done
 ok "Heartbeat-staleness sweep transitioned online → awaiting_agent (proof healthsweep.go fix working)"
+require_transition "sweep: online → awaiting_agent (no heartbeat)"
 
 # ─── 7. Re-register and confirm we can come back online ─────────────────
 # This proves the awaiting_agent state is recoverable (re-registrable),
 # which is the whole point of using it instead of 'offline'.
 log "7/8 Re-registering after stale → confirming recovery to online..."
 # Same payload contract as step 5 (id + agent_card both required). See note
-# there for why workspace_id would 400.
-REREG_RESP=$(curl -sS --max-time 30 -w "\nHTTP_CODE=%{http_code}" -X POST "$TENANT_URL/registry/register" \
-  -H "Authorization: Bearer $WS_AUTH_TOKEN" \
-  -H "X-Molecule-Org-Id: $ORG_ID" \
-  -H "Content-Type: application/json" \
-  -d "$REGISTER_BODY") || true
-log "    re-register response: $(echo "$REREG_RESP" | head -c 300)"
-echo "$REREG_RESP" | grep -q "HTTP_CODE=200" || fail "re-register returned non-200 — see body above"
+# there for why workspace_id would 400. Same bounded retry-on-transient.
+REGISTER_RESP=""
+register_with_retry "re-register" "$REGISTER_BODY" \
+  || fail "re-register returned non-200 after bounded retries — body: $(printf '%s' "$REGISTER_RESP" | sanitize_http_body | head -c 300)"
+log "    re-register response: $(echo "$REGISTER_RESP" | sanitize_http_body | head -c 300)"
 
 GET_RESP=$(tenant_call GET "/workspaces/$WS_ID")
 RECOVERED_STATUS=$(echo "$GET_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))")
 [ "$RECOVERED_STATUS" != "online" ] && \
   fail "Expected re-register to return workspace to online, got $RECOVERED_STATUS"
 ok "Re-register succeeded — awaiting_agent → online (operator-recoverable)"
+require_transition "re-register: awaiting_agent → online (recovery)"
 
 # ─── 8. Done — cleanup runs in the EXIT trap ───────────────────────────
+# REQUIRE_LIVE belt-and-braces: assert here too (in addition to the EXIT
+# trap) so the failure surfaces in step order, not only post-teardown.
+if [ "${REQUIRE_LIVE}" = "1" ] && [ "$TRANSITIONS_VERIFIED" -lt "$EXPECTED_TRANSITIONS" ]; then
+  fail "REQUIRE_LIVE: only ${TRANSITIONS_VERIFIED}/${EXPECTED_TRANSITIONS} transitions proven at end of run"
+fi
 log "8/8 All four awaiting_agent transitions verified."
 log "═══════════════════════════════════════════════════════════════════"
 ok "External-runtime E2E PASSED on $SLUG"
