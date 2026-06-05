@@ -1434,12 +1434,44 @@ print(json.dumps({
     'scope': 'LOCAL'
 }))
 ")
-  tenant_call POST "/workspaces/$PARENT_ID/memories" \
+  # SURFACE THE BODY (mirrors the step-9b / A2A pattern): the previous
+  # `>/dev/null || fail "memory POST failed"` discarded the response body
+  # that --fail-with-body deliberately preserves on a non-2xx, so a 500 from
+  # the workspace-server HMA path (e.g. "failed to store memory" /
+  # "failed to resolve writable namespaces", or a 503 "memory plugin is not
+  # configured") was reported as a bare "memory POST failed" — opaque, the
+  # same #2310-class blind spot. Route http_code into -w and body into -o,
+  # then fail with the sanitized status+body so the mechanism is visible.
+  MEM_POST_TMP=$(e2e_tmp /tmp/e2e_mem_post.XXXXXX)
+  set +e
+  MEM_POST_CODE=$(tenant_call POST "/workspaces/$PARENT_ID/memories" \
     -H "Content-Type: application/json" \
-    -d "$MEM_PAYLOAD" >/dev/null || fail "memory POST failed"
-  MEM_LIST=$(tenant_call GET "/workspaces/$PARENT_ID/memories?scope=LOCAL")
+    -d "$MEM_PAYLOAD" \
+    -o "$MEM_POST_TMP" -w "%{http_code}" 2>/dev/null)
+  MEM_POST_RC=$?
+  set -e
+  MEM_POST_CODE=${MEM_POST_CODE:-000}
+  if [ "$MEM_POST_RC" != "0" ] || [ "$MEM_POST_CODE" -lt 200 ] || [ "$MEM_POST_CODE" -ge 300 ]; then
+    MEM_POST_BODY=$(head -c 400 "$MEM_POST_TMP" 2>/dev/null | sanitize_http_body)
+    fail "memory POST /workspaces/$PARENT_ID/memories failed (curl_rc=$MEM_POST_RC, http=$MEM_POST_CODE): ${MEM_POST_BODY:-<empty body>}"
+  fi
+
+  # Same fail-closed surfacing for the read-back: a 5xx / network error here
+  # previously slipped through the bare `$(tenant_call ...)` capture and only
+  # showed up as "not readable" with an empty list.
+  MEM_LIST_TMP=$(e2e_tmp /tmp/e2e_mem_list.XXXXXX)
+  set +e
+  MEM_LIST_CODE=$(tenant_call GET "/workspaces/$PARENT_ID/memories?scope=LOCAL" \
+    -o "$MEM_LIST_TMP" -w "%{http_code}" 2>/dev/null)
+  MEM_LIST_RC=$?
+  set -e
+  MEM_LIST_CODE=${MEM_LIST_CODE:-000}
+  MEM_LIST=$(cat "$MEM_LIST_TMP" 2>/dev/null || echo "")
+  if [ "$MEM_LIST_RC" != "0" ] || [ "$MEM_LIST_CODE" -lt 200 ] || [ "$MEM_LIST_CODE" -ge 300 ]; then
+    fail "memory GET /workspaces/$PARENT_ID/memories failed (curl_rc=$MEM_LIST_RC, http=$MEM_LIST_CODE): $(printf '%s' "$MEM_LIST" | sanitize_http_body | head -c 400)"
+  fi
   if ! echo "$MEM_LIST" | grep -q "run $SLUG"; then
-    fail "HMA memory not readable after write. List: ${MEM_LIST:0:200}"
+    fail "HMA memory not readable after write (http=$MEM_LIST_CODE). List: $(printf '%s' "$MEM_LIST" | sanitize_http_body | head -c 200)"
   fi
   ok "HMA memory write+read roundtripped"
 
