@@ -109,6 +109,9 @@ jobs:
       E2E_ANTHROPIC_API_KEY: ${{ secrets.MOLECULE_STAGING_ANTHROPIC_API_KEY }}
       E2E_OPENAI_API_KEY: ${{ secrets.MOLECULE_STAGING_OPENAI_API_KEY }}
       E2E_RUNTIME: claude-code
+      # Platform-managed create path (moonshot/kimi-k2.6, no tenant key) — the
+      # combo proven to create cleanly; this test only needs the ws online.
+      E2E_LLM_PATH: platform
       E2E_MODEL_SLUG: MiniMax-M2
       E2E_RUN_ID: "${{ github.run_id }}-${{ github.run_attempt }}"
       E2E_KEEP_ORG: ${{ github.event.inputs.keep_org && '1' || '0' }}

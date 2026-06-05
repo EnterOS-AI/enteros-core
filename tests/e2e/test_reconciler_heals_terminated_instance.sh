@@ -50,7 +50,11 @@
 # Optional env (mirrors the full-saas harness where they overlap):
 #   E2E_RUNTIME                        claude-code (default)
 #   E2E_PROVISION_TIMEOUT_SECS         default 900 (cold EC2 budget)
-#   E2E_WORKSPACE_ONLINE_TIMEOUT_SECS  default 3600 (cold-boot worst-case)
+#   E2E_WORKSPACE_ONLINE_TIMEOUT_SECS  default 900 (15min). A workspace that
+#                     cannot reach online in 15min is a staging/boot problem,
+#                     not slow cold-boot — fail fast so the trap tears down the
+#                     EC2 instead of hanging ~1h and leaking a running instance
+#                     (observed: run 216031 hung 32min with a live e2e-rec EC2).
 #   E2E_RECONCILE_OFFLINE_TIMEOUT_SECS default 180 (PRIMARY: leave 'online'.
 #                                      Reconciler cadence is 60s — 3 cycles +
 #                                      AWS terminate-visibility slack.)
@@ -82,7 +86,7 @@ CP_URL="${MOLECULE_CP_URL:-https://staging-api.moleculesai.app}"
 ADMIN_TOKEN="${MOLECULE_ADMIN_TOKEN:?MOLECULE_ADMIN_TOKEN required — Railway staging CP_ADMIN_API_TOKEN}"
 RUNTIME="${E2E_RUNTIME:-claude-code}"
 PROVISION_TIMEOUT_SECS="${E2E_PROVISION_TIMEOUT_SECS:-900}"
-WORKSPACE_ONLINE_TIMEOUT_SECS="${E2E_WORKSPACE_ONLINE_TIMEOUT_SECS:-3600}"
+WORKSPACE_ONLINE_TIMEOUT_SECS="${E2E_WORKSPACE_ONLINE_TIMEOUT_SECS:-900}"
 # PRIMARY bound: the reconciler ticks every 60s; it needs one cycle to see
 # the dead instance after AWS makes the terminate visible to DescribeInstances
 # (typically seconds, but can lag). 180s = ~3 cycles + slack.
@@ -325,7 +329,18 @@ ws_field() {
 # tolerable — but wiring the same keys keeps boot behaviour identical to the
 # sibling and avoids a config path that only this test would exercise.
 SECRETS_JSON='{}'
-if [ -n "${E2E_MINIMAX_API_KEY:-}" ]; then
+# Platform-managed path (E2E_LLM_PATH=platform, the DEFAULT for this test):
+# the workspace boots on the CP LLM proxy with NO tenant key, model
+# moonshot/kimi-k2.6 — the exact create combo test_staging_full_saas.sh uses
+# successfully. This test only needs the workspace to reach status=online so
+# it can kill the EC2 and assert the reconciler heals it; it does NOT exercise
+# a real LLM completion, so the platform path is both sufficient and the one
+# proven to create cleanly. (The BYOK key paths below 400'd at create — see
+# the create-failure capture added below — which is why platform is default.)
+if [ "${E2E_LLM_PATH:-platform}" = "platform" ]; then
+  log "    LLM path: PLATFORM-MANAGED (no tenant key; moonshot/kimi-k2.6 via proxy)"
+  SECRETS_JSON='{}'
+elif [ -n "${E2E_MINIMAX_API_KEY:-}" ]; then
   SECRETS_JSON=$(python3 -c "import json,os; print(json.dumps({'MINIMAX_API_KEY': os.environ['E2E_MINIMAX_API_KEY']}))")
 elif [ -n "${E2E_ANTHROPIC_API_KEY:-}" ]; then
   SECRETS_JSON=$(python3 -c "import json,os; print(json.dumps({'ANTHROPIC_API_KEY': os.environ['E2E_ANTHROPIC_API_KEY']}))")
@@ -345,15 +360,22 @@ print(json.dumps({
 ")
 fi
 
-MODEL_SLUG=$(pick_model_slug "$RUNTIME")
+E2E_LLM_PATH="${E2E_LLM_PATH:-platform}" MODEL_SLUG=$(E2E_LLM_PATH="${E2E_LLM_PATH:-platform}" pick_model_slug "$RUNTIME")
 log "    MODEL_SLUG=$MODEL_SLUG"
 
 log "4/6 Provisioning workspace (runtime=$RUNTIME)..."
+# --fail-with-body makes curl exit non-zero on a 4xx/5xx but STILL writes the
+# response body to stdout; the `|| { ... }` catches that so the body is printed
+# instead of `set -e` aborting the command-substitution silently (the old bug
+# that hid the real HTTP-400 reason). $WS_RESP holds the body either way.
 WS_RESP=$(tenant_call POST /workspaces \
   -H "Content-Type: application/json" \
-  -d "{\"name\":\"E2E Reconciler\",\"runtime\":\"$RUNTIME\",\"tier\":2,\"model\":\"$MODEL_SLUG\",\"secrets\":$SECRETS_JSON}")
-WS_ID=$(echo "$WS_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
-[ -z "$WS_ID" ] && fail "Workspace create response missing 'id': $WS_RESP"
+  -d "{\"name\":\"E2E Reconciler\",\"runtime\":\"$RUNTIME\",\"tier\":2,\"model\":\"$MODEL_SLUG\",\"secrets\":$SECRETS_JSON}") || {
+  rc=$?
+  fail "Workspace create failed (curl rc=$rc, model=$MODEL_SLUG). Response body: $WS_RESP"
+}
+WS_ID=$(echo "$WS_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('id',''))" 2>/dev/null)
+[ -z "$WS_ID" ] && fail "Workspace create response missing 'id' (model=$MODEL_SLUG): $WS_RESP"
 log "    WS_ID=$WS_ID"
 
 # Wait for the workspace to reach status=online and capture its instance_id.
