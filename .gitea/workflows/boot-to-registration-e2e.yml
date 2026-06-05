@@ -41,27 +41,10 @@ name: boot-to-registration-e2e (advisory)
 
 on:
   workflow_dispatch:
-    inputs:
-      runtime:
-        description: "Runtime to provision (claude-code default)"
-        required: false
-        default: "claude-code"
-        type: string
-      billing_mode:
-        description: "Billing mode (platform_managed default — exercises cp#469 cluster path)"
-        required: false
-        default: "platform_managed"
-        type: string
-      provider:
-        description: "Provider (platform = LLM proxy, the cp#469 cluster path)"
-        required: false
-        default: "platform"
-        type: string
-      model:
-        description: "Model id (default moonshot/kimi-k2.6 per CTO directive 14eb4f07)"
-        required: false
-        default: "moonshot/kimi-k2.6"
-        type: string
+  # Note: Gitea 1.22.6 does not support workflow_dispatch.inputs
+  # (feedback_gitea_workflow_dispatch_inputs_unsupported). Defaults
+  # are hardcoded in the job env below. Stage 2 can add matrix/
+  # param support once the Gitea version supports it.
 
 # Advisory: no cron schedule, manual dispatch only. Branch protection
 # doesn't require this — RED on main is expected pre-cp#469-cluster
@@ -87,10 +70,13 @@ jobs:
     #   - tail headroom: ~6-7 min
     timeout-minutes: 12
     env:
-      E2E_RUNTIME: ${{ github.event.inputs.runtime || 'claude-code' }}
-      E2E_BILLING_MODE: ${{ github.event.inputs.billing_mode || 'platform_managed' }}
-      E2E_PROVIDER: ${{ github.event.inputs.provider || 'platform' }}
-      E2E_MODEL: ${{ github.event.inputs.model || 'moonshot/kimi-k2.6' }}
+      # Hardcoded defaults — Gitea 1.22.6 does not support workflow_dispatch.inputs
+      # (feedback_gitea_workflow_dispatch_inputs_unsupported). Stage 2 can add
+      # matrix/param support once the Gitea version supports it.
+      E2E_RUNTIME: claude-code
+      E2E_BILLING_MODE: platform_managed
+      E2E_PROVIDER: platform
+      E2E_MODEL: moonshot/kimi-k2.6
       E2E_RUN_ID: cp455-${{ github.run_id }}
       E2E_PROVISION_TIMEOUT_SECS: '300' # 5 min — fast teardown budget
       MOLECULE_CP_URL: ${{ vars.STAGING_CP_URL || 'https://staging-api.moleculesai.app' }}
