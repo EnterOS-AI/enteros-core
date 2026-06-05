@@ -1816,8 +1816,9 @@ func TestBuildDelegateA2ABody_SchemaValidSendMessageRequest(t *testing.T) {
 	if !ok {
 		t.Fatalf("first part is not a map: %T", parts[0])
 	}
-	if firstPart["type"] != "text" {
-		t.Errorf("first part type = %v, want text", firstPart["type"])
+	// A2A v0.3 Part discriminator is `kind`, NOT `type` (#2251)
+	if firstPart["kind"] != "text" {
+		t.Errorf("first part kind = %v, want text", firstPart["kind"])
 	}
 	if firstPart["text"] != task {
 		t.Errorf("first part text = %v, want %q", firstPart["text"], task)
