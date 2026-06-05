@@ -654,6 +654,125 @@ fi
 MODEL_SLUG=$(pick_model_slug "$RUNTIME")
 log "    MODEL_SLUG=$MODEL_SLUG"
 
+# ─── BYOK opt-in split (secret-write gate requires explicit byok) ───────
+# Every vendor-key arm above (MiniMax / Anthropic / Google / OpenAI-hermes)
+# writes one or more keys that workspace-server's secret-write gate —
+# rejectPlatformManagedDirectLLMBypassForWorkspace in
+# workspace-server/internal/handlers/secrets.go — STRIPS/BLOCKS while a
+# workspace's resolved billing mode is platform_managed (the org/CTO default).
+# The strip-list (secrets.go platformManagedDirectLLMBypassKeys) includes
+# MINIMAX_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY, OPENAI_API_KEY/_BASE_URL,
+# HERMES_CUSTOM_API_KEY/_BASE_URL, etc. A bare vendor key in the CREATE payload
+# does NOT auto-derive byok: at create time no auth-env is present yet, so the
+# resolver derives platform_managed and the write is rejected. The resolver's
+# org rung was retired (internal#718 P2-B) — ResolveLLMBillingMode now ignores
+# the org default — so the ONLY way to opt a workspace into byok is an explicit
+# per-workspace override via PUT /admin/workspaces/:id/llm-billing-mode.
+#
+# Real evidence — staging job 295385 (main f1558b54), AFTER #2311/#2312 made
+# bare `MiniMax-M2.7` registry-valid: parent-create passed model validation but
+# FAILED with
+#   {"error":"direct vendor key writes are blocked for platform-managed
+#    workspaces; ... or set this workspace's billing mode to 'byok' via
+#    /admin/workspaces/:id/llm-billing-mode","key":"MINIMAX_API_KEY"}
+# That 400 is INTENDED product behavior, not a product bug. The e2e must mirror
+# the real BYOK user flow: opt the workspace into byok FIRST, then write the key.
+#
+# Mechanism: per-workspace override (NOT org-default), because the org rung is
+# retired — an org-create billing field could not satisfy this gate even if
+# /cp/admin/orgs accepted one. So for any arm that ships strip-listed keys we:
+#   1. create the workspace WITHOUT those keys (create succeeds platform_managed),
+#   2. PUT billing-mode=byok on that workspace id (per-tenant admin token),
+#   3. write the deferred strip-listed keys (now allowed by the gate),
+# then continue. The #1994 byok-routing guard (8c) then sees a LEGITIMATELY
+# byok workspace (explicit override) and still validates real routing — NOT
+# masked.
+#
+# The PLATFORM path (E2E_LLM_PATH=platform) produces SECRETS_JSON='{}', so it
+# carries NO strip-listed key → CREATE_SECRETS_JSON stays '{}' and no opt-in
+# fires. It remains platform_managed (the moonshot/kimi NOT_CONFIGURED
+# regression guard) — deliberately untouched.
+#
+# Keep this strip-list BYTE-IN-SYNC with secrets.go platformManagedDirectLLMBypassKeys.
+BYOK_STRIP_KEYS="AI_GATEWAY_API_KEY ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ARCEEAI_API_KEY CLAUDE_CODE_OAUTH_TOKEN CODEX_AUTH_JSON DASHSCOPE_API_KEY DEEPSEEK_API_KEY GEMINI_API_KEY GLM_API_KEY HERMES_CUSTOM_API_KEY HERMES_CUSTOM_BASE_URL HF_TOKEN KIMI_API_KEY KIMI_CN_API_KEY MINIMAX_API_KEY MINIMAX_CN_API_KEY NOUS_API_KEY OPENAI_API_KEY OPENAI_BASE_URL OPENROUTER_API_KEY XAI_API_KEY ZAI_API_KEY"
+# Split SECRETS_JSON into CREATE_SECRETS_JSON (gate-safe, written at create)
+# and DEFERRED_SECRETS_JSON (strip-listed keys, written AFTER byok opt-in).
+# Emit the two JSON blobs on SEPARATE LINES (not space-separated) — a value or
+# a json.dumps default separator contains spaces, which whitespace-`read` would
+# mangle. read -r line1 → CREATE, line2 → DEFERRED.
+{
+  read -r CREATE_SECRETS_JSON
+  read -r DEFERRED_SECRETS_JSON
+} < <(
+  BYOK_STRIP_KEYS="$BYOK_STRIP_KEYS" E2E_WS_SECRETS="$SECRETS_JSON" python3 -c "
+import json, os
+strip = set(os.environ['BYOK_STRIP_KEYS'].split())
+d = json.loads(os.environ['E2E_WS_SECRETS'] or '{}')
+create = {k: v for k, v in d.items() if k not in strip}
+deferred = {k: v for k, v in d.items() if k in strip}
+print(json.dumps(create))
+print(json.dumps(deferred))
+"
+)
+# Defensive: if the split somehow produced empty (read failure), treat as
+# no-deferred so we never PUT byok on a workspace that has no vendor key.
+[ -n "$DEFERRED_SECRETS_JSON" ] || DEFERRED_SECRETS_JSON='{}'
+[ -n "$CREATE_SECRETS_JSON" ] || CREATE_SECRETS_JSON='{}'
+if [ "$DEFERRED_SECRETS_JSON" != "{}" ]; then
+  log "    BYOK opt-in required — deferring vendor key(s) until after billing-mode=byok"
+fi
+
+# byok_opt_in_and_write_deferred <workspace_id>
+#   For the byok arms (DEFERRED_SECRETS_JSON non-empty): PUT billing-mode=byok
+#   on the workspace, then write each deferred strip-listed secret (now allowed
+#   by the secret-write gate). No-op for the platform/no-key path. See the
+#   BYOK-opt-in block above + secrets.go rejectPlatformManagedDirectLLMBypassForWorkspace.
+byok_opt_in_and_write_deferred() {
+  local _id="$1"
+  if [ "$DEFERRED_SECRETS_JSON" = "{}" ]; then
+    return 0
+  fi
+  # Explicit byok opt-in (per-workspace override).
+  local _bm_resp _bm_mode
+  set +e
+  _bm_resp=$(tenant_call PUT "/admin/workspaces/$_id/llm-billing-mode" \
+    -H "Content-Type: application/json" \
+    -d '{"mode":"byok"}' 2>/dev/null)
+  local _bm_rc=$?
+  set -e
+  if [ "$_bm_rc" != "0" ]; then
+    fail "byok opt-in: PUT /admin/workspaces/$_id/llm-billing-mode {mode:byok} failed (rc=$_bm_rc). Raw: $(printf '%s' "$_bm_resp" | sanitize_http_body)"
+  fi
+  _bm_mode=$(echo "$_bm_resp" | python3 -c "import json,sys; print(json.load(sys.stdin).get('resolved_mode',''))" 2>/dev/null || echo "")
+  [ "$_bm_mode" = "byok" ] || fail "byok opt-in: workspace $_id resolved_mode='$_bm_mode' after PUT mode=byok (want byok). Raw: $(printf '%s' "$_bm_resp" | sanitize_http_body)"
+
+  # Write each deferred strip-listed secret one-per-call (the Set endpoint
+  # takes {key,value}). The gate now passes because resolved=byok. Bodies are
+  # built in Python (env-only) so secret values never hit a command line.
+  local _keys _k _sec_body _sec_tmp _sec_code _sec_out
+  _keys=$(echo "$DEFERRED_SECRETS_JSON" | python3 -c "import json,sys; print('\n'.join(json.load(sys.stdin).keys()))")
+  while IFS= read -r _k; do
+    [ -n "$_k" ] || continue
+    _sec_body=$(BYOK_K="$_k" E2E_WS_DEFERRED="$DEFERRED_SECRETS_JSON" python3 -c "
+import json, os
+d = json.loads(os.environ['E2E_WS_DEFERRED'])
+print(json.dumps({'key': os.environ['BYOK_K'], 'value': d[os.environ['BYOK_K']]}))
+")
+    _sec_tmp=$(mktemp -t synth_byok_secret.XXXXXX)
+    _sec_code=$(printf '%s' "$_sec_body" | tenant_call POST "/workspaces/$_id/secrets" \
+      -H "Content-Type: application/json" \
+      -d @- \
+      -o "$_sec_tmp" -w '%{http_code}' 2>/dev/null || echo "000")
+    if [ "$_sec_code" != "200" ] && [ "$_sec_code" != "201" ] && [ "$_sec_code" != "204" ]; then
+      _sec_out=$(cat "$_sec_tmp" 2>/dev/null | sanitize_http_body)
+      rm -f "$_sec_tmp"
+      fail "byok vendor-key write: POST /workspaces/$_id/secrets ($_k) returned $_sec_code: $_sec_out — secret-write gate should allow it after the byok opt-in (secrets.go rejectPlatformManagedDirectLLMBypassForWorkspace)."
+    fi
+    rm -f "$_sec_tmp"
+  done <<< "$_keys"
+  ok "    $_id byok opt-in + deferred vendor key(s) written"
+}
+
 # ─── runtime → provision-selector resolution ────────────────────────────
 # Most runtimes are selected directly by the `runtime` field. seo-agent is
 # the exception: it is NOT a registry runtime (absent from manifest.json +
@@ -680,7 +799,7 @@ build_create_payload() {
   E2E_WS_RUNTIME="$RUNTIME" \
   E2E_WS_TEMPLATE="$PROVISION_TEMPLATE" \
   E2E_WS_MODEL="$MODEL_SLUG" \
-  E2E_WS_SECRETS="$SECRETS_JSON" \
+  E2E_WS_SECRETS="$CREATE_SECRETS_JSON" \
   python3 -c "
 import json, os
 secrets = json.loads(os.environ['E2E_WS_SECRETS'] or '{}')
@@ -740,6 +859,9 @@ if [ -z "$PARENT_ID" ]; then
   fail "Parent workspace create returned no 'id' (runtime=$RUNTIME, template=${PROVISION_TEMPLATE:-<none>}). Response: $(printf '%s' "$PARENT_RESP" | sanitize_http_body)"
 fi
 log "    PARENT_ID=$PARENT_ID"
+# BYOK arms only: opt the workspace into byok, then write the deferred vendor
+# key(s). No-op for the platform/no-key path. (See the BYOK opt-in block.)
+byok_opt_in_and_write_deferred "$PARENT_ID"
 
 # ─── 6. Provision child (full mode only) ────────────────────────────────
 CHILD_ID=""
@@ -758,6 +880,8 @@ if [ "$MODE" = "full" ]; then
     fail "Child workspace create returned no 'id' (runtime=$RUNTIME, template=${PROVISION_TEMPLATE:-<none>}). Response: $(printf '%s' "$CHILD_RESP" | sanitize_http_body)"
   fi
   log "    CHILD_ID=$CHILD_ID"
+  # Same BYOK opt-in as the parent — the child also carries the vendor key(s).
+  byok_opt_in_and_write_deferred "$CHILD_ID"
 else
   log "6/11 Canary mode — skipping child workspace"
 fi
