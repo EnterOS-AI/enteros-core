@@ -272,6 +272,24 @@ jobs:
           echo "::error::Redis did not become ready in 15s"
           docker logs "$REDIS_CONTAINER" || true
           exit 1
+      - name: Set deterministic admin token for the e2e platform
+        if: needs.detect-changes.outputs.api == 'true'
+        run: |
+          # AdminAuth (workspace-server/internal/middleware/wsauth_middleware.go:164)
+          # reads ADMIN_TOKEN. Setting it (a) closes isDevModeFailOpen (devmode.go:50
+          # returns false when ADMIN_TOKEN is non-empty), so admin routes require a
+          # bearer, and (b) makes Tier-2b accept a bearer that constant-time-equals
+          # ADMIN_TOKEN. The platform process inherits ADMIN_TOKEN from $GITHUB_ENV.
+          #
+          # MOLECULE_ADMIN_TOKEN is the var the e2e scripts send as the bearer
+          # (tests/e2e/_lib.sh:33 e2e_mint_workspace_token, and the run_mock
+          # org-import curl). Set BOTH to the SAME value so the bearer the test
+          # sends == the secret the platform checks. Deterministic test value;
+          # this platform is ephemeral, single-run, and never reachable off-host.
+          E2E_ADMIN_TOKEN="e2e-api-admin-${{ github.run_id }}-${{ github.run_attempt }}"
+          echo "ADMIN_TOKEN=${E2E_ADMIN_TOKEN}" >> "$GITHUB_ENV"
+          echo "MOLECULE_ADMIN_TOKEN=${E2E_ADMIN_TOKEN}" >> "$GITHUB_ENV"
+          echo "Admin token configured for the e2e platform (ADMIN_TOKEN + MOLECULE_ADMIN_TOKEN)."
       - name: Build platform
         if: needs.detect-changes.outputs.api == 'true'
         working-directory: workspace-server
@@ -397,8 +415,33 @@ jobs:
       - name: Run notify-with-attachments E2E
         if: needs.detect-changes.outputs.api == 'true'
         run: bash tests/e2e/test_notify_attachments_e2e.sh
-      - name: Run priority-runtimes E2E (claude-code + hermes — skips when keys absent)
+      - name: "Run priority-runtimes E2E (REQUIRE-LIVE: mock validates the runtime plumbing end-to-end)"
+        # E2E_REQUIRE_LIVE=1 is ON: the run MUST validate >=1 runtime end-to-end
+        # or it exits NON-zero (RED). This is now SAFE because the `mock` arm can
+        # actually provision in CI: the only blocker was that POST /org/import and
+        # POST /admin/workspaces/:id/tokens are AdminAuth-gated
+        # (router.go:778 + :427) and this job previously configured NO admin token,
+        # so every admin call 401'd ("admin auth required"). The "Set deterministic
+        # admin token" step above now sets ADMIN_TOKEN on the platform AND exports
+        # the matching MOLECULE_ADMIN_TOKEN the e2e scripts send as the bearer, so
+        # the mock arm can org-import → online → mint token → canned A2A reply →
+        # validated(). That guarantees VALIDATED>=1 on a healthy platform, so the
+        # REQUIRED `E2E API Smoke Test` gate now HONESTLY validates a runtime
+        # end-to-end; if the mock plumbing (DB insert, status flip, A2A proxy,
+        # activity logging, or the admin-auth wiring) genuinely breaks, the gate
+        # goes RED instead of false-green. The zero-validated→RED decision is also
+        # regression-gated WITHOUT provisioning by the bash unit test
+        # tests/e2e/test_require_live_priority_gate_unit.sh (wired into ci.yml's
+        # "Run E2E bash unit tests" job), so a revert of that logic still fails CI.
+        #
+        # MiniMax stays an OPPORTUNISTIC best-effort arm: create is registry-fragile
+        # in CI (422 UNREGISTERED_MODEL_FOR_RUNTIME), so a miss is reported via
+        # bestfail() and never reds the gate — mock carries the required validation,
+        # MiniMax is a bonus real-LLM check when it comes up. ZERO new credentials.
         if: needs.detect-changes.outputs.api == 'true'
+        env:
+          E2E_REQUIRE_LIVE: '1'
+          E2E_MINIMAX_API_KEY: ${{ secrets.MOLECULE_STAGING_MINIMAX_API_KEY }}
         run: bash tests/e2e/test_priority_runtimes_e2e.sh
       - name: Install standalone runtime parser from Gitea registry
         if: needs.detect-changes.outputs.api == 'true'

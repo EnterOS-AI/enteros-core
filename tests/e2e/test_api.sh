@@ -15,17 +15,26 @@ SUM_AUTH=()
 ECHO_URL="https://example.com/echo-agent"
 SUM_URL="https://example.com/summarizer-agent"
 
-# AdminAuth-gated calls need a bearer token once any workspace token
-# exists in the DB. ADMIN_TOKEN is populated after the first workspace
-# create + real token mint. acurl = "authenticated curl".
-ADMIN_TOKEN=""
+# AdminAuth-gated calls (GET/POST/DELETE /workspaces, /events, /bundles)
+# require the platform admin bearer once ADMIN_TOKEN is set on the server.
+# Tier-2b (wsauth_middleware.go:250) REJECTS workspace bearer tokens on admin
+# routes when ADMIN_TOKEN is set, so admin calls MUST send the exact ADMIN_TOKEN
+# value — which the e2e-api CI job exports here as MOLECULE_ADMIN_TOKEN. acurl =
+# "admin curl": it always sends the platform admin bearer (if one is set).
+#
+# Guarded if-set: a fresh self-hosted/dev platform with no ADMIN_TOKEN fail-opens
+# (devmode.go:50), so sending no bearer still works there.
+ADMIN_BEARER="${MOLECULE_ADMIN_TOKEN:-${ADMIN_TOKEN:-}}"
+ADMIN_AUTH=()
+[ -n "$ADMIN_BEARER" ] && ADMIN_AUTH=(-H "Authorization: Bearer $ADMIN_BEARER")
 acurl() {
-  if [ -n "$ADMIN_TOKEN" ]; then
-    curl -s -H "Authorization: Bearer $ADMIN_TOKEN" "$@"
-  else
-    curl -s "$@"
-  fi
+  curl -s ${ADMIN_AUTH[@]+"${ADMIN_AUTH[@]}"} "$@"
 }
+
+# WORKSPACE_TOKEN holds a per-workspace bearer for the WorkspaceAuth-gated
+# routes (PATCH /workspaces/:id, /activity, …). It is set after the first
+# create+mint and is NOT interchangeable with the admin bearer.
+WORKSPACE_TOKEN=""
 
 # Pre-test cleanup: remove any workspaces left over from prior runs so
 # count-based assertions ("empty", "count=2") are reproducible.
@@ -57,19 +66,22 @@ check "GET /health" '"status":"ok"' "$R"
 R=$(acurl "$BASE/workspaces")
 check "GET /workspaces (empty)" '[]' "$R"
 
-# Test 3: Create workspace A (AdminAuth fail-open — no tokens exist yet)
-R=$(curl -s -X POST "$BASE/workspaces" -H "Content-Type: application/json" -d '{"name":"Echo Agent","tier":1,"runtime":"external","external":true}')
+# Test 3: Create workspace A. POST /workspaces is AdminAuth-gated (router.go:166);
+# send the admin bearer (acurl). On a fail-open dev platform acurl sends nothing
+# and the create still works.
+R=$(acurl -X POST "$BASE/workspaces" -H "Content-Type: application/json" -d '{"name":"Echo Agent","tier":1,"runtime":"external","external":true}')
 check "POST /workspaces (create echo)" '"status":"awaiting_agent"' "$R"
 ECHO_ID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
 
-ADMIN_TOKEN=$(echo "$R" | e2e_extract_token)
-if [ -z "$ADMIN_TOKEN" ]; then
-  ADMIN_TOKEN=$(e2e_mint_workspace_token "$ECHO_ID" 2>/dev/null || echo "")
+# Per-workspace token for Echo, for the WorkspaceAuth-gated routes below.
+WORKSPACE_TOKEN=$(echo "$R" | e2e_extract_token)
+if [ -z "$WORKSPACE_TOKEN" ]; then
+  WORKSPACE_TOKEN=$(e2e_mint_workspace_token "$ECHO_ID" 2>/dev/null || echo "")
 fi
-if [ -n "$ADMIN_TOKEN" ]; then
-  echo "  (acquired admin token: ${ADMIN_TOKEN:0:8}...)"
+if [ -n "$WORKSPACE_TOKEN" ]; then
+  echo "  (acquired Echo workspace token: ${WORKSPACE_TOKEN:0:8}...)"
 else
-  echo "  WARNING: no admin token acquired — subsequent AdminAuth calls will fail"
+  echo "  WARNING: no Echo workspace token acquired — WorkspaceAuth calls will fail"
 fi
 
 # Test 4: Create workspace B (needs bearer — tokens now exist in DB)
@@ -98,7 +110,7 @@ check "GET /workspaces/:id (agent_card null)" '"agent_card":null' "$R"
 # Test 7: Register echo — use workspace-specific token (from real admin
 # endpoint), not the admin token. C18 requires a token issued TO THIS
 # workspace, not just any valid token.
-ECHO_WS_TOKEN="$ADMIN_TOKEN"
+ECHO_WS_TOKEN="$WORKSPACE_TOKEN"
 [ -n "$ECHO_WS_TOKEN" ] && ECHO_AUTH=(-H "Authorization: Bearer $ECHO_WS_TOKEN")
 R=$(curl -s -X POST "$BASE/registry/register" -H "Content-Type: application/json" \
   "${ECHO_AUTH[@]}" \
@@ -159,26 +171,29 @@ R=$(curl -s -X POST "$BASE/registry/check-access" -H "Content-Type: application/
   -d "{\"caller_id\":\"$ECHO_ID\",\"target_id\":\"$SUM_ID\"}")
 check "POST /registry/check-access (same-org allowed)" '"allowed":true' "$R"
 
-# Test 15: PATCH workspace (update position)
-R=$(acurl -X PATCH "$BASE/workspaces/$ECHO_ID" -H "Content-Type: application/json" -d '{"x":100,"y":200}')
+# Test 15: PATCH workspace (update position). PATCH /workspaces/:id is
+# WorkspaceAuth-gated (router.go:227 — #680 IDOR fix), so it needs Echo's OWN
+# bearer, NOT the admin bearer (WorkspaceAuth rejects the admin token).
+R=$(curl -s "${ECHO_AUTH[@]}" -X PATCH "$BASE/workspaces/$ECHO_ID" -H "Content-Type: application/json" -d '{"x":100,"y":200}')
 check "PATCH /workspaces/:id (position)" '"status":"updated"' "$R"
 
 R=$(acurl "$BASE/workspaces/$ECHO_ID")
 check "Position saved (x=100)" '"x":100' "$R"
 check "Position saved (y=200)" '"y":200' "$R"
 
-# Test 16: PATCH workspace (update name)
-R=$(acurl -X PATCH "$BASE/workspaces/$ECHO_ID" -H "Content-Type: application/json" -d '{"name":"Echo Agent v2"}')
+# Test 16: PATCH workspace (update name) — WorkspaceAuth-gated; use Echo's token.
+R=$(curl -s "${ECHO_AUTH[@]}" -X PATCH "$BASE/workspaces/$ECHO_ID" -H "Content-Type: application/json" -d '{"name":"Echo Agent v2"}')
 check "PATCH /workspaces/:id (name)" '"status":"updated"' "$R"
 
 R=$(acurl "$BASE/workspaces/$ECHO_ID")
 check "Name updated" '"name":"Echo Agent v2"' "$R"
 
-# Test 17: Events (#165 / PR #167 — now admin-gated, bearer required)
-R=$(acurl "$BASE/events" -H "Authorization: Bearer $ECHO_TOKEN")
+# Test 17: Events (#165 / PR #167 — admin-gated; the admin bearer is required,
+# and Tier-2b rejects a workspace bearer here, so use acurl's admin token alone).
+R=$(acurl "$BASE/events")
 check "GET /events (has events)" 'WORKSPACE_ONLINE' "$R"
 
-R=$(acurl "$BASE/events/$ECHO_ID" -H "Authorization: Bearer $ECHO_TOKEN")
+R=$(acurl "$BASE/events/$ECHO_ID")
 check "GET /events/:id (has events for echo)" 'WORKSPACE_ONLINE' "$R"
 
 # Test 18: Update card
@@ -295,7 +310,7 @@ check "active_tasks cleared" '"active_tasks":0' "$R"
 # endpoint is admin-auth gated and keeps the full record, so operators
 # can still see task progress from the dashboard without exposing it
 # over the public per-workspace GET.
-R=$(curl -s "$BASE/workspaces" -H "Authorization: Bearer $ECHO_TOKEN")
+R=$(acurl "$BASE/workspaces")
 check "current_task in list response" '"current_task"' "$R"
 
 # Test 21: Delete
@@ -306,18 +321,20 @@ check "current_task in list response" '"current_task"' "$R"
 # Delete the CHILD (Summarizer) here instead: a child delete does NOT cascade
 # upward, so the parent Echo survives and count=1 holds. The bundle round-trip
 # below needs Summarizer's exported config, so capture it BEFORE this delete.
-BUNDLE=$(curl -s "$BASE/bundles/export/$SUM_ID" -H "Authorization: Bearer $SUM_TOKEN")
+# GET /bundles/export/:id is admin-gated (router.go:741) — use the admin bearer.
+BUNDLE=$(acurl "$BASE/bundles/export/$SUM_ID")
 check "GET /bundles/export/:id" '"name":"Summarizer Agent"' "$BUNDLE"
 ORIG_NAME=$(echo "$BUNDLE" | python3 -c "import sys,json; print(json.load(sys.stdin)['name'])")
 ORIG_TIER=$(echo "$BUNDLE" | python3 -c "import sys,json; print(json.load(sys.stdin)['tier'])")
 
+# DELETE /workspaces/:id is admin-gated (router.go:167). X-Confirm-Name must
+# still match the workspace name even with admin auth.
 R=$(acurl -X DELETE "$BASE/workspaces/$SUM_ID?confirm=true" \
-  -H "Authorization: Bearer $SUM_TOKEN" \
   -H "X-Confirm-Name: Summarizer Agent")
 check "DELETE /workspaces/:id" '"status":"removed"' "$R"
 
-# Parent Echo must survive a child delete — list as Echo and expect count=1.
-R=$(curl -s "$BASE/workspaces" -H "Authorization: Bearer $ECHO_TOKEN")
+# Parent Echo must survive a child delete — list (admin) and expect count=1.
+R=$(acurl "$BASE/workspaces")
 COUNT=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))")
 check "List after delete (count=1)" "1" "$COUNT"
 
@@ -328,21 +345,21 @@ check "List after delete (count=1)" "1" "$COUNT"
 echo ""
 echo "--- Bundle Round-Trip Test ---"
 
-# Delete the remaining parent Echo — use ECHO_TOKEN (per-workspace) for
-# WorkspaceAuth and ADMIN_TOKEN for the AdminAuth layer.
+# Delete the remaining parent Echo — DELETE is admin-gated (router.go:167);
+# the platform admin bearer (acurl) authorizes it. X-Confirm-Name still required.
 R=$(acurl -X DELETE "$BASE/workspaces/$ECHO_ID?confirm=true" \
-  -H "Authorization: Bearer $ECHO_TOKEN" \
   -H "X-Confirm-Name: Echo Agent v2")
 check "Delete before re-import" '"status":"removed"' "$R"
 
-# After deleting both workspaces, all per-workspace tokens are revoked.
-# Clear the now-revoked admin bearer so acurl can use fresh-install fail-open.
-ADMIN_TOKEN=""
+# Both workspaces are now deleted. The platform-level ADMIN_TOKEN env is still
+# set, so admin routes still require the admin bearer (fail-open does NOT
+# re-engage just because the token table emptied) — keep using acurl's bearer.
 R=$(acurl "$BASE/workspaces")
 COUNT=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))")
 check "All workspaces deleted (count=0)" "0" "$COUNT"
 
-# Re-import from the exported bundle (AdminAuth fail-open — no live tokens)
+# Re-import from the exported bundle. POST /bundles/import is admin-gated
+# (router.go:742) — acurl sends the admin bearer.
 R=$(acurl -X POST "$BASE/bundles/import" -H "Content-Type: application/json" -d "$BUNDLE")
 check "POST /bundles/import" '"status":"provisioning"' "$R"
 NEW_ID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['workspace_id'])")
@@ -398,12 +415,15 @@ check "Register re-imported workspace" '"status":"registered"' "$R"
 REG_NEW_TOKEN=$(echo "$R" | e2e_extract_token)
 [ -n "$REG_NEW_TOKEN" ] && NEW_TOKEN="$REG_NEW_TOKEN"
 
-# Re-export and verify agent_card survives the round-trip (#165 / PR #167 — admin-gated)
-REBUNDLE=$(curl -s "$BASE/bundles/export/$NEW_ID" -H "Authorization: Bearer $NEW_TOKEN")
+# Re-export and verify agent_card survives the round-trip (#165 / PR #167 —
+# GET /bundles/export/:id is admin-gated; use the admin bearer).
+REBUNDLE=$(acurl "$BASE/bundles/export/$NEW_ID")
 check "Re-exported bundle has agent_card" '"agent_card"' "$REBUNDLE"
 
-# Clean up — use the token just issued to the re-imported workspace
-e2e_delete_workspace "$NEW_ID" "$ORIG_NAME" -H "Authorization: Bearer $NEW_TOKEN"
+# Clean up — DELETE /workspaces/:id is admin-gated; pass no per-call auth so
+# e2e_delete_workspace falls back to the platform admin bearer (a workspace
+# bearer would be rejected by Tier-2b).
+e2e_delete_workspace "$NEW_ID" "$ORIG_NAME"
 
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="

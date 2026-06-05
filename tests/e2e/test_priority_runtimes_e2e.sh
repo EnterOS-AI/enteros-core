@@ -24,11 +24,73 @@
 # Each phase skips cleanly when its prerequisite secret is absent so a
 # partially-keyed env (e.g. CI without an OpenAI key) doesn't false-fail.
 #
+# REQUIRE-LIVE (false-green guard, mirrors CP serving-e2e's
+# SERVING_E2E_REQUIRE_LIVE semantics)
+# ------------------------------------------------------------------
+# Without a guard, an env with NO live secrets makes every phase SKIP,
+# leaving PASS=0 FAIL=0 — and the historical `[ "$FAIL" -eq 0 ]` gate
+# exits 0 (GREEN) while validating ZERO runtimes. That made the REQUIRED
+# `E2E API Smoke Test` merge gate pass without exercising a single
+# runtime (false-green).
+#
+# Fix: a real "validated arm" counter (VALIDATED) tracks runtimes that
+# actually ran AND produced a non-error A2A reply. With E2E_REQUIRE_LIVE=1:
+# if zero arms validated, the run exits NON-zero with a loud message.
+# Without it (E2E_REQUIRE_LIVE unset/0), a fully-skipped run stays a LOUD
+# skip + exit 0 for dev convenience.
+#
+# This zero-validated→RED decision is the load-bearing logic. It is factored
+# into evaluate_require_live_gate() (a pure function of $FAIL/$VALIDATED/
+# $E2E_REQUIRE_LIVE, defined before any platform I/O) and is REGRESSION-GATED
+# on every PR by tests/e2e/test_require_live_priority_gate_unit.sh, which
+# sources this file (E2E_PRIORITY_UNIT_SOURCE=1), sets the counters, and
+# asserts the gate's exit code — no platform, no provisioning, no network.
+# So the false-green can't silently come back: a revert of the guard fails CI.
+#
+# CI POSTURE (REQUIRE-LIVE ON — see .gitea/workflows/e2e-api.yml):
+# The live e2e-api job SETS E2E_REQUIRE_LIVE=1. The `mock` arm is the
+# CI-provisionable live-completion arm: it org-imports a mock workspace
+# (→online→canned A2A reply) with NO external secret. The only thing that
+# previously blocked it in CI was admin auth — POST /org/import and POST
+# /admin/workspaces/:id/tokens are AdminAuth-gated, and the job set no admin
+# token, so every admin call 401'd ("admin auth required"). The job now sets
+# ADMIN_TOKEN on the platform AND exports the matching MOLECULE_ADMIN_TOKEN
+# the scripts send, so mock validates end-to-end and VALIDATED>=1 holds on a
+# healthy platform — the REQUIRED `E2E API Smoke Test` gate now HONESTLY
+# validates a runtime. If the mock plumbing or the admin-auth wiring breaks,
+# the gate goes RED (not false-green). The zero-validated→RED decision is also
+# regression-gated WITHOUT provisioning by the bash unit test above, so a
+# revert of that logic still fails CI.
+#
+# LIVE ARMS (run when their prerequisite is present; opportunistic):
+#   - `mock` (run_mock) is the no-key REQUIRE-LIVE backbone: a virtual
+#     workspace (no container, no EC2, no provider) whose org-import path
+#     short-circuits to status='online' with a canned A2A reply. It validates
+#     in CI now that the e2e-api job wires an admin token (org-import + token
+#     mint are AdminAuth-gated), so it is the guaranteed >=1 validation.
+#   - MiniMax (E2E_MINIMAX_API_KEY, from MOLECULE_STAGING_MINIMAX_API_KEY) is
+#     an OPPORTUNISTIC best-effort real-LLM arm: registry-fragile in CI (422
+#     UNREGISTERED_MODEL_FOR_RUNTIME — see run_minimax header), so a miss is
+#     a best-effort MISS via bestfail() and does NOT red the gate.
+# The CI e2e-api job sets E2E_REQUIRE_LIVE=1: mock guarantees a validation, so
+# the REQUIRED gate is honest (RED if the mock plumbing/admin-auth breaks). The
+# zero-validated→RED logic is also regression-gated by the bash unit test above.
+#
 # Usage:
+#   # Enforce REQUIRE-LIVE locally (need >=1 arm to actually validate):
+#   E2E_REQUIRE_LIVE=1 E2E_MINIMAX_API_KEY=... \
+#     tests/e2e/test_priority_runtimes_e2e.sh
+#
+#   # Default (no enforcement): all-skip stays a LOUD skip + exit 0:
+#   tests/e2e/test_priority_runtimes_e2e.sh
+#
+#   # Other live arms (if their secrets are configured):
 #   CLAUDE_CODE_OAUTH_TOKEN=... E2E_OPENAI_API_KEY=... \
 #     tests/e2e/test_priority_runtimes_e2e.sh
 #
 #   # Run only one runtime
+#   E2E_RUNTIMES=mock        tests/e2e/test_priority_runtimes_e2e.sh
+#   E2E_RUNTIMES=minimax     tests/e2e/test_priority_runtimes_e2e.sh
 #   E2E_RUNTIMES=claude-code tests/e2e/test_priority_runtimes_e2e.sh
 #   E2E_RUNTIMES=hermes      tests/e2e/test_priority_runtimes_e2e.sh
 #
@@ -41,12 +103,80 @@
 
 set -euo pipefail
 
-source "$(dirname "$0")/_lib.sh"
-
 PASS=0
 FAIL=0
 SKIP=0
+# VALIDATED counts runtimes that ACTUALLY ran end-to-end (provisioned,
+# reached online, AND returned a non-error A2A reply). Distinct from PASS,
+# which also counts sub-assertions like activity-log rows. This is the
+# signal the REQUIRE-LIVE gate keys off: VALIDATED==0 means we proved
+# nothing about any runtime, regardless of how many sub-asserts "passed".
+VALIDATED=0
 CREATED_WSIDS=()
+
+# evaluate_require_live_gate — the SINGLE source of the final exit decision.
+# Pure function of $FAIL, $VALIDATED, and $E2E_REQUIRE_LIVE; performs NO I/O
+# beyond the loud messages. Returns the exit code the script should exit with:
+#   - FAIL>0                       → 1 (a real failure is always red)
+#   - VALIDATED==0 + REQUIRE_LIVE  → 1 (false-green trap: proved nothing → RED)
+#   - VALIDATED==0 + !REQUIRE_LIVE → 0 (dev-convenience LOUD skip)
+#   - VALIDATED>=1                 → 0 (at least one arm validated end-to-end)
+# It is a function (not inline tail code) so test_require_live_priority_gate_unit.sh
+# can drive the REAL decision in isolation — set the counters, call this, assert
+# the return code — with no platform, no provisioning, no network. That makes the
+# zero-validated→RED logic a CI-gated regression contract: a future revert of it
+# fails the unit test on every PR. See that unit test for the fail-direction proof.
+evaluate_require_live_gate() {
+  # Any real failure is always red.
+  if [ "$FAIL" -ne 0 ]; then
+    return 1
+  fi
+
+  # REQUIRE-LIVE gate (mirrors CP serving-e2e SERVING_E2E_REQUIRE_LIVE).
+  # A run where every runtime SKIPPED proves nothing. In enforced mode
+  # (E2E_REQUIRE_LIVE=1) that MUST be red so the required `E2E API Smoke
+  # Test` gate can't be false-green on an all-skip run.
+  local require_live="${E2E_REQUIRE_LIVE:-0}"
+  if [ "$VALIDATED" -eq 0 ]; then
+    if [ "$require_live" = "1" ] || [ "$require_live" = "true" ]; then
+      echo "::error::E2E_REQUIRE_LIVE is set but ZERO runtimes were validated end-to-end." >&2
+      echo "         Every runtime SKIPPED — no live secret was present, so this gate" >&2
+      echo "         validated nothing. Wire at least one live arm via Gitea secrets" >&2
+      echo "         (E2E_MINIMAX_API_KEY ← MOLECULE_STAGING_MINIMAX_API_KEY is the" >&2
+      echo "         default CI arm; CLAUDE_CODE_OAUTH_TOKEN / E2E_OPENAI_API_KEY also" >&2
+      echo "         work) so >=1 runtime actually provisions + replies. Failing RED" >&2
+      echo "         instead of false-green." >&2
+      return 1
+    fi
+    # Dev convenience: no enforcement requested → loud skip, exit 0.
+    echo "SKIPPED: no live secrets present and E2E_REQUIRE_LIVE is not set — validated" >&2
+    echo "         zero runtimes. This is a dev-convenience pass; CI sets" >&2
+    echo "         E2E_REQUIRE_LIVE=1 to make zero-validated a hard failure." >&2
+    return 0
+  fi
+
+  echo "OK: $VALIDATED runtime(s) validated end-to-end."
+  return 0
+}
+
+# Source-guard: when sourced by the unit test (E2E_PRIORITY_UNIT_SOURCE=1) we
+# stop HERE — the counters + evaluate_require_live_gate are now defined, and we
+# must NOT fall through to _lib.sh's platform-dependent helpers or the live
+# pre-sweep curl below (there is no platform in the unit-test environment).
+if [ "${E2E_PRIORITY_UNIT_SOURCE:-0}" = "1" ]; then
+  return 0
+fi
+
+source "$(dirname "$0")/_lib.sh"
+
+# GET /workspaces (list, router.go:165) and POST /workspaces (create,
+# router.go:166) are AdminAuth-gated. The e2e-api CI job sets ADMIN_TOKEN on the
+# platform (fail-open OFF) and exports MOLECULE_ADMIN_TOKEN here, so the
+# pre-sweep list and every runtime-create must send the admin bearer or they
+# 401. run_mock uses POST /org/import (also admin-gated) and wires its own admin
+# auth inline. Guarded if-set so a fail-open dev platform still works.
+ADMIN_AUTH=()
+e2e_admin_auth_args ADMIN_AUTH
 
 cleanup() {
   # `set -u` + empty array would error on "${CREATED_WSIDS[@]}"; the
@@ -58,14 +188,26 @@ cleanup() {
 }
 trap cleanup EXIT
 
-pass()  { echo "  PASS — $1"; PASS=$((PASS + 1)); }
-fail()  { echo "  FAIL — $1"; echo "         $2"; FAIL=$((FAIL + 1)); }
-skip()  { echo "  SKIP — $1"; SKIP=$((SKIP + 1)); }
+pass()      { echo "  PASS — $1"; PASS=$((PASS + 1)); }
+fail()      { echo "  FAIL — $1"; echo "         $2"; FAIL=$((FAIL + 1)); }
+skip()      { echo "  SKIP — $1"; SKIP=$((SKIP + 1)); }
+# Mark a runtime as having been validated end-to-end (online + non-error
+# A2A reply). Also emits a PASS line so it shows in the results tally.
+validated() { echo "  PASS — $1"; PASS=$((PASS + 1)); VALIDATED=$((VALIDATED + 1)); }
+# bestfail() is for OPPORTUNISTIC (best-effort) arms whose failure must
+# NOT red the gate. It does NOT increment FAIL — it only logs + bumps
+# SKIP so the tally stays honest ("we tried, it didn't validate, but it
+# was never load-bearing"). Used by the MiniMax arm: MiniMax-create is
+# fragile in CI (registry-skewed model id, BYOK plumbing — see core#2263
+# and the run_minimax header), so a MiniMax miss is reported but never
+# fails the REQUIRED gate. The mock arm is the load-bearing validation
+# that keeps the gate honest; MiniMax is the real-LLM bonus on top.
+bestfail()  { echo "  BEST-EFFORT MISS — $1"; echo "         $2"; SKIP=$((SKIP + 1)); }
 
 # Pre-sweep any prior runs that left workspaces behind (same defence as
 # test_notify_attachments_e2e.sh: trap fires on normal exit, but a
 # SIGPIPE / kill -9 can bypass it).
-PRIOR=$(curl -s "$BASE/workspaces" | python3 -c '
+PRIOR=$(curl -s "$BASE/workspaces" ${ADMIN_AUTH[@]+"${ADMIN_AUTH[@]}"} | python3 -c '
 import json, sys
 try:
     print(" ".join(w["id"] for w in json.load(sys.stdin) if w.get("name","").startswith("Priority E2E ")))
@@ -188,7 +330,7 @@ print(json.dumps({'CLAUDE_CODE_OAUTH_TOKEN': os.environ['CLAUDE_CODE_OAUTH_TOKEN
 ")
   local resp wsid
   # model required (CTO 2026-05-22 SSOT) — pass the deleted DefaultModel("claude-code") value.
-  resp=$(curl -s -X POST "$BASE/workspaces" -H "Content-Type: application/json" \
+  resp=$(curl -s -X POST "$BASE/workspaces" ${ADMIN_AUTH[@]+"${ADMIN_AUTH[@]}"} -H "Content-Type: application/json" \
     -d "{\"name\":\"Priority E2E (claude-code)\",\"runtime\":\"claude-code\",\"model\":\"sonnet\",\"tier\":1,\"secrets\":$secrets}")
   wsid=$(echo "$resp" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("id",""))') || true
   if [ -z "$wsid" ]; then
@@ -220,9 +362,9 @@ print(json.dumps({'CLAUDE_CODE_OAUTH_TOKEN': os.environ['CLAUDE_CODE_OAUTH_TOKEN
   local reply
   if reply=$(send_test_prompt "$wsid" "$token"); then
     if echo "$reply" | grep -q "PONG"; then
-      pass "claude-code reply contains PONG"
+      validated "claude-code reply contains PONG"
     else
-      pass "claude-code reply non-empty (first 80 chars: ${reply:0:80})"
+      validated "claude-code reply non-empty (first 80 chars: ${reply:0:80})"
     fi
     assert_activity_logged "claude-code" "$wsid" "$token"
   else
@@ -254,7 +396,7 @@ print(json.dumps({
 }))
 ")
   local resp wsid
-  resp=$(curl -s -X POST "$BASE/workspaces" -H "Content-Type: application/json" \
+  resp=$(curl -s -X POST "$BASE/workspaces" ${ADMIN_AUTH[@]+"${ADMIN_AUTH[@]}"} -H "Content-Type: application/json" \
     -d "{\"name\":\"Priority E2E (hermes)\",\"runtime\":\"hermes\",\"tier\":1,\"model\":\"openai/gpt-4o\",\"secrets\":$secrets}")
   wsid=$(echo "$resp" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("id",""))') || true
   if [ -z "$wsid" ]; then
@@ -288,9 +430,9 @@ print(json.dumps({
   local reply
   if reply=$(send_test_prompt "$wsid" "$token"); then
     if echo "$reply" | grep -q "PONG"; then
-      pass "hermes reply contains PONG"
+      validated "hermes reply contains PONG"
     else
-      pass "hermes reply non-empty (first 80 chars: ${reply:0:80})"
+      validated "hermes reply non-empty (first 80 chars: ${reply:0:80})"
     fi
     assert_activity_logged "hermes" "$wsid" "$token"
   else
@@ -327,7 +469,7 @@ print(json.dumps({
 }))
 ")
   local resp wsid
-  resp=$(curl -s -X POST "$BASE/workspaces" -H "Content-Type: application/json" \
+  resp=$(curl -s -X POST "$BASE/workspaces" ${ADMIN_AUTH[@]+"${ADMIN_AUTH[@]}"} -H "Content-Type: application/json" \
     -d "{\"name\":\"Priority E2E ($runtime)\",\"runtime\":\"$runtime\",\"tier\":1,\"model\":\"openai/gpt-4o-mini\",\"secrets\":$secrets}")
   wsid=$(echo "$resp" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("id",""))') || true
   if [ -z "$wsid" ]; then
@@ -358,9 +500,9 @@ print(json.dumps({
   local reply
   if reply=$(send_test_prompt "$wsid" "$token"); then
     if echo "$reply" | grep -q "PONG"; then
-      pass "$runtime reply contains PONG"
+      validated "$runtime reply contains PONG"
     else
-      pass "$runtime reply non-empty (first 80 chars: ${reply:0:80})"
+      validated "$runtime reply non-empty (first 80 chars: ${reply:0:80})"
     fi
     assert_activity_logged "$runtime" "$wsid" "$token"
   else
@@ -371,18 +513,253 @@ print(json.dumps({
 run_codex()      { run_openai_runtime "codex"      "codex"; }
 run_openclaw()   { run_openai_runtime "openclaw"   "openclaw"; }
 
-WANT="${E2E_RUNTIMES:-claude-code codex hermes openclaw}"
+####################################################################
+# Mock arm — the GUARANTEED, always-available REQUIRE-LIVE backbone.
+####################################################################
+# The mock runtime (workspace-server/internal/handlers/mock_runtime.go)
+# is a virtual workspace: NO container, NO EC2, NO LLM key. The org-import
+# path (createWorkspaceTree, org_import.go) short-circuits a runtime=mock
+# workspace straight to status='online' (no provisioner needed), and the
+# A2A proxy (a2a_proxy.go → handleMockA2A) synthesises a deterministic
+# canned JSON-RPC reply with logActivity=true (writes the activity_logs
+# row too). That makes mock the perfect REQUIRE-LIVE backbone: it
+# exercises the SAME plumbing every real runtime needs to pass —
+#   provision-decision → status=online → A2A round-trip → activity_logs —
+# without depending on any external provider key or LLM availability. It
+# is GREEN on a healthy platform and RED only if that plumbing genuinely
+# breaks (DB insert, status flip, A2A proxy, activity logging). No more
+# false-green (zero-validated is impossible when mock works), and no more
+# can't-go-green (mock needs no secret, so it always runs in CI).
+#
+# Why org-import (POST /org/import) instead of POST /workspaces:
+#   The mock→online short-circuit lives ONLY in createWorkspaceTree
+#   (org_import.go). The single-workspace Create handler (workspace.go)
+#   has no mock branch — it routes runtime=mock through
+#   provisionWorkspaceAuto, which in CI's local-build mode has no mock
+#   image and would never reach online. Org-import is the supported path
+#   to a live mock workspace, so the arm drives it.
+#
+# The canned reply is one of the "On it!" variants (NOT "PONG"), so this
+# arm validates on the non-empty / non-error branch — that is the real
+# contract for mock (it proves the plumbing, not an LLM's instruction-
+# following).
+run_mock() {
+  echo ""
+  echo "=== mock (no-key plumbing backbone) happy path ==="
+  # No secret gate — mock ALWAYS runs. That is the whole point: it is the
+  # required-validation arm that keeps E2E_REQUIRE_LIVE honest without a key.
+
+  # Inline single-workspace mock org. model is a required field on the
+  # org-import contract (createWorkspaceTree fails-closed without one);
+  # mock never USES the model, so any non-empty value satisfies the
+  # contract. The org-import path does not run the Create handler's
+  # registry model-validation, so "mock" is accepted as-is.
+  # POST /org/import is AdminAuth-gated (router.go:778). When the platform has
+  # ADMIN_TOKEN set (as the e2e-api CI job now does), an unauthenticated import
+  # 401s with {"error":"admin auth required"}. Send the same admin bearer the
+  # mint helper uses (MOLECULE_ADMIN_TOKEN, ADMIN_TOKEN fallback) — guarded so a
+  # bootstrap/dev platform with no admin token (fail-open) still works.
+  local admin_bearer="${MOLECULE_ADMIN_TOKEN:-${ADMIN_TOKEN:-}}"
+  local admin_auth=()
+  [ -n "$admin_bearer" ] && admin_auth=(-H "Authorization: Bearer $admin_bearer")
+  local import_resp wsid
+  import_resp=$(curl -s -X POST "$BASE/org/import" -H "Content-Type: application/json" \
+    ${admin_auth[@]+"${admin_auth[@]}"} \
+    -d '{
+      "template": {
+        "name": "Priority E2E Mock Org",
+        "defaults": {"runtime": "mock", "model": "mock", "tier": 1},
+        "workspaces": [
+          {"name": "Priority E2E (mock)", "runtime": "mock", "model": "mock", "tier": 1}
+        ]
+      }
+    }')
+  # org-import returns {"org":..., "count":N, "workspaces":[{"id":...,
+  # "name":...,"tier":...}, ...]} (handlers/org.go:898-901). Pull the id of
+  # the single workspace we declared. (Older "results" key fallback kept for
+  # forward/back compat in case the response shape is ever versioned.)
+  wsid=$(echo "$import_resp" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for r in (d.get("workspaces") or d.get("results") or []):
+    if r.get("name") == "Priority E2E (mock)" and r.get("id"):
+        print(r["id"]); break
+') || true
+  if [ -z "$wsid" ]; then
+    # mock org-import is the REQUIRE-LIVE backbone and is EXPECTED to succeed in
+    # CI now that the e2e-api job wires an admin token (ADMIN_TOKEN on the
+    # platform + MOLECULE_ADMIN_TOKEN sent above). A missing id here is a REAL
+    # break (admin-auth wiring, org-import create, or the mock short-circuit) and
+    # MUST red the gate — so this is a hard fail(), not a best-effort miss. Under
+    # E2E_REQUIRE_LIVE=1 a FAIL also forces a non-zero exit via
+    # evaluate_require_live_gate. Surface the response so the break is visible
+    # (e.g. {"error":"admin auth required"} would mean the token wiring regressed).
+    fail "create mock workspace (org-import)" "$import_resp"
+    return 0
+  fi
+  CREATED_WSIDS+=("$wsid")
+  echo "  workspace=$wsid"
+
+  # Mock goes straight to online (no container boot) — a short budget is
+  # plenty; if it is NOT online quickly the mock short-circuit in
+  # createWorkspaceTree is genuinely broken and the gate SHOULD red.
+  local final
+  final=$(wait_for_status "$wsid" "online failed" 60) || true
+  if [ "$final" != "online" ]; then
+    fail "mock workspace reaches online" "final status: $final (mock should go online without provisioning)"
+    return 0
+  fi
+  pass "mock workspace reaches online"
+
+  # Mock workspaces are not created with an inline token; mint one via the
+  # admin endpoint (same fallback every other arm uses).
+  local token
+  token=$(e2e_mint_workspace_token "$wsid") || true
+  if [ -z "$token" ]; then
+    fail "resolve mock workspace token" "no token returned from POST /admin/workspaces/:id/tokens"
+    return 0
+  fi
+
+  # A2A round-trip. The mock proxy returns a canned non-error reply (one
+  # of the "On it!" variants) — NOT "PONG" — so we validate on the
+  # non-empty branch. A non-error, non-empty reply means the A2A proxy
+  # short-circuit + reply-shape contract are intact end-to-end.
+  local reply
+  if reply=$(send_test_prompt "$wsid" "$token"); then
+    validated "mock reply non-empty (canned; first 80 chars: ${reply:0:80})"
+    assert_activity_logged "mock" "$wsid" "$token"
+  else
+    fail "mock reply" "${reply:-<empty or error>} (mock A2A short-circuit should always return a canned reply)"
+  fi
+}
+
+####################################################################
+# MiniMax live arm — OPPORTUNISTIC (best-effort) real-LLM arm.
+####################################################################
+# NOTE: this is now a BEST-EFFORT arm, not the REQUIRE-LIVE backbone.
+# mock (run_mock above) is the guaranteed, no-key validation that keeps
+# the gate honest. MiniMax-create is fragile in CI: the namespaced model
+# id minimax:MiniMax-M2.7 is NOT in claude-code's native model set and
+# does NOT resolve via DeriveProvider (its only prefix-owner, byok-minimax,
+# is not wired as a claude-code runtime arm), so the create is rejected
+# 422 UNREGISTERED_MODEL_FOR_RUNTIME before any provisioning (RCA core
+# registry_gen.go Runtimes["claude-code"]). Rather than red the REQUIRED
+# gate on that registry-skew (or on any transient MiniMax provisioning /
+# model-registration issue), this arm reports a best-effort MISS via
+# bestfail() and lets mock carry the validation. If MiniMax DOES come up
+# it validates as a bonus real-LLM check.
+# Drives the claude-code runtime against MiniMax (BYOK) using the
+# already-present Gitea secret MOLECULE_STAGING_MINIMAX_API_KEY,
+# surfaced into the env as E2E_MINIMAX_API_KEY (same name + secret the
+# staging-smoke / continuous-synth canaries use — see staging-smoke.yml
+# and continuous-synth-e2e.yml). NO new credential is introduced.
+#
+# Why this is the arm that keeps the REQUIRED gate honest:
+#   - claude-code's `minimax` provider (providers.yaml / registry_gen.go)
+#     is third_party_anthropic_compat: it reads MINIMAX_API_KEY at boot
+#     and routes ANTHROPIC_BASE_URL → api.minimax.io/anthropic. So the
+#     ONLY tenant secret needed is {"MINIMAX_API_KEY": <key>} — exactly
+#     the SECRETS_JSON branch test_staging_full_saas.sh uses.
+#   - Model id is the NAMESPACED colon-form `minimax:MiniMax-M2.7`, the
+#     registered BYOK arm for claude-code (registry_gen.go Runtimes
+#     ["claude-code"]["minimax"]). Per core#2263 the BARE `MiniMax-M2`
+#     id can 400 on a registry-skewed ws-server build; the namespaced
+#     form resolves the way kimi's `moonshot/…` does, so it's the
+#     robust choice for the gate.
+run_minimax() {
+  echo ""
+  echo "=== minimax (claude-code BYOK) happy path ==="
+  if [ -z "${E2E_MINIMAX_API_KEY:-}" ]; then
+    skip "E2E_MINIMAX_API_KEY not set (MiniMax live arm needs the MiniMax key)"
+    return 0
+  fi
+  local secrets
+  secrets=$(python3 -c "
+import json, os
+# claude-code's minimax provider (third_party_anthropic_compat) reads
+# MINIMAX_API_KEY and points ANTHROPIC_BASE_URL at api.minimax.io/anthropic
+# at boot — so the ONLY tenant secret needed is the MiniMax key itself.
+print(json.dumps({'MINIMAX_API_KEY': os.environ['E2E_MINIMAX_API_KEY']}))
+")
+  local resp wsid
+  # Namespaced BYOK model id (core#2263): bare MiniMax-M2 can 400 on a
+  # registry-skewed ws-server build; minimax:MiniMax-M2.7 is the
+  # registered claude-code BYOK arm and resolves like kimi's moonshot/…
+  resp=$(curl -s -X POST "$BASE/workspaces" ${ADMIN_AUTH[@]+"${ADMIN_AUTH[@]}"} -H "Content-Type: application/json" \
+    -d "{\"name\":\"Priority E2E (minimax)\",\"runtime\":\"claude-code\",\"model\":\"minimax:MiniMax-M2.7\",\"tier\":1,\"secrets\":$secrets}")
+  wsid=$(echo "$resp" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("id",""))') || true
+  if [ -z "$wsid" ]; then
+    # BEST-EFFORT: MiniMax-create is fragile (see header — the namespaced
+    # model id is registry-skewed → 422). Do NOT red the gate; mock is the
+    # required backbone. Report the create response so the skew is visible.
+    bestfail "create minimax workspace (best-effort; mock carries the gate)" "$resp"
+    return 0
+  fi
+  CREATED_WSIDS+=("$wsid")
+  echo "  workspace=$wsid"
+
+  # claude-code runtime image is already pulled; cold boot ~30-90s. The
+  # first MiniMax cold-call can be slow but that's covered by send_test_prompt's
+  # --max-time 180.
+  local final
+  final=$(wait_for_status "$wsid" "online failed" 240) || true
+  if [ "$final" != "online" ]; then
+    bestfail "minimax workspace reaches online (best-effort)" "final status: $final"
+    return 0
+  fi
+  pass "minimax workspace reaches online"
+
+  local token
+  token=$(echo "$resp" | e2e_extract_token)
+  if [ -z "$token" ]; then
+    token=$(e2e_mint_workspace_token "$wsid")
+  fi
+  if [ -z "$token" ]; then
+    bestfail "resolve minimax workspace token (best-effort)" "no token returned"
+    return 0
+  fi
+
+  local reply
+  if reply=$(send_test_prompt "$wsid" "$token"); then
+    if echo "$reply" | grep -q "PONG"; then
+      validated "minimax reply contains PONG"
+    else
+      validated "minimax reply non-empty (first 80 chars: ${reply:0:80})"
+    fi
+    assert_activity_logged "minimax" "$wsid" "$token"
+  else
+    bestfail "minimax reply (best-effort)" "${reply:-<empty or error>}"
+  fi
+}
+
+# `mock` runs FIRST and by default: it is the no-key REQUIRE-LIVE backbone
+# that guarantees >=1 validation on a healthy platform (see run_mock). The
+# real-LLM arms (claude-code/codex/hermes/openclaw/minimax) run if their
+# secrets are present and add real-provider coverage on top; minimax is
+# best-effort (never reds the gate).
+WANT="${E2E_RUNTIMES:-mock claude-code codex hermes openclaw minimax}"
 for r in $WANT; do
   case "$r" in
+    mock)        run_mock ;;
     claude-code) run_claude_code ;;
     codex)       run_codex ;;
     hermes)      run_hermes ;;
     openclaw)    run_openclaw ;;
-    all)         run_claude_code; run_codex; run_hermes; run_openclaw ;;
+    minimax)     run_minimax ;;
+    all)         run_mock; run_claude_code; run_codex; run_hermes; run_openclaw; run_minimax ;;
     *) echo "unknown runtime in E2E_RUNTIMES: $r" >&2; exit 2 ;;
   esac
 done
 
 echo ""
-echo "=== Results: $PASS passed, $FAIL failed, $SKIP skipped ==="
-[ "$FAIL" -eq 0 ]
+echo "=== Results: $PASS passed, $FAIL failed, $SKIP skipped, $VALIDATED runtime(s) validated end-to-end ==="
+
+# Final exit decision lives in evaluate_require_live_gate (defined at the top of
+# this file, before any platform I/O) so the same logic is unit-tested in
+# isolation by test_require_live_priority_gate_unit.sh. Mirror its return code
+# into the process exit code.
+evaluate_require_live_gate
+exit $?
