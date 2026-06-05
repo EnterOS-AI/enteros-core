@@ -393,7 +393,7 @@ func (h *PluginsHandler) readPluginSkillsFromContainer(ctx context.Context, cont
 // `# Plugin: <name> /` — mirrors AgentskillsAdaptor.uninstall's stripping
 // logic so install/uninstall are symmetric. Best-effort: silent on read or
 // write failure, since the rest of uninstall must still succeed.
-func (h *PluginsHandler) stripPluginMarkersFromMemory(ctx context.Context, containerName, pluginName string) {
+func (h *PluginsHandler) stripPluginMarkersFromMemory(ctx context.Context, workspaceID, containerName, pluginName string) {
 	// Use sed via bash -c for atomic in-place delete: drop the marker line
 	// and the blank line that follows it (install adds a leading blank line
 	// before the marker via append_to_memory). Three sed passes mirror the

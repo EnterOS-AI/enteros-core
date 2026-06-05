@@ -161,7 +161,7 @@ func (h *PluginsHandler) uninstallViaDocker(ctx context.Context, c *gin.Context,
 	// 1. Strip plugin's rule/fragment markers from CLAUDE.md (mirrors
 	//    AgentskillsAdaptor.uninstall lines 184-188). Best-effort: if
 	//    the user edited CLAUDE.md, our marker stays untouched.
-	h.stripPluginMarkersFromMemory(ctx, containerName, pluginName)
+	h.stripPluginMarkersFromMemory(ctx, workspaceID, containerName, pluginName)
 
 	// 2. Remove copied skill dirs declared in the plugin's plugin.yaml.
 	for _, skill := range skillNames {
