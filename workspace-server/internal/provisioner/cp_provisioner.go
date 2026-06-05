@@ -182,6 +182,46 @@ type cpProvisionResponse struct {
 	Error      string `json:"error"`
 }
 
+// buildCPTenantEnv assembles the env map the control plane forwards to a
+// tenant EC2 workspace container, applying the forensic #145 SCM-write-token
+// guard.
+//
+// The guard strips every key classified by isSCMWriteTokenKey (GITEA_TOKEN,
+// GITHUB_TOKEN, …) UNLESS that key is positively workspace-authored —
+// i.e. present in cfg.WorkspaceSecretKeys, the provenance set populated from
+// the workspace_secrets table. Rationale:
+//
+//   - Operator / persona-merged (global-scoped) SCM-write tokens are an
+//     upstream bleed and MUST NOT reach an agent-controlled container — that
+//     keeps the two-eyes review gate structurally self-bypass-proof.
+//   - A workspace-scoped GITEA_TOKEN that an org admin deliberately set via
+//     the canvas Secrets tab is the INTENDED delivery channel for that
+//     workspace's reviewer agent. Stripping it broke codex reviewers
+//     (whoami 401/404). It is exempt.
+//
+// Fail-safe: a nil cfg.WorkspaceSecretKeys yields wsAuthored=false for every
+// key, so a missing provenance map strips ALL SCM-write tokens rather than
+// leaking them. adminToken, when non-empty, is injected as ADMIN_TOKEN (it is
+// never an SCM-write key, so the guard never touches it).
+func buildCPTenantEnv(cfg WorkspaceConfig, adminToken string) map[string]string {
+	env := make(map[string]string, len(cfg.EnvVars)+1)
+	for k, v := range cfg.EnvVars {
+		if isSCMWriteTokenKey(k) {
+			_, wsAuthored := cfg.WorkspaceSecretKeys[k] // nil map → false (fail-safe)
+			if !wsAuthored {
+				log.Printf("CPProvisioner.Start: dropped SCM-write credential %q from tenant workspace env (forensic #145 guard; provenance=operator/global)", k)
+				continue
+			}
+			log.Printf("CPProvisioner.Start: preserved workspace-authored SCM credential %q for tenant workspace (forensic #145: workspace_secrets provenance, intended delivery)", k)
+		}
+		env[k] = v
+	}
+	if adminToken != "" {
+		env["ADMIN_TOKEN"] = adminToken
+	}
+	return env
+}
+
 // Start provisions a workspace by calling the control plane → EC2.
 func (p *CPProvisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string, error) {
 	// Inject ADMIN_TOKEN into the workspace container env so the agent can call
@@ -193,18 +233,10 @@ func (p *CPProvisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string,
 	// the SCM-write-token denylist (see buildContainerEnv) is enforced here
 	// too. Always build a filtered copy — never pass cfg.EnvVars through
 	// verbatim — so a latent persona-merged GITEA_TOKEN can't reach the
-	// tenant container regardless of whether ADMIN_TOKEN is set.
-	env := make(map[string]string, len(cfg.EnvVars)+1)
-	for k, v := range cfg.EnvVars {
-		if isSCMWriteTokenKey(k) {
-			log.Printf("CPProvisioner.Start: dropped SCM-write credential %q from tenant workspace env (forensic #145 guard)", k)
-			continue
-		}
-		env[k] = v
-	}
-	if p.adminToken != "" {
-		env["ADMIN_TOKEN"] = p.adminToken
-	}
+	// tenant container regardless of whether ADMIN_TOKEN is set. Extracted to
+	// buildCPTenantEnv so the strip/exempt logic is unit-testable without
+	// standing up the CP HTTP round-trip.
+	env := buildCPTenantEnv(cfg, p.adminToken)
 	// Collect template files and generated configs, with OFFSEC-010 guards:
 	// - Rejects symlinks at the template root (prevents bypass via symlink traversal)
 	// - Skips symlinks during WalkDir (prevents /etc/passwd etc. inclusion)

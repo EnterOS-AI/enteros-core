@@ -129,7 +129,7 @@ func (h *WorkspaceHandler) provisionWorkspaceOpts(workspaceID, templatePath stri
 							workspaceID, filepath.Base(runtimeTemplate))
 						templatePath = runtimeTemplate
 						// Rebuild cfg with the recovered template path so Start() sees it.
-						cfg = h.buildProvisionerConfig(ctx, workspaceID, templatePath, configFiles, payload, prepared.EnvVars, prepared.PluginsPath)
+						cfg = h.buildProvisionerConfig(ctx, workspaceID, templatePath, configFiles, payload, prepared.EnvVars, prepared.Config.WorkspaceSecretKeys, prepared.PluginsPath)
 						cfg.ResetClaudeSession = resetClaudeSession
 						recovered = true
 						break
@@ -281,6 +281,7 @@ func (h *WorkspaceHandler) buildProvisionerConfig(
 	configFiles map[string][]byte,
 	payload models.CreateWorkspacePayload,
 	envVars map[string]string,
+	workspaceSecretKeys map[string]struct{},
 	pluginsPath string,
 ) provisioner.WorkspaceConfig {
 	// Per-workspace workspace_dir takes priority over global WORKSPACE_DIR env var.
@@ -337,8 +338,13 @@ func (h *WorkspaceHandler) buildProvisionerConfig(
 			Height:   payload.Compute.Display.Height,
 			Protocol: payload.Compute.Display.Protocol,
 		},
-		EnvVars:     envVars,
-		PlatformURL: h.platformURL,
+		EnvVars: envVars,
+		// Forensic #145: positive provenance set so the SCM-write-token guard
+		// (cp_provisioner.Start) exempts a workspace-authored GITEA_TOKEN from
+		// the operator-bleed strip while still stripping global/persona-merged
+		// SCM tokens. Carried by both Docker- and CP-mode configs.
+		WorkspaceSecretKeys: workspaceSecretKeys,
+		PlatformURL:         h.platformURL,
 		// Image left empty — molecule-core's runtime_image_pins table (mig
 		// 047, dead reader removed by RFC internal#617 / task #335) was an
 		// aspirational SSOT that never received a writer. CP's
@@ -1233,9 +1239,18 @@ func firstNonEmptyEnv(names ...string) string {
 // stores — NOT the user's own scoped PAT they explicitly authorized via
 // the per-workspace Secrets tab.
 //
+// The third return value (workspaceKeys) is the POSITIVE counterpart: the
+// set of keys authored via the per-workspace `workspace_secrets` table
+// (user / org-admin set, authenticated as the workspace owner). It is the
+// provenance signal the forensic #145 SCM-write-token guard consults to
+// EXEMPT a workspace-scoped GITEA_TOKEN (the intended, legitimate delivery
+// channel for a reviewer agent) from the operator-bleed strip. A key set
+// in BOTH stores lands here (workspace overrides global) and is removed
+// from globalKeys, matching the precedence semantic below.
+//
 // The merged map preserves the existing precedence semantic (workspace
 // rows overwrite global rows on key collision); only the provenance side-
-// channel is new. Existing single-return callers can ignore globalKeys.
+// channels are new. Existing callers can ignore globalKeys / workspaceKeys.
 //
 // F1086 / #1206: the returned error string is the SAFE-CANNED message that
 // gets persisted to workspaces.last_sample_error AND broadcast as the
@@ -1243,9 +1258,10 @@ func firstNonEmptyEnv(names ...string) string {
 // the encryption version, the decrypt-error text) is logged here, never
 // returned to the caller, so it can't leak via the canvas event stream
 // (cf. TestProvisionWorkspace_NoInternalErrorsInBroadcast).
-func loadWorkspaceSecrets(ctx context.Context, workspaceID string) (map[string]string, map[string]struct{}, string) {
+func loadWorkspaceSecrets(ctx context.Context, workspaceID string) (map[string]string, map[string]struct{}, map[string]struct{}, string) {
 	envVars := map[string]string{}
 	globalKeys := map[string]struct{}{}
+	workspaceKeys := map[string]struct{}{}
 	globalRows, globalErr := db.DB.QueryContext(ctx,
 		`SELECT key, encrypted_value, encryption_version FROM global_secrets`)
 	if globalErr == nil {
@@ -1266,7 +1282,7 @@ func loadWorkspaceSecrets(ctx context.Context, workspaceID string) (map[string]s
 				decrypted, decErr := crypto.DecryptVersioned(v, ver)
 				if decErr != nil {
 					log.Printf("Provisioner: FATAL — failed to decrypt global secret %s (version=%d): %v — aborting provision of workspace %s", k, ver, decErr, workspaceID)
-					return nil, nil, "failed to decrypt global secret"
+					return nil, nil, nil, "failed to decrypt global secret"
 				}
 				envVars[k] = string(decrypted)
 				globalKeys[k] = struct{}{}
@@ -1300,7 +1316,7 @@ func loadWorkspaceSecrets(ctx context.Context, workspaceID string) (map[string]s
 				decrypted, decErr := crypto.DecryptVersioned(v, ver)
 				if decErr != nil {
 					log.Printf("Provisioner: FATAL — failed to decrypt workspace secret %s (version=%d) for %s: %v — aborting provision", k, ver, workspaceID, decErr)
-					return nil, nil, "failed to decrypt workspace secret"
+					return nil, nil, nil, "failed to decrypt workspace secret"
 				}
 				envVars[k] = string(decrypted)
 				// User-authored workspace_secrets value supersedes any
@@ -1309,13 +1325,19 @@ func loadWorkspaceSecrets(ctx context.Context, workspaceID string) (map[string]s
 				// re-set the value via the canvas Secrets tab, so it is
 				// no longer "the operator-store version."
 				delete(globalKeys, k)
+				// Positive provenance: record that this key was authored
+				// via workspace_secrets. The forensic #145 SCM-write-token
+				// guard exempts only keys in this set — a workspace-scoped
+				// GITEA_TOKEN is the intended delivery channel for that
+				// workspace's agent.
+				workspaceKeys[k] = struct{}{}
 			}
 		}
 		if err := wsRows.Err(); err != nil {
 			log.Printf("Provisioner: workspace_secrets rows.Err workspace=%s: %v", workspaceID, err)
 		}
 	}
-	return envVars, globalKeys, ""
+	return envVars, globalKeys, workspaceKeys, ""
 }
 
 // provisionWorkspaceCP provisions a workspace via the control plane API.
