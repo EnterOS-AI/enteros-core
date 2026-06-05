@@ -33,11 +33,20 @@
 #                           2026-05-17 (internal#189 Phase 1).
 #
 # BURN-IN CLOSED 2026-05-17 (internal#189 Phase 1): The 7-day burn-in
-# window closed. continue-on-error: true has been removed from the
-# tier-check job; AND-composition is now fully enforced. If you need
-# to temporarily re-introduce a mask, file a tracker and follow the
-# mc#1982 protocol (Tier 2e lint requires a current tracker within
-# 2 lines of any continue-on-error: true).
+# window closed. As of 2026-06-04 the residual masks left behind by the
+# burn-in are removed for real (the comment previously claimed this while
+# the masks still persisted — that was stale):
+#   - continue-on-error: true on the jq-install step (redundant; the step
+#     already exits 0) and on the tier-check step (the burn-in mask).
+#   - the `|| true` after the sop-tier-check.sh invocation, which masked
+#     real tier-gate verdicts.
+# AND-composition is now fully enforced and the tier-check step can
+# honestly red CI on a real SOP-6 violation. SOP_FAIL_OPEN=1 is RETAINED
+# as sanctioned infra-resilience: it fails-open only on token/network/jq
+# faults, never on a real gate verdict. If you need to temporarily
+# re-introduce a mask, file a tracker and follow the mc#1982 protocol
+# (Tier 2e lint requires a current tracker within 2 lines of any
+# continue-on-error: true).
 
 name: sop-tier-check
 
@@ -90,10 +99,11 @@ jobs:
         # GitHub releases may be unreachable from some runner networks
         # (infra#241 follow-up: GitHub timeout after 3s on 5.78.80.188
         # runners). The sop-tier-check script has its own fallback as a
-        # third line of defense. continue-on-error: true ensures this step
-        # failing does not block the job.
-        # mc#1982: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
-        continue-on-error: true
+        # third line of defense, and this step's final command
+        # (`jq --version ... || echo`) already exits 0 unconditionally — so
+        # the step cannot fail the job on its own.
+        # continue-on-error REMOVED 2026-06-04 (mc#1982 directive: root-fix
+        # and remove, do not renew). It was redundant masking, not a gate.
         run: |
           # apt-get is the primary method — Ubuntu package mirrors are reliably
           # reachable from runner containers. GitHub releases may be blocked
@@ -110,11 +120,11 @@ jobs:
           jq --version 2>/dev/null || echo "::notice::jq not yet available — script fallback will retry"
 
       - name: Verify tier label + reviewer team membership
-        # continue-on-error: true at step level — job-level is ignored by Gitea
-        # Actions (quirk #10, internal runbooks). Belt-and-suspenders with
-        # SOP_FAIL_OPEN=1 + || true below.
-        # mc#1982: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
-        continue-on-error: true
+        # continue-on-error REMOVED 2026-06-04 (expired internal#189 Phase 1
+        # burn-in, window closed 2026-05-17; mc#1982 directive: root-fix and
+        # remove, do not renew). SOP_FAIL_OPEN=1 below still fails-open on
+        # token/network/infra errors only (never on a real tier-gate verdict),
+        # so this step can now honestly fail CI on a genuine SOP-6 violation.
         env:
           GITEA_TOKEN: ${{ secrets.SOP_TIER_CHECK_TOKEN || secrets.GITHUB_TOKEN }}
           GITEA_HOST: git.moleculesai.app
@@ -123,9 +133,13 @@ jobs:
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           SOP_DEBUG: '0'
           SOP_LEGACY_CHECK: '0'
-          # SOP_FAIL_OPEN=1 makes the script always exit 0. The UI enforces
-          # the actual merge gate. Combined with continue-on-error: true
-          # above, this step never fails the job regardless of script exit.
+          # SOP_FAIL_OPEN=1 fails-open ONLY on infra faults (empty/invalid
+          # token, unreachable Gitea API, missing jq) — see the guarded
+          # `exit 0` branches in sop-tier-check.sh. It does NOT mask a real
+          # tier-gate verdict: a missing tier label, no approving review, or
+          # an unsatisfied AND-clause still `exit 1`. Kept as sanctioned
+          # infra-resilience; the `|| true` mask was REMOVED with the burn-in
+          # COE (2026-06-04) so a genuine SOP-6 violation now reds CI.
           SOP_FAIL_OPEN: '1'
         run: |
-          bash .gitea/scripts/sop-tier-check.sh || true
+          bash .gitea/scripts/sop-tier-check.sh
