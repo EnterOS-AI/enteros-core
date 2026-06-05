@@ -203,9 +203,9 @@ func TestRestartByID_DebounceExpiresAfterWindow(t *testing.T) {
 	const wsID = "self-fire-ws-debounce-release"
 	resetSelfFireState(wsID)
 
-	orig := restartDebounceWindow
-	restartDebounceWindow = 5 * time.Millisecond
-	defer func() { restartDebounceWindow = orig }()
+	orig := RestartDebounceWindow
+	RestartDebounceWindow = 5 * time.Millisecond
+	defer func() { RestartDebounceWindow = orig }()
 
 	// Stamp inside the window.
 	sv, _ := restartStates.LoadOrStore(wsID, &restartState{})

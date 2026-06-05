@@ -45,7 +45,7 @@ type restartState struct {
 	// flipped running=true. Used by the self-fire debounce (internal#544,
 	// the ws-server self-fire restart feedback loop seen in prod-Reviewer/
 	// Researcher 2026-05-19 ~00:05Z 4x reprov thrash): any RestartByID
-	// arriving within restartDebounceWindow of this timestamp is silently
+	// arriving within RestartDebounceWindow of this timestamp is silently
 	// dropped so a probe firing during the EC2-pending window can't
 	// re-trigger a fresh full cycle on the just-launched instance.
 	restartStartedAt time.Time
@@ -55,13 +55,19 @@ type restartState struct {
 // its own entry so unrelated workspaces don't serialize on each other.
 var restartStates sync.Map // map[workspaceID]*restartState
 
-// restartDebounceWindow is the silent-drop window for successive RestartByID
+// RestartDebounceWindow is the silent-drop window for successive RestartByID
 // calls. Sized to cover the typical EC2 pending → online interval (20-30s)
 // with a margin so a probe firing during the just-after-online but still-
 // flaky heartbeat window also gets dropped. Bigger than that would block
 // legitimate "Restart failed, retry" recoveries; smaller would let the
 // 4x thrash class through. Package-level so tests can shrink it.
-var restartDebounceWindow = 60 * time.Second
+//
+// COUPLING: this window MUST be >= the CP instance reconciler interval
+// (cmd/server/main.go:355, currently 60s). If the interval ever shrinks
+// below this window, a workspace flipped offline by one reconcile tick can
+// be reprovisioned again by the next tick before the debounce drops it,
+// reopening the double-reprovision thrash class (internal#544).
+var RestartDebounceWindow = 60 * time.Second
 
 // restartByIDDropCounter is incremented every time RestartByID drops a call
 // inside the debounce window. Exposed as a package-level atomic counter so
@@ -536,7 +542,7 @@ func (h *WorkspaceHandler) RestartByID(workspaceID string) {
 		return
 	}
 	// Self-fire debounce: drop (not coalesce) successive RestartByID calls
-	// within restartDebounceWindow of the most recent cycle's start. This
+	// within RestartDebounceWindow of the most recent cycle's start. This
 	// is the load-bearing protection against the 4x reprov thrash class —
 	// coalesceRestart's pending-flag would otherwise drain by running
 	// ANOTHER full cycle of stop+provision on the just-launched EC2 (still
@@ -550,14 +556,14 @@ func (h *WorkspaceHandler) RestartByID(workspaceID string) {
 	if shouldDebounceRestart(workspaceID) {
 		restartByIDDropCounter.Add(1)
 		log.Printf("RestartByID: %s — dropped (within %s self-fire debounce window; total dropped=%d)",
-			workspaceID, restartDebounceWindow, restartByIDDropCounter.Load())
+			workspaceID, RestartDebounceWindow, restartByIDDropCounter.Load())
 		return
 	}
 	coalesceRestart(workspaceID, func() { h.runRestartCycle(workspaceID) })
 }
 
 // shouldDebounceRestart reports whether the most recent cycle for this
-// workspace started within restartDebounceWindow. Read-only on
+// workspace started within RestartDebounceWindow. Read-only on
 // restartState; the actual restartStartedAt stamp is written in
 // coalesceRestart when running flips false→true.
 func shouldDebounceRestart(workspaceID string) bool {
@@ -571,7 +577,7 @@ func shouldDebounceRestart(workspaceID string) bool {
 	if state.restartStartedAt.IsZero() {
 		return false
 	}
-	return time.Since(state.restartStartedAt) < restartDebounceWindow
+	return time.Since(state.restartStartedAt) < RestartDebounceWindow
 }
 
 // coalesceRestart implements the pending-flag gate around an arbitrary cycle
@@ -594,7 +600,7 @@ func coalesceRestart(workspaceID string, cycle func()) {
 	}
 	state.running = true
 	// Stamp the start time so the RestartByID debounce can drop any
-	// self-fire probe that hits within restartDebounceWindow. Only the
+	// self-fire probe that hits within RestartDebounceWindow. Only the
 	// false→true edge stamps; the drain-loop's inner cycles re-use the
 	// same start (they're effectively one "restart event" from the
 	// debounce's POV).
