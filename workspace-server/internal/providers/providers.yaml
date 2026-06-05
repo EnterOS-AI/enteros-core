@@ -827,29 +827,25 @@ runtimes:
           - anthropic:claude-sonnet-4-5
       - name: kimi-coding
         # BYOK kimi-coding gateway ids — bare form is the canonical id
-        # the gateway routes; the colon form `moonshot:kimi-k2.*` is the
-        # legacy BYOK selection form (already in use on the openclaw
-        # native set below). claude-code's adapter accepts both
-        # (internal#718 P4 PR-1).
+        # the gateway routes. The colon form `moonshot:kimi-k2.*` was
+        # removed because claude-code's adapter cannot strip the
+        # `moonshot:` prefix — it only handles `anthropic:`/`claude:`
+        # (cp#521). The bare forms already cover these models.
         models:
           - kimi-for-coding
           - kimi-k2.5
           - kimi-k2
-          - moonshot:kimi-k2.6
-          - moonshot:kimi-k2.5
       - name: minimax
-        # BYOK MiniMax ids — bare form is the canonical id; colon form is
-        # the legacy BYOK selection spelling carried in the create corpus
-        # and the openclaw template (internal#718 P4 PR-1).
+        # BYOK MiniMax ids — bare form is the canonical id. The colon
+        # forms `minimax:MiniMax-*` were removed because claude-code's
+        # adapter cannot strip the `minimax:` prefix — it only handles
+        # `anthropic:`/`claude:` (cp#521). The bare forms already cover
+        # these models.
         models:
           - MiniMax-M2
           - MiniMax-M2.7
           - MiniMax-M2.7-highspeed
           - MiniMax-M3
-          - minimax:MiniMax-M2
-          - minimax:MiniMax-M2.7
-          - minimax:MiniMax-M2.7-highspeed
-          - minimax:MiniMax-M3
       # Platform-managed (no tenant key; Molecule owns billing). The
       # vendor/model-namespaced ids the proxy resolves to the upstream vendor.
       # Canonical for the template's `provider: platform` model entries — the

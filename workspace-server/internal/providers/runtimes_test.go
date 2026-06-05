@@ -117,14 +117,15 @@ func TestModelsForRuntime_ExactModelIDs(t *testing.T) {
 			"anthropic:claude-haiku-4-5", "anthropic:claude-sonnet-4-5",
 			// anthropic via platform proxy (namespaced)
 			"anthropic/claude-opus-4-7", "anthropic/claude-sonnet-4-6",
-			// kimi (kimi-coding gateway, bare + legacy colon-namespaced BYOK)
+			// kimi (kimi-coding gateway, bare form only — colon-forms removed
+			// because claude-code's adapter cannot strip the moonshot: prefix;
+			// openclaw retains them natively, cp#521).
 			"kimi-for-coding", "kimi-k2.5", "kimi-k2",
-			"moonshot:kimi-k2.6", "moonshot:kimi-k2.5",
 			// kimi via platform proxy
 			"moonshot/kimi-k2.6", "moonshot/kimi-k2.5",
-			// minimax BYOK (bare + legacy colon-namespaced)
+			// minimax BYOK (bare form only — colon-forms removed because
+			// claude-code's adapter cannot strip the minimax: prefix, cp#521).
 			"MiniMax-M2", "MiniMax-M2.7", "MiniMax-M2.7-highspeed", "MiniMax-M3",
-			"minimax:MiniMax-M2", "minimax:MiniMax-M2.7", "minimax:MiniMax-M2.7-highspeed", "minimax:MiniMax-M3",
 			// minimax via platform proxy
 			"minimax/MiniMax-M2.7", "minimax/MiniMax-M2.7-highspeed", "minimax/MiniMax-M3",
 		},
