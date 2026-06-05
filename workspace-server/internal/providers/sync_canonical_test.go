@@ -29,7 +29,7 @@ import (
 // canonicalProvidersYAMLSHA256 is the sha256 of the canonical providers.yaml as
 // synced from molecule-controlplane. Bumped deliberately on each re-sync (see
 // file doc). Cross-checked live by the sync-providers-yaml CI workflow.
-const canonicalProvidersYAMLSHA256 = "846ddef11ec423ebf2e96b5da21bd89129dbc3f0a2d14ac086940e005c079387"
+const canonicalProvidersYAMLSHA256 = "9eb6f97fc37b528c91936be4a75dd87f6c7172742b4535d76b9bb2231ee18e80"
 
 func TestSyncedYAMLMatchesCanonicalSHA(t *testing.T) {
 	sum := sha256.Sum256(embeddedYAML)
