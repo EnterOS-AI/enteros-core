@@ -370,7 +370,7 @@ test.describe("staging canvas tabs", () => {
 
     // The tablist appears once the side panel mounts. Condition-based
     // wait — no fixed delay.
-    const tablist = page.locator('[role="tablist"]');
+    const tablist = page.getByRole("tablist", { name: "Workspace panel tabs" });
     await expect(
       tablist,
       "side panel tablist never appeared after clicking the workspace node",
