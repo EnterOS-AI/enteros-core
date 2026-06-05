@@ -394,6 +394,21 @@ jobs:
       - name: Run E2E API tests
         if: needs.detect-changes.outputs.api == 'true'
         run: bash tests/e2e/test_api.sh
+      - name: Run keyless feature-contract E2E (terminal-diagnose / webhooks / budget / checkpoints / audit / traces / session-search / rescue / llm-billing-mode / resume / hibernate)
+        # Keyless required-lane coverage for feature endpoints that ship without
+        # an LLM key (runtime=external fixture). Each asserts the real HTTP
+        # contract + a meaningful failure mode (401/400/fail-closed) so a
+        # regression goes RED, not silently green. The mock-runtime A2A canned
+        # round-trip is covered by the priority-runtimes `mock` arm, not here.
+        if: needs.detect-changes.outputs.api == 'true'
+        run: bash tests/e2e/test_keyless_feature_contracts_e2e.sh
+      - name: Run secrets-dispatch contract test (keyless SECRETS_JSON branch order)
+        # Previously orphaned (no workflow referenced it). Hermetic unit-style
+        # contract over test_staging_full_saas.sh's LLM-key branch precedence —
+        # needs no platform, no bearer, no network. Guards the 2026-05-03
+        # "wrong key shape wins" incident class.
+        if: needs.detect-changes.outputs.api == 'true'
+        run: bash tests/e2e/test_secrets_dispatch.sh
       - name: Run notify-with-attachments E2E
         if: needs.detect-changes.outputs.api == 'true'
         run: bash tests/e2e/test_notify_attachments_e2e.sh
