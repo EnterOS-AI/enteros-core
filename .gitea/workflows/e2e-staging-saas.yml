@@ -124,7 +124,12 @@ jobs:
     # Phase 3 (RFC #219 §1): surface broken workflows without blocking.
     # mc#1982: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
     continue-on-error: true
-    timeout-minutes: 45
+    # Raised 45→75: step 10b now exercises pause→resume→online +
+    # hibernate→wake→online, each of which RE-PROVISIONS the parent (CP
+    # re-provision + heartbeat recovery, not a fresh EC2 cold start, but still
+    # minutes). The base provision→online→A2A matrix fits in ~35 min; the two
+    # extra lifecycle reprovisions need headroom under WORKSPACE_ONLINE_TIMEOUT.
+    timeout-minutes: 75
     permissions:
       contents: read
 
@@ -184,6 +189,11 @@ jobs:
       E2E_MODEL_SLUG: ${{ github.event.inputs.runtime == 'hermes' && 'openai/gpt-4o' || github.event.inputs.runtime == 'codex' && 'openai/gpt-4o' || github.event.inputs.runtime == 'google-adk' && 'google_genai:gemini-2.5-pro' || 'minimax:MiniMax-M2.7' }}
       E2E_RUN_ID: "${{ github.run_id }}-${{ github.run_attempt }}"
       E2E_KEEP_ORG: ${{ github.event.inputs.keep_org && '1' || '0' }}
+      # Lifecycle transitions (step 10b): pause→resume→online +
+      # hibernate→wake→online on the provisioned parent. `auto` runs them in
+      # full mode (this job). Set `off` to skip the ~2x-reprovision cost on an
+      # ad-hoc dispatch. The timeout-minutes above is sized for this being on.
+      E2E_LIFECYCLE: auto
       # Fail-closed-on-skip: in CI the harness MUST prove ≥1 full
       # provision→online→A2A cycle. If it reaches the end having validated
       # nothing (a future short-circuit / skip path), it exits 5 rather than

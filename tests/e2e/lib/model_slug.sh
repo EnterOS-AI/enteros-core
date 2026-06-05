@@ -83,7 +83,17 @@ pick_model_slug() {
   fi
   case "$runtime" in
     hermes)      printf 'openai/gpt-4o' ;;
-    claude-code)
+    # seo-agent is a claude-code-adapter template VARIANT selected by
+    # template name (template="seo-agent"), not a distinct registry runtime
+    # (it is absent from manifest.json + runtime_registry.go). Its config.yaml
+    # declares `runtime: claude-code` and copies the claude-code `providers:`
+    # block (providers.yaml:21 "The same block is copy-pasted into the seo-agent
+    # template"), so its model dispatch is IDENTICAL to claude-code's: the
+    # MiniMax BYOK colon id (the staging-default key path), else direct
+    # Anthropic, else the OAuth `sonnet` alias. Sharing the claude-code branch
+    # keeps the SSOT one place — a seo-agent run is just a claude-code run
+    # behind a productized template skin.
+    claude-code|seo-agent)
       if [ -n "${E2E_MINIMAX_API_KEY:-}" ]; then
         # Namespaced (colon) BYOK id, not bare "MiniMax-M2" (#2263 deploy-skew):
         # bare ids can lag the deployed staging ws-server's compiled registry,
@@ -101,6 +111,20 @@ pick_model_slug() {
       else
         printf 'sonnet'
       fi
+      ;;
+    # google-adk: Gemini via two distinct provider arms in providers.yaml
+    # runtimes.google-adk:
+    #   * platform arm → `platform:gemini-2.5-pro` (keyless Vertex via the CP
+    #     LLM proxy + server-side WIF mint; the org-compliant PROD path). This
+    #     id is selected via E2E_LLM_PATH=platform above, NOT here.
+    #   * google arm (AI Studio BYOK) → bare `gemini-2.5-pro` with the tenant's
+    #     own GOOGLE_API_KEY. This is the staging-exercisable path (no WIF
+    #     provisioning needed) and is what this branch selects.
+    # The workflow may further override with E2E_MODEL_SLUG=google_genai:gemini-2.5-pro
+    # (the adapter's provider:model spelling) — E2E_MODEL_SLUG wins at the top
+    # of this function, so both forms are supported.
+    google-adk)
+      printf 'gemini-2.5-pro'
       ;;
     *)           printf 'openai/gpt-4o' ;;  # safest fallback (matches hermes)
   esac

@@ -26,7 +26,26 @@
 #      the workspace stuck on 'online' indefinitely.)
 #
 # Hibernation is intentionally NOT covered here — it has its own timing
-# model (idle threshold) and warrants a separate harness.
+# model (idle threshold) and warrants a separate harness. (The
+# pause→resume + hibernate→wake transitions for PLATFORM-compute runtimes
+# are covered by test_staging_full_saas.sh step 10b.)
+#
+# BYO meta-runtime arms (kimi, kimi-cli) — added 2026-06-05:
+#   kimi and kimi-cli are BYO-compute meta-runtimes (isExternalLikeRuntime:
+#   runtime_registry.go:141-147) that go through the SAME external/poll
+#   provisioning path as `external` — create with external:true →
+#   awaiting_agent, register → online — but with their runtime LABEL
+#   PRESERVED (workspace.go:752-770 normalizeExternalRuntime keeps the
+#   specific label, does NOT coerce to generic "external", so the canvas
+#   shows the right runtime). They had ONLY validation/unit coverage and
+#   were NEVER provisioned→online in any e2e. Step 9 adds, for EACH of
+#   {kimi, kimi-cli}: create → assert awaiting_agent + label-preserved →
+#   register(poll) → assert online + label-preserved → A2A → assert the
+#   poll-mode {status:"queued"} envelope (a2a_proxy.go:462-477). The A2A
+#   arm proves the a2a proxy routes a BYO meta-runtime to the poll queue
+#   (200 + queued) rather than 404/500 — the meaningful round-trip for a
+#   workspace with no standing live agent. A real BYO-agent COMPLETION
+#   needs a standing kimi BYO cell (flagged for the CTO in the PR body).
 #
 # Required env (mirrors test_staging_full_saas.sh):
 #   MOLECULE_CP_URL          default: https://staging-api.moleculesai.app
@@ -455,6 +474,108 @@ RECOVERED_STATUS=$(echo "$GET_RESP" | python3 -c "import json,sys; print(json.lo
   fail "Expected re-register to return workspace to online, got $RECOVERED_STATUS"
 ok "Re-register succeeded — awaiting_agent → online (operator-recoverable)"
 require_transition "re-register: awaiting_agent → online (recovery)"
+
+# ─── 7b. BYO meta-runtime arms: kimi + kimi-cli ─────────────────────────
+# kimi and kimi-cli are BYO-compute meta-runtimes (isExternalLikeRuntime).
+# They share the external/poll provisioning path but PRESERVE their runtime
+# label (workspace.go normalizeExternalRuntime). They had no provision→online
+# e2e until now. For EACH: create(external:true, runtime=<rt>) → assert
+# awaiting_agent + label preserved → register(poll) → assert online + label
+# preserved → A2A → assert the poll-mode {status:"queued"} envelope.
+#
+# Why poll-mode {queued} is the A2A assertion (not a real completion): there
+# is no standing live BYO agent in staging, so the meaningful round-trip is
+# that the a2a proxy ROUTES a BYO meta-runtime to the poll queue (HTTP 200 +
+# {status:"queued", delivery_mode:"poll"}, a2a_proxy.go:462-477) instead of
+# 404/500. A real BYO-agent COMPLETION needs a standing kimi BYO cell — see
+# the CTO flag in the PR body.
+byo_meta_runtime_arm() {  # $1 = runtime label (kimi | kimi-cli)
+  local rt="$1"
+  local resp wid status auth get_resp db_status reg_dm online_status
+  log "    [$rt] create (external:true, runtime=$rt)..."
+  resp=$(tenant_call POST /workspaces \
+    -d "$(printf '{"name":"ext-%s-e2e","runtime":"%s","external":true}' "$rt" "$rt")")
+  wid=$(echo "$resp" | python3 -c "import json,sys; print(json.load(sys.stdin).get('id',''))")
+  status=$(echo "$resp" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))")
+  auth=$(echo "$resp" | python3 -c "
+import json,sys
+try:
+    d=json.load(sys.stdin); conn=d.get('connection') or {}
+    print(conn.get('auth_token','') or d.get('auth_token',''))
+except Exception:
+    print('')
+")
+  [ -z "$wid" ] && fail "[$rt] create missing id: $resp"
+  [ "$status" = "awaiting_agent" ] || fail "[$rt] create status='$status' (expected awaiting_agent — external/poll path)"
+  [ -z "$auth" ] && fail "[$rt] create returned no workspace auth token — register impossible"
+
+  # Assert the runtime LABEL was preserved (NOT coerced to generic 'external').
+  get_resp=$(tenant_call GET "/workspaces/$wid")
+  db_status=$(echo "$get_resp" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))")
+  local db_runtime
+  db_runtime=$(echo "$get_resp" | python3 -c "import json,sys; print(json.load(sys.stdin).get('runtime',''))")
+  [ "$db_status" = "awaiting_agent" ] || fail "[$rt] DB row status=$db_status (expected awaiting_agent)"
+  [ "$db_runtime" = "$rt" ] || fail "[$rt] runtime label coerced to '$db_runtime' (expected '$rt' — normalizeExternalRuntime must PRESERVE the BYO meta-runtime label, workspace.go:752-770)"
+  ok "    [$rt] create → awaiting_agent, runtime label preserved ✓"
+
+  # register(poll) → online. Reuse register_with_retry by setting WS_AUTH_TOKEN
+  # (the helper reads it as a global). REGISTER_RESP is set by the helper.
+  WS_AUTH_TOKEN="$auth"
+  local body
+  body=$(printf '{"id":"%s","url":"https://example.invalid:443","delivery_mode":"poll","agent_card":{"name":"e2e-%s","skills":[{"id":"echo","name":"Echo"}]}}' "$wid" "$rt")
+  REGISTER_RESP=""
+  register_with_retry "[$rt] register" "$body" \
+    || fail "[$rt] register returned non-200 after bounded retries — body: $(printf '%s' "$REGISTER_RESP" | sanitize_http_body | head -c 300)"
+  online_status=$(tenant_call GET "/workspaces/$wid" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))")
+  [ "$online_status" = "online" ] || fail "[$rt] expected online after register, got $online_status"
+  reg_dm=$(echo "$REGISTER_RESP" | head -n1 | python3 -c "import json,sys; print(json.load(sys.stdin).get('delivery_mode',''))" 2>/dev/null || echo "")
+  [ "$reg_dm" = "poll" ] || fail "[$rt] register response delivery_mode='$reg_dm' (expected poll)"
+  ok "    [$rt] register → online (delivery_mode=poll) ✓"
+
+  # A2A → assert poll-mode {status:"queued"} envelope. Bounded retry on the
+  # transient cold-edge 5xx class; a 4xx/non-queued 2xx is a real bug.
+  local a2a_payload a2a_tmp a2a_code a2a_rc a2a_status attempt
+  a2a_payload=$(python3 -c "
+import json, uuid
+print(json.dumps({
+    'jsonrpc':'2.0','method':'message/send','id':'e2e-byo-1',
+    'params':{'message':{'role':'user','messageId':f'e2e-{uuid.uuid4().hex[:8]}',
+        'parts':[{'kind':'text','text':'BYO meta-runtime poll-route smoke. Respond: OK'}]}}
+}))
+")
+  a2a_tmp=$(mktemp -t byo_a2a.XXXXXX)
+  for attempt in $(seq 1 8); do
+    : >"$a2a_tmp"
+    set +e
+    a2a_code=$(curl -sS --max-time 60 -X POST "$TENANT_URL/workspaces/$wid/a2a" \
+      -H "Authorization: Bearer $TENANT_TOKEN" \
+      -H "X-Molecule-Org-Id: $ORG_ID" \
+      -H "Content-Type: application/json" \
+      -d "$a2a_payload" -o "$a2a_tmp" -w '%{http_code}' 2>/dev/null)
+    a2a_rc=$?
+    set -e
+    a2a_code=${a2a_code:-000}
+    if [ "$a2a_rc" = "0" ] && [ "$a2a_code" = "200" ]; then break; fi
+    if echo "$a2a_code" | grep -Eq '^(502|503|504)$' && [ "$attempt" -lt 8 ]; then
+      log "    [$rt] A2A transient $a2a_code attempt $attempt/8"; sleep 10; continue
+    fi
+    break
+  done
+  a2a_status=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('status',''))" "$a2a_tmp" 2>/dev/null || echo "")
+  local a2a_dm
+  a2a_dm=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('delivery_mode',''))" "$a2a_tmp" 2>/dev/null || echo "")
+  rm -f "$a2a_tmp"
+  [ "$a2a_rc" = "0" ] && [ "$a2a_code" = "200" ] \
+    || fail "[$rt] A2A POST failed (rc=$a2a_rc, http=$a2a_code) — a BYO meta-runtime poll-mode A2A must 200 with a queued envelope, not error"
+  [ "$a2a_status" = "queued" ] && [ "$a2a_dm" = "poll" ] \
+    || fail "[$rt] A2A returned status='$a2a_status' delivery_mode='$a2a_dm' (expected queued/poll — a2a proxy must route a BYO meta-runtime to the poll queue, a2a_proxy.go:462-477)"
+  ok "    [$rt] A2A → poll-mode queued envelope ✓ (provision→online→A2A proven for $rt)"
+}
+
+log "7c/8 BYO meta-runtime arms (kimi, kimi-cli) — provision→online→A2A..."
+byo_meta_runtime_arm "kimi"
+byo_meta_runtime_arm "kimi-cli"
+ok "BYO meta-runtime arms passed for kimi + kimi-cli"
 
 # ─── 8. Done — cleanup runs in the EXIT trap ───────────────────────────
 # REQUIRE_LIVE belt-and-braces: assert here too (in addition to the EXIT

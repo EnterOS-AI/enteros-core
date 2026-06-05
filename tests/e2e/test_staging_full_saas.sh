@@ -24,6 +24,19 @@
 #
 # Optional env:
 #   E2E_RUNTIME                  hermes (default) | claude-code | codex | openclaw
+#                                | seo-agent | google-adk
+#                                  - seo-agent: a claude-code-adapter template
+#                                    VARIANT (not a distinct registry runtime).
+#                                    Selected via the `template` field (config.yaml
+#                                    resolves runtime=claude-code); reuses the
+#                                    same MiniMax/claude-code key path. See the
+#                                    TEMPLATE derivation + SECRETS_JSON block.
+#                                  - google-adk: Gemini. The AI-Studio-keyed BYOK
+#                                    path (E2E_GOOGLE_API_KEY) is staging-
+#                                    exercisable here; the keyless Vertex PROD
+#                                    path needs WIF (see header note + the CTO
+#                                    flag in the PR body) and is selected via
+#                                    E2E_LLM_PATH=platform + a platform: model.
 #   E2E_PROVISION_TIMEOUT_SECS   default 900 (15 min cold EC2 budget)
 #   E2E_WORKSPACE_ONLINE_TIMEOUT_SECS  default 3600 (60 min — hermes
 #                                cold-boot worst-case + slack). Raised from
@@ -47,6 +60,18 @@
 #                                tear down cleanly (and exit 4 on leak).
 #                                Used by a dedicated sanity workflow
 #                                that verifies the safety net.
+#   E2E_LIFECYCLE                auto (default) | off
+#                                When auto + MODE=full, exercises the
+#                                pause→resume→online and hibernate→resume(wake)
+#                                state transitions on the provisioned parent
+#                                (step 10b). These are REAL transitions on the
+#                                live tenant (Pause stops the container + sets
+#                                status=paused; Resume re-provisions →
+#                                provisioning → online; Hibernate stops +
+#                                status=hibernated; the next A2A auto-wakes it).
+#                                Set `off` for a fast smoke that skips the
+#                                ~2x-reprovision cost. In smoke MODE it is
+#                                skipped regardless (no parent stability budget).
 #   E2E_REQUIRE_LIVE             1 → fail-closed-on-skip guard (CI sets this).
 #                                When set, the run MUST actually complete
 #                                ≥1 full provision→online→A2A cycle. A run
@@ -592,6 +617,24 @@ print(json.dumps({
     'ANTHROPIC_API_KEY': k,
 }))
 ")
+elif [ -n "${E2E_GOOGLE_API_KEY:-}" ]; then
+  # google-adk AI-Studio BYOK path. The `google` provider entry
+  # (providers.yaml:401-413) reads GEMINI_API_KEY / GOOGLE_API_KEY and dials
+  # generativelanguage.googleapis.com — the tenant's OWN key, distinct from the
+  # keyless-Vertex PROD path (which routes through the CP proxy + server-side
+  # WIF and carries NO tenant credential). This branch exercises google-adk
+  # being PROVISIONED AT ALL on staging; the Vertex-specific WIF path is flagged
+  # for the CTO (needs extra provisioning) and is NOT reachable here. Inject
+  # under both env names the provider accepts so the adapter resolves regardless
+  # of which one it reads first.
+  SECRETS_JSON=$(python3 -c "
+import json, os
+k = os.environ['E2E_GOOGLE_API_KEY']
+print(json.dumps({
+    'GOOGLE_API_KEY': k,
+    'GEMINI_API_KEY': k,
+}))
+")
 elif [ -n "${E2E_OPENAI_API_KEY:-}" ]; then
   SECRETS_JSON=$(python3 -c "
 import json, os
@@ -611,11 +654,79 @@ fi
 MODEL_SLUG=$(pick_model_slug "$RUNTIME")
 log "    MODEL_SLUG=$MODEL_SLUG"
 
-log "5/11 Provisioning parent workspace (runtime=$RUNTIME)..."
+# ─── runtime → provision-selector resolution ────────────────────────────
+# Most runtimes are selected directly by the `runtime` field. seo-agent is
+# the exception: it is NOT a registry runtime (absent from manifest.json +
+# runtime_registry.go knownRuntimes) — it is a claude-code-adapter template
+# VARIANT selected by the `template` field. The ws-server Create handler reads
+# the template's config.yaml, which declares `runtime: claude-code`, and
+# resolves the concrete runtime from there (workspace.go:290-336). So for
+# seo-agent we send template="seo-agent" and OMIT runtime, letting the
+# template resolve it — sending an explicit runtime="seo-agent" would
+# RUNTIME_UNSUPPORTED-422 at workspace.go:374-384 because it is not in
+# knownRuntimes. PROVISION_TEMPLATE is "" for every real registry runtime.
+PROVISION_TEMPLATE=""
+case "$RUNTIME" in
+  seo-agent) PROVISION_TEMPLATE="seo-agent" ;;
+esac
+
+# Build the create payload in Python so the optional `template`/`runtime`
+# fields are emitted conditionally and the secrets blob is embedded without
+# shell-escaping hazards. Args: name, [parent_id|""].
+build_create_payload() {
+  local name="$1" parent_id="${2:-}"
+  E2E_WS_NAME="$name" \
+  E2E_WS_PARENT_ID="$parent_id" \
+  E2E_WS_RUNTIME="$RUNTIME" \
+  E2E_WS_TEMPLATE="$PROVISION_TEMPLATE" \
+  E2E_WS_MODEL="$MODEL_SLUG" \
+  E2E_WS_SECRETS="$SECRETS_JSON" \
+  python3 -c "
+import json, os
+secrets = json.loads(os.environ['E2E_WS_SECRETS'] or '{}')
+payload = {
+    'name': os.environ['E2E_WS_NAME'],
+    'tier': 2,
+    'model': os.environ['E2E_WS_MODEL'],
+    'secrets': secrets,
+}
+tmpl = os.environ.get('E2E_WS_TEMPLATE', '')
+if tmpl:
+    # Template-selected variant (seo-agent): the template's config.yaml
+    # resolves runtime=claude-code server-side. Do NOT also send an explicit
+    # runtime — seo-agent is not a registry runtime and would 422.
+    payload['template'] = tmpl
+else:
+    payload['runtime'] = os.environ['E2E_WS_RUNTIME']
+pid = os.environ.get('E2E_WS_PARENT_ID', '')
+if pid:
+    payload['parent_id'] = pid
+print(json.dumps(payload))
+"
+}
+
+if [ -n "$PROVISION_TEMPLATE" ]; then
+  log "5/11 Provisioning parent workspace (runtime=$RUNTIME via template=$PROVISION_TEMPLATE → claude-code adapter)..."
+else
+  log "5/11 Provisioning parent workspace (runtime=$RUNTIME)..."
+fi
 PARENT_RESP=$(tenant_call POST /workspaces \
   -H "Content-Type: application/json" \
-  -d "{\"name\":\"E2E Parent\",\"runtime\":\"$RUNTIME\",\"tier\":2,\"model\":\"$MODEL_SLUG\",\"secrets\":$SECRETS_JSON}")
-PARENT_ID=$(echo "$PARENT_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+  -d "$(build_create_payload 'E2E Parent')")
+# Surface the workspace-create error CLEARLY instead of dying on a Python
+# KeyError when the response has no 'id'. The load-bearing cases this names:
+#   - google-adk: RUNTIME_UNSUPPORTED 422 if google-adk is absent from the
+#     deployed manifest.json's workspace_templates (the Create-handler
+#     allowlist is manifest-derived — runtime_registry.go). google-adk is in
+#     providers.yaml + provisioner/registry.go + registry_gen but NOT (yet) in
+#     manifest.json, so it cannot be provisioned by `runtime` until the
+#     manifest gains it. Flagged for the CTO — this arm REDS until then.
+#   - seo-agent: an "invalid template" 400 if the seo-agent template isn't
+#     present in the tenant's configs/cache dir (template-cache refresh gap).
+PARENT_ID=$(echo "$PARENT_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('id',''))" 2>/dev/null || echo "")
+if [ -z "$PARENT_ID" ]; then
+  fail "Parent workspace create returned no 'id' (runtime=$RUNTIME, template=${PROVISION_TEMPLATE:-<none>}). Response: $(printf '%s' "$PARENT_RESP" | sanitize_http_body)"
+fi
 log "    PARENT_ID=$PARENT_ID"
 
 # ─── 6. Provision child (full mode only) ────────────────────────────────
@@ -624,8 +735,11 @@ if [ "$MODE" = "full" ]; then
   log "6/11 Provisioning child workspace..."
   CHILD_RESP=$(tenant_call POST /workspaces \
     -H "Content-Type: application/json" \
-    -d "{\"name\":\"E2E Child\",\"runtime\":\"$RUNTIME\",\"tier\":2,\"model\":\"$MODEL_SLUG\",\"parent_id\":\"$PARENT_ID\",\"secrets\":$SECRETS_JSON}")
-  CHILD_ID=$(echo "$CHILD_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+    -d "$(build_create_payload 'E2E Child' "$PARENT_ID")")
+  CHILD_ID=$(echo "$CHILD_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('id',''))" 2>/dev/null || echo "")
+  if [ -z "$CHILD_ID" ]; then
+    fail "Child workspace create returned no 'id' (runtime=$RUNTIME, template=${PROVISION_TEMPLATE:-<none>}). Response: $(printf '%s' "$CHILD_RESP" | sanitize_http_body)"
+  fi
   log "    CHILD_ID=$CHILD_ID"
 else
   log "6/11 Canary mode — skipping child workspace"
@@ -1414,6 +1528,135 @@ except Exception:
   else
     fail "Child activity log never referenced parent $PARENT_ID within ${E2E_CHILD_ACTIVITY_TIMEOUT_SECS:-60}s (last http=$CHILD_ACT_LASTCODE) — delegation-provenance pipeline regression (parent not recorded as source). Previously soft-logged → false-green."
   fi
+fi
+
+# ─── 10b. Pause/Resume + Hibernate/Resume lifecycle transitions ─────────
+# Exercise the REAL workspace lifecycle state machine on the provisioned
+# parent — the transitions that previously had only handler unit tests
+# (handlers_additional_test.go / hibernation_test.go) and NO real-infra
+# coverage. Each transition is asserted against the live DB-backed status the
+# GET /workspaces/:id endpoint returns, so a regression in the Pause/Resume/
+# Hibernate handlers (workspace_restart.go) or their CP stop/re-provision
+# wiring fails the gate instead of silently leaking an EC2 / wedging a tenant.
+#
+# Contract (workspace_restart.go):
+#   POST /pause     online → 'paused'  (container stopped, url cleared)  {"status":"paused"}
+#   POST /resume    paused → 'provisioning' → … → 'online' (re-provision) {"status":"provisioning"}
+#   POST /hibernate online → 'hibernating' → 'hibernated' (container stopped) {"status":"hibernated"}
+#   auto-wake       next A2A message/send on a hibernated ws → online
+#
+# Gated to full MODE (smoke has no parent-stability budget) + E2E_LIFECYCLE.
+# Runs LAST (after all read-only A2A/memory/peer checks) so the pause/stop
+# cycles don't disturb the earlier assertions. Skips are LOUD (logged), and
+# any broken transition hard-fails — never a silent pass.
+if [ "$MODE" = "full" ] && [ "${E2E_LIFECYCLE:-auto}" != "off" ]; then
+  log "10b/11 Lifecycle transitions: pause→resume→online, hibernate→resume(wake) on parent $PARENT_ID..."
+
+  lifecycle_status() {  # echoes the live workspace status
+    tenant_call GET "/workspaces/$PARENT_ID" 2>/dev/null \
+      | python3 -c "import json,sys; print(json.load(sys.stdin).get('status') or '')" 2>/dev/null || echo ""
+  }
+  # Bounded readiness-poll for a target status — same fail-closed shape as
+  # wait_workspaces_online_routable, but for an arbitrary terminal status.
+  wait_status() {  # $1=target $2=timeout_secs $3=label
+    local target="$1" timeout="$2" label="$3"
+    local deadline cur last=""
+    deadline=$(( $(date +%s) + timeout ))
+    while true; do
+      cur=$(lifecycle_status)
+      if [ "$cur" != "$last" ]; then log "    parent status → ${cur:-<empty>}"; last="$cur"; fi
+      [ "$cur" = "$target" ] && return 0
+      if [ "$(date +%s)" -gt "$deadline" ]; then
+        log "    [lifecycle] $label never reached '$target' within ${timeout}s (last='$cur')"
+        return 1
+      fi
+      sleep 10
+    done
+  }
+
+  # ── pause → paused ──
+  PAUSE_RESP=$(tenant_call POST "/workspaces/$PARENT_ID/pause" 2>/dev/null || echo '{}')
+  PAUSE_STATUS=$(echo "$PAUSE_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))" 2>/dev/null || echo "")
+  [ "$PAUSE_STATUS" = "paused" ] || fail "Pause: POST /pause returned status='$PAUSE_STATUS' (expected 'paused'). Body: ${PAUSE_RESP:0:200}"
+  # Poll the DB-backed status — the response body could lie; the GET proves the row.
+  wait_status "paused" 120 "pause" || fail "Pause: workspace $PARENT_ID never settled at status=paused (DB row) — Pause handler / CP stop regression (workspace_restart.go Pause)."
+  ok "    pause → paused (DB-verified)"
+
+  # ── resume → provisioning → online ──
+  RESUME_RESP=$(tenant_call POST "/workspaces/$PARENT_ID/resume" 2>/dev/null || echo '{}')
+  RESUME_STATUS=$(echo "$RESUME_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))" 2>/dev/null || echo "")
+  [ "$RESUME_STATUS" = "provisioning" ] || fail "Resume: POST /resume returned status='$RESUME_STATUS' (expected 'provisioning'). Body: ${RESUME_RESP:0:200}"
+  # Resume re-provisions from the preserved config volume; reuse the same
+  # online+routable readiness boundary the initial boot used (no fresh EC2
+  # cold-start, but CP re-provision + heartbeat recovery can still take minutes).
+  wait_workspaces_online_routable "    Waiting for parent to return online after resume (up to $((WORKSPACE_ONLINE_TIMEOUT_SECS/60)) min)..." "$PARENT_ID"
+  ok "    resume → provisioning → online (DB-verified)"
+
+  # ── hibernate → hibernated ──
+  HIB_RESP=$(tenant_call POST "/workspaces/$PARENT_ID/hibernate?force=true" 2>/dev/null || echo '{}')
+  HIB_STATUS=$(echo "$HIB_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))" 2>/dev/null || echo "")
+  [ "$HIB_STATUS" = "hibernated" ] || fail "Hibernate: POST /hibernate?force=true returned status='$HIB_STATUS' (expected 'hibernated'). Body: ${HIB_RESP:0:200}"
+  # The handler runs the claim→stop→'hibernated' sequence; poll the DB row to
+  # confirm it landed on 'hibernated' (not stuck mid-'hibernating').
+  wait_status "hibernated" 120 "hibernate" || fail "Hibernate: workspace $PARENT_ID never settled at status=hibernated (DB row) — Hibernate handler / CP stop regression (workspace_restart.go HibernateWorkspace)."
+  ok "    hibernate → hibernated (DB-verified)"
+
+  # ── resume-from-hibernate via auto-wake on next A2A ──
+  # A hibernated workspace auto-wakes on the next incoming A2A message/send
+  # (no explicit /resume — Resume only handles status=paused). Send a wake
+  # A2A and assert the workspace returns to online. We accept transient cold
+  # 5xx during wake (same edge class the PONG probe tolerates) and poll the
+  # status to the online boundary rather than asserting on the single A2A code.
+  log "    Hibernate auto-wake: sending A2A to wake hibernated parent..."
+  WAKE_PAYLOAD=$(python3 -c "
+import json, uuid
+print(json.dumps({
+    'jsonrpc': '2.0',
+    'method': 'message/send',
+    'id': 'e2e-wake-1',
+    'params': {
+        'message': {
+            'role': 'user',
+            'messageId': f'e2e-wake-{uuid.uuid4().hex[:8]}',
+            'parts': [{'kind': 'text', 'text': 'This is the platform lifecycle smoke test waking a hibernated workspace. No tools or memory are needed — please respond with exactly the single token: WOKE'}]
+        }
+    }
+}))
+")
+  WAKE_TMP=$(mktemp -t wake_a2a.XXXXXX)
+  for WAKE_ATTEMPT in $(seq 1 12); do
+    : >"$WAKE_TMP"
+    set +e
+    WAKE_CODE=$(tenant_call POST "/workspaces/$PARENT_ID/a2a" \
+      --max-time 90 \
+      -H "Content-Type: application/json" \
+      -d "$WAKE_PAYLOAD" \
+      -o "$WAKE_TMP" -w '%{http_code}' 2>/dev/null)
+    WAKE_RC=$?
+    set -e
+    WAKE_CODE=${WAKE_CODE:-000}
+    if [ "$WAKE_RC" = "0" ] && [ "$WAKE_CODE" -ge 200 ] && [ "$WAKE_CODE" -lt 300 ]; then
+      break
+    fi
+    WAKE_SAFE_BODY=$(cat "$WAKE_TMP" 2>/dev/null | sanitize_http_body)
+    # Wake legitimately returns transient 5xx while the container restarts —
+    # retry that class only (bounded), never a 4xx.
+    if echo "$WAKE_CODE" | grep -Eq '^(502|503|504)$' && [ "$WAKE_ATTEMPT" -lt 12 ]; then
+      log "    wake A2A cold/restart attempt $WAKE_ATTEMPT/12 returned $WAKE_CODE: ${WAKE_SAFE_BODY:0:120}"
+      sleep 15
+      continue
+    fi
+    break
+  done
+  rm -f "$WAKE_TMP"
+  # The auto-wake contract is the STATUS transition (hibernated → online), not
+  # the A2A body content — assert the live DB row, the real readiness signal.
+  wait_status "online" "$WORKSPACE_ONLINE_TIMEOUT_SECS" "hibernate-wake" \
+    || fail "Hibernate auto-wake: parent $PARENT_ID never returned to status=online after a wake A2A (last A2A http=$WAKE_CODE) — auto-wake-on-message regression (a hibernated ws must re-provision on the next A2A)."
+  ok "    hibernate → online via auto-wake A2A (DB-verified)"
+  ok "Lifecycle transitions passed: pause→resume→online + hibernate→wake→online"
+else
+  log "10b/11 Lifecycle transitions skipped (MODE=$MODE, E2E_LIFECYCLE=${E2E_LIFECYCLE:-auto}) — pause/resume/hibernate only run in full mode with E2E_LIFECYCLE!=off."
 fi
 
 # ─── 11. Teardown runs via trap ────────────────────────────────────────
