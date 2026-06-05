@@ -380,12 +380,18 @@ func (h *ActivityHandler) List(c *gin.Context) {
 	// "row not found" — both indicate the cursor is no longer usable for
 	// this caller, no information leak.
 	var cursorTime time.Time
+	var cursorSeq int64
 	usingCursor := false
 	if sinceID != "" {
+		// Resolve BOTH ordering-key components of the cursor row. The feed is
+		// ordered by (created_at, seq), so the strictly-after filter below must
+		// compare the full tuple — comparing created_at alone silently drops a
+		// row written in the SAME microsecond as the cursor row (the boundary
+		// skip the since_id E2E intermittently tripped over).
 		err := db.DB.QueryRowContext(c.Request.Context(),
-			`SELECT created_at FROM activity_logs WHERE id = $1 AND workspace_id = $2`,
+			`SELECT created_at, seq FROM activity_logs WHERE id = $1 AND workspace_id = $2`,
 			sinceID, workspaceID,
-		).Scan(&cursorTime)
+		).Scan(&cursorTime, &cursorSeq)
 		if errors.Is(err, sql.ErrNoRows) {
 			c.JSON(http.StatusGone, gin.H{
 				"error": "since_id cursor not found (row may have been pruned or belongs to a different workspace); omit since_id to reset",
@@ -492,10 +498,20 @@ func (h *ActivityHandler) List(c *gin.Context) {
 		argIdx++
 	}
 	if usingCursor {
-		// Strictly after — never replay the cursor row itself.
-		query += fmt.Sprintf(" AND "+actCol+"created_at > $%d", argIdx)
-		args = append(args, cursorTime)
-		argIdx++
+		// Strictly after the cursor on the FULL ordering key (created_at, seq).
+		// Tuple comparison: a row is "after" the cursor if its created_at is
+		// later, OR it shares the cursor's created_at but has a higher seq.
+		// This (a) never replays the cursor row itself and (b) — unlike a bare
+		// `created_at > cursor` — never drops a row written in the same
+		// microsecond as the cursor row. Expressed as the expanded boolean
+		// rather than a row-value `(created_at, seq) > ($t, $s)` so it composes
+		// with the actCol qualifier prefix and the existing placeholder/arg
+		// builder cleanly.
+		query += fmt.Sprintf(
+			" AND ("+actCol+"created_at > $%d OR ("+actCol+"created_at = $%d AND "+actCol+"seq > $%d))",
+			argIdx, argIdx, argIdx+1)
+		args = append(args, cursorTime, cursorSeq)
+		argIdx += 2
 	}
 
 	// Polling clients (since_id) need oldest-first within the new window so
@@ -503,9 +519,13 @@ func (h *ActivityHandler) List(c *gin.Context) {
 	// since_id) keeps DESC — that's the canvas/UI shape and changing it
 	// would surprise existing callers.
 	if usingCursor {
-		query += fmt.Sprintf(" ORDER BY "+actCol+"created_at ASC LIMIT $%d", argIdx)
+		// (created_at, seq) ASC — seq is the deterministic tiebreaker for rows
+		// sharing a microsecond-collided created_at. Replays in recorded order.
+		query += fmt.Sprintf(" ORDER BY "+actCol+"created_at ASC, "+actCol+"seq ASC LIMIT $%d", argIdx)
 	} else {
-		query += fmt.Sprintf(" ORDER BY "+actCol+"created_at DESC LIMIT $%d", argIdx)
+		// (created_at, seq) DESC — same tiebreaker, newest-first for the
+		// canvas/recent-feed shape.
+		query += fmt.Sprintf(" ORDER BY "+actCol+"created_at DESC, "+actCol+"seq DESC LIMIT $%d", argIdx)
 	}
 	args = append(args, limit)
 
@@ -680,7 +700,8 @@ func buildSessionSearchQuery(workspaceID, query string, limit int) (string, []in
 				COALESCE(status, '') AS status,
 				request_body,
 				response_body,
-				created_at
+				created_at,
+				seq
 			FROM activity_logs
 			WHERE workspace_id = $1
 		)
@@ -702,7 +723,13 @@ func buildSessionSearchQuery(workspaceID, query string, limit int) (string, []in
 		args = append(args, "%"+query+"%")
 	}
 
-	sqlQuery += ` ORDER BY created_at DESC LIMIT $` + strconv.Itoa(len(args)+1)
+	// Deterministic order: created_at alone is not unique (same-microsecond
+	// rows), so tie-break on the monotonic seq — same fix as the since_id feed
+	// (§ No flakes: no unstable sorts, even on an unused surface). `seq` is
+	// projected through the session_items CTE above so this outer ORDER BY can
+	// reference it — the outer SELECT can only sort on the CTE's output columns,
+	// not on activity_logs directly.
+	sqlQuery += ` ORDER BY created_at DESC, seq DESC LIMIT $` + strconv.Itoa(len(args)+1)
 	args = append(args, limit)
 	return sqlQuery, args
 }
