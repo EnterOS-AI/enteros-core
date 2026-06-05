@@ -169,6 +169,15 @@ fi
 
 source "$(dirname "$0")/_lib.sh"
 
+# GET /workspaces (list, router.go:165) and POST /workspaces (create,
+# router.go:166) are AdminAuth-gated. The e2e-api CI job sets ADMIN_TOKEN on the
+# platform (fail-open OFF) and exports MOLECULE_ADMIN_TOKEN here, so the
+# pre-sweep list and every runtime-create must send the admin bearer or they
+# 401. run_mock uses POST /org/import (also admin-gated) and wires its own admin
+# auth inline. Guarded if-set so a fail-open dev platform still works.
+ADMIN_AUTH=()
+e2e_admin_auth_args ADMIN_AUTH
+
 cleanup() {
   # `set -u` + empty array would error on "${CREATED_WSIDS[@]}"; the
   # ${VAR[@]+"…"} form expands to nothing when the array is unset/empty
@@ -198,7 +207,7 @@ bestfail()  { echo "  BEST-EFFORT MISS — $1"; echo "         $2"; SKIP=$((SKIP
 # Pre-sweep any prior runs that left workspaces behind (same defence as
 # test_notify_attachments_e2e.sh: trap fires on normal exit, but a
 # SIGPIPE / kill -9 can bypass it).
-PRIOR=$(curl -s "$BASE/workspaces" | python3 -c '
+PRIOR=$(curl -s "$BASE/workspaces" ${ADMIN_AUTH[@]+"${ADMIN_AUTH[@]}"} | python3 -c '
 import json, sys
 try:
     print(" ".join(w["id"] for w in json.load(sys.stdin) if w.get("name","").startswith("Priority E2E ")))
@@ -321,7 +330,7 @@ print(json.dumps({'CLAUDE_CODE_OAUTH_TOKEN': os.environ['CLAUDE_CODE_OAUTH_TOKEN
 ")
   local resp wsid
   # model required (CTO 2026-05-22 SSOT) — pass the deleted DefaultModel("claude-code") value.
-  resp=$(curl -s -X POST "$BASE/workspaces" -H "Content-Type: application/json" \
+  resp=$(curl -s -X POST "$BASE/workspaces" ${ADMIN_AUTH[@]+"${ADMIN_AUTH[@]}"} -H "Content-Type: application/json" \
     -d "{\"name\":\"Priority E2E (claude-code)\",\"runtime\":\"claude-code\",\"model\":\"sonnet\",\"tier\":1,\"secrets\":$secrets}")
   wsid=$(echo "$resp" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("id",""))') || true
   if [ -z "$wsid" ]; then
@@ -387,7 +396,7 @@ print(json.dumps({
 }))
 ")
   local resp wsid
-  resp=$(curl -s -X POST "$BASE/workspaces" -H "Content-Type: application/json" \
+  resp=$(curl -s -X POST "$BASE/workspaces" ${ADMIN_AUTH[@]+"${ADMIN_AUTH[@]}"} -H "Content-Type: application/json" \
     -d "{\"name\":\"Priority E2E (hermes)\",\"runtime\":\"hermes\",\"tier\":1,\"model\":\"openai/gpt-4o\",\"secrets\":$secrets}")
   wsid=$(echo "$resp" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("id",""))') || true
   if [ -z "$wsid" ]; then
@@ -460,7 +469,7 @@ print(json.dumps({
 }))
 ")
   local resp wsid
-  resp=$(curl -s -X POST "$BASE/workspaces" -H "Content-Type: application/json" \
+  resp=$(curl -s -X POST "$BASE/workspaces" ${ADMIN_AUTH[@]+"${ADMIN_AUTH[@]}"} -H "Content-Type: application/json" \
     -d "{\"name\":\"Priority E2E ($runtime)\",\"runtime\":\"$runtime\",\"tier\":1,\"model\":\"openai/gpt-4o-mini\",\"secrets\":$secrets}")
   wsid=$(echo "$resp" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("id",""))') || true
   if [ -z "$wsid" ]; then
@@ -679,7 +688,7 @@ print(json.dumps({'MINIMAX_API_KEY': os.environ['E2E_MINIMAX_API_KEY']}))
   # Namespaced BYOK model id (core#2263): bare MiniMax-M2 can 400 on a
   # registry-skewed ws-server build; minimax:MiniMax-M2.7 is the
   # registered claude-code BYOK arm and resolves like kimi's moonshot/…
-  resp=$(curl -s -X POST "$BASE/workspaces" -H "Content-Type: application/json" \
+  resp=$(curl -s -X POST "$BASE/workspaces" ${ADMIN_AUTH[@]+"${ADMIN_AUTH[@]}"} -H "Content-Type: application/json" \
     -d "{\"name\":\"Priority E2E (minimax)\",\"runtime\":\"claude-code\",\"model\":\"minimax:MiniMax-M2.7\",\"tier\":1,\"secrets\":$secrets}")
   wsid=$(echo "$resp" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("id",""))') || true
   if [ -z "$wsid" ]; then
