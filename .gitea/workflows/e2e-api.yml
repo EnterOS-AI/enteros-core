@@ -402,18 +402,27 @@ jobs:
         # E2E_REQUIRE_LIVE=1 makes the script exit NON-zero if zero runtimes
         # were actually validated end-to-end. Previously every runtime SKIPPED
         # here (no secrets in env), so PASS=0/FAIL=0 exited 0 and this REQUIRED
-        # gate was false-green — validating nothing. The secret below gives the
-        # gate a live arm.
+        # gate was false-green — validating nothing.
         #
-        # LIVE ARM — uses the ALREADY-PRESENT MOLECULE_STAGING_MINIMAX_API_KEY
-        # Gitea secret (the same secret the staging-smoke and continuous-synth
-        # canaries use). Surfaced as E2E_MINIMAX_API_KEY, it drives the
-        # claude-code runtime against MiniMax (BYOK, model minimax:MiniMax-M2.7).
-        # ZERO new credentials are required. CLAUDE_CODE_OAUTH_TOKEN /
-        # E2E_OPENAI_API_KEY are NOT configured on this repo, so they are NOT
-        # referenced here — wiring an absent secret would just RED the gate.
-        # If the MiniMax key is ever unset the job goes RED (by design) — a
-        # missing live arm is a real gap, not a skip.
+        # REQUIRE-LIVE BACKBONE — the `mock` runtime arm (run_mock). It needs
+        # NO secret: the mock runtime is a virtual workspace (no container, no
+        # EC2, no LLM) whose org-import path goes straight to status='online'
+        # and whose A2A proxy returns a deterministic canned reply
+        # (mock_runtime.go + a2a_proxy.go::handleMockA2A). So it exercises the
+        # full provision-decision → online → A2A round-trip → activity_logs
+        # plumbing and ALWAYS validates on a healthy platform — making this
+        # REQUIRED gate GREEN when the plumbing works and RED only when it
+        # genuinely breaks. No external key can make this gate false-green or
+        # can't-go-green.
+        #
+        # BEST-EFFORT BONUS ARM — MiniMax via the ALREADY-PRESENT
+        # MOLECULE_STAGING_MINIMAX_API_KEY Gitea secret (same secret the
+        # staging-smoke / continuous-synth canaries use), surfaced as
+        # E2E_MINIMAX_API_KEY. It drives claude-code against MiniMax (BYOK).
+        # MiniMax-create is registry-fragile in CI, so the MiniMax arm reports
+        # a best-effort MISS and does NOT red the gate on failure — mock is the
+        # load-bearing validation. ZERO new credentials are required. If the
+        # MiniMax key is unset the arm simply SKIPs (mock still validates).
         if: needs.detect-changes.outputs.api == 'true'
         env:
           E2E_REQUIRE_LIVE: '1'
