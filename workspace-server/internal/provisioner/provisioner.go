@@ -100,6 +100,7 @@ type WorkspaceConfig struct {
 	InstanceType    string // Optional CP EC2 instance type override (SaaS only)
 	DiskGB          int32  // Optional CP root volume size override in GiB (SaaS only)
 	DataPersistence string // internal#734: "persist"|"ephemeral"|"" — durable-data choice forwarded to CP (SaaS only)
+	Provider        string // multi-provider RFC: ""/"aws"|"hetzner"|"gcp" compute backend for the workspace box (per-workspace; distinct from LLM/model provider). Forwarded to CP.
 	Display         WorkspaceDisplayConfig
 	EnvVars         map[string]string // Additional env vars (API keys, etc.)
 	PlatformURL     string
