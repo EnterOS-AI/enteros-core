@@ -361,6 +361,117 @@ def test_process_once_holds_pr_on_permanent_merge_error(monkeypatch):
 
 
 # --------------------------------------------------------------------------
+# Fix 2 (cont.): mergeable=None is fail-CLOSED — Gitea is still computing the
+# conflict check, so the queue must WAIT (re-check next tick), NOT merge. Only
+# an explicit mergeable==True proceeds to an autonomous merge.
+# --------------------------------------------------------------------------
+
+def _fully_ready_process_once_monkeypatch(monkeypatch, mergeable, calls):
+    """Wire process_once so every gate is green EXCEPT the `mergeable` field,
+    which is set to the value under test. Records merge attempts in `calls`."""
+    monkeypatch.setattr(mq, "OWNER", "molecule-ai")
+    monkeypatch.setattr(mq, "NAME", "molecule-core")
+    monkeypatch.setattr(mq, "WATCH_BRANCH", "main")
+    monkeypatch.setattr(mq, "QUEUE_LABEL", "merge-queue")
+    monkeypatch.setattr(mq, "HOLD_LABEL", "merge-queue-hold")
+    monkeypatch.setattr(mq, "REVIEWER_SET", REVIEWERS)
+    monkeypatch.setattr(mq, "get_branch_protection", lambda branch: mq.BranchProtection(
+        required_contexts=["CI / all-required (pull_request)"],
+        required_approvals=2,
+        block_on_rejected_reviews=True,
+    ))
+    main_sha = "b" * 40
+    head_sha = "a" * 40
+    monkeypatch.setattr(mq, "get_branch_head", lambda branch: main_sha)
+
+    def fake_combined(sha):
+        ctx = "CI / all-required (push)" if sha == main_sha else "CI / all-required (pull_request)"
+        return {"state": "success", "statuses": [{"context": ctx, "status": "success"}]}
+    monkeypatch.setattr(mq, "get_combined_status", fake_combined)
+
+    monkeypatch.setattr(mq, "list_queued_issues", lambda: [
+        {"number": 102, "pull_request": {}, "labels": [{"name": "merge-queue"}],
+         "created_at": "2026-06-01T00:00:00Z"},
+    ])
+    # mergeable is the value under test; everything else is fully ready.
+    monkeypatch.setattr(mq, "get_pull", lambda n: {
+        "state": "open", "number": n, "mergeable": mergeable,
+        "base": {"ref": "main", "repo_id": 1},
+        "head": {"sha": head_sha, "repo_id": 1},
+        "labels": [{"name": "merge-queue"}],
+    })
+    monkeypatch.setattr(mq, "get_pull_commits", lambda n: [{"sha": main_sha}, {"sha": head_sha}])
+    monkeypatch.setattr(mq, "get_pull_reviews", lambda n: [
+        {"state": "APPROVED", "user": {"login": "agent-researcher"},
+         "official": True, "stale": False, "dismissed": False, "commit_id": head_sha},
+        {"state": "APPROVED", "user": {"login": "agent-reviewer-cr2"},
+         "official": True, "stale": False, "dismissed": False, "commit_id": head_sha},
+    ])
+
+    def fake_merge(pr_number, *, dry_run, force=False):
+        calls["merge_attempts"] += 1
+    monkeypatch.setattr(mq, "merge_pull", fake_merge)
+
+    def fake_add_label(pr_number, label_name, *, dry_run):
+        calls["hold_label"] = (pr_number, label_name)
+    monkeypatch.setattr(mq, "add_label_by_name", fake_add_label)
+    monkeypatch.setattr(mq, "update_pull", lambda *a, **k: calls.__setitem__("updated", True))
+    monkeypatch.setattr(mq, "post_comment", lambda *a, **k: None)
+
+
+def test_process_once_waits_when_mergeable_is_none(monkeypatch):
+    """FAIL-CLOSED: mergeable=None means Gitea is still computing the conflict
+    check. The queue must NOT merge this tick; it waits and re-checks next tick.
+    Critically: this is transient, so the PR is NOT hold-labelled (it stays
+    queued and re-selectable)."""
+    calls = {"merge_attempts": 0, "hold_label": None, "updated": False}
+    _fully_ready_process_once_monkeypatch(monkeypatch, mergeable=None, calls=calls)
+
+    rc = mq.process_once(dry_run=False)
+
+    assert rc == 0
+    # The bug regression: a None mergeable must NEVER trigger an autonomous merge.
+    assert calls["merge_attempts"] == 0
+    # Transient, not permanent — must NOT be held/dequeued; retried next tick.
+    assert calls["hold_label"] is None
+    assert calls["updated"] is False
+
+
+def test_process_once_waits_when_mergeable_field_absent(monkeypatch):
+    """Some Gitea versions omit the `mergeable` field entirely. Absent must be
+    treated the same as None — fail-closed, wait, no merge."""
+    calls = {"merge_attempts": 0, "hold_label": None, "updated": False}
+    # Reuse the ready wiring but drop the mergeable key from the pull payload.
+    _fully_ready_process_once_monkeypatch(monkeypatch, mergeable=None, calls=calls)
+    head_sha = "a" * 40
+    monkeypatch.setattr(mq, "get_pull", lambda n: {
+        "state": "open", "number": n,  # no "mergeable" key at all
+        "base": {"ref": "main", "repo_id": 1},
+        "head": {"sha": head_sha, "repo_id": 1},
+        "labels": [{"name": "merge-queue"}],
+    })
+
+    rc = mq.process_once(dry_run=False)
+
+    assert rc == 0
+    assert calls["merge_attempts"] == 0
+    assert calls["hold_label"] is None
+
+
+def test_process_once_merges_when_mergeable_is_true(monkeypatch):
+    """The decisive case: an explicit mergeable==True (with every other gate
+    green) DOES proceed to the autonomous merge."""
+    calls = {"merge_attempts": 0, "hold_label": None, "updated": False}
+    _fully_ready_process_once_monkeypatch(monkeypatch, mergeable=True, calls=calls)
+
+    rc = mq.process_once(dry_run=False)
+
+    assert rc == 0
+    assert calls["merge_attempts"] == 1
+    assert calls["hold_label"] is None
+
+
+# --------------------------------------------------------------------------
 # Fix 3: status fetch is fail-closed (failed fetch != green)
 # --------------------------------------------------------------------------
 

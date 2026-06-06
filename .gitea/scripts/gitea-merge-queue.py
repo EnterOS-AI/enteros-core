@@ -708,11 +708,15 @@ def process_once(*, dry_run: bool = False) -> int:
     # (the PR is never treated as green).
     pr_status = get_combined_status(head_sha)
     pr_labels = label_names(pr)
-    # mergeable is None while Gitea is still computing it; treat None as "not
-    # yet mergeable" and wait, only false/true are decisive. Default to True so
-    # a missing field does not block (Gitea omits it on some versions).
+    # FAIL-CLOSED: Gitea returns mergeable=None (or omits the field) while it is
+    # still COMPUTING conflict state. Only the literal True is decisive proof the
+    # PR is conflict-free; None and False both mean "not (yet) mergeable". We must
+    # NOT autonomously merge on an unknown — treat anything but True as not-yet-
+    # mergeable so evaluate_merge_readiness returns a transient "wait" decision.
+    # This is transient: process_once returns 0 (no hold label, no dequeue) and
+    # the PR is re-checked next tick once Gitea has finished computing mergeability.
     mergeable_field = pr.get("mergeable")
-    mergeable = True if mergeable_field is None else bool(mergeable_field)
+    mergeable = mergeable_field is True
 
     reviews = get_pull_reviews(pr_number)
     approvers, request_changes = genuine_approvals(
