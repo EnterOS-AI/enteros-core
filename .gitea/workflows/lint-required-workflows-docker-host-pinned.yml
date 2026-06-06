@@ -40,6 +40,7 @@ env:
   GITHUB_SERVER_URL: https://git.moleculesai.app
 
 jobs:
+  # bp-exempt: informational lint enforcing docker-host/publish pin convention (internal#512), not a merge gate
   lint-docker-host-pin:
     name: Lint docker-host pin on docker-touching workflows
     runs-on: docker-host
