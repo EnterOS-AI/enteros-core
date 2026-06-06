@@ -241,7 +241,14 @@ export default async function globalSetup(_config: FullConfig): Promise<void> {
       name: "E2E Canvas Test",
       runtime: "hermes",
       tier: 2,
-      model: "gpt-4o",
+      // Provider-registry SSOT (internal#718) registers ONLY Kimi models for
+      // the hermes runtime — `moonshot/kimi-k2.6` is the platform-managed
+      // entry (workspace-server/internal/providers/providers.yaml, hermes ->
+      // platform). The old `gpt-4o` was never a registered hermes model and
+      // now 422s UNREGISTERED_MODEL_FOR_RUNTIME (core#2225). This workspace
+      // defaults closed to platform_managed (see the boot-shape note below),
+      // so a platform-namespaced model id is the registry-correct choice.
+      model: "moonshot/kimi-k2.6",
     }),
   });
   if (ws.status >= 400 || !ws.body?.id) {
@@ -264,7 +271,7 @@ export default async function globalSetup(_config: FullConfig): Promise<void> {
   // CP proxy env absent) made a platform_managed workspace ABORT AT BOOT
   // with MISSING_PLATFORM_PROXY when MOLECULE_LLM_BASE_URL /
   // MOLECULE_LLM_USAGE_TOKEN are not present in the tenant's env. The
-  // canvas E2E creates a bare hermes/gpt-4o workspace, which defaults
+  // canvas E2E creates a bare hermes/moonshot platform workspace, which defaults
   // closed to platform_managed (workspace_provision.go:~1009), and the
   // staging tenant does not carry the CP proxy env — so the agent never
   // starts. Pre-#2162 this same workspace booted credential-less (the bug
@@ -330,13 +337,99 @@ export default async function globalSetup(_config: FullConfig): Promise<void> {
 
   // 7. Hand state off to tests + teardown — overwrite the slug-only
   // bootstrap state with the full state spec tests need.
-  writeFileSync(
-    stateFile,
-    JSON.stringify({ slug, tenantURL, workspaceId, tenantToken }, null, 2),
-  );
+  //
+  // FAIL-CLOSED handoff: every field the spec reads must be non-empty. If
+  // any is missing here, the spec's env-presence guard would throw with a
+  // generic "did setup run?" message that hides WHICH field was lost. Catch
+  // it at the source — a partial provision must hard-fail setup, never hand
+  // off a half-built state that the spec then has to diagnose (or worse,
+  // skip). This is the loud, fail-closed contract: STAGING was requested,
+  // so an incomplete provision is an error, not a skip.
+  const handoff = { slug, tenantURL, workspaceId, tenantToken };
+  const missingFields = Object.entries(handoff)
+    .filter(([, v]) => !v)
+    .map(([k]) => k);
+  if (missingFields.length > 0) {
+    throw new Error(
+      `[staging-setup] provision incomplete — empty handoff field(s): ` +
+        `${missingFields.join(", ")}. Refusing to hand off a partial state ` +
+        `that would surface downstream as an opaque spec failure.`,
+    );
+  }
+  writeFileSync(stateFile, JSON.stringify(handoff, null, 2));
   process.env.STAGING_SLUG = slug;
   process.env.STAGING_TENANT_URL = tenantURL;
   process.env.STAGING_WORKSPACE_ID = workspaceId;
   process.env.STAGING_TENANT_TOKEN = tenantToken;
+  // The ephemeral org's UUID — exported so specs that route through the CP
+  // edge can send X-Molecule-Org-Id (workspace-server TenantGuard). The tabs
+  // harness hits the tenant box same-origin and doesn't need it, but the
+  // take-control gate (staging-display.spec.ts) does.
+  process.env.STAGING_ORG_ID = orgID;
   console.log(`[staging-setup] Ready — ${stateFile}`);
+
+  // 8. (core#2261 Gap 1) Resolve the STANDING desktop-capable org, if one is
+  // configured, for the live take-control e2e (staging-display.spec.ts).
+  //
+  // This block is FULLY env-gated and additive: it provisions NOTHING and is
+  // a no-op unless STAGING_DISPLAY_SLUG is set. We deliberately do NOT spin a
+  // desktop workspace inside this shared setup — a desktop AMI boots in
+  // ~12-15 min and would tax every tabs run. Instead an operator stands up
+  // one always-on desktop org once (a CTO cost item) and points
+  // STAGING_DISPLAY_SLUG + STAGING_DISPLAY_WORKSPACE_ID at it. Here we just
+  // resolve that standing org's tenant URL, admin token, and org id so the
+  // display spec can reach it. Fail-closed: if STAGING_DISPLAY_SLUG is set but
+  // we can't resolve its token/id, we THROW — the gate must never silently
+  // fall back to the (non-desktop) ephemeral org and pass.
+  const displaySlug = process.env.STAGING_DISPLAY_SLUG;
+  if (displaySlug) {
+    console.log(`[staging-setup] Resolving standing desktop org: ${displaySlug}`);
+
+    // org id for the standing slug (admin-orgs row carries it + status).
+    const orgsRes = await jsonFetch(`${CP_URL}/cp/admin/orgs`, { headers: adminAuth });
+    if (orgsRes.status !== 200) {
+      throw new Error(
+        `STAGING_DISPLAY_SLUG=${displaySlug} set, but GET /cp/admin/orgs returned ` +
+          `${orgsRes.status} — cannot resolve the standing desktop org for the ` +
+          `take-control gate.`,
+      );
+    }
+    const displayRow = (orgsRes.body?.orgs || []).find(
+      (o: any) => o.slug === displaySlug,
+    );
+    if (!displayRow?.id) {
+      throw new Error(
+        `STAGING_DISPLAY_SLUG=${displaySlug} not found in /cp/admin/orgs — the ` +
+          `standing desktop org for the take-control gate does not exist. Provision ` +
+          `it (one always-on desktop EC2) or unset STAGING_DISPLAY_SLUG/` +
+          `STAGING_DISPLAY_WORKSPACE_ID to skip the gate.`,
+      );
+    }
+    if (displayRow.instance_status !== "running") {
+      throw new Error(
+        `Standing desktop org ${displaySlug} is '${displayRow.instance_status}', ` +
+          `not 'running' — the take-control gate needs a live desktop tenant. ` +
+          `full row: ${JSON.stringify(displayRow)}`,
+      );
+    }
+
+    const displayTokRes = await jsonFetch(
+      `${CP_URL}/cp/admin/orgs/${displaySlug}/admin-token`,
+      { headers: adminAuth },
+    );
+    if (displayTokRes.status !== 200 || !displayTokRes.body?.admin_token) {
+      throw new Error(
+        `admin-token fetch for standing desktop org ${displaySlug} returned ` +
+          `${displayTokRes.status}: ${JSON.stringify(displayTokRes.body)}`,
+      );
+    }
+
+    process.env.STAGING_DISPLAY_ORG_ID = displayRow.id;
+    process.env.STAGING_DISPLAY_TENANT_URL = `https://${displaySlug}.${TENANT_DOMAIN}`;
+    process.env.STAGING_DISPLAY_TENANT_TOKEN = displayTokRes.body.admin_token;
+    console.log(
+      `[staging-setup] Standing desktop org resolved: ${displaySlug} ` +
+        `(org_id=${displayRow.id}, url=${process.env.STAGING_DISPLAY_TENANT_URL})`,
+    );
+  }
 }

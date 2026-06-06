@@ -126,6 +126,7 @@ jobs:
   # push/dispatch/cron only (30+ min). This is NOT a fake-green mask of
   # the real assertion — it validates the driving script's bash syntax
   # and inline-python so a broken test script fails at PR time.
+  # bp-required: pending #1296 — PR emitter, not yet required (tracked in #1296).
   pr-validate:
     name: E2E Peer Visibility
     runs-on: ubuntu-latest

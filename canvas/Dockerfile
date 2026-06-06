@@ -24,6 +24,17 @@ COPY --from=builder /app/public ./public
 EXPOSE 3000
 ENV PORT=3000
 ENV HOSTNAME="0.0.0.0"
+# Git SHA the image was built from, surfaced at /api/buildinfo so canvas
+# deploys are verifiable by the served SHA the same way workspace-server's
+# /buildinfo is (core#2235). Wired from `${{ github.sha }}` in
+# publish-canvas-image.yml. Server-only (not NEXT_PUBLIC_) — the route
+# handler reads it at runtime on the standalone Node server, so it stays
+# out of the client bundle. Set on the final stage (not the builder) so it
+# lives in the runtime env that force-dynamic reads per request. Default
+# "dev" matches the route + workspace-server sentinel: an unwired build
+# fails the SHA comparison closed instead of looking deployed.
+ARG BUILD_SHA=dev
+ENV BUILD_SHA=$BUILD_SHA
 # Non-root runtime — use addgroup/adduser without fixed GID/UID to avoid conflicts with base image
 RUN addgroup canvas 2>/dev/null || true && adduser -G canvas -s /bin/sh -D canvas 2>/dev/null || true
 USER canvas

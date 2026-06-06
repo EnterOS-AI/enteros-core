@@ -126,6 +126,32 @@ var mcpAllTools = []mcpTool{
 					"type":        "string",
 					"description": "The task description to send to the target workspace",
 				},
+				"attachments": map[string]interface{}{
+					"type":        "array",
+					"description": "Optional files to send with the task. Each item must include uri and name; mimeType and size are optional.",
+					"items": map[string]interface{}{
+						"type": "object",
+						"properties": map[string]interface{}{
+							"uri": map[string]interface{}{
+								"type":        "string",
+								"description": "Workspace attachment URI, usually workspace:/absolute/path",
+							},
+							"name": map[string]interface{}{
+								"type":        "string",
+								"description": "Display filename",
+							},
+							"mimeType": map[string]interface{}{
+								"type":        "string",
+								"description": "Optional MIME type",
+							},
+							"size": map[string]interface{}{
+								"type":        "number",
+								"description": "Optional file size in bytes",
+							},
+						},
+						"required": []string{"uri", "name"},
+					},
+				},
 			},
 			"required": []string{"workspace_id", "task"},
 		},
@@ -143,6 +169,32 @@ var mcpAllTools = []mcpTool{
 				"task": map[string]interface{}{
 					"type":        "string",
 					"description": "The task description to send to the target workspace",
+				},
+				"attachments": map[string]interface{}{
+					"type":        "array",
+					"description": "Optional files to send with the task. Each item must include uri and name; mimeType and size are optional.",
+					"items": map[string]interface{}{
+						"type": "object",
+						"properties": map[string]interface{}{
+							"uri": map[string]interface{}{
+								"type":        "string",
+								"description": "Workspace attachment URI, usually workspace:/absolute/path",
+							},
+							"name": map[string]interface{}{
+								"type":        "string",
+								"description": "Display filename",
+							},
+							"mimeType": map[string]interface{}{
+								"type":        "string",
+								"description": "Optional MIME type",
+							},
+							"size": map[string]interface{}{
+								"type":        "number",
+								"description": "Optional file size in bytes",
+							},
+						},
+						"required": []string{"uri", "name"},
+					},
 				},
 			},
 			"required": []string{"workspace_id", "task"},

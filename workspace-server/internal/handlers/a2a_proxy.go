@@ -801,6 +801,18 @@ func normalizeA2APayload(body []byte) ([]byte, string, *proxyA2AError) {
 			if _, hasID := msg["messageId"]; !hasID {
 				msg["messageId"] = uuid.New().String()
 			}
+			// #2251: default params.message.role to "user" when absent.
+			// The downstream a2a-sdk v0.3 Pydantic validator marks role a
+			// REQUIRED field; a role-less envelope fails parse with
+			// "params.message.role Field required". The Go builders
+			// (mcp_tools/delegation/scheduler/channels) already set it, but
+			// raw external/canvas POSTs to ProxyA2A may omit it — making this
+			// the single canonical choke that guarantees a schema-valid role.
+			// Mirror the messageId default exactly: inject only when missing,
+			// never overwrite a caller-supplied role (e.g. "agent").
+			if _, hasRole := msg["role"]; !hasRole {
+				msg["role"] = "user"
+			}
 			_, hasParts := msg["parts"]
 			rawContent, hasContent := msg["content"]
 			if !hasParts {
@@ -829,6 +841,27 @@ func normalizeA2APayload(body []byte) ([]byte, string, *proxyA2AError) {
 							"error": "params.message must contain either 'parts' (v0.3) or 'content' (v0.2 compat)",
 							"hint":  "v0.3 example: {\"parts\":[{\"kind\":\"text\",\"text\":\"...\"}]}",
 						},
+					}
+				}
+			}
+			// #2251: wire hygiene — the A2A v0.3 Part discriminator is
+			// "kind", but some builders/clients emit the legacy "type" key
+			// (e.g. delegation.go). The v0.3 Pydantic validator keys on
+			// "kind"; a stray "type" leaves the Part untagged. Rename
+			// "type" → "kind" on every Part that lacks an explicit "kind"
+			// so the discriminator is always present on the wire.
+			if parts, ok := msg["parts"].([]interface{}); ok {
+				for _, p := range parts {
+					part, ok := p.(map[string]interface{})
+					if !ok {
+						continue
+					}
+					if _, hasKind := part["kind"]; hasKind {
+						continue
+					}
+					if t, hasType := part["type"]; hasType {
+						part["kind"] = t
+						delete(part, "type")
 					}
 				}
 			}

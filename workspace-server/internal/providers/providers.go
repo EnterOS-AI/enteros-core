@@ -257,9 +257,20 @@ func parseManifest(raw []byte) (*Manifest, error) {
 				return nil, fmt.Errorf("providers: runtime %q references provider %q twice", rt, ref.Name)
 			}
 			refSeen[ref.Name] = struct{}{}
-			if len(ref.Models) == 0 {
-				return nil, fmt.Errorf("providers: runtime %q provider %q has no model ids", rt, ref.Name)
-			}
+			// A NAME-ONLY arm (zero model ids) is permitted (cp#529): it adds
+			// NOTHING to the runtime's platform menu (ModelsForRuntime only
+			// iterates ref.Models, so an empty Models contributes no selectable
+			// id — additive, zero platform-menu change) yet wires the provider
+			// into the runtime's NATIVE prefix-routing set, so a BYOK id the
+			// provider's model_prefix_match matches becomes routable via
+			// DeriveProvider step-4. This is the mechanism the cp#529
+			// routability-aware enforcer keys off: a name-only BYOK arm makes a
+			// passthrough id (openrouter/…, deepseek-…, etc.) resolve to a
+			// concrete provider without ever appearing on the platform menu.
+			// BILLING GUARDRAIL: only CONFIRMED-NON-PLATFORM (BYOK) providers
+			// are wired as name-only arms — never `platform`/anthropic-*/
+			// openai-*/moonshot/minimax/google/vertex — so a name-only arm can
+			// never route a customer model through the platform's key.
 		}
 	}
 

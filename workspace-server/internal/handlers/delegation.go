@@ -179,8 +179,11 @@ func (h *DelegationHandler) Delegate(c *gin.Context) {
 			"message": map[string]interface{}{
 				"role":      "user",
 				"messageId": delegationID,
-				"parts":     []map[string]interface{}{{"type": "text", "text": body.Task}},
-				"metadata":  map[string]interface{}{"delegation_id": delegationID},
+				// A2A v0.3 Part discriminator is `kind`, NOT `type` (#2251) —
+				// a `type`-keyed Part is dropped by the receiver's v0.3
+				// validator, silently losing the delegated task.
+				"parts":    []map[string]interface{}{{"kind": "text", "text": body.Task}},
+				"metadata": map[string]interface{}{"delegation_id": delegationID},
 			},
 		},
 	})

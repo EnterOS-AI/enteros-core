@@ -243,6 +243,7 @@ func TestBuildProvisionerConfig_CopiesComputeSizingFromPayload(t *testing.T) {
 			},
 		},
 		nil,
+		nil,
 		t.TempDir(),
 	)
 

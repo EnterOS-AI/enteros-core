@@ -96,6 +96,7 @@ env:
   GITHUB_SERVER_URL: https://git.moleculesai.app
 
 jobs:
+  # bp-exempt: advisory arm64 pilot, non-gating by design (internal#418).
   fast-checks:
     name: fast-checks
     # AND-set: only the Mac arm64 runner advertises macos-self-hosted.

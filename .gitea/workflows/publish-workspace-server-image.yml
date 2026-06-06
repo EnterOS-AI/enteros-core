@@ -115,6 +115,26 @@ jobs:
           echo "Docker daemon OK"
           echo "::endgroup::"
 
+      # Pre-flight: verify every repo in manifest.json actually exists.
+      #
+      # Why: deleting a template repo without updating manifest.json breaks
+      # clone-manifest.sh with a generic git 404, which looks like a
+      # transient network error and wastes debug time. We catch it here
+      # with a per-entry ::error:: annotation naming the missing repo
+      # (issue #2192). This is the push-time complement to PR #2186's
+      # PR-time manifest-entry-existence gate.
+      #
+      # Token: workspace-template-* repos are PRIVATE, so the existence check
+      # must authenticate (same AUTO_SYNC_TOKEN as the clone step). Without it
+      # an unauthenticated GET 404s on private repos and false-prunes them
+      # (regression that dropped seo-agent/google-adk from the palette).
+      - name: Validate manifest entries exist
+        env:
+          MOLECULE_GITEA_TOKEN: ${{ secrets.AUTO_SYNC_TOKEN }}
+        run: |
+          set -euo pipefail
+          bash scripts/check-manifest-repos-exist.sh manifest.json
+
       # Pre-clone manifest deps before docker build.
       #
       # Why: workspace-template-* repos on Gitea are private. The pre-fix
@@ -262,6 +282,11 @@ jobs:
       PROD_AUTO_DEPLOY_BATCH_SIZE: ${{ vars.PROD_AUTO_DEPLOY_BATCH_SIZE || '3' }}
       PROD_AUTO_DEPLOY_DRY_RUN: ${{ vars.PROD_AUTO_DEPLOY_DRY_RUN || '' }}
       PROD_ALLOW_NON_PROD_CP_URL: ${{ vars.PROD_ALLOW_NON_PROD_CP_URL || '' }}
+      # #2213: per-tenant /buildinfo settle budget. A freshly-swapped tenant can
+      # keep serving the old image at the edge for a short drain window; the
+      # verify step polls each tenant up to this budget before declaring it stale.
+      PROD_AUTO_DEPLOY_VERIFY_BUDGET_SECONDS: ${{ vars.PROD_AUTO_DEPLOY_VERIFY_BUDGET_SECONDS || '240' }}
+      PROD_AUTO_DEPLOY_VERIFY_INTERVAL_SECONDS: ${{ vars.PROD_AUTO_DEPLOY_VERIFY_INTERVAL_SECONDS || '20' }}
     steps:
       # The publish runner's default HOME (/home/hongming) is not writable, so
       # git/docker credential saves fail (`Error saving credentials: mkdir
@@ -320,8 +345,50 @@ jobs:
           set -euo pipefail
           python3 .gitea/scripts/prod-auto-deploy.py wait-ci
 
-      - name: Call production CP redeploy-fleet
+      # Superseded-job guard — BEFORE any production side effect (#2213).
+      #
+      # This workflow has no `concurrency:` (see header: Gitea 1.22.6 cancels
+      # queued prod deploys). So two close main pushes run BOTH deploy-production
+      # jobs. The verify step already skips its strict /buildinfo check when this
+      # job is superseded (#2194) — but that guard was AFTER the redeploy and the
+      # :latest promote, so an OLDER job that started late still:
+      #   1. rolled the whole fleet BACKWARD to its older tag (canary hongming
+      #      was reverted from the newer SHA — the #2213 red), then
+      #   2. promoted :latest backward to the older image,
+      # and only THEN skipped verify and exited green. A superseded job must do
+      # NEITHER. We re-check the branch head here, immediately before the rollout,
+      # and skip every side effect when a newer commit already owns main.
+      #
+      # exit 0 + non-empty stdout => superseded (newer head printed); the redeploy
+      # and promote steps are gated off via this output. exit 10 => this job is
+      # still the latest, proceed to roll the fleet. Fail-safe: a head that can't
+      # be read returns NOT-superseded (exit 10), so a genuine deploy is never
+      # silently skipped. (Re-checked again at verify time to catch a newer job
+      # that lands DURING this rollout.)
+      - name: Check superseded before production side effects
+        id: supersede
         if: ${{ steps.plan.outputs.enabled == 'true' }}
+        run: |
+          set -euo pipefail
+          set +e
+          NEWER_HEAD="$(python3 .gitea/scripts/prod-auto-deploy.py check-superseded)"
+          SUPERSEDED_EXIT=$?
+          set -e
+          if [ "$SUPERSEDED_EXIT" -eq 0 ] && [ -n "$NEWER_HEAD" ]; then
+            echo "superseded=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Superseded before rollout: main head is now ${NEWER_HEAD:0:7} (this job deploys ${GITHUB_SHA:0:7}). Skipping redeploy + :latest promote so an older job never rolls the fleet backward."
+            {
+              echo "## Production auto-deploy skipped — superseded before rollout"
+              echo ""
+              echo "This deploy job's SHA \`${GITHUB_SHA:0:7}\` is no longer the head of \`main\` (now \`${NEWER_HEAD:0:7}\`)."
+              echo "A newer deploy job owns the fleet; rolling it backward to this older build would revert tenants and \`:latest\`. No side effects performed."
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "superseded=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Call production CP redeploy-fleet
+        if: ${{ steps.plan.outputs.enabled == 'true' && steps.supersede.outputs.superseded != 'true' }}
         run: |
           set -euo pipefail
           python3 .gitea/scripts/prod-auto-deploy.py assert-enabled
@@ -380,7 +447,11 @@ jobs:
           fi
 
       - name: Verify reachable tenants report this SHA
-        if: ${{ steps.plan.outputs.enabled == 'true' }}
+        # Skip when superseded BEFORE rollout: the redeploy step did not run, so
+        # there is no redeploy-fleet response to verify against and the newer job
+        # owns verification (#2213). The in-step guard below still catches the
+        # case where a newer job lands DURING this job's rollout.
+        if: ${{ steps.plan.outputs.enabled == 'true' && steps.supersede.outputs.superseded != 'true' }}
         env:
           TENANT_DOMAIN: moleculesai.app
         run: |
@@ -422,6 +493,20 @@ jobs:
             exit 1
           fi
 
+          # Per-tenant settle/retry budget (#2213). A tenant whose container the
+          # CP just swapped can keep serving the OLD image at the edge for a short
+          # window while the old container drains — /buildinfo returns HTTP 200
+          # with the previous SHA, which `curl --retry` does NOT retry (it only
+          # retries connection/5xx failures, not a stale-but-200 body). Without a
+          # settle window a still-rolling tenant false-reds "stale" on the very
+          # first poll. So poll each tenant's /buildinfo until it reports the
+          # target SHA or the budget is exhausted; only THEN declare it stale or
+          # unreachable. This never masks a genuinely stuck tenant — a tenant that
+          # never reaches the target within the budget still fails loud (and the
+          # superseded-job revert class is already blocked before rollout above).
+          SETTLE_BUDGET_SECONDS="${PROD_AUTO_DEPLOY_VERIFY_BUDGET_SECONDS:-240}"
+          SETTLE_INTERVAL_SECONDS="${PROD_AUTO_DEPLOY_VERIFY_INTERVAL_SECONDS:-20}"
+
           STALE_COUNT=0
           UNREACHABLE_COUNT=0
           UNHEALTHY_COUNT=0
@@ -433,18 +518,36 @@ jobs:
               continue
             fi
             url="https://${slug}.${TENANT_DOMAIN}/buildinfo"
-            body="$(curl -sS --max-time 30 --retry 3 --retry-delay 5 --retry-connrefused "$url" || true)"
-            actual="$(echo "$body" | jq -r '.git_sha // ""' 2>/dev/null || echo "")"
-            if [ -z "$actual" ]; then
-              echo "::error::$slug did not return /buildinfo after deploy."
-              UNREACHABLE_COUNT=$((UNREACHABLE_COUNT + 1))
-              continue
-            fi
-            if [ "$actual" != "$GITHUB_SHA" ]; then
-              echo "::error::$slug is stale: actual=${actual:0:7}, expected=${GITHUB_SHA:0:7}"
-              STALE_COUNT=$((STALE_COUNT + 1))
-            else
+            deadline=$(( $(date +%s) + SETTLE_BUDGET_SECONDS ))
+            actual=""
+            last_actual=""
+            on_target=false
+            while :; do
+              body="$(curl -sS --max-time 30 --retry 3 --retry-delay 5 --retry-connrefused "$url" || true)"
+              actual="$(echo "$body" | jq -r '.git_sha // ""' 2>/dev/null || echo "")"
+              [ -n "$actual" ] && last_actual="$actual"
+              if [ "$actual" = "$GITHUB_SHA" ]; then
+                on_target=true
+                break
+              fi
+              now=$(date +%s)
+              if [ "$now" -ge "$deadline" ]; then
+                break
+              fi
+              # Still rolling (stale 200) or transiently unreachable — wait and
+              # re-poll within the settle budget rather than failing on first read.
+              remaining=$(( deadline - now ))
+              echo "$slug: waiting for target SHA (have '${actual:0:7}', want ${GITHUB_SHA:0:7}; ${remaining}s left)"
+              sleep "$SETTLE_INTERVAL_SECONDS"
+            done
+            if [ "$on_target" = true ]; then
               echo "$slug: ${actual:0:7}"
+            elif [ -z "$last_actual" ]; then
+              echo "::error::$slug did not return /buildinfo after deploy (waited ${SETTLE_BUDGET_SECONDS}s)."
+              UNREACHABLE_COUNT=$((UNREACHABLE_COUNT + 1))
+            else
+              echo "::error::$slug is stale: actual=${last_actual:0:7}, expected=${GITHUB_SHA:0:7} (waited ${SETTLE_BUDGET_SECONDS}s)"
+              STALE_COUNT=$((STALE_COUNT + 1))
             fi
           done
 
@@ -488,8 +591,12 @@ jobs:
       #
       #   Re-tag is digest-level (imagetools create), so no rebuild and
       #   :latest is byte-identical to :staging-<sha> for this commit.
+      # Gate on supersede: a superseded older job must NOT move :latest backward
+      # to its older image (#2213 — 275383 promoted :latest → the older
+      # staging-7a72516 after a newer job had already shipped). :latest must only
+      # ever advance under the job that owns main's head.
       - name: Promote :latest to the verified prod image
-        if: ${{ steps.plan.outputs.enabled == 'true' }}
+        if: ${{ steps.plan.outputs.enabled == 'true' && steps.supersede.outputs.superseded != 'true' }}
         env:
           TENANT_IMAGE_NAME: ${{ env.TENANT_IMAGE_NAME }}
           STAGING_TENANT_IMAGE_NAME: ${{ env.STAGING_TENANT_IMAGE_NAME }}

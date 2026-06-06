@@ -118,6 +118,23 @@ func TestExtractAttachmentsFromRequestBody_ImageAndAudio(t *testing.T) {
 	}
 }
 
+func TestExtractAttachmentsFromRequestBody_VideoPart(t *testing.T) {
+	// Video parts are accepted in message-parts envelope (issue #2222).
+	body := []byte(`{"jsonrpc":"2.0","method":"message/send","params":{"message":{"parts":[
+		{"kind":"video","file":{"uri":"workspace:clip.mp4","mime_type":"video/mp4","name":"clip.mp4"}}
+	]}}}`)
+	atts := extractAttachmentsFromRequestBody(body)
+	if len(atts) != 1 {
+		t.Fatalf("want 1 attachment, got %d", len(atts))
+	}
+	if atts[0]["kind"] != "video" {
+		t.Errorf("kind: want video, got %v", atts[0]["kind"])
+	}
+	if atts[0]["uri"] != "workspace:clip.mp4" {
+		t.Errorf("uri mismatch: %v", atts[0]["uri"])
+	}
+}
+
 func TestExtractAttachmentsFromRequestBody_LegacyV0TypeDiscriminator(t *testing.T) {
 	// Legacy v0 shape: type=file (not kind), inlined fields (no nested .file)
 	body := []byte(`{"jsonrpc":"2.0","method":"message/send","params":{"message":{"parts":[

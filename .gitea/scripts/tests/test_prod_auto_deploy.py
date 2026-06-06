@@ -571,3 +571,44 @@ def test_current_branch_head_none_without_token():
 def test_current_branch_head_none_on_non_200(monkeypatch):
     monkeypatch.setattr(prod, "_api_json_optional", lambda _u, _t: (500, None))
     assert prod.current_branch_head({"GITEA_TOKEN": "secret"}) is None
+
+
+# --- #2213: superseded check must fire BEFORE production side effects ----------
+#
+# Real incident shape: two main pushes land ~2 min apart. The OLDER deploy job
+# (GITHUB_SHA=7a72516, target staging-7a72516) started LATE — main head was
+# already 7f25373. The #2194 guard only protected the *verify* step, so the
+# older job still:
+#   1. rolled the canary (hongming) BACKWARD to staging-7a72516 (the #2213 red,
+#      seen as the newer job's verify reading hongming on the old SHA), then
+#   2. promoted :latest backward to the older image,
+# before finally skipping verify. The workflow now calls this same superseded
+# check BEFORE the redeploy + promote steps and gates both off when it fires.
+# These tests pin the contract that check-superseded relies on for the exact
+# incident shape.
+
+
+def test_superseded_by_fires_for_older_job_when_newer_already_head(monkeypatch):
+    # Older job (7a72516) re-checks the head just before rollout and finds the
+    # newer merge (7f25373) already owns main -> superseded -> skip side effects.
+    monkeypatch.setattr(
+        prod, "current_branch_head", lambda _env: "7f25373309eca54a36f08c371ff783c3a47c3f8d"
+    )
+    newer = prod.superseded_by(
+        {"GITHUB_SHA": "7a72516f7e7ba1a710c4f393fef08be8d22e1866"}
+    )
+    assert newer == "7f25373309eca54a36f08c371ff783c3a47c3f8d"
+
+
+def test_superseded_by_none_for_latest_job_so_it_still_rolls(monkeypatch):
+    # The newer job (7f25373) IS the head -> NOT superseded -> it proceeds to
+    # roll the fleet and verify, so a genuinely-behind tenant still fails loud.
+    monkeypatch.setattr(
+        prod, "current_branch_head", lambda _env: "7f25373309eca54a36f08c371ff783c3a47c3f8d"
+    )
+    assert (
+        prod.superseded_by(
+            {"GITHUB_SHA": "7f25373309eca54a36f08c371ff783c3a47c3f8d"}
+        )
+        is None
+    )

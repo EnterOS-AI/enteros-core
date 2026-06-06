@@ -187,6 +187,32 @@ func (h *MCPHandler) toolGetWorkspaceInfo(ctx context.Context, workspaceID strin
 	return string(b), nil
 }
 
+// buildA2AMessageParts constructs the A2A message parts array from a task string
+// and optional attachments. The text part always comes first; attachment parts
+// follow in the order provided, with kind derived from MIME type.
+func buildA2AMessageParts(task string, attachments []AgentMessageAttachment) []map[string]interface{} {
+	parts := []map[string]interface{}{
+		// A2A v0.3 Part discriminator is `kind`, NOT `type` (#2251).
+		// The receiver's v0.3 Pydantic validator drops a Part keyed
+		// `type`, silently losing the task text — the file part below
+		// already uses `kind`, this is the matching fix for text.
+		{"kind": "text", "text": task},
+	}
+	for _, att := range attachments {
+		kind := kindFromMimeType(att.MimeType)
+		filePart := map[string]interface{}{
+			"kind": kind,
+			"file": map[string]interface{}{
+				"uri":       att.URI,
+				"mime_type": att.MimeType,
+				"name":      att.Name,
+			},
+		}
+		parts = append(parts, filePart)
+	}
+	return parts
+}
+
 func (h *MCPHandler) toolDelegateTask(ctx context.Context, callerID string, args map[string]interface{}, timeout time.Duration) (string, error) {
 	targetID, _ := args["workspace_id"].(string)
 	task, _ := args["task"].(string)
@@ -208,6 +234,8 @@ func (h *MCPHandler) toolDelegateTask(ctx context.Context, callerID string, args
 		// Non-fatal: still make the A2A call even if activity log write fails.
 	}
 
+	attachments, _ := parseAgentMessageAttachments(args["attachments"])
+
 	a2aBody, err := json.Marshal(map[string]interface{}{
 		"jsonrpc": "2.0",
 		"id":      uuid.New().String(),
@@ -215,7 +243,7 @@ func (h *MCPHandler) toolDelegateTask(ctx context.Context, callerID string, args
 		"params": map[string]interface{}{
 			"message": map[string]interface{}{
 				"role":      "user",
-				"parts":     []map[string]interface{}{{"type": "text", "text": task}},
+				"parts":     buildA2AMessageParts(task, attachments),
 				"messageId": uuid.New().String(),
 			},
 		},
@@ -275,6 +303,8 @@ func (h *MCPHandler) toolDelegateTaskAsync(ctx context.Context, callerID string,
 		bgCtx, cancel := context.WithTimeout(context.Background(), mcpAsyncCallTimeout)
 		defer cancel()
 
+		attachments, _ := parseAgentMessageAttachments(args["attachments"])
+
 		a2aBody, marshalErr := marshalA2ABody(map[string]interface{}{
 			"jsonrpc": "2.0",
 			"id":      delegationID,
@@ -282,7 +312,7 @@ func (h *MCPHandler) toolDelegateTaskAsync(ctx context.Context, callerID string,
 			"params": map[string]interface{}{
 				"message": map[string]interface{}{
 					"role":      "user",
-					"parts":     []map[string]interface{}{{"type": "text", "text": task}},
+					"parts":     buildA2AMessageParts(task, attachments),
 					"messageId": uuid.New().String(),
 				},
 			},
