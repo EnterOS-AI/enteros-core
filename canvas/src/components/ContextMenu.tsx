@@ -172,7 +172,7 @@ export function ContextMenu() {
     const nodeId = contextMenu.nodeId;
     closeContextMenu();
     try {
-      await api.post(`/workspaces/${nodeId}/pause`, {});
+      await api.post(`/workspaces/${nodeId}/pause?cascade=true`, {});
       updateNodeData(nodeId, { status: "paused" });
     } catch (e) {
       showToast("Pause failed", "error");
@@ -184,7 +184,7 @@ export function ContextMenu() {
     const nodeId = contextMenu.nodeId;
     closeContextMenu();
     try {
-      await api.post(`/workspaces/${nodeId}/resume`, {});
+      await api.post(`/workspaces/${nodeId}/resume?cascade=true`, {});
       updateNodeData(nodeId, { status: "provisioning" });
     } catch (e) {
       showToast("Resume failed", "error");

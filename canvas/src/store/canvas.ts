@@ -324,7 +324,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
   batchPause: async () => {
     const ids = Array.from(get().selectedNodeIds);
     const results = await Promise.allSettled(
-      ids.map((id) => api.post(`/workspaces/${id}/pause`))
+      ids.map((id) => api.post(`/workspaces/${id}/pause?cascade=true`))
     );
     const failed: string[] = [];
     results.forEach((r, i) => {
