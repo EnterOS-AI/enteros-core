@@ -49,9 +49,20 @@ jobs:
           QUEUE_LABEL: merge-queue
           HOLD_LABEL: merge-queue-hold
           UPDATE_STYLE: merge
-          REQUIRED_CONTEXTS: >-
-            CI / all-required (pull_request),
-            sop-checklist / all-items-acked (pull_request)
+          # Recognised official-reviewer set. A merge needs >= required_approvals
+          # DISTINCT genuine official approvals from these accounts on the
+          # CURRENT head sha (not stale/dismissed). The required_approvals count
+          # itself is read from branch protection at runtime.
+          REVIEWER_SET: agent-reviewer,agent-researcher,agent-reviewer-cr2
+          # NOTE: REQUIRED_CONTEXTS is no longer the authoritative PR gate. The
+          # queue now reads the required status contexts from BRANCH PROTECTION
+          # (status_check_contexts) so non-required governance reds (qa-review,
+          # security-review, sop-tier, sop-checklist when not branch-required,
+          # E2E Chat, Staging SaaS, ci-arm64-advisory) cannot block a merge.
+          # If branch protection cannot be enumerated the queue HOLDS
+          # (fail-closed). REQUIRED_APPROVALS below is only a fallback used when
+          # branch protection does not specify required_approvals.
+          REQUIRED_APPROVALS: "2"
           # Push-side required contexts. Checking CI / all-required (push)
           # explicitly instead of the combined state avoids false-pause when
           # non-blocking jobs (continue-on-error: true) have failed — those

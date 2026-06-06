@@ -1,16 +1,40 @@
 #!/usr/bin/env python3
 """gitea-merge-queue — conservative serialized merge bot for Gitea.
 
-Gitea 1.22.6 has auto-merge (`pull_auto_merge`) but no GitHub-style merge
+Gitea 1.22.6+ has auto-merge (`pull_auto_merge`) but no GitHub-style merge
 queue. This script provides the missing serialized policy in user space:
 
-1. Pick the oldest open PR carrying QUEUE_LABEL.
-2. Refuse to act unless main is green.
+1. Pick the oldest open PR carrying QUEUE_LABEL (skipping HOLD_LABEL).
+2. Refuse to act unless main's BP-required contexts are green.
 3. Refuse fork PRs; the queue may only mutate same-repo branches.
 4. If the PR branch does not contain current main, call Gitea's
    /pulls/{n}/update endpoint and stop. CI must rerun on the updated head.
-5. If the updated PR head has all required contexts green, merge with the
-   non-bypass merge actor token.
+5. Merge ONLY when, on the PR's CURRENT head sha:
+     - >= REQUIRED_APPROVALS distinct GENUINE official APPROVED reviews from
+       the recognised reviewer set (not stale, not dismissed, commit_id ==
+       current head), AND
+     - no open official REQUEST_CHANGES on the current head, AND
+     - every BP-required status context is green, AND
+     - the PR is mergeable.
+
+Authoritative gates (fail-closed):
+  - The REQUIRED status contexts come from BRANCH PROTECTION
+    (`status_check_contexts`), not a hand-maintained env list. If branch
+    protection cannot be enumerated, the queue HOLDS (does not merge blindly).
+  - NON-required reds (qa-review, security-review, sop-tier, sop-checklist
+    when not branch-required, E2E Chat, Staging SaaS, ci-arm64-advisory, any
+    continue-on-error job) MUST NOT block. They are reported, never gating.
+  - `force_merge=true` is used ONLY when the merge is blocked *solely* by
+    missing-but-non-required governance contexts (required are green + genuine
+    approvals present). It is NEVER used to bypass a failing REQUIRED context
+    or missing approvals.
+
+Head-of-line (HOL) safety: a permanent permission/4xx merge error
+(403/404/405) HOLDS the PR (applies HOLD_LABEL) so the queue advances to the
+next PR instead of re-selecting the same wedged PR every tick.
+
+Status-fetch is fail-closed: if the combined status for a sha cannot be
+fetched, the PR is skipped this tick (never treated as green).
 
 The script is intentionally one-PR-per-run. Workflow/cron concurrency should
 serialize invocations so two green PRs cannot merge against the same main.
@@ -57,6 +81,24 @@ PUSH_REQUIRED_CONTEXTS_RAW = _env(
     default="CI / all-required (push)",
 )
 
+# Recognised official-reviewer set. A merge requires this many DISTINCT genuine
+# approvals (not stale/dismissed, on the current head sha) from accounts in
+# this set. The set is the real agents-team reviewer roster; founder/CTO-agent
+# accounts are intentionally excluded so the queue cannot be satisfied by a
+# human/owner approval alone — it must be a genuine peer review.
+REVIEWER_SET = {
+    name.strip()
+    for name in _env(
+        "REVIEWER_SET",
+        default="agent-reviewer,agent-researcher,agent-reviewer-cr2",
+    ).split(",")
+    if name.strip()
+}
+# Default mirrors molecule-core branch protection (required_approvals: 2). The
+# authoritative value is read from branch protection at runtime; this is only
+# the fallback when BP does not specify one.
+REQUIRED_APPROVALS_DEFAULT = int(_env("REQUIRED_APPROVALS", default="2") or "2")
+
 OWNER, NAME = (REPO.split("/", 1) + [""])[:2] if REPO else ("", "")
 API = f"https://{GITEA_HOST}/api/v1" if GITEA_HOST else ""
 
@@ -67,7 +109,13 @@ class ApiError(RuntimeError):
 
 class MergePermissionError(ApiError):
     """Merge failed with a permanent permission error (403/404/405).
-    The queue should skip this PR and move to the next one."""
+    The queue should HOLD this PR and move to the next one."""
+
+
+class BranchProtectionUnavailable(ApiError):
+    """Branch protection (the authoritative required-context source) could not
+    be enumerated. The queue must HOLD rather than merge with an unverified
+    required-context set (fail-closed, no fail-open)."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -75,6 +123,20 @@ class MergeDecision:
     ready: bool
     action: str
     reason: str
+    # When ready is True, force indicates the merge is blocked SOLELY by
+    # missing-but-non-required governance contexts (required are green +
+    # genuine approvals present), so force_merge=true is justified to bypass
+    # ONLY those non-required contexts. Defaults False.
+    force: bool = False
+
+
+@dataclasses.dataclass(frozen=True)
+class BranchProtection:
+    """The subset of branch protection the queue depends on."""
+
+    required_contexts: list[str]
+    required_approvals: int
+    block_on_rejected_reviews: bool
 
 
 def _require_runtime_env() -> None:
@@ -191,6 +253,117 @@ def required_contexts_green(
     return not missing_or_bad, missing_or_bad
 
 
+def parse_branch_protection(body: Any) -> BranchProtection:
+    """Extract the queue-relevant fields from a branch_protections payload.
+
+    Fail-closed: raises BranchProtectionUnavailable when status checks are
+    expected but the required-context list cannot be enumerated. We never fall
+    back to a hand-maintained env list as the authoritative required set —
+    doing so risks merging when a real required context is red/missing.
+    """
+    if not isinstance(body, dict):
+        raise BranchProtectionUnavailable("branch protection response not an object")
+    enable = bool(body.get("enable_status_check"))
+    contexts_raw = body.get("status_check_contexts")
+    if not enable:
+        # Status checks not enforced by BP at all. With no required contexts
+        # the queue would gate on approvals only — acceptable, but make it
+        # explicit and let the caller decide.
+        contexts: list[str] = []
+    else:
+        if not isinstance(contexts_raw, list):
+            raise BranchProtectionUnavailable(
+                "enable_status_check is true but status_check_contexts is not a list"
+            )
+        contexts = [c for c in contexts_raw if isinstance(c, str) and c.strip()]
+        if not contexts:
+            raise BranchProtectionUnavailable(
+                "enable_status_check is true but status_check_contexts is empty"
+            )
+    approvals = body.get("required_approvals")
+    required_approvals = (
+        int(approvals) if isinstance(approvals, int) else REQUIRED_APPROVALS_DEFAULT
+    )
+    return BranchProtection(
+        required_contexts=contexts,
+        required_approvals=required_approvals,
+        block_on_rejected_reviews=bool(body.get("block_on_rejected_reviews")),
+    )
+
+
+def get_branch_protection(branch: str) -> BranchProtection:
+    """Fetch branch protection for `branch`; fail-closed if unavailable."""
+    try:
+        _, body = api("GET", f"/repos/{OWNER}/{NAME}/branch_protections/{branch}")
+    except ApiError as exc:
+        raise BranchProtectionUnavailable(
+            f"could not fetch branch protection for {branch}: {exc}"
+        ) from exc
+    return parse_branch_protection(body)
+
+
+def genuine_approvals(
+    reviews: list[dict],
+    *,
+    head_sha: str,
+    reviewer_set: set[str],
+) -> tuple[set[str], list[str]]:
+    """Reduce a PR's reviews to genuine official approvals on the CURRENT head.
+
+    Returns (approvers, request_changes) where:
+      - approvers is the set of distinct logins (in reviewer_set) whose LATEST
+        review on the current head is an official, non-stale, non-dismissed
+        APPROVED, and
+      - request_changes is the list of logins (in reviewer_set) whose latest
+        official review on the current head is REQUEST_CHANGES.
+
+    "Current head" is enforced two ways, because Gitea exposes both signals:
+    a review must be `official` and NOT `stale`/`dismissed`, AND when the
+    review carries a commit_id it must equal head_sha. A review with no
+    commit_id but stale=False/dismissed=False is accepted (older Gitea rows).
+    We take each reviewer's LATEST submission (reviews arrive oldest-first), so
+    a later REQUEST_CHANGES correctly supersedes an earlier APPROVED and vice
+    versa.
+    """
+    latest_by_user: dict[str, dict] = {}
+    for review in reviews:
+        if not isinstance(review, dict):
+            continue
+        user = (review.get("user") or {}).get("login")
+        if not isinstance(user, str) or user not in reviewer_set:
+            continue
+        state = str(review.get("state") or "").upper()
+        if state not in {"APPROVED", "REQUEST_CHANGES"}:
+            continue  # ignore COMMENT/PENDING/DISMISSED-state rows
+        # reviews are returned oldest-first; later entries overwrite → latest wins
+        latest_by_user[user] = review
+
+    approvers: set[str] = set()
+    request_changes: list[str] = []
+    for user, review in latest_by_user.items():
+        if not review.get("official"):
+            continue
+        if review.get("stale") or review.get("dismissed"):
+            continue
+        commit_id = review.get("commit_id")
+        if isinstance(commit_id, str) and commit_id and head_sha:
+            if commit_id != head_sha:
+                continue  # review was on a previous head
+        state = str(review.get("state") or "").upper()
+        if state == "APPROVED":
+            approvers.add(user)
+        elif state == "REQUEST_CHANGES":
+            request_changes.append(user)
+    return approvers, request_changes
+
+
+def get_pull_reviews(pr_number: int) -> list[dict]:
+    _, body = api("GET", f"/repos/{OWNER}/{NAME}/pulls/{pr_number}/reviews")
+    if not isinstance(body, list):
+        raise ApiError(f"PR #{pr_number} reviews response not list")
+    return body
+
+
 def label_names(issue: dict) -> set[str]:
     return {
         label["name"]
@@ -233,36 +406,87 @@ def pr_has_current_base(pr: dict, commits: list[dict], main_sha: str) -> bool:
     return pr_contains_base_sha(commits, main_sha)
 
 
+def _non_required_red_present(
+    latest: dict[str, dict],
+    required_contexts: list[str],
+) -> bool:
+    """True if any NON-required context is non-success.
+
+    Such reds are the governance/SOP/advisory checks Gitea may still treat as
+    "missing required context" at merge time even though branch protection does
+    not require them. Their presence is what justifies force_merge=true (we
+    have already verified every REQUIRED context is green and approvals are
+    genuine, so force only bypasses these non-required reds).
+    """
+    required = set(required_contexts)
+    for context, status in latest.items():
+        if context in required:
+            continue
+        if status_state(status) != "success":
+            return True
+    return False
+
+
 def evaluate_merge_readiness(
     *,
     main_status: dict,
     pr_status: dict,
     required_contexts: list[str],
+    required_approvals: int,
+    approvers: set[str],
+    request_changes: list[str],
     pr_has_current_base: bool,
+    mergeable: bool,
     pr_labels: set[str] | None = None,
 ) -> MergeDecision:
-    # Check push-required contexts explicitly instead of combined state.
-    # Combined state can be "failure" due to non-blocking jobs
-    # (continue-on-error: true) that don't actually gate merges.
-    # CI / all-required (push) is the authoritative gate — it respects
-    # continue-on-error and correctly aggregates all blocking failures.
+    # 1) Main's push-required contexts must be green. Combined state can be
+    #    "failure" due to non-blocking jobs (continue-on-error: true) that do
+    #    not gate merges, so check the explicit required set, not combined.
     main_latest = latest_statuses_by_context(main_status.get("statuses") or [])
     main_ok, main_bad = required_contexts_green(main_latest, push_required_contexts())
     if not main_ok:
         return MergeDecision(False, "pause", "main required contexts not green: " + ", ".join(main_bad))
+
+    # 2) PR head must contain current main.
     if not pr_has_current_base:
         return MergeDecision(False, "update", "PR head does not contain current main")
 
-    # Check explicit required contexts instead of combined state. Combined state
-    # can be "failure" due to non-blocking jobs with continue-on-error: true
-    # (e.g. publish-runtime-autobump/pr-validate, qa-review on stale tokens).
-    # The required_contexts list is the authoritative gate — it includes only
-    # the checks that actually block merges.
+    # 3) No open official REQUEST_CHANGES on the current head.
+    if request_changes:
+        return MergeDecision(
+            False, "wait",
+            "open REQUEST_CHANGES on current head from: " + ", ".join(sorted(request_changes)),
+        )
+
+    # 4) Enough distinct genuine official approvals on the current head.
+    if len(approvers) < required_approvals:
+        return MergeDecision(
+            False, "wait",
+            f"insufficient genuine approvals on current head: have "
+            f"{len(approvers)} ({', '.join(sorted(approvers)) or 'none'}), "
+            f"need {required_approvals}",
+        )
+
+    # 5) Every BRANCH-PROTECTION-REQUIRED status context must be green. This is
+    #    the authoritative status gate — NON-required reds (qa-review,
+    #    security-review, sop-tier/sop-checklist when not BP-required, E2E Chat,
+    #    Staging SaaS, ci-arm64-advisory, continue-on-error jobs) are NOT
+    #    consulted here and must not block.
     latest = latest_statuses_by_context(pr_status.get("statuses") or [])
     ok, missing_or_bad = required_contexts_green(latest, required_contexts, pr_labels)
     if not ok:
         return MergeDecision(False, "wait", "required contexts not green: " + ", ".join(missing_or_bad))
-    return MergeDecision(True, "merge", "ready")
+
+    # 6) Gitea must consider the PR mergeable (no conflicts).
+    if not mergeable:
+        return MergeDecision(False, "wait", "PR is not mergeable (conflicts)")
+
+    # Ready. Use force_merge ONLY if the merge would otherwise be blocked by
+    # missing-but-non-required governance contexts. Required are green and
+    # approvals are genuine, so force only bypasses non-required reds — never a
+    # failing required context or missing approval.
+    force = _non_required_red_present(latest, required_contexts)
+    return MergeDecision(True, "merge", "ready", force=force)
 
 
 def get_branch_head(branch: str) -> str:
@@ -280,6 +504,12 @@ def get_combined_status(sha: str) -> dict:
     The /status endpoint caps the `statuses` array at 30 entries (Gitea
     default page size), so we fetch the full list via /statuses with a
     higher limit. The combined `state` still comes from /status.
+
+    Fail-closed: the PRIMARY /status fetch must succeed. If it raises, the
+    error propagates so the caller skips this PR this tick (we never treat a
+    failed status fetch as green — dev-sop "no fail-open"). Only the SECONDARY
+    /statuses enrichment (which merely extends the per-context list beyond the
+    30-entry cap) is best-effort; if it fails we still have the combined set.
     """
     _, combined = api("GET", f"/repos/{OWNER}/{NAME}/commits/{sha}/status")
     if not isinstance(combined, dict):
@@ -362,22 +592,54 @@ def update_pull(pr_number: int, *, dry_run: bool) -> None:
     )
 
 
-def merge_pull(pr_number: int, *, dry_run: bool) -> None:
-    payload = {
+def add_label_by_name(pr_number: int, label_name: str, *, dry_run: bool) -> None:
+    """Apply an existing repo label (by name) to a PR/issue.
+
+    Used to HOLD a wedged PR so the queue advances. Resolves the label id from
+    the repo label set; if the label does not exist, raises ApiError (the
+    caller decides whether that is fatal).
+    """
+    print(f"::notice::applying label '{label_name}' to PR #{pr_number}")
+    if dry_run:
+        return
+    _, labels = api("GET", f"/repos/{OWNER}/{NAME}/labels", query={"limit": "100"})
+    label_id = None
+    if isinstance(labels, list):
+        for label in labels:
+            if isinstance(label, dict) and label.get("name") == label_name:
+                label_id = label.get("id")
+                break
+    if label_id is None:
+        raise ApiError(f"label '{label_name}' not found in repo {OWNER}/{NAME}")
+    api(
+        "POST",
+        f"/repos/{OWNER}/{NAME}/issues/{pr_number}/labels",
+        body={"labels": [label_id]},
+    )
+
+
+def merge_pull(pr_number: int, *, dry_run: bool, force: bool = False) -> None:
+    payload: dict[str, Any] = {
         "Do": "merge",
         "MergeTitleField": f"Merge PR #{pr_number} via Gitea merge queue",
         "MergeMessageField": (
             "Serialized merge by gitea-merge-queue after current-main, "
-            "SOP, and required CI checks were green."
+            "genuine approvals, and required CI checks were green."
         ),
     }
-    print(f"::notice::merging PR #{pr_number}")
+    if force:
+        # force_merge bypasses ONLY missing-but-non-required governance
+        # contexts. The caller has already verified required contexts are green
+        # and genuine approvals are present, so this never bypasses a failing
+        # required context or an approval shortfall.
+        payload["force_merge"] = True
+    print(f"::notice::merging PR #{pr_number}{' (force_merge: non-required reds)' if force else ''}")
     if dry_run:
         return
     try:
         api("POST", f"/repos/{OWNER}/{NAME}/pulls/{pr_number}/merge", body=payload, expect_json=False)
     except ApiError as exc:
-        # Re-raise permission-like errors so process_once can skip this PR.
+        # Re-raise permission-like errors so process_once can HOLD this PR.
         # 403 = no push access, 404 = repo/pr not found, 405 = not allowed.
         msg = str(exc)
         for code in ("403", "404", "405"):
@@ -387,7 +649,25 @@ def merge_pull(pr_number: int, *, dry_run: bool) -> None:
 
 
 def process_once(*, dry_run: bool = False) -> int:
-    contexts = required_contexts(REQUIRED_CONTEXTS_RAW)
+    # Required status contexts come from BRANCH PROTECTION, not a hand-kept env
+    # list. Fail-closed: if BP cannot be enumerated, HOLD the whole tick rather
+    # than merge against an unverified required set.
+    try:
+        bp = get_branch_protection(WATCH_BRANCH)
+    except BranchProtectionUnavailable as exc:
+        sys.stderr.write(
+            f"::error::queue held: branch protection for {WATCH_BRANCH} "
+            f"unavailable (fail-closed): {exc}\n"
+        )
+        return 0
+    contexts = bp.required_contexts
+    required_approvals = bp.required_approvals
+    print(
+        f"::notice::queue policy from branch protection: "
+        f"required_approvals={required_approvals} "
+        f"required_contexts={contexts or '[none]'}"
+    )
+
     main_sha = get_branch_head(WATCH_BRANCH)
     main_status = get_combined_status(main_sha)
     # Check push-required contexts explicitly instead of combined state.
@@ -424,13 +704,30 @@ def process_once(*, dry_run: bool = False) -> int:
         raise ApiError(f"PR #{pr_number} missing head sha")
     commits = get_pull_commits(pr_number)
     current_base = pr_has_current_base(pr, commits, main_sha)
+    # Fail-closed: a failed status fetch raises here and the tick is skipped
+    # (the PR is never treated as green).
     pr_status = get_combined_status(head_sha)
     pr_labels = label_names(pr)
+    # mergeable is None while Gitea is still computing it; treat None as "not
+    # yet mergeable" and wait, only false/true are decisive. Default to True so
+    # a missing field does not block (Gitea omits it on some versions).
+    mergeable_field = pr.get("mergeable")
+    mergeable = True if mergeable_field is None else bool(mergeable_field)
+
+    reviews = get_pull_reviews(pr_number)
+    approvers, request_changes = genuine_approvals(
+        reviews, head_sha=head_sha, reviewer_set=REVIEWER_SET
+    )
+
     decision = evaluate_merge_readiness(
         main_status=main_status,
         pr_status=pr_status,
         required_contexts=contexts,
+        required_approvals=required_approvals,
+        approvers=approvers,
+        request_changes=request_changes,
         pr_has_current_base=current_base,
+        mergeable=mergeable,
         pr_labels=pr_labels,
     )
 
@@ -455,23 +752,36 @@ def process_once(*, dry_run: bool = False) -> int:
             )
             return 0
         try:
-            merge_pull(pr_number, dry_run=dry_run)
+            merge_pull(pr_number, dry_run=dry_run, force=decision.force)
         except MergePermissionError as exc:
-            # Permanent merge failure (HTTP 403/404/405). Post a comment so
-            # maintainers know why, then return 0 so this tick is done.
-            # The PR stays in the queue; future ticks can retry after the
-            # permission issue is resolved.
+            # Permanent merge failure (HTTP 403/404/405). This is the
+            # head-of-line (HOL) bug fix: previously we returned 0 with the PR
+            # still queued, so the next tick re-selected the SAME wedged PR
+            # forever and the queue never advanced. Instead, HOLD this PR by
+            # applying HOLD_LABEL (choose_next_queued_issue skips held PRs), so
+            # the queue moves on to the next candidate. A maintainer removes
+            # the hold once the permission issue is fixed.
             sys.stderr.write(f"::error::merge permission error for PR #{pr_number}: {exc}\n")
-            post_comment(
-                pr_number,
-                (
-                    "merge-queue: merge failed with HTTP 405 'User not allowed to merge PR'. "
-                    "No available token has Can-merge permission on this repo. "
-                    "Fix: grant Can-merge to a token, or add a maintain/admin collaborator. "
-                    "Skipping to next queued PR on next tick."
-                ),
-                dry_run=dry_run,
+            hold_note = (
+                "merge-queue: merge failed with a permanent permission error "
+                f"({exc}). No available token has Can-merge permission for this "
+                f"PR. Applied `{HOLD_LABEL}` to unblock the queue (HOL guard). "
+                f"Fix: grant Can-merge to the queue token, then remove "
+                f"`{HOLD_LABEL}` to requeue."
             )
+            try:
+                add_label_by_name(pr_number, HOLD_LABEL, dry_run=dry_run)
+            except ApiError as label_exc:
+                # If we cannot even apply the hold label, fall back to a comment
+                # so the wedge is at least visible; do NOT loop on this PR.
+                sys.stderr.write(
+                    f"::error::could not apply HOLD_LABEL to PR #{pr_number}: {label_exc}\n"
+                )
+                hold_note += (
+                    f"\n\n(NOTE: could not apply the hold label automatically: "
+                    f"{label_exc}. Please add `{HOLD_LABEL}` manually.)"
+                )
+            post_comment(pr_number, hold_note, dry_run=dry_run)
             return 0
         return 0
     return 0
