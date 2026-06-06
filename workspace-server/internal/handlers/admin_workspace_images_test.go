@@ -3,7 +3,14 @@ package handlers
 import (
 	"encoding/base64"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"sort"
 	"testing"
+
+	"github.com/gin-gonic/gin"
+
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/providers"
 )
 
 func TestGHCRAuthHeader_NoEnvReturnsEmpty(t *testing.T) {
@@ -89,6 +96,119 @@ func TestGHCRAuthHeader_RespectsRegistryEnv(t *testing.T) {
 	// Sanity: the org-path portion must NOT leak into serveraddress.
 	if payload["serveraddress"] == "004947743811.dkr.ecr.us-east-2.amazonaws.com/molecule-ai" {
 		t.Error("serveraddress must be host-only, not host+org-path")
+	}
+}
+
+// runtimeListContains is a tiny membership helper for the runtime-allowlist tests.
+func runtimeListContains(s []string, v string) bool {
+	for _, x := range s {
+		if x == v {
+			return true
+		}
+	}
+	return false
+}
+
+// TestAllRuntimes_IncludesGoogleADK is the direct regression for
+// controlplane#578: a google-adk pin promote/redeploy is accepted CP-side, so
+// the tenant image-refresh allowlist MUST also accept google-adk or the image
+// fix never deploys (tenant returned 400 "unknown runtime"). google-adk lives
+// in the providers SSOT, so the derived AllRuntimes must contain it.
+func TestAllRuntimes_IncludesGoogleADK(t *testing.T) {
+	if !runtimeListContains(AllRuntimes, "google-adk") {
+		t.Fatalf("AllRuntimes must include google-adk (controlplane#578 drift); got %v", AllRuntimes)
+	}
+}
+
+// TestAllRuntimes_MatchesProvidersSSOT is the drift guard. AllRuntimes is
+// derived from providers.LoadManifest().Runtimes — assert it equals exactly the
+// runtime keys the providers manifest (mirrored from CP's providers.yaml)
+// declares. If CP adds/removes a runtime, this test fails RED until the tenant
+// re-derives, so the tenant image-refresh allowlist can never silently drift
+// from the CP pin-promote allowlist again.
+func TestAllRuntimes_MatchesProvidersSSOT(t *testing.T) {
+	m, err := providers.LoadManifest()
+	if err != nil {
+		t.Fatalf("providers.LoadManifest: %v", err)
+	}
+	want := make([]string, 0, len(m.Runtimes))
+	for rt := range m.Runtimes {
+		want = append(want, rt)
+	}
+	sort.Strings(want)
+
+	got := append([]string(nil), AllRuntimes...)
+	sort.Strings(got)
+
+	if len(got) != len(want) {
+		t.Fatalf("AllRuntimes drift: got %v, want %v (providers SSOT)", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("AllRuntimes drift at %d: got %v, want %v (providers SSOT)", i, got, want)
+		}
+	}
+}
+
+// TestImageRefreshFallbackMatchesSSOT pins the static fallback (used only when
+// the embedded manifest fails to load) to the providers SSOT. If a runtime is
+// added to providers.yaml but not to imageRefreshFallbackRuntimes, this fails
+// RED — so a manifest-load failure can't silently drop a supported runtime.
+func TestImageRefreshFallbackMatchesSSOT(t *testing.T) {
+	m, err := providers.LoadManifest()
+	if err != nil {
+		t.Fatalf("providers.LoadManifest: %v", err)
+	}
+	want := make([]string, 0, len(m.Runtimes))
+	for rt := range m.Runtimes {
+		want = append(want, rt)
+	}
+	sort.Strings(want)
+
+	got := append([]string(nil), imageRefreshFallbackRuntimes...)
+	sort.Strings(got)
+
+	if len(got) != len(want) {
+		t.Fatalf("fallback drift: got %v, want %v (providers SSOT)", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("fallback drift at %d: got %v, want %v (providers SSOT)", i, got, want)
+		}
+	}
+}
+
+// TestRefresh_RejectsUnknownRuntime asserts a genuinely unknown runtime still
+// 400s (the guard isn't removed) AND that the 400 body lists google-adk in
+// known_runtimes (proving the allowlist now advertises it). This exercises the
+// gin handler's reject branch, which runs entirely before any Docker call.
+func TestRefresh_RejectsUnknownRuntime(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	// nil docker client is safe: the unknown-runtime branch returns 400
+	// before svc.Refresh (which is the only path that touches Docker).
+	h := &AdminWorkspaceImagesHandler{svc: &WorkspaceImageService{}}
+
+	r := gin.New()
+	r.POST("/admin/workspace-images/refresh", h.Refresh)
+
+	req := httptest.NewRequest(http.MethodPost, "/admin/workspace-images/refresh?runtime=not-a-real-runtime", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("unknown runtime: got status %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+
+	var body struct {
+		Error         string   `json:"error"`
+		KnownRuntimes []string `json:"known_runtimes"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode 400 body: %v (raw=%s)", err, rec.Body.String())
+	}
+	if !runtimeListContains(body.KnownRuntimes, "google-adk") {
+		t.Errorf("400 known_runtimes must advertise google-adk (controlplane#578); got %v", body.KnownRuntimes)
 	}
 }
 
