@@ -34,8 +34,10 @@ name: Sweep stale Cloudflare DNS records
 # scripts/ops/test_sweep_cf_decide.py (#2027) cover the rule
 # classifier.
 #
-# Secrets: CF_API_TOKEN, CF_ZONE_ID, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
-# are confirmed existing per issue #425 §425 audit. CP_ADMIN_API_TOKEN and
+# Secrets: CF_API_TOKEN (preferred CI-scoped name) or CLOUDFLARE_API_TOKEN
+# (operator-host canonical name) are accepted — the workflow falls back
+# automatically. Same for CF_ZONE_ID / CLOUDFLARE_ZONE_ID. Confirmed
+# existing per issue #425 §425 audit. CP_ADMIN_API_TOKEN and
 # CP_STAGING_ADMIN_API_TOKEN are unconfirmed — if missing, the verify step
 # (schedule → hard-fail, dispatch → soft-skip) surfaces it clearly.
 
@@ -79,8 +81,8 @@ jobs:
     # each individually capped at 10s by the script's curl -m flag.
     timeout-minutes: 3
     env:
-      CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
-      CF_ZONE_ID: ${{ secrets.CF_ZONE_ID }}
+      CF_API_TOKEN: ${{ secrets.CF_API_TOKEN || secrets.CLOUDFLARE_API_TOKEN }}
+      CF_ZONE_ID: ${{ secrets.CF_ZONE_ID || secrets.CLOUDFLARE_ZONE_ID }}
       CP_ADMIN_API_TOKEN: ${{ secrets.CP_ADMIN_API_TOKEN }}
       CP_STAGING_ADMIN_API_TOKEN: ${{ secrets.CP_STAGING_ADMIN_API_TOKEN }}
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -129,6 +131,7 @@ jobs:
             fi
             echo "::error::sweep cannot run — required secrets missing: ${missing[*]}"
             echo "::error::set them at Settings → Secrets and Variables → Actions, or disable this workflow."
+            echo "::error::Cloudflare secrets accept either the CI-scoped name (CF_API_TOKEN / CF_ZONE_ID) or the operator-host canonical name (CLOUDFLARE_API_TOKEN / CLOUDFLARE_ZONE_ID)."
             echo "::error::a silent skip masked an active CF DNS leak (152/200 zone records) caught only by a manual audit on 2026-04-28; this gate exists to make the gap visible."
             exit 1
           fi
