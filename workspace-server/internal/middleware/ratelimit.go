@@ -102,15 +102,16 @@ func (rl *RateLimiter) keyFor(c *gin.Context) string {
 // the priority list and rationale.
 func (rl *RateLimiter) Middleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// Tier-1b dev-mode hatch — same gate as AdminAuth / WorkspaceAuth /
-		// discovery. On a local single-user Docker setup the 600-req/min
-		// bucket fills fast: a 15-workspace canvas + activity polling +
-		// approvals polling + A2A overlay + initial hydration all land in
-		// one bucket (whichever keyFor returns — typically the dev user's
-		// IP or shared admin token), so a minute of active use can trip
-		// 429 and blank the page. Gated by MOLECULE_ENV=development +
-		// empty ADMIN_TOKEN so SaaS production keeps the bucket.
-		if isDevModeFailOpen() {
+		// Local-dev rate-limit relaxation (NON-security; see devmode.go).
+		// On a local single-user stack the 600-req/min bucket fills fast:
+		// a 15-workspace canvas + activity polling + approvals polling +
+		// A2A overlay + initial hydration all land in one bucket, so a
+		// minute of active use can trip 429 and blank the page. This only
+		// relaxes a DoS knob — it grants no access and is unrelated to
+		// authentication (auth is fail-closed in every env). Gated solely
+		// by MOLECULE_ENV=dev/development so SaaS production keeps the
+		// bucket. Decoupled from ADMIN_TOKEN (dev now provisions one).
+		if isLocalDevEnv() {
 			c.Header("X-RateLimit-Limit", "unlimited")
 			c.Next()
 			return

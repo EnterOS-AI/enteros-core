@@ -835,6 +835,125 @@ func TestCPProvisionerEnv_StripsSCMWriteTokens(t *testing.T) {
 	}
 }
 
+// TestBuildCPTenantEnv_ForensicGuardProvenance pins the forensic #145
+// provenance-aware guard on the tenant-EC2 path (CPProvisioner.Start →
+// buildCPTenantEnv). The guard strips SCM-write tokens UNLESS they are
+// positively workspace-authored (present in cfg.WorkspaceSecretKeys). Each
+// security invariant from the fix spec gets a row:
+//
+//  1. SCM token ONLY in global_secrets (in EnvVars, NOT WorkspaceSecretKeys) → STRIPPED.
+//  2. SCM token persona/mutator-injected (in EnvVars, NOT WorkspaceSecretKeys) → STRIPPED.
+//  3. SCM token authored via workspace_secrets (in EnvVars AND WorkspaceSecretKeys) → PRESERVED.
+//  4. WorkspaceSecretKeys == nil → ALL SCM-write tokens STRIPPED (fail-safe).
+//  5. Non-SCM keys pass through unchanged regardless of the set.
+func TestBuildCPTenantEnv_ForensicGuardProvenance(t *testing.T) {
+	const tok = "gitea-write-pat-value"
+
+	tests := []struct {
+		name             string
+		envVars          map[string]string
+		workspaceKeys    map[string]struct{}
+		wantPreserved    map[string]string // key→expected value that MUST survive
+		wantStrippedKeys []string          // keys that MUST be absent from the result
+	}{
+		{
+			name:             "invariant 1 — global_secrets-only SCM token is stripped",
+			envVars:          map[string]string{"GITEA_TOKEN": tok},
+			workspaceKeys:    map[string]struct{}{}, // not workspace-authored
+			wantStrippedKeys: []string{"GITEA_TOKEN"},
+		},
+		{
+			name:    "invariant 2 — persona/mutator-injected SCM token is stripped",
+			envVars: map[string]string{"GITEA_TOKEN": "persona-merged-write-pat"},
+			// Persona/mutator merges into EnvVars but NEVER into the
+			// workspace_secrets provenance set — this is the exact bleed the
+			// guard exists for and MUST stay stripped.
+			workspaceKeys:    map[string]struct{}{"ANTHROPIC_API_KEY": {}},
+			wantStrippedKeys: []string{"GITEA_TOKEN"},
+		},
+		{
+			name:          "invariant 3 — workspace_secrets-authored SCM token is preserved",
+			envVars:       map[string]string{"GITEA_TOKEN": tok},
+			workspaceKeys: map[string]struct{}{"GITEA_TOKEN": {}},
+			wantPreserved: map[string]string{"GITEA_TOKEN": tok},
+		},
+		{
+			name: "invariant 4 — nil provenance map strips ALL SCM-write tokens (fail-safe)",
+			envVars: map[string]string{
+				"GITEA_TOKEN":     tok,
+				"GITHUB_TOKEN":    "gh",
+				"GH_TOKEN":        "gh2",
+				"GITLAB_TOKEN":    "gl",
+				"GL_TOKEN":        "gl2",
+				"BITBUCKET_TOKEN": "bb",
+			},
+			workspaceKeys: nil, // missing provenance map must never leak
+			wantStrippedKeys: []string{
+				"GITEA_TOKEN", "GITHUB_TOKEN", "GH_TOKEN",
+				"GITLAB_TOKEN", "GL_TOKEN", "BITBUCKET_TOKEN",
+			},
+		},
+		{
+			name: "invariant 5 — non-SCM keys pass through regardless of the set",
+			envVars: map[string]string{
+				"ANTHROPIC_API_KEY": "sk-keep",
+				"CUSTOM":            "ok",
+				"GITEA_USER":        "reviewer-agent", // read-only identity, not a write token
+				"GITEA_TOKEN":       tok,              // SCM-write, NOT workspace-authored → stripped
+			},
+			workspaceKeys: map[string]struct{}{}, // empty → GITEA_TOKEN not exempt
+			wantPreserved: map[string]string{
+				"ANTHROPIC_API_KEY": "sk-keep",
+				"CUSTOM":            "ok",
+				"GITEA_USER":        "reviewer-agent",
+			},
+			wantStrippedKeys: []string{"GITEA_TOKEN"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := WorkspaceConfig{
+				WorkspaceID:         "ws-tenant",
+				PlatformURL:         "http://localhost:8080",
+				Tier:                2,
+				EnvVars:             tt.envVars,
+				WorkspaceSecretKeys: tt.workspaceKeys,
+			}
+			// adminToken empty so the guard's behaviour is isolated; ADMIN_TOKEN
+			// injection is covered separately below.
+			got := buildCPTenantEnv(cfg, "")
+
+			for _, k := range tt.wantStrippedKeys {
+				if v, ok := got[k]; ok {
+					t.Errorf("SCM-write credential %q leaked into tenant env (forensic #145 invariant violated): value=%q", k, v)
+				}
+			}
+			for k, want := range tt.wantPreserved {
+				if got[k] != want {
+					t.Errorf("key %q = %q; want preserved value %q", k, got[k], want)
+				}
+			}
+		})
+	}
+}
+
+// TestBuildCPTenantEnv_AdminTokenInjected asserts ADMIN_TOKEN is injected when
+// the provisioner carries one, and is never subject to the SCM-write strip.
+func TestBuildCPTenantEnv_AdminTokenInjected(t *testing.T) {
+	cfg := WorkspaceConfig{
+		WorkspaceID: "ws-tenant",
+		EnvVars:     map[string]string{"GITEA_TOKEN": "stripme"},
+	}
+	got := buildCPTenantEnv(cfg, "admin-secret")
+	if got["ADMIN_TOKEN"] != "admin-secret" {
+		t.Errorf("ADMIN_TOKEN = %q; want admin-secret", got["ADMIN_TOKEN"])
+	}
+	if _, ok := got["GITEA_TOKEN"]; ok {
+		t.Errorf("GITEA_TOKEN must still be stripped alongside ADMIN_TOKEN injection")
+	}
+}
+
 // TestBuildContainerEnv_GHPATAliasPrecedence asserts that explicit GH_TOKEN /
 // GITHUB_TOKEN in workspace secrets win over the GH_PAT alias (#1687 CR2
 // review_id=5646). The alias must only inject a key when it was NOT explicitly
