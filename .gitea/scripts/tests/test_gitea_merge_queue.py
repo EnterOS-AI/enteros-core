@@ -182,6 +182,33 @@ def test_current_base_but_not_mergeable_pr_waits():
     assert "not mergeable" in decision.reason
 
 
+def test_behind_main_and_mergeable_none_waits_not_update():
+    """§SOP-22 (CR2 #2374) — the churn-residual fix. A BEHIND-MAIN PR whose
+    mergeability Gitea is STILL COMPUTING (mergeable is None) must WAIT, NOT take
+    the /update path. The old code collapsed None→False, so a behind-main +
+    None PR returned action="update" → /pulls/{n}/update → dismiss_stale_approvals
+    → the exact rebase-churn this change eliminates, fired during the compute
+    window. None and False are now DISTINCT: None waits, False updates."""
+    decision = mq.evaluate_merge_readiness(
+        **_ready_kwargs(pr_has_current_base=False, mergeable=None)
+    )
+
+    assert decision.ready is False
+    assert decision.action == "wait"  # NOT "update" — no churn during compute
+    assert "computed" in decision.reason
+
+
+def test_current_base_and_mergeable_none_waits():
+    """Up-to-date with main + mergeable None (still computing) → WAIT (unchanged
+    fail-closed; just confirming None is never merged regardless of base)."""
+    decision = mq.evaluate_merge_readiness(
+        **_ready_kwargs(pr_has_current_base=True, mergeable=None)
+    )
+
+    assert decision.ready is False
+    assert decision.action == "wait"
+
+
 def test_MergePermissionError_inherits_from_ApiError():
     assert issubclass(mq.MergePermissionError, mq.ApiError)
 
@@ -536,6 +563,30 @@ def test_process_once_merges_when_mergeable_is_true(monkeypatch):
     assert rc == 0
     assert calls["merge_attempts"] == 1
     assert calls["hold_label"] is None
+
+
+def test_process_once_behind_main_mergeable_none_waits_no_update(monkeypatch):
+    """§SOP-22 (CR2 #2374) — end-to-end churn-residual regression. A BEHIND-MAIN
+    PR (commits do NOT contain main_sha) whose mergeability Gitea is STILL
+    COMPUTING (mergeable=None) must WAIT: process_once returns 0 and NEVER calls
+    update_pull (which dismisses genuine approvals via dismiss_stale_approvals)
+    NOR merge_pull NOR hold. The old None→False collapse routed this exact case
+    into the /update path → approval-dismissing rebase churn during the compute
+    window. This proves the durable churn elimination: no update, approvals
+    preserved, re-checked next tick."""
+    calls = {"merge_attempts": 0, "hold_label": None, "updated": False}
+    _fully_ready_process_once_monkeypatch(monkeypatch, mergeable=None, calls=calls)
+    # Make the head BEHIND main: commits do NOT contain main_sha. This is the
+    # case the bug missed (the prior None test had current base, masking it).
+    behind_head = "a" * 40
+    monkeypatch.setattr(mq, "get_pull_commits", lambda n: [{"sha": behind_head}])
+
+    rc = mq.process_once(dry_run=False)
+
+    assert rc == 0
+    assert calls["updated"] is False  # NO /update → approvals NOT dismissed
+    assert calls["merge_attempts"] == 0  # never merge on an unknown
+    assert calls["hold_label"] is None  # transient → not held, retried next tick
 
 
 # --------------------------------------------------------------------------

@@ -21,10 +21,14 @@ queue. This script provides the missing serialized policy in user space:
    up-to-date, so behind-main conflict-free PRs merge cleanly, and calling
    /update would trigger Gitea dismiss_stale_approvals (dismissing the genuine
    approvals and forcing a re-review every tick — the rebase-churn bottleneck).
-   The /update path is used ONLY when the PR is NOT mergeable (mergeable
-   False/None) AND its head lacks current main — refreshing the branch may
-   resolve a behind-main non-conflict; a real conflict returns HTTP 409 and the
-   PR is HELD per #2352. mergeable=None is fail-closed (never merged).
+   The /update path is used ONLY when the PR is DEFINITIVELY not mergeable
+   (mergeable is literal False) AND its head lacks current main — refreshing the
+   branch may resolve a behind-main non-conflict; a real conflict returns HTTP
+   409 and the PR is HELD per #2352. mergeable=None/missing (Gitea STILL
+   COMPUTING conflict state) is a distinct fail-closed WAIT: never merged AND
+   never /update'd — calling /update during the compute window would dismiss the
+   PR's genuine approvals (dismiss_stale_approvals) and re-introduce the exact
+   rebase-churn this queue eliminates. None is re-checked next tick.
 5. Merge ONLY when, on the PR's CURRENT head sha:
      - >= REQUIRED_APPROVALS distinct GENUINE official APPROVED reviews from
        the recognised reviewer set (not stale, not dismissed, commit_id ==
@@ -634,7 +638,7 @@ def evaluate_merge_readiness(
     approvers: set[str],
     request_changes: list[str],
     pr_has_current_base: bool,
-    mergeable: bool,
+    mergeable: bool | None,
     pr_labels: set[str] | None = None,
 ) -> MergeDecision:
     # 1) Main's push-required contexts must be green. Combined state can be
@@ -696,18 +700,32 @@ def evaluate_merge_readiness(
     #    pre-merge. force_merge is used ONLY for missing-but-non-required
     #    governance reds (required are green + approvals genuine), never to
     #    bypass a failing required context or an approval shortfall.
-    if mergeable:
+    if mergeable is True:
         force = _non_required_red_present(latest, required_contexts)
         return MergeDecision(True, "merge", "ready", force=force)
 
-    # 6) NOT mergeable (mergeable is False/None — conflict or still computing).
-    #    FAIL-CLOSED: never merge on an unknown. If the head also does not
+    # 6) NOT (yet) mergeable. TRI-STATE, fail-closed — never merge on an unknown.
+    #    We MUST distinguish "still computing" (None/missing) from a "definitive
+    #    conflict" (False); collapsing them would route a behind-main but
+    #    STILL-COMPUTING PR into the /update path, whose dismiss_stale_approvals
+    #    is the rebase-churn this change eliminates.
+    #
+    #    mergeable is None  → Gitea has NOT finished computing conflict state.
+    #    WAIT: do nothing this tick — never /update (would dismiss genuine
+    #    approvals during the compute window → churn), never merge. Re-check next
+    #    tick once Gitea reports a decisive True/False.
+    if mergeable is None:
+        return MergeDecision(
+            False, "wait",
+            "PR mergeability is still being computed (mergeable=None) — waiting",
+        )
+
+    # mergeable is False → DEFINITIVE not-mergeable. If the head also does not
     #    contain current main, try the /update path to refresh the branch (this
     #    may resolve a behind-main non-conflict; a real conflict returns HTTP 409
     #    and process_once HOLDs the PR per #2352). If the head already contains
     #    current main yet Gitea still reports not-mergeable, there is nothing the
-    #    queue can do (genuine conflict against current main, or Gitea is still
-    #    computing) — WAIT.
+    #    queue can do (genuine conflict against current main) — WAIT.
     if not pr_has_current_base:
         return MergeDecision(False, "update", "PR not mergeable and head does not contain current main")
     return MergeDecision(False, "wait", "PR is not mergeable (conflicts)")
@@ -1114,12 +1132,20 @@ def _evaluate_candidate(
     # never treated as green).
     pr_status = get_combined_status(head_sha)
     pr_labels = label_names(pr)
-    # FAIL-CLOSED: Gitea returns mergeable=None (or omits the field) while it is
-    # still COMPUTING conflict state. Only the literal True is decisive proof the
-    # PR is conflict-free; None and False both mean "not (yet) mergeable". We must
-    # NOT autonomously merge on an unknown — treat anything but True as not-yet-
-    # mergeable so evaluate_merge_readiness returns a "wait" decision.
-    mergeable = pr.get("mergeable") is True
+    # FAIL-CLOSED, TRI-STATE: Gitea returns mergeable=None (or omits the field)
+    # while it is still COMPUTING conflict state, mergeable=False for a definitive
+    # conflict, and mergeable=True only when it has proven the PR conflict-free.
+    # We preserve all THREE states (do NOT collapse None/missing into False):
+    #   - True            → direct-merge eligible (step 5).
+    #   - None / missing  → still computing → WAIT (never merge, never update,
+    #                       never dismiss approvals); re-check next tick.
+    #   - False           → definitive conflict → the update/hold path (step 6).
+    # Collapsing None→False would route a behind-main but STILL-COMPUTING PR into
+    # the /update path, which triggers dismiss_stale_approvals — the exact
+    # rebase-churn this change eliminates. Normalize only to the literal True /
+    # False / None set (some Gitea versions omit the key entirely → None).
+    raw_mergeable = pr.get("mergeable")
+    mergeable: bool | None = raw_mergeable if isinstance(raw_mergeable, bool) else None
 
     reviews = get_pull_reviews(pr_number)
     approvers, request_changes = genuine_approvals(
