@@ -268,6 +268,34 @@ def api(
         return status, {"_raw": raw.decode("utf-8", errors="replace")}
 
 
+def api_paginated(
+    method: str,
+    path: str,
+    *,
+    query: dict[str, str] | None = None,
+    page_size: int = 50,
+) -> list[dict]:
+    """Fetch all pages of a paginated Gitea list endpoint.
+
+    Gitea paginates with `page` (1-indexed) and `limit`. We loop until a
+    page returns fewer than `page_size` items, indicating the end.
+    """
+    results: list[dict] = []
+    page = 1
+    while True:
+        page_query = dict(query or {})
+        page_query["page"] = str(page)
+        page_query["limit"] = str(page_size)
+        _, body = api(method, path, query=page_query)
+        if not isinstance(body, list):
+            raise ApiError(f"{path} paginated response not list")
+        results.extend(body)
+        if len(body) < page_size:
+            break
+        page += 1
+    return results
+
+
 def required_contexts(raw: str) -> list[str]:
     return [part.strip() for part in raw.split(",") if part.strip()]
 
@@ -660,32 +688,23 @@ def get_combined_status(sha: str) -> dict:
     """Combined status + all individual statuses for `sha`.
 
     The /status endpoint caps the `statuses` array at 30 entries (Gitea
-    default page size), so we fetch the full list via /statuses with a
-    higher limit. The combined `state` still comes from /status.
+    default page size), so we fetch the full list via /statuses. The combined
+    `state` still comes from /status.
 
-    Fail-closed: the PRIMARY /status fetch must succeed. If it raises, the
-    error propagates so the caller skips this PR this tick (we never treat a
-    failed status fetch as green — dev-sop "no fail-open"). Only the SECONDARY
-    /statuses enrichment (which merely extends the per-context list beyond the
-    30-entry cap) is best-effort; if it fails we still have the combined set.
+    Fail-closed: BOTH the PRIMARY /status fetch AND the SECONDARY /statuses
+    enrichment must succeed. If either raises, the error propagates so the
+    caller skips this PR this tick (we never treat a failed status fetch as
+    green — dev-sop "no fail-open"). A paginated /statuses error must NOT
+    silently degrade to an incomplete status set.
     """
     _, combined = api("GET", f"/repos/{OWNER}/{NAME}/commits/{sha}/status")
     if not isinstance(combined, dict):
         raise ApiError(f"status for {sha} response not object")
     combined_statuses: list[dict] = combined.get("statuses") or []
-    try:
-        _, all_statuses_raw = api(
-            "GET",
-            f"/repos/{OWNER}/{NAME}/commits/{sha}/statuses",
-            query={"limit": "50"},
-        )
-        if isinstance(all_statuses_raw, list):
-            all_statuses: list[dict] = list(all_statuses_raw)
-        else:
-            all_statuses = []
-    except (ApiError, urllib.error.URLError, TimeoutError, OSError) as exc:
-        sys.stderr.write(f"::warning::could not fetch full statuses list for {sha[:8]}: {exc}\n")
-        all_statuses = []
+    all_statuses = api_paginated(
+        "GET",
+        f"/repos/{OWNER}/{NAME}/commits/{sha}/statuses",
+    )
     # Build latest per context: process combined (ascending→reverse=newest
     # first), then fill gaps from all_statuses (already newest-first).
     latest: dict[str, dict] = {}
@@ -702,19 +721,15 @@ def get_combined_status(sha: str) -> dict:
 
 
 def list_queued_issues() -> list[dict]:
-    _, body = api(
+    return api_paginated(
         "GET",
         f"/repos/{OWNER}/{NAME}/issues",
         query={
             "state": "open",
             "type": "pulls",
             "labels": QUEUE_LABEL,
-            "limit": "50",
         },
     )
-    if not isinstance(body, list):
-        raise ApiError("queued issues response not list")
-    return body
 
 
 def list_candidate_issues(*, auto_discover: bool) -> list[dict]:
@@ -728,18 +743,14 @@ def list_candidate_issues(*, auto_discover: bool) -> list[dict]:
     """
     if not auto_discover:
         return list_queued_issues()
-    _, body = api(
+    return api_paginated(
         "GET",
         f"/repos/{OWNER}/{NAME}/issues",
         query={
             "state": "open",
             "type": "pulls",
-            "limit": "50",
         },
     )
-    if not isinstance(body, list):
-        raise ApiError("candidate issues response not list")
-    return body
 
 
 def get_pull(pr_number: int) -> dict:
