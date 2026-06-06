@@ -109,23 +109,34 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._json(200, [{
                     "state": "APPROVED",
                     "dismissed": True,
+                    "official": True,
                     "user": {"login": "core-devops"},
-                    "commit_id": "abc1234",
+                    "commit_id": "deadbeef0000111122223333444455556666",
                 }])
             if sc == "T3_reviews_approved_non_author":
                 return self._json(200, [
-                    {"state": "CHANGES_REQUESTED", "dismissed": False, "user": {"login": "bob"}, "commit_id": "abc1234"},
-                    {"state": "APPROVED", "dismissed": False, "user": {"login": "core-devops"}, "commit_id": "abc1234"},
+                    {"state": "CHANGES_REQUESTED", "dismissed": False, "official": True, "user": {"login": "bob"}, "commit_id": "deadbeef0000111122223333444455556666"},
+                    {"state": "APPROVED", "dismissed": False, "official": True, "user": {"login": "core-devops"}, "commit_id": "deadbeef0000111122223333444455556666"},
                 ])
             if sc == "T19_ai_sop_ack_approved":
                 # ai-sop-ack member submitted APPROVED review — must NOT count
                 # toward qa-review (team_id=20) or security-review (team_id=21).
                 return self._json(200, [
-                    {"state": "APPROVED", "dismissed": False, "user": {"login": "ai-reviewer"}, "commit_id": "abc1234"},
+                    {"state": "APPROVED", "dismissed": False, "official": True, "user": {"login": "ai-reviewer"}, "commit_id": "deadbeef0000111122223333444455556666"},
                 ])
-            # Default: one non-author APPROVED
+            if sc == "T21_stale_head_approved":
+                # APPROVED review but on an old commit (stale head) → must be rejected
+                return self._json(200, [
+                    {"state": "APPROVED", "dismissed": False, "official": True, "user": {"login": "core-devops"}, "commit_id": "oldsha0000000000000000000000000000"},
+                ])
+            if sc == "T22_missing_official":
+                # APPROVED review with no official field → must be rejected
+                return self._json(200, [
+                    {"state": "APPROVED", "dismissed": False, "user": {"login": "core-devops"}, "commit_id": "deadbeef0000111122223333444455556666"},
+                ])
+            # Default: one non-author APPROVED (current head, official)
             return self._json(200, [
-                {"state": "APPROVED", "dismissed": False, "user": {"login": "core-devops"}, "commit_id": "abc1234"},
+                {"state": "APPROVED", "dismissed": False, "official": True, "user": {"login": "core-devops"}, "commit_id": "deadbeef0000111122223333444455556666"},
             ])
 
         # GET /repos/{owner}/{name}/issues/{pr_number}/comments

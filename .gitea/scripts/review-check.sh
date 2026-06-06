@@ -197,19 +197,15 @@ if [ "$HTTP_CODE" != "200" ]; then
   exit 1
 fi
 
-# Filter: state=APPROVED, not-dismissed, non-author. Optionally strict-mode
-# adds commit_id==head.sha (off by default; see header).
+# Filter: state=APPROVED, official=true, not-dismissed, non-author,
+# commit_id matches current PR head. All conditions are mandatory.
 JQ_FILTER='.[]
   | select(.state == "APPROVED")
+  | select(.official == true)
   | select(.dismissed != true)
-  | select(.official != false)
-  | select(.user.login != $author)'
-if [ "${REVIEW_CHECK_STRICT:-}" = "1" ]; then
-  JQ_FILTER="${JQ_FILTER}
-  | select(.commit_id == \$head)"
-fi
-JQ_FILTER="${JQ_FILTER}
-  | .user.login"
+  | select(.user.login != $author)
+  | select(.commit_id == $head)
+  | .user.login'
 
 REVIEW_CANDIDATES=$(jq -r --arg author "$PR_AUTHOR" --arg head "$PR_HEAD_SHA" "$JQ_FILTER" "$REVIEWS_JSON" | sort -u)
 debug "candidate non-author approvers: $(echo "$REVIEW_CANDIDATES" | tr '\n' ' ')"
