@@ -35,6 +35,7 @@ Every production CI/CD PR must include concrete answers for:
 - Verification: how production state is proven after deployment.
 - Logging: proof that CI logs do not contain raw production runtime, SSM, or secret-adjacent output.
 - Rollback: the exact command, variable, or workflow to return to a known-good tag/digest.
+- No fail-open gates: required checks fail loud + closed on protected contexts (no skip/`|| true`/`403`-as-pass). See `runbooks/dev-sop.md` § *Fail-closed CI integrity*.
 
 ## Human Review
 

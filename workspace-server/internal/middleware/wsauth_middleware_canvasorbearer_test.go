@@ -143,11 +143,15 @@ func TestCanvasOrBearer_AdminTokenEnv_Passes(t *testing.T) {
 	}
 }
 
-// TestCanvasOrBearer_DBError_FailOpen pins the documented behavior on a
-// HasAnyLiveTokenGlobal failure. The middleware logs and falls open so a
-// flaky DB doesn't lock canvas users out of cosmetic routes. Hardcoded in
-// the comment block; this is a reminder if anyone changes that semantic.
-func TestCanvasOrBearer_DBError_FailOpen(t *testing.T) {
+// TestCanvasOrBearer_DBError_FailsClosed pins the removal of the
+// fail-open-on-DB-error branch (harden/no-fail-open-auth). A
+// HasAnyLiveTokenGlobal failure used to log + c.Next() (allow); it now fails
+// CLOSED with 503 — an availability tradeoff that grants NO access. The
+// handler must NOT be reached.
+//
+// Watch-it-fail: restore `if err != nil { log; c.Next(); return }` in
+// CanvasOrBearer → this flips 503→200 and fails.
+func TestCanvasOrBearer_DBError_FailsClosed(t *testing.T) {
 	mockDB, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock: %v", err)
@@ -156,8 +160,10 @@ func TestCanvasOrBearer_DBError_FailOpen(t *testing.T) {
 	mock.ExpectQuery(hasAnyLiveTokenGlobalQuery).
 		WillReturnError(http.ErrAbortHandler) // any non-nil error suffices
 
+	handlerCalled := false
 	r := gin.New()
 	r.PUT("/canvas/viewport", CanvasOrBearer(mockDB), func(c *gin.Context) {
+		handlerCalled = true
 		c.JSON(http.StatusOK, gin.H{"ok": true})
 	})
 
@@ -165,8 +171,11 @@ func TestCanvasOrBearer_DBError_FailOpen(t *testing.T) {
 	req, _ := http.NewRequest(http.MethodPut, "/canvas/viewport", nil)
 	r.ServeHTTP(w, req)
 
-	if w.Code != http.StatusOK {
-		t.Errorf("DB error fail-open: got %d, want 200 (%s)", w.Code, w.Body.String())
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("DB error must fail CLOSED: got %d, want 503 (%s)", w.Code, w.Body.String())
+	}
+	if handlerCalled {
+		t.Error("handler reached on a datastore-error request — DB-error fail-open not removed")
 	}
 }
 
