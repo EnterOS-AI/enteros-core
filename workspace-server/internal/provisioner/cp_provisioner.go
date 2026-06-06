@@ -161,6 +161,9 @@ type cpProvisionRequest struct {
 	Tier         int    `json:"tier"`
 	InstanceType string `json:"instance_type,omitempty"`
 	DiskGB       int32  `json:"disk_gb,omitempty"`
+	// Provider routes the CP to the compute backend for this workspace box
+	// (multi-provider RFC, per-workspace). Distinct from the LLM/model provider.
+	Provider string `json:"provider,omitempty"`
 	// DataPersistence is the per-workspace durable-data choice (internal#734);
 	// CP validates the enum at its provision edge and resolves the data volume
 	// from it. Empty = auto (omitted on the wire).
@@ -257,6 +260,7 @@ func (p *CPProvisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string,
 		InstanceType:    cfg.InstanceType,
 		DiskGB:          cfg.DiskGB,
 		DataPersistence: cfg.DataPersistence,
+		Provider:        cfg.Provider,
 		Display:         cfg.Display,
 		PlatformURL:     cfg.PlatformURL,
 		Env:             env,
