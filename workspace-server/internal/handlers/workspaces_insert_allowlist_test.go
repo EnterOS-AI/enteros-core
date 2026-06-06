@@ -56,6 +56,11 @@ func TestINSERTworkspacesAllowlist(t *testing.T) {
 		// workspace; UUID is server-generated. Caller intent IS to
 		// create, so no idempotency check is needed.
 		"workspace.go:Create": "single-workspace POST, server-generated UUID",
+		// platform_agent.installPlatformAgent: single platform-agent row,
+		// caller-supplied deterministic UUID; INSERT is idempotent via
+		// ON CONFLICT (id) DO UPDATE and runs inside the install transaction.
+		// Pinned by TestIntegration_PlatformAgentInstall_ReparentsRootAndMovesAnchors.
+		"platform_agent.go:installPlatformAgent": "ON CONFLICT (id) DO UPDATE, single row in tx",
 	}
 
 	actual := map[string]string{}
