@@ -250,6 +250,20 @@ jobs:
           echo "CANVAS_PORT=${CANVAS_PORT}" >> "$GITHUB_ENV"
           echo "Canvas host port: ${CANVAS_PORT}"
 
+      - name: Set deterministic admin token
+        if: needs.detect-changes.outputs.chat == 'true'
+        run: |
+          # PR #2291 made auth fail-closed everywhere (no dev-mode escape).
+          # The platform server requires ADMIN_TOKEN; the canvas requires the
+          # matching NEXT_PUBLIC_ADMIN_TOKEN or every API call 401s.
+          # We set a deterministic per-run value so the ephemeral platform
+          # and canvas are paired correctly.
+          E2E_ADMIN_TOKEN="e2e-chat-admin-${{ github.run_id }}-${{ github.run_attempt }}"
+          echo "ADMIN_TOKEN=${E2E_ADMIN_TOKEN}" >> "$GITHUB_ENV"
+          echo "MOLECULE_ADMIN_TOKEN=${E2E_ADMIN_TOKEN}" >> "$GITHUB_ENV"
+          echo "NEXT_PUBLIC_ADMIN_TOKEN=${E2E_ADMIN_TOKEN}" >> "$GITHUB_ENV"
+          echo "Admin token configured for e2e-chat platform + canvas."
+
       - name: Start platform (background)
         if: needs.detect-changes.outputs.chat == 'true'
         working-directory: workspace-server
