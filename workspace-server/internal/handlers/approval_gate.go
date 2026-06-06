@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/approvals"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
@@ -50,7 +51,7 @@ func approvalRequestHash(workspaceID, action string, contextMap map[string]inter
 // requireApproval returns (approved=true, consumedID) when a matching approval
 // exists and was just consumed; otherwise it creates/reuses a pending approval
 // and returns (false, pendingID). A non-nil error is a server error.
-func requireApproval(ctx context.Context, b *events.Broadcaster, workspaceID string, action approvals.Action, reason string, contextMap map[string]interface{}) (bool, string, error) {
+func requireApproval(ctx context.Context, b events.EventEmitter, workspaceID string, action approvals.Action, reason string, contextMap map[string]interface{}) (bool, string, error) {
 	hash := approvalRequestHash(workspaceID, string(action), contextMap)
 
 	// 1. Atomically consume an approved + unconsumed request, if one exists.
@@ -103,18 +104,25 @@ func requireApproval(ctx context.Context, b *events.Broadcaster, workspaceID str
 	// Broadcast to the canvas (the user-facing signal). For a platform agent the
 	// parent_id is NULL, so the requested-event on its own workspace IS the user
 	// prompt; ordinary workspaces also escalate to their parent.
-	if bErr := b.RecordAndBroadcast(ctx, string(events.EventApprovalRequested), workspaceID, map[string]interface{}{
-		"approval_id": approvalID,
-		"action":      string(action),
-		"reason":      reason,
-	}); bErr != nil {
-		log.Printf("approval_gate: broadcast requested failed (ws=%s): %v", workspaceID, bErr)
+	//
+	// b may be nil: stateless handlers (e.g. org-token mint — OrgTokenHandler is
+	// an empty struct with no broadcaster) still gate; they just can't push a
+	// live canvas event. The pending approval row is persisted regardless, so
+	// the request is never lost — only the notification is skipped.
+	if b != nil {
+		if bErr := b.RecordAndBroadcast(ctx, string(events.EventApprovalRequested), workspaceID, map[string]interface{}{
+			"approval_id": approvalID,
+			"action":      string(action),
+			"reason":      reason,
+		}); bErr != nil {
+			log.Printf("approval_gate: broadcast requested failed (ws=%s): %v", workspaceID, bErr)
+		}
 	}
 	var parentID *string
 	if pErr := db.DB.QueryRowContext(ctx, `SELECT parent_id FROM workspaces WHERE id = $1`, workspaceID).Scan(&parentID); pErr != nil {
 		log.Printf("approval_gate: parent lookup failed (ws=%s): %v", workspaceID, pErr)
 	}
-	if parentID != nil {
+	if parentID != nil && b != nil {
 		if bErr := b.RecordAndBroadcast(ctx, string(events.EventApprovalEscalated), *parentID, map[string]interface{}{
 			"approval_id":       approvalID,
 			"from_workspace_id": workspaceID,
@@ -130,8 +138,24 @@ func requireApproval(ctx context.Context, b *events.Broadcaster, workspaceID str
 // gateDestructive runs requireApproval for a gated action and, when approval is
 // still pending, writes the 202 response and returns false (caller must stop).
 // Returns true when the caller may proceed (action consumed an approval).
-func gateDestructive(c *gin.Context, b *events.Broadcaster, workspaceID string, action approvals.Action, reason string, contextMap map[string]interface{}) bool {
+func gateDestructive(c *gin.Context, b events.EventEmitter, workspaceID string, action approvals.Action, reason string, contextMap map[string]interface{}) bool {
 	if !approvals.IsGated(action) {
+		return true
+	}
+	// Scope (RFC platform-agent Phase 4b). Wiring is a one-liner in each
+	// destructive handler; the activation policy lives here, centrally, so it is
+	// uniform and testable:
+	//   - default-OFF rollout flag, so the wiring is inert until an operator
+	//     enables it (mirrors the 3a/3c default-off design and protects existing
+	//     org-token automation from a surprise async-approval behaviour change);
+	//   - only callers holding an ORG token are gated. The platform agent runs
+	//     with MOLECULE_API_KEY=<org-admin token>, so the auth middleware sets
+	//     org_token_id. Ordinary workspace-token agents and human CP-session
+	//     operators (cp_session_actor — the approvers themselves) are NOT gated,
+	//     so normal operation is byte-identical. This realises the file-header
+	//     trust boundary ("anything holding an org-admin token still goes
+	//     through the gate") without gating everyone.
+	if !destructiveGateEnabled() || !callerHoldsOrgToken(c) {
 		return true
 	}
 	approved, approvalID, err := requireApproval(c.Request.Context(), b, workspaceID, action, reason, contextMap)
@@ -150,4 +174,23 @@ func gateDestructive(c *gin.Context, b *events.Broadcaster, workspaceID string, 
 		return false
 	}
 	return true
+}
+
+// destructiveGateEnabled is the default-off rollout flag for the org-level
+// destructive-op approval gate. Inert until an operator sets
+// MOLECULE_PLATFORM_APPROVAL_GATE=1 (or "true") — typically when the platform
+// agent is deployed to the org. Keeps 4b's wiring shipped-but-dormant, matching
+// the platform-agent feature's default-off posture (3a/3c).
+func destructiveGateEnabled() bool {
+	v := os.Getenv("MOLECULE_PLATFORM_APPROVAL_GATE")
+	return v == "1" || v == "true"
+}
+
+// callerHoldsOrgToken reports whether the request authenticated with an org
+// token (the auth middleware sets org_token_id, see middleware/wsauth_middleware.go).
+// The platform agent uses an org-admin token; ordinary workspace-token agents
+// and human CP sessions do not, so they bypass the gate entirely.
+func callerHoldsOrgToken(c *gin.Context) bool {
+	_, ok := c.Get("org_token_id")
+	return ok
 }

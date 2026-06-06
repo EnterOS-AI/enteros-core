@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strings"
 
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/approvals"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/audit"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/crypto"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
@@ -317,6 +318,18 @@ func (h *SecretsHandler) Set(c *gin.Context) {
 		return
 	}
 	if rejectPlatformManagedDirectLLMBypassForWorkspace(c, workspaceID, body.Key) {
+		return
+	}
+
+	// RFC platform-agent Phase 4b: gate org-token (platform-agent) secret writes
+	// behind human approval. The context includes the key so an approval for one
+	// secret cannot authorise writing another. No-op for ordinary callers and
+	// when the rollout flag is off (scoping lives in gateDestructive).
+	// SecretsHandler has no broadcaster, so pass nil — requireApproval persists
+	// the pending row regardless; only the live canvas push is skipped.
+	if !gateDestructive(c, nil, workspaceID, approvals.ActionSecretWrite,
+		"write secret "+body.Key,
+		map[string]interface{}{"workspace_id": workspaceID, "key": body.Key}) {
 		return
 	}
 
