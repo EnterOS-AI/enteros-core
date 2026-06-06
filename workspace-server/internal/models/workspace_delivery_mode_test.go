@@ -34,6 +34,35 @@ func TestIsValidDeliveryMode_Invalid(t *testing.T) {
 	}
 }
 
+// ==================== IsValidKind ====================
+
+func TestIsValidKind_Valid(t *testing.T) {
+	for _, k := range []string{KindWorkspace, KindPlatform} {
+		if !IsValidKind(k) {
+			t.Errorf("IsValidKind(%q) = false, want true", k)
+		}
+	}
+}
+
+func TestIsValidKind_Invalid(t *testing.T) {
+	cases := []struct {
+		val  string
+		want bool
+	}{
+		{"", false},          // empty is not valid — callers resolve the default
+		{"platforms", false}, // typo
+		{"Platform", false},  // case-sensitive
+		{"platform ", false}, // trailing space
+		{"root", false},      // not a kind
+		{"user", false},      // the user is implicit, not a workspace kind
+	}
+	for _, tc := range cases {
+		if got := IsValidKind(tc.val); got != tc.want {
+			t.Errorf("IsValidKind(%q) = %v, want %v", tc.val, got, tc.want)
+		}
+	}
+}
+
 // ==================== WorkspaceStatus ====================
 
 func TestWorkspaceStatus_String(t *testing.T) {

@@ -180,7 +180,7 @@ func TestRegisterHandler(t *testing.T) {
 
 	// Expect the upsert INSERT ... ON CONFLICT
 	mock.ExpectExec("INSERT INTO workspaces").
-		WithArgs("ws-123", "ws-123", "http://localhost:8000", `{"name":"test"}`, "push").
+		WithArgs("ws-123", "ws-123", "http://localhost:8000", `{"name":"test"}`, "push", "").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// Expect the SELECT url query (for cache URL logic)

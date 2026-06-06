@@ -61,11 +61,9 @@ name: Lint pre-flip continue-on-error
 # feedback_no_shared_persona_token_use.
 #
 # Phase contract (RFC internal#219 §1 ladder):
-#   - This workflow lands at `continue-on-error: true` (Phase 3 —
-#     surface defects without blocking). Follow-up PR flips it to
-#     `false` ONLY after this workflow's own recent runs on `main`
-#     are confirmed clean — exactly the discipline the workflow
-#     itself enforces. Eat your own dogfood.
+#   - Flipped to `continue-on-error: false` after Researcher live-verified
+#     clean runs. The script's own 35 pytest tests pass and recent PR
+#     history shows no masked regressions — the gate is now enforcing.
 
 on:
   pull_request:
@@ -97,10 +95,9 @@ jobs:
     name: Verify continue-on-error flips have run-log proof
     runs-on: ubuntu-latest
     timeout-minutes: 8
-    # Phase 3 (RFC internal#219 §1): surface broken flips without blocking
-    # the PR yet. Follow-up flips this to `false` once the workflow itself
-    # has clean recent runs on main. mc#1982 interim — remove when CoE→false.
-    continue-on-error: true  # mc#1982
+    # Fail-closed: the lint script is verified clean (35/35 tests pass,
+    # Researcher live-check confirmed). Masking removed per mc#1982 close-out.
+    continue-on-error: false
     steps:
       - name: Check out PR head (full history for base-SHA access)
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2

@@ -2,6 +2,8 @@ import importlib.util
 import sys
 from pathlib import Path
 
+import pytest
+
 SCRIPT = Path(__file__).resolve().parents[1] / "gitea-merge-queue.py"
 spec = importlib.util.spec_from_file_location("gitea_merge_queue", SCRIPT)
 mq = importlib.util.module_from_spec(spec)
@@ -42,6 +44,35 @@ def test_required_contexts_green_rejects_missing_and_pending():
         "sop-checklist / all-items-acked (pull_request)=pending",
         "qa-review / approved (pull_request)=missing",
     ]
+
+
+def test_required_contexts_green_rejects_volume_skipped_even_for_tier_low():
+    """volume-skipped pending is a partial view, not a genuine soft-fail.
+
+    Per sop-checklist.py:1179-1187, volume_skipped posts pending with a
+    '[volume-skipped]' prefix. The merge queue must NOT treat this as an
+    acceptable soft-fail for tier:low — the gate did not finish evaluating.
+    """
+    latest = mq.latest_statuses_by_context([
+        {"context": "CI / all-required (pull_request)", "status": "success"},
+        {
+            "context": "sop-checklist / all-items-acked (pull_request)",
+            "status": "pending",
+            "description": "[volume-skipped] comment-cap=1000 hit; please file ...",
+        },
+    ])
+
+    ok, missing_or_bad = mq.required_contexts_green(
+        latest,
+        [
+            "CI / all-required (pull_request)",
+            "sop-checklist / all-items-acked (pull_request)",
+        ],
+        pr_labels={"tier:low"},
+    )
+
+    assert ok is False
+    assert "sop-checklist / all-items-acked (pull_request)=pending" in missing_or_bad
 
 
 def test_choose_next_pr_sorts_by_queue_label_timestamp_then_number():
@@ -530,6 +561,61 @@ def test_status_fetch_failure_is_fail_closed(monkeypatch):
     with pytest.raises(mq.ApiError):
         mq.process_once(dry_run=False)
     assert merged["called"] is False
+
+
+# --------------------------------------------------------------------------
+# Pagination: api_paginated loops pages and is fail-closed on page errors
+# --------------------------------------------------------------------------
+
+def test_api_paginated_loops_pages_until_partial(monkeypatch):
+    """api_paginated fetches all pages and stops when a page is < page_size."""
+    calls = []
+
+    def fake_api(method, path, *, query=None, **kw):
+        page = int((query or {}).get("page", "1"))
+        limit = int((query or {}).get("limit", "50"))
+        calls.append((page, limit))
+        if page == 1:
+            return 200, [{"number": 1}, {"number": 2}]
+        if page == 2:
+            return 200, [{"number": 3}]
+        return 200, []
+
+    monkeypatch.setattr(mq, "api", fake_api)
+    results = mq.api_paginated("GET", "/repos/o/r/issues", page_size=2)
+    assert len(results) == 3
+    assert results[0]["number"] == 1
+    assert results[1]["number"] == 2
+    assert results[2]["number"] == 3
+    assert calls == [(1, 2), (2, 2)]
+
+
+def test_api_paginated_raises_on_non_list(monkeypatch):
+    """A page that returns a dict instead of list is an error."""
+    def fake_api(method, path, *, query=None, **kw):
+        return 200, {"message": "not found"}
+
+    monkeypatch.setattr(mq, "api", fake_api)
+    with pytest.raises(mq.ApiError):
+        mq.api_paginated("GET", "/repos/o/r/issues")
+
+
+def test_get_combined_status_propagates_paginated_statuses_error(monkeypatch):
+    """If the paginated /statuses enrichment raises, the error propagates
+    (fail-closed — we do NOT silently fall back to an incomplete status set)."""
+    monkeypatch.setattr(mq, "OWNER", "o")
+    monkeypatch.setattr(mq, "NAME", "r")
+
+    def fake_api(method, path, *, query=None, **kw):
+        if path.endswith("/status"):
+            return 200, {"state": "success", "statuses": [{"context": "c1", "status": "success", "id": 1}]}
+        if path.endswith("/statuses"):
+            raise mq.ApiError("GET /statuses -> HTTP 502")
+        raise mq.ApiError(f"unexpected {path}")
+
+    monkeypatch.setattr(mq, "api", fake_api)
+    with pytest.raises(mq.ApiError, match="GET /statuses"):
+        mq.get_combined_status("a" * 40)
 
 
 def test_process_once_holds_tick_when_branch_protection_unavailable(monkeypatch):

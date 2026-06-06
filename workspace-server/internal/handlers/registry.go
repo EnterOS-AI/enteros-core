@@ -164,6 +164,20 @@ func (h *RegistryHandler) resolveDeliveryMode(ctx context.Context, workspaceID, 
 	return models.DeliveryModePush, nil
 }
 
+// errPlatformNotRoot is the client-facing message when a register call tried to
+// mark a non-root workspace as a platform agent.
+const errPlatformNotRoot = "a platform agent must be the org root (parent_id must be null)"
+
+// isPlatformRootViolation reports whether err is the DB rejecting a register
+// that tried to mark a non-root workspace as a platform agent (the
+// workspaces_platform_root_check CHECK constraint). The handler maps it to a
+// friendly HTTP 409 instead of a raw 500. The invariant — platform == org root,
+// which structurally also guarantees one platform agent per org — is enforced
+// race-proof at the DB level; this is just the friendly surface.
+func isPlatformRootViolation(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "workspaces_platform_root_check")
+}
+
 // Returns a non-nil error suitable for including in a 400 Bad Request response.
 func validateAgentURL(rawURL string) error {
 	if rawURL == "" {
@@ -274,6 +288,14 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 	// in the upsert below. See #2339 for the poll/push split rationale.
 	if payload.DeliveryMode != "" && !models.IsValidDeliveryMode(payload.DeliveryMode) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "delivery_mode must be 'push' or 'poll'"})
+		return
+	}
+
+	// Validate explicit kind if the agent declared one; empty is allowed and
+	// resolves to the row's existing value (or "workspace" default) in
+	// resolveKind below. Only the platform-agent container declares 'platform'.
+	if payload.Kind != "" && !models.IsValidKind(payload.Kind) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "kind must be 'workspace' or 'platform'"})
 		return
 	}
 
@@ -390,9 +412,15 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 	// the row. Without this guard, bulk deletes left tier-3 stragglers because
 	// the last pre-teardown heartbeat flipped status back to 'online' after
 	// Delete's UPDATE.
+	// kind ($6) is the raw payload value (validated above; "" = unspecified).
+	// COALESCE(NULLIF($6,''), …) means: an explicit kind wins; an unspecified
+	// kind defaults to 'workspace' for a NEW row and KEEPS the existing kind on
+	// re-register (so a platform agent re-registering without kind is never
+	// downgraded). A non-root row asking for 'platform' is rejected by the
+	// workspaces_platform_root_check constraint → friendly 409 below.
 	_, err = db.DB.ExecContext(ctx, `
-		INSERT INTO workspaces (id, name, url, agent_card, status, last_heartbeat_at, delivery_mode)
-		VALUES ($1, $2, $3, $4::jsonb, 'online', now(), $5)
+		INSERT INTO workspaces (id, name, url, agent_card, status, last_heartbeat_at, delivery_mode, kind)
+		VALUES ($1, $2, $3, $4::jsonb, 'online', now(), $5, COALESCE(NULLIF($6, ''), 'workspace'))
 		ON CONFLICT (id) DO UPDATE SET
 			url = CASE
 				WHEN workspaces.url LIKE 'http://127.0.0.1%' THEN workspaces.url
@@ -402,10 +430,15 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 			status = 'online',
 			last_heartbeat_at = now(),
 			delivery_mode = EXCLUDED.delivery_mode,
+			kind = COALESCE(NULLIF($6, ''), workspaces.kind),
 			updated_at = now()
 		WHERE workspaces.status IS DISTINCT FROM 'removed'
-	`, payload.ID, payload.ID, urlForUpsert, agentCardStr, modeForUpsert)
+	`, payload.ID, payload.ID, urlForUpsert, agentCardStr, modeForUpsert, payload.Kind)
 	if err != nil {
+		if isPlatformRootViolation(err) {
+			c.JSON(http.StatusConflict, gin.H{"error": errPlatformNotRoot})
+			return
+		}
 		log.Printf("Registry register error: %v (id=%s)", err, payload.ID)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "registration failed"})
 		return
