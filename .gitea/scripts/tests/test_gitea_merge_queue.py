@@ -539,3 +539,166 @@ def test_process_once_holds_tick_when_branch_protection_unavailable(monkeypatch)
     rc = mq.process_once(dry_run=False)
     assert rc == 0
     assert merged["called"] is False
+
+
+# --------------------------------------------------------------------------
+# Fix 4 (issue #2352): a persistent 409-conflict-on-update HOLDS the PR and
+# the queue ADVANCES — it does not retry the conflicted PR forever (HOL).
+# --------------------------------------------------------------------------
+
+def test_BranchUpdateConflictError_inherits_from_ApiError():
+    assert issubclass(mq.BranchUpdateConflictError, mq.ApiError)
+
+
+def test_update_pull_raises_conflict_error_on_409(monkeypatch):
+    """A 409 from the /update endpoint becomes BranchUpdateConflictError so
+    process_once can HOLD-and-advance rather than letting it propagate as a
+    plain ApiError (which would leave the PR queued and re-selectable)."""
+    monkeypatch.setattr(mq, "OWNER", "molecule-ai")
+    monkeypatch.setattr(mq, "NAME", "molecule-core")
+
+    def fake_api(method, path, **kwargs):
+        raise mq.ApiError("POST /pulls/1409/update -> HTTP 409: merge conflict")
+    monkeypatch.setattr(mq, "api", fake_api)
+
+    import pytest
+    with pytest.raises(mq.BranchUpdateConflictError) as exc_info:
+        mq.update_pull(1409, dry_run=False)
+    assert "409" in str(exc_info.value)
+
+
+def test_update_pull_reraises_non_409_errors(monkeypatch):
+    """Non-409 update failures (e.g. 500) are NOT conflicts; they must NOT be
+    swallowed as a hold — they re-raise as the original ApiError so the tick is
+    a transient no-op and the PR is retried next tick."""
+    monkeypatch.setattr(mq, "OWNER", "molecule-ai")
+    monkeypatch.setattr(mq, "NAME", "molecule-core")
+
+    def fake_api(method, path, **kwargs):
+        raise mq.ApiError("POST /pulls/1409/update -> HTTP 500: server error")
+    monkeypatch.setattr(mq, "api", fake_api)
+
+    import pytest
+    with pytest.raises(mq.ApiError) as exc_info:
+        mq.update_pull(1409, dry_run=False)
+    # Re-raised as plain ApiError, NOT the conflict subclass.
+    assert not isinstance(exc_info.value, mq.BranchUpdateConflictError)
+    assert "500" in str(exc_info.value)
+
+
+def _stale_pr_update_409_monkeypatch(monkeypatch, queued_issues, calls):
+    """Wire process_once so the selected PR needs an update (head does NOT
+    contain main) and the /update call returns a 409 conflict. Everything else
+    is green. Records merge attempts and the applied hold label in `calls`."""
+    monkeypatch.setattr(mq, "OWNER", "molecule-ai")
+    monkeypatch.setattr(mq, "NAME", "molecule-core")
+    monkeypatch.setattr(mq, "WATCH_BRANCH", "main")
+    monkeypatch.setattr(mq, "QUEUE_LABEL", "merge-queue")
+    monkeypatch.setattr(mq, "HOLD_LABEL", "merge-queue-hold")
+    monkeypatch.setattr(mq, "REVIEWER_SET", REVIEWERS)
+    monkeypatch.setattr(mq, "get_branch_protection", lambda branch: mq.BranchProtection(
+        required_contexts=["CI / all-required (pull_request)"],
+        required_approvals=2,
+        block_on_rejected_reviews=True,
+    ))
+    main_sha = "b" * 40
+    head_sha = "a" * 40
+    monkeypatch.setattr(mq, "get_branch_head", lambda branch: main_sha)
+
+    def fake_combined(sha):
+        ctx = "CI / all-required (push)" if sha == main_sha else "CI / all-required (pull_request)"
+        return {"state": "success", "statuses": [{"context": ctx, "status": "success"}]}
+    monkeypatch.setattr(mq, "get_combined_status", fake_combined)
+
+    monkeypatch.setattr(mq, "list_queued_issues", lambda: queued_issues)
+    monkeypatch.setattr(mq, "get_pull", lambda n: {
+        "state": "open", "number": n, "mergeable": True,
+        "base": {"ref": "main", "repo_id": 1},
+        "head": {"sha": head_sha, "repo_id": 1},
+        "labels": [{"name": "merge-queue"}],
+    })
+    # NOTE: commits do NOT contain main_sha → pr_has_current_base is False →
+    # decision.action == "update".
+    monkeypatch.setattr(mq, "get_pull_commits", lambda n: [{"sha": head_sha}])
+    monkeypatch.setattr(mq, "get_pull_reviews", lambda n: [
+        {"state": "APPROVED", "user": {"login": "agent-researcher"},
+         "official": True, "stale": False, "dismissed": False, "commit_id": head_sha},
+        {"state": "APPROVED", "user": {"login": "agent-reviewer-cr2"},
+         "official": True, "stale": False, "dismissed": False, "commit_id": head_sha},
+    ])
+
+    def fake_update(pr_number, *, dry_run):
+        calls["update_attempts"] += 1
+        raise mq.BranchUpdateConflictError(
+            "POST /pulls/%d/update -> HTTP 409: merge conflict" % pr_number
+        )
+    monkeypatch.setattr(mq, "update_pull", fake_update)
+
+    def fake_merge(pr_number, *, dry_run, force=False):
+        calls["merge_attempts"] += 1
+    monkeypatch.setattr(mq, "merge_pull", fake_merge)
+
+    def fake_add_label(pr_number, label_name, *, dry_run):
+        calls["hold_label"] = (pr_number, label_name)
+    monkeypatch.setattr(mq, "add_label_by_name", fake_add_label)
+    monkeypatch.setattr(mq, "post_comment", lambda *a, **k: None)
+
+
+def test_process_once_holds_pr_on_409_conflict_on_update(monkeypatch):
+    """The #2352 regression: a queued PR whose /update returns 409 must get the
+    HOLD_LABEL (so the queue advances) and must NOT be merged. Without the fix
+    the 409 propagated, the PR stayed queued, and the next tick re-selected the
+    SAME conflicted PR forever (head-of-line block)."""
+    calls = {"update_attempts": 0, "merge_attempts": 0, "hold_label": None}
+    _stale_pr_update_409_monkeypatch(
+        monkeypatch,
+        queued_issues=[
+            {"number": 1409, "pull_request": {}, "labels": [{"name": "merge-queue"}],
+             "created_at": "2026-06-01T00:00:00Z"},
+        ],
+        calls=calls,
+    )
+
+    rc = mq.process_once(dry_run=False)
+
+    assert rc == 0
+    assert calls["update_attempts"] == 1
+    # Held, not merged — fail-closed.
+    assert calls["hold_label"] == (1409, "merge-queue-hold")
+    assert calls["merge_attempts"] == 0
+
+
+def test_queue_advances_past_held_conflicted_pr(monkeypatch):
+    """End-to-end HOL proof for #2352: PR #1409 (oldest) hits a 409-on-update
+    and is held; on the NEXT tick choose_next_queued_issue must SKIP the held
+    PR and select the next ready PR (#1500) instead of stalling on #1409."""
+    calls = {"update_attempts": 0, "merge_attempts": 0, "hold_label": None}
+    conflicted = {"number": 1409, "pull_request": {},
+                  "labels": [{"name": "merge-queue"}],
+                  "created_at": "2026-06-01T00:00:00Z"}
+    next_ready = {"number": 1500, "pull_request": {},
+                  "labels": [{"name": "merge-queue"}],
+                  "created_at": "2026-06-02T00:00:00Z"}
+    _stale_pr_update_409_monkeypatch(
+        monkeypatch,
+        queued_issues=[conflicted, next_ready],
+        calls=calls,
+    )
+
+    # Tick 1: oldest (#1409) is selected, 409-on-update → held.
+    rc = mq.process_once(dry_run=False)
+    assert rc == 0
+    assert calls["hold_label"] == (1409, "merge-queue-hold")
+
+    # Simulate the label now present on #1409 (as the real hold would persist).
+    conflicted["labels"] = [{"name": "merge-queue"}, {"name": "merge-queue-hold"}]
+
+    # Tick 2: the queue must ADVANCE — choose_next_queued_issue skips the held
+    # #1409 and selects the next ready candidate #1500, NOT re-select #1409.
+    selected = mq.choose_next_queued_issue(
+        [conflicted, next_ready],
+        queue_label="merge-queue",
+        hold_label="merge-queue-hold",
+    )
+    assert selected is not None
+    assert selected["number"] == 1500

@@ -31,7 +31,11 @@ Authoritative gates (fail-closed):
 
 Head-of-line (HOL) safety: a permanent permission/4xx merge error
 (403/404/405) HOLDS the PR (applies HOLD_LABEL) so the queue advances to the
-next PR instead of re-selecting the same wedged PR every tick.
+next PR instead of re-selecting the same wedged PR every tick. Likewise, a
+persistent branch-update conflict (the /update endpoint returns HTTP 409
+because the PR branch cannot be merged with main without manual rebase) HOLDS
+the PR — a conflict will not self-resolve, so retrying it every tick would
+HOL-block every ready PR behind it (issue #2352).
 
 Status-fetch is fail-closed: if the combined status for a sha cannot be
 fetched, the PR is skipped this tick (never treated as green).
@@ -110,6 +114,20 @@ class ApiError(RuntimeError):
 class MergePermissionError(ApiError):
     """Merge failed with a permanent permission error (403/404/405).
     The queue should HOLD this PR and move to the next one."""
+
+
+class BranchUpdateConflictError(ApiError):
+    """Updating the PR branch with the base hit a merge-conflict (HTTP 409).
+
+    A true merge-conflict is NOT transient: the branch cannot be auto-updated
+    until a human/agent rebases it. The queue should HOLD this PR (apply
+    HOLD_LABEL) and advance to the next candidate, exactly like the permission
+    path — otherwise the conflicted PR sits at the queue head and is retried
+    every tick forever, head-of-line-blocking every ready PR behind it.
+
+    NOTE: distinct from mergeable=None, which is Gitea STILL COMPUTING conflict
+    state — that case is handled as a transient WAIT (no hold). This error is
+    only raised on an explicit 409 returned by the /update endpoint."""
 
 
 class BranchProtectionUnavailable(ApiError):
@@ -584,12 +602,24 @@ def update_pull(pr_number: int, *, dry_run: bool) -> None:
     print(f"::notice::updating PR #{pr_number} with base branch via style={UPDATE_STYLE}")
     if dry_run:
         return
-    api(
-        "POST",
-        f"/repos/{OWNER}/{NAME}/pulls/{pr_number}/update",
-        query={"style": UPDATE_STYLE},
-        expect_json=False,
-    )
+    try:
+        api(
+            "POST",
+            f"/repos/{OWNER}/{NAME}/pulls/{pr_number}/update",
+            query={"style": UPDATE_STYLE},
+            expect_json=False,
+        )
+    except ApiError as exc:
+        # Gitea returns HTTP 409 when the base cannot be merged into the PR
+        # branch because of a real conflict. The queue cannot auto-resolve a
+        # conflict, so re-raise as BranchUpdateConflictError; process_once HOLDs
+        # the PR and advances (HOL guard) instead of retrying it forever.
+        # Match the HTTP STATUS token ("-> HTTP 409") specifically, not a bare
+        # "409" substring — the PR number or path can itself contain "409"
+        # (e.g. /pulls/1409/update) and must not be misread as a conflict.
+        if "-> HTTP 409" in str(exc):
+            raise BranchUpdateConflictError(str(exc)) from exc
+        raise  # re-raise other ApiErrors unchanged
 
 
 def add_label_by_name(pr_number: int, label_name: str, *, dry_run: bool) -> None:
@@ -616,6 +646,29 @@ def add_label_by_name(pr_number: int, label_name: str, *, dry_run: bool) -> None
         f"/repos/{OWNER}/{NAME}/issues/{pr_number}/labels",
         body={"labels": [label_id]},
     )
+
+
+def hold_pr(pr_number: int, hold_note: str, *, dry_run: bool) -> None:
+    """Apply HOLD_LABEL to a wedged PR so the queue advances past it.
+
+    choose_next_queued_issue skips HOLD_LABEL-bearing PRs, so this is the HOL
+    guard: a PR the queue cannot make progress on (permanent permission error
+    or unresolvable branch-update conflict) is held and a human/agent fixes it,
+    rather than the queue re-selecting it every tick forever. If the label
+    cannot be applied we still post the explanatory comment so the wedge is at
+    least visible — but we never loop on the PR.
+    """
+    try:
+        add_label_by_name(pr_number, HOLD_LABEL, dry_run=dry_run)
+    except ApiError as label_exc:
+        sys.stderr.write(
+            f"::error::could not apply HOLD_LABEL to PR #{pr_number}: {label_exc}\n"
+        )
+        hold_note += (
+            f"\n\n(NOTE: could not apply the hold label automatically: "
+            f"{label_exc}. Please add `{HOLD_LABEL}` manually.)"
+        )
+    post_comment(pr_number, hold_note, dry_run=dry_run)
 
 
 def merge_pull(pr_number: int, *, dry_run: bool, force: bool = False) -> None:
@@ -737,7 +790,30 @@ def process_once(*, dry_run: bool = False) -> int:
 
     print(f"::notice::PR #{pr_number} decision={decision.action}: {decision.reason}")
     if decision.action == "update":
-        update_pull(pr_number, dry_run=dry_run)
+        try:
+            update_pull(pr_number, dry_run=dry_run)
+        except BranchUpdateConflictError as exc:
+            # The branch cannot be updated with main because of a real conflict
+            # (HTTP 409). This is the HOL fix for issue #2352: previously the
+            # 409 propagated to main() and the tick exited 0 with the PR still
+            # queued, so the NEXT tick re-selected the SAME conflicted PR and
+            # retried the failing update forever — head-of-line-blocking every
+            # ready PR behind it. A conflict will not self-resolve; it needs a
+            # human/agent rebase. So HOLD this PR (HOL guard) and advance to the
+            # next candidate. Fail-closed: a held PR is skipped, never merged.
+            sys.stderr.write(
+                f"::error::branch-update conflict for PR #{pr_number}: {exc}\n"
+            )
+            hold_note = (
+                "merge-queue: could not update this branch with "
+                f"`{WATCH_BRANCH}` — the update returned a merge conflict "
+                f"(HTTP 409) that the queue cannot auto-resolve ({exc}). "
+                f"Applied `{HOLD_LABEL}` to unblock the queue (HOL guard). "
+                f"Fix: rebase/merge `{WATCH_BRANCH}` into this branch and "
+                f"resolve the conflicts, then remove `{HOLD_LABEL}` to requeue."
+            )
+            hold_pr(pr_number, hold_note, dry_run=dry_run)
+            return 0
         post_comment(
             pr_number,
             (
@@ -773,19 +849,7 @@ def process_once(*, dry_run: bool = False) -> int:
                 f"Fix: grant Can-merge to the queue token, then remove "
                 f"`{HOLD_LABEL}` to requeue."
             )
-            try:
-                add_label_by_name(pr_number, HOLD_LABEL, dry_run=dry_run)
-            except ApiError as label_exc:
-                # If we cannot even apply the hold label, fall back to a comment
-                # so the wedge is at least visible; do NOT loop on this PR.
-                sys.stderr.write(
-                    f"::error::could not apply HOLD_LABEL to PR #{pr_number}: {label_exc}\n"
-                )
-                hold_note += (
-                    f"\n\n(NOTE: could not apply the hold label automatically: "
-                    f"{label_exc}. Please add `{HOLD_LABEL}` manually.)"
-                )
-            post_comment(pr_number, hold_note, dry_run=dry_run)
+            hold_pr(pr_number, hold_note, dry_run=dry_run)
             return 0
         return 0
     return 0
