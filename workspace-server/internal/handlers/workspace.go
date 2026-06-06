@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -113,6 +114,11 @@ func (h *WorkspaceHandler) goAsync(fn func()) {
 	h.asyncWG.Add(1)
 	go func() {
 		defer h.asyncWG.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("PANIC recovered in goAsync goroutine: %v\n%s", r, debug.Stack())
+			}
+		}()
 		fn()
 	}()
 }
@@ -151,6 +157,11 @@ func globalGoAsync(fn func()) {
 	globalAsync.Add(1)
 	go func() {
 		defer globalAsync.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("PANIC recovered in globalGoAsync goroutine: %v\n%s", r, debug.Stack())
+			}
+		}()
 		fn()
 	}()
 }

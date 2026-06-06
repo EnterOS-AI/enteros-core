@@ -271,6 +271,11 @@ func (m *Manager) Reload(ctx context.Context) {
 		ch.Config["_channel_id"] = ch.ID
 
 		go func(a ChannelAdapter, c ChannelRow, pCtx context.Context) {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("PANIC recovered in channel polling goroutine: %v", r)
+				}
+			}()
 			if err := a.StartPolling(pCtx, c.Config, m.onInboundMessage); err != nil {
 				log.Printf("Channels: polling error for %s/%s: %v", c.ChannelType, truncID(c.ID), err)
 			}
@@ -354,6 +359,11 @@ func (m *Manager) HandleInbound(ctx context.Context, ch ChannelRow, msg *Inbound
 			typingCtx, typingCancel := context.WithCancel(fireCtx)
 			defer typingCancel()
 			go func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("PANIC recovered in typing indicator goroutine: %v", r)
+					}
+				}()
 				typer.SendTyping(ch.Config, msg.ChatID)
 				ticker := time.NewTicker(4 * time.Second)
 				defer ticker.Stop()
