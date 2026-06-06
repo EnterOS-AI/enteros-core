@@ -68,9 +68,16 @@ if [ "$PR_HTTP" != "200" ]; then
 fi
 # FAIL-CLOSED: a 200 response with a missing/malformed `merged` field must
 # NOT be treated as "not merged" (that would silently skip the audit).
-# Abort so the operator knows the API response is untrustworthy.
-if ! echo "$PR" | jq -e 'has("merged")' >/dev/null; then
-  echo "::error::GET /pulls/${PR_NUMBER} returned HTTP 200 but payload missing 'merged' field — cannot evaluate merge state."
+# We verify both presence AND correct type for every field we consume.
+PR_SCHEMA_OK=$(echo "$PR" | jq -r '
+  (.merged | type == "boolean") and
+  (.merge_commit_sha | type == "string") and
+  (.merged_by | type == "object") and (.merged_by.login | type == "string") and
+  (.base | type == "object") and (.base.ref | type == "string") and
+  (.head | type == "object") and (.head.sha | type == "string")
+')
+if [ "$PR_SCHEMA_OK" != "true" ]; then
+  echo "::error::GET /pulls/${PR_NUMBER} returned HTTP 200 but one or more required fields are missing, null, or of wrong type — cannot evaluate force-merge."
   exit 1
 fi
 MERGED=$(echo "$PR" | jq -r '.merged')
@@ -79,24 +86,6 @@ if [ "$MERGED" != "true" ]; then
   exit 0
 fi
 
-# NOTE: no || true — with set -euo pipefail, jq parse failures (e.g. field
-# missing from API response) propagate as hard errors. Use jq's // operator
-# for graceful defaults instead of bash || true guards. This was re-added by
-# 8c343e3a ("fix(gitea): add || true guards to jq pipelines") — reverted
-# here because the guards mask silent failures that hide malformed API responses.
-#
-# FAIL-CLOSED: every field we need for the audit must be present in the 200
-# payload. A missing or null intermediate node (e.g. merged_by=null) means the
-# response is untrustworthy — we must NOT silently skip the audit or emit an
-# anonymous/unattributable event.
-# We validate the FULL jq path (not just the top-level key) so nested nulls
-# are caught too.
-for jq_path in '.merge_commit_sha' '.merged_by.login' '.base.ref' '.head.sha'; do
-  if ! echo "$PR" | jq -e "$jq_path" >/dev/null; then
-    echo "::error::GET /pulls/${PR_NUMBER} returned HTTP 200 but payload missing/null field '${jq_path}' — cannot evaluate force-merge."
-    exit 1
-  fi
-done
 MERGE_SHA=$(echo "$PR" | jq -r '.merge_commit_sha')
 MERGED_BY=$(echo "$PR" | jq -r '.merged_by.login')
 TITLE=$(echo "$PR" | jq -r '.title // ""')
@@ -105,7 +94,17 @@ HEAD_SHA=$(echo "$PR" | jq -r '.head.sha')
 
 # 2. Required status checks — branch-aware JSON dict takes precedence.
 if [ -n "${REQUIRED_CHECKS_JSON:-}" ]; then
-  REQUIRED=$(echo "$REQUIRED_CHECKS_JSON" | jq -r --arg branch "$BASE_BRANCH" '.[$branch] // [] | .[]')
+  # FAIL-CLOSED: if REQUIRED_CHECKS_JSON is set, the branch entry must exist
+  # and be an array. A missing branch or non-array value means the config is
+  # malformed or drifted — we must NOT silently treat it as "no checks".
+  _RC_JSON_OK=$(echo "$REQUIRED_CHECKS_JSON" | jq -r --arg branch "$BASE_BRANCH" '
+    has($branch) and (.[$branch] | type == "array")
+  ')
+  if [ "$_RC_JSON_OK" != "true" ]; then
+    echo "::error::REQUIRED_CHECKS_JSON missing or non-array entry for branch '$BASE_BRANCH' — cannot evaluate required checks."
+    exit 1
+  fi
+  REQUIRED=$(echo "$REQUIRED_CHECKS_JSON" | jq -r --arg branch "$BASE_BRANCH" '.[$branch] | .[]')
 else
   REQUIRED="$REQUIRED_CHECKS"
 fi
@@ -128,10 +127,11 @@ if [ "$STATUS_HTTP" != "200" ]; then
   echo "::error::GET /commits/${HEAD_SHA}/status returned HTTP ${STATUS_HTTP} — cannot evaluate required checks."
   exit 1
 fi
-# FAIL-CLOSED: a 200 status response missing the 'statuses' array must NOT be
-# treated as "no checks" (that would silently declare all checks green).
-if ! echo "$STATUS" | jq -e 'has("statuses")' >/dev/null; then
-  echo "::error::GET /commits/${HEAD_SHA}/status returned HTTP 200 but payload missing 'statuses' field — cannot evaluate required checks."
+# FAIL-CLOSED: a 200 status response missing the 'statuses' array, or with
+# 'statuses' set to a non-array type (null/string/object), must NOT be treated
+# as "no checks" — that would silently declare all checks green.
+if ! echo "$STATUS" | jq -e '(.statuses | type) == "array"' >/dev/null; then
+  echo "::error::GET /commits/${HEAD_SHA}/status returned HTTP 200 but 'statuses' is missing or not an array — cannot evaluate required checks."
   exit 1
 fi
 declare -A CHECK_STATE
