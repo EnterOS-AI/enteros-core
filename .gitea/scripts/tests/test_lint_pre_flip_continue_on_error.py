@@ -320,10 +320,10 @@ class TestVerifyFlip(unittest.TestCase):
         self.assertEqual(len(verdict["fail_runs"]), 1)
         self.assertEqual(verdict["fail_runs"][0]["status"], "failure")
 
-    def test_unreadable_log_warns_not_blocks(self):
-        # Acceptance test #5: log fetch 404 (None) → warn, not block.
-        # Status is `success`, log is None — we can't tell, so we warn
-        # and allow.
+    def test_unreadable_log_on_success_blocks(self):
+        # Fail-closed: log fetch 404 (None) on a success status is a
+        # potential Quirk #10 mask — we cannot verify it's genuine, so
+        # we block the flip rather than allowing it.
         with mock.patch.object(lpfc, "recent_commits_on_branch", return_value=["sha1"]):
             with mock.patch.object(
                 lpfc, "combined_status",
@@ -332,7 +332,8 @@ class TestVerifyFlip(unittest.TestCase):
                 with mock.patch.object(lpfc, "fetch_log", return_value=None):
                     verdict = lpfc.verify_flip(FLIP_FIXTURE, "main", 5)
         self.assertEqual(verdict["fail_runs"], [])
-        self.assertEqual(verdict["masked_runs"], [])
+        self.assertEqual(len(verdict["masked_runs"]), 1)
+        self.assertIn("log unavailable", verdict["masked_runs"][0]["samples"][0])
         self.assertTrue(any("log unavailable" in w for w in verdict["warnings"]))
 
     def test_unreadable_log_with_failure_status_still_blocks(self):

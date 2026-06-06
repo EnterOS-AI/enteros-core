@@ -582,6 +582,17 @@ def verify_flip(flip: dict, branch: str, n: int) -> dict:
                         "target_url": target_url,
                         "samples": ["[log unavailable; status itself is " + state + "]"],
                     })
+                elif state == "success":
+                    # Fail-closed: unreadable log on a success status is a
+                    # potential Quirk #10 mask (continue-on-error hiding real
+                    # failures). We cannot verify it's clean, so treat as
+                    # masked rather than allowing the flip.
+                    result["masked_runs"].append({
+                        "sha": sha,
+                        "status": state,
+                        "target_url": target_url,
+                        "samples": ["[log unavailable; cannot verify status is genuine — treat as masked]"],
+                    })
                 break
             samples = grep_fail_markers(log_text)
             if state in ("failure", "error"):
