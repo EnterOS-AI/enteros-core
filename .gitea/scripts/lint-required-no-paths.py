@@ -40,20 +40,24 @@ Context-format note (Gitea 1.22.6):
 
 Exit codes:
   0 — no required workflow has a paths/paths-ignore filter (clean) OR
-      branch_protections endpoint returned 403/404 (token-scope issue;
-      surfaced via ::error:: but non-fatal so a missing scope doesn't
-      red-X every PR — fix the token, not the lint).
+      branch_protections returned an authenticated 404 (branch
+      genuinely has no protection; ::warning:: surfaced).
   1 — at least one required workflow has a paths/paths-ignore filter
       (the gate-degrading defect class).
   2 — env contract violation (missing GITEA_TOKEN/HOST/REPO/BRANCH).
   3 — workflows directory missing or workflow YAML unparseable.
-  4 — protection response shape unexpected (non-dict body on 2xx).
+  4 — FAIL-CLOSED verification failure: branch_protections 401/403
+      auth failure (token can't read BP), 5xx transient (propagated
+      ApiError), or unexpected response shape. This is a HARD gate on
+      a protected context — it MUST NOT green when it cannot verify.
 
 Auth note: `GET /repos/.../branch_protections/{branch}` requires
 repo-admin role in Gitea 1.22.6. The workflow-default `GITHUB_TOKEN`
 is non-admin; we re-use `DRIFT_BOT_TOKEN` (same persona that powers
-ci-required-drift.yml). If `DRIFT_BOT_TOKEN` is unavailable in a future
-context, the script falls through gracefully (exit 0 + ::error::).
+ci-required-drift.yml). A 401/403 from a missing-scope token is an
+AUTH FAILURE that FAILS CLOSED (exit 4) — fix the token, not the
+lint. Only an authenticated 404 (genuinely-absent protection) is a
+tolerated graceful skip.
 """
 from __future__ import annotations
 
@@ -309,14 +313,36 @@ def run() -> int:
         msg = str(e)
         m = re.search(r"HTTP (\d{3})", msg)
         http_status = int(m.group(1)) if m else None
-        if http_status in (403, 404):
+        # FAIL-CLOSED contract (was fail-open: 403 AND 404 both exit 0 —
+        # fixed). This is a HARD gate (no continue-on-error → false) on a
+        # PROTECTED context: pull_request (same-repo; fork PRs can't carry
+        # DRIFT_BOT_TOKEN) + workflow_dispatch. We split auth-failure from
+        # genuinely-absent:
+        #   401/403 → AUTH FAILURE: the token cannot read branch
+        #     protections, so we CANNOT enumerate the required-check set
+        #     and CANNOT verify the no-paths-filter invariant. Fail loud /
+        #     fail closed (exit 4) — do NOT green an unverifiable gate.
+        #   404 → authenticated absent resource: branch genuinely has no
+        #     protection. Nothing to enumerate; tolerated degradation,
+        #     surfaced loudly (exit 0 with ::warning::).
+        if http_status in (401, 403):
             sys.stderr.write(
-                f"::error::GET {protection_path} returned HTTP {http_status} — "
-                f"DRIFT_BOT_TOKEN lacks repo-admin scope (Gitea 1.22.6 "
-                f"requires it for this endpoint) OR branch '{BRANCH}' has "
-                f"no protection configured. Cannot enumerate required "
-                f"checks; skipping lint with exit 0 to avoid red-X on "
-                f"every PR. Fix: grant repo-admin to mc-drift-bot.\n"
+                f"::error::GET {protection_path} returned HTTP "
+                f"{http_status} — DRIFT_BOT_TOKEN cannot read branch "
+                f"protections (needs repo-admin scope). AUTH FAILURE: "
+                f"cannot enumerate required checks, so this lint FAILS "
+                f"CLOSED rather than greening a gate it could not verify. "
+                f"Fix: grant repo-admin to mc-drift-bot (org team "
+                f"`drift-bot`, perm=admin) — fix the token, not the lint.\n"
+            )
+            return 4
+        if http_status == 404:
+            sys.stderr.write(
+                f"::warning::GET {protection_path} returned HTTP 404 — "
+                f"branch '{BRANCH}' has no protection configured "
+                f"(authenticated absent resource). No required contexts to "
+                f"check. If '{BRANCH}' SHOULD be protected, this is a real "
+                f"finding.\n"
             )
             return 0
         raise

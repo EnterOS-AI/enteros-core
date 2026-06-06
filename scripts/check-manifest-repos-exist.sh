@@ -50,8 +50,22 @@ check_category() {
         repo=$(echo "$MANIFEST_JSON" | jq -r ".${category}[$i].repo")
         TOTAL=$((TOTAL + 1))
 
-        # Check repo existence via Gitea API (public endpoint, no auth needed)
-        http_code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "${GITEA_API}/${repo}" 2>/dev/null || true)
+        # Check repo existence via Gitea API. Many manifest repos are PRIVATE
+        # (e.g. the workspace templates), so an *unauthenticated* GET returns
+        # 404 even when the repo exists — indistinguishable from a genuinely
+        # missing repo. We therefore authenticate with the same token
+        # clone-manifest.sh uses (MOLECULE_GITEA_TOKEN). A 404 *with* a valid
+        # token still means the repo is truly missing, which is what we want
+        # to catch. If the token is unset (local dev), fall back to an
+        # unauthenticated request — private repos will then 404, so run the
+        # check in CI where the token is present.
+        if [ -n "${MOLECULE_GITEA_TOKEN:-}" ]; then
+            http_code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 \
+                -H "Authorization: token ${MOLECULE_GITEA_TOKEN}" \
+                "${GITEA_API}/${repo}" 2>/dev/null || true)
+        else
+            http_code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "${GITEA_API}/${repo}" 2>/dev/null || true)
+        fi
 
         if [ "$http_code" != "200" ]; then
             echo "::error::manifest.json ${category} entry '${name}' → repo '${repo}' returned HTTP ${http_code} (expected 200). Delete the manifest entry BEFORE deleting the repo." >&2
