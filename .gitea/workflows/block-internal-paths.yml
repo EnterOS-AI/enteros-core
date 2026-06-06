@@ -34,6 +34,8 @@ jobs:
   check:
     name: Block forbidden paths
     runs-on: ubuntu-latest
+    # Hard gate — detected internal-path leaks fail the workflow.
+    # continue-on-error removed per directive (fail-open → fail-closed).
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
