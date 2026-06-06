@@ -7,12 +7,14 @@
 # extraction (and ongoing template work) can't silently break any
 # runtime.
 #
-# Runtimes covered: claude-code, codex, hermes, openclaw.
+# Runtimes covered: claude-code, codex, hermes, openclaw, google-adk.
 # claude-code + hermes have unique
 # provisioning quirks (claude-code OAuth, hermes 15-min cold-boot)
 # and stay first-class with their own run_<runtime> functions; the
-# OpenAI-backed runtimes share run_openai_runtime. Each phase skips cleanly
-# if its prerequisite secret is missing.
+# OpenAI-backed runtimes share run_openai_runtime. google-adk has its own
+# run_google_adk (it asserts manifest registration unconditionally, then drives
+# its AI-Studio BYOK live arm — keyless-Vertex needs platform WIF CI lacks).
+# Each phase skips cleanly if its prerequisite secret is missing.
 #
 # What this proves:
 #   1. Provisioning + container boot works for each runtime.
@@ -93,6 +95,7 @@
 #   E2E_RUNTIMES=minimax     tests/e2e/test_priority_runtimes_e2e.sh
 #   E2E_RUNTIMES=claude-code tests/e2e/test_priority_runtimes_e2e.sh
 #   E2E_RUNTIMES=hermes      tests/e2e/test_priority_runtimes_e2e.sh
+#   E2E_RUNTIMES=google-adk  tests/e2e/test_priority_runtimes_e2e.sh  # registration always; live arm needs E2E_GOOGLE_API_KEY
 #
 # Prereqs:
 #   - workspace-server on http://localhost:8080
@@ -514,6 +517,132 @@ run_codex()      { run_openai_runtime "codex"      "codex"; }
 run_openclaw()   { run_openai_runtime "openclaw"   "openclaw"; }
 
 ####################################################################
+# google-adk arm — Gemini. REGISTRATION asserted always; LIVE arm is
+# REQUIRED-when-keyed, LOUD-skip-when-absent (NEVER best-effort/fail-open).
+####################################################################
+# google-adk serves Gemini two ways (providers.yaml runtimes.google-adk):
+#   * platform arm  → keyless Vertex via the Molecule LLM proxy (server-side
+#     WIF mint, platform_managed billing — the org-default PROD path). It needs
+#     a platform WIF identity that CI does NOT have, so this arm does NOT drive
+#     the keyless-Vertex path (no fail-open arm — we never green a path we can't
+#     actually exercise).
+#   * google arm   → AI Studio API-key BYOK (the tenant's OWN GOOGLE/GEMINI
+#     key), bare `gemini-2.5-pro`. This is the CI-/staging-exercisable path and
+#     is what the LIVE portion below drives when E2E_GOOGLE_API_KEY is present.
+#
+# Two-part contract (core#2332 P0.1 — google-adk previously had ZERO e2e):
+#   1. REGISTRATION (always, NO live creds): google-adk MUST be present in the
+#      deployed manifest.json's workspace_templates — that file is the SSOT the
+#      Create-handler's runtime allowlist is derived from (runtime_registry.go::
+#      loadRuntimesFromManifest). If it is absent, a google-adk create 422s
+#      RUNTIME_UNSUPPORTED, so registration is the precondition for ANY serving.
+#      Asserting it offline means even a key-less CI run proves google-adk is
+#      registered (a regression that drops it from the manifest reds the gate).
+#      This does NOT bump VALIDATED — registration is not end-to-end serving.
+#   2. LIVE (REQUIRED-when-keyed): with E2E_GOOGLE_API_KEY set, provision the
+#      AI-Studio BYOK arm end-to-end (online + non-error A2A reply). A miss here
+#      is a HARD fail() (fail-closed-if-present), exactly like the claude-code /
+#      hermes / openai arms — NOT a best-effort miss. Without the key the live
+#      portion is a LOUD skip() (dev-convenience), same as every keyed arm.
+run_google_adk() {
+  echo ""
+  echo "=== google-adk (Gemini) — registration + AI-Studio BYOK happy path ==="
+
+  # ── Part 1: REGISTRATION (always; no live creds needed) ──────────────────
+  # Assert google-adk is in the manifest.json workspace_templates SSOT (the
+  # Create-handler allowlist source). WORKSPACE_MANIFEST_PATH override mirrors
+  # the server's own env (runtime_registry.go::manifestPath); otherwise resolve
+  # the monorepo-root manifest.json relative to this script (tests/e2e/ -> repo
+  # root is two levels up).
+  local manifest="${WORKSPACE_MANIFEST_PATH:-$(cd "$(dirname "$0")/../.." && pwd)/manifest.json}"
+  if [ ! -f "$manifest" ]; then
+    fail "google-adk registration" "manifest.json not found at $manifest (cannot verify the runtime allowlist SSOT)"
+    return 0
+  fi
+  local registered
+  registered=$(python3 -c '
+import json, sys
+try:
+    m = json.load(open(sys.argv[1]))
+except Exception as e:
+    print("ERR:%s" % e); sys.exit(0)
+names = [t.get("name") for t in m.get("workspace_templates", [])]
+# loadRuntimesFromManifest strips the "-default" vanilla suffix; match the same.
+norm = {n[:-len("-default")] if isinstance(n, str) and n.endswith("-default") else n for n in names}
+print("yes" if "google-adk" in norm else "no:%s" % sorted(n for n in norm if n))
+' "$manifest")
+  if [ "$registered" != "yes" ]; then
+    fail "google-adk registered in manifest.json workspace_templates" \
+      "google-adk absent from the Create-handler runtime allowlist SSOT ($registered) — a create would 422 RUNTIME_UNSUPPORTED"
+    return 0
+  fi
+  pass "google-adk registered in manifest.json workspace_templates (Create-handler allowlist SSOT)"
+
+  # ── Part 2: LIVE arm (REQUIRED-when-keyed, LOUD-skip-when-absent) ─────────
+  # AI-Studio BYOK path: the tenant's own GOOGLE_API_KEY/GEMINI_API_KEY. The
+  # keyless-Vertex PROD path needs a platform WIF identity CI lacks, so it is
+  # NOT exercised here (no fail-open arm). Same env name the staging-full-saas
+  # google-adk arm uses (E2E_GOOGLE_API_KEY).
+  if [ -z "${E2E_GOOGLE_API_KEY:-}" ]; then
+    skip "E2E_GOOGLE_API_KEY not set (google-adk live arm needs an AI-Studio Gemini key; keyless-Vertex needs platform WIF, not available in CI)"
+    return 0
+  fi
+  local secrets
+  secrets=$(python3 -c "
+import json, os
+# The google provider (providers.yaml) reads GEMINI_API_KEY / GOOGLE_API_KEY and
+# dials generativelanguage.googleapis.com with the tenant's OWN key. Inject under
+# both names the provider accepts so the adapter resolves regardless of order.
+k = os.environ['E2E_GOOGLE_API_KEY']
+print(json.dumps({'GOOGLE_API_KEY': k, 'GEMINI_API_KEY': k}))
+")
+  local resp wsid
+  # Bare `gemini-2.5-pro` is the registered AI-Studio BYOK id for google-adk
+  # (providers.yaml runtimes.google-adk `google` arm). DeriveProvider routes the
+  # bare gemini- id to the google vendor (third_party_anthropic_compat, BYOK).
+  resp=$(curl -s -X POST "$BASE/workspaces" ${ADMIN_AUTH[@]+"${ADMIN_AUTH[@]}"} -H "Content-Type: application/json" \
+    -d "{\"name\":\"Priority E2E (google-adk)\",\"runtime\":\"google-adk\",\"tier\":1,\"model\":\"gemini-2.5-pro\",\"secrets\":$secrets}")
+  wsid=$(echo "$resp" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("id",""))') || true
+  if [ -z "$wsid" ]; then
+    fail "create google-adk workspace" "$resp"
+    return 0
+  fi
+  CREATED_WSIDS+=("$wsid")
+  echo "  workspace=$wsid"
+
+  # google-adk runtime image cold boot ~30-90s (image already pulled).
+  local final
+  final=$(wait_for_status "$wsid" "online failed" 240) || true
+  if [ "$final" != "online" ]; then
+    fail "google-adk workspace reaches online" "final status: $final"
+    return 0
+  fi
+  pass "google-adk workspace reaches online"
+
+  local token
+  token=$(echo "$resp" | e2e_extract_token)
+  if [ -z "$token" ]; then
+    token=$(e2e_mint_workspace_token "$wsid")
+  fi
+  if [ -z "$token" ]; then
+    fail "resolve google-adk workspace token" "no token returned"
+    return 0
+  fi
+
+  local reply
+  if reply=$(send_test_prompt "$wsid" "$token"); then
+    if echo "$reply" | grep -q "PONG"; then
+      validated "google-adk reply contains PONG"
+    else
+      validated "google-adk reply non-empty (first 80 chars: ${reply:0:80})"
+    fi
+    assert_activity_logged "google-adk" "$wsid" "$token"
+  else
+    fail "google-adk reply" "${reply:-<empty or error>}"
+  fi
+}
+
+####################################################################
 # Mock arm — the GUARANTEED, always-available REQUIRE-LIVE backbone.
 ####################################################################
 # The mock runtime (workspace-server/internal/handlers/mock_runtime.go)
@@ -742,10 +871,12 @@ print(json.dumps({'MINIMAX_API_KEY': os.environ['E2E_MINIMAX_API_KEY']}))
 
 # `mock` runs FIRST and by default: it is the no-key REQUIRE-LIVE backbone
 # that guarantees >=1 validation on a healthy platform (see run_mock). The
-# real-LLM arms (claude-code/codex/hermes/openclaw/minimax) run if their
-# secrets are present and add real-provider coverage on top; minimax is
-# best-effort (never reds the gate).
-WANT="${E2E_RUNTIMES:-mock claude-code codex hermes openclaw minimax}"
+# real-LLM arms (claude-code/codex/hermes/openclaw/minimax/google-adk) run if
+# their secrets are present and add real-provider coverage on top; minimax is
+# best-effort (never reds the gate). google-adk ALSO asserts its registration
+# unconditionally (no key needed), then drives its AI-Studio BYOK live arm as a
+# REQUIRED-when-keyed (fail-closed-if-present), LOUD-skip-when-absent arm.
+WANT="${E2E_RUNTIMES:-mock claude-code codex hermes openclaw minimax google-adk}"
 for r in $WANT; do
   case "$r" in
     mock)        run_mock ;;
@@ -754,7 +885,8 @@ for r in $WANT; do
     hermes)      run_hermes ;;
     openclaw)    run_openclaw ;;
     minimax)     run_minimax ;;
-    all)         run_mock; run_claude_code; run_codex; run_hermes; run_openclaw; run_minimax ;;
+    google-adk)  run_google_adk ;;
+    all)         run_mock; run_claude_code; run_codex; run_hermes; run_openclaw; run_minimax; run_google_adk ;;
     *) echo "unknown runtime in E2E_RUNTIMES: $r" >&2; exit 2 ;;
   esac
 done

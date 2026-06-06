@@ -57,10 +57,14 @@ comment unrelated to the new job.
 Exit codes
 ----------
   0 — no new emissions, all new emissions have valid directives,
-      or BP read errored (graceful-degrade per Tier 2a contract).
+      OR an authenticated 404 (branch genuinely has no protection
+      to verify against — surfaces ::warning::, not a fail-open).
   1 — at least one new emission lacks a directive, or has
       `bp-required: yes` but the context is missing from BP.
-  2 — env contract violation or YAML parse error.
+  2 — env contract violation, YAML parse error, OR a fail-closed
+      verification failure: 401/403 auth failure (token can't read
+      BP) or transient/unexpected API error. HARD gate on a
+      same-repo PR context — MUST NOT green when it cannot verify.
 
 Env
 ---
@@ -420,33 +424,51 @@ def run() -> int:
         return 0
 
     # Step 3 — fetch BP context list.
+    #
+    # FAIL-CLOSED contract (was fail-open with exit 0 — fixed). This is a
+    # HARD gate (continue-on-error: false) that runs on `pull_request`
+    # against `main`. On molecule-core, `pull_request` runs are same-repo
+    # (fork PRs cannot carry the DRIFT_BOT_TOKEN secret), so this is a
+    # PROTECTED/trusted context with no legitimate fork-degradation. An
+    # auth failure or transient error means we CANNOT verify a NEW
+    # bp-required emission is actually in BP — so we MUST fail loud rather
+    # than green the gate. (A genuinely-absent 404 read with a valid token
+    # is the one tolerated degradation: there is no BP to check against.)
     status, bp = api("GET", f"/repos/{repo}/branch_protections/{branch}")
     bp_contexts: set[str] = set()
     if status == "forbidden":
         sys.stderr.write(
-            f"::error::GET branch_protections/{branch} returned HTTP 403 — "
-            f"DRIFT_BOT_TOKEN lacks repo-admin scope. Cannot verify "
-            f"bp-required directives; skipping lint with exit 0 per "
-            f"Tier 2a contract. Fix the token, not the lint.\n"
+            f"::error::GET branch_protections/{branch} returned HTTP "
+            f"401/403 — DRIFT_BOT_TOKEN cannot read branch protections "
+            f"(needs repo-admin scope). This is an AUTH FAILURE: the lint "
+            f"CANNOT verify the bp-required directives on this PR, so it "
+            f"FAILS CLOSED instead of greening unverified. Fix: grant "
+            f"repo-admin to mc-drift-bot (org team `drift-bot`) — fix the "
+            f"token, not the lint.\n"
         )
-        return 0
+        return 2
     elif status == "not_found":
-        # Branch has no protection — nothing to verify against; the
-        # bp-required: yes directive can't be satisfied. Treat as
-        # graceful-skip rather than red-X.
+        # Authenticated 404 — branch genuinely has no protection. There is
+        # nothing to verify a `bp-required: yes` directive against, so this
+        # is the one tolerated degradation. Surface loudly (on `main` a
+        # missing protection is itself a real finding) but do not hard-fail.
         print(
-            f"::notice::branch '{branch}' has no protection; cannot verify "
-            f"bp-required directives. Skipping (exit 0)."
+            f"::warning::branch '{branch}' has no protection (authenticated "
+            f"404); cannot verify bp-required directives. If '{branch}' "
+            f"SHOULD be protected this is a real finding."
         )
         return 0
     elif status == "ok" and isinstance(bp, dict):
         bp_contexts = set(bp.get("status_check_contexts") or [])
     else:
         sys.stderr.write(
-            f"::error::branch_protections/{branch} response unexpected; "
-            f"status={status}. Treating as transient; exit 0.\n"
+            f"::error::branch_protections/{branch} read failed with "
+            f"status={status} (transient/unexpected). CANNOT verify "
+            f"bp-required directives on this PR; FAILING CLOSED rather than "
+            f"greening unverified. Re-run; if persistent, check Gitea API "
+            f"health / token validity.\n"
         )
-        return 0
+        return 2
 
     # Step 4 — validate each new emission's directive.
     violations: list[str] = []

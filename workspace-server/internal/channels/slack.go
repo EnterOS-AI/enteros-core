@@ -21,6 +21,27 @@ const (
 
 var slackHTTPClient = &http.Client{Timeout: slackHTTPTimeout}
 
+// slackWebhookAccepted reports whether a Slack Incoming Webhook URL is allowed
+// as a send destination. Production accepts only the real hooks.slack.com host.
+//
+// TEST SEAM (gating e2e): when MOLECULE_CHANNELS_TEST_WEBHOOK_BASE is set, a
+// URL with that prefix is ALSO accepted so tests/e2e/test_channels_e2e.sh can
+// point the live Slack send path at a local mock-upstream and assert the mock
+// actually received the serialized {"text":...} payload end-to-end (the unit
+// tests can only assert the body shape — see lark_test.go's prefix-gate
+// workaround comment). The env var is NEVER set in any production/staging
+// deploy; channelsTestWebhookBase() returns "" there and only the real
+// hooks.slack.com prefix passes, so this changes no production behaviour.
+func slackWebhookAccepted(u string) bool {
+	if strings.HasPrefix(u, slackWebhookPrefix) {
+		return true
+	}
+	if base := channelsTestWebhookBase(); base != "" && strings.HasPrefix(u, base) {
+		return true
+	}
+	return false
+}
+
 // SlackAdapter implements ChannelAdapter for Slack Incoming Webhooks.
 //
 // Outbound messages are sent via Slack Incoming Webhooks (the simple,
@@ -98,7 +119,7 @@ func (s *SlackAdapter) ValidateConfig(config map[string]interface{}) error {
 			return fmt.Errorf("bot_token mode requires channel_id")
 		}
 	}
-	if webhookURL != "" && !strings.HasPrefix(webhookURL, slackWebhookPrefix) {
+	if webhookURL != "" && !slackWebhookAccepted(webhookURL) {
 		return fmt.Errorf("invalid Slack webhook URL")
 	}
 	return nil
@@ -197,7 +218,7 @@ func (s *SlackAdapter) sendWebhookMessage(ctx context.Context, config map[string
 	if webhookURL == "" {
 		return fmt.Errorf("webhook_url not configured")
 	}
-	if !strings.HasPrefix(webhookURL, slackWebhookPrefix) {
+	if !slackWebhookAccepted(webhookURL) {
 		return fmt.Errorf("invalid Slack webhook URL")
 	}
 

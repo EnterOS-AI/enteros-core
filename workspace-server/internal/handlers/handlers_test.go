@@ -508,6 +508,7 @@ func TestBuildProvisionerConfig_WorkspacePathFromPayload(t *testing.T) {
 		map[string][]byte{"config.yaml": []byte("name: test")},
 		models.CreateWorkspacePayload{Tier: 2, Runtime: "claude-code", WorkspaceDir: "/tmp/workspace", WorkspaceAccess: "read_write"},
 		map[string]string{"OPENAI_API_KEY": "sk-test"},
+		nil,
 		"/tmp/plugins",
 	)
 
