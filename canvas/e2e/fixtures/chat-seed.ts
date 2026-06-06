@@ -27,9 +27,13 @@ export async function seedWorkspace(echoURL: string): Promise<SeededWorkspace> {
   // 1. Create external workspace pointing at the in-process echo runtime.
   const runId = Math.random().toString(36).slice(2, 8);
   const wsName = `Chat E2E Agent ${runId}`;
+  const adminToken = process.env.E2E_ADMIN_TOKEN ?? process.env.ADMIN_TOKEN;
   const createRes = await fetch(`${PLATFORM_URL}/workspaces`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      ...(adminToken ? { Authorization: `Bearer ${adminToken}` } : {}),
+    },
     body: JSON.stringify({
       name: wsName,
       tier: 1,
