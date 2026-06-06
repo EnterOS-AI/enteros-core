@@ -173,20 +173,8 @@ func (h *DelegationHandler) Delegate(c *gin.Context) {
 	// check_task_status returned status='queued' forever even after a
 	// real reply landed). messageId mirrors delegation_id so the
 	// platform's idempotency-key extraction also keys off the same id.
-	a2aBody, marshalErr := json.Marshal(map[string]interface{}{
-		"method": "message/send",
-		"params": map[string]interface{}{
-			"message": map[string]interface{}{
-				"role":      "user",
-				"messageId": delegationID,
-				// A2A v0.3 Part discriminator is `kind`, NOT `type` (#2251) —
-				// a `type`-keyed Part is dropped by the receiver's v0.3
-				// validator, silently losing the delegated task.
-				"parts":    []map[string]interface{}{{"kind": "text", "text": body.Task}},
-				"metadata": map[string]interface{}{"delegation_id": delegationID},
-			},
-		},
-	})
+	// Build A2A payload via helper so contract tests can assert the envelope shape.
+	a2aBody, marshalErr := buildDelegateA2ABody(delegationID, body.Task)
 	if marshalErr != nil {
 		log.Printf("Delegation %s: json.Marshal a2aBody failed: %v", delegationID, marshalErr)
 	}
@@ -372,6 +360,27 @@ func insertDelegationRow(ctx context.Context, c *gin.Context, sourceID string, b
 	}
 	log.Printf("Delegation: failed to store: %v", err)
 	return insertTrackingUnavailable
+}
+
+// buildDelegateA2ABody constructs the A2A JSON-RPC envelope for a delegation.
+// The returned shape is a schema-valid SendMessageRequest with role="user",
+// messageId, parts, and delegation metadata. Extracted to a pure function so
+// unit tests can assert the envelope contract without standing up HTTP or DB.
+func buildDelegateA2ABody(delegationID, task string) ([]byte, error) {
+	return json.Marshal(map[string]interface{}{
+		"method": "message/send",
+		"params": map[string]interface{}{
+			"message": map[string]interface{}{
+				"role":      "user",
+				"messageId": delegationID,
+				// A2A v0.3 Part discriminator is `kind`, NOT `type` (#2251) —
+				// a `type`-keyed Part is dropped by the receiver's v0.3
+				// validator, silently losing the delegated task.
+				"parts":    []map[string]interface{}{{"kind": "text", "text": task}},
+				"metadata": map[string]interface{}{"delegation_id": delegationID},
+			},
+		},
+	})
 }
 
 // executeDelegation runs in a goroutine — sends A2A and stores the result.

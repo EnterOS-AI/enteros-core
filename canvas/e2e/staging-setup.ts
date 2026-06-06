@@ -234,30 +234,44 @@ export default async function globalSetup(_config: FullConfig): Promise<void> {
     "Authorization": `Bearer ${tenantToken}`,
     "X-Molecule-Org-Id": orgID,
   };
-  const ws = await jsonFetch(`${tenantURL}/workspaces`, {
-    method: "POST",
-    headers: tenantAuth,
-    body: JSON.stringify({
-      name: "E2E Canvas Test",
-      runtime: "hermes",
-      tier: 2,
-      // Provider-registry SSOT (internal#718) registers ONLY Kimi models for
-      // the hermes runtime — `moonshot/kimi-k2.6` is the platform-managed
-      // entry (workspace-server/internal/providers/providers.yaml, hermes ->
-      // platform). The old `gpt-4o` was never a registered hermes model and
-      // now 422s UNREGISTERED_MODEL_FOR_RUNTIME (core#2225). This workspace
-      // defaults closed to platform_managed (see the boot-shape note below),
-      // so a platform-namespaced model id is the registry-correct choice.
-      model: "moonshot/kimi-k2.6",
-    }),
-  });
-  if (ws.status >= 400 || !ws.body?.id) {
-    throw new Error(`Workspace create ${ws.status}: ${JSON.stringify(ws.body)}`);
+  // Retry workspace creation on transient 5xx / timeout — staging CP can
+  // return 502/503/504 under load and a single-shot failure kills the
+  // entire E2E run. 3 attempts with 3s exponential backoff (3s, 6s, 12s)
+  // gives ~21s total budget, well inside the 20-min provision envelope.
+  let workspaceId = "";
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const ws = await jsonFetch(`${tenantURL}/workspaces`, {
+      method: "POST",
+      headers: tenantAuth,
+      body: JSON.stringify({
+        name: "E2E Canvas Test",
+        runtime: "hermes",
+        tier: 2,
+        // Provider-registry SSOT (internal#718) registers ONLY Kimi models for
+        // the hermes runtime — `moonshot/kimi-k2.6` is the platform-managed
+        // entry (workspace-server/internal/providers/providers.yaml, hermes ->
+        // platform). The old `gpt-4o` was never a registered hermes model and
+        // now 422s UNREGISTERED_MODEL_FOR_RUNTIME (core#2225). This workspace
+        // defaults closed to platform_managed (see the boot-shape note below),
+        // so a platform-namespaced model id is the registry-correct choice.
+        model: "moonshot/kimi-k2.6",
+      }),
+    });
+    if (ws.status >= 200 && ws.status < 300 && ws.body?.id) {
+      workspaceId = ws.body.id as string;
+      break;
+    }
+    const isTransient = ws.status >= 500 || ws.status === 0;
+    if (!isTransient || attempt === 3) {
+      throw new Error(`Workspace create ${ws.status} (attempt ${attempt}): ${JSON.stringify(ws.body)}`);
+    }
+    const backoff = 3000 * Math.pow(2, attempt - 1);
+    console.log(`[staging-setup] Workspace create transient ${ws.status}, retrying in ${backoff}ms...`);
+    await new Promise((r) => setTimeout(r, backoff));
   }
-  const workspaceId = ws.body.id as string;
   console.log(`[staging-setup] Workspace created: ${workspaceId}`);
 
-  // 6. Wait for workspace RENDERABLE.
+  // 6. Wait for workspace online
   //
   // This harness exists to verify the canvas *tab UI* renders (staging-
   // tabs.spec.ts: open each of the 13 workspace-panel tabs, assert no hard
@@ -265,6 +279,16 @@ export default async function globalSetup(_config: FullConfig): Promise<void> {
   // no LLM call is made, the spec even mocks /cp/auth/me and 401→200. All
   // it needs is a workspace ROW that the canvas lists so the node renders
   // and the side-panel tabs open. A fully-`online` agent is NOT required.
+  //
+  // Hermes cold-boot takes 10-13 min on slow apt days (apt + uv + hermes
+  // install + npm browser-tools). The controlplane bootstrap-watcher
+  // deadline fires at 5 min and sets status=failed prematurely; heartbeat
+  // then transitions failed → online after install.sh finishes. The ONLY
+  // failed shape we tolerate is the pre-start credential-abort
+  // (uptime_seconds=0, no last_sample_error) — the agent never ran. Real
+  // boot regressions (image pull error, panic, PYTHONPATH, etc.) still
+  // hard-throw immediately so triage gets detail without waiting for a
+  // polling timeout. See test_staging_full_saas.sh step 7/11 and issue #2632.
   //
   // That distinction became load-bearing on 2026-06-03: workspace-server
   // #2162 (fix(provision): platform-managed workspace must fail-closed when
@@ -287,8 +311,10 @@ export default async function globalSetup(_config: FullConfig): Promise<void> {
   // the node + tabs render, proceed. We do NOT mask a real boot regression:
   // any `failed` carrying a last_sample_error, OR a non-zero uptime (the
   // agent started then crashed — image pull, panic, PYTHONPATH, etc.),
-  // still hard-throws. Genuine *infra* provision failure is already caught
-  // loud one step earlier at the org level (instance_status === "failed").
+  // still hard-throws immediately so triage gets boot_stage / last_error /
+  // image fields without waiting for a polling timeout.
+  // Genuine *infra* provision failure is already caught loud one step
+  // earlier at the org level (instance_status === "failed").
   await waitFor<boolean>(
     async () => {
       const r = await jsonFetch(`${tenantURL}/workspaces/${workspaceId}`, {
@@ -315,13 +341,7 @@ export default async function globalSetup(_config: FullConfig): Promise<void> {
           );
           return true;
         }
-        // last_sample_error is often empty when the failure happens before
-        // the agent emits a sample (e.g. boot crash, image pull error,
-        // missing PYTHONPATH, OpenAI quota at startup). Dumping the full
-        // body gives triage the boot_stage / last_error / image fields it
-        // needs without a second probe. Otherwise this propagates as a
-        // bare "Workspace failed: " — the exact useless message that
-        // sent #2632 to the issue tracker.
+        // Real boot regression — hard-throw immediately with full detail.
         const detail = sampleErr
           ? sampleErr
           : `(no last_sample_error) full body: ${JSON.stringify(r.body)}`;
@@ -333,7 +353,7 @@ export default async function globalSetup(_config: FullConfig): Promise<void> {
     10_000,
     "workspace online",
   );
-  console.log(`[staging-setup] Workspace renderable`);
+  console.log(`[staging-setup] Workspace online`);
 
   // 7. Hand state off to tests + teardown — overwrite the slug-only
   // bootstrap state with the full state spec tests need.
