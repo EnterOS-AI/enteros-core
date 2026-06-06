@@ -44,6 +44,35 @@ def test_required_contexts_green_rejects_missing_and_pending():
     ]
 
 
+def test_required_contexts_green_rejects_volume_skipped_even_for_tier_low():
+    """volume-skipped pending is a partial view, not a genuine soft-fail.
+
+    Per sop-checklist.py:1179-1187, volume_skipped posts pending with a
+    '[volume-skipped]' prefix. The merge queue must NOT treat this as an
+    acceptable soft-fail for tier:low — the gate did not finish evaluating.
+    """
+    latest = mq.latest_statuses_by_context([
+        {"context": "CI / all-required (pull_request)", "status": "success"},
+        {
+            "context": "sop-checklist / all-items-acked (pull_request)",
+            "status": "pending",
+            "description": "[volume-skipped] comment-cap=1000 hit; please file ...",
+        },
+    ])
+
+    ok, missing_or_bad = mq.required_contexts_green(
+        latest,
+        [
+            "CI / all-required (pull_request)",
+            "sop-checklist / all-items-acked (pull_request)",
+        ],
+        pr_labels={"tier:low"},
+    )
+
+    assert ok is False
+    assert "sop-checklist / all-items-acked (pull_request)=pending" in missing_or_bad
+
+
 def test_choose_next_pr_sorts_by_queue_label_timestamp_then_number():
     issues = [
         {

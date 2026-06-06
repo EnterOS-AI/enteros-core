@@ -304,13 +304,24 @@ def _is_tier_low_pending_ok(
     sop-checklist posts state=pending when acks are satisfied (missing
     manager/ceo acks are informational only). The queue should accept
     pending instead of waiting for success.
+
+    FAIL-CLOSED: volume-skipped pending (partial comment view) is NOT a
+    genuine soft-fail — the script stopped parsing before verifying acks.
+    See sop-checklist.py:1179-1187. Reject so the PR stays in queue until
+    a human splits bot-relay history and the gate can evaluate honestly.
     """
     if "tier:low" not in pr_labels:
         return False
     if "sop-checklist" not in context:
         return False
     status = latest_statuses.get(context) or {}
-    return status_state(status) == "pending"
+    if status_state(status) != "pending":
+        return False
+    desc = status.get("description") or ""
+    # Reject volume-skipped pending — partial view is not a genuine soft-fail.
+    if "[volume-skipped]" in desc:
+        return False
+    return True
 
 
 def required_contexts_green(
