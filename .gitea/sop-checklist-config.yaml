@@ -205,5 +205,5 @@ n/a_gates:
     required_teams: [security, managers, ceo]
     description: >-
       Security review N/A when this change has no security surface
-      (docs-only, pure-frontend, dependency-only). A security/owners
+      (docs-only, pure-frontend, dependency-only). A security/managers/ceo
       member must post /sop-n/a security-review to activate.
