@@ -54,7 +54,18 @@ API="https://${GITEA_HOST}/api/v1"
 AUTH="Authorization: token ${GITEA_TOKEN}"
 
 # 1. Fetch the PR. If not merged, no-op.
-PR=$(curl -sS -H "$AUTH" "${API}/repos/${OWNER}/${NAME}/pulls/${PR_NUMBER}")
+# Fail-closed: verify HTTP 200 before parsing. A 401/403/404 means the token
+# is invalid or the PR is inaccessible — we must NOT silently treat that as
+# "not merged" and skip the audit.
+PR_TMP=$(mktemp)
+PR_HTTP=$(curl -sS -o "$PR_TMP" -w '%{http_code}' -H "$AUTH" \
+  "${API}/repos/${OWNER}/${NAME}/pulls/${PR_NUMBER}")
+PR=$(cat "$PR_TMP")
+rm -f "$PR_TMP"
+if [ "$PR_HTTP" != "200" ]; then
+  echo "::error::GET /pulls/${PR_NUMBER} returned HTTP ${PR_HTTP} — cannot evaluate merge state."
+  exit 1
+fi
 MERGED=$(echo "$PR" | jq -r '.merged // false')
 if [ "$MERGED" != "true" ]; then
   echo "::notice::PR #${PR_NUMBER} closed without merge — no audit emission."
@@ -91,8 +102,17 @@ fi
 # 3. Status-check state at the PR HEAD (where checks ran). The merge
 #    commit doesn't get its own checks; we evaluate the PR's last
 #    commit, which is what branch protection compared against.
-STATUS=$(curl -sS -H "$AUTH" \
+# Fail-closed: verify HTTP 200. A 401/403/404 means the status is
+# unreadable — we must NOT treat that as "no statuses" and skip checks.
+STATUS_TMP=$(mktemp)
+STATUS_HTTP=$(curl -sS -o "$STATUS_TMP" -w '%{http_code}' -H "$AUTH" \
   "${API}/repos/${OWNER}/${NAME}/commits/${HEAD_SHA}/status")
+STATUS=$(cat "$STATUS_TMP")
+rm -f "$STATUS_TMP"
+if [ "$STATUS_HTTP" != "200" ]; then
+  echo "::error::GET /commits/${HEAD_SHA}/status returned HTTP ${STATUS_HTTP} — cannot evaluate required checks."
+  exit 1
+fi
 declare -A CHECK_STATE
 while IFS=$'\t' read -r ctx state; do
   [ -n "$ctx" ] && CHECK_STATE[$ctx]="$state"
