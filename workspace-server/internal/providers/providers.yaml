@@ -1058,7 +1058,26 @@ runtimes:
           - platform:gemini-2.5-pro
           - platform:gemini-2.5-flash
       # API-key BYOK arm: AI Studio (the tenant's OWN GOOGLE_API_KEY).
+      #
+      # The colon-namespaced `google_genai:` ids are the BYOK spelling the
+      # template's models[] offers (template-google-adk main:
+      # `google_genai:gemini-2.5-pro` / `-flash`, AI-Studio BYOK; the default is
+      # the platform arm above). The runtime adapter (_routing.resolve_model)
+      # treats `google_genai`/`google`/`gemini` as the SAME AI-Studio prefix
+      # family — it strips the prefix to the bare `gemini-2.5-pro` and serves it
+      # via ADK LlmAgent on the AI-Studio backend (GOOGLE_API_KEY) — so both the
+      # bare and `google_genai:` forms resolve to THIS `google` arm. The bare ids
+      # stay (registry-projection / canvas form); the `google_genai:` ids are
+      # ADDED because the LIVE core check is EXACT membership in ModelsForRuntime,
+      # NOT the `^gemini-` prefix (model_registry_validation.go), so without these
+      # exact entries a template BYOK create 422s UNREGISTERED_MODEL_FOR_RUNTIME.
+      # (This corrects the template's own stale comment that `google_genai:` is
+      # covered by the `^gemini-` prefix — it is not; `^gemini-` matches only the
+      # BARE id.) Vertex was intentionally dropped from the runtime arm (cp#514);
+      # the template no longer offers `vertex:`, so no vertex arm is added here.
       - name: google
         models:
           - gemini-2.5-pro
           - gemini-2.5-flash
+          - google_genai:gemini-2.5-pro
+          - google_genai:gemini-2.5-flash
