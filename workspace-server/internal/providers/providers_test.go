@@ -324,3 +324,46 @@ func TestVertexProviderRegistered(t *testing.T) {
 		}
 	}
 }
+
+// TestPlatformProvider_AuthEnvIsUsageTokenOnly is the SSOT-side regression
+// gate for the platform-managed auth_env drift class (issue #2250 — the
+// codex template's `platform` provider shipped
+// auth_env: [MOLECULE_LLM_USAGE_TOKEN, ANTHROPIC_API_KEY], wrongly
+// advertising a vendor key under a platform-managed provider).
+//
+// The `platform` provider is the closed Molecule proxy arm: the platform
+// owns billing and injects MOLECULE_LLM_USAGE_TOKEN, so a tenant supplies
+// NO vendor credential. Listing ANTHROPIC_API_KEY (or any other vendor key)
+// in its auth_env makes the canvas demand a credential the platform path
+// neither needs nor uses, and lets a stray vendor key satisfy the
+// "auth present" check on a path that ignores it — exactly the wrong-bill /
+// silent-no-op failure mode the BYOK-vs-platform split exists to prevent.
+//
+// EXACT-equality (not membership): the prior template-side test only
+// asserted `"MOLECULE_LLM_USAGE_TOKEN" in auth_env`, which PASSED against
+// the buggy two-element list. Pin the WHOLE set so an extra vendor key
+// trips the gate. This is the core providers.yaml SSOT; the template
+// derives from / must byte-match this set (drift-gated by molecule-ci).
+// On core this currently PASSES (auth_env is already clean; the vendor
+// key lives in the separate auth_token_env field) — the gate locks that
+// in so a future drift onto this SSOT trips CI.
+func TestPlatformProvider_AuthEnvIsUsageTokenOnly(t *testing.T) {
+	ps, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	var platform *Provider
+	for i := range ps {
+		if ps[i].Name == "platform" {
+			platform = &ps[i]
+			break
+		}
+	}
+	if platform == nil {
+		t.Fatal("platform provider missing from providers.yaml — the closed proxy arm must exist")
+	}
+	want := []string{"MOLECULE_LLM_USAGE_TOKEN"}
+	if len(platform.AuthEnv) != len(want) || platform.AuthEnv[0] != want[0] {
+		t.Errorf("platform provider auth_env = %v, want exactly %v — a vendor key under a platform-managed provider is the #2250 drift; auth_token_env (the proxy's internal projection target) is a SEPARATE field and must not leak into auth_env", platform.AuthEnv, want)
+	}
+}
