@@ -143,11 +143,43 @@ def test_merge_decision_requires_main_green_pr_green_and_current_base():
     assert decision.force is False  # no non-required reds present
 
 
-def test_merge_decision_updates_stale_pr_before_merge():
-    decision = mq.evaluate_merge_readiness(**_ready_kwargs(pr_has_current_base=False))
+def test_behind_main_but_mergeable_pr_merges_directly():
+    """§SOP-22 (#2358): a behind-main but CONFLICT-FREE PR (mergeable is True)
+    merges DIRECTLY — no update step. Branch protection does not require strict
+    up-to-date, and calling /update would dismiss the genuine approvals
+    (dismiss_stale_approvals), forcing re-review every tick (the throughput
+    bottleneck). This replaces the old update-before-merge behavior."""
+    decision = mq.evaluate_merge_readiness(
+        **_ready_kwargs(pr_has_current_base=False, mergeable=True)
+    )
+
+    assert decision.ready is True
+    assert decision.action == "merge"
+
+
+def test_behind_main_and_not_mergeable_pr_updates():
+    """The /update path is reached ONLY when the PR is NOT mergeable AND its head
+    lacks current main — refreshing the branch may resolve a behind-main
+    non-conflict; a real conflict 409s and is held (#2352)."""
+    decision = mq.evaluate_merge_readiness(
+        **_ready_kwargs(pr_has_current_base=False, mergeable=False)
+    )
 
     assert decision.ready is False
     assert decision.action == "update"
+
+
+def test_current_base_but_not_mergeable_pr_waits():
+    """Up-to-date with main yet Gitea reports not-mergeable → genuine conflict
+    against current main (or still computing). The queue cannot act: WAIT,
+    never update (update would not help) and never merge (fail-closed)."""
+    decision = mq.evaluate_merge_readiness(
+        **_ready_kwargs(pr_has_current_base=True, mergeable=False)
+    )
+
+    assert decision.ready is False
+    assert decision.action == "wait"
+    assert "not mergeable" in decision.reason
 
 
 def test_MergePermissionError_inherits_from_ApiError():
@@ -507,6 +539,107 @@ def test_process_once_merges_when_mergeable_is_true(monkeypatch):
 
 
 # --------------------------------------------------------------------------
+# §SOP-22: DIRECT-MERGE throughput fix (#2358). A conflict-free 2-genuine PR
+# merges WITHOUT a pre-merge /update call, so its approvals are NOT dismissed by
+# dismiss_stale_approvals. The merge bar (2-genuine-on-current-head +
+# BP-required green + mergeable + no RC + opt-out) is UNCHANGED; only the
+# unnecessary update-before-merge churn is removed. The /update path survives
+# for the genuine case it is needed (not-mergeable + behind-main), where a real
+# conflict 409s and is held per #2352. mergeable=None stays fail-closed.
+# --------------------------------------------------------------------------
+
+
+def test_process_once_merges_conflict_free_pr_without_update(monkeypatch):
+    """§SOP-22(a) — the core throughput fix. A conflict-free, fully-approved PR
+    merges WITHOUT update_pull ever being called. The old behavior called
+    /update first whenever the head lacked current main, which dismissed the 2
+    genuine approvals (dismiss_stale_approvals) and forced re-review every tick.
+    Assert update_pull is NOT invoked and merge_pull IS invoked."""
+    calls = {"merge_attempts": 0, "hold_label": None, "updated": False}
+    _fully_ready_process_once_monkeypatch(monkeypatch, mergeable=True, calls=calls)
+    # Make the head BEHIND main: commits do NOT contain main_sha. Under the old
+    # logic this alone forced an update_pull; under the fix it merges directly.
+    head_sha = "a" * 40
+    monkeypatch.setattr(mq, "get_pull_commits", lambda n: [{"sha": head_sha}])
+
+    rc = mq.process_once(dry_run=False)
+
+    assert rc == 0
+    assert calls["merge_attempts"] == 1  # merged directly
+    assert calls["updated"] is False  # NO update_pull → approvals NOT dismissed
+    assert calls["hold_label"] is None
+
+
+def test_process_once_behind_main_conflict_free_merges_directly(monkeypatch):
+    """§SOP-22(b) — explicit behind-main + conflict-free case: it still merges
+    directly (branch protection does not require strict up-to-date)."""
+    calls = {"merge_attempts": 0, "hold_label": None, "updated": False}
+    _fully_ready_process_once_monkeypatch(monkeypatch, mergeable=True, calls=calls)
+    behind_head = "a" * 40
+    monkeypatch.setattr(mq, "get_pull_commits", lambda n: [{"sha": behind_head}])
+
+    rc = mq.process_once(dry_run=False)
+
+    assert rc == 0
+    assert calls["merge_attempts"] == 1
+    assert calls["updated"] is False
+
+
+def test_process_once_pauses_when_main_not_green_no_direct_merge(monkeypatch):
+    """§SOP-22 backstop — the serialized safety that makes direct-merge safe:
+    when main's required push contexts are NOT green (e.g. a prior direct merge
+    introduced a semantic main-break caught by post-merge main CI), the queue
+    PAUSES — it does NOT merge the next PR onto an unverified/red main."""
+    calls = {"merge_attempts": 0, "hold_label": None, "updated": False}
+    _fully_ready_process_once_monkeypatch(monkeypatch, mergeable=True, calls=calls)
+    main_sha = "b" * 40
+
+    def red_main_combined(sha):
+        if sha == main_sha:
+            return {"state": "failure",
+                    "statuses": [{"context": "CI / all-required (push)", "status": "failure"}]}
+        return {"state": "success",
+                "statuses": [{"context": "CI / all-required (pull_request)", "status": "success"}]}
+    monkeypatch.setattr(mq, "get_combined_status", red_main_combined)
+
+    rc = mq.process_once(dry_run=False)
+
+    assert rc == 0
+    assert calls["merge_attempts"] == 0  # paused — no merge onto red main
+    assert calls["updated"] is False
+
+
+def test_direct_merge_bar_unchanged_behind_main(monkeypatch):
+    """§SOP-22(d) — the merge bar is UNCHANGED on the new direct-merge path. A
+    behind-main + conflict-free PR is still rejected (no merge) when ANY gate
+    fails: insufficient genuine approvals, red required context, open
+    REQUEST_CHANGES, or opt-out label. Direct-merge removes the update churn, it
+    does NOT weaken the bar — fail-closed on every gate."""
+    head_sha = "a" * 40
+    behind_main = dict(pr_has_current_base=False, mergeable=True)
+
+    # <2 genuine approvals → wait, not merge.
+    d = mq.evaluate_merge_readiness(
+        **_ready_kwargs(approvers={"agent-researcher"}, **behind_main)
+    )
+    assert d.action == "wait" and d.ready is False
+
+    # Red required context → wait, not merge.
+    red_required = {"state": "failure", "statuses": [
+        {"context": "CI / all-required (pull_request)", "status": "failure"}]}
+    d = mq.evaluate_merge_readiness(
+        **_ready_kwargs(pr_status=red_required, **behind_main)
+    )
+    assert d.action == "wait" and d.ready is False
+
+    # Open REQUEST_CHANGES on current head → wait, not merge.
+    d = mq.evaluate_merge_readiness(
+        **_ready_kwargs(request_changes=["agent-reviewer-cr2"], **behind_main)
+    )
+    assert d.action == "wait" and d.ready is False
+
+
+# --------------------------------------------------------------------------
 # Fix 3: status fetch is fail-closed (failed fetch != green)
 # --------------------------------------------------------------------------
 
@@ -707,13 +840,17 @@ def _stale_pr_update_409_monkeypatch(monkeypatch, queued_issues, calls):
     # Scan-loop process_once enumerates candidates via list_candidate_issues.
     monkeypatch.setattr(mq, "list_candidate_issues", lambda *, auto_discover: queued_issues)
     monkeypatch.setattr(mq, "get_pull", lambda n: {
-        "state": "open", "number": n, "mergeable": True,
+        "state": "open", "number": n, "mergeable": False,
         "base": {"ref": "main", "repo_id": 1},
         "head": {"sha": head_sha, "repo_id": 1},
         "labels": [{"name": "merge-queue"}],
     })
-    # NOTE: commits do NOT contain main_sha → pr_has_current_base is False →
-    # decision.action == "update".
+    # NOTE: mergeable is False (real conflict) AND commits do NOT contain
+    # main_sha → pr_has_current_base is False → decision.action == "update".
+    # Under the #2358 direct-merge fix the update path is reached ONLY when the
+    # PR is NOT mergeable; a mergeable=True behind-main PR would merge directly,
+    # so this fixture sets mergeable=False to exercise the #2352 409-on-update
+    # hold path.
     monkeypatch.setattr(mq, "get_pull_commits", lambda n: [{"sha": head_sha}])
     monkeypatch.setattr(mq, "get_pull_reviews", lambda n: [
         {"state": "APPROVED", "user": {"login": "agent-researcher"},
