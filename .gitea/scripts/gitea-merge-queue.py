@@ -300,17 +300,18 @@ def _is_tier_low_pending_ok(
 ) -> bool:
     """Return True if tier:low PR can tolerate sop-checklist pending state.
 
-    Per sop-checklist-config.yaml tier_failure_mode, tier:low uses soft-fail:
-    sop-checklist posts state=pending when acks are satisfied (missing
-    manager/ceo acks are informational only). The queue should accept
-    pending instead of waiting for success.
+    GENERIC PENDING-AS-GREEN REMOVED (Researcher + CR2 RC on #2368):
+    The prior soft-fail accepted ANY pending sop-checklist for tier:low,
+    which allowed required checks to pass without genuine verification.
+    Pending required sop-checklist must now always HOLD and appear in
+    missing_or_bad. This function is retained as a policy hook but
+    currently always returns False so pending never counts green.
+
+    If a positively identifiable genuine soft-fail state is defined in
+    future (e.g., a specific check-run conclusion), implement it here
+    with strict positive identification — never default to pass.
     """
-    if "tier:low" not in pr_labels:
-        return False
-    if "sop-checklist" not in context:
-        return False
-    status = latest_statuses.get(context) or {}
-    return status_state(status) == "pending"
+    return False
 
 
 def required_contexts_green(
