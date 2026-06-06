@@ -9,17 +9,33 @@ queue. This script provides the missing serialized policy in user space:
    candidate (REQUEST_CHANGES, mergeable!=True, insufficient genuine approvals,
    or red required CI) is SKIPPED so it cannot head-of-line block newer ready
    PRs; the scan continues to the next candidate.
-2. Refuse to act unless main's BP-required contexts are green.
+2. Refuse to act unless main's BP-required contexts are green. This is also
+   the serialized backstop for direct-merge (see below): after a direct merge,
+   main re-runs push CI and this gate PAUSES the queue if main goes red, so no
+   merge piles onto an unverified/red main (issue #2358).
 3. Refuse fork PRs; the queue may only mutate same-repo branches.
-4. If the PR branch does not contain current main, call Gitea's
-   /pulls/{n}/update endpoint and stop. CI must rerun on the updated head.
+4. DIRECT-MERGE when conflict-free (issue #2358). When Gitea reports the PR
+   conflict-free (mergeable is True) and the merge bar below is met, MERGE IT
+   DIRECTLY — even if its head does not contain current main. We do NOT call
+   /pulls/{n}/update first: branch protection does not require strict
+   up-to-date, so behind-main conflict-free PRs merge cleanly, and calling
+   /update would trigger Gitea dismiss_stale_approvals (dismissing the genuine
+   approvals and forcing a re-review every tick — the rebase-churn bottleneck).
+   The /update path is used ONLY when the PR is DEFINITIVELY not mergeable
+   (mergeable is literal False) AND its head lacks current main — refreshing the
+   branch may resolve a behind-main non-conflict; a real conflict returns HTTP
+   409 and the PR is HELD per #2352. mergeable=None/missing (Gitea STILL
+   COMPUTING conflict state) is a distinct fail-closed WAIT: never merged AND
+   never /update'd — calling /update during the compute window would dismiss the
+   PR's genuine approvals (dismiss_stale_approvals) and re-introduce the exact
+   rebase-churn this queue eliminates. None is re-checked next tick.
 5. Merge ONLY when, on the PR's CURRENT head sha:
      - >= REQUIRED_APPROVALS distinct GENUINE official APPROVED reviews from
        the recognised reviewer set (not stale, not dismissed, commit_id ==
        current head), AND
      - no open official REQUEST_CHANGES on the current head, AND
      - every BP-required status context is green, AND
-     - the PR is mergeable.
+     - the PR is mergeable (Gitea reports it conflict-free).
 
 Authoritative gates (fail-closed):
   - The REQUIRED status contexts come from BRANCH PROTECTION
@@ -268,6 +284,34 @@ def api(
         return status, {"_raw": raw.decode("utf-8", errors="replace")}
 
 
+def api_paginated(
+    method: str,
+    path: str,
+    *,
+    query: dict[str, str] | None = None,
+    page_size: int = 50,
+) -> list[dict]:
+    """Fetch all pages of a paginated Gitea list endpoint.
+
+    Gitea paginates with `page` (1-indexed) and `limit`. We loop until a
+    page returns fewer than `page_size` items, indicating the end.
+    """
+    results: list[dict] = []
+    page = 1
+    while True:
+        page_query = dict(query or {})
+        page_query["page"] = str(page)
+        page_query["limit"] = str(page_size)
+        _, body = api(method, path, query=page_query)
+        if not isinstance(body, list):
+            raise ApiError(f"{path} paginated response not list")
+        results.extend(body)
+        if len(body) < page_size:
+            break
+        page += 1
+    return results
+
+
 def required_contexts(raw: str) -> list[str]:
     return [part.strip() for part in raw.split(",") if part.strip()]
 
@@ -300,17 +344,18 @@ def _is_tier_low_pending_ok(
 ) -> bool:
     """Return True if tier:low PR can tolerate sop-checklist pending state.
 
-    Per sop-checklist-config.yaml tier_failure_mode, tier:low uses soft-fail:
-    sop-checklist posts state=pending when acks are satisfied (missing
-    manager/ceo acks are informational only). The queue should accept
-    pending instead of waiting for success.
+    GENERIC PENDING-AS-GREEN REMOVED (Researcher + CR2 RC on #2368):
+    The prior soft-fail accepted ANY pending sop-checklist for tier:low,
+    which allowed required checks to pass without genuine verification.
+    Pending required sop-checklist must now always HOLD and appear in
+    missing_or_bad. This function is retained as a policy hook but
+    currently always returns False so pending never counts green.
+
+    If a positively identifiable genuine soft-fail state is defined in
+    future (e.g., a specific check-run conclusion), implement it here
+    with strict positive identification — never default to pass.
     """
-    if "tier:low" not in pr_labels:
-        return False
-    if "sop-checklist" not in context:
-        return False
-    status = latest_statuses.get(context) or {}
-    return status_state(status) == "pending"
+    return False
 
 
 def required_contexts_green(
@@ -593,29 +638,32 @@ def evaluate_merge_readiness(
     approvers: set[str],
     request_changes: list[str],
     pr_has_current_base: bool,
-    mergeable: bool,
+    mergeable: bool | None,
     pr_labels: set[str] | None = None,
 ) -> MergeDecision:
     # 1) Main's push-required contexts must be green. Combined state can be
     #    "failure" due to non-blocking jobs (continue-on-error: true) that do
     #    not gate merges, so check the explicit required set, not combined.
+    #
+    #    This main-green gate is ALSO the serialized backstop that makes the
+    #    direct-merge (no update) path safe (issue #2358): after a direct merge
+    #    of a behind-main PR, main re-runs its push CI; if a semantic main-break
+    #    slips through (PR green standalone but broken when combined with newer
+    #    main), main's required contexts go red and this gate PAUSES the queue —
+    #    no further merge piles onto an unverified/red main until it is green.
     main_latest = latest_statuses_by_context(main_status.get("statuses") or [])
     main_ok, main_bad = required_contexts_green(main_latest, push_required_contexts())
     if not main_ok:
         return MergeDecision(False, "pause", "main required contexts not green: " + ", ".join(main_bad))
 
-    # 2) PR head must contain current main.
-    if not pr_has_current_base:
-        return MergeDecision(False, "update", "PR head does not contain current main")
-
-    # 3) No open official REQUEST_CHANGES on the current head.
+    # 2) No open official REQUEST_CHANGES on the current head.
     if request_changes:
         return MergeDecision(
             False, "wait",
             "open REQUEST_CHANGES on current head from: " + ", ".join(sorted(request_changes)),
         )
 
-    # 4) Enough distinct genuine official approvals on the current head.
+    # 3) Enough distinct genuine official approvals on the current head.
     if len(approvers) < required_approvals:
         return MergeDecision(
             False, "wait",
@@ -624,7 +672,7 @@ def evaluate_merge_readiness(
             f"need {required_approvals}",
         )
 
-    # 5) Every BRANCH-PROTECTION-REQUIRED status context must be green. This is
+    # 4) Every BRANCH-PROTECTION-REQUIRED status context must be green. This is
     #    the authoritative status gate — NON-required reds (qa-review,
     #    security-review, sop-tier/sop-checklist when not BP-required, E2E Chat,
     #    Staging SaaS, ci-arm64-advisory, continue-on-error jobs) are NOT
@@ -634,16 +682,53 @@ def evaluate_merge_readiness(
     if not ok:
         return MergeDecision(False, "wait", "required contexts not green: " + ", ".join(missing_or_bad))
 
-    # 6) Gitea must consider the PR mergeable (no conflicts).
-    if not mergeable:
-        return MergeDecision(False, "wait", "PR is not mergeable (conflicts)")
+    # 5) DIRECT-MERGE when conflict-free (issue #2358 — throughput fix).
+    #    If Gitea reports the PR conflict-free (mergeable is True), MERGE IT
+    #    DIRECTLY even if its head does not yet contain current main. Branch
+    #    protection does NOT require strict up-to-date, so a behind-main but
+    #    conflict-free PR merges cleanly. We deliberately do NOT call
+    #    /pulls/{n}/update first: update triggers Gitea dismiss_stale_approvals,
+    #    which would dismiss the PR's genuine approvals and force a full
+    #    re-review every tick — the rebase-churn bottleneck that collapsed
+    #    throughput to ~0/hr with dozens of mergeable PRs open.
+    #
+    #    The merge bar is UNCHANGED: we only reach here with main green +
+    #    >= required genuine approvals on the current head + no open
+    #    REQUEST_CHANGES + every BP-required context green. The trade-off is
+    #    that the PR's CI ran on a possibly-behind base, so a SEMANTIC main-break
+    #    is caught by POST-merge main CI (step 1's pause backstop) rather than
+    #    pre-merge. force_merge is used ONLY for missing-but-non-required
+    #    governance reds (required are green + approvals genuine), never to
+    #    bypass a failing required context or an approval shortfall.
+    if mergeable is True:
+        force = _non_required_red_present(latest, required_contexts)
+        return MergeDecision(True, "merge", "ready", force=force)
 
-    # Ready. Use force_merge ONLY if the merge would otherwise be blocked by
-    # missing-but-non-required governance contexts. Required are green and
-    # approvals are genuine, so force only bypasses non-required reds — never a
-    # failing required context or missing approval.
-    force = _non_required_red_present(latest, required_contexts)
-    return MergeDecision(True, "merge", "ready", force=force)
+    # 6) NOT (yet) mergeable. TRI-STATE, fail-closed — never merge on an unknown.
+    #    We MUST distinguish "still computing" (None/missing) from a "definitive
+    #    conflict" (False); collapsing them would route a behind-main but
+    #    STILL-COMPUTING PR into the /update path, whose dismiss_stale_approvals
+    #    is the rebase-churn this change eliminates.
+    #
+    #    mergeable is None  → Gitea has NOT finished computing conflict state.
+    #    WAIT: do nothing this tick — never /update (would dismiss genuine
+    #    approvals during the compute window → churn), never merge. Re-check next
+    #    tick once Gitea reports a decisive True/False.
+    if mergeable is None:
+        return MergeDecision(
+            False, "wait",
+            "PR mergeability is still being computed (mergeable=None) — waiting",
+        )
+
+    # mergeable is False → DEFINITIVE not-mergeable. If the head also does not
+    #    contain current main, try the /update path to refresh the branch (this
+    #    may resolve a behind-main non-conflict; a real conflict returns HTTP 409
+    #    and process_once HOLDs the PR per #2352). If the head already contains
+    #    current main yet Gitea still reports not-mergeable, there is nothing the
+    #    queue can do (genuine conflict against current main) — WAIT.
+    if not pr_has_current_base:
+        return MergeDecision(False, "update", "PR not mergeable and head does not contain current main")
+    return MergeDecision(False, "wait", "PR is not mergeable (conflicts)")
 
 
 def get_branch_head(branch: str) -> str:
@@ -659,32 +744,23 @@ def get_combined_status(sha: str) -> dict:
     """Combined status + all individual statuses for `sha`.
 
     The /status endpoint caps the `statuses` array at 30 entries (Gitea
-    default page size), so we fetch the full list via /statuses with a
-    higher limit. The combined `state` still comes from /status.
+    default page size), so we fetch the full list via /statuses. The combined
+    `state` still comes from /status.
 
-    Fail-closed: the PRIMARY /status fetch must succeed. If it raises, the
-    error propagates so the caller skips this PR this tick (we never treat a
-    failed status fetch as green — dev-sop "no fail-open"). Only the SECONDARY
-    /statuses enrichment (which merely extends the per-context list beyond the
-    30-entry cap) is best-effort; if it fails we still have the combined set.
+    Fail-closed: BOTH the PRIMARY /status fetch AND the SECONDARY /statuses
+    enrichment must succeed. If either raises, the error propagates so the
+    caller skips this PR this tick (we never treat a failed status fetch as
+    green — dev-sop "no fail-open"). A paginated /statuses error must NOT
+    silently degrade to an incomplete status set.
     """
     _, combined = api("GET", f"/repos/{OWNER}/{NAME}/commits/{sha}/status")
     if not isinstance(combined, dict):
         raise ApiError(f"status for {sha} response not object")
     combined_statuses: list[dict] = combined.get("statuses") or []
-    try:
-        _, all_statuses_raw = api(
-            "GET",
-            f"/repos/{OWNER}/{NAME}/commits/{sha}/statuses",
-            query={"limit": "50"},
-        )
-        if isinstance(all_statuses_raw, list):
-            all_statuses: list[dict] = list(all_statuses_raw)
-        else:
-            all_statuses = []
-    except (ApiError, urllib.error.URLError, TimeoutError, OSError) as exc:
-        sys.stderr.write(f"::warning::could not fetch full statuses list for {sha[:8]}: {exc}\n")
-        all_statuses = []
+    all_statuses = api_paginated(
+        "GET",
+        f"/repos/{OWNER}/{NAME}/commits/{sha}/statuses",
+    )
     # Build latest per context: process combined (ascending→reverse=newest
     # first), then fill gaps from all_statuses (already newest-first).
     latest: dict[str, dict] = {}
@@ -701,19 +777,15 @@ def get_combined_status(sha: str) -> dict:
 
 
 def list_queued_issues() -> list[dict]:
-    _, body = api(
+    return api_paginated(
         "GET",
         f"/repos/{OWNER}/{NAME}/issues",
         query={
             "state": "open",
             "type": "pulls",
             "labels": QUEUE_LABEL,
-            "limit": "50",
         },
     )
-    if not isinstance(body, list):
-        raise ApiError("queued issues response not list")
-    return body
 
 
 def list_candidate_issues(*, auto_discover: bool) -> list[dict]:
@@ -727,18 +799,14 @@ def list_candidate_issues(*, auto_discover: bool) -> list[dict]:
     """
     if not auto_discover:
         return list_queued_issues()
-    _, body = api(
+    return api_paginated(
         "GET",
         f"/repos/{OWNER}/{NAME}/issues",
         query={
             "state": "open",
             "type": "pulls",
-            "limit": "50",
         },
     )
-    if not isinstance(body, list):
-        raise ApiError("candidate issues response not list")
-    return body
 
 
 def get_pull(pr_number: int) -> dict:
@@ -1064,12 +1132,20 @@ def _evaluate_candidate(
     # never treated as green).
     pr_status = get_combined_status(head_sha)
     pr_labels = label_names(pr)
-    # FAIL-CLOSED: Gitea returns mergeable=None (or omits the field) while it is
-    # still COMPUTING conflict state. Only the literal True is decisive proof the
-    # PR is conflict-free; None and False both mean "not (yet) mergeable". We must
-    # NOT autonomously merge on an unknown — treat anything but True as not-yet-
-    # mergeable so evaluate_merge_readiness returns a "wait" decision.
-    mergeable = pr.get("mergeable") is True
+    # FAIL-CLOSED, TRI-STATE: Gitea returns mergeable=None (or omits the field)
+    # while it is still COMPUTING conflict state, mergeable=False for a definitive
+    # conflict, and mergeable=True only when it has proven the PR conflict-free.
+    # We preserve all THREE states (do NOT collapse None/missing into False):
+    #   - True            → direct-merge eligible (step 5).
+    #   - None / missing  → still computing → WAIT (never merge, never update,
+    #                       never dismiss approvals); re-check next tick.
+    #   - False           → definitive conflict → the update/hold path (step 6).
+    # Collapsing None→False would route a behind-main but STILL-COMPUTING PR into
+    # the /update path, which triggers dismiss_stale_approvals — the exact
+    # rebase-churn this change eliminates. Normalize only to the literal True /
+    # False / None set (some Gitea versions omit the key entirely → None).
+    raw_mergeable = pr.get("mergeable")
+    mergeable: bool | None = raw_mergeable if isinstance(raw_mergeable, bool) else None
 
     reviews = get_pull_reviews(pr_number)
     approvers, request_changes = genuine_approvals(
@@ -1098,18 +1174,18 @@ def main() -> int:
     try:
         return process_once(dry_run=args.dry_run)
     except ApiError as exc:
-        # API errors (401/403/404/500) are transient for a queue tick —
-        # log and exit 0 so the workflow is not marked failed and the next
-        # tick can retry. Returning non-zero would permanently fail the
-        # workflow run, blocking future ticks.
+        # FAIL-CLOSED: API errors are not "transient success" — they mean
+        # the queue could not evaluate merge state. Returning 0 hides
+        # persistent infra issues (auth drift, endpoint outages) from
+        # operators. Return 1 so the cron job surfaces red and paging fires.
         sys.stderr.write(f"::error::queue API error: {exc}\n")
-        return 0
+        return 1
     except urllib.error.URLError as exc:
         sys.stderr.write(f"::error::queue network error: {exc}\n")
-        return 0
+        return 1
     except TimeoutError as exc:
         sys.stderr.write(f"::error::queue timeout: {exc}\n")
-        return 0
+        return 1
 
 
 if __name__ == "__main__":

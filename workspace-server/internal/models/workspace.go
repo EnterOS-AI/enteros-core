@@ -13,11 +13,16 @@ import (
 const DefaultMaxConcurrentTasks = 1
 
 type Workspace struct {
-	ID                 string          `json:"id" db:"id"`
-	Name               string          `json:"name" db:"name"`
-	Role               sql.NullString  `json:"role" db:"role"`
-	Tier               int             `json:"tier" db:"tier"`
-	Status             string          `json:"status" db:"status"`
+	ID     string         `json:"id" db:"id"`
+	Name   string         `json:"name" db:"name"`
+	Role   sql.NullString `json:"role" db:"role"`
+	Tier   int            `json:"tier" db:"tier"`
+	Status string         `json:"status" db:"status"`
+	// Kind: "workspace" (default) or "platform". A "platform" workspace is the
+	// org-level concierge (the platform agent) that sits at the org root and is
+	// the user's default A2A target. See migration
+	// 20260606000000_workspaces_kind + RFC docs/design/rfc-platform-agent.md.
+	Kind               string          `json:"kind" db:"kind"`
 	SourceBundleID     sql.NullString  `json:"source_bundle_id" db:"source_bundle_id"`
 	AgentCard          json.RawMessage `json:"agent_card" db:"agent_card"`
 	URL                sql.NullString  `json:"url" db:"url"`
@@ -63,6 +68,21 @@ func IsValidDeliveryMode(s string) bool {
 	return s == DeliveryModePush || s == DeliveryModePoll
 }
 
+// Workspace kind constants. Matches the CHECK constraint in migration
+// 20260606000000_workspaces_kind. KindPlatform marks the org-level concierge
+// (the platform agent) which sits at the org root; see
+// docs/design/rfc-platform-agent.md.
+const (
+	KindWorkspace = "workspace"
+	KindPlatform  = "platform"
+)
+
+// IsValidKind reports whether s is a recognised workspace kind. Empty string is
+// NOT valid here — callers resolve the default (KindWorkspace) before calling.
+func IsValidKind(s string) bool {
+	return s == KindWorkspace || s == KindPlatform
+}
+
 type RegisterPayload struct {
 	ID string `json:"id" binding:"required"`
 	// URL is required for push-mode workspaces; optional / unused for
@@ -76,6 +96,12 @@ type RegisterPayload struct {
 	// value on the workspace row, or default to push for new rows".
 	// When set, must be one of DeliveryModePush / DeliveryModePoll.
 	DeliveryMode string `json:"delivery_mode,omitempty"`
+	// Kind is optional. Empty string means "keep the existing value on the
+	// workspace row, or default to KindWorkspace for new rows". When set, must
+	// be one of KindWorkspace / KindPlatform. KindPlatform additionally requires
+	// the row to be its own org root (parent_id IS NULL) and to be the only
+	// platform agent in the org — enforced by the Register handler.
+	Kind string `json:"kind,omitempty"`
 }
 
 type HeartbeatPayload struct {

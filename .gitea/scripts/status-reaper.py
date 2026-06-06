@@ -689,8 +689,8 @@ def reap_branch(
         shas = list_recent_commit_shas(branch, limit)
     except ApiError as e:
         print(
-            "::warning::status-reaper skipped this tick because the "
-            f"commit list could not be read after retries: {e}"
+            "::error::status-reaper cannot run: commit-list API failed "
+            f"after retries: {e}"
         )
         return {
             "scanned_shas": 0,
@@ -704,6 +704,7 @@ def reap_branch(
             "compensated_cancelled_push": 0,
             "preserved_pr_without_push_success": 0,
             "compensated_per_sha": {},
+            "sha_api_errors": 0,
             "skipped": True,
             "skip_reason": "commit-list-api-error",
         }
@@ -720,6 +721,7 @@ def reap_branch(
         "compensated_cancelled_push": 0,
         "preserved_pr_without_push_success": 0,
         "compensated_per_sha": {},
+        "sha_api_errors": 0,
     }
 
     for sha in shas:
@@ -731,8 +733,9 @@ def reap_branch(
         try:
             combined = get_combined_status(sha)
         except ApiError as e:
+            aggregate["sha_api_errors"] += 1
             print(
-                f"::warning::get_combined_status({sha[:10]}) failed; "
+                f"::error::get_combined_status({sha[:10]}) failed; "
                 f"skipping this SHA: {e}"
             )
             continue
@@ -819,6 +822,14 @@ def main() -> int:
             sort_keys=True,
         )
     )
+    # Observability: infra-failure → red. If the commit list could not be
+    # read or any per-SHA status fetch failed, the tick is incomplete and
+    # must be observable as a failure (non-zero exit) so the cron bot or
+    # runner surface alerts.
+    if counters.get("skipped"):
+        return 1
+    if counters.get("sha_api_errors", 0) > 0:
+        return 1
     return 0
 
 
