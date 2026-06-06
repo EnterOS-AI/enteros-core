@@ -585,6 +585,54 @@ def test_find_open_issue_raises_on_transient_error(drift_module, monkeypatch):
 
 
 # --------------------------------------------------------------------------
+# Pagination: search beyond page 1 so an existing issue on any page is found
+# --------------------------------------------------------------------------
+def test_find_open_issue_paginates_to_page_2(drift_module, monkeypatch):
+    """Issue exists on page 2 → paginate and find it."""
+    target = {"number": 99, "title": "[ci-drift] foo"}
+    filler = [{"number": i, "title": f"other-{i}"} for i in range(1, 51)]
+
+    class PaginatedStub:
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, method, path, *, body=None, query=None, expect_json=True):
+            self.calls.append((method, path, body, query))
+            page = int((query or {}).get("page", "1"))
+            if page == 1:
+                return 200, filler
+            if page == 2:
+                return 200, [target]
+            return 200, []
+
+    stub = PaginatedStub()
+    monkeypatch.setattr(drift_module, "api", stub)
+    assert drift_module.find_open_issue("[ci-drift] foo") == target
+    assert len(stub.calls) == 2
+
+
+def test_find_open_issue_stops_at_last_page(drift_module, monkeypatch):
+    """No match across pages → stop when a page has <50 results."""
+    filler = [{"number": i, "title": f"other-{i}"} for i in range(1, 51)]
+
+    class PaginatedStub:
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, method, path, *, body=None, query=None, expect_json=True):
+            self.calls.append((method, path, body, query))
+            page = int((query or {}).get("page", "1"))
+            if page == 1:
+                return 200, filler
+            return 200, []
+
+    stub = PaginatedStub()
+    monkeypatch.setattr(drift_module, "api", stub)
+    assert drift_module.find_open_issue("[ci-drift] foo") is None
+    assert len(stub.calls) == 2
+
+
+# --------------------------------------------------------------------------
 # Idempotent path: existing issue is PATCHed, NOT duplicated
 # --------------------------------------------------------------------------
 def test_file_or_update_patches_existing_issue(drift_module, monkeypatch):

@@ -552,23 +552,34 @@ def find_open_issue(title: str) -> dict | None:
     hourly; failing one cycle loudly is strictly better than silently
     duplicating.
 
-    Gitea issue search returns at most page=50 per page; one page is
-    enough as long as `[ci-drift]` issues are a tiny minority. (See
-    follow-up issue for Link-header pagination.)
+    Paginates through all open issues (limit=50 per page) until the
+    title is found or the result set is exhausted. Previously only one
+    page was fetched, causing duplicate [ci-drift] issues when the
+    existing tracking issue fell beyond page 1.
     """
-    _, results = api(
-        "GET",
-        f"/repos/{OWNER}/{NAME}/issues",
-        query={"state": "open", "type": "issues", "limit": "50"},
-    )
-    if not isinstance(results, list):
-        raise ApiError(
-            f"issue search returned non-list body (got {type(results).__name__})"
+    page = 1
+    while True:
+        _, results = api(
+            "GET",
+            f"/repos/{OWNER}/{NAME}/issues",
+            query={
+                "state": "open",
+                "type": "issues",
+                "limit": "50",
+                "page": str(page),
+            },
         )
-    for issue in results:
-        if issue.get("title") == title:
-            return issue
-    return None
+        if not isinstance(results, list):
+            raise ApiError(
+                f"issue search returned non-list body (got {type(results).__name__})"
+            )
+        for issue in results:
+            if issue.get("title") == title:
+                return issue
+        # Fewer than limit results means last page reached.
+        if len(results) < 50:
+            return None
+        page += 1
 
 
 def render_body(branch: str, findings: list[str], debug: dict) -> str:
