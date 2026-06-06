@@ -88,8 +88,9 @@ jobs:
     # surprises and keeps the routing rule discoverable in one place.
     runs-on: docker-host
     # mc#1982 Phase 3 (RFC §1): surface broken workflows without blocking.
-    # mc#1982: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
-    continue-on-error: true
+    # mc#1982: mask removed. If regressions appear, root-fix the underlying
+    # test — do NOT renew the mask silently.
+    continue-on-error: false
     outputs:
       handlers: ${{ steps.filter.outputs.handlers }}
     steps:
@@ -119,8 +120,9 @@ jobs:
     # exists). See detect-changes for the full routing rationale.
     runs-on: docker-host
     # mc#1982 Phase 3 (RFC §1): surface broken workflows without blocking.
-    # mc#1982: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
-    continue-on-error: true
+    # mc#1982: mask removed. If regressions appear, root-fix the underlying
+    # test — do NOT renew the mask silently.
+    continue-on-error: false
     env:
       # Unique name per run so concurrent jobs don't collide on the
       # bridge network. ${RUN_ID}-${RUN_ATTEMPT} is unique even across
@@ -241,7 +243,8 @@ jobs:
           # MUST exist for the integration tests to be meaningful. Hard-
           # fail if any didn't land — that would be a real regression we
           # want loud.
-          for tbl in delegations workspaces activity_logs pending_uploads; do
+          # workspace_schedules added for the #2149 scheduler integration tests.
+          for tbl in delegations workspaces activity_logs pending_uploads workspace_schedules; do
             if ! psql -h "${PG_HOST}" -U postgres -d molecule -tA \
                 -c "SELECT 1 FROM information_schema.tables WHERE table_name = '$tbl'" \
                 | grep -q 1; then
@@ -252,12 +255,35 @@ jobs:
           done
 
       - if: needs.detect-changes.outputs.handlers == 'true'
+        name: Preflight — INTEGRATION_DB_URL must be present
+        run: |
+          # Belt-and-suspenders: if the postgres-start step failed to
+          # export INTEGRATION_DB_URL, fail loud BEFORE go test can
+          # t.Skip its way to a green build. Closes the workflow-level
+          # fail-open gap identified in PR #2166 blocker #2.
+          if [ -z "${INTEGRATION_DB_URL:-}" ]; then
+            echo "::error::INTEGRATION_DB_URL is empty — postgres-start step did not export the connection string"
+            exit 1
+          fi
+          echo "INTEGRATION_DB_URL is set"
+
+      - if: needs.detect-changes.outputs.handlers == 'true'
         name: Run integration tests
         run: |
           # INTEGRATION_DB_URL is exported by the start-postgres step;
           # points at the per-run bridge IP, not 127.0.0.1, so concurrent
           # workflow runs don't fight over a host-net 5432 port.
           go test -tags=integration -timeout 5m -v ./internal/handlers/ -run "^TestIntegration_"
+
+      - if: needs.detect-changes.outputs.handlers == 'true'
+        name: Run scheduler integration tests (#2149)
+        run: |
+          # #2149: real-PG regression coverage for the scheduler firing loop
+          # (tick → A2A fire → write-back of last_run_at/next_run_at/run_count/
+          # activity_logs jsonb incl. invalid-UTF-8 sanitization + sweepPhantomBusy).
+          # Reuses the same migrated Postgres (workspace_schedules / activity_logs
+          # / workspaces all landed by the migration replay step above).
+          go test -tags=integration -timeout 5m -v ./internal/scheduler/ -run "^TestIntegration_"
 
       - if: failure() && needs.detect-changes.outputs.handlers == 'true'
         name: Diagnostic dump on failure

@@ -67,6 +67,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # bp-required: pending #718 — soak-then-promote, not in BP yet.
   verify:
     name: Regenerate providers artifact and fail on drift
     runs-on: ubuntu-latest
@@ -89,7 +90,13 @@ jobs:
           # checked-in artifact; exit 1 (RED) on any drift. This is the
           # single source of the gate's verdict — the same code path
           # `go test ./cmd/gen-providers` exercises.
-          go run ./cmd/gen-providers -check
+          if ! go run ./cmd/gen-providers -check; then
+            echo "::error::workspace-server/internal/providers/gen/registry_gen.go is stale (drifted from providers.yaml)."
+            echo "Regenerate and commit it (run from repo root):"
+            echo "  make gen          # native (needs a local Go toolchain)"
+            echo "  make gen-docker   # Docker only — no local Go needed"
+            exit 1
+          fi
 
       - name: Belt-and-braces — regenerate in place and assert clean tree
         run: |
@@ -100,7 +107,9 @@ jobs:
           go generate ./...
           if ! git diff --quiet -- internal/providers/gen/registry_gen.go; then
             echo "::error::workspace-server/internal/providers/gen/registry_gen.go drifted from providers.yaml."
-            echo "Run 'go generate ./...' (or 'go run ./cmd/gen-providers') in workspace-server/ and commit the result."
+            echo "Regenerate and commit it. No local Go? Use Docker (run from repo root):"
+            echo "  make gen          # native (needs a local Go toolchain)"
+            echo "  make gen-docker   # Docker only — no local Go needed"
             git --no-pager diff -- internal/providers/gen/registry_gen.go | head -80
             exit 1
           fi

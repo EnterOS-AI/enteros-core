@@ -26,7 +26,26 @@
 #      the workspace stuck on 'online' indefinitely.)
 #
 # Hibernation is intentionally NOT covered here — it has its own timing
-# model (idle threshold) and warrants a separate harness.
+# model (idle threshold) and warrants a separate harness. (The
+# pause→resume + hibernate→wake transitions for PLATFORM-compute runtimes
+# are covered by test_staging_full_saas.sh step 10b.)
+#
+# BYO meta-runtime arms (kimi, kimi-cli) — added 2026-06-05:
+#   kimi and kimi-cli are BYO-compute meta-runtimes (isExternalLikeRuntime:
+#   runtime_registry.go:141-147) that go through the SAME external/poll
+#   provisioning path as `external` — create with external:true →
+#   awaiting_agent, register → online — but with their runtime LABEL
+#   PRESERVED (workspace.go:752-770 normalizeExternalRuntime keeps the
+#   specific label, does NOT coerce to generic "external", so the canvas
+#   shows the right runtime). They had ONLY validation/unit coverage and
+#   were NEVER provisioned→online in any e2e. Step 9 adds, for EACH of
+#   {kimi, kimi-cli}: create → assert awaiting_agent + label-preserved →
+#   register(poll) → assert online + label-preserved → A2A → assert the
+#   poll-mode {status:"queued"} envelope (a2a_proxy.go:462-477). The A2A
+#   arm proves the a2a proxy routes a BYO meta-runtime to the poll queue
+#   (200 + queued) rather than 404/500 — the meaningful round-trip for a
+#   workspace with no standing live agent. A real BYO-agent COMPLETION
+#   needs a standing kimi BYO cell (flagged for the CTO in the PR body).
 #
 # Required env (mirrors test_staging_full_saas.sh):
 #   MOLECULE_CP_URL          default: https://staging-api.moleculesai.app
@@ -40,9 +59,25 @@
 #   E2E_INTENTIONAL_FAILURE     1 → break a step on purpose to verify
 #                               the EXIT trap still tears down (mirrors
 #                               the full-saas harness's safety net).
+#   E2E_REQUIRE_LIVE            1 → fail-closed if the harness exits 0
+#                               WITHOUT having driven all four
+#                               awaiting_agent transitions. CI sets this
+#                               so a future skip / early-return can never
+#                               masquerade as a green run. Mirrors CP
+#                               serving-e2e SERVING_E2E_REQUIRE_LIVE.
+#   E2E_STALE_POLL_DEADLINE_SECS  default 240. Upper bound for the
+#                               heartbeat-staleness READINESS poll (step
+#                               6). Replaces the old fixed sleep+one-shot
+#                               assert that raced the sweep cadence.
+#   E2E_TRANSIENT_RETRIES      default 8. Bounded retries for register /
+#                               re-register against transient edge errors
+#                               (502/503/504 from Caddy during cold TLS /
+#                               agent boot). Mirrors the full-saas
+#                               cold-start retry loop — NOT a bare sleep.
 #
 # Exit codes: 0 happy, 1 generic, 2 missing env, 3 provision timeout,
-# 4 teardown leak.
+# 4 teardown leak, 5 REQUIRE_LIVE violation (exited 0 having validated
+# nothing).
 
 set -euo pipefail
 
@@ -51,6 +86,13 @@ ADMIN_TOKEN="${MOLECULE_ADMIN_TOKEN:?MOLECULE_ADMIN_TOKEN required — Railway s
 PROVISION_TIMEOUT_SECS="${E2E_PROVISION_TIMEOUT_SECS:-900}"
 RUN_ID_SUFFIX="${E2E_RUN_ID:-$(date +%H%M%S)-$$}"
 STALE_WAIT_SECS="${E2E_STALE_WAIT_SECS:-180}"
+# Readiness-poll deadline for the sweep transition (step 6). Must exceed
+# STALE_WAIT_SECS (the no-heartbeat window) by at least one sweep
+# interval so a slightly-late sweep tick is polled-for, not misread as a
+# stuck 'online'. 240 = 180s window + 60s sweep-cadence headroom.
+STALE_POLL_DEADLINE_SECS="${E2E_STALE_POLL_DEADLINE_SECS:-240}"
+TRANSIENT_RETRIES="${E2E_TRANSIENT_RETRIES:-8}"
+REQUIRE_LIVE="${E2E_REQUIRE_LIVE:-0}"
 
 SLUG="e2e-ext-$(date +%Y%m%d)-${RUN_ID_SUFFIX}"
 SLUG=$(echo "$SLUG" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-' | head -c 32)
@@ -58,6 +100,66 @@ SLUG=$(echo "$SLUG" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-' | head -c 32
 log()  { echo "[$(date +%H:%M:%S)] $*"; }
 fail() { echo "[$(date +%H:%M:%S)] ❌ $*" >&2; exit 1; }
 ok()   { echo "[$(date +%H:%M:%S)] ✅ $*"; }
+
+# REQUIRE_LIVE bookkeeping: count the four awaiting_agent transitions the
+# test is contracted to prove. The EXIT trap fails-closed (exit 5) if the
+# script reaches a clean exit without all four — so a silent skip, an
+# early `return 0`, or a refactor that drops a step can never show green.
+TRANSITIONS_VERIFIED=0
+EXPECTED_TRANSITIONS=4
+require_transition() {  # $1 = human label
+  TRANSITIONS_VERIFIED=$((TRANSITIONS_VERIFIED + 1))
+  log "    [require-live] transition ${TRANSITIONS_VERIFIED}/${EXPECTED_TRANSITIONS} proven: $1"
+}
+
+# Redact bearer tokens from any HTTP body before logging (mirrors the
+# full-saas sanitize_http_body so transient-error logs never leak creds).
+sanitize_http_body() {
+  sed -E 's/(Bearer|token)[[:space:]]+[A-Za-z0-9._-]+/\1 REDACTED/g'
+}
+
+# Bounded retry-on-transient for POST /registry/register. The tenant edge
+# (Caddy) returns 502/503/504 with an identifiable body while TLS / the
+# workspace agent finishes cold-booting — a single shot here was the
+# un-named flake (a transient edge error misread as a register failure).
+# This mirrors the full-saas cold-start loop (test_staging_full_saas.sh
+# ~L780-816): retry ONLY on a transient TRANSPORT class (5xx + body
+# match), bounded by TRANSIENT_RETRIES, and FAIL CLOSED (non-zero) once
+# the budget is spent. It deliberately does NOT retry on a 4xx — that's a
+# real contract bug (e.g. wrong payload field) and must stay red.
+# Sets REGISTER_RESP (body + trailing "HTTP_CODE=NNN" line) on success;
+# returns non-zero (caller `fail`s) when the bounded budget is exhausted.
+register_with_retry() {  # $1 = step label, $2 = request body
+  local label="$1" body="$2"
+  local attempt code resp safe
+  for attempt in $(seq 1 "$TRANSIENT_RETRIES"); do
+    set +e
+    resp=$(curl -sS --max-time 30 -w "\nHTTP_CODE=%{http_code}" -X POST \
+      "$TENANT_URL/registry/register" \
+      -H "Authorization: Bearer $WS_AUTH_TOKEN" \
+      -H "X-Molecule-Org-Id: $ORG_ID" \
+      -H "Content-Type: application/json" \
+      -d "$body")
+    set -e
+    code=$(printf '%s' "$resp" | sed -n 's/^HTTP_CODE=//p' | tail -n1)
+    code=${code:-000}
+    if [ "$code" = "200" ]; then
+      REGISTER_RESP="$resp"
+      return 0
+    fi
+    safe=$(printf '%s' "$resp" | sanitize_http_body | head -c 300)
+    # Retry ONLY on a transient transport class; a 4xx is a real bug.
+    if echo "$code" | grep -Eq '^(502|503|504)$' \
+       && echo "$safe" | grep -Eqi 'Service Unavailable|Bad Gateway|Gateway Timeout|error code: 502|error code: 504|workspace agent unreachable|connection refused|no healthy upstream'; then
+      log "    ${label} transient $code attempt ${attempt}/${TRANSIENT_RETRIES}: $safe"
+      [ "$attempt" -lt "$TRANSIENT_RETRIES" ] && { sleep 10; continue; }
+    fi
+    # Non-transient (4xx, or unrecognized 5xx body): stop and fail closed.
+    REGISTER_RESP="$resp"
+    return 1
+  done
+  return 1
+}
 
 CURL_COMMON=(-sS --fail-with-body --max-time 30)
 
@@ -98,8 +200,19 @@ cleanup_org() {
   fi
   ok "Teardown clean — no orphan resources for $SLUG (${elapsed}s)"
 
+  # REQUIRE_LIVE fail-closed gate. Only meaningful on an OTHERWISE-CLEAN
+  # exit (entry_rc==0): a script that completed all steps but somehow did
+  # not register all four transitions (a skip, an early return, a dropped
+  # assertion in a refactor) must NOT report success. A non-zero entry_rc
+  # already carries its own failure semantics — don't mask it with 5.
+  if [ "$entry_rc" = "0" ] && [ "${REQUIRE_LIVE}" = "1" ] \
+     && [ "$TRANSITIONS_VERIFIED" -lt "$EXPECTED_TRANSITIONS" ]; then
+    echo "❌ REQUIRE_LIVE: exited 0 but only ${TRANSITIONS_VERIFIED}/${EXPECTED_TRANSITIONS} awaiting_agent transitions were proven — refusing to report green." >&2
+    exit 5
+  fi
+
   case "$entry_rc" in
-    0|1|2|3|4) ;;
+    0|1|2|3|4|5) ;;
     *) exit 1 ;;
   esac
 }
@@ -125,10 +238,17 @@ admin_call() {
 
 # ─── 1. Create org ──────────────────────────────────────────────────────
 log "1/8 Creating org $SLUG..."
+# admin_call inherits CURL_COMMON's --fail-with-body: a non-2xx makes curl
+# exit 22, which under `set -euo pipefail` would abort this bare command
+# substitution BEFORE the `fail "... missing 'id'"` handler below can print
+# the body. set +e / `|| true` keeps the 22 from tripping `set -e`; curl
+# still wrote the body, so CREATE_RESP holds it and the id-check surfaces why.
+set +e
 CREATE_RESP=$(admin_call POST /cp/admin/orgs \
   -d "{\"slug\":\"$SLUG\",\"name\":\"E2E ext $SLUG\",\"owner_user_id\":\"e2e-runner:$SLUG\"}")
-ORG_ID=$(echo "$CREATE_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('id',''))")
-[ -z "$ORG_ID" ] && fail "Org create response missing 'id'"
+set -e
+ORG_ID=$(echo "$CREATE_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('id',''))" 2>/dev/null || echo "")
+[ -z "$ORG_ID" ] && fail "Org create response missing 'id': $(printf '%s' "$CREATE_RESP" | sanitize_http_body 2>/dev/null || printf '%s' "$CREATE_RESP")"
 ok "Org created (id=$ORG_ID)"
 
 # ─── 2. Wait for tenant provisioning ────────────────────────────────────
@@ -221,8 +341,13 @@ tenant_call() {
 # on whatever the create handler set first (typically 'provisioning')
 # because the follow-up UPDATE failed the enum cast.
 log "4/8 Creating external workspace (no URL — exercises workspace.go:333)..."
+# tenant_call inherits CURL_COMMON's --fail-with-body: guard the same way as
+# the org create above so a non-2xx returns the body to the id/status checks
+# below instead of aborting opaquely on curl exit 22.
+set +e
 WS_CREATE_RESP=$(tenant_call POST /workspaces \
   -d '{"name":"ext-e2e","runtime":"external","external":true}')
+set -e
 
 WS_ID=$(echo "$WS_CREATE_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('id',''))")
 WS_RESP_STATUS=$(echo "$WS_CREATE_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))")
@@ -235,7 +360,7 @@ try:
 except Exception:
     print('')
 ")
-[ -z "$WS_ID" ] && fail "Workspace create missing id: $WS_CREATE_RESP"
+[ -z "$WS_ID" ] && fail "Workspace create missing id: $(printf '%s' "$WS_CREATE_RESP" | sanitize_http_body 2>/dev/null || printf '%s' "$WS_CREATE_RESP")"
 [ "$WS_RESP_STATUS" != "awaiting_agent" ] && fail "Expected response status=awaiting_agent, got $WS_RESP_STATUS"
 ok "Workspace created (id=$WS_ID, response status=awaiting_agent)"
 
@@ -248,6 +373,7 @@ GET_RESP=$(tenant_call GET "/workspaces/$WS_ID")
 DB_STATUS=$(echo "$GET_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))")
 [ "$DB_STATUS" != "awaiting_agent" ] && fail "DB row status=$DB_STATUS (expected awaiting_agent — migration 046 likely not applied)"
 ok "DB row stored as awaiting_agent (proof migration 046 applied)"
+require_transition "create: provisioning → awaiting_agent (DB-verified)"
 
 # ─── 5. Register the workspace (transitions to online) ──────────────────
 # Pre-fix this path was actually fine because it writes 'online', a value
@@ -277,20 +403,20 @@ log "5/8 Registering workspace via /registry/register..."
 #   url           — accepted but not dispatched-to in poll mode, so
 #                   example.invalid is a valid sentinel.
 REGISTER_BODY=$(printf '{"id":"%s","url":"https://example.invalid:443","delivery_mode":"poll","agent_card":{"name":"e2e-ext","skills":[{"id":"echo","name":"Echo"}]}}' "$WS_ID")
-# Disable --fail-with-body for this one call so a 4xx surfaces the response
-# body (the bare CURL_COMMON would `set -e`-kill before we could log it).
-REGISTER_RESP=$(curl -sS --max-time 30 -w "\nHTTP_CODE=%{http_code}" -X POST "$TENANT_URL/registry/register" \
-  -H "Authorization: Bearer $WS_AUTH_TOKEN" \
-  -H "X-Molecule-Org-Id: $ORG_ID" \
-  -H "Content-Type: application/json" \
-  -d "$REGISTER_BODY") || true
-log "    register response: $(echo "$REGISTER_RESP" | head -c 300)"
-echo "$REGISTER_RESP" | grep -q "HTTP_CODE=200" || fail "register returned non-200 — see body above"
+# Bounded retry-on-transient (see register_with_retry). The previous
+# single-shot here would `fail` on a cold-boot 502 from the tenant edge —
+# an un-named transient misread as a register break. The helper retries
+# ONLY that class and fails closed on a real 4xx or an exhausted budget.
+REGISTER_RESP=""
+register_with_retry "register" "$REGISTER_BODY" \
+  || fail "register returned non-200 after bounded retries — body: $(printf '%s' "$REGISTER_RESP" | sanitize_http_body | head -c 300)"
+log "    register response: $(echo "$REGISTER_RESP" | sanitize_http_body | head -c 300)"
 
 GET_RESP=$(tenant_call GET "/workspaces/$WS_ID")
 ONLINE_STATUS=$(echo "$GET_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))")
 [ "$ONLINE_STATUS" != "online" ] && fail "Expected online after register, got $ONLINE_STATUS"
 ok "Workspace transitioned to online"
+require_transition "register: awaiting_agent → online"
 
 # Confirm the register handler echoed back delivery_mode=poll. We read
 # this from the register RESPONSE, not the workspace GET response, because
@@ -310,38 +436,165 @@ fi
 # This is the SECOND silent-failure path (registry/healthsweep.go's
 # sweepStaleRemoteWorkspaces). Pre-migration-046 the heartbeat-staleness
 # UPDATE silently failed and the workspace stuck on 'online' forever
-# even though no agent was alive. We wait the full window + a sweep
-# interval and assert the row transitions back to 'awaiting_agent'.
-log "6/8 Waiting ${STALE_WAIT_SECS}s for heartbeat-staleness sweep (no heartbeat sent)..."
+# even though no agent was alive.
+#
+# FLAKE FIX (named: sweep-cadence race). The old code did a FIXED
+# `sleep $STALE_WAIT_SECS` then a SINGLE assert. The staleness sweep is a
+# periodic tick (REMOTE_LIVENESS_STALE_AFTER + a sweep interval); if the
+# tick that flips the row lands even one second after the fixed sleep, the
+# one-shot GET reads 'online' and the test fails — a real transition,
+# misread as a flake because the assert was racing the sweep cadence.
+# Replace with: sleep through the mandatory no-heartbeat window ONCE (the
+# sweep cannot fire before the window elapses, so polling earlier is
+# pointless), then READINESS-POLL for the awaiting_agent transition up to
+# STALE_POLL_DEADLINE_SECS, hard-failing with a clear message at the
+# deadline. Deterministic: a slow-but-working sweep passes; a genuinely
+# stuck 'online' still fails (now with how long we actually waited).
+log "6/8 Waiting ${STALE_WAIT_SECS}s no-heartbeat window, then polling for sweep (up to ${STALE_POLL_DEADLINE_SECS}s total)..."
+[ "$STALE_POLL_DEADLINE_SECS" -le "$STALE_WAIT_SECS" ] && \
+  fail "Misconfigured: STALE_POLL_DEADLINE_SECS ($STALE_POLL_DEADLINE_SECS) must exceed STALE_WAIT_SECS ($STALE_WAIT_SECS) by at least one sweep interval"
 sleep "$STALE_WAIT_SECS"
 
-GET_RESP=$(tenant_call GET "/workspaces/$WS_ID")
-STALE_STATUS=$(echo "$GET_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))")
-[ "$STALE_STATUS" != "awaiting_agent" ] && \
-  fail "After ${STALE_WAIT_SECS}s with no heartbeat, expected status=awaiting_agent (sweep transition), got $STALE_STATUS — migration 046 likely not applied OR sweep not running"
+STALE_DEADLINE=$(( $(date +%s) + (STALE_POLL_DEADLINE_SECS - STALE_WAIT_SECS) ))
+STALE_STATUS=""
+while true; do
+  GET_RESP=$(tenant_call GET "/workspaces/$WS_ID")
+  STALE_STATUS=$(echo "$GET_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))")
+  [ "$STALE_STATUS" = "awaiting_agent" ] && break
+  if [ "$(date +%s)" -gt "$STALE_DEADLINE" ]; then
+    fail "After ${STALE_POLL_DEADLINE_SECS}s with no heartbeat, status still '$STALE_STATUS' (expected awaiting_agent sweep transition) — migration 046 likely not applied OR sweep not running"
+  fi
+  sleep 10
+done
 ok "Heartbeat-staleness sweep transitioned online → awaiting_agent (proof healthsweep.go fix working)"
+require_transition "sweep: online → awaiting_agent (no heartbeat)"
 
 # ─── 7. Re-register and confirm we can come back online ─────────────────
 # This proves the awaiting_agent state is recoverable (re-registrable),
 # which is the whole point of using it instead of 'offline'.
 log "7/8 Re-registering after stale → confirming recovery to online..."
 # Same payload contract as step 5 (id + agent_card both required). See note
-# there for why workspace_id would 400.
-REREG_RESP=$(curl -sS --max-time 30 -w "\nHTTP_CODE=%{http_code}" -X POST "$TENANT_URL/registry/register" \
-  -H "Authorization: Bearer $WS_AUTH_TOKEN" \
-  -H "X-Molecule-Org-Id: $ORG_ID" \
-  -H "Content-Type: application/json" \
-  -d "$REGISTER_BODY") || true
-log "    re-register response: $(echo "$REREG_RESP" | head -c 300)"
-echo "$REREG_RESP" | grep -q "HTTP_CODE=200" || fail "re-register returned non-200 — see body above"
+# there for why workspace_id would 400. Same bounded retry-on-transient.
+REGISTER_RESP=""
+register_with_retry "re-register" "$REGISTER_BODY" \
+  || fail "re-register returned non-200 after bounded retries — body: $(printf '%s' "$REGISTER_RESP" | sanitize_http_body | head -c 300)"
+log "    re-register response: $(echo "$REGISTER_RESP" | sanitize_http_body | head -c 300)"
 
 GET_RESP=$(tenant_call GET "/workspaces/$WS_ID")
 RECOVERED_STATUS=$(echo "$GET_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))")
 [ "$RECOVERED_STATUS" != "online" ] && \
   fail "Expected re-register to return workspace to online, got $RECOVERED_STATUS"
 ok "Re-register succeeded — awaiting_agent → online (operator-recoverable)"
+require_transition "re-register: awaiting_agent → online (recovery)"
+
+# ─── 7b. BYO meta-runtime arms: kimi + kimi-cli ─────────────────────────
+# kimi and kimi-cli are BYO-compute meta-runtimes (isExternalLikeRuntime).
+# They share the external/poll provisioning path but PRESERVE their runtime
+# label (workspace.go normalizeExternalRuntime). They had no provision→online
+# e2e until now. For EACH: create(external:true, runtime=<rt>) → assert
+# awaiting_agent + label preserved → register(poll) → assert online + label
+# preserved → A2A → assert the poll-mode {status:"queued"} envelope.
+#
+# Why poll-mode {queued} is the A2A assertion (not a real completion): there
+# is no standing live BYO agent in staging, so the meaningful round-trip is
+# that the a2a proxy ROUTES a BYO meta-runtime to the poll queue (HTTP 200 +
+# {status:"queued", delivery_mode:"poll"}, a2a_proxy.go:462-477) instead of
+# 404/500. A real BYO-agent COMPLETION needs a standing kimi BYO cell — see
+# the CTO flag in the PR body.
+byo_meta_runtime_arm() {  # $1 = runtime label (kimi | kimi-cli)
+  local rt="$1"
+  local resp wid status auth get_resp db_status reg_dm online_status
+  log "    [$rt] create (external:true, runtime=$rt)..."
+  resp=$(tenant_call POST /workspaces \
+    -d "$(printf '{"name":"ext-%s-e2e","runtime":"%s","external":true}' "$rt" "$rt")")
+  wid=$(echo "$resp" | python3 -c "import json,sys; print(json.load(sys.stdin).get('id',''))")
+  status=$(echo "$resp" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))")
+  auth=$(echo "$resp" | python3 -c "
+import json,sys
+try:
+    d=json.load(sys.stdin); conn=d.get('connection') or {}
+    print(conn.get('auth_token','') or d.get('auth_token',''))
+except Exception:
+    print('')
+")
+  [ -z "$wid" ] && fail "[$rt] create missing id: $resp"
+  [ "$status" = "awaiting_agent" ] || fail "[$rt] create status='$status' (expected awaiting_agent — external/poll path)"
+  [ -z "$auth" ] && fail "[$rt] create returned no workspace auth token — register impossible"
+
+  # Assert the runtime LABEL was preserved (NOT coerced to generic 'external').
+  get_resp=$(tenant_call GET "/workspaces/$wid")
+  db_status=$(echo "$get_resp" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))")
+  local db_runtime
+  db_runtime=$(echo "$get_resp" | python3 -c "import json,sys; print(json.load(sys.stdin).get('runtime',''))")
+  [ "$db_status" = "awaiting_agent" ] || fail "[$rt] DB row status=$db_status (expected awaiting_agent)"
+  [ "$db_runtime" = "$rt" ] || fail "[$rt] runtime label coerced to '$db_runtime' (expected '$rt' — normalizeExternalRuntime must PRESERVE the BYO meta-runtime label, workspace.go:752-770)"
+  ok "    [$rt] create → awaiting_agent, runtime label preserved ✓"
+
+  # register(poll) → online. Reuse register_with_retry by setting WS_AUTH_TOKEN
+  # (the helper reads it as a global). REGISTER_RESP is set by the helper.
+  WS_AUTH_TOKEN="$auth"
+  local body
+  body=$(printf '{"id":"%s","url":"https://example.invalid:443","delivery_mode":"poll","agent_card":{"name":"e2e-%s","skills":[{"id":"echo","name":"Echo"}]}}' "$wid" "$rt")
+  REGISTER_RESP=""
+  register_with_retry "[$rt] register" "$body" \
+    || fail "[$rt] register returned non-200 after bounded retries — body: $(printf '%s' "$REGISTER_RESP" | sanitize_http_body | head -c 300)"
+  online_status=$(tenant_call GET "/workspaces/$wid" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))")
+  [ "$online_status" = "online" ] || fail "[$rt] expected online after register, got $online_status"
+  reg_dm=$(echo "$REGISTER_RESP" | head -n1 | python3 -c "import json,sys; print(json.load(sys.stdin).get('delivery_mode',''))" 2>/dev/null || echo "")
+  [ "$reg_dm" = "poll" ] || fail "[$rt] register response delivery_mode='$reg_dm' (expected poll)"
+  ok "    [$rt] register → online (delivery_mode=poll) ✓"
+
+  # A2A → assert poll-mode {status:"queued"} envelope. Bounded retry on the
+  # transient cold-edge 5xx class; a 4xx/non-queued 2xx is a real bug.
+  local a2a_payload a2a_tmp a2a_code a2a_rc a2a_status attempt
+  a2a_payload=$(python3 -c "
+import json, uuid
+print(json.dumps({
+    'jsonrpc':'2.0','method':'message/send','id':'e2e-byo-1',
+    'params':{'message':{'role':'user','messageId':f'e2e-{uuid.uuid4().hex[:8]}',
+        'parts':[{'kind':'text','text':'BYO meta-runtime poll-route smoke. Respond: OK'}]}}
+}))
+")
+  a2a_tmp=$(mktemp -t byo_a2a.XXXXXX)
+  for attempt in $(seq 1 8); do
+    : >"$a2a_tmp"
+    set +e
+    a2a_code=$(curl -sS --max-time 60 -X POST "$TENANT_URL/workspaces/$wid/a2a" \
+      -H "Authorization: Bearer $TENANT_TOKEN" \
+      -H "X-Molecule-Org-Id: $ORG_ID" \
+      -H "Content-Type: application/json" \
+      -d "$a2a_payload" -o "$a2a_tmp" -w '%{http_code}' 2>/dev/null)
+    a2a_rc=$?
+    set -e
+    a2a_code=${a2a_code:-000}
+    if [ "$a2a_rc" = "0" ] && [ "$a2a_code" = "200" ]; then break; fi
+    if echo "$a2a_code" | grep -Eq '^(502|503|504)$' && [ "$attempt" -lt 8 ]; then
+      log "    [$rt] A2A transient $a2a_code attempt $attempt/8"; sleep 10; continue
+    fi
+    break
+  done
+  a2a_status=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('status',''))" "$a2a_tmp" 2>/dev/null || echo "")
+  local a2a_dm
+  a2a_dm=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('delivery_mode',''))" "$a2a_tmp" 2>/dev/null || echo "")
+  rm -f "$a2a_tmp"
+  [ "$a2a_rc" = "0" ] && [ "$a2a_code" = "200" ] \
+    || fail "[$rt] A2A POST failed (rc=$a2a_rc, http=$a2a_code) — a BYO meta-runtime poll-mode A2A must 200 with a queued envelope, not error"
+  [ "$a2a_status" = "queued" ] && [ "$a2a_dm" = "poll" ] \
+    || fail "[$rt] A2A returned status='$a2a_status' delivery_mode='$a2a_dm' (expected queued/poll — a2a proxy must route a BYO meta-runtime to the poll queue, a2a_proxy.go:462-477)"
+  ok "    [$rt] A2A → poll-mode queued envelope ✓ (provision→online→A2A proven for $rt)"
+}
+
+log "7c/8 BYO meta-runtime arms (kimi, kimi-cli) — provision→online→A2A..."
+byo_meta_runtime_arm "kimi"
+byo_meta_runtime_arm "kimi-cli"
+ok "BYO meta-runtime arms passed for kimi + kimi-cli"
 
 # ─── 8. Done — cleanup runs in the EXIT trap ───────────────────────────
+# REQUIRE_LIVE belt-and-braces: assert here too (in addition to the EXIT
+# trap) so the failure surfaces in step order, not only post-teardown.
+if [ "${REQUIRE_LIVE}" = "1" ] && [ "$TRANSITIONS_VERIFIED" -lt "$EXPECTED_TRANSITIONS" ]; then
+  fail "REQUIRE_LIVE: only ${TRANSITIONS_VERIFIED}/${EXPECTED_TRANSITIONS} transitions proven at end of run"
+fi
 log "8/8 All four awaiting_agent transitions verified."
 log "═══════════════════════════════════════════════════════════════════"
 ok "External-runtime E2E PASSED on $SLUG"

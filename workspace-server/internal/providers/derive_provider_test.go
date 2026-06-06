@@ -99,10 +99,16 @@ func TestDeriveProvider_UnregisteredErrors(t *testing.T) {
 		runtime string
 		model   string
 	}{
-		// gpt-* is OpenAI — not in claude-code's native set.
+		// gpt-* is OpenAI — not in claude-code's native set (no openai arm;
+		// the platform-shared openai vendor is never wired into a BYOK runtime).
 		{"claude-code", "gpt-5.5"},
-		// deepseek is a catalog provider but in NO runtime's native set.
-		{"claude-code", "deepseek-v4-pro"},
+		// qwen-* is alibaba — a catalog provider NOT wired into claude-code
+		// (cp#529 wires alibaba only into hermes; claude-code's name-only BYOK
+		// arms are zai/deepseek/xiaomi-mimo). So it stays unregistered here.
+		// (NB: deepseek-* IS now routable on claude-code via the deepseek
+		// name-only arm — see the routability tests — so it is no longer a valid
+		// "unregistered" example; qwen replaces it.)
+		{"claude-code", "qwen-max"},
 		// codex is OpenAI-only — a kimi id is unregistered for it.
 		{"codex", "kimi-for-coding"},
 		// a slug no provider in the manifest matches at all.

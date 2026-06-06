@@ -876,8 +876,9 @@ func (h *WorkspaceHandler) runRestartCycle(workspaceID string) {
 	h.provisionWorkspaceAutoSync(workspaceID, "", nil, payload)
 	// sendRestartContext is a one-way notification to the new container; safe
 	// to fire async — the next restart cycle won't depend on it completing.
-	// Tracked via goAsync so the test harness can drain it before the
-	// global db.DB swap (sendRestartContext reads db.DB).
+	// Tracked via h.goAsync so tests can wait for it via h.asyncWG before
+	// closing the sqlmock. Without this, untracked goroutines hit the restored
+	// mock and cause "was not expected" errors in parallel CI execution (mc#1264).
 	h.goAsync(func() { h.sendRestartContext(workspaceID, restartData) })
 }
 

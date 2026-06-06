@@ -710,6 +710,44 @@ func (h *SecretsHandler) SetModel(c *gin.Context) {
 		return
 	}
 
+	// issue #2172: validate the model against the registry before persisting.
+	// Empty model clears the override — skip validation (MODEL_REQUIRED owns
+	// the empty case at create time; clearing is always allowed).
+	if body.Model != "" {
+		var runtime string
+		if err := db.DB.QueryRowContext(ctx,
+			`SELECT runtime FROM workspaces WHERE id = $1`, workspaceID,
+		).Scan(&runtime); err != nil {
+			if err == sql.ErrNoRows {
+				c.JSON(http.StatusNotFound, gin.H{"error": "workspace not found"})
+				return
+			}
+			log.Printf("SetModel: runtime lookup failed for %s: %v", workspaceID, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read workspace runtime"})
+			return
+		}
+		if ok, why := validateRegisteredModelForRuntime(runtime, body.Model); !ok {
+			log.Printf("SetModel: 422 UNREGISTERED_MODEL_FOR_RUNTIME (runtime=%q model=%q): %s", runtime, body.Model, why)
+			c.JSON(http.StatusUnprocessableEntity, gin.H{
+				"error":   why,
+				"runtime": runtime,
+				"model":   body.Model,
+				"code":    "UNREGISTERED_MODEL_FOR_RUNTIME",
+			})
+			return
+		}
+		if ok, why := validateDerivedProviderInRegistry(runtime, body.Model); !ok {
+			log.Printf("SetModel: 422 DERIVED_PROVIDER_NOT_IN_REGISTRY (runtime=%q model=%q): %s", runtime, body.Model, why)
+			c.JSON(http.StatusUnprocessableEntity, gin.H{
+				"error":   why,
+				"runtime": runtime,
+				"model":   body.Model,
+				"code":    "DERIVED_PROVIDER_NOT_IN_REGISTRY",
+			})
+			return
+		}
+	}
+
 	if err := setModelSecret(ctx, workspaceID, body.Model); err != nil {
 		log.Printf("SetModel error: %v", err)
 		if body.Model == "" {

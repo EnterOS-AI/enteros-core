@@ -129,7 +129,7 @@ func (h *WorkspaceHandler) provisionWorkspaceOpts(workspaceID, templatePath stri
 							workspaceID, filepath.Base(runtimeTemplate))
 						templatePath = runtimeTemplate
 						// Rebuild cfg with the recovered template path so Start() sees it.
-						cfg = h.buildProvisionerConfig(ctx, workspaceID, templatePath, configFiles, payload, prepared.EnvVars, prepared.PluginsPath)
+						cfg = h.buildProvisionerConfig(ctx, workspaceID, templatePath, configFiles, payload, prepared.EnvVars, prepared.Config.WorkspaceSecretKeys, prepared.PluginsPath)
 						cfg.ResetClaudeSession = resetClaudeSession
 						recovered = true
 						break
@@ -281,6 +281,7 @@ func (h *WorkspaceHandler) buildProvisionerConfig(
 	configFiles map[string][]byte,
 	payload models.CreateWorkspacePayload,
 	envVars map[string]string,
+	workspaceSecretKeys map[string]struct{},
 	pluginsPath string,
 ) provisioner.WorkspaceConfig {
 	// Per-workspace workspace_dir takes priority over global WORKSPACE_DIR env var.
@@ -331,14 +332,20 @@ func (h *WorkspaceHandler) buildProvisionerConfig(
 		InstanceType:    payload.Compute.InstanceType,
 		DiskGB:          int32(payload.Compute.Volume.RootGB),
 		DataPersistence: payload.Compute.DataPersistence,
+		Provider:        payload.Compute.Provider,
 		Display: provisioner.WorkspaceDisplayConfig{
 			Mode:     payload.Compute.Display.Mode,
 			Width:    payload.Compute.Display.Width,
 			Height:   payload.Compute.Display.Height,
 			Protocol: payload.Compute.Display.Protocol,
 		},
-		EnvVars:     envVars,
-		PlatformURL: h.platformURL,
+		EnvVars: envVars,
+		// Forensic #145: positive provenance set so the SCM-write-token guard
+		// (cp_provisioner.Start) exempts a workspace-authored GITEA_TOKEN from
+		// the operator-bleed strip while still stripping global/persona-merged
+		// SCM tokens. Carried by both Docker- and CP-mode configs.
+		WorkspaceSecretKeys: workspaceSecretKeys,
+		PlatformURL:         h.platformURL,
 		// Image left empty — molecule-core's runtime_image_pins table (mig
 		// 047, dead reader removed by RFC internal#617 / task #335) was an
 		// aspirational SSOT that never received a writer. CP's
@@ -613,6 +620,32 @@ func (h *WorkspaceHandler) ensureDefaultConfig(workspaceID string, payload model
 	if model == "" {
 		log.Printf("ensureDefaultConfig: workspace %s reached provisioning with empty model — Create handler should have rejected this; rendering empty model: \"\" in config.yaml (workspace will boot not_configured)", workspaceID)
 	}
+
+	// Derive the provider from the providers manifest and stamp it into the
+	// generated config BEFORE claude-code model normalization strips the
+	// slash-prefix. DeriveProvider needs the FULL, un-normalized model id
+	// (e.g. "moonshot/kimi-k2.6") for the exact-id match that resolves the
+	// canvas claude-code case to provider=platform — normalizing to
+	// "kimi-k2.6" first would lose that match.
+	//
+	// Why this exists (RFC#340 Fix A): a canvas-created claude-code workspace
+	// with model "moonshot/kimi-k2.6" booted NOT_CONFIGURED — the adapter
+	// derived provider="moonshot" (slash-split of the model id) which is not
+	// in the providers registry. CP bakes `provider: platform` via heredoc,
+	// but the cp#329 config-bundle fetch overwrites /configs/config.yaml with
+	// THIS (previously providerless) bundle version, so molecule-runtime
+	// config.py re-derived the wrong provider. Stamping the manifest-derived
+	// provider here (mirroring CP's buildModelProviderYAML shape) makes the
+	// config the adapter reads carry the canonical provider.
+	//
+	// Reuses the SAME manifest path the config-SAVE validators use
+	// (providerRegistry() + Manifest.DeriveProvider; see
+	// model_registry_validation.go). On a derive MISS (unknown/unregistered
+	// model, or registry unavailable) provider is left empty and the field is
+	// omitted below — preserving today's behavior; never fail provisioning on
+	// a derive miss.
+	derivedProvider := deriveDefaultConfigProvider(runtime, model)
+
 	if runtime == "claude-code" {
 		model = normalizeClaudeCodeModel(model)
 	}
@@ -640,6 +673,14 @@ func (h *WorkspaceHandler) ensureDefaultConfig(workspaceID string, payload model
 	// Model always at top level — config.py reads raw["model"] for all runtimes.
 	configYAML += fmt.Sprintf("model: %s\n", quoteModel)
 
+	// Stamp the manifest-derived provider at top level (mirroring CP's
+	// buildModelProviderYAML). Omitted entirely on a derive miss so the prior
+	// behavior — no `provider:` key, runtime re-derives — is preserved for
+	// unregistered models (requirement #3).
+	if derivedProvider != "" {
+		configYAML += fmt.Sprintf("provider: '%s'\n", yamlEscapeSingleQuotedProvider(derivedProvider))
+	}
+
 	// Add runtime_config. required_env is intentionally omitted — the
 	// platform injects secrets at container-start time via the secrets API,
 	// and preflight already validates that the env vars are present before
@@ -649,12 +690,58 @@ func (h *WorkspaceHandler) ensureDefaultConfig(workspaceID string, payload model
 	if runtime == "claude-code" {
 		configYAML += fmt.Sprintf("  model: %s\n", quoteModel)
 	}
+	// Mirror the top-level provider under runtime_config (CP writes both).
+	if derivedProvider != "" {
+		configYAML += fmt.Sprintf("  provider: '%s'\n", yamlEscapeSingleQuotedProvider(derivedProvider))
+	}
 	configYAML += "  timeout: 0\n"
 
 	files["config.yaml"] = []byte(configYAML)
 
 	log.Printf("Provisioner: generated %d config files for workspace %s (runtime: %s)", len(files), workspaceID, runtime)
 	return files
+}
+
+// deriveDefaultConfigProvider resolves the provider name the adapter should
+// see for (runtime, model) using the SAME providers manifest the config-SAVE
+// validators use (providerRegistry() + Manifest.DeriveProvider; see
+// model_registry_validation.go). It is intentionally fail-OPEN: any miss
+// (empty model, registry unavailable, unknown runtime, or a model the runtime
+// does not own) returns "" so the caller omits the `provider:` field and the
+// generated config keeps its pre-fix shape. It NEVER fails provisioning.
+//
+// `model` must be the FULL, un-normalized id (e.g. "moonshot/kimi-k2.6") so
+// DeriveProvider's exact-id match resolves the canvas claude-code case to
+// provider=platform. The availableAuthEnv arg is nil here — config-generation
+// has no per-workspace auth context yet (secrets are injected at container
+// start), matching the validators' nil call.
+func deriveDefaultConfigProvider(runtime, model string) string {
+	if strings.TrimSpace(model) == "" {
+		return ""
+	}
+	m, err := providerRegistry()
+	if err != nil || m == nil {
+		// Registry unavailable (a build-time defect the gen/sync gates catch).
+		// Fail open — do not stamp a provider, do not block provisioning.
+		return ""
+	}
+	p, err := m.DeriveProvider(runtime, model, nil)
+	if err != nil {
+		// Unknown runtime (federation / non-first-party) or a model the
+		// runtime does not own. Either way, omit the provider and let the
+		// runtime fall back to its prior derivation — preserving today's
+		// behavior for unregistered models.
+		return ""
+	}
+	return p.Name
+}
+
+// yamlEscapeSingleQuotedProvider escapes a value for a YAML single-quoted
+// scalar, mirroring CP's buildModelProviderYAML (a literal single quote is
+// doubled). Provider names are registry-controlled identifiers, so this is a
+// defense-in-depth measure rather than a hot path.
+func yamlEscapeSingleQuotedProvider(v string) string {
+	return strings.ReplaceAll(v, "'", "''")
 }
 
 func normalizeClaudeCodeModel(model string) string {
@@ -1153,9 +1240,18 @@ func firstNonEmptyEnv(names ...string) string {
 // stores — NOT the user's own scoped PAT they explicitly authorized via
 // the per-workspace Secrets tab.
 //
+// The third return value (workspaceKeys) is the POSITIVE counterpart: the
+// set of keys authored via the per-workspace `workspace_secrets` table
+// (user / org-admin set, authenticated as the workspace owner). It is the
+// provenance signal the forensic #145 SCM-write-token guard consults to
+// EXEMPT a workspace-scoped GITEA_TOKEN (the intended, legitimate delivery
+// channel for a reviewer agent) from the operator-bleed strip. A key set
+// in BOTH stores lands here (workspace overrides global) and is removed
+// from globalKeys, matching the precedence semantic below.
+//
 // The merged map preserves the existing precedence semantic (workspace
 // rows overwrite global rows on key collision); only the provenance side-
-// channel is new. Existing single-return callers can ignore globalKeys.
+// channels are new. Existing callers can ignore globalKeys / workspaceKeys.
 //
 // F1086 / #1206: the returned error string is the SAFE-CANNED message that
 // gets persisted to workspaces.last_sample_error AND broadcast as the
@@ -1163,9 +1259,10 @@ func firstNonEmptyEnv(names ...string) string {
 // the encryption version, the decrypt-error text) is logged here, never
 // returned to the caller, so it can't leak via the canvas event stream
 // (cf. TestProvisionWorkspace_NoInternalErrorsInBroadcast).
-func loadWorkspaceSecrets(ctx context.Context, workspaceID string) (map[string]string, map[string]struct{}, string) {
+func loadWorkspaceSecrets(ctx context.Context, workspaceID string) (map[string]string, map[string]struct{}, map[string]struct{}, string) {
 	envVars := map[string]string{}
 	globalKeys := map[string]struct{}{}
+	workspaceKeys := map[string]struct{}{}
 	globalRows, globalErr := db.DB.QueryContext(ctx,
 		`SELECT key, encrypted_value, encryption_version FROM global_secrets`)
 	if globalErr == nil {
@@ -1186,7 +1283,7 @@ func loadWorkspaceSecrets(ctx context.Context, workspaceID string) (map[string]s
 				decrypted, decErr := crypto.DecryptVersioned(v, ver)
 				if decErr != nil {
 					log.Printf("Provisioner: FATAL — failed to decrypt global secret %s (version=%d): %v — aborting provision of workspace %s", k, ver, decErr, workspaceID)
-					return nil, nil, "failed to decrypt global secret"
+					return nil, nil, nil, "failed to decrypt global secret"
 				}
 				envVars[k] = string(decrypted)
 				globalKeys[k] = struct{}{}
@@ -1220,7 +1317,7 @@ func loadWorkspaceSecrets(ctx context.Context, workspaceID string) (map[string]s
 				decrypted, decErr := crypto.DecryptVersioned(v, ver)
 				if decErr != nil {
 					log.Printf("Provisioner: FATAL — failed to decrypt workspace secret %s (version=%d) for %s: %v — aborting provision", k, ver, workspaceID, decErr)
-					return nil, nil, "failed to decrypt workspace secret"
+					return nil, nil, nil, "failed to decrypt workspace secret"
 				}
 				envVars[k] = string(decrypted)
 				// User-authored workspace_secrets value supersedes any
@@ -1229,13 +1326,19 @@ func loadWorkspaceSecrets(ctx context.Context, workspaceID string) (map[string]s
 				// re-set the value via the canvas Secrets tab, so it is
 				// no longer "the operator-store version."
 				delete(globalKeys, k)
+				// Positive provenance: record that this key was authored
+				// via workspace_secrets. The forensic #145 SCM-write-token
+				// guard exempts only keys in this set — a workspace-scoped
+				// GITEA_TOKEN is the intended delivery channel for that
+				// workspace's agent.
+				workspaceKeys[k] = struct{}{}
 			}
 		}
 		if err := wsRows.Err(); err != nil {
 			log.Printf("Provisioner: workspace_secrets rows.Err workspace=%s: %v", workspaceID, err)
 		}
 	}
-	return envVars, globalKeys, ""
+	return envVars, globalKeys, workspaceKeys, ""
 }
 
 // provisionWorkspaceCP provisions a workspace via the control plane API.
