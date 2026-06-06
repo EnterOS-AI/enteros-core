@@ -278,7 +278,14 @@ if [ "${COMPLETION_HTTP_CODE}" != "200" ]; then
   exit "${EXIT_CODE}"
 fi
 # Verify JSON-RPC 2.0 success envelope
-RPC_RESULT=$(jq -r '.result // .error // empty' /tmp/completion-resp.json 2>/dev/null || echo "")
+RPC_ERROR=$(jq -r '.error // empty' /tmp/completion-resp.json 2>/dev/null || echo "")
+if [ -n "${RPC_ERROR}" ]; then
+  echo "::error::Completion returned JSON-RPC error: ${RPC_ERROR}"
+  cat /tmp/completion-resp.json 2>/dev/null || true
+  EXIT_CODE=5
+  exit "${EXIT_CODE}"
+fi
+RPC_RESULT=$(jq -r '.result // empty' /tmp/completion-resp.json 2>/dev/null || echo "")
 if [ -z "${RPC_RESULT}" ] || [ "${RPC_RESULT}" = "null" ]; then
   echo "::error::Completion response missing result field"
   cat /tmp/completion-resp.json 2>/dev/null || true
