@@ -123,7 +123,14 @@ jobs:
       # with a per-entry ::error:: annotation naming the missing repo
       # (issue #2192). This is the push-time complement to PR #2186's
       # PR-time manifest-entry-existence gate.
+      #
+      # Token: workspace-template-* repos are PRIVATE, so the existence check
+      # must authenticate (same AUTO_SYNC_TOKEN as the clone step). Without it
+      # an unauthenticated GET 404s on private repos and false-prunes them
+      # (regression that dropped seo-agent/google-adk from the palette).
       - name: Validate manifest entries exist
+        env:
+          MOLECULE_GITEA_TOKEN: ${{ secrets.AUTO_SYNC_TOKEN }}
         run: |
           set -euo pipefail
           bash scripts/check-manifest-repos-exist.sh manifest.json

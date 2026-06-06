@@ -389,8 +389,24 @@ INSTANCE_ID_GRACE_SECS="${E2E_INSTANCE_ID_GRACE_SECS:-45}"
 WS_LAST_STATUS=""
 while true; do
   if [ "$(date +%s)" -gt "$ONLINE_DEADLINE" ]; then
+    # Boot-failure diagnostic burst (#2310-class): last_sample_error is often
+    # EMPTY for a config-resolution failure (the agent never sampled — it
+    # failed before its first heartbeat), so a bare "err=" tells us nothing
+    # (run 223233). Surface the FULL workspace record + every plausible error
+    # field so the actual reason (e.g. unservable provider, missing key, wrong
+    # model arm) is visible without re-running.
     WS_LAST_ERR=$(ws_field "$WS_ID" "last_sample_error")
-    fail "Workspace $WS_ID never reached status=online within ${WORKSPACE_ONLINE_TIMEOUT_SECS}s (last status=$WS_LAST_STATUS, err=$WS_LAST_ERR)"
+    log "── DIAGNOSTIC BURST (step 4 — workspace never reached online) ──"
+    log "    model=$MODEL_SLUG  llm_path=${E2E_LLM_PATH:-platform}  secrets=$([ "$SECRETS_JSON" = '{}' ] && echo '(none)' || echo '(set)')"
+    for f in status last_sample_error last_error error provisioning_error instance_id instance_status; do
+      log "    ${f}=$(ws_field "$WS_ID" "$f")"
+    done
+    log "    full record:"
+    tenant_call GET "/workspaces/$WS_ID" 2>/dev/null \
+      | python3 -m json.tool 2>/dev/null | sed 's/^/      /' \
+      || log "      (could not fetch /workspaces/$WS_ID)"
+    log "── END DIAGNOSTIC ──"
+    fail "Workspace $WS_ID never reached status=online within ${WORKSPACE_ONLINE_TIMEOUT_SECS}s (last status=$WS_LAST_STATUS, err=$WS_LAST_ERR; see diagnostic burst above)"
   fi
   WS_STATUS=$(ws_field "$WS_ID" "status")
   if [ "$WS_STATUS" != "$WS_LAST_STATUS" ]; then

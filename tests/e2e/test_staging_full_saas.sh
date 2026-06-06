@@ -24,6 +24,19 @@
 #
 # Optional env:
 #   E2E_RUNTIME                  hermes (default) | claude-code | codex | openclaw
+#                                | seo-agent | google-adk
+#                                  - seo-agent: a claude-code-adapter template
+#                                    VARIANT (not a distinct registry runtime).
+#                                    Selected via the `template` field (config.yaml
+#                                    resolves runtime=claude-code); reuses the
+#                                    same MiniMax/claude-code key path. See the
+#                                    TEMPLATE derivation + SECRETS_JSON block.
+#                                  - google-adk: Gemini. The AI-Studio-keyed BYOK
+#                                    path (E2E_GOOGLE_API_KEY) is staging-
+#                                    exercisable here; the keyless Vertex PROD
+#                                    path needs WIF (see header note + the CTO
+#                                    flag in the PR body) and is selected via
+#                                    E2E_LLM_PATH=platform + a platform: model.
 #   E2E_PROVISION_TIMEOUT_SECS   default 900 (15 min cold EC2 budget)
 #   E2E_WORKSPACE_ONLINE_TIMEOUT_SECS  default 3600 (60 min — hermes
 #                                cold-boot worst-case + slack). Raised from
@@ -47,6 +60,27 @@
 #                                tear down cleanly (and exit 4 on leak).
 #                                Used by a dedicated sanity workflow
 #                                that verifies the safety net.
+#   E2E_LIFECYCLE                auto (default) | off
+#                                When auto + MODE=full, exercises the
+#                                pause→resume→online and hibernate→resume(wake)
+#                                state transitions on the provisioned parent
+#                                (step 10b). These are REAL transitions on the
+#                                live tenant (Pause stops the container + sets
+#                                status=paused; Resume re-provisions →
+#                                provisioning → online; Hibernate stops +
+#                                status=hibernated; the next A2A auto-wakes it).
+#                                Set `off` for a fast smoke that skips the
+#                                ~2x-reprovision cost. In smoke MODE it is
+#                                skipped regardless (no parent stability budget).
+#   E2E_REQUIRE_LIVE             1 → fail-closed-on-skip guard (CI sets this).
+#                                When set, the run MUST actually complete
+#                                ≥1 full provision→online→A2A cycle. A run
+#                                that reaches the end without having proven
+#                                a real round-trip (e.g. a future refactor
+#                                short-circuits a stage, or a skip path
+#                                swallows the lifecycle) exits 5 rather than
+#                                reporting a false green. Mirrors CP
+#                                serving-e2e's SERVING_E2E_REQUIRE_LIVE.
 #
 # Exit codes:
 #   0  happy path
@@ -54,6 +88,37 @@
 #   2  missing required env
 #   3  provisioning timed out
 #   4  teardown left orphan resources
+#   5  E2E_REQUIRE_LIVE set but the run validated no real lifecycle (no
+#      false-green-on-skip)
+#
+# ─────────────────────────────────────────────────────────────────────────
+# PROMOTION-READINESS (harden/e2e-staging-saas-failclosed):
+#   This harness is being hardened so `E2E Staging SaaS` + `E2E Staging
+#   Platform Boot` can become HARD merge-gates. continue-on-error is NOT
+#   flipped here — that promotion is the CTO's irreversible branch-protection
+#   call. What this branch makes fail-closed (was false-green / un-named
+#   flake before):
+#     • Provision/online waits are bounded readiness-POLLS, not fixed sleeps;
+#       each hard-fails with a named mechanism + last-seen signal on deadline,
+#       never a silent timeout (cp#245 boot-timeout class).
+#     • Peer-discovery (9b) asserts a real 2xx, not just "not 404" — a 5xx /
+#       000 / empty no longer reads as "reachable".
+#     • Activity-log (9b) is ASSERTED reachable (2xx + parseable), not
+#       logged-and-ignored behind `|| echo '[]'`.
+#     • Child activity provenance (10) is asserted (was soft-logged).
+#     • E2E_REQUIRE_LIVE=1 (CI) makes the run exit 5 if it reached the end
+#       without proving a real provision→online→A2A round-trip — no
+#       false-green-on-skip.
+#   STILL BLOCKS making it REQUIRED (must clear before the CTO flips
+#   continue-on-error→false in .gitea/workflows/e2e-staging-saas.yml):
+#     • De-flake window: N consecutive green runs on main for BOTH jobs
+#       (platform-boot shares the cp#245 boot surface — #2187 tracks its
+#       flip). This harness removes the harness-side flake mechanisms; the
+#       remaining surface is real-infra (EC2 cold boot, CF DNS) latency,
+#       already bounded by the readiness polls above.
+#     • Branch-protection required-context wiring is a repo-settings change,
+#       not a code change in this PR.
+# ─────────────────────────────────────────────────────────────────────────
 
 set -euo pipefail
 
@@ -89,6 +154,41 @@ SLUG=$(echo "$SLUG" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-' | head -c 32
 log()  { echo "[$(date +%H:%M:%S)] $*"; }
 fail() { echo "[$(date +%H:%M:%S)] ❌ $*" >&2; exit 1; }
 ok()   { echo "[$(date +%H:%M:%S)] ✅ $*"; }
+
+# ─── fail-closed-on-skip live-lifecycle guard ───────────────────────────
+# E2E_REQUIRE_LIVE=1 (set by CI) asserts this run ACTUALLY exercised a full
+# provision→online→A2A cycle. Each load-bearing lifecycle stage stamps a
+# milestone via live_milestone(); at the very end, require_live_or_die()
+# checks every required milestone fired. Mechanism: without this, a future
+# refactor that short-circuits a stage — or a skip/early-return path that
+# swallows the lifecycle — would let the script reach its final `ok` and
+# report GREEN having validated nothing. Mirrors CP serving-e2e's
+# SERVING_E2E_REQUIRE_LIVE (skip-if-absent must be LOUD, never silent green).
+REQUIRE_LIVE="${E2E_REQUIRE_LIVE:-0}"
+LIVE_MILESTONES=""
+live_milestone() {
+  # Idempotent set-membership append. Space-delimited; names are tokens.
+  case " $LIVE_MILESTONES " in
+    *" $1 "*) ;;
+    *) LIVE_MILESTONES="$LIVE_MILESTONES $1" ;;
+  esac
+}
+require_live_or_die() {
+  # No-op unless CI demanded a live run.
+  [ "$REQUIRE_LIVE" = "1" ] || return 0
+  local required="provisioned tenant_online workspace_online a2a_roundtrip"
+  local m missing=""
+  for m in $required; do
+    case " $LIVE_MILESTONES " in
+      *" $m "*) ;;
+      *) missing="$missing $m" ;;
+    esac
+  done
+  if [ -n "$missing" ]; then
+    echo "[$(date +%H:%M:%S)] ❌ E2E_REQUIRE_LIVE=1 but the run did NOT prove a full live lifecycle — missing milestone(s):${missing}. Reached:${LIVE_MILESTONES:-<none>}. This is a false-green-on-skip guard: a run that validates no real provision→online→A2A cycle MUST NOT report green." >&2
+    exit 5
+  fi
+}
 
 # Per-runtime model slug dispatch — see lib/model_slug.sh for the rationale.
 # Extracted so unit tests (tests/e2e/test_model_slug.sh) can pin every branch
@@ -197,7 +297,7 @@ cleanup_org() {
   # case statement, and opens a false-positive priority-high
   # "safety net broken" issue (#2159, 2026-04-27).
   case "$entry_rc" in
-    0|1|2|3|4) ;;          # contracted codes — let bash use entry_rc
+    0|1|2|3|4|5) ;;        # contracted codes — let bash use entry_rc
     *) exit 1 ;;            # anything else is a generic failure
   esac
 }
@@ -295,6 +395,7 @@ print('(no org row found for slug=$SLUG — DB drift?)')
   esac
 done
 ok "Tenant provisioning complete"
+live_milestone provisioned
 
 # Derive tenant domain from CP hostname so the same harness works in
 # both prod (api.moleculesai.app → moleculesai.app) and staging
@@ -351,6 +452,7 @@ while true; do
   sleep 5
 done
 ok "Tenant reachable at $TENANT_URL"
+live_milestone tenant_online
 
 # Sanity-test path: once the tenant is provisioned, poisoning the
 # tenant token proves the EXIT trap + leak assertion still fire.
@@ -515,6 +617,24 @@ print(json.dumps({
     'ANTHROPIC_API_KEY': k,
 }))
 ")
+elif [ -n "${E2E_GOOGLE_API_KEY:-}" ]; then
+  # google-adk AI-Studio BYOK path. The `google` provider entry
+  # (providers.yaml:401-413) reads GEMINI_API_KEY / GOOGLE_API_KEY and dials
+  # generativelanguage.googleapis.com — the tenant's OWN key, distinct from the
+  # keyless-Vertex PROD path (which routes through the CP proxy + server-side
+  # WIF and carries NO tenant credential). This branch exercises google-adk
+  # being PROVISIONED AT ALL on staging; the Vertex-specific WIF path is flagged
+  # for the CTO (needs extra provisioning) and is NOT reachable here. Inject
+  # under both env names the provider accepts so the adapter resolves regardless
+  # of which one it reads first.
+  SECRETS_JSON=$(python3 -c "
+import json, os
+k = os.environ['E2E_GOOGLE_API_KEY']
+print(json.dumps({
+    'GOOGLE_API_KEY': k,
+    'GEMINI_API_KEY': k,
+}))
+")
 elif [ -n "${E2E_OPENAI_API_KEY:-}" ]; then
   SECRETS_JSON=$(python3 -c "
 import json, os
@@ -534,22 +654,234 @@ fi
 MODEL_SLUG=$(pick_model_slug "$RUNTIME")
 log "    MODEL_SLUG=$MODEL_SLUG"
 
-log "5/11 Provisioning parent workspace (runtime=$RUNTIME)..."
+# ─── BYOK opt-in split (secret-write gate requires explicit byok) ───────
+# Every vendor-key arm above (MiniMax / Anthropic / Google / OpenAI-hermes)
+# writes one or more keys that workspace-server's secret-write gate —
+# rejectPlatformManagedDirectLLMBypassForWorkspace in
+# workspace-server/internal/handlers/secrets.go — STRIPS/BLOCKS while a
+# workspace's resolved billing mode is platform_managed (the org/CTO default).
+# The strip-list (secrets.go platformManagedDirectLLMBypassKeys) includes
+# MINIMAX_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY, OPENAI_API_KEY/_BASE_URL,
+# HERMES_CUSTOM_API_KEY/_BASE_URL, etc. A bare vendor key in the CREATE payload
+# does NOT auto-derive byok: at create time no auth-env is present yet, so the
+# resolver derives platform_managed and the write is rejected. The resolver's
+# org rung was retired (internal#718 P2-B) — ResolveLLMBillingMode now ignores
+# the org default — so the ONLY way to opt a workspace into byok is an explicit
+# per-workspace override via PUT /admin/workspaces/:id/llm-billing-mode.
+#
+# Real evidence — staging job 295385 (main f1558b54), AFTER #2311/#2312 made
+# bare `MiniMax-M2.7` registry-valid: parent-create passed model validation but
+# FAILED with
+#   {"error":"direct vendor key writes are blocked for platform-managed
+#    workspaces; ... or set this workspace's billing mode to 'byok' via
+#    /admin/workspaces/:id/llm-billing-mode","key":"MINIMAX_API_KEY"}
+# That 400 is INTENDED product behavior, not a product bug. The e2e must mirror
+# the real BYOK user flow: opt the workspace into byok FIRST, then write the key.
+#
+# Mechanism: per-workspace override (NOT org-default), because the org rung is
+# retired — an org-create billing field could not satisfy this gate even if
+# /cp/admin/orgs accepted one. So for any arm that ships strip-listed keys we:
+#   1. create the workspace WITHOUT those keys (create succeeds platform_managed),
+#   2. PUT billing-mode=byok on that workspace id (per-tenant admin token),
+#   3. write the deferred strip-listed keys (now allowed by the gate),
+# then continue. The #1994 byok-routing guard (8c) then sees a LEGITIMATELY
+# byok workspace (explicit override) and still validates real routing — NOT
+# masked.
+#
+# The PLATFORM path (E2E_LLM_PATH=platform) produces SECRETS_JSON='{}', so it
+# carries NO strip-listed key → CREATE_SECRETS_JSON stays '{}' and no opt-in
+# fires. It remains platform_managed (the moonshot/kimi NOT_CONFIGURED
+# regression guard) — deliberately untouched.
+#
+# Keep this strip-list BYTE-IN-SYNC with secrets.go platformManagedDirectLLMBypassKeys.
+BYOK_STRIP_KEYS="AI_GATEWAY_API_KEY ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ARCEEAI_API_KEY CLAUDE_CODE_OAUTH_TOKEN CODEX_AUTH_JSON DASHSCOPE_API_KEY DEEPSEEK_API_KEY GEMINI_API_KEY GLM_API_KEY HERMES_CUSTOM_API_KEY HERMES_CUSTOM_BASE_URL HF_TOKEN KIMI_API_KEY KIMI_CN_API_KEY MINIMAX_API_KEY MINIMAX_CN_API_KEY NOUS_API_KEY OPENAI_API_KEY OPENAI_BASE_URL OPENROUTER_API_KEY XAI_API_KEY ZAI_API_KEY"
+# Split SECRETS_JSON into CREATE_SECRETS_JSON (gate-safe, written at create)
+# and DEFERRED_SECRETS_JSON (strip-listed keys, written AFTER byok opt-in).
+# Emit the two JSON blobs on SEPARATE LINES (not space-separated) — a value or
+# a json.dumps default separator contains spaces, which whitespace-`read` would
+# mangle. read -r line1 → CREATE, line2 → DEFERRED.
+{
+  read -r CREATE_SECRETS_JSON
+  read -r DEFERRED_SECRETS_JSON
+} < <(
+  BYOK_STRIP_KEYS="$BYOK_STRIP_KEYS" E2E_WS_SECRETS="$SECRETS_JSON" python3 -c "
+import json, os
+strip = set(os.environ['BYOK_STRIP_KEYS'].split())
+d = json.loads(os.environ['E2E_WS_SECRETS'] or '{}')
+create = {k: v for k, v in d.items() if k not in strip}
+deferred = {k: v for k, v in d.items() if k in strip}
+print(json.dumps(create))
+print(json.dumps(deferred))
+"
+)
+# Defensive: if the split somehow produced empty (read failure), treat as
+# no-deferred so we never PUT byok on a workspace that has no vendor key.
+[ -n "$DEFERRED_SECRETS_JSON" ] || DEFERRED_SECRETS_JSON='{}'
+[ -n "$CREATE_SECRETS_JSON" ] || CREATE_SECRETS_JSON='{}'
+if [ "$DEFERRED_SECRETS_JSON" != "{}" ]; then
+  log "    BYOK opt-in required — deferring vendor key(s) until after billing-mode=byok"
+fi
+
+# byok_opt_in_and_write_deferred <workspace_id>
+#   For the byok arms (DEFERRED_SECRETS_JSON non-empty): PUT billing-mode=byok
+#   on the workspace, then write each deferred strip-listed secret (now allowed
+#   by the secret-write gate). No-op for the platform/no-key path. See the
+#   BYOK-opt-in block above + secrets.go rejectPlatformManagedDirectLLMBypassForWorkspace.
+byok_opt_in_and_write_deferred() {
+  local _id="$1"
+  if [ "$DEFERRED_SECRETS_JSON" = "{}" ]; then
+    return 0
+  fi
+  # Explicit byok opt-in (per-workspace override).
+  local _bm_resp _bm_mode
+  set +e
+  _bm_resp=$(tenant_call PUT "/admin/workspaces/$_id/llm-billing-mode" \
+    -H "Content-Type: application/json" \
+    -d '{"mode":"byok"}' 2>/dev/null)
+  local _bm_rc=$?
+  set -e
+  if [ "$_bm_rc" != "0" ]; then
+    fail "byok opt-in: PUT /admin/workspaces/$_id/llm-billing-mode {mode:byok} failed (rc=$_bm_rc). Raw: $(printf '%s' "$_bm_resp" | sanitize_http_body)"
+  fi
+  _bm_mode=$(echo "$_bm_resp" | python3 -c "import json,sys; print(json.load(sys.stdin).get('resolved_mode',''))" 2>/dev/null || echo "")
+  [ "$_bm_mode" = "byok" ] || fail "byok opt-in: workspace $_id resolved_mode='$_bm_mode' after PUT mode=byok (want byok). Raw: $(printf '%s' "$_bm_resp" | sanitize_http_body)"
+
+  # Write each deferred strip-listed secret one-per-call (the Set endpoint
+  # takes {key,value}). The gate now passes because resolved=byok. Bodies are
+  # built in Python (env-only) so secret values never hit a command line.
+  local _keys _k _sec_body _sec_tmp _sec_code _sec_out
+  _keys=$(echo "$DEFERRED_SECRETS_JSON" | python3 -c "import json,sys; print('\n'.join(json.load(sys.stdin).keys()))")
+  while IFS= read -r _k; do
+    [ -n "$_k" ] || continue
+    _sec_body=$(BYOK_K="$_k" E2E_WS_DEFERRED="$DEFERRED_SECRETS_JSON" python3 -c "
+import json, os
+d = json.loads(os.environ['E2E_WS_DEFERRED'])
+print(json.dumps({'key': os.environ['BYOK_K'], 'value': d[os.environ['BYOK_K']]}))
+")
+    _sec_tmp=$(mktemp -t synth_byok_secret.XXXXXX)
+    _sec_code=$(printf '%s' "$_sec_body" | tenant_call POST "/workspaces/$_id/secrets" \
+      -H "Content-Type: application/json" \
+      -d @- \
+      -o "$_sec_tmp" -w '%{http_code}' 2>/dev/null || echo "000")
+    if [ "$_sec_code" != "200" ] && [ "$_sec_code" != "201" ] && [ "$_sec_code" != "204" ]; then
+      _sec_out=$(cat "$_sec_tmp" 2>/dev/null | sanitize_http_body)
+      rm -f "$_sec_tmp"
+      fail "byok vendor-key write: POST /workspaces/$_id/secrets ($_k) returned $_sec_code: $_sec_out — secret-write gate should allow it after the byok opt-in (secrets.go rejectPlatformManagedDirectLLMBypassForWorkspace)."
+    fi
+    rm -f "$_sec_tmp"
+  done <<< "$_keys"
+  ok "    $_id byok opt-in + deferred vendor key(s) written"
+}
+
+# ─── runtime → provision-selector resolution ────────────────────────────
+# Most runtimes are selected directly by the `runtime` field. seo-agent is
+# the exception: it is NOT a registry runtime (absent from manifest.json +
+# runtime_registry.go knownRuntimes) — it is a claude-code-adapter template
+# VARIANT selected by the `template` field. The ws-server Create handler reads
+# the template's config.yaml, which declares `runtime: claude-code`, and
+# resolves the concrete runtime from there (workspace.go:290-336). So for
+# seo-agent we send template="seo-agent" and OMIT runtime, letting the
+# template resolve it — sending an explicit runtime="seo-agent" would
+# RUNTIME_UNSUPPORTED-422 at workspace.go:374-384 because it is not in
+# knownRuntimes. PROVISION_TEMPLATE is "" for every real registry runtime.
+PROVISION_TEMPLATE=""
+case "$RUNTIME" in
+  seo-agent) PROVISION_TEMPLATE="seo-agent" ;;
+esac
+
+# Build the create payload in Python so the optional `template`/`runtime`
+# fields are emitted conditionally and the secrets blob is embedded without
+# shell-escaping hazards. Args: name, [parent_id|""].
+build_create_payload() {
+  local name="$1" parent_id="${2:-}"
+  E2E_WS_NAME="$name" \
+  E2E_WS_PARENT_ID="$parent_id" \
+  E2E_WS_RUNTIME="$RUNTIME" \
+  E2E_WS_TEMPLATE="$PROVISION_TEMPLATE" \
+  E2E_WS_MODEL="$MODEL_SLUG" \
+  E2E_WS_SECRETS="$CREATE_SECRETS_JSON" \
+  python3 -c "
+import json, os
+secrets = json.loads(os.environ['E2E_WS_SECRETS'] or '{}')
+payload = {
+    'name': os.environ['E2E_WS_NAME'],
+    'tier': 2,
+    'model': os.environ['E2E_WS_MODEL'],
+    'secrets': secrets,
+}
+tmpl = os.environ.get('E2E_WS_TEMPLATE', '')
+if tmpl:
+    # Template-selected variant (seo-agent): the template's config.yaml
+    # resolves runtime=claude-code server-side. Do NOT also send an explicit
+    # runtime — seo-agent is not a registry runtime and would 422.
+    payload['template'] = tmpl
+else:
+    payload['runtime'] = os.environ['E2E_WS_RUNTIME']
+pid = os.environ.get('E2E_WS_PARENT_ID', '')
+if pid:
+    payload['parent_id'] = pid
+print(json.dumps(payload))
+"
+}
+
+if [ -n "$PROVISION_TEMPLATE" ]; then
+  log "5/11 Provisioning parent workspace (runtime=$RUNTIME via template=$PROVISION_TEMPLATE → claude-code adapter)..."
+else
+  log "5/11 Provisioning parent workspace (runtime=$RUNTIME)..."
+fi
+# tenant_call inherits CURL_COMMON's --fail-with-body, so a non-2xx create
+# (e.g. the 422 RUNTIME_UNSUPPORTED below) makes curl exit 22. Capturing it
+# bare as $(tenant_call ...) propagates that 22 through the command
+# substitution and, under `set -euo pipefail`, ABORTS the whole script right
+# here — before the `fail "... Response: ..."` handler below can print the
+# body. The result was an opaque `curl: (22) ... error: 422` + teardown with
+# no body (run 220702, main f78fef4c, step "5/11 Provisioning parent
+# workspace"). set +e / `|| true` keeps the 22 from tripping `set -e`; curl
+# still WROTE the body to stdout (that's what --fail-with-body does), so
+# PARENT_RESP holds the 422 JSON and the id-check below surfaces WHY.
+set +e
 PARENT_RESP=$(tenant_call POST /workspaces \
   -H "Content-Type: application/json" \
-  -d "{\"name\":\"E2E Parent\",\"runtime\":\"$RUNTIME\",\"tier\":2,\"model\":\"$MODEL_SLUG\",\"secrets\":$SECRETS_JSON}")
-PARENT_ID=$(echo "$PARENT_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+  -d "$(build_create_payload 'E2E Parent')")
+set -e
+# Surface the workspace-create error CLEARLY instead of dying on a Python
+# KeyError when the response has no 'id'. The load-bearing cases this names:
+#   - google-adk: RUNTIME_UNSUPPORTED 422 if google-adk is absent from the
+#     deployed manifest.json's workspace_templates (the Create-handler
+#     allowlist is manifest-derived — runtime_registry.go). google-adk is in
+#     providers.yaml + provisioner/registry.go + registry_gen but NOT (yet) in
+#     manifest.json, so it cannot be provisioned by `runtime` until the
+#     manifest gains it. Flagged for the CTO — this arm REDS until then.
+#   - seo-agent: an "invalid template" 400 if the seo-agent template isn't
+#     present in the tenant's configs/cache dir (template-cache refresh gap).
+PARENT_ID=$(echo "$PARENT_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('id',''))" 2>/dev/null || echo "")
+if [ -z "$PARENT_ID" ]; then
+  fail "Parent workspace create returned no 'id' (runtime=$RUNTIME, template=${PROVISION_TEMPLATE:-<none>}). Response: $(printf '%s' "$PARENT_RESP" | sanitize_http_body)"
+fi
 log "    PARENT_ID=$PARENT_ID"
+# BYOK arms only: opt the workspace into byok, then write the deferred vendor
+# key(s). No-op for the platform/no-key path. (See the BYOK opt-in block.)
+byok_opt_in_and_write_deferred "$PARENT_ID"
 
 # ─── 6. Provision child (full mode only) ────────────────────────────────
 CHILD_ID=""
 if [ "$MODE" = "full" ]; then
   log "6/11 Provisioning child workspace..."
+  # Same --fail-with-body / set -e abort guard as the parent create above:
+  # let a non-2xx return the body so the id-check below surfaces it instead
+  # of the script dying opaquely on curl exit 22.
+  set +e
   CHILD_RESP=$(tenant_call POST /workspaces \
     -H "Content-Type: application/json" \
-    -d "{\"name\":\"E2E Child\",\"runtime\":\"$RUNTIME\",\"tier\":2,\"model\":\"$MODEL_SLUG\",\"parent_id\":\"$PARENT_ID\",\"secrets\":$SECRETS_JSON}")
-  CHILD_ID=$(echo "$CHILD_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+    -d "$(build_create_payload 'E2E Child' "$PARENT_ID")")
+  set -e
+  CHILD_ID=$(echo "$CHILD_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('id',''))" 2>/dev/null || echo "")
+  if [ -z "$CHILD_ID" ]; then
+    fail "Child workspace create returned no 'id' (runtime=$RUNTIME, template=${PROVISION_TEMPLATE:-<none>}). Response: $(printf '%s' "$CHILD_RESP" | sanitize_http_body)"
+  fi
   log "    CHILD_ID=$CHILD_ID"
+  # Same BYOK opt-in as the parent — the child also carries the vendor key(s).
+  byok_opt_in_and_write_deferred "$CHILD_ID"
 else
   log "6/11 Canary mode — skipping child workspace"
 fi
@@ -570,6 +902,7 @@ fi
 WS_TO_CHECK=("$PARENT_ID")
 [ -n "$CHILD_ID" ] && WS_TO_CHECK+=("$CHILD_ID")
 wait_workspaces_online_routable "7/11 Waiting for workspace(s) to reach status=online (up to $((WORKSPACE_ONLINE_TIMEOUT_SECS/60)) min — hermes cold boot)..." "${WS_TO_CHECK[@]}"
+live_milestone workspace_online
 
 # ─── 7a. Real chat image upload/download round-trip ───────────────────
 # This deliberately uses the production workflow: tenant admin/session auth
@@ -671,6 +1004,12 @@ for wid in "${WS_TO_CHECK[@]}"; do
   else
     DIAG_FAIL=$(echo "$DIAG_JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('first_failure','unknown'))" 2>/dev/null || echo "unknown")
     DIAG_DETAIL=$(echo "$DIAG_JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); s=[x for x in d.get('steps',[]) if not x.get('ok')]; step=s[0] if s else {}; print(' — '.join(x for x in [step.get('error',''), step.get('detail','')] if x))" 2>/dev/null || echo "")
+    # #767: always emit the full diagnose JSON so operators see every step's
+    # Detail field even when the Python extraction above fails or the shape
+    # drifts. The burst is bracketed like steps 2 and 4 for grep-friendly CI.
+    log "── DIAGNOSTIC BURST (step 7b — terminal diagnose for $wid) ──"
+    echo "$DIAG_JSON" | python3 -m json.tool 2>/dev/null || echo "$DIAG_JSON"
+    log "── END DIAGNOSTIC ──"
     fail "Workspace $wid terminal diagnose failed at step '$DIAG_FAIL': $DIAG_DETAIL — check tenant SG has tcp/22 from the configured EIC endpoint SG, MOLECULE_EIC_ENDPOINT_SG_ID is set in Railway, and EIC endpoint health"
   fi
 done
@@ -886,7 +1225,7 @@ fi
 # identical on main's scheduled synthetic E2E and on PRs (so it is an
 # environmental backend regression, never PR-introduced).
 if echo "$AGENT_TEXT" | grep -qiF "message contained no text content"; then
-  fail "A2A — EMPTY COMPLETION (backend regression, NOT a platform/workspace-server bug). The configured model (MODEL_SLUG=${MODEL_SLUG:-?}) returned a 2xx completion with no text part; the runtime surfaced 'message contained no text content.'. Operator action: check the staging LLM backend / proxy for the canary model (the claude-code default is minimax:MiniMax-M2.7 since #2263; was bare MiniMax-M2 #2710) — empty assistant turns, not an auth/quota/boot fault. Raw: $AGENT_TEXT"
+  fail "A2A — EMPTY COMPLETION (backend regression, NOT a platform/workspace-server bug). The configured model (MODEL_SLUG=${MODEL_SLUG:-?}) returned a 2xx completion with no text part; the runtime surfaced 'message contained no text content.'. Operator action: check the staging LLM backend / proxy for the canary model (the claude-code MiniMax-BYOK default is the BARE registered id MiniMax-M2.7 — the colon minimax:MiniMax-M2.7 is UNREGISTERED on claude-code, internal#718) — empty assistant turns, not an auth/quota/boot fault. Raw: $AGENT_TEXT"
 fi
 # Generic catch-all — falls through if none of the known regressions hit.
 if echo "$AGENT_TEXT" | grep -qiE "error|exception"; then
@@ -981,6 +1320,11 @@ except Exception:
 " 2>/dev/null || echo "")
 # CORE GATE: contains PINEAPPLE (real round-trip) AND no error-as-text.
 a2a_assert_real_completion "$KA_TEXT" "PINEAPPLE" "A2A known-answer (parent, $RUNTIME/$MODEL_SLUG)"
+# Real, deterministic LLM round-trip proven — the load-bearing milestone for
+# the fail-closed-on-skip guard. Stamped AFTER a2a_assert_real_completion (not
+# after the looser PONG check) so the milestone means a verified completion,
+# not just a 2xx-with-text.
+live_milestone a2a_roundtrip
 
 # ─── 8c. byok-routing regression guard (#1994) ─────────────────────────
 # The parent was provisioned with the customer's OWN vendor key
@@ -1096,28 +1440,92 @@ print(json.dumps({
     'scope': 'LOCAL'
 }))
 ")
-  tenant_call POST "/workspaces/$PARENT_ID/memories" \
+  # SURFACE THE BODY (mirrors the step-9b / A2A pattern): the previous
+  # `>/dev/null || fail "memory POST failed"` discarded the response body
+  # that --fail-with-body deliberately preserves on a non-2xx, so a 500 from
+  # the workspace-server HMA path (e.g. "failed to store memory" /
+  # "failed to resolve writable namespaces", or a 503 "memory plugin is not
+  # configured") was reported as a bare "memory POST failed" — opaque, the
+  # same #2310-class blind spot. Route http_code into -w and body into -o,
+  # then fail with the sanitized status+body so the mechanism is visible.
+  MEM_POST_TMP=$(e2e_tmp /tmp/e2e_mem_post.XXXXXX)
+  set +e
+  MEM_POST_CODE=$(tenant_call POST "/workspaces/$PARENT_ID/memories" \
     -H "Content-Type: application/json" \
-    -d "$MEM_PAYLOAD" >/dev/null || fail "memory POST failed"
-  MEM_LIST=$(tenant_call GET "/workspaces/$PARENT_ID/memories?scope=LOCAL")
+    -d "$MEM_PAYLOAD" \
+    -o "$MEM_POST_TMP" -w "%{http_code}" 2>/dev/null)
+  MEM_POST_RC=$?
+  set -e
+  MEM_POST_CODE=${MEM_POST_CODE:-000}
+  if [ "$MEM_POST_RC" != "0" ] || [ "$MEM_POST_CODE" -lt 200 ] || [ "$MEM_POST_CODE" -ge 300 ]; then
+    MEM_POST_BODY=$(head -c 400 "$MEM_POST_TMP" 2>/dev/null | sanitize_http_body)
+    fail "memory POST /workspaces/$PARENT_ID/memories failed (curl_rc=$MEM_POST_RC, http=$MEM_POST_CODE): ${MEM_POST_BODY:-<empty body>}"
+  fi
+
+  # Same fail-closed surfacing for the read-back: a 5xx / network error here
+  # previously slipped through the bare `$(tenant_call ...)` capture and only
+  # showed up as "not readable" with an empty list.
+  MEM_LIST_TMP=$(e2e_tmp /tmp/e2e_mem_list.XXXXXX)
+  set +e
+  MEM_LIST_CODE=$(tenant_call GET "/workspaces/$PARENT_ID/memories?scope=LOCAL" \
+    -o "$MEM_LIST_TMP" -w "%{http_code}" 2>/dev/null)
+  MEM_LIST_RC=$?
+  set -e
+  MEM_LIST_CODE=${MEM_LIST_CODE:-000}
+  MEM_LIST=$(cat "$MEM_LIST_TMP" 2>/dev/null || echo "")
+  if [ "$MEM_LIST_RC" != "0" ] || [ "$MEM_LIST_CODE" -lt 200 ] || [ "$MEM_LIST_CODE" -ge 300 ]; then
+    fail "memory GET /workspaces/$PARENT_ID/memories failed (curl_rc=$MEM_LIST_RC, http=$MEM_LIST_CODE): $(printf '%s' "$MEM_LIST" | sanitize_http_body | head -c 400)"
+  fi
   if ! echo "$MEM_LIST" | grep -q "run $SLUG"; then
-    fail "HMA memory not readable after write. List: ${MEM_LIST:0:200}"
+    fail "HMA memory not readable after write (http=$MEM_LIST_CODE). List: $(printf '%s' "$MEM_LIST" | sanitize_http_body | head -c 200)"
   fi
   ok "HMA memory write+read roundtripped"
 
   log "9b.  Peer discovery + activity log smoke..."
+  # FAIL-CLOSED: assert a real 2xx, not merely "not 404". The previous
+  # `[ "$PEERS_CODE" = "404" ] && fail` only caught the route-missing case —
+  # a 5xx, 000 (connection failure), or empty capture ALL fell through to
+  # "reachable" (false-green: a broken-but-present route read as healthy).
+  # Mechanism: route the http_code into its own tempfile (no stderr capture,
+  # which the old `2>&1 | head -1` could pollute with a curl error line) and
+  # require 2xx explicitly.
+  PEERS_TMP=$(e2e_tmp /tmp/e2e_peers.XXXXXX)
   set +e
-  tenant_call GET "/registry/$PARENT_ID/peers" -o /dev/null -w "%{http_code}\n" 2>&1 | head -1 > /tmp/peers_code.txt
+  PEERS_CODE=$(tenant_call GET "/registry/$PARENT_ID/peers" \
+    -o "$PEERS_TMP" -w "%{http_code}" 2>/dev/null)
+  PEERS_RC=$?
   set -e
-  PEERS_CODE=$(cat /tmp/peers_code.txt)
-  [ "$PEERS_CODE" = "404" ] && fail "Peers endpoint missing (404) — route regression"
+  PEERS_CODE=${PEERS_CODE:-000}
+  if [ "$PEERS_CODE" = "404" ]; then
+    fail "Peers endpoint missing (404) — route regression. /registry/$PARENT_ID/peers"
+  fi
+  if [ "$PEERS_RC" != "0" ] || [ "$PEERS_CODE" -lt 200 ] || [ "$PEERS_CODE" -ge 300 ]; then
+    fail "Peers endpoint unhealthy (curl_rc=$PEERS_RC, http=$PEERS_CODE) — not a clean 2xx, so 'reachable' would be a false-green. Body: $(head -c 200 "$PEERS_TMP" 2>/dev/null | sanitize_http_body)"
+  fi
   ok "Peers endpoint reachable (HTTP $PEERS_CODE)"
 
-  ACTIVITY=$(tenant_call GET "/activity?workspace_id=$PARENT_ID&limit=5" 2>/dev/null || echo '[]')
-  ACTIVITY_COUNT=$(echo "$ACTIVITY" | python3 -c "import json,sys
-d=json.load(sys.stdin)
-print(len(d if isinstance(d, list) else d.get('events', [])))" 2>/dev/null || echo 0)
-  log "    Activity events observed: $ACTIVITY_COUNT"
+  # FAIL-CLOSED: the activity-log read was `|| echo '[]'` then the count was
+  # only LOGGED, never asserted — a 5xx / network failure silently became an
+  # empty list and the step exited 0 having validated nothing (false-green:
+  # "validated nothing" class). Assert the endpoint returns a 2xx and a
+  # parseable activity shape. We do NOT assert count>0 (the parent may
+  # legitimately have 0 events this early — that's a real, valid state), but
+  # we DO require the call to have actually succeeded and returned valid JSON.
+  ACTIVITY_TMP=$(e2e_tmp /tmp/e2e_activity.XXXXXX)
+  set +e
+  ACTIVITY_CODE=$(tenant_call GET "/activity?workspace_id=$PARENT_ID&limit=5" \
+    -o "$ACTIVITY_TMP" -w "%{http_code}" 2>/dev/null)
+  ACTIVITY_RC=$?
+  set -e
+  ACTIVITY_CODE=${ACTIVITY_CODE:-000}
+  if [ "$ACTIVITY_RC" != "0" ] || [ "$ACTIVITY_CODE" -lt 200 ] || [ "$ACTIVITY_CODE" -ge 300 ]; then
+    fail "Activity-log endpoint unhealthy (curl_rc=$ACTIVITY_RC, http=$ACTIVITY_CODE) — was previously swallowed by '|| echo []' and reported as 0 events (false-green). Body: $(head -c 200 "$ACTIVITY_TMP" 2>/dev/null | sanitize_http_body)"
+  fi
+  ACTIVITY_COUNT=$(python3 -c "import json,sys
+d=json.load(open(sys.argv[1]))
+print(len(d if isinstance(d, list) else d.get('events', [])))" "$ACTIVITY_TMP" 2>/dev/null) \
+    || fail "Activity-log returned HTTP $ACTIVITY_CODE but body was not parseable JSON (events array / {events:[...]}). Body: $(head -c 200 "$ACTIVITY_TMP" 2>/dev/null | sanitize_http_body)"
+  log "    Activity events observed: $ACTIVITY_COUNT (endpoint 2xx + parseable ✓)"
 
   # ─── 9c. Workspace KV memory Edit round-trip ─────────────────────────
   # Pins the Edit affordance added to the canvas Memory tab. The UI calls
@@ -1268,14 +1676,173 @@ except Exception:
   [ -z "$DELEG_TEXT" ] && fail "Delegation returned no text. Raw: ${DELEG_RESP:0:200}"
   ok "Delegation proxy works (child responded: \"${DELEG_TEXT:0:60}\")"
 
-  CHILD_ACT=$(tenant_call GET "/activity?workspace_id=$CHILD_ID&limit=20" 2>/dev/null || echo '[]')
-  if echo "$CHILD_ACT" | grep -q "$PARENT_ID"; then
+  # FAIL-CLOSED via bounded readiness-POLL (was soft-logged false-green).
+  # The activity pipeline is async, so an immediate single read can miss the
+  # parent reference — but "did not reference parent" was previously just
+  # LOGGED and the step passed regardless, so a genuinely broken provenance
+  # pipeline (parent never recorded as source) read as success. Mechanism:
+  # poll the child activity log for the parent id for a bounded window
+  # (E2E_CHILD_ACTIVITY_TIMEOUT_SECS, default 60s) — this is the real
+  # readiness signal (provenance row materialised), not a fixed sleep — and
+  # hard-fail with a named mechanism if it never appears.
+  CHILD_ACT_DEADLINE=$(( $(date +%s) + ${E2E_CHILD_ACTIVITY_TIMEOUT_SECS:-60} ))
+  CHILD_ACT_SEEN=0
+  CHILD_ACT_LASTCODE="000"
+  while true; do
+    CHILD_ACT_TMP=$(e2e_tmp /tmp/e2e_child_act.XXXXXX)
+    set +e
+    CHILD_ACT_CODE=$(tenant_call GET "/activity?workspace_id=$CHILD_ID&limit=20" \
+      -o "$CHILD_ACT_TMP" -w "%{http_code}" 2>/dev/null)
+    set -e
+    CHILD_ACT_LASTCODE=${CHILD_ACT_CODE:-000}
+    if grep -q "$PARENT_ID" "$CHILD_ACT_TMP" 2>/dev/null; then
+      CHILD_ACT_SEEN=1
+      break
+    fi
+    [ "$(date +%s)" -ge "$CHILD_ACT_DEADLINE" ] && break
+    sleep 5
+  done
+  if [ "$CHILD_ACT_SEEN" = "1" ]; then
     ok "Child activity log records parent as source"
   else
-    log "Child activity log did not reference parent (pipeline may be async)"
+    fail "Child activity log never referenced parent $PARENT_ID within ${E2E_CHILD_ACTIVITY_TIMEOUT_SECS:-60}s (last http=$CHILD_ACT_LASTCODE) — delegation-provenance pipeline regression (parent not recorded as source). Previously soft-logged → false-green."
   fi
 fi
 
+# ─── 10b. Pause/Resume + Hibernate/Resume lifecycle transitions ─────────
+# Exercise the REAL workspace lifecycle state machine on the provisioned
+# parent — the transitions that previously had only handler unit tests
+# (handlers_additional_test.go / hibernation_test.go) and NO real-infra
+# coverage. Each transition is asserted against the live DB-backed status the
+# GET /workspaces/:id endpoint returns, so a regression in the Pause/Resume/
+# Hibernate handlers (workspace_restart.go) or their CP stop/re-provision
+# wiring fails the gate instead of silently leaking an EC2 / wedging a tenant.
+#
+# Contract (workspace_restart.go):
+#   POST /pause     online → 'paused'  (container stopped, url cleared)  {"status":"paused"}
+#   POST /resume    paused → 'provisioning' → … → 'online' (re-provision) {"status":"provisioning"}
+#   POST /hibernate online → 'hibernating' → 'hibernated' (container stopped) {"status":"hibernated"}
+#   auto-wake       next A2A message/send on a hibernated ws → online
+#
+# Gated to full MODE (smoke has no parent-stability budget) + E2E_LIFECYCLE.
+# Runs LAST (after all read-only A2A/memory/peer checks) so the pause/stop
+# cycles don't disturb the earlier assertions. Skips are LOUD (logged), and
+# any broken transition hard-fails — never a silent pass.
+if [ "$MODE" = "full" ] && [ "${E2E_LIFECYCLE:-auto}" != "off" ]; then
+  log "10b/11 Lifecycle transitions: pause→resume→online, hibernate→resume(wake) on parent $PARENT_ID..."
+
+  lifecycle_status() {  # echoes the live workspace status
+    tenant_call GET "/workspaces/$PARENT_ID" 2>/dev/null \
+      | python3 -c "import json,sys; print(json.load(sys.stdin).get('status') or '')" 2>/dev/null || echo ""
+  }
+  # Bounded readiness-poll for a target status — same fail-closed shape as
+  # wait_workspaces_online_routable, but for an arbitrary terminal status.
+  wait_status() {  # $1=target $2=timeout_secs $3=label
+    local target="$1" timeout="$2" label="$3"
+    local deadline cur last=""
+    deadline=$(( $(date +%s) + timeout ))
+    while true; do
+      cur=$(lifecycle_status)
+      if [ "$cur" != "$last" ]; then log "    parent status → ${cur:-<empty>}"; last="$cur"; fi
+      [ "$cur" = "$target" ] && return 0
+      if [ "$(date +%s)" -gt "$deadline" ]; then
+        log "    [lifecycle] $label never reached '$target' within ${timeout}s (last='$cur')"
+        return 1
+      fi
+      sleep 10
+    done
+  }
+
+  # ── pause → paused ──
+  PAUSE_RESP=$(tenant_call POST "/workspaces/$PARENT_ID/pause" 2>/dev/null || echo '{}')
+  PAUSE_STATUS=$(echo "$PAUSE_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))" 2>/dev/null || echo "")
+  [ "$PAUSE_STATUS" = "paused" ] || fail "Pause: POST /pause returned status='$PAUSE_STATUS' (expected 'paused'). Body: ${PAUSE_RESP:0:200}"
+  # Poll the DB-backed status — the response body could lie; the GET proves the row.
+  wait_status "paused" 120 "pause" || fail "Pause: workspace $PARENT_ID never settled at status=paused (DB row) — Pause handler / CP stop regression (workspace_restart.go Pause)."
+  ok "    pause → paused (DB-verified)"
+
+  # ── resume → provisioning → online ──
+  RESUME_RESP=$(tenant_call POST "/workspaces/$PARENT_ID/resume" 2>/dev/null || echo '{}')
+  RESUME_STATUS=$(echo "$RESUME_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))" 2>/dev/null || echo "")
+  [ "$RESUME_STATUS" = "provisioning" ] || fail "Resume: POST /resume returned status='$RESUME_STATUS' (expected 'provisioning'). Body: ${RESUME_RESP:0:200}"
+  # Resume re-provisions from the preserved config volume; reuse the same
+  # online+routable readiness boundary the initial boot used (no fresh EC2
+  # cold-start, but CP re-provision + heartbeat recovery can still take minutes).
+  wait_workspaces_online_routable "    Waiting for parent to return online after resume (up to $((WORKSPACE_ONLINE_TIMEOUT_SECS/60)) min)..." "$PARENT_ID"
+  ok "    resume → provisioning → online (DB-verified)"
+
+  # ── hibernate → hibernated ──
+  HIB_RESP=$(tenant_call POST "/workspaces/$PARENT_ID/hibernate?force=true" 2>/dev/null || echo '{}')
+  HIB_STATUS=$(echo "$HIB_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))" 2>/dev/null || echo "")
+  [ "$HIB_STATUS" = "hibernated" ] || fail "Hibernate: POST /hibernate?force=true returned status='$HIB_STATUS' (expected 'hibernated'). Body: ${HIB_RESP:0:200}"
+  # The handler runs the claim→stop→'hibernated' sequence; poll the DB row to
+  # confirm it landed on 'hibernated' (not stuck mid-'hibernating').
+  wait_status "hibernated" 120 "hibernate" || fail "Hibernate: workspace $PARENT_ID never settled at status=hibernated (DB row) — Hibernate handler / CP stop regression (workspace_restart.go HibernateWorkspace)."
+  ok "    hibernate → hibernated (DB-verified)"
+
+  # ── resume-from-hibernate via auto-wake on next A2A ──
+  # A hibernated workspace auto-wakes on the next incoming A2A message/send
+  # (no explicit /resume — Resume only handles status=paused). Send a wake
+  # A2A and assert the workspace returns to online. We accept transient cold
+  # 5xx during wake (same edge class the PONG probe tolerates) and poll the
+  # status to the online boundary rather than asserting on the single A2A code.
+  log "    Hibernate auto-wake: sending A2A to wake hibernated parent..."
+  WAKE_PAYLOAD=$(python3 -c "
+import json, uuid
+print(json.dumps({
+    'jsonrpc': '2.0',
+    'method': 'message/send',
+    'id': 'e2e-wake-1',
+    'params': {
+        'message': {
+            'role': 'user',
+            'messageId': f'e2e-wake-{uuid.uuid4().hex[:8]}',
+            'parts': [{'kind': 'text', 'text': 'This is the platform lifecycle smoke test waking a hibernated workspace. No tools or memory are needed — please respond with exactly the single token: WOKE'}]
+        }
+    }
+}))
+")
+  WAKE_TMP=$(mktemp -t wake_a2a.XXXXXX)
+  for WAKE_ATTEMPT in $(seq 1 12); do
+    : >"$WAKE_TMP"
+    set +e
+    WAKE_CODE=$(tenant_call POST "/workspaces/$PARENT_ID/a2a" \
+      --max-time 90 \
+      -H "Content-Type: application/json" \
+      -d "$WAKE_PAYLOAD" \
+      -o "$WAKE_TMP" -w '%{http_code}' 2>/dev/null)
+    WAKE_RC=$?
+    set -e
+    WAKE_CODE=${WAKE_CODE:-000}
+    if [ "$WAKE_RC" = "0" ] && [ "$WAKE_CODE" -ge 200 ] && [ "$WAKE_CODE" -lt 300 ]; then
+      break
+    fi
+    WAKE_SAFE_BODY=$(cat "$WAKE_TMP" 2>/dev/null | sanitize_http_body)
+    # Wake legitimately returns transient 5xx while the container restarts —
+    # retry that class only (bounded), never a 4xx.
+    if echo "$WAKE_CODE" | grep -Eq '^(502|503|504)$' && [ "$WAKE_ATTEMPT" -lt 12 ]; then
+      log "    wake A2A cold/restart attempt $WAKE_ATTEMPT/12 returned $WAKE_CODE: ${WAKE_SAFE_BODY:0:120}"
+      sleep 15
+      continue
+    fi
+    break
+  done
+  rm -f "$WAKE_TMP"
+  # The auto-wake contract is the STATUS transition (hibernated → online), not
+  # the A2A body content — assert the live DB row, the real readiness signal.
+  wait_status "online" "$WORKSPACE_ONLINE_TIMEOUT_SECS" "hibernate-wake" \
+    || fail "Hibernate auto-wake: parent $PARENT_ID never returned to status=online after a wake A2A (last A2A http=$WAKE_CODE) — auto-wake-on-message regression (a hibernated ws must re-provision on the next A2A)."
+  ok "    hibernate → online via auto-wake A2A (DB-verified)"
+  ok "Lifecycle transitions passed: pause→resume→online + hibernate→wake→online"
+else
+  log "10b/11 Lifecycle transitions skipped (MODE=$MODE, E2E_LIFECYCLE=${E2E_LIFECYCLE:-auto}) — pause/resume/hibernate only run in full mode with E2E_LIFECYCLE!=off."
+fi
+
 # ─── 11. Teardown runs via trap ────────────────────────────────────────
+# Fail-closed-on-skip: before declaring PASS, assert (when CI demanded a live
+# run) that every load-bearing lifecycle milestone actually fired. A run that
+# reaches here without provision→online→A2A having truly happened exits 5
+# instead of reporting green. Teardown still runs (EXIT trap) on that exit.
+require_live_or_die
 log "11/11 All checks passed. Teardown runs via EXIT trap."
 ok "═══ STAGING $MODE-SAAS E2E PASSED ═══"

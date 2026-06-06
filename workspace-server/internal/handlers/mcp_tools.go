@@ -192,7 +192,11 @@ func (h *MCPHandler) toolGetWorkspaceInfo(ctx context.Context, workspaceID strin
 // follow in the order provided, with kind derived from MIME type.
 func buildA2AMessageParts(task string, attachments []AgentMessageAttachment) []map[string]interface{} {
 	parts := []map[string]interface{}{
-		{"type": "text", "text": task},
+		// A2A v0.3 Part discriminator is `kind`, NOT `type` (#2251).
+		// The receiver's v0.3 Pydantic validator drops a Part keyed
+		// `type`, silently losing the task text — the file part below
+		// already uses `kind`, this is the matching fix for text.
+		{"kind": "text", "text": task},
 	}
 	for _, att := range attachments {
 		kind := kindFromMimeType(att.MimeType)

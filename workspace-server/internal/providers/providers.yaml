@@ -28,9 +28,20 @@
 #   display_name       canvas dropdown label
 #   vendor_logo        canvas asset key
 #   protocol           openai | anthropic   (proxy wire format)
-#   auth_mode          anthropic_api | oauth | third_party_anthropic_compat
-#   base_url_template  base URL for the openai-protocol surface (null = CLI/SDK default)
+#   auth_mode          anthropic_api | oauth | third_party_anthropic_compat |
+#                      wif_adc (keyless AWS→GCP WIF server-side mint; the one
+#                      value the proxy ACTS on — triggers vertexauth.Token)
+#   base_url_template  base URL for the openai-protocol surface (null = CLI/SDK
+#                      default). MAY contain {placeholder} tokens resolved at
+#                      resolution time from endpoint_vars (RFC vertex-provider-
+#                      ssot-endpoint §Design 1) — e.g. vertex's {location}/{project}.
 #   base_url_anthropic base URL for the anthropic-protocol surface (where applicable)
+#   endpoint_vars      OPTIONAL map placeholder -> {env, default}: how each
+#                      {placeholder} in base_url_template is resolved (env when
+#                      set + non-empty, else default — the structured form of the
+#                      proxy's envOr). Empty/absent = static URL (today's shape).
+#   wire_model_prefix  OPTIONAL publisher prefix the upstream expects on the wire
+#                      model id ("google/" for vertex). Empty = unprefixed.
 #   auth_env           env var names accepted (NAMES ONLY — never secrets); any one satisfies auth
 #   auth_token_env     env var the adapter projects the vendor key INTO (default ANTHROPIC_AUTH_TOKEN)
 #   model_prefix_match RE2 regex unifying proxy inferLLMProvider prefixes +
@@ -428,15 +439,34 @@ providers:
   #
   # NOTE: display_name ("keyless ADC") and auth_env (GOOGLE_APPLICATION_CREDENTIALS)
   # are now VESTIGIAL — no consumer reads auth_env post-leak-fix, but it must stay
-  # non-empty (providers.go validate). Left as-is to keep this a comment-only,
-  # regen-free change; retiring them is a registry-regen follow-up.
+  # non-empty (providers.go validate). Retiring them is a follow-up.
+  #
+  # RFC vertex-provider-ssot-endpoint (Phase 1): the endpoint that used to live
+  # ONLY in llm_proxy.go's `case "google", "vertex":` fmt.Sprintf is now
+  # expressed HERE as a templated base_url_template + endpoint_vars, and the
+  # keyless WIF mint is declared via auth_mode: wif_adc. The proxy resolves this
+  # row through Manifest.ResolveEndpoint — the interpolated URL is BYTE-IDENTICAL
+  # to the former fmt.Sprintf (drift-gated by TestProxyEndpointsMatchManifest).
+  # wire_model_prefix replaces the proxy's inline `if !HasPrefix(wireModel,
+  # "google/")`. (Phase 2 migrates the remaining static providers; out of scope.)
   - name: vertex
     display_name: "Google Vertex AI (keyless ADC)"
     vendor_logo: "google"
     protocol: openai
-    auth_mode: third_party_anthropic_compat
-    base_url_template: null
+    # wif_adc (AuthModeWIFADC): keyless AWS→GCP Workload Identity Federation
+    # server-side token mint (internal/vertexauth.Token). The ONE auth_mode the
+    # proxy acts on — it triggers the mint instead of a hardcoded `case "vertex"`.
+    auth_mode: wif_adc
+    # Templated endpoint: {location}/{project} interpolated from endpoint_vars
+    # below. Reproduces the proxy's former
+    # fmt.Sprintf("https://%s-aiplatform.googleapis.com/v1beta1/projects/%s/locations/%s/endpoints/openapi", loc, proj, loc).
+    base_url_template: "https://{location}-aiplatform.googleapis.com/v1beta1/projects/{project}/locations/{location}/endpoints/openapi"
     base_url_anthropic: null
+    endpoint_vars:
+      location: { env: MOLECULE_VERTEX_LOCATION, default: us-central1 }
+      project: { env: MOLECULE_VERTEX_PROJECT, default: molecule-vertex }
+    # Vertex requires the publisher-prefixed model id on the wire (google/<model>).
+    wire_model_prefix: "google/"
     auth_env: [GOOGLE_APPLICATION_CREDENTIALS]
     auth_token_env: ANTHROPIC_AUTH_TOKEN
     model_prefix_match: "^vertex:"
@@ -1028,7 +1058,26 @@ runtimes:
           - platform:gemini-2.5-pro
           - platform:gemini-2.5-flash
       # API-key BYOK arm: AI Studio (the tenant's OWN GOOGLE_API_KEY).
+      #
+      # The colon-namespaced `google_genai:` ids are the BYOK spelling the
+      # template's models[] offers (template-google-adk main:
+      # `google_genai:gemini-2.5-pro` / `-flash`, AI-Studio BYOK; the default is
+      # the platform arm above). The runtime adapter (_routing.resolve_model)
+      # treats `google_genai`/`google`/`gemini` as the SAME AI-Studio prefix
+      # family — it strips the prefix to the bare `gemini-2.5-pro` and serves it
+      # via ADK LlmAgent on the AI-Studio backend (GOOGLE_API_KEY) — so both the
+      # bare and `google_genai:` forms resolve to THIS `google` arm. The bare ids
+      # stay (registry-projection / canvas form); the `google_genai:` ids are
+      # ADDED because the LIVE core check is EXACT membership in ModelsForRuntime,
+      # NOT the `^gemini-` prefix (model_registry_validation.go), so without these
+      # exact entries a template BYOK create 422s UNREGISTERED_MODEL_FOR_RUNTIME.
+      # (This corrects the template's own stale comment that `google_genai:` is
+      # covered by the `^gemini-` prefix — it is not; `^gemini-` matches only the
+      # BARE id.) Vertex was intentionally dropped from the runtime arm (cp#514);
+      # the template no longer offers `vertex:`, so no vertex arm is added here.
       - name: google
         models:
           - gemini-2.5-pro
           - gemini-2.5-flash
+          - google_genai:gemini-2.5-pro
+          - google_genai:gemini-2.5-flash

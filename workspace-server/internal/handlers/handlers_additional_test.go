@@ -551,6 +551,9 @@ func TestDiscover_AccessDenied(t *testing.T) {
 	setupTestRedis(t)
 	handler := NewDiscoveryHandler()
 
+	// validateDiscoveryCaller probes HasAnyLiveToken(callerID) first; grandfather.
+	seedDiscoveryGrandfather(mock, "ws-child-a")
+
 	// CanCommunicate: different parents → denied
 	mock.ExpectQuery("SELECT id, parent_id FROM workspaces WHERE id =").
 		WithArgs("ws-child-a").
@@ -581,6 +584,9 @@ func TestDiscover_TargetOffline(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
 	handler := NewDiscoveryHandler()
+
+	// validateDiscoveryCaller probes HasAnyLiveToken(callerID) first; grandfather.
+	seedDiscoveryGrandfather(mock, "ws-caller")
 
 	// Share a parent so communication is allowed under post-#1955 rules
 	sharedParent := "ws-parent"
