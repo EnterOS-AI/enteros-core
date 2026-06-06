@@ -174,6 +174,16 @@ def parse_directives(
         if not parts:
             continue
         first = parts[0]
+        # Em-dash (U+2014) is a common visual separator in user-written
+        # notes, e.g.  /sop-ack Five-Axis — five-axis-review
+        # If raw_slug contains an em-dash, split on the first one so
+        # the part before becomes the slug and the rest becomes the note.
+        note_from_slug = ""
+        slug_source = raw_slug
+        emdash_idx = raw_slug.find("—")
+        if emdash_idx != -1:
+            slug_source = raw_slug[:emdash_idx].strip()
+            note_from_slug = raw_slug[emdash_idx + 1 :].strip()
         # If the slug-capture greedily matched multiple words (e.g.
         # "comprehensive testing"), preserve normalize behavior: join
         # the WHOLE first-word-token only; trailing words get appended to
@@ -186,13 +196,19 @@ def parse_directives(
             # as slug and "testing extra-note" as note. We defer the
             # disambiguation to the caller via the returned canonical
             # slug. For simplicity: try the WHOLE captured string first.
-            canonical = normalize_slug(raw_slug, numeric_aliases)
+            canonical = normalize_slug(slug_source, numeric_aliases)
         else:
-            canonical = normalize_slug(first, numeric_aliases)
+            canonical = normalize_slug(slug_source, numeric_aliases)
         note_from_group = (m.group(3) or "").strip()
-        # If we collapsed multi-word slug into kebab and there's a
-        # trailing-text group too, append it.
-        entry = (kind, canonical, note_from_group)
+        # The em-dash (U+2014) is a visual separator; the regex puts it
+        # in group(3) because it is outside the slug character class.
+        # Strip it so "/sop-ack slug — note" yields just "note".
+        if note_from_group.startswith("—"):
+            note_from_group = note_from_group[1:].strip()
+        # Combine note_from_slug (em-dash split) with note_from_group
+        # (trailing text after the slug captured by the regex group).
+        combined_note = (note_from_slug + " " + note_from_group).strip()
+        entry = (kind, canonical, combined_note)
         if kind == "sop-n/a":
             na_directives.append(entry)
         else:
@@ -1228,10 +1244,13 @@ def main(argv: list[str] | None = None) -> int:
                 )
 
         na_desc = ", ".join(sorted(na_descs)) if na_descs else "(none)"
-        na_status_state = "success" if na_descs else "pending"
+        # internal#818: na-declarations is an informational context, not a merge
+        # gate. An empty declaration list is a terminal success state — pending
+        # here poisons the PR combined status.
+        na_status_state = "success"
         # review-check.sh reads the description to discover which gates are N/A.
         # Include the gate names so it can grep for them.
-        na_description = f"N/A: {na_desc}" if na_descs else "N/A: (none)"
+        na_description = f"N/A: {na_desc}"
 
         if not args.dry_run:
             client.post_status(

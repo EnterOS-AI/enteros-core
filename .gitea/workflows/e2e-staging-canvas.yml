@@ -12,9 +12,30 @@ name: E2E Staging Canvas (Playwright)
 #
 
 # Playwright test suite that provisions a fresh staging org per run and
-# verifies every workspace-panel tab renders without crashing. Complements
-# e2e-staging-saas.yml (which tests the API shape) by exercising the
-# actual browser + canvas bundle against live staging.
+# verifies every workspace-panel tab renders REAL content (not just an
+# empty/errored container). Complements e2e-staging-saas.yml (which tests
+# the API shape) by exercising the actual browser + canvas bundle against
+# live staging.
+#
+# PROMOTION-READINESS (toward making this a HARD merge-gate):
+#   NOW RELIABLE (spec hardened — staging-tabs.spec.ts):
+#     - All waits condition-based (toBeVisible/toHaveAttribute/expect.poll);
+#       no fixed waitForTimeout in the spec.
+#     - Tabs asserted on settled REAL content, not "container visible".
+#     - ErrorBoundary + visible error alerts fail non-degraded tabs.
+#     - Tab-list parity-checked vs live DOM; fail-closed on missing tenant.
+#   STILL BLOCKS PROMOTION-TO-REQUIRED (do NOT remove continue-on-error —
+#   CTO-owned, RFC internal#219 §1):
+#     - Infra dependency: real staging EC2 per run (12-20 min cold boot);
+#       AWS/Cloudflare/CP availability would become merge-blockers.
+#     - Shared-zone TLS/DNS/ACME propagation flake surface is upstream of
+#       this repo and outside its control.
+#     - Required-gate correctness needs CP_STAGING_ADMIN_API_TOKEN GUARANTEED
+#       present; today's skip-if-absent (core#2225) is right for non-gating
+#       but would skip-green a required check.
+#     - Single hermes/platform_managed workspace; agent-dependent content
+#       (live chat/traces round-trip) not exercised on staging (#2162).
+#   The full checklist lives at the foot of canvas/e2e/staging-tabs.spec.ts.
 #
 # Triggers: push to main, PR touching canvas sources + this workflow only
 # after the PR enters `merge-queue`, manual dispatch, and scheduled cron to

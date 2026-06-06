@@ -373,6 +373,9 @@ func TestExtended_DiscoverWithCallerID(t *testing.T) {
 	setupTestRedis(t)
 	handler := NewDiscoveryHandler()
 
+	// validateDiscoveryCaller probes HasAnyLiveToken(callerID) first; grandfather.
+	seedDiscoveryGrandfather(mock, "ws-caller")
+
 	// CanCommunicate needs to look up both workspaces
 	// Share a parent so communication is allowed under post-#1955 rules
 	sharedParent := "ws-parent"
@@ -463,6 +466,9 @@ func TestExtended_Peers(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
 	handler := NewDiscoveryHandler()
+
+	// validateDiscoveryCaller probes HasAnyLiveToken(:id) first; grandfather.
+	seedDiscoveryGrandfather(mock, "ws-peer")
 
 	// Expect parent_id lookup for requesting workspace (root-level, no parent)
 	mock.ExpectQuery("SELECT parent_id FROM workspaces WHERE id =").

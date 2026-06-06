@@ -10,6 +10,7 @@ import {
   buildProviderCatalog,
   buildProviderCatalogFromRegistry,
   findProviderForModel,
+  isPlatformManagedProvider,
   type SelectorModel,
   type SelectorValue,
   type RegistryProvider,
@@ -290,7 +291,15 @@ export function CreateWorkspaceButton() {
       setError("Model is required");
       return;
     }
-    if (!isExternal && selectedLLMProvider?.envVars.length && !llmSecret.trim()) {
+    // Platform-managed providers need NO user credential — the platform injects
+    // its own usage token (MOLECULE_LLM_USAGE_TOKEN = tenant admin_token) at
+    // provision time. Only BYOK providers require a user-supplied key. (#2245)
+    if (
+      !isExternal &&
+      !isPlatformManagedProvider(selectedLLMProvider) &&
+      selectedLLMProvider?.envVars.length &&
+      !llmSecret.trim()
+    ) {
       setError("Provider credential is required");
       return;
     }
@@ -325,7 +334,11 @@ export function CreateWorkspaceButton() {
           ? {
               model: llmSelection.model.trim(),
               llm_provider: nativeProvider.vendor,
-              ...(nativeProvider.envVars.length > 0
+              // Only BYOK providers carry a user secret. For platform-managed
+              // the token is provisioner-injected; sending an (empty) secret
+              // here would clobber it — so omit it entirely. (#2245)
+              ...(nativeProvider.envVars.length > 0 &&
+              !isPlatformManagedProvider(nativeProvider)
                 ? { secrets: { [nativeProvider.envVars[0]]: llmSecret.trim() } }
                 : {}),
             }
@@ -521,20 +534,26 @@ export function CreateWorkspaceButton() {
                   idPrefix="create-workspace-llm"
                   variant="stack"
                 />
-                {selectedLLMProvider.envVars.length > 0 && (
-                  <div>
-                    <label htmlFor="llm-secret-input" className="text-[11px] text-ink-mid block mb-1">
-                      {selectedLLMProvider.envVars[0]}
-                    </label>
-                    <input
-                      id="llm-secret-input"
-                      type="password"
-                      value={llmSecret}
-                      onChange={(e) => setLLMSecret(e.target.value)}
-                      autoComplete="off"
-                      className="w-full bg-surface-card/60 border border-line/50 rounded-lg px-3 py-2 text-sm text-ink placeholder-ink-soft focus:outline-none focus:border-accent/60 focus:ring-1 focus:ring-accent/20 transition-colors font-mono"
-                    />
+                {isPlatformManagedProvider(selectedLLMProvider) ? (
+                  <div className="text-[11px] text-ink-soft">
+                    Platform-managed — no API key required.
                   </div>
+                ) : (
+                  selectedLLMProvider.envVars.length > 0 && (
+                    <div>
+                      <label htmlFor="llm-secret-input" className="text-[11px] text-ink-mid block mb-1">
+                        {selectedLLMProvider.envVars[0]}
+                      </label>
+                      <input
+                        id="llm-secret-input"
+                        type="password"
+                        value={llmSecret}
+                        onChange={(e) => setLLMSecret(e.target.value)}
+                        autoComplete="off"
+                        className="w-full bg-surface-card/60 border border-line/50 rounded-lg px-3 py-2 text-sm text-ink placeholder-ink-soft focus:outline-none focus:border-accent/60 focus:ring-1 focus:ring-accent/20 transition-colors font-mono"
+                      />
+                    </div>
+                  )
                 )}
               </div>
             )}

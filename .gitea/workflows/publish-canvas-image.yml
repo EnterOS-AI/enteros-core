@@ -208,6 +208,11 @@ jobs:
           build-args: |
             NEXT_PUBLIC_PLATFORM_URL=${{ steps.build_args.outputs.platform_url }}
             NEXT_PUBLIC_WS_URL=${{ steps.build_args.outputs.ws_url }}
+            # Bake the merge SHA into the image so /api/buildinfo reports the
+            # served canvas SHA (core#2235). Mirrors how the platform image
+            # surfaces GIT_SHA at /buildinfo. Full 40-char SHA (not the
+            # 7-char tag) so the fleet redeploy verification can match exactly.
+            BUILD_SHA=${{ github.sha }}
           # Ordered deploy (core#2226): the build job pushes the immutable
           # per-commit tag + the build-tracking staging-latest + the legacy
           # back-compat :sha-<sha> tag. It does NOT push :latest — :latest is

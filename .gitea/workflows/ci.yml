@@ -364,6 +364,25 @@ jobs:
           # check missed. If a refactor weakens the gate to a shape check,
           # this step goes red on every PR.
           bash tests/e2e/test_completion_assert_unit.sh
+          # harden/e2e-staging-saas-failclosed: fail-direction proof for the
+          # E2E_REQUIRE_LIVE fail-closed-on-skip guard in
+          # test_staging_full_saas.sh. Offline (no LLM/network/provisioning):
+          # asserts the guard exits 5 when a live lifecycle did NOT run and
+          # passes when all milestones fired — so a refactor that lets the
+          # staging gate report green without a real provision→online→A2A
+          # cycle goes red on every PR.
+          bash tests/e2e/test_require_live_guard_unit.sh
+          # harden/enforce-ci-gates-core-v2 (PR #2286): fail-direction proof
+          # for the E2E_REQUIRE_LIVE zero-validated gate in
+          # test_priority_runtimes_e2e.sh (the REQUIRED `E2E API Smoke Test`).
+          # Offline (no LLM/network/provisioning): sources that script under
+          # its unit source-guard and drives the REAL evaluate_require_live_gate
+          # — asserts REQUIRE_LIVE=1 + zero validated → RED (the false-green
+          # trap), REQUIRE_LIVE=1 + >=1 validated → GREEN, and REQUIRE_LIVE
+          # unset + zero validated → GREEN (loud skip). CI can't provision a
+          # live arm to prove this, so this unit test IS the regression gate:
+          # a revert of the zero-validated→RED logic goes red on every PR.
+          bash tests/e2e/test_require_live_priority_gate_unit.sh
 
       - if: ${{ needs.changes.outputs.scripts == 'true' }}
         name: Test ECR promote-tenant-image script (mock-driven, no live infra)

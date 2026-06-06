@@ -48,14 +48,42 @@ run_test "hermes → slash-form (derive-provider.sh contract)"       hermes     
 run_test "codex → slash-form fallback"                             codex       "openai/gpt-4o"
 run_test "claude-code → OAuth/default alias"                      claude-code "sonnet"
 
+# BARE registered BYOK id (registry_gen.go:88), NOT colon `minimax:…`. On
+# claude-code the colon form is intentionally UNREGISTERED (the adapter can't
+# strip `minimax:`) and 422s create-validation (internal#718, job 295075);
+# bare resolves to provider=minimax BYOK. Pinned by the matrix test's
+# colon-vs-slash-vs-bare triple in derive_provider_matrix_test.go.
 got=$(unset E2E_MODEL_SLUG E2E_ANTHROPIC_API_KEY; E2E_MINIMAX_API_KEY="mx-test" pick_model_slug claude-code)
-assert_eq "claude-code + MiniMax key → MiniMax model"             "$got" "MiniMax-M2"
+assert_eq "claude-code + MiniMax key → bare registered MiniMax model" "$got" "MiniMax-M2.7"
 
 got=$(unset E2E_MODEL_SLUG E2E_MINIMAX_API_KEY; E2E_ANTHROPIC_API_KEY="sk-ant-test" pick_model_slug claude-code)
 assert_eq "claude-code + Anthropic API key → Anthropic API model" "$got" "claude-sonnet-4-6"
 
 got=$(unset E2E_MODEL_SLUG; E2E_MINIMAX_API_KEY="mx-priority" E2E_ANTHROPIC_API_KEY="sk-ant-loser" pick_model_slug claude-code)
-assert_eq "claude-code + both keys → MiniMax priority"            "$got" "MiniMax-M2"
+assert_eq "claude-code + both keys → MiniMax priority (bare)"     "$got" "MiniMax-M2.7"
+
+# ── seo-agent (claude-code-adapter template variant) ──
+# seo-agent shares the claude-code dispatch branch (it reuses the claude-code
+# adapter + the same copied providers block). Pin that it resolves IDENTICALLY
+# to claude-code for every key path so a future refactor can't accidentally
+# fork seo-agent's model selection from claude-code's.
+run_test "seo-agent → claude-code default alias"                  seo-agent   "sonnet"
+
+got=$(unset E2E_MODEL_SLUG E2E_ANTHROPIC_API_KEY; E2E_MINIMAX_API_KEY="mx-test" pick_model_slug seo-agent)
+assert_eq "seo-agent + MiniMax key → bare MiniMax model (==claude-code)" "$got" "MiniMax-M2.7"
+
+got=$(unset E2E_MODEL_SLUG E2E_MINIMAX_API_KEY; E2E_ANTHROPIC_API_KEY="sk-ant-test" pick_model_slug seo-agent)
+assert_eq "seo-agent + Anthropic key → Anthropic model (==claude-code)" "$got" "claude-sonnet-4-6"
+
+# ── google-adk (Gemini) ──
+# AI-Studio BYOK arm → bare gemini-2.5-pro (providers.yaml runtimes.google-adk
+# `google` arm). The platform/Vertex arm is selected via E2E_LLM_PATH=platform
+# (a platform: id), not this dispatch. Pin the bare form so a drift to the
+# platform id (which would change billing/route) is caught.
+run_test "google-adk → AI-Studio bare gemini id"                  google-adk  "gemini-2.5-pro"
+
+got=$(E2E_MODEL_SLUG="google_genai:gemini-2.5-pro" pick_model_slug google-adk)
+assert_eq "google-adk + E2E_MODEL_SLUG override (adapter spelling)" "$got" "google_genai:gemini-2.5-pro"
 
 # ── Fallback for unknown runtime ──
 # Picks slash-form (hermes-shaped) since hermes is the historical

@@ -174,6 +174,11 @@ type WorkspaceCompute struct {
 	// disk (wiped each recreate — privacy); "" = auto (desktop-control persists,
 	// others follow the org flag). Forwarded verbatim to CP's data_persistence.
 	DataPersistence string `json:"data_persistence,omitempty"`
+	// Provider is the CLOUD/compute backend for this workspace box (multi-provider
+	// RFC, per-workspace): ""/"aws" = default EC2; "hetzner"/"gcp" route to the
+	// CP WorkspaceProvisioner. Distinct from the LLM/model provider. Forwarded to
+	// CP /cp/workspaces/provision `provider`.
+	Provider string `json:"provider,omitempty"`
 }
 
 type CreateWorkspacePayload struct {

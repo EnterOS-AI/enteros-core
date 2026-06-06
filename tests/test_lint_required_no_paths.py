@@ -527,15 +527,13 @@ def test_multi_required_one_bad_one_good_fails(
             assert "good.yml" not in ln
 
 
-def test_protection_403_treated_as_skip(lint_module, monkeypatch, capsys):
-    """If the token can't read branch_protections (HTTP 403), exit 0
-    with a clear ::error::-but-non-fatal note. Same scope-fallback shape
-    as ci-required-drift.py per the precedent.
-
-    Rationale: if the lint workflow itself can't read protection, the PR
-    can't make THIS state worse (a paths-filter PR was already addable
-    without the lint). Better to surface a token-scope problem loudly
-    than to red-X every PR until the token is fixed.
+def test_protection_403_fails_closed(lint_module, monkeypatch, capsys):
+    """AUTH FAILURE → FAIL CLOSED (exit 4). If the token can't read
+    branch_protections (HTTP 401/403), the lint CANNOT enumerate the
+    required-check set and therefore CANNOT verify the no-paths-filter
+    invariant. This is a HARD gate on a protected (same-repo PR) context,
+    so it MUST fail loud rather than green an unverifiable gate — fix the
+    token, not the lint.
     """
     stub = _make_stub_api({
         ("GET", "/repos/owner/repo/branch_protections/main"): (
@@ -546,7 +544,26 @@ def test_protection_403_treated_as_skip(lint_module, monkeypatch, capsys):
     })
     monkeypatch.setattr(lint_module, "api", stub)
     rc = lint_module.run()
-    assert rc == 0
+    assert rc == 4
     err = capsys.readouterr().err
     assert "::error::" in err
     assert "403" in err
+
+
+def test_protection_404_skips_gracefully(lint_module, monkeypatch, capsys):
+    """Authenticated 404 (branch genuinely has no protection) is the one
+    tolerated degradation: there are no required contexts to check.
+    Exit 0 with a ::warning:: — NOT a fail-open (this is a real read of an
+    absent resource with a valid token, not an auth failure)."""
+    stub = _make_stub_api({
+        ("GET", "/repos/owner/repo/branch_protections/main"): (
+            lint_module.ApiError(
+                "GET /repos/owner/repo/branch_protections/main → HTTP 404: not found"
+            )
+        ),
+    })
+    monkeypatch.setattr(lint_module, "api", stub)
+    rc = lint_module.run()
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "404" in err

@@ -113,6 +113,29 @@ jobs:
     runs-on: docker-host
     # Phase 3 (RFC #219 §1): surface broken workflows without blocking.
     # mc#1982: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
+    #
+    # PROMOTION-READINESS (toward required gate — do NOT flip continue-on-error
+    # without CTO sign-off, that's the irreversible call):
+    #   NOW FAIL-CLOSED:
+    #     - Postgres/Redis/platform/canvas readiness are already bounded
+    #       readiness-polls that hard-fail (and dump logs) at their deadline,
+    #       not fixed sleeps — preserved.
+    #     - passWithNoTests:false + forbidOnly (playwright.config.ts) → a
+    #       renamed/moved spec or stray test.only can no longer green the lane.
+    #     - REQUIRE-LIVE guard in "Run Playwright E2E tests" → chat==true must
+    #       actually execute >=1 test, else exit 1.
+    #     - chat-desktop "activity log" test no longer swallows its assertion.
+    #   STILL BLOCKS PROMOTION:
+    #     - The echo round-trip asserts on rendered "Echo: ..." text but never
+    #       asserts the echo runtime actually RECEIVED the A2A request
+    #       (fixtures/echo-runtime.ts exposes lastRequest, unused) — an
+    #       optimistic client-side render could pass without a real round-trip.
+    #       Add a server-received assertion before required.
+    #     - The "No-op pass" path (detect-changes chat!=true) is a legitimate
+    #       paths-filter skip, but a required gate needs it to be a neutral
+    #       check, not a green "success", so a skipped heavy lane can't be
+    #       mistaken for a passed one.
+    # mc#1982: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
     continue-on-error: true
     timeout-minutes: 15
     env:
@@ -334,11 +357,32 @@ jobs:
       - name: Run Playwright E2E tests
         if: needs.detect-changes.outputs.chat == 'true'
         working-directory: canvas
+        env:
+          # CI=1 activates forbidOnly in playwright.config.ts (a stray
+          # `test.only` would otherwise green the suite while skipping the
+          # rest). passWithNoTests:false (also in the config) already makes
+          # a zero-match selection exit non-zero.
+          CI: "1"
         run: |
+          set -euo pipefail
           export E2E_PLATFORM_URL="http://127.0.0.1:${PLATFORM_PORT}"
           export E2E_DATABASE_URL="${DATABASE_URL}"
           export PLAYWRIGHT_BASE_URL="http://localhost:${CANVAS_PORT}"
-          npx playwright test e2e/chat-desktop.spec.ts e2e/chat-mobile.spec.ts
+
+          # REQUIRE-LIVE guard (mirrors CP serving-e2e SERVING_E2E_REQUIRE_LIVE):
+          # this lane reached here only because detect-changes said chat==true,
+          # so it MUST actually execute the round-trip specs. `pipefail` makes
+          # a real test failure (playwright non-zero) abort here under `set -e`;
+          # passWithNoTests:false makes a zero-match selection non-zero too. The
+          # explicit grep below is belt-and-braces: assert the list reporter
+          # printed an executed-count summary, so a silent all-skip / no-op can
+          # never report green.
+          npx playwright test e2e/chat-desktop.spec.ts e2e/chat-mobile.spec.ts \
+            --reporter=list 2>&1 | tee /tmp/pw-chat.out
+          if ! grep -qE '[0-9]+ (passed|failed|skipped)' /tmp/pw-chat.out; then
+            echo "::error::E2E Chat REQUIRE-LIVE: chat==true but Playwright reported no executed tests — specs missing or all-skipped, refusing to report green."
+            exit 1
+          fi
 
       - name: Dump platform log on failure
         if: failure() && needs.detect-changes.outputs.chat == 'true'
