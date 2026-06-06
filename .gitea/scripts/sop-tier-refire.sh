@@ -105,12 +105,26 @@ if [ "${SOP_REFIRE_DISABLE_RATE_LIMIT:-}" != "1" ]; then
 fi
 
 # 3. Invoke sop-tier-check.sh with the env it expects.
-# The canonical workflow intentionally fail-opens the job conclusion
-# (`bash .gitea/scripts/sop-tier-check.sh || true`) while Gitea branch
-# protection enforces reviewer approvals separately. Keep the refire path
-# aligned with that workflow status behavior; otherwise /refire-tier-check can
-# post a hard failure that the canonical pull_request_target workflow would
-# not publish.
+#
+# FAIL-CLOSED contract (was fail-open — fixed 2026-06-05,
+# fix/core-ci-fail-closed). The previous shape was:
+#     bash "$SCRIPT" || true
+#     TIER_EXIT=0          # <-- hardcoded success
+# which discarded the real verdict and ALWAYS POSTed
+# `state=success` for the REQUIRED context
+# `sop-tier-check / tier-check (pull_request)`. That meant ANY
+# collaborator could comment `/refire-tier-check` to forcibly green
+# the SOP-6 approval gate on the PR head SHA — a fail-open AND a
+# privilege bypass of branch protection. The canonical
+# pull_request_target workflow's conclusion publishes the same
+# context honestly (red on a real violation); the refire MUST mirror
+# THAT honesty, not a discarded exit code.
+#
+# We now capture the script's real exit code under `set +e` and POST
+# success ONLY when it actually exited 0. sop-tier-check.sh itself
+# fails closed on infra faults (no SOP_FAIL_OPEN in this refire env),
+# so a bad token / unreachable API / missing jq → non-zero → we POST
+# `state=failure`, never a false green.
 #
 # SOP_REFIRE_TIER_CHECK_SCRIPT env var lets tests substitute a mock —
 # sop-tier-check.sh uses bash 4+ associative arrays which trigger a known
@@ -125,7 +139,10 @@ if [ ! -f "$SCRIPT" ]; then
 fi
 
 # Re-invoke. Pipe stdout/stderr through so the runner log shows the
-# tier-check decision inline.
+# tier-check decision inline. Capture the REAL exit code (set +e so a
+# non-zero verdict doesn't abort this script under set -e) — the POST
+# below keys off it, so a failed tier-check posts state=failure.
+set +e
 GITEA_TOKEN="$GITEA_TOKEN" \
   GITEA_HOST="$GITEA_HOST" \
   REPO="$REPO" \
@@ -133,8 +150,9 @@ GITEA_TOKEN="$GITEA_TOKEN" \
   PR_AUTHOR="$PR_AUTHOR" \
   SOP_DEBUG="${SOP_DEBUG:-0}" \
   SOP_LEGACY_CHECK="${SOP_LEGACY_CHECK:-0}" \
-  bash "$SCRIPT" || true
-TIER_EXIT=0
+  bash "$SCRIPT"
+TIER_EXIT=$?
+set -e
 debug "sop-tier-check.sh exit=$TIER_EXIT"
 
 # 4. POST the resulting status.
@@ -170,4 +188,12 @@ if [ "$POST_HTTP" != "200" ] && [ "$POST_HTTP" != "201" ]; then
 fi
 
 echo "::notice::sop-tier-refire posted state=$STATE for context=\"$CONTEXT\" on sha=$HEAD_SHA"
-exit "$TIER_EXIT"
+# Exit 0: the refire JOB succeeded — it re-evaluated the gate and posted
+# an HONEST status. The gate VERDICT is carried by the POSTed status
+# ($STATE), which is what branch protection reads; a failing tier-check
+# posts state=failure (red on the PR), so there is no fail-open. We do
+# NOT also exit non-zero on a failing verdict — that would double-signal
+# the same failure as both a red status AND a red refire job. The
+# fail-open that mattered (TIER_EXIT hardcoded to 0 → always state=success)
+# is fixed above by capturing the real exit code.
+exit 0

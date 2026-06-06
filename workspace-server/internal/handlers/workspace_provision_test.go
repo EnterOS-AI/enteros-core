@@ -845,6 +845,7 @@ func TestBuildProvisionerConfig_BasicFields(t *testing.T) {
 		map[string][]byte{"config.yaml": []byte("name: test")},
 		models.CreateWorkspacePayload{Tier: 1, Runtime: "claude-code"},
 		map[string]string{"API_KEY": "secret"},
+		nil,
 		pluginsPath,
 	)
 
@@ -893,11 +894,77 @@ func TestBuildProvisionerConfig_WorkspacePathFromEnv(t *testing.T) {
 		nil,
 		models.CreateWorkspacePayload{Tier: 2, Runtime: "claude-code"},
 		nil,
+		nil,
 		pluginsPath,
 	)
 
 	if cfg.WorkspacePath != workspaceDir {
 		t.Errorf("expected WorkspacePath from env, got %q", cfg.WorkspacePath)
+	}
+}
+
+// ==================== loadWorkspaceSecrets provenance (forensic #145) ====================
+
+// TestLoadWorkspaceSecrets_WorkspaceKeysProvenance pins the positive
+// provenance side-channel added for forensic #145: a key sourced from
+// workspace_secrets must land in the third return value (workspaceKeys),
+// while a key sourced only from global_secrets must NOT. A key present in
+// BOTH stores is treated as workspace-authored (workspace overrides global),
+// so it lands in workspaceKeys AND is removed from globalKeys.
+func TestLoadWorkspaceSecrets_WorkspaceKeysProvenance(t *testing.T) {
+	mock := setupTestDB(t)
+
+	// global_secrets: an operator-store GITEA_TOKEN (the bleed channel) and
+	// an OPERATOR_ONLY key that no workspace row re-sets.
+	globalRows := sqlmock.NewRows([]string{"key", "encrypted_value", "encryption_version"}).
+		AddRow("GITEA_TOKEN", []byte("operator-store-gitea"), 0).
+		AddRow("OPERATOR_ONLY", []byte("op-val"), 0)
+	mock.ExpectQuery(`SELECT key, encrypted_value, encryption_version FROM global_secrets`).
+		WillReturnRows(globalRows)
+
+	// workspace_secrets: the user/org-admin re-authors GITEA_TOKEN (override)
+	// and adds a workspace-only WS_ONLY key. encryption_version 0 = plaintext
+	// passthrough (crypto.DecryptVersioned).
+	wsRows := sqlmock.NewRows([]string{"key", "encrypted_value", "encryption_version"}).
+		AddRow("GITEA_TOKEN", []byte("workspace-authored-gitea"), 0).
+		AddRow("WS_ONLY", []byte("ws-val"), 0)
+	mock.ExpectQuery(`SELECT key, encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1`).
+		WithArgs("ws-prov").
+		WillReturnRows(wsRows)
+
+	envVars, globalKeys, workspaceKeys, errMsg := loadWorkspaceSecrets(context.Background(), "ws-prov")
+	if errMsg != "" {
+		t.Fatalf("loadWorkspaceSecrets returned error: %q", errMsg)
+	}
+
+	// Workspace override wins on value precedence.
+	if got := envVars["GITEA_TOKEN"]; got != "workspace-authored-gitea" {
+		t.Errorf("GITEA_TOKEN value = %q; want workspace-authored override", got)
+	}
+
+	// workspaceKeys: both workspace-sourced keys present.
+	if _, ok := workspaceKeys["GITEA_TOKEN"]; !ok {
+		t.Errorf("GITEA_TOKEN (re-authored via workspace_secrets) missing from workspaceKeys: %v", workspaceKeys)
+	}
+	if _, ok := workspaceKeys["WS_ONLY"]; !ok {
+		t.Errorf("WS_ONLY (workspace_secrets) missing from workspaceKeys: %v", workspaceKeys)
+	}
+	// OPERATOR_ONLY came only from global_secrets → NOT workspace-authored.
+	if _, ok := workspaceKeys["OPERATOR_ONLY"]; ok {
+		t.Errorf("OPERATOR_ONLY (global_secrets only) wrongly present in workspaceKeys: %v", workspaceKeys)
+	}
+
+	// globalKeys: GITEA_TOKEN's operator-bleed flag dropped by the override;
+	// OPERATOR_ONLY stays flagged.
+	if _, ok := globalKeys["GITEA_TOKEN"]; ok {
+		t.Errorf("GITEA_TOKEN should be removed from globalKeys after workspace override: %v", globalKeys)
+	}
+	if _, ok := globalKeys["OPERATOR_ONLY"]; !ok {
+		t.Errorf("OPERATOR_ONLY missing from globalKeys: %v", globalKeys)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations not met: %v", err)
 	}
 }
 

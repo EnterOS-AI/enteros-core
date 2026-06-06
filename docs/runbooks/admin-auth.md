@@ -1,5 +1,29 @@
 # Admin Authentication Runbook
 
+## Auth is fail-CLOSED in every environment — `ADMIN_TOKEN` is the bootstrap credential
+
+Per the CTO "nothing should be fail-open" directive, **every** auth path on the
+workspace-server fails closed — there is no dev-mode / zero-token / DB-outage
+hatch that grants access. This includes:
+
+- `AdminAuth` and `WorkspaceAuth` (admin + per-workspace routes),
+- `CanvasOrBearer` (the cosmetic `PUT /canvas/viewport` route), and
+- `validateDiscoveryCaller` (`/registry/:id/peers`, `/registry/discover/:id`).
+
+Consequence for **bootstrap**: a brand-new self-hosted / dev install has **no
+DB-backed tokens yet**, and there is no longer a fail-open that lets the first
+request through. The **only** way to reach admin routes (and to mint the first
+workspace token via `POST /admin/workspaces/:id/tokens`) is to set `ADMIN_TOKEN`
+in the platform environment and present it as the bearer. This is the "local
+mimics production" principle: there is no zero-config bootstrap.
+
+- **Local dev:** `scripts/dev-start.sh` provisions a deterministic
+  `ADMIN_TOKEN` into `.env` (and exports the matching `NEXT_PUBLIC_ADMIN_TOKEN`
+  so the canvas authenticates with it). See `docs/quickstart.md`.
+- **Self-hosted / SaaS:** set `ADMIN_TOKEN` to a strong random secret
+  (`openssl rand -base64 32`) in the platform env and bake the matching
+  `NEXT_PUBLIC_ADMIN_TOKEN` into the canvas bundle.
+
 ## Required: set `MOLECULE_ENV` in all non-dev environments
 
 ```bash
@@ -7,8 +31,10 @@
 MOLECULE_ENV=production
 ```
 
-This matches the production tenant default and disables development-only
-shortcuts. Staging and production smoke tests should use the real user/API
+This matches the production tenant default. NOTE: `MOLECULE_ENV` no longer gates
+any auth decision — it only drives NON-security local-dev conveniences (loopback
+bind, relaxed rate limit). Setting it to `dev`/`development` does **not** relax
+authentication. Staging and production smoke tests should use the real user/API
 workflow: create a workspace, then mint a one-time displayed workspace bearer
 with `POST /admin/workspaces/:id/tokens`.
 
@@ -23,5 +49,7 @@ The platform uses `ADMIN_TOKEN` as the bearer credential for admin-gated endpoin
 | `POST /org/import` | `Authorization: Bearer <ADMIN_TOKEN>` |
 | `POST /admin/workspaces/:id/tokens` | `Authorization: Bearer <ADMIN_TOKEN>`; plaintext token returned once |
 
-Missing or invalid `ADMIN_TOKEN` → AdminAuth fails open in dev mode (no token set), or
-returns 401 in production mode (token set but invalid).
+Missing or invalid bearer → **401 in every environment** (fail-closed; no
+dev-mode fail-open). If the auth datastore is unreachable, auth-gated routes
+return **503** (`platform_unavailable`) — an availability tradeoff that grants no
+access — rather than allowing the request through.

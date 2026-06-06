@@ -116,6 +116,56 @@ func TestChannelHandler_List(t *testing.T) {
 	}
 }
 
+func TestChannelHandler_List_InvalidJSON_FallsBack(t *testing.T) {
+	mock := setupTestDB(t)
+	handler := NewChannelHandler(newTestChannelManager())
+
+	rows := sqlmock.NewRows([]string{
+		"id", "workspace_id", "channel_type", "channel_config", "enabled",
+		"allowed_users", "last_message_at", "message_count", "created_at", "updated_at",
+	}).AddRow(
+		"ch-bad", "ws-1", "telegram",
+		[]byte(`{not valid json`),
+		true, []byte(`[also not json`), nil, 0, nil, nil,
+	)
+	mock.ExpectQuery("SELECT .* FROM workspace_channels WHERE workspace_id").
+		WithArgs("ws-1").
+		WillReturnRows(rows)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request, _ = http.NewRequest("GET", "/workspaces/ws-1/channels", nil)
+	c.Params = gin.Params{{Key: "id", Value: "ws-1"}}
+
+	handler.List(c)
+
+	if w.Code != 200 {
+		t.Errorf("expected 200, got %d", w.Code)
+	}
+
+	var result []map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &result)
+	if len(result) != 1 {
+		t.Fatalf("expected 1 channel, got %d", len(result))
+	}
+
+	config, ok := result[0]["config"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected config to be a map, got %T", result[0]["config"])
+	}
+	if len(config) != 0 {
+		t.Errorf("expected empty config after unmarshal fallback, got %v", config)
+	}
+
+	allowed, ok := result[0]["allowed_users"].([]interface{})
+	if !ok {
+		t.Fatalf("expected allowed_users to be a slice, got %T", result[0]["allowed_users"])
+	}
+	if len(allowed) != 0 {
+		t.Errorf("expected empty allowed_users after unmarshal fallback, got %v", allowed)
+	}
+}
+
 // ==================== Create ====================
 
 func TestChannelHandler_Create_Success(t *testing.T) {
@@ -543,6 +593,41 @@ func TestChannelHandler_Webhook_UnknownType(t *testing.T) {
 
 	if w.Code != 404 {
 		t.Errorf("expected 404 for unknown type, got %d", w.Code)
+	}
+}
+
+// TestChannelHandler_Webhook_InvalidJSON_FallsBack verifies that when the DB
+// row contains invalid JSON for channel_config or allowed_users, the webhook
+// handler logs the error and falls back to an empty map/slice rather than
+// leaving the fields nil (which would panic on downstream code that expects
+// concrete values). With empty config there is no chat_id match, so the
+// handler returns {"status":"no_channel"}.
+func TestChannelHandler_Webhook_InvalidJSON_FallsBack(t *testing.T) {
+	mock := setupTestDB(t)
+	handler := NewChannelHandler(newTestChannelManager())
+
+	mock.ExpectQuery(`SELECT id, workspace_id, channel_type, channel_config, enabled, allowed_users FROM workspace_channels WHERE channel_type = .* AND enabled = true`).
+		WithArgs("telegram").
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "workspace_id", "channel_type", "channel_config", "enabled", "allowed_users",
+		}).AddRow("ch-bad", "ws-1", "telegram", []byte(`{bad json`), true, []byte(`[bad json`)))
+
+	body := `{"update_id":1,"message":{"message_id":1,"from":{"id":111,"is_bot":false,"first_name":"Test","username":"testuser"},"chat":{"id":-100123,"title":"Test Group","type":"supergroup"},"date":1700000000,"text":"hello"}}`
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/webhooks/telegram", strings.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Params = gin.Params{{Key: "type", Value: "telegram"}}
+
+	handler.Webhook(c)
+
+	if w.Code != 200 {
+		t.Errorf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["status"] != "no_channel" {
+		t.Errorf("expected status 'no_channel', got %v", resp["status"])
 	}
 }
 
