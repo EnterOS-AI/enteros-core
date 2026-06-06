@@ -601,6 +601,8 @@ def _stale_pr_update_409_monkeypatch(monkeypatch, queued_issues, calls):
     monkeypatch.setattr(mq, "WATCH_BRANCH", "main")
     monkeypatch.setattr(mq, "QUEUE_LABEL", "merge-queue")
     monkeypatch.setattr(mq, "HOLD_LABEL", "merge-queue-hold")
+    monkeypatch.setattr(mq, "AUTO_DISCOVER", True)
+    monkeypatch.setattr(mq, "OPT_OUT_LABELS", {"merge-queue-hold", "do-not-auto-merge", "wip"})
     monkeypatch.setattr(mq, "REVIEWER_SET", REVIEWERS)
     monkeypatch.setattr(mq, "get_branch_protection", lambda branch: mq.BranchProtection(
         required_contexts=["CI / all-required (pull_request)"],
@@ -616,7 +618,8 @@ def _stale_pr_update_409_monkeypatch(monkeypatch, queued_issues, calls):
         return {"state": "success", "statuses": [{"context": ctx, "status": "success"}]}
     monkeypatch.setattr(mq, "get_combined_status", fake_combined)
 
-    monkeypatch.setattr(mq, "list_queued_issues", lambda: queued_issues)
+    # Scan-loop process_once enumerates candidates via list_candidate_issues.
+    monkeypatch.setattr(mq, "list_candidate_issues", lambda *, auto_discover: queued_issues)
     monkeypatch.setattr(mq, "get_pull", lambda n: {
         "state": "open", "number": n, "mergeable": True,
         "base": {"ref": "main", "repo_id": 1},
@@ -646,6 +649,7 @@ def _stale_pr_update_409_monkeypatch(monkeypatch, queued_issues, calls):
 
     def fake_add_label(pr_number, label_name, *, dry_run):
         calls["hold_label"] = (pr_number, label_name)
+        calls.setdefault("holds", []).append((pr_number, label_name))
     monkeypatch.setattr(mq, "add_label_by_name", fake_add_label)
     monkeypatch.setattr(mq, "post_comment", lambda *a, **k: None)
 
@@ -675,9 +679,12 @@ def test_process_once_holds_pr_on_409_conflict_on_update(monkeypatch):
 
 
 def test_queue_advances_past_held_conflicted_pr(monkeypatch):
-    """End-to-end HOL proof for #2352: PR #1409 (oldest) hits a 409-on-update
-    and is held; on the NEXT tick choose_next_queued_issue must SKIP the held
-    PR and select the next ready PR (#1500) instead of stalling on #1409."""
+    """End-to-end HOL proof for #2352 under the scan-loop architecture: PR #1409
+    (oldest) hits a 409-on-update and is HELD (HOLD_LABEL applied); once held it
+    carries an opt-out label so it is excluded from candidate selection and can
+    never re-block the queue. The 409-conflict hold (#2354) and the
+    scan-through-skip (#2356) coexist: a held conflicted PR is both held AND no
+    longer a candidate, so newer ready PRs behind it are unblocked."""
     calls = {"update_attempts": 0, "merge_attempts": 0, "hold_label": None}
     conflicted = {"number": 1409, "pull_request": {},
                   "labels": [{"name": "merge-queue"}],
@@ -691,16 +698,30 @@ def test_queue_advances_past_held_conflicted_pr(monkeypatch):
         calls=calls,
     )
 
-    # Tick 1: oldest (#1409) is selected, 409-on-update → held.
+    # Tick 1: oldest (#1409) is selected, 409-on-update → held, then the scan
+    # CONTINUES to #1500 (which also 409s in this fixture and is likewise held).
+    # The key #2352 property: the conflicted oldest PR is held and does NOT stop
+    # the scan from advancing past it.
     rc = mq.process_once(dry_run=False)
     assert rc == 0
-    assert calls["hold_label"] == (1409, "merge-queue-hold")
+    assert (1409, "merge-queue-hold") in calls["holds"]
+    assert calls["merge_attempts"] == 0  # held, not merged — fail-closed
 
     # Simulate the label now present on #1409 (as the real hold would persist).
     conflicted["labels"] = [{"name": "merge-queue"}, {"name": "merge-queue-hold"}]
 
-    # Tick 2: the queue must ADVANCE — choose_next_queued_issue skips the held
-    # #1409 and selects the next ready candidate #1500, NOT re-select #1409.
+    # Next selection: the scan-loop candidate selector must SKIP the now-held
+    # #1409 (HOLD_LABEL is in OPT_OUT_LABELS) and surface the next ready
+    # candidate #1500 — the held PR no longer head-of-line blocks. The legacy
+    # opt-IN selector (choose_next_queued_issue) honours the same hold.
+    opt_out = {"merge-queue-hold", "do-not-auto-merge", "wip"}
+    remaining = mq.choose_candidate_issues(
+        [conflicted, next_ready],
+        queue_label="merge-queue",
+        opt_out_labels=opt_out,
+        auto_discover=True,
+    )
+    assert [i["number"] for i in remaining] == [1500]
     selected = mq.choose_next_queued_issue(
         [conflicted, next_ready],
         queue_label="merge-queue",
@@ -1005,6 +1026,246 @@ def test_process_once_does_not_merge_unmergeable_pr(monkeypatch):
 
     assert rc == 0
     assert calls["merged"] is None
+
+
+# --------------------------------------------------------------------------
+# §SOP-22 (cont.): HEAD-OF-LINE (HOL) — a non-ready auto-discovered candidate
+# must NOT block the newer ready PRs behind it. The queue SCANS THROUGH the
+# FIFO candidate list, skipping `wait` candidates (REQUEST_CHANGES, mergeable
+# != True, insufficient genuine approvals, or red required CI), and merges the
+# first ready PR in the SAME tick. (Regression for the #1519-style false
+# candidate the reviewer caught: open + unlabeled + mergeable=false + current-
+# head official REQUEST_CHANGES + <2 genuine approvals.)
+# --------------------------------------------------------------------------
+
+MAIN_SHA = "b" * 40
+
+
+def _wire_multi_candidate_process_once(monkeypatch, *, issues, pulls, reviews, calls):
+    """Wire process_once for MULTIPLE candidates, dispatching get_pull /
+    get_pull_reviews / head-status BY PR NUMBER so each candidate can have a
+    different readiness. `pulls` maps number -> pull payload; `reviews` maps
+    number -> reviews list. Main is green; each PR head status is green."""
+    monkeypatch.setattr(mq, "OWNER", "molecule-ai")
+    monkeypatch.setattr(mq, "NAME", "molecule-core")
+    monkeypatch.setattr(mq, "WATCH_BRANCH", "main")
+    monkeypatch.setattr(mq, "QUEUE_LABEL", "merge-queue")
+    monkeypatch.setattr(mq, "HOLD_LABEL", "merge-queue-hold")
+    monkeypatch.setattr(mq, "AUTO_DISCOVER", True)
+    monkeypatch.setattr(mq, "OPT_OUT_LABELS", OPT_OUT)
+    monkeypatch.setattr(mq, "REVIEWER_SET", REVIEWERS)
+    monkeypatch.setattr(mq, "get_branch_protection", lambda branch: mq.BranchProtection(
+        required_contexts=["CI / all-required (pull_request)"],
+        required_approvals=2, block_on_rejected_reviews=True,
+    ))
+    monkeypatch.setattr(mq, "get_branch_head", lambda branch: MAIN_SHA)
+
+    def fake_combined(sha):
+        ctx = "CI / all-required (push)" if sha == MAIN_SHA else "CI / all-required (pull_request)"
+        return {"state": "success", "statuses": [{"context": ctx, "status": "success"}]}
+    monkeypatch.setattr(mq, "get_combined_status", fake_combined)
+
+    monkeypatch.setattr(mq, "list_candidate_issues", lambda *, auto_discover: issues)
+    monkeypatch.setattr(mq, "get_pull", lambda n: dict(pulls[n], number=n))
+    # Each PR head contains current main (so no candidate needs an update; the
+    # only differentiator is readiness). head sha is the pull's own head.
+    monkeypatch.setattr(
+        mq, "get_pull_commits",
+        lambda n: [{"sha": MAIN_SHA}, {"sha": pulls[n]["head"]["sha"]}],
+    )
+    monkeypatch.setattr(mq, "get_pull_reviews", lambda n: reviews[n])
+
+    def fake_merge(pr_number, *, dry_run, force=False):
+        calls.setdefault("merged", [])
+        calls["merged"].append(pr_number)
+    monkeypatch.setattr(mq, "merge_pull", fake_merge)
+    monkeypatch.setattr(mq, "update_pull", lambda *a, **k: calls.__setitem__("updated", True))
+    monkeypatch.setattr(mq, "post_comment", lambda *a, **k: None)
+    monkeypatch.setattr(mq, "add_label_by_name", lambda *a, **k: None)
+
+
+def _two_approvals(head_sha):
+    return [
+        {"state": "APPROVED", "user": {"login": "agent-researcher"},
+         "official": True, "stale": False, "dismissed": False, "commit_id": head_sha},
+        {"state": "APPROVED", "user": {"login": "agent-reviewer-cr2"},
+         "official": True, "stale": False, "dismissed": False, "commit_id": head_sha},
+    ]
+
+
+def test_hol_unready_oldest_does_not_block_newer_ready_pr(monkeypatch):
+    """The OLDEST auto-discovered candidate is NOT ready (mergeable=false). The
+    queue must SKIP it and merge the NEWER ready PR in the SAME tick — no HOL."""
+    calls = {"updated": False}
+    old_head, new_head = "a" * 40, "c" * 40
+    _wire_multi_candidate_process_once(
+        monkeypatch,
+        issues=[
+            _issue(500, labels=[], created="2026-06-01T01:00:00Z"),  # oldest, NOT ready
+            _issue(501, labels=[], created="2026-06-01T02:00:00Z"),  # newer, READY
+        ],
+        pulls={
+            500: {"state": "open", "mergeable": False, "draft": False,  # conflict
+                  "base": {"ref": "main", "repo_id": 1},
+                  "head": {"sha": old_head, "repo_id": 1}, "labels": []},
+            501: {"state": "open", "mergeable": True, "draft": False,
+                  "base": {"ref": "main", "repo_id": 1},
+                  "head": {"sha": new_head, "repo_id": 1}, "labels": []},
+        },
+        reviews={500: _two_approvals(old_head), 501: _two_approvals(new_head)},
+        calls=calls,
+    )
+
+    rc = mq.process_once(dry_run=False)
+
+    assert rc == 0
+    # The newer ready PR merged; the non-ready oldest did not block it.
+    assert calls.get("merged") == [501]
+
+
+def test_hol_1519_style_false_candidate_never_merged_and_never_blocks(monkeypatch):
+    """Live #1519 repro: oldest, open, UNLABELED, but mergeable=false + a
+    current-head official REQUEST_CHANGES + only ONE genuine approval. It must
+    NEVER be merged and must NEVER block the newer ready PR behind it."""
+    calls = {"updated": False}
+    false_head, ready_head = "a" * 40, "c" * 40
+    _wire_multi_candidate_process_once(
+        monkeypatch,
+        issues=[
+            _issue(1519, labels=[], created="2026-05-20T00:00:00Z"),  # oldest false candidate
+            _issue(2000, labels=[], created="2026-06-01T00:00:00Z"),  # newer, READY
+        ],
+        pulls={
+            1519: {"state": "open", "mergeable": False, "draft": False,
+                   "base": {"ref": "main", "repo_id": 1},
+                   "head": {"sha": false_head, "repo_id": 1}, "labels": []},
+            2000: {"state": "open", "mergeable": True, "draft": False,
+                   "base": {"ref": "main", "repo_id": 1},
+                   "head": {"sha": ready_head, "repo_id": 1}, "labels": []},
+        },
+        reviews={
+            1519: [
+                # one genuine approval (below 2) ...
+                {"state": "APPROVED", "user": {"login": "agent-researcher"},
+                 "official": True, "stale": False, "dismissed": False, "commit_id": false_head},
+                # ... plus a current-head official REQUEST_CHANGES (human action needed)
+                {"state": "REQUEST_CHANGES", "user": {"login": "agent-reviewer"},
+                 "official": True, "stale": False, "dismissed": False, "commit_id": false_head},
+            ],
+            2000: _two_approvals(ready_head),
+        },
+        calls=calls,
+    )
+
+    rc = mq.process_once(dry_run=False)
+
+    assert rc == 0
+    # #1519 is never merged; the ready PR behind it merges this same tick.
+    assert calls.get("merged") == [2000]
+    assert 1519 not in calls.get("merged", [])
+
+
+def test_hol_unready_red_required_ci_is_skipped_for_ready_pr(monkeypatch):
+    """A candidate whose required CI is RED is skipped (not waited-on) so the
+    newer ready PR merges in the same tick."""
+    calls = {"updated": False}
+    red_head, ready_head = "a" * 40, "c" * 40
+    _wire_multi_candidate_process_once(
+        monkeypatch,
+        issues=[
+            _issue(600, labels=[], created="2026-06-01T01:00:00Z"),  # required CI red
+            _issue(601, labels=[], created="2026-06-01T02:00:00Z"),  # ready
+        ],
+        pulls={
+            600: {"state": "open", "mergeable": True, "draft": False,
+                  "base": {"ref": "main", "repo_id": 1},
+                  "head": {"sha": red_head, "repo_id": 1}, "labels": []},
+            601: {"state": "open", "mergeable": True, "draft": False,
+                  "base": {"ref": "main", "repo_id": 1},
+                  "head": {"sha": ready_head, "repo_id": 1}, "labels": []},
+        },
+        reviews={600: _two_approvals(red_head), 601: _two_approvals(ready_head)},
+        calls=calls,
+    )
+    # PR 600's required PR context is FAILURE; 601 (and main) stay green.
+    def fake_combined(sha):
+        if sha == MAIN_SHA:
+            return {"state": "success",
+                    "statuses": [{"context": "CI / all-required (push)", "status": "success"}]}
+        state = "failure" if sha == red_head else "success"
+        return {"state": state,
+                "statuses": [{"context": "CI / all-required (pull_request)", "status": state}]}
+    monkeypatch.setattr(mq, "get_combined_status", fake_combined)
+
+    rc = mq.process_once(dry_run=False)
+
+    assert rc == 0
+    assert calls.get("merged") == [601]
+
+
+def test_hol_all_candidates_unready_merges_nothing(monkeypatch):
+    """If EVERY candidate is non-ready, the queue merges nothing (fail-closed)
+    and does not loop — it simply finds no actionable PR this tick."""
+    calls = {"updated": False}
+    h1, h2 = "a" * 40, "c" * 40
+    _wire_multi_candidate_process_once(
+        monkeypatch,
+        issues=[
+            _issue(700, labels=[], created="2026-06-01T01:00:00Z"),  # RC
+            _issue(701, labels=[], created="2026-06-01T02:00:00Z"),  # unmergeable
+        ],
+        pulls={
+            700: {"state": "open", "mergeable": True, "draft": False,
+                  "base": {"ref": "main", "repo_id": 1},
+                  "head": {"sha": h1, "repo_id": 1}, "labels": []},
+            701: {"state": "open", "mergeable": False, "draft": False,
+                  "base": {"ref": "main", "repo_id": 1},
+                  "head": {"sha": h2, "repo_id": 1}, "labels": []},
+        },
+        reviews={
+            700: _two_approvals(h1) + [
+                {"state": "REQUEST_CHANGES", "user": {"login": "agent-reviewer"},
+                 "official": True, "stale": False, "dismissed": False, "commit_id": h1},
+            ],
+            701: _two_approvals(h2),
+        },
+        calls=calls,
+    )
+
+    rc = mq.process_once(dry_run=False)
+
+    assert rc == 0
+    assert calls.get("merged") is None  # nothing merged; no HOL loop
+
+
+def test_opt_out_draft_label_excludes_candidate():
+    """The literal `draft` label is now an opt-out label (added to the default
+    OPT_OUT_LABELS), independent of Gitea draft STATE — a human can opt a PR out
+    by labeling it `draft` without converting it to a draft PR."""
+    # `draft` must be in the shipped default opt-out set.
+    assert "draft" in mq.OPT_OUT_LABELS
+    opt_out = OPT_OUT | {"draft"}
+    issues = [_issue(800, labels=["draft"], draft=False)]  # label only, not draft STATE
+    selected = mq.choose_next_candidate_issue(
+        issues, queue_label="merge-queue", opt_out_labels=opt_out, auto_discover=True
+    )
+    assert selected is None
+
+
+def test_choose_candidate_issues_returns_full_fifo_list_skipping_opt_out():
+    """choose_candidate_issues returns ALL eligible candidates oldest-first (so
+    process_once can scan past non-ready ones), skipping opt-out/draft/non-PR."""
+    issues = [
+        _issue(72, labels=["merge-queue"], created="2026-06-01T03:00:00Z"),
+        _issue(70, labels=["do-not-auto-merge"], created="2026-06-01T01:00:00Z"),  # opt-out
+        _issue(71, labels=[], created="2026-06-01T02:00:00Z"),
+        _issue(73, labels=[], draft=True, created="2026-06-01T00:30:00Z"),         # draft
+        _issue(74, labels=[], is_pr=False, created="2026-06-01T00:00:00Z"),        # not a PR
+    ]
+    ordered = mq.choose_candidate_issues(
+        issues, queue_label="merge-queue", opt_out_labels=OPT_OUT, auto_discover=True
+    )
+    assert [i["number"] for i in ordered] == [71, 72]  # FIFO, opt-out/draft/non-PR dropped
 
 
 def test_process_once_defensive_skip_when_pull_payload_opted_out(monkeypatch):

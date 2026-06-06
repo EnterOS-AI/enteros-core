@@ -4,8 +4,11 @@
 Gitea 1.22.6+ has auto-merge (`pull_auto_merge`) but no GitHub-style merge
 queue. This script provides the missing serialized policy in user space:
 
-1. Pick the oldest open same-repo PR that is NOT opted out (auto-discovery,
-   see below), skipping drafts.
+1. Scan open same-repo PRs that are NOT opted out (auto-discovery, see below),
+   oldest-first, skipping drafts, until an ACTIONABLE one is found. A non-ready
+   candidate (REQUEST_CHANGES, mergeable!=True, insufficient genuine approvals,
+   or red required CI) is SKIPPED so it cannot head-of-line block newer ready
+   PRs; the scan continues to the next candidate.
 2. Refuse to act unless main's BP-required contexts are green.
 3. Refuse fork PRs; the queue may only mutate same-repo branches.
 4. If the PR branch does not contain current main, call Gitea's
@@ -44,19 +47,28 @@ Auto-discovery (opt-OUT, label-optional):
   is now OPTIONAL metadata, not a gate.
 
   SAFETY is preserved as opt-OUT: any PR carrying an opt-out label
-  (OPT_OUT_LABELS — `merge-queue-hold`, `do-not-auto-merge`, `wip` by default) is
-  skipped (never auto-considered, never merged). Draft PRs (draft=true) are also
-  skipped. A human who wants to keep a PR out of autonomous merging just adds one
-  of those labels. Setting AUTO_DISCOVER=0 restores the legacy opt-IN behaviour
+  (OPT_OUT_LABELS — `merge-queue-hold`, `do-not-auto-merge`, `wip`, `draft` by
+  default) is skipped (never auto-considered, never merged). Draft PRs
+  (draft=true STATE) are also skipped; the literal `draft` LABEL is an
+  additional explicit opt-out a human can apply without converting to a draft.
+  A human who wants to keep a PR out of autonomous merging just adds one of
+  those labels. Setting AUTO_DISCOVER=0 restores the legacy opt-IN behaviour
   (only PRs already carrying QUEUE_LABEL are considered).
 
-Head-of-line (HOL) safety: a permanent permission/4xx merge error
-(403/404/405) HOLDS the PR (applies HOLD_LABEL) so the queue advances to the
-next PR instead of re-selecting the same wedged PR every tick. Likewise, a
-persistent branch-update conflict (the /update endpoint returns HTTP 409
-because the PR branch cannot be merged with main without manual rebase) HOLDS
-the PR — a conflict will not self-resolve, so retrying it every tick would
-HOL-block every ready PR behind it (issue #2352).
+Head-of-line (HOL) safety has two complementary layers:
+  (a) The queue SCANS THROUGH the FIFO candidate list and skips any non-ready
+      PR (REQUEST_CHANGES, mergeable!=True, insufficient genuine approvals, or
+      red required CI) instead of locking on the oldest and waiting, so a PR
+      that can never become ready without human action does not block newer
+      ready PRs.
+  (b) For the candidate the scan acts on, two permanent failure modes HOLD the
+      PR (apply HOLD_LABEL) and let the scan CONTINUE to the next candidate
+      rather than re-selecting the same wedged PR every tick:
+        - a permanent permission/4xx merge error (403/404/405), and
+        - a persistent branch-update conflict (the /update endpoint returns
+          HTTP 409 because the PR branch cannot be merged with main without a
+          manual rebase). A conflict will not self-resolve, so retrying it
+          every tick would HOL-block every ready PR behind it (issue #2352).
 
 Status-fetch is fail-closed: if the combined status for a sha cannot be
 fetched, the PR is skipped this tick (never treated as green).
@@ -105,11 +117,14 @@ AUTO_DISCOVER = _env("AUTO_DISCOVER", default="1").strip().lower() not in {
 # never merged) — the human escape hatch from autonomous merging. HOLD_LABEL is
 # always included so the existing hold semantics keep working. `do-not-auto-merge`
 # and `wip` let a human keep a PR out of the auto-merge path without removing it.
+# `draft` is included as a literal label too: Gitea draft STATE (draft=true) is
+# already skipped via _issue_is_draft, but a "draft" LABEL is an additional,
+# explicit opt-out signal a human can apply without converting the PR to a draft.
 OPT_OUT_LABELS = {
     name.strip()
     for name in _env(
         "OPT_OUT_LABELS",
-        default="do-not-auto-merge,wip",
+        default="do-not-auto-merge,wip,draft",
     ).split(",")
     if name.strip()
 } | ({HOLD_LABEL} if HOLD_LABEL else set())
@@ -468,14 +483,14 @@ def _issue_is_draft(issue: dict) -> bool:
     return issue.get("draft") is True
 
 
-def choose_next_candidate_issue(
+def choose_candidate_issues(
     issues: list[dict],
     *,
     queue_label: str,
     opt_out_labels: set[str],
     auto_discover: bool,
-) -> dict | None:
-    """Pick the oldest open PR eligible for a merge attempt this tick.
+) -> list[dict]:
+    """All open PRs eligible for a merge attempt this tick, oldest-first.
 
     This is the auto-discovery selector. It does NOT change the merge bar — it
     only changes WHICH PRs are considered:
@@ -488,8 +503,15 @@ def choose_next_candidate_issue(
         candidates (still skipping opt-out labels and drafts).
 
     Opt-out is the safety escape hatch: any opt_out_labels member present skips
-    the PR entirely (never considered, never merged). Selection is oldest-first
+    the PR entirely (never considered, never merged). Ordering is oldest-first
     (created_at, then number) to preserve the serialized FIFO ordering.
+
+    Returns the FULL ordered list (not just the head) so process_once can SCAN
+    THROUGH non-ready candidates instead of locking on the oldest. A non-ready
+    auto-discovered PR (e.g. one with REQUEST_CHANGES or mergeable=false, which
+    can never become ready without human action) must NOT head-of-line block the
+    newer ready PRs behind it — the readiness check happens per-candidate in
+    process_once, and a `wait` candidate is skipped to the next one.
     """
     candidates = []
     for issue in issues:
@@ -504,6 +526,26 @@ def choose_next_candidate_issue(
             continue  # legacy opt-IN: require the queue label
         candidates.append(issue)
     candidates.sort(key=lambda issue: (issue.get("created_at") or "", int(issue["number"])))
+    return candidates
+
+
+def choose_next_candidate_issue(
+    issues: list[dict],
+    *,
+    queue_label: str,
+    opt_out_labels: set[str],
+    auto_discover: bool,
+) -> dict | None:
+    """The oldest eligible candidate, or None. Thin head-of-list wrapper around
+    choose_candidate_issues; retained for callers/tests that only want the head.
+    process_once uses the full list (choose_candidate_issues) so it can scan past
+    non-ready PRs rather than HOL-block on the oldest."""
+    candidates = choose_candidate_issues(
+        issues,
+        queue_label=queue_label,
+        opt_out_labels=opt_out_labels,
+        auto_discover=auto_discover,
+    )
     return candidates[0] if candidates else None
 
 
@@ -853,59 +895,181 @@ def process_once(*, dry_run: bool = False) -> int:
         print(f"::notice::queue paused: {WATCH_BRANCH}@{main_sha[:8]} required contexts not green: {', '.join(main_bad)}")
         return 0
 
-    issue = choose_next_candidate_issue(
+    candidates = choose_candidate_issues(
         list_candidate_issues(auto_discover=AUTO_DISCOVER),
         queue_label=QUEUE_LABEL,
         opt_out_labels=OPT_OUT_LABELS,
         auto_discover=AUTO_DISCOVER,
     )
-    if not issue:
+    if not candidates:
         print(
             "::notice::no merge candidates "
             f"(auto_discover={'on' if AUTO_DISCOVER else 'off'})"
         )
         return 0
 
+    # HOL fix: SCAN THROUGH the FIFO candidate list until a PR we can ACT on is
+    # found, instead of locking on the oldest and waiting. A non-ready candidate
+    # (decision.action == "wait": REQUEST_CHANGES, mergeable!=True, insufficient
+    # genuine approvals, or red required CI) is SKIPPED — it must NOT head-of-line
+    # block the newer ready PRs behind it. The merge bar is unchanged: a skipped
+    # PR is never merged, and the first ACTIONABLE candidate (an "update" that
+    # advances a stale branch, or a fully-ready "merge") terminates the scan.
+    #
+    # `update` is treated as actionable, not skippable: a PR whose head merely
+    # lacks current main is in a legitimate in-progress state (updating it +
+    # rerunning CI moves it toward ready), unlike a PR that can never become
+    # ready without a human (RC / conflict), which is a `wait` and gets skipped.
+    for issue in candidates:
+        decision, ctx = _evaluate_candidate(
+            issue,
+            main_sha=main_sha,
+            main_status=main_status,
+            required_contexts=contexts,
+            required_approvals=required_approvals,
+            dry_run=dry_run,
+        )
+        if decision is None:
+            continue  # not merge-eligible (not-open / opted-out / fork / wrong base)
+        pr_number = ctx["pr_number"]
+        print(f"::notice::PR #{pr_number} decision={decision.action}: {decision.reason}")
+        if decision.action == "wait":
+            # Non-ready: skip to the next candidate (no HOL block, no merge).
+            continue
+        if decision.action == "update":
+            try:
+                update_pull(pr_number, dry_run=dry_run)
+            except BranchUpdateConflictError as exc:
+                # The branch cannot be updated with main because of a real
+                # conflict (HTTP 409 from /update). This is the #2352 HOL guard:
+                # a conflict will not self-resolve without a human/agent rebase,
+                # so re-attempting the update every tick would head-of-line block
+                # every ready PR behind it. HOLD this PR (apply HOLD_LABEL, which
+                # is an opt-out label so later ticks skip it) and CONTINUE the
+                # scan so a newer ready PR can still merge this tick. Fail-closed:
+                # a held PR is skipped, never merged.
+                sys.stderr.write(
+                    f"::error::branch-update conflict for PR #{pr_number}: {exc}\n"
+                )
+                hold_note = (
+                    "merge-queue: could not update this branch with "
+                    f"`{WATCH_BRANCH}` — the update returned a merge conflict "
+                    f"(HTTP 409) that the queue cannot auto-resolve ({exc}). "
+                    f"Applied `{HOLD_LABEL}` to unblock the queue (HOL guard). "
+                    f"Fix: rebase/merge `{WATCH_BRANCH}` into this branch and "
+                    f"resolve the conflicts, then remove `{HOLD_LABEL}` to requeue."
+                )
+                hold_pr(pr_number, hold_note, dry_run=dry_run)
+                continue  # held — keep scanning for a mergeable candidate
+            post_comment(
+                pr_number,
+                (
+                    f"merge-queue: updated this branch with `{WATCH_BRANCH}` at "
+                    f"`{main_sha[:12]}`. Waiting for CI on the refreshed head."
+                ),
+                dry_run=dry_run,
+            )
+            return 0
+        if decision.ready:
+            latest_main_sha = get_branch_head(WATCH_BRANCH)
+            if latest_main_sha != main_sha:
+                print(
+                    f"::notice::main moved {main_sha[:8]} -> {latest_main_sha[:8]}; "
+                    "deferring to next tick"
+                )
+                return 0
+            try:
+                merge_pull(pr_number, dry_run=dry_run, force=decision.force)
+            except MergePermissionError as exc:
+                # Permanent merge failure (HTTP 403/404/405). HOLD this PR by
+                # applying HOLD_LABEL (it becomes an opt-out label, so subsequent
+                # ticks skip it) and CONTINUE scanning so the queue still advances
+                # to the next ready PR this tick rather than stalling.
+                sys.stderr.write(f"::error::merge permission error for PR #{pr_number}: {exc}\n")
+                hold_note = (
+                    "merge-queue: merge failed with a permanent permission error "
+                    f"({exc}). No available token has Can-merge permission for this "
+                    f"PR. Applied `{HOLD_LABEL}` to unblock the queue (HOL guard). "
+                    f"Fix: grant Can-merge to the queue token, then remove "
+                    f"`{HOLD_LABEL}` to requeue."
+                )
+                try:
+                    add_label_by_name(pr_number, HOLD_LABEL, dry_run=dry_run)
+                except ApiError as label_exc:
+                    # If we cannot even apply the hold label, fall back to a comment
+                    # so the wedge is at least visible; do NOT loop on this PR.
+                    sys.stderr.write(
+                        f"::error::could not apply HOLD_LABEL to PR #{pr_number}: {label_exc}\n"
+                    )
+                    hold_note += (
+                        f"\n\n(NOTE: could not apply the hold label automatically: "
+                        f"{label_exc}. Please add `{HOLD_LABEL}` manually.)"
+                    )
+                post_comment(pr_number, hold_note, dry_run=dry_run)
+                continue  # held — keep scanning for a mergeable candidate
+            return 0
+    return 0
+
+
+def _evaluate_candidate(
+    issue: dict,
+    *,
+    main_sha: str,
+    main_status: dict,
+    required_contexts: list[str],
+    required_approvals: int,
+    dry_run: bool,
+) -> tuple[MergeDecision | None, dict]:
+    """Evaluate a single auto-discovered candidate against the full merge bar.
+
+    Returns (decision, ctx) where ctx carries {"pr_number"}. A None decision
+    means the PR is not merge-eligible at all (not open / opted-out / draft /
+    fork / wrong base) and the caller should skip to the next candidate; for
+    fork / wrong-base the explanatory comment is posted here before returning.
+
+    The merge bar is UNCHANGED from the single-PR path — this only factors the
+    per-PR evaluation out so process_once can scan multiple candidates. A failed
+    status fetch still raises (fail-closed): it propagates to the caller so the
+    PR is never treated as green.
+    """
     pr_number = int(issue["number"])
+    ctx = {"pr_number": pr_number}
     pr = get_pull(pr_number)
     if pr.get("state") != "open":
         print(f"::notice::PR #{pr_number} is not open; skipping")
-        return 0
+        return None, ctx
     # Defensive opt-out/draft re-check on the authoritative pull payload: the
     # /issues listing's label/draft view can lag, but the merge bar must respect
-    # the live pull state. (choose_next_candidate_issue already filtered on the
+    # the live pull state. (choose_candidate_issues already filtered on the
     # listing; this guards against a stale listing racing a just-added opt-out.)
     if OPT_OUT_LABELS & label_names(pr):
         print(f"::notice::PR #{pr_number} carries an opt-out label; skipping")
-        return 0
+        return None, ctx
     if pr.get("draft") is True:
         print(f"::notice::PR #{pr_number} is a draft; skipping")
-        return 0
+        return None, ctx
     if pr.get("base", {}).get("ref") != WATCH_BRANCH:
         post_comment(pr_number, f"merge-queue: skipped; base branch is not `{WATCH_BRANCH}`.", dry_run=dry_run)
-        return 0
+        return None, ctx
     if pr.get("head", {}).get("repo_id") != pr.get("base", {}).get("repo_id"):
         post_comment(pr_number, "merge-queue: skipped; fork PRs are not supported by the serialized queue.", dry_run=dry_run)
-        return 0
+        return None, ctx
 
     head_sha = pr.get("head", {}).get("sha")
     if not isinstance(head_sha, str) or len(head_sha) < 7:
         raise ApiError(f"PR #{pr_number} missing head sha")
     commits = get_pull_commits(pr_number)
     current_base = pr_has_current_base(pr, commits, main_sha)
-    # Fail-closed: a failed status fetch raises here and the tick is skipped
-    # (the PR is never treated as green).
+    # Fail-closed: a failed status fetch raises here and propagates (the PR is
+    # never treated as green).
     pr_status = get_combined_status(head_sha)
     pr_labels = label_names(pr)
     # FAIL-CLOSED: Gitea returns mergeable=None (or omits the field) while it is
     # still COMPUTING conflict state. Only the literal True is decisive proof the
     # PR is conflict-free; None and False both mean "not (yet) mergeable". We must
     # NOT autonomously merge on an unknown — treat anything but True as not-yet-
-    # mergeable so evaluate_merge_readiness returns a transient "wait" decision.
-    # This is transient: process_once returns 0 (no hold label, no dequeue) and
-    # the PR is re-checked next tick once Gitea has finished computing mergeability.
-    mergeable_field = pr.get("mergeable")
-    mergeable = mergeable_field is True
+    # mergeable so evaluate_merge_readiness returns a "wait" decision.
+    mergeable = pr.get("mergeable") is True
 
     reviews = get_pull_reviews(pr_number)
     approvers, request_changes = genuine_approvals(
@@ -915,7 +1079,7 @@ def process_once(*, dry_run: bool = False) -> int:
     decision = evaluate_merge_readiness(
         main_status=main_status,
         pr_status=pr_status,
-        required_contexts=contexts,
+        required_contexts=required_contexts,
         required_approvals=required_approvals,
         approvers=approvers,
         request_changes=request_changes,
@@ -923,72 +1087,7 @@ def process_once(*, dry_run: bool = False) -> int:
         mergeable=mergeable,
         pr_labels=pr_labels,
     )
-
-    print(f"::notice::PR #{pr_number} decision={decision.action}: {decision.reason}")
-    if decision.action == "update":
-        try:
-            update_pull(pr_number, dry_run=dry_run)
-        except BranchUpdateConflictError as exc:
-            # The branch cannot be updated with main because of a real conflict
-            # (HTTP 409). This is the HOL fix for issue #2352: previously the
-            # 409 propagated to main() and the tick exited 0 with the PR still
-            # queued, so the NEXT tick re-selected the SAME conflicted PR and
-            # retried the failing update forever — head-of-line-blocking every
-            # ready PR behind it. A conflict will not self-resolve; it needs a
-            # human/agent rebase. So HOLD this PR (HOL guard) and advance to the
-            # next candidate. Fail-closed: a held PR is skipped, never merged.
-            sys.stderr.write(
-                f"::error::branch-update conflict for PR #{pr_number}: {exc}\n"
-            )
-            hold_note = (
-                "merge-queue: could not update this branch with "
-                f"`{WATCH_BRANCH}` — the update returned a merge conflict "
-                f"(HTTP 409) that the queue cannot auto-resolve ({exc}). "
-                f"Applied `{HOLD_LABEL}` to unblock the queue (HOL guard). "
-                f"Fix: rebase/merge `{WATCH_BRANCH}` into this branch and "
-                f"resolve the conflicts, then remove `{HOLD_LABEL}` to requeue."
-            )
-            hold_pr(pr_number, hold_note, dry_run=dry_run)
-            return 0
-        post_comment(
-            pr_number,
-            (
-                f"merge-queue: updated this branch with `{WATCH_BRANCH}` at "
-                f"`{main_sha[:12]}`. Waiting for CI on the refreshed head."
-            ),
-            dry_run=dry_run,
-        )
-        return 0
-    if decision.ready:
-        latest_main_sha = get_branch_head(WATCH_BRANCH)
-        if latest_main_sha != main_sha:
-            print(
-                f"::notice::main moved {main_sha[:8]} -> {latest_main_sha[:8]}; "
-                "deferring to next tick"
-            )
-            return 0
-        try:
-            merge_pull(pr_number, dry_run=dry_run, force=decision.force)
-        except MergePermissionError as exc:
-            # Permanent merge failure (HTTP 403/404/405). This is the
-            # head-of-line (HOL) bug fix: previously we returned 0 with the PR
-            # still queued, so the next tick re-selected the SAME wedged PR
-            # forever and the queue never advanced. Instead, HOLD this PR by
-            # applying HOLD_LABEL (choose_next_queued_issue skips held PRs), so
-            # the queue moves on to the next candidate. A maintainer removes
-            # the hold once the permission issue is fixed.
-            sys.stderr.write(f"::error::merge permission error for PR #{pr_number}: {exc}\n")
-            hold_note = (
-                "merge-queue: merge failed with a permanent permission error "
-                f"({exc}). No available token has Can-merge permission for this "
-                f"PR. Applied `{HOLD_LABEL}` to unblock the queue (HOL guard). "
-                f"Fix: grant Can-merge to the queue token, then remove "
-                f"`{HOLD_LABEL}` to requeue."
-            )
-            hold_pr(pr_number, hold_note, dry_run=dry_run)
-            return 0
-        return 0
-    return 0
+    return decision, ctx
 
 
 def main() -> int:
