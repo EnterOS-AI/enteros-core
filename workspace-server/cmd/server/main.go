@@ -351,8 +351,17 @@ func main() {
 	// (true, err) on any transient error, so a CP blip never flips a healthy
 	// workspace.
 	if cpProv != nil {
+		// Guard against double-reprovision thrash (internal#544): the restart
+		// debounce window must cover the reconciler interval so a workspace
+		// flipped offline by one reconcile tick isn't immediately reprovisioned
+		// again by the next tick before the debounce drops it. If the interval
+		// ever shrinks below the debounce window, the coupling silently breaks.
+		reconcileInterval := 60 * time.Second
+		if handlers.RestartDebounceWindow < reconcileInterval {
+			log.Fatalf("RestartDebounceWindow (%s) must be >= CP instance reconciler interval (%s) to prevent double-reprovision thrash (internal#544)", handlers.RestartDebounceWindow, reconcileInterval)
+		}
 		go supervised.RunWithRecover(ctx, "cp-instance-reconciler", func(c context.Context) {
-			registry.StartCPInstanceReconciler(c, cpProv, onWorkspaceOffline, 60*time.Second)
+			registry.StartCPInstanceReconciler(c, cpProv, onWorkspaceOffline, reconcileInterval)
 		})
 	}
 
