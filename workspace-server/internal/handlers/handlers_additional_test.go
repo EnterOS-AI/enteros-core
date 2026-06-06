@@ -337,7 +337,7 @@ func TestRegister_ProvisionerURLPreserved(t *testing.T) {
 		WillReturnError(sql.ErrNoRows)
 
 	mock.ExpectExec("INSERT INTO workspaces").
-		WithArgs("ws-prov", "ws-prov", "http://localhost:8000", `{"name":"agent"}`, "push").
+		WithArgs("ws-prov", "ws-prov", "http://localhost:8000", `{"name":"agent"}`, "push", "").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// DB returns provisioner URL (127.0.0.1) — should take precedence over agent-reported URL

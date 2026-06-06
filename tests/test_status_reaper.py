@@ -1050,12 +1050,13 @@ def test_reap_continues_on_per_sha_apierror(sr_module, monkeypatch, capsys):
 
 
 def test_main_soft_skips_when_commit_listing_times_out(sr_module, monkeypatch, capsys):
-    """A transient outage while listing recent commits should not paint main red.
+    """A transient outage while listing recent commits fails the tick visibly.
 
     Per-SHA status read failures are already isolated inside `reap_branch`.
     The real 2026-05-14 failure was earlier: `/commits?sha=main&limit=30`
     timed out after all retries, aborting the tick. The next 5-minute tick can
-    retry safely, so `main()` should emit an observable warning and return 0.
+    retry safely, but the tick itself must be observable as red (exit 1 + error
+    annotation) so the cron bot alerts on persistent infra issues.
     """
 
     monkeypatch.setattr(sr_module, "scan_workflows", lambda _: {"workflow-without-push": False})
@@ -1068,9 +1069,9 @@ def test_main_soft_skips_when_commit_listing_times_out(sr_module, monkeypatch, c
     monkeypatch.setattr(sr_module, "list_recent_commit_shas", fake_list_recent_commit_shas)
     monkeypatch.setattr(sys, "argv", ["status-reaper.py"])
 
-    assert sr_module.main() == 0
+    assert sr_module.main() == 1
     captured = capsys.readouterr()
-    assert "::warning::status-reaper skipped this tick" in captured.out
+    assert "::error::status-reaper cannot run" in captured.out
     assert '"skipped": true' in captured.out
     assert '"skip_reason": "commit-list-api-error"' in captured.out
 
