@@ -350,9 +350,9 @@ class TestVerifyFlip(unittest.TestCase):
         self.assertEqual(len(verdict["fail_runs"]), 1)
         self.assertIn("log unavailable", verdict["fail_runs"][0]["samples"][0])
 
-    def test_zero_runs_history_warns_allows(self):
-        # No commits with a matching context — newly added workflow.
-        # Allow with warning.
+    def test_zero_runs_history_blocks(self):
+        # No commits with a matching context — cannot verify the flip.
+        # Fail-closed: treat as masked rather than allowing.
         with mock.patch.object(lpfc, "recent_commits_on_branch", return_value=["sha1", "sha2"]):
             with mock.patch.object(
                 lpfc, "combined_status",
@@ -361,17 +361,32 @@ class TestVerifyFlip(unittest.TestCase):
                 verdict = lpfc.verify_flip(FLIP_FIXTURE, "main", 5)
         self.assertEqual(verdict["checked_commits"], 0)
         self.assertEqual(verdict["fail_runs"], [])
-        self.assertEqual(verdict["masked_runs"], [])
-        self.assertTrue(any("no runs of" in w for w in verdict["warnings"]))
+        self.assertEqual(len(verdict["masked_runs"]), 1)
+        self.assertIn("cannot verify flip", verdict["masked_runs"][0]["samples"][0])
 
-    def test_zero_commits_warns_allows(self):
-        # Empty branch (newly created repo, e.g.). Allow with warning.
+    def test_zero_commits_blocks(self):
+        # Empty branch (newly created repo, e.g.). Fail-closed: block.
         with mock.patch.object(lpfc, "recent_commits_on_branch", return_value=[]):
             verdict = lpfc.verify_flip(FLIP_FIXTURE, "main", 5)
         self.assertEqual(verdict["checked_commits"], 0)
         self.assertEqual(verdict["fail_runs"], [])
-        self.assertEqual(verdict["masked_runs"], [])
-        self.assertTrue(any("no recent commits" in w for w in verdict["warnings"]))
+        self.assertEqual(len(verdict["masked_runs"]), 1)
+        self.assertIn("cannot verify flip", verdict["masked_runs"][0]["samples"][0])
+
+    def test_combined_status_api_error_blocks(self):
+        # Fail-closed: combined_status ApiError means the check history is
+        # unreadable — we cannot verify the flip, so block as masked.
+        with mock.patch.object(lpfc, "recent_commits_on_branch", return_value=["sha1"]):
+            with mock.patch.object(
+                lpfc, "combined_status",
+                side_effect=lpfc.ApiError("GET /statuses/sha → HTTP 500"),
+            ):
+                verdict = lpfc.verify_flip(FLIP_FIXTURE, "main", 5)
+        self.assertEqual(verdict["checked_commits"], 0)
+        self.assertEqual(verdict["fail_runs"], [])
+        # One masked_run from the ApiError, one from zero checked_commits.
+        self.assertEqual(len(verdict["masked_runs"]), 2)
+        self.assertIn("API error", verdict["masked_runs"][0]["samples"][0])
 
 
 # --------------------------------------------------------------------------

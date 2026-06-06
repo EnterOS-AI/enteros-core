@@ -546,16 +546,24 @@ def verify_flip(flip: dict, branch: str, n: int) -> dict:
 
     shas = recent_commits_on_branch(branch, n)
     if not shas:
-        result["warnings"].append(
-            f"no recent commits on {branch} (cannot verify flip)"
-        )
+        result["masked_runs"].append({
+            "sha": "",
+            "status": "unverified",
+            "target_url": "",
+            "samples": [f"no recent commits on {branch} — cannot verify flip"],
+        })
         return result
 
     for sha in shas:
         try:
             status_doc = combined_status(sha)
         except ApiError as e:
-            result["warnings"].append(f"combined-status for {sha}: {e}")
+            result["masked_runs"].append({
+                "sha": sha,
+                "status": "error",
+                "target_url": "",
+                "samples": [f"combined-status API error: {e}"],
+            })
             continue
         statuses = status_doc.get("statuses") or []
         # First entry matching the context name. Newest SHAs come
@@ -616,10 +624,12 @@ def verify_flip(flip: dict, branch: str, n: int) -> dict:
             break
 
     if result["checked_commits"] == 0:
-        result["warnings"].append(
-            f"no runs of {target_context!r} found in the last {n} commits on "
-            f"{branch} — cannot verify; allowing flip with warning"
-        )
+        result["masked_runs"].append({
+            "sha": "",
+            "status": "unverified",
+            "target_url": "",
+            "samples": [f"no runs of {target_context!r} found in the last {n} commits on {branch} — cannot verify flip"],
+        })
     return result
 
 
