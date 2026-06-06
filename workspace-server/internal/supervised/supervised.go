@@ -60,10 +60,12 @@ func RunWithRecover(ctx context.Context, name string, fn func(context.Context)) 
 		}
 
 		// Panic → back off and restart.
+		timer := time.NewTimer(backoff)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return
-		case <-time.After(backoff):
+		case <-timer.C:
 		}
 		if backoff < maxBackoff {
 			backoff *= 2

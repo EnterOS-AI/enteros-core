@@ -42,8 +42,8 @@ import (
 	"log"
 	"net/http"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/wsauth"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wsauth"
 	"github.com/gin-gonic/gin"
 )
 
@@ -153,7 +153,15 @@ func queueRowAuthFields(ctx context.Context, queueID string) (callerID, workspac
 	if err != nil {
 		return "", "", err
 	}
-	return callerNS.String, workspaceNS.String, nil
+	callerID = ""
+	if callerNS.Valid {
+		callerID = callerNS.String
+	}
+	workspaceID = ""
+	if workspaceNS.Valid {
+		workspaceID = workspaceNS.String
+	}
+	return callerID, workspaceID, nil
 }
 
 // GetA2AQueueStatus handles GET /workspaces/:id/a2a/queue/:queue_id.

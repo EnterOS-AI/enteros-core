@@ -1,16 +1,18 @@
 package middleware
 
 import (
+	"crypto/sha256"
 	"crypto/subtle"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"log"
 	"net/http"
 	"os"
 	"strings"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/orgtoken"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/wsauth"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/orgtoken"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wsauth"
 	"github.com/gin-gonic/gin"
 )
 
@@ -108,17 +110,22 @@ func WorkspaceAuth(database *sql.DB) gin.HandlerFunc {
 			c.Next()
 			return
 		}
-		// Same-origin canvas on tenant image — Referer matches Host.
-		if isSameOriginCanvas(c) {
-			c.Next()
-			return
+		// SaaS-canvas path: a browser cookie is acceptable only after the
+		// control plane confirms membership in this tenant. Referer/Origin
+		// are forgeable and must never authenticate workspace data routes.
+		if cookieHeader := c.GetHeader("Cookie"); cookieHeader != "" {
+			if ok, _ := VerifiedCPSession(cookieHeader); ok {
+				c.Set("cp_session_actor", cpSessionActor(cookieHeader))
+				c.Next()
+				return
+			}
 		}
-		// Local-dev escape hatch — see devmode.go. Unreachable on SaaS
-		// (hosted tenants always have ADMIN_TOKEN + MOLECULE_ENV=production).
-		if isDevModeFailOpen() {
-			c.Next()
-			return
-		}
+		// No bearer, no verified CP session: fail CLOSED in EVERY
+		// environment (harden/no-fail-open-auth). The old local-dev
+		// escape hatch that let bearer-less requests through when
+		// ADMIN_TOKEN was unset + MOLECULE_ENV=dev has been removed —
+		// local dev now authenticates with a provisioned ADMIN_TOKEN
+		// (see scripts/dev-start.sh).
 		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "missing workspace auth token"})
 	}
 }
@@ -126,11 +133,18 @@ func WorkspaceAuth(database *sql.DB) gin.HandlerFunc {
 // AdminAuth returns a Gin middleware for global/admin routes (e.g.
 // /settings/secrets, /admin/secrets) that have no per-workspace scope.
 //
+// FAIL-CLOSED in every environment (harden/no-fail-open-auth): there is no
+// bearer-less path through this middleware. A request reaches the handler
+// ONLY by presenting a valid credential (verified CP session cookie, org
+// token, ADMIN_TOKEN, or — deprecated — a live workspace token). The former
+// "Tier-1 lazy-bootstrap fail-open" (no live tokens + no ADMIN_TOKEN ⇒ pass)
+// has been removed: it let an attacker pre-empt the first user by POSTing
+// /org/import before any token was minted (C4 SaaS-launch finding). A fresh
+// install must set ADMIN_TOKEN to reach admin routes.
+//
 // # Credential tier (evaluated in order)
 //
-//  1. Lazy-bootstrap fail-open: if no live workspace token exists anywhere on
-//     the platform (fresh install / pre-Phase-30 upgrade), every request passes
-//     through so existing deployments keep working.
+//  1. Verified CP session cookie (SaaS canvas) — upstream-confirmed.
 //
 //  2. ADMIN_TOKEN env var (recommended, closes #684): when set, the bearer
 //     MUST equal this value exactly (constant-time comparison). Workspace
@@ -156,31 +170,15 @@ func AdminAuth(database *sql.DB) gin.HandlerFunc {
 		ctx := c.Request.Context()
 		adminSecret := os.Getenv("ADMIN_TOKEN")
 
-		hasLive, err := wsauth.HasAnyLiveTokenGlobal(ctx, database)
-		if err != nil {
+		// (harden/no-fail-open-auth) Both former fail-open branches have
+		// been REMOVED here:
+		//   - Tier-1 lazy-bootstrap (no live tokens + no ADMIN_TOKEN ⇒ pass)
+		//   - Tier-1b local-dev escape hatch (isDevModeFailOpen ⇒ pass)
+		// Admin auth is now fail-CLOSED in every environment. We still probe
+		// HasAnyLiveTokenGlobal so a datastore outage returns a structured
+		// 503 (not a silent pass), but its result no longer opens any path.
+		if _, err := wsauth.HasAnyLiveTokenGlobal(ctx, database); err != nil {
 			abortAuthLookupError(c, "AdminAuth: HasAnyLiveTokenGlobal", err)
-			return
-		}
-		if !hasLive {
-			// Tier 1: fail-open is ONLY safe when ADMIN_TOKEN is unset
-			// (self-hosted dev, pre-Phase-30 upgrade). Hosted SaaS always
-			// sets ADMIN_TOKEN at provision time, and C4 (SaaS-launch
-			// blocker) showed that without this guard an attacker can
-			// pre-empt the first user by POSTing /org/import before any
-			// token gets minted. When ADMIN_TOKEN is set we fall through
-			// into the same bearer-check path Tier-2 uses below.
-			if adminSecret == "" {
-				c.Next()
-				return
-			}
-		}
-
-		// Tier 1b: Local-dev escape hatch — see devmode.go. Lets the
-		// Canvas dashboard keep working after the first workspace token
-		// lands in the DB on `go run ./cmd/server`. Unreachable on SaaS
-		// (hosted tenants always have ADMIN_TOKEN + MOLECULE_ENV=production).
-		if isDevModeFailOpen() {
-			c.Next()
 			return
 		}
 
@@ -196,6 +194,7 @@ func AdminAuth(database *sql.DB) gin.HandlerFunc {
 		// bearer-only path unchanged.
 		if cookieHeader := c.GetHeader("Cookie"); cookieHeader != "" {
 			if ok, _ := VerifiedCPSession(cookieHeader); ok {
+				c.Set("cp_session_actor", cpSessionActor(cookieHeader))
 				c.Next()
 				return
 			}
@@ -260,6 +259,11 @@ func AdminAuth(database *sql.DB) gin.HandlerFunc {
 	}
 }
 
+func cpSessionActor(cookieHeader string) string {
+	sum := sha256.Sum256([]byte(tenantSlug() + "\x00" + cookieHeader))
+	return "session:" + hex.EncodeToString(sum[:])[:16]
+}
+
 // CanvasOrBearer is a softer admin-auth variant used ONLY for cosmetic
 // canvas routes where forging the request has zero security impact (PUT
 // /canvas/viewport: worst case an attacker resets the shared viewport
@@ -268,34 +272,46 @@ func AdminAuth(database *sql.DB) gin.HandlerFunc {
 // Accepts either:
 //
 //  1. A valid bearer token (same contract as AdminAuth) — covers molecli,
-//     agent-to-platform calls, and anyone using the API directly.
-//  2. A browser Origin header that matches CORS_ORIGINS (canvas itself).
-//     This is NOT a strict auth boundary — curl can forge Origin — but for
-//     cosmetic-only routes the trade-off is acceptable. Non-cosmetic routes
-//     MUST NOT use this middleware (see #194 review on why it would re-open
-//     #164 CRITICAL if applied to /bundles/import).
+//     agent-to-platform calls, the browser canvas (which now sends
+//     Authorization: Bearer $NEXT_PUBLIC_ADMIN_TOKEN on every platform
+//     call — see canvas/src/lib/api.ts platformAuthHeaders), and anyone
+//     using the API directly.
+//  2. A same-origin canvas request (Referer/Host match), but ONLY when the
+//     combined-tenant canvas proxy is active (CANVAS_PROXY_URL set). This is
+//     a real same-origin check the browser cannot forge cross-origin (see
+//     isSameOriginCanvas / IsVerifiedCanvasSession, #623/#194) — NOT the
+//     trivially-forgeable cross-origin Origin header. The forgeable
+//     CORS_ORIGINS Origin-match path was REMOVED under the CTO
+//     "nothing fail-open" directive (a no-bearer request passing purely on a
+//     spoofable Origin is effectively open even for a cosmetic route, and is
+//     no longer needed now that the canvas always sends a bearer).
 //
-// Lazy-bootstrap fail-open preserved: zero-token installs pass everything
-// through so fresh self-hosted / dev sessions aren't bricked.
+// Non-cosmetic routes MUST NOT use this middleware (see #194 review on why it
+// would re-open #164 CRITICAL if applied to /bundles/import).
+//
+// (harden/no-fail-open-auth) Two former fail-open branches are REMOVED:
+//   - DB-error on HasAnyLiveTokenGlobal used to `c.Next()` (allow); it now
+//     fails CLOSED with 503 (availability tradeoff that grants NO access).
+//   - The lazy-bootstrap pass (`!hasLive ⇒ c.Next()`) used to let a
+//     zero-token install through EVERYTHING; it is gone. Bootstrap is now via
+//     ADMIN_TOKEN (provisioned by scripts/dev-start.sh for local dev,
+//     operator/SaaS-set in production) — local mimics production.
 func CanvasOrBearer(database *sql.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		ctx := c.Request.Context()
 
-		hasLive, err := wsauth.HasAnyLiveTokenGlobal(ctx, database)
-		if err != nil {
-			log.Printf("wsauth: CanvasOrBearer HasAnyLiveTokenGlobal failed: %v — allowing request", err)
-			c.Next()
-			return
-		}
-		if !hasLive {
-			c.Next()
+		// Probe global token state for the (no-bearer) same-origin path
+		// below. Fail CLOSED on a datastore error — an availability tradeoff
+		// that does NOT grant access (was: log + c.Next() fail-open).
+		if _, err := wsauth.HasAnyLiveTokenGlobal(ctx, database); err != nil {
+			abortAuthLookupError(c, "CanvasOrBearer: HasAnyLiveTokenGlobal", err)
 			return
 		}
 
 		// Path 1: bearer present → bearer MUST validate. Do not fall through
-		// to Origin on an invalid bearer — an attacker with a revoked /
-		// expired token + a matching Origin would otherwise bypass auth.
-		// Empty bearer → skip to Origin path (canvas never sends one).
+		// to the same-origin path on an invalid bearer — an attacker with a
+		// revoked / expired token would otherwise bypass auth.
+		// Empty bearer → fall to the same-origin canvas path.
 		if tok := wsauth.BearerTokenFromHeader(c.GetHeader("Authorization")); tok != "" {
 			// Admin token accepted for canvas dashboard
 			adminSecret := os.Getenv("ADMIN_TOKEN")
@@ -311,13 +327,10 @@ func CanvasOrBearer(database *sql.DB) gin.HandlerFunc {
 			return
 		}
 
-		// Path 2: canvas origin match (cross-origin canvas).
-		if canvasOriginAllowed(c.GetHeader("Origin")) {
-			c.Next()
-			return
-		}
-
-		// Path 3: same-origin canvas (tenant image).
+		// Path 2: same-origin canvas (combined-tenant image). Gated behind
+		// canvasProxyActive (CANVAS_PROXY_URL) and a non-forgeable
+		// Referer/Host same-origin check — NOT the spoofable cross-origin
+		// Origin header (that path was removed, see doc comment above).
 		if isSameOriginCanvas(c) {
 			c.Next()
 			return
@@ -327,30 +340,14 @@ func CanvasOrBearer(database *sql.DB) gin.HandlerFunc {
 	}
 }
 
-// canvasOriginAllowed returns true if origin matches any entry in the
-// CORS_ORIGINS env var (comma-separated) or the localhost defaults.
-// Exact-match only; no prefix or wildcard logic — that's handled by the
-// real CORS middleware upstream. The intent here is "did this request come
-// from the canvas page the user is already logged into?" — a binary check.
-func canvasOriginAllowed(origin string) bool {
-	if origin == "" {
-		return false
-	}
-	allowed := []string{"http://localhost:3000", "http://localhost:3001"}
-	if v := os.Getenv("CORS_ORIGINS"); v != "" {
-		for _, o := range strings.Split(v, ",") {
-			if o = strings.TrimSpace(o); o != "" {
-				allowed = append(allowed, o)
-			}
-		}
-	}
-	for _, a := range allowed {
-		if a == origin {
-			return true
-		}
-	}
-	return false
-}
+// (harden/no-fail-open-auth) canvasOriginAllowed was REMOVED. It matched a
+// request's (trivially forgeable, cross-origin) Origin header against
+// CORS_ORIGINS and was the basis of CanvasOrBearer's no-bearer Origin-match
+// pass — effectively open to any curl that sets a matching Origin. Under the
+// CTO "nothing fail-open" directive that path is gone; the canvas now always
+// sends a bearer (NEXT_PUBLIC_ADMIN_TOKEN), so nothing legitimate relied on it.
+// The CORS *response-header* allowlist is handled by the real CORS middleware
+// upstream, unaffected by this removal.
 
 // isSameOriginCanvas returns true when the request appears to come from the
 // canvas UI served by the same Go process (tenant image). In this topology,
@@ -398,4 +395,41 @@ func isSameOriginCanvas(c *gin.Context) bool {
 	// Referer but always send Origin).
 	origin := c.GetHeader("Origin")
 	return origin == "https://"+host || origin == "http://"+host
+}
+
+// cpSessionConfigured reports whether this platform is wired for upstream
+// session-cookie verification — i.e. it runs as a SaaS tenant image with
+// both CP_UPSTREAM_URL and MOLECULE_ORG_SLUG set. When false (self-hosted /
+// dev), VerifiedCPSession can never succeed, so callers that want a
+// non-forgeable canvas signal in SaaS while still working in dev can use
+// this to decide whether the forgeable same-origin fallback is acceptable.
+func cpSessionConfigured() bool {
+	return os.Getenv("CP_UPSTREAM_URL") != "" && tenantSlug() != ""
+}
+
+// CPSessionConfigured is the exported form of cpSessionConfigured for callers
+// outside this package (e.g. the A2A proxy's canvas-user classification).
+func CPSessionConfigured() bool {
+	return cpSessionConfigured()
+}
+
+// IsVerifiedCanvasSession returns true ONLY when the request carries a WorkOS
+// session cookie that the control plane confirms belongs to a member of THIS
+// tenant's org (via /cp/auth/tenant-member). Unlike IsSameOriginCanvas — whose
+// Host/Referer/Origin inputs are trivially forgeable by any container on the
+// Docker network and which is therefore documented as cosmetic-only (see
+// AdminAuth / CanvasOrBearer comments above, #623/#194) — this is a real,
+// upstream-verified authentication boundary. It is the correct gate for
+// non-cosmetic actions such as A2A dispatch on behalf of a canvas user.
+//
+// Returns false (no network call) in self-hosted / dev deployments where
+// CP_UPSTREAM_URL / MOLECULE_ORG_SLUG are unset; callers should treat that as
+// "no verified canvas session available" and fall back accordingly.
+func IsVerifiedCanvasSession(c *gin.Context) bool {
+	cookie := c.GetHeader("Cookie")
+	if cookie == "" {
+		return false
+	}
+	valid, _ := VerifiedCPSession(cookie)
+	return valid
 }

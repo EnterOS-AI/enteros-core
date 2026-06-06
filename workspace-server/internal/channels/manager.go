@@ -9,8 +9,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/events"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
 )
 
 const (
@@ -82,7 +82,10 @@ func NewManager(proxy A2AProxy, broadcaster Broadcaster) *Manager {
 			log.Printf("Channels: failed to disable telegram chat_id=%s: %v", chatID, err)
 			return
 		}
-		if rows, _ := res.RowsAffected(); rows > 0 {
+		rows, err := res.RowsAffected()
+		if err != nil {
+			log.Printf("Channels: disable telegram RowsAffected error chat_id=%s: %v", chatID, err)
+		} else if rows > 0 {
 			log.Printf("Channels: disabled %d telegram channel(s) for chat_id=%s (bot removed)", rows, chatID)
 			// Reload so the in-memory poller map drops the now-disabled row.
 			m.Reload(ctx)
@@ -156,6 +159,9 @@ func (m *Manager) PausePollersForToken(workspaceID, botToken string) func() {
 			}
 		}
 	}
+	if err := rows.Err(); err != nil {
+		log.Printf("Channels: pause-pollers rows.Err: %v", err)
+	}
 	m.mu.Unlock()
 
 	if len(pausedIDs) == 0 {
@@ -204,8 +210,16 @@ func (m *Manager) Reload(ctx context.Context) {
 			log.Printf("Channels: reload scan error: %v", err)
 			continue
 		}
-		_ = json.Unmarshal(configJSON, &ch.Config)
-		_ = json.Unmarshal(allowedJSON, &ch.AllowedUsers)
+		if err := json.Unmarshal(configJSON, &ch.Config); err != nil {
+			log.Printf("Channels: reload config unmarshal error for %s: %v", truncID(ch.ID), err)
+			continue
+		}
+		if len(allowedJSON) > 0 {
+			if err := json.Unmarshal(allowedJSON, &ch.AllowedUsers); err != nil {
+				log.Printf("Channels: reload allowed_users unmarshal error for %s: %v", truncID(ch.ID), err)
+				continue
+			}
+		}
 		// #319: decrypt at the boundary between DB (ciphertext) and the
 		// in-memory config adapters consume. A decrypt failure logs and
 		// skips the channel — downstream getUpdates would fail anyway
@@ -215,6 +229,9 @@ func (m *Manager) Reload(ctx context.Context) {
 			continue
 		}
 		desired[ch.ID] = ch
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("Channels: reload rows.Err: %v", err)
 	}
 
 	m.mu.Lock()
@@ -296,7 +313,7 @@ func (m *Manager) HandleInbound(ctx context.Context, ch ChannelRow, msg *Inbound
 	history := m.loadHistory(ctx, historyKey)
 
 	// Build A2A JSON-RPC payload
-	a2aBody, _ := json.Marshal(map[string]interface{}{
+	a2aBody, marshalErr := json.Marshal(map[string]interface{}{
 		"method": "message/send",
 		"params": map[string]interface{}{
 			"message": map[string]interface{}{
@@ -316,6 +333,10 @@ func (m *Manager) HandleInbound(ctx context.Context, ch ChannelRow, msg *Inbound
 			},
 		},
 	})
+	if marshalErr != nil {
+		log.Printf("Channels %s: json.Marshal a2aBody failed: %v", ch.ChannelType, marshalErr)
+		return fmt.Errorf("marshal a2a body: %w", marshalErr)
+	}
 
 	callerID := "channel:" + ch.ChannelType
 
@@ -375,21 +396,25 @@ func (m *Manager) HandleInbound(ctx context.Context, ch ChannelRow, msg *Inbound
 
 	// Update stats in DB
 	if db.DB != nil {
-		db.DB.ExecContext(ctx, `
+		if _, err := db.DB.ExecContext(ctx, `
 			UPDATE workspace_channels
 			SET last_message_at = now(), message_count = message_count + 1, updated_at = now()
 			WHERE id = $1
-		`, ch.ID)
+		`, ch.ID); err != nil {
+			log.Printf("Channels: inbound stats update failed for channel %s: %v", ch.ID, err)
+		}
 	}
 
 	// Broadcast event
 	if m.broadcaster != nil {
-		m.broadcaster.RecordAndBroadcast(ctx, string(events.EventChannelMessage), ch.WorkspaceID, map[string]interface{}{
+		if err := m.broadcaster.RecordAndBroadcast(ctx, string(events.EventChannelMessage), ch.WorkspaceID, map[string]interface{}{
 			"channel_id":   ch.ID,
 			"channel_type": ch.ChannelType,
 			"username":     msg.Username,
 			"direction":    "inbound",
-		})
+		}); err != nil {
+			log.Printf("Channels: failed to broadcast inbound event: %v", err)
+		}
 	}
 
 	return nil
@@ -420,19 +445,23 @@ func (m *Manager) SendOutbound(ctx context.Context, channelID string, text strin
 	}
 
 	if db.DB != nil {
-		db.DB.ExecContext(ctx, `
+		if _, err := db.DB.ExecContext(ctx, `
 			UPDATE workspace_channels
 			SET last_message_at = now(), message_count = message_count + 1, updated_at = now()
 			WHERE id = $1
-		`, channelID)
+		`, channelID); err != nil {
+			log.Printf("Channels: outbound stats update failed for channel %s: %v", channelID, err)
+		}
 	}
 
 	if m.broadcaster != nil {
-		m.broadcaster.RecordAndBroadcast(ctx, string(events.EventChannelMessage), ch.WorkspaceID, map[string]interface{}{
+		if err := m.broadcaster.RecordAndBroadcast(ctx, string(events.EventChannelMessage), ch.WorkspaceID, map[string]interface{}{
 			"channel_id":   ch.ID,
 			"channel_type": ch.ChannelType,
 			"direction":    "outbound",
-		})
+		}); err != nil {
+			log.Printf("Channels: failed to broadcast outbound event: %v", err)
+		}
 	}
 
 	return nil
@@ -473,6 +502,9 @@ func (m *Manager) BroadcastToWorkspaceChannels(ctx context.Context, workspaceID,
 			}
 		}
 	}
+	if err := rows.Err(); err != nil {
+		log.Printf("Channels: broadcast rows.Err: %v", err)
+	}
 }
 
 // FetchWorkspaceChannelContext returns recent Slack channel messages formatted
@@ -491,14 +523,20 @@ func (m *Manager) FetchWorkspaceChannelContext(ctx context.Context, workspaceID 
 	}
 	defer rows.Close()
 	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			log.Printf("ChannelManager: FetchWorkspaceChannelContext rows error for %s: %v", workspaceID, err)
+		}
 		return ""
 	}
 	var configJSON []byte
-	if rows.Scan(&configJSON) != nil {
+	if err := rows.Scan(&configJSON); err != nil {
+		log.Printf("ChannelManager: FetchWorkspaceChannelContext scan error for %s: %v", workspaceID, err)
 		return ""
 	}
 	var config map[string]interface{}
-	json.Unmarshal(configJSON, &config)
+	if err := json.Unmarshal(configJSON, &config); err != nil {
+		log.Printf("ChannelManager: unmarshal config: %v", err)
+	}
 	if err := DecryptSensitiveFields(config); err != nil {
 		return ""
 	}
@@ -555,8 +593,14 @@ func (m *Manager) loadChannel(ctx context.Context, channelID string) (ChannelRow
 	if err != nil {
 		return ch, fmt.Errorf("channel %s not found: %w", channelID, err)
 	}
-	json.Unmarshal(configJSON, &ch.Config)
-	json.Unmarshal(allowedJSON, &ch.AllowedUsers)
+	if err := json.Unmarshal(configJSON, &ch.Config); err != nil {
+		return ch, fmt.Errorf("channel %s config unmarshal: %w", channelID, err)
+	}
+	if len(allowedJSON) > 0 {
+		if err := json.Unmarshal(allowedJSON, &ch.AllowedUsers); err != nil {
+			return ch, fmt.Errorf("channel %s allowed_users unmarshal: %w", channelID, err)
+		}
+	}
 	// #319: decrypt bot_token / webhook_secret — SendOutbound and adapter
 	// methods downstream read them as plaintext strings.
 	if err := DecryptSensitiveFields(ch.Config); err != nil {
@@ -629,12 +673,16 @@ func (m *Manager) appendHistory(ctx context.Context, key string, username, userM
 	if db.RDB == nil {
 		return
 	}
-	entry, _ := json.Marshal(map[string]string{
+	entry, marshalErr := json.Marshal(map[string]string{
 		"user":    username,
 		"message": userMsg,
 		"reply":   agentReply,
 		"time":    time.Now().UTC().Format(time.RFC3339),
 	})
+	if marshalErr != nil {
+		log.Printf("appendHistory %s: json.Marshal entry failed: %v", key, marshalErr)
+		return
+	}
 	db.RDB.LPush(ctx, key, string(entry))
 	db.RDB.LTrim(ctx, key, 0, int64(maxHistoryEntries-1))
 	db.RDB.Expire(ctx, key, historyTTL)

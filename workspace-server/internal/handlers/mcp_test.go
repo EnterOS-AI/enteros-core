@@ -14,8 +14,9 @@ import (
 
 	"errors"
 
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/memory/contract"
 	"github.com/DATA-DOG/go-sqlmock"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
 	"github.com/gin-gonic/gin"
 )
 
@@ -51,6 +52,15 @@ func mcpPost(t *testing.T, h *MCPHandler, workspaceID string, body interface{}) 
 	c.Request.Header.Set("Content-Type", "application/json")
 	h.Call(c)
 	return w
+}
+
+func expectCanCommunicateSiblings(mock sqlmock.Sqlmock, callerID, targetID, parentID string) {
+	mock.ExpectQuery(`SELECT id, parent_id FROM workspaces WHERE id = \$1`).
+		WithArgs(callerID).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "parent_id"}).AddRow(callerID, parentID))
+	mock.ExpectQuery(`SELECT id, parent_id FROM workspaces WHERE id = \$1`).
+		WithArgs(targetID).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "parent_id"}).AddRow(targetID, parentID))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -175,6 +185,299 @@ func TestMCPHandler_ToolsList_ContainsExpectedTools(t *testing.T) {
 		if !names[name] {
 			t.Errorf("tool %q missing from tools/list", name)
 		}
+	}
+}
+
+func TestMCPHandler_DelegateTask_RoutesThroughPlatformA2AProxy(t *testing.T) {
+	h, mock := newMCPHandler(t)
+	callerID := "11111111-1111-1111-1111-111111111111"
+	targetID := "22222222-2222-2222-2222-222222222222"
+	parentID := "33333333-3333-3333-3333-333333333333"
+
+	expectCanCommunicateSiblings(mock, callerID, targetID, parentID)
+	mock.ExpectExec(`(?s)INSERT INTO activity_logs.*'delegation'.*'delegate'`).
+		WithArgs(callerID, callerID, targetID, "Delegating to "+targetID, sqlmock.AnyArg(), "pending").
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(`UPDATE activity_logs`).
+		WithArgs("dispatched", "", callerID, sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	var gotTarget, gotCaller string
+	h.a2aProxy = func(ctx context.Context, workspaceID string, body []byte, callerID string, logActivity bool) (int, []byte, error) {
+		gotTarget = workspaceID
+		gotCaller = callerID
+		if !logActivity {
+			t.Fatal("delegate_task should log through platform A2A proxy")
+		}
+		if !strings.Contains(string(body), "do work") {
+			t.Fatalf("A2A body missing task text: %s", string(body))
+		}
+		return 200, []byte(`{"result":{"message":{"parts":[{"text":"done"}]}}}`), nil
+	}
+
+	out, err := h.toolDelegateTask(context.Background(), callerID, map[string]interface{}{
+		"workspace_id": targetID,
+		"task":         "do work",
+	}, mcpCallTimeout)
+	if err != nil {
+		t.Fatalf("delegate_task returned error: %v", err)
+	}
+	if out != "done" {
+		t.Fatalf("delegate_task response = %q, want done", out)
+	}
+	if gotTarget != targetID || gotCaller != callerID {
+		t.Fatalf("proxy called with target=%q caller=%q, want target=%q caller=%q", gotTarget, gotCaller, targetID, callerID)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestMCPHandler_DelegateTaskAsync_RoutesThroughPlatformA2AProxy(t *testing.T) {
+	h, mock := newMCPHandler(t)
+	callerID := "11111111-1111-1111-1111-111111111111"
+	targetID := "22222222-2222-2222-2222-222222222222"
+	parentID := "33333333-3333-3333-3333-333333333333"
+
+	expectCanCommunicateSiblings(mock, callerID, targetID, parentID)
+	mock.ExpectExec(`(?s)INSERT INTO activity_logs.*'delegation'.*'delegate'`).
+		WithArgs(callerID, callerID, targetID, "Delegating to "+targetID, sqlmock.AnyArg(), "pending").
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(`UPDATE activity_logs`).
+		WithArgs("dispatched", "", callerID, sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	called := make(chan struct{}, 1)
+	h.a2aProxy = func(ctx context.Context, workspaceID string, body []byte, proxyCallerID string, logActivity bool) (int, []byte, error) {
+		if workspaceID != targetID || proxyCallerID != callerID {
+			t.Fatalf("unexpected proxy route target=%q caller=%q", workspaceID, proxyCallerID)
+		}
+		if !strings.Contains(string(body), "async work") {
+			t.Fatalf("A2A body missing task text: %s", string(body))
+		}
+		called <- struct{}{}
+		return 200, []byte(`{"result":{"message":{"parts":[{"text":"accepted"}]}}}`), nil
+	}
+
+	out, err := h.toolDelegateTaskAsync(context.Background(), callerID, map[string]interface{}{
+		"workspace_id": targetID,
+		"task":         "async work",
+	})
+	if err != nil {
+		t.Fatalf("delegate_task_async returned error: %v", err)
+	}
+	if !strings.Contains(out, `"status":"dispatched"`) {
+		t.Fatalf("delegate_task_async response = %s", out)
+	}
+	waitGlobalAsyncForTest()
+	select {
+	case <-called:
+	default:
+		t.Fatal("async delegate did not call platform A2A proxy")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// TestMCPHandler_DelegateTaskAsync_MarshalFailureDoesNotCallProxy proves the
+// extracted #1933 fix: when the A2A body fails to marshal, the detached
+// goroutine returns early and never calls proxyA2ARequest with a nil/empty
+// body. Before the fix the goroutine logged the error and fell through,
+// dispatching a malformed A2A request.
+
+func TestMCPHandler_DelegateTask_WithAttachments(t *testing.T) {
+	h, mock := newMCPHandler(t)
+	callerID := "11111111-1111-1111-1111-111111111111"
+	targetID := "22222222-2222-2222-2222-222222222222"
+	parentID := "33333333-3333-3333-3333-333333333333"
+
+	expectCanCommunicateSiblings(mock, callerID, targetID, parentID)
+	mock.ExpectExec(`(?s)INSERT INTO activity_logs.*'delegation'.*'delegate'`).
+		WithArgs(callerID, callerID, targetID, "Delegating to "+targetID, sqlmock.AnyArg(), "pending").
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(`UPDATE activity_logs`).
+		WithArgs("dispatched", "", callerID, sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	h.a2aProxy = func(ctx context.Context, workspaceID string, body []byte, proxyCallerID string, logActivity bool) (int, []byte, error) {
+		if workspaceID != targetID || proxyCallerID != callerID {
+			t.Fatalf("unexpected proxy route target=%q caller=%q", workspaceID, proxyCallerID)
+		}
+		bodyStr := string(body)
+		if !strings.Contains(bodyStr, `"text":"review this video"`) {
+			t.Fatalf("A2A body missing task text: %s", bodyStr)
+		}
+		if !strings.Contains(bodyStr, `"kind":"video"`) {
+			t.Fatalf("A2A body missing video attachment kind: %s", bodyStr)
+		}
+		if !strings.Contains(bodyStr, `"uri":"workspace:/tmp/clip.mp4"`) {
+			t.Fatalf("A2A body missing attachment uri: %s", bodyStr)
+		}
+		if !strings.Contains(bodyStr, `"mime_type":"video/mp4"`) {
+			t.Fatalf("A2A body missing attachment mime_type: %s", bodyStr)
+		}
+		return 200, []byte(`{"result":{"message":{"parts":[{"text":"done"}]}}}`), nil
+	}
+
+	out, err := h.toolDelegateTask(context.Background(), callerID, map[string]interface{}{
+		"workspace_id": targetID,
+		"task":         "review this video",
+		"attachments": []interface{}{
+			map[string]interface{}{
+				"uri":      "workspace:/tmp/clip.mp4",
+				"name":     "clip.mp4",
+				"mimeType": "video/mp4",
+				"size":     12345,
+			},
+		},
+	}, mcpCallTimeout)
+	if err != nil {
+		t.Fatalf("delegate_task returned error: %v", err)
+	}
+	if out != "done" {
+		t.Fatalf("delegate_task response = %q, want done", out)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestMCPHandler_DelegateTaskAsync_WithAttachments(t *testing.T) {
+	h, mock := newMCPHandler(t)
+	callerID := "11111111-1111-1111-1111-111111111111"
+	targetID := "22222222-2222-2222-2222-222222222222"
+	parentID := "33333333-3333-3333-3333-333333333333"
+
+	expectCanCommunicateSiblings(mock, callerID, targetID, parentID)
+	mock.ExpectExec(`(?s)INSERT INTO activity_logs.*'delegation'.*'delegate'`).
+		WithArgs(callerID, callerID, targetID, "Delegating to "+targetID, sqlmock.AnyArg(), "pending").
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(`UPDATE activity_logs`).
+		WithArgs("dispatched", "", callerID, sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	called := make(chan []byte, 1)
+	h.a2aProxy = func(ctx context.Context, workspaceID string, body []byte, proxyCallerID string, logActivity bool) (int, []byte, error) {
+		if workspaceID != targetID || proxyCallerID != callerID {
+			t.Fatalf("unexpected proxy route target=%q caller=%q", workspaceID, proxyCallerID)
+		}
+		called <- body
+		return 200, []byte(`{"result":{"message":{"parts":[{"text":"accepted"}]}}}`), nil
+	}
+
+	out, err := h.toolDelegateTaskAsync(context.Background(), callerID, map[string]interface{}{
+		"workspace_id": targetID,
+		"task":         "async work with image",
+		"attachments": []interface{}{
+			map[string]interface{}{
+				"uri":      "workspace:/tmp/screenshot.png",
+				"name":     "screenshot.png",
+				"mimeType": "image/png",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("delegate_task_async returned error: %v", err)
+	}
+	if !strings.Contains(out, `"status":"dispatched"`) {
+		t.Fatalf("delegate_task_async response = %s", out)
+	}
+	waitGlobalAsyncForTest()
+	select {
+	case body := <-called:
+		bodyStr := string(body)
+		if !strings.Contains(bodyStr, `"kind":"image"`) {
+			t.Fatalf("A2A body missing image attachment kind: %s", bodyStr)
+		}
+		if !strings.Contains(bodyStr, `"uri":"workspace:/tmp/screenshot.png"`) {
+			t.Fatalf("A2A body missing attachment uri: %s", bodyStr)
+		}
+	default:
+		t.Fatal("async delegate did not call platform A2A proxy")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+func TestMCPHandler_DelegateTaskAsync_MarshalFailureDoesNotCallProxy(t *testing.T) {
+	h, mock := newMCPHandler(t)
+	callerID := "11111111-1111-1111-1111-111111111111"
+	targetID := "22222222-2222-2222-2222-222222222222"
+	parentID := "33333333-3333-3333-3333-333333333333"
+
+	expectCanCommunicateSiblings(mock, callerID, targetID, parentID)
+	mock.ExpectExec(`(?s)INSERT INTO activity_logs.*'delegation'.*'delegate'`).
+		WithArgs(callerID, callerID, targetID, "Delegating to "+targetID, sqlmock.AnyArg(), "pending").
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(`UPDATE activity_logs`).
+		WithArgs("dispatched", "", callerID, sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// Force the (otherwise near-impossible) marshal failure for the A2A body.
+	origMarshal := marshalA2ABody
+	marshalA2ABody = func(any) ([]byte, error) {
+		return nil, errors.New("forced marshal failure")
+	}
+	t.Cleanup(func() { marshalA2ABody = origMarshal })
+
+	proxyCalled := make(chan struct{}, 1)
+	h.a2aProxy = func(ctx context.Context, workspaceID string, body []byte, proxyCallerID string, logActivity bool) (int, []byte, error) {
+		proxyCalled <- struct{}{}
+		return 200, []byte(`{}`), nil
+	}
+
+	out, err := h.toolDelegateTaskAsync(context.Background(), callerID, map[string]interface{}{
+		"workspace_id": targetID,
+		"task":         "async work",
+	})
+	if err != nil {
+		t.Fatalf("delegate_task_async returned error: %v", err)
+	}
+	if !strings.Contains(out, `"status":"dispatched"`) {
+		t.Fatalf("delegate_task_async response = %s", out)
+	}
+
+	// Wait for the detached goroutine to finish, then assert the proxy was
+	// never reached because of the early return on marshal failure.
+	waitGlobalAsyncForTest()
+	select {
+	case <-proxyCalled:
+		t.Fatal("proxyA2ARequest was called after marshal failure; expected early return")
+	default:
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// TestMCPHandler_CheckTaskStatus_NullStatusDefaultsToUnknown proves the
+// extracted #1933 hardening: when the activity_logs row has a NULL status,
+// check_task_status reports "unknown" instead of an empty string (the old
+// status.String zero value).
+func TestMCPHandler_CheckTaskStatus_NullStatusDefaultsToUnknown(t *testing.T) {
+	h, mock := newMCPHandler(t)
+	callerID := "11111111-1111-1111-1111-111111111111"
+	targetID := "22222222-2222-2222-2222-222222222222"
+	taskID := "task-abc"
+
+	mock.ExpectQuery(`(?s)SELECT status, error_detail, response_body.*FROM activity_logs`).
+		WithArgs(callerID, targetID, taskID).
+		WillReturnRows(sqlmock.NewRows([]string{"status", "error_detail", "response_body"}).
+			AddRow(nil, nil, nil))
+
+	out, err := h.toolCheckTaskStatus(context.Background(), callerID, map[string]interface{}{
+		"workspace_id": targetID,
+		"task_id":      taskID,
+	})
+	if err != nil {
+		t.Fatalf("check_task_status returned error: %v", err)
+	}
+	if !strings.Contains(out, `"status": "unknown"`) {
+		t.Fatalf("expected status \"unknown\" for NULL status row, got: %s", out)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
 	}
 }
 
@@ -384,65 +687,45 @@ func TestMCPHandler_ListPeers_ReturnsSiblings(t *testing.T) {
 // tools/call — commit_memory
 // ─────────────────────────────────────────────────────────────────────────────
 
-func TestMCPHandler_CommitMemory_LocalScope_Success(t *testing.T) {
+// Issue #1733: the legacy SQL success-path tests for commit_memory and
+// recall_memory have been removed — the v2 plugin is the only backend
+// and its success paths are covered by:
+//   - TestToolCommitMemory_RoutesThroughV2WhenWired (legacy-shim test)
+//   - TestToolRecallMemory_RoutesThroughV2WhenWired (legacy-shim test)
+//   - Every test in mcp_tools_memory_v2_test.go
+// The unwired-path tests live in mcp_tools_memory_legacy_shim_test.go
+// (TestToolCommitMemory_ErrorsWhenV2Unwired and its recall sibling).
+//
+// The two scope-blocked tests below remain because they validate the
+// OFFSEC-001 JSON-RPC scrub layer (mcp.go dispatchRPC), which is
+// orthogonal to the memory backend. After A1 the underlying error
+// shifts from "GLOBAL scope is not permitted" to "memory plugin is
+// not configured" — but the client-visible message stays "tool call
+// failed", which is what the scrub assertion actually proves.
+
+// TestMCPHandler_CommitMemory_GlobalScope_ScrubsInternalError verifies the
+// OFFSEC-001 / #259 scrub contract on the commit_memory tool: the GLOBAL
+// scope block at scopeToWritableNamespace produces an internal error
+// containing the tokens "GLOBAL", "scope", "permitted", "bridge",
+// "LOCAL", "TEAM" — every one of those MUST be scrubbed to the constant
+// "tool call failed" + code -32000 before reaching the JSON-RPC wire.
+//
+// Issue #1747 review fixed the test setup: the handler is now wired
+// with a v2 plugin + resolver stub so the request actually reaches
+// the GLOBAL-block path in commitMemoryLegacyShim →
+// scopeToWritableNamespace. Without that wiring, the handler errors
+// earlier in `memoryV2Available()` with "memory plugin is not
+// configured", and the leaked-tokens assertion below becomes
+// vacuously true — passes even if the entire scrub layer in
+// mcp.go:dispatchRPC is deleted. The wired path is the only one
+// that actually pins the OFFSEC-001 contract.
+func TestMCPHandler_CommitMemory_GlobalScope_ScrubsInternalError(t *testing.T) {
 	h, mock := newMCPHandler(t)
-
-	mock.ExpectExec("INSERT INTO agent_memories").
-		WithArgs(sqlmock.AnyArg(), "ws-1", "important fact", "LOCAL", "ws-1").
-		WillReturnResult(sqlmock.NewResult(1, 1))
-
-	w := mcpPost(t, h, "ws-1", map[string]interface{}{
-		"jsonrpc": "2.0",
-		"id":      9,
-		"method":  "tools/call",
-		"params": map[string]interface{}{
-			"name": "commit_memory",
-			"arguments": map[string]interface{}{
-				"content": "important fact",
-				"scope":   "LOCAL",
-			},
-		},
-	})
-
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
-	}
-	var resp mcpResponse
-	json.Unmarshal(w.Body.Bytes(), &resp)
-	if resp.Error != nil {
-		t.Fatalf("unexpected error: %+v", resp.Error)
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("unmet sqlmock expectations: %v", err)
-	}
-}
-
-// TestMCPHandler_CommitMemory_GlobalScope_Blocked_ScrubsInternalError verifies
-// two contracts at once on the GLOBAL-scope-blocked path:
-//
-//  1. C3 invariant (commit_memory with scope=GLOBAL aborts on the MCP bridge
-//     before touching the DB), AND
-//  2. OFFSEC-001 / #259 scrub contract (commit 7d1a189f): the JSON-RPC error
-//     returned to the client is a CONSTANT — code=-32000, message="tool call
-//     failed" — with the production-internal err.Error() text logged
-//     server-side, never reflected back to the caller.
-//
-// Prior to this rename the test asserted that the client-visible message
-// CONTAINED the substring "GLOBAL", which was the human-readable internal
-// error from toolCommitMemory. mc#664 Class 2 flipped that assertion the
-// right way around: now the test FAILS if the scrub regresses (i.e. if the
-// internal string is ever reflected back to the wire), and PASSES iff the
-// scrubbed constant reaches the client.
-//
-// Coupling note: the constant string "tool call failed" and the code -32000
-// are the same values asserted by
-// TestMCPHandler_dispatchRPC_UnknownTool_ReturnsConstantMessage — both are
-// the OFFSEC-001 contract for the dispatch-failure branch in mcp.go (the
-// third err.Error() leak that 7d1a189f scrubbed). If those constants ever
-// change, both tests must move together.
-func TestMCPHandler_CommitMemory_GlobalScope_Blocked_ScrubsInternalError(t *testing.T) {
-	h, mock := newMCPHandler(t)
-	// No DB expectations — handler must abort before touching the DB (C3).
+	// Wire v2 stubs so toolCommitMemory → commitMemoryLegacyShim
+	// actually runs (without v2, it short-circuits with the
+	// "plugin not configured" error that doesn't contain the
+	// leaked-token strings we're asserting on).
+	h.withMemoryV2APIs(&stubMemoryPlugin{}, rootNamespaceResolver())
 
 	w := mcpPost(t, h, "ws-1", map[string]interface{}{
 		"jsonrpc": "2.0",
@@ -484,7 +767,7 @@ func TestMCPHandler_CommitMemory_GlobalScope_Blocked_ScrubsInternalError(t *test
 	}
 
 	// (3) OFFSEC-001 negative assertions — the internal err.Error() text
-	// from toolCommitMemory ("GLOBAL scope is not permitted via the MCP
+	// from scopeToWritableNamespace ("GLOBAL scope is not permitted via the MCP
 	// bridge — use LOCAL or TEAM") must NOT appear in the client-visible
 	// message. Each token below is a distinct substring of that internal
 	// string; if ANY leaks through, the scrub in mcp.go dispatchRPC has
@@ -509,41 +792,43 @@ func TestMCPHandler_CommitMemory_GlobalScope_Blocked_ScrubsInternalError(t *test
 	}
 }
 
-// TestMCPHandler_CommitMemory_SecretInContent_IsRedactedBeforeInsert verifies
-// the SAFE-T1201 (#838) fix on the MCP bridge path. PR #881 closed the HTTP
-// handler but missed this one — an agent tool-call carrying plain-text
-// credentials must have them scrubbed before the INSERT reaches the DB.
-//
-// The test asserts via the sqlmock `WithArgs` matcher that the content column
-// binds the REDACTED form, not the raw input. sqlmock verifies the exact arg
-// values, so a regression (removing the redactSecrets call) would fail with
-// "argument mismatch" rather than silently persisting the secret.
-func TestMCPHandler_CommitMemory_SecretInContent_IsRedactedBeforeInsert(t *testing.T) {
-	h, mock := newMCPHandler(t)
+// Issue #1733: the legacy SQL-path redaction tests for commit_memory
+// (SecretInContent_IsRedactedBeforeInsert, CleanContent_PassesThrough)
+// have been removed. The v2 plugin path performs the same redaction
+// (mcp_tools_memory_v2.go:122 + :242); its coverage lives in
+// mcp_tools_memory_v2_test.go.
 
-	// Content with three distinct secret patterns covered by redactSecrets:
-	//   - env-var assignment (ANTHROPIC_API_KEY=)
-	//   - Bearer token
-	//   - sk-… prefixed key
+// TestMCPHandler_CommitMemory_LegacyName_RedactionAtPlugin verifies that
+// the LEGACY MCP tool name `commit_memory` (the one most agents
+// actually call — `commit_memory_v2` is the underlying handler the
+// shim delegates to) still redacts secret-shaped content before the
+// payload reaches the v2 plugin. The deleted SQL-path version of this
+// test pinned the same contract against `agent_memories` INSERT
+// arguments; #1747 review (finding N6) noted the legacy-name path
+// had no direct equivalent post-A1. This test fills that gap by
+// capturing the MemoryWrite the stub plugin receives.
+func TestMCPHandler_CommitMemory_LegacyName_RedactionAtPlugin(t *testing.T) {
+	h, _ := newMCPHandler(t)
+
+	var captured contract.MemoryWrite
+	plugin := &stubMemoryPlugin{
+		commitFn: func(_ context.Context, _ string, body contract.MemoryWrite) (*contract.MemoryWriteResponse, error) {
+			captured = body
+			return &contract.MemoryWriteResponse{ID: "mem-x", Namespace: "workspace:root-1"}, nil
+		},
+	}
+	h.withMemoryV2APIs(plugin, rootNamespaceResolver())
+
 	rawContent := "key=ANTHROPIC_API_KEY=sk-ant-xxxxxxxxxxxxxxxx auth=Bearer ghp_yyyyyyyyyyyyy note=sk-proj-zzzzzzzzzzzzzzzzzzzz"
-
-	// Derive what redactSecrets will produce so the sqlmock arg match is
-	// exact. This keeps the test brittle-on-purpose: if redactSecrets's
-	// output shape changes, this test must be re-derived, which surfaces
-	// the change during review.
-	expected, changed := redactSecrets("ws-1", rawContent)
+	wantRedacted, changed := redactSecrets("root-1", rawContent)
 	if !changed {
-		t.Fatalf("precondition failed — redactSecrets must change the test content; got unchanged %q", expected)
+		t.Fatalf("precondition failed — redactSecrets must change the test content; got %q", wantRedacted)
 	}
-	if bytes.Contains([]byte(expected), []byte("sk-ant-xxxxxxxxxxxxxxxx")) {
-		t.Fatalf("precondition failed — redacted content still contains raw secret: %s", expected)
+	if bytes.Contains([]byte(wantRedacted), []byte("sk-ant-xxxxxxxxxxxxxxxx")) {
+		t.Fatalf("precondition failed — redacted content still contains raw secret: %s", wantRedacted)
 	}
 
-	mock.ExpectExec("INSERT INTO agent_memories").
-		WithArgs(sqlmock.AnyArg(), "ws-1", expected, "LOCAL", "ws-1").
-		WillReturnResult(sqlmock.NewResult(1, 1))
-
-	w := mcpPost(t, h, "ws-1", map[string]interface{}{
+	w := mcpPost(t, h, "root-1", map[string]interface{}{
 		"jsonrpc": "2.0",
 		"id":      99,
 		"method":  "tools/call",
@@ -555,52 +840,32 @@ func TestMCPHandler_CommitMemory_SecretInContent_IsRedactedBeforeInsert(t *testi
 			},
 		},
 	})
-
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
 	var resp mcpResponse
-	json.Unmarshal(w.Body.Bytes(), &resp)
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("response is not valid JSON: %v", err)
+	}
 	if resp.Error != nil {
 		t.Fatalf("unexpected JSON-RPC error: %+v", resp.Error)
 	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("sqlmock mismatch — content was NOT redacted before insert: %v", err)
+
+	// The plugin must have seen the REDACTED content, not the raw
+	// secret. If this trips, redaction in the legacy-shim → v2 path
+	// has regressed and credentials are flowing through to the
+	// plugin's memory_records table.
+	if captured.Content == "" {
+		t.Fatal("plugin.CommitMemory was not called — the shim short-circuited before reaching v2")
 	}
-}
-
-// TestMCPHandler_CommitMemory_CleanContent_PassesThrough confirms that the
-// redactor is a no-op on content with no credentials — a regression where
-// redactSecrets corrupted benign content would be a user-visible bug.
-func TestMCPHandler_CommitMemory_CleanContent_PassesThrough(t *testing.T) {
-	h, mock := newMCPHandler(t)
-
-	cleanContent := "the quick brown fox jumps over the lazy dog — no secrets here"
-
-	// Bind the exact string — no wildcards — so that any transformation
-	// (whitespace, case, truncation) would fail the arg match.
-	mock.ExpectExec("INSERT INTO agent_memories").
-		WithArgs(sqlmock.AnyArg(), "ws-1", cleanContent, "TEAM", "ws-1").
-		WillReturnResult(sqlmock.NewResult(1, 1))
-
-	w := mcpPost(t, h, "ws-1", map[string]interface{}{
-		"jsonrpc": "2.0",
-		"id":      100,
-		"method":  "tools/call",
-		"params": map[string]interface{}{
-			"name": "commit_memory",
-			"arguments": map[string]interface{}{
-				"content": cleanContent,
-				"scope":   "TEAM",
-			},
-		},
-	})
-
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	if captured.Content == rawContent {
+		t.Errorf("legacy commit_memory leaked raw secret to plugin: %q", captured.Content)
 	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("clean content should pass through unchanged: %v", err)
+	if captured.Content != wantRedacted {
+		t.Errorf("captured.Content = %q, want redacted %q", captured.Content, wantRedacted)
+	}
+	if bytes.Contains([]byte(captured.Content), []byte("sk-ant-xxxxxxxxxxxxxxxx")) {
+		t.Errorf("captured.Content still contains raw API key fragment: %s", captured.Content)
 	}
 }
 
@@ -608,14 +873,17 @@ func TestMCPHandler_CommitMemory_CleanContent_PassesThrough(t *testing.T) {
 // tools/call — recall_memory
 // ─────────────────────────────────────────────────────────────────────────────
 
-// TestMCPHandler_RecallMemory_GlobalScope_Blocked_ScrubsInternalError verifies
-// C3 (GLOBAL scope blocked on MCP bridge) is enforced and that the OFFSEC-001
-// scrub contract applies: the client-visible error.message is the constant
-// "tool call failed", NOT the descriptive internal reason. The internal reason
-// ("GLOBAL scope is not permitted via the MCP bridge") is logged server-side
-// but must never reach the wire.
-func TestMCPHandler_RecallMemory_GlobalScope_Blocked_ScrubsInternalError(t *testing.T) {
+// TestMCPHandler_RecallMemory_GlobalScope_ScrubsInternalError mirrors the
+// commit_memory scrub test on the recall_memory path. Same #1747 review
+// fix applied: wire v2 stubs so the request reaches the GLOBAL-block
+// path in scopeToReadableNamespaces (which produces the same "GLOBAL
+// scope is not permitted via the MCP bridge" internal error that the
+// leaked-tokens loop below tests for). Without v2 stubs the handler
+// short-circuits on `memoryV2Available()` and the leaked-tokens loop
+// becomes vacuously true.
+func TestMCPHandler_RecallMemory_GlobalScope_ScrubsInternalError(t *testing.T) {
 	h, mock := newMCPHandler(t)
+	h.withMemoryV2APIs(&stubMemoryPlugin{}, rootNamespaceResolver())
 	// No DB expectations — handler must abort before touching the DB.
 
 	w := mcpPost(t, h, "ws-1", map[string]interface{}{
@@ -669,42 +937,11 @@ func TestMCPHandler_RecallMemory_GlobalScope_Blocked_ScrubsInternalError(t *test
 	}
 }
 
-func TestMCPHandler_RecallMemory_LocalScope_Empty(t *testing.T) {
-	h, mock := newMCPHandler(t)
-
-	mock.ExpectQuery("SELECT id, content, scope, created_at").
-		WithArgs("ws-1", "").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "content", "scope", "created_at"}))
-
-	w := mcpPost(t, h, "ws-1", map[string]interface{}{
-		"jsonrpc": "2.0",
-		"id":      12,
-		"method":  "tools/call",
-		"params": map[string]interface{}{
-			"name": "recall_memory",
-			"arguments": map[string]interface{}{
-				"query": "",
-				"scope": "LOCAL",
-			},
-		},
-	})
-
-	var resp mcpResponse
-	json.Unmarshal(w.Body.Bytes(), &resp)
-	if resp.Error != nil {
-		t.Fatalf("unexpected error: %+v", resp.Error)
-	}
-	result, _ := resp.Result.(map[string]interface{})
-	content, _ := result["content"].([]interface{})
-	item, _ := content[0].(map[string]interface{})
-	text, _ := item["text"].(string)
-	if text != "No memories found." {
-		t.Errorf("expected 'No memories found.', got %q", text)
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("unmet sqlmock expectations: %v", err)
-	}
-}
+// Issue #1733: TestMCPHandler_RecallMemory_LocalScope_Empty removed —
+// it asserted on the legacy SQL SELECT path. The v2 empty-result
+// rendering is covered by TestToolRecallMemory_RoutesThroughV2WhenWired
+// (mcp_tools_memory_legacy_shim_test.go) which uses a stub plugin that
+// returns an empty SearchResponse.
 
 // ─────────────────────────────────────────────────────────────────────────────
 // tools/call — send_message_to_user
@@ -901,6 +1138,75 @@ func TestMCPHandler_SendMessageToUser_PersistsToActivityLog(t *testing.T) {
 	}
 }
 
+func TestMCPHandler_SendMessageToUser_WithAttachments_PersistsFileParts(t *testing.T) {
+	t.Setenv("MOLECULE_MCP_ALLOW_SEND_MESSAGE", "true")
+	h, mock := newMCPHandler(t)
+
+	mock.ExpectQuery("SELECT name, talk_to_user_enabled FROM workspaces").
+		WithArgs("ws-mcp-attach").
+		WillReturnRows(sqlmock.NewRows([]string{"name", "talk_to_user_enabled"}).AddRow("Hermes Agent", true))
+
+	mock.ExpectExec(`INSERT INTO activity_logs.*'a2a_receive'.*'notify'`).
+		WithArgs(
+			"ws-mcp-attach",
+			sqlmock.AnyArg(),
+			jsonMatcher{
+				desc: "MCP send_message_to_user response_body has result + file parts",
+				predicate: func(parsed map[string]any) bool {
+					if parsed["result"] != "see attached" {
+						return false
+					}
+					parts, ok := parsed["parts"].([]any)
+					if !ok || len(parts) != 1 {
+						return false
+					}
+					part, ok := parts[0].(map[string]any)
+					if !ok || part["kind"] != "file" {
+						return false
+					}
+					file, ok := part["file"].(map[string]any)
+					return ok &&
+						file["uri"] == "workspace:/workspace/org_chart_v2.png" &&
+						file["name"] == "org_chart_v2.png" &&
+						file["mimeType"] == "image/png" &&
+						file["size"] == float64(12345)
+				},
+			},
+		).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	w := mcpPost(t, h, "ws-mcp-attach", map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      102,
+		"method":  "tools/call",
+		"params": map[string]interface{}{
+			"name": "send_message_to_user",
+			"arguments": map[string]interface{}{
+				"message": "see attached",
+				"attachments": []map[string]interface{}{
+					{
+						"uri":      "workspace:/workspace/org_chart_v2.png",
+						"name":     "org_chart_v2.png",
+						"mimeType": "image/png",
+						"size":     12345,
+					},
+				},
+			},
+		},
+	})
+
+	var resp mcpResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("response was not valid JSON-RPC: %v\nbody=%s", err, w.Body.String())
+	}
+	if resp.Error != nil {
+		t.Errorf("unexpected JSON-RPC error: %+v", resp.Error)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("MCP attachment response_body drift: %v", err)
+	}
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Parse error
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1040,6 +1346,8 @@ func TestIsSafeURL_Blocks169_254_Metadata(t *testing.T) {
 }
 
 func TestIsSafeURL_Blocks10xPrivate(t *testing.T) {
+	t.Setenv("MOLECULE_ORG_ID", "")
+	t.Setenv("MOLECULE_DEPLOY_MODE", "self-hosted")
 	err := isSafeURL("http://10.0.0.1/agent")
 	if err == nil {
 		t.Errorf("isSafeURL: expected 10.x.x.x to be blocked, got nil")
@@ -1047,6 +1355,8 @@ func TestIsSafeURL_Blocks10xPrivate(t *testing.T) {
 }
 
 func TestIsSafeURL_Blocks172Private(t *testing.T) {
+	t.Setenv("MOLECULE_ORG_ID", "")
+	t.Setenv("MOLECULE_DEPLOY_MODE", "self-hosted")
 	err := isSafeURL("http://172.16.0.1/agent")
 	if err == nil {
 		t.Errorf("isSafeURL: expected 172.16.0.0/12 to be blocked, got nil")
@@ -1054,6 +1364,8 @@ func TestIsSafeURL_Blocks172Private(t *testing.T) {
 }
 
 func TestIsSafeURL_Blocks192_168Private(t *testing.T) {
+	t.Setenv("MOLECULE_ORG_ID", "")
+	t.Setenv("MOLECULE_DEPLOY_MODE", "self-hosted")
 	err := isSafeURL("http://192.168.1.100/agent")
 	if err == nil {
 		t.Errorf("isSafeURL: expected 192.168.x.x to be blocked, got nil")
@@ -1077,6 +1389,8 @@ func TestIsSafeURL_BlocksInvalidURL(t *testing.T) {
 // ==================== SSRF Defence — isPrivateOrMetadataIP ====================
 
 func TestIsPrivateOrMetadataIP_10Range(t *testing.T) {
+	t.Setenv("MOLECULE_ORG_ID", "")
+	t.Setenv("MOLECULE_DEPLOY_MODE", "self-hosted")
 	tests := []string{"10.0.0.0", "10.255.255.255", "10.1.2.3"}
 	for _, ip := range tests {
 		if !isPrivateOrMetadataIP(net.ParseIP(ip)) {
@@ -1086,6 +1400,8 @@ func TestIsPrivateOrMetadataIP_10Range(t *testing.T) {
 }
 
 func TestIsPrivateOrMetadataIP_172Range(t *testing.T) {
+	t.Setenv("MOLECULE_ORG_ID", "")
+	t.Setenv("MOLECULE_DEPLOY_MODE", "self-hosted")
 	tests := []string{"172.16.0.0", "172.31.255.255", "172.20.1.1"}
 	for _, ip := range tests {
 		if !isPrivateOrMetadataIP(net.ParseIP(ip)) {
@@ -1095,6 +1411,8 @@ func TestIsPrivateOrMetadataIP_172Range(t *testing.T) {
 }
 
 func TestIsPrivateOrMetadataIP_192_168Range(t *testing.T) {
+	t.Setenv("MOLECULE_ORG_ID", "")
+	t.Setenv("MOLECULE_DEPLOY_MODE", "self-hosted")
 	tests := []string{"192.168.0.0", "192.168.255.255", "192.168.1.1"}
 	for _, ip := range tests {
 		if !isPrivateOrMetadataIP(net.ParseIP(ip)) {

@@ -53,19 +53,12 @@ name: status-reaper
 # `inputs:` block here. Gitea 1.22.6 rejects the whole workflow as
 # "unknown on type" when `workflow_dispatch.inputs.X` is present.
 on:
-  # SCHEDULE RE-ENABLED 2026-05-12 rev3 — interim disable (mc#645) reverted now that
-  # rev3 widens DEFAULT_SWEEP_LIMIT 10 → 30 (covers retroactive-failure timing window).
-  # Sibling watchdog re-enabled in the same PR with timeout-minutes raised 5 → 15.
-  schedule:
-    # Every 5 minutes. Off-zero alignment with sibling cron workflows:
-    # ci-required-drift (`:17`), main-red-watchdog (`:05`),
-    # railway-pin-audit (`:23`). 5-min cadence gives a tight enough
-    # close on schedule-triggered false-reds that main-red-watchdog
-    # (hourly :05) almost never files an issue on the false case.
-    # rev3 keeps `*/5` unchanged per hongming-pc2 03:25Z review:
-    # "trades window-width-cheap for cadence-loady" — N=30 widens
-    # the lookback cheaply without doubling runner load via `*/2`.
-    - cron: '*/5 * * * *'
+  # Schedule moved to operator-config:
+  #   /etc/cron.d/molecule-core-status-reaper ->
+  #   /usr/local/bin/molecule-core-cron-bot.sh status-reaper
+  #
+  # This keeps the 5-minute compensation cadence but stops a maintenance
+  # bot from consuming Gitea Actions runner slots during PR merge waves.
   workflow_dispatch:
 
 # Compensating-status POST needs write on repo statuses; no other

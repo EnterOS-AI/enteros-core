@@ -19,8 +19,8 @@
 // suppress the toolbar; we keep it on so the user gets standard
 // PDF affordances.
 //
-// Fullscreen: AttachmentLightbox hosts the PDF at viewport size on
-// click. Same shared modal as image — third caller justifies the
+// Preview: AttachmentLightbox hosts the PDF inside the active chat tab
+// on click. Same shared modal as image — third caller justifies the
 // abstraction (per RFC #2991 design).
 //
 // Failure modes:
@@ -144,16 +144,15 @@ export function AttachmentPDF({ workspaceId, attachment, onDownload, tone }: Pro
         open={open}
         onClose={() => setOpen(false)}
         ariaLabel={`Preview of ${attachment.name}`}
+        contained
       >
-        <embed
-          src={state.blobUrl}
-          type="application/pdf"
-          // The lightbox's content slot caps at 95vw / 90vh, so size
-          // 100% within that and let the user scroll inside the PDF
-          // viewer.
-          style={{ width: "95vw", height: "90vh" }}
-          aria-label={attachment.name}
-        />
+        <div className="h-full w-full overflow-hidden rounded-lg border border-white/20 bg-white shadow-2xl">
+          <iframe
+            src={`${state.blobUrl}#view=FitH`}
+            title={attachment.name}
+            className="h-full w-full bg-white"
+          />
+        </div>
       </AttachmentLightbox>
     </>
   );

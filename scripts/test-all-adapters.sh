@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# E2E test: All 6 adapters — create one agent per runtime, test A2A between all
+# E2E test: all maintained adapters — create one agent per runtime, test A2A
 set -euo pipefail
 
 PLATFORM="${1:-http://localhost:8080}"
@@ -52,12 +52,12 @@ a2a_send() {
 }
 
 echo "============================================"
-echo "  All-Adapters E2E Test (6 runtimes)"
+echo "  All-Adapters E2E Test (4 runtimes)"
 echo "============================================"
 echo ""
 
 # --- Create workspaces ---
-echo "--- Step 1: Create 6 workspaces ---"
+echo "--- Step 1: Create 4 workspaces ---"
 
 R=$(curl -s -X POST "$PLATFORM/workspaces" -H 'Content-Type: application/json' \
   -d '{"name":"Alice-Claude","role":"claude-code test","tier":2,"template":"claude-code-default"}')
@@ -65,9 +65,9 @@ ALICE=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'
 check "Create Alice (claude-code)" "provisioning" "$R"
 
 R=$(curl -s -X POST "$PLATFORM/workspaces" -H 'Content-Type: application/json' \
-  -d '{"name":"Bob-LangGraph","role":"langgraph test","tier":2,"template":"langgraph"}')
+  -d '{"name":"Bob-Codex","role":"codex test","tier":2,"template":"codex"}')
 BOB=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
-check "Create Bob (langgraph)" "provisioning" "$R"
+check "Create Bob (codex)" "provisioning" "$R"
 
 R=$(curl -s -X POST "$PLATFORM/workspaces" -H 'Content-Type: application/json' \
   -d '{"name":"Carol-OpenClaw","role":"openclaw test","tier":2,"template":"openclaw"}')
@@ -75,29 +75,19 @@ CAROL=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'
 check "Create Carol (openclaw)" "provisioning" "$R"
 
 R=$(curl -s -X POST "$PLATFORM/workspaces" -H 'Content-Type: application/json' \
-  -d '{"name":"Dave-DeepAgents","role":"deepagents test","tier":2,"template":"deepagents"}')
+  -d '{"name":"Dave-Hermes","role":"hermes test","tier":2,"template":"hermes"}')
 DAVE=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
-check "Create Dave (deepagents)" "provisioning" "$R"
-
-R=$(curl -s -X POST "$PLATFORM/workspaces" -H 'Content-Type: application/json' \
-  -d '{"name":"Eve-CrewAI","role":"crewai test","tier":2,"template":"crewai"}')
-EVE=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
-check "Create Eve (crewai)" "provisioning" "$R"
-
-R=$(curl -s -X POST "$PLATFORM/workspaces" -H 'Content-Type: application/json' \
-  -d '{"name":"Frank-AutoGen","role":"autogen test","tier":2,"template":"autogen"}')
-FRANK=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
-check "Create Frank (autogen)" "provisioning" "$R"
+check "Create Dave (hermes)" "provisioning" "$R"
 
 # --- Set API keys (skip Claude which uses OAuth) ---
 echo ""
 echo "--- Step 2: Set API keys ---"
-for ID in $BOB $CAROL $DAVE $EVE $FRANK; do
+for ID in $BOB $CAROL $DAVE; do
   curl -s -X POST "$PLATFORM/workspaces/$ID/secrets" \
     -H 'Content-Type: application/json' \
     -d "{\"key\":\"OPENAI_API_KEY\",\"value\":\"$OPENAI_KEY\"}" > /dev/null
 done
-echo "Set OPENAI_API_KEY on 5 agents"
+echo "Set OPENAI_API_KEY on 3 agents"
 
 # Auto-restart happens automatically when secrets are set
 echo "Secrets trigger auto-restart — waiting for agents to come back..."
@@ -105,13 +95,11 @@ sleep 15
 
 # --- Wait for all online ---
 echo ""
-echo "--- Step 3: Wait for agents (OpenClaw ~3min, CrewAI/AutoGen/DeepAgents ~2min) ---"
+echo "--- Step 3: Wait for agents (OpenClaw ~3min, Hermes may take longer) ---"
 
 wait_online "$ALICE" "Alice-Claude" 20 && check "Alice online" "ok" "ok" || check "Alice online" "online" "timeout"
-wait_online "$BOB" "Bob-LangGraph" 60 && check "Bob online" "ok" "ok" || check "Bob online" "online" "timeout"
-wait_online "$DAVE" "Dave-DeepAgents" 120 && check "Dave online" "ok" "ok" || check "Dave online" "online" "timeout"
-wait_online "$EVE" "Eve-CrewAI" 120 && check "Eve online" "ok" "ok" || check "Eve online" "online" "timeout"
-wait_online "$FRANK" "Frank-AutoGen" 120 && check "Frank online" "ok" "ok" || check "Frank online" "online" "timeout"
+wait_online "$BOB" "Bob-Codex" 60 && check "Bob online" "ok" "ok" || check "Bob online" "online" "timeout"
+wait_online "$DAVE" "Dave-Hermes" 180 && check "Dave online" "ok" "ok" || check "Dave online" "online" "timeout"
 wait_online "$CAROL" "Carol-OpenClaw" 360 && check "Carol online" "ok" "ok" || check "Carol online" "online" "timeout"
 
 # --- Test A2A messages ---
@@ -123,7 +111,7 @@ RESP=$(a2a_send "$ALICE" "say hello in one word")
 echo "    -> $RESP"
 check "Alice responds" "hello" "$RESP"
 
-echo "  Talking to Bob (LangGraph)..."
+echo "  Talking to Bob (Codex)..."
 RESP=$(a2a_send "$BOB" "say hello in one word")
 echo "    -> $RESP"
 check "Bob responds" "hello" "$RESP"
@@ -133,20 +121,10 @@ RESP=$(a2a_send "$CAROL" "say hello in one word")
 echo "    -> $RESP"
 check "Carol responds" "hello" "$RESP"
 
-echo "  Talking to Dave (DeepAgents)..."
+echo "  Talking to Dave (Hermes)..."
 RESP=$(a2a_send "$DAVE" "say hello in one word")
 echo "    -> $RESP"
 check "Dave responds" "hello" "$RESP"
-
-echo "  Talking to Eve (CrewAI)..."
-RESP=$(a2a_send "$EVE" "say hello in one word")
-echo "    -> $RESP"
-check "Eve responds" "hello" "$RESP"
-
-echo "  Talking to Frank (AutoGen)..."
-RESP=$(a2a_send "$FRANK" "say hello in one word")
-echo "    -> $RESP"
-check "Frank responds" "hello" "$RESP"
 
 # --- Peer discovery ---
 echo ""
@@ -157,7 +135,7 @@ peers = json.load(sys.stdin)
 print(f'{len(peers)} peers: {\" \".join(p.get(\"name\",\"\") for p in peers)}')
 " 2>/dev/null)
 echo "  Alice sees: $R"
-check "Alice sees 5 peers" "5 peers" "$R"
+check "Alice sees 3 peers" "3 peers" "$R"
 
 # --- Isolation ---
 echo ""
@@ -168,7 +146,7 @@ check "No ws-* dirs on host" "0" "$HOST_WS"
 # --- Cleanup ---
 echo ""
 echo "--- Step 7: Cleanup ---"
-for ID in $ALICE $BOB $CAROL $DAVE $EVE $FRANK; do
+for ID in $ALICE $BOB $CAROL $DAVE; do
   curl -s -X DELETE "$PLATFORM/workspaces/$ID" > /dev/null 2>&1
 done
 check "Cleanup" "ok" "ok"

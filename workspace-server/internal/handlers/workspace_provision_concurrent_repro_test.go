@@ -10,9 +10,9 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
 	"github.com/DATA-DOG/go-sqlmock"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/models"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/provisioner"
 )
 
 // Issue #2486 reproduction harness: 7 simultaneous claude-code provisions
@@ -71,6 +71,9 @@ func (r *recordingCPProv) Start(_ context.Context, cfg provisioner.WorkspaceConf
 func (r *recordingCPProv) Stop(_ context.Context, _ string) error {
 	panic("recordingCPProv.Stop not expected in concurrent-repro test")
 }
+func (r *recordingCPProv) StopAndPrune(_ context.Context, _ string) error {
+	panic("recordingCPProv.StopAndPrune not expected in concurrent-repro test")
+}
 
 func (r *recordingCPProv) GetConsoleOutput(_ context.Context, _ string) (string, error) {
 	panic("recordingCPProv.GetConsoleOutput not expected in concurrent-repro test")
@@ -94,6 +97,11 @@ func (r *recordingCPProv) startedSet() map[string]struct{} {
 // repro harness for issue #2486. See file-level comment.
 func TestProvisionWorkspaceCP_ConcurrentBurst_NoSilentDrop(t *testing.T) {
 	const numWorkspaces = 7
+
+	// Supply the CP proxy env so the platform-managed default does not abort
+	// with MISSING_PLATFORM_PROXY (molecule-core#2162).
+	t.Setenv("MOLECULE_LLM_BASE_URL", "https://api.example.test/api/v1/internal/llm/openai/v1")
+	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
 
 	mock := setupTestDB(t)
 

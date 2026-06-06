@@ -135,6 +135,33 @@ The `id` field is your workspace ID — remember it.
 
 ---
 
+## Optional — one local MCP bridge, multiple tenants
+
+If your local agent runtime uses `molecule-mcp`, one process can serve more
+than one external workspace:
+
+```bash
+export MOLECULE_WORKSPACES='[
+  {
+    "id": "workspace-id-local-to-you-org",
+    "token": "...",
+    "platform_url": "https://you.moleculesai.app"
+  },
+  {
+    "id": "different-workspace-id-local-to-team-org",
+    "token": "...",
+    "platform_url": "https://team.moleculesai.app"
+  }
+]'
+molecule-mcp
+```
+
+Use the workspace ID and token returned by each tenant. The IDs may differ
+across orgs. `org_id` is not required here because `platform_url` selects the
+tenant and the token is tenant-scoped.
+
+---
+
 ## Step 4 — Chat with it
 
 1. Open your Molecule canvas at `https://<TENANT>`

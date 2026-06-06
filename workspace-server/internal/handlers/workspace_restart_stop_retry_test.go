@@ -43,7 +43,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/provisioner"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
 )
 
 // scriptedCPStop returns a fakeCPStop that returns errs[i] on call i, then
@@ -71,6 +71,13 @@ func (s *scriptedCPStop) Stop(ctx context.Context, _ string) error {
 		return s.errs[i]
 	}
 	return nil
+}
+
+// StopAndPrune delegates to Stop so the retry/error scripting is identical —
+// the prune flag only changes the URL the real provisioner builds, not the
+// retry behavior these tests exercise.
+func (s *scriptedCPStop) StopAndPrune(ctx context.Context, id string) error {
+	return s.Stop(ctx, id)
 }
 func (s *scriptedCPStop) Start(_ context.Context, _ provisioner.WorkspaceConfig) (string, error) {
 	return "", nil
@@ -248,8 +255,13 @@ func TestRestart_CPStopOnlyInsideRetryHelper(t *testing.T) {
 		if !ok || fn.Body == nil || fn.Recv == nil {
 			continue
 		}
-		// cpStopWithRetry is the ONE allowed home for h.cpProv.Stop.
-		if fn.Name.Name == "cpStopWithRetry" {
+		// cpStopWithRetryErr is the ONE allowed home for h.cpProv.Stop —
+		// the bounded-retry loop. cpStopWithRetry is the void-returning
+		// wrapper (restart path) that delegates to it; the delete path uses
+		// cpStopWithRetryErr directly via stopWorkspaceForDelete to capture
+		// the terminal error (task #15). Both wrappers are exempt from this
+		// gate; any OTHER direct cpProv.Stop is the silent-leak regression.
+		if fn.Name.Name == "cpStopWithRetry" || fn.Name.Name == "cpStopWithRetryErr" {
 			continue
 		}
 		ast.Inspect(fn.Body, func(n ast.Node) bool {

@@ -17,18 +17,14 @@ import urllib.error
 import urllib.request
 from urllib.parse import quote
 
-
 TRUE_VALUES = {"1", "true", "yes", "on", "disabled", "disable"}
 PROD_CP_URL = "https://api.moleculesai.app"
 DEFAULT_REQUIRED_CONTEXTS = [
-    "CI / Platform (Go) (push)",
-    "CI / Canvas (Next.js) (push)",
-    "CI / Shellcheck (E2E scripts) (push)",
-    "CI / Python Lint & Test (push)",
     "CI / all-required (push)",
     "Secret scan / Scan diff for credential-shaped strings (push)",
 ]
 TERMINAL_FAILURE_STATES = {"failure", "error", "cancelled", "canceled", "skipped"}
+REDEPLOY_PATH = "/cp/admin/tenants/redeploy-fleet"
 
 
 def truthy_flag(value: str | None) -> bool:
@@ -71,6 +67,12 @@ def build_plan(env: dict[str, str]) -> dict:
         "soak_seconds": _int_env(env, "PROD_AUTO_DEPLOY_SOAK_SECONDS", 60, minimum=0),
         "batch_size": _int_env(env, "PROD_AUTO_DEPLOY_BATCH_SIZE", 3),
         "dry_run": truthy_flag(env.get("PROD_AUTO_DEPLOY_DRY_RUN", "")),
+        # confirm:true ack required by CP /cp/admin/tenants/redeploy-fleet
+        # contract (cp#228 / task #308) for fleet-wide intent. Empty body
+        # / {confirm:false} / {only_slugs:[]} → 400. This caller is the
+        # production auto-deploy step that rolls every live tenant (canary
+        # + fan-out), no slug scoping, so confirm:true is correct.
+        "confirm": True,
     }
     if canary_slug:
         body["canary_slug"] = canary_slug
@@ -128,6 +130,217 @@ def required_contexts(env: dict[str, str]) -> list[str]:
     return [line.strip() for line in raw.replace(",", "\n").splitlines() if line.strip()]
 
 
+def chunks(items: list[str], size: int) -> list[list[str]]:
+    return [items[i : i + size] for i in range(0, len(items), size)]
+
+
+class RolloutFailed(RuntimeError):
+    def __init__(self, message: str, response: dict):
+        super().__init__(message)
+        self.response = response
+
+
+def slugs_from_redeploy_response(body: dict) -> list[str]:
+    slugs: list[str] = []
+    for row in body.get("results") or []:
+        slug = str(row.get("slug") or "").strip()
+        if slug:
+            slugs.append(slug)
+    return slugs
+
+
+def scoped_redeploy_body(base: dict, slugs: list[str]) -> dict:
+    body = dict(base)
+    body.pop("canary_slug", None)
+    body["only_slugs"] = slugs
+    body["soak_seconds"] = 0
+    body["batch_size"] = max(1, len(slugs))
+    return body
+
+
+def cp_api_json(method: str, url: str, token: str, body: dict | None = None) -> tuple[int, dict]:
+    data = None
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+    }
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            return resp.status, json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            parsed = {"error": raw[:500]}
+        return exc.code, parsed
+
+
+def plan_rollout_slugs(cp_url: str, token: str, body: dict, redeploy=None) -> list[str]:
+    if redeploy is None:
+        redeploy = redeploy_scoped
+    dry_run_body = dict(body)
+    dry_run_body["dry_run"] = True
+    status, resp = redeploy(cp_url, token, dry_run_body)
+    if status != 200:
+        raise RuntimeError(f"dry-run redeploy-fleet returned HTTP {status}: {resp.get('error', '')}")
+    if resp.get("ok") is not True:
+        raise RuntimeError(f"dry-run redeploy-fleet reported ok={resp.get('ok')}: {resp.get('error', '')}")
+    slugs = slugs_from_redeploy_response(resp)
+    if not slugs:
+        raise RuntimeError("dry-run redeploy-fleet returned no rollout candidates")
+    return slugs
+
+
+def redeploy_scoped(cp_url: str, token: str, body: dict) -> tuple[int, dict]:
+    return cp_api_json("POST", f"{cp_url}{REDEPLOY_PATH}", token, body)
+
+
+def _raise_for_redeploy_result(status: int, body: dict, slugs: list[str]) -> None:
+    if status != 200 or body.get("ok") is not True:
+        raise RuntimeError(
+            "redeploy scoped call failed for "
+            f"{','.join(slugs)}: HTTP {status}, ok={body.get('ok')}"
+        )
+
+
+def rollout_stragglers(enumerated: list[str], results: list[dict]) -> list[str]:
+    """Return every enumerated tenant NOT proven on the target build.
+
+    A straggler is any tenant the rollout was supposed to cover that the
+    CP could not verify is running the target image tag — whether it
+    errored, was skipped, or SSM-succeeded onto the wrong image
+    (internal#724). CP marks each per-tenant result row with
+    ``verified_on_target`` (the REDEPLOY_RUNNING_IMAGE docker-inspect
+    proof). A tenant enumerated for the rollout but absent from the
+    result set (no batch ever ran it) is also a straggler — that is the
+    exact agents-team silent-skip class.
+
+    Backward-compat: an OLDER CP that doesn't emit ``verified_on_target``
+    yet returns rows without the key. Treat a missing key as verified so
+    this surfacing degrades to the previous (ok-based) behavior against an
+    un-upgraded CP, rather than failing every deploy spuriously. Once the
+    CP fix is deployed the key is always present and real stragglers are
+    caught.
+    """
+
+    verified: set[str] = set()
+    for row in results:
+        if str(row.get("ssm_status") or "") == "DryRun":
+            continue
+        slug = str(row.get("slug") or "").strip()
+        if not slug:
+            continue
+        # Missing key (old CP) => assume verified; present key is authoritative.
+        if "verified_on_target" not in row or row.get("verified_on_target"):
+            verified.add(slug)
+    return sorted(s for s in dict.fromkeys(enumerated) if s not in verified)
+
+
+def assert_full_coverage(enumerated: list[str], aggregate: dict, dry_run: bool) -> None:
+    """Fail the rollout if any enumerated tenant is not on the target build.
+
+    This is the no-silent-skip gate (internal#724). A dry run proves
+    nothing landed, so coverage is not asserted for it.
+    """
+
+    if dry_run:
+        return
+    stragglers = rollout_stragglers(enumerated, aggregate.get("results") or [])
+    if stragglers:
+        msg = (
+            f"incomplete rollout: {len(stragglers)} tenant(s) not verified on target "
+            f"after redeploy-fleet: {', '.join(stragglers)} "
+            f"(enumerated {len(set(enumerated))})"
+        )
+        aggregate["ok"] = False
+        aggregate["error"] = msg
+        aggregate["stragglers"] = stragglers
+        raise RolloutFailed(msg, aggregate)
+
+
+def execute_scoped_rollout(
+    plan: dict,
+    token: str,
+    list_slugs=plan_rollout_slugs,
+    redeploy=redeploy_scoped,
+    sleep=time.sleep,
+) -> dict:
+    cp_url = plan["cp_url"]
+    base_body = plan["body"]
+    all_slugs = list_slugs(cp_url, token, base_body)
+    batch_size = int(base_body.get("batch_size") or 1)
+    canary_slug = str(base_body.get("canary_slug") or "").strip()
+    dry_run = bool(base_body.get("dry_run"))
+    aggregate = {"ok": True, "results": []}
+
+    if canary_slug:
+        if canary_slug not in all_slugs:
+            raise RuntimeError(f"configured canary slug {canary_slug!r} is not a running tenant")
+        body = scoped_redeploy_body(base_body, [canary_slug])
+        print(f"POST {cp_url}{REDEPLOY_PATH} only_slugs={','.join(body['only_slugs'])}")
+        status, resp = redeploy(cp_url, token, body)
+        aggregate["results"].extend(resp.get("results") or [])
+        try:
+            _raise_for_redeploy_result(status, resp, [canary_slug])
+        except RuntimeError as exc:
+            aggregate["ok"] = False
+            aggregate["error"] = str(exc)
+            raise RolloutFailed(str(exc), aggregate) from exc
+        soak_seconds = int(base_body.get("soak_seconds") or 0)
+        if soak_seconds > 0 and not dry_run:
+            print(f"Canary passed; soaking locally for {soak_seconds}s")
+            sleep(soak_seconds)
+
+    remaining = [slug for slug in all_slugs if slug != canary_slug]
+    for group in chunks(remaining, batch_size):
+        body = scoped_redeploy_body(base_body, group)
+        print(f"POST {cp_url}{REDEPLOY_PATH} only_slugs={','.join(group)}")
+        status, resp = redeploy(cp_url, token, body)
+        aggregate["results"].extend(resp.get("results") or [])
+        try:
+            _raise_for_redeploy_result(status, resp, group)
+        except RuntimeError as exc:
+            aggregate["ok"] = False
+            aggregate["error"] = str(exc)
+            raise RolloutFailed(str(exc), aggregate) from exc
+
+    # No-silent-skip coverage gate (internal#724): every enumerated tenant
+    # must be PROVEN on the target build. A per-tenant HTTP-200/ok response
+    # is not proof — a tenant that SSM-succeeded but stayed on the old tag,
+    # or one enumerated but never batched, is a straggler. Surfacing it as
+    # a RolloutFailed makes the deploy step exit non-zero instead of
+    # silently reporting success (the exact agents-team failure mode).
+    assert_full_coverage(all_slugs, aggregate, dry_run)
+
+    return aggregate
+
+
+def rollout_from_plan_file(plan_path: str, response_path: str, env: dict[str, str]) -> None:
+    token = env.get("CP_ADMIN_API_TOKEN", "").strip()
+    if not token:
+        raise ValueError("CP_ADMIN_API_TOKEN is required for production auto-deploy")
+    with open(plan_path, "r", encoding="utf-8") as fh:
+        plan = json.load(fh)
+    if not plan.get("enabled"):
+        raise RuntimeError("production auto-deploy plan is disabled")
+    try:
+        response = execute_scoped_rollout(plan, token)
+    except RolloutFailed as exc:
+        response = exc.response
+        with open(response_path, "w", encoding="utf-8") as fh:
+            json.dump(response, fh, sort_keys=True)
+            fh.write("\n")
+        raise
+    with open(response_path, "w", encoding="utf-8") as fh:
+        json.dump(response, fh, sort_keys=True)
+        fh.write("\n")
+
+
 def _api_json(url: str, token: str) -> dict:
     req = urllib.request.Request(url, headers={"Authorization": f"token {token}"})
     try:
@@ -149,6 +362,71 @@ def _api_json_optional(url: str, token: str) -> tuple[int, dict | None]:
         body = exc.read().decode("utf-8", errors="replace")[:300]
         print(f"::warning::GET {url} -> HTTP {exc.code}: {body}", file=sys.stderr)
         return exc.code, None
+
+
+def current_branch_head(env: dict[str, str]) -> str | None:
+    """Return the SHA at the tip of the deploy branch (main) per Gitea, or None.
+
+    Used to detect a *superseded* deploy job (see `superseded_by`). Fail-safe:
+    any read error / missing token returns None so the caller treats the job as
+    NOT superseded and the strict /buildinfo verify still runs. We never let an
+    unreadable head silently green a deploy.
+    """
+
+    token = env.get("GITEA_TOKEN", "").strip()
+    if not token:
+        return None
+    host = env.get("GITEA_HOST", "git.moleculesai.app")
+    repo = env.get("GITHUB_REPOSITORY", "molecule-ai/molecule-core")
+    # Deploy lane is on: push:main; the branch is always main here, but read it
+    # from the ref name when present so a future branch rename doesn't break us.
+    branch = env.get("GITHUB_REF_NAME", "").strip() or "main"
+    url = f"https://{host}/api/v1/repos/{repo}/branches/{quote(branch, safe='')}"
+    status, body = _api_json_optional(url, token)
+    if status != 200 or not isinstance(body, dict):
+        return None
+    commit = body.get("commit")
+    if isinstance(commit, dict):
+        head = commit.get("id") or commit.get("sha")
+        if isinstance(head, str) and head.strip():
+            return head.strip()
+    return None
+
+
+def superseded_by(env: dict[str, str]) -> str | None:
+    """Return the newer head SHA if THIS deploy job has been superseded, else None.
+
+    This workflow runs with no `concurrency:` (intentional — Gitea 1.22.6 cancels
+    queued runs, which is unacceptable for a prod deploy). When two main pushes
+    land close together, BOTH deploy-production jobs run. The newer push rolls the
+    fleet forward first; the OLDER job's strict /buildinfo verify then sees tenants
+    on the NEWER SHA and false-reds with "$slug is stale" — even though the fleet
+    is AHEAD, not behind. Git SHAs aren't ordered, so the verify can't tell ahead
+    from behind on its own (and /buildinfo exposes only git_sha, no build time).
+
+    Resolve it at the source of truth for ordering — the branch ref: if main's
+    current head is a DIFFERENT SHA than the one this job is deploying, a newer
+    commit has landed and this job is superseded; the newest job's verify is the
+    authoritative one. We return that head SHA so the caller can log it and exit
+    success early, skipping the strict-equality verify for this stale job.
+
+    Fail-safe: returns None (NOT superseded) when the head can't be read or equals
+    our SHA, so a genuinely-behind tenant under the LATEST deploy job still fails
+    the strict verify loudly. This never suppresses a real-stale signal — it only
+    excuses a job that is no longer the latest from asserting exact equality.
+    """
+
+    sha = env.get("GITHUB_SHA", "").strip()
+    if not sha:
+        return None
+    head = current_branch_head(env)
+    if not head:
+        return None
+    # SHA lengths can differ (short vs full); compare on the shorter prefix.
+    n = min(len(head), len(sha))
+    if head[:n].lower() == sha[:n].lower():
+        return None
+    return head
 
 
 def live_disable_flag(env: dict[str, str]) -> str:
@@ -229,6 +507,17 @@ def main() -> int:
     sub.add_parser("plan", help="print production deploy plan as JSON")
     sub.add_parser("assert-enabled", help="fail if production deploy is currently disabled")
     sub.add_parser("wait-ci", help="block until required CI context is green")
+    sub.add_parser(
+        "check-superseded",
+        help=(
+            "exit 0 if a newer commit has landed on the deploy branch (this job "
+            "is superseded; prints the newer head SHA), exit 10 if this job is "
+            "still the latest"
+        ),
+    )
+    rollout_parser = sub.add_parser("rollout", help="execute canary-first scoped production rollout")
+    rollout_parser.add_argument("--plan", required=True, help="path to prod-auto-deploy plan JSON")
+    rollout_parser.add_argument("--response", required=True, help="path to write aggregate response JSON")
     args = parser.parse_args()
 
     try:
@@ -240,6 +529,19 @@ def main() -> int:
             return 0
         if args.command == "wait-ci":
             wait_for_ci_context(dict(os.environ))
+            return 0
+        if args.command == "check-superseded":
+            newer = superseded_by(dict(os.environ))
+            if newer:
+                print(newer)
+                return 0
+            # Exit 10 (not 0, not 1): "this job is still the latest". The
+            # workflow treats only exit 0 as superseded; 10 means proceed to
+            # the strict verify. A non-zero code here is informational, not a
+            # failure — the workflow step swallows it.
+            return 10
+        if args.command == "rollout":
+            rollout_from_plan_file(args.plan, args.response, dict(os.environ))
             return 0
     except Exception as exc:  # noqa: BLE001 - CLI should render operator-friendly errors.
         print(f"::error::{exc}", file=sys.stderr)

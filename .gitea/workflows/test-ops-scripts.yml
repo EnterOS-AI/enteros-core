@@ -49,7 +49,7 @@ jobs:
     name: Ops scripts (unittest)
     runs-on: ubuntu-latest
     # Phase 3 (RFC #219 §1): surface broken workflows without blocking.
-    # mc#774: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
+    # mc#1982: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
     continue-on-error: true
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -58,14 +58,20 @@ jobs:
           python-version: '3.11'
       - name: Install .gitea script test dependencies
         run: python -m pip install --quiet 'pytest==9.0.2' 'PyYAML==6.0.2'
-      - name: Run scripts/ unittests (build_runtime_package, ...)
-        # Top-level scripts/ tests live alongside their target file
-        # (e.g. scripts/test_build_runtime_package.py exercises
-        # scripts/build_runtime_package.py). discover from scripts/
-        # picks up only top-level test_*.py because scripts/ops/ has
-        # no __init__.py — that's intentional, so we run two passes.
+      - name: Run scripts/ unittests, if any
+        # Top-level scripts/ tests live alongside their target file. The
+        # runtime packaging tests moved to molecule-ai-workspace-runtime, so
+        # this pass may legitimately find no tests.
         working-directory: scripts
-        run: python -m unittest discover -t . -p 'test_*.py' -v
+        run: |
+          set +e
+          python -m unittest discover -t . -p 'test_*.py' -v
+          rc=$?
+          if [ "$rc" -eq 5 ]; then
+            echo "No top-level scripts/ unittest files found; skipping."
+            exit 0
+          fi
+          exit "$rc"
       - name: Run scripts/ops/ unittests (sweep_cf_decide, ...)
         working-directory: scripts/ops
         run: python -m unittest discover -p 'test_*.py' -v

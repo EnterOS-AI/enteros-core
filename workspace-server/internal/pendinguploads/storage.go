@@ -37,14 +37,37 @@ import (
 	"fmt"
 	"time"
 
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/uploads"
 	"github.com/google/uuid"
 )
 
-// Per-file size cap. Mirrors workspace-side ingest_handler
-// (workspace/internal_chat_uploads.py:198). Pinned at the DB level via
-// the size_bytes CHECK constraint; this Go-side constant exists so the
-// Put implementation can reject before round-tripping to Postgres.
-const MaxFileBytes = 25 * 1024 * 1024
+// MaxFileBytes is the per-file size cap enforced by Put / PutBatch
+// before any DB round-trip. Mirrors workspace-side ingest
+// (workspace/internal_chat_uploads.py:CHAT_UPLOAD_MAX_FILE_BYTES) and
+// push-mode chat upload cap (chat_files.go:chatUploadMaxBytes). Also
+// pinned at the DB level via the pending_uploads.size_bytes CHECK
+// constraint (currently <=104857600 per migration
+// 20260519200000_pending_uploads_bump_size_cap); this Go-side const
+// exists so a 100 MB+1 byte payload is rejected before Postgres has
+// to look at it.
+//
+// SSOT (task #320): the value derives from uploads.DefaultUploadLimits()
+// — the single source consumed by GET /uploads/limits. Bumping the cap
+// is a one-line edit in internal/uploads/limits.go; this constant
+// follows. The migration's size_bytes CHECK upper bound must be raised
+// in lockstep (separate migration file) since DB constraints can't read
+// Go vars at runtime.
+//
+// Why "var" instead of "const": Go disallows initializing a const from
+// a function call. The runtime cost is zero (DefaultUploadLimits is a
+// pure literal-builder) and tests can still treat it as effectively
+// immutable — no caller mutates it.
+//
+// Why "int" instead of "int64": the existing API surface is
+// len(content)-comparison + make([]byte, MaxFileBytes+1) call sites,
+// both of which want int. We convert from the int64 SSOT field once,
+// here, rather than thread int64 through every caller.
+var MaxFileBytes = int(uploads.DefaultUploadLimits().PerFileBytes)
 
 // ErrNotFound is returned by Get / MarkFetched / Ack when the row is
 // absent. Callers turn this into HTTP 404. Treat acked + expired rows
@@ -297,20 +320,18 @@ func putBatchInsertRows(ctx context.Context, tx *sql.Tx, workspaceID uuid.UUID, 
 }
 
 func (p *PostgresStorage) Get(ctx context.Context, fileID uuid.UUID) (Record, error) {
-	// The expires_at + acked_at filter in the WHERE clause means a
-	// caller sees ErrNotFound for absent / acked / expired without
-	// needing per-case branching. Trade-off: we can't differentiate
-	// in metrics, but the workspace's response is the same in all
-	// three cases ("file gone, give up") so the granularity isn't
-	// useful at this layer. Phase 3 dashboards aggregate row-state
-	// counts directly off the table.
+	// The expires_at filter keeps hard-TTL semantics while allowing
+	// acked rows to remain readable during the ack-retention window.
+	// Canvas chat history stores platform-pending: URIs; after the
+	// poll-mode workspace acks the upload, refreshed browser previews
+	// still need to fetch the same bytes until the sweeper reclaims
+	// the acked row.
 	var r Record
 	err := p.db.QueryRowContext(ctx, `
 		SELECT file_id, workspace_id, content, filename, mimetype,
 		       size_bytes, created_at, fetched_at, acked_at, expires_at
 		FROM pending_uploads
 		WHERE file_id = $1
-		  AND acked_at IS NULL
 		  AND expires_at > now()
 	`, fileID).Scan(
 		&r.FileID, &r.WorkspaceID, &r.Content, &r.Filename, &r.Mimetype,
@@ -326,15 +347,14 @@ func (p *PostgresStorage) Get(ctx context.Context, fileID uuid.UUID) (Record, er
 }
 
 func (p *PostgresStorage) MarkFetched(ctx context.Context, fileID uuid.UUID) error {
-	// UPDATE on the same gating predicate as Get — keeps the "absent
-	// or acked or expired = ErrNotFound" contract symmetric. Without
-	// the predicate a workspace could re-stamp fetched_at on an acked
-	// row, which would mislead Phase 3's stuck-fetch dashboard.
+	// UPDATE on the same expiry predicate as Get. This may re-stamp
+	// fetched_at on an acked row when the canvas previews an attachment
+	// after refresh, which is fine: acked_at remains the delivery-time
+	// signal and the sweeper still deletes by acked_at retention.
 	res, err := p.db.ExecContext(ctx, `
 		UPDATE pending_uploads
 		SET fetched_at = now()
 		WHERE file_id = $1
-		  AND acked_at IS NULL
 		  AND expires_at > now()
 	`, fileID)
 	if err != nil {

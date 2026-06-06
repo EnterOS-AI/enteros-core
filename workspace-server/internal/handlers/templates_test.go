@@ -86,6 +86,7 @@ func TestTemplatesList_WithTemplates(t *testing.T) {
 	configYaml := `name: Test Agent
 description: A test agent
 tier: 2
+runtime: claude-code
 model: anthropic:claude-sonnet-4-20250514
 skills:
   - web-search
@@ -132,6 +133,71 @@ skills:
 	}
 }
 
+func TestTemplatesList_CacheOverridesBakedTemplate(t *testing.T) {
+	setupTestDB(t)
+	setupTestRedis(t)
+
+	bakedDir := t.TempDir()
+	cacheDir := t.TempDir()
+
+	mustWriteTemplate := func(root, id, body string) {
+		t.Helper()
+		dir := filepath.Join(root, id)
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(body), 0644); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+	}
+
+	mustWriteTemplate(bakedDir, "seo-agent", `name: SEO Agent
+description: stale
+tier: 4
+runtime: claude-code
+model: old
+runtime_config:
+  recommended_env: [TELEGRAM_BOT_TOKEN]
+skills: []
+`)
+	mustWriteTemplate(cacheDir, "seo-agent", `name: SEO Agent
+description: fresh
+tier: 4
+runtime: claude-code
+model: moonshot/kimi-k2.6
+runtime_config:
+  required_env: [TENANT_NAME]
+  recommended_env: [GOOGLE_GSC_SITE]
+skills: []
+`)
+
+	handler := NewTemplatesHandler(bakedDir, nil, nil).WithCacheDir(cacheDir)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest("GET", "/templates", nil)
+	handler.List(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp []templateSummary
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(resp) != 1 {
+		t.Fatalf("expected 1 template, got %d", len(resp))
+	}
+	if resp[0].Description != "fresh" {
+		t.Fatalf("cache template should override baked copy, got description %q", resp[0].Description)
+	}
+	if !reflect.DeepEqual(resp[0].RequiredEnv, []string{"TENANT_NAME"}) {
+		t.Fatalf("RequiredEnv = %+v", resp[0].RequiredEnv)
+	}
+	if reflect.DeepEqual(resp[0].RecommendedEnv, []string{"TELEGRAM_BOT_TOKEN"}) {
+		t.Fatalf("stale baked recommended_env leaked through: %+v", resp[0].RecommendedEnv)
+	}
+}
+
 func TestTemplatesList_RuntimeAndModelsRegistry(t *testing.T) {
 	setupTestDB(t)
 	setupTestRedis(t)
@@ -147,12 +213,14 @@ tier: 2
 runtime: hermes
 runtime_config:
   model: nous-hermes-3-70b
+  recommended_env: [GOOGLE_GSC_SITE, GOOGLE_GA4_PROPERTY_ID]
   models:
     - id: nous-hermes-3-70b
       name: Nous Hermes 3 70B
       required_env: [HERMES_API_KEY]
     - id: minimax/minimax-m2.7
       name: MiniMax M2.7 (via OpenRouter)
+      provider: platform
       required_env: [OPENROUTER_API_KEY]
 skills: []
 `
@@ -195,8 +263,16 @@ skills: []
 	if got.Models[1].ID != "minimax/minimax-m2.7" {
 		t.Errorf("Models[1].ID: got %q", got.Models[1].ID)
 	}
+	if got.Models[1].Provider != "platform" {
+		t.Errorf("Models[1].Provider: got %q", got.Models[1].Provider)
+	}
 	if len(got.Models[1].RequiredEnv) != 1 || got.Models[1].RequiredEnv[0] != "OPENROUTER_API_KEY" {
 		t.Errorf("Models[1] required_env: want [OPENROUTER_API_KEY], got %+v", got.Models[1].RequiredEnv)
+	}
+	if len(got.RecommendedEnv) != 2 ||
+		got.RecommendedEnv[0] != "GOOGLE_GSC_SITE" ||
+		got.RecommendedEnv[1] != "GOOGLE_GA4_PROPERTY_ID" {
+		t.Errorf("RecommendedEnv: want [GOOGLE_GSC_SITE GOOGLE_GA4_PROPERTY_ID], got %+v", got.RecommendedEnv)
 	}
 }
 
@@ -385,7 +461,7 @@ skills: []
 
 // TestTemplatesList_OmitsProviderRegistryWhenAbsent pins the omitempty
 // behavior for the new field — templates without a top-level
-// `providers:` block (hermes today, langgraph, etc.) must NOT emit
+// `providers:` block (hermes today, claude-code, etc.) must NOT emit
 // `provider_registry: null`, which would break canvas's array-typed
 // parser (Array.isArray check returns false for null).
 // TestTemplatesList_BothProviderShapesCoexist pins the real production
@@ -546,7 +622,7 @@ func TestTemplatesList_OmitsProvidersWhenAbsent(t *testing.T) {
 		t.Fatalf("mkdir: %v", err)
 	}
 	configYaml := `name: Legacy
-runtime: langgraph
+runtime: hermes
 runtime_config:
   model: anthropic:claude-opus-4-7
 skills: []
@@ -582,6 +658,7 @@ func TestTemplatesList_LegacyTopLevelModel(t *testing.T) {
 	}
 	configYaml := `name: Legacy Agent
 tier: 1
+runtime: claude-code
 model: anthropic:claude-sonnet-4-6
 skills: []
 `
@@ -600,10 +677,10 @@ skills: []
 		t.Fatalf("parse: %v", err)
 	}
 	if len(resp) != 1 || resp[0].Model != "anthropic:claude-sonnet-4-6" {
-		t.Errorf("legacy top-level model not surfaced: %+v", resp)
+		t.Fatalf("legacy top-level model not surfaced: %+v", resp)
 	}
-	if resp[0].Runtime != "" {
-		t.Errorf("Runtime should be empty for legacy template, got %q", resp[0].Runtime)
+	if resp[0].Runtime != "claude-code" {
+		t.Errorf("Runtime should be claude-code for legacy template, got %q", resp[0].Runtime)
 	}
 	if len(resp[0].Models) != 0 {
 		t.Errorf("Models should be empty for legacy template, got %+v", resp[0].Models)
@@ -1250,5 +1327,313 @@ func TestCWE78_DeleteFile_TraversalVariants(t *testing.T) {
 					tc.path, w.Code, w.Body.String())
 			}
 		})
+	}
+}
+
+// ============================================================================
+// internal#718 P3 — GET /templates serves the selectable provider/model list
+// FROM the provider registry (workspace-server/internal/providers), not from
+// each template's hand-authored config.yaml. Additive: the registry-served
+// fields (registry_backed / registry_providers / registry_models) ride
+// ALONGSIDE the existing template-served fields so non-registry runtimes and
+// older canvases keep working. The canvas (PR-B) prefers the registry block;
+// "only registered selectable" follows because the registry block is the
+// authoritative list for a registry-known runtime.
+// ============================================================================
+
+// TestTemplatesList_RegistryServesSelectableModels pins the core P3 contract:
+// for a runtime the provider registry knows (claude-code), /templates serves
+// the registry's NATIVE model ids — regardless of what the template's
+// config.yaml runtime_config.models happens to list. A template author can no
+// longer surface an unregistered model into the canvas dropdown.
+func TestTemplatesList_RegistryServesSelectableModels(t *testing.T) {
+	tmpDir := t.TempDir()
+	tmplDir := filepath.Join(tmpDir, "claude-code-default")
+	if err := os.MkdirAll(tmplDir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// Deliberately list a BOGUS model the registry does not know. The
+	// registry-served list must NOT contain it.
+	configYaml := `name: Claude Code
+runtime: claude-code
+runtime_config:
+  model: claude-sonnet-4-6
+  models:
+    - id: totally-made-up-model
+      name: Not In Registry
+skills: []
+`
+	if err := os.WriteFile(filepath.Join(tmplDir, "config.yaml"), []byte(configYaml), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	handler := NewTemplatesHandler(tmpDir, nil, nil)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest("GET", "/templates", nil)
+	handler.List(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp []templateSummary
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(resp) != 1 {
+		t.Fatalf("expected 1 template, got %d", len(resp))
+	}
+	got := resp[0]
+
+	if !got.RegistryBacked {
+		t.Fatalf("claude-code is a registry-known runtime; RegistryBacked must be true")
+	}
+
+	// The registry-served model set must be the claude-code native set
+	// (anthropic-oauth: sonnet/opus/haiku, anthropic-api: claude-*-4-*,
+	// kimi-coding: kimi-*, minimax: MiniMax-*, platform: vendor/model ids).
+	// It must NOT contain the template's bogus id.
+	regModelIDs := map[string]bool{}
+	for _, m := range got.RegistryModels {
+		regModelIDs[m.ID] = true
+	}
+	if regModelIDs["totally-made-up-model"] {
+		t.Errorf("RegistryModels leaked the template's unregistered model id")
+	}
+	for _, want := range []string{"sonnet", "opus", "claude-opus-4-7", "anthropic/claude-opus-4-7"} {
+		if !regModelIDs[want] {
+			t.Errorf("RegistryModels missing native model %q; got %v", want, regModelIDs)
+		}
+	}
+}
+
+// TestTemplatesList_RegistryAnnotatesDerivedProviderAndBilling pins that each
+// registry-served model carries its DERIVED provider name + a billing_mode
+// reflecting whether that derived provider is the closed platform set
+// (platform_managed) or BYOK (byok). This is what the canvas Config tab reads
+// to show the billing-mode of the DERIVED provider (folds in #1931 intent),
+// instead of its hardcoded billingModeForProvider rule.
+func TestTemplatesList_RegistryAnnotatesDerivedProviderAndBilling(t *testing.T) {
+	tmpDir := t.TempDir()
+	tmplDir := filepath.Join(tmpDir, "claude-code-default")
+	if err := os.MkdirAll(tmplDir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	configYaml := `name: Claude Code
+runtime: claude-code
+runtime_config:
+  model: claude-sonnet-4-6
+skills: []
+`
+	if err := os.WriteFile(filepath.Join(tmplDir, "config.yaml"), []byte(configYaml), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	handler := NewTemplatesHandler(tmpDir, nil, nil)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest("GET", "/templates", nil)
+	handler.List(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp []templateSummary
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	got := resp[0]
+
+	billByModel := map[string]string{}
+	provByModel := map[string]string{}
+	for _, m := range got.RegistryModels {
+		billByModel[m.ID] = m.BillingMode
+		provByModel[m.ID] = m.Provider
+	}
+
+	// A BYOK API model derives to anthropic-api → byok.
+	if provByModel["claude-opus-4-7"] != "anthropic-api" {
+		t.Errorf("claude-opus-4-7 derived provider: want anthropic-api, got %q", provByModel["claude-opus-4-7"])
+	}
+	if billByModel["claude-opus-4-7"] != "byok" {
+		t.Errorf("claude-opus-4-7 billing_mode: want byok, got %q", billByModel["claude-opus-4-7"])
+	}
+	// A platform-namespaced model derives to the closed platform provider →
+	// platform_managed.
+	if provByModel["anthropic/claude-opus-4-7"] != "platform" {
+		t.Errorf("anthropic/claude-opus-4-7 derived provider: want platform, got %q", provByModel["anthropic/claude-opus-4-7"])
+	}
+	if billByModel["anthropic/claude-opus-4-7"] != "platform_managed" {
+		t.Errorf("anthropic/claude-opus-4-7 billing_mode: want platform_managed, got %q", billByModel["anthropic/claude-opus-4-7"])
+	}
+
+	// registry_providers carries the provider display_name + auth_env +
+	// billing_mode for the dropdown labels — sourced from the registry, not
+	// the canvas VENDOR_LABELS map.
+	byName := map[string]registryProviderView{}
+	for _, p := range got.RegistryProviders {
+		byName[p.Name] = p
+	}
+	oauth, ok := byName["anthropic-oauth"]
+	if !ok {
+		t.Fatalf("registry_providers missing anthropic-oauth; got %v", byName)
+	}
+	if oauth.DisplayName != "Claude Code subscription" {
+		t.Errorf("anthropic-oauth display_name: want %q, got %q", "Claude Code subscription", oauth.DisplayName)
+	}
+	if oauth.BillingMode != "byok" {
+		t.Errorf("anthropic-oauth billing_mode: want byok, got %q", oauth.BillingMode)
+	}
+	if len(oauth.AuthEnv) != 1 || oauth.AuthEnv[0] != "CLAUDE_CODE_OAUTH_TOKEN" {
+		t.Errorf("anthropic-oauth auth_env: want [CLAUDE_CODE_OAUTH_TOKEN], got %v", oauth.AuthEnv)
+	}
+	plat, ok := byName["platform"]
+	if !ok || plat.BillingMode != "platform_managed" {
+		t.Errorf("platform provider billing_mode: want platform_managed, got %+v", plat)
+	}
+}
+
+// TestTemplatesList_NonRegistryRuntimeFallsOpenToTemplate pins federation-
+// readiness: for a runtime the registry does NOT know (a hypothetical
+// third-party / external-like runtime), /templates does NOT set
+// RegistryBacked and does NOT synthesize a registry block — the template's
+// own config.yaml fields remain the source, unchanged. No behavior change for
+// non-registry runtimes.
+func TestTemplatesList_NonRegistryRuntimeFallsOpenToTemplate(t *testing.T) {
+	tmpDir := t.TempDir()
+	tmplDir := filepath.Join(tmpDir, "byo-runtime")
+	if err := os.MkdirAll(tmplDir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// "mock" is a known runtime to the manifest allowlist (so List doesn't
+	// skip it) but is NOT in the provider registry's runtimes: block.
+	configYaml := `name: Mock Runtime
+runtime: mock
+runtime_config:
+  model: canned-reply
+  providers: [some-byo-provider]
+  models:
+    - id: canned-reply
+      name: Canned Reply
+skills: []
+`
+	if err := os.WriteFile(filepath.Join(tmplDir, "config.yaml"), []byte(configYaml), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	handler := NewTemplatesHandler(tmpDir, nil, nil)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest("GET", "/templates", nil)
+	handler.List(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp []templateSummary
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(resp) != 1 {
+		t.Fatalf("expected 1 template, got %d", len(resp))
+	}
+	got := resp[0]
+
+	if got.RegistryBacked {
+		t.Errorf("mock is NOT a registry runtime; RegistryBacked must be false")
+	}
+	if len(got.RegistryModels) != 0 || len(got.RegistryProviders) != 0 {
+		t.Errorf("non-registry runtime must not synthesize a registry block; got models=%v providers=%v",
+			got.RegistryModels, got.RegistryProviders)
+	}
+	// Template-served fields untouched.
+	if len(got.Models) != 1 || got.Models[0].ID != "canned-reply" {
+		t.Errorf("template Models unchanged: got %+v", got.Models)
+	}
+	if !reflect.DeepEqual(got.Providers, []string{"some-byo-provider"}) {
+		t.Errorf("template Providers unchanged: got %v", got.Providers)
+	}
+}
+
+// TestTemplatesList_DisplayableFlag verifies the SSOT-driven runtime-picker
+// opt-out: a template's config.yaml `displayable: false` surfaces as a
+// non-nil false on the /templates row (canvas hides it), while an absent
+// flag stays nil (canvas shows it) and an explicit true surfaces as true.
+// This is the backend half of removing the hardcoded frontend allowlist —
+// the picker trusts this list, so hiding a runtime must be declarative here.
+func TestTemplatesList_DisplayableFlag(t *testing.T) {
+	setupTestDB(t)
+	setupTestRedis(t)
+
+	tmpDir := t.TempDir()
+
+	mk := func(dir, yaml string) {
+		d := filepath.Join(tmpDir, dir)
+		if err := os.MkdirAll(d, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(d, "config.yaml"), []byte(yaml), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// absent → nil
+	mk("adk-shown", "name: ADK Shown\nruntime: claude-code\n")
+	// explicit false → hidden marker
+	mk("adk-hidden", "name: ADK Hidden\nruntime: claude-code\ndisplayable: false\n")
+	// explicit true → shown marker
+	mk("adk-explicit", "name: ADK Explicit\nruntime: claude-code\ndisplayable: true\n")
+
+	handler := NewTemplatesHandler(tmpDir, nil, nil)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest("GET", "/templates", nil)
+	handler.List(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp []templateSummary
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	byID := map[string]templateSummary{}
+	for _, s := range resp {
+		byID[s.ID] = s
+	}
+
+	if s, ok := byID["adk-shown"]; !ok {
+		t.Fatal("adk-shown missing")
+	} else if s.Displayable != nil {
+		t.Errorf("adk-shown: expected nil Displayable (absent), got %v", *s.Displayable)
+	}
+
+	if s, ok := byID["adk-hidden"]; !ok {
+		t.Fatal("adk-hidden missing")
+	} else if s.Displayable == nil || *s.Displayable != false {
+		t.Errorf("adk-hidden: expected non-nil false Displayable, got %v", s.Displayable)
+	}
+
+	if s, ok := byID["adk-explicit"]; !ok {
+		t.Fatal("adk-explicit missing")
+	} else if s.Displayable == nil || *s.Displayable != true {
+		t.Errorf("adk-explicit: expected non-nil true Displayable, got %v", s.Displayable)
+	}
+
+	// JSON contract: omitempty drops the field entirely when nil so existing
+	// templates' payloads are byte-unchanged; present when set.
+	var rawRows []map[string]json.RawMessage
+	if err := json.Unmarshal(w.Body.Bytes(), &rawRows); err != nil {
+		t.Fatalf("raw parse: %v", err)
+	}
+	for _, row := range rawRows {
+		id := ""
+		_ = json.Unmarshal(row["id"], &id)
+		_, present := row["displayable"]
+		if id == "adk-shown" && present {
+			t.Error("adk-shown: displayable key should be omitted when nil")
+		}
+		if (id == "adk-hidden" || id == "adk-explicit") && !present {
+			t.Errorf("%s: displayable key should be present when set", id)
+		}
 	}
 }

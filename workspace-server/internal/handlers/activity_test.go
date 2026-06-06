@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"github.com/gin-gonic/gin"
 )
 
@@ -931,6 +931,184 @@ func TestLogActivity_Broadcast_IncludesRequestAndResponseBodies(t *testing.T) {
 	// renders an empty agent reply bubble).
 	if _, present := payload["response_body"]; present {
 		t.Errorf("response_body should be omitted when nil, got %v", payload["response_body"])
+	}
+}
+
+// TestLogActivity_Broadcast_IncludesErrorDetail pins the internal#212
+// UX fix: when an a2a_receive row is logged with status="error" and a
+// non-empty error_detail, the live broadcast MUST carry that detail so
+// the canvas chat-tab error bubble can render the actionable reason
+// (e.g. the provider's own 403 message) instead of the opaque
+// "Agent error (Exception) — see workspace logs for details." string.
+// Without this, the canvas falls back to the hardcoded boilerplate;
+// the row's error_detail is in the DB but never reaches the user
+// without a manual refresh of the Activity tab.
+func TestLogActivity_Broadcast_IncludesErrorDetail(t *testing.T) {
+	mock := setupTestDB(t)
+	defer mock.ExpectationsWereMet()
+
+	mock.ExpectExec("INSERT INTO activity_logs").
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	cb := &recordingBroadcaster{}
+	srcID := "ws-source"
+	tgtID := "ws-target"
+	method := "message/send"
+	// Realistic actionable reason: provider HTTP status + provider's
+	// own message. Secret-safe (no token, no api key, just the cause).
+	detail := "Anthropic 403 oauth_org_not_allowed: Your organization has disabled Claude subscription access for Claude Code — use an Anthropic API key or ask your admin to enable access."
+
+	LogActivity(context.Background(), cb, ActivityParams{
+		WorkspaceID:  "ws-source",
+		ActivityType: "a2a_receive",
+		SourceID:     &srcID,
+		TargetID:     &tgtID,
+		Method:       &method,
+		Status:       "error",
+		ErrorDetail:  &detail,
+	})
+
+	if len(cb.calls) != 1 {
+		t.Fatalf("expected 1 broadcast, got %d", len(cb.calls))
+	}
+	payload := cb.calls[0].payload
+	got, ok := payload["error_detail"].(string)
+	if !ok {
+		t.Fatalf("error_detail missing from broadcast payload: got %#v", payload["error_detail"])
+	}
+	if got != detail {
+		t.Errorf("error_detail = %q, want %q", got, detail)
+	}
+}
+
+// TestLogActivity_Broadcast_OmitsErrorDetailWhenNil pins the inverse:
+// rows logged without an error_detail (the common ok-path) must not
+// have an empty "error_detail":"" key in the broadcast, which would
+// false-positive the canvas's "has actionable reason" guard and render
+// an empty Underlying-Error block. The omission rule matches how
+// request_body/response_body are handled.
+func TestLogActivity_Broadcast_OmitsErrorDetailWhenNil(t *testing.T) {
+	mock := setupTestDB(t)
+	defer mock.ExpectationsWereMet()
+
+	mock.ExpectExec("INSERT INTO activity_logs").
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	cb := &recordingBroadcaster{}
+	srcID := "ws-source"
+
+	LogActivity(context.Background(), cb, ActivityParams{
+		WorkspaceID:  "ws-source",
+		ActivityType: "a2a_send",
+		SourceID:     &srcID,
+		Status:       "ok",
+		ErrorDetail:  nil,
+	})
+
+	if len(cb.calls) != 1 {
+		t.Fatalf("expected 1 broadcast, got %d", len(cb.calls))
+	}
+	if _, present := cb.calls[0].payload["error_detail"]; present {
+		t.Errorf("error_detail should be omitted when nil, got %v", cb.calls[0].payload["error_detail"])
+	}
+}
+
+// TestSanitizeErrorDetail_StripsSecretShapes pins the secret-safe
+// scrubber's contract: the broadcast layer is the last defense before
+// a string crosses the canvas WebSocket and lands in the user's
+// browser, so anything that *looks* like an API key / bearer token /
+// JWT must be replaced with [REDACTED] even if upstream (the runtime,
+// the provider) failed to scrub it. The non-secret parts of the
+// message — provider status, error code, human-readable cause — MUST
+// survive intact, otherwise the whole point of internal#212 (giving
+// the user an actionable reason) is defeated.
+func TestSanitizeErrorDetail_StripsSecretShapes(t *testing.T) {
+	cases := []struct {
+		name     string
+		in       string
+		mustHave []string // substrings that must survive — the actionable parts
+		mustMiss []string // substrings that must NOT survive — the secret shapes
+	}{
+		{
+			name:     "preserves actionable provider reason",
+			in:       "Anthropic 403 oauth_org_not_allowed: Your organization has disabled Claude subscription access for Claude Code",
+			mustHave: []string{"403", "oauth_org_not_allowed", "disabled Claude subscription"},
+			mustMiss: []string{"[REDACTED]"},
+		},
+		{
+			name:     "redacts sk- API key embedded in error",
+			in:       "openai 401 invalid_api_key: Incorrect API key provided: sk-proj-abcdefghijklmnop1234567890abcdef. Check your key.",
+			mustHave: []string{"401", "invalid_api_key", "Incorrect API key provided"},
+			mustMiss: []string{"sk-proj-abcdefghijklmnop1234567890abcdef"},
+		},
+		{
+			name:     "redacts Bearer token in stringified header dump",
+			in:       "auth failed; headers: Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.aaaaaaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbbbbb",
+			mustHave: []string{"auth failed"},
+			mustMiss: []string{"eyJhbGciOiJIUzI1NiJ9.aaaaaaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbbbbb"},
+		},
+		{
+			name:     "truncates absurdly long detail to bound payload size",
+			in:       "kimi 500 internal_error: " + strings.Repeat("x", 8000),
+			mustHave: []string{"kimi 500 internal_error"},
+			mustMiss: []string{strings.Repeat("x", 5000)}, // 5000 in a row must NOT survive — cap is 4096
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := sanitizeErrorDetailForBroadcast(tc.in)
+			for _, s := range tc.mustHave {
+				if !strings.Contains(got, s) {
+					t.Errorf("expected %q to survive scrub, got: %q", s, got)
+				}
+			}
+			for _, s := range tc.mustMiss {
+				if strings.Contains(got, s) {
+					t.Errorf("expected %q to be scrubbed, got: %q", s, got)
+				}
+			}
+		})
+	}
+}
+
+// TestLogActivity_Broadcast_ErrorDetailIsSanitized pins the integration
+// of the scrubber into the broadcast path: if an upstream caller
+// somehow passes through an error_detail with a secret-shaped token,
+// the wire payload (what reaches the canvas WebSocket) must already
+// be scrubbed. Defense in depth — the runtime should never let this
+// happen, but the canvas is the trust boundary, not the runtime.
+func TestLogActivity_Broadcast_ErrorDetailIsSanitized(t *testing.T) {
+	mock := setupTestDB(t)
+	defer mock.ExpectationsWereMet()
+
+	mock.ExpectExec("INSERT INTO activity_logs").
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	cb := &recordingBroadcaster{}
+	srcID := "ws-source"
+	// Upstream leaked a token into the detail string. The DB still
+	// stores the unscrubbed copy (workspace logs are an internal
+	// audit surface), but the broadcast that reaches the canvas
+	// must already be sanitized.
+	detail := "anthropic 401 invalid_api_key: provided key sk-proj-leakedsecretvalueabcdefghij is wrong"
+
+	LogActivity(context.Background(), cb, ActivityParams{
+		WorkspaceID:  "ws-source",
+		ActivityType: "a2a_receive",
+		SourceID:     &srcID,
+		Status:       "error",
+		ErrorDetail:  &detail,
+	})
+
+	if len(cb.calls) != 1 {
+		t.Fatalf("expected 1 broadcast, got %d", len(cb.calls))
+	}
+	got, _ := cb.calls[0].payload["error_detail"].(string)
+	if strings.Contains(got, "sk-proj-leakedsecretvalueabcdefghij") {
+		t.Errorf("broadcast leaked secret-shaped token: %q", got)
+	}
+	if !strings.Contains(got, "invalid_api_key") {
+		t.Errorf("scrubber over-redacted: lost the actionable code from %q", got)
 	}
 }
 

@@ -35,6 +35,19 @@ import (
 // drift-risk #6.
 var ErrNoBackend = errors.New("provisioner: no backend configured (zero-valued receiver)")
 
+// ErrUnresolvableRuntime is returned by selectImage when a workspace
+// names a runtime that has no resolvable image (not in RuntimeImages and
+// no operator-pinned cfg.Image). RFC internal#483 + security review 4269:
+// previously such a request silently fell through to DefaultImage — a user
+// asking for a removed runtime would get a different container
+// with no signal. The CTO standing directive
+// (feedback_platform_must_hardgate_base_contract) is fail-closed: a
+// named-but-unresolvable runtime must reject with a structured,
+// runtime-naming error so the existing provision-failed notify/log path
+// surfaces it, NOT silently degrade. The genuinely-unspecified (empty)
+// runtime is still a distinct, legitimate path that keeps DefaultImage.
+var ErrUnresolvableRuntime = errors.New("provisioner: requested runtime has no resolvable image")
+
 // RuntimeImages maps runtime names to their Docker image refs.
 // Each standalone template repo publishes its image via the reusable
 // publish-template-image workflow in molecule-ci on every main merge.
@@ -55,8 +68,7 @@ var ErrNoBackend = errors.New("provisioner: no backend configured (zero-valued r
 // short-circuit pulls entirely if needed.
 var RuntimeImages = computeRuntimeImages()
 
-// DefaultImage is the fallback workspace Docker image (langgraph is the
-// most common runtime). Computed via RegistryPrefix() so the prefix
+// DefaultImage is the fallback workspace Docker image. Computed via RegistryPrefix() so the prefix
 // override applies to the fallback path too.
 //
 // NOTE: Every runtime MUST have an entry in knownRuntimes (registry.go).
@@ -78,46 +90,83 @@ const (
 
 // WorkspaceConfig holds the parameters needed to provision a workspace container.
 type WorkspaceConfig struct {
-	WorkspaceID        string
-	TemplatePath       string            // Host path to template dir to copy from (e.g. claude-code-default/)
-	ConfigFiles        map[string][]byte // Generated config files to write into /configs volume
-	PluginsPath        string            // Host path to plugins directory (mounted at /plugins)
-	WorkspacePath      string            // Host path to bind-mount as /workspace (if empty, uses Docker named volume)
-	Tier               int
-	Runtime            string            // "langgraph" (default) or "claude-code", "codex", "ollama", "custom"
-	EnvVars            map[string]string // Additional env vars (API keys, etc.)
-	PlatformURL        string
-	AwarenessURL       string
-	AwarenessNamespace string
-	WorkspaceAccess    string // #65: "none" (default), "read_only", or "read_write"
-	ResetClaudeSession bool   // #12: if true, discard the claude-sessions volume before start (fresh session dir)
+	WorkspaceID     string
+	TemplatePath    string            // Host path to template dir to copy from (e.g. claude-code-default/)
+	ConfigFiles     map[string][]byte // Generated config files to write into /configs volume
+	PluginsPath     string            // Host path to plugins directory (mounted at /plugins)
+	WorkspacePath   string            // Host path to bind-mount as /workspace (if empty, uses Docker named volume)
+	Tier            int
+	Runtime         string // "claude-code" (default), "codex", "hermes", "openclaw", etc.
+	InstanceType    string // Optional CP EC2 instance type override (SaaS only)
+	DiskGB          int32  // Optional CP root volume size override in GiB (SaaS only)
+	DataPersistence string // internal#734: "persist"|"ephemeral"|"" — durable-data choice forwarded to CP (SaaS only)
+	Provider        string // multi-provider RFC: ""/"aws"|"hetzner"|"gcp" compute backend for the workspace box (per-workspace; distinct from LLM/model provider). Forwarded to CP.
+	Display         WorkspaceDisplayConfig
+	EnvVars         map[string]string // Additional env vars (API keys, etc.)
+	PlatformURL     string
 
-	// Image, when non-empty, overrides the runtime→image lookup. The handler
-	// layer sets this to the digest-pinned form (`<base>@sha256:<digest>`)
-	// when an operator has promoted a specific runtime build via the
-	// runtime_image_pins table (#2272 layer 1). Empty = legacy behavior,
-	// fall back to RuntimeImages[Runtime] which resolves to the moving
-	// `:latest` tag.
+	// WorkspaceSecretKeys are env keys authored via the workspace_secrets table
+	// (user/org-admin set, per-workspace). The Forensic #145 SCM-write-token
+	// guard EXEMPTS these from stripping: a workspace-scoped GITEA_TOKEN is the
+	// intended, legitimate delivery channel for that workspace's agent. Operator/
+	// persona-merged (global) SCM tokens are NOT in this set and stay stripped.
+	WorkspaceSecretKeys map[string]struct{}
+	WorkspaceAccess     string // #65: "none" (default), "read_only", or "read_write"
+	ResetClaudeSession  bool   // #12: if true, discard the claude-sessions volume before start (fresh session dir)
+
+	// Image, when non-empty, overrides the runtime→image lookup. CP
+	// (molecule-controlplane) is the single SSOT for runtime image digest
+	// pins via its migrations/027_runtime_image_pins table — the pin is
+	// applied at CP's provisioner layer before the workspace-server even
+	// runs, so under the current architecture this field is always empty
+	// on the workspace-server side. Empty = fall back to RuntimeImages
+	// [Runtime] which resolves to the moving `:latest` tag.
+	//
+	// Historical note: molecule-core's own runtime_image_pins table
+	// (workspace-server/migrations 047) was the original aspirational
+	// design (#2272 layer 1) but never received a writer; RFC internal#617 /
+	// task #335 retired the dead reader + table in favor of CP-as-SSOT.
 	Image string
+}
+
+type WorkspaceDisplayConfig struct {
+	Mode     string `json:"mode,omitempty"`
+	Width    int    `json:"width,omitempty"`
+	Height   int    `json:"height,omitempty"`
+	Protocol string `json:"protocol,omitempty"`
 }
 
 // selectImage resolves the final Docker image ref for a workspace. The handler
 // layer is the source of truth — if it set cfg.Image (the digest-pinned form
-// from runtime_image_pins, #2272), honor that. Otherwise fall back to the
-// runtime→tag lookup in RuntimeImages (legacy `:latest` behavior). When the
-// runtime isn't recognized either, fall back to DefaultImage so Start() still
-// has something to hand Docker — surfacing a "No such image" later is more
-// actionable than a silent "" panic in ContainerCreate.
-func selectImage(cfg WorkspaceConfig) string {
+// supplied by CP, the SSOT for runtime image pins; molecule-core's own
+// runtime_image_pins reader retired by RFC internal#617 / task #335), honor
+// that. Otherwise fall back to the runtime→tag lookup in RuntimeImages
+// (legacy `:latest` behavior).
+//
+// Fail-closed contract (RFC internal#483 / security review 4269 /
+// feedback_platform_must_hardgate_base_contract): if the workspace NAMES a
+// runtime that resolves to no image (not in RuntimeImages, no pinned
+// cfg.Image), reject with ErrUnresolvableRuntime instead of silently
+// substituting DefaultImage. Pre-fix, removing a runtime from the catalog left
+// those create requests silently provisioning a fallback container with no
+// signal. The error propagates through Start → markProvisionFailed, which
+// already broadcasts WorkspaceProvisionFailed and records the message.
+//
+// The genuinely-unspecified runtime (empty cfg.Runtime, e.g. an org template
+// that doesn't pin one) is an intended distinct path and still resolves to
+// DefaultImage — only a NAMED-but-unresolvable runtime is rejected.
+func selectImage(cfg WorkspaceConfig) (string, error) {
 	if cfg.Image != "" {
-		return cfg.Image
+		return cfg.Image, nil
 	}
 	if cfg.Runtime != "" {
 		if img, ok := RuntimeImages[cfg.Runtime]; ok {
-			return img
+			return img, nil
 		}
+		return "", fmt.Errorf("%w: runtime %q (known runtimes: %v)",
+			ErrUnresolvableRuntime, cfg.Runtime, knownRuntimes)
 	}
-	return DefaultImage
+	return DefaultImage, nil
 }
 
 // Workspace-access constants for #65. Matches the CHECK constraint on
@@ -188,6 +237,24 @@ const containerNamePrefix = "ws-"
 // labeled container whose workspace row no longer exists at all
 // (the wiped-DB case after `docker compose down -v`).
 const LabelManaged = "molecule.platform.managed"
+
+// AgentUID / AgentGID are the uid/gid of the unprivileged `agent` user that
+// every workspace template creates and drops to via `gosu agent` before
+// exec'ing the runtime (the a2a_mcp_server runs under this uid). The value is
+// fixed at 1000:1000 across all templates — see:
+//   - workspace-configs-templates/claude-code-default/Dockerfile (`useradd -u 1000 ... agent`)
+//   - workspace-configs-templates/hermes/Dockerfile               (`useradd -u 1000 ... agent`)
+//   - workspace/entrypoint.sh                                     (`exec gosu agent` — "uid 1000")
+//
+// Files the platform injects into /configs AFTER the entrypoint's
+// `chown -R agent:agent /configs` (the post-start #418 re-injection and the
+// pre-start #1877 volume write) must be owned by this uid/gid, otherwise the
+// agent-uid MCP server hits EACCES reading /configs/.auth_token, sends an
+// empty bearer, and the platform 401s on /registry/{id}/peers (list_peers).
+const (
+	AgentUID = 1000
+	AgentGID = 1000
+)
 
 // managedLabels is the canonical label map applied to every workspace
 // container + volume. Pulled out so a future addition (e.g. instance
@@ -318,7 +385,15 @@ func (p *Provisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string, e
 
 	env := buildContainerEnv(cfg)
 
-	image := selectImage(cfg)
+	image, imgErr := selectImage(cfg)
+	if imgErr != nil {
+		// Fail-closed: a named-but-unresolvable runtime must not silently
+		// become DefaultImage (RFC internal#483 / review 4269). The caller's
+		// error path (markProvisionFailed) broadcasts the failure + records
+		// the message so the canvas surfaces it.
+		log.Printf("Provisioner: refusing to start %s: %v", cfg.WorkspaceID, imgErr)
+		return "", imgErr
+	}
 
 	// Local-build mode (issue #63 / Task #194): when MOLECULE_IMAGE_REGISTRY
 	// is unset, the OSS contributor path skips the registry pull entirely
@@ -326,7 +401,7 @@ func (p *Provisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string, e
 	// + `docker build`s it locally. Replace the placeholder image ref with
 	// the SHA-pinned tag of the freshly-built image before ContainerCreate.
 	//
-	// Pinned overrides (cfg.Image set, e.g. via runtime_image_pins for
+	// Pinned overrides (cfg.Image set, e.g. via CP's runtime_image_pins for
 	// production thin-AMI launches) bypass this path — they pin a digest
 	// the operator chose explicitly.
 	if cfg.Image == "" && cfg.Runtime != "" {
@@ -591,6 +666,28 @@ func ValidateWorkspaceAccess(access, workspacePath string) error {
 	}
 }
 
+// scmWriteTokenKeys is the explicit denylist of environment variable names
+// that carry a Git SCM *write* credential (push / merge / approve). These
+// must never reach a tenant workspace container — see the forensic #145
+// rationale in buildContainerEnv. Kept as an exact-match set rather than a
+// substring/prefix heuristic so the guard is auditable and can't silently
+// over-strip a legitimately-named var.
+var scmWriteTokenKeys = map[string]struct{}{
+	"GITEA_TOKEN":     {},
+	"GITHUB_TOKEN":    {},
+	"GH_TOKEN":        {}, // gh CLI honours GH_TOKEN as a GITHUB_TOKEN alias
+	"GITLAB_TOKEN":    {},
+	"GL_TOKEN":        {}, // glab CLI alias
+	"BITBUCKET_TOKEN": {},
+}
+
+// isSCMWriteTokenKey reports whether an env var name is a known Git SCM
+// write credential that must be stripped from tenant workspace env.
+func isSCMWriteTokenKey(key string) bool {
+	_, ok := scmWriteTokenKeys[key]
+	return ok
+}
+
 // buildContainerEnv assembles the initial environment variables injected
 // into every workspace container.
 //
@@ -617,17 +714,53 @@ func buildContainerEnv(cfg WorkspaceConfig) []string {
 		// /app and set ENV ADAPTER_MODULE=adapter, but molecule-runtime is a
 		// pip console_script entry point so cwd isn't on sys.path automatically.
 		// Setting PYTHONPATH from the provisioner fixes every adapter image
-		// (claude-code, hermes, langgraph, …) without needing to PR each
+		// (claude-code, codex, hermes, openclaw, …) without needing to PR each
 		// standalone template repo. Per-template ENV in the Dockerfile can
 		// still override (Dockerfile ENV is overridden by docker -e at runtime).
 		"PYTHONPATH=/app",
 	}
-	if cfg.AwarenessNamespace != "" && cfg.AwarenessURL != "" {
-		env = append(env, fmt.Sprintf("AWARENESS_NAMESPACE=%s", cfg.AwarenessNamespace))
-		env = append(env, fmt.Sprintf("AWARENESS_URL=%s", cfg.AwarenessURL))
-	}
+	// #1687: track explicit GH_TOKEN / GITHUB_TOKEN so they win over GH_PAT
+	// alias. These are normally stripped by the SCM-write guard below, but
+	// when a user explicitly sets them we preserve the value.
+	var explicitGHToken, explicitGitHubToken string
 	for k, v := range cfg.EnvVars {
+		if k == "GH_TOKEN" {
+			explicitGHToken = v
+			continue
+		}
+		if k == "GITHUB_TOKEN" {
+			explicitGitHubToken = v
+			continue
+		}
+		// Forensic #145 hardening: tenant workspace containers run
+		// agent-controlled code and must NEVER receive a Git SCM *write*
+		// credential. Without merge/approve creds in-container the
+		// two-eyes review gate is structurally self-bypass-proof — an
+		// agent that forges an approval has no token to act on it. A
+		// latent path exists (loadPersonaEnvFile merges a per-role
+		// persona `GITEA_TOKEN` into cfg.EnvVars when MOLECULE_PERSONA_ROOT
+		// is set on a tenant host); it is inert today (persona dirs are
+		// operator-host-only) but unguarded. Strip SCM-write tokens here
+		// by construction so the invariant holds regardless of whether
+		// that path ever becomes reachable.
+		if isSCMWriteTokenKey(k) {
+			log.Printf("buildContainerEnv: dropped SCM-write credential %q from workspace env (forensic #145 guard)", k)
+			continue
+		}
 		env = append(env, fmt.Sprintf("%s=%s", k, v))
+	}
+	// #1687: alias GH_PAT → GH_TOKEN / GITHUB_TOKEN on the READ side
+	// (container env assembly). Explicit values win: only alias when the
+	// key was not set in workspace secrets.
+	if explicitGHToken != "" {
+		env = append(env, fmt.Sprintf("GH_TOKEN=%s", explicitGHToken))
+	} else if pat, hasPAT := cfg.EnvVars["GH_PAT"]; hasPAT && pat != "" {
+		env = append(env, fmt.Sprintf("GH_TOKEN=%s", pat))
+	}
+	if explicitGitHubToken != "" {
+		env = append(env, fmt.Sprintf("GITHUB_TOKEN=%s", explicitGitHubToken))
+	} else if pat, hasPAT := cfg.EnvVars["GH_PAT"]; hasPAT && pat != "" {
+		env = append(env, fmt.Sprintf("GITHUB_TOKEN=%s", pat))
 	}
 	// Inject ADMIN_TOKEN from the platform server's environment so workspace
 	// containers can call /admin/liveness and other admin-gated endpoints
@@ -862,8 +995,18 @@ func buildTemplateTar(templatePath string) (*bytes.Buffer, error) {
 	return &buf, nil
 }
 
-// WriteFilesToContainer writes in-memory files into /configs in the container.
-func (p *Provisioner) WriteFilesToContainer(ctx context.Context, containerID string, files map[string][]byte) error {
+// buildConfigFilesTar builds the tar stream that WriteFilesToContainer streams
+// into /configs via CopyToContainer. Every entry is stamped Uid/Gid = agent
+// (AgentUID/AgentGID) so the files land agent-owned after extraction. This is
+// the issue #418 post-start re-injection path: it runs AFTER the template
+// entrypoint's `chown -R agent:agent /configs`, so without explicit ownership
+// in the tar header the files extract as root:root (tar Uid/Gid default 0) and
+// the agent-uid MCP server can no longer read /configs/.auth_token (and
+// /configs/.platform_inbound_secret) → empty bearer → list_peers 401.
+//
+// Pulled out as a pure function so the ownership contract is unit-testable
+// without a live Docker daemon (mirrors buildTemplateTar).
+func buildConfigFilesTar(files map[string][]byte) (*bytes.Buffer, error) {
 	var buf bytes.Buffer
 	tw := tar.NewWriter(&buf)
 
@@ -876,8 +1019,10 @@ func (p *Provisioner) WriteFilesToContainer(ctx context.Context, containerID str
 				Typeflag: tar.TypeDir,
 				Name:     dir + "/",
 				Mode:     0755,
+				Uid:      AgentUID,
+				Gid:      AgentGID,
 			}); err != nil {
-				return fmt.Errorf("failed to write tar dir header for %s: %w", dir, err)
+				return nil, fmt.Errorf("failed to write tar dir header for %s: %w", dir, err)
 			}
 			createdDirs[dir] = true
 		}
@@ -886,19 +1031,30 @@ func (p *Provisioner) WriteFilesToContainer(ctx context.Context, containerID str
 			Name: name,
 			Mode: 0644,
 			Size: int64(len(data)),
+			Uid:  AgentUID,
+			Gid:  AgentGID,
 		}
 		if err := tw.WriteHeader(header); err != nil {
-			return fmt.Errorf("failed to write tar header for %s: %w", name, err)
+			return nil, fmt.Errorf("failed to write tar header for %s: %w", name, err)
 		}
 		if _, err := tw.Write(data); err != nil {
-			return fmt.Errorf("failed to write tar data for %s: %w", name, err)
+			return nil, fmt.Errorf("failed to write tar data for %s: %w", name, err)
 		}
 	}
 	if err := tw.Close(); err != nil {
-		return fmt.Errorf("failed to close tar writer: %w", err)
+		return nil, fmt.Errorf("failed to close tar writer: %w", err)
 	}
+	return &buf, nil
+}
 
-	return p.cli.CopyToContainer(ctx, containerID, "/configs", &buf, container.CopyToContainerOptions{})
+// WriteFilesToContainer writes in-memory files into /configs in the container,
+// agent-owned (see buildConfigFilesTar).
+func (p *Provisioner) WriteFilesToContainer(ctx context.Context, containerID string, files map[string][]byte) error {
+	buf, err := buildConfigFilesTar(files)
+	if err != nil {
+		return err
+	}
+	return p.cli.CopyToContainer(ctx, containerID, "/configs", buf, container.CopyToContainerOptions{})
 }
 
 // CopyToContainer exposes CopyToContainer from the Docker client for use by other packages.
@@ -988,13 +1144,28 @@ func (p *Provisioner) ReadFromVolume(ctx context.Context, volumeName, filePath s
 	return clean, nil
 }
 
+// writeAuthTokenVolumeCmd is the shell command the throwaway alpine container
+// runs to seed /vol/.auth_token. alpine runs it as root, so without the
+// explicit `chown 1000:1000` the file stays root:root after the template
+// entrypoint's `chown -R agent:agent /configs` has already run — the agent-uid
+// (AgentUID) MCP server then gets EACCES reading it → empty bearer →
+// list_peers 401. Pulled out as a pure function so the ownership contract is
+// unit-testable without a live Docker daemon. Issue #1877.
+func writeAuthTokenVolumeCmd() string {
+	return fmt.Sprintf(
+		"mkdir -p /vol && printf '%%s' $TOKEN > /vol/.auth_token && chmod 0600 /vol/.auth_token && chown %d:%d /vol/.auth_token",
+		AgentUID, AgentGID,
+	)
+}
+
 // WriteAuthTokenToVolume writes the workspace auth token into the config volume
 // BEFORE the container starts, eliminating the token-injection race window where
 // a restarted container could read a stale token from /configs/.auth_token before
 // WriteFilesToContainer writes the new one. Issue #1877.
 //
 // Uses a throwaway alpine container to write directly to the named volume,
-// bypassing the container lifecycle entirely.
+// bypassing the container lifecycle entirely. The written file is chowned to
+// the agent uid/gid (see writeAuthTokenVolumeCmd).
 func (p *Provisioner) WriteAuthTokenToVolume(ctx context.Context, workspaceID, token string) error {
 	if p == nil || p.cli == nil {
 		return ErrNoBackend
@@ -1002,7 +1173,7 @@ func (p *Provisioner) WriteAuthTokenToVolume(ctx context.Context, workspaceID, t
 	volName := ConfigVolumeName(workspaceID)
 	resp, err := p.cli.ContainerCreate(ctx, &container.Config{
 		Image: "alpine",
-		Cmd:   []string{"sh", "-c", "mkdir -p /vol && printf '%s' $TOKEN > /vol/.auth_token && chmod 0600 /vol/.auth_token"},
+		Cmd:   []string{"sh", "-c", writeAuthTokenVolumeCmd()},
 		Env:   []string{"TOKEN=" + token},
 	}, &container.HostConfig{
 		Binds: []string{volName + ":/vol"},

@@ -24,17 +24,30 @@ import (
 
 // BuildExternalConnectionPayload assembles the gin.H payload that the
 // canvas's ExternalConnectModal consumes. Pure data — caller owns DB
-// reads (workspace_id) and token minting (auth_token).
+// reads (workspace_id, workspace_name) and token minting (auth_token).
 //
 // authToken may be empty for the read-only "show instructions again"
 // path; the modal masks the field in that case rather than displaying
 // an empty string.
-func BuildExternalConnectionPayload(platformURL, workspaceID, authToken string) gin.H {
+//
+// workspaceName feeds the per-workspace MCP server-name in the snippets
+// that wire molecule-mcp into an external Claude Code (or other
+// MCP-stdio) client. Without a unique server name a second
+// `claude mcp add molecule` call REPLACES the first entry, collapsing
+// multi-workspace use into a single per-session slot — see
+// mcpServerNameForWorkspace below. May be empty (re-show / rotate paths
+// that don't plumb the name); the helper falls back to the workspace
+// ID's short prefix so the snippet is always unique.
+func BuildExternalConnectionPayload(platformURL, workspaceID, workspaceName, authToken string) gin.H {
 	pURL := strings.TrimSuffix(platformURL, "/")
+	mcpName := mcpServerNameForWorkspace(workspaceID, workspaceName)
 	stamp := func(tmpl string) string {
 		return strings.ReplaceAll(
-			strings.ReplaceAll(tmpl, "{{PLATFORM_URL}}", pURL),
-			"{{WORKSPACE_ID}}", workspaceID,
+			strings.ReplaceAll(
+				strings.ReplaceAll(tmpl, "{{PLATFORM_URL}}", pURL),
+				"{{WORKSPACE_ID}}", workspaceID,
+			),
+			"{{MCP_SERVER_NAME}}", mcpName,
 		)
 	}
 	return gin.H{
@@ -75,6 +88,81 @@ func externalPlatformURL(c *gin.Context) string {
 		host = xh
 	}
 	return scheme + "://" + host
+}
+
+// mcpServerNameForWorkspace derives the unique MCP server name used in
+// the Universal MCP snippet's `claude mcp add <name> -- ...` line.
+//
+// Why per-workspace, not a fixed "molecule": `claude mcp add` keys
+// entries by name in ~/.claude.json, so re-running with the same name
+// silently REPLACES the previous entry. A single external Claude Code
+// session that connects to N molecule workspaces must therefore use N
+// distinct server names — otherwise the second install collapses the
+// first, and the user experiences "MCP is per-session". MCP itself
+// supports many servers per session; the install-snippet name was the
+// only thing standing in the way.
+//
+// Pattern: "molecule-<slug>" where slug comes from the workspace name
+// (lowercased, non-alphanumeric → hyphen, collapsed, trimmed, <=24
+// chars). Falls back to the workspace ID's first 8 chars when the name
+// is empty or slugifies to nothing — both produce a deterministic,
+// Claude-Code-name-safe (alphanumeric + hyphens, no spaces / dots /
+// slashes) identifier that disambiguates per-workspace.
+//
+// Two workspaces with identical names still produce identical slugs by
+// design — the user picked them to look the same. The
+// `claude mcp add` step will overwrite the older one in that case;
+// the workaround is to rename one, then re-run. Documented in the
+// snippet header so users aren't surprised.
+func mcpServerNameForWorkspace(workspaceID, workspaceName string) string {
+	const fallbackIDPrefixLen = 8
+	const maxSlugLen = 24
+	slug := slugifyForMcpName(workspaceName, maxSlugLen)
+	if slug == "" {
+		id := strings.ReplaceAll(workspaceID, "-", "")
+		if len(id) > fallbackIDPrefixLen {
+			id = id[:fallbackIDPrefixLen]
+		}
+		slug = id
+	}
+	if slug == "" {
+		// Defensive: empty workspaceID at this layer means the caller
+		// is misusing the API; we still return a usable (non-colliding
+		// in the common case) constant rather than producing "molecule-"
+		// which Claude Code would reject.
+		return "molecule"
+	}
+	return "molecule-" + slug
+}
+
+// slugifyForMcpName lowercases, replaces non-[a-z0-9] runs with a single
+// '-', trims leading/trailing '-', and truncates to maxLen. Returns ""
+// if nothing usable remains. Pure helper; no allocations beyond the
+// builder.
+func slugifyForMcpName(s string, maxLen int) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	lastHyphen := true // suppress leading hyphens
+	for _, r := range s {
+		switch {
+		case r >= 'A' && r <= 'Z':
+			b.WriteRune(r + ('a' - 'A'))
+			lastHyphen = false
+		case (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9'):
+			b.WriteRune(r)
+			lastHyphen = false
+		default:
+			if !lastHyphen {
+				b.WriteByte('-')
+				lastHyphen = true
+			}
+		}
+	}
+	out := strings.TrimRight(b.String(), "-")
+	if len(out) > maxLen {
+		out = strings.TrimRight(out[:maxLen], "-")
+	}
+	return out
 }
 
 // externalCurlTemplate — zero-dependency register snippet. Placeholders:
@@ -128,74 +216,107 @@ curl -fsS -X POST "{{PLATFORM_URL}}/registry/register" \
 const externalChannelTemplate = `# Claude Code channel — bridges this workspace's A2A traffic into your
 # Claude Code session. No tunnel/public URL needed (polling-based).
 #
-# Prereq: Bun installed (channel plugins are Bun scripts).
-#   bun --version    # must print a version number
+# Prereq: Bun 1.3+ installed (channel plugins are Bun scripts).
+#   bun --version    # must print a version (1.3.x or newer)
 #
-# 1. Inside Claude Code, install the channel plugin from its GitHub repo.
-#    The plugin is NOT on Anthropic's default allowlist, so a one-time
-#    marketplace-add is needed before install:
+# 1. Inside Claude Code, install the channel plugin. The plugin lives in
+#    Molecule's own Gitea marketplace (not Anthropic's default), so a
+#    one-time marketplace-add is needed before install:
 #
 #      /plugin marketplace add https://git.moleculesai.app/molecule-ai/molecule-mcp-claude-channel.git
 #      /plugin install molecule@molecule-channel
 #
-#    Then either run /reload-plugins or restart Claude Code so the
-#    plugin is registered.
+#    Then /reload-plugins (or restart Claude Code) so the plugin is
+#    registered.
 #
-# 2. Create the per-watched-workspace config file:
+# 2. Create (or extend) the per-host config file. The canonical SSOT
+#    shape is MOLECULE_WORKSPACES_JSON — a JSON array of
+#    {id, token, platform_url} objects. One plugin instance can watch
+#    many workspaces across many tenants; append more objects to the
+#    array (separate them with commas, NOT a newline):
 mkdir -p ~/.claude/channels/molecule
 cat > ~/.claude/channels/molecule/.env <<'EOF'
-MOLECULE_PLATFORM_URL={{PLATFORM_URL}}
-MOLECULE_WORKSPACE_IDS={{WORKSPACE_ID}}
-MOLECULE_WORKSPACE_TOKENS=<paste auth_token from create response>
+MOLECULE_WORKSPACES_JSON=[{"id":"{{WORKSPACE_ID}}","token":"<paste auth_token from create response>","platform_url":"{{PLATFORM_URL}}"}]
 EOF
 chmod 600 ~/.claude/channels/molecule/.env
 
-# 3. Launch Claude Code with the channel enabled. Custom (non-Anthropic-
-#    allowlisted) channels need the --dangerously-load-development-channels
-#    flag to opt in — without it, you'll see "not on the approved channels
-#    allowlist" on startup.
-claude --dangerously-load-development-channels \
-  --channels plugin:molecule@molecule-channel
+# (Legacy single-platform shape — MOLECULE_PLATFORM_URL + comma-separated
+# MOLECULE_WORKSPACE_IDS + MOLECULE_WORKSPACE_TOKENS — is still supported
+# for back-compat but does NOT work across multiple tenant URLs. Use
+# MOLECULE_WORKSPACES_JSON above unless you have a specific reason.)
+
+# 3. Launch Claude Code with the channel enabled. The channel spec is the
+#    VALUE of --dangerously-load-development-channels — NOT a separate
+#    --channels flag (that flag does not exist in current Claude Code;
+#    passing it errors with "entries must be tagged: --channels").
+claude --dangerously-load-development-channels plugin:molecule@molecule-channel
 
 # You should see on stderr:
-#   molecule channel: connected — watching 1 workspace(s) at {{PLATFORM_URL}}
+#   molecule channel: connected — watching N workspace(s) across M platform(s)
+#     targets: <platform_url>: <workspace_id>
 #
-# Inbound A2A messages now surface as conversation turns. Claude's
-# replies route back via the reply_to_workspace MCP tool — no extra
-# wiring on your side.
+# Inbound A2A messages now surface as conversation turns (synthetic
+# <channel ...> tags). Claude's replies route back via the
+# reply_to_workspace / send_message_to_user MCP tools.
+#
+# Multi-workspace note: when watching more than one workspace, every
+# outbound tool call (send_message_to_user, reply_to_workspace,
+# delegate_task, list_peers) MUST pass _as_workspace=<id> so the plugin
+# knows which token to authenticate with. The host returns -32603 if you
+# forget — the synthetic <channel> tag's "watching_as" attribute tells
+# you which id to use.
 #
 # Common errors:
-#   "plugin not installed"            → Step 1 didn't run; run /plugin install
+#   "plugin not installed"            → Step 1 didn't run; run /plugin
+#                                       marketplace add + /plugin install
 #                                       inside Claude Code, then /reload-plugins.
-#   "not on approved channels allowlist" → Add --dangerously-load-development-channels
-#                                       to the launch command (Step 3).
-#   "config-missing"                  → ~/.claude/channels/molecule/.env not
-#                                       readable; re-run Step 2 and check chmod.
+#   "entries must be tagged"          → You passed --channels separately.
+#                                       Put plugin:molecule@molecule-channel
+#                                       directly after
+#                                       --dangerously-load-development-channels.
+#   "not on approved channels allowlist" → Org policy gating. See "managed
+#                                       settings" note below.
+#   "config-missing"                  → ~/.claude/channels/molecule/.env
+#                                       not readable; re-run Step 2 and check
+#                                       chmod 600.
 #
-# Team/Enterprise orgs: the --dangerously-load-development-channels flag is
-# blocked by managed settings. Your admin must set channelsEnabled=true and
-# add the plugin to allowedChannelPlugins in claude.ai admin settings.
+# Team/Enterprise plans: the channel allowlist is gated by org policy
+# AND must be written to the local managed-settings.json file on disk
+# (not the claude.ai web admin UI — there is no web toggle for this).
+# Path per OS:
+#   macOS:   /Library/Application Support/ClaudeCode/managed-settings.json
+#   Linux:   /etc/claude-code/managed-settings.json
+#   Windows: C:\ProgramData\ClaudeCode\managed-settings.json
+# Set channelsEnabled: true and add
+#   { "plugin": "molecule", "marketplace": "molecule-channel" }
+# to allowedChannelPlugins. Restart Claude Code after writing the file.
+# A user-level ~/.claude/settings.json does NOT work on Team/Enterprise
+# — this is the single most common reason a freshly-installed plugin
+# appears to do nothing.
 #
-# Multi-workspace: comma-separate IDs and tokens (same order). See
-# https://git.moleculesai.app/molecule-ai/molecule-mcp-claude-channel for
-# pairing flow, push-mode upgrade, and v0.2 roadmap.
+# Pro/Max plans skip the channelsEnabled gate but still need the
+# allowedChannelPlugins entry in the managed-settings file.
 
 # Need help?
 #   Documentation: https://doc.moleculesai.app/docs/guides/claude-code-channel-plugin
+#   Full README:   https://git.moleculesai.app/molecule-ai/molecule-mcp-claude-channel
 #   Common errors:
 #     • "plugin not installed" — run /plugin marketplace add then
 #       /plugin install lines above; /reload-plugins or restart.
+#     • "entries must be tagged: --channels" — the launch flag form
+#       changed; use --dangerously-load-development-channels plugin:molecule@molecule-channel
+#       (channel spec is the VALUE, not a separate --channels flag).
 #     • "not on the approved channels allowlist" — custom channels need
-#       --dangerously-load-development-channels; team/enterprise orgs
-#       need admin to set channelsEnabled + allowedChannelPlugins.
+#       allowedChannelPlugins in /Library/Application Support/ClaudeCode/managed-settings.json
+#       (macOS) / equivalent on Linux+Windows. NOT a web setting.
 #     • "Inbound messages not arriving" — stderr should show
 #       "molecule channel: connected — watching N workspace(s)";
-#       verify ~/.claude/channels/molecule/.env has PLATFORM_URL + token.
+#       verify ~/.claude/channels/molecule/.env shape is MOLECULE_WORKSPACES_JSON.
 `
 
 // externalUniversalMcpTemplate — runtime-agnostic standalone path.
 // Ships as the `molecule-mcp` console script in the
-// molecule-ai-workspace-runtime PyPI wheel (workspace/mcp_cli.py).
+// molecule-ai-workspace-runtime wheel published to the Gitea package registry.
 // Any MCP-aware runtime (Claude Code, hermes, codex, third-party)
 // registers it once and gets the same 8 universal tools that
 // container-bound runtimes use today: delegate_task, list_peers,
@@ -216,6 +337,14 @@ const externalUniversalMcpTemplate = `# Universal MCP — standalone register + 
 # for any MCP-aware runtime (Claude Code, hermes, codex, etc.).
 # Pair with the Claude Code or Python SDK tab if your runtime needs
 # inbound A2A delivery (canvas messages → agent conversation turns).
+#
+# Multi-workspace: MCP supports many servers per Claude Code session.
+# This snippet uses a workspace-specific server name ({{MCP_SERVER_NAME}})
+# so installing for a second workspace ADDS another entry instead of
+# overwriting the first — run the snippet from each workspace's modal
+# in turn and ` + "`claude mcp list`" + ` will show all of them. If two
+# workspaces have the same name, slugs collide and the second install
+# overwrites the first; rename one workspace to disambiguate.
 
 # Requires Python >= 3.11. On 3.10 or older pip says
 # "Could not find a version that satisfies the requirement
@@ -224,11 +353,14 @@ const externalUniversalMcpTemplate = `# Universal MCP — standalone register + 
 # Upgrade the interpreter (brew install python@3.12 / apt install
 # python3.12 / etc.) or use a 3.11+ venv.
 
-# 1. Install the workspace runtime wheel:
-pip install molecule-ai-workspace-runtime
+# 1. Install the workspace runtime wheel (once per machine — safe to
+#    re-run; subsequent workspaces share the same wheel):
+pip install --index-url https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/ molecule-ai-workspace-runtime
 
 # 2. Wire molecule-mcp into your agent's MCP config. Claude Code:
-claude mcp add molecule -s user -- env \
+#    NOTE the server name is workspace-specific ("{{MCP_SERVER_NAME}}") so
+#    multiple molecule workspaces co-exist in one Claude Code session.
+claude mcp add {{MCP_SERVER_NAME}} -s user -- env \
   WORKSPACE_ID={{WORKSPACE_ID}} \
   PLATFORM_URL={{PLATFORM_URL}} \
   MOLECULE_WORKSPACE_TOKEN="<paste from create response>" \
@@ -245,20 +377,23 @@ claude mcp add molecule -s user -- env \
 # needed when calling tools through the MCP server.
 
 # Need help?
-#   Where to install: https://pypi.org/project/molecule-ai-workspace-runtime/
+#   Where to install: https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/molecule-ai-workspace-runtime/
 #   Documentation: https://doc.moleculesai.app/docs/guides/mcp-server-setup
 #   Common errors:
 #     • "Tools not appearing in your agent" — run ` + "`claude mcp list`" + ` (or
-#       your runtime's equivalent) and confirm the molecule entry. If
-#       missing, re-run the ` + "`claude mcp add`" + ` line above.
+#       your runtime's equivalent) and confirm the {{MCP_SERVER_NAME}} entry.
+#       If missing, re-run the ` + "`claude mcp add`" + ` line above.
+#     • "Connecting a second workspace overwrote the first" — re-check that
+#       the server name in the line above is {{MCP_SERVER_NAME}} (not a bare
+#       "molecule"); each workspace's modal generates a distinct name.
 #     • "ConnectionRefused / DNS error on first call" — PLATFORM_URL must
 #       include the scheme (https://) and have NO trailing slash. Verify
 #       with: curl ${PLATFORM_URL}/healthz
 `
 
 // externalPythonTemplate uses molecule-sdk-python's RemoteAgentClient +
-// A2AServer (PR #13 in that repo). Until the SDK cuts a v0.y release
-// to PyPI the snippet pins git+main.
+// A2AServer. Until the SDK is published to the Gitea package registry the
+// snippet pins git+main.
 const externalPythonTemplate = `# pip install 'git+https://git.moleculesai.app/molecule-ai/molecule-sdk-python.git@main'
 
 import asyncio
@@ -294,7 +429,7 @@ if __name__ == "__main__":
     asyncio.run(main())
 
 # Need help?
-#   Where to install: https://pypi.org/project/molecule-ai-workspace-runtime/
+#   Where to install: https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/molecule-ai-workspace-runtime/
 #   Documentation: https://doc.moleculesai.app/docs/guides/external-agent-registration
 #   Common errors:
 #     • 401 from /heartbeat — AUTH_TOKEN expired or wrong workspace_id.
@@ -331,12 +466,19 @@ const externalHermesChannelTemplate = `# Hermes channel — bridges this workspa
 # hermes-agent session. No tunnel/public URL needed (long-poll based,
 # same shape as the Claude Code channel).
 #
+# Multi-workspace: each workspace's plugin_platforms entry is keyed by a
+# workspace-specific slug ("{{MCP_SERVER_NAME}}") so two molecule
+# workspaces can coexist in one hermes config — YAML rejects duplicate
+# mapping keys, so re-using the same "molecule:" key for a second
+# workspace would silently overwrite the first. Re-running this snippet
+# for another workspace ADDS a sibling entry instead.
+#
 # Prereq: a hermes-agent install on the target machine. Latest builds
 # (post #17751) ship the platform-plugin API natively; older ones are
 # also supported via the plugin's dual-mode fallback.
 #
 # 1. Install the runtime + plugin:
-pip install molecule-ai-workspace-runtime
+pip install --index-url https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/ molecule-ai-workspace-runtime
 pip install 'git+https://git.moleculesai.app/molecule-ai/hermes-channel-molecule.git'
 
 # 2. Export the workspace credentials:
@@ -345,13 +487,17 @@ export MOLECULE_PLATFORM_URL={{PLATFORM_URL}}
 export MOLECULE_WORKSPACE_TOKEN="<paste from create response>"
 
 # 3. Edit ~/.hermes/config.yaml — under your existing top-level
-#    gateway: block, add a plugin_platforms entry:
+#    gateway: block, add a plugin_platforms entry. The platform key
+#    ({{MCP_SERVER_NAME}}) is workspace-specific so multiple molecule
+#    workspaces coexist; re-using the same key for a second workspace
+#    would silently overwrite the first (YAML duplicate-key collapse):
 #
 #      gateway:
 #        # ...your existing gateway settings...
 #        plugin_platforms:
-#          molecule:
+#          {{MCP_SERVER_NAME}}:
 #            enabled: true
+#            workspace_id: {{WORKSPACE_ID}}
 #
 #    If you don't yet have a gateway: block, create one with just
 #    that plugin_platforms entry. Don't append blindly — YAML
@@ -404,31 +550,37 @@ hermes gateway --replace
 const externalCodexTemplate = `# Codex external setup — outbound tools (MCP) + inbound push (bridge).
 # For operators whose external agent is a codex CLI (@openai/codex)
 # session.
+#
+# Multi-workspace: the TOML table name is workspace-specific
+# ("{{MCP_SERVER_NAME}}") so two molecule workspaces can coexist in one
+# ~/.codex/config.toml — TOML rejects duplicate
+# [mcp_servers.<name>] tables, so re-using a bare "molecule" name for a
+# second workspace would either break codex parsing or silently
+# overwrite the first. Re-running this snippet for another workspace
+# ADDS a sibling table instead.
 
 # 1. Install codex CLI, the workspace runtime, and the bridge daemon:
 npm install -g @openai/codex@latest
-pip install molecule-ai-workspace-runtime
+pip install --index-url https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/ molecule-ai-workspace-runtime
 pip install codex-channel-molecule
 
 # 2. Wire the molecule MCP server into codex's config.toml — this is
 #    the OUTBOUND path (codex calls list_peers / delegate_task /
-#    send_message_to_user / commit_memory).
-#
-#    Don't append blindly — TOML rejects duplicate
-#    [mcp_servers.molecule] tables, so re-running on an existing
-#    config will break codex parsing. If [mcp_servers.molecule]
-#    already exists (e.g. you set this up before), replace the
-#    existing block instead of appending.
+#    send_message_to_user / commit_memory). The table name
+#    ({{MCP_SERVER_NAME}}) is workspace-specific; re-running the
+#    snippet for a DIFFERENT workspace appends a sibling table without
+#    touching the first. Re-running for the SAME workspace produces
+#    the same name, so replace the existing block instead of appending.
 
 mkdir -p ~/.codex
 # (then open ~/.codex/config.toml in your editor and paste:)
 #
-# [mcp_servers.molecule]
+# [mcp_servers.{{MCP_SERVER_NAME}}]
 # command = "molecule-mcp"
 # args = []
 # startup_timeout_sec = 30
 #
-# [mcp_servers.molecule.env]
+# [mcp_servers.{{MCP_SERVER_NAME}}.env]
 # WORKSPACE_ID = "{{WORKSPACE_ID}}"
 # PLATFORM_URL = "{{PLATFORM_URL}}"
 # MOLECULE_WORKSPACE_TOKEN = "<paste from create response>"
@@ -472,11 +624,13 @@ codex
 # Need help?
 #   Documentation: https://doc.moleculesai.app/docs/guides/mcp-server-setup
 #   Common errors:
-#     • [mcp_servers.molecule] not loaded — codex must be ≥ 0.57.
+#     • [mcp_servers.{{MCP_SERVER_NAME}}] not loaded — codex must be ≥ 0.57.
 #       Check with ` + "`codex --version`" + `; upgrade via npm install -g @openai/codex@latest.
-#     • TOML parse error after re-running setup — TOML rejects duplicate
-#       [mcp_servers.molecule] tables. Open ~/.codex/config.toml and
-#       remove the old block before pasting the new one.
+#     • TOML parse error after re-running setup for the SAME workspace —
+#       TOML rejects duplicate [mcp_servers.<name>] tables. Open
+#       ~/.codex/config.toml and remove the old block before pasting the
+#       new one. (A second molecule workspace gets a DIFFERENT table
+#       name, so coexisting workspaces don't conflict.)
 #     • Canvas messages don't wake codex — step 3 (codex-channel-molecule
 #       bridge daemon) is required for inbound push. Check
 #       pgrep -f codex-channel-molecule and tail ~/.codex-channel-molecule/daemon.log.
@@ -499,26 +653,26 @@ const externalKimiTemplate = `# Kimi CLI external setup — register + heartbeat
 # No public URL needed; runs behind NAT in poll mode.
 
 # 1. Install the workspace runtime wheel (provides HTTP client):
-pip install molecule-ai-workspace-runtime
+pip install --index-url https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/ molecule-ai-workspace-runtime
 
 # 2. Save credentials and the bridge script:
-mkdir -p ~/.molecule-ai/kimi-workspace
-chmod 700 ~/.molecule-ai/kimi-workspace
-cat > ~/.molecule-ai/kimi-workspace/env <<'EOF'
+mkdir -p ~/.molecule-ai/kimi-{{MCP_SERVER_NAME}}
+chmod 700 ~/.molecule-ai/kimi-{{MCP_SERVER_NAME}}
+cat > ~/.molecule-ai/kimi-{{MCP_SERVER_NAME}}/env <<'EOF'
 WORKSPACE_ID={{WORKSPACE_ID}}
 PLATFORM_URL={{PLATFORM_URL}}
 MOLECULE_WORKSPACE_TOKEN=<paste from create response>
 EOF
-chmod 600 ~/.molecule-ai/kimi-workspace/env
+chmod 600 ~/.molecule-ai/kimi-{{MCP_SERVER_NAME}}/env
 
-cat > ~/.molecule-ai/kimi-workspace/kimi_bridge.py <<'PYEOF'
+cat > ~/.molecule-ai/kimi-{{MCP_SERVER_NAME}}/kimi_bridge.py <<'PYEOF'
 #!/usr/bin/env python3
 """Kimi bridge — keeps workspace online and polls for canvas messages."""
 import json, logging, time
 from pathlib import Path
 import httpx
 
-ENV = Path.home() / ".molecule-ai" / "kimi-workspace" / "env"
+ENV = Path.home() / ".molecule-ai" / "kimi-{{MCP_SERVER_NAME}}" / "env"
 HEARTBEAT_INTERVAL = 20
 POLL_INTERVAL = 5
 
@@ -549,7 +703,15 @@ def heartbeat(client, url, ws, tok, start):
     r.raise_for_status()
 
 def poll_inbound(client, url, ws, tok, since_id):
-    params = {"since_secs": "30", "limit": "50"}
+    # include=peer_info opts into Layer 1's row-level projection so each
+    # polled activity carries peer_name, peer_role, agent_card_url, and
+    # attachments[] inline (when source_id resolves to a peer / when the
+    # message included a file). Pre-Layer-1 platforms ignore unknown query
+    # params and return the bare row shape, so this is back-compat. Use
+    # the extra fields in your reply logic — e.g. address the sender by
+    # peer_name rather than UUID, or Read attached files via the workspace:
+    # URIs in attachments[].
+    params = {"since_secs": "30", "limit": "50", "include": "peer_info"}
     if since_id:
         params["since_id"] = since_id
     r = client.get(f"{url}/workspaces/{ws}/activity", params=params, headers=hdrs(url, tok))
@@ -608,21 +770,27 @@ def main():
 if __name__ == "__main__":
     main()
 PYEOF
-chmod +x ~/.molecule-ai/kimi-workspace/kimi_bridge.py
+chmod +x ~/.molecule-ai/kimi-{{MCP_SERVER_NAME}}/kimi_bridge.py
 
 # 3. Start the bridge (run in a persistent terminal or via launchd):
-python3 ~/.molecule-ai/kimi-workspace/kimi_bridge.py
+python3 ~/.molecule-ai/kimi-{{MCP_SERVER_NAME}}/kimi_bridge.py
 
 # What the script does:
 #   • Registers the workspace in poll mode (no public URL needed)
 #   • Heartbeats every 20s to keep STATUS = online on the canvas
-#   • Polls /workspaces/:id/activity every 5s for new canvas messages
+#   • Polls /workspaces/:id/activity?include=peer_info every 5s — Layer 1
+#     enrichment surfaces peer_name / peer_role / agent_card_url /
+#     attachments[] inline on each polled row when applicable
 #   • Echo-replies via POST /workspaces/:id/notify
 #
 # To change the reply logic, edit the send_reply() call inside the loop.
+# Each polled item has top-level peer_name / peer_role / agent_card_url
+# fields (peer_agent rows) and attachments[] (any kind) when Layer 1 is
+# enabled on the platform — use them to disambiguate senders and to Read
+# attached files via the workspace: URIs.
 # To send a one-off reply from another terminal:
 #   curl -fsS -X POST "{{PLATFORM_URL}}/workspaces/{{WORKSPACE_ID}}/notify" \
-#     -H "Authorization: Bearer $(cat ~/.molecule-ai/kimi-workspace/env | grep TOKEN | cut -d= -f2)" \
+#     -H "Authorization: Bearer $(cat ~/.molecule-ai/kimi-{{MCP_SERVER_NAME}}/env | grep TOKEN | cut -d= -f2)" \
 #     -H "Content-Type: application/json" \
 #     -d '{"message":"Hello from Kimi"}'
 #
@@ -644,6 +812,13 @@ const externalOpenClawTemplate = `# OpenClaw MCP config — outbound tool path. 
 # sessions.steer push path; an external setup would need the same
 # bridge daemon the template uses. For inbound delivery on an
 # external machine today, pair with the Python SDK tab.
+#
+# Multi-workspace: each workspace registers under a workspace-specific
+# MCP server name ("{{MCP_SERVER_NAME}}"). openclaw keys MCP servers by
+# name in its config (~/.openclaw/mcp/<name>.json), so re-running with
+# a bare "molecule" name would overwrite the prior workspace's entry.
+# Re-run this snippet for another workspace to ADD a sibling entry
+# instead.
 
 # 1. Install openclaw CLI + the workspace runtime wheel:
 #    The version pin (>=0.1.999) ensures the "molecule-mcp" console
@@ -651,7 +826,7 @@ const externalOpenClawTemplate = `# OpenClaw MCP config — outbound tool path. 
 #    (register-on-startup + 20s heartbeat). Older versions only ship
 #    a2a_mcp_server which does not heartbeat.
 npm install -g openclaw@latest
-pip install "molecule-ai-workspace-runtime>=0.1.999"
+pip install --index-url https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/ "molecule-ai-workspace-runtime>=0.1.999"
 
 # 2. Onboard openclaw against your model provider (one-time setup).
 #    --non-interactive needs an explicit --provider + --model so it
@@ -674,7 +849,7 @@ pip install "molecule-ai-workspace-runtime>=0.1.999"
 # workspace as awaiting_agent (OFFLINE) within 60-90s even while
 # tools work.
 WORKSPACE_TOKEN="<paste from create response>"
-openclaw mcp set molecule "$(cat <<EOF
+openclaw mcp set {{MCP_SERVER_NAME}} "$(cat <<EOF
 {
   "command": "molecule-mcp",
   "args": [],
@@ -704,6 +879,6 @@ openclaw agent --message "list my peers"
 #     • Gateway not starting — tail ~/.openclaw/gateway.log. The loopback
 #       bind requires :18789 to be free; check with ` + "`lsof -iTCP:18789`" + `.
 #     • ` + "`openclaw mcp set`" + ` rejected — the heredoc generates JSON;
-#       verify with ` + "`jq < ~/.openclaw/mcp/molecule.json`" + ` and re-run
+#       verify with ` + "`jq < ~/.openclaw/mcp/{{MCP_SERVER_NAME}}.json`" + ` and re-run
 #       ` + "`openclaw mcp set`" + ` if the file is malformed.
 `

@@ -47,7 +47,9 @@ What this script does, per `.gitea/workflows/status-reaper.yml` invocation:
          Parse context as `<workflow_name> / <job_name> (push)`.
          Look up workflow_name in the trigger map:
            - missing → log ::notice:: and skip (conservative).
-           - has_push_trigger=True → preserve (real defect signal).
+           - has_push_trigger=True and description == "Has been cancelled"
+             → compensate cancelled/superseded push noise.
+           - has_push_trigger=True otherwise → preserve (real defect signal).
            - has_push_trigger=False → POST a compensating
              `state=success` status to /statuses/{sha} with the same
              context (Gitea de-dups by context) and a description
@@ -141,6 +143,11 @@ PR_SHADOW_COMPENSATION_DESCRIPTION = (
     "shadowed by successful push status on same SHA; see "
     ".gitea/scripts/status-reaper.py)"
 )
+CANCELLED_PUSH_COMPENSATION_DESCRIPTION = (
+    "Compensated by status-reaper (push run was cancelled/superseded; "
+    "Gitea 1.22.6 reports cancelled runs as failure statuses)"
+)
+CANCELLED_DESCRIPTION = "Has been cancelled"
 
 # Context suffix the reaper acts on. Gitea hardcodes this for ALL
 # default-branch workflow runs.
@@ -476,7 +483,7 @@ def reap(
       {compensated, preserved_real_push, preserved_unknown,
        preserved_non_failure, preserved_non_push_suffix,
        preserved_unparseable, compensated_pr_shadowed_by_push_success,
-       preserved_pr_without_push_success,
+       preserved_pr_without_push_success, compensated_cancelled_push,
        compensated_contexts: [<context>, ...]}
 
     `compensated_contexts` is rev2-added so `reap_branch` can build
@@ -490,6 +497,7 @@ def reap(
         "preserved_non_push_suffix": 0,
         "preserved_unparseable": 0,
         "compensated_pr_shadowed_by_push_success": 0,
+        "compensated_cancelled_push": 0,
         "preserved_pr_without_push_success": 0,
         "compensated_contexts": [],
     }
@@ -567,8 +575,27 @@ def reap(
             counters["preserved_unknown"] += 1
             continue
 
+        if (s.get("description") or "").strip() == CANCELLED_DESCRIPTION:
+            # Gitea 1.22.6 maps cancelled action runs to failure commit
+            # statuses. During merge bursts, older push runs can be
+            # superseded and cancelled even though a newer run for the
+            # same branch is the real signal. Compensate only the exact
+            # Gitea cancellation description; real push failures remain red.
+            post_compensating_status(
+                sha,
+                context,
+                s.get("target_url"),
+                description=CANCELLED_PUSH_COMPENSATION_DESCRIPTION,
+                dry_run=dry_run,
+            )
+            counters["compensated"] += 1
+            counters["compensated_cancelled_push"] += 1
+            counters["compensated_contexts"].append(context)
+            continue
+
         if workflow_trigger_map[workflow_name]:
-            # Real push trigger → real defect signal. Preserve.
+            # Real push trigger with a non-cancelled failure description
+            # remains a defect signal. Preserve.
             counters["preserved_real_push"] += 1
             continue
 
@@ -662,8 +689,8 @@ def reap_branch(
         shas = list_recent_commit_shas(branch, limit)
     except ApiError as e:
         print(
-            "::warning::status-reaper skipped this tick because the "
-            f"commit list could not be read after retries: {e}"
+            "::error::status-reaper cannot run: commit-list API failed "
+            f"after retries: {e}"
         )
         return {
             "scanned_shas": 0,
@@ -674,8 +701,10 @@ def reap_branch(
             "preserved_non_push_suffix": 0,
             "preserved_unparseable": 0,
             "compensated_pr_shadowed_by_push_success": 0,
+            "compensated_cancelled_push": 0,
             "preserved_pr_without_push_success": 0,
             "compensated_per_sha": {},
+            "sha_api_errors": 0,
             "skipped": True,
             "skip_reason": "commit-list-api-error",
         }
@@ -689,8 +718,10 @@ def reap_branch(
         "preserved_non_push_suffix": 0,
         "preserved_unparseable": 0,
         "compensated_pr_shadowed_by_push_success": 0,
+        "compensated_cancelled_push": 0,
         "preserved_pr_without_push_success": 0,
         "compensated_per_sha": {},
+        "sha_api_errors": 0,
     }
 
     for sha in shas:
@@ -702,8 +733,9 @@ def reap_branch(
         try:
             combined = get_combined_status(sha)
         except ApiError as e:
+            aggregate["sha_api_errors"] += 1
             print(
-                f"::warning::get_combined_status({sha[:10]}) failed; "
+                f"::error::get_combined_status({sha[:10]}) failed; "
                 f"skipping this SHA: {e}"
             )
             continue
@@ -728,6 +760,7 @@ def reap_branch(
             "preserved_non_push_suffix",
             "preserved_unparseable",
             "compensated_pr_shadowed_by_push_success",
+            "compensated_cancelled_push",
             "preserved_pr_without_push_success",
         ):
             aggregate[key] += per_sha[key]
@@ -789,6 +822,14 @@ def main() -> int:
             sort_keys=True,
         )
     )
+    # Observability: infra-failure → red. If the commit list could not be
+    # read or any per-SHA status fetch failed, the tick is incomplete and
+    # must be observable as a failure (non-zero exit) so the cron bot or
+    # runner surface alerts.
+    if counters.get("skipped"):
+        return 1
+    if counters.get("sha_api_errors", 0) > 0:
+        return 1
     return 0
 
 

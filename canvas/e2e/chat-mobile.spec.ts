@@ -49,7 +49,7 @@ test.describe("MobileChat", () => {
     await textarea.fill("Mobile test message");
     await page.getByRole("button", { name: /Send/ }).first().click();
 
-    await expect(page.getByText("Mobile test message")).toBeVisible({ timeout: 5_000 });
+    await expect(page.getByText("Mobile test message", { exact: true })).toBeVisible({ timeout: 5_000 });
     await expect(page.getByText("Echo: Mobile test message")).toBeVisible({ timeout: 15_000 });
   });
 
@@ -60,11 +60,26 @@ test.describe("MobileChat", () => {
 
     await expect(page.getByText("Echo: Mobile persistence")).toBeVisible({ timeout: 15_000 });
 
+    // Reload and deterministically wait for the chat-history GET that
+    // rehydrates the transcript to come back 2xx, rather than racing a
+    // fixed-timeout render assertion against an in-flight fetch. The
+    // server now persists the a2a_receive row SYNCHRONOUSLY before the
+    // send's 200 (workspace-server logA2ASuccess), so the row is
+    // guaranteed present by the time this GET runs — the wait is for
+    // hydration latency, not for a still-racing write.
+    const historyResponse = page.waitForResponse(
+      (resp) =>
+        resp.url().includes("/chat-history") &&
+        resp.request().method() === "GET" &&
+        resp.status() === 200,
+      { timeout: 15_000 },
+    );
     await page.reload();
     await page.waitForSelector("[data-testid='chat-panel']", { timeout: 10_000 });
+    await historyResponse;
 
-    await expect(page.getByText("Mobile persistence", { exact: true })).toBeVisible({ timeout: 5_000 });
-    await expect(page.getByText("Echo: Mobile persistence")).toBeVisible({ timeout: 5_000 });
+    await expect(page.getByText("Mobile persistence", { exact: true })).toBeVisible();
+    await expect(page.getByText("Echo: Mobile persistence")).toBeVisible();
   });
 
   test("composer auto-grows with multi-line text", async ({ page }) => {

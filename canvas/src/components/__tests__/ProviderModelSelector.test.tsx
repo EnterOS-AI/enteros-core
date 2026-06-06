@@ -44,6 +44,14 @@ const HERMES_MODELS: SelectorModel[] = [
 ];
 
 describe("inferVendor", () => {
+  it("uses explicit provider metadata before slug heuristics", () => {
+    expect(inferVendor({
+      id: "moonshot/kimi-k2.6",
+      provider: "platform",
+      required_env: [],
+    })).toBe("platform");
+  });
+
   it("uses slash prefix when present", () => {
     expect(inferVendor({ id: "nousresearch/hermes-4-70b", required_env: ["HERMES_API_KEY"] }))
       .toBe("nousresearch");
@@ -103,6 +111,22 @@ describe("buildProviderCatalog", () => {
     expect(minimax!.models.map((m) => m.id).sort()).toEqual(["MiniMax-M2", "MiniMax-M2.7"]);
     const oauth = catalog.find((p) => p.vendor === "anthropic-oauth");
     expect(oauth!.models.map((m) => m.id).sort()).toEqual(["haiku", "opus", "sonnet"]);
+  });
+
+  it("labels explicit platform-managed providers", () => {
+    const catalog = buildProviderCatalog([
+      {
+        id: "moonshot/kimi-k2.6",
+        name: "Kimi K2.6",
+        provider: "platform",
+        required_env: [],
+      },
+    ]);
+    expect(catalog[0]).toMatchObject({
+      vendor: "platform",
+      label: "Platform",
+      envVars: [],
+    });
   });
 
   it("flags wildcard providers", () => {

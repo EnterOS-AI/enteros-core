@@ -21,8 +21,8 @@ import (
 	"strings"
 	"testing"
 
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/middleware"
 	sqlmock "github.com/DATA-DOG/go-sqlmock"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/middleware"
 	"github.com/gin-gonic/gin"
 )
 
@@ -89,12 +89,16 @@ func TestSecurity_GetTemplates_NoAuth_Returns401(t *testing.T) {
 	}
 }
 
-// TestSecurity_GetTemplates_FreshInstall_FailsOpen verifies that GET /templates
-// still succeeds on a fresh install (zero enrolled workspaces → AdminAuth fail-open).
-// This is the regression check: the auth gate must not break new deployments.
-func TestSecurity_GetTemplates_FreshInstall_FailsOpen(t *testing.T) {
+// TestSecurity_GetTemplates_FreshInstall_FailsClosed pins the post-hardening
+// contract (harden/no-fail-open-auth): GET /templates on a fresh install (zero
+// enrolled workspaces, no ADMIN_TOKEN) now 401s with no bearer. The former
+// AdminAuth Tier-1 lazy-bootstrap fail-open (fresh install ⇒ 200) is gone — a
+// new deployment must provision ADMIN_TOKEN (dev does so via dev-start.sh).
+func TestSecurity_GetTemplates_FreshInstall_FailsClosed(t *testing.T) {
 	setupTestDB(t)
 	setupTestRedis(t)
+	t.Setenv("ADMIN_TOKEN", "")
+	t.Setenv("MOLECULE_ENV", "")
 	authDB, authMock := newFreshInstallAuthDB(t)
 
 	tmpDir := t.TempDir()
@@ -107,8 +111,8 @@ func TestSecurity_GetTemplates_FreshInstall_FailsOpen(t *testing.T) {
 	req, _ := http.NewRequest(http.MethodGet, "/templates", nil)
 	r.ServeHTTP(w, req)
 
-	if w.Code != http.StatusOK {
-		t.Errorf("#686 GET /templates fresh-install: want 200 (fail-open), got %d body=%s", w.Code, w.Body.String())
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("#686 GET /templates fresh-install fail-closed: want 401, got %d body=%s", w.Code, w.Body.String())
 	}
 	if err := authMock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet auth mock expectations: %v", err)
@@ -147,11 +151,14 @@ func TestSecurity_GetOrgTemplates_NoAuth_Returns401(t *testing.T) {
 	}
 }
 
-// TestSecurity_GetOrgTemplates_FreshInstall_FailsOpen mirrors the /templates
-// regression check for /org/templates — fresh installs must still work.
-func TestSecurity_GetOrgTemplates_FreshInstall_FailsOpen(t *testing.T) {
+// TestSecurity_GetOrgTemplates_FreshInstall_FailsClosed mirrors the /templates
+// fail-closed check for /org/templates (harden/no-fail-open-auth): a fresh
+// install with no bearer / no ADMIN_TOKEN now 401s rather than fail-open.
+func TestSecurity_GetOrgTemplates_FreshInstall_FailsClosed(t *testing.T) {
 	setupTestDB(t)
 	setupTestRedis(t)
+	t.Setenv("ADMIN_TOKEN", "")
+	t.Setenv("MOLECULE_ENV", "")
 	authDB, authMock := newFreshInstallAuthDB(t)
 
 	tmpDir := t.TempDir()
@@ -165,8 +172,8 @@ func TestSecurity_GetOrgTemplates_FreshInstall_FailsOpen(t *testing.T) {
 	req, _ := http.NewRequest(http.MethodGet, "/org/templates", nil)
 	r.ServeHTTP(w, req)
 
-	if w.Code != http.StatusOK {
-		t.Errorf("#686 GET /org/templates fresh-install: want 200 (fail-open), got %d body=%s", w.Code, w.Body.String())
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("#686 GET /org/templates fresh-install fail-closed: want 401, got %d body=%s", w.Code, w.Body.String())
 	}
 	if err := authMock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet auth mock expectations: %v", err)
@@ -401,12 +408,12 @@ func TestSecurity_Create_RoleWithCR_Returns400(t *testing.T) {
 // tighten or loosen the constraint by ±1.
 func TestSecurity_ValidateWorkspaceFields_BoundaryValues(t *testing.T) {
 	cases := []struct {
-		label           string
-		name            string
-		role            string
-		model           string
-		runtime         string
-		wantErr         bool
+		label   string
+		name    string
+		role    string
+		model   string
+		runtime string
+		wantErr bool
 	}{
 		// Exact maximum lengths — must PASS.
 		{"name_at_255", strings.Repeat("a", 255), "", "", "", false},
@@ -424,7 +431,7 @@ func TestSecurity_ValidateWorkspaceFields_BoundaryValues(t *testing.T) {
 		{"model_newline", "", "", "a\nb", "", true},
 		{"runtime_newline", "", "", "", "a\nb", true},
 		// Fully valid — must PASS.
-		{"all_valid", "My Agent", "You are a helpful agent.", "claude-opus-4-7", "langgraph", false},
+		{"all_valid", "My Agent", "You are a helpful agent.", "claude-opus-4-7", "claude-code", false},
 	}
 
 	for _, tc := range cases {

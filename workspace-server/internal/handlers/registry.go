@@ -14,10 +14,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/events"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/models"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/wsauth"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wsauth"
 	"github.com/gin-gonic/gin"
 )
 
@@ -112,7 +112,7 @@ func (h *RegistryHandler) SetQueueDrainFunc(f QueueDrainFunc) {
 // Go's net.ParseIP.To4() before Contains() runs, so the IPv4 rules above
 // catch those without a separate entry.
 //
-// F1083/#1130 (SSRF on mcpResolveURL / a2a_proxy resolveAgentURL): in
+// F1083/#1130 (SSRF on direct A2A URL resolution): in
 // addition to blocking IP literals, DNS names are now resolved and each
 // returned IP is checked against the blocklist. This closes the gap where
 // an attacker could register agent.example.com pointing to 169.254.169.254.
@@ -162,6 +162,20 @@ func (h *RegistryHandler) resolveDeliveryMode(ctx context.Context, workspaceID, 
 		return models.DeliveryModePoll, nil
 	}
 	return models.DeliveryModePush, nil
+}
+
+// errPlatformNotRoot is the client-facing message when a register call tried to
+// mark a non-root workspace as a platform agent.
+const errPlatformNotRoot = "a platform agent must be the org root (parent_id must be null)"
+
+// isPlatformRootViolation reports whether err is the DB rejecting a register
+// that tried to mark a non-root workspace as a platform agent (the
+// workspaces_platform_root_check CHECK constraint). The handler maps it to a
+// friendly HTTP 409 instead of a raw 500. The invariant — platform == org root,
+// which structurally also guarantees one platform agent per org — is enforced
+// race-proof at the DB level; this is just the friendly surface.
+func isPlatformRootViolation(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "workspaces_platform_root_check")
 }
 
 // Returns a non-nil error suitable for including in a 400 Bad Request response.
@@ -277,6 +291,14 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 		return
 	}
 
+	// Validate explicit kind if the agent declared one; empty is allowed and
+	// resolves to the row's existing value (or "workspace" default) in
+	// resolveKind below. Only the platform-agent container declares 'platform'.
+	if payload.Kind != "" && !models.IsValidKind(payload.Kind) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "kind must be 'workspace' or 'platform'"})
+		return
+	}
+
 	ctx := c.Request.Context()
 
 	// C18: prevent workspace URL hijacking on re-registration.
@@ -327,7 +349,41 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 		}
 	}
 
-	agentCardStr := string(payload.AgentCard)
+	// Reconcile the runtime-supplied card's identity fields against the
+	// trusted workspaces row before storing. The runtime builds its card
+	// from config.name, which the CP-regenerated /configs/config.yaml
+	// sets to the workspace UUID — so without this the stored card
+	// served at /.well-known/agent-card.json and returned to peers via
+	// agent_card_url has name = UUID, description = "", role = null even
+	// though the operator-controlled workspaces.name holds the friendly
+	// name the canvas shows. We only FILL gaps from the DB (never
+	// downgrade a card that already carries a real name); identity stays
+	// platform-controlled — the agent cannot self-set these. Best-effort:
+	// a lookup failure leaves the card exactly as the runtime sent it
+	// (no-worse-than-before). See agent_card_reconcile.go.
+	reconciledCard := payload.AgentCard
+	{
+		var dbName, dbRole sql.NullString
+		if qErr := db.DB.QueryRowContext(ctx,
+			`SELECT name, role FROM workspaces WHERE id = $1`, payload.ID,
+		).Scan(&dbName, &dbRole); qErr == nil {
+			name := ""
+			if dbName.Valid {
+				name = dbName.String
+			}
+			role := ""
+			if dbRole.Valid {
+				role = dbRole.String
+			}
+			if rc, did := reconcileAgentCardIdentity(
+				payload.AgentCard, payload.ID, name, role,
+			); did {
+				reconciledCard = rc
+				log.Printf("Registry register: reconciled agent_card identity for %s from workspaces row", payload.ID)
+			}
+		}
+	}
+	agentCardStr := string(reconciledCard)
 
 	// urlForUpsert: poll-mode workspaces don't need a URL. Empty input
 	// becomes NULL via sql.NullString so the row's URL stays clean (the
@@ -356,9 +412,15 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 	// the row. Without this guard, bulk deletes left tier-3 stragglers because
 	// the last pre-teardown heartbeat flipped status back to 'online' after
 	// Delete's UPDATE.
+	// kind ($6) is the raw payload value (validated above; "" = unspecified).
+	// COALESCE(NULLIF($6,''), …) means: an explicit kind wins; an unspecified
+	// kind defaults to 'workspace' for a NEW row and KEEPS the existing kind on
+	// re-register (so a platform agent re-registering without kind is never
+	// downgraded). A non-root row asking for 'platform' is rejected by the
+	// workspaces_platform_root_check constraint → friendly 409 below.
 	_, err = db.DB.ExecContext(ctx, `
-		INSERT INTO workspaces (id, name, url, agent_card, status, last_heartbeat_at, delivery_mode)
-		VALUES ($1, $2, $3, $4::jsonb, 'online', now(), $5)
+		INSERT INTO workspaces (id, name, url, agent_card, status, last_heartbeat_at, delivery_mode, kind)
+		VALUES ($1, $2, $3, $4::jsonb, 'online', now(), $5, COALESCE(NULLIF($6, ''), 'workspace'))
 		ON CONFLICT (id) DO UPDATE SET
 			url = CASE
 				WHEN workspaces.url LIKE 'http://127.0.0.1%' THEN workspaces.url
@@ -368,10 +430,15 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 			status = 'online',
 			last_heartbeat_at = now(),
 			delivery_mode = EXCLUDED.delivery_mode,
+			kind = COALESCE(NULLIF($6, ''), workspaces.kind),
 			updated_at = now()
 		WHERE workspaces.status IS DISTINCT FROM 'removed'
-	`, payload.ID, payload.ID, urlForUpsert, agentCardStr, modeForUpsert)
+	`, payload.ID, payload.ID, urlForUpsert, agentCardStr, modeForUpsert, payload.Kind)
 	if err != nil {
+		if isPlatformRootViolation(err) {
+			c.JSON(http.StatusConflict, gin.H{"error": errPlatformNotRoot})
+			return
+		}
 		log.Printf("Registry register error: %v (id=%s)", err, payload.ID)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "registration failed"})
 		return
@@ -413,10 +480,12 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 		}
 	}
 
-	// Broadcast WORKSPACE_ONLINE
+	// Broadcast WORKSPACE_ONLINE — use the reconciled card so the canvas
+	// Agent Card view live-updates with the friendly name, matching what
+	// was just persisted (not the runtime's raw UUID-name card).
 	if err := h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceOnline), payload.ID, map[string]interface{}{
 		"url":           cachedURL,
-		"agent_card":    payload.AgentCard,
+		"agent_card":    reconciledCard,
 		"delivery_mode": effectiveMode,
 	}); err != nil {
 		log.Printf("Registry broadcast error: %v", err)
@@ -502,7 +571,10 @@ func (h *RegistryHandler) Heartbeat(c *gin.Context) {
 
 	// Read previous current_task to detect changes (before the UPDATE)
 	var prevTask string
-	_ = db.DB.QueryRowContext(ctx, `SELECT COALESCE(current_task, '') FROM workspaces WHERE id = $1`, payload.WorkspaceID).Scan(&prevTask)
+	var prevSpend int64
+	if err := db.DB.QueryRowContext(ctx, `SELECT COALESCE(current_task, ''), COALESCE(monthly_spend, 0) FROM workspaces WHERE id = $1`, payload.WorkspaceID).Scan(&prevTask, &prevSpend); err != nil {
+		log.Printf("registry heartbeat: prev_task query failed for workspace %s: %v", payload.WorkspaceID, err)
+	}
 
 	// #615: Clamp monthly_spend to a safe range before any DB write.
 	// A malicious or buggy agent could report math.MaxInt64, causing
@@ -516,6 +588,25 @@ func (h *RegistryHandler) Heartbeat(c *gin.Context) {
 	}
 	if payload.MonthlySpend > maxMonthlySpend {
 		payload.MonthlySpend = maxMonthlySpend
+	}
+
+	// Multi-period budget (#49): record the spend INCREMENT into the
+	// workspace_spend_events ledger so the server can compute rolling per-period
+	// windows (hourly/daily/weekly/monthly) — see budget_periods.go. The agent
+	// still reports a cumulative monthly figure; we derive the delta vs the
+	// last-seen cumulative (prevSpend). A DECREASE means the agent reset its
+	// monthly cumulative (new month) → treat the new value as fresh spend.
+	// Best-effort: a ledger failure must never break the heartbeat.
+	if payload.MonthlySpend > 0 {
+		delta := payload.MonthlySpend - prevSpend
+		if delta < 0 {
+			delta = payload.MonthlySpend
+		}
+		if delta > 0 {
+			if err := recordSpendDelta(ctx, db.DB, payload.WorkspaceID, delta); err != nil {
+				log.Printf("registry heartbeat: spend-ledger insert failed for workspace %s: %v", payload.WorkspaceID, err)
+			}
+		}
 	}
 
 	// Update heartbeat columns. #73 guard: exclude 'removed' rows so a
@@ -784,15 +875,20 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 	// timeouts, retry logic, and activity_logs wiring.
 	if h.drainQueue != nil {
 		var maxConcurrent int
-		_ = db.DB.QueryRowContext(ctx,
+		if err := db.DB.QueryRowContext(ctx,
 			`SELECT COALESCE(max_concurrent_tasks, 1) FROM workspaces WHERE id = $1`,
 			payload.WorkspaceID,
-		).Scan(&maxConcurrent)
+		).Scan(&maxConcurrent); err != nil {
+			log.Printf("registry heartbeat: max_concurrent query failed for workspace %s: %v", payload.WorkspaceID, err)
+		}
 		if payload.ActiveTasks < maxConcurrent {
 			// context.WithoutCancel: heartbeat handler's ctx is about to
 			// expire as soon as we return. The drain needs to outlive it.
+			// RFC internal#524 Layer 1: drainQueue reads db.DB; route
+			// through globalGoAsync so test cleanup waits for it.
 			drainCtx := context.WithoutCancel(ctx)
-			go h.drainQueue(drainCtx, payload.WorkspaceID)
+			wsID := payload.WorkspaceID
+			globalGoAsync(func() { h.drainQueue(drainCtx, wsID) })
 		}
 	}
 }

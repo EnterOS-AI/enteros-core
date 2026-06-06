@@ -5,8 +5,8 @@ import (
 	"log"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/supervised"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/supervised"
 )
 
 // HibernateHandler is called for each workspace that the hibernation monitor
@@ -71,7 +71,7 @@ func hibernateIdleWorkspaces(ctx context.Context, onHibernate HibernateHandler) 
 		  AND hibernation_idle_minutes > 0
 		  AND status IN ('online', 'degraded')
 		  AND active_tasks = 0
-		  AND COALESCE(runtime, 'langgraph') != 'external'
+		  AND COALESCE(runtime, 'claude-code') != 'external'
 		  AND last_heartbeat_at IS NOT NULL
 		  AND last_heartbeat_at < now() - (hibernation_idle_minutes * INTERVAL '1 minute')
 	`)

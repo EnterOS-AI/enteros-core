@@ -1,51 +1,42 @@
 # Admin Authentication Runbook
 
-## Test-token route: lock in staging and production
+## Auth is fail-CLOSED in every environment — `ADMIN_TOKEN` is the bootstrap credential
 
-The `GET /admin/workspaces/:id/test-token` endpoint mints fresh workspace auth tokens.
-It is gated by `TestTokensEnabled()` which returns `true` only when `MOLECULE_ENV != "production"`.
+Per the CTO "nothing should be fail-open" directive, **every** auth path on the
+workspace-server fails closed — there is no dev-mode / zero-token / DB-outage
+hatch that grants access. This includes:
 
-**Effect**: if `MOLECULE_ENV` is unset or set to `development` / `dev` in a staging or production
-tenant, the test-token route remains enabled. While the route is protected by `subtle.ConstantTimeCompare`
-against `ADMIN_TOKEN` (returns 404 when disabled, not 403), the safest posture is to lock it
-out in any environment where it is not intentionally used.
+- `AdminAuth` and `WorkspaceAuth` (admin + per-workspace routes),
+- `CanvasOrBearer` (the cosmetic `PUT /canvas/viewport` route), and
+- `validateDiscoveryCaller` (`/registry/:id/peers`, `/registry/discover/:id`).
 
-### Required: set MOLECULE_ENV in all non-dev environments
+Consequence for **bootstrap**: a brand-new self-hosted / dev install has **no
+DB-backed tokens yet**, and there is no longer a fail-open that lets the first
+request through. The **only** way to reach admin routes (and to mint the first
+workspace token via `POST /admin/workspaces/:id/tokens`) is to set `ADMIN_TOKEN`
+in the platform environment and present it as the bearer. This is the "local
+mimics production" principle: there is no zero-config bootstrap.
+
+- **Local dev:** `scripts/dev-start.sh` provisions a deterministic
+  `ADMIN_TOKEN` into `.env` (and exports the matching `NEXT_PUBLIC_ADMIN_TOKEN`
+  so the canvas authenticates with it). See `docs/quickstart.md`.
+- **Self-hosted / SaaS:** set `ADMIN_TOKEN` to a strong random secret
+  (`openssl rand -base64 32`) in the platform env and bake the matching
+  `NEXT_PUBLIC_ADMIN_TOKEN` into the canvas bundle.
+
+## Required: set `MOLECULE_ENV` in all non-dev environments
 
 ```bash
 # In your tenant / EC2 / Railway environment variables:
 MOLECULE_ENV=production
 ```
 
-This matches the production tenant default. When `MOLECULE_ENV=production`:
-
-- `TestTokensEnabled()` → `false`
-- `GET /admin/workspaces/:id/test-token` → 404 (route disabled)
-
-### Startup visibility
-
-workspace-server logs the test-token route state at boot:
-
-```
-Platform starting on ... (dev-mode-fail-open=...)
-```
-
-Additionally, when `TestTokensEnabled()` is `true` (route enabled), the server emits an INFO line
-so operators can confirm the setting in logs:
-
-```
-[molecule-git-token-helper] NOTE: /admin/workspaces/:id/test-token is ENABLED
-(running with MOLECULE_ENV != production)
-```
-
-If you do not see this line and the route is still accessible, verify `MOLECULE_ENV` is not set to
-`development`, `dev`, or any value that is not exactly `production`.
-
-### Dev environments
-
-In local dev (`MOLECULE_ENV=development` or unset with no `ADMIN_TOKEN`), the test-token route
-is intentionally enabled — it is the only way to bootstrap a workspace bearer token without a running
-canvas. This is the correct default for developer workstations.
+This matches the production tenant default. NOTE: `MOLECULE_ENV` no longer gates
+any auth decision — it only drives NON-security local-dev conveniences (loopback
+bind, relaxed rate limit). Setting it to `dev`/`development` does **not** relax
+authentication. Staging and production smoke tests should use the real user/API
+workflow: create a workspace, then mint a one-time displayed workspace bearer
+with `POST /admin/workspaces/:id/tokens`.
 
 ## Admin bearer token (`ADMIN_TOKEN`)
 
@@ -56,7 +47,9 @@ The platform uses `ADMIN_TOKEN` as the bearer credential for admin-gated endpoin
 | `GET/POST/PATCH/DELETE /workspaces` | `Authorization: Bearer <ADMIN_TOKEN>` |
 | `GET /admin/liveness` | `Authorization: Bearer <ADMIN_TOKEN>` |
 | `POST /org/import` | `Authorization: Bearer <ADMIN_TOKEN>` |
-| `GET /admin/workspaces/:id/test-token` | `Authorization: Bearer <ADMIN_TOKEN>` (enabled only when `MOLECULE_ENV != "production"`) |
+| `POST /admin/workspaces/:id/tokens` | `Authorization: Bearer <ADMIN_TOKEN>`; plaintext token returned once |
 
-Missing or invalid `ADMIN_TOKEN` → AdminAuth fails open in dev mode (no token set), or
-returns 401 in production mode (token set but invalid).
+Missing or invalid bearer → **401 in every environment** (fail-closed; no
+dev-mode fail-open). If the auth datastore is unreachable, auth-gated routes
+return **503** (`platform_unavailable`) — an availability tradeoff that grants no
+access — rather than allowing the request through.

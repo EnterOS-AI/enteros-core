@@ -26,11 +26,12 @@ import (
 //     the update cycle — no ssh, no re-provision, no ops toil.
 //
 // Contract (paired with cp-side GET /cp/tenants/config):
-//   Request:  GET {MOLECULE_CP_URL or https://api.moleculesai.app}/cp/tenants/config
-//             Authorization: Bearer <ADMIN_TOKEN>
-//             X-Molecule-Org-Id: <MOLECULE_ORG_ID>
-//   Response: 200 {"MOLECULE_CP_SHARED_SECRET":"…","MOLECULE_CP_URL":"…", …}
-//             401 on bearer mismatch or unknown org
+//
+//	Request:  GET {MOLECULE_CP_URL or https://api.moleculesai.app}/cp/tenants/config
+//	          Authorization: Bearer <ADMIN_TOKEN>
+//	          X-Molecule-Org-Id: <MOLECULE_ORG_ID>
+//	Response: 200 {"MOLECULE_CP_SHARED_SECRET":"…","MOLECULE_CP_URL":"…", …}
+//	          401 on bearer mismatch or unknown org
 //
 // Best-effort: any failure logs and returns — main() keeps booting.
 // Self-hosted deploys without MOLECULE_ORG_ID or ADMIN_TOKEN set
@@ -103,5 +104,55 @@ func refreshEnvFromCP() error {
 		applied++
 	}
 	log.Printf("CP env refresh: applied %d values from %s/cp/tenants/config", applied, base)
+	return nil
+}
+
+// requiredLLMEnvVars is the set of LLM proxy env vars a managed SaaS
+// tenant must have populated after refreshEnvFromCP. cp#469 (tenant
+// proxy-env delivery) — guaranteed CP-delivered creds reach the
+// tenant process env on boot. Per Researcher Task #37 / Spec 2 and
+// Task #46 (watch-fail-first test).
+//
+// Key set byte-matched against Researcher's verified emission in
+// controlplane tenant_config.go:140-144 (Researcher REQUEST_CHANGES
+// iterate body, 3987f59c). The four keys below ARE the LLM-proxy
+// subset of the 8 CP-emitted keys; OPENAI_BASE_URL / OPENAI_API_KEY /
+// ANTHROPIC_BASE_URL / ANTHROPIC_API_KEY are out of scope for cp#469
+// (different feature surfaces — direct-to-provider fallbacks, not
+// the proxy). v2 fix: MOLECULE_LLM_USAGE_TOKEN, MOLECULE_LLM_USAGE_URL,
+// MOLECULE_LLM_BASE_URL, MOLECULE_LLM_ANTHROPIC_BASE_URL — note the
+// 4th key is namespaced MOLECULE_LLM_ANTHROPIC_BASE_URL, NOT bare
+// ANTHROPIC_BASE_URL. Bare ANTHROPIC_BASE_URL is a separate CP-emitted
+// key for direct-provider use, not the LLM proxy.
+var requiredLLMEnvVars = []string{
+	"MOLECULE_LLM_USAGE_TOKEN",
+	"MOLECULE_LLM_USAGE_URL", // CRITICAL fix v2: was MOLECULE_LLM_URL in v1
+	"MOLECULE_LLM_BASE_URL",
+	"MOLECULE_LLM_ANTHROPIC_BASE_URL", // CRITICAL fix v3: was ANTHROPIC_BASE_URL in v2 (different key!)
+}
+
+// assertManagedTenantHasLLMEnv verifies that, when running as a
+// managed SaaS tenant (MOLECULE_ORG_ID + ADMIN_TOKEN both set), all
+// required LLM proxy env vars are populated after refreshEnvFromCP.
+//
+// Self-hosted (no orgID/adminToken) is exempt — dev must not be
+// blocked here. Managed tenants with missing LLM keys fail with
+// MISSING_CP_LLM_ENV so they do not silently boot with broken proxy
+// creds. Caller in main.go decides whether to log and continue or
+// log.Fatalf depending on deployment context.
+func assertManagedTenantHasLLMEnv() error {
+	if os.Getenv("MOLECULE_ORG_ID") == "" || os.Getenv("ADMIN_TOKEN") == "" {
+		// Self-hosted dev / not yet provisioned — not a managed tenant.
+		return nil
+	}
+	var missing []string
+	for _, k := range requiredLLMEnvVars {
+		if os.Getenv(k) == "" {
+			missing = append(missing, k)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("MISSING_CP_LLM_ENV: required LLM proxy keys not set after refreshEnvFromCP: %v", missing)
+	}
 	return nil
 }

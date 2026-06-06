@@ -16,7 +16,40 @@ interface TokensTabProps {
   workspaceId: string;
 }
 
+// The settings panel passes the literal sentinel "global" when no canvas
+// node is selected. Workspace tokens are inherently per-workspace — there
+// is no /workspaces/global/tokens endpoint (querying the uuid column with
+// "global" 500s on Postgres). The org-wide equivalent lives in the
+// separate "Org API Keys" tab. Mirrors the sentinel-awareness that
+// api/secrets.ts already has (workspaceId === 'global' → /settings/secrets).
+const GLOBAL_WORKSPACE_ID = 'global';
+
 export function TokensTab({ workspaceId }: TokensTabProps) {
+  if (workspaceId === GLOBAL_WORKSPACE_ID) {
+    return (
+      <div className="p-4 space-y-4">
+        <div>
+          <h3 className="text-sm font-semibold text-ink">API Tokens</h3>
+          <p className="text-[10px] text-ink-mid mt-0.5">
+            Bearer tokens for authenticating API calls to this workspace.
+          </p>
+        </div>
+        <div className="text-center py-6">
+          <p className="text-xs text-ink-mid">Select a workspace node first</p>
+          <p className="text-[10px] text-ink-mid mt-1">
+            Workspace tokens are scoped to a single workspace. Select a node
+            on the canvas to manage its tokens, or use the{' '}
+            <span className="text-accent font-medium">Org API Keys</span> tab
+            for org-wide API keys.
+          </p>
+        </div>
+      </div>
+    );
+  }
+  return <WorkspaceTokensTab workspaceId={workspaceId} />;
+}
+
+function WorkspaceTokensTab({ workspaceId }: TokensTabProps) {
   const [tokens, setTokens] = useState<Token[]>([]);
   const [loading, setLoading] = useState(true);
   const [creating, setCreating] = useState(false);
@@ -88,7 +121,7 @@ export function TokensTab({ workspaceId }: TokensTabProps) {
         <button
           onClick={handleCreate}
           disabled={creating}
-          className="px-3 py-1.5 bg-accent-strong/20 hover:bg-accent-strong/30 border border-accent/30 rounded-lg text-[11px] text-accent font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5"
+          className="px-3 py-1.5 bg-accent-strong/20 hover:bg-accent-strong/30 border border-accent/30 rounded-lg text-[11px] text-accent font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-1"
         >
           {creating ? <><Spinner size="sm" /> Creating...</> : '+ New Token'}
         </button>
@@ -107,14 +140,14 @@ export function TokensTab({ workspaceId }: TokensTabProps) {
             </code>
             <button
               onClick={handleCopy}
-              className="shrink-0 px-2 py-1.5 bg-emerald-800/40 hover:bg-emerald-700/50 border border-emerald-700/40 rounded text-[10px] text-good transition-colors"
+              className="shrink-0 px-2 py-1.5 bg-emerald-800/40 hover:bg-emerald-700/50 border border-emerald-700/40 rounded text-[10px] text-good transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-1"
             >
               {copied ? 'Copied' : 'Copy'}
             </button>
           </div>
           <button
             onClick={() => setNewToken(null)}
-            className="text-[9px] text-good/60 hover:text-good transition-colors"
+            className="text-[9px] text-good/60 hover:text-good transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-1"
           >
             Dismiss
           </button>
@@ -122,7 +155,7 @@ export function TokensTab({ workspaceId }: TokensTabProps) {
       )}
 
       {error && (
-        <div className="px-3 py-2 bg-red-950/40 border border-red-800/50 rounded-lg text-[10px] text-bad">
+        <div role="alert" aria-live="assertive" className="px-3 py-2 bg-red-950/40 border border-red-800/50 rounded-lg text-[10px] text-bad">
           {error}
         </div>
       )}
@@ -159,7 +192,7 @@ export function TokensTab({ workspaceId }: TokensTabProps) {
               </div>
               <button
                 onClick={() => setRevokeTarget(t)}
-                className="text-[10px] text-bad/70 hover:text-bad transition-colors px-2 py-1"
+                className="text-[10px] text-bad/70 hover:text-bad transition-colors px-2 py-1 focus:outline-none focus-visible:ring-2 focus-visible:ring-red-400 focus-visible:ring-offset-1"
               >
                 Revoke
               </button>

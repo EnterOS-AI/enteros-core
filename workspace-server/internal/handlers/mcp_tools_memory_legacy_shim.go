@@ -2,14 +2,13 @@ package handlers
 
 // mcp_tools_memory_legacy_shim.go — translates legacy commit_memory /
 // recall_memory calls (scope-based) into the v2 plugin path
-// (namespace-based) when the v2 plugin is wired.
+// (namespace-based).
 //
-// Behavior:
-//   - If h.memv2 is wired (MEMORY_PLUGIN_URL set + plugin reachable),
-//     legacy tools translate scope→namespace and delegate to v2.
-//   - If h.memv2 is NOT wired, legacy tools fall through to the
-//     original DB-backed path in mcp_tools.go (zero behavior change
-//     for operators who haven't enabled the plugin yet).
+// Issue #1733: v2 is now the only memory backend. Callers in
+// mcp_tools.go MUST verify h.memv2 is wired before invoking these
+// helpers (toolCommitMemory / toolRecallMemory both check
+// memoryV2Available and short-circuit with an error when not wired).
+// The previous "fall through to direct SQL" branch is gone.
 //
 // Translation:
 //   commit:  LOCAL  → workspace:<self>
@@ -26,9 +25,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/memory/contract"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/memory/contract"
 )
 
 // scopeToWritableNamespace maps a legacy scope value to the namespace
@@ -191,7 +191,11 @@ func (h *MCPHandler) recallMemoryLegacyShim(ctx context.Context, workspaceID str
 	if len(out) == 0 {
 		return "No memories found.", nil
 	}
-	b, _ := json.MarshalIndent(out, "", "  ")
+	b, marshalErr := json.MarshalIndent(out, "", "  ")
+	if marshalErr != nil {
+		log.Printf("toolRecallMemory: json.MarshalIndent out failed: %v", marshalErr)
+		return "", fmt.Errorf("marshal response: %w", marshalErr)
+	}
 	return string(b), nil
 }
 

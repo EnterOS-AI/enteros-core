@@ -2,8 +2,11 @@
 
 // 04 · Chat — message thread + composer + sub-tabs.
 // Wired to the same /workspaces/:id/a2a (method message/send) endpoint
-// that the desktop ChatTab uses, but with a slimmer surface: no
-// attachments, no A2A topology overlay, no conversation tracing.
+// that the desktop ChatTab uses. Render parity with desktop ChatTab is
+// achieved by reusing its renderers rather than forking a reduced
+// mobile path: the Agent Comms sub-tab mounts the same AgentCommsPanel,
+// and message attachments route through the same AttachmentPreview
+// dispatch the desktop My-Chat bubble uses (#231/#232).
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
@@ -16,6 +19,9 @@ import {
   useChatSend,
   useChatSocket,
 } from "@/components/tabs/chat/hooks";
+import { AgentCommsPanel } from "@/components/tabs/chat/AgentCommsPanel";
+import { AttachmentPreview } from "@/components/tabs/chat/AttachmentPreview";
+import { downloadChatFile } from "@/components/tabs/chat/uploads";
 
 import { toMobileAgent } from "./components";
 import { MOBILE_FONT_MONO, MOBILE_FONT_SANS, usePalette } from "./palette";
@@ -304,6 +310,17 @@ export function MobileChat({
   const removePendingFile = (index: number) =>
     setPendingFiles((prev) => prev.filter((_, i) => i !== index));
 
+  // Route attachment downloads through the same authenticated helper
+  // the desktop ChatTab uses (downloadChatFile) so platform-scheme
+  // URIs get a real Blob with auth headers instead of about:blank.
+  const downloadAttachment = (att: ChatAttachment) => {
+    downloadChatFile(agentId, att).catch(() => {
+      // AttachmentPreview's own error affordance covers the in-bubble
+      // failure state; matches ChatTab's behaviour of not double-
+      // reporting a download failure.
+    });
+  };
+
   const send = async () => {
     const text = draft.trim();
     if ((!text && pendingFiles.length === 0) || sending || !reachable) return;
@@ -339,6 +356,7 @@ export function MobileChat({
             type="button"
             onClick={onBack}
             aria-label="Back"
+            className="focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-100 dark:focus-visible:ring-offset-zinc-900"
             style={{
               width: 36,
               height: 36,
@@ -385,6 +403,7 @@ export function MobileChat({
           <button
             type="button"
             aria-label="More"
+            className="focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-100 dark:focus-visible:ring-offset-zinc-900"
             style={{
               width: 36,
               height: 36,
@@ -415,6 +434,7 @@ export function MobileChat({
                 key={t.id}
                 type="button"
                 onClick={() => setTab(t.id)}
+                className="focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-100 dark:focus-visible:ring-offset-zinc-900"
                 style={{
                   padding: "4px 0 8px",
                   border: "none",
@@ -433,7 +453,19 @@ export function MobileChat({
         </div>
       </div>
 
+      {/* Agent Comms — reuse the desktop AgentCommsPanel verbatim so
+          mobile renders the identical peer/A2A + delegation feed
+          (history GET + live socket events) instead of a placeholder
+          (#231). The panel owns its own scroll/load/error/empty
+          states, matching ChatTab's agent-comms tabpanel. */}
+      {tab === "a2a" && (
+        <div style={{ flex: 1, minHeight: 0, overflow: "hidden" }}>
+          <AgentCommsPanel workspaceId={agentId} />
+        </div>
+      )}
+
       {/* Messages */}
+      {tab === "my" && (
       <div
         ref={scrollRef}
         style={{
@@ -445,20 +477,8 @@ export function MobileChat({
           gap: 8,
         }}
       >
-        {tab === "a2a" && (
-          <div
-            style={{
-              padding: "20px 4px",
-              textAlign: "center",
-              color: p.text3,
-              fontSize: 13,
-            }}
-          >
-            Agent Comms — peer-to-peer A2A traffic surfaces in the Comms tab.
-          </div>
-        )}
         {tab === "my" && historyLoading && (
-          <div style={{ padding: "20px 4px", textAlign: "center", color: p.text3, fontSize: 13 }}>
+          <div role="status" aria-live="polite" style={{ padding: "20px 4px", textAlign: "center", color: p.text3, fontSize: 13 }}>
             Loading chat history…
           </div>
         )}
@@ -478,6 +498,8 @@ export function MobileChat({
               onClick={() => {
                 loadInitial();
               }}
+              aria-label="Retry loading chat history"
+              className="focus:outline-none focus-visible:ring-2 focus-visible:ring-red-400"
               style={{
                 padding: "6px 14px",
                 borderRadius: 14,
@@ -493,7 +515,7 @@ export function MobileChat({
           </div>
         )}
         {tab === "my" && !historyLoading && !historyError && messages.length === 0 && (
-          <div style={{ padding: "20px 4px", textAlign: "center", color: p.text3, fontSize: 13 }}>
+          <div role="status" aria-live="polite" style={{ padding: "20px 4px", textAlign: "center", color: p.text3, fontSize: 13 }}>
             Send a message to start chatting.
           </div>
         )}
@@ -521,9 +543,31 @@ export function MobileChat({
                     overflowWrap: "anywhere",
                   }}
                 >
-                  <MarkdownBubble dark={dark} accent={p.accent}>
-                    {m.content}
-                  </MarkdownBubble>
+                  {m.content && (
+                    <MarkdownBubble dark={dark} accent={p.accent}>
+                      {m.content}
+                    </MarkdownBubble>
+                  )}
+                  {m.attachments && m.attachments.length > 0 && (
+                    <div
+                      style={{
+                        display: "flex",
+                        flexWrap: "wrap",
+                        gap: 4,
+                        marginTop: m.content ? 6 : 0,
+                      }}
+                    >
+                      {m.attachments.map((att, i) => (
+                        <AttachmentPreview
+                          key={`${m.id}-${i}`}
+                          workspaceId={agentId}
+                          attachment={att}
+                          onDownload={downloadAttachment}
+                          tone={mine ? "user" : "agent"}
+                        />
+                      ))}
+                    </div>
+                  )}
                   <div
                     style={{
                       fontSize: 10,
@@ -554,7 +598,13 @@ export function MobileChat({
           </div>
         )}
       </div>
+      )}
 
+      {/* Footer ID + composer belong to My Chat only. The Agent Comms
+          tab is a read-only peer/A2A feed (parity with desktop
+          ChatTab, where the agent-comms tabpanel has no composer). */}
+      {tab === "my" && (
+      <>
       {/* Footer ID */}
       <div
         style={{
@@ -619,6 +669,7 @@ export function MobileChat({
                   type="button"
                   onClick={() => removePendingFile(i)}
                   aria-label={`Remove ${f.name}`}
+                  className="focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-100 dark:focus-visible:ring-offset-zinc-900"
                   style={{
                     border: "none",
                     background: "transparent",
@@ -659,6 +710,7 @@ export function MobileChat({
             onClick={() => fileInputRef.current?.click()}
             disabled={!reachable || sending || uploading}
             aria-label="Attach"
+            className="focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-100 dark:focus-visible:ring-offset-zinc-900"
             style={{
               width: 32,
               height: 32,
@@ -680,6 +732,7 @@ export function MobileChat({
             ref={composerRef}
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
+            aria-label="Message"
             onKeyDown={(e) => {
               // Enter sends; Shift+Enter inserts a newline. Skip when the
               // IME is composing — pressing Enter to commit a Chinese/
@@ -703,7 +756,12 @@ export function MobileChat({
               border: "none",
               outline: "none",
               background: "transparent",
-              fontSize: 14.5,
+              // iOS Safari/PWA zooms the viewport when a focused textarea
+              // has a computed font-size below 16px. 14.5 triggers that
+              // focus-zoom; the page looks broken until the user pinches
+              // back (#224, same class as desktop #1434 / sibling #225).
+              // 16px is the minimum that keeps focus from zooming.
+              fontSize: 16,
               lineHeight: 1.4,
               color: p.text,
               padding: "6px 0",
@@ -719,12 +777,13 @@ export function MobileChat({
             onClick={send}
             disabled={(!draft.trim() && pendingFiles.length === 0) || !reachable || sending || uploading}
             aria-label="Send"
+            className="focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-100 dark:focus-visible:ring-offset-zinc-900"
             style={{
               width: 36,
               height: 36,
               borderRadius: 999,
               border: "none",
-              cursor: (draft.trim() || pendingFiles.length > 0) && !sending && !uploading ? "pointer" : "not-allowed",
+              cursor: (draft.trim() || pendingFiles.length === 0) && !sending && !uploading ? "pointer" : "not-allowed",
               flexShrink: 0,
               background:
                 (draft.trim() || pendingFiles.length > 0) && reachable && !sending && !uploading
@@ -746,6 +805,8 @@ export function MobileChat({
           </button>
         </div>
       </div>
+      </>
+      )}
     </div>
   );
 }

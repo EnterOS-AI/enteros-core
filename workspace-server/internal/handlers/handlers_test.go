@@ -8,22 +8,63 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/ws"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wsauth"
 	"github.com/DATA-DOG/go-sqlmock"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/events"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/models"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/ws"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/wsauth"
 	"github.com/alicebob/miniredis/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/redis/go-redis/v9"
 )
 
+// liveTestHandlers tracks every WorkspaceHandler built during the test
+// binary's lifetime so setupTestDB can drain their in-flight goAsync
+// goroutines (notably the detached RestartByID restart cycle, which
+// reads the global db.DB) BEFORE restoring db.DB. Without this drain a
+// fire-and-forget restart goroutine spawned by one test outlives that
+// test and races the db.DB swap in a later test's t.Cleanup — the
+// 0x...d548 data race on platform/internal/db.DB.
+var (
+	liveTestHandlersMu sync.Mutex
+	liveTestHandlers   []*WorkspaceHandler
+)
+
 func init() {
 	gin.SetMode(gin.TestMode)
+	newHandlerHook = func(h *WorkspaceHandler) {
+		liveTestHandlersMu.Lock()
+		liveTestHandlers = append(liveTestHandlers, h)
+		liveTestHandlersMu.Unlock()
+	}
+}
+
+// drainTestAsync waits for every tracked handler's goAsync goroutines to
+// finish. Called from setupTestDB's cleanup before db.DB is restored so
+// no detached restart/provision goroutine is mid-read of db.DB when the
+// pointer is swapped.
+//
+// Also drains the package-level globalAsync WaitGroup (RFC internal#524
+// Layer 1 deliverable 2) so sibling handlers (SecretsHandler /
+// PluginsHandler / etc.) that route through globalGoAsync rather than
+// h.goAsync are likewise drained before db.DB is swapped. Without this
+// drain a SecretsHandler.Set's restartFunc-via-globalGoAsync could race
+// the db.DB restore exactly the same way maybeMarkContainerDead did
+// before commit 69d9b4e3.
+func drainTestAsync() {
+	liveTestHandlersMu.Lock()
+	handlers := make([]*WorkspaceHandler, len(liveTestHandlers))
+	copy(handlers, liveTestHandlers)
+	liveTestHandlersMu.Unlock()
+	for _, h := range handlers {
+		h.waitAsyncForTest()
+	}
+	waitGlobalAsyncForTest()
 }
 
 // setupTestDB creates a sqlmock DB and assigns it to the global db.DB.
@@ -42,7 +83,16 @@ func setupTestDB(t *testing.T) sqlmock.Sqlmock {
 	}
 	prevDB := db.DB
 	db.DB = mockDB
-	t.Cleanup(func() { db.DB = prevDB; mockDB.Close() })
+	t.Cleanup(func() {
+		// Drain detached async goroutines (e.g. goAsync(RestartByID),
+		// which reads db.DB in runRestartCycle before its provisioner
+		// gate) BEFORE swapping db.DB back. Doing the restore first
+		// would let an in-flight restart goroutine read db.DB while
+		// this line writes it — the data race this guards against.
+		drainTestAsync()
+		db.DB = prevDB
+		mockDB.Close()
+	})
 
 	// Disable SSRF checks for the duration of this test only. Restore
 	// the previous state via t.Cleanup so that TestIsSafeURL_* tests
@@ -108,9 +158,11 @@ func allowLoopbackForTest(t *testing.T) {
 // handler in the 2026-04-18 restructure but the tests never caught up,
 // leaving Platform (Go) CI red for weeks.
 func expectBudgetCheck(mock sqlmock.Sqlmock, workspaceID string) {
-	mock.ExpectQuery(`SELECT budget_limit, COALESCE\(monthly_spend, 0\) FROM workspaces WHERE id = \$1`).
+	// Multi-period (#49): checkWorkspaceBudget reads budget_limits jsonb. An
+	// empty map → no limits → returns early (no spend query), enforcement skipped.
+	mock.ExpectQuery(`SELECT COALESCE\(budget_limits`).
 		WithArgs(workspaceID).
-		WillReturnRows(sqlmock.NewRows([]string{"budget_limit", "monthly_spend"}))
+		WillReturnRows(sqlmock.NewRows([]string{"budget_limits"}).AddRow([]byte("{}")))
 }
 
 // ---------- TestRegisterHandler ----------
@@ -128,7 +180,7 @@ func TestRegisterHandler(t *testing.T) {
 
 	// Expect the upsert INSERT ... ON CONFLICT
 	mock.ExpectExec("INSERT INTO workspaces").
-		WithArgs("ws-123", "ws-123", "http://localhost:8000", `{"name":"test"}`, "push").
+		WithArgs("ws-123", "ws-123", "http://localhost:8000", `{"name":"test"}`, "push", "").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// Expect the SELECT url query (for cache URL logic)
@@ -314,15 +366,17 @@ func TestWorkspaceCreate(t *testing.T) {
 	// Expect transaction begin for atomic workspace+secrets creation
 	mock.ExpectBegin()
 
-	// Expect workspace INSERT (uuid is dynamic, use AnyArg for id, runtime, awareness_namespace).
+	// Expect workspace INSERT (uuid is dynamic, use AnyArg for id, runtime).
 	// Default tier is 3 (Privileged) — see workspace.go create-handler comment.
 	// delivery_mode defaults to "push" when payload omits it (#2339).
 	mock.ExpectExec("INSERT INTO workspaces").
-		WithArgs(sqlmock.AnyArg(), "Test Agent", nil, 3, "langgraph", sqlmock.AnyArg(), (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
+		WithArgs(sqlmock.AnyArg(), "Test Agent", nil, 3, "claude-code", (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// Expect transaction commit (no secrets in this payload)
 	mock.ExpectCommit()
+	mock.ExpectExec("INSERT INTO workspace_secrets").
+		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// Expect canvas_layouts INSERT
 	mock.ExpectExec("INSERT INTO canvas_layouts").
@@ -332,11 +386,19 @@ func TestWorkspaceCreate(t *testing.T) {
 	// Expect RecordAndBroadcast INSERT for WORKSPACE_PROVISIONING
 	mock.ExpectExec("INSERT INTO structure_events").
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO workspace_auth_tokens").
+		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 
-	body := `{"name":"Test Agent","canvas":{"x":100,"y":200}}`
+	// Note: model is now required at the Create boundary (CTO 2026-05-22
+	// SSOT directive — see feedback_workspace_model_required_no_platform_default_dynamic_credential_intake
+	// and TestCreate_ModelRequired_Returns422). This test happens to take
+	// the bare-defaults path (no template, no runtime → claude-code), so
+	// the body must declare an explicit model. Using a claude-code-compatible
+	// id; the test doesn't exercise model semantics beyond presence.
+	body := `{"name":"Test Agent","model":"anthropic:claude-opus-4-7","canvas":{"x":100,"y":200}}`
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
@@ -356,25 +418,87 @@ func TestWorkspaceCreate(t *testing.T) {
 	if resp["id"] == nil || resp["id"] == "" {
 		t.Error("expected non-empty id in response")
 	}
-	if resp["awareness_namespace"] != "workspace:"+resp["id"].(string) {
-		t.Errorf("expected awareness namespace derived from workspace id, got %v", resp["awareness_namespace"])
-	}
 
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations: %v", err)
 	}
 }
 
-func TestBuildProvisionerConfig_IncludesAwarenessSettings(t *testing.T) {
+// TestWorkspaceCreate_ReturnsAuthToken_201 pins the inline-auth_token
+// behaviour added for #1644. Pre-fix, the 201 response was
+// {id, status, awareness_namespace, workspace_access} — callers had to
+// make a separate POST to /admin/workspaces/:id/tokens (AdminAuth-gated,
+// path-prefix differs in CP-admin deploys) OR fall back to the dev-only
+// GET /admin/workspaces/:id/test-token (deliberately 404s on
+// MOLECULE_ENV=production per feedback_no_dev_only_routes_in_e2e).
+//
+// Post-fix: every Create response includes an `auth_token` field with
+// the freshly-minted plaintext bearer (returned once, never recoverable).
+// This is the SSOT path — production E2E + canvas + org_import all
+// get the bearer they need in the same round trip.
+//
+// Failure path is non-fatal: if the IssueToken DB call fails, the 201
+// still goes out without auth_token + a fallback log line. That branch
+// is exercised by sqlmock returning a non-INSERT-INTO-workspace_auth_tokens
+// path here — the test asserts presence on the happy path.
+func TestWorkspaceCreate_ReturnsAuthToken_201(t *testing.T) {
 	mock := setupTestDB(t)
-	mock.ExpectQuery(`SELECT digest FROM runtime_image_pins`).
-		WithArgs("claude-code").
-		WillReturnError(sql.ErrNoRows)
-
+	setupTestRedis(t)
 	broadcaster := newTestBroadcaster()
 	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", "/tmp/configs")
 
-	t.Setenv("AWARENESS_URL", "http://awareness:37800")
+	mock.ExpectBegin()
+	mock.ExpectExec("INSERT INTO workspaces").
+		WithArgs(sqlmock.AnyArg(), "Token Holder", nil, 3, "claude-code", (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+	mock.ExpectExec("INSERT INTO canvas_layouts").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO structure_events").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	// The inline mint added in #1644 Part B — wsauth.IssueToken issues
+	// a new bearer via INSERT INTO workspace_auth_tokens (workspace_id,
+	// token_hash, prefix). This is the assertion that the new code path
+	// reaches the DB.
+	mock.ExpectExec("INSERT INTO workspace_auth_tokens").
+		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	body := `{"name":"Token Holder","model":"anthropic:claude-opus-4-7"}`
+	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Create(c)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("parse response: %v", err)
+	}
+	tok, ok := resp["auth_token"].(string)
+	if !ok || tok == "" {
+		t.Fatalf("expected non-empty auth_token in 201 response (the #1644 SSOT inline mint), got: %s", w.Body.String())
+	}
+	// Sanity: tokens are base64-RawURL encoded 32-byte payloads (per
+	// wsauth/tokens.go::tokenPayloadBytes), so a meaningful lower bound
+	// is ~40 chars. If this fails, IssueToken's contract drifted.
+	if len(tok) < 40 {
+		t.Errorf("auth_token suspiciously short (%d chars) — wsauth.IssueToken contract drift?", len(tok))
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations — inline mint path may have skipped IssueToken: %v", err)
+	}
+}
+
+func TestBuildProvisionerConfig_WorkspacePathFromPayload(t *testing.T) {
+	setupTestDB(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", "/tmp/configs")
+
 	t.Setenv("WORKSPACE_DIR", "/tmp/workspace")
 
 	cfg := handler.buildProvisionerConfig(
@@ -384,18 +508,12 @@ func TestBuildProvisionerConfig_IncludesAwarenessSettings(t *testing.T) {
 		map[string][]byte{"config.yaml": []byte("name: test")},
 		models.CreateWorkspacePayload{Tier: 2, Runtime: "claude-code", WorkspaceDir: "/tmp/workspace", WorkspaceAccess: "read_write"},
 		map[string]string{"OPENAI_API_KEY": "sk-test"},
+		nil,
 		"/tmp/plugins",
-		"workspace:ws-123",
 	)
 
-	if cfg.AwarenessURL != "http://awareness:37800" {
-		t.Fatalf("expected awareness URL to be injected, got %q", cfg.AwarenessURL)
-	}
-	if cfg.AwarenessNamespace != "workspace:ws-123" {
-		t.Fatalf("expected awareness namespace to be injected, got %q", cfg.AwarenessNamespace)
-	}
 	if cfg.WorkspacePath != "/tmp/workspace" {
-		t.Fatalf("expected workspace path from env, got %q", cfg.WorkspacePath)
+		t.Fatalf("expected workspace path from payload, got %q", cfg.WorkspacePath)
 	}
 }
 
@@ -407,7 +525,7 @@ func TestWorkspaceList(t *testing.T) {
 	broadcaster := newTestBroadcaster()
 	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", "/tmp/configs")
 
-	// 23 cols: broadcast_enabled + talk_to_user_enabled added after monthly_spend
+	// 24 cols: compute added after talk_to_user_enabled.
 	// (migration 20260514). Column order must match scanWorkspaceRow exactly.
 	columns := []string{
 		"id", "name", "role", "tier", "status", "agent_card", "url",
@@ -415,13 +533,13 @@ func TestWorkspaceList(t *testing.T) {
 		"last_error_rate", "last_sample_error",
 		"uptime_seconds", "current_task", "runtime", "workspace_dir", "x", "y", "collapsed",
 		"budget_limit", "monthly_spend",
-		"broadcast_enabled", "talk_to_user_enabled",
+		"broadcast_enabled", "talk_to_user_enabled", "compute",
 	}
 	rows := sqlmock.NewRows(columns).
 		AddRow("ws-1", "Agent One", "worker", 1, "online", []byte("null"), "http://localhost:8001",
-			nil, 0, 1, 0.0, "", 100, "", "claude-code", "", 10.0, 20.0, false, nil, int64(0), false, true).
+			nil, 0, 1, 0.0, "", 100, "", "claude-code", "", 10.0, 20.0, false, nil, int64(0), false, true, []byte(`{}`)).
 		AddRow("ws-2", "Agent Two", "manager", 2, "provisioning", []byte("null"), "",
-			nil, 0, 1, 0.0, "", 0, "", "langgraph", "", 50.0, 60.0, false, nil, int64(0), false, true)
+			nil, 0, 1, 0.0, "", 0, "", "claude-code", "", 50.0, 60.0, false, nil, int64(0), false, true, []byte(`{}`))
 
 	mock.ExpectQuery("SELECT w.id, w.name").
 		WillReturnRows(rows)
@@ -1135,14 +1253,14 @@ func TestWorkspaceGet_CurrentTask(t *testing.T) {
 		"parent_id", "active_tasks", "max_concurrent_tasks", "last_error_rate", "last_sample_error",
 		"uptime_seconds", "current_task", "runtime", "workspace_dir", "x", "y", "collapsed",
 		"budget_limit", "monthly_spend",
-		"broadcast_enabled", "talk_to_user_enabled",
+		"broadcast_enabled", "talk_to_user_enabled", "compute",
 	}
 	mock.ExpectQuery("SELECT w.id, w.name").
 		WithArgs("dddddddd-0004-0000-0000-000000000000").
 		WillReturnRows(sqlmock.NewRows(columns).AddRow(
 			"dddddddd-0004-0000-0000-000000000000", "Task Worker", "worker", 1, "online", []byte("null"), "http://localhost:9000",
-			nil, 2, 1, 0.0, "", 300, "Analyzing document", "langgraph", "", 10.0, 20.0, false,
-			nil, int64(0), false, true,
+			nil, 2, 1, 0.0, "", 300, "Analyzing document", "claude-code", "", 10.0, 20.0, false,
+			nil, int64(0), false, true, []byte(`{}`),
 		))
 
 	w := httptest.NewRecorder()

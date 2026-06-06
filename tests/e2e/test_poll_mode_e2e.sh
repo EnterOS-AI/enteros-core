@@ -43,8 +43,8 @@ INVALID_PROBE_ID="$(gen_uuid)"
 cleanup() {
   local rc=$?
   # Best-effort delete; non-fatal if the row was never created.
-  curl -s -X DELETE "$BASE/workspaces/$POLL_WS_ID" >/dev/null || true
-  curl -s -X DELETE "$BASE/workspaces/$CALLER_WS_ID" >/dev/null || true
+  e2e_delete_workspace "$POLL_WS_ID" "poll-mode-test"
+  e2e_delete_workspace "$CALLER_WS_ID" "poll-cross-test"
   exit $rc
 }
 trap cleanup EXIT
@@ -179,8 +179,14 @@ echo "--- Phase 3.5: Python parser classifies real server response (#2967) ---"
 PARSE_RESULT=$(WORKSPACE_ID="00000000-0000-0000-0000-000000000001" \
   python3 -c "
 import json, sys
-sys.path.insert(0, '$(cd "$(dirname "$0")/../../workspace" && pwd)')
-import a2a_response
+try:
+    from molecule_runtime import a2a_response
+except ModuleNotFoundError as exc:
+    raise SystemExit(
+        'molecule-ai-workspace-runtime is required for poll-mode parser '
+        'coverage; install it from the Gitea package registry before running '
+        'this E2E'
+    ) from exc
 data = json.loads(r'''$A2A_RESP''')
 v = a2a_response.parse(data)
 print(type(v).__name__)
@@ -294,7 +300,14 @@ rows = json.load(sys.stdin)
 def text_of(r):
     body = r.get('request_body') or {}
     parts = (body.get('params') or {}).get('message', {}).get('parts') or []
-    return ''.join(p.get('text','') for p in parts if p.get('type')=='text')
+    # A2A v0.3 keys the Part discriminator on 'kind'; legacy senders used
+    # 'type'. ProxyA2A.normalizeA2APayload (#2251) rewrites 'type' -> 'kind'
+    # on ingest, so the stored request_body carries 'kind' even when the
+    # caller posted 'type'. Accept EITHER so this parser asserts on the text
+    # payload, not on which discriminator field the server happened to store.
+    def is_text(p):
+        return p.get('kind') == 'text' or p.get('type') == 'text'
+    return ''.join(p.get('text', '') for p in parts if is_text(p))
 if len(rows) < 2:
     print('NEED2_GOT_'+str(len(rows)))
 else:
@@ -302,6 +315,29 @@ else:
 ")
 check_eq "since_id feed orders ASC (oldest-new first, newest-new last)" \
   "hello-from-e2e-2|hello-from-e2e-3" "$ASC_FIRST"
+
+# Wire-contract gate (#2251): the caller posted parts with the LEGACY "type"
+# discriminator, but ProxyA2A.normalizeA2APayload rewrites "type" -> "kind"
+# (A2A v0.3) BEFORE the row is durably logged. Assert the stored request_body
+# carries "kind" and no longer carries "type", so a regression that drops the
+# rename — or a feed that stops storing the normalized body — fails loudly here
+# instead of silently feeding the polling agent an untagged Part. This is the
+# end-to-end half of the Go unit tests in a2a_proxy_test.go (which assert the
+# rename in isolation); this proves it survives the durable activity_logs path.
+DISC=$(echo "$ASC_RESP" | python3 -c "
+import json, sys
+rows = json.load(sys.stdin)
+kinds, types = [], []
+for r in rows:
+    body = r.get('request_body') or {}
+    parts = (body.get('params') or {}).get('message', {}).get('parts') or []
+    for p in parts:
+        if 'kind' in p: kinds.append(p['kind'])
+        if 'type' in p: types.append(p['type'])
+print(('kind' if kinds and not types else 'BAD') + ':' + ','.join(kinds) + '/' + ','.join(types))
+")
+check_eq "stored Part uses v0.3 'kind' discriminator, never legacy 'type' (#2251)" \
+  "kind:text,text/" "$DISC"
 
 # ---------- Phase 6: stale cursor returns 410 ----------
 echo ""

@@ -13,12 +13,16 @@ import (
 const DefaultMaxConcurrentTasks = 1
 
 type Workspace struct {
-	ID                 string          `json:"id" db:"id"`
-	Name               string          `json:"name" db:"name"`
-	Role               sql.NullString  `json:"role" db:"role"`
-	Tier               int             `json:"tier" db:"tier"`
-	AwarenessNamespace sql.NullString  `json:"awareness_namespace" db:"awareness_namespace"`
-	Status             string          `json:"status" db:"status"`
+	ID     string         `json:"id" db:"id"`
+	Name   string         `json:"name" db:"name"`
+	Role   sql.NullString `json:"role" db:"role"`
+	Tier   int            `json:"tier" db:"tier"`
+	Status string         `json:"status" db:"status"`
+	// Kind: "workspace" (default) or "platform". A "platform" workspace is the
+	// org-level concierge (the platform agent) that sits at the org root and is
+	// the user's default A2A target. See migration
+	// 20260606000000_workspaces_kind + RFC docs/design/rfc-platform-agent.md.
+	Kind               string          `json:"kind" db:"kind"`
 	SourceBundleID     sql.NullString  `json:"source_bundle_id" db:"source_bundle_id"`
 	AgentCard          json.RawMessage `json:"agent_card" db:"agent_card"`
 	URL                sql.NullString  `json:"url" db:"url"`
@@ -35,16 +39,16 @@ type Workspace struct {
 	// DeliveryMode: "push" (synchronous to URL — default) or "poll" (logged
 	// to activity_logs, agent reads via GET /activity?since_id=). See
 	// migration 045 + RFC #2339.
-	DeliveryMode       string          `json:"delivery_mode" db:"delivery_mode"`
+	DeliveryMode string `json:"delivery_mode" db:"delivery_mode"`
 	// BroadcastEnabled: when true the workspace may call POST /broadcast to
 	// deliver a message to all non-removed agent workspaces in the org.
 	// Default false — only privileged orchestrators should hold this ability.
-	BroadcastEnabled   bool            `json:"broadcast_enabled" db:"broadcast_enabled"`
+	BroadcastEnabled bool `json:"broadcast_enabled" db:"broadcast_enabled"`
 	// TalkToUserEnabled: when false the workspace's send_message_to_user calls
 	// and POST /notify requests are rejected with HTTP 403 so the agent is
 	// forced to route updates through a parent workspace. Default true
 	// (preserves existing behaviour for all workspaces).
-	TalkToUserEnabled  bool            `json:"talk_to_user_enabled" db:"talk_to_user_enabled"`
+	TalkToUserEnabled bool `json:"talk_to_user_enabled" db:"talk_to_user_enabled"`
 	// Canvas layout fields (from JOIN)
 	X         float64 `json:"x"`
 	Y         float64 `json:"y"`
@@ -64,6 +68,21 @@ func IsValidDeliveryMode(s string) bool {
 	return s == DeliveryModePush || s == DeliveryModePoll
 }
 
+// Workspace kind constants. Matches the CHECK constraint in migration
+// 20260606000000_workspaces_kind. KindPlatform marks the org-level concierge
+// (the platform agent) which sits at the org root; see
+// docs/design/rfc-platform-agent.md.
+const (
+	KindWorkspace = "workspace"
+	KindPlatform  = "platform"
+)
+
+// IsValidKind reports whether s is a recognised workspace kind. Empty string is
+// NOT valid here — callers resolve the default (KindWorkspace) before calling.
+func IsValidKind(s string) bool {
+	return s == KindWorkspace || s == KindPlatform
+}
+
 type RegisterPayload struct {
 	ID string `json:"id" binding:"required"`
 	// URL is required for push-mode workspaces; optional / unused for
@@ -71,12 +90,18 @@ type RegisterPayload struct {
 	// enforces the conditional requirement based on the resolved
 	// delivery mode (payload value, falling back to the row's existing
 	// value, falling back to "push").
-	URL          string          `json:"url"`
-	AgentCard    json.RawMessage `json:"agent_card" binding:"required"`
+	URL       string          `json:"url"`
+	AgentCard json.RawMessage `json:"agent_card" binding:"required"`
 	// DeliveryMode is optional. Empty string means "keep the existing
 	// value on the workspace row, or default to push for new rows".
 	// When set, must be one of DeliveryModePush / DeliveryModePoll.
-	DeliveryMode string          `json:"delivery_mode,omitempty"`
+	DeliveryMode string `json:"delivery_mode,omitempty"`
+	// Kind is optional. Empty string means "keep the existing value on the
+	// workspace row, or default to KindWorkspace for new rows". When set, must
+	// be one of KindWorkspace / KindPlatform. KindPlatform additionally requires
+	// the row to be its own org root (parent_id IS NULL) and to be the only
+	// platform agent in the org — enforced by the Register handler.
+	Kind string `json:"kind,omitempty"`
 }
 
 type HeartbeatPayload struct {
@@ -154,19 +179,51 @@ type MemorySeed struct {
 	Scope   string `json:"scope" yaml:"scope"` // LOCAL, TEAM, GLOBAL
 }
 
+type WorkspaceComputeVolume struct {
+	RootGB int `json:"root_gb,omitempty"`
+}
+
+type WorkspaceComputeDisplay struct {
+	Mode     string `json:"mode,omitempty"`
+	Width    int    `json:"width,omitempty"`
+	Height   int    `json:"height,omitempty"`
+	Protocol string `json:"protocol,omitempty"`
+}
+
+type WorkspaceCompute struct {
+	InstanceType string                  `json:"instance_type,omitempty"`
+	Volume       WorkspaceComputeVolume  `json:"volume,omitempty"`
+	Display      WorkspaceComputeDisplay `json:"display,omitempty"`
+	// DataPersistence is the per-workspace durable-data choice (internal#734):
+	// "persist" keeps the workspace's data volume (browser profile / cookies /
+	// downloads / agent memory) across recreate; "ephemeral" uses no durable
+	// disk (wiped each recreate — privacy); "" = auto (desktop-control persists,
+	// others follow the org flag). Forwarded verbatim to CP's data_persistence.
+	DataPersistence string `json:"data_persistence,omitempty"`
+	// Provider is the CLOUD/compute backend for this workspace box (multi-provider
+	// RFC, per-workspace): ""/"aws" = default EC2; "hetzner"/"gcp" route to the
+	// CP WorkspaceProvisioner. Distinct from the LLM/model provider. Forwarded to
+	// CP /cp/workspaces/provision `provider`.
+	Provider string `json:"provider,omitempty"`
+}
+
 type CreateWorkspacePayload struct {
-	Name     string  `json:"name" binding:"required"`
-	Role     string  `json:"role"`
-	Template string  `json:"template"` // workspace-configs-templates folder name
-	Tier     int     `json:"tier"`
-	Model    string  `json:"model"`
-	Runtime      string  `json:"runtime"`       // "langgraph" (default), "claude-code", etc.
-	External     bool    `json:"external"`      // true = no Docker container, just a registered URL
-	URL          string  `json:"url"`           // for external workspaces: the A2A endpoint URL (push mode only — omit for poll)
+	Name     string `json:"name" binding:"required"`
+	Role     string `json:"role"`
+	Template string `json:"template"` // workspace-configs-templates folder name
+	Tier     int    `json:"tier"`
+	Model    string `json:"model"`
+	// LLMProvider is the optional provider slug paired with Model. Runtimes
+	// such as claude-code need a bare model id plus explicit provider slug;
+	// hermes can still derive provider from slash-prefixed model ids.
+	LLMProvider string `json:"llm_provider"`
+	Runtime     string `json:"runtime"`  // "claude-code" (default), "codex", etc.
+	External    bool   `json:"external"` // true = no Docker container, just a registered URL
+	URL         string `json:"url"`      // for external workspaces: the A2A endpoint URL (push mode only — omit for poll)
 	// DeliveryMode: "push" (default) sends inbound A2A to URL synchronously;
 	// "poll" records inbound to activity_logs for the agent to consume via
 	// GET /activity?since_id=. Poll mode does not require a URL. See #2339.
-	DeliveryMode string  `json:"delivery_mode,omitempty"`
+	DeliveryMode    string  `json:"delivery_mode,omitempty"`
 	WorkspaceDir    string  `json:"workspace_dir"`    // host path to mount as /workspace (empty = isolated volume)
 	WorkspaceAccess string  `json:"workspace_access"` // "none" (default), "read_only", or "read_write" — see #65
 	ParentID        *string `json:"parent_id"`
@@ -180,13 +237,18 @@ type CreateWorkspacePayload struct {
 	// MaxConcurrentTasks caps parallel A2A + cron dispatch. 0 means use
 	// DefaultMaxConcurrentTasks. Leaders typically set 3.
 	MaxConcurrentTasks int `json:"max_concurrent_tasks"`
-	Canvas   struct {
+	// Compute is the product-facing per-workspace EC2 shape/display
+	// contract. Phase 1 uses instance_type + volume.root_gb and persists
+	// display for future desktop-control workspaces.
+	Compute WorkspaceCompute `json:"compute,omitempty"`
+	Canvas  struct {
 		X float64 `json:"x"`
 		Y float64 `json:"y"`
 	} `json:"canvas"`
 	// InitialMemories is an optional list of memories to seed into the
 	// workspace immediately after creation. Each entry is inserted into
-	// agent_memories with the workspace's awareness namespace. Issue #1050.
+	// agent_memories under the workspace's v2 memory namespace
+	// ("workspace:<id>"). Issue #1050.
 	InitialMemories []MemorySeed `json:"initial_memories"`
 }
 

@@ -584,6 +584,10 @@
 .secrets-tab__refresh-btn:hover {
   background: #1e40af;
 }
+.secrets-tab__refresh-btn:focus-visible {
+  outline: 2px solid #1d4ed8;
+  outline-offset: 2px;
+}
 
 .secrets-tab__no-results {
   text-align: center;
@@ -649,6 +653,15 @@
   border-radius: 6px;
   cursor: pointer;
 }
+.delete-dialog__cancel-btn:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: var(--focus-ring-offset);
+}
+
+.delete-dialog__cancel-btn:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: var(--focus-ring-offset);
+}
 
 .delete-dialog__confirm-btn {
   background: var(--status-invalid);
@@ -657,6 +670,15 @@
   padding: 8px 16px;
   border-radius: 6px;
   cursor: pointer;
+}
+.delete-dialog__confirm-btn:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: var(--focus-ring-offset);
+}
+
+.delete-dialog__confirm-btn:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: var(--focus-ring-offset);
 }
 
 .delete-dialog__confirm-btn:disabled { opacity: 0.4; cursor: not-allowed; }

@@ -16,17 +16,31 @@ name: publish-workspace-server-image
 #
 # Image tags produced:
 #   :staging-<sha> — per-commit digest, stable for canary verify
-#   :staging-latest — tracks most recent build on this branch
+#   :staging-latest — tracks most recent BUILD on this branch (set by the
+#                     build job, last-writer-wins, NOT prod-gated)
+#   :latest — tracks the most recent PROD-PROMOTED build. Re-pointed by the
+#             deploy-production job ONLY after green main CI + canary +
+#             fleet rollout + /buildinfo verification pass. So :latest ==
+#             "current prod image", never the raw build. (Added 2026-06-03
+#             after a stale :latest — last moved 2026-05-10 — reverted a
+#             production tenant on a no-arg redeploy.)
 #
 # Production auto-deploy:
 #   After both platform and tenant images are pushed, deploy-production waits
 #   for strict required push contexts on the same SHA to go green, then
 #   calls the production CP redeploy-fleet endpoint with target_tag=
-#   staging-<sha>. Set repo variable or secret PROD_AUTO_DEPLOY_DISABLED=true
-#   to stop production rollout while keeping image publishing enabled.
+#   staging-<sha>. On success (rollout + buildinfo verified) it re-points
+#   :latest to the same SHA. Set repo variable or secret
+#   PROD_AUTO_DEPLOY_DISABLED=true to stop production rollout while keeping
+#   image publishing enabled — in which case :latest is NOT advanced either
+#   (correct: an unpromoted build must not become :latest).
 #
-# ECR target: 153263036946.dkr.ecr.us-east-2.amazonaws.com/molecule-ai/*
+# Primary ECR target: 153263036946.dkr.ecr.us-east-2.amazonaws.com/molecule-ai/*
+# Optional staging tenant mirror target:
+#   004947743811.dkr.ecr.us-east-2.amazonaws.com/molecule-ai/platform-tenant
 # Required secrets: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AUTO_SYNC_TOKEN
+# Staging ECR grants the primary SSOT-managed publisher principal repository
+# policy access, so no persistent staging AWS access keys are required.
 #
 # mc#711: Docker daemon not accessible on ubuntu-latest runner (molecule-canonical-1
 # shows client-only in `docker info` — daemon not running). DinD mount is present but
@@ -43,18 +57,40 @@ on:
 # `cancel-in-progress: false`; that is not acceptable for a workflow with a
 # production deploy job. Per-SHA image tags are immutable, and staging-latest is
 # best-effort last-writer-wins metadata.
+#
+# 2026-05-20 retrigger: run #86994 on mc#1589 merge sha 0f0f1ba2 failed at
+# setup-buildx-action with EACCES on PC2 WSL publish runner — the runner's
+# DOCKER_CONFIG=/home/hongming/.docker-ecr/ dir didn't have a buildx/certs
+# subdir writable by the container's UID 1001. Hot-patched the dir perms;
+# this chore push retriggers the workflow. Proper fix (per-runner
+# DOCKER_CONFIG owned by 1001, internal#597 --env HOME=/home/runner pattern)
+# is tracked as a CI-hygiene follow-up — not in scope here.
 
 permissions:
   contents: read
   packages: write
 
 env:
-  IMAGE_NAME: 153263036946.dkr.ecr.us-east-2.amazonaws.com/molecule-ai/platform
-  TENANT_IMAGE_NAME: 153263036946.dkr.ecr.us-east-2.amazonaws.com/molecule-ai/platform-tenant
+  # SSOT-Instance-10 (#333): ECR registry triplet (account.dkr.ecr.region.amazonaws.com)
+  # sourced from org/repo var `ECR_REGISTRY` with the current prod-account literal as
+  # bootstrap fallback. When the org var is set, the fallback becomes dead code and
+  # switching accounts/regions is a one-line change at the org level (instead of
+  # touching every workflow). Pattern mirrors `vars.CP_URL || 'literal'` already in
+  # use below in this repo's staging-verify.yml.
+  IMAGE_NAME: ${{ vars.ECR_REGISTRY || '153263036946.dkr.ecr.us-east-2.amazonaws.com' }}/molecule-ai/platform
+  TENANT_IMAGE_NAME: ${{ vars.ECR_REGISTRY || '153263036946.dkr.ecr.us-east-2.amazonaws.com' }}/molecule-ai/platform-tenant
+  STAGING_TENANT_IMAGE_NAME: ${{ vars.STAGING_ECR_REGISTRY || '004947743811.dkr.ecr.us-east-2.amazonaws.com' }}/molecule-ai/platform-tenant
 
 jobs:
   build-and-push:
-    runs-on: ubuntu-latest
+    # Dedicated publish/release lane (internal#462 / #394 / #399). This
+    # is a post-merge ship job (on: push:main) — it must NOT FIFO-compete
+    # with PR required-CI on the shared pool (PR#1350's prod image build
+    # was delayed ~25min this way). The `publish` label resolves ONLY to
+    # the reserved molecule-runner-publish-* sub-pool (config.publish.yaml,
+    # OUTSIDE the managed 1..20 range) so a merged fix's image build
+    # starts immediately while PR-CI keeps the general pool.
+    runs-on: publish
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -78,6 +114,26 @@ jobs:
           printf '%s\n' "${docker_info}" | sed -n '1,5p'
           echo "Docker daemon OK"
           echo "::endgroup::"
+
+      # Pre-flight: verify every repo in manifest.json actually exists.
+      #
+      # Why: deleting a template repo without updating manifest.json breaks
+      # clone-manifest.sh with a generic git 404, which looks like a
+      # transient network error and wastes debug time. We catch it here
+      # with a per-entry ::error:: annotation naming the missing repo
+      # (issue #2192). This is the push-time complement to PR #2186's
+      # PR-time manifest-entry-existence gate.
+      #
+      # Token: workspace-template-* repos are PRIVATE, so the existence check
+      # must authenticate (same AUTO_SYNC_TOKEN as the clone step). Without it
+      # an unauthenticated GET 404s on private repos and false-prunes them
+      # (regression that dropped seo-agent/google-adk from the palette).
+      - name: Validate manifest entries exist
+        env:
+          MOLECULE_GITEA_TOKEN: ${{ secrets.AUTO_SYNC_TOKEN }}
+        run: |
+          set -euo pipefail
+          bash scripts/check-manifest-repos-exist.sh manifest.json
 
       # Pre-clone manifest deps before docker build.
       #
@@ -114,6 +170,18 @@ jobs:
         run: |
           echo "sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
+      # Keep Buildx state inside the job temp dir. The publish runner's
+      # inherited DOCKER_CONFIG can point at a host-owned ECR config path
+      # (/home/hongming/.docker-ecr), which caused setup-buildx-action to
+      # fail before image build with EACCES creating buildx/certs.
+      - name: Prepare writable Docker config
+        run: |
+          set -euo pipefail
+          export DOCKER_CONFIG="$RUNNER_TEMP/docker-config"
+          mkdir -p "$DOCKER_CONFIG/buildx/certs"
+          echo "DOCKER_CONFIG=$DOCKER_CONFIG" >> "$GITHUB_ENV"
+          docker buildx version
+
       # Build + push platform image (inline ECR auth — mirrors the operator-host
       # approach; credentials come from GITHUB_SECRET_AWS_ACCESS_KEY_ID /
       # GITHUB_SECRET_AWS_SECRET_ACCESS_KEY in Gitea Actions).
@@ -149,9 +217,14 @@ jobs:
             --push .
 
       # Build + push tenant image (Go platform + Next.js canvas in one image).
+      # Push the same build to the staging account too so fresh staging/E2E
+      # tenants can pull without cross-account ECR reads. The staging ECR repo
+      # policy trusts the primary SSOT-managed publisher principal; do not add
+      # separate persistent staging AWS access keys here.
       - name: Build & push tenant image to ECR (staging-<sha> + staging-latest)
         env:
           TENANT_IMAGE_NAME: ${{ env.TENANT_IMAGE_NAME }}
+          STAGING_TENANT_IMAGE_NAME: ${{ env.STAGING_TENANT_IMAGE_NAME }}
           TAG_SHA: staging-${{ steps.tags.outputs.sha }}
           TAG_LATEST: staging-latest
           GIT_SHA: ${{ github.sha }}
@@ -162,8 +235,19 @@ jobs:
         run: |
           set -euo pipefail
           ECR_REGISTRY="${TENANT_IMAGE_NAME%%/*}"
+          STAGING_ECR_REGISTRY="${STAGING_TENANT_IMAGE_NAME%%/*}"
           aws ecr get-login-password --region us-east-2 | \
             docker login --username AWS --password-stdin "${ECR_REGISTRY}"
+          aws ecr get-login-password --region us-east-2 | \
+            docker login --username AWS --password-stdin "${STAGING_ECR_REGISTRY}"
+
+          build_tags=(
+            --tag "${TENANT_IMAGE_NAME}:${TAG_SHA}"
+            --tag "${TENANT_IMAGE_NAME}:${TAG_LATEST}"
+            --tag "${STAGING_TENANT_IMAGE_NAME}:${TAG_SHA}"
+            --tag "${STAGING_TENANT_IMAGE_NAME}:${TAG_LATEST}"
+          )
+
           docker buildx build \
             --file ./workspace-server/Dockerfile.tenant \
             --build-arg NEXT_PUBLIC_PLATFORM_URL= \
@@ -172,8 +256,7 @@ jobs:
             --label "org.opencontainers.image.revision=${GIT_SHA}" \
             --label "org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             --label "molecule.workflow.run_id=${GITHUB_RUN_ID}" \
-            --tag "${TENANT_IMAGE_NAME}:${TAG_SHA}" \
-            --tag "${TENANT_IMAGE_NAME}:${TAG_LATEST}" \
+            "${build_tags[@]}" \
             --push .
 
   # bp-exempt: production deploy side-effect; merge is gated by CI / all-required and this job waits for push CI before acting.
@@ -181,20 +264,43 @@ jobs:
     name: Production auto-deploy
     needs: build-and-push
     if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 75
+    # Side-effect deploy only; image publish success is the durable artifact. mc#1982
+    continue-on-error: true
+    # Publish/release lane (internal#462) — production deploy of a merged
+    # fix; reserved capacity, never queued behind PR-CI.
+    runs-on: publish
+    timeout-minutes: 90
     env:
       CP_URL: ${{ vars.PROD_CP_URL || 'https://api.moleculesai.app' }}
       CP_ADMIN_API_TOKEN: ${{ secrets.CP_ADMIN_API_TOKEN }}
       GITEA_HOST: git.moleculesai.app
       GITEA_TOKEN: ${{ secrets.PROD_AUTO_DEPLOY_CONTROL_TOKEN || secrets.AUTO_SYNC_TOKEN }}
+      CI_STATUS_TIMEOUT_SECONDS: "3600"
       PROD_AUTO_DEPLOY_DISABLED: ${{ vars.PROD_AUTO_DEPLOY_DISABLED || secrets.PROD_AUTO_DEPLOY_DISABLED || '' }}
       PROD_AUTO_DEPLOY_CANARY_SLUG: ${{ vars.PROD_AUTO_DEPLOY_CANARY_SLUG || 'hongming' }}
       PROD_AUTO_DEPLOY_SOAK_SECONDS: ${{ vars.PROD_AUTO_DEPLOY_SOAK_SECONDS || '60' }}
       PROD_AUTO_DEPLOY_BATCH_SIZE: ${{ vars.PROD_AUTO_DEPLOY_BATCH_SIZE || '3' }}
       PROD_AUTO_DEPLOY_DRY_RUN: ${{ vars.PROD_AUTO_DEPLOY_DRY_RUN || '' }}
       PROD_ALLOW_NON_PROD_CP_URL: ${{ vars.PROD_ALLOW_NON_PROD_CP_URL || '' }}
+      # #2213: per-tenant /buildinfo settle budget. A freshly-swapped tenant can
+      # keep serving the old image at the edge for a short drain window; the
+      # verify step polls each tenant up to this budget before declaring it stale.
+      PROD_AUTO_DEPLOY_VERIFY_BUDGET_SECONDS: ${{ vars.PROD_AUTO_DEPLOY_VERIFY_BUDGET_SECONDS || '240' }}
+      PROD_AUTO_DEPLOY_VERIFY_INTERVAL_SECONDS: ${{ vars.PROD_AUTO_DEPLOY_VERIFY_INTERVAL_SECONDS || '20' }}
     steps:
+      # The publish runner's default HOME (/home/hongming) is not writable, so
+      # git/docker credential saves fail (`Error saving credentials: mkdir
+      # /home/hongming: permission denied`) and halt the production rollout
+      # (#2193). Point HOME + DOCKER_CONFIG at the writable job temp dir —
+      # mirrors build-and-push's "Prepare writable Docker config" fix above.
+      - name: Prepare writable HOME + Docker config
+        run: |
+          set -euo pipefail
+          H="$RUNNER_TEMP/auto-deploy-home"
+          mkdir -p "$H/.docker"
+          echo "HOME=$H" >> "$GITHUB_ENV"
+          echo "DOCKER_CONFIG=$H/.docker" >> "$GITHUB_ENV"
+
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -239,33 +345,68 @@ jobs:
           set -euo pipefail
           python3 .gitea/scripts/prod-auto-deploy.py wait-ci
 
-      - name: Call production CP redeploy-fleet
+      # Superseded-job guard — BEFORE any production side effect (#2213).
+      #
+      # This workflow has no `concurrency:` (see header: Gitea 1.22.6 cancels
+      # queued prod deploys). So two close main pushes run BOTH deploy-production
+      # jobs. The verify step already skips its strict /buildinfo check when this
+      # job is superseded (#2194) — but that guard was AFTER the redeploy and the
+      # :latest promote, so an OLDER job that started late still:
+      #   1. rolled the whole fleet BACKWARD to its older tag (canary hongming
+      #      was reverted from the newer SHA — the #2213 red), then
+      #   2. promoted :latest backward to the older image,
+      # and only THEN skipped verify and exited green. A superseded job must do
+      # NEITHER. We re-check the branch head here, immediately before the rollout,
+      # and skip every side effect when a newer commit already owns main.
+      #
+      # exit 0 + non-empty stdout => superseded (newer head printed); the redeploy
+      # and promote steps are gated off via this output. exit 10 => this job is
+      # still the latest, proceed to roll the fleet. Fail-safe: a head that can't
+      # be read returns NOT-superseded (exit 10), so a genuine deploy is never
+      # silently skipped. (Re-checked again at verify time to catch a newer job
+      # that lands DURING this rollout.)
+      - name: Check superseded before production side effects
+        id: supersede
         if: ${{ steps.plan.outputs.enabled == 'true' }}
+        run: |
+          set -euo pipefail
+          set +e
+          NEWER_HEAD="$(python3 .gitea/scripts/prod-auto-deploy.py check-superseded)"
+          SUPERSEDED_EXIT=$?
+          set -e
+          if [ "$SUPERSEDED_EXIT" -eq 0 ] && [ -n "$NEWER_HEAD" ]; then
+            echo "superseded=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Superseded before rollout: main head is now ${NEWER_HEAD:0:7} (this job deploys ${GITHUB_SHA:0:7}). Skipping redeploy + :latest promote so an older job never rolls the fleet backward."
+            {
+              echo "## Production auto-deploy skipped — superseded before rollout"
+              echo ""
+              echo "This deploy job's SHA \`${GITHUB_SHA:0:7}\` is no longer the head of \`main\` (now \`${NEWER_HEAD:0:7}\`)."
+              echo "A newer deploy job owns the fleet; rolling it backward to this older build would revert tenants and \`:latest\`. No side effects performed."
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "superseded=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Call production CP redeploy-fleet
+        if: ${{ steps.plan.outputs.enabled == 'true' && steps.supersede.outputs.superseded != 'true' }}
         run: |
           set -euo pipefail
           python3 .gitea/scripts/prod-auto-deploy.py assert-enabled
           PLAN="$RUNNER_TEMP/prod-auto-deploy-plan.json"
           TARGET_TAG="$(jq -r '.target_tag' "$PLAN")"
-          BODY="$(jq -c '.body' "$PLAN")"
-
-          echo "POST $CP_URL/cp/admin/tenants/redeploy-fleet"
-          echo "  target_tag: $TARGET_TAG"
-          echo "  body: $BODY"
 
           HTTP_RESPONSE="$RUNNER_TEMP/prod-redeploy-response.json"
-          HTTP_CODE_FILE="$RUNNER_TEMP/prod-redeploy-http-code.txt"
           set +e
-          curl -sS -o "$HTTP_RESPONSE" -w '%{http_code}' \
-            -m 1200 \
-            -H "Authorization: Bearer $CP_ADMIN_API_TOKEN" \
-            -H "Content-Type: application/json" \
-            -X POST "$CP_URL/cp/admin/tenants/redeploy-fleet" \
-            -d "$BODY" > "$HTTP_CODE_FILE"
+          python3 .gitea/scripts/prod-auto-deploy.py rollout \
+            --plan "$PLAN" \
+            --response "$HTTP_RESPONSE"
+          ROLLOUT_EXIT=$?
           set -e
 
-          HTTP_CODE="$(cat "$HTTP_CODE_FILE" 2>/dev/null || echo "000")"
-          [ -z "$HTTP_CODE" ] && HTTP_CODE="000"
-          echo "HTTP $HTTP_CODE"
+          if [ ! -s "$HTTP_RESPONSE" ]; then
+            jq -nc --arg error "rollout command exited $ROLLOUT_EXIT before writing a response" \
+              '{ok:false, results:[], error:$error}' > "$HTTP_RESPONSE"
+          fi
           jq '{ok, result_count: (.results // [] | length)}' "$HTTP_RESPONSE" || true
 
           {
@@ -273,37 +414,98 @@ jobs:
             echo ""
             echo "**Commit:** \`${GITHUB_SHA:0:7}\`"
             echo "**Target tag:** \`$TARGET_TAG\`"
-            echo "**HTTP:** $HTTP_CODE"
             echo ""
             echo "### Per-tenant result"
             echo ""
-            echo "| Slug | Phase | SSM Status | Exit | Healthz | Error present |"
-            echo "|------|-------|------------|------|---------|---------------|"
-            jq -r '.results[]? | "| \(.slug) | \(.phase) | \(.ssm_status // "-") | \(.ssm_exit_code) | \(.healthz_ok) | \((.error // "") != "") |"' "$HTTP_RESPONSE" || true
+            echo "| Slug | Phase | SSM Status | Exit | Healthz | On target | Error present |"
+            echo "|------|-------|------------|------|---------|-----------|---------------|"
+            jq -r '.results[]? | "| \(.slug) | \(.phase) | \(.ssm_status // "-") | \(.ssm_exit_code) | \(.healthz_ok) | \(.verified_on_target) | \((.error // "") != "") |"' "$HTTP_RESPONSE" || true
+            # internal#724: stragglers are tenants enumerated but not proven
+            # on the target build. Surface them loudly — a non-empty list
+            # means the rollout did NOT fully land.
+            STRAGGLERS="$(jq -r '(.stragglers // []) | join(", ")' "$HTTP_RESPONSE")"
+            if [ -n "$STRAGGLERS" ]; then
+              echo ""
+              echo "### ⚠ Stragglers (NOT on target tag \`$TARGET_TAG\`)"
+              echo ""
+              echo "\`$STRAGGLERS\`"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-          if [ "$HTTP_CODE" != "200" ]; then
-            echo "::error::redeploy-fleet returned HTTP $HTTP_CODE"
-            exit 1
-          fi
           OK="$(jq -r '.ok' "$HTTP_RESPONSE")"
           if [ "$OK" != "true" ]; then
+            STRAGGLERS="$(jq -r '(.stragglers // []) | join(", ")' "$HTTP_RESPONSE")"
+            if [ -n "$STRAGGLERS" ]; then
+              echo "::error::incomplete rollout — tenants not on target tag $TARGET_TAG: $STRAGGLERS"
+            fi
             echo "::error::redeploy-fleet reported ok=false; production rollout halted."
             exit 1
           fi
+          if [ "$ROLLOUT_EXIT" -ne 0 ]; then
+            echo "::error::redeploy-fleet rollout failed with exit code $ROLLOUT_EXIT."
+            exit "$ROLLOUT_EXIT"
+          fi
 
       - name: Verify reachable tenants report this SHA
-        if: ${{ steps.plan.outputs.enabled == 'true' }}
+        # Skip when superseded BEFORE rollout: the redeploy step did not run, so
+        # there is no redeploy-fleet response to verify against and the newer job
+        # owns verification (#2213). The in-step guard below still catches the
+        # case where a newer job lands DURING this job's rollout.
+        if: ${{ steps.plan.outputs.enabled == 'true' && steps.supersede.outputs.superseded != 'true' }}
         env:
           TENANT_DOMAIN: moleculesai.app
         run: |
           set -euo pipefail
           RESP="$RUNNER_TEMP/prod-redeploy-response.json"
+
+          # Superseded-job guard. This workflow has no `concurrency:` (header
+          # explains why: Gitea 1.22.6 cancels queued prod deploys). So two
+          # close main pushes run BOTH deploy-production jobs. The newer one
+          # rolls the fleet to its (newer) build first; this older job's strict
+          # equality check below would then see tenants on the NEWER SHA and
+          # false-red "$slug is stale" even though the fleet is AHEAD, not
+          # behind (git SHAs aren't ordered; /buildinfo exposes only git_sha).
+          #
+          # If main's current head is no longer THIS job's SHA, a newer commit
+          # has landed and this deploy is superseded — the newest job's verify
+          # is authoritative. Skip strict verify and succeed. exit 0 => newer
+          # head printed (superseded); exit 10 => still the latest, proceed to
+          # the strict verify so a genuinely-behind tenant still fails loudly.
+          set +e
+          NEWER_HEAD="$(python3 .gitea/scripts/prod-auto-deploy.py check-superseded)"
+          SUPERSEDED_EXIT=$?
+          set -e
+          if [ "$SUPERSEDED_EXIT" -eq 0 ] && [ -n "$NEWER_HEAD" ]; then
+            echo "::notice::Superseded deploy: main head is now ${NEWER_HEAD:0:7} (this job deployed ${GITHUB_SHA:0:7}). The fleet is at or ahead of this build; the newer deploy job's verify is authoritative. Skipping strict SHA verify."
+            {
+              echo ""
+              echo "### Buildinfo verification skipped — superseded deploy"
+              echo ""
+              echo "This deploy job's SHA \`${GITHUB_SHA:0:7}\` is no longer the head of \`main\` (now \`${NEWER_HEAD:0:7}\`)."
+              echo "A newer deploy job is rolling the fleet forward; its verify is authoritative."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
           mapfile -t SLUGS < <(jq -r '.results[]? | .slug' "$RESP")
           if [ ${#SLUGS[@]} -eq 0 ]; then
             echo "::error::No tenants returned from redeploy-fleet; refusing to mark production deploy verified."
             exit 1
           fi
+
+          # Per-tenant settle/retry budget (#2213). A tenant whose container the
+          # CP just swapped can keep serving the OLD image at the edge for a short
+          # window while the old container drains — /buildinfo returns HTTP 200
+          # with the previous SHA, which `curl --retry` does NOT retry (it only
+          # retries connection/5xx failures, not a stale-but-200 body). Without a
+          # settle window a still-rolling tenant false-reds "stale" on the very
+          # first poll. So poll each tenant's /buildinfo until it reports the
+          # target SHA or the budget is exhausted; only THEN declare it stale or
+          # unreachable. This never masks a genuinely stuck tenant — a tenant that
+          # never reaches the target within the budget still fails loud (and the
+          # superseded-job revert class is already blocked before rollout above).
+          SETTLE_BUDGET_SECONDS="${PROD_AUTO_DEPLOY_VERIFY_BUDGET_SECONDS:-240}"
+          SETTLE_INTERVAL_SECONDS="${PROD_AUTO_DEPLOY_VERIFY_INTERVAL_SECONDS:-20}"
 
           STALE_COUNT=0
           UNREACHABLE_COUNT=0
@@ -316,18 +518,36 @@ jobs:
               continue
             fi
             url="https://${slug}.${TENANT_DOMAIN}/buildinfo"
-            body="$(curl -sS --max-time 30 --retry 3 --retry-delay 5 --retry-connrefused "$url" || true)"
-            actual="$(echo "$body" | jq -r '.git_sha // ""' 2>/dev/null || echo "")"
-            if [ -z "$actual" ]; then
-              echo "::error::$slug did not return /buildinfo after deploy."
-              UNREACHABLE_COUNT=$((UNREACHABLE_COUNT + 1))
-              continue
-            fi
-            if [ "$actual" != "$GITHUB_SHA" ]; then
-              echo "::error::$slug is stale: actual=${actual:0:7}, expected=${GITHUB_SHA:0:7}"
-              STALE_COUNT=$((STALE_COUNT + 1))
-            else
+            deadline=$(( $(date +%s) + SETTLE_BUDGET_SECONDS ))
+            actual=""
+            last_actual=""
+            on_target=false
+            while :; do
+              body="$(curl -sS --max-time 30 --retry 3 --retry-delay 5 --retry-connrefused "$url" || true)"
+              actual="$(echo "$body" | jq -r '.git_sha // ""' 2>/dev/null || echo "")"
+              [ -n "$actual" ] && last_actual="$actual"
+              if [ "$actual" = "$GITHUB_SHA" ]; then
+                on_target=true
+                break
+              fi
+              now=$(date +%s)
+              if [ "$now" -ge "$deadline" ]; then
+                break
+              fi
+              # Still rolling (stale 200) or transiently unreachable — wait and
+              # re-poll within the settle budget rather than failing on first read.
+              remaining=$(( deadline - now ))
+              echo "$slug: waiting for target SHA (have '${actual:0:7}', want ${GITHUB_SHA:0:7}; ${remaining}s left)"
+              sleep "$SETTLE_INTERVAL_SECONDS"
+            done
+            if [ "$on_target" = true ]; then
               echo "$slug: ${actual:0:7}"
+            elif [ -z "$last_actual" ]; then
+              echo "::error::$slug did not return /buildinfo after deploy (waited ${SETTLE_BUDGET_SECONDS}s)."
+              UNREACHABLE_COUNT=$((UNREACHABLE_COUNT + 1))
+            else
+              echo "::error::$slug is stale: actual=${last_actual:0:7}, expected=${GITHUB_SHA:0:7} (waited ${SETTLE_BUDGET_SECONDS}s)"
+              STALE_COUNT=$((STALE_COUNT + 1))
             fi
           done
 
@@ -345,3 +565,69 @@ jobs:
           if [ "$STALE_COUNT" -gt 0 ] || [ "$UNHEALTHY_COUNT" -gt 0 ] || [ "$UNREACHABLE_COUNT" -gt 0 ]; then
             exit 1
           fi
+
+      # Re-point :latest to the just-promoted image — ONLY after the
+      # production rollout + buildinfo verification above have passed.
+      #
+      # WHY HERE (promote point), not at build time:
+      #   The platform-tenant ECR `:latest` tag was last moved 2026-05-10
+      #   and went 3.5 weeks stale because the build step only pushes
+      #   :staging-<sha> + :staging-latest and never re-points :latest. A
+      #   no-arg POST /cp/admin/tenants/:slug/redeploy (whose default tag
+      #   fell through to "latest") then pulled the 3.5-week-old image and
+      #   REVERTED the tenant (incident: molecule-adk-demo, 2026-06-03).
+      #
+      #   The defense-in-depth half of this fix changes that redeploy
+      #   default to :staging-latest, but :latest itself must also be
+      #   kept meaningful. We make :latest track the PROD-BLESSED build,
+      #   not the raw build: by living at the end of deploy-production —
+      #   after `wait-ci` (green main CI), the canary-first batched fleet
+      #   rollout, AND the /buildinfo SHA verification — :latest only ever
+      #   advances to a SHA that is actually green and confirmed running
+      #   across the live fleet. So `:latest` == "current prod image",
+      #   and any consumer that pulls :latest (legacy callers, manual
+      #   `docker pull`, a redeploy that somehow still resolves "latest")
+      #   gets the blessed image instead of whatever happened to build.
+      #
+      #   Re-tag is digest-level (imagetools create), so no rebuild and
+      #   :latest is byte-identical to :staging-<sha> for this commit.
+      # Gate on supersede: a superseded older job must NOT move :latest backward
+      # to its older image (#2213 — 275383 promoted :latest → the older
+      # staging-7a72516 after a newer job had already shipped). :latest must only
+      # ever advance under the job that owns main's head.
+      - name: Promote :latest to the verified prod image
+        if: ${{ steps.plan.outputs.enabled == 'true' && steps.supersede.outputs.superseded != 'true' }}
+        env:
+          TENANT_IMAGE_NAME: ${{ env.TENANT_IMAGE_NAME }}
+          STAGING_TENANT_IMAGE_NAME: ${{ env.STAGING_TENANT_IMAGE_NAME }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: us-east-2
+        run: |
+          set -euo pipefail
+          SHA_TAG="staging-${GITHUB_SHA::7}"
+          PROD_ECR_REGISTRY="${TENANT_IMAGE_NAME%%/*}"
+          STAGING_ECR_REGISTRY="${STAGING_TENANT_IMAGE_NAME%%/*}"
+
+          aws ecr get-login-password --region us-east-2 | \
+            docker login --username AWS --password-stdin "${PROD_ECR_REGISTRY}"
+          aws ecr get-login-password --region us-east-2 | \
+            docker login --username AWS --password-stdin "${STAGING_ECR_REGISTRY}"
+
+          # imagetools create copies the source manifest to the new tag by
+          # digest (no pull/rebuild). :latest now points at the exact image
+          # that just passed the prod gate.
+          docker buildx imagetools create \
+            --tag "${TENANT_IMAGE_NAME}:latest" \
+            "${TENANT_IMAGE_NAME}:${SHA_TAG}"
+          docker buildx imagetools create \
+            --tag "${STAGING_TENANT_IMAGE_NAME}:latest" \
+            "${STAGING_TENANT_IMAGE_NAME}:${SHA_TAG}"
+
+          {
+            echo ""
+            echo "### :latest promoted"
+            echo ""
+            echo "Re-pointed \`platform-tenant:latest\` → \`${SHA_TAG}\` (prod + staging ECR)."
+            echo ":latest now tracks the prod-blessed, fleet-verified image."
+          } >> "$GITHUB_STEP_SUMMARY"

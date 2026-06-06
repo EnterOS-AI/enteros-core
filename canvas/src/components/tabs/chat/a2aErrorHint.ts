@@ -38,7 +38,11 @@ export function inferA2AErrorHint(detail: string): string {
     return "The connection to the remote agent dropped before a reply arrived. Usually a transient network blip — retry once. If it repeats, the remote container may have crashed mid-request; check its logs.";
   }
   if (t.includes("agent error") || t.includes("exception")) {
-    return "The remote agent's runtime threw an exception. Check the workspace's container logs for the traceback. Restart usually clears transient runtime crashes.";
+    // internal#212 closeout: end users have no "container logs" surface
+    // in the canvas; the Activity tab IS the user-visible logs surface
+    // (full row carries request/response body + error_detail). Point
+    // there so the hint is actionable from inside the product.
+    return "The remote agent's runtime threw an exception. Open the Activity tab for the full row (request body, response, error_detail) — Restart usually clears transient runtime crashes.";
   }
   if (
     t.includes("not found") ||
@@ -50,5 +54,9 @@ export function inferA2AErrorHint(detail: string): string {
   if (detail === "") {
     return "The remote agent returned no error detail (the underlying httpx exception had an empty message — typically a connection-reset or silent timeout). A workspace restart is the safe first move.";
   }
-  return "The remote agent reported a delivery failure. Check the workspace logs or try restarting.";
+  // internal#212 closeout: "workspace logs" pointed at a tab that does
+  // not exist — Activity tab is the in-product logs surface. Keep the
+  // hint generic enough for the unrecognised-detail fallback but point
+  // the user at a real affordance.
+  return "The remote agent reported a delivery failure. Open the Activity tab for the full row, or try restarting the workspace.";
 }

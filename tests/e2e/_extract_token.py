@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stdin: JSON response from POST /registry/register.
+"""Stdin: JSON response from token-bearing workspace APIs.
 Stdout: the auth_token value, or empty string.
 Stderr: diagnostic when the response is unparseable or missing a token.
 
@@ -18,7 +18,7 @@ except (json.JSONDecodeError, ValueError) as e:
     print("")
     raise SystemExit(0)
 
-token = data.get("auth_token", "")
+token = data.get("auth_token", "") or data.get("connection", {}).get("auth_token", "")
 if not token:
     sys.stderr.write("e2e_extract_token: response contained no auth_token field\n")
 print(token)

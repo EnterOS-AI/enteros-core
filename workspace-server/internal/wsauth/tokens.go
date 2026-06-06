@@ -19,6 +19,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 )
 
@@ -124,8 +125,10 @@ func ValidateToken(ctx context.Context, db *sql.DB, expectedWorkspaceID, plainte
 
 	// Best-effort last_used_at update. A failure here (DB hiccup, etc.)
 	// must not cause an otherwise-valid request to 401.
-	_, _ = db.ExecContext(ctx,
-		`UPDATE workspace_auth_tokens SET last_used_at = now() WHERE id = $1`, tokenID)
+	if _, err := db.ExecContext(ctx,
+		`UPDATE workspace_auth_tokens SET last_used_at = now() WHERE id = $1`, tokenID); err != nil {
+		log.Printf("wsauth: last_used_at bump failed for %s: %v", tokenID, err)
+	}
 	return nil
 }
 
@@ -250,7 +253,9 @@ func ValidateAnyToken(ctx context.Context, db *sql.DB, plaintext string) error {
 	}
 
 	// Best-effort last_used_at update.
-	_, _ = db.ExecContext(ctx,
-		`UPDATE workspace_auth_tokens SET last_used_at = now() WHERE id = $1`, tokenID)
+	if _, err := db.ExecContext(ctx,
+		`UPDATE workspace_auth_tokens SET last_used_at = now() WHERE id = $1`, tokenID); err != nil {
+		log.Printf("wsauth: last_used_at bump failed for %s: %v", tokenID, err)
+	}
 	return nil
 }

@@ -131,7 +131,7 @@ export function OrgTokensTab() {
         <button
           onClick={handleCreate}
           disabled={creating}
-          className="px-3 py-1.5 bg-accent-strong/20 hover:bg-accent-strong/30 border border-accent/30 rounded-lg text-[11px] text-accent font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5"
+          className="px-3 py-1.5 bg-accent-strong/20 hover:bg-accent-strong/30 border border-accent/30 rounded-lg text-[11px] text-accent font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-1"
         >
           {creating ? (
             <>
@@ -160,14 +160,14 @@ export function OrgTokensTab() {
             </code>
             <button
               onClick={handleCopy}
-              className="shrink-0 px-2 py-1.5 bg-emerald-800/40 hover:bg-emerald-700/50 border border-emerald-700/40 rounded text-[10px] text-good transition-colors"
+              className="shrink-0 px-2 py-1.5 bg-emerald-800/40 hover:bg-emerald-700/50 border border-emerald-700/40 rounded text-[10px] text-good transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-1"
             >
               {copied ? 'Copied' : 'Copy'}
             </button>
           </div>
           <button
             onClick={() => setNewToken(null)}
-            className="text-[9px] text-good/60 hover:text-good transition-colors"
+            className="text-[9px] text-good/60 hover:text-good transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-1"
           >
             Dismiss
           </button>
@@ -175,7 +175,7 @@ export function OrgTokensTab() {
       )}
 
       {error && (
-        <div className="px-3 py-2 bg-red-950/40 border border-red-800/50 rounded-lg text-[10px] text-bad">
+        <div role="alert" aria-live="assertive" className="px-3 py-2 bg-red-950/40 border border-red-800/50 rounded-lg text-[10px] text-bad">
           {error}
         </div>
       )}
@@ -219,7 +219,7 @@ export function OrgTokensTab() {
               </div>
               <button
                 onClick={() => setRevokeTarget(t)}
-                className="text-[10px] text-bad/70 hover:text-bad transition-colors px-2 py-1 shrink-0"
+                className="text-[10px] text-bad/70 hover:text-bad transition-colors px-2 py-1 shrink-0 focus:outline-none focus-visible:ring-2 focus-visible:ring-red-400 focus-visible:ring-offset-1"
               >
                 Revoke
               </button>

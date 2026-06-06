@@ -68,9 +68,12 @@ jobs:
   # bp-exempt: production redeploy is a side-effect workflow, not a merge gate.
   redeploy:
     if: ${{ github.event_name == 'workflow_dispatch' }}
-    runs-on: ubuntu-latest
+    # Dedicated publish/release lane (internal#462 / #394 / #399).
+    # Production tenant redeploy — a deploy action, reserved capacity so
+    # it never queues behind PR-CI. `publish` -> molecule-runner-publish-*.
+    runs-on: publish
     # Phase 3 (RFC #219 §1): surface broken workflows without blocking.
-    # mc#774: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
+    # mc#1982: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
     continue-on-error: true
     timeout-minutes: 25
     env:
@@ -148,6 +151,11 @@ jobs:
             exit 1
           fi
 
+          # confirm:true ack required by CP /cp/admin/tenants/redeploy-fleet
+          # contract (cp#228 / task #308) for fleet-wide intent. Empty body
+          # / {confirm:false} / {only_slugs:[]} → 400. This caller redeploys
+          # the entire prod fleet (canary + fan-out), no slug scoping, so
+          # confirm:true is correct.
           BODY=$(jq -nc \
             --arg tag "$TARGET_TAG" \
             --arg canary "$CANARY_SLUG" \
@@ -159,7 +167,8 @@ jobs:
               canary_slug: $canary,
               soak_seconds: $soak,
               batch_size: $batch,
-              dry_run: $dry
+              dry_run: $dry,
+              confirm: true
             }')
 
           echo "POST $CP_URL/cp/admin/tenants/redeploy-fleet"

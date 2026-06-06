@@ -479,8 +479,10 @@ func TestSecretsGetModel_Default(t *testing.T) {
 	setupTestRedis(t)
 	handler := NewSecretsHandler(nil)
 
-	// No MODEL_PROVIDER secret
-	mock.ExpectQuery("SELECT encrypted_value, encryption_version FROM workspace_secrets").
+	// No MODEL secret (formerly MODEL_PROVIDER — see 2026-05-19 rename
+	// migration). Pin the WHERE clause so a regression that reads the
+	// wrong column-name shows up here.
+	mock.ExpectQuery(`SELECT encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1 AND key = 'MODEL'`).
 		WithArgs("ws-model").
 		WillReturnError(sql.ErrNoRows)
 
@@ -516,7 +518,7 @@ func TestSecretsGetModel_DBError(t *testing.T) {
 	setupTestRedis(t)
 	handler := NewSecretsHandler(nil)
 
-	mock.ExpectQuery("SELECT encrypted_value, encryption_version FROM workspace_secrets").
+	mock.ExpectQuery(`SELECT encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1 AND key = 'MODEL'`).
 		WithArgs("ws-model-err").
 		WillReturnError(sql.ErrConnDone)
 
@@ -544,7 +546,14 @@ func TestSecretsSetModel_Upsert(t *testing.T) {
 	restartCalled := make(chan string, 1)
 	handler := NewSecretsHandler(func(id string) { restartCalled <- id })
 
-	mock.ExpectExec(`INSERT INTO workspace_secrets`).
+	// Runtime lookup (issue #2172) — model is non-empty so validation fires.
+	mock.ExpectQuery(`SELECT runtime FROM workspaces WHERE id = \$1`).
+		WithArgs("00000000-0000-0000-0000-000000000001").
+		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("claude-code"))
+
+	// Pin the literal 'MODEL' key in the SQL so a regression to the
+	// pre-2026-05-19 'MODEL_PROVIDER' column name shows up here.
+	mock.ExpectExec(`INSERT INTO workspace_secrets[\s\S]*'MODEL'`).
 		WithArgs("00000000-0000-0000-0000-000000000001", sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 
@@ -578,7 +587,8 @@ func TestSecretsSetModel_EmptyClears(t *testing.T) {
 	setupTestRedis(t)
 	handler := NewSecretsHandler(func(string) {})
 
-	mock.ExpectExec(`DELETE FROM workspace_secrets`).
+	// Pin the literal 'MODEL' key — see TestSecretsSetModel_Upsert.
+	mock.ExpectExec(`DELETE FROM workspace_secrets WHERE workspace_id = \$1 AND key = 'MODEL'`).
 		WithArgs("00000000-0000-0000-0000-000000000002").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
@@ -618,124 +628,62 @@ func TestSecretsSetModel_InvalidID(t *testing.T) {
 	}
 }
 
-// ==================== GetProvider / SetProvider (Option B PR-2) ====================
-//
-// Mirror of the GetModel/SetModel suite. Same secret-storage shape (key=
-// 'LLM_PROVIDER' instead of 'MODEL_PROVIDER'), same restart-trigger
-// contract, same UUID validation gate. We pin the contract symmetrically
-// so a future refactor that breaks one without the other shows up in CI.
-
-func TestSecretsGetProvider_Default(t *testing.T) {
+// TestSecretsSetModel_UnregisteredModel_422 guards that a model not in the
+// runtime's native set is rejected at save (issue #2172 continuation).
+func TestSecretsSetModel_UnregisteredModel_422(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
 	handler := NewSecretsHandler(nil)
 
-	mock.ExpectQuery("SELECT encrypted_value, encryption_version FROM workspace_secrets").
-		WithArgs("ws-prov").
-		WillReturnError(sql.ErrNoRows)
-
-	w := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(w)
-	c.Params = gin.Params{{Key: "id", Value: "ws-prov"}}
-	c.Request = httptest.NewRequest("GET", "/workspaces/ws-prov/provider", nil)
-
-	handler.GetProvider(c)
-
-	if w.Code != http.StatusOK {
-		t.Errorf("expected status 200, got %d: %s", w.Code, w.Body.String())
-	}
-
-	var resp map[string]interface{}
-	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("failed to parse response: %v", err)
-	}
-	if resp["provider"] != "" {
-		t.Errorf("expected empty provider, got %v", resp["provider"])
-	}
-	if resp["source"] != "default" {
-		t.Errorf("expected source 'default', got %v", resp["source"])
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("unmet sqlmock expectations: %v", err)
-	}
-}
-
-func TestSecretsGetProvider_DBError(t *testing.T) {
-	mock := setupTestDB(t)
-	setupTestRedis(t)
-	handler := NewSecretsHandler(nil)
-
-	mock.ExpectQuery("SELECT encrypted_value, encryption_version FROM workspace_secrets").
-		WithArgs("ws-prov-err").
-		WillReturnError(sql.ErrConnDone)
-
-	w := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(w)
-	c.Params = gin.Params{{Key: "id", Value: "ws-prov-err"}}
-	c.Request = httptest.NewRequest("GET", "/workspaces/ws-prov-err/provider", nil)
-
-	handler.GetProvider(c)
-
-	if w.Code != http.StatusInternalServerError {
-		t.Errorf("expected status 500, got %d: %s", w.Code, w.Body.String())
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("unmet sqlmock expectations: %v", err)
-	}
-}
-
-func TestSecretsSetProvider_Upsert(t *testing.T) {
-	mock := setupTestDB(t)
-	setupTestRedis(t)
-	restartCalled := make(chan string, 1)
-	handler := NewSecretsHandler(func(id string) { restartCalled <- id })
-
-	mock.ExpectExec(`INSERT INTO workspace_secrets`).
-		WithArgs("00000000-0000-0000-0000-000000000003", sqlmock.AnyArg(), sqlmock.AnyArg()).
-		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectQuery(`SELECT runtime FROM workspaces WHERE id = \$1`).
+		WithArgs("00000000-0000-0000-0000-000000000003").
+		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("claude-code"))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 	c.Params = gin.Params{{Key: "id", Value: "00000000-0000-0000-0000-000000000003"}}
-	c.Request = httptest.NewRequest("PUT", "/workspaces/00000000-0000-0000-0000-000000000003/provider",
-		strings.NewReader(`{"provider":"minimax"}`))
+	c.Request = httptest.NewRequest("PUT", "/workspaces/00000000-0000-0000-0000-000000000003/model",
+		strings.NewReader(`{"model":"totally-made-up-model-xyz"}`))
 	c.Request.Header.Set("Content-Type", "application/json")
 
-	handler.SetProvider(c)
+	handler.SetModel(c)
 
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422, got %d: %s", w.Code, w.Body.String())
 	}
-	select {
-	case id := <-restartCalled:
-		if id != "00000000-0000-0000-0000-000000000003" {
-			t.Errorf("restart called with wrong id: %s", id)
-		}
-	case <-time.After(500 * time.Millisecond):
-		t.Error("restart was not triggered")
+	body := w.Body.String()
+	if !strings.Contains(body, "UNREGISTERED_MODEL_FOR_RUNTIME") {
+		t.Errorf("expected code UNREGISTERED_MODEL_FOR_RUNTIME in body, got: %s", body)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations: %v", err)
 	}
 }
 
-func TestSecretsSetProvider_EmptyClears(t *testing.T) {
+// TestSecretsSetModel_UnknownRuntimeFailOpen_200 verifies the federation
+// contract: a runtime absent from the registry (langgraph) passes through
+// without validation so non-first-party runtimes are not blocked.
+func TestSecretsSetModel_UnknownRuntimeFailOpen_200(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
-	handler := NewSecretsHandler(func(string) {})
+	handler := NewSecretsHandler(nil)
 
-	mock.ExpectExec(`DELETE FROM workspace_secrets`).
+	mock.ExpectQuery(`SELECT runtime FROM workspaces WHERE id = \$1`).
 		WithArgs("00000000-0000-0000-0000-000000000004").
-		WillReturnResult(sqlmock.NewResult(0, 1))
+		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("langgraph"))
+
+	mock.ExpectExec(`INSERT INTO workspace_secrets[\s\S]*'MODEL'`).
+		WithArgs("00000000-0000-0000-0000-000000000004", sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(1, 1))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 	c.Params = gin.Params{{Key: "id", Value: "00000000-0000-0000-0000-000000000004"}}
-	c.Request = httptest.NewRequest("PUT", "/workspaces/00000000-0000-0000-0000-000000000004/provider",
-		strings.NewReader(`{"provider":""}`))
+	c.Request = httptest.NewRequest("PUT", "/workspaces/00000000-0000-0000-0000-000000000004/model",
+		strings.NewReader(`{"model":"any-arbitrary-model"}`))
 	c.Request.Header.Set("Content-Type", "application/json")
 
-	handler.SetProvider(c)
+	handler.SetModel(c)
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
@@ -745,24 +693,107 @@ func TestSecretsSetProvider_EmptyClears(t *testing.T) {
 	}
 }
 
-func TestSecretsSetProvider_InvalidID(t *testing.T) {
-	setupTestDB(t)
+// TestSecretsSetModel_WorkspaceNotFound_404 verifies 404 when the runtime
+// lookup finds no workspace row.
+func TestSecretsSetModel_WorkspaceNotFound_404(t *testing.T) {
+	mock := setupTestDB(t)
 	setupTestRedis(t)
 	handler := NewSecretsHandler(nil)
 
+	mock.ExpectQuery(`SELECT runtime FROM workspaces WHERE id = \$1`).
+		WithArgs("00000000-0000-0000-0000-000000000005").
+		WillReturnError(sql.ErrNoRows)
+
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
-	c.Params = gin.Params{{Key: "id", Value: "not-a-uuid"}}
-	c.Request = httptest.NewRequest("PUT", "/workspaces/not-a-uuid/provider",
-		strings.NewReader(`{"provider":"x"}`))
+	c.Params = gin.Params{{Key: "id", Value: "00000000-0000-0000-0000-000000000005"}}
+	c.Request = httptest.NewRequest("PUT", "/workspaces/00000000-0000-0000-0000-000000000005/model",
+		strings.NewReader(`{"model":"claude-sonnet-4-6"}`))
 	c.Request.Header.Set("Content-Type", "application/json")
 
-	handler.SetProvider(c)
+	handler.SetModel(c)
 
-	if w.Code != http.StatusBadRequest {
-		t.Errorf("expected 400 for bad UUID, got %d", w.Code)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
 	}
 }
+
+// TestSecretsModel_RoundTrip_KeyIsMODELNotMODEL_PROVIDER pins the
+// 2026-05-19 rename: writes via SetModel land under workspace_secrets
+// key='MODEL', and reads via GetModel hit the same key. A regression
+// that reverts either side to 'MODEL_PROVIDER' will mismatch sqlmock's
+// query-regex anchor and fail loudly here. Combined integration-shape
+// guard for the secrets.go half of fix/workspace-server-rename-
+// MODEL_PROVIDER-to-MODEL.
+func TestSecretsModel_RoundTrip_KeyIsMODELNotMODEL_PROVIDER(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewSecretsHandler(func(string) {})
+
+	// 1. SetModel — must hit key='MODEL' in the INSERT.
+	// Runtime lookup (issue #2172) — model is non-empty so validation fires.
+	mock.ExpectQuery(`SELECT runtime FROM workspaces WHERE id = \$1`).
+		WithArgs("00000000-0000-0000-0000-000000000099").
+		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("codex"))
+	mock.ExpectExec(`INSERT INTO workspace_secrets[\s\S]*'MODEL'[\s\S]*ON CONFLICT`).
+		WithArgs("00000000-0000-0000-0000-000000000099", sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	w1 := httptest.NewRecorder()
+	c1, _ := gin.CreateTestContext(w1)
+	c1.Params = gin.Params{{Key: "id", Value: "00000000-0000-0000-0000-000000000099"}}
+	c1.Request = httptest.NewRequest("PUT", "/workspaces/00000000-0000-0000-0000-000000000099/model",
+		strings.NewReader(`{"model":"gpt-5.5"}`))
+	c1.Request.Header.Set("Content-Type", "application/json")
+	handler.SetModel(c1)
+	if w1.Code != http.StatusOK {
+		t.Fatalf("SetModel: expected 200, got %d: %s", w1.Code, w1.Body.String())
+	}
+
+	// 2. GetModel — must hit key='MODEL' in the SELECT. Return raw
+	//    bytes; the handler will run them through DecryptVersioned.
+	//    crypto is disabled in the test env (no MASTER_KEY), so the
+	//    raw bytes pass through unchanged. We assert the SELECT
+	//    fires against key='MODEL' (the rename pin); the decoded
+	//    value isn't load-bearing for this contract test.
+	mock.ExpectQuery(`SELECT encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1 AND key = 'MODEL'`).
+		WithArgs("00000000-0000-0000-0000-000000000099").
+		WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}).
+			AddRow([]byte("gpt-5.5"), 0))
+
+	w2 := httptest.NewRecorder()
+	c2, _ := gin.CreateTestContext(w2)
+	c2.Params = gin.Params{{Key: "id", Value: "00000000-0000-0000-0000-000000000099"}}
+	c2.Request = httptest.NewRequest("GET", "/workspaces/00000000-0000-0000-0000-000000000099/model", nil)
+	handler.GetModel(c2)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("GetModel: expected 200, got %d: %s", w2.Code, w2.Body.String())
+	}
+
+	// We don't assert resp["model"] equals "gpt-5.5" because crypto
+	// state in this package varies by build tag; the load-bearing
+	// contract is the workspace_secrets key, pinned by the sqlmock
+	// regex above. If a future change adds encryption to the test
+	// env, the round-trip value check can move to an integration
+	// test that owns the crypto state.
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations — Model round-trip did not hit key='MODEL' on both sides: %v", err)
+	}
+}
+
+// ==================== GetProvider / SetProvider — RETIRED ====================
+//
+// internal#718 P4 closure: the GetProvider/SetProvider suite covered the
+// LLM_PROVIDER workspace_secret round-trip. Both handlers and the
+// shared setProviderSecret helper were removed when the secret itself
+// was retired. The replacement endpoint behavior (410 Gone with a
+// structured body) is covered by
+// `llm_provider_removal_p4_test.go::TestPutProvider_410Gone`,
+// `TestGetProvider_410Gone`, and
+// `TestProviderEndpointGone_BodyShape`.
 
 // ==================== Values — Phase 30.2 decrypted pull ====================
 
@@ -801,6 +832,12 @@ func TestSecretsValues_LegacyWorkspaceGrandfathered(t *testing.T) {
 		WithArgs(testWsID).
 		WillReturnRows(sqlmock.NewRows([]string{"key", "encrypted_value", "encryption_version"}).
 			AddRow("WS_KEY", []byte("ws_plainvalue"), 0))
+	// internal#711: Values now resolves billing mode to gate the global LLM-cred
+	// merge. Neither key here is a platform-managed LLM bypass key, so the mode
+	// is immaterial to the assertions — but the resolver query must be mocked.
+	mock.ExpectQuery(`SELECT llm_billing_mode FROM workspaces WHERE id = \$1`).
+		WithArgs(testWsID).
+		WillReturnRows(sqlmock.NewRows([]string{"llm_billing_mode"}).AddRow(LLMBillingModePlatformManaged))
 
 	w := httptest.NewRecorder()
 	c := secretsValuesRequest(w, "") // no auth — grandfathered
@@ -878,6 +915,12 @@ func TestSecretsValues_ValidTokenReturnsDecryptedMerge(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"key", "encrypted_value", "encryption_version"}).
 			AddRow("ONLY_WS", []byte("ws_val"), 0).
 			AddRow("SHARED_KEY", []byte("ws_wins"), 0))
+	// internal#711: billing-mode resolver query. None of these keys is a
+	// platform-managed LLM bypass key, so the resolved mode does not affect the
+	// merge assertions; platform_managed keeps the existing pass-through.
+	mock.ExpectQuery(`SELECT llm_billing_mode FROM workspaces WHERE id = \$1`).
+		WithArgs(testWsID).
+		WillReturnRows(sqlmock.NewRows([]string{"llm_billing_mode"}).AddRow(LLMBillingModePlatformManaged))
 
 	w := httptest.NewRecorder()
 	c := secretsValuesRequest(w, "Bearer good-token")
@@ -896,6 +939,71 @@ func TestSecretsValues_ValidTokenReturnsDecryptedMerge(t *testing.T) {
 	}
 	if body["SHARED_KEY"] != "ws_wins" {
 		t.Errorf("workspace should override global: got %q", body["SHARED_KEY"])
+	}
+}
+
+// TestSecretsValues_ByokServesTenantGlobalLLMCred is the molecule-core#1994
+// (corrected-model) regression guard for the remote-pull path. `global_secrets`
+// is the TENANT's store, so a byok workspace's pull MUST include the tenant's
+// own global-scope LLM credential — that is exactly what byok runs on, direct.
+//
+// Pre-fix (internal#711) this path STRIPPED the global-origin oauth on byok,
+// resting on the inverted premise that a global LLM cred was "the platform's
+// own"; that killed legitimate byok workspaces whose oauth lived at global
+// scope. The strip is removed: the merged bundle (tenant globals + workspace
+// overrides) is served verbatim.
+//
+// Mutation: re-add the byok global-LLM-cred strip in secrets.go Values() →
+// CLAUDE_CODE_OAUTH_TOKEN disappears from the body → this test RED.
+func TestSecretsValues_ByokServesTenantGlobalLLMCred(t *testing.T) {
+	mock := setupTestDB(t)
+	handler := NewSecretsHandler(nil)
+
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM workspace_auth_tokens`).
+		WithArgs(testWsID).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+	mock.ExpectQuery(`SELECT t\.id, t\.workspace_id.*FROM workspace_auth_tokens t.*JOIN workspaces`).
+		WithArgs(sqlmock.AnyArg()).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "workspace_id"}).AddRow("tok-1", testWsID))
+	mock.ExpectExec(`UPDATE workspace_auth_tokens SET last_used_at`).
+		WithArgs("tok-1").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	// global_secrets holds the TENANT's own global-scope OAuth token (shared
+	// across all the tenant's workspaces) + a non-LLM global.
+	mock.ExpectQuery(`SELECT key, encrypted_value, encryption_version FROM global_secrets`).
+		WillReturnRows(sqlmock.NewRows([]string{"key", "encrypted_value", "encryption_version"}).
+			AddRow("CLAUDE_CODE_OAUTH_TOKEN", []byte("TENANT-OWN-GLOBAL-OAUTH"), 0).
+			AddRow("SENTRY_DSN", []byte("https://sentry.example/123"), 0))
+	// This workspace set no LLM secret of its own — it relies on the tenant
+	// global-scope oauth.
+	mock.ExpectQuery(`SELECT key, encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id`).
+		WithArgs(testWsID).
+		WillReturnRows(sqlmock.NewRows([]string{"key", "encrypted_value", "encryption_version"}).
+			AddRow("MODEL", []byte("opus"), 0))
+
+	w := httptest.NewRecorder()
+	c := secretsValuesRequest(w, "Bearer good-token")
+	handler.Values(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var body map[string]string
+	_ = json.Unmarshal(w.Body.Bytes(), &body)
+	// 1. The tenant's own global-scope OAuth token SURVIVES — byok runs on it.
+	if body["CLAUDE_CODE_OAUTH_TOKEN"] != "TENANT-OWN-GLOBAL-OAUTH" {
+		t.Fatalf("CLAUDE_CODE_OAUTH_TOKEN = %q, want the tenant's own global-scope token served for byok pull", body["CLAUDE_CODE_OAUTH_TOKEN"])
+	}
+	// 2. The workspace's own non-LLM secret survives.
+	if body["MODEL"] != "opus" {
+		t.Fatalf("MODEL = %q, want opus preserved", body["MODEL"])
+	}
+	// 3. Unrelated non-LLM global secrets are untouched.
+	if body["SENTRY_DSN"] != "https://sentry.example/123" {
+		t.Fatalf("SENTRY_DSN = %q, want non-LLM globals untouched", body["SENTRY_DSN"])
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
 	}
 }
 
@@ -968,6 +1076,61 @@ func TestSetGlobal_AutoRestartsAffectedWorkspaces(t *testing.T) {
 		t.Errorf("expected ws-a and ws-c restarted, got %v", seen)
 	}
 
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// TestSetGlobal_AllowsTenantOwnedVendorKeyDespiteLegacyOrgEnv pins the
+// internal#718 correction: the org-level LLM billing rung is RETIRED (billing
+// is resolved per-workspace, not per-org). A global secret is the tenant's OWN
+// shared credential and is always writable at global scope; the provision-time
+// provider-matched strip (workspace_provision) keeps any platform-managed
+// workspace from USING a non-matching global cred, and per-workspace secret
+// writes still enforce the strip-list via the per-workspace guard. So even with
+// the legacy MOLECULE_LLM_BILLING_MODE env still set to platform_managed, a
+// global vendor/oauth key write MUST SUCCEED (200) and persist — the retired
+// org rung no longer gates it.
+//
+// Mutation: re-add the org-level rejectPlatformManagedDirectLLMBypass guard to
+// SetGlobal → the write 400s before the INSERT → this test RED.
+func TestSetGlobal_AllowsTenantOwnedVendorKeyDespiteLegacyOrgEnv(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+
+	restarted := make(chan string, 2)
+	handler := NewSecretsHandler(func(id string) { restarted <- id })
+
+	// Legacy org env still platform_managed — it must no longer gate the write.
+	t.Setenv("MOLECULE_LLM_BILLING_MODE", LLMBillingModePlatformManaged)
+
+	mock.ExpectExec("INSERT INTO global_secrets").
+		WithArgs("CLAUDE_CODE_OAUTH_TOKEN", sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery("SELECT id FROM workspaces").
+		WithArgs("CLAUDE_CODE_OAUTH_TOKEN").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("ws-a"))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	body := `{"key":"CLAUDE_CODE_OAUTH_TOKEN","value":"sk-ant-oat01-tenant-own"}`
+	c.Request = httptest.NewRequest("POST", "/admin/secrets", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.SetGlobal(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 (global write allowed; org rung retired), got %d: %s", w.Code, w.Body.String())
+	}
+	// Wait on the async restart fan-out so its SELECT drains before db swap.
+	select {
+	case id := <-restarted:
+		if id != "ws-a" {
+			t.Errorf("expected ws-a restarted, got %s", id)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("auto-restart not fired for affected workspace")
+	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations: %v", err)
 	}

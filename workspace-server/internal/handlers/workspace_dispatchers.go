@@ -31,11 +31,13 @@ package handlers
 
 import (
 	"context"
+	"encoding/json"
 	"log"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/models"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/provlog"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provlog"
 )
 
 // HasProvisioner reports whether either backend (CP or local Docker) is
@@ -205,6 +207,90 @@ func (h *WorkspaceHandler) StopWorkspaceAuto(ctx context.Context, workspaceID st
 		return h.provisioner.Stop(ctx, workspaceID)
 	}
 	return nil
+}
+
+// stopWorkspaceForDelete is the DELETE-path stop dispatcher. It differs
+// from StopWorkspaceAuto in exactly one way: the CP (EC2) path gets the
+// same bounded retry the restart path uses (cpStopWithRetryErr), and on
+// retry exhaustion it persists a durable `workspace.delete.terminate_retry_exhausted`
+// event to structure_events (the structured-logging gate) so the leak
+// decision is queryable, not just stdout prose.
+//
+// Why retry here (task #15 / workspace-ec2-leak): the bare cpProv.Stop on
+// delete left a transient CP/AWS hiccup as an immediate 500 with no inline
+// recovery. For a cascade *descendant* the "client retries → replays
+// terminate" recovery is defeated by CascadeDelete's `status != 'removed'`
+// CTE filter (the descendant's row is already 'removed', so a retry walks
+// zero descendant rows). Bounded retry absorbs the transient class inline;
+// the durable event + the row staying status='removed'+instance_id is the
+// hand-off to the 60s CP-orphan-sweeper (registry/cp_orphan_sweeper.go) for
+// the (rarer) sustained-outage case.
+//
+// We deliberately do NOT clear status='removed' on exhaustion — the
+// CP-orphan-sweeper's recovery query keys on exactly that state, so
+// reverting it would break the existing backstop. The error is still
+// returned so the HTTP Delete handler surfaces the retryable 500.
+//
+// Docker path: single Stop, no retry — a local daemon that fails to stop a
+// container won't heal on retry (matches RestartWorkspaceAuto's Docker
+// rationale); the orphan-container sweeper (registry/orphan_sweeper.go) is
+// the Docker-side backstop.
+// stopWorkspaceForDelete terminates a workspace's compute on the delete path.
+// erase=true (internal#734) means the user asked to erase saved data, so the CP
+// teardown prunes the durable data volume. The local-docker path always removes
+// its volume via CascadeDelete's RemoveVolume, so erase is a CP-only concern.
+func (h *WorkspaceHandler) stopWorkspaceForDelete(ctx context.Context, workspaceID string, erase bool) error {
+	if h.cpProv != nil {
+		if err := h.cpStopWithRetryErr(ctx, workspaceID, "Delete", erase); err != nil {
+			h.emitDeleteTerminateRetryExhausted(ctx, workspaceID, err)
+			return err
+		}
+		return nil
+	}
+	if h.provisioner != nil {
+		return h.provisioner.Stop(ctx, workspaceID)
+	}
+	return nil
+}
+
+// emitDeleteTerminateRetryExhausted persists a durable record that the
+// delete-path EC2 terminate could not be completed inline after the full
+// retry budget. Per the §Persistent structured logging gate: a
+// state-mutating decision (we are leaving a known-leaked-or-pending EC2 for
+// the orphan sweeper) must land in structure_events, not just log.Printf.
+//
+// Event-type taxonomy (append-only; never rename):
+//
+//	workspace.delete.terminate_retry_exhausted — delete-path cpProv.Stop
+//	  exhausted its retry budget; row stays status='removed' with
+//	  instance_id populated for the CP-orphan-sweeper to re-drive.
+//
+// Telemetry never blocks the request path: marshal / INSERT failures are
+// logged and swallowed.
+func (h *WorkspaceHandler) emitDeleteTerminateRetryExhausted(ctx context.Context, workspaceID string, cause error) {
+	payload := map[string]any{
+		"workspace_id": workspaceID,
+		"attempts":     cpStopRetryAttempts,
+		"last_error":   cause.Error(),
+		// recovery_path documents WHO is expected to finish the terminate,
+		// so a reader of the audit row doesn't have to grep the code to
+		// know the EC2 isn't simply abandoned.
+		"recovery_path": "cp_orphan_sweeper",
+	}
+	payloadJSON, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("emitDeleteTerminateRetryExhausted: marshal payload failed for %s: %v", workspaceID, err)
+		return
+	}
+	if db.DB == nil {
+		return
+	}
+	if _, err := db.DB.ExecContext(ctx, `
+		INSERT INTO structure_events (event_type, workspace_id, payload, created_at)
+		VALUES ($1, $2, $3, now())
+	`, "workspace.delete.terminate_retry_exhausted", workspaceID, payloadJSON); err != nil {
+		log.Printf("emitDeleteTerminateRetryExhausted: insert failed for %s: %v", workspaceID, err)
+	}
 }
 
 // RestartWorkspaceAuto stops the running workload (with retry semantics

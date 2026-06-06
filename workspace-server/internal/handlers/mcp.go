@@ -33,7 +33,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/events"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
 	"github.com/gin-gonic/gin"
 )
 
@@ -84,6 +84,7 @@ type mcpTool struct {
 type MCPHandler struct {
 	database    *sql.DB
 	broadcaster *events.Broadcaster
+	a2aProxy    func(ctx context.Context, workspaceID string, body []byte, callerID string, logActivity bool) (int, []byte, error)
 
 	// memv2 is the v2 memory plugin wiring (RFC #2728). nil-safe:
 	// every v2 tool calls memoryV2Available() first and returns a
@@ -96,6 +97,14 @@ type MCPHandler struct {
 // Pass db.DB and the platform broadcaster at router-setup time.
 func NewMCPHandler(database *sql.DB, broadcaster *events.Broadcaster) *MCPHandler {
 	return &MCPHandler{database: database, broadcaster: broadcaster}
+}
+
+func (h *MCPHandler) proxyA2ARequest(ctx context.Context, workspaceID string, body []byte, callerID string, logActivity bool) (int, []byte, error) {
+	if h.a2aProxy != nil {
+		return h.a2aProxy(ctx, workspaceID, body, callerID, logActivity)
+	}
+	wh := NewWorkspaceHandler(h.broadcaster, nil, "", "")
+	return wh.ProxyA2ARequest(ctx, workspaceID, body, callerID, logActivity)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -117,6 +126,32 @@ var mcpAllTools = []mcpTool{
 					"type":        "string",
 					"description": "The task description to send to the target workspace",
 				},
+				"attachments": map[string]interface{}{
+					"type":        "array",
+					"description": "Optional files to send with the task. Each item must include uri and name; mimeType and size are optional.",
+					"items": map[string]interface{}{
+						"type": "object",
+						"properties": map[string]interface{}{
+							"uri": map[string]interface{}{
+								"type":        "string",
+								"description": "Workspace attachment URI, usually workspace:/absolute/path",
+							},
+							"name": map[string]interface{}{
+								"type":        "string",
+								"description": "Display filename",
+							},
+							"mimeType": map[string]interface{}{
+								"type":        "string",
+								"description": "Optional MIME type",
+							},
+							"size": map[string]interface{}{
+								"type":        "number",
+								"description": "Optional file size in bytes",
+							},
+						},
+						"required": []string{"uri", "name"},
+					},
+				},
 			},
 			"required": []string{"workspace_id", "task"},
 		},
@@ -134,6 +169,32 @@ var mcpAllTools = []mcpTool{
 				"task": map[string]interface{}{
 					"type":        "string",
 					"description": "The task description to send to the target workspace",
+				},
+				"attachments": map[string]interface{}{
+					"type":        "array",
+					"description": "Optional files to send with the task. Each item must include uri and name; mimeType and size are optional.",
+					"items": map[string]interface{}{
+						"type": "object",
+						"properties": map[string]interface{}{
+							"uri": map[string]interface{}{
+								"type":        "string",
+								"description": "Workspace attachment URI, usually workspace:/absolute/path",
+							},
+							"name": map[string]interface{}{
+								"type":        "string",
+								"description": "Display filename",
+							},
+							"mimeType": map[string]interface{}{
+								"type":        "string",
+								"description": "Optional MIME type",
+							},
+							"size": map[string]interface{}{
+								"type":        "number",
+								"description": "Optional file size in bytes",
+							},
+						},
+						"required": []string{"uri", "name"},
+					},
 				},
 			},
 			"required": []string{"workspace_id", "task"},
@@ -182,6 +243,32 @@ var mcpAllTools = []mcpTool{
 				"message": map[string]interface{}{
 					"type":        "string",
 					"description": "The message to send to the user",
+				},
+				"attachments": map[string]interface{}{
+					"type":        "array",
+					"description": "Optional files to render as canvas chat attachments. Each item must include uri and name; mimeType and size are optional.",
+					"items": map[string]interface{}{
+						"type": "object",
+						"properties": map[string]interface{}{
+							"uri": map[string]interface{}{
+								"type":        "string",
+								"description": "Workspace attachment URI, usually workspace:/absolute/path",
+							},
+							"name": map[string]interface{}{
+								"type":        "string",
+								"description": "Display filename",
+							},
+							"mimeType": map[string]interface{}{
+								"type":        "string",
+								"description": "Optional MIME type",
+							},
+							"size": map[string]interface{}{
+								"type":        "number",
+								"description": "Optional file size in bytes",
+							},
+						},
+						"required": []string{"uri", "name"},
+					},
 				},
 			},
 			"required": []string{"message"},

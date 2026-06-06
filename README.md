@@ -46,6 +46,18 @@
 
 ---
 
+## Quick Start
+
+```bash
+git clone https://git.moleculesai.app/molecule-ai/molecule-core.git
+cd molecule-core
+./scripts/dev-start.sh
+```
+
+Then open [http://localhost:3000](http://localhost:3000), add your model API key in **Config → Secrets & API Keys → Global**, and create a workspace from a template.
+
+See the full [Quickstart Guide](./docs/quickstart.md) for prerequisites, manual setup, and troubleshooting.
+
 ## The Pitch
 
 Molecule AI is the most powerful way to govern an AI agent organization in production.
@@ -53,7 +65,7 @@ Molecule AI is the most powerful way to govern an AI agent organization in produ
 It combines the parts that are usually scattered across demos, internal glue code, and framework-specific tooling into one product:
 
 - one org-native control plane for teams, roles, hierarchy, and lifecycle
-- one runtime layer that lets **eight** agent runtimes — LangGraph, DeepAgents, Claude Code, CrewAI, AutoGen, **Hermes**, **Gemini CLI**, and OpenClaw — run side by side behind one workspace contract
+- one runtime layer that lets **four** maintained agent runtimes — Claude Code, Codex, **Hermes**, and OpenClaw — run side by side behind one workspace contract
 - one memory model that keeps recall, sharing, and skill evolution aligned with organizational boundaries (Memory v2 backed by pgvector for semantic recall)
 - one operational surface for observing, pausing, restarting, inspecting, and improving live workspaces
 
@@ -75,11 +87,11 @@ You do not wire collaboration paths by hand. Hierarchy defines the default commu
 
 ### 3. Runtime choice stops being a dead-end decision
 
-LangGraph, DeepAgents, Claude Code, CrewAI, AutoGen, Hermes, Gemini CLI, and OpenClaw can all plug into the same workspace abstraction. Teams can standardize governance without forcing every group onto one runtime.
+Claude Code, Codex, Hermes, and OpenClaw can all plug into the same workspace abstraction. Teams can standardize governance without forcing every group onto one runtime.
 
 ### 4. Memory is treated like infrastructure
 
-Molecule AI's HMA approach is designed around organizational boundaries, not just “store more context somewhere.” Durable recall, scoped sharing, awareness namespaces, and skill promotion are all part of one coherent system.
+Molecule AI's HMA approach is designed around organizational boundaries, not just "store more context somewhere." Durable recall, scoped sharing through the v2 memory plugin, and skill promotion are all part of one coherent system.
 
 ### 5. It comes with a real control plane
 
@@ -101,7 +113,7 @@ Registry, heartbeats, restart, pause/resume, activity logs, approvals, terminal 
 | **Role-native workspace abstraction** | Your org structure survives model swaps, framework changes, and team expansion |
 | **Fractal team expansion** | A single specialist can become a managed department without breaking upstream integrations |
 | **Heterogeneous runtime compatibility** | Different teams can keep their preferred agent architecture while sharing one control plane |
-| **HMA + awareness namespaces** | Memory sharing follows hierarchy instead of leaking across the whole system |
+| **HMA + v2 memory plugin** | Memory sharing follows hierarchy instead of leaking across the whole system; one plugin per tenant, namespace-scoped per workspace |
 | **Skill evolution loop** | Durable successful workflows can graduate from memory into reusable, hot-reloadable skills |
 | **WebSocket-first operational UX** | The canvas reflects task state, structure changes, and A2A responses in near real time |
 | **Global secrets with local override** | Centralize provider access, then override only where a workspace needs specialized credentials |
@@ -112,13 +124,9 @@ Molecule AI is not trying to replace the frameworks below. It is the system that
 
 | Runtime / architecture | Status in current repo | Native strength | What Molecule AI adds |
 |---|---|---|---|
-| **LangGraph** | Shipping on `main` | Graph control, tool use, Python extensibility | Canvas orchestration, hierarchy routing, A2A, memory scopes, operational lifecycle |
-| **DeepAgents** | Shipping on `main` | Deeper planning and decomposition | Same workspace contract, team topology, activity stream, restart behavior |
 | **Claude Code** | Shipping on `main` | Real coding workflows, CLI-native continuity | Secure workspace abstraction, A2A delegation, org boundaries, shared control plane |
-| **CrewAI** | Shipping on `main` | Role-based crews | Persistent workspace identity, policy consistency, shared canvas and registry |
-| **AutoGen** | Shipping on `main` | Assistant/tool orchestration | Standardized deployment, hierarchy-aware collaboration, shared ops plane |
+| **Codex** | Shipping on `main` | OpenAI Codex CLI workflows | Secure workspace abstraction, A2A delegation, org boundaries, shared control plane |
 | **Hermes 4** | Shipping on `main` | Hybrid reasoning, native tools, json_schema (NousResearch/hermes-agent) | Option B upstream hook, A2A bridge to OpenAI-compat API, multi-provider provider derivation |
-| **Gemini CLI** | Shipping on `main` | Google Gemini CLI continuity | Workspace lifecycle, A2A, hierarchy-aware collaboration, shared ops plane |
 | **OpenClaw** | Shipping on `main` | CLI-native runtime with its own session model | Workspace lifecycle, templates, activity logs, topology-aware collaboration |
 | **NemoClaw** | WIP on `feat/nemoclaw-t4-docker` | NVIDIA-oriented runtime path | Planned to join the same abstraction once merged; not yet part of `main` |
 
@@ -133,7 +141,7 @@ Most projects stop at “we added memory.” Molecule AI pushes further:
 | Flat store or weak namespaces | Hierarchy-aligned `LOCAL`, `TEAM`, `GLOBAL` scopes |
 | Sharing is easy to overexpose | Sharing is explicit and structure-aware |
 | Memory and procedure get mixed together | Memory stores durable facts; skills store repeatable procedure |
-| Every agent can become over-privileged | Workspace awareness namespaces reduce blast radius |
+| Every agent can become over-privileged | Per-workspace namespaces in the v2 memory plugin reduce blast radius |
 | UI memory and runtime memory blur together | Separate surfaces for scoped agent memory, key/value workspace memory, and recall |
 
 ### The flywheel
@@ -163,16 +171,16 @@ Most agent systems stop at "a smart runtime." Molecule AI pushes further: it giv
 
 | Core mechanism | Molecule AI module(s) | Why it matters |
 |---|---|---|
-| **Durable memory that survives sessions** | `workspace/builtin_tools/memory.py`, `workspace/builtin_tools/awareness_client.py`, `workspace-server/internal/handlers/memories.go` | Memory is not just durable, it is **workspace-scoped** and can route into awareness namespaces tied to the org structure |
+| **Durable memory that survives sessions** | `molecule-ai-workspace-runtime/molecule_runtime/builtin_tools/`, `workspace-server/internal/handlers/memories.go`, `workspace-server/internal/memory/` (v2 plugin client + namespace resolver) | Memory is not just durable, it is **workspace-scoped** — every write lands in the workspace's own `workspace:<id>` namespace, with `team:<root>` and `org:<root>` available for cross-workspace shares via the platform's namespace ACL when an agent explicitly promotes a memory |
 | **Cross-session recall** | `workspace-server/internal/handlers/activity.go` (`/workspaces/:id/session-search`) | Recall spans both activity history and memory rows, so the system can search what happened and what was learned without inventing a separate hidden store |
-| **Skills built from experience** | `workspace/builtin_tools/memory.py` (`_maybe_log_skill_promotion`) | Promotion from memory into a skill candidate is surfaced as an explicit platform activity, not a silent internal side effect |
-| **Skill improvement during use** | `workspace/skill_loader/watcher.py`, `workspace/skill_loader/loader.py`, `workspace/main.py` | Skills hot-reload into the live runtime, so improvements become available on the next A2A task without restarting the workspace |
-| **Persistent skill lifecycle** | `workspace-server/cmd/cli/cmd_agent_skill.go`, `workspace/plugins.py` | Skills are not just generated once; they can be audited, installed, published, shared, mounted by plugins, and governed as reusable operational assets |
+| **Skills built from experience** | `molecule-ai-workspace-runtime/molecule_runtime/builtin_tools/memory.py` (`_maybe_log_skill_promotion`) | Promotion from memory into a skill candidate is surfaced as an explicit platform activity, not a silent internal side effect |
+| **Skill improvement during use** | `molecule-ai-workspace-runtime/molecule_runtime/skill_loader/`, `molecule-ai-workspace-runtime/molecule_runtime/main.py` | Skills hot-reload into the live runtime, so improvements become available on the next A2A task without restarting the workspace |
+| **Persistent skill lifecycle** | `workspace-server/cmd/cli/cmd_agent_skill.go`, `molecule-ai-workspace-runtime/molecule_runtime/plugins.py` | Skills are not just generated once; they can be audited, installed, published, shared, mounted by plugins, and governed as reusable operational assets |
 
 ### Why this matters in Molecule AI
 
 1. **The learning loop is org-aware, not just session-aware.**
-   Memory can live at `LOCAL`, `TEAM`, or `GLOBAL` scope, and awareness namespaces give each workspace a durable identity boundary.
+   Memory can live at `LOCAL`, `TEAM`, or `GLOBAL` scope, and the v2 plugin's namespace ACL gives each workspace a durable identity boundary.
 
 2. **The learning loop is visible to operators.**
    Promotion events, activity logs, current-task updates, traces, and WebSocket fanout mean self-improvement is part of the control plane, not a hidden black box.
@@ -208,10 +216,10 @@ The result is not just “an agent that learns.” It is **an organization that 
 
 ### Runtime
 
-- unified `workspace/` image; thin AMI in production (us-east-2)
-- adapter-driven execution across **8 runtimes** (Claude Code, Hermes, Gemini CLI, LangGraph, DeepAgents, CrewAI, AutoGen, OpenClaw)
+- standalone workspace-template images that install `molecule-ai-workspace-runtime` from the Gitea package registry; thin AMI in production (us-east-2)
+- adapter-driven execution across **4 maintained runtimes** (Claude Code, Codex, Hermes, OpenClaw)
 - Agent Card registration
-- awareness-backed memory integration; **Memory v2 backed by pgvector** for semantic recall
+- **Memory v2 backed by pgvector** — per-tenant plugin sidecar serving HMA namespaces with FTS + semantic recall
 - plugin-mounted shared rules/skills
 - hot-reloadable local skills
 - coordinator-only delegation path
@@ -238,14 +246,14 @@ The result is not just “an agent that learns.” It is **an organization that 
 - subscribe to one or more workspaces; peer messages surface as conversation turns; replies route back through Molecule's A2A
 - no tunnel, no public endpoint — the plugin self-registers each watched workspace as `delivery_mode=poll` and long-polls `/activity?since_id=…`
 - multi-tenant friendly: one plugin install can watch workspaces across multiple Molecule tenants (`MOLECULE_PLATFORM_URLS` per-workspace)
-- install via the standard marketplace flow: `/plugin marketplace add Molecule-AI/molecule-mcp-claude-channel` → `/plugin install molecule-channel@molecule-mcp-claude-channel`
+- install via the standard marketplace flow: `/plugin marketplace add https://git.moleculesai.app/molecule-ai/molecule-mcp-claude-channel.git` → `/plugin install molecule@molecule-channel`, then launch with `claude --dangerously-load-development-channels=plugin:molecule@molecule-channel`
 
 ## Built For Teams That Need More Than A Demo
 
 Molecule AI is especially strong when you need to run:
 
 - AI engineering teams with PM / Dev Lead / QA / Research / Ops roles
-- mixed runtime organizations where one team prefers LangGraph and another prefers Claude Code
+- mixed runtime organizations where one team prefers Hermes and another prefers Claude Code
 - long-lived agent organizations that need memory boundaries and reusable procedures
 - internal platforms that want to expose agent teams as structured infrastructure, not ad hoc scripts
 
@@ -260,9 +268,9 @@ Canvas (Next.js 15, warm-paper :3000)  <--HTTP / WS-->  Platform (Go 1.25 :8080)
          +------------------------- shows ------------------------> workspaces, teams, tasks, traces, events
 
 Workspace Runtime (Python ≥3.11, image with adapters)
-  - 8 adapters: LangGraph / DeepAgents / Claude Code / CrewAI / AutoGen / Hermes / Gemini CLI / OpenClaw
+  - 4 adapters: Claude Code / Codex / Hermes / OpenClaw
   - Agent Card + A2A server (typed-SSOT response path, RFC #2967)
-  - heartbeat + activity + awareness-backed memory (Memory v2 — pgvector semantic recall)
+  - heartbeat + activity + Memory v2 (pgvector semantic recall via per-tenant plugin sidecar)
   - skills + plugins + hot reload
 
 SaaS Control Plane (molecule-controlplane, private)
@@ -328,7 +336,7 @@ Then open `http://localhost:3000`:
 
 ## Current Scope
 
-The current `main` branch ships the core platform, Canvas v4 (warm-paper themed), Memory v2 (pgvector semantic recall), the typed-SSOT A2A response path (RFC #2967), **eight production adapters** (Claude Code, Hermes, Gemini CLI, LangGraph, DeepAgents, CrewAI, AutoGen, OpenClaw), skill lifecycle, and operational surfaces.
+The current `main` branch ships the core platform, Canvas v4 (warm-paper themed), Memory v2 (pgvector semantic recall), the typed-SSOT A2A response path (RFC #2967), **four maintained production adapters** (Claude Code, Codex, Hermes, OpenClaw), skill lifecycle, and operational surfaces.
 
 The companion private repo [`molecule-controlplane`](https://git.moleculesai.app/molecule-ai/molecule-controlplane) provides the SaaS surface — multi-tenant orchestration on EC2 + Neon + Cloudflare Tunnels, KMS envelope encryption, WorkOS auth, Stripe billing, and a `tenant_resources` audit table with a 30-min reconciler.
 

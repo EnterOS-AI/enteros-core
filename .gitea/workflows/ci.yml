@@ -25,10 +25,9 @@
 #      sufficient for `actions/checkout` against this same repo.
 #
 #   4. Docs — no docs/scripts reference github.com URLs that need swapping.
-#      The canvas-deploy-reminder step writes a `ghcr.io/...` image
-#      reference into the step summary text — that's documentation prose
-#      pointing at the ECR-mirrored canvas image and stays unchanged for
-#      this port (a separate cleanup if ghcr→ECR sweep is in scope).
+#      The canvas-deploy-status step (core#2226, formerly canvas-deploy-reminder)
+#      writes the canvas ordered-deploy status into the step summary; it points
+#      at the ECR canvas image and the publish workflow, no ghcr.io prose.
 #
 # Cross-links:
 #   - RFC: internal#219 (CI/CD hard-gate hardening)
@@ -86,55 +85,27 @@ jobs:
         with:
           fetch-depth: 0
       - id: check
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PUSH_BEFORE: ${{ github.event.before }}
         run: |
-          # For PR events: diff against the base branch (not HEAD~1 of the branch,
-          # which may be unrelated after force-pushes). When a push updates a PR,
-          # both pull_request and push events fire — prefer the PR base so that
-          # the diff is always computed against the actual merge base, not the
-          # previous SHA on the branch which may be on a different history line.
-          BASE="${GITHUB_BASE_REF:-${{ github.event.before }}}"
-          # GITHUB_BASE_REF is set for PR events (the base branch name).
-          # For pull_request events we use the stored base.sha; for push events
-          # (or when base.sha is unavailable) fall back to github.event.before.
-          if [ "${{ github.event_name }}" = "pull_request" ] && [ -n "${{ github.event.pull_request.base.sha }}" ]; then
-            BASE="${{ github.event.pull_request.base.sha }}"
-          fi
-          # Fallback: if BASE is empty or all zeros (new branch), run everything
-          if [ -z "$BASE" ] || echo "$BASE" | grep -qE '^0+$'; then
-            echo "platform=true" >> "$GITHUB_OUTPUT"
-            echo "canvas=true" >> "$GITHUB_OUTPUT"
-            echo "python=true" >> "$GITHUB_OUTPUT"
-            echo "scripts=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          # Workflow-only edits are covered by the workflow lint family
-          # and by this workflow's always-present required jobs. Do not fan
-          # those edits out into Go/Canvas/Python/shellcheck work; the
-          # downstream jobs still emit their required contexts via no-op
-          # steps when their surface flag is false.
-          #
-          # If the diff itself cannot be trusted, fail open by running every
-          # surface instead of silently under-testing the PR.
-          if ! DIFF=$(git diff --name-only "$BASE" HEAD 2>/dev/null); then
-            echo "platform=true" >> "$GITHUB_OUTPUT"
-            echo "canvas=true" >> "$GITHUB_OUTPUT"
-            echo "python=true" >> "$GITHUB_OUTPUT"
-            echo "scripts=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          echo "platform=$(echo "$DIFF" | grep -qE '^workspace-server/' && echo true || echo false)" >> "$GITHUB_OUTPUT"
-          echo "canvas=$(echo "$DIFF" | grep -qE '^canvas/' && echo true || echo false)" >> "$GITHUB_OUTPUT"
-          echo "python=$(echo "$DIFF" | grep -qE '^workspace/' && echo true || echo false)" >> "$GITHUB_OUTPUT"
-          echo "scripts=$(echo "$DIFF" | grep -qE '^tests/e2e/|^scripts/|^infra/scripts/' && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          python3 .gitea/scripts/detect-changes.py \
+            --profile ci \
+            --event-name "${{ github.event_name }}" \
+            --pr-base-sha "$PR_BASE_SHA" \
+            --base-ref "$PR_BASE_REF" \
+            --push-before "${GITHUB_EVENT_BEFORE:-$PUSH_BEFORE}"
 
-  # Platform (Go) — Go build/vet/test/lint + coverage gates. The always-run
-  # + per-step gating shape preserves the GitHub-side required-check name
-  # contract (so when this Gitea port becomes a required check in Phase 4,
-  # the name match works on PRs that don't touch workspace-server/).
+  # Platform (Go) — Go build/vet/test/lint + coverage gates. The job always
+  # emits the required context, but expensive steps are path-scoped on every
+  # event so docs/E2E/Canvas-only main pushes do not block deploy on unrelated
+  # Go bootstrap work.
   platform-build:
     name: Platform (Go)
+    needs: changes
     runs-on: ubuntu-latest
-    # mc#774 (closed 2026-05-14): Phase 4 flip of the platform-build job.
+    # mc#1982 (closed 2026-05-14): Phase 4 flip of the platform-build job.
     # Phase 4 (#656) originally flipped this to continue-on-error: false based on
     # Phase-3-masked "green on main 2026-05-12". Two failure classes then surfaced:
     #   (1) 4x delegation_test.go sqlmock gaps (PR #669 / #634 fix-forward, closed).
@@ -153,29 +124,29 @@ jobs:
       run:
         working-directory: workspace-server
     steps:
-      - if: false
+      - if: ${{ needs.changes.outputs.platform != 'true' }}
         working-directory: .
-        run: echo "No platform/** changes — skipping real build steps; this job always runs to satisfy the required-check name on branch protection."
-      - if: always()
+        run: echo "No workspace-server/** changes — Platform (Go) gate satisfied without running Go build/test/lint."
+      - if: ${{ needs.changes.outputs.platform == 'true' }}
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - if: always()
+      - if: ${{ needs.changes.outputs.platform == 'true' }}
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: 'stable'
-      - if: always()
+      - if: ${{ needs.changes.outputs.platform == 'true' }}
         run: go mod download
-      - if: always()
+      - if: ${{ needs.changes.outputs.platform == 'true' }}
         run: go build ./cmd/server
       # CLI (molecli) moved to standalone repo: git.moleculesai.app/molecule-ai/molecule-cli
-      - if: always()
+      - if: ${{ needs.changes.outputs.platform == 'true' }}
         run: go vet ./...
-      - if: always()
+      - if: ${{ needs.changes.outputs.platform == 'true' }}
         name: Install golangci-lint
         run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
-      - if: always()
+      - if: ${{ needs.changes.outputs.platform == 'true' }}
         name: Run golangci-lint
         run: $(go env GOPATH)/bin/golangci-lint run --timeout 3m ./...
-      - if: always()
+      - if: ${{ needs.changes.outputs.platform == 'true' }}
         name: Diagnostic — per-package verbose 60s
         run: |
           set +e
@@ -189,17 +160,25 @@ jobs:
           echo "::group::pendinguploads exit=$pu_exit (last 100 lines)"
           tail -100 /tmp/test-pu.log
           echo "::endgroup::"
-        # mc#774: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
+        # mc#1982: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
         continue-on-error: true
-      - if: always()
-        name: Run tests with race detection and coverage
-        # Explicit timeout: cold runner cache causes OOM kills at ~4m39s on the
-        # full ./... suite with race detection + coverage. A 10m per-step timeout
-        # lets the suite complete on cold cache (~5-7m) while failing cleanly
-        # instead of OOM-killing. The job-level timeout (15m) is a backstop.
-        run: go test -race -timeout 10m -coverprofile=coverage.out ./...
+      - if: ${{ needs.changes.outputs.platform == 'true' }}
+        name: Run tests with coverage (blocking gate)
+        # Removed -race from the blocking gate per #1184: cold runners
+        # take 13-25 min to compile with race instrumentation, exceeding
+        # the 10m step timeout and causing false failures. Race detection
+        # now runs as a non-blocking advisory step below.
+        run: go test -timeout 10m -coverprofile=coverage.out ./...
 
-      - if: always()
+      - if: ${{ needs.changes.outputs.platform == 'true' }}
+        name: Race detection (advisory, non-blocking)
+        # mc#1184: runs race detector as an advisory check so cold-runner
+        # compile-time spikes don't block merges. Failures here surface in
+        # the run log but do not fail the build.
+        run: go test -race -timeout 10m ./...
+        continue-on-error: true
+
+      - if: ${{ needs.changes.outputs.platform == 'true' }}
         name: Per-file coverage report
         # Advisory — lists every source file with its coverage so reviewers
         # can see at-a-glance where gaps are. Sorted ascending so the worst
@@ -213,7 +192,7 @@ jobs:
                    END {for (f in s) printf "%6.1f%%  %s\n", s[f]/c[f], f}' \
             | sort -n
 
-      - if: always()
+      - if: ${{ needs.changes.outputs.platform == 'true' }}
         name: Check coverage thresholds
         # Enforces two gates from #1823 Layer 1:
         #   1. Total floor (25% — ratchet plan in COVERAGE_FLOOR.md).
@@ -267,7 +246,7 @@ jobs:
               # Strip the package-import prefix so we can match .coverage-allowlist.txt
               # entries written as paths relative to workspace-server/.
               # Handle both module paths: platform/workspace-server/... and platform/...
-              rel=$(echo "$file" | sed 's|^github.com/molecule-ai/molecule-monorepo/platform/workspace-server/||; s|^github.com/molecule-ai/molecule-monorepo/platform/||')
+              rel=$(echo "$file" | sed 's|^git.moleculesai.app/molecule-ai/molecule-core/workspace-server/workspace-server/||; s|^git.moleculesai.app/molecule-ai/molecule-core/workspace-server/||')
 
               if echo "$ALLOWLIST" | grep -qxF "$rel"; then
                 echo "::warning file=workspace-server/$rel::Critical file at ${pct}% coverage (allowlisted, #1823) — fix before expiry."
@@ -301,6 +280,7 @@ jobs:
   # siblings — verified empirically on PR #2314).
   canvas-build:
     name: Canvas (Next.js)
+    needs: changes
     runs-on: ubuntu-latest
     timeout-minutes: 20
     # Phase 4 (RFC #219 §1): confirmed green on main 2026-05-12.
@@ -309,20 +289,20 @@ jobs:
       run:
         working-directory: canvas
     steps:
-      - if: false
+      - if: ${{ needs.changes.outputs.canvas != 'true' }}
         working-directory: .
-        run: echo "No canvas/** changes — skipping real build steps; this job always runs to satisfy the required-check name on branch protection."
-      - if: always()
+        run: echo "No canvas/** changes — Canvas (Next.js) gate satisfied without running npm build/test."
+      - if: ${{ needs.changes.outputs.canvas == 'true' }}
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - if: always()
+      - if: ${{ needs.changes.outputs.canvas == 'true' }}
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
           node-version: '22'
-      - if: always()
-        run: rm -f package-lock.json && npm install
-      - if: always()
+      - if: ${{ needs.changes.outputs.canvas == 'true' }}
+        run: npm ci --include=optional --prefer-offline
+      - if: ${{ needs.changes.outputs.canvas == 'true' }}
         run: npm run build
-      - if: always()
+      - if: ${{ needs.changes.outputs.canvas == 'true' }}
         name: Run tests with coverage
         # Coverage instrumentation is configured in canvas/vitest.config.ts
         # (provider: v8, reporters: text + html + json-summary). Step 2 of
@@ -331,7 +311,7 @@ jobs:
         # tracked in #1815) after the team sees what current coverage is.
         run: npx vitest run --coverage
       - name: Upload coverage summary as artifact
-        if: always()
+        if: ${{ needs.changes.outputs.canvas == 'true' }}
         # Pinned to v3 for Gitea act_runner v0.6 compatibility — v4+ uses
         # the GHES 3.10+ artifact protocol that Gitea 1.22.x does NOT
         # implement, surfacing as `GHESNotSupportedError: @actions/artifact
@@ -345,18 +325,19 @@ jobs:
           retention-days: 7
           if-no-files-found: warn
 
-  # Shellcheck (E2E scripts) — required check, always runs.
+  # Shellcheck (E2E scripts) — required context, path-scoped heavy steps.
   shellcheck:
     name: Shellcheck (E2E scripts)
+    needs: changes
     runs-on: ubuntu-latest
     # Phase 4 (RFC #219 §1): confirmed green on main 2026-05-12.
     continue-on-error: false
     steps:
-      - if: false
-        run: echo "No tests/e2e/ or infra/scripts/ changes — skipping real shellcheck; this job always runs to satisfy the required-check name on branch protection."
-      - if: always()
+      - if: ${{ needs.changes.outputs.scripts != 'true' }}
+        run: echo "No tests/e2e, scripts, or infra/scripts changes — Shellcheck gate satisfied without running script checks."
+      - if: ${{ needs.changes.outputs.scripts == 'true' }}
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - if: always()
+      - if: ${{ needs.changes.outputs.scripts == 'true' }}
         name: Run shellcheck on tests/e2e/*.sh and infra/scripts/*.sh
         # shellcheck is pre-installed on ubuntu-latest runners (via apt).
         # infra/scripts/ is included because setup.sh + nuke.sh gate the
@@ -367,16 +348,43 @@ jobs:
           find tests/e2e infra/scripts -type f -name '*.sh' -print0 \
             | xargs -0 shellcheck --severity=warning
 
-      - if: always()
+      - if: ${{ needs.changes.outputs.scripts == 'true' }}
         name: Lint cleanup-trap hygiene (RFC #2873)
         run: bash tests/e2e/lint_cleanup_traps.sh
 
-      - if: always()
+      - if: ${{ needs.changes.outputs.scripts == 'true' }}
         name: Run E2E bash unit tests (no live infra)
         run: |
           bash tests/e2e/test_model_slug.sh
+          # molecule-core#1995 (#1994 follow-on): fail-direction proof for
+          # the A2A real-completion + byok-routing assertion helpers
+          # (lib/completion_assert.sh). Offline (no LLM, no network): it
+          # asserts an error-as-text payload FAILS the real-completion gate
+          # — the exact trap the historical shape-only `"kind":"text"`
+          # check missed. If a refactor weakens the gate to a shape check,
+          # this step goes red on every PR.
+          bash tests/e2e/test_completion_assert_unit.sh
+          # harden/e2e-staging-saas-failclosed: fail-direction proof for the
+          # E2E_REQUIRE_LIVE fail-closed-on-skip guard in
+          # test_staging_full_saas.sh. Offline (no LLM/network/provisioning):
+          # asserts the guard exits 5 when a live lifecycle did NOT run and
+          # passes when all milestones fired — so a refactor that lets the
+          # staging gate report green without a real provision→online→A2A
+          # cycle goes red on every PR.
+          bash tests/e2e/test_require_live_guard_unit.sh
+          # harden/enforce-ci-gates-core-v2 (PR #2286): fail-direction proof
+          # for the E2E_REQUIRE_LIVE zero-validated gate in
+          # test_priority_runtimes_e2e.sh (the REQUIRED `E2E API Smoke Test`).
+          # Offline (no LLM/network/provisioning): sources that script under
+          # its unit source-guard and drives the REAL evaluate_require_live_gate
+          # — asserts REQUIRE_LIVE=1 + zero validated → RED (the false-green
+          # trap), REQUIRE_LIVE=1 + >=1 validated → GREEN, and REQUIRE_LIVE
+          # unset + zero validated → GREEN (loud skip). CI can't provision a
+          # live arm to prove this, so this unit test IS the regression gate:
+          # a revert of the zero-validated→RED logic goes red on every PR.
+          bash tests/e2e/test_require_live_priority_gate_unit.sh
 
-      - if: always()
+      - if: ${{ needs.changes.outputs.scripts == 'true' }}
         name: Test ECR promote-tenant-image script (mock-driven, no live infra)
         # Covers scripts/promote-tenant-image.sh — the codified
         # :staging-latest → :latest ECR promote + tenant fleet redeploy
@@ -386,7 +394,7 @@ jobs:
         run: |
           bash scripts/test-promote-tenant-image.sh
 
-      - if: always()
+      - if: ${{ needs.changes.outputs.scripts == 'true' }}
         name: Shellcheck promote-tenant-image script
         # scripts/ is excluded from the bulk shellcheck pass above (legacy
         # SC3040/SC3043 cleanup pending). Run shellcheck explicitly on
@@ -399,150 +407,97 @@ jobs:
 
   # mc#959 root-fix (sre)
 
-  canvas-deploy-reminder:
-    name: Canvas Deploy Reminder
-    runs-on: ubuntu-latest
-    # mc#774 root-fix: added job-level `if:` so ci-required-drift.py's
-    # ci_job_names() detects this as github.ref-gated and skips it from F1.
-    # The step-level exit 0 handles the "not main push" case; the job-level
-    # `if:` makes the gating explicit so the drift script sees it.
-    # Runs on both main and staging pushes; step exits 0 when not applicable.
+  canvas-deploy-status:
+    # core#2226: replaces the old advisory "Canvas Deploy Reminder". The canvas
+    # image now has a real ORDERED auto-deploy (publish-canvas-image.yml:
+    # build → push :staging-<sha> → wait green main CI → promote :latest by
+    # digest), and docker-compose pins via CANVAS_IMAGE_TAG. There is no longer
+    # a manual "go run docker compose pull by hand" step to remind operators
+    # about — so this job just records, on a canvas-touching main push, that the
+    # ordered deploy is handling it (and where to watch), instead of prescribing
+    # a manual action that determinism made obsolete.
+    name: Canvas Deploy Status
+    runs-on: docker-host
+    # Job-level `if:` so ci-required-drift.py's ci_job_names() detects this as
+    # github.ref-gated and skips it from the required-context F1 set (mc#1982).
+    # Step-level exit 0 handles the "not a canvas main push" case.
     if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/staging' }}
     needs: [changes, canvas-build]
     steps:
-      - name: Write deploy reminder to step summary
+      - name: Record canvas ordered-deploy status
         env:
           COMMIT_SHA: ${{ github.sha }}
           CANVAS_CHANGED: ${{ needs.changes.outputs.canvas }}
           EVENT_NAME: ${{ github.event_name }}
           REF_NAME: ${{ github.ref }}
-          # github.server_url resolves via the workflow-level env override
-          # to the Gitea instance, so the RUN_URL points at the Gitea run
-          # page (not github.com). See feedback_act_runner_github_server_url.
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          # github.server_url resolves via the workflow-level env override to the
+          # Gitea instance, so RUN_URL points at the Gitea run page (not github.com).
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions
         run: |
           set -euo pipefail
           if [ "$CANVAS_CHANGED" != "true" ] || [ "$EVENT_NAME" != "push" ] || [ "$REF_NAME" != "refs/heads/main" ]; then
-            echo "Canvas deploy reminder not applicable for event=$EVENT_NAME ref=$REF_NAME canvas_changed=$CANVAS_CHANGED."
+            echo "Canvas deploy status not applicable for event=$EVENT_NAME ref=$REF_NAME canvas_changed=$CANVAS_CHANGED."
             exit 0
           fi
 
           # Write body to a temp file — avoids backtick escaping in shell.
-          cat > /tmp/deploy-reminder.md << 'BODY'
-          ## Canvas build passed — deploy required
+          cat > /tmp/deploy-status.md << 'BODY'
+          ## Canvas ordered deploy in progress — no manual action required
 
-          The `publish-canvas-image` workflow is now building a fresh Docker image
-          (`ghcr.io/molecule-ai/canvas:latest`) in the background.
+          This canvas-touching main push triggers `publish-canvas-image`, which now
+          runs an ORDERED, CI-gated deploy (core#2226) — the same shape as the
+          platform's deploy-production:
 
-          Once it completes (~3–5 min), apply on the host machine with:
-          ```bash
-          cd <runner-workspace>
-          git pull origin main
-          docker compose pull canvas && docker compose up -d canvas
-          ```
+          1. Build → push `molecule-ai/canvas:staging-<sha>` + `:staging-latest`.
+          2. Wait for green main CI on this SHA.
+          3. Promote `:latest` to the verified `:staging-<sha>` by digest.
 
-          If you need to rebuild from local source instead (e.g. testing unreleased
-          changes or a new `NEXT_PUBLIC_*` URL), use:
-          ```bash
-          docker compose build canvas && docker compose up -d canvas
-          ```
+          Tenants/hosts pin via `CANVAS_IMAGE_TAG` (default `latest` = the last
+          CI-green build), so a deploy is reproducible — no hand-run
+          `docker compose pull` needed. Watch the run in the canvas publish workflow.
           BODY
-          printf '\n> Posted automatically by CI · commit `%s` · [build log](%s)\n' \
-            "$COMMIT_SHA" "$RUN_URL" >> /tmp/deploy-reminder.md
+          printf '\n> Posted automatically by CI · commit `%s` · [publish workflow](%s)\n' \
+            "$COMMIT_SHA" "$RUN_URL" >> /tmp/deploy-status.md
 
-          # Gitea has no commit-comments API; write to GITHUB_STEP_SUMMARY,
-          # which both GitHub Actions and Gitea Actions render as the
-          # workflow run's summary page. (#75 / PR-D)
-          cat /tmp/deploy-reminder.md >> "$GITHUB_STEP_SUMMARY"
+          # Gitea has no commit-comments API; write to GITHUB_STEP_SUMMARY, which
+          # both GitHub and Gitea Actions render as the run's summary page.
+          cat /tmp/deploy-status.md >> "$GITHUB_STEP_SUMMARY"
 
   # Python Lint & Test — required check, always runs.
+  # Runtime Python moved to molecule-ai-workspace-runtime. Keep this context as
+  # a guard so branch protection still catches attempts to reintroduce an
+  # editable runtime copy under molecule-core/workspace/.
   python-lint:
     name: Python Lint & Test
     runs-on: ubuntu-latest
-    # Phase 4 (RFC #219 §1): confirmed green on main 2026-05-12.
     continue-on-error: false
-    env:
-      WORKSPACE_ID: test
-    defaults:
-      run:
-        working-directory: workspace
     steps:
-      - if: false
-        working-directory: .
-        run: echo "No workspace/** changes — skipping real lint+test; this job always runs to satisfy the required-check name on branch protection."
-      - if: always()
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - if: always()
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
-        with:
-          python-version: '3.11'
-          cache: pip
-          cache-dependency-path: workspace/requirements.txt
-      - if: always()
-        run: pip install -r requirements.txt pytest pytest-asyncio pytest-cov sqlalchemy>=2.0.0
-      # Coverage flags + fail-under floor moved into workspace/pytest.ini
-      # (issue #1817) so local `pytest` and CI use identical config.
-      - if: always()
-        run: python -m pytest --tb=short
-
-      - if: always()
-        name: Per-file critical-path coverage (MCP / inbox / auth)
-        # MCP-critical Python files have a per-file floor on top of the
-        # 86% total floor in pytest.ini. See issue #2790 for full rationale.
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Runtime SSOT guard
         run: |
-          set -e
-          PER_FILE_FLOOR=75
-          CRITICAL_FILES=(
-            "a2a_mcp_server.py"
-            "mcp_cli.py"
-            "a2a_tools.py"
-            "a2a_tools_inbox.py"
-            "inbox.py"
-            "platform_auth.py"
-          )
-
-          # pytest already wrote .coverage; emit a JSON view scoped to
-          # the critical files so jq/python can read the per-file pct
-          # without parsing tabular text.
-          INCLUDES=$(printf '*%s,' "${CRITICAL_FILES[@]}")
-          INCLUDES="${INCLUDES%,}"
-          python -m coverage json -o /tmp/critical-cov.json --include="$INCLUDES"
-
-          FAILED=0
-          for f in "${CRITICAL_FILES[@]}"; do
-            pct=$(jq -r --arg f "$f" '.files | to_entries | map(select(.key == $f)) | .[0].value.summary.percent_covered // "MISSING"' /tmp/critical-cov.json)
-            if [ "$pct" = "MISSING" ]; then
-              echo "::error file=workspace/$f::No coverage data — file may have moved or test exclusion mis-set."
-              FAILED=$((FAILED+1))
-              continue
-            fi
-            echo "$f: ${pct}%"
-            if awk "BEGIN{exit !($pct < $PER_FILE_FLOOR)}"; then
-              echo "::error file=workspace/$f::${pct}% < ${PER_FILE_FLOOR}% per-file floor (MCP critical path). See COVERAGE_FLOOR.md."
-              FAILED=$((FAILED+1))
-            fi
-          done
-
-          if [ "$FAILED" -gt 0 ]; then
-            echo ""
-            echo "$FAILED MCP critical-path file(s) below the ${PER_FILE_FLOOR}% per-file floor."
-            echo "These paths handle multi-tenant routing, auth tokens, and inbox dispatch."
-            echo "A coverage drop here is the same risk shape as Go-side tokens/secrets files"
-            echo "dropping below 10% (see COVERAGE_FLOOR.md). Either:"
-            echo "  (a) add tests to raise coverage back above ${PER_FILE_FLOOR}%, or"
-            echo "  (b) if this is unavoidable historical debt, file an issue and propose"
-            echo "      adjusting the floor with rationale in COVERAGE_FLOOR.md."
+          set -eu
+          if [ -d workspace ]; then
+            echo "::error file=workspace::Runtime source must live in molecule-ai-workspace-runtime, not molecule-core/workspace."
             exit 1
           fi
+          for f in scripts/build_runtime_package.py scripts/test_build_runtime_package.py; do
+            if [ -e "$f" ]; then
+              echo "::error file=$f::Legacy build-from-workspace packaging script must not be restored."
+              exit 1
+            fi
+          done
+          echo "Runtime SSOT guard passed; core consumes the standalone runtime package."
 
   all-required:
     # Aggregator sentinel — RFC internal#219 §2 (Phase 4 — closes internal#286).
     #
-    # Single stable required-status name that branch protection points at;
-    # CI churns underneath in `needs:` without any protection edits. Mirrors
-    # the molecule-controlplane Phase 2a impl shipped in CP PR#112 and
-    # referenced by `internal#286` ("Phase 4 is a single small PR... mirrors
-    # CP's existing one").
+    # Emits `CI / all-required (<event>)` where <event> is the workflow trigger
+    # (e.g. `CI / all-required (pull_request)`, `CI / all-required (push)`).
+    # Branch protection requires the event-suffixed name —
+    # requiring `CI / all-required` (bare, no suffix) silently blocks all merges
+    # because Gitea treats absent status contexts as pending (not skipped), and
+    # no workflow emits the bare name. BP requires
+    # `CI / all-required (pull_request)` per issue #1473.
     #
     # Closes the failure mode where status_check_contexts on molecule-core/main
     # only listed `Secret scan` + `sop-tier-check` (the 2 meta-gates), so real
@@ -550,104 +505,91 @@ jobs:
     # red silently merged through. See internal#286 for the three concrete
     # tonight-of-2026-05-11 incidents that prompted the emergency bump.
     #
-    # This job deliberately has no `needs:`. Gitea 1.22/act_runner can mark a
-    # job-level `if: always()` + `needs:` sentinel as skipped before upstream
-    # jobs settle, leaving branch protection with a permanent pending
-    # `CI / all-required` context. Instead, this independent sentinel polls the
-    # required commit-status contexts for this SHA and fails if any fail, skip,
-    # or never emit.
+    # ── 2026-06-01 CI-scheduler-overload fix (fix/ci-scheduler-fanout) ──
+    # PREVIOUS shape: a poll-gate that ran detect-changes then LOOPED on
+    # `GET /commits/{sha}/statuses` every 15s for up to 40 min, occupying a
+    # `ci-meta` executor slot the entire time it waited for upstream jobs.
+    # With only 2 ci-meta runners, that poll-loop squatted half the lane on
+    # every PR — a confirmed throughput sink in the live RCA (two concurrent
+    # `JOB-all-required` containers observed pinning the lane). The polling
+    # design existed only to dodge the Gitea `needs:` + `if: always()` bug,
+    # where an always()-guarded sentinel could be marked skipped before
+    # upstream jobs settled (leaving BP pending forever).
     #
-    # canvas-deploy-reminder is intentionally NOT included in all-required.needs.
-    # It is an informational main-push reminder, not a PR quality gate. Keeping
-    # it in this dependency list lets a skipped reminder skip the required
-    # sentinel before the `always()` guard can emit a branch-protection status.
+    # NEW shape: a plain `needs:` aggregator with NO polling loop. This is
+    # safe here — and was NOT safe at the time the poller was written —
+    # because every aggregated CI job now gates its real work PER-STEP
+    # (`if: needs.changes.outputs.* != 'true'`) rather than at the JOB level.
+    # A per-step-gated job always reaches a terminal SUCCESS (it no-ops its
+    # expensive steps but the job itself still completes), so it is never
+    # `skipped`. Plain `needs:` (WITHOUT `if: always()`) works correctly on
+    # Gitea 1.22.6 / act_runner v0.6.1 — only `needs:` + `if: always()` is
+    # broken (feedback_gitea_needs_works_only_ifalways_broken). We therefore
+    # use plain `needs:` + an explicit per-need result check (NOT
+    # `if: always()`); if any need fails/errors, Gitea never starts this job
+    # and BP sees `CI / all-required` go red via the failed dependency
+    # propagation — exactly the gate we want, with zero runner-squat.
     #
+    # The `needs:` list MUST stay in lockstep with ci-required-drift.py's
+    # F1 check (`ci_job_names()` = every job MINUS the sentinel MINUS jobs
+    # whose `if:` gates on github.event_name/github.ref). canvas-deploy-
+    # reminder is event-gated (`if: github.ref == refs/heads/{main,staging}`)
+    # so it is intentionally EXCLUDED — it skips on PRs and a `needs:` on a
+    # skipped job would never let the sentinel run. If a new always-running
+    # CI job is added, add it here too or ci-required-drift F1 will flag it.
+    #
+    # Stays on the dedicated `ci-meta` lane (no docker work, so the
+    # docker-host-pin lint does not apply), but now the job is sub-second:
+    # it only inspects already-settled `needs.*.result` values, so it frees
+    # the slot immediately instead of holding it for the whole CI duration.
+    #
+    needs:
+      - changes
+      - platform-build
+      - canvas-build
+      - shellcheck
+      - python-lint
     continue-on-error: false
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
+    runs-on: ci-meta
+    timeout-minutes: 5
     steps:
-      - name: Wait for required CI contexts
+      - name: Verify all aggregated CI jobs succeeded
+        # NO polling, NO API call, NO checkout. Because this job lists the
+        # aggregated jobs under `needs:` (without `if: always()`), Gitea only
+        # starts it once every need has reached SUCCESS — a failed/errored
+        # need short-circuits the job and propagates red to the
+        # `CI / all-required` context. This explicit check is a
+        # belt-and-suspenders assertion + a readable run summary; the real
+        # gating is the `needs:` edge itself.
         env:
-          GITEA_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          API_ROOT: ${{ github.server_url }}/api/v1
-          REPOSITORY: ${{ github.repository }}
-          COMMIT_SHA: ${{ github.sha }}
-          EVENT_NAME: ${{ github.event_name }}
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          PLATFORM_RESULT: ${{ needs.platform-build.result }}
+          CANVAS_RESULT: ${{ needs.canvas-build.result }}
+          SHELLCHECK_RESULT: ${{ needs.shellcheck.result }}
+          PYTHON_LINT_RESULT: ${{ needs.python-lint.result }}
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          import json
-          import os
-          import sys
-          import time
-          import urllib.error
-          import urllib.request
-
-          token = os.environ["GITEA_TOKEN"]
-          api_root = os.environ["API_ROOT"].rstrip("/")
-          repo = os.environ["REPOSITORY"]
-          sha = os.environ["COMMIT_SHA"]
-          event = os.environ["EVENT_NAME"]
-          required = [
-              f"CI / Detect changes ({event})",
-              f"CI / Platform (Go) ({event})",
-              f"CI / Canvas (Next.js) ({event})",
-              f"CI / Shellcheck (E2E scripts) ({event})",
-              f"CI / Python Lint & Test ({event})",
-          ]
-          terminal_bad = {"failure", "error"}
-          deadline = time.time() + 40 * 60
-          last_summary = None
-
-          def fetch_statuses():
-              statuses = []
-              for page in range(1, 6):
-                  url = f"{api_root}/repos/{repo}/commits/{sha}/statuses?page={page}&limit=100"
-                  req = urllib.request.Request(url, headers={"Authorization": f"token {token}"})
-                  with urllib.request.urlopen(req, timeout=10) as resp:
-                      chunk = json.load(resp)
-                  if not chunk:
-                      break
-                  statuses.extend(chunk)
-              latest = {}
-              for item in statuses:
-                  ctx = item.get("context")
-                  if not ctx:
-                      continue
-                  prev = latest.get(ctx)
-                  if prev is None or (item.get("updated_at") or item.get("created_at") or "") >= (prev.get("updated_at") or prev.get("created_at") or ""):
-                      latest[ctx] = item
-              return latest
-
-          while True:
-              try:
-                  latest = fetch_statuses()
-              except (TimeoutError, OSError, urllib.error.URLError) as exc:
-                  if time.time() >= deadline:
-                      print(f"FAIL: status polling did not recover before deadline: {exc}", file=sys.stderr)
-                      sys.exit(1)
-                  print(f"WARN: status poll failed, retrying: {exc}", flush=True)
-                  time.sleep(15)
-                  continue
-              states = {ctx: (latest.get(ctx) or {}).get("status") or (latest.get(ctx) or {}).get("state") or "missing" for ctx in required}
-              summary = ", ".join(f"{ctx}={state}" for ctx, state in states.items())
-              if summary != last_summary:
-                  print(summary, flush=True)
-                  last_summary = summary
-              bad = {ctx: state for ctx, state in states.items() if state in terminal_bad}
-              if bad:
-                  print("FAIL: required CI context failed:", file=sys.stderr)
-                  for ctx, state in bad.items():
-                      desc = (latest.get(ctx) or {}).get("description") or ""
-                      print(f"  - {ctx}: {state} {desc}", file=sys.stderr)
-                  sys.exit(1)
-              if all(state == "success" for state in states.values()):
-                  print(f"OK: all {len(required)} required CI contexts succeeded")
-                  sys.exit(0)
-              if time.time() >= deadline:
-                  print("FAIL: timed out waiting for required CI contexts:", file=sys.stderr)
-                  for ctx, state in states.items():
-                      print(f"  - {ctx}: {state}", file=sys.stderr)
-                  sys.exit(1)
-              time.sleep(15)
-          PY
+          fail=0
+          check() {
+            name="$1"; result="$2"
+            printf 'CI / %s = %s\n' "$name" "$result"
+            # `success` is the only green terminal state we accept. A plain
+            # `needs:` job is only started when all needs succeed, so reaching
+            # this step already implies success — but assert explicitly so a
+            # future `if: always()` reintroduction (which WOULD let non-success
+            # through) fails loudly instead of silently passing the gate.
+            if [ "$result" != "success" ]; then
+              echo "::error::aggregated CI job '${name}' did not succeed (result=${result})"
+              fail=1
+            fi
+          }
+          check "Detect changes"        "$CHANGES_RESULT"
+          check "Platform (Go)"         "$PLATFORM_RESULT"
+          check "Canvas (Next.js)"      "$CANVAS_RESULT"
+          check "Shellcheck (E2E scripts)" "$SHELLCHECK_RESULT"
+          check "Python Lint & Test"    "$PYTHON_LINT_RESULT"
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::all-required: one or more aggregated CI jobs did not succeed"
+            exit 1
+          fi
+          echo "OK: all aggregated CI jobs succeeded — CI / all-required green."

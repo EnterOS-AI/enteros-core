@@ -9,11 +9,11 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/middleware"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/provisioner"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/registry"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/wsauth"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/middleware"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/registry"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wsauth"
 	"github.com/gin-gonic/gin"
 )
 
@@ -128,7 +128,7 @@ func discoverHostPeer(ctx context.Context, c *gin.Context, targetID string) {
 // of `callerID` and writes the JSON response (or an appropriate 404/503 error).
 func discoverWorkspacePeer(ctx context.Context, c *gin.Context, callerID, targetID string) {
 	var wsName, wsRuntime string
-	db.DB.QueryRowContext(ctx, `SELECT COALESCE(name,''), COALESCE(runtime,'langgraph') FROM workspaces WHERE id = $1`, targetID).Scan(&wsName, &wsRuntime)
+	db.DB.QueryRowContext(ctx, `SELECT COALESCE(name,''), COALESCE(runtime,'claude-code') FROM workspaces WHERE id = $1`, targetID).Scan(&wsName, &wsRuntime)
 
 	// External workspaces: return their registered URL.
 	// Rewrite 127.0.0.1/localhost → host.docker.internal ONLY when the
@@ -180,7 +180,7 @@ func writeExternalWorkspaceURL(ctx context.Context, c *gin.Context, callerID, ta
 	}
 	outURL := wsURL
 	var callerRuntime string
-	db.DB.QueryRowContext(ctx, `SELECT COALESCE(runtime,'langgraph') FROM workspaces WHERE id = $1`, callerID).Scan(&callerRuntime)
+	db.DB.QueryRowContext(ctx, `SELECT COALESCE(runtime,'claude-code') FROM workspaces WHERE id = $1`, callerID).Scan(&callerRuntime)
 	if !isExternalLikeRuntime(callerRuntime) {
 		outURL = strings.Replace(outURL, "127.0.0.1", "host.docker.internal", 1)
 		outURL = strings.Replace(outURL, "localhost", "host.docker.internal", 1)
@@ -203,8 +203,8 @@ func writeExternalWorkspaceURL(ctx context.Context, c *gin.Context, callerID, ta
 
 // Peers handles GET /registry/:id/peers
 //
-// Optional ``?q=<substring>`` filters the result by case-insensitive
-// substring match against ``name`` or ``role`` (#1038). Filtering is done
+// Optional “?q=<substring>“ filters the result by case-insensitive
+// substring match against “name“ or “role“ (#1038). Filtering is done
 // in Go after the DB read — keeps the SQL identical to the no-filter path
 // (no injection risk, no DB-driver collation surprises) at the cost of
 // loading the unfiltered set first. Acceptable because the peer set is
@@ -237,7 +237,17 @@ func (h *DiscoveryHandler) Peers(c *gin.Context) {
 
 	var peers []map[string]interface{}
 
-	// Siblings
+	// Siblings — workspaces sharing the caller's parent.
+	//
+	// #1953 cross-tenant isolation: the OLD code's else-branch handled the
+	// org-root caller (parent_id IS NULL) by returning EVERY workspace with
+	// parent_id IS NULL — i.e. every other tenant's org root, since the
+	// workspaces table has no org_id column. That leaked peer identities/URLs
+	// across tenants. An org root has no siblings inside its own org (each
+	// tenant is a distinct org root), so the org-root caller now gets an empty
+	// sibling set; its real peers are its children, returned below. Only the
+	// parent_id-bound branch enumerates siblings, and that is already scoped to
+	// one parent (one tenant).
 	if parentID.Valid {
 		siblings, _ := queryPeerMaps(`
 			SELECT w.id, w.name, COALESCE(w.role, ''), w.tier, w.status,
@@ -246,33 +256,44 @@ func (h *DiscoveryHandler) Peers(c *gin.Context) {
 			FROM workspaces w WHERE w.parent_id = $1 AND w.id != $2 AND w.status != 'removed'`,
 			parentID.String, workspaceID)
 		peers = append(peers, siblings...)
-	} else {
-		siblings, _ := queryPeerMaps(`
-			SELECT w.id, w.name, COALESCE(w.role, ''), w.tier, w.status,
-				   COALESCE(w.agent_card, 'null'::jsonb), COALESCE(w.url, ''),
-				   w.parent_id, w.active_tasks
-			FROM workspaces w WHERE w.parent_id IS NULL AND w.id != $1 AND w.status != 'removed'`,
-			workspaceID)
-		peers = append(peers, siblings...)
 	}
 
-	// Children
+	// Children — exclude self defensively. A child row whose parent_id
+	// equals the requesting workspaceID can never legitimately be the
+	// caller (a workspace can't be its own child), but a future data-
+	// integrity defect (e.g. self-loop introduced by a buggy register
+	// path) would otherwise smuggle the caller back into its own peer
+	// list. The agent then attempts `delegate_task(<own_id>)`, which
+	// either deadlocks _run_lock (sync path) or hits the platform's
+	// self-delegation 400 in a tight loop (#383). The `w.id != $2`
+	// clause makes self-delegation-via-peer-list impossible regardless
+	// of DB state.
 	children, _ := queryPeerMaps(`
 		SELECT w.id, w.name, COALESCE(w.role, ''), w.tier, w.status,
 			   COALESCE(w.agent_card, 'null'::jsonb), COALESCE(w.url, ''),
 			   w.parent_id, w.active_tasks
-		FROM workspaces w WHERE w.parent_id = $1 AND w.status != 'removed'`, workspaceID)
+		FROM workspaces w WHERE w.parent_id = $1 AND w.id != $2 AND w.status != 'removed'`,
+		workspaceID, workspaceID)
 	peers = append(peers, children...)
 
-	// Parent
+	// Parent — same defense-in-depth. A workspace whose parent_id points
+	// to itself is data corruption, but the peer-list endpoint must not
+	// propagate that corruption back to the agent as a "peer who is also
+	// you" entry.
 	if parentID.Valid {
 		parent, _ := queryPeerMaps(`
 			SELECT w.id, w.name, COALESCE(w.role, ''), w.tier, w.status,
 				   COALESCE(w.agent_card, 'null'::jsonb), COALESCE(w.url, ''),
 				   w.parent_id, w.active_tasks
-			FROM workspaces w WHERE w.id = $1 AND w.status != 'removed'`, parentID.String)
+			FROM workspaces w WHERE w.id = $1 AND w.id != $2 AND w.status != 'removed'`,
+			parentID.String, workspaceID)
 		peers = append(peers, parent...)
 	}
+
+	// #383 final-line defense: even if a future code path adds a query
+	// that doesn't filter self, strip the caller's own row before
+	// returning. Cheap O(n) over a peer set bounded at <50 rows.
+	peers = excludeSelfFromPeers(peers, workspaceID)
 
 	peers = filterPeersByQuery(peers, c.Query("q"))
 
@@ -280,6 +301,32 @@ func (h *DiscoveryHandler) Peers(c *gin.Context) {
 		peers = make([]map[string]interface{}, 0)
 	}
 	c.JSON(http.StatusOK, peers)
+}
+
+// excludeSelfFromPeers strips any peer entry whose “id“ equals
+// “workspaceID“ (the caller's own row). Final-line defense for #383
+// (self-delegation 400-loop on external workspaces): a peer-list that
+// includes the requester's own row is the root mechanism by which an
+// agent ends up delegating to itself. The pre-DB filters in Peers
+// already enforce `w.id != $caller` on each branch; this function
+// guarantees the contract holds regardless of which query path
+// returned the row, including future ones added without a self-filter.
+//
+// O(n) over a peer set bounded at <50 rows per `Peers` comment — well
+// below the hot-path overhead of the existing filterPeersByQuery.
+func excludeSelfFromPeers(peers []map[string]interface{}, workspaceID string) []map[string]interface{} {
+	if len(peers) == 0 {
+		return peers
+	}
+	out := make([]map[string]interface{}, 0, len(peers))
+	for _, p := range peers {
+		id, _ := p["id"].(string)
+		if id == workspaceID {
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
 }
 
 // filterPeersByQuery returns peers whose name or role case-insensitively
@@ -292,8 +339,8 @@ func filterPeersByQuery(peers []map[string]interface{}, q string) []map[string]i
 	needle := strings.ToLower(q)
 	out := make([]map[string]interface{}, 0, len(peers))
 	for _, p := range peers {
-		name, _ := p["name"].(string)  // nil → "" — safe on empty-role rows
-		role, _ := p["role"].(string)  // nil → "" — queryPeerMaps sets nil when DB role is empty
+		name, _ := p["name"].(string) // nil → "" — safe on empty-role rows
+		role, _ := p["role"].(string) // nil → "" — queryPeerMaps sets nil when DB role is empty
 		if strings.Contains(strings.ToLower(name), needle) ||
 			strings.Contains(strings.ToLower(role), needle) {
 			out = append(out, p)
@@ -348,6 +395,9 @@ func queryPeerMaps(query string, args ...interface{}) ([]map[string]interface{},
 
 		result = append(result, peer)
 	}
+	if err := rows.Err(); err != nil {
+		log.Printf("queryPeerMaps rows.Err: %v", err)
+	}
 	return result, nil
 }
 
@@ -372,28 +422,33 @@ func (h *DiscoveryHandler) CheckAccess(c *gin.Context) {
 // workspaces with tokens must present a matching Bearer, token binding
 // is strict (A's token cannot authenticate caller B).
 //
-// Fail-open on DB hiccups. Unlike secrets.Values (which returns plaintext
-// secrets and must fail closed), discovery only exposes peer URLs that
-// are already behind the existing `CanCommunicate` hierarchy check — a
-// momentary DB outage shouldn't take agent-to-agent discovery offline.
+// (harden/no-fail-open-auth) Fails CLOSED on DB error. This used to return nil
+// (allow) on a HasAnyLiveToken hiccup "because discovery only exposes peer URLs
+// already behind CanCommunicate" — but the CTO "nothing fail-open" directive is
+// absolute, and a request must never gain access because the auth datastore is
+// unreachable. A datastore error now writes 503 (availability tradeoff that
+// grants NO access) and returns a non-nil error; the caller already does
+// `if err != nil { return }` so the 503 body is what the client sees.
 func validateDiscoveryCaller(ctx context.Context, c *gin.Context, workspaceID string) error {
 	hasLive, err := wsauth.HasAnyLiveToken(ctx, db.DB, workspaceID)
 	if err != nil {
-		log.Printf("wsauth: discovery HasAnyLiveToken(%s) failed: %v — allowing request", workspaceID, err)
-		return nil
+		log.Printf("wsauth: discovery HasAnyLiveToken(%s): datastore lookup failed (returning 503): %v", workspaceID, err)
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error": "platform datastore unavailable — retry shortly",
+			"code":  "platform_unavailable",
+		})
+		return errors.New("auth datastore unavailable")
 	}
 	if !hasLive {
 		return nil // legacy / pre-upgrade
 	}
-	// Tier-1b dev-mode hatch — same escape hatch AdminAuth and
-	// WorkspaceAuth apply on a local Docker setup. Without this, the
-	// canvas Details tab can never load peers for a workspace that has
-	// registered its live token, producing the 401 the user sees.
-	// Gated by MOLECULE_ENV=development + empty ADMIN_TOKEN, so SaaS
-	// production stays strict.
-	if middleware.IsDevModeFailOpen() {
-		return nil
-	}
+	// (harden/no-fail-open-auth) The former dev-mode escape hatch that
+	// returned nil (allow) here when MOLECULE_ENV=dev + ADMIN_TOKEN unset
+	// has been REMOVED. Discovery callers must present a verified CP
+	// session or a valid bearer in every environment. Local dev now
+	// authenticates the Canvas with a provisioned ADMIN_TOKEN /
+	// NEXT_PUBLIC_ADMIN_TOKEN (see scripts/dev-start.sh), so the Details
+	// tab loads peers with a real credential rather than via fail-open.
 
 	// Try session cookie auth first (SaaS canvas path).
 	// verifiedCPSession returns (valid, presented):

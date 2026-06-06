@@ -48,7 +48,6 @@ set -euo pipefail
 # workflow-level jq install can fail on runners with network restrictions
 # (GitHub releases not reachable from some runner networks — infra#241
 # follow-up). This fallback is idempotent — no-op when jq is already on PATH.
-# SOP_FAIL_OPEN=1 makes this always exit 0 so CI never blocks on jq absence.
 if ! command -v jq >/dev/null 2>&1; then
   echo "::notice::jq not found on PATH — attempting install..."
   _jq_installed="no"
@@ -67,12 +66,6 @@ if ! command -v jq >/dev/null 2>&1; then
   if ! command -v jq >/dev/null 2>&1; then
     echo "::error::jq installation failed — apt-get and GitHub binary both failed."
     echo "::error::sop-tier-check requires jq for all JSON API parsing."
-    # SOP_FAIL_OPEN=1 is set in the workflow step's env — makes script always
-    # exit 0 so CI never blocks. The SOP-6 tier review gate remains enforced.
-    if [ "${SOP_FAIL_OPEN:-}" = "1" ]; then
-      echo "::warning::SOP_FAIL_OPEN=1 — exiting 0 so CI does not block."
-      exit 0
-    fi
     exit 1
   fi
 fi
@@ -101,18 +94,22 @@ echo "::notice::tier-check start: repo=$OWNER/$NAME pr=$PR_NUMBER author=$PR_AUT
 # cause the script to exit prematurely when the token is empty/invalid — the
 # if check below handles that case gracefully. Without || true, a 401 from an
 # empty/invalid token causes jq to exit 1, triggering set -e and exiting the
-# entire script before SOP_FAIL_OPEN can be evaluated (the check is in the jq-
-# install block; if jq is already on PATH, that block is skipped entirely).
+# entire script before the error can be logged.
 WHOAMI=$(curl -sS -H "$AUTH" "${API}/user" | jq -r '.login // ""') || true
 if [ -z "$WHOAMI" ]; then
   echo "::error::GITEA_TOKEN cannot resolve a user via /api/v1/user — check the token scope and that the secret is wired correctly."
-  if [ "${SOP_FAIL_OPEN:-}" = "1" ]; then
-    echo "::warning::SOP_FAIL_OPEN=1 — exiting 0 so CI does not block."
-    exit 0
-  fi
   exit 1
 fi
 echo "::notice::token resolves to user: $WHOAMI"
+
+# 0.5 Read PR head SHA so we can reject stale approvals after head moves
+# (internal#816). Reviews carry the commit_id they were submitted against.
+HEAD_SHA=$(curl -sS -H "$AUTH" "${API}/repos/${OWNER}/${NAME}/pulls/${PR_NUMBER}" | jq -r '.head.sha // ""') || true
+if [ -z "$HEAD_SHA" ]; then
+  echo "::error::Failed to fetch PR head SHA — token may be invalid."
+  exit 1
+fi
+debug "pr-head-sha=$HEAD_SHA"
 
 # 1. Read tier label. || true ensures set -euo pipefail does not abort the
 # script if curl or jq fails (e.g. 401 from empty token).
@@ -202,10 +199,6 @@ if [ "${SOP_DEBUG:-}" = "1" ]; then
 fi
 if [ "$_HTTP_EXIT" -ne 0 ] || [ "$HTTP_CODE" != "200" ]; then
   echo "::error::GET /orgs/${OWNER}/teams failed (curl exit=$_HTTP_EXIT HTTP=$HTTP_CODE) — token may lack read:org scope or be invalid."
-  if [ "${SOP_FAIL_OPEN:-}" = "1" ]; then
-    echo "::warning::SOP_FAIL_OPEN=1 — exiting 0 so CI does not block."
-    exit 0
-  fi
   exit 1
 fi
 
@@ -252,20 +245,16 @@ done
 
 # 5. Read approving reviewers. set +e disables set -e temporarily so that curl
 # failures (e.g. empty/invalid token → HTTP 401) do not abort the script before
-# SOP_FAIL_OPEN is evaluated. set -e is restored immediately after.
+# set -e is restored immediately after.
 set +e
 REVIEWS=$(curl -sS -H "$AUTH" "${API}/repos/${OWNER}/${NAME}/pulls/${PR_NUMBER}/reviews")
 _REVIEWS_EXIT=$?
 set -e
 if [ $_REVIEWS_EXIT -ne 0 ] || [ -z "$REVIEWS" ]; then
   echo "::error::Failed to fetch reviews (curl exit=$_REVIEWS_EXIT) — token may be invalid or unreachable."
-  if [ "${SOP_FAIL_OPEN:-}" = "1" ]; then
-    echo "::warning::SOP_FAIL_OPEN=1 — exiting 0 so CI does not block."
-    exit 0
-  fi
   exit 1
 fi
-APPROVERS=$(echo "$REVIEWS" | jq -r '[.[] | select(.state=="APPROVED") | .user.login] | unique | .[]') || true
+APPROVERS=$(echo "$REVIEWS" | jq -r --arg head_sha "$HEAD_SHA" '[.[] | select(.state=="APPROVED" and .commit_id == $head_sha) | .user.login] | unique | .[]') || true
 if [ -z "$APPROVERS" ]; then
   echo "::error::No approving reviews on this PR. Set SOP_DEBUG=1 and re-run for diagnostics."
   exit 1
@@ -277,47 +266,74 @@ debug "approvers: $(echo "$APPROVERS" | tr '\n' ' ')"
 # Pre/post spaces ensure case patterns *${_t}* match even when the name
 # is the first or last entry (bash case *word* needs delimiters on both sides).
 #
-# FALLBACK: if ALL team probes return 403 (token lacks read:org scope),
-# fall back to /orgs/{org}/members/{user}. This returns 204 for any org
-# member — a superset of team membership. Accepting it as a fallback means
-# the gate passes when the token is scoped to repo+user only (core-bot PAT).
-# This is safe because: (a) org membership is a prerequisite for every
-# eligible team; (b) the AND-composition of internal#189 still requires
-# multiple independent approvers; (c) any token with read:repository can
-# see the approving reviews, so bypass requires a colluding approver.
+# FAIL-CLOSED AUTHORIZATION (security: SOP tier gate is an AUTHORIZATION gate).
+#
+# This used to fall back to /orgs/{org}/members/{user} whenever every team
+# probe failed and credit any org member as a member of EVERY queried team.
+# That was a privilege-escalation: org membership is NOT team membership, so
+# a 403/visibility/token-scope gap on the team probes silently promoted a
+# plain org member to satisfy tier:high (ceo). An inability-to-verify became
+# an authorization GRANT. The fallback is REMOVED — org membership must never
+# satisfy a team-gated tier.
+#
+# A team-membership probe has exactly three meaningful outcomes:
+#   200 / 204  → the user IS a member of that team       (credit it)
+#   404        → the user is definitively NOT a member    (no credit, verified)
+#   anything else (403 / 401 / 5xx / curl failure / non-numeric)
+#              → membership CANNOT be read                 (cannot-verify)
+#
+# Per the dev-sop fail-closed rule (inability-to-verify = failure, never a
+# pass — and here, never an authorization grant), a cannot-verify outcome on
+# ANY probe is a HARD infra failure: we publish a loud cannot-verify error and
+# exit non-zero. We do NOT proceed to evaluate the tier expression on a partial
+# / unverifiable membership picture, because doing so could let an unverifiable
+# approver's clause silently fail-or-pass on incomplete data. Fix the token
+# scope (read:organization) or the runner network — not the gate.
 declare -A APPROVER_TEAMS
+_verify_failed=""   # accumulates "<user>:<team>(HTTP <code>)" for probes we could not read
 for U in $APPROVERS; do
   [ "$U" = "$PR_AUTHOR" ] && debug "skip self-review by $U" && continue
-  _any_team_success="no"
   for T in "${!TEAM_ID[@]}"; do
     ID="${TEAM_ID[$T]}"
+    set +e
     CODE=$(curl -sS -o /dev/null -w '%{http_code}' -H "$AUTH" \
       "${API}/teams/${ID}/members/${U}")
-    debug "probe: $U in team $T (id=$ID) → HTTP $CODE"
-    if [ "$CODE" = "200" ] || [ "$CODE" = "204" ]; then
-      APPROVER_TEAMS[$U]="${APPROVER_TEAMS[$U]:- } ${APPROVER_TEAMS[$U]:+ }$T "
-      debug "$U qualifies for team $T"
-      _any_team_success="yes"
+    _curl_exit=$?
+    set -e
+    debug "probe: $U in team $T (id=$ID) → HTTP $CODE (curl exit=$_curl_exit)"
+    if [ "$_curl_exit" -ne 0 ]; then
+      # curl itself failed (DNS, connection refused, timeout) — unreachable.
+      _verify_failed="${_verify_failed}${_verify_failed:+, }${U}:${T}(curl exit ${_curl_exit})"
+      continue
     fi
-  done
-  # Fallback: if every team probe returned 403, try org membership.
-  # "??" teams were never resolved to IDs so they never entered the loop.
-  # If the user is an org member, credit them as being in each queried team
-  # (engineers, managers, ceo are all org-level). This is safe because org
-  # membership is a prerequisite for all three, and bypass requires a colluding
-  # approver (same risk as before the AND-composition).
-  if [ "$_any_team_success" = "no" ]; then
-    ORG_CODE=$(curl -sS -o /dev/null -w '%{http_code}' -H "$AUTH" \
-      "${API}/orgs/${OWNER}/members/${U}")
-    debug "probe: $U in org $OWNER (fallback) → HTTP $ORG_CODE"
-    if [ "$ORG_CODE" = "204" ]; then
-      for T in "${!TEAM_ID[@]}"; do
+    case "$CODE" in
+      200|204)
         APPROVER_TEAMS[$U]="${APPROVER_TEAMS[$U]:- } ${APPROVER_TEAMS[$U]:+ }$T "
-      done
-      debug "$U credited as org member for all queried teams (fallback — token may lack read:org)"
-    fi
-  fi
+        debug "$U qualifies for team $T"
+        ;;
+      404)
+        # Definitively not a member of this team — a verified negative.
+        debug "$U is NOT a member of team $T (verified 404)"
+        ;;
+      *)
+        # 403/401/5xx/etc — membership is unreadable. Do NOT treat as "not a
+        # member" and do NOT fall back to org membership. This is cannot-verify.
+        _verify_failed="${_verify_failed}${_verify_failed:+, }${U}:${T}(HTTP ${CODE})"
+        ;;
+    esac
+  done
 done
+
+# Fail-closed: if ANY membership probe could not be read, we cannot make an
+# authorization decision. Publish a loud cannot-verify / infra-failed status
+# and exit non-zero. Never grant the tier on unverifiable membership.
+if [ -n "$_verify_failed" ]; then
+  echo "::error::sop-tier-check CANNOT VERIFY team membership — gate FAILS CLOSED."
+  echo "::error::Unreadable membership probe(s): ${_verify_failed}"
+  echo "::error::A team-membership probe returned 403/401/5xx (or curl failed). The SOP tier gate is an authorization gate; an inability to verify team membership is treated as a FAILURE, never a pass. Org membership is NOT team membership and is never credited as a fallback."
+  echo "::error::Fix: ensure GITEA_TOKEN (SOP_TIER_CHECK_TOKEN) has read:organization scope and the Gitea API is reachable from the runner, then re-run. Do NOT relax this gate."
+  exit 1
+fi
 
 # 7. Evaluate the tier expression.
 #

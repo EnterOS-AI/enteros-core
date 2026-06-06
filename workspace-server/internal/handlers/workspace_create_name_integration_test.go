@@ -41,7 +41,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"os"
 	"testing"
 
 	"github.com/google/uuid"
@@ -59,10 +58,7 @@ import (
 // only those.
 func integrationDB_WorkspaceCreateName(t *testing.T) *sql.DB {
 	t.Helper()
-	url := os.Getenv("INTEGRATION_DB_URL")
-	if url == "" {
-		t.Skip("INTEGRATION_DB_URL not set; skipping (see file header)")
-	}
+	url := requireIntegrationDBURL(t)
 	conn, err := sql.Open("postgres", url)
 	if err != nil {
 		t.Fatalf("open: %v", err)
@@ -103,13 +99,13 @@ func cleanupTestRows(t *testing.T, conn *sql.DB, namePrefix string) {
 // TestIntegration_WorkspaceCreate_NameRetry_AutoSuffixesOnCollision
 // exercises the helper end-to-end against a real Postgres:
 //
-//   1. INSERT a row with name "<prefix>-Repro" — succeeds.
-//   2. Run insertWorkspaceWithNameRetry with the same name —
-//      partial-unique violation fires, helper retries with
-//      " (2)", that succeeds.
-//   3. SELECT the row by id, confirm name = "<prefix>-Repro (2)".
-//   4. Run helper AGAIN — second collision, helper retries with
-//      " (3)".
+//  1. INSERT a row with name "<prefix>-Repro" — succeeds.
+//  2. Run insertWorkspaceWithNameRetry with the same name —
+//     partial-unique violation fires, helper retries with
+//     " (2)", that succeeds.
+//  3. SELECT the row by id, confirm name = "<prefix>-Repro (2)".
+//  4. Run helper AGAIN — second collision, helper retries with
+//     " (3)".
 //
 // This is the live-test that proves the partial-index behaviour
 // matches the migration's intent — sqlmock cannot reach this depth.
@@ -130,9 +126,9 @@ func TestIntegration_WorkspaceCreate_NameRetry_AutoSuffixesOnCollision(t *testin
 	// targets + the NOT NULL columns required by the schema).
 	firstID := uuid.New().String()
 	if _, err := conn.ExecContext(ctx, `
-		INSERT INTO workspaces (id, name, tier, runtime, awareness_namespace, status)
-		VALUES ($1, $2, 2, 'claude-code', $3, 'provisioning')
-	`, firstID, baseName, "workspace:"+firstID); err != nil {
+		INSERT INTO workspaces (id, name, tier, runtime, status)
+		VALUES ($1, $2, 2, 'claude-code', 'provisioning')
+	`, firstID, baseName); err != nil {
 		t.Fatalf("seed first row: %v", err)
 	}
 
@@ -145,10 +141,10 @@ func TestIntegration_WorkspaceCreate_NameRetry_AutoSuffixesOnCollision(t *testin
 	}
 	secondID := uuid.New().String()
 	query := `
-		INSERT INTO workspaces (id, name, tier, runtime, awareness_namespace, status)
-		VALUES ($1, $2, 2, 'claude-code', $3, 'provisioning')
+		INSERT INTO workspaces (id, name, tier, runtime, status)
+		VALUES ($1, $2, 2, 'claude-code', 'provisioning')
 	`
-	args := []any{secondID, baseName, "workspace:" + secondID}
+	args := []any{secondID, baseName}
 	persistedName, finalTx, err := insertWorkspaceWithNameRetry(
 		ctx, tx, beginTx, baseName, 1, query, args,
 	)
@@ -179,7 +175,7 @@ func TestIntegration_WorkspaceCreate_NameRetry_AutoSuffixesOnCollision(t *testin
 		t.Fatalf("begin tx3: %v", err)
 	}
 	thirdID := uuid.New().String()
-	args3 := []any{thirdID, baseName, "workspace:" + thirdID}
+	args3 := []any{thirdID, baseName}
 	persistedName3, finalTx3, err := insertWorkspaceWithNameRetry(
 		ctx, tx3, beginTx, baseName, 1, query, args3,
 	)
@@ -216,9 +212,9 @@ func TestIntegration_WorkspaceCreate_NameRetry_TombstonedRowDoesNotCollide(t *te
 	// Seed a row, then tombstone it.
 	firstID := uuid.New().String()
 	if _, err := conn.ExecContext(ctx, `
-		INSERT INTO workspaces (id, name, tier, runtime, awareness_namespace, status)
-		VALUES ($1, $2, 2, 'claude-code', $3, 'removed')
-	`, firstID, baseName, "workspace:"+firstID); err != nil {
+		INSERT INTO workspaces (id, name, tier, runtime, status)
+		VALUES ($1, $2, 2, 'claude-code', 'removed')
+	`, firstID, baseName); err != nil {
 		t.Fatalf("seed tombstoned row: %v", err)
 	}
 
@@ -231,10 +227,10 @@ func TestIntegration_WorkspaceCreate_NameRetry_TombstonedRowDoesNotCollide(t *te
 	}
 	secondID := uuid.New().String()
 	query := `
-		INSERT INTO workspaces (id, name, tier, runtime, awareness_namespace, status)
-		VALUES ($1, $2, 2, 'claude-code', $3, 'provisioning')
+		INSERT INTO workspaces (id, name, tier, runtime, status)
+		VALUES ($1, $2, 2, 'claude-code', 'provisioning')
 	`
-	args := []any{secondID, baseName, "workspace:" + secondID}
+	args := []any{secondID, baseName}
 	persistedName, finalTx, err := insertWorkspaceWithNameRetry(
 		ctx, tx, beginTx, baseName, 1, query, args,
 	)

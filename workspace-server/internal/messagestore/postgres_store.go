@@ -15,6 +15,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"log"
 	"path"
 	"strings"
 	"time"
@@ -391,7 +392,9 @@ func extractFilesFromResponse(body json.RawMessage) []ChatAttachment {
 	var probe struct {
 		Result json.RawMessage `json:"result"`
 	}
-	_ = json.Unmarshal(body, &probe)
+	if err := json.Unmarshal(body, &probe); err != nil {
+		log.Printf("messagestore: unmarshal probe body: %v", err)
+	}
 	feed := body
 	if len(probe.Result) > 0 {
 		trimmed := bytesTrimSpace(probe.Result)

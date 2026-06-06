@@ -49,6 +49,10 @@ func TestDiscover_WorkspaceNotFound_WithCaller(t *testing.T) {
 	setupTestRedis(t)
 	handler := NewDiscoveryHandler()
 
+	// validateDiscoveryCaller probes HasAnyLiveToken(callerID) first;
+	// grandfather (count=0) so the bearer-less request is allowed through.
+	seedDiscoveryGrandfather(mock, "ws-caller")
+
 	// CanCommunicate will need DB lookups — both workspace name lookups
 	// For the access check: caller lookup succeeds, target lookup fails
 	mock.ExpectQuery("SELECT id, parent_id FROM workspaces WHERE id =").
@@ -113,6 +117,9 @@ func TestPeers_WithParent(t *testing.T) {
 	setupTestRedis(t)
 	handler := NewDiscoveryHandler()
 
+	// validateDiscoveryCaller probes HasAnyLiveToken(:id) first; grandfather.
+	seedDiscoveryGrandfather(mock, "ws-sibling-1")
+
 	// Expect parent_id lookup for the requesting workspace
 	mock.ExpectQuery("SELECT parent_id FROM workspaces WHERE id =").
 		WithArgs("ws-sibling-1").
@@ -125,14 +132,14 @@ func TestPeers_WithParent(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows(peerCols).
 			AddRow("ws-sibling-2", "Sibling Two", "worker", 1, "online", []byte("null"), "http://localhost:8002", "ws-parent", 0))
 
-	// Expect children query
-	mock.ExpectQuery("SELECT w.id, w.name.*WHERE w.parent_id = \\$1 AND w.status").
-		WithArgs("ws-sibling-1").
+	// Expect children query — #383 added explicit `w.id != $2` self-filter
+	mock.ExpectQuery("SELECT w.id, w.name.*WHERE w.parent_id = \\$1 AND w.id != \\$2 AND w.status").
+		WithArgs("ws-sibling-1", "ws-sibling-1").
 		WillReturnRows(sqlmock.NewRows(peerCols))
 
-	// Expect parent query
-	mock.ExpectQuery("SELECT w.id, w.name.*WHERE w.id = \\$1 AND w.status").
-		WithArgs("ws-parent").
+	// Expect parent query — #383 added explicit `w.id != $2` self-filter
+	mock.ExpectQuery("SELECT w.id, w.name.*WHERE w.id = \\$1 AND w.id != \\$2 AND w.status").
+		WithArgs("ws-parent", "ws-sibling-1").
 		WillReturnRows(sqlmock.NewRows(peerCols).
 			AddRow("ws-parent", "Parent PM", "manager", 2, "online", []byte("null"), "http://localhost:8001", nil, 1))
 
@@ -165,6 +172,9 @@ func TestPeers_NotFound(t *testing.T) {
 	setupTestRedis(t)
 	handler := NewDiscoveryHandler()
 
+	// validateDiscoveryCaller probes HasAnyLiveToken(:id) first; grandfather.
+	seedDiscoveryGrandfather(mock, "ws-ghost")
+
 	// Workspace not found
 	mock.ExpectQuery("SELECT parent_id FROM workspaces WHERE id =").
 		WithArgs("ws-ghost").
@@ -191,6 +201,11 @@ func TestPeers_DBError(t *testing.T) {
 	setupTestRedis(t)
 	handler := NewDiscoveryHandler()
 
+	// Auth probe grandfathers; this test targets a DB error on the
+	// *handler-body* parent_id query → 500 (distinct from the auth-probe
+	// DB error which now fails closed with 503).
+	seedDiscoveryGrandfather(mock, "ws-dberr")
+
 	mock.ExpectQuery("SELECT parent_id FROM workspaces WHERE id =").
 		WithArgs("ws-dberr").
 		WillReturnError(sql.ErrConnDone)
@@ -216,6 +231,9 @@ func TestPeers_RootWorkspace_NoPeers(t *testing.T) {
 	setupTestRedis(t)
 	handler := NewDiscoveryHandler()
 
+	// validateDiscoveryCaller probes HasAnyLiveToken(:id) first; grandfather.
+	seedDiscoveryGrandfather(mock, "ws-root-alone")
+
 	// Root workspace (parent_id is NULL)
 	mock.ExpectQuery("SELECT parent_id FROM workspaces WHERE id =").
 		WithArgs("ws-root-alone").
@@ -223,14 +241,14 @@ func TestPeers_RootWorkspace_NoPeers(t *testing.T) {
 
 	peerCols := []string{"id", "name", "role", "tier", "status", "agent_card", "url", "parent_id", "active_tasks"}
 
-	// Siblings (other root-level workspaces) — none
-	mock.ExpectQuery("SELECT w.id, w.name.*WHERE w.parent_id IS NULL AND w.id != \\$1").
-		WithArgs("ws-root-alone").
-		WillReturnRows(sqlmock.NewRows(peerCols))
+	// #1953: an org-root caller (parent_id IS NULL) now issues NO sibling
+	// query at all. The old `WHERE w.parent_id IS NULL` sibling read returned
+	// EVERY tenant's org root (cross-tenant leak); an org root has no siblings
+	// inside its own org, so the handler skips the sibling read entirely.
 
-	// Children — none
-	mock.ExpectQuery("SELECT w.id, w.name.*WHERE w.parent_id = \\$1").
-		WithArgs("ws-root-alone").
+	// Children — none. #383 added explicit `w.id != $2` self-filter.
+	mock.ExpectQuery("SELECT w.id, w.name.*WHERE w.parent_id = \\$1 AND w.id != \\$2").
+		WithArgs("ws-root-alone", "ws-root-alone").
 		WillReturnRows(sqlmock.NewRows(peerCols))
 
 	// No parent query since parent_id is NULL
@@ -270,6 +288,9 @@ func peersFilterFixture(t *testing.T) (*DiscoveryHandler, sqlmock.Sqlmock) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
 
+	// validateDiscoveryCaller probes HasAnyLiveToken(:id) first; grandfather.
+	seedDiscoveryGrandfather(mock, "ws-self")
+
 	mock.ExpectQuery("SELECT parent_id FROM workspaces WHERE id =").
 		WithArgs("ws-self").
 		WillReturnRows(sqlmock.NewRows([]string{"parent_id"}).AddRow("ws-pm"))
@@ -282,12 +303,14 @@ func peersFilterFixture(t *testing.T) (*DiscoveryHandler, sqlmock.Sqlmock) {
 			AddRow("ws-alpha", "Alpha Researcher", "researcher", 1, "online", []byte("null"), "http://a", "ws-pm", 0).
 			AddRow("ws-beta", "Beta Designer", "designer", 1, "online", []byte("null"), "http://b", "ws-pm", 0))
 
-	mock.ExpectQuery("SELECT w.id, w.name.*WHERE w.parent_id = \\$1 AND w.status").
-		WithArgs("ws-self").
+	// #383 — children query gained explicit `w.id != $2` self-filter.
+	mock.ExpectQuery("SELECT w.id, w.name.*WHERE w.parent_id = \\$1 AND w.id != \\$2 AND w.status").
+		WithArgs("ws-self", "ws-self").
 		WillReturnRows(sqlmock.NewRows(cols))
 
-	mock.ExpectQuery("SELECT w.id, w.name.*WHERE w.id = \\$1 AND w.status").
-		WithArgs("ws-pm").
+	// #383 — parent query gained explicit `w.id != $2` self-filter.
+	mock.ExpectQuery("SELECT w.id, w.name.*WHERE w.id = \\$1 AND w.id != \\$2 AND w.status").
+		WithArgs("ws-pm", "ws-self").
 		WillReturnRows(sqlmock.NewRows(cols).
 			AddRow("ws-pm", "PM Workspace", "manager", 2, "online", []byte("null"), "http://pm", nil, 1))
 
@@ -402,11 +425,11 @@ func TestPeers_Q_NoMatches_RawBodyIsArrayNotNull(t *testing.T) {
 // role and asserts no panic + correct filter behaviour.
 func TestFilterPeersByQuery_NilRoleRegression(t *testing.T) {
 	cases := []struct {
-		name       string
-		peers      []map[string]interface{}
-		q          string
-		wantLen    int
-		wantIDs    []string
+		name    string
+		peers   []map[string]interface{}
+		q       string
+		wantLen int
+		wantIDs []string
 	}{
 		{
 			name: "nil role matches on name",
@@ -553,9 +576,9 @@ func TestDiscoverWorkspacePeer_Online(t *testing.T) {
 	setupTestRedis(t)
 
 	// name/runtime lookup → non-external
-	mock.ExpectQuery(`SELECT COALESCE\(name,''\), COALESCE\(runtime,'langgraph'\) FROM workspaces WHERE id =`).
+	mock.ExpectQuery(`SELECT COALESCE\(name,''\), COALESCE\(runtime,'claude-code'\) FROM workspaces WHERE id =`).
 		WithArgs("ws-online").
-		WillReturnRows(sqlmock.NewRows([]string{"name", "runtime"}).AddRow("Target", "langgraph"))
+		WillReturnRows(sqlmock.NewRows([]string{"name", "runtime"}).AddRow("Target", "claude-code"))
 	// No cached internal URL → DB status lookup → online
 	mock.ExpectQuery(`SELECT status FROM workspaces WHERE id =`).
 		WithArgs("ws-online").
@@ -581,9 +604,9 @@ func TestDiscoverWorkspacePeer_NotFound(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
 
-	mock.ExpectQuery(`SELECT COALESCE\(name,''\), COALESCE\(runtime,'langgraph'\) FROM workspaces WHERE id =`).
+	mock.ExpectQuery(`SELECT COALESCE\(name,''\), COALESCE\(runtime,'claude-code'\) FROM workspaces WHERE id =`).
 		WithArgs("ws-missing").
-		WillReturnRows(sqlmock.NewRows([]string{"name", "runtime"}).AddRow("", "langgraph"))
+		WillReturnRows(sqlmock.NewRows([]string{"name", "runtime"}).AddRow("", "claude-code"))
 	mock.ExpectQuery(`SELECT status FROM workspaces WHERE id =`).
 		WithArgs("ws-missing").
 		WillReturnError(sql.ErrNoRows)
@@ -603,14 +626,14 @@ func TestDiscoverWorkspacePeer_ExternalRuntime_HandledByExternalURL(t *testing.T
 	mock := setupTestDB(t)
 	setupTestRedis(t)
 
-	mock.ExpectQuery(`SELECT COALESCE\(name,''\), COALESCE\(runtime,'langgraph'\) FROM workspaces WHERE id =`).
+	mock.ExpectQuery(`SELECT COALESCE\(name,''\), COALESCE\(runtime,'claude-code'\) FROM workspaces WHERE id =`).
 		WithArgs("ws-ext").
 		WillReturnRows(sqlmock.NewRows([]string{"name", "runtime"}).AddRow("Ext", "external"))
 	// writeExternalWorkspaceURL's two queries
 	mock.ExpectQuery(`SELECT COALESCE\(url,''\) FROM workspaces WHERE id =`).
 		WithArgs("ws-ext").
 		WillReturnRows(sqlmock.NewRows([]string{"url"}).AddRow("http://external.example"))
-	mock.ExpectQuery(`SELECT COALESCE\(runtime,'langgraph'\) FROM workspaces WHERE id =`).
+	mock.ExpectQuery(`SELECT COALESCE\(runtime,'claude-code'\) FROM workspaces WHERE id =`).
 		WithArgs("ws-caller").
 		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("external"))
 
@@ -628,9 +651,9 @@ func TestDiscoverWorkspacePeer_CachedInternalURLHit(t *testing.T) {
 	mock := setupTestDB(t)
 	mr := setupTestRedis(t)
 
-	mock.ExpectQuery(`SELECT COALESCE\(name,''\), COALESCE\(runtime,'langgraph'\) FROM workspaces WHERE id =`).
+	mock.ExpectQuery(`SELECT COALESCE\(name,''\), COALESCE\(runtime,'claude-code'\) FROM workspaces WHERE id =`).
 		WithArgs("ws-cached").
-		WillReturnRows(sqlmock.NewRows([]string{"name", "runtime"}).AddRow("Cached", "langgraph"))
+		WillReturnRows(sqlmock.NewRows([]string{"name", "runtime"}).AddRow("Cached", "claude-code"))
 	mr.Set("ws:ws-cached:internal_url", "http://ws-cached:8000")
 
 	w := httptest.NewRecorder()
@@ -652,9 +675,9 @@ func TestDiscoverWorkspacePeer_NotReachable(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
 
-	mock.ExpectQuery(`SELECT COALESCE\(name,''\), COALESCE\(runtime,'langgraph'\) FROM workspaces WHERE id =`).
+	mock.ExpectQuery(`SELECT COALESCE\(name,''\), COALESCE\(runtime,'claude-code'\) FROM workspaces WHERE id =`).
 		WithArgs("ws-paused").
-		WillReturnRows(sqlmock.NewRows([]string{"name", "runtime"}).AddRow("Paused", "langgraph"))
+		WillReturnRows(sqlmock.NewRows([]string{"name", "runtime"}).AddRow("Paused", "claude-code"))
 	mock.ExpectQuery(`SELECT status FROM workspaces WHERE id =`).
 		WithArgs("ws-paused").
 		WillReturnRows(sqlmock.NewRows([]string{"status"}).AddRow("paused"))
@@ -679,9 +702,9 @@ func TestWriteExternalWorkspaceURL_Success(t *testing.T) {
 	mock.ExpectQuery(`SELECT COALESCE\(url,''\) FROM workspaces WHERE id =`).
 		WithArgs("ws-ext").
 		WillReturnRows(sqlmock.NewRows([]string{"url"}).AddRow("http://external.example/a2a"))
-	mock.ExpectQuery(`SELECT COALESCE\(runtime,'langgraph'\) FROM workspaces WHERE id =`).
+	mock.ExpectQuery(`SELECT COALESCE\(runtime,'claude-code'\) FROM workspaces WHERE id =`).
 		WithArgs("ws-caller").
-		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("langgraph"))
+		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("claude-code"))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -729,9 +752,9 @@ func TestWriteExternalWorkspaceURL_RewritesLocalhostForDockerCaller(t *testing.T
 		WithArgs("ws-ext").
 		WillReturnRows(sqlmock.NewRows([]string{"url"}).AddRow("http://127.0.0.1:8000/a2a"))
 	// non-external caller runtime → rewrite enabled
-	mock.ExpectQuery(`SELECT COALESCE\(runtime,'langgraph'\) FROM workspaces WHERE id =`).
+	mock.ExpectQuery(`SELECT COALESCE\(runtime,'claude-code'\) FROM workspaces WHERE id =`).
 		WithArgs("ws-caller").
-		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("langgraph"))
+		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("claude-code"))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -816,9 +839,9 @@ func TestWriteExternalWorkspaceURL_RejectsMetadataIPURL(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"url"}).
 			AddRow("http://169.254.169.254/computeMetadata/v1/"))
 	// callerRuntime lookup happens before isSafeURL — must mock it.
-	mock.ExpectQuery(`SELECT COALESCE\(runtime,'langgraph'\) FROM workspaces WHERE id =`).
+	mock.ExpectQuery(`SELECT COALESCE\(runtime,'claude-code'\) FROM workspaces WHERE id =`).
 		WithArgs("ws-caller").
-		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("langgraph"))
+		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("claude-code"))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -925,13 +948,14 @@ func TestDiscoverHostPeer_Smoke_Success(t *testing.T) {
 	}
 }
 
-// ==================== Peers auth — dev-mode fail-open gate ====================
+// ==================== Peers auth — fail-CLOSED gate ====================
 //
-// validateDiscoveryCaller applies a Tier-1b dev-mode hatch so the canvas
-// user session (which holds no workspace-scoped bearer) can still load
-// the Details → PEERS list on a local Docker setup. The gate must pass
-// ONLY when MOLECULE_ENV is development AND ADMIN_TOKEN is empty.
-// These tests pin that contract against accidental polarity flips.
+// (harden/no-fail-open-auth) validateDiscoveryCaller USED to apply a
+// Tier-1b dev-mode hatch that let the bearer-less canvas session load the
+// Details → PEERS list when MOLECULE_ENV=development AND ADMIN_TOKEN empty.
+// That hatch has been REMOVED — discovery callers must present a verified
+// CP session or a valid bearer in every environment. These tests pin the
+// fail-closed contract against accidental re-introduction.
 
 // peersAuthFixtureHasLiveToken seeds the mock rows required for the
 // Peers handler to reach the auth branch: HasAnyLiveToken → true (a
@@ -944,10 +968,30 @@ func peersAuthFixtureHasLiveToken(mock sqlmock.Sqlmock, workspaceID string) {
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
 }
 
-func TestPeers_DevModeFailOpen_AllowsBearerlessRequest(t *testing.T) {
-	// Dev mode: MOLECULE_ENV=development AND ADMIN_TOKEN empty. Canvas
-	// sends no bearer token; validateDiscoveryCaller must return nil
-	// (allow) and the handler must proceed to return the peer list.
+// seedDiscoveryGrandfather seeds the FIRST query validateDiscoveryCaller
+// issues (HasAnyLiveToken → 0 = legacy / pre-upgrade) so a bearer-less
+// discovery request grandfathers through and the test can exercise the
+// handler body.
+//
+// (harden/no-fail-open-auth) Before this branch, validateDiscoveryCaller
+// returned nil (allow) when the HasAnyLiveToken probe ERRORED — so these
+// handler-body tests never had to seed the probe at all; the unmatched
+// COUNT query erred and the fail-open swallowed it. Now that the DB-error
+// path fails CLOSED (503), the probe must be seeded explicitly. count=0 is
+// the legitimate grandfather path (no live tokens for this workspace yet),
+// which is what these pre-existing tests intend.
+func seedDiscoveryGrandfather(mock sqlmock.Sqlmock, workspaceID string) {
+	mock.ExpectQuery("SELECT COUNT.+workspace_auth_tokens").
+		WithArgs(workspaceID).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+}
+
+func TestPeers_DevMode_BearerlessRequest_FailsClosed(t *testing.T) {
+	// (harden/no-fail-open-auth) Exact old-hatch conditions:
+	// MOLECULE_ENV=development AND ADMIN_TOKEN empty, with a live token in
+	// the DB. The bearer-less canvas-style request must now 401 — the
+	// dev-mode hatch that returned nil (allow) here is gone. Local dev
+	// authenticates via a provisioned ADMIN_TOKEN (scripts/dev-start.sh).
 	t.Setenv("MOLECULE_ENV", "development")
 	t.Setenv("ADMIN_TOKEN", "")
 
@@ -955,20 +999,9 @@ func TestPeers_DevModeFailOpen_AllowsBearerlessRequest(t *testing.T) {
 	setupTestRedis(t)
 	handler := NewDiscoveryHandler()
 
+	// Only the HasAnyLiveToken probe runs; auth 401s before the peer
+	// queries, so no further expectations are seeded.
 	peersAuthFixtureHasLiveToken(mock, "ws-dev")
-
-	// Root workspace → children+parent queries still fire but the
-	// parent_id lookup comes first.
-	mock.ExpectQuery("SELECT parent_id FROM workspaces WHERE id =").
-		WithArgs("ws-dev").
-		WillReturnRows(sqlmock.NewRows([]string{"parent_id"}).AddRow(nil))
-	peerCols := []string{"id", "name", "role", "tier", "status", "agent_card", "url", "parent_id", "active_tasks"}
-	mock.ExpectQuery("SELECT w.id.+WHERE w.parent_id IS NULL AND w.id").
-		WithArgs("ws-dev").
-		WillReturnRows(sqlmock.NewRows(peerCols))
-	mock.ExpectQuery("SELECT w.id.+WHERE w.parent_id = \\$1 AND w.status").
-		WithArgs("ws-dev").
-		WillReturnRows(sqlmock.NewRows(peerCols))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -977,8 +1010,8 @@ func TestPeers_DevModeFailOpen_AllowsBearerlessRequest(t *testing.T) {
 
 	handler.Peers(c)
 
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200 under dev-mode hatch, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 (fail-closed) under old dev-mode hatch conditions, got %d: %s", w.Code, w.Body.String())
 	}
 }
 
@@ -1029,4 +1062,251 @@ func TestPeers_DevModeFailOpen_ClosedInProduction(t *testing.T) {
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 in production, got %d: %s", w.Code, w.Body.String())
 	}
+}
+
+// TestPeers_AuthProbeDBError_FailsClosed pins the removal of
+// validateDiscoveryCaller's fail-open-on-DB-error branch
+// (harden/no-fail-open-auth). When the HasAnyLiveToken auth probe ERRORS, the
+// request must NOT be allowed through — it now returns 503 (availability
+// tradeoff that grants NO access). Before this branch the function returned nil
+// (allow) on a DB hiccup, so the request reached the peer queries.
+//
+// Watch-it-fail: restore `if err != nil { log; return nil }` in
+// validateDiscoveryCaller → this flips 503→(200/handler path) and fails.
+func TestPeers_AuthProbeDBError_FailsClosed(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewDiscoveryHandler()
+
+	// The FIRST query validateDiscoveryCaller issues (HasAnyLiveToken) errors.
+	// No further expectations: a fail-closed 503 must be written before the
+	// peer-list queries run.
+	mock.ExpectQuery("SELECT COUNT.+workspace_auth_tokens").
+		WithArgs("ws-dberr-auth").
+		WillReturnError(sql.ErrConnDone)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-dberr-auth"}}
+	c.Request = httptest.NewRequest("GET", "/registry/ws-dberr-auth/peers", nil)
+
+	handler.Peers(c)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("auth-probe DB error must fail CLOSED: expected 503, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// TestDiscover_AuthProbeDBError_FailsClosed is the Discover-endpoint companion
+// to TestPeers_AuthProbeDBError_FailsClosed: a HasAnyLiveToken error on the
+// caller's discovery request fails CLOSED with 503 (was: fail-open allow).
+func TestDiscover_AuthProbeDBError_FailsClosed(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewDiscoveryHandler()
+
+	mock.ExpectQuery("SELECT COUNT.+workspace_auth_tokens").
+		WithArgs("ws-caller").
+		WillReturnError(sql.ErrConnDone)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-target"}}
+	c.Request = httptest.NewRequest("GET", "/registry/discover/ws-target", nil)
+	c.Request.Header.Set("X-Workspace-ID", "ws-caller")
+
+	handler.Discover(c)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("Discover auth-probe DB error must fail CLOSED: expected 503, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// ==================== Peers — #383 self never appears in result ====================
+
+// TestPeers_ExcludeSelf_DefenseInDepth verifies the final-line filter in
+// Peers strips any row whose id matches the caller. The pre-DB SQL filters
+// already do this, but a future code path that omits the `w.id != $caller`
+// clause must not be able to smuggle a self-row through. This test
+// simulates that future-defect case by mocking the children query to
+// (incorrectly) return a row whose id matches the caller, and asserts the
+// final filter still drops it.
+//
+// Root cause class for #383: an agent that sees its own row in /peers
+// proceeds to delegate_task to itself, hitting the platform's
+// self-delegation 400 in a tight loop. The fix in discovery.go is
+// defense-in-depth: even if the SQL filter regresses, this handler-level
+// filter prevents the 400-loop from materializing.
+func TestPeers_ExcludeSelf_DefenseInDepth(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewDiscoveryHandler()
+
+	const selfID = "ws-xiaodong"
+
+	// validateDiscoveryCaller probes HasAnyLiveToken(:id) first; grandfather.
+	seedDiscoveryGrandfather(mock, selfID)
+
+	// parent_id lookup — workspace has a parent.
+	mock.ExpectQuery("SELECT parent_id FROM workspaces WHERE id =").
+		WithArgs(selfID).
+		WillReturnRows(sqlmock.NewRows([]string{"parent_id"}).AddRow("ws-parent"))
+
+	peerCols := []string{"id", "name", "role", "tier", "status", "agent_card", "url", "parent_id", "active_tasks"}
+
+	// Siblings — returns one legitimate sibling. The SQL filter excludes
+	// self at the source.
+	mock.ExpectQuery("SELECT w.id, w.name.*WHERE w.parent_id = \\$1 AND w.id != \\$2").
+		WithArgs("ws-parent", selfID).
+		WillReturnRows(sqlmock.NewRows(peerCols).
+			AddRow("ws-sibling", "Sibling", "worker", 1, "online", []byte("null"), "http://localhost:8002", "ws-parent", 0))
+
+	// Children — simulates the data-integrity defect class: the DB
+	// (incorrectly) returns the caller's own row in the children set.
+	// In real production this would require a workspace whose
+	// parent_id points to itself — corruption only, but the handler
+	// must not propagate it.
+	mock.ExpectQuery("SELECT w.id, w.name.*WHERE w.parent_id = \\$1 AND w.id != \\$2 AND w.status").
+		WithArgs(selfID, selfID).
+		WillReturnRows(sqlmock.NewRows(peerCols).
+			AddRow(selfID, "Self As Child", "worker", 1, "online", []byte("null"), "http://localhost:8001", selfID, 0).
+			AddRow("ws-child", "Real Child", "worker", 1, "online", []byte("null"), "http://localhost:8003", selfID, 0))
+
+	// Parent — explicit `w.id != $2` clause so the parent path is also
+	// self-filtered. parentID.String = "ws-parent" != selfID, so the
+	// row is included.
+	mock.ExpectQuery("SELECT w.id, w.name.*WHERE w.id = \\$1 AND w.id != \\$2 AND w.status").
+		WithArgs("ws-parent", selfID).
+		WillReturnRows(sqlmock.NewRows(peerCols).
+			AddRow("ws-parent", "Parent", "manager", 2, "online", []byte("null"), "http://localhost:8004", nil, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: selfID}}
+	c.Request = httptest.NewRequest("GET", "/registry/"+selfID+"/peers", nil)
+
+	handler.Peers(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var peers []map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &peers); err != nil {
+		t.Fatalf("failed to parse response: %v", err)
+	}
+
+	// The defense-in-depth filter must drop the self row even though
+	// the (mocked-defective) children query returned it.
+	for _, p := range peers {
+		if id, _ := p["id"].(string); id == selfID {
+			t.Fatalf("peer list contains caller's own id %q — self-delegation defense regressed; full list: %+v", selfID, peers)
+		}
+	}
+
+	// Sanity: the three legitimate peers (sibling, real child, parent)
+	// must all be present. Catches an over-aggressive filter that
+	// strips legitimate rows.
+	expectedIDs := map[string]bool{"ws-sibling": false, "ws-child": false, "ws-parent": false}
+	for _, p := range peers {
+		if id, _ := p["id"].(string); id != "" {
+			if _, ok := expectedIDs[id]; ok {
+				expectedIDs[id] = true
+			}
+		}
+	}
+	for id, found := range expectedIDs {
+		if !found {
+			t.Errorf("legitimate peer %q missing from response; got %+v", id, peers)
+		}
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// TestExcludeSelfFromPeers_Unit exercises the helper directly so the
+// defense-in-depth contract is asserted independently of SQL mocking.
+// Pure-function tests run in microseconds and pin the filter shape
+// (empty input, no-match passthrough, single-row drop, multi-row drop,
+// preserves order) so future edits to the helper can't silently
+// regress to "returns input unchanged".
+func TestExcludeSelfFromPeers_Unit(t *testing.T) {
+	t.Run("empty input returns empty slice", func(t *testing.T) {
+		out := excludeSelfFromPeers(nil, "ws-self")
+		if len(out) != 0 {
+			t.Errorf("expected empty, got %+v", out)
+		}
+	})
+
+	t.Run("no self in list passes through unchanged", func(t *testing.T) {
+		in := []map[string]interface{}{
+			{"id": "ws-a", "name": "A"},
+			{"id": "ws-b", "name": "B"},
+		}
+		out := excludeSelfFromPeers(in, "ws-self")
+		if len(out) != 2 {
+			t.Fatalf("expected 2, got %d (%+v)", len(out), out)
+		}
+		if out[0]["id"] != "ws-a" || out[1]["id"] != "ws-b" {
+			t.Errorf("order not preserved: %+v", out)
+		}
+	})
+
+	t.Run("self row dropped, others preserved", func(t *testing.T) {
+		in := []map[string]interface{}{
+			{"id": "ws-a", "name": "A"},
+			{"id": "ws-self", "name": "Me"},
+			{"id": "ws-b", "name": "B"},
+		}
+		out := excludeSelfFromPeers(in, "ws-self")
+		if len(out) != 2 {
+			t.Fatalf("expected 2, got %d (%+v)", len(out), out)
+		}
+		if out[0]["id"] != "ws-a" || out[1]["id"] != "ws-b" {
+			t.Errorf("expected [ws-a, ws-b], got %+v", out)
+		}
+	})
+
+	t.Run("multiple self rows all dropped", func(t *testing.T) {
+		// Pathological — should never happen, but the contract is
+		// "no row with id==workspaceID survives", not "at most one
+		// such row is dropped". Pin it.
+		in := []map[string]interface{}{
+			{"id": "ws-self", "name": "Me1"},
+			{"id": "ws-a", "name": "A"},
+			{"id": "ws-self", "name": "Me2"},
+		}
+		out := excludeSelfFromPeers(in, "ws-self")
+		if len(out) != 1 {
+			t.Fatalf("expected 1, got %d (%+v)", len(out), out)
+		}
+		if out[0]["id"] != "ws-a" {
+			t.Errorf("expected [ws-a], got %+v", out)
+		}
+	})
+
+	t.Run("row with missing id key is preserved (not a self-collision)", func(t *testing.T) {
+		// A peer row with no "id" key shouldn't be silently dropped
+		// by the self-filter — it's a malformed row class that
+		// belongs to a different defect.
+		in := []map[string]interface{}{
+			{"name": "no-id-row"},
+			{"id": "ws-self", "name": "Me"},
+		}
+		out := excludeSelfFromPeers(in, "ws-self")
+		if len(out) != 1 {
+			t.Fatalf("expected 1, got %d (%+v)", len(out), out)
+		}
+		if out[0]["name"] != "no-id-row" {
+			t.Errorf("expected no-id-row preserved, got %+v", out)
+		}
+	})
 }

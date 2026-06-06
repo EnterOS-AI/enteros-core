@@ -6,12 +6,17 @@ import { useCanvasStore } from "@/store/canvas";
 import { type ConfigData, DEFAULT_CONFIG, TextInput, NumberInput, Toggle, TagList, Section } from "./config/form-inputs";
 import { parseYaml, toYaml } from "./config/yaml-utils";
 import { SecretsSection } from "./config/secrets-section";
+import { LLMBillingSection } from "./config/llm-billing-section";
 import { ExternalConnectionSection } from "./ExternalConnectionSection";
 import {
   ProviderModelSelector,
   buildProviderCatalog,
+  buildProviderCatalogFromRegistry,
   findProviderForModel,
   type SelectorValue,
+  type ProviderEntry,
+  type RegistryProvider,
+  type RegistryModel,
 } from "../ProviderModelSelector";
 import { isExternalLikeRuntime } from "@/lib/externalRuntimes";
 
@@ -81,7 +86,7 @@ function AgentCardSection({ workspaceId }: { workspaceId: string }) {
             spellCheck={false} rows={12}
             className="w-full bg-surface-card border border-line rounded p-2 text-[10px] font-mono text-ink focus:outline-none focus:border-accent resize-none"
           />
-          {error && <div className="px-2 py-1 bg-red-900/30 border border-red-800 rounded text-[10px] text-bad">{error}</div>}
+          {error && <div role="alert" aria-live="assertive" className="px-2 py-1 bg-red-900/30 border border-red-800 rounded text-[10px] text-bad">{error}</div>}
           <div className="flex gap-2">
             <button type="button" onClick={handleSave} disabled={saving}
               className="px-2 py-1 bg-accent hover:bg-accent-strong text-[10px] rounded text-white disabled:opacity-50 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-1 focus-visible:ring-offset-surface">
@@ -109,6 +114,130 @@ function AgentCardSection({ workspaceId }: { workspaceId: string }) {
   );
 }
 
+// --- Agent Abilities Section ---
+//
+// Always-visible on/off controls for the two workspace-level ability flags
+// (broadcast_enabled, talk_to_user_enabled). Both are mutated through the
+// same admin endpoint the ChatTab recovery banner already uses
+// (PATCH /workspaces/:id/abilities) and reflected into the canvas store node
+// data (broadcastEnabled / talkToUserEnabled) so every surface that reads
+// useCanvasStore.nodes stays consistent without a full re-hydrate.
+//
+// Before this section there was NO canvas control for either flag: the
+// backend was fully wired (workspace_abilities.go / workspace_broadcast.go /
+// agent_message_writer.go, see commit 29b4bffb + internal#510/#511) but the
+// only frontend affordance was the ChatTab recovery banner, which renders
+// solely when talk_to_user_enabled===false and so is invisible under the
+// TRUE default and never existed at all for broadcast.
+function AgentAbilitiesSection({ workspaceId }: { workspaceId: string }) {
+  // Read the live ability flags off the canvas store node — the platform
+  // event stream hydrates these (canvas-topology.ts maps the workspace row's
+  // broadcast_enabled/talk_to_user_enabled onto node data), so this stays in
+  // sync with the recovery banner and avoids a duplicate GET. Mirrors the
+  // store-read pattern used by AgentCardSection above.
+  const node = useCanvasStore((s) =>
+    s.nodes?.find?.((n) => n.id === workspaceId),
+  );
+  // Defaults match the backend column defaults + canvas-topology mapping:
+  // broadcast_enabled defaults FALSE, talk_to_user_enabled defaults TRUE.
+  const broadcastEnabled = node?.data.broadcastEnabled ?? false;
+  const talkToUserEnabled = node?.data.talkToUserEnabled ?? true;
+
+  // Track an in-flight PATCH per field so a double-click can't fire two
+  // racing writes, and surface a one-line error if the server rejects.
+  const [pending, setPending] = useState<null | "broadcast" | "talk">(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const patchAbility = async (
+    which: "broadcast" | "talk",
+    body: { broadcast_enabled: boolean } | { talk_to_user_enabled: boolean },
+    optimistic: Partial<{ broadcastEnabled: boolean; talkToUserEnabled: boolean }>,
+  ) => {
+    setError(null);
+    setPending(which);
+    // Optimistic store update — the toggle flips immediately; on failure we
+    // roll back to the server-truth value the store last held.
+    const prev = {
+      broadcastEnabled,
+      talkToUserEnabled,
+    };
+    useCanvasStore.getState().updateNodeData(workspaceId, optimistic);
+    try {
+      await api.patch(`/workspaces/${workspaceId}/abilities`, body);
+    } catch (e) {
+      // Roll back the optimistic change to last-known server truth.
+      useCanvasStore.getState().updateNodeData(workspaceId, {
+        broadcastEnabled: prev.broadcastEnabled,
+        talkToUserEnabled: prev.talkToUserEnabled,
+      });
+      setError(
+        e instanceof Error ? e.message : "Failed to update ability — try again",
+      );
+    } finally {
+      setPending(null);
+    }
+  };
+
+  return (
+    <Section title="Agent Abilities">
+      <p className="text-[10px] text-ink-mid px-1 pb-1">
+        Workspace-level permissions for this agent. Changes apply immediately
+        (no restart required).
+      </p>
+      <div className="space-y-2">
+        <div>
+          <Toggle
+            label="Talk to user"
+            checked={talkToUserEnabled}
+            onChange={(v) =>
+              pending
+                ? undefined
+                : patchAbility(
+                    "talk",
+                    { talk_to_user_enabled: v },
+                    { talkToUserEnabled: v },
+                  )
+            }
+          />
+          <p className="text-[10px] text-ink-mid mt-0.5 ml-6">
+            When off, the agent&apos;s <code className="font-mono">send_message_to_user</code>{" "}
+            and <code className="font-mono">POST /notify</code> calls are
+            rejected (403) — it must route updates through a parent workspace.
+          </p>
+        </div>
+        <div>
+          <Toggle
+            label="Broadcast to peers"
+            checked={broadcastEnabled}
+            onChange={(v) =>
+              pending
+                ? undefined
+                : patchAbility(
+                    "broadcast",
+                    { broadcast_enabled: v },
+                    { broadcastEnabled: v },
+                  )
+            }
+          />
+          <p className="text-[10px] text-ink-mid mt-0.5 ml-6">
+            When on, the agent may <code className="font-mono">POST /broadcast</code>{" "}
+            to message all non-removed agent workspaces in the org. Off by
+            default — only privileged orchestrators should hold this.
+          </p>
+        </div>
+      </div>
+      {pending && (
+        <div className="mt-2 text-[10px] text-ink-mid">Saving…</div>
+      )}
+      {error && (
+        <div role="alert" aria-live="assertive" className="mt-2 px-2 py-1 bg-red-900/30 border border-red-800 rounded text-[10px] text-bad">
+          {error}
+        </div>
+      )}
+    </Section>
+  );
+}
+
 // --- Main ConfigTab ---
 
 interface ModelSpec {
@@ -129,10 +258,21 @@ interface RuntimeOption {
   // its config.yaml under runtime_config.providers. The /templates API
   // surfaces it (workspace-server templates.go) so canvas stays
   // adapter-driven: hermes ships ~20 slugs, claude-code ships
-  // ["anthropic"], gemini-cli ships ["gemini"], etc. Empty list →
+  // ["anthropic"], codex ships OpenAI-compatible model ids, etc. Empty list →
   // canvas falls back to deriving unique vendor prefixes from
   // models[].id (still adapter-driven, just inferred).
   providers: string[];
+  // registryBacked / registryProviders / registryModels come from the
+  // registry-served GET /templates fields (internal#718 P3). When
+  // registryBacked is true, the selectable provider+model list is built from
+  // the registry (registryProviders/registryModels) — display labels +
+  // billing mode + derived provider come from the provider-registry SSOT, not
+  // the canvas VENDOR_LABELS / billingModeForProvider vocabularies. When
+  // false (non-registry runtime / older backend), the canvas falls back to
+  // the template-served models[] + its inferVendor heuristic.
+  registryBacked: boolean;
+  registryProviders: RegistryProvider[];
+  registryModels: RegistryModel[];
 }
 
 // deriveProvidersFromModels — when a template doesn't ship an explicit
@@ -163,6 +303,66 @@ export function deriveProvidersFromModels(models: ModelSpec[]): string[] {
   return out;
 }
 
+// billingModeForProvider — maps a selected PROVIDER (vendor key) to the
+// LLM billing_mode it implies (internal#703 Gap 2).
+//
+// Today, picking a non-Platform provider in the Config tab writes the
+// credential env (CLAUDE_CODE_OAUTH_TOKEN / vendor key) but leaves
+// llm_billing_mode at its resolved default (`platform_managed`). The CP
+// tenant_config endpoint then keeps injecting the platform proxy base
+// URLs, so the OAuth token / vendor key is never actually used — BYOK
+// silently no-ops (the live SEO-Agent symptom in #703). The workspace-
+// server even hard-blocks vendor-key writes on platform_managed
+// workspaces (secrets.go:87), pointing the user at this exact billing-
+// mode switch. Wiring the provider change to also set billing_mode is
+// the UI half that makes BYOK take (the CP/workspace-server backend half
+// is being fixed in parallel — internal#703 Gap 1).
+//
+// Mapping:
+//   - "platform" (the Platform-managed proxy) OR "" (no explicit
+//     provider override → inherit, defaults to platform) → "platform_managed".
+//   - any other vendor key ("anthropic-oauth" = Claude Code subscription
+//     OAuth, "anthropic" = Anthropic API key, "minimax", "openrouter",
+//     etc.) → "byok".
+//
+// Returns the billing_mode string the PUT body should carry. The valid
+// set is fixed by workspace-server's recognizer (platform_managed | byok
+// | disabled); "disabled" is never auto-selected by a provider choice —
+// it's an explicit operator action via the LLM Billing section.
+export type LLMBillingMode = "platform_managed" | "byok";
+
+export function billingModeForProvider(provider: string): LLMBillingMode {
+  const v = provider.trim().toLowerCase();
+  if (v === "" || v === "platform") return "platform_managed";
+  return "byok";
+}
+
+// billingModeForSelectedProvider — internal#718 P3 (retire-list #5): the
+// billing mode the Config tab shows/sends for the selected PROVIDER, sourced
+// from the registry-served catalog when available rather than the hardcoded
+// billingModeForProvider rule.
+//
+// When the runtime is registry-backed, GET /templates serves each provider's
+// DERIVED billing_mode (platform_managed for the closed platform provider,
+// byok otherwise) on the ProviderEntry. We read it off the catalog so the UI
+// reflects the registry SSOT — the same predicate billing/credential emission
+// keys off the derived provider.
+//
+// Falls back to billingModeForProvider when: no catalog (non-registry runtime
+// / older backend), or the provider string isn't carried by the catalog
+// (e.g. a stale saved value). The fallback keeps the legacy behavior intact
+// for everything the registry doesn't yet speak to.
+export function billingModeForSelectedProvider(
+  provider: string,
+  catalog?: ProviderEntry[],
+): LLMBillingMode {
+  if (catalog && catalog.length > 0) {
+    const entry = catalog.find((p) => p.vendor === provider.trim());
+    if (entry?.billingMode) return entry.billingMode;
+  }
+  return billingModeForProvider(provider);
+}
+
 // Fallback used when /templates can't be fetched (offline, older backend).
 // Keep in sync with manifest.json workspace_templates as a defensive default.
 // Model + env suggestions only flow when the backend is reachable.
@@ -177,16 +377,20 @@ export function deriveProvidersFromModels(models: ModelSpec[]): string[] {
 // config.yaml` on the container is a separate runtime-internal file,
 // not this one.
 const RUNTIMES_WITH_OWN_CONFIG = new Set<string>(["external", "kimi", "kimi-cli", "openclaw"]);
+// The runtime picker is SSOT-driven: options come from GET /templates,
+// which workspace-server already gates to the manifest.json maintained set
+// (loadRuntimesFromManifest). A hand-maintained frontend allowlist silently
+// dropped runtimes the backend added (google-adk shipped in manifest but was
+// filtered out, so its workspaces rendered the wrong default option). A
+// template may still opt OUT of the picker via `displayable: false` on its
+// /templates row. See project_canvas_runtime_dropdown_ssot_fix.
 
 const FALLBACK_RUNTIME_OPTIONS: RuntimeOption[] = [
-  { value: "", label: "LangGraph (default)", models: [], providers: [] },
-  { value: "claude-code", label: "Claude Code", models: [], providers: [] },
-  { value: "crewai", label: "CrewAI", models: [], providers: [] },
-  { value: "autogen", label: "AutoGen", models: [], providers: [] },
-  { value: "deepagents", label: "DeepAgents", models: [], providers: [] },
-  { value: "openclaw", label: "OpenClaw", models: [], providers: [] },
-  { value: "hermes", label: "Hermes", models: [], providers: [] },
-  { value: "gemini-cli", label: "Gemini CLI", models: [], providers: [] },
+  { value: "claude-code", label: "Claude Code", models: [], providers: [], registryBacked: false, registryProviders: [], registryModels: [] },
+  { value: "codex", label: "Codex", models: [], providers: [], registryBacked: false, registryProviders: [], registryModels: [] },
+  { value: "google-adk", label: "Google ADK", models: [], providers: [], registryBacked: false, registryProviders: [], registryModels: [] },
+  { value: "openclaw", label: "OpenClaw", models: [], providers: [], registryBacked: false, registryProviders: [], registryModels: [] },
+  { value: "hermes", label: "Hermes", models: [], providers: [], registryBacked: false, registryProviders: [], registryModels: [] },
 ];
 
 export function ConfigTab({ workspaceId }: Props) {
@@ -199,15 +403,24 @@ export function ConfigTab({ workspaceId }: Props) {
   const [rawMode, setRawMode] = useState(false);
   const [rawDraft, setRawDraft] = useState("");
   const [runtimeOptions, setRuntimeOptions] = useState<RuntimeOption[]>(FALLBACK_RUNTIME_OPTIONS);
-  // Provider override (Option B PR-5): stored separately from config.yaml
-  // because the value lives in workspace_secrets (encrypted), not in the
-  // platform-managed config.yaml. The two endpoints are GET/PUT
-  // /workspaces/:id/provider on workspace-server (handlers/secrets.go).
-  // Empty = "auto-derive from model slug prefix" — pre-Option-B behavior
-  // and what most users want. Setting to a non-empty value writes
-  // LLM_PROVIDER into workspace_secrets and triggers an auto-restart so
-  // the workspace boots with the new provider in env (and via CP user-
-  // data, written into /configs/config.yaml on next provision too).
+  // internal#718 P4 closure: the explicit provider override
+  // (LLM_PROVIDER workspace_secret, surfaced via GET/PUT
+  // /workspaces/:id/provider) has been RETIRED. The provider is
+  // derived at every decision point from (runtime, model) via the
+  // registry — no stored row remains. The `provider` / `originalProvider`
+  // state and the provider dropdown survive in this component for
+  // backwards-compat (display only) but are no longer persisted:
+  //   - loadConfig no longer GETs /workspaces/:id/provider (the
+  //     endpoint returns 410 Gone). The state initializes to ""
+  //     and stays there.
+  //   - handleSave no longer PUTs /workspaces/:id/provider.
+  //   - The dropdown still updates the local `provider` state so the
+  //     user can preview the derived value; the value never leaves
+  //     the browser.
+  // This is the canvas-side complement to the backend retirement of
+  // SetProvider/GetProvider/setProviderSecret. Older canvases that
+  // still call PUT /provider hit the 410 Gone with a structured
+  // PROVIDER_ENDPOINT_RETIRED code — loud failure, no silent miss.
   const [provider, setProvider] = useState("");
   const [originalProvider, setOriginalProvider] = useState("");
   // Track the model the form first rendered, so handleSave can detect
@@ -258,26 +471,23 @@ export function ConfigTab({ workspaceId }: Props) {
     //
     // See GH #1894 for the workspace-row-as-source-of-truth rationale
     // that motivated splitting from a single config.yaml read.
-    const [wsRes, modelRes, providerRes] = await Promise.all([
+    // internal#718 P4 closure: the GET /workspaces/:id/provider leg is
+    // RETIRED — the endpoint returns 410 Gone. Provider is now derived
+    // from (runtime, model) via the registry; no stored value exists
+    // to load. Always seed the local state to "" so the dropdown
+    // initializes to "auto-derive".
+    const [wsRes, modelRes] = await Promise.all([
       api.get<{ runtime?: string; tier?: number }>(`/workspaces/${workspaceId}`)
         .catch(() => ({} as { runtime?: string; tier?: number })),
       api.get<{ model?: string }>(`/workspaces/${workspaceId}/model`)
         .catch(() => ({} as { model?: string })),
-      api.get<{ provider?: string }>(`/workspaces/${workspaceId}/provider`)
-        .catch(() => null),
     ]);
     const wsMetadataRuntime = (wsRes.runtime || "").trim();
     const wsMetadataModel = (modelRes.model || "").trim();
     const wsMetadataTier: number | null =
       typeof wsRes.tier === "number" ? wsRes.tier : null;
-    if (providerRes !== null) {
-      const loadedProvider = (providerRes.provider || "").trim();
-      setProvider(loadedProvider);
-      setOriginalProvider(loadedProvider);
-    } else {
-      setProvider("");
-      setOriginalProvider("");
-    }
+    setProvider("");
+    setOriginalProvider("");
     // originalModel is set further down once the YAML has been parsed —
     // we want it to reflect what the form ACTUALLY rendered, which may
     // be the YAML's runtime_config.model fallback when MODEL_PROVIDER
@@ -371,24 +581,52 @@ export function ConfigTab({ workspaceId }: Props) {
 
   useEffect(() => {
     let cancelled = false;
-    api.get<Array<{ id: string; name?: string; runtime?: string; models?: ModelSpec[]; providers?: string[] }>>("/templates")
+    api.get<Array<{
+      id: string;
+      name?: string;
+      runtime?: string;
+      models?: ModelSpec[];
+      providers?: string[];
+      // internal#718 P3 registry-served fields (additive; absent on older
+      // backends and for non-registry runtimes).
+      registry_backed?: boolean;
+      registry_providers?: RegistryProvider[];
+      registry_models?: RegistryModel[];
+      displayable?: boolean;
+    }>>("/templates")
       .then((rows) => {
         if (cancelled || !Array.isArray(rows)) return;
         const byRuntime = new Map<string, RuntimeOption>();
-        byRuntime.set("", { value: "", label: "LangGraph (default)", models: [], providers: [] });
         for (const r of rows) {
           const v = (r.runtime || "").trim();
-          if (!v || v === "langgraph") continue;
+          if (!v) continue;
+          // Honor an explicit opt-out; absent/true means show it.
+          if (r.displayable === false) continue;
           // Last template wins if two templates share a runtime — rare, and the
           // one with the richer models list is probably newer.
           const existing = byRuntime.get(v);
           const models = Array.isArray(r.models) ? r.models : [];
           const providers = Array.isArray(r.providers) ? r.providers : [];
-          if (!existing || models.length > existing.models.length) {
-            byRuntime.set(v, { value: v, label: r.name || v, models, providers });
+          const registryProviders = Array.isArray(r.registry_providers) ? r.registry_providers : [];
+          const registryModels = Array.isArray(r.registry_models) ? r.registry_models : [];
+          const registryBacked = r.registry_backed === true && registryModels.length > 0;
+          // Prefer the richer payload: a registry-backed entry, then more
+          // template models. Keeps the "last/richer template wins" intent.
+          const score = (o: RuntimeOption) => (o.registryBacked ? 1000 : 0) + o.models.length;
+          const candidate: RuntimeOption = {
+            value: v,
+            label: r.name || v,
+            models,
+            providers,
+            registryBacked,
+            registryProviders,
+            registryModels,
+          };
+          if (!existing || score(candidate) > score(existing)) {
+            byRuntime.set(v, candidate);
           }
         }
-        if (byRuntime.size > 1) setRuntimeOptions(Array.from(byRuntime.values()));
+        if (byRuntime.size > 0) setRuntimeOptions(Array.from(byRuntime.values()));
       })
       .catch(() => { /* keep fallback */ });
     return () => { cancelled = true; };
@@ -396,7 +634,13 @@ export function ConfigTab({ workspaceId }: Props) {
 
   // Models + env hints for the currently-selected runtime.
   const selectedRuntime = runtimeOptions.find((o) => o.value === (config.runtime || "")) ?? null;
-  const availableModels: ModelSpec[] = selectedRuntime?.models ?? [];
+  // Memoised so its identity is stable across renders — it feeds several
+  // useMemo dependency arrays below (registry/legacy catalog, selector models)
+  // and a fresh `[]` literal each render would defeat their memoisation.
+  const availableModels: ModelSpec[] = useMemo(
+    () => selectedRuntime?.models ?? [],
+    [selectedRuntime?.models],
+  );
   // Provider suggestions for the legacy free-text input fallback (used
   // when /templates returned no models for this runtime, e.g. hermes
   // workspaces). Prefer the runtime's declarative providers list,
@@ -410,9 +654,37 @@ export function ConfigTab({ workspaceId }: Props) {
 
   // Vendor-aware catalog shared with the selector. Memoised so the
   // catalog identity is stable across renders (selector relies on it).
+  //
+  // internal#718 P3: when the runtime is registry-backed, build the catalog
+  // FROM the registry-served providers/models (display labels + billing +
+  // derived provider from the provider-registry SSOT) instead of re-inferring
+  // vendor from model-id prefixes. Falls back to the inferVendor heuristic
+  // for non-registry runtimes / older backends.
+  const registryBacked = selectedRuntime?.registryBacked ?? false;
   const providerCatalog = useMemo(
-    () => buildProviderCatalog(availableModels),
-    [availableModels],
+    () =>
+      registryBacked
+        ? buildProviderCatalogFromRegistry(
+            selectedRuntime?.registryProviders ?? [],
+            selectedRuntime?.registryModels ?? [],
+          )
+        : buildProviderCatalog(availableModels),
+    [registryBacked, selectedRuntime?.registryProviders, selectedRuntime?.registryModels, availableModels],
+  );
+  // Models fed to the selector dropdown: the registry-served native set for a
+  // registry-backed runtime (so the dropdown can render no unregistered
+  // option), else the template-served models.
+  const selectorModels: ModelSpec[] = useMemo(
+    () =>
+      registryBacked
+        ? (selectedRuntime?.registryModels ?? []).map((m) => ({
+            id: m.id,
+            name: m.name,
+            // carry the derived provider so the selector buckets correctly
+            ...(m.provider ? { provider: m.provider } : {}),
+          }))
+        : availableModels,
+    [registryBacked, selectedRuntime?.registryModels, availableModels],
   );
 
   // Derive the selector's current value from the form state. Provider
@@ -563,23 +835,27 @@ export function ConfigTab({ workspaceId }: Props) {
         }
       }
 
-      // Provider override save (Option B PR-5). PUT only when the user
-      // changed the dropdown — otherwise an unrelated Save (e.g. tier
-      // edit) would re-write the provider unchanged and the server-
-      // side auto-restart would fire on every Save, costing the user a
-      // ~30s reboot for a no-op change. Server endpoint accepts an
-      // empty string to clear the override (deletes the
-      // workspace_secrets row); we forward whatever the form holds.
-      let providerSaveError: string | null = null;
-      const providerChanged = provider !== originalProvider;
-      if (providerChanged) {
-        try {
-          await api.put(`/workspaces/${workspaceId}/provider`, { provider });
-          setOriginalProvider(provider);
-        } catch (e) {
-          providerSaveError = e instanceof Error ? e.message : "Provider update was rejected";
-        }
-      }
+      // internal#718 P4 closure: provider override save is RETIRED. The
+      // /workspaces/:id/provider endpoint returns 410 Gone; the provider
+      // is derived from (runtime, model) at every decision point via the
+      // registry. The local dropdown state still updates so the user can
+      // see the predicted provider, but it never round-trips to the
+      // server. Variables retained as locals (set to constants) so the
+      // downstream restart-suppress logic below has clear semantics
+      // and the diff against the prior shape stays small.
+      const providerSaveError: string | null = null;
+      const providerChanged = false;
+
+      // internal#718 P4 closure: provider → billing_mode linkage is also
+      // RETIRED. P2-B (#1972) moved the billing decision to
+      // ResolveLLMBillingModeDerived, which DERIVES the provider from
+      // (runtime, model) at every read. The canvas can no longer
+      // override it via a separate PUT, by design — the runtime+model
+      // selection IS the billing-mode selection. The
+      // /admin/workspaces/:id/llm-billing-mode endpoint still exists
+      // as the operator override surface (workspaces.llm_billing_mode
+      // column); it is no longer driven by the provider dropdown.
+      const billingModeSaveError: string | null = null;
 
       setOriginalYaml(content);
       if (rawMode) {
@@ -588,28 +864,29 @@ export function ConfigTab({ workspaceId }: Props) {
       } else {
         setRawDraft(content);
       }
-      // SetProvider on the server already triggers an auto-restart for
-      // the workspace whenever the value actually changed (see
-      // workspace-server/internal/handlers/secrets.go:SetProvider). If
-      // the user also clicked Save+Restart we'd kick off a SECOND
-      // restart here and the two would race in the canvas store —
-      // suppress the redundant call and rely on the server-side one.
-      const providerWillAutoRestart = providerChanged && !providerSaveError;
+      // internal#718 P4 closure: providerWillAutoRestart is always
+      // false now (provider PUT is retired; no server-side auto-restart
+      // can fire). Save+Restart flows through the canvas store
+      // restart path the same way it did pre-#718 for non-provider
+      // edits.
+      const providerWillAutoRestart = providerChanged && !providerSaveError
       if (restart && !providerWillAutoRestart) {
         await useCanvasStore.getState().restartWorkspace(workspaceId);
       } else if (!restart) {
         useCanvasStore.getState().updateNodeData(workspaceId, { needsRestart: !providerWillAutoRestart });
       }
-      // Aggregate partial-save errors. Both modelSaveError and
-      // providerSaveError describe rejected updates from independent
-      // endpoints — show whichever fired so the user knows which
-      // field reverts on next reload (otherwise they'd see "Saved" and
-      // be confused why Provider snapped back).
+      // Aggregate partial-save errors. With provider+billing-mode PUTs
+      // retired, only modelSaveError can fire from the secret-mint side
+      // — the provider/billing branches are dead code retained as
+      // constant nils to keep the diff small. They are surfaced
+      // defensively in case a future re-enablement needs the wiring.
       const partialError = providerSaveError
         ? `Other fields saved, but provider update failed: ${providerSaveError}`
-        : modelSaveError
-          ? `Other fields saved, but model update failed: ${modelSaveError}`
-          : null;
+        : billingModeSaveError
+          ? `Provider saved, but switching billing mode failed — your own provider key/OAuth may not take effect until billing mode is set: ${billingModeSaveError}`
+          : modelSaveError
+            ? `Other fields saved, but model update failed: ${modelSaveError}`
+            : null;
       if (partialError) {
         setError(partialError);
       } else {
@@ -727,9 +1004,10 @@ export function ConfigTab({ workspaceId }: Props) {
                 — empty = "auto-derive from model slug" was the pre-PR-5
                 behavior; selecting any provider here writes LLM_PROVIDER
                 and triggers an auto-restart. */}
-            {availableModels.length > 0 ? (
+            {selectorModels.length > 0 ? (
               <ProviderModelSelector
-                models={availableModels}
+                models={selectorModels}
+                catalog={registryBacked ? providerCatalog : undefined}
                 value={selectorValue}
                 onChange={(next) => {
                   setSelectorValue(next);
@@ -742,7 +1020,7 @@ export function ConfigTab({ workspaceId }: Props) {
                   setConfig((prev) => {
                     const v = next.model;
                     const prevModelId = prev.runtime_config?.model || prev.model || "";
-                    const prevSpec = availableModels.find((m) => m.id === prevModelId) ?? null;
+                    const prevSpec = selectorModels.find((m) => m.id === prevModelId) ?? null;
                     const prevRequired = prev.runtime_config?.required_env ?? [];
                     const wasTemplateDriven =
                       prevRequired.length === 0 ||
@@ -795,6 +1073,7 @@ export function ConfigTab({ workspaceId }: Props) {
                   <label className="text-[10px] text-ink-mid block mb-1">Model</label>
                   <input
                     type="text"
+                    aria-label="Model"
                     value={currentModelId}
                     onChange={(e) => {
                       const v = e.target.value;
@@ -884,6 +1163,8 @@ export function ConfigTab({ workspaceId }: Props) {
               </div>
             )}
           </Section>
+
+          <AgentAbilitiesSection workspaceId={workspaceId} />
 
           {/* Claude Settings — shown for claude-code runtime or claude/anthropic model names */}
           {(config.runtime === "claude-code" ||
@@ -985,6 +1266,8 @@ export function ConfigTab({ workspaceId }: Props) {
             </div>
           </Section>
 
+          <LLMBillingSection workspaceId={workspaceId} />
+
           <SecretsSection
             workspaceId={workspaceId}
             requiredEnv={config.runtime_config?.required_env}
@@ -995,7 +1278,7 @@ export function ConfigTab({ workspaceId }: Props) {
       )}
 
       {error && (
-        <div className="mx-3 mb-2 px-3 py-1.5 bg-red-900/30 border border-red-800 rounded text-xs text-bad">{error}</div>
+        <div role="alert" aria-live="assertive" className="mx-3 mb-2 px-3 py-1.5 bg-red-900/30 border border-red-800 rounded text-xs text-bad">{error}</div>
       )}
       {!error && RUNTIMES_WITH_OWN_CONFIG.has(config.runtime || "") && (
         <div className="mx-3 mb-2 px-3 py-1.5 bg-surface-sunken/50 border border-line rounded text-xs text-ink-mid">

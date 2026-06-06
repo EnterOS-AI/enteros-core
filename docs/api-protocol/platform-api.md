@@ -90,8 +90,6 @@ Poll `GET /workspaces/:id/delegations` to check results. Each entry includes `de
 
 This is the recommended way for agents to delegate work — it works for all runtimes (Claude Code, LangGraph, etc.) since it operates at the platform level.
 
-Workspace creation also assigns an `awareness_namespace` on the workspace row. That namespace is later injected into the provisioned runtime.
-
 ### Registry
 
 | Method | Path | Description | Auth |

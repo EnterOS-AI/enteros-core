@@ -75,6 +75,90 @@ func TestWorkspaceAuth_351_NoBearer_Returns401_NoDBCalls(t *testing.T) {
 	}
 }
 
+// TestWorkspaceAuth_ForgedSameOriginHeaders_Returns401 pins the production
+// boundary for combined tenant images: Referer/Origin are forgeable request
+// headers and must not authenticate workspace data routes.
+func TestWorkspaceAuth_ForgedSameOriginHeaders_Returns401(t *testing.T) {
+	t.Setenv("MOLECULE_ENV", "production")
+	t.Setenv("ADMIN_TOKEN", "admin-secret")
+	prev := canvasProxyActive
+	canvasProxyActive = true
+	defer func() { canvasProxyActive = prev }()
+
+	mockDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer mockDB.Close()
+
+	r := gin.New()
+	r.GET("/workspaces/:id/secrets", WorkspaceAuth(mockDB), func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"ok": true})
+	})
+	r.DELETE("/workspaces/:id/secrets/:key", WorkspaceAuth(mockDB), func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"ok": true})
+	})
+
+	for _, tt := range []struct {
+		name   string
+		method string
+		path   string
+	}{
+		{"list secrets", http.MethodGet, "/workspaces/ws-forged/secrets"},
+		{"delete secret", http.MethodDelete, "/workspaces/ws-forged/secrets/HERMES_CUSTOM_API_KEY"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			req, _ := http.NewRequest(tt.method, tt.path, nil)
+			req.Host = "tenant.example.test"
+			req.Header.Set("Referer", "https://tenant.example.test/")
+			req.Header.Set("Origin", "https://tenant.example.test")
+			r.ServeHTTP(w, req)
+			if w.Code != http.StatusUnauthorized {
+				t.Fatalf("forged same-origin headers: expected 401, got %d: %s", w.Code, w.Body.String())
+			}
+		})
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+func TestWorkspaceAuth_VerifiedTenantSessionCookie_AllowsCanvas(t *testing.T) {
+	resetSessionCache()
+	t.Setenv("MOLECULE_ENV", "production")
+	t.Setenv("ADMIN_TOKEN", "admin-secret")
+	t.Setenv("MOLECULE_ORG_SLUG", "tenant-a")
+	srv, _ := mockCPServer(t, http.StatusOK, `{"member":true,"user_id":"u_1","role":"owner","org_id":"org_1"}`)
+	t.Setenv("CP_UPSTREAM_URL", srv.URL)
+
+	mockDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer mockDB.Close()
+
+	r := gin.New()
+	r.GET("/workspaces/:id/secrets", WorkspaceAuth(mockDB), func(c *gin.Context) {
+		if _, ok := c.Get("cp_session_actor"); !ok {
+			t.Errorf("cp_session_actor was not set")
+		}
+		c.JSON(http.StatusOK, gin.H{"ok": true})
+	})
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/workspaces/ws-session/secrets", nil)
+	req.Header.Set("Cookie", "molecule_session=valid")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("verified tenant session: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
 // TestWorkspaceAuth_C4_C8_NoBearer_Returns401 — C4/C8 critical path:
 // when a workspace has live tokens and the caller sends NO bearer token,
 // the middleware must return 401.  This was the confirmed attack vector —
@@ -255,14 +339,24 @@ func TestWorkspaceAuth_WrongWorkspace_Returns401(t *testing.T) {
 // TestAdminAuth_FailOpen_NoTokensGlobally — C10/C11: on a fresh install (no
 // live tokens anywhere) the middleware must let the request through so existing
 // deployments keep working during the Phase-30 rollout.
-func TestAdminAuth_FailOpen_NoTokensGlobally(t *testing.T) {
+// TestAdminAuth_FreshInstallNoTokens_FailsClosed pins the post-hardening
+// contract (harden/no-fail-open-auth): on a fresh install with NO live
+// tokens anywhere AND no ADMIN_TOKEN, a bearer-less admin request now 401s.
+// The former Tier-1 "lazy-bootstrap fail-open" (no tokens ⇒ 200) is GONE —
+// it let an attacker pre-empt the first user via /org/import (C4). A fresh
+// install must provision ADMIN_TOKEN to reach admin routes.
+func TestAdminAuth_FreshInstallNoTokens_FailsClosed(t *testing.T) {
+	t.Setenv("ADMIN_TOKEN", "")
+	t.Setenv("MOLECULE_ENV", "")
 	mockDB, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock.New: %v", err)
 	}
 	defer mockDB.Close()
 
-	// HasAnyLiveTokenGlobal returns 0 — fresh install.
+	// HasAnyLiveTokenGlobal returns 0 — fresh install. We still probe it
+	// (so a DB outage yields a structured 503), but the result no longer
+	// opens any path.
 	mock.ExpectQuery(hasAnyLiveTokenGlobalQuery).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
 
@@ -275,8 +369,56 @@ func TestAdminAuth_FailOpen_NoTokensGlobally(t *testing.T) {
 	req, _ := http.NewRequest(http.MethodGet, "/admin/secrets", nil)
 	r.ServeHTTP(w, req)
 
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("fresh-install no-token fail-closed: expected 401, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+func TestAdminAuth_VerifiedCPSession_SetsSessionActor(t *testing.T) {
+	resetSessionCache()
+	srv, hits := mockCPServer(t, http.StatusOK, `{"member":true,"user_id":"u_1","role":"owner","org_id":"org_1"}`)
+	t.Setenv("CP_UPSTREAM_URL", srv.URL)
+	t.Setenv("MOLECULE_ORG_SLUG", "acme")
+	t.Setenv("ADMIN_TOKEN", "admin-secret")
+
+	mockDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer mockDB.Close()
+
+	mock.ExpectQuery(hasAnyLiveTokenGlobalQuery).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+
+	const cookie = "session=valid-browser-session"
+	r := gin.New()
+	r.GET("/workspaces", AdminAuth(mockDB), func(c *gin.Context) {
+		actor, ok := c.Get("cp_session_actor")
+		if !ok {
+			t.Fatalf("expected cp_session_actor in context")
+		}
+		if actor != cpSessionActor(cookie) {
+			t.Fatalf("cp_session_actor = %q, want stable hashed actor", actor)
+		}
+		if actor == cookie {
+			t.Fatalf("cp_session_actor must not expose the raw cookie")
+		}
+		c.JSON(http.StatusOK, gin.H{"ok": true})
+	})
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/workspaces", nil)
+	req.Header.Set("Cookie", cookie)
+	r.ServeHTTP(w, req)
+
 	if w.Code != http.StatusOK {
-		t.Errorf("C10 fail-open (no global tokens): expected 200, got %d: %s", w.Code, w.Body.String())
+		t.Fatalf("expected 200 for verified CP session, got %d: %s", w.Code, w.Body.String())
+	}
+	if hits.Load() != 1 {
+		t.Fatalf("expected one CP verification request, got %d", hits.Load())
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations: %v", err)
@@ -375,6 +517,7 @@ func TestAdminAuth_C11_DeleteNoBearer_Returns401(t *testing.T) {
 // TestAdminAuth_ValidBearer_Passes — a valid bearer token (from any workspace)
 // must be accepted for admin routes.
 func TestAdminAuth_ValidBearer_Passes(t *testing.T) {
+	t.Setenv("ADMIN_TOKEN", "")
 	mockDB, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock.New: %v", err)
@@ -418,6 +561,7 @@ func TestAdminAuth_ValidBearer_Passes(t *testing.T) {
 
 // TestAdminAuth_InvalidBearer_Returns401 — wrong token must not grant admin access.
 func TestAdminAuth_InvalidBearer_Returns401(t *testing.T) {
+	t.Setenv("ADMIN_TOKEN", "")
 	mockDB, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock.New: %v", err)
@@ -696,17 +840,23 @@ func TestAdminAuth_Issue180_ApprovalsListing_NoBearer_Returns401(t *testing.T) {
 	}
 }
 
-// TestAdminAuth_Issue180_ApprovalsListing_FailOpen_NoTokens documents the
-// fail-open contract: on a fresh install (no tokens anywhere), the middleware
-// must not block the canvas from polling /approvals/pending.
-func TestAdminAuth_Issue180_ApprovalsListing_FailOpen_NoTokens(t *testing.T) {
+// TestAdminAuth_Issue180_ApprovalsListing_FreshInstall_FailsClosed pins the
+// post-hardening contract (harden/no-fail-open-auth): on a fresh install (no
+// tokens anywhere, no ADMIN_TOKEN), the canvas polling /approvals/pending with
+// no bearer now gets 401. The former #180 fail-open (200 on no-tokens) is gone
+// — local dev now provisions an ADMIN_TOKEN and the canvas authenticates with
+// it (scripts/dev-start.sh).
+func TestAdminAuth_Issue180_ApprovalsListing_FreshInstall_FailsClosed(t *testing.T) {
+	t.Setenv("ADMIN_TOKEN", "")
+	t.Setenv("MOLECULE_ENV", "")
 	mockDB, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock.New: %v", err)
 	}
 	defer mockDB.Close()
 
-	// HasAnyLiveTokenGlobal returns 0 — fresh install, no tokens yet.
+	// HasAnyLiveTokenGlobal returns 0 — fresh install, no tokens yet. Probed
+	// for the 503-on-outage semantics, but it opens no path now.
 	mock.ExpectQuery(hasAnyLiveTokenGlobalQuery).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
 
@@ -719,24 +869,21 @@ func TestAdminAuth_Issue180_ApprovalsListing_FailOpen_NoTokens(t *testing.T) {
 	req, _ := http.NewRequest(http.MethodGet, "/approvals/pending", nil)
 	r.ServeHTTP(w, req)
 
-	if w.Code != http.StatusOK {
-		t.Errorf("#180 fail-open (no tokens): expected 200, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("#180 fresh-install fail-closed: expected 401, got %d: %s", w.Code, w.Body.String())
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations: %v", err)
 	}
 }
 
-// TestWorkspaceAuth_DevModeEscapeHatch_NoBearer_FailsOpen documents the
-// local-dev escape hatch on WorkspaceAuth. On `go run ./cmd/server` +
-// `npm run dev`, Canvas at localhost:3000 calls the platform at
-// localhost:8080 cross-port, so isSameOriginCanvas's Host==Referer
-// check fails. Without this hatch the Canvas can't show per-workspace
-// activity/delegations.
-//
-// SaaS never fires this branch because tenant provisioning sets both
-// MOLECULE_ENV=production and ADMIN_TOKEN.
-func TestWorkspaceAuth_DevModeEscapeHatch_NoBearer_FailsOpen(t *testing.T) {
+// TestWorkspaceAuth_DevMode_NoBearer_FailsClosed pins the post-hardening
+// contract (harden/no-fail-open-auth): the former local-dev escape hatch on
+// WorkspaceAuth — which let a bearer-less request through when
+// MOLECULE_ENV=dev + ADMIN_TOKEN unset — is GONE. Under exactly those
+// conditions the request now 401s. Local dev authenticates with a
+// provisioned ADMIN_TOKEN handed to the Canvas (scripts/dev-start.sh).
+func TestWorkspaceAuth_DevMode_NoBearer_FailsClosed(t *testing.T) {
 	t.Setenv("MOLECULE_ENV", "development")
 	t.Setenv("ADMIN_TOKEN", "")
 
@@ -746,7 +893,9 @@ func TestWorkspaceAuth_DevModeEscapeHatch_NoBearer_FailsOpen(t *testing.T) {
 	}
 	defer mockDB.Close()
 
-	// No DB queries expected — the hatch short-circuits before any lookup.
+	// No DB queries expected — WorkspaceAuth 401s before any lookup when
+	// there is no bearer / cookie. The hatch that used to short-circuit
+	// here no longer exists.
 
 	r := gin.New()
 	r.GET("/workspaces/:id/activity", WorkspaceAuth(mockDB), func(c *gin.Context) {
@@ -758,8 +907,8 @@ func TestWorkspaceAuth_DevModeEscapeHatch_NoBearer_FailsOpen(t *testing.T) {
 		"/workspaces/00000000-0000-0000-0000-000000000000/activity", nil)
 	r.ServeHTTP(w, req)
 
-	if w.Code != http.StatusOK {
-		t.Errorf("WorkspaceAuth dev-mode hatch: expected 200, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("WorkspaceAuth dev-mode fail-closed: expected 401, got %d: %s", w.Code, w.Body.String())
 	}
 }
 
@@ -821,15 +970,14 @@ func TestWorkspaceAuth_DevModeEscapeHatch_IgnoredWhenAdminTokenSet(t *testing.T)
 	}
 }
 
-// TestAdminAuth_DevModeEscapeHatch_FailsOpenWithHasLiveTokens documents the
-// Tier-1b dev-mode escape hatch. When the platform runs with MOLECULE_ENV=development
-// and ADMIN_TOKEN is unset, AdminAuth must stay fail-open even after workspace
-// tokens land in the DB. This keeps the Canvas dashboard usable in local dev
-// after the first workspace is created (PR #1871 — quickstart bugless).
-//
-// SaaS never hits this path because tenant provisioning sets both
-// ADMIN_TOKEN and MOLECULE_ENV=production.
-func TestAdminAuth_DevModeEscapeHatch_FailsOpenWithHasLiveTokens(t *testing.T) {
+// TestAdminAuth_DevMode_NoBearer_FailsClosed pins the post-hardening contract
+// (harden/no-fail-open-auth): the former Tier-1b dev-mode escape hatch — which
+// let AdminAuth pass a bearer-less request when MOLECULE_ENV=dev + ADMIN_TOKEN
+// unset, even with live tokens in the DB — is GONE. Under exactly those
+// conditions the request now 401s. Local dev authenticates with a provisioned
+// ADMIN_TOKEN handed to the Canvas as NEXT_PUBLIC_ADMIN_TOKEN
+// (scripts/dev-start.sh).
+func TestAdminAuth_DevMode_NoBearer_FailsClosed(t *testing.T) {
 	t.Setenv("MOLECULE_ENV", "development")
 	t.Setenv("ADMIN_TOKEN", "")
 
@@ -840,7 +988,7 @@ func TestAdminAuth_DevModeEscapeHatch_FailsOpenWithHasLiveTokens(t *testing.T) {
 	defer mockDB.Close()
 
 	// HasAnyLiveTokenGlobal returns 1 — tokens exist (post first-workspace).
-	// The Tier-1 fail-open branch WOULD close here. Tier-1b must still open.
+	// Probed for the 503-on-outage semantics, but it opens no path now.
 	mock.ExpectQuery(hasAnyLiveTokenGlobalQuery).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
 
@@ -853,8 +1001,8 @@ func TestAdminAuth_DevModeEscapeHatch_FailsOpenWithHasLiveTokens(t *testing.T) {
 	req, _ := http.NewRequest(http.MethodGet, "/workspaces", nil)
 	r.ServeHTTP(w, req)
 
-	if w.Code != http.StatusOK {
-		t.Errorf("dev-mode escape hatch: expected 200, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("dev-mode fail-closed: expected 401, got %d: %s", w.Code, w.Body.String())
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations: %v", err)
@@ -968,7 +1116,16 @@ func TestAdminAuth_Issue120_PatchWorkspace_NoBearer_Returns401(t *testing.T) {
 // Accepts bearer or a matching Origin header. MUST NOT be used anywhere a
 // forged request would leak data or create resources.
 
-func TestCanvasOrBearer_NoTokens_FailOpen(t *testing.T) {
+// TestCanvasOrBearer_NoTokens_FailsClosed pins the removal of the
+// lazy-bootstrap fail-open (harden/no-fail-open-auth): a zero-token install
+// must NOT pass everything through. A bearer-less request on a fresh install
+// (HasAnyLiveTokenGlobal → 0) now 401s. Bootstrap is via ADMIN_TOKEN
+// (scripts/dev-start.sh provisions it for local dev; operator/SaaS sets it in
+// production) — not a zero-config fail-open.
+//
+// Watch-it-fail: restore `if !hasLive { c.Next(); return }` in CanvasOrBearer
+// → this flips 401→200 and fails.
+func TestCanvasOrBearer_NoTokens_FailsClosed(t *testing.T) {
 	mockDB, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock: %v", err)
@@ -978,8 +1135,10 @@ func TestCanvasOrBearer_NoTokens_FailOpen(t *testing.T) {
 	mock.ExpectQuery(hasAnyLiveTokenGlobalQuery).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
 
+	handlerCalled := false
 	r := gin.New()
 	r.PUT("/canvas/viewport", CanvasOrBearer(mockDB), func(c *gin.Context) {
+		handlerCalled = true
 		c.JSON(http.StatusOK, gin.H{"ok": true})
 	})
 
@@ -987,8 +1146,11 @@ func TestCanvasOrBearer_NoTokens_FailOpen(t *testing.T) {
 	req, _ := http.NewRequest(http.MethodPut, "/canvas/viewport", nil)
 	r.ServeHTTP(w, req)
 
-	if w.Code != http.StatusOK {
-		t.Errorf("bootstrap fail-open: got %d, want 200 (%s)", w.Code, w.Body.String())
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("zero-token install must fail CLOSED (lazy-bootstrap fail-open removed): got %d, want 401 (%s)", w.Code, w.Body.String())
+	}
+	if handlerCalled {
+		t.Error("handler reached on a fresh-install bearer-less request — lazy-bootstrap fail-open not removed")
 	}
 }
 
@@ -1059,7 +1221,16 @@ func TestCanvasOrBearer_TokensExist_WrongOrigin_Returns401(t *testing.T) {
 	}
 }
 
-func TestCanvasOrBearer_TokensExist_CanvasOrigin_Passes(t *testing.T) {
+// TestCanvasOrBearer_TokensExist_ForgeableOrigin_NoBearer_FailsClosed pins the
+// removal of the cross-origin Origin-match cosmetic path
+// (harden/no-fail-open-auth). A no-bearer request whose forgeable Origin header
+// matches CORS_ORIGINS used to pass; it now 401s. The canvas always sends a
+// bearer (NEXT_PUBLIC_ADMIN_TOKEN), so legitimate traffic is unaffected, and a
+// curl that forges Origin can no longer reach even a cosmetic route.
+//
+// Watch-it-fail: restore `if canvasOriginAllowed(c.GetHeader("Origin")) {
+// c.Next(); return }` in CanvasOrBearer → this flips 401→200 and fails.
+func TestCanvasOrBearer_TokensExist_ForgeableOrigin_NoBearer_FailsClosed(t *testing.T) {
 	mockDB, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock: %v", err)
@@ -1071,18 +1242,24 @@ func TestCanvasOrBearer_TokensExist_CanvasOrigin_Passes(t *testing.T) {
 
 	t.Setenv("CORS_ORIGINS", "https://acme.moleculesai.app,https://bob.moleculesai.app")
 
+	handlerCalled := false
 	r := gin.New()
 	r.PUT("/canvas/viewport", CanvasOrBearer(mockDB), func(c *gin.Context) {
+		handlerCalled = true
 		c.JSON(http.StatusOK, gin.H{"ok": true})
 	})
 
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest(http.MethodPut, "/canvas/viewport", nil)
+	// A matching-but-forgeable Origin with NO bearer must NOT pass anymore.
 	req.Header.Set("Origin", "https://acme.moleculesai.app")
 	r.ServeHTTP(w, req)
 
-	if w.Code != http.StatusOK {
-		t.Errorf("canvas origin: got %d, want 200 (%s)", w.Code, w.Body.String())
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("no-bearer request on a forgeable matching Origin must fail CLOSED (Origin-match path removed): got %d, want 401 (%s)", w.Code, w.Body.String())
+	}
+	if handlerCalled {
+		t.Error("handler reached on a no-bearer forgeable-Origin request — Origin-match fail-open not removed")
 	}
 }
 
@@ -1098,6 +1275,7 @@ func TestCanvasOrBearer_TokensExist_CanvasOrigin_Passes(t *testing.T) {
 // issuing workspace has status='removed' must not grant admin access.
 // The JOIN in ValidateAnyToken filters the row out, resulting in ErrNoRows.
 func TestAdminAuth_RemovedWorkspaceToken_Returns401(t *testing.T) {
+	t.Setenv("ADMIN_TOKEN", "")
 	mockDB, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock.New: %v", err)
@@ -1161,21 +1339,9 @@ func TestCanvasOrBearer_WrongOrigin_Blocked(t *testing.T) {
 	}
 }
 
-func TestCanvasOriginAllowed_EmptyOriginRejected(t *testing.T) {
-	if canvasOriginAllowed("") {
-		t.Error("empty Origin must not pass")
-	}
-}
-
-func TestCanvasOriginAllowed_LocalhostDefault(t *testing.T) {
-	t.Setenv("CORS_ORIGINS", "")
-	if !canvasOriginAllowed("http://localhost:3000") {
-		t.Error("localhost:3000 should be allowed by default")
-	}
-	if canvasOriginAllowed("http://evil.example.com") {
-		t.Error("random origin should not be allowed")
-	}
-}
+// (harden/no-fail-open-auth) TestCanvasOriginAllowed_* were REMOVED along with
+// the canvasOriginAllowed helper they exercised — the forgeable cross-origin
+// Origin-match cosmetic path no longer exists in CanvasOrBearer.
 
 // ── Issue #623 regression ─────────────────────────────────────────────────────
 // AdminAuth must NOT accept forged Origin headers. Any container on the Docker
@@ -1251,6 +1417,7 @@ func TestAdminAuth_623_ForgedCORSOrigin_Returns401(t *testing.T) {
 // TestAdminAuth_623_ValidBearer_WithOrigin_Passes — bearer + matching Origin
 // should still work (the Origin is irrelevant once the bearer validates).
 func TestAdminAuth_623_ValidBearer_WithOrigin_Passes(t *testing.T) {
+	t.Setenv("ADMIN_TOKEN", "")
 	mockDB, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock: %v", err)

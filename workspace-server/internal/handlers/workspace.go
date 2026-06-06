@@ -18,13 +18,14 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/crypto"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/events"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/models"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/provisioner"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/wsauth"
-	"github.com/Molecule-AI/molecule-monorepo/platform/pkg/provisionhook"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/crypto"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/memory/contract"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wsauth"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/pkg/provisionhook"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
@@ -55,6 +56,7 @@ type WorkspaceHandler struct {
 	cpProv      provisioner.CPProvisionerAPI
 	platformURL string
 	configsDir  string // path to workspace-configs-templates/ (for reading templates)
+	cacheDir    string // optional runtime-refreshed template cache; overrides configsDir by template id
 	// envMutators runs registered EnvMutator plugins right before
 	// container Start, after built-in secret loads. Nil = no plugins
 	// registered; Registry.Run handles a nil receiver as a no-op so the
@@ -74,11 +76,38 @@ type WorkspaceHandler struct {
 	// memory plugin). main.go sets this to plugin.DeleteNamespace
 	// when MEMORY_PLUGIN_URL is configured.
 	namespaceCleanupFn func(ctx context.Context, workspaceID string)
+	// seedMemoryPlugin is the v2 memory plugin client used by
+	// seedInitialMemories (issue #1755) to write workspace-create
+	// `initial_memories` into the plugin instead of the legacy
+	// `agent_memories` table. nil-safe: when nil, seeding logs a loud
+	// warning and skips. After A1 (#1747) there is no SQL fallback —
+	// seeded memories with no plugin wired are simply not persisted.
+	// main.go attaches this alongside namespaceCleanupFn when
+	// MEMORY_PLUGIN_URL is set (memBundle.Plugin).
+	seedMemoryPlugin seedMemoryPluginAPI
 	// asyncWG tracks goroutines launched by goAsync so tests can wait
 	// for async DB users (restart, provision) before asserting results.
 	// Matches the pattern from main commit 1c3b4ff3.
 	asyncWG sync.WaitGroup
 }
+
+// seedMemoryPluginAPI is the slice of the v2 memory plugin client that
+// seedInitialMemories needs. Defining it as an interface here (parallel
+// to memoryPluginAPI in mcp_tools_memory_v2.go) lets tests stub the
+// plugin with a capture-only spy and keeps the handler decoupled from
+// the concrete *client.Client.
+type seedMemoryPluginAPI interface {
+	CommitMemory(ctx context.Context, namespace string, body contract.MemoryWrite) (*contract.MemoryWriteResponse, error)
+}
+
+// newHandlerHook, when non-nil, is invoked for every WorkspaceHandler
+// created via NewWorkspaceHandler. It is nil in production (zero cost);
+// the test harness sets it so setupTestDB can drain every handler's
+// in-flight async goroutines before swapping the global db.DB. Without
+// this, a detached restart goroutine (maybeMarkContainerDead ->
+// goAsync(RestartByID) -> runRestartCycle reads db.DB) races the
+// db.DB restore in another test's t.Cleanup.
+var newHandlerHook func(*WorkspaceHandler)
 
 func (h *WorkspaceHandler) goAsync(fn func()) {
 	h.asyncWG.Add(1)
@@ -90,6 +119,47 @@ func (h *WorkspaceHandler) goAsync(fn func()) {
 
 func (h *WorkspaceHandler) waitAsyncForTest() {
 	h.asyncWG.Wait()
+}
+
+// globalAsync tracks goroutines launched by globalGoAsync — the
+// equivalent of WorkspaceHandler.goAsync for sibling handlers that
+// don't carry a *WorkspaceHandler reference (SecretsHandler /
+// PluginsHandler / AdminPluginDriftHandler / ChannelHandler /
+// MCPHandler / RegistryHandler), and for callers of package-level
+// free functions (a2a_proxy_helpers extractAndUpsertTokenUsage).
+//
+// Forward-port of RFC internal#524 Layer 1 deliverable 2: the
+// canonical db.DB race fix lives at workspace.go:goAsync / asyncWG,
+// but ~25 sibling bare-`go` sites still write to db.DB outside any
+// WorkspaceHandler's drain window. globalAsync gives them the same
+// drain hook (waitGlobalAsyncForTest, drained from drainTestAsync)
+// so a test's t.Cleanup db.DB restore cannot race a detached
+// goroutine spawned by any sibling handler.
+//
+// Zero-cost in production (a single sync.WaitGroup Add/Done per
+// fire-and-forget call, no test-only branching).
+var globalAsync sync.WaitGroup
+
+// globalGoAsync schedules fn on a detached goroutine tracked by
+// globalAsync. Use this in package-internal callers that don't have
+// a *WorkspaceHandler receiver to thread h.goAsync through.
+//
+// When a *WorkspaceHandler IS available, prefer h.goAsync — it lets
+// per-handler tests (waitAsyncForTest) wait without disturbing
+// unrelated handlers' inflight work.
+func globalGoAsync(fn func()) {
+	globalAsync.Add(1)
+	go func() {
+		defer globalAsync.Done()
+		fn()
+	}()
+}
+
+// waitGlobalAsyncForTest blocks until every globalGoAsync goroutine
+// finishes. Called from drainTestAsync's cleanup chain in the test
+// harness; production code never calls it.
+func waitGlobalAsyncForTest() {
+	globalAsync.Wait()
 }
 
 func NewWorkspaceHandler(b events.EventEmitter, p *provisioner.Provisioner, platformURL, configsDir string) *WorkspaceHandler {
@@ -108,6 +178,14 @@ func NewWorkspaceHandler(b events.EventEmitter, p *provisioner.Provisioner, plat
 	if p != nil {
 		h.provisioner = p
 	}
+	if newHandlerHook != nil {
+		newHandlerHook(h)
+	}
+	return h
+}
+
+func (h *WorkspaceHandler) WithTemplateCacheDir(cacheDir string) *WorkspaceHandler {
+	h.cacheDir = cacheDir
 	return h
 }
 
@@ -118,6 +196,19 @@ func NewWorkspaceHandler(b events.EventEmitter, p *provisioner.Provisioner, plat
 // purge path treats as a no-op.
 func (h *WorkspaceHandler) WithNamespaceCleanup(fn func(ctx context.Context, workspaceID string)) *WorkspaceHandler {
 	h.namespaceCleanupFn = fn
+	return h
+}
+
+// WithSeedMemoryPlugin wires the v2 memory plugin so
+// seedInitialMemories (issue #1755) routes workspace-create
+// `initial_memories` through the plugin instead of the legacy
+// `agent_memories` table. main.go passes memBundle.Plugin (a
+// `*client.Client`); tests pass a stub matching the
+// seedMemoryPluginAPI interface. Nil-safe: omitting this leaves the
+// field nil and seedInitialMemories logs a warning + skips on each
+// invocation.
+func (h *WorkspaceHandler) WithSeedMemoryPlugin(p seedMemoryPluginAPI) *WorkspaceHandler {
+	h.seedMemoryPlugin = p
 	return h
 }
 
@@ -163,7 +254,6 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 	}
 
 	id := uuid.New().String()
-	awarenessNamespace := workspaceAwarenessNamespace(id)
 	if h.IsSaaS() {
 		// SaaS hard gate: every hosted workspace gets its own sibling
 		// EC2 instance, so T4 is the only meaningful runtime boundary.
@@ -186,11 +276,22 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 	// back to its compiled-in Anthropic default and 401s when the user's
 	// key is for a different provider. Non-hermes runtimes are unaffected
 	// (the server still passes model through, they just don't use it).
+	// runtimeExplicitlyRequested is true when the caller expressed intent for
+	// a SPECIFIC runtime — either by passing `runtime` directly, or by naming
+	// a `template` (a template encodes a runtime). When true, we must NOT
+	// silently fall back to the default runtime if that intent can't be honored: that
+	// is the molecule-controlplane#188 / #184 contract violation (caller asks
+	// for codex/hermes/openclaw, gets a default-runtime workspace, 201, no error — a
+	// false success). #188 mandates fail-closed (error+notify) on mismatch,
+	// not an advisory degrade. The legitimate "no template, no runtime →
+	// default-runtime path (bare {"name":...}) is unaffected.
+	runtimeExplicitlyRequested := payload.Runtime != "" || payload.Template != ""
+	templateRuntimeResolved := payload.Runtime != ""
 	if payload.Template != "" && (payload.Runtime == "" || payload.Model == "") {
 		// #226: payload.Template is attacker-controllable. resolveInsideRoot
 		// rejects absolute paths and any ".." that escapes configsDir so the
 		// provisioner can't be pointed at host directories.
-		candidatePath, resolveErr := resolveInsideRoot(h.configsDir, payload.Template)
+		candidatePath, resolveErr := resolveWorkspaceTemplatePath(h.configsDir, h.cacheDir, payload.Template)
 		if resolveErr != nil {
 			log.Printf("Create: invalid template path %q: %v", payload.Template, resolveErr)
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid template"})
@@ -218,6 +319,9 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 			switch {
 			case payload.Runtime == "" && !indented && strings.HasPrefix(stripped, "runtime:") && !strings.HasPrefix(stripped, "runtime_config"):
 				payload.Runtime = strings.TrimSpace(strings.TrimPrefix(stripped, "runtime:"))
+				if payload.Runtime != "" {
+					templateRuntimeResolved = true
+				}
 			case payload.Model == "" && !indented && strings.HasPrefix(stripped, "model:"):
 				// Legacy top-level `model:` — pre-runtime_config templates.
 				payload.Model = strings.Trim(strings.TrimSpace(strings.TrimPrefix(stripped, "model:")), `"'`)
@@ -230,8 +334,172 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 			}
 		}
 	}
+	// Fail-closed (molecule-controlplane#188 / #184): if the caller expressed
+	// intent for a specific runtime (passed `runtime`, or named a `template`)
+	// but we could NOT resolve a concrete runtime from it (template's
+	// config.yaml unreadable, or it has no `runtime:` key), DO NOT silently
+	// substitute the default runtime and return 201 — that is the silent contract
+	// violation that produced 5/5 wrong workspaces and a false codex E2E pass.
+	// Return 422 so the caller learns the requested runtime was not honored.
+	// The platform-side CP fix (controlplane#188) is the sibling gate; this
+	// closes the ws-server `Create` boundary the product UI actually hits.
+	if payload.Runtime == "" && runtimeExplicitlyRequested && !templateRuntimeResolved {
+		log.Printf("Create: FAIL-CLOSED (controlplane#188) — template=%q requested but runtime could not be resolved; refusing silent default-runtime fallback", payload.Template)
+		c.JSON(http.StatusUnprocessableEntity, gin.H{
+			"error":    "runtime could not be resolved from the requested template; refusing to silently provision the default runtime (controlplane#188). Pass an explicit \"runtime\", or use a template whose config.yaml declares one.",
+			"template": payload.Template,
+			"code":     "RUNTIME_UNRESOLVED",
+		})
+		return
+	}
 	if payload.Runtime == "" {
-		payload.Runtime = "langgraph"
+		if payload.External {
+			payload.Runtime = "external"
+		} else {
+			// Legitimate default path: no template AND no runtime requested
+			// (bare {"name":...}) — claude-code is the intended default here.
+			payload.Runtime = "claude-code"
+		}
+	}
+
+	if payload.External && !isExternalLikeRuntime(payload.Runtime) {
+		log.Printf("Create: FAIL-CLOSED — external workspace requested with non-external runtime %q", payload.Runtime)
+		c.JSON(http.StatusUnprocessableEntity, gin.H{
+			"error":   "external workspaces must use runtime \"external\", \"kimi\", or \"kimi-cli\"",
+			"runtime": payload.Runtime,
+			"code":    "RUNTIME_UNSUPPORTED",
+		})
+		return
+	}
+	if payload.Runtime != "" && !isExternalLikeRuntime(payload.Runtime) {
+		if _, ok := knownRuntimes[payload.Runtime]; !ok {
+			log.Printf("Create: FAIL-CLOSED — unsupported runtime %q", payload.Runtime)
+			c.JSON(http.StatusUnprocessableEntity, gin.H{
+				"error":   "unsupported workspace runtime",
+				"runtime": payload.Runtime,
+				"code":    "RUNTIME_UNSUPPORTED",
+			})
+			return
+		}
+	}
+
+	// SSOT (CTO 2026-05-22, feedback_workspace_model_required_no_platform_default_dynamic_credential_intake):
+	// model is REQUIRED user input for SPAWNED-runtime workspaces. The
+	// platform must not provide a default; the runtime must not fall back.
+	// The decision belongs to the user (or to the agent acting on the
+	// user's behalf), never to the platform.
+	//
+	// Empirical trigger: Code Reviewer 5ba15d7e was created with
+	// `{"name":"Code Reviewer","role":"...","runtime":"codex",...}` (no
+	// model). The legacy `DefaultModel(runtime)` fallback in
+	// provisionWorkspace returned `"anthropic:claude-opus-4-7"`. Codex
+	// adapter only supports openai-* providers — it wedged forever with
+	// `codex adapter: workspace config picks provider='anthropic' but
+	// it is not in the providers registry`. PATCH /workspaces/:id
+	// explicitly disallows updating model (the comment literally reads
+	// `model not patchable`), so the only recovery path was SQL UPDATE
+	// or delete+recreate.
+	//
+	// External workspaces are EXEMPT — they intentionally do not spawn
+	// a Docker container or run an adapter; they delegate to a registered
+	// URL (see provision.go: "external is a first-class runtime that
+	// intentionally does NOT spawn a Docker container"). The MODEL_REQUIRED
+	// gate is meaningful for spawned-runtime workspaces where the model
+	// id drives provider selection at adapter init. For external workspaces
+	// the contract is the URL, not the model — requiring it would be
+	// ceremony with no payoff, and would 422 every legitimate "register
+	// my agent at https://..." flow. The SSOT directive concerns
+	// platform-side defaults; an external workspace genuinely has no
+	// "model decision" for the user to make.
+	//
+	// Fail-closed at the Create boundary so the caller learns the
+	// contract immediately — same shape as the controlplane#188
+	// runtime-unresolved gate above. Caller fixes the request, no
+	// EC2 launched, no stuck workspace, no operator paging.
+	isExternal := payload.External || isExternalLikeRuntime(payload.Runtime)
+	if payload.Model == "" && !isExternal {
+		log.Printf("Create: FAIL-CLOSED — model is required (runtime=%q template=%q); refusing the silent DefaultModel fallback per CTO 2026-05-22 SSOT directive", payload.Runtime, payload.Template)
+		c.JSON(http.StatusUnprocessableEntity, gin.H{
+			"error":    "model is required and has no platform-side default — pass an explicit \"model\" in the request body, or use a \"template\" whose config.yaml declares one. See feedback_workspace_model_required_no_platform_default_dynamic_credential_intake for the contract.",
+			"runtime":  payload.Runtime,
+			"template": payload.Template,
+			"code":     "MODEL_REQUIRED",
+		})
+		return
+	}
+
+	// internal#718 P4 PR-2: ONLY-REGISTERED validation at the create boundary —
+	// FLIPPED from WARN to HARD-REJECT (was the P2-B WARN-mode signal).
+	//
+	// For a runtime the provider registry knows (first-party:
+	// claude-code/codex/hermes/openclaw) this checks the (runtime, model) pair
+	// against the registry's native model set. Fails OPEN for runtimes the
+	// registry doesn't know (langgraph/external/kimi/mock/federated) so
+	// non-first-party / federated flows are UNCHANGED. Skipped for external
+	// workspaces (the URL is the contract, not the model — see MODEL_REQUIRED
+	// rationale above).
+	//
+	// THE FLIP (was WARN, now 422):
+	//   * P2-B carried the gate in WARN mode (X-Molecule-Model-Unregistered
+	//     response header + log line, create proceeds) because the legacy
+	//     colon-namespaced BYOK vocabulary ('anthropic:claude-opus-4-7' etc.)
+	//     was live across the create corpus but not yet in the registry's
+	//     exact-id model sets — hard-rejecting would have 422'd legitimate
+	//     existing flows.
+	//   * P4 PR-1 reconciled that colon vocab into the registry as
+	//     first-class native-set entries (each runtime native set now lists
+	//     both bare/slash AND colon forms for the BYOK ids the live corpus
+	//     uses; openclaw's pre-existing colon-form precedent extended to
+	//     claude-code). DeriveProvider / Manifest.ModelsForRuntime now
+	//     resolves every legitimate model in the corpus.
+	//   * With the reconcile landed, an unregistered (runtime, model) pair
+	//     is a real misconfiguration — the corpus has no legitimate model
+	//     this validator now rejects. We flip to 422
+	//     UNREGISTERED_MODEL_FOR_RUNTIME so the caller fails LOUDLY at the
+	//     boundary instead of provisioning a workspace that will wedge at
+	//     adapter init (the codex 'anthropic:claude-opus-4-7' wedge class
+	//     the MODEL_REQUIRED gate also targets).
+	//
+	// The registry model set is code-generated from the canonical
+	// providers.yaml (P2-A artifact); the check stays in sync with the SSOT
+	// via the verify-providers-gen + sync-providers-yaml CI gates.
+	if !isExternal {
+		if ok, why := validateRegisteredModelForRuntime(payload.Runtime, payload.Model); !ok {
+			log.Printf("Create: 422 UNREGISTERED_MODEL_FOR_RUNTIME (runtime=%q model=%q): %s [internal#718 P4 PR-2 hard-reject]", payload.Runtime, payload.Model, why)
+			c.JSON(http.StatusUnprocessableEntity, gin.H{
+				"error":   why,
+				"runtime": payload.Runtime,
+				"model":   payload.Model,
+				"code":    "UNREGISTERED_MODEL_FOR_RUNTIME",
+			})
+			return
+		}
+		// issue #2172 (provider-side companion): once the (runtime, model)
+		// pair is known to be registered, confirm the DERIVED provider
+		// (the one the adapter will resolve at boot) is a known provider
+		// in the providers.yaml catalog. Live trigger (adk-demo Assistant,
+		// 2026-06-03): the model-side check passed for a registry-resident
+		// model whose derived provider name was NOT in the providers list,
+		// so the save was accepted and the agent wedged at boot with
+		// "provider=X not in providers registry". This check is a
+		// defense-in-depth registry-consistency guard: by construction a
+		// model in a runtime's native set derives to a provider that IS in
+		// the catalog, so the rejection path is primarily a registry-data
+		// invariant — any future drift between `providers:` and `runtimes:`
+		// fails the create with a clear pointer to the missing provider
+		// rather than silently wedging the agent. Fails open for runtimes
+		// the registry doesn't know (langgraph/external/kimi/mock/federated
+		// — the federation contract the model-side check also honors).
+		if ok, why := validateDerivedProviderInRegistry(payload.Runtime, payload.Model); !ok {
+			log.Printf("Create: 422 DERIVED_PROVIDER_NOT_IN_REGISTRY (runtime=%q model=%q): %s [issue #2172 hard-reject]", payload.Runtime, payload.Model, why)
+			c.JSON(http.StatusUnprocessableEntity, gin.H{
+				"error":   why,
+				"runtime": payload.Runtime,
+				"model":   payload.Model,
+				"code":    "DERIVED_PROVIDER_NOT_IN_REGISTRY",
+			})
+			return
+		}
 	}
 
 	ctx := c.Request.Context()
@@ -259,6 +527,10 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 	}
 	if err := provisioner.ValidateWorkspaceAccess(workspaceAccess, payload.WorkspaceDir); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid workspace access"})
+		return
+	}
+	if err := validateWorkspaceCompute(payload.Compute); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
@@ -312,10 +584,10 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 	// returns the actually-persisted name (which we MUST thread back into
 	// payload + broadcast so the canvas displays what the DB has).
 	const insertWorkspaceSQL = `
-		INSERT INTO workspaces (id, name, role, tier, runtime, awareness_namespace, status, parent_id, workspace_dir, workspace_access, budget_limit, max_concurrent_tasks, delivery_mode)
-		VALUES ($1, $2, $3, $4, $5, $6, 'provisioning', $7, $8, $9, $10, $11, $12)
+		INSERT INTO workspaces (id, name, role, tier, runtime, status, parent_id, workspace_dir, workspace_access, budget_limit, max_concurrent_tasks, delivery_mode)
+		VALUES ($1, $2, $3, $4, $5, 'provisioning', $6, $7, $8, $9, $10, $11)
 	`
-	insertArgs := []any{id, payload.Name, role, payload.Tier, payload.Runtime, awarenessNamespace, payload.ParentID, workspaceDir, workspaceAccess, payload.BudgetLimit, maxConcurrent, deliveryMode}
+	insertArgs := []any{id, payload.Name, role, payload.Tier, payload.Runtime, payload.ParentID, workspaceDir, workspaceAccess, payload.BudgetLimit, maxConcurrent, deliveryMode}
 	persistedName, currentTx, err := insertWorkspaceWithNameRetry(
 		ctx,
 		tx,
@@ -348,10 +620,32 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 		payload.Name = persistedName
 	}
 
+	if !workspaceComputeIsZero(payload.Compute) {
+		computeJSON, encErr := workspaceComputeJSON(payload.Compute)
+		if encErr != nil {
+			tx.Rollback() //nolint:errcheck
+			log.Printf("Create workspace %s: failed to encode compute config: %v", id, encErr)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to encode compute config"})
+			return
+		}
+		if _, dbErr := tx.ExecContext(ctx,
+			`UPDATE workspaces SET compute = $2::jsonb, updated_at = now() WHERE id = $1`,
+			id, computeJSON); dbErr != nil {
+			tx.Rollback() //nolint:errcheck
+			log.Printf("Create workspace %s: failed to persist compute config: %v", id, dbErr)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save compute config"})
+			return
+		}
+	}
+
 	// Persist initial secrets from the create payload (inside same transaction).
 	// nil/empty map is a no-op.  Any failure rolls back the workspace insert
 	// so we never have a workspace row without its intended secrets.
 	for k, v := range payload.Secrets {
+		if rejectPlatformManagedDirectLLMBypassForWorkspace(c, id, k) {
+			tx.Rollback() //nolint:errcheck
+			return
+		}
 		encrypted, encErr := crypto.Encrypt([]byte(v))
 		if encErr != nil {
 			tx.Rollback() //nolint:errcheck
@@ -379,33 +673,38 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 		return
 	}
 
-	// Persist canvas-selected model + derived provider as workspace
-	// secrets so they survive restart and are picked up by CP user-data
-	// when regenerating /configs/config.yaml. Without this, the
-	// applyRuntimeModelEnv fallback chain (workspace_provision.go)
-	// cannot recover the user's choice on a Restart payload (which
-	// rebuilds from the workspaces row, where there is no model column),
-	// and hermes silently boots with the template-default model. See
-	// failed-workspace 95ed3ff2 (2026-05-02): canvas POSTed
-	// minimax/MiniMax-M2.7-highspeed, MODEL_PROVIDER was never written,
-	// container fell through to nousresearch/hermes-4-70b, derive-
-	// provider.sh produced the wrong provider, hermes gateway 401'd,
-	// /health poll failed, molecule-runtime never registered.
+	// Persist canvas-selected model as the MODEL workspace_secret so it
+	// survives restart and is picked up by CP user-data when regenerating
+	// /configs/config.yaml. Without this, the applyRuntimeModelEnv
+	// fallback chain (workspace_provision.go) cannot recover the user's
+	// choice on a Restart payload (which rebuilds from the workspaces
+	// row, where there is no model column), and hermes silently boots
+	// with the template-default model. See failed-workspace 95ed3ff2
+	// (2026-05-02): canvas POSTed minimax/MiniMax-M2.7-highspeed,
+	// MODEL_PROVIDER was never written, container fell through to
+	// nousresearch/hermes-4-70b, derive-provider.sh produced the wrong
+	// provider, hermes gateway 401'd, /health poll failed,
+	// molecule-runtime never registered.
 	//
-	// Both writes are non-fatal: a failure here logs and continues so
-	// the workspace row stays consistent. The runtime can still boot
-	// (with the template default) and a later Save+Restart will re-
-	// persist via the SecretsHandler endpoints. The DB error path here
-	// is rare (the same DB just committed a workspace row a microsecond
-	// ago) so failing the create response would be unfriendly.
+	// internal#718 P4 closure: the prior `setProviderSecret` write
+	// (LLM_PROVIDER row, derived from the canvas-supplied
+	// payload.LLMProvider OR from deriveProviderFromModelSlug) has been
+	// REMOVED. The provider is now DERIVED at every decision point from
+	// (runtime, model) via the registry — billing (P2-B), CP user-data
+	// (this PR's CP-side commit replaces resolveModelAndProvider's
+	// env["LLM_PROVIDER"] read with a DeriveProvider call), and
+	// validation (P3 PR-C provisioner). Storing it is pure write-ghost
+	// with no remaining consumer. `payload.LLMProvider` is preserved on
+	// the request struct for backward-compatibility with older canvases
+	// that still send it; the value is intentionally ignored here.
+	//
+	// The setModelSecret write is non-fatal: a failure here logs and
+	// continues so the workspace row stays consistent. The runtime can
+	// still boot (with the template default) and a later
+	// Save+Restart will re-persist via the SecretsHandler endpoints.
 	if payload.Model != "" {
 		if err := setModelSecret(ctx, id, payload.Model); err != nil {
 			log.Printf("Create workspace %s: failed to persist MODEL_PROVIDER %q: %v (non-fatal)", id, payload.Model, err)
-		}
-		if derived := deriveProviderFromModelSlug(payload.Model); derived != "" {
-			if err := setProviderSecret(ctx, id, derived); err != nil {
-				log.Printf("Create workspace %s: failed to persist LLM_PROVIDER %q: %v (non-fatal)", id, derived, err)
-			}
 		}
 	}
 
@@ -418,7 +717,7 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 
 	// Seed initial memories from the create payload (issue #1050).
 	// Non-fatal: failures are logged but don't block workspace creation.
-	seedInitialMemories(ctx, id, payload.InitialMemories, awarenessNamespace)
+	h.seedInitialMemories(ctx, id, payload.InitialMemories)
 
 	// Broadcast provisioning event. Include `runtime` so the canvas can
 	// populate the Runtime pill on the side panel immediately — without it
@@ -453,7 +752,9 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 			// Preserve BYO-compute runtime label (kimi, kimi-cli, external) —
 			// don't coerce to generic "external" so the canvas can show the
 			// correct runtime name in the node card.
-			db.DB.ExecContext(ctx, `UPDATE workspaces SET url = $1, status = $2, runtime = $3, updated_at = now() WHERE id = $4`, payload.URL, models.StatusOnline, normalizeExternalRuntime(payload.Runtime), id)
+			if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET url = $1, status = $2, runtime = $3, updated_at = now() WHERE id = $4`, payload.URL, models.StatusOnline, normalizeExternalRuntime(payload.Runtime), id); err != nil {
+				log.Printf("External workspace: failed to update URL/status for %s: %v", id, err)
+			}
 			if err := db.CacheURL(ctx, id, payload.URL); err != nil {
 				log.Printf("External workspace: failed to cache URL for %s: %v", id, err)
 			}
@@ -466,7 +767,9 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 			// from the external agent (with this token + its URL)
 			// flips the row to online.
 			// Preserve BYO-compute runtime label (kimi, kimi-cli, external).
-			db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1, runtime = $2, updated_at = now() WHERE id = $3`, models.StatusAwaitingAgent, normalizeExternalRuntime(payload.Runtime), id)
+			if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1, runtime = $2, updated_at = now() WHERE id = $3`, models.StatusAwaitingAgent, normalizeExternalRuntime(payload.Runtime), id); err != nil {
+				log.Printf("External workspace: failed to update status for %s: %v", id, err)
+			}
 			tok, tokErr := wsauth.IssueToken(ctx, db.DB, id)
 			if tokErr != nil {
 				log.Printf("External workspace %s: token issuance failed: %v", id, tokErr)
@@ -500,7 +803,7 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 			// shape. Adding a new snippet means adding it once there;
 			// all three callers pick it up automatically.
 			resp["connection"] = BuildExternalConnectionPayload(
-				externalPlatformURL(c), id, connectionToken,
+				externalPlatformURL(c), id, payload.Name, connectionToken,
 			)
 		}
 		c.JSON(http.StatusCreated, resp)
@@ -512,7 +815,7 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 	var templatePath string
 	var configFiles map[string][]byte
 	if payload.Template != "" {
-		candidatePath, resolveErr := resolveInsideRoot(h.configsDir, payload.Template)
+		candidatePath, resolveErr := resolveWorkspaceTemplatePath(h.configsDir, h.cacheDir, payload.Template)
 		if resolveErr != nil {
 			log.Printf("Create provision: rejecting template %q: %v", payload.Template, resolveErr)
 			return
@@ -541,7 +844,8 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 	// runtime/model/tier as JSON — the Config tab needs that to render
 	// even on failed workspaces, so Create owns this Create-only side
 	// effect rather than coupling Auto to a UI concern.
-	if !h.provisionWorkspaceAuto(id, templatePath, configFiles, payload) {
+	provisionOK := h.provisionWorkspaceAuto(id, templatePath, configFiles, payload)
+	if !provisionOK {
 		cfgJSON := fmt.Sprintf(`{"name":%q,"runtime":%q,"tier":%d,"template":%q}`,
 			payload.Name, payload.Runtime, payload.Tier, payload.Template)
 		if _, err := db.DB.ExecContext(ctx, `
@@ -552,12 +856,64 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 		}
 	}
 
-	c.JSON(http.StatusCreated, gin.H{
-		"id":                  id,
-		"status":              "provisioning",
-		"awareness_namespace": awarenessNamespace,
-		"workspace_access":    workspaceAccess,
-	})
+	// Seed schedules declared in the workspace template's config.yaml
+	// AFTER provisionWorkspaceAuto succeeds so the scheduler never
+	// fires cron rows against a workspace whose backend never wired
+	// (review feedback PR #1929#1). Async EC2 provisioning may still
+	// fail downstream; scheduler.go is expected to handle non-online
+	// status as a no-op tick. Idempotent across re-creates via
+	// orgImportScheduleSQL's ON CONFLICT clause; runtime-added rows
+	// are preserved (Issue #24 contract). Restart does not re-seed
+	// (so user-deleted template rows stay deleted).
+	//
+	// Non-fatal: a broken schedules: block must never block workspace
+	// provisioning — the workspace row is already live and the grid
+	// is recoverable via POST /workspaces/{id}/schedules.
+	if provisionOK && templatePath != "" {
+		if templateScheds, parseErr := parseTemplateSchedules(templatePath); parseErr != nil {
+			log.Printf("Create %s: parsing template schedules: %v (continuing)", id, parseErr)
+		} else if len(templateScheds) > 0 {
+			seeded, skipped := seedTemplateSchedules(ctx, id, templatePath, templateScheds)
+			if skipped > 0 {
+				log.Printf("Create %s: template schedule partial-seed: seeded=%d skipped=%d total=%d", id, seeded, skipped, len(templateScheds))
+			} else {
+				log.Printf("Create %s: seeded %d/%d template schedules", id, seeded, len(templateScheds))
+			}
+		}
+	}
+
+	// Mint the workspace's first bearer token and return it inline
+	// (#1644). Pre-fix, callers had to make a separate POST to
+	// /admin/workspaces/:id/tokens (production path, AdminAuth-gated,
+	// but the path-prefix differs in CP-admin deploys so staging E2E
+	// got HTML 404) OR fall back to GET /admin/workspaces/:id/test-token
+	// (dev-only — deliberately 404s on MOLECULE_ENV=production per
+	// admin_test_token.go::TestTokensEnabled, which violates
+	// feedback_no_dev_only_routes_in_e2e). Inlining the first token here
+	// makes the create response the SSOT — every caller (canvas Save,
+	// org_import, E2E, third-party API) gets the bearer they need to
+	// authenticate /activity, /a2a, /memory etc. without an extra
+	// round trip to a separate mint endpoint.
+	//
+	// Failure is non-fatal: the workspace row already committed; the
+	// operator can recover via POST /admin/workspaces/:id/tokens
+	// (canonical admin mint) or POST /workspaces/:id/external/rotate
+	// (already-used for the external pre-register path above). We log
+	// the failure and return 201 without the field — callers that need
+	// the token will get a clear-shaped fallback (auth_token absent
+	// from response = use the admin mint path).
+	resp := gin.H{
+		"id":               id,
+		"status":           "provisioning",
+		"workspace_access": workspaceAccess,
+	}
+	if authToken, tokErr := wsauth.IssueToken(ctx, db.DB, id); tokErr != nil {
+		log.Printf("Create workspace %s: inline auth_token mint failed (non-fatal — caller can use POST /admin/workspaces/:id/tokens): %v", id, tokErr)
+	} else {
+		resp["auth_token"] = authToken
+	}
+
+	c.JSON(http.StatusCreated, resp)
 }
 
 // addProvisionTimeoutMs decorates a workspace response map with the
@@ -592,6 +948,7 @@ func scanWorkspaceRow(rows interface {
 	Scan(dest ...interface{}) error
 }) (map[string]interface{}, error) {
 	var id, name, role, status, url, sampleError, currentTask, runtime, workspaceDir string
+	var computeRaw []byte
 	var tier, activeTasks, maxConcurrentTasks, uptimeSeconds int
 	var errorRate, x, y float64
 	var collapsed, broadcastEnabled, talkToUserEnabled bool
@@ -603,7 +960,7 @@ func scanWorkspaceRow(rows interface {
 	err := rows.Scan(&id, &name, &role, &tier, &status, &agentCard, &url,
 		&parentID, &activeTasks, &maxConcurrentTasks, &errorRate, &sampleError, &uptimeSeconds,
 		&currentTask, &runtime, &workspaceDir, &x, &y, &collapsed,
-		&budgetLimit, &monthlySpend, &broadcastEnabled, &talkToUserEnabled)
+		&budgetLimit, &monthlySpend, &broadcastEnabled, &talkToUserEnabled, &computeRaw)
 	if err != nil {
 		return nil, err
 	}
@@ -629,6 +986,11 @@ func scanWorkspaceRow(rows interface {
 		"collapsed":            collapsed,
 		"broadcast_enabled":    broadcastEnabled,
 		"talk_to_user_enabled": talkToUserEnabled,
+	}
+	if len(computeRaw) > 0 && string(computeRaw) != "null" {
+		ws["compute"] = json.RawMessage(computeRaw)
+	} else {
+		ws["compute"] = json.RawMessage(`{}`)
 	}
 
 	// budget_limit: nil when no limit set, int64 otherwise
@@ -661,11 +1023,12 @@ const workspaceListQuery = `
 		   w.parent_id, w.active_tasks, COALESCE(w.max_concurrent_tasks, 1),
 		   w.last_error_rate,
 		   COALESCE(w.last_sample_error, ''), w.uptime_seconds,
-		   COALESCE(w.current_task, ''), COALESCE(w.runtime, 'langgraph'),
+		   COALESCE(w.current_task, ''), COALESCE(w.runtime, 'claude-code'),
 		   COALESCE(w.workspace_dir, ''),
 		   COALESCE(cl.x, 0), COALESCE(cl.y, 0), COALESCE(cl.collapsed, false),
 		   w.budget_limit, COALESCE(w.monthly_spend, 0),
-		   w.broadcast_enabled, w.talk_to_user_enabled
+		   w.broadcast_enabled, w.talk_to_user_enabled,
+		   COALESCE(w.compute, '{}'::jsonb)
 	FROM workspaces w
 	LEFT JOIN canvas_layouts cl ON cl.workspace_id = w.id
 	WHERE w.status != 'removed'
@@ -722,11 +1085,12 @@ func (h *WorkspaceHandler) Get(c *gin.Context) {
 			   w.parent_id, w.active_tasks, COALESCE(w.max_concurrent_tasks, 1),
 			   w.last_error_rate,
 			   COALESCE(w.last_sample_error, ''), w.uptime_seconds,
-			   COALESCE(w.current_task, ''), COALESCE(w.runtime, 'langgraph'),
+			   COALESCE(w.current_task, ''), COALESCE(w.runtime, 'claude-code'),
 			   COALESCE(w.workspace_dir, ''),
 			   COALESCE(cl.x, 0), COALESCE(cl.y, 0), COALESCE(cl.collapsed, false),
 			   w.budget_limit, COALESCE(w.monthly_spend, 0),
-			   w.broadcast_enabled, w.talk_to_user_enabled
+			   w.broadcast_enabled, w.talk_to_user_enabled,
+			   COALESCE(w.compute, '{}'::jsonb)
 		FROM workspaces w
 		LEFT JOIN canvas_layouts cl ON cl.workspace_id = w.id
 		WHERE w.id = $1
@@ -761,9 +1125,11 @@ func (h *WorkspaceHandler) Get(c *gin.Context) {
 			// the client would otherwise see — the actionable signal
 			// is the 410 + hint, not the timestamp.
 			var removedAt time.Time
-			_ = db.DB.QueryRowContext(c.Request.Context(),
+			if err := db.DB.QueryRowContext(c.Request.Context(),
 				`SELECT updated_at FROM workspaces WHERE id = $1`, id,
-			).Scan(&removedAt)
+			).Scan(&removedAt); err != nil {
+				log.Printf("workspace GET: removed_at query failed for %s: %v", id, err)
+			}
 			body := gin.H{
 				"error": "workspace removed",
 				"id":    id,

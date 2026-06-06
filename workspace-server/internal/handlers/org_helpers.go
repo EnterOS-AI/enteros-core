@@ -177,7 +177,7 @@ func isEnvIdentPart(c byte) bool {
 	return isEnvIdentStart(c) || (c >= '0' && c <= '9')
 }
 
-// loadWorkspaceEnv reads the org root .env and the workspace-specific .env .env and the workspace-specific .env
+// loadWorkspaceEnv reads the org root .env and the workspace-specific .env
 // (workspace overrides org root). Used by both secret injection and channel
 // config expansion.
 //
@@ -218,6 +218,14 @@ func loadWorkspaceEnv(orgBaseDir, filesDir string) map[string]string {
 // check, or when the env file does not exist (workspaces without a role —
 // or running on hosts that don't ship the bootstrap dir — keep their old
 // behavior).
+//
+// Token-file fallback: the newer prod-team personas (agent-dev-a,
+// agent-dev-b, agent-pm) ship `token` + `universal-auth.env` only — no
+// legacy plaintext `env` file. When the env-file load produces zero rows,
+// loadPersonaTokenFile fills in GITEA_TOKEN / GITEA_USER / GITEA_USER_EMAIL
+// from the token file so the GIT_ASKPASS helper has something to emit.
+// The env-file form remains authoritative when present (it may carry
+// richer rows like GITEA_TOKEN_SCOPES / GITEA_SSH_KEY_PATH).
 func loadPersonaEnvFile(role string, out map[string]string) {
 	if !isSafeRoleName(role) {
 		if role != "" {
@@ -229,7 +237,61 @@ func loadPersonaEnvFile(role string, out map[string]string) {
 	if root == "" {
 		root = "/etc/molecule-bootstrap/personas"
 	}
+	before := len(out)
 	parseEnvFile(filepath.Join(root, role, "env"), out)
+	if len(out) == before {
+		// No env-file rows landed (file absent, or present-but-empty).
+		// Try the token-only persona shape used by the prod-team
+		// identities. Existing keys in out are preserved.
+		loadPersonaTokenFile(role, out)
+	}
+}
+
+// loadPersonaTokenFile populates GITEA_TOKEN / GITEA_USER / GITEA_USER_EMAIL
+// from a persona dir that ships only the bare `token` file — the shape used
+// by the production agent personas (agent-dev-a, agent-dev-b, agent-pm).
+// Those dirs do not carry an `env` file because their non-Gitea creds come
+// from Infisical Universal Auth at runtime (universal-auth.env), so the
+// historical loadPersonaEnvFile path silently no-ops on them.
+//
+// File layout: $MOLECULE_PERSONA_ROOT/<role>/token (mode 600, plain text).
+// The token contents become GITEA_TOKEN (whitespace-trimmed); the role
+// name becomes GITEA_USER; GITEA_USER_EMAIL is synthesised as
+// <role>@<gitIdentityEmailDomain> to match the email shape that
+// applyAgentGitIdentity uses for its slug-derived authorship addresses.
+//
+// Silent no-op when the role fails the safe-segment check, when the
+// token file does not exist, or when its contents are empty after
+// trimming. Existing keys in out are not overwritten — the caller's
+// later .env layers and any prior loadPersonaEnvFile rows always win.
+func loadPersonaTokenFile(role string, out map[string]string) {
+	if out == nil {
+		return
+	}
+	if !isSafeRoleName(role) {
+		return
+	}
+	root := os.Getenv("MOLECULE_PERSONA_ROOT")
+	if root == "" {
+		root = "/etc/molecule-bootstrap/personas"
+	}
+	data, err := os.ReadFile(filepath.Join(root, role, "token"))
+	if err != nil {
+		return
+	}
+	token := strings.TrimSpace(string(data))
+	if token == "" {
+		return
+	}
+	if _, ok := out["GITEA_TOKEN"]; !ok {
+		out["GITEA_TOKEN"] = token
+	}
+	if _, ok := out["GITEA_USER"]; !ok {
+		out["GITEA_USER"] = role
+	}
+	if _, ok := out["GITEA_USER_EMAIL"]; !ok {
+		out["GITEA_USER_EMAIL"] = role + "@" + gitIdentityEmailDomain
+	}
 }
 
 // isSafeRoleName accepts a single path segment of [A-Za-z0-9_-]+. Rejects

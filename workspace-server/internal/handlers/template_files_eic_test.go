@@ -32,7 +32,6 @@ func TestResolveWorkspaceFilePath_RuntimeIndirection(t *testing.T) {
 		// and would 500 with EACCES on save (the bug that motivated this gate).
 		{"claude-code", "/configs", "config.yaml", "/configs/config.yaml"},
 		{"CLAUDE-CODE", "/configs", "config.yaml", "/configs/config.yaml"}, // case-insensitive
-		{"langgraph", "/configs", "config.yaml", "/opt/configs/config.yaml"},
 		{"external", "/configs", "skills.json", "/opt/configs/skills.json"},
 		{"", "/configs", "config.yaml", "/configs/config.yaml"},        // empty runtime → default
 		{"unknown", "/configs", "config.yaml", "/configs/config.yaml"}, // unknown → default
@@ -70,7 +69,7 @@ func TestResolveWorkspaceFilePath_LiteralRoots(t *testing.T) {
 		// universal Linux path, not a managed-config indirection.
 		{"hermes", "/home", "ubuntu/.bashrc", "/home/ubuntu/.bashrc"},
 		{"claude-code", "/home", "ubuntu/notes.md", "/home/ubuntu/notes.md"},
-		{"langgraph", "/home", "ubuntu/x", "/home/ubuntu/x"},
+		{"codex", "/home", "ubuntu/x", "/home/ubuntu/x"},
 		// /workspace and /plugins are also literal — runtime is ignored.
 		{"hermes", "/workspace", "src/main.go", "/workspace/src/main.go"},
 		{"claude-code", "/plugins", "p/manifest.yaml", "/plugins/p/manifest.yaml"},

@@ -43,7 +43,6 @@ package handlers
 import (
 	"context"
 	"database/sql"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -51,7 +50,7 @@ import (
 	"github.com/google/uuid"
 	_ "github.com/lib/pq"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/pendinguploads"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/pendinguploads"
 )
 
 // integrationDB_PendingUploads opens a connection from $INTEGRATION_DB_URL
@@ -63,10 +62,7 @@ import (
 // but kept separate so each table's wipe step is local to its tests.
 func integrationDB_PendingUploads(t *testing.T) *sql.DB {
 	t.Helper()
-	url := os.Getenv("INTEGRATION_DB_URL")
-	if url == "" {
-		t.Skip("INTEGRATION_DB_URL not set; skipping (local devs: see file header)")
-	}
+	url := requireIntegrationDBURL(t)
 	conn, err := sql.Open("postgres", url)
 	if err != nil {
 		t.Fatalf("open: %v", err)
@@ -124,13 +120,17 @@ func TestIntegration_PendingUploads_PutGetAckRoundTrip(t *testing.T) {
 		t.Errorf("FetchedAt should be set after MarkFetched")
 	}
 
-	// Ack flips acked_at; subsequent Gets return ErrNotFound (acked rows
-	// are filtered out at the SELECT predicate).
+	// Ack flips acked_at. Acked rows remain readable during retention so
+	// refreshed canvas previews can resolve platform-pending: attachment URIs.
 	if err := store.Ack(ctx, fileID); err != nil {
 		t.Fatalf("Ack: %v", err)
 	}
-	if _, err := store.Get(ctx, fileID); err != pendinguploads.ErrNotFound {
-		t.Errorf("Get after Ack: got %v, want ErrNotFound", err)
+	rec3, err := store.Get(ctx, fileID)
+	if err != nil {
+		t.Fatalf("Get after Ack: %v", err)
+	}
+	if rec3.AckedAt == nil {
+		t.Errorf("AckedAt should be set after Ack")
 	}
 
 	// Idempotent re-ack succeeds.
@@ -667,5 +667,103 @@ func TestIntegration_PendingUploads_GetIgnoresExpiredAndAcked(t *testing.T) {
 	}
 	if _, err := store.Get(ctx, fid); err != pendinguploads.ErrNotFound {
 		t.Errorf("Get after expiry: got %v, want ErrNotFound", err)
+	}
+}
+
+// TestIntegration_PendingUploads_SizeCap_100MB pins the post-mc#1588
+// poll-mode cap to 100 MB at the DB CHECK level. The MaxFileBytes-1 row
+// must INSERT cleanly (no CHECK violation) and the +1 row must be
+// rejected pre-DB by Put with ErrTooLarge. We also verify the raw DB
+// CHECK by attempting an INSERT that bypasses Put's pre-DB guard — the
+// constraint itself must enforce 104857600.
+//
+// Regression target: migration 20260519200000_pending_uploads_bump_size_cap
+// — if a future migration regresses the cap (e.g., re-applies the
+// 25 MB ceiling) this test 413s.
+func TestIntegration_PendingUploads_SizeCap_100MB(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping 100MB cap integration test in -short mode (allocates ~100MB)")
+	}
+	conn := integrationDB_PendingUploads(t)
+	store := pendinguploads.NewPostgres(conn)
+	ctx := context.Background()
+
+	wsID := uuid.New()
+
+	// 50 MB row — previously would have hit the 25 MB CHECK; must now
+	// succeed end-to-end (Put → INSERT → row visible via Get).
+	fiftyMB := make([]byte, 50*1024*1024)
+	for i := range fiftyMB {
+		fiftyMB[i] = 0x42 // non-zero so bytea round-trip is observable
+	}
+	fid, err := store.Put(ctx, wsID, fiftyMB, "halfcap.bin", "application/octet-stream")
+	if err != nil {
+		t.Fatalf("Put 50MB: want nil err (cap is 100MB after mc#1588 follow-up), got %v", err)
+	}
+	rec, err := store.Get(ctx, fid)
+	if err != nil {
+		t.Fatalf("Get 50MB row: %v", err)
+	}
+	if rec.SizeBytes != int64(len(fiftyMB)) {
+		t.Errorf("size_bytes mismatch: got %d, want %d", rec.SizeBytes, len(fiftyMB))
+	}
+
+	// Exact-cap row — 100 MB exact must succeed (the CHECK is `<=`).
+	atCap := make([]byte, pendinguploads.MaxFileBytes)
+	if _, err := store.Put(ctx, wsID, atCap, "atcap.bin", "application/octet-stream"); err != nil {
+		t.Errorf("Put MaxFileBytes (at-cap): want nil err, got %v", err)
+	}
+
+	// Over-cap row — must be rejected by Put pre-DB.
+	overCap := make([]byte, pendinguploads.MaxFileBytes+1)
+	if _, err := store.Put(ctx, wsID, overCap, "overcap.bin", "application/octet-stream"); err != pendinguploads.ErrTooLarge {
+		t.Errorf("Put MaxFileBytes+1: want ErrTooLarge, got %v", err)
+	}
+
+	// Raw DB CHECK enforcement — bypass Put's pre-DB guard with a direct
+	// INSERT of a 101-MB row. The CHECK must reject with a Postgres
+	// integrity-violation (SQLSTATE 23514). This catches the case where a
+	// future code path inserts straight into the table without going
+	// through Put (e.g., a background importer).
+	overByOne := pendinguploads.MaxFileBytes + 1
+	_, dbErr := conn.ExecContext(ctx, `
+		INSERT INTO pending_uploads (workspace_id, content, size_bytes, filename, mimetype)
+		VALUES ($1, $2, $3, $4, $5)
+	`, wsID, []byte("dummy"), overByOne, "raw-overcap.bin", "application/octet-stream")
+	if dbErr == nil {
+		t.Errorf("raw INSERT of %d bytes: want CHECK violation, got nil", overByOne)
+	} else if !strings.Contains(dbErr.Error(), "pending_uploads_size_bytes_check") &&
+		!strings.Contains(dbErr.Error(), "23514") {
+		t.Errorf("raw INSERT: want size_bytes_check violation (SQLSTATE 23514), got: %v", dbErr)
+	}
+}
+
+// TestIntegration_PendingUploads_SizeCap_DBConstraintName pins the
+// expected CHECK constraint name. Migration 20260519200000 DROP IF
+// EXISTSes by the auto-generated name `pending_uploads_size_bytes_check`
+// and re-adds the constraint under the same name. If a future schema
+// edit renames the constraint, the next bump migration will silently
+// no-op the DROP and leave the old ceiling in place — this test catches
+// that drift.
+func TestIntegration_PendingUploads_SizeCap_DBConstraintName(t *testing.T) {
+	conn := integrationDB_PendingUploads(t)
+	ctx := context.Background()
+
+	var checkClause string
+	err := conn.QueryRowContext(ctx, `
+		SELECT pg_get_constraintdef(c.oid)
+		FROM pg_constraint c
+		JOIN pg_class t ON t.oid = c.conrelid
+		WHERE t.relname = 'pending_uploads'
+		  AND c.conname = 'pending_uploads_size_bytes_check'
+	`).Scan(&checkClause)
+	if err != nil {
+		t.Fatalf("lookup CHECK clause: %v", err)
+	}
+	if !strings.Contains(checkClause, "104857600") {
+		t.Errorf("size_bytes CHECK clause = %q; want it to contain 104857600 (100 MB)", checkClause)
+	}
+	if strings.Contains(checkClause, "26214400") {
+		t.Errorf("size_bytes CHECK clause = %q; must NOT contain 26214400 (the pre-bump 25 MB ceiling)", checkClause)
 	}
 }

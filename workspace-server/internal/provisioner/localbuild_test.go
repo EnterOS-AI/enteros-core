@@ -161,7 +161,7 @@ func TestEnsureLocalImage_GiteaUnreachable(t *testing.T) {
 	opts.remoteHeadSha = func(ctx context.Context, opts *LocalBuildOptions, runtime string) (string, error) {
 		return "", errors.New("dial tcp: no such host")
 	}
-	_, err := ensureLocalImageWithOpts(context.Background(), "langgraph", opts)
+	_, err := ensureLocalImageWithOpts(context.Background(), "hermes", opts)
 	if err == nil {
 		t.Fatalf("expected error, got nil")
 	}
@@ -190,7 +190,7 @@ func TestEnsureLocalImage_RepoNotFound(t *testing.T) {
 	opts.HTTPClient = srv.Client()
 	opts.remoteHeadSha = nil // exercise real HTTP path
 
-	_, err := ensureLocalImageWithOpts(context.Background(), "crewai", opts)
+	_, err := ensureLocalImageWithOpts(context.Background(), "hermes", opts)
 	if err == nil {
 		t.Fatalf("expected error, got nil")
 	}
@@ -259,7 +259,7 @@ func TestEnsureLocalImage_BuildFailure(t *testing.T) {
 	opts.dockerBuild = func(ctx context.Context, opts *LocalBuildOptions, contextDir, tag string) error {
 		return errors.New("Dockerfile syntax error")
 	}
-	_, err := ensureLocalImageWithOpts(context.Background(), "autogen", opts)
+	_, err := ensureLocalImageWithOpts(context.Background(), "codex", opts)
 	if err == nil {
 		t.Fatalf("expected error, got nil")
 	}
@@ -313,7 +313,7 @@ func TestEnsureLocalImage_ConcurrentSameRuntime(t *testing.T) {
 	for i := 0; i < N; i++ {
 		go func() {
 			defer wg.Done()
-			_, _ = ensureLocalImageWithOpts(context.Background(), "langgraph", opts)
+			_, _ = ensureLocalImageWithOpts(context.Background(), "hermes", opts)
 		}()
 	}
 	wg.Wait()

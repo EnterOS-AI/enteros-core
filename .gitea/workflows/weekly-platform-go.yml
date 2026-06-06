@@ -31,7 +31,7 @@ jobs:
     name: Weekly Platform-Go Surface
     runs-on: ubuntu-latest
     # continue-on-error: surface only, never block
-    # mc#774: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
+    # mc#1982: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
     continue-on-error: true
     defaults:
       run:
@@ -106,7 +106,7 @@ jobs:
               [[ "$file" == *_test.go ]] && continue
               [[ "$file" == *"$path"* ]] || continue
               awk "BEGIN{exit !(\$pct < 10)}" || continue
-              rel=$(echo "$file" | sed 's|^github.com/molecule-ai/molecule-monorepo/platform/workspace-server/||; s|^github.com/molecule-ai/molecule-monorepo/platform/||')
+              rel=$(echo "$file" | sed 's|^git.moleculesai.app/molecule-ai/molecule-core/workspace-server/workspace-server/||; s|^git.moleculesai.app/molecule-ai/molecule-core/workspace-server/||')
               if echo "$ALLOWLIST" | grep -qxF "$rel"; then
                 continue
               fi

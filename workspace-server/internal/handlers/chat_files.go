@@ -46,9 +46,10 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/events"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/pendinguploads"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/pendinguploads"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/uploads"
 )
 
 // ChatFilesHandler serves file upload + download for chat. Holds a
@@ -67,7 +68,7 @@ type ChatFilesHandler struct {
 
 	// httpClient is broken out so tests can swap in an httptest.Server
 	// transport. Prod uses a default with a generous Timeout to cover
-	// the 50 MB worst case on a slow EC2 link without leaving a
+	// the 100 MB worst case on a slow EC2 link without leaving a
 	// connection hanging forever on a sick workspace.
 	httpClient *http.Client
 
@@ -89,9 +90,14 @@ func NewChatFilesHandler(t *TemplatesHandler) *ChatFilesHandler {
 	return &ChatFilesHandler{
 		templates: t,
 		httpClient: &http.Client{
-			// 50 MB total body cap / ~1 MB/s slow-network floor → ~60s.
-			// Doubled for headroom on the legitimate-but-slow case.
-			Timeout: 120 * time.Second,
+			// 100 MB total body cap / ~100 KB/s slow-uplink floor → ~1000s.
+			// Doubled for headroom on the legitimate-but-slow case (e.g.
+			// reno-stars 2026-05-19 forensic a99ab0a1: 60MB upload over a
+			// constrained uplink). Client-side AbortSignal.timeout (canvas
+			// uploads.ts) computes the matching deadline per-request and
+			// surfaces "connection too slow" — distinct from the file-size
+			// pre-flight that returns immediately before any network I/O.
+			Timeout: 1200 * time.Second,
 		},
 	}
 }
@@ -107,10 +113,26 @@ func (h *ChatFilesHandler) WithPendingUploads(storage pendinguploads.Storage, br
 }
 
 // chatUploadMaxBytes caps the full multipart request body so a
-// malicious / runaway client can't OOM the proxy hop. 50 MB matches
-// the workspace-side limit; anything larger is rejected at the
-// network boundary before forwarding.
-const chatUploadMaxBytes = 50 * 1024 * 1024
+// malicious / runaway client can't OOM the proxy hop. Derived from the
+// SSOT in internal/uploads (task #320): bumping the cap is one edit in
+// internal/uploads/limits.go, never a synchronized 5-surface bump.
+//
+// CANVAS_MIRROR: canvas/src/components/tabs/chat/uploads.ts reads the
+// live value via GET /uploads/limits at app init (Phase 2 follow-up;
+// today still a literal 100 MB pinned by an assertion test, which the
+// migration PR will replace). The canvas constant exists so the
+// pre-flight size check can fail immediately (before network I/O) with
+// the actionable "File too large (got X MB) — limit is 100MB" message.
+// Bumping one side without the other yields the wrong-reason surface
+// that motivated this constant pair (CTO 2026-05-19 directive on
+// forensic a99ab0a1: file-size cause MUST surface as file-size, NOT as
+// a downstream timeout). Once the canvas migrates to the live fetch,
+// drift becomes structurally impossible.
+//
+// Why "var" instead of "const": Go disallows initializing a const from
+// a function call. The DefaultUploadLimits() body is pure literals so
+// the runtime cost is zero.
+var chatUploadMaxBytes = uploads.DefaultUploadLimits().PerRequestBytes
 
 // resolveWorkspaceForwardCreds resolves the workspace's URL +
 // platform_inbound_secret for an /internal/* forward, applying
@@ -174,10 +196,15 @@ func resolveWorkspaceForwardCreds(c *gin.Context, ctx context.Context, workspace
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "workspace url not registered yet"})
 		return "", "", false
 	}
-	// Trust note: workspaces.url passes validateAgentURL at /registry/
-	// register write time, blocking SSRF-shaped URLs. We rely on that
-	// upstream gate rather than re-validating here. Tracked at #2316
-	// for follow-up: forward-time re-validation as defense-in-depth.
+	// Defense-in-depth for #2316: workspaces.url is validated at
+	// registration time, but the DB row can be stale/tampered and the
+	// SSRF policy can tighten. Re-validate immediately before attaching
+	// the inbound secret to an outbound forward.
+	if err := isSafeURL(wsURL); err != nil {
+		log.Printf("chat_files %s: unsafe workspace URL for %s rejected: %v", op, workspaceID, err)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "workspace URL not allowed"})
+		return "", "", false
+	}
 
 	secret, healed, err := readOrLazyHealInboundSecret(ctx, workspaceID, "chat_files "+op)
 	if err != nil {
@@ -268,7 +295,7 @@ func contentDispositionAttachment(name string) string {
 // back unchanged.
 //
 // Why streaming, not parse-then-re-encode:
-//   - Eliminates the 50 MB intermediate buffer on the platform.
+//   - Eliminates the 100 MB intermediate buffer on the platform.
 //   - Per-file size + path-safety enforcement is the workspace's job;
 //     duplicating it here just creates two places to keep in sync.
 //   - The error responses from the workspace (413 with the offending
@@ -354,7 +381,7 @@ func (h *ChatFilesHandler) Upload(c *gin.Context) {
 // either.
 //
 // Body is streamed end-to-end (no buffering on the platform), preserving
-// binary safety and arbitrary file size (the 50 MB cap on Upload doesn't
+// binary safety and arbitrary file size (the 100 MB cap on Upload doesn't
 // apply to artefacts the agent produced).
 func (h *ChatFilesHandler) Download(c *gin.Context) {
 	workspaceID := c.Param("id")
@@ -546,8 +573,8 @@ type uploadedFile struct {
 //     a fetcher crash mid-batch.
 //
 // Limits enforced here mirror the workspace-side ingest_handler:
-//   - Total body cap: 50 MB (set on c.Request.Body before reaching us)
-//   - Per-file cap: 25 MB (pendinguploads.MaxFileBytes; rejected as 413)
+//   - Total body cap: 100 MB (set on c.Request.Body before reaching us)
+//   - Per-file cap: 100 MB (pendinguploads.MaxFileBytes; rejected as 413)
 //   - Filename: sanitized + capped at 100 chars (SanitizeFilename)
 //
 // Logging: every persisted file logs an INFO line with workspace_id,
@@ -561,7 +588,7 @@ func (h *ChatFilesHandler) uploadPollMode(c *gin.Context, ctx context.Context, w
 	// expose those limits directly — the underlying ParseMultipartForm
 	// caps memory at 32 MB by default and spills to disk. For poll-
 	// mode we read each file into memory to hand to Storage.Put;
-	// 25 MB-per-file × 64-files ceiling means worst-case is 1.6 GB of
+	// 100 MB-per-file × 64-files ceiling means worst-case is 6.4 GB of
 	// peak memory. Bound the per-file size at the multipart layer so
 	// the spill never gets close.
 	if err := c.Request.ParseMultipartForm(32 << 20); err != nil {
@@ -606,7 +633,7 @@ func (h *ChatFilesHandler) uploadPollMode(c *gin.Context, ctx context.Context, w
 	prepReady := make([]prepped, 0, len(headers))
 	items := make([]pendinguploads.PutItem, 0, len(headers))
 	for _, fh := range headers {
-		if fh.Size > pendinguploads.MaxFileBytes {
+		if fh.Size > int64(pendinguploads.MaxFileBytes) {
 			log.Printf("chat_files uploadPollMode: per-file cap exceeded for %s: %s (%d bytes)",
 				workspaceID, fh.Filename, fh.Size)
 			c.JSON(http.StatusRequestEntityTooLarge, gin.H{

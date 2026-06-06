@@ -466,12 +466,40 @@ def fetch_log(target_url: str) -> str | None:
 
 def grep_fail_markers(log_text: str) -> list[str]:
     """Return up to 5 sample matching lines for any FAIL_PATTERNS hit.
-    Empty list = clean log."""
+    Empty list = clean log.
+
+    Heuristic: skip lines where the marker appears inside script source
+    (e.g. ``echo "::error::..."`` in a ``::group::Run`` block) rather
+    than actual execution output. The Gitea Actions log prints the raw
+    script before executing it; ``echo "::error::"`` lines in that
+    display are false positives.
+    """
     matches: list[str] = []
+    in_run_group = False
+    group_depth = 0
     for line in log_text.splitlines():
+        stripped = line.strip()
+        # Track Gitea Actions group markers so we can skip the
+        # ``::group::Run`` script-source display blocks.
+        if stripped.startswith("::group::Run"):
+            in_run_group = True
+            group_depth = 1
+            continue
+        if stripped == "::endgroup::":
+            if in_run_group:
+                in_run_group = False
+                group_depth = 0
+            continue
+        if in_run_group:
+            continue
         for pat in FAIL_PATTERNS:
             if pat in line:
-                # Truncate to keep error output bounded.
+                # Additional false-positive guard: ``echo "::error::"``
+                # is script source, not a runtime error emission.
+                if pat == "::error::":
+                    prefix = line[: line.index(pat)].strip()
+                    if prefix.endswith('echo') or prefix.endswith("echo '") or prefix.endswith('echo "'):
+                        break
                 matches.append(line.strip()[:240])
                 break
         if len(matches) >= 5:
@@ -518,16 +546,24 @@ def verify_flip(flip: dict, branch: str, n: int) -> dict:
 
     shas = recent_commits_on_branch(branch, n)
     if not shas:
-        result["warnings"].append(
-            f"no recent commits on {branch} (cannot verify flip)"
-        )
+        result["masked_runs"].append({
+            "sha": "",
+            "status": "unverified",
+            "target_url": "",
+            "samples": [f"no recent commits on {branch} — cannot verify flip"],
+        })
         return result
 
     for sha in shas:
         try:
             status_doc = combined_status(sha)
         except ApiError as e:
-            result["warnings"].append(f"combined-status for {sha}: {e}")
+            result["masked_runs"].append({
+                "sha": sha,
+                "status": "error",
+                "target_url": "",
+                "samples": [f"combined-status API error: {e}"],
+            })
             continue
         statuses = status_doc.get("statuses") or []
         # First entry matching the context name. Newest SHAs come
@@ -554,6 +590,17 @@ def verify_flip(flip: dict, branch: str, n: int) -> dict:
                         "target_url": target_url,
                         "samples": ["[log unavailable; status itself is " + state + "]"],
                     })
+                elif state == "success":
+                    # Fail-closed: unreadable log on a success status is a
+                    # potential Quirk #10 mask (continue-on-error hiding real
+                    # failures). We cannot verify it's clean, so treat as
+                    # masked rather than allowing the flip.
+                    result["masked_runs"].append({
+                        "sha": sha,
+                        "status": state,
+                        "target_url": target_url,
+                        "samples": ["[log unavailable; cannot verify status is genuine — treat as masked]"],
+                    })
                 break
             samples = grep_fail_markers(log_text)
             if state in ("failure", "error"):
@@ -577,10 +624,12 @@ def verify_flip(flip: dict, branch: str, n: int) -> dict:
             break
 
     if result["checked_commits"] == 0:
-        result["warnings"].append(
-            f"no runs of {target_context!r} found in the last {n} commits on "
-            f"{branch} — cannot verify; allowing flip with warning"
-        )
+        result["masked_runs"].append({
+            "sha": "",
+            "status": "unverified",
+            "target_url": "",
+            "samples": [f"no runs of {target_context!r} found in the last {n} commits on {branch} — cannot verify flip"],
+        })
     return result
 
 
@@ -641,6 +690,15 @@ def main(argv: list[str] | None = None) -> int:
 
     base_workflows = workflows_at_sha(BASE_SHA)
     head_workflows = workflows_at_sha(HEAD_SHA)
+    # Ignore workflow files that are identical on both sides — old branches
+    # that haven't rebased onto main carry stale copies of workflows that
+    # were updated later. Comparing those stale copies against the current
+    # base produces false-positive "flips".
+    base_workflows = {
+        p: t for p, t in base_workflows.items()
+        if p in head_workflows and head_workflows[p] != t
+    }
+    head_workflows = {p: t for p, t in head_workflows.items() if p in base_workflows}
     flips = detect_flips(base_workflows, head_workflows)
 
     if not flips:

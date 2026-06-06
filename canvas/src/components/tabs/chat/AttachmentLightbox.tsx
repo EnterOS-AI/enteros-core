@@ -1,6 +1,6 @@
 "use client";
 
-// AttachmentLightbox — shared fullscreen modal for image / PDF /
+// AttachmentLightbox — shared modal for image / PDF /
 // (future) any-fullscreen-renderable kind. Owns:
 //   - Backdrop + centered viewport
 //   - Esc to close
@@ -14,11 +14,11 @@
 //
 // Design choices:
 //
-// 1. Portals — we don't use ReactDOM.createPortal because the canvas
-//    chat surface already renders at a high z-index and the modal's
-//    fixed-position layout reaches the viewport regardless. Saves a
-//    portal mount in the common case + avoids the SSR warning (canvas
-//    is "use client" but the parent shell is server-rendered).
+// 1. Portals — we don't use ReactDOM.createPortal because the chat tab
+//    already gives us a positioned container and the preview should stay
+//    inside that panel. Saves a portal mount in the common case + avoids
+//    the SSR warning (canvas is "use client" but the parent shell is
+//    server-rendered).
 //
 // 2. Focus trap — inline implementation (not a 3rd-party dep). The
 //    chat lightbox needs to trap focus only across two interactive
@@ -41,13 +41,17 @@ interface Props {
    *  the dialog opens. The caller knows what's inside (image alt
    *  text, PDF filename) and supplies it. */
   ariaLabel: string;
+  /** Constrain the preview to the nearest positioned ancestor instead
+   *  of the whole browser viewport. ChatTab passes this so previews
+   *  stay inside the active side-panel tab. */
+  contained?: boolean;
   /** The thing being shown in fullscreen — <img>, <embed>, etc.
    *  Caller is responsible for sizing it to fit the viewport (we
    *  give it max-w-full max-h-full via CSS). */
   children: ReactNode;
 }
 
-export function AttachmentLightbox({ open, onClose, ariaLabel, children }: Props) {
+export function AttachmentLightbox({ open, onClose, ariaLabel, contained = false, children }: Props) {
   const closeButtonRef = useRef<HTMLButtonElement>(null);
   const previousFocusRef = useRef<HTMLElement | null>(null);
 
@@ -90,12 +94,19 @@ export function AttachmentLightbox({ open, onClose, ariaLabel, children }: Props
 
   if (!open) return null;
 
+  const rootClass = contained
+    ? "absolute inset-0 z-50 flex items-center justify-center bg-black/85 motion-reduce:transition-none transition-opacity"
+    : "fixed inset-0 z-50 flex items-center justify-center bg-black/85 motion-reduce:transition-none transition-opacity";
+  const contentClass = contained
+    ? "h-full w-full p-3 flex items-center justify-center"
+    : "max-w-[95vw] max-h-[90vh] flex items-center justify-center";
+
   return (
     <div
       role="dialog"
       aria-modal="true"
       aria-label={ariaLabel}
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/85 motion-reduce:transition-none transition-opacity"
+      className={rootClass}
       onClick={onBackdropClick}
     >
       {/* Close button — top-right, large hit area, keyboard-focusable.
@@ -112,7 +123,7 @@ export function AttachmentLightbox({ open, onClose, ariaLabel, children }: Props
         </svg>
       </button>
       <div
-        className="max-w-[95vw] max-h-[90vh] flex items-center justify-center"
+        className={contentClass}
         onClick={(e) => e.stopPropagation()}
       >
         {children}

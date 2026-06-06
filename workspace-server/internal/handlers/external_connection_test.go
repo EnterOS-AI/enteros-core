@@ -118,3 +118,86 @@ func TestExternalTemplates_NoBrokenMoleculeAIGitHubURLs(t *testing.T) {
 		}
 	}
 }
+
+// TestExternalChannelTemplate_LaunchFlagShape pins the Claude Code channel
+// snippet to the working launch invocation. The channel spec must be the
+// VALUE of --dangerously-load-development-channels, NOT a separate
+// --channels flag. The two-flag form (`--dangerously-load-development-channels
+// --channels plugin:molecule@...`) errors with "entries must be tagged:
+// --channels" on current Claude Code builds (2.1.143+) and silently no-ops
+// on older ones — either way, new users hit a wall on first launch.
+//
+// Empirical: hit by a session walking through this exact snippet 2026-05-21;
+// the broken form was copy-pasted from this template, ran, errored, and
+// confused the operator into believing the plugin install was broken when
+// the snippet itself was the bug.
+func TestExternalChannelTemplate_LaunchFlagShape(t *testing.T) {
+	// The broken two-flag form. If this string ever appears in the
+	// snippet again, the same onboarding pothole returns.
+	bannedFormBroken := "--dangerously-load-development-channels \\\n  --channels plugin:molecule@molecule-channel"
+	if strings.Contains(externalChannelTemplate, bannedFormBroken) {
+		t.Errorf("externalChannelTemplate contains the broken two-flag launch form. " +
+			"Use --dangerously-load-development-channels plugin:molecule@molecule-channel (spec as value, not a separate --channels flag).")
+	}
+
+	// The single-flag form must be present.
+	requiredFormGood := "--dangerously-load-development-channels plugin:molecule@molecule-channel"
+	if !strings.Contains(externalChannelTemplate, requiredFormGood) {
+		t.Errorf("externalChannelTemplate must contain %q so operators see the working launch invocation", requiredFormGood)
+	}
+}
+
+// TestExternalChannelTemplate_CanonicalEnvShape pins the canvas-served
+// .env example to the canonical SSOT shape (MOLECULE_WORKSPACES_JSON)
+// rather than the legacy single-platform shape. The legacy form
+// (MOLECULE_PLATFORM_URL + comma-separated IDs/TOKENS) is still accepted
+// by the channel plugin's parseWorkspaceTargets but is single-tenant
+// only — it silently fails to onboard users who want to watch multiple
+// platforms (e.g. hongming + agents-team from the same plugin instance),
+// which is the post-PR#15 expected use case.
+func TestExternalChannelTemplate_CanonicalEnvShape(t *testing.T) {
+	if !strings.Contains(externalChannelTemplate, "MOLECULE_WORKSPACES_JSON=") {
+		t.Errorf("externalChannelTemplate must use MOLECULE_WORKSPACES_JSON as the canonical .env shape (the post-PR#15 SSOT)")
+	}
+	// The JSON example must contain the workspace_id + platform_url placeholders
+	// so the canvas substitutes them at serve time.
+	for _, ph := range []string{"{{WORKSPACE_ID}}", "{{PLATFORM_URL}}"} {
+		if !strings.Contains(externalChannelTemplate, ph) {
+			t.Errorf("externalChannelTemplate must contain placeholder %q so the canvas substitutes per-workspace values", ph)
+		}
+	}
+}
+
+// TestPollingTemplates_OptIntoPeerInfo pins the invariant that any template
+// which calls /workspaces/:id/activity for inbound delivery requests the
+// Layer 1 enrichment via ?include=peer_info. Without this opt-in, the
+// platform returns bare activity rows and the operator's bridge / channel
+// loses peer_name / peer_role / agent_card_url / attachments[] — they're
+// available on the server but not delivered.
+//
+// Pre-Layer-1 platforms ignore unknown query params (HTTP spec: filters
+// not understood are dropped), so this is back-compat across deploys.
+//
+// The Claude Code channel template doesn't include the poll URL in this
+// snippet — its polling lives in the plugin's own server.ts (handled by
+// molecule-mcp-claude-channel PR#21). The Kimi template DOES include a
+// poll loop in its kimi_bridge.py block, so the invariant applies there.
+func TestPollingTemplates_OptIntoPeerInfo(t *testing.T) {
+	pollingTemplates := map[string]string{
+		"externalKimiTemplate": externalKimiTemplate,
+	}
+	for name, body := range pollingTemplates {
+		// If the snippet polls /activity, it must opt into peer_info.
+		// The detection is intentionally loose ("/activity" appears in
+		// the script) — operators who customize the script keep the
+		// invariant only if the include hint is in the template.
+		if !strings.Contains(body, "/activity") {
+			t.Errorf("%s no longer polls /activity — review whether this test still applies", name)
+			continue
+		}
+		if !strings.Contains(body, `"include": "peer_info"`) && !strings.Contains(body, "include=peer_info") {
+			t.Errorf("%s polls /activity without ?include=peer_info — operators lose Layer 1 enrichment "+
+				"(peer_name / peer_role / agent_card_url / attachments[]). Add the param to the poll URL.", name)
+		}
+	}
+}

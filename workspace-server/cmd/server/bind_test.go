@@ -2,10 +2,15 @@ package main
 
 import "testing"
 
-// TestResolveBindHost pins the precedence: BIND_ADDR explicit > dev-mode
-// fail-open default of 127.0.0.1 > production-shape empty (all interfaces).
+// TestResolveBindHost pins the precedence: BIND_ADDR explicit > local-dev
+// loopback default of 127.0.0.1 > production-shape empty (all interfaces).
 //
-// Mutation-test invariant: removing the IsDevModeFailOpen() branch makes
+// (harden/no-fail-open-auth) The loopback default is now keyed on
+// MOLECULE_ENV alone (IsLocalDevEnv), decoupled from ADMIN_TOKEN — a dev box
+// defaults to loopback even when it provisions an ADMIN_TOKEN. This is
+// defense-in-depth, not an auth lever; auth is fail-closed in every env.
+//
+// Mutation-test invariant: removing the IsLocalDevEnv() branch makes
 // "no_bindaddr_devmode_unset_admin" fail (returns "" instead of "127.0.0.1").
 // Removing the BIND_ADDR branch makes "explicit_bindaddr_*" cases fail.
 func TestResolveBindHost(t *testing.T) {
@@ -35,7 +40,10 @@ func TestResolveBindHost(t *testing.T) {
 			bindAddr:   "",
 			adminToken: "secret",
 			molEnv:     "dev",
-			want:       "", // ADMIN_TOKEN flips IsDevModeFailOpen to false → all interfaces
+			// harden/no-fail-open-auth: loopback default is keyed on
+			// MOLECULE_ENV alone now — a dev box defaults to loopback even
+			// with ADMIN_TOKEN provisioned (which dev-start.sh now does).
+			want: "127.0.0.1",
 		},
 		{
 			name:       "no_bindaddr_production_env",

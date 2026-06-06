@@ -129,6 +129,14 @@ var (
 
 // getEICTunnelPool returns the singleton pool, lazy-initialising on
 // first call. Idempotent.
+//
+// goAsync-exempt (RFC internal#524 Layer 2.2): every `go` in this file
+// is pool-internal lifecycle (janitor + per-entry cleanup closures).
+// None reads db.DB — the pool tracks SSH tunnels, not workspace state.
+// The janitor exits on close(p.stopJanitor); cleanups exit when the
+// captured tunnel's resources are released. Wrapping in globalGoAsync
+// would block test cleanup on the singleton janitor that intentionally
+// runs forever.
 func getEICTunnelPool() *eicTunnelPool {
 	globalEICTunnelPoolOnce.Do(func() {
 		globalEICTunnelPool = newEICTunnelPool()

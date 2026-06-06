@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
 	"github.com/DATA-DOG/go-sqlmock"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/models"
 )
 
 // fakeEmitter records every RecordAndBroadcast call so tests can assert
@@ -42,12 +42,15 @@ func (f *fakeEmitter) count() int {
 	return len(f.events)
 }
 
-// candidateRows builds the new-shape query result (id, runtime, age_sec).
-// Use this in every sweep test to match the runtime-aware SELECT.
-func candidateRows(rows ...[3]any) *sqlmock.Rows {
-	r := sqlmock.NewRows([]string{"id", "runtime", "age_sec"})
+// candidateRows builds the query result (id, runtime, instance_id,
+// age_sec). instance_id was added for the RFC internal#742 rescue hook —
+// it rides alongside runtime so the boot-failure capture can reach the
+// still-running box. Tests that don't care about the rescue path pass
+// "" for instance_id. Use this in every sweep test to match the SELECT.
+func candidateRows(rows ...[4]any) *sqlmock.Rows {
+	r := sqlmock.NewRows([]string{"id", "runtime", "instance_id", "age_sec"})
 	for _, row := range rows {
-		r = r.AddRow(row[0], row[1], row[2])
+		r = r.AddRow(row[0], row[1], row[2], row[3])
 	}
 	return r
 }
@@ -58,8 +61,8 @@ func TestSweepStuckProvisioning_FlipsOverdue(t *testing.T) {
 	mock := setupTestDB(t)
 
 	// claude-code workspace, 700s old > 600s default timeout → flipped.
-	mock.ExpectQuery(`SELECT id, COALESCE\(runtime, ''\), EXTRACT`).
-		WillReturnRows(candidateRows([3]any{"ws-stuck", "claude-code", 700}))
+	mock.ExpectQuery(`SELECT id, COALESCE\(runtime, ''\), COALESCE\(instance_id, ''\), EXTRACT`).
+		WillReturnRows(candidateRows([4]any{"ws-stuck", "claude-code", "i-stuck", 700}))
 
 	mock.ExpectExec(`UPDATE workspaces`).
 		WithArgs("ws-stuck", sqlmock.AnyArg(), sqlmock.AnyArg(), models.StatusFailed).
@@ -92,8 +95,8 @@ func TestSweepStuckProvisioning_HermesGets30MinSlack(t *testing.T) {
 
 	// 11 min = 660 sec. < HermesProvisioningTimeout (1800s).
 	// No UPDATE should fire — hermes still has time.
-	mock.ExpectQuery(`SELECT id, COALESCE\(runtime, ''\), EXTRACT`).
-		WillReturnRows(candidateRows([3]any{"ws-hermes-booting", "hermes", 660}))
+	mock.ExpectQuery(`SELECT id, COALESCE\(runtime, ''\), COALESCE\(instance_id, ''\), EXTRACT`).
+		WillReturnRows(candidateRows([4]any{"ws-hermes-booting", "hermes", "i-h1", 660}))
 
 	emit := &fakeEmitter{}
 	sweepStuckProvisioning(context.Background(), emit, nil)
@@ -114,8 +117,8 @@ func TestSweepStuckProvisioning_HermesPastDeadline(t *testing.T) {
 	mock := setupTestDB(t)
 
 	// 31 min = 1860 sec > HermesProvisioningTimeout (1800s).
-	mock.ExpectQuery(`SELECT id, COALESCE\(runtime, ''\), EXTRACT`).
-		WillReturnRows(candidateRows([3]any{"ws-hermes-stuck", "hermes", 1860}))
+	mock.ExpectQuery(`SELECT id, COALESCE\(runtime, ''\), COALESCE\(instance_id, ''\), EXTRACT`).
+		WillReturnRows(candidateRows([4]any{"ws-hermes-stuck", "hermes", "i-h2", 1860}))
 	mock.ExpectExec(`UPDATE workspaces`).
 		WithArgs("ws-hermes-stuck", sqlmock.AnyArg(), sqlmock.AnyArg(), models.StatusFailed).
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -150,8 +153,8 @@ func TestSweepStuckProvisioning_HermesPastDeadline(t *testing.T) {
 func TestSweepStuckProvisioning_ManifestOverrideSparesRow(t *testing.T) {
 	mock := setupTestDB(t)
 
-	mock.ExpectQuery(`SELECT id, COALESCE\(runtime, ''\), EXTRACT`).
-		WillReturnRows(candidateRows([3]any{"ws-claude-templated", "claude-code", 660}))
+	mock.ExpectQuery(`SELECT id, COALESCE\(runtime, ''\), COALESCE\(instance_id, ''\), EXTRACT`).
+		WillReturnRows(candidateRows([4]any{"ws-claude-templated", "claude-code", "i-ct", 660}))
 
 	// No ExpectExec — if the sweeper still flips the row, sqlmock will
 	// fail with an unexpected-query error.
@@ -183,8 +186,8 @@ func TestSweepStuckProvisioning_ManifestOverrideStillFlipsPastDeadline(t *testin
 	mock := setupTestDB(t)
 
 	// 21 min = 1260s > 1200s manifest override → flipped.
-	mock.ExpectQuery(`SELECT id, COALESCE\(runtime, ''\), EXTRACT`).
-		WillReturnRows(candidateRows([3]any{"ws-claude-truly-stuck", "claude-code", 1260}))
+	mock.ExpectQuery(`SELECT id, COALESCE\(runtime, ''\), COALESCE\(instance_id, ''\), EXTRACT`).
+		WillReturnRows(candidateRows([4]any{"ws-claude-truly-stuck", "claude-code", "i-cts", 1260}))
 	mock.ExpectExec(`UPDATE workspaces`).
 		WithArgs("ws-claude-truly-stuck", sqlmock.AnyArg(), sqlmock.AnyArg(), models.StatusFailed).
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -221,8 +224,8 @@ func TestSweepStuckProvisioning_ManifestOverrideStillFlipsPastDeadline(t *testin
 func TestSweepStuckProvisioning_RaceSafe(t *testing.T) {
 	mock := setupTestDB(t)
 
-	mock.ExpectQuery(`SELECT id, COALESCE\(runtime, ''\), EXTRACT`).
-		WillReturnRows(candidateRows([3]any{"ws-raced", "claude-code", 700}))
+	mock.ExpectQuery(`SELECT id, COALESCE\(runtime, ''\), COALESCE\(instance_id, ''\), EXTRACT`).
+		WillReturnRows(candidateRows([4]any{"ws-raced", "claude-code", "i-raced", 700}))
 
 	mock.ExpectExec(`UPDATE workspaces`).
 		WithArgs("ws-raced", sqlmock.AnyArg(), sqlmock.AnyArg(), models.StatusFailed).
@@ -244,7 +247,7 @@ func TestSweepStuckProvisioning_RaceSafe(t *testing.T) {
 func TestSweepStuckProvisioning_NoStuck(t *testing.T) {
 	mock := setupTestDB(t)
 
-	mock.ExpectQuery(`SELECT id, COALESCE\(runtime, ''\), EXTRACT`).
+	mock.ExpectQuery(`SELECT id, COALESCE\(runtime, ''\), COALESCE\(instance_id, ''\), EXTRACT`).
 		WillReturnRows(candidateRows())
 
 	emit := &fakeEmitter{}
@@ -265,10 +268,10 @@ func TestSweepStuckProvisioning_NoStuck(t *testing.T) {
 func TestSweepStuckProvisioning_MultipleStuck(t *testing.T) {
 	mock := setupTestDB(t)
 
-	mock.ExpectQuery(`SELECT id, COALESCE\(runtime, ''\), EXTRACT`).
+	mock.ExpectQuery(`SELECT id, COALESCE\(runtime, ''\), COALESCE\(instance_id, ''\), EXTRACT`).
 		WillReturnRows(candidateRows(
-			[3]any{"ws-claude-code", "claude-code", 700},
-			[3]any{"ws-hermes", "hermes", 1860},
+			[4]any{"ws-claude-code", "claude-code", "i-cc", 700},
+			[4]any{"ws-hermes", "hermes", "i-hh", 1860},
 		))
 
 	mock.ExpectExec(`UPDATE workspaces`).
@@ -292,8 +295,8 @@ func TestSweepStuckProvisioning_MultipleStuck(t *testing.T) {
 func TestSweepStuckProvisioning_BroadcastFailureDoesNotCrash(t *testing.T) {
 	mock := setupTestDB(t)
 
-	mock.ExpectQuery(`SELECT id, COALESCE\(runtime, ''\), EXTRACT`).
-		WillReturnRows(candidateRows([3]any{"ws-stuck", "claude-code", 700}))
+	mock.ExpectQuery(`SELECT id, COALESCE\(runtime, ''\), COALESCE\(instance_id, ''\), EXTRACT`).
+		WillReturnRows(candidateRows([4]any{"ws-stuck", "claude-code", "i-stuck", 700}))
 	mock.ExpectExec(`UPDATE workspaces`).
 		WithArgs("ws-stuck", sqlmock.AnyArg(), sqlmock.AnyArg(), models.StatusFailed).
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -336,10 +339,9 @@ func TestProvisioningTimeout_RuntimeAware(t *testing.T) {
 		want    time.Duration
 	}{
 		{"hermes", HermesProvisioningTimeout},
-		{"langgraph", DefaultProvisioningTimeout},
 		{"claude-code", DefaultProvisioningTimeout},
-		{"crewai", DefaultProvisioningTimeout},
-		{"autogen", DefaultProvisioningTimeout},
+		{"codex", DefaultProvisioningTimeout},
+		{"openclaw", DefaultProvisioningTimeout},
 		{"", DefaultProvisioningTimeout},
 		{"unknown-runtime", DefaultProvisioningTimeout},
 	}
@@ -359,17 +361,17 @@ func TestProvisioningTimeout_RuntimeAware(t *testing.T) {
 //
 // Order pinned:
 //
-//   1. PROVISION_TIMEOUT_SECONDS env beats everything (ops debug).
-//   2. Manifest lookup beats hermes special-case + default.
-//   3. Hermes default applies when lookup returns 0 for hermes.
-//   4. DefaultProvisioningTimeout applies when lookup returns 0 for
-//      anything else.
-//   5. Lookup returning 0 for ANY runtime is "no override" — never
-//      a 0-second timeout (which would kill every workspace instantly).
+//  1. PROVISION_TIMEOUT_SECONDS env beats everything (ops debug).
+//  2. Manifest lookup beats hermes special-case + default.
+//  3. Hermes default applies when lookup returns 0 for hermes.
+//  4. DefaultProvisioningTimeout applies when lookup returns 0 for
+//     anything else.
+//  5. Lookup returning 0 for ANY runtime is "no override" — never
+//     a 0-second timeout (which would kill every workspace instantly).
 func TestProvisioningTimeout_ManifestOverride(t *testing.T) {
 	manifest := map[string]int{
 		"claude-code": 900, // 15 min — what an ops manifest bump would set
-		"langgraph":   1200,
+		"codex":       1200,
 		"hermes":      2400, // 40 min — manifest can override hermes default too
 	}
 	lookup := func(runtime string) int { return manifest[runtime] }
@@ -380,7 +382,7 @@ func TestProvisioningTimeout_ManifestOverride(t *testing.T) {
 		want    time.Duration
 	}{
 		{"manifest override beats default for claude-code", "claude-code", 900 * time.Second},
-		{"manifest override applied for langgraph", "langgraph", 1200 * time.Second},
+		{"manifest override applied for codex", "codex", 1200 * time.Second},
 		{"manifest override beats hermes default", "hermes", 2400 * time.Second},
 		{"unknown runtime + no manifest entry → default", "unknown-runtime", DefaultProvisioningTimeout},
 		{"empty runtime + no manifest entry → default", "", DefaultProvisioningTimeout},

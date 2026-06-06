@@ -20,13 +20,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/envx"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/events"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/models"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/provisioner"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/registry"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/wsauth"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/envx"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/registry"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wsauth"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
@@ -111,12 +111,13 @@ const maxProxyResponseBody = 10 << 20
 //     a generic 502 page to canvas. 10s is well above realistic intra-region
 //     latencies and well below CF's edge timeout.
 //
-//  3. Transport.ResponseHeaderTimeout — 180s default. From request-body-end
+//  3. Transport.ResponseHeaderTimeout — 5min default. From request-body-end
 //     to response-headers-start. Configurable via
 //     A2A_PROXY_RESPONSE_HEADER_TIMEOUT (envx.Duration). Covers cold-start
 //     first-byte (30-60s OAuth flow above) with enough room for Opus agent
-//     turns (big context + internal delegate_task round-trips routinely exceed
-//     the old 60s ceiling). Body streaming after headers is governed by the
+//     turns and Codex scheduled tasks (big context + internal delegate_task
+//     round-trips routinely exceed the old 60s/180s ceilings). Body streaming
+//     after headers is governed by the
 //     per-request context deadline, NOT this timeout — so multi-minute agent
 //     responses still work fine.
 //
@@ -131,7 +132,7 @@ var a2aClient = &http.Client{
 			Timeout:   10 * time.Second,
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
-		ResponseHeaderTimeout: envx.Duration("A2A_PROXY_RESPONSE_HEADER_TIMEOUT", 180*time.Second),
+		ResponseHeaderTimeout: envx.Duration("A2A_PROXY_RESPONSE_HEADER_TIMEOUT", 5*time.Minute),
 		TLSHandshakeTimeout:   10 * time.Second,
 		// MaxIdleConns / IdleConnTimeout: stdlib defaults are fine; agent
 		// fan-in is bounded by the platform's broadcaster fan-out, not by
@@ -228,7 +229,7 @@ func (e *proxyA2AError) Error() string {
 // cron scheduler and other internal callers that need to send A2A messages
 // to workspaces programmatically (not from an HTTP handler).
 func (h *WorkspaceHandler) ProxyA2ARequest(ctx context.Context, workspaceID string, body []byte, callerID string, logActivity bool) (int, []byte, error) {
-	status, resp, proxyErr := h.proxyA2ARequest(ctx, workspaceID, body, callerID, logActivity)
+	status, resp, proxyErr := h.proxyA2ARequest(ctx, workspaceID, body, callerID, logActivity, false)
 	if proxyErr != nil {
 		return status, resp, proxyErr
 	}
@@ -307,13 +308,21 @@ func (h *WorkspaceHandler) ProxyA2A(c *gin.Context) {
 	// The bind is strict: the token must match `callerID`, not
 	// `workspaceID` (the target). A compromised token from workspace A
 	// must never authenticate calls from A pretending to be B.
-	if callerID != "" && callerID != workspaceID {
-		if err := validateCallerToken(ctx, c, callerID); err != nil {
+	//
+	// Post-RFC#637: canvas users now send X-Workspace-ID (their identity
+	// workspace). validateCallerToken detects canvas/admin auth on a
+	// tokenless workspace and returns isCanvasUser=true so the proxy can
+	// bypass CanCommunicate (human users sit outside the hierarchy).
+	isCanvasUser := false
+	if callerID != "" && callerID != workspaceID && !isSystemCaller(callerID) {
+		var err error
+		isCanvasUser, err = validateCallerToken(ctx, c, callerID)
+		if err != nil {
 			return // response already written with 401
 		}
 	}
 
-	status, respBody, proxyErr := h.proxyA2ARequest(ctx, workspaceID, body, callerID, true)
+	status, respBody, proxyErr := h.proxyA2ARequest(ctx, workspaceID, body, callerID, true, isCanvasUser)
 	if proxyErr != nil {
 		for k, v := range proxyErr.Headers {
 			c.Header(k, v)
@@ -325,43 +334,80 @@ func (h *WorkspaceHandler) ProxyA2A(c *gin.Context) {
 	c.Data(status, "application/json", respBody)
 }
 
-// checkWorkspaceBudget returns a proxyA2AError with 402 when the workspace
-// has a budget_limit set and monthly_spend has reached or exceeded it.
-// DB errors are logged and treated as fail-open — a budget check failure
-// must not block legitimate A2A traffic.
+// checkWorkspaceBudget returns a proxyA2AError with 402 when the workspace has
+// exceeded ANY of its configured per-period budget limits (hourly/daily/weekly/
+// monthly — see budget_periods.go). Per-period spend is the rolling-window sum
+// over the workspace_spend_events ledger. DB errors are logged and treated as
+// fail-open — a budget check failure must not block legitimate A2A traffic.
 func (h *WorkspaceHandler) checkWorkspaceBudget(ctx context.Context, workspaceID string) *proxyA2AError {
-	var budgetLimit sql.NullInt64
-	var monthlySpend int64
-	err := db.DB.QueryRowContext(ctx,
-		`SELECT budget_limit, COALESCE(monthly_spend, 0) FROM workspaces WHERE id = $1`,
+	var limitsRaw []byte
+	if err := db.DB.QueryRowContext(ctx,
+		`SELECT COALESCE(budget_limits, '{}'::jsonb) FROM workspaces WHERE id = $1`,
 		workspaceID,
-	).Scan(&budgetLimit, &monthlySpend)
-	if err != nil {
+	).Scan(&limitsRaw); err != nil {
 		if err != sql.ErrNoRows {
 			log.Printf("ProxyA2A: budget check failed for %s: %v", workspaceID, err)
 		}
 		return nil // fail-open
 	}
-	if budgetLimit.Valid && monthlySpend >= budgetLimit.Int64 {
-		log.Printf("ProxyA2A: budget exceeded for %s (spend=%d limit=%d)", workspaceID, monthlySpend, budgetLimit.Int64)
+	limits := parseBudgetLimits(limitsRaw)
+	if len(limits) == 0 {
+		return nil // no limits configured
+	}
+	spend, err := spendByPeriod(ctx, db.DB, workspaceID)
+	if err != nil {
+		log.Printf("ProxyA2A: budget spend query failed for %s: %v", workspaceID, err)
+		return nil // fail-open
+	}
+	if over := exceededPeriods(limits, spend); len(over) > 0 {
+		log.Printf("ProxyA2A: budget exceeded for %s (periods=%v limits=%v spend=%v)", workspaceID, over, limits, spend)
 		return &proxyA2AError{
-			Status:   http.StatusPaymentRequired,
-			Response: gin.H{"error": "workspace budget limit exceeded"},
+			Status: http.StatusPaymentRequired,
+			Response: gin.H{
+				"error":            "workspace budget limit exceeded",
+				"exceeded_periods": over,
+			},
 		}
 	}
 	return nil
 }
 
-func (h *WorkspaceHandler) proxyA2ARequest(ctx context.Context, workspaceID string, body []byte, callerID string, logActivity bool) (int, []byte, *proxyA2AError) {
+func (h *WorkspaceHandler) proxyA2ARequest(ctx context.Context, workspaceID string, body []byte, callerID string, logActivity bool, isCanvasUser bool) (int, []byte, *proxyA2AError) {
 	// Access control: workspace-to-workspace requests must pass CanCommunicate check.
 	// Canvas requests (callerID == "") and system callers (webhook:*, system:*, test:*)
 	// are trusted. Self-calls (callerID == workspaceID) are always allowed.
-	if callerID != "" && callerID != workspaceID && !isSystemCaller(callerID) {
+	// Post-RFC#637: canvas-user identity workspaces also bypass CanCommunicate
+	// because human users sit outside the org hierarchy.
+	if callerID != "" && callerID != workspaceID && !isSystemCaller(callerID) && !isCanvasUser {
 		if !registry.CanCommunicate(callerID, workspaceID) {
 			log.Printf("ProxyA2A: access denied %s → %s", callerID, workspaceID)
 			return 0, nil, &proxyA2AError{
 				Status:   http.StatusForbidden,
 				Response: gin.H{"error": "access denied: workspaces cannot communicate per hierarchy rules"},
+			}
+		}
+
+		// #1953 cross-tenant isolation. CanCommunicate alone does NOT enforce
+		// org boundaries: its "root-level siblings — both have no parent" rule
+		// treats every tenant's org root as a sibling, so a caller that is an
+		// org root could resolve and route a2a to another tenant's org root
+		// (and resolveAgentURL accepts ANY workspace id with no org check).
+		// Gate on the SAME parent_id-chain org scoping the OFFSEC-015 broadcast
+		// fix uses: reject before resolveAgentURL when caller and target are in
+		// different orgs. Fail-closed — a DB error denies cross-org routing.
+		ok, err := sameOrg(ctx, db.DB, callerID, workspaceID)
+		if err != nil {
+			log.Printf("ProxyA2A: org-scope check failed %s → %s: %v — denying", callerID, workspaceID, err)
+			return 0, nil, &proxyA2AError{
+				Status:   http.StatusForbidden,
+				Response: gin.H{"error": "access denied: org isolation check failed"},
+			}
+		}
+		if !ok {
+			log.Printf("ProxyA2A: cross-org routing denied %s → %s (#1953)", callerID, workspaceID)
+			return 0, nil, &proxyA2AError{
+				Status:   http.StatusForbidden,
+				Response: gin.H{"error": "access denied: target workspace is in a different org"},
 			}
 		}
 	}
@@ -399,7 +445,21 @@ func (h *WorkspaceHandler) proxyA2ARequest(ctx context.Context, workspaceID stri
 	// (no Do(), no maybeMarkContainerDead). The response is a synthetic
 	// {status:"queued"} envelope so the caller (canvas, another workspace)
 	// knows delivery is acknowledged but pending consumption.
-	if lookupDeliveryMode(ctx, workspaceID) == models.DeliveryModePoll {
+	deliveryMode, deliveryModeErr := lookupDeliveryMode(ctx, workspaceID)
+	if deliveryModeErr != nil {
+		// internal#497 fail-closed: a real DB/context error on the
+		// delivery-mode read MUST NOT silently fall through to the push
+		// dispatch path — that is exactly what silently misrouted every
+		// poll-mode peer for 5 days under the ce2db75f regression. Surface
+		// a structured error so the delegation is marked failed (loud +
+		// retryable) instead of dispatched to the wrong path.
+		log.Printf("ProxyA2A: delivery-mode lookup failed for %s: %v — failing closed", workspaceID, deliveryModeErr)
+		return 0, nil, &proxyA2AError{
+			Status:   http.StatusServiceUnavailable,
+			Response: gin.H{"error": "delivery-mode lookup failed; refusing to dispatch to avoid silent misrouting"},
+		}
+	}
+	if deliveryMode == models.DeliveryModePoll {
 		if logActivity {
 			h.logA2AReceiveQueued(ctx, workspaceID, callerID, body, a2aMethod)
 		}
@@ -542,7 +602,14 @@ func (h *WorkspaceHandler) proxyA2ARequest(ctx context.Context, workspaceID stri
 	// Track LLM token usage for cost transparency (#593).
 	// Fires in a detached goroutine so token accounting never adds latency
 	// to the critical A2A path.
-	go extractAndUpsertTokenUsage(context.WithoutCancel(ctx), workspaceID, respBody)
+	// RFC internal#524 Layer 1: extractAndUpsertTokenUsage reads db.DB
+	// (INSERT INTO llm_token_usage). Without globalGoAsync, the detached
+	// write races a subsequent test's db.DB swap exactly like the
+	// maybeMarkContainerDead path that 69d9b4e3 fixed.
+	tokCtx := context.WithoutCancel(ctx)
+	wsID := workspaceID
+	tokBody := respBody
+	globalGoAsync(func() { extractAndUpsertTokenUsage(tokCtx, wsID, tokBody) })
 
 	// Non-2xx agent response: the agent received the request but returned an
 	// error status. Return a proxyErr so the caller (DrainQueueForWorkspace)
@@ -665,11 +732,22 @@ func (h *WorkspaceHandler) resolveAgentURL(ctx context.Context, workspaceID stri
 		_ = db.CacheURL(ctx, workspaceID, agentURL)
 	}
 
-	// When the platform runs inside Docker, 127.0.0.1:{host_port} is
-	// unreachable (it's the platform container's own localhost, not the
-	// Docker host). Rewrite to the container's Docker-bridge hostname.
+	// When the platform runs inside Docker, a managed workspace's
+	// 127.0.0.1:{host_port} URL points at the Docker host and must be
+	// rewritten to the workspace container's Docker-bridge hostname.
+	// External runtimes are not managed containers; their local test/runtime
+	// URL is the target and must not be synthesized into ws-<id>:8000.
 	if strings.HasPrefix(agentURL, "http://127.0.0.1:") && h.provisioner != nil && platformInDocker {
-		agentURL = provisioner.InternalURL(workspaceID)
+		var wsRuntime string
+		if err := db.DB.QueryRowContext(ctx,
+			`SELECT COALESCE(runtime, 'claude-code') FROM workspaces WHERE id = $1`,
+			workspaceID,
+		).Scan(&wsRuntime); err != nil {
+			log.Printf("ProxyA2A: runtime lookup before Docker URL rewrite failed for %s: %v", workspaceID, err)
+		}
+		if !isExternalLikeRuntime(wsRuntime) {
+			agentURL = provisioner.InternalURL(workspaceID)
+		}
 	}
 	// SSRF defence: reject private/metadata URLs before making outbound call.
 	if err := isSafeURL(agentURL); err != nil {
@@ -723,6 +801,18 @@ func normalizeA2APayload(body []byte) ([]byte, string, *proxyA2AError) {
 			if _, hasID := msg["messageId"]; !hasID {
 				msg["messageId"] = uuid.New().String()
 			}
+			// #2251: default params.message.role to "user" when absent.
+			// The downstream a2a-sdk v0.3 Pydantic validator marks role a
+			// REQUIRED field; a role-less envelope fails parse with
+			// "params.message.role Field required". The Go builders
+			// (mcp_tools/delegation/scheduler/channels) already set it, but
+			// raw external/canvas POSTs to ProxyA2A may omit it — making this
+			// the single canonical choke that guarantees a schema-valid role.
+			// Mirror the messageId default exactly: inject only when missing,
+			// never overwrite a caller-supplied role (e.g. "agent").
+			if _, hasRole := msg["role"]; !hasRole {
+				msg["role"] = "user"
+			}
 			_, hasParts := msg["parts"]
 			rawContent, hasContent := msg["content"]
 			if !hasParts {
@@ -751,6 +841,27 @@ func normalizeA2APayload(body []byte) ([]byte, string, *proxyA2AError) {
 							"error": "params.message must contain either 'parts' (v0.3) or 'content' (v0.2 compat)",
 							"hint":  "v0.3 example: {\"parts\":[{\"kind\":\"text\",\"text\":\"...\"}]}",
 						},
+					}
+				}
+			}
+			// #2251: wire hygiene — the A2A v0.3 Part discriminator is
+			// "kind", but some builders/clients emit the legacy "type" key
+			// (e.g. delegation.go). The v0.3 Pydantic validator keys on
+			// "kind"; a stray "type" leaves the Part untagged. Rename
+			// "type" → "kind" on every Part that lacks an explicit "kind"
+			// so the discriminator is always present on the wire.
+			if parts, ok := msg["parts"].([]interface{}); ok {
+				for _, p := range parts {
+					part, ok := p.(map[string]interface{})
+					if !ok {
+						continue
+					}
+					if _, hasKind := part["kind"]; hasKind {
+						continue
+					}
+					if t, hasType := part["type"]; hasType {
+						part["kind"] = t
+						delete(part, "type")
 					}
 				}
 			}
@@ -917,6 +1028,12 @@ func applyIdleTimeout(parent context.Context, b *events.Broadcaster, workspaceID
 	}
 	ctx, cancel := context.WithCancel(parent)
 	sub, unsub := b.SubscribeSSE(workspaceID)
+	// goAsync-exempt (RFC internal#524 Layer 2.2 annotation): this
+	// goroutine owns the parent ctx's cancel and exits only on
+	// ctx.Done() / sub-channel close — wrapping it in globalGoAsync would
+	// deadlock drainTestAsync because the request that owns ctx hasn't
+	// completed when t.Cleanup fires. Does NOT read db.DB; idle-timer
+	// management only.
 	go func() {
 		defer unsub()
 		timer := time.NewTimer(idle)

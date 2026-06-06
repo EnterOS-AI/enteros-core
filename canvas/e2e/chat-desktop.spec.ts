@@ -55,7 +55,7 @@ test.describe("Desktop ChatTab", () => {
     await textarea.fill("What is the weather?");
     await page.getByRole("button", { name: /Send/ }).first().click();
 
-    await expect(page.getByText("What is the weather?")).toBeVisible({ timeout: 5_000 });
+    await expect(page.getByText("What is the weather?", { exact: true })).toBeVisible({ timeout: 5_000 });
     await expect(page.getByText("Echo: What is the weather?")).toBeVisible({ timeout: 15_000 });
   });
 
@@ -101,10 +101,19 @@ test.describe("Desktop ChatTab", () => {
     await textarea.fill("Trigger activity");
     await page.getByRole("button", { name: /Send/ }).first().click();
 
-    // Activity log container should appear during the send flow.
-    await expect(page.locator("[data-testid='activity-log']").first()).toBeVisible({ timeout: 10_000 }).catch(() => {
-      // Activity log may not be present in all layouts.
-    });
+    // FALSE-GREEN FIX: the prior `.catch(() => {})` swallowed the assertion
+    // entirely, so this test passed whether or not the activity log ever
+    // rendered. The activity-log container is optional per layout, so we
+    // gate on its presence in the DOM: if it's not part of this layout,
+    // skip explicitly (a recorded skip, not a silent pass); if it IS
+    // present, it MUST become visible during the send flow — that's the
+    // behaviour this test exists to protect.
+    const activityLog = page.locator("[data-testid='activity-log']").first();
+    if ((await activityLog.count()) === 0) {
+      test.skip(true, "activity-log not part of this layout");
+      return;
+    }
+    await expect(activityLog).toBeVisible({ timeout: 10_000 });
   });
 });
 

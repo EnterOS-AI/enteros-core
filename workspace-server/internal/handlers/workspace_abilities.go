@@ -16,7 +16,7 @@ import (
 	"log"
 	"net/http"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"github.com/gin-gonic/gin"
 )
 
@@ -56,7 +56,20 @@ func PatchAbilities(c *gin.Context) {
 		return
 	}
 
-	if body.BroadcastEnabled != nil {
+	// Atomic update: when both fields are supplied, apply them in one SQL
+	// statement so the request is all-or-nothing (#2131). A partial mutation
+	// (e.g. broadcast_enabled updated but talk_to_user_enabled failing) would
+	// leave the workspace in an ambiguous capability state.
+	if body.BroadcastEnabled != nil && body.TalkToUserEnabled != nil {
+		if _, err := db.DB.ExecContext(ctx,
+			`UPDATE workspaces SET broadcast_enabled = $2, talk_to_user_enabled = $3, updated_at = now() WHERE id = $1`,
+			id, *body.BroadcastEnabled, *body.TalkToUserEnabled,
+		); err != nil {
+			log.Printf("PatchAbilities both-fields for %s: %v", id, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "update failed"})
+			return
+		}
+	} else if body.BroadcastEnabled != nil {
 		if _, err := db.DB.ExecContext(ctx,
 			`UPDATE workspaces SET broadcast_enabled = $2, updated_at = now() WHERE id = $1`,
 			id, *body.BroadcastEnabled,
@@ -65,9 +78,7 @@ func PatchAbilities(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "update failed"})
 			return
 		}
-	}
-
-	if body.TalkToUserEnabled != nil {
+	} else if body.TalkToUserEnabled != nil {
 		if _, err := db.DB.ExecContext(ctx,
 			`UPDATE workspaces SET talk_to_user_enabled = $2, updated_at = now() WHERE id = $1`,
 			id, *body.TalkToUserEnabled,

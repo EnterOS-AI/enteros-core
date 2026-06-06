@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 /**
- * AttachmentLightbox — fullscreen modal for image / PDF preview.
+ * AttachmentLightbox — modal for image / PDF preview.
  *
  * Owns: backdrop + viewport, Esc to close, click-outside to close,
  * focus trap (close button focus on open, restore on close),
@@ -134,6 +134,22 @@ describe("AttachmentLightbox — render", () => {
     );
     const closeBtn = document.querySelector('button[aria-label="Close preview"]');
     expect(closeBtn).toBeTruthy();
+  });
+
+  it("uses absolute positioning when contained=true", () => {
+    render(
+      <AttachmentLightbox
+        open={true}
+        onClose={vi.fn()}
+        ariaLabel="Preview"
+        contained
+      >
+        <MockContent />
+      </AttachmentLightbox>,
+    );
+    const dialog = document.querySelector('[role="dialog"]');
+    expect(dialog?.className).toContain("absolute");
+    expect(dialog?.className).not.toContain("fixed");
   });
 });
 

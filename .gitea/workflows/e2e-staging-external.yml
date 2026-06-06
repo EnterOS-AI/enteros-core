@@ -84,7 +84,27 @@ jobs:
     name: E2E Staging External Runtime
     runs-on: ubuntu-latest
     # Phase 3 (RFC #219 §1): surface broken workflows without blocking.
-    # mc#774: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
+    # mc#1982: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
+    #
+    # PROMOTION-READINESS (toward required gate — do NOT flip continue-on-error
+    # without CTO sign-off, that's the irreversible call):
+    #   NOW FAIL-CLOSED:
+    #     - Missing CP_STAGING_ADMIN_API_TOKEN → hard exit 2 (preflight).
+    #     - Staging CP unhealthy → hard exit 1 (preflight, not a workspace bug).
+    #     - Harness E2E_REQUIRE_LIVE=1 → exit 5 if a clean exit didn't prove
+    #       all four awaiting_agent transitions (no silent skip).
+    #     - Sweep transition (step 6) is now a bounded readiness-poll, not a
+    #       fixed sleep + one-shot assert → no more sweep-cadence flake.
+    #     - register / re-register retry ONLY transient edge 5xx (bounded),
+    #       fail closed on 4xx → no more cold-boot-502 flake.
+    #   STILL BLOCKS PROMOTION:
+    #     - Single shared staging tenant + EC2 quota window: an infra-side
+    #       provisioning outage (not a code bug) would turn the gate red.
+    #       Needs an infra-class vs code-class signal split before required.
+    #     - "CP unhealthy → exit 1" currently looks identical to a real
+    #       failure on the run page; required-gate would need it demoted to
+    #       a neutral/skip so staging flakiness can't block merges.
+    # mc#1982: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
     continue-on-error: true
     timeout-minutes: 25
 
@@ -124,6 +144,15 @@ jobs:
 
       - name: Run external-runtime E2E
         id: e2e
+        # E2E_REQUIRE_LIVE=1: the harness fails CLOSED (exit 5) if it ever
+        # reaches a clean exit without proving all four awaiting_agent
+        # transitions. Mirrors CP serving-e2e SERVING_E2E_REQUIRE_LIVE — a
+        # silent skip / early-return / dropped assertion can no longer
+        # masquerade as green. Token-missing and CP-unhealthy already
+        # hard-fail in the two preflight steps above, so reaching this step
+        # means a real cycle is expected.
+        env:
+          E2E_REQUIRE_LIVE: "1"
         run: bash tests/e2e/test_staging_external_runtime.sh
 
       # Mirror the e2e-staging-saas.yml safety net: if the runner is

@@ -148,6 +148,7 @@ export function MobileSpawn({ dark, onClose }: { dark: boolean; onClose: () => v
             type="button"
             onClick={onClose}
             aria-label="Close"
+            className="focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-100 dark:focus-visible:ring-offset-zinc-900"
             style={{
               width: 32,
               height: 32,
@@ -170,6 +171,8 @@ export function MobileSpawn({ dark, onClose }: { dark: boolean; onClose: () => v
         <div style={{ padding: "0 14px" }}>
           {loadingTemplates ? (
             <div
+              role="status"
+              aria-live="polite"
               style={{
                 padding: "24px 8px",
                 textAlign: "center",
@@ -214,6 +217,8 @@ export function MobileSpawn({ dark, onClose }: { dark: boolean; onClose: () => v
                       setTplId(t.id);
                       setTier(tCode);
                     }}
+                    aria-label={`Select template: ${t.name} (tier ${t.tier})`}
+                    className="focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-100 dark:focus-visible:ring-offset-zinc-900"
                     style={{
                       background: on
                         ? dark
@@ -302,6 +307,7 @@ export function MobileSpawn({ dark, onClose }: { dark: boolean; onClose: () => v
           <input
             value={name}
             onChange={(e) => setName(e.target.value)}
+            aria-label="Agent name"
             placeholder={tplId
               ? (templates.find((t) => t.id === tplId)?.name ?? "agent-name")
               : "agent-name"}
@@ -312,7 +318,12 @@ export function MobileSpawn({ dark, onClose }: { dark: boolean; onClose: () => v
               border: `0.5px solid ${p.border}`,
               borderRadius: 12,
               fontFamily: MOBILE_FONT_MONO,
-              fontSize: 13.5,
+              // iOS Safari/PWA zooms the viewport when a focused input has
+              // a computed font-size below 16px; the layout jumps and the
+              // page looks broken until the user pinches back (#224 / #225,
+              // same class as desktop #1434). 16px is the minimum that
+              // suppresses that focus-zoom.
+              fontSize: 16,
               color: p.text,
               outline: "none",
               boxSizing: "border-box",
@@ -330,6 +341,8 @@ export function MobileSpawn({ dark, onClose }: { dark: boolean; onClose: () => v
                 key={t}
                 type="button"
                 onClick={() => setTier(t)}
+                aria-label={`Select tier ${t}: ${TIER_LABEL[t]}`}
+                className="focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-100 dark:focus-visible:ring-offset-zinc-900"
                 style={{
                   flex: 1,
                   padding: "10px 8px",
@@ -377,6 +390,8 @@ export function MobileSpawn({ dark, onClose }: { dark: boolean; onClose: () => v
             type="button"
             onClick={handleSpawn}
             disabled={busy || !tplId || templates.length === 0}
+            aria-label="Spawn agent"
+            className="focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-100 dark:focus-visible:ring-offset-zinc-900"
             style={{
               width: "100%",
               height: 52,

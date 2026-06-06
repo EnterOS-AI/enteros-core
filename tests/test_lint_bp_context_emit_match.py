@@ -34,9 +34,12 @@ Test classes (per `feedback_branch_count_before_approving`):
     together, not short-circuited.
   - test_bp_empty_lints_nothing            — BP has no contexts.
     Exit 0 cleanly.
-  - test_api_403_skips_gracefully          — branch_protections endpoint
-    403s (token-scope). Exit 0 with ::error::, do NOT red-X.
-  - test_api_404_skips_gracefully          — branch has no protection.
+  - test_api_403_fails_closed              — branch_protections endpoint
+    401/403s (auth failure). FAIL CLOSED (exit 2) with ::error::.
+  - test_api_transient_fails_closed        — transient/unexpected API
+    error. FAIL CLOSED (exit 2).
+  - test_api_404_skips_gracefully          — branch has no protection
+    (authenticated absent resource). Tolerated skip (exit 0 + warning).
     Exit 0 cleanly.
   - test_context_event_match_required      — BP context says `(push)` and
     workflow only emits on `pull_request`. That's NOT a match — the
@@ -55,9 +58,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
-import sys
 from pathlib import Path
-from unittest import mock
 
 import pytest
 
@@ -164,7 +165,7 @@ def test_bp_orphan_context_fails(envset, monkeypatch, capsys):
         "  all-required:\n    runs-on: x\n    steps:\n      - run: echo hi\n",
     )
     m = _import_lint()
-    posted = _stub_api(
+    _stub_api(
         monkeypatch,
         m,
         ("ok", {"status_check_contexts": [
@@ -249,9 +250,10 @@ def test_bp_empty_lints_nothing(envset, monkeypatch, capsys):
 
 
 # ---------------------------------------------------------------------------
-# API 403 — graceful-degrade.
+# API 403 — AUTH FAILURE → FAIL CLOSED (exit 2). This is a HARD gate on a
+# protected context; a token that can't read BP must NOT green the lint.
 # ---------------------------------------------------------------------------
-def test_api_403_skips_gracefully(envset, monkeypatch, capsys):
+def test_api_403_fails_closed(envset, monkeypatch, capsys):
     _write_wf(
         envset,
         "ci.yml",
@@ -261,13 +263,30 @@ def test_api_403_skips_gracefully(envset, monkeypatch, capsys):
     m = _import_lint()
     _stub_api(monkeypatch, m, ("forbidden", None))
     rc = m.run()
-    assert rc == 0
+    assert rc == 2
     err = capsys.readouterr().err
     assert "403" in err or "scope" in err.lower() or "token" in err.lower()
 
 
 # ---------------------------------------------------------------------------
-# API 404 — branch has no protection → clean exit.
+# API transient/unexpected error → FAIL CLOSED (exit 2).
+# ---------------------------------------------------------------------------
+def test_api_transient_fails_closed(envset, monkeypatch, capsys):
+    _write_wf(
+        envset,
+        "ci.yml",
+        "name: CI\non:\n  pull_request:\n    branches: [main]\njobs:\n"
+        "  j:\n    runs-on: x\n    steps:\n      - run: echo hi\n",
+    )
+    m = _import_lint()
+    _stub_api(monkeypatch, m, ("error", None))
+    rc = m.run()
+    assert rc == 2
+
+
+# ---------------------------------------------------------------------------
+# API 404 — authenticated absent resource (branch has no protection) →
+# tolerated graceful skip (exit 0 with ::warning::), NOT a fail-open.
 # ---------------------------------------------------------------------------
 def test_api_404_skips_gracefully(envset, monkeypatch, capsys):
     _write_wf(

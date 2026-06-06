@@ -7,6 +7,7 @@ package handlers
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -15,10 +16,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/events"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/models"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/wsauth"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wsauth"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/lib/pq"
@@ -161,6 +162,36 @@ func (h *WorkspaceHandler) Update(c *gin.Context) {
 			}
 		}
 	}
+	var computeJSON string
+	computePatch := false
+	if rawCompute, ok := body["compute"]; ok {
+		computePatch = true
+		if rawCompute == nil {
+			computeJSON = "{}"
+		} else {
+			b, err := json.Marshal(rawCompute)
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid compute config"})
+				return
+			}
+			var compute models.WorkspaceCompute
+			if err := json.Unmarshal(b, &compute); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid compute config"})
+				return
+			}
+			if err := validateWorkspaceCompute(compute); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
+			}
+			encoded, err := workspaceComputeJSON(compute)
+			if err != nil {
+				log.Printf("Update compute encode error for %s: %v", id, err)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to encode compute config"})
+				return
+			}
+			computeJSON = encoded
+		}
+	}
 
 	ctx := c.Request.Context()
 
@@ -212,17 +243,28 @@ func (h *WorkspaceHandler) Update(c *gin.Context) {
 			log.Printf("Update collapsed error for %s: %v", id, err)
 		}
 	}
+	needsRestart := false
 	if runtime, ok := body["runtime"]; ok {
 		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET runtime = $2, updated_at = now() WHERE id = $1`, id, runtime); err != nil {
 			log.Printf("Update runtime error for %s: %v", id, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save runtime"})
+			return
 		}
+		needsRestart = true
 	}
-	needsRestart := false
 	if wsDir, ok := body["workspace_dir"]; ok {
 		// ValidateWorkspaceDir was already called above before the existence check;
 		// the UPDATE itself is unconditional.
 		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET workspace_dir = $2, updated_at = now() WHERE id = $1`, id, wsDir); err != nil {
 			log.Printf("Update workspace_dir error for %s: %v", id, err)
+		}
+		needsRestart = true
+	}
+	if computePatch {
+		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET compute = $2::jsonb, updated_at = now() WHERE id = $1`, id, computeJSON); err != nil {
+			log.Printf("Update compute error for %s: %v", id, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save compute config"})
+			return
 		}
 		needsRestart = true
 	}
@@ -283,6 +325,37 @@ func (h *WorkspaceHandler) Delete(c *gin.Context) {
 		return
 	}
 
+	var workspaceName, workspaceStatus string
+	var activeTasks int
+	if err := db.DB.QueryRowContext(ctx,
+		`SELECT name, COALESCE(active_tasks, 0), status FROM workspaces WHERE id = $1`, id,
+	).Scan(&workspaceName, &activeTasks, &workspaceStatus); err != nil {
+		if err == sql.ErrNoRows {
+			c.JSON(http.StatusNotFound, gin.H{"error": "workspace not found"})
+			return
+		}
+		log.Printf("Delete: workspace lookup failed for %s: %v", id, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check workspace"})
+		return
+	}
+	if workspaceStatus == string(models.StatusRemoved) {
+		c.JSON(http.StatusGone, gin.H{"error": "workspace removed", "id": id})
+		return
+	}
+
+	if c.GetHeader("X-Confirm-Name") != workspaceName {
+		childCount, scheduleCount := destructiveDeleteCounts(ctx, id)
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":          "destructive_action_requires_confirmation",
+			"hint":           "Re-send the same request with header X-Confirm-Name: " + workspaceName,
+			"workspace_name": workspaceName,
+			"active_tasks":   activeTasks,
+			"child_count":    childCount,
+			"schedule_count": scheduleCount,
+		})
+		return
+	}
+
 	// Check for children
 	rows, err := db.DB.QueryContext(ctx,
 		`SELECT id, name FROM workspaces WHERE parent_id = $1 AND status != 'removed'`, id)
@@ -326,7 +399,13 @@ func (h *WorkspaceHandler) Delete(c *gin.Context) {
 	// disable, broadcast). The HTTP-specific bits — direct-children 409
 	// gate above, ?purge=true hard-delete below, response shaping —
 	// stay in this handler.
-	descendantIDs, stopErrs, err := h.CascadeDelete(ctx, id)
+	// internal#734: the user can ask to erase saved data (browser profile /
+	// cookies / downloads / agent memory) on delete. Opt-in — default keeps the
+	// data on its volume for the orphan-sweeper grace. Only a genuine
+	// permanent-delete reaches here (restart/reconcile use other paths), so this
+	// is the one place prune may be requested.
+	erase := c.Query("erase_data") == "true"
+	descendantIDs, stopErrs, err := h.CascadeDelete(ctx, id, erase)
 	if err != nil {
 		// Audit 2026-05-09 (Core-Security): raw `err.Error()` here was
 		// exposed to HTTP clients verbatim, including wrapped lib/pq
@@ -360,7 +439,11 @@ func (h *WorkspaceHandler) Delete(c *gin.Context) {
 		purgeIDs := pq.Array(allIDs)
 		// Order matters: delete from leaf tables first, then workspace row
 		for _, table := range []string{
-			"agent_memories", "activity_logs", "workspace_secrets",
+			// agent_memories removed in Phase A3 (#1792); memory rows now
+			// live in memory_plugin.memory_records. The plugin's
+			// namespace-cascade handles cleanup when the workspace's
+			// namespace is deleted via DeleteNamespace.
+			"activity_logs", "workspace_secrets",
 			"workspace_channels", "workspace_config", "workspace_memory",
 			"workspace_token_usage", "approval_requests", "audit_events",
 			"workflow_checkpoints", "workspace_artifacts", "agents",
@@ -373,8 +456,12 @@ func (h *WorkspaceHandler) Delete(c *gin.Context) {
 			}
 		}
 		// Null out parent_id / forwarded_to references
-		db.DB.ExecContext(ctx, "UPDATE workspaces SET parent_id = NULL WHERE parent_id = ANY($1::uuid[])", purgeIDs)
-		db.DB.ExecContext(ctx, "UPDATE workspaces SET forwarded_to = NULL WHERE forwarded_to = ANY($1::uuid[])", purgeIDs)
+		if _, err := db.DB.ExecContext(ctx, "UPDATE workspaces SET parent_id = NULL WHERE parent_id = ANY($1::uuid[])", purgeIDs); err != nil {
+			log.Printf("Purge parent_id null error for %v: %v", allIDs, err)
+		}
+		if _, err := db.DB.ExecContext(ctx, "UPDATE workspaces SET forwarded_to = NULL WHERE forwarded_to = ANY($1::uuid[])", purgeIDs); err != nil {
+			log.Printf("Purge forwarded_to null error for %v: %v", allIDs, err)
+		}
 		// Hard delete the workspace row
 		if _, err := db.DB.ExecContext(ctx, "DELETE FROM workspaces WHERE id = ANY($1::uuid[])", purgeIDs); err != nil {
 			log.Printf("Purge workspace row error for %v: %v", allIDs, err)
@@ -404,6 +491,22 @@ func (h *WorkspaceHandler) Delete(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "removed", "cascade_deleted": len(descendantIDs)})
 }
 
+func destructiveDeleteCounts(ctx context.Context, id string) (childCount int, scheduleCount int) {
+	if err := db.DB.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM workspaces WHERE parent_id = $1 AND status != 'removed'`, id,
+	).Scan(&childCount); err != nil {
+		log.Printf("Delete: child count failed for %s: %v", id, err)
+		childCount = 0
+	}
+	if err := db.DB.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM workspace_schedules WHERE workspace_id = $1 AND enabled = true`, id,
+	).Scan(&scheduleCount); err != nil {
+		log.Printf("Delete: schedule count failed for %s: %v", id, err)
+		scheduleCount = 0
+	}
+	return childCount, scheduleCount
+}
+
 // CascadeDelete performs the cascade-removal sequence used by the HTTP
 // DELETE handler and by OrgImport's reconcile mode: walk descendants, mark
 // self+descendants 'removed' first (#73 race guard), stop containers / EC2s,
@@ -418,7 +521,13 @@ func (h *WorkspaceHandler) Delete(c *gin.Context) {
 // Caller is responsible for the children-confirmation gate (the HTTP handler
 // returns 409 when children exist + ?confirm=true is missing); this helper
 // always cascades.
-func (h *WorkspaceHandler) CascadeDelete(ctx context.Context, id string) ([]string, []error, error) {
+// CascadeDelete tears down a workspace and its descendants (stop compute,
+// remove volumes, revoke tokens, disable schedules, broadcast). erase=true
+// (internal#734) means the user asked to erase saved data, so the CP compute
+// teardown prunes each workspace's durable data volume; the HTTP delete passes
+// the user's choice, the org-import reconcile passes false (a reconcile is not
+// a user-erase).
+func (h *WorkspaceHandler) CascadeDelete(ctx context.Context, id string, erase bool) ([]string, []error, error) {
 	if err := validateWorkspaceID(id); err != nil {
 		return nil, nil, err
 	}
@@ -435,13 +544,16 @@ func (h *WorkspaceHandler) CascadeDelete(ctx context.Context, id string) ([]stri
 	if err != nil {
 		return nil, nil, fmt.Errorf("descendant query: %w", err)
 	}
+	defer descRows.Close()
 	for descRows.Next() {
 		var descID string
 		if descRows.Scan(&descID) == nil {
 			descendantIDs = append(descendantIDs, descID)
 		}
 	}
-	descRows.Close()
+	if err := descRows.Err(); err != nil {
+		return nil, nil, fmt.Errorf("CascadeDelete: failed iterating descendants: %w", err)
+	}
 
 	allIDs := append([]string{id}, descendantIDs...)
 
@@ -474,7 +586,12 @@ func (h *WorkspaceHandler) CascadeDelete(ctx context.Context, id string) ([]stri
 
 	var stopErrs []error
 	stopAndRemove := func(wsID string) {
-		if err := h.StopWorkspaceAuto(cleanupCtx, wsID); err != nil {
+		// Delete-path stop uses bounded retry (matches the restart path) and
+		// records a durable structure_events row on exhaustion so a leaked /
+		// pending EC2 is queryable and handed off to the CP-orphan-sweeper —
+		// rather than the bare one-shot StopWorkspaceAuto that produced the
+		// silent-leak class (task #15 / workspace-ec2-leak).
+		if err := h.stopWorkspaceForDelete(cleanupCtx, wsID, erase); err != nil {
 			log.Printf("CascadeDelete %s stop failed: %v — leaving cleanup for orphan sweeper", wsID, err)
 			stopErrs = append(stopErrs, fmt.Errorf("stop %s: %w", wsID, err))
 			return
