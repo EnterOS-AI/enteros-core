@@ -53,7 +53,9 @@
 #   PV_RUNTIMES            space list; default "hermes openclaw claude-code"
 #   E2E_PROVISION_TIMEOUT_SECS  default 1800 (hermes/openclaw cold EC2 budget)
 #   E2E_MINIMAX_API_KEY / E2E_ANTHROPIC_API_KEY / E2E_OPENAI_API_KEY
-#                          LLM provider key injected so the runtime can boot
+#                          DEPRECATED for this script — platform-managed models
+#                          use the CP LLM proxy; direct vendor keys are blocked
+#                          by PR #2291. Kept in workflow env for other E2Es.
 #   PV_TOKEN_DIAGNOSTIC_ONLY
 #                          1 -> stop after create/token acquisition. Useful
 #                          to classify Hermes-only vs shared auth-route issues.
@@ -222,17 +224,14 @@ else
 fi
 
 # ─── 4. Provision the parent + one sibling per runtime under test ──────
-# Inject the LLM provider key so each runtime can authenticate at boot.
-# Priority: MiniMax → direct-Anthropic → OpenAI (mirrors
-# test_staging_full_saas.sh's secrets-injection chain).
+# Platform-managed models: Molecule owns billing via the CP LLM proxy, so
+# the workspace needs NO tenant key. PR #2291 blocks direct vendor key writes
+# (ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN, MINIMAX_API_KEY, etc.) for
+# platform-managed workspaces. We intentionally keep SECRETS_JSON empty so a
+# stray E2E_*_API_KEY in the runner env cannot silently convert this into a
+# BYOK run and mask the platform-managed path (mirrors
+# test_staging_full_saas.sh's E2E_LLM_PATH=platform branch).
 SECRETS_JSON='{}'
-if [ -n "${E2E_MINIMAX_API_KEY:-}" ]; then
-  SECRETS_JSON=$(python3 -c "import json,os;k=os.environ['E2E_MINIMAX_API_KEY'];print(json.dumps({'ANTHROPIC_BASE_URL':'https://api.minimax.io/anthropic','ANTHROPIC_AUTH_TOKEN':k,'MINIMAX_API_KEY':k}))")
-elif [ -n "${E2E_ANTHROPIC_API_KEY:-}" ]; then
-  SECRETS_JSON=$(python3 -c "import json,os;k=os.environ['E2E_ANTHROPIC_API_KEY'];print(json.dumps({'ANTHROPIC_API_KEY':k}))")
-elif [ -n "${E2E_OPENAI_API_KEY:-}" ]; then
-  SECRETS_JSON=$(python3 -c "import json,os;k=os.environ['E2E_OPENAI_API_KEY'];print(json.dumps({'OPENAI_API_KEY':k,'OPENAI_BASE_URL':'https://api.openai.com/v1','MODEL_PROVIDER':'openai:gpt-4o','HERMES_INFERENCE_PROVIDER':'custom','HERMES_CUSTOM_BASE_URL':'https://api.openai.com/v1','HERMES_CUSTOM_API_KEY':k,'HERMES_CUSTOM_API_MODE':'chat_completions'}))")
-fi
 
 # Workspace-create now enforces the MODEL_REQUIRED contract: there is NO
 # platform-side default model for a runtime (feedback_workspace_model_required_

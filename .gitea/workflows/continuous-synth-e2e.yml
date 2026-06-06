@@ -131,9 +131,9 @@ jobs:
       # on the per-runtime default ("sonnet" → routes to direct
       # Anthropic, defeats the cost saving). Operators can override
       # via workflow_dispatch by setting a different E2E_MODEL_SLUG
-      # input if they need to exercise a specific model. MiniMax-M2 is the
-      # stable staging MiniMax path used by the full-SaaS smoke.
-      E2E_MODEL_SLUG: ${{ github.event.inputs.model_slug || 'MiniMax-M2' }}
+      # input if they need to exercise a specific model. MiniMax-M2.7 is the
+      # stable staging MiniMax path used by the full-SaaS smoke (#1997).
+      E2E_MODEL_SLUG: ${{ github.event.inputs.model_slug || 'MiniMax-M2.7' }}
       # Bound to 10 min so a stuck provision fails the run instead of
       # holding up the next cron firing. 15-min default in the script
       # is for the on-PR full lifecycle where we have more headroom.
