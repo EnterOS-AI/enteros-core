@@ -422,28 +422,33 @@ func (h *DiscoveryHandler) CheckAccess(c *gin.Context) {
 // workspaces with tokens must present a matching Bearer, token binding
 // is strict (A's token cannot authenticate caller B).
 //
-// Fail-open on DB hiccups. Unlike secrets.Values (which returns plaintext
-// secrets and must fail closed), discovery only exposes peer URLs that
-// are already behind the existing `CanCommunicate` hierarchy check — a
-// momentary DB outage shouldn't take agent-to-agent discovery offline.
+// (harden/no-fail-open-auth) Fails CLOSED on DB error. This used to return nil
+// (allow) on a HasAnyLiveToken hiccup "because discovery only exposes peer URLs
+// already behind CanCommunicate" — but the CTO "nothing fail-open" directive is
+// absolute, and a request must never gain access because the auth datastore is
+// unreachable. A datastore error now writes 503 (availability tradeoff that
+// grants NO access) and returns a non-nil error; the caller already does
+// `if err != nil { return }` so the 503 body is what the client sees.
 func validateDiscoveryCaller(ctx context.Context, c *gin.Context, workspaceID string) error {
 	hasLive, err := wsauth.HasAnyLiveToken(ctx, db.DB, workspaceID)
 	if err != nil {
-		log.Printf("wsauth: discovery HasAnyLiveToken(%s) failed: %v — allowing request", workspaceID, err)
-		return nil
+		log.Printf("wsauth: discovery HasAnyLiveToken(%s): datastore lookup failed (returning 503): %v", workspaceID, err)
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error": "platform datastore unavailable — retry shortly",
+			"code":  "platform_unavailable",
+		})
+		return errors.New("auth datastore unavailable")
 	}
 	if !hasLive {
 		return nil // legacy / pre-upgrade
 	}
-	// Tier-1b dev-mode hatch — same escape hatch AdminAuth and
-	// WorkspaceAuth apply on a local Docker setup. Without this, the
-	// canvas Details tab can never load peers for a workspace that has
-	// registered its live token, producing the 401 the user sees.
-	// Gated by MOLECULE_ENV=development + empty ADMIN_TOKEN, so SaaS
-	// production stays strict.
-	if middleware.IsDevModeFailOpen() {
-		return nil
-	}
+	// (harden/no-fail-open-auth) The former dev-mode escape hatch that
+	// returned nil (allow) here when MOLECULE_ENV=dev + ADMIN_TOKEN unset
+	// has been REMOVED. Discovery callers must present a verified CP
+	// session or a valid bearer in every environment. Local dev now
+	// authenticates the Canvas with a provisioned ADMIN_TOKEN /
+	// NEXT_PUBLIC_ADMIN_TOKEN (see scripts/dev-start.sh), so the Details
+	// tab loads peers with a real credential rather than via fail-open.
 
 	// Try session cookie auth first (SaaS canvas path).
 	// verifiedCPSession returns (valid, presented):

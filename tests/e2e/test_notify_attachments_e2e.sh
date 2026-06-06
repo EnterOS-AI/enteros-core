@@ -28,6 +28,13 @@ PASS=0
 FAIL=0
 WSID=""
 
+# GET /workspaces (list) and POST /workspaces (create) are AdminAuth-gated
+# (router.go:165-166). The e2e-api CI job sets ADMIN_TOKEN on the platform
+# (fail-open OFF) and exports MOLECULE_ADMIN_TOKEN here, so these calls need the
+# admin bearer. Guarded if-set so a fail-open dev platform still works.
+ADMIN_AUTH=()
+e2e_admin_auth_args ADMIN_AUTH
+
 cleanup() {
   # Workspace teardown — best-effort, ignore errors so an unrelated CP
   # outage doesn't shadow a real test failure.
@@ -80,7 +87,7 @@ echo "=== Setup ==="
 # canvas. Find and delete any with this exact name so the test is safe to
 # re-run from any state. Match by name (not tag) so this also catches
 # leftovers created by older script versions.
-PRIOR=$(curl -s "$BASE/workspaces" | python3 -c '
+PRIOR=$(curl -s "$BASE/workspaces" ${ADMIN_AUTH[@]+"${ADMIN_AUTH[@]}"} | python3 -c '
 import json, sys
 try:
     print(" ".join(w["id"] for w in json.load(sys.stdin) if w.get("name") == "Notify E2E"))
@@ -96,7 +103,7 @@ done
 # feedback_workspace_model_required_no_platform_default_dynamic_credential_intake).
 # Body has no runtime → defaults to claude-code; pass the matching model
 # that the workspace-creation contract now requires.
-R=$(curl -s -X POST "$BASE/workspaces" -H "Content-Type: application/json" \
+R=$(curl -s -X POST "$BASE/workspaces" ${ADMIN_AUTH[@]+"${ADMIN_AUTH[@]}"} -H "Content-Type: application/json" \
   -d '{"name":"Notify E2E","tier":1,"runtime":"external","external":true,"model":"sonnet"}')
 WSID=$(echo "$R" | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])' 2>/dev/null || true)
 [ -n "$WSID" ] || { echo "Failed to create workspace: $R"; exit 1; }

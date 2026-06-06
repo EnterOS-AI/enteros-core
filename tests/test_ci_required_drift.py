@@ -203,6 +203,60 @@ def test_f1_job_missing_from_sentinel_needs(drift_module, tmp_path, monkeypatch)
     assert any("F1 —" in f and "test" in f for f in findings), findings
 
 
+def test_detect_drift_403_fails_closed(drift_module, tmp_path, monkeypatch):
+    """AUTH FAILURE on branch_protections (HTTP 401/403) → RAISE (fail
+    closed). The token can't read BP, so drift is UNVERIFIABLE; greening
+    the hourly cron here would let jobs↔protection drift go silently
+    undetected — exactly the regression class this sentinel exists to
+    catch. fix/core-ci-fail-closed.
+    """
+    ci = _write_ci_yaml(
+        tmp_path,
+        jobs={"build": {"runs-on": "ubuntu-latest"}},
+        sentinel_needs=["build"],
+    )
+    audit = _write_audit_yaml(tmp_path, ["ci / build (pull_request)"])
+    _patch_paths(drift_module, monkeypatch, ci, audit)
+
+    stub = _make_stub_api({
+        ("GET", "/repos/owner/repo/branch_protections/main"): (
+            drift_module.ApiError(
+                "GET /repos/owner/repo/branch_protections/main → HTTP 403: forbidden"
+            )
+        ),
+    })
+    monkeypatch.setattr(drift_module, "api", stub)
+    with pytest.raises(drift_module.ApiError):
+        drift_module.detect_drift("main")
+
+
+def test_detect_drift_404_skips_branch(drift_module, tmp_path, monkeypatch):
+    """Authenticated 404 (branch genuinely has no protection, e.g. staging
+    pre-rollout) → tolerated skip: return ([], debug) with
+    protection_contexts_skipped True. NOT a fail-open (real read of an
+    absent resource with a valid token)."""
+    ci = _write_ci_yaml(
+        tmp_path,
+        jobs={"build": {"runs-on": "ubuntu-latest"}},
+        sentinel_needs=["build"],
+    )
+    audit = _write_audit_yaml(tmp_path, ["ci / build (pull_request)"])
+    _patch_paths(drift_module, monkeypatch, ci, audit)
+
+    stub = _make_stub_api({
+        ("GET", "/repos/owner/repo/branch_protections/staging"): (
+            drift_module.ApiError(
+                "GET /repos/owner/repo/branch_protections/staging → HTTP 404: not found"
+            )
+        ),
+    })
+    monkeypatch.setattr(drift_module, "api", stub)
+    findings, debug = drift_module.detect_drift("staging")
+    assert findings == []
+    assert debug.get("protection_contexts_skipped") is True
+    assert debug.get("protection_http_status") == 404
+
+
 def test_f1b_sentinel_needs_typo(drift_module, tmp_path, monkeypatch):
     """F1b: sentinel.needs lists a job not present in ci.yml (typo).
 

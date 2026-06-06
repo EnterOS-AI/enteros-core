@@ -104,6 +104,7 @@ jobs:
     #     - "CP unhealthy → exit 1" currently looks identical to a real
     #       failure on the run page; required-gate would need it demoted to
     #       a neutral/skip so staging flakiness can't block merges.
+    # mc#1982: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
     continue-on-error: true
     timeout-minutes: 25
 

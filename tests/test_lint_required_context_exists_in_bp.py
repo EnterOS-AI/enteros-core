@@ -47,7 +47,10 @@ Test classes (per `feedback_branch_count_before_approving`):
     (the OLD context name disappears; the NEW one needs validation).
   - test_unrelated_workflow_edit_is_not_new       — edit a comment in
     an existing emitter; no new context introduced; pass.
-  - test_api_403_skips_gracefully                 — BP read 403; exit 0
+  - test_api_403_fails_closed                     — BP read 401/403 auth
+    failure → FAIL CLOSED (exit 2)
+  - test_api_transient_fails_closed               — transient → exit 2
+  - test_api_404_skips_gracefully                 — authenticated 404 → exit 0
     with stderr ::error::.
   - test_directive_must_be_in_workflow_yml        — directive in PR
     body alone is NOT sufficient; the comment must live in the
@@ -392,9 +395,10 @@ def test_unrelated_workflow_edit_is_not_new(env, monkeypatch, capsys):
 
 
 # ---------------------------------------------------------------------------
-# BP API 403 → exit 0 with ::error::.
+# BP API 401/403 = AUTH FAILURE → FAIL CLOSED (exit 2). A new emission can't
+# be verified against BP if the token can't read BP — must not green.
 # ---------------------------------------------------------------------------
-def test_api_403_skips_gracefully(env, monkeypatch, capsys):
+def test_api_403_fails_closed(env, monkeypatch, capsys):
     m = _import_lint()
     _stub_git_and_api(
         monkeypatch,
@@ -404,9 +408,42 @@ def test_api_403_skips_gracefully(env, monkeypatch, capsys):
         bp_response=("forbidden", None),
     )
     rc = m.run()
-    assert rc == 0
+    assert rc == 2
     err = capsys.readouterr().err
     assert "403" in err or "scope" in err.lower() or "token" in err.lower()
+
+
+# ---------------------------------------------------------------------------
+# BP API transient/unexpected error → FAIL CLOSED (exit 2).
+# ---------------------------------------------------------------------------
+def test_api_transient_fails_closed(env, monkeypatch, capsys):
+    m = _import_lint()
+    _stub_git_and_api(
+        monkeypatch,
+        m,
+        base_files={".gitea/workflows/ci.yml": WF_CI_BASE},
+        head_files={".gitea/workflows/ci.yml": WF_CI_NEW_JOB},
+        bp_response=("error", None),
+    )
+    rc = m.run()
+    assert rc == 2
+
+
+# ---------------------------------------------------------------------------
+# BP API authenticated 404 (branch genuinely unprotected) → tolerated
+# graceful skip (exit 0 with ::warning::), NOT a fail-open.
+# ---------------------------------------------------------------------------
+def test_api_404_skips_gracefully(env, monkeypatch, capsys):
+    m = _import_lint()
+    _stub_git_and_api(
+        monkeypatch,
+        m,
+        base_files={".gitea/workflows/ci.yml": WF_CI_BASE},
+        head_files={".gitea/workflows/ci.yml": WF_CI_NEW_JOB},
+        bp_response=("not_found", None),
+    )
+    rc = m.run()
+    assert rc == 0
 
 
 # ---------------------------------------------------------------------------
