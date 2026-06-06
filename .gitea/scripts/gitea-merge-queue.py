@@ -1098,18 +1098,18 @@ def main() -> int:
     try:
         return process_once(dry_run=args.dry_run)
     except ApiError as exc:
-        # API errors (401/403/404/500) are transient for a queue tick —
-        # log and exit 0 so the workflow is not marked failed and the next
-        # tick can retry. Returning non-zero would permanently fail the
-        # workflow run, blocking future ticks.
+        # FAIL-CLOSED: API errors are not "transient success" — they mean
+        # the queue could not evaluate merge state. Returning 0 hides
+        # persistent infra issues (auth drift, endpoint outages) from
+        # operators. Return 1 so the cron job surfaces red and paging fires.
         sys.stderr.write(f"::error::queue API error: {exc}\n")
-        return 0
+        return 1
     except urllib.error.URLError as exc:
         sys.stderr.write(f"::error::queue network error: {exc}\n")
-        return 0
+        return 1
     except TimeoutError as exc:
         sys.stderr.write(f"::error::queue timeout: {exc}\n")
-        return 0
+        return 1
 
 
 if __name__ == "__main__":
