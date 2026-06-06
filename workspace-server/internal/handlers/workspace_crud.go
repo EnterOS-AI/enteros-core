@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/approvals"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
@@ -353,6 +354,16 @@ func (h *WorkspaceHandler) Delete(c *gin.Context) {
 			"child_count":    childCount,
 			"schedule_count": scheduleCount,
 		})
+		return
+	}
+
+	// RFC platform-agent Phase 4b: gate org-token (platform-agent) deletes behind
+	// human approval. No-op for ordinary workspace/CP-session callers and when
+	// the rollout flag is off (scoping lives in gateDestructive). Placed after
+	// the synchronous X-Confirm-Name guard, before any destruction.
+	if !gateDestructive(c, h.broadcaster, id, approvals.ActionDeleteWorkspace,
+		"delete workspace "+workspaceName,
+		map[string]interface{}{"workspace_id": id, "name": workspaceName}) {
 		return
 	}
 
