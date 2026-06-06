@@ -241,49 +241,14 @@ if [ -z "$REVIEW_CANDIDATES" ]; then
 
 fi
 
-# --- Fallback/extension (internal#348): check issue comments for agent-approval ---
-# core-qa-agent and core-security-agent can approve via issue comments. Always
-# include comment candidates, even if the reviews API returned approvals for a
-# different team; team membership below is the authoritative filter.
-COMMENT_CANDIDATES=""
-AGENT_PATTERN=""
-case "$TEAM" in
-  qa)       AGENT_PATTERN="\\[core-qa-agent\\]" ;;
-  security) AGENT_PATTERN="\\[core-security-agent\\]" ;;
-esac
-HTTP_CODE=$(curl -sS -o "$COMMENTS_JSON" -w '%{http_code}' \
-  -K "$CURL_AUTH_FILE" "${API}/repos/${OWNER}/${NAME}/issues/${PR_NUMBER}/comments")
-debug "GET /issues/${PR_NUMBER}/comments → HTTP ${HTTP_CODE}"
-if [ "$HTTP_CODE" = "200" ]; then
-  # JQ expression: select non-author comments that match either the
-  # agent-prefix pattern (case-insensitive) OR a generic approval keyword.
-  JQ_APPROVALS='
-    .[] |
-    select(.user.login != $author) |
-    . as $cmt |
-    if ($agent_pattern | length) > 0 and ($cmt.body // "" | test($agent_pattern; "i")) then
-      $cmt.user.login
-    elif ($cmt.body // "" | test("\\b(APPROVED|LGTM|ACCEPTED)\\b"; "i")) then
-      $cmt.user.login
-    else
-      empty
-    end
-  '
-  COMMENT_CANDIDATES=$(jq -r \
-    --arg author "$PR_AUTHOR" \
-    --arg agent_pattern "$AGENT_PATTERN" \
-    "$JQ_APPROVALS" \
-    "$COMMENTS_JSON" 2>/dev/null | sort -u)
-  debug "comment-based approval candidates: $(echo "$COMMENT_CANDIDATES" | tr '\n' ' ')"
-
-  if [ -n "$COMMENT_CANDIDATES" ]; then
-    echo "::notice::${TEAM}-review: found $(echo "$COMMENT_CANDIDATES" | wc -w | xargs) comment-based approval candidate(s) — verifying team membership..."
-  fi
-else
-  debug "could not fetch issue comments (HTTP ${HTTP_CODE})"
-fi
-
-CANDIDATES=$(printf '%s\n%s\n' "$REVIEW_CANDIDATES" "$COMMENT_CANDIDATES" | sed '/^$/d' | sort -u)
+# --- COMMENT APPROVAL REMOVED (security hardening) ---
+# Previous versions accepted issue comments containing generic approval
+# keywords (APPROVED/LGTM/ACCEPTED) or agent prefixes ([core-qa-agent],
+# [core-security-agent]) as satisfying the gate. Both paths are bypasses:
+# a comment lacks the audit trail, dismissal, stale-review invalidation,
+# and commit_id binding that an official Gitea review provides.
+# Only APPROVED reviews from the Gitea reviews API count.
+CANDIDATES="$REVIEW_CANDIDATES"
 
 if [ -z "${CANDIDATES:-}" ]; then
   echo "::error::${TEAM}-review awaiting non-author APPROVE from ${TEAM} team (no candidates from reviews API or issue comments)"

@@ -338,22 +338,27 @@ assert_contains "T12 jq: core-devops (non-author APPROVED) in candidates" "core-
 assert_eq "T12 jq: alice (author) NOT in candidates" "" "$(echo "$T12_CANDIDATES" | grep '^alice$' || true)"
 assert_eq "T12 jq: carol (dismissed) NOT in candidates" "" "$(echo "$T12_CANDIDATES" | grep '^carol$' || true)"
 
-# T15 — comment-based approval via agent prefix pattern → exit 0
+# T15 — comment-based approval via agent prefix pattern → exit 1
+# SECURITY: agent-prefix comments are also removed. A text prefix in an
+# issue comment is spoofable (any team member can type "[core-qa-agent]")
+# and lacks the audit trail of an official Gitea review.
 echo
 echo "== T15 comment agent-prefix approval =="
 T15_OUT=$(run_review_check "T15_comments_agent_approval")
 T15_RC=$(cat "$FIX_STATE_DIR/last_rc")
-assert_eq "T15 exit code 0 (agent-comment approval + team member)" "0" "$T15_RC"
-assert_contains "T15 comment fallback notice" "comment-based approval" "$T15_OUT"
-assert_contains "T15 core-qa-agent APPROVED" "APPROVED by core-qa-agent" "$T15_OUT"
+assert_eq "T15 exit code 1 (agent-prefix comment rejected — not an official review)" "1" "$T15_RC"
+assert_contains "T15 no candidates error" "no candidates from reviews API or issue comments" "$T15_OUT"
 
-# T16 — comment-based approval via generic APPROVED keyword → exit 0
+# T16 — comment-based approval via generic APPROVED keyword → exit 1
+# SECURITY: generic keywords (APPROVED/LGTM/ACCEPTED) must NOT satisfy the
+# gate — only official Gitea reviews or agent-prefix comments count. A plain
+# comment from a team member is a bypass if it skips the review UI.
 echo
 echo "== T16 comment generic keyword approval =="
 T16_OUT=$(run_review_check "T16_comments_generic_approval")
 T16_RC=$(cat "$FIX_STATE_DIR/last_rc")
-assert_eq "T16 exit code 0 (generic-approval comment + team member)" "0" "$T16_RC"
-assert_contains "T16 comment fallback notice" "comment-based approval" "$T16_OUT"
+assert_eq "T16 exit code 1 (generic-approval comment rejected — not an official review)" "1" "$T16_RC"
+assert_contains "T16 no candidates error" "no candidates from reviews API or issue comments" "$T16_OUT"
 
 # T17 — no approval keywords in comments → exit 1
 echo
@@ -363,16 +368,16 @@ T17_RC=$(cat "$FIX_STATE_DIR/last_rc")
 assert_eq "T17 exit code 1 (no candidates from comments)" "1" "$T17_RC"
 assert_contains "T17 no candidates error" "no candidates from reviews API or issue comments" "$T17_OUT"
 
-# T18 — a wrong-team PR review candidate must not suppress a right-team
-# comment approval. This matches PR #1790, where QA had an APPROVED review
-# and security approved via the agent comment convention.
+# T18 — wrong-team review + right-team comment → exit 1
+# SECURITY: with comment approval fully removed, a wrong-team review plus
+# a right-team comment yields NO valid candidates. Only official reviews
+# from the target team count.
 echo
 echo "== T18 review candidate wrong team, comment candidate right team =="
 T18_OUT=$(run_review_check "T18_review_wrong_team_comment_right_team")
 T18_RC=$(cat "$FIX_STATE_DIR/last_rc")
-assert_eq "T18 exit code 0 (comment approval still considered)" "0" "$T18_RC"
-assert_contains "T18 comment candidate notice" "comment-based approval" "$T18_OUT"
-assert_contains "T18 comment approver accepted" "APPROVED by core-qa-agent" "$T18_OUT"
+assert_eq "T18 exit code 1 (comment approval removed — no valid candidates)" "1" "$T18_RC"
+assert_contains "T18 none are in team" "none are in team" "$T18_OUT"
 
 # T19 — ai-sop-ack member APPROVED review must NOT count toward qa-review
 # or security-review (R1 hardening refinement, msg 1388c76f).
