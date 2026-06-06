@@ -13,20 +13,26 @@ set -euo pipefail
 OWNER="${REPO%%/*}"
 NAME="${REPO##*/}"
 API="https://${GITEA_HOST}/api/v1"
-CONTEXT="${TEAM}-review / approved (pull_request)"
+# Branch-protection requires the (pull_request_target) context variant.
+# The refire path must post the EXACT BP-required name so the gate flips.
+CONTEXT="${TEAM}-review / approved (pull_request_target)"
 TARGET_URL="https://${GITEA_HOST}/${OWNER}/${NAME}/pulls/${PR_NUMBER}"
 
 authfile=$(mktemp)
+post_authfile=$(mktemp)
 prfile=$(mktemp)
 postfile=$(mktemp)
 # shellcheck disable=SC2329 # invoked by EXIT trap
 cleanup() {
-  rm -f "$authfile" "$prfile" "$postfile"
+  rm -f "$authfile" "$post_authfile" "$prfile" "$postfile"
 }
 trap cleanup EXIT
 
-chmod 600 "$authfile"
+chmod 600 "$authfile" "$post_authfile"
 printf 'header = "Authorization: token %s"\n' "$GITEA_TOKEN" > "$authfile"
+# STATUS_POST_TOKEN is narrow-scoped write:repository for explicit status POST.
+# Falls back to GITEA_TOKEN for backward compatibility (e.g. local test).
+printf 'header = "Authorization: token %s"\n' "${STATUS_POST_TOKEN:-$GITEA_TOKEN}" > "$post_authfile"
 
 code=$(curl -sS -o "$prfile" -w '%{http_code}' -K "$authfile" \
   "${API}/repos/${OWNER}/${NAME}/pulls/${PR_NUMBER}")
@@ -68,7 +74,7 @@ body=$(jq -nc \
   '{state:$state, context:$context, description:$description, target_url:$target_url}')
 
 code=$(curl -sS -o "$postfile" -w '%{http_code}' -X POST \
-  -K "$authfile" -H "Content-Type: application/json" \
+  -K "$post_authfile" -H "Content-Type: application/json" \
   -d "$body" \
   "${API}/repos/${OWNER}/${NAME}/statuses/${head_sha}")
 if [ "$code" != "200" ] && [ "$code" != "201" ]; then

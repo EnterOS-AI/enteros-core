@@ -122,7 +122,7 @@ func (h *WorkspaceHandler) prepareProvisionContext(
 	payload models.CreateWorkspacePayload,
 	resetClaudeSession bool,
 ) (*preparedProvisionContext, *provisionAbort) {
-	envVars, globalSecretKeys, decryptErr := loadWorkspaceSecrets(ctx, workspaceID)
+	envVars, globalSecretKeys, workspaceSecretKeys, decryptErr := loadWorkspaceSecrets(ctx, workspaceID)
 	if decryptErr != "" {
 		return nil, &provisionAbort{Msg: decryptErr}
 	}
@@ -230,6 +230,18 @@ func (h *WorkspaceHandler) prepareProvisionContext(
 			Extra: map[string]interface{}{"error": msg, "code": "MISSING_BYOK_CREDENTIAL", "billing_mode": llmRes.ResolvedMode, "issue": "1994"},
 		}
 	}
+	// Fail closed for a platform-managed workspace whose CP proxy env is
+	// absent: do NOT start it credential-less (adk-demo dark-wedge class,
+	// #2162). The platform_managed path requires the proxy injection to
+	// produce a usable credential.
+	if llmRes.ResolvedMode == LLMBillingModePlatformManaged && !llmRes.HasUsableLLMCred {
+		msg := formatMissingPlatformProxyError()
+		log.Printf("Provisioner: ABORT workspace=%s — platform-managed billing mode but CP proxy env absent (MISSING_PLATFORM_PROXY, molecule-core#2162)", workspaceID)
+		return nil, &provisionAbort{
+			Msg:   msg,
+			Extra: map[string]interface{}{"error": msg, "code": "MISSING_PLATFORM_PROXY", "billing_mode": llmRes.ResolvedMode, "issue": "2162"},
+		}
+	}
 	applyRuntimeModelEnv(envVars, payload.Runtime, payload.Model)
 	if payload.Role != "" {
 		envVars["MOLECULE_AGENT_ROLE"] = payload.Role
@@ -282,7 +294,7 @@ func (h *WorkspaceHandler) prepareProvisionContext(
 		return nil, abort
 	}
 
-	cfg := h.buildProvisionerConfig(ctx, workspaceID, templatePath, configFiles, payload, envVars, pluginsPath)
+	cfg := h.buildProvisionerConfig(ctx, workspaceID, templatePath, configFiles, payload, envVars, workspaceSecretKeys, pluginsPath)
 	cfg.ResetClaudeSession = resetClaudeSession
 
 	return &preparedProvisionContext{

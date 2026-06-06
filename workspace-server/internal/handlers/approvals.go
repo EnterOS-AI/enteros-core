@@ -54,23 +54,29 @@ func (h *ApprovalsHandler) Create(c *gin.Context) {
 		return
 	}
 
-	h.broadcaster.RecordAndBroadcast(ctx, string(events.EventApprovalRequested), workspaceID, map[string]interface{}{
+	if err := h.broadcaster.RecordAndBroadcast(ctx, string(events.EventApprovalRequested), workspaceID, map[string]interface{}{
 		"approval_id": approvalID,
 		"action":      body.Action,
 		"reason":      body.Reason,
 		"task_id":     body.TaskID,
-	})
+	}); err != nil {
+		log.Printf("approvals: failed to broadcast approval requested: %v", err)
+	}
 
 	// Auto-escalate to parent
 	var parentID *string
-	db.DB.QueryRowContext(ctx, `SELECT parent_id FROM workspaces WHERE id = $1`, workspaceID).Scan(&parentID)
+	if err := db.DB.QueryRowContext(ctx, `SELECT parent_id FROM workspaces WHERE id = $1`, workspaceID).Scan(&parentID); err != nil {
+		log.Printf("approvals: failed to lookup parent for escalation: %v", err)
+	}
 	if parentID != nil {
-		h.broadcaster.RecordAndBroadcast(ctx, string(events.EventApprovalEscalated), *parentID, map[string]interface{}{
+		if err := h.broadcaster.RecordAndBroadcast(ctx, string(events.EventApprovalEscalated), *parentID, map[string]interface{}{
 			"approval_id":       approvalID,
 			"from_workspace_id": workspaceID,
 			"action":            body.Action,
 			"reason":            body.Reason,
-		})
+		}); err != nil {
+			log.Printf("approvals: failed to broadcast approval escalated: %v", err)
+		}
 	}
 
 	c.JSON(http.StatusCreated, gin.H{"approval_id": approvalID, "status": "pending"})
@@ -221,11 +227,13 @@ func (h *ApprovalsHandler) Decide(c *gin.Context) {
 		eventType = "APPROVAL_DENIED"
 	}
 
-	h.broadcaster.RecordAndBroadcast(ctx, eventType, workspaceID, map[string]interface{}{
+	if err := h.broadcaster.RecordAndBroadcast(ctx, eventType, workspaceID, map[string]interface{}{
 		"approval_id": approvalID,
 		"decision":    body.Decision,
 		"decided_by":  decidedBy,
-	})
+	}); err != nil {
+		log.Printf("approvals: failed to broadcast approval decision: %v", err)
+	}
 
 	c.JSON(http.StatusOK, gin.H{"status": body.Decision, "approval_id": approvalID})
 }

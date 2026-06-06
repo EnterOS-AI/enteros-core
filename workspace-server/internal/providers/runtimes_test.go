@@ -17,19 +17,39 @@ import (
 // of its native vendors the proxy can serve — kimi for hermes/openclaw,
 // openai for codex, anthropic+kimi+minimax for claude-code.
 //
+// cp#529 adds NAME-ONLY BYOK arms (zero model ids) to claude-code/hermes/
+// openclaw: they add NOTHING to the platform menu (ModelsForRuntime) but wire
+// CONFIRMED-NON-PLATFORM providers into the runtime's NATIVE prefix-routing set
+// so a matching BYOK id resolves via DeriveProvider. ProvidersForRuntime returns
+// the full native arm set (menu + name-only), so the expected sets below include
+// them. The platform-shared/denylist providers are NEVER wired into a BYOK arm.
+//
 //	claude-code -> anthropic (oauth+api), kimi (kimi-coding), minimax, platform
+//	               + BYOK name-only: zai, deepseek, xiaomi-mimo
 //	hermes      -> kimi (kimi-coding), platform
-//	codex       -> openai (subscription + api), platform
-//	openclaw    -> kimi (kimi-coding), platform
+//	               + BYOK name-only: openrouter, huggingface, ai-gateway,
+//	                 opencode-zen, opencode-go, kilocode, custom, nvidia, arcee,
+//	                 ollama-cloud, minimax-cn, nousresearch, deepseek, zai,
+//	                 xiaomi-mimo, alibaba
+//	codex       -> openai (subscription + api), platform   (no BYOK name-only)
+//	openclaw    -> kimi (kimi-coding), platform + BYOK name-only: openrouter, custom
 var runtimeNativeProviders = map[string][]string{
-	"claude-code": {"anthropic-api", "anthropic-oauth", "kimi-coding", "minimax", "platform"},
-	"hermes":      {"kimi-coding", "platform"},
+	"claude-code": {"anthropic-api", "anthropic-oauth", "kimi-coding", "minimax", "platform", "zai", "deepseek", "xiaomi-mimo"},
+	"hermes": {"kimi-coding", "platform",
+		"openrouter", "huggingface", "ai-gateway", "opencode-zen", "opencode-go",
+		"kilocode", "custom", "nvidia", "arcee", "ollama-cloud", "minimax-cn",
+		"nousresearch", "deepseek", "zai", "xiaomi-mimo", "alibaba",
+		// cp#529 dedicated BYOK-vendor name-only arms (shared-vendor namespaced ids).
+		"byok-anthropic", "byok-gemini", "byok-openai", "byok-minimax"},
 	// codex's OpenAI BYOK is split across the OAuth subscription arm
 	// (openai-subscription) and the direct-key arm (openai-api), mirroring
 	// claude-code's anthropic oauth+api split; platform openai via the proxy
-	// Responses surface.
-	"codex":    {"openai-subscription", "openai-api", "platform"},
-	"openclaw": {"kimi-coding", "platform"},
+	// Responses surface. cp#529 adds the byok-minimax name-only arm so the
+	// template's BYOK MiniMax token-plan id (codex-minimax-m2.7) resolves.
+	"codex":    {"openai-subscription", "openai-api", "platform", "byok-minimax"},
+	"openclaw": {"kimi-coding", "platform", "openrouter", "custom",
+		// cp#529 dedicated BYOK-vendor name-only arms (openai:/minimax:/groq:).
+		"byok-openai", "byok-minimax", "groq"},
 }
 
 func sortedCopy(in []string) []string {
@@ -97,14 +117,15 @@ func TestModelsForRuntime_ExactModelIDs(t *testing.T) {
 			"anthropic:claude-haiku-4-5", "anthropic:claude-sonnet-4-5",
 			// anthropic via platform proxy (namespaced)
 			"anthropic/claude-opus-4-7", "anthropic/claude-sonnet-4-6",
-			// kimi (kimi-coding gateway, bare + legacy colon-namespaced BYOK)
+			// kimi (kimi-coding gateway, bare form only — colon-forms removed
+			// because claude-code's adapter cannot strip the moonshot: prefix;
+			// openclaw retains them natively, cp#521).
 			"kimi-for-coding", "kimi-k2.5", "kimi-k2",
-			"moonshot:kimi-k2.6", "moonshot:kimi-k2.5",
 			// kimi via platform proxy
 			"moonshot/kimi-k2.6", "moonshot/kimi-k2.5",
-			// minimax BYOK (bare + legacy colon-namespaced)
+			// minimax BYOK (bare form only — colon-forms removed because
+			// claude-code's adapter cannot strip the minimax: prefix, cp#521).
 			"MiniMax-M2", "MiniMax-M2.7", "MiniMax-M2.7-highspeed", "MiniMax-M3",
-			"minimax:MiniMax-M2", "minimax:MiniMax-M2.7", "minimax:MiniMax-M2.7-highspeed", "minimax:MiniMax-M3",
 			// minimax via platform proxy
 			"minimax/MiniMax-M2.7", "minimax/MiniMax-M2.7-highspeed", "minimax/MiniMax-M3",
 		},
@@ -253,6 +274,56 @@ func TestParseManifest_ValidBaseline(t *testing.T) {
 	}
 }
 
+// TestParseManifest_NameOnlyArm proves a NAME-ONLY runtime arm (zero model
+// ids) is PERMITTED (cp#529) and is additive: it contributes nothing to the
+// runtime's platform menu (ModelsForRuntime) yet wires the provider into the
+// runtime's NATIVE prefix-routing set so a matching BYOK id resolves via
+// DeriveProvider. This is the loader half of the cp#529 routability change.
+func TestParseManifest_NameOnlyArm(t *testing.T) {
+	const y = `
+schema_version: 1
+providers:
+  - name: openai
+    display_name: "OpenAI"
+    protocol: openai
+    auth_mode: anthropic_api
+    auth_env: [OPENAI_API_KEY]
+    model_prefix_match: "^gpt-"
+  - name: openrouter
+    display_name: "OpenRouter"
+    protocol: openai
+    auth_mode: third_party_anthropic_compat
+    auth_env: [OPENROUTER_API_KEY]
+    model_prefix_match: "^openrouter[:/]"
+runtimes:
+  codex:
+    providers:
+      - name: openai
+        models: [gpt-5.5]
+      - name: openrouter
+`
+	m, err := parseManifest([]byte(y))
+	if err != nil {
+		t.Fatalf("parseManifest(name-only arm) error = %v; want nil (name-only arms are permitted)", err)
+	}
+	// The name-only arm adds NOTHING to the platform menu.
+	models, err := m.ModelsForRuntime("codex")
+	if err != nil {
+		t.Fatalf("ModelsForRuntime(codex) error = %v", err)
+	}
+	if len(models) != 1 || models[0] != "gpt-5.5" {
+		t.Fatalf("ModelsForRuntime(codex) = %v; want [gpt-5.5] (name-only arm must not add a menu id)", models)
+	}
+	// …yet a BYOK id matching the name-only arm's prefix now ROUTES.
+	p, err := m.DeriveProvider("codex", "openrouter/anthropic/claude-3.5-sonnet", nil)
+	if err != nil {
+		t.Fatalf("DeriveProvider(codex, openrouter/…) error = %v; want it to resolve via the name-only arm", err)
+	}
+	if p.Name != "openrouter" {
+		t.Fatalf("DeriveProvider resolved to %q; want openrouter", p.Name)
+	}
+}
+
 // TestParseManifest_FailDirection is the load-bearing-guard proof: each case
 // breaks the manifest in one way and asserts the matching error fires. If a
 // future edit removes a guard, the corresponding case flips red.
@@ -286,19 +357,6 @@ runtimes:
     providers: []
 `,
 			wantErr: "empty native provider set",
-		},
-		{
-			name: "provider ref with no models",
-			yaml: `
-schema_version: 1
-providers:
-  - {name: openai, display_name: "OpenAI", protocol: openai, auth_mode: anthropic_api, auth_env: [OPENAI_API_KEY], model_prefix_match: "^gpt-"}
-runtimes:
-  codex:
-    providers:
-      - {name: openai, models: []}
-`,
-			wantErr: "no model ids",
 		},
 		{
 			name: "duplicate provider ref",

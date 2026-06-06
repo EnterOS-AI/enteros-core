@@ -205,6 +205,8 @@ chmod +x "$FIXTURE_DIR/bin/curl"
 # Helper: run the script with fixture environment
 run_review_check() {
   local scenario="$1"
+  local team="${2:-qa}"
+  local team_id="${3:-20}"
   echo "$scenario" >"$FIX_STATE_DIR/scenario"
   local out
   set +e
@@ -215,8 +217,8 @@ run_review_check() {
     REPO="molecule-ai/molecule-core" \
     PR_NUMBER="999" \
     DEFAULT_BRANCH="main" \
-    TEAM="qa" \
-    TEAM_ID="20" \
+    TEAM="$team" \
+    TEAM_ID="$team_id" \
     REVIEW_CHECK_DEBUG="0" \
     REVIEW_CHECK_STRICT="0" \
     bash "$SCRIPT" 2>&1
@@ -371,6 +373,25 @@ T18_RC=$(cat "$FIX_STATE_DIR/last_rc")
 assert_eq "T18 exit code 0 (comment approval still considered)" "0" "$T18_RC"
 assert_contains "T18 comment candidate notice" "comment-based approval" "$T18_OUT"
 assert_contains "T18 comment approver accepted" "APPROVED by core-qa-agent" "$T18_OUT"
+
+# T19 — ai-sop-ack member APPROVED review must NOT count toward qa-review
+# or security-review (R1 hardening refinement, msg 1388c76f).
+echo
+echo "== T19 ai-sop-ack APPROVED review excluded from qa-review gate =="
+T19_OUT=$(run_review_check "T19_ai_sop_ack_approved" "qa" "20")
+T19_RC=$(cat "$FIX_STATE_DIR/last_rc")
+assert_eq "T19 exit code 1 (ai-sop-ack not in qa team)" "1" "$T19_RC"
+assert_contains "T19 ai-reviewer excluded from qa" "candidates: ai-reviewer" "$T19_OUT"
+assert_contains "T19 none are in qa team" "none are in team" "$T19_OUT"
+
+# T20 — same ai-sop-ack member must also be excluded from security-review gate.
+echo
+echo "== T20 ai-sop-ack APPROVED review excluded from security-review gate =="
+T20_OUT=$(run_review_check "T19_ai_sop_ack_approved" "security" "21")
+T20_RC=$(cat "$FIX_STATE_DIR/last_rc")
+assert_eq "T20 exit code 1 (ai-sop-ack not in security team)" "1" "$T20_RC"
+assert_contains "T20 ai-reviewer excluded from security" "candidates: ai-reviewer" "$T20_OUT"
+assert_contains "T20 none are in security team" "none are in team" "$T20_OUT"
 
 echo
 echo "------"

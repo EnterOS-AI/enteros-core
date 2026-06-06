@@ -264,6 +264,11 @@ func TestPrepareProvisionContext_ParentIDInjection(t *testing.T) {
 		},
 	}
 
+	// Supply the CP proxy env so the platform-managed default does not abort
+	// with MISSING_PLATFORM_PROXY (molecule-core#2162).
+	t.Setenv("MOLECULE_LLM_BASE_URL", "https://api.example.test/api/v1/internal/llm/openai/v1")
+	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
+
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			mock := setupTestDB(t)
@@ -331,6 +336,10 @@ func TestPrepareProvisionContext_InjectsGitHTTPCredsFromPersonaToken(t *testing.
 		}
 	}
 	t.Setenv("MOLECULE_PERSONA_ROOT", root)
+	// Supply the CP proxy env so the platform-managed default does not abort
+	// with MISSING_PLATFORM_PROXY (molecule-core#2162).
+	t.Setenv("MOLECULE_LLM_BASE_URL", "https://api.example.test/api/v1/internal/llm/openai/v1")
+	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
 
 	cases := []struct {
 		name         string
@@ -459,6 +468,10 @@ func TestPrepareProvisionContext_WorkspaceSecretWinsOverPersonaToken(t *testing.
 		t.Fatal(err)
 	}
 	t.Setenv("MOLECULE_PERSONA_ROOT", root)
+	// Supply the CP proxy env so the platform-managed default does not abort
+	// with MISSING_PLATFORM_PROXY (molecule-core#2162).
+	t.Setenv("MOLECULE_LLM_BASE_URL", "https://api.example.test/api/v1/internal/llm/openai/v1")
+	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
 
 	mock := setupTestDB(t)
 	mock.ExpectQuery(`SELECT key, encrypted_value, encryption_version FROM global_secrets`).

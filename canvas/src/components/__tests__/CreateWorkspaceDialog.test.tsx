@@ -2,6 +2,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, fireEvent, waitFor, cleanup } from "@testing-library/react";
 import { CreateWorkspaceButton } from "../CreateWorkspaceDialog";
+import { isPlatformManagedProvider } from "../ProviderModelSelector";
 
 vi.mock("@/lib/api", () => ({
   api: {
@@ -63,6 +64,34 @@ const SAMPLE_TEMPLATES = [
       { id: "openai/gpt-4o", name: "GPT-4o", required_env: ["OPENAI_API_KEY"] },
       { id: "anthropic/claude-sonnet-4-5", name: "Claude Sonnet 4.5", required_env: ["ANTHROPIC_API_KEY"] },
       { id: "moonshot/kimi-k2.6", name: "Kimi K2.6", provider: "platform", required_env: [] },
+    ],
+  },
+  // #2245 fixtures. The real registry `platform` provider declares
+  // MOLECULE_LLM_USAGE_TOKEN in its auth_env — the default mock above masks the
+  // bug by using required_env:[]. This template gives the platform provider a
+  // non-empty auth env (matching production) so the credential-suppression
+  // logic is actually exercised.
+  {
+    id: "platform-managed-test",
+    name: "Platform Managed Test",
+    runtime: "claude-code",
+    model: "moonshot/kimi-k2.6",
+    providers: ["platform", "minimax"],
+    models: [
+      { id: "moonshot/kimi-k2.6", name: "Kimi K2.6", provider: "platform", required_env: ["MOLECULE_LLM_USAGE_TOKEN"] },
+      { id: "MiniMax-M2.7", name: "MiniMax M2.7", required_env: ["MINIMAX_API_KEY"] },
+    ],
+  },
+  // BYOK-only template (no platform provider) — the credential requirement
+  // MUST still hold for these (no-regression guard).
+  {
+    id: "byok-only-test",
+    name: "BYOK Only Test",
+    runtime: "claude-code",
+    model: "openai/gpt-4o",
+    providers: ["openai"],
+    models: [
+      { id: "openai/gpt-4o", name: "GPT-4o", required_env: ["OPENAI_API_KEY"] },
     ],
   },
 ];
@@ -455,6 +484,182 @@ describe("CreateWorkspaceDialog — dynamic runtime provider picker", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Registry-backed provider catalog (RFC#340 Fix C)
+//
+// Regression guard for the mis-bucketing bug: when a registry-backed
+// claude-code template serves `moonshot/kimi-k2.6` whose DERIVED provider is
+// `platform`, the dialog must build the dropdown from registry_providers/
+// registry_models (buildProviderCatalogFromRegistry) — NOT the legacy
+// inferVendor heuristic which slash-splits the id into "moonshot". The
+// distinguishing trait of this fixture: the plain `models[]` array does NOT
+// carry an explicit `provider` field, so the LEGACY path would bucket the
+// model under "moonshot" and send llm_provider:"moonshot". Only the
+// registry-backed path yields the Platform bucket + llm_provider:"platform".
+// ---------------------------------------------------------------------------
+
+// claude-code template whose plain models[] is UN-annotated (no explicit
+// provider). The derived-provider annotation lives ONLY in registry_models.
+const REGISTRY_TEMPLATE = {
+  id: "claude-code-default",
+  name: "Claude Code Agent",
+  runtime: "claude-code",
+  model: "moonshot/kimi-k2.6",
+  // Legacy fields — note: NO explicit provider on the platform model, so the
+  // legacy inferVendor path would slash-split it into "moonshot".
+  providers: ["platform", "minimax", "anthropic"],
+  models: [
+    { id: "moonshot/kimi-k2.6", name: "Kimi K2.6", required_env: [] },
+    { id: "MiniMax-M2.7", name: "MiniMax M2.7", required_env: ["MINIMAX_API_KEY"] },
+    { id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6", required_env: ["ANTHROPIC_API_KEY"] },
+  ],
+  // Registry-served SSOT (internal#718 P3). DeriveProvider resolved
+  // moonshot/kimi-k2.6 → "platform"; MiniMax-M2.7 → "minimax".
+  registry_backed: true,
+  registry_providers: [
+    { name: "platform", display_name: "Platform", auth_env: [], billing_mode: "platform_managed" },
+    { name: "minimax", display_name: "MiniMax", auth_env: ["MINIMAX_API_KEY"], billing_mode: "byok" },
+    { name: "anthropic", display_name: "Anthropic API", auth_env: ["ANTHROPIC_API_KEY"], billing_mode: "byok" },
+  ],
+  registry_models: [
+    { id: "moonshot/kimi-k2.6", name: "Kimi K2.6", provider: "platform", billing_mode: "platform_managed" },
+    { id: "MiniMax-M2.7", name: "MiniMax M2.7", provider: "minimax", billing_mode: "byok" },
+    { id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6", provider: "anthropic", billing_mode: "byok" },
+  ],
+};
+
+// Registry-backed platform provider WITH a non-empty auth_env — this matches
+// the PRODUCTION provider view, which ships the raw AuthEnv
+// ([MOLECULE_LLM_USAGE_TOKEN]). REGISTRY_TEMPLATE above uses auth_env:[] so it
+// never exercises suppression; this one drives the billingMode==="platform_
+// managed" branch end-to-end through buildProviderCatalogFromRegistry. (#2245)
+const REGISTRY_TEMPLATE_PLATFORM_AUTHENV = {
+  ...REGISTRY_TEMPLATE,
+  registry_providers: [
+    {
+      name: "platform",
+      display_name: "Platform",
+      auth_env: ["MOLECULE_LLM_USAGE_TOKEN"],
+      billing_mode: "platform_managed",
+    },
+    { name: "minimax", display_name: "MiniMax", auth_env: ["MINIMAX_API_KEY"], billing_mode: "byok" },
+    { name: "anthropic", display_name: "Anthropic API", auth_env: ["ANTHROPIC_API_KEY"], billing_mode: "byok" },
+  ],
+};
+
+describe("CreateWorkspaceDialog — registry-backed provider catalog (RFC#340 Fix C)", () => {
+  beforeEach(() => {
+    mockGet.mockImplementation(async (url: string) => {
+      if (url === "/templates") {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        return [REGISTRY_TEMPLATE] as any;
+      }
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      return SAMPLE_WORKSPACES as any;
+    });
+  });
+
+  it("shows the Platform provider bucket for the registry-backed claude-code runtime", async () => {
+    await openDialog();
+    const providerSelect = await waitFor(() => {
+      const sel = document.querySelector("[data-testid='provider-select']") as HTMLSelectElement;
+      expect(sel).toBeTruthy();
+      return sel;
+    });
+    const labels = Array.from(providerSelect.options).map((o) => o.text.trim());
+    // Registry display_name "Platform" appears — NOT "moonshot" from the
+    // legacy slash-split heuristic.
+    expect(labels).toContain("Platform");
+    expect(labels).not.toContain("moonshot");
+    // Bucket id is the registry-keyed id, vendor is the bare provider name.
+    const values = Array.from(providerSelect.options).map((o) => o.value);
+    expect(values).toContain("registry|platform");
+  });
+
+  it("sends llm_provider: platform (not moonshot) for moonshot/kimi-k2.6", async () => {
+    await openDialog();
+    fireEvent.change(screen.getByPlaceholderText("e.g. SEO Agent"), {
+      target: { value: "Kimi Agent" },
+    });
+    // Wait for the registry default to settle on the Platform bucket + model.
+    await waitFor(() => {
+      const modelSelect = document.querySelector("[data-testid='model-select']") as HTMLSelectElement;
+      expect(modelSelect?.value).toBe("moonshot/kimi-k2.6");
+    });
+
+    const createBtn = screen.getAllByRole("button").find((b) => b.textContent === "Create");
+    fireEvent.click(createBtn!);
+
+    await waitFor(() => expect(mockPost).toHaveBeenCalled());
+    const body = mockPost.mock.calls[0][1] as Record<string, unknown>;
+    expect(body.model).toBe("moonshot/kimi-k2.6");
+    expect(body.llm_provider).toBe("platform");
+    // Platform is auth-env-free → no BYOK secret.
+    expect(body.secrets).toBeUndefined();
+  });
+
+  it("buckets MiniMax-M2.7 under its derived provider and sends llm_provider: minimax", async () => {
+    await openDialog();
+    fireEvent.change(screen.getByPlaceholderText("e.g. SEO Agent"), {
+      target: { value: "MiniMax Agent" },
+    });
+    await waitFor(() => {
+      const sel = document.querySelector("[data-testid='provider-select']") as HTMLSelectElement;
+      expect(Array.from(sel.options).map((o) => o.value)).toContain("registry|minimax");
+    });
+    fireEvent.change(document.querySelector("[data-testid='provider-select']") as HTMLSelectElement, {
+      target: { value: "registry|minimax" },
+    });
+    fireEvent.change(document.getElementById("llm-secret-input") as HTMLInputElement, {
+      target: { value: "sk-minimax-test" },
+    });
+
+    const createBtn = screen.getAllByRole("button").find((b) => b.textContent === "Create");
+    fireEvent.click(createBtn!);
+
+    await waitFor(() => expect(mockPost).toHaveBeenCalled());
+    const body = mockPost.mock.calls[0][1] as Record<string, unknown>;
+    expect(body.model).toBe("MiniMax-M2.7");
+    expect(body.llm_provider).toBe("minimax");
+    expect(body.secrets).toEqual({ MINIMAX_API_KEY: "sk-minimax-test" });
+  });
+
+  it("suppresses the credential for a registry-backed platform provider that declares an auth_env — billingMode path (#2245)", async () => {
+    // Override the default REGISTRY_TEMPLATE (auth_env:[]) with the production-
+    // shaped one whose platform provider declares MOLECULE_LLM_USAGE_TOKEN.
+    mockGet.mockImplementation(async (url: string) => {
+      if (url === "/templates") {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        return [REGISTRY_TEMPLATE_PLATFORM_AUTHENV] as any;
+      }
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      return SAMPLE_WORKSPACES as any;
+    });
+    await openDialog();
+    fireEvent.change(screen.getByPlaceholderText("e.g. SEO Agent"), {
+      target: { value: "Registry Platform Agent" },
+    });
+    // Platform is the default bucket; even with a non-empty auth_env the key
+    // field must NOT render (suppressed via billingMode==="platform_managed").
+    await waitFor(() => {
+      const sel = document.querySelector("[data-testid='provider-select']") as HTMLSelectElement;
+      expect(sel?.value).toBe("registry|platform");
+    });
+    expect(screen.getByText("Platform-managed — no API key required.")).toBeTruthy();
+    expect(document.getElementById("llm-secret-input")).toBeNull();
+
+    const createBtn = screen.getAllByRole("button").find((b) => b.textContent === "Create");
+    fireEvent.click(createBtn!);
+
+    await waitFor(() => expect(mockPost).toHaveBeenCalled());
+    expect(screen.queryByText("Provider credential is required")).toBeNull();
+    const body = mockPost.mock.calls[0][1] as Record<string, unknown>;
+    expect(body.llm_provider).toBe("platform");
+    // The provisioner-injected MOLECULE_LLM_USAGE_TOKEN must NOT be clobbered.
+    expect(body.secrets).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // budget_limit field tests (#541)
 // ---------------------------------------------------------------------------
 
@@ -533,5 +738,72 @@ describe("CreateWorkspaceDialog — budget_limit field", () => {
     await openDialog();
     const budgetInput = screen.getByPlaceholderText("e.g. 100") as HTMLInputElement;
     expect(budgetInput.value).toBe("");
+  });
+});
+
+describe("CreateWorkspaceDialog — platform-managed credential suppression (#2245)", () => {
+  describe("isPlatformManagedProvider", () => {
+    it("is true for the platform proxy vendor", () => {
+      expect(isPlatformManagedProvider({ vendor: "platform" })).toBe(true);
+    });
+    it("is true for a registry billingMode of platform_managed", () => {
+      expect(
+        isPlatformManagedProvider({ vendor: "minimax", billingMode: "platform_managed" }),
+      ).toBe(true);
+    });
+    it("is false for a BYOK provider", () => {
+      expect(isPlatformManagedProvider({ vendor: "anthropic", billingMode: "byok" })).toBe(false);
+      expect(isPlatformManagedProvider({ vendor: "minimax" })).toBe(false);
+    });
+    it("is false for null/undefined", () => {
+      expect(isPlatformManagedProvider(null)).toBe(false);
+      expect(isPlatformManagedProvider(undefined)).toBe(false);
+    });
+  });
+
+  it("platform-managed provider with a declared auth env requires NO credential, hides the key field, and sends NO secret", async () => {
+    await openDialog();
+    await setTemplate("platform-managed-test");
+    fireEvent.change(screen.getByPlaceholderText("e.g. SEO Agent"), {
+      target: { value: "Platform Agent" },
+    });
+
+    // The credential input must NOT render for platform-managed; a "no key
+    // required" note appears instead.
+    await waitFor(() =>
+      expect(screen.getByText("Platform-managed — no API key required.")).toBeTruthy(),
+    );
+    expect(screen.queryByLabelText("MOLECULE_LLM_USAGE_TOKEN")).toBeNull();
+
+    const createBtn = screen.getAllByRole("button").find((b) => b.textContent === "Create");
+    fireEvent.click(createBtn!);
+
+    await waitFor(() => expect(mockPost).toHaveBeenCalled());
+    // No validation error, and the provisioner-injected token is NOT clobbered
+    // by an empty secret.
+    expect(screen.queryByText("Provider credential is required")).toBeNull();
+    const body = mockPost.mock.calls[0][1] as Record<string, unknown>;
+    expect(body.llm_provider).toBe("platform");
+    expect(body.secrets).toBeUndefined();
+  });
+
+  it("BYOK provider still requires a credential and renders the key field (no-regression)", async () => {
+    await openDialog();
+    await setTemplate("byok-only-test");
+    fireEvent.change(screen.getByPlaceholderText("e.g. SEO Agent"), {
+      target: { value: "BYOK Agent" },
+    });
+
+    // The credential field IS rendered for BYOK...
+    await waitFor(() => expect(screen.getByLabelText("OPENAI_API_KEY")).toBeTruthy());
+
+    const createBtn = screen.getAllByRole("button").find((b) => b.textContent === "Create");
+    fireEvent.click(createBtn!);
+
+    // ...and create stays blocked until it's filled.
+    await waitFor(() =>
+      expect(screen.getByText("Provider credential is required")).toBeTruthy(),
+    );
+    expect(mockPost).not.toHaveBeenCalled();
   });
 });

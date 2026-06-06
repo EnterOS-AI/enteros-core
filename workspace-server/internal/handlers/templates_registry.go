@@ -44,6 +44,20 @@ func billingModeForRegistryProvider(p providers.Provider) string {
 	return LLMBillingModeBYOK
 }
 
+// requiredEnvForRegistryProvider derives the env vars the USER must supply for
+// a model owned by the resolved provider — the proper-SSOT single fact behind
+// the canvas "Missing API Keys" preflight (task #65). The closed platform
+// provider injects credentials server-side (the metered proxy) -> nothing
+// required; BYOK providers require their auth_env. Derived from IsPlatform +
+// AuthEnv so a template can no longer hand-author a required_env that drifts
+// from the registry's serving classification.
+func requiredEnvForRegistryProvider(p providers.Provider) []string {
+	if p.IsPlatform() {
+		return nil
+	}
+	return p.AuthEnv
+}
+
 // enrichFromRegistry populates the registry-served fields on a templateSummary
 // when its runtime is known to the provider registry. It is a no-op (leaves
 // RegistryBacked=false and the registry slices nil) for a runtime the registry
@@ -98,6 +112,7 @@ func enrichFromRegistry(summary *templateSummary, runtime string) {
 		if derived, derr := m.DeriveProvider(runtime, id, nil); derr == nil {
 			ms.Provider = derived.Name
 			ms.BillingMode = billingModeForRegistryProvider(derived)
+			ms.RequiredEnv = requiredEnvForRegistryProvider(derived)
 		}
 		// If DeriveProvider errors (ambiguous/overlap — a manifest defect the
 		// loader's tests pin against), still serve the id without a provider

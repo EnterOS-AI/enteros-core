@@ -179,10 +179,10 @@ jobs:
       - name: Refire qa-review status
         if: steps.classify.outputs.run_qa == 'true'
         env:
-          # RFC_324_TEAM_READ_TOKEN is read-only (team membership read scope only).
-          # review-refire-status.sh POSTs to /statuses — requires write scope.
-          # SOP_TIER_CHECK_TOKEN carries write:repository + write:issue + read:organization.
+          # Evaluator (review-check.sh + GET /pulls) stays on read-scoped token.
           GITEA_TOKEN: ${{ secrets.SOP_TIER_CHECK_TOKEN || secrets.GITHUB_TOKEN }}
+          # Explicit POST /statuses uses narrow-scoped write:repository token.
+          STATUS_POST_TOKEN: ${{ secrets.STATUS_POST_TOKEN }}
           GITEA_HOST: git.moleculesai.app
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.issue.number }}
@@ -198,10 +198,10 @@ jobs:
       - name: Refire security-review status
         if: steps.classify.outputs.run_security == 'true'
         env:
-          # RFC_324_TEAM_READ_TOKEN is read-only (team membership read scope only).
-          # review-refire-status.sh POSTs to /statuses — requires write scope.
-          # SOP_TIER_CHECK_TOKEN carries write:repository + write:issue + read:organization.
+          # Evaluator (review-check.sh + GET /pulls) stays on read-scoped token.
           GITEA_TOKEN: ${{ secrets.SOP_TIER_CHECK_TOKEN || secrets.GITHUB_TOKEN }}
+          # Explicit POST /statuses uses narrow-scoped write:repository token.
+          STATUS_POST_TOKEN: ${{ secrets.STATUS_POST_TOKEN }}
           GITEA_HOST: git.moleculesai.app
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.issue.number }}

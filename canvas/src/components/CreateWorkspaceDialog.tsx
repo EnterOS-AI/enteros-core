@@ -8,9 +8,13 @@ import { ExternalConnectModal, type ExternalConnectionInfo } from "./ExternalCon
 import {
   ProviderModelSelector,
   buildProviderCatalog,
+  buildProviderCatalogFromRegistry,
   findProviderForModel,
+  isPlatformManagedProvider,
   type SelectorModel,
   type SelectorValue,
+  type RegistryProvider,
+  type RegistryModel,
 } from "./ProviderModelSelector";
 
 interface WorkspaceOption {
@@ -32,6 +36,16 @@ interface TemplateSpec {
   model?: string;
   models?: SelectorModel[];
   providers?: string[];
+  // internal#718 P3 registry-served fields (additive; absent on older
+  // backends and for non-registry runtimes). When registry_backed is true the
+  // provider→model catalog is built from registry_providers/registry_models so
+  // each model's DERIVED provider (e.g. moonshot/kimi-k2.6 → "platform") drives
+  // the dropdown bucket and the create payload's llm_provider — instead of the
+  // legacy inferVendor heuristic that slash-splits the id into "moonshot".
+  // Mirrors ConfigTab's RuntimeOption loader (RFC#340 Fix C).
+  registry_backed?: boolean;
+  registry_providers?: RegistryProvider[];
+  registry_models?: RegistryModel[];
 }
 
 const DEFAULT_RUNTIME = "claude-code";
@@ -168,15 +182,53 @@ export function CreateWorkspaceButton() {
     }),
     [runtime, templateSpecs],
   );
-  const llmModels = useMemo(
-    () => {
-      const sourceSpec = selectedTemplateSpec ?? selectedRuntimeTemplateSpec;
-      if (!sourceSpec?.models?.length) return [];
-      return sourceSpec.models;
-    },
+  // The /templates row backing the LLM picker: an explicitly-selected
+  // workspace template wins, else the base runtime template row.
+  const llmSourceSpec = useMemo<TemplateSpec | null>(
+    () => selectedTemplateSpec ?? selectedRuntimeTemplateSpec,
     [selectedRuntimeTemplateSpec, selectedTemplateSpec],
   );
-  const llmCatalog = useMemo(() => buildProviderCatalog(llmModels), [llmModels]);
+  // internal#718 P3 / RFC#340 Fix C: a runtime is registry-backed when the
+  // /templates row says so AND it served a non-empty registry_models set.
+  // Mirrors ConfigTab's `registryBacked` derivation exactly.
+  const registryBacked = useMemo(
+    () =>
+      llmSourceSpec?.registry_backed === true &&
+      (llmSourceSpec.registry_models?.length ?? 0) > 0,
+    [llmSourceSpec],
+  );
+  // Models fed to the selector dropdown. For a registry-backed runtime use the
+  // registry-served native set, carrying each model's DERIVED provider so the
+  // selector buckets it correctly (moonshot/kimi-k2.6 → "platform", not the
+  // inferVendor "moonshot"). Otherwise fall back to the template-served
+  // models[] + the legacy heuristic — same fallback ConfigTab keeps.
+  const llmModels = useMemo<SelectorModel[]>(
+    () => {
+      if (registryBacked) {
+        return (llmSourceSpec?.registry_models ?? []).map((m) => ({
+          id: m.id,
+          name: m.name,
+          ...(m.provider ? { provider: m.provider } : {}),
+        }));
+      }
+      return llmSourceSpec?.models?.length ? llmSourceSpec.models : [];
+    },
+    [registryBacked, llmSourceSpec],
+  );
+  // Registry-backed path: build the catalog from registry_providers/
+  // registry_models so dropdown labels + billing + the derived provider come
+  // from the provider-registry SSOT (restores the "Platform" bucket). Legacy
+  // path: re-infer from models[] via buildProviderCatalog (inferVendor).
+  const llmCatalog = useMemo(
+    () =>
+      registryBacked
+        ? buildProviderCatalogFromRegistry(
+            llmSourceSpec?.registry_providers ?? [],
+            llmSourceSpec?.registry_models ?? [],
+          )
+        : buildProviderCatalog(llmModels),
+    [registryBacked, llmSourceSpec, llmModels],
+  );
   const selectedLLMProvider = useMemo(
     () => llmCatalog.find((p) => p.id === llmSelection.providerId) ?? llmCatalog[0],
     [llmCatalog, llmSelection.providerId],
@@ -184,7 +236,7 @@ export function CreateWorkspaceButton() {
 
   useEffect(() => {
     if (llmCatalog.length === 0) return;
-    const sourceDefault = (selectedTemplateSpec ?? selectedRuntimeTemplateSpec)?.model?.trim();
+    const sourceDefault = llmSourceSpec?.model?.trim();
     const platformProvider = llmCatalog.find((p) => p.vendor === "platform");
     const matched = sourceDefault ? findProviderForModel(llmCatalog, sourceDefault) : null;
     const next = platformProvider ?? matched ?? llmCatalog[0];
@@ -197,7 +249,7 @@ export function CreateWorkspaceButton() {
       envVars: next.envVars,
     });
     setLLMSecret("");
-  }, [llmCatalog, selectedRuntimeTemplateSpec, selectedTemplateSpec]);
+  }, [llmCatalog, llmSourceSpec]);
 
   // Reset form and load workspaces whenever dialog opens
   useEffect(() => {
@@ -239,7 +291,15 @@ export function CreateWorkspaceButton() {
       setError("Model is required");
       return;
     }
-    if (!isExternal && selectedLLMProvider?.envVars.length && !llmSecret.trim()) {
+    // Platform-managed providers need NO user credential — the platform injects
+    // its own usage token (MOLECULE_LLM_USAGE_TOKEN = tenant admin_token) at
+    // provision time. Only BYOK providers require a user-supplied key. (#2245)
+    if (
+      !isExternal &&
+      !isPlatformManagedProvider(selectedLLMProvider) &&
+      selectedLLMProvider?.envVars.length &&
+      !llmSecret.trim()
+    ) {
       setError("Provider credential is required");
       return;
     }
@@ -274,7 +334,11 @@ export function CreateWorkspaceButton() {
           ? {
               model: llmSelection.model.trim(),
               llm_provider: nativeProvider.vendor,
-              ...(nativeProvider.envVars.length > 0
+              // Only BYOK providers carry a user secret. For platform-managed
+              // the token is provisioner-injected; sending an (empty) secret
+              // here would clobber it — so omit it entirely. (#2245)
+              ...(nativeProvider.envVars.length > 0 &&
+              !isPlatformManagedProvider(nativeProvider)
                 ? { secrets: { [nativeProvider.envVars[0]]: llmSecret.trim() } }
                 : {}),
             }
@@ -461,6 +525,7 @@ export function CreateWorkspaceButton() {
                 </div>
                 <ProviderModelSelector
                   models={llmModels}
+                  catalog={registryBacked ? llmCatalog : undefined}
                   value={llmSelection}
                   onChange={(next) => {
                     setLLMSelection(next);
@@ -469,20 +534,26 @@ export function CreateWorkspaceButton() {
                   idPrefix="create-workspace-llm"
                   variant="stack"
                 />
-                {selectedLLMProvider.envVars.length > 0 && (
-                  <div>
-                    <label htmlFor="llm-secret-input" className="text-[11px] text-ink-mid block mb-1">
-                      {selectedLLMProvider.envVars[0]}
-                    </label>
-                    <input
-                      id="llm-secret-input"
-                      type="password"
-                      value={llmSecret}
-                      onChange={(e) => setLLMSecret(e.target.value)}
-                      autoComplete="off"
-                      className="w-full bg-surface-card/60 border border-line/50 rounded-lg px-3 py-2 text-sm text-ink placeholder-ink-soft focus:outline-none focus:border-accent/60 focus:ring-1 focus:ring-accent/20 transition-colors font-mono"
-                    />
+                {isPlatformManagedProvider(selectedLLMProvider) ? (
+                  <div className="text-[11px] text-ink-soft">
+                    Platform-managed — no API key required.
                   </div>
+                ) : (
+                  selectedLLMProvider.envVars.length > 0 && (
+                    <div>
+                      <label htmlFor="llm-secret-input" className="text-[11px] text-ink-mid block mb-1">
+                        {selectedLLMProvider.envVars[0]}
+                      </label>
+                      <input
+                        id="llm-secret-input"
+                        type="password"
+                        value={llmSecret}
+                        onChange={(e) => setLLMSecret(e.target.value)}
+                        autoComplete="off"
+                        className="w-full bg-surface-card/60 border border-line/50 rounded-lg px-3 py-2 text-sm text-ink placeholder-ink-soft focus:outline-none focus:border-accent/60 focus:ring-1 focus:ring-accent/20 transition-colors font-mono"
+                      />
+                    </div>
+                  )
                 )}
               </div>
             )}

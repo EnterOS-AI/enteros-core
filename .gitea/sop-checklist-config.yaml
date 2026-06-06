@@ -32,6 +32,26 @@
 # AUTHOR SELF-ACK IS FORBIDDEN regardless of which team contains them
 # — the gate script enforces commenter != PR author before checking
 # team membership.
+#
+# AI-SOP-ACK TEAM (internal#760 ceremony design, CTO-approved):
+#   The `ai-sop-ack` team contains AI agent identities that can ack
+#   SOP-checklist items ON BEHALF OF automated evidence.  An AI ack is
+#   only valid when:
+#     1. the item has `ai_ack_eligible: true`
+#     2. the item is NOT in the human-only carve-out (migration/schema)
+#     3. for testing-class items, CI / all-required (pull_request) is
+#        green on the current head SHA
+#
+#   AI acks NEVER count toward qa-review or security-review gates —
+#   those remain human-team-only (enforced by review-check.sh team
+#   probe against TEAM_ID 20/21).
+#
+#   INITIAL ai_ack_eligible allowlist (CTO-controlled, msg 1388c76f):
+#     comprehensive-testing, local-postgres-e2e, staging-smoke,
+#     five-axis-review, memory-consulted
+#   HUMAN-ONLY carve-out:
+#     root-cause, no-backwards-compat
+#   Any widening requires an explicit config change reviewed by CTO.
 
 version: 1
 
@@ -83,25 +103,31 @@ items:
     numeric_alias: 1
     pr_section_marker: "Comprehensive testing performed"
     required_teams: [qa, engineers]
+    ai_ack_eligible: true
     description: >-
       What was tested, how, edge cases covered. Ack from any qa-team
-      member (or engineers fallback while qa is small).
+      member (or engineers fallback while qa is small). AI ack valid
+      only when CI / all-required (pull_request) is green.
 
   - slug: local-postgres-e2e
     numeric_alias: 2
     pr_section_marker: "Local-postgres E2E run"
     required_teams: [engineers]
+    ai_ack_eligible: true
     description: >-
       Link to local CI artifact, or "N/A: pure-frontend change". Ack
       from any engineer who can verify the local DB test actually ran.
+      AI ack valid only when CI / all-required (pull_request) is green.
 
   - slug: staging-smoke
     numeric_alias: 3
     pr_section_marker: "Staging-smoke verified or pending"
     required_teams: [engineers]
+    ai_ack_eligible: true
     description: >-
       Link to canary run, or "scheduled post-merge". Ack from any
       engineer (core-devops/infra-sre are members of engineers team).
+      AI ack valid only when CI / all-required (pull_request) is green.
 
   - slug: root-cause
     numeric_alias: 4
@@ -120,6 +146,7 @@ items:
     numeric_alias: 5
     pr_section_marker: "Five-Axis review walked"
     required_teams: [engineers]
+    ai_ack_eligible: true
     description: >-
       Correctness / readability / architecture / security / performance.
       Ack from any non-author engineer.
@@ -140,6 +167,7 @@ items:
     numeric_alias: 7
     pr_section_marker: "Memory/saved-feedback consulted"
     required_teams: [engineers]
+    ai_ack_eligible: true
     description: >-
       List of feedback memories applicable to this change. Ack from
       any engineer who has the same memory access.
@@ -177,5 +205,5 @@ n/a_gates:
     required_teams: [security, managers, ceo]
     description: >-
       Security review N/A when this change has no security surface
-      (docs-only, pure-frontend, dependency-only). A security/owners
+      (docs-only, pure-frontend, dependency-only). A security/managers/ceo
       member must post /sop-n/a security-review to activate.

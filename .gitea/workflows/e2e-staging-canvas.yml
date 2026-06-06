@@ -12,9 +12,30 @@ name: E2E Staging Canvas (Playwright)
 #
 
 # Playwright test suite that provisions a fresh staging org per run and
-# verifies every workspace-panel tab renders without crashing. Complements
-# e2e-staging-saas.yml (which tests the API shape) by exercising the
-# actual browser + canvas bundle against live staging.
+# verifies every workspace-panel tab renders REAL content (not just an
+# empty/errored container). Complements e2e-staging-saas.yml (which tests
+# the API shape) by exercising the actual browser + canvas bundle against
+# live staging.
+#
+# PROMOTION-READINESS (toward making this a HARD merge-gate):
+#   NOW RELIABLE (spec hardened — staging-tabs.spec.ts):
+#     - All waits condition-based (toBeVisible/toHaveAttribute/expect.poll);
+#       no fixed waitForTimeout in the spec.
+#     - Tabs asserted on settled REAL content, not "container visible".
+#     - ErrorBoundary + visible error alerts fail non-degraded tabs.
+#     - Tab-list parity-checked vs live DOM; fail-closed on missing tenant.
+#   STILL BLOCKS PROMOTION-TO-REQUIRED (do NOT remove continue-on-error —
+#   CTO-owned, RFC internal#219 §1):
+#     - Infra dependency: real staging EC2 per run (12-20 min cold boot);
+#       AWS/Cloudflare/CP availability would become merge-blockers.
+#     - Shared-zone TLS/DNS/ACME propagation flake surface is upstream of
+#       this repo and outside its control.
+#     - Required-gate correctness needs CP_STAGING_ADMIN_API_TOKEN GUARANTEED
+#       present; today's skip-if-absent (core#2225) is right for non-gating
+#       but would skip-green a required check.
+#     - Single hermes/platform_managed workspace; agent-dependent content
+#       (live chat/traces round-trip) not exercised on staging (#2162).
+#   The full checklist lives at the foot of canvas/e2e/staging-tabs.spec.ts.
 #
 # Triggers: push to main, PR touching canvas sources + this workflow only
 # after the PR enters `merge-queue`, manual dispatch, and scheduled cron to
@@ -167,16 +188,30 @@ jobs:
       - if: needs.detect-changes.outputs.canvas == 'true'
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - name: Verify admin token present
+      # Skip-if-absent (core#2225), mirroring the serving-e2e gate's
+      # skip-if-secret-unset contract: a MISSING CI secret is an operator
+      # CONFIG gap, not a code regression, so it must not paint this E2E
+      # red. When CP_STAGING_ADMIN_API_TOKEN is unset we emit a LOUD
+      # ::warning:: + ::notice:: and skip the real provision/test steps (the
+      # job still completes green). When the secret IS present we run the
+      # full suite exactly as before. Operators: set
+      # CP_STAGING_ADMIN_API_TOKEN as a repo/org Actions secret on
+      # molecule-core to actually exercise this E2E.
+      - name: Check admin token (skip-if-absent)
+        id: token_check
         if: needs.detect-changes.outputs.canvas == 'true'
         run: |
           if [ -z "$MOLECULE_ADMIN_TOKEN" ]; then
-            echo "::error::Missing CP_STAGING_ADMIN_API_TOKEN"
-            exit 2
+            echo "::warning::CP_STAGING_ADMIN_API_TOKEN is not set on this runner — SKIPPING the staging canvas E2E (cannot auth to staging CP). This is an operator config gap, not a code failure; set the secret on molecule-core (repo or org Actions secrets) to run it. See core#2225."
+            echo "::notice::E2E Staging Canvas skipped: CP_STAGING_ADMIN_API_TOKEN absent."
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "CP_STAGING_ADMIN_API_TOKEN present ✓ — running staging canvas E2E."
+            echo "present=true" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Set up Node
-        if: needs.detect-changes.outputs.canvas == 'true'
+        if: needs.detect-changes.outputs.canvas == 'true' && steps.token_check.outputs.present == 'true'
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
           node-version: '20'
@@ -184,11 +219,11 @@ jobs:
           cache-dependency-path: canvas/package-lock.json
 
       - name: Install canvas deps
-        if: needs.detect-changes.outputs.canvas == 'true'
+        if: needs.detect-changes.outputs.canvas == 'true' && steps.token_check.outputs.present == 'true'
         run: npm ci
 
       - name: Install Playwright browsers
-        if: needs.detect-changes.outputs.canvas == 'true'
+        if: needs.detect-changes.outputs.canvas == 'true' && steps.token_check.outputs.present == 'true'
         timeout-minutes: 10
         run: |
           PREBAKED_PLAYWRIGHT=/ms-playwright
@@ -200,7 +235,7 @@ jobs:
           npx playwright install --with-deps chromium
 
       - name: Run staging canvas E2E
-        if: needs.detect-changes.outputs.canvas == 'true'
+        if: needs.detect-changes.outputs.canvas == 'true' && steps.token_check.outputs.present == 'true'
         run: npx playwright test --config=playwright.staging.config.ts
 
       - name: Upload Playwright report on failure

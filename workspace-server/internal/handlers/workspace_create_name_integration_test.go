@@ -41,7 +41,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"os"
 	"testing"
 
 	"github.com/google/uuid"
@@ -59,10 +58,7 @@ import (
 // only those.
 func integrationDB_WorkspaceCreateName(t *testing.T) *sql.DB {
 	t.Helper()
-	url := os.Getenv("INTEGRATION_DB_URL")
-	if url == "" {
-		t.Skip("INTEGRATION_DB_URL not set; skipping (see file header)")
-	}
+	url := requireIntegrationDBURL(t)
 	conn, err := sql.Open("postgres", url)
 	if err != nil {
 		t.Fatalf("open: %v", err)

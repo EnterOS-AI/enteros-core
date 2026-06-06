@@ -176,6 +176,10 @@ func TestResolveAgentURLForRestartSignal_CacheMiss(t *testing.T) {
 // TestGracefulPreRestart_Success verifies that when the workspace returns 200,
 // the signal is logged as acknowledged without error.
 func TestGracefulPreRestart_Success(t *testing.T) {
+	hWrapper := &resolveURLTestWrapper{
+		WorkspaceHandler: newHandlerWithTestDeps(t),
+		testURL:          "http://fake-agent.example/agent",
+	}
 	_ = setupTestDB(t)
 
 	// httptest server simulating the workspace container's /signals/restart_pending
@@ -205,18 +209,15 @@ func TestGracefulPreRestart_Success(t *testing.T) {
 		})
 	}))
 	defer srv.Close()
+	hWrapper.testURL = srv.URL + "/agent"
 
 	// Pre-populate Redis cache with the test server URL
 	_ = setupTestRedisWithURL(t, srv.URL)
 
-	// Use a wrapper so gracefulPreRestart runs through the embedded handler.
-	hWrapper := &resolveURLTestWrapper{
-		WorkspaceHandler: newHandlerWithTestDeps(t),
-		testURL:          srv.URL + "/agent",
-	}
+	// gracefulPreRestart runs in a goroutine; wait for it before db.DB is restored.
+	// Must be registered AFTER setupTestDB (LIFO: async wait → db.DB restore).
+	waitForHandlerAsyncBeforeDBCleanup(t, hWrapper.WorkspaceHandler)
 
-	// gracefulPreRestart runs in a goroutine with its own timeout.
-	// We give it time to complete before the test ends.
 	hWrapper.gracefulPreRestart(context.Background(), "ws-ack-789")
 	time.Sleep(200 * time.Millisecond)
 }
@@ -224,19 +225,22 @@ func TestGracefulPreRestart_Success(t *testing.T) {
 // TestGracefulPreRestart_NotImplemented verifies that when the workspace returns
 // 404 (old SDK version), the platform proceeds gracefully (log + no error).
 func TestGracefulPreRestart_NotImplemented(t *testing.T) {
+	hWrapper := &resolveURLTestWrapper{
+		WorkspaceHandler: newHandlerWithTestDeps(t),
+		testURL:          "http://fake-agent.example/agent",
+	}
 	_ = setupTestDB(t)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 	}))
 	defer srv.Close()
+	hWrapper.testURL = srv.URL + "/agent"
 
 	_ = setupTestRedisWithURL(t, srv.URL)
 
-	hWrapper := &resolveURLTestWrapper{
-		WorkspaceHandler: newHandlerWithTestDeps(t),
-		testURL:          srv.URL + "/agent",
-	}
+	// Must be registered AFTER setupTestDB so LIFO order is: async wait → db.DB restore.
+	waitForHandlerAsyncBeforeDBCleanup(t, hWrapper.WorkspaceHandler)
 
 	hWrapper.gracefulPreRestart(context.Background(), "ws-noimpl-999")
 	time.Sleep(200 * time.Millisecond)
@@ -246,15 +250,18 @@ func TestGracefulPreRestart_NotImplemented(t *testing.T) {
 // TestGracefulPreRestart_ConnectionRefused verifies that when the workspace
 // is unreachable, the platform proceeds gracefully without error.
 func TestGracefulPreRestart_ConnectionRefused(t *testing.T) {
-	_ = setupTestDB(t)
-
-	mr := setupTestRedisWithURL(t, "http://localhost:19999/agent") // nothing listening on 19999
-	_ = mr
-
 	hWrapper := &resolveURLTestWrapper{
 		WorkspaceHandler: newHandlerWithTestDeps(t),
 		testURL:          "http://localhost:19999/agent",
 	}
+	_ = setupTestDB(t)
+
+	// Nothing listening on 19999 — deliberate connection failure.
+	mr := setupTestRedisWithURL(t, "http://localhost:19999/agent")
+	_ = mr
+
+	// Must be registered AFTER setupTestDB so LIFO order is: async wait → db.DB restore.
+	waitForHandlerAsyncBeforeDBCleanup(t, hWrapper.WorkspaceHandler)
 
 	hWrapper.gracefulPreRestart(context.Background(), "ws-unreachable-000")
 	time.Sleep(200 * time.Millisecond)
@@ -264,13 +271,17 @@ func TestGracefulPreRestart_ConnectionRefused(t *testing.T) {
 // TestGracefulPreRestart_URLResolutionError verifies that when URL resolution
 // fails, the platform proceeds gracefully without blocking the restart.
 func TestGracefulPreRestart_URLResolutionError(t *testing.T) {
-	_ = setupTestDB(t)
-	_ = setupTestRedis(t) // empty → URL resolution will fail in resolveAgentURLForRestartSignal
-
 	hWrapper := &resolveURLTestWrapper{
 		WorkspaceHandler: newHandlerWithTestDeps(t),
 		errToReturn:      context.DeadlineExceeded,
 	}
+	_ = setupTestDB(t)
+	_ = setupTestRedis(t) // empty → URL resolution will fail in resolveAgentURLForRestartSignal
+
+	// Must be registered AFTER setupTestDB so LIFO order is: async wait → db.DB restore.
+	// This ensures goroutines (which access both DB and Redis) are drained before
+	// any cleanup fires. setupTestRedis comes after newHandlerWithTestDeps
+	// so the handler holds the correct Redis client reference.
 	waitForHandlerAsyncBeforeDBCleanup(t, hWrapper.WorkspaceHandler)
 
 	hWrapper.gracefulPreRestart(context.Background(), "ws-url-err-111")

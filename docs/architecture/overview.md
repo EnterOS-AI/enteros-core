@@ -114,7 +114,7 @@ Opt-in pattern: when `idle_prompt` is non-empty in `config.yaml`, the workspace 
 
 Three Gin middleware classes gate server-side routes. Full contract in `docs/runbooks/admin-auth.md`.
 
-- **`middleware.AdminAuth(db.DB)`** — strict bearer-only. Used for any route where a forged request could leak prompts/memory, create/mutate workspaces, or leak ops intel. Lazy-bootstrap fail-open when `HasAnyLiveTokenGlobal` returns 0.
+- **`middleware.AdminAuth(db.DB)`** — strict bearer-only and **fail-closed in every environment** (harden/no-fail-open-auth). Used for any route where a forged request could leak prompts/memory, create/mutate workspaces, or leak ops intel. The former lazy-bootstrap fail-open (pass when `HasAnyLiveTokenGlobal` returns 0) and the dev-mode escape hatch have both been removed — a fresh install must provision `ADMIN_TOKEN` to reach admin routes.
 - **`middleware.CanvasOrBearer(db.DB)`** — accepts a bearer token OR an Origin matching `CORS_ORIGINS`. Used **only** for cosmetic routes where a forged request has zero data/security impact. Currently only on `PUT /canvas/viewport`. Do not extend this to any route that leaks data or creates resources — see the runbook.
 - **`middleware.WorkspaceAuth(db.DB)`** — binds a bearer token to `:id`. Workspace A's token cannot hit workspace B's sub-routes. Used for the entire `/workspaces/:id/*` group except the A2A proxy (which has its own `CanCommunicate` layer).
 

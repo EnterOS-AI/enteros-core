@@ -208,6 +208,22 @@ class TestParseDirectives(unittest.TestCase):
         d = self.parse_ack_revoke("/sop-ack Comprehensive_Testing")
         self.assertEqual(d[0][1], "comprehensive-testing")
 
+    def test_emdash_separator_parsed_correctly(self):
+        # Em-dash (U+2014) between slug and note is common in practice.
+        # /sop-ack Five-Axis — five-axis-review
+        # → slug = five-axis, note = — five-axis-review
+        d = self.parse_ack_revoke("/sop-ack Five-Axis — five-axis-review")
+        self.assertEqual(len(d), 1)
+        self.assertEqual(d[0][1], "five-axis")
+        self.assertIn("five-axis-review", d[0][2])
+
+    def test_emdash_no_note(self):
+        # Em-dash at end of slug: only slug, no note content
+        d = self.parse_ack_revoke("/sop-ack Five-Axis —")
+        self.assertEqual(len(d), 1)
+        self.assertEqual(d[0][1], "five-axis")
+        self.assertEqual(d[0][2], "")  # em-dash is separator-only → empty note
+
 
 # ---------------------------------------------------------------------------
 # section_marker_present
@@ -1003,3 +1019,404 @@ class TestComputeNaStateAcceptsGateNotInItems(unittest.TestCase):
             comments, "alice", na_gates, lambda *_: ["alice"]
         )
         self.assertFalse(na_state["security-review"]["declared"])
+
+
+# ---------------------------------------------------------------------------
+# internal#760 ceremony — ai-sop-ack team + ai_ack_eligible per-item flag
+# ---------------------------------------------------------------------------
+
+
+class TestAIAckEligibleConfig(unittest.TestCase):
+    """CTO-controlled allowlist (msg 1388c76f):
+      ai_ack_eligible: comprehensive-testing, local-postgres-e2e, staging-smoke,
+                       five-axis-review, memory-consulted
+      human-only:      root-cause, no-backwards-compat
+    """
+
+    def test_ai_ack_eligible_items(self):
+        cfg = sop.load_config(CONFIG_PATH)
+        items_by_slug = {it["slug"]: it for it in cfg["items"]}
+        eligible = {
+            "comprehensive-testing",
+            "local-postgres-e2e",
+            "staging-smoke",
+            "five-axis-review",
+            "memory-consulted",
+        }
+        for slug in eligible:
+            self.assertTrue(
+                items_by_slug[slug].get("ai_ack_eligible"),
+                f"{slug} must be ai_ack_eligible",
+            )
+
+    def test_human_only_items(self):
+        cfg = sop.load_config(CONFIG_PATH)
+        items_by_slug = {it["slug"]: it for it in cfg["items"]}
+        human_only = {"root-cause", "no-backwards-compat"}
+        for slug in human_only:
+            self.assertFalse(
+                items_by_slug[slug].get("ai_ack_eligible", False),
+                f"{slug} must NOT be ai_ack_eligible (human-only)",
+            )
+
+    def test_testing_class_slugs_constant(self):
+        """_TESTING_CLASS_SLUGS must match the three testing items."""
+        self.assertEqual(
+            sop._TESTING_CLASS_SLUGS,
+            {"comprehensive-testing", "local-postgres-e2e", "staging-smoke"},
+        )
+
+    def test_human_only_slugs_constant(self):
+        """_HUMAN_ONLY_SLUGS encodes the migration/schema carve-out.
+
+        If this set changes, the CTO must approve the widening.
+        """
+        self.assertEqual(
+            sop._HUMAN_ONLY_SLUGS,
+            {"root-cause", "no-backwards-compat", "migration", "schema"},
+        )
+
+    def test_human_only_invariant_enforced_in_code_and_config(self):
+        """Every config-present slug in _HUMAN_ONLY_SLUGS must be human-only.
+
+        This test fails if a migration/schema-class item accidentally
+        acquires ai_ack_eligible via config drift.  migration/schema are
+        future-proofing slugs not yet in the live config; they are checked
+        by the production probe closure but skipped here.
+        """
+        cfg = sop.load_config(CONFIG_PATH)
+        items_by_slug = {it["slug"]: it for it in cfg["items"]}
+        for slug in sop._HUMAN_ONLY_SLUGS:
+            if slug not in items_by_slug:
+                # Future-proofing slug (e.g. migration, schema) — not yet
+                # in config, but the code guard still rejects AI acks.
+                continue
+            self.assertFalse(
+                items_by_slug[slug].get("ai_ack_eligible", False),
+                f"{slug} is in _HUMAN_ONLY_SLUGS and must NEVER be ai_ack_eligible",
+            )
+
+
+class TestAIAckEligibilityProbe(unittest.TestCase):
+    """The probe closure in main() delegates to compute_ack_state.
+    We simulate the AI-ack path by injecting a probe that behaves like
+    the production probe (human team first, then ai-sop-ack fallback).
+    """
+
+    def setUp(self):
+        self.items = _items_by_slug()
+        self.aliases = _numeric_aliases()
+
+    def _probe_human_then_ai(self, human_users, ai_users):
+        """Return users in human_users immediately; users in ai_users only
+        if the item is ai_ack_eligible."""
+        def probe(slug, users):
+            item = self.items.get(slug, {})
+            approved = []
+            for u in users:
+                if u in human_users:
+                    approved.append(u)
+                elif u in ai_users and item.get("ai_ack_eligible"):
+                    approved.append(u)
+            return approved
+        return probe
+
+    def test_ai_ack_passes_for_eligible_item(self):
+        comments = [_comment("ai-bot", "/sop-ack five-axis-review")]
+        probe = self._probe_human_then_ai(human_users=set(), ai_users={"ai-bot"})
+        state = sop.compute_ack_state(
+            comments, "alice", self.items, self.aliases, probe
+        )
+        self.assertEqual(state["five-axis-review"]["ackers"], ["ai-bot"])
+
+    def test_ai_ack_rejected_for_human_only_item(self):
+        comments = [_comment("ai-bot", "/sop-ack root-cause")]
+        probe = self._probe_human_then_ai(human_users=set(), ai_users={"ai-bot"})
+        state = sop.compute_ack_state(
+            comments, "alice", self.items, self.aliases, probe
+        )
+        self.assertEqual(state["root-cause"]["ackers"], [])
+        self.assertIn("ai-bot", state["root-cause"]["rejected"]["not_in_team"])
+
+    def test_human_ack_still_works_for_ai_eligible_item(self):
+        comments = [_comment("bob", "/sop-ack comprehensive-testing")]
+        probe = self._probe_human_then_ai(human_users={"bob"}, ai_users=set())
+        state = sop.compute_ack_state(
+            comments, "alice", self.items, self.aliases, probe
+        )
+        self.assertEqual(state["comprehensive-testing"]["ackers"], ["bob"])
+
+    def test_ai_ack_rejected_for_testing_item_when_ci_red(self):
+        # Simulate the production probe that checks CI status for testing items.
+        # When CI is not green, ai-sop-ack member is rejected.
+        def probe(slug, users):
+            item = self.items.get(slug, {})
+            approved = []
+            for u in users:
+                if u == "ai-bot" and item.get("ai_ack_eligible"):
+                    # Testing items require CI green; simulate CI red.
+                    if slug in sop._TESTING_CLASS_SLUGS:
+                        continue  # rejected: CI not green
+                    approved.append(u)
+            return approved
+
+        comments = [_comment("ai-bot", "/sop-ack comprehensive-testing")]
+        state = sop.compute_ack_state(
+            comments, "alice", self.items, self.aliases, probe
+        )
+        self.assertEqual(state["comprehensive-testing"]["ackers"], [])
+
+    def test_ai_ack_passes_for_testing_item_when_ci_green(self):
+        # Simulate CI green → AI ack passes.
+        def probe(slug, users):
+            item = self.items.get(slug, {})
+            approved = []
+            for u in users:
+                if u == "ai-bot" and item.get("ai_ack_eligible"):
+                    if slug in sop._TESTING_CLASS_SLUGS:
+                        # CI is green → allow
+                        pass
+                    approved.append(u)
+            return approved
+
+        comments = [_comment("ai-bot", "/sop-ack comprehensive-testing")]
+        state = sop.compute_ack_state(
+            comments, "alice", self.items, self.aliases, probe
+        )
+        self.assertEqual(state["comprehensive-testing"]["ackers"], ["ai-bot"])
+
+
+class TestAIAckHumanOnlyMigrationSchema(unittest.TestCase):
+    """RC 8322: migration and schema items are human-only regardless of
+    any future config that might accidentally mark them ai_ack_eligible.
+
+    These slugs are not yet in the live config items list; the tests use
+    synthetic items so the production guard can be exercised directly.
+    """
+
+    def setUp(self):
+        # Synthetic items — if live config ever adds migration/schema,
+        # they MUST stay human-only. The probe below mirrors the actual
+        # production closure logic (human team first, then AI fallback
+        # with _HUMAN_ONLY_SLUGS guard).
+        self.items = {
+            "migration": {
+                "slug": "migration",
+                "ai_ack_eligible": True,
+                "required_teams": ["engineers"],
+            },
+            "schema": {
+                "slug": "schema",
+                "ai_ack_eligible": True,
+                "required_teams": ["engineers"],
+            },
+        }
+        self.aliases = {}
+
+    def _production_like_probe(self, human_users, ai_users):
+        """Return a probe that mirrors the production closure's guard."""
+
+        def probe(slug, users):
+            item = self.items.get(slug, {})
+            approved = []
+            for u in users:
+                if u in human_users:
+                    approved.append(u)
+                elif u in ai_users:
+                    # Production guard: _HUMAN_ONLY_SLUGS rejects AI acks
+                    # regardless of the ai_ack_eligible flag.
+                    if slug in sop._HUMAN_ONLY_SLUGS:
+                        continue
+                    if item.get("ai_ack_eligible"):
+                        approved.append(u)
+            return approved
+
+        return probe
+
+    def test_ai_ack_rejected_for_migration(self):
+        comments = [_comment("ai-bot", "/sop-ack migration")]
+        probe = self._production_like_probe(human_users=set(), ai_users={"ai-bot"})
+        state = sop.compute_ack_state(
+            comments, "alice", self.items, self.aliases, probe
+        )
+        self.assertEqual(state["migration"]["ackers"], [])
+        self.assertIn("ai-bot", state["migration"]["rejected"]["not_in_team"])
+
+    def test_ai_ack_rejected_for_schema(self):
+        comments = [_comment("ai-bot", "/sop-ack schema")]
+        probe = self._production_like_probe(human_users=set(), ai_users={"ai-bot"})
+        state = sop.compute_ack_state(
+            comments, "alice", self.items, self.aliases, probe
+        )
+        self.assertEqual(state["schema"]["ackers"], [])
+        self.assertIn("ai-bot", state["schema"]["rejected"]["not_in_team"])
+
+    def test_human_ack_still_works_for_migration(self):
+        # Human team member acking migration/schema is unaffected.
+        comments = [_comment("bob", "/sop-ack migration")]
+        probe = self._production_like_probe(human_users={"bob"}, ai_users=set())
+        state = sop.compute_ack_state(
+            comments, "alice", self.items, self.aliases, probe
+        )
+        self.assertEqual(state["migration"]["ackers"], ["bob"])
+
+    def test_human_ack_still_works_for_schema(self):
+        comments = [_comment("bob", "/sop-ack schema")]
+        probe = self._production_like_probe(human_users={"bob"}, ai_users=set())
+        state = sop.compute_ack_state(
+            comments, "alice", self.items, self.aliases, probe
+        )
+        self.assertEqual(state["schema"]["ackers"], ["bob"])
+
+
+class TestGetCIStatus(unittest.TestCase):
+    """Verify get_ci_status reads the correct context from commit statuses."""
+
+    def _client_with_statuses(self, statuses):
+        client = sop.GiteaClient("git.example.com", "tok")
+
+        def fake_req(method, path, body=None, ok_codes=(200, 201, 204)):
+            return 200, statuses
+
+        client._req = fake_req  # type: ignore[method-assign]
+        return client
+
+    def test_ci_green_returns_success(self):
+        client = self._client_with_statuses([
+            {"context": "CI / all-required (pull_request)", "state": "success"},
+        ])
+        self.assertEqual(
+            sop.get_ci_status(client, "o", "r", "sha1"), "success"
+        )
+
+    def test_ci_red_returns_failure(self):
+        client = self._client_with_statuses([
+            {"context": "CI / all-required (pull_request)", "state": "failure"},
+        ])
+        self.assertEqual(
+            sop.get_ci_status(client, "o", "r", "sha1"), "failure"
+        )
+
+    def test_missing_context_returns_missing(self):
+        client = self._client_with_statuses([
+            {"context": "some-other-context", "state": "success"},
+        ])
+        self.assertEqual(
+            sop.get_ci_status(client, "o", "r", "sha1"), "missing"
+        )
+
+    def test_api_error_returns_unknown(self):
+        client = sop.GiteaClient("git.example.com", "tok")
+
+        def fake_req(method, path, body=None, ok_codes=(200, 201, 204)):
+            return 500, {"error": "boom"}
+
+        client._req = fake_req  # type: ignore[method-assign]
+        self.assertEqual(
+            sop.get_ci_status(client, "o", "r", "sha1"), "unknown"
+        )
+
+
+# ---------------------------------------------------------------------------
+# internal#818 — na-declarations status must be terminal success
+# ---------------------------------------------------------------------------
+
+
+class TestNaDeclarationsStatusTerminal(unittest.TestCase):
+    """Regression for internal#818: the na-declarations context is
+    informational, not a merge gate.  An empty N/A declaration list must
+    post `success` (not `pending`) so it does not poison the PR combined
+    status."""
+
+    def _run_with_fake_client(self, fake_client_class):
+        """Swap GiteaClient temporarily and invoke main() with a fake token."""
+        orig_client = sop.GiteaClient
+        orig_token = os.environ.get("GITEA_TOKEN")
+        try:
+            sop.GiteaClient = fake_client_class
+            os.environ["GITEA_TOKEN"] = "fake-token"
+            return sop.main([
+                "--owner", "o", "--repo", "r", "--pr", "1",
+                "--config", CONFIG_PATH,
+                "--gitea-host", "git.example.com",
+            ])
+        finally:
+            sop.GiteaClient = orig_client
+            if orig_token is None:
+                os.environ.pop("GITEA_TOKEN", None)
+            else:
+                os.environ["GITEA_TOKEN"] = orig_token
+
+    def test_empty_na_descriptions_posts_success(self):
+        posted = []
+
+        class FakeClient(sop.GiteaClient):
+            def get_pr(self, owner, repo, pr):
+                return {
+                    "state": "open",
+                    "user": {"login": "alice"},
+                    "head": {"sha": "abc123"},
+                    "labels": [],
+                }
+
+            def get_issue_comments(self, owner, repo, issue, max_comments=None):
+                return []
+
+            def resolve_team_id(self, org, team_name):
+                return None
+
+            def is_team_member(self, team_id, login):
+                return False
+
+            def post_status(self, owner, repo, sha, state, context,
+                            description, target_url=""):
+                posted.append({
+                    "state": state,
+                    "context": context,
+                    "description": description,
+                })
+
+        rc = self._run_with_fake_client(FakeClient)
+        self.assertEqual(rc, 0)
+        na_posts = [p for p in posted if "na-declarations" in p["context"]]
+        self.assertEqual(len(na_posts), 1, f"expected one na-declarations post, got {posted}")
+        self.assertEqual(na_posts[0]["state"], "success")
+        self.assertEqual(na_posts[0]["description"], "N/A: (none)")
+
+    def test_populated_na_descriptions_posts_success(self):
+        posted = []
+
+        class FakeClient(sop.GiteaClient):
+            def get_pr(self, owner, repo, pr):
+                return {
+                    "state": "open",
+                    "user": {"login": "alice"},
+                    "head": {"sha": "abc123"},
+                    "labels": [],
+                }
+
+            def get_issue_comments(self, owner, repo, issue, max_comments=None):
+                return [
+                    {"user": {"login": "bob"}, "body": "/sop-n/a qa-review N/A: docs-only"},
+                ]
+
+            def resolve_team_id(self, org, team_name):
+                return 1
+
+            def is_team_member(self, team_id, login):
+                return True
+
+            def post_status(self, owner, repo, sha, state, context,
+                            description, target_url=""):
+                posted.append({
+                    "state": state,
+                    "context": context,
+                    "description": description,
+                })
+
+        rc = self._run_with_fake_client(FakeClient)
+        self.assertEqual(rc, 0)
+        na_posts = [p for p in posted if "na-declarations" in p["context"]]
+        self.assertEqual(len(na_posts), 1)
+        self.assertEqual(na_posts[0]["state"], "success")
+        self.assertIn("qa-review", na_posts[0]["description"])

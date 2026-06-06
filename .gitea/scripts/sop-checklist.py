@@ -174,6 +174,16 @@ def parse_directives(
         if not parts:
             continue
         first = parts[0]
+        # Em-dash (U+2014) is a common visual separator in user-written
+        # notes, e.g.  /sop-ack Five-Axis — five-axis-review
+        # If raw_slug contains an em-dash, split on the first one so
+        # the part before becomes the slug and the rest becomes the note.
+        note_from_slug = ""
+        slug_source = raw_slug
+        emdash_idx = raw_slug.find("—")
+        if emdash_idx != -1:
+            slug_source = raw_slug[:emdash_idx].strip()
+            note_from_slug = raw_slug[emdash_idx + 1 :].strip()
         # If the slug-capture greedily matched multiple words (e.g.
         # "comprehensive testing"), preserve normalize behavior: join
         # the WHOLE first-word-token only; trailing words get appended to
@@ -186,13 +196,19 @@ def parse_directives(
             # as slug and "testing extra-note" as note. We defer the
             # disambiguation to the caller via the returned canonical
             # slug. For simplicity: try the WHOLE captured string first.
-            canonical = normalize_slug(raw_slug, numeric_aliases)
+            canonical = normalize_slug(slug_source, numeric_aliases)
         else:
-            canonical = normalize_slug(first, numeric_aliases)
+            canonical = normalize_slug(slug_source, numeric_aliases)
         note_from_group = (m.group(3) or "").strip()
-        # If we collapsed multi-word slug into kebab and there's a
-        # trailing-text group too, append it.
-        entry = (kind, canonical, note_from_group)
+        # The em-dash (U+2014) is a visual separator; the regex puts it
+        # in group(3) because it is outside the slug character class.
+        # Strip it so "/sop-ack slug — note" yields just "note".
+        if note_from_group.startswith("—"):
+            note_from_group = note_from_group[1:].strip()
+        # Combine note_from_slug (em-dash split) with note_from_group
+        # (trailing text after the slug captured by the regex group).
+        combined_note = (note_from_slug + " " + note_from_group).strip()
+        entry = (kind, canonical, combined_note)
         if kind == "sop-n/a":
             na_directives.append(entry)
         else:
@@ -895,6 +911,47 @@ def resolve_required_teams(item: dict[str, Any], high_risk: bool) -> list[str]:
     return list(item.get("required_teams") or [])
 
 
+# ---------------------------------------------------------------------------
+# CI status validation for testing-class AI acks (internal#760 CTO hardening)
+# ---------------------------------------------------------------------------
+
+# Slugs that require CI / all-required green before an AI ack is valid.
+_TESTING_CLASS_SLUGS = {"comprehensive-testing", "local-postgres-e2e", "staging-smoke"}
+
+# Human-only carve-out: these items can NEVER be acked by AI, regardless
+# of config drift. Any item in this set MUST NOT have ai_ack_eligible.
+# migration / schema are future-proofing — not yet in config items, but
+# the code guard rejects them proactively (CTO hardening, msg 1388c76f).
+_HUMAN_ONLY_SLUGS = {"root-cause", "no-backwards-compat", "migration", "schema"}
+
+
+def get_ci_status(client: GiteaClient, owner: str, repo: str, sha: str) -> str:
+    """Return the state of CI / all-required (pull_request) for `sha`.
+
+    Looks through the commit statuses and returns the state string
+    ("success", "failure", "pending", "error") or "missing" if the
+    context is not found. This prevents an AI agent from attesting
+    "tests pass" independently of the actual CI run.
+    """
+    code, data = client._req(  # noqa: SLF001
+        "GET", f"/repos/{owner}/{repo}/statuses/{sha}"
+    )
+    if code != 200:
+        return "unknown"
+    if not data or not isinstance(data, list):
+        return "missing"
+    # Gitea returns statuses newest-first. Find the latest for our context.
+    for status in data:
+        if status.get("context") == "CI / all-required (pull_request)":
+            return status.get("state", "unknown")
+    return "missing"
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--owner", required=True)
@@ -988,6 +1045,9 @@ def main(argv: list[str] | None = None) -> int:
     # one membership lookup per team.
     team_member_cache: dict[tuple[str, int], bool | None] = {}
 
+    # Pre-resolve the ai-sop-ack team id once (None if the team does not exist).
+    ai_sop_ack_team_id = client.resolve_team_id(args.owner, "ai-sop-ack")
+
     def probe(slug: str, users: list[str]) -> list[str]:
         # `slug` may be either an items-key (compute_ack_state caller) OR
         # an n/a-gate key (compute_na_state caller). Previously this hard
@@ -1042,14 +1102,18 @@ def main(argv: list[str] | None = None) -> int:
                     file=sys.stderr,
                 )
         approved: list[str] = []
+        rejected_ai_ineligible: list[str] = []
+        rejected_ci_not_green: list[str] = []
         for u in users:
+            # 1) Human required_teams membership check
+            in_human_team = False
             for tid in team_ids:
                 cache_key = (u, tid)
                 if cache_key not in team_member_cache:
                     team_member_cache[cache_key] = client.is_team_member(tid, u)
                 result = team_member_cache[cache_key]
                 if result is True:
-                    approved.append(u)
+                    in_human_team = True
                     break
                 if result is None:
                     print(
@@ -1059,6 +1123,44 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     # Treat as not-in-team for this user/team pair; loop
                     # may still find membership in another team.
+            if in_human_team:
+                approved.append(u)
+                continue
+
+            # 2) AI-sop-ack team membership check (only for items that allow it).
+            if slug in items_by_slug:
+                item = items_by_slug[slug]
+                # Defensive: human-only carve-out is enforced in code, not just
+                # config. Even if ai_ack_eligible were mistakenly added to a
+                # migration/schema item, the AI path is rejected here.
+                if slug in _HUMAN_ONLY_SLUGS:
+                    rejected_ai_ineligible.append(u)
+                    continue
+                if item.get("ai_ack_eligible") and ai_sop_ack_team_id is not None:
+                    cache_key = (u, ai_sop_ack_team_id)
+                    if cache_key not in team_member_cache:
+                        team_member_cache[cache_key] = client.is_team_member(
+                            ai_sop_ack_team_id, u
+                        )
+                    result = team_member_cache[cache_key]
+                    if result is True:
+                        # 2a) Testing-class items require real CI artifact evidence.
+                        if slug in _TESTING_CLASS_SLUGS:
+                            ci_state = get_ci_status(
+                                client, args.owner, args.repo, head_sha
+                            )
+                            if ci_state != "success":
+                                print(
+                                    f"::warning::AI ack for {slug} rejected: "
+                                    f"CI / all-required is {ci_state}, not success",
+                                    file=sys.stderr,
+                                )
+                                rejected_ci_not_green.append(u)
+                                continue
+                        approved.append(u)
+                        continue
+            # If we get here, user is not approved for this slug.
+            rejected_ai_ineligible.append(u)
         return approved
 
     ack_state = compute_ack_state(
@@ -1142,10 +1244,13 @@ def main(argv: list[str] | None = None) -> int:
                 )
 
         na_desc = ", ".join(sorted(na_descs)) if na_descs else "(none)"
-        na_status_state = "success" if na_descs else "pending"
+        # internal#818: na-declarations is an informational context, not a merge
+        # gate. An empty declaration list is a terminal success state — pending
+        # here poisons the PR combined status.
+        na_status_state = "success"
         # review-check.sh reads the description to discover which gates are N/A.
         # Include the gate names so it can grep for them.
-        na_description = f"N/A: {na_desc}" if na_descs else "N/A: (none)"
+        na_description = f"N/A: {na_desc}"
 
         if not args.dry_run:
             client.post_status(

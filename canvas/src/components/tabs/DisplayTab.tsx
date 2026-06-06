@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "@/lib/api";
 import type RFB from "@novnc/novnc";
 
@@ -33,6 +33,11 @@ export function DisplayTab({ workspaceId }: Props) {
   const [controlBusy, setControlBusy] = useState(false);
   const [sessionUrl, setSessionUrl] = useState<string | null>(null);
   const requestGeneration = useRef(0);
+  // Freshest signed session URL (token bound to the lease's expires_at). The
+  // renewal timer keeps this current WITHOUT swapping the live stream's
+  // sessionUrl (which would needlessly reconnect the desktop); the stream uses
+  // it only when it has to reconnect after an unclean drop.
+  const latestSessionUrlRef = useRef<string | null>(null);
 
   useEffect(() => {
     const generation = requestGeneration.current + 1;
@@ -41,6 +46,7 @@ export function DisplayTab({ workspaceId }: Props) {
     setStatus(null);
     setControl(null);
     setSessionUrl(null);
+    latestSessionUrlRef.current = null;
     setError(null);
     setControlError(null);
     setControlBusy(false);
@@ -69,6 +75,41 @@ export function DisplayTab({ workspaceId }: Props) {
     };
   }, [workspaceId]);
 
+  // Acquire (or re-acquire) the display-control lease as the current holder.
+  // Re-acquiring extends the 300s server-side lock AND returns a freshly-signed
+  // session URL (token bound to the new expires_at). Used both to renew the
+  // lease on a timer and to mint a non-stale token for each reconnect — a
+  // cached URL can be past its ~300s expiry, which would make a reconnect 401.
+  const reacquireSession = useCallback(async (): Promise<string | null> => {
+    const generation = requestGeneration.current;
+    try {
+      const next = await api.post<DisplayControlStatus>(
+        `/workspaces/${workspaceId}/display/control/acquire`,
+        { controller: "user", ttl_seconds: 300 },
+      );
+      if (requestGeneration.current !== generation) return null;
+      setControl(next);
+      if (next.session_url) latestSessionUrlRef.current = next.session_url;
+      return next.session_url ?? null;
+    } catch {
+      // Transient failure, or another holder took over: the live stream keeps
+      // running on its existing connection; a reconnect re-evaluates control.
+      return null;
+    }
+  }, [workspaceId]);
+
+  // Renew the lease while we hold it. The lock is a 300s lease with no
+  // server-side auto-renewal, so without this the control (and the session
+  // token) silently expire mid-session — the user appears "kicked" every ~5
+  // minutes. We renew well inside the TTL and do not touch the live stream.
+  useEffect(() => {
+    if (!sessionUrl) return;
+    const timer = setInterval(() => {
+      void reacquireSession();
+    }, 120_000);
+    return () => clearInterval(timer);
+  }, [sessionUrl, reacquireSession]);
+
   const acquireControl = async () => {
     const generation = requestGeneration.current;
     const controlPath = `/workspaces/${workspaceId}/display/control`;
@@ -82,6 +123,7 @@ export function DisplayTab({ workspaceId }: Props) {
       if (requestGeneration.current !== generation) return;
       setControl(next);
       setSessionUrl(next.session_url || null);
+      latestSessionUrlRef.current = next.session_url || null;
     } catch (err) {
       if (requestGeneration.current !== generation) return;
       setControlError("Failed to take control");
@@ -108,6 +150,7 @@ export function DisplayTab({ workspaceId }: Props) {
       if (requestGeneration.current !== generation) return;
       setControl(next);
       setSessionUrl(null);
+      latestSessionUrlRef.current = null;
     } catch (err) {
       if (requestGeneration.current !== generation) return;
       setControlError("Failed to release control");
@@ -235,7 +278,11 @@ export function DisplayTab({ workspaceId }: Props) {
         />
       </div>
       {sessionUrl ? (
-        <DesktopStream sessionUrl={sessionUrl} />
+        <DesktopStream
+          sessionUrl={sessionUrl}
+          latestSessionUrlRef={latestSessionUrlRef}
+          reacquireSession={reacquireSession}
+        />
       ) : (
         <div className="flex flex-1 items-center justify-center p-8 text-center">
           <div>
@@ -311,7 +358,15 @@ function DisplayControlBar({
   );
 }
 
-function DesktopStream({ sessionUrl }: { sessionUrl: string }) {
+function DesktopStream({
+  sessionUrl,
+  latestSessionUrlRef,
+  reacquireSession,
+}: {
+  sessionUrl: string;
+  latestSessionUrlRef: { current: string | null };
+  reacquireSession: () => Promise<string | null>;
+}) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const rfbRef = useRef<RFB | null>(null);
   const [streamError, setStreamError] = useState<string | null>(null);
@@ -329,20 +384,37 @@ function DesktopStream({ sessionUrl }: { sessionUrl: string }) {
       clipboardTimer = setTimeout(() => setClipboardStatus(null), 2500);
     };
 
-    async function connect() {
+    let attempts = 0;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+    const maxAttempts = 10;
+
+    async function connect(reacquire = false) {
       setStreamError(null);
       try {
+        // On a reconnect, mint a fresh lease + token first — the original token
+        // is only ~300s, so a cached URL can be expired and would 401. The
+        // initial connect already holds a fresh token from acquireControl.
+        if (reacquire) await reacquireSession();
         const mod = await import("@novnc/novnc");
         if (cancelled || !containerRef.current) return;
-        const stream = displayWebSocketConnection(sessionUrl);
+        const stream = displayWebSocketConnection(latestSessionUrlRef.current || sessionUrl);
         rfb = new mod.default(containerRef.current, stream.url, {
           wsProtocols: ["binary", `molecule-display-token.${stream.token}`],
         });
         rfbRef.current = rfb;
         rfb.scaleViewport = true;
-        rfb.resizeSession = true;
+        // Do NOT request a server-side resize: the workspace display runs a
+        // fixed Xorg modeline and x11vnc rejects SetDesktopSize ("Resize is
+        // administratively prohibited"), which spams the console on every
+        // (re)connect. scaleViewport already fits the fixed framebuffer to the
+        // container client-side, so we don't need the server to resize.
+        rfb.resizeSession = false;
         rfb.focusOnClick = true;
         rfb.focus({ preventScroll: true });
+        rfb.addEventListener("connect", () => {
+          attempts = 0;
+          if (!cancelled) setStreamError(null);
+        });
         rfb.addEventListener("clipboard", (event: Event) => {
           const text = (event as CustomEvent<{ text?: string }>).detail?.text ?? "";
           if (!text) return;
@@ -353,7 +425,20 @@ function DesktopStream({ sessionUrl }: { sessionUrl: string }) {
         });
         rfb.addEventListener("disconnect", (event: Event) => {
           const detail = (event as CustomEvent<{ clean?: boolean }>).detail;
-          if (!cancelled && !detail?.clean) setStreamError("Desktop stream disconnected.");
+          rfbRef.current = null;
+          if (cancelled || detail?.clean) return;
+          // Auto-reconnect after an unclean drop (idle/network blip, brief
+          // agent hiccup); bounded backoff so a genuinely-dead session still
+          // surfaces an error instead of looping forever.
+          if (attempts < maxAttempts) {
+            attempts += 1;
+            setStreamError(`Reconnecting to desktop… (attempt ${attempts})`);
+            retryTimer = setTimeout(() => {
+              if (!cancelled) void connect(true);
+            }, Math.min(1000 * attempts, 5000));
+          } else {
+            setStreamError("Desktop stream disconnected.");
+          }
         });
       } catch {
         if (!cancelled) setStreamError("Desktop stream could not be opened.");
@@ -363,11 +448,12 @@ function DesktopStream({ sessionUrl }: { sessionUrl: string }) {
     connect();
     return () => {
       cancelled = true;
+      if (retryTimer) clearTimeout(retryTimer);
       if (clipboardTimer) clearTimeout(clipboardTimer);
       rfbRef.current = null;
       rfb?.disconnect();
     };
-  }, [sessionUrl]);
+  }, [sessionUrl, reacquireSession, latestSessionUrlRef]);
 
   useEffect(() => {
     const onPaste = (event: ClipboardEvent) => {

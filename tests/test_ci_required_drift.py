@@ -18,6 +18,7 @@ No network. No live Gitea calls.
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import textwrap
 from pathlib import Path
@@ -117,6 +118,31 @@ def _write_audit_yaml(tmp_path: Path, required_checks: list[str]) -> Path:
     return p
 
 
+def _write_audit_yaml_json(tmp_path: Path, required_checks_json: dict) -> Path:
+    """Write a synthetic audit-force-merge.yml with REQUIRED_CHECKS_JSON env."""
+    block = json.dumps(required_checks_json, indent=2)
+    text = textwrap.dedent(
+        f"""\
+        name: audit-force-merge
+        on:
+          schedule:
+            - cron: '*/30 * * * *'
+        jobs:
+          audit:
+            runs-on: ubuntu-latest
+            steps:
+              - name: Run audit
+                env:
+                  REQUIRED_CHECKS_JSON: |
+                    {block.replace(chr(10), chr(10) + '                    ')}
+                run: bash .gitea/scripts/audit-force-merge.sh
+        """
+    )
+    p = tmp_path / "audit-force-merge.yml"
+    p.write_text(text, encoding="utf-8")
+    return p
+
+
 def _make_stub_api(responses: dict):
     """Build a fake `api()` callable.
 
@@ -175,6 +201,60 @@ def test_f1_job_missing_from_sentinel_needs(drift_module, tmp_path, monkeypatch)
 
     findings, _ = drift_module.detect_drift("main")
     assert any("F1 —" in f and "test" in f for f in findings), findings
+
+
+def test_detect_drift_403_fails_closed(drift_module, tmp_path, monkeypatch):
+    """AUTH FAILURE on branch_protections (HTTP 401/403) → RAISE (fail
+    closed). The token can't read BP, so drift is UNVERIFIABLE; greening
+    the hourly cron here would let jobs↔protection drift go silently
+    undetected — exactly the regression class this sentinel exists to
+    catch. fix/core-ci-fail-closed.
+    """
+    ci = _write_ci_yaml(
+        tmp_path,
+        jobs={"build": {"runs-on": "ubuntu-latest"}},
+        sentinel_needs=["build"],
+    )
+    audit = _write_audit_yaml(tmp_path, ["ci / build (pull_request)"])
+    _patch_paths(drift_module, monkeypatch, ci, audit)
+
+    stub = _make_stub_api({
+        ("GET", "/repos/owner/repo/branch_protections/main"): (
+            drift_module.ApiError(
+                "GET /repos/owner/repo/branch_protections/main → HTTP 403: forbidden"
+            )
+        ),
+    })
+    monkeypatch.setattr(drift_module, "api", stub)
+    with pytest.raises(drift_module.ApiError):
+        drift_module.detect_drift("main")
+
+
+def test_detect_drift_404_skips_branch(drift_module, tmp_path, monkeypatch):
+    """Authenticated 404 (branch genuinely has no protection, e.g. staging
+    pre-rollout) → tolerated skip: return ([], debug) with
+    protection_contexts_skipped True. NOT a fail-open (real read of an
+    absent resource with a valid token)."""
+    ci = _write_ci_yaml(
+        tmp_path,
+        jobs={"build": {"runs-on": "ubuntu-latest"}},
+        sentinel_needs=["build"],
+    )
+    audit = _write_audit_yaml(tmp_path, ["ci / build (pull_request)"])
+    _patch_paths(drift_module, monkeypatch, ci, audit)
+
+    stub = _make_stub_api({
+        ("GET", "/repos/owner/repo/branch_protections/staging"): (
+            drift_module.ApiError(
+                "GET /repos/owner/repo/branch_protections/staging → HTTP 404: not found"
+            )
+        ),
+    })
+    monkeypatch.setattr(drift_module, "api", stub)
+    findings, debug = drift_module.detect_drift("staging")
+    assert findings == []
+    assert debug.get("protection_contexts_skipped") is True
+    assert debug.get("protection_http_status") == 404
 
 
 def test_f1b_sentinel_needs_typo(drift_module, tmp_path, monkeypatch):
@@ -342,6 +422,107 @@ def test_happy_path_no_drift(drift_module, tmp_path, monkeypatch):
             "ci / test (pull_request)",
             "ci / all-required (pull_request)",
         ],
+    )
+    _patch_paths(drift_module, monkeypatch, ci, audit)
+
+    stub = _make_stub_api({
+        ("GET", "/repos/owner/repo/branch_protections/main"): (
+            200,
+            {
+                "status_check_contexts": [
+                    "ci / build (pull_request)",
+                    "ci / test (pull_request)",
+                    "ci / all-required (pull_request)",
+                ]
+            },
+        ),
+    })
+    monkeypatch.setattr(drift_module, "api", stub)
+
+    findings, _ = drift_module.detect_drift("main")
+    assert findings == [], findings
+
+
+# --------------------------------------------------------------------------
+# REQUIRED_CHECKS_JSON variant drift tests
+# --------------------------------------------------------------------------
+def test_f3a_env_wider_than_protection_json_variant(drift_module, tmp_path, monkeypatch):
+    """F3a: REQUIRED_CHECKS_JSON env has a context NOT in protection."""
+    ci = _write_ci_yaml(
+        tmp_path,
+        jobs={"build": {"runs-on": "ubuntu-latest"}},
+        sentinel_needs=["build"],
+    )
+    audit = _write_audit_yaml_json(
+        tmp_path,
+        {"main": ["ci / build (pull_request)", "ci / ghost (pull_request)"]},
+    )
+    _patch_paths(drift_module, monkeypatch, ci, audit)
+
+    stub = _make_stub_api({
+        ("GET", "/repos/owner/repo/branch_protections/main"): (
+            200,
+            {"status_check_contexts": ["ci / build (pull_request)"]},
+        ),
+    })
+    monkeypatch.setattr(drift_module, "api", stub)
+
+    findings, _ = drift_module.detect_drift("main")
+    assert any("F3a" in f and "ghost" in f for f in findings), findings
+
+
+def test_f3b_protection_wider_than_env_json_variant(drift_module, tmp_path, monkeypatch):
+    """F3b: protection has a context NOT in REQUIRED_CHECKS_JSON env."""
+    ci = _write_ci_yaml(
+        tmp_path,
+        jobs={
+            "build": {"runs-on": "ubuntu-latest"},
+            "test": {"runs-on": "ubuntu-latest"},
+        },
+        sentinel_needs=["build", "test"],
+    )
+    audit = _write_audit_yaml_json(
+        tmp_path,
+        {"main": ["ci / build (pull_request)"]},
+    )
+    _patch_paths(drift_module, monkeypatch, ci, audit)
+
+    stub = _make_stub_api({
+        ("GET", "/repos/owner/repo/branch_protections/main"): (
+            200,
+            {
+                "status_check_contexts": [
+                    "ci / build (pull_request)",
+                    "ci / test (pull_request)",
+                ]
+            },
+        ),
+    })
+    monkeypatch.setattr(drift_module, "api", stub)
+
+    findings, _ = drift_module.detect_drift("main")
+    assert any("F3b" in f and "ci / test (pull_request)" in f for f in findings), findings
+
+
+def test_happy_path_no_drift_json_variant(drift_module, tmp_path, monkeypatch):
+    """Happy path with REQUIRED_CHECKS_JSON: all aligned."""
+    ci = _write_ci_yaml(
+        tmp_path,
+        jobs={
+            "build": {"runs-on": "ubuntu-latest"},
+            "test": {"runs-on": "ubuntu-latest"},
+        },
+        sentinel_needs=["build", "test"],
+    )
+    audit = _write_audit_yaml_json(
+        tmp_path,
+        {
+            "main": [
+                "ci / build (pull_request)",
+                "ci / test (pull_request)",
+                "ci / all-required (pull_request)",
+            ]
+        },
     )
     _patch_paths(drift_module, monkeypatch, ci, audit)
 

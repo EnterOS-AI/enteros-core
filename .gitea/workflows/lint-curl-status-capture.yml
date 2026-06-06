@@ -48,11 +48,9 @@ jobs:
   scan:
     name: Scan workflows for curl status-capture pollution
     runs-on: ubuntu-latest
-    # Phase 3 (RFC #219 §1): surface broken workflows without blocking
-    # the PR. Follow-up PR flips this off after surfaced defects are
-    # triaged.
-    # mc#1982: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
-    continue-on-error: true
+    # Phase 4 (RFC #219 §1): 22 days green since 2026-05-11 port.
+    # mc#1982 mask removed — no surfaced defects in this lane.
+    continue-on-error: false
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Find curl ... -w '%{http_code}' ... || echo "000" subshells

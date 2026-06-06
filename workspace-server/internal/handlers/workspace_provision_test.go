@@ -363,6 +363,74 @@ runtime_config:
 	}
 }
 
+// TestEnsureDefaultConfig_StampsDerivedProvider pins RFC#340 Fix A: a
+// canvas-created claude-code workspace with model "moonshot/kimi-k2.6" must
+// have the manifest-derived provider stamped into config.yaml at BOTH the top
+// level and under runtime_config, so the cp#329 config-bundle the adapter
+// reads no longer leaves the runtime to slash-split "moonshot/..." → an
+// unregistered provider="moonshot" (the original NOT_CONFIGURED boot). The
+// canonical manifest exact-id-matches "moonshot/kimi-k2.6" to provider=platform.
+func TestEnsureDefaultConfig_StampsDerivedProvider(t *testing.T) {
+	broadcaster := newTestBroadcaster()
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+
+	files := handler.ensureDefaultConfig("ws-moonshot", models.CreateWorkspacePayload{
+		Name:    "Kimi Agent",
+		Tier:    2,
+		Runtime: "claude-code",
+		Model:   "moonshot/kimi-k2.6",
+	})
+
+	var parsed struct {
+		Model         string `yaml:"model"`
+		Provider      string `yaml:"provider"`
+		RuntimeConfig struct {
+			Model    string `yaml:"model"`
+			Provider string `yaml:"provider"`
+		} `yaml:"runtime_config"`
+	}
+	if err := yaml.Unmarshal(files["config.yaml"], &parsed); err != nil {
+		t.Fatalf("generated YAML invalid: %v\n%s", err, files["config.yaml"])
+	}
+	if parsed.Provider != "platform" {
+		t.Errorf("top-level provider = %q, want platform\n%s", parsed.Provider, files["config.yaml"])
+	}
+	if parsed.RuntimeConfig.Provider != "platform" {
+		t.Errorf("runtime_config.provider = %q, want platform\n%s", parsed.RuntimeConfig.Provider, files["config.yaml"])
+	}
+	// The claude-code model normalization still strips the slash prefix.
+	if parsed.Model != "kimi-k2.6" {
+		t.Errorf("top-level model = %q, want kimi-k2.6\n%s", parsed.Model, files["config.yaml"])
+	}
+}
+
+// TestEnsureDefaultConfig_DeriveMissOmitsProvider pins requirement #3: a model
+// the providers manifest does NOT recognize for the runtime (a derive miss)
+// must NOT write any `provider:` key — neither top-level nor under
+// runtime_config — preserving the pre-fix behavior (no empty `provider:`,
+// provisioning never fails on a miss). "gpt-4o" is not a registered
+// claude-code model, so DeriveProvider errors and the field is omitted.
+func TestEnsureDefaultConfig_DeriveMissOmitsProvider(t *testing.T) {
+	broadcaster := newTestBroadcaster()
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+
+	files := handler.ensureDefaultConfig("ws-derivemiss", models.CreateWorkspacePayload{
+		Name:    "Unregistered Agent",
+		Tier:    1,
+		Runtime: "claude-code",
+		Model:   "gpt-4o",
+	})
+
+	content := string(files["config.yaml"])
+	if strings.Contains(content, "provider:") {
+		t.Errorf("derive miss must NOT write any provider: key, got:\n%s", content)
+	}
+	// Sanity: a derive miss must still produce a valid, model-bearing config.
+	if !strings.Contains(content, `model: "gpt-4o"`) {
+		t.Errorf("derive miss should still render the model, got:\n%s", content)
+	}
+}
+
 func TestEnsureDefaultConfig_CustomModel(t *testing.T) {
 	broadcaster := newTestBroadcaster()
 	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
@@ -777,6 +845,7 @@ func TestBuildProvisionerConfig_BasicFields(t *testing.T) {
 		map[string][]byte{"config.yaml": []byte("name: test")},
 		models.CreateWorkspacePayload{Tier: 1, Runtime: "claude-code"},
 		map[string]string{"API_KEY": "secret"},
+		nil,
 		pluginsPath,
 	)
 
@@ -825,11 +894,77 @@ func TestBuildProvisionerConfig_WorkspacePathFromEnv(t *testing.T) {
 		nil,
 		models.CreateWorkspacePayload{Tier: 2, Runtime: "claude-code"},
 		nil,
+		nil,
 		pluginsPath,
 	)
 
 	if cfg.WorkspacePath != workspaceDir {
 		t.Errorf("expected WorkspacePath from env, got %q", cfg.WorkspacePath)
+	}
+}
+
+// ==================== loadWorkspaceSecrets provenance (forensic #145) ====================
+
+// TestLoadWorkspaceSecrets_WorkspaceKeysProvenance pins the positive
+// provenance side-channel added for forensic #145: a key sourced from
+// workspace_secrets must land in the third return value (workspaceKeys),
+// while a key sourced only from global_secrets must NOT. A key present in
+// BOTH stores is treated as workspace-authored (workspace overrides global),
+// so it lands in workspaceKeys AND is removed from globalKeys.
+func TestLoadWorkspaceSecrets_WorkspaceKeysProvenance(t *testing.T) {
+	mock := setupTestDB(t)
+
+	// global_secrets: an operator-store GITEA_TOKEN (the bleed channel) and
+	// an OPERATOR_ONLY key that no workspace row re-sets.
+	globalRows := sqlmock.NewRows([]string{"key", "encrypted_value", "encryption_version"}).
+		AddRow("GITEA_TOKEN", []byte("operator-store-gitea"), 0).
+		AddRow("OPERATOR_ONLY", []byte("op-val"), 0)
+	mock.ExpectQuery(`SELECT key, encrypted_value, encryption_version FROM global_secrets`).
+		WillReturnRows(globalRows)
+
+	// workspace_secrets: the user/org-admin re-authors GITEA_TOKEN (override)
+	// and adds a workspace-only WS_ONLY key. encryption_version 0 = plaintext
+	// passthrough (crypto.DecryptVersioned).
+	wsRows := sqlmock.NewRows([]string{"key", "encrypted_value", "encryption_version"}).
+		AddRow("GITEA_TOKEN", []byte("workspace-authored-gitea"), 0).
+		AddRow("WS_ONLY", []byte("ws-val"), 0)
+	mock.ExpectQuery(`SELECT key, encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1`).
+		WithArgs("ws-prov").
+		WillReturnRows(wsRows)
+
+	envVars, globalKeys, workspaceKeys, errMsg := loadWorkspaceSecrets(context.Background(), "ws-prov")
+	if errMsg != "" {
+		t.Fatalf("loadWorkspaceSecrets returned error: %q", errMsg)
+	}
+
+	// Workspace override wins on value precedence.
+	if got := envVars["GITEA_TOKEN"]; got != "workspace-authored-gitea" {
+		t.Errorf("GITEA_TOKEN value = %q; want workspace-authored override", got)
+	}
+
+	// workspaceKeys: both workspace-sourced keys present.
+	if _, ok := workspaceKeys["GITEA_TOKEN"]; !ok {
+		t.Errorf("GITEA_TOKEN (re-authored via workspace_secrets) missing from workspaceKeys: %v", workspaceKeys)
+	}
+	if _, ok := workspaceKeys["WS_ONLY"]; !ok {
+		t.Errorf("WS_ONLY (workspace_secrets) missing from workspaceKeys: %v", workspaceKeys)
+	}
+	// OPERATOR_ONLY came only from global_secrets → NOT workspace-authored.
+	if _, ok := workspaceKeys["OPERATOR_ONLY"]; ok {
+		t.Errorf("OPERATOR_ONLY (global_secrets only) wrongly present in workspaceKeys: %v", workspaceKeys)
+	}
+
+	// globalKeys: GITEA_TOKEN's operator-bleed flag dropped by the override;
+	// OPERATOR_ONLY stays flagged.
+	if _, ok := globalKeys["GITEA_TOKEN"]; ok {
+		t.Errorf("GITEA_TOKEN should be removed from globalKeys after workspace override: %v", globalKeys)
+	}
+	if _, ok := globalKeys["OPERATOR_ONLY"]; !ok {
+		t.Errorf("OPERATOR_ONLY missing from globalKeys: %v", globalKeys)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations not met: %v", err)
 	}
 }
 
@@ -1424,6 +1559,11 @@ func (s *stubFailingCPProv) IsRunning(_ context.Context, _ string) (bool, error)
 // the broadcast payload would surface every marker; the canned
 // "provisioning failed" message must surface none of them.
 func TestProvisionWorkspaceCP_NoInternalErrorsInBroadcast(t *testing.T) {
+	// Supply the CP proxy env so the platform-managed default does not abort
+	// with MISSING_PLATFORM_PROXY (molecule-core#2162).
+	t.Setenv("MOLECULE_LLM_BASE_URL", "https://api.example.test/api/v1/internal/llm/openai/v1")
+	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
+
 	mock := setupTestDB(t)
 
 	// loadWorkspaceSecrets queries global_secrets and workspace_secrets

@@ -26,11 +26,14 @@ name: sync-providers-yaml
 # sentinel does not fire on it.
 #
 # AUTH: uses AUTO_SYNC_TOKEN (the existing cross-repo read token used to sync
-# template/provider content from sibling repos). If the secret is absent the
-# job emits a clear ::warning:: and exits 0 — the hermetic sha pin in
-# sync_canonical_test.go is the always-on backstop, so a missing cross-repo
-# token degrades to "hand-edit still caught, live canonical drift not caught"
-# rather than a hard red that blocks unrelated PRs.
+# template/provider content from sibling repos). If the secret is absent:
+#   * Trusted contexts (push to main/staging, schedule, same-repo PR,
+#     workflow_dispatch): hard ::error:: + exit 1 (#2158 — silent
+#     fail-open was masking live canonical drift from the daily schedule).
+#   * Untrusted fork PRs: soft ::warning:: + exit 0 (forks cannot receive
+#     secrets, so a hard-fail here would block every fork PR).
+# The hermetic sha pin in sync_canonical_test.go is the always-on backstop
+# for hand-edits of core's synced copy regardless of AUTO_SYNC_TOKEN state.
 
 on:
   pull_request:
@@ -60,6 +63,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # bp-required: pending #718 — soak-then-promote, not in BP yet.
   compare:
     name: Compare synced providers.yaml against controlplane canonical
     runs-on: ubuntu-latest
@@ -73,10 +77,37 @@ jobs:
           API_ROOT: ${{ github.server_url }}/api/v1
         run: |
           set -euo pipefail
+          # Trusted-context detection (per #2158): AUTO_SYNC_TOKEN absence
+          # is a hard failure on contexts that *should* have the secret
+          # (push to main/staging, schedule, same-repo PRs, workflow_dispatch).
+          # Fork PRs cannot receive secrets, so the soft warning is preserved
+          # for that one untrusted case. The hermetic sha pin in
+          # sync_canonical_test.go remains the always-on backstop for
+          # hand-edits of core's synced copy.
+          case "${{ github.event_name }}" in
+            push|schedule|workflow_dispatch)
+              is_trusted=true
+              ;;
+            pull_request)
+              if [ "${{ github.event.pull_request.head.repo.fork }}" = "false" ]; then
+                is_trusted=true
+              else
+                is_trusted=false
+              fi
+              ;;
+            *)
+              # Unknown event type — treat as trusted to avoid silent failures
+              # on a future event we haven't enumerated.
+              is_trusted=true
+              ;;
+          esac
           if [ -z "${AUTO_SYNC_TOKEN:-}" ]; then
-            echo "::warning::AUTO_SYNC_TOKEN secret missing — skipping the live cross-repo compare."
+            if [ "$is_trusted" = "true" ]; then
+              echo "::error::AUTO_SYNC_TOKEN secret missing on trusted context (${{ github.event_name }}). Live cross-repo canonical-drift detection cannot run — this would silently mask a controlplane-side providers.yaml change from going red on the daily schedule and on same-repo PRs. Provision AUTO_SYNC_TOKEN (read scope on molecule-controlplane) to restore detection."
+              exit 1
+            fi
+            echo "::warning::AUTO_SYNC_TOKEN secret missing on untrusted fork PR — skipping the live cross-repo compare (forks cannot receive secrets)."
             echo "The hermetic sha pin (sync_canonical_test.go) still gates hand-edits of core's copy."
-            echo "Provision AUTO_SYNC_TOKEN (read scope on molecule-controlplane) to enable live canonical-drift detection."
             exit 0
           fi
           CANON_URL="${API_ROOT}/repos/molecule-ai/molecule-controlplane/raw/internal/providers/providers.yaml?ref=main"

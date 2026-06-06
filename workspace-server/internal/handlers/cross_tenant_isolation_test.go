@@ -68,6 +68,10 @@ func TestPeers_CrossTenant_OrgRootNotLeaked(t *testing.T) {
 
 	caller := "org-a-root" // parent_id IS NULL — an org root for tenant A
 
+	// validateDiscoveryCaller probes HasAnyLiveToken(:id) first; grandfather.
+	// (Unordered match is set above, so this can be consumed at any point.)
+	seedDiscoveryGrandfather(mock, caller)
+
 	// parent_id lookup → NULL (caller is an org root)
 	mock.ExpectQuery("SELECT parent_id FROM workspaces WHERE id =").
 		WithArgs(caller).
@@ -127,6 +131,9 @@ func TestPeers_SameOrg_SiblingsStillWork(t *testing.T) {
 
 	caller := "org-a-child-1"
 	parent := "org-a-root"
+
+	// validateDiscoveryCaller probes HasAnyLiveToken(:id) first; grandfather.
+	seedDiscoveryGrandfather(mock, caller)
 
 	mock.ExpectQuery("SELECT parent_id FROM workspaces WHERE id =").
 		WithArgs(caller).

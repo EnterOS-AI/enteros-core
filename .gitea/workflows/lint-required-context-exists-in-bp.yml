@@ -81,10 +81,10 @@ jobs:
     name: lint-required-context-exists-in-bp
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    # Phase 3 (RFC #219 §1): surface the pattern without blocking PRs
-    # while the directive convention beds in. Follow-up flip to false
-    # after 7 clean days on main. mc#1982.
-    continue-on-error: true  # mc#1982 Phase 3 — flip to false after 7 clean main runs
+    # Phase 4 (RFC #219 §1): 22 days green since 2026-05-11 port,
+    # well past the 7-clean-day threshold. PR-time failure is now
+    # a hard CI signal.
+    continue-on-error: false
     steps:
       - name: Check out PR head with full history (need base SHA blobs)
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
