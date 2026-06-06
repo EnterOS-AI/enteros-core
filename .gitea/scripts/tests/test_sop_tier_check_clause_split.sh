@@ -57,12 +57,12 @@ echo "test: tier:low OR-clause splits to 3 tokens"
 assert_eq "tier:low" "engineers|managers|ceo" "$(split_clause "engineers,managers,ceo")"
 
 echo "test: tier:medium AND-expression — bash word-split on \$EXPR yields 5 tokens"
-EXPR="managers AND engineers AND qa???,security???"
+EXPR="managers AND engineers AND qa,security"
 out=""
 for _raw in $EXPR; do
   out="${out}${out:+ ; }$(split_clause "$_raw")"
 done
-assert_eq "tier:medium" "managers ; AND ; engineers ; AND ; qa???|security???" "$out"
+assert_eq "tier:medium" "managers ; AND ; engineers ; AND ; qa|security" "$out"
 
 echo "test: tier:high single-team OR-clause"
 assert_eq "tier:high" "ceo" "$(split_clause "ceo")"

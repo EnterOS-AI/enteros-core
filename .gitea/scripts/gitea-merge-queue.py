@@ -9,17 +9,33 @@ queue. This script provides the missing serialized policy in user space:
    candidate (REQUEST_CHANGES, mergeable!=True, insufficient genuine approvals,
    or red required CI) is SKIPPED so it cannot head-of-line block newer ready
    PRs; the scan continues to the next candidate.
-2. Refuse to act unless main's BP-required contexts are green.
+2. Refuse to act unless main's BP-required contexts are green. This is also
+   the serialized backstop for direct-merge (see below): after a direct merge,
+   main re-runs push CI and this gate PAUSES the queue if main goes red, so no
+   merge piles onto an unverified/red main (issue #2358).
 3. Refuse fork PRs; the queue may only mutate same-repo branches.
-4. If the PR branch does not contain current main, call Gitea's
-   /pulls/{n}/update endpoint and stop. CI must rerun on the updated head.
+4. DIRECT-MERGE when conflict-free (issue #2358). When Gitea reports the PR
+   conflict-free (mergeable is True) and the merge bar below is met, MERGE IT
+   DIRECTLY — even if its head does not contain current main. We do NOT call
+   /pulls/{n}/update first: branch protection does not require strict
+   up-to-date, so behind-main conflict-free PRs merge cleanly, and calling
+   /update would trigger Gitea dismiss_stale_approvals (dismissing the genuine
+   approvals and forcing a re-review every tick — the rebase-churn bottleneck).
+   The /update path is used ONLY when the PR is DEFINITIVELY not mergeable
+   (mergeable is literal False) AND its head lacks current main — refreshing the
+   branch may resolve a behind-main non-conflict; a real conflict returns HTTP
+   409 and the PR is HELD per #2352. mergeable=None/missing (Gitea STILL
+   COMPUTING conflict state) is a distinct fail-closed WAIT: never merged AND
+   never /update'd — calling /update during the compute window would dismiss the
+   PR's genuine approvals (dismiss_stale_approvals) and re-introduce the exact
+   rebase-churn this queue eliminates. None is re-checked next tick.
 5. Merge ONLY when, on the PR's CURRENT head sha:
      - >= REQUIRED_APPROVALS distinct GENUINE official APPROVED reviews from
        the recognised reviewer set (not stale, not dismissed, commit_id ==
        current head), AND
      - no open official REQUEST_CHANGES on the current head, AND
      - every BP-required status context is green, AND
-     - the PR is mergeable.
+     - the PR is mergeable (Gitea reports it conflict-free).
 
 Authoritative gates (fail-closed):
   - The REQUIRED status contexts come from BRANCH PROTECTION
@@ -622,29 +638,32 @@ def evaluate_merge_readiness(
     approvers: set[str],
     request_changes: list[str],
     pr_has_current_base: bool,
-    mergeable: bool,
+    mergeable: bool | None,
     pr_labels: set[str] | None = None,
 ) -> MergeDecision:
     # 1) Main's push-required contexts must be green. Combined state can be
     #    "failure" due to non-blocking jobs (continue-on-error: true) that do
     #    not gate merges, so check the explicit required set, not combined.
+    #
+    #    This main-green gate is ALSO the serialized backstop that makes the
+    #    direct-merge (no update) path safe (issue #2358): after a direct merge
+    #    of a behind-main PR, main re-runs its push CI; if a semantic main-break
+    #    slips through (PR green standalone but broken when combined with newer
+    #    main), main's required contexts go red and this gate PAUSES the queue —
+    #    no further merge piles onto an unverified/red main until it is green.
     main_latest = latest_statuses_by_context(main_status.get("statuses") or [])
     main_ok, main_bad = required_contexts_green(main_latest, push_required_contexts())
     if not main_ok:
         return MergeDecision(False, "pause", "main required contexts not green: " + ", ".join(main_bad))
 
-    # 2) PR head must contain current main.
-    if not pr_has_current_base:
-        return MergeDecision(False, "update", "PR head does not contain current main")
-
-    # 3) No open official REQUEST_CHANGES on the current head.
+    # 2) No open official REQUEST_CHANGES on the current head.
     if request_changes:
         return MergeDecision(
             False, "wait",
             "open REQUEST_CHANGES on current head from: " + ", ".join(sorted(request_changes)),
         )
 
-    # 4) Enough distinct genuine official approvals on the current head.
+    # 3) Enough distinct genuine official approvals on the current head.
     if len(approvers) < required_approvals:
         return MergeDecision(
             False, "wait",
@@ -653,7 +672,7 @@ def evaluate_merge_readiness(
             f"need {required_approvals}",
         )
 
-    # 5) Every BRANCH-PROTECTION-REQUIRED status context must be green. This is
+    # 4) Every BRANCH-PROTECTION-REQUIRED status context must be green. This is
     #    the authoritative status gate — NON-required reds (qa-review,
     #    security-review, sop-tier/sop-checklist when not BP-required, E2E Chat,
     #    Staging SaaS, ci-arm64-advisory, continue-on-error jobs) are NOT
@@ -663,16 +682,53 @@ def evaluate_merge_readiness(
     if not ok:
         return MergeDecision(False, "wait", "required contexts not green: " + ", ".join(missing_or_bad))
 
-    # 6) Gitea must consider the PR mergeable (no conflicts).
-    if not mergeable:
-        return MergeDecision(False, "wait", "PR is not mergeable (conflicts)")
+    # 5) DIRECT-MERGE when conflict-free (issue #2358 — throughput fix).
+    #    If Gitea reports the PR conflict-free (mergeable is True), MERGE IT
+    #    DIRECTLY even if its head does not yet contain current main. Branch
+    #    protection does NOT require strict up-to-date, so a behind-main but
+    #    conflict-free PR merges cleanly. We deliberately do NOT call
+    #    /pulls/{n}/update first: update triggers Gitea dismiss_stale_approvals,
+    #    which would dismiss the PR's genuine approvals and force a full
+    #    re-review every tick — the rebase-churn bottleneck that collapsed
+    #    throughput to ~0/hr with dozens of mergeable PRs open.
+    #
+    #    The merge bar is UNCHANGED: we only reach here with main green +
+    #    >= required genuine approvals on the current head + no open
+    #    REQUEST_CHANGES + every BP-required context green. The trade-off is
+    #    that the PR's CI ran on a possibly-behind base, so a SEMANTIC main-break
+    #    is caught by POST-merge main CI (step 1's pause backstop) rather than
+    #    pre-merge. force_merge is used ONLY for missing-but-non-required
+    #    governance reds (required are green + approvals genuine), never to
+    #    bypass a failing required context or an approval shortfall.
+    if mergeable is True:
+        force = _non_required_red_present(latest, required_contexts)
+        return MergeDecision(True, "merge", "ready", force=force)
 
-    # Ready. Use force_merge ONLY if the merge would otherwise be blocked by
-    # missing-but-non-required governance contexts. Required are green and
-    # approvals are genuine, so force only bypasses non-required reds — never a
-    # failing required context or missing approval.
-    force = _non_required_red_present(latest, required_contexts)
-    return MergeDecision(True, "merge", "ready", force=force)
+    # 6) NOT (yet) mergeable. TRI-STATE, fail-closed — never merge on an unknown.
+    #    We MUST distinguish "still computing" (None/missing) from a "definitive
+    #    conflict" (False); collapsing them would route a behind-main but
+    #    STILL-COMPUTING PR into the /update path, whose dismiss_stale_approvals
+    #    is the rebase-churn this change eliminates.
+    #
+    #    mergeable is None  → Gitea has NOT finished computing conflict state.
+    #    WAIT: do nothing this tick — never /update (would dismiss genuine
+    #    approvals during the compute window → churn), never merge. Re-check next
+    #    tick once Gitea reports a decisive True/False.
+    if mergeable is None:
+        return MergeDecision(
+            False, "wait",
+            "PR mergeability is still being computed (mergeable=None) — waiting",
+        )
+
+    # mergeable is False → DEFINITIVE not-mergeable. If the head also does not
+    #    contain current main, try the /update path to refresh the branch (this
+    #    may resolve a behind-main non-conflict; a real conflict returns HTTP 409
+    #    and process_once HOLDs the PR per #2352). If the head already contains
+    #    current main yet Gitea still reports not-mergeable, there is nothing the
+    #    queue can do (genuine conflict against current main) — WAIT.
+    if not pr_has_current_base:
+        return MergeDecision(False, "update", "PR not mergeable and head does not contain current main")
+    return MergeDecision(False, "wait", "PR is not mergeable (conflicts)")
 
 
 def get_branch_head(branch: str) -> str:
@@ -1076,12 +1132,20 @@ def _evaluate_candidate(
     # never treated as green).
     pr_status = get_combined_status(head_sha)
     pr_labels = label_names(pr)
-    # FAIL-CLOSED: Gitea returns mergeable=None (or omits the field) while it is
-    # still COMPUTING conflict state. Only the literal True is decisive proof the
-    # PR is conflict-free; None and False both mean "not (yet) mergeable". We must
-    # NOT autonomously merge on an unknown — treat anything but True as not-yet-
-    # mergeable so evaluate_merge_readiness returns a "wait" decision.
-    mergeable = pr.get("mergeable") is True
+    # FAIL-CLOSED, TRI-STATE: Gitea returns mergeable=None (or omits the field)
+    # while it is still COMPUTING conflict state, mergeable=False for a definitive
+    # conflict, and mergeable=True only when it has proven the PR conflict-free.
+    # We preserve all THREE states (do NOT collapse None/missing into False):
+    #   - True            → direct-merge eligible (step 5).
+    #   - None / missing  → still computing → WAIT (never merge, never update,
+    #                       never dismiss approvals); re-check next tick.
+    #   - False           → definitive conflict → the update/hold path (step 6).
+    # Collapsing None→False would route a behind-main but STILL-COMPUTING PR into
+    # the /update path, which triggers dismiss_stale_approvals — the exact
+    # rebase-churn this change eliminates. Normalize only to the literal True /
+    # False / None set (some Gitea versions omit the key entirely → None).
+    raw_mergeable = pr.get("mergeable")
+    mergeable: bool | None = raw_mergeable if isinstance(raw_mergeable, bool) else None
 
     reviews = get_pull_reviews(pr_number)
     approvers, request_changes = genuine_approvals(

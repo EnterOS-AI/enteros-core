@@ -305,9 +305,9 @@ def validate_tracker(
     if status == "error":
         sys.stderr.write(
             f"::error::issue {slug}#{num} fetch errored — treating as "
-            f"unverified, skipping this check.\n"
+            f"unverified, FAILING CLOSED (do not skip on outage).\n"
         )
-        return (True, "fetch-error — skipped")
+        return (False, f"{slug}#{num} fetch errored — cannot verify tracker")
 
     assert payload is not None
     state = payload.get("state", "")

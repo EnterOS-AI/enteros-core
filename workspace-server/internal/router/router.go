@@ -426,6 +426,12 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		adminTokH := handlers.NewAdminWorkspaceTokenHandler()
 		r.POST("/admin/workspaces/:id/tokens", middleware.AdminAuth(db.DB), adminTokH.Create)
 
+		// Platform agent install — idempotently makes the org-level concierge
+		// the org root (re-parents the existing root + moves org-anchor refs).
+		// Called by the control plane at org provision + existing-org backfill.
+		// (RFC docs/design/rfc-platform-agent.md)
+		r.POST("/admin/org/platform-agent", middleware.AdminAuth(db.DB), handlers.InstallPlatformAgent)
+
 		// Memory
 		memh := handlers.NewMemoryHandler()
 		wsAuth.GET("/memory", memh.List)

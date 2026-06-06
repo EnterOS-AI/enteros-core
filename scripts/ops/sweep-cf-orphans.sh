@@ -19,7 +19,10 @@
 #
 # Env vars required:
 #   CF_API_TOKEN        — Cloudflare token with zone:dns:edit
+#     (falls back to CLOUDFLARE_API_TOKEN if CF_API_TOKEN is unset;
+#      the workflow YAML maps both secret names into CF_API_TOKEN)
 #   CF_ZONE_ID          — the zone (moleculesai.app)
+#     (falls back to CLOUDFLARE_ZONE_ID if CF_ZONE_ID is unset)
 #   CP_ADMIN_API_TOKEN — CP admin bearer for api.moleculesai.app
 #   CP_STAGING_ADMIN_API_TOKEN — CP admin bearer for staging-api.moleculesai.app
 #   AWS_*               — standard AWS creds (default region us-east-2)
@@ -56,6 +59,12 @@ need() {
     exit 1
   fi
 }
+# Fallback: operator-host canonical names → CI-scoped names.
+# The workflow YAML already maps both, but direct script invocation
+# (e.g. local ops) may only have the canonical names set.
+CF_API_TOKEN="${CF_API_TOKEN:-${CLOUDFLARE_API_TOKEN:-}}"
+CF_ZONE_ID="${CF_ZONE_ID:-${CLOUDFLARE_ZONE_ID:-}}"
+
 need CF_API_TOKEN
 need CF_ZONE_ID
 need CP_ADMIN_API_TOKEN
@@ -121,7 +130,7 @@ if not payload.get("success", False) or not isinstance(payload.get("result"), li
     print(f"ERROR: Cloudflare DNS list failed: {detail}", file=sys.stderr)
     raise SystemExit(1)
 '; then
-  log "Cloudflare DNS list failed; verify CF_API_TOKEN has Zone:DNS:Edit and CF_ZONE_ID is the moleculesai.app zone."
+  log "Cloudflare DNS list failed; verify CF_API_TOKEN (or CLOUDFLARE_API_TOKEN) has Zone:DNS:Edit and CF_ZONE_ID (or CLOUDFLARE_ZONE_ID) is the moleculesai.app zone."
   exit 1
 fi
 TOTAL_CF=$(echo "$CF_JSON" | python3 -c "import json,sys; print(len(json.load(sys.stdin)['result']))")
