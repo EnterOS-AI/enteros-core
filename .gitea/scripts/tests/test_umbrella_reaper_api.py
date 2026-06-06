@@ -371,3 +371,104 @@ def test_load_required_sub_jobs_from_ci_yml_push_event(monkeypatch):
     jobs = mod._load_required_sub_jobs_from_ci_yml(".gitea/workflows")
     assert all(j.endswith(" (push)") for j in jobs)
     assert "CI / Detect changes (push)" in jobs
+
+
+def test_list_open_prs_paginates(monkeypatch):
+    mod = load_reaper()
+    calls = []
+
+    def fake_api(method, path, *, body=None, query=None, expect_json=True):
+        calls.append(query)
+        page = int(query.get("page", 1))
+        limit = int(query.get("limit", 50))
+        if page == 1:
+            return 200, [{"number": 1}, {"number": 2}]
+        if page == 2:
+            return 200, [{"number": 3}]
+        return 200, []
+
+    monkeypatch.setattr(mod, "api", fake_api)
+    prs = mod.list_open_prs(limit=2)
+    assert len(prs) == 3
+    assert prs[0]["number"] == 1
+    assert prs[2]["number"] == 3
+    assert calls[0]["page"] == "1"
+    assert calls[1]["page"] == "2"
+
+
+def test_process_pr_returns_false_on_status_fetch_failure(monkeypatch):
+    mod = load_reaper()
+
+    def fake_get_combined_status(sha):
+        raise mod.ApiError("GET /statuses/abc123 -> HTTP 500: simulated outage")
+
+    monkeypatch.setattr(mod, "get_combined_status", fake_get_combined_status)
+    monkeypatch.setattr(
+        mod,
+        "REQUIRED_SUB_JOBS",
+        ["CI / Detect changes (pull_request)"],
+    )
+
+    pr = _pr_fixture(8, "abc123")
+    ok = mod.process_pr(pr)
+    assert ok is False
+
+
+def test_process_pr_returns_false_on_missing_statuses_array(monkeypatch):
+    mod = load_reaper()
+
+    def fake_get_combined_status(sha):
+        return {"state": "success"}  # missing 'statuses' array
+
+    monkeypatch.setattr(mod, "get_combined_status", fake_get_combined_status)
+    monkeypatch.setattr(
+        mod,
+        "REQUIRED_SUB_JOBS",
+        ["CI / Detect changes (pull_request)"],
+    )
+
+    pr = _pr_fixture(9, "def456")
+    ok = mod.process_pr(pr)
+    assert ok is False
+
+
+def test_main_exits_nonzero_when_any_status_read_fails(monkeypatch):
+    mod = load_reaper()
+
+    monkeypatch.setenv("GITEA_TOKEN", "fixture-token")
+    monkeypatch.setenv("GITEA_HOST", "git.example.test")
+    monkeypatch.setenv("REPO", "owner/repo")
+
+    monkeypatch.setattr(
+        mod,
+        "REQUIRED_SUB_JOBS",
+        [
+            "CI / Detect changes (pull_request)",
+            "CI / Platform (Go) (pull_request)",
+        ],
+    )
+    monkeypatch.setattr(
+        mod,
+        "list_open_prs",
+        lambda limit: [
+            _pr_fixture(1, "abc123"),
+            _pr_fixture(2, "def456"),
+        ],
+    )
+
+    def fake_combined_status(sha):
+        if sha == "abc123":
+            return {
+                "statuses": [
+                    _status_entry("CI / all-required (pull_request)", "failure"),
+                    _status_entry("CI / Detect changes (pull_request)", "success"),
+                    _status_entry("CI / Platform (Go) (pull_request)", "success"),
+                ]
+            }
+        raise mod.ApiError("simulated status fetch failure")
+
+    monkeypatch.setattr(mod, "get_combined_status", fake_combined_status)
+    monkeypatch.setattr(mod, "post_status", lambda *a, **k: None)
+
+    exit_code = mod.main()
+    assert exit_code == 1

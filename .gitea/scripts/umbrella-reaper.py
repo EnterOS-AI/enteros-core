@@ -214,10 +214,24 @@ def api(
 # Gitea reads / writes
 # --------------------------------------------------------------------------
 def list_open_prs(limit: int = 50) -> list[dict]:
-    _, body = api("GET", f"/repos/{OWNER}/{NAME}/pulls", query={"state": "open", "limit": str(limit)})
-    if not isinstance(body, list):
-        raise ApiError("PR list response is not a JSON array")
-    return body
+    """Paginate through all open PR pages. Fail closed on non-list responses."""
+    all_prs: list[dict] = []
+    page = 1
+    while True:
+        _, body = api(
+            "GET",
+            f"/repos/{OWNER}/{NAME}/pulls",
+            query={"state": "open", "limit": str(limit), "page": str(page)},
+        )
+        if not isinstance(body, list):
+            raise ApiError(f"PR list page {page} response is not a JSON array")
+        if not body:
+            break
+        all_prs.extend(body)
+        if len(body) < limit:
+            break
+        page += 1
+    return all_prs
 
 
 def get_combined_status(sha: str) -> dict:
@@ -259,10 +273,13 @@ def process_pr(pr: dict) -> bool:
     try:
         status = get_combined_status(sha)
     except ApiError as e:
-        print(f"::warning::PR #{num}: status fetch failed: {e}")
-        return True
+        print(f"::error::PR #{num}: status fetch failed: {e}")
+        return False
 
-    statuses = status.get("statuses") or []
+    statuses = status.get("statuses")
+    if not isinstance(statuses, list):
+        print(f"::error::PR #{num}: combined status missing 'statuses' array")
+        return False
     umbrella_entry = None
     subjob_states: dict[str, str] = {}
 
