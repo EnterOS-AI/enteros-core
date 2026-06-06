@@ -4,7 +4,8 @@
 Gitea 1.22.6+ has auto-merge (`pull_auto_merge`) but no GitHub-style merge
 queue. This script provides the missing serialized policy in user space:
 
-1. Pick the oldest open PR carrying QUEUE_LABEL (skipping HOLD_LABEL).
+1. Pick the oldest open same-repo PR that is NOT opted out (auto-discovery,
+   see below), skipping drafts.
 2. Refuse to act unless main's BP-required contexts are green.
 3. Refuse fork PRs; the queue may only mutate same-repo branches.
 4. If the PR branch does not contain current main, call Gitea's
@@ -28,6 +29,26 @@ Authoritative gates (fail-closed):
     missing-but-non-required governance contexts (required are green + genuine
     approvals present). It is NEVER used to bypass a failing REQUIRED context
     or missing approvals.
+
+Auto-discovery (opt-OUT, label-optional):
+  The queue is SELF-SUSTAINING — a ready PR does NOT need a human (or an agent)
+  to add the `merge-queue` label first. When AUTO_DISCOVER is on (default), the
+  queue enumerates ALL open same-repo PRs and considers any that meets the full
+  merge bar (genuine approvals on current head + BP-required green + mergeable +
+  no open REQUEST_CHANGES). The merge bar above is UNCHANGED; auto-discovery only
+  changes WHICH PRs are considered, not whether they are mergeable.
+
+  This deliberately removes the historical dependency on an agent adding the
+  `merge-queue` label — agent Gitea tokens lack `write:issue` (labels are
+  issue-scoped), so they could never self-label and the queue stalled. The label
+  is now OPTIONAL metadata, not a gate.
+
+  SAFETY is preserved as opt-OUT: any PR carrying an opt-out label
+  (OPT_OUT_LABELS — `merge-queue-hold`, `do-not-auto-merge`, `wip` by default) is
+  skipped (never auto-considered, never merged). Draft PRs (draft=true) are also
+  skipped. A human who wants to keep a PR out of autonomous merging just adds one
+  of those labels. Setting AUTO_DISCOVER=0 restores the legacy opt-IN behaviour
+  (only PRs already carrying QUEUE_LABEL are considered).
 
 Head-of-line (HOL) safety: a permanent permission/4xx merge error
 (403/404/405) HOLDS the PR (applies HOLD_LABEL) so the queue advances to the
@@ -68,6 +89,30 @@ WATCH_BRANCH = _env("WATCH_BRANCH", default="main")
 QUEUE_LABEL = _env("QUEUE_LABEL", default="merge-queue")
 HOLD_LABEL = _env("HOLD_LABEL", default="merge-queue-hold")
 UPDATE_STYLE = _env("UPDATE_STYLE", default="merge")
+# Auto-discovery (opt-OUT). When truthy (default), the queue considers ALL open
+# same-repo PRs that meet the merge bar, not only PRs already carrying
+# QUEUE_LABEL — so the queue is self-sustaining without any human/agent labeling
+# (agent tokens lack write:issue and cannot self-label). Set AUTO_DISCOVER=0 to
+# restore the legacy opt-IN behaviour (QUEUE_LABEL required to be considered).
+AUTO_DISCOVER = _env("AUTO_DISCOVER", default="1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+    "",
+}
+# Opt-OUT labels. A PR carrying ANY of these is skipped (never auto-considered,
+# never merged) — the human escape hatch from autonomous merging. HOLD_LABEL is
+# always included so the existing hold semantics keep working. `do-not-auto-merge`
+# and `wip` let a human keep a PR out of the auto-merge path without removing it.
+OPT_OUT_LABELS = {
+    name.strip()
+    for name in _env(
+        "OPT_OUT_LABELS",
+        default="do-not-auto-merge,wip",
+    ).split(",")
+    if name.strip()
+} | ({HOLD_LABEL} if HOLD_LABEL else set())
 REQUIRED_CONTEXTS_RAW = _env(
     "REQUIRED_CONTEXTS",
     default=(
@@ -410,6 +455,58 @@ def choose_next_queued_issue(
     return candidates[0] if candidates else None
 
 
+def _issue_is_draft(issue: dict) -> bool:
+    """True if the issue/PR is a draft.
+
+    The /issues listing exposes draft state under the `pull_request` sub-object
+    (`{"draft": true}`); some Gitea versions also surface a top-level `draft`.
+    Either is honoured. Drafts are never auto-considered for merging.
+    """
+    pr = issue.get("pull_request")
+    if isinstance(pr, dict) and pr.get("draft") is True:
+        return True
+    return issue.get("draft") is True
+
+
+def choose_next_candidate_issue(
+    issues: list[dict],
+    *,
+    queue_label: str,
+    opt_out_labels: set[str],
+    auto_discover: bool,
+) -> dict | None:
+    """Pick the oldest open PR eligible for a merge attempt this tick.
+
+    This is the auto-discovery selector. It does NOT change the merge bar — it
+    only changes WHICH PRs are considered:
+
+      - auto_discover=True (default): every open same-repo PR is a candidate,
+        EXCEPT those carrying an opt-out label or marked draft. The QUEUE_LABEL
+        is optional metadata, not a gate, so a ready PR reaches the queue with no
+        human/agent labeling (the write:issue gap is removed).
+      - auto_discover=False: legacy opt-IN — only PRs carrying queue_label are
+        candidates (still skipping opt-out labels and drafts).
+
+    Opt-out is the safety escape hatch: any opt_out_labels member present skips
+    the PR entirely (never considered, never merged). Selection is oldest-first
+    (created_at, then number) to preserve the serialized FIFO ordering.
+    """
+    candidates = []
+    for issue in issues:
+        if "pull_request" not in issue:
+            continue
+        labels = label_names(issue)
+        if opt_out_labels & labels:
+            continue  # opt-out: human kept this PR out of autonomous merging
+        if _issue_is_draft(issue):
+            continue  # drafts are never auto-merged
+        if not auto_discover and queue_label not in labels:
+            continue  # legacy opt-IN: require the queue label
+        candidates.append(issue)
+    candidates.sort(key=lambda issue: (issue.get("created_at") or "", int(issue["number"])))
+    return candidates[0] if candidates else None
+
+
 def pr_contains_base_sha(commits: list[dict], base_sha: str) -> bool:
     for commit in commits:
         sha = commit.get("sha") or commit.get("id")
@@ -577,6 +674,31 @@ def list_queued_issues() -> list[dict]:
     return body
 
 
+def list_candidate_issues(*, auto_discover: bool) -> list[dict]:
+    """Open PR issues eligible for consideration this tick.
+
+    With auto_discover=True (default) this enumerates ALL open PRs (no label
+    filter) so the queue is self-sustaining — a ready PR is considered without
+    any human/agent first adding QUEUE_LABEL. With auto_discover=False it falls
+    back to the legacy label-filtered listing (opt-IN). Opt-out filtering and
+    draft-skipping happen in choose_next_candidate_issue, not here.
+    """
+    if not auto_discover:
+        return list_queued_issues()
+    _, body = api(
+        "GET",
+        f"/repos/{OWNER}/{NAME}/issues",
+        query={
+            "state": "open",
+            "type": "pulls",
+            "limit": "50",
+        },
+    )
+    if not isinstance(body, list):
+        raise ApiError("candidate issues response not list")
+    return body
+
+
 def get_pull(pr_number: int) -> dict:
     _, body = api("GET", f"/repos/{OWNER}/{NAME}/pulls/{pr_number}")
     if not isinstance(body, dict):
@@ -731,19 +853,33 @@ def process_once(*, dry_run: bool = False) -> int:
         print(f"::notice::queue paused: {WATCH_BRANCH}@{main_sha[:8]} required contexts not green: {', '.join(main_bad)}")
         return 0
 
-    issue = choose_next_queued_issue(
-        list_queued_issues(),
+    issue = choose_next_candidate_issue(
+        list_candidate_issues(auto_discover=AUTO_DISCOVER),
         queue_label=QUEUE_LABEL,
-        hold_label=HOLD_LABEL,
+        opt_out_labels=OPT_OUT_LABELS,
+        auto_discover=AUTO_DISCOVER,
     )
     if not issue:
-        print("::notice::merge queue empty")
+        print(
+            "::notice::no merge candidates "
+            f"(auto_discover={'on' if AUTO_DISCOVER else 'off'})"
+        )
         return 0
 
     pr_number = int(issue["number"])
     pr = get_pull(pr_number)
     if pr.get("state") != "open":
         print(f"::notice::PR #{pr_number} is not open; skipping")
+        return 0
+    # Defensive opt-out/draft re-check on the authoritative pull payload: the
+    # /issues listing's label/draft view can lag, but the merge bar must respect
+    # the live pull state. (choose_next_candidate_issue already filtered on the
+    # listing; this guards against a stale listing racing a just-added opt-out.)
+    if OPT_OUT_LABELS & label_names(pr):
+        print(f"::notice::PR #{pr_number} carries an opt-out label; skipping")
+        return 0
+    if pr.get("draft") is True:
+        print(f"::notice::PR #{pr_number} is a draft; skipping")
         return 0
     if pr.get("base", {}).get("ref") != WATCH_BRANCH:
         post_comment(pr_number, f"merge-queue: skipped; base branch is not `{WATCH_BRANCH}`.", dry_run=dry_run)

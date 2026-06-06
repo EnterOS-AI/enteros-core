@@ -308,6 +308,8 @@ def test_process_once_holds_pr_on_permanent_merge_error(monkeypatch):
     monkeypatch.setattr(mq, "WATCH_BRANCH", "main")
     monkeypatch.setattr(mq, "QUEUE_LABEL", "merge-queue")
     monkeypatch.setattr(mq, "HOLD_LABEL", "merge-queue-hold")
+    monkeypatch.setattr(mq, "AUTO_DISCOVER", True)
+    monkeypatch.setattr(mq, "OPT_OUT_LABELS", {"merge-queue-hold", "do-not-auto-merge", "wip"})
     monkeypatch.setattr(mq, "REVIEWER_SET", REVIEWERS)
 
     monkeypatch.setattr(mq, "get_branch_protection", lambda branch: mq.BranchProtection(
@@ -324,7 +326,7 @@ def test_process_once_holds_pr_on_permanent_merge_error(monkeypatch):
         return {"state": "success", "statuses": [{"context": ctx, "status": "success"}]}
     monkeypatch.setattr(mq, "get_combined_status", fake_combined)
 
-    monkeypatch.setattr(mq, "list_queued_issues", lambda: [
+    monkeypatch.setattr(mq, "list_candidate_issues", lambda *, auto_discover: [
         {"number": 100, "pull_request": {}, "labels": [{"name": "merge-queue"}],
          "created_at": "2026-06-01T00:00:00Z"},
     ])
@@ -374,6 +376,8 @@ def _fully_ready_process_once_monkeypatch(monkeypatch, mergeable, calls):
     monkeypatch.setattr(mq, "WATCH_BRANCH", "main")
     monkeypatch.setattr(mq, "QUEUE_LABEL", "merge-queue")
     monkeypatch.setattr(mq, "HOLD_LABEL", "merge-queue-hold")
+    monkeypatch.setattr(mq, "AUTO_DISCOVER", True)
+    monkeypatch.setattr(mq, "OPT_OUT_LABELS", {"merge-queue-hold", "do-not-auto-merge", "wip"})
     monkeypatch.setattr(mq, "REVIEWER_SET", REVIEWERS)
     monkeypatch.setattr(mq, "get_branch_protection", lambda branch: mq.BranchProtection(
         required_contexts=["CI / all-required (pull_request)"],
@@ -389,7 +393,7 @@ def _fully_ready_process_once_monkeypatch(monkeypatch, mergeable, calls):
         return {"state": "success", "statuses": [{"context": ctx, "status": "success"}]}
     monkeypatch.setattr(mq, "get_combined_status", fake_combined)
 
-    monkeypatch.setattr(mq, "list_queued_issues", lambda: [
+    monkeypatch.setattr(mq, "list_candidate_issues", lambda *, auto_discover: [
         {"number": 102, "pull_request": {}, "labels": [{"name": "merge-queue"}],
          "created_at": "2026-06-01T00:00:00Z"},
     ])
@@ -484,6 +488,8 @@ def test_status_fetch_failure_is_fail_closed(monkeypatch):
     monkeypatch.setattr(mq, "WATCH_BRANCH", "main")
     monkeypatch.setattr(mq, "QUEUE_LABEL", "merge-queue")
     monkeypatch.setattr(mq, "HOLD_LABEL", "merge-queue-hold")
+    monkeypatch.setattr(mq, "AUTO_DISCOVER", True)
+    monkeypatch.setattr(mq, "OPT_OUT_LABELS", {"merge-queue-hold", "do-not-auto-merge", "wip"})
     monkeypatch.setattr(mq, "REVIEWER_SET", REVIEWERS)
     monkeypatch.setattr(mq, "get_branch_protection", lambda branch: mq.BranchProtection(
         required_contexts=["CI / all-required (pull_request)"],
@@ -501,7 +507,7 @@ def test_status_fetch_failure_is_fail_closed(monkeypatch):
         raise mq.ApiError("GET /commits/HEAD/status -> HTTP 502: bad gateway")
     monkeypatch.setattr(mq, "get_combined_status", fake_combined)
 
-    monkeypatch.setattr(mq, "list_queued_issues", lambda: [
+    monkeypatch.setattr(mq, "list_candidate_issues", lambda *, auto_discover: [
         {"number": 101, "pull_request": {}, "labels": [{"name": "merge-queue"}],
          "created_at": "2026-06-01T00:00:00Z"},
     ])
@@ -702,3 +708,323 @@ def test_queue_advances_past_held_conflicted_pr(monkeypatch):
     )
     assert selected is not None
     assert selected["number"] == 1500
+
+
+# --------------------------------------------------------------------------
+# §SOP-22: AUTO-DISCOVERY (opt-OUT, label-optional). The queue must be
+# self-sustaining — a ready PR is considered/merged with NO `merge-queue`
+# label, while opt-out labels (merge-queue-hold / do-not-auto-merge / wip) and
+# drafts are skipped. The merge bar (approvals/required-green/mergeable) is
+# unchanged; only candidate selection changes.
+# --------------------------------------------------------------------------
+
+OPT_OUT = {"merge-queue-hold", "do-not-auto-merge", "wip"}
+
+
+def _issue(number, labels, *, created="2026-06-01T00:00:00Z", draft=False, is_pr=True):
+    pr = {"draft": draft} if is_pr else None
+    out = {
+        "number": number,
+        "labels": [{"name": n} for n in labels],
+        "created_at": created,
+    }
+    if pr is not None:
+        out["pull_request"] = pr
+    return out
+
+
+def test_auto_discover_selects_unlabeled_ready_pr():
+    """A ready PR with NO merge-queue label is auto-considered (the autonomy fix:
+    agents cannot self-label because their token lacks write:issue)."""
+    issues = [_issue(50, labels=[])]  # no merge-queue label at all
+    selected = mq.choose_next_candidate_issue(
+        issues, queue_label="merge-queue", opt_out_labels=OPT_OUT, auto_discover=True
+    )
+    assert selected is not None
+    assert selected["number"] == 50
+
+
+def test_auto_discover_skips_opt_out_labels():
+    """Each opt-out label keeps a PR OUT of autonomous merging (the human escape
+    hatch). A PR carrying any of them is never selected even though it is open."""
+    for optout in OPT_OUT:
+        issues = [_issue(60, labels=[optout])]
+        selected = mq.choose_next_candidate_issue(
+            issues, queue_label="merge-queue", opt_out_labels=OPT_OUT, auto_discover=True
+        )
+        assert selected is None, f"{optout!r} should opt the PR out"
+
+
+def test_auto_discover_skips_opt_out_even_when_queue_labeled():
+    """An opt-out label beats the merge-queue label: a held/wip PR that also
+    carries merge-queue is still skipped."""
+    issues = [_issue(61, labels=["merge-queue", "wip"])]
+    selected = mq.choose_next_candidate_issue(
+        issues, queue_label="merge-queue", opt_out_labels=OPT_OUT, auto_discover=True
+    )
+    assert selected is None
+
+
+def test_auto_discover_skips_drafts():
+    issues = [_issue(62, labels=[], draft=True)]
+    selected = mq.choose_next_candidate_issue(
+        issues, queue_label="merge-queue", opt_out_labels=OPT_OUT, auto_discover=True
+    )
+    assert selected is None
+
+
+def test_auto_discover_skips_non_pull_issues():
+    """A plain issue (no pull_request key) is never a merge candidate."""
+    issues = [_issue(63, labels=[], is_pr=False)]
+    selected = mq.choose_next_candidate_issue(
+        issues, queue_label="merge-queue", opt_out_labels=OPT_OUT, auto_discover=True
+    )
+    assert selected is None
+
+
+def test_auto_discover_oldest_first_skipping_opt_out():
+    """Selection is FIFO (oldest created_at first), and the opt-out PR is passed
+    over for the next-oldest eligible PR."""
+    issues = [
+        _issue(70, labels=["do-not-auto-merge"], created="2026-06-01T01:00:00Z"),
+        _issue(71, labels=[], created="2026-06-01T02:00:00Z"),
+        _issue(72, labels=["merge-queue"], created="2026-06-01T03:00:00Z"),
+    ]
+    selected = mq.choose_next_candidate_issue(
+        issues, queue_label="merge-queue", opt_out_labels=OPT_OUT, auto_discover=True
+    )
+    assert selected["number"] == 71  # 70 opted out, 71 is next-oldest eligible
+
+
+def test_opt_in_mode_requires_queue_label():
+    """AUTO_DISCOVER off restores legacy opt-IN: only merge-queue-labeled PRs are
+    candidates; an unlabeled ready PR is NOT selected."""
+    issues = [
+        _issue(80, labels=[], created="2026-06-01T01:00:00Z"),
+        _issue(81, labels=["merge-queue"], created="2026-06-01T02:00:00Z"),
+    ]
+    selected = mq.choose_next_candidate_issue(
+        issues, queue_label="merge-queue", opt_out_labels=OPT_OUT, auto_discover=False
+    )
+    assert selected["number"] == 81
+
+
+def test_opt_in_mode_still_honours_opt_out():
+    """Even in opt-IN mode, an opt-out label on a queue-labeled PR skips it."""
+    issues = [_issue(82, labels=["merge-queue", "merge-queue-hold"])]
+    selected = mq.choose_next_candidate_issue(
+        issues, queue_label="merge-queue", opt_out_labels=OPT_OUT, auto_discover=False
+    )
+    assert selected is None
+
+
+def test_list_candidate_issues_omits_label_filter_when_auto_discover(monkeypatch):
+    """The auto-discovery listing must NOT pass a `labels` filter (so unlabeled
+    PRs are enumerated); the opt-IN listing must keep filtering by QUEUE_LABEL."""
+    captured = {}
+
+    def fake_api(method, path, *, query=None, **kw):
+        captured["query"] = dict(query or {})
+        return 200, []
+
+    monkeypatch.setattr(mq, "api", fake_api)
+    monkeypatch.setattr(mq, "QUEUE_LABEL", "merge-queue")
+
+    mq.list_candidate_issues(auto_discover=True)
+    assert "labels" not in captured["query"]
+    assert captured["query"].get("type") == "pulls"
+
+    mq.list_candidate_issues(auto_discover=False)
+    assert captured["query"].get("labels") == "merge-queue"
+
+
+def _wire_ready_process_once(monkeypatch, *, issues, pr_payload, calls):
+    """Wire process_once fully green EXCEPT candidate selection / pull payload,
+    which the caller supplies to exercise auto-discovery end-to-end."""
+    monkeypatch.setattr(mq, "OWNER", "molecule-ai")
+    monkeypatch.setattr(mq, "NAME", "molecule-core")
+    monkeypatch.setattr(mq, "WATCH_BRANCH", "main")
+    monkeypatch.setattr(mq, "QUEUE_LABEL", "merge-queue")
+    monkeypatch.setattr(mq, "HOLD_LABEL", "merge-queue-hold")
+    monkeypatch.setattr(mq, "AUTO_DISCOVER", True)
+    monkeypatch.setattr(mq, "OPT_OUT_LABELS", OPT_OUT)
+    monkeypatch.setattr(mq, "REVIEWER_SET", REVIEWERS)
+    monkeypatch.setattr(mq, "get_branch_protection", lambda branch: mq.BranchProtection(
+        required_contexts=["CI / all-required (pull_request)"],
+        required_approvals=2, block_on_rejected_reviews=True,
+    ))
+    main_sha = "b" * 40
+    head_sha = "a" * 40
+    monkeypatch.setattr(mq, "get_branch_head", lambda branch: main_sha)
+
+    def fake_combined(sha):
+        ctx = "CI / all-required (push)" if sha == main_sha else "CI / all-required (pull_request)"
+        return {"state": "success", "statuses": [{"context": ctx, "status": "success"}]}
+    monkeypatch.setattr(mq, "get_combined_status", fake_combined)
+    monkeypatch.setattr(mq, "list_candidate_issues", lambda *, auto_discover: issues)
+    monkeypatch.setattr(mq, "get_pull", lambda n: dict(pr_payload, number=n))
+    monkeypatch.setattr(mq, "get_pull_commits", lambda n: [{"sha": main_sha}, {"sha": head_sha}])
+    monkeypatch.setattr(mq, "get_pull_reviews", lambda n: [
+        {"state": "APPROVED", "user": {"login": "agent-researcher"},
+         "official": True, "stale": False, "dismissed": False, "commit_id": head_sha},
+        {"state": "APPROVED", "user": {"login": "agent-reviewer-cr2"},
+         "official": True, "stale": False, "dismissed": False, "commit_id": head_sha},
+    ])
+
+    def fake_merge(pr_number, *, dry_run, force=False):
+        calls["merged"] = pr_number
+    monkeypatch.setattr(mq, "merge_pull", fake_merge)
+    monkeypatch.setattr(mq, "update_pull", lambda *a, **k: calls.__setitem__("updated", True))
+    monkeypatch.setattr(mq, "post_comment", lambda *a, **k: None)
+    monkeypatch.setattr(mq, "add_label_by_name", lambda *a, **k: None)
+    return main_sha, head_sha
+
+
+def test_process_once_auto_merges_unlabeled_ready_pr(monkeypatch):
+    """End-to-end: a fully-ready PR with NO merge-queue label is auto-merged.
+    This is the core autonomy fix — no human/agent labeling required."""
+    calls = {"merged": None, "updated": False}
+    head_sha = "a" * 40
+    _wire_ready_process_once(
+        monkeypatch,
+        issues=[_issue(90, labels=[])],  # NO merge-queue label
+        pr_payload={
+            "state": "open", "mergeable": True, "draft": False,
+            "base": {"ref": "main", "repo_id": 1},
+            "head": {"sha": head_sha, "repo_id": 1},
+            "labels": [],
+        },
+        calls=calls,
+    )
+
+    rc = mq.process_once(dry_run=False)
+
+    assert rc == 0
+    assert calls["merged"] == 90  # merged despite no merge-queue label
+
+
+def test_process_once_skips_opt_out_labeled_pr(monkeypatch):
+    """A fully-ready PR carrying an opt-out label is NOT merged (skipped)."""
+    for optout in OPT_OUT:
+        calls = {"merged": None, "updated": False}
+        head_sha = "a" * 40
+        _wire_ready_process_once(
+            monkeypatch,
+            issues=[_issue(91, labels=[optout])],
+            pr_payload={
+                "state": "open", "mergeable": True, "draft": False,
+                "base": {"ref": "main", "repo_id": 1},
+                "head": {"sha": head_sha, "repo_id": 1},
+                "labels": [{"name": optout}],
+            },
+            calls=calls,
+        )
+        rc = mq.process_once(dry_run=False)
+        assert rc == 0
+        assert calls["merged"] is None, f"{optout!r} PR must not be merged"
+
+
+def test_process_once_does_not_merge_unapproved_pr(monkeypatch):
+    """A not-ready PR (only one genuine approval) is auto-considered but NOT
+    merged — auto-discovery does not lower the merge bar."""
+    calls = {"merged": None, "updated": False}
+    head_sha = "a" * 40
+    main_sha, _ = _wire_ready_process_once(
+        monkeypatch,
+        issues=[_issue(92, labels=[])],
+        pr_payload={
+            "state": "open", "mergeable": True, "draft": False,
+            "base": {"ref": "main", "repo_id": 1},
+            "head": {"sha": head_sha, "repo_id": 1},
+            "labels": [],
+        },
+        calls=calls,
+    )
+    # Only ONE genuine approval → below the required 2.
+    monkeypatch.setattr(mq, "get_pull_reviews", lambda n: [
+        {"state": "APPROVED", "user": {"login": "agent-researcher"},
+         "official": True, "stale": False, "dismissed": False, "commit_id": head_sha},
+    ])
+
+    rc = mq.process_once(dry_run=False)
+
+    assert rc == 0
+    assert calls["merged"] is None
+
+
+def test_process_once_does_not_merge_red_required_pr(monkeypatch):
+    """A not-ready PR (required context red) is auto-considered but NOT merged."""
+    calls = {"merged": None, "updated": False}
+    head_sha = "a" * 40
+    main_sha = "b" * 40
+    _wire_ready_process_once(
+        monkeypatch,
+        issues=[_issue(93, labels=[])],
+        pr_payload={
+            "state": "open", "mergeable": True, "draft": False,
+            "base": {"ref": "main", "repo_id": 1},
+            "head": {"sha": head_sha, "repo_id": 1},
+            "labels": [],
+        },
+        calls=calls,
+    )
+
+    # Required PR context is FAILURE; main stays green.
+    def fake_combined(sha):
+        if sha == main_sha:
+            return {"state": "success",
+                    "statuses": [{"context": "CI / all-required (push)", "status": "success"}]}
+        return {"state": "failure",
+                "statuses": [{"context": "CI / all-required (pull_request)", "status": "failure"}]}
+    monkeypatch.setattr(mq, "get_combined_status", fake_combined)
+
+    rc = mq.process_once(dry_run=False)
+
+    assert rc == 0
+    assert calls["merged"] is None
+
+
+def test_process_once_does_not_merge_unmergeable_pr(monkeypatch):
+    """A not-ready PR (mergeable False = conflicts) is auto-considered but NOT
+    merged."""
+    calls = {"merged": None, "updated": False}
+    head_sha = "a" * 40
+    _wire_ready_process_once(
+        monkeypatch,
+        issues=[_issue(94, labels=[])],
+        pr_payload={
+            "state": "open", "mergeable": False, "draft": False,
+            "base": {"ref": "main", "repo_id": 1},
+            "head": {"sha": head_sha, "repo_id": 1},
+            "labels": [],
+        },
+        calls=calls,
+    )
+
+    rc = mq.process_once(dry_run=False)
+
+    assert rc == 0
+    assert calls["merged"] is None
+
+
+def test_process_once_defensive_skip_when_pull_payload_opted_out(monkeypatch):
+    """If the listing missed an opt-out label but the authoritative pull payload
+    carries it (stale listing race), process_once must still skip the merge."""
+    calls = {"merged": None, "updated": False}
+    head_sha = "a" * 40
+    _wire_ready_process_once(
+        monkeypatch,
+        issues=[_issue(95, labels=[])],  # listing shows no opt-out
+        pr_payload={
+            "state": "open", "mergeable": True, "draft": False,
+            "base": {"ref": "main", "repo_id": 1},
+            "head": {"sha": head_sha, "repo_id": 1},
+            "labels": [{"name": "do-not-auto-merge"}],  # live pull is opted out
+        },
+        calls=calls,
+    )
+
+    rc = mq.process_once(dry_run=False)
+
+    assert rc == 0
+    assert calls["merged"] is None
