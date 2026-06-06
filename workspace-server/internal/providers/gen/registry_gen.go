@@ -16,7 +16,7 @@ const SchemaVersion = 1
 // Fingerprint is a stable content hash of the generated projection (schema
 // version + provider catalog + runtime native sets). It changes iff the
 // registry DATA changes (comment-only YAML edits do not churn it).
-const Fingerprint = "e457249eb0fd77a2"
+const Fingerprint = "9d129c96c9df9689"
 
 // GenProvider is the generated projection of one provider catalog entry —
 // the subset a downstream consumer needs to derive + display a provider.
@@ -56,7 +56,7 @@ var Providers = []GenProvider{
 	{Name: "kimi-coding", DisplayName: "Moonshot Kimi (coding-tuned)", Protocol: "anthropic", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"KIMI_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"}, ModelPrefixMatch: "^kimi-", IsPlatform: false},
 	{Name: "deepseek", DisplayName: "DeepSeek", Protocol: "anthropic", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"DEEPSEEK_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"}, ModelPrefixMatch: "^deepseek[-:/]", IsPlatform: false},
 	{Name: "google", DisplayName: "Google Gemini", Protocol: "openai", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"GEMINI_API_KEY", "GOOGLE_API_KEY"}, ModelPrefixMatch: "^gemini-", IsPlatform: false},
-	{Name: "vertex", DisplayName: "Google Vertex AI (keyless ADC)", Protocol: "openai", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"GOOGLE_APPLICATION_CREDENTIALS"}, ModelPrefixMatch: "^vertex:", IsPlatform: false},
+	{Name: "vertex", DisplayName: "Google Vertex AI (keyless ADC)", Protocol: "openai", AuthMode: "wif_adc", AuthEnv: []string{"GOOGLE_APPLICATION_CREDENTIALS"}, ModelPrefixMatch: "^vertex:", IsPlatform: false},
 	{Name: "alibaba", DisplayName: "Alibaba Qwen (DashScope)", Protocol: "openai", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"DASHSCOPE_API_KEY", "ALIBABA_API_KEY"}, ModelPrefixMatch: "(?i)^(qwen|alibaba[:/])", IsPlatform: false},
 	{Name: "nousresearch", DisplayName: "Nous Research (Hermes)", Protocol: "openai", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"NOUSRESEARCH_API_KEY"}, ModelPrefixMatch: "^nousresearch[:/]", IsPlatform: false},
 	{Name: "openrouter", DisplayName: "OpenRouter (any model)", Protocol: "openai", AuthMode: "third_party_anthropic_compat", AuthEnv: []string{"OPENROUTER_API_KEY"}, ModelPrefixMatch: "^openrouter[:/]", IsPlatform: false},
