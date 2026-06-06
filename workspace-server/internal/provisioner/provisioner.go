@@ -90,21 +90,29 @@ const (
 
 // WorkspaceConfig holds the parameters needed to provision a workspace container.
 type WorkspaceConfig struct {
-	WorkspaceID        string
-	TemplatePath       string            // Host path to template dir to copy from (e.g. claude-code-default/)
-	ConfigFiles        map[string][]byte // Generated config files to write into /configs volume
-	PluginsPath        string            // Host path to plugins directory (mounted at /plugins)
-	WorkspacePath      string            // Host path to bind-mount as /workspace (if empty, uses Docker named volume)
-	Tier               int
-	Runtime            string // "claude-code" (default), "codex", "hermes", "openclaw", etc.
-	InstanceType       string // Optional CP EC2 instance type override (SaaS only)
-	DiskGB             int32  // Optional CP root volume size override in GiB (SaaS only)
-	DataPersistence    string // internal#734: "persist"|"ephemeral"|"" — durable-data choice forwarded to CP (SaaS only)
-	Display            WorkspaceDisplayConfig
-	EnvVars            map[string]string // Additional env vars (API keys, etc.)
-	PlatformURL        string
-	WorkspaceAccess    string // #65: "none" (default), "read_only", or "read_write"
-	ResetClaudeSession bool   // #12: if true, discard the claude-sessions volume before start (fresh session dir)
+	WorkspaceID     string
+	TemplatePath    string            // Host path to template dir to copy from (e.g. claude-code-default/)
+	ConfigFiles     map[string][]byte // Generated config files to write into /configs volume
+	PluginsPath     string            // Host path to plugins directory (mounted at /plugins)
+	WorkspacePath   string            // Host path to bind-mount as /workspace (if empty, uses Docker named volume)
+	Tier            int
+	Runtime         string // "claude-code" (default), "codex", "hermes", "openclaw", etc.
+	InstanceType    string // Optional CP EC2 instance type override (SaaS only)
+	DiskGB          int32  // Optional CP root volume size override in GiB (SaaS only)
+	DataPersistence string // internal#734: "persist"|"ephemeral"|"" — durable-data choice forwarded to CP (SaaS only)
+	Provider        string // multi-provider RFC: ""/"aws"|"hetzner"|"gcp" compute backend for the workspace box (per-workspace; distinct from LLM/model provider). Forwarded to CP.
+	Display         WorkspaceDisplayConfig
+	EnvVars         map[string]string // Additional env vars (API keys, etc.)
+	PlatformURL     string
+
+	// WorkspaceSecretKeys are env keys authored via the workspace_secrets table
+	// (user/org-admin set, per-workspace). The Forensic #145 SCM-write-token
+	// guard EXEMPTS these from stripping: a workspace-scoped GITEA_TOKEN is the
+	// intended, legitimate delivery channel for that workspace's agent. Operator/
+	// persona-merged (global) SCM tokens are NOT in this set and stay stripped.
+	WorkspaceSecretKeys map[string]struct{}
+	WorkspaceAccess     string // #65: "none" (default), "read_only", or "read_write"
+	ResetClaudeSession  bool   // #12: if true, discard the claude-sessions volume before start (fresh session dir)
 
 	// Image, when non-empty, overrides the runtime→image lookup. CP
 	// (molecule-controlplane) is the single SSOT for runtime image digest
