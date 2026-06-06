@@ -144,18 +144,14 @@ debug "tier=$TIER"
 # as unachievable (would always fail) — operators notice the clear error
 # and create the missing team.
 #
-# Current Gitea teams: ceo, engineers, managers
-# Future teams (create before removing "???" fallback): qa, security, security-audit
+# Current Gitea teams: ceo, engineers, managers, qa, security
 declare -A TIER_EXPR=(
   # tier:low — same as previous OR gate: any engineer, manager, or ceo.
   ["tier:low"]="engineers,managers,ceo"
 
-  # tier:medium — AND of (managers) AND (engineers) AND (qa???,security???)
-  # The qa+security clause requires both teams to exist; when not yet
-  # created, the PR author is responsible for adding them before requesting
-  # approval on a tier:medium PR. Ops: create qa + security Gitea teams
-  # and update this map to remove the "???" markers (internal#189 follow-up).
-  ["tier:medium"]="managers AND engineers AND qa???,security???"
+  # tier:medium — AND of (managers) AND (engineers) AND (qa,security)
+  # ≥1 approver from managers AND ≥1 from engineers AND ≥1 from qa OR security.
+  ["tier:medium"]="managers AND engineers AND qa,security"
 
   # tier:high — ceo only. The AND-composition adds no value for a
   # single-team gate, but the framework is wired for consistency.
