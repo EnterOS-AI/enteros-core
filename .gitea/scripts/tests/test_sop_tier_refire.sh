@@ -246,21 +246,24 @@ assert_contains "T1 POST context is sop-tier-check / tier-check" \
   '"context": "sop-tier-check / tier-check (pull_request)"' "$POSTED"
 assert_contains "T1 description names commenter" "test-runner" "$POSTED"
 
-# T2: missing tier label → tier-check fails internally, but refire status
-# matches the canonical workflow's fail-open job conclusion.
+# T2: missing tier label → tier-check fails internally (mock exits 1).
+# FAIL-CLOSED contract (fix/core-ci-fail-closed): refire now captures the
+# REAL exit code and POSTs state=failure — it does NOT forge a green on
+# the required context. The refire job itself still exits 0 (it succeeded
+# at posting an honest failure status).
 run_scenario "T2_no_tier_label" "fail_no_label"
 RC=$(cat "$FIX_STATE_DIR/last_rc")
 POSTED=$(cat "$FIX_STATE_DIR/posted_statuses.jsonl" 2>/dev/null || true)
-assert_eq "T2 exit code 0 (canonical fail-open)" "0" "$RC"
-assert_contains "T2 POSTed state=success" '"state": "success"' "$POSTED"
+assert_eq "T2 exit code 0 (posted an honest status)" "0" "$RC"
+assert_contains "T2 POSTed state=failure (no forged green)" '"state": "failure"' "$POSTED"
 
-# T3: tier:low present but ZERO approving reviews → internal tier check fails,
-# refire status remains aligned with the canonical workflow.
+# T3: tier:low present but ZERO approving reviews → internal tier check
+# fails (mock exits 1). Refire POSTs state=failure, never a false green.
 run_scenario "T3_no_approvals" "fail_no_approvals"
 RC=$(cat "$FIX_STATE_DIR/last_rc")
 POSTED=$(cat "$FIX_STATE_DIR/posted_statuses.jsonl" 2>/dev/null || true)
-assert_eq "T3 exit code 0 (canonical fail-open)" "0" "$RC"
-assert_contains "T3 POSTed state=success" '"state": "success"' "$POSTED"
+assert_eq "T3 exit code 0 (posted an honest status)" "0" "$RC"
+assert_contains "T3 POSTed state=failure (no forged green)" '"state": "failure"' "$POSTED"
 
 # T4: closed PR — refire is a no-op (no POST, exit 0)
 run_scenario "T4_closed" "pass"
