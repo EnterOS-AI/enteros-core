@@ -17,7 +17,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"github.com/google/uuid"
 )
 
@@ -133,24 +133,30 @@ func loadRestartContextData(ctx context.Context, workspaceID string) restartCont
 	// message bus.
 	keySet := map[string]struct{}{}
 	if rows, err := db.DB.QueryContext(ctx, `SELECT key FROM global_secrets`); err == nil {
+		defer rows.Close()
 		for rows.Next() {
 			var k string
 			if rows.Scan(&k) == nil {
 				keySet[k] = struct{}{}
 			}
 		}
-		rows.Close()
+		if err := rows.Err(); err != nil {
+			log.Printf("loadRestartContextData: global_secrets rows.Err: %v", err)
+		}
 	}
 	if rows, err := db.DB.QueryContext(ctx,
 		`SELECT key FROM workspace_secrets WHERE workspace_id = $1`, workspaceID,
 	); err == nil {
+		defer rows.Close()
 		for rows.Next() {
 			var k string
 			if rows.Scan(&k) == nil {
 				keySet[k] = struct{}{}
 			}
 		}
-		rows.Close()
+		if err := rows.Err(); err != nil {
+			log.Printf("loadRestartContextData: workspace_secrets rows.Err: %v", err)
+		}
 	}
 	for k := range keySet {
 		d.EnvKeys = append(d.EnvKeys, k)
@@ -171,10 +177,50 @@ func waitForWorkspaceOnline(ctx context.Context, workspaceID string, timeout tim
 		).Scan(&status); err == nil && status == "online" {
 			return true
 		}
+		timer := time.NewTimer(restartContextOnlinePollInterval)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return false
-		case <-time.After(restartContextOnlinePollInterval):
+		case <-timer.C:
+		}
+	}
+	return false
+}
+
+// waitForFreshHeartbeat polls until the workspace has BOTH a non-empty
+// url AND a last_heartbeat_at strictly after restartStartTs (i.e. the
+// heartbeat we observe is NEW, not the stale pre-restart one carried
+// across through the row update). Returns false on timeout or DB error.
+//
+// This is the Layer 2 gate for the 2026-05-19 ws-server self-fire restart
+// loop fix. status='online' can flip while url='' is still in place (the
+// status update happens in /registry/register; url is set at the same
+// time but the read here may see a transient interleaving) and pre-fix
+// the trailing restart-context probe could fire against a half-registered
+// row, triggering the upstream-502 → maybeMarkContainerDead → self-fire
+// chain we're closing. The url + heartbeat-freshness check is the
+// strict, correlated end-state assertion that says "the new container is
+// actually addressable" — not just "some heartbeat happened".
+func waitForFreshHeartbeat(ctx context.Context, workspaceID string, restartStartTs time.Time, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		var url sql.NullString
+		var lastHB sql.NullTime
+		err := db.DB.QueryRowContext(ctx,
+			`SELECT url, last_heartbeat_at FROM workspaces WHERE id = $1`, workspaceID,
+		).Scan(&url, &lastHB)
+		if err == nil &&
+			url.Valid && url.String != "" &&
+			lastHB.Valid && lastHB.Time.After(restartStartTs) {
+			return true
+		}
+		timer := time.NewTimer(restartContextOnlinePollInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return false
+		case <-timer.C:
 		}
 	}
 	return false
@@ -218,6 +264,22 @@ func (h *WorkspaceHandler) sendRestartContext(workspaceID string, data restartCo
 
 	if !waitForWorkspaceOnline(ctx, workspaceID, restartContextOnlineTimeout) {
 		log.Printf("restart-context: workspace %s did not come online within %s — dropping context message", workspaceID, restartContextOnlineTimeout)
+		return
+	}
+	// Self-fire guard (Layer 2 of the 2026-05-19 ws-server self-fire fix):
+	// status='online' alone is not enough to safely fire the trailing
+	// ProxyA2ARequest. The workspace must also have:
+	//   - url != ''                            (the new container's URL has been registered)
+	//   - last_heartbeat_at > data.RestartAt   (the heartbeat we're seeing is NEW, not stale)
+	// Without those, ProxyA2ARequest can fail with a connect error or
+	// upstream 502, hit handleA2ADispatchError → maybeMarkContainerDead →
+	// RestartByID → self-fire. The Layer 1 isRestarting gate already
+	// covers that, but this is a belt-and-suspenders so the probe never
+	// even tries until the new container is actually addressable. Best-
+	// effort: if the DB read errors out we proceed (preserves the legacy
+	// behaviour of "online means online").
+	if !waitForFreshHeartbeat(ctx, workspaceID, data.RestartAt, restartContextOnlineTimeout) {
+		log.Printf("restart-context: workspace %s online but no fresh heartbeat or empty url — dropping context message (self-fire guard)", workspaceID)
 		return
 	}
 

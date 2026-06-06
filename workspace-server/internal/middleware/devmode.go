@@ -5,61 +5,53 @@ import (
 	"strings"
 )
 
-// Dev-mode escape hatch — factored out of AdminAuth + WorkspaceAuth so a
-// future third caller (or a change to what "dev mode" means) touches one
-// place. Narrowing the exposed seam also makes it grep-able from security
-// reviews: every `isDevModeFailOpen()` call is an intentional fail-open.
+// Local-dev environment detection.
 //
-// Why the helper exists at all: on `go run ./cmd/server` the Canvas (at
-// localhost:3000) calls the platform (at localhost:8080) cross-port. Both
-// `isSameOriginCanvas` (Referer==Host) and the AdminAuth Tier-1 fail-open
-// (no tokens in DB) close the moment the user creates their first
-// workspace. Without this hatch the Canvas 401s on every /workspaces
-// enumeration and every /workspaces/:id/* read until the operator sets
-// `ADMIN_TOKEN` and rebuilds the Canvas bundle with a matching
-// `NEXT_PUBLIC_ADMIN_TOKEN`. That's too much friction for a local smoke
-// test — hence the hatch.
+// SECURITY (harden/no-fail-open-auth): this file used to export an auth
+// escape hatch — `isDevModeFailOpen()` — that let AdminAuth, WorkspaceAuth,
+// and the discovery handler serve admin/workspace-protected endpoints with
+// NO bearer token whenever `ADMIN_TOKEN` was unset and `MOLECULE_ENV` was a
+// dev value. The CTO directive is "nothing should be fail-open": auth is now
+// fail-CLOSED in every environment, dev included. The hatch is GONE.
 //
-// Why it's safe for SaaS: hosted tenants are provisioned with both
-// `ADMIN_TOKEN` (a random secret, checked by Tier-2 above) and
-// `MOLECULE_ENV=production`. Either one being set makes this helper
-// return false, so the fail-open branch is unreachable in production.
-// The convention matches `handlers/admin_test_token.go`, which gates
-// the e2e test-token mint on `MOLECULE_ENV != "production"`.
+// What remains here is a NON-security predicate, `isLocalDevEnv()`, that
+// reports ONLY whether `MOLECULE_ENV` names a local-dev environment. It does
+// NOT consult `ADMIN_TOKEN` and it does NOT influence authentication. It is
+// used for two convenience/defense-in-depth knobs that never grant access:
+//
+//   - ratelimit.go: relax the per-caller request bucket on a single-user
+//     local stack (a DoS knob, not a credential — relaxing it cannot expose
+//     any protected data).
+//   - cmd/server resolveBindHost(): default the HTTP listener to loopback
+//     (127.0.0.1) in local dev. This is strictly *safer* than binding all
+//     interfaces and is unrelated to whether a request is authenticated.
+//
+// Local dev now stays AUTHENTICATED, not open: scripts/dev-start.sh
+// provisions a deterministic `ADMIN_TOKEN` and hands the matching
+// `NEXT_PUBLIC_ADMIN_TOKEN` to the Canvas, so the browser sends a real
+// bearer. See scripts/dev-start.sh and canvas/src/lib/api.ts.
 
 // devModeEnvValues is the set of MOLECULE_ENV values that count as
-// "explicit dev mode". Production callers don't set any of these.
+// "explicit local dev". Production callers don't set any of these.
 // Case-insensitive compare via strings.ToLower below.
 var devModeEnvValues = map[string]struct{}{
 	"development": {},
 	"dev":         {},
 }
 
-// isDevModeFailOpen reports whether the AdminAuth / WorkspaceAuth
-// middleware should let a bearer-less request through despite live
-// workspace tokens existing in the DB.
-//
-// True only when BOTH:
-//   - `ADMIN_TOKEN` is empty (operator has not opted in to the #684
-//     closure), AND
-//   - `MOLECULE_ENV` is explicitly a dev value ("development" / "dev").
-//
-// Either condition failing returns false — that's the SaaS safety
-// guarantee. Tests: `devmode_test.go` covers every branch.
-func isDevModeFailOpen() bool {
-	if os.Getenv("ADMIN_TOKEN") != "" {
-		return false
-	}
+// isLocalDevEnv reports whether MOLECULE_ENV names a local-dev environment
+// ("development" / "dev"). It carries NO authentication semantics — callers
+// must never use it to bypass a credential check. It exists only for
+// dev-convenience / defense-in-depth knobs (rate-limit relaxation, loopback
+// bind default) that cannot expose protected data.
+func isLocalDevEnv() bool {
 	env := strings.ToLower(strings.TrimSpace(os.Getenv("MOLECULE_ENV")))
 	_, ok := devModeEnvValues[env]
 	return ok
 }
 
-// IsDevModeFailOpen exposes isDevModeFailOpen to packages outside the
-// middleware module (handlers, discovery, etc.) so they can apply the
-// same Tier-1b escape hatch their sibling AdminAuth / WorkspaceAuth
-// already do. Keep every call site audit-tagged so security review can
-// grep them.
-func IsDevModeFailOpen() bool {
-	return isDevModeFailOpen()
+// IsLocalDevEnv exposes isLocalDevEnv to packages outside the middleware
+// module (cmd/server bind-host default). NON-security: see isLocalDevEnv.
+func IsLocalDevEnv() bool {
+	return isLocalDevEnv()
 }

@@ -11,13 +11,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
 
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
 	"github.com/DATA-DOG/go-sqlmock"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/models"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/provisioner"
 	"github.com/gin-gonic/gin"
 )
 
@@ -280,7 +281,7 @@ func TestProxyA2A_Upstream502_TriggersContainerDeadCheck(t *testing.T) {
 	mock.ExpectExec("INSERT INTO activity_logs").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	// maybeMarkContainerDead's runtime lookup, then the offline-flip UPDATE.
-	mock.ExpectQuery(`SELECT COALESCE\(runtime, 'langgraph'\) FROM workspaces WHERE id =`).
+	mock.ExpectQuery(`SELECT COALESCE\(runtime, 'claude-code'\) FROM workspaces WHERE id =`).
 		WithArgs("ws-tunnel-dead").
 		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("hermes"))
 	mock.ExpectExec(`UPDATE workspaces SET status =`).
@@ -340,7 +341,7 @@ func TestProxyA2A_Upstream502_AliveAgent_PropagatesAsIs(t *testing.T) {
 	expectBudgetCheck(mock, "ws-alive-502")
 	mock.ExpectExec("INSERT INTO activity_logs").WillReturnResult(sqlmock.NewResult(0, 1))
 	// IsRunning runtime lookup runs but no UPDATE follows (running=true).
-	mock.ExpectQuery(`SELECT COALESCE\(runtime, 'langgraph'\) FROM workspaces WHERE id =`).
+	mock.ExpectQuery(`SELECT COALESCE\(runtime, 'claude-code'\) FROM workspaces WHERE id =`).
 		WithArgs("ws-alive-502").
 		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("hermes"))
 
@@ -436,6 +437,10 @@ func TestProxyA2A_CallerIDPropagated(t *testing.T) {
 		WithArgs("ws-target").
 		WillReturnRows(sqlmock.NewRows([]string{"id", "parent_id"}).AddRow("ws-target", "ws-parent"))
 
+	// #1953 cross-tenant guard: same-org check after CanCommunicate. Both
+	// workspaces resolve to the same org root → routing allowed.
+	mockSameOrg(mock, "ws-caller", "ws-target", true)
+
 	expectBudgetCheck(mock, "ws-target")
 
 	// Expect activity log with source_id set
@@ -462,6 +467,24 @@ func TestProxyA2A_CallerIDPropagated(t *testing.T) {
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations: %v", err)
 	}
+}
+
+// mockSameOrg sets up the two org-root recursive-CTE expectations that the
+// #1953 cross-tenant guard in proxyA2ARequest runs after CanCommunicate passes.
+// sameOrg=true returns the SAME root_id for both caller and target (same tenant);
+// sameOrg=false returns different root_ids (cross-tenant → routing must be denied).
+func mockSameOrg(mock sqlmock.Sqlmock, caller, target string, sameOrg bool) {
+	callerRoot := "org-root-shared"
+	targetRoot := "org-root-shared"
+	if !sameOrg {
+		targetRoot = "org-root-other-tenant"
+	}
+	mock.ExpectQuery("WITH RECURSIVE org_chain AS").
+		WithArgs(caller).
+		WillReturnRows(sqlmock.NewRows([]string{"root_id"}).AddRow(callerRoot))
+	mock.ExpectQuery("WITH RECURSIVE org_chain AS").
+		WithArgs(target).
+		WillReturnRows(sqlmock.NewRows([]string{"root_id"}).AddRow(targetRoot))
 }
 
 // mockCanCommunicate sets up sqlmock expectations for CanCommunicate(caller, target).
@@ -657,6 +680,9 @@ func TestProxyA2A_CallerIDDerivedFromBearer(t *testing.T) {
 	mock.ExpectQuery("SELECT id, parent_id FROM workspaces WHERE id = ").
 		WithArgs("ws-target").
 		WillReturnRows(sqlmock.NewRows([]string{"id", "parent_id"}).AddRow("ws-target", "ws-parent"))
+
+	// 3b. #1953 cross-tenant guard — same org root → routing allowed.
+	mockSameOrg(mock, "ws-caller", "ws-target", true)
 
 	expectBudgetCheck(mock, "ws-target")
 
@@ -1112,8 +1138,12 @@ func TestValidateCallerToken_LegacyCallerGrandfathered(t *testing.T) {
 	c, _ := gin.CreateTestContext(w)
 	c.Request = httptest.NewRequest("POST", "/workspaces/x/a2a", bytes.NewBufferString("{}"))
 
-	if err := validateCallerToken(context.Background(), c, "ws-legacy"); err != nil {
+	isCanvasUser, err := validateCallerToken(context.Background(), c, "ws-legacy")
+	if err != nil {
 		t.Errorf("legacy caller should grandfather through; got %v", err)
+	}
+	if isCanvasUser {
+		t.Errorf("legacy caller should NOT be identified as canvas user")
 	}
 	if w.Code != 200 {
 		// gin default before c.JSON is 200; we want no error response written
@@ -1136,9 +1166,12 @@ func TestValidateCallerToken_MissingTokenWhenOnFile(t *testing.T) {
 	c.Request = httptest.NewRequest("POST", "/workspaces/x/a2a", bytes.NewBufferString("{}"))
 	// No Authorization header set
 
-	err := validateCallerToken(context.Background(), c, "ws-authed")
+	isCanvasUser, err := validateCallerToken(context.Background(), c, "ws-authed")
 	if err == nil {
 		t.Fatal("expected error for missing token")
+	}
+	if isCanvasUser {
+		t.Errorf("authed workspace with missing token should NOT be canvas user")
 	}
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("expected 401, got %d", w.Code)
@@ -1164,8 +1197,12 @@ func TestValidateCallerToken_InvalidToken(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer wrong")
 	c.Request = req
 
-	if err := validateCallerToken(context.Background(), c, "ws-authed"); err == nil {
+	isCanvasUser, err := validateCallerToken(context.Background(), c, "ws-authed")
+	if err == nil {
 		t.Fatal("expected error for bad token")
+	}
+	if isCanvasUser {
+		t.Errorf("authed workspace with bad token should NOT be canvas user")
 	}
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("expected 401, got %d", w.Code)
@@ -1192,8 +1229,12 @@ func TestValidateCallerToken_ValidToken(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer goodtok")
 	c.Request = req
 
-	if err := validateCallerToken(context.Background(), c, "ws-authed"); err != nil {
+	isCanvasUser, err := validateCallerToken(context.Background(), c, "ws-authed")
+	if err != nil {
 		t.Errorf("valid token should pass; got %v", err)
+	}
+	if isCanvasUser {
+		t.Errorf("authed workspace with valid token should NOT be canvas user")
 	}
 }
 
@@ -1216,11 +1257,81 @@ func TestValidateCallerToken_WrongWorkspaceBindingRejected(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer tok-for-A")
 	c.Request = req
 
-	if err := validateCallerToken(context.Background(), c, "ws-b-attacker"); err == nil {
+	isCanvasUser, err := validateCallerToken(context.Background(), c, "ws-b-attacker")
+	if err == nil {
 		t.Fatal("token from A must not authenticate caller B")
+	}
+	if isCanvasUser {
+		t.Errorf("cross-workspace token replay should NOT be identified as canvas user")
 	}
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("expected 401, got %d", w.Code)
+	}
+}
+
+func TestValidateCallerToken_CanvasUser_AdminToken(t *testing.T) {
+	setupTestDB(t)
+	setupTestRedis(t)
+
+	// #1673/#1944: the genuine-canvas-user check (admin bearer here) now runs
+	// BEFORE HasAnyLiveToken, so no SELECT COUNT(*) is issued — the human's
+	// credential, not the caller workspace's token state, decides canvas-user.
+
+	t.Setenv("ADMIN_TOKEN", "admin-secret-42")
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	req := httptest.NewRequest("POST", "/workspaces/x/a2a", bytes.NewBufferString("{}"))
+	req.Header.Set("Authorization", "Bearer admin-secret-42")
+	c.Request = req
+
+	isCanvasUser, err := validateCallerToken(context.Background(), c, "ws-canvas-admin")
+	if err != nil {
+		t.Errorf("admin token should identify canvas user; got error: %v", err)
+	}
+	if !isCanvasUser {
+		t.Errorf("admin token bearer should be identified as canvas user")
+	}
+	if w.Code != 200 || w.Body.Len() != 0 {
+		t.Errorf("admin token path should not write a response body; got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestValidateCallerToken_CanvasUser_OrgToken(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+
+	// #1673/#1944: the genuine-canvas-user check (org token here) now runs
+	// BEFORE HasAnyLiveToken, so the first DB query is orgtoken.Validate's
+	// lookup — there is no SELECT COUNT(*) expectation anymore.
+
+	// orgtoken.Validate lookup
+	mock.ExpectQuery(`SELECT id, prefix, org_id FROM org_api_tokens WHERE token_hash = .* AND revoked_at IS NULL`).
+		WithArgs(sqlmock.AnyArg()).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "prefix", "org_id"}).AddRow("orgtok-1", "pref1234", "org-1"))
+	mock.ExpectExec(`UPDATE org_api_tokens SET last_used_at`).
+		WithArgs("orgtok-1").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	req := httptest.NewRequest("POST", "/workspaces/x/a2a", bytes.NewBufferString("{}"))
+	req.Header.Set("Authorization", "Bearer org-token-plaintext-xyz")
+	c.Request = req
+
+	isCanvasUser, err := validateCallerToken(context.Background(), c, "ws-canvas-org")
+	if err != nil {
+		t.Errorf("org token should identify canvas user; got error: %v", err)
+	}
+	if !isCanvasUser {
+		t.Errorf("org token bearer should be identified as canvas user")
+	}
+	if w.Code != 200 || w.Body.Len() != 0 {
+		t.Errorf("org token path should not write a response body; got %d: %s", w.Code, w.Body.String())
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
 	}
 }
 
@@ -1403,6 +1514,142 @@ func TestNormalizeA2APayload_NoMessageNoCheck(t *testing.T) {
 	}
 }
 
+// --- #2251: role default + part-kind hygiene contract tests ---
+//
+// These assert normalizeA2APayload is the single canonical Go choke that
+// guarantees a schema-valid outbound message/send envelope: it injects a
+// default params.message.role="user" when the sender omitted role (the bug
+// that made delegate_task fail the peer's a2a Pydantic validator with
+// "params.message.role Field required" while reply_to_workspace worked), and
+// it renames the legacy Part discriminator "type"→"kind" for wire hygiene.
+
+// normMsg is a small helper that runs normalizeA2APayload and returns the
+// resolved params.message map, failing the test on any normalization error.
+func normMsg(t *testing.T, raw string) map[string]interface{} {
+	t.Helper()
+	out, _, perr := normalizeA2APayload([]byte(raw))
+	if perr != nil {
+		t.Fatalf("normalizeA2APayload returned error: %+v", perr)
+	}
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(out, &parsed); err != nil {
+		t.Fatalf("output not valid JSON: %v", err)
+	}
+	params, ok := parsed["params"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("output missing params object: %s", string(out))
+	}
+	msg, ok := params["message"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("output missing params.message object: %s", string(out))
+	}
+	return msg
+}
+
+func TestNormalizeA2APayload_DefaultsRoleWhenMissing(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+	}{
+		{
+			name: "v0.3 parts, no role",
+			raw:  `{"method":"message/send","params":{"message":{"parts":[{"kind":"text","text":"hi"}]}}}`,
+		},
+		{
+			name: "v0.2 string content, no role",
+			raw:  `{"method":"message/send","params":{"message":{"content":"hi"}}}`,
+		},
+		{
+			name: "legacy type part, no role",
+			raw:  `{"method":"message/send","params":{"message":{"parts":[{"type":"text","text":"hi"}]}}}`,
+		},
+		{
+			name: "already wrapped jsonrpc, no role",
+			raw:  `{"jsonrpc":"2.0","id":"x","method":"message/send","params":{"message":{"parts":[{"kind":"text","text":"hi"}]}}}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			msg := normMsg(t, tc.raw)
+			if msg["role"] != "user" {
+				t.Errorf("expected role defaulted to \"user\", got %v", msg["role"])
+			}
+			// Parts must remain valid (non-empty) after normalization.
+			parts, ok := msg["parts"].([]interface{})
+			if !ok || len(parts) == 0 {
+				t.Fatalf("expected non-empty parts after normalization, got %v", msg["parts"])
+			}
+			// Every part must carry the v0.3 "kind" discriminator.
+			for i, p := range parts {
+				part, ok := p.(map[string]interface{})
+				if !ok {
+					t.Fatalf("part %d is not an object: %v", i, p)
+				}
+				if _, hasKind := part["kind"]; !hasKind {
+					t.Errorf("part %d missing \"kind\" discriminator: %v", i, part)
+				}
+				if _, hasType := part["type"]; hasType {
+					t.Errorf("part %d still has legacy \"type\" key: %v", i, part)
+				}
+			}
+		})
+	}
+}
+
+func TestNormalizeA2APayload_PreservesExplicitRole(t *testing.T) {
+	// A caller-supplied role (e.g. "agent") must NOT be overwritten with "user".
+	msg := normMsg(t, `{"method":"message/send","params":{"message":{"role":"agent","parts":[{"kind":"text","text":"hi"}]}}}`)
+	if msg["role"] != "agent" {
+		t.Errorf("explicit role overwritten: expected \"agent\", got %v", msg["role"])
+	}
+}
+
+func TestNormalizeA2APayload_RenamesPartTypeToKind(t *testing.T) {
+	// Mirrors delegation.go's builder which emits {"type":"text",...}. After
+	// normalization the wire Part must be discriminated by "kind".
+	msg := normMsg(t, `{"method":"message/send","params":{"message":{"role":"user","parts":[{"type":"text","text":"a"},{"type":"file","uri":"workspace:/x"}]}}}`)
+	parts := msg["parts"].([]interface{})
+	if len(parts) != 2 {
+		t.Fatalf("expected 2 parts, got %d", len(parts))
+	}
+	wantKind := []string{"text", "file"}
+	for i, p := range parts {
+		part := p.(map[string]interface{})
+		if part["kind"] != wantKind[i] {
+			t.Errorf("part %d: expected kind=%q, got %v", i, wantKind[i], part["kind"])
+		}
+		if _, hasType := part["type"]; hasType {
+			t.Errorf("part %d still carries legacy \"type\": %v", i, part)
+		}
+	}
+}
+
+func TestNormalizeA2APayload_DoesNotClobberKindWithType(t *testing.T) {
+	// If a part has BOTH kind and type, kind wins and is left untouched.
+	msg := normMsg(t, `{"method":"message/send","params":{"message":{"role":"user","parts":[{"kind":"text","type":"ignored","text":"a"}]}}}`)
+	part := msg["parts"].([]interface{})[0].(map[string]interface{})
+	if part["kind"] != "text" {
+		t.Errorf("expected kind preserved as \"text\", got %v", part["kind"])
+	}
+}
+
+// TestNormalizeA2APayload_RoleDefault_ContractRegression documents the
+// pre-fix failure: without the role default, a role-less message/send body
+// emerged from normalization still missing params.message.role, which the
+// peer's a2a Pydantic validator rejects. This asserts the POST-fix invariant
+// (role present) directly; before the a2a_proxy.go change this assertion
+// fails (role is absent → msg["role"] == nil).
+func TestNormalizeA2APayload_RoleDefault_ContractRegression(t *testing.T) {
+	msg := normMsg(t, `{"method":"message/send","params":{"message":{"parts":[{"kind":"text","text":"delegate this"}]}}}`)
+	role, hasRole := msg["role"]
+	if !hasRole {
+		t.Fatal("REGRESSION (#2251): params.message.role absent after normalization — peer a2a validator will reject with 'role Field required'")
+	}
+	if role != "user" {
+		t.Errorf("expected default role \"user\", got %v", role)
+	}
+}
+
 // --- resolveAgentURL direct unit tests ---
 
 func TestResolveAgentURL_CacheHit(t *testing.T) {
@@ -1508,6 +1755,35 @@ func TestResolveAgentURL_DockerRewrite(t *testing.T) {
 	// nil provisioner → no rewrite
 	if url != "http://127.0.0.1:55555" {
 		t.Errorf("with nil provisioner, URL must not be rewritten; got %q", url)
+	}
+}
+
+func TestResolveAgentURL_ExternalRuntimeLoopbackNotRewrittenInDocker(t *testing.T) {
+	mock := setupTestDB(t)
+	mr := setupTestRedis(t)
+	allowLoopbackForTest(t)
+	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
+	waitForHandlerAsyncBeforeDBCleanup(t, handler)
+	handler.provisioner = &stubLocalProv{}
+
+	restore := setPlatformInDockerForTest(true)
+	defer restore()
+
+	agentURL := "http://127.0.0.1:55555"
+	mr.Set("ws:ws-external:url", agentURL)
+	mock.ExpectQuery("SELECT COALESCE\\(runtime").
+		WithArgs("ws-external").
+		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("external"))
+
+	url, perr := handler.resolveAgentURL(context.Background(), "ws-external")
+	if perr != nil {
+		t.Fatalf("unexpected error: %+v", perr)
+	}
+	if url != agentURL {
+		t.Errorf("external runtime loopback URL must not be rewritten; got %q want %q", url, agentURL)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
 	}
 }
 
@@ -1750,6 +2026,58 @@ func TestHandleA2ADispatchError_ContextDeadline(t *testing.T) {
 	}
 }
 
+func TestHandleA2ADispatchError_BusyEnqueueLogsQueuedNotFailure(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
+	waitForHandlerAsyncBeforeDBCleanup(t, handler)
+
+	mock.ExpectQuery(`INSERT INTO a2a_queue`).
+		WithArgs("ws-busy", nil, PriorityTask, "{}", "message/send", nil, nil).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("11111111-1111-1111-1111-111111111111"))
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM a2a_queue`).
+		WithArgs("ws-busy").
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+	mock.ExpectQuery(`SELECT name FROM workspaces WHERE id =`).
+		WithArgs("ws-busy").
+		WillReturnRows(sqlmock.NewRows([]string{"name"}).AddRow("Busy Target"))
+	mock.ExpectExec("INSERT INTO activity_logs").
+		WithArgs(
+			"ws-busy",
+			"a2a_receive",
+			nil,
+			sqlmock.AnyArg(),
+			sqlmock.AnyArg(),
+			sqlmock.AnyArg(),
+			sqlmock.AnyArg(),
+			nil,
+			nil,
+			sqlmock.AnyArg(),
+			"ok",
+			nil,
+		).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	status, body, perr := handler.handleA2ADispatchError(
+		context.Background(), "ws-busy", "", []byte("{}"), "message/send",
+		context.DeadlineExceeded, 180002, true,
+	)
+	if perr != nil {
+		t.Fatalf("expected busy enqueue success, got proxy error: %+v", perr)
+	}
+	if status != http.StatusAccepted {
+		t.Fatalf("got status %d, want 202", status)
+	}
+	if !bytes.Contains(body, []byte(`"queued":true`)) {
+		t.Fatalf("expected queued response body, got %s", string(body))
+	}
+
+	time.Sleep(80 * time.Millisecond)
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations; busy enqueue must log status=ok, not error: %v", err)
+	}
+}
+
 func TestHandleA2ADispatchError_BuildError(t *testing.T) {
 	setupTestDB(t)
 	setupTestRedis(t)
@@ -1786,9 +2114,9 @@ func TestMaybeMarkContainerDead_NilProvisioner(t *testing.T) {
 	setupTestRedis(t)
 	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
 
-	mock.ExpectQuery(`SELECT COALESCE\(runtime, 'langgraph'\) FROM workspaces WHERE id =`).
+	mock.ExpectQuery(`SELECT COALESCE\(runtime, 'claude-code'\) FROM workspaces WHERE id =`).
 		WithArgs("ws-nilprov").
-		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("langgraph"))
+		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("claude-code"))
 
 	if got := handler.maybeMarkContainerDead(context.Background(), "ws-nilprov"); got {
 		t.Error("expected false when provisioner is nil")
@@ -1809,7 +2137,7 @@ func TestMaybeMarkContainerDead_CPOnly_NotRunning(t *testing.T) {
 	cp := &fakeCPProv{running: false}
 	handler.SetCPProvisioner(cp)
 
-	mock.ExpectQuery(`SELECT COALESCE\(runtime, 'langgraph'\) FROM workspaces WHERE id =`).
+	mock.ExpectQuery(`SELECT COALESCE\(runtime, 'claude-code'\) FROM workspaces WHERE id =`).
 		WithArgs("ws-saas-dead").
 		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("hermes"))
 	mock.ExpectExec(`UPDATE workspaces SET status =`).
@@ -1838,7 +2166,7 @@ func TestMaybeMarkContainerDead_CPOnly_Running(t *testing.T) {
 	cp := &fakeCPProv{running: true}
 	handler.SetCPProvisioner(cp)
 
-	mock.ExpectQuery(`SELECT COALESCE\(runtime, 'langgraph'\) FROM workspaces WHERE id =`).
+	mock.ExpectQuery(`SELECT COALESCE\(runtime, 'claude-code'\) FROM workspaces WHERE id =`).
 		WithArgs("ws-saas-alive").
 		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("hermes"))
 
@@ -1925,6 +2253,10 @@ func (f *fakeCPProv) Stop(_ context.Context, _ string) error {
 	f.stopCalls++
 	return nil
 }
+func (f *fakeCPProv) StopAndPrune(_ context.Context, _ string) error {
+	f.stopCalls++
+	return nil
+}
 func (f *fakeCPProv) GetConsoleOutput(_ context.Context, _ string) (string, error) {
 	return "", nil
 }
@@ -1939,7 +2271,7 @@ func TestMaybeMarkContainerDead_ExternalRuntime(t *testing.T) {
 	setupTestRedis(t)
 	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
 
-	mock.ExpectQuery(`SELECT COALESCE\(runtime, 'langgraph'\) FROM workspaces WHERE id =`).
+	mock.ExpectQuery(`SELECT COALESCE\(runtime, 'claude-code'\) FROM workspaces WHERE id =`).
 		WithArgs("ws-ext").
 		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("external"))
 
@@ -2173,6 +2505,197 @@ func TestProxyA2A_PollMode_ShortCircuits_NoSSRF_NoDispatch(t *testing.T) {
 	}
 }
 
+// stubVerifiedCPSession points VerifiedCPSession at a stub control-plane that
+// confirms the given cookie belongs to a tenant-member, so tests can exercise
+// the genuine (non-forgeable) canvas-session path end-to-end without a live CP.
+// It sets CP_UPSTREAM_URL + MOLECULE_ORG_SLUG for the test's lifetime; the
+// real middleware.VerifiedCPSession HTTP+cache code path runs unchanged.
+func stubVerifiedCPSession(t *testing.T, member bool) {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if member {
+			fmt.Fprint(w, `{"member":true,"user_id":"user-canvas-1"}`)
+		} else {
+			w.WriteHeader(http.StatusForbidden)
+			fmt.Fprint(w, `{"member":false}`)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	t.Setenv("CP_UPSTREAM_URL", srv.URL)
+	t.Setenv("MOLECULE_ORG_SLUG", "test-tenant")
+}
+
+// TestProxyA2A_PollMode_CanvasUserWithVerifiedSession is the #1673 regression
+// guard. A poll-mode canvas-user identity workspace that HAS acquired live
+// tokens (the exact condition that made #1673 fire) sends a canvas message
+// carrying a control-plane-verified session cookie but no bearer token. The
+// fix must classify it as a canvas user BEFORE the HasAnyLiveToken peer-token
+// contract, so the request is queued (200) and logA2AReceiveQueued writes the
+// activity_logs row — instead of the pre-fix silent 401 that dropped the
+// message before any row landed (breaking canvas chat + chat-history).
+//
+// Runs in a subprocess with CANVAS_PROXY_URL set so middleware.canvasProxyActive
+// is true at package-init time (matching the combined-tenant image), proving the
+// fix does not depend on disabling same-origin detection.
+func TestProxyA2A_PollMode_CanvasUserWithVerifiedSession(t *testing.T) {
+	if os.Getenv("CANVAS_PROXY_URL") == "" {
+		cmd := exec.Command(os.Args[0], "-test.run=^TestProxyA2A_PollMode_CanvasUserWithVerifiedSession$", "-test.v")
+		cmd.Env = append(os.Environ(), "CANVAS_PROXY_URL=http://localhost")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("subprocess test failed: %v\n%s", err, out)
+		}
+		return
+	}
+
+	stubVerifiedCPSession(t, true)
+
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+
+	const wsTarget = "ws-poll-canvas-target"
+	const wsCanvasUser = "ws-canvas-user-344a"
+
+	// CRUCIAL: no SELECT COUNT(*) FROM workspace_auth_tokens expectation. The
+	// genuine-canvas-user check (verified session) must short-circuit BEFORE
+	// HasAnyLiveToken — that is the #1673 regression path. An identity
+	// workspace that already holds live tokens must NOT fall into the
+	// hasLive=true bearer-required branch.
+
+	// isCanvasUser=true → CanCommunicate is skipped (no parent_id lookups).
+	expectBudgetCheck(mock, wsTarget)
+	mock.ExpectQuery("SELECT delivery_mode FROM workspaces WHERE id").
+		WithArgs(wsTarget).
+		WillReturnRows(sqlmock.NewRows([]string{"delivery_mode"}).AddRow("poll"))
+	// logA2AReceiveQueued must fire synchronously and write the row.
+	mock.ExpectExec("INSERT INTO activity_logs").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: wsTarget}}
+
+	body := `{"jsonrpc":"2.0","id":"canvas-1","method":"message/send","params":{"message":{"role":"user","parts":[{"text":"hello from canvas"}]}}}`
+	req := httptest.NewRequest("POST", "/workspaces/"+wsTarget+"/a2a", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Workspace-ID", wsCanvasUser)
+	// Verified canvas session cookie (the genuine, non-forgeable signal).
+	req.Header.Set("Cookie", "wos-session=valid-canvas-session-cookie")
+	// Same-origin headers, present as a real canvas request would send them —
+	// but they are NOT what authorizes the bypass here (the verified session is).
+	req.Host = "localhost"
+	req.Header.Set("Referer", "https://localhost/")
+	c.Request = req
+
+	handler.ProxyA2A(c)
+
+	time.Sleep(50 * time.Millisecond)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 (queued) for canvas-user with verified session, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("response is not valid JSON: %v", err)
+	}
+	if resp["status"] != "queued" {
+		t.Errorf("response.status = %v, want %q", resp["status"], "queued")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations (activity_logs row must be written): %v", err)
+	}
+}
+
+// TestProxyA2A_ForgedSameOrigin_CannotBypassCanCommunicate is the security
+// crux of the #1673 fix and the reason PR #1944 was held. In the combined-
+// tenant SaaS image (CANVAS_PROXY_URL set, CP session verification configured),
+// an attacker forges a same-origin request — correct Host + a matching
+// `Referer: https://<host>/` — and supplies an arbitrary X-Workspace-ID naming
+// a workspace it does not control, targeting a workspace it is NOT authorized
+// to reach. It presents NO verified session cookie, NO admin token, NO org
+// token.
+//
+// PR #1944's same-origin bypass would have classified this as a canvas user and
+// skipped CanCommunicate, granting cross-workspace A2A — a privilege
+// escalation. The safe fix must instead fall through to the standard
+// peer-token contract and CanCommunicate, which rejects the cross-hierarchy
+// call with 403. This test proves the escalation is closed.
+func TestProxyA2A_ForgedSameOrigin_CannotBypassCanCommunicate(t *testing.T) {
+	if os.Getenv("CANVAS_PROXY_URL") == "" {
+		cmd := exec.Command(os.Args[0], "-test.run=^TestProxyA2A_ForgedSameOrigin_CannotBypassCanCommunicate$", "-test.v")
+		cmd.Env = append(os.Environ(), "CANVAS_PROXY_URL=http://localhost")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("subprocess test failed: %v\n%s", err, out)
+		}
+		return
+	}
+
+	// SaaS image with CP session verification configured. The stub CP rejects
+	// any cookie as a non-member; the attacker sends none anyway. This asserts
+	// that with verification configured, same-origin alone is NOT a canvas
+	// signal (CPSessionConfigured()==true disables the dev fallback).
+	stubVerifiedCPSession(t, false)
+
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+
+	const wsTarget = "ws-victim-target"
+	const wsForgedCaller = "ws-attacker-caller"
+
+	// validateCallerToken: not a genuine canvas user (no verified session, no
+	// admin/org token, and the dev same-origin fallback is disabled in SaaS).
+	// So it consults the peer-token contract: HasAnyLiveToken for the forged
+	// caller. Return 0 → tokenless legacy peer → grandfathered through token
+	// validation (isCanvasUser stays false). The request must then still be
+	// gated by CanCommunicate.
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM workspace_auth_tokens`).
+		WithArgs(wsForgedCaller).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+
+	// CanCommunicate MUST run (the escalation guard) and DENY: caller and
+	// target sit under different parents.
+	mockCanCommunicate(mock, wsForgedCaller, wsTarget, false)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: wsTarget}}
+
+	body := `{"jsonrpc":"2.0","id":"exploit-1","method":"message/send","params":{"message":{"role":"user","parts":[{"text":"cross-workspace exploit"}]}}}`
+	req := httptest.NewRequest("POST", "/workspaces/"+wsTarget+"/a2a", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	// Arbitrary caller workspace the attacker does not own.
+	req.Header.Set("X-Workspace-ID", wsForgedCaller)
+	// Forged same-origin signals (the #1944 bypass vector).
+	req.Host = "localhost"
+	req.Header.Set("Referer", "https://localhost/")
+	req.Header.Set("Origin", "https://localhost")
+	// No Cookie / Authorization — no genuine canvas credential.
+	c.Request = req
+
+	handler.ProxyA2A(c)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("ESCALATION NOT CLOSED: forged same-origin + arbitrary X-Workspace-ID "+
+			"reached an unauthorized target with status %d (want 403): %s", w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("body not JSON: %v", err)
+	}
+	if !strings.Contains(fmt.Sprint(resp["error"]), "access denied") {
+		t.Errorf("expected an access-denied error from CanCommunicate, got %v", resp["error"])
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations — CanCommunicate must have been consulted: %v", err)
+	}
+}
+
 // TestProxyA2A_PushMode_NoShortCircuit verifies the symmetric contract:
 // a push-mode workspace (default) is NOT affected by the new short-circuit.
 // It still proceeds to resolveAgentURL + dispatch. Without this guard, a
@@ -2235,12 +2758,18 @@ func TestProxyA2A_PushMode_NoShortCircuit(t *testing.T) {
 	}
 }
 
-// TestProxyA2A_PollMode_FailsClosedToPush verifies the safety contract:
-// a DB error reading delivery_mode must default to push (the existing
-// behavior), NOT poll. Failing to push means a poll-mode workspace
-// briefly attempts a real dispatch — visible failure (502 / SSRF
-// rejection / restart cascade), not a silent drop into activity_logs
-// where the agent might never look. Loud > silent, recoverable > lost.
+// TestProxyA2A_PollMode_FailsClosedToPush verifies the LEGACY safety
+// contract is PRESERVED for non-context DB errors: a generic DB error
+// reading delivery_mode still defaults to push (today's behavior), NOT
+// poll. Failing to push means a poll-mode workspace briefly attempts a
+// real dispatch — visible failure (502 / SSRF rejection / restart
+// cascade), not a silent drop into activity_logs where the agent might
+// never look. Loud > silent, recoverable > lost.
+//
+// internal#497 narrows the fail-closed change to *context* errors only
+// (the actual ce2db75f regression vector); generic DB errors keep this
+// long-standing fail-open-to-push contract. The ctx-error fail-closed is
+// covered by TestLookupDeliveryMode_ContextCanceled_FailsClosed.
 func TestProxyA2A_PollMode_FailsClosedToPush(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t) // empty Redis — forces resolveAgentURL DB lookup
@@ -2251,7 +2780,8 @@ func TestProxyA2A_PollMode_FailsClosedToPush(t *testing.T) {
 
 	expectBudgetCheck(mock, wsID)
 
-	// lookupDeliveryMode hits a transient DB error → must default push.
+	// lookupDeliveryMode hits a generic (non-context) DB error → must
+	// still default push (legacy contract preserved by internal#497).
 	mock.ExpectQuery("SELECT delivery_mode FROM workspaces WHERE id").
 		WithArgs(wsID).
 		WillReturnError(sql.ErrConnDone)
@@ -2275,7 +2805,7 @@ func TestProxyA2A_PollMode_FailsClosedToPush(t *testing.T) {
 		var resp map[string]interface{}
 		_ = json.Unmarshal(w.Body.Bytes(), &resp)
 		if resp["status"] == "queued" {
-			t.Errorf("DB error on delivery_mode lookup silently queued the request — must fail-closed-to-push, got body: %s", w.Body.String())
+			t.Errorf("generic DB error on delivery_mode lookup silently queued the request — must fail-open-to-push, got body: %s", w.Body.String())
 		}
 	}
 
@@ -2284,10 +2814,41 @@ func TestProxyA2A_PollMode_FailsClosedToPush(t *testing.T) {
 	}
 }
 
+// TestLookupDeliveryMode_ContextCanceled_FailsClosed is the internal#497
+// regression test for the SECONDARY defect. It pins the exact invariant
+// that hid the ce2db75f regression for 5 days: when the delivery_mode read
+// fails because the context was cancelled (precisely what happened in the
+// detached delegation goroutine running on a returned request context),
+// lookupDeliveryMode MUST return an error and MUST NOT silently return
+// "push". Returning push there is what skipped the poll-mode short-circuit
+// and silently dropped 100% of poll-mode peer deliveries.
+//
+// A pre-cancelled context makes QueryRowContext fail with
+// context.Canceled deterministically — no DB rows are mocked because the
+// query never reaches a result.
+func TestLookupDeliveryMode_ContextCanceled_FailsClosed(t *testing.T) {
+	mock := setupTestDB(t)
+	// The query fails on the cancelled ctx before matching; provide a
+	// permissive expectation so sqlmock doesn't complain about the attempt.
+	mock.ExpectQuery("SELECT delivery_mode FROM workspaces WHERE id").
+		WillReturnError(context.Canceled)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // simulate the HTTP handler having returned (request ctx dead)
+
+	mode, err := lookupDeliveryMode(ctx, "ws-poll-peer")
+	if err == nil {
+		t.Fatalf("internal#497 regression: lookupDeliveryMode swallowed a context error and returned mode=%q with nil err — this is the exact 5-day silent-misrouting vector", mode)
+	}
+	if mode == models.DeliveryModePush {
+		t.Errorf("internal#497 regression: context error must NOT default to push (got mode=%q)", mode)
+	}
+}
+
 // ==================== a2aClient ResponseHeaderTimeout config ====================
 
 func TestA2AClientResponseHeaderTimeout(t *testing.T) {
-	const defaultTimeout = 180 * time.Second
+	const defaultTimeout = 5 * time.Minute
 
 	// Default (unset env) — a2aClient was initialised at package load time.
 	if a2aClient.Transport.(*http.Transport).ResponseHeaderTimeout != defaultTimeout {
@@ -2311,7 +2872,7 @@ func TestA2AClientResponseHeaderTimeout(t *testing.T) {
 	t.Run("invalid A2A_PROXY_RESPONSE_HEADER_TIMEOUT falls back to default", func(t *testing.T) {
 		t.Setenv("A2A_PROXY_RESPONSE_HEADER_TIMEOUT", "not-a-duration")
 		// Simulate what envx.Duration does with an invalid value.
-		var fallback = 180 * time.Second
+		var fallback = 5 * time.Minute
 		override := fallback
 		if v := os.Getenv("A2A_PROXY_RESPONSE_HEADER_TIMEOUT"); v != "" {
 			if d, err := time.ParseDuration(v); err == nil && d > 0 {

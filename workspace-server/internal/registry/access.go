@@ -4,7 +4,7 @@ import (
 	"database/sql"
 	"log"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 )
 
 // maxAncestorWalk caps the depth of the parent-chain walk in
@@ -99,11 +99,6 @@ func CanCommunicate(callerID, targetID string) bool {
 		*caller.ParentID == *target.ParentID {
 		return true
 	}
-	// Root-level siblings — both have no parent
-	if caller.ParentID == nil && target.ParentID == nil {
-		return true
-	}
-
 	// Direct parent → child (fast path; avoids the ancestor walk)
 	if target.ParentID != nil && caller.ID == *target.ParentID {
 		return true

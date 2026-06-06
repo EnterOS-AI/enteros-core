@@ -32,7 +32,7 @@ func TestMissingRequiredEnv_NoRequiredEnvInYaml(t *testing.T) {
 	// intentionally omitted for auto-generated configs).
 	yml := `
 name: example
-runtime: langgraph
+runtime: claude-code
 runtime_config:
   timeout: 0
 `

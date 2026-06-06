@@ -15,8 +15,8 @@ import (
 	"net/http"
 	"os"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/plugins"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/plugins"
 	"github.com/gin-gonic/gin"
 )
 
@@ -189,13 +189,16 @@ func (h *AdminPluginDriftHandler) Apply(c *gin.Context) {
 	// at construction. Trigger it asynchronously so the HTTP response returns
 	// immediately after the install; the restart is best-effort.
 	if h.pluginsHandler != nil {
-		go func() {
+		// RFC internal#524 Layer 1: globalGoAsync so the detached restart
+		// is drained before db.DB swap (see workspace.go:globalGoAsync).
+		wsID := entry.WorkspaceID
+		globalGoAsync(func() {
 			// We can't use result.PluginName as a restart key since the
 			// restartFunc takes a workspaceID. Pass the workspaceID.
 			if restart := h.pluginsHandler.GetRestartFunc(); restart != nil {
-				restart(entry.WorkspaceID)
+				restart(wsID)
 			}
-		}()
+		})
 	}
 
 	log.Printf("AdminPluginDrift: applied drift update for %s/%s (queue_id=%s)",

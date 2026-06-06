@@ -36,7 +36,8 @@ Daily scheduled run + workflow_dispatch:
 
   1. GET `branch_protections/{BRANCH}` (needs DRIFT_BOT_TOKEN with
      repo-admin scope; same persona as ci-required-drift.yml).
-     Graceful-degrade on 403/404 per Tier 2a contract.
+     FAIL CLOSED on 401/403 (auth failure → exit 2); a genuine
+     authenticated 404 (no protection) is a loud ::warning:: skip.
 
   2. Walk `.gitea/workflows/*.yml` via PyYAML AST. For each workflow,
      enumerate its emitted contexts: `{workflow.name} / {job.name or
@@ -59,10 +60,14 @@ Daily scheduled run + workflow_dispatch:
 
 Exit codes
 ----------
-  0 — clean OR API 403/404 (graceful-degrade, surfaces ::error::).
+  0 — clean, OR an authenticated 404 (branch genuinely has no
+      protection — surfaces ::warning::, not a fail-open).
   1 — at least one BP context has no emitter.
-  2 — env contract violation, workflows-dir missing, or YAML parse
-      error.
+  2 — env contract violation, workflows-dir missing, YAML parse
+      error, OR a fail-closed verification failure: 401/403 auth
+      failure (token can't read BP) or transient/unexpected API
+      error. This is a HARD gate on a protected context (schedule/
+      dispatch on main) — it MUST NOT green when it cannot verify.
 
 Env
 ---
@@ -283,7 +288,7 @@ def _ensure_labels(repo: str, names: list[str]) -> list[int]:
     if status != "ok" or not isinstance(labels, list):
         return []
     out: list[int] = []
-    by_name = {l["name"]: l["id"] for l in labels if isinstance(l, dict)}
+    by_name = {label["name"]: label["id"] for label in labels if isinstance(label, dict)}
     for n in names:
         if n in by_name:
             out.append(by_name[n])
@@ -394,28 +399,49 @@ def run() -> int:
         return 2
 
     # 1. Pull BP.
+    #
+    # FAIL-CLOSED contract (was fail-open with exit 0 — fixed). This lint
+    # is a HARD gate (continue-on-error: false) and only ever runs on a
+    # PROTECTED context: schedule + workflow_dispatch on `main`. There is
+    # NO fork/advisory split here — the DRIFT_BOT_TOKEN secret is always
+    # present and trusted, so an auth failure or transient error is a real
+    # inability-to-verify, not a legitimate degradation. We MUST fail loud
+    # (`::error::` + nonzero) rather than green a gate we could not check.
     status, bp = api("GET", f"/repos/{repo}/branch_protections/{branch}")
     if status == "forbidden":
         sys.stderr.write(
-            f"::error::GET branch_protections/{branch} returned HTTP 403 — "
-            f"DRIFT_BOT_TOKEN lacks repo-admin scope (Gitea 1.22.6 requires "
-            f"it for this endpoint). Skipping lint with exit 0 to avoid "
-            f"red-X on every run. Fix: grant repo-admin to mc-drift-bot. "
-            f"Per Tier 2a contract.\n"
+            f"::error::GET branch_protections/{branch} returned HTTP "
+            f"401/403 — DRIFT_BOT_TOKEN cannot read branch protections "
+            f"(needs repo-admin scope; Gitea requires it for this "
+            f"endpoint). This is an AUTH FAILURE, not an absent resource: "
+            f"the lint CANNOT verify the BP↔emitter invariant, so it FAILS "
+            f"CLOSED instead of greening a gate it could not check. Fix: "
+            f"grant repo-admin to mc-drift-bot (org team `drift-bot`, "
+            f"perm=admin) — fix the token, not the lint.\n"
         )
-        return 0
+        return 2
     if status == "not_found":
+        # Genuine 404 WITH a valid token = branch has no protection
+        # configured. On `main` this is itself suspicious (main should
+        # always be protected) but it is a real, authenticated read of an
+        # absent resource — not an auth failure — so we surface it loudly
+        # but do not hard-fail on the genuinely-absent case.
         print(
-            f"::notice::branch '{branch}' has no protection configured; "
-            f"nothing to lint."
+            f"::warning::branch '{branch}' has no protection configured "
+            f"(authenticated 404); nothing to lint. If '{branch}' SHOULD be "
+            f"protected, this is a real finding — configure branch "
+            f"protection."
         )
         return 0
     if status != "ok" or not isinstance(bp, dict):
         sys.stderr.write(
-            f"::error::branch_protections/{branch} response unexpected; "
-            f"status={status}. Treating as transient; exit 0.\n"
+            f"::error::branch_protections/{branch} read failed with "
+            f"status={status} (transient/unexpected). The lint CANNOT "
+            f"verify the BP↔emitter invariant on this run; FAILING CLOSED "
+            f"rather than greening unverified. Re-run; if it persists, "
+            f"investigate Gitea API health / token validity.\n"
         )
-        return 0
+        return 2
 
     bp_contexts: list[str] = list(bp.get("status_check_contexts") or [])
     if not bp_contexts:

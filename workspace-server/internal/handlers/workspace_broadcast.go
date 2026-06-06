@@ -27,8 +27,8 @@ import (
 	"net/http"
 	"strconv"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/events"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
 	"github.com/gin-gonic/gin"
 )
 
@@ -85,15 +85,15 @@ func (h *BroadcastHandler) Broadcast(c *gin.Context) {
 	var orgRootID string
 	err = db.DB.QueryRowContext(ctx, `
 		WITH RECURSIVE org_chain AS (
-			SELECT id, parent_id, id AS root_id
+			SELECT id, parent_id
 			FROM workspaces
 			WHERE id = $1
 			UNION ALL
-			SELECT w.id, w.parent_id, c.root_id
+			SELECT w.id, w.parent_id
 			FROM workspaces w
 			JOIN org_chain c ON w.id = c.parent_id
 		)
-		SELECT root_id FROM org_chain WHERE parent_id IS NULL LIMIT 1
+		SELECT id AS root_id FROM org_chain WHERE parent_id IS NULL LIMIT 1
 	`, senderID).Scan(&orgRootID)
 	if err != nil {
 		log.Printf("Broadcast: org root lookup for %s: %v", senderID, err)

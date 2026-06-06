@@ -18,15 +18,24 @@
 # per §SOP-6 security model). No-op when merged=false.
 #
 # Required env (set by the workflow):
-#   GITEA_TOKEN, GITEA_HOST, REPO, PR_NUMBER, REQUIRED_CHECKS
+#   GITEA_TOKEN, GITEA_HOST, REPO, PR_NUMBER
+#   plus one of REQUIRED_CHECKS_JSON (preferred) or REQUIRED_CHECKS (legacy)
 #
-# REQUIRED_CHECKS is a newline-separated list of status-check context
-# names that branch protection requires. Declared in the workflow YAML
-# rather than fetched from /branch_protections (which needs admin
-# scope — sop-tier-bot has read-only). Trade dynamism for simplicity:
-# when the required-check set changes, update both branch protection
-# AND this env. Keeping them in sync is less complexity than granting
-# the audit bot admin perms on every repo.
+# REQUIRED_CHECKS_JSON is a JSON object keyed by branch name. Each value
+# is an array of status-check context names that branch protection
+# requires for that branch. The script looks up the PR's base branch and
+# evaluates only the checks declared for that branch.
+#
+#   {"main": ["CI / all-required (pull_request)", ...],
+#    "staging": ["CI / all-required (pull_request)", ...]}
+#
+# REQUIRED_CHECKS (legacy) is a newline-separated list used when the
+# JSON variable is not set. Declared in the workflow YAML rather than
+# fetched from /branch_protections (which needs admin scope — sop-tier-bot
+# has read-only). Trade dynamism for simplicity: when the required-check
+# set changes, update both branch protection AND this env. Keeping them
+# in sync is less complexity than granting the audit bot admin perms on
+# every repo.
 
 set -euo pipefail
 
@@ -34,7 +43,10 @@ set -euo pipefail
 : "${GITEA_HOST:?required}"
 : "${REPO:?required}"
 : "${PR_NUMBER:?required}"
-: "${REQUIRED_CHECKS:?required (newline-separated context names)}"
+if [ -z "${REQUIRED_CHECKS_JSON:-}" ] && [ -z "${REQUIRED_CHECKS:-}" ]; then
+  echo "::error::Either REQUIRED_CHECKS_JSON or REQUIRED_CHECKS must be set"
+  exit 1
+fi
 
 OWNER="${REPO%%/*}"
 NAME="${REPO##*/}"
@@ -65,10 +77,14 @@ if [ -z "$MERGE_SHA" ]; then
   exit 0
 fi
 
-# 2. Required status checks declared in the workflow env.
-REQUIRED="$REQUIRED_CHECKS"
+# 2. Required status checks — branch-aware JSON dict takes precedence.
+if [ -n "${REQUIRED_CHECKS_JSON:-}" ]; then
+  REQUIRED=$(echo "$REQUIRED_CHECKS_JSON" | jq -r --arg branch "$BASE_BRANCH" '.[$branch] // [] | .[]')
+else
+  REQUIRED="$REQUIRED_CHECKS"
+fi
 if [ -z "${REQUIRED//[[:space:]]/}" ]; then
-  echo "::notice::REQUIRED_CHECKS empty — force-merge not applicable."
+  echo "::notice::REQUIRED_CHECKS empty for branch '$BASE_BRANCH' — force-merge not applicable."
   exit 0
 fi
 

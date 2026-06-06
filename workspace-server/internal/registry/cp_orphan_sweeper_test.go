@@ -9,8 +9,15 @@ import (
 
 	"github.com/DATA-DOG/go-sqlmock"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/rescue"
 )
+
+// rescueVolumeGraceHours surfaces the rescue grace as whole hours for
+// the retention-contract assertion (RFC internal#742 Part 2).
+func rescueVolumeGraceHours() int {
+	return int(rescue.RescueVolumeGrace.Hours())
+}
 
 // fakeCPReaper is a hand-rolled CPOrphanReaper for the SaaS-mode
 // sweeper tests. Records every Stop call so tests can assert which
@@ -94,6 +101,55 @@ func TestCPSweepOnce_NoOrphans(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// TestCPSweepOnce_DoesNotReapFailedWorkspace — RFC internal#742 Part 2
+// volume-retention guarantee, molecule-core side.
+//
+// A boot-FAILED workspace (status='failed') must NOT be terminated by
+// the platform's orphan sweeper: its instance + /configs data volume are
+// retained through the rescue grace (rescue.RescueVolumeGrace) so a live
+// rescue read is possible, distinct from the user-prune erase path. The
+// sweeper reaps ONLY status='removed' (the explicit deprovision path),
+// so a `failed` row is structurally excluded at the SELECT — it never
+// reaches reaper.Stop. We assert the predicate filters to 'removed'
+// (so the failed instance survives) and that no Stop fires for a DB
+// whose only orphan-shaped row is `failed`.
+//
+// This is the "if the sweeper already keeps volumes by default, confirm
+// + add a test asserting it" branch of the RFC: it does, by construction.
+func TestCPSweepOnce_DoesNotReapFailedWorkspace(t *testing.T) {
+	mock := setupTestDB(t)
+	reaper := &fakeCPReaper{}
+
+	// The sweeper's SELECT carries `status = 'removed'`. A boot-failed
+	// workspace (status='failed') does not match that predicate, so the
+	// real DB returns it nowhere in this result set — modelled as the
+	// empty result the `removed`-only filter produces when the only
+	// instance-bearing row is `failed`. The regex pins the retention-
+	// critical predicate so a future widening to include 'failed' (which
+	// would terminate boot-failed boxes mid-rescue) fails this test.
+	mock.ExpectQuery(`(?s)WHERE status = 'removed'\s+AND instance_id IS NOT NULL`).
+		WithArgs(cpSweepLimit).
+		WillReturnRows(sqlmock.NewRows([]string{"id"})) // failed row excluded by predicate
+
+	cpSweepOnce(context.Background(), reaper)
+
+	if len(reaper.stopCalls) != 0 {
+		t.Fatalf("boot-failed workspace must be RETAINED (no terminate); got Stop calls %v", reaper.stopCalls)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// TestRescueVolumeGraceIsDistinctFromPrune documents that the rescue
+// grace is its own contract (24h) and not coupled to any prune timing —
+// the value is the SSOT the control-plane reaper must honour.
+func TestRescueVolumeGraceIsDistinctFromPrune(t *testing.T) {
+	if rescueVolumeGraceHours() != 24 {
+		t.Errorf("rescue volume grace = %dh, want 24h (RFC internal#742)", rescueVolumeGraceHours())
 	}
 }
 

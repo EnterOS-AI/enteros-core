@@ -38,7 +38,11 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-WORKFLOWS_DIR="$REPO_ROOT/.github/workflows"
+# Gitea is the SSOT for CI on molecule-core per task #347 / memory
+# reference_molecule_core_actions_gitea_only — workflows live in
+# .gitea/workflows/ exclusively. The legacy .github/workflows/ tree was
+# deleted in SSOT-Instance-4 (task #331).
+WORKFLOWS_DIR="$REPO_ROOT/.gitea/workflows"
 APPLY_SH="$SCRIPT_DIR/apply.sh"
 
 if [[ ! -f "$APPLY_SH" ]]; then
@@ -46,7 +50,7 @@ if [[ ! -f "$APPLY_SH" ]]; then
   exit 2
 fi
 if [[ ! -d "$WORKFLOWS_DIR" ]]; then
-  echo "check_name_parity: missing .github/workflows at $WORKFLOWS_DIR" >&2
+  echo "check_name_parity: missing .gitea/workflows at $WORKFLOWS_DIR" >&2
   exit 2
 fi
 

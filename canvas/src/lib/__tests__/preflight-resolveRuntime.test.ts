@@ -8,51 +8,39 @@
  * count bounded.
  */
 import { describe, it, expect } from "vitest";
-import { resolveRuntime } from "../deploy-preflight";
+import { isUserVisibleWorkspaceTemplate, resolveRuntime } from "../deploy-preflight";
 
 describe("resolveRuntime", () => {
   describe("explicit runtime-map entries", () => {
-    it('maps "langgraph" to "langgraph"', () => {
-      expect(resolveRuntime("langgraph")).toBe("langgraph");
-    });
-
     it('maps "claude-code-default" to "claude-code"', () => {
       expect(resolveRuntime("claude-code-default")).toBe("claude-code");
+    });
+
+    it('maps "codex" to "codex"', () => {
+      expect(resolveRuntime("codex")).toBe("codex");
+    });
+
+    it('maps "hermes" to "hermes"', () => {
+      expect(resolveRuntime("hermes")).toBe("hermes");
     });
 
     it('maps "openclaw" to "openclaw"', () => {
       expect(resolveRuntime("openclaw")).toBe("openclaw");
     });
-
-    it('maps "deepagents" to "deepagents"', () => {
-      expect(resolveRuntime("deepagents")).toBe("deepagents");
-    });
-
-    it('maps "crewai" to "crewai"', () => {
-      expect(resolveRuntime("crewai")).toBe("crewai");
-    });
-
-    it('maps "autogen" to "autogen"', () => {
-      expect(resolveRuntime("autogen")).toBe("autogen");
-    });
   });
 
   describe("identity fallback for modern template ids", () => {
-    it("returns the id unchanged when not in the map", () => {
-      expect(resolveRuntime("hermes")).toBe("hermes");
-    });
-
     it("strips trailing -default suffix as fallback", () => {
       expect(resolveRuntime("hermes-default")).toBe("hermes");
     });
 
     it("strips -default only when it is the suffix", () => {
       // "default-something" should NOT strip
-      expect(resolveRuntime("default-langgraph")).toBe("default-langgraph");
+      expect(resolveRuntime("default-custom")).toBe("default-custom");
     });
 
     it("returns the id unchanged when id has no -default suffix", () => {
-      expect(resolveRuntime("gemini-cli")).toBe("gemini-cli");
+      expect(resolveRuntime("custom-runtime")).toBe("custom-runtime");
     });
 
     it("handles custom template ids from community templates", () => {
@@ -74,5 +62,17 @@ describe("resolveRuntime", () => {
       // The JS replace only replaces the first match by default
       expect(resolveRuntime("claude-code-default-default")).toBe("claude-code-default");
     });
+  });
+});
+
+describe("isUserVisibleWorkspaceTemplate", () => {
+  it("hides runtime-default templates from product template surfaces", () => {
+    for (const id of ["claude-code-default", "codex", "hermes", "openclaw"]) {
+      expect(isUserVisibleWorkspaceTemplate({ id })).toBe(false);
+    }
+  });
+
+  it("keeps product templates visible", () => {
+    expect(isUserVisibleWorkspaceTemplate({ id: "seo-agent" })).toBe(true);
   });
 });

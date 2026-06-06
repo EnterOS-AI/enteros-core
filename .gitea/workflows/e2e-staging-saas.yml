@@ -48,7 +48,12 @@ on:
       - 'workspace-server/internal/handlers/a2a_proxy.go'
       - 'workspace-server/internal/middleware/**'
       - 'workspace-server/internal/provisioner/**'
+      - 'workspace-server/internal/providers/providers.yaml'
       - 'tests/e2e/test_staging_full_saas.sh'
+      - 'tests/e2e/lib/completion_assert.sh'
+      - 'tests/e2e/lib/model_slug.sh'
+      - 'tests/e2e/lib/aws_leak_check.sh'
+      - 'tests/e2e/test_aws_leak_check.sh'
       - '.gitea/workflows/e2e-staging-saas.yml'
   pull_request:
     branches: [main]
@@ -58,7 +63,12 @@ on:
       - 'workspace-server/internal/handlers/a2a_proxy.go'
       - 'workspace-server/internal/middleware/**'
       - 'workspace-server/internal/provisioner/**'
+      - 'workspace-server/internal/providers/providers.yaml'
       - 'tests/e2e/test_staging_full_saas.sh'
+      - 'tests/e2e/lib/completion_assert.sh'
+      - 'tests/e2e/lib/model_slug.sh'
+      - 'tests/e2e/lib/aws_leak_check.sh'
+      - 'tests/e2e/test_aws_leak_check.sh'
       - '.gitea/workflows/e2e-staging-saas.yml'
   workflow_dispatch:
   schedule:
@@ -88,33 +98,38 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 1
-        # mc#774: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
+        # mc#1982: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
         continue-on-error: true
 
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: "3.11"
-        # mc#774: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
+        # mc#1982: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
         continue-on-error: true
 
       - name: YAML validation (best-effort)
         run: |
           echo "e2e-staging-saas.yml — PR validation: workflow YAML is valid."
           echo "E2E step runs only when provisioning-critical files change."
-        # mc#774: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
+        # mc#1982: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
         continue-on-error: true
 
-  # Actual E2E: runs on trunk pushes (main + staging). NOT the PR-fire-only
-  # path — pr-validate above posts success for workflow-only PRs.
+  # Actual E2E: runs on trunk pushes and PRs that touch provisioning-critical
+  # paths. pr-validate remains as the lightweight workflow-shape check for PRs,
+  # but it is not a substitute for live staging proof when this workflow or the
+  # staging harness changes.
   e2e-staging-saas:
     name: E2E Staging SaaS
     runs-on: ubuntu-latest
-    # Only runs on trunk pushes. PR paths get pr-validate instead.
-    if: github.event.pull_request.base.ref == ''
     # Phase 3 (RFC #219 §1): surface broken workflows without blocking.
-    # mc#774: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
+    # mc#1982: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
     continue-on-error: true
-    timeout-minutes: 45
+    # Raised 45→75: step 10b now exercises pause→resume→online +
+    # hibernate→wake→online, each of which RE-PROVISIONS the parent (CP
+    # re-provision + heartbeat recovery, not a fresh EC2 cold start, but still
+    # minutes). The base provision→online→A2A matrix fits in ~35 min; the two
+    # extra lifecycle reprovisions need headroom under WORKSPACE_ONLINE_TIMEOUT.
+    timeout-minutes: 75
     permissions:
       contents: read
 
@@ -127,6 +142,11 @@ jobs:
       # (dead in org secret store) to CP_STAGING_ADMIN_API_TOKEN per
       # internal#322 — see this PR for the cross-workflow sweep.
       MOLECULE_ADMIN_TOKEN: ${{ secrets.CP_STAGING_ADMIN_API_TOKEN }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: us-east-2
+      E2E_AWS_LEAK_CHECK: required
+      E2E_AWS_TERMINATE_LEAKS: '1'
       # MiniMax is the PRIMARY LLM auth path post-2026-05-04. Switched
       # from hermes+OpenAI default after #2578 (the staging OpenAI key
       # account went over quota and stayed dead for 36+ hours, taking
@@ -143,18 +163,46 @@ jobs:
       # block). See #2578 PR comment for the rationale.
       E2E_ANTHROPIC_API_KEY: ${{ secrets.MOLECULE_STAGING_ANTHROPIC_API_KEY }}
       # OpenAI fallback — kept wired so an operator-dispatched run with
-      # E2E_RUNTIME=hermes or =langgraph via workflow_dispatch can still
+      # E2E_RUNTIME=hermes or =codex via workflow_dispatch can still
       # exercise the OpenAI path.
       E2E_OPENAI_API_KEY: ${{ secrets.MOLECULE_STAGING_OPENAI_API_KEY }}
+      # google-adk (operator-dispatched only) auths Gemini with an
+      # AI-Studio key. Org policy disallows API keys in PROD (Vertex+ADC
+      # there); CI uses the keyed AI-Studio path with config model
+      # google_genai:gemini-2.5-pro. Vertex remains the supported prod path.
+      E2E_GOOGLE_API_KEY: ${{ secrets.MOLECULE_STAGING_GOOGLE_API_KEY }}
       E2E_RUNTIME: ${{ github.event.inputs.runtime || 'claude-code' }}
       # Pin the model when running on the default claude-code path —
       # the per-runtime default ("sonnet") routes to direct Anthropic
       # and defeats the cost saving. Operators can override via the
       # workflow_dispatch flow (no input wired here yet — runtime
       # override is enough for ad-hoc).
-      E2E_MODEL_SLUG: ${{ github.event.inputs.runtime == 'hermes' && 'openai/gpt-4o' || github.event.inputs.runtime == 'langgraph' && 'openai:gpt-4o' || 'MiniMax-M2.7-highspeed' }}
+      #
+      # claude-code MiniMax slug must be the BARE registered id `MiniMax-M2.7`.
+      # It is the BYOK-minimax form: registry_gen.go:88 registers it on the
+      # `minimax` arm (resolves provider=minimax via MINIMAX_API_KEY), so the
+      # #1994 byok-not-platform guard still passes. The COLON form
+      # `minimax:MiniMax-M2.7` is UNREGISTERED on claude-code (internal#718;
+      # derive_provider_matrix_test.go:288) — the claude-code adapter can't
+      # strip the `minimax:` prefix, so workspace-create 422s
+      # UNREGISTERED_MODEL_FOR_RUNTIME (real failure: job 295233, main 4b3590e3).
+      # The slash form `minimax/MiniMax-M2.7` is the platform-billed arm and
+      # would trip the byok guard. #2311 fixed the same colon-vs-bare bug in the
+      # pick_model_slug lib (tests/e2e/lib/model_slug.sh), but this env var
+      # OVERRIDES that lib, so the bare fix has to live here too.
+      E2E_MODEL_SLUG: ${{ github.event.inputs.runtime == 'hermes' && 'openai/gpt-4o' || github.event.inputs.runtime == 'codex' && 'openai/gpt-4o' || github.event.inputs.runtime == 'google-adk' && 'google_genai:gemini-2.5-pro' || 'MiniMax-M2.7' }}
       E2E_RUN_ID: "${{ github.run_id }}-${{ github.run_attempt }}"
       E2E_KEEP_ORG: ${{ github.event.inputs.keep_org && '1' || '0' }}
+      # Lifecycle transitions (step 10b): pause→resume→online +
+      # hibernate→wake→online on the provisioned parent. `auto` runs them in
+      # full mode (this job). Set `off` to skip the ~2x-reprovision cost on an
+      # ad-hoc dispatch. The timeout-minutes above is sized for this being on.
+      E2E_LIFECYCLE: auto
+      # Fail-closed-on-skip: in CI the harness MUST prove ≥1 full
+      # provision→online→A2A cycle. If it reaches the end having validated
+      # nothing (a future short-circuit / skip path), it exits 5 rather than
+      # reporting a false green. Mirrors CP serving-e2e SERVING_E2E_REQUIRE_LIVE.
+      E2E_REQUIRE_LIVE: '1'
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -165,12 +213,18 @@ jobs:
             echo "::error::CP_STAGING_ADMIN_API_TOKEN secret not set (Railway staging CP_ADMIN_API_TOKEN)"
             exit 2
           fi
+          for var in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; do
+            if [ -z "${!var:-}" ]; then
+              echo "::error::$var not set — EC2 leak verification cannot run"
+              exit 2
+            fi
+          done
           echo "Admin token present ✓"
 
       - name: Verify LLM key present
         run: |
           # Per-runtime key check — claude-code uses MiniMax; hermes /
-          # langgraph (operator-dispatched only) use OpenAI. Hard-fail
+          # codex (operator-dispatched only) use OpenAI. Hard-fail
           # rather than soft-skip per #2578's lesson — empty key
           # silently falls through to the wrong SECRETS_JSON branch and
           # produces a confusing auth error 5 min later instead of the
@@ -191,9 +245,13 @@ jobs:
                 required_secret_value=""
               fi
               ;;
-            langgraph|hermes)
+            codex|hermes)
               required_secret_name="MOLECULE_STAGING_OPENAI_API_KEY"
               required_secret_value="${E2E_OPENAI_API_KEY:-}"
+              ;;
+            google-adk)
+              required_secret_name="MOLECULE_STAGING_GOOGLE_API_KEY"
+              required_secret_value="${E2E_GOOGLE_API_KEY:-}"
               ;;
             *)
               echo "::warning::Unknown E2E_RUNTIME='${E2E_RUNTIME}' — skipping LLM-key check"
@@ -287,5 +345,154 @@ jobs:
           done
           if [ ${#leaks[@]} -gt 0 ]; then
             echo "::warning::saas teardown left ${#leaks[@]} leak(s): ${leaks[*]}"
+          fi
+          exit 0
+
+  # ── PLATFORM-MANAGED BOOT REGRESSION (moonshot/kimi NOT_CONFIGURED) ──────────
+  #
+  # The REAL-boot complement to the deterministic unit suite
+  # (workspace_provision_platform_boot_test.go). Provisions a REAL staging
+  # claude-code workspace on the PLATFORM-managed path — provider=platform,
+  # model=moonshot/kimi-k2.6, NO tenant LLM key — and asserts it reaches
+  # status=online (NOT not_configured) and a completion returns 200, via the same
+  # online-wait + completion-assert the BYOK job uses.
+  #
+  # Why a SEPARATE job (not a matrix leg of e2e-staging-saas): the platform path
+  # injects NO secret and pins a different model, so its env block diverges from
+  # the BYOK job's. A dedicated job keeps each path's "verify key present" preflight
+  # honest (BYOK requires a key; platform requires its ABSENCE not to matter) and
+  # gives the regression its own named commit-status for branch protection.
+  #
+  # Add `E2E Staging Platform Boot` to branch protection after 3 consecutive
+  # green runs on main (de-flake window; this path shares the cp#245
+  # boot-timeout flake surface the BYOK job has, so it must prove stable before
+  # it can BLOCK — see the gate-making plan in the PR body).
+  # bp-required: pending #2187
+  e2e-staging-platform-boot:
+    name: E2E Staging Platform Boot
+    runs-on: ubuntu-latest
+    # Phase 3 (RFC #219 §1): surface without blocking until the de-flake window
+    # closes. mc#1982: do NOT renew this mask silently — the gate-making plan
+    # tracks the flip to false under #2187.
+    continue-on-error: true
+    timeout-minutes: 45
+    permissions:
+      contents: read
+
+    env:
+      MOLECULE_CP_URL: https://staging-api.moleculesai.app
+      MOLECULE_ADMIN_TOKEN: ${{ secrets.CP_STAGING_ADMIN_API_TOKEN }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: us-east-2
+      E2E_AWS_LEAK_CHECK: required
+      E2E_AWS_TERMINATE_LEAKS: '1'
+      # The regression combo: claude-code + platform-managed + moonshot/kimi-k2.6.
+      # NO E2E_*_API_KEY is set — platform-managed billing is owned by Molecule via
+      # the CP LLM proxy. The harness's E2E_LLM_PATH=platform branch sends empty
+      # secrets and pin-selects the platform model.
+      E2E_RUNTIME: claude-code
+      E2E_LLM_PATH: platform
+      # Smoke mode: a single parent workspace is enough to prove online +
+      # completion for the platform path (the A2A/delegation matrix is the BYOK
+      # job's job). Override E2E_DEFAULT_PLATFORM_MODEL via workflow_dispatch to
+      # exercise another platform model id.
+      E2E_MODE: smoke
+      E2E_RUN_ID: "platform-${{ github.run_id }}-${{ github.run_attempt }}"
+      E2E_KEEP_ORG: ${{ github.event.inputs.keep_org && '1' || '0' }}
+      # Fail-closed-on-skip (see BYOK job). smoke mode still runs steps 2/4/7/8b,
+      # so all four required milestones (provisioned/tenant_online/
+      # workspace_online/a2a_roundtrip) fire — the guard is valid for this lane too.
+      E2E_REQUIRE_LIVE: '1'
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Verify admin token present
+        run: |
+          if [ -z "$MOLECULE_ADMIN_TOKEN" ]; then
+            echo "::error::CP_STAGING_ADMIN_API_TOKEN secret not set (Railway staging CP_ADMIN_API_TOKEN)"
+            exit 2
+          fi
+          for var in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; do
+            if [ -z "${!var:-}" ]; then
+              echo "::error::$var not set — EC2 leak verification cannot run"
+              exit 2
+            fi
+          done
+          echo "Admin token present ✓"
+
+      - name: Assert NO BYOK key leaks into the platform run
+        run: |
+          # The whole point of this job is the platform-managed path. A stray
+          # E2E_*_API_KEY in the runner env would (via the harness) still be
+          # skipped by the E2E_LLM_PATH=platform branch — but assert their
+          # absence loudly here so a future env edit can't silently convert this
+          # into a masked BYOK run that no longer exercises the regression.
+          for var in E2E_MINIMAX_API_KEY E2E_ANTHROPIC_API_KEY E2E_OPENAI_API_KEY; do
+            if [ -n "${!var:-}" ]; then
+              echo "::warning::$var is set in this platform-boot job's env — the harness ignores it on E2E_LLM_PATH=platform, but it should not be wired here."
+            fi
+          done
+          echo "Platform-managed path: no tenant LLM key required ✓"
+
+      - name: CP staging health preflight
+        run: |
+          code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 10 "$MOLECULE_CP_URL/health")
+          if [ "$code" != "200" ]; then
+            echo "::error::Staging CP unhealthy (got HTTP $code). Skipping — not a workspace bug."
+            exit 1
+          fi
+          echo "Staging CP healthy ✓"
+
+      - name: Run platform-managed boot E2E (online + completion)
+        id: e2e
+        run: bash tests/e2e/test_staging_full_saas.sh
+
+      - name: Teardown safety net (runs on cancel/failure)
+        if: always()
+        env:
+          ADMIN_TOKEN: ${{ secrets.CP_STAGING_ADMIN_API_TOKEN }}
+        run: |
+          set +e
+          orgs=$(curl -sS "$MOLECULE_CP_URL/cp/admin/orgs" \
+            -H "Authorization: Bearer $ADMIN_TOKEN" 2>/dev/null \
+            | python3 -c "
+          import json, sys, os, datetime
+          run_id = os.environ.get('GITHUB_RUN_ID', '')
+          d = json.load(sys.stdin)
+          today = datetime.date.today()
+          yesterday = today - datetime.timedelta(days=1)
+          dates = (today.strftime('%Y%m%d'), yesterday.strftime('%Y%m%d'))
+          # smoke mode slugs are e2e-smoke-YYYYMMDD-platform-<run_id>-...
+          if run_id:
+              prefixes = tuple(f'e2e-smoke-{d}-platform-{run_id}-' for d in dates)
+          else:
+              prefixes = tuple(f'e2e-smoke-{d}-platform-' for d in dates)
+          candidates = [o['slug'] for o in d.get('orgs', [])
+                        if any(o.get('slug','').startswith(p) for p in prefixes)
+                        and o.get('instance_status') not in ('purged',)]
+          print('\n'.join(candidates))
+          " 2>/dev/null)
+          leaks=()
+          for slug in $orgs; do
+            echo "Safety-net teardown: $slug"
+            set +e
+            curl -sS -o /tmp/plat-cleanup.out -w "%{http_code}" \
+              -X DELETE "$MOLECULE_CP_URL/cp/admin/tenants/$slug" \
+              -H "Authorization: Bearer $ADMIN_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "{\"confirm\":\"$slug\"}" >/tmp/plat-cleanup.code
+            set -e
+            code=$(cat /tmp/plat-cleanup.code 2>/dev/null || echo "000")
+            if [ "$code" = "200" ] || [ "$code" = "204" ]; then
+              echo "[teardown] deleted $slug (HTTP $code)"
+            else
+              echo "::warning::platform-boot teardown for $slug returned HTTP $code — sweep-stale-e2e-orgs will catch it within ~45 min. Body: $(head -c 300 /tmp/plat-cleanup.out 2>/dev/null)"
+              leaks+=("$slug")
+            fi
+          done
+          if [ ${#leaks[@]} -gt 0 ]; then
+            echo "::warning::platform-boot teardown left ${#leaks[@]} leak(s): ${leaks[*]}"
           fi
           exit 0

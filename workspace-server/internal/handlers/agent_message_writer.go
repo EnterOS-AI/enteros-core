@@ -43,8 +43,8 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/events"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/textutil"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/textutil"
 )
 
 // ErrWorkspaceNotFound is returned by AgentMessageWriter.Send when the
@@ -64,10 +64,10 @@ var ErrTalkToUserDisabled = errors.New("agent_message: talk_to_user disabled")
 // distinct so the writer's API doesn't import a handler type with HTTP
 // binding tags.
 type AgentMessageAttachment struct {
-	URI      string
-	Name     string
-	MimeType string
-	Size     int64
+	URI      string `json:"uri"`
+	Name     string `json:"name"`
+	MimeType string `json:"mimeType,omitempty"`
+	Size     int64  `json:"size,omitempty"`
 }
 
 // AgentMessageWriter persists + broadcasts agent → user messages. Construct
@@ -164,7 +164,11 @@ func (w *AgentMessageWriter) Send(
 		}
 		respPayload["parts"] = fileParts
 	}
-	respJSON, _ := json.Marshal(respPayload)
+	respJSON, marshalErr := json.Marshal(respPayload)
+	if marshalErr != nil {
+		log.Printf("AgentMessageWriter %s: json.Marshal respPayload failed: %v", workspaceID, marshalErr)
+		return nil
+	}
 	preview := textutil.TruncateRunes(message, 80)
 	if _, err := w.db.ExecContext(ctx, `
 		INSERT INTO activity_logs (workspace_id, activity_type, method, summary, response_body, status)

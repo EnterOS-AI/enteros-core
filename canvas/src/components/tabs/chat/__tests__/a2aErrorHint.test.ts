@@ -41,6 +41,19 @@ describe("inferA2AErrorHint", () => {
     expect(inferA2AErrorHint("RuntimeException in tool call")).toMatch(/runtime threw an exception/);
   });
 
+  it("points at the Activity tab (the real in-product logs surface), not 'workspace/container logs' (internal#212)", () => {
+    // Pre-#212 these hints sent users to "workspace logs" / "container
+    // logs" — neither has a UI affordance in the canvas. Activity tab
+    // is the in-product surface where the full row lives. Lock the
+    // copy so a future refactor cannot re-introduce the dangling
+    // pointer.
+    expect(inferA2AErrorHint("Agent error: boom")).toMatch(/Activity tab/);
+    expect(inferA2AErrorHint("some completely novel error nobody has matched yet")).toMatch(/Activity tab/);
+    // And the two strings together must not regress to the old text.
+    expect(inferA2AErrorHint("Agent error: boom")).not.toMatch(/container logs/);
+    expect(inferA2AErrorHint("some novel error")).not.toMatch(/workspace logs/);
+  });
+
   it("recognises peer-unreachable cases (Activity-tab originals)", () => {
     expect(inferA2AErrorHint("workspace not found")).toMatch(/can't be reached/);
     expect(inferA2AErrorHint("not accessible")).toMatch(/can't be reached/);
@@ -53,7 +66,8 @@ describe("inferA2AErrorHint", () => {
 
   it("returns a generic fallback for unrecognised text", () => {
     const hint = inferA2AErrorHint("some completely novel error nobody has matched yet");
-    expect(hint).toMatch(/Check the workspace logs|delivery failure/);
+    // Fallback now sends the user to the Activity tab (post-#212).
+    expect(hint).toMatch(/Activity tab|delivery failure/);
   });
 
   it("Claude SDK wedge wins over the more general timeout pattern", () => {

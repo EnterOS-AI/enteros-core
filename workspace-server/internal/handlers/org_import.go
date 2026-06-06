@@ -17,14 +17,14 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/channels"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/crypto"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/events"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/models"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/provisioner"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/provlog"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/scheduler"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/channels"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/crypto"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provlog"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/scheduler"
 	"github.com/google/uuid"
 )
 
@@ -62,17 +62,22 @@ func (h *OrgHandler) createWorkspaceTree(ws OrgWorkspace, parentID *string, absX
 		runtime = defaults.Runtime
 	}
 	if runtime == "" {
-		runtime = "langgraph"
+		runtime = "claude-code"
 	}
 	model := ws.Model
 	if model == "" {
 		model = defaults.Model
 	}
 	if model == "" {
-		// SSOT: per-runtime defaults live in models/runtime_defaults.go
-		// (see RFC #2873). Consolidated from a duplicate of the same
-		// branch in workspace_provision.go.
-		model = models.DefaultModel(runtime)
+		// SSOT (CTO 2026-05-22, feedback_workspace_model_required_no_platform_default_dynamic_credential_intake):
+		// model is REQUIRED. The org-import template MUST declare a
+		// model — either per-workspace (`ws.Model`) or via the org
+		// defaults block (`defaults.Model`). If neither is present
+		// the template is malformed and the import must fail-closed
+		// rather than silently provisioning a workspace with a
+		// runtime-incompatible default (the prior `anthropic:claude-opus-4-7`
+		// fallback wedged every codex workspace at adapter init).
+		return fmt.Errorf("org import: workspace %q has no model and the org defaults block does not provide one (runtime=%s) — model is a required field per the workspace-creation contract; either set `model:` on the workspace or under `defaults:`", ws.Name, runtime)
 	}
 	tier := ws.Tier
 	if tier == 0 {
@@ -97,7 +102,6 @@ func (h *OrgHandler) createWorkspaceTree(ws OrgWorkspace, parentID *string, absX
 	}
 
 	id := uuid.New().String()
-	awarenessNS := workspaceAwarenessNamespace(id)
 
 	var role interface{}
 	if ws.Role != "" {
@@ -163,13 +167,13 @@ func (h *OrgHandler) createWorkspaceTree(ws OrgWorkspace, parentID *string, absX
 	// EXACTLY for Postgres to consider the index applicable.
 	var insertedID string
 	err := db.DB.QueryRowContext(ctx, `
-		INSERT INTO workspaces (id, name, role, tier, runtime, awareness_namespace, status, parent_id, workspace_dir, workspace_access, max_concurrent_tasks)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+		INSERT INTO workspaces (id, name, role, tier, runtime, status, parent_id, workspace_dir, workspace_access, max_concurrent_tasks)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 		ON CONFLICT (COALESCE(parent_id, '00000000-0000-0000-0000-000000000000'::uuid), name)
 		WHERE status != 'removed'
 		DO NOTHING
 		RETURNING id
-	`, id, ws.Name, role, tier, runtime, awarenessNS, "provisioning", parentID, workspaceDir, workspaceAccess, maxConcurrent).Scan(&insertedID)
+	`, id, ws.Name, role, tier, runtime, "provisioning", parentID, workspaceDir, workspaceAccess, maxConcurrent).Scan(&insertedID)
 	if errors.Is(err, sql.ErrNoRows) {
 		// Skip path — a non-removed row already exists for
 		// (parent_id, name). Re-select its id; idempotency-friendly
@@ -254,7 +258,7 @@ func (h *OrgHandler) createWorkspaceTree(ws OrgWorkspace, parentID *string, absX
 	if len(wsMemories) == 0 {
 		wsMemories = defaults.InitialMemories
 	}
-	seedInitialMemories(ctx, id, wsMemories, awarenessNS)
+	h.workspace.seedInitialMemories(ctx, id, wsMemories)
 
 	// Handle external workspaces
 	if ws.External {
@@ -534,11 +538,25 @@ func (h *OrgHandler) createWorkspaceTree(ws OrgWorkspace, parentID *string, absX
 		// Docker-mode otherwise; the org-import call site doesn't need
 		// to know which.
 		provisionSem <- struct{}{} // acquire
-		go func(wID, tPath string, cFiles map[string][]byte, p models.CreateWorkspacePayload) {
+		// RFC internal#524 Layer 1: route through workspace.goAsync —
+		// provisionWorkspaceAuto inserts/updates the workspaces row in
+		// db.DB and must be drained before any test cleanup swap.
+		wID, tPath, cFiles, p := id, templatePath, configFiles, payload
+		h.workspace.goAsync(func() {
 			defer func() { <-provisionSem }() // release
 			h.workspace.provisionWorkspaceAuto(wID, tPath, cFiles, p)
-		}(id, templatePath, configFiles, payload)
+		})
 	}
+
+	// internal#2006: migrate runtime-created schedules from a removed
+	// predecessor of the same agent (role+parent) onto this freshly-created
+	// workspace. Reconcile re-derives template-sourced state below, but
+	// schedules a user added at runtime (source='runtime', via the canvas/API)
+	// bind to the ephemeral workspace_id and would otherwise be abandoned on
+	// the removed row when an agent is recreated with a new id. Runs before the
+	// template upsert loop so a same-named template schedule still wins.
+	// Best-effort: never fails the import.
+	h.migrateRuntimeSchedulesFromRemovedPredecessor(ctx, id, role, ws.Name, parentID)
 
 	// Insert schedules if defined. Resolve each schedule's prompt body from
 	// either inline `prompt:` or `prompt_file:` (file ref relative to the
@@ -677,6 +695,69 @@ func (h *OrgHandler) createWorkspaceTree(ws OrgWorkspace, parentID *string, absX
 	// same helper so partial-match (parent exists, some children missing)
 	// backfills correctly without duplicating the recursion logic.
 	return h.recurseChildrenForImport(ws, id, absX, absY, defaults, orgBaseDir, results, provisionSem)
+}
+
+// migrateRuntimeSchedulesFromRemovedPredecessor re-points runtime-created
+// schedules (source='runtime') from the most-recent removed predecessor of the
+// same agent onto newID. Recreating an agent mints a NEW workspace id (the
+// ON CONFLICT in createWorkspaceTree only matches non-removed rows), so a
+// schedule a user added at runtime would otherwise be abandoned on the removed
+// row. Template-sourced schedules are NOT migrated — reconcile re-derives those
+// from the org template (the upsert loop). The predecessor is matched by the
+// stable `role` when present (survives the name auto-suffixing that yields
+// "Agent (2)"), falling back to name+parent. Idempotent (skips names already on
+// newID) and best-effort (logs, never errors the import). See internal#2006.
+func (h *OrgHandler) migrateRuntimeSchedulesFromRemovedPredecessor(ctx context.Context, newID string, role interface{}, name string, parentID *string) {
+	var predID string
+	var err error
+	if role != nil {
+		err = db.DB.QueryRowContext(ctx, `
+			SELECT id FROM workspaces
+			WHERE status = 'removed' AND role = $1
+			  AND parent_id IS NOT DISTINCT FROM $2
+			  AND id <> $3
+			ORDER BY updated_at DESC NULLS LAST
+			LIMIT 1
+		`, role, parentID, newID).Scan(&predID)
+	} else {
+		err = db.DB.QueryRowContext(ctx, `
+			SELECT id FROM workspaces
+			WHERE status = 'removed' AND name = $1
+			  AND parent_id IS NOT DISTINCT FROM $2
+			  AND id <> $3
+			ORDER BY updated_at DESC NULLS LAST
+			LIMIT 1
+		`, name, parentID, newID).Scan(&predID)
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return // first-time create — no predecessor to migrate from
+	}
+	if err != nil {
+		log.Printf("Org import: predecessor lookup for %q (new=%s) failed: %v — skipping schedule migration", name, newID, err)
+		return
+	}
+	res, err := db.DB.ExecContext(ctx, `
+		UPDATE workspace_schedules s
+		SET workspace_id = $1, updated_at = now()
+		WHERE s.workspace_id = $2
+		  AND s.source = 'runtime'
+		  AND NOT EXISTS (
+		      SELECT 1 FROM workspace_schedules t
+		      WHERE t.workspace_id = $1 AND t.name = s.name
+		  )
+	`, newID, predID)
+	if err != nil {
+		log.Printf("Org import: schedule migration %s -> %s (%q) failed: %v", predID, newID, name, err)
+		return
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		log.Printf("Org import: schedule migration rows affected %s -> %s: %v", predID, newID, err)
+		return
+	}
+	if n > 0 {
+		log.Printf("Org import: migrated %d runtime schedule(s) from removed predecessor %s to new workspace %s (%q)", n, predID, newID, name)
+	}
 }
 
 // lookupExistingChild returns the id of an existing workspace under

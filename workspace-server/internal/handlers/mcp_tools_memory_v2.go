@@ -31,9 +31,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/memory/client"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/memory/contract"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/memory/namespace"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/memory/client"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/memory/contract"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/memory/namespace"
 )
 
 // memoryV2Deps bundles the dependencies the v2 tools need. Lifted
@@ -47,6 +48,7 @@ type memoryV2Deps struct {
 // call. Defining an interface here lets handler tests stub the plugin
 // without spinning up an HTTP server.
 type memoryPluginAPI interface {
+	UpsertNamespace(ctx context.Context, name string, body contract.NamespaceUpsert) (*contract.Namespace, error)
 	CommitMemory(ctx context.Context, namespace string, body contract.MemoryWrite) (*contract.MemoryWriteResponse, error)
 	Search(ctx context.Context, body contract.SearchRequest) (*contract.SearchResponse, error)
 	ForgetMemory(ctx context.Context, id string, body contract.ForgetRequest) error
@@ -116,6 +118,9 @@ func (h *MCPHandler) toolCommitMemoryV2(ctx context.Context, workspaceID string,
 	if !ok {
 		return "", fmt.Errorf("workspace %s cannot write to namespace %s", workspaceID, ns)
 	}
+	if _, err := h.memv2.plugin.UpsertNamespace(ctx, ns, contract.NamespaceUpsert{Kind: kindFromNamespace(ns)}); err != nil {
+		return "", fmt.Errorf("plugin upsert namespace: %w", err)
+	}
 
 	// SAFE-T1201: scrub credential-shaped strings BEFORE the plugin sees
 	// them. Non-negotiable; see memories.go:180.
@@ -154,8 +159,33 @@ func (h *MCPHandler) toolCommitMemoryV2(ctx context.Context, workspaceID string,
 		}
 	}
 
-	out, _ := json.Marshal(resp)
+	// Broadcast ACTIVITY_LOGGED so the canvas Memory tab live-refreshes
+	// (issue #1754). Fire-and-forget — broadcast failure must not roll
+	// back a successful plugin write. Source=agent because this is the
+	// MCP path (vs canvas user-driven POST /memories which the legacy
+	// handler logs with `memory_write_global`).
+	summary := "commit_memory to " + ns
+	logMemoryMCPActivity(ctx, h.broadcaster, workspaceID, "memory_write", resp.ID, ns, &summary)
+
+	out, marshalErr := json.Marshal(resp)
+	if marshalErr != nil {
+		log.Printf("toolCommitMemoryV2 %s: json.Marshal resp failed: %v", workspaceID, marshalErr)
+		return "", fmt.Errorf("marshal response: %w", marshalErr)
+	}
 	return string(out), nil
+}
+
+func kindFromNamespace(ns string) contract.NamespaceKind {
+	switch {
+	case strings.HasPrefix(ns, "workspace:"):
+		return contract.NamespaceKindWorkspace
+	case strings.HasPrefix(ns, "team:"):
+		return contract.NamespaceKindTeam
+	case strings.HasPrefix(ns, "org:"):
+		return contract.NamespaceKindOrg
+	default:
+		return contract.NamespaceKindCustom
+	}
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -208,7 +238,11 @@ func (h *MCPHandler) toolSearchMemory(ctx context.Context, workspaceID string, a
 		}
 	}
 
-	out, _ := json.Marshal(resp)
+	out, marshalErr := json.Marshal(resp)
+	if marshalErr != nil {
+		log.Printf("toolSearchMemory %s: json.Marshal resp failed: %v", workspaceID, marshalErr)
+		return "", fmt.Errorf("marshal response: %w", marshalErr)
+	}
 	return string(out), nil
 }
 
@@ -258,7 +292,16 @@ func (h *MCPHandler) toolCommitSummary(ctx context.Context, workspaceID string, 
 	if err != nil {
 		return "", fmt.Errorf("plugin commit: %w", err)
 	}
-	out, _ := json.Marshal(resp)
+
+	// Broadcast ACTIVITY_LOGGED for live canvas refresh (#1754).
+	summary := "commit_summary to " + ns
+	logMemoryMCPActivity(ctx, h.broadcaster, workspaceID, "memory_summary_write", resp.ID, ns, &summary)
+
+	out, marshalErr := json.Marshal(resp)
+	if marshalErr != nil {
+		log.Printf("toolCommitSummary %s: json.Marshal resp failed: %v", workspaceID, marshalErr)
+		return "", fmt.Errorf("marshal response: %w", marshalErr)
+	}
 	return string(out), nil
 }
 
@@ -274,7 +317,11 @@ func (h *MCPHandler) toolListWritableNamespaces(ctx context.Context, workspaceID
 	if err != nil {
 		return "", fmt.Errorf("resolve writable: %w", err)
 	}
-	b, _ := json.MarshalIndent(ns, "", "  ")
+	b, marshalErr := json.MarshalIndent(ns, "", "  ")
+	if marshalErr != nil {
+		log.Printf("toolListWritableNamespaces %s: json.MarshalIndent ns failed: %v", workspaceID, marshalErr)
+		return "", fmt.Errorf("marshal response: %w", marshalErr)
+	}
 	return string(b), nil
 }
 
@@ -286,7 +333,11 @@ func (h *MCPHandler) toolListReadableNamespaces(ctx context.Context, workspaceID
 	if err != nil {
 		return "", fmt.Errorf("resolve readable: %w", err)
 	}
-	b, _ := json.MarshalIndent(ns, "", "  ")
+	b, marshalErr := json.MarshalIndent(ns, "", "  ")
+	if marshalErr != nil {
+		log.Printf("toolListReadableNamespaces %s: json.MarshalIndent ns failed: %v", workspaceID, marshalErr)
+		return "", fmt.Errorf("marshal response: %w", marshalErr)
+	}
 	return string(b), nil
 }
 
@@ -320,6 +371,13 @@ func (h *MCPHandler) toolForgetMemory(ctx context.Context, workspaceID string, a
 	}); err != nil {
 		return "", fmt.Errorf("plugin forget: %w", err)
 	}
+
+	// Broadcast ACTIVITY_LOGGED for live canvas refresh (#1754).
+	// On forget, target_id carries the forgotten memory's id so the
+	// canvas can remove the row optimistically.
+	summary := "forget_memory " + memID + " from " + ns
+	logMemoryMCPActivity(ctx, h.broadcaster, workspaceID, "memory_delete", memID, ns, &summary)
+
 	return `{"forgotten":true}`, nil
 }
 
@@ -392,4 +450,44 @@ func pickStringSlice(args map[string]interface{}, key string) []string {
 		return out
 	}
 	return nil
+}
+
+// logMemoryMCPActivity fires the ACTIVITY_LOGGED broadcast for MCP-tool
+// memory writes/deletes (issue #1754). The canvas Memory tab subscribes
+// to memory_* activity_types via the WS feed; without this call, the
+// panel only refreshes when the user hits the manual reload button.
+//
+// Fire-and-forget: broadcast failure must never roll back a successful
+// plugin write. The underlying LogActivity helper already logs insert
+// errors and swallows them — wrap with a nil-broadcaster guard so test
+// fixtures without an events.Broadcaster don't nil-deref.
+//
+// IMPORTANT: takes *events.Broadcaster (concrete pointer), not
+// events.EventEmitter (interface). Passing a nil *Broadcaster as
+// EventEmitter creates a typed-nil interface that does NOT compare
+// equal to nil — and would derefence inside LogActivity. Keeping the
+// concrete type here lets the nil-check work reliably.
+//
+// Args:
+//   - activityType: "memory_write" / "memory_summary_write" / "memory_delete"
+//   - targetID: the affected memory's id (the canvas uses this for
+//     optimistic add/remove without a full refetch)
+//   - namespace: the v2 namespace the row landed in (canvas filters
+//     its display by readable-namespace intersection)
+func logMemoryMCPActivity(ctx context.Context, broadcaster *events.Broadcaster, workspaceID, activityType, targetID, namespace string, summary *string) {
+	if broadcaster == nil {
+		return
+	}
+	source := workspaceID
+	target := targetID
+	method := namespace
+	LogActivity(ctx, broadcaster, ActivityParams{
+		WorkspaceID:  workspaceID,
+		ActivityType: activityType,
+		SourceID:     &source,
+		TargetID:     &target,
+		Method:       &method,
+		Summary:      summary,
+		Status:       "ok",
+	})
 }

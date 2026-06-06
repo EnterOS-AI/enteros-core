@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -19,6 +20,27 @@ const (
 )
 
 var slackHTTPClient = &http.Client{Timeout: slackHTTPTimeout}
+
+// slackWebhookAccepted reports whether a Slack Incoming Webhook URL is allowed
+// as a send destination. Production accepts only the real hooks.slack.com host.
+//
+// TEST SEAM (gating e2e): when MOLECULE_CHANNELS_TEST_WEBHOOK_BASE is set, a
+// URL with that prefix is ALSO accepted so tests/e2e/test_channels_e2e.sh can
+// point the live Slack send path at a local mock-upstream and assert the mock
+// actually received the serialized {"text":...} payload end-to-end (the unit
+// tests can only assert the body shape — see lark_test.go's prefix-gate
+// workaround comment). The env var is NEVER set in any production/staging
+// deploy; channelsTestWebhookBase() returns "" there and only the real
+// hooks.slack.com prefix passes, so this changes no production behaviour.
+func slackWebhookAccepted(u string) bool {
+	if strings.HasPrefix(u, slackWebhookPrefix) {
+		return true
+	}
+	if base := channelsTestWebhookBase(); base != "" && strings.HasPrefix(u, base) {
+		return true
+	}
+	return false
+}
 
 // SlackAdapter implements ChannelAdapter for Slack Incoming Webhooks.
 //
@@ -97,7 +119,7 @@ func (s *SlackAdapter) ValidateConfig(config map[string]interface{}) error {
 			return fmt.Errorf("bot_token mode requires channel_id")
 		}
 	}
-	if webhookURL != "" && !strings.HasPrefix(webhookURL, slackWebhookPrefix) {
+	if webhookURL != "" && !slackWebhookAccepted(webhookURL) {
 		return fmt.Errorf("invalid Slack webhook URL")
 	}
 	return nil
@@ -159,7 +181,11 @@ func (s *SlackAdapter) sendBotMessage(ctx context.Context, config map[string]int
 			payload["icon_emoji"] = iconEmoji
 		}
 
-		body, _ := json.Marshal(payload)
+		body, marshalErr := json.Marshal(payload)
+		if marshalErr != nil {
+			log.Printf("slack SendMessage: json.Marshal payload failed: %v", marshalErr)
+			return fmt.Errorf("slack: marshal payload: %w", marshalErr)
+		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://slack.com/api/chat.postMessage", bytes.NewReader(body))
 		if err != nil {
 			return fmt.Errorf("slack: build request: %w", err)
@@ -171,8 +197,11 @@ func (s *SlackAdapter) sendBotMessage(ctx context.Context, config map[string]int
 		if err != nil {
 			return fmt.Errorf("slack: send: %w", err)
 		}
-		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		_ = resp.Body.Close()
+		if readErr != nil {
+			return fmt.Errorf("slack: read response body: %w", readErr)
+		}
 		var result struct {
 			OK    bool   `json:"ok"`
 			Error string `json:"error"`
@@ -189,7 +218,7 @@ func (s *SlackAdapter) sendWebhookMessage(ctx context.Context, config map[string
 	if webhookURL == "" {
 		return fmt.Errorf("webhook_url not configured")
 	}
-	if !strings.HasPrefix(webhookURL, slackWebhookPrefix) {
+	if !slackWebhookAccepted(webhookURL) {
 		return fmt.Errorf("invalid Slack webhook URL")
 	}
 
@@ -208,9 +237,13 @@ func (s *SlackAdapter) sendWebhookMessage(ctx context.Context, config map[string
 	if err != nil {
 		return fmt.Errorf("slack: send: %w", err)
 	}
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			return fmt.Errorf("slack: webhook returned %d (read body failed: %v)", resp.StatusCode, readErr)
+		}
 		return fmt.Errorf("slack: webhook returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	return nil
@@ -524,8 +557,11 @@ func FetchChannelHistory(ctx context.Context, botToken, channelID string, limit 
 	if err != nil {
 		return nil, err
 	}
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 65536))
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, 65536))
 	_ = resp.Body.Close()
+	if readErr != nil {
+		return nil, fmt.Errorf("slack: read history response: %w", readErr)
+	}
 
 	var result struct {
 		OK       bool                  `json:"ok"`

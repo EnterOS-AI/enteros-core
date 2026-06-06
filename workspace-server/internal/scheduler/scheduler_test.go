@@ -3,14 +3,15 @@ package scheduler
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"testing"
 	"time"
 	"unicode/utf8"
 
 	sqlmock "github.com/DATA-DOG/go-sqlmock"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/textutil"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/textutil"
 )
 
 // errDBDown is a sentinel error used by tests to simulate a DB connection failure.
@@ -256,6 +257,58 @@ func (p *successProxy) ProxyA2ARequest(
 	return 200, []byte(`{"ok":true}`), nil
 }
 
+// ── adapterErrorProxy ─────────────────────────────────────────────────────────
+
+// adapterErrorProxy is a test double whose ProxyA2ARequest returns HTTP 200
+// with a JSON-RPC error body, simulating an adapter SDK that throws internally
+// but still completes the HTTP round-trip. Issue #1696.
+type adapterErrorProxy struct{}
+
+func (p *adapterErrorProxy) ProxyA2ARequest(
+	_ context.Context, _ string, _ []byte, _ string, _ bool,
+) (int, []byte, error) {
+	return 200, []byte(`{"jsonrpc":"2.0","id":"cron-test-123","error":{"code":-32603,"message":"adapter SDK internal error"}}`), nil
+}
+
+// ── TestFireSchedule_AdapterSDKError (#1696) ──────────────────────────────────
+//
+// When the adapter SDK throws internally and returns HTTP 200 with an error
+// payload, fireSchedule must record last_status='error', not 'ok'.
+
+func TestFireSchedule_AdapterSDKError(t *testing.T) {
+	mock := setupTestDB(t)
+
+	sched := scheduleRow{
+		ID:          "55555555-dead-beef-0000-000000000005",
+		WorkspaceID: "66666666-dead-beef-0000-000000000006",
+		Name:        "adapter-err-job",
+		CronExpr:    "0 * * * *",
+		Timezone:    "UTC",
+		Prompt:      "do something",
+	}
+
+	// active_tasks check → 0 (workspace is idle; proceed to fire)
+	mock.ExpectQuery(`SELECT COALESCE`).
+		WillReturnRows(sqlmock.NewRows([]string{"coalesce"}).AddRow(0))
+
+	// Post-fire UPDATE must record last_status='error' with the adapter error message.
+	mock.ExpectExec(`UPDATE workspace_schedules`).
+		WithArgs(sched.ID, sqlmock.AnyArg(), "error", "A2A adapter error: adapter SDK internal error").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// activity_logs INSERT must carry status='error' and the error detail.
+	mock.ExpectExec(`INSERT INTO activity_logs`).
+		WithArgs(sched.WorkspaceID, sqlmock.AnyArg(), sqlmock.AnyArg(), "error", "A2A adapter error: adapter SDK internal error").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	s := New(&adapterErrorProxy{}, nil)
+	s.fireSchedule(context.Background(), sched)
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet DB expectations — adapter error not recorded correctly: %v", err)
+	}
+}
+
 // ── TestFireSchedule_ComputeNextRunError (#722 Bug 1) ─────────────────────────
 //
 // When ComputeNextRun fails (bad cron expression), fireSchedule must NOT write
@@ -281,6 +334,12 @@ func TestFireSchedule_ComputeNextRunError(t *testing.T) {
 
 	// #795 consecutive_empty_runs reset — successProxy returns {"ok":true}
 	// which is non-empty, so the counter is reset to 0.
+	mock.ExpectExec(`UPDATE workspace_schedules`).
+		WithArgs(sched.ID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// #1696 consecutive_sdk_errors reset — successProxy has no result_kind,
+	// so detectResultKind returns "" and lastStatus="ok" → reset.
 	mock.ExpectExec(`UPDATE workspace_schedules`).
 		WithArgs(sched.ID).
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -540,7 +599,14 @@ func TestFireSchedule_NormalSuccess_AdvancesNextRunAt(t *testing.T) {
 		WithArgs(sched.ID).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	// 3. Normal UPDATE after successful proxy call.
+	// 3. #1696 consecutive_sdk_errors reset — successProxy response has no
+	//    result_kind in the body, so detectResultKind returns "" and lastStatus
+	//    is "ok" → we hit the SDK-error counter reset branch.
+	mock.ExpectExec(`UPDATE workspace_schedules`).
+		WithArgs(sched.ID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// 4. Normal UPDATE after successful proxy call.
 	//    Args: $1=sched.ID, $2=nextRunPtr (computed time), $3=lastStatus, $4=lastError
 	mock.ExpectExec(`UPDATE workspace_schedules`).
 		WithArgs(sched.ID, sqlmock.AnyArg(), "ok", "").
@@ -602,6 +668,336 @@ func TestRecordSkipped_AdvancesNextRunAt(t *testing.T) {
 	}
 }
 // trigger CI
+
+// ── TestDetectResultKind ───────────────────────────────────────────────────────
+
+// TestDetectResultKind covers the SDK error detection path: HTTP 200 responses
+// with non-ok result_kind in the body must be recognised and returned as the
+// kind string, not silently treated as ok.
+func TestDetectResultKind(t *testing.T) {
+	// The test exercises detectResultKind directly so we don't need a full
+	// fireSchedule mock for this unit-test level.
+	tests := []struct {
+		name     string
+		body     string
+		wantKind string
+	}{
+		{
+			name:     "clean ok response — empty body",
+			body:     `{}`,
+			wantKind: "",
+		},
+		{
+			name:     "clean ok response — result.kind absent",
+			body:     `{"result":{"parts":[{"text":"hello"}]}}`,
+			wantKind: "",
+		},
+		{
+			name:     "clean ok response — result.kind=ok",
+			body:     `{"result":{"kind":"ok","parts":[{"text":"hello"}]}}`,
+			wantKind: "",
+		},
+		{
+			name:     "clean ok response — result.result_kind=ok",
+			body:     `{"result":{"result_kind":"ok","parts":[{"text":"hello"}]}}`,
+			wantKind: "",
+		},
+		{
+			// REGRESSION GUARD: A2A-SDK canonical Message envelope.
+			// Pre-fix, every successful agent reply was mis-flagged as an SDK
+			// error (PM scheduler hit 21 consecutive false-failure ticks before
+			// auto-disable; canvas screenshot 2026-05-23).
+			name:     "clean ok response — result.kind=message (A2A Message envelope)",
+			body:     `{"jsonrpc":"2.0","result":{"kind":"message","parts":[{"kind":"text","text":"hello"}]},"id":"1"}`,
+			wantKind: "",
+		},
+		{
+			name:     "clean ok response — result.result_kind=message",
+			body:     `{"result":{"result_kind":"message","parts":[{"text":"hello"}]}}`,
+			wantKind: "",
+		},
+		{
+			// A2A Task envelope, in-progress — `status.state` discriminator is
+			// `submitted` or `working` → treat as clean (not an SDK error).
+			name:     "clean ok — task envelope state=working",
+			body:     `{"result":{"kind":"task","task_id":"abc","status":{"state":"working"}}}`,
+			wantKind: "",
+		},
+		{
+			name:     "clean ok — task envelope state=submitted",
+			body:     `{"result":{"kind":"task","status":{"state":"submitted"}}}`,
+			wantKind: "",
+		},
+		{
+			name:     "clean ok — task envelope state=completed",
+			body:     `{"result":{"kind":"task","status":{"state":"completed"}}}`,
+			wantKind: "",
+		},
+		{
+			// Conservative: missing status.state → don't fire false-failure.
+			name:     "clean ok — task envelope no status block",
+			body:     `{"result":{"kind":"task","task_id":"abc"}}`,
+			wantKind: "",
+		},
+		{
+			// REGRESSION GUARD: terminal failure states MUST propagate as last_status.
+			// Without taskOKStates gating, the blanket "task" allowlist would have
+			// masked these — CR2 review feedback on #1716.
+			name:     "SDK error — task envelope state=failed",
+			body:     `{"result":{"kind":"task","status":{"state":"failed"}}}`,
+			wantKind: "failed",
+		},
+		{
+			name:     "SDK error — task envelope state=canceled",
+			body:     `{"result":{"kind":"task","status":{"state":"canceled"}}}`,
+			wantKind: "canceled",
+		},
+		{
+			name:     "SDK error — task envelope state=rejected",
+			body:     `{"result":{"kind":"task","status":{"state":"rejected"}}}`,
+			wantKind: "rejected",
+		},
+		{
+			name:     "SDK error — result.kind=rate_limited",
+			body:     `{"result":{"kind":"rate_limited","parts":[{"text":"error"}]}}`,
+			wantKind: "rate_limited",
+		},
+		{
+			name:     "SDK error — result.kind=quota_exhausted",
+			body:     `{"result":{"kind":"quota_exhausted"}}`,
+			wantKind: "quota_exhausted",
+		},
+		{
+			name:     "SDK error — result.kind=sdk_error",
+			body:     `{"result":{"kind":"sdk_error"}}`,
+			wantKind: "sdk_error",
+		},
+		{
+			name:     "SDK error — result.result_kind=rate_limited",
+			body:     `{"result":{"result_kind":"rate_limited"}}`,
+			wantKind: "rate_limited",
+		},
+		{
+			name:     "SDK error — error string with rate limit",
+			body:     `{"result":{"parts":[]},"error":"An error occurred: rate limit exceeded"}`,
+			wantKind: "rate_limited",
+		},
+		{
+			name:     "SDK error — error string with max-plan",
+			body:     `{"error":"Max-plan rate limit reached"}`,
+			wantKind: "quota_exhausted",
+		},
+		{
+			name:     "SDK error — error string with quota",
+			body:     `{"error":"quota exhausted for model"}`,
+			wantKind: "quota_exhausted",
+		},
+		{
+			name:     "SDK error — error string with sdk error",
+			body:     `{"error":"Claude Code returned an error result: success"}`,
+			wantKind: "sdk_error",
+		},
+		{
+			name:     "SDK error — error string with api key",
+			body:     `{"error":"invalid API key"}`,
+			wantKind: "sdk_error",
+		},
+		{
+			name:     "unknown error string — not an SDK error",
+			body:     `{"error":"something went wrong"}`,
+			wantKind: "",
+		},
+		{
+			name:     "empty response body",
+			body:     ``,
+			wantKind: "",
+		},
+		{
+			name:     "malformed JSON",
+			body:     `not valid json`,
+			wantKind: "",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := detectResultKind([]byte(tc.body))
+			if got != tc.wantKind {
+				t.Errorf("detectResultKind(%q) = %q, want %q", tc.body, got, tc.wantKind)
+			}
+		})
+	}
+}
+
+// ── TestFireSchedule_SDKError_RateLimited (#1696) ───────────────────────────────
+//
+// When ProxyA2ARequest returns HTTP 200 but the response body contains a
+// non-ok result_kind, fireSchedule must:
+//   1. Set last_status to the result_kind (not 'ok').
+//   2. Set last_error to describe the SDK error.
+//   3. Increment consecutive_sdk_errors.
+//   4. NOT auto-disable on first occurrence (threshold is 3).
+//
+// This test uses an sdkErrorProxy that returns a rate-limited body and asserts
+// the first run is recorded as 'rate_limited' with consecutive_sdk_errors=1
+// and enabled=true.
+func TestFireSchedule_SDKError_RateLimited(t *testing.T) {
+	mock := setupTestDB(t)
+
+	sched := scheduleRow{
+		ID:          "sdk1-test-sched-0001",
+		WorkspaceID: "sdk1-test-workspace1",
+		Name:        "rate-limited-job",
+		CronExpr:    "0 * * * *",
+		Timezone:    "UTC",
+		Prompt:      "do work",
+	}
+
+	// 1. active_tasks check → workspace idle
+	mock.ExpectQuery(`SELECT COALESCE`).
+		WillReturnRows(sqlmock.NewRows([]string{"coalesce"}).AddRow(0))
+
+	// 2. #1696 consecutive_sdk_errors bump — RETURNING gives us count=1.
+	//    Use ExpectQuery (not Exec) because QueryRowContext + RETURNING
+	//    produces a result set consumed via .Scan().
+	mock.ExpectQuery(`UPDATE workspace_schedules`).
+		WithArgs(sched.ID).
+		WillReturnRows(sqlmock.NewRows([]string{"consecutive_sdk_errors"}).AddRow(1))
+
+	// 3. Post-fire UPDATE — last_status='rate_limited', last_error='SDK error: result_kind=rate_limited'
+	mock.ExpectExec(`UPDATE workspace_schedules`).
+		WithArgs(sched.ID, sqlmock.AnyArg(), "rate_limited", sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// 4. activity_logs INSERT
+	mock.ExpectExec(`INSERT INTO activity_logs`).
+		WithArgs(sched.WorkspaceID, sqlmock.AnyArg(), sqlmock.AnyArg(), "rate_limited", sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	s := New(&sdkErrorProxy{kind: "rate_limited"}, nil)
+	s.fireSchedule(context.Background(), sched)
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet DB expectations for SDK-error first run: %v", err)
+	}
+}
+
+// ── TestFireSchedule_SDKError_AutoDisableOnThirdConsecutive (#1696) ───────────
+//
+// On the 3rd consecutive SDK error, fireSchedule must auto-disable the
+// schedule (enabled=false) in addition to recording the error status.
+// Threshold is 3 per #1696 requirement.
+func TestFireSchedule_SDKError_AutoDisableOnThirdConsecutive(t *testing.T) {
+	mock := setupTestDB(t)
+
+	sched := scheduleRow{
+		ID:          "sdk2-test-sched-0002",
+		WorkspaceID: "sdk2-test-workspace2",
+		Name:        "auto-disable-job",
+		CronExpr:    "0 * * * *",
+		Timezone:    "UTC",
+		Prompt:      "do work",
+	}
+
+	// 1. active_tasks check → workspace idle
+	mock.ExpectQuery(`SELECT COALESCE`).
+		WillReturnRows(sqlmock.NewRows([]string{"coalesce"}).AddRow(0))
+
+	// 2. #1696 consecutive_sdk_errors bump — RETURNING gives count=3 (threshold met).
+	//    Use ExpectQuery (not Exec) because QueryRowContext + RETURNING
+	//    produces a result set consumed via .Scan().
+	mock.ExpectQuery(`UPDATE workspace_schedules`).
+		WithArgs(sched.ID).
+		WillReturnRows(sqlmock.NewRows([]string{"consecutive_sdk_errors"}).AddRow(3))
+
+	// 3. Auto-disable UPDATE — sets enabled=false (schedule has hit 3rd SDK error)
+	mock.ExpectExec(`UPDATE workspace_schedules SET enabled`).
+		WithArgs(sched.ID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// 4. Post-fire UPDATE
+	mock.ExpectExec(`UPDATE workspace_schedules`).
+		WithArgs(sched.ID, sqlmock.AnyArg(), "rate_limited", sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// 5. activity_logs INSERT
+	mock.ExpectExec(`INSERT INTO activity_logs`).
+		WithArgs(sched.WorkspaceID, sqlmock.AnyArg(), sqlmock.AnyArg(), "rate_limited", sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	s := New(&sdkErrorProxy{kind: "rate_limited"}, nil)
+	s.fireSchedule(context.Background(), sched)
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet DB expectations for SDK-error auto-disable: %v", err)
+	}
+}
+
+// ── TestFireSchedule_SDKError_CounterResetOnCleanRun (#1696) ──────────────────
+//
+// A clean HTTP-200 run (no SDK error) must reset consecutive_sdk_errors to 0.
+// This prevents false auto-disable after intermittent SDK blips.
+func TestFireSchedule_SDKError_CounterResetOnCleanRun(t *testing.T) {
+	mock := setupTestDB(t)
+
+	sched := scheduleRow{
+		ID:          "sdk3-test-sched-0003",
+		WorkspaceID: "sdk3-test-workspace3",
+		Name:        "clean-reset-job",
+		CronExpr:    "30 * * * *",
+		Timezone:    "UTC",
+		Prompt:      "do work",
+	}
+
+	// 1. active_tasks check → workspace idle
+	mock.ExpectQuery(`SELECT COALESCE`).
+		WillReturnRows(sqlmock.NewRows([]string{"coalesce"}).AddRow(0))
+
+	// 2. No SDK error — #1696 counter is reset to 0
+	//    (lastStatus is 'ok', resultKind is empty, so we go to the reset branch)
+	mock.ExpectExec(`UPDATE workspace_schedules`).
+		WithArgs(sched.ID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// 3. Post-fire UPDATE
+	mock.ExpectExec(`UPDATE workspace_schedules`).
+		WithArgs(sched.ID, sqlmock.AnyArg(), "ok", "").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// 4. activity_logs INSERT
+	mock.ExpectExec(`INSERT INTO activity_logs`).
+		WithArgs(sched.WorkspaceID, sqlmock.AnyArg(), sqlmock.AnyArg(), "ok", "").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	s := New(&successProxy{}, nil)
+	s.fireSchedule(context.Background(), sched)
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet DB expectations for SDK-error counter reset: %v", err)
+	}
+}
+
+// ── sdkErrorProxy ──────────────────────────────────────────────────────────────
+//
+// sdkErrorProxy is a test double whose ProxyA2ARequest returns HTTP 200 but
+// embeds a non-ok result_kind in the response body, simulating a Claude Code
+// SDK that returned 200 but the inner LLM call threw a rate-limit / quota error.
+// Used by TestFireSchedule_SDKError_* to cover #1696 SDK error detection.
+type sdkErrorProxy struct {
+	kind string // result_kind value to embed in the response body
+}
+
+func (p *sdkErrorProxy) ProxyA2ARequest(
+	_ context.Context, _ string, _ []byte, _ string, _ bool,
+) (int, []byte, error) {
+	body, _ := json.Marshal(map[string]interface{}{
+		"result": map[string]interface{}{
+			"kind":  p.kind,
+			"parts": []map[string]interface{}{{"kind": "text", "text": "(no response generated)"}},
+		},
+	})
+	return 200, body, nil
+}
 
 // ── TestTruncate_utf8Safe_regression2026 ──────────────────────────────────────
 

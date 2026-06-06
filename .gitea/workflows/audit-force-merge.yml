@@ -47,12 +47,25 @@ jobs:
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           # Required-status-check contexts to evaluate at merge time.
-          # Newline-separated. Mirror this against branch protection
-          # (settings → branches → protected branch → required checks).
+          # Branch-aware JSON dict: keys are protected branch names,
+          # values are arrays of context names that branch protection
+          # requires for that branch. Mirror this against branch
+          # protection (settings → branches → protected branch →
+          # required checks) for each branch listed here.
+          #
           # Declared here rather than fetched from /branch_protections
           # because that endpoint requires admin write — sop-tier-bot is
           # read-only by design (least-privilege).
-          REQUIRED_CHECKS: |
-            CI / all-required (pull_request)
-            sop-checklist / all-items-acked (pull_request)
+          REQUIRED_CHECKS_JSON: |
+            {
+              "main": [
+                "CI / all-required (pull_request)",
+                "E2E API Smoke Test / E2E API Smoke Test (pull_request)",
+                "Handlers Postgres Integration / Handlers Postgres Integration (pull_request)"
+              ],
+              "staging": [
+                "CI / all-required (pull_request)",
+                "sop-checklist / all-items-acked (pull_request)"
+              ]
+            }
         run: bash .gitea/scripts/audit-force-merge.sh

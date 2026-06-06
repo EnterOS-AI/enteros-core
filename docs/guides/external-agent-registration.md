@@ -285,6 +285,39 @@ Canvas requests (no `X-Workspace-ID` header) and system callers
 
 ---
 
+## Multiple Workspaces From One Local MCP Bridge
+
+The standalone runtime package includes `molecule-mcp`, a local MCP bridge for
+external agents such as Claude Code, Codex, Hermes, and other tools that run
+outside the platform container fleet. One local bridge can serve multiple
+external workspaces by setting `MOLECULE_WORKSPACES`:
+
+```json
+[
+  {
+    "id": "workspace-id-local-to-hongming-org",
+    "token": "...",
+    "platform_url": "https://hongming.moleculesai.app"
+  },
+  {
+    "id": "different-workspace-id-local-to-agents-team-org",
+    "token": "...",
+    "platform_url": "https://agents-team.moleculesai.app"
+  }
+]
+```
+
+`platform_url` is the tenant routing key. The bridge registers, heartbeats,
+polls inboxes, and sends outbound A2A calls against the URL attached to the
+workspace that is doing the work.
+
+Do not add `org_id` to this config. The tenant already comes from
+`platform_url`, and the bearer token is issued by that tenant. Workspace IDs
+also do not need to be shared across orgs; each tenant can return its own
+workspace ID and token for the same local agent process.
+
+---
+
 ## Canvas Appearance
 
 External workspaces appear on the canvas with a purple **REMOTE** badge

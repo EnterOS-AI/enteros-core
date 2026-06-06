@@ -10,19 +10,43 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/provisioner"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
 	"github.com/docker/docker/client"
 	"github.com/gin-gonic/gin"
 	"gopkg.in/yaml.v3"
 )
 
 // allowedRoots are the container paths that the Files API can browse.
+//
+// `/agent-home` (added 2026-05-15, internal#425 RFC) is the container's
+// own $HOME — `/root` for openclaw, `/home/agent` for claude-code/hermes
+// — browsed via `docker exec` rather than host-side `find`. The
+// dispatch is stubbed today (returns 501); full implementation lands in
+// Phase 2b of the RFC. The allowedRoots key is added now so the canvas
+// can design its root-selector UI against the final shape and the
+// stub-vs-full transition is server-side only.
 var allowedRoots = map[string]bool{
-	"/configs":   true,
-	"/workspace": true,
-	"/home":      true,
-	"/plugins":   true,
+	"/configs":    true,
+	"/workspace":  true,
+	"/home":       true,
+	"/plugins":    true,
+	"/agent-home": true,
+}
+
+// agentHomeStubMessage is the body returned by every Files API verb
+// when `?root=/agent-home` is requested before Phase 2b lands. Keep the
+// status code 501 (Not Implemented) — the route exists, the verb is
+// understood, but the handler is unimplemented. Distinguishes from
+// 400/404 so a canvas behind a less-current server can render a clean
+// "feature pending" state instead of a generic error.
+const agentHomeStubMessage = "/agent-home not implemented yet (internal#425 RFC Phase 2b — docker-exec backend pending)"
+
+// isAgentHomeStubRequest returns true when the request targets the
+// stubbed /agent-home root. Centralised so every verb in this file
+// short-circuits with the same response shape.
+func isAgentHomeStubRequest(rootPath string) bool {
+	return rootPath == "/agent-home"
 }
 
 // maxUploadFiles limits the number of files in a single import/replace.
@@ -30,6 +54,7 @@ const maxUploadFiles = 200
 
 type TemplatesHandler struct {
 	configsDir string
+	cacheDir   string
 	docker     *client.Client
 	// wh is used by Import and ReplaceFiles to call DefaultTier() so a
 	// generated config.yaml's tier matches the SaaS-vs-self-hosted
@@ -37,6 +62,11 @@ type TemplatesHandler struct {
 	// the caller doesn't import templates that need a fresh config
 	// generated.
 	wh *WorkspaceHandler
+	// refreshCache is nil unless main wires a manifest-backed template
+	// cache refresher. POST /admin/templates/refresh uses this hook so a
+	// template repo merge can update the tenant catalog without rebuilding
+	// the full tenant image.
+	refreshCache func(ctx *gin.Context) (any, error)
 }
 
 // NewTemplatesHandler constructs a TemplatesHandler. wh may be nil for
@@ -47,13 +77,56 @@ func NewTemplatesHandler(configsDir string, dockerCli *client.Client, wh *Worksp
 	return &TemplatesHandler{configsDir: configsDir, docker: dockerCli, wh: wh}
 }
 
+func (h *TemplatesHandler) WithCacheDir(cacheDir string) *TemplatesHandler {
+	h.cacheDir = cacheDir
+	return h
+}
+
+func (h *TemplatesHandler) WithRefreshFunc(fn func(ctx *gin.Context) (any, error)) *TemplatesHandler {
+	h.refreshCache = fn
+	return h
+}
+
 // modelSpec describes a single supported model on a template: its id (sent
 // to the runtime), a human-readable label, and the env vars that must be
 // present for that model to work (e.g. API keys).
 type modelSpec struct {
 	ID          string   `json:"id" yaml:"id"`
 	Name        string   `json:"name,omitempty" yaml:"name"`
+	Provider    string   `json:"provider,omitempty" yaml:"provider"`
 	RequiredEnv []string `json:"required_env,omitempty" yaml:"required_env"`
+	// BillingMode is the billing source the DERIVED provider implies:
+	// "platform_managed" (the closed core-only platform provider; Molecule
+	// owns the upstream key + the bill) or "byok" (any other provider; the
+	// tenant supplies its own key). Set ONLY on registry-served models
+	// (RegistryModels) where DeriveProvider resolved an owning provider;
+	// empty on template-served models. internal#718 P3 — the canvas reads
+	// this to show the billing-mode of the DERIVED provider instead of its
+	// hardcoded billingModeForProvider rule.
+	BillingMode string `json:"billing_mode,omitempty" yaml:"-"`
+}
+
+// registryProviderView is the canvas-facing projection of a single registry
+// Provider entry for a registry-known runtime: the stable name, the dropdown
+// display label, the auth-env-var NAMES (never values), and the billing mode
+// the provider implies. Sourced from the provider registry
+// (internal/providers) so the canvas drops its hardcoded VENDOR_LABELS map
+// and billingModeForProvider rule (internal#718 P3, retire-list #4/#5).
+type registryProviderView struct {
+	// Name is the registry provider key (e.g. "anthropic-oauth", "platform").
+	Name string `json:"name"`
+	// DisplayName is the canvas dropdown label (registry Provider.DisplayName).
+	DisplayName string `json:"display_name,omitempty"`
+	// AuthEnv is the env-var NAMES any one of which satisfies auth for this
+	// provider (registry Provider.AuthEnv). Names only, never secret values.
+	AuthEnv []string `json:"auth_env,omitempty"`
+	// BillingMode is "platform_managed" for the closed platform provider,
+	// "byok" otherwise — keyed off the registry IsPlatform predicate so the
+	// canvas shows the DERIVED provider's billing source.
+	BillingMode string `json:"billing_mode,omitempty"`
+	// Deprecated mirrors the registry's deprecated flag so the canvas can
+	// grey the provider out without breaking saved configs.
+	Deprecated bool `json:"deprecated,omitempty"`
 }
 
 // providerRegistryEntry mirrors a row from a template's top-level
@@ -92,12 +165,16 @@ type templateSummary struct {
 	// preflight uses this as the fallback provider when `models` is empty
 	// so provider picker stays data-driven instead of hardcoded in the UI.
 	RequiredEnv []string `json:"required_env,omitempty"`
+	// RecommendedEnv mirrors runtime_config.recommended_env from the
+	// template's config.yaml. Canvas prompts for these as non-blocking
+	// optional secrets during template deploy.
+	RecommendedEnv []string `json:"recommended_env,omitempty"`
 	// Providers is the runtime's own list of supported provider slugs,
 	// sourced from runtime_config.providers in the template's config.yaml.
 	// The canvas Config tab surfaces this as the Provider override
 	// dropdown (Option B PR-5). Data-driven so each runtime owns its own
 	// taxonomy — hermes-agent supports 20+ providers; claude-code only
-	// "anthropic"; gemini-cli only "gemini" — and a future runtime with
+	// "anthropic" — and a future runtime with
 	// a different vendor list doesn't need a canvas edit. Empty list →
 	// canvas falls back to deriving suggestions from `models[].id` slug
 	// prefixes (still adapter-driven, just inferred).
@@ -117,8 +194,29 @@ type templateSummary struct {
 	// (omitempty); the canvas's existing per-model fallback continues
 	// to work for them.
 	ProviderRegistry []providerRegistryEntry `json:"provider_registry,omitempty"`
-	Skills           []string                `json:"skills"`
-	SkillCount       int                     `json:"skill_count"`
+	// RegistryBacked is true when this template's runtime is known to the
+	// provider registry (internal/providers runtimes: block) and the
+	// RegistryProviders / RegistryModels fields below were populated from it.
+	// The canvas treats a registry-backed payload as AUTHORITATIVE for the
+	// selectable provider+model list (it drops its prefix-inference fallback)
+	// — "only registered selectable" follows because the canvas can render
+	// no option the registry did not serve. False = the runtime is not in the
+	// registry (federation / external / mock); the canvas keeps using the
+	// template-served Models/Providers + its heuristic. internal#718 P3.
+	RegistryBacked bool `json:"registry_backed,omitempty"`
+	// RegistryProviders is the runtime's NATIVE provider set from the
+	// registry (ProvidersForRuntime), each with its display label, auth-env
+	// names, and billing mode. Empty when !RegistryBacked. This is the SSOT
+	// the canvas Provider dropdown consumes instead of VENDOR_LABELS.
+	RegistryProviders []registryProviderView `json:"registry_providers,omitempty"`
+	// RegistryModels is the runtime's NATIVE model set from the registry
+	// (ModelsForRuntime), each annotated with its DERIVED provider and the
+	// billing mode that provider implies. Empty when !RegistryBacked. This is
+	// the SSOT the canvas Model dropdown consumes — a template can no longer
+	// surface a model the registry does not list for the runtime.
+	RegistryModels []modelSpec `json:"registry_models,omitempty"`
+	Skills         []string    `json:"skills"`
+	SkillCount     int         `json:"skill_count"`
 	// ProvisionTimeoutSeconds lets a slow runtime declare its expected
 	// cold-boot duration in its template manifest. Canvas's
 	// ProvisioningTimeout banner respects this per-workspace via the
@@ -126,12 +224,30 @@ type templateSummary struct {
 	// 0 = template hasn't declared one, falls through to canvas's
 	// runtime-profile default.
 	ProvisionTimeoutSeconds int `json:"provision_timeout_seconds,omitempty"`
+	// Displayable lets a template opt OUT of the canvas runtime picker
+	// declaratively (config.yaml `displayable: false`) while still being a
+	// provisionable runtime. nil/absent or true → shown; only an explicit
+	// false hides it. The canvas runtime dropdown is SSOT-driven off this
+	// list (no hardcoded frontend allowlist), so this is the single place a
+	// runtime is hidden from the picker. Pointer so "unset" is distinct from
+	// "false" and omitempty keeps the payload unchanged for existing
+	// templates that never declare it.
+	Displayable *bool `json:"displayable,omitempty"`
 }
 
 // resolveTemplateDir finds the template directory for a workspace on the host.
 // Only resolves to actual templates (not ws-* dirs since those are now Docker volumes).
 // Returns empty string if no matching template is found.
 func (h *TemplatesHandler) resolveTemplateDir(wsName string) string {
+	if h.cacheDir != "" {
+		nameDir := filepath.Join(h.cacheDir, normalizeName(wsName))
+		if _, err := os.Stat(nameDir); err == nil {
+			return nameDir
+		}
+		if tmpl := findTemplateByName(h.cacheDir, wsName); tmpl != "" {
+			return filepath.Join(h.cacheDir, tmpl)
+		}
+	}
 	nameDir := filepath.Join(h.configsDir, normalizeName(wsName))
 	if _, err := os.Stat(nameDir); err == nil {
 		return nameDir
@@ -146,69 +262,120 @@ func (h *TemplatesHandler) resolveTemplateDir(wsName string) string {
 // List handles GET /templates
 func (h *TemplatesHandler) List(c *gin.Context) {
 	templates := make([]templateSummary, 0)
-	walkTemplateConfigs(h.configsDir, func(id string, data []byte) {
-		var raw struct {
-			Name        string   `yaml:"name"`
-			Description string   `yaml:"description"`
-			Tier        int      `yaml:"tier"`
-			Runtime     string   `yaml:"runtime"`
-			Model       string   `yaml:"model"`
-			Skills      []string `yaml:"skills"`
-			// Top-level `providers:` block — structured registry. Distinct
-			// from runtime_config.providers (slug list) below. Both shapes
-			// coexist in production: claude-code ships the structured
-			// registry, hermes still uses the slug list. /templates surfaces
-			// both verbatim so each runtime owns its taxonomy.
-			Providers     []providerRegistryEntry `yaml:"providers"`
-			RuntimeConfig struct {
-				Model                   string      `yaml:"model"`
-				Models                  []modelSpec `yaml:"models"`
-				RequiredEnv             []string    `yaml:"required_env"`
-				Providers               []string    `yaml:"providers"`
-				ProvisionTimeoutSeconds int         `yaml:"provision_timeout_seconds"`
-			} `yaml:"runtime_config"`
-		}
-		if err := yaml.Unmarshal(data, &raw); err != nil {
-			// Without this log a malformed config.yaml causes the
-			// template to silently disappear from /templates with no
-			// trace — the operator can't tell "excluded due to parse
-			// error" from "never existed." That matters more now that
-			// templates ship richer YAML shapes (top-level providers
-			// registry, models[] with required_env, etc.) where a
-			// type-shape mismatch on one field drops the whole entry.
-			log.Printf("templates list: skip %s: yaml.Unmarshal: %v", id, err)
+	seen := map[string]struct{}{}
+	walk := func(root string) {
+		if root == "" {
 			return
 		}
+		walkTemplateConfigs(root, func(id string, data []byte) {
+			if _, ok := seen[id]; ok {
+				return
+			}
+			seen[id] = struct{}{}
+			var raw struct {
+				Name        string   `yaml:"name"`
+				Description string   `yaml:"description"`
+				Tier        int      `yaml:"tier"`
+				Runtime     string   `yaml:"runtime"`
+				Model       string   `yaml:"model"`
+				Skills      []string `yaml:"skills"`
+				Displayable *bool    `yaml:"displayable"`
+				// Top-level `providers:` block — structured registry. Distinct
+				// from runtime_config.providers (slug list) below. Both shapes
+				// coexist in production: claude-code ships the structured
+				// registry, hermes still uses the slug list. /templates surfaces
+				// both verbatim so each runtime owns its taxonomy.
+				Providers     []providerRegistryEntry `yaml:"providers"`
+				RuntimeConfig struct {
+					Model                   string      `yaml:"model"`
+					Models                  []modelSpec `yaml:"models"`
+					RequiredEnv             []string    `yaml:"required_env"`
+					RecommendedEnv          []string    `yaml:"recommended_env"`
+					Providers               []string    `yaml:"providers"`
+					ProvisionTimeoutSeconds int         `yaml:"provision_timeout_seconds"`
+				} `yaml:"runtime_config"`
+			}
+			if err := yaml.Unmarshal(data, &raw); err != nil {
+				// Without this log a malformed config.yaml causes the
+				// template to silently disappear from /templates with no
+				// trace — the operator can't tell "excluded due to parse
+				// error" from "never existed." That matters more now that
+				// templates ship richer YAML shapes (top-level providers
+				// registry, models[] with required_env, etc.) where a
+				// type-shape mismatch on one field drops the whole entry.
+				log.Printf("templates list: skip %s: yaml.Unmarshal: %v", id, err)
+				return
+			}
+			// normalizedRuntime strips the "-default" vanilla-variant suffix
+			// (claude-code-default → claude-code). Hoisted out of the
+			// known-runtime guard so the registry enrichment below can key off
+			// the same normalised name the guard validated.
+			normalizedRuntime := strings.TrimSuffix(strings.TrimSpace(raw.Runtime), "-default")
+			if raw.Runtime != "" {
+				if _, ok := knownRuntimes[normalizedRuntime]; !ok {
+					log.Printf("templates list: skip %s: unsupported runtime %q", id, raw.Runtime)
+					return
+				}
+			}
 
-		// Model comes from either top-level (legacy) or runtime_config.model (current).
-		model := raw.Model
-		if model == "" {
-			model = raw.RuntimeConfig.Model
-		}
+			// Model comes from either top-level (legacy) or runtime_config.model (current).
+			model := raw.Model
+			if model == "" {
+				model = raw.RuntimeConfig.Model
+			}
 
-		tier := raw.Tier
-		if h.wh != nil && h.wh.IsSaaS() {
-			tier = h.wh.DefaultTier()
-		}
+			tier := raw.Tier
+			if h.wh != nil && h.wh.IsSaaS() {
+				tier = h.wh.DefaultTier()
+			}
 
-		templates = append(templates, templateSummary{
-			ID:                      id,
-			Name:                    raw.Name,
-			Description:             raw.Description,
-			Tier:                    tier,
-			Runtime:                 raw.Runtime,
-			Model:                   model,
-			Models:                  raw.RuntimeConfig.Models,
-			RequiredEnv:             raw.RuntimeConfig.RequiredEnv,
-			Providers:               raw.RuntimeConfig.Providers,
-			ProviderRegistry:        raw.Providers,
-			Skills:                  raw.Skills,
-			SkillCount:              len(raw.Skills),
-			ProvisionTimeoutSeconds: raw.RuntimeConfig.ProvisionTimeoutSeconds,
+			summary := templateSummary{
+				ID:                      id,
+				Name:                    raw.Name,
+				Description:             raw.Description,
+				Tier:                    tier,
+				Runtime:                 raw.Runtime,
+				Model:                   model,
+				Models:                  raw.RuntimeConfig.Models,
+				RequiredEnv:             raw.RuntimeConfig.RequiredEnv,
+				RecommendedEnv:          raw.RuntimeConfig.RecommendedEnv,
+				Providers:               raw.RuntimeConfig.Providers,
+				ProviderRegistry:        raw.Providers,
+				Skills:                  raw.Skills,
+				SkillCount:              len(raw.Skills),
+				ProvisionTimeoutSeconds: raw.RuntimeConfig.ProvisionTimeoutSeconds,
+				Displayable:             raw.Displayable,
+			}
+
+			// internal#718 P3: serve the SELECTABLE provider/model list from
+			// the provider registry for a registry-known runtime. Additive —
+			// the template-served Models/Providers above stay for non-registry
+			// runtimes + older canvases; this adds the authoritative
+			// registry_backed/registry_providers/registry_models block the
+			// current canvas prefers. Fail-open for unknown runtimes.
+			enrichFromRegistry(&summary, normalizedRuntime)
+
+			templates = append(templates, summary)
 		})
-	})
+	}
+	walk(h.cacheDir)
+	walk(h.configsDir)
 
 	c.JSON(http.StatusOK, templates)
+}
+
+// RefreshCache handles POST /admin/templates/refresh.
+func (h *TemplatesHandler) RefreshCache(c *gin.Context) {
+	if h.refreshCache == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "template cache refresh is not configured"})
+		return
+	}
+	result, err := h.refreshCache(c)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, result)
 }
 
 // ListFiles handles GET /workspaces/:id/files
@@ -224,7 +391,14 @@ func (h *TemplatesHandler) ListFiles(c *gin.Context) {
 	//   ?depth= — max depth to recurse (default: 1, max: 5)
 	rootPath := c.DefaultQuery("root", "/configs")
 	if !allowedRoots[rootPath] {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "root must be one of: /configs, /workspace, /home, /plugins"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "root must be one of: /configs, /workspace, /home, /plugins, /agent-home"})
+		return
+	}
+	// /agent-home dispatch is stubbed pre-Phase-2b. Short-circuit before
+	// the DB lookup + EIC dance so a canvas exercising the new root key
+	// gets a clean 501 instead of a half-effort response.
+	if isAgentHomeStubRequest(rootPath) {
+		c.JSON(http.StatusNotImplemented, gin.H{"error": agentHomeStubMessage})
 		return
 	}
 	subPath := c.DefaultQuery("path", "")
@@ -393,7 +567,11 @@ func (h *TemplatesHandler) ReadFile(c *gin.Context) {
 	ctx := c.Request.Context()
 	rootPath := c.DefaultQuery("root", "/configs")
 	if !allowedRoots[rootPath] {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "root must be one of: /configs, /workspace, /home, /plugins"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "root must be one of: /configs, /workspace, /home, /plugins, /agent-home"})
+		return
+	}
+	if isAgentHomeStubRequest(rootPath) {
+		c.JSON(http.StatusNotImplemented, gin.H{"error": agentHomeStubMessage})
 		return
 	}
 
@@ -506,7 +684,11 @@ func (h *TemplatesHandler) WriteFile(c *gin.Context) {
 	ctx := c.Request.Context()
 	rootPath := c.DefaultQuery("root", "/configs")
 	if !allowedRoots[rootPath] {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "root must be one of: /configs, /workspace, /home, /plugins"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "root must be one of: /configs, /workspace, /home, /plugins, /agent-home"})
+		return
+	}
+	if isAgentHomeStubRequest(rootPath) {
+		c.JSON(http.StatusNotImplemented, gin.H{"error": agentHomeStubMessage})
 		return
 	}
 	var wsName, instanceID, runtime string
@@ -531,7 +713,13 @@ func (h *TemplatesHandler) WriteFile(c *gin.Context) {
 		}
 		c.JSON(http.StatusOK, gin.H{"status": "saved", "path": filePath})
 		if h.wh != nil {
-			go h.wh.RestartByID(workspaceID)
+			// internal#624: 15s per-workspace debounce around the file-write
+			// → RestartByID trigger. Canvas Save fires N PUTs in a burst;
+			// without this each PUT chains into the coalesceRestart drain
+			// loop and produces back-to-back EC2 recreate cycles. The
+			// helper still uses goAsync internally (drains via
+			// h.wh.waitAsyncForTest), preserving RFC internal#524 Layer 1.
+			h.wh.maybeRestartAfterFileWrite(workspaceID)
 		}
 		return
 	}
@@ -545,7 +733,13 @@ func (h *TemplatesHandler) WriteFile(c *gin.Context) {
 		}
 		c.JSON(http.StatusOK, gin.H{"status": "saved", "path": filePath})
 		if h.wh != nil {
-			go h.wh.RestartByID(workspaceID)
+			// internal#624: 15s per-workspace debounce around the file-write
+			// → RestartByID trigger. Canvas Save fires N PUTs in a burst;
+			// without this each PUT chains into the coalesceRestart drain
+			// loop and produces back-to-back EC2 recreate cycles. The
+			// helper still uses goAsync internally (drains via
+			// h.wh.waitAsyncForTest), preserving RFC internal#524 Layer 1.
+			h.wh.maybeRestartAfterFileWrite(workspaceID)
 		}
 		return
 	}
@@ -559,7 +753,13 @@ func (h *TemplatesHandler) WriteFile(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, gin.H{"status": "saved", "path": filePath})
 	if h.wh != nil {
-		go h.wh.RestartByID(workspaceID)
+		// internal#624: 15s per-workspace debounce around the file-write
+		// → RestartByID trigger. Canvas Save fires N PUTs in a burst;
+		// without this each PUT chains into the coalesceRestart drain
+		// loop and produces back-to-back EC2 recreate cycles. The
+		// helper still uses goAsync internally (drains via
+		// h.wh.waitAsyncForTest), preserving RFC internal#524 Layer 1.
+		h.wh.maybeRestartAfterFileWrite(workspaceID)
 	}
 }
 
@@ -583,7 +783,11 @@ func (h *TemplatesHandler) DeleteFile(c *gin.Context) {
 	ctx := c.Request.Context()
 	rootPath := c.DefaultQuery("root", "/configs")
 	if !allowedRoots[rootPath] {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "root must be one of: /configs, /workspace, /home, /plugins"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "root must be one of: /configs, /workspace, /home, /plugins, /agent-home"})
+		return
+	}
+	if isAgentHomeStubRequest(rootPath) {
+		c.JSON(http.StatusNotImplemented, gin.H{"error": agentHomeStubMessage})
 		return
 	}
 	var wsName, instanceID, runtime string
@@ -608,7 +812,13 @@ func (h *TemplatesHandler) DeleteFile(c *gin.Context) {
 		}
 		c.JSON(http.StatusOK, gin.H{"status": "deleted", "path": filePath})
 		if h.wh != nil {
-			go h.wh.RestartByID(workspaceID)
+			// internal#624: 15s per-workspace debounce around the file-write
+			// → RestartByID trigger. Canvas Save fires N PUTs in a burst;
+			// without this each PUT chains into the coalesceRestart drain
+			// loop and produces back-to-back EC2 recreate cycles. The
+			// helper still uses goAsync internally (drains via
+			// h.wh.waitAsyncForTest), preserving RFC internal#524 Layer 1.
+			h.wh.maybeRestartAfterFileWrite(workspaceID)
 		}
 		return
 	}
@@ -626,7 +836,13 @@ func (h *TemplatesHandler) DeleteFile(c *gin.Context) {
 		}
 		c.JSON(http.StatusOK, gin.H{"status": "deleted", "path": filePath})
 		if h.wh != nil {
-			go h.wh.RestartByID(workspaceID)
+			// internal#624: 15s per-workspace debounce around the file-write
+			// → RestartByID trigger. Canvas Save fires N PUTs in a burst;
+			// without this each PUT chains into the coalesceRestart drain
+			// loop and produces back-to-back EC2 recreate cycles. The
+			// helper still uses goAsync internally (drains via
+			// h.wh.waitAsyncForTest), preserving RFC internal#524 Layer 1.
+			h.wh.maybeRestartAfterFileWrite(workspaceID)
 		}
 		return
 	}
@@ -639,6 +855,12 @@ func (h *TemplatesHandler) DeleteFile(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, gin.H{"status": "deleted", "path": filePath})
 	if h.wh != nil {
-		go h.wh.RestartByID(workspaceID)
+		// internal#624: 15s per-workspace debounce around the file-write
+		// → RestartByID trigger. Canvas Save fires N PUTs in a burst;
+		// without this each PUT chains into the coalesceRestart drain
+		// loop and produces back-to-back EC2 recreate cycles. The
+		// helper still uses goAsync internally (drains via
+		// h.wh.waitAsyncForTest), preserving RFC internal#524 Layer 1.
+		h.wh.maybeRestartAfterFileWrite(workspaceID)
 	}
 }

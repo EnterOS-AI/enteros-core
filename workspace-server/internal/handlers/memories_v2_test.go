@@ -27,8 +27,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/memory/contract"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/memory/namespace"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/memory/contract"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/memory/namespace"
 	"github.com/gin-gonic/gin"
 )
 
@@ -45,6 +45,9 @@ type fakePlugin struct {
 	forgetReq  contract.ForgetRequest
 }
 
+func (f *fakePlugin) UpsertNamespace(ctx context.Context, name string, body contract.NamespaceUpsert) (*contract.Namespace, error) {
+	return &contract.Namespace{Name: name, Kind: body.Kind}, nil
+}
 func (f *fakePlugin) CommitMemory(ctx context.Context, ns string, body contract.MemoryWrite) (*contract.MemoryWriteResponse, error) {
 	return nil, errors.New("not implemented in fake")
 }
@@ -511,11 +514,11 @@ func TestMemoriesV2_Forget_MissingMemoryID_400(t *testing.T) {
 // DisplayName over UUID-prefix fallback (issue #2988).
 func TestNamespaceLabelWithName_PrefersDisplayNameWhenSet(t *testing.T) {
 	cases := []struct {
-		name         string
-		raw          string
-		kind         contract.NamespaceKind
-		display      string
-		want         string
+		name    string
+		raw     string
+		kind    contract.NamespaceKind
+		display string
+		want    string
 	}{
 		{"workspace with name", "workspace:abc-1234", contract.NamespaceKindWorkspace, "mac laptop", "Workspace (mac laptop)"},
 		{"team with name", "team:abc-1234", contract.NamespaceKindTeam, "Engineering", "Team (Engineering)"},
@@ -625,12 +628,12 @@ func TestParseLimit(t *testing.T) {
 	}{
 		{"", memoriesV2DefaultLimit},
 		{"10", 10},
-		{"0", memoriesV2DefaultLimit},        // ≤0 → default, not error
-		{"-5", memoriesV2DefaultLimit},       // negative → default
-		{"abc", memoriesV2DefaultLimit},      // non-numeric → default
-		{"99999", memoriesV2MaxLimit},        // over cap → clamped
-		{"100", memoriesV2MaxLimit},          // exactly cap → kept
-		{"99", 99},                           // just under cap → kept
+		{"0", memoriesV2DefaultLimit},   // ≤0 → default, not error
+		{"-5", memoriesV2DefaultLimit},  // negative → default
+		{"abc", memoriesV2DefaultLimit}, // non-numeric → default
+		{"99999", memoriesV2MaxLimit},   // over cap → clamped
+		{"100", memoriesV2MaxLimit},     // exactly cap → kept
+		{"99", 99},                      // just under cap → kept
 	}
 	for _, tc := range cases {
 		t.Run("raw="+tc.raw, func(t *testing.T) {
@@ -741,11 +744,11 @@ func TestWithMemoryV2_FluentReturnsReceiver(t *testing.T) {
 
 func TestShortID(t *testing.T) {
 	cases := map[string]string{
-		"":                    "",
-		"short":               "short",
-		"exactly8":            "exactly8",
-		"longer-than-eight":   "longer-t",
-		"abc-1234-5678-90ab":  "abc-1234",
+		"":                   "",
+		"short":              "short",
+		"exactly8":           "exactly8",
+		"longer-than-eight":  "longer-t",
+		"abc-1234-5678-90ab": "abc-1234",
 	}
 	for in, want := range cases {
 		if got := shortID(in); got != want {

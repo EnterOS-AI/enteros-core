@@ -30,8 +30,8 @@ import (
 
 	"github.com/DATA-DOG/go-sqlmock"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/models"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/provisioner"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
 )
 
 // trackingCPProv records every Start() call in a thread-safe slice.
@@ -42,6 +42,7 @@ type trackingCPProv struct {
 	mu       sync.Mutex
 	started  []string
 	stopped  []string
+	pruned   []string // internal#734: workspaces stopped via StopAndPrune
 	startErr error
 	stopErr  error
 }
@@ -58,6 +59,13 @@ func (r *trackingCPProv) Start(_ context.Context, cfg provisioner.WorkspaceConfi
 func (r *trackingCPProv) Stop(_ context.Context, workspaceID string) error {
 	r.mu.Lock()
 	r.stopped = append(r.stopped, workspaceID)
+	r.mu.Unlock()
+	return r.stopErr
+}
+func (r *trackingCPProv) StopAndPrune(_ context.Context, workspaceID string) error {
+	r.mu.Lock()
+	r.stopped = append(r.stopped, workspaceID)
+	r.pruned = append(r.pruned, workspaceID)
 	r.mu.Unlock()
 	return r.stopErr
 }
@@ -126,6 +134,11 @@ func TestProvisionWorkspaceAuto_NoBackendMarksFailed(t *testing.T) {
 // This is the regression-prevention test for the Design Director bug
 // where 7-of-7 sub-agents went down the Docker path on SaaS.
 func TestProvisionWorkspaceAuto_RoutesToCPWhenSet(t *testing.T) {
+	// Supply the CP proxy env so the platform-managed default does not abort
+	// with MISSING_PLATFORM_PROXY (molecule-core#2162).
+	t.Setenv("MOLECULE_LLM_BASE_URL", "https://api.example.test/api/v1/internal/llm/openai/v1")
+	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
+
 	mock := setupTestDB(t)
 	mock.MatchExpectationsInOrder(false)
 
@@ -589,6 +602,11 @@ func TestNoCallSiteCallsBareStop(t *testing.T) {
 // count without mocking out the retry helper itself, which would
 // invert the test contract — the retry IS the dispatcher's job here).
 func TestRestartWorkspaceAuto_RoutesToCPWhenSet(t *testing.T) {
+	// Supply the CP proxy env so the platform-managed default does not abort
+	// with MISSING_PLATFORM_PROXY (molecule-core#2162).
+	t.Setenv("MOLECULE_LLM_BASE_URL", "https://api.example.test/api/v1/internal/llm/openai/v1")
+	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
+
 	rec := &trackingCPProv{}
 	bcast := &concurrentSafeBroadcaster{}
 	h := NewWorkspaceHandler(bcast, nil, "http://localhost:8080", t.TempDir())
@@ -787,6 +805,11 @@ func TestResumeHandler_UsesProvisionWorkspaceAuto(t *testing.T) {
 // the async tests; the absence of `go` semantics is the load-bearing
 // distinction we're pinning.
 func TestProvisionWorkspaceAutoSync_RoutesToCPWhenSet(t *testing.T) {
+	// Supply the CP proxy env so the platform-managed default does not abort
+	// with MISSING_PLATFORM_PROXY (molecule-core#2162).
+	t.Setenv("MOLECULE_LLM_BASE_URL", "https://api.example.test/api/v1/internal/llm/openai/v1")
+	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
+
 	mock := setupTestDB(t)
 	mock.MatchExpectationsInOrder(false)
 	// provisionWorkspaceCP runs prepareProvisionContext synchronously, which

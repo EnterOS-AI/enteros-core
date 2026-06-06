@@ -47,23 +47,23 @@ echo "  Cross-Agent Chat: Agents Talk to Each Other"
 echo "============================================"
 echo ""
 
-# --- Create 3 agents: PM (LangGraph), Developer (CrewAI), Researcher (AutoGen) ---
+# --- Create 3 agents: PM (Claude Code), Developer (OpenClaw), Researcher (Codex) ---
 echo "--- Creating 3 agents ---"
 
 R=$(curl -s -X POST "$PLATFORM/workspaces" -H 'Content-Type: application/json' \
-  -d '{"name":"PM","role":"Project Manager","tier":2,"template":"langgraph"}')
+  -d '{"name":"PM","role":"Project Manager","tier":2,"template":"claude-code-default"}')
 PM=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
-echo "PM (LangGraph): $PM"
+echo "PM (Claude Code): $PM"
 
 R=$(curl -s -X POST "$PLATFORM/workspaces" -H 'Content-Type: application/json' \
-  -d '{"name":"Developer","role":"Code implementation","tier":2,"template":"crewai"}')
+  -d '{"name":"Developer","role":"Code implementation","tier":2,"template":"openclaw"}')
 DEV=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
-echo "Developer (CrewAI): $DEV"
+echo "Developer (OpenClaw): $DEV"
 
 R=$(curl -s -X POST "$PLATFORM/workspaces" -H 'Content-Type: application/json' \
-  -d '{"name":"Researcher","role":"Research and analysis","tier":2,"template":"autogen"}')
+  -d '{"name":"Researcher","role":"Research and analysis","tier":2,"template":"codex"}')
 RES=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
-echo "Researcher (AutoGen): $RES"
+echo "Researcher (Codex): $RES"
 
 # --- Set hierarchy: PM -> Developer, Researcher ---
 echo ""
@@ -136,7 +136,7 @@ check "Researcher responds directly" "agent" "$RESP"
 echo ""
 echo "--- Test 2: PM delegates to Researcher (cross-runtime A2A) ---"
 echo "  Asking PM to research something (should delegate to Researcher)..."
-RESP=$(a2a_send "$PM" "Please ask the Researcher to briefly explain what LangGraph is.")
+RESP=$(a2a_send "$PM" "Please ask the Researcher to briefly explain what Claude Code is.")
 echo "  PM says: $RESP"
 # The response should contain info from the Researcher
 check "PM got Researcher's response" "graph\|agent\|lang\|workflow" "$RESP"

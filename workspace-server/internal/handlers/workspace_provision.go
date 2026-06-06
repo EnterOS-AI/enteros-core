@@ -10,11 +10,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/crypto"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/models"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/provisioner"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/wsauth"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/crypto"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/memory/contract"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wsauth"
 	"gopkg.in/yaml.v3"
 )
 
@@ -128,7 +129,7 @@ func (h *WorkspaceHandler) provisionWorkspaceOpts(workspaceID, templatePath stri
 							workspaceID, filepath.Base(runtimeTemplate))
 						templatePath = runtimeTemplate
 						// Rebuild cfg with the recovered template path so Start() sees it.
-						cfg = h.buildProvisionerConfig(ctx, workspaceID, templatePath, configFiles, payload, prepared.EnvVars, prepared.PluginsPath, prepared.AwarenessNamespace)
+						cfg = h.buildProvisionerConfig(ctx, workspaceID, templatePath, configFiles, payload, prepared.EnvVars, prepared.Config.WorkspaceSecretKeys, prepared.PluginsPath)
 						cfg.ResetClaudeSession = resetClaudeSession
 						recovered = true
 						break
@@ -184,20 +185,45 @@ func (h *WorkspaceHandler) provisionWorkspaceOpts(workspaceID, templatePath stri
 	// which transitions status to 'online' and broadcasts WORKSPACE_ONLINE
 }
 
-// seedInitialMemories inserts a list of MemorySeed entries into agent_memories
-// for the given workspace. Called during workspace creation and org import to
-// pre-populate memories from config/template. Non-fatal: each insert is
-// attempted independently and failures are logged. Issue #1050.
-// maxMemoryContentLength is the maximum allowed size for a single memory content
-// field. Content exceeding this limit is truncated to prevent storage exhaustion
-// (CWE-400) and OOM on read paths. The limit is intentionally generous — it fits
-// a ~64k context window worth of text — but small enough to prevent abuse.
+// seedInitialMemories writes a list of MemorySeed entries through the v2
+// memory plugin for the given workspace. Called during workspace creation
+// and org import to pre-populate memories from config/template (issue
+// #1050). Non-fatal: each plugin call is attempted independently and
+// failures are logged.
+//
+// Issue #1755: post-A1 (#1747) v2 is the only memory backend; writing
+// into `agent_memories` would be invisible to `recall_memory` (which
+// reads exclusively from the plugin). When the plugin isn't wired
+// (WithSeedMemoryPlugin not called, i.e. `MEMORY_PLUGIN_URL` unset on
+// platform-tenant), seedInitialMemories logs a loud warning and skips
+// — seeded memories simply don't materialise on that operator's
+// deployment. There is no SQL fallback.
+//
+// Scope handling: the v2 plugin's data model has no `scope` column. All
+// seeded memories land in `workspace:<id>` (the workspace's private
+// namespace). Pre-A1 callers wrote TEAM/GLOBAL-scoped memories into
+// `agent_memories` with `namespace=workspace:<id>` anyway, so this is
+// behaviour-preserving for LOCAL and a no-op-shrink for TEAM/GLOBAL
+// (those scopes can be promoted later via an explicit
+// `commit_memory_v2` call by the agent).
+//
+// maxMemoryContentLength is the maximum allowed size for a single
+// memory content field. Content exceeding this limit is truncated to
+// prevent storage exhaustion (CWE-400) and OOM on read paths. The
+// limit is intentionally generous — it fits a ~64k context window
+// worth of text — but small enough to prevent abuse.
 const maxMemoryContentLength = 100_000 // ~100 KiB of text
 
-func seedInitialMemories(ctx context.Context, workspaceID string, memories []models.MemorySeed, awarenessNamespace string) {
+func (h *WorkspaceHandler) seedInitialMemories(ctx context.Context, workspaceID string, memories []models.MemorySeed) {
 	if len(memories) == 0 {
 		return
 	}
+	if h.seedMemoryPlugin == nil {
+		log.Printf("seedInitialMemories: ⚠️  skipping %d memories for workspace %s — v2 memory plugin not wired (set MEMORY_PLUGIN_URL on platform-tenant). Seeded memories from this template are not persisted.", len(memories), workspaceID)
+		return
+	}
+	namespace := workspaceMemoryNamespace(workspaceID)
+	seeded := 0
 	for _, mem := range memories {
 		scope := strings.ToUpper(mem.Scope)
 		if scope == "" {
@@ -210,9 +236,10 @@ func seedInitialMemories(ctx context.Context, workspaceID string, memories []mod
 		if mem.Content == "" {
 			continue
 		}
-		// #1066: enforce content length limit to prevent storage exhaustion (CWE-400).
-		// Truncate oversized content rather than rejecting the whole insert so that
-		// template authors get a predictable fallback rather than a silent skip.
+		// #1066: enforce content length limit to prevent storage exhaustion
+		// (CWE-400). Truncate oversized content rather than rejecting the
+		// whole insert so that template authors get a predictable fallback
+		// rather than a silent skip.
 		content := mem.Content
 		if len(content) > maxMemoryContentLength {
 			content = content[:maxMemoryContentLength]
@@ -220,27 +247,32 @@ func seedInitialMemories(ctx context.Context, workspaceID string, memories []mod
 				workspaceID, scope, len(mem.Content), maxMemoryContentLength)
 		}
 		redactedContent, _ := redactSecrets(workspaceID, content)
-		if _, err := db.DB.ExecContext(ctx, `
-			INSERT INTO agent_memories (workspace_id, content, scope, namespace)
-			VALUES ($1, $2, $3, $4)
-		`, workspaceID, redactedContent, scope, awarenessNamespace); err != nil {
-			log.Printf("seedInitialMemories: failed to insert memory for %s (scope=%s): %v", workspaceID, scope, err)
+		if _, err := h.seedMemoryPlugin.CommitMemory(ctx, namespace, contract.MemoryWrite{
+			Content: redactedContent,
+			// Kind = fact: seeded memories are factual baseline knowledge,
+			// not session summaries or runtime checkpoints.
+			Kind: contract.MemoryKindFact,
+			// Source = runtime: the platform (not the agent) is writing
+			// these on the agent's behalf at provision time. Distinct from
+			// `agent` (commit_memory MCP call) and `user` (canvas write).
+			Source: contract.MemorySourceRuntime,
+		}); err != nil {
+			log.Printf("seedInitialMemories: plugin commit failed for %s (scope=%s): %v", workspaceID, scope, err)
+			continue
 		}
+		seeded++
 	}
-	log.Printf("seedInitialMemories: seeded %d memories for workspace %s", len(memories), workspaceID)
+	if seeded > 0 {
+		log.Printf("seedInitialMemories: seeded %d/%d memories for workspace %s via v2 plugin (namespace=%s)",
+			seeded, len(memories), workspaceID, namespace)
+	}
 }
 
-func workspaceAwarenessNamespace(workspaceID string) string {
+// workspaceMemoryNamespace returns the canonical v2 memory namespace
+// string for a workspace. Matches the form produced by
+// internal/memory/namespace/resolver.go for self-reads (issue #1735).
+func workspaceMemoryNamespace(workspaceID string) string {
 	return fmt.Sprintf("workspace:%s", workspaceID)
-}
-
-func (h *WorkspaceHandler) loadAwarenessNamespace(ctx context.Context, workspaceID string) string {
-	var awarenessNamespace string
-	err := db.DB.QueryRowContext(ctx, `SELECT COALESCE(awareness_namespace, '') FROM workspaces WHERE id = $1`, workspaceID).Scan(&awarenessNamespace)
-	if err != nil || awarenessNamespace == "" {
-		return workspaceAwarenessNamespace(workspaceID)
-	}
-	return awarenessNamespace
 }
 
 func (h *WorkspaceHandler) buildProvisionerConfig(
@@ -249,7 +281,8 @@ func (h *WorkspaceHandler) buildProvisionerConfig(
 	configFiles map[string][]byte,
 	payload models.CreateWorkspacePayload,
 	envVars map[string]string,
-	pluginsPath, awarenessNamespace string,
+	workspaceSecretKeys map[string]struct{},
+	pluginsPath string,
 ) provisioner.WorkspaceConfig {
 	// Per-workspace workspace_dir takes priority over global WORKSPACE_DIR env var.
 	// If neither is set, the provisioner creates an isolated Docker volume.
@@ -261,7 +294,14 @@ func (h *WorkspaceHandler) buildProvisionerConfig(
 	workspaceAccess := payload.WorkspaceAccess
 	if (workspacePath == "" || workspaceAccess == "") && db.DB != nil {
 		var dbDir, dbAccess string
-		if err := db.DB.QueryRow(
+		// QueryRowContext (not QueryRow) so the provision-timeout ctx
+		// propagates here too. Previously ctx flowed in only to be passed
+		// to resolveRuntimeImage; that dead reader was removed by
+		// RFC internal#617 / task #335. Wiring ctx into the surviving DB
+		// query keeps the parameter load-bearing and is a small correctness
+		// nudge (a 10s ProvisionTimeout now actually bounds this lookup).
+		if err := db.DB.QueryRowContext(
+			ctx,
 			`SELECT COALESCE(workspace_dir, ''), COALESCE(workspace_access, 'none') FROM workspaces WHERE id = $1`,
 			workspaceID,
 		).Scan(&dbDir, &dbAccess); err == nil {
@@ -281,19 +321,40 @@ func (h *WorkspaceHandler) buildProvisionerConfig(
 	}
 
 	return provisioner.WorkspaceConfig{
-		WorkspaceID:        workspaceID,
-		TemplatePath:       templatePath,
-		ConfigFiles:        configFiles,
-		PluginsPath:        pluginsPath,
-		WorkspacePath:      workspacePath,
-		WorkspaceAccess:    workspaceAccess,
-		Tier:               payload.Tier,
-		Runtime:            payload.Runtime,
-		EnvVars:            envVars,
-		PlatformURL:        h.platformURL,
-		AwarenessURL:       os.Getenv("AWARENESS_URL"),
-		AwarenessNamespace: awarenessNamespace,
-		Image:              resolveRuntimeImage(ctx, payload.Runtime),
+		WorkspaceID:     workspaceID,
+		TemplatePath:    templatePath,
+		ConfigFiles:     configFiles,
+		PluginsPath:     pluginsPath,
+		WorkspacePath:   workspacePath,
+		WorkspaceAccess: workspaceAccess,
+		Tier:            payload.Tier,
+		Runtime:         payload.Runtime,
+		InstanceType:    payload.Compute.InstanceType,
+		DiskGB:          int32(payload.Compute.Volume.RootGB),
+		DataPersistence: payload.Compute.DataPersistence,
+		Provider:        payload.Compute.Provider,
+		Display: provisioner.WorkspaceDisplayConfig{
+			Mode:     payload.Compute.Display.Mode,
+			Width:    payload.Compute.Display.Width,
+			Height:   payload.Compute.Display.Height,
+			Protocol: payload.Compute.Display.Protocol,
+		},
+		EnvVars: envVars,
+		// Forensic #145: positive provenance set so the SCM-write-token guard
+		// (cp_provisioner.Start) exempts a workspace-authored GITEA_TOKEN from
+		// the operator-bleed strip while still stripping global/persona-merged
+		// SCM tokens. Carried by both Docker- and CP-mode configs.
+		WorkspaceSecretKeys: workspaceSecretKeys,
+		PlatformURL:         h.platformURL,
+		// Image left empty — molecule-core's runtime_image_pins table (mig
+		// 047, dead reader removed by RFC internal#617 / task #335) was an
+		// aspirational SSOT that never received a writer. CP's
+		// runtime_image_pins (CP migration 027) is the single SSOT; the
+		// pin is applied at CP's provisioner layer before this code path
+		// runs. Empty here means selectImage() falls back to the legacy
+		// RuntimeImages[Runtime] :latest lookup, which is what the dead
+		// reader's sql.ErrNoRows path was producing already.
+		Image: "",
 	}
 }
 
@@ -432,6 +493,17 @@ func findTemplateByName(configsDir, name string) string {
 	return ""
 }
 
+func resolveWorkspaceTemplatePath(configsDir, cacheDir, template string) (string, error) {
+	if cacheDir != "" {
+		if p, err := resolveInsideRoot(cacheDir, template); err != nil {
+			return "", err
+		} else if _, statErr := os.Stat(p); statErr == nil {
+			return p, nil
+		}
+	}
+	return resolveInsideRoot(configsDir, template)
+}
+
 // resolveOrgTemplate looks for a matching role directory under
 // configsDir/org-templates/ and returns the absolute path and a short label
 // ("org-templates/<dir>"). Used by the restart handler's rebuild_config path
@@ -462,15 +534,13 @@ func configDirName(workspaceID string) string {
 }
 
 // knownRuntimes is the allowlist of runtime strings the provisioner will
-// accept. Unknown values are coerced to the default ("langgraph") instead
+// accept. Unknown values are coerced to the default ("claude-code") instead
 // of being splatted into filepath.Join + config.yaml templating, which
 // closes both the YAML-injection vector (#241) where an attacker could
 // smuggle `initial_prompt: run id && curl …` through a crafted runtime
 // string, and the path-traversal oracle where `runtime: ../../sensitive`
 // probed host directories for existence.
 //
-// Keep in sync with workspace/build-all.sh — adding a new
-// runtime means bumping both this list and the Docker image tags.
 // knownRuntimes is populated from manifest.json at service init (see
 // runtime_registry.go). The package init order is:
 //  1. var knownRuntimes = fallbackRuntimes
@@ -533,14 +603,49 @@ func (h *WorkspaceHandler) ensureDefaultConfig(workspaceID string, payload model
 	// via a crafted runtime string (#241).
 	runtime := sanitizeRuntime(payload.Runtime)
 
-	// Generate a minimal config.yaml
+	// Generate a minimal config.yaml.
+	//
+	// SSOT (CTO 2026-05-22): model is REQUIRED user input. The platform
+	// must not provide a default; the runtime must not fall back. The
+	// Create handler is responsible for rejecting empty model BEFORE
+	// reaching provisionWorkspace; this is a defence-in-depth assertion.
+	// If we hit here with an empty model the YAML below would still
+	// render a `model: ""` line — which renders all downstream provider
+	// derivation undefined. Log loudly and let the workspace boot into
+	// not_configured rather than masking the contract violation with a
+	// silently-broken default (the prior `anthropic:claude-opus-4-7`
+	// fallback was the canonical example — every codex workspace
+	// created without an explicit model wedged).
 	model := payload.Model
 	if model == "" {
-		// SSOT: per-runtime defaults live in models/runtime_defaults.go
-		// (see RFC #2873). Was previously duplicated here AND in
-		// org_import.go; consolidating prevents silent drift.
-		model = models.DefaultModel(runtime)
+		log.Printf("ensureDefaultConfig: workspace %s reached provisioning with empty model — Create handler should have rejected this; rendering empty model: \"\" in config.yaml (workspace will boot not_configured)", workspaceID)
 	}
+
+	// Derive the provider from the providers manifest and stamp it into the
+	// generated config BEFORE claude-code model normalization strips the
+	// slash-prefix. DeriveProvider needs the FULL, un-normalized model id
+	// (e.g. "moonshot/kimi-k2.6") for the exact-id match that resolves the
+	// canvas claude-code case to provider=platform — normalizing to
+	// "kimi-k2.6" first would lose that match.
+	//
+	// Why this exists (RFC#340 Fix A): a canvas-created claude-code workspace
+	// with model "moonshot/kimi-k2.6" booted NOT_CONFIGURED — the adapter
+	// derived provider="moonshot" (slash-split of the model id) which is not
+	// in the providers registry. CP bakes `provider: platform` via heredoc,
+	// but the cp#329 config-bundle fetch overwrites /configs/config.yaml with
+	// THIS (previously providerless) bundle version, so molecule-runtime
+	// config.py re-derived the wrong provider. Stamping the manifest-derived
+	// provider here (mirroring CP's buildModelProviderYAML shape) makes the
+	// config the adapter reads carry the canonical provider.
+	//
+	// Reuses the SAME manifest path the config-SAVE validators use
+	// (providerRegistry() + Manifest.DeriveProvider; see
+	// model_registry_validation.go). On a derive MISS (unknown/unregistered
+	// model, or registry unavailable) provider is left empty and the field is
+	// omitted below — preserving today's behavior; never fail provisioning on
+	// a derive miss.
+	derivedProvider := deriveDefaultConfigProvider(runtime, model)
+
 	if runtime == "claude-code" {
 		model = normalizeClaudeCodeModel(model)
 	}
@@ -568,6 +673,14 @@ func (h *WorkspaceHandler) ensureDefaultConfig(workspaceID string, payload model
 	// Model always at top level — config.py reads raw["model"] for all runtimes.
 	configYAML += fmt.Sprintf("model: %s\n", quoteModel)
 
+	// Stamp the manifest-derived provider at top level (mirroring CP's
+	// buildModelProviderYAML). Omitted entirely on a derive miss so the prior
+	// behavior — no `provider:` key, runtime re-derives — is preserved for
+	// unregistered models (requirement #3).
+	if derivedProvider != "" {
+		configYAML += fmt.Sprintf("provider: '%s'\n", yamlEscapeSingleQuotedProvider(derivedProvider))
+	}
+
 	// Add runtime_config. required_env is intentionally omitted — the
 	// platform injects secrets at container-start time via the secrets API,
 	// and preflight already validates that the env vars are present before
@@ -577,12 +690,58 @@ func (h *WorkspaceHandler) ensureDefaultConfig(workspaceID string, payload model
 	if runtime == "claude-code" {
 		configYAML += fmt.Sprintf("  model: %s\n", quoteModel)
 	}
+	// Mirror the top-level provider under runtime_config (CP writes both).
+	if derivedProvider != "" {
+		configYAML += fmt.Sprintf("  provider: '%s'\n", yamlEscapeSingleQuotedProvider(derivedProvider))
+	}
 	configYAML += "  timeout: 0\n"
 
 	files["config.yaml"] = []byte(configYAML)
 
 	log.Printf("Provisioner: generated %d config files for workspace %s (runtime: %s)", len(files), workspaceID, runtime)
 	return files
+}
+
+// deriveDefaultConfigProvider resolves the provider name the adapter should
+// see for (runtime, model) using the SAME providers manifest the config-SAVE
+// validators use (providerRegistry() + Manifest.DeriveProvider; see
+// model_registry_validation.go). It is intentionally fail-OPEN: any miss
+// (empty model, registry unavailable, unknown runtime, or a model the runtime
+// does not own) returns "" so the caller omits the `provider:` field and the
+// generated config keeps its pre-fix shape. It NEVER fails provisioning.
+//
+// `model` must be the FULL, un-normalized id (e.g. "moonshot/kimi-k2.6") so
+// DeriveProvider's exact-id match resolves the canvas claude-code case to
+// provider=platform. The availableAuthEnv arg is nil here — config-generation
+// has no per-workspace auth context yet (secrets are injected at container
+// start), matching the validators' nil call.
+func deriveDefaultConfigProvider(runtime, model string) string {
+	if strings.TrimSpace(model) == "" {
+		return ""
+	}
+	m, err := providerRegistry()
+	if err != nil || m == nil {
+		// Registry unavailable (a build-time defect the gen/sync gates catch).
+		// Fail open — do not stamp a provider, do not block provisioning.
+		return ""
+	}
+	p, err := m.DeriveProvider(runtime, model, nil)
+	if err != nil {
+		// Unknown runtime (federation / non-first-party) or a model the
+		// runtime does not own. Either way, omit the provider and let the
+		// runtime fall back to its prior derivation — preserving today's
+		// behavior for unregistered models.
+		return ""
+	}
+	return p.Name
+}
+
+// yamlEscapeSingleQuotedProvider escapes a value for a YAML single-quoted
+// scalar, mirroring CP's buildModelProviderYAML (a literal single quote is
+// doubled). Provider names are registry-controlled identifiers, so this is a
+// defense-in-depth measure rather than a hot path.
+func yamlEscapeSingleQuotedProvider(v string) string {
+	return strings.ReplaceAll(v, "'", "''")
 }
 
 func normalizeClaudeCodeModel(model string) string {
@@ -598,7 +757,7 @@ func (h *WorkspaceHandler) defaultTemplateProvidersYAML(runtime string) string {
 		return ""
 	}
 	templateName := runtime + "-default"
-	templatePath, err := resolveInsideRoot(h.configsDir, templateName)
+	templatePath, err := resolveWorkspaceTemplatePath(h.configsDir, h.cacheDir, templateName)
 	if err != nil {
 		log.Printf("Provisioner: default template providers skipped for runtime %s: %v", runtime, err)
 		return ""
@@ -639,131 +798,21 @@ func (h *WorkspaceHandler) defaultTemplateProvidersYAML(runtime string) string {
 	return ""
 }
 
-// deriveProviderFromModelSlug maps a hermes-agent model slug prefix to
-// its provider name — a Go translation of the case statement in
-// workspace-configs-templates/hermes/scripts/derive-provider.sh that we
-// can run at provision time so LLM_PROVIDER lands in workspace_secrets
-// (and from there, into /configs/config.yaml via CP user-data) before
-// the container ever boots.
+// internal#718 P4 closure — `deriveProviderFromModelSlug` (retire-list #3)
+// has been removed together with its only caller (WorkspaceHandler.Create's
+// setProviderSecret write) and the LLM_PROVIDER workspace_secret it
+// populated.
 //
-// Returns "" when the prefix isn't recognized OR when the runtime-only
-// override would be needed to pick a provider — the caller skips the
-// LLM_PROVIDER write in that case so derive-provider.sh keeps the final
-// say at boot. derive-provider.sh remains the source of truth: this is
-// strictly a *gating* hint that survives restarts and gives CP a YAML
-// field to populate. Without it, "Save+Restart" would lose the user's
-// provider choice every time CP regenerates the config.
-//
-// Two intentional differences from the shell version:
-//
-//  1. nousresearch/* and openai/* both return "openrouter" here. The
-//     shell script special-cases "prefer nous if HERMES_API_KEY set" /
-//     "prefer custom if OPENAI_API_KEY set", but those depend on
-//     runtime env that may not yet be loaded at provision time. We pick
-//     the safe default ("openrouter" reaches both Hermes 3 and OpenAI
-//     models without extra config); derive-provider.sh's runtime check
-//     can still upgrade to nous/custom when the keys are present.
-//
-//  2. Unknown prefixes return "" instead of "auto". Persisting "auto"
-//     would block a future "Save+Restart" with a known prefix from
-//     re-deriving — the CP YAML field is sticky once written. Returning
-//     "" means the caller skips the write and the runtime falls through
-//     to derive-provider.sh's *=auto branch on its own.
-//
-// Cover the same prefix list as derive-provider.sh's case statement;
-// keep both files in sync when a new provider is added (table-driven
-// test in workspace_provision_shared_test.go pins the mapping).
-func deriveProviderFromModelSlug(model string) string {
-	if model == "" {
-		return ""
-	}
-	idx := strings.Index(model, "/")
-	if idx <= 0 {
-		return ""
-	}
-	prefix := model[:idx]
-	switch prefix {
-	// Direct-SDK providers (clean 1:1 prefix→provider mapping).
-	case "minimax":
-		return "minimax"
-	case "minimax-cn":
-		return "minimax-cn"
-	case "anthropic":
-		return "anthropic"
-	case "gemini":
-		return "gemini"
-	case "deepseek":
-		return "deepseek"
-	case "zai":
-		return "zai"
-	case "kimi-coding":
-		return "kimi-coding"
-	case "kimi-coding-cn":
-		return "kimi-coding-cn"
-	case "alibaba", "dashscope", "qwen":
-		return "alibaba"
-	case "xiaomi", "mimo":
-		return "xiaomi"
-	case "arcee", "arcee-ai":
-		return "arcee"
-	case "nvidia", "nim":
-		return "nvidia"
-	case "ollama-cloud":
-		return "ollama-cloud"
-	case "huggingface", "hf":
-		return "huggingface"
-	case "ai-gateway", "aigateway":
-		return "ai-gateway"
-	case "kilocode":
-		return "kilocode"
-	case "opencode-zen":
-		return "opencode-zen"
-	case "opencode-go":
-		return "opencode-go"
-	// Aggregator + explicit catch-alls.
-	case "openrouter":
-		return "openrouter"
-	case "custom":
-		return "custom"
-	// Runtime-only override candidates. derive-provider.sh's
-	// HERMES_API_KEY / OPENAI_API_KEY checks happen at boot; we pick the
-	// safe default (openrouter reaches both Hermes 3 and OpenAI without
-	// extra config) and let the script upgrade to nous/custom at runtime.
-	case "nousresearch", "openai":
-		return "openrouter"
-	// Additional 1:1 prefix→provider mappings — kept aligned with upstream's
-	// HERMES_INFERENCE_PROVIDER list (NousResearch/hermes-agent v0.12.0,
-	// 2026-04-30) and the additional case clauses in derive-provider.sh.
-	// The drift gate in derive_provider_drift_test.go enforces parity.
-	case "xai", "grok":
-		return "xai"
-	case "bedrock", "aws":
-		return "bedrock"
-	case "tencent", "tencent-tokenhub":
-		return "tencent-tokenhub"
-	case "gmi":
-		return "gmi"
-	case "qwen-oauth":
-		return "qwen-oauth"
-	case "lmstudio", "lm-studio":
-		return "lmstudio"
-	case "minimax-oauth":
-		return "minimax-oauth"
-	case "alibaba-coding-plan":
-		return "alibaba-coding-plan"
-	case "google-gemini-cli":
-		return "google-gemini-cli"
-	case "openai-codex":
-		return "openai-codex"
-	case "copilot-acp":
-		return "copilot-acp"
-	case "copilot":
-		return "copilot"
-	}
-	// Unknown prefix → don't persist a guess. derive-provider.sh's
-	// *=auto fallback handles it at runtime.
-	return ""
-}
+// The hand-rolled prefix switch was a Go mirror of
+// workspace-configs-templates/hermes/scripts/derive-provider.sh kept in
+// sync via a drift test. The replacement is providers.Manifest.DeriveProvider
+// (synced in P2-A), which derives the provider from (runtime, model)
+// against the registry SSOT at every decision point — billing (P2-B),
+// CP user-data emission (this PR's CP-side commit), validation
+// (P3 PR-C). The shell script in the hermes template continues to be the
+// runtime fallback for unregistered models; codegen of the template's
+// providers block from the registry is the P4 follow-up gated on
+// registry data growth.
 
 // applyRuntimeModelEnv exposes the workspace's selected model via an
 // env var the target runtime's install.sh / start.sh knows to read.
@@ -772,13 +821,13 @@ func deriveProviderFromModelSlug(model string) string {
 //
 // Why per-runtime rather than a generic MOLECULE_MODEL: each runtime
 // installer has its own config schema and naming (hermes writes to
-// ~/.hermes/config.yaml with `model.default`; langgraph reads from
+// ~/.hermes/config.yaml with `model.default`; codex reads from
 // /configs/config.yaml directly; future IoT/robotics targets may have
 // firmware manifests). Keeping the contract owned by the runtime
 // template means adding a new runtime doesn't require edits on the
 // tenant side for each one.
 //
-// For runtimes with no env-based model override (langgraph etc. read
+// For runtimes with no env-based model override (codex etc. read
 // model from /configs/config.yaml which CP user-data generates from
 // payload.Model at boot), this is a no-op — no harm in the switch
 // being empty for those cases.
@@ -786,51 +835,52 @@ func applyRuntimeModelEnv(envVars map[string]string, runtime, model string) {
 	// Resolution order (priority high → low):
 	//   1. payload.Model (caller passed the canvas-picked model id verbatim)
 	//   2. envVars["MOLECULE_MODEL"]  (the canonical, unambiguous name)
-	//   3. envVars["MODEL"]  (workspace_secret persisted by /org/import via
-	//      the persona env file — MODEL=MiniMax-M2.7-highspeed etc.)
-	//   4. envVars["MODEL_PROVIDER"] (legacy + misleadingly named: it carries
-	//      a *model id*, never the provider — that's LLM_PROVIDER. Historically
-	//      set by canvas Save+Restart's PUT /model; the post-2026-05-08
-	//      persona-env convention sometimes (mis)set it to a provider slug
-	//      ("minimax") or a runtime name ("claude-code"), neither a valid
-	//      model id — see internal#226. Only fires when the better-named
-	//      vars are absent.)
+	//   3. envVars["MODEL"]  (workspace_secret — written by SetModel /
+	//      WorkspaceHandler.Create / persona env file; the only correct
+	//      home for a picked model id).
 	//
-	// Pre-fix bug: this function unconditionally OVERWROTE envVars["MODEL"]
-	// with the MODEL_PROVIDER slug (when payload.Model was empty), wiping
-	// the operator's explicit per-persona MODEL secret on every restart.
-	// Symptom: a workspace whose persona env said
-	// MODEL=MiniMax-M2.7-highspeed booted fine on first /org/import (the
-	// envVars map was populated direct from the env file), then on the
-	// next Restart the workspace_secrets-derived MODEL got clobbered by
-	// MODEL_PROVIDER="minimax" — the literal slug, not a valid model id —
-	// and the workspace template's adapter routed to providers[0]
-	// (anthropic-oauth) and wedged at SDK initialize. Caught 2026-05-08
-	// during Phase 4 verification of template-claude-code PR #9.
-	if model == "" {
-		model = envVars["MOLECULE_MODEL"]
-	}
-	if model == "" {
-		model = envVars["MODEL"]
-	}
-	if model == "" {
-		model = envVars["MODEL_PROVIDER"]
-	}
+	// Pre-fix bug (2026-05-08): this function used to consult
+	// envVars["MODEL_PROVIDER"] as a fourth fallback AND unconditionally
+	// overwrite envVars["MODEL"] with that slug when payload.Model was
+	// empty. The MODEL_PROVIDER key was misleadingly named — it carried
+	// a model id, never a provider — and the persona-env convention
+	// sometimes (mis)set it to a provider slug ("minimax") or a runtime
+	// name ("claude-code"), neither a valid model id. Symptom: a
+	// workspace whose persona env said MODEL=MiniMax-M2.7-highspeed
+	// booted fine on first /org/import, then on the next Restart the
+	// workspace_secrets-derived MODEL got clobbered by
+	// MODEL_PROVIDER="minimax" — the literal slug, not a valid model
+	// id — and the workspace template's adapter routed to providers[0]
+	// (anthropic-oauth) and wedged at SDK initialize.
+	//
+	// The 2026-05-19 follow-up fix (this commit) renamed the
+	// workspace_secrets row MODEL_PROVIDER → MODEL (root cause: the
+	// misleading column name; see secrets.go + the
+	// 20260519000000_workspace_secrets_model_provider_rename migration)
+	// and drops the MODEL_PROVIDER fallback here so the fallback chain
+	// can no longer confuse a provider slug for a model id. CP-side
+	// slot-separation (cp#213 + cp#220) merged the analogous fix on
+	// the CP side; this is the workspace-server companion.
+	model = effectiveModelForBilling(model, envVars)
 	if model == "" {
 		return
 	}
 
 	// Canonical model env vars — molecule-runtime's workspace/config.py
 	// resolves the picked model as MOLECULE_MODEL > MODEL > (legacy)
-	// MODEL_PROVIDER (#280). Export both new names so adapters can read
-	// either; MODEL stays for backwards compat with everything that
-	// already reads os.environ["MODEL"] (the claude-code adapter does,
-	// since #194). Without this, the user's canvas selection is silently
-	// dropped on every templated provision — confirmed via crash-loop
-	// diagnosis on 2026-05-02 where MiniMax picks booted with model=sonnet
-	// (template default) and demanded CLAUDE_CODE_OAUTH_TOKEN. Set these
-	// FIRST so the per-runtime branches below can layer on additional
-	// vendor-specific names without fighting over the canonical one.
+	// MODEL_PROVIDER (#280; the legacy env-var fallback in the Python
+	// runtime is independent of the workspace_secrets row rename — it
+	// still reads the env var for back-compat with already-running
+	// images, but workspace-server no longer emits it). Export both new
+	// names so adapters can read either; MODEL stays for backwards
+	// compat with everything that already reads os.environ["MODEL"]
+	// (the claude-code adapter does, since #194). Without this, the
+	// user's canvas selection is silently dropped on every templated
+	// provision — confirmed via crash-loop diagnosis on 2026-05-02
+	// where MiniMax picks booted with model=sonnet (template default)
+	// and demanded CLAUDE_CODE_OAUTH_TOKEN. Set these FIRST so the
+	// per-runtime branches below can layer on additional vendor-
+	// specific names without fighting over the canonical one.
 	envVars["MOLECULE_MODEL"] = model
 	envVars["MODEL"] = model
 
@@ -844,9 +894,364 @@ func applyRuntimeModelEnv(envVars map[string]string, runtime, model string) {
 	}
 }
 
+// effectiveModelForBilling resolves the picked model id from an explicit
+// argument with the SAME fallback chain applyRuntimeModelEnv uses to set the
+// container MODEL env: explicit arg → envVars["MOLECULE_MODEL"] →
+// envVars["MODEL"] (the workspace_secret). It is the single source of truth
+// for "what model is this workspace going to run", shared by both
+// applyRuntimeModelEnv (which exports it to the container) and
+// applyPlatformManagedLLMEnv (which derives the billing mode from it).
+//
+// molecule-core#1994: the billing resolver MUST consult the same effective
+// model the container will actually run. Pre-fix it used the raw payload.Model
+// only, which is "" on a re-provision (the payload is rebuilt from the DB with
+// no Model), so it derived from an empty model → defaulted closed to
+// platform_managed and diverged from the read endpoint (which reads the stored
+// MODEL secret). Returns "" only when no model is resolvable anywhere — the
+// legitimate "unset → platform default" case the resolver fails closed on.
+func effectiveModelForBilling(model string, envVars map[string]string) string {
+	if model == "" {
+		model = envVars["MOLECULE_MODEL"]
+	}
+	if model == "" {
+		model = envVars["MODEL"]
+	}
+	return model
+}
+
+// applyPlatformManagedLLMEnv wires the control-plane LLM proxy into a
+// workspace only when the RESOLVED billing mode for this workspace is
+// platform_managed. "Resolved" means: the workspace-level override (if any)
+// wins over the org default (delivered via tenant_config in MOLECULE_LLM_BILLING_MODE).
+//
+// Pre-internal#691 this gate read the org-level env var directly, which made
+// it impossible to mix billing modes across workspaces in the same org. The
+// resolver (ResolveLLMBillingMode) is the single source of truth now; the
+// architectural test asserts no remaining code path gates on os.Getenv
+// ("MOLECULE_LLM_BILLING_MODE") for strip-decision purposes — that env value
+// is still read INTO the resolver as the org-default input, but it is never
+// the final decision.
+//
+// Default-closed: any resolver error / NULL JOIN / garbled enum value
+// collapses to platform_managed (see llm_billing_mode.go for the contract).
+// This preserves the existing implicit default exactly while making the
+// per-workspace opt-out path safe.
+//
+// The resolved mode is exported into the workspace container as
+// MOLECULE_LLM_BILLING_MODE_RESOLVED so an in-container debug check can
+// answer "what mode is this workspace running under" without DB queries
+// (RFC Observability hot-spot).
+//
+// molecule-core#1994 (credential-handling follow-on, CTO-confirmed model).
+// `global_secrets` is the TENANT's own secret store, shared across all of
+// that tenant's workspaces — it is NOT the platform's. The platform's own
+// LLM credential is the CP proxy usage token (MOLECULE_LLM_USAGE_TOKEN),
+// injected SEPARATELY on the platform_managed path below; it is never stored
+// in any tenant's global_secrets.
+//
+// Consequently the byok/disabled branch does NOT strip the tenant's
+// global-origin LLM creds. Under the corrected model the tenant's own
+// credential — whether at global scope (a global_secrets row, e.g. the key
+// they configured via the org-import required-env preflight / the settings
+// Secrets tab) or at workspace scope (a workspace_secrets row) — is exactly
+// what byok must run on, direct. The earlier internal#711 strip rested on the
+// inverted premise that a global-scope LLM cred was "the platform's own"; it
+// was wrong and it killed legitimate byok workspaces (MISSING_BYOK_CREDENTIAL
+// for tenants whose oauth lived at global scope — Reno Stars Marketing agent,
+// confirmed live 2026-05-28). Removing the strip is only safe because the
+// platform's own credential is never co-mingled into a tenant's global_secrets
+// (guarded at the write boundary: SetGlobal rejects bypass-list keys for a
+// platform-managed tenant; the platform proxy token is read from server env
+// only, never persisted to a tenant store).
+//
+// The boolean return still reports whether the workspace has at least one
+// usable LLM credential. The caller (prepareProvisionContext) uses it to FAIL
+// CLOSED — a byok workspace with no usable LLM credential at ANY scope is
+// aborted with a clear MISSING_BYOK_CREDENTIAL error at provision time rather
+// than started credential-less.
+// platformLLMEnvResult is the structured outcome of applyPlatformManagedLLMEnv.
+// ResolvedMode is the per-workspace billing/provider mode the resolver
+// landed on. HasUsableLLMCred reports whether the workspace has at least one
+// platform-managed-shaped LLM credential key in its env — the tenant's own,
+// at global or workspace scope. Only the non-platform (byok) path consults
+// HasUsableLLMCred for the fail-closed decision; the platform_managed path
+// always returns true (it forces the CP proxy usage token, which IS the
+// usable credential).
+type platformLLMEnvResult struct {
+	ResolvedMode     string
+	HasUsableLLMCred bool
+	// Source records which layer decided the mode (internal#718 P2-B):
+	// derived_provider (registry derivation), derived_default (derive failed →
+	// platform default), workspace_override (explicit operator pin), or
+	// constant_fallback (DB error). Surfaced for observability + asserted by the
+	// behavior-delta tests so a regression of "derived, not stored" flips red.
+	Source BillingModeSource
+}
+
+// globalKeys is the provenance side-channel from loadWorkspaceSecrets: the set
+// of env keys that originated from the operator-controlled global_secrets table
+// (a workspace_secrets row of the same name overrides and clears the flag). It
+// is consumed ONLY on the byok/disabled branch's provider-matched strip
+// (internal#728 Bug 1): a global-origin LLM bypass cred that does NOT match the
+// resolved provider's auth_env is stripped so a greedy runtime (claude-code
+// prefers CLAUDE_CODE_OAUTH_TOKEN) cannot route a non-anthropic model to the
+// wrong upstream. May be nil (no global-origin keys / unknown provenance) — a
+// nil set strips nothing, preserving the pre-#728 behavior for callers that do
+// not thread provenance.
+func applyPlatformManagedLLMEnv(ctx context.Context, envVars map[string]string, workspaceID, runtime, model string, globalKeys map[string]struct{}) platformLLMEnvResult {
+	// internal#718 P2-B: the platform-vs-byok decision now DERIVES the provider
+	// from (runtime, model) via the registry and keys off IsPlatform(derived) —
+	// NOT a stored LLM_PROVIDER and NOT the org rung. This path already carries
+	// runtime + model + the workspace env, so it calls the DERIVED resolver
+	// directly (no DB round-trip for runtime/model). availableAuthEnv is the set
+	// of recognized provider auth-env-var NAMES present in envVars (the same
+	// disambiguation input the registry uses to split oauth-vs-api). The org-env
+	// MOLECULE_LLM_BILLING_MODE is NO LONGER read into the decision (retired).
+	availableAuthEnv := availableAuthEnvNames(envVars)
+	// molecule-core#1994: derive billing mode from the EFFECTIVE model, not the
+	// raw payload.Model. On a re-provision (restart/resume/auto-restart) the
+	// payload is rebuilt from the DB with Name+Tier+Runtime only — payload.Model
+	// is "" (workspace_restart.go via withStoredCompute, which backfills Compute
+	// but NOT Model). With an empty model DeriveProvider errors → the resolver
+	// defaults closed to platform_managed and bakes the CP proxy, DIVERGING from
+	// the read endpoint (which reads the stored MODEL workspace_secret and derives
+	// byok). The stored model already lives in the merged envVars (loaded by
+	// loadWorkspaceSecrets); resolve it with the SAME fallback chain
+	// applyRuntimeModelEnv uses so the provision-path derive inputs match the
+	// read-path's — keeping the two resolvers in parity (the #1994 regression
+	// guard test asserts this).
+	effectiveModel := effectiveModelForBilling(model, envVars)
+	res, resolveErr := ResolveLLMBillingModeDerived(ctx, workspaceID, runtime, effectiveModel, availableAuthEnv)
+	if resolveErr != nil {
+		// resolveErr != nil ⇒ resolver hit a DB error AND already defaulted
+		// res.ResolvedMode to platform_managed. Log + proceed; the safe default
+		// is already in place, no early return needed.
+		log.Printf("workspace_provision: resolve billing mode workspace=%s err=%v (defaulting to platform_managed)", workspaceID, resolveErr)
+	}
+	log.Printf("workspace_provision: billing mode workspace=%s resolved=%s source=%s derived_provider=%s", workspaceID, res.ResolvedMode, res.Source, derefOrEmpty(res.ProviderSelection))
+	// internal#703: MOLECULE_LLM_BILLING_MODE in the container must reflect the
+	// RESOLVED per-workspace mode, not a hardcoded literal. Pre-fix this var was
+	// only emitted (hardcoded "platform_managed") on the strip path below, so a
+	// byok/disabled container never carried a truthful billing-mode value — only
+	// MOLECULE_LLM_BILLING_MODE_RESOLVED. Emit both here, resolver-driven, for
+	// every mode so the value is correct on the byok/disabled early-return path
+	// too (and downstream consumers / debug shells see byok, not platform_managed).
+	envVars["MOLECULE_LLM_BILLING_MODE"] = res.ResolvedMode
+	// Observability: surface the resolved mode in the container env so the
+	// agent / debug shell can answer "why is my key being stripped" without
+	// pulling logs or hitting the admin route.
+	envVars["MOLECULE_LLM_BILLING_MODE_RESOLVED"] = res.ResolvedMode
+	if res.ResolvedMode != LLMBillingModePlatformManaged {
+		// byok or disabled — DO NOT force-route to CP, DO NOT override the
+		// workspace's own ANTHROPIC_BASE_URL, and DO NOT strip the tenant's own
+		// (provider-matching) LLM credentials.
+		//
+		// molecule-core#1994 (corrected model): `global_secrets` is the
+		// TENANT's store, not the platform's. The tenant's own credential —
+		// at global OR workspace scope — is exactly what byok runs on, direct.
+		// The platform's own credential is never in a tenant's global_secrets
+		// (guarded at the SetGlobal write boundary + the proxy token is
+		// server-env-only), so leaving the tenant's globals in place cannot
+		// re-open the platform-credit drain.
+		//
+		// internal#728 Bug 1 (provider-matched credential injection): #1994
+		// removed the BLANKET strip, which was correct for the platform-key
+		// co-mingling it targeted but left EVERY claude-code workspace
+		// inheriting the tenant-global CLAUDE_CODE_OAUTH_TOKEN. A claude-code
+		// runtime greedily prefers that oauth (`llm-auth: detected oauth` →
+		// api.anthropic.com), so a workspace whose RESOLVED provider is NOT
+		// anthropic-oauth (minimax, kimi-byok, …) routes its non-Anthropic
+		// model to Anthropic and errors (`Claude Code returned an error
+		// result`; DevB MiniMax-M2.7 live-confirmed 2026-05-28).
+		//
+		// The precise, provider-AWARE replacement for the over-removed strip:
+		// keep ONLY the global-origin bypass creds whose env-var name is in the
+		// RESOLVED provider's auth_env; strip the rest. This is NOT a return to
+		// the blanket strip — it is keyed off the derived provider:
+		//   - minimax (auth_env: MINIMAX_API_KEY, ANTHROPIC_AUTH_TOKEN,
+		//     ANTHROPIC_API_KEY) → global-origin CLAUDE_CODE_OAUTH_TOKEN is
+		//     NOT a match → stripped (fixes DevB).
+		//   - anthropic-oauth (auth_env: CLAUDE_CODE_OAUTH_TOKEN) → the
+		//     global-origin oauth IS a match → kept (PM/reno opus byok NOT
+		//     regressed — the #1994 ByokGlobalScopeOAuthSurvives guard holds).
+		// WORKSPACE-origin creds (the user explicitly set them via the canvas
+		// Secrets tab → NOT in globalKeys) are NEVER stripped here, even when
+		// they don't match: the user authored them deliberately (JRS kimi
+		// workspace-key, reno's own oauth). Only the inherited operator-store
+		// channel is provider-gated.
+		stripNonMatchingGlobalOriginLLMCreds(envVars, globalKeys, runtime, effectiveModel, availableAuthEnv)
+		return platformLLMEnvResult{
+			ResolvedMode:     res.ResolvedMode,
+			HasUsableLLMCred: hasAnyPlatformManagedLLMKey(envVars),
+			Source:           res.Source,
+		}
+	}
+	baseURL := firstNonEmptyEnv("MOLECULE_LLM_BASE_URL", "OPENAI_BASE_URL")
+	anthropicBaseURL := firstNonEmptyEnv("MOLECULE_LLM_ANTHROPIC_BASE_URL", "ANTHROPIC_BASE_URL")
+	token := firstNonEmptyEnv("MOLECULE_LLM_USAGE_TOKEN", "OPENAI_API_KEY")
+	if baseURL == "" || token == "" {
+		// Proxy not configured (boot race / misconfig). The platform_managed
+		// path REQUIRES the CP proxy env to inject a usable credential.
+		// Reporting HasUsableLLMCred=true here would start the workspace
+		// credential-less — the adk-demo dark-wedge class (#2162).
+		// Return false so the caller's fail-closed branch aborts with
+		// MISSING_PLATFORM_PROXY.
+		return platformLLMEnvResult{ResolvedMode: res.ResolvedMode, HasUsableLLMCred: false, Source: res.Source}
+	}
+	stripPlatformManagedLLMBypassEnv(envVars)
+
+	// MOLECULE_LLM_BILLING_MODE is already set to res.ResolvedMode (==
+	// platform_managed on this path) above (internal#703); no hardcode here.
+	envVars["MOLECULE_LLM_BASE_URL"] = baseURL
+	envVars["MOLECULE_LLM_USAGE_TOKEN"] = token
+	if anthropicBaseURL != "" {
+		envVars["MOLECULE_LLM_ANTHROPIC_BASE_URL"] = anthropicBaseURL
+	}
+	if usageURL := strings.TrimSpace(os.Getenv("MOLECULE_LLM_USAGE_URL")); usageURL != "" {
+		envVars["MOLECULE_LLM_USAGE_URL"] = usageURL
+	}
+
+	if !runtimeUsesAnthropicNativeProxy(runtime) {
+		envVars["OPENAI_API_KEY"] = token
+		envVars["OPENAI_BASE_URL"] = baseURL
+	}
+	if runtimeUsesAnthropicNativeProxy(runtime) && anthropicBaseURL != "" {
+		envVars["ANTHROPIC_API_KEY"] = token
+		envVars["ANTHROPIC_BASE_URL"] = anthropicBaseURL
+	}
+
+	if model == "" && strings.TrimSpace(envVars["MOLECULE_MODEL"]) == "" && strings.TrimSpace(envVars["MODEL"]) == "" {
+		if defaultModel := strings.TrimSpace(os.Getenv("MOLECULE_LLM_DEFAULT_MODEL")); defaultModel != "" {
+			envVars["MOLECULE_MODEL"] = defaultModel
+		}
+	}
+	// platform_managed: the CP proxy usage token (injected as ANTHROPIC_API_KEY
+	// / OPENAI_API_KEY above) IS the usable credential, so the workspace is
+	// never fail-closed on this path.
+	return platformLLMEnvResult{ResolvedMode: res.ResolvedMode, HasUsableLLMCred: true, Source: res.Source}
+}
+
+func stripPlatformManagedLLMBypassEnv(envVars map[string]string) {
+	for key := range platformManagedDirectLLMBypassKeys {
+		delete(envVars, key)
+	}
+}
+
+// hasAnyPlatformManagedLLMKey reports whether envVars carries at least one
+// non-empty platform-managed-shaped LLM credential key (the tenant's own, at
+// global or workspace scope). Used by the byok fail-closed branch: a byok
+// workspace with no LLM credential at ANY scope must be aborted with
+// MISSING_BYOK_CREDENTIAL rather than started credential-less.
+func hasAnyPlatformManagedLLMKey(envVars map[string]string) bool {
+	for key := range platformManagedDirectLLMBypassKeys {
+		if strings.TrimSpace(envVars[key]) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// stripNonMatchingGlobalOriginLLMCreds is the byok-branch provider-matched
+// credential injection (internal#728 Bug 1). It removes from envVars every
+// platform-managed LLM bypass key that:
+//
+//  1. originated from the operator-controlled global_secrets store
+//     (present in globalKeys — a workspace_secrets row of the same name
+//     overrides + clears the flag, so user-authored creds are exempt), AND
+//  2. is NOT in the RESOLVED provider's auth_env set.
+//
+// The motivating regression: #1994 dropped the blanket strip, so a claude-code
+// workspace resolving to `minimax` still inherited the tenant-global
+// CLAUDE_CODE_OAUTH_TOKEN; the runtime prefers that oauth and routes the
+// MiniMax model to api.anthropic.com → error. Keeping only the resolved
+// provider's own auth_env keys (minimax: MINIMAX_API_KEY/ANTHROPIC_AUTH_TOKEN/
+// ANTHROPIC_API_KEY — not the oauth) removes the stray oauth while preserving
+// anthropic-oauth's CLAUDE_CODE_OAUTH_TOKEN for an opus byok workspace.
+//
+// Fail-OPEN by design: if the provider cannot be derived (empty model /
+// unknown runtime / ambiguous) or the registry is unavailable, we strip
+// NOTHING — we never strip a credential we cannot prove is non-matching, so a
+// derive miss can never fail-close a legitimate byok workspace (mirrors the
+// resolver's own default-closed-to-platform contract: the worst case is we
+// keep a stray cred, never that we remove the only usable one). The earlier
+// internal#711 blanket strip's fail-direction (remove first) was the bug;
+// this strip's fail-direction is keep-first.
+func stripNonMatchingGlobalOriginLLMCreds(envVars map[string]string, globalKeys map[string]struct{}, runtime, model string, availableAuthEnv []string) {
+	if len(globalKeys) == 0 {
+		return // no operator-store-origin keys to consider — nothing to strip.
+	}
+	manifest, err := providerRegistry()
+	if err != nil || manifest == nil {
+		return // registry unavailable — fail open, strip nothing.
+	}
+	provider, dErr := manifest.DeriveProvider(runtime, model, availableAuthEnv)
+	if dErr != nil {
+		return // underivable provider — fail open, strip nothing.
+	}
+	// The resolved provider's accepted auth-env-var NAMES (case-insensitive
+	// for parity with isPlatformManagedDirectLLMBypassKey, which upper-cases).
+	keep := make(map[string]struct{}, len(provider.AuthEnv))
+	for _, e := range provider.AuthEnv {
+		keep[strings.ToUpper(strings.TrimSpace(e))] = struct{}{}
+	}
+	for key := range globalKeys {
+		upper := strings.ToUpper(strings.TrimSpace(key))
+		if _, isBypass := platformManagedDirectLLMBypassKeys[upper]; !isBypass {
+			continue // not an LLM bypass cred (e.g. a non-LLM operator secret) — leave it.
+		}
+		if _, matches := keep[upper]; matches {
+			continue // matches the resolved provider's auth_env — this is what byok runs on.
+		}
+		// Global-origin LLM bypass cred that does NOT match the resolved
+		// provider — the stray that a greedy runtime would mis-prefer. Strip.
+		if _, present := envVars[key]; present {
+			log.Printf("workspace_provision: byok provider-matched strip — removing global-origin LLM cred %s (resolved provider=%s does not accept it)", key, provider.Name)
+			delete(envVars, key)
+		}
+	}
+}
+
+func runtimeUsesAnthropicNativeProxy(runtime string) bool {
+	return strings.EqualFold(strings.TrimSpace(runtime), "claude-code")
+}
+
+func firstNonEmptyEnv(names ...string) string {
+	for _, name := range names {
+		if v := strings.TrimSpace(os.Getenv(name)); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
 // loadWorkspaceSecrets loads global + workspace-specific secrets into a map.
 // Returns nil map + error string on decrypt failure. Shared by both Docker
 // and control plane provisioning paths to avoid duplication.
+//
+// The second return value (globalKeys) records which keys originated from
+// the operator-controlled `global_secrets` table — used by RFC#523 Layer 1
+// to constrain its forbidden-key check to the operator-bleed channel,
+// instead of blanket-blocking by name across BOTH provenance channels (the
+// over-fire that breaks the legitimate user flow of pasting their own
+// GitHub PAT into the canvas Secrets tab → workspace_secrets row). See
+// `feedback_upstream_docs_first_before_hypothesizing`: RFC#523's threat
+// model (issue molecule-ai/internal#523 §"Threat model") names operator-
+// scope tokens being injected via provision-time env / operator-side
+// stores — NOT the user's own scoped PAT they explicitly authorized via
+// the per-workspace Secrets tab.
+//
+// The third return value (workspaceKeys) is the POSITIVE counterpart: the
+// set of keys authored via the per-workspace `workspace_secrets` table
+// (user / org-admin set, authenticated as the workspace owner). It is the
+// provenance signal the forensic #145 SCM-write-token guard consults to
+// EXEMPT a workspace-scoped GITEA_TOKEN (the intended, legitimate delivery
+// channel for a reviewer agent) from the operator-bleed strip. A key set
+// in BOTH stores lands here (workspace overrides global) and is removed
+// from globalKeys, matching the precedence semantic below.
+//
+// The merged map preserves the existing precedence semantic (workspace
+// rows overwrite global rows on key collision); only the provenance side-
+// channels are new. Existing callers can ignore globalKeys / workspaceKeys.
 //
 // F1086 / #1206: the returned error string is the SAFE-CANNED message that
 // gets persisted to workspaces.last_sample_error AND broadcast as the
@@ -854,8 +1259,10 @@ func applyRuntimeModelEnv(envVars map[string]string, runtime, model string) {
 // the encryption version, the decrypt-error text) is logged here, never
 // returned to the caller, so it can't leak via the canvas event stream
 // (cf. TestProvisionWorkspace_NoInternalErrorsInBroadcast).
-func loadWorkspaceSecrets(ctx context.Context, workspaceID string) (map[string]string, string) {
+func loadWorkspaceSecrets(ctx context.Context, workspaceID string) (map[string]string, map[string]struct{}, map[string]struct{}, string) {
 	envVars := map[string]string{}
+	globalKeys := map[string]struct{}{}
+	workspaceKeys := map[string]struct{}{}
 	globalRows, globalErr := db.DB.QueryContext(ctx,
 		`SELECT key, encrypted_value, encryption_version FROM global_secrets`)
 	if globalErr == nil {
@@ -865,12 +1272,21 @@ func loadWorkspaceSecrets(ctx context.Context, workspaceID string) (map[string]s
 			var v []byte
 			var ver int
 			if globalRows.Scan(&k, &v, &ver) == nil {
+				// internal#718 P4 closure: LLM_PROVIDER is retired even
+				// at the global rung. The same provider-from-(runtime,model)
+				// derivation runs per-workspace, so a global default
+				// would be pure ghost. Symmetric with the workspace_secrets
+				// drop below.
+				if k == "LLM_PROVIDER" {
+					continue
+				}
 				decrypted, decErr := crypto.DecryptVersioned(v, ver)
 				if decErr != nil {
 					log.Printf("Provisioner: FATAL — failed to decrypt global secret %s (version=%d): %v — aborting provision of workspace %s", k, ver, decErr, workspaceID)
-					return nil, "failed to decrypt global secret"
+					return nil, nil, nil, "failed to decrypt global secret"
 				}
 				envVars[k] = string(decrypted)
+				globalKeys[k] = struct{}{}
 			}
 		}
 		if err := globalRows.Err(); err != nil {
@@ -886,19 +1302,43 @@ func loadWorkspaceSecrets(ctx context.Context, workspaceID string) (map[string]s
 			var v []byte
 			var ver int
 			if wsRows.Scan(&k, &v, &ver) == nil {
+				// internal#718 P4 closure: LLM_PROVIDER is a retired
+				// secret key. Migration 20260528000000 deletes any
+				// straggler rows; this drop is defence-in-depth so a
+				// rolling deploy (new code, old DB) never re-emits the
+				// retired key into the provisioner env (which would
+				// reach the CP-side resolveModelAndProvider — now
+				// itself retired, but the env contract belongs to
+				// core). Idempotent: a fresh tenant has zero
+				// LLM_PROVIDER rows and this branch is unreached.
+				if k == "LLM_PROVIDER" {
+					continue
+				}
 				decrypted, decErr := crypto.DecryptVersioned(v, ver)
 				if decErr != nil {
 					log.Printf("Provisioner: FATAL — failed to decrypt workspace secret %s (version=%d) for %s: %v — aborting provision", k, ver, workspaceID, decErr)
-					return nil, "failed to decrypt workspace secret"
+					return nil, nil, nil, "failed to decrypt workspace secret"
 				}
 				envVars[k] = string(decrypted)
+				// User-authored workspace_secrets value supersedes any
+				// global_secrets row of the same key — including dropping
+				// the operator-bleed provenance flag. The user explicitly
+				// re-set the value via the canvas Secrets tab, so it is
+				// no longer "the operator-store version."
+				delete(globalKeys, k)
+				// Positive provenance: record that this key was authored
+				// via workspace_secrets. The forensic #145 SCM-write-token
+				// guard exempts only keys in this set — a workspace-scoped
+				// GITEA_TOKEN is the intended delivery channel for that
+				// workspace's agent.
+				workspaceKeys[k] = struct{}{}
 			}
 		}
 		if err := wsRows.Err(); err != nil {
 			log.Printf("Provisioner: workspace_secrets rows.Err workspace=%s: %v", workspaceID, err)
 		}
 	}
-	return envVars, ""
+	return envVars, globalKeys, workspaceKeys, ""
 }
 
 // provisionWorkspaceCP provisions a workspace via the control plane API.

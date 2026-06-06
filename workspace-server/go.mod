@@ -1,4 +1,4 @@
-module github.com/Molecule-AI/molecule-monorepo/platform
+module git.moleculesai.app/molecule-ai/molecule-core/workspace-server
 
 go 1.25.0
 

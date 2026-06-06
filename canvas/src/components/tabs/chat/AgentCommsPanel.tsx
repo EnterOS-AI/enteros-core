@@ -405,7 +405,7 @@ export function AgentCommsPanel({ workspaceId }: { workspaceId: string }) {
         </p>
         <button
           onClick={loadInitial}
-          className="text-[10px] px-2 py-0.5 rounded bg-red-800/40 text-bad hover:bg-red-700/50 transition-colors"
+          className="text-[10px] px-2 py-0.5 rounded bg-red-800/40 text-bad hover:bg-red-700/50 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500/60 focus-visible:ring-offset-1"
         >
           Retry
         </button>
@@ -610,7 +610,7 @@ function PeerTabButton({
       aria-selected={active}
       tabIndex={active ? 0 : -1}
       onClick={onClick}
-      className={`shrink-0 px-3 py-1.5 text-[10px] font-medium transition-colors whitespace-nowrap ${
+      className={`shrink-0 px-3 py-1.5 text-[10px] font-medium transition-colors whitespace-nowrap focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-500/60 focus-visible:ring-offset-1 ${
         active
           ? "border-b-2 border-cyan-500 text-cyan-200"
           : "border-b-2 border-transparent text-ink-mid hover:text-ink-mid"
@@ -649,7 +649,17 @@ function WaitingBubbles({ visible }: { visible: CommMessage[] }) {
     if (!prev || m.timestamp > prev.timestamp) tailByPeer.set(m.peerId, m);
   }
   const waitingPeers = Array.from(tailByPeer.values()).filter(
-    (m) => m.flow === "out" && (m.status === "pending" || m.status === "queued"),
+    // Task #227 — also light the indicator for status="dispatched": that's
+    // the platform's marker for a poll-mode delegation that's been
+    // recorded into the peer's inbox but not yet picked up. Without this
+    // arm, external/MCP peer threads showed an outbound bubble and then
+    // dead silence until the eventual reply landed — no parity with the
+    // native push-path "pending" indicator.
+    (m) =>
+      m.flow === "out" &&
+      (m.status === "pending" ||
+        m.status === "queued" ||
+        m.status === "dispatched"),
   );
   if (waitingPeers.length === 0) return null;
   return (
@@ -688,7 +698,9 @@ function WaitingBubbles({ visible }: { visible: CommMessage[] }) {
               <span className="text-[10px]">
                 {m.status === "queued"
                   ? `${m.peerName} is busy — reply will arrive when they're free`
-                  : `Waiting for ${m.peerName}…`}
+                  : m.status === "dispatched"
+                    ? `Queued — ${m.peerName} will pick up on next poll`
+                    : `Waiting for ${m.peerName}…`}
               </span>
             </span>
           </div>

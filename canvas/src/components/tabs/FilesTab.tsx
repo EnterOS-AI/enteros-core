@@ -45,11 +45,54 @@ export function FilesTab({ workspaceId, data }: Props) {
   if (data && isExternalLikeRuntime(data.runtime)) {
     return <NotAvailablePanel runtime={data.runtime} />;
   }
-  return <PlatformOwnedFilesTab workspaceId={workspaceId} />;
+  return <PlatformOwnedFilesTab workspaceId={workspaceId} runtime={data?.runtime} />;
 }
 
-function PlatformOwnedFilesTab({ workspaceId }: { workspaceId: string }) {
-  const [root, setRoot] = useState("/configs");
+/** Picks the initial root for the FilesTab dropdown based on the
+ *  workspace's runtime. Decision: per-runtime default (Hongming
+ *  2026-05-15, internal#425 Decisions §2).
+ *
+ *  - openclaw → `/agent-home` (the agent's identity/state — the
+ *    user-facing interesting files for that runtime live in
+ *    `~/.openclaw/` inside the container, which `/agent-home` maps to
+ *    via the Phase 2b docker-exec backend).
+ *  - everything else (claude-code, hermes, external-like, undefined)
+ *    → `/configs` (the legacy default — managed config that flows
+ *    through the per-runtime indirection in
+ *    workspace-server/internal/handlers/template_files_eic.go).
+ *
+ *  When the runtime is undefined (legacy callers that don't thread
+ *  `data` through, or a workspace whose runtime field hasn't loaded
+ *  yet) the default is `/configs` — matches today's behaviour, no
+ *  surprise.
+ *
+ *  Note on `/agent-home` pre-Phase-2b: the backend short-circuits
+ *  with HTTP 501 and the canonical "implementation pending" body.
+ *  The tab renders empty + the error banner explains. This is by
+ *  design — lets us land the canvas UX before the backend ships,
+ *  per the RFC's phased rollout. The 501 is graceful: it doesn't
+ *  poison error toasts or generate "workspace not found" noise.
+ *
+ *  Adding a new runtime that should default to `/agent-home`: add it
+ *  to the agentHomeDefaultRuntimes set below. Adding a runtime that
+ *  should default to a different root: extend this function. */
+const agentHomeDefaultRuntimes = new Set(["openclaw"]);
+
+function defaultRootForRuntime(runtime: string | undefined): string {
+  if (runtime && agentHomeDefaultRuntimes.has(runtime)) {
+    return "/agent-home";
+  }
+  return "/configs";
+}
+
+function PlatformOwnedFilesTab({
+  workspaceId,
+  runtime,
+}: {
+  workspaceId: string;
+  runtime?: string;
+}) {
+  const [root, setRoot] = useState(() => defaultRootForRuntime(runtime));
   const [selectedFile, setSelectedFile] = useState<string | null>(null);
   const [fileContent, setFileContent] = useState("");
   const [editContent, setEditContent] = useState("");
@@ -223,7 +266,7 @@ function PlatformOwnedFilesTab({ workspaceId }: { workspaceId: string }) {
         // immediately. Delete-All hovers DARKER (bg-red-700) — same AA
         // contrast trap that bit ConfirmDialog/ApprovalBanner. Cancel
         // lifts to surface-elevated instead of the prior no-op hover.
-        <div role="alertdialog" aria-labelledby="files-delete-all-msg" className="mx-3 mt-2 px-3 py-2 bg-red-950/30 border border-red-800/40 rounded space-y-1.5">
+        <div role="alertdialog" aria-modal="false" aria-labelledby="files-delete-all-msg" className="mx-3 mt-2 px-3 py-2 bg-red-950/30 border border-red-800/40 rounded space-y-1.5">
           <p id="files-delete-all-msg" className="text-xs text-bad">Delete all {files.filter((f) => !f.dir).length} files? This cannot be undone.</p>
           <div className="flex gap-2">
             <button type="button" onClick={() => { handleDeleteAll(); setShowDeleteAll(false); }} className="px-2 py-0.5 bg-red-700 hover:bg-red-600 text-[10px] rounded text-white transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-red-500/60 focus-visible:ring-offset-1 focus-visible:ring-offset-surface">Delete All</button>
@@ -237,7 +280,7 @@ function PlatformOwnedFilesTab({ workspaceId }: { workspaceId: string }) {
       )}
 
       {confirmDelete && (
-        <div role="alertdialog" aria-labelledby="files-delete-one-msg" className="mx-3 mt-2 px-3 py-2 bg-amber-950/30 border border-amber-800/40 rounded space-y-1.5">
+        <div role="alertdialog" aria-modal="false" aria-labelledby="files-delete-one-msg" className="mx-3 mt-2 px-3 py-2 bg-amber-950/30 border border-amber-800/40 rounded space-y-1.5">
           <p id="files-delete-one-msg" className="text-xs text-warm">Delete <span className="font-mono">{confirmDelete}</span>{files.find((f) => f.path === confirmDelete && f.dir) ? " and all its contents" : ""}?</p>
           <div className="flex gap-2">
             <button type="button" onClick={confirmDeleteFile} className="px-2 py-0.5 bg-red-700 hover:bg-red-600 text-[10px] rounded text-white transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-red-500/60 focus-visible:ring-offset-1 focus-visible:ring-offset-surface">Delete</button>

@@ -17,14 +17,18 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/channels"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/channels"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 )
 
 // ChannelHandler manages workspace social channel integrations.
 type ChannelHandler struct {
 	manager *channels.Manager
 }
+
+// channelSlugRe matches valid agent slugs used in [slug] routing.
+// Compiled once at init to avoid recompilation on every webhook call.
+var channelSlugRe = regexp.MustCompile(`^[a-zA-Z0-9 _-]+$`)
 
 // NewChannelHandler creates a channel handler with the given manager.
 func NewChannelHandler(manager *channels.Manager) *ChannelHandler {
@@ -67,7 +71,10 @@ func (h *ChannelHandler) List(c *gin.Context) {
 		}
 
 		var config map[string]interface{}
-		json.Unmarshal(configJSON, &config)
+		if err := json.Unmarshal(configJSON, &config); err != nil {
+			log.Printf("Channels: unmarshal config for channel %s: %v", id, err)
+			config = map[string]interface{}{}
+		}
 		// #319: decrypt sensitive fields first so the mask operates on
 		// plaintext (first-4 / last-4 of the real token, not the ciphertext
 		// prefix). Decrypt errors are logged but non-fatal — List must keep
@@ -86,7 +93,10 @@ func (h *ChannelHandler) List(c *gin.Context) {
 		}
 
 		var allowed []string
-		json.Unmarshal(allowedJSON, &allowed)
+		if err := json.Unmarshal(allowedJSON, &allowed); err != nil {
+			log.Printf("Channels: unmarshal allowed_users for channel %s: %v", id, err)
+			allowed = []string{}
+		}
 
 		entry := map[string]interface{}{
 			"id":            id,
@@ -103,6 +113,9 @@ func (h *ChannelHandler) List(c *gin.Context) {
 			entry["last_message_at"] = lastMsg.Time
 		}
 		result = append(result, entry)
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("Channels: list rows.Err: %v", err)
 	}
 
 	c.JSON(http.StatusOK, result)
@@ -158,8 +171,18 @@ func (h *ChannelHandler) Create(c *gin.Context) {
 		return
 	}
 
-	configJSON, _ := json.Marshal(body.Config)
-	allowedJSON, _ := json.Marshal(body.AllowedUsers)
+	configJSON, marshalErr := json.Marshal(body.Config)
+	if marshalErr != nil {
+		log.Printf("Channels create %s: json.Marshal config failed: %v", workspaceID, marshalErr)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "marshal config failed"})
+		return
+	}
+	allowedJSON, marshalErr := json.Marshal(body.AllowedUsers)
+	if marshalErr != nil {
+		log.Printf("Channels create %s: json.Marshal allowed_users failed: %v", workspaceID, marshalErr)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "marshal allowed_users failed"})
+		return
+	}
 	enabled := true
 	if body.Enabled != nil {
 		enabled = *body.Enabled
@@ -214,11 +237,21 @@ func (h *ChannelHandler) Update(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "encrypt failed"})
 			return
 		}
-		j, _ := json.Marshal(body.Config)
+		j, marshalErr := json.Marshal(body.Config)
+		if marshalErr != nil {
+			log.Printf("Channels update %s: json.Marshal config failed: %v", workspaceID, marshalErr)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "marshal config failed"})
+			return
+		}
 		configArg = string(j)
 	}
 	if body.AllowedUsers != nil {
-		j, _ := json.Marshal(body.AllowedUsers)
+		j, marshalErr := json.Marshal(body.AllowedUsers)
+		if marshalErr != nil {
+			log.Printf("Channels update %s: json.Marshal allowed_users failed: %v", workspaceID, marshalErr)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "marshal allowed_users failed"})
+			return
+		}
 		allowedArg = string(j)
 	}
 
@@ -235,7 +268,13 @@ func (h *ChannelHandler) Update(c *gin.Context) {
 		return
 	}
 
-	if n, _ := result.RowsAffected(); n == 0 {
+	n, err := result.RowsAffected()
+	if err != nil {
+		log.Printf("Channel update RowsAffected error channel=%s workspace=%s: %v", channelID, workspaceID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "update failed"})
+		return
+	}
+	if n == 0 {
 		c.JSON(http.StatusNotFound, gin.H{"error": "channel not found"})
 		return
 	}
@@ -260,7 +299,13 @@ func (h *ChannelHandler) Delete(c *gin.Context) {
 		return
 	}
 
-	if n, _ := result.RowsAffected(); n == 0 {
+	n, err := result.RowsAffected()
+	if err != nil {
+		log.Printf("Channel delete RowsAffected error channel=%s workspace=%s: %v", channelID, workspaceID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "delete failed"})
+		return
+	}
+	if n == 0 {
 		c.JSON(http.StatusNotFound, gin.H{"error": "channel not found"})
 		return
 	}
@@ -461,11 +506,10 @@ func (h *ChannelHandler) Webhook(c *gin.Context) {
 	// in a shared channel and route to a specific agent.
 	targetSlug := ""
 	routedText := msg.Text
-	validSlugRe := regexp.MustCompile(`^[a-zA-Z0-9 _-]+$`)
 	if len(msg.Text) > 2 && msg.Text[0] == '[' {
 		if idx := strings.Index(msg.Text, "]"); idx > 1 && idx < 40 {
 			candidate := strings.ToLower(strings.TrimSpace(msg.Text[1:idx]))
-			if validSlugRe.MatchString(candidate) {
+			if channelSlugRe.MatchString(candidate) {
 				targetSlug = candidate
 				routedText = strings.TrimSpace(msg.Text[idx+1:])
 				if routedText == "" {
@@ -496,8 +540,14 @@ func (h *ChannelHandler) Webhook(c *gin.Context) {
 		if err := rows.Scan(&row.ID, &row.WorkspaceID, &row.ChannelType, &configJSON, &row.Enabled, &allowedJSON); err != nil {
 			continue
 		}
-		json.Unmarshal(configJSON, &row.Config)
-		json.Unmarshal(allowedJSON, &row.AllowedUsers)
+		if err := json.Unmarshal(configJSON, &row.Config); err != nil {
+			log.Printf("Channels: unmarshal config for webhook row %s: %v", row.ID, err)
+			row.Config = map[string]interface{}{}
+		}
+		if err := json.Unmarshal(allowedJSON, &row.AllowedUsers); err != nil {
+			log.Printf("Channels: unmarshal allowed_users for webhook row %s: %v", row.ID, err)
+			row.AllowedUsers = []string{}
+		}
 		if err := channels.DecryptSensitiveFields(row.Config); err != nil {
 			log.Printf("Channels: decrypt webhook row %s: %v", row.ID, err)
 			continue
@@ -513,6 +563,9 @@ func (h *ChannelHandler) Webhook(c *gin.Context) {
 		if matchesChatID(row.Config, msg.ChatID) {
 			candidates = append(candidates, row)
 		}
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("Channels: telegram webhook rows.Err: %v", err)
 	}
 
 	if targetSlug != "" {
@@ -556,13 +609,16 @@ func (h *ChannelHandler) Webhook(c *gin.Context) {
 		return
 	}
 
-	// Process asynchronously — don't block the webhook response
-	go func() {
+	// Process asynchronously — don't block the webhook response.
+	// RFC internal#524 Layer 1: globalGoAsync — HandleInbound traverses
+	// db.DB to resolve workspace + record the channel event; drained by
+	// drainTestAsync before db.DB swap.
+	globalGoAsync(func() {
 		bgCtx := context.Background()
 		if err := h.manager.HandleInbound(bgCtx, ch, msg); err != nil {
 			log.Printf("Channels: async HandleInbound error for workspace %s: %v", ch.WorkspaceID[:12], err)
 		}
-	}()
+	})
 
 	c.JSON(http.StatusOK, gin.H{"status": "accepted"})
 }

@@ -7,10 +7,22 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/wsauth"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wsauth"
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 )
+
+// validWorkspaceID returns true when id is a syntactically valid UUID.
+// workspace_id is a `uuid` column; passing a non-UUID (e.g. the canvas
+// "global" sentinel sent when no node is selected) makes Postgres raise
+// `invalid input syntax for type uuid`, which previously leaked as an
+// opaque 500. Reject up front with a clean 400 instead. Mirrors the
+// uuid.Parse guard already used in handlers/activity.go.
+func validWorkspaceID(id string) bool {
+	_, err := uuid.Parse(id)
+	return err == nil
+}
 
 // TokenHandler exposes user-facing token management for workspaces.
 // Routes: GET/POST/DELETE /workspaces/:id/tokens (behind WorkspaceAuth).
@@ -31,6 +43,10 @@ type tokenListItem struct {
 // never the plaintext or hash).
 func (h *TokenHandler) List(c *gin.Context) {
 	workspaceID := c.Param("id")
+	if !validWorkspaceID(workspaceID) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid workspace id"})
+		return
+	}
 
 	limit := 50
 	if v := c.Query("limit"); v != "" {
@@ -53,6 +69,7 @@ func (h *TokenHandler) List(c *gin.Context) {
 		LIMIT $2 OFFSET $3
 	`, workspaceID, limit, offset)
 	if err != nil {
+		log.Printf("tokens: list query failed for workspace %s: %v", workspaceID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list tokens"})
 		return
 	}
@@ -85,6 +102,10 @@ const maxTokensPerWorkspace = 50
 // exactly once in the response — it cannot be recovered afterwards.
 func (h *TokenHandler) Create(c *gin.Context) {
 	workspaceID := c.Param("id")
+	if !validWorkspaceID(workspaceID) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid workspace id"})
+		return
+	}
 
 	// Rate limit: max active tokens per workspace
 	var count int
@@ -117,6 +138,10 @@ func (h *TokenHandler) Create(c *gin.Context) {
 func (h *TokenHandler) Revoke(c *gin.Context) {
 	workspaceID := c.Param("id")
 	tokenID := c.Param("tokenId")
+	if !validWorkspaceID(workspaceID) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid workspace id"})
+		return
+	}
 
 	result, err := db.DB.ExecContext(c.Request.Context(), `
 		UPDATE workspace_auth_tokens
@@ -128,7 +153,12 @@ func (h *TokenHandler) Revoke(c *gin.Context) {
 		return
 	}
 
-	rows, _ := result.RowsAffected()
+	rows, err := result.RowsAffected()
+	if err != nil {
+		log.Printf("tokens: revoke RowsAffected error token=%s workspace=%s: %v", tokenID, workspaceID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to revoke token"})
+		return
+	}
 	if rows == 0 {
 		c.JSON(http.StatusNotFound, gin.H{"error": "token not found or already revoked"})
 		return

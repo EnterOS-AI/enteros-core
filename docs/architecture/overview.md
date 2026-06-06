@@ -17,7 +17,7 @@ Canvas (Next.js :3000) ←WebSocket→ Platform (Go :8080) ←HTTP→ Postgres +
 
 - **Workspace Server** (`workspace-server/`): Go/Gin control plane — workspace CRUD, registry, discovery, WebSocket hub, liveness monitoring.
 - **Canvas** (`canvas/`): Next.js 15 + React Flow (@xyflow/react v12) + Zustand + Tailwind — visual workspace graph.
-- **Workspace Runtime** (`workspace/`): Shared runtime published as [`molecule-ai-workspace-runtime`](https://pypi.org/project/molecule-ai-workspace-runtime/) on PyPI. Supports LangGraph, Claude Code, OpenClaw, DeepAgents, CrewAI, AutoGen. Each adapter lives in its own standalone template repo (e.g. `molecule-ai-workspace-template-claude-code`). See `docs/workspace-runtime-package.md` for the full picture.
+- **Workspace Runtime**: Shared runtime published from [`molecule-ai-workspace-runtime`](https://git.moleculesai.app/molecule-ai/molecule-ai-workspace-runtime) to the Molecule AI Gitea package registry. Supports LangGraph, Claude Code, OpenClaw, Hermes, Codex, and AutoGen. Each adapter lives in its own standalone template repo (e.g. `molecule-ai-workspace-template-claude-code`). See `docs/workspace-runtime-package.md` for the full picture.
 - **molecli** (`workspace-server/cmd/cli/`): Go TUI dashboard (Bubbletea + Lipgloss) — real-time workspace monitoring, event log, health overview, delete/filter operations.
 
 ## Key Architectural Patterns
@@ -44,7 +44,7 @@ All three call `onWorkspaceOffline`, which broadcasts `WORKSPACE_OFFLINE` and ca
 
 ### Template Resolution (Workspace Create)
 
-Runtime detection happens **before** the DB insert: if `payload.Runtime` is empty and a template is specified, the handler reads `runtime:` from `configsDir/template/config.yaml` first. If still empty, it defaults to `"langgraph"`. This ensures the correct runtime (e.g. `claude-code`) is persisted in the DB and used for container image selection.
+Runtime detection happens **before** the DB insert: if `payload.Runtime` is empty and a template is specified, the handler reads `runtime:` from `configsDir/template/config.yaml` first. If still empty, it defaults to `"claude-code"`. This ensures the correct runtime is persisted in the DB and used for container image selection.
 
 When the requested template does not exist, the Create handler falls back in order:
 
@@ -114,7 +114,7 @@ Opt-in pattern: when `idle_prompt` is non-empty in `config.yaml`, the workspace 
 
 Three Gin middleware classes gate server-side routes. Full contract in `docs/runbooks/admin-auth.md`.
 
-- **`middleware.AdminAuth(db.DB)`** — strict bearer-only. Used for any route where a forged request could leak prompts/memory, create/mutate workspaces, or leak ops intel. Lazy-bootstrap fail-open when `HasAnyLiveTokenGlobal` returns 0.
+- **`middleware.AdminAuth(db.DB)`** — strict bearer-only and **fail-closed in every environment** (harden/no-fail-open-auth). Used for any route where a forged request could leak prompts/memory, create/mutate workspaces, or leak ops intel. The former lazy-bootstrap fail-open (pass when `HasAnyLiveTokenGlobal` returns 0) and the dev-mode escape hatch have both been removed — a fresh install must provision `ADMIN_TOKEN` to reach admin routes.
 - **`middleware.CanvasOrBearer(db.DB)`** — accepts a bearer token OR an Origin matching `CORS_ORIGINS`. Used **only** for cosmetic routes where a forged request has zero data/security impact. Currently only on `PUT /canvas/viewport`. Do not extend this to any route that leaks data or creates resources — see the runbook.
 - **`middleware.WorkspaceAuth(db.DB)`** — binds a bearer token to `:id`. Workspace A's token cannot hit workspace B's sub-routes. Used for the entire `/workspaces/:id/*` group except the A2A proxy (which has its own `CanCommunicate` layer).
 

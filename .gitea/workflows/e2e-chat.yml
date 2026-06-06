@@ -1,8 +1,10 @@
 name: E2E Chat
 
 # Comprehensive Playwright E2E for the unified chat stack (desktop
-# ChatTab + mobile MobileChat). Runs on every PR that touches canvas,
-# workspace-server, or this workflow file.
+# ChatTab + mobile MobileChat). Heavy browser execution is intentionally
+# outside the normal required PR path: PRs run it only after entering the
+# `merge-queue`, while push/main, nightly, and manual dispatch preserve
+# coverage without making every PR pay the full runtime/browser cost.
 #
 # Architecture:
 #   1. Ephemeral Postgres + Redis (docker, unique container names)
@@ -22,6 +24,11 @@ on:
     branches: [main, staging]
   pull_request:
     branches: [main, staging]
+  schedule:
+    # Nightly at 09:00 UTC. Keeps coverage for the currently non-required
+    # heavy browser lane without spending runner time on every PR.
+    - cron: '0 9 * * *'
+  workflow_dispatch:
 
 concurrency:
   group: e2e-chat-${{ github.event.pull_request.head.sha || github.sha }}
@@ -33,9 +40,15 @@ env:
 jobs:
   # bp-exempt: helper job; real gate is E2E Chat / E2E Chat (pull_request)
   detect-changes:
-    runs-on: ubuntu-latest
+    # mc#1529 follow-on: pin to `docker-host` (Linux operator-host
+    # runners). The bare `ubuntu-latest` label is also advertised by
+    # hongming-pc-runner-* (Windows act_runner v1.0.3) where the
+    # docker.sock-bound steps below fail. Mirror of mc#1543
+    # (handlers-postgres-integration). See internal#512 for the class
+    # defect.
+    runs-on: docker-host
     # Phase 3 (RFC #219 §1): surface broken workflows without blocking.
-    # mc#774: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
+    # mc#1982: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
     continue-on-error: true
     outputs:
       chat: ${{ steps.decide.outputs.chat }}
@@ -44,7 +57,14 @@ jobs:
         with:
           fetch-depth: 0
       - id: decide
+        env:
+          GITEA_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          QUEUE_LABEL: merge-queue
         run: |
+          if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "chat=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           BASE="${GITHUB_BASE_REF:-${{ github.event.before }}}"
           if [ "${{ github.event_name }}" = "pull_request" ] && [ -n "${{ github.event.pull_request.base.sha }}" ]; then
             BASE="${{ github.event.pull_request.base.sha }}"
@@ -61,9 +81,26 @@ jobs:
             exit 0
           fi
           CHANGED=$(git diff --name-only "$BASE" HEAD)
-          if echo "$CHANGED" | grep -qE '^(canvas/|workspace-server/|\.gitea/workflows/e2e-chat\.yml$)'; then
+          if ! echo "$CHANGED" | grep -qE '^(canvas/|workspace-server/|\.gitea/workflows/e2e-chat\.yml$)'; then
+            echo "chat=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "chat=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          authfile=$(mktemp)
+          chmod 600 "$authfile"
+          printf 'header = "Authorization: token %s"\n' "$GITEA_TOKEN" > "$authfile"
+          labels=$(curl -fsS -K "$authfile" \
+            "${{ github.server_url }}/api/v1/repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels" \
+            | python3 -c 'import json,sys; print("\n".join(label.get("name","") for label in json.load(sys.stdin)))')
+          rm -f "$authfile"
+          if printf '%s\n' "$labels" | grep -qx "$QUEUE_LABEL"; then
             echo "chat=true" >> "$GITHUB_OUTPUT"
           else
+            echo "PR is not in merge-queue; skipping heavy E2E Chat for normal PR path."
             echo "chat=false" >> "$GITHUB_OUTPUT"
           fi
 
@@ -71,9 +108,34 @@ jobs:
   e2e-chat:
     needs: detect-changes
     name: E2E Chat
-    runs-on: ubuntu-latest
+    # mc#1529 follow-on: docker run/exec for postgres + redis containers.
+    # Must land on operator-host Linux (docker-host).
+    runs-on: docker-host
     # Phase 3 (RFC #219 §1): surface broken workflows without blocking.
-    # mc#774: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
+    # mc#1982: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
+    #
+    # PROMOTION-READINESS (toward required gate — do NOT flip continue-on-error
+    # without CTO sign-off, that's the irreversible call):
+    #   NOW FAIL-CLOSED:
+    #     - Postgres/Redis/platform/canvas readiness are already bounded
+    #       readiness-polls that hard-fail (and dump logs) at their deadline,
+    #       not fixed sleeps — preserved.
+    #     - passWithNoTests:false + forbidOnly (playwright.config.ts) → a
+    #       renamed/moved spec or stray test.only can no longer green the lane.
+    #     - REQUIRE-LIVE guard in "Run Playwright E2E tests" → chat==true must
+    #       actually execute >=1 test, else exit 1.
+    #     - chat-desktop "activity log" test no longer swallows its assertion.
+    #   STILL BLOCKS PROMOTION:
+    #     - The echo round-trip asserts on rendered "Echo: ..." text but never
+    #       asserts the echo runtime actually RECEIVED the A2A request
+    #       (fixtures/echo-runtime.ts exposes lastRequest, unused) — an
+    #       optimistic client-side render could pass without a real round-trip.
+    #       Add a server-received assertion before required.
+    #     - The "No-op pass" path (detect-changes chat!=true) is a legitimate
+    #       paths-filter skip, but a required gate needs it to be a neutral
+    #       check, not a green "success", so a skipped heavy lane can't be
+    #       mistaken for a passed one.
+    # mc#1982: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
     continue-on-error: true
     timeout-minutes: 15
     env:
@@ -203,16 +265,36 @@ jobs:
       - name: Wait for /health
         if: needs.detect-changes.outputs.chat == 'true'
         run: |
-          for i in $(seq 1 30); do
+          # Readiness signal: the platform binds /health only AFTER the full
+          # migration chain has been applied on cold start (it prints
+          # "Platform starting on :PORT" at that point). So a 200 from /health
+          # is the real "migrations done + server listening" signal.
+          #
+          # The migration chain grows every release, so a fixed ~30s budget is
+          # brittle by construction. Use a generous wall-clock budget that
+          # comfortably exceeds cold-start + full-migration time, polling fast.
+          # Robust to a growing chain WITHOUT masking a dead platform: if the
+          # background platform-server process has exited, fail loudly at once.
+          DEADLINE_SECS=180          # cold-start + full migration chain headroom
+          PLATFORM_PID="$(cat workspace-server/platform.pid 2>/dev/null || true)"
+          start=$(date +%s)
+          while :; do
             if curl -sf "http://127.0.0.1:${PLATFORM_PORT}/health" > /dev/null; then
-              echo "Platform up after ${i}s"
+              echo "Platform healthy after $(( $(date +%s) - start ))s"
               exit 0
+            fi
+            if [ -n "$PLATFORM_PID" ] && ! kill -0 "$PLATFORM_PID" 2>/dev/null; then
+              echo "::error::platform-server (pid ${PLATFORM_PID}) exited before /health became reachable — see log below"
+              cat workspace-server/platform.log || true
+              exit 1
+            fi
+            if [ "$(( $(date +%s) - start ))" -ge "$DEADLINE_SECS" ]; then
+              echo "::error::Platform did not become healthy within ${DEADLINE_SECS}s — see log below"
+              cat workspace-server/platform.log || true
+              exit 1
             fi
             sleep 1
           done
-          echo "::error::Platform did not become healthy in 30s"
-          cat workspace-server/platform.log || true
-          exit 1
 
       - name: Install canvas dependencies
         if: needs.detect-changes.outputs.chat == 'true'
@@ -222,7 +304,14 @@ jobs:
       - name: Install Playwright browsers
         if: needs.detect-changes.outputs.chat == 'true'
         working-directory: canvas
-        run: npx playwright install --with-deps chromium
+        run: |
+          PREBAKED_PLAYWRIGHT=/ms-playwright
+          if [ -d "${PREBAKED_PLAYWRIGHT}" ] && find "${PREBAKED_PLAYWRIGHT}" -maxdepth 3 -type f -name 'chrome' | grep -q .; then
+            echo "Using prebaked Playwright Chromium from ${PREBAKED_PLAYWRIGHT}"
+            echo "PLAYWRIGHT_BROWSERS_PATH=${PREBAKED_PLAYWRIGHT}" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          npx playwright install --with-deps chromium
 
       - name: Start canvas dev server (background)
         if: needs.detect-changes.outputs.chat == 'true'
@@ -232,25 +321,68 @@ jobs:
           export NEXT_PUBLIC_WS_URL="ws://127.0.0.1:${PLATFORM_PORT}/ws"
           npx next dev --turbopack -p "${CANVAS_PORT}" > canvas.log 2>&1 &
           echo $! > canvas.pid
-          for i in $(seq 1 30); do
-            if curl -sf "http://localhost:${CANVAS_PORT}" > /dev/null 2>&1; then
-              echo "Canvas up after ${i}s"
-              exit 0
+          # Readiness must wait for the actual chat route to *compile*, not
+          # just for the dev server to bind the port. `next dev --turbopack`
+          # accepts the TCP connection well before it has compiled a route
+          # on first request, so a bare `curl /` can 200 (or hang) while the
+          # page the tests load is still building. We therefore probe the
+          # real route the specs navigate to (`/?m=chat`) and require a 2xx,
+          # which only happens once Turbopack has finished the first
+          # compile. The previous 30s budget was also too tight for a cold
+          # Turbopack first-compile on a loaded operator-host runner — the
+          # `Canvas did not start in 30s` flake. Raise to 120s (job
+          # timeout-minutes is 15, so this is comfortably bounded) and probe
+          # every 2s.
+          READY=""
+          for i in $(seq 1 60); do
+            # Tempfile-routed -w + set +e/-e prevents curl-exit-code
+            # pollution of the captured status (lint-curl-status-capture.yml).
+            set +e
+            curl -s -o /dev/null -w '%{http_code}' "http://localhost:${CANVAS_PORT}/?m=chat" > /tmp/canvas-ready.code
+            set -e
+            CODE=$(cat /tmp/canvas-ready.code 2>/dev/null || echo "000")
+            if [ "$CODE" -ge 200 ] && [ "$CODE" -lt 400 ]; then
+              echo "Canvas (chat route compiled) up after ~$((i*2))s (HTTP ${CODE})"
+              READY=1
+              break
             fi
-            sleep 1
+            sleep 2
           done
-          echo "::error::Canvas did not start in 30s"
-          cat canvas.log || true
-          exit 1
+          if [ -z "$READY" ]; then
+            echo "::error::Canvas chat route did not compile in 120s (last HTTP ${CODE})"
+            cat canvas.log || true
+            exit 1
+          fi
 
       - name: Run Playwright E2E tests
         if: needs.detect-changes.outputs.chat == 'true'
         working-directory: canvas
+        env:
+          # CI=1 activates forbidOnly in playwright.config.ts (a stray
+          # `test.only` would otherwise green the suite while skipping the
+          # rest). passWithNoTests:false (also in the config) already makes
+          # a zero-match selection exit non-zero.
+          CI: "1"
         run: |
+          set -euo pipefail
           export E2E_PLATFORM_URL="http://127.0.0.1:${PLATFORM_PORT}"
           export E2E_DATABASE_URL="${DATABASE_URL}"
           export PLAYWRIGHT_BASE_URL="http://localhost:${CANVAS_PORT}"
-          npx playwright test e2e/chat-desktop.spec.ts e2e/chat-mobile.spec.ts
+
+          # REQUIRE-LIVE guard (mirrors CP serving-e2e SERVING_E2E_REQUIRE_LIVE):
+          # this lane reached here only because detect-changes said chat==true,
+          # so it MUST actually execute the round-trip specs. `pipefail` makes
+          # a real test failure (playwright non-zero) abort here under `set -e`;
+          # passWithNoTests:false makes a zero-match selection non-zero too. The
+          # explicit grep below is belt-and-braces: assert the list reporter
+          # printed an executed-count summary, so a silent all-skip / no-op can
+          # never report green.
+          npx playwright test e2e/chat-desktop.spec.ts e2e/chat-mobile.spec.ts \
+            --reporter=list 2>&1 | tee /tmp/pw-chat.out
+          if ! grep -qE '[0-9]+ (passed|failed|skipped)' /tmp/pw-chat.out; then
+            echo "::error::E2E Chat REQUIRE-LIVE: chat==true but Playwright reported no executed tests — specs missing or all-skipped, refusing to report green."
+            exit 1
+          fi
 
       - name: Dump platform log on failure
         if: failure() && needs.detect-changes.outputs.chat == 'true'

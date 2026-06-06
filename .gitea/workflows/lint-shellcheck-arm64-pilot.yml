@@ -1,0 +1,137 @@
+name: Lint shellcheck (arm64 pilot)
+
+# Mac-CI dual-track pilot (#233). ADDITIVE / NOT REQUIRED.
+#
+# Validates the arm64 self-hosted lane (no docker.sock, no privileged
+# ops) before any required gate moves onto it.
+#
+# Runner label mapping (2026-05-22 fix): the actual Mac mini runner
+# registered in this Gitea ships labels
+#   ["self-hosted","macos-self-hosted-arm64","arm64-darwin"]
+# — no plain `arm64`. The earlier `runs-on: [self-hosted, arm64]`
+# could not match any registered runner so every fire of this workflow
+# was assigned task_id=0 / runner_id=NULL → Gitea cancelled it. The
+# rows showed up as Cancelled in the action status feed (not Failed)
+# but the lane never actually ran. Workflow now selects on
+# `arm64-darwin` which is the canonical Mac-arm64 label per the
+# Mac mini's registration (per internal#494 capability-honest labels).
+#
+# If we later want to add a Linux-arm64 runner to the same lane, add
+# both labels to that runner's registration AND broaden the selector
+# here — don't rename `arm64-darwin` (it's Mac-specific by design and
+# `feedback_pc2_runner_labels_must_stay_narrow` rule applies).
+#
+# Pairs with internal#543 (RFC: Mac arm64 multi-arch runner-base) and
+# internal#494 (multi-arch runner-base capability-honest labels).
+# No paths: filter on purpose (feedback_path_filtered_workflow_cant_be_required).
+
+on:
+  pull_request:
+    branches:
+      - main
+      - staging
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  shellcheck-arm64:
+    name: shellcheck-arm64 (pilot)
+    runs-on: [self-hosted, arm64-darwin]
+    # NOT a required check; safe to sit pending until Mac runner is up.
+    # If the Mac runner has trouble pulling actions/checkout we fall
+    # back to a plain git clone (see step 'fallback clone').
+    timeout-minutes: 10
+    env:
+      GITHUB_SERVER_URL: https://git.moleculesai.app
+    steps:
+      - name: Identify runner
+        id: identify
+        continue-on-error: true
+        run: |
+          set -eu
+          echo "arch=$(uname -m)"
+          echo "kernel=$(uname -sr)"
+          echo "shell=$BASH_VERSION"
+          # Sanity: must actually be arm64. If amd64 sneaks in here,
+          # the job skips gracefully rather than hard-failing, because
+          # a mislabelled runner is an ops concern, not a code defect.
+          # Pilot lane must not make main red (#2146).
+          case "$(uname -m)" in
+            aarch64|arm64)
+              echo "arm64 confirmed"
+              echo "arm64=true" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "ERROR: expected arm64, got $(uname -m) — label routing may be wrong"
+              echo "arm64=false" >> "$GITHUB_OUTPUT"
+              exit 1
+              ;;
+          esac
+
+      - name: Checkout
+        if: steps.identify.outputs.arm64 == 'true'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install shellcheck (arm64)
+        if: steps.identify.outputs.arm64 == 'true'
+        continue-on-error: true
+        run: |
+          set -eu
+          if command -v shellcheck >/dev/null 2>&1; then
+            echo "shellcheck already present: $(shellcheck --version | head -1)"
+          else
+            # Prefer apt if the runner base ships it; else download the
+            # correct platform binary (darwin vs linux).
+            if command -v apt-get >/dev/null 2>&1; then
+              sudo apt-get update -qq
+              sudo apt-get install -y --no-install-recommends shellcheck
+            else
+              SC_VER=v0.10.0
+              if [ "$(uname -s)" = "Darwin" ]; then
+                SC_PKG="shellcheck-${SC_VER}.darwin.aarch64.tar.xz"
+              else
+                SC_PKG="shellcheck-${SC_VER}.linux.aarch64.tar.xz"
+              fi
+              curl -fsSL "https://github.com/koalaman/shellcheck/releases/download/${SC_VER}/${SC_PKG}" \
+                | tar -xJf - --strip-components=1
+              sudo mv shellcheck /usr/local/bin/
+            fi
+          fi
+          shellcheck --version | head -2
+
+      - name: Run shellcheck on .gitea/scripts/*.sh
+        if: steps.identify.outputs.arm64 == 'true'
+        continue-on-error: true
+        run: |
+          set -eu
+          # Only the scripts we control under .gitea/scripts. Pilot
+          # scope is intentionally narrow — broaden in a follow-up
+          # once the lane is proven.
+          if ! command -v shellcheck >/dev/null 2>&1 || ! shellcheck --version >/dev/null 2>&1; then
+            echo "WARN: shellcheck not functional — skipping (pilot mode)"
+            exit 0
+          fi
+          # NOTE: macOS ships Bash 3.2 (Apple license), no `mapfile`
+          # (Bash 4+ builtin). Mac mini runner empirically failed at
+          # `mapfile: command not found` (run 79275 / task 145654).
+          # Use the portable `while read` pattern instead — works on
+          # both Bash 3.2 (macOS) and Bash 4+ (Linux).
+          TARGETS=()
+          while IFS= read -r f; do
+            TARGETS+=("$f")
+          done < <(find .gitea/scripts -maxdepth 2 -type f -name '*.sh' | sort)
+          if [ "${#TARGETS[@]}" -eq 0 ]; then
+            echo "No .sh files found under .gitea/scripts — nothing to check"
+            exit 0
+          fi
+          echo "Checking ${#TARGETS[@]} file(s):"
+          printf '  %s\n' "${TARGETS[@]}"
+          # SC1091 = couldn't follow non-constant source; expected for
+          # CI-time analysis without the full runtime layout.
+          shellcheck --severity=error --exclude=SC1091 "${TARGETS[@]}"

@@ -231,6 +231,7 @@ export function MobileComms({ dark }: { dark: boolean }) {
                 fontSize: 13,
                 fontWeight: 500,
               }}
+              className="focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-100 dark:focus-visible:ring-offset-zinc-900"
             >
               {o.label}
               <span
@@ -251,11 +252,11 @@ export function MobileComms({ dark }: { dark: boolean }) {
 
       <div style={{ padding: "0 14px", display: "flex", flexDirection: "column", gap: 8 }}>
         {loading && items.length === 0 ? (
-          <div style={{ padding: "30px 4px", textAlign: "center", color: p.text3, fontSize: 13 }}>
+          <div role="status" aria-live="polite" style={{ padding: "30px 4px", textAlign: "center", color: p.text3, fontSize: 13 }}>
             Loading recent comms…
           </div>
         ) : filtered.length === 0 ? (
-          <div style={{ padding: "30px 4px", textAlign: "center", color: p.text3, fontSize: 13 }}>
+          <div role="status" aria-live="polite" style={{ padding: "30px 4px", textAlign: "center", color: p.text3, fontSize: 13 }}>
             No A2A traffic yet.
           </div>
         ) : (

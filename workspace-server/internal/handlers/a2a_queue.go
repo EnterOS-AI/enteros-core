@@ -20,9 +20,9 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/events"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/textutil"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/textutil"
 )
 
 // extractIdempotencyKey pulls params.message.messageId out of an A2A JSON-RPC
@@ -160,10 +160,12 @@ func EnqueueA2A(
 	}
 
 	// Return current queue depth for the caller's visibility.
-	_ = db.DB.QueryRowContext(ctx, `
+	if err := db.DB.QueryRowContext(ctx, `
 		SELECT COUNT(*) FROM a2a_queue
 		WHERE workspace_id = $1 AND status = 'queued'
-	`, workspaceID).Scan(&depth)
+	`, workspaceID).Scan(&depth); err != nil {
+		log.Printf("A2AQueue: depth query failed for workspace %s: %v", workspaceID, err)
+	}
 
 	log.Printf("A2AQueue: enqueued %s for workspace %s (priority=%d, depth=%d)", id, workspaceID, priority, depth)
 	return id, depth, nil
@@ -249,10 +251,12 @@ func MarkQueueItemFailed(ctx context.Context, id, errMsg string) {
 // can see how many ahead of them.
 func QueueDepth(ctx context.Context, workspaceID string) int {
 	var n int
-	_ = db.DB.QueryRowContext(ctx,
+	if err := db.DB.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM a2a_queue WHERE workspace_id = $1 AND status = 'queued'`,
 		workspaceID,
-	).Scan(&n)
+	).Scan(&n); err != nil {
+		log.Printf("A2AQueue: QueueDepth query failed for workspace %s: %v", workspaceID, err)
+	}
 	return n
 }
 
@@ -333,7 +337,7 @@ func (h *WorkspaceHandler) DrainQueueForWorkspace(ctx context.Context, workspace
 	}
 	// logActivity=false: the original EnqueueA2A callsite already logged
 	// the dispatch attempt; re-logging here would double-count events.
-	status, respBody, proxyErr := h.proxyA2ARequest(ctx, workspaceID, item.Body, callerID, false)
+	status, respBody, proxyErr := h.proxyA2ARequest(ctx, workspaceID, item.Body, callerID, false, false)
 
 	// 202 Accepted = the dispatch was itself queued again (target still busy).
 	// That's not a failure — the queued item just stays queued naturally on
@@ -415,10 +419,14 @@ func (h *WorkspaceHandler) stitchDrainResponseToDelegation(ctx context.Context, 
 		return
 	}
 	responseText := extractResponseText(respBody)
-	respJSON, _ := json.Marshal(map[string]interface{}{
+	respJSON, marshalErr := json.Marshal(map[string]interface{}{
 		"text":          responseText,
 		"delegation_id": delegationID,
 	})
+	if marshalErr != nil {
+		log.Printf("a2aQueue stitch %s: json.Marshal respJSON failed: %v", delegationID, marshalErr)
+		return
+	}
 	res, err := db.DB.ExecContext(ctx, `
 		UPDATE activity_logs
 		   SET status        = 'completed',
@@ -434,7 +442,12 @@ func (h *WorkspaceHandler) stitchDrainResponseToDelegation(ctx context.Context, 
 		log.Printf("A2AQueue drain stitch: update failed for delegation %s: %v", delegationID, err)
 		return
 	}
-	if rows, _ := res.RowsAffected(); rows == 0 {
+	rows, err := res.RowsAffected()
+	if err != nil {
+		log.Printf("A2AQueue drain stitch: RowsAffected error for delegation %s: %v", delegationID, err)
+		return
+	}
+	if rows == 0 {
 		log.Printf("A2AQueue drain stitch: no delegate_result row for delegation %s (queued-row may not exist yet)", delegationID)
 		return
 	}

@@ -25,7 +25,7 @@ import (
 
 	_ "github.com/lib/pq"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/memory/pgplugin"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/memory/pgplugin"
 )
 
 // migrationsFS bundles the .up.sql files into the binary at build time

@@ -15,8 +15,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/provlog"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provlog"
 )
 
 // CPProvisionerAPI is the contract WorkspaceHandler uses to talk to the
@@ -32,6 +32,9 @@ import (
 type CPProvisionerAPI interface {
 	Start(ctx context.Context, cfg WorkspaceConfig) (string, error)
 	Stop(ctx context.Context, workspaceID string) error
+	// StopAndPrune is Stop + "erase the durable data volume" (internal#734),
+	// for the permanent-delete-with-erase flow ONLY. Restart/recreate use Stop.
+	StopAndPrune(ctx context.Context, workspaceID string) error
 	GetConsoleOutput(ctx context.Context, workspaceID string) (string, error)
 	// IsRunning reports whether the workspace's compute (EC2 instance) is
 	// currently in the running state. Surfaced on the interface (rather than
@@ -152,12 +155,22 @@ func (p *CPProvisioner) adminAuthHeaders(req *http.Request) {
 }
 
 type cpProvisionRequest struct {
-	OrgID       string            `json:"org_id"`
-	WorkspaceID string            `json:"workspace_id"`
-	Runtime     string            `json:"runtime"`
-	Tier        int               `json:"tier"`
-	PlatformURL string            `json:"platform_url"`
-	Env         map[string]string `json:"env"`
+	OrgID        string `json:"org_id"`
+	WorkspaceID  string `json:"workspace_id"`
+	Runtime      string `json:"runtime"`
+	Tier         int    `json:"tier"`
+	InstanceType string `json:"instance_type,omitempty"`
+	DiskGB       int32  `json:"disk_gb,omitempty"`
+	// Provider routes the CP to the compute backend for this workspace box
+	// (multi-provider RFC, per-workspace). Distinct from the LLM/model provider.
+	Provider string `json:"provider,omitempty"`
+	// DataPersistence is the per-workspace durable-data choice (internal#734);
+	// CP validates the enum at its provision edge and resolves the data volume
+	// from it. Empty = auto (omitted on the wire).
+	DataPersistence string                 `json:"data_persistence,omitempty"`
+	Display         WorkspaceDisplayConfig `json:"display,omitempty"`
+	PlatformURL     string                 `json:"platform_url"`
+	Env             map[string]string      `json:"env"`
 	// ConfigFiles are template + generated config files to write into the
 	// EC2 instance's /configs directory. OFFSEC-010: collected by
 	// collectCPConfigFiles which rejects symlinks and non-regular files
@@ -172,38 +185,86 @@ type cpProvisionResponse struct {
 	Error      string `json:"error"`
 }
 
+// buildCPTenantEnv assembles the env map the control plane forwards to a
+// tenant EC2 workspace container, applying the forensic #145 SCM-write-token
+// guard.
+//
+// The guard strips every key classified by isSCMWriteTokenKey (GITEA_TOKEN,
+// GITHUB_TOKEN, …) UNLESS that key is positively workspace-authored —
+// i.e. present in cfg.WorkspaceSecretKeys, the provenance set populated from
+// the workspace_secrets table. Rationale:
+//
+//   - Operator / persona-merged (global-scoped) SCM-write tokens are an
+//     upstream bleed and MUST NOT reach an agent-controlled container — that
+//     keeps the two-eyes review gate structurally self-bypass-proof.
+//   - A workspace-scoped GITEA_TOKEN that an org admin deliberately set via
+//     the canvas Secrets tab is the INTENDED delivery channel for that
+//     workspace's reviewer agent. Stripping it broke codex reviewers
+//     (whoami 401/404). It is exempt.
+//
+// Fail-safe: a nil cfg.WorkspaceSecretKeys yields wsAuthored=false for every
+// key, so a missing provenance map strips ALL SCM-write tokens rather than
+// leaking them. adminToken, when non-empty, is injected as ADMIN_TOKEN (it is
+// never an SCM-write key, so the guard never touches it).
+func buildCPTenantEnv(cfg WorkspaceConfig, adminToken string) map[string]string {
+	env := make(map[string]string, len(cfg.EnvVars)+1)
+	for k, v := range cfg.EnvVars {
+		if isSCMWriteTokenKey(k) {
+			_, wsAuthored := cfg.WorkspaceSecretKeys[k] // nil map → false (fail-safe)
+			if !wsAuthored {
+				log.Printf("CPProvisioner.Start: dropped SCM-write credential %q from tenant workspace env (forensic #145 guard; provenance=operator/global)", k)
+				continue
+			}
+			log.Printf("CPProvisioner.Start: preserved workspace-authored SCM credential %q for tenant workspace (forensic #145: workspace_secrets provenance, intended delivery)", k)
+		}
+		env[k] = v
+	}
+	if adminToken != "" {
+		env["ADMIN_TOKEN"] = adminToken
+	}
+	return env
+}
+
 // Start provisions a workspace by calling the control plane → EC2.
 func (p *CPProvisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string, error) {
 	// Inject ADMIN_TOKEN into the workspace container env so the agent can call
 	// /admin/liveness and other admin-gated platform endpoints (core#831).
 	// p.adminToken is read from os.Getenv("ADMIN_TOKEN") at provisioner creation;
 	// it is also used for CP→platform HTTP auth but those are separate concerns.
-	env := cfg.EnvVars
-	if p.adminToken != "" {
-		env = make(map[string]string, len(cfg.EnvVars)+1)
-		for k, v := range cfg.EnvVars {
-			env[k] = v
-		}
-		env["ADMIN_TOKEN"] = p.adminToken
-	}
+	//
+	// Forensic #145 hardening: tenant workspaces run on EC2 via this path, so
+	// the SCM-write-token denylist (see buildContainerEnv) is enforced here
+	// too. Always build a filtered copy — never pass cfg.EnvVars through
+	// verbatim — so a latent persona-merged GITEA_TOKEN can't reach the
+	// tenant container regardless of whether ADMIN_TOKEN is set. Extracted to
+	// buildCPTenantEnv so the strip/exempt logic is unit-testable without
+	// standing up the CP HTTP round-trip.
+	env := buildCPTenantEnv(cfg, p.adminToken)
 	// Collect template files and generated configs, with OFFSEC-010 guards:
 	// - Rejects symlinks at the template root (prevents bypass via symlink traversal)
 	// - Skips symlinks during WalkDir (prevents /etc/passwd etc. inclusion)
 	// - Validates all paths are relative and non-escaping
-	// - Caps total size at 12 KiB to prevent payload bloat
+	// - Caps total size at cpConfigFilesMaxBytes (a transport-DoS guard,
+	//   not the retired 12 KiB user-data ceiling — config now ships off
+	//   user-data via the CP's Secrets-Manager seeding path)
 	configFiles, err := collectCPConfigFiles(cfg)
 	if err != nil {
 		return "", fmt.Errorf("cp provisioner: collect config files: %w", err)
 	}
 
 	req := cpProvisionRequest{
-		OrgID:       p.orgID,
-		WorkspaceID: cfg.WorkspaceID,
-		Runtime:     cfg.Runtime,
-		Tier:        cfg.Tier,
-		PlatformURL: cfg.PlatformURL,
-		Env:         env,
-		ConfigFiles: configFiles,
+		OrgID:           p.orgID,
+		WorkspaceID:     cfg.WorkspaceID,
+		Runtime:         cfg.Runtime,
+		Tier:            cfg.Tier,
+		InstanceType:    cfg.InstanceType,
+		DiskGB:          cfg.DiskGB,
+		DataPersistence: cfg.DataPersistence,
+		Provider:        cfg.Provider,
+		Display:         cfg.Display,
+		PlatformURL:     cfg.PlatformURL,
+		Env:             env,
+		ConfigFiles:     configFiles,
 	}
 
 	body, err := json.Marshal(req)
@@ -228,9 +289,12 @@ func (p *CPProvisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string,
 	// Cap body read at 64 KiB — the CP only ever returns small JSON
 	// responses; an unbounded read could be weaponized into log-flood
 	// DoS by a compromised upstream.
-	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	if readErr != nil {
+		return "", fmt.Errorf("cp provisioner: read response body: %w", readErr)
+	}
 	var result cpProvisionResponse
-	json.Unmarshal(respBody, &result)
+	unmarshalErr := json.Unmarshal(respBody, &result)
 
 	if resp.StatusCode != http.StatusCreated {
 		// Prefer the structured {"error":"..."} field. Do NOT fall back
@@ -244,6 +308,10 @@ func (p *CPProvisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string,
 		return "", fmt.Errorf("cp provisioner: provision failed (%d): %s", resp.StatusCode, errMsg)
 	}
 
+	if unmarshalErr != nil {
+		return "", fmt.Errorf("cp provisioner: decode 201 response: %w", unmarshalErr)
+	}
+
 	log.Printf("CP provisioner: workspace %s → EC2 instance %s (%s)", cfg.WorkspaceID, result.InstanceID, result.State)
 	provlog.Event("provision.ec2_started", map[string]any{
 		"workspace_id": cfg.WorkspaceID,
@@ -255,7 +323,27 @@ func (p *CPProvisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string,
 	return result.InstanceID, nil
 }
 
-const cpConfigFilesMaxBytes = 12 << 10
+// cpConfigFilesMaxBytes bounds the aggregate config bundle this tenant
+// ships to the control plane. It is a transport-DoS guard, NOT the old
+// EC2-user-data ceiling.
+//
+// History: this was 12 KiB (12<<10) because the CP embedded the bundle in
+// EC2 user-data, which AWS caps at 16 KiB (the cap left ~4 KiB for bootstrap
+// overhead). That ceiling failed real customers — the jrs-auto SEO Agent's
+// config (long SEO system prompt + SERVICES_REPO_WEBSITE + a 12-schedule
+// block baked into config.yaml) exceeds 12 KiB, so Start() rejected it
+// client-side with "config files exceed 12288 bytes" and the workspace
+// could never provision.
+//
+// Config delivery now goes OFF user-data: the CP stages the bundle to AWS
+// Secrets Manager (molecule/workspace/<id>/config) at provision time and the
+// workspace fetches it into /configs at boot (mirrors the proven tenant
+// bootstrap-secrets pattern). The bundle travels here only inside the JSON
+// HTTP request body to the CP, which has no 16 KiB limit. The remaining
+// bound exists purely so a buggy/hostile tenant can't stream an unbounded
+// body and OOM the CP provision path — set generous (256 KiB) so legitimate
+// growth (more schedules, longer prompts, more skills) never re-hits a wall.
+const cpConfigFilesMaxBytes = 256 << 10
 
 // isCPTemplateConfigFile restricts which files from a template directory are
 // eligible for transport to the control plane. Only config.yaml (the runtime
@@ -354,6 +442,20 @@ func collectCPConfigFiles(cfg WorkspaceConfig) (map[string]string, error) {
 // blocking the next provision with InvalidGroup.Duplicate — a full
 // "Save & Restart" crash on SaaS.
 func (p *CPProvisioner) Stop(ctx context.Context, workspaceID string) error {
+	return p.stopInternal(ctx, workspaceID, false)
+}
+
+// StopAndPrune terminates the workspace's compute AND requests that its durable
+// data volume (browser profile / cookies / downloads / agent memory) be erased
+// (internal#734). Used ONLY by the permanent-delete flow when the user chose to
+// erase saved data — NEVER by restart/recreate (which call Stop), so a recreate
+// can never trigger a prune. CP enforces this defensively too (the prune is a
+// short-grace mark-then-sweep gated on the workspace being genuinely gone).
+func (p *CPProvisioner) StopAndPrune(ctx context.Context, workspaceID string) error {
+	return p.stopInternal(ctx, workspaceID, true)
+}
+
+func (p *CPProvisioner) stopInternal(ctx context.Context, workspaceID string, prune bool) error {
 	if p == nil {
 		return ErrNoBackend
 	}
@@ -376,7 +478,14 @@ func (p *CPProvisioner) Stop(ctx context.Context, workspaceID string) error {
 		return ErrNoBackend
 	}
 	url := fmt.Sprintf("%s/cp/workspaces/%s?instance_id=%s", p.baseURL, workspaceID, instanceID)
-	req, _ := http.NewRequestWithContext(ctx, "DELETE", url, nil)
+	if prune {
+		// internal#734: ask CP to erase the data volume on this delete.
+		url += "&prune=true"
+	}
+	req, err := http.NewRequestWithContext(ctx, "DELETE", url, nil)
+	if err != nil {
+		return fmt.Errorf("cp provisioner: stop: build request: %w", err)
+	}
 	p.provisionAuthHeaders(req)
 	resp, err := p.httpClient.Do(req)
 	if err != nil {
@@ -396,7 +505,11 @@ func (p *CPProvisioner) Stop(ctx context.Context, workspaceID string) error {
 		// Read a bounded slice of the body so the error message gives ops
 		// enough to triage without risking a multi-MB log line on a
 		// pathological response. 512 bytes covers any sane error envelope.
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 512))
+		if readErr != nil {
+			return fmt.Errorf("cp provisioner: stop %s: unexpected %d (read body failed: %w)",
+				workspaceID, resp.StatusCode, readErr)
+		}
 		return fmt.Errorf("cp provisioner: stop %s: unexpected %d: %s",
 			workspaceID, resp.StatusCode, strings.TrimSpace(string(body)))
 	}
@@ -487,7 +600,10 @@ func (p *CPProvisioner) IsRunning(ctx context.Context, workspaceID string) (bool
 		return false, ErrNoBackend
 	}
 	url := fmt.Sprintf("%s/cp/workspaces/%s/status?instance_id=%s", p.baseURL, workspaceID, instanceID)
-	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return true, fmt.Errorf("cp provisioner: status: build request: %w", err)
+	}
 	p.provisionAuthHeaders(req)
 	resp, err := p.httpClient.Do(req)
 	if err != nil {
@@ -521,7 +637,10 @@ func (p *CPProvisioner) IsRunning(ctx context.Context, workspaceID string) (bool
 // to render to the user.
 func (p *CPProvisioner) GetConsoleOutput(ctx context.Context, workspaceID string) (string, error) {
 	url := fmt.Sprintf("%s/cp/admin/workspaces/%s/console", p.baseURL, workspaceID)
-	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return "", fmt.Errorf("cp provisioner: console: build request: %w", err)
+	}
 	p.adminAuthHeaders(req)
 	resp, err := p.httpClient.Do(req)
 	if err != nil {

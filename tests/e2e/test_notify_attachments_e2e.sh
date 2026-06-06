@@ -28,11 +28,18 @@ PASS=0
 FAIL=0
 WSID=""
 
+# GET /workspaces (list) and POST /workspaces (create) are AdminAuth-gated
+# (router.go:165-166). The e2e-api CI job sets ADMIN_TOKEN on the platform
+# (fail-open OFF) and exports MOLECULE_ADMIN_TOKEN here, so these calls need the
+# admin bearer. Guarded if-set so a fail-open dev platform still works.
+ADMIN_AUTH=()
+e2e_admin_auth_args ADMIN_AUTH
+
 cleanup() {
   # Workspace teardown — best-effort, ignore errors so an unrelated CP
   # outage doesn't shadow a real test failure.
   if [ -n "$WSID" ]; then
-    curl -s -X DELETE "$BASE/workspaces/$WSID?confirm=true" > /dev/null || true
+    e2e_delete_workspace "$WSID" "Notify E2E"
   fi
   # /tmp scratch — pre-fix only ran on success path (the unconditional
   # rm at the bottom of the script). Trap-based path lets the file leak
@@ -80,7 +87,7 @@ echo "=== Setup ==="
 # canvas. Find and delete any with this exact name so the test is safe to
 # re-run from any state. Match by name (not tag) so this also catches
 # leftovers created by older script versions.
-PRIOR=$(curl -s "$BASE/workspaces" | python3 -c '
+PRIOR=$(curl -s "$BASE/workspaces" ${ADMIN_AUTH[@]+"${ADMIN_AUTH[@]}"} | python3 -c '
 import json, sys
 try:
     print(" ".join(w["id"] for w in json.load(sys.stdin) if w.get("name") == "Notify E2E"))
@@ -89,21 +96,27 @@ except Exception:
 ')
 for _wid in $PRIOR; do
   echo "Sweeping leftover Notify E2E workspace: $_wid"
-  curl -s -X DELETE "$BASE/workspaces/$_wid?confirm=true" > /dev/null || true
+  e2e_delete_workspace "$_wid" "Notify E2E"
 done
 
-R=$(curl -s -X POST "$BASE/workspaces" -H "Content-Type: application/json" \
-  -d '{"name":"Notify E2E","tier":1}')
+# model is required at the Create boundary (CTO 2026-05-22 SSOT — see
+# feedback_workspace_model_required_no_platform_default_dynamic_credential_intake).
+# Body has no runtime → defaults to claude-code; pass the matching model
+# that the workspace-creation contract now requires.
+R=$(curl -s -X POST "$BASE/workspaces" ${ADMIN_AUTH[@]+"${ADMIN_AUTH[@]}"} -H "Content-Type: application/json" \
+  -d '{"name":"Notify E2E","tier":1,"runtime":"external","external":true,"model":"sonnet"}')
 WSID=$(echo "$R" | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])' 2>/dev/null || true)
 [ -n "$WSID" ] || { echo "Failed to create workspace: $R"; exit 1; }
+TOKEN=$(echo "$R" | e2e_extract_token)
 echo "Created workspace $WSID"
 
 # Mint a bearer token so the wsAuth-grouped endpoints (notify, activity,
-# chat/uploads) accept us. Local dev mode skips auth, but CI enforces it
-# — so we always send the header to keep the test portable. The
-# admin/test-token endpoint is only enabled when MOLECULE_ENV != production.
-TOKEN=$(e2e_mint_test_token "$WSID")
-[ -n "$TOKEN" ] || { echo "Failed to mint test token"; exit 1; }
+# chat/uploads) accept us. Local dev mode skips auth, but CI enforces it,
+# so we always send the header to keep the test portable.
+if [ -z "$TOKEN" ]; then
+  TOKEN=$(e2e_mint_workspace_token "$WSID")
+fi
+[ -n "$TOKEN" ] || { echo "Failed to mint workspace token"; exit 1; }
 AUTH="Authorization: Bearer $TOKEN"
 
 echo ""

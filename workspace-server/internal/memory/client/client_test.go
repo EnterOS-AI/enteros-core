@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/memory/contract"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/memory/contract"
 )
 
 // roundTripperFunc lets tests inject a fully synthetic transport.

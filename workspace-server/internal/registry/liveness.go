@@ -5,8 +5,8 @@ import (
 	"log"
 	"strings"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/models"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
 )
 
 // OfflineHandler is called when a workspace's liveness key expires.

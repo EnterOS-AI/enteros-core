@@ -91,7 +91,7 @@ Cold-start times on workspace-template images:
 |---|---|
 | claude-code | ~30-60s |
 | openclaw | ~1-2 min |
-| langgraph | ~1 min |
+| claude-code | ~1 min |
 | hermes | **~7 min** (large image) |
 
 If the demo will use `hermes`, provision the demo workspace at least

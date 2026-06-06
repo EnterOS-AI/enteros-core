@@ -21,6 +21,8 @@ func TestExtended_WorkspaceDelete(t *testing.T) {
 	broadcaster := newTestBroadcaster()
 	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", "/tmp/configs")
 
+	expectWorkspaceDeleteLookup(mock, wsDelID, "Delete Me", 0, "running")
+
 	// Expect children query — no children
 	mock.ExpectQuery("SELECT id, name FROM workspaces WHERE parent_id").
 		WithArgs(wsDelID).
@@ -59,6 +61,7 @@ func TestExtended_WorkspaceDelete(t *testing.T) {
 	c, _ := gin.CreateTestContext(w)
 	c.Params = gin.Params{{Key: "id", Value: wsDelID}}
 	c.Request = httptest.NewRequest("DELETE", "/workspaces/"+wsDelID+"?confirm=true", nil)
+	c.Request.Header.Set("X-Confirm-Name", "Delete Me")
 
 	handler.Delete(c)
 
@@ -187,7 +190,7 @@ func TestExtended_WorkspaceRestart_NoProvisioner(t *testing.T) {
 	// Expect SELECT for workspace existence check (includes runtime column)
 	mock.ExpectQuery("SELECT status, name, tier").
 		WithArgs("ws-restart").
-		WillReturnRows(sqlmock.NewRows([]string{"status", "name", "tier", "runtime"}).AddRow("offline", "Restarting Agent", 1, "langgraph"))
+		WillReturnRows(sqlmock.NewRows([]string{"status", "name", "tier", "runtime"}).AddRow("offline", "Restarting Agent", 1, "claude-code"))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -252,8 +255,20 @@ func TestExtended_SecretsListEmpty(t *testing.T) {
 // ---------- TestSecretsSet (Extended) ----------
 
 func TestExtended_SecretsSet(t *testing.T) {
+	// internal#718 P2-B: the per-workspace strip gate keys off the DERIVED mode
+	// (org rung retired). This test's intent is the happy path of persisting a
+	// vendor key on a byok workspace; the realistic way a workspace is byok for
+	// a direct vendor-key write is an explicit operator override (the escape
+	// hatch the reject error itself points to: PUT /admin/.../llm-billing-mode).
+	// The override short-circuits the resolver to byok in a single read, so the
+	// bypass-list check is skipped and the write proceeds.
+	t.Setenv("MOLECULE_LLM_BILLING_MODE", "platform_managed") // org env ignored now
 	mock := setupTestDB(t)
 	handler := NewSecretsHandler(nil)
+
+	mock.ExpectQuery(`SELECT llm_billing_mode FROM workspaces WHERE id = \$1`).
+		WithArgs("22222222-2222-2222-2222-222222222222").
+		WillReturnRows(sqlmock.NewRows([]string{"llm_billing_mode"}).AddRow(LLMBillingModeBYOK))
 
 	// Expect INSERT (encrypted value is dynamic, use AnyArg)
 	mock.ExpectExec("INSERT INTO workspace_secrets").
@@ -287,6 +302,26 @@ func TestExtended_SecretsSet(t *testing.T) {
 
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+func TestExtended_SecretsSetRejectsHermesCustomProviderInPlatformManagedMode(t *testing.T) {
+	t.Setenv("MOLECULE_LLM_BILLING_MODE", "platform_managed")
+	_ = setupTestDB(t)
+	handler := NewSecretsHandler(nil)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "22222222-2222-2222-2222-222222222222"}}
+
+	body := `{"key":"KIMI_API_KEY","value":"sk-test-moonshot"}`
+	c.Request = httptest.NewRequest("POST", "/workspaces/22222222-2222-2222-2222-222222222222/secrets", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Set(c)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d: %s", w.Code, w.Body.String())
 	}
 }
 
@@ -338,20 +373,23 @@ func TestExtended_DiscoverWithCallerID(t *testing.T) {
 	setupTestRedis(t)
 	handler := NewDiscoveryHandler()
 
+	// validateDiscoveryCaller probes HasAnyLiveToken(callerID) first; grandfather.
+	seedDiscoveryGrandfather(mock, "ws-caller")
+
 	// CanCommunicate needs to look up both workspaces
-	// Caller: root-level (no parent)
+	// Share a parent so communication is allowed under post-#1955 rules
+	sharedParent := "ws-parent"
 	mock.ExpectQuery("SELECT id, parent_id FROM workspaces WHERE id =").
 		WithArgs("ws-caller").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "parent_id"}).AddRow("ws-caller", nil))
-	// Target: also root-level (no parent) — root-level siblings are allowed
+		WillReturnRows(sqlmock.NewRows([]string{"id", "parent_id"}).AddRow("ws-caller", sharedParent))
 	mock.ExpectQuery("SELECT id, parent_id FROM workspaces WHERE id =").
 		WithArgs("ws-target").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "parent_id"}).AddRow("ws-target", nil))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "parent_id"}).AddRow("ws-target", sharedParent))
 
 	// Discover handler looks up workspace name + runtime
 	mock.ExpectQuery("SELECT COALESCE").
 		WithArgs("ws-target").
-		WillReturnRows(sqlmock.NewRows([]string{"name", "runtime"}).AddRow("Target Agent", "langgraph"))
+		WillReturnRows(sqlmock.NewRows([]string{"name", "runtime"}).AddRow("Target Agent", "claude-code"))
 
 	// No cached internal URL (Redis empty), so falls through to DB status check
 	mock.ExpectQuery("SELECT status FROM workspaces WHERE id =").
@@ -416,26 +454,35 @@ func TestExtended_DiscoverMissingHeader(t *testing.T) {
 
 // ---------- TestPeers (Extended) ----------
 
+// TestExtended_Peers verifies a root-level (org-root) workspace's peer view.
+//
+// #1953: previously a root-level caller issued `WHERE w.parent_id IS NULL`
+// for siblings, which returned EVERY other tenant's org root as a "peer"
+// (cross-tenant leak, since the workspaces table has no org_id column). After
+// the fix an org root has no cross-tenant siblings; its only peers are its own
+// children. This test asserts the child is returned and that NO sibling query
+// is issued (no `parent_id IS NULL` read).
 func TestExtended_Peers(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
 	handler := NewDiscoveryHandler()
+
+	// validateDiscoveryCaller probes HasAnyLiveToken(:id) first; grandfather.
+	seedDiscoveryGrandfather(mock, "ws-peer")
 
 	// Expect parent_id lookup for requesting workspace (root-level, no parent)
 	mock.ExpectQuery("SELECT parent_id FROM workspaces WHERE id =").
 		WithArgs("ws-peer").
 		WillReturnRows(sqlmock.NewRows([]string{"parent_id"}).AddRow(nil))
 
-	// Expect root-level siblings query (parent IS NULL, excluding self)
-	mock.ExpectQuery("SELECT w.id, w.name").
-		WithArgs("ws-peer").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "role", "tier", "status", "agent_card", "url", "parent_id", "active_tasks"}).
-			AddRow("ws-sibling", "Sibling Agent", "worker", 1, "online", []byte("null"), "http://localhost:9001", nil, 0))
+	// NO root-level sibling query is issued for an org-root caller anymore.
 
-	// Expect children query (workspaces with parent_id = ws-peer)
+	// Children query (workspaces with parent_id = ws-peer, excluding self).
+	// Query binds (parent_id, self_id) for the self-filter guard added in #383.
 	mock.ExpectQuery("SELECT w.id, w.name").
-		WithArgs("ws-peer").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "role", "tier", "status", "agent_card", "url", "parent_id", "active_tasks"}))
+		WithArgs("ws-peer", "ws-peer").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "role", "tier", "status", "agent_card", "url", "parent_id", "active_tasks"}).
+			AddRow("ws-child", "Child Agent", "worker", 1, "online", []byte("null"), "http://localhost:9001", "ws-peer", 0))
 
 	// No parent query since workspace is root-level
 
@@ -455,10 +502,10 @@ func TestExtended_Peers(t *testing.T) {
 		t.Fatalf("failed to parse response: %v", err)
 	}
 	if len(resp) != 1 {
-		t.Fatalf("expected 1 peer, got %d", len(resp))
+		t.Fatalf("expected 1 peer (the child), got %d", len(resp))
 	}
-	if resp[0]["name"] != "Sibling Agent" {
-		t.Errorf("expected peer name 'Sibling Agent', got %v", resp[0]["name"])
+	if resp[0]["name"] != "Child Agent" {
+		t.Errorf("expected peer name 'Child Agent', got %v", resp[0]["name"])
 	}
 
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -474,13 +521,14 @@ func TestExtended_CheckAccess(t *testing.T) {
 	handler := NewDiscoveryHandler()
 
 	// CanCommunicate will look up both workspaces
-	// Both root-level — should be allowed
+	// Share a parent so communication is allowed under post-#1955 rules
+	sharedParent := "ws-parent"
 	mock.ExpectQuery("SELECT id, parent_id FROM workspaces WHERE id =").
 		WithArgs("ws-a").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "parent_id"}).AddRow("ws-a", nil))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "parent_id"}).AddRow("ws-a", sharedParent))
 	mock.ExpectQuery("SELECT id, parent_id FROM workspaces WHERE id =").
 		WithArgs("ws-b").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "parent_id"}).AddRow("ws-b", nil))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "parent_id"}).AddRow("ws-b", sharedParent))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -730,7 +778,7 @@ func TestValidateWorkspaceFields_Lengths(t *testing.T) {
 		name, role, model, runtime string
 		wantErr                    bool
 	}{
-		{"ok", "ok", "ok role", "gpt-4", "langgraph", false},
+		{"ok", "ok", "ok role", "gpt-4", "claude-code", false},
 		{"name_too_long", long256, "", "", "", true},
 		{"role_too_long", "", long1001, "", "", true},
 		{"model_too_long", "", "", long101, "", true},
@@ -773,6 +821,103 @@ func TestCreate_FieldValidation_Returns400(t *testing.T) {
 				t.Errorf("Create(%s): want 400, got %d: %s", tc.label, w.Code, w.Body.String())
 			}
 		})
+	}
+}
+
+// TestCreate_ModelRequired_Returns422 pins the CTO 2026-05-22 SSOT
+// directive (feedback_workspace_model_required_no_platform_default_dynamic_credential_intake):
+// model is required user input; the platform must not supply a default,
+// the runtime must not fall back. Empirical trigger: Code Reviewer
+// 5ba15d7e was created with `{"name":..., "runtime":"codex", ...}` (no
+// model). The legacy DefaultModel fallback returned "anthropic:claude-opus-4-7"
+// and codex adapter wedged forever — `picks provider='anthropic' but it
+// is not in the providers registry`. The gate at the Create boundary
+// turns that silent stuck-workspace failure into an immediate 422 the
+// caller can react to.
+//
+// Three shapes covered:
+//  1. bare name (no template, no runtime, no model) — formerly defaulted
+//     to claude-code + anthropic; now 422 because model is unspecified.
+//  2. explicit runtime, no model — the Code Reviewer repro shape.
+//  3. explicit runtime+template path, but template (when missing on
+//     disk or unreadable) would leave model empty — exercised here by
+//     pointing at a non-existent template under /tmp/configs.
+func TestCreate_ModelRequired_Returns422(t *testing.T) {
+	setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", "/tmp/configs")
+
+	cases := []struct{ label, body string }{
+		{"bare_name_no_runtime_no_model", `{"name":"x"}`},
+		{"explicit_codex_no_model", `{"name":"Code Reviewer","role":"code reviewer","runtime":"codex","tier":4,"max_concurrent_tasks":1}`},
+		{"explicit_hermes_no_model", `{"name":"researcher","runtime":"hermes"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.label, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(tc.body))
+			c.Request.Header.Set("Content-Type", "application/json")
+			handler.Create(c)
+			if w.Code != http.StatusUnprocessableEntity {
+				t.Errorf("Create(%s): want 422 MODEL_REQUIRED, got %d: %s", tc.label, w.Code, w.Body.String())
+				return
+			}
+			if !bytes.Contains(w.Body.Bytes(), []byte(`"code":"MODEL_REQUIRED"`)) {
+				t.Errorf("Create(%s): want body containing code=MODEL_REQUIRED, got %s", tc.label, w.Body.String())
+			}
+		})
+	}
+}
+
+// TestCreate_ExternalRuntime_NoModel_OK pins the external-runtime
+// exemption from the MODEL_REQUIRED gate. External workspaces
+// intentionally do not spawn a Docker container or run an adapter;
+// they delegate to a registered URL (workspace_provision.go:497-498:
+// "external is a first-class runtime that intentionally does NOT
+// spawn a Docker container"). The model field has no meaning for
+// them — the URL is the contract, and the gate would 422 every
+// legitimate "register my agent at https://..." flow.
+//
+// Both spellings count as external:
+//  1. payload.External == true (the canonical flag, e.g. with any runtime)
+//  2. payload.Runtime == "external" (legacy shape some E2E scripts still use)
+//
+// The isExternalLikeRuntime() helper catches both "external" and any
+// future external-like runtime alias.
+func TestCreate_ExternalRuntime_NoModel_OK(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
+
+	// External=true with explicit runtime — the test_api.sh / Echo Agent shape.
+	mock.ExpectBegin()
+	mock.ExpectExec("INSERT INTO workspaces").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+	mock.ExpectExec("INSERT INTO canvas_layouts").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO structure_events").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`UPDATE workspaces SET status =`).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO workspace_auth_tokens").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO structure_events").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	body := `{"name":"Echo Agent","tier":1,"runtime":"external","external":true}`
+	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	handler.Create(c)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("external workspace without model: want 201, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations not met: %v", err)
 	}
 }
 

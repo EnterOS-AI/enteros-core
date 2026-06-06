@@ -3,17 +3,19 @@ package handlers
 import (
 	"context"
 	"database/sql"
+	"io"
 	"log"
 	"net/http"
 	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/events"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/models"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/provlog"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provlog"
 	"github.com/gin-gonic/gin"
 )
 
@@ -39,11 +41,147 @@ type restartState struct {
 	mu      sync.Mutex
 	running bool // true while a restart cycle is in flight
 	pending bool // set by any caller that arrived during the in-flight cycle
+	// restartStartedAt records the wall-clock when the most recent cycle
+	// flipped running=true. Used by the self-fire debounce (internal#544,
+	// the ws-server self-fire restart feedback loop seen in prod-Reviewer/
+	// Researcher 2026-05-19 ~00:05Z 4x reprov thrash): any RestartByID
+	// arriving within restartDebounceWindow of this timestamp is silently
+	// dropped so a probe firing during the EC2-pending window can't
+	// re-trigger a fresh full cycle on the just-launched instance.
+	restartStartedAt time.Time
 }
 
 // restartStates is a per-workspace map of *restartState. Each workspace gets
 // its own entry so unrelated workspaces don't serialize on each other.
 var restartStates sync.Map // map[workspaceID]*restartState
+
+// restartDebounceWindow is the silent-drop window for successive RestartByID
+// calls. Sized to cover the typical EC2 pending → online interval (20-30s)
+// with a margin so a probe firing during the just-after-online but still-
+// flaky heartbeat window also gets dropped. Bigger than that would block
+// legitimate "Restart failed, retry" recoveries; smaller would let the
+// 4x thrash class through. Package-level so tests can shrink it.
+var restartDebounceWindow = 60 * time.Second
+
+// restartByIDDropCounter is incremented every time RestartByID drops a call
+// inside the debounce window. Exposed as a package-level atomic counter so
+// (a) tests can assert the drop fired, (b) ops can grep logs for the drop
+// log line + the counter snapshot in a future /admin/metrics endpoint.
+// Not a Prometheus metric because the platform doesn't pull metrics from
+// workspace-server yet — that's a separate RFC.
+var restartByIDDropCounter atomic.Uint64
+
+// fileWriteRestartDebounceWindow is the per-workspace coalescing window for
+// the file-write → RestartByID trigger fired by templates.go's WriteFile,
+// DeleteFile, and ReplaceFiles handlers (and template_import.go's variants).
+//
+// Background (internal#624 2026-05-20): canvas Save fires N PUT /files
+// requests in a 30-60s burst (claude-code SEO agent observed 10-17 files in
+// 60s). Each successful write previously fired `goAsync(RestartByID)`. The
+// 60s self-fire debounce in RestartByID itself catches calls 1-60s, but
+// writes at T+65s+ pass the debounce, set pending=true on a still-running
+// coalesceRestart cycle, and drain immediately into cycle 2 — which DELETEs
+// + recreates EC2 mid-burst, returning 500 EC2InstanceStateInvalidException
+// on the in-flight user PUTs.
+//
+// 15s is sized to absorb a canvas Save burst (writes typically land within
+// a 5-10s window) while still letting a deliberate "edit, wait, edit again"
+// pattern restart twice. Bigger than that would silently swallow legitimate
+// rapid-iteration edits; smaller would let burst tails leak through.
+var fileWriteRestartDebounceWindow = 15 * time.Second
+
+// fileWriteRestartLastFireAt records the last time `maybeRestartAfterFileWrite`
+// actually fired a restart for each workspace. sync.Map (not RWMutex+map)
+// because writes happen on every successful file-write handler, reads on
+// every subsequent file-write handler call — both per-workspace — and the
+// keys are sparse + long-lived. Stored as int64 unix-nano so the load/store
+// path can stay lock-free (atomic.Int64 inside sync.Map.Value is fine, but
+// time.Time itself isn't atomically loadable).
+var fileWriteRestartLastFireAt sync.Map // map[workspaceID]*atomic.Int64
+
+// fileWriteRestartDropCounter counts how many file-write restart triggers
+// were silently coalesced. Same observability rationale as
+// restartByIDDropCounter — package-level atomic so tests can assert the
+// drop fired and ops can correlate with "user clicked Save 10 times,
+// only saw 1 restart cycle".
+var fileWriteRestartDropCounter atomic.Uint64
+
+// maybeRestartAfterFileWrite is the call-site debounce wrapper for the 9
+// file-write trigger sites in templates.go + template_import.go. Replaces
+// the direct `goAsync(func() { wh.RestartByID(wsID) })` pattern with a
+// 15s per-workspace coalescing window:
+//
+//   - First call (no prior fire OR last fire >15s ago): records the
+//     current timestamp and fires goAsync(RestartByID).
+//   - Subsequent calls within 15s of the last fire: silently dropped,
+//     drop counter incremented.
+//
+// This is the call-site-layer protection (internal#624 Path A). The drain-
+// loop layer in coalesceRestart (Path B, re-stamping restartStartedAt per
+// iteration) is the platform-layer defense in depth — together they close
+// the file-write tight-loop class regardless of which entry point fires.
+//
+// Stateless on the handler so any handler with access to a WorkspaceHandler
+// can use it; the per-workspace state lives in the package-level sync.Map.
+func (h *WorkspaceHandler) maybeRestartAfterFileWrite(workspaceID string) {
+	now := time.Now().UnixNano()
+
+	// LoadOrStore the per-workspace last-fire stamp. First write for a
+	// brand-new workspace falls through the CompareAndSwap below because
+	// the zero-init value (0) is far enough in the past to satisfy the
+	// "last fire >15s ago" predicate.
+	sv, _ := fileWriteRestartLastFireAt.LoadOrStore(workspaceID, new(atomic.Int64))
+	stamp := sv.(*atomic.Int64)
+
+	// CAS loop: read last, decide, swap. We use CAS instead of Lock/Unlock
+	// because the typical case is "thousands of writes, one restart per
+	// 15s" — uncontended atomic is ~5ns vs ~30ns mutex. Bounded retry
+	// because in the rare contended case (two writes finishing nanoseconds
+	// apart) one will win the swap and the other will see the new stamp,
+	// drop, and bail.
+	for retry := 0; retry < 4; retry++ {
+		last := stamp.Load()
+		elapsed := time.Duration(now - last)
+		if last != 0 && elapsed < fileWriteRestartDebounceWindow {
+			// Within debounce window — drop silently.
+			fileWriteRestartDropCounter.Add(1)
+			log.Printf("maybeRestartAfterFileWrite: %s — coalesced "+
+				"(last fire %s ago < %s window; total dropped=%d)",
+				workspaceID, elapsed.Round(time.Millisecond),
+				fileWriteRestartDebounceWindow,
+				fileWriteRestartDropCounter.Load())
+			return
+		}
+		if stamp.CompareAndSwap(last, now) {
+			break
+		}
+		// Another writer beat us to the stamp update. Re-read and retry;
+		// the retry will almost certainly see the new value and drop.
+	}
+
+	h.goAsync(func() { h.RestartByID(workspaceID) })
+}
+
+// isRestarting reports whether a restart cycle is currently in flight for
+// the workspace. Callers that have their own "container looks dead" probe
+// MUST consult this before triggering a restart, because during the
+// 20-30s EC2-pending window the workspace's url=” and IsRunning()=false
+// looks identical to a dead container — and any restart-triggering probe
+// (maybeMarkContainerDead from canvas /delegations poll, or the trailing
+// restart-context probe at the end of runRestartCycle) will set
+// pending=true and the outer coalesceRestart loop will drain by running
+// ANOTHER full cycle, ec2_stopped of the just-booted instance →
+// re-provision. That's the self-fire loop closed by this gate.
+func isRestarting(workspaceID string) bool {
+	sv, ok := restartStates.Load(workspaceID)
+	if !ok {
+		return false
+	}
+	state := sv.(*restartState)
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	return state.running
+}
 
 // isParentPaused checks if any ancestor of the workspace is paused.
 func isParentPaused(ctx context.Context, workspaceID string) (bool, string) {
@@ -75,7 +213,7 @@ func (h *WorkspaceHandler) Restart(c *gin.Context) {
 	var status, wsName, dbRuntime string
 	var tier int
 	err := db.DB.QueryRowContext(ctx,
-		`SELECT status, name, tier, COALESCE(runtime, 'langgraph') FROM workspaces WHERE id = $1`, id,
+		`SELECT status, name, tier, COALESCE(runtime, 'claude-code') FROM workspaces WHERE id = $1`, id,
 	).Scan(&status, &wsName, &tier, &dbRuntime)
 	if err == sql.ErrNoRows {
 		c.JSON(http.StatusNotFound, gin.H{"error": "workspace not found"})
@@ -135,46 +273,38 @@ func (h *WorkspaceHandler) Restart(c *gin.Context) {
 		return
 	}
 
-	// Read runtime from container's config.yaml before stopping. Docker-
-	// only: in SaaS mode the workspace runs on a remote EC2 and we can't
-	// exec into it, so we trust the DB value (user updates runtime via
-	// the Config tab which writes through to both the DB and the container).
-	containerRuntime := dbRuntime
-	if h.provisioner != nil {
-		containerName := configDirName(id) // ws-{id[:12]}
-		if cfgBytes, readErr := h.provisioner.ExecRead(ctx, containerName, "/configs/config.yaml"); readErr == nil {
-			for _, line := range strings.Split(string(cfgBytes), "\n") {
-				line = strings.TrimSpace(line)
-				if strings.HasPrefix(line, "runtime:") {
-					parsed := strings.TrimSpace(strings.TrimPrefix(line, "runtime:"))
-					if parsed != "" && parsed != containerRuntime {
-						log.Printf("Restart: runtime changed in config.yaml %q→%q for %s", containerRuntime, parsed, wsName)
-						containerRuntime = parsed
-						db.DB.ExecContext(ctx, `UPDATE workspaces SET runtime = $1 WHERE id = $2`, containerRuntime, id)
-					}
-					break
-				}
-			}
-		}
-	}
-
-	// Reset to provisioning
-	db.DB.ExecContext(ctx,
-		`UPDATE workspaces SET status = $1, url = '', updated_at = now() WHERE id = $2`, models.StatusProvisioning, id)
-	h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceProvisioning), id, map[string]interface{}{
-		"name":    wsName,
-		"tier":    tier,
-		"runtime": containerRuntime,
-	})
-
-	// Read template from request body or try to find matching config
+	// Read template from request body before consulting the existing
+	// config volume. apply_template means the caller just changed the
+	// runtime in the DB and wants the runtime-default template to be
+	// authoritative; in that case, reading the old container config would
+	// roll the DB runtime back before restart.
 	var body struct {
 		Template      string `json:"template"`
 		ApplyTemplate bool   `json:"apply_template"` // force re-apply runtime-default template (e.g. after runtime change)
 		Reset         bool   `json:"reset"`          // #12: discard claude-sessions volume before restart
 		RebuildConfig bool   `json:"rebuild_config"` // #239: re-render config volume from org-template source (recovery path when volume was destroyed)
 	}
-	c.ShouldBindJSON(&body)
+	if err := c.ShouldBindJSON(&body); err != nil && err != io.EOF {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid JSON body"})
+		return
+	}
+
+	// Read runtime from container's config.yaml before stopping. Docker-
+	// only: in SaaS mode the workspace runs on a remote EC2 and we can't
+	// exec into it, so we trust the DB value (user updates runtime via
+	// the Config tab which writes through to both the DB and the container).
+	containerRuntime := h.restartRuntimeFromConfig(ctx, id, wsName, dbRuntime, body.ApplyTemplate)
+
+	// Reset to provisioning
+	if _, err := db.DB.ExecContext(ctx,
+		`UPDATE workspaces SET status = $1, url = '', updated_at = now() WHERE id = $2`, models.StatusProvisioning, id); err != nil {
+		log.Printf("Restart: failed to set provisioning status for %s: %v", id, err)
+	}
+	h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceProvisioning), id, map[string]interface{}{
+		"name":    wsName,
+		"tier":    tier,
+		"runtime": containerRuntime,
+	})
 
 	templatePath, configLabel := resolveRestartTemplate(h.configsDir, wsName, dbRuntime, restartTemplateInput{
 		Template:      body.Template,
@@ -200,7 +330,7 @@ func (h *WorkspaceHandler) Restart(c *gin.Context) {
 	}
 
 	var configFiles map[string][]byte
-	payload := models.CreateWorkspacePayload{Name: wsName, Tier: tier, Runtime: containerRuntime}
+	payload := withStoredCompute(ctx, id, models.CreateWorkspacePayload{Name: wsName, Tier: tier, Runtime: containerRuntime})
 	log.Printf("Restart: workspace %s (%s) runtime=%q", wsName, id, containerRuntime)
 
 	// #12: ?reset=true (or body.Reset) discards the claude-sessions volume
@@ -237,12 +367,37 @@ func (h *WorkspaceHandler) Restart(c *gin.Context) {
 	// the silent-drop bugs PRs #2811/#2824 closed). RestartWorkspaceAuto
 	// enforces CP-FIRST ordering matching the other dispatchers — see
 	// docs/architecture/backends.md.
-	go func() {
+	h.goAsync(func() {
 		h.RestartWorkspaceAutoOpts(context.Background(), id, templatePath, configFiles, payload, resetClaudeSession)
-	}()
-	go h.sendRestartContext(id, restartData)
+	})
+	h.goAsync(func() { h.sendRestartContext(id, restartData) })
 
 	c.JSON(http.StatusOK, gin.H{"status": "provisioning", "config_dir": configLabel, "reset_session": resetClaudeSession})
+}
+
+func (h *WorkspaceHandler) restartRuntimeFromConfig(ctx context.Context, id, wsName, dbRuntime string, applyTemplate bool) string {
+	if h.provisioner == nil || applyTemplate {
+		return dbRuntime
+	}
+	containerRuntime := dbRuntime
+	containerName := configDirName(id) // ws-{id[:12]}
+	if cfgBytes, readErr := h.provisioner.ExecRead(ctx, containerName, "/configs/config.yaml"); readErr == nil {
+		for _, line := range strings.Split(string(cfgBytes), "\n") {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "runtime:") {
+				parsed := strings.TrimSpace(strings.TrimPrefix(line, "runtime:"))
+				if parsed != "" && parsed != containerRuntime {
+					log.Printf("Restart: runtime changed in config.yaml %q→%q for %s", containerRuntime, parsed, wsName)
+					containerRuntime = parsed
+					if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET runtime = $1 WHERE id = $2`, containerRuntime, id); err != nil {
+						log.Printf("Restart: failed to persist runtime %q for %s: %v", containerRuntime, id, err)
+					}
+				}
+				break
+			}
+		}
+	}
+	return containerRuntime
 }
 
 // Hibernate handles POST /workspaces/:id/hibernate
@@ -319,7 +474,11 @@ func (h *WorkspaceHandler) HibernateWorkspace(ctx context.Context, workspaceID s
 		log.Printf("Hibernate: atomic claim failed for %s: %v", workspaceID, err)
 		return
 	}
-	rowsAffected, _ := result.RowsAffected()
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		log.Printf("Hibernate: RowsAffected error for %s: %v", workspaceID, err)
+		return
+	}
 	if rowsAffected == 0 {
 		// Either already hibernating/hibernated/paused/removed, or active_tasks > 0 —
 		// safe to abort without side-effects.
@@ -376,7 +535,43 @@ func (h *WorkspaceHandler) RestartByID(workspaceID string) {
 	if !h.HasProvisioner() {
 		return
 	}
+	// Self-fire debounce: drop (not coalesce) successive RestartByID calls
+	// within restartDebounceWindow of the most recent cycle's start. This
+	// is the load-bearing protection against the 4x reprov thrash class —
+	// coalesceRestart's pending-flag would otherwise drain by running
+	// ANOTHER full cycle of stop+provision on the just-launched EC2 (still
+	// in the pending state), which is the self-fire we're closing.
+	//
+	// Only applies to RestartByID (programmatic — secrets handler,
+	// maybeMarkContainerDead, preflightContainerHealth). The HTTP Restart
+	// handler in workspace_restart.go's Restart() bypasses this path and
+	// calls RestartWorkspaceAutoOpts directly, so user-initiated restart
+	// clicks are unaffected.
+	if shouldDebounceRestart(workspaceID) {
+		restartByIDDropCounter.Add(1)
+		log.Printf("RestartByID: %s — dropped (within %s self-fire debounce window; total dropped=%d)",
+			workspaceID, restartDebounceWindow, restartByIDDropCounter.Load())
+		return
+	}
 	coalesceRestart(workspaceID, func() { h.runRestartCycle(workspaceID) })
+}
+
+// shouldDebounceRestart reports whether the most recent cycle for this
+// workspace started within restartDebounceWindow. Read-only on
+// restartState; the actual restartStartedAt stamp is written in
+// coalesceRestart when running flips false→true.
+func shouldDebounceRestart(workspaceID string) bool {
+	sv, ok := restartStates.Load(workspaceID)
+	if !ok {
+		return false
+	}
+	state := sv.(*restartState)
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.restartStartedAt.IsZero() {
+		return false
+	}
+	return time.Since(state.restartStartedAt) < restartDebounceWindow
 }
 
 // coalesceRestart implements the pending-flag gate around an arbitrary cycle
@@ -398,6 +593,12 @@ func coalesceRestart(workspaceID string, cycle func()) {
 		return
 	}
 	state.running = true
+	// Stamp the start time so the RestartByID debounce can drop any
+	// self-fire probe that hits within restartDebounceWindow. Only the
+	// false→true edge stamps; the drain-loop's inner cycles re-use the
+	// same start (they're effectively one "restart event" from the
+	// debounce's POV).
+	state.restartStartedAt = time.Now()
 	state.mu.Unlock()
 
 	// Always clear running on exit — including panic — so a panicking
@@ -425,6 +626,27 @@ func coalesceRestart(workspaceID string, cycle func()) {
 	// inside provisionWorkspace, so any writes that committed since the
 	// last cycle are picked up. Continues until no pending request was
 	// observed at the top of an iteration.
+	//
+	// internal#624 Path B (defense in depth for the file-write tight-loop
+	// class): re-stamp restartStartedAt at the top of every drain iteration
+	// past the first. The original design (stamp only on false→true edge)
+	// treated all drained pending as "one event from the debounce's POV",
+	// which is correct for the secrets-batch use case but lets a file-write
+	// burst at T+65s of a 60s drain pipe straight into another full cycle.
+	// Re-stamping closes that hole — each drained cycle gets its own fresh
+	// debounce window, so any RestartByID arriving during cycle N is
+	// dropped by shouldDebounceRestart instead of accumulating into
+	// pending=true for cycle N+1.
+	//
+	// The original "one cycle picks up everyone who arrived during it"
+	// semantic still holds for the secrets-write path: callers that hit
+	// coalesceRestart during cycle 1 still set pending=true and still get
+	// their effects landed in cycle 2. What changes is that callers
+	// arriving during cycle 2 (via RestartByID) now hit the re-stamped
+	// debounce and are dropped instead of being chained into cycle 3,
+	// which is exactly the chain that produced the 22:08-22:10 thrash on
+	// 3fe84b89.
+	iteration := 0
 	for {
 		state.mu.Lock()
 		if !state.pending {
@@ -432,7 +654,13 @@ func coalesceRestart(workspaceID string, cycle func()) {
 			return // defer clears running
 		}
 		state.pending = false
+		if iteration > 0 {
+			// Re-stamp for drained iterations only; the false→true edge
+			// already stamped at the top of coalesceRestart.
+			state.restartStartedAt = time.Now()
+		}
 		state.mu.Unlock()
+		iteration++
 
 		cycle()
 	}
@@ -493,18 +721,51 @@ var cpStopRetryBaseDelay = 1 * time.Second
 //
 // Returns nothing — caller's contract is unchanged.
 func (h *WorkspaceHandler) cpStopWithRetry(ctx context.Context, workspaceID, source string) {
+	// Restart's contract is "make the workspace alive again": it proceeds
+	// with reprovision regardless of the Stop outcome, so it discards the
+	// terminal error. The delete path needs the error (it must keep the
+	// row recoverable for the orphan-sweeper + emit a durable event), so
+	// the actual retry loop lives in cpStopWithRetryErr below.
+	_ = h.cpStopWithRetryErr(ctx, workspaceID, source, false) // restart/hibernate never prunes
+}
+
+// cpStopWithRetryErr is the shared bounded-retry core for cpProv.Stop.
+// It returns the terminal error so callers that need to react to a leak
+// (the DELETE path's stopWorkspaceForDelete) can do so, while
+// cpStopWithRetry keeps its void contract for the restart paths.
+//
+// Behaviour (unchanged from the original cpStopWithRetry loop):
+//   - cpProv nil          → nil (no-op; nothing to stop).
+//   - success on attempt N → nil; logs a retry-success line when N > 1.
+//   - ctx cancelled mid-retry → returns ctx.Err(); logs an "abandoned"
+//     line and deliberately does NOT emit LEAK-SUSPECT (operator-initiated
+//     drain is a different signal than "we tried hard and failed").
+//   - all attempts fail   → returns the LAST attempt's error and emits the
+//     stable `LEAK-SUSPECT cpProv.Stop ...` log line so the CP-side orphan
+//     reconciler can correlate by workspace_id.
+//
+// cpStopWithRetryErr terminates the workspace's CP-managed compute with bounded
+// retry. prune=true (internal#734) additionally requests CP erase the durable
+// data volume — set ONLY by the permanent-delete-with-erase path, NEVER by
+// restart/hibernate (those pass false), so a recreate can never prune.
+func (h *WorkspaceHandler) cpStopWithRetryErr(ctx context.Context, workspaceID, source string, prune bool) error {
 	if h.cpProv == nil {
-		return
+		return nil
 	}
 	var lastErr error
 	delay := cpStopRetryBaseDelay
 	for attempt := 1; attempt <= cpStopRetryAttempts; attempt++ {
-		err := h.cpProv.Stop(ctx, workspaceID)
+		var err error
+		if prune {
+			err = h.cpProv.StopAndPrune(ctx, workspaceID)
+		} else {
+			err = h.cpProv.Stop(ctx, workspaceID)
+		}
 		if err == nil {
 			if attempt > 1 {
 				log.Printf("%s: cpProv.Stop(%s) succeeded on attempt %d", source, workspaceID, attempt)
 			}
-			return
+			return nil
 		}
 		lastErr = err
 		if attempt == cpStopRetryAttempts {
@@ -512,12 +773,14 @@ func (h *WorkspaceHandler) cpStopWithRetry(ctx context.Context, workspaceID, sou
 		}
 		// Sleep with ctx awareness so a cancelled ctx exits early instead
 		// of stalling the goroutine through the remaining backoff.
+		timer := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			log.Printf("%s: cpProv.Stop(%s) abandoned mid-retry: ctx cancelled (last_err=%v)",
 				source, workspaceID, lastErr)
-			return
-		case <-time.After(delay):
+			return ctx.Err()
+		case <-timer.C:
 		}
 		delay *= 2
 	}
@@ -525,6 +788,7 @@ func (h *WorkspaceHandler) cpStopWithRetry(ctx context.Context, workspaceID, sou
 	// so logs are greppable / parseable for the CP-side orphan reconciler.
 	log.Printf("LEAK-SUSPECT cpProv.Stop workspace_id=%s source=%s attempts=%d last_err=%q",
 		workspaceID, source, cpStopRetryAttempts, lastErr.Error())
+	return lastErr
 }
 
 // runRestartCycle does the actual stop+provision work for one restart
@@ -538,7 +802,7 @@ func (h *WorkspaceHandler) runRestartCycle(workspaceID string) {
 	var wsName, status, dbRuntime string
 	var tier int
 	err := db.DB.QueryRowContext(ctx,
-		`SELECT name, status, tier, COALESCE(runtime, 'langgraph') FROM workspaces WHERE id = $1 AND status NOT IN ('removed', 'paused', 'hibernated')`, workspaceID,
+		`SELECT name, status, tier, COALESCE(runtime, 'claude-code') FROM workspaces WHERE id = $1 AND status NOT IN ('removed', 'paused', 'hibernated')`, workspaceID,
 	).Scan(&wsName, &status, &tier, &dbRuntime)
 	if err != nil {
 		return // includes paused/hibernated — don't auto-restart those
@@ -578,14 +842,16 @@ func (h *WorkspaceHandler) runRestartCycle(workspaceID string) {
 
 	h.stopForRestart(ctx, workspaceID)
 
-	db.DB.ExecContext(ctx,
-		`UPDATE workspaces SET status = $1, url = '', updated_at = now() WHERE id = $2`, models.StatusProvisioning, workspaceID)
+	if _, err := db.DB.ExecContext(ctx,
+		`UPDATE workspaces SET status = $1, url = '', updated_at = now() WHERE id = $2`, models.StatusProvisioning, workspaceID); err != nil {
+		log.Printf("Auto-restart: failed to set provisioning status for %s: %v", workspaceID, err)
+	}
 	h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceProvisioning), workspaceID, map[string]interface{}{
 		"name": wsName, "tier": tier, "runtime": dbRuntime,
 	})
 
 	// Runtime from DB — no more config file parsing
-	payload := models.CreateWorkspacePayload{Name: wsName, Tier: tier, Runtime: dbRuntime}
+	payload := withStoredCompute(ctx, workspaceID, models.CreateWorkspacePayload{Name: wsName, Tier: tier, Runtime: dbRuntime})
 
 	// Snapshot restart-context data before the new session overwrites
 	// last_heartbeat_at. Issue #19 Layer 1.
@@ -610,7 +876,10 @@ func (h *WorkspaceHandler) runRestartCycle(workspaceID string) {
 	h.provisionWorkspaceAutoSync(workspaceID, "", nil, payload)
 	// sendRestartContext is a one-way notification to the new container; safe
 	// to fire async — the next restart cycle won't depend on it completing.
-	go h.sendRestartContext(workspaceID, restartData)
+	// Tracked via h.goAsync so tests can wait for it via h.asyncWG before
+	// closing the sqlmock. Without this, untracked goroutines hit the restored
+	// mock and cause "was not expected" errors in parallel CI execution (mc#1264).
+	h.goAsync(func() { h.sendRestartContext(workspaceID, restartData) })
 }
 
 // Pause handles POST /workspaces/:id/pause
@@ -636,12 +905,15 @@ func (h *WorkspaceHandler) Pause(c *gin.Context) {
 
 	// Collect this workspace + all descendants to pause
 	toPause := []struct{ id, name string }{{id, wsName}}
-	rows, _ := db.DB.QueryContext(ctx,
+	rows, err := db.DB.QueryContext(ctx,
 		`WITH RECURSIVE descendants AS (
 			SELECT id, name FROM workspaces WHERE parent_id = $1 AND status NOT IN ('removed', 'paused')
 			UNION ALL
 			SELECT w.id, w.name FROM workspaces w JOIN descendants d ON w.parent_id = d.id WHERE w.status NOT IN ('removed', 'paused')
 		) SELECT id, name FROM descendants`, id)
+	if err != nil {
+		log.Printf("Pause: descendant query failed for %s: %v", id, err)
+	}
 	if rows != nil {
 		defer rows.Close()
 		for rows.Next() {
@@ -649,6 +921,9 @@ func (h *WorkspaceHandler) Pause(c *gin.Context) {
 			if rows.Scan(&cid, &cname) == nil {
 				toPause = append(toPause, struct{ id, name string }{cid, cname})
 			}
+		}
+		if err := rows.Err(); err != nil {
+			log.Printf("Pause: descendant query rows.Err: %v", err)
 		}
 	}
 
@@ -665,8 +940,10 @@ func (h *WorkspaceHandler) Pause(c *gin.Context) {
 		if err := h.StopWorkspaceAuto(ctx, ws.id); err != nil {
 			log.Printf("Pause: stop %s failed: %v — orphan sweeper will reconcile", ws.id, err)
 		}
-		db.DB.ExecContext(ctx,
-			`UPDATE workspaces SET status = $1, url = '', updated_at = now() WHERE id = $2`, models.StatusPaused, ws.id)
+		if _, err := db.DB.ExecContext(ctx,
+			`UPDATE workspaces SET status = $1, url = '', updated_at = now() WHERE id = $2`, models.StatusPaused, ws.id); err != nil {
+			log.Printf("Pause: failed to set paused status for %s: %v", ws.id, err)
+		}
 		db.ClearWorkspaceKeys(ctx, ws.id)
 		h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspacePaused), ws.id, map[string]interface{}{
 			"name": ws.name,
@@ -686,7 +963,7 @@ func (h *WorkspaceHandler) Resume(c *gin.Context) {
 	var wsName, dbRuntime string
 	var tier int
 	err := db.DB.QueryRowContext(ctx,
-		`SELECT name, tier, COALESCE(runtime, 'langgraph') FROM workspaces WHERE id = $1 AND status = 'paused'`, id,
+		`SELECT name, tier, COALESCE(runtime, 'claude-code') FROM workspaces WHERE id = $1 AND status = 'paused'`, id,
 	).Scan(&wsName, &tier, &dbRuntime)
 	if err == sql.ErrNoRows {
 		c.JSON(http.StatusNotFound, gin.H{"error": "workspace not found or not paused"})
@@ -717,12 +994,15 @@ func (h *WorkspaceHandler) Resume(c *gin.Context) {
 		tier              int
 	}
 	toResume := []wsInfo{{id, wsName, dbRuntime, tier}}
-	rows, _ := db.DB.QueryContext(ctx,
+	rows, err := db.DB.QueryContext(ctx,
 		`WITH RECURSIVE descendants AS (
-			SELECT id, name, tier, COALESCE(runtime, 'langgraph') AS runtime FROM workspaces WHERE parent_id = $1 AND status = 'paused'
+			SELECT id, name, tier, COALESCE(runtime, 'claude-code') AS runtime FROM workspaces WHERE parent_id = $1 AND status = 'paused'
 			UNION ALL
-			SELECT w.id, w.name, w.tier, COALESCE(w.runtime, 'langgraph') FROM workspaces w JOIN descendants d ON w.parent_id = d.id WHERE w.status = 'paused'
+			SELECT w.id, w.name, w.tier, COALESCE(w.runtime, 'claude-code') FROM workspaces w JOIN descendants d ON w.parent_id = d.id WHERE w.status = 'paused'
 		) SELECT id, name, tier, runtime FROM descendants`, id)
+	if err != nil {
+		log.Printf("Resume: descendant query failed for %s: %v", id, err)
+	}
 	if rows != nil {
 		defer rows.Close()
 		for rows.Next() {
@@ -731,16 +1011,21 @@ func (h *WorkspaceHandler) Resume(c *gin.Context) {
 				toResume = append(toResume, ws)
 			}
 		}
+		if err := rows.Err(); err != nil {
+			log.Printf("Resume: descendant query rows.Err: %v", err)
+		}
 	}
 
 	// Re-provision all
 	for _, ws := range toResume {
-		db.DB.ExecContext(ctx,
-			`UPDATE workspaces SET status = $1, updated_at = now() WHERE id = $2`, models.StatusProvisioning, ws.id)
+		if _, err := db.DB.ExecContext(ctx,
+			`UPDATE workspaces SET status = $1, updated_at = now() WHERE id = $2`, models.StatusProvisioning, ws.id); err != nil {
+			log.Printf("Resume: failed to set provisioning status for %s: %v", ws.id, err)
+		}
 		h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceProvisioning), ws.id, map[string]interface{}{
 			"name": ws.name, "tier": ws.tier, "runtime": ws.runtime,
 		})
-		payload := models.CreateWorkspacePayload{Name: ws.name, Tier: ws.tier, Runtime: ws.runtime}
+		payload := withStoredCompute(ctx, ws.id, models.CreateWorkspacePayload{Name: ws.name, Tier: ws.tier, Runtime: ws.runtime})
 		// Resume is provision-only (workspace is paused, no live container
 		// to stop). provisionWorkspaceAuto handles backend routing and the
 		// no-backend mark-failed fallback identically to Create. Pre-

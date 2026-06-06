@@ -6,9 +6,10 @@
 #   T1: PR open + APPROVED via tier:low → script invokes sop-tier-check
 #       and POSTs status=success.
 #   T2: PR open + missing tier label → sop-tier-check exits non-zero;
-#       refire POSTs status=failure (description mentions failure).
+#       refire still POSTs status=success, matching the canonical
+#       pull_request_target workflow's fail-open job conclusion.
 #   T3: PR open + tier:low but NO approving reviews → sop-tier-check
-#       exits non-zero; refire POSTs status=failure.
+#       exits non-zero; refire still POSTs status=success for the same reason.
 #   T4: PR CLOSED → refire exits 0 with no status POST (no-op on closed).
 #   T5: Rate-limit — recent status update within 30s → refire skips,
 #       no new POST.
@@ -32,7 +33,7 @@ THIS_DIR="$(cd "$(dirname "$0")" && pwd)"
 SCRIPT_DIR="$(cd "$THIS_DIR/.." && pwd)"
 WORKFLOW_DIR="$(cd "$THIS_DIR/../../workflows" && pwd)"
 WORKFLOW="$WORKFLOW_DIR/sop-tier-refire.yml"
-DISPATCH_WORKFLOW="$WORKFLOW_DIR/review-refire-comments.yml"
+DISPATCH_WORKFLOW="$WORKFLOW_DIR/sop-checklist.yml"
 SCRIPT="$SCRIPT_DIR/sop-tier-refire.sh"
 
 PASS=0
@@ -88,7 +89,7 @@ assert_file_exists() {
 echo
 echo "== existence =="
 assert_file_exists "workflow file exists"  "$WORKFLOW"
-assert_file_exists "dispatcher workflow file exists" "$DISPATCH_WORKFLOW"
+assert_file_exists "SSOT dispatcher workflow file exists" "$DISPATCH_WORKFLOW"
 assert_file_exists "script file exists"    "$SCRIPT"
 if [ "$FAIL" -gt 0 ]; then
   echo
@@ -133,15 +134,15 @@ else
 fi
 
 DISPATCH_PARSE_OUT=$(python3 -c 'import sys,yaml;yaml.safe_load(open(sys.argv[1]).read());print("ok")' "$DISPATCH_WORKFLOW" 2>&1 || true)
-assert_eq "T6e dispatcher workflow parses as YAML" "ok" "$DISPATCH_PARSE_OUT"
+assert_eq "T6e SSOT dispatcher workflow parses as YAML" "ok" "$DISPATCH_PARSE_OUT"
 DISPATCH_CONTENT=$(cat "$DISPATCH_WORKFLOW")
-assert_contains "T6f dispatcher listens on issue_comment" \
+assert_contains "T6f SSOT dispatcher listens on issue_comment" \
   "issue_comment" "$DISPATCH_CONTENT"
-assert_contains "T6g dispatcher handles /qa-recheck" \
+assert_contains "T6g SSOT dispatcher handles /qa-recheck" \
   "/qa-recheck" "$DISPATCH_CONTENT"
-assert_contains "T6h dispatcher handles /security-recheck" \
+assert_contains "T6h SSOT dispatcher handles /security-recheck" \
   "/security-recheck" "$DISPATCH_CONTENT"
-assert_contains "T6i dispatcher handles /refire-tier-check" \
+assert_contains "T6i SSOT dispatcher handles /refire-tier-check" \
   "/refire-tier-check" "$DISPATCH_CONTENT"
 
 # T1-T5 — script behavior against a local Gitea-fixture
@@ -245,34 +246,24 @@ assert_contains "T1 POST context is sop-tier-check / tier-check" \
   '"context": "sop-tier-check / tier-check (pull_request)"' "$POSTED"
 assert_contains "T1 description names commenter" "test-runner" "$POSTED"
 
-# T2: missing tier label → tier-check fails → failure status POSTed
+# T2: missing tier label → tier-check fails internally (mock exits 1).
+# FAIL-CLOSED contract (fix/core-ci-fail-closed): refire now captures the
+# REAL exit code and POSTs state=failure — it does NOT forge a green on
+# the required context. The refire job itself still exits 0 (it succeeded
+# at posting an honest failure status).
 run_scenario "T2_no_tier_label" "fail_no_label"
 RC=$(cat "$FIX_STATE_DIR/last_rc")
 POSTED=$(cat "$FIX_STATE_DIR/posted_statuses.jsonl" 2>/dev/null || true)
-# tier-check.sh exits 1; refire script forwards that exit, so RC != 0
-if [ "$RC" -ne 0 ]; then
-  echo "  PASS  T2 exit code non-zero (got $RC)"
-  PASS=$((PASS + 1))
-else
-  echo "  FAIL  T2 exit code should be non-zero, got 0"
-  FAIL=$((FAIL + 1))
-  FAILED_TESTS="${FAILED_TESTS} T2_rc"
-fi
-assert_contains "T2 POSTed state=failure" '"state": "failure"' "$POSTED"
+assert_eq "T2 exit code 0 (posted an honest status)" "0" "$RC"
+assert_contains "T2 POSTed state=failure (no forged green)" '"state": "failure"' "$POSTED"
 
-# T3: tier:low present but ZERO approving reviews → failure
+# T3: tier:low present but ZERO approving reviews → internal tier check
+# fails (mock exits 1). Refire POSTs state=failure, never a false green.
 run_scenario "T3_no_approvals" "fail_no_approvals"
 RC=$(cat "$FIX_STATE_DIR/last_rc")
 POSTED=$(cat "$FIX_STATE_DIR/posted_statuses.jsonl" 2>/dev/null || true)
-if [ "$RC" -ne 0 ]; then
-  echo "  PASS  T3 exit code non-zero (got $RC)"
-  PASS=$((PASS + 1))
-else
-  echo "  FAIL  T3 exit code should be non-zero, got 0"
-  FAIL=$((FAIL + 1))
-  FAILED_TESTS="${FAILED_TESTS} T3_rc"
-fi
-assert_contains "T3 POSTed state=failure" '"state": "failure"' "$POSTED"
+assert_eq "T3 exit code 0 (posted an honest status)" "0" "$RC"
+assert_contains "T3 POSTed state=failure (no forged green)" '"state": "failure"' "$POSTED"
 
 # T4: closed PR — refire is a no-op (no POST, exit 0)
 run_scenario "T4_closed" "pass"

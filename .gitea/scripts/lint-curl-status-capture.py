@@ -13,10 +13,8 @@ from __future__ import annotations
 import argparse
 import glob
 import re
-import sys
 from pathlib import Path
 from typing import NamedTuple
-
 
 SELF = ".gitea/workflows/lint-curl-status-capture.yml"
 

@@ -40,7 +40,6 @@ Dependencies: stdlib + pytest + PyYAML. No network.
 from __future__ import annotations
 
 import importlib.util
-import json
 import os
 import sys
 from pathlib import Path
@@ -64,7 +63,7 @@ SCRIPT_PATH = (
 def sr_module():
     """Import the script as a module under a known env."""
     env = {
-        "GITEA_TOKEN": "test-token",
+        "GITEA_TOKEN": "fixture-token",
         "GITEA_HOST": "git.example.test",
         "REPO": "owner/repo",
         "WATCH_BRANCH": "main",
@@ -442,6 +441,46 @@ def test_reap_preserves_real_push(sr_module, monkeypatch):
     assert calls == []  # NO POST
 
 
+def test_reap_compensates_cancelled_real_push_status(sr_module, monkeypatch):
+    """Gitea 1.22.6 maps cancelled push runs to failure statuses.
+
+    A real push workflow with description exactly "Has been cancelled"
+    is cancel-cascade noise, not a defect signal. Status-reaper should
+    compensate it even though the workflow has a push trigger.
+    """
+    calls = []
+
+    def fake_api(method, path, *, body=None, query=None, expect_json=True):
+        calls.append((method, path, body))
+        return (201, {})
+
+    monkeypatch.setattr(sr_module, "api", fake_api)
+
+    workflow_map = {"ci": True}
+    combined = {
+        "state": "failure",
+        "statuses": [
+            {
+                "context": "ci / test (push)",
+                "status": "failure",
+                "description": "Has been cancelled",
+                "target_url": "https://example.test/actions/runs/1",
+            }
+        ],
+    }
+
+    counters = sr_module.reap(workflow_map, combined, SHA, dry_run=False)
+
+    assert counters["compensated"] == 1
+    assert counters["compensated_cancelled_push"] == 1
+    assert counters["preserved_real_push"] == 0
+    assert len(calls) == 1
+    assert calls[0][0] == "POST"
+    assert calls[0][1] == f"/repos/owner/repo/statuses/{SHA}"
+    assert calls[0][2]["context"] == "ci / test (push)"
+    assert calls[0][2]["state"] == "success"
+
+
 def test_reap_preserves_unknown_workflow(sr_module, monkeypatch, capsys):
     """Workflow not in map → ::notice:: + skip (conservative)."""
     monkeypatch.setattr(
@@ -813,7 +852,6 @@ def test_reap_skips_combined_success_shas(sr_module, monkeypatch):
     Mock 2 SHAs with combined=success + 1 with combined=failure → only
     the failure-SHA's statuses get the per-context loop applied.
     """
-    per_context_iterated_for: list[str] = []
     posts: list[tuple[str, dict]] = []
 
     failure_statuses = [
@@ -1012,12 +1050,13 @@ def test_reap_continues_on_per_sha_apierror(sr_module, monkeypatch, capsys):
 
 
 def test_main_soft_skips_when_commit_listing_times_out(sr_module, monkeypatch, capsys):
-    """A transient outage while listing recent commits should not paint main red.
+    """A transient outage while listing recent commits fails the tick visibly.
 
     Per-SHA status read failures are already isolated inside `reap_branch`.
     The real 2026-05-14 failure was earlier: `/commits?sha=main&limit=30`
     timed out after all retries, aborting the tick. The next 5-minute tick can
-    retry safely, so `main()` should emit an observable warning and return 0.
+    retry safely, but the tick itself must be observable as red (exit 1 + error
+    annotation) so the cron bot alerts on persistent infra issues.
     """
 
     monkeypatch.setattr(sr_module, "scan_workflows", lambda _: {"workflow-without-push": False})
@@ -1030,9 +1069,9 @@ def test_main_soft_skips_when_commit_listing_times_out(sr_module, monkeypatch, c
     monkeypatch.setattr(sr_module, "list_recent_commit_shas", fake_list_recent_commit_shas)
     monkeypatch.setattr(sys, "argv", ["status-reaper.py"])
 
-    assert sr_module.main() == 0
+    assert sr_module.main() == 1
     captured = capsys.readouterr()
-    assert "::warning::status-reaper skipped this tick" in captured.out
+    assert "::error::status-reaper cannot run" in captured.out
     assert '"skipped": true' in captured.out
     assert '"skip_reason": "commit-list-api-error"' in captured.out
 

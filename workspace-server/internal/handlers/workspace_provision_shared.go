@@ -37,14 +37,17 @@ package handlers
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
+	"os"
 	"path/filepath"
+	"strings"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/events"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/models"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/provisioner"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/wsauth"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wsauth"
 )
 
 // readOrLazyHealInboundSecret reads the workspace's
@@ -85,10 +88,9 @@ func readOrLazyHealInboundSecret(ctx context.Context, workspaceID, opLabel strin
 // prepareProvisionContext when the caller proceeds; nil + non-empty
 // abort message when the caller must mark the workspace failed.
 type preparedProvisionContext struct {
-	EnvVars            map[string]string
-	PluginsPath        string
-	AwarenessNamespace string
-	Config             provisioner.WorkspaceConfig
+	EnvVars     map[string]string
+	PluginsPath string
+	Config      provisioner.WorkspaceConfig
 }
 
 // provisionAbort describes why prepareProvisionContext refused to
@@ -120,17 +122,126 @@ func (h *WorkspaceHandler) prepareProvisionContext(
 	payload models.CreateWorkspacePayload,
 	resetClaudeSession bool,
 ) (*preparedProvisionContext, *provisionAbort) {
-	envVars, decryptErr := loadWorkspaceSecrets(ctx, workspaceID)
+	envVars, globalSecretKeys, workspaceSecretKeys, decryptErr := loadWorkspaceSecrets(ctx, workspaceID)
 	if decryptErr != "" {
 		return nil, &provisionAbort{Msg: decryptErr}
 	}
 
+	// RFC#523 Layer 1 (issue molecule-ai/internal#523): refuse to start a
+	// tenant workspace when any forbidden operator-scope env var is
+	// present in the operator-controlled store (global_secrets).
+	//
+	// PROVENANCE-AWARE — fix for the over-fire reported by CTO empirical
+	// 2026-05-20: the original implementation ran this check on the
+	// merged env-set, which conflated two very different sources:
+	//
+	//   1. global_secrets — operator-side store. ANY operator-scope token
+	//      here is an upstream bleed (e.g. tenant_secrets_seed.go pre-
+	//      4f45d37 propagating CP-env GITHUB_TOKEN into every fresh
+	//      tenant's row). RFC#523's literal threat model.
+	//
+	//   2. workspace_secrets — user-set via the canvas Secrets tab,
+	//      authenticated as the workspace owner. If the user pastes
+	//      their own scoped GitHub PAT under GITHUB_TOKEN so the agent
+	//      can push to their personal repos, that is the system working
+	//      as designed — not the leak RFC#523 was written to catch.
+	//
+	// The provenance side-channel from loadWorkspaceSecrets tells us
+	// which keys came from global_secrets (workspace_secrets writes
+	// override and clear the flag, since the user explicitly re-set
+	// the value). We restrict the abort to that set.
+	//
+	// Defense-in-depth NOT removed: provisioner.buildContainerEnv still
+	// runs the forensic #145 silent-strip (lower-confidence late layer),
+	// and workspace/entrypoint.sh has Layer 2 inside the container. If a
+	// real operator-scope token slips into workspace_secrets some other
+	// way, the later layers (and the per-workspace SG, and the per-tenant
+	// VPC isolation) are still in force.
+	//
+	// Key names (not values) are echoed in the user-facing error so
+	// the operator can locate and remove the offending row. Per memory
+	// `feedback_passwords_in_chat_are_burned`, key names are not
+	// secret; values would be.
+	if forbidden := findForbiddenTenantEnvKeysFromGlobals(envVars, globalSecretKeys); len(forbidden) > 0 {
+		msg := formatForbiddenTenantEnvError(forbidden)
+		log.Printf("Provisioner: ABORT workspace=%s — forbidden operator-scope env keys present in global_secrets: %v (RFC#523)", workspaceID, forbidden)
+		return nil, &provisionAbort{
+			Msg:   msg,
+			Extra: map[string]interface{}{"error": msg, "forbidden_env_keys": forbidden, "rfc": "523", "source": "global_secrets"},
+		}
+	}
+
 	pluginsPath, _ := filepath.Abs(filepath.Join(h.configsDir, "..", "plugins"))
-	awarenessNamespace := h.loadAwarenessNamespace(ctx, workspaceID)
 
 	// Per-agent git identity (#1957) — must run after secret loads so
 	// a workspace_secret named GIT_AUTHOR_NAME can override.
 	applyAgentGitIdentity(envVars, payload.Name)
+	// Per-agent git HTTP credential injection — bridges the gap that
+	// PR template-claude-code#30 + mc#1525 left open: the askpass binary
+	// + GIT_ASKPASS env are wired in-image, but until now no code path
+	// in workspace-server actually read the persona's git token from
+	// the operator-host bootstrap dir and exported it as
+	// GIT_HTTP_USERNAME / GIT_HTTP_PASSWORD. Without this, the askpass
+	// helper invokes with an empty password env and git fails the
+	// auth challenge in ~500ms (live-verified for Dev-A/Dev-B
+	// 2026-05-18 ~23:55Z).
+	//
+	// Runs AFTER applyAgentGitIdentity so workspace_secrets named
+	// GIT_HTTP_USERNAME / GIT_HTTP_PASSWORD (operator-supplied,
+	// loaded earlier by loadWorkspaceSecrets) win over the
+	// persona-file default. Uses payload.Role as the persona key —
+	// this matches the slug-form convention agent-dev-a /
+	// agent-dev-b / agent-pm. Descriptive multi-word roles
+	// ("Frontend Engineer") take the silent-no-op branch and
+	// continue to rely on workspace_secrets / org-import persona-env
+	// merge for their git auth.
+	applyAgentGitHTTPCreds(envVars, payload.Role)
+	// molecule-core#1994: per-workspace LLM billing-mode resolution + env wiring.
+	// On platform_managed it forces the CP proxy usage token; on byok/disabled
+	// it keeps the tenant's own provider-MATCHING creds (global OR workspace
+	// scope) and reports whether a usable LLM credential is present.
+	//
+	// internal#728 Bug 1: globalSecretKeys (loadWorkspaceSecrets provenance)
+	// lets the byok branch strip ONLY operator-store-origin LLM creds that do
+	// NOT match the resolved provider's auth_env — so a non-anthropic-oauth
+	// claude-code workspace no longer inherits the stray tenant-global
+	// CLAUDE_CODE_OAUTH_TOKEN the runtime would greedily prefer. User-authored
+	// workspace_secrets (provenance flag cleared) are exempt.
+	llmRes := applyPlatformManagedLLMEnv(ctx, envVars, workspaceID, payload.Runtime, payload.Model, globalSecretKeys)
+	// Fail closed for a BYOK workspace with no usable LLM credential at ANY
+	// scope: do NOT start it credential-less. Mirror the "model+provider+
+	// credential REQUIRED at create" spirit with an actionable error surfaced
+	// at provision time.
+	//
+	// Scoped to byok specifically (NOT disabled): "byok" means "the user
+	// intends to run an LLM on their own credential" — a missing one is a
+	// misconfiguration worth surfacing loudly. "disabled" means "this
+	// workspace runs no platform-billed LLM at all" (terminal / file work, or
+	// a runtime that talks to a non-bypass-key endpoint), so aborting would
+	// regress a legitimate no-LLM workspace.
+	//
+	// The bypass-key check is intentionally broad — any present bypass key
+	// (the tenant's own, at global or workspace scope) clears it.
+	if llmRes.ResolvedMode == LLMBillingModeBYOK && !llmRes.HasUsableLLMCred {
+		msg := formatMissingBYOKCredentialError(llmRes.ResolvedMode)
+		log.Printf("Provisioner: ABORT workspace=%s — byok billing mode has no usable LLM credential (MISSING_BYOK_CREDENTIAL, molecule-core#1994)", workspaceID)
+		return nil, &provisionAbort{
+			Msg:   msg,
+			Extra: map[string]interface{}{"error": msg, "code": "MISSING_BYOK_CREDENTIAL", "billing_mode": llmRes.ResolvedMode, "issue": "1994"},
+		}
+	}
+	// Fail closed for a platform-managed workspace whose CP proxy env is
+	// absent: do NOT start it credential-less (adk-demo dark-wedge class,
+	// #2162). The platform_managed path requires the proxy injection to
+	// produce a usable credential.
+	if llmRes.ResolvedMode == LLMBillingModePlatformManaged && !llmRes.HasUsableLLMCred {
+		msg := formatMissingPlatformProxyError()
+		log.Printf("Provisioner: ABORT workspace=%s — platform-managed billing mode but CP proxy env absent (MISSING_PLATFORM_PROXY, molecule-core#2162)", workspaceID)
+		return nil, &provisionAbort{
+			Msg:   msg,
+			Extra: map[string]interface{}{"error": msg, "code": "MISSING_PLATFORM_PROXY", "billing_mode": llmRes.ResolvedMode, "issue": "2162"},
+		}
+	}
 	applyRuntimeModelEnv(envVars, payload.Runtime, payload.Model)
 	if payload.Role != "" {
 		envVars["MOLECULE_AGENT_ROLE"] = payload.Role
@@ -167,15 +278,100 @@ func (h *WorkspaceHandler) prepareProvisionContext(
 		}
 	}
 
-	cfg := h.buildProvisionerConfig(ctx, workspaceID, templatePath, configFiles, payload, envVars, pluginsPath, awarenessNamespace)
+	// Preflight: runtime-seed match (issue #2027). Fail LOUD when a workspace
+	// NAMED a runtime but the config.yaml we're about to seed declares a
+	// different top-level runtime — the symmetric counterpart to selectImage's
+	// ErrUnresolvableRuntime guard, on the config/template side. Pre-fix, when a
+	// runtime's workspace template wasn't in the tenant cache at provision time
+	// (or sanitizeRuntime coerced an unknown runtime), seeding silently fell
+	// back to the claude-code-default template: the image+env said e.g.
+	// google-adk but the seeded config said claude-code, so the agent booted
+	// mislabeled and personaless yet looked 'online' and returned canned
+	// non-answers. Refusing loudly turns that silent wrong-agent into a visible
+	// WORKSPACE_PROVISION_FAILED the operator can act on.
+	if abort := runtimeSeedMismatchAbort(payload.Runtime, templatePath, configFiles); abort != nil {
+		log.Printf("Provisioner: ABORT workspace=%s — %s", workspaceID, abort.Msg)
+		return nil, abort
+	}
+
+	cfg := h.buildProvisionerConfig(ctx, workspaceID, templatePath, configFiles, payload, envVars, workspaceSecretKeys, pluginsPath)
 	cfg.ResetClaudeSession = resetClaudeSession
 
 	return &preparedProvisionContext{
-		EnvVars:            envVars,
-		PluginsPath:        pluginsPath,
-		AwarenessNamespace: awarenessNamespace,
-		Config:             cfg,
+		EnvVars:     envVars,
+		PluginsPath: pluginsPath,
+		Config:      cfg,
 	}, nil
+}
+
+// runtimeSeedMismatchAbort returns a non-nil abort when a workspace NAMED a
+// runtime but the config.yaml about to be seeded declares a *different*
+// top-level runtime — the fail-loud counterpart to selectImage's
+// ErrUnresolvableRuntime (issue #2027). It catches the silent
+// claude-code-default substitution that occurs when a runtime's workspace
+// template isn't cached at provision time (or sanitizeRuntime coerced an
+// unknown runtime to claude-code): both surface as a seeded config whose
+// runtime contradicts the requested one.
+//
+// Pure (modulo reading the template dir's config.yaml). An empty
+// requestedRuntime (unspecified / org-template default path) or an
+// indeterminate seeded runtime (e.g. CP mode with no local config bytes) is
+// allowed — we only fail on a concrete, contradictory signal, never on
+// absence of one.
+func runtimeSeedMismatchAbort(requestedRuntime, templatePath string, configFiles map[string][]byte) *provisionAbort {
+	if requestedRuntime == "" {
+		return nil
+	}
+	seeded := seededConfigRuntime(templatePath, configFiles)
+	if seeded == "" || seeded == requestedRuntime {
+		return nil
+	}
+	msg := fmt.Sprintf(
+		"runtime seed mismatch: workspace requested runtime %q but the seeded config.yaml declares %q — the %q workspace template was not available at provision time (silent %q fallback). Refusing to launch a mislabeled agent; refresh the template cache (POST /admin/templates/refresh) and re-provision.",
+		requestedRuntime, seeded, requestedRuntime, seeded,
+	)
+	return &provisionAbort{
+		Msg: msg,
+		Extra: map[string]interface{}{
+			"error":             msg,
+			"requested_runtime": requestedRuntime,
+			"seeded_runtime":    seeded,
+			"issue":             "2027",
+		},
+	}
+}
+
+// seededConfigRuntime extracts the top-level `runtime:` from the config.yaml
+// that will be seeded into the workspace — preferring the in-memory
+// configFiles, falling back to the template directory on disk. Returns ""
+// when no config.yaml is available or it declares no top-level runtime.
+func seededConfigRuntime(templatePath string, configFiles map[string][]byte) string {
+	if data, ok := configFiles["config.yaml"]; ok {
+		return parseTopLevelRuntime(data)
+	}
+	if templatePath != "" {
+		if data, err := os.ReadFile(filepath.Join(templatePath, "config.yaml")); err == nil {
+			return parseTopLevelRuntime(data)
+		}
+	}
+	return ""
+}
+
+// parseTopLevelRuntime returns the value of the top-level `runtime:` key in a
+// config.yaml, ignoring the nested `runtime_config:` block. A small dedicated
+// line scanner (mirrors the one the Create handler uses to read a template's
+// runtime) so the provision-time guard needs no YAML dependency.
+func parseTopLevelRuntime(data []byte) string {
+	for _, raw := range strings.Split(string(data), "\n") {
+		trimmed := strings.TrimLeft(raw, " \t")
+		if len(raw) > len(trimmed) {
+			continue // indented — inside a nested block (e.g. runtime_config:)
+		}
+		if strings.HasPrefix(trimmed, "runtime:") && !strings.HasPrefix(trimmed, "runtime_config") {
+			return strings.Trim(strings.TrimSpace(strings.TrimPrefix(trimmed, "runtime:")), `"'`)
+		}
+	}
+	return ""
 }
 
 // mintWorkspaceSecrets issues + persists the workspace auth token

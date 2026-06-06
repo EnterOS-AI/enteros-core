@@ -37,7 +37,6 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
-import sys
 import urllib.error
 from pathlib import Path
 from unittest import mock
@@ -56,11 +55,26 @@ SCRIPT_PATH = (
 )
 
 
+@pytest.fixture(autouse=True)
+def _stub_time_sleep(monkeypatch):
+    """Autouse: stub time.sleep across every test.
+
+    The watchdog's RECHECK_DELAY_SECS (default 90s) is wired into
+    run_once() via time.sleep(). Without this stub, integration-style
+    tests that exercise run_once() would each block for 90s — a
+    pre-fix `pytest -q` ran in ~0.1s; the unstubbed equivalent took
+    >4 minutes (task #394 review evidence). Stubbing here keeps the
+    suite fast and deterministic without requiring every red-path test
+    to remember the patch.
+    """
+    monkeypatch.setattr("time.sleep", lambda s: None)
+
+
 @pytest.fixture(scope="module")
 def wd_module():
     """Import the script as a module under a known env."""
     env = {
-        "GITEA_TOKEN": "test-token",
+        "GITEA_TOKEN": "fixture-token",
         "GITEA_HOST": "git.example.test",
         "REPO": "owner/repo",
         "WATCH_BRANCH": "main",
@@ -102,15 +116,25 @@ def _make_stub_api(responses: dict):
 
         def __call__(self, method, path, *, body=None, query=None, expect_json=True):
             self.calls.append((method, path, body, query))
+            # If we've stored a list for this (method, path), rotate through.
+            # This supports tests that need sequential responses for the
+            # same endpoint without adding query-param noise.
             key = (method, path)
-            if key not in responses:
-                raise AssertionError(
-                    f"unexpected api call: {method} {path} (no stub registered)"
-                )
-            r = responses[key]
-            if isinstance(r, Exception):
-                raise r
-            return r
+            r = responses.get(key)
+            if isinstance(r, list):
+                if not r:
+                    raise AssertionError(
+                        f"stub sequential responses exhausted for {method} "
+                        f"{path} — provisioned {len(r)} entries"
+                    )
+                return r.pop(0)
+            if r is not None:
+                if isinstance(r, Exception):
+                    raise r
+                return r
+            raise AssertionError(
+                f"unexpected api call: {method} {path} (no stub registered)"
+            )
 
     return StubApi()
 
@@ -118,10 +142,24 @@ def _make_stub_api(responses: dict):
 # Sample SHA used throughout. 40 chars per Gitea convention.
 SHA_RED = "deadbeefcafe1234567890abcdef000011112222"
 SHA_GREEN = "ababababcdcdcdcd0000111122223333deadc0de"
+SHA_NEW = "aaaabbbbccccddddeeeeffff0000111122223333"
 
 
 def _branches_response(sha: str) -> dict:
     """Shape Gitea returns from /repos/{o}/{r}/branches/{name}."""
+    return {"name": "main", "commit": {"id": sha}}
+
+
+def _branch_alt(sha: str) -> dict:
+    """Identical shape but to a different key path so _make_stub_api
+    retains a separate first-response entry from the primary
+    _branches_response() path.
+
+    The stub stores only the first response per (method, path) pair.
+    Tests that need two distinct responses for the same logical
+    GET /branches/main call use _branch_alt for the second lookup so
+    the stub returns the correct sequential entry.
+    """
     return {"name": "main", "commit": {"id": sha}}
 
 
@@ -238,6 +276,119 @@ def test_is_red_state_only_fallback_still_works(wd_module):
         "state": "pending",
         "statuses": [
             {"context": "ci/test", "state": "failure"},  # legacy shape
+        ],
+    })
+    assert red is True
+    assert len(failed) == 1
+
+
+# --------------------------------------------------------------------------
+# Cancel-cascade filter (mc#1564) — Gitea maps action_run.status=2 (Failure)
+# AND status=3 (Cancelled) BOTH to commit-status `"failure"`. We only want
+# real failures (status=2) to file. status=3 entries carry description
+# `"Has been cancelled"`; real failures carry `"Failing after Ns"`.
+# Canonical Gitea 1.22.6 enum (1=Success, 2=Failure, 3=Cancelled, 4=Skipped,
+# 5=Waiting, 6=Running, 7=Blocked) per
+# `reference_gitea_action_status_enum_corrected_2026_05_19`.
+# --------------------------------------------------------------------------
+def test_is_red_skips_cancel_cascade_entry(wd_module):
+    """status=3 (Cancelled, description='Has been cancelled') must NOT
+    count as red. Cancel-cascade from `concurrency: cancel-in-progress`
+    on a busy main was generating phantom `[main-red]` issues (mc#1564
+    evidence: mc#1562/#1552/#1540 et al). The filter is the durable fix."""
+    red, failed = wd_module.is_red({
+        "state": "failure",
+        "statuses": [
+            {"context": "ci/canvas-deploy-reminder",
+             "status": "failure",
+             "description": "Has been cancelled"},
+        ],
+    })
+    assert red is False, (
+        "cancel-cascade entry (description='Has been cancelled', i.e. "
+        "Gitea action_run.status=3) must not trip the watchdog"
+    )
+    assert failed == []
+
+
+def test_is_red_keeps_real_failure_entry(wd_module):
+    """status=2 (Failure, description='Failing after Ns') IS red.
+    Companion to the cancel-cascade filter — we must not over-filter."""
+    red, failed = wd_module.is_red({
+        "state": "failure",
+        "statuses": [
+            {"context": "ci/test",
+             "status": "failure",
+             "description": "Failing after 12s"},
+        ],
+    })
+    assert red is True
+    assert len(failed) == 1
+    assert failed[0]["context"] == "ci/test"
+
+
+def test_is_red_mixed_cancel_and_real_failure(wd_module):
+    """Real-world shape (mc#1562 body, verified 2026-05-19): combined
+    `failure` with a mix of 'Failing after Ns' and 'Has been cancelled'
+    entries. The watchdog must file (real failures present) AND the
+    failed[] list must contain ONLY the real failures — cancel-cascade
+    noise is filtered out of the issue body."""
+    red, failed = wd_module.is_red({
+        "state": "failure",
+        "statuses": [
+            {"context": "ci/test", "status": "failure",
+             "description": "Failing after 1m49s"},
+            {"context": "ci/canvas-deploy-reminder", "status": "failure",
+             "description": "Has been cancelled"},
+            {"context": "ci/lint", "status": "failure",
+             "description": "Failing after 8s"},
+        ],
+    })
+    assert red is True
+    assert [s["context"] for s in failed] == ["ci/test", "ci/lint"], (
+        "cancel-cascade entry should be filtered out of failed[] body"
+    )
+
+
+def test_is_red_all_entries_cancelled_is_green(wd_module):
+    """Pure cancel-cascade (every red-shaped entry is status=3) = green.
+    This is the phantom-issue case the watchdog was generating before
+    mc#1564. With the filter, no issue files."""
+    red, failed = wd_module.is_red({
+        "state": "failure",
+        "statuses": [
+            {"context": "ci/a", "status": "failure",
+             "description": "Has been cancelled"},
+            {"context": "ci/b", "status": "failure",
+             "description": "Has been cancelled"},
+        ],
+    })
+    assert red is False
+    assert failed == []
+
+
+def test_is_red_combined_failure_no_per_entry_still_red(wd_module):
+    """Edge case: combined=failure with empty statuses[] — preserved
+    from rev4 behaviour. This is the "CI emitter set combined-status
+    directly without a per-context status" path (render_body fallback);
+    the operator still needs the breadcrumb. The cancel-cascade filter
+    only fires on per-entry detail, so this is unaffected."""
+    red, failed = wd_module.is_red({"state": "failure", "statuses": []})
+    assert red is True
+    assert failed == []
+
+
+def test_is_red_cancel_cascade_filter_exact_match_only(wd_module):
+    """The cancel-cascade filter matches description EXACTLY (after
+    strip) — substring would over-match (e.g. a hypothetical test
+    output `"Has been cancelled by the user unexpectedly"` should
+    remain a real failure). Locks down the contract."""
+    red, failed = wd_module.is_red({
+        "state": "failure",
+        "statuses": [
+            {"context": "ci/edge",
+             "status": "failure",
+             "description": "Has been cancelled by the user unexpectedly"},
         ],
     })
     assert red is True
@@ -414,7 +565,6 @@ def test_auto_close_skips_when_main_pending(wd_module, monkeypatch):
     """main pending (CI still running) at NEW_SHA → leave old issue alone.
     Pending could resolve to red, so closing prematurely would lose the
     breadcrumb of the prior red."""
-    old_title = f"[main-red] owner/repo: {SHA_RED[:10]}"
     stub = _make_stub_api({
         ("GET", "/repos/owner/repo/branches/main"): (200, _branches_response(SHA_GREEN)),
         ("GET", f"/repos/owner/repo/commits/{SHA_GREEN}/status"): (
@@ -431,6 +581,81 @@ def test_auto_close_skips_when_main_pending(wd_module, monkeypatch):
     methods_paths = [(c[0], c[1]) for c in stub.calls]
     assert ("PATCH", "/repos/owner/repo/issues/7") not in methods_paths
     assert ("GET", "/repos/owner/repo/issues") not in methods_paths
+
+
+# --------------------------------------------------------------------------
+# Stale-issue cleanup on transient / head-drift (internal#1789)
+# --------------------------------------------------------------------------
+def test_head_drift_closes_stale_issue_for_prior_sha(wd_module, monkeypatch):
+    """Initial red at SHA_RED. Before recheck, main is force-pushed to
+    SHA_NEW (different commit). watchdog must close the stale SHA_RED
+    issue before returning — otherwise stale open issues accumulate
+    when main is force-pushed during a red window."""
+    stub = _make_stub_api({
+        # Initial check: branch SHA_RED, status failure
+        ("GET", "/repos/owner/repo/branches/main"): [
+            (200, _branches_response(SHA_RED)),
+            (200, _branch_alt(SHA_NEW)),      # recheck branch call → HEAD moved
+            (200, _branch_alt(SHA_NEW)),      # close path branch call
+        ],
+        ("GET", f"/repos/owner/repo/commits/{SHA_RED}/status"): [
+            (200, _combined_status("failure", [
+                {"context": "ci/test", "status": "failure", "description": "broke"},
+            ])),
+            (200, _combined_status("success", [    # recheck: CI result arrived
+                {"context": "ci/test", "status": "success"},
+            ])),
+        ],
+        ("GET", f"/repos/owner/repo/commits/{SHA_NEW}/status"): [
+            (200, _combined_status("success", [
+                {"context": "ci/test", "status": "success"},
+            ])),
+        ],
+        # close_open_red_issues_for_other_shas(SHA_NEW): issue for SHA_RED found
+        ("GET", "/repos/owner/repo/issues"): [
+            (200, [{"number": 9, "title": f"[main-red] owner/repo: {SHA_RED[:10]}"}]),
+        ],
+        ("POST", "/repos/owner/repo/issues/9/comments"): (201, {"id": 200}),
+        ("PATCH", "/repos/owner/repo/issues/9"): (200, {"number": 9, "state": "closed"}),
+    })
+    monkeypatch.setattr(wd_module, "api", stub)
+    rc = wd_module.run_once(dry_run=False)
+    assert rc == 0
+    methods_paths = [(c[0], c[1]) for c in stub.calls]
+    assert ("PATCH", "/repos/owner/repo/issues/9") in methods_paths, \
+        "head-drift should close the stale SHA_RED issue"
+
+
+def test_recovery_on_same_sha_closes_issue_filed_on_prior_tick(wd_module, monkeypatch):
+    """Same SHA shows red on initial check, but CI recovers before recheck
+    completes. watchdog must close the issue that was filed on an earlier
+    tick for this same SHA — otherwise stale open issues accumulate when CI
+    recovers within the settling window."""
+    stub = _make_stub_api({
+        ("GET", "/repos/owner/repo/branches/main"): (200, _branches_response(SHA_RED)),
+        # Sequential: initial check → failure, recheck (≥2nd call) → success.
+        # Using a list so Python dict keeps a single key (avoids overwrite).
+        ("GET", f"/repos/owner/repo/commits/{SHA_RED}/status"): [
+            (200, _combined_status("failure", [
+                {"context": "ci/test", "status": "failure", "description": "broke"},
+            ])),
+            (200, _combined_status("success", [
+                {"context": "ci/test", "state": "success"},
+            ])),
+        ],
+        # List open red issues → find stale issue for this SHA
+        ("GET", "/repos/owner/repo/issues"): (
+            200, [{"number": 11, "title": f"[main-red] owner/repo: {SHA_RED[:10]}"}],
+        ),
+        ("POST", "/repos/owner/repo/issues/11/comments"): (201, {"id": 300}),
+        ("PATCH", "/repos/owner/repo/issues/11"): (200, {"number": 11, "state": "closed"}),
+    })
+    monkeypatch.setattr(wd_module, "api", stub)
+    rc = wd_module.run_once(dry_run=False)
+    assert rc == 0
+    methods_paths = [(c[0], c[1]) for c in stub.calls]
+    assert ("PATCH", "/repos/owner/repo/issues/11") in methods_paths, \
+        "recovery-on-same-SHA should close the stale issue"
 
 
 # --------------------------------------------------------------------------
@@ -662,7 +887,7 @@ def test_emit_loki_event_prints_json_line(wd_module, capsys, monkeypatch):
     captured = capsys.readouterr()
     assert "main-red-watchdog event:" in captured.out
     # Find the JSON payload after the prefix and verify it parses
-    line = [l for l in captured.out.splitlines() if "main-red-watchdog event:" in l][0]
+    line = [ln for ln in captured.out.splitlines() if "main-red-watchdog event:" in ln][0]
     payload = json.loads(line.split("main-red-watchdog event:", 1)[1].strip())
     assert payload["event_type"] == "main_red_detected"
     assert payload["repo"] == "owner/repo"
@@ -696,3 +921,214 @@ def test_require_runtime_env_exits_when_missing(wd_module, monkeypatch):
     with pytest.raises(SystemExit) as excinfo:
         wd_module._require_runtime_env()
     assert excinfo.value.code == 2
+
+
+# --------------------------------------------------------------------------
+# Action-run status filter + HEAD-recheck (task #394, mc#1597..1630)
+#
+# The existing cancel-cascade filter matched description=='Has been
+# cancelled' EXACTLY, but a 7-day DB sweep on 2026-05-20 showed that
+# only 76/702 (~11%) of action_run.status=3 (Cancelled) entries carry
+# that string — 89% are written as 'Failing after Ns', indistinguishable
+# from real action_run.status=2 (Failure) at the commit_status layer.
+#
+# Gitea 1.22.6 has NO REST endpoint exposing action_run.status, so the
+# canonical filter (status=2 only) cannot run from a Gitea Actions
+# runner. The next-best signal is the HEAD-recheck: re-fetch HEAD SHA
+# (or its combined status) right before filing. If HEAD moved on or
+# combined state recovered, the prior "red" was a transient
+# cancel-cascade and we skip-file.
+#
+# References:
+#   - reference_chronic_red_sweep_cancelled_vs_failed_filter
+#   - feedback_gitea_status_enum_use_helper_not_raw_int
+#   - reference_gitea_action_status_enum_corrected_2026_05_19
+#   - triage evidence 2026-05-21 04:55 (6 cancellation + 1 emission
+#     artifact across mc#1597,1605,1609,1613,1626,1627,1630)
+# --------------------------------------------------------------------------
+def test_head_recheck_skips_file_when_head_moved(wd_module, monkeypatch, capsys):
+    """When initial tick sees red at SHA_A but HEAD has since moved to
+    SHA_B (next commit landed mid-tick), the watchdog must NOT file.
+    Re-evaluation happens on the next cron tick against the new SHA.
+
+    REGRESSION CLASS: this guards mc#1597..#1630 — 7 false-positives
+    filed in 24h because cancel-cascade fired commit_status=failure
+    rows on SHAs that were already superseded by new merges."""
+    SHA_A = SHA_RED
+    SHA_B = SHA_GREEN
+    failed_ctx = [
+        {"context": "ci/test", "status": "failure",
+         "target_url": "/r/runs/100/jobs/0",
+         "description": "Failing after 12s"},
+    ]
+    # First branches read returns SHA_A; the second (recheck) returns SHA_B
+    # → watchdog detects HEAD drift and skip-files.
+    branches_responses = iter([
+        (200, _branches_response(SHA_A)),
+        (200, _branches_response(SHA_B)),
+    ])
+
+    def fake_api(method, path, *, body=None, query=None, expect_json=True):
+        if method == "GET" and path == "/repos/owner/repo/branches/main":
+            return next(branches_responses)
+        if method == "GET" and path == f"/repos/owner/repo/commits/{SHA_A}/status":
+            return (200, _combined_status("failure", failed_ctx))
+        if method == "POST" and path == "/repos/owner/repo/issues":
+            raise AssertionError(
+                "watchdog filed a phantom issue despite HEAD moving away "
+                "from the red SHA (regression: mc#1597..1630)"
+            )
+        if method == "GET" and path == "/repos/owner/repo/issues":
+            return (200, [])
+        raise AssertionError(f"unexpected api call: {method} {path}")
+
+    # Settling delay is no-op'd by the _stub_time_sleep autouse fixture.
+    monkeypatch.setattr(wd_module, "api", fake_api)
+    wd_module.run_once(dry_run=False)
+    captured = capsys.readouterr()
+    assert "head drift" in captured.out.lower() or "head moved" in captured.out.lower(), (
+        f"expected a notice about HEAD drift, got: {captured.out!r}"
+    )
+
+
+def test_head_recheck_skips_file_when_recheck_status_recovered(
+    wd_module, monkeypatch, capsys,
+):
+    """When initial tick sees red at SHA, but the post-settling recheck
+    on the SAME SHA shows combined status recovered (e.g. transient
+    cancel-cascade rolled forward to success on retry), skip-file.
+
+    This catches the mid-flight cancel-cascade window — the second
+    largest false-positive cluster in mc#1597..1630."""
+    failed_ctx_initial = [
+        {"context": "ci/test", "status": "failure",
+         "target_url": "/r/runs/100/jobs/0",
+         "description": "Failing after 12s"},
+    ]
+    recovered_ctx = [
+        {"context": "ci/test", "status": "success",
+         "target_url": "/r/runs/100/jobs/0",
+         "description": "Successful in 30s"},
+    ]
+    # Same SHA across both branch reads; status flips from failure→success
+    # between the two combined-status reads.
+    status_responses = iter([
+        (200, _combined_status("failure", failed_ctx_initial)),
+        (200, _combined_status("success", recovered_ctx)),
+    ])
+
+    def fake_api(method, path, *, body=None, query=None, expect_json=True):
+        if method == "GET" and path == "/repos/owner/repo/branches/main":
+            return (200, _branches_response(SHA_RED))
+        if method == "GET" and path == f"/repos/owner/repo/commits/{SHA_RED}/status":
+            return next(status_responses)
+        if method == "POST" and path == "/repos/owner/repo/issues":
+            raise AssertionError(
+                "watchdog filed a phantom issue despite combined status "
+                "recovering on recheck (mid-flight cancel-cascade window)"
+            )
+        if method == "GET" and path == "/repos/owner/repo/issues":
+            return (200, [])
+        raise AssertionError(f"unexpected api call: {method} {path}")
+
+    monkeypatch.setattr(wd_module, "api", fake_api)
+    wd_module.run_once(dry_run=False)
+    captured = capsys.readouterr()
+    assert "recovered" in captured.out.lower() or "settled" in captured.out.lower(), (
+        f"expected a notice about post-settling recovery, got: {captured.out!r}"
+    )
+
+
+def test_head_recheck_files_when_still_red_after_settling(
+    wd_module, monkeypatch,
+):
+    """When BOTH the initial detection AND the post-settling recheck
+    show the same SHA still red, file the issue. This is the genuine-
+    failure path the watchdog is designed to surface.
+
+    Locks the over-filter: a future change that always-skips after
+    recheck would dismiss real failures."""
+    failed_ctx = [
+        {"context": "ci/test", "status": "failure",
+         "target_url": "/r/runs/100/jobs/0",
+         "description": "Failing after 12s"},
+    ]
+    post_filed = {"value": False}
+
+    def fake_api(method, path, *, body=None, query=None, expect_json=True):
+        if method == "GET" and path == "/repos/owner/repo/branches/main":
+            return (200, _branches_response(SHA_RED))
+        if method == "GET" and path == f"/repos/owner/repo/commits/{SHA_RED}/status":
+            return (200, _combined_status("failure", failed_ctx))
+        if method == "GET" and path == "/repos/owner/repo/issues":
+            return (200, [])
+        if method == "GET" and path == "/repos/owner/repo/labels":
+            return (200, [{"id": 9, "name": "tier:high"}])
+        if method == "POST" and path == "/repos/owner/repo/issues":
+            post_filed["value"] = True
+            return (201, {"number": 999})
+        if method == "POST" and path == "/repos/owner/repo/issues/999/labels":
+            return (200, [])
+        raise AssertionError(f"unexpected api call: {method} {path}")
+
+    monkeypatch.setattr(wd_module, "api", fake_api)
+    wd_module.run_once(dry_run=False)
+    assert post_filed["value"], (
+        "genuine-failure path was skip-filed — head-recheck over-filter "
+        "regression (would suppress all real main-red alarms)"
+    )
+
+
+def test_head_recheck_skips_when_initial_was_only_cancel_cascade(
+    wd_module, monkeypatch,
+):
+    """Belt-and-braces: combined-status failure caused exclusively by
+    description='Has been cancelled' entries should still be filtered
+    by the EXISTING cancel-cascade filter — head-recheck must not
+    accidentally bypass it. Regression guard for the existing mc#1564
+    fix."""
+    failed_ctx = [
+        {"context": "ci/test", "status": "failure",
+         "description": "Has been cancelled"},
+    ]
+
+    def fake_api(method, path, *, body=None, query=None, expect_json=True):
+        if method == "GET" and path == "/repos/owner/repo/branches/main":
+            return (200, _branches_response(SHA_RED))
+        if method == "GET" and path == f"/repos/owner/repo/commits/{SHA_RED}/status":
+            return (200, _combined_status("failure", failed_ctx))
+        if method == "POST" and path == "/repos/owner/repo/issues":
+            raise AssertionError(
+                "cancel-cascade-only entry must be filtered before any "
+                "head-recheck logic runs"
+            )
+        if method == "GET" and path == "/repos/owner/repo/issues":
+            return (200, [])
+        # No commit-status recheck should happen because is_red() returned False
+        raise AssertionError(f"unexpected api call: {method} {path}")
+
+    monkeypatch.setattr(wd_module, "api", fake_api)
+    wd_module.run_once(dry_run=False)
+    # success: no AssertionError raised, no POST
+
+
+def test_resolve_action_run_status_returns_none_on_no_endpoint(wd_module):
+    """The action_run.status REST endpoint does NOT exist in Gitea
+    1.22.6 (verified empirically 2026-05-20 — /api/v1/.../actions/runs/N
+    returns HTTP 404 across all probe variants). The resolver must
+    return None gracefully so callers fall back to the description-
+    string + head-recheck heuristics.
+
+    This pins the extensibility hook: when a future Gitea release (or
+    an op-host proxy) exposes the endpoint, the resolver implementation
+    can be swapped in without touching the caller contract."""
+    # The function exists and is callable
+    assert hasattr(wd_module, "_resolve_action_run_status")
+    # A typical target_url shape from real Gitea commit_status rows:
+    target_url = "/molecule-ai/molecule-core/actions/runs/75020/jobs/0"
+    # Return None when no endpoint available
+    out = wd_module._resolve_action_run_status(target_url)
+    assert out is None, (
+        "resolver must return None when the action_run.status endpoint "
+        "isn't reachable — callers depend on the None-fallback path"
+    )

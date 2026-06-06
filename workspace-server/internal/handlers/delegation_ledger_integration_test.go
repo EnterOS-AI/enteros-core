@@ -36,12 +36,11 @@ package handlers
 import (
 	"context"
 	"database/sql"
-	"os"
 	"strings"
 	"testing"
 	"time"
 
-	mdb "github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
+	mdb "git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	_ "github.com/lib/pq"
 )
 
@@ -57,10 +56,7 @@ import (
 // directly rather than going through the package global.
 func integrationDB(t *testing.T) *sql.DB {
 	t.Helper()
-	url := os.Getenv("INTEGRATION_DB_URL")
-	if url == "" {
-		t.Skip("INTEGRATION_DB_URL not set; skipping (local devs: see file header)")
-	}
+	url := requireIntegrationDBURL(t)
 	conn, err := sql.Open("postgres", url)
 	if err != nil {
 		t.Fatalf("open: %v", err)

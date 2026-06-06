@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -18,7 +19,8 @@ import (
 	dockerclient "github.com/docker/docker/client"
 	"github.com/gin-gonic/gin"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/provisioner"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/providers"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
 )
 
 // WorkspaceImageService is the production-side end of the runtime CD chain.
@@ -41,11 +43,53 @@ func NewWorkspaceImageService(docker *dockerclient.Client) *WorkspaceImageServic
 	return &WorkspaceImageService{docker: docker}
 }
 
-// AllRuntimes is the canonical list mirroring docs/workspace-runtime-package.md.
-// Update both when a new template is added.
-var AllRuntimes = []string{
-	"claude-code", "langgraph", "autogen",
-	"hermes", "openclaw",
+// AllRuntimes is the canonical set of workspace runtimes this tenant will
+// pull/recreate template images for. It is DERIVED from the same providers
+// manifest SSOT (internal/providers/providers.yaml `runtimes:` block, mirrored
+// from CP's providers.yaml) that the rest of the platform routes against —
+// NOT a second hand-maintained list.
+//
+// Why derive instead of hardcode (controlplane#578): the old hardcoded slice
+// here ({claude-code, codex, hermes, openclaw}) silently DRIFTED from CP, which
+// already accepts `google-adk` for pin-promote/redeploy. A google-adk pin would
+// be accepted CP-side, then this tenant's POST /admin/workspace-images/refresh
+// ?runtime=google-adk rejected it 400 ("unknown runtime"), so google-adk image
+// fixes never deployed. Deriving from the manifest makes the tenant allowlist
+// and the CP allowlist provably the same set — they can't drift again.
+//
+// imageRefreshFallbackRuntimes is used ONLY if the embedded providers manifest
+// fails to load (which would be a build/CI failure caught by the providers
+// package's own tests, never a healthy prod). It preserves the historical
+// behavior — plus google-adk — so a manifest regression can never take the
+// refresh endpoint fully offline. Kept in lockstep with the providers.yaml
+// `runtimes:` keys; the drift guard in admin_workspace_images_test.go asserts
+// the two match.
+var imageRefreshFallbackRuntimes = []string{
+	"claude-code", "codex", "google-adk", "hermes", "openclaw",
+}
+
+// AllRuntimes is computed once at package init from the providers SSOT.
+var AllRuntimes = loadImageRefreshRuntimes()
+
+// loadImageRefreshRuntimes returns the sorted runtime names declared in the
+// providers manifest, falling back to imageRefreshFallbackRuntimes if the
+// manifest can't be loaded.
+func loadImageRefreshRuntimes() []string {
+	m, err := providers.LoadManifest()
+	if err != nil || len(m.Runtimes) == 0 {
+		if err != nil {
+			log.Printf("workspace-images: providers.LoadManifest failed (%v); falling back to static runtime allowlist", err)
+		}
+		out := append([]string(nil), imageRefreshFallbackRuntimes...)
+		sort.Strings(out)
+		return out
+	}
+	out := make([]string, 0, len(m.Runtimes))
+	for rt := range m.Runtimes {
+		out = append(out, rt)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // RefreshResult is the per-call outcome surfaced to HTTP callers AND logged
@@ -198,7 +242,7 @@ func (s *WorkspaceImageService) Refresh(ctx context.Context, runtimes []string, 
 
 // AdminWorkspaceImagesHandler serves POST /admin/workspace-images/refresh.
 //
-//	?runtime=claude-code   (optional; default = all 8 templates)
+//	?runtime=claude-code   (optional; default = all runtimes in AllRuntimes)
 //	&recreate=true|false   (default true; false = pull only)
 //
 // Returns JSON {pulled: [...], failed: [...], recreated: [...]}

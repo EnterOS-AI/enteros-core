@@ -93,6 +93,24 @@ describe("MobileSpawn — render", () => {
     expect(input).toBeTruthy();
   });
 
+  // Regression #224 / #225: the agent-name input must render with a
+  // font-size ≥ 16px. iOS Safari and PWAs auto-zoom the viewport when a
+  // focused input has a computed font-size below 16px — the layout
+  // jumps and the page looks broken until the user pinches back.
+  it("renders the name input at font-size 16px or greater (iOS focus-zoom regression)", () => {
+    apiGetSpy.mockResolvedValue(mockTemplates);
+    render(<MobileSpawn dark={true} onClose={vi.fn()} />);
+    const input = document.querySelector(
+      'input[aria-label="Agent name"]',
+    ) as HTMLInputElement | null;
+    expect(input).toBeTruthy();
+    // Parse the inline style font-size — jsdom doesn't run a layout
+    // engine, so getComputedStyle reports the inline value verbatim.
+    const fs = Number.parseFloat(input!.style.fontSize);
+    expect(Number.isFinite(fs)).toBe(true);
+    expect(fs).toBeGreaterThanOrEqual(16);
+  });
+
   it("renders all 4 tier buttons", () => {
     apiGetSpy.mockResolvedValue(mockTemplates);
     render(<MobileSpawn dark={true} onClose={vi.fn()} />);

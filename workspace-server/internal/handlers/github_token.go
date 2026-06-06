@@ -51,7 +51,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/pkg/provisionhook"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/pkg/provisionhook"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 )
@@ -78,8 +78,7 @@ func NewGitHubTokenHandler(reg *provisionhook.Registry) *GitHubTokenHandler {
 //	500 {"error": "token refresh failed"}  — provider returned error
 //
 // The 404 vs 403 distinction is intentional: a 404 means the feature is
-// simply not configured, not that the caller is forbidden. This matches
-// the pattern used by GET /admin/workspaces/:id/test-token.
+// simply not configured, not that the caller is forbidden.
 //
 // Callers must retry with exponential back-off on 500 — a transient
 // upstream GitHub API error should not permanently block git operations.
@@ -156,14 +155,21 @@ func generateAppInstallationToken() (string, time.Time, error) {
 	if err != nil {
 		return "", time.Time{}, fmt.Errorf("sign JWT: %w", err)
 	}
-	req, _ := http.NewRequest("POST", fmt.Sprintf("https://api.github.com/app/installations/%d/access_tokens", installID), nil)
+	req, err := http.NewRequest("POST", fmt.Sprintf("https://api.github.com/app/installations/%d/access_tokens", installID), nil)
+	if err != nil {
+		return "", time.Time{}, fmt.Errorf("build request: %w", err)
+	}
 	req.Header.Set("Authorization", "Bearer "+signed)
 	req.Header.Set("Accept", "application/vnd.github+json")
-	resp, err := http.DefaultClient.Do(req)
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", time.Time{}, err
 	}
 	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusCreated {
+		return "", time.Time{}, fmt.Errorf("github token endpoint returned status %d", resp.StatusCode)
+	}
 	var result struct {
 		Token     string    `json:"token"`
 		ExpiresAt time.Time `json:"expires_at"`

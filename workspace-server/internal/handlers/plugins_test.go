@@ -402,8 +402,8 @@ func writePlugin(t *testing.T, dir, name, manifest string) {
 func TestPluginListRegistry_FiltersByRuntime(t *testing.T) {
 	dir := t.TempDir()
 	writePlugin(t, dir, "p-cc", "name: p-cc\nruntimes: [claude_code]\n")
-	writePlugin(t, dir, "p-da", "name: p-da\nruntimes: [deepagents]\n")
-	writePlugin(t, dir, "p-both", "name: p-both\nruntimes: [claude_code, deepagents]\n")
+	writePlugin(t, dir, "p-da", "name: p-da\nruntimes: [hermes]\n")
+	writePlugin(t, dir, "p-both", "name: p-both\nruntimes: [claude_code, hermes]\n")
 	writePlugin(t, dir, "p-legacy", "name: p-legacy\n") // no runtimes — always allowed
 
 	h := NewPluginsHandler(dir, nil, nil)
@@ -415,7 +415,7 @@ func TestPluginListRegistry_FiltersByRuntime(t *testing.T) {
 	}{
 		{"no filter returns all", "", map[string]bool{"p-cc": true, "p-da": true, "p-both": true, "p-legacy": true}},
 		{"claude_code filter", "claude_code", map[string]bool{"p-cc": true, "p-both": true, "p-legacy": true}},
-		{"deepagents filter", "deepagents", map[string]bool{"p-da": true, "p-both": true, "p-legacy": true}},
+		{"hermes filter", "hermes", map[string]bool{"p-da": true, "p-both": true, "p-legacy": true}},
 		{"hyphen form normalized", "claude-code", map[string]bool{"p-cc": true, "p-both": true, "p-legacy": true}},
 	}
 	for _, tc := range cases {
@@ -453,13 +453,13 @@ func TestPluginListRegistry_FiltersByRuntime(t *testing.T) {
 
 func TestPluginListAvailableForWorkspace_UsesRuntimeLookup(t *testing.T) {
 	dir := t.TempDir()
-	writePlugin(t, dir, "only-deepagents", "name: only-deepagents\nruntimes: [deepagents]\n")
+	writePlugin(t, dir, "only-hermes", "name: only-hermes\nruntimes: [hermes]\n")
 	writePlugin(t, dir, "only-claude", "name: only-claude\nruntimes: [claude_code]\n")
 
-	// Workspace resolves to deepagents.
+	// Workspace resolves to hermes.
 	h := NewPluginsHandler(dir, nil, nil).WithRuntimeLookup(func(id string) (string, error) {
 		if id == "ws-da" {
-			return "deepagents", nil
+			return "hermes", nil
 		}
 		return "claude_code", nil
 	})
@@ -477,14 +477,14 @@ func TestPluginListAvailableForWorkspace_UsesRuntimeLookup(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &plugins); err != nil {
 		t.Fatal(err)
 	}
-	if len(plugins) != 1 || plugins[0].Name != "only-deepagents" {
-		t.Errorf("expected only-deepagents, got %+v", plugins)
+	if len(plugins) != 1 || plugins[0].Name != "only-hermes" {
+		t.Errorf("expected only-hermes, got %+v", plugins)
 	}
 }
 
 func TestPluginListAvailableForWorkspace_NoLookupReturnsAll(t *testing.T) {
 	dir := t.TempDir()
-	writePlugin(t, dir, "only-deepagents", "name: only-deepagents\nruntimes: [deepagents]\n")
+	writePlugin(t, dir, "only-hermes", "name: only-hermes\nruntimes: [hermes]\n")
 	writePlugin(t, dir, "only-claude", "name: only-claude\nruntimes: [claude_code]\n")
 
 	// No runtime lookup wired → falls back to full registry.
@@ -508,15 +508,15 @@ func TestPluginListAvailableForWorkspace_NoLookupReturnsAll(t *testing.T) {
 // ---------- Manifest parsing: runtimes field ----------
 
 func TestParseManifestYAML_PicksUpRuntimes(t *testing.T) {
-	info := parseManifestYAML("demo", []byte("name: demo\nruntimes:\n  - claude_code\n  - deepagents\n"))
-	if len(info.Runtimes) != 2 || info.Runtimes[0] != "claude_code" || info.Runtimes[1] != "deepagents" {
-		t.Errorf("expected [claude_code, deepagents], got %v", info.Runtimes)
+	info := parseManifestYAML("demo", []byte("name: demo\nruntimes:\n  - claude_code\n  - hermes\n"))
+	if len(info.Runtimes) != 2 || info.Runtimes[0] != "claude_code" || info.Runtimes[1] != "hermes" {
+		t.Errorf("expected [claude_code, hermes], got %v", info.Runtimes)
 	}
 	if !info.supportsRuntime("claude-code") {
 		t.Error("hyphen/underscore normalization broken")
 	}
-	if info.supportsRuntime("langgraph") {
-		t.Error("should not support langgraph")
+	if info.supportsRuntime("openclaw") {
+		t.Error("should not support openclaw")
 	}
 }
 
@@ -548,7 +548,7 @@ func TestCheckRuntimeCompatibility_TriviallyCompatibleWhenContainerMissing(t *te
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 	c.Params = gin.Params{{Key: "id", Value: "ws"}}
-	c.Request = httptest.NewRequest("GET", "/workspaces/ws/plugins/compatibility?runtime=deepagents", nil)
+	c.Request = httptest.NewRequest("GET", "/workspaces/ws/plugins/compatibility?runtime=hermes", nil)
 	h.CheckRuntimeCompatibility(c)
 
 	if w.Code != http.StatusOK {
@@ -561,7 +561,7 @@ func TestCheckRuntimeCompatibility_TriviallyCompatibleWhenContainerMissing(t *te
 	if body["all_compatible"] != true {
 		t.Errorf("expected all_compatible=true, got %v", body["all_compatible"])
 	}
-	if body["target_runtime"] != "deepagents" {
+	if body["target_runtime"] != "hermes" {
 		t.Errorf("target_runtime mismatch: %v", body["target_runtime"])
 	}
 }

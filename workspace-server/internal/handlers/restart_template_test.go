@@ -1,9 +1,13 @@
 package handlers
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
+	"github.com/DATA-DOG/go-sqlmock"
 )
 
 // Tests for resolveRestartTemplate — the pure helper that implements the
@@ -65,12 +69,12 @@ func TestResolveRestartTemplate_DefaultRestart_PreservesVolume(t *testing.T) {
 // that passing Template by name works regardless of ApplyTemplate —
 // the caller named a template, that's unambiguous consent.
 func TestResolveRestartTemplate_ExplicitTemplate_AlwaysHonoured(t *testing.T) {
-	root := newTemplateDir(t, "langgraph")
+	root := newTemplateDir(t, "claude-code")
 
 	path, label := resolveRestartTemplate(root, "Some Agent", "", restartTemplateInput{
-		Template: "langgraph",
+		Template: "claude-code",
 	})
-	if path == "" || label != "langgraph" {
+	if path == "" || label != "claude-code" {
 		t.Errorf("explicit template must resolve; got path=%q label=%q", path, label)
 	}
 }
@@ -104,6 +108,71 @@ func TestResolveRestartTemplate_ApplyTemplate_RuntimeDefault(t *testing.T) {
 	}
 }
 
+type restartRuntimeProv struct {
+	execReadCalls int
+	config        []byte
+}
+
+func (p *restartRuntimeProv) Start(_ context.Context, _ provisioner.WorkspaceConfig) (string, error) {
+	panic("restartRuntimeProv.Start not implemented")
+}
+func (p *restartRuntimeProv) Stop(_ context.Context, _ string) error {
+	panic("restartRuntimeProv.Stop not implemented")
+}
+func (p *restartRuntimeProv) IsRunning(_ context.Context, _ string) (bool, error) {
+	panic("restartRuntimeProv.IsRunning not implemented")
+}
+func (p *restartRuntimeProv) ExecRead(_ context.Context, _, _ string) ([]byte, error) {
+	p.execReadCalls++
+	return p.config, nil
+}
+func (p *restartRuntimeProv) RemoveVolume(_ context.Context, _ string) error {
+	panic("restartRuntimeProv.RemoveVolume not implemented")
+}
+func (p *restartRuntimeProv) VolumeHasFile(_ context.Context, _, _ string) (bool, error) {
+	panic("restartRuntimeProv.VolumeHasFile not implemented")
+}
+func (p *restartRuntimeProv) WriteAuthTokenToVolume(_ context.Context, _, _ string) error {
+	panic("restartRuntimeProv.WriteAuthTokenToVolume not implemented")
+}
+
+var _ provisioner.LocalProvisionerAPI = (*restartRuntimeProv)(nil)
+
+func TestRestartRuntimeFromConfig_ApplyTemplateTrustsDBRuntime(t *testing.T) {
+	prov := &restartRuntimeProv{config: []byte("runtime: claude-code\n")}
+	h := &WorkspaceHandler{provisioner: prov}
+
+	got := h.restartRuntimeFromConfig(context.Background(), "ws-runtime", "Runtime Workspace", "hermes", true)
+
+	if got != "hermes" {
+		t.Fatalf("runtime = %q, want DB runtime hermes", got)
+	}
+	if prov.execReadCalls != 0 {
+		t.Fatalf("ExecRead calls = %d, want 0 when apply_template=true", prov.execReadCalls)
+	}
+}
+
+func TestRestartRuntimeFromConfig_DefaultRestartPreservesContainerRuntime(t *testing.T) {
+	mock := setupTestDB(t)
+	mock.ExpectExec(`UPDATE workspaces SET runtime = \$1 WHERE id = \$2`).
+		WithArgs("claude-code", "ws-runtime").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	prov := &restartRuntimeProv{config: []byte("runtime: claude-code\n")}
+	h := &WorkspaceHandler{provisioner: prov}
+
+	got := h.restartRuntimeFromConfig(context.Background(), "ws-runtime", "Runtime Workspace", "hermes", false)
+
+	if got != "claude-code" {
+		t.Fatalf("runtime = %q, want container runtime claude-code", got)
+	}
+	if prov.execReadCalls != 1 {
+		t.Fatalf("ExecRead calls = %d, want 1", prov.execReadCalls)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet sqlmock expectations: %v", err)
+	}
+}
+
 // TestResolveRestartTemplate_ApplyTemplate_NoMatch_NoRuntime falls all
 // the way through to the reuse-volume path when neither name nor
 // runtime-default resolves.
@@ -126,7 +195,7 @@ func TestResolveRestartTemplate_ApplyTemplate_NoMatch_NoRuntime(t *testing.T) {
 // to a valid dir (e.g. traversal attempt, deleted template). The helper
 // must log + fall through, not crash or escape the root.
 func TestResolveRestartTemplate_InvalidExplicitTemplate_ProceedsWithout(t *testing.T) {
-	root := newTemplateDir(t, "langgraph")
+	root := newTemplateDir(t, "claude-code")
 
 	path, label := resolveRestartTemplate(root, "Some Agent", "", restartTemplateInput{
 		Template: "../../etc/passwd",
@@ -143,7 +212,7 @@ func TestResolveRestartTemplate_InvalidExplicitTemplate_ProceedsWithout(t *testi
 // above but for a syntactically-valid name that simply doesn't exist
 // on disk (e.g. template was manually deleted). Must fall through.
 func TestResolveRestartTemplate_NonExistentExplicitTemplate(t *testing.T) {
-	root := newTemplateDir(t, "langgraph")
+	root := newTemplateDir(t, "claude-code")
 
 	path, label := resolveRestartTemplate(root, "Some Agent", "", restartTemplateInput{
 		Template: "deleted-template",
@@ -159,19 +228,19 @@ func TestResolveRestartTemplate_NonExistentExplicitTemplate(t *testing.T) {
 // TestResolveRestartTemplate_Priority_ExplicitBeatsApplyTemplate proves
 // that an explicit Template takes precedence over a name-based match.
 // Scenario: workspace "Hermes" with ApplyTemplate=true + explicit
-// Template="langgraph" — caller wants langgraph, not hermes.
+// Template="claude-code" — caller wants claude-code, not hermes.
 func TestResolveRestartTemplate_Priority_ExplicitBeatsApplyTemplate(t *testing.T) {
-	root := newTemplateDir(t, "hermes", "langgraph")
+	root := newTemplateDir(t, "hermes", "claude-code")
 
 	path, label := resolveRestartTemplate(root, "Hermes", "", restartTemplateInput{
-		Template:      "langgraph",
+		Template:      "claude-code",
 		ApplyTemplate: true,
 	})
-	if label != "langgraph" {
+	if label != "claude-code" {
 		t.Errorf("explicit Template must win; got label=%q", label)
 	}
-	// Verify the path is actually inside the langgraph template dir
-	expected := filepath.Join(root, "langgraph")
+	// Verify the path is actually inside the claude-code template dir
+	expected := filepath.Join(root, "claude-code")
 	if path != expected {
 		t.Errorf("expected path %q, got %q", expected, path)
 	}
@@ -183,26 +252,28 @@ func TestResolveRestartTemplate_Priority_ExplicitBeatsApplyTemplate(t *testing.T
 // An attacker who holds a workspace token can set the runtime field to a
 // path-traversal string (e.g. "../../../etc").  Before the fix, the code
 // did:
-//   runtimeTemplate := filepath.Join(configsDir, dbRuntime+"-default")
+//
+//	runtimeTemplate := filepath.Join(configsDir, dbRuntime+"-default")
+//
 // which on a host with /configs/../../../etc-default would return /etc-default,
 // injecting arbitrary host files into the workspace container.
 //
 // After the fix, sanitizeRuntime is called first.  Unknown runtimes
-// (including traversal strings) are remapped to "langgraph".  The attacker
+// (including traversal strings) are remapped to "claude-code".  The attacker
 // cannot choose an arbitrary host path — they can at most trigger
-// langgraph-default if that template happens to exist.
+// claude-code-default if that template happens to exist.
 //
 // This test verifies that a traversal string in dbRuntime falls through to
-// "existing-volume" when no langgraph-default template is present.
+// "existing-volume" when no claude-code-default template is present.
 func TestResolveRestartTemplate_CWE22_TraversalRuntime_FallsThrough(t *testing.T) {
 	root := newTemplateDir(t) // no template dirs at all
 
 	for _, tc := range []struct {
-		name     string
+		name      string
 		dbRuntime string
 	}{
 		{"simple traversal", "../../../etc"},
-		{"mid-path traversal", "langgraph/../../../etc"},
+		{"mid-path traversal", "claude-code/../../../etc"},
 		{"absolute-path attempt", "/etc/passwd"},
 		{"double-dot chain", "../.."},
 		{"deep traversal", "a/b/c/../../../d"},
@@ -223,8 +294,8 @@ func TestResolveRestartTemplate_CWE22_TraversalRuntime_FallsThrough(t *testing.T
 }
 
 // TestResolveRestartTemplate_CWE22_TraversalRuntime_CannotOverrideKnownRuntime
-// verifies that even if a langgraph-default template exists, a traversal
-// string in dbRuntime resolves langgraph-default (the safe default) rather
+// verifies that even if a claude-code-default template exists, a traversal
+// string in dbRuntime resolves claude-code-default (the safe default) rather
 // than any attacker-chosen path.  The attacker gains no additional access.
 func TestResolveRestartTemplate_CWE22_TraversalRuntime_CannotOverrideKnownRuntime(t *testing.T) {
 	root := newTemplateDir(t, "claude-code-default")

@@ -272,7 +272,9 @@ describe("OrgCancelButton — API interactions", () => {
     fireEvent.click(screen.getByRole("button", { name: /cancel deployment of test org/i }));
     fireEvent.click(screen.getByRole("button", { name: /yes/i }));
     await act(async () => { /* flush */ });
-    expect(mockApiDel).toHaveBeenCalledWith("/workspaces/root-1?confirm=true");
+    expect(mockApiDel).toHaveBeenCalledWith("/workspaces/root-1?confirm=true", {
+      headers: { "X-Confirm-Name": "Test Org" },
+    });
   });
 
   it("shows success toast on DELETE success", async () => {

@@ -1,7 +1,7 @@
 # Molecule AI — Comprehensive Technical Documentation
 
 > Definitive technical reference for the Molecule AI Agent Team platform.
-> Based on a full non-invasive scan of the [molecule-monorepo](https://git.moleculesai.app/molecule-ai/molecule-monorepo) repository.
+> Based on a full non-invasive scan of the [molecule-core](https://git.moleculesai.app/molecule-ai/molecule-core) repository.
 
 ---
 
@@ -83,6 +83,8 @@ Six runtime adapters ship production-ready on `main`: LangGraph, DeepAgents, Cla
 ---
 
 ## 3. System Architecture
+
+> **Workspace placement contract:** every Molecule org runs as a fully isolated tenant on its own EC2, with workspace-server, memory plugin, Postgres, and Redis all co-located. The platform (controlplane on Railway) handles provisioning, billing, and DNS only — it never holds tenant data. See [`workspace-placement.md`](workspace-placement.md) for the formal RFC.
 
 ### System Boundary Diagram
 
@@ -426,10 +428,10 @@ submitted → working → completed
 
 | Surface | Storage | Endpoint | Purpose |
 |---------|---------|----------|---------|
-| **Scoped agent memory** | `agent_memories` table | `POST /workspaces/:id/memories` | HMA-backed distributed memory with scope enforcement |
-| **Key/value workspace memory** | `workspace_memory` table | `POST /workspaces/:id/memory` | Simple structured state, UI-visible, optional TTL |
-| **Activity recall** | `activity_logs` + `agent_memories` | `GET /workspaces/:id/session-search` | "What just happened?" contextual recall |
-| **Awareness-backed** | External service | Same tool interface | When `AWARENESS_URL` + `AWARENESS_NAMESPACE` configured |
+| **Memory v2 plugin (SSOT)** | `memory_plugin.memory_records` table via RFC #2728 HTTP plugin | `POST /workspaces/:id/v2/memories`, MCP tools `commit_memory` / `commit_memory_v2` / `commit_summary` | Production memory backend — agent reads/writes route through here exclusively |
+| **Key/value workspace memory** | `workspace_memory` table | `POST /workspaces/:id/memory` | Simple structured state, UI-visible, optional TTL — separate from agent memory |
+| **Activity recall** | `activity_logs` + `agent_memories` (legacy read-only) | `GET /workspaces/:id/session-search` | "What just happened?" contextual recall |
+| **Legacy `agent_memories`** | `agent_memories` table | `POST /workspaces/:id/memories` (REST) | Frozen post-A1 — kept only for the REST canvas-side path; the workspace-create `seedInitialMemories` writer routes through the v2 plugin once #1755 (PR #1759) lands. Scheduled for drop in Phase A3 (#1733). |
 
 ### Memory → Skill Compounding Flywheel
 
@@ -511,7 +513,7 @@ description: ""
 version: "1.0.0"
 tier: 2                                    # 1=sandboxed, 2=standard, 3=privileged, 4=full-host
 model: "anthropic:claude-sonnet-4-6"       # provider:model syntax
-runtime: "langgraph"                       # langgraph | deepagents | claude-code | crewai | autogen | openclaw
+runtime: "claude-code"                     # claude-code | codex | hermes | openclaw
 runtime_config:                            # Runtime-specific settings
   command: "claude"                        # For CLI runtimes
   args: []
@@ -565,15 +567,13 @@ compliance:
   max_task_duration_seconds: 300
 ```
 
-### Six Runtime Adapters
+### Four Runtime Adapters
 
 | Adapter | Core Strength | Image Tag |
 |---------|--------------|-----------|
-| **LangGraph** | Graph-based state machine, tool use, streaming | `workspace-template:langgraph` |
-| **DeepAgents** | Deep planning, multi-step task decomposition | `workspace-template:deepagents` |
 | **Claude Code** | Native coding workflows, CLI continuity, OAuth auth | `workspace-template:claude-code` |
-| **CrewAI** | Role-based crews, structured task orchestration | `workspace-template:crewai` |
-| **AutoGen** | Multi-agent conversations, explicit strategies | `workspace-template:autogen` |
+| **Codex** | OpenAI Codex coding workflows | `workspace-template:codex` |
+| **Hermes** | Hermes agent runtime | `workspace-template:hermes` |
 | **OpenClaw** | CLI-native runtime, own session model | `workspace-template:openclaw` |
 
 **Branch-level WIP**: NemoClaw (NVIDIA T4 + Docker socket) on `feat/nemoclaw-t4-docker`.
@@ -740,7 +740,6 @@ requires:
 | `hitl.py` | Multi-channel HITL (dashboard, Slack, email) | hitl.bypass_roles |
 | `sandbox.py` | Code execution (subprocess or Docker backend) | sandbox access |
 | `telemetry.py` | OpenTelemetry span creation and tracing | trace emission |
-| `awareness_client.py` | Awareness namespace memory wrapper | memory scope |
 | `security_scan.py` | CVE and security scanning (pip-audit/Snyk) | security audit |
 | `temporal_workflow.py` | Temporal.io workflow integration | workflow engine |
 | `a2a_tools.py` | A2A delegation helpers and route resolution | delegate/receive |
@@ -749,8 +748,7 @@ requires:
 
 | Server | Purpose |
 |--------|---------|
-| `molecule` | 20+ platform management tools (workspace CRUD, chat, memory, teams, secrets, files, approvals) |
-| `awareness-memory` | Persistent cross-session memory via Awareness SDK |
+| `molecule` | 20+ platform management tools (workspace CRUD, chat, memory, teams, secrets, files, approvals) — includes `commit_memory` / `commit_memory_v2` / `search_memory` routed through the v2 plugin |
 
 ---
 
@@ -909,7 +907,7 @@ Postgres + Redis + Langfuse only (for local development without containerized wo
 | `CORS_ORIGINS` | `http://localhost:3000,...` | CORS whitelist |
 | `RATE_LIMIT` | `600` | Requests per minute |
 | `WORKSPACE_DIR` | Optional | Shared workspace volume |
-| `AWARENESS_URL` | Optional | Awareness service URL |
+| `MEMORY_PLUGIN_URL` | Unset by default | v2 memory plugin sidecar address. Typically set externally — CP user-data injects `http://localhost:9100` on tenant EC2 boot, which `entrypoint-tenant.sh` reads as the signal to spawn the bundled `memory-plugin` sidecar on the matching loopback port. When unset, today (pre-#1747) the legacy `agent_memories` SQL path is used as silent fallback; after #1747 (RFC #1733 Phase A1) lands, memory MCP tools return a "plugin not configured" error instead. |
 
 ### Canvas (Next.js)
 
@@ -927,8 +925,6 @@ Postgres + Redis + Langfuse only (for local development without containerized wo
 | `WORKSPACE_CONFIG_PATH` | `/configs` | Config directory mount |
 | `PLATFORM_URL` | `http://platform:8080` | Platform connection |
 | `PARENT_ID` | Empty | Parent workspace ID (set if nested) |
-| `AWARENESS_URL` | Optional | Awareness service |
-| `AWARENESS_NAMESPACE` | Optional | Scoped namespace for awareness memory |
 | `LANGFUSE_HOST` | `http://langfuse-web:3000` | Langfuse endpoint |
 | `LANGFUSE_PUBLIC_KEY` | Optional | Langfuse auth |
 | `LANGFUSE_SECRET_KEY` | Optional | Langfuse auth |
@@ -1091,20 +1087,6 @@ Every Tier 1 launch (Open Interpreter, CrewAI) had all four elements.
 }
 ```
 
-### Awareness MCP Server
-
-For persistent cross-session memory:
-
-```json
-{
-  "awareness-memory": {
-    "type": "stdio",
-    "command": "npx",
-    "args": ["-y", "@awareness-sdk/local", "mcp"]
-  }
-}
-```
-
 ---
 
 ## 29. Summary Statistics
@@ -1149,11 +1131,11 @@ Molecule AI's workspace abstraction is **runtime-agnostic by design**. A workspa
 
 ## Links
 
-- **GitHub**: https://git.moleculesai.app/molecule-ai/molecule-monorepo
-- **Architecture Docs**: https://git.moleculesai.app/molecule-ai/molecule-monorepo/src/branch/main/docs/architecture
-- **API Protocol**: https://git.moleculesai.app/molecule-ai/molecule-monorepo/src/branch/main/docs/api-protocol
-- **Agent Runtime**: https://git.moleculesai.app/molecule-ai/molecule-monorepo/src/branch/main/docs/agent-runtime
-- **Product Docs**: https://git.moleculesai.app/molecule-ai/molecule-monorepo/src/branch/main/docs/product
+- **GitHub**: https://git.moleculesai.app/molecule-ai/molecule-core
+- **Architecture Docs**: https://git.moleculesai.app/molecule-ai/molecule-core/src/branch/main/docs/architecture
+- **API Protocol**: https://git.moleculesai.app/molecule-ai/molecule-core/src/branch/main/docs/api-protocol
+- **Agent Runtime**: https://git.moleculesai.app/molecule-ai/molecule-core/src/branch/main/docs/agent-runtime
+- **Product Docs**: https://git.moleculesai.app/molecule-ai/molecule-core/src/branch/main/docs/product
 
 ---
 

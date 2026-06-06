@@ -53,8 +53,8 @@ func TestRuntimeImage_AllKnownRuntimes(t *testing.T) {
 		}
 	}
 	// Pin the count so adding a runtime requires explicit test acknowledgement.
-	if len(knownRuntimes) != 6 {
-		t.Errorf("knownRuntimes length = %d, want 6 (autogen, claude-code, codex, hermes, langgraph, openclaw)", len(knownRuntimes))
+	if len(knownRuntimes) != 5 {
+		t.Errorf("knownRuntimes length = %d, want 5 (claude-code, codex, google-adk, hermes, openclaw)", len(knownRuntimes))
 	}
 }
 

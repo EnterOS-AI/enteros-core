@@ -29,7 +29,7 @@ import (
 	"encoding/base64"
 	"strings"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/crypto"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/crypto"
 )
 
 // sensitiveFields is the set of channel_config keys that get encrypted at

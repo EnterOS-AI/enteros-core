@@ -24,6 +24,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"log"
 	"time"
 )
 
@@ -130,8 +131,10 @@ func Validate(ctx context.Context, db *sql.DB, plaintext string) (id, prefix, or
 	// Best-effort last_used_at bump. Failure here is acceptable — the
 	// request is already authenticated; we don't want a transient DB
 	// blip to flip a 200 into a 500.
-	_, _ = db.ExecContext(ctx,
-		`UPDATE org_api_tokens SET last_used_at = now() WHERE id = $1`, id)
+	if _, err := db.ExecContext(ctx,
+		`UPDATE org_api_tokens SET last_used_at = now() WHERE id = $1`, id); err != nil {
+		log.Printf("orgtoken: last_used_at bump failed for %s: %v", id, err)
+	}
 	return id, prefix, orgID, nil
 }
 
@@ -192,7 +195,10 @@ func Revoke(ctx context.Context, db *sql.DB, id string) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("orgtoken: revoke: %w", err)
 	}
-	n, _ := res.RowsAffected()
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("orgtoken: revoke RowsAffected: %w", err)
+	}
 	return n > 0, nil
 }
 

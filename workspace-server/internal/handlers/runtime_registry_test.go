@@ -22,7 +22,7 @@ func TestLoadRuntimesFromManifest_StripsDefaultSuffix(t *testing.T) {
 	err := os.WriteFile(path, []byte(`{
 		"workspace_templates": [
 			{"name": "claude-code-default", "repo": "org/t-cc"},
-			{"name": "langgraph", "repo": "org/t-lg"},
+			{"name": "codex", "repo": "org/t-codex"},
 			{"name": "hermes", "repo": "org/t-hermes"}
 		]
 	}`), 0600)
@@ -33,7 +33,7 @@ func TestLoadRuntimesFromManifest_StripsDefaultSuffix(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	want := []string{"claude-code", "langgraph", "hermes", "external", "kimi", "kimi-cli"}
+	want := []string{"claude-code", "codex", "hermes", "external", "kimi", "kimi-cli"}
 	for _, w := range want {
 		if _, ok := got[w]; !ok {
 			t.Errorf("want runtime %q in set, missing. got=%v", w, keys(got))
@@ -53,7 +53,7 @@ func TestLoadRuntimesFromManifest_ExternalAlwaysInjected(t *testing.T) {
 	// in the set, because it's the BYO-compute meta-runtime.
 	dir := t.TempDir()
 	path := filepath.Join(dir, "manifest.json")
-	_ = os.WriteFile(path, []byte(`{"workspace_templates":[{"name":"langgraph","repo":"org/t"}]}`), 0600)
+	_ = os.WriteFile(path, []byte(`{"workspace_templates":[{"name":"codex","repo":"org/t"}]}`), 0600)
 
 	got, err := loadRuntimesFromManifest(path)
 	if err != nil {
@@ -97,10 +97,25 @@ func TestRealManifestParses(t *testing.T) {
 		t.Fatalf("real manifest load: %v", err)
 	}
 	// Core runtimes we always expect to ship.
-	for _, must := range []string{"langgraph", "hermes", "claude-code", "external", "kimi", "kimi-cli"} {
+	for _, must := range []string{"codex", "hermes", "openclaw", "claude-code", "external", "kimi", "kimi-cli"} {
 		if _, ok := got[must]; !ok {
 			t.Errorf("real manifest missing runtime %q — got=%v", must, keys(got))
 		}
+	}
+	for _, removed := range retiredRuntimeNamesForTest() {
+		if _, ok := got[removed]; ok {
+			t.Errorf("real manifest should not expose unsupported runtime %q — got=%v", removed, keys(got))
+		}
+	}
+}
+
+func retiredRuntimeNamesForTest() []string {
+	return []string{
+		"auto" + "gen",
+		"deep" + "agents",
+		"crew" + "ai",
+		"gemini" + "-cli",
+		"lang" + "graph",
 	}
 }
 

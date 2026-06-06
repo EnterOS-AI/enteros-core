@@ -6,8 +6,8 @@
 # RFC#351 Step 2 of 6 (implementation MVP).
 #
 # Invoked by .gitea/workflows/sop-checklist.yml on:
-#   - pull_request_target: [opened, edited, synchronize, reopened]
-#   - issue_comment:       [created, edited, deleted]
+#   - pull_request_target: [opened, edited, synchronize, reopened, labeled, unlabeled]
+#   - issue_comment:       [created]  # edited/deleted omitted (Gitea 1.22.6 job-parsing quirk)
 #
 # Flow:
 #   1. Load .gitea/sop-checklist-config.yaml (from BASE ref — trusted).
@@ -64,11 +64,41 @@ import argparse
 import json
 import os
 import re
+import resource
 import sys
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
+
+# ---------------------------------------------------------------------------
+# Address-space guardrail (RFC#369 / task #369 follow-up to mc#1242-class OOM).
+#
+# `get_issue_comments` paginates the full comment history of a PR. On
+# bot-relay-heavy PRs (e.g. mc#291, mc#1242) this can balloon past the
+# runner's cgroup memory limit and 137 the job. Cap virtual-address-space
+# at 2 GiB so the script OOMs as a `MemoryError` (catchable / surfaceable)
+# rather than a SIGKILL we can't post a status for.
+#
+# 2 GiB is generous — a 5000-comment PR with 1 KiB minimal-dicts (see
+# get_issue_comments below) fits in ~10 MiB, leaving plenty of headroom
+# for the Python runtime + urllib + json buffers.
+#
+# Skipped under pytest / dry-run where RLIMIT_AS would interfere with
+# test runner memory needs (set SOP_CHECKLIST_NO_RLIMIT=1 to opt out).
+if not os.environ.get("SOP_CHECKLIST_NO_RLIMIT"):
+    try:
+        resource.setrlimit(resource.RLIMIT_AS, (2 * 1024**3, 2 * 1024**3))
+    except (ValueError, OSError):
+        # macOS sometimes refuses RLIMIT_AS; not fatal — the Linux runner
+        # is the only place this matters for the OOM-prevention goal.
+        pass
+
+# Per-comment body cap (task #369). The directive parser walks the body
+# line-by-line looking for ^/sop-ack ^/sop-revoke ^/sop-n/a markers — only
+# the first few KiB matter for that. Cap each comment body so a single
+# pasted-log comment can't push us past the cgroup limit.
+_MAX_BODY_BYTES = int(os.environ.get("SOP_CHECKLIST_MAX_BODY_BYTES") or 8 * 1024)
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +174,16 @@ def parse_directives(
         if not parts:
             continue
         first = parts[0]
+        # Em-dash (U+2014) is a common visual separator in user-written
+        # notes, e.g.  /sop-ack Five-Axis — five-axis-review
+        # If raw_slug contains an em-dash, split on the first one so
+        # the part before becomes the slug and the rest becomes the note.
+        note_from_slug = ""
+        slug_source = raw_slug
+        emdash_idx = raw_slug.find("—")
+        if emdash_idx != -1:
+            slug_source = raw_slug[:emdash_idx].strip()
+            note_from_slug = raw_slug[emdash_idx + 1 :].strip()
         # If the slug-capture greedily matched multiple words (e.g.
         # "comprehensive testing"), preserve normalize behavior: join
         # the WHOLE first-word-token only; trailing words get appended to
@@ -156,13 +196,19 @@ def parse_directives(
             # as slug and "testing extra-note" as note. We defer the
             # disambiguation to the caller via the returned canonical
             # slug. For simplicity: try the WHOLE captured string first.
-            canonical = normalize_slug(raw_slug, numeric_aliases)
+            canonical = normalize_slug(slug_source, numeric_aliases)
         else:
-            canonical = normalize_slug(first, numeric_aliases)
+            canonical = normalize_slug(slug_source, numeric_aliases)
         note_from_group = (m.group(3) or "").strip()
-        # If we collapsed multi-word slug into kebab and there's a
-        # trailing-text group too, append it.
-        entry = (kind, canonical, note_from_group)
+        # The em-dash (U+2014) is a visual separator; the regex puts it
+        # in group(3) because it is outside the slug character class.
+        # Strip it so "/sop-ack slug — note" yields just "note".
+        if note_from_group.startswith("—"):
+            note_from_group = note_from_group[1:].strip()
+        # Combine note_from_slug (em-dash split) with note_from_group
+        # (trailing text after the slug captured by the regex group).
+        combined_note = (note_from_slug + " " + note_from_group).strip()
+        entry = (kind, canonical, combined_note)
         if kind == "sop-n/a":
             na_directives.append(entry)
         else:
@@ -268,6 +314,7 @@ def compute_ack_state(
     items_by_slug: dict[str, dict[str, Any]],
     numeric_aliases: dict[int, str],
     team_membership_probe: "callable[[str, list[str]], list[str]]",
+    high_risk: bool = False,
 ) -> dict[str, dict[str, Any]]:
     """Compute per-item ack state.
 
@@ -307,7 +354,6 @@ def compute_ack_state(
     # Filter out self-acks and unknown slugs.
     ackers_per_slug: dict[str, list[str]] = {s: [] for s in items_by_slug}
     rejected_self: dict[str, list[str]] = {s: [] for s in items_by_slug}
-    rejected_unknown: dict[str, list[str]] = {s: [] for s in items_by_slug}
     pending_team_check: dict[str, list[str]] = {s: [] for s in items_by_slug}
 
     for (user, slug), kind in latest_directive.items():
@@ -330,11 +376,16 @@ def compute_ack_state(
     for slug, candidates in pending_team_check.items():
         if not candidates:
             continue
-        required = items_by_slug[slug]["required_teams"]
+        # Risk-class-aware required-teams resolution (RFC#450 Option C):
+        # high-risk PRs use `required_teams_high_risk` (when set on the
+        # item); default class uses `required_teams`. The probe closure
+        # is built with the same high_risk flag so the two reads are
+        # always consistent (both sites share `resolve_required_teams`).
+        required = resolve_required_teams(items_by_slug[slug], high_risk)
         approved = team_membership_probe(slug, candidates)  # returns subset
         rejected_not_in_team[slug] = [u for u in candidates if u not in approved]
         ackers_per_slug[slug] = approved
-        # Stash required teams for description rendering.
+        # Stash resolved teams for description rendering.
         items_by_slug[slug]["_required_resolved"] = required
 
     return {
@@ -454,16 +505,35 @@ class GiteaClient:
             raise RuntimeError(f"GET pulls/{pr} → HTTP {code}: {data!r}")
         return data
 
-    def get_issue_comments(
-        self, owner: str, repo: str, issue: int
-    ) -> list[dict[str, Any]]:
-        # Paginate. Gitea default page size 50.
-        out: list[dict[str, Any]] = []
+    def iter_issue_comments(
+        self, owner: str, repo: str, issue: int, page_size: int = 50
+    ) -> Iterator[dict[str, Any]]:
+        """Stream comments page-by-page, yielding ONE minimal-dict per comment.
+
+        Each yielded comment carries ONLY the fields the gate actually reads
+        — `{"user": {"login": str}, "body": str}` — and DROPS the much
+        larger Gitea-API extras (html_url, pull_request_url, issue_url,
+        assets, created_at, updated_at, id, original_author_*).
+
+        Memory motivation (task #369 / mc#1242-class OOM): full Gitea
+        comment dicts are ~2 KiB median + ~3 KiB p95. On PRs with several
+        thousand bot-relay comments the eager `list[full_dict]` shape used
+        previously pushed runner anon-rss past the cgroup limit. The
+        minimal-dict shape is ~10-20x smaller (typically ~50-100B Python
+        overhead + the body string).
+
+        The two downstream consumers (`compute_ack_state`,
+        `compute_na_state`) each iterate the comment list exactly once and
+        read only `body` + `user.login`, so dropping every other field is
+        safe. They still receive `list[dict[str, Any]]`-shaped objects so
+        the test fixtures (which already used the minimal shape) keep
+        working with no fixture changes.
+        """
         page = 1
         while True:
             code, data = self._req(
                 "GET",
-                f"/repos/{owner}/{repo}/issues/{issue}/comments?limit=50&page={page}",
+                f"/repos/{owner}/{repo}/issues/{issue}/comments?limit={page_size}&page={page}",
             )
             if code != 200:
                 raise RuntimeError(
@@ -471,10 +541,41 @@ class GiteaClient:
                 )
             if not data:
                 break
-            out.extend(data)
-            if len(data) < 50:
+            for c in data:
+                # Minimal projection — drop ALL fields the gate doesn't read.
+                user_login = ((c.get("user") or {}).get("login") or "") if isinstance(c, dict) else ""
+                body = (c.get("body") if isinstance(c, dict) else "") or ""
+                # Body-size guardrail: huge comments (e.g. pasted CI logs) can
+                # individually be MiBs. The directive parser only needs the
+                # first ~8 KiB to find /sop-ack /sop-revoke /sop-n/a markers
+                # — anything past that is filler. Truncate at 8 KiB so a
+                # single oversized comment can't OOM the runner.
+                if len(body) > _MAX_BODY_BYTES:
+                    body = body[:_MAX_BODY_BYTES]
+                yield {"user": {"login": user_login}, "body": body}
+            if len(data) < page_size:
                 break
             page += 1
+
+    def get_issue_comments(
+        self,
+        owner: str,
+        repo: str,
+        issue: int,
+        max_comments: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Paginate + collect minimal comment dicts. See `iter_issue_comments`
+        for the per-comment shape and the OOM-prevention rationale.
+
+        `max_comments` (optional, default unbounded): hard cap. When the cap
+        is hit we stop fetching further pages and the caller surfaces a
+        soft 'skipping due to volume' status (see main()).
+        """
+        out: list[dict[str, Any]] = []
+        for c in self.iter_issue_comments(owner, repo, issue):
+            out.append(c)
+            if max_comments is not None and len(out) >= max_comments:
+                break
         return out
 
     def resolve_team_id(self, org: str, team_name: str) -> int | None:
@@ -551,8 +652,11 @@ def load_config(path: str) -> dict[str, Any]:
     dep by keeping the config shape constrained.
     """
     try:
-        import yaml  # type: ignore[import-not-found]
-        with open(path) as f:
+        # yaml is an optional dep; the canonical loader is used when available,
+        # but the SOP runs on runners that may not have PyYAML installed. The
+        # fallback _load_config_minimal covers the same config shape without
+        import yaml  # type: ignore[import-not-found]  # optional dep; fall back silently if absent
+        with open(path, encoding="utf-8") as f:
             return yaml.safe_load(f)
     except ImportError:
         return _load_config_minimal(path)
@@ -566,13 +670,19 @@ def _load_config_minimal(path: str) -> dict[str, Any]:
     item map: scalars + lists of scalars. Does NOT support nested lists,
     YAML anchors, multi-doc, or flow style.
     """
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         lines = f.readlines()
     return _parse_minimal_yaml(lines)
 
 
-def _parse_minimal_yaml(lines: list[str]) -> dict[str, Any]:  # noqa: C901
-    """Hand-rolled subset parser. See _load_config_minimal docstring."""
+def _parse_minimal_yaml(lines: list[str]) -> dict[str, Any]:
+    """Hand-rolled subset parser. See _load_config_minimal docstring.
+
+    C901: function is necessarily long — it implements a finite-state YAML
+    subset (scalars, maps, lists of maps at fixed depth). No utility refactors
+    meaningfully reduce length without degrading readability. All branches
+    are exhaustively tested in test_parse_minimal_yaml.py.
+    """
     # Strip comments + blank lines but preserve indentation.
     cleaned: list[tuple[int, str]] = []
     for raw in lines:
@@ -756,13 +866,90 @@ def render_status(
 def get_tier_mode(pr: dict[str, Any], cfg: dict[str, Any]) -> str:
     """Read tier label, return 'hard' or 'soft' per cfg.tier_failure_mode."""
     labels = pr.get("labels") or []
-    tier_labels = [l.get("name", "") for l in labels if (l.get("name", "") or "").startswith("tier:")]
+    tier_labels = [label.get("name", "") for label in labels if (label.get("name", "") or "").startswith("tier:")]
     mode_map = cfg.get("tier_failure_mode") or {}
     default_mode = cfg.get("default_mode", "hard")
     for tl in tier_labels:
         if tl in mode_map:
             return mode_map[tl]
     return default_mode
+
+
+def is_high_risk(pr: dict[str, Any], cfg: dict[str, Any]) -> bool:
+    """Return True when the PR is high-risk per RFC#450 Option C.
+
+    A PR is high-risk when ANY of:
+      - it carries the `tier:high` label (mechanically strictest tier), or
+      - it carries any label listed in cfg.high_risk_labels.
+
+    High-risk PRs use `required_teams_high_risk` (when set on an item)
+    instead of the default `required_teams`. Items without
+    `required_teams_high_risk` are unaffected (the default applies).
+
+    Governance fix for internal#442 — closes the inconsistency between
+    sop-tier-check (tier-aware) and sop-checklist (was tier-blind).
+    """
+    label_set = {(label.get("name") or "") for label in (pr.get("labels") or [])}
+    if "tier:high" in label_set:
+        return True
+    high_risk_labels = set(cfg.get("high_risk_labels") or [])
+    return bool(label_set & high_risk_labels)
+
+
+def resolve_required_teams(item: dict[str, Any], high_risk: bool) -> list[str]:
+    """Pick the active required_teams list for an item.
+
+    When high_risk is True AND the item declares a non-empty
+    `required_teams_high_risk`, return that. Else fall back to
+    `required_teams`. Keeping this in one helper means the gate's
+    decision shape stays single-sited even as items grow.
+    """
+    if high_risk:
+        elevated = item.get("required_teams_high_risk") or []
+        if elevated:
+            return list(elevated)
+    return list(item.get("required_teams") or [])
+
+
+# ---------------------------------------------------------------------------
+# CI status validation for testing-class AI acks (internal#760 CTO hardening)
+# ---------------------------------------------------------------------------
+
+# Slugs that require CI / all-required green before an AI ack is valid.
+_TESTING_CLASS_SLUGS = {"comprehensive-testing", "local-postgres-e2e", "staging-smoke"}
+
+# Human-only carve-out: these items can NEVER be acked by AI, regardless
+# of config drift. Any item in this set MUST NOT have ai_ack_eligible.
+# migration / schema are future-proofing — not yet in config items, but
+# the code guard rejects them proactively (CTO hardening, msg 1388c76f).
+_HUMAN_ONLY_SLUGS = {"root-cause", "no-backwards-compat", "migration", "schema"}
+
+
+def get_ci_status(client: GiteaClient, owner: str, repo: str, sha: str) -> str:
+    """Return the state of CI / all-required (pull_request) for `sha`.
+
+    Looks through the commit statuses and returns the state string
+    ("success", "failure", "pending", "error") or "missing" if the
+    context is not found. This prevents an AI agent from attesting
+    "tests pass" independently of the actual CI run.
+    """
+    code, data = client._req(  # noqa: SLF001
+        "GET", f"/repos/{owner}/{repo}/statuses/{sha}"
+    )
+    if code != 200:
+        return "unknown"
+    if not data or not isinstance(data, list):
+        return "missing"
+    # Gitea returns statuses newest-first. Find the latest for our context.
+    for status in data:
+        if status.get("context") == "CI / all-required (pull_request)":
+            return status.get("state", "unknown")
+    return "missing"
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -788,6 +975,17 @@ def main(argv: list[str] | None = None) -> int:
             "If set, exit non-zero when state=failure. Default OFF so the "
             "job-level conclusion is independent of ack-state — the only "
             "thing BP sees is the POSTed status. Useful for local debugging."
+        ),
+    )
+    p.add_argument(
+        "--max-comments",
+        type=int,
+        default=int(os.environ.get("SOP_CHECKLIST_MAX_COMMENTS") or 5000),
+        help=(
+            "Hard cap on comments fetched from the PR. Above this we post "
+            "a SOFT-pending status with a 'skipping due to volume' note "
+            "instead of OOM'ing the runner (task #369). Override with the "
+            "SOP_CHECKLIST_MAX_COMMENTS env var. Set 0 to disable the cap."
         ),
     )
     args = p.parse_args(argv)
@@ -823,16 +1021,62 @@ def main(argv: list[str] | None = None) -> int:
         print("::error::PR payload missing user.login or head.sha", file=sys.stderr)
         return 1
 
-    comments = client.get_issue_comments(args.owner, args.repo, args.pr)
+    max_comments_cap = args.max_comments if args.max_comments and args.max_comments > 0 else None
+    comments = client.get_issue_comments(
+        args.owner, args.repo, args.pr, max_comments=max_comments_cap
+    )
+
+    # Volume short-circuit: PRs with thousands of bot-relay comments
+    # (the mc#1242-class OOM source) get a soft 'volume-skipped' status
+    # so the gate doesn't churn the runner; reviewers can re-trigger by
+    # editing the PR or filing a fresh PR with the housekeeping comments
+    # split off. Cap-hit means we couldn't see the WHOLE history, so we
+    # can't fairly post failure — pending is the safe default.
+    volume_skipped = bool(max_comments_cap and len(comments) >= max_comments_cap)
+
+    # High-risk classification (RFC#450 Option C, governance fix for
+    # internal#442). Computed ONCE per PR — used by both the probe
+    # closure and compute_ack_state so the elevation decision is
+    # single-sited.
+    high_risk = is_high_risk(pr, cfg)
 
     # Build team-membership probe closure that caches results per
     # (user, team-id) so a user acking multiple items only triggers
     # one membership lookup per team.
     team_member_cache: dict[tuple[str, int], bool | None] = {}
 
+    # Pre-resolve the ai-sop-ack team id once (None if the team does not exist).
+    ai_sop_ack_team_id = client.resolve_team_id(args.owner, "ai-sop-ack")
+
     def probe(slug: str, users: list[str]) -> list[str]:
-        item = items_by_slug[slug]
-        team_names: list[str] = item["required_teams"]
+        # `slug` may be either an items-key (compute_ack_state caller) OR
+        # an n/a-gate key (compute_na_state caller). Previously this hard
+        # KeyError'd on the n/a-gate path when slug was e.g. "security-review"
+        # — that's a config gate, not an item — so the gate would crash
+        # instead of falling back to the gate's own required_teams. Fix
+        # task #369 follow-up to issue #355.
+        if slug in items_by_slug:
+            item = items_by_slug[slug]
+            team_names: list[str] = resolve_required_teams(item, high_risk)
+        elif slug in na_gates:
+            # n/a-gate configs carry `required_teams` directly (see
+            # sop-checklist-config.yaml: n/a_gates.<gate>.required_teams).
+            gate_cfg = na_gates[slug] or {}
+            team_names = list(gate_cfg.get("required_teams") or [])
+            if not team_names:
+                print(
+                    f"::warning::n/a-gate '{slug}' has no required_teams; "
+                    "fail-closed (no users will be approved)",
+                    file=sys.stderr,
+                )
+        else:
+            # Unknown slug — fail closed, log so we can find config drift.
+            print(
+                f"::warning::probe() called with slug '{slug}' which is "
+                f"neither an items entry nor an n/a-gate; fail-closed",
+                file=sys.stderr,
+            )
+            return []
         # Resolve names → ids. NOTE: orgs/{org}/teams/search may not be
         # available — fall back to the list endpoint.
         team_ids: list[int] = []
@@ -840,14 +1084,14 @@ def main(argv: list[str] | None = None) -> int:
             tid = client.resolve_team_id(args.owner, tn)
             if tid is None:
                 # Try the list endpoint as a fallback.
-                code, data = client._req(  # noqa: SLF001
+                code, data = client._req(  # noqa: SLF001  # internal helper; called from loop in caller context
                     "GET", f"/orgs/{args.owner}/teams"
                 )
                 if code == 200 and isinstance(data, list):
                     for t in data:
                         if t.get("name") == tn:
                             tid = t.get("id")
-                            client._team_id_cache[(args.owner, tn)] = tid  # noqa: SLF001
+                            client._team_id_cache[(args.owner, tn)] = tid  # noqa: SLF001  # write-through cache; intentional side-effect for reuse across calls
                             break
             if tid is not None:
                 team_ids.append(tid)
@@ -858,14 +1102,18 @@ def main(argv: list[str] | None = None) -> int:
                     file=sys.stderr,
                 )
         approved: list[str] = []
+        rejected_ai_ineligible: list[str] = []
+        rejected_ci_not_green: list[str] = []
         for u in users:
+            # 1) Human required_teams membership check
+            in_human_team = False
             for tid in team_ids:
                 cache_key = (u, tid)
                 if cache_key not in team_member_cache:
                     team_member_cache[cache_key] = client.is_team_member(tid, u)
                 result = team_member_cache[cache_key]
                 if result is True:
-                    approved.append(u)
+                    in_human_team = True
                     break
                 if result is None:
                     print(
@@ -875,9 +1123,49 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     # Treat as not-in-team for this user/team pair; loop
                     # may still find membership in another team.
+            if in_human_team:
+                approved.append(u)
+                continue
+
+            # 2) AI-sop-ack team membership check (only for items that allow it).
+            if slug in items_by_slug:
+                item = items_by_slug[slug]
+                # Defensive: human-only carve-out is enforced in code, not just
+                # config. Even if ai_ack_eligible were mistakenly added to a
+                # migration/schema item, the AI path is rejected here.
+                if slug in _HUMAN_ONLY_SLUGS:
+                    rejected_ai_ineligible.append(u)
+                    continue
+                if item.get("ai_ack_eligible") and ai_sop_ack_team_id is not None:
+                    cache_key = (u, ai_sop_ack_team_id)
+                    if cache_key not in team_member_cache:
+                        team_member_cache[cache_key] = client.is_team_member(
+                            ai_sop_ack_team_id, u
+                        )
+                    result = team_member_cache[cache_key]
+                    if result is True:
+                        # 2a) Testing-class items require real CI artifact evidence.
+                        if slug in _TESTING_CLASS_SLUGS:
+                            ci_state = get_ci_status(
+                                client, args.owner, args.repo, head_sha
+                            )
+                            if ci_state != "success":
+                                print(
+                                    f"::warning::AI ack for {slug} rejected: "
+                                    f"CI / all-required is {ci_state}, not success",
+                                    file=sys.stderr,
+                                )
+                                rejected_ci_not_green.append(u)
+                                continue
+                        approved.append(u)
+                        continue
+            # If we get here, user is not approved for this slug.
+            rejected_ai_ineligible.append(u)
         return approved
 
-    ack_state = compute_ack_state(comments, author, items_by_slug, numeric_aliases, probe)
+    ack_state = compute_ack_state(
+        comments, author, items_by_slug, numeric_aliases, probe, high_risk=high_risk
+    )
     body_state = {it["slug"]: section_marker_present(body, it["pr_section_marker"]) for it in items}
 
     state, description = render_status(items, ack_state, body_state)
@@ -888,9 +1176,21 @@ def main(argv: list[str] | None = None) -> int:
         # were not required (vs a tier:medium+ PR that truly passed all acks).
         state = "success"
         description = f"[info tier:low] {description}"
+    if volume_skipped:
+        # Above the comment-cap — we may have a partial view. Soft-pend
+        # so neither BP nor the author gets stuck; surface the cap so
+        # reviewers know what's up. No-block at the gate level.
+        state = "pending"
+        description = (
+            f"[volume-skipped] comment-cap={max_comments_cap} hit; please file "
+            f"a fresh PR with bot-relay history split off (#369). {description}"
+        )
 
     # Diagnostics to job log.
-    print(f"::notice::PR #{args.pr} author={author} head={head_sha[:7]} mode={mode}")
+    print(
+        f"::notice::PR #{args.pr} author={author} head={head_sha[:7]} "
+        f"mode={mode} risk_class={'high' if high_risk else 'default'}"
+    )
     for it in items:
         slug = it["slug"]
         ackers = ack_state[slug]["ackers"]
@@ -944,10 +1244,13 @@ def main(argv: list[str] | None = None) -> int:
                 )
 
         na_desc = ", ".join(sorted(na_descs)) if na_descs else "(none)"
-        na_status_state = "success" if na_descs else "pending"
+        # internal#818: na-declarations is an informational context, not a merge
+        # gate. An empty declaration list is a terminal success state — pending
+        # here poisons the PR combined status.
+        na_status_state = "success"
         # review-check.sh reads the description to discover which gates are N/A.
         # Include the gate names so it can grep for them.
-        na_description = f"N/A: {na_desc}" if na_descs else "N/A: (none)"
+        na_description = f"N/A: {na_desc}"
 
         if not args.dry_run:
             client.post_status(

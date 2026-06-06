@@ -7,10 +7,11 @@
 #   PR_NUMBER  — set via ${{ github.event.pull_request.number }} from the trigger
 #   POST_COMMENT — "true" to post/update comment on PR
 #
-# Gating logic (MVP signals 1,2,3,6):
+# Gating logic (MVP signals 1,2,3,4,6):
 #   1. Author-aware agent-tag comment scan
 #   2. REQUEST_CHANGES reviews state machine
 #   3. Staleness detection (SOP-12: review.commit_id != PR.head_sha + >1 working day)
+#   4. Branch divergence / scope-creep guard (base-sha vs target HEAD; mc#365)
 #   6. CI required-checks awareness
 #
 # Exit code: 0=CLEAR, 1=BLOCKED, 2=ERROR
@@ -32,6 +33,24 @@ on:
   # iterating all open PRs when PR_NUMBER is empty.
   workflow_dispatch:
 
+# Serialize per PR (or per repo for schedule/manual ticks) to prevent
+# the fan-out OOM class documented in
+# `reference_operator_host_python3_oom_storm_2026_05_18`. `edited`
+# events fan out on every PR-body edit; combined with the hourly cron
+# and synchronize bursts this workflow can stack runs of the same
+# workflow_id on the same PR (each ~4GB anon-RSS) and trip the
+# `--memory=4g --memory-swap=8g` per-container cap.
+#
+# NO `cancel-in-progress` (defaults to false). Per
+# `feedback_janitor_supersede_must_group_by_workflow_id`, cancelling
+# in-flight runs of any required-check-shaped workflow risks the
+# dismiss_stale_approvals + empty-commit-rerun dance (Gitea 1.22.6 has
+# no REST rerun). The gate-check is `continue-on-error: true` +
+# idempotent (POST/PATCH gate-check comment by context) so sequential
+# ticks are strictly safe.
+concurrency:
+  group: gate-check-v3-${{ github.event.pull_request.number || github.event.issue.number || github.ref }}
+
 permissions:
   # read: contents — for checkout (base ref, not PR head for security)
   # read: pull-requests — for reading PR info via API
@@ -47,7 +66,7 @@ jobs:
   # bp-exempt: PR advisory bot; merge blocking is enforced by CI status and branch protection.
   gate-check:
     runs-on: ubuntu-latest
-    # mc#774: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
+    # mc#1982: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
     continue-on-error: true  # Never block on our own detector failing
     steps:
       - name: Check out BASE ref (never PR-head under pull_request_target)

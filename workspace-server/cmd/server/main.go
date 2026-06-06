@@ -1,3 +1,26 @@
+// Package main runs the per-tenant workspace-server.
+//
+//	@title			Molecule AI Workspace Server API
+//	@version		1.0
+//	@description	The per-tenant workspace-server HTTP API. Single source of truth for workspace/schedule/agent/secrets/files/memory CRUD. Hand-written clients (canvas, molecule-mcp-server, molecule-cli, molecule-sdk-python) should be replaced by clients generated from this spec — see RFC #1706.
+//	@host			api.moleculesai.app
+//	@BasePath		/
+//	@schemes		https
+//
+//	@securityDefinitions.apikey	BearerAuth
+//	@in							header
+//	@name						Authorization
+//	@description				Bearer token issued by Gitea (org-admin or persona PAT) or by the platform's signup/SSO flow.
+//
+//	@securityDefinitions.apikey	OrgSlugAuth
+//	@in							header
+//	@name						X-Molecule-Org-Slug
+//	@description				Tenant routing header — required on every /workspaces/{id}/* request so the platform edge can route to the correct per-tenant workspace-server. Either X-Molecule-Org-Slug (human-readable, e.g. "agents-team") or X-Molecule-Org-Id (UUID) must be sent; slug is preferred for client code.
+//
+//	@securityDefinitions.apikey	OrgIdAuth
+//	@in							header
+//	@name						X-Molecule-Org-Id
+//	@description				Tenant routing header (UUID form). Alternative to X-Molecule-Org-Slug. At least one of OrgSlugAuth or OrgIdAuth must be sent alongside BearerAuth.
 package main
 
 import (
@@ -12,29 +35,32 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/channels"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/crypto"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/events"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/handlers"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/imagewatch"
-	memwiring "github.com/Molecule-AI/molecule-monorepo/platform/internal/memory/wiring"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/middleware"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/pendinguploads"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/plugins"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/provisioner"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/registry"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/router"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/scheduler"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/supervised"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/ws"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/channels"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/codexauth"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/crypto"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/handlers"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/imagewatch"
+	memwiring "git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/memory/wiring"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/middleware"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/pendinguploads"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/plugins"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/registry"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/router"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/scheduler"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/supervised"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/templatecache"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/ws"
 
 	// External plugins — each registers EnvMutator(s) that run at workspace
 	// provision time. Loaded via soft-dep gates in main() so self-hosters
 	// without per-agent identity configured keep working.
 	ghidentity "go.moleculesai.app/plugin/gh-identity/pluginloader"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/pkg/provisionhook"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/pkg/provisionhook"
+	"github.com/gin-gonic/gin"
 )
 
 func main() {
@@ -54,6 +80,16 @@ func main() {
 	// is how they heal without SSH.
 	if err := refreshEnvFromCP(); err != nil {
 		log.Printf("CP env refresh: %v (continuing with baked-in env)", err)
+	}
+
+	// Managed-tenant boot assertion (cp#469 — tenant proxy-env delivery).
+	// If we're a managed SaaS tenant (orgID + adminToken set), all required
+	// LLM proxy env vars must be present after refresh. Missing keys block
+	// the tenant from booting with broken LLM creds — silent-fail is worse
+	// than a loud refusal. Self-hosted (no orgID/adminToken) short-circuits
+	// inside the assertion, so this never fires for dev.
+	if err := assertManagedTenantHasLLMEnv(); err != nil {
+		log.Fatalf("Managed tenant boot assertion: %v", err)
 	}
 
 	// Secrets encryption. In MOLECULE_ENV=prod, boot refuses to start
@@ -124,8 +160,13 @@ func main() {
 				result, err := db.DB.ExecContext(ctx, `DELETE FROM activity_logs WHERE created_at < now() - ($1 || ' days')::interval`, retentionDays)
 				if err != nil {
 					log.Printf("Activity log cleanup error: %v", err)
-				} else if n, _ := result.RowsAffected(); n > 0 {
-					log.Printf("Activity log cleanup: purged %d old entries", n)
+				} else {
+					n, err := result.RowsAffected()
+					if err != nil {
+						log.Printf("Activity log cleanup RowsAffected error: %v", err)
+					} else if n > 0 {
+						log.Printf("Activity log cleanup: purged %d old entries", n)
+					}
 				}
 			}
 		}
@@ -170,11 +211,28 @@ func main() {
 	port := envOr("PORT", "8080")
 	platformURL := envOr("PLATFORM_URL", fmt.Sprintf("http://host.docker.internal:%s", port))
 	configsDir := envOr("CONFIGS_DIR", findConfigsDir())
+	templateCacheDir := envOr("TEMPLATE_CACHE_DIR", filepath.Join(os.TempDir(), "molecule-template-cache"))
+	manifestPath := findWorkspaceManifestPath()
+	templateToken := templateCacheToken()
+	refreshTemplates := func(ctx context.Context) (templatecache.RefreshReport, error) {
+		return templatecache.RefreshWorkspaceTemplates(ctx, manifestPath, templateCacheDir, templateToken)
+	}
+	if shouldRefreshTemplateCache(templateToken, manifestPath) {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		report, err := refreshTemplates(ctx)
+		cancel()
+		if err != nil {
+			log.Printf("template cache refresh: %v (continuing with baked templates)", err)
+		} else {
+			log.Printf("template cache refresh: refreshed %d workspace templates into %s", len(report.Results), templateCacheDir)
+		}
+	}
 
 	// Init order: wh → onWorkspaceOffline → liveness/healthSweep → router
 	// WorkspaceHandler is created before the router so RestartByID can be wired into
 	// the offline callbacks used by both the liveness monitor and the health sweep.
-	wh := handlers.NewWorkspaceHandler(broadcaster, prov, platformURL, configsDir)
+	wh := handlers.NewWorkspaceHandler(broadcaster, prov, platformURL, configsDir).
+		WithTemplateCacheDir(templateCacheDir)
 	if cpProv != nil {
 		wh.SetCPProvisioner(cpProv)
 	}
@@ -187,6 +245,12 @@ func main() {
 	memBundle := memwiring.Build(db.DB)
 	if memBundle != nil {
 		wh.WithNamespaceCleanup(memBundle.NamespaceCleanupFn())
+		// Issue #1755: route workspace-create `initial_memories` through
+		// the v2 plugin instead of the legacy `agent_memories` table.
+		// Same plugin client the MCP tools use, same namespace
+		// (`workspace:<id>`); writes are visible to subsequent
+		// `recall_memory` calls on the same workspace.
+		wh.WithSeedMemoryPlugin(memBundle.Plugin)
 	}
 
 	// External-plugin env mutators — each plugin contributes 0+ mutators
@@ -273,6 +337,25 @@ func main() {
 		})
 	}
 
+	// CP-mode instance-state reconciler — authoritative EC2-liveness pass
+	// for SaaS workspaces (core#2261). Every other liveness sweep keys off
+	// a PROXY (Redis TTL, agent heartbeat, local Docker, or
+	// runtime='external'); a SaaS claude-code workspace whose EC2 was
+	// terminated/stopped falls through ALL of them and stays status='online'
+	// pointing at a dead instance_id forever (root cause: core#2247). This
+	// loop asks the ONE authoritative question the others lack —
+	// cpProv.IsRunning (CP DescribeInstances-equivalent) — for each online
+	// SaaS row, and on a CLEAN "not running" feeds it into the SAME
+	// onWorkspaceOffline closure the other sweeps use (status flip +
+	// RestartByID reprovision, existing volume). Fail-safe: IsRunning is
+	// (true, err) on any transient error, so a CP blip never flips a healthy
+	// workspace.
+	if cpProv != nil {
+		go supervised.RunWithRecover(ctx, "cp-instance-reconciler", func(c context.Context) {
+			registry.StartCPInstanceReconciler(c, cpProv, onWorkspaceOffline, 60*time.Second)
+		})
+	}
+
 	// Pending-uploads GC sweep — deletes acked rows past their retention
 	// window plus unacked rows past expires_at. Without this the
 	// pending_uploads table grows unbounded; even with the 24h hard TTL,
@@ -280,6 +363,30 @@ func main() {
 	go supervised.RunWithRecover(ctx, "pending-uploads-sweeper", func(c context.Context) {
 		pendinguploads.StartSweeper(c, pendinguploads.NewPostgres(db.DB), 0)
 	})
+
+	// Codex shared-OAuth central refresher — the SINGLE owner of the rotating
+	// refresh_token for the global codex (ChatGPT/Codex subscription) credential
+	// (global_secrets key CODEX_AUTH_JSON). Multiple codex workspaces share ONE
+	// ChatGPT-Pro OAuth token; OpenAI's refresh_token is single-use, so letting
+	// each per-agent app-server refresh on its own 401 burned the seed within
+	// seconds (a refresh storm). This goroutine is structurally single-flight
+	// (one goroutine + a package mutex), refreshes only within a safety margin
+	// of expiry, POSTs the refresh_token at most once per due cycle, and writes
+	// the rotated blob back — workspaces now only GET the current token (see the
+	// codex template's codex_auth_sync.sh). INERT when no CODEX_AUTH_JSON exists.
+	go supervised.RunWithRecover(ctx, "codex-auth-refresher", func(c context.Context) {
+		codexauth.StartCodexAuthRefresher(c, db.DB)
+	})
+
+	// RFC internal#742 Part 2: wire the boot-failure rescue capture into
+	// the provision-timeout sweep's failure verdict. When the sweep flips
+	// a stuck workspace to `failed`, this hook captures a forensic rescue
+	// bundle off the still-running (but boot-failed) EC2 and ships it to
+	// obs/Loki before the control plane reaps the instance. Best-effort +
+	// non-blocking (handlers.BootFailureRescueHook dispatches on its own
+	// goroutine + timeout). The handler-side boot-failure path
+	// (WorkspaceHandler.BootstrapFailed) wires its own capture inline.
+	registry.BootFailureRescueHook = handlers.BootFailureRescueHook
 
 	// Provision-timeout sweep — flips workspaces that have been stuck in
 	// status='provisioning' past the timeout window to 'failed' and emits
@@ -348,7 +455,12 @@ func main() {
 	// require a plugins/ dir on disk (nil in CP/SaaS mode).
 	pluginRegistry := plugins.NewRegistry()
 	pluginRegistry.Register(plugins.NewGithubResolver())
-	r := router.Setup(hub, broadcaster, prov, platformURL, configsDir, wh, channelMgr, memBundle, pluginRegistry)
+	refreshTemplatesHTTP := func(c *gin.Context) (any, error) {
+		ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Minute)
+		defer cancel()
+		return refreshTemplates(ctx)
+	}
+	r := router.Setup(hub, broadcaster, prov, platformURL, configsDir, templateCacheDir, wh, channelMgr, memBundle, pluginRegistry, refreshTemplatesHTTP)
 
 	// Plugin drift sweeper — periodic detection of upstream plugin version drift
 	// (core#123). Scans workspace_plugins rows where tracked_ref != 'none',
@@ -362,24 +474,22 @@ func main() {
 
 	// HTTP server with graceful shutdown.
 	//
-	// Bind host: in dev-mode (no ADMIN_TOKEN, MOLECULE_ENV=dev|development)
-	// the AdminAuth chain fails open by design; pairing that with a wildcard
-	// bind would expose unauth /workspaces to any same-LAN peer. Default to
-	// loopback when fail-open is active. Operators who need LAN exposure set
-	// BIND_ADDR=0.0.0.0 explicitly. Production (ADMIN_TOKEN set) is unchanged.
-	// See molecule-core#7.
+	// Bind host: in local dev (MOLECULE_ENV=dev|development) default the
+	// listener to loopback as defense-in-depth — a dev box shouldn't be
+	// reachable from the LAN. This is NOT an auth lever (auth is fail-closed
+	// in every env now); it's strictly the safer default. Operators who need
+	// LAN exposure set BIND_ADDR=0.0.0.0 explicitly. Production binds all
+	// interfaces (existing shape). See molecule-core#7.
 	bindHost := resolveBindHost()
 	srv := &http.Server{
-		Addr:    fmt.Sprintf("%s:%s", bindHost, port),
-		Handler: r,
+		Addr:              fmt.Sprintf("%s:%s", bindHost, port),
+		Handler:           r,
+		ReadHeaderTimeout: 5 * time.Second,
 	}
 
 	// Start server in goroutine
 	go func() {
-		log.Printf("Platform starting on %s:%s (dev-mode-fail-open=%v)", bindHost, port, middleware.IsDevModeFailOpen())
-		if handlers.TestTokensEnabled() {
-			log.Printf("NOTE: /admin/workspaces/:id/test-token is ENABLED (MOLECULE_ENV=%q — set MOLECULE_ENV=production in staging/prod to lock this route)", os.Getenv("MOLECULE_ENV"))
-		}
+		log.Printf("Platform starting on %s:%s (local-dev-env=%v)", bindHost, port, middleware.IsLocalDevEnv())
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Server failed: %v", err)
 		}
@@ -418,20 +528,20 @@ func envOr(key, fallback string) string {
 //
 // Precedence:
 //  1. BIND_ADDR — explicit operator override (any value, including "0.0.0.0").
-//  2. dev-mode fail-open active → "127.0.0.1" (loopback only).
+//  2. local dev (MOLECULE_ENV=dev|development) → "127.0.0.1" (loopback only).
 //  3. otherwise → "" (Go binds every interface; existing prod/self-host shape).
 //
-// Coupling the loopback default to middleware.IsDevModeFailOpen() means the
-// two safety levers — bind narrowness and auth strength — move together. A
-// production deploy (ADMIN_TOKEN set) keeps binding to all interfaces because
-// the auth chain is doing its job; a dev Mac (no ADMIN_TOKEN, MOLECULE_ENV=dev)
-// is reachable only via loopback because the auth chain is fail-open. See
-// molecule-core#7 for the original LAN exposure finding.
+// NOTE (harden/no-fail-open-auth): this is a defense-in-depth default, NOT an
+// auth lever. Auth is fail-closed in every environment now, so the loopback
+// default no longer compensates for a weak auth chain — it simply keeps a dev
+// box off the LAN by default. It is keyed on MOLECULE_ENV alone (decoupled
+// from ADMIN_TOKEN), because dev now provisions an ADMIN_TOKEN yet should
+// still default to loopback. See molecule-core#7 for the original LAN finding.
 func resolveBindHost() string {
 	if v := os.Getenv("BIND_ADDR"); v != "" {
 		return v
 	}
-	if middleware.IsDevModeFailOpen() {
+	if middleware.IsLocalDevEnv() {
 		return "127.0.0.1"
 	}
 	return ""
@@ -464,6 +574,40 @@ func findConfigsDir() string {
 		}
 	}
 	return "workspace-configs-templates"
+}
+
+func findWorkspaceManifestPath() string {
+	if v := os.Getenv("WORKSPACE_MANIFEST_PATH"); v != "" {
+		return v
+	}
+	for _, p := range []string{"/app/manifest.json", "manifest.json", "../manifest.json", "../../manifest.json"} {
+		if abs, err := filepath.Abs(p); err == nil {
+			if _, err := os.Stat(abs); err == nil {
+				return abs
+			}
+		}
+	}
+	return ""
+}
+
+func templateCacheToken() string {
+	for _, key := range []string{"MOLECULE_TEMPLATE_GITEA_TOKEN", "MOLECULE_GITEA_TOKEN"} {
+		if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func shouldRefreshTemplateCache(token, manifestPath string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("TEMPLATE_CACHE_REFRESH"))) {
+	case "0", "false", "off", "no":
+		return false
+	case "1", "true", "on", "yes":
+		return token != "" && manifestPath != ""
+	default:
+		return token != "" && manifestPath != ""
+	}
 }
 
 func findMigrationsDir() string {

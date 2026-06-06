@@ -7,9 +7,9 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/events"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/models"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
 )
 
 // ProvisionTimeoutEmitter is the narrow broadcaster dependency the sweeper
@@ -21,8 +21,8 @@ type ProvisionTimeoutEmitter interface {
 
 // DefaultProvisioningTimeout is how long a workspace may sit in
 // status='provisioning' before the sweeper flips it to 'failed'.
-// Default for non-hermes runtimes (claude-code, langgraph, crewai,
-// autogen, etc.) which cold-boot in <5 min. The container-launch path
+// Default for non-hermes runtimes (claude-code, codex, openclaw, etc.)
+// which cold-boot in <5 min. The container-launch path
 // has its own 3-minute context timeout (provisioner.ProvisionTimeout)
 // but that only bounds the docker API call — a container that started
 // but crashes before /registry/register never triggers that path and
@@ -92,6 +92,23 @@ func provisioningTimeoutFor(runtime string, lookup RuntimeTimeoutLookup) time.Du
 	return DefaultProvisioningTimeout
 }
 
+// BootFailureRescueHook, when wired, is invoked once per workspace the
+// sweep flips from `provisioning` to `failed` — i.e. on the boot-failure
+// verdict, BEFORE the control plane reaps the instance. It captures a
+// forensic rescue bundle off the still-running (but boot-failed) EC2 and
+// ships it to obs/Loki (RFC internal#742 Part 2). Wired in main.go to
+// handlers.captureRescueBundle via a thin adapter; nil in tests + on
+// self-hosted deploys (no rescue shipping there).
+//
+// Function-typed injection (not an import of handlers) keeps the
+// existing handlers→registry import direction intact — registry must not
+// import handlers.
+//
+// MUST be best-effort + non-blocking: the hook itself dispatches the
+// capture on its own goroutine with its own timeout, so the sweep loop
+// is never slowed or blocked by a hung EIC tunnel on the dead box.
+var BootFailureRescueHook func(workspaceID, instanceID, reason string)
+
 // StartProvisioningTimeoutSweep periodically scans for workspaces stuck in
 // `status='provisioning'` past the timeout window, flips them to `failed`,
 // and broadcasts a WORKSPACE_PROVISION_TIMEOUT event so the canvas can
@@ -144,7 +161,7 @@ func sweepStuckProvisioning(ctx context.Context, emitter ProvisionTimeoutEmitter
 	// flight, not historical) and the partial index on status keeps
 	// it fast.
 	rows, err := db.DB.QueryContext(ctx, `
-		SELECT id, COALESCE(runtime, ''), EXTRACT(EPOCH FROM (now() - updated_at))::int
+		SELECT id, COALESCE(runtime, ''), COALESCE(instance_id, ''), EXTRACT(EPOCH FROM (now() - updated_at))::int
 		FROM workspaces
 		WHERE status = 'provisioning'
 	`)
@@ -155,16 +172,20 @@ func sweepStuckProvisioning(ctx context.Context, emitter ProvisionTimeoutEmitter
 	defer rows.Close()
 
 	type candidate struct {
-		id      string
-		runtime string
-		ageSec  int
+		id         string
+		runtime    string
+		instanceID string
+		ageSec     int
 	}
 	var ids []candidate
 	for rows.Next() {
 		var c candidate
-		if err := rows.Scan(&c.id, &c.runtime, &c.ageSec); err == nil {
+		if err := rows.Scan(&c.id, &c.runtime, &c.instanceID, &c.ageSec); err == nil {
 			ids = append(ids, c)
 		}
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("Provision-timeout sweep: rows error: %v", err)
 	}
 
 	for _, c := range ids {
@@ -187,12 +208,29 @@ func sweepStuckProvisioning(ctx context.Context, emitter ProvisionTimeoutEmitter
 			log.Printf("Provision-timeout sweep: failed to flip %s to failed: %v", c.id, err)
 			continue
 		}
-		affected, _ := res.RowsAffected()
+		affected, err := res.RowsAffected()
+		if err != nil {
+			log.Printf("Provision-timeout sweep: RowsAffected error for %s: %v", c.id, err)
+			continue
+		}
 		if affected == 0 {
 			// Raced with restart / register — no harm, just skip.
 			continue
 		}
 		log.Printf("Provision-timeout sweep: %s (runtime=%q) stuck in provisioning > %s — marked failed", c.id, c.runtime, timeout)
+
+		// RFC internal#742 Part 2: this flip is a boot-failure verdict.
+		// The instance is still running (the CP reaps it shortly after);
+		// capture a forensic rescue bundle off it NOW, before teardown.
+		// Best-effort + non-blocking — the hook dispatches on its own
+		// goroutine + timeout, so a hung EIC tunnel on the dead box can't
+		// slow the sweep. Only fires on a real flip (affected==1), never
+		// on a race (affected==0) or a non-overdue row — guaranteeing it
+		// runs once per boot-failure verdict and never on a healthy row.
+		if BootFailureRescueHook != nil {
+			BootFailureRescueHook(c.id, c.instanceID, "provision_timeout_sweep")
+		}
+
 		// Emit as WORKSPACE_PROVISION_FAILED, not _TIMEOUT, because the
 		// canvas event handler only flips node state on the _FAILED case.
 		// A separate event type was considered but the UI reaction is

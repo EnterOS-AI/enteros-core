@@ -17,14 +17,14 @@ This path is aligned to the current repository and current UI. It gets you from 
 ## The one-command path
 
 ```bash
-git clone https://git.moleculesai.app/molecule-ai/molecule-monorepo.git
-cd molecule-monorepo
+git clone https://git.moleculesai.app/molecule-ai/molecule-core.git
+cd molecule-core
 ./scripts/dev-start.sh
 ```
 
 That single script:
 
-1. Generates an `ADMIN_TOKEN` into `.env` (first run only — preserved on re-runs)
+1. Generates an `ADMIN_TOKEN` into `.env` (first run only — preserved on re-runs) and exports the matching `NEXT_PUBLIC_ADMIN_TOKEN` so the canvas authenticates with it. Auth is **fail-closed in every environment** (including local dev) — there is no dev-mode fail-open; the canvas reaches admin/workspace routes only because it sends this bearer.
 2. Brings up Postgres, Redis, Langfuse, ClickHouse, and Temporal via `infra/scripts/setup.sh`
 3. Populates the workspace template + plugin registry from `manifest.json`
 4. Builds and starts the platform on `http://localhost:8080`
@@ -42,8 +42,8 @@ If you'd rather run each component yourself — useful when you're iterating on 
 ### Step 1: Clone the repository
 
 ```bash
-git clone https://git.moleculesai.app/molecule-ai/molecule-monorepo.git
-cd molecule-monorepo
+git clone https://git.moleculesai.app/molecule-ai/molecule-core.git
+cd molecule-core
 ```
 
 ### Step 2: Start the shared infrastructure
@@ -62,11 +62,17 @@ If you only want the raw compose flow:
 docker compose -f docker-compose.infra.yml up -d
 ```
 
+> **Auth is fail-closed even in local dev.** Pick any local admin token and
+> set it on *both* sides — the platform (`ADMIN_TOKEN`) and the canvas
+> (`NEXT_PUBLIC_ADMIN_TOKEN`, same value). Without it the canvas 401s on every
+> admin/workspace call. (`scripts/dev-start.sh` does this for you; the manual
+> steps below set it explicitly.)
+
 ### Step 3: Start the platform
 
 ```bash
 cd workspace-server
-go run ./cmd/server
+ADMIN_TOKEN=dev-local-admin-token MOLECULE_ENV=development go run ./cmd/server
 ```
 
 The control plane listens on `http://localhost:8080`.
@@ -78,7 +84,7 @@ In a new terminal:
 ```bash
 cd canvas
 npm install
-npm run dev
+NEXT_PUBLIC_ADMIN_TOKEN=dev-local-admin-token npm run dev   # MUST match ADMIN_TOKEN above
 ```
 
 Open `http://localhost:3000`.
@@ -238,7 +244,7 @@ No inbound firewall rules needed — the agent initiates the outbound WebSocket 
 ## What To Try Next
 
 - **Expand to a team:** right-click a workspace and choose `Expand to Team`.
-- **Switch runtime:** use `Config -> Runtime` to move between LangGraph, DeepAgents, Claude Code, CrewAI, AutoGen, and OpenClaw.
+- **Switch runtime:** use `Config -> Runtime` to move between Claude Code, Codex, Hermes, and OpenClaw.
 - **Inspect operations:** check `Activity`, `Traces`, `Events`, and `Terminal`.
 - **Use global keys:** configure one provider once in `Secrets & API Keys -> Global`.
 - **Import a template:** use the template palette or `POST /templates/import`.
@@ -268,7 +274,7 @@ Browser  -->  Canvas (Next.js :3000)
                                 |
                                 v
                        Provisioned workspaces
-                     (LangGraph / Claude Code / CrewAI / AutoGen / etc.)
+                     (Claude Code / Codex / Hermes / OpenClaw)
 ```
 
 For the full system model, see [Architecture](./architecture/architecture.md).

@@ -5,8 +5,8 @@ import (
 	"log"
 	"net/http"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/events"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
 	"github.com/gin-gonic/gin"
 )
 
@@ -34,7 +34,10 @@ func (h *ApprovalsHandler) Create(c *gin.Context) {
 		return
 	}
 
-	ctxJSON, _ := json.Marshal(body.Context)
+	ctxJSON, marshalErr := json.Marshal(body.Context)
+	if marshalErr != nil {
+		log.Printf("Approvals create %s: json.Marshal context failed: %v", workspaceID, marshalErr)
+	}
 	if ctxJSON == nil {
 		ctxJSON = []byte("{}")
 	}
@@ -51,23 +54,29 @@ func (h *ApprovalsHandler) Create(c *gin.Context) {
 		return
 	}
 
-	h.broadcaster.RecordAndBroadcast(ctx, string(events.EventApprovalRequested), workspaceID, map[string]interface{}{
+	if err := h.broadcaster.RecordAndBroadcast(ctx, string(events.EventApprovalRequested), workspaceID, map[string]interface{}{
 		"approval_id": approvalID,
 		"action":      body.Action,
 		"reason":      body.Reason,
 		"task_id":     body.TaskID,
-	})
+	}); err != nil {
+		log.Printf("approvals: failed to broadcast approval requested: %v", err)
+	}
 
 	// Auto-escalate to parent
 	var parentID *string
-	db.DB.QueryRowContext(ctx, `SELECT parent_id FROM workspaces WHERE id = $1`, workspaceID).Scan(&parentID)
+	if err := db.DB.QueryRowContext(ctx, `SELECT parent_id FROM workspaces WHERE id = $1`, workspaceID).Scan(&parentID); err != nil {
+		log.Printf("approvals: failed to lookup parent for escalation: %v", err)
+	}
 	if parentID != nil {
-		h.broadcaster.RecordAndBroadcast(ctx, string(events.EventApprovalEscalated), *parentID, map[string]interface{}{
+		if err := h.broadcaster.RecordAndBroadcast(ctx, string(events.EventApprovalEscalated), *parentID, map[string]interface{}{
 			"approval_id":       approvalID,
 			"from_workspace_id": workspaceID,
 			"action":            body.Action,
 			"reason":            body.Reason,
-		})
+		}); err != nil {
+			log.Printf("approvals: failed to broadcast approval escalated: %v", err)
+		}
 	}
 
 	c.JSON(http.StatusCreated, gin.H{"approval_id": approvalID, "status": "pending"})
@@ -80,10 +89,12 @@ func (h *ApprovalsHandler) ListAll(c *gin.Context) {
 	ctx := c.Request.Context()
 
 	// Auto-expire stale approvals (older than 10 min)
-	db.DB.ExecContext(ctx, `
+	if _, err := db.DB.ExecContext(ctx, `
 		UPDATE approval_requests SET status = 'denied', decided_by = 'auto-expired', decided_at = now()
 		WHERE status = 'pending' AND created_at < now() - interval '10 minutes'
-	`)
+	`); err != nil {
+		log.Printf("approvals: auto-expire failed: %v", err)
+	}
 
 	rows, err := db.DB.QueryContext(ctx, `
 		SELECT a.id, a.workspace_id, w.name, a.action, a.reason, a.status, a.created_at
@@ -200,7 +211,12 @@ func (h *ApprovalsHandler) Decide(c *gin.Context) {
 		return
 	}
 
-	rows, _ := result.RowsAffected()
+	rows, err := result.RowsAffected()
+	if err != nil {
+		log.Printf("Approval decision RowsAffected error approval=%s workspace=%s: %v", approvalID, workspaceID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update"})
+		return
+	}
 	if rows == 0 {
 		c.JSON(http.StatusNotFound, gin.H{"error": "approval not found or already decided"})
 		return
@@ -211,11 +227,13 @@ func (h *ApprovalsHandler) Decide(c *gin.Context) {
 		eventType = "APPROVAL_DENIED"
 	}
 
-	h.broadcaster.RecordAndBroadcast(ctx, eventType, workspaceID, map[string]interface{}{
+	if err := h.broadcaster.RecordAndBroadcast(ctx, eventType, workspaceID, map[string]interface{}{
 		"approval_id": approvalID,
 		"decision":    body.Decision,
 		"decided_by":  decidedBy,
-	})
+	}); err != nil {
+		log.Printf("approvals: failed to broadcast approval decision: %v", err)
+	}
 
 	c.JSON(http.StatusOK, gin.H{"status": body.Decision, "approval_id": approvalID})
 }

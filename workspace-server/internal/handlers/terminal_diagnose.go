@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -11,9 +12,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/db"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/provisioner"
-	"github.com/Molecule-AI/molecule-monorepo/platform/internal/wsauth"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wsauth"
 	"github.com/gin-gonic/gin"
 )
 
@@ -119,9 +120,11 @@ func (h *TerminalHandler) HandleDiagnose(c *gin.Context) {
 	}
 
 	var instanceID string
-	_ = db.DB.QueryRowContext(ctx,
+	if err := db.DB.QueryRowContext(ctx,
 		`SELECT COALESCE(instance_id, '') FROM workspaces WHERE id = $1`,
-		workspaceID).Scan(&instanceID)
+		workspaceID).Scan(&instanceID); err != nil {
+		log.Printf("terminal diagnose: instance_id query failed for workspace %s: %v", workspaceID, err)
+	}
 
 	var res diagnoseResult
 	if instanceID != "" {
