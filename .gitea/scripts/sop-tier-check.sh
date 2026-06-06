@@ -48,7 +48,6 @@ set -euo pipefail
 # workflow-level jq install can fail on runners with network restrictions
 # (GitHub releases not reachable from some runner networks — infra#241
 # follow-up). This fallback is idempotent — no-op when jq is already on PATH.
-# SOP_FAIL_OPEN=1 makes this always exit 0 so CI never blocks on jq absence.
 if ! command -v jq >/dev/null 2>&1; then
   echo "::notice::jq not found on PATH — attempting install..."
   _jq_installed="no"
@@ -67,12 +66,6 @@ if ! command -v jq >/dev/null 2>&1; then
   if ! command -v jq >/dev/null 2>&1; then
     echo "::error::jq installation failed — apt-get and GitHub binary both failed."
     echo "::error::sop-tier-check requires jq for all JSON API parsing."
-    # SOP_FAIL_OPEN=1 is set in the workflow step's env — makes script always
-    # exit 0 so CI never blocks. The SOP-6 tier review gate remains enforced.
-    if [ "${SOP_FAIL_OPEN:-}" = "1" ]; then
-      echo "::warning::SOP_FAIL_OPEN=1 — exiting 0 so CI does not block."
-      exit 0
-    fi
     exit 1
   fi
 fi
@@ -101,15 +94,10 @@ echo "::notice::tier-check start: repo=$OWNER/$NAME pr=$PR_NUMBER author=$PR_AUT
 # cause the script to exit prematurely when the token is empty/invalid — the
 # if check below handles that case gracefully. Without || true, a 401 from an
 # empty/invalid token causes jq to exit 1, triggering set -e and exiting the
-# entire script before SOP_FAIL_OPEN can be evaluated (the check is in the jq-
-# install block; if jq is already on PATH, that block is skipped entirely).
+# entire script before the error can be logged.
 WHOAMI=$(curl -sS -H "$AUTH" "${API}/user" | jq -r '.login // ""') || true
 if [ -z "$WHOAMI" ]; then
   echo "::error::GITEA_TOKEN cannot resolve a user via /api/v1/user — check the token scope and that the secret is wired correctly."
-  if [ "${SOP_FAIL_OPEN:-}" = "1" ]; then
-    echo "::warning::SOP_FAIL_OPEN=1 — exiting 0 so CI does not block."
-    exit 0
-  fi
   exit 1
 fi
 echo "::notice::token resolves to user: $WHOAMI"
@@ -119,10 +107,6 @@ echo "::notice::token resolves to user: $WHOAMI"
 HEAD_SHA=$(curl -sS -H "$AUTH" "${API}/repos/${OWNER}/${NAME}/pulls/${PR_NUMBER}" | jq -r '.head.sha // ""') || true
 if [ -z "$HEAD_SHA" ]; then
   echo "::error::Failed to fetch PR head SHA — token may be invalid."
-  if [ "${SOP_FAIL_OPEN:-}" = "1" ]; then
-    echo "::warning::SOP_FAIL_OPEN=1 — exiting 0 so CI does not block."
-    exit 0
-  fi
   exit 1
 fi
 debug "pr-head-sha=$HEAD_SHA"
@@ -215,10 +199,6 @@ if [ "${SOP_DEBUG:-}" = "1" ]; then
 fi
 if [ "$_HTTP_EXIT" -ne 0 ] || [ "$HTTP_CODE" != "200" ]; then
   echo "::error::GET /orgs/${OWNER}/teams failed (curl exit=$_HTTP_EXIT HTTP=$HTTP_CODE) — token may lack read:org scope or be invalid."
-  if [ "${SOP_FAIL_OPEN:-}" = "1" ]; then
-    echo "::warning::SOP_FAIL_OPEN=1 — exiting 0 so CI does not block."
-    exit 0
-  fi
   exit 1
 fi
 
@@ -265,17 +245,13 @@ done
 
 # 5. Read approving reviewers. set +e disables set -e temporarily so that curl
 # failures (e.g. empty/invalid token → HTTP 401) do not abort the script before
-# SOP_FAIL_OPEN is evaluated. set -e is restored immediately after.
+# set -e is restored immediately after.
 set +e
 REVIEWS=$(curl -sS -H "$AUTH" "${API}/repos/${OWNER}/${NAME}/pulls/${PR_NUMBER}/reviews")
 _REVIEWS_EXIT=$?
 set -e
 if [ $_REVIEWS_EXIT -ne 0 ] || [ -z "$REVIEWS" ]; then
   echo "::error::Failed to fetch reviews (curl exit=$_REVIEWS_EXIT) — token may be invalid or unreachable."
-  if [ "${SOP_FAIL_OPEN:-}" = "1" ]; then
-    echo "::warning::SOP_FAIL_OPEN=1 — exiting 0 so CI does not block."
-    exit 0
-  fi
   exit 1
 fi
 APPROVERS=$(echo "$REVIEWS" | jq -r --arg head_sha "$HEAD_SHA" '[.[] | select(.state=="APPROVED" and .commit_id == $head_sha) | .user.login] | unique | .[]') || true
