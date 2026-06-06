@@ -84,16 +84,21 @@ fi
 # for graceful defaults instead of bash || true guards. This was re-added by
 # 8c343e3a ("fix(gitea): add || true guards to jq pipelines") — reverted
 # here because the guards mask silent failures that hide malformed API responses.
-MERGE_SHA=$(echo "$PR" | jq -r '.merge_commit_sha // empty')
-MERGED_BY=$(echo "$PR" | jq -r '.merged_by.login // "unknown"')
+#
+# FAIL-CLOSED: every field we need for the audit must be present in the 200
+# payload. A missing field means the response is untrustworthy — we must NOT
+# silently skip the audit or emit an anonymous/unattributable event.
+for field in merge_commit_sha merged_by base.ref head.sha; do
+  if ! echo "$PR" | jq -e "has(\"${field%%.*}\")" >/dev/null; then
+    echo "::error::GET /pulls/${PR_NUMBER} returned HTTP 200 but payload missing '${field}' field — cannot evaluate force-merge."
+    exit 1
+  fi
+done
+MERGE_SHA=$(echo "$PR" | jq -r '.merge_commit_sha')
+MERGED_BY=$(echo "$PR" | jq -r '.merged_by.login')
 TITLE=$(echo "$PR" | jq -r '.title // ""')
-BASE_BRANCH=$(echo "$PR" | jq -r '.base.ref // "main"')
-HEAD_SHA=$(echo "$PR" | jq -r '.head.sha // empty')
-
-if [ -z "$MERGE_SHA" ]; then
-  echo "::warning::PR #${PR_NUMBER} merged=true but no merge_commit_sha — cannot evaluate force-merge."
-  exit 0
-fi
+BASE_BRANCH=$(echo "$PR" | jq -r '.base.ref')
+HEAD_SHA=$(echo "$PR" | jq -r '.head.sha')
 
 # 2. Required status checks — branch-aware JSON dict takes precedence.
 if [ -n "${REQUIRED_CHECKS_JSON:-}" ]; then
@@ -120,10 +125,16 @@ if [ "$STATUS_HTTP" != "200" ]; then
   echo "::error::GET /commits/${HEAD_SHA}/status returned HTTP ${STATUS_HTTP} — cannot evaluate required checks."
   exit 1
 fi
+# FAIL-CLOSED: a 200 status response missing the 'statuses' array must NOT be
+# treated as "no checks" (that would silently declare all checks green).
+if ! echo "$STATUS" | jq -e 'has("statuses")' >/dev/null; then
+  echo "::error::GET /commits/${HEAD_SHA}/status returned HTTP 200 but payload missing 'statuses' field — cannot evaluate required checks."
+  exit 1
+fi
 declare -A CHECK_STATE
 while IFS=$'\t' read -r ctx state; do
   [ -n "$ctx" ] && CHECK_STATE[$ctx]="$state"
-done < <(echo "$STATUS" | jq -r '.statuses // [] | .[] | "\(.context)\t\(.status)"')
+done < <(echo "$STATUS" | jq -r '.statuses | .[] | "\(.context)\t\(.status)"')
 
 # 4. For each required check, was it green at merge? YAML block scalars
 #    (`|`) leave a trailing newline; skip blank/whitespace-only lines.
