@@ -142,7 +142,7 @@ func ghcrAuthHeader() string {
 		log.Printf("workspace-images: failed to marshal GHCR auth: %v", err)
 		return ""
 	}
-	return base64.URLEncoding.EncodeToString(js)
+	return base64.StdEncoding.EncodeToString(js)
 }
 
 // Refresh pulls the requested runtimes' template images from GHCR and (if
