@@ -66,7 +66,14 @@ if [ "$PR_HTTP" != "200" ]; then
   echo "::error::GET /pulls/${PR_NUMBER} returned HTTP ${PR_HTTP} — cannot evaluate merge state."
   exit 1
 fi
-MERGED=$(echo "$PR" | jq -r '.merged // false')
+# FAIL-CLOSED: a 200 response with a missing/malformed `merged` field must
+# NOT be treated as "not merged" (that would silently skip the audit).
+# Abort so the operator knows the API response is untrustworthy.
+if ! echo "$PR" | jq -e 'has("merged")' >/dev/null; then
+  echo "::error::GET /pulls/${PR_NUMBER} returned HTTP 200 but payload missing 'merged' field — cannot evaluate merge state."
+  exit 1
+fi
+MERGED=$(echo "$PR" | jq -r '.merged')
 if [ "$MERGED" != "true" ]; then
   echo "::notice::PR #${PR_NUMBER} closed without merge — no audit emission."
   exit 0
