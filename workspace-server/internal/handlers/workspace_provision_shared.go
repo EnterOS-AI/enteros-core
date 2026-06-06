@@ -122,7 +122,7 @@ func (h *WorkspaceHandler) prepareProvisionContext(
 	payload models.CreateWorkspacePayload,
 	resetClaudeSession bool,
 ) (*preparedProvisionContext, *provisionAbort) {
-	envVars, globalSecretKeys, decryptErr := loadWorkspaceSecrets(ctx, workspaceID)
+	envVars, globalSecretKeys, workspaceSecretKeys, decryptErr := loadWorkspaceSecrets(ctx, workspaceID)
 	if decryptErr != "" {
 		return nil, &provisionAbort{Msg: decryptErr}
 	}
@@ -294,7 +294,7 @@ func (h *WorkspaceHandler) prepareProvisionContext(
 		return nil, abort
 	}
 
-	cfg := h.buildProvisionerConfig(ctx, workspaceID, templatePath, configFiles, payload, envVars, pluginsPath)
+	cfg := h.buildProvisionerConfig(ctx, workspaceID, templatePath, configFiles, payload, envVars, workspaceSecretKeys, pluginsPath)
 	cfg.ResetClaudeSession = resetClaudeSession
 
 	return &preparedProvisionContext{

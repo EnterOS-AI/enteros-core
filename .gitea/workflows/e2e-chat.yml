@@ -135,6 +135,7 @@ jobs:
     #       paths-filter skip, but a required gate needs it to be a neutral
     #       check, not a green "success", so a skipped heavy lane can't be
     #       mistaken for a passed one.
+    # mc#1982: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
     continue-on-error: true
     timeout-minutes: 15
     env:

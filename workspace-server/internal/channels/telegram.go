@@ -148,7 +148,18 @@ func (t *TelegramAdapter) DiscoverChats(ctx context.Context, botToken string) (*
 		return nil, errors.New("invalid bot token format")
 	}
 
-	bot, err := tgbotapi.NewBotAPI(botToken)
+	// TEST SEAM: when MOLECULE_CHANNELS_TEST_TELEGRAM_API_BASE is set (only in
+	// the gating channels e2e — never in prod/staging), build the bot client
+	// against a local mock API base instead of api.telegram.org so
+	// POST /channels/discover can be proven end-to-end. The format string is
+	// "<base>/bot%s/%s" (token, method), matching tgbotapi.APIEndpoint.
+	var bot *tgbotapi.BotAPI
+	var err error
+	if apiBase := channelsTestTelegramAPIBase(); apiBase != "" {
+		bot, err = tgbotapi.NewBotAPIWithAPIEndpoint(botToken, apiBase+"/bot%s/%s")
+	} else {
+		bot, err = tgbotapi.NewBotAPI(botToken)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("invalid bot token: %w", err)
 	}
