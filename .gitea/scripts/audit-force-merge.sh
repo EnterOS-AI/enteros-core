@@ -86,11 +86,14 @@ fi
 # here because the guards mask silent failures that hide malformed API responses.
 #
 # FAIL-CLOSED: every field we need for the audit must be present in the 200
-# payload. A missing field means the response is untrustworthy — we must NOT
-# silently skip the audit or emit an anonymous/unattributable event.
-for field in merge_commit_sha merged_by base.ref head.sha; do
-  if ! echo "$PR" | jq -e "has(\"${field%%.*}\")" >/dev/null; then
-    echo "::error::GET /pulls/${PR_NUMBER} returned HTTP 200 but payload missing '${field}' field — cannot evaluate force-merge."
+# payload. A missing or null intermediate node (e.g. merged_by=null) means the
+# response is untrustworthy — we must NOT silently skip the audit or emit an
+# anonymous/unattributable event.
+# We validate the FULL jq path (not just the top-level key) so nested nulls
+# are caught too.
+for jq_path in '.merge_commit_sha' '.merged_by.login' '.base.ref' '.head.sha'; do
+  if ! echo "$PR" | jq -e "$jq_path" >/dev/null; then
+    echo "::error::GET /pulls/${PR_NUMBER} returned HTTP 200 but payload missing/null field '${jq_path}' — cannot evaluate force-merge."
     exit 1
   fi
 done
