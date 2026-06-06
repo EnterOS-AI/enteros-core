@@ -290,6 +290,15 @@ jobs:
           echo "ADMIN_TOKEN=${E2E_ADMIN_TOKEN}" >> "$GITHUB_ENV"
           echo "MOLECULE_ADMIN_TOKEN=${E2E_ADMIN_TOKEN}" >> "$GITHUB_ENV"
           echo "Admin token configured for the e2e platform (ADMIN_TOKEN + MOLECULE_ADMIN_TOKEN)."
+          # Channels e2e test seam (core#2332 P1.10). These env-gated overrides
+          # let the LIVE Slack-webhook send path + Telegram discover path target
+          # the local mock upstreams that tests/e2e/test_channels_e2e.sh binds,
+          # so the outbound serialize+POST is provable in CI (was unit-mock-only).
+          # Inert in prod/staging — those deploys never set these. The fixed
+          # loopback ports MUST match the script's E2E_CHANNELS_*_PORT defaults.
+          echo "MOLECULE_CHANNELS_TEST_WEBHOOK_BASE=http://127.0.0.1:18099/" >> "$GITHUB_ENV"
+          echo "MOLECULE_CHANNELS_TEST_TELEGRAM_API_BASE=http://127.0.0.1:18098" >> "$GITHUB_ENV"
+          echo "Channels test seam configured (webhook+telegram mock bases on fixed loopback ports)."
       - name: Build platform
         if: needs.detect-changes.outputs.api == 'true'
         working-directory: workspace-server
@@ -430,6 +439,20 @@ jobs:
       - name: Run notify-with-attachments E2E
         if: needs.detect-changes.outputs.api == 'true'
         run: bash tests/e2e/test_notify_attachments_e2e.sh
+      - name: "Run channels + data-prune E2E (REQUIRE-LIVE: mock upstream proves send+discover, purge proves prune)"
+        # core#2332 P1.10. Stands up a local mock upstream, points the LIVE
+        # Slack-webhook send + Telegram discover paths at it via the
+        # production-inert test seam configured above, and asserts the mock
+        # RECEIVED the serialized payload (send) + round-tripped the bot/chat
+        # (discover). Then exercises the RFC #734 data-prune: DELETE
+        # ?purge=true removes the target's durable child data while a sibling
+        # survives. E2E_REQUIRE_LIVE=1 ⇒ a missing/regressed seam is RED, not a
+        # silent skip. The platform inherits the MOLECULE_CHANNELS_TEST_* bases
+        # from $GITHUB_ENV; the script's mock ports match them (18099/18098).
+        if: needs.detect-changes.outputs.api == 'true'
+        env:
+          E2E_REQUIRE_LIVE: '1'
+        run: bash tests/e2e/test_channels_e2e.sh
       - name: "Run priority-runtimes E2E (REQUIRE-LIVE: mock validates the runtime plumbing end-to-end)"
         # E2E_REQUIRE_LIVE=1 is ON: the run MUST validate >=1 runtime end-to-end
         # or it exits NON-zero (RED). This is now SAFE because the `mock` arm can

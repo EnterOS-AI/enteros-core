@@ -290,47 +290,74 @@ debug "approvers: $(echo "$APPROVERS" | tr '\n' ' ')"
 # Pre/post spaces ensure case patterns *${_t}* match even when the name
 # is the first or last entry (bash case *word* needs delimiters on both sides).
 #
-# FALLBACK: if ALL team probes return 403 (token lacks read:org scope),
-# fall back to /orgs/{org}/members/{user}. This returns 204 for any org
-# member — a superset of team membership. Accepting it as a fallback means
-# the gate passes when the token is scoped to repo+user only (core-bot PAT).
-# This is safe because: (a) org membership is a prerequisite for every
-# eligible team; (b) the AND-composition of internal#189 still requires
-# multiple independent approvers; (c) any token with read:repository can
-# see the approving reviews, so bypass requires a colluding approver.
+# FAIL-CLOSED AUTHORIZATION (security: SOP tier gate is an AUTHORIZATION gate).
+#
+# This used to fall back to /orgs/{org}/members/{user} whenever every team
+# probe failed and credit any org member as a member of EVERY queried team.
+# That was a privilege-escalation: org membership is NOT team membership, so
+# a 403/visibility/token-scope gap on the team probes silently promoted a
+# plain org member to satisfy tier:high (ceo). An inability-to-verify became
+# an authorization GRANT. The fallback is REMOVED — org membership must never
+# satisfy a team-gated tier.
+#
+# A team-membership probe has exactly three meaningful outcomes:
+#   200 / 204  → the user IS a member of that team       (credit it)
+#   404        → the user is definitively NOT a member    (no credit, verified)
+#   anything else (403 / 401 / 5xx / curl failure / non-numeric)
+#              → membership CANNOT be read                 (cannot-verify)
+#
+# Per the dev-sop fail-closed rule (inability-to-verify = failure, never a
+# pass — and here, never an authorization grant), a cannot-verify outcome on
+# ANY probe is a HARD infra failure: we publish a loud cannot-verify error and
+# exit non-zero. We do NOT proceed to evaluate the tier expression on a partial
+# / unverifiable membership picture, because doing so could let an unverifiable
+# approver's clause silently fail-or-pass on incomplete data. Fix the token
+# scope (read:organization) or the runner network — not the gate.
 declare -A APPROVER_TEAMS
+_verify_failed=""   # accumulates "<user>:<team>(HTTP <code>)" for probes we could not read
 for U in $APPROVERS; do
   [ "$U" = "$PR_AUTHOR" ] && debug "skip self-review by $U" && continue
-  _any_team_success="no"
   for T in "${!TEAM_ID[@]}"; do
     ID="${TEAM_ID[$T]}"
+    set +e
     CODE=$(curl -sS -o /dev/null -w '%{http_code}' -H "$AUTH" \
       "${API}/teams/${ID}/members/${U}")
-    debug "probe: $U in team $T (id=$ID) → HTTP $CODE"
-    if [ "$CODE" = "200" ] || [ "$CODE" = "204" ]; then
-      APPROVER_TEAMS[$U]="${APPROVER_TEAMS[$U]:- } ${APPROVER_TEAMS[$U]:+ }$T "
-      debug "$U qualifies for team $T"
-      _any_team_success="yes"
+    _curl_exit=$?
+    set -e
+    debug "probe: $U in team $T (id=$ID) → HTTP $CODE (curl exit=$_curl_exit)"
+    if [ "$_curl_exit" -ne 0 ]; then
+      # curl itself failed (DNS, connection refused, timeout) — unreachable.
+      _verify_failed="${_verify_failed}${_verify_failed:+, }${U}:${T}(curl exit ${_curl_exit})"
+      continue
     fi
-  done
-  # Fallback: if every team probe returned 403, try org membership.
-  # "??" teams were never resolved to IDs so they never entered the loop.
-  # If the user is an org member, credit them as being in each queried team
-  # (engineers, managers, ceo are all org-level). This is safe because org
-  # membership is a prerequisite for all three, and bypass requires a colluding
-  # approver (same risk as before the AND-composition).
-  if [ "$_any_team_success" = "no" ]; then
-    ORG_CODE=$(curl -sS -o /dev/null -w '%{http_code}' -H "$AUTH" \
-      "${API}/orgs/${OWNER}/members/${U}")
-    debug "probe: $U in org $OWNER (fallback) → HTTP $ORG_CODE"
-    if [ "$ORG_CODE" = "204" ]; then
-      for T in "${!TEAM_ID[@]}"; do
+    case "$CODE" in
+      200|204)
         APPROVER_TEAMS[$U]="${APPROVER_TEAMS[$U]:- } ${APPROVER_TEAMS[$U]:+ }$T "
-      done
-      debug "$U credited as org member for all queried teams (fallback — token may lack read:org)"
-    fi
-  fi
+        debug "$U qualifies for team $T"
+        ;;
+      404)
+        # Definitively not a member of this team — a verified negative.
+        debug "$U is NOT a member of team $T (verified 404)"
+        ;;
+      *)
+        # 403/401/5xx/etc — membership is unreadable. Do NOT treat as "not a
+        # member" and do NOT fall back to org membership. This is cannot-verify.
+        _verify_failed="${_verify_failed}${_verify_failed:+, }${U}:${T}(HTTP ${CODE})"
+        ;;
+    esac
+  done
 done
+
+# Fail-closed: if ANY membership probe could not be read, we cannot make an
+# authorization decision. Publish a loud cannot-verify / infra-failed status
+# and exit non-zero. Never grant the tier on unverifiable membership.
+if [ -n "$_verify_failed" ]; then
+  echo "::error::sop-tier-check CANNOT VERIFY team membership — gate FAILS CLOSED."
+  echo "::error::Unreadable membership probe(s): ${_verify_failed}"
+  echo "::error::A team-membership probe returned 403/401/5xx (or curl failed). The SOP tier gate is an authorization gate; an inability to verify team membership is treated as a FAILURE, never a pass. Org membership is NOT team membership and is never credited as a fallback."
+  echo "::error::Fix: ensure GITEA_TOKEN (SOP_TIER_CHECK_TOKEN) has read:organization scope and the Gitea API is reachable from the runner, then re-run. Do NOT relax this gate."
+  exit 1
+fi
 
 # 7. Evaluate the tier expression.
 #

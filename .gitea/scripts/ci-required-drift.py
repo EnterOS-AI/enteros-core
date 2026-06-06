@@ -361,15 +361,17 @@ def detect_drift(branch: str) -> tuple[list[str], dict]:
     """Returns (findings, debug). Empty findings == no drift.
 
     Raises:
-        ApiError: propagated from the protection fetch only when the
-                  failure is likely a transient Gitea outage (5xx).
-                  403/404 from the protection endpoint is treated as
-                  "cannot determine drift for this branch" — a token-
-                  scope issue (missing repo-admin on DRIFT_BOT_TOKEN) or
-                  a repo with no protection set should not turn the
-                  hourly cron red. The workflow continues to the next
-                  branch; no [ci-drift] issue is filed for a branch
-                  whose protection cannot be read.
+        ApiError: propagated (fail-closed) on a transient Gitea outage
+                  (5xx) AND on a 401/403 auth failure from the protection
+                  endpoint. A 401/403 means DRIFT_BOT_TOKEN cannot read
+                  branch protections at all — drift is UNVERIFIABLE, so
+                  this HARD gate must fail loud rather than green
+                  undetected drift (the regression class it exists to
+                  catch). An authenticated 404 (branch genuinely has no
+                  protection, e.g. staging pre-rollout) is the one
+                  tolerated skip: it returns ([], debug) with a loud
+                  ::warning:: and the workflow continues to the next
+                  branch.
     """
     findings: list[str] = []
 
@@ -403,17 +405,38 @@ def detect_drift(branch: str) -> tuple[list[str], dict]:
         m = _re.search(r"HTTP (\d{3})", msg)
         if m:
             http_status = int(m.group(1))
-        if http_status in (403, 404):
-            # Token lacks scope OR branch has no protection. Cannot
-            # determine drift — skip this branch. Do NOT exit non-zero;
-            # the issue IS the alarm, not a red workflow.
+        # FAIL-CLOSED contract (was fail-open: 403 AND 404 both returned
+        # [] with no signal — fixed). This is a HARD gate (no
+        # continue-on-error → false) running hourly on a PROTECTED context
+        # (schedule/dispatch on main). We split auth-failure from
+        # genuinely-absent:
+        #   401/403 → AUTH FAILURE: the token cannot read branch
+        #     protections at all, so drift CANNOT be determined for ANY
+        #     branch. Greening the hourly cron here means jobs↔protection
+        #     drift goes silently undetected — exactly the regression class
+        #     this sentinel exists to catch. Raise so the workflow fails
+        #     loud / fails closed.
+        #   404 → authenticated absent resource: this specific branch has
+        #     no protection (e.g. `staging` before its protection rollout).
+        #     Genuinely nothing to diff against — skip THIS branch with a
+        #     loud ::warning::, continue to the next.
+        if http_status in (401, 403):
             sys.stderr.write(
-                f"::error::GET {protection_path} returned HTTP {http_status} — "
-                f"DRIFT_BOT_TOKEN lacks repo-admin scope (Gitea 1.22.6 "
-                f"requires it for this endpoint) OR branch has no protection "
-                f"configured. Cannot determine drift for {branch}; "
-                f"skipping. Fix: grant repo-admin to mc-drift-bot or "
-                f"configure protection on {branch}.\n"
+                f"::error::GET {protection_path} returned HTTP "
+                f"{http_status} — DRIFT_BOT_TOKEN cannot read branch "
+                f"protections (needs repo-admin scope). AUTH FAILURE: "
+                f"drift CANNOT be determined, so this HARD gate FAILS "
+                f"CLOSED rather than greening undetected drift. Fix: grant "
+                f"repo-admin to mc-drift-bot (org team `drift-bot`, "
+                f"perm=admin) — fix the token, not the lint.\n"
+            )
+            raise
+        if http_status == 404:
+            sys.stderr.write(
+                f"::warning::GET {protection_path} returned HTTP 404 — "
+                f"branch '{branch}' has no protection configured "
+                f"(authenticated absent resource). Skipping drift check for "
+                f"{branch}; if it SHOULD be protected, configure it.\n"
             )
             debug = {
                 "branch": branch,
@@ -424,7 +447,7 @@ def detect_drift(branch: str) -> tuple[list[str], dict]:
                 "audit_env_checks": sorted(env_set),
             }
             return [], debug
-        # 5xx — propagate (transient outage, fail loud per design).
+        # 5xx / other — propagate (transient outage, fail loud per design).
         raise
     if not isinstance(protection, dict):
         sys.stderr.write(
