@@ -8,26 +8,39 @@ against the latest `main`.
 
 ## Queue Contract
 
-Add the `merge-queue` label to an open PR when it is ready to merge.
+**Auto-discovery (opt-OUT, default).** You do NOT need to label a PR. The bot
+auto-discovers every open same-repo PR and merges any that meets the bar. The
+`merge-queue` label is now optional metadata, not a gate. This removed the
+historical autonomy gap: agent Gitea tokens lack `write:issue` (labels are
+issue-scoped), so agents could never self-label and ready PRs stalled.
+
+To keep a PR OUT of autonomous merging, add an opt-OUT label:
+`merge-queue-hold`, `do-not-auto-merge`, or `wip`. Draft PRs are also skipped.
 
 The bot processes one PR per tick:
 
-1. Confirms `main` is green.
-2. Selects the oldest open PR carrying `merge-queue`.
-3. Skips PRs with `merge-queue-hold`.
-4. Rejects fork PRs because the queue may only update same-repo branches.
-5. If the PR head does not contain current `main`, calls Gitea's
+1. Confirms `main`'s branch-protection-required push contexts are green.
+2. Selects the oldest open same-repo PR that is NOT opt-out-labeled and NOT a
+   draft (auto-discovery). With `AUTO_DISCOVER=0` it falls back to legacy
+   opt-IN: only PRs carrying `merge-queue` are considered.
+3. Rejects fork PRs because the queue may only update same-repo branches.
+4. If the PR head does not contain current `main`, calls Gitea's
    `/pulls/{n}/update?style=merge` endpoint and waits for CI on the new head.
-6. Merges only after the current PR head has required contexts green:
-   - `CI / all-required (pull_request)`
-   - `sop-checklist / all-items-acked (pull_request)`
+5. Merges only when, on the PR's CURRENT head sha:
+   - `>= required_approvals` distinct genuine official `APPROVED` reviews from
+     the recognised reviewer set (read from branch protection; default 2),
+   - no open official `REQUEST_CHANGES`,
+   - every branch-protection-required status context is green, and
+   - the PR is `mergeable` (Gitea returns `True`; `None`/`False` = wait).
 
-The workflow is serialized with `concurrency`, so two queued PRs cannot be
+The merge bar is unchanged by auto-discovery — only WHICH PRs are considered
+changes. The workflow is serialized with `concurrency`, so two PRs cannot be
 merged against the same observed `main`.
 
 ## Operator Commands
 
-Queue a PR:
+Queue a PR (optional — auto-discovery already considers every ready PR; the
+label is just visible metadata):
 
 ```bash
 curl -fsS -X POST \
@@ -37,7 +50,8 @@ curl -fsS -X POST \
   -d '{"labels":["merge-queue"]}'
 ```
 
-Temporarily hold a queued PR:
+Keep a PR OUT of autonomous merging (opt-OUT — use `merge-queue-hold`,
+`do-not-auto-merge`, or `wip`):
 
 ```bash
 curl -fsS -X POST \
@@ -56,9 +70,11 @@ REPO=molecule-ai/molecule-core \
 WATCH_BRANCH=main \
 QUEUE_LABEL=merge-queue \
 HOLD_LABEL=merge-queue-hold \
+AUTO_DISCOVER=1 \
+OPT_OUT_LABELS=do-not-auto-merge,wip \
+REVIEWER_SET=agent-reviewer,agent-researcher,agent-reviewer-cr2 \
 UPDATE_STYLE=merge \
-REQUIRED_CONTEXTS='CI / all-required (pull_request),sop-checklist / all-items-acked (pull_request)' \
-python3 .gitea/scripts/gitea-merge-queue.py
+python3 .gitea/scripts/gitea-merge-queue.py --dry-run
 ```
 
 Dry run:

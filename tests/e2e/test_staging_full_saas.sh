@@ -654,6 +654,125 @@ fi
 MODEL_SLUG=$(pick_model_slug "$RUNTIME")
 log "    MODEL_SLUG=$MODEL_SLUG"
 
+# ─── BYOK opt-in split (secret-write gate requires explicit byok) ───────
+# Every vendor-key arm above (MiniMax / Anthropic / Google / OpenAI-hermes)
+# writes one or more keys that workspace-server's secret-write gate —
+# rejectPlatformManagedDirectLLMBypassForWorkspace in
+# workspace-server/internal/handlers/secrets.go — STRIPS/BLOCKS while a
+# workspace's resolved billing mode is platform_managed (the org/CTO default).
+# The strip-list (secrets.go platformManagedDirectLLMBypassKeys) includes
+# MINIMAX_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY, OPENAI_API_KEY/_BASE_URL,
+# HERMES_CUSTOM_API_KEY/_BASE_URL, etc. A bare vendor key in the CREATE payload
+# does NOT auto-derive byok: at create time no auth-env is present yet, so the
+# resolver derives platform_managed and the write is rejected. The resolver's
+# org rung was retired (internal#718 P2-B) — ResolveLLMBillingMode now ignores
+# the org default — so the ONLY way to opt a workspace into byok is an explicit
+# per-workspace override via PUT /admin/workspaces/:id/llm-billing-mode.
+#
+# Real evidence — staging job 295385 (main f1558b54), AFTER #2311/#2312 made
+# bare `MiniMax-M2.7` registry-valid: parent-create passed model validation but
+# FAILED with
+#   {"error":"direct vendor key writes are blocked for platform-managed
+#    workspaces; ... or set this workspace's billing mode to 'byok' via
+#    /admin/workspaces/:id/llm-billing-mode","key":"MINIMAX_API_KEY"}
+# That 400 is INTENDED product behavior, not a product bug. The e2e must mirror
+# the real BYOK user flow: opt the workspace into byok FIRST, then write the key.
+#
+# Mechanism: per-workspace override (NOT org-default), because the org rung is
+# retired — an org-create billing field could not satisfy this gate even if
+# /cp/admin/orgs accepted one. So for any arm that ships strip-listed keys we:
+#   1. create the workspace WITHOUT those keys (create succeeds platform_managed),
+#   2. PUT billing-mode=byok on that workspace id (per-tenant admin token),
+#   3. write the deferred strip-listed keys (now allowed by the gate),
+# then continue. The #1994 byok-routing guard (8c) then sees a LEGITIMATELY
+# byok workspace (explicit override) and still validates real routing — NOT
+# masked.
+#
+# The PLATFORM path (E2E_LLM_PATH=platform) produces SECRETS_JSON='{}', so it
+# carries NO strip-listed key → CREATE_SECRETS_JSON stays '{}' and no opt-in
+# fires. It remains platform_managed (the moonshot/kimi NOT_CONFIGURED
+# regression guard) — deliberately untouched.
+#
+# Keep this strip-list BYTE-IN-SYNC with secrets.go platformManagedDirectLLMBypassKeys.
+BYOK_STRIP_KEYS="AI_GATEWAY_API_KEY ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ARCEEAI_API_KEY CLAUDE_CODE_OAUTH_TOKEN CODEX_AUTH_JSON DASHSCOPE_API_KEY DEEPSEEK_API_KEY GEMINI_API_KEY GLM_API_KEY HERMES_CUSTOM_API_KEY HERMES_CUSTOM_BASE_URL HF_TOKEN KIMI_API_KEY KIMI_CN_API_KEY MINIMAX_API_KEY MINIMAX_CN_API_KEY NOUS_API_KEY OPENAI_API_KEY OPENAI_BASE_URL OPENROUTER_API_KEY XAI_API_KEY ZAI_API_KEY"
+# Split SECRETS_JSON into CREATE_SECRETS_JSON (gate-safe, written at create)
+# and DEFERRED_SECRETS_JSON (strip-listed keys, written AFTER byok opt-in).
+# Emit the two JSON blobs on SEPARATE LINES (not space-separated) — a value or
+# a json.dumps default separator contains spaces, which whitespace-`read` would
+# mangle. read -r line1 → CREATE, line2 → DEFERRED.
+{
+  read -r CREATE_SECRETS_JSON
+  read -r DEFERRED_SECRETS_JSON
+} < <(
+  BYOK_STRIP_KEYS="$BYOK_STRIP_KEYS" E2E_WS_SECRETS="$SECRETS_JSON" python3 -c "
+import json, os
+strip = set(os.environ['BYOK_STRIP_KEYS'].split())
+d = json.loads(os.environ['E2E_WS_SECRETS'] or '{}')
+create = {k: v for k, v in d.items() if k not in strip}
+deferred = {k: v for k, v in d.items() if k in strip}
+print(json.dumps(create))
+print(json.dumps(deferred))
+"
+)
+# Defensive: if the split somehow produced empty (read failure), treat as
+# no-deferred so we never PUT byok on a workspace that has no vendor key.
+[ -n "$DEFERRED_SECRETS_JSON" ] || DEFERRED_SECRETS_JSON='{}'
+[ -n "$CREATE_SECRETS_JSON" ] || CREATE_SECRETS_JSON='{}'
+if [ "$DEFERRED_SECRETS_JSON" != "{}" ]; then
+  log "    BYOK opt-in required — deferring vendor key(s) until after billing-mode=byok"
+fi
+
+# byok_opt_in_and_write_deferred <workspace_id>
+#   For the byok arms (DEFERRED_SECRETS_JSON non-empty): PUT billing-mode=byok
+#   on the workspace, then write each deferred strip-listed secret (now allowed
+#   by the secret-write gate). No-op for the platform/no-key path. See the
+#   BYOK-opt-in block above + secrets.go rejectPlatformManagedDirectLLMBypassForWorkspace.
+byok_opt_in_and_write_deferred() {
+  local _id="$1"
+  if [ "$DEFERRED_SECRETS_JSON" = "{}" ]; then
+    return 0
+  fi
+  # Explicit byok opt-in (per-workspace override).
+  local _bm_resp _bm_mode
+  set +e
+  _bm_resp=$(tenant_call PUT "/admin/workspaces/$_id/llm-billing-mode" \
+    -H "Content-Type: application/json" \
+    -d '{"mode":"byok"}' 2>/dev/null)
+  local _bm_rc=$?
+  set -e
+  if [ "$_bm_rc" != "0" ]; then
+    fail "byok opt-in: PUT /admin/workspaces/$_id/llm-billing-mode {mode:byok} failed (rc=$_bm_rc). Raw: $(printf '%s' "$_bm_resp" | sanitize_http_body)"
+  fi
+  _bm_mode=$(echo "$_bm_resp" | python3 -c "import json,sys; print(json.load(sys.stdin).get('resolved_mode',''))" 2>/dev/null || echo "")
+  [ "$_bm_mode" = "byok" ] || fail "byok opt-in: workspace $_id resolved_mode='$_bm_mode' after PUT mode=byok (want byok). Raw: $(printf '%s' "$_bm_resp" | sanitize_http_body)"
+
+  # Write each deferred strip-listed secret one-per-call (the Set endpoint
+  # takes {key,value}). The gate now passes because resolved=byok. Bodies are
+  # built in Python (env-only) so secret values never hit a command line.
+  local _keys _k _sec_body _sec_tmp _sec_code _sec_out
+  _keys=$(echo "$DEFERRED_SECRETS_JSON" | python3 -c "import json,sys; print('\n'.join(json.load(sys.stdin).keys()))")
+  while IFS= read -r _k; do
+    [ -n "$_k" ] || continue
+    _sec_body=$(BYOK_K="$_k" E2E_WS_DEFERRED="$DEFERRED_SECRETS_JSON" python3 -c "
+import json, os
+d = json.loads(os.environ['E2E_WS_DEFERRED'])
+print(json.dumps({'key': os.environ['BYOK_K'], 'value': d[os.environ['BYOK_K']]}))
+")
+    _sec_tmp=$(mktemp -t synth_byok_secret.XXXXXX)
+    _sec_code=$(printf '%s' "$_sec_body" | tenant_call POST "/workspaces/$_id/secrets" \
+      -H "Content-Type: application/json" \
+      -d @- \
+      -o "$_sec_tmp" -w '%{http_code}' 2>/dev/null || echo "000")
+    if [ "$_sec_code" != "200" ] && [ "$_sec_code" != "201" ] && [ "$_sec_code" != "204" ]; then
+      _sec_out=$(cat "$_sec_tmp" 2>/dev/null | sanitize_http_body)
+      rm -f "$_sec_tmp"
+      fail "byok vendor-key write: POST /workspaces/$_id/secrets ($_k) returned $_sec_code: $_sec_out — secret-write gate should allow it after the byok opt-in (secrets.go rejectPlatformManagedDirectLLMBypassForWorkspace)."
+    fi
+    rm -f "$_sec_tmp"
+  done <<< "$_keys"
+  ok "    $_id byok opt-in + deferred vendor key(s) written"
+}
+
 # ─── runtime → provision-selector resolution ────────────────────────────
 # Most runtimes are selected directly by the `runtime` field. seo-agent is
 # the exception: it is NOT a registry runtime (absent from manifest.json +
@@ -680,7 +799,7 @@ build_create_payload() {
   E2E_WS_RUNTIME="$RUNTIME" \
   E2E_WS_TEMPLATE="$PROVISION_TEMPLATE" \
   E2E_WS_MODEL="$MODEL_SLUG" \
-  E2E_WS_SECRETS="$SECRETS_JSON" \
+  E2E_WS_SECRETS="$CREATE_SECRETS_JSON" \
   python3 -c "
 import json, os
 secrets = json.loads(os.environ['E2E_WS_SECRETS'] or '{}')
@@ -710,9 +829,21 @@ if [ -n "$PROVISION_TEMPLATE" ]; then
 else
   log "5/11 Provisioning parent workspace (runtime=$RUNTIME)..."
 fi
+# tenant_call inherits CURL_COMMON's --fail-with-body, so a non-2xx create
+# (e.g. the 422 RUNTIME_UNSUPPORTED below) makes curl exit 22. Capturing it
+# bare as $(tenant_call ...) propagates that 22 through the command
+# substitution and, under `set -euo pipefail`, ABORTS the whole script right
+# here — before the `fail "... Response: ..."` handler below can print the
+# body. The result was an opaque `curl: (22) ... error: 422` + teardown with
+# no body (run 220702, main f78fef4c, step "5/11 Provisioning parent
+# workspace"). set +e / `|| true` keeps the 22 from tripping `set -e`; curl
+# still WROTE the body to stdout (that's what --fail-with-body does), so
+# PARENT_RESP holds the 422 JSON and the id-check below surfaces WHY.
+set +e
 PARENT_RESP=$(tenant_call POST /workspaces \
   -H "Content-Type: application/json" \
   -d "$(build_create_payload 'E2E Parent')")
+set -e
 # Surface the workspace-create error CLEARLY instead of dying on a Python
 # KeyError when the response has no 'id'. The load-bearing cases this names:
 #   - google-adk: RUNTIME_UNSUPPORTED 422 if google-adk is absent from the
@@ -728,19 +859,29 @@ if [ -z "$PARENT_ID" ]; then
   fail "Parent workspace create returned no 'id' (runtime=$RUNTIME, template=${PROVISION_TEMPLATE:-<none>}). Response: $(printf '%s' "$PARENT_RESP" | sanitize_http_body)"
 fi
 log "    PARENT_ID=$PARENT_ID"
+# BYOK arms only: opt the workspace into byok, then write the deferred vendor
+# key(s). No-op for the platform/no-key path. (See the BYOK opt-in block.)
+byok_opt_in_and_write_deferred "$PARENT_ID"
 
 # ─── 6. Provision child (full mode only) ────────────────────────────────
 CHILD_ID=""
 if [ "$MODE" = "full" ]; then
   log "6/11 Provisioning child workspace..."
+  # Same --fail-with-body / set -e abort guard as the parent create above:
+  # let a non-2xx return the body so the id-check below surfaces it instead
+  # of the script dying opaquely on curl exit 22.
+  set +e
   CHILD_RESP=$(tenant_call POST /workspaces \
     -H "Content-Type: application/json" \
     -d "$(build_create_payload 'E2E Child' "$PARENT_ID")")
+  set -e
   CHILD_ID=$(echo "$CHILD_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('id',''))" 2>/dev/null || echo "")
   if [ -z "$CHILD_ID" ]; then
     fail "Child workspace create returned no 'id' (runtime=$RUNTIME, template=${PROVISION_TEMPLATE:-<none>}). Response: $(printf '%s' "$CHILD_RESP" | sanitize_http_body)"
   fi
   log "    CHILD_ID=$CHILD_ID"
+  # Same BYOK opt-in as the parent — the child also carries the vendor key(s).
+  byok_opt_in_and_write_deferred "$CHILD_ID"
 else
   log "6/11 Canary mode — skipping child workspace"
 fi
@@ -863,6 +1004,12 @@ for wid in "${WS_TO_CHECK[@]}"; do
   else
     DIAG_FAIL=$(echo "$DIAG_JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('first_failure','unknown'))" 2>/dev/null || echo "unknown")
     DIAG_DETAIL=$(echo "$DIAG_JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); s=[x for x in d.get('steps',[]) if not x.get('ok')]; step=s[0] if s else {}; print(' — '.join(x for x in [step.get('error',''), step.get('detail','')] if x))" 2>/dev/null || echo "")
+    # #767: always emit the full diagnose JSON so operators see every step's
+    # Detail field even when the Python extraction above fails or the shape
+    # drifts. The burst is bracketed like steps 2 and 4 for grep-friendly CI.
+    log "── DIAGNOSTIC BURST (step 7b — terminal diagnose for $wid) ──"
+    echo "$DIAG_JSON" | python3 -m json.tool 2>/dev/null || echo "$DIAG_JSON"
+    log "── END DIAGNOSTIC ──"
     fail "Workspace $wid terminal diagnose failed at step '$DIAG_FAIL': $DIAG_DETAIL — check tenant SG has tcp/22 from the configured EIC endpoint SG, MOLECULE_EIC_ENDPOINT_SG_ID is set in Railway, and EIC endpoint health"
   fi
 done
@@ -1078,7 +1225,7 @@ fi
 # identical on main's scheduled synthetic E2E and on PRs (so it is an
 # environmental backend regression, never PR-introduced).
 if echo "$AGENT_TEXT" | grep -qiF "message contained no text content"; then
-  fail "A2A — EMPTY COMPLETION (backend regression, NOT a platform/workspace-server bug). The configured model (MODEL_SLUG=${MODEL_SLUG:-?}) returned a 2xx completion with no text part; the runtime surfaced 'message contained no text content.'. Operator action: check the staging LLM backend / proxy for the canary model (the claude-code default is minimax:MiniMax-M2.7 since #2263; was bare MiniMax-M2 #2710) — empty assistant turns, not an auth/quota/boot fault. Raw: $AGENT_TEXT"
+  fail "A2A — EMPTY COMPLETION (backend regression, NOT a platform/workspace-server bug). The configured model (MODEL_SLUG=${MODEL_SLUG:-?}) returned a 2xx completion with no text part; the runtime surfaced 'message contained no text content.'. Operator action: check the staging LLM backend / proxy for the canary model (the claude-code MiniMax-BYOK default is the BARE registered id MiniMax-M2.7 — the colon minimax:MiniMax-M2.7 is UNREGISTERED on claude-code, internal#718) — empty assistant turns, not an auth/quota/boot fault. Raw: $AGENT_TEXT"
 fi
 # Generic catch-all — falls through if none of the known regressions hit.
 if echo "$AGENT_TEXT" | grep -qiE "error|exception"; then
@@ -1293,12 +1440,44 @@ print(json.dumps({
     'scope': 'LOCAL'
 }))
 ")
-  tenant_call POST "/workspaces/$PARENT_ID/memories" \
+  # SURFACE THE BODY (mirrors the step-9b / A2A pattern): the previous
+  # `>/dev/null || fail "memory POST failed"` discarded the response body
+  # that --fail-with-body deliberately preserves on a non-2xx, so a 500 from
+  # the workspace-server HMA path (e.g. "failed to store memory" /
+  # "failed to resolve writable namespaces", or a 503 "memory plugin is not
+  # configured") was reported as a bare "memory POST failed" — opaque, the
+  # same #2310-class blind spot. Route http_code into -w and body into -o,
+  # then fail with the sanitized status+body so the mechanism is visible.
+  MEM_POST_TMP=$(e2e_tmp /tmp/e2e_mem_post.XXXXXX)
+  set +e
+  MEM_POST_CODE=$(tenant_call POST "/workspaces/$PARENT_ID/memories" \
     -H "Content-Type: application/json" \
-    -d "$MEM_PAYLOAD" >/dev/null || fail "memory POST failed"
-  MEM_LIST=$(tenant_call GET "/workspaces/$PARENT_ID/memories?scope=LOCAL")
+    -d "$MEM_PAYLOAD" \
+    -o "$MEM_POST_TMP" -w "%{http_code}" 2>/dev/null)
+  MEM_POST_RC=$?
+  set -e
+  MEM_POST_CODE=${MEM_POST_CODE:-000}
+  if [ "$MEM_POST_RC" != "0" ] || [ "$MEM_POST_CODE" -lt 200 ] || [ "$MEM_POST_CODE" -ge 300 ]; then
+    MEM_POST_BODY=$(head -c 400 "$MEM_POST_TMP" 2>/dev/null | sanitize_http_body)
+    fail "memory POST /workspaces/$PARENT_ID/memories failed (curl_rc=$MEM_POST_RC, http=$MEM_POST_CODE): ${MEM_POST_BODY:-<empty body>}"
+  fi
+
+  # Same fail-closed surfacing for the read-back: a 5xx / network error here
+  # previously slipped through the bare `$(tenant_call ...)` capture and only
+  # showed up as "not readable" with an empty list.
+  MEM_LIST_TMP=$(e2e_tmp /tmp/e2e_mem_list.XXXXXX)
+  set +e
+  MEM_LIST_CODE=$(tenant_call GET "/workspaces/$PARENT_ID/memories?scope=LOCAL" \
+    -o "$MEM_LIST_TMP" -w "%{http_code}" 2>/dev/null)
+  MEM_LIST_RC=$?
+  set -e
+  MEM_LIST_CODE=${MEM_LIST_CODE:-000}
+  MEM_LIST=$(cat "$MEM_LIST_TMP" 2>/dev/null || echo "")
+  if [ "$MEM_LIST_RC" != "0" ] || [ "$MEM_LIST_CODE" -lt 200 ] || [ "$MEM_LIST_CODE" -ge 300 ]; then
+    fail "memory GET /workspaces/$PARENT_ID/memories failed (curl_rc=$MEM_LIST_RC, http=$MEM_LIST_CODE): $(printf '%s' "$MEM_LIST" | sanitize_http_body | head -c 400)"
+  fi
   if ! echo "$MEM_LIST" | grep -q "run $SLUG"; then
-    fail "HMA memory not readable after write. List: ${MEM_LIST:0:200}"
+    fail "HMA memory not readable after write (http=$MEM_LIST_CODE). List: $(printf '%s' "$MEM_LIST" | sanitize_http_body | head -c 200)"
   fi
   ok "HMA memory write+read roundtripped"
 

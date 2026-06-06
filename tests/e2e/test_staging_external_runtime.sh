@@ -238,10 +238,17 @@ admin_call() {
 
 # ─── 1. Create org ──────────────────────────────────────────────────────
 log "1/8 Creating org $SLUG..."
+# admin_call inherits CURL_COMMON's --fail-with-body: a non-2xx makes curl
+# exit 22, which under `set -euo pipefail` would abort this bare command
+# substitution BEFORE the `fail "... missing 'id'"` handler below can print
+# the body. set +e / `|| true` keeps the 22 from tripping `set -e`; curl
+# still wrote the body, so CREATE_RESP holds it and the id-check surfaces why.
+set +e
 CREATE_RESP=$(admin_call POST /cp/admin/orgs \
   -d "{\"slug\":\"$SLUG\",\"name\":\"E2E ext $SLUG\",\"owner_user_id\":\"e2e-runner:$SLUG\"}")
-ORG_ID=$(echo "$CREATE_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('id',''))")
-[ -z "$ORG_ID" ] && fail "Org create response missing 'id'"
+set -e
+ORG_ID=$(echo "$CREATE_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('id',''))" 2>/dev/null || echo "")
+[ -z "$ORG_ID" ] && fail "Org create response missing 'id': $(printf '%s' "$CREATE_RESP" | sanitize_http_body 2>/dev/null || printf '%s' "$CREATE_RESP")"
 ok "Org created (id=$ORG_ID)"
 
 # ─── 2. Wait for tenant provisioning ────────────────────────────────────
@@ -334,8 +341,13 @@ tenant_call() {
 # on whatever the create handler set first (typically 'provisioning')
 # because the follow-up UPDATE failed the enum cast.
 log "4/8 Creating external workspace (no URL — exercises workspace.go:333)..."
+# tenant_call inherits CURL_COMMON's --fail-with-body: guard the same way as
+# the org create above so a non-2xx returns the body to the id/status checks
+# below instead of aborting opaquely on curl exit 22.
+set +e
 WS_CREATE_RESP=$(tenant_call POST /workspaces \
   -d '{"name":"ext-e2e","runtime":"external","external":true}')
+set -e
 
 WS_ID=$(echo "$WS_CREATE_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('id',''))")
 WS_RESP_STATUS=$(echo "$WS_CREATE_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))")
@@ -348,7 +360,7 @@ try:
 except Exception:
     print('')
 ")
-[ -z "$WS_ID" ] && fail "Workspace create missing id: $WS_CREATE_RESP"
+[ -z "$WS_ID" ] && fail "Workspace create missing id: $(printf '%s' "$WS_CREATE_RESP" | sanitize_http_body 2>/dev/null || printf '%s' "$WS_CREATE_RESP")"
 [ "$WS_RESP_STATUS" != "awaiting_agent" ] && fail "Expected response status=awaiting_agent, got $WS_RESP_STATUS"
 ok "Workspace created (id=$WS_ID, response status=awaiting_agent)"
 

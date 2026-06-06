@@ -178,15 +178,19 @@ jobs:
       # workflow_dispatch flow (no input wired here yet — runtime
       # override is enough for ad-hoc).
       #
-      # #2263 deploy-skew: the claude-code default is the COLON-namespaced BYOK
-      # id `minimax:MiniMax-M2.7`, NOT bare `MiniMax-M2`. The deployed staging
-      # ws-server's compiled registry can lag source; validateRegisteredModelForRuntime
-      # 400s the bare form on an older image (the sibling Platform Boot job, on
-      # the SAME image, succeeds with namespaced `moonshot/kimi-k2.6`). The colon
-      # form stays in the BYOK `minimax` arm (providers.yaml:851) so it resolves
-      # provider=minimax (BYOK) and the #1994 byok-not-platform guard still
-      # passes — the slash/platform form `minimax/MiniMax-M2.7` would not.
-      E2E_MODEL_SLUG: ${{ github.event.inputs.runtime == 'hermes' && 'openai/gpt-4o' || github.event.inputs.runtime == 'codex' && 'openai/gpt-4o' || github.event.inputs.runtime == 'google-adk' && 'google_genai:gemini-2.5-pro' || 'minimax:MiniMax-M2.7' }}
+      # claude-code MiniMax slug must be the BARE registered id `MiniMax-M2.7`.
+      # It is the BYOK-minimax form: registry_gen.go:88 registers it on the
+      # `minimax` arm (resolves provider=minimax via MINIMAX_API_KEY), so the
+      # #1994 byok-not-platform guard still passes. The COLON form
+      # `minimax:MiniMax-M2.7` is UNREGISTERED on claude-code (internal#718;
+      # derive_provider_matrix_test.go:288) — the claude-code adapter can't
+      # strip the `minimax:` prefix, so workspace-create 422s
+      # UNREGISTERED_MODEL_FOR_RUNTIME (real failure: job 295233, main 4b3590e3).
+      # The slash form `minimax/MiniMax-M2.7` is the platform-billed arm and
+      # would trip the byok guard. #2311 fixed the same colon-vs-bare bug in the
+      # pick_model_slug lib (tests/e2e/lib/model_slug.sh), but this env var
+      # OVERRIDES that lib, so the bare fix has to live here too.
+      E2E_MODEL_SLUG: ${{ github.event.inputs.runtime == 'hermes' && 'openai/gpt-4o' || github.event.inputs.runtime == 'codex' && 'openai/gpt-4o' || github.event.inputs.runtime == 'google-adk' && 'google_genai:gemini-2.5-pro' || 'MiniMax-M2.7' }}
       E2E_RUN_ID: "${{ github.run_id }}-${{ github.run_attempt }}"
       E2E_KEEP_ORG: ${{ github.event.inputs.keep_org && '1' || '0' }}
       # Lifecycle transitions (step 10b): pause→resume→online +
