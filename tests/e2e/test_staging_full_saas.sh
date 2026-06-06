@@ -1004,6 +1004,12 @@ for wid in "${WS_TO_CHECK[@]}"; do
   else
     DIAG_FAIL=$(echo "$DIAG_JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('first_failure','unknown'))" 2>/dev/null || echo "unknown")
     DIAG_DETAIL=$(echo "$DIAG_JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); s=[x for x in d.get('steps',[]) if not x.get('ok')]; step=s[0] if s else {}; print(' — '.join(x for x in [step.get('error',''), step.get('detail','')] if x))" 2>/dev/null || echo "")
+    # #767: always emit the full diagnose JSON so operators see every step's
+    # Detail field even when the Python extraction above fails or the shape
+    # drifts. The burst is bracketed like steps 2 and 4 for grep-friendly CI.
+    log "── DIAGNOSTIC BURST (step 7b — terminal diagnose for $wid) ──"
+    echo "$DIAG_JSON" | python3 -m json.tool 2>/dev/null || echo "$DIAG_JSON"
+    log "── END DIAGNOSTIC ──"
     fail "Workspace $wid terminal diagnose failed at step '$DIAG_FAIL': $DIAG_DETAIL — check tenant SG has tcp/22 from the configured EIC endpoint SG, MOLECULE_EIC_ENDPOINT_SG_ID is set in Railway, and EIC endpoint health"
   fi
 done
