@@ -101,18 +101,29 @@ jobs:
       # so teardown MUST positively confirm no slug-tagged box survives.
       E2E_AWS_LEAK_CHECK: required
       E2E_AWS_TERMINATE_LEAKS: '1'
-      # claude-code + MiniMax is the cheapest boot-to-online path (same as the
-      # saas job). The reconciler test never makes a completion, but the key is
-      # wired so the first boot reaches online on the same path the saas
-      # harness uses. First non-empty wins in the script's priority chain.
-      E2E_MINIMAX_API_KEY: ${{ secrets.MOLECULE_STAGING_MINIMAX_API_KEY }}
-      E2E_ANTHROPIC_API_KEY: ${{ secrets.MOLECULE_STAGING_ANTHROPIC_API_KEY }}
-      E2E_OPENAI_API_KEY: ${{ secrets.MOLECULE_STAGING_OPENAI_API_KEY }}
       E2E_RUNTIME: claude-code
       # Platform-managed create path (moonshot/kimi-k2.6, no tenant key) — the
       # combo proven to create cleanly; this test only needs the ws online.
+      #
+      # DELIBERATELY no E2E_MODEL_SLUG and no E2E_*_API_KEY here — mirror the
+      # e2e-staging-platform-boot job in e2e-staging-saas.yml. On
+      # E2E_LLM_PATH=platform the harness sends EMPTY secrets and lets
+      # pick_model_slug return the platform default moonshot/kimi-k2.6 (a member
+      # of the providers.yaml claude-code `platform` arm → provider=platform,
+      # billed by the CP LLM proxy, NO tenant key required).
+      #
+      # The previous wiring set E2E_MODEL_SLUG: MiniMax-M2 (a BARE id in the
+      # providers.yaml `minimax` BYOK arm → provider=minimax, requires
+      # MINIMAX_API_KEY) while sending secrets={} on the platform path. Because
+      # E2E_MODEL_SLUG wins over the E2E_LLM_PATH=platform branch in
+      # pick_model_slug, the workspace got a keyless BYOK-minimax model, could
+      # not resolve a serving path, and booted to status=failed — never online
+      # (run 223233: "MODEL_SLUG=MiniMax-M2" then "→ failed", "never reached
+      # status=online within 900s"). The BYOK key wiring was equally misleading:
+      # the harness ignores E2E_*_API_KEY on E2E_LLM_PATH=platform, so the keys
+      # only made the contradiction harder to spot. Platform-only is correct
+      # here — this test exercises instance-state, never an LLM completion.
       E2E_LLM_PATH: platform
-      E2E_MODEL_SLUG: MiniMax-M2
       E2E_RUN_ID: "${{ github.run_id }}-${{ github.run_attempt }}"
       E2E_KEEP_ORG: ${{ github.event.inputs.keep_org && '1' || '0' }}
 
