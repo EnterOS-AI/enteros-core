@@ -10,6 +10,7 @@ import { Canvas } from "@/components/Canvas";
 import { Legend } from "@/components/Legend";
 import { CommunicationOverlay } from "@/components/CommunicationOverlay";
 import { ChatTab } from "@/components/tabs/ChatTab";
+import { WorkspacePanelTabs } from "@/components/WorkspacePanelTabs";
 import { PlatformBillingSection } from "./PlatformBillingSection";
 import { SettingsTabs } from "@/components/settings";
 import s from "./Concierge.module.css";
@@ -501,10 +502,40 @@ export function ConciergeShell() {
                   <div className={s.settingsHead}>
                     <h1>Settings</h1>
                     <p>
-                      Org-level settings for the platform concierge. Manage how the
-                      platform agent pays for model usage, plus shared secrets,
-                      tokens and org identity.
+                      Org-level settings for the platform concierge. Configure the
+                      concierge exactly like any workspace — config.yaml, plugins
+                      and skills, container/compute, display, channels, schedule
+                      and secrets — plus how it pays for model usage and org
+                      identity.
                     </p>
+                  </div>
+
+                  {/* Platform agent configuration — the FULL workspace tab UI
+                      (Config, Plugins/Skills, Container, Display, Details,
+                      Activity, Terminal, Channels, Schedule, Files, Memory,
+                      Traces, Events, Audit), reusing the exact same
+                      WorkspacePanelTabs the Org-map SidePanel renders so the two
+                      surfaces can't drift. Pointed at the platform agent; the
+                      panel owns its own local active-tab state so it doesn't
+                      fight the map's node selection. */}
+                  <div className={s.scard}>
+                    <div className={s.scardHead}>
+                      <div className={s.scardTitle}>Platform agent configuration</div>
+                      <div className={s.scardDesc}>
+                        Update the concierge like any workspace: its config.yaml,
+                        plugins &amp; skills, container/compute, display, channels,
+                        schedule and more.
+                      </div>
+                    </div>
+                    {platformRoot ? (
+                      <div className={s.embedPanel}>
+                        <WorkspacePanelTabs key={platformRoot.id} node={platformRoot} defaultTab="config" />
+                      </div>
+                    ) : (
+                      <div className={s.scardDesc}>
+                        No platform agent yet. Spin one up from Home to configure it.
+                      </div>
+                    )}
                   </div>
 
                   {platformId ? (
