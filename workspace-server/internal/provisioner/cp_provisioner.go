@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -477,12 +478,25 @@ func (p *CPProvisioner) stopInternal(ctx context.Context, workspaceID string, pr
 		// orphan sweeper / shutdown path can branch.
 		return ErrNoBackend
 	}
-	url := fmt.Sprintf("%s/cp/workspaces/%s?instance_id=%s", p.baseURL, workspaceID, instanceID)
+	provider, err := resolveProvider(ctx, workspaceID)
+	if err != nil {
+		return fmt.Errorf("cp provisioner: stop: resolve provider: %w", err)
+	}
+
+	q := url.Values{}
+	q.Set("instance_id", instanceID)
+	if provider != "" {
+		// #2386: CP Deprovision routes by provider so a non-AWS workspace is
+		// torn down by its own backend instead of falling through to the AWS
+		// terminate path (which would leak the box).
+		q.Set("provider", provider)
+	}
 	if prune {
 		// internal#734: ask CP to erase the data volume on this delete.
-		url += "&prune=true"
+		q.Set("prune", "true")
 	}
-	req, err := http.NewRequestWithContext(ctx, "DELETE", url, nil)
+	u := fmt.Sprintf("%s/cp/workspaces/%s?%s", p.baseURL, workspaceID, q.Encode())
+	req, err := http.NewRequestWithContext(ctx, "DELETE", u, nil)
 	if err != nil {
 		return fmt.Errorf("cp provisioner: stop: build request: %w", err)
 	}
@@ -547,6 +561,27 @@ var resolveInstanceID = func(ctx context.Context, workspaceID string) (string, e
 		return "", nil
 	}
 	return instanceID.String, nil
+}
+
+// resolveProvider reads workspaces.compute->>'provider' for the given workspace.
+// Returns ("", nil) when the row has no provider or the column is missing —
+// callers treat empty as "default provider" (AWS). Exposed as a package var
+// so tests can substitute a stub, same pattern as resolveInstanceID.
+var resolveProvider = func(ctx context.Context, workspaceID string) (string, error) {
+	if db.DB == nil {
+		return "", nil
+	}
+	var provider sql.NullString
+	err := db.DB.QueryRowContext(ctx,
+		`SELECT compute->>'provider' FROM workspaces WHERE id = $1`, workspaceID,
+	).Scan(&provider)
+	if err != nil && err != sql.ErrNoRows {
+		return "", err
+	}
+	if !provider.Valid {
+		return "", nil
+	}
+	return provider.String, nil
 }
 
 // IsRunning checks workspace EC2 instance state via the control plane.
