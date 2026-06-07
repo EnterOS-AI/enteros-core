@@ -10,6 +10,8 @@ import { Canvas } from "@/components/Canvas";
 import { Legend } from "@/components/Legend";
 import { CommunicationOverlay } from "@/components/CommunicationOverlay";
 import { ConciergeChat } from "./ConciergeChat";
+import { PlatformBillingSection } from "./PlatformBillingSection";
+import { SettingsTabs } from "@/components/settings";
 import s from "./Concierge.module.css";
 import {
   IcHome, IcOrgMap, IcSettings, IcSearch, IcBell, IcSun, IcMoon, IcChevDown,
@@ -443,10 +445,46 @@ export function ConciergeShell() {
 
             {/* SETTINGS VIEW */}
             <div className={`${s.view} ${topView === "settings" ? s.active : ""}`}>
-              <div className={s.ph}>
-                <IcSettings />
-                <h2>Settings</h2>
-                <p>Org-level settings live here. For now, per-workspace config stays on the Org map (select a node).</p>
+              <div className={s.settingsScroll}>
+                <div className={s.settingsInner}>
+                  <div className={s.settingsHead}>
+                    <h1>Settings</h1>
+                    <p>
+                      Org-level settings for the platform concierge. Manage how the
+                      platform agent pays for model usage, plus shared secrets,
+                      tokens and org identity.
+                    </p>
+                  </div>
+
+                  {platformId ? (
+                    <PlatformBillingSection platformId={platformId} />
+                  ) : (
+                    <div className={s.scard}>
+                      <div className={s.scardHead}>
+                        <div className={s.scardTitle}>LLM billing — platform agent</div>
+                        <div className={s.scardDesc}>
+                          No platform agent yet. Spin one up from Home to configure
+                          billing.
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  <div className={s.scard}>
+                    <div className={s.scardHead}>
+                      <div className={s.scardTitle}>Org &amp; canvas settings</div>
+                      <div className={s.scardDesc}>
+                        Secrets, workspace tokens, org API keys and organization
+                        identity. These also live behind the gear in the top bar.
+                      </div>
+                    </div>
+                    {platformId && (
+                      <div className={s.embedSettings}>
+                        <SettingsTabs workspaceId={platformId} />
+                      </div>
+                    )}
+                  </div>
+                </div>
               </div>
             </div>
           </div>
