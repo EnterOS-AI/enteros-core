@@ -146,7 +146,7 @@ export type PanelTab = "details" | "skills" | "chat" | "terminal" | "display" | 
  * Top-level canvas view. "home" is the Org Concierge view (chat with the
  * platform agent); "map" is the node-graph canvas (the original view).
  */
-export type TopView = "home" | "map";
+export type TopView = "home" | "map" | "settings";
 
 export interface ContextMenuState {
   x: number;
@@ -292,7 +292,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
   edges: [],
   selectedNodeId: null,
   panelTab: "chat",
-  topView: "map",
+  topView: "home",
   dragOverNodeId: null,
   contextMenu: null,
   sidePanelWidth: 480, // matches SIDEPANEL_DEFAULT_WIDTH in SidePanel.tsx
