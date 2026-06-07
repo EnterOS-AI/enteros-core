@@ -1,16 +1,19 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useCanvasStore, type TopView } from "@/store/canvas";
 import { useTheme } from "@/lib/theme-provider";
+import { api } from "@/lib/api";
+import { showToast } from "@/components/Toaster";
+import type { ActivityEntry } from "@/types/activity";
 import { Canvas } from "@/components/Canvas";
 import { Legend } from "@/components/Legend";
 import { CommunicationOverlay } from "@/components/CommunicationOverlay";
+import { ConciergeChat } from "./ConciergeChat";
 import s from "./Concierge.module.css";
 import {
   IcHome, IcOrgMap, IcSettings, IcSearch, IcBell, IcSun, IcMoon, IcChevDown,
-  IcQueue, IcCaret, IcMolecule, IcCheck, IcSchedule, IcWorkspace, IcWarn,
-  IcSend, IcHistory, IcDots, IcClock, IcTrash, IcChat,
+  IcQueue, IcCaret, IcMolecule, IcSchedule, IcTrash,
 } from "./icons";
 
 /* ── status → concept palette ─────────────────────────────────────────── */
@@ -49,6 +52,39 @@ function gradientFor(id: string): string {
 
 type SbTab = "agents" | "tasks" | "approvals";
 
+interface PendingApproval {
+  id: string;
+  workspace_id: string;
+  workspace_name: string;
+  action: string;
+  reason: string | null;
+  status: string;
+  created_at: string;
+}
+interface Schedule {
+  id: string;
+  name: string;
+  cron_expr: string;
+  prompt: string;
+  enabled: boolean;
+  next_run_at: string | null;
+}
+
+/** ISO timestamp → "9:05 PM" (local). Empty string on a bad/missing value. */
+function clockTime(iso: string | null | undefined): string {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  return d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+}
+
+/** A human action label from an activity row. */
+function activityText(a: ActivityEntry): string {
+  if (a.summary) return a.summary;
+  const verb = a.activity_type?.replace(/_/g, " ") ?? "activity";
+  return a.method ? `${verb} · ${a.method}` : verb;
+}
+
 export function ConciergeShell() {
   const nodes = useCanvasStore((st) => st.nodes);
   const topView = useCanvasStore((st) => st.topView);
@@ -82,6 +118,49 @@ export function ConciergeShell() {
     () => roots.find((r) => /concierge|platform/i.test(`${r.data.role ?? ""} ${r.data.name ?? ""}`)) ?? roots[0] ?? null,
     [roots],
   );
+
+  const platformId = platformRoot?.id ?? null;
+
+  // ── live data: approvals (org-wide), activity + schedules (platform agent) ──
+  const [approvals, setApprovals] = useState<PendingApproval[]>([]);
+  const [activity, setActivity] = useState<ActivityEntry[]>([]);
+  const [schedules, setSchedules] = useState<Schedule[]>([]);
+  const [deciding, setDeciding] = useState<string | null>(null);
+
+  const loadApprovals = useCallback(() => {
+    api.get<PendingApproval[]>("/approvals/pending")
+      .then((r) => setApprovals(r ?? []))
+      .catch(() => setApprovals([]));
+  }, []);
+  useEffect(() => { loadApprovals(); }, [loadApprovals]);
+
+  useEffect(() => {
+    if (!platformId) return;
+    let cancelled = false;
+    api.get<ActivityEntry[]>(`/workspaces/${platformId}/activity?limit=12`)
+      .then((r) => { if (!cancelled) setActivity(r ?? []); })
+      .catch(() => { if (!cancelled) setActivity([]); });
+    api.get<Schedule[]>(`/workspaces/${platformId}/schedules`)
+      .then((r) => { if (!cancelled) setSchedules(r ?? []); })
+      .catch(() => { if (!cancelled) setSchedules([]); });
+    return () => { cancelled = true; };
+  }, [platformId]);
+
+  const decide = useCallback(async (a: PendingApproval, decision: "approved" | "denied") => {
+    if (deciding) return;
+    setDeciding(a.id);
+    try {
+      await api.post(`/workspaces/${a.workspace_id}/approvals/${a.id}/decide`, {
+        decision, decided_by: "human",
+      });
+      showToast(decision === "approved" ? "Approved" : "Denied", decision === "approved" ? "success" : "info");
+      setApprovals((prev) => prev.filter((x) => x.id !== a.id));
+    } catch {
+      showToast("Failed to record decision", "error");
+    } finally {
+      setDeciding(null);
+    }
+  }, [deciding]);
 
   const nav = (v: TopView) => setTopView(v);
 
@@ -211,10 +290,10 @@ export function ConciergeShell() {
                 <div className={s.sbTabs}>
                   <button className={`${s.sbTab} ${sbTab === "agents" ? s.active : ""}`} onClick={() => setSbTab("agents")}>Agents</button>
                   <button className={`${s.sbTab} ${sbTab === "tasks" ? s.active : ""}`} onClick={() => setSbTab("tasks")}>
-                    Tasks<span className={s.cnt}>2</span>
+                    Tasks{schedules.length > 0 && <span className={s.cnt}>{schedules.length}</span>}
                   </button>
                   <button className={`${s.sbTab} ${sbTab === "approvals" ? s.active : ""}`} onClick={() => setSbTab("approvals")}>
-                    Approvals<span className={s.cnt}>1</span>
+                    Approvals{approvals.length > 0 && <span className={s.cnt}>{approvals.length}</span>}
                   </button>
                 </div>
                 <div className={s.sbBody}>
@@ -228,116 +307,95 @@ export function ConciergeShell() {
                       </div>
                       <div className={s.sbSection}>Recent activity</div>
                       <div>
-                        <div className={s.act}><span className={s.actTime}>9:05 PM</span><div className={`${s.actLine} ${s.grn}`}><div className={s.actText}><b>SEO Researcher</b> published draft</div></div></div>
-                        <div className={s.act}><span className={s.actTime}>9:02 PM</span><div className={s.actLine}><div className={s.actText}>Delegated task to <b>Backend Engineer</b></div></div></div>
-                        <div className={s.act}><span className={s.actTime}>8:58 PM</span><div className={`${s.actLine} ${s.grn}`}><div className={s.actText}>Scheduled <b>weekly publish</b></div></div></div>
-                        <div className={s.act}><span className={s.actTime}>8:54 PM</span><div className={s.actLine}><div className={s.actText}>Created workspace <b>SEO Researcher</b></div></div></div>
+                        {activity.length === 0 && (
+                          <div className={s.empty}>No recent activity yet.</div>
+                        )}
+                        {activity.map((a) => {
+                          const ok = a.status !== "error" && a.status !== "failed";
+                          return (
+                            <div key={a.id} className={s.act}>
+                              <span className={s.actTime}>{clockTime(a.created_at)}</span>
+                              <div className={`${s.actLine} ${ok ? s.grn : ""}`}>
+                                <div className={s.actText}>{activityText(a)}</div>
+                              </div>
+                            </div>
+                          );
+                        })}
                       </div>
                     </>
                   )}
                   {sbTab === "tasks" && (
                     <>
-                      <div className={s.task}>
-                        <div className={s.taskRow}>
-                          <div className={`${s.taskIc} ${s.run}`}><IcClock /></div>
-                          <div className={s.taskMeta}><div className={s.taskT}>Build weekly publish pipeline</div><div className={s.taskS}>Backend Engineer<span className={s.pip} />in progress</div></div>
+                      {schedules.length === 0 && (
+                        <div className={s.empty}>No scheduled tasks yet. Ask the concierge to set one up.</div>
+                      )}
+                      {schedules.map((sc) => (
+                        <div key={sc.id} className={s.task}>
+                          <div className={s.taskRow}>
+                            <div className={`${s.taskIc} ${sc.enabled ? s.sched : s.done}`}><IcSchedule /></div>
+                            <div className={s.taskMeta}>
+                              <div className={s.taskT}>{sc.name}</div>
+                              <div className={s.taskS}>
+                                <span style={{ fontFamily: "var(--mono)" }}>{sc.cron_expr}</span>
+                                <span className={s.pip} />
+                                {sc.enabled ? "scheduled" : "disabled"}
+                                {sc.next_run_at ? ` · next ${clockTime(sc.next_run_at)}` : ""}
+                              </div>
+                            </div>
+                          </div>
                         </div>
-                      </div>
-                      <div className={s.task}>
-                        <div className={s.taskRow}>
-                          <div className={`${s.taskIc} ${s.sched}`}><IcSchedule /></div>
-                          <div className={s.taskMeta}><div className={s.taskT}>Weekly publish · Mondays 9am</div><div className={s.taskS}>SEO Researcher<span className={s.pip} />scheduled</div></div>
-                        </div>
-                      </div>
-                      <div className={`${s.task} ${s.isDone}`}>
-                        <div className={s.taskRow}>
-                          <div className={`${s.taskIc} ${s.done}`}><IcCheck /></div>
-                          <div className={s.taskMeta}><div className={s.taskT}>Draft launch post: 10 SEO tips</div><div className={s.taskS}>SEO Researcher<span className={s.pip} />done</div></div>
-                        </div>
-                      </div>
+                      ))}
                     </>
                   )}
                   {sbTab === "approvals" && (
-                    <div className={s.apprCard}>
-                      <div className={s.apprRow}>
-                        <div className={s.apprIc}><IcTrash /></div>
-                        <div className={s.apprMeta}><div className={s.apprT}>Delete workspace <code>old-test</code></div><div className={s.apprS}>Requested by PM · destructive</div></div>
-                      </div>
-                      <div className={s.apprActions}>
-                        <button className={`${s.btn} ${s.approve} ${s.flex}`}>Approve</button>
-                        <button className={`${s.btn} ${s.deny} ${s.flex}`}>Deny</button>
-                      </div>
-                    </div>
+                    <>
+                      {approvals.length === 0 && (
+                        <div className={s.empty}>No pending approvals. Destructive actions await sign-off here.</div>
+                      )}
+                      {approvals.map((a) => (
+                        <div key={a.id} className={s.apprCard} style={{ marginBottom: 7 }}>
+                          <div className={s.apprRow}>
+                            <div className={s.apprIc}><IcTrash /></div>
+                            <div className={s.apprMeta}>
+                              <div className={s.apprT}>{a.action.replace(/_/g, " ")} <code>{a.workspace_name}</code></div>
+                              <div className={s.apprS}>{a.reason || "destructive"}</div>
+                            </div>
+                          </div>
+                          <div className={s.apprActions}>
+                            <button className={`${s.btn} ${s.approve} ${s.flex}`} disabled={deciding === a.id} onClick={() => decide(a, "approved")}>
+                              {deciding === a.id ? "…" : "Approve"}
+                            </button>
+                            <button className={`${s.btn} ${s.deny} ${s.flex}`} disabled={deciding === a.id} onClick={() => decide(a, "denied")}>
+                              {deciding === a.id ? "…" : "Deny"}
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </>
                   )}
                 </div>
               </aside>
 
-              {/* CHAT */}
-              <section className={s.chat}>
-                <div className={s.chatHead}>
-                  <div className={s.chAv}><IcChat /></div>
-                  <div className={s.chMeta}>
-                    <div className={s.chTitle}>{platformRoot?.data.name ?? "Org Concierge"}</div>
-                    <div className={s.chSub}><span className={s.sdot} />online · platform agent</div>
-                  </div>
-                  <div className={s.chTools}>
-                    <button className={s.iconPill} title="History"><IcHistory /></button>
-                    <button className={s.iconPill} title="More"><IcDots /></button>
-                  </div>
-                </div>
-                <div className={s.chatScroll}>
-                  <div className={s.chatInner}>
-                    <div className={`${s.msg} ${s.user}`}>
-                      <div className={s.msgAv}>HW</div>
-                      <div className={s.bubbleWrap}><div className={s.bubble}>Spin up an SEO team that publishes a blog post weekly</div></div>
-                    </div>
-                    <div className={`${s.msg} ${s.bot}`}>
-                      <div className={s.msgAv}><IcChat /></div>
-                      <div className={s.bubbleWrap}>
-                        <div className={s.bubble}>On it. I&apos;ve created a dedicated <b>SEO Researcher</b> workspace and set up a recurring publish schedule so a fresh post ships every week — no manual nudging needed.</div>
-                        <div className={s.actionCard}>
-                          <div className={s.acIc}><IcWorkspace /></div>
-                          <div className={s.acMeta}><div className={s.acLabel}>Action · workspace</div><div className={s.acTitle}>Created workspace <span className={s.pill}>SEO Researcher</span></div></div>
-                          <div className={s.acCheck}><IcCheck /></div>
-                        </div>
-                        <div className={s.actionCard}>
-                          <div className={s.acIc}><IcSchedule /></div>
-                          <div className={s.acMeta}><div className={s.acLabel}>Action · schedule</div><div className={s.acTitle}>Scheduled <span className={s.pill}>weekly publish · Mon 9am</span></div></div>
-                          <div className={s.acCheck}><IcCheck /></div>
-                        </div>
-                        <div className={s.bubble}>One thing needs your sign-off before I continue — the leftover <b>old-test</b> workspace overlaps with the new team and should be removed.</div>
-                        <div className={s.reqCard}>
-                          <div className={s.reqTop}>
-                            <div className={s.reqIc}><IcWarn /></div>
-                            <div className={s.reqMeta}>
-                              <div className={s.reqLabel}>Approval required</div>
-                              <div className={s.reqTitle}>Approve destructive action: delete workspace <code>old-test</code>?</div>
-                              <div className={s.reqDesc}>This permanently removes the workspace, its agents and run history. This cannot be undone.</div>
-                            </div>
-                          </div>
-                          <div className={s.reqActions}>
-                            <button className={`${s.btn} ${s.approve}`}>Approve</button>
-                            <button className={`${s.btn} ${s.deny}`}>Deny</button>
-                          </div>
-                        </div>
-                      </div>
+              {/* CHAT — real platform-agent conversation */}
+              {platformId ? (
+                <ConciergeChat
+                  workspaceId={platformId}
+                  agentName={platformRoot?.data.name ?? "Org Concierge"}
+                  online={
+                    platformRoot?.data.status === "online" ||
+                    platformRoot?.data.status === "degraded"
+                  }
+                  statusLabel={statusInfo(platformRoot?.data.status ?? "").label}
+                />
+              ) : (
+                <section className={s.chat}>
+                  <div className={s.greetWrap}>
+                    <div className={s.greet}>
+                      <span className={s.stamp}>✷</span> No platform agent yet
                     </div>
                   </div>
-                </div>
-                <div className={s.composer}>
-                  <div className={s.composerInner}>
-                    <div className={s.inputBox}>
-                      <div className={s.inputTop}>
-                        <textarea className={s.msgInput} rows={1} placeholder="Message your concierge" />
-                        <button className={s.send} title="Send"><IcSend /></button>
-                      </div>
-                      <div className={s.inputBottom}>
-                        <span className={s.hint}><kbd>↵</kbd>&nbsp;send</span>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              </section>
+                </section>
+              )}
             </div>
 
             {/* ORG MAP VIEW — the live canvas */}
