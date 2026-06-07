@@ -1774,6 +1774,7 @@ func TestProvisionWorkspaceCP_InstanceIDPersistFail_MarksFailed(t *testing.T) {
 
 	t.Setenv("MOLECULE_LLM_BASE_URL", "https://api.example.test/api/v1/internal/llm/openai/v1")
 	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
+	t.Setenv("MOLECULE_DEPLOY_MODE", "self-hosted")
 
 	mock := setupTestDB(t)
 
@@ -1829,6 +1830,18 @@ func TestProvisionWorkspaceCP_InstanceIDPersistFail_MarksFailed(t *testing.T) {
 	if got := cap.lastData["attempts"]; got != instanceIDPersistRetryAttempts {
 		t.Errorf("broadcast attempts = %v, want %d", got, instanceIDPersistRetryAttempts)
 	}
+	// Security: RC 9378 — raw DB error must NEVER be client-visible in broadcast/WS/SSE.
+	for _, key := range []string{"detail", "db_error", "raw_error"} {
+		if val, has := cap.lastData[key]; has {
+			t.Errorf("broadcast must NOT contain raw DB error under key %q; got %v", key, val)
+		}
+	}
+	// Also verify no raw error string leaked into any broadcast field.
+	for key, val := range cap.lastData {
+		if s, ok := val.(string); ok && strings.Contains(s, "connection reset by peer") {
+			t.Errorf("broadcast field %q contains raw DB error leak: %q", key, s)
+		}
+	}
 	if stub.stopCalls != 0 {
 		t.Errorf("Stop called %d times; want 0 (live instance must NOT be terminated)", stub.stopCalls)
 	}
@@ -1844,6 +1857,7 @@ func TestProvisionWorkspaceCP_InstanceIDPersistFail_RetrySucceeds(t *testing.T) 
 
 	t.Setenv("MOLECULE_LLM_BASE_URL", "https://api.example.test/api/v1/internal/llm/openai/v1")
 	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
+	t.Setenv("MOLECULE_DEPLOY_MODE", "self-hosted")
 
 	mock := setupTestDB(t)
 
