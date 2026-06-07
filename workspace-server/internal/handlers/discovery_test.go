@@ -277,6 +277,52 @@ func TestPeers_RootWorkspace_NoPeers(t *testing.T) {
 	}
 }
 
+// validateDiscoveryCaller must accept the org ADMIN_TOKEN (the canvas
+// operator's credential) even when the workspace has its OWN live token — so
+// the concierge config tabs (Details → peers) load for the platform agent,
+// which the operator doesn't personally hold a per-workspace token for.
+// Regression guard for the 401 the discovery routes returned before the
+// admin/org-token fallback was added.
+func TestPeers_AdminToken_Allowed(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewDiscoveryHandler()
+
+	const adminTok = "test-admin-token"
+	t.Setenv("ADMIN_TOKEN", adminTok)
+
+	// A live token EXISTS for the workspace (grandfather path NOT taken), so a
+	// valid credential is required. The operator presents ADMIN_TOKEN, not the
+	// workspace's own per-workspace token.
+	mock.ExpectQuery("SELECT COUNT.+workspace_auth_tokens").
+		WithArgs("ws-platform").
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+
+	// After the admin-token fallback allows, Peers runs its lookups (org root).
+	mock.ExpectQuery("SELECT parent_id FROM workspaces WHERE id =").
+		WithArgs("ws-platform").
+		WillReturnRows(sqlmock.NewRows([]string{"parent_id"}).AddRow(nil))
+	peerCols := []string{"id", "name", "role", "tier", "status", "agent_card", "url", "parent_id", "active_tasks"}
+	mock.ExpectQuery("SELECT w.id, w.name.*WHERE w.parent_id = \\$1 AND w.id != \\$2").
+		WithArgs("ws-platform", "ws-platform").
+		WillReturnRows(sqlmock.NewRows(peerCols))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-platform"}}
+	c.Request = httptest.NewRequest("GET", "/registry/ws-platform/peers", nil)
+	c.Request.Header.Set("Authorization", "Bearer "+adminTok)
+
+	handler.Peers(c)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("admin token should be accepted; expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
 // ==================== Peers — ?q= filter (#1038) ====================
 
 // peersFilterFixture mocks the 4 SQL reads (parent_id lookup + siblings +

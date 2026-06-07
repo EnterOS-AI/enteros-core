@@ -2,15 +2,18 @@ package handlers
 
 import (
 	"context"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/middleware"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/orgtoken"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/registry"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wsauth"
@@ -481,6 +484,29 @@ func validateDiscoveryCaller(ctx context.Context, c *gin.Context, workspaceID st
 		}
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing workspace auth token"})
 		return errors.New("missing token")
+	}
+	// Admin-token fallback — lets the canvas operator (dashboard / concierge
+	// Settings config tabs) read a workspace's peers with the single admin
+	// credential, mirroring middleware.WorkspaceAuth. Without this the
+	// operator's admin bearer fell through to the per-workspace ValidateToken
+	// below and 401'd for any workspace it doesn't personally hold a token for
+	// — e.g. the platform agent surfaced in the concierge config tabs.
+	if adminSecret := os.Getenv("ADMIN_TOKEN"); adminSecret != "" &&
+		subtle.ConstantTimeCompare([]byte(tok), []byte(adminSecret)) == 1 {
+		return nil
+	}
+	// Org-scoped API token — grants access to every workspace in the org (same
+	// product spec as WorkspaceAuth). Checked before the per-workspace token so
+	// an org-key presenter doesn't hit the narrower failure path.
+	if _, _, _, err := orgtoken.Validate(ctx, db.DB, tok); err == nil {
+		return nil
+	} else if !errors.Is(err, orgtoken.ErrInvalidToken) {
+		log.Printf("wsauth: discovery orgtoken.Validate(%s): datastore lookup failed (returning 503): %v", workspaceID, err)
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error": "platform datastore unavailable — retry shortly",
+			"code":  "platform_unavailable",
+		})
+		return err
 	}
 	if err := wsauth.ValidateToken(ctx, db.DB, workspaceID, tok); err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid workspace auth token"})
