@@ -31,9 +31,16 @@
 # advisory lifecycle-only run (the proxy-reach step then asserts reachability,
 # not the canned text — a real LLM-less runtime can't produce "STUB OK").
 #
-# Run:
+# Run (stub, default — fast, no LLM):
 #   BASE=http://localhost:8080 ADMIN_TOKEN=dev-local-admin-token \
 #     bash tests/e2e/test_local_provision_lifecycle_e2e.sh
+#
+# Run (REAL MiniMax LLM round-trip — cheapest real model; asserts a real reply):
+#   BASE=http://localhost:8080 ADMIN_TOKEN=dev-local-admin-token \
+#     LIFECYCLE_LLM=minimax MINIMAX_API_KEY=<key> \
+#     bash tests/e2e/test_local_provision_lifecycle_e2e.sh
+#   (MINIMAX_API_KEY missing => loud skip exit 0; key is only ever sent in the
+#    secret-write curl body, never echoed or written to disk.)
 set -euo pipefail
 
 source "$(dirname "$0")/_lib.sh"  # sets BASE default + admin-auth + cleanup helpers
@@ -42,6 +49,11 @@ source "$(dirname "$0")/_lib.sh"  # sets BASE default + admin-auth + cleanup hel
 ADMIN_TOKEN="${ADMIN_TOKEN:-${MOLECULE_ADMIN_TOKEN:-}}"
 export ADMIN_TOKEN MOLECULE_ADMIN_TOKEN="${ADMIN_TOKEN}"
 
+# Was ONLINE_TIMEOUT set by the caller? Remember before we default it so the
+# minimax mode (heavier real-template boot) can bump the default without
+# clobbering an explicit operator/CI override.
+ONLINE_TIMEOUT_EXPLICIT=0
+[ -n "${ONLINE_TIMEOUT:-}" ] && ONLINE_TIMEOUT_EXPLICIT=1
 ONLINE_TIMEOUT="${ONLINE_TIMEOUT:-90}"          # seconds to wait for online
 A2A_TIMEOUT="${A2A_TIMEOUT:-30}"
 STUB_DIR="$(cd "$(dirname "$0")/stub-runtime" && pwd)"
@@ -79,6 +91,49 @@ LIFECYCLE_MODEL="${LIFECYCLE_MODEL:-claude-opus-4-7}"
 LIFECYCLE_LLM_KEY="${LIFECYCLE_LLM_KEY:-ANTHROPIC_API_KEY}"
 LIFECYCLE_LLM_VALUE="${LIFECYCLE_LLM_VALUE:-sk-ant-e2e-stub-dummy-not-a-real-key}"
 LATEST_TAG="${CACHE_REPO}:latest"
+
+# ---- LIFECYCLE_LLM: real-LLM round-trip mode -------------------------------
+# Default "" = the existing behaviour (stub or LLM-less real image).
+#
+#   LIFECYCLE_LLM=minimax — provision the REAL claude-code template image with a
+#   MiniMax BYOK credential and assert an ACTUAL model reply at the proxy-reach
+#   step (Step 5), proving a genuine round-trip through the ws-<id>:8000 proxy.
+#
+#   Why MiniMax: it's the cheapest LLM the platform offers (the staging canaries'
+#   primary auth path post-2026-05-04). The claude-code adapter's `minimax`
+#   provider (providers.yaml:258) reads MINIMAX_API_KEY at boot and points
+#   ANTHROPIC_BASE_URL at api.minimax.io/anthropic — MiniMax's OWN API, NOT the
+#   molecule LLM proxy — so a BYOK MiniMax workspace reaches the model DIRECTLY
+#   and works on this local dev stack with no CP proxy env.
+#
+#   The registered claude-code slug is the BARE id `MiniMax-M2.7` (derives
+#   provider=minimax => byok). The colon form `minimax:MiniMax-M2.7` is
+#   UNREGISTERED on claude-code (internal#718). auth_env for `minimax` accepts
+#   MINIMAX_API_KEY, which the adapter projects into ANTHROPIC_AUTH_TOKEN.
+#
+#   The real key MUST be supplied via the MINIMAX_API_KEY env var (never echoed
+#   or written to disk by this script — it only travels in the secret-write curl
+#   body, exactly like the dummy ANTHROPIC_API_KEY does today). Missing key =>
+#   loud skip (exit 0), never a red fail (mirrors the serving-e2e pattern).
+LIFECYCLE_LLM="${LIFECYCLE_LLM:-}"
+if [ "$LIFECYCLE_LLM" = "minimax" ]; then
+  if [ -z "${MINIMAX_API_KEY:-}" ]; then
+    echo "SKIP: LIFECYCLE_LLM=minimax but MINIMAX_API_KEY is not set in the env."
+    echo "      Provide a real MiniMax key (the advisory CI job reads it from a"
+    echo "      CI secret) to run the real-LLM round-trip. Skipping (exit 0)."
+    exit 0
+  fi
+  # Real claude-code template build (provisioner resolves+builds via
+  # RegistryModeLocal — same path as the advisory lifecycle-real job).
+  LIFECYCLE_PROVISIONER_BUILDS="1"
+  # Registered BYOK MiniMax slug for claude-code (bare id => provider=minimax).
+  LIFECYCLE_MODEL="MiniMax-M2.7"
+  LIFECYCLE_LLM_KEY="MINIMAX_API_KEY"
+  LIFECYCLE_LLM_VALUE="${MINIMAX_API_KEY}"
+  # The real template boot is heavier than the stub; give it room (unless the
+  # caller pinned ONLINE_TIMEOUT explicitly).
+  [ "$ONLINE_TIMEOUT_EXPLICIT" -eq 0 ] && ONLINE_TIMEOUT=180
+fi
 
 # Image the provisioner should actually run. Default: build the stub. Override
 # to a real image (a pre-built tag) for the advisory lifecycle-only run.
@@ -170,7 +225,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 echo "=== Local Docker-Provisioner Lifecycle E2E ==="
-echo "BASE=$BASE  runtime=$RUNTIME  using_stub=$USING_STUB  cache_tag=${CACHE_TAG:-<resolve-in-step-1>}"
+echo "BASE=$BASE  runtime=$RUNTIME  using_stub=$USING_STUB  llm=${LIFECYCLE_LLM:-none}  model=$LIFECYCLE_MODEL  cache_tag=${CACHE_TAG:-<resolve-in-step-1>}"
 echo ""
 
 # Preflight: docker must be reachable and the platform must be up.
@@ -299,6 +354,25 @@ SEC=$(curl -s -X POST "$BASE/workspaces/$WSID/secrets" \
   -d "{\"key\":\"$LIFECYCLE_LLM_KEY\",\"value\":\"$LIFECYCLE_LLM_VALUE\"}")
 echo "  secret write: $(echo "$SEC" | head -c 120)"
 
+# In minimax mode also write MODEL_PROVIDER=minimax as a secret env. The
+# claude-code adapter's _resolve_model_and_provider_from_env honours
+# MODEL_PROVIDER ONLY when it matches a registered provider name (else it's
+# treated as a legacy model-id), so a literal "minimax" routes the workspace to
+# the `minimax` provider entry — projecting MINIMAX_API_KEY → ANTHROPIC_AUTH_TOKEN
+# and setting ANTHROPIC_BASE_URL=https://api.minimax.io/anthropic. workspace-
+# server injects MODEL/MOLECULE_MODEL from the picked slug but NO LONGER emits
+# MODEL_PROVIDER (applyRuntimeModelEnv, post-2026-05-19), so this secret-provided
+# value survives into the container env. Without it a BARE `MiniMax-M2.7` derives
+# no provider and falls through to the anthropic-api default (boot banner
+# "provider=anthropic-api", base_url unset → AuthenticationError on the first
+# call → the "Agent error" this mode exists to catch).
+if [ "$LIFECYCLE_LLM" = "minimax" ]; then
+  SECP=$(curl -s -X POST "$BASE/workspaces/$WSID/secrets" \
+    -H "Authorization: Bearer $WTOKEN" -H "Content-Type: application/json" \
+    -d '{"key":"MODEL_PROVIDER","value":"minimax"}')
+  echo "  secret write (MODEL_PROVIDER): $(echo "$SECP" | head -c 120)"
+fi
+
 # Seed config.yaml directly into the named config volume so the provision (and
 # every later restart) has a config source. Create's byok-no-cred abort never
 # wrote it, and this dev stack ships no claude-code template in the platform's
@@ -306,14 +380,27 @@ echo "  secret write: $(echo "$SEC" | head -c 120)"
 # created the volume on its first (aborted) Start attempt; ensure it exists,
 # then drop a minimal valid config.yaml in via a throwaway alpine container.
 docker volume create "$CONFIG_VOL" >/dev/null 2>&1 || true
+# In minimax mode the seeded config MUST carry an explicit `provider: minimax`.
+# The claude-code adapter (and the molecule_runtime wheel's
+# _derive_provider_from_model) only auto-derive a provider from a `vendor:model`
+# or `vendor/model` slug — a BARE `MiniMax-M2.7` derives no provider and falls
+# through to the anthropic-api default (boot banner: "provider=anthropic-api",
+# ANTHROPIC_BASE_URL unset → the MiniMax key is never projected and the first
+# LLM call fails with AuthenticationError). Naming the provider explicitly makes
+# the adapter pick the `minimax` registry entry, project
+# MINIMAX_API_KEY → ANTHROPIC_AUTH_TOKEN, and set
+# ANTHROPIC_BASE_URL=https://api.minimax.io/anthropic — a real round-trip.
+LIFECYCLE_PROVIDER_LINE=""
+[ "$LIFECYCLE_LLM" = "minimax" ] && LIFECYCLE_PROVIDER_LINE="provider: minimax"
 CFG_YAML="name: ${WSID}
-description: stub lifecycle e2e
+description: lifecycle e2e
 version: 1.0.0
 tier: 2
 runtime: ${RUNTIME}
 model: ${LIFECYCLE_MODEL}
 runtime_config:
   model: ${LIFECYCLE_MODEL}
+  ${LIFECYCLE_PROVIDER_LINE}
   timeout: 0
 "
 if docker run --rm -v "${CONFIG_VOL}:/configs" alpine:3 sh -c "cat > /configs/config.yaml" <<EOF >/dev/null 2>&1
@@ -401,10 +488,62 @@ echo ""
 # Step 5 — proxy reach (ws-<id>:8000 Docker-DNS rewrite, end to end).
 # ----------------------------------------------------------------------------
 echo "--- Step 5: proxy reach (POST /workspaces/$WSID/a2a) ---"
-A2A=$(curl -s --max-time "$A2A_TIMEOUT" -X POST "$BASE/workspaces/$WSID/a2a" \
+# In minimax mode we send a DETERMINISTIC known-answer prompt and assert the
+# model echoes the answer back — proving a real LLM round-trip, not just
+# reachability. Otherwise a plain "ping".
+if [ "$LIFECYCLE_LLM" = "minimax" ]; then
+  A2A_PROMPT="Reply with exactly the single word PONG and nothing else."
+else
+  A2A_PROMPT="ping"
+fi
+A2A_BODY=$(python3 -c "
+import json,sys
+print(json.dumps({'method':'message/send','params':{'message':{'role':'user','parts':[{'type':'text','text':sys.argv[1]}]}}}))
+" "$A2A_PROMPT")
+# Real LLM cold-start (first turn boots the claude-code SDK + dials MiniMax) is
+# slower than the stub; give the real-LLM call a longer ceiling.
+A2A_CEIL="$A2A_TIMEOUT"
+[ "$LIFECYCLE_LLM" = "minimax" ] && A2A_CEIL="${A2A_MINIMAX_TIMEOUT:-120}"
+A2A=$(curl -s --max-time "$A2A_CEIL" -X POST "$BASE/workspaces/$WSID/a2a" \
   -H "Content-Type: application/json" \
-  -d '{"method":"message/send","params":{"message":{"role":"user","parts":[{"type":"text","text":"ping"}]}}}')
-if [ "$USING_STUB" -eq 1 ]; then
+  -d "$A2A_BODY")
+# Extract the assistant text part once (shared by the minimax assertion +
+# diagnostics). Tolerates result.parts[].text and result.message.parts[].text.
+a2a_text() {
+  echo "$1" | python3 -c "import sys,json
+try:
+  d=json.load(sys.stdin); r=d.get('result',d)
+  m=r.get('message',r)
+  parts=m.get('parts',[]) or r.get('parts',[])
+  print(' '.join(p.get('text','') for p in parts if isinstance(p,dict)))
+except Exception:
+  print('')"
+}
+if [ "$LIFECYCLE_LLM" = "minimax" ]; then
+  # REAL round-trip assertion. The reply must be model-produced text — NOT a
+  # proxy-level unreachable, NOT an LLM-less "Agent error", NOT an empty
+  # completion. Then it must contain the known answer (PONG).
+  check "proxy returned a result envelope" '"result"' "$A2A"
+  AGENT_TEXT="$(a2a_text "$A2A")"
+  echo "  MiniMax reply: $(echo "$AGENT_TEXT" | head -c 200)"
+  if echo "$A2A" | grep -qiE 'unreachable|workspace has no URL|restarting'; then
+    fail "MiniMax runtime not reachable through proxy" "$A2A"
+  elif echo "$AGENT_TEXT" | grep -qiF "message contained no text content"; then
+    fail "MiniMax returned an EMPTY completion (no text part) — backend/key issue, not a real round-trip" "$AGENT_TEXT"
+  elif echo "$AGENT_TEXT" | grep -qiE 'agent error|exception|invalid api key|insufficient_quota|exceeded your current quota'; then
+    fail "MiniMax round-trip returned an error-shaped reply (no real completion)" "$AGENT_TEXT"
+  elif echo "$AGENT_TEXT" | tr '[:lower:]' '[:upper:]' | grep -qF "PONG"; then
+    pass "REAL MiniMax round-trip: model replied with the known answer (PONG)"
+  else
+    # Non-error, non-empty, but didn't contain PONG — still a real reply (the
+    # model answered with its own words). Accept as a real round-trip but note it.
+    if [ -n "$AGENT_TEXT" ]; then
+      pass "REAL MiniMax round-trip: non-error model reply (did not contain PONG, but real text)"
+    else
+      fail "MiniMax round-trip produced no assertable text" "$A2A"
+    fi
+  fi
+elif [ "$USING_STUB" -eq 1 ]; then
   check "proxy returned a result envelope" '"result"' "$A2A"
   check "proxy reached stub (canned reply)" 'STUB OK' "$A2A"
   # Parse the envelope so whitespace/key-ordering doesn't break the assertion.

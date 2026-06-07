@@ -13,9 +13,15 @@ name: Local Provision Lifecycle E2E
 #     lifecycle e2e (provision -> online -> restart-survive -> proxy-reach). Fast
 #     (seconds of agent boot, no LLM, no 2.5GB image).
 #   * lifecycle-real  (ADVISORY, continue-on-error) — runs the SAME script against
-#     the real claude-code template image (lifecycle-only; the proxy-reach step
-#     asserts reachability, not a canned reply, since there's no LLM). Heavy +
-#     network-dependent (pulls/builds the template), so it is non-blocking.
+#     the real claude-code template image with a REAL MiniMax BYOK credential
+#     (LIFECYCLE_LLM=minimax). The proxy-reach step asserts an ACTUAL model reply
+#     (real round-trip through the ws-<id>:8000 proxy), not just reachability.
+#     MiniMax is the cheapest LLM the platform offers, and its `minimax` provider
+#     dials api.minimax.io directly (no CP proxy needed on this local stack).
+#     Heavy + network-dependent (pulls/builds the template + a real LLM call), so
+#     it is non-blocking. Needs the MOLECULE_STAGING_MINIMAX_API_KEY CI secret:
+#     when ABSENT the script SKIPS loud (exit 0) — it never reds on a missing
+#     secret (serving-e2e skip-if-absent pattern).
 #
 # SUBSTRATE REQUIREMENT (read before wiring into branch protection)
 # -----------------------------------------------------------------
@@ -175,12 +181,13 @@ jobs:
   # ===========================================================================
   # ADVISORY — real claude-code image, lifecycle-only. Non-blocking.
   # bp-exempt: advisory lane (continue-on-error). Never a merge gate; it pulls/
-  #   builds the 2.5GB template image and is network-dependent, so a miss must
-  #   not block. It proves the REAL runtime also survives a restart on the local
-  #   provisioner (proxy-reach asserts reachability, not a canned reply).
+  #   builds the 2.5GB template image, makes a real (cheap) MiniMax LLM call, and
+  #   is network-dependent, so a miss must not block. It proves the REAL runtime
+  #   survives a restart AND serves a genuine LLM round-trip on the local
+  #   provisioner (proxy-reach asserts a real MiniMax reply, not just reachability).
   # ===========================================================================
   lifecycle-real:
-    name: Local Provision Lifecycle E2E (real image, advisory)
+    name: Local Provision Lifecycle E2E (real image + MiniMax LLM, advisory)
     runs-on: docker-host
     continue-on-error: true
     timeout-minutes: 30
@@ -265,16 +272,24 @@ jobs:
             sleep 1
           done
 
-      - name: Run local-provision lifecycle E2E (real claude-code image — ADVISORY)
+      - name: Run local-provision lifecycle E2E (real image + MiniMax LLM — ADVISORY)
         env:
-          # LIFECYCLE_PROVISIONER_BUILDS=1: no image pre-tag — the provisioner
-          # resolves runtime=claude-code itself via RegistryModeLocal (clones +
-          # docker builds the real template from Gitea). Exercises the GENUINE
-          # local image-resolution path. USING_STUB=0 => the proxy-reach step
-          # asserts reachability (the LLM-less real runtime can't produce the
-          # canned "STUB OK"). ONLINE_TIMEOUT bumped for the heavier real boot.
-          LIFECYCLE_PROVISIONER_BUILDS: '1'
-          ONLINE_TIMEOUT: '180'
+          # LIFECYCLE_LLM=minimax: provision the REAL claude-code template image
+          # (the mode forces LIFECYCLE_PROVISIONER_BUILDS=1 — the provisioner
+          # clones + docker-builds the template from Gitea via RegistryModeLocal)
+          # with a real MiniMax BYOK credential, and assert an ACTUAL model reply
+          # at the proxy-reach step (a genuine round-trip through ws-<id>:8000).
+          # MiniMax is the cheapest LLM the platform offers; its `minimax`
+          # provider dials api.minimax.io directly, so no CP proxy env is needed.
+          #
+          # Key wiring (DO NOT hardcode): the script reads MINIMAX_API_KEY from
+          # the env; we feed it from the MOLECULE_STAGING_MINIMAX_API_KEY CI
+          # secret (the same secret the staging-smoke + e2e-api MiniMax arms use).
+          # When that secret is ABSENT, MINIMAX_API_KEY is empty and the script
+          # SKIPS loud (exit 0) — it never reds on a missing secret (serving-e2e
+          # skip-if-absent pattern). The advisory job stays green either way.
+          LIFECYCLE_LLM: minimax
+          MINIMAX_API_KEY: ${{ secrets.MOLECULE_STAGING_MINIMAX_API_KEY }}
         run: bash tests/e2e/test_local_provision_lifecycle_e2e.sh
 
       - name: Dump platform log on failure
