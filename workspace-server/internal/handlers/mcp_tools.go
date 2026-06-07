@@ -16,7 +16,6 @@ import (
 	"os"
 	"time"
 
-	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/registry"
 	"github.com/google/uuid"
 )
@@ -439,26 +438,13 @@ func (h *MCPHandler) toolRequestUserAction(ctx context.Context, workspaceID stri
 	if title == "" {
 		return "", fmt.Errorf("title is required")
 	}
-	var detail interface{}
-	if d, ok := args["detail"].(string); ok && d != "" {
-		detail = d
-	}
+	detail, _ := args["detail"].(string)
 
-	var taskID string
-	err := h.database.QueryRowContext(ctx, `
-		INSERT INTO user_tasks (workspace_id, title, detail)
-		VALUES ($1, $2, $3)
-		RETURNING id
-	`, workspaceID, title, detail).Scan(&taskID)
-	if err != nil {
+	// SSOT for user-task persistence + validation + broadcast — see
+	// user_task_store.go. Pre-consolidation this hand-wrote the same INSERT
+	// and USER_TASK_REQUESTED broadcast the REST Create handler did.
+	if _, err := h.userTaskStore().Create(ctx, workspaceID, title, detail); err != nil {
 		return "", fmt.Errorf("failed to create user task: %w", err)
-	}
-
-	if err := h.broadcaster.RecordAndBroadcast(ctx, string(events.EventUserTaskRequested), workspaceID, map[string]interface{}{
-		"user_task_id": taskID,
-		"title":        title,
-	}); err != nil {
-		log.Printf("request_user_action: failed to broadcast: %v", err)
 	}
 
 	return "Asked the user: " + title, nil
@@ -467,16 +453,14 @@ func (h *MCPHandler) toolRequestUserAction(ctx context.Context, workspaceID stri
 // toolListUserTasks implements list_user_tasks — the asks THIS workspace
 // raised, with status. Returns a JSON array string.
 func (h *MCPHandler) toolListUserTasks(ctx context.Context, workspaceID string) (string, error) {
-	rows, err := h.database.QueryContext(ctx, `
-		SELECT id, title, detail, status, created_at
-		FROM user_tasks WHERE workspace_id = $1
-		ORDER BY created_at DESC LIMIT 50
-	`, workspaceID)
+	rows, err := h.userTaskStore().List(ctx, workspaceID)
 	if err != nil {
 		return "", fmt.Errorf("failed to list user tasks: %w", err)
 	}
-	defer rows.Close()
 
+	// The MCP surface returns a slimmer shape than the REST list (no
+	// resolved_at / resolved_by). Project the store rows down so the
+	// existing tool output stays stable.
 	type ut struct {
 		ID        string  `json:"id"`
 		Title     string  `json:"title"`
@@ -484,13 +468,15 @@ func (h *MCPHandler) toolListUserTasks(ctx context.Context, workspaceID string) 
 		Status    string  `json:"status"`
 		CreatedAt string  `json:"created_at"`
 	}
-	tasks := make([]ut, 0)
-	for rows.Next() {
-		var t ut
-		if err := rows.Scan(&t.ID, &t.Title, &t.Detail, &t.Status, &t.CreatedAt); err != nil {
-			continue
-		}
-		tasks = append(tasks, t)
+	tasks := make([]ut, 0, len(rows))
+	for _, r := range rows {
+		tasks = append(tasks, ut{
+			ID:        r.ID,
+			Title:     r.Title,
+			Detail:    r.Detail,
+			Status:    r.Status,
+			CreatedAt: r.CreatedAt,
+		})
 	}
 	out, err := json.Marshal(tasks)
 	if err != nil {
@@ -506,32 +492,27 @@ func (h *MCPHandler) toolUpdateUserTask(ctx context.Context, workspaceID string,
 	if taskID == "" {
 		return "", fmt.Errorf("user_task_id is required")
 	}
-	var title, detail, status interface{}
+	var title, detail, status *string
 	if v, ok := args["title"].(string); ok && v != "" {
-		title = v
+		title = &v
 	}
 	if v, ok := args["detail"].(string); ok && v != "" {
-		detail = v
+		detail = &v
 	}
 	if v, ok := args["status"].(string); ok && v != "" {
-		if v != "pending" && v != "done" && v != "dismissed" {
+		status = &v
+	}
+
+	// SSOT for the COALESCE update + status-enum validation — see
+	// user_task_store.go.
+	if err := h.userTaskStore().Update(ctx, workspaceID, taskID, title, detail, status); err != nil {
+		if errors.Is(err, ErrInvalidUserTaskStatus) {
 			return "", fmt.Errorf("status must be 'pending', 'done' or 'dismissed'")
 		}
-		status = v
-	}
-	res, err := h.database.ExecContext(ctx, `
-		UPDATE user_tasks SET
-			title  = COALESCE($1, title),
-			detail = COALESCE($2, detail),
-			status = COALESCE($3, status)
-		WHERE id = $4 AND workspace_id = $5
-	`, title, detail, status, taskID, workspaceID)
-	if err != nil {
+		if errors.Is(err, ErrUserTaskNotFound) {
+			return "", fmt.Errorf("user task not found")
+		}
 		return "", fmt.Errorf("failed to update user task: %w", err)
-	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		return "", fmt.Errorf("user task not found")
 	}
 	return "User task updated.", nil
 }
@@ -543,15 +524,11 @@ func (h *MCPHandler) toolDeleteUserTask(ctx context.Context, workspaceID string,
 	if taskID == "" {
 		return "", fmt.Errorf("user_task_id is required")
 	}
-	res, err := h.database.ExecContext(ctx, `
-		DELETE FROM user_tasks WHERE id = $1 AND workspace_id = $2
-	`, taskID, workspaceID)
-	if err != nil {
+	if err := h.userTaskStore().Delete(ctx, workspaceID, taskID); err != nil {
+		if errors.Is(err, ErrUserTaskNotFound) {
+			return "", fmt.Errorf("user task not found")
+		}
 		return "", fmt.Errorf("failed to delete user task: %w", err)
-	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		return "", fmt.Errorf("user task not found")
 	}
 	return "User task deleted.", nil
 }

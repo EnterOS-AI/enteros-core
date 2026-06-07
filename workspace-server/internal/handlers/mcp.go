@@ -99,6 +99,15 @@ func NewMCPHandler(database *sql.DB, broadcaster *events.Broadcaster) *MCPHandle
 	return &MCPHandler{database: database, broadcaster: broadcaster}
 }
 
+// userTaskStore builds the SSOT user-task store over the handler's DB pool +
+// broadcaster — the same store the REST user_tasks handlers route through, so
+// the MCP bridge and HTTP share one persistence + validation + broadcast path
+// (see user_task_store.go). Mirrors how toolSendMessageToUser constructs an
+// AgentMessageWriter.
+func (h *MCPHandler) userTaskStore() *UserTaskStore {
+	return NewUserTaskStore(h.database, h.broadcaster)
+}
+
 func (h *MCPHandler) proxyA2ARequest(ctx context.Context, workspaceID string, body []byte, callerID string, logActivity bool) (int, []byte, error) {
 	if h.a2aProxy != nil {
 		return h.a2aProxy(ctx, workspaceID, body, callerID, logActivity)

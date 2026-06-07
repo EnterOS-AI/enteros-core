@@ -453,64 +453,58 @@ func validateDiscoveryCaller(ctx context.Context, c *gin.Context, workspaceID st
 	// NEXT_PUBLIC_ADMIN_TOKEN (see scripts/dev-start.sh), so the Details
 	// tab loads peers with a real credential rather than via fail-open.
 
-	// Try session cookie auth first (SaaS canvas path).
-	// verifiedCPSession returns (valid, presented):
-	//   - (false, false) = no cookie, fall through to bearer
-	//   - (true, true)   = valid session, allow
-	//   - (false, true)  = cookie presented but invalid, 401
-	if cookieHeader := c.GetHeader("Cookie"); cookieHeader != "" {
-		if ok, presented := middleware.VerifiedCPSession(cookieHeader); presented {
-			if ok {
-				return nil // session verified, allow
-			}
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid session"})
-			return errors.New("invalid session")
+	// Precedence MUST match middleware.WorkspaceAuth: try the bearer token
+	// first (admin → org → per-workspace), and only fall back to a verified
+	// CP-session cookie when no bearer is presented. Keeping the two auth
+	// surfaces in the same order means a credential that passes one passes
+	// the other — divergent precedence is how an admin/org bearer ended up
+	// 401'ing on one surface but not the other.
+	tok := wsauth.BearerTokenFromHeader(c.GetHeader("Authorization"))
+	if tok != "" {
+		// Admin-token fallback — lets the canvas operator (dashboard /
+		// concierge Settings config tabs) read a workspace's peers with the
+		// single admin credential, mirroring middleware.WorkspaceAuth.
+		// Without this the operator's admin bearer fell through to the
+		// per-workspace ValidateToken below and 401'd for any workspace it
+		// doesn't personally hold a token for — e.g. the platform agent
+		// surfaced in the concierge config tabs.
+		if adminSecret := os.Getenv("ADMIN_TOKEN"); adminSecret != "" &&
+			subtle.ConstantTimeCompare([]byte(tok), []byte(adminSecret)) == 1 {
+			return nil
 		}
+		// Org-scoped API token — grants access to every workspace in the org
+		// (same product spec as WorkspaceAuth). Checked before the
+		// per-workspace token so an org-key presenter doesn't hit the
+		// narrower failure path.
+		if _, _, _, err := orgtoken.Validate(ctx, db.DB, tok); err == nil {
+			return nil
+		} else if !errors.Is(err, orgtoken.ErrInvalidToken) {
+			log.Printf("wsauth: discovery orgtoken.Validate(%s): datastore lookup failed (returning 503): %v", workspaceID, err)
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"error": "platform datastore unavailable — retry shortly",
+				"code":  "platform_unavailable",
+			})
+			return err
+		}
+		if err := wsauth.ValidateToken(ctx, db.DB, workspaceID, tok); err != nil {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid workspace auth token"})
+			return err
+		}
+		return nil
 	}
 
-	tok := wsauth.BearerTokenFromHeader(c.GetHeader("Authorization"))
-	if tok == "" {
-		// Canvas hits this endpoint via session cookie, not bearer token.
-		// verifiedCPSession returns (valid, presented):
-		//   - (false, false) = no cookie, 401
-		//   - (true, true)   = valid session, allow
-		//   - (false, true)  = cookie presented but invalid, 401
-		if ok, presented := middleware.VerifiedCPSession(c.GetHeader("Cookie")); presented {
-			if ok {
-				return nil
-			}
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid session"})
-			return errors.New("invalid session")
+	// No bearer: SaaS-canvas path authenticates via a CP-session cookie.
+	// VerifiedCPSession returns (valid, presented):
+	//   - (false, false) = no cookie, 401 (missing auth)
+	//   - (true, true)   = valid session, allow
+	//   - (false, true)  = cookie presented but invalid, 401
+	if ok, presented := middleware.VerifiedCPSession(c.GetHeader("Cookie")); presented {
+		if ok {
+			return nil
 		}
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing workspace auth token"})
-		return errors.New("missing token")
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid session"})
+		return errors.New("invalid session")
 	}
-	// Admin-token fallback — lets the canvas operator (dashboard / concierge
-	// Settings config tabs) read a workspace's peers with the single admin
-	// credential, mirroring middleware.WorkspaceAuth. Without this the
-	// operator's admin bearer fell through to the per-workspace ValidateToken
-	// below and 401'd for any workspace it doesn't personally hold a token for
-	// — e.g. the platform agent surfaced in the concierge config tabs.
-	if adminSecret := os.Getenv("ADMIN_TOKEN"); adminSecret != "" &&
-		subtle.ConstantTimeCompare([]byte(tok), []byte(adminSecret)) == 1 {
-		return nil
-	}
-	// Org-scoped API token — grants access to every workspace in the org (same
-	// product spec as WorkspaceAuth). Checked before the per-workspace token so
-	// an org-key presenter doesn't hit the narrower failure path.
-	if _, _, _, err := orgtoken.Validate(ctx, db.DB, tok); err == nil {
-		return nil
-	} else if !errors.Is(err, orgtoken.ErrInvalidToken) {
-		log.Printf("wsauth: discovery orgtoken.Validate(%s): datastore lookup failed (returning 503): %v", workspaceID, err)
-		c.JSON(http.StatusServiceUnavailable, gin.H{
-			"error": "platform datastore unavailable — retry shortly",
-			"code":  "platform_unavailable",
-		})
-		return err
-	}
-	if err := wsauth.ValidateToken(ctx, db.DB, workspaceID, tok); err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid workspace auth token"})
-		return err
-	}
-	return nil
+	c.JSON(http.StatusUnauthorized, gin.H{"error": "missing workspace auth token"})
+	return errors.New("missing token")
 }

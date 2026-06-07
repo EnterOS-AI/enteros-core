@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"errors"
 	"log"
 	"net/http"
 
@@ -89,6 +90,14 @@ func NewUserTasksHandler(b *events.Broadcaster) *UserTasksHandler {
 	return &UserTasksHandler{broadcaster: b}
 }
 
+// store builds a UserTaskStore over the live global db.DB per request.
+// Constructed per call (rather than cached on the handler) so the global-DB
+// swap the test harness performs in setupTestDB is observed — the same shape
+// AgentMessageWriter is used with in activity.go.
+func (h *UserTasksHandler) store() *UserTaskStore {
+	return NewUserTaskStore(db.DB, h.broadcaster)
+}
+
 // Create handles POST /workspaces/:id/user-tasks — an agent raises an ask.
 //
 //	@Summary	Raise a user task
@@ -115,28 +124,11 @@ func (h *UserTasksHandler) Create(c *gin.Context) {
 		return
 	}
 
-	var detail interface{}
-	if body.Detail != "" {
-		detail = body.Detail
-	}
-
-	var taskID string
-	err := db.DB.QueryRowContext(ctx, `
-		INSERT INTO user_tasks (workspace_id, title, detail)
-		VALUES ($1, $2, $3)
-		RETURNING id
-	`, workspaceID, body.Title, detail).Scan(&taskID)
+	taskID, err := h.store().Create(ctx, workspaceID, body.Title, body.Detail)
 	if err != nil {
 		log.Printf("Create user task error workspace=%s: %v", workspaceID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create user task"})
 		return
-	}
-
-	if err := h.broadcaster.RecordAndBroadcast(ctx, string(events.EventUserTaskRequested), workspaceID, map[string]interface{}{
-		"user_task_id": taskID,
-		"title":        body.Title,
-	}); err != nil {
-		log.Printf("user_tasks: failed to broadcast user task requested: %v", err)
 	}
 
 	c.JSON(http.StatusCreated, gin.H{"user_task_id": taskID, "status": "pending"})
@@ -228,38 +220,18 @@ func (h *UserTasksHandler) Resolve(c *gin.Context) {
 		return
 	}
 
-	resolvedBy := body.ResolvedBy
-	if resolvedBy == "" {
-		resolvedBy = "human"
-	}
-
-	result, err := db.DB.ExecContext(ctx, `
-		UPDATE user_tasks
-		SET status = $1, resolved_at = now(), resolved_by = $2
-		WHERE id = $3 AND workspace_id = $4 AND status = 'pending'
-	`, body.Status, resolvedBy, taskID, workspaceID)
-	if err != nil {
+	if _, err := h.store().Resolve(ctx, workspaceID, taskID, body.Status, body.ResolvedBy); err != nil {
+		if errors.Is(err, ErrUserTaskNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "user task not found or already resolved"})
+			return
+		}
+		if errors.Is(err, ErrInvalidUserTaskStatus) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "status must be 'done' or 'dismissed'"})
+			return
+		}
+		log.Printf("User task resolve error task=%s workspace=%s: %v", taskID, workspaceID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update"})
 		return
-	}
-
-	rows, err := result.RowsAffected()
-	if err != nil {
-		log.Printf("User task resolve RowsAffected error task=%s workspace=%s: %v", taskID, workspaceID, err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update"})
-		return
-	}
-	if rows == 0 {
-		c.JSON(http.StatusNotFound, gin.H{"error": "user task not found or already resolved"})
-		return
-	}
-
-	if err := h.broadcaster.RecordAndBroadcast(ctx, string(events.EventUserTaskResolved), workspaceID, map[string]interface{}{
-		"user_task_id": taskID,
-		"status":       body.Status,
-		"resolved_by":  resolvedBy,
-	}); err != nil {
-		log.Printf("user_tasks: failed to broadcast user task resolved: %v", err)
 	}
 
 	c.JSON(http.StatusOK, gin.H{"status": body.Status, "user_task_id": taskID})
@@ -280,36 +252,11 @@ func (h *UserTasksHandler) List(c *gin.Context) {
 	workspaceID := c.Param("id")
 	ctx := c.Request.Context()
 
-	rows, err := db.DB.QueryContext(ctx, `
-		SELECT id, title, detail, status, created_at, resolved_at, resolved_by
-		FROM user_tasks WHERE workspace_id = $1
-		ORDER BY created_at DESC LIMIT 50
-	`, workspaceID)
+	tasks, err := h.store().List(ctx, workspaceID)
 	if err != nil {
+		log.Printf("List user tasks error workspace=%s: %v", workspaceID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "query failed"})
 		return
-	}
-	defer rows.Close()
-
-	tasks := make([]map[string]interface{}, 0)
-	for rows.Next() {
-		var id, title, status, createdAt string
-		var detail, resolvedBy, resolvedAt *string
-		if rows.Scan(&id, &title, &detail, &status, &createdAt, &resolvedAt, &resolvedBy) != nil {
-			continue
-		}
-		tasks = append(tasks, map[string]interface{}{
-			"id":          id,
-			"title":       title,
-			"detail":      detail,
-			"status":      status,
-			"created_at":  createdAt,
-			"resolved_at": resolvedAt,
-			"resolved_by": resolvedBy,
-		})
-	}
-	if err := rows.Err(); err != nil {
-		log.Printf("List user tasks rows.Err workspace=%s: %v", workspaceID, err)
 	}
 
 	c.JSON(http.StatusOK, tasks)
@@ -346,30 +293,18 @@ func (h *UserTasksHandler) Update(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
 		return
 	}
-	if body.Status != nil && *body.Status != "pending" && *body.Status != "done" && *body.Status != "dismissed" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "status must be 'pending', 'done' or 'dismissed'"})
-		return
-	}
 
-	result, err := db.DB.ExecContext(ctx, `
-		UPDATE user_tasks SET
-			title  = COALESCE($1, title),
-			detail = COALESCE($2, detail),
-			status = COALESCE($3, status)
-		WHERE id = $4 AND workspace_id = $5
-	`, body.Title, body.Detail, body.Status, taskID, workspaceID)
-	if err != nil {
+	if err := h.store().Update(ctx, workspaceID, taskID, body.Title, body.Detail, body.Status); err != nil {
+		if errors.Is(err, ErrInvalidUserTaskStatus) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "status must be 'pending', 'done' or 'dismissed'"})
+			return
+		}
+		if errors.Is(err, ErrUserTaskNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "user task not found"})
+			return
+		}
+		log.Printf("User task update error task=%s workspace=%s: %v", taskID, workspaceID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update"})
-		return
-	}
-	rows, err := result.RowsAffected()
-	if err != nil {
-		log.Printf("User task update RowsAffected error task=%s workspace=%s: %v", taskID, workspaceID, err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update"})
-		return
-	}
-	if rows == 0 {
-		c.JSON(http.StatusNotFound, gin.H{"error": "user task not found"})
 		return
 	}
 
@@ -395,21 +330,13 @@ func (h *UserTasksHandler) Delete(c *gin.Context) {
 	taskID := c.Param("taskId")
 	ctx := c.Request.Context()
 
-	result, err := db.DB.ExecContext(ctx, `
-		DELETE FROM user_tasks WHERE id = $1 AND workspace_id = $2
-	`, taskID, workspaceID)
-	if err != nil {
+	if err := h.store().Delete(ctx, workspaceID, taskID); err != nil {
+		if errors.Is(err, ErrUserTaskNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "user task not found"})
+			return
+		}
+		log.Printf("User task delete error task=%s workspace=%s: %v", taskID, workspaceID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete"})
-		return
-	}
-	rows, err := result.RowsAffected()
-	if err != nil {
-		log.Printf("User task delete RowsAffected error task=%s workspace=%s: %v", taskID, workspaceID, err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete"})
-		return
-	}
-	if rows == 0 {
-		c.JSON(http.StatusNotFound, gin.H{"error": "user task not found"})
 		return
 	}
 
