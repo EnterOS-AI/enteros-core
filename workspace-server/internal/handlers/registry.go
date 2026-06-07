@@ -869,6 +869,29 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 		})
 	}
 
+	// Auto-recovery from failed: the provision-timeout sweeper
+	// (registry/provisiontimeout.go) flips a workspace to 'failed' when it sits
+	// in 'provisioning' past DefaultProvisioningTimeout (10m for claude-code).
+	// But a slow cold-boot (EC2 image pull + LLM preflight) can still finish and
+	// start heartbeating AFTER the flip — agent_card is written unconditionally
+	// on register, so the box is genuinely serving while its status is stuck
+	// 'failed'. A live heartbeat is authoritative: recover to online. Without
+	// this, a healthy-but-slow workspace (e.g. a model that preflights slower
+	// than the 10m budget) shows 'failed' forever despite working — the
+	// mechanism behind the intermittent multi-provider e2e "boot failures". The
+	// `AND status = 'failed'` guard keeps the flip conditional (won't override
+	// 'removed').
+	if currentStatus == "failed" {
+		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1, updated_at = now() WHERE id = $2 AND status = 'failed'`, models.StatusOnline, payload.WorkspaceID); err != nil {
+			log.Printf("Heartbeat: failed to recover %s from failed: %v", payload.WorkspaceID, err)
+		} else {
+			log.Printf("Heartbeat: transitioned %s from failed to online (late heartbeat after provision-timeout)", payload.WorkspaceID)
+		}
+		h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceOnline), payload.WorkspaceID, map[string]interface{}{
+			"recovered_from": currentStatus,
+		})
+	}
+
 	// #1870 Phase 1: drain one queued A2A request if the target reports
 	// spare capacity. The heartbeat's active_tasks field reflects what the
 	// workspace runtime is ACTUALLY running right now, independent of

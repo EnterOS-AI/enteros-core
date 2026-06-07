@@ -193,6 +193,54 @@ func TestHeartbeatHandler_ProvisioningToOnline(t *testing.T) {
 	}
 }
 
+// ==================== Heartbeat — failed → online recovery (#616 follow-up) ====================
+
+// A workspace flipped to 'failed' by the provision-timeout sweeper must recover
+// to 'online' once it starts heartbeating: a live heartbeat proves the agent
+// booted (just slowly, past the 10m budget), so the timeout flip was premature.
+func TestHeartbeatHandler_FailedToOnline(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewRegistryHandler(broadcaster)
+
+	mock.ExpectQuery("SELECT COALESCE\\(current_task").
+		WithArgs("ws-failed").
+		WillReturnRows(sqlmock.NewRows([]string{"current_task"}).AddRow(""))
+
+	mock.ExpectExec("UPDATE workspaces SET").
+		WithArgs("ws-failed", 0.0, "", 1, 3000, "").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// evaluateStatus SELECT — currently failed (provision-timeout sweeper flip)
+	mock.ExpectQuery("SELECT status FROM workspaces WHERE id =").
+		WithArgs("ws-failed").
+		WillReturnRows(sqlmock.NewRows([]string{"status"}).AddRow("failed"))
+
+	// the new failed → online recovery transition
+	mock.ExpectExec("UPDATE workspaces SET status =").
+		WithArgs(models.StatusOnline, "ws-failed").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	mock.ExpectExec("INSERT INTO structure_events").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	body := `{"workspace_id":"ws-failed","error_rate":0.0,"sample_error":"","active_tasks":1,"uptime_seconds":3000}`
+	c.Request = httptest.NewRequest("POST", "/registry/heartbeat", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Heartbeat(c)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
 // ==================== Heartbeat — awaiting_agent → online recovery ====================
 // External workspaces flip to 'awaiting_agent' via healthsweep when their
 // heartbeat goes stale. When the operator's poller comes back, heartbeat
