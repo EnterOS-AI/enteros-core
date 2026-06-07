@@ -226,7 +226,7 @@ func (h *MemoriesHandler) Commit(c *gin.Context) {
 		Source: contract.MemorySourceUser,
 	})
 	if err != nil {
-		log.Printf("Commit memory error (plugin): %v", err)
+		log.Printf("Commit memory plugin error: workspace=%s scope=%s namespace=%s err_class=%T err=%q", workspaceID, body.Scope, nsName, err, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store memory"})
 		return
 	}
