@@ -534,6 +534,27 @@ func (p *CPProvisioner) stopInternal(ctx context.Context, workspaceID string, pr
 	return nil
 }
 
+// resolveProvider reads workspaces.compute->>'provider' for the given workspace.
+// Returns ("", nil) when the row has no provider or the column is missing —
+// callers treat empty as "default provider" (AWS). Exposed as a package var
+// so tests can substitute a stub, same pattern as resolveInstanceID.
+var resolveProvider = func(ctx context.Context, workspaceID string) (string, error) {
+	if db.DB == nil {
+		return "", nil
+	}
+	var provider sql.NullString
+	err := db.DB.QueryRowContext(ctx,
+		`SELECT compute->>'provider' FROM workspaces WHERE id = $1`, workspaceID,
+	).Scan(&provider)
+	if err != nil && err != sql.ErrNoRows {
+		return "", err
+	}
+	if !provider.Valid {
+		return "", nil
+	}
+	return provider.String, nil
+}
+
 // resolveInstanceID reads workspaces.instance_id for the given workspace.
 // Returns ("", nil) when the row exists but has no instance_id recorded
 // (edge case for external workspaces or stale rows). Returns an error
@@ -634,8 +655,20 @@ func (p *CPProvisioner) IsRunning(ctx context.Context, workspaceID string) (bool
 		// caller can branch (a2a_proxy keeps alive, healthsweep skips).
 		return false, ErrNoBackend
 	}
-	url := fmt.Sprintf("%s/cp/workspaces/%s/status?instance_id=%s", p.baseURL, workspaceID, instanceID)
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	provider, err := resolveProvider(ctx, workspaceID)
+	if err != nil {
+		return true, fmt.Errorf("cp provisioner: status: resolve provider: %w", err)
+	}
+	q := url.Values{}
+	q.Set("instance_id", instanceID)
+	if provider != "" {
+		// Sibling-leak to #2386: CP status routes by provider so a non-AWS
+		// workspace is queried by its own backend instead of falling through
+		// to the AWS status path (which would report NOT_FOUND / wrong state).
+		q.Set("provider", provider)
+	}
+	u := fmt.Sprintf("%s/cp/workspaces/%s/status?%s", p.baseURL, workspaceID, q.Encode())
+	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
 	if err != nil {
 		return true, fmt.Errorf("cp provisioner: status: build request: %w", err)
 	}
