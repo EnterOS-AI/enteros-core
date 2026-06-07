@@ -225,14 +225,32 @@ export function WorkspaceNode({ id, data }: NodeProps<Node<WorkspaceNodeData>>) 
             </span>
           </div>
           <div className="flex items-center gap-1.5 shrink-0">
-            {hasChildren && (
-              <span className="text-[10px] font-mono text-accent bg-accent/15 border border-accent/40 px-1.5 py-0.5 rounded-md">
-                {descendantCount} sub
-              </span>
-            )}
-            <span className={`text-[10px] font-mono px-1.5 py-0.5 rounded-md ${tierCfg.color}`}>
-              {tierCfg.label}
-            </span>
+            {/* Model pill (concept top-right). Shortens the agent_card model to
+                a family label (Opus/Sonnet/Haiku/Kimi); falls back to the raw
+                last segment, then to the tier badge when no model is known. */}
+            {(() => {
+              const m = (data.agentCard as Record<string, unknown> | null)?.model;
+              const model = typeof m === "string" && m ? m : null;
+              if (!model) {
+                return (
+                  <span className={`text-[10px] font-mono px-1.5 py-0.5 rounded-md ${tierCfg.color}`}>
+                    {tierCfg.label}
+                  </span>
+                );
+              }
+              const label = /opus/i.test(model) ? "Opus"
+                : /sonnet/i.test(model) ? "Sonnet"
+                : /haiku/i.test(model) ? "Haiku"
+                : /kimi/i.test(model) ? "Kimi"
+                : /gpt|openai/i.test(model) ? "GPT"
+                : /gemini/i.test(model) ? "Gemini"
+                : (model.split(/[/:]/).pop() || model);
+              return (
+                <span className="text-[10px] font-mono px-2 py-0.5 rounded-md text-white bg-accent" title={model}>
+                  {label}
+                </span>
+              );
+            })()}
           </div>
         </div>
 
@@ -242,6 +260,9 @@ export function WorkspaceNode({ id, data }: NodeProps<Node<WorkspaceNodeData>>) 
             We treat empty-string DB values as "missing" so an unbackfilled
             row falls through to the agent-card value rather than rendering
             a blank pill. */}
+        {/* Role pill (concept) — uppercase, accent-bordered. Platform root
+            shows "PLATFORM · ROOT"; Phase 30 external-runtime agents get the
+            REMOTE marker alongside. */}
         {(() => {
           const dbRuntime = typeof data.runtime === "string" && data.runtime !== ""
             ? data.runtime : null;
@@ -249,32 +270,46 @@ export function WorkspaceNode({ id, data }: NodeProps<Node<WorkspaceNodeData>>) 
             ? (data.agentCard as Record<string, string>).runtime
             : null;
           const runtime = dbRuntime ?? cardRuntime;
-          if (!runtime) return null;
+          const isRemote = !!runtime && isExternalLikeRuntime(runtime);
+          const isPlatformRoot = !data.parentId && hasChildren;
+          const roleLabel = isPlatformRoot ? "PLATFORM · ROOT" : (data.role || null);
+          if (!roleLabel && !isRemote) return null;
           return (
-            <div className="mb-1 flex items-center gap-1">
-              {isExternalLikeRuntime(runtime) ? (
+            <div className="mb-2 flex items-center gap-1.5">
+              {roleLabel && (
+                <span className="max-w-[180px] truncate text-[9px] font-mono uppercase tracking-[0.04em] px-1.5 py-0.5 rounded-md text-accent bg-accent/12 border border-accent/35">
+                  {roleLabel}
+                </span>
+              )}
+              {isRemote && (
                 <span
-                  className="text-[7px] font-mono px-1.5 py-0.5 rounded-md text-white bg-violet-800 border border-violet-900"
+                  className="text-[9px] font-mono uppercase px-1.5 py-0.5 rounded-md text-white bg-violet-800 border border-violet-900"
                   title="Phase 30 remote agent — runs outside this platform's Docker network. Lifecycle managed via heartbeat-based polling, not Docker exec."
                 >
                   ★ REMOTE
-                </span>
-              ) : (
-                <span className="text-[7px] font-mono px-1.5 py-0.5 rounded-md text-ink-mid bg-surface-card border border-line">
-                  {runtime}
                 </span>
               )}
             </div>
           );
         })()}
 
-        {/* Role — clamp to 2 lines. Without this, a verbose role
-         *  description (common on org-template imports) lets the card
-         *  grow arbitrarily tall, which wrecks the grid-slot layout
-         *  because siblings all plan for the same CHILD_DEFAULT_HEIGHT. */}
-        {data.role && (
-          <div className="text-[10px] text-ink-mid mb-1.5 leading-tight line-clamp-2">{data.role}</div>
-        )}
+        {/* Status line (concept) — uppercase status, "· N AGENTS" for parents,
+            with a queued pill on the right. */}
+        <div className="mb-1.5 flex items-center justify-between gap-2">
+          <span className={`text-[10px] font-mono uppercase tracking-[0.04em] ${
+            isOnline ? "text-good"
+              : effectiveStatus === "failed" ? "text-bad"
+              : (effectiveStatus === "provisioning" || effectiveStatus === "degraded") ? "text-warm"
+              : "text-ink-soft"
+          }`}>
+            {statusCfg.label}{hasChildren ? ` · ${descendantCount} agents` : ""}
+          </span>
+          {data.activeTasks > 0 && (
+            <span className="shrink-0 text-[10px] font-mono px-1.5 py-0.5 rounded-md text-ink-mid bg-surface-card border border-line">
+              ≡ {data.activeTasks} queued
+            </span>
+          )}
+        </div>
 
         {/* Skills */}
         {skills.length > 0 && (
@@ -328,29 +363,7 @@ export function WorkspaceNode({ id, data }: NodeProps<Node<WorkspaceNodeData>>) 
           </button>
         )}
 
-        {/* Bottom row: status / active tasks */}
-        <div className="flex items-center justify-between mt-0.5">
-          {effectiveStatus !== "online" ? (
-            <div className={`text-[10px] uppercase tracking-widest font-medium ${
-              effectiveStatus === "failed" ? "text-bad" :
-              effectiveStatus === "degraded" ? "text-warm" :
-              effectiveStatus === "not_configured" ? "text-warm" :
-              effectiveStatus === "provisioning" ? "text-accent" :
-              "text-ink-mid"
-            }`}>
-              {statusCfg.label}
-            </div>
-          ) : <div />}
-
-          {data.activeTasks > 0 && (
-            <div className="flex items-center gap-1">
-              <div className="w-1 h-1 rounded-full bg-warm motion-safe:animate-pulse" />
-              <span className="text-[10px] text-warm tabular-nums">
-                {data.activeTasks} task{data.activeTasks > 1 ? "s" : ""}
-              </span>
-            </div>
-          )}
-        </div>
+        {/* (status + queued now rendered above, concept-style) */}
 
         {/* Degraded error preview */}
         {data.status === "degraded" && data.lastSampleError && (
