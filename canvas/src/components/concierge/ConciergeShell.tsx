@@ -100,6 +100,28 @@ export function ConciergeShell() {
   const [sbTab, setSbTab] = useState<SbTab>("agents");
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
 
+  // Dynamic org name for the topbar. Sourced from GET /org/identity
+  // ({name} ← MOLECULE_ORG_NAME, added by a parallel backend change).
+  // Falls back to "Molecule AI" when the endpoint 404s / errors or
+  // returns an empty name, so the topbar never breaks before the backend
+  // lands.
+  const [orgName, setOrgName] = useState("Molecule AI");
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .get<{ name?: string }>("/org/identity")
+      .then((r) => {
+        const name = (r?.name || "").trim();
+        if (!cancelled && name) setOrgName(name);
+      })
+      .catch(() => {
+        // No endpoint / not reachable — keep the "Molecule AI" fallback.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   // Build the agent hierarchy from live nodes.
   const { roots, childrenOf } = useMemo(() => {
     const childrenOf = new Map<string, typeof nodes>();
@@ -287,8 +309,8 @@ export function ConciergeShell() {
           {/* TOPBAR */}
           <header className={s.topbar}>
             <div className={s.org}>
-              <div className={s.orgBadge}>M</div>
-              <span className={s.orgName}>Molecule AI</span>
+              <div className={s.orgBadge}>{initials(orgName).slice(0, 1)}</div>
+              <span className={s.orgName}>{orgName}</span>
               <span className={s.chev}><IcChevDown /></span>
             </div>
             <div className={s.topbarRight}>
