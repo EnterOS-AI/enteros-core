@@ -95,9 +95,17 @@ export function ConciergeShell() {
     const isPlatform = n.id === platformRoot?.id;
     const q = (n.data.activeTasks as number) ?? 0;
     const row = (
-      <button
+      <div
+        role="button"
+        tabIndex={0}
         className={`${s.ws} ${selectedNodeId === n.id ? s.active : ""}`}
         onClick={() => selectNode(n.id)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            selectNode(n.id);
+          }
+        }}
       >
         <div className={s.wsAv} style={{ background: gradientFor(n.id) }}>
           {initials(n.data.name)}
@@ -134,7 +142,7 @@ export function ConciergeShell() {
             <IcCaret />
           </button>
         )}
-      </button>
+      </div>
     );
     return (
       <div key={n.id} className={s.tnode}>
