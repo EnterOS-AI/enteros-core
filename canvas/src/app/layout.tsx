@@ -164,6 +164,12 @@ export default async function RootLayout({
          */}
         <script
           nonce={nonce}
+          // The browser strips the nonce attribute off <script> after applying
+          // CSP, so the hydrated DOM shows nonce="" while React's tree carries
+          // the real value — a benign, expected server/client diff. Suppress
+          // the hydration warning for this element (same rationale as the
+          // <html> suppressHydrationWarning above).
+          suppressHydrationWarning
           dangerouslySetInnerHTML={{ __html: themeBootScript }}
         />
         {/*
@@ -189,6 +195,7 @@ export default async function RootLayout({
         <script
           type="application/ld+json"
           nonce={nonce}
+          suppressHydrationWarning
           dangerouslySetInnerHTML={{
             __html: JSON.stringify({
               "@context": "https://schema.org",
