@@ -7,7 +7,6 @@ import { api } from "@/lib/api";
 import { showToast } from "@/components/Toaster";
 import type { ActivityEntry } from "@/types/activity";
 import { Canvas } from "@/components/Canvas";
-import { Legend } from "@/components/Legend";
 import { CommunicationOverlay } from "@/components/CommunicationOverlay";
 import { ChatTab } from "@/components/tabs/ChatTab";
 import { WorkspacePanelTabs } from "@/components/WorkspacePanelTabs";
@@ -489,7 +488,6 @@ export function ConciergeShell() {
                   <main aria-label="Agent canvas" style={{ position: "absolute", inset: 0 }}>
                     <Canvas />
                   </main>
-                  <Legend />
                   <CommunicationOverlay />
                 </div>
               )}

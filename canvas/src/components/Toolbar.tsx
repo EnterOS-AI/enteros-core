@@ -3,11 +3,8 @@
 import { useMemo, useState, useCallback, useEffect, useRef } from "react";
 import { api } from "@/lib/api";
 import { useCanvasStore } from "@/store/canvas";
-import { SettingsButton } from "@/components/settings/SettingsButton";
-import { settingsGearRef } from "@/components/settings/SettingsPanel";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { showToast } from "@/components/Toaster";
-import { ThemeToggle } from "@/components/ThemeToggle";
 import { statusDotClass } from "@/lib/design-tokens";
 import { KeyboardShortcutsDialog } from "@/components/KeyboardShortcutsDialog";
 
@@ -463,11 +460,8 @@ export function Toolbar() {
         )}
       </div>
 
-      {/* Theme picker — System / Light / Dark */}
-      <ThemeToggle />
-
-      {/* Settings gear icon */}
-      <SettingsButton ref={settingsGearRef} />
+      {/* Theme picker + settings gear removed from the map toolbar — both now
+          live in the concierge global Settings (left rail) + topbar. */}
 
       <ConfirmDialog
         open={restartConfirmOpen}
