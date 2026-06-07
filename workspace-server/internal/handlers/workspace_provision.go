@@ -1428,9 +1428,9 @@ func (h *WorkspaceHandler) provisionWorkspaceCP(workspaceID, templatePath string
 	if persistErr != nil {
 		log.Printf("CPProvisioner: CRITICAL persist instance_id failed for %s after %d attempts: %v — EC2 instance %s is RUNNING but UNTRACKED. Operator must manually reconcile or remove the workspace to trigger orphan cleanup.", workspaceID, instanceIDPersistRetryAttempts, persistErr, machineID)
 		h.markProvisionFailed(ctx, workspaceID, "instance_id persist failed after retry — EC2 untracked", map[string]interface{}{
-			"error":       persistErr.Error(),
 			"instance_id": machineID,
 			"attempts":    instanceIDPersistRetryAttempts,
+			"detail":      persistErr.Error(),
 		})
 		return
 	}
