@@ -840,11 +840,23 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 			if _, err := os.Stat(runtimeDefault); err == nil {
 				templatePath = runtimeDefault
 			} else {
-				configFiles = h.ensureDefaultConfig(id, payload)
+				var cfgErr error
+				configFiles, cfgErr = h.ensureDefaultConfig(id, payload)
+				if cfgErr != nil {
+					log.Printf("Create workspace %s: default config generation failed: %v", id, cfgErr)
+					c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate workspace configuration"})
+					return
+				}
 			}
 		}
 	} else {
-		configFiles = h.ensureDefaultConfig(id, payload)
+		var cfgErr error
+		configFiles, cfgErr = h.ensureDefaultConfig(id, payload)
+		if cfgErr != nil {
+			log.Printf("Create workspace %s: default config generation failed: %v", id, cfgErr)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate workspace configuration"})
+			return
+		}
 	}
 
 	// Auto-provision — pick backend: control plane (SaaS) or Docker (self-hosted).

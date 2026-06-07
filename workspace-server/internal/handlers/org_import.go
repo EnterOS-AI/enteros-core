@@ -321,7 +321,17 @@ func (h *OrgHandler) createWorkspaceTree(ws OrgWorkspace, parentID *string, absX
 		}
 
 		// Always generate default config.yaml (runtime, model, tier, etc.)
-		configFiles := h.workspace.ensureDefaultConfig(id, payload)
+		configFiles, cfgErr := h.workspace.ensureDefaultConfig(id, payload)
+		if cfgErr != nil {
+			log.Printf("Org import: default config generation failed for %s: %v — marking workspace failed", ws.Name, cfgErr)
+			// Fail-closed: the workspace row + layout + broadcast are already
+			// persisted above (status='provisioning'). If we fall through,
+			// the workspace stays stuck in provisioning silently. Mark it
+			// failed so the canvas surfaces the failure card and the operator
+			// sees the signal immediately, then skip the provisioning block.
+			h.workspace.markProvisionFailed(ctx, id, fmt.Sprintf("default config generation failed: %v", cfgErr), nil)
+			goto skipProvision
+		}
 
 		// Copy files_dir contents on top (system-prompt.md, CLAUDE.md, skills/, etc.)
 		// Uses templatePath for CopyTemplateToContainer — runs AFTER configFiles are written
@@ -548,6 +558,7 @@ func (h *OrgHandler) createWorkspaceTree(ws OrgWorkspace, parentID *string, absX
 		})
 	}
 
+skipProvision:
 	// internal#2006: migrate runtime-created schedules from a removed
 	// predecessor of the same agent (role+parent) onto this freshly-created
 	// workspace. Reconcile re-derives template-sourced state below, but
