@@ -102,7 +102,12 @@
 .viewArea { flex: 1; min-height: 0; position: relative; }
 .view { position: absolute; inset: 0; display: none; }
 .view.active { display: flex; }
-.canvasMount { position: absolute; inset: 0; }
+/* A transform turns this into the containing block for its position:fixed
+   descendants — so the canvas's own overlays (Toolbar, Legend, Communications,
+   New Workspace, minimap) anchor to THIS box (the map view area, right of the
+   rail and below the topbar) instead of the viewport, and stop overlapping the
+   shell chrome. */
+.canvasMount { position: absolute; inset: 0; transform: translateZ(0); overflow: hidden; }
 
 /* ===== HOME VIEW ===== */
 .homeSidebar { flex: 0 0 296px; max-width: 296px; background: var(--panel-2); border-right: 1px solid var(--hair); display: flex; flex-direction: column; min-height: 0; }
