@@ -286,12 +286,12 @@ func (h *MCPHandler) toolDelegateTaskAsync(ctx context.Context, callerID string,
 	delegationID := uuid.New().String()
 
 	// Issue #158: write delegation row so canvas Agent Comms tab shows the task text.
-	// Insert with 'dispatched' status since the goroutine won't update it.
+	// Insert with 'queued' status; goroutine updates to delivered or failed.
 	if err := insertMCPDelegationRow(ctx, h.database, callerID, targetID, delegationID, task); err != nil {
 		log.Printf("MCP delegate_task_async: failed to record delegation row: %v", err)
 		// Non-fatal: still fire the A2A call.
 	} else {
-		updateMCPDelegationStatus(ctx, h.database, callerID, delegationID, "dispatched", "")
+		updateMCPDelegationStatus(ctx, h.database, callerID, delegationID, "queued", "")
 	}
 
 	// Fire and forget in a detached goroutine. Use a background context so
@@ -321,21 +321,28 @@ func (h *MCPHandler) toolDelegateTaskAsync(ctx context.Context, callerID string,
 			log.Printf("toolDelegateTask %s: json.Marshal a2aBody failed: %v", delegationID, marshalErr)
 			// Bail out: proceeding would call proxyA2ARequest with a
 			// nil/empty body, dispatching a malformed A2A request.
+			updateMCPDelegationStatus(bgCtx, h.database, callerID, delegationID, "failed", fmt.Sprintf("marshal_error: %v", marshalErr))
 			return
 		}
 
 		status, _, err := h.proxyA2ARequest(bgCtx, targetID, a2aBody, callerID, true)
 		if err != nil || status < 200 || status >= 300 {
+			var errorDetail string
 			if err != nil {
 				log.Printf("MCPHandler.delegate_task_async: A2A proxy to %s: %v", targetID, err)
+				errorDetail = fmt.Sprintf("target_offline: %v", err)
 			} else {
 				log.Printf("MCPHandler.delegate_task_async: A2A proxy to %s returned status %d", targetID, status)
+				errorDetail = fmt.Sprintf("http_status: %d", status)
 			}
+			updateMCPDelegationStatus(bgCtx, h.database, callerID, delegationID, "failed", errorDetail)
 			return
 		}
+
+		updateMCPDelegationStatus(bgCtx, h.database, callerID, delegationID, "delivered", "")
 	})
 
-	return fmt.Sprintf(`{"task_id":%q,"status":"dispatched","target_id":%q}`, delegationID, targetID), nil
+	return fmt.Sprintf(`{"task_id":%q,"status":"queued","target_id":%q}`, delegationID, targetID), nil
 }
 
 func (h *MCPHandler) toolCheckTaskStatus(ctx context.Context, callerID string, args map[string]interface{}) (string, error) {
