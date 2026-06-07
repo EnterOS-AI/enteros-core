@@ -683,6 +683,9 @@ export function ConfigTab({ workspaceId }: Props) {
             name: m.name,
             // carry the derived provider so the selector buckets correctly
             ...(m.provider ? { provider: m.provider } : {}),
+            // carry required_env so wasTemplateDriven can detect
+            // template-driven env lists for registry-backed runtimes
+            ...(m.required_env ? { required_env: m.required_env } : {}),
           }))
         : availableModels,
     [registryBacked, selectedRuntime?.registryModels, availableModels],
@@ -1039,7 +1042,7 @@ export function ConfigTab({ workspaceId }: Props) {
                           prevRequired.every((e, i) => e === prevSpec.required_env![i])
                         : false);
                     const nextRequired =
-                      filteredEnvVars.length > 0 && wasTemplateDriven
+                      wasTemplateDriven
                         ? filteredEnvVars
                         : prevRequired;
                     if (prev.runtime) {
@@ -1048,7 +1051,7 @@ export function ConfigTab({ workspaceId }: Props) {
                         runtime_config: {
                           ...prev.runtime_config,
                           model: v,
-                          ...(filteredEnvVars.length > 0 && wasTemplateDriven
+                          ...(wasTemplateDriven
                             ? { required_env: nextRequired }
                             : {}),
                         },

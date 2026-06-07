@@ -91,6 +91,7 @@ export interface RegistryModel {
   name?: string;
   provider?: string;
   billing_mode?: "platform_managed" | "byok";
+  required_env?: string[];
 }
 
 export interface SelectorValue {
