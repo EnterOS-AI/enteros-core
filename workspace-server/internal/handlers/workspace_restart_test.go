@@ -70,6 +70,33 @@ func TestRestartHandler_DBConnectionError(t *testing.T) {
 	}
 }
 
+func TestRestartHandler_RemovedWorkspaceReturns404(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+
+	mock.ExpectQuery("SELECT status, name, tier, COALESCE").
+		WithArgs("ws-removed").
+		WillReturnRows(sqlmock.NewRows([]string{"status", "name", "tier", "runtime"}).
+			AddRow("removed", "Removed Agent", 1, "claude-code"))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-removed"}}
+	c.Request = httptest.NewRequest("POST", "/workspaces/ws-removed/restart", nil)
+
+	handler.Restart(c)
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("expected 404 for removed workspace, got %d: %s", w.Code, w.Body.String())
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
 func TestRestartHandler_AncestorPausedBlocksRestart(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
