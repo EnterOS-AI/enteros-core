@@ -370,13 +370,16 @@ export function CreateWorkspaceButton() {
                       width: Number.isFinite(displayWidth) ? displayWidth : 1920,
                       height: Number.isFinite(displayHeight) ? displayHeight : 1080,
                     },
-                    provider: cloudProvider,
+                    // Only meaningful when CP provisions the box (SaaS), where
+                    // the picker is shown. Omit on self-hosted so the payload is
+                    // unchanged there.
+                    ...(isSaaS ? { provider: cloudProvider } : {}),
                   }
                 : {
                     instance_type: DEFAULT_HEADLESS_INSTANCE_TYPE,
                     volume: { root_gb: DEFAULT_HEADLESS_ROOT_GB },
                     display: { mode: "none" },
-                    provider: cloudProvider,
+                    ...(isSaaS ? { provider: cloudProvider } : {}),
                   },
             }
           : {}),
