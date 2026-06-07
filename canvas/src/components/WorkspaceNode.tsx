@@ -95,7 +95,7 @@ export function WorkspaceNode({ id, data }: NodeProps<Node<WorkspaceNodeData>>) 
         minWidth={hasChildren ? 360 : 210}
         minHeight={hasChildren ? 200 : 110}
         lineClassName="!border-accent/40"
-        handleClassName="!w-2 !h-2 !bg-accent !border !border-blue-300"
+        handleClassName="!w-2 !h-2 !bg-accent !border !border-accent"
       />
     <div
       role="button"
@@ -168,13 +168,13 @@ export function WorkspaceNode({ id, data }: NodeProps<Node<WorkspaceNodeData>>) 
         ${isDragTarget
           ? "bg-emerald-950/40 border-2 border-emerald-400/60 ring-2 ring-emerald-400/20 scale-[1.03]"
           : isBatchSelected
-          ? "bg-surface-sunken/95 border-2 border-accent/80 ring-2 ring-accent/30 shadow-lg shadow-blue-500/15"
+          ? "bg-surface-sunken/95 border-2 border-accent/80 ring-2 ring-accent/30 shadow-lg shadow-accent/15"
           : isSelected
-          ? "bg-surface-sunken/95 border border-accent/70 ring-1 ring-accent/30 shadow-lg shadow-blue-500/10"
-          : "bg-surface-sunken/90 border border-line/80 hover:border-zinc-500/60 shadow-lg shadow-black/30 hover:shadow-xl hover:shadow-black/40"
+          ? "bg-surface-sunken/95 border border-accent/70 ring-1 ring-accent/30 shadow-lg shadow-accent/10"
+          : "bg-surface-sunken/90 border border-line/80 hover:border-ink-soft/60 shadow-lg shadow-black/30 hover:shadow-xl hover:shadow-black/40"
         }
         backdrop-blur-sm
-        focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/70 focus-visible:ring-offset-1 focus-visible:ring-offset-zinc-950
+        focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/70 focus-visible:ring-offset-1 focus-visible:ring-offset-surface
         ${deploy.isActivelyProvisioning ? "mol-deploy-shimmer" : ""}
         ${deploy.isLockedChild ? "mol-deploy-locked" : ""}
       `}
@@ -212,7 +212,7 @@ export function WorkspaceNode({ id, data }: NodeProps<Node<WorkspaceNodeData>>) 
             }
           }
         }}
-        className="!w-2.5 !h-1 !rounded-full !bg-surface-card/80 !border-0 !-top-0.5 hover:!bg-blue-400 hover:!h-1.5 focus-visible:!bg-blue-400 focus-visible:!h-1.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-400/60 focus-visible:ring-offset-1 focus-visible:ring-offset-zinc-950 transition-all"
+        className="!w-2.5 !h-1 !rounded-full !bg-surface-card/80 !border-0 !-top-0.5 hover:!bg-accent hover:!h-1.5 focus-visible:!bg-accent focus-visible:!h-1.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/60 focus-visible:ring-offset-1 focus-visible:ring-offset-surface transition-all"
       />
 
       <div className="relative px-3.5 py-2.5">
@@ -395,7 +395,7 @@ export function WorkspaceNode({ id, data }: NodeProps<Node<WorkspaceNodeData>>) 
             }
           }
         }}
-        className="!w-2.5 !h-1 !rounded-full !bg-surface-card/80 !border-0 !-bottom-0.5 hover:!bg-blue-400 hover:!h-1.5 focus-visible:!bg-blue-400 focus-visible:!h-1.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-400/60 focus-visible:ring-offset-1 focus-visible:ring-offset-zinc-950 transition-all"
+        className="!w-2.5 !h-1 !rounded-full !bg-surface-card/80 !border-0 !-bottom-0.5 hover:!bg-accent hover:!h-1.5 focus-visible:!bg-accent focus-visible:!h-1.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/60 focus-visible:ring-offset-1 focus-visible:ring-offset-surface transition-all"
       />
     </div>
     </>
