@@ -275,6 +275,24 @@ var mcpAllTools = []mcpTool{
 		},
 	},
 	{
+		Name:        "request_user_action",
+		Description: "Ask the human user to do something only they can do (e.g. review a draft, provide an API key, confirm a decision). Creates a tracked task in the user's concierge Tasks list. Unlike send_message_to_user (a passing chat message), this is an ask the user explicitly marks done or dismissed.",
+		InputSchema: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"title": map[string]interface{}{
+					"type":        "string",
+					"description": "The ask, one line (e.g. 'Review the launch draft')",
+				},
+				"detail": map[string]interface{}{
+					"type":        "string",
+					"description": "Optional longer context for the ask",
+				},
+			},
+			"required": []string{"title"},
+		},
+	},
+	{
 		Name:        "commit_memory",
 		Description: "Save important information to persistent memory. Scope LOCAL (this workspace only) and TEAM (parent + siblings) are supported. GLOBAL scope is not available via the MCP bridge.",
 		InputSchema: map[string]interface{}{
@@ -554,6 +572,8 @@ func (h *MCPHandler) dispatch(ctx context.Context, workspaceID, toolName string,
 		return h.toolCheckTaskStatus(ctx, workspaceID, args)
 	case "send_message_to_user":
 		return h.toolSendMessageToUser(ctx, workspaceID, args)
+	case "request_user_action":
+		return h.toolRequestUserAction(ctx, workspaceID, args)
 	case "commit_memory":
 		return h.toolCommitMemory(ctx, workspaceID, args)
 	case "recall_memory":

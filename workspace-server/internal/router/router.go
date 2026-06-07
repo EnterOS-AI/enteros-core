@@ -321,6 +321,15 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		// entire platform. Gated behind AdminAuth (issue #180).
 		r.GET("/approvals/pending", middleware.AdminAuth(db.DB), apph.ListAll)
 
+		// User tasks — agent → user action requests ("asks"). Worklist
+		// signal (not a destructive gate); mirrors the approvals auth split.
+		uth := handlers.NewUserTasksHandler(broadcaster)
+		wsAuth.POST("/user-tasks", uth.Create)
+		wsAuth.POST("/user-tasks/:taskId/resolve", uth.Resolve)
+		// /user-tasks/pending is cross-workspace (concierge Tasks tab), so
+		// AdminAuth-gated exactly like /approvals/pending.
+		r.GET("/user-tasks/pending", middleware.AdminAuth(db.DB), uth.ListAll)
+
 		// (TeamHandler is gone — #2864.) The visual canvas Collapse
 		// button calls PATCH /workspaces/:id { collapsed: true/false }
 		// (presentational toggle on canvas_layouts), NOT the destructive

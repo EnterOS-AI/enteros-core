@@ -16,6 +16,7 @@ import (
 	"os"
 	"time"
 
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/registry"
 	"github.com/google/uuid"
 )
@@ -419,6 +420,41 @@ func (h *MCPHandler) toolSendMessageToUser(ctx context.Context, workspaceID stri
 		return "", err
 	}
 	return "Message sent.", nil
+}
+
+// toolRequestUserAction implements request_user_action — the agent raises a
+// tracked ask for the human user (it appears in the concierge Tasks list).
+// Mirrors the user_tasks REST Create handler. Unlike send_message_to_user it
+// is not gated behind MOLECULE_MCP_ALLOW_SEND_MESSAGE — raising an ask is
+// always allowed.
+func (h *MCPHandler) toolRequestUserAction(ctx context.Context, workspaceID string, args map[string]interface{}) (string, error) {
+	title, _ := args["title"].(string)
+	if title == "" {
+		return "", fmt.Errorf("title is required")
+	}
+	var detail interface{}
+	if d, ok := args["detail"].(string); ok && d != "" {
+		detail = d
+	}
+
+	var taskID string
+	err := h.database.QueryRowContext(ctx, `
+		INSERT INTO user_tasks (workspace_id, title, detail)
+		VALUES ($1, $2, $3)
+		RETURNING id
+	`, workspaceID, title, detail).Scan(&taskID)
+	if err != nil {
+		return "", fmt.Errorf("failed to create user task: %w", err)
+	}
+
+	if err := h.broadcaster.RecordAndBroadcast(ctx, string(events.EventUserTaskRequested), workspaceID, map[string]interface{}{
+		"user_task_id": taskID,
+		"title":        title,
+	}); err != nil {
+		log.Printf("request_user_action: failed to broadcast: %v", err)
+	}
+
+	return "Asked the user: " + title, nil
 }
 
 func parseAgentMessageAttachments(raw interface{}) ([]AgentMessageAttachment, error) {

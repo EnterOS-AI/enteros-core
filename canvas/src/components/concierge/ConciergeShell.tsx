@@ -13,7 +13,7 @@ import { ConciergeChat } from "./ConciergeChat";
 import s from "./Concierge.module.css";
 import {
   IcHome, IcOrgMap, IcSettings, IcSearch, IcBell, IcSun, IcMoon, IcChevDown,
-  IcQueue, IcCaret, IcMolecule, IcSchedule, IcTrash,
+  IcQueue, IcCaret, IcMolecule, IcClock, IcCheck, IcTrash,
 } from "./icons";
 
 /* ── status → concept palette ─────────────────────────────────────────── */
@@ -61,13 +61,14 @@ interface PendingApproval {
   status: string;
   created_at: string;
 }
-interface Schedule {
+interface UserTask {
   id: string;
-  name: string;
-  cron_expr: string;
-  prompt: string;
-  enabled: boolean;
-  next_run_at: string | null;
+  workspace_id: string;
+  workspace_name: string;
+  title: string;
+  detail: string | null;
+  status: string;
+  created_at: string;
 }
 
 /** ISO timestamp → "9:05 PM" (local). Empty string on a bad/missing value. */
@@ -121,18 +122,24 @@ export function ConciergeShell() {
 
   const platformId = platformRoot?.id ?? null;
 
-  // ── live data: approvals (org-wide), activity + schedules (platform agent) ──
+  // ── live data: approvals + user-tasks (org-wide), activity (platform agent) ──
   const [approvals, setApprovals] = useState<PendingApproval[]>([]);
+  const [userTasks, setUserTasks] = useState<UserTask[]>([]);
   const [activity, setActivity] = useState<ActivityEntry[]>([]);
-  const [schedules, setSchedules] = useState<Schedule[]>([]);
   const [deciding, setDeciding] = useState<string | null>(null);
+  const [resolving, setResolving] = useState<string | null>(null);
 
   const loadApprovals = useCallback(() => {
     api.get<PendingApproval[]>("/approvals/pending")
       .then((r) => setApprovals(r ?? []))
       .catch(() => setApprovals([]));
   }, []);
-  useEffect(() => { loadApprovals(); }, [loadApprovals]);
+  const loadUserTasks = useCallback(() => {
+    api.get<UserTask[]>("/user-tasks/pending")
+      .then((r) => setUserTasks(r ?? []))
+      .catch(() => setUserTasks([]));
+  }, []);
+  useEffect(() => { loadApprovals(); loadUserTasks(); }, [loadApprovals, loadUserTasks]);
 
   useEffect(() => {
     if (!platformId) return;
@@ -140,9 +147,6 @@ export function ConciergeShell() {
     api.get<ActivityEntry[]>(`/workspaces/${platformId}/activity?limit=12`)
       .then((r) => { if (!cancelled) setActivity(r ?? []); })
       .catch(() => { if (!cancelled) setActivity([]); });
-    api.get<Schedule[]>(`/workspaces/${platformId}/schedules`)
-      .then((r) => { if (!cancelled) setSchedules(r ?? []); })
-      .catch(() => { if (!cancelled) setSchedules([]); });
     return () => { cancelled = true; };
   }, [platformId]);
 
@@ -161,6 +165,22 @@ export function ConciergeShell() {
       setDeciding(null);
     }
   }, [deciding]);
+
+  const resolveTask = useCallback(async (t: UserTask, status: "done" | "dismissed") => {
+    if (resolving) return;
+    setResolving(t.id);
+    try {
+      await api.post(`/workspaces/${t.workspace_id}/user-tasks/${t.id}/resolve`, {
+        status, resolved_by: "human",
+      });
+      showToast(status === "done" ? "Marked done" : "Dismissed", status === "done" ? "success" : "info");
+      setUserTasks((prev) => prev.filter((x) => x.id !== t.id));
+    } catch {
+      showToast("Failed to resolve task", "error");
+    } finally {
+      setResolving(null);
+    }
+  }, [resolving]);
 
   const nav = (v: TopView) => setTopView(v);
 
@@ -290,7 +310,7 @@ export function ConciergeShell() {
                 <div className={s.sbTabs}>
                   <button className={`${s.sbTab} ${sbTab === "agents" ? s.active : ""}`} onClick={() => setSbTab("agents")}>Agents</button>
                   <button className={`${s.sbTab} ${sbTab === "tasks" ? s.active : ""}`} onClick={() => setSbTab("tasks")}>
-                    Tasks{schedules.length > 0 && <span className={s.cnt}>{schedules.length}</span>}
+                    Tasks{userTasks.length > 0 && <span className={s.cnt}>{userTasks.length}</span>}
                   </button>
                   <button className={`${s.sbTab} ${sbTab === "approvals" ? s.active : ""}`} onClick={() => setSbTab("approvals")}>
                     Approvals{approvals.length > 0 && <span className={s.cnt}>{approvals.length}</span>}
@@ -326,22 +346,32 @@ export function ConciergeShell() {
                   )}
                   {sbTab === "tasks" && (
                     <>
-                      {schedules.length === 0 && (
-                        <div className={s.empty}>No scheduled tasks yet. Ask the concierge to set one up.</div>
+                      {userTasks.length === 0 && (
+                        <div className={s.empty}>Nothing needs you right now. When an agent needs you to do something, it shows up here.</div>
                       )}
-                      {schedules.map((sc) => (
-                        <div key={sc.id} className={s.task}>
+                      {userTasks.map((t) => (
+                        <div key={t.id} className={s.task}>
                           <div className={s.taskRow}>
-                            <div className={`${s.taskIc} ${sc.enabled ? s.sched : s.done}`}><IcSchedule /></div>
+                            <div className={`${s.taskIc} ${s.run}`}><IcClock /></div>
                             <div className={s.taskMeta}>
-                              <div className={s.taskT}>{sc.name}</div>
+                              <div className={s.taskT}>{t.title}</div>
                               <div className={s.taskS}>
-                                <span style={{ fontFamily: "var(--mono)" }}>{sc.cron_expr}</span>
-                                <span className={s.pip} />
-                                {sc.enabled ? "scheduled" : "disabled"}
-                                {sc.next_run_at ? ` · next ${clockTime(sc.next_run_at)}` : ""}
+                                {t.workspace_name}<span className={s.pip} />asked {clockTime(t.created_at)}
                               </div>
+                              {t.detail && (
+                                <div style={{ fontSize: 12, color: "var(--tx-3)", marginTop: 6, lineHeight: 1.45 }}>
+                                  {t.detail}
+                                </div>
+                              )}
                             </div>
+                          </div>
+                          <div className={s.taskActions}>
+                            <button className={`${s.tbtn} ${s.done}`} disabled={resolving === t.id} onClick={() => resolveTask(t, "done")}>
+                              <IcCheck />Done
+                            </button>
+                            <button className={s.tbtn} disabled={resolving === t.id} onClick={() => resolveTask(t, "dismissed")}>
+                              Dismiss
+                            </button>
                           </div>
                         </div>
                       ))}
