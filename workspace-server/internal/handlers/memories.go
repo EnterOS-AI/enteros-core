@@ -226,7 +226,15 @@ func (h *MemoriesHandler) Commit(c *gin.Context) {
 		Source: contract.MemorySourceUser,
 	})
 	if err != nil {
-		log.Printf("Commit memory plugin error: workspace=%s scope=%s namespace=%s err_class=%T err=%q", workspaceID, body.Scope, nsName, err, err)
+		// The underlying plugin error must NOT leak to the HTTP response body
+		// (generic 500 keeps client surface stable). Emit full operator context
+		// (workspace, scope, namespace, error type + message) server-side so
+		// recurring incidents (continuous-synth E2E, HMA memory-commit, etc.)
+		// can be distinguished in the log aggregator.
+		log.Printf(
+			"Commit memory plugin error: workspace=%s scope=%s namespace=%s err_class=%T err=%q",
+			workspaceID, body.Scope, nsName, err, err,
+		)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store memory"})
 		return
 	}
