@@ -321,7 +321,13 @@ func (h *OrgHandler) createWorkspaceTree(ws OrgWorkspace, parentID *string, absX
 		}
 
 		// Always generate default config.yaml (runtime, model, tier, etc.)
-		configFiles := h.workspace.ensureDefaultConfig(id, payload)
+		configFiles, cfgErr := h.workspace.ensureDefaultConfig(id, payload)
+		if cfgErr != nil {
+			log.Printf("Org import: default config generation failed for %s: %v — skipping provision", ws.Name, cfgErr)
+			// Skip provisioning for this workspace but continue the import loop
+			// (the DB row + layout + broadcast are already persisted above).
+			continue
+		}
 
 		// Copy files_dir contents on top (system-prompt.md, CLAUDE.md, skills/, etc.)
 		// Uses templatePath for CopyTemplateToContainer — runs AFTER configFiles are written

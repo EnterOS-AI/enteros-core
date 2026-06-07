@@ -104,12 +104,15 @@ func TestEnsureDefaultConfig_StampsProviderForEverySSOTPlatformModel(t *testing.
 			broadcaster := newTestBroadcaster()
 			handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
 
-			files := handler.ensureDefaultConfig("ws-platform-boot", models.CreateWorkspacePayload{
+			files, err := handler.ensureDefaultConfig("ws-platform-boot", models.CreateWorkspacePayload{
 				Name:    "Platform Boot Agent",
 				Tier:    2,
 				Runtime: runtime,
 				Model:   model,
 			})
+			if err != nil {
+				t.Fatalf("ensureDefaultConfig failed for model %q: %v", model, err)
+			}
 
 			raw, ok := files["config.yaml"]
 			if !ok {

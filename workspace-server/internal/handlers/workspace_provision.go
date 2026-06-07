@@ -595,7 +595,14 @@ func sanitizeRuntime(raw string) string {
 
 // ensureDefaultConfig generates minimal config files in memory for workspaces without a template.
 // Returns a map of filename → content to be written into the container's /configs volume.
-func (h *WorkspaceHandler) ensureDefaultConfig(workspaceID string, payload models.CreateWorkspacePayload) map[string][]byte {
+//
+// #2248 follow-up (provider-correctness): if the provider registry is
+// available and the runtime/model IS known, but DeriveProvider errors,
+// the error is propagated so provisioning is blocked rather than
+// generating a providerless config that re-derives to the wrong provider
+// at runtime. Unknown/federated runtimes and derive-misses still return
+// a providerless config (preserving today's pass-through behavior).
+func (h *WorkspaceHandler) ensureDefaultConfig(workspaceID string, payload models.CreateWorkspacePayload) (map[string][]byte, error) {
 	files := make(map[string][]byte)
 
 	// Determine runtime — pass through the allowlist so an attacker
@@ -641,10 +648,14 @@ func (h *WorkspaceHandler) ensureDefaultConfig(workspaceID string, payload model
 	// Reuses the SAME manifest path the config-SAVE validators use
 	// (providerRegistry() + Manifest.DeriveProvider; see
 	// model_registry_validation.go). On a derive MISS (unknown/unregistered
-	// model, or registry unavailable) provider is left empty and the field is
-	// omitted below — preserving today's behavior; never fail provisioning on
-	// a derive miss.
-	derivedProvider := deriveDefaultConfigProvider(runtime, model)
+	// model for a known runtime) provider is left empty and the field is
+	// omitted below — preserving today's behavior. On a registry load error
+	// or an exceptional DeriveProvider failure for a KNOWN runtime/model,
+	// the error is propagated and provisioning is blocked.
+	derivedProvider, err := deriveDefaultConfigProvider(runtime, model)
+	if err != nil {
+		return nil, fmt.Errorf("ensureDefaultConfig: provider derivation failed for workspace %s (runtime=%s model=%s): %w", workspaceID, runtime, model, err)
+	}
 
 	if runtime == "claude-code" {
 		model = normalizeClaudeCodeModel(model)
@@ -699,41 +710,94 @@ func (h *WorkspaceHandler) ensureDefaultConfig(workspaceID string, payload model
 	files["config.yaml"] = []byte(configYAML)
 
 	log.Printf("Provisioner: generated %d config files for workspace %s (runtime: %s)", len(files), workspaceID, runtime)
-	return files
+	return files, nil
 }
 
 // deriveDefaultConfigProvider resolves the provider name the adapter should
 // see for (runtime, model) using the SAME providers manifest the config-SAVE
 // validators use (providerRegistry() + Manifest.DeriveProvider; see
-// model_registry_validation.go). It is intentionally fail-OPEN: any miss
-// (empty model, registry unavailable, unknown runtime, or a model the runtime
-// does not own) returns "" so the caller omits the `provider:` field and the
-// generated config keeps its pre-fix shape. It NEVER fails provisioning.
+// model_registry_validation.go).
+//
+// Failure modes:
+//   - Empty model → ("", nil) — pass-through, no provider stamp.
+//   - Registry unavailable/load-error → ("", error) — fail-closed; provisioning
+//     must not proceed on a degraded registry.
+//   - Unknown/federated runtime → ("", nil) — pass-through; no first-party
+//     provider exists, the runtime re-derives at boot.
+//   - Known runtime + known model, but DeriveProvider errors (ambiguous match,
+//     overlap, etc.) → ("", error) — fail-closed; a known model should never
+//     fail derivation, so silently omitting the provider would generate a
+//     providerless config that re-derives to the WRONG provider at runtime
+//     (the moonshot→platform NOT_CONFIGURED class, #2248 follow-up).
+//   - Known runtime + unregistered model (derive miss) → ("", nil) —
+//     pass-through; preserves today's behavior for unregistered models.
 //
 // `model` must be the FULL, un-normalized id (e.g. "moonshot/kimi-k2.6") so
 // DeriveProvider's exact-id match resolves the canvas claude-code case to
 // provider=platform. The availableAuthEnv arg is nil here — config-generation
 // has no per-workspace auth context yet (secrets are injected at container
 // start), matching the validators' nil call.
-func deriveDefaultConfigProvider(runtime, model string) string {
+func deriveDefaultConfigProvider(runtime, model string) (string, error) {
 	if strings.TrimSpace(model) == "" {
-		return ""
+		return "", nil
 	}
 	m, err := providerRegistry()
 	if err != nil || m == nil {
 		// Registry unavailable (a build-time defect the gen/sync gates catch).
-		// Fail open — do not stamp a provider, do not block provisioning.
-		return ""
+		// Fail closed — don't provision on a degraded registry.
+		return "", fmt.Errorf("provider registry unavailable: %w", err)
 	}
-	p, err := m.DeriveProvider(runtime, model, nil)
+	return deriveDefaultConfigProviderFromManifest(m, runtime, model)
+}
+
+// deriveDefaultConfigProviderFromManifest contains the core logic so it can be
+// unit-tested with mock manifests without touching the package-level singleton.
+func deriveDefaultConfigProviderFromManifest(manifest *providers.Manifest, runtime, model string) (string, error) {
+	// Unknown/federated runtime — no first-party provider exists.
+	// Pass-through explicitly so federation is not broken.
+	native, ok := manifest.Runtimes[runtime]
+	if !ok {
+		return "", nil
+	}
+
+	p, err := manifest.DeriveProvider(runtime, model, nil)
 	if err != nil {
-		// Unknown runtime (federation / non-first-party) or a model the
-		// runtime does not own. Either way, omit the provider and let the
-		// runtime fall back to its prior derivation — preserving today's
-		// behavior for unregistered models.
-		return ""
+		// Derive miss for a known runtime (unregistered model) → pass-through.
+		// We detect "known" vs "unknown" by checking whether the model is
+		// recognized by ANY native provider of this runtime — either via an
+		// exact-id match or a prefix match. If the runtime knows the model
+		// (exact or prefix) but DeriveProvider still errors, the error is
+		// exceptional (ambiguous prefix, overlap, etc.) and must fail-closed.
+		// If the runtime does NOT recognize the model at all, it's a genuine
+		// derive miss and the providerless config is the correct fallback.
+		byName := make(map[string]providers.Provider, len(manifest.Providers))
+		for _, prov := range manifest.Providers {
+			byName[prov.Name] = prov
+		}
+		knownModel := false
+		for _, ref := range native.Providers {
+			// Exact-id match
+			for _, mid := range ref.Models {
+				if mid == model {
+					knownModel = true
+					break
+				}
+			}
+			if knownModel {
+				break
+			}
+			// Prefix match
+			if prov, ok := byName[ref.Name]; ok && prov.MatchesModel(model) {
+				knownModel = true
+				break
+			}
+		}
+		if knownModel {
+			return "", fmt.Errorf("derive provider for known runtime/model %s/%s: %w", runtime, model, err)
+		}
+		return "", nil
 	}
-	return p.Name
+	return p.Name, nil
 }
 
 // yamlEscapeSingleQuotedProvider escapes a value for a YAML single-quoted
