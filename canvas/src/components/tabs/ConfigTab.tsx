@@ -13,6 +13,7 @@ import {
   buildProviderCatalog,
   buildProviderCatalogFromRegistry,
   findProviderForModel,
+  isPlatformManagedProvider,
   type SelectorValue,
   type ProviderEntry,
   type RegistryProvider,
@@ -682,6 +683,9 @@ export function ConfigTab({ workspaceId }: Props) {
             name: m.name,
             // carry the derived provider so the selector buckets correctly
             ...(m.provider ? { provider: m.provider } : {}),
+            // carry required_env so wasTemplateDriven can detect
+            // template-driven env lists for registry-backed runtimes
+            ...(m.required_env ? { required_env: m.required_env } : {}),
           }))
         : availableModels,
     [registryBacked, selectedRuntime?.registryModels, availableModels],
@@ -1017,6 +1021,15 @@ export function ConfigTab({ workspaceId }: Props) {
                   // top-level model. required_env follows the selected
                   // provider's envVars when the existing required_env
                   // was template-driven (don't clobber user-typed envs).
+                  //
+                  // #2248: suppress provisioner-injected internal tokens
+                  // (MOLECULE_LLM_USAGE_TOKEN) for platform-managed providers
+                  // so the user can't clobber them.
+                  const selectedEntry = providerCatalog.find((p) => p.id === next.providerId);
+                  const isPlatformManaged = selectedEntry ? isPlatformManagedProvider(selectedEntry) : false;
+                  const filteredEnvVars = isPlatformManaged
+                    ? next.envVars.filter((k) => k !== "MOLECULE_LLM_USAGE_TOKEN")
+                    : next.envVars;
                   setConfig((prev) => {
                     const v = next.model;
                     const prevModelId = prev.runtime_config?.model || prev.model || "";
@@ -1029,8 +1042,8 @@ export function ConfigTab({ workspaceId }: Props) {
                           prevRequired.every((e, i) => e === prevSpec.required_env![i])
                         : false);
                     const nextRequired =
-                      next.envVars.length > 0 && wasTemplateDriven
-                        ? next.envVars
+                      wasTemplateDriven
+                        ? filteredEnvVars
                         : prevRequired;
                     if (prev.runtime) {
                       return {
@@ -1038,7 +1051,7 @@ export function ConfigTab({ workspaceId }: Props) {
                         runtime_config: {
                           ...prev.runtime_config,
                           model: v,
-                          ...(next.envVars.length > 0 && wasTemplateDriven
+                          ...(wasTemplateDriven
                             ? { required_env: nextRequired }
                             : {}),
                         },

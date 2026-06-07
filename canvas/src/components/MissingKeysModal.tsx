@@ -12,6 +12,7 @@ import {
   ProviderModelSelector,
   buildProviderCatalog,
   findProviderForModel,
+  isPlatformManagedProvider,
   type SelectorValue,
 } from "./ProviderModelSelector";
 
@@ -267,10 +268,21 @@ function ProviderPickerModal({
     setSelectorValue(initial);
   }, [open, initial]);
 
+  // #2248: filter out provisioner-injected internal tokens for platform-managed
+  // providers so the user can't clobber them. Memoized so the array reference is
+  // stable across renders and does not churn the entries useEffect.
+  const userEditableEnvVars = useMemo(() => {
+    const selectedProvider = catalog.find((p) => p.id === selectorValue.providerId);
+    const isPlatformManaged = selectedProvider ? isPlatformManagedProvider(selectedProvider) : false;
+    return isPlatformManaged
+      ? selectorValue.envVars.filter((k) => k !== "MOLECULE_LLM_USAGE_TOKEN")
+      : selectorValue.envVars;
+  }, [catalog, selectorValue.providerId, selectorValue.envVars]);
+
   useEffect(() => {
     if (!open) return;
     setEntries(
-      selectorValue.envVars.map((key) => ({
+      userEditableEnvVars.map((key) => ({
         key,
         value: "",
         // Pre-mark as saved when the key is already in the configured
@@ -283,7 +295,7 @@ function ProviderPickerModal({
     );
     setOptionalEntries(
       optionalKeys
-        .filter((key) => !selectorValue.envVars.includes(key))
+        .filter((key) => !userEditableEnvVars.includes(key))
         .map((key) => ({
           key,
           value: "",
@@ -292,7 +304,7 @@ function ProviderPickerModal({
           error: null,
         })),
     );
-  }, [open, selectorValue.envVars, configuredKeys, optionalKeys]);
+  }, [open, userEditableEnvVars, configuredKeys, optionalKeys]);
 
   useEffect(() => {
     if (!open) return;
