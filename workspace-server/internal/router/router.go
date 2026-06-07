@@ -106,6 +106,14 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		c.JSON(200, gin.H{"git_sha": buildinfo.GitSHA})
 	})
 
+	// Org identity — public, no auth. Returns {"name": <MOLECULE_ORG_NAME or "">}
+	// so the canvas topbar can render the org's name without holding an admin
+	// token (the canvas hits this before login/bootstrap). Open + CORS-friendly,
+	// same class as /health and /buildinfo: it exposes a single non-sensitive
+	// identity string the tenant is already named after. The platform agent is
+	// named "<org name> Agent" from the same env (see handlers.OrgIdentity).
+	r.GET("/org/identity", handlers.OrgIdentity)
+
 	// Upload limits — public, no auth. Single source of truth for
 	// per-file / per-request / max-attachments caps consumed by the
 	// canvas (chat upload pre-flight), the workspace python ingest

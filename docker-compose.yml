@@ -73,6 +73,10 @@ services:
       # (concierge), so the tenant server seeds it on boot. Idempotent; unset it
       # if you don't want the auto-seeded Org Concierge root.
       MOLECULE_SEED_PLATFORM_AGENT: "${MOLECULE_SEED_PLATFORM_AGENT:-true}"
+      # Org display name. Drives the platform-agent name ("<MOLECULE_ORG_NAME>
+      # Agent", e.g. "Molecule AI Agent") and the canvas topbar (via the open
+      # GET /org/identity route). Empty → legacy "Org Concierge" + no topbar name.
+      MOLECULE_ORG_NAME: "${MOLECULE_ORG_NAME:-Molecule AI}"
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:${CANVAS_PUBLISH_PORT:-3000},http://127.0.0.1:${CANVAS_PUBLISH_PORT:-3000},http://localhost:3001}
       RATE_LIMIT: "${RATE_LIMIT:-1000}"
       CONFIGS_DIR: /configs

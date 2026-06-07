@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
@@ -39,6 +40,19 @@ import (
 // is one platform agent per self-hosted tenant, so a fixed namespaced uuidv5 is
 // sufficient and stable across restarts.
 var SelfHostedPlatformAgentID = uuid.NewSHA1(uuid.NameSpaceURL, []byte("molecule:self-hosted:platform-agent")).String()
+
+// defaultPlatformAgentName returns the display name for the org's platform
+// agent (the concierge). When the tenant server is told its org's name via the
+// MOLECULE_ORG_NAME env (the self-hosted docker-compose sets it; SaaS passes an
+// explicit name in the CP install payload instead), the concierge is named
+// "<org name> Agent" — e.g. org "Molecule AI" → "Molecule AI Agent". With no
+// org name configured it falls back to the legacy "Org Concierge".
+func defaultPlatformAgentName() string {
+	if orgName := os.Getenv("MOLECULE_ORG_NAME"); orgName != "" {
+		return fmt.Sprintf("%s Agent", orgName)
+	}
+	return "Org Concierge"
+}
 
 // EnsureSelfHostedPlatformAgent installs the org's platform agent (the concierge,
 // the org root) on a tenant that has no control plane to do it — i.e. self-hosted
@@ -58,7 +72,75 @@ func EnsureSelfHostedPlatformAgent(ctx context.Context, database *sql.DB) error 
 		return fmt.Errorf("check existing platform agent: %w", err)
 	}
 	log.Printf("boot: no platform agent present — self-seeding %s (self-hosted)", SelfHostedPlatformAgentID)
-	return installPlatformAgent(ctx, database, SelfHostedPlatformAgentID, "Org Concierge")
+	return installPlatformAgent(ctx, database, SelfHostedPlatformAgentID, defaultPlatformAgentName())
+}
+
+// OrgIdentity handles GET /org/identity (open / CORS-friendly, no auth).
+//
+// Returns the org's display name from the MOLECULE_ORG_NAME env (empty string
+// when unset). The canvas topbar reads this to render "<org name>" without an
+// admin token — exactly like /health and /buildinfo, it exposes a single
+// non-sensitive identity string the tenant is already named after. The contract
+// is intentionally minimal: {"name": <MOLECULE_ORG_NAME or "">}. A parallel
+// frontend agent consumes it with its own fallback, so an empty name is fine.
+func OrgIdentity(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"name": os.Getenv("MOLECULE_ORG_NAME")})
+}
+
+// MaybeProvisionPlatformAgentOnBoot best-effort provisions a container for the
+// self-hosted org's platform agent (the concierge) at boot. The boot-seed
+// (EnsureSelfHostedPlatformAgent) only creates the DB row; on a fresh self-host
+// that leaves the concierge with no container. This brings it online
+// automatically once creds exist.
+//
+// STRICTLY self-host + best-effort:
+//   - The CALLER gates this on MOLECULE_SEED_PLATFORM_AGENT set AND the local
+//     Docker provisioner being active (prov != nil, i.e. MOLECULE_ORG_ID unset).
+//     SaaS (cpProv) never reaches here.
+//   - It looks up the kind='platform' root; if absent (seed disabled / failed)
+//     it no-ops. If the container is already running (prov.IsRunning) it no-ops.
+//   - Otherwise it kicks off ONE provision via the same path the restart
+//     endpoint uses (WorkspaceHandler.RestartByID), which reads the row's
+//     runtime ('claude-code' as seeded) + config and provisions accordingly.
+//
+// On a fresh self-host with no LLM credentials the provision will fail (missing
+// key) and the agent stays 'failed' until the user configures BYOK via
+// Settings — that's expected. This never fatals and never loops: RestartByID is
+// itself debounced/coalesced, and this runs exactly once at boot. Run it in a
+// goroutine so a slow Docker pull doesn't delay the HTTP server coming up.
+func MaybeProvisionPlatformAgentOnBoot(ctx context.Context, database *sql.DB, prov localProvisionerIsRunning, restartByID func(string)) {
+	if prov == nil || restartByID == nil {
+		return
+	}
+	var id, status string
+	err := database.QueryRowContext(ctx,
+		`SELECT id, status FROM workspaces WHERE kind = 'platform' AND parent_id IS NULL LIMIT 1`).Scan(&id, &status)
+	if err == sql.ErrNoRows {
+		log.Printf("boot: platform-agent provision skipped — no platform agent row present")
+		return
+	}
+	if err != nil {
+		log.Printf("boot: platform-agent provision lookup failed (non-fatal): %v", err)
+		return
+	}
+	// Already online AND a live container? Nothing to do. We still provision
+	// when status=='online' but the container is gone (stale row from a prior
+	// boot) — IsRunning is the authoritative check, status is the cheap one.
+	running, _ := prov.IsRunning(ctx, id)
+	if running {
+		log.Printf("boot: platform-agent %s already running — skipping provision", id)
+		return
+	}
+	log.Printf("boot: platform-agent %s not running (status=%s) — kicking off best-effort provision", id, status)
+	go restartByID(id)
+}
+
+// localProvisionerIsRunning is the minimal slice of the local Docker
+// provisioner that MaybeProvisionPlatformAgentOnBoot needs — just the
+// "is this workspace's container live?" probe. Narrowed to an interface so the
+// boot helper is unit-testable without a real Docker daemon.
+type localProvisionerIsRunning interface {
+	IsRunning(ctx context.Context, workspaceID string) (bool, error)
 }
 
 type installPlatformAgentPayload struct {
@@ -82,7 +164,7 @@ func InstallPlatformAgent(c *gin.Context) {
 	}
 	name := p.Name
 	if name == "" {
-		name = "Org Concierge"
+		name = defaultPlatformAgentName()
 	}
 	if err := installPlatformAgent(c.Request.Context(), db.DB, p.ID, name); err != nil {
 		log.Printf("InstallPlatformAgent: %v (id=%s)", err, p.ID)
