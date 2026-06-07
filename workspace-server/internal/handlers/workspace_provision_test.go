@@ -1783,6 +1783,17 @@ func TestProvisionWorkspaceCP_InstanceIDPersistFail_MarksFailed(t *testing.T) {
 		WithArgs("ws-cp-orphan").
 		WillReturnRows(sqlmock.NewRows([]string{"key", "encrypted_value", "encryption_version"}))
 
+	// mintWorkspaceSecrets: revoke + issue auth token + inbound secret
+	mock.ExpectExec(`UPDATE workspace_auth_tokens SET revoked_at`).
+		WithArgs("ws-cp-orphan").
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(`INSERT INTO workspace_auth_tokens`).
+		WithArgs("ws-cp-orphan", sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(`UPDATE workspaces SET platform_inbound_secret`).
+		WithArgs(sqlmock.AnyArg(), "ws-cp-orphan").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
 	// All 3 retry attempts fail.
 	for i := 0; i < instanceIDPersistRetryAttempts; i++ {
 		mock.ExpectExec(`UPDATE workspaces SET instance_id =`).
@@ -1841,6 +1852,17 @@ func TestProvisionWorkspaceCP_InstanceIDPersistFail_RetrySucceeds(t *testing.T) 
 	mock.ExpectQuery(`SELECT key, encrypted_value, encryption_version FROM workspace_secrets`).
 		WithArgs("ws-cp-retry-ok").
 		WillReturnRows(sqlmock.NewRows([]string{"key", "encrypted_value", "encryption_version"}))
+
+	// mintWorkspaceSecrets: revoke + issue auth token + inbound secret
+	mock.ExpectExec(`UPDATE workspace_auth_tokens SET revoked_at`).
+		WithArgs("ws-cp-retry-ok").
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(`INSERT INTO workspace_auth_tokens`).
+		WithArgs("ws-cp-retry-ok", sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(`UPDATE workspaces SET platform_inbound_secret`).
+		WithArgs(sqlmock.AnyArg(), "ws-cp-retry-ok").
+		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// First attempt fails, second succeeds.
 	mock.ExpectExec(`UPDATE workspaces SET instance_id =`).
