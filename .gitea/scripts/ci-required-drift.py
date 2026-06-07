@@ -317,7 +317,33 @@ def required_checks_env(audit_doc: dict, branch: str) -> set[str]:
                 f"::error::REQUIRED_CHECKS_JSON['{branch}'] is {type(branch_checks).__name__}, expected list\n"
             )
             sys.exit(3)
-        return {str(item).strip() for item in branch_checks if str(item).strip()}
+        # Fail-closed validation: every entry must be a non-empty string.
+        # Reject null, int, dict, or empty/whitespace strings silently —
+        # they indicate a malformed manifest that drift-detect must not
+        # normalize away (that would hide config errors).
+        validated: set[str] = set()
+        for idx, item in enumerate(branch_checks):
+            if not isinstance(item, str):
+                sys.stderr.write(
+                    f"::error::REQUIRED_CHECKS_JSON['{branch}'][{idx}] is "
+                    f"{type(item).__name__} (value={item!r}), expected str\n"
+                )
+                sys.exit(3)
+            stripped = item.strip()
+            if not stripped:
+                sys.stderr.write(
+                    f"::error::REQUIRED_CHECKS_JSON['{branch}'][{idx}] is "
+                    f"empty/whitespace string\n"
+                )
+                sys.exit(3)
+            if stripped in validated:
+                sys.stderr.write(
+                    f"::error::REQUIRED_CHECKS_JSON['{branch}'] contains "
+                    f"duplicate context '{stripped}' at index {idx}\n"
+                )
+                sys.exit(3)
+            validated.add(stripped)
+        return validated
 
     # Legacy variant fallback.
     if found_legacy:

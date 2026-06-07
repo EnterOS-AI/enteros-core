@@ -1563,3 +1563,126 @@ def test_process_once_defensive_skip_when_pull_payload_opted_out(monkeypatch):
 
     assert rc == 0
     assert calls["merged"] is None
+
+
+# ---------------------------------------------------------------------------
+# readiness-enumeration + post-batch summary
+# ---------------------------------------------------------------------------
+
+def test_enumerate_readiness_evaluates_all_candidates(monkeypatch):
+    """enumerate_readiness returns every candidate's state, not stopping at
+    the first actionable one."""
+    old_head, new_head = "a" * 40, "c" * 40
+    _wire_multi_candidate_process_once(
+        monkeypatch,
+        issues=[
+            _issue(500, labels=[], created="2026-06-01T01:00:00Z"),
+            _issue(501, labels=[], created="2026-06-01T02:00:00Z"),
+        ],
+        pulls={
+            500: {"state": "open", "mergeable": False, "draft": False,
+                  "base": {"ref": "main", "repo_id": 1},
+                  "head": {"sha": old_head, "repo_id": 1}, "labels": []},
+            501: {"state": "open", "mergeable": True, "draft": False,
+                  "base": {"ref": "main", "repo_id": 1},
+                  "head": {"sha": new_head, "repo_id": 1}, "labels": []},
+        },
+        reviews={500: _two_approvals(old_head), 501: _two_approvals(new_head)},
+        calls={},
+    )
+
+    entries = mq.enumerate_readiness(dry_run=False)
+
+    assert len(entries) == 2
+    by_num = {e.pr_number: e for e in entries}
+    assert by_num[500].decision is not None
+    assert by_num[500].decision.ready is False
+    assert by_num[501].decision is not None
+    assert by_num[501].decision.ready is True
+
+
+def test_enumerate_readiness_includes_ineligible_pr(monkeypatch):
+    """enumerate_readiness marks fork / wrong-base PRs as ineligible
+    (decision=None) while still evaluating the rest."""
+    head = "a" * 40
+    _wire_multi_candidate_process_once(
+        monkeypatch,
+        issues=[
+            _issue(600, labels=[], created="2026-06-01T01:00:00Z"),
+            _issue(601, labels=[], created="2026-06-01T02:00:00Z"),
+        ],
+        pulls={
+            600: {"state": "open", "mergeable": True, "draft": False,
+                  "base": {"ref": "main", "repo_id": 1},
+                  "head": {"sha": head, "repo_id": 2}, "labels": []},  # fork
+            601: {"state": "open", "mergeable": True, "draft": False,
+                  "base": {"ref": "main", "repo_id": 1},
+                  "head": {"sha": head, "repo_id": 1}, "labels": []},
+        },
+        reviews={600: _two_approvals(head), 601: _two_approvals(head)},
+        calls={},
+    )
+
+    entries = mq.enumerate_readiness(dry_run=False)
+
+    by_num = {e.pr_number: e for e in entries}
+    assert by_num[600].decision is None
+    assert "not merge-eligible" in by_num[600].reason
+    assert by_num[601].decision is not None
+    assert by_num[601].decision.ready is True
+
+
+def test_enumerate_readiness_fail_closed_on_api_error(monkeypatch):
+    """If get_pull raises for one candidate, that candidate is recorded as
+    unverifiable; other candidates are still evaluated."""
+    head = "a" * 40
+    _wire_multi_candidate_process_once(
+        monkeypatch,
+        issues=[
+            _issue(700, labels=[], created="2026-06-01T01:00:00Z"),
+            _issue(701, labels=[], created="2026-06-01T02:00:00Z"),
+        ],
+        pulls={
+            700: {"state": "open", "mergeable": True, "draft": False,
+                  "base": {"ref": "main", "repo_id": 1},
+                  "head": {"sha": head, "repo_id": 1}, "labels": []},
+            701: {"state": "open", "mergeable": True, "draft": False,
+                  "base": {"ref": "main", "repo_id": 1},
+                  "head": {"sha": head, "repo_id": 1}, "labels": []},
+        },
+        reviews={700: _two_approvals(head), 701: _two_approvals(head)},
+        calls={},
+    )
+
+    original_get_pull = mq.get_pull
+    def failing_get_pull(n):
+        if n == 700:
+            raise mq.ApiError("simulated API failure")
+        return original_get_pull(n)
+    monkeypatch.setattr(mq, "get_pull", failing_get_pull)
+
+    entries = mq.enumerate_readiness(dry_run=False)
+
+    by_num = {e.pr_number: e for e in entries}
+    assert by_num[700].decision is None
+    assert "unverifiable" in by_num[700].reason
+    assert by_num[701].decision is not None
+    assert by_num[701].decision.ready is True
+
+
+def test_print_post_batch_summary_counts_correctly(capsys):
+    entries = [
+        mq.ReadinessEntry(pr_number=1, decision=mq.MergeDecision(True, "merge", "ready"), reason="ready"),
+        mq.ReadinessEntry(pr_number=2, decision=mq.MergeDecision(False, "wait", "CI red"), reason="CI red"),
+        mq.ReadinessEntry(pr_number=3, decision=None, reason="draft"),
+    ]
+    mq.print_post_batch_summary(entries)
+    captured = capsys.readouterr()
+    out = captured.out
+    assert "total_candidates=3" in out
+    assert "ready=1" in out
+    assert "waiting=1" in out
+    assert "ineligible/unverifiable=1" in out
+    assert "PR #1: state=ready" in out
+    assert "PR #2: state=waiting" in out
+    assert "PR #3: state=ineligible" in out

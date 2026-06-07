@@ -32,6 +32,21 @@ func primeInstanceIDLookup(t *testing.T, pairs map[string]string) {
 	t.Cleanup(func() { resolveInstanceID = prev })
 }
 
+// primeProviderLookup swaps resolveProvider for a stub that returns the
+// mapped provider for the given workspace_id, or "" for anything not in
+// the map. Mirrors primeInstanceIDLookup for the #2386 deprovider path.
+func primeProviderLookup(t *testing.T, pairs map[string]string) {
+	t.Helper()
+	prev := resolveProvider
+	resolveProvider = func(_ context.Context, wsID string) (string, error) {
+		if p, ok := pairs[wsID]; ok {
+			return p, nil
+		}
+		return "", nil
+	}
+	t.Cleanup(func() { resolveProvider = prev })
+}
+
 // TestNewCPProvisioner_RequiresOrgID — self-hosted deployments don't
 // have a MOLECULE_ORG_ID, and the provisioner must refuse to construct
 // rather than silently phone home to the prod CP with an empty tenant.

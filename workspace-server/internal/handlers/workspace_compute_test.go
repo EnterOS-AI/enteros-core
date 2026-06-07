@@ -93,6 +93,38 @@ func TestWorkspaceComputeJSON_OmitsEmptyNestedSections(t *testing.T) {
 	}
 }
 
+// Regression: provider + data_persistence were FORWARDED to CP but dropped from
+// the serialized compute, so GET /workspaces never returned them (the canvas
+// provider badge always showed AWS, the persistence selector always "auto").
+func TestWorkspaceComputeJSON_RoundTripsProviderAndDataPersistence(t *testing.T) {
+	got, err := workspaceComputeJSON(models.WorkspaceCompute{
+		InstanceType:    "t3.medium",
+		Provider:        "gcp",
+		DataPersistence: "persist",
+	})
+	if err != nil {
+		t.Fatalf("workspaceComputeJSON returned error: %v", err)
+	}
+	if !strings.Contains(got, `"provider":"gcp"`) {
+		t.Fatalf("workspaceComputeJSON dropped provider: %s", got)
+	}
+	if !strings.Contains(got, `"data_persistence":"persist"`) {
+		t.Fatalf("workspaceComputeJSON dropped data_persistence: %s", got)
+	}
+}
+
+// A provider-only compute must NOT be treated as zero (else it serializes to
+// "{}" and the cloud is lost).
+func TestWorkspaceComputeJSON_ProviderOnlyIsNotZero(t *testing.T) {
+	got, err := workspaceComputeJSON(models.WorkspaceCompute{Provider: "hetzner"})
+	if err != nil {
+		t.Fatalf("workspaceComputeJSON returned error: %v", err)
+	}
+	if got == "{}" || !strings.Contains(got, `"provider":"hetzner"`) {
+		t.Fatalf("provider-only compute serialized as zero: %s", got)
+	}
+}
+
 func TestWorkspaceCreate_WithCompute_PersistsComputeJSON(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)

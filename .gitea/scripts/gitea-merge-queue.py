@@ -1166,12 +1166,122 @@ def _evaluate_candidate(
     return decision, ctx
 
 
+@dataclasses.dataclass(frozen=True)
+class ReadinessEntry:
+    """One candidate's readiness state."""
+
+    pr_number: int
+    decision: MergeDecision | None
+    reason: str
+
+
+def enumerate_readiness(*, dry_run: bool = False) -> list[ReadinessEntry]:
+    """Evaluate ALL candidates and return their readiness states.
+
+    Fail-closed: if branch protection cannot be fetched, raise
+    BranchProtectionUnavailable (caller must handle). Unlike
+    process_once, this does NOT stop at the first actionable candidate;
+    it evaluates every eligible PR and returns the full list so a
+    post-batch summary can be printed.
+    """
+    bp = get_branch_protection(WATCH_BRANCH)
+    contexts = bp.required_contexts
+    required_approvals = bp.required_approvals
+
+    main_sha = get_branch_head(WATCH_BRANCH)
+    main_status = get_combined_status(main_sha)
+    main_latest = latest_statuses_by_context(main_status.get("statuses") or [])
+    main_ok, main_bad = required_contexts_green(main_latest, push_required_contexts())
+
+    candidates = choose_candidate_issues(
+        list_candidate_issues(auto_discover=AUTO_DISCOVER),
+        queue_label=QUEUE_LABEL,
+        opt_out_labels=OPT_OUT_LABELS,
+        auto_discover=AUTO_DISCOVER,
+    )
+
+    entries: list[ReadinessEntry] = []
+    for issue in candidates:
+        pr_number = int(issue["number"])
+        try:
+            decision, ctx = _evaluate_candidate(
+                issue,
+                main_sha=main_sha,
+                main_status=main_status,
+                required_contexts=contexts,
+                required_approvals=required_approvals,
+                dry_run=dry_run,
+            )
+        except ApiError as exc:
+            # Fail-closed per candidate: an unreadable PR is recorded as
+            # unverifiable, not skipped silently.
+            entries.append(
+                ReadinessEntry(
+                    pr_number=pr_number,
+                    decision=None,
+                    reason=f"unverifiable (API error: {exc})",
+                )
+            )
+            continue
+        if decision is None:
+            entries.append(
+                ReadinessEntry(
+                    pr_number=pr_number,
+                    decision=None,
+                    reason="not merge-eligible (opt-out/draft/fork/wrong-base)",
+                )
+            )
+            continue
+        entries.append(
+            ReadinessEntry(
+                pr_number=pr_number,
+                decision=decision,
+                reason=decision.reason,
+            )
+        )
+    return entries
+
+
+def print_post_batch_summary(entries: list[ReadinessEntry]) -> None:
+    """Print a structured summary of all candidates' readiness.
+
+    Emits ::notice:: lines for machine parsing and a human-readable
+    block for operator visibility.
+    """
+    ready = [e for e in entries if e.decision and e.decision.ready]
+    waiting = [e for e in entries if e.decision and not e.decision.ready]
+    ineligible = [e for e in entries if e.decision is None]
+
+    print("::group::merge-queue readiness summary")
+    print(f"total_candidates={len(entries)}")
+    print(f"ready={len(ready)}")
+    print(f"waiting={len(waiting)}")
+    print(f"ineligible/unverifiable={len(ineligible)}")
+    print("")
+    for e in entries:
+        state = "ready" if e.decision and e.decision.ready else (
+            "waiting" if e.decision else "ineligible"
+        )
+        action = e.decision.action if e.decision else "n/a"
+        print(f"PR #{e.pr_number}: state={state} action={action} reason={e.reason}")
+    print("::endgroup::")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--enumerate",
+        action="store_true",
+        help="Evaluate all candidates and print a readiness summary without merging.",
+    )
     args = parser.parse_args()
     _require_runtime_env()
     try:
+        if args.enumerate:
+            entries = enumerate_readiness(dry_run=args.dry_run)
+            print_post_batch_summary(entries)
+            return 0
         return process_once(dry_run=args.dry_run)
     except ApiError as exc:
         # FAIL-CLOSED: API errors are not "transient success" — they mean

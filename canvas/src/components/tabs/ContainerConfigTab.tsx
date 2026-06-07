@@ -38,8 +38,16 @@ const DATA_PERSISTENCE_OPTIONS = ["", "persist", "ephemeral"];
 const dataPersistenceLabel = (v: string): string =>
   v === "persist" ? "Always keep (persist)" : v === "ephemeral" ? "Don't keep (ephemeral)" : "Auto";
 
+// Cloud/compute backend display name. The provider is chosen at create time and
+// is NOT editable here (changing a workspace's cloud requires a recreate), so
+// it renders as a read-only badge — but we must preserve it across Save (the
+// compute payload is rebuilt below, and dropping it would wipe the column).
+const cloudProviderLabel = (v: string | undefined): string =>
+  v === "gcp" ? "GCP" : v === "hetzner" ? "Hetzner" : "AWS";
+
 export function ContainerConfigTab({ workspaceId, data }: Props) {
   const runtime = data.runtime;
+  const provider = data.compute?.provider; // read-only; set at create time
   const instanceType = data.compute?.instance_type;
   const rootGB = data.compute?.volume?.root_gb;
   const displayMode = data.compute?.display?.mode;
@@ -94,6 +102,10 @@ export function ContainerConfigTab({ workspaceId, data }: Props) {
             : { mode: "none" },
           // internal#734: omit when "auto" so the wire/default behavior is unchanged.
           ...(form.dataPersistence ? { data_persistence: form.dataPersistence } : {}),
+          // Preserve the create-time cloud provider — it's not editable here, but
+          // this PATCH rebuilds the whole compute object, so omitting it would
+          // wipe the persisted provider (and mislead the badge after a Save).
+          ...(provider ? { provider } : {}),
         };
 
         const resp = await api.patch<{ needs_restart?: boolean }>(`/workspaces/${workspaceId}`, {
@@ -126,7 +138,18 @@ export function ContainerConfigTab({ workspaceId, data }: Props) {
     <div className="p-4 space-y-4">
       <section className="rounded-lg border border-line/50 bg-surface-card/40 p-4">
         <div className="mb-3 flex items-center justify-between gap-3">
-          <h3 className="text-sm font-semibold text-ink">Container Config</h3>
+          <div className="flex items-center gap-2">
+            <h3 className="text-sm font-semibold text-ink">Container Config</h3>
+            {/* Read-only cloud-provider badge — which cloud this workspace's box
+                runs on (AWS/GCP/Hetzner). Defaults to AWS when unset (legacy
+                rows). Set at create time in the Create Workspace dialog. */}
+            <span
+              title="Cloud provider for this workspace's compute (set at create time)"
+              className="rounded-full border border-line/60 bg-surface-sunken px-2 py-0.5 font-mono text-[10px] uppercase tracking-wide text-ink-mid"
+            >
+              {cloudProviderLabel(provider)}
+            </span>
+          </div>
           {data.needsRestart && <span className="text-[11px] text-warm">Restart required</span>}
         </div>
 

@@ -787,7 +787,8 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 	nativeStatus := runtimeOverrides.HasCapability(payload.WorkspaceID, "status_mgmt")
 
 	if !nativeStatus && currentStatus == "online" && payload.ErrorRate >= 0.5 {
-		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1, updated_at = now() WHERE id = $2`, models.StatusDegraded, payload.WorkspaceID); err != nil {
+		// #73 guard: heartbeat degrade must not resurrect a removed workspace.
+		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1, updated_at = now() WHERE id = $2 AND status = 'online'`, models.StatusDegraded, payload.WorkspaceID); err != nil {
 			log.Printf("Heartbeat: failed to mark %s degraded: %v", payload.WorkspaceID, err)
 		}
 		h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceDegraded), payload.WorkspaceID, map[string]interface{}{
@@ -806,7 +807,8 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 	// Skipped under native_status_mgmt for the same reason as the
 	// degrade branch above: the adapter owns the transition.
 	if !nativeStatus && currentStatus == "degraded" && payload.ErrorRate < 0.1 && payload.RuntimeState == "" {
-		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1, updated_at = now() WHERE id = $2`, models.StatusOnline, payload.WorkspaceID); err != nil {
+		// #73 guard: heartbeat recovery must not resurrect a removed workspace.
+		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1, updated_at = now() WHERE id = $2 AND status = 'degraded'`, models.StatusOnline, payload.WorkspaceID); err != nil {
 			log.Printf("Heartbeat: failed to recover %s to online: %v", payload.WorkspaceID, err)
 		}
 		h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceOnline), payload.WorkspaceID, map[string]interface{}{})
@@ -861,6 +863,29 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 			log.Printf("Heartbeat: failed to recover %s from awaiting_agent: %v", payload.WorkspaceID, err)
 		} else {
 			log.Printf("Heartbeat: transitioned %s from awaiting_agent to online (heartbeat received)", payload.WorkspaceID)
+		}
+		h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceOnline), payload.WorkspaceID, map[string]interface{}{
+			"recovered_from": currentStatus,
+		})
+	}
+
+	// Auto-recovery from failed: the provision-timeout sweeper
+	// (registry/provisiontimeout.go) flips a workspace to 'failed' when it sits
+	// in 'provisioning' past DefaultProvisioningTimeout (10m for claude-code).
+	// But a slow cold-boot (EC2 image pull + LLM preflight) can still finish and
+	// start heartbeating AFTER the flip — agent_card is written unconditionally
+	// on register, so the box is genuinely serving while its status is stuck
+	// 'failed'. A live heartbeat is authoritative: recover to online. Without
+	// this, a healthy-but-slow workspace (e.g. a model that preflights slower
+	// than the 10m budget) shows 'failed' forever despite working — the
+	// mechanism behind the intermittent multi-provider e2e "boot failures". The
+	// `AND status = 'failed'` guard keeps the flip conditional (won't override
+	// 'removed').
+	if currentStatus == "failed" {
+		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1, updated_at = now() WHERE id = $2 AND status = 'failed'`, models.StatusOnline, payload.WorkspaceID); err != nil {
+			log.Printf("Heartbeat: failed to recover %s from failed: %v", payload.WorkspaceID, err)
+		} else {
+			log.Printf("Heartbeat: transitioned %s from failed to online (late heartbeat after provision-timeout)", payload.WorkspaceID)
 		}
 		h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceOnline), payload.WorkspaceID, map[string]interface{}{
 			"recovered_from": currentStatus,

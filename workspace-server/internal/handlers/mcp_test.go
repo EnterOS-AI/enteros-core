@@ -291,7 +291,10 @@ func TestMCPHandler_DelegateTaskAsync_RoutesThroughPlatformA2AProxy(t *testing.T
 		WithArgs(callerID, callerID, targetID, "Delegating to "+targetID, sqlmock.AnyArg(), "pending").
 		WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectExec(`UPDATE activity_logs`).
-		WithArgs("dispatched", "", callerID, sqlmock.AnyArg()).
+		WithArgs("queued", "", callerID, sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`UPDATE activity_logs`).
+		WithArgs("delivered", "", callerID, sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	called := make(chan struct{}, 1)
@@ -311,7 +314,7 @@ func TestMCPHandler_DelegateTaskAsync_RoutesThroughPlatformA2AProxy(t *testing.T
 	if err != nil {
 		t.Fatalf("delegate_task_async returned error: %v", err)
 	}
-	if !strings.Contains(out, `"status":"dispatched"`) {
+	if !strings.Contains(out, `"status":"queued"`) {
 		t.Fatalf("delegate_task_async response = %s", out)
 	}
 	waitGlobalAsyncForTest()
@@ -397,7 +400,10 @@ func TestMCPHandler_DelegateTaskAsync_WithAttachments(t *testing.T) {
 		WithArgs(callerID, callerID, targetID, "Delegating to "+targetID, sqlmock.AnyArg(), "pending").
 		WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectExec(`UPDATE activity_logs`).
-		WithArgs("dispatched", "", callerID, sqlmock.AnyArg()).
+		WithArgs("queued", "", callerID, sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`UPDATE activity_logs`).
+		WithArgs("delivered", "", callerID, sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	called := make(chan []byte, 1)
@@ -423,7 +429,7 @@ func TestMCPHandler_DelegateTaskAsync_WithAttachments(t *testing.T) {
 	if err != nil {
 		t.Fatalf("delegate_task_async returned error: %v", err)
 	}
-	if !strings.Contains(out, `"status":"dispatched"`) {
+	if !strings.Contains(out, `"status":"queued"`) {
 		t.Fatalf("delegate_task_async response = %s", out)
 	}
 	waitGlobalAsyncForTest()
@@ -455,7 +461,10 @@ func TestMCPHandler_DelegateTaskAsync_MarshalFailureDoesNotCallProxy(t *testing.
 		WithArgs(callerID, callerID, targetID, "Delegating to "+targetID, sqlmock.AnyArg(), "pending").
 		WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectExec(`UPDATE activity_logs`).
-		WithArgs("dispatched", "", callerID, sqlmock.AnyArg()).
+		WithArgs("queued", "", callerID, sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`UPDATE activity_logs`).
+		WithArgs("failed", sqlmock.AnyArg(), callerID, sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// Force the (otherwise near-impossible) marshal failure for the A2A body.
@@ -478,7 +487,7 @@ func TestMCPHandler_DelegateTaskAsync_MarshalFailureDoesNotCallProxy(t *testing.
 	if err != nil {
 		t.Fatalf("delegate_task_async returned error: %v", err)
 	}
-	if !strings.Contains(out, `"status":"dispatched"`) {
+	if !strings.Contains(out, `"status":"queued"`) {
 		t.Fatalf("delegate_task_async response = %s", out)
 	}
 

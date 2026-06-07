@@ -229,6 +229,13 @@ func (h *WorkspaceHandler) Restart(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "lookup failed"})
 		return
 	}
+	// Block restart if workspace is removed — same 404 as not-found so we don't
+	// leak that the row ever existed, and to prevent resurrecting a removed
+	// workspace to 'provisioning' before the async runRestartCycle guard fires.
+	if status == string(models.StatusRemoved) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "workspace not found"})
+		return
+	}
 	// Block restart if any ancestor is paused — must resume parent first
 	if paused, parentName := isParentPaused(ctx, id); paused {
 		c.JSON(http.StatusConflict, gin.H{"error": "parent workspace \"" + parentName + "\" is paused — resume it first"})
