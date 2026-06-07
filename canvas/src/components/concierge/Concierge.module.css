@@ -316,3 +316,8 @@
 
 /* embedded canvas settings tabs */
 .embedSettings { border: 1px solid var(--hair); border-radius: 14px; overflow: hidden; background: var(--card); }
+
+/* embedded canonical ChatTab (shared with the Org-map SidePanel).
+   Fills the chat column below the concierge header; min-height:0 lets the
+   ChatTab's own overflow-y scroller work inside the flex column. */
+.embedChat { flex: 1; min-height: 0; display: flex; flex-direction: column; }

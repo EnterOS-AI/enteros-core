@@ -9,13 +9,13 @@ import type { ActivityEntry } from "@/types/activity";
 import { Canvas } from "@/components/Canvas";
 import { Legend } from "@/components/Legend";
 import { CommunicationOverlay } from "@/components/CommunicationOverlay";
-import { ConciergeChat } from "./ConciergeChat";
+import { ChatTab } from "@/components/tabs/ChatTab";
 import { PlatformBillingSection } from "./PlatformBillingSection";
 import { SettingsTabs } from "@/components/settings";
 import s from "./Concierge.module.css";
 import {
   IcHome, IcOrgMap, IcSettings, IcSearch, IcBell, IcSun, IcMoon, IcChevDown,
-  IcQueue, IcCaret, IcMolecule, IcClock, IcCheck, IcTrash,
+  IcQueue, IcCaret, IcMolecule, IcClock, IcCheck, IcTrash, IcChat,
 } from "./icons";
 
 /* ── status → concept palette ─────────────────────────────────────────── */
@@ -437,17 +437,39 @@ export function ConciergeShell() {
                 </div>
               </aside>
 
-              {/* CHAT — real platform-agent conversation */}
-              {platformId ? (
-                <ConciergeChat
-                  workspaceId={platformId}
-                  agentName={platformRoot?.data.name ?? "Org Concierge"}
-                  online={
-                    platformRoot?.data.status === "online" ||
-                    platformRoot?.data.status === "degraded"
-                  }
-                  statusLabel={statusInfo(platformRoot?.data.status ?? "").label}
-                />
+              {/* CHAT — reuses the EXACT canonical chat the Org-map SidePanel
+                  renders (My Chat / Agent Comms sub-tabs, attachments, history,
+                  delivery-mode handling), pointed at the platform agent. A thin
+                  concierge-styled header keeps the Home look; the ChatTab body
+                  below is identical to the map path so features can't drift. */}
+              {platformId && platformRoot ? (
+                <section className={s.chat}>
+                  <div className={s.chatHead}>
+                    <div className={s.chAv}><IcChat /></div>
+                    <div className={s.chMeta}>
+                      <div className={s.chTitle}>{platformRoot.data.name ?? "Org Concierge"}</div>
+                      <div className={s.chSub}>
+                        {(() => {
+                          const online =
+                            platformRoot.data.status === "online" ||
+                            platformRoot.data.status === "degraded";
+                          return (
+                            <>
+                              <span
+                                className={s.sdot}
+                                style={{ background: online ? "var(--green)" : "var(--grey)" }}
+                              />
+                              {online ? "online" : statusInfo(platformRoot.data.status ?? "").label} · platform agent
+                            </>
+                          );
+                        })()}
+                      </div>
+                    </div>
+                  </div>
+                  <div className={s.embedChat}>
+                    <ChatTab key={platformId} workspaceId={platformId} data={platformRoot.data} />
+                  </div>
+                </section>
               ) : (
                 <section className={s.chat}>
                   <div className={s.greetWrap}>
