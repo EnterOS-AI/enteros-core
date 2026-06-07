@@ -1761,11 +1761,16 @@ func (m *mockResolver) Fetch(_ context.Context, _, _ string) (string, error) {
 }
 
 // TestProvisionWorkspaceCP_InstanceIDPersistFail_MarksFailed asserts that
-// when cpProv.Start succeeds but the DB UPDATE for instance_id fails, the
-// handler marks the workspace failed WITHOUT terminating the live EC2 (the
-// instance may contain valuable state; operator decides). Regression test for
-// ticket #1 (Researcher cleanup audit).
+// when cpProv.Start succeeds but the DB UPDATE for instance_id fails on ALL
+// retry attempts, the handler marks the workspace failed WITHOUT terminating
+// the live EC2. The orphaned instance_id is recorded in the broadcast event
+// for operator reconciliation. Regression test for ticket #1.
 func TestProvisionWorkspaceCP_InstanceIDPersistFail_MarksFailed(t *testing.T) {
+	// Shrink retry backoff so the test doesn't stall.
+	prevDelay := instanceIDPersistRetryBaseDelay
+	instanceIDPersistRetryBaseDelay = 1 * time.Millisecond
+	t.Cleanup(func() { instanceIDPersistRetryBaseDelay = prevDelay })
+
 	t.Setenv("MOLECULE_LLM_BASE_URL", "https://api.example.test/api/v1/internal/llm/openai/v1")
 	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
 
@@ -1777,12 +1782,14 @@ func TestProvisionWorkspaceCP_InstanceIDPersistFail_MarksFailed(t *testing.T) {
 		WithArgs("ws-cp-orphan").
 		WillReturnRows(sqlmock.NewRows([]string{"key", "encrypted_value", "encryption_version"}))
 
-	// instance_id persist fails
-	mock.ExpectExec(`UPDATE workspaces SET instance_id =`).
-		WithArgs("ws-cp-orphan", "i-12345").
-		WillReturnError(fmt.Errorf("connection reset by peer"))
+	// All 3 retry attempts fail.
+	for i := 0; i < instanceIDPersistRetryAttempts; i++ {
+		mock.ExpectExec(`UPDATE workspaces SET instance_id =`).
+			WithArgs("ws-cp-orphan", "i-12345").
+			WillReturnError(fmt.Errorf("connection reset by peer"))
+	}
 
-	// markProvisionFailed updates status to failed
+	// markProvisionFailed updates status to failed.
 	mock.ExpectExec(`UPDATE workspaces SET status =`).
 		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -1801,21 +1808,81 @@ func TestProvisionWorkspaceCP_InstanceIDPersistFail_MarksFailed(t *testing.T) {
 	if cap.lastData == nil {
 		t.Fatal("expected RecordAndBroadcast to capture data on persist failure; got nothing")
 	}
-	if got := cap.lastData["error"]; got != "instance_id persist failed — EC2 untracked" {
-		t.Errorf("broadcast error message = %q, want 'instance_id persist failed — EC2 untracked'", got)
+	if got := cap.lastData["error"]; got != "instance_id persist failed after retry — EC2 untracked" {
+		t.Errorf("broadcast error message = %q, want 'instance_id persist failed after retry — EC2 untracked'", got)
+	}
+	if got := cap.lastData["instance_id"]; got != "i-12345" {
+		t.Errorf("broadcast instance_id = %v, want 'i-12345'", got)
+	}
+	if got := cap.lastData["attempts"]; got != instanceIDPersistRetryAttempts {
+		t.Errorf("broadcast attempts = %v, want %d", got, instanceIDPersistRetryAttempts)
+	}
+	if stub.stopCalls != 0 {
+		t.Errorf("Stop called %d times; want 0 (live instance must NOT be terminated)", stub.stopCalls)
+	}
+}
+
+// TestProvisionWorkspaceCP_InstanceIDPersistFail_RetrySucceeds asserts that a
+// transient DB blip on the first attempt is recovered by the bounded retry:
+// the second UPDATE succeeds and the workspace proceeds to online normally.
+func TestProvisionWorkspaceCP_InstanceIDPersistFail_RetrySucceeds(t *testing.T) {
+	prevDelay := instanceIDPersistRetryBaseDelay
+	instanceIDPersistRetryBaseDelay = 1 * time.Millisecond
+	t.Cleanup(func() { instanceIDPersistRetryBaseDelay = prevDelay })
+
+	t.Setenv("MOLECULE_LLM_BASE_URL", "https://api.example.test/api/v1/internal/llm/openai/v1")
+	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
+
+	mock := setupTestDB(t)
+
+	mock.ExpectQuery(`SELECT key, encrypted_value, encryption_version FROM global_secrets`).
+		WillReturnRows(sqlmock.NewRows([]string{"key", "encrypted_value", "encryption_version"}))
+	mock.ExpectQuery(`SELECT key, encrypted_value, encryption_version FROM workspace_secrets`).
+		WithArgs("ws-cp-retry-ok").
+		WillReturnRows(sqlmock.NewRows([]string{"key", "encrypted_value", "encryption_version"}))
+
+	// First attempt fails, second succeeds.
+	mock.ExpectExec(`UPDATE workspaces SET instance_id =`).
+		WithArgs("ws-cp-retry-ok", "i-retry-ok").
+		WillReturnError(fmt.Errorf("connection reset by peer"))
+	mock.ExpectExec(`UPDATE workspaces SET instance_id =`).
+		WithArgs("ws-cp-retry-ok", "i-retry-ok").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	cap := &captureBroadcaster{}
+	stub := &stubInstanceIDPersistFailCPProv{instanceID: "i-retry-ok"}
+	handler := NewWorkspaceHandler(cap, nil, "http://localhost:8080", t.TempDir())
+	handler.SetCPProvisioner(stub)
+
+	handler.provisionWorkspaceCP("ws-cp-retry-ok", "/nonexistent/template", nil, models.CreateWorkspacePayload{
+		Name:    "ws-cp-retry-ok",
+		Tier:    1,
+		Runtime: "claude-code",
+	})
+
+	// No failure broadcast should have fired.
+	if cap.lastData != nil {
+		t.Fatalf("expected NO failure broadcast on retry success; got %v", cap.lastData)
+	}
+	if stub.stopCalls != 0 {
+		t.Errorf("Stop called %d times; want 0", stub.stopCalls)
 	}
 }
 
 // stubInstanceIDPersistFailCPProv implements CPProvisionerAPI for the
-// instance-id-persist-failure test.
+// instance-id-persist-failure tests.
 type stubInstanceIDPersistFailCPProv struct {
 	instanceID string
+	stopCalls  int
 }
 
 func (s *stubInstanceIDPersistFailCPProv) Start(_ context.Context, _ provisioner.WorkspaceConfig) (string, error) {
 	return s.instanceID, nil
 }
-func (s *stubInstanceIDPersistFailCPProv) Stop(_ context.Context, _ string) error { return nil }
+func (s *stubInstanceIDPersistFailCPProv) Stop(_ context.Context, _ string) error {
+	s.stopCalls++
+	return nil
+}
 func (s *stubInstanceIDPersistFailCPProv) StopAndPrune(_ context.Context, _ string) error { return nil }
 func (s *stubInstanceIDPersistFailCPProv) GetConsoleOutput(_ context.Context, _ string) (string, error) {
 	return "", nil
