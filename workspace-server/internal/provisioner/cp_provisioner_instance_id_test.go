@@ -24,8 +24,11 @@ package provisioner
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strings"
 	"testing"
 )
 
@@ -94,6 +97,141 @@ func TestStop_NoInstanceIDSkipsCPCall(t *testing.T) {
 	if called {
 		t.Error("#1738 REGRESSION: Stop hit CP with empty instance_id — would trigger " +
 			"InvalidInstanceID.Malformed downstream. Fix must short-circuit on empty lookup.")
+	}
+}
+
+// TestStop_SendsProviderQueryParam — #2386 regression guard. When the
+// workspace row carries a non-empty provider (e.g. "hetzner", "gcp"), the
+// deprovision DELETE must include ?provider= so CP routes to the correct
+// backend. Without it, non-AWS workspaces fall through to the AWS terminate
+// path and leak.
+func TestStop_SendsProviderQueryParam(t *testing.T) {
+	primeInstanceIDLookup(t, map[string]string{
+		"ws-cd5c9906-bfd7-4e2a-8c0b-9f1e2d3a4b5c": "i-0a1b2c3d4e5f67890",
+	})
+	primeProviderLookup(t, map[string]string{
+		"ws-cd5c9906-bfd7-4e2a-8c0b-9f1e2d3a4b5c": "hetzner",
+	})
+
+	var sawProvider string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawProvider = r.URL.Query().Get("provider")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	p := &CPProvisioner{
+		baseURL:      srv.URL,
+		orgID:        "org-1",
+		sharedSecret: "s3cret",
+		adminToken:   "tok-xyz",
+		httpClient:   srv.Client(),
+	}
+	if err := p.Stop(context.Background(), "ws-cd5c9906-bfd7-4e2a-8c0b-9f1e2d3a4b5c"); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+
+	if sawProvider != "hetzner" {
+		t.Errorf("#2386 REGRESSION: provider query = %q, want hetzner. "+
+			"CP would route to AWS backend and leak the non-AWS box.", sawProvider)
+	}
+}
+
+// TestStop_EmptyProviderOmitsQueryParam — when provider is absent (default
+// AWS path), the URL must not include ?provider= so the CP uses its default
+// AWS terminate route.
+func TestStop_EmptyProviderOmitsQueryParam(t *testing.T) {
+	primeInstanceIDLookup(t, map[string]string{
+		"ws-cd5c9906-bfd7-4e2a-8c0b-9f1e2d3a4b5c": "i-0a1b2c3d4e5f67890",
+	})
+	primeProviderLookup(t, map[string]string{}) // empty → "" for everything
+
+	var sawProvider string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawProvider = r.URL.Query().Get("provider")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	p := &CPProvisioner{
+		baseURL:    srv.URL,
+		orgID:      "org-1",
+		httpClient: srv.Client(),
+	}
+	if err := p.Stop(context.Background(), "ws-cd5c9906-bfd7-4e2a-8c0b-9f1e2d3a4b5c"); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+
+	if sawProvider != "" {
+		t.Errorf("provider query = %q, want omitted. Empty provider must default to AWS.", sawProvider)
+	}
+}
+
+// TestStop_ProviderLookupErrorFailsClosed — #2386 CR2. If the DB/provider
+// lookup fails after instance_id resolves, a non-AWS workspace must NOT
+// silently omit provider= and fall back to the AWS terminate path. The fix
+// must return the error (fail closed) so the caller retries instead of
+// leaking the box.
+func TestStop_ProviderLookupErrorFailsClosed(t *testing.T) {
+	primeInstanceIDLookup(t, map[string]string{
+		"ws-cd5c9906-bfd7-4e2a-8c0b-9f1e2d3a4b5c": "i-0a1b2c3d4e5f67890",
+	})
+	prev := resolveProvider
+	resolveProvider = func(_ context.Context, _ string) (string, error) {
+		return "", fmt.Errorf("db connection reset")
+	}
+	defer func() { resolveProvider = prev }()
+
+	called := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	p := &CPProvisioner{baseURL: srv.URL, orgID: "org-1", httpClient: srv.Client()}
+	err := p.Stop(context.Background(), "ws-cd5c9906-bfd7-4e2a-8c0b-9f1e2d3a4b5c")
+	if err == nil {
+		t.Fatal("want error when provider lookup fails, got nil — would leak to AWS path")
+	}
+	if called {
+		t.Error("CR2 REGRESSION: Stop hit CP after provider lookup error — should fail closed before any CP call")
+	}
+}
+
+// TestStop_ProviderQueryParamIsEncoded — #2386 CR2. Provider slugs that
+// contain query-special characters must be URL-encoded so they don't
+// corrupt the DELETE URL or inject unintended query parameters.
+func TestStop_ProviderQueryParamIsEncoded(t *testing.T) {
+	primeInstanceIDLookup(t, map[string]string{
+		"ws-cd5c9906-bfd7-4e2a-8c0b-9f1e2d3a4b5c": "i-0a1b2c3d4e5f67890",
+	})
+	primeProviderLookup(t, map[string]string{
+		// Intentionally hostile slug: contains '=', '&', and '%'.
+		"ws-cd5c9906-bfd7-4e2a-8c0b-9f1e2d3a4b5c": "prov=a&b=2%c",
+	})
+
+	var rawQuery string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rawQuery = r.URL.RawQuery
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	p := &CPProvisioner{baseURL: srv.URL, orgID: "org-1", httpClient: srv.Client()}
+	if err := p.Stop(context.Background(), "ws-cd5c9906-bfd7-4e2a-8c0b-9f1e2d3a4b5c"); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+
+	// The raw query must NOT contain the literal hostile string — it must
+	// be percent-encoded. If it appears literally, url.Values was not used.
+	if strings.Contains(rawQuery, "prov=a&b=2%c") {
+		t.Errorf("CR2 REGRESSION: provider query param is raw/unchecked — contains literal hostile string in %q", rawQuery)
+	}
+	// Sanity: after decoding the provider value must round-trip correctly.
+	parsed, _ := url.ParseQuery(rawQuery)
+	if parsed.Get("provider") != "prov=a&b=2%c" {
+		t.Errorf("provider round-trip failed: got %q, want prov=a&b=2%%c", parsed.Get("provider"))
 	}
 }
 
