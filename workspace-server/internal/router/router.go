@@ -325,7 +325,10 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		// signal (not a destructive gate); mirrors the approvals auth split.
 		uth := handlers.NewUserTasksHandler(broadcaster)
 		wsAuth.POST("/user-tasks", uth.Create)
+		wsAuth.GET("/user-tasks", uth.List)
 		wsAuth.POST("/user-tasks/:taskId/resolve", uth.Resolve)
+		wsAuth.PATCH("/user-tasks/:taskId", uth.Update)
+		wsAuth.DELETE("/user-tasks/:taskId", uth.Delete)
 		// /user-tasks/pending is cross-workspace (concierge Tasks tab), so
 		// AdminAuth-gated exactly like /approvals/pending.
 		r.GET("/user-tasks/pending", middleware.AdminAuth(db.DB), uth.ListAll)

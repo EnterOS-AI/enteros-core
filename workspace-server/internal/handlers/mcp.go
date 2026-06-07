@@ -293,6 +293,39 @@ var mcpAllTools = []mcpTool{
 		},
 	},
 	{
+		Name:        "list_user_tasks",
+		Description: "List the action-requests (user tasks) THIS workspace has raised for the user, with their status (pending/done/dismissed). Use to check whether the user has handled your asks.",
+		InputSchema: map[string]interface{}{
+			"type":       "object",
+			"properties": map[string]interface{}{},
+		},
+	},
+	{
+		Name:        "update_user_task",
+		Description: "Update one of your own user tasks — change its title, detail, or status. Only tasks this workspace raised can be updated.",
+		InputSchema: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"user_task_id": map[string]interface{}{"type": "string", "description": "The task id (from request_user_action / list_user_tasks)"},
+				"title":        map[string]interface{}{"type": "string", "description": "New title (optional)"},
+				"detail":       map[string]interface{}{"type": "string", "description": "New detail (optional)"},
+				"status":       map[string]interface{}{"type": "string", "enum": []string{"pending", "done", "dismissed"}, "description": "New status (optional)"},
+			},
+			"required": []string{"user_task_id"},
+		},
+	},
+	{
+		Name:        "delete_user_task",
+		Description: "Delete one of your own user tasks (e.g. it is no longer relevant). Only tasks this workspace raised can be deleted.",
+		InputSchema: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"user_task_id": map[string]interface{}{"type": "string", "description": "The task id to delete"},
+			},
+			"required": []string{"user_task_id"},
+		},
+	},
+	{
 		Name:        "commit_memory",
 		Description: "Save important information to persistent memory. Scope LOCAL (this workspace only) and TEAM (parent + siblings) are supported. GLOBAL scope is not available via the MCP bridge.",
 		InputSchema: map[string]interface{}{
@@ -574,6 +607,12 @@ func (h *MCPHandler) dispatch(ctx context.Context, workspaceID, toolName string,
 		return h.toolSendMessageToUser(ctx, workspaceID, args)
 	case "request_user_action":
 		return h.toolRequestUserAction(ctx, workspaceID, args)
+	case "list_user_tasks":
+		return h.toolListUserTasks(ctx, workspaceID)
+	case "update_user_task":
+		return h.toolUpdateUserTask(ctx, workspaceID, args)
+	case "delete_user_task":
+		return h.toolDeleteUserTask(ctx, workspaceID, args)
 	case "commit_memory":
 		return h.toolCommitMemory(ctx, workspaceID, args)
 	case "recall_memory":

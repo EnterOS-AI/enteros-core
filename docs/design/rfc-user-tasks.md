@@ -48,8 +48,16 @@ CREATE INDEX idx_user_tasks_pending ON user_tasks (status, created_at DESC);
 | Method + path | Auth | Purpose |
 |---|---|---|
 | `POST /workspaces/:id/user-tasks` | WorkspaceAuth | Agent raises an ask `{title, detail?}` → `201 {user_task_id, status:"pending"}` |
+| `GET /workspaces/:id/user-tasks` | WorkspaceAuth | A workspace **reads its own** tasks (any status) |
+| `PATCH /workspaces/:id/user-tasks/:taskId` | WorkspaceAuth | A workspace **updates its own** task `{title?, detail?, status?}` (scoped by `workspace_id`) |
+| `DELETE /workspaces/:id/user-tasks/:taskId` | WorkspaceAuth | A workspace **deletes its own** task (scoped by `workspace_id`) |
 | `GET /user-tasks/pending` | AdminAuth | Cross-workspace pending list for the concierge Tasks tab → `[{id, workspace_id, workspace_name, title, detail, status, created_at}]` |
 | `POST /workspaces/:id/user-tasks/:taskId/resolve` | WorkspaceAuth | User marks `{status:"done"|"dismissed", resolved_by?}` → `200` |
+
+**Any** workspace (not just the platform agent) can create and manage its own
+tasks; the `:id` workspace scope on update/delete means an agent can only touch
+tasks it raised. The Home Tasks list (`/user-tasks/pending`) is org-wide, so
+every workspace's asks surface in one place for the user.
 
 `/user-tasks/pending` is AdminAuth + cross-workspace exactly like
 `/approvals/pending` (an unauthenticated caller must not enumerate every org's
@@ -61,13 +69,17 @@ Added to the **in-workspace `a2a` MCP** (same place as `send_message_to_user`)
 so every agent can raise an ask:
 
 ```
-request_user_action(title: string, detail?: string)
-  → inserts a user_tasks row for the calling workspace, broadcasts
-    USER_TASK_REQUESTED, returns success.
+request_user_action(title, detail?)   → raise an ask (insert + USER_TASK_REQUESTED)
+list_user_tasks()                       → read the asks this workspace raised + status
+update_user_task(user_task_id, title?, detail?, status?)  → edit own task
+delete_user_task(user_task_id)          → delete own task
 ```
 
-Not gated behind `MOLECULE_MCP_ALLOW_SEND_MESSAGE` (that gate is specific to
-`send_message_to_user`); raising an ask is always allowed.
+So every agent (any workspace, via MCP) can create AND manage its own asks —
+`request_user_action` is the create; `list_/update_/delete_user_task` are the
+read/update/delete, all scoped to tasks the calling workspace raised. None are
+gated behind `MOLECULE_MCP_ALLOW_SEND_MESSAGE` (that gate is specific to
+`send_message_to_user`); raising/managing an ask is always allowed.
 
 ### Events
 

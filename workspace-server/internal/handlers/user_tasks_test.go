@@ -116,3 +116,94 @@ func TestUserTasks_Resolve_InvalidStatus(t *testing.T) {
 		t.Errorf("expected 400 for invalid status, got %d", w.Code)
 	}
 }
+
+// ---------- UserTasksHandler: List / Update / Delete (workspace-owned) ----------
+
+func TestUserTasks_List_Success(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewUserTasksHandler(newTestBroadcaster())
+
+	mock.ExpectQuery("SELECT id, title, detail, status, created_at, resolved_at, resolved_by FROM user_tasks WHERE workspace_id").
+		WithArgs("ws-1").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "title", "detail", "status", "created_at", "resolved_at", "resolved_by"}).
+			AddRow("ut-1", "Review draft", nil, "pending", "2026-06-07T00:00:00Z", nil, nil))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-1"}}
+	c.Request = httptest.NewRequest("GET", "/", nil)
+
+	handler.List(c)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp []map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if len(resp) != 1 || resp[0]["id"] != "ut-1" {
+		t.Errorf("expected one task ut-1, got %v", resp)
+	}
+}
+
+func TestUserTasks_Update_Success(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewUserTasksHandler(newTestBroadcaster())
+
+	mock.ExpectExec("UPDATE user_tasks SET").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-1"}, {Key: "taskId", Value: "ut-1"}}
+	c.Request = httptest.NewRequest("PATCH", "/", bytes.NewBufferString(`{"title":"Updated"}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Update(c)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestUserTasks_Update_NotFound(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewUserTasksHandler(newTestBroadcaster())
+
+	mock.ExpectExec("UPDATE user_tasks SET").
+		WillReturnResult(sqlmock.NewResult(0, 0))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-1"}, {Key: "taskId", Value: "nope"}}
+	c.Request = httptest.NewRequest("PATCH", "/", bytes.NewBufferString(`{"title":"x"}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Update(c)
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("expected 404, got %d", w.Code)
+	}
+}
+
+func TestUserTasks_Delete_Success(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewUserTasksHandler(newTestBroadcaster())
+
+	mock.ExpectExec("DELETE FROM user_tasks").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-1"}, {Key: "taskId", Value: "ut-1"}}
+	c.Request = httptest.NewRequest("DELETE", "/", nil)
+
+	handler.Delete(c)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+}
