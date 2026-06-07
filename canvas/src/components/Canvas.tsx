@@ -277,7 +277,7 @@ function CanvasInner() {
       >
         Skip to canvas
       </a>
-      <main id="canvas-main" className="w-screen h-screen bg-surface">
+      <main id="canvas-main" className="w-full h-full bg-surface">
         <ReactFlow
           colorMode={resolvedTheme}
           nodes={nodes}
