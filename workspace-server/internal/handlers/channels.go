@@ -153,6 +153,15 @@ func (h *ChannelHandler) Create(c *gin.Context) {
 		return
 	}
 
+	// #319: encrypt sensitive fields (bot_token, webhook_secret) before
+	// persisting so a DB read/backup leak can't recover the credentials.
+	// Validation above ran against plaintext; storage is ciphertext.
+	if err := channels.EncryptSensitiveFields(body.Config); err != nil {
+		log.Printf("Channels: encrypt config failed for workspace %s: %v", workspaceID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "encrypt failed"})
+		return
+	}
+
 	configJSON, marshalErr := json.Marshal(body.Config)
 	if marshalErr != nil {
 		log.Printf("Channels create %s: json.Marshal config failed: %v", workspaceID, marshalErr)
