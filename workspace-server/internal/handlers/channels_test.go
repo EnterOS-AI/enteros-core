@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -163,6 +164,42 @@ func TestChannelHandler_List_InvalidJSON_FallsBack(t *testing.T) {
 	}
 	if len(allowed) != 0 {
 		t.Errorf("expected empty allowed_users after unmarshal fallback, got %v", allowed)
+	}
+}
+
+func TestChannelHandler_List_RowsErr_LogsError(t *testing.T) {
+	mock := setupTestDB(t)
+	handler := NewChannelHandler(newTestChannelManager())
+
+	rows := sqlmock.NewRows([]string{
+		"id", "workspace_id", "channel_type", "channel_config", "enabled",
+		"allowed_users", "last_message_at", "message_count", "created_at", "updated_at",
+	}).AddRow(
+		"ch-1", "ws-1", "telegram",
+		[]byte(`{"bot_token":"123:ABCDEFGHIJ","chat_id":"-100"}`),
+		true, []byte(`["user-1"]`), nil, 5, nil, nil,
+	).RowError(1, errors.New("storage engine fault"))
+	mock.ExpectQuery("SELECT .* FROM workspace_channels WHERE workspace_id").
+		WithArgs("ws-1").
+		WillReturnRows(rows)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request, _ = http.NewRequest("GET", "/workspaces/ws-1/channels", nil)
+	c.Params = gin.Params{{Key: "id", Value: "ws-1"}}
+
+	handler.List(c)
+
+	// rows.Err() is non-fatal — the handler logs and still returns the row
+	// that was successfully scanned before the iteration error.
+	if w.Code != 200 {
+		t.Errorf("expected 200, got %d", w.Code)
+	}
+
+	var result []map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &result)
+	if len(result) != 1 {
+		t.Fatalf("expected 1 channel despite rows.Err, got %d", len(result))
 	}
 }
 
