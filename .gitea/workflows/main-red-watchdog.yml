@@ -95,10 +95,10 @@ jobs:
           # included here — staging green is a separate gate
           # (`feedback_staging_e2e_merge_gate`).
           WATCH_BRANCH: 'main'
-          # Issue label applied on file/open. `tier:high` exists in the
+          # Issue label applied on file/open. `ci-bp-drift` exists in the
           # molecule-core label set (verified 2026-05-11, label id 9).
           # Rationale for high: main red blocks the promotion train and
           # poisons every PR's auto-rebase base; treat as a fire even
           # if intermittent.
-          RED_LABEL: 'tier:high'
+          RED_LABEL: 'ci-bp-drift'
         run: python3 .gitea/scripts/main-red-watchdog.py

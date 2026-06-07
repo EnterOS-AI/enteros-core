@@ -499,7 +499,7 @@ jobs:
     # `CI / all-required (pull_request)` per issue #1473.
     #
     # Closes the failure mode where status_check_contexts on molecule-core/main
-    # only listed `Secret scan` + `sop-tier-check` (the 2 meta-gates), so real
+    # only listed `Secret scan` + `sop-checklist` (the 2 meta-gates), so real
     # `Platform (Go)` / `Canvas (Next.js)` / `Python Lint & Test` / `Shellcheck`
     # red silently merged through. See internal#286 for the three concrete
     # tonight-of-2026-05-11 incidents that prompted the emergency bump.

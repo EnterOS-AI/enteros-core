@@ -10,8 +10,8 @@
 # A1-α addendum (internal#760): review-event trigger added so the security
 # gate flips immediately when a team member submits an APPROVE review.
 # Uses `pull_request_review` types: [submitted] — verified live via
-# sop-tier-check.yml which provably fires this event (produces
-# `sop-tier-check / tier-check (pull_request_review)` contexts).
+# sop-checklist.yml which provably fires this event (produces
+# `sop-checklist / all-items-acked (pull_request_review)` contexts).
 # The job-level `if:` guard checks
 # `github.event.review.state == 'APPROVED' || 'approved'` so only APPROVE
 # reviews run the evaluator; COMMENT and REQUEST_CHANGES are skipped at

@@ -13,14 +13,14 @@
 # the structured JSON shape is forward-compatible.
 #
 # Logic in `.gitea/scripts/audit-force-merge.sh` per the same script-
-# extract pattern as sop-tier-check.
+# extract pattern as sop-checklist.
 
 name: audit-force-merge
 
 # pull_request_target loads from the base branch — same security model
-# as sop-tier-check. Without this, an attacker could rewrite the
+# as sop-checklist. Without this, an attacker could rewrite the
 # workflow on a PR and skip the audit emission for their own
-# force-merge. See `.gitea/workflows/sop-tier-check.yml` for the full
+# force-merge. See `.gitea/workflows/sop-checklist.yml` for the full
 # rationale.
 on:
   pull_request_target:
@@ -41,7 +41,7 @@ jobs:
           ref: ${{ github.event.pull_request.base.sha }}
       - name: Detect force-merge + emit audit event
         env:
-          # Same org-level secret the sop-tier-check workflow uses.
+          # Same org-level secret the sop-checklist workflow uses.
           GITEA_TOKEN: ${{ secrets.SOP_TIER_CHECK_TOKEN || secrets.GITHUB_TOKEN }}
           GITEA_HOST: git.moleculesai.app
           REPO: ${{ github.repository }}
@@ -54,7 +54,7 @@ jobs:
           # required checks) for each branch listed here.
           #
           # Declared here rather than fetched from /branch_protections
-          # because that endpoint requires admin write — sop-tier-bot is
+          # because that endpoint requires admin write — sop-checklist-bot is
           # read-only by design (least-privilege).
           REQUIRED_CHECKS_JSON: |
             {

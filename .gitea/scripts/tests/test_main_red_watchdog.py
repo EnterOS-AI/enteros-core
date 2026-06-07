@@ -17,7 +17,7 @@ wd.REPO = "molecule-ai/molecule-core"
 wd.OWNER = "molecule-ai"
 wd.NAME = "molecule-core"
 wd.WATCH_BRANCH = "main"
-wd.RED_LABEL = "tier:high"
+wd.RED_LABEL = "ci-bp-drift"
 wd.API = "https://git.example.com/api/v1"
 
 

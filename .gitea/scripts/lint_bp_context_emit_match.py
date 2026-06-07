@@ -49,8 +49,7 @@ Daily scheduled run + workflow_dispatch:
   4. If orphans exist:
      - File or PATCH a `[ci-bp-drift]` issue (idempotency contract:
        search for exact title prefix, edit existing if open).
-     - Apply labels `tier:high` + `ci-bp-drift` (lookup IDs per
-       repo; per `feedback_tier_label_ids_are_per_repo`).
+     - Apply label `ci-bp-drift` (lookup ID per repo).
      - Exit 1.
 
   5. If no orphans:
@@ -82,7 +81,7 @@ Memory cross-links
 ------------------
   - internal#350 (the RFC that specs this lint)
   - feedback_phantom_required_check_after_gitea_migration
-  - feedback_tier_label_ids_are_per_repo
+  - feedback_label_ids_are_per_repo
   - reference_post_suspension_pipeline
 """
 from __future__ import annotations
@@ -359,7 +358,7 @@ def file_or_update_issue(
                 existing = h
                 break
 
-    label_ids = _ensure_labels(repo, ["ci-bp-drift", "tier:high"])
+    label_ids = _ensure_labels(repo, ["ci-bp-drift"])
 
     if existing:
         api(

@@ -14,10 +14,10 @@
 # Fix (PR #1345 / issue #1280):
 #   - ONE workflow, ONE issue_comment:[created] subscription (no edited/deleted)
 #   - all-items-acked job: pull_request_target OR sop slash-command comments
-#   - review-refire job: qa/security/tier refire slash commands
+#   - review-refire job: qa/security refire slash commands
 #   → ~50% reduction in comment-triggered runner occupancy vs pre-fix.
 #
-# Trust boundary (mirrors RFC#324 §A4 + sop-tier-check security note):
+# Trust boundary (mirrors RFC#324 §A4 + sop-checklist security note):
 #   `pull_request_target` (not `pull_request`) — workflow def is loaded
 #   from BASE branch, so a PR cannot rewrite this workflow to exfiltrate
 #   the token. The `actions/checkout` step pins `ref: base.sha` so the
@@ -33,14 +33,6 @@
 #     the dev-lead token (a member of engineers, managers, qa, security)
 #     via a repo secret `SOP_CHECKLIST_GATE_TOKEN`. Provisioning of that
 #     secret is a follow-up authorization step (separate from this PR).
-#
-# Failure mode: tier-aware (RFC#351 open question 2):
-#   - tier:high   → state=failure (hard-fail; BP blocks merge)
-#   - tier:medium → state=failure (hard-fail; same)
-#   - tier:low    → state=pending (soft-fail; BP can choose to require
-#                    this context or skip for low-tier PRs)
-#   - missing/no-tier → state=failure (default-mode: hard — never lower
-#                    the bar per feedback_fix_root_not_symptom)
 #
 # Slash-command contract (RFC#351 v1 + §A1.1-style notes from RFC#324):
 #
@@ -61,7 +53,7 @@
 #       — declare a gate (qa-review, security-review) N/A.
 #       — see sop-checklist-config.yaml n/a_gates section.
 #
-#   /qa-recheck /security-recheck /refire-tier-check
+#   /qa-recheck /security-recheck
 #       — refire the corresponding status check on the PR head.
 #
 # The eval is read-only + idempotent (read PR + comments + team
@@ -149,7 +141,6 @@ jobs:
           {
             echo "run_qa=false"
             echo "run_security=false"
-            echo "run_tier=false"
           } >> "$GITHUB_OUTPUT"
           first_line=$(printf '%s\n' "$COMMENT_BODY" | sed -n '1p')
           case "$first_line" in
@@ -159,9 +150,6 @@ jobs:
             /security-recheck*)
               echo "run_security=true" >> "$GITHUB_OUTPUT"
               ;;
-            /refire-tier-check*)
-              echo "run_tier=true" >> "$GITHUB_OUTPUT"
-              ;;
             *)
               echo "::notice::no supported review refire slash command; no-op"
               ;;
@@ -170,8 +158,7 @@ jobs:
       - name: Check out BASE ref for trusted scripts
         if: |
           steps.classify.outputs.run_qa == 'true' ||
-          steps.classify.outputs.run_security == 'true' ||
-          steps.classify.outputs.run_tier == 'true'
+          steps.classify.outputs.run_security == 'true'
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           ref: ${{ github.event.repository.default_branch }}
@@ -213,13 +200,3 @@ jobs:
         run: |
           set -euo pipefail
           .gitea/scripts/review-refire-status.sh
-
-      - name: Refire sop-tier-check status
-        if: steps.classify.outputs.run_tier == 'true'
-        env:
-          GITEA_TOKEN: ${{ secrets.SOP_TIER_CHECK_TOKEN || secrets.GITHUB_TOKEN }}
-          GITEA_HOST: git.moleculesai.app
-          REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.issue.number }}
-          SOP_DEBUG: '0'
-        run: bash .gitea/scripts/sop-tier-refire.sh

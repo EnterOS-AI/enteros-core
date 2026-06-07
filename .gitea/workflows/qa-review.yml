@@ -12,9 +12,9 @@
 #     - `pull_request_review` types: [submitted]
 #         → re-evaluate when a team member submits an APPROVE review so
 #           the gate flips immediately (no wait for the next push or
-#           slash-command). Verified live: sop-tier-check.yml uses this
+#           slash-command). Verified live: sop-checklist.yml uses this
 #           same event and provably fires (produces
-#           `sop-tier-check / tier-check (pull_request_review)` contexts).
+#           `sop-checklist / all-items-acked (pull_request_review)` contexts).
 #           The job-level `if:` guard checks
 #           `github.event.review.state == 'APPROVED' || 'approved'` so
 #           only APPROVE reviews run the evaluator; COMMENT and
@@ -53,7 +53,7 @@
 #
 #   We MUST NOT use `github.event.comment.author_association` (the
 #   field doesn't exist on Gitea 1.22.6 webhook payload — this was
-#   sop-tier-refire's defect #1).
+#   's defect #1).
 #
 # A4 (no PR-head checkout under pull_request_target):
 #   We check out the BASE ref explicitly so the review-check.sh script is
@@ -73,7 +73,7 @@
 # also not in qa/security teams → also 403.
 #
 # Resolution: a dedicated `RFC_324_TEAM_READ_TOKEN` secret, owned by an
-# identity that IS in both `qa` and `security` teams (Owners-tier
+# identity that IS in both `qa` and `security` teams (Owners-level
 # claude-ceo-assistant, or a new service-bot added to both teams).
 # Provisioning of this secret is tracked as a follow-up issue (filed by
 # core-devops at PR open).

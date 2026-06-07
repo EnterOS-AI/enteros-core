@@ -35,7 +35,7 @@ GITEA_TOKEN = os.environ.get("GITEA_TOKEN", os.environ.get("GITHUB_TOKEN", ""))
 API_BASE = f"https://{GITEA_HOST}/api/v1"
 
 # Timeout in seconds for all HTTP calls. Defence-in-depth: ensures a missing or
-# invalid SOP_TIER_CHECK_TOKEN causes a fast (~15 s) failure rather than an
+# invalid GITEA_TOKEN causes a fast (~15 s) failure rather than an
 # indefinite hang. The real fix is provisioning the token; this caps worst-case
 # wall-clock on a broken/unreachable Gitea host.
 DEFAULT_TIMEOUT = 15
@@ -116,45 +116,27 @@ LOGIN_ALIASES = {
     "infra-sre": "core-devops",
 }
 
-# SOP-6 tier → required agent groups
-# tier:low    → engineers,managers,ceo (OR: any one suffices)
-# tier:medium → managers AND engineers AND qa,security (AND)
-# tier:high   → ceo (OR, but single)
-# "?" = teams not yet created; treated as optional for MVP
-TIER_AGENTS = {
-    "tier:low":    {"managers": "core-lead", "engineers": "core-devops", "ceo": "ceo"},
-    "tier:medium": {"managers": "core-lead", "engineers": "core-devops", "qa": "core-qa", "security": "core-security"},
-    "tier:high":   {"ceo": "ceo"},
-}
-
 POSITIVE_VERDICTS = {"APPROVED", "N/A", "ACK"}
 
-
-def _get_pr_tier(pr_number: int, repo: str) -> str:
-    """Get the PR's tier label."""
-    owner, name = repo.split("/", 1)
-    try:
-        pr = api_get(f"/repos/{owner}/{name}/pulls/{pr_number}")
-        for label in pr.get("labels", []):
-            name_l = label.get("name", "")
-            if name_l in TIER_AGENTS:
-                return name_l
-    except GiteaError:
-        pass
-    return "tier:low"  # Default for untagged PRs
+# Uniform required-agent set (SOP-6 tier removal, CTO 2026-06-07).
+# ALL of the following must APPROVE (AND gate, strict).
+REQUIRED_AGENTS = {
+    "managers": "core-lead",
+    "engineers": "core-devops",
+    "qa": "core-qa",
+    "security": "core-security",
+}
 
 
 def signal_1_comment_scan(pr_number: int, repo: str) -> dict:
     """
     Scan issue + PR comments AND reviews for agent-tag policy gates.
-    Matches tag AND author. Filters to tier-relevant agents.
+    Matches tag AND author. All REQUIRED_AGENTS must positively ACK.
     Returns: {signal, results, verdict}
     """
     owner, name = repo.split("/", 1)
 
-    # Get tier label to determine relevant agents
-    tier = _get_pr_tier(pr_number, repo)
-    relevant_roles = TIER_AGENTS.get(tier, TIER_AGENTS["tier:low"])
+    relevant_roles = REQUIRED_AGENTS
 
     # Build reverse map: login -> (group, agent_key)
     login_to_group = {}
@@ -221,35 +203,22 @@ def signal_1_comment_scan(pr_number: int, repo: str) -> dict:
         latest = max(matches, key=lambda x: x["created_at"], default=None) if matches else None
         findings[agent_key] = {
             "group": group,
-            "tier": tier,
             "found": latest,
             "verdict": latest["verdict"] if latest else "MISSING",
         }
 
-    # Compute gate verdict using tier-specific logic:
-    # - tier:low / tier:high (OR gate): ANY positive = CLEAR, ANY negative = BLOCKED
-    # - tier:medium (AND gate): ALL must be positive = CLEAR, ANY negative = BLOCKED
+    # Uniform AND gate: ALL required agents must be positive.
     verdicts = [f["verdict"] for f in findings.values()]
     if not verdicts:
         gate_verdict = "N/A"
-    elif tier in ("tier:low", "tier:high"):
-        # OR gate: one positive is enough
-        if any(v in POSITIVE_VERDICTS for v in verdicts):
-            gate_verdict = "CLEAR"
-        elif any(v in ("BLOCKED", "CHANGES_REQUESTED", "COMMENT") for v in verdicts):
-            gate_verdict = "BLOCKED"
-        else:
-            gate_verdict = "INCOMPLETE"
+    elif all(v in POSITIVE_VERDICTS for v in verdicts):
+        gate_verdict = "CLEAR"
+    elif any(v in ("BLOCKED", "CHANGES_REQUESTED", "COMMENT") for v in verdicts):
+        gate_verdict = "BLOCKED"
     else:
-        # AND gate (tier:medium): all must be positive
-        if all(v in POSITIVE_VERDICTS for v in verdicts):
-            gate_verdict = "CLEAR"
-        elif any(v in ("BLOCKED", "CHANGES_REQUESTED", "COMMENT") for v in verdicts):
-            gate_verdict = "BLOCKED"
-        else:
-            gate_verdict = "INCOMPLETE"
+        gate_verdict = "INCOMPLETE"
 
-    return {"signal": "agent_tag_comments", "results": findings, "verdict": gate_verdict, "tier": tier}
+    return {"signal": "agent_tag_comments", "results": findings, "verdict": gate_verdict}
 
 
 # ── Signal 2: REQUEST_CHANGES reviews state machine ────────────────────────────
@@ -504,6 +473,7 @@ def signal_6_ci(pr_number: int, repo: str, branch: str | None = None, pr_data: d
 
     failing_required = []
     passing_required = []
+    pending_required = []
     for ctx in required_checks:
         state = check_statuses.get(ctx, "null")
         if state == "failure":
@@ -511,7 +481,7 @@ def signal_6_ci(pr_number: int, repo: str, branch: str | None = None, pr_data: d
         elif state in ("success", "neutral"):
             passing_required.append(ctx)
         else:
-            passing_required.append(f"{ctx} (pending)")
+            pending_required.append(ctx)
 
     # NOTE: do NOT use ci_state (combined_state) as a fallback verdict driver.
     # The combined_state is computed over ALL statuses including this
@@ -519,12 +489,14 @@ def signal_6_ci(pr_number: int, repo: str, branch: str | None = None, pr_data: d
     # self-referential loop: gate-check posts failure → combined_state
     # becomes failure → script re-blocks → posts failure again.
     # The check_statuses dict already excludes gate-check (Bug-1 fix from
-    # PR #547). Use failing_required as the sole CI gate; if no required
-    # checks are defined on the branch, return CLEAR rather than re-using
-    # the combined_state which includes our own status.
+    # PR #547).
+    #
+    # Fail-closed: any required check that is missing, pending, or failing
+    # blocks the gate. Only return CLEAR when every required check is
+    # explicitly success/neutral.
     if failing_required:
         verdict = "CI_FAIL"
-    elif ci_state == "pending":
+    elif pending_required:
         verdict = "CI_PENDING"
     else:
         verdict = "CLEAR"
@@ -535,6 +507,7 @@ def signal_6_ci(pr_number: int, repo: str, branch: str | None = None, pr_data: d
         "required_checks": required_checks,
         "failing_required": failing_required,
         "passing_required": passing_required,
+        "pending_required": pending_required,
         "all_check_statuses": check_statuses,
         "verdict": verdict,
     }

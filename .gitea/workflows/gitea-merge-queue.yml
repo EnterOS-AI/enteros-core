@@ -73,7 +73,7 @@ jobs:
           # NOTE: REQUIRED_CONTEXTS is no longer the authoritative PR gate. The
           # queue now reads the required status contexts from BRANCH PROTECTION
           # (status_check_contexts) so non-required governance reds (qa-review,
-          # security-review, sop-tier, sop-checklist when not branch-required,
+          # security-review, sop-checklist when not branch-required,
           # E2E Chat, Staging SaaS, ci-arm64-advisory) cannot block a merge.
           # If branch protection cannot be enumerated the queue HOLDS
           # (fail-closed). REQUIRED_APPROVALS below is only a fallback used when

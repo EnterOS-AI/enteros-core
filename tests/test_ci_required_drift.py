@@ -55,7 +55,7 @@ def drift_module():
         "SENTINEL_JOB": "all-required",
         "AUDIT_WORKFLOW_PATH": ".gitea/workflows/audit-force-merge.yml",
         "CI_WORKFLOW_PATH": ".gitea/workflows/ci.yml",
-        "DRIFT_LABEL": "tier:high",
+        "DRIFT_LABEL": "ci-bp-drift",
     }
     with mock.patch.dict(os.environ, env, clear=False):
         spec = importlib.util.spec_from_file_location(
@@ -665,7 +665,7 @@ def test_file_or_update_posts_new_issue_when_none_exists(drift_module, monkeypat
     stub = _make_stub_api({
         ("GET", "/repos/owner/repo/issues"): (200, []),
         ("POST", "/repos/owner/repo/issues"): (201, {"number": 99}),
-        ("GET", "/repos/owner/repo/labels"): (200, [{"id": 10, "name": "tier:high"}]),
+        ("GET", "/repos/owner/repo/labels"): (200, [{"id": 10, "name": "ci-bp-drift"}]),
         ("POST", "/repos/owner/repo/issues/99/labels"): (200, []),
     })
     monkeypatch.setattr(drift_module, "api", stub)

@@ -39,11 +39,11 @@ def test_signal_1_infra_sre_login_alias_resolved_to_core_devops(monkeypatch):
     mod = load_gate_check()
 
     def fake_api_get(path):
-        # PR 900 has tier:low label
+        # PR 900 has area:ci label
         if path == "/repos/molecule-ai/molecule-core/pulls/900":
             return {
                 "number": 900,
-                "labels": [{"name": "tier:low"}],
+                "labels": [{"name": "area:ci"}],
             }
         raise AssertionError(f"unexpected api_get: {path}")
 
@@ -59,7 +59,25 @@ def test_signal_1_infra_sre_login_alias_resolved_to_core_devops(monkeypatch):
                     "user": {"login": "infra-sre"},
                     "state": "APPROVED",
                     "submitted_at": "2026-05-13T10:00:00Z",
-                }
+                },
+                {
+                    "id": 2,
+                    "user": {"login": "core-lead"},
+                    "state": "APPROVED",
+                    "submitted_at": "2026-05-13T10:00:01Z",
+                },
+                {
+                    "id": 3,
+                    "user": {"login": "core-qa"},
+                    "state": "APPROVED",
+                    "submitted_at": "2026-05-13T10:00:02Z",
+                },
+                {
+                    "id": 4,
+                    "user": {"login": "core-security"},
+                    "state": "APPROVED",
+                    "submitted_at": "2026-05-13T10:00:03Z",
+                },
             ]
         raise AssertionError(f"unexpected api_list: {path}")
 
@@ -85,7 +103,7 @@ def test_signal_1_null_user_in_review_does_not_crash(monkeypatch):
         if path == "/repos/molecule-ai/molecule-core/pulls/901":
             return {
                 "number": 901,
-                "labels": [{"name": "tier:low"}],
+                "labels": [{"name": "area:ci"}],
             }
         raise AssertionError(f"unexpected api_get: {path}")
 
@@ -108,6 +126,24 @@ def test_signal_1_null_user_in_review_does_not_crash(monkeypatch):
                     "state": "APPROVED",
                     "submitted_at": "2026-05-13T10:01:00Z",
                 },
+                {
+                    "id": 3,
+                    "user": {"login": "core-lead"},
+                    "state": "APPROVED",
+                    "submitted_at": "2026-05-13T10:01:01Z",
+                },
+                {
+                    "id": 4,
+                    "user": {"login": "core-qa"},
+                    "state": "APPROVED",
+                    "submitted_at": "2026-05-13T10:01:02Z",
+                },
+                {
+                    "id": 5,
+                    "user": {"login": "core-security"},
+                    "state": "APPROVED",
+                    "submitted_at": "2026-05-13T10:01:03Z",
+                },
             ]
         raise AssertionError(f"unexpected api_list: {path}")
 
@@ -116,7 +152,7 @@ def test_signal_1_null_user_in_review_does_not_crash(monkeypatch):
 
     result = mod.signal_1_comment_scan(901, "molecule-ai/molecule-core")
 
-    # Should not crash; the valid review from core-devops still satisfies engineers gate
+    # Should not crash; all required gates clear
     assert result["verdict"] == "CLEAR"
     assert result["results"]["core-devops"]["verdict"] == "APPROVED"
 

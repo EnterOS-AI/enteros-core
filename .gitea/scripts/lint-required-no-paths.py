@@ -165,7 +165,7 @@ def api(
 # Format: "<workflow_name> / <job_name_or_key> (<event>)"
 # Examples observed on molecule-core/main:
 #   "Secret scan / Scan diff for credential-shaped strings (pull_request)"
-#   "sop-tier-check / tier-check (pull_request)"
+#   " / tier-check (pull_request)"
 #
 # Split strategy: peel off the trailing ` (<event>)` first, then split
 # the leading `<workflow> / <rest>` on the FIRST ` / ` (workflow names

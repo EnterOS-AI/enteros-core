@@ -11,7 +11,7 @@
 #
 # Flow:
 #   1. Load .gitea/sop-checklist-config.yaml (from BASE ref — trusted).
-#   2. GET /repos/{R}/pulls/{N}          — author, head.sha, tier label
+#   2. GET /repos/{R}/pulls/{N}          — author, head.sha, labels
 #   3. GET /repos/{R}/issues/{N}/comments — extract /sop-ack and /sop-revoke
 #   4. For each checklist item:
 #        a. Is the section marker present in PR body? (author answered)
@@ -665,8 +665,8 @@ def load_config(path: str) -> dict[str, Any]:
 def _load_config_minimal(path: str) -> dict[str, Any]:
     """Minimal YAML subset parser for our config shape.
 
-    Supports: top-level scalar:value, top-level map-of-map (e.g.
-    tier_failure_mode), top-level list of maps (items:), and within an
+    Supports: top-level scalar:value, top-level map-of-map,
+    top-level list of maps (items:), and within an
     item map: scalars + lists of scalars. Does NOT support nested lists,
     YAML anchors, multi-doc, or flow style.
     """
@@ -835,8 +835,7 @@ def render_status(
 
     state is "success" if every item has at least one valid ack
     (body section presence is informational only — peer-ack is the
-    real gate).  tier:low PRs receive state="success" (soft-fail — no
-    acks required); the description carries "[info tier:low]" prefix.
+    real gate).
     """
     n = len(items)
     fully_acked = [
@@ -863,35 +862,16 @@ def render_status(
     return state, " — ".join(desc_parts)
 
 
-def get_tier_mode(pr: dict[str, Any], cfg: dict[str, Any]) -> str:
-    """Read tier label, return 'hard' or 'soft' per cfg.tier_failure_mode."""
-    labels = pr.get("labels") or []
-    tier_labels = [label.get("name", "") for label in labels if (label.get("name", "") or "").startswith("tier:")]
-    mode_map = cfg.get("tier_failure_mode") or {}
-    default_mode = cfg.get("default_mode", "hard")
-    for tl in tier_labels:
-        if tl in mode_map:
-            return mode_map[tl]
-    return default_mode
-
-
 def is_high_risk(pr: dict[str, Any], cfg: dict[str, Any]) -> bool:
     """Return True when the PR is high-risk per RFC#450 Option C.
 
-    A PR is high-risk when ANY of:
-      - it carries the `tier:high` label (mechanically strictest tier), or
-      - it carries any label listed in cfg.high_risk_labels.
+    A PR is high-risk when it carries any label listed in cfg.high_risk_labels.
 
     High-risk PRs use `required_teams_high_risk` (when set on an item)
     instead of the default `required_teams`. Items without
     `required_teams_high_risk` are unaffected (the default applies).
-
-    Governance fix for internal#442 — closes the inconsistency between
-    sop-tier-check (tier-aware) and sop-checklist (was tier-blind).
     """
     label_set = {(label.get("name") or "") for label in (pr.get("labels") or [])}
-    if "tier:high" in label_set:
-        return True
     high_risk_labels = set(cfg.get("high_risk_labels") or [])
     return bool(label_set & high_risk_labels)
 
@@ -1169,13 +1149,6 @@ def main(argv: list[str] | None = None) -> int:
     body_state = {it["slug"]: section_marker_present(body, it["pr_section_marker"]) for it in items}
 
     state, description = render_status(items, ack_state, body_state)
-    mode = get_tier_mode(pr, cfg)
-    if mode == "soft":
-        # tier:low: acks are informational only — post success so BP gate passes.
-        # Description carries "[info tier:low]" prefix so reviewers know acks
-        # were not required (vs a tier:medium+ PR that truly passed all acks).
-        state = "success"
-        description = f"[info tier:low] {description}"
     if volume_skipped:
         # Above the comment-cap — we may have a partial view. Soft-pend
         # so neither BP nor the author gets stuck; surface the cap so
@@ -1189,7 +1162,7 @@ def main(argv: list[str] | None = None) -> int:
     # Diagnostics to job log.
     print(
         f"::notice::PR #{args.pr} author={author} head={head_sha[:7]} "
-        f"mode={mode} risk_class={'high' if high_risk else 'default'}"
+        f"risk_class={'high' if high_risk else 'default'}"
     )
     for it in items:
         slug = it["slug"]

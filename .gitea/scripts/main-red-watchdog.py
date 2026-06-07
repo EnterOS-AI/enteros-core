@@ -50,7 +50,7 @@ runtime contract enforcement lives in `_require_runtime_env()`.
 
 Run locally (dry-run, no API mutation):
     GITEA_TOKEN=... GITEA_HOST=git.moleculesai.app REPO=owner/repo \\
-      WATCH_BRANCH=main RED_LABEL=tier:high \\
+      WATCH_BRANCH=main RED_LABEL=ci-bp-drift \\
       python3 .gitea/scripts/main-red-watchdog.py --dry-run
 """
 from __future__ import annotations
@@ -81,7 +81,7 @@ GITEA_TOKEN = _env("GITEA_TOKEN")
 GITEA_HOST = _env("GITEA_HOST")
 REPO = _env("REPO")
 WATCH_BRANCH = _env("WATCH_BRANCH", default="main")
-RED_LABEL = _env("RED_LABEL", default="tier:high")
+RED_LABEL = _env("RED_LABEL", default="ci-bp-drift")
 
 OWNER, NAME = (REPO.split("/", 1) + [""])[:2] if REPO else ("", "")
 API = f"https://{GITEA_HOST}/api/v1" if GITEA_HOST else ""

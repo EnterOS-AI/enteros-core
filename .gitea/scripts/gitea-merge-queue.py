@@ -39,13 +39,13 @@ queue. This script provides the missing serialized policy in user space:
 
 Authoritative gates (fail-closed):
   - The REQUIRED status contexts come from BRANCH PROTECTION
-    (`status_check_contexts`), not a hand-maintained env list. If branch
-    protection cannot be enumerated, the queue HOLDS (does not merge blindly).
-  - NON-required reds (qa-review, security-review, sop-tier, sop-checklist
-    when not branch-required, E2E Chat, Staging SaaS, ci-arm64-advisory, any
+    (`status_check_contexts`) PLUS the hardcoded governance checks
+    (qa-review, security-review, sop-checklist). If branch protection
+    cannot be enumerated, the queue HOLDS (does not merge blindly).
+  - NON-required reds (E2E Chat, Staging SaaS, ci-arm64-advisory, any
     continue-on-error job) MUST NOT block. They are reported, never gating.
   - `force_merge=true` is used ONLY when the merge is blocked *solely* by
-    missing-but-non-required governance contexts (required are green + genuine
+    missing-but-non-required advisory contexts (required are green + genuine
     approvals present). It is NEVER used to bypass a failing REQUIRED context
     or missing approvals.
 
@@ -144,6 +144,15 @@ OPT_OUT_LABELS = {
     ).split(",")
     if name.strip()
 } | ({HOLD_LABEL} if HOLD_LABEL else set())
+# Governance checks that are ALWAYS required for every PR, regardless of
+# branch-protection configuration. These are the uniform-gate checks that
+# must pass before any PR can merge (SOP tier removal makes them mandatory
+# for all PRs, not just tier:medium/tier:high).
+GOVERNANCE_REQUIRED_CONTEXTS = [
+    "qa-review / approved (pull_request)",
+    "security-review / approved (pull_request)",
+    "sop-checklist / all-items-acked (pull_request)",
+]
 REQUIRED_CONTEXTS_RAW = _env(
     "REQUIRED_CONTEXTS",
     default=(
@@ -337,41 +346,15 @@ def latest_statuses_by_context(statuses: list[dict]) -> dict[str, dict]:
     return latest
 
 
-def _is_tier_low_pending_ok(
-    latest_statuses: dict[str, dict],
-    context: str,
-    pr_labels: set[str],
-) -> bool:
-    """Return True if tier:low PR can tolerate sop-checklist pending state.
-
-    GENERIC PENDING-AS-GREEN REMOVED (Researcher + CR2 RC on #2368):
-    The prior soft-fail accepted ANY pending sop-checklist for tier:low,
-    which allowed required checks to pass without genuine verification.
-    Pending required sop-checklist must now always HOLD and appear in
-    missing_or_bad. This function is retained as a policy hook but
-    currently always returns False so pending never counts green.
-
-    If a positively identifiable genuine soft-fail state is defined in
-    future (e.g., a specific check-run conclusion), implement it here
-    with strict positive identification — never default to pass.
-    """
-    return False
-
-
 def required_contexts_green(
     latest_statuses: dict[str, dict],
     contexts: list[str],
-    pr_labels: set[str] | None = None,
 ) -> tuple[bool, list[str]]:
     missing_or_bad: list[str] = []
     for context in contexts:
         status = latest_statuses.get(context)
         state = status_state(status or {})
         if state != "success":
-            if pr_labels and _is_tier_low_pending_ok(
-                latest_statuses, context, pr_labels
-            ):
-                continue  # tier:low soft-fail: accept pending sop-checklist
             missing_or_bad.append(f"{context}={state or 'missing'}")
     return not missing_or_bad, missing_or_bad
 
@@ -672,13 +655,13 @@ def evaluate_merge_readiness(
             f"need {required_approvals}",
         )
 
-    # 4) Every BRANCH-PROTECTION-REQUIRED status context must be green. This is
-    #    the authoritative status gate — NON-required reds (qa-review,
-    #    security-review, sop-tier/sop-checklist when not BP-required, E2E Chat,
-    #    Staging SaaS, ci-arm64-advisory, continue-on-error jobs) are NOT
+    # 4) Every REQUIRED status context must be green. This includes both
+    #    branch-protection-required contexts AND the hardcoded governance checks
+    #    (qa-review, security-review, sop-checklist). NON-required reds (E2E
+    #    Chat, Staging SaaS, ci-arm64-advisory, continue-on-error jobs) are NOT
     #    consulted here and must not block.
     latest = latest_statuses_by_context(pr_status.get("statuses") or [])
-    ok, missing_or_bad = required_contexts_green(latest, required_contexts, pr_labels)
+    ok, missing_or_bad = required_contexts_green(latest, required_contexts)
     if not ok:
         return MergeDecision(False, "wait", "required contexts not green: " + ", ".join(missing_or_bad))
 
@@ -945,7 +928,9 @@ def process_once(*, dry_run: bool = False) -> int:
             f"unavailable (fail-closed): {exc}\n"
         )
         return 0
-    contexts = bp.required_contexts
+    # Uniform gate: governance checks are ALWAYS required, even if branch
+    # protection does not enumerate them. Deduplicate against BP list.
+    contexts = list(dict.fromkeys(bp.required_contexts + GOVERNANCE_REQUIRED_CONTEXTS))
     required_approvals = bp.required_approvals
     print(
         f"::notice::queue policy from branch protection: "

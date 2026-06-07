@@ -427,13 +427,13 @@ def test_required_workflow_with_paths_ignore_fails(
     """Same defect class for `paths-ignore` — exit 1, named."""
     _write_workflow(
         lint_module.WORKFLOWS_DIR,
-        "sop-tier-check.yml",
-        "name: sop-tier-check\n"
+        "sop-checklist.yml",
+        "name: sop-checklist\n"
         "on:\n"
         "  pull_request_target:\n"
         "    paths-ignore: ['docs/**']\n"
         "jobs:\n"
-        "  tier-check:\n"
+        "  all-items-acked:\n"
         "    runs-on: ubuntu-latest\n",
     )
     stub = _make_stub_api({
@@ -441,7 +441,7 @@ def test_required_workflow_with_paths_ignore_fails(
             200,
             {
                 "status_check_contexts": [
-                    "sop-tier-check / tier-check (pull_request_target)"
+                    "sop-checklist / all-items-acked (pull_request_target)"
                 ]
             },
         ),
@@ -450,7 +450,7 @@ def test_required_workflow_with_paths_ignore_fails(
     rc = lint_module.run()
     assert rc == 1
     out = capsys.readouterr().out
-    assert "sop-tier-check.yml" in out
+    assert "sop-checklist.yml" in out
     assert "paths-ignore" in out
 
 
