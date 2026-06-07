@@ -31,7 +31,35 @@ import (
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 )
+
+// SelfHostedPlatformAgentID is the deterministic platform-agent id used when no
+// control plane is present to derive a per-org id (self-hosted / local). There
+// is one platform agent per self-hosted tenant, so a fixed namespaced uuidv5 is
+// sufficient and stable across restarts.
+var SelfHostedPlatformAgentID = uuid.NewSHA1(uuid.NameSpaceURL, []byte("molecule:self-hosted:platform-agent")).String()
+
+// EnsureSelfHostedPlatformAgent installs the org's platform agent (the concierge,
+// the org root) on a tenant that has no control plane to do it — i.e. self-hosted
+// or local. In SaaS the CP calls InstallPlatformAgent at org-provision time; this
+// is the no-CP equivalent. Idempotent: returns early if a kind='platform' root
+// already exists (a prior boot, or a CP install in a hybrid setup). The CALLER
+// gates this on the MOLECULE_SEED_PLATFORM_AGENT flag (set by the self-hosted
+// docker-compose) so CI harnesses and SaaS tenants are unaffected.
+func EnsureSelfHostedPlatformAgent(ctx context.Context, database *sql.DB) error {
+	var existing string
+	err := database.QueryRowContext(ctx,
+		`SELECT id FROM workspaces WHERE kind = 'platform' AND parent_id IS NULL LIMIT 1`).Scan(&existing)
+	if err == nil {
+		return nil // platform agent already present — nothing to do
+	}
+	if err != sql.ErrNoRows {
+		return fmt.Errorf("check existing platform agent: %w", err)
+	}
+	log.Printf("boot: no platform agent present — self-seeding %s (self-hosted)", SelfHostedPlatformAgentID)
+	return installPlatformAgent(ctx, database, SelfHostedPlatformAgentID, "Org Concierge")
+}
 
 type installPlatformAgentPayload struct {
 	// ID is the platform agent's workspace id (a deterministic uuidv5 the

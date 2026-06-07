@@ -119,6 +119,18 @@ func main() {
 		}
 	}
 
+	// Self-hosted platform-agent seed. With no control plane present to install
+	// the org's concierge (SaaS leaves it to the CP at org-provision time), the
+	// tenant server seeds it itself when MOLECULE_SEED_PLATFORM_AGENT is set —
+	// the self-hosted docker-compose sets it, while CI harnesses + SaaS tenants
+	// leave it unset (so e2e empty-DB assertions and the CP path are unaffected).
+	// Idempotent + best-effort — never fatal.
+	if v := os.Getenv("MOLECULE_SEED_PLATFORM_AGENT"); v == "true" || v == "1" {
+		if err := handlers.EnsureSelfHostedPlatformAgent(context.Background(), db.DB); err != nil {
+			log.Printf("boot: platform-agent self-seed failed (non-fatal): %v", err)
+		}
+	}
+
 	// Redis
 	redisURL := envOr("REDIS_URL", "redis://localhost:6379")
 	if err := db.InitRedis(redisURL); err != nil {

@@ -69,6 +69,10 @@ services:
       # Override to "production" for SaaS/staged deploys; in those modes
       # ADMIN_TOKEN must also be set or every request rejects.
       MOLECULE_ENV: "${MOLECULE_ENV:-development}"
+      # Self-hosted: no control plane to install the org's platform agent
+      # (concierge), so the tenant server seeds it on boot. Idempotent; unset it
+      # if you don't want the auto-seeded Org Concierge root.
+      MOLECULE_SEED_PLATFORM_AGENT: "${MOLECULE_SEED_PLATFORM_AGENT:-true}"
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:${CANVAS_PUBLISH_PORT:-3000},http://127.0.0.1:${CANVAS_PUBLISH_PORT:-3000},http://localhost:3001}
       RATE_LIMIT: "${RATE_LIMIT:-1000}"
       CONFIGS_DIR: /configs
