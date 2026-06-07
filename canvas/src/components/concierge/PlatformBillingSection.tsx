@@ -48,8 +48,17 @@ import s from "./Concierge.module.css";
  * provider (same secret the e2e test agent used to run the platform
  * agent on MiniMax: model `MiniMax-M2.7` + MODEL_PROVIDER=minimax).
  *
+ * Self-hosted (no Molecule proxy): GET /org/identity returns
+ * `platform_managed_available: false`. In that mode the platform-managed
+ * "Platform (proxy)" provider is HIDDEN (it cannot work — there is no hosted
+ * Molecule proxy / credit ledger), the default selection is the first BYOK
+ * provider, and the billing write is always `byok`. A 404 / error on the
+ * signal is treated as UNAVAILABLE (self-host safety: a missing signal means we
+ * cannot confirm a proxy exists). On SaaS (`platform_managed_available: true`)
+ * the behavior is unchanged — Platform offered + default platform_managed.
+ *
  * Graceful when the backend has no billing/registry endpoint: each read
- * fails silently and the UI shows the default platform-managed state.
+ * fails silently and the UI shows the default state for the resolved mode.
  */
 
 // Mirrors workspace-server BillingModeResolution (see llm-billing-section.tsx).
@@ -85,6 +94,15 @@ export function PlatformBillingSection({ platformId }: Props) {
   // Billing-mode resolution (defaults to platform-managed until the read
   // resolves; a 404 keeps us on this default).
   const [resolution, setResolution] = useState<BillingModeResolution | null>(null);
+
+  // Whether a Molecule LLM proxy is configured (GET /org/identity →
+  // platform_managed_available). Starts true (SaaS-shaped) so the initial render
+  // — before the signal resolves — matches the SaaS contract; the read flips it
+  // false on self-host. A 404 / error on the signal flips it false too
+  // (self-host safety: a missing signal can't confirm a proxy exists). When
+  // false: hide the "Platform (proxy)" provider, default to a BYOK provider, and
+  // always write byok.
+  const [platformManagedAvailable, setPlatformManagedAvailable] = useState(true);
 
   // Registry catalog source — the platform agent's runtime + the /templates
   // rows it indexes into.
@@ -125,6 +143,25 @@ export function PlatformBillingSection({ platformId }: Props) {
   }, [platformId]);
 
   useEffect(() => loadBilling(), [loadBilling]);
+
+  // Capability signal — is a Molecule LLM proxy configured? Open / no-auth, read
+  // pre-login exactly like /org/identity (it IS /org/identity). 404 / error →
+  // treat as UNAVAILABLE (self-host safety: a missing signal can't confirm a
+  // proxy, so hide Platform rather than risk offering an unworkable mode).
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .get<{ platform_managed_available?: boolean }>("/org/identity")
+      .then((r) => {
+        if (!cancelled) setPlatformManagedAvailable(r?.platform_managed_available === true);
+      })
+      .catch(() => {
+        if (!cancelled) setPlatformManagedAvailable(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // Runtime + current model of the platform agent (best-effort; both fall
   // back to empty so the registry catalog still loads its default provider).
@@ -213,28 +250,46 @@ export function PlatformBillingSection({ platformId }: Props) {
     [registryBacked, sourceSpec, llmModels],
   );
 
+  // On self-host (no proxy) the platform-managed "Platform (proxy)" provider
+  // cannot work, so filter it out of the selectable catalog entirely. On SaaS
+  // (platformManagedAvailable) the full catalog is used unchanged. Empty-after-
+  // filter is tolerated (the no-catalog note renders) — a self-host registry
+  // would normally still carry BYOK providers.
+  const visibleCatalog = useMemo<ProviderEntry[]>(
+    () =>
+      platformManagedAvailable
+        ? catalog
+        : catalog.filter((p) => !isPlatformManagedProvider(p)),
+    [catalog, platformManagedAvailable],
+  );
+
   const selectedProvider = useMemo(
-    () => catalog.find((p) => p.id === llmSelection.providerId) ?? null,
-    [catalog, llmSelection.providerId],
+    () => visibleCatalog.find((p) => p.id === llmSelection.providerId) ?? null,
+    [visibleCatalog, llmSelection.providerId],
   );
 
   // Pre-select provider+model from the platform agent's current model once the
   // catalog is available. Prefer the matching provider for the saved model;
   // fall back to the platform provider, then the first catalog entry.
   useEffect(() => {
-    if (catalog.length === 0) return;
+    if (visibleCatalog.length === 0) return;
     setLLMSelection((prev) => {
       // Don't clobber an in-progress user selection.
       if (prev.providerId) return prev;
-      const matched = currentModel ? findProviderForModel(catalog, currentModel) : null;
-      const platform = catalog.find((p) => p.vendor === "platform");
-      const next = matched ?? platform ?? catalog[0];
+      const matched = currentModel ? findProviderForModel(visibleCatalog, currentModel) : null;
+      // Prefer the platform provider only when it's actually available (SaaS);
+      // on self-host it's been filtered out of visibleCatalog, so fall straight
+      // through to the first (BYOK) entry as the default.
+      const platform = platformManagedAvailable
+        ? visibleCatalog.find((p) => p.vendor === "platform")
+        : undefined;
+      const next = matched ?? platform ?? visibleCatalog[0];
       const model =
         next.models.find((m) => m.id === currentModel)?.id ??
         (next.wildcard ? currentModel : next.models[0]?.id ?? "");
       return { providerId: next.id, model, envVars: next.envVars };
     });
-  }, [catalog, currentModel]);
+  }, [visibleCatalog, currentModel, platformManagedAvailable]);
 
   // ── writes ────────────────────────────────────────────────────────────────
   const setMode = (mode: Choice) =>
@@ -247,7 +302,13 @@ export function PlatformBillingSection({ platformId }: Props) {
   // proxy stops metering). This single derivation — not a separate radio —
   // drives the whole card: the user picks "Platform" in the dropdown for
   // managed billing, or any other provider to bring their own key.
-  const providerIsPlatformManaged = isPlatformManagedProvider(selectedProvider);
+  // Self-host (no proxy) can NEVER be platform-managed: the platform provider is
+  // filtered out of visibleCatalog, but force the derivation false too so the
+  // billing-mode write is always byok in this mode regardless of any stale
+  // selection (belt-and-suspenders for the "never platform_managed on self-host"
+  // invariant).
+  const providerIsPlatformManaged =
+    platformManagedAvailable && isPlatformManagedProvider(selectedProvider);
   const requiredEnv = selectedProvider?.envVars[0] ?? "";
 
   const save = async () => {
@@ -322,15 +383,27 @@ export function PlatformBillingSection({ platformId }: Props) {
       <div className={s.scardHead}>
         <div className={s.scardTitle}>LLM billing — platform agent</div>
         <div className={s.scardDesc}>
-          Pick the provider + model the org concierge runs on. Choose{" "}
-          <strong>Platform</strong> to meter through the Molecule proxy on your
-          org credits (the default), or any other provider to bring your own
-          key. Current resolved mode: <strong>{currentMode}</strong>.
+          {platformManagedAvailable ? (
+            <>
+              Pick the provider + model the org concierge runs on. Choose{" "}
+              <strong>Platform</strong> to meter through the Molecule proxy on
+              your org credits (the default), or any other provider to bring your
+              own key. Current resolved mode: <strong>{currentMode}</strong>.
+            </>
+          ) : (
+            <>
+              Bring your own provider key — this self-hosted deployment has no
+              Molecule proxy, so platform-managed billing (org credits) is
+              unavailable. Pick the provider + model the org concierge runs on
+              and supply the matching key. Current resolved mode:{" "}
+              <strong>{currentMode}</strong>.
+            </>
+          )}
         </div>
       </div>
 
       <div className={s.keyRow}>
-        {catalog.length === 0 ? (
+        {visibleCatalog.length === 0 ? (
           <div className={s.keyNote}>
             No provider catalog available yet (the registry endpoint did not
             respond). Provider/model selection will appear once the backend is
@@ -340,7 +413,7 @@ export function PlatformBillingSection({ platformId }: Props) {
           <>
             <ProviderModelSelector
               models={llmModels}
-              catalog={registryBacked ? catalog : undefined}
+              catalog={visibleCatalog}
               value={llmSelection}
               onChange={(next) => {
                 setLLMSelection(next);

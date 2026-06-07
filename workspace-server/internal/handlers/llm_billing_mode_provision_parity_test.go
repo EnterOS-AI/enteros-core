@@ -173,6 +173,7 @@ func TestApplyPlatformManagedLLMEnv_ReadProvisionParity(t *testing.T) {
 // This mirrors the agents-team genuinely-platform case. Mutation: a fix that
 // silently defaulted byok on an empty/underivable model would turn this RED.
 func TestApplyPlatformManagedLLMEnv_DefaultPreservation(t *testing.T) {
+	withProxyConfigured(t) // SaaS context: no-model default stays platform_managed.
 	ctx := context.Background()
 	const wsID = "11111111-2222-3333-4444-555555555555"
 

@@ -95,6 +95,77 @@ func TestOrgIdentity(t *testing.T) {
 			t.Errorf("name = %q, want empty string", body.Name)
 		}
 	})
+
+	// platform_managed_available reflects whether a Molecule LLM proxy is wired
+	// into the process env — true on SaaS (proxy base URL + usage token set),
+	// false on self-host (neither set). The canvas reads it to hide/show the
+	// "Platform (proxy)" billing option pre-login.
+	t.Run("platform_managed_available true when proxy configured (SaaS)", func(t *testing.T) {
+		t.Setenv("MOLECULE_LLM_BASE_URL", "https://proxy.example/v1")
+		t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tok-test")
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest("GET", "/org/identity", nil)
+
+		OrgIdentity(c)
+
+		var body struct {
+			PlatformManagedAvailable bool `json:"platform_managed_available"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+			t.Fatalf("unmarshal: %v (%s)", err, w.Body.String())
+		}
+		if !body.PlatformManagedAvailable {
+			t.Errorf("platform_managed_available = false, want true (proxy configured)")
+		}
+	})
+
+	t.Run("platform_managed_available false when no proxy (self-host)", func(t *testing.T) {
+		// Clear every proxy env so neither the molecule nor openai alias is set.
+		t.Setenv("MOLECULE_LLM_BASE_URL", "")
+		t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "")
+		t.Setenv("OPENAI_BASE_URL", "")
+		t.Setenv("OPENAI_API_KEY", "")
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest("GET", "/org/identity", nil)
+
+		OrgIdentity(c)
+
+		var body struct {
+			PlatformManagedAvailable bool `json:"platform_managed_available"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+			t.Fatalf("unmarshal: %v (%s)", err, w.Body.String())
+		}
+		if body.PlatformManagedAvailable {
+			t.Errorf("platform_managed_available = true, want false (no proxy / self-host)")
+		}
+	})
+
+	t.Run("platform_managed_available true via openai alias env", func(t *testing.T) {
+		// The proxy can also be wired via the OPENAI_* aliases (non-anthropic
+		// runtimes). Either pair satisfies the signal.
+		t.Setenv("MOLECULE_LLM_BASE_URL", "")
+		t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "")
+		t.Setenv("OPENAI_BASE_URL", "https://proxy.example/v1")
+		t.Setenv("OPENAI_API_KEY", "tok-test")
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest("GET", "/org/identity", nil)
+
+		OrgIdentity(c)
+
+		var body struct {
+			PlatformManagedAvailable bool `json:"platform_managed_available"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+			t.Fatalf("unmarshal: %v (%s)", err, w.Body.String())
+		}
+		if !body.PlatformManagedAvailable {
+			t.Errorf("platform_managed_available = false, want true (openai alias proxy env)")
+		}
+	})
 }
 
 // stubBootProv is a minimal localProvisionerIsRunning for the boot-provision

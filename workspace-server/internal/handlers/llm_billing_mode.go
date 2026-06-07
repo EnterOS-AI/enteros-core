@@ -127,6 +127,30 @@ type BillingModeResolution struct {
 	ProviderSelection *string `json:"provider_selection"`
 }
 
+// defaultClosedBillingMode is the mode the resolver falls back to when it
+// cannot DERIVE a provider (no model, unknown runtime, unregistered/ambiguous
+// model, registry-load failure, or the pre-provision empty-id path).
+//
+// Historically this was an UNCONDITIONAL platform_managed ("unset → platform
+// default", CTO 2026-05-27). That is correct on SaaS: an undecided workspace
+// bills the platform proxy. But on a SELF-HOSTED stack there IS no Molecule
+// proxy and no credit ledger (PlatformManagedProxyConfigured() == false), so a
+// platform_managed default is unreachable — the provision path would inject no
+// usable credential and fail closed (MISSING_PLATFORM_PROXY). On self-host the
+// honest default is byok: the tenant must bring their own provider key, and the
+// resolved mode should say so rather than advertise an impossible mode.
+//
+// Strictly gated on the no-proxy condition: when a proxy IS configured (SaaS),
+// this returns platform_managed exactly as before — SaaS behavior is unchanged.
+// This only changes the FALLBACK; an explicit operator override and a
+// successfully-derived provider are decided before this is ever consulted.
+func defaultClosedBillingMode() string {
+	if PlatformManagedProxyConfigured() {
+		return LLMBillingModePlatformManaged
+	}
+	return LLMBillingModeBYOK
+}
+
 // isKnownBillingMode is the enum-recognizer for the resolver's default-closed
 // branch. Returning false for an unknown string forces the resolver to fall
 // through to the next layer (or the constant fallback) — NEVER to honor a
@@ -208,7 +232,7 @@ func ResolveLLMBillingModeDerived(ctx context.Context, workspaceID, runtime, mod
 	// the no-id path historically does no DB work and the strip gate only runs
 	// post-create, so keep it a pure default to preserve that contract.)
 	if workspaceID == "" {
-		res.ResolvedMode = LLMBillingModePlatformManaged
+		res.ResolvedMode = defaultClosedBillingMode()
 		res.Source = BillingModeSourceDerivedDefault
 		return res, nil
 	}
@@ -231,8 +255,8 @@ func ResolveLLMBillingModeDerived(ctx context.Context, workspaceID, runtime, mod
 	manifest, mErr := providerRegistry()
 	if mErr != nil || manifest == nil {
 		// Registry unavailable (malformed embedded YAML — a build-time defect the
-		// gates catch). Default closed.
-		res.ResolvedMode = LLMBillingModePlatformManaged
+		// gates catch). Default closed (byok on self-host where no proxy exists).
+		res.ResolvedMode = defaultClosedBillingMode()
 		res.Source = BillingModeSourceDerivedDefault
 		return res, mErr
 	}
@@ -242,8 +266,10 @@ func ResolveLLMBillingModeDerived(ctx context.Context, workspaceID, runtime, mod
 		// NOT an error to the caller: an unregistered model is a legitimate
 		// "we can't say it's BYOK, so bill the platform default" outcome, and the
 		// only-registered gate at the create/config API is where an unregistered
-		// model is rejected loudly. Here we just fail closed for safety.
-		res.ResolvedMode = LLMBillingModePlatformManaged
+		// model is rejected loudly. Here we just fail closed for safety. On a
+		// self-hosted stack (no proxy configured) the safe default is byok, since
+		// platform_managed is unreachable there.
+		res.ResolvedMode = defaultClosedBillingMode()
 		res.Source = BillingModeSourceDerivedDefault
 		sel := model
 		if sel != "" {

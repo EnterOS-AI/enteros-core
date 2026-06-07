@@ -74,9 +74,22 @@ const TEMPLATES = [
 ];
 
 // Wire the per-path GET mock used by most tests. billingOverride lets a test
-// start the agent already on byok.
-function mockGets(opts?: { billingOverride?: string | null; model?: string }) {
+// start the agent already on byok. platformManagedAvailable defaults true (SaaS:
+// GET /org/identity → platform_managed_available); pass false to simulate a
+// self-hosted deployment with no Molecule proxy.
+function mockGets(opts?: {
+  billingOverride?: string | null;
+  model?: string;
+  platformManagedAvailable?: boolean;
+}) {
+  const pmAvailable = opts?.platformManagedAvailable ?? true;
   apiGet.mockImplementation((path: string) => {
+    if (path === "/org/identity") {
+      return Promise.resolve({
+        name: "Test Org",
+        platform_managed_available: pmAvailable,
+      });
+    }
     if (path.endsWith("/llm-billing-mode")) {
       return Promise.resolve({
         workspace_id: "plat-1",
@@ -131,6 +144,9 @@ describe("PlatformBillingSection — SSOT provider+model BYOK", () => {
 
   it("stays on platform-managed default when the billing endpoint is absent", async () => {
     apiGet.mockImplementation((path: string) => {
+      // Proxy IS configured (SaaS) — only the billing-mode endpoint is absent.
+      if (path === "/org/identity")
+        return Promise.resolve({ platform_managed_available: true });
       if (path.endsWith("/llm-billing-mode")) {
         return Promise.reject(new Error("404 not found"));
       }
@@ -244,5 +260,94 @@ describe("PlatformBillingSection — SSOT provider+model BYOK", () => {
         { mode: "platform_managed" },
       );
     });
+  });
+});
+
+// Self-hosted: GET /org/identity → platform_managed_available=false. The
+// "Platform (proxy)" option is HIDDEN, the default is a BYOK provider, the copy
+// drops the proxy/credits promise, and the billing write is always byok.
+describe("PlatformBillingSection — self-hosted (no Molecule proxy)", () => {
+  it("hides the Platform (proxy) provider and defaults to a BYOK provider", async () => {
+    mockGets({ platformManagedAvailable: false });
+
+    render(<PlatformBillingSection platformId="plat-1" />);
+    await waitFor(() => expect(apiGet).toHaveBeenCalledWith("/org/identity"));
+
+    const providerSelect = await screen.findByTestId("provider-select");
+    const labels = Array.from(providerSelect.querySelectorAll("option")).map(
+      (o) => o.textContent ?? "",
+    );
+    // Platform is filtered out; BYOK providers remain.
+    expect(labels.join(" ")).not.toMatch(/Platform/);
+    expect(labels.join(" ")).toMatch(/Anthropic API/);
+    expect(labels.join(" ")).toMatch(/MiniMax/);
+
+    // The platform-managed note (proxy/credits) is NOT shown — a BYOK provider
+    // is pre-selected, so its required-env key field appears instead.
+    expect(screen.queryByText(/metered through the Molecule proxy/i)).toBeNull();
+    // Self-host copy explains the proxy is unavailable.
+    expect(
+      screen.getByText(/self-hosted deployment has no\s+Molecule proxy/i),
+    ).toBeTruthy();
+  });
+
+  it("treats a 404 / error on /org/identity as unavailable (hide Platform)", async () => {
+    // /org/identity rejects → self-host safety: hide Platform, default BYOK.
+    apiGet.mockImplementation((path: string) => {
+      if (path === "/org/identity")
+        return Promise.reject(new Error("404 not found"));
+      if (path.endsWith("/llm-billing-mode"))
+        return Promise.resolve({
+          workspace_id: "plat-1",
+          resolved_mode: "platform_managed",
+          workspace_override: null,
+          org_default: "platform_managed",
+          source: "org_default",
+        });
+      if (path === "/templates") return Promise.resolve(TEMPLATES);
+      if (path.endsWith("/model")) return Promise.resolve({ model: "" });
+      return Promise.resolve({ runtime: "claude-code" });
+    });
+
+    render(<PlatformBillingSection platformId="plat-1" />);
+    await waitFor(() => expect(apiGet).toHaveBeenCalledWith("/org/identity"));
+
+    const providerSelect = await screen.findByTestId("provider-select");
+    const labels = Array.from(providerSelect.querySelectorAll("option")).map(
+      (o) => o.textContent ?? "",
+    );
+    expect(labels.join(" ")).not.toMatch(/Platform/);
+    expect(screen.queryByText(/metered through the Molecule proxy/i)).toBeNull();
+  });
+
+  it("saving writes byok (never platform_managed) on self-host", async () => {
+    mockGets({ platformManagedAvailable: false });
+    apiPut.mockResolvedValue({});
+
+    render(<PlatformBillingSection platformId="plat-1" />);
+    await waitFor(() => expect(apiGet).toHaveBeenCalledWith("/org/identity"));
+
+    const providerSelect = await screen.findByTestId("provider-select");
+    selectProvider(providerSelect, /MiniMax/);
+
+    const modelSelect = await screen.findByTestId("model-select");
+    fireEvent.change(modelSelect, { target: { value: "MiniMax-M2.7" } });
+
+    const keyInput = await screen.findByLabelText("MINIMAX_API_KEY");
+    fireEvent.change(keyInput, { target: { value: "mm-test-key" } });
+
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+
+    await waitFor(() => {
+      expect(apiPut).toHaveBeenCalledWith(
+        "/admin/workspaces/plat-1/llm-billing-mode",
+        { mode: "byok" },
+      );
+    });
+    // The platform_managed write must NEVER happen on self-host.
+    expect(apiPut).not.toHaveBeenCalledWith(
+      "/admin/workspaces/plat-1/llm-billing-mode",
+      { mode: "platform_managed" },
+    );
   });
 });

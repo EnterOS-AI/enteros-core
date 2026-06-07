@@ -75,28 +75,43 @@ func EnsureSelfHostedPlatformAgent(ctx context.Context, database *sql.DB) error 
 	return installPlatformAgent(ctx, database, SelfHostedPlatformAgentID, defaultPlatformAgentName())
 }
 
-// OrgIdentityResponse is the {name} body of GET /org/identity.
+// OrgIdentityResponse is the body of GET /org/identity.
 type OrgIdentityResponse struct {
 	// Name is the org's display name (MOLECULE_ORG_NAME, "" when unset).
 	Name string `json:"name"`
+	// PlatformManagedAvailable reports whether a Molecule LLM proxy is wired
+	// into this workspace-server process — i.e. whether platform_managed billing
+	// can actually work. True on SaaS (the CP provisioner exports the proxy base
+	// URL + usage token), false on a self-hosted stack (no hosted proxy / no
+	// credit ledger). The canvas reads this pre-login to decide whether to offer
+	// the "Platform (proxy)" billing option or hide it and default to BYOK.
+	PlatformManagedAvailable bool `json:"platform_managed_available"`
 }
 
 // OrgIdentity handles GET /org/identity (open / CORS-friendly, no auth).
 //
 // Returns the org's display name from the MOLECULE_ORG_NAME env (empty string
-// when unset). The canvas topbar reads this to render "<org name>" without an
-// admin token — exactly like /health and /buildinfo, it exposes a single
-// non-sensitive identity string the tenant is already named after. The contract
-// is intentionally minimal: {"name": <MOLECULE_ORG_NAME or "">}. A parallel
-// frontend agent consumes it with its own fallback, so an empty name is fine.
+// when unset) plus a platform_managed_available capability flag. The canvas
+// topbar reads `name` to render "<org name>" without an admin token, and the
+// Settings billing card reads `platform_managed_available` to decide whether to
+// offer platform-managed (proxy) billing — exactly like /health and /buildinfo,
+// it exposes only non-sensitive identity/capability signals.
 //
-//	@Summary	Get the org's display name
+// platform_managed_available is true iff a Molecule LLM proxy is configured in
+// this process env (PlatformManagedProxyConfigured — the same base-URL + usage-
+// token precondition the strip gate enforces). On self-host both are unset, so
+// it is false and the canvas hides the "Platform (proxy)" option + defaults BYOK.
+//
+//	@Summary	Get the org's display name + billing capability
 //	@Tags		org
 //	@Produce	json
 //	@Success	200	{object}	OrgIdentityResponse
 //	@Router		/org/identity [get]
 func OrgIdentity(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{"name": os.Getenv("MOLECULE_ORG_NAME")})
+	c.JSON(http.StatusOK, gin.H{
+		"name":                       os.Getenv("MOLECULE_ORG_NAME"),
+		"platform_managed_available": PlatformManagedProxyConfigured(),
+	})
 }
 
 // MaybeProvisionPlatformAgentOnBoot best-effort provisions a container for the
