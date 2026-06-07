@@ -60,6 +60,16 @@ const BASE_RUNTIME_TEMPLATE_IDS = new Set(["claude-code-default", "codex", "goog
 const DEFAULT_HEADLESS_INSTANCE_TYPE = "t3.medium";
 const DEFAULT_HEADLESS_ROOT_GB = 30;
 const DEFAULT_DISPLAY_INSTANCE_TYPE = "t3.xlarge";
+
+// Per-workspace cloud/compute backend (multi-provider RFC). "aws" is the default
+// EC2 path; "gcp"/"hetzner" route to the matching CP WorkspaceProvisioner. A
+// workspace whose cloud differs from its tenant's is reached over a per-workspace
+// Cloudflare tunnel (runtime#95). Distinct from the LLM/model provider.
+const CLOUD_PROVIDER_OPTIONS = [
+  { value: "aws", label: "AWS (default)" },
+  { value: "gcp", label: "GCP" },
+  { value: "hetzner", label: "Hetzner" },
+];
 const DEFAULT_DISPLAY_ROOT_GB = 80;
 
 export function CreateWorkspaceButton() {
@@ -77,6 +87,10 @@ export function CreateWorkspaceButton() {
   const [displayInstanceType, setDisplayInstanceType] = useState(DEFAULT_DISPLAY_INSTANCE_TYPE);
   const [displayRootGB, setDisplayRootGB] = useState(String(DEFAULT_DISPLAY_ROOT_GB));
   const [displayResolution, setDisplayResolution] = useState("1920x1080");
+  // Cloud/compute backend for the workspace box (multi-provider, per-workspace).
+  // "aws" default; "gcp"/"hetzner" route to the matching CP WorkspaceProvisioner
+  // (a non-tenant-cloud box is reached over a per-workspace tunnel, runtime#95).
+  const [cloudProvider, setCloudProvider] = useState("aws");
   // Templates fetched from /api/templates — drives the dynamic provider
   // filter below. Same data source ConfigTab uses (PR #2454). When the
   // selected template declares `runtime_config.providers` in its
@@ -266,6 +280,7 @@ export function CreateWorkspaceButton() {
     setDisplayInstanceType(DEFAULT_DISPLAY_INSTANCE_TYPE);
     setDisplayRootGB(String(DEFAULT_DISPLAY_ROOT_GB));
     setDisplayResolution("1920x1080");
+    setCloudProvider("aws");
     setExternalRuntime("external");
     setLLMSelection({ providerId: "", model: "", envVars: [] });
     setLLMSecret("");
@@ -355,11 +370,16 @@ export function CreateWorkspaceButton() {
                       width: Number.isFinite(displayWidth) ? displayWidth : 1920,
                       height: Number.isFinite(displayHeight) ? displayHeight : 1080,
                     },
+                    // Only meaningful when CP provisions the box (SaaS), where
+                    // the picker is shown. Omit on self-hosted so the payload is
+                    // unchanged there.
+                    ...(isSaaS ? { provider: cloudProvider } : {}),
                   }
                 : {
                     instance_type: DEFAULT_HEADLESS_INSTANCE_TYPE,
                     volume: { root_gb: DEFAULT_HEADLESS_ROOT_GB },
                     display: { mode: "none" },
+                    ...(isSaaS ? { provider: cloudProvider } : {}),
                   },
             }
           : {}),
@@ -599,6 +619,26 @@ export function CreateWorkspaceButton() {
                 <div className="mb-2 text-[11px] font-medium text-ink-mid">
                   Container Config
                 </div>
+                {/* Cloud provider — only meaningful when CP provisions the box
+                    (SaaS). A non-tenant-cloud workspace is reached over a
+                    per-workspace Cloudflare tunnel (runtime#95). */}
+                {isSaaS && (
+                  <label htmlFor="workspace-cloud-provider" className="mb-3 grid gap-1">
+                    <span className="text-xs font-medium text-ink">Cloud provider</span>
+                    <select
+                      id="workspace-cloud-provider"
+                      value={cloudProvider}
+                      onChange={(e) => setCloudProvider(e.target.value)}
+                      className="w-full bg-surface-card/60 border border-line/50 rounded-lg px-3 py-2 text-sm text-ink focus:outline-none focus:border-accent/60 focus:ring-1 focus:ring-accent/20 transition-colors"
+                    >
+                      {CLOUD_PROVIDER_OPTIONS.map((p) => (
+                        <option key={p.value} value={p.value}>
+                          {p.label}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                )}
                 <label className="flex items-center justify-between gap-3">
                   <span className="text-xs font-medium text-ink">Display</span>
                   <input

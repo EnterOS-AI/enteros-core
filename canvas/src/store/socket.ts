@@ -371,6 +371,12 @@ export interface WorkspaceCompute {
   // internal#734: per-workspace durable-data choice. "persist" | "ephemeral" |
   // undefined (auto). Controls whether the data volume survives recreate.
   data_persistence?: string;
+  // Cloud/compute backend for this workspace box (multi-provider, per-workspace):
+  // "aws" (default EC2) | "gcp" | "hetzner". Distinct from the LLM/model provider.
+  // Set at create time; routed by CP to the matching WorkspaceProvisioner. A
+  // workspace whose provider differs from its tenant's cloud is reached over a
+  // per-workspace Cloudflare tunnel (runtime#95).
+  provider?: string;
 }
 
 let socket: ReconnectingSocket | null = null;
