@@ -323,9 +323,13 @@ func (h *OrgHandler) createWorkspaceTree(ws OrgWorkspace, parentID *string, absX
 		// Always generate default config.yaml (runtime, model, tier, etc.)
 		configFiles, cfgErr := h.workspace.ensureDefaultConfig(id, payload)
 		if cfgErr != nil {
-			log.Printf("Org import: default config generation failed for %s: %v — skipping provision", ws.Name, cfgErr)
-			// Skip provisioning for this workspace but continue the import loop
-			// (the DB row + layout + broadcast are already persisted above).
+			log.Printf("Org import: default config generation failed for %s: %v — marking workspace failed", ws.Name, cfgErr)
+			// Fail-closed: the workspace row + layout + broadcast are already
+			// persisted above (status='provisioning'). If we just `continue`,
+			// the workspace stays stuck in provisioning silently. Mark it
+			// failed so the canvas surfaces the failure card and the operator
+			// sees the signal immediately.
+			h.workspace.markProvisionFailed(ctx, id, fmt.Sprintf("default config generation failed: %v", cfgErr), nil)
 			continue
 		}
 

@@ -63,7 +63,11 @@ var (
 	providerRegistryErr      error
 )
 
-func providerRegistry() (*providers.Manifest, error) {
+// providerRegistry loads the embedded providers manifest once and caches it.
+// Defined as a variable (not a named function) so tests can swap in a mock
+// without restarting the process — required for fail-closed coverage of the
+// registry-unavailable path (workspace_provision_derive_test.go).
+var providerRegistry = func() (*providers.Manifest, error) {
 	providerRegistryOnce.Do(func() {
 		providerRegistryManifest, providerRegistryErr = providers.LoadManifest()
 		if providerRegistryErr != nil {

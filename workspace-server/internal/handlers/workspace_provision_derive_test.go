@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -96,6 +97,29 @@ func TestDeriveProvider_KnownModelErrorFailClosed(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "derive provider for known runtime/model") {
 		t.Errorf("error should signal known-model fail-closed, got: %v", err)
+	}
+}
+
+// TestDeriveProvider_RegistryLoadErrorFailClosed pins requirement #3:
+// when the provider registry itself fails to load (build-time defect, degraded
+// disk, corrupted manifest), provisioning must be blocked — do not silently
+// generate a providerless config on a degraded registry.
+func TestDeriveProvider_RegistryLoadErrorFailClosed(t *testing.T) {
+	oldProviderRegistry := providerRegistry
+	providerRegistry = func() (*providers.Manifest, error) {
+		return nil, errors.New("test registry load failure")
+	}
+	defer func() { providerRegistry = oldProviderRegistry }()
+
+	provider, err := deriveDefaultConfigProvider("claude-code", "sonnet")
+	if err == nil {
+		t.Fatal("registry load error must fail-closed, got nil error")
+	}
+	if provider != "" {
+		t.Errorf("fail-closed must return empty provider, got %q", provider)
+	}
+	if !strings.Contains(err.Error(), "provider registry unavailable") {
+		t.Errorf("error should signal registry-unavailable fail-closed, got: %v", err)
 	}
 }
 
