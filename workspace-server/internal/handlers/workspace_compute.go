@@ -112,7 +112,12 @@ func workspaceComputeIsZero(compute models.WorkspaceCompute) bool {
 		compute.Display.Mode == "" &&
 		compute.Display.Width == 0 &&
 		compute.Display.Height == 0 &&
-		compute.Display.Protocol == ""
+		compute.Display.Protocol == "" &&
+		// A provider- or persistence-only compute is NOT zero — it must
+		// round-trip so GET returns those fields (canvas provider badge +
+		// data-persistence selector both read them back).
+		compute.Provider == "" &&
+		compute.DataPersistence == ""
 }
 
 func workspaceComputeJSON(compute models.WorkspaceCompute) (string, error) {
@@ -141,6 +146,17 @@ func workspaceComputeJSON(compute models.WorkspaceCompute) (string, error) {
 	}
 	if len(display) > 0 {
 		out["display"] = display
+	}
+	// Cloud/compute provider + durable-data choice. These were FORWARDED to CP
+	// at provision time but never serialized back here, so GET /workspaces
+	// dropped them — the canvas provider badge always showed the default AWS and
+	// the data-persistence selector always showed "auto". Round-trip them (still
+	// omit-when-empty, so existing AWS/default rows serialize unchanged).
+	if compute.Provider != "" {
+		out["provider"] = compute.Provider
+	}
+	if compute.DataPersistence != "" {
+		out["data_persistence"] = compute.DataPersistence
 	}
 	b, err := json.Marshal(out)
 	if err != nil {
