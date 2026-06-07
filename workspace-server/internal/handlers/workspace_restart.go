@@ -232,7 +232,7 @@ func (h *WorkspaceHandler) Restart(c *gin.Context) {
 	// Block restart if workspace is removed — same 404 as not-found so we don't
 	// leak that the row ever existed, and to prevent resurrecting a removed
 	// workspace to 'provisioning' before the async runRestartCycle guard fires.
-	if status == models.StatusRemoved {
+	if status == string(models.StatusRemoved) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "workspace not found"})
 		return
 	}
