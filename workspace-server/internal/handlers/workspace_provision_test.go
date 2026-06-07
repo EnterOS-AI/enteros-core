@@ -1760,6 +1760,70 @@ func (m *mockResolver) Fetch(_ context.Context, _, _ string) (string, error) {
 	return m.fetchName, m.fetchErr
 }
 
+// TestProvisionWorkspaceCP_InstanceIDPersistFail_MarksFailed asserts that
+// when cpProv.Start succeeds but the DB UPDATE for instance_id fails, the
+// handler marks the workspace failed WITHOUT terminating the live EC2 (the
+// instance may contain valuable state; operator decides). Regression test for
+// ticket #1 (Researcher cleanup audit).
+func TestProvisionWorkspaceCP_InstanceIDPersistFail_MarksFailed(t *testing.T) {
+	t.Setenv("MOLECULE_LLM_BASE_URL", "https://api.example.test/api/v1/internal/llm/openai/v1")
+	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
+
+	mock := setupTestDB(t)
+
+	mock.ExpectQuery(`SELECT key, encrypted_value, encryption_version FROM global_secrets`).
+		WillReturnRows(sqlmock.NewRows([]string{"key", "encrypted_value", "encryption_version"}))
+	mock.ExpectQuery(`SELECT key, encrypted_value, encryption_version FROM workspace_secrets`).
+		WithArgs("ws-cp-orphan").
+		WillReturnRows(sqlmock.NewRows([]string{"key", "encrypted_value", "encryption_version"}))
+
+	// instance_id persist fails
+	mock.ExpectExec(`UPDATE workspaces SET instance_id =`).
+		WithArgs("ws-cp-orphan", "i-12345").
+		WillReturnError(fmt.Errorf("connection reset by peer"))
+
+	// markProvisionFailed updates status to failed
+	mock.ExpectExec(`UPDATE workspaces SET status =`).
+		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	cap := &captureBroadcaster{}
+	stub := &stubInstanceIDPersistFailCPProv{instanceID: "i-12345"}
+	handler := NewWorkspaceHandler(cap, nil, "http://localhost:8080", t.TempDir())
+	handler.SetCPProvisioner(stub)
+
+	handler.provisionWorkspaceCP("ws-cp-orphan", "/nonexistent/template", nil, models.CreateWorkspacePayload{
+		Name:    "ws-cp-orphan",
+		Tier:    1,
+		Runtime: "claude-code",
+	})
+
+	if cap.lastData == nil {
+		t.Fatal("expected RecordAndBroadcast to capture data on persist failure; got nothing")
+	}
+	if got := cap.lastData["error"]; got != "instance_id persist failed — EC2 untracked" {
+		t.Errorf("broadcast error message = %q, want 'instance_id persist failed — EC2 untracked'", got)
+	}
+}
+
+// stubInstanceIDPersistFailCPProv implements CPProvisionerAPI for the
+// instance-id-persist-failure test.
+type stubInstanceIDPersistFailCPProv struct {
+	instanceID string
+}
+
+func (s *stubInstanceIDPersistFailCPProv) Start(_ context.Context, _ provisioner.WorkspaceConfig) (string, error) {
+	return s.instanceID, nil
+}
+func (s *stubInstanceIDPersistFailCPProv) Stop(_ context.Context, _ string) error { return nil }
+func (s *stubInstanceIDPersistFailCPProv) StopAndPrune(_ context.Context, _ string) error { return nil }
+func (s *stubInstanceIDPersistFailCPProv) GetConsoleOutput(_ context.Context, _ string) (string, error) {
+	return "", nil
+}
+func (s *stubInstanceIDPersistFailCPProv) IsRunning(_ context.Context, _ string) (bool, error) {
+	return true, nil
+}
+
 // TestRuntimeUsesAnthropicNativeProxy_CaseAndWhitespace proves the
 // strings.EqualFold hardening: the runtime check now matches "claude-code"
 // case-insensitively (and after trimming whitespace) instead of relying on

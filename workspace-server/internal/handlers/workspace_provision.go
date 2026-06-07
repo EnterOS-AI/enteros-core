@@ -1396,10 +1396,19 @@ func (h *WorkspaceHandler) provisionWorkspaceCP(workspaceID, templatePath string
 	if _, err := db.DB.ExecContext(ctx,
 		`UPDATE workspaces SET instance_id = $2, updated_at = now() WHERE id = $1`,
 		workspaceID, machineID); err != nil {
-		// Non-fatal: provisioning succeeded, the workspace will still run.
-		// The row stays without instance_id — terminal falls back to the
-		// "CP-provisioned but unreachable" error, not a silent failure.
-		log.Printf("CPProvisioner: persist instance_id failed for %s: %v", workspaceID, err)
+		// Fatal: without instance_id in the DB we cannot Stop the EC2 later
+		// (resolveInstanceID returns ""). We do NOT auto-terminate the live
+		// instance — it may contain valuable state the operator wants to recover.
+		// Instead, log the instance_id prominently and mark the workspace failed
+		// so the operator can manually reconcile. The CP orphan sweeper will
+		// eventually clean up if the workspace is later removed. (#1 Researcher
+		// cleanup audit)
+		log.Printf("CPProvisioner: CRITICAL persist instance_id failed for %s: %v — EC2 instance %s is RUNNING but UNTRACKED. Operator must manually reconcile or remove the workspace to trigger orphan cleanup.", workspaceID, err, machineID)
+		h.markProvisionFailed(ctx, workspaceID, "instance_id persist failed — EC2 untracked", map[string]interface{}{
+			"error":      err.Error(),
+			"instance_id": machineID,
+		})
+		return
 	}
 
 	log.Printf("CPProvisioner: workspace %s started as machine %s via control plane", workspaceID, machineID)
