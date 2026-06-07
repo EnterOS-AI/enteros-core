@@ -179,7 +179,6 @@ function Shell({
           <p className="mt-2 text-ink-mid">
             Each org is an isolated Molecule workspace.
           </p>
-          <DataResidencyNotice />
           <div className="mt-8">{children}</div>
         </div>
       </TermsGate>
@@ -220,25 +219,6 @@ function AccountBar({ session }: { session: Session }) {
     </div>
   );
 }
-
-// DataResidencyNotice surfaces where workspace data lives so EU-based
-// signups can make an informed choice (GDPR Art. 13 disclosure
-// requirement). Plain text, no icon — the goal is clarity, not
-// decoration. A future EU region selector can replace this with a
-// region dropdown.
-function DataResidencyNotice() {
-  return (
-    <p className="mt-3 rounded border border-line bg-surface-sunken/60 px-3 py-2 text-xs text-ink-mid">
-      Workspaces run in AWS us-east-2 (Ohio, United States). EU region support is on the roadmap — reach out to
-      {" "}
-      <a href="mailto:support@moleculesai.app" className="underline">
-        support@moleculesai.app
-      </a>
-      {" "}if you need data residency in another region today.
-    </p>
-  );
-}
-
 function OrgRow({ org }: { org: Org }) {
   return (
     <li className="rounded-lg border border-line bg-surface-sunken p-4">
