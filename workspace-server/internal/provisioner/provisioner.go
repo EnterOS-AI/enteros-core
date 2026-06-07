@@ -5,6 +5,8 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -14,6 +16,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/docker/docker/api/types/container"
@@ -238,6 +241,25 @@ const containerNamePrefix = "ws-"
 // (the wiped-DB case after `docker compose down -v`).
 const LabelManaged = "molecule.platform.managed"
 
+// LabelInstance namespaces a managed container/volume to the SPECIFIC
+// platform process (more precisely: the specific Postgres database) that
+// provisioned it. LabelManaged alone is NOT enough to claim ownership on
+// a shared Docker daemon: two co-resident platform processes (two dev
+// stacks, two concurrent CI runs, a blue/green pair) each run their own
+// provisioner and each stamp LabelManaged=true. The orphan sweeper's
+// wiped-DB pass ("labeled container with no row in MY DB → reap") would
+// then cross-reap a sibling platform's perfectly-alive containers (the
+// sibling has the DB row; we don't). Observed in production: a second
+// platform reaped 25 live containers across 8 workspaces.
+//
+// Scoping the reap to LabelInstance == PlatformInstanceID() fixes this:
+// the wiped-DB pass only ever considers containers THIS database
+// provisioned, so a sibling's containers (different DB → different
+// instance id, or — for legacy containers — no instance label at all)
+// are invisible to it. The per-row orphan logic is unchanged: a
+// this-instance container with no row is still the real wiped-DB orphan.
+const LabelInstance = "molecule.platform.instance"
+
 // AgentUID / AgentGID are the uid/gid of the unprivileged `agent` user that
 // every workspace template creates and drops to via `gosu agent` before
 // exec'ing the runtime (the a2a_mcp_server runs under this uid). The value is
@@ -257,10 +279,60 @@ const (
 )
 
 // managedLabels is the canonical label map applied to every workspace
-// container + volume. Pulled out so a future addition (e.g. instance
-// UUID for multi-platform-shared-daemon disambiguation) is one edit.
+// container + volume. Both the cross-platform "this is a Molecule
+// platform container" marker (LabelManaged) and the per-instance
+// ownership marker (LabelInstance) are stamped here so the orphan
+// sweeper can distinguish "ours" from "a co-resident sibling's".
 func managedLabels() map[string]string {
-	return map[string]string{LabelManaged: "true"}
+	return map[string]string{
+		LabelManaged:  "true",
+		LabelInstance: PlatformInstanceID(),
+	}
+}
+
+// platformInstanceID is the resolved-once, process-lifetime stable
+// identifier for THIS platform instance. Computed lazily on first use
+// and memoised so every container/volume + every sweeper filter in a
+// single process sees an identical value.
+var (
+	platformInstanceOnce sync.Once
+	platformInstanceID   string
+)
+
+// PlatformInstanceID returns a stable identifier for this platform
+// instance, used to namespace managed-container labels so co-resident
+// platforms sharing one Docker daemon can't cross-reap each other's
+// workspaces.
+//
+// The identity is derived from DATABASE_URL — the Postgres connection
+// string. This is the correct anchor because the orphan sweeper's
+// wiped-DB pass is defined RELATIVE TO A SPECIFIC DATABASE ("a labeled
+// container with no row in this DB"). Two co-resident platforms point at
+// different databases (different host/port/dbname), so their derived ids
+// differ; the SAME platform restarting reconnects to the SAME DSN, so
+// its id is stable across restarts (the property the per-row orphan
+// logic relies on). We hash the DSN with SHA-256 and keep the first 16
+// hex chars: it never leaks credentials into a Docker label, is a valid
+// label value, and 64 bits is far more than enough to avoid collisions
+// between the handful of platforms that could ever share a daemon.
+//
+// If DATABASE_URL is unset (no-DB test harness / misconfiguration) the
+// id falls back to the literal "default". That is intentional: it keeps
+// behaviour identical to the pre-namespacing world for a lone platform,
+// while two unconfigured co-resident platforms — which would have no DB
+// to define a wiped-DB orphan against — are an unsupported deployment we
+// don't try to disambiguate.
+func PlatformInstanceID() string {
+	platformInstanceOnce.Do(func() {
+		dsn := os.Getenv("DATABASE_URL")
+		if dsn == "" {
+			platformInstanceID = "default"
+			return
+		}
+		sum := sha256.Sum256([]byte(dsn))
+		platformInstanceID = hex.EncodeToString(sum[:])[:16]
+	})
+	return platformInstanceID
 }
 
 // ListWorkspaceContainerIDPrefixes returns the 12-char workspace ID
@@ -314,16 +386,24 @@ func (p *Provisioner) ListWorkspaceContainerIDPrefixes(ctx context.Context) ([]s
 }
 
 // ListManagedContainerIDPrefixes returns the workspace ID prefix of every
-// container carrying the LabelManaged stamp. Distinct from
-// ListWorkspaceContainerIDPrefixes (name-filtered, may include sibling
-// platforms' containers on a shared Docker daemon): this method is the
-// "things definitely provisioned by a Molecule platform process" set.
+// container provisioned by THIS platform instance — carrying both the
+// LabelManaged stamp AND a LabelInstance value matching
+// PlatformInstanceID(). Distinct from ListWorkspaceContainerIDPrefixes
+// (name-filtered, may include sibling platforms' containers on a shared
+// Docker daemon): this method is the "things THIS database provisioned"
+// set.
 //
 // The orphan sweeper uses this for its second pass — reaping containers
 // whose workspace row no longer exists at all (the wiped-DB case after
-// `docker compose down -v`). Without the label gate the sweeper would
-// have to be conservative and only reap rows it could prove were ours,
-// leaving wiped-DB orphans to leak forever.
+// `docker compose down -v`). The instance-scoped filter is load-bearing
+// for multi-platform-on-shared-daemon safety: without it, a co-resident
+// sibling platform's live containers (which carry LabelManaged=true from
+// their OWN provisioner) would show up here, the sweeper would find no
+// row for them in THIS DB, and reap a sibling's healthy workspaces. The
+// label filter pins the candidate set to this instance, so a sibling's
+// containers (different DB → different instance id) and legacy containers
+// (no instance label) are never returned — the wiped-DB pass can't see
+// them, let alone reap them.
 //
 // Returns an empty slice on any Docker error (sweeper treats that as
 // "skip this round" — same contract as ListWorkspaceContainerIDPrefixes).
@@ -332,8 +412,15 @@ func (p *Provisioner) ListManagedContainerIDPrefixes(ctx context.Context) ([]str
 		return nil, nil
 	}
 	containers, err := p.cli.ContainerList(ctx, container.ListOptions{
-		All:     true,
-		Filters: filters.NewArgs(filters.Arg("label", LabelManaged+"=true")),
+		All: true,
+		// Both labels are required (Docker ANDs multiple label filters):
+		// LabelManaged proves it's a Molecule container, LabelInstance
+		// proves it's OURS. A sibling platform stamps LabelManaged=true
+		// but a different LabelInstance, so it's excluded here.
+		Filters: filters.NewArgs(
+			filters.Arg("label", LabelManaged+"=true"),
+			filters.Arg("label", LabelInstance+"="+PlatformInstanceID()),
+		),
 	})
 	if err != nil {
 		return nil, err
