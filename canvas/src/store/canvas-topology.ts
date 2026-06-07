@@ -51,13 +51,13 @@ export function sortParentsBeforeChildren<T extends { id: string; parentId?: str
 }
 
 // Grid-slot defaults for children laid under a parent. The card
-// component (WorkspaceNode.tsx) sets `max-w-[240px]` on leaves, so a
-// slot stride of CHILD_DEFAULT_WIDTH + CHILD_GUTTER guarantees cards
-// never bleed into their neighbour's slot. Keep these in sync with
-// the Go mirror in workspace-server/internal/handlers/org.go —
-// changing one without the other leads to import-time / runtime drift.
-export const CHILD_DEFAULT_WIDTH = 240;
-export const CHILD_DEFAULT_HEIGHT = 130;
+// component (WorkspaceNode.tsx) renders leaves at exactly w-[300px] /
+// min-h-[176px], so a slot stride of CHILD_DEFAULT_WIDTH + CHILD_GUTTER
+// guarantees cards never bleed into their neighbour's slot. Keep these
+// in sync with the Go mirror in workspace-server/internal/handlers/org.go
+// — changing one without the other leads to import-time / runtime drift.
+export const CHILD_DEFAULT_WIDTH = 300;
+export const CHILD_DEFAULT_HEIGHT = 176;
 // Parent header space — reserves room above the child grid so the
 // parent's own name + runtime pill + clamped role + currentTask
 // banner aren't covered by the first row of child cards. The

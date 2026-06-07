@@ -4,6 +4,8 @@ import { useEffect, useState } from "react";
 import { Canvas } from "@/components/Canvas";
 import { Legend } from "@/components/Legend";
 import { CommunicationOverlay } from "@/components/CommunicationOverlay";
+import { TopViewTabs } from "@/components/TopViewTabs";
+import { ConciergeHome } from "@/components/ConciergeHome";
 import { MobileApp } from "@/components/mobile/MobileApp";
 import { Spinner } from "@/components/Spinner";
 import { connectSocket, disconnectSocket } from "@/store/socket";
@@ -14,6 +16,7 @@ import type { WorkspaceData } from "@/store/socket";
 export default function Home() {
   const hydrationError = useCanvasStore((s) => s.hydrationError);
   const setHydrationError = useCanvasStore((s) => s.setHydrationError);
+  const topView = useCanvasStore((s) => s.topView);
   const [hydrating, setHydrating] = useState(true);
   // < 640px viewport renders the dedicated mobile shell instead of the
   // desktop canvas. Tri-state: `null` until matchMedia has resolved,
@@ -115,11 +118,18 @@ export default function Home() {
 
   return (
     <>
-      <main aria-label="Agent canvas">
-        <Canvas />
-      </main>
-      <Legend />
-      <CommunicationOverlay />
+      <TopViewTabs />
+      {topView === "home" ? (
+        <ConciergeHome />
+      ) : (
+        <>
+          <main aria-label="Agent canvas">
+            <Canvas />
+          </main>
+          <Legend />
+          <CommunicationOverlay />
+        </>
+      )}
       {hydrationError && (
         <div
           role="alert"

@@ -11,7 +11,23 @@ import {
   childSlotInGrid,
   parentMinSize,
   parentMinSizeFromChildren,
+  CHILD_DEFAULT_WIDTH,
+  CHILD_DEFAULT_HEIGHT,
+  CHILD_GUTTER,
+  PARENT_SIDE_PADDING,
+  PARENT_HEADER_PADDING,
+  PARENT_BOTTOM_PADDING,
 } from "../canvas-topology";
+
+// Layout-math aliases so these assertions track the card-size constants
+// instead of hard-coding pixel values (which drift when the card size
+// changes — e.g. the 240×130 → 300×176 "bigger cards" redesign).
+const W = CHILD_DEFAULT_WIDTH;
+const H = CHILD_DEFAULT_HEIGHT;
+const GUT = CHILD_GUTTER;
+const SIDE = PARENT_SIDE_PADDING;
+const HEAD = PARENT_HEADER_PADDING;
+const BOTTOM = PARENT_BOTTOM_PADDING;
 
 // ─── sortParentsBeforeChildren ─────────────────────────────────────────────────
 
@@ -115,34 +131,34 @@ describe("sortParentsBeforeChildren", () => {
 
 // ─── defaultChildSlot ─────────────────────────────────────────────────────────
 
-describe("defaultChildSlot — 2-column grid (240×130 cards)", () => {
+describe("defaultChildSlot — 2-column grid", () => {
   it("slot 0 → column 0, row 0", () => {
     const s = defaultChildSlot(0);
-    expect(s).toEqual({ x: 16, y: 130 });
+    expect(s).toEqual({ x: SIDE, y: HEAD });
   });
 
   it("slot 1 → column 1, row 0", () => {
     const s = defaultChildSlot(1);
-    expect(s.x).toBe(16 + 240 + 14); // PARENT_SIDE_PADDING + CHILD_DEFAULT_WIDTH + CHILD_GUTTER
-    expect(s.y).toBe(130);
+    expect(s.x).toBe(SIDE + W + GUT); // PARENT_SIDE_PADDING + CHILD_DEFAULT_WIDTH + CHILD_GUTTER
+    expect(s.y).toBe(HEAD);
   });
 
   it("slot 2 → column 0, row 1", () => {
     const s = defaultChildSlot(2);
-    expect(s.x).toBe(16);
-    expect(s.y).toBe(130 + 130 + 14); // row 0 height + gutter
+    expect(s.x).toBe(SIDE);
+    expect(s.y).toBe(HEAD + H + GUT); // row 0 height + gutter
   });
 
   it("slot 3 → column 1, row 1", () => {
     const s = defaultChildSlot(3);
-    expect(s.x).toBe(16 + 240 + 14);
-    expect(s.y).toBe(130 + 130 + 14);
+    expect(s.x).toBe(SIDE + W + GUT);
+    expect(s.y).toBe(HEAD + H + GUT);
   });
 
   it("slot 4 → column 0, row 2", () => {
     const s = defaultChildSlot(4);
-    expect(s.x).toBe(16);
-    expect(s.y).toBe(130 + (130 + 14) * 2); // row 1 end + gutter
+    expect(s.x).toBe(SIDE);
+    expect(s.y).toBe(HEAD + (H + GUT) * 2); // row 1 end + gutter
   });
 });
 
@@ -194,36 +210,35 @@ describe("parentMinSize — uniform-size children", () => {
 
   it("1 child → 1 col, 1 row", () => {
     const s = parentMinSize(1);
-    // width = 16*2 + 1*240 + 0 = 272; height = 130 + 1*130 + 0 + 16 = 276
-    expect(s.width).toBe(16 * 2 + 240);
-    expect(s.height).toBe(130 + 130 + 16);
+    // width = SIDE*2 + 1*W; height = HEAD + 1*H + BOTTOM
+    expect(s.width).toBe(SIDE * 2 + W);
+    expect(s.height).toBe(HEAD + H + BOTTOM);
   });
 
   it("2 children → 2 cols, 1 row", () => {
     const s = parentMinSize(2);
-    // width = 16*2 + 2*240 + 1*14 = 526; height = 130 + 1*130 + 0 + 16 = 276
-    expect(s.width).toBe(16 * 2 + 2 * 240 + 14);
-    expect(s.height).toBe(130 + 130 + 16);
+    // width = SIDE*2 + 2*W + 1*GUT; height = HEAD + 1*H + BOTTOM
+    expect(s.width).toBe(SIDE * 2 + 2 * W + GUT);
+    expect(s.height).toBe(HEAD + H + BOTTOM);
   });
 
   it("3 children → 2 cols, 2 rows", () => {
     const s = parentMinSize(3);
-    // width = 16*2 + 2*240 + 1*14 = 526
-    expect(s.width).toBe(16 * 2 + 2 * 240 + 14);
-    // height = 130 + 2*130 + 1*14 + 16 = 416
-    expect(s.height).toBe(130 + 2 * 130 + 14 + 16);
+    expect(s.width).toBe(SIDE * 2 + 2 * W + GUT);
+    // height = HEAD + 2*H + 1*GUT + BOTTOM
+    expect(s.height).toBe(HEAD + 2 * H + GUT + BOTTOM);
   });
 
   it("4 children → 2 cols, 2 rows (full grid)", () => {
     const s = parentMinSize(4);
-    expect(s.width).toBe(16 * 2 + 2 * 240 + 14);
-    expect(s.height).toBe(130 + 2 * 130 + 14 + 16);
+    expect(s.width).toBe(SIDE * 2 + 2 * W + GUT);
+    expect(s.height).toBe(HEAD + 2 * H + GUT + BOTTOM);
   });
 
   it("5 children → 2 cols, 3 rows", () => {
     const s = parentMinSize(5);
-    expect(s.width).toBe(16 * 2 + 2 * 240 + 14);
-    expect(s.height).toBe(130 + 3 * 130 + 2 * 14 + 16);
+    expect(s.width).toBe(SIDE * 2 + 2 * W + GUT);
+    expect(s.height).toBe(HEAD + 3 * H + 2 * GUT + BOTTOM);
   });
 });
 
@@ -243,8 +258,8 @@ describe("parentMinSizeFromChildren — variable-size children", () => {
 
   it("two equal-width children → same as parentMinSize(2)", () => {
     const fromChildren = parentMinSizeFromChildren([
-      { width: 240, height: 130 },
-      { width: 240, height: 130 },
+      { width: W, height: H },
+      { width: W, height: H },
     ]);
     expect(fromChildren.width).toBe(parentMinSize(2).width);
     expect(fromChildren.height).toBe(parentMinSize(2).height);

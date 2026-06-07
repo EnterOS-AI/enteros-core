@@ -142,6 +142,12 @@ export interface WorkspaceNodeData extends Record<string, unknown> {
 
 export type PanelTab = "details" | "skills" | "chat" | "terminal" | "display" | "container-config" | "config" | "schedule" | "channels" | "files" | "memory" | "traces" | "events" | "activity" | "audit";
 
+/**
+ * Top-level canvas view. "home" is the Org Concierge view (chat with the
+ * platform agent); "map" is the node-graph canvas (the original view).
+ */
+export type TopView = "home" | "map";
+
 export interface ContextMenuState {
   x: number;
   y: number;
@@ -154,6 +160,8 @@ interface CanvasState {
   edges: Edge[];
   selectedNodeId: string | null;
   panelTab: PanelTab;
+  /** Top-level view: Org Concierge home (chat) vs the node-graph map. */
+  topView: TopView;
   dragOverNodeId: string | null;
   contextMenu: ContextMenuState | null;
   // Live width of the SidePanel in pixels. Only meaningful when
@@ -174,6 +182,7 @@ interface CanvasState {
   savePosition: (nodeId: string, x: number, y: number) => void;
   selectNode: (id: string | null) => void;
   setPanelTab: (tab: PanelTab) => void;
+  setTopView: (view: TopView) => void;
   getSelectedNode: () => Node<WorkspaceNodeData> | null;
   updateNodeData: (id: string, data: Partial<WorkspaceNodeData>) => void;
   restartWorkspace: (id: string, options?: { applyTemplate?: boolean }) => Promise<void>;
@@ -283,6 +292,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
   edges: [],
   selectedNodeId: null,
   panelTab: "chat",
+  topView: "map",
   dragOverNodeId: null,
   contextMenu: null,
   sidePanelWidth: 480, // matches SIDEPANEL_DEFAULT_WIDTH in SidePanel.tsx
@@ -418,6 +428,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
     }
   },
   setPanelTab: (tab) => set({ panelTab: tab }),
+  setTopView: (view) => set({ topView: view }),
   setDragOverNode: (id) => set({ dragOverNodeId: id }),
 
   batchNest: async (nodeIds, targetId) => {

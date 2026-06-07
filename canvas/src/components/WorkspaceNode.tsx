@@ -157,8 +157,8 @@ export function WorkspaceNode({ id, data }: NodeProps<Node<WorkspaceNodeData>>) 
       className={`
         group relative rounded-xl
         ${hasChildren && !data.collapsed
-          ? "h-full w-full min-w-[360px] min-h-[200px]"
-          : "w-[240px] min-h-[130px]"}
+          ? "h-full w-full min-w-[420px] min-h-[240px]"
+          : "w-[300px] min-h-[176px]"}
         cursor-pointer overflow-hidden
         transition-all duration-200 ease-out
         ${isDragTarget
@@ -211,12 +211,12 @@ export function WorkspaceNode({ id, data }: NodeProps<Node<WorkspaceNodeData>>) 
         className="!w-2.5 !h-1 !rounded-full !bg-surface-card/80 !border-0 !-top-0.5 hover:!bg-accent hover:!h-1.5 focus-visible:!bg-accent focus-visible:!h-1.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/60 focus-visible:ring-offset-1 focus-visible:ring-offset-surface transition-all"
       />
 
-      <div className="relative px-3.5 py-2.5">
+      <div className="relative px-4 py-3.5">
         {/* Header row */}
-        <div className="flex items-center justify-between gap-2 mb-1">
-          <div className="flex items-center gap-2 min-w-0">
-            <div className={`w-2 h-2 rounded-full shrink-0 ${statusCfg.dot} ${statusCfg.glow} shadow-sm`} />
-            <span className="text-[13px] font-semibold text-ink truncate leading-tight">
+        <div className="flex items-center justify-between gap-2 mb-2.5">
+          <div className="flex items-center gap-2.5 min-w-0">
+            <div className={`w-2.5 h-2.5 rounded-full shrink-0 ${statusCfg.dot} ${statusCfg.glow} shadow-sm`} />
+            <span className="text-[15px] font-semibold text-ink truncate leading-tight">
               {data.name}
             </span>
           </div>
@@ -229,7 +229,7 @@ export function WorkspaceNode({ id, data }: NodeProps<Node<WorkspaceNodeData>>) 
               const model = typeof m === "string" && m ? m : null;
               if (!model) {
                 return (
-                  <span className={`text-[10px] font-mono px-1.5 py-0.5 rounded-md ${tierCfg.color}`}>
+                  <span className={`text-[11px] font-mono px-2 py-1 rounded-md ${tierCfg.color}`}>
                     {tierCfg.label}
                   </span>
                 );
@@ -242,7 +242,7 @@ export function WorkspaceNode({ id, data }: NodeProps<Node<WorkspaceNodeData>>) 
                 : /gemini/i.test(model) ? "Gemini"
                 : (model.split(/[/:]/).pop() || model);
               return (
-                <span className="text-[10px] font-mono px-2 py-0.5 rounded-md text-white bg-accent" title={model}>
+                <span className="text-[11px] font-mono px-2 py-1 rounded-md text-white bg-accent" title={model}>
                   {label}
                 </span>
               );
@@ -271,15 +271,15 @@ export function WorkspaceNode({ id, data }: NodeProps<Node<WorkspaceNodeData>>) 
           const roleLabel = isPlatformRoot ? "PLATFORM · ROOT" : (data.role || null);
           if (!roleLabel && !isRemote) return null;
           return (
-            <div className="mb-2 flex items-center gap-1.5">
+            <div className="mb-2.5 flex items-center gap-1.5">
               {roleLabel && (
-                <span className="max-w-[180px] truncate text-[9px] font-mono uppercase tracking-[0.04em] px-1.5 py-0.5 rounded-md text-accent bg-accent/12 border border-accent/35">
+                <span className="max-w-[220px] truncate text-[10px] font-mono uppercase tracking-[0.04em] px-2 py-1 rounded-md text-accent bg-accent/12 border border-accent/35">
                   {roleLabel}
                 </span>
               )}
               {isRemote && (
                 <span
-                  className="text-[9px] font-mono uppercase px-1.5 py-0.5 rounded-md text-white bg-violet-800 border border-violet-900"
+                  className="text-[10px] font-mono uppercase px-2 py-1 rounded-md text-white bg-violet-800 border border-violet-900"
                   title="Phase 30 remote agent — runs outside this platform's Docker network. Lifecycle managed via heartbeat-based polling, not Docker exec."
                 >
                   ★ REMOTE
@@ -291,8 +291,8 @@ export function WorkspaceNode({ id, data }: NodeProps<Node<WorkspaceNodeData>>) 
 
         {/* Status line (concept) — uppercase status, "· N AGENTS" for parents,
             with a queued pill on the right. */}
-        <div className="mb-1.5 flex items-center justify-between gap-2">
-          <span className={`text-[10px] font-mono uppercase tracking-[0.04em] ${
+        <div className="mb-2 flex items-center justify-between gap-2">
+          <span className={`text-[11px] font-mono uppercase tracking-[0.04em] ${
             isOnline ? "text-good"
               : effectiveStatus === "failed" ? "text-bad"
               : (effectiveStatus === "provisioning" || effectiveStatus === "degraded") ? "text-warm"
@@ -301,7 +301,7 @@ export function WorkspaceNode({ id, data }: NodeProps<Node<WorkspaceNodeData>>) 
             {statusCfg.label}{hasChildren ? ` · ${descendantCount} agents` : ""}
           </span>
           {data.activeTasks > 0 && (
-            <span className="shrink-0 text-[10px] font-mono px-1.5 py-0.5 rounded-md text-ink-mid bg-surface-card border border-line">
+            <span className="shrink-0 text-[11px] font-mono px-2 py-1 rounded-md text-ink-mid bg-surface-card border border-line">
               ≡ {data.activeTasks} queued
             </span>
           )}
