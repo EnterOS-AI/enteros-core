@@ -13,6 +13,7 @@ import {
 import "@xyflow/react/dist/style.css";
 
 import { useCanvasStore } from "@/store/canvas";
+import { WORKSPACE_KIND } from "@/lib/workspace-kind";
 import { stripPlatformRootForMap } from "@/store/canvas-topology";
 import { useTheme } from "@/lib/theme-provider";
 import { A2ATopologyOverlay } from "./A2ATopologyOverlay";
@@ -97,7 +98,7 @@ function CanvasInner() {
     () =>
       new Set(
         storeNodes
-          .filter((n) => n.data.kind === "platform")
+          .filter((n) => n.data.kind === WORKSPACE_KIND.Platform)
           .map((n) => n.id),
       ),
     [storeNodes],

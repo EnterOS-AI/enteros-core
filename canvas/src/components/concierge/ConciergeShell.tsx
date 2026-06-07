@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useCanvasStore, type TopView } from "@/store/canvas";
+import { WORKSPACE_KIND } from "@/lib/workspace-kind";
 import { useTheme } from "@/lib/theme-provider";
 import { api } from "@/lib/api";
 import { showToast } from "@/components/Toaster";
@@ -10,7 +11,6 @@ import { Canvas } from "@/components/Canvas";
 import { CommunicationOverlay } from "@/components/CommunicationOverlay";
 import { ChatTab } from "@/components/tabs/ChatTab";
 import { WorkspacePanelTabs } from "@/components/WorkspacePanelTabs";
-import { PlatformBillingSection } from "./PlatformBillingSection";
 import { SettingsTabs } from "@/components/settings";
 import s from "./Concierge.module.css";
 import {
@@ -141,11 +141,13 @@ export function ConciergeShell() {
 
   const platformRoot = useMemo(
     () =>
-      // Prefer the authoritative kind='platform' marker; fall back to the
-      // name/role heuristic for older ws-server builds that don't return kind,
-      // then to the first root.
-      roots.find((r) => r.data.kind === "platform") ??
-      roots.find((r) => /concierge|platform/i.test(`${r.data.role ?? ""} ${r.data.name ?? ""}`)) ??
+      // Resolve the platform agent by the authoritative kind='platform' marker
+      // only — the backend in this branch always returns kind
+      // (COALESCE(w.kind,'workspace')) and the map-side filter
+      // (canvas-topology/Canvas/Toolbar) is kind-only, so the shell must not
+      // disagree via a name/role heuristic. Fall back to the first root only as
+      // graceful degradation if no node is tagged platform.
+      roots.find((r) => r.data.kind === WORKSPACE_KIND.Platform) ??
       roots[0] ??
       null,
     [roots],
@@ -535,20 +537,6 @@ export function ConciergeShell() {
                       </div>
                     )}
                   </div>
-
-                  {platformId ? (
-                    <PlatformBillingSection platformId={platformId} />
-                  ) : (
-                    <div className={s.scard}>
-                      <div className={s.scardHead}>
-                        <div className={s.scardTitle}>LLM billing — platform agent</div>
-                        <div className={s.scardDesc}>
-                          No platform agent yet. Spin one up from Home to configure
-                          billing.
-                        </div>
-                      </div>
-                    </div>
-                  )}
 
                   <div className={s.scard}>
                     <div className={s.scardHead}>

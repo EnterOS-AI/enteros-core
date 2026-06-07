@@ -1,6 +1,7 @@
 import type { Node, Edge } from "@xyflow/react";
 import type { WorkspaceData } from "./socket";
 import type { WorkspaceNodeData } from "./canvas";
+import { WORKSPACE_KIND } from "@/lib/workspace-kind";
 
 const H_SPACING = 320;
 const V_SPACING = 200;
@@ -532,7 +533,7 @@ export function buildNodesAndEdges(
         // Org-level platform agent ('platform') vs ordinary workspace. The map
         // view hides the platform root (it's the undeletable org anchor) via
         // stripPlatformRootForMap; the shell home tree keeps it as ROOT.
-        kind: ws.kind ?? "workspace",
+        kind: ws.kind ?? WORKSPACE_KIND.Workspace,
       },
     };
     if (hasParent) {
@@ -649,7 +650,7 @@ export function stripPlatformRootForMap(
   edges: Edge[],
 ): { nodes: Node<WorkspaceNodeData>[]; edges: Edge[] } {
   const platformIds = new Set(
-    nodes.filter((n) => n.data.kind === "platform").map((n) => n.id),
+    nodes.filter((n) => n.data.kind === WORKSPACE_KIND.Platform).map((n) => n.id),
   );
   if (platformIds.size === 0) return { nodes, edges };
 

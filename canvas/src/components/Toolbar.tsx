@@ -3,6 +3,7 @@
 import { useMemo, useState, useCallback, useEffect, useRef } from "react";
 import { api } from "@/lib/api";
 import { useCanvasStore } from "@/store/canvas";
+import { WORKSPACE_KIND } from "@/lib/workspace-kind";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { showToast } from "@/components/Toaster";
 import { statusDotClass } from "@/lib/design-tokens";
@@ -54,7 +55,7 @@ export function Toolbar() {
   const counts = useMemo(() => {
     // Exclude the org-level platform agent (the concierge) — it's the
     // undeletable org root surfaced in the shell, not a counted map workspace.
-    const mapNodes = nodes.filter((n) => n.data.kind !== "platform");
+    const mapNodes = nodes.filter((n) => n.data.kind !== WORKSPACE_KIND.Platform);
     const c = { total: mapNodes.length, roots: 0, children: 0, online: 0, offline: 0, failed: 0, provisioning: 0, activeTasks: 0 };
     for (const n of mapNodes) {
       if (n.data.parentId) c.children++; else c.roots++;

@@ -74,6 +74,12 @@ function growParentsToFitChildren<T extends Record<string, unknown>>(
 export { summarizeWorkspaceCapabilities } from "./canvas-capabilities";
 export type { WorkspaceCapabilitySummary } from "./canvas-capabilities";
 
+/** Canonical workspace `kind` values — the TS mirror of Go's models.Kind*
+ *  constants. Defined in a leaf module (`@/lib/workspace-kind`) and re-exported
+ *  here for convenience so consumers can keep importing from `@/store/canvas`.
+ *  Use these instead of the bare "platform"/"workspace" string literals. */
+export { WORKSPACE_KIND } from "@/lib/workspace-kind";
+
 export interface WorkspaceNodeData extends Record<string, unknown> {
   name: string;
   status: string;
