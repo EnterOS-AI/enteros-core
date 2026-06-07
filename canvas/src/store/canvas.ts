@@ -86,6 +86,10 @@ export interface WorkspaceNodeData extends Record<string, unknown> {
   lastSampleError: string;
   url: string;
   parentId: string | null;
+  /** 'platform' = the org concierge (hidden from the map graph, surfaced as the
+   *  shell's org root); 'workspace' = ordinary agent. Optional: absent on older
+   *  ws-server builds / some event-constructed nodes — treat absent as ordinary. */
+  kind?: string;
   currentTask: string;
   runtime: string;
   workspaceAccess?: string | null;

@@ -140,7 +140,14 @@ export function ConciergeShell() {
   }, [nodes]);
 
   const platformRoot = useMemo(
-    () => roots.find((r) => /concierge|platform/i.test(`${r.data.role ?? ""} ${r.data.name ?? ""}`)) ?? roots[0] ?? null,
+    () =>
+      // Prefer the authoritative kind='platform' marker; fall back to the
+      // name/role heuristic for older ws-server builds that don't return kind,
+      // then to the first root.
+      roots.find((r) => r.data.kind === "platform") ??
+      roots.find((r) => /concierge|platform/i.test(`${r.data.role ?? ""} ${r.data.name ?? ""}`)) ??
+      roots[0] ??
+      null,
     [roots],
   );
 

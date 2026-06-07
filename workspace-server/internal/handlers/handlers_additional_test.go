@@ -244,13 +244,13 @@ func TestWorkspaceList_WithData(t *testing.T) {
 		"last_error_rate", "last_sample_error",
 		"uptime_seconds", "current_task", "runtime", "workspace_dir", "x", "y", "collapsed",
 		"budget_limit", "monthly_spend",
-		"broadcast_enabled", "talk_to_user_enabled", "compute",
+		"broadcast_enabled", "talk_to_user_enabled", "compute", "kind",
 	}
 	rows := sqlmock.NewRows(columns).
 		AddRow("ws-1", "Agent One", "worker", 1, "online", []byte(`{"name":"agent1"}`), "http://localhost:8001",
-			nil, 3, 1, 0.02, "", 7200, "processing", "claude-code", "", 10.0, 20.0, false, nil, int64(0), false, true, []byte(`{}`)).
+			nil, 3, 1, 0.02, "", 7200, "processing", "claude-code", "", 10.0, 20.0, false, nil, int64(0), false, true, []byte(`{}`), "workspace").
 		AddRow("ws-2", "Agent Two", "", 2, "degraded", []byte("null"), "",
-			nil, 0, 1, 0.6, "timeout", 100, "", "claude-code", "", 50.0, 60.0, true, nil, int64(0), false, true, []byte(`{}`))
+			nil, 0, 1, 0.6, "timeout", 100, "", "claude-code", "", 50.0, 60.0, true, nil, int64(0), false, true, []byte(`{}`), "workspace")
 
 	mock.ExpectQuery("SELECT w.id, w.name").
 		WillReturnRows(rows)

@@ -13,6 +13,7 @@ import {
 import "@xyflow/react/dist/style.css";
 
 import { useCanvasStore } from "@/store/canvas";
+import { stripPlatformRootForMap } from "@/store/canvas-topology";
 import { useTheme } from "@/lib/theme-provider";
 import { A2ATopologyOverlay } from "./A2ATopologyOverlay";
 import { WorkspaceNode } from "./WorkspaceNode";
@@ -78,15 +79,38 @@ function CanvasInner() {
   // half-themed page. Pull resolvedTheme so the canvas matches the user's
   // selected mode (and the system preference when they pick "system").
   const { resolvedTheme } = useTheme();
-  const rawNodes = useCanvasStore((s) => s.nodes);
-  const edges = useCanvasStore((s) => s.edges);
+  const storeNodes = useCanvasStore((s) => s.nodes);
+  const storeEdges = useCanvasStore((s) => s.edges);
   const a2aEdges = useCanvasStore((s) => s.a2aEdges);
   const showA2AEdges = useCanvasStore((s) => s.showA2AEdges);
   const deletingIds = useCanvasStore((s) => s.deletingIds);
-  const allEdges = useMemo(
-    () => (showA2AEdges ? [...edges, ...a2aEdges] : edges),
-    [edges, a2aEdges, showA2AEdges],
+  // Hide the org-level platform agent (the concierge) from the map graph: it is
+  // the undeletable org ROOT surfaced in the shell (topbar + Home tree), not a
+  // draggable/deletable map node. Its direct children are reparented to
+  // top-level and tree edges touching it are dropped. The store keeps the full
+  // node set, so the shell's Home agent tree still renders it as ROOT.
+  const { nodes: rawNodes, edges } = useMemo(
+    () => stripPlatformRootForMap(storeNodes, storeEdges),
+    [storeNodes, storeEdges],
   );
+  const platformIds = useMemo(
+    () =>
+      new Set(
+        storeNodes
+          .filter((n) => n.data.kind === "platform")
+          .map((n) => n.id),
+      ),
+    [storeNodes],
+  );
+  const allEdges = useMemo(() => {
+    if (!showA2AEdges) return edges;
+    // Drop A2A edges that touch the hidden platform root so React Flow doesn't
+    // warn about an edge to a missing node.
+    const a2a = a2aEdges.filter(
+      (e) => !platformIds.has(e.source) && !platformIds.has(e.target),
+    );
+    return [...edges, ...a2a];
+  }, [edges, a2aEdges, showA2AEdges, platformIds]);
   // Drag-lock during a system-owned operation (deploy OR delete).
   // React Flow respects Node.draggable, which stops the gesture
   // before it starts — preventDefault() on the drag-start callback

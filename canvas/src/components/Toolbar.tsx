@@ -55,8 +55,11 @@ export function Toolbar() {
   }, [wsStatus]);
 
   const counts = useMemo(() => {
-    const c = { total: nodes.length, roots: 0, children: 0, online: 0, offline: 0, failed: 0, provisioning: 0, activeTasks: 0 };
-    for (const n of nodes) {
+    // Exclude the org-level platform agent (the concierge) — it's the
+    // undeletable org root surfaced in the shell, not a counted map workspace.
+    const mapNodes = nodes.filter((n) => n.data.kind !== "platform");
+    const c = { total: mapNodes.length, roots: 0, children: 0, online: 0, offline: 0, failed: 0, provisioning: 0, activeTasks: 0 };
+    for (const n of mapNodes) {
       if (n.data.parentId) c.children++; else c.roots++;
       const s = n.data.status;
       if (s === "online") c.online++;

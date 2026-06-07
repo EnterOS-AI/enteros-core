@@ -958,7 +958,7 @@ func (h *WorkspaceHandler) ProvisionTimeoutSecondsForRuntime(runtime string) int
 func scanWorkspaceRow(rows interface {
 	Scan(dest ...interface{}) error
 }) (map[string]interface{}, error) {
-	var id, name, role, status, url, sampleError, currentTask, runtime, workspaceDir string
+	var id, name, role, status, url, sampleError, currentTask, runtime, workspaceDir, kind string
 	var computeRaw []byte
 	var tier, activeTasks, maxConcurrentTasks, uptimeSeconds int
 	var errorRate, x, y float64
@@ -971,7 +971,7 @@ func scanWorkspaceRow(rows interface {
 	err := rows.Scan(&id, &name, &role, &tier, &status, &agentCard, &url,
 		&parentID, &activeTasks, &maxConcurrentTasks, &errorRate, &sampleError, &uptimeSeconds,
 		&currentTask, &runtime, &workspaceDir, &x, &y, &collapsed,
-		&budgetLimit, &monthlySpend, &broadcastEnabled, &talkToUserEnabled, &computeRaw)
+		&budgetLimit, &monthlySpend, &broadcastEnabled, &talkToUserEnabled, &computeRaw, &kind)
 	if err != nil {
 		return nil, err
 	}
@@ -983,6 +983,11 @@ func scanWorkspaceRow(rows interface {
 		"status":               status,
 		"url":                  url,
 		"parent_id":            parentID,
+		// kind discriminates the org-level platform agent ('platform') from
+		// ordinary workspaces ('workspace'). The canvas hides the platform
+		// root from the node graph (it's the undeletable org anchor) and uses
+		// it to resolve the concierge for the shell home/settings.
+		"kind": kind,
 		"active_tasks":         activeTasks,
 		"max_concurrent_tasks": maxConcurrentTasks,
 		"last_error_rate":      errorRate,
@@ -1039,7 +1044,8 @@ const workspaceListQuery = `
 		   COALESCE(cl.x, 0), COALESCE(cl.y, 0), COALESCE(cl.collapsed, false),
 		   w.budget_limit, COALESCE(w.monthly_spend, 0),
 		   w.broadcast_enabled, w.talk_to_user_enabled,
-		   COALESCE(w.compute, '{}'::jsonb)
+		   COALESCE(w.compute, '{}'::jsonb),
+		   COALESCE(w.kind, 'workspace')
 	FROM workspaces w
 	LEFT JOIN canvas_layouts cl ON cl.workspace_id = w.id
 	WHERE w.status != 'removed'
@@ -1101,7 +1107,8 @@ func (h *WorkspaceHandler) Get(c *gin.Context) {
 			   COALESCE(cl.x, 0), COALESCE(cl.y, 0), COALESCE(cl.collapsed, false),
 			   w.budget_limit, COALESCE(w.monthly_spend, 0),
 			   w.broadcast_enabled, w.talk_to_user_enabled,
-			   COALESCE(w.compute, '{}'::jsonb)
+			   COALESCE(w.compute, '{}'::jsonb),
+		   COALESCE(w.kind, 'workspace')
 		FROM workspaces w
 		LEFT JOIN canvas_layouts cl ON cl.workspace_id = w.id
 		WHERE w.id = $1
