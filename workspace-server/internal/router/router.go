@@ -55,7 +55,7 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 	r.Use(cors.New(cors.Config{
 		AllowOrigins:     corsOrigins,
 		AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
-		AllowHeaders:     []string{"Origin", "Content-Type", "X-Workspace-ID", "X-Molecule-Org-Id", "X-Molecule-Org-Slug", "Authorization"},
+		AllowHeaders:     []string{"Origin", "Content-Type", "X-Workspace-ID", "X-Molecule-Org-Id", "X-Molecule-Org-Slug", "X-Confirm-Name", "Authorization"},
 		AllowCredentials: true,
 	}))
 
