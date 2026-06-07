@@ -75,6 +75,12 @@ func EnsureSelfHostedPlatformAgent(ctx context.Context, database *sql.DB) error 
 	return installPlatformAgent(ctx, database, SelfHostedPlatformAgentID, defaultPlatformAgentName())
 }
 
+// OrgIdentityResponse is the {name} body of GET /org/identity.
+type OrgIdentityResponse struct {
+	// Name is the org's display name (MOLECULE_ORG_NAME, "" when unset).
+	Name string `json:"name"`
+}
+
 // OrgIdentity handles GET /org/identity (open / CORS-friendly, no auth).
 //
 // Returns the org's display name from the MOLECULE_ORG_NAME env (empty string
@@ -83,6 +89,12 @@ func EnsureSelfHostedPlatformAgent(ctx context.Context, database *sql.DB) error 
 // non-sensitive identity string the tenant is already named after. The contract
 // is intentionally minimal: {"name": <MOLECULE_ORG_NAME or "">}. A parallel
 // frontend agent consumes it with its own fallback, so an empty name is fine.
+//
+//	@Summary	Get the org's display name
+//	@Tags		org
+//	@Produce	json
+//	@Success	200	{object}	OrgIdentityResponse
+//	@Router		/org/identity [get]
 func OrgIdentity(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"name": os.Getenv("MOLECULE_ORG_NAME")})
 }

@@ -17,11 +17,91 @@ type UserTasksHandler struct {
 	broadcaster *events.Broadcaster
 }
 
+// --- OpenAPI doc shapes (used by swaggo; the handlers emit gin.H inline) ---
+
+// CreateUserTaskRequest is the body of POST /workspaces/{id}/user-tasks.
+type CreateUserTaskRequest struct {
+	Title  string `json:"title" binding:"required"`
+	Detail string `json:"detail"`
+}
+
+// CreateUserTaskResponse is returned by POST /workspaces/{id}/user-tasks.
+type CreateUserTaskResponse struct {
+	UserTaskID string `json:"user_task_id"`
+	Status     string `json:"status"`
+}
+
+// ResolveUserTaskRequest is the body of
+// POST /workspaces/{id}/user-tasks/{taskId}/resolve.
+type ResolveUserTaskRequest struct {
+	Status     string `json:"status" binding:"required" enums:"done,dismissed"`
+	ResolvedBy string `json:"resolved_by"`
+}
+
+// ResolveUserTaskResponse is returned by the resolve endpoint.
+type ResolveUserTaskResponse struct {
+	Status     string `json:"status"`
+	UserTaskID string `json:"user_task_id"`
+}
+
+// UpdateUserTaskRequest is the body of
+// PATCH /workspaces/{id}/user-tasks/{taskId}. All fields are optional;
+// only provided keys are updated (COALESCE).
+type UpdateUserTaskRequest struct {
+	Title  *string `json:"title"`
+	Detail *string `json:"detail"`
+	Status *string `json:"status" enums:"pending,done,dismissed"`
+}
+
+// UserTaskMutationResponse is the {status, user_task_id} echo returned by
+// the update and delete endpoints.
+type UserTaskMutationResponse struct {
+	Status     string `json:"status"`
+	UserTaskID string `json:"user_task_id"`
+}
+
+// UserTask is a single ask a workspace raised, as returned by
+// GET /workspaces/{id}/user-tasks. detail/resolved_at/resolved_by are
+// null until the task is resolved.
+type UserTask struct {
+	ID         string  `json:"id"`
+	Title      string  `json:"title"`
+	Detail     *string `json:"detail"`
+	Status     string  `json:"status" enums:"pending,done,dismissed"`
+	CreatedAt  string  `json:"created_at"`
+	ResolvedAt *string `json:"resolved_at"`
+	ResolvedBy *string `json:"resolved_by"`
+}
+
+// PendingUserTask is one row of the cross-workspace pending list returned by
+// GET /user-tasks/pending (joined with the workspace name).
+type PendingUserTask struct {
+	ID            string  `json:"id"`
+	WorkspaceID   string  `json:"workspace_id"`
+	WorkspaceName string  `json:"workspace_name"`
+	Title         string  `json:"title"`
+	Detail        *string `json:"detail"`
+	Status        string  `json:"status" enums:"pending"`
+	CreatedAt     string  `json:"created_at"`
+}
+
 func NewUserTasksHandler(b *events.Broadcaster) *UserTasksHandler {
 	return &UserTasksHandler{broadcaster: b}
 }
 
 // Create handles POST /workspaces/:id/user-tasks — an agent raises an ask.
+//
+//	@Summary	Raise a user task
+//	@Tags		user-tasks
+//	@Accept		json
+//	@Produce	json
+//	@Param		id		path		string					true	"Workspace ID"
+//	@Param		body	body		CreateUserTaskRequest	true	"Task fields"
+//	@Success	201		{object}	CreateUserTaskResponse
+//	@Failure	400		{object}	ErrorResponse
+//	@Failure	500		{object}	ErrorResponse
+//	@Router		/workspaces/{id}/user-tasks [post]
+//	@Security	BearerAuth && OrgSlugAuth
 func (h *UserTasksHandler) Create(c *gin.Context) {
 	workspaceID := c.Param("id")
 	ctx := c.Request.Context()
@@ -64,6 +144,14 @@ func (h *UserTasksHandler) Create(c *gin.Context) {
 
 // ListAll handles GET /user-tasks/pending — all pending asks across the org
 // (for the concierge Tasks tab). Cross-workspace, so AdminAuth-gated.
+//
+//	@Summary	List pending user tasks across all workspaces
+//	@Tags		user-tasks
+//	@Produce	json
+//	@Success	200	{array}		PendingUserTask
+//	@Failure	500	{object}	ErrorResponse
+//	@Router		/user-tasks/pending [get]
+//	@Security	BearerAuth
 func (h *UserTasksHandler) ListAll(c *gin.Context) {
 	ctx := c.Request.Context()
 
@@ -107,6 +195,20 @@ func (h *UserTasksHandler) ListAll(c *gin.Context) {
 
 // Resolve handles POST /workspaces/:id/user-tasks/:taskId/resolve — the user
 // marks an ask done or dismissed.
+//
+//	@Summary	Resolve a user task
+//	@Tags		user-tasks
+//	@Accept		json
+//	@Produce	json
+//	@Param		id		path		string					true	"Workspace ID"
+//	@Param		taskId	path		string					true	"User task ID"
+//	@Param		body	body		ResolveUserTaskRequest	true	"Resolution"
+//	@Success	200		{object}	ResolveUserTaskResponse
+//	@Failure	400		{object}	ErrorResponse
+//	@Failure	404		{object}	ErrorResponse
+//	@Failure	500		{object}	ErrorResponse
+//	@Router		/workspaces/{id}/user-tasks/{taskId}/resolve [post]
+//	@Security	BearerAuth && OrgSlugAuth
 func (h *UserTasksHandler) Resolve(c *gin.Context) {
 	workspaceID := c.Param("id")
 	taskID := c.Param("taskId")
@@ -165,6 +267,15 @@ func (h *UserTasksHandler) Resolve(c *gin.Context) {
 
 // List handles GET /workspaces/:id/user-tasks — the asks a workspace itself
 // raised (any status). Lets an agent read back its own created tasks.
+//
+//	@Summary	List a workspace's own user tasks
+//	@Tags		user-tasks
+//	@Produce	json
+//	@Param		id	path		string	true	"Workspace ID"
+//	@Success	200	{array}		UserTask
+//	@Failure	500	{object}	ErrorResponse
+//	@Router		/workspaces/{id}/user-tasks [get]
+//	@Security	BearerAuth && OrgSlugAuth
 func (h *UserTasksHandler) List(c *gin.Context) {
 	workspaceID := c.Param("id")
 	ctx := c.Request.Context()
@@ -207,6 +318,20 @@ func (h *UserTasksHandler) List(c *gin.Context) {
 // Update handles PATCH /workspaces/:id/user-tasks/:taskId — a workspace edits
 // its own ask (title / detail / status). The workspace_id scope means an
 // agent can only touch tasks it raised. Fields are optional (COALESCE).
+//
+//	@Summary	Update a workspace's own user task
+//	@Tags		user-tasks
+//	@Accept		json
+//	@Produce	json
+//	@Param		id		path		string					true	"Workspace ID"
+//	@Param		taskId	path		string					true	"User task ID"
+//	@Param		body	body		UpdateUserTaskRequest	true	"Partial task fields (only provided keys are updated)"
+//	@Success	200		{object}	UserTaskMutationResponse
+//	@Failure	400		{object}	ErrorResponse
+//	@Failure	404		{object}	ErrorResponse
+//	@Failure	500		{object}	ErrorResponse
+//	@Router		/workspaces/{id}/user-tasks/{taskId} [patch]
+//	@Security	BearerAuth && OrgSlugAuth
 func (h *UserTasksHandler) Update(c *gin.Context) {
 	workspaceID := c.Param("id")
 	taskID := c.Param("taskId")
@@ -254,6 +379,17 @@ func (h *UserTasksHandler) Update(c *gin.Context) {
 // Delete handles DELETE /workspaces/:id/user-tasks/:taskId — a workspace
 // removes its own ask. Scoped by workspace_id so agents can only delete
 // tasks they raised.
+//
+//	@Summary	Delete a workspace's own user task
+//	@Tags		user-tasks
+//	@Produce	json
+//	@Param		id		path		string	true	"Workspace ID"
+//	@Param		taskId	path		string	true	"User task ID"
+//	@Success	200		{object}	UserTaskMutationResponse
+//	@Failure	404		{object}	ErrorResponse
+//	@Failure	500		{object}	ErrorResponse
+//	@Router		/workspaces/{id}/user-tasks/{taskId} [delete]
+//	@Security	BearerAuth && OrgSlugAuth
 func (h *UserTasksHandler) Delete(c *gin.Context) {
 	workspaceID := c.Param("id")
 	taskID := c.Param("taskId")
