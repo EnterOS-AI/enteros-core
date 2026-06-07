@@ -783,7 +783,7 @@ def list_queued_issues() -> list[dict]:
         query={
             "state": "open",
             "type": "pulls",
-            "labels": QUEUE_LABEL,
+            "label": QUEUE_LABEL,
         },
     )
 
