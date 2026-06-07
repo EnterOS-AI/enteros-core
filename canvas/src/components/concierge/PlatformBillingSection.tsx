@@ -85,7 +85,6 @@ export function PlatformBillingSection({ platformId }: Props) {
   // Billing-mode resolution (defaults to platform-managed until the read
   // resolves; a 404 keeps us on this default).
   const [resolution, setResolution] = useState<BillingModeResolution | null>(null);
-  const [choice, setChoice] = useState<Choice>("platform_managed");
 
   // Registry catalog source — the platform agent's runtime + the /templates
   // rows it indexes into.
@@ -115,8 +114,6 @@ export function PlatformBillingSection({ platformId }: Props) {
       .then((r) => {
         if (cancelled || !r) return;
         setResolution(r);
-        if (r.workspace_override === "byok") setChoice("byok");
-        else setChoice("platform_managed");
       })
       .catch(() => {
         // No billing endpoint / not reachable — keep platform-managed default.
@@ -245,37 +242,15 @@ export function PlatformBillingSection({ platformId }: Props) {
       mode,
     });
 
-  const selectPlatformManaged = async () => {
-    setChoice("platform_managed");
-    setError(null);
-    setOk(null);
-    if (resolution?.workspace_override === "byok") {
-      setSaving(true);
-      try {
-        await setMode("platform_managed");
-        showToast("Switched to platform-managed billing", "success");
-        setOk("Platform-managed. LLM usage is billed to org credits.");
-        loadBilling();
-      } catch (e) {
-        setError(e instanceof Error ? e.message : "Failed to switch billing mode");
-      } finally {
-        setSaving(false);
-      }
-    }
-  };
-
-  const selectByok = () => {
-    setChoice("byok");
-    setError(null);
-    setOk(null);
-  };
-
-  // Whether the chosen provider is platform-managed (no key, effectively
-  // platform_managed billing) vs a BYOK provider (needs a per-provider key).
+  // Whether the chosen provider is platform-managed (no key, billed to org
+  // credits via the proxy) vs a BYOK provider (needs a per-provider key + the
+  // proxy stops metering). This single derivation — not a separate radio —
+  // drives the whole card: the user picks "Platform" in the dropdown for
+  // managed billing, or any other provider to bring their own key.
   const providerIsPlatformManaged = isPlatformManagedProvider(selectedProvider);
   const requiredEnv = selectedProvider?.envVars[0] ?? "";
 
-  const saveByok = async () => {
+  const save = async () => {
     if (!selectedProvider) {
       setError("Pick a provider and model first");
       return;
@@ -347,126 +322,82 @@ export function PlatformBillingSection({ platformId }: Props) {
       <div className={s.scardHead}>
         <div className={s.scardTitle}>LLM billing — platform agent</div>
         <div className={s.scardDesc}>
-          Choose how the org concierge (platform agent) pays for model usage.
-          Current resolved mode: <strong>{currentMode}</strong>.
+          Pick the provider + model the org concierge runs on. Choose{" "}
+          <strong>Platform</strong> to meter through the Molecule proxy on your
+          org credits (the default), or any other provider to bring your own
+          key. Current resolved mode: <strong>{currentMode}</strong>.
         </div>
       </div>
 
-      <div className={s.optList}>
-        <label
-          className={`${s.opt} ${choice === "platform_managed" ? s.optActive : ""}`}
-        >
-          <input
-            type="radio"
-            name="platform-billing"
-            checked={choice === "platform_managed"}
-            onChange={() => void selectPlatformManaged()}
-            disabled={saving}
-            style={{ position: "absolute", opacity: 0, pointerEvents: "none" }}
-          />
-          <span className={s.optRadio} aria-hidden="true" />
-          <span className={s.optBody}>
-            <span className={s.optTitle}>
-              Platform-managed
-              <span className={`${s.optTag} ${s.optTagCur}`}>default</span>
-            </span>
-            <span className={s.optDesc}>
-              Metered through the Molecule proxy and billed to your org
-              credits. No key required — recommended for most orgs.
-            </span>
-          </span>
-        </label>
-
-        <label className={`${s.opt} ${choice === "byok" ? s.optActive : ""}`}>
-          <input
-            type="radio"
-            name="platform-billing"
-            checked={choice === "byok"}
-            onChange={selectByok}
-            disabled={saving}
-            style={{ position: "absolute", opacity: 0, pointerEvents: "none" }}
-          />
-          <span className={s.optRadio} aria-hidden="true" />
-          <span className={s.optBody}>
-            <span className={s.optTitle}>Use my own provider / key (BYOK)</span>
-            <span className={s.optDesc}>
-              Pick any provider + model the registry offers (Anthropic,
-              MiniMax, Kimi, GLM, DeepSeek, …) and supply that provider&apos;s
-              key. LLM traffic goes directly to your provider and is billed to
-              your account.
-            </span>
-          </span>
-        </label>
-      </div>
-
-      {choice === "byok" && (
-        <div className={s.keyRow}>
-          {catalog.length === 0 ? (
-            <div className={s.keyNote}>
-              No provider catalog available yet (the registry endpoint did not
-              respond). Provider/model selection will appear once the backend is
-              reachable.
-            </div>
-          ) : (
-            <>
-              <ProviderModelSelector
-                models={llmModels}
-                catalog={registryBacked ? catalog : undefined}
-                value={llmSelection}
-                onChange={(next) => {
-                  setLLMSelection(next);
-                  setApiKey("");
-                }}
-                idPrefix="platform-billing-llm"
-                variant="stack"
-                allowCustomModelEscape
-              />
-              {providerIsPlatformManaged ? (
-                <div className={s.keyNote}>
-                  Platform-managed provider — no API key required. The
-                  credential is injected by the platform; saving sets the model
-                  and keeps billing on org credits.
-                </div>
-              ) : (
-                requiredEnv && (
-                  <>
-                    <label className={s.keyLabel} htmlFor="byok-provider-key">
-                      {requiredEnv}
-                    </label>
-                    <div className={s.keyInputRow}>
-                      <input
-                        id="byok-provider-key"
-                        type="password"
-                        className={s.keyInput}
-                        placeholder="paste key…"
-                        value={apiKey}
-                        autoComplete="off"
-                        onChange={(e) => setApiKey(e.target.value)}
-                        disabled={saving}
-                      />
-                    </div>
-                    <div className={s.keyNote}>
-                      Stored encrypted as a workspace secret (
-                      <code>{requiredEnv}</code>) and never exposed to the
-                      browser. Restart the platform agent to apply.
-                    </div>
-                  </>
-                )
-              )}
-              <div className={s.keyInputRow}>
-                <button
-                  type="button"
-                  className={`${s.btn} ${s.primary}`}
-                  disabled={saveDisabled}
-                  onClick={() => void saveByok()}
-                >
-                  {saving ? "Saving…" : "Save provider"}
-                </button>
+      <div className={s.keyRow}>
+        {catalog.length === 0 ? (
+          <div className={s.keyNote}>
+            No provider catalog available yet (the registry endpoint did not
+            respond). Provider/model selection will appear once the backend is
+            reachable.
+          </div>
+        ) : (
+          <>
+            <ProviderModelSelector
+              models={llmModels}
+              catalog={registryBacked ? catalog : undefined}
+              value={llmSelection}
+              onChange={(next) => {
+                setLLMSelection(next);
+                setApiKey("");
+                setError(null);
+                setOk(null);
+              }}
+              idPrefix="platform-billing-llm"
+              variant="stack"
+              allowCustomModelEscape
+            />
+            {providerIsPlatformManaged ? (
+              <div className={s.keyNote}>
+                Platform-managed — metered through the Molecule proxy and billed
+                to your org credits. No API key required; the credential is
+                injected by the platform.
               </div>
-            </>
-          )}
-        </div>
-      )}
+            ) : (
+              requiredEnv && (
+                <>
+                  <label className={s.keyLabel} htmlFor="byok-provider-key">
+                    {requiredEnv}
+                  </label>
+                  <div className={s.keyInputRow}>
+                    <input
+                      id="byok-provider-key"
+                      type="password"
+                      className={s.keyInput}
+                      placeholder="paste key…"
+                      value={apiKey}
+                      autoComplete="off"
+                      onChange={(e) => setApiKey(e.target.value)}
+                      disabled={saving}
+                    />
+                  </div>
+                  <div className={s.keyNote}>
+                    BYOK — LLM traffic goes directly to your provider and is
+                    billed to your account. Stored encrypted as a workspace
+                    secret (<code>{requiredEnv}</code>) and never exposed to the
+                    browser. Restart the platform agent to apply.
+                  </div>
+                </>
+              )
+            )}
+            <div className={s.keyInputRow}>
+              <button
+                type="button"
+                className={`${s.btn} ${s.primary}`}
+                disabled={saveDisabled}
+                onClick={() => void save()}
+              >
+                {saving ? "Saving…" : "Save"}
+              </button>
+            </div>
+          </>
+        )}
+      </div>
 
       {error && <div className={`${s.sMsg} ${s.sMsgErr}`}>{error}</div>}
       {ok && <div className={`${s.sMsg} ${s.sMsgOk}`}>{ok}</div>}

@@ -10,17 +10,29 @@ import {
 import { PlatformBillingSection } from "../PlatformBillingSection";
 
 // Tests for PlatformBillingSection (concierge Settings — SSOT provider+model
-// BYOK opt-in for the platform agent). Locks in the rebuilt contract:
+// BYOK for the platform agent). Locks in the rebuilt contract:
 //  - reads GET /admin/workspaces/:id/llm-billing-mode + /workspaces/:id +
 //    /workspaces/:id/model + /templates on mount
+//  - there are NO mode radios: the provider DROPDOWN drives everything —
+//    picking "Platform" = platform-managed (no key), any other provider = BYOK.
+//    Pre-selects the platform provider by default (platform-managed).
 //  - defaults to platform-managed when the billing read fails (no endpoint)
-//  - the BYOK provider/model dropdown is SSOT-driven (registry_providers/
+//  - the provider/model dropdown is SSOT-driven (registry_providers/
 //    registry_models from /templates) — NOT hardcoded to Anthropic
 //  - the key field is labelled with the SELECTED provider's required_env
 //    (MINIMAX_API_KEY for MiniMax, ANTHROPIC_API_KEY for Anthropic, …)
 //  - saving sets model (PUT /model), forces the provider (MODEL_PROVIDER
 //    secret), writes the per-provider key secret, then flips billing-mode
-//  - switching back to platform-managed PUTs {mode: "platform_managed"}
+//  - selecting "Platform" + Save PUTs {mode: "platform_managed"}
+
+// Pick the registry provider whose option label matches `re`, in a
+// ProviderModelSelector <select data-testid="provider-select">.
+function selectProvider(providerSelect: HTMLElement, re: RegExp) {
+  const opt = Array.from(providerSelect.querySelectorAll("option")).find((o) =>
+    re.test(o.textContent ?? ""),
+  ) as HTMLOptionElement;
+  fireEvent.change(providerSelect, { target: { value: opt.value } });
+}
 
 const apiGet = vi.fn();
 const apiPut = vi.fn();
@@ -96,7 +108,7 @@ afterEach(() => {
 });
 
 describe("PlatformBillingSection — SSOT provider+model BYOK", () => {
-  it("reads billing mode on mount and defaults to platform-managed", async () => {
+  it("reads billing mode on mount and defaults to platform-managed (no key field, no radios)", async () => {
     mockGets();
 
     render(<PlatformBillingSection platformId="plat-1" />);
@@ -107,11 +119,13 @@ describe("PlatformBillingSection — SSOT provider+model BYOK", () => {
       );
     });
 
-    const platformRadio = screen.getByRole("radio", {
-      name: /platform-managed/i,
-    }) as HTMLInputElement;
-    expect(platformRadio.checked).toBe(true);
-    // No key field shown until BYOK is chosen.
+    // No mode radios at all — the dropdown drives the mode.
+    expect(screen.queryByRole("radio")).toBeNull();
+    // The platform provider is pre-selected → platform-managed note shown,
+    // and no per-provider key field.
+    expect(
+      await screen.findByText(/metered through the Molecule proxy/i),
+    ).toBeTruthy();
     expect(screen.queryByLabelText(/API_KEY/)).toBeNull();
   });
 
@@ -129,22 +143,23 @@ describe("PlatformBillingSection — SSOT provider+model BYOK", () => {
 
     await waitFor(() => expect(apiGet).toHaveBeenCalled());
 
-    const platformRadio = screen.getByRole("radio", {
-      name: /platform-managed/i,
-    }) as HTMLInputElement;
-    expect(platformRadio.checked).toBe(true);
+    // Catalog still loads from /templates → platform provider pre-selected →
+    // platform-managed note, no key field.
+    expect(
+      await screen.findByText(/metered through the Molecule proxy/i),
+    ).toBeTruthy();
+    expect(screen.queryByLabelText(/API_KEY/)).toBeNull();
   });
 
-  it("BYOK provider/model dropdown is SSOT-driven (not hardcoded Anthropic)", async () => {
+  it("provider/model dropdown is SSOT-driven (not hardcoded Anthropic)", async () => {
     mockGets();
 
     render(<PlatformBillingSection platformId="plat-1" />);
     await waitFor(() => expect(apiGet).toHaveBeenCalledWith("/templates"));
 
-    fireEvent.click(screen.getByRole("radio", { name: /use my own provider/i }));
-
-    // The shared ProviderModelSelector renders with a provider <select>
-    // carrying all registry providers — proof the catalog is SSOT-driven.
+    // The shared ProviderModelSelector renders a provider <select> carrying
+    // every registry provider — proof the catalog is SSOT-driven. No radio
+    // gate: the dropdown is shown immediately.
     const providerSelect = await screen.findByTestId("provider-select");
     const labels = Array.from(providerSelect.querySelectorAll("option")).map(
       (o) => o.textContent,
@@ -160,14 +175,8 @@ describe("PlatformBillingSection — SSOT provider+model BYOK", () => {
     render(<PlatformBillingSection platformId="plat-1" />);
     await waitFor(() => expect(apiGet).toHaveBeenCalledWith("/templates"));
 
-    fireEvent.click(screen.getByRole("radio", { name: /use my own provider/i }));
-
     const providerSelect = await screen.findByTestId("provider-select");
-    // Pick the MiniMax provider.
-    const minimaxOption = Array.from(
-      providerSelect.querySelectorAll("option"),
-    ).find((o) => /MiniMax/.test(o.textContent ?? ""))! as HTMLOptionElement;
-    fireEvent.change(providerSelect, { target: { value: minimaxOption.value } });
+    selectProvider(providerSelect, /MiniMax/);
 
     // Key field is labelled MINIMAX_API_KEY — driven by required_env, not
     // hardcoded to ANTHROPIC_API_KEY.
@@ -175,20 +184,15 @@ describe("PlatformBillingSection — SSOT provider+model BYOK", () => {
     expect(screen.queryByLabelText("ANTHROPIC_API_KEY")).toBeNull();
   });
 
-  it("saving BYOK sets model, MODEL_PROVIDER secret, the key secret, then flips billing-mode", async () => {
+  it("saving a BYOK provider sets model, MODEL_PROVIDER secret, the key secret, then flips billing-mode", async () => {
     mockGets();
     apiPut.mockResolvedValue({});
 
     render(<PlatformBillingSection platformId="plat-1" />);
     await waitFor(() => expect(apiGet).toHaveBeenCalledWith("/templates"));
 
-    fireEvent.click(screen.getByRole("radio", { name: /use my own provider/i }));
-
     const providerSelect = await screen.findByTestId("provider-select");
-    const minimaxOption = Array.from(
-      providerSelect.querySelectorAll("option"),
-    ).find((o) => /MiniMax/.test(o.textContent ?? ""))! as HTMLOptionElement;
-    fireEvent.change(providerSelect, { target: { value: minimaxOption.value } });
+    selectProvider(providerSelect, /MiniMax/);
 
     // Pick the MiniMax model.
     const modelSelect = await screen.findByTestId("model-select");
@@ -197,7 +201,7 @@ describe("PlatformBillingSection — SSOT provider+model BYOK", () => {
     const keyInput = await screen.findByLabelText("MINIMAX_API_KEY");
     fireEvent.change(keyInput, { target: { value: "mm-test-key" } });
 
-    fireEvent.click(screen.getByRole("button", { name: /save provider/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
 
     await waitFor(() => {
       expect(apiPut).toHaveBeenCalledWith("/workspaces/plat-1/model", {
@@ -218,20 +222,21 @@ describe("PlatformBillingSection — SSOT provider+model BYOK", () => {
     });
   });
 
-  it("switching back to platform-managed from byok PUTs {mode: platform_managed}", async () => {
-    mockGets({ billingOverride: "byok" });
+  it("selecting Platform + Save flips billing-mode back to platform_managed", async () => {
+    // Agent starts on byok (MiniMax) so the dropdown pre-selects MiniMax.
+    mockGets({ billingOverride: "byok", model: "MiniMax-M2.7" });
     apiPut.mockResolvedValue({});
 
     render(<PlatformBillingSection platformId="plat-1" />);
 
-    await waitFor(() => {
-      const byokRadio = screen.getByRole("radio", {
-        name: /use my own provider/i,
-      }) as HTMLInputElement;
-      expect(byokRadio.checked).toBe(true);
-    });
+    // Pre-selected to the BYOK MiniMax provider → key field present.
+    const providerSelect = await screen.findByTestId("provider-select");
+    await screen.findByLabelText("MINIMAX_API_KEY");
 
-    fireEvent.click(screen.getByRole("radio", { name: /platform-managed/i }));
+    // Switch to the Platform (platform-managed) provider and save.
+    selectProvider(providerSelect, /Platform/);
+    await screen.findByText(/metered through the Molecule proxy/i);
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
 
     await waitFor(() => {
       expect(apiPut).toHaveBeenCalledWith(
