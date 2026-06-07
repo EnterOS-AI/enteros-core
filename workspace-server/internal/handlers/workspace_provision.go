@@ -20,6 +20,15 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// instanceIDPersistRetryAttempts caps total instance_id UPDATE attempts
+// (initial + retries). 3 catches transient DB blips without stalling the
+// provision goroutine past the context timeout.
+var instanceIDPersistRetryAttempts = 3
+
+// instanceIDPersistRetryBaseDelay is the first-retry backoff. Doubles each
+// attempt: 100ms → 200ms → 400ms. Total stall ≤ 700ms.
+var instanceIDPersistRetryBaseDelay = 100 * time.Millisecond
+
 // logProvisionPanic is the deferred recover at the top of every provision
 // goroutine. Without it, a panic inside provisionWorkspaceOpts /
 // provisionWorkspaceCP propagates up the goroutine stack and crashes the
@@ -1458,13 +1467,38 @@ func (h *WorkspaceHandler) provisionWorkspaceCP(workspaceID, templatePath string
 	// Persist the backing instance id so later operations (terminal via
 	// EIC+SSH, live logs, debug introspection) can resolve workspace → EC2
 	// without re-asking CP on every request.
-	if _, err := db.DB.ExecContext(ctx,
-		`UPDATE workspaces SET instance_id = $2, updated_at = now() WHERE id = $1`,
-		workspaceID, machineID); err != nil {
-		// Non-fatal: provisioning succeeded, the workspace will still run.
-		// The row stays without instance_id — terminal falls back to the
-		// "CP-provisioned but unreachable" error, not a silent failure.
-		log.Printf("CPProvisioner: persist instance_id failed for %s: %v", workspaceID, err)
+	//
+	// Bounded retry with exponential backoff: a transient DB blip must not
+	// orphan a healthy running instance. If all retries fail, mark the
+	// workspace failed and record the instance_id in the broadcast event +
+	// last_sample_error so an operator/reaper can reconcile later. The live
+	// EC2 is NOT terminated — it may contain valuable state. (#1)
+	var persistErr error
+	delay := instanceIDPersistRetryBaseDelay
+	for attempt := 1; attempt <= instanceIDPersistRetryAttempts; attempt++ {
+		_, persistErr = db.DB.ExecContext(ctx,
+			`UPDATE workspaces SET instance_id = $2, updated_at = now() WHERE id = $1`,
+			workspaceID, machineID)
+		if persistErr == nil {
+			if attempt > 1 {
+				log.Printf("CPProvisioner: instance_id persist for %s succeeded on attempt %d", workspaceID, attempt)
+			}
+			break
+		}
+		if attempt < instanceIDPersistRetryAttempts {
+			time.Sleep(delay)
+			delay *= 2
+		}
+	}
+	if persistErr != nil {
+		log.Printf("CPProvisioner: CRITICAL persist instance_id failed for %s after %d attempts: %v — EC2 instance %s is RUNNING but UNTRACKED. Operator must manually reconcile or remove the workspace to trigger orphan cleanup.", workspaceID, instanceIDPersistRetryAttempts, persistErr, machineID)
+		// Server-only log already captures the raw error above; broadcast gets
+		// safe fields only (no client-visible DB error). Security: RC 9378.
+		h.markProvisionFailed(ctx, workspaceID, "instance_id persist failed after retry — EC2 untracked", map[string]interface{}{
+			"instance_id": machineID,
+			"attempts":    instanceIDPersistRetryAttempts,
+		})
+		return
 	}
 
 	log.Printf("CPProvisioner: workspace %s started as machine %s via control plane", workspaceID, machineID)
