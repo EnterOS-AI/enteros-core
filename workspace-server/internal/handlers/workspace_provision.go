@@ -14,6 +14,7 @@ import (
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/memory/contract"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/providers"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wsauth"
 	"gopkg.in/yaml.v3"
