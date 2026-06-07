@@ -55,11 +55,16 @@ env:
 
 jobs:
   # ===========================================================================
-  # REQUIRED gate — stub runtime, fast.
-  # bp-exempt: new lane; NOT yet wired into branch protection. Wire it in once the
-  #   operator confirms the docker-host runners reliably provision sibling
-  #   containers from the host platform binary for this lane (see SUBSTRATE
-  #   REQUIREMENT above). Until then it runs informationally on every push/PR.
+  # REQUIRED gate — stub runtime, fast. This IS meant to be a required merge gate
+  # (the only mandatory coverage for the LOCAL Docker provisioner), but the new
+  # context is not yet in branch_protections/main — wire it in once the operator
+  # confirms the docker-host runners reliably provision sibling containers from
+  # the host platform binary for this lane (see SUBSTRATE REQUIREMENT above), then
+  # flip the directive below to `# bp-required: yes`. Until then it runs gating
+  # locally (continue-on-error: false) but un-wired in BP, an acknowledged
+  # asymmetry tracked for follow-up. (Earlier this block read `# bp-exempt`, which
+  # contradicted "REQUIRED gate" and tripped lint-required-context-exists-in-bp.)
+  # bp-required: pending #2409
   # ===========================================================================
   lifecycle-stub:
     name: Local Provision Lifecycle E2E (stub)
@@ -136,6 +141,35 @@ jobs:
         working-directory: workspace-server
         run: go build -o platform-server ./cmd/server
 
+      - name: Kill stale platform-server before start (issue #1046)
+        run: |
+          # ROOT CAUSE of the stub-gate red on docker-host: both this gating job
+          # and the advisory lifecycle-real job bind the SAME fixed host port
+          # :8080 (PORT=8080 ./platform-server). On the small docker-host runner
+          # pool a prior cancelled/timeout run can leave a zombie platform-server
+          # on :8080 (a cancelled run never reaches "Stop platform"), and — until
+          # lifecycle-real was serialised behind this job via needs: — the two
+          # jobs could also co-schedule on one runner and contend for :8080. A
+          # second bind on :8080 is FATAL (the server exits), so "Wait for
+          # /health" times out at 300s and this REQUIRED gate reds. Free the port
+          # before binding — mirrors the e2e-api.yml #1046 fix for the identical
+          # fixed-port-on-shared-runner class.
+          #
+          # /proc scan — works on any Linux without pkill/lsof/ss. comm is
+          # truncated to 15 chars: "platform-serve" matches "platform-server".
+          # Verify via cmdline to avoid false positives.
+          killed=0
+          for pid in $(grep -l "platform-serve" /proc/[0-9]*/comm 2>/dev/null); do
+            kpid="${pid%/comm}"; kpid="${kpid##*/}"
+            cmdline=$(cat "/proc/${kpid}/cmdline" 2>/dev/null | tr '\0' ' ')
+            if echo "$cmdline" | grep -q "platform-server"; then
+              echo "Killing stale platform-server pid ${kpid}: ${cmdline}"
+              kill "$kpid" 2>/dev/null || true
+              killed=$((killed + 1))
+            fi
+          done
+          if [ "$killed" -gt 0 ]; then sleep 2; echo "Killed $killed stale process(es); :8080 released."; else echo "No stale platform-server found."; fi
+
       - name: Start platform (background)
         working-directory: workspace-server
         run: |
@@ -179,17 +213,29 @@ jobs:
           docker rm -f "$REDIS_CONTAINER" 2>/dev/null || true
 
   # ===========================================================================
-  # ADVISORY — real claude-code image, lifecycle-only. Non-blocking.
-  # bp-exempt: advisory lane (continue-on-error). Never a merge gate; it pulls/
-  #   builds the 2.5GB template image, makes a real (cheap) MiniMax LLM call, and
-  #   is network-dependent, so a miss must not block. It proves the REAL runtime
-  #   survives a restart AND serves a genuine LLM round-trip on the local
-  #   provisioner (proxy-reach asserts a real MiniMax reply, not just reachability).
+  # ADVISORY — real claude-code image, lifecycle-only. Non-blocking. It pulls/
+  # builds the 2.5GB template image, makes a real (cheap) MiniMax LLM call, and is
+  # network-dependent, so a miss must not block. It proves the REAL runtime
+  # survives a restart AND serves a genuine LLM round-trip on the local
+  # provisioner (proxy-reach asserts a real MiniMax reply, not just reachability).
   # ===========================================================================
+  # bp-exempt: advisory lane (continue-on-error: true) — informational, never a merge gate.
   lifecycle-real:
     name: Local Provision Lifecycle E2E (real image + MiniMax LLM, advisory)
     runs-on: docker-host
-    continue-on-error: true
+    # Serialise behind the gating stub job: both jobs bind the SAME fixed host
+    # port :8080, so co-scheduling them on one docker-host runner makes the
+    # second platform-server fail to bind (fatal) and reds whichever lost the
+    # race. `needs:` forces this advisory job to start only AFTER lifecycle-stub
+    # finishes, so they never contend for :8080. continue-on-error keeps a real-
+    # job miss non-blocking; `needs:` does NOT gate on the stub's success (a
+    # failed required gate still lets this advisory dependent run).
+    needs: lifecycle-stub
+    if: ${{ always() }}
+    # Tracker for lint-continue-on-error-tracking (Tier 2e / internal#350): this
+    # mask has a forced 14-day renewal cycle. mc#2408 tracks promoting this
+    # advisory MiniMax round-trip to a gating job (then flip to false).
+    continue-on-error: true  # mc#2408 — promote advisory MiniMax e2e to gating
     timeout-minutes: 30
     env:
       PG_CONTAINER: pg-lpe2e-real-${{ github.run_id }}-${{ github.run_attempt }}
@@ -249,6 +295,22 @@ jobs:
       - name: Build platform
         working-directory: workspace-server
         run: go build -o platform-server ./cmd/server
+
+      - name: Kill stale platform-server before start (issue #1046)
+        run: |
+          # Same fixed-:8080 hygiene as the stub job — free the port from any
+          # zombie left by a cancelled run before this job binds it.
+          killed=0
+          for pid in $(grep -l "platform-serve" /proc/[0-9]*/comm 2>/dev/null); do
+            kpid="${pid%/comm}"; kpid="${kpid##*/}"
+            cmdline=$(cat "/proc/${kpid}/cmdline" 2>/dev/null | tr '\0' ' ')
+            if echo "$cmdline" | grep -q "platform-server"; then
+              echo "Killing stale platform-server pid ${kpid}: ${cmdline}"
+              kill "$kpid" 2>/dev/null || true
+              killed=$((killed + 1))
+            fi
+          done
+          if [ "$killed" -gt 0 ]; then sleep 2; echo "Killed $killed stale process(es); :8080 released."; else echo "No stale platform-server found."; fi
 
       - name: Start platform (background)
         working-directory: workspace-server
