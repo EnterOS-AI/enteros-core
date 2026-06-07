@@ -107,6 +107,36 @@ def test_required_checks_env_json_malformed_fails():
         raise AssertionError("expected SystemExit(3)")
 
 
+def test_required_checks_env_json_non_string_item_fails():
+    doc = _make_audit_doc_json({"main": ["ctx-a", 123, "ctx-b"]})
+    try:
+        drift.required_checks_env(doc, "main")
+    except SystemExit as exc:
+        assert exc.code == 3
+    else:
+        raise AssertionError("expected SystemExit(3)")
+
+
+def test_required_checks_env_json_empty_string_item_fails():
+    doc = _make_audit_doc_json({"main": ["ctx-a", "   ", "ctx-b"]})
+    try:
+        drift.required_checks_env(doc, "main")
+    except SystemExit as exc:
+        assert exc.code == 3
+    else:
+        raise AssertionError("expected SystemExit(3)")
+
+
+def test_required_checks_env_json_duplicate_context_fails():
+    doc = _make_audit_doc_json({"main": ["ctx-a", "ctx-b", "ctx-a"]})
+    try:
+        drift.required_checks_env(doc, "main")
+    except SystemExit as exc:
+        assert exc.code == 3
+    else:
+        raise AssertionError("expected SystemExit(3)")
+
+
 # ---------------------------------------------------------------------------
 # sentinel_needs
 # ---------------------------------------------------------------------------
