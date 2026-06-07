@@ -120,7 +120,7 @@ export { usePalette } from "./palette-context";
 // References the CSS variables that next/font/google emits in
 // app/layout.tsx. Falls through to system fonts if the variable is
 // undefined (e.g. in unit tests with no <body> font class).
-export const MOBILE_FONT_SANS = "var(--font-inter), 'Inter', ui-sans-serif, system-ui, sans-serif";
+export const MOBILE_FONT_SANS = "var(--font-hanken), 'Hanken Grotesk', ui-sans-serif, system-ui, sans-serif";
 export const MOBILE_FONT_MONO = "var(--font-jetbrains), 'JetBrains Mono', ui-monospace, monospace";
 
 // Status keys we surface in the mobile UI. Anything else from the
