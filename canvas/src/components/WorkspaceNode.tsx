@@ -1,7 +1,7 @@
 "use client";
 
-import { useCallback, useMemo, type KeyboardEvent } from "react";
-import { Handle, NodeResizer, Position, type NodeProps, type Node } from "@xyflow/react";
+import { useMemo, type KeyboardEvent } from "react";
+import { Handle, Position, type NodeProps, type Node } from "@xyflow/react";
 import { useCanvasStore, type WorkspaceNodeData } from "@/store/canvas";
 import { getConfigurationError, getConfigurationStatus } from "@/store/canvas-topology";
 import { showToast } from "@/components/Toaster";
@@ -21,7 +21,8 @@ function useDescendantCount(nodeId: string): number {
   return useMemo(() => countDescendants(nodeId, nodes), [nodeId, nodes]);
 }
 
-/** Boolean flag used to drive min-size and NodeResizer dimensions.
+/** Boolean flag used to drive the container's system-controlled size
+ *  (leaves render fixed-size; parents grow to fit children).
  *  Selecting `nodes` stably avoids re-render loops (same issue as
  *  useDescendantCount). */
 function useHasChildren(nodeId: string): boolean {
@@ -87,16 +88,9 @@ export function WorkspaceNode({ id, data }: NodeProps<Node<WorkspaceNodeData>>) 
 
   return (
     <>
-      {/* NodeResizer — visible only on the selected card. Lets the user
-       *  drag any edge/corner to grow or shrink the workspace, which is
-       *  useful on cards that contain nested child workspaces. */}
-      <NodeResizer
-        isVisible={isSelected}
-        minWidth={hasChildren ? 360 : 210}
-        minHeight={hasChildren ? 200 : 110}
-        lineClassName="!border-accent/40"
-        handleClassName="!w-2 !h-2 !bg-accent !border !border-accent"
-      />
+      {/* Free-resize removed (was NodeResizer). Container size + shape are now
+       *  system-controlled: leaf workspaces render at a fixed width; parent
+       *  workspaces grow to fit their nested children (store grow logic). */}
     <div
       role="button"
       tabIndex={0}
@@ -161,8 +155,10 @@ export function WorkspaceNode({ id, data }: NodeProps<Node<WorkspaceNodeData>>) 
         }
       }}
       className={`
-        group relative rounded-xl h-full w-full
-        ${hasChildren && !data.collapsed ? "min-w-[360px] min-h-[200px]" : "min-w-[210px]"}
+        group relative rounded-xl
+        ${hasChildren && !data.collapsed
+          ? "h-full w-full min-w-[360px] min-h-[200px]"
+          : "w-[240px] min-h-[130px]"}
         cursor-pointer overflow-hidden
         transition-all duration-200 ease-out
         ${isDragTarget

@@ -25,8 +25,8 @@ import {
 /**
  * Walk every parent node and bump its width/height (if explicitly set)
  * so the union of its children's relative bboxes plus padding fits. A
- * parent's size never shrinks via this path — only grows — because
- * shrinking on resize would fight the user's own NodeResizer drag.
+ * parent's size never shrinks via this path — only grows — so a parent
+ * that expanded to fit children stays expanded as their layout settles.
  */
 function growParentsToFitChildren<T extends Record<string, unknown>>(
   nodes: Node<T>[],
@@ -951,8 +951,9 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
     // response to the child near its edge, the child's relative
     // position becomes valid again and the grow stops mid-drag, only to
     // resume on the next tick. Commit-on-release: only run grow when a
-    // change set contains a `dimensions` change (NodeResizer commit),
-    // not on pure `position` changes. Drag-stop grow is handled
+    // change set contains a `dimensions` change (React Flow's auto-measure
+    // of a card's fixed-size CSS), not on pure `position` changes. Drag-stop
+    // grow is handled
     // explicitly in Canvas.onNodeDragStop via growOnce().
     const hasDimensionChange = changes.some((c) => c.type === "dimensions");
     set({ nodes: hasDimensionChange ? growParentsToFitChildren(next) : next });

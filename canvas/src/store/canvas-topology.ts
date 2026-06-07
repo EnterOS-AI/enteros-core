@@ -553,10 +553,10 @@ export function buildNodesAndEdges(
     //   - Collapsed parents: leaf-sized (header-only card).
     //   - Leaves: leaf-sized — they land in their grid slot cleanly.
     //
-    // NodeResizer still drives user-initiated growth at runtime; these
-    // are only the initial values, and React Flow updates them in place
-    // when the user drags a resize handle. A future hydrate() will
-    // reset to the default until we persist width/height server-side.
+    // Sizes are fully system-controlled (free-resize was removed): these
+    // initial values stand, and at runtime React Flow re-measures leaves
+    // from their fixed-size card CSS while parents grow to fit children
+    // (growParentsToFitChildren). Width/height are never persisted.
     const kids = childCounts.get(ws.id) ?? 0;
     if (kids > 0 && !ws.collapsed) {
       const size = parentSize.get(ws.id)!;
