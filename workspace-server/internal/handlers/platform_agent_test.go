@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -189,7 +190,9 @@ func TestOrgIdentity(t *testing.T) {
 }
 
 // stubBootProv is a minimal localProvisionerIsRunning for the boot-provision
-// helper test — no Docker daemon required.
+// helper test — no Docker daemon required. It deliberately does NOT implement
+// ExecRead, so conciergeIdentityPresent's type-assertion misses and a running
+// container is treated as already-identified (skip) — the legacy behaviour.
 type stubBootProv struct {
 	running    bool
 	calledWith string
@@ -198,6 +201,22 @@ type stubBootProv struct {
 func (s *stubBootProv) IsRunning(_ context.Context, id string) (bool, error) {
 	s.calledWith = id
 	return s.running, nil
+}
+
+// stubBootProvExec adds ExecRead so the boot helper can probe for the concierge
+// identity on a RUNNING container — the path that restarts a running-but-vanilla
+// concierge so it picks up the seeded overlay.
+type stubBootProvExec struct {
+	stubBootProv
+	systemPrompt string // returned for /configs/system-prompt.md; "" with execErr to simulate a probe miss
+	execErr      error
+}
+
+func (s *stubBootProvExec) ExecRead(_ context.Context, _ /*container*/, _ /*path*/ string) ([]byte, error) {
+	if s.execErr != nil {
+		return nil, s.execErr
+	}
+	return []byte(s.systemPrompt), nil
 }
 
 const bootPlatformID = "11111111-2222-3333-4444-555555555555"
@@ -282,4 +301,139 @@ func TestMaybeProvisionPlatformAgentOnBoot_NilGuards(t *testing.T) {
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations (should have made no queries): %v", err)
 	}
+}
+
+// TestMaybeProvisionPlatformAgentOnBoot_RestartsRunningButVanilla: a RUNNING
+// concierge whose /configs/system-prompt.md lacks the identity (a pre-overlay
+// boot) is restarted ONCE so the provision path re-seeds the concierge config.
+func TestMaybeProvisionPlatformAgentOnBoot_RestartsRunningButVanilla(t *testing.T) {
+	mock := setupTestDB(t)
+	mock.ExpectQuery(`SELECT id, status FROM workspaces WHERE kind = 'platform'`).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "status"}).AddRow(bootPlatformID, "online"))
+
+	// Running, but ExecRead of system-prompt.md returns vanilla content (no
+	// "Org Concierge") → identity absent → restart.
+	prov := &stubBootProvExec{stubBootProv: stubBootProv{running: true}, systemPrompt: "generic coding assistant"}
+	done := make(chan string, 1)
+	MaybeProvisionPlatformAgentOnBoot(context.Background(), db.DB, prov, func(id string) { done <- id })
+
+	select {
+	case got := <-done:
+		if got != bootPlatformID {
+			t.Errorf("RestartByID called with %q, want %q", got, bootPlatformID)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("RestartByID was not called for a running-but-vanilla concierge")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// TestMaybeProvisionPlatformAgentOnBoot_SkipsRunningWithIdentity: a RUNNING
+// concierge that already carries the Org-Concierge identity is left alone.
+func TestMaybeProvisionPlatformAgentOnBoot_SkipsRunningWithIdentity(t *testing.T) {
+	mock := setupTestDB(t)
+	mock.ExpectQuery(`SELECT id, status FROM workspaces WHERE kind = 'platform'`).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "status"}).AddRow(bootPlatformID, "online"))
+
+	prov := &stubBootProvExec{stubBootProv: stubBootProv{running: true}, systemPrompt: "# You are Molecule AI Agent — the Org Concierge"}
+	called := make(chan string, 1)
+	MaybeProvisionPlatformAgentOnBoot(context.Background(), db.DB, prov, func(id string) { called <- id })
+
+	select {
+	case got := <-called:
+		t.Fatalf("RestartByID should not have been called (identity present), got %q", got)
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// TestConciergeIdentityFiles asserts the overlay: a system-prompt.md carrying
+// the Org-Concierge identity, and a config.yaml that gains the platform
+// mcp_servers entry — appended idempotently onto the base config.
+func TestConciergeIdentityFiles(t *testing.T) {
+	base := []byte("name: \"Org Concierge\"\nruntime: claude-code\nmodel: \"sonnet\"\n")
+	files := conciergeIdentityFiles("Molecule AI Agent", base)
+
+	sp, ok := files["system-prompt.md"]
+	if !ok {
+		t.Fatal("overlay missing system-prompt.md")
+	}
+	for _, want := range []string{"Molecule AI Agent", "Org Concierge", "platform agent", "delegate", "approv"} {
+		if !strings.Contains(string(sp), want) {
+			t.Errorf("system-prompt.md missing %q", want)
+		}
+	}
+
+	cfg, ok := files["config.yaml"]
+	if !ok {
+		t.Fatal("overlay missing config.yaml (mcp_servers should have been appended)")
+	}
+	for _, want := range []string{"mcp_servers:", "name: platform", "command: node", "/opt/molecule-mcp-server/dist/index.js", "runtime: claude-code"} {
+		if !strings.Contains(string(cfg), want) {
+			t.Errorf("config.yaml missing %q\n--- got ---\n%s", want, cfg)
+		}
+	}
+
+	// Idempotent: re-applying onto an already-patched config does NOT add a
+	// second mcp_servers block and does NOT emit a config.yaml overlay (nothing
+	// to change), so the count of "mcp_servers:" stays exactly one.
+	files2 := conciergeIdentityFiles("Molecule AI Agent", cfg)
+	if _, present := files2["config.yaml"]; present {
+		t.Error("re-apply should NOT re-emit config.yaml when mcp_servers is already present")
+	}
+	if n := strings.Count(string(cfg), "mcp_servers:"); n != 1 {
+		t.Errorf("mcp_servers: appears %d times, want exactly 1", n)
+	}
+
+	// No base config (couldn't read one): identity still lands; no config.yaml.
+	only := conciergeIdentityFiles("Org Concierge", nil)
+	if _, present := only["system-prompt.md"]; !present {
+		t.Error("system prompt must land even with no base config")
+	}
+	if _, present := only["config.yaml"]; present {
+		t.Error("no config.yaml overlay when there is no base to append onto")
+	}
+}
+
+// TestConciergePlatformMCPEnv asserts the platform-MCP env wiring: ADMIN_TOKEN →
+// MOLECULE_API_KEY, PLATFORM_URL → MOLECULE_API_URL fallback, and that an
+// already-present value is never clobbered.
+func TestConciergePlatformMCPEnv(t *testing.T) {
+	t.Run("wires from ADMIN_TOKEN + PLATFORM_URL", func(t *testing.T) {
+		t.Setenv("ADMIN_TOKEN", "admintok")
+		t.Setenv("MOLECULE_API_URL", "")
+		t.Setenv("PLATFORM_URL", "http://platform:8080")
+		t.Setenv("MOLECULE_ORG_ID", "org-123")
+		env := map[string]string{}
+		conciergePlatformMCPEnv(env)
+		if env["MOLECULE_API_KEY"] != "admintok" {
+			t.Errorf("MOLECULE_API_KEY = %q, want admintok", env["MOLECULE_API_KEY"])
+		}
+		if env["MOLECULE_API_URL"] != "http://platform:8080" {
+			t.Errorf("MOLECULE_API_URL = %q, want platform url fallback", env["MOLECULE_API_URL"])
+		}
+		if env["MOLECULE_ORG_ID"] != "org-123" {
+			t.Errorf("MOLECULE_ORG_ID = %q, want org-123", env["MOLECULE_ORG_ID"])
+		}
+	})
+
+	t.Run("does not clobber existing values", func(t *testing.T) {
+		t.Setenv("ADMIN_TOKEN", "admintok")
+		env := map[string]string{"MOLECULE_API_KEY": "preset"}
+		conciergePlatformMCPEnv(env)
+		if env["MOLECULE_API_KEY"] != "preset" {
+			t.Errorf("MOLECULE_API_KEY overwritten to %q, want preset preserved", env["MOLECULE_API_KEY"])
+		}
+	})
+
+	t.Run("MOLECULE_API_URL prefers explicit over PLATFORM_URL", func(t *testing.T) {
+		t.Setenv("MOLECULE_API_URL", "http://explicit:9000")
+		t.Setenv("PLATFORM_URL", "http://platform:8080")
+		env := map[string]string{}
+		conciergePlatformMCPEnv(env)
+		if env["MOLECULE_API_URL"] != "http://explicit:9000" {
+			t.Errorf("MOLECULE_API_URL = %q, want the explicit env", env["MOLECULE_API_URL"])
+		}
+	})
 }
