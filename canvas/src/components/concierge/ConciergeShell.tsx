@@ -227,6 +227,10 @@ export function ConciergeShell() {
     const isRoot = depth === 0;
     const isPlatform = n.id === platformRoot?.id;
     const q = (n.data.activeTasks as number) ?? 0;
+    // Role can be a long descriptor (e.g. "Coding Executor (Kimi) — …"); render
+    // it compact (single-line, truncated by .wsRole) and surface the full text
+    // on hover via the native tooltip.
+    const roleLabel = isPlatform ? "platform" : n.data.role || "agent";
     const row = (
       <div
         role="button"
@@ -251,7 +255,7 @@ export function ConciergeShell() {
         <div className={s.wsMeta}>
           <div className={s.wsName}>{n.data.name}</div>
           <div className={s.wsSub}>
-            <span className={s.wsRole}>{isPlatform ? "platform" : n.data.role || "agent"}</span>
+            <span className={s.wsRole} title={roleLabel}>{roleLabel}</span>
             <span className={s.wsStatus} style={{ color: st.color }}>
               <span className={s.sdot} style={{ background: st.color }} />
               {st.label}
