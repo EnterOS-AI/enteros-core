@@ -134,6 +134,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._json(200, [
                     {"state": "APPROVED", "dismissed": False, "user": {"login": "core-devops"}, "commit_id": "deadbeef0000111122223333444455556666"},
                 ])
+            if sc == "T23_missing_commit_id":
+                # APPROVED review with NO commit_id field — the SEV-1
+                # internal#812 / closed-#843 spoof-bug signature. The
+                # fail-closed SSOT must REJECT (not silently accept as
+                # "older Gitea row" the way the old pre-fix code did).
+                return self._json(200, [
+                    {"state": "APPROVED", "official": True, "dismissed": False, "user": {"login": "core-devops"}},
+                ])
             # Default: one non-author APPROVED (current head, official)
             return self._json(200, [
                 {"state": "APPROVED", "dismissed": False, "official": True, "user": {"login": "core-devops"}, "commit_id": "deadbeef0000111122223333444455556666"},

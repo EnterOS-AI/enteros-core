@@ -25,6 +25,11 @@
 #   T20 — ai-sop-ack APPROVED review excluded from security-review gate
 #   T21 — stale-head APPROVED review → exit 1 (commit_id mismatch)
 #   T22 — missing/non-official APPROVED review → exit 1 (official != true)
+#   T23 — missing-commit_id APPROVED review → exit 1 (SEV-1 internal#812
+#         fail-closed contract: a missing/empty commit_id is REJECTED, not
+#         silently accepted as "older Gitea row" the way the pre-fix
+#         gitea-merge-queue.py did. Closes the spoof-bug surface that
+#         #843 had.)
 #
 # Hostile-self-review (per feedback_assert_exact_not_substring):
 # this test MUST FAIL if the script is absent. Verified by running
@@ -426,6 +431,22 @@ T22_OUT=$(run_review_check "T22_missing_official")
 T22_RC=$(cat "$FIX_STATE_DIR/last_rc")
 assert_eq "T22 exit code 1 (missing official rejected)" "1" "$T22_RC"
 assert_contains "T22 no candidates error" "no candidates from reviews API or issue comments" "$T22_OUT"
+
+# T23 — missing-commit_id APPROVED review must be rejected.
+# SEV-1 internal#812 (supersedes closed internal#843). A review with NO
+# commit_id field is the spoof-bug signature: a real reviewer cannot
+# have submitted against a commit that doesn't exist. The fail-closed
+# SSOT must REJECT — the pre-fix gitea-merge-queue.py silently accepted
+# these (the "older Gitea row" escape hatch), which is the exact surface
+# that closed #843 had. The Python unit tests in
+# test_approval_validator.py cover the predicate at the unit level;
+# this T23 covers the bash + jq pipeline end-to-end.
+echo
+echo "== T23 missing commit_id APPROVED review rejected (SEV-1 fail-closed) =="
+T23_OUT=$(run_review_check "T23_missing_commit_id")
+T23_RC=$(cat "$FIX_STATE_DIR/last_rc")
+assert_eq "T23 exit code 1 (missing commit_id rejected)" "1" "$T23_RC"
+assert_contains "T23 no candidates error" "no candidates from reviews API or issue comments" "$T23_OUT"
 
 echo
 echo "------"

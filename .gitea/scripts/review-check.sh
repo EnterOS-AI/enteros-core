@@ -197,17 +197,13 @@ if [ "$HTTP_CODE" != "200" ]; then
   exit 1
 fi
 
-# Filter: state=APPROVED, official=true, not-dismissed, non-author,
-# commit_id matches current PR head. All conditions are mandatory.
-JQ_FILTER='.[]
-  | select(.state == "APPROVED")
-  | select(.official == true)
-  | select(.dismissed != true)
-  | select(.user.login != $author)
-  | select(.commit_id == $head)
-  | .user.login'
-
-REVIEW_CANDIDATES=$(jq -r --arg author "$PR_AUTHOR" --arg head "$PR_HEAD_SHA" "$JQ_FILTER" "$REVIEWS_JSON" | sort -u)
+# Filter via the SSOT fail-closed predicate in _approval_validator.py
+# (same module gitea-merge-queue.py imports). The jq filter is gone
+# entirely — any change to the predicate must be made in
+# _approval_validator.py. See SEV-1 internal#812 for the fail-closed
+# contract this closes.
+SCRIPT_DIR_HERE="$(cd "$(dirname "$0")" && pwd)"
+REVIEW_CANDIDATES=$(python3 "$SCRIPT_DIR_HERE/_review_check_filter.py" "$REVIEWS_JSON" "$PR_HEAD_SHA" "$PR_AUTHOR")
 debug "candidate non-author approvers: $(echo "$REVIEW_CANDIDATES" | tr '\n' ' ')"
 
 if [ -z "$REVIEW_CANDIDATES" ]; then
