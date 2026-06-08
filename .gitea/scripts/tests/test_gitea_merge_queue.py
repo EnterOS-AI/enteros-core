@@ -333,6 +333,27 @@ def test_governance_red_blocks_merge():
     assert "required contexts not green" in decision.reason
 
 
+def test_non_required_red_does_not_block_merge():
+    # Uniform gate flip (CTO #2407): qa-review, security-review, sop-checklist
+    # are REQUIRED for ALL PRs. A PR with these failing/pending must NOT be
+    # force-mergeable, even if BP-required CI is green and approvals are genuine.
+    pr_status = {
+        "state": "failure",
+        "statuses": [
+            {"context": "CI / all-required (pull_request)", "status": "success"},
+            {"context": "qa-review / approved (pull_request)", "status": "failure"},
+            {"context": "security-review / approved (pull_request)", "status": "pending"},
+            {"context": "sop-checklist / all-items-acked (pull_request)", "status": "failure"},
+            {"context": "Staging SaaS / e2e (pull_request)", "status": "failure"},
+        ],
+    }
+    decision = mq.evaluate_merge_readiness(**_ready_kwargs(pr_status=pr_status))
+    assert decision.ready is False
+    assert decision.action == "wait"
+    assert "required contexts not green" in decision.reason
+    assert decision.force is False
+
+
 def test_non_required_advisory_red_does_not_block_merge():
     # Governance checks are green; only advisory non-required reds (Staging SaaS)
     # are present → PR is still mergeable with force_merge bypassing the advisory.

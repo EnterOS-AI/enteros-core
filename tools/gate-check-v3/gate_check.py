@@ -433,6 +433,17 @@ def signal_4_branch_divergence(
 
 # ── Signal 6: CI required-checks awareness ───────────────────────────────────
 
+# Governance checks that are ALWAYS required for every PR, regardless of
+# branch-protection configuration. These are the uniform-gate checks that
+# must pass before any PR can merge (SOP tier removal makes them mandatory
+# for all PRs, not just tier:medium/tier:high).
+GOVERNANCE_REQUIRED_CONTEXTS = [
+    "qa-review / approved (pull_request)",
+    "security-review / approved (pull_request)",
+    "sop-checklist / all-items-acked (pull_request)",
+]
+
+
 def signal_6_ci(pr_number: int, repo: str, branch: str | None = None, pr_data: dict | None = None) -> dict:
     """
     Query combined CI status for PR head commit.
@@ -470,6 +481,9 @@ def signal_6_ci(pr_number: int, repo: str, branch: str | None = None, pr_data: d
             required_checks.append(check["context"])
     except GiteaError:
         pass  # No protection or no read access
+    # Uniform gate: governance checks are ALWAYS required, even if branch
+    # protection does not enumerate them. Deduplicate against BP list.
+    required_checks = list(dict.fromkeys(required_checks + GOVERNANCE_REQUIRED_CONTEXTS))
 
     failing_required = []
     passing_required = []

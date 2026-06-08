@@ -463,3 +463,24 @@ def test_signal_6_all_required_green_returns_clear(monkeypatch):
     assert result["verdict"] == "CLEAR"
     assert result["pending_required"] == []
     assert result["failing_required"] == []
+
+
+def test_signal_6_governance_checks_always_required_even_when_bp_empty(monkeypatch):
+    """Uniform gate: qa/security/sop are REQUIRED even if branch protection
+    does not enumerate them. A PR with only CI/all-required green but missing
+    governance contexts must be CI_PENDING (fail-closed)."""
+    mod = load_gate_check()
+    monkeypatch.setattr(
+        mod, "api_get",
+        _signal_6_api_get(
+            required_checks=[],  # BP lists nothing
+            statuses=[
+                {"context": "CI / all-required (pull_request)", "status": "success"},
+            ],
+        ),
+    )
+    result = mod.signal_6_ci(200, "molecule-ai/molecule-core")
+    assert result["verdict"] == "CI_PENDING"
+    assert "qa-review / approved (pull_request)" in result["pending_required"]
+    assert "security-review / approved (pull_request)" in result["pending_required"]
+    assert "sop-checklist / all-items-acked (pull_request)" in result["pending_required"]
