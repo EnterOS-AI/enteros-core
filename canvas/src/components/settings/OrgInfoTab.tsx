@@ -15,11 +15,20 @@ import { Spinner } from '@/components/Spinner';
  * currently-active org, plus a switcher list when the user belongs to
  * multiple orgs.
  *
- * Data path:
+ * Data path (SaaS — control plane present):
  *   1. fetchSession() → /cp/auth/me → current org_id
  *   2. api.get('/cp/orgs') → list of all orgs the user belongs to
  *   3. Match by id === session.org_id; fall back to host-slug match
  *      if the session probe loses the race.
+ *
+ * Data path (self-host — NO control plane):
+ *   /cp/orgs is a control-plane route that does not exist on a self-hosted
+ *   stack, so it 404s. When that probe fails we fall back to the open
+ *   GET /org/identity route (served by the tenant workspace-server in both
+ *   modes) and render a single org card from name + slug + org_id. On a
+ *   fresh self-host only `name` is populated (MOLECULE_ORG_SLUG /
+ *   MOLECULE_ORG_ID are unset) — the card omits the empty rows and shows
+ *   no error and no "other organizations" list.
  *
  * Read-only — this tab never mutates. Org creation/switching lives at
  * /orgs (the post-signup landing page).
@@ -36,25 +45,50 @@ interface Org {
 // for the same defensive unwrap.
 type OrgsResponse = Org[] | { orgs?: Org[] };
 
+// GET /org/identity (self-host fallback) — open route on the tenant
+// workspace-server. slug/org_id are "" on a fresh self-host.
+interface OrgIdentity {
+  name?: string;
+  slug?: string;
+  org_id?: string;
+}
+
 export function OrgInfoTab() {
   const [orgs, setOrgs] = useState<Org[] | null>(null);
   const [session, setSession] = useState<Session | null>(null);
+  // selfHostOrg is set only when /cp/orgs is unavailable (self-host) and the
+  // /org/identity fallback yields an org. When non-null we render exactly one
+  // card from it and never show the "other organizations" list or an error.
+  const [selfHostOrg, setSelfHostOrg] = useState<Org | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     let cancelled = false;
     (async () => {
+      const sess = await fetchSession().catch(() => null);
+      if (cancelled) return;
+      setSession(sess);
       try {
-        const [sess, body] = await Promise.all([
-          fetchSession().catch(() => null),
-          api.get<OrgsResponse>('/cp/orgs'),
-        ]);
+        const body = await api.get<OrgsResponse>('/cp/orgs');
         if (cancelled) return;
-        setSession(sess);
         setOrgs(Array.isArray(body) ? body : body.orgs ?? []);
-      } catch (e) {
-        if (!cancelled) setError(e instanceof Error ? e.message : 'Failed to load org info');
+      } catch {
+        // /cp/orgs is a control-plane route — absent on a self-hosted stack
+        // (404 / network error). Fall back to the open /org/identity route on
+        // the tenant server instead of surfacing a red error banner.
+        try {
+          const id = await api.get<OrgIdentity>('/org/identity');
+          if (cancelled) return;
+          setSelfHostOrg({
+            id: id.org_id ?? '',
+            slug: id.slug ?? '',
+            name: id.name ?? '',
+          });
+        } catch (e2) {
+          if (!cancelled)
+            setError(e2 instanceof Error ? e2.message : 'Failed to load org info');
+        }
       } finally {
         if (!cancelled) setLoading(false);
       }
@@ -66,10 +100,14 @@ export function OrgInfoTab() {
 
   const tenantSlug = getTenantSlug();
   const currentOrg =
+    selfHostOrg ??
     orgs?.find((o) => session && o.id === session.org_id) ??
     orgs?.find((o) => tenantSlug && o.slug === tenantSlug) ??
     null;
-  const otherOrgs = orgs?.filter((o) => o.id !== currentOrg?.id) ?? [];
+  // Self-host renders a single org only — no "other organizations" list.
+  const otherOrgs = selfHostOrg
+    ? []
+    : orgs?.filter((o) => o.id !== currentOrg?.id) ?? [];
 
   if (loading) {
     return (
@@ -127,21 +165,25 @@ export function OrgInfoTab() {
 }
 
 function OrgIdentityCard({ org, highlighted }: { org: Org; highlighted?: boolean }) {
+  // On self-host, slug / UUID may be unconfigured ("") — omit those rows
+  // gracefully rather than rendering an empty code box.
   return (
     <div
       className={`rounded-lg border p-3 space-y-2 ${
         highlighted ? 'border-accent/40 bg-accent-strong/5' : 'border-line/40 bg-surface-card/40'
       }`}
-      data-testid={`org-card-${org.slug}`}
+      data-testid={`org-card-${org.slug || org.id || 'self-host'}`}
     >
       <div className="flex items-baseline justify-between gap-2">
-        <span className="text-[12px] font-medium text-ink truncate">{org.name}</span>
+        <span className="text-[12px] font-medium text-ink truncate">
+          {org.name || 'This organization'}
+        </span>
         {org.status && (
           <span className="text-[9px] text-ink-mid uppercase tracking-wider shrink-0">{org.status}</span>
         )}
       </div>
-      <IdentityRow label="Slug" value={org.slug} />
-      <IdentityRow label="UUID" value={org.id} mono />
+      {org.slug && <IdentityRow label="Slug" value={org.slug} />}
+      {org.id && <IdentityRow label="UUID" value={org.id} mono />}
     </div>
   );
 }

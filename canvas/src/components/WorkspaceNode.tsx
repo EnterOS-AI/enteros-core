@@ -1,7 +1,7 @@
 "use client";
 
-import { useCallback, useMemo, type KeyboardEvent } from "react";
-import { Handle, NodeResizer, Position, type NodeProps, type Node } from "@xyflow/react";
+import { useMemo, type KeyboardEvent } from "react";
+import { Handle, Position, type NodeProps, type Node } from "@xyflow/react";
 import { useCanvasStore, type WorkspaceNodeData } from "@/store/canvas";
 import { getConfigurationError, getConfigurationStatus } from "@/store/canvas-topology";
 import { showToast } from "@/components/Toaster";
@@ -21,7 +21,8 @@ function useDescendantCount(nodeId: string): number {
   return useMemo(() => countDescendants(nodeId, nodes), [nodeId, nodes]);
 }
 
-/** Boolean flag used to drive min-size and NodeResizer dimensions.
+/** Boolean flag used to drive the container's system-controlled size
+ *  (leaves render fixed-size; parents grow to fit children).
  *  Selecting `nodes` stably avoids re-render loops (same issue as
  *  useDescendantCount). */
 function useHasChildren(nodeId: string): boolean {
@@ -87,16 +88,9 @@ export function WorkspaceNode({ id, data }: NodeProps<Node<WorkspaceNodeData>>) 
 
   return (
     <>
-      {/* NodeResizer — visible only on the selected card. Lets the user
-       *  drag any edge/corner to grow or shrink the workspace, which is
-       *  useful on cards that contain nested child workspaces. */}
-      <NodeResizer
-        isVisible={isSelected}
-        minWidth={hasChildren ? 360 : 210}
-        minHeight={hasChildren ? 200 : 110}
-        lineClassName="!border-accent/40"
-        handleClassName="!w-2 !h-2 !bg-accent !border !border-blue-300"
-      />
+      {/* Free-resize removed (was NodeResizer). Container size + shape are now
+       *  system-controlled: leaf workspaces render at a fixed width; parent
+       *  workspaces grow to fit their nested children (store grow logic). */}
     <div
       role="button"
       tabIndex={0}
@@ -161,20 +155,22 @@ export function WorkspaceNode({ id, data }: NodeProps<Node<WorkspaceNodeData>>) 
         }
       }}
       className={`
-        group relative rounded-xl h-full w-full
-        ${hasChildren && !data.collapsed ? "min-w-[360px] min-h-[200px]" : "min-w-[210px]"}
+        group relative rounded-xl
+        ${hasChildren && !data.collapsed
+          ? "h-full w-full min-w-[420px] min-h-[240px]"
+          : "w-[300px] min-h-[176px]"}
         cursor-pointer overflow-hidden
         transition-all duration-200 ease-out
         ${isDragTarget
           ? "bg-emerald-950/40 border-2 border-emerald-400/60 ring-2 ring-emerald-400/20 scale-[1.03]"
           : isBatchSelected
-          ? "bg-surface-sunken/95 border-2 border-accent/80 ring-2 ring-accent/30 shadow-lg shadow-blue-500/15"
+          ? "bg-surface-sunken/95 border-2 border-accent/80 ring-2 ring-accent/30 shadow-lg shadow-accent/15"
           : isSelected
-          ? "bg-surface-sunken/95 border border-accent/70 ring-1 ring-accent/30 shadow-lg shadow-blue-500/10"
-          : "bg-surface-sunken/90 border border-line/80 hover:border-zinc-500/60 shadow-lg shadow-black/30 hover:shadow-xl hover:shadow-black/40"
+          ? "bg-surface-sunken/95 border border-accent/70 ring-1 ring-accent/30 shadow-lg shadow-accent/10"
+          : "bg-surface-sunken/90 border border-line/80 hover:border-ink-soft/60 shadow-lg shadow-black/30 hover:shadow-xl hover:shadow-black/40"
         }
         backdrop-blur-sm
-        focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/70 focus-visible:ring-offset-1 focus-visible:ring-offset-zinc-950
+        focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/70 focus-visible:ring-offset-1 focus-visible:ring-offset-surface
         ${deploy.isActivelyProvisioning ? "mol-deploy-shimmer" : ""}
         ${deploy.isLockedChild ? "mol-deploy-locked" : ""}
       `}
@@ -212,27 +208,45 @@ export function WorkspaceNode({ id, data }: NodeProps<Node<WorkspaceNodeData>>) 
             }
           }
         }}
-        className="!w-2.5 !h-1 !rounded-full !bg-surface-card/80 !border-0 !-top-0.5 hover:!bg-blue-400 hover:!h-1.5 focus-visible:!bg-blue-400 focus-visible:!h-1.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-400/60 focus-visible:ring-offset-1 focus-visible:ring-offset-zinc-950 transition-all"
+        className="!w-2.5 !h-1 !rounded-full !bg-surface-card/80 !border-0 !-top-0.5 hover:!bg-accent hover:!h-1.5 focus-visible:!bg-accent focus-visible:!h-1.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/60 focus-visible:ring-offset-1 focus-visible:ring-offset-surface transition-all"
       />
 
-      <div className="relative px-3.5 py-2.5">
+      <div className="relative px-4 py-3.5">
         {/* Header row */}
-        <div className="flex items-center justify-between gap-2 mb-1">
-          <div className="flex items-center gap-2 min-w-0">
-            <div className={`w-2 h-2 rounded-full shrink-0 ${statusCfg.dot} ${statusCfg.glow} shadow-sm`} />
-            <span className="text-[13px] font-semibold text-ink truncate leading-tight">
+        <div className="flex items-center justify-between gap-2 mb-2.5">
+          <div className="flex items-center gap-2.5 min-w-0">
+            <div className={`w-2.5 h-2.5 rounded-full shrink-0 ${statusCfg.dot} ${statusCfg.glow} shadow-sm`} />
+            <span className="text-[15px] font-semibold text-ink truncate leading-tight">
               {data.name}
             </span>
           </div>
           <div className="flex items-center gap-1.5 shrink-0">
-            {hasChildren && (
-              <span className="text-[10px] font-mono text-accent bg-accent/15 border border-accent/40 px-1.5 py-0.5 rounded-md">
-                {descendantCount} sub
-              </span>
-            )}
-            <span className={`text-[10px] font-mono px-1.5 py-0.5 rounded-md ${tierCfg.color}`}>
-              {tierCfg.label}
-            </span>
+            {/* Model pill (concept top-right). Shortens the agent_card model to
+                a family label (Opus/Sonnet/Haiku/Kimi); falls back to the raw
+                last segment, then to the tier badge when no model is known. */}
+            {(() => {
+              const m = (data.agentCard as Record<string, unknown> | null)?.model;
+              const model = typeof m === "string" && m ? m : null;
+              if (!model) {
+                return (
+                  <span className={`text-[11px] font-mono px-2 py-1 rounded-md ${tierCfg.color}`}>
+                    {tierCfg.label}
+                  </span>
+                );
+              }
+              const label = /opus/i.test(model) ? "Opus"
+                : /sonnet/i.test(model) ? "Sonnet"
+                : /haiku/i.test(model) ? "Haiku"
+                : /kimi/i.test(model) ? "Kimi"
+                : /gpt|openai/i.test(model) ? "GPT"
+                : /gemini/i.test(model) ? "Gemini"
+                : (model.split(/[/:]/).pop() || model);
+              return (
+                <span className="text-[11px] font-mono px-2 py-1 rounded-md text-white bg-accent" title={model}>
+                  {label}
+                </span>
+              );
+            })()}
           </div>
         </div>
 
@@ -242,6 +256,9 @@ export function WorkspaceNode({ id, data }: NodeProps<Node<WorkspaceNodeData>>) 
             We treat empty-string DB values as "missing" so an unbackfilled
             row falls through to the agent-card value rather than rendering
             a blank pill. */}
+        {/* Role pill (concept) — uppercase, accent-bordered. Platform root
+            shows "PLATFORM · ROOT"; Phase 30 external-runtime agents get the
+            REMOTE marker alongside. */}
         {(() => {
           const dbRuntime = typeof data.runtime === "string" && data.runtime !== ""
             ? data.runtime : null;
@@ -249,32 +266,46 @@ export function WorkspaceNode({ id, data }: NodeProps<Node<WorkspaceNodeData>>) 
             ? (data.agentCard as Record<string, string>).runtime
             : null;
           const runtime = dbRuntime ?? cardRuntime;
-          if (!runtime) return null;
+          const isRemote = !!runtime && isExternalLikeRuntime(runtime);
+          const isPlatformRoot = !data.parentId && hasChildren;
+          const roleLabel = isPlatformRoot ? "PLATFORM · ROOT" : (data.role || null);
+          if (!roleLabel && !isRemote) return null;
           return (
-            <div className="mb-1 flex items-center gap-1">
-              {isExternalLikeRuntime(runtime) ? (
+            <div className="mb-2.5 flex items-center gap-1.5">
+              {roleLabel && (
+                <span className="max-w-[220px] truncate text-[10px] font-mono uppercase tracking-[0.04em] px-2 py-1 rounded-md text-accent bg-accent/12 border border-accent/35">
+                  {roleLabel}
+                </span>
+              )}
+              {isRemote && (
                 <span
-                  className="text-[7px] font-mono px-1.5 py-0.5 rounded-md text-white bg-violet-800 border border-violet-900"
+                  className="text-[10px] font-mono uppercase px-2 py-1 rounded-md text-white bg-violet-800 border border-violet-900"
                   title="Phase 30 remote agent — runs outside this platform's Docker network. Lifecycle managed via heartbeat-based polling, not Docker exec."
                 >
                   ★ REMOTE
-                </span>
-              ) : (
-                <span className="text-[7px] font-mono px-1.5 py-0.5 rounded-md text-ink-mid bg-surface-card border border-line">
-                  {runtime}
                 </span>
               )}
             </div>
           );
         })()}
 
-        {/* Role — clamp to 2 lines. Without this, a verbose role
-         *  description (common on org-template imports) lets the card
-         *  grow arbitrarily tall, which wrecks the grid-slot layout
-         *  because siblings all plan for the same CHILD_DEFAULT_HEIGHT. */}
-        {data.role && (
-          <div className="text-[10px] text-ink-mid mb-1.5 leading-tight line-clamp-2">{data.role}</div>
-        )}
+        {/* Status line (concept) — uppercase status, "· N AGENTS" for parents,
+            with a queued pill on the right. */}
+        <div className="mb-2 flex items-center justify-between gap-2">
+          <span className={`text-[11px] font-mono uppercase tracking-[0.04em] ${
+            isOnline ? "text-good"
+              : effectiveStatus === "failed" ? "text-bad"
+              : (effectiveStatus === "provisioning" || effectiveStatus === "degraded") ? "text-warm"
+              : "text-ink-soft"
+          }`}>
+            {statusCfg.label}{hasChildren ? ` · ${descendantCount} agents` : ""}
+          </span>
+          {data.activeTasks > 0 && (
+            <span className="shrink-0 text-[11px] font-mono px-2 py-1 rounded-md text-ink-mid bg-surface-card border border-line">
+              ≡ {data.activeTasks} queued
+            </span>
+          )}
+        </div>
 
         {/* Skills */}
         {skills.length > 0 && (
@@ -328,29 +359,7 @@ export function WorkspaceNode({ id, data }: NodeProps<Node<WorkspaceNodeData>>) 
           </button>
         )}
 
-        {/* Bottom row: status / active tasks */}
-        <div className="flex items-center justify-between mt-0.5">
-          {effectiveStatus !== "online" ? (
-            <div className={`text-[10px] uppercase tracking-widest font-medium ${
-              effectiveStatus === "failed" ? "text-bad" :
-              effectiveStatus === "degraded" ? "text-warm" :
-              effectiveStatus === "not_configured" ? "text-warm" :
-              effectiveStatus === "provisioning" ? "text-accent" :
-              "text-ink-mid"
-            }`}>
-              {statusCfg.label}
-            </div>
-          ) : <div />}
-
-          {data.activeTasks > 0 && (
-            <div className="flex items-center gap-1">
-              <div className="w-1 h-1 rounded-full bg-warm motion-safe:animate-pulse" />
-              <span className="text-[10px] text-warm tabular-nums">
-                {data.activeTasks} task{data.activeTasks > 1 ? "s" : ""}
-              </span>
-            </div>
-          )}
-        </div>
+        {/* (status + queued now rendered above, concept-style) */}
 
         {/* Degraded error preview */}
         {data.status === "degraded" && data.lastSampleError && (
@@ -395,7 +404,7 @@ export function WorkspaceNode({ id, data }: NodeProps<Node<WorkspaceNodeData>>) 
             }
           }
         }}
-        className="!w-2.5 !h-1 !rounded-full !bg-surface-card/80 !border-0 !-bottom-0.5 hover:!bg-blue-400 hover:!h-1.5 focus-visible:!bg-blue-400 focus-visible:!h-1.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-400/60 focus-visible:ring-offset-1 focus-visible:ring-offset-zinc-950 transition-all"
+        className="!w-2.5 !h-1 !rounded-full !bg-surface-card/80 !border-0 !-bottom-0.5 hover:!bg-accent hover:!h-1.5 focus-visible:!bg-accent focus-visible:!h-1.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/60 focus-visible:ring-offset-1 focus-visible:ring-offset-surface transition-all"
       />
     </div>
     </>

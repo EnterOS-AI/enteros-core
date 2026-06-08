@@ -55,7 +55,7 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 	r.Use(cors.New(cors.Config{
 		AllowOrigins:     corsOrigins,
 		AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
-		AllowHeaders:     []string{"Origin", "Content-Type", "X-Workspace-ID", "X-Molecule-Org-Id", "X-Molecule-Org-Slug", "Authorization"},
+		AllowHeaders:     []string{"Origin", "Content-Type", "X-Workspace-ID", "X-Molecule-Org-Id", "X-Molecule-Org-Slug", "X-Confirm-Name", "Authorization"},
 		AllowCredentials: true,
 	}))
 
@@ -105,6 +105,14 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 	r.GET("/buildinfo", func(c *gin.Context) {
 		c.JSON(200, gin.H{"git_sha": buildinfo.GitSHA})
 	})
+
+	// Org identity — public, no auth. Returns {"name": <MOLECULE_ORG_NAME or "">}
+	// so the canvas topbar can render the org's name without holding an admin
+	// token (the canvas hits this before login/bootstrap). Open + CORS-friendly,
+	// same class as /health and /buildinfo: it exposes a single non-sensitive
+	// identity string the tenant is already named after. The platform agent is
+	// named "<org name> Agent" from the same env (see handlers.OrgIdentity).
+	r.GET("/org/identity", handlers.OrgIdentity)
 
 	// Upload limits — public, no auth. Single source of truth for
 	// per-file / per-request / max-attachments caps consumed by the
@@ -320,6 +328,18 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		// unauthenticated caller cannot enumerate all pending approvals across the
 		// entire platform. Gated behind AdminAuth (issue #180).
 		r.GET("/approvals/pending", middleware.AdminAuth(db.DB), apph.ListAll)
+
+		// User tasks — agent → user action requests ("asks"). Worklist
+		// signal (not a destructive gate); mirrors the approvals auth split.
+		uth := handlers.NewUserTasksHandler(broadcaster)
+		wsAuth.POST("/user-tasks", uth.Create)
+		wsAuth.GET("/user-tasks", uth.List)
+		wsAuth.POST("/user-tasks/:taskId/resolve", uth.Resolve)
+		wsAuth.PATCH("/user-tasks/:taskId", uth.Update)
+		wsAuth.DELETE("/user-tasks/:taskId", uth.Delete)
+		// /user-tasks/pending is cross-workspace (concierge Tasks tab), so
+		// AdminAuth-gated exactly like /approvals/pending.
+		r.GET("/user-tasks/pending", middleware.AdminAuth(db.DB), uth.ListAll)
 
 		// (TeamHandler is gone — #2864.) The visual canvas Collapse
 		// button calls PATCH /workspaces/:id { collapsed: true/false }
@@ -882,6 +902,22 @@ func findPluginsDir(configsDir string) string {
 }
 
 func findOrgDir(configsDir string) string {
+	// Explicit override wins (SSOT parity with TEMPLATE_CACHE_DIR for the
+	// runtime templates). The tenant image bakes the default org templates
+	// (molecule-dev, molecule-worker-gemini, ux-ab-lab) at /org-templates, but
+	// the local docker-compose used to bind-mount an EMPTY host ./org-templates
+	// over that same path — shadowing the baked defaults so the Home page's ORG
+	// TEMPLATES section showed "No org templates in org-templates/". Pointing
+	// ORG_TEMPLATES_DIR at the baked path makes the local stack serve the same
+	// defaults production ships. Empty → fall through to the discovery probe.
+	if d := os.Getenv("ORG_TEMPLATES_DIR"); d != "" {
+		if info, err := os.Stat(d); err == nil && info.IsDir() {
+			abs, _ := filepath.Abs(d)
+			return abs
+		}
+		// ORG_TEMPLATES_DIR set but not a directory — fall through to the
+		// discovery probe rather than returning a bad path.
+	}
 	candidates := []string{
 		"org-templates",
 		"../org-templates",

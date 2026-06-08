@@ -2,13 +2,9 @@
 
 import { createRef, useCallback, useEffect, useState } from 'react';
 import * as Dialog from '@radix-ui/react-dialog';
-import * as Tabs from '@radix-ui/react-tabs';
 import { useSecretsStore } from '@/stores/secrets-store';
 import { useKeyboardShortcut } from '@/hooks/use-keyboard-shortcut';
-import { SecretsTab } from './SecretsTab';
-import { TokensTab } from './TokensTab';
-import { OrgTokensTab } from './OrgTokensTab';
-import { OrgInfoTab } from './OrgInfoTab';
+import { SettingsTabs } from './SettingsTabs';
 import { UnsavedChangesGuard } from './UnsavedChangesGuard';
 
 /** Module-level ref so TopBar's SettingsButton can receive focus back on close. */
@@ -106,38 +102,7 @@ export function SettingsPanel({ workspaceId }: SettingsPanelProps) {
               </Dialog.Close>
             </div>
 
-            <Tabs.Root defaultValue="api-keys">
-              <Tabs.List className="settings-panel__tabs" aria-label="Settings sections">
-                <Tabs.Trigger value="api-keys" className="settings-panel__tab">
-                  Secrets
-                </Tabs.Trigger>
-                <Tabs.Trigger value="tokens" className="settings-panel__tab">
-                  Workspace Tokens
-                </Tabs.Trigger>
-                <Tabs.Trigger value="org-tokens" className="settings-panel__tab">
-                  Org API Keys
-                </Tabs.Trigger>
-                <Tabs.Trigger value="org-info" className="settings-panel__tab">
-                  Organization
-                </Tabs.Trigger>
-              </Tabs.List>
-
-              <Tabs.Content value="api-keys" className="settings-panel__content">
-                <SecretsTab workspaceId={workspaceId} />
-              </Tabs.Content>
-
-              <Tabs.Content value="tokens" className="settings-panel__content">
-                <TokensTab workspaceId={workspaceId} />
-              </Tabs.Content>
-
-              <Tabs.Content value="org-tokens" className="settings-panel__content">
-                <OrgTokensTab />
-              </Tabs.Content>
-
-              <Tabs.Content value="org-info" className="settings-panel__content">
-                <OrgInfoTab />
-              </Tabs.Content>
-            </Tabs.Root>
+            <SettingsTabs workspaceId={workspaceId} />
 
             <div className="settings-panel__footer">
               <span className="settings-panel__shortcut-hint">

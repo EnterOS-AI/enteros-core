@@ -1,9 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Canvas } from "@/components/Canvas";
-import { Legend } from "@/components/Legend";
-import { CommunicationOverlay } from "@/components/CommunicationOverlay";
+import { ConciergeShell } from "@/components/concierge/ConciergeShell";
 import { MobileApp } from "@/components/mobile/MobileApp";
 import { Spinner } from "@/components/Spinner";
 import { connectSocket, disconnectSocket } from "@/store/socket";
@@ -115,11 +113,7 @@ export default function Home() {
 
   return (
     <>
-      <main aria-label="Agent canvas">
-        <Canvas />
-      </main>
-      <Legend />
-      <CommunicationOverlay />
+      <ConciergeShell />
       {hydrationError && (
         <div
           role="alert"

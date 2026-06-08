@@ -13,6 +13,7 @@ import (
 	"strings"
 	"testing"
 
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/providers"
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/gin-gonic/gin"
 )
@@ -1347,6 +1348,11 @@ func TestCWE78_DeleteFile_TraversalVariants(t *testing.T) {
 // config.yaml runtime_config.models happens to list. A template author can no
 // longer surface an unregistered model into the canvas dropdown.
 func TestTemplatesList_RegistryServesSelectableModels(t *testing.T) {
+	// SaaS path: a Molecule proxy is configured, so the platform-managed
+	// provider + its models ARE selectable (this test's assertions cover them).
+	t.Setenv("MOLECULE_LLM_BASE_URL", "https://llm.example.test")
+	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "proxy-tok")
+
 	tmpDir := t.TempDir()
 	tmplDir := filepath.Join(tmpDir, "claude-code-default")
 	if err := os.MkdirAll(tmplDir, 0755); err != nil {
@@ -1414,6 +1420,11 @@ skills: []
 // to show the billing-mode of the DERIVED provider (folds in #1931 intent),
 // instead of its hardcoded billingModeForProvider rule.
 func TestTemplatesList_RegistryAnnotatesDerivedProviderAndBilling(t *testing.T) {
+	// SaaS path: a Molecule proxy is configured, so the platform-managed
+	// provider + its models ARE present (this test pins their annotations).
+	t.Setenv("MOLECULE_LLM_BASE_URL", "https://llm.example.test")
+	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "proxy-tok")
+
 	tmpDir := t.TempDir()
 	tmplDir := filepath.Join(tmpDir, "claude-code-default")
 	if err := os.MkdirAll(tmplDir, 0755); err != nil {
@@ -1636,4 +1647,113 @@ func TestTemplatesList_DisplayableFlag(t *testing.T) {
 			t.Errorf("%s: displayable key should be present when set", id)
 		}
 	}
+}
+
+// TestTemplatesList_PlatformManagedFilteredWhenNoProxy pins the SSOT filter:
+// the closed `platform` provider (and every model that derives to it) is
+// dropped from the /templates payload AT THE SOURCE when no Molecule LLM
+// proxy is configured (self-host) — so every consumer (ConfigTab,
+// CreateWorkspaceDialog, MissingKeysModal) inherits it — and is present,
+// unchanged, when the proxy IS configured (SaaS).
+func TestTemplatesList_PlatformManagedFilteredWhenNoProxy(t *testing.T) {
+	tmpDir := t.TempDir()
+	tmplDir := filepath.Join(tmpDir, "claude-code-default")
+	if err := os.MkdirAll(tmplDir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	configYaml := `name: Claude Code
+runtime: claude-code
+runtime_config:
+  model: claude-sonnet-4-6
+skills: []
+`
+	if err := os.WriteFile(filepath.Join(tmplDir, "config.yaml"), []byte(configYaml), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	fetch := func(t *testing.T) templateSummary {
+		t.Helper()
+		handler := NewTemplatesHandler(tmpDir, nil, nil)
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest("GET", "/templates", nil)
+		handler.List(c)
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d", w.Code)
+		}
+		var resp []templateSummary
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		if len(resp) != 1 {
+			t.Fatalf("expected 1 template, got %d", len(resp))
+		}
+		return resp[0]
+	}
+
+	hasPlatformProvider := func(s templateSummary) bool {
+		for _, p := range s.RegistryProviders {
+			if p.Name == providers.PlatformProviderName {
+				return true
+			}
+		}
+		return false
+	}
+	hasPlatformModel := func(s templateSummary) bool {
+		for _, m := range s.RegistryModels {
+			if m.Provider == providers.PlatformProviderName {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Self-host: NO proxy → platform provider + its models are filtered out.
+	t.Run("no_proxy_filters_platform", func(t *testing.T) {
+		t.Setenv("MOLECULE_LLM_BASE_URL", "")
+		t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "")
+		t.Setenv("OPENAI_BASE_URL", "")
+		t.Setenv("OPENAI_API_KEY", "")
+		if PlatformManagedProxyConfigured() {
+			t.Fatalf("precondition: proxy must read as unconfigured")
+		}
+
+		got := fetch(t)
+		if !got.RegistryBacked {
+			t.Fatalf("claude-code is registry-backed; RegistryBacked must be true")
+		}
+		if hasPlatformProvider(got) {
+			t.Errorf("self-host: platform provider must be filtered from RegistryProviders; got %+v", got.RegistryProviders)
+		}
+		if hasPlatformModel(got) {
+			t.Errorf("self-host: platform-derived models must be filtered from RegistryModels; got %+v", got.RegistryModels)
+		}
+		// A BYOK provider/model must STILL be present — only platform is dropped.
+		byokPresent := false
+		for _, p := range got.RegistryProviders {
+			if p.Name == "anthropic-api" {
+				byokPresent = true
+			}
+		}
+		if !byokPresent {
+			t.Errorf("self-host: BYOK provider anthropic-api must remain; got %+v", got.RegistryProviders)
+		}
+	})
+
+	// SaaS: proxy configured → platform provider + its models ARE present.
+	t.Run("proxy_keeps_platform", func(t *testing.T) {
+		t.Setenv("MOLECULE_LLM_BASE_URL", "https://llm.example.test")
+		t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "proxy-tok")
+		if !PlatformManagedProxyConfigured() {
+			t.Fatalf("precondition: proxy must read as configured")
+		}
+
+		got := fetch(t)
+		if !hasPlatformProvider(got) {
+			t.Errorf("SaaS: platform provider must be present in RegistryProviders; got %+v", got.RegistryProviders)
+		}
+		if !hasPlatformModel(got) {
+			t.Errorf("SaaS: platform-derived models must be present in RegistryModels; got %+v", got.RegistryModels)
+		}
+	})
 }

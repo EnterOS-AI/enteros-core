@@ -52,8 +52,10 @@ describe("prefers-reduced-motion compliance", () => {
     expect(src).toContain("motion-safe:animate-pulse");
   });
 
-  it("SidePanel.tsx uses motion-safe:animate-pulse", () => {
-    const src = readSrc("components/SidePanel.tsx");
+  it("WorkspacePanelTabs.tsx uses motion-safe:animate-pulse", () => {
+    // The connection-status dot moved out of SidePanel.tsx into the extracted
+    // WorkspacePanelTabs.tsx; verify the reduced-motion guard followed it.
+    const src = readSrc("components/WorkspacePanelTabs.tsx");
     expect(src.includes("animate-pulse") && !src.includes("motion-safe:animate-pulse")).toBe(false);
     expect(src).toContain("motion-safe:animate-pulse");
   });

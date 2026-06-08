@@ -1203,7 +1203,7 @@ def test_list_candidate_issues_omits_label_filter_when_auto_discover(monkeypatch
     assert captured["query"].get("type") == "pulls"
 
     mq.list_candidate_issues(auto_discover=False)
-    assert captured["query"].get("labels") == "merge-queue"
+    assert captured["query"].get("label") == "merge-queue"
 
 
 def _wire_ready_process_once(monkeypatch, *, issues, pr_payload, calls):

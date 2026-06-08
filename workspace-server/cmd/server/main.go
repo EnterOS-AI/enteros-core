@@ -119,6 +119,18 @@ func main() {
 		}
 	}
 
+	// Self-hosted platform-agent seed. With no control plane present to install
+	// the org's concierge (SaaS leaves it to the CP at org-provision time), the
+	// tenant server seeds it itself when MOLECULE_SEED_PLATFORM_AGENT is set —
+	// the self-hosted docker-compose sets it, while CI harnesses + SaaS tenants
+	// leave it unset (so e2e empty-DB assertions and the CP path are unaffected).
+	// Idempotent + best-effort — never fatal.
+	if v := os.Getenv("MOLECULE_SEED_PLATFORM_AGENT"); v == "true" || v == "1" {
+		if err := handlers.EnsureSelfHostedPlatformAgent(context.Background(), db.DB); err != nil {
+			log.Printf("boot: platform-agent self-seed failed (non-fatal): %v", err)
+		}
+	}
+
 	// Redis
 	redisURL := envOr("REDIS_URL", "redis://localhost:6379")
 	if err := db.InitRedis(redisURL); err != nil {
@@ -235,6 +247,25 @@ func main() {
 		WithTemplateCacheDir(templateCacheDir)
 	if cpProv != nil {
 		wh.SetCPProvisioner(cpProv)
+	}
+
+	// Self-hosted platform-agent boot-provision (Change 1). The line-128 seed
+	// only creates the concierge DB ROW; on a fresh self-host that leaves it
+	// with no container (status='failed'/'online' but nothing running). Now that
+	// the local Docker provisioner (prov) and WorkspaceHandler (RestartByID)
+	// exist, kick off a best-effort provision so a self-hosted concierge comes
+	// online automatically once LLM creds exist.
+	//
+	// Guarded to self-host ONLY: same MOLECULE_SEED_PLATFORM_AGENT flag as the
+	// seed AND prov != nil (local Docker active ⇒ MOLECULE_ORG_ID unset). The
+	// SaaS path (cpProv != nil ⇒ prov == nil) never triggers — the CP owns
+	// concierge provisioning there. Best-effort + non-fatal + runs once: on a
+	// fresh self-host with no creds the provision fails and the agent stays
+	// 'failed' until BYOK is configured via Settings; RestartByID is itself
+	// debounced so this can't loop. Runs in a goroutine inside the helper so a
+	// slow image pull never delays the HTTP server.
+	if v := os.Getenv("MOLECULE_SEED_PLATFORM_AGENT"); (v == "true" || v == "1") && prov != nil {
+		handlers.MaybeProvisionPlatformAgentOnBoot(context.Background(), db.DB, prov, wh.RestartByID)
 	}
 
 	// Memory v2 plugin (RFC #2728): build the dependency bundle once

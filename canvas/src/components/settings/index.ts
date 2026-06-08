@@ -1,4 +1,5 @@
 export { SettingsPanel } from './SettingsPanel';
+export { SettingsTabs } from './SettingsTabs';
 export { SettingsButton } from './SettingsButton';
 export { SecretsTab } from './SecretsTab';
 export { SecretRow } from './SecretRow';

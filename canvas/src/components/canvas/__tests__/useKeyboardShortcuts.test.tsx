@@ -325,7 +325,7 @@ describe("all shortcuts respect inInput guard", () => {
   });
 });
 
-describe("Cmd/Ctrl+Arrow — keyboard node resize", () => {
+describe("Cmd/Ctrl+Arrow — free-resize removed (system-controlled sizing)", () => {
   beforeEach(() => {
     mockStoreState.nodes = [
       {
@@ -340,81 +340,15 @@ describe("Cmd/Ctrl+Arrow — keyboard node resize", () => {
     renderWithProvider();
   });
 
-  it("resizes height down (smaller) on Cmd/Ctrl+ArrowUp", () => {
-    // Node starts at minHeight=110 (no children). Shrinking clamps to min —
-    // height stays 110. Width is unchanged.
+  it("no longer resizes the node on Cmd/Ctrl+Arrow (free-resize removed)", () => {
+    // Sizing is system-controlled now: leaves render fixed-size and parents
+    // grow to fit their children, so Cmd/Ctrl+Arrow must not emit a
+    // `dimensions` change anymore.
     fireEvent.keyDown(window, { key: "ArrowUp", metaKey: true });
-    expect(mockStoreState.onNodesChange).toHaveBeenCalledWith([
-      expect.objectContaining({
-        type: "dimensions",
-        id: "n1",
-        dimensions: { width: 210, height: 110 },
-      }),
-    ]);
-  });
-
-  it("resizes height up (larger) on Cmd/Ctrl+ArrowDown", () => {
     fireEvent.keyDown(window, { key: "ArrowDown", ctrlKey: true });
-    expect(mockStoreState.onNodesChange).toHaveBeenCalledWith([
-      expect.objectContaining({
-        type: "dimensions",
-        id: "n1",
-        dimensions: { width: 210, height: 120 },
-      }),
-    ]);
-  });
-
-  it("resizes width down (smaller) on Cmd/Ctrl+ArrowLeft", () => {
-    // Node starts at minWidth=210 (no children). Shrinking clamps to min —
-    // width stays 210. Height is unchanged.
     fireEvent.keyDown(window, { key: "ArrowLeft", metaKey: true });
-    expect(mockStoreState.onNodesChange).toHaveBeenCalledWith([
-      expect.objectContaining({
-        type: "dimensions",
-        id: "n1",
-        dimensions: { width: 210, height: 110 },
-      }),
-    ]);
-  });
-
-  it("resizes width up (larger) on Cmd/Ctrl+ArrowRight", () => {
     fireEvent.keyDown(window, { key: "ArrowRight", ctrlKey: true });
-    expect(mockStoreState.onNodesChange).toHaveBeenCalledWith([
-      expect.objectContaining({
-        type: "dimensions",
-        id: "n1",
-        dimensions: { width: 220, height: 110 },
-      }),
-    ]);
-  });
-
-  it("uses 2px step with Shift held", () => {
-    // Step is 2px with Shift, but minHeight=110 clamps the result.
-    // 110 - 2 = 108, Math.max(110, 108) = 110. Width is unchanged.
-    fireEvent.keyDown(window, { key: "ArrowUp", metaKey: true, shiftKey: true });
-    expect(mockStoreState.onNodesChange).toHaveBeenCalledWith([
-      expect.objectContaining({
-        dimensions: { width: 210, height: 110 },
-      }),
-    ]);
-  });
-
-  it("respects min-height constraint (no children)", () => {
-    fireEvent.keyDown(window, { key: "ArrowUp", metaKey: true });
-    fireEvent.keyDown(window, { key: "ArrowUp", metaKey: true });
-    // After shrinking from 110 to 100, another ArrowUp hits min-height of 110
-    // (110 - 10 = 100, but 100 < 110 so it should stay at 110)
-    // Actually: 110 -> 100 -> 110 (resets to min)
-    // Let me check: the hook does Math.max(minHeight, currentHeight - step)
-    // minHeight=110, step=10, so 110 - 10 = 100, but Math.max(110, 100) = 110
-    // So two ArrowUp calls should both result in height=100 then height=110?
-    // Wait: 110 - 10 = 100, Math.max(110, 100) = 110 (not 100)
-    // So the height never goes below 110. After first: 110 -> 100, but clamped to 110.
-    // Actually Math.max(110, 100) = 110, so the height never changes.
-    // The min constraint is respected — height stays at 110.
-    expect(mockStoreState.onNodesChange).toHaveBeenLastCalledWith([
-      expect.objectContaining({ dimensions: { width: 210, height: 110 } }),
-    ]);
+    expect(mockStoreState.onNodesChange).not.toHaveBeenCalled();
   });
 
   it("does NOT fire when no node is selected", () => {

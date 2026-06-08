@@ -319,6 +319,11 @@ export interface WorkspaceData {
   agent_card: Record<string, unknown> | null;
   url: string;
   parent_id: string | null;
+  /** Workspace kind: 'platform' = the org-level concierge (the undeletable org
+   *  root, hidden from the map graph); 'workspace' = an ordinary agent. Absent
+   *  on older ws-server builds that predate the kind column — treat as
+   *  'workspace'. (migration 20260606000000_workspaces_kind) */
+  kind?: string;
   active_tasks: number;
   max_concurrent_tasks?: number | null;
   last_error_rate: number;
