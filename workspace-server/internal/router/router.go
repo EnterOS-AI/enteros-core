@@ -902,6 +902,22 @@ func findPluginsDir(configsDir string) string {
 }
 
 func findOrgDir(configsDir string) string {
+	// Explicit override wins (SSOT parity with TEMPLATE_CACHE_DIR for the
+	// runtime templates). The tenant image bakes the default org templates
+	// (molecule-dev, molecule-worker-gemini, ux-ab-lab) at /org-templates, but
+	// the local docker-compose used to bind-mount an EMPTY host ./org-templates
+	// over that same path — shadowing the baked defaults so the Home page's ORG
+	// TEMPLATES section showed "No org templates in org-templates/". Pointing
+	// ORG_TEMPLATES_DIR at the baked path makes the local stack serve the same
+	// defaults production ships. Empty → fall through to the discovery probe.
+	if d := os.Getenv("ORG_TEMPLATES_DIR"); d != "" {
+		if info, err := os.Stat(d); err == nil && info.IsDir() {
+			abs, _ := filepath.Abs(d)
+			return abs
+		}
+		// ORG_TEMPLATES_DIR set but not a directory — fall through to the
+		// discovery probe rather than returning a bad path.
+	}
 	candidates := []string{
 		"org-templates",
 		"../org-templates",

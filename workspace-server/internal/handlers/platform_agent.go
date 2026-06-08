@@ -79,6 +79,12 @@ func EnsureSelfHostedPlatformAgent(ctx context.Context, database *sql.DB) error 
 type OrgIdentityResponse struct {
 	// Name is the org's display name (MOLECULE_ORG_NAME, "" when unset).
 	Name string `json:"name"`
+	// Slug is the org's URL slug (MOLECULE_ORG_SLUG, "" when unset). Empty on
+	// a self-hosted stack where no control plane assigns a slug.
+	Slug string `json:"slug"`
+	// OrgID is the org's UUID (MOLECULE_ORG_ID, "" when unset). Empty on a
+	// self-hosted stack where no control plane assigns an org id.
+	OrgID string `json:"org_id"`
 	// PlatformManagedAvailable reports whether a Molecule LLM proxy is wired
 	// into this workspace-server process — i.e. whether platform_managed billing
 	// can actually work. True on SaaS (the CP provisioner exports the proxy base
@@ -91,11 +97,15 @@ type OrgIdentityResponse struct {
 // OrgIdentity handles GET /org/identity (open / CORS-friendly, no auth).
 //
 // Returns the org's display name from the MOLECULE_ORG_NAME env (empty string
-// when unset) plus a platform_managed_available capability flag. The canvas
-// topbar reads `name` to render "<org name>" without an admin token, and the
-// Settings billing card reads `platform_managed_available` to decide whether to
-// offer platform-managed (proxy) billing — exactly like /health and /buildinfo,
-// it exposes only non-sensitive identity/capability signals.
+// when unset), its slug (MOLECULE_ORG_SLUG) and id (MOLECULE_ORG_ID) — both ""
+// on self-host where no control plane assigns them — plus a
+// platform_managed_available capability flag. The canvas topbar reads `name` to
+// render "<org name>" without an admin token; the Settings → Organization tab
+// reads name+slug+org_id to render the org-identity card on self-host (where the
+// control-plane /cp/orgs endpoint does not exist); and the Settings billing card
+// reads `platform_managed_available` to decide whether to offer platform-managed
+// (proxy) billing — exactly like /health and /buildinfo, it exposes only
+// non-sensitive identity/capability signals.
 //
 // platform_managed_available is true iff a Molecule LLM proxy is configured in
 // this process env (PlatformManagedProxyConfigured — the same base-URL + usage-
@@ -110,6 +120,8 @@ type OrgIdentityResponse struct {
 func OrgIdentity(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"name":                       os.Getenv("MOLECULE_ORG_NAME"),
+		"slug":                       os.Getenv("MOLECULE_ORG_SLUG"),
+		"org_id":                     os.Getenv("MOLECULE_ORG_ID"),
 		"platform_managed_available": PlatformManagedProxyConfigured(),
 	})
 }

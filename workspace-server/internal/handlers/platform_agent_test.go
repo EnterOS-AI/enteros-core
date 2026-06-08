@@ -55,8 +55,10 @@ func TestDefaultPlatformAgentName(t *testing.T) {
 func TestOrgIdentity(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	t.Run("returns configured org name", func(t *testing.T) {
+	t.Run("returns configured org name, slug and id (SaaS)", func(t *testing.T) {
 		t.Setenv("MOLECULE_ORG_NAME", "Molecule AI")
+		t.Setenv("MOLECULE_ORG_SLUG", "molecule-ai")
+		t.Setenv("MOLECULE_ORG_ID", "11111111-2222-3333-4444-555555555555")
 		w := httptest.NewRecorder()
 		c, _ := gin.CreateTestContext(w)
 		c.Request = httptest.NewRequest("GET", "/org/identity", nil)
@@ -67,7 +69,9 @@ func TestOrgIdentity(t *testing.T) {
 			t.Fatalf("expected 200, got %d", w.Code)
 		}
 		var body struct {
-			Name string `json:"name"`
+			Name  string `json:"name"`
+			Slug  string `json:"slug"`
+			OrgID string `json:"org_id"`
 		}
 		if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
 			t.Fatalf("unmarshal: %v (%s)", err, w.Body.String())
@@ -75,10 +79,18 @@ func TestOrgIdentity(t *testing.T) {
 		if body.Name != "Molecule AI" {
 			t.Errorf("name = %q, want %q", body.Name, "Molecule AI")
 		}
+		if body.Slug != "molecule-ai" {
+			t.Errorf("slug = %q, want %q", body.Slug, "molecule-ai")
+		}
+		if body.OrgID != "11111111-2222-3333-4444-555555555555" {
+			t.Errorf("org_id = %q, want the configured uuid", body.OrgID)
+		}
 	})
 
-	t.Run("empty when unset", func(t *testing.T) {
+	t.Run("name/slug/org_id empty when unset (self-host)", func(t *testing.T) {
 		t.Setenv("MOLECULE_ORG_NAME", "")
+		t.Setenv("MOLECULE_ORG_SLUG", "")
+		t.Setenv("MOLECULE_ORG_ID", "")
 		w := httptest.NewRecorder()
 		c, _ := gin.CreateTestContext(w)
 		c.Request = httptest.NewRequest("GET", "/org/identity", nil)
@@ -86,13 +98,21 @@ func TestOrgIdentity(t *testing.T) {
 		OrgIdentity(c)
 
 		var body struct {
-			Name string `json:"name"`
+			Name  string `json:"name"`
+			Slug  string `json:"slug"`
+			OrgID string `json:"org_id"`
 		}
 		if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
 			t.Fatalf("unmarshal: %v", err)
 		}
 		if body.Name != "" {
 			t.Errorf("name = %q, want empty string", body.Name)
+		}
+		if body.Slug != "" {
+			t.Errorf("slug = %q, want empty string", body.Slug)
+		}
+		if body.OrgID != "" {
+			t.Errorf("org_id = %q, want empty string", body.OrgID)
 		}
 	})
 
