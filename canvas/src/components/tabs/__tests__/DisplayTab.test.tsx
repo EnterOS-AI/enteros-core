@@ -197,6 +197,14 @@ describe("DisplayTab", () => {
     fireEvent.click(screen.getByRole("button", { name: "Take control" }));
 
     const desktop = await screen.findByTitle("Workspace desktop");
+    // Wait for the RFB instance to actually connect before pasting. The component
+    // sets rfbRef.current synchronously right after `new RFB()` (which fires
+    // mockRFBConstructor) INSIDE the async connect() — but the "Workspace desktop"
+    // title renders before that await resolves. Firing paste immediately races
+    // rfbRef.current===null, so the window paste handler's
+    // `rfbRef.current?.clipboardPasteFrom(text)` no-ops (0 calls). This lost the
+    // race under CI runner load; waiting for the constructor makes it deterministic.
+    await waitFor(() => expect(mockRFBConstructor).toHaveBeenCalled());
     fireEvent.paste(desktop, {
       clipboardData: {
         getData: (type: string) => (type === "text/plain" ? "Paste Me" : ""),
