@@ -231,6 +231,10 @@ export function ConciergeShell() {
       <div
         role="button"
         tabIndex={0}
+        data-testid="agent-tree-node"
+        data-node-name={n.data.name}
+        data-platform={isPlatform ? "true" : "false"}
+        data-depth={depth}
         className={`${s.ws} ${selectedNodeId === n.id ? s.active : ""}`}
         onClick={() => selectNode(n.id)}
         onKeyDown={(e) => {
@@ -255,7 +259,7 @@ export function ConciergeShell() {
           </div>
         </div>
         {isRoot && isPlatform ? (
-          <span className={s.rootTag}>root</span>
+          <span data-testid="agent-tree-root-tag" className={s.rootTag}>root</span>
         ) : (
           <span className={`${s.wsQ} ${q === 0 ? s.zero : ""}`} title="Tasks in queue">
             <IcQueue />
@@ -303,14 +307,14 @@ export function ConciergeShell() {
               <IcOrgMap />
             </button>
           </div>
-          <button className={`${s.navbtn} ${topView === "home" ? s.active : ""}`} title="Home" onClick={() => nav("home")}>
+          <button data-testid="nav-home" className={`${s.navbtn} ${topView === "home" ? s.active : ""}`} title="Home" onClick={() => nav("home")}>
             <span className={s.ico}><IcHome /></span><span className={s.lbl}>Home</span>
           </button>
-          <button className={`${s.navbtn} ${topView === "map" ? s.active : ""}`} title="Org map" onClick={() => nav("map")}>
+          <button data-testid="nav-map" className={`${s.navbtn} ${topView === "map" ? s.active : ""}`} title="Org map" onClick={() => nav("map")}>
             <span className={s.ico}><IcOrgMap /></span><span className={s.lbl}>Org map</span>
           </button>
           <div className={s.spacer} />
-          <button className={`${s.navbtn} ${topView === "settings" ? s.active : ""}`} title="Settings" onClick={() => nav("settings")}>
+          <button data-testid="nav-settings" className={`${s.navbtn} ${topView === "settings" ? s.active : ""}`} title="Settings" onClick={() => nav("settings")}>
             <span className={s.ico}><IcSettings /></span><span className={s.lbl}>Settings</span>
           </button>
         </nav>
@@ -320,7 +324,7 @@ export function ConciergeShell() {
           <header className={s.topbar}>
             <div className={s.org}>
               <div className={s.orgBadge}>{initials(orgName).slice(0, 1)}</div>
-              <span className={s.orgName}>{orgName}</span>
+              <span data-testid="topbar-org-name" className={s.orgName}>{orgName}</span>
               <span className={s.chev}><IcChevDown /></span>
             </div>
             <div className={s.topbarRight}>
@@ -342,11 +346,11 @@ export function ConciergeShell() {
             <div className={`${s.view} ${topView === "home" ? s.active : ""}`}>
               <aside className={s.homeSidebar}>
                 <div className={s.sbTabs}>
-                  <button className={`${s.sbTab} ${sbTab === "agents" ? s.active : ""}`} onClick={() => setSbTab("agents")}>Agents</button>
-                  <button className={`${s.sbTab} ${sbTab === "tasks" ? s.active : ""}`} onClick={() => setSbTab("tasks")}>
+                  <button data-testid="home-subtab-agents" className={`${s.sbTab} ${sbTab === "agents" ? s.active : ""}`} onClick={() => setSbTab("agents")}>Agents</button>
+                  <button data-testid="home-subtab-tasks" className={`${s.sbTab} ${sbTab === "tasks" ? s.active : ""}`} onClick={() => setSbTab("tasks")}>
                     Tasks{userTasks.length > 0 && <span className={s.cnt}>{userTasks.length}</span>}
                   </button>
-                  <button className={`${s.sbTab} ${sbTab === "approvals" ? s.active : ""}`} onClick={() => setSbTab("approvals")}>
+                  <button data-testid="home-subtab-approvals" className={`${s.sbTab} ${sbTab === "approvals" ? s.active : ""}`} onClick={() => setSbTab("approvals")}>
                     Approvals{approvals.length > 0 && <span className={s.cnt}>{approvals.length}</span>}
                   </button>
                 </div>
@@ -518,6 +522,7 @@ export function ConciergeShell() {
                     <button
                       type="button"
                       role="tab"
+                      data-testid="settings-tab-platform"
                       aria-selected={settingsTab === "platform"}
                       className={`${s.sbTab} ${settingsTab === "platform" ? s.active : ""}`}
                       onClick={() => setSettingsTab("platform")}
@@ -527,6 +532,7 @@ export function ConciergeShell() {
                     <button
                       type="button"
                       role="tab"
+                      data-testid="settings-tab-org"
                       aria-selected={settingsTab === "org"}
                       className={`${s.sbTab} ${settingsTab === "org" ? s.active : ""}`}
                       onClick={() => setSettingsTab("org")}
@@ -544,7 +550,7 @@ export function ConciergeShell() {
                       panel owns its own local active-tab state so it doesn't
                       fight the map's node selection. */}
                   {settingsTab === "platform" && (
-                    <div className={s.scard}>
+                    <div data-testid="settings-pane-platform" className={s.scard}>
                       <div className={s.scardHead}>
                         <div className={s.scardDesc}>
                           Update the concierge like any workspace: its config.yaml,
@@ -565,7 +571,7 @@ export function ConciergeShell() {
                   )}
 
                   {settingsTab === "org" && (
-                    <div className={s.scard}>
+                    <div data-testid="settings-pane-org" className={s.scard}>
                       <div className={s.scardHead}>
                         <div className={s.scardDesc}>
                           Secrets, workspace tokens, org API keys and organization
