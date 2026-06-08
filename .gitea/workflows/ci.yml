@@ -309,6 +309,11 @@ jobs:
         # #1815 — wires coverage into CI so we get a baseline visible on
         # every PR. No threshold gate yet; thresholds dial in (Step 3, also
         # tracked in #1815) after the team sees what current coverage is.
+        # Memory: the full vitest+v8-coverage process tree peaks at ~1.33 GB
+        # (measured 2026-06-08), comfortably within the runner — so this single
+        # run is BOTH the pass/fail gate and the coverage artifact (one SSOT, no
+        # split). The earlier intermittent red here was a DisplayTab paste-race
+        # (fixed in this PR), NOT a coverage OOM.
         run: npx vitest run --coverage
       - name: Upload coverage summary as artifact
         if: ${{ needs.changes.outputs.canvas == 'true' }}

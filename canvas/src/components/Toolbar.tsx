@@ -3,11 +3,9 @@
 import { useMemo, useState, useCallback, useEffect, useRef } from "react";
 import { api } from "@/lib/api";
 import { useCanvasStore } from "@/store/canvas";
-import { SettingsButton } from "@/components/settings/SettingsButton";
-import { settingsGearRef } from "@/components/settings/SettingsPanel";
+import { WORKSPACE_KIND } from "@/lib/workspace-kind";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { showToast } from "@/components/Toaster";
-import { ThemeToggle } from "@/components/ThemeToggle";
 import { statusDotClass } from "@/lib/design-tokens";
 import { KeyboardShortcutsDialog } from "@/components/KeyboardShortcutsDialog";
 
@@ -55,8 +53,11 @@ export function Toolbar() {
   }, [wsStatus]);
 
   const counts = useMemo(() => {
-    const c = { total: nodes.length, roots: 0, children: 0, online: 0, offline: 0, failed: 0, provisioning: 0, activeTasks: 0 };
-    for (const n of nodes) {
+    // Exclude the org-level platform agent (the concierge) — it's the
+    // undeletable org root surfaced in the shell, not a counted map workspace.
+    const mapNodes = nodes.filter((n) => n.data.kind !== WORKSPACE_KIND.Platform);
+    const c = { total: mapNodes.length, roots: 0, children: 0, online: 0, offline: 0, failed: 0, provisioning: 0, activeTasks: 0 };
+    for (const n of mapNodes) {
       if (n.data.parentId) c.children++; else c.roots++;
       const s = n.data.status;
       if (s === "online") c.online++;
@@ -460,11 +461,8 @@ export function Toolbar() {
         )}
       </div>
 
-      {/* Theme picker — System / Light / Dark */}
-      <ThemeToggle />
-
-      {/* Settings gear icon */}
-      <SettingsButton ref={settingsGearRef} />
+      {/* Theme picker + settings gear removed from the map toolbar — both now
+          live in the concierge global Settings (left rail) + topbar. */}
 
       <ConfirmDialog
         open={restartConfirmOpen}

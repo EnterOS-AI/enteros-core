@@ -275,9 +275,9 @@ describe("WorkspaceNode — status states", () => {
     expect(screen.getByText("STARTING")).toBeTruthy();
   });
 
-  it("suppresses status label for online node", () => {
+  it("shows status label for online node (concept: status always visible)", () => {
     renderNode({ status: "online" });
-    expect(screen.queryByText("ONLINE")).toBeNull();
+    expect(screen.getByText("ONLINE")).toBeTruthy();
   });
 
   it("shows degraded error preview when status is degraded and lastSampleError is set", () => {
@@ -404,14 +404,18 @@ describe("WorkspaceNode — double-click interactions", () => {
 });
 
 describe("WorkspaceNode — active tasks", () => {
-  it("shows active tasks badge when activeTasks > 0", () => {
+  it("shows the queued count when activeTasks > 0", () => {
     renderNode({ activeTasks: 3 });
-    expect(screen.getByText("3 tasks")).toBeTruthy();
+    expect(
+      screen.getByText((_, el) => el?.tagName === "SPAN" && (el.textContent ?? "").includes("3 queued")),
+    ).toBeTruthy();
   });
 
-  it("shows singular 'task' when activeTasks is 1", () => {
+  it("shows the queued count for a single task", () => {
     renderNode({ activeTasks: 1 });
-    expect(screen.getByText("1 task")).toBeTruthy();
+    expect(
+      screen.getByText((_, el) => el?.tagName === "SPAN" && (el.textContent ?? "").includes("1 queued")),
+    ).toBeTruthy();
   });
 
   it("suppresses badge when no active tasks", () => {
@@ -471,13 +475,15 @@ describe("WorkspaceNode — needs restart", () => {
 });
 
 describe("WorkspaceNode — descendant badge", () => {
-  it("shows descendant count badge when node has children in store", () => {
+  it("shows the agent count in the status line when node has children", () => {
     store().nodes = [
       makeNode({ id: "ws-1" }),
       { id: "child-1", data: { ...makeNode({ id: "ws-1" }).data, parentId: "ws-1" } },
     ];
     renderNode();
-    expect(screen.getByText("1 sub")).toBeTruthy();
+    expect(
+      screen.getByText((_, el) => el?.tagName === "SPAN" && (el.textContent ?? "").includes("1 agents")),
+    ).toBeTruthy();
   });
 
   it("suppresses badge when node has no children", () => {
@@ -527,9 +533,9 @@ describe("WorkspaceNode — skills pills", () => {
 });
 
 describe("WorkspaceNode — runtime badge", () => {
-  it("shows runtime badge when runtime is set", () => {
-    renderNode({ runtime: "hermes" });
-    expect(screen.getByText("hermes")).toBeTruthy();
+  it("shows the role pill (runtime pill replaced by role pill in the concept redesign)", () => {
+    renderNode({ role: "researcher" });
+    expect(screen.getByText("researcher")).toBeTruthy();
   });
 
   it("shows REMOTE badge for external runtime", () => {

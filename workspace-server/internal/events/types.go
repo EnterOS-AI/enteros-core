@@ -80,6 +80,10 @@ const (
 	EventApprovalRequested EventType = "APPROVAL_REQUESTED"
 	EventApprovalEscalated EventType = "APPROVAL_ESCALATED"
 
+	// User tasks (agent → user asks).
+	EventUserTaskRequested EventType = "USER_TASK_REQUESTED"
+	EventUserTaskResolved  EventType = "USER_TASK_RESOLVED"
+
 	// Auth / credentials.
 	EventExternalCredentialsRotated EventType = "EXTERNAL_CREDENTIALS_ROTATED"
 )
@@ -112,6 +116,8 @@ var AllEventTypes = []EventType{
 	EventDelegationStatus,
 	EventExternalCredentialsRotated,
 	EventTaskUpdated,
+	EventUserTaskRequested,
+	EventUserTaskResolved,
 	EventWorkspaceAwaitingAgent,
 	EventWorkspaceDegraded,
 	EventWorkspaceHeartbeat,

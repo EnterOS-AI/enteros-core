@@ -25,8 +25,8 @@ import {
 /**
  * Walk every parent node and bump its width/height (if explicitly set)
  * so the union of its children's relative bboxes plus padding fits. A
- * parent's size never shrinks via this path — only grows — because
- * shrinking on resize would fight the user's own NodeResizer drag.
+ * parent's size never shrinks via this path — only grows — so a parent
+ * that expanded to fit children stays expanded as their layout settles.
  */
 function growParentsToFitChildren<T extends Record<string, unknown>>(
   nodes: Node<T>[],
@@ -74,6 +74,12 @@ function growParentsToFitChildren<T extends Record<string, unknown>>(
 export { summarizeWorkspaceCapabilities } from "./canvas-capabilities";
 export type { WorkspaceCapabilitySummary } from "./canvas-capabilities";
 
+/** Canonical workspace `kind` values — the TS mirror of Go's models.Kind*
+ *  constants. Defined in a leaf module (`@/lib/workspace-kind`) and re-exported
+ *  here for convenience so consumers can keep importing from `@/store/canvas`.
+ *  Use these instead of the bare "platform"/"workspace" string literals. */
+export { WORKSPACE_KIND } from "@/lib/workspace-kind";
+
 export interface WorkspaceNodeData extends Record<string, unknown> {
   name: string;
   status: string;
@@ -86,6 +92,10 @@ export interface WorkspaceNodeData extends Record<string, unknown> {
   lastSampleError: string;
   url: string;
   parentId: string | null;
+  /** 'platform' = the org concierge (hidden from the map graph, surfaced as the
+   *  shell's org root); 'workspace' = ordinary agent. Optional: absent on older
+   *  ws-server builds / some event-constructed nodes — treat absent as ordinary. */
+  kind?: string;
   currentTask: string;
   runtime: string;
   workspaceAccess?: string | null;
@@ -142,6 +152,12 @@ export interface WorkspaceNodeData extends Record<string, unknown> {
 
 export type PanelTab = "details" | "skills" | "chat" | "terminal" | "display" | "container-config" | "config" | "schedule" | "channels" | "files" | "memory" | "traces" | "events" | "activity" | "audit";
 
+/**
+ * Top-level canvas view. "home" is the Org Concierge view (chat with the
+ * platform agent); "map" is the node-graph canvas (the original view).
+ */
+export type TopView = "home" | "map" | "settings";
+
 export interface ContextMenuState {
   x: number;
   y: number;
@@ -154,6 +170,8 @@ interface CanvasState {
   edges: Edge[];
   selectedNodeId: string | null;
   panelTab: PanelTab;
+  /** Top-level view: Org Concierge home (chat) vs the node-graph map. */
+  topView: TopView;
   dragOverNodeId: string | null;
   contextMenu: ContextMenuState | null;
   // Live width of the SidePanel in pixels. Only meaningful when
@@ -174,6 +192,7 @@ interface CanvasState {
   savePosition: (nodeId: string, x: number, y: number) => void;
   selectNode: (id: string | null) => void;
   setPanelTab: (tab: PanelTab) => void;
+  setTopView: (view: TopView) => void;
   getSelectedNode: () => Node<WorkspaceNodeData> | null;
   updateNodeData: (id: string, data: Partial<WorkspaceNodeData>) => void;
   restartWorkspace: (id: string, options?: { applyTemplate?: boolean }) => Promise<void>;
@@ -283,6 +302,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
   edges: [],
   selectedNodeId: null,
   panelTab: "chat",
+  topView: "home",
   dragOverNodeId: null,
   contextMenu: null,
   sidePanelWidth: 480, // matches SIDEPANEL_DEFAULT_WIDTH in SidePanel.tsx
@@ -418,6 +438,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
     }
   },
   setPanelTab: (tab) => set({ panelTab: tab }),
+  setTopView: (view) => set({ topView: view }),
   setDragOverNode: (id) => set({ dragOverNodeId: id }),
 
   batchNest: async (nodeIds, targetId) => {
@@ -951,8 +972,9 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
     // response to the child near its edge, the child's relative
     // position becomes valid again and the grow stops mid-drag, only to
     // resume on the next tick. Commit-on-release: only run grow when a
-    // change set contains a `dimensions` change (NodeResizer commit),
-    // not on pure `position` changes. Drag-stop grow is handled
+    // change set contains a `dimensions` change (React Flow's auto-measure
+    // of a card's fixed-size CSS), not on pure `position` changes. Drag-stop
+    // grow is handled
     // explicitly in Canvas.onNodeDragStop via growOnce().
     const hasDimensionChange = changes.some((c) => c.type === "dimensions");
     set({ nodes: hasDimensionChange ? growParentsToFitChildren(next) : next });

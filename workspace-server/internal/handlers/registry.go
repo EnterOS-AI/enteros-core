@@ -166,7 +166,7 @@ func (h *RegistryHandler) resolveDeliveryMode(ctx context.Context, workspaceID, 
 
 // errPlatformNotRoot is the client-facing message when a register call tried to
 // mark a non-root workspace as a platform agent.
-const errPlatformNotRoot = "a platform agent must be the org root (parent_id must be null)"
+const errPlatformNotRoot = "a platform agent must be the org root (parent_id must be null) and there can be only one per org"
 
 // isPlatformRootViolation reports whether err is the DB rejecting a register
 // that tried to mark a non-root workspace as a platform agent (the
@@ -175,7 +175,15 @@ const errPlatformNotRoot = "a platform agent must be the org root (parent_id mus
 // which structurally also guarantees one platform agent per org — is enforced
 // race-proof at the DB level; this is just the friendly surface.
 func isPlatformRootViolation(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "workspaces_platform_root_check")
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	// workspaces_platform_root_check: tried to mark a non-root (parented) row
+	// platform. uniq_workspaces_one_platform_root: tried to create a SECOND
+	// platform root. Both surface as a friendly 409 instead of a raw 500.
+	return strings.Contains(msg, "workspaces_platform_root_check") ||
+		strings.Contains(msg, "uniq_workspaces_one_platform_root")
 }
 
 // Returns a non-nil error suitable for including in a 400 Bad Request response.
@@ -351,6 +359,32 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 	// for /registry/heartbeat and /registry/update-card.
 	if err := h.requireWorkspaceToken(ctx, c, payload.ID); err != nil {
 		return // 401 response already written by requireWorkspaceToken
+	}
+
+	// SECURITY (privilege-escalation fix): the public register path must never
+	// CREATE or PROMOTE a row to kind='platform'. The org root is minted only by
+	// the AdminAuth/boot-gated install paths (InstallPlatformAgent /
+	// EnsureSelfHostedPlatformAgent). Without this, an ordinary in-VPC workspace
+	// could register a fresh UUID as {"kind":"platform"} (a bootstrap-allowed call,
+	// parent_id defaults NULL so the per-row CHECK is satisfied) and then be
+	// provisioned with the tenant org-admin token (MOLECULE_API_KEY=ADMIN_TOKEN).
+	// A platform agent re-registering its already-platform row (or omitting kind)
+	// is unaffected. uniq_workspaces_one_platform_root is the structural backstop;
+	// this is the friendly app-layer guard. Placed after the token check so it
+	// doesn't side-channel row existence (mirrors resolveDeliveryMode below).
+	if payload.Kind == models.KindPlatform {
+		var existingKind string
+		kErr := db.DB.QueryRowContext(ctx,
+			`SELECT kind FROM workspaces WHERE id = $1`, payload.ID).Scan(&existingKind)
+		switch {
+		case errors.Is(kErr, sql.ErrNoRows), kErr == nil && existingKind != models.KindPlatform:
+			c.JSON(http.StatusForbidden, gin.H{"error": "kind='platform' may only be assigned by the platform-agent install path"})
+			return
+		case kErr != nil && !errors.Is(kErr, sql.ErrNoRows):
+			log.Printf("Registry register: kind precheck failed for %s: %v", payload.ID, kErr)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "registration failed"})
+			return
+		}
 	}
 
 	// Resolve the EFFECTIVE delivery mode for THIS register call: the

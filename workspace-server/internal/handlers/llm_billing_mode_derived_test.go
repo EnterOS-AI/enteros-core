@@ -36,7 +36,18 @@ func expectOverrideQuery(m sqlmock.Sqlmock, wsID, value string) {
 		WillReturnRows(rows)
 }
 
+// withProxyConfigured sets the Molecule LLM proxy env (base URL + usage token)
+// for the duration of a test so PlatformManagedProxyConfigured() is true — i.e.
+// the SaaS context, where the default-closed billing mode is platform_managed.
+// Self-host (no proxy env) is covered separately by the *_SelfHost tests.
+func withProxyConfigured(t *testing.T) {
+	t.Helper()
+	t.Setenv("MOLECULE_LLM_BASE_URL", "https://proxy.example/v1")
+	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tok-test")
+}
+
 func TestResolveLLMBillingModeDerived_BehaviorDelta(t *testing.T) {
+	withProxyConfigured(t) // SaaS context: default-closed → platform_managed.
 	ctx := context.Background()
 	const wsID = "33333333-3333-3333-3333-333333333333"
 
@@ -193,6 +204,9 @@ func TestResolveLLMBillingModeDerived_BehaviorDelta(t *testing.T) {
 // error reading the override column defaults closed to platform_managed and
 // propagates the error — never silently flips a workspace off platform creds.
 func TestResolveLLMBillingModeDerived_OverrideDBError_DefaultClosed(t *testing.T) {
+	// A transient DB error MUST default to platform_managed regardless of proxy
+	// config (it propagates an error; it is not the no-proxy decision path).
+	withProxyConfigured(t)
 	ctx := context.Background()
 	const wsID = "44444444-4444-4444-4444-444444444444"
 
@@ -217,6 +231,7 @@ func TestResolveLLMBillingModeDerived_OverrideDBError_DefaultClosed(t *testing.T
 // pre-provision context (no workspace id, no override read) defaults to
 // platform_managed without a DB query.
 func TestResolveLLMBillingModeDerived_EmptyWorkspaceID_PlatformDefault(t *testing.T) {
+	withProxyConfigured(t) // SaaS context.
 	ctx := context.Background()
 	mock := setupTestDB(t) // no query expected
 	res, err := ResolveLLMBillingModeDerived(ctx, "", "claude-code", "kimi-for-coding", nil)
@@ -229,4 +244,91 @@ func TestResolveLLMBillingModeDerived_EmptyWorkspaceID_PlatformDefault(t *testin
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("sqlmock expectations: %v", err)
 	}
+}
+
+// TestResolveLLMBillingModeDerived_SelfHost_DefaultsBYOK asserts the
+// environment-aware default: on a SELF-HOSTED stack (no Molecule LLM proxy env
+// configured) the default-closed branches resolve to byok instead of
+// platform_managed (which is unreachable there). It covers all three derive-
+// failure fallbacks: unset model, unregistered model, and the empty-workspace
+// pre-provision path. A successfully-DERIVED provider and an explicit override
+// are NOT affected by the no-proxy default (decided before the fallback).
+func TestResolveLLMBillingModeDerived_SelfHost_DefaultsBYOK(t *testing.T) {
+	// Ensure no proxy env leaks in from the host.
+	t.Setenv("MOLECULE_LLM_BASE_URL", "")
+	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "")
+	t.Setenv("OPENAI_BASE_URL", "")
+	t.Setenv("OPENAI_API_KEY", "")
+	ctx := context.Background()
+	const wsID = "55555555-5555-5555-5555-555555555555"
+
+	t.Run("unset_model_defaults_byok_on_selfhost", func(t *testing.T) {
+		mock := setupTestDB(t)
+		expectOverrideQuery(mock, wsID, "") // NULL override
+		res, err := ResolveLLMBillingModeDerived(ctx, wsID, "claude-code", "", nil)
+		if err != nil {
+			t.Fatalf("unexpected err: %v", err)
+		}
+		if res.ResolvedMode != LLMBillingModeBYOK {
+			t.Errorf("self-host unset model: got %q want byok", res.ResolvedMode)
+		}
+		if res.Source != BillingModeSourceDerivedDefault {
+			t.Errorf("source: got %q want %q", res.Source, BillingModeSourceDerivedDefault)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("sqlmock expectations: %v", err)
+		}
+	})
+
+	t.Run("unregistered_model_defaults_byok_on_selfhost", func(t *testing.T) {
+		mock := setupTestDB(t)
+		expectOverrideQuery(mock, wsID, "")
+		res, err := ResolveLLMBillingModeDerived(ctx, wsID, "claude-code", "totally-made-up-model-xyz", nil)
+		if err != nil {
+			t.Fatalf("unexpected err: %v", err)
+		}
+		if res.ResolvedMode != LLMBillingModeBYOK {
+			t.Errorf("self-host unregistered model: got %q want byok", res.ResolvedMode)
+		}
+		if res.Source != BillingModeSourceDerivedDefault {
+			t.Errorf("source: got %q want %q", res.Source, BillingModeSourceDerivedDefault)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("sqlmock expectations: %v", err)
+		}
+	})
+
+	t.Run("empty_workspace_id_defaults_byok_on_selfhost", func(t *testing.T) {
+		mock := setupTestDB(t) // no query expected (pre-provision path)
+		res, err := ResolveLLMBillingModeDerived(ctx, "", "claude-code", "kimi-for-coding", nil)
+		if err != nil {
+			t.Fatalf("unexpected err: %v", err)
+		}
+		if res.ResolvedMode != LLMBillingModeBYOK {
+			t.Errorf("self-host empty workspace id: got %q want byok", res.ResolvedMode)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("sqlmock expectations: %v", err)
+		}
+	})
+
+	t.Run("explicit_platform_override_still_wins_on_selfhost", func(t *testing.T) {
+		// An operator override is honored even on self-host (escape hatch); the
+		// no-proxy default only governs the derive-failure fallback.
+		mock := setupTestDB(t)
+		expectOverrideQuery(mock, wsID, LLMBillingModePlatformManaged)
+		res, err := ResolveLLMBillingModeDerived(ctx, wsID, "claude-code", "", nil)
+		if err != nil {
+			t.Fatalf("unexpected err: %v", err)
+		}
+		if res.ResolvedMode != LLMBillingModePlatformManaged {
+			t.Errorf("explicit override must win: got %q want platform_managed", res.ResolvedMode)
+		}
+		if res.Source != BillingModeSourceWorkspaceOverride {
+			t.Errorf("source: got %q want %q", res.Source, BillingModeSourceWorkspaceOverride)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("sqlmock expectations: %v", err)
+		}
+	})
 }

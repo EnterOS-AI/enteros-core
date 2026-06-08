@@ -429,6 +429,9 @@ jobs:
         # round-trip is covered by the priority-runtimes `mock` arm, not here.
         if: needs.detect-changes.outputs.api == 'true'
         run: bash tests/e2e/test_keyless_feature_contracts_e2e.sh
+      - name: Run user_tasks E2E (REST + MCP — agent→user action requests)
+        if: needs.detect-changes.outputs.api == 'true'
+        run: bash tests/e2e/test_user_tasks_e2e.sh
       - name: Run secrets-dispatch contract test (keyless SECRETS_JSON branch order)
         # Previously orphaned (no workflow referenced it). Hermetic unit-style
         # contract over test_staging_full_saas.sh's LLM-key branch precedence —

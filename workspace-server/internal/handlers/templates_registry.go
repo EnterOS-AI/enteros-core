@@ -80,10 +80,25 @@ func enrichFromRegistry(summary *templateSummary, runtime string) {
 		return
 	}
 
+	// SSOT filter (the BLOCKER): when no Molecule LLM proxy is wired into this
+	// process the platform_managed billing path cannot inject a credential, so
+	// the closed `platform` provider (and every model that derives to it) is
+	// not actually selectable. Drop it AT THE SOURCE so every consumer of the
+	// /templates payload (ConfigTab, CreateWorkspaceDialog, MissingKeysModal)
+	// respects it — instead of a frontend leaf-filter that each consumer must
+	// remember to apply. On SaaS the proxy is configured -> proxyOn=true and
+	// this is a no-op, leaving the payload byte-identical to before.
+	proxyOn := PlatformManagedProxyConfigured()
+
 	// registry_providers — the runtime's native provider set, in registry
 	// declared order, projected to the canvas-facing view.
 	views := make([]registryProviderView, 0, len(provs))
 	for _, p := range provs {
+		if !proxyOn && p.IsPlatform() {
+			// Self-host: no proxy -> platform-managed billing is impossible.
+			// Hide the platform provider so it can't be offered anywhere.
+			continue
+		}
 		views = append(views, registryProviderView{
 			Name:        p.Name,
 			DisplayName: p.DisplayName,
@@ -110,6 +125,12 @@ func enrichFromRegistry(summary *templateSummary, runtime string) {
 	for _, id := range models {
 		ms := modelSpec{ID: id}
 		if derived, derr := m.DeriveProvider(runtime, id, nil); derr == nil {
+			if !proxyOn && derived.IsPlatform() {
+				// Self-host: this model derives to the platform-managed
+				// provider, which is unusable without a proxy. Drop it at the
+				// source so it can't leak as a selectable id in any consumer.
+				continue
+			}
 			ms.Provider = derived.Name
 			ms.BillingMode = billingModeForRegistryProvider(derived)
 			ms.RequiredEnv = requiredEnvForRegistryProvider(derived)

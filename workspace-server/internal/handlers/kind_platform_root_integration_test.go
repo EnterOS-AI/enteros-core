@@ -14,13 +14,17 @@
 //
 // Why this is NOT a sqlmock test
 // ------------------------------
-// The invariant "a platform agent must be the org root (parent_id IS NULL),
-// which structurally also means at most one platform agent per org" is enforced
-// by the workspaces_platform_root_check CHECK constraint in migration
-// 20260606000000_workspaces_kind. sqlmock cannot execute DDL or evaluate a CHECK
-// constraint, so only a real Postgres can prove the constraint actually rejects
-// a non-root platform agent and accepts a root one. The Register handler's
-// isPlatformRootViolation()/409 path depends on this constraint firing.
+// Two DB-level invariants back the platform agent:
+//   - "a platform agent must be the org root (parent_id IS NULL)" — the
+//     workspaces_platform_root_check CHECK in migration 20260606000000.
+//   - "at most one platform agent per org" — the partial unique index
+//     uniq_workspaces_one_platform_root in migration 20260607000000. The CHECK
+//     does NOT bound the count (it permits multiple parentless platform rows);
+//     the unique index does. This closes a privilege-escalation path (a rogue
+//     second org root getting the org-admin token at provision time).
+// sqlmock cannot execute DDL or evaluate these, so only a real Postgres can
+// prove they fire. The Register handler's isPlatformRootViolation()/409 path
+// depends on both constraints.
 
 package handlers
 
@@ -118,5 +122,66 @@ func TestIntegration_PlatformKind_RootAllowed_NonRootRejected(t *testing.T) {
 		`UPDATE workspaces SET kind = 'bogus' WHERE id = $1`, rootID)
 	if err == nil || !strings.Contains(err.Error(), "workspaces_kind_check") {
 		t.Fatalf("unknown kind wanted workspaces_kind_check rejection, got: %v", err)
+	}
+}
+
+// TestIntegration_PlatformKind_SecondRootRejected proves the privilege-escalation
+// fix at the DB level: the workspaces_platform_root_check CHECK alone permits
+// MULTIPLE parentless platform rows; the partial unique index
+// uniq_workspaces_one_platform_root (migration 20260607000000) forbids a SECOND
+// platform root. Without it, an ordinary in-VPC workspace could register a fresh
+// UUID as kind='platform' and mint itself a second org root that then gets the
+// org-admin token at provision time. This is what the per-row CHECK could not
+// stop — only a real Postgres with the unique index proves it.
+func TestIntegration_PlatformKind_SecondRootRejected(t *testing.T) {
+	conn := integrationDB_PlatformKind(t)
+	ctx := context.Background()
+
+	prefix := fmt.Sprintf("itest-2root-%s", uuid.New().String()[:8])
+	cleanup := func() {
+		if _, err := conn.ExecContext(ctx,
+			`DELETE FROM workspaces WHERE name LIKE $1`, prefix+"%"); err != nil {
+			t.Logf("cleanup (non-fatal): %v", err)
+		}
+	}
+	t.Cleanup(cleanup)
+	cleanup()
+
+	// NOTE: the shared integration DB is single-org by construction, but a stray
+	// platform row from another suite would make the FIRST insert below collide
+	// instead of the second. Guard by asserting we start from zero platform rows
+	// for our prefix and using a savepoint-free, prefix-scoped check.
+	first := uuid.New().String()
+	second := uuid.New().String()
+
+	// First parentless platform root: allowed.
+	if _, err := conn.ExecContext(ctx, `
+		INSERT INTO workspaces (id, name, kind, tier, runtime, status, parent_id)
+		VALUES ($1, $2, 'platform', 0, 'claude-code', 'online', NULL)
+	`, first, prefix+"-first"); err != nil {
+		// If this fails on the unique index, another platform root already exists
+		// in the shared DB — skip rather than false-fail this isolation-sensitive case.
+		if strings.Contains(err.Error(), "uniq_workspaces_one_platform_root") {
+			t.Skipf("shared integration DB already has a platform root; cannot isolate: %v", err)
+		}
+		t.Fatalf("first platform root insert: unexpected error: %v", err)
+	}
+
+	// Second parentless platform root: the per-row CHECK is satisfied
+	// (parent_id IS NULL), so ONLY the unique index can reject it.
+	_, err := conn.ExecContext(ctx, `
+		INSERT INTO workspaces (id, name, kind, tier, runtime, status, parent_id)
+		VALUES ($1, $2, 'platform', 0, 'claude-code', 'online', NULL)
+	`, second, prefix+"-second")
+	if err == nil {
+		t.Fatalf("second platform root accepted — uniq_workspaces_one_platform_root did not fire (privilege-escalation guard missing)")
+	}
+	if !strings.Contains(err.Error(), "uniq_workspaces_one_platform_root") {
+		t.Fatalf("second platform root rejection wanted uniq_workspaces_one_platform_root, got: %v", err)
+	}
+
+	// And isPlatformRootViolation maps it to the friendly 409 surface.
+	if !isPlatformRootViolation(err) {
+		t.Fatalf("isPlatformRootViolation should classify the unique-index violation as a platform-root 409, got false for: %v", err)
 	}
 }

@@ -302,8 +302,14 @@ func (h *WorkspaceHandler) buildProvisionerConfig(
 	// present) wins, matching the existing WorkspaceDir precedence.
 	workspacePath := payload.WorkspaceDir
 	workspaceAccess := payload.WorkspaceAccess
-	if (workspacePath == "" || workspaceAccess == "") && db.DB != nil {
-		var dbDir, dbAccess string
+	// kind drives the platform-agent image selection in the provisioner (a
+	// kind='platform' concierge runs on the platform-agent image variant, which
+	// bakes /opt/molecule-mcp-server so the org-admin MCP can load). Sourced from
+	// the DB row (CreateWorkspacePayload carries no kind — the row is the SSOT,
+	// written by InstallPlatformAgent / EnsureSelfHostedPlatformAgent).
+	var kind string
+	if db.DB != nil {
+		var dbDir, dbAccess, dbKind string
 		// QueryRowContext (not QueryRow) so the provision-timeout ctx
 		// propagates here too. Previously ctx flowed in only to be passed
 		// to resolveRuntimeImage; that dead reader was removed by
@@ -312,15 +318,16 @@ func (h *WorkspaceHandler) buildProvisionerConfig(
 		// nudge (a 10s ProvisionTimeout now actually bounds this lookup).
 		if err := db.DB.QueryRowContext(
 			ctx,
-			`SELECT COALESCE(workspace_dir, ''), COALESCE(workspace_access, 'none') FROM workspaces WHERE id = $1`,
+			`SELECT COALESCE(workspace_dir, ''), COALESCE(workspace_access, 'none'), COALESCE(kind, 'workspace') FROM workspaces WHERE id = $1`,
 			workspaceID,
-		).Scan(&dbDir, &dbAccess); err == nil {
+		).Scan(&dbDir, &dbAccess, &dbKind); err == nil {
 			if workspacePath == "" && dbDir != "" {
 				workspacePath = dbDir
 			}
 			if workspaceAccess == "" {
 				workspaceAccess = dbAccess
 			}
+			kind = dbKind
 		}
 	}
 	if workspacePath == "" {
@@ -337,6 +344,7 @@ func (h *WorkspaceHandler) buildProvisionerConfig(
 		PluginsPath:     pluginsPath,
 		WorkspacePath:   workspacePath,
 		WorkspaceAccess: workspaceAccess,
+		Kind:            kind,
 		Tier:            payload.Tier,
 		Runtime:         payload.Runtime,
 		InstanceType:    payload.Compute.InstanceType,
@@ -1296,6 +1304,25 @@ func firstNonEmptyEnv(names ...string) string {
 		}
 	}
 	return ""
+}
+
+// PlatformManagedProxyConfigured reports whether a Molecule LLM proxy is wired
+// into THIS workspace-server process — i.e. whether the platform_managed billing
+// path can actually inject a usable credential. It is the SAME precondition the
+// strip gate enforces in applyPlatformManagedLLMEnv on the platform_managed
+// branch: a proxy base URL (MOLECULE_LLM_BASE_URL / OPENAI_BASE_URL) AND a proxy
+// usage token (MOLECULE_LLM_USAGE_TOKEN / OPENAI_API_KEY) must BOTH be present.
+//
+// On a SELF-HOSTED stack neither is set (there is no hosted Molecule proxy and
+// no org credit ledger), so this returns false and platform_managed cannot work.
+// The open GET /org/identity handler surfaces this as platform_managed_available
+// so the canvas can hide the "Platform (proxy)" option and default to BYOK.
+// On SaaS the CP provisioner exports both, so it returns true and the canvas
+// behaves exactly as before.
+func PlatformManagedProxyConfigured() bool {
+	baseURL := firstNonEmptyEnv("MOLECULE_LLM_BASE_URL", "OPENAI_BASE_URL")
+	token := firstNonEmptyEnv("MOLECULE_LLM_USAGE_TOKEN", "OPENAI_API_KEY")
+	return baseURL != "" && token != ""
 }
 
 // loadWorkspaceSecrets loads global + workspace-specific secrets into a map.

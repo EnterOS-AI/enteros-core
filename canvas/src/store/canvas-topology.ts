@@ -1,6 +1,7 @@
 import type { Node, Edge } from "@xyflow/react";
 import type { WorkspaceData } from "./socket";
 import type { WorkspaceNodeData } from "./canvas";
+import { WORKSPACE_KIND } from "@/lib/workspace-kind";
 
 const H_SPACING = 320;
 const V_SPACING = 200;
@@ -51,13 +52,13 @@ export function sortParentsBeforeChildren<T extends { id: string; parentId?: str
 }
 
 // Grid-slot defaults for children laid under a parent. The card
-// component (WorkspaceNode.tsx) sets `max-w-[240px]` on leaves, so a
-// slot stride of CHILD_DEFAULT_WIDTH + CHILD_GUTTER guarantees cards
-// never bleed into their neighbour's slot. Keep these in sync with
-// the Go mirror in workspace-server/internal/handlers/org.go —
-// changing one without the other leads to import-time / runtime drift.
-export const CHILD_DEFAULT_WIDTH = 240;
-export const CHILD_DEFAULT_HEIGHT = 130;
+// component (WorkspaceNode.tsx) renders leaves at exactly w-[300px] /
+// min-h-[176px], so a slot stride of CHILD_DEFAULT_WIDTH + CHILD_GUTTER
+// guarantees cards never bleed into their neighbour's slot. Keep these
+// in sync with the Go mirror in workspace-server/internal/handlers/org.go
+// — changing one without the other leads to import-time / runtime drift.
+export const CHILD_DEFAULT_WIDTH = 300;
+export const CHILD_DEFAULT_HEIGHT = 176;
 // Parent header space — reserves room above the child grid so the
 // parent's own name + runtime pill + clamped role + currentTask
 // banner aren't covered by the first row of child cards. The
@@ -529,6 +530,10 @@ export function buildNodesAndEdges(
         // — leave undefined so the chat UI's "?? 'push'" fallback applies.
         deliveryMode: ws.delivery_mode,
         compute: ws.compute,
+        // Org-level platform agent ('platform') vs ordinary workspace. The map
+        // view hides the platform root (it's the undeletable org anchor) via
+        // stripPlatformRootForMap; the shell home tree keeps it as ROOT.
+        kind: ws.kind ?? WORKSPACE_KIND.Workspace,
       },
     };
     if (hasParent) {
@@ -553,10 +558,10 @@ export function buildNodesAndEdges(
     //   - Collapsed parents: leaf-sized (header-only card).
     //   - Leaves: leaf-sized — they land in their grid slot cleanly.
     //
-    // NodeResizer still drives user-initiated growth at runtime; these
-    // are only the initial values, and React Flow updates them in place
-    // when the user drags a resize handle. A future hydrate() will
-    // reset to the default until we persist width/height server-side.
+    // Sizes are fully system-controlled (free-resize was removed): these
+    // initial values stand, and at runtime React Flow re-measures leaves
+    // from their fixed-size card CSS while parents grow to fit children
+    // (growParentsToFitChildren). Width/height are never persisted.
     const kids = childCounts.get(ws.id) ?? 0;
     if (kids > 0 && !ws.collapsed) {
       const size = parentSize.get(ws.id)!;
@@ -624,4 +629,54 @@ export function getConfigurationError(
   if (getConfigurationStatus(agentCard) !== "not_configured") return null;
   const raw = agentCard.configuration_error;
   return typeof raw === "string" && raw.length > 0 ? raw : null;
+}
+
+/**
+ * Map-view filter: removes the org-level platform agent (the concierge) from
+ * the node graph. The platform agent is the undeletable org ROOT — every other
+ * workspace hangs under it — so it is surfaced as the shell's org anchor
+ * (topbar + Home tree), NOT as a draggable/deletable map node.
+ *
+ * Its direct children are promoted to top-level: React Flow stores child
+ * positions RELATIVE to the parent, so when the parent is dropped each child is
+ * converted back to an absolute position (parent.position + child.position) and
+ * its parent binding cleared. Edges touching the platform node are dropped.
+ *
+ * The store keeps the full node set (the shell's Home agent tree renders the
+ * platform as ROOT); only the map's React Flow input is stripped.
+ */
+export function stripPlatformRootForMap(
+  nodes: Node<WorkspaceNodeData>[],
+  edges: Edge[],
+): { nodes: Node<WorkspaceNodeData>[]; edges: Edge[] } {
+  const platformIds = new Set(
+    nodes.filter((n) => n.data.kind === WORKSPACE_KIND.Platform).map((n) => n.id),
+  );
+  if (platformIds.size === 0) return { nodes, edges };
+
+  const posById = new Map(nodes.map((n) => [n.id, n.position]));
+  const outNodes = nodes
+    .filter((n) => !platformIds.has(n.id))
+    .map((n) => {
+      const pid = n.parentId;
+      if (pid && platformIds.has(pid)) {
+        const parentPos = posById.get(pid) ?? { x: 0, y: 0 };
+        return {
+          ...n,
+          parentId: undefined,
+          extent: undefined,
+          position: {
+            x: parentPos.x + n.position.x,
+            y: parentPos.y + n.position.y,
+          },
+          data: { ...n.data, parentId: null },
+        } as Node<WorkspaceNodeData>;
+      }
+      return n;
+    });
+
+  const outEdges = edges.filter(
+    (e) => !platformIds.has(e.source) && !platformIds.has(e.target),
+  );
+  return { nodes: outNodes, edges: outEdges };
 }

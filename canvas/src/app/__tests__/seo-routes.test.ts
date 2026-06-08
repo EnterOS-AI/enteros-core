@@ -10,7 +10,7 @@ import { describe, it, expect, vi } from "vitest";
 // transform). We import layout.tsx only for its exported `metadata`
 // constant — mock the font module to a constructor-returning stub.
 vi.mock("next/font/google", () => ({
-  Inter: () => ({ variable: "--font-inter" }),
+  Hanken_Grotesk: () => ({ variable: "--font-hanken" }),
   JetBrains_Mono: () => ({ variable: "--font-jetbrains" }),
 }));
 

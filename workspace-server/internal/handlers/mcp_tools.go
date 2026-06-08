@@ -428,6 +428,111 @@ func (h *MCPHandler) toolSendMessageToUser(ctx context.Context, workspaceID stri
 	return "Message sent.", nil
 }
 
+// toolRequestUserAction implements request_user_action — the agent raises a
+// tracked ask for the human user (it appears in the concierge Tasks list).
+// Mirrors the user_tasks REST Create handler. Unlike send_message_to_user it
+// is not gated behind MOLECULE_MCP_ALLOW_SEND_MESSAGE — raising an ask is
+// always allowed.
+func (h *MCPHandler) toolRequestUserAction(ctx context.Context, workspaceID string, args map[string]interface{}) (string, error) {
+	title, _ := args["title"].(string)
+	if title == "" {
+		return "", fmt.Errorf("title is required")
+	}
+	detail, _ := args["detail"].(string)
+
+	// SSOT for user-task persistence + validation + broadcast — see
+	// user_task_store.go. Pre-consolidation this hand-wrote the same INSERT
+	// and USER_TASK_REQUESTED broadcast the REST Create handler did.
+	if _, err := h.userTaskStore().Create(ctx, workspaceID, title, detail); err != nil {
+		return "", fmt.Errorf("failed to create user task: %w", err)
+	}
+
+	return "Asked the user: " + title, nil
+}
+
+// toolListUserTasks implements list_user_tasks — the asks THIS workspace
+// raised, with status. Returns a JSON array string.
+func (h *MCPHandler) toolListUserTasks(ctx context.Context, workspaceID string) (string, error) {
+	rows, err := h.userTaskStore().List(ctx, workspaceID)
+	if err != nil {
+		return "", fmt.Errorf("failed to list user tasks: %w", err)
+	}
+
+	// The MCP surface returns a slimmer shape than the REST list (no
+	// resolved_at / resolved_by). Project the store rows down so the
+	// existing tool output stays stable.
+	type ut struct {
+		ID        string  `json:"id"`
+		Title     string  `json:"title"`
+		Detail    *string `json:"detail"`
+		Status    string  `json:"status"`
+		CreatedAt string  `json:"created_at"`
+	}
+	tasks := make([]ut, 0, len(rows))
+	for _, r := range rows {
+		tasks = append(tasks, ut{
+			ID:        r.ID,
+			Title:     r.Title,
+			Detail:    r.Detail,
+			Status:    r.Status,
+			CreatedAt: r.CreatedAt,
+		})
+	}
+	out, err := json.Marshal(tasks)
+	if err != nil {
+		return "", fmt.Errorf("failed to encode user tasks: %w", err)
+	}
+	return string(out), nil
+}
+
+// toolUpdateUserTask implements update_user_task — edit a task this workspace
+// raised (title / detail / status). Scoped by workspace_id.
+func (h *MCPHandler) toolUpdateUserTask(ctx context.Context, workspaceID string, args map[string]interface{}) (string, error) {
+	taskID, _ := args["user_task_id"].(string)
+	if taskID == "" {
+		return "", fmt.Errorf("user_task_id is required")
+	}
+	var title, detail, status *string
+	if v, ok := args["title"].(string); ok && v != "" {
+		title = &v
+	}
+	if v, ok := args["detail"].(string); ok && v != "" {
+		detail = &v
+	}
+	if v, ok := args["status"].(string); ok && v != "" {
+		status = &v
+	}
+
+	// SSOT for the COALESCE update + status-enum validation — see
+	// user_task_store.go.
+	if err := h.userTaskStore().Update(ctx, workspaceID, taskID, title, detail, status); err != nil {
+		if errors.Is(err, ErrInvalidUserTaskStatus) {
+			return "", fmt.Errorf("status must be 'pending', 'done' or 'dismissed'")
+		}
+		if errors.Is(err, ErrUserTaskNotFound) {
+			return "", fmt.Errorf("user task not found")
+		}
+		return "", fmt.Errorf("failed to update user task: %w", err)
+	}
+	return "User task updated.", nil
+}
+
+// toolDeleteUserTask implements delete_user_task — remove a task this
+// workspace raised. Scoped by workspace_id.
+func (h *MCPHandler) toolDeleteUserTask(ctx context.Context, workspaceID string, args map[string]interface{}) (string, error) {
+	taskID, _ := args["user_task_id"].(string)
+	if taskID == "" {
+		return "", fmt.Errorf("user_task_id is required")
+	}
+	if err := h.userTaskStore().Delete(ctx, workspaceID, taskID); err != nil {
+		if errors.Is(err, ErrUserTaskNotFound) {
+			return "", fmt.Errorf("user task not found")
+		}
+		return "", fmt.Errorf("failed to delete user task: %w", err)
+	}
+	return "User task deleted.", nil
+}
+
 func parseAgentMessageAttachments(raw interface{}) ([]AgentMessageAttachment, error) {
 	if raw == nil {
 		return nil, nil

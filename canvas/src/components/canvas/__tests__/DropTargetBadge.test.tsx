@@ -188,11 +188,13 @@ describe("DropTargetBadge — renders ghost slot + badge for valid drag target",
     });
     render(<DropTargetBadge />);
     expect(screen.getByTestId("ghost-slot")).toBeTruthy();
-    // Ghost uses slotBR from 3rd call: slotBR - slotTL = (712-232, 920-660)
+    // Ghost spans one default child slot at zoom 2: width = CHILD_DEFAULT_WIDTH
+    // (300) × 2 = 600; height = CHILD_DEFAULT_HEIGHT (176) × 2 = 352. left/top
+    // are the column-0/row-0 slot origin (unchanged by the card-size bump).
     expect(screen.getByTestId("ghost-slot").style.left).toBe("232px");
     expect(screen.getByTestId("ghost-slot").style.top).toBe("660px");
-    expect(screen.getByTestId("ghost-slot").style.width).toBe("480px");
-    expect(screen.getByTestId("ghost-slot").style.height).toBe("260px");
+    expect(screen.getByTestId("ghost-slot").style.width).toBe("600px");
+    expect(screen.getByTestId("ghost-slot").style.height).toBe("352px");
   });
 
   it("ghost is hidden when slot falls entirely outside parent bounds", () => {
