@@ -163,6 +163,50 @@ func LocalImageLatestTag(runtime string) string {
 	return fmt.Sprintf("%s/workspace-template-%s:latest", localImagePrefix, runtime)
 }
 
+// platformAgentImageSuffix names the dedicated platform-agent image variant
+// (the plain runtime image + a baked /opt/molecule-mcp-server so the org-admin
+// platform MCP can load). The local image tag is
+// `molecule-local/workspace-template-<runtime>-platform-agent:<tag>`, built from
+// workspace-configs-templates/claude-code-default/Dockerfile.platform-agent.
+const platformAgentImageSuffix = "-platform-agent"
+
+// LocalPlatformAgentLatestTag returns the floating `:latest` tag for the
+// platform-agent image variant of a runtime in local-build mode. This is the
+// image the local Docker provisioner prefers for a kind='platform' workspace
+// (the org concierge) so the platform MCP binary is present.
+func LocalPlatformAgentLatestTag(runtime string) string {
+	return fmt.Sprintf("%s/workspace-template-%s%s:latest", localImagePrefix, runtime, platformAgentImageSuffix)
+}
+
+// resolvePlatformAgentImage returns the platform-agent image variant to use for
+// a kind='platform' workspace, or ("", false) when no such image is available
+// (so the caller falls back to the plain runtime image). It is deliberately
+// gated on the image already being present in the local store: the
+// platform-agent image is built out-of-band (Dockerfile.platform-agent), not by
+// the runtime template repo's local-build clone, so we never try to build it
+// here — we only USE it if an operator has built+tagged it.
+//
+// fallbackImage is the plain runtime image the caller already resolved; it is
+// only used to keep the log line informative. hasTagFn is the docker
+// image-inspect probe (seam for tests).
+func resolvePlatformAgentImage(ctx context.Context, runtime, fallbackImage string, hasTagFn func(ctx context.Context, tag string) (bool, error)) (string, bool) {
+	tag := LocalPlatformAgentLatestTag(runtime)
+	if hasTagFn == nil {
+		hasTagFn = dockerHasTagProd
+	}
+	exists, err := hasTagFn(ctx, tag)
+	if err != nil {
+		log.Printf("local-build: platform-agent image probe for %s failed (%v); falling back to plain runtime image %s — the concierge's platform MCP will be skipped (build %s via Dockerfile.platform-agent to enable it)", tag, err, fallbackImage, tag)
+		return "", false
+	}
+	if !exists {
+		log.Printf("local-build: platform-agent image %s not present; falling back to plain runtime image %s — the concierge's platform MCP will be skipped (build %s via Dockerfile.platform-agent to enable it)", tag, fallbackImage, tag)
+		return "", false
+	}
+	log.Printf("local-build: kind=platform → using platform-agent image %s (bakes /opt/molecule-mcp-server)", tag)
+	return tag, true
+}
+
 // EnsureLocalImage is the entry point the provisioner calls before
 // ContainerCreate when Resolve().Mode == RegistryModeLocal. Returns the
 // image tag (SHA-pinned form) the caller should hand to Docker, or an

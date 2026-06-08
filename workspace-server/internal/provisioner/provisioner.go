@@ -89,6 +89,14 @@ const (
 
 	// ProvisionTimeout is how long to wait for first heartbeat before marking as failed.
 	ProvisionTimeout = 3 * time.Minute
+
+	// WorkspaceKindPlatform mirrors models.KindPlatform — the org-level
+	// concierge / platform agent. Duplicated here (rather than importing the
+	// models package from the lower-level provisioner) so the image-resolution
+	// branch can compare WorkspaceConfig.Kind without pulling a higher-level
+	// dependency into the provisioner. Kept in sync with models.KindPlatform
+	// (a provisioner test asserts the two agree).
+	WorkspaceKindPlatform = "platform"
 )
 
 // WorkspaceConfig holds the parameters needed to provision a workspace container.
@@ -116,6 +124,14 @@ type WorkspaceConfig struct {
 	WorkspaceSecretKeys map[string]struct{}
 	WorkspaceAccess     string // #65: "none" (default), "read_only", or "read_write"
 	ResetClaudeSession  bool   // #12: if true, discard the claude-sessions volume before start (fresh session dir)
+
+	// Kind is the workspace kind: "" / "workspace" (ordinary) or "platform"
+	// (the org-level concierge / platform agent). When "platform", the local
+	// Docker provisioner prefers the platform-agent image variant (which bakes
+	// /opt/molecule-mcp-server so the org-admin platform MCP can load) over the
+	// plain runtime image. See models.KindPlatform + RFC
+	// docs/design/rfc-platform-agent.md.
+	Kind string
 
 	// Image, when non-empty, overrides the runtime→image lookup. CP
 	// (molecule-controlplane) is the single SSOT for runtime image digest
@@ -499,6 +515,21 @@ func (p *Provisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string, e
 			}
 			image = builtTag
 			log.Printf("Provisioner: local-build mode → using locally-built image %s for runtime %s", image, cfg.Runtime)
+
+			// kind='platform' (the org concierge): prefer the platform-agent
+			// image variant, which bakes /opt/molecule-mcp-server so the
+			// org-admin platform MCP can load. Gated on the image being present
+			// — if an operator hasn't built it (Dockerfile.platform-agent), we
+			// fall back to the plain runtime image + log, so an ordinary local
+			// stack keeps working (the concierge just runs without org-admin
+			// tools, exactly as before this change). Never breaks normal
+			// workspaces (kind != platform) or the SaaS/CP path (handled in the
+			// control-plane provisioner — separate repo).
+			if cfg.Kind == WorkspaceKindPlatform {
+				if paTag, ok := resolvePlatformAgentImage(ctx, cfg.Runtime, image, nil); ok {
+					image = paTag
+				}
+			}
 		}
 	}
 

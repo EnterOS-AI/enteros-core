@@ -302,8 +302,14 @@ func (h *WorkspaceHandler) buildProvisionerConfig(
 	// present) wins, matching the existing WorkspaceDir precedence.
 	workspacePath := payload.WorkspaceDir
 	workspaceAccess := payload.WorkspaceAccess
-	if (workspacePath == "" || workspaceAccess == "") && db.DB != nil {
-		var dbDir, dbAccess string
+	// kind drives the platform-agent image selection in the provisioner (a
+	// kind='platform' concierge runs on the platform-agent image variant, which
+	// bakes /opt/molecule-mcp-server so the org-admin MCP can load). Sourced from
+	// the DB row (CreateWorkspacePayload carries no kind — the row is the SSOT,
+	// written by InstallPlatformAgent / EnsureSelfHostedPlatformAgent).
+	var kind string
+	if db.DB != nil {
+		var dbDir, dbAccess, dbKind string
 		// QueryRowContext (not QueryRow) so the provision-timeout ctx
 		// propagates here too. Previously ctx flowed in only to be passed
 		// to resolveRuntimeImage; that dead reader was removed by
@@ -312,15 +318,16 @@ func (h *WorkspaceHandler) buildProvisionerConfig(
 		// nudge (a 10s ProvisionTimeout now actually bounds this lookup).
 		if err := db.DB.QueryRowContext(
 			ctx,
-			`SELECT COALESCE(workspace_dir, ''), COALESCE(workspace_access, 'none') FROM workspaces WHERE id = $1`,
+			`SELECT COALESCE(workspace_dir, ''), COALESCE(workspace_access, 'none'), COALESCE(kind, 'workspace') FROM workspaces WHERE id = $1`,
 			workspaceID,
-		).Scan(&dbDir, &dbAccess); err == nil {
+		).Scan(&dbDir, &dbAccess, &dbKind); err == nil {
 			if workspacePath == "" && dbDir != "" {
 				workspacePath = dbDir
 			}
 			if workspaceAccess == "" {
 				workspaceAccess = dbAccess
 			}
+			kind = dbKind
 		}
 	}
 	if workspacePath == "" {
@@ -337,6 +344,7 @@ func (h *WorkspaceHandler) buildProvisionerConfig(
 		PluginsPath:     pluginsPath,
 		WorkspacePath:   workspacePath,
 		WorkspaceAccess: workspaceAccess,
+		Kind:            kind,
 		Tier:            payload.Tier,
 		Runtime:         payload.Runtime,
 		InstanceType:    payload.Compute.InstanceType,
