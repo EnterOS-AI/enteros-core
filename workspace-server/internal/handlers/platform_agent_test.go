@@ -437,3 +437,59 @@ func TestConciergePlatformMCPEnv(t *testing.T) {
 		}
 	})
 }
+
+// TestApplyConciergeProvisionConfig_OnlyPlatformGetsOrgMCP locks the security
+// invariant the user requires: ONLY the tenant-native concierge (kind='platform')
+// receives the org/platform MCP + the org-admin token. An ordinary workspace must
+// NOT get the platform MCP config, the system prompt, or MOLECULE_API_KEY (the
+// org-admin credential) natively — otherwise any workspace could drive org-admin
+// actions (create_workspace, set_secret, …). Gate is keyed off the DB kind column
+// (SSOT, protected by the one-platform-root CHECK constraint).
+func TestApplyConciergeProvisionConfig_OnlyPlatformGetsOrgMCP(t *testing.T) {
+	t.Setenv("ADMIN_TOKEN", "secret-org-admin")
+	t.Setenv("PLATFORM_URL", "http://platform:8080")
+	h := &WorkspaceHandler{}
+	const kindQuery = `SELECT COALESCE\(kind, 'workspace'\) FROM workspaces WHERE id =`
+
+	t.Run("ordinary workspace gets NO org MCP and NO admin token", func(t *testing.T) {
+		mock := setupTestDB(t)
+		mock.ExpectQuery(kindQuery).WithArgs("ws-ordinary").
+			WillReturnRows(sqlmock.NewRows([]string{"kind"}).AddRow("workspace"))
+		env := map[string]string{}
+		cf := map[string][]byte{"config.yaml": []byte("runtime: claude-code\n")}
+		out := h.applyConciergeProvisionConfig(context.Background(), "ws-ordinary", "", cf, env, "Worker")
+		if _, ok := env["MOLECULE_API_KEY"]; ok {
+			t.Errorf("SECURITY: ordinary workspace leaked MOLECULE_API_KEY (org-admin token): %v", env)
+		}
+		if _, ok := out["system-prompt.md"]; ok {
+			t.Error("ordinary workspace was given the concierge system prompt")
+		}
+		if strings.Contains(string(out["config.yaml"]), "mcp_servers") {
+			t.Error("SECURITY: ordinary workspace was given the platform mcp_servers config")
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("unmet sqlmock expectations: %v", err)
+		}
+	})
+
+	t.Run("platform agent DOES get the org MCP and admin token", func(t *testing.T) {
+		mock := setupTestDB(t)
+		mock.ExpectQuery(kindQuery).WithArgs("ws-concierge").
+			WillReturnRows(sqlmock.NewRows([]string{"kind"}).AddRow("platform"))
+		env := map[string]string{}
+		cf := map[string][]byte{"config.yaml": []byte("runtime: claude-code\n")}
+		out := h.applyConciergeProvisionConfig(context.Background(), "ws-concierge", "", cf, env, "Molecule AI Agent")
+		if env["MOLECULE_API_KEY"] != "secret-org-admin" {
+			t.Errorf("concierge did not receive the org-admin token; env=%v", env)
+		}
+		if _, ok := out["system-prompt.md"]; !ok {
+			t.Error("concierge did not receive the system prompt")
+		}
+		if !strings.Contains(string(out["config.yaml"]), "mcp_servers") {
+			t.Error("concierge did not receive the platform mcp_servers config")
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("unmet sqlmock expectations: %v", err)
+		}
+	})
+}
