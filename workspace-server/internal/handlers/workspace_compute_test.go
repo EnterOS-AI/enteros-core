@@ -36,6 +36,34 @@ func TestValidateWorkspaceCompute_RejectsUnknownInstanceType(t *testing.T) {
 	}
 }
 
+// Multi-provider: compute.provider must be "" (default AWS) or one of the wired
+// cloud backends. Pins the allowlist to the controlplane cloudprovider SSOT
+// (Supported = {aws, hetzner, gcp}); if the SSOT changes, update both sides.
+func TestValidateWorkspaceCompute_Provider(t *testing.T) {
+	for _, ok := range []string{"", "aws", "gcp", "hetzner"} {
+		c := models.WorkspaceCompute{Provider: ok}
+		if err := validateWorkspaceCompute(c); err != nil {
+			t.Errorf("provider=%q must be accepted: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"AWS", "azure", "digitalocean", "ec2", "google", "hetzner-cloud"} {
+		c := models.WorkspaceCompute{Provider: bad}
+		if err := validateWorkspaceCompute(c); err == nil {
+			t.Errorf("provider=%q must be rejected", bad)
+		}
+	}
+	// Pin the exact SSOT-mirrored set so a silent drift fails here.
+	want := map[string]struct{}{"aws": {}, "gcp": {}, "hetzner": {}}
+	if len(workspaceComputeProviderAllowlist) != len(want) {
+		t.Fatalf("provider allowlist drifted from SSOT {aws,gcp,hetzner}: %v", workspaceComputeProviderAllowlist)
+	}
+	for p := range want {
+		if _, ok := workspaceComputeProviderAllowlist[p]; !ok {
+			t.Fatalf("provider allowlist missing %q (SSOT drift)", p)
+		}
+	}
+}
+
 // internal#734: data_persistence enum. "" (auto), "persist", "ephemeral" are
 // the only accepted values; anything else is a clear 400 before the CP call.
 func TestValidateWorkspaceCompute_DataPersistence(t *testing.T) {
