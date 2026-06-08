@@ -42,6 +42,13 @@ func (p *panicProxy) ProxyA2ARequest(
 	panic("simulated A2A proxy panic")
 }
 
+// EnqueueA2A satisfies the extended A2AProxy interface; panics like the fire path.
+func (p *panicProxy) EnqueueA2A(
+	_ context.Context, _ string, _ string, _ int, _ []byte, _ string, _ string, _ *time.Time,
+) (string, int, error) {
+	panic("simulated A2A enqueue panic")
+}
+
 // ── TestLastTickAt_zero ───────────────────────────────────────────────────────
 
 // TestLastTickAt_zero confirms that LastTickAt returns a zero time.Time on a
@@ -210,6 +217,90 @@ func TestShort_helper(t *testing.T) {
 }
 
 // ── TestRecordSkipped_writesSkippedStatus ────────────────────────────────────
+// ── busyEnqueueProxy + TestFireSchedule_BusyEnqueuesInsteadOfSkipping ──────────
+//
+// Replaces the old "busy → skip after 2 min" assertion. When the workspace is
+// at capacity, fireSchedule must ENQUEUE the tick into the durable a2a_queue
+// (keyed by schedule_id) and record last_status='queued' — NOT fire and NOT
+// recordSkipped. Proves the scheduled-tick-starvation fix.
+
+type busyEnqueueProxy struct {
+	fired       int
+	enqueued    int
+	enqKey      string
+	enqMethod   string
+	enqPriority int
+}
+
+func (p *busyEnqueueProxy) ProxyA2ARequest(
+	_ context.Context, _ string, _ []byte, _ string, _ bool,
+) (int, []byte, error) {
+	p.fired++
+	return 200, []byte(`{"ok":true}`), nil
+}
+
+func (p *busyEnqueueProxy) EnqueueA2A(
+	_ context.Context, _ string, _ string, priority int, _ []byte, method, idempotencyKey string, _ *time.Time,
+) (string, int, error) {
+	p.enqueued++
+	p.enqKey = idempotencyKey
+	p.enqMethod = method
+	p.enqPriority = priority
+	return "q-busy-1", 1, nil
+}
+
+func TestFireSchedule_BusyEnqueuesInsteadOfSkipping(t *testing.T) {
+	mock := setupTestDB(t)
+
+	sched := scheduleRow{
+		ID:          "77777777-dead-beef-0000-000000000007",
+		WorkspaceID: "88888888-dead-beef-0000-000000000008",
+		Name:        "busy-enqueue-job",
+		CronExpr:    "*/5 * * * *",
+		Timezone:    "UTC",
+		Prompt:      "tick while busy",
+	}
+
+	// Capacity check → active_tasks(2) >= max_concurrent(1): workspace is busy.
+	mock.ExpectQuery(`SELECT COALESCE`).
+		WillReturnRows(sqlmock.NewRows([]string{"active_tasks", "max"}).AddRow(2, 1))
+
+	// recordQueued UPDATE — binds ($1=sched.ID, $2=nextRunPtr, $3=reason);
+	// last_status='queued' is a SQL literal, not a bound arg.
+	mock.ExpectExec(`UPDATE workspace_schedules`).
+		WithArgs(sched.ID, sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// recordQueued activity_logs INSERT — binds 4 args (workspace_id, summary,
+	// request_body, error_detail); status='queued' is a SQL literal.
+	mock.ExpectExec(`INSERT INTO activity_logs`).
+		WithArgs(sched.WorkspaceID, sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	proxy := &busyEnqueueProxy{}
+	s := New(proxy, nil)
+	s.fireSchedule(context.Background(), sched)
+
+	if proxy.fired != 0 {
+		t.Errorf("busy workspace: ProxyA2ARequest must NOT fire, got %d fires", proxy.fired)
+	}
+	if proxy.enqueued != 1 {
+		t.Fatalf("busy workspace: expected exactly 1 EnqueueA2A, got %d", proxy.enqueued)
+	}
+	if proxy.enqKey != sched.ID {
+		t.Errorf("idempotency key must be schedule_id %q (buffer-latest dedup), got %q", sched.ID, proxy.enqKey)
+	}
+	if proxy.enqMethod != "message/send" {
+		t.Errorf("enqueued method = %q, want \"message/send\"", proxy.enqMethod)
+	}
+	if proxy.enqPriority != priorityTask {
+		t.Errorf("enqueued priority = %d, want priorityTask(%d)", proxy.enqPriority, priorityTask)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet DB expectations — busy tick not recorded as queued: %v", err)
+	}
+}
+
 // #115 coverage gap: the recordSkipped path wasn't tested at all when it
 // first landed. Exercises the UPDATE workspace_schedules + INSERT into
 // activity_logs via sqlmock. Broadcaster is nil so we don't need to stub
@@ -257,6 +348,13 @@ func (p *successProxy) ProxyA2ARequest(
 	return 200, []byte(`{"ok":true}`), nil
 }
 
+// EnqueueA2A satisfies the extended A2AProxy interface.
+func (p *successProxy) EnqueueA2A(
+	_ context.Context, _ string, _ string, _ int, _ []byte, _ string, _ string, _ *time.Time,
+) (string, int, error) {
+	return "q-success", 1, nil
+}
+
 // ── adapterErrorProxy ─────────────────────────────────────────────────────────
 
 // adapterErrorProxy is a test double whose ProxyA2ARequest returns HTTP 200
@@ -268,6 +366,13 @@ func (p *adapterErrorProxy) ProxyA2ARequest(
 	_ context.Context, _ string, _ []byte, _ string, _ bool,
 ) (int, []byte, error) {
 	return 200, []byte(`{"jsonrpc":"2.0","id":"cron-test-123","error":{"code":-32603,"message":"adapter SDK internal error"}}`), nil
+}
+
+// EnqueueA2A satisfies the extended A2AProxy interface.
+func (p *adapterErrorProxy) EnqueueA2A(
+	_ context.Context, _ string, _ string, _ int, _ []byte, _ string, _ string, _ *time.Time,
+) (string, int, error) {
+	return "q-adaptererr", 1, nil
 }
 
 // ── TestFireSchedule_AdapterSDKError (#1696) ──────────────────────────────────
@@ -667,6 +772,7 @@ func TestRecordSkipped_AdvancesNextRunAt(t *testing.T) {
 			"recordSkipped must advance next_run_at when workspace is busy (#1029)", err)
 	}
 }
+
 // trigger CI
 
 // ── TestDetectResultKind ───────────────────────────────────────────────────────
@@ -833,10 +939,10 @@ func TestDetectResultKind(t *testing.T) {
 //
 // When ProxyA2ARequest returns HTTP 200 but the response body contains a
 // non-ok result_kind, fireSchedule must:
-//   1. Set last_status to the result_kind (not 'ok').
-//   2. Set last_error to describe the SDK error.
-//   3. Increment consecutive_sdk_errors.
-//   4. NOT auto-disable on first occurrence (threshold is 3).
+//  1. Set last_status to the result_kind (not 'ok').
+//  2. Set last_error to describe the SDK error.
+//  3. Increment consecutive_sdk_errors.
+//  4. NOT auto-disable on first occurrence (threshold is 3).
 //
 // This test uses an sdkErrorProxy that returns a rate-limited body and asserts
 // the first run is recorded as 'rate_limited' with consecutive_sdk_errors=1
@@ -997,6 +1103,13 @@ func (p *sdkErrorProxy) ProxyA2ARequest(
 		},
 	})
 	return 200, body, nil
+}
+
+// EnqueueA2A satisfies the extended A2AProxy interface.
+func (p *sdkErrorProxy) EnqueueA2A(
+	_ context.Context, _ string, _ string, _ int, _ []byte, _ string, _ string, _ *time.Time,
+) (string, int, error) {
+	return "q-sdkerr", 1, nil
 }
 
 // ── TestTruncate_utf8Safe_regression2026 ──────────────────────────────────────

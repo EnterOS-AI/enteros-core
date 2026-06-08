@@ -73,6 +73,14 @@ type recordingProxy struct {
 	lastCaller  string
 	lastLogFlag bool
 	lastWSID    string
+
+	// enqueue tracking — the busy path calls EnqueueA2A instead of firing.
+	enqueues    int
+	lastEnqBody []byte
+	lastEnqKey  string
+	enqQueueID  string
+	enqDepth    int
+	enqErr      error
 }
 
 func (p *recordingProxy) ProxyA2ARequest(
@@ -87,6 +95,25 @@ func (p *recordingProxy) ProxyA2ARequest(
 		return 0, nil, p.err
 	}
 	return p.status, p.body, nil
+}
+
+// EnqueueA2A records the busy-path enqueue so tests can assert that a tick on a
+// busy workspace was buffered (not fired, not skipped).
+func (p *recordingProxy) EnqueueA2A(
+	_ context.Context, workspaceID, callerID string, _ int, body []byte, _ string, idempotencyKey string, _ *time.Time,
+) (string, int, error) {
+	p.enqueues++
+	p.lastWSID = workspaceID
+	p.lastCaller = callerID
+	p.lastEnqBody = body
+	p.lastEnqKey = idempotencyKey
+	if p.enqErr != nil {
+		return "", 0, p.enqErr
+	}
+	if p.enqQueueID == "" {
+		p.enqQueueID = "q-rec-1"
+	}
+	return p.enqQueueID, p.enqDepth, nil
 }
 
 // ── connection + fixture helpers ──────────────────────────────────────────
