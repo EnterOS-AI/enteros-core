@@ -50,15 +50,15 @@ class TestQaReviewDirectTrigger:
             "pull_request_review must include 'submitted' type"
         )
 
-    def test_job_guard_requires_approved_state(self):
+    def test_job_guard_has_no_review_state_check(self):
         wf = load_workflow("qa-review.yml")
         guard = _job_guard_string(wf)
-        assert "github.event.review.state == 'APPROVED'" in guard, (
-            "job guard must check review.state for 'APPROVED'"
+        assert "github.event.review.state" not in guard, (
+            "job guard must NOT check review.state (#2159: Gitea 1.22.6 payload unreliable); "
+            "evaluator (review-check.sh) verifies actual APPROVE via API"
         )
-        assert "github.event.review.state == 'approved'" in guard, (
-            "job guard must check review.state for 'approved' (case fallback per #2135)"
-        )
+        assert "github.event_name == 'pull_request_target'" in guard
+        assert "github.event_name == 'pull_request_review'" in guard
 
     def test_post_step_uses_status_post_token(self):
         wf = load_workflow("qa-review.yml")
@@ -91,15 +91,15 @@ class TestSecurityReviewDirectTrigger:
             "pull_request_review must include 'submitted' type"
         )
 
-    def test_job_guard_requires_approved_state(self):
+    def test_job_guard_has_no_review_state_check(self):
         wf = load_workflow("security-review.yml")
         guard = _job_guard_string(wf)
-        assert "github.event.review.state == 'APPROVED'" in guard, (
-            "job guard must check review.state for 'APPROVED'"
+        assert "github.event.review.state" not in guard, (
+            "job guard must NOT check review.state (#2159: Gitea 1.22.6 payload unreliable); "
+            "evaluator (review-check.sh) verifies actual APPROVE via API"
         )
-        assert "github.event.review.state == 'approved'" in guard, (
-            "job guard must check review.state for 'approved' (case fallback per #2135)"
-        )
+        assert "github.event_name == 'pull_request_target'" in guard
+        assert "github.event_name == 'pull_request_review'" in guard
 
     def test_post_step_uses_status_post_token(self):
         wf = load_workflow("security-review.yml")
@@ -153,7 +153,7 @@ class TestRefireTokenSeparation:
             "qa refire must receive STATUS_POST_TOKEN env var"
         )
         # Evaluator stays on read token
-        assert "SOP_TIER_CHECK_TOKEN" in env.get("GITEA_TOKEN", "") or "GITHUB_TOKEN" in env.get("GITEA_TOKEN", ""), (
+        assert "SOP_CHECKLIST_GATE_TOKEN" in env.get("GITEA_TOKEN", "") or "GITHUB_TOKEN" in env.get("GITEA_TOKEN", ""), (
             "qa refire evaluator must stay on read-scoped token"
         )
 
@@ -163,6 +163,6 @@ class TestRefireTokenSeparation:
         assert env.get("STATUS_POST_TOKEN") == "${{ secrets.STATUS_POST_TOKEN }}", (
             "security refire must receive STATUS_POST_TOKEN env var"
         )
-        assert "SOP_TIER_CHECK_TOKEN" in env.get("GITEA_TOKEN", "") or "GITHUB_TOKEN" in env.get("GITEA_TOKEN", ""), (
+        assert "SOP_CHECKLIST_GATE_TOKEN" in env.get("GITEA_TOKEN", "") or "GITHUB_TOKEN" in env.get("GITEA_TOKEN", ""), (
             "security refire evaluator must stay on read-scoped token"
         )
