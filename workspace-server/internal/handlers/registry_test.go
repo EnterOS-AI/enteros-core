@@ -985,6 +985,7 @@ func TestValidateAgentURL_PendingPlatformTunnel(t *testing.T) {
 		{"api.moleculesai.app", false},               // no ws- prefix
 		{"ws-x.fakemoleculesai.app", false},          // lookalike domain, not a subdomain
 		{"ws-abc123moleculesai.app", false},          // missing dot before platform domain
+		{"ws-x.moleculesai.app.attacker.com", false}, // parent-domain trick
 	} {
 		if got := isPlatformTunnelHostname(tc.h); got != tc.want {
 			t.Errorf("isPlatformTunnelHostname(%q)=%v want %v", tc.h, got, tc.want)
