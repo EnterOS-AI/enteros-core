@@ -148,10 +148,23 @@ OPT_OUT_LABELS = {
 # branch-protection configuration. These are the uniform-gate checks that
 # must pass before any PR can merge (SOP tier removal makes them mandatory
 # for all PRs, not just tier:medium/tier:high).
+#
+# Context names use the (pull_request_target) suffix (not pull_request)
+# to match the workflow event_type that actually emits them — verified
+# live against PR#2419/#2331/etc.: the qa-review/security-review
+# workflows run on pull_request_target (their `on:` block uses
+# pull_request_target, not pull_request), and sop-checklist's
+# all-items-acked job also uses pull_request_target. The previous
+# (pull_request) suffix never matched the live emitted contexts,
+# which is what was painting ~16 ready PRs red (gate appeared
+# "missing" qa-review/security-review even after both passed).
+# Verified against the lint-bp-context-emit-match test which already
+# asserts (pull_request_target) for these names. No requirement
+# dropped; just a name correction.
 GOVERNANCE_REQUIRED_CONTEXTS = [
-    "qa-review / approved (pull_request)",
-    "security-review / approved (pull_request)",
-    "sop-checklist / all-items-acked (pull_request)",
+    "qa-review / approved (pull_request_target)",
+    "security-review / approved (pull_request_target)",
+    "sop-checklist / all-items-acked (pull_request_target)",
 ]
 REQUIRED_CONTEXTS_RAW = _env(
     "REQUIRED_CONTEXTS",
