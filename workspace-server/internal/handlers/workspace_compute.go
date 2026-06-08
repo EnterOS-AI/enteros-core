@@ -41,6 +41,20 @@ var workspaceComputeInstanceAllowlist = map[string]struct{}{
 	"c6i.xlarge": {},
 }
 
+// workspaceComputeProviderAllowlist mirrors the controlplane cloud-provider SSOT
+// (controlplane internal/cloudprovider.Supported = {aws, hetzner, gcp}).
+// ws-server lives in a different repo and cannot import that package, so this is
+// a DELIBERATE mirror; TestValidateWorkspaceCompute_Provider pins the exact set
+// and this doc-comment names the SSOT, so a CP-side change forces a matching
+// change here (and the CP itself fail-closes an unwired provider with a 422).
+// "" = default (AWS) and is always accepted. This is the gate the switch-provider
+// flow reuses to reject a bad provider with a clean 400 before any CP round-trip.
+var workspaceComputeProviderAllowlist = map[string]struct{}{
+	"aws":     {},
+	"gcp":     {},
+	"hetzner": {},
+}
+
 func validateWorkspaceCompute(compute models.WorkspaceCompute) error {
 	if compute.InstanceType != "" {
 		if _, ok := workspaceComputeInstanceAllowlist[compute.InstanceType]; !ok {
@@ -72,6 +86,15 @@ func validateWorkspaceCompute(compute models.WorkspaceCompute) error {
 	case "", "persist", "ephemeral":
 	default:
 		return fmt.Errorf("unsupported compute.data_persistence (want persist|ephemeral)")
+	}
+	// Cloud backend for the box (multi-provider). "" = default (AWS). CP fail-
+	// closes an unwired provider with a 422 (PROVIDER_UNAVAILABLE); validating
+	// here gives a clean 400 before the round-trip and is the gate reused by the
+	// switch-provider flow. Mirrors the controlplane cloudprovider SSOT.
+	if compute.Provider != "" {
+		if _, ok := workspaceComputeProviderAllowlist[compute.Provider]; !ok {
+			return fmt.Errorf("unsupported compute.provider (want aws|gcp|hetzner)")
+		}
 	}
 	return nil
 }
