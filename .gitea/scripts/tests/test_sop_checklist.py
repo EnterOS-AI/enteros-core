@@ -291,14 +291,14 @@ class TestComputeAckState(unittest.TestCase):
         )
         self.assertEqual(state["comprehensive-testing"]["ackers"], ["bob"])
 
-    def test_self_ack_permitted_when_author_in_team(self):
-        # Author self-acks are normal SOP; they count when the author
-        # passes the team-membership probe (same as peer acks).
+    def test_self_ack_rejected_when_author_in_team(self):
+        # Author self-acks are forbidden — a non-author peer must ack.
         comments = [_comment("alice", "/sop-ack comprehensive-testing")]
         state = sop.compute_ack_state(
             comments, "alice", self.items, self.aliases, self._approve_all
         )
-        self.assertEqual(state["comprehensive-testing"]["ackers"], ["alice"])
+        self.assertEqual(state["comprehensive-testing"]["ackers"], [])
+        self.assertEqual(state["comprehensive-testing"]["rejected"]["self_ack"], ["alice"])
 
     def test_not_in_team_rejected(self):
         comments = [_comment("eve", "/sop-ack comprehensive-testing")]
@@ -723,16 +723,16 @@ class TestRootCauseAckEligibilityWidened(unittest.TestCase):
         )
         self.assertEqual(state["root-cause"]["ackers"], ["hongming"])
 
-    def test_self_ack_permitted_with_widened_eligibility(self):
-        # Author self-acks count when the author is in the required
-        # team (same as peer acks); widening teams does not weaken
-        # the gate, it just includes the author as a valid acker.
+    def test_self_ack_rejected_with_widened_eligibility(self):
+        # Author self-acks are forbidden even when the author is in the
+        # required team — a non-author peer must ack.
         comments = [_comment("alice", "/sop-ack root-cause")]
         probe = self._approve_only({"alice"})
         state = sop.compute_ack_state(
             comments, "alice", self.items, self.aliases, probe, high_risk=False
         )
-        self.assertEqual(state["root-cause"]["ackers"], ["alice"])
+        self.assertEqual(state["root-cause"]["ackers"], [])
+        self.assertEqual(state["root-cause"]["rejected"]["self_ack"], ["alice"])
 
 
 class TestHighRiskClassUsesElevatedListInConfig(unittest.TestCase):
