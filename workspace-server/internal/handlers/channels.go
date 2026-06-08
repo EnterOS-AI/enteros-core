@@ -154,7 +154,7 @@ func (h *ChannelHandler) Create(c *gin.Context) {
 	}
 
 	// #319: encrypt sensitive fields (bot_token, webhook_secret) before
-	// persisting so a DB read/backup leak can't recover the credentials.
+	// persisting. Exactly one call here; duplicate removed in this PR.
 	// Validation above ran against plaintext; storage is ciphertext.
 	if err := channels.EncryptSensitiveFields(body.Config); err != nil {
 		log.Printf("Channels: encrypt config failed for workspace %s: %v", workspaceID, err)
