@@ -35,10 +35,32 @@ if grep -q '_is_tier_low_pending_ok' .gitea/scripts/gitea-merge-queue.py; then
 fi
 
 # 5. No sop-tier-check context references in workflow YAML
-if grep -r 'sop-tier-check' .gitea/workflows/; then
+if grep -rI --exclude-dir='__pycache__' 'sop-tier-check' .gitea/workflows/; then
   echo "FAIL: sop-tier-check context reappeared in workflows" >&2
   fail=1
 fi
+
+# 6. No SOP_TIER_CHECK_TOKEN references in workflow YAML or scripts
+if grep -rI --exclude-dir='__pycache__' --exclude='test_no_tier_regression.sh' 'SOP_TIER_CHECK_TOKEN' .gitea/workflows/ .gitea/scripts/; then
+  echo "FAIL: SOP_TIER_CHECK_TOKEN reference reappeared (use SOP_CHECKLIST_GATE_TOKEN)" >&2
+  fail=1
+fi
+
+# 7. qa-review and security-review must have labeled/unlabeled triggers (#2139)
+for f in .gitea/workflows/qa-review.yml .gitea/workflows/security-review.yml; do
+  if ! grep -q 'labeled, unlabeled' "$f"; then
+    echo "FAIL: $f missing labeled/unlabeled triggers (#2139)" >&2
+    fail=1
+  fi
+done
+
+# 8. qa-review and security-review must NOT have review.state guard (#2159)
+for f in .gitea/workflows/qa-review.yml .gitea/workflows/security-review.yml; do
+  if grep -q 'github.event.review.state' "$f"; then
+    echo "FAIL: $f has review.state guard reappeared (#2159)" >&2
+    fail=1
+  fi
+done
 
 if [ "$fail" -eq 1 ]; then
   echo "TIER_REGRESSION_DETECTED" >&2

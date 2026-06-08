@@ -167,7 +167,7 @@ jobs:
         if: steps.classify.outputs.run_qa == 'true'
         env:
           # Evaluator (review-check.sh + GET /pulls) stays on read-scoped token.
-          GITEA_TOKEN: ${{ secrets.SOP_TIER_CHECK_TOKEN || secrets.GITHUB_TOKEN }}
+          GITEA_TOKEN: ${{ secrets.SOP_CHECKLIST_GATE_TOKEN || secrets.GITHUB_TOKEN }}
           # Explicit POST /statuses uses narrow-scoped write:repository token.
           STATUS_POST_TOKEN: ${{ secrets.STATUS_POST_TOKEN }}
           GITEA_HOST: git.moleculesai.app
@@ -186,7 +186,7 @@ jobs:
         if: steps.classify.outputs.run_security == 'true'
         env:
           # Evaluator (review-check.sh + GET /pulls) stays on read-scoped token.
-          GITEA_TOKEN: ${{ secrets.SOP_TIER_CHECK_TOKEN || secrets.GITHUB_TOKEN }}
+          GITEA_TOKEN: ${{ secrets.SOP_CHECKLIST_GATE_TOKEN || secrets.GITHUB_TOKEN }}
           # Explicit POST /statuses uses narrow-scoped write:repository token.
           STATUS_POST_TOKEN: ${{ secrets.STATUS_POST_TOKEN }}
           GITEA_HOST: git.moleculesai.app

@@ -278,7 +278,7 @@ receive **HTTP 401** on every API call. Affected workflows in molecule-core:
 
 | Workflow | Symptom | Workaround |
 |---|---|---|
-| `gate-check-v3.yml` | Reports BLOCKED on every PR | Provision `SOP_TIER_CHECK_TOKEN`; update workflow to use it |
+| `gate-check-v3.yml` | Reports BLOCKED on every PR | Provision `SOP_CHECKLIST_GATE_TOKEN`; update workflow to use it |
 | `qa-review.yml` | Fails immediately on PR open | Same — needs named secret |
 | `security-review.yml` | Fails immediately on PR open | Same — needs named secret |
 
@@ -313,7 +313,7 @@ dispatcher may fire **only 1 of N eligible workflows** on the initial
 
 This was observed on molecule-core PR #558 (created 2026-05-11T19:54:10Z):
 12+ workflows had no `paths:` filter and should have fired, but only
-`sop-tier-check.yml` dispatched.
+`sop-checklist.yml` dispatched.
 
 Concurrent PRs created within the same minute received 12–30 dispatches each,
 confirming this is specific to the PR-create event dispatch, not a general
