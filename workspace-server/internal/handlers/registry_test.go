@@ -882,6 +882,42 @@ func TestValidateAgentURL_SaaSMode_AllowsRFC1918(t *testing.T) {
 	}
 }
 
+// TestValidateAgentURL_PendingPlatformTunnel (#36/#2421): a freshly-provisioned
+// cross-cloud workspace advertises its per-workspace tunnel hostname
+// (ws-<id>.<appDomain>) whose DNS has not propagated yet when a FAST box (Hetzner
+// ~1s boot) registers. validateAgentURL must allow such a platform-tunnel
+// hostname through in SaaS mode instead of 400 (which the runtime never retries
+// → agent_card never lands). Non-platform unresolvable hostnames stay blocked.
+func TestValidateAgentURL_PendingPlatformTunnel(t *testing.T) {
+	for _, tc := range []struct {
+		h    string
+		want bool
+	}{
+		{"ws-abc123.moleculesai.app", true},
+		{"ws-abc123.staging.moleculesai.app", true},
+		{"ws-abc123.evil.com", false},       // not under the platform domain
+		{"api.moleculesai.app", false},      // no ws- prefix
+		{"ws-x.fakemoleculesai.app", false}, // lookalike domain, not a subdomain
+	} {
+		if got := isPlatformTunnelHostname(tc.h); got != tc.want {
+			t.Errorf("isPlatformTunnelHostname(%q)=%v want %v", tc.h, got, tc.want)
+		}
+	}
+	t.Setenv("MOLECULE_ORG_ID", "")
+	t.Setenv("MOLECULE_DEPLOY_MODE", "saas")
+	// A platform tunnel hostname is allowed — whether or not its DNS has
+	// propagated (a resolved record is a public Cloudflare IP = allowed; an
+	// unresolved one is allowed by the pending-tunnel branch).
+	if err := validateAgentURL("https://ws-deadbeef0001.staging.moleculesai.app/a2a"); err != nil {
+		t.Errorf("SaaS: pending platform tunnel must be allowed, got %v", err)
+	}
+	// A NON-platform unresolvable hostname stays blocked even in SaaS
+	// (.invalid never resolves — RFC 2606).
+	if err := validateAgentURL("https://ws-x.attacker.invalid/a2a"); err == nil {
+		t.Error("SaaS: non-platform unresolvable hostname must stay blocked")
+	}
+}
+
 // TestValidateAgentURL_SaaSMode_StillBlocksMetadataEtAl verifies that even in
 // SaaS mode the always-blocked ranges (metadata, loopback, TEST-NET, CGNAT,
 // non-fd00 ULA) stay blocked.

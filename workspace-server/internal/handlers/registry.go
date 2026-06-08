@@ -261,9 +261,28 @@ func validateAgentURL(rawURL string) error {
 	// the agent won't be reachable anyway, so blocking on DNS failure is safe.
 	ips, lookupErr := net.LookupIP(hostname)
 	if lookupErr != nil {
-		// DNS lookup failed — block the URL rather than allow a potentially-
-		// unreachable or intentionally-unresolvable hostname through. The
-		// platform has no use for a workspace it cannot reach.
+		// #36/#2421: a freshly-provisioned CROSS-CLOUD workspace advertises its
+		// per-workspace Cloudflare tunnel hostname (ws-<id>.<appDomain>). That DNS
+		// record is eventually-consistent, and a FAST-booting box (a Hetzner cpx
+		// reports "workspace ready after ~1s") registers BEFORE the record
+		// propagates → the lookup fails → 400 → and the runtime does not retry a
+		// 4xx → agent_card never lands and the agent never comes online. AWS boots
+		// slowly enough to miss the race, which is why only the fast cloud broke.
+		//
+		// Such a hostname is NOT an SSRF vector: it lives under the platform's own
+		// domain (only the platform can create records there, so it can't be
+		// pointed at 169.254/127/private space by an attacker), and it resolves to
+		// nothing right now. So in SaaS mode allow a platform-tunnel hostname
+		// through while its DNS settles; everything else stays blocked. The
+		// unconditional metadata/loopback blocks above still apply once it
+		// resolves. (Restores the pre-#1130 "let an unresolvable platform URL
+		// through" behaviour, scoped to the trusted tunnel domain.)
+		if saasMode() && isPlatformTunnelHostname(hostname) {
+			log.Printf("Registry validateAgentURL: allowing not-yet-resolvable platform tunnel hostname %q (DNS still propagating)", hostname)
+			return nil
+		}
+		// DNS lookup failed for a non-platform hostname — block it. The platform
+		// has no use for a workspace it cannot reach.
 		return fmt.Errorf("hostname %q cannot be resolved (DNS error): %w", hostname, lookupErr)
 	}
 	for _, ip := range ips {
@@ -272,6 +291,24 @@ func validateAgentURL(rawURL string) error {
 		}
 	}
 	return nil
+}
+
+// isPlatformTunnelHostname reports whether h is a platform-provisioned per-
+// workspace Cloudflare tunnel hostname — `ws-<id>.<appDomain>` under the
+// platform's OWN domain. Only the platform controls DNS there, so a not-yet-
+// resolvable such hostname is a pending-DNS tunnel (DNS propagation race), never
+// an attacker-controlled SSRF URL. The domain defaults to moleculesai.app
+// (covers prod `*.moleculesai.app` and staging `*.staging.moleculesai.app`) and
+// is overridable via MOLECULE_APP_DOMAIN for other deployments.
+func isPlatformTunnelHostname(h string) bool {
+	if !strings.HasPrefix(h, "ws-") {
+		return false
+	}
+	domain := strings.TrimSpace(os.Getenv("MOLECULE_APP_DOMAIN"))
+	if domain == "" {
+		domain = "moleculesai.app"
+	}
+	return strings.HasSuffix(h, "."+domain)
 }
 
 // Register handles POST /registry/register
