@@ -1,7 +1,14 @@
 import { test, expect } from "@playwright/test";
+import type { Page } from "@playwright/test";
 import { startEchoRuntime } from "./fixtures/echo-runtime";
 import { seedWorkspace, startHeartbeat, cleanupWorkspace } from "./fixtures/chat-seed";
 
+/** Enter the Org-map view so the Canvas (React Flow graph) mounts. */
+async function enterMapView(page: Page): Promise<void> {
+  const btn = page.getByTestId("nav-map");
+  await expect(btn, "rail button nav-map missing").toBeVisible({ timeout: 10_000 });
+  await btn.click();
+}
 
 test.describe("Desktop ChatTab", () => {
   let cleanup: () => Promise<void> = async () => {};
@@ -29,6 +36,7 @@ test.describe("Desktop ChatTab", () => {
   test.beforeEach(async ({ page }) => {
     await page.setViewportSize({ width: 1280, height: 800 });
     await page.goto("/");
+    await enterMapView(page);
     await page.waitForSelector(".react-flow__node", { timeout: 10_000 });
     // Dismiss onboarding guide if present.
     const skipGuide = page.getByText("Skip guide");
@@ -67,6 +75,7 @@ test.describe("Desktop ChatTab", () => {
     await expect(page.getByText("Echo: Persistence test")).toBeVisible({ timeout: 15_000 });
 
     await page.reload();
+    await enterMapView(page);
     await page.waitForSelector(".react-flow__node", { timeout: 10_000 });
     await page.getByText(workspaceName, { exact: true }).first().click();
     await page.locator('#tab-chat').click();
@@ -143,6 +152,7 @@ test.describe("Desktop ChatTab — Markdown rendering", () => {
   test.beforeEach(async ({ page }) => {
     await page.setViewportSize({ width: 1280, height: 800 });
     await page.goto("/");
+    await enterMapView(page);
     await page.waitForSelector(".react-flow__node", { timeout: 10_000 });
     const skipGuide2 = page.getByText("Skip guide");
     if (await skipGuide2.isVisible().catch(() => false)) {
