@@ -244,7 +244,12 @@ jobs:
           # fail if any didn't land — that would be a real regression we
           # want loud.
           # workspace_schedules added for the #2149 scheduler integration tests.
-          for tbl in delegations workspaces activity_logs pending_uploads workspace_schedules; do
+          # workspace_auth_tokens + org_api_tokens added for the #2156
+          # registry-auth TestIntegration_ suite (#2148). Without this
+          # guard, a silently-skipped migration 020 (workspace_auth_tokens)
+          # or 035 (org_api_tokens) would let the auth tests run against
+          # missing tables and falsely green.
+          for tbl in delegations workspaces activity_logs pending_uploads workspace_schedules workspace_auth_tokens org_api_tokens; do
             if ! psql -h "${PG_HOST}" -U postgres -d molecule -tA \
                 -c "SELECT 1 FROM information_schema.tables WHERE table_name = '$tbl'" \
                 | grep -q 1; then
