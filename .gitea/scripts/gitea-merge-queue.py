@@ -1170,7 +1170,9 @@ def enumerate_readiness(*, dry_run: bool = False) -> list[ReadinessEntry]:
     post-batch summary can be printed.
     """
     bp = get_branch_protection(WATCH_BRANCH)
-    contexts = bp.required_contexts
+    # Uniform gate: governance checks are ALWAYS required, even if branch
+    # protection does not enumerate them. Deduplicate against BP list.
+    contexts = list(dict.fromkeys(bp.required_contexts + GOVERNANCE_REQUIRED_CONTEXTS))
     required_approvals = bp.required_approvals
 
     main_sha = get_branch_head(WATCH_BRANCH)
