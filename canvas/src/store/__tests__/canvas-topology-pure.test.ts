@@ -17,7 +17,9 @@ import {
   PARENT_SIDE_PADDING,
   PARENT_HEADER_PADDING,
   PARENT_BOTTOM_PADDING,
+  stripPlatformRootForMap,
 } from "../canvas-topology";
+import { WORKSPACE_KIND } from "../../lib/workspace-kind";
 
 // Layout-math aliases so these assertions track the card-size constants
 // instead of hard-coding pixel values (which drift when the card size
@@ -275,5 +277,76 @@ describe("parentMinSizeFromChildren — variable-size children", () => {
     const wide = parentMinSizeFromChildren([{ width: 500, height: 130 }]);
     const narrow = parentMinSizeFromChildren([{ width: 200, height: 130 }]);
     expect(wide.width).toBeGreaterThan(narrow.width);
+  });
+});
+
+// ─── stripPlatformRootForMap ───────────────────────────────────────────────────
+
+describe("stripPlatformRootForMap", () => {
+  // Minimal Node<WorkspaceNodeData> builder — only the fields the function reads.
+  const node = (
+    id: string,
+    opts: { kind?: string; parentId?: string; x?: number; y?: number } = {},
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  ): any => ({
+    id,
+    position: { x: opts.x ?? 0, y: opts.y ?? 0 },
+    parentId: opts.parentId,
+    data: { kind: opts.kind ?? WORKSPACE_KIND.Workspace, parentId: opts.parentId ?? null },
+  });
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const edge = (source: string, target: string): any => ({ id: `${source}->${target}`, source, target });
+
+  it("returns input unchanged when there is no platform node", () => {
+    const nodes = [node("a"), node("b", { parentId: "a", x: 5, y: 5 })];
+    const edges = [edge("a", "b")];
+    const out = stripPlatformRootForMap(nodes, edges);
+    expect(out.nodes).toBe(nodes); // same reference — no work done
+    expect(out.edges).toBe(edges);
+  });
+
+  it("removes the platform root, promotes its direct children to absolute positions, and drops platform-touching edges", () => {
+    const platform = node("P", { kind: WORKSPACE_KIND.Platform, x: 100, y: 50 });
+    const child = node("c", { parentId: "P", x: 10, y: 20 }); // RF-relative to P
+    const grandchild = node("g", { parentId: "c", x: 5, y: 5 });
+    const out = stripPlatformRootForMap(
+      [platform, child, grandchild],
+      [edge("P", "c"), edge("c", "g")],
+    );
+
+    // Platform node is gone.
+    expect(out.nodes.find((n) => n.id === "P")).toBeUndefined();
+
+    // Direct child promoted to top-level with absolute position (parentPos + childPos).
+    const c = out.nodes.find((n) => n.id === "c")!;
+    expect(c.parentId).toBeUndefined();
+    expect(c.extent).toBeUndefined();
+    expect(c.position).toEqual({ x: 110, y: 70 });
+    expect(c.data.parentId).toBeNull();
+
+    // Grandchild (child of a non-platform node) is untouched.
+    const g = out.nodes.find((n) => n.id === "g")!;
+    expect(g.parentId).toBe("c");
+    expect(g.position).toEqual({ x: 5, y: 5 });
+
+    // Edge touching the platform node dropped; the other preserved.
+    expect(out.edges.map((e) => e.id)).toEqual(["c->g"]);
+  });
+
+  it("leaves children of an ordinary (non-platform) parent untouched", () => {
+    const platform = node("P", { kind: WORKSPACE_KIND.Platform });
+    const ordinaryParent = node("op", { parentId: "P", x: 200, y: 0 });
+    const grandchild = node("gc", { parentId: "op", x: 7, y: 9 });
+    const out = stripPlatformRootForMap([platform, ordinaryParent, grandchild], []);
+
+    // op is a direct child of platform → promoted (absolute = 200+0, 0+0).
+    const op = out.nodes.find((n) => n.id === "op")!;
+    expect(op.parentId).toBeUndefined();
+    expect(op.position).toEqual({ x: 200, y: 0 });
+
+    // gc's parent is the ordinary node, not platform → relative position preserved.
+    const gc = out.nodes.find((n) => n.id === "gc")!;
+    expect(gc.parentId).toBe("op");
+    expect(gc.position).toEqual({ x: 7, y: 9 });
   });
 });

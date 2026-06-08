@@ -1700,12 +1700,12 @@ func TestRegister_InvalidKind(t *testing.T) {
 	}
 }
 
-// TestRegister_PlatformKind_PersistsKind verifies that a workspace registering
-// with kind="platform" has that value written through the upsert (the platform
-// agent self-registers as the org root). The platform==root invariant itself is
-// enforced by the workspaces_platform_root_check DB constraint and exercised by
-// the integration test, which sqlmock cannot enforce.
-func TestRegister_PlatformKind_PersistsKind(t *testing.T) {
+// TestRegister_AllowsAlreadyPlatformReRegister verifies that a workspace whose
+// row is ALREADY kind="platform" (pre-seeded by the AdminAuth/boot-gated install
+// path) may re-register through the public /registry/register path with
+// kind="platform", and the value is preserved through the upsert. This is the
+// legitimate platform-agent boot flow.
+func TestRegister_AllowsAlreadyPlatformReRegister(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
 	broadcaster := newTestBroadcaster()
@@ -1717,6 +1717,12 @@ func TestRegister_PlatformKind_PersistsKind(t *testing.T) {
 	mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM workspace_auth_tokens").
 		WithArgs(wsID).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+
+	// SECURITY precheck: the row is already kind="platform", so the re-register
+	// is allowed to proceed.
+	mock.ExpectQuery("SELECT kind FROM workspaces WHERE id").
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"kind"}).AddRow("platform"))
 
 	// delivery_mode="push" is set explicitly, so resolveDeliveryMode
 	// short-circuits (no SELECT delivery_mode lookup). The upsert MUST carry
@@ -1751,7 +1757,83 @@ func TestRegister_PlatformKind_PersistsKind(t *testing.T) {
 	handler.Register(c)
 
 	if w.Code != http.StatusOK {
-		t.Fatalf("platform register: expected 200, got %d: %s", w.Code, w.Body.String())
+		t.Fatalf("already-platform re-register: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// TestRegister_RejectsFreshPlatformKind locks the privilege-escalation fix: the
+// public /registry/register path must NOT let a brand-new (fresh-id) workspace
+// declare kind="platform" and mint itself a second org root. It must be refused
+// (403) before any upsert — only the AdminAuth/boot-gated install paths may mint
+// the platform agent.
+func TestRegister_RejectsFreshPlatformKind(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewRegistryHandler(newTestBroadcaster())
+
+	const wsID = "ws-rogue-fresh"
+
+	// Bootstrap path — no live tokens (a fresh id).
+	mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM workspace_auth_tokens").
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+
+	// SECURITY precheck: no existing row → empty result → sql.ErrNoRows → refuse.
+	// No upsert / token issuance must follow.
+	mock.ExpectQuery("SELECT kind FROM workspaces WHERE id").
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"kind"}))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest("POST", "/registry/register",
+		bytes.NewBufferString(`{"id":"`+wsID+`","url":"http://localhost:9100","delivery_mode":"push","kind":"platform","agent_card":{"name":"rogue"}}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Register(c)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("fresh kind=platform register: expected 403, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// TestRegister_RejectsPlatformPromotion locks the other half of the fix: a row
+// that already exists as kind="workspace" must NOT be promotable to "platform"
+// via the public register path (which would later get it provisioned with the
+// org-admin token). Refused (403) before the upsert.
+func TestRegister_RejectsPlatformPromotion(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewRegistryHandler(newTestBroadcaster())
+
+	const wsID = "ws-ordinary"
+
+	// Has no live tokens for test simplicity (bootstrap-allowed call).
+	mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM workspace_auth_tokens").
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+
+	// SECURITY precheck: existing row is kind="workspace" → refuse promotion.
+	mock.ExpectQuery("SELECT kind FROM workspaces WHERE id").
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"kind"}).AddRow("workspace"))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest("POST", "/registry/register",
+		bytes.NewBufferString(`{"id":"`+wsID+`","url":"http://localhost:9100","delivery_mode":"push","kind":"platform","agent_card":{"name":"rogue"}}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Register(c)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("promote workspace->platform: expected 403, got %d: %s", w.Code, w.Body.String())
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet expectations: %v", err)

@@ -28,10 +28,12 @@ BEGIN
 END $$;
 
 -- platform == org root, enforced at the DB level (race-proof). A platform agent
--- MUST have parent_id IS NULL. Because an org is the subtree under a single
--- parent_id IS NULL root (org_scope.go) and only a root may be 'platform', this
--- also structurally guarantees at most ONE platform agent per org. The handler
--- additionally pre-checks this to return a friendly 409 instead of a raw 23514.
+-- MUST have parent_id IS NULL. NOTE: this CHECK alone does NOT bound the number
+-- of platform rows — it permits multiple parentless platform roots. "At most one
+-- platform agent per org" is enforced by the partial unique index added in
+-- 20260607000000_one_platform_root (uniq_workspaces_one_platform_root); see that
+-- migration for the privilege-escalation rationale. The handler additionally
+-- pre-checks both to return a friendly 409 instead of a raw 23514/23505.
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'workspaces_platform_root_check') THEN
