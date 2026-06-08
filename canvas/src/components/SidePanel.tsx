@@ -1,49 +1,15 @@
 "use client";
 
 import { useState, useCallback, useRef, useEffect } from "react";
-import { useCanvasStore, type PanelTab } from "@/store/canvas";
-import { showToast } from "@/components/Toaster";
+import { useCanvasStore } from "@/store/canvas";
 import { StatusDot } from "./StatusDot";
-import { Tooltip } from "./Tooltip";
-import { DetailsTab } from "./tabs/DetailsTab";
-import { SkillsTab } from "./tabs/SkillsTab";
-import { ChatTab } from "./tabs/ChatTab";
-import { ConfigTab } from "./tabs/ConfigTab";
-import { ContainerConfigTab } from "./tabs/ContainerConfigTab";
-import { DisplayTab } from "./tabs/DisplayTab";
-import { TerminalTab } from "./tabs/TerminalTab";
-import { FilesTab } from "./tabs/FilesTab";
-import { MemoryInspectorPanel } from "./MemoryInspectorPanel";
-import { AuditTrailPanel } from "./AuditTrailPanel";
-import { TracesTab } from "./tabs/TracesTab";
-import { EventsTab } from "./tabs/EventsTab";
-import { ActivityTab } from "./tabs/ActivityTab";
-import { ScheduleTab } from "./tabs/ScheduleTab";
-import { ChannelsTab } from "./tabs/ChannelsTab";
+import { WorkspacePanelTabs } from "./WorkspacePanelTabs";
 import { summarizeWorkspaceCapabilities } from "@/store/canvas";
 
 const SIDEPANEL_WIDTH_KEY = "molecule:sidepanel-width";
 const SIDEPANEL_DEFAULT_WIDTH = 480;
 const SIDEPANEL_MIN_WIDTH = 320;
 const SIDEPANEL_MAX_WIDTH = 800;
-
-const TABS: { id: PanelTab; label: string; icon: string }[] = [
-  { id: "chat", label: "Chat", icon: "◈" },
-  { id: "activity", label: "Activity", icon: "⊙" },
-  { id: "details", label: "Details", icon: "◉" },
-  { id: "skills", label: "Plugins", icon: "✦" },
-  { id: "terminal", label: "Terminal", icon: "▸" },
-  { id: "display", label: "Display", icon: "▣" },
-  { id: "container-config", label: "Container", icon: "▤" },
-  { id: "config", label: "Config", icon: "⚙" },
-  { id: "schedule", label: "Schedule", icon: "⏲" },
-  { id: "channels", label: "Channels", icon: "⇌" },
-  { id: "files", label: "Files", icon: "⊞" },
-  { id: "memory", label: "Memory", icon: "◇" },
-  { id: "traces", label: "Traces", icon: "◎" },
-  { id: "events", label: "Events", icon: "◊" },
-  { id: "audit",  label: "Audit",  icon: "⊟" },
-];
 
 export function SidePanel() {
   const selectedNodeId = useCanvasStore((s) => s.selectedNodeId);
@@ -219,104 +185,12 @@ export function SidePanel() {
         </div>
       </div>
 
-      {/* Tabs — relative wrapper lets the fade gradient position against the scroll container */}
-      <div className="relative border-b border-line/40">
-        {/* Right-edge fade: signals more tabs are hidden off-screen when the bar overflows */}
-        <div className="pointer-events-none absolute inset-y-0 right-0 w-8 bg-gradient-to-l from-surface to-transparent z-10" aria-hidden="true" />
-      <div
-        role="tablist"
-        aria-label="Workspace panel tabs"
-        className="flex overflow-x-auto bg-surface-sunken/20 px-1"
-        onKeyDown={(e) => {
-          const idx = TABS.findIndex((t) => t.id === panelTab);
-          let next: number | null = null;
-          if (e.key === "ArrowRight") { e.preventDefault(); next = (idx + 1) % TABS.length; }
-          else if (e.key === "ArrowLeft") { e.preventDefault(); next = (idx - 1 + TABS.length) % TABS.length; }
-          else if (e.key === "Home") { e.preventDefault(); next = 0; }
-          else if (e.key === "End") { e.preventDefault(); next = TABS.length - 1; }
-          if (next !== null) {
-            setPanelTab(TABS[next].id);
-            requestAnimationFrame(() => { const el = document.getElementById(`tab-${TABS[next!].id}`); el?.focus(); el?.scrollIntoView({ block: "nearest", inline: "nearest" }); });
-          }
-        }}
-      >
-        {TABS.map((tab) => (
-          <button
-            type="button"
-            key={tab.id}
-            id={`tab-${tab.id}`}
-            role="tab"
-            aria-selected={panelTab === tab.id}
-            aria-controls={`panel-${tab.id}`}
-            tabIndex={panelTab === tab.id ? 0 : -1}
-            onClick={() => setPanelTab(tab.id)}
-            className={`shrink-0 px-3 py-2.5 text-[10px] font-medium tracking-wide transition-all rounded-t-lg mx-0.5 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/70 ${
-              panelTab === tab.id
-                ? "text-ink bg-surface-card border-b-2 border-accent"
-                : "text-ink-mid hover:text-ink hover:bg-surface-card/60"
-            }`}
-          >
-            <span className="mr-1 opacity-50" aria-hidden="true">{tab.icon}</span>
-            {tab.label}
-          </button>
-        ))}
-      </div>
-      </div>
-
-      {/* Needs Restart Banner */}
-      {node.data.needsRestart && !node.data.currentTask && selectedNodeId && (
-        <div className="px-4 py-2 bg-sky-950/20 border-b border-sky-800/20 flex items-center justify-between">
-          <span className="text-[10px] text-sky-300/90">Config changed — restart to apply</span>
-          <button
-            type="button"
-            onClick={() => {
-              useCanvasStore.getState().restartWorkspace(selectedNodeId).catch(() => showToast("Restart failed", "error"));
-            }}
-            className="text-[11px] px-2 py-1 bg-sky-800/40 hover:bg-sky-700/50 text-sky-200 rounded transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-1"
-          >
-            Restart Now
-          </button>
-        </div>
-      )}
-
-      {/* Current Task Banner */}
-      {node.data.currentTask && (
-        <Tooltip text={node.data.currentTask as string}>
-          <div className="px-4 py-2 bg-amber-950/20 border-b border-amber-800/20 flex items-center gap-2 cursor-default">
-            <div className="w-1.5 h-1.5 rounded-full bg-amber-400 motion-safe:animate-pulse shrink-0" />
-            <span className="text-[10px] text-warm/90 truncate">
-              {node.data.currentTask}
-            </span>
-          </div>
-        </Tooltip>
-      )}
-
-      {/* Tab Content */}
-      <div
-        role="tabpanel"
-        id={`panel-${panelTab}`}
-        aria-labelledby={`tab-${panelTab}`}
-        tabIndex={0}
-        className="flex-1 overflow-y-auto focus:outline-none"
-      >
-        {panelTab === "details" && <DetailsTab key={selectedNodeId} workspaceId={selectedNodeId} data={node.data} />}
-        {panelTab === "skills" && <SkillsTab key={selectedNodeId} workspaceId={selectedNodeId} data={node.data} />}
-        {panelTab === "activity" && <ActivityTab key={selectedNodeId} workspaceId={selectedNodeId} />}
-        {panelTab === "chat" && <ChatTab key={selectedNodeId} workspaceId={selectedNodeId} data={node.data} />}
-        {panelTab === "terminal" && <TerminalTab key={selectedNodeId} workspaceId={selectedNodeId} data={node.data} />}
-        {panelTab === "display" && <DisplayTab key={selectedNodeId} workspaceId={selectedNodeId} />}
-        {panelTab === "container-config" && selectedNodeId && (
-          <ContainerConfigTab key={selectedNodeId} workspaceId={selectedNodeId} data={node.data} />
-        )}
-        {panelTab === "config" && <ConfigTab key={selectedNodeId} workspaceId={selectedNodeId} />}
-        {panelTab === "schedule" && <ScheduleTab key={selectedNodeId} workspaceId={selectedNodeId} />}
-        {panelTab === "channels" && <ChannelsTab key={selectedNodeId} workspaceId={selectedNodeId} />}
-        {panelTab === "files" && <FilesTab key={selectedNodeId} workspaceId={selectedNodeId} data={node.data} />}
-        {panelTab === "memory" && <MemoryInspectorPanel key={selectedNodeId} workspaceId={selectedNodeId} />}
-        {panelTab === "traces" && <TracesTab key={selectedNodeId} workspaceId={selectedNodeId} />}
-        {panelTab === "events" && <EventsTab key={selectedNodeId} workspaceId={selectedNodeId} />}
-        {panelTab === "audit" && <AuditTrailPanel key={selectedNodeId} workspaceId={selectedNodeId} />}
-      </div>
+      {/* Tabs + tab content — extracted into WorkspacePanelTabs so the same
+          tab bar/body is reused verbatim by the concierge Settings page. The
+          map drawer stays store-driven: we thread the global panelTab /
+          setPanelTab through as the controlled active-tab pair, preserving the
+          existing selection + keyboard behaviour. */}
+      <WorkspacePanelTabs node={node} activeTab={panelTab} onTabChange={setPanelTab} />
 
       {/* Footer — workspace ID */}
       <div className="px-4 sm:px-5 py-2 border-t border-line/40 bg-surface-sunken/20">

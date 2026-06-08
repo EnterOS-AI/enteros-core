@@ -9,7 +9,9 @@
  *   - Copy button writes the UUID to navigator.clipboard
  *   - Falls back to host-slug match when session lookup fails
  *   - Lists other orgs when user belongs to multiple
- *   - Error banner when /cp/orgs throws
+ *   - Self-host fallback: /cp/orgs 404 → /org/identity single-org card (no error)
+ *   - Self-host fallback with only a name (slug/org_id unset) — omits empty rows
+ *   - Error banner only when BOTH /cp/orgs AND /org/identity fail
  *   - Empty/no-match state renders the recovery hint, not a crash
  */
 import React from "react";
@@ -180,12 +182,69 @@ describe("OrgInfoTab — fallbacks", () => {
   });
 });
 
+// ─── Self-host fallback: /cp/orgs absent → /org/identity ─────────────────────
+
+describe("OrgInfoTab — self-host fallback", () => {
+  it("renders a single org card from /org/identity when /cp/orgs 404s", async () => {
+    mockFetchSession.mockResolvedValue(null);
+    mockGet.mockImplementation((path: string) => {
+      if (path === "/cp/orgs")
+        return Promise.reject(new Error("API GET /cp/orgs: 404 page not found"));
+      if (path === "/org/identity")
+        return Promise.resolve({
+          name: "Molecule AI",
+          slug: "molecule-ai",
+          org_id: "abc-123",
+        });
+      return Promise.reject(new Error(`unexpected path ${path}`));
+    });
+
+    render(<OrgInfoTab />);
+    await flush();
+    await waitFor(() => screen.getByText("Current Organization"));
+
+    // Single card from /org/identity — name + slug + UUID, no error banner.
+    expect(screen.getByText("Molecule AI")).toBeTruthy();
+    expect(screen.getByText("molecule-ai")).toBeTruthy();
+    expect(screen.getByText("abc-123")).toBeTruthy();
+    // No "other organizations" list and no error.
+    expect(screen.queryByText(/Your other organizations/)).toBeNull();
+    expect(screen.queryByText(/404/)).toBeNull();
+  });
+
+  it("renders only the name when slug/org_id are unset (fresh self-host)", async () => {
+    mockFetchSession.mockResolvedValue(null);
+    mockGet.mockImplementation((path: string) => {
+      if (path === "/cp/orgs")
+        return Promise.reject(new Error("API GET /cp/orgs: 404 page not found"));
+      if (path === "/org/identity")
+        return Promise.resolve({ name: "Molecule AI", slug: "", org_id: "" });
+      return Promise.reject(new Error(`unexpected path ${path}`));
+    });
+
+    render(<OrgInfoTab />);
+    await flush();
+    await waitFor(() => screen.getByText("Current Organization"));
+
+    expect(screen.getByText("Molecule AI")).toBeTruthy();
+    // Empty slug/UUID rows omitted — no copy buttons rendered.
+    expect(screen.queryByRole("button", { name: /Copy Slug/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: /Copy UUID/i })).toBeNull();
+  });
+});
+
 // ─── Error + empty handling ──────────────────────────────────────────────────
 
 describe("OrgInfoTab — error + empty", () => {
-  it("renders an error banner when /cp/orgs throws", async () => {
+  it("renders an error banner only when BOTH /cp/orgs and /org/identity fail", async () => {
     mockFetchSession.mockResolvedValue(null);
-    mockGet.mockRejectedValue(new Error("API GET /cp/orgs: 500 boom"));
+    mockGet.mockImplementation((path: string) => {
+      if (path === "/cp/orgs")
+        return Promise.reject(new Error("API GET /cp/orgs: 404 page not found"));
+      if (path === "/org/identity")
+        return Promise.reject(new Error("API GET /org/identity: 500 boom"));
+      return Promise.reject(new Error(`unexpected path ${path}`));
+    });
 
     render(<OrgInfoTab />);
     await flush();
@@ -193,10 +252,14 @@ describe("OrgInfoTab — error + empty", () => {
     expect(screen.queryByText("Current Organization")).toBeNull();
   });
 
-  it("renders the recovery hint when no org matches (no crash)", async () => {
+  it("renders the recovery hint when /cp/orgs returns an empty list (no crash)", async () => {
     mockFetchSession.mockResolvedValue(null);
     mockGetTenantSlug.mockReturnValue("");
-    mockGet.mockResolvedValue([]);
+    mockGet.mockImplementation((path: string) =>
+      path === "/cp/orgs"
+        ? Promise.resolve([])
+        : Promise.reject(new Error(`unexpected path ${path}`)),
+    );
 
     render(<OrgInfoTab />);
     await flush();

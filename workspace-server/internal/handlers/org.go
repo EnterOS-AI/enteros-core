@@ -94,8 +94,8 @@ func resolveProvisionConcurrency() int {
 // overlapping mess under the nested render (see screenshot in PR
 // #1981 thread).
 const (
-	childDefaultWidth    = 240.0
-	childDefaultHeight   = 130.0
+	childDefaultWidth    = 300.0
+	childDefaultHeight   = 176.0
 	childGutter          = 14.0
 	parentHeaderPadding  = 130.0
 	parentSidePadding    = 16.0

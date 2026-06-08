@@ -145,6 +145,7 @@ func TestPutWorkspaceLLMBillingMode_SetByok(t *testing.T) {
 
 func TestPutWorkspaceLLMBillingMode_ExplicitNullClearsOverride(t *testing.T) {
 	t.Setenv("MOLECULE_LLM_BILLING_MODE", LLMBillingModePlatformManaged)
+	withProxyConfigured(t) // SaaS context: cleared override → derived_default → platform_managed.
 	mock := setupTestDB(t)
 	mock.ExpectExec(`UPDATE workspaces SET llm_billing_mode = NULL WHERE id = \$1`).
 		WithArgs(testWSID).

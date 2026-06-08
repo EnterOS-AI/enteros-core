@@ -46,6 +46,7 @@ func expectLegacyShimQueries(m sqlmock.Sqlmock, wsID, runtime, model string) {
 }
 
 func TestResolveLLMBillingMode_LegacyShimDerives(t *testing.T) {
+	withProxyConfigured(t) // SaaS context: default-closed → platform_managed.
 	ctx := context.Background()
 	const wsID = "11111111-1111-1111-1111-111111111111"
 
@@ -163,6 +164,7 @@ func TestResolveLLMBillingMode_LegacyShimDerives(t *testing.T) {
 // (no workspace id) defaults closed with no DB read (org rung retired, so the
 // old "org_only" behavior is gone — it's now the platform default).
 func TestResolveLLMBillingMode_EmptyWorkspaceID_PlatformDefault(t *testing.T) {
+	withProxyConfigured(t) // SaaS context.
 	ctx := context.Background()
 	mock := setupTestDB(t) // no DB read expected
 	res, err := ResolveLLMBillingMode(ctx, "", LLMBillingModeBYOK)
@@ -182,6 +184,7 @@ func TestResolveLLMBillingMode_EmptyWorkspaceID_PlatformDefault(t *testing.T) {
 // values. The strip gate downstream relies on this so it can switch on
 // res.ResolvedMode without a separate is-valid check on every call site.
 func TestResolveLLMBillingMode_ResolvedModeIsAlwaysValid(t *testing.T) {
+	withProxyConfigured(t) // SaaS context: default-closed → platform_managed.
 	ctx := context.Background()
 	const wsID = "22222222-2222-2222-2222-222222222222"
 

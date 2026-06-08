@@ -1,5 +1,5 @@
 import type { Metadata } from "next";
-import { Inter, JetBrains_Mono } from "next/font/google";
+import { Hanken_Grotesk, JetBrains_Mono } from "next/font/google";
 import { cookies, headers } from "next/headers";
 import "./globals.css";
 
@@ -7,10 +7,13 @@ import "./globals.css";
 // because Next.js serves the .woff2 from /_next/static). Exposed as
 // CSS variables so the mobile palette can reference them without
 // importing this module.
-const interFont = Inter({
+// Org Concierge UI typeface (canvas redesign): Hanken Grotesk, exposed as
+// --font-hanken and consumed by the --font-sans theme token in globals.css.
+const interFont = Hanken_Grotesk({
   subsets: ["latin"],
+  weight: ["400", "500", "600", "700"],
   display: "swap",
-  variable: "--font-inter",
+  variable: "--font-hanken",
 });
 const monoFont = JetBrains_Mono({
   subsets: ["latin"],
@@ -161,6 +164,12 @@ export default async function RootLayout({
          */}
         <script
           nonce={nonce}
+          // The browser strips the nonce attribute off <script> after applying
+          // CSP, so the hydrated DOM shows nonce="" while React's tree carries
+          // the real value — a benign, expected server/client diff. Suppress
+          // the hydration warning for this element (same rationale as the
+          // <html> suppressHydrationWarning above).
+          suppressHydrationWarning
           dangerouslySetInnerHTML={{ __html: themeBootScript }}
         />
         {/*
@@ -186,6 +195,7 @@ export default async function RootLayout({
         <script
           type="application/ld+json"
           nonce={nonce}
+          suppressHydrationWarning
           dangerouslySetInnerHTML={{
             __html: JSON.stringify({
               "@context": "https://schema.org",

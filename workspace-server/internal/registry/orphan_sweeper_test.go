@@ -259,9 +259,9 @@ func TestIsLikelyWorkspaceID(t *testing.T) {
 		{"abcdef-1234-5678-90ab-cdef00112233", true},
 		{"ABC123DEF456", true}, // uppercase hex still allowed
 		{"", false},
-		{"abc_123", false},      // underscore (SQL LIKE single-char wildcard)
-		{"abc%123", false},      // percent (SQL LIKE multi-char wildcard)
-		{"hello world", false},  // space, non-hex letters
+		{"abc_123", false},       // underscore (SQL LIKE single-char wildcard)
+		{"abc%123", false},       // percent (SQL LIKE multi-char wildcard)
+		{"hello world", false},   // space, non-hex letters
 		{"valid-but-not", false}, // 'l', 't', 'n' aren't hex
 		{"abc 123", false},
 		{".../escape", false},
@@ -451,6 +451,78 @@ func TestSweepOnce_WipedDBSkipsNonUUIDPrefixes(t *testing.T) {
 
 	if len(reaper.stopCalls) != 1 || reaper.stopCalls[0] != valid {
 		t.Errorf("expected exactly 1 reap (the UUID-shaped one); got %v", reaper.stopCalls)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// instanceScopedReaper models the real provisioner's
+// ListManagedContainerIDPrefixes AFTER the per-instance Docker label
+// filter (the cross-reap fix): it returns ONLY the prefixes whose
+// LabelInstance matches this platform instance. A co-resident sibling
+// platform's containers carry LabelManaged=true but a DIFFERENT
+// LabelInstance, so the Docker filter never returns them — modeled here
+// by simply not including them in selfInstancePrefixes. otherInstance
+// records what a buggy (un-scoped) lister WOULD have leaked, so the test
+// can assert those prefixes are never Stopped.
+type instanceScopedReaper struct {
+	fakeReaper
+	otherInstancePrefixes []string
+}
+
+// TestSweepOnce_WipedDBDoesNotCrossReapOtherInstance is the regression
+// guard for the cross-reap bug: two platforms share one Docker daemon.
+// Platform B's container is alive and HAS a row in B's DB — but it does
+// NOT have a row in THIS (platform A's) DB, and the old un-scoped sweep
+// would have reaped it as a "wiped-DB orphan". With the per-instance
+// label scoping, B's container never enters A's candidate set, so it is
+// never Stopped. Meanwhile A's OWN labeled container that genuinely has
+// no row in A's DB (real wiped-DB orphan) IS reaped.
+//
+// The instance-scoped lister (modeling the real Docker label filter)
+// returns only A's self-instance prefix. The reverse-lookup returns no
+// rows (A's DB was wiped), so A's own prefix is reaped — and the
+// sibling's prefix, never listed, is provably untouched.
+func TestSweepOnce_WipedDBDoesNotCrossReapOtherInstance(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+
+	const selfOrphan = "5e1f00000000" // A's own container, no row in A's DB → reap
+	const sibling = "0the112233ff"    // B's live container, has a row in B's DB
+
+	reaper := &instanceScopedReaper{
+		fakeReaper: fakeReaper{
+			listResponse: nil,
+			// Only A's container is returned — the real provisioner's
+			// LabelInstance filter excludes the sibling, whose label
+			// carries B's instance id.
+			managedListResponse: []string{selfOrphan},
+		},
+		otherInstancePrefixes: []string{sibling},
+	}
+
+	// Reverse-lookup against A's (wiped) DB: selfOrphan has no row.
+	mock.ExpectQuery(`SELECT lk\s+FROM unnest`).
+		WillReturnRows(sqlmock.NewRows([]string{"lk"}))
+	expectStaleTokenSweepNoOp(mock)
+
+	sweepOnce(context.Background(), reaper)
+
+	// A's own row-less orphan is reaped.
+	if len(reaper.stopCalls) != 1 || reaper.stopCalls[0] != selfOrphan {
+		t.Fatalf("expected exactly the self-instance orphan %q reaped, got %v", selfOrphan, reaper.stopCalls)
+	}
+	// The sibling platform's live container is NEVER touched — it never
+	// entered the candidate set.
+	for _, c := range reaper.stopCalls {
+		for _, other := range reaper.otherInstancePrefixes {
+			if c == other {
+				t.Fatalf("CROSS-REAP REGRESSION: reaped sibling platform's container %q "+
+					"(it has a row in the sibling's DB; the per-instance label scope must "+
+					"keep it out of this platform's wiped-DB sweep)", c)
+			}
+		}
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations: %v", err)

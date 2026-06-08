@@ -261,6 +261,15 @@ func (h *WorkspaceHandler) prepareProvisionContext(
 		return nil, &provisionAbort{Msg: "plugin env mutator chain failed"}
 	}
 
+	// Concierge identity (RFC docs/design/rfc-platform-agent.md): when this
+	// workspace is the org platform agent (kind='platform'), overlay the
+	// Org-Concierge system prompt + the platform-MCP declaration and inject the
+	// org-admin MCP env. No-op for ordinary workspaces. Runs BEFORE the
+	// required-env preflight so a concierge config.yaml that the overlay just
+	// wrote is the one preflight inspects. Rebinds configFiles because it is nil
+	// on the auto-restart path (where the overlay is what introduces the files).
+	configFiles = h.applyConciergeProvisionConfig(ctx, workspaceID, templatePath, configFiles, envVars, payload.Name)
+
 	// Preflight #5: refuse to launch when config.yaml declares required
 	// env vars that are not set. Skipped in SaaS mode when configFiles
 	// is nil (CP-mode's cfg is built without local config bytes — the

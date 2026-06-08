@@ -11,7 +11,25 @@ import {
   childSlotInGrid,
   parentMinSize,
   parentMinSizeFromChildren,
+  CHILD_DEFAULT_WIDTH,
+  CHILD_DEFAULT_HEIGHT,
+  CHILD_GUTTER,
+  PARENT_SIDE_PADDING,
+  PARENT_HEADER_PADDING,
+  PARENT_BOTTOM_PADDING,
+  stripPlatformRootForMap,
 } from "../canvas-topology";
+import { WORKSPACE_KIND } from "../../lib/workspace-kind";
+
+// Layout-math aliases so these assertions track the card-size constants
+// instead of hard-coding pixel values (which drift when the card size
+// changes — e.g. the 240×130 → 300×176 "bigger cards" redesign).
+const W = CHILD_DEFAULT_WIDTH;
+const H = CHILD_DEFAULT_HEIGHT;
+const GUT = CHILD_GUTTER;
+const SIDE = PARENT_SIDE_PADDING;
+const HEAD = PARENT_HEADER_PADDING;
+const BOTTOM = PARENT_BOTTOM_PADDING;
 
 // ─── sortParentsBeforeChildren ─────────────────────────────────────────────────
 
@@ -115,34 +133,34 @@ describe("sortParentsBeforeChildren", () => {
 
 // ─── defaultChildSlot ─────────────────────────────────────────────────────────
 
-describe("defaultChildSlot — 2-column grid (240×130 cards)", () => {
+describe("defaultChildSlot — 2-column grid", () => {
   it("slot 0 → column 0, row 0", () => {
     const s = defaultChildSlot(0);
-    expect(s).toEqual({ x: 16, y: 130 });
+    expect(s).toEqual({ x: SIDE, y: HEAD });
   });
 
   it("slot 1 → column 1, row 0", () => {
     const s = defaultChildSlot(1);
-    expect(s.x).toBe(16 + 240 + 14); // PARENT_SIDE_PADDING + CHILD_DEFAULT_WIDTH + CHILD_GUTTER
-    expect(s.y).toBe(130);
+    expect(s.x).toBe(SIDE + W + GUT); // PARENT_SIDE_PADDING + CHILD_DEFAULT_WIDTH + CHILD_GUTTER
+    expect(s.y).toBe(HEAD);
   });
 
   it("slot 2 → column 0, row 1", () => {
     const s = defaultChildSlot(2);
-    expect(s.x).toBe(16);
-    expect(s.y).toBe(130 + 130 + 14); // row 0 height + gutter
+    expect(s.x).toBe(SIDE);
+    expect(s.y).toBe(HEAD + H + GUT); // row 0 height + gutter
   });
 
   it("slot 3 → column 1, row 1", () => {
     const s = defaultChildSlot(3);
-    expect(s.x).toBe(16 + 240 + 14);
-    expect(s.y).toBe(130 + 130 + 14);
+    expect(s.x).toBe(SIDE + W + GUT);
+    expect(s.y).toBe(HEAD + H + GUT);
   });
 
   it("slot 4 → column 0, row 2", () => {
     const s = defaultChildSlot(4);
-    expect(s.x).toBe(16);
-    expect(s.y).toBe(130 + (130 + 14) * 2); // row 1 end + gutter
+    expect(s.x).toBe(SIDE);
+    expect(s.y).toBe(HEAD + (H + GUT) * 2); // row 1 end + gutter
   });
 });
 
@@ -194,36 +212,35 @@ describe("parentMinSize — uniform-size children", () => {
 
   it("1 child → 1 col, 1 row", () => {
     const s = parentMinSize(1);
-    // width = 16*2 + 1*240 + 0 = 272; height = 130 + 1*130 + 0 + 16 = 276
-    expect(s.width).toBe(16 * 2 + 240);
-    expect(s.height).toBe(130 + 130 + 16);
+    // width = SIDE*2 + 1*W; height = HEAD + 1*H + BOTTOM
+    expect(s.width).toBe(SIDE * 2 + W);
+    expect(s.height).toBe(HEAD + H + BOTTOM);
   });
 
   it("2 children → 2 cols, 1 row", () => {
     const s = parentMinSize(2);
-    // width = 16*2 + 2*240 + 1*14 = 526; height = 130 + 1*130 + 0 + 16 = 276
-    expect(s.width).toBe(16 * 2 + 2 * 240 + 14);
-    expect(s.height).toBe(130 + 130 + 16);
+    // width = SIDE*2 + 2*W + 1*GUT; height = HEAD + 1*H + BOTTOM
+    expect(s.width).toBe(SIDE * 2 + 2 * W + GUT);
+    expect(s.height).toBe(HEAD + H + BOTTOM);
   });
 
   it("3 children → 2 cols, 2 rows", () => {
     const s = parentMinSize(3);
-    // width = 16*2 + 2*240 + 1*14 = 526
-    expect(s.width).toBe(16 * 2 + 2 * 240 + 14);
-    // height = 130 + 2*130 + 1*14 + 16 = 416
-    expect(s.height).toBe(130 + 2 * 130 + 14 + 16);
+    expect(s.width).toBe(SIDE * 2 + 2 * W + GUT);
+    // height = HEAD + 2*H + 1*GUT + BOTTOM
+    expect(s.height).toBe(HEAD + 2 * H + GUT + BOTTOM);
   });
 
   it("4 children → 2 cols, 2 rows (full grid)", () => {
     const s = parentMinSize(4);
-    expect(s.width).toBe(16 * 2 + 2 * 240 + 14);
-    expect(s.height).toBe(130 + 2 * 130 + 14 + 16);
+    expect(s.width).toBe(SIDE * 2 + 2 * W + GUT);
+    expect(s.height).toBe(HEAD + 2 * H + GUT + BOTTOM);
   });
 
   it("5 children → 2 cols, 3 rows", () => {
     const s = parentMinSize(5);
-    expect(s.width).toBe(16 * 2 + 2 * 240 + 14);
-    expect(s.height).toBe(130 + 3 * 130 + 2 * 14 + 16);
+    expect(s.width).toBe(SIDE * 2 + 2 * W + GUT);
+    expect(s.height).toBe(HEAD + 3 * H + 2 * GUT + BOTTOM);
   });
 });
 
@@ -243,8 +260,8 @@ describe("parentMinSizeFromChildren — variable-size children", () => {
 
   it("two equal-width children → same as parentMinSize(2)", () => {
     const fromChildren = parentMinSizeFromChildren([
-      { width: 240, height: 130 },
-      { width: 240, height: 130 },
+      { width: W, height: H },
+      { width: W, height: H },
     ]);
     expect(fromChildren.width).toBe(parentMinSize(2).width);
     expect(fromChildren.height).toBe(parentMinSize(2).height);
@@ -260,5 +277,76 @@ describe("parentMinSizeFromChildren — variable-size children", () => {
     const wide = parentMinSizeFromChildren([{ width: 500, height: 130 }]);
     const narrow = parentMinSizeFromChildren([{ width: 200, height: 130 }]);
     expect(wide.width).toBeGreaterThan(narrow.width);
+  });
+});
+
+// ─── stripPlatformRootForMap ───────────────────────────────────────────────────
+
+describe("stripPlatformRootForMap", () => {
+  // Minimal Node<WorkspaceNodeData> builder — only the fields the function reads.
+  const node = (
+    id: string,
+    opts: { kind?: string; parentId?: string; x?: number; y?: number } = {},
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  ): any => ({
+    id,
+    position: { x: opts.x ?? 0, y: opts.y ?? 0 },
+    parentId: opts.parentId,
+    data: { kind: opts.kind ?? WORKSPACE_KIND.Workspace, parentId: opts.parentId ?? null },
+  });
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const edge = (source: string, target: string): any => ({ id: `${source}->${target}`, source, target });
+
+  it("returns input unchanged when there is no platform node", () => {
+    const nodes = [node("a"), node("b", { parentId: "a", x: 5, y: 5 })];
+    const edges = [edge("a", "b")];
+    const out = stripPlatformRootForMap(nodes, edges);
+    expect(out.nodes).toBe(nodes); // same reference — no work done
+    expect(out.edges).toBe(edges);
+  });
+
+  it("removes the platform root, promotes its direct children to absolute positions, and drops platform-touching edges", () => {
+    const platform = node("P", { kind: WORKSPACE_KIND.Platform, x: 100, y: 50 });
+    const child = node("c", { parentId: "P", x: 10, y: 20 }); // RF-relative to P
+    const grandchild = node("g", { parentId: "c", x: 5, y: 5 });
+    const out = stripPlatformRootForMap(
+      [platform, child, grandchild],
+      [edge("P", "c"), edge("c", "g")],
+    );
+
+    // Platform node is gone.
+    expect(out.nodes.find((n) => n.id === "P")).toBeUndefined();
+
+    // Direct child promoted to top-level with absolute position (parentPos + childPos).
+    const c = out.nodes.find((n) => n.id === "c")!;
+    expect(c.parentId).toBeUndefined();
+    expect(c.extent).toBeUndefined();
+    expect(c.position).toEqual({ x: 110, y: 70 });
+    expect(c.data.parentId).toBeNull();
+
+    // Grandchild (child of a non-platform node) is untouched.
+    const g = out.nodes.find((n) => n.id === "g")!;
+    expect(g.parentId).toBe("c");
+    expect(g.position).toEqual({ x: 5, y: 5 });
+
+    // Edge touching the platform node dropped; the other preserved.
+    expect(out.edges.map((e) => e.id)).toEqual(["c->g"]);
+  });
+
+  it("leaves children of an ordinary (non-platform) parent untouched", () => {
+    const platform = node("P", { kind: WORKSPACE_KIND.Platform });
+    const ordinaryParent = node("op", { parentId: "P", x: 200, y: 0 });
+    const grandchild = node("gc", { parentId: "op", x: 7, y: 9 });
+    const out = stripPlatformRootForMap([platform, ordinaryParent, grandchild], []);
+
+    // op is a direct child of platform → promoted (absolute = 200+0, 0+0).
+    const op = out.nodes.find((n) => n.id === "op")!;
+    expect(op.parentId).toBeUndefined();
+    expect(op.position).toEqual({ x: 200, y: 0 });
+
+    // gc's parent is the ordinary node, not platform → relative position preserved.
+    const gc = out.nodes.find((n) => n.id === "gc")!;
+    expect(gc.parentId).toBe("op");
+    expect(gc.position).toEqual({ x: 7, y: 9 });
   });
 });

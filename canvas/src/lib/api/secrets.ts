@@ -1,5 +1,5 @@
 import type { Secret } from '@/types/secrets';
-import { getTenantSlug } from '../tenant';
+import { platformAuthHeaders } from '@/lib/api';
 
 const PLATFORM_URL = process.env.NEXT_PUBLIC_PLATFORM_URL ?? 'http://localhost:8080';
 
@@ -13,16 +13,19 @@ function apiUrl(workspaceId: string, path = ''): string {
 }
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
-  // Match api.ts shape — slug header + cross-origin credentials so SaaS
-  // cross-subdomain fetches work. See lib/api.ts for the rationale.
-  const slug = getTenantSlug();
-  const saasHeaders: Record<string, string> = { 'Content-Type': 'application/json' };
-  if (slug) saasHeaders['X-Molecule-Org-Slug'] = slug;
+  // Auth pair (admin/org Bearer token + tenant slug) + JSON Content-Type come
+  // from the shared `platformAuthHeaders()` helper. This bespoke fetch
+  // previously hand-rolled only the slug + Content-Type and OMITTED the
+  // Authorization bearer — so against a workspace-server with ADMIN_TOKEN set
+  // (local dev, every SaaS tenant), WorkspaceAuth saw no bearer and no verified
+  // CP session and returned 401 "missing workspace auth token". That's exactly
+  // the #178 raw-fetch-forgets-a-header bug shape the helper exists to prevent.
   const res = await fetch(url, {
     ...init,
     credentials: 'include',
     headers: {
-      ...saasHeaders,
+      'Content-Type': 'application/json',
+      ...platformAuthHeaders(),
       ...init?.headers,
     },
   });

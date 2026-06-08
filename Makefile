@@ -4,7 +4,7 @@
 # use this Makefile; CI calls docker compose / go test directly so the
 # Makefile can evolve without breaking the build.
 
-.PHONY: help dev up down logs build test e2e-peer-visibility openapi-spec openapi-spec-check gen gen-docker gen-check gen-check-docker
+.PHONY: help dev up down logs build test e2e-peer-visibility e2e-concierge-creates-workspace openapi-spec openapi-spec-check gen gen-docker gen-check gen-check-docker
 
 # ─── Provider-registry SSOT codegen (internal#718) ─────────────────────
 # The Go module lives in workspace-server/. The checked-in artifact
@@ -56,6 +56,16 @@ test: ## Run Go unit tests in workspace-server/.
 # env contract (CLAUDE_CODE_OAUTH_TOKEN / E2E_MINIMAX_API_KEY / etc).
 e2e-peer-visibility: ## Run the LOCAL peer-visibility MCP gate vs the running stack (needs `make up` first).
 	bash tests/e2e/test_peer_visibility_mcp_local.sh
+
+# FUNCTIONAL local proof that the org concierge actually DOES org-management:
+# send it a natural-language A2A request and assert it really CREATES a workspace
+# via its platform MCP (create_workspace) — the deterministic side effect, not a
+# REST 200. SKIPs LOUD (exit 0) unless the local concierge is seeded, online, and
+# running on the platform-agent image (so create_workspace exists). To run it
+# green locally: seed the concierge (MOLECULE_SEED_PLATFORM_AGENT=1) on the
+# platform-agent image WITH a model key. See the script header for the contract.
+e2e-concierge-creates-workspace: ## Prove the concierge actually creates a workspace via its platform MCP (skips loud if not runnable).
+	bash tests/e2e/test_concierge_creates_workspace_local.sh
 
 # ─── OpenAPI spec generation (RFC #1706, Phase 1) ─────────────────────
 # Regenerate workspace-server/docs/openapi/swagger.{yaml,json} from

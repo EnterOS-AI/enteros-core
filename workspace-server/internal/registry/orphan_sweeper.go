@@ -33,13 +33,16 @@ import (
 type OrphanReaper interface {
 	ListWorkspaceContainerIDPrefixes(ctx context.Context) ([]string, error)
 	// ListManagedContainerIDPrefixes returns containers carrying the
-	// provisioner's LabelManaged stamp — the "definitely ours" set.
-	// Used by the wiped-DB reap pass: a labeled container with no
-	// matching workspaces row is something a previous platform process
-	// created but whose DB row is gone (e.g. operator did
-	// `docker compose down -v` then back up). Without this pass those
-	// orphans leak forever, since the existing status='removed' query
-	// finds zero matches against a wiped table.
+	// provisioner's LabelManaged stamp AND this platform instance's
+	// LabelInstance stamp — the "definitely ours, this DB" set. The
+	// instance scoping is what keeps a co-resident sibling platform's
+	// live containers out of the wiped-DB reap (they carry LabelManaged
+	// too, but a different instance id). Used by the wiped-DB reap pass:
+	// a this-instance labeled container with no matching workspaces row
+	// is something THIS platform created but whose DB row is gone (e.g.
+	// operator did `docker compose down -v` then back up). Without this
+	// pass those orphans leak forever, since the existing status='removed'
+	// query finds zero matches against a wiped table.
 	ListManagedContainerIDPrefixes(ctx context.Context) ([]string, error)
 	Stop(ctx context.Context, workspaceID string) error
 	RemoveVolume(ctx context.Context, workspaceID string) error
@@ -220,9 +223,18 @@ func sweepRemovedRows(ctx context.Context, reaper OrphanReaper) {
 // The first pass finds nothing because there are no status='removed'
 // rows. Without this second pass, those containers leak forever.
 //
-// Safe under multi-platform-on-shared-daemon because the label is
-// stamped only by the provisioner: a sibling stack's containers won't
-// carry it, so this pass leaves them alone.
+// Multi-platform-on-shared-daemon safety: the candidate set comes from
+// ListManagedContainerIDPrefixes, which filters on BOTH the LabelManaged
+// stamp AND a LabelInstance value matching this platform's
+// PlatformInstanceID() (derived from DATABASE_URL). A co-resident sibling
+// platform stamps LabelManaged=true too — but with its OWN instance id,
+// so its containers never reach this pass. (The earlier comment claiming
+// the bare LabelManaged stamp was sufficient was WRONG: two different
+// provisioner instances both stamp it, and this pass once cross-reaped a
+// sibling's 25 live containers across 8 workspaces. The instance scoping
+// in ListManagedContainerIDPrefixes is the fix.) Because the set is
+// already scoped to us, a labeled prefix with no row in this DB is a
+// genuine wiped-DB orphan and reapable.
 func sweepLabeledOrphansWithoutRows(ctx context.Context, reaper OrphanReaper) {
 	managedPrefixes, err := reaper.ListManagedContainerIDPrefixes(ctx)
 	if err != nil {

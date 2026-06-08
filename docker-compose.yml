@@ -69,10 +69,43 @@ services:
       # Override to "production" for SaaS/staged deploys; in those modes
       # ADMIN_TOKEN must also be set or every request rejects.
       MOLECULE_ENV: "${MOLECULE_ENV:-development}"
+      # Self-hosted: no control plane to install the org's platform agent
+      # (concierge), so the tenant server seeds it on boot. Idempotent; unset it
+      # if you don't want the auto-seeded Org Concierge root.
+      MOLECULE_SEED_PLATFORM_AGENT: "${MOLECULE_SEED_PLATFORM_AGENT:-true}"
+      # Org display name. Drives the platform-agent name ("<MOLECULE_ORG_NAME>
+      # Agent", e.g. "Molecule AI Agent") and the canvas topbar (via the open
+      # GET /org/identity route). Empty → legacy "Org Concierge" + no topbar name.
+      MOLECULE_ORG_NAME: "${MOLECULE_ORG_NAME:-Molecule AI}"
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:${CANVAS_PUBLISH_PORT:-3000},http://127.0.0.1:${CANVAS_PUBLISH_PORT:-3000},http://localhost:3001}
       RATE_LIMIT: "${RATE_LIMIT:-1000}"
       CONFIGS_DIR: /configs
+      # Runtime/template SSOT parity with production. The image bakes the FULL
+      # template set (claude-code-default, codex, google-adk, hermes, openclaw,
+      # seo-agent) at /workspace-configs-templates, but the ./workspace-configs-
+      # templates:/configs mount below only carries claude-code-default on the
+      # host — so without this, GET /templates (the runtime-picker SSOT) listed
+      # only claude-code locally while production lists them all. Pointing the
+      # template cache-dir at the baked bundle makes the local runtime LIST match
+      # production. NOTE: the local Docker provisioner bind-mounts a template
+      # from CONFIGS_HOST_DIR (host path) at provision time, and the host dir
+      # only has claude-code-default — so the other runtimes are SELECTABLE but
+      # only claude-code is PROVISIONABLE locally (their images + host templates
+      # aren't present in this lightweight dev stack). Real provisioning of the
+      # other runtimes is covered by the staging e2e, which carries all images.
+      TEMPLATE_CACHE_DIR: "${TEMPLATE_CACHE_DIR:-/workspace-configs-templates}"
       CONFIGS_HOST_DIR: "${CONFIGS_HOST_DIR:-${PWD}/workspace-configs-templates}"
+      # ORG-TEMPLATE SSOT parity — same shadowing fix as TEMPLATE_CACHE_DIR
+      # above, for ORG templates (the Home page's ORG TEMPLATES section). The
+      # image bakes the default org templates (molecule-dev,
+      # molecule-worker-gemini, ux-ab-lab) at /org-templates. Previously the
+      # `./org-templates:/org-templates:ro` mount bind-mounted an EMPTY host dir
+      # over that exact path, shadowing the baked defaults — so the Home page
+      # showed "No org templates in org-templates/" locally while production
+      # listed all three. The shadowing mount is removed below; this env points
+      # findOrgDir() at the baked bundle so the local listing matches production.
+      # Override to a populated host dir to develop your own org templates.
+      ORG_TEMPLATES_DIR: "${ORG_TEMPLATES_DIR:-/org-templates}"
       PLUGINS_HOST_DIR: "${PLUGINS_HOST_DIR:-${PWD}/plugins}"
       # github-app-auth plugin — injects GITHUB_TOKEN / GH_TOKEN into every
       # workspace env from the App installation token. Remap the host-side
@@ -125,7 +158,12 @@ services:
       IMAGE_AUTO_REFRESH: "${IMAGE_AUTO_REFRESH:-true}"
     volumes:
       - ./workspace-configs-templates:/configs
-      - ./org-templates:/org-templates:ro
+      # NOTE: the empty host ./org-templates is intentionally NOT mounted over
+      # the baked /org-templates — that shadowed the image's default org
+      # templates and made the Home page show "No org templates". The platform
+      # reads org templates from ORG_TEMPLATES_DIR (set to the baked
+      # /org-templates above). To develop custom org templates, mount a
+      # POPULATED host dir at a different path and point ORG_TEMPLATES_DIR at it.
       - ./plugins:/plugins:ro
       - /var/run/docker.sock:/var/run/docker.sock
       # App private key — read-only bind-mount. The host-side path is
