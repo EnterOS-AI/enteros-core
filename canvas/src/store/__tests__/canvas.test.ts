@@ -162,6 +162,27 @@ describe("hydrate", () => {
     useCanvasStore.getState().hydrate([ws]);
     expect(useCanvasStore.getState().nodes[0].data.currentTask).toBe("");
   });
+
+  it("preserves in-flight turn status after refresh (issue #2391)", () => {
+    // Simulates a page refresh: the canvas re-hydrates from GET /workspaces
+    // while the agent has an active in-flight turn. The store must reflect
+    // "working" immediately — no dependence on a subsequent TASK_UPDATED
+    // socket event. This prevents the "stuck idle" UX after reload.
+    const ws = makeWS({
+      id: "ws-1",
+      status: "online",
+      current_task: "Analyzing data",
+      active_tasks: 2,
+    });
+    useCanvasStore.getState().hydrate([ws]);
+    const node = useCanvasStore.getState().nodes[0];
+    expect(node.data.currentTask).toBe("Analyzing data");
+    expect(node.data.activeTasks).toBe(2);
+    expect(node.data.status).toBe("online");
+    // Defensive: the node must be considered "working" for any UI that
+    // gates on currentTask (e.g. ChatTab thinking indicator).
+    expect(!!node.data.currentTask).toBe(true);
+  });
 });
 
 describe("summarizeWorkspaceCapabilities", () => {
