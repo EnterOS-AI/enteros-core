@@ -690,6 +690,25 @@ func (h *RegistryHandler) Heartbeat(c *gin.Context) {
 		return
 	}
 
+	// #2421: backfill agent_card when the initial register failed and the
+	// heartbeat carries it. Only writes when NULL — never overwrites a
+	// reconciled or updated card. This is the recovery path for fast-cloud
+	// workspaces whose DNS wasn't ready at first register.
+	if len(payload.AgentCard) > 0 {
+		res, err := db.DB.ExecContext(ctx, `
+			UPDATE workspaces
+			SET agent_card = $2
+			WHERE id = $1 AND agent_card IS NULL
+		`, payload.WorkspaceID, payload.AgentCard)
+		if err != nil {
+			log.Printf("Registry heartbeat: agent_card backfill failed for %s: %v", payload.WorkspaceID, err)
+		} else {
+			if rows, _ := res.RowsAffected(); rows > 0 {
+				log.Printf("Registry heartbeat: backfilled agent_card for %s (initial register had failed)", payload.WorkspaceID)
+			}
+		}
+	}
+
 	// Refresh Redis TTL
 	if err := db.RefreshTTL(ctx, payload.WorkspaceID); err != nil {
 		log.Printf("Heartbeat redis error: %v", err)

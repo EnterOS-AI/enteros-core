@@ -755,6 +755,88 @@ func TestHeartbeat_SkipsRemovedRows(t *testing.T) {
 	}
 }
 
+// ==================== Heartbeat — agent_card backfill (#2421) ====================
+
+func TestHeartbeatHandler_BackfillsAgentCard_WhenNull(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewRegistryHandler(broadcaster)
+
+	mock.ExpectQuery("SELECT COALESCE\\(current_task").
+		WithArgs("ws-nocard").
+		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend"}).AddRow("", 0))
+
+	mock.ExpectExec("UPDATE workspaces SET").
+		WithArgs("ws-nocard", 0.0, "", 0, 0, "").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// #2421: backfill agent_card when heartbeat carries it and DB row is NULL
+	mock.ExpectExec("UPDATE workspaces SET agent_card =").
+		WithArgs("ws-nocard", sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	mock.ExpectQuery("SELECT status FROM workspaces WHERE id =").
+		WithArgs("ws-nocard").
+		WillReturnRows(sqlmock.NewRows([]string{"status"}).AddRow(models.StatusOnline))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+
+	body := `{"workspace_id":"ws-nocard","agent_card":{"name":"backfilled"}}`
+	c.Request = httptest.NewRequest("POST", "/registry/heartbeat", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Heartbeat(c)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+func TestHeartbeatHandler_SkipsAgentCardBackfill_WhenAlreadySet(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewRegistryHandler(broadcaster)
+
+	mock.ExpectQuery("SELECT COALESCE\\(current_task").
+		WithArgs("ws-hascard").
+		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend"}).AddRow("", 0))
+
+	mock.ExpectExec("UPDATE workspaces SET").
+		WithArgs("ws-hascard", 0.0, "", 0, 0, "").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// #2421: backfill must be a no-op when agent_card already exists (0 rows affected)
+	mock.ExpectExec("UPDATE workspaces SET agent_card =").
+		WithArgs("ws-hascard", sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+
+	mock.ExpectQuery("SELECT status FROM workspaces WHERE id =").
+		WithArgs("ws-hascard").
+		WillReturnRows(sqlmock.NewRows([]string{"status"}).AddRow(models.StatusOnline))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+
+	body := `{"workspace_id":"ws-hascard","agent_card":{"name":"ignored"}}`
+	c.Request = httptest.NewRequest("POST", "/registry/heartbeat", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Heartbeat(c)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
 // ------------------------------------------------------------
 // validateAgentURL (C6 SSRF fix)
 // ------------------------------------------------------------
