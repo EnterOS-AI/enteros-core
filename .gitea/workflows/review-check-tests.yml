@@ -21,15 +21,21 @@ on:
     branches: [main, staging]
     paths:
       - '.gitea/scripts/review-check.sh'
+      - '.gitea/scripts/_approval_validator.py'
+      - '.gitea/scripts/_review_check_filter.py'
       - '.gitea/scripts/tests/test_review_check.sh'
       - '.gitea/scripts/tests/_review_check_fixture.py'
+      - '.gitea/scripts/tests/test_approval_validator.py'
       - '.gitea/workflows/review-check-tests.yml'
   pull_request:
     branches: [main, staging]
     paths:
       - '.gitea/scripts/review-check.sh'
+      - '.gitea/scripts/_approval_validator.py'
+      - '.gitea/scripts/_review_check_filter.py'
       - '.gitea/scripts/tests/test_review_check.sh'
       - '.gitea/scripts/tests/_review_check_fixture.py'
+      - '.gitea/scripts/tests/test_approval_validator.py'
       - '.gitea/workflows/review-check-tests.yml'
   workflow_dispatch:
 
@@ -70,3 +76,11 @@ jobs:
 
       - name: Run review-check.sh regression suite
         run: bash .gitea/scripts/tests/test_review_check.sh
+
+      - name: SSOT approval-validator unit tests (SEV-1 internal#812)
+        # The Python unit tests for _approval_validator.py are
+        # mutation-verified — every fail-closed branch has an explicit
+        # REJECT assertion. A reviewer who weakens the predicate trips
+        # these in CI.
+        run: |
+          python3 -m unittest discover -s .gitea/scripts -p "test_approval_validator.py" -v
