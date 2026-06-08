@@ -354,3 +354,112 @@ def test_signal_4_branch_api_error_returns_na(monkeypatch):
 
     assert result["verdict"] == "N/A"
     assert "error" in result
+
+
+# ── Signal 6: CI required checks ────────────────────────────────────────────
+
+
+def _signal_6_api_get(required_checks, statuses):
+    """Return a fake_api_get closure for signal_6 tests."""
+    def fake_api_get(path):
+        if path == "/repos/molecule-ai/molecule-core/pulls/200":
+            return {"base": {"sha": "base000", "ref": "main"}, "head": {"sha": "pr222"}}
+        if path == "/repos/molecule-ai/molecule-core/commits/pr222/status":
+            return {"state": "failure", "statuses": statuses}
+        if path == "/repos/molecule-ai/molecule-core/branches/main/protection":
+            return {"required_status_checks": {"checks": [{"context": c} for c in required_checks]}}
+        raise AssertionError(f"unexpected api_get: {path}")
+    return fake_api_get
+
+
+def test_signal_6_missing_required_context_returns_ci_pending(monkeypatch):
+    """A required check that is ABSENT from the status list is treated as missing,
+    which is fail-closed → CI_PENDING (never ready-by-absence)."""
+    mod = load_gate_check()
+    monkeypatch.setattr(
+        mod, "api_get",
+        _signal_6_api_get(
+            required_checks=["qa-review / approved (pull_request)", "security-review / approved (pull_request)"],
+            statuses=[
+                {"context": "qa-review / approved (pull_request)", "status": "success"},
+                # security-review is completely missing
+            ],
+        ),
+    )
+    result = mod.signal_6_ci(200, "molecule-ai/molecule-core")
+    assert result["verdict"] == "CI_PENDING"
+    assert "security-review / approved (pull_request)" in result["pending_required"]
+
+
+def test_signal_6_pending_required_context_returns_ci_pending(monkeypatch):
+    """A required check with status 'pending' blocks the gate with CI_PENDING."""
+    mod = load_gate_check()
+    monkeypatch.setattr(
+        mod, "api_get",
+        _signal_6_api_get(
+            required_checks=[
+                "qa-review / approved (pull_request)",
+                "security-review / approved (pull_request)",
+                "sop-checklist / all-items-acked (pull_request)",
+            ],
+            statuses=[
+                {"context": "qa-review / approved (pull_request)", "status": "success"},
+                {"context": "security-review / approved (pull_request)", "status": "pending"},
+                {"context": "sop-checklist / all-items-acked (pull_request)", "status": "success"},
+            ],
+        ),
+    )
+    result = mod.signal_6_ci(200, "molecule-ai/molecule-core")
+    assert result["verdict"] == "CI_PENDING"
+    assert "security-review / approved (pull_request)" in result["pending_required"]
+
+
+def test_signal_6_failing_required_context_returns_ci_fail(monkeypatch):
+    """A required check with status 'failure' blocks the gate with CI_FAIL."""
+    mod = load_gate_check()
+    monkeypatch.setattr(
+        mod, "api_get",
+        _signal_6_api_get(
+            required_checks=[
+                "qa-review / approved (pull_request)",
+                "security-review / approved (pull_request)",
+                "sop-checklist / all-items-acked (pull_request)",
+                "CI / all-required (pull_request)",
+            ],
+            statuses=[
+                {"context": "qa-review / approved (pull_request)", "status": "failure"},
+                {"context": "security-review / approved (pull_request)", "status": "success"},
+                {"context": "sop-checklist / all-items-acked (pull_request)", "status": "success"},
+                {"context": "CI / all-required (pull_request)", "status": "success"},
+            ],
+        ),
+    )
+    result = mod.signal_6_ci(200, "molecule-ai/molecule-core")
+    assert result["verdict"] == "CI_FAIL"
+    assert "qa-review / approved (pull_request)" in result["failing_required"]
+
+
+def test_signal_6_all_required_green_returns_clear(monkeypatch):
+    """When every required check is success/neutral, the gate is CLEAR."""
+    mod = load_gate_check()
+    monkeypatch.setattr(
+        mod, "api_get",
+        _signal_6_api_get(
+            required_checks=[
+                "qa-review / approved (pull_request)",
+                "security-review / approved (pull_request)",
+                "sop-checklist / all-items-acked (pull_request)",
+                "CI / all-required (pull_request)",
+            ],
+            statuses=[
+                {"context": "qa-review / approved (pull_request)", "status": "success"},
+                {"context": "security-review / approved (pull_request)", "status": "success"},
+                {"context": "sop-checklist / all-items-acked (pull_request)", "status": "success"},
+                {"context": "CI / all-required (pull_request)", "status": "success"},
+            ],
+        ),
+    )
+    result = mod.signal_6_ci(200, "molecule-ai/molecule-core")
+    assert result["verdict"] == "CLEAR"
+    assert result["pending_required"] == []
+    assert result["failing_required"] == []
