@@ -83,4 +83,9 @@ jobs:
         # REJECT assertion. A reviewer who weakens the predicate trips
         # these in CI.
         run: |
-          python3 -m unittest discover -s .gitea/scripts -p "test_approval_validator.py" -v
+          # The test file lives in .gitea/scripts/tests/ with no __init__.py,
+          # so `unittest discover -s .gitea/scripts` finds 0 tests (the SEV-1
+          # suite silently never ran — a CI gap fixed alongside internal#812).
+          # Run the file directly; it self-inserts its sys.path and calls
+          # unittest.main(), so a failing assertion exits non-zero and fails CI.
+          python3 .gitea/scripts/tests/test_approval_validator.py -v

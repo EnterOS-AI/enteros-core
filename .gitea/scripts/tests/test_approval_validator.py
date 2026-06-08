@@ -349,6 +349,143 @@ class ClassifyReviewsContract(unittest.TestCase):
         _, request_changes = classify_reviews(reviews, headsha=HEAD)
         self.assertEqual(request_changes, [])
 
+    # -----------------------------------------------------------------
+    # VALIDATE-BEFORE-REDUCE regression tests (SEV-1 internal#812 follow-up).
+    #
+    # The bug: classify_reviews reduced to the LATEST row per user FIRST and
+    # validated AFTER. A later INVALID row (a COMMENT, or APPROVED/
+    # REQUEST_CHANGES with a null/old commit_id) from the same user could
+    # overwrite a genuine current-head review — masking an approval or
+    # ERASING a REQUEST_CHANGES block. The fix validates before the reduce,
+    # so an invalid later row is never eligible to be a user's "latest".
+    # -----------------------------------------------------------------
+
+    def test_genuine_approval_not_masked_by_later_comment(self):
+        """A genuine current-head APPROVED followed by a LATER COMMENT from
+        the SAME user must STILL count as an approval. A later non-
+        APPROVED/RC row (COMMENT) must not erase the approval. This is the
+        reduce-before-validate masking bug."""
+        reviews = [
+            _review(user="alice", state="APPROVED", commit_id=HEAD),
+            _review(user="alice", state="COMMENT", commit_id=HEAD),
+        ]
+        approvers, request_changes = classify_reviews(reviews, headsha=HEAD)
+        self.assertIn("alice", approvers)
+        self.assertEqual(request_changes, [])
+
+    def test_genuine_approval_not_masked_by_later_null_commit_id(self):
+        """A genuine current-head APPROVED followed by a LATER APPROVED with
+        a null commit_id (the spoof/invalid signature) from the SAME user
+        must STILL count. The invalid later row must be ignored, not allowed
+        to overwrite the valid earlier approval."""
+        for bad in [None, ""]:
+            with self.subTest(commit_id=bad):
+                reviews = [
+                    _review(user="alice", state="APPROVED", commit_id=HEAD),
+                    _review(user="alice", state="APPROVED", commit_id=bad),
+                ]
+                approvers, _ = classify_reviews(reviews, headsha=HEAD)
+                self.assertIn(
+                    "alice", approvers,
+                    f"later invalid commit_id={bad!r} must not mask the "
+                    "genuine current-head approval",
+                )
+
+    def test_genuine_approval_not_masked_by_later_stale_commit_id(self):
+        """A genuine current-head APPROVED followed by a LATER APPROVED on a
+        STALE (old) head from the SAME user must STILL count toward
+        approvers — the stale later row is invalid and must be ignored."""
+        reviews = [
+            _review(user="alice", state="APPROVED", commit_id=HEAD),
+            _review(user="alice", state="APPROVED", commit_id=OTHER_HEAD),
+        ]
+        approvers, _ = classify_reviews(reviews, headsha=HEAD)
+        self.assertIn("alice", approvers)
+
+    def test_request_changes_not_erased_by_later_comment(self):
+        """A genuine current-head REQUEST_CHANGES followed by a LATER COMMENT
+        from the SAME user must STILL block. The later invalid row must not
+        erase the REQUEST_CHANGES — this is the worse, silently-evaporating-
+        block variant of the bug."""
+        reviews = [
+            _review(user="bob", state="REQUEST_CHANGES", commit_id=HEAD),
+            _review(user="bob", state="COMMENT", commit_id=HEAD),
+        ]
+        approvers, request_changes = classify_reviews(reviews, headsha=HEAD)
+        self.assertIn("bob", request_changes)
+        self.assertNotIn("bob", approvers)
+
+    def test_request_changes_not_erased_by_later_null_commit_id(self):
+        """A genuine current-head REQUEST_CHANGES followed by a LATER
+        REQUEST_CHANGES with a null/old commit_id from the SAME user must
+        STILL block. The invalid later row must be ignored, not allowed to
+        relocate the user's verdict off the current head."""
+        for bad in [None, "", OTHER_HEAD]:
+            with self.subTest(commit_id=bad):
+                reviews = [
+                    _review(user="bob", state="REQUEST_CHANGES", commit_id=HEAD),
+                    _review(user="bob", state="REQUEST_CHANGES", commit_id=bad),
+                ]
+                _, request_changes = classify_reviews(reviews, headsha=HEAD)
+                self.assertIn(
+                    "bob", request_changes,
+                    f"later invalid commit_id={bad!r} must not erase the "
+                    "genuine current-head REQUEST_CHANGES block",
+                )
+
+    def test_request_changes_not_erased_by_later_approved_invalid(self):
+        """A genuine current-head REQUEST_CHANGES followed by a LATER
+        INVALID APPROVED (null commit_id) from the SAME user must STILL
+        block AND must NOT count the user as an approver. The invalid
+        approval must not flip a real block into a pass."""
+        reviews = [
+            _review(user="bob", state="REQUEST_CHANGES", commit_id=HEAD),
+            _review(user="bob", state="APPROVED", commit_id=None),
+        ]
+        approvers, request_changes = classify_reviews(reviews, headsha=HEAD)
+        self.assertIn("bob", request_changes)
+        self.assertNotIn("bob", approvers)
+
+    def test_genuine_request_changes_still_supersedes_genuine_approval(self):
+        """Sanity: a genuine LATER current-head REQUEST_CHANGES still
+        supersedes an earlier genuine APPROVED from the same user (the
+        valid-row supersession we MUST preserve — only INVALID later rows
+        are ignored). Guards against an over-correction that ignores all
+        later rows."""
+        reviews = [
+            _review(user="alice", state="APPROVED", commit_id=HEAD),
+            _review(user="alice", state="REQUEST_CHANGES", commit_id=HEAD),
+        ]
+        approvers, request_changes = classify_reviews(reviews, headsha=HEAD)
+        self.assertNotIn("alice", approvers)
+        self.assertIn("alice", request_changes)
+
+    def test_genuine_approval_still_supersedes_genuine_request_changes(self):
+        """Sanity: a genuine LATER current-head APPROVED supersedes an
+        earlier genuine REQUEST_CHANGES from the same user."""
+        reviews = [
+            _review(user="alice", state="REQUEST_CHANGES", commit_id=HEAD),
+            _review(user="alice", state="APPROVED", commit_id=HEAD),
+        ]
+        approvers, request_changes = classify_reviews(reviews, headsha=HEAD)
+        self.assertIn("alice", approvers)
+        self.assertEqual(request_changes, [])
+
+    def test_two_valid_approvers_plus_one_invalid_later_row(self):
+        """Two distinct users with valid current-head approvals + a third
+        user whose ONLY genuine approval is followed by an invalid later
+        row → all three real approvers are counted; the invalid later row
+        does not drop the third user."""
+        reviews = [
+            _review(user="alice", state="APPROVED", commit_id=HEAD),
+            _review(user="bob", state="APPROVED", commit_id=HEAD),
+            _review(user="carol", state="APPROVED", commit_id=HEAD),
+            _review(user="carol", state="COMMENT", commit_id=HEAD),
+        ]
+        approvers, request_changes = classify_reviews(reviews, headsha=HEAD)
+        self.assertEqual(approvers, {"alice", "bob", "carol"})
+        self.assertEqual(request_changes, [])
+
 
 # ---------------------------------------------------------------------------
 # Mutation-resistance smoke checks

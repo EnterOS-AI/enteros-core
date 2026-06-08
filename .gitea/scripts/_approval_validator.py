@@ -158,12 +158,34 @@ def classify_reviews(
     request_changes: distinct logins whose LATEST official review on the
         current head is REQUEST_CHANGES.
 
-    Gitea returns reviews oldest-first; we keep the latest submission per
-    user (later entries overwrite). This is the same shape the merge-queue
-    used pre-fix; only the per-review predicate has changed.
+    Gitea returns reviews oldest-first. We keep the latest *VALID*
+    submission per user (later VALID entries overwrite earlier ones; an
+    invalid later row — a COMMENT, or a review with a null/old commit_id —
+    is ignored and can NOT overwrite or erase a genuine review). See the
+    inline VALIDATE-BEFORE-REDUCE note below for the exploit this closes.
     """
     reviewer_set_set = set(reviewer_set) if reviewer_set is not None else None
-    latest_by_user: dict = {}
+
+    # VALIDATE-BEFORE-REDUCE (SEV-1 internal#812 follow-up).
+    #
+    # The earlier implementation reduced FIRST (latest row per user, keyed
+    # only on state in {APPROVED, REQUEST_CHANGES}) and validated the single
+    # surviving row AFTER. That is reduce-before-validate, and it is
+    # exploitable: a user posts a genuine current-head APPROVED (or
+    # REQUEST_CHANGES), then posts a LATER row that fails the fail-closed
+    # predicate (a COMMENT, or an APPROVED with a null/old commit_id). The
+    # later INVALID row overwrote the genuine one in latest_by_user, so a
+    # real approval was masked, and — worse — a real current-head
+    # REQUEST_CHANGES could be erased and the block silently evaporate.
+    #
+    # The fix: filter to VALID reviews FIRST (each row must pass
+    # is_official_current_head AND carry an APPROVED/REQUEST_CHANGES state),
+    # and only then reduce to the latest VALID review per user. An invalid
+    # later row is never eligible to become a user's "latest" state, so it
+    # cannot overwrite or erase a genuine review. A user's verdict is the
+    # state of their latest VALID (official, current-head, non-dismissed,
+    # non-stale, commit_id-present-and-matching) review.
+    latest_valid_by_user: dict = {}
     for review in reviews:
         if not isinstance(review, dict):
             continue
@@ -175,11 +197,19 @@ def classify_reviews(
         state = str(review.get("state") or "").upper()
         if state not in {"APPROVED", "REQUEST_CHANGES"}:
             continue
-        latest_by_user[user] = review
+        # Fail-closed predicate BEFORE the reduce: official, not dismissed,
+        # not stale, commit_id present AND == head. Invalid rows are dropped
+        # here and so can never become the per-user "latest".
+        if not is_official_current_head(review, headsha):
+            continue
+        latest_valid_by_user[user] = review
 
     approvers: set[str] = set()
     request_changes: list[str] = []
-    for user, review in latest_by_user.items():
+    for user, review in latest_valid_by_user.items():
+        # Each surviving review already passed is_official_current_head, so
+        # the state alone determines the verdict. We still go through the
+        # per-verdict SSOT predicates so the rule cannot drift.
         if is_genuine_approval(review, headsha=headsha, reviewer_set=None):
             approvers.add(user)
         elif is_open_request_changes(review, headsha=headsha):
