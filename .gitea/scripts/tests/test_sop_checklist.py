@@ -428,9 +428,7 @@ class TestRenderStatus(unittest.TestCase):
             self._state_with(all_slugs),
             {it["slug"]: False for it in self.items},
         )
-        # #1974: body-section presence is informational only; state is success
-        # when all items are peer-acked, even if body sections are missing.
-        self.assertEqual(state, "success")
+        self.assertEqual(state, "failure")
         self.assertIn("body-unfilled", desc)
 
 
@@ -502,8 +500,7 @@ class TestEndToEndAckFlow(unittest.TestCase):
         self.assertEqual(result_state, "success")
         self.assertIn("7/7", desc)
 
-    def test_all_acks_succeed_when_body_section_unfilled(self):
-        """#1974: body-section presence is informational; ack gate is peer-ack."""
+    def test_all_acks_still_fail_when_body_section_unfilled(self):
         items = _items_by_slug()
         aliases = _numeric_aliases()
         comments = [
@@ -524,9 +521,7 @@ class TestEndToEndAckFlow(unittest.TestCase):
         body["root-cause"] = False
         items_list = list(items.values())
         result_state, desc = sop.render_status(items_list, state, body)
-        # #1974: body-unfilled is informational only; state is success when
-        # all required acks are present.
-        self.assertEqual(result_state, "success")
+        self.assertEqual(result_state, "failure")
         self.assertIn("7/7", desc)
         self.assertIn("body-unfilled: root-cause", desc)
 

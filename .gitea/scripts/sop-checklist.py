@@ -858,8 +858,7 @@ def render_status(
         if len(missing_body) > 3:
             shown += f", +{len(missing_body) - 3}"
         desc_parts.append(f"body-unfilled: {shown}")
-    # #1974: body-section presence is informational only; the gate is peer-ack.
-    state = "success" if not missing else "failure"
+    state = "success" if not missing and not missing_body else "failure"
     return state, " — ".join(desc_parts)
 
 
