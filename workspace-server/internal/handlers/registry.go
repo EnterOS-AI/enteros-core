@@ -309,6 +309,8 @@ func validateAgentURL(rawURL string) error {
 // (covers prod `*.moleculesai.app` and staging `*.staging.moleculesai.app`) and
 // is overridable via MOLECULE_APP_DOMAIN for other deployments.
 func isPlatformTunnelHostname(h string) bool {
+	// DNS is case-insensitive and FQDN-form hostnames may carry a trailing dot.
+	h = strings.ToLower(strings.TrimSuffix(h, "."))
 	if !strings.HasPrefix(h, "ws-") {
 		return false
 	}
@@ -316,6 +318,7 @@ func isPlatformTunnelHostname(h string) bool {
 	if domain == "" {
 		domain = "moleculesai.app"
 	}
+	domain = strings.ToLower(strings.TrimSuffix(domain, "."))
 	return strings.HasSuffix(h, "."+domain)
 }
 
