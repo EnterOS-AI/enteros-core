@@ -56,10 +56,10 @@ func sanitizeUTF8(s string) string {
 // WorkspaceHandler.ProxyA2ARequest + WorkspaceHandler.EnqueueA2A satisfy this.
 type A2AProxy interface {
 	ProxyA2ARequest(ctx context.Context, workspaceID string, body []byte, callerID string, logActivity bool) (int, []byte, error)
-	// EnqueueA2A durably buffers an A2A message in the a2a_queue table for a
-	// busy workspace; the heartbeat drain dispatches it serially when the
-	// agent frees. idempotencyKey dedups active rows per (workspace,key).
-	// Returns the queue row id, the resulting queued depth, and any error.
+	// EnqueueA2A durably buffers an A2A message for a busy workspace; the
+	// drain dispatches it serially when the agent frees. idempotencyKey
+	// collapses duplicate pending buffers per (workspace,key). Returns the
+	// buffered entry id, the resulting pending depth, and any error.
 	EnqueueA2A(ctx context.Context, workspaceID, callerID string, priority int, body []byte, method, idempotencyKey string, expiresAt *time.Time) (string, int, error)
 }
 
@@ -414,23 +414,19 @@ func (s *Scheduler) fireSchedule(ctx context.Context, sched scheduleRow) {
 
 	// #969 → durable buffering. When the target workspace is busy
 	// (active_tasks >= max_concurrent_tasks) we do NOT skip the tick and we do
-	// NOT block the scheduler goroutine waiting for capacity. Instead we ENQUEUE
-	// the cron message into the durable a2a_queue, mirroring how busy A2A
-	// dispatches already buffer (internal/handlers/a2a_queue.go). The heartbeat
-	// drain then dispatches it serially the moment the agent frees — execution
-	// stays one-at-a-time; max_concurrent_tasks is unchanged.
+	// NOT block the scheduler goroutine waiting for capacity. Instead we durably
+	// buffer the cron message, mirroring how busy A2A dispatches already buffer.
+	// The drain then dispatches it serially the moment the agent frees —
+	// execution stays one-at-a-time; max_concurrent_tasks is unchanged.
 	//
-	// This supersedes the previous "poll 10s ×12 then recordSkipped" behavior,
-	// which dropped scheduled ticks on perpetually-busy workspaces (the
-	// Orchestrator pulse delegation chain kept leaders busy, ~30% cron drop).
+	// This supersedes the previous "poll then recordSkipped" behavior, which
+	// dropped scheduled ticks on workspaces that stayed busy across the whole
+	// poll window.
 	//
 	// Idempotency key = sched.ID (the SCHEDULE id), NOT msgID/a random uuid.
-	// The a2a_queue partial-unique index idx_a2a_queue_idempotency dedups on
-	// (workspace_id, idempotency_key) for status IN ('queued','dispatched').
 	// Keying by schedule_id means a busy agent buffers AT MOST ONE pending tick
-	// per schedule — the latest one wins (ON CONFLICT DO NOTHING keeps the
-	// already-queued row; the obsolete newer tick is dropped at the DB) — so we
-	// hold the next tick instead of stacking a stale backlog of one-tick-per-30s.
+	// per schedule — the latest one wins, the obsolete newer tick is collapsed —
+	// so we hold the next tick instead of stacking a stale backlog.
 	if capErr == nil && activeTasks >= maxConcurrent {
 		// Buffered ticks expire at the next scheduled fire: a tick that's been
 		// sitting in the queue past when the cron would naturally tick again is
@@ -761,14 +757,14 @@ func (s *Scheduler) recordSkipped(ctx context.Context, sched scheduleRow, active
 }
 
 // recordQueued advances next_run_at and logs a cron_run activity entry with
-// status='queued' when the target workspace was busy and the tick was buffered
-// into the durable a2a_queue instead of fired. Mirrors recordSkipped (#115) but
-// records a buffer, not a drop: the heartbeat drain will dispatch qID serially
-// when the agent frees. next_run_at still advances so the liveness view keeps
-// ticking and the NEXT cron slot enqueues (the schedule_id idempotency key then
-// holds at most one pending tick — the latest — per schedule).
+// status='queued' when the target workspace was busy and the tick was durably
+// buffered instead of fired. Mirrors recordSkipped (#115) but records a buffer,
+// not a drop: the drain will dispatch qID serially when the agent frees.
+// next_run_at still advances so the liveness view keeps ticking and the NEXT
+// cron slot enqueues (the schedule_id idempotency key then holds at most one
+// pending tick — the latest — per schedule).
 func (s *Scheduler) recordQueued(ctx context.Context, sched scheduleRow, activeTasks int, queueID string, depth int) {
-	reason := fmt.Sprintf("queued: workspace busy (active_tasks=%d), buffered to a2a_queue (id=%s, depth=%d)", activeTasks, short(queueID, 8), depth)
+	reason := fmt.Sprintf("queued: workspace busy (active_tasks=%d), buffered (id=%s, depth=%d)", activeTasks, short(queueID, 8), depth)
 
 	nextRun, nextErr := ComputeNextRun(sched.CronExpr, sched.Timezone, time.Now())
 	var nextRunPtr *time.Time
