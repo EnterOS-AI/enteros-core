@@ -5,17 +5,21 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"database/sql/driver"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
 	sqlmock "github.com/DATA-DOG/go-sqlmock"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/channels"
+	channels_crypto "git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/crypto"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"github.com/gin-gonic/gin"
 )
@@ -237,6 +241,66 @@ func TestChannelHandler_Create_Success(t *testing.T) {
 	json.Unmarshal(w.Body.Bytes(), &result)
 	if result["id"] != "new-ch-id" {
 		t.Errorf("expected id 'new-ch-id', got %v", result["id"])
+	}
+}
+
+// encryptedConfigArg matches INSERT args where bot_token has the ec1: prefix.
+type encryptedConfigArg struct{}
+
+func (a encryptedConfigArg) Match(v driver.Value) bool {
+	s, ok := v.(string)
+	if !ok {
+		return false
+	}
+	var cfg map[string]interface{}
+	if err := json.Unmarshal([]byte(s), &cfg); err != nil {
+		return false
+	}
+	token, ok := cfg["bot_token"].(string)
+	if !ok {
+		return false
+	}
+	// #319: bot_token must be encrypted (ciphertextPrefix "ec1:")
+	// before persistence, NOT stored plaintext.
+	return strings.HasPrefix(token, "ec1:")
+}
+
+func TestChannelHandler_Create_EncryptsSensitiveFields(t *testing.T) {
+	// Enable encryption for this test so EncryptSensitiveFields actually transforms.
+	os.Setenv("SECRETS_ENCRYPTION_KEY", base64.StdEncoding.EncodeToString(make([]byte, 32)))
+	channels_crypto.ResetForTesting()
+	channels_crypto.Init()
+	defer func() {
+		os.Unsetenv("SECRETS_ENCRYPTION_KEY")
+		channels_crypto.ResetForTesting()
+	}()
+
+	mock := setupTestDB(t)
+	handler := NewChannelHandler(newTestChannelManager())
+
+	mock.ExpectQuery("INSERT INTO workspace_channels").
+		WithArgs("ws-1", "telegram", encryptedConfigArg{}, true, sqlmock.AnyArg()).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("new-ch-id"))
+	// Reload query
+	mock.ExpectQuery("SELECT .* FROM workspace_channels").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "workspace_id", "channel_type", "channel_config", "enabled", "allowed_users"}))
+
+	body, _ := json.Marshal(map[string]interface{}{
+		"channel_type":  "telegram",
+		"config":        map[string]interface{}{"bot_token": "123456789:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "chat_id": "-100"},
+		"allowed_users": []string{"user-1"},
+	})
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request, _ = http.NewRequest("POST", "/workspaces/ws-1/channels", bytes.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Params = gin.Params{{Key: "id", Value: "ws-1"}}
+
+	handler.Create(c)
+
+	if w.Code != 201 {
+		t.Errorf("expected 201, got %d: %s", w.Code, w.Body.String())
 	}
 }
 
