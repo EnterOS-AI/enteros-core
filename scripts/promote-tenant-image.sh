@@ -229,6 +229,11 @@ ssm_refresh_ecr_auth() {
   # to guarantee correct string escaping (OFFSEC-001 / CWE-78 hardening).
   # Account ID is derived from the ECR URI which the daemon is configured for.
   local acct="${ECR_ACCOUNT_ID:-153263036946}"
+  # #676: validate account ID is exactly 12 digits (AWS account ID format).
+  if ! [[ "$acct" =~ ^[0-9]{12}$ ]]; then
+    err "invalid ECR_ACCOUNT_ID (must be 12 digits): $acct"
+    return 1
+  fi
   local params
   params=$(mktemp)
   python3 -c "
@@ -290,6 +295,11 @@ validate_slug() {
 
 preflight() {
   log "preflight: source=$SOURCE_TAG dest=$DEST_TAG repo=$REPO region=$REGION"
+  # Region validation: reject obviously malformed input (CWE-78 / injection guard).
+  if ! [[ "$REGION" =~ ^[a-z][a-z0-9-]*[0-9]$ ]]; then
+    err "invalid AWS region: $REGION"
+    exit 64
+  fi
   local src_manifest
   src_manifest=$(aws_ecr_get_image "$SOURCE_TAG") || {
     err "source tag '$SOURCE_TAG' not found in $REPO"

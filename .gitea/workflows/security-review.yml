@@ -10,20 +10,23 @@
 # A1-α addendum (internal#760): review-event trigger added so the security
 # gate flips immediately when a team member submits an APPROVE review.
 # Uses `pull_request_review` types: [submitted] — verified live via
-# sop-tier-check.yml which provably fires this event (produces
-# `sop-tier-check / tier-check (pull_request_review)` contexts).
-# The job-level `if:` guard checks
-# `github.event.review.state == 'APPROVED' || 'approved'` so only APPROVE
-# reviews run the evaluator; COMMENT and REQUEST_CHANGES are skipped at
-# the job level. Branch-protection requires the `(pull_request_target)`
-# context variant, so the review-event path EXPLICITLY POSTS the required
-# context via the API. Trust boundary preserved (BASE ref, no PR-head).
+# sop-checklist.yml which provably fires this event (produces
+# `sop-checklist / all-items-acked (pull_request_review)` contexts).
+# The job-level `if:` does NOT guard on review.state (issue #2159):
+# Gitea 1.22.6's payload shape for this event does not reliably expose
+# the state field that the GitHub-style guard expects.  The evaluator
+# (review-check.sh) reads actual reviews from the API and checks for a
+# real APPROVE, so running on COMMENT or REQUEST_CHANGES is harmless
+# (read-only, idempotent).  Branch-protection requires the
+# `(pull_request_target)` context variant, so the review-event path
+# EXPLICITLY POSTS the required context via the API. Trust boundary
+# preserved (BASE ref, no PR-head).
 
 name: security-review
 
 on:
   pull_request_target:
-    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
   pull_request_review:
     types: [submitted]
 
@@ -37,13 +40,19 @@ jobs:
   approved:
     # Gate the job:
     #   - On pull_request_target events: always run.
-    #   - On pull_request_review_approved events: run so the gate flips
-    #     immediately when a team member submits an APPROVE review.
+    #   - On pull_request_review events: always run.  We do NOT guard on
+    #     review.state here because Gitea 1.22.6's payload shape for this
+    #     event does not reliably expose the state field (issue #2159).
+    #     The evaluator (review-check.sh) reads actual reviews from the
+    #     API and checks for a real APPROVE, so running on COMMENT or
+    #     REQUEST_CHANGES is harmless (read-only, idempotent).
+    #   - On labeled/unlabeled events: re-evaluate when labels change.
+    #     This ensures security-review flips when risk-indicator labels
+    #     are added or removed.
     # Comment-triggered refires live in sop-checklist.yml review-refire job.
     if: |
       github.event_name == 'pull_request_target' ||
-      (github.event_name == 'pull_request_review' &&
-       (github.event.review.state == 'APPROVED' || github.event.review.state == 'approved'))
+      github.event_name == 'pull_request_review'
     runs-on: ubuntu-latest
     steps:
       - name: Privilege check (A1.1 — INFORMATIONAL log only, NOT a gate)
@@ -52,7 +61,7 @@ jobs:
         # so re-running on a non-collaborator comment is harmless.
         if: github.event_name == 'issue_comment'
         env:
-          GITEA_TOKEN: ${{ secrets.SOP_TIER_CHECK_TOKEN || secrets.GITHUB_TOKEN }}
+          GITEA_TOKEN: ${{ secrets.SOP_CHECKLIST_GATE_TOKEN || secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           login="${{ github.event.comment.user.login }}"
@@ -78,7 +87,7 @@ jobs:
       - name: Evaluate security-review
         id: eval
         env:
-          GITEA_TOKEN: ${{ secrets.SOP_TIER_CHECK_TOKEN || secrets.GITHUB_TOKEN }}
+          GITEA_TOKEN: ${{ secrets.SOP_CHECKLIST_GATE_TOKEN || secrets.GITHUB_TOKEN }}
           GITEA_HOST: git.moleculesai.app
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
@@ -98,7 +107,7 @@ jobs:
         # TOKEN FIX (RC 8326): uses STATUS_POST_TOKEN (CTO-granted,
         # msg d52cc72a). Dedicated narrow-scoped write:repository token
         # for the explicit status POST. Evaluator step stays on
-        # SOP_TIER_CHECK_TOKEN (read-only) per deliberate security
+        # SOP_CHECKLIST_GATE_TOKEN (read-only) per deliberate security
         # separation: eval computes, POST writes, never the same cred.
         if: github.event_name == 'pull_request_review' && always()
         env:

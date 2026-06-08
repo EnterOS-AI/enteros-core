@@ -55,38 +55,22 @@
 
 version: 1
 
-# Tier-aware failure mode (RFC#351 open question 2):
-#   For tier:high — hard-fail (status `failure`, blocks merge via BP).
-#   For tier:medium — hard-fail (same as high; medium is non-trivial).
-#   For tier:low — soft-fail (status `pending` with `acked: N/M` in the
-#                  description). BP can choose to require the context
-#                  or not for low-tier PRs.
-# If no tier label is present, default to medium (hard-fail) — every PR
-# should have a tier label per sop-tier-check, and absence indicates
-# a missing-tier defect we should surface, not silently lower the bar.
-tier_failure_mode:
-  "tier:high": hard
-  "tier:medium": hard
-  "tier:low": soft
-default_mode: hard  # used when no tier:* label is present
+# Uniform hard-fail mode (CTO 2026-06-07):
+#   Every PR uses the same gate — no tier branching.
+#   Missing acks → status `failure`, blocks merge via branch protection.
 
 # High-risk class (RFC#450 Option C, governance-fix for internal#442).
 #
-# A PR is "high-risk" when ANY of the listed labels are applied OR when
-# the PR has `tier:high` (mechanically the strictest existing tier).
+# A PR is "high-risk" when ANY of the listed labels are applied.
 # High-risk items use `required_teams_high_risk` (when present on the
 # item); non-high-risk items use the default `required_teams`.
 #
-# This closes the inconsistency that the SOP charter already mandates
-# `tier:high → ceo only` for the sibling `sop-tier-check` gate; the
-# sop-checklist's `root-cause` and `no-backwards-compat` items now
-# follow the same risk-classed two-eyes shape:
-#   - Default class (tier:low/medium, not high-risk): a non-author
-#     engineers/managers/ceo ack satisfies the item — 25+ live
-#     identities, no dependency on a dead/inactive senior persona
-#     token.
-#   - High-risk class (tier:high OR any high_risk_label): still
-#     requires a non-author ceo ack (durable human team).
+# Risk-classed two-eyes shape:
+#   - Default class (not high-risk): a non-author engineers/managers/ceo
+#     ack satisfies the item — 25+ live identities, no dependency on a
+#     dead/inactive senior persona token.
+#   - High-risk class (any high_risk_label): still requires a non-author
+#     ceo ack (durable human team).
 #
 # Tightening: add labels to high_risk_labels.
 # Loosening: remove labels.
@@ -165,7 +149,11 @@ items:
 
   - slug: memory-consulted
     numeric_alias: 7
-    pr_section_marker: "Memory/saved-feedback consulted"
+    # #1973: normalize marker so it matches the slug. Previously the
+    # slash produced a checklist status that never resolved because
+    # normalize_slug() collapses / to - and the Gitea PR body parser
+    # would not find the expected heading.
+    pr_section_marker: "Memory consulted"
     required_teams: [engineers]
     ai_ack_eligible: true
     description: >-

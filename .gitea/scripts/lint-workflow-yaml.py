@@ -17,7 +17,7 @@ Rules (4 fatal + 1 fatal cross-file + 1 heuristic-warn):
      enumeration; task #81). Workflow registers, fires for 0 events.
   3. `name:` containing `/` — breaks the
      `<workflow> / <job> (<event>)` commit-status context convention;
-     downstream parsers (sop-tier-check, status-reaper) tokenize on `/`.
+     downstream parsers (sop-checklist, status-reaper) tokenize on `/`.
   4. `name:` collision across files — Gitea routes commit-status updates
      by `name` and behavior on collision is undefined (status-reaper
      rev1 fail-loud).
@@ -150,7 +150,7 @@ def check_name_with_slash(filename: str, doc: Any) -> list[str]:
             f"::error file={filename}::Rule 3 (FATAL): workflow `name: "
             f"{name!r}` contains `/`. The commit-status context convention "
             f"is `<workflow> / <job> (<event>)`; embedding `/` in the "
-            f"workflow name makes downstream parsers (sop-tier-check, "
+            f"workflow name makes downstream parsers (sop-checklist, "
             f"status-reaper) tokenize ambiguously. Rename to use `-` or "
             f"` ` instead."
         )

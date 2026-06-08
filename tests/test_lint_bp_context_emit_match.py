@@ -127,7 +127,7 @@ def _stub_api(monkeypatch, lint_mod, bp_response, issue_search_response=None, po
             posted_record.setdefault("patches", []).append({"path": path, "body": body})
             return ("ok", {"number": 9001})
         if "/labels" in path:
-            return ("ok", [{"id": 10, "name": "ci-bp-drift"}, {"id": 9, "name": "tier:high"}])
+            return ("ok", [{"id": 10, "name": "ci-bp-drift"}, {"id": 9, "name": "ci-bp-drift"}])
         return ("ok", {})
 
     monkeypatch.setattr(lint_mod, "api", fake_api)

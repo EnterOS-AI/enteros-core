@@ -12,7 +12,7 @@
 # (SHA 0adf2098) per RFC internal#219 Phase 2b+c — replicate repo-by-repo.
 #
 # When any pair diverges, a `[ci-drift]` issue is opened or updated
-# (idempotent by title) and labelled `tier:high`. This is the
+# (idempotent by title) and labelled `ci-bp-drift`. This is the
 # auto-detection that closes the regression class identified in
 # RFC §1 finding 3 (protection only listed 2 of 6 real jobs for
 # ~weeks, undetected) and §6 (audit env drifts silently from
@@ -81,7 +81,7 @@ jobs:
           # Gitea persona whose ONLY job is reading branch_protections
           # and posting the [ci-drift] tracking issue. The endpoint
           # `GET /repos/.../branch_protections/{branch}` requires
-          # repo-ADMIN role (Gitea 1.22.6) — SOP_TIER_CHECK_TOKEN and the
+          # repo-ADMIN role (Gitea 1.22.6) — the default GITHUB_TOKEN and the
           # auto-injected GITHUB_TOKEN do NOT have it (read-only / write
           # without admin), so the previous fallback chain 403'd.
           # Mirrors the controlplane fix landed in CP PR#134.
@@ -106,7 +106,7 @@ jobs:
           AUDIT_WORKFLOW_PATH: '.gitea/workflows/audit-force-merge.yml'
           # Path to the CI workflow with the sentinel + the jobs.
           CI_WORKFLOW_PATH: '.gitea/workflows/ci.yml'
-          # Issue label applied on file/update. `tier:high` exists in
+          # Issue label applied on file/update. `ci-bp-drift` exists in
           # the molecule-core label set (verified 2026-05-11, label id 9).
-          DRIFT_LABEL: 'tier:high'
+          DRIFT_LABEL: 'ci-bp-drift'
         run: python3 .gitea/scripts/ci-required-drift.py

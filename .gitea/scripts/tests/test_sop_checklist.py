@@ -11,7 +11,7 @@
 #   - compute_ack_state (self-ack rejected, team probe applied, revoke
 #     invalidates own prior ack, peer's ack survives unrevoked)
 #   - render_status (state + description format)
-#   - get_tier_mode (label-driven, default fallback)
+#   - is_high_risk (label-driven, default fallback)
 #   - load_config (default config parses cleanly with both PyYAML and
 #     the bundled minimal parser)
 #
@@ -433,37 +433,6 @@ class TestRenderStatus(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# get_tier_mode
-# ---------------------------------------------------------------------------
-
-
-class TestGetTierMode(unittest.TestCase):
-    def setUp(self):
-        self.cfg = sop.load_config(CONFIG_PATH)
-
-    def test_tier_high_is_hard(self):
-        pr = {"labels": [{"name": "tier:high"}, {"name": "area:ci"}]}
-        self.assertEqual(sop.get_tier_mode(pr, self.cfg), "hard")
-
-    def test_tier_medium_is_hard(self):
-        pr = {"labels": [{"name": "tier:medium"}]}
-        self.assertEqual(sop.get_tier_mode(pr, self.cfg), "hard")
-
-    def test_tier_low_is_soft(self):
-        pr = {"labels": [{"name": "tier:low"}]}
-        self.assertEqual(sop.get_tier_mode(pr, self.cfg), "soft")
-
-    def test_no_tier_label_defaults_to_hard(self):
-        # Per feedback_fix_root_not_symptom — never silently lower the bar.
-        pr = {"labels": [{"name": "area:ci"}]}
-        self.assertEqual(sop.get_tier_mode(pr, self.cfg), "hard")
-
-    def test_no_labels_defaults_to_hard(self):
-        self.assertEqual(sop.get_tier_mode({"labels": []}, self.cfg), "hard")
-        self.assertEqual(sop.get_tier_mode({}, self.cfg), "hard")
-
-
-# ---------------------------------------------------------------------------
 # load_config
 # ---------------------------------------------------------------------------
 
@@ -486,13 +455,6 @@ class TestLoadConfig(unittest.TestCase):
                 "memory-consulted",
             },
         )
-
-    def test_default_config_tier_mode_shape(self):
-        cfg = sop.load_config(CONFIG_PATH)
-        self.assertEqual(cfg["tier_failure_mode"]["tier:high"], "hard")
-        self.assertEqual(cfg["tier_failure_mode"]["tier:medium"], "hard")
-        self.assertEqual(cfg["tier_failure_mode"]["tier:low"], "soft")
-        self.assertEqual(cfg["default_mode"], "hard")
 
     def test_each_item_has_required_fields(self):
         cfg = sop.load_config(CONFIG_PATH)
@@ -627,7 +589,7 @@ class TestComputeNaState(unittest.TestCase):
 class TestIsHighRisk(unittest.TestCase):
     """The high-risk predicate decides which required_teams list applies.
 
-    Predicate: tier:high label OR any label in cfg.high_risk_labels.
+    Predicate: any label in cfg.high_risk_labels.
     """
 
     def setUp(self):
@@ -637,23 +599,8 @@ class TestIsHighRisk(unittest.TestCase):
         pr = {"labels": []}
         self.assertFalse(sop.is_high_risk(pr, self.cfg))
 
-    def test_tier_high_is_high_risk(self):
-        pr = {"labels": [{"name": "tier:high"}]}
-        self.assertTrue(sop.is_high_risk(pr, self.cfg))
-
-    def test_tier_low_is_default_class(self):
-        pr = {"labels": [{"name": "tier:low"}]}
-        self.assertFalse(sop.is_high_risk(pr, self.cfg))
-
-    def test_tier_medium_is_default_class(self):
-        # tier:medium alone is NOT high-risk (Option C — medium routes
-        # to the wider engineers OR-set).
-        pr = {"labels": [{"name": "tier:medium"}]}
-        self.assertFalse(sop.is_high_risk(pr, self.cfg))
-
     def test_area_security_label_is_high_risk(self):
-        pr = {"labels": [{"name": "tier:medium"}, {"name": "area:security"}]}
-        self.assertTrue(sop.is_high_risk(pr, self.cfg))
+        pr = {"labels": [{"name": "area:security"}]}
 
     def test_area_schema_label_is_high_risk(self):
         pr = {"labels": [{"name": "area:schema"}]}
@@ -668,7 +615,7 @@ class TestIsHighRisk(unittest.TestCase):
         self.assertTrue(sop.is_high_risk(pr, self.cfg))
 
     def test_area_gate_meta_label_is_high_risk(self):
-        # Gate-meta = changes to sop-checklist/sop-tier-check itself.
+        # Gate-meta = changes to sop-checklist/sop-checklist itself.
         pr = {"labels": [{"name": "area:gate-meta"}]}
         self.assertTrue(sop.is_high_risk(pr, self.cfg))
 
@@ -722,7 +669,7 @@ class TestRootCauseAckEligibilityWidened(unittest.TestCase):
     root-cause / no-backwards-compat for the default class.
 
     The dead-managers/ceo-persona-token gridlock is the symptom; the
-    root cause is that sop-checklist ignored tier-class. These tests
+    root cause is that sop-checklist ignored high-risk class. These tests
     pin the new wider-default behavior so it can't regress silently.
     """
 
@@ -793,7 +740,7 @@ class TestHighRiskClassUsesElevatedListInConfig(unittest.TestCase):
 
     def test_root_cause_high_risk_elevated_to_ceo_only(self):
         items = _items_by_slug()
-        # tier:high alone makes the PR high-risk → root-cause needs ceo.
+        # area:schema alone makes the PR high-risk → root-cause needs ceo.
         self.assertEqual(
             sop.resolve_required_teams(items["root-cause"], high_risk=True),
             ["ceo"],

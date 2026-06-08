@@ -46,12 +46,12 @@ def test_required_contexts_green_rejects_missing_and_pending():
     ]
 
 
-def test_required_contexts_green_rejects_volume_skipped_even_for_tier_low():
+def test_required_contexts_green_rejects_volume_skipped():
     """volume-skipped pending is a partial view, not a genuine soft-fail.
 
     Per sop-checklist.py:1179-1187, volume_skipped posts pending with a
     '[volume-skipped]' prefix. The merge queue must NOT treat this as an
-    acceptable soft-fail for tier:low — the gate did not finish evaluating.
+    acceptable soft-fail — the gate did not finish evaluating.
     """
     latest = mq.latest_statuses_by_context([
         {"context": "CI / all-required (pull_request)", "status": "success"},
@@ -68,7 +68,6 @@ def test_required_contexts_green_rejects_volume_skipped_even_for_tier_low():
             "CI / all-required (pull_request)",
             "sop-checklist / all-items-acked (pull_request)",
         ],
-        pr_labels={"tier:low"},
     )
 
     assert ok is False
@@ -114,7 +113,13 @@ def test_pr_needs_update_when_base_sha_absent_from_commits():
 
 
 def _ready_kwargs(**overrides):
-    """Default kwargs for a fully-ready merge; override per test."""
+    """Default kwargs for a fully-ready merge; override per test.
+
+    Includes the uniform governance checks (qa-review, security-review,
+    sop-checklist) as required contexts and green statuses, matching the
+    behaviour of process_once which merges GOVERNANCE_REQUIRED_CONTEXTS
+    with branch-protection contexts.
+    """
     base = dict(
         main_status={
             "state": "success",
@@ -122,9 +127,19 @@ def _ready_kwargs(**overrides):
         },
         pr_status={
             "state": "success",
-            "statuses": [{"context": "CI / all-required (pull_request)", "status": "success"}],
+            "statuses": [
+                {"context": "CI / all-required (pull_request)", "status": "success"},
+                {"context": "qa-review / approved (pull_request)", "status": "success"},
+                {"context": "security-review / approved (pull_request)", "status": "success"},
+                {"context": "sop-checklist / all-items-acked (pull_request)", "status": "success"},
+            ],
         },
-        required_contexts=["CI / all-required (pull_request)"],
+        required_contexts=[
+            "CI / all-required (pull_request)",
+            "qa-review / approved (pull_request)",
+            "security-review / approved (pull_request)",
+            "sop-checklist / all-items-acked (pull_request)",
+        ],
         required_approvals=2,
         approvers={"agent-reviewer-cr2", "agent-researcher"},
         request_changes=[],
@@ -299,16 +314,56 @@ def test_merge_blocked_when_insufficient_genuine_approvals():
     assert "insufficient genuine approvals" in decision.reason
 
 
-def test_non_required_red_does_not_block_merge():
-    # Required (CI) green; non-required governance reds present → still merge,
-    # and force is set so force_merge bypasses ONLY those non-required reds.
+def test_governance_red_blocks_merge():
+    # Uniform gate: qa-review, security-review, sop-checklist are ALWAYS
+    # required. If any of them fail/pending, the PR is blocked.
     pr_status = {
-        "state": "failure",  # combined polluted by non-required reds
+        "state": "failure",
         "statuses": [
             {"context": "CI / all-required (pull_request)", "status": "success"},
             {"context": "qa-review / approved (pull_request)", "status": "failure"},
             {"context": "security-review / approved (pull_request)", "status": "pending"},
-            {"context": "sop-tier-check / tier-check (pull_request)", "status": "failure"},
+            {"context": "sop-checklist / all-items-acked (pull_request)", "status": "failure"},
+            {"context": "Staging SaaS / e2e (pull_request)", "status": "failure"},
+        ],
+    }
+    decision = mq.evaluate_merge_readiness(**_ready_kwargs(pr_status=pr_status))
+    assert decision.ready is False
+    assert decision.action == "wait"
+    assert "required contexts not green" in decision.reason
+
+
+def test_non_required_red_does_not_block_merge():
+    # Uniform gate flip (CTO #2407): qa-review, security-review, sop-checklist
+    # are REQUIRED for ALL PRs. A PR with these failing/pending must NOT be
+    # force-mergeable, even if BP-required CI is green and approvals are genuine.
+    pr_status = {
+        "state": "failure",
+        "statuses": [
+            {"context": "CI / all-required (pull_request)", "status": "success"},
+            {"context": "qa-review / approved (pull_request)", "status": "failure"},
+            {"context": "security-review / approved (pull_request)", "status": "pending"},
+            {"context": "sop-checklist / all-items-acked (pull_request)", "status": "failure"},
+            {"context": "Staging SaaS / e2e (pull_request)", "status": "failure"},
+        ],
+    }
+    decision = mq.evaluate_merge_readiness(**_ready_kwargs(pr_status=pr_status))
+    assert decision.ready is False
+    assert decision.action == "wait"
+    assert "required contexts not green" in decision.reason
+    assert decision.force is False
+
+
+def test_non_required_advisory_red_does_not_block_merge():
+    # Governance checks are green; only advisory non-required reds (Staging SaaS)
+    # are present → PR is still mergeable with force_merge bypassing the advisory.
+    pr_status = {
+        "state": "failure",  # combined polluted by advisory non-required reds
+        "statuses": [
+            {"context": "CI / all-required (pull_request)", "status": "success"},
+            {"context": "qa-review / approved (pull_request)", "status": "success"},
+            {"context": "security-review / approved (pull_request)", "status": "success"},
+            {"context": "sop-checklist / all-items-acked (pull_request)", "status": "success"},
             {"context": "Staging SaaS / e2e (pull_request)", "status": "failure"},
         ],
     }
@@ -412,8 +467,14 @@ def test_process_once_holds_pr_on_permanent_merge_error(monkeypatch):
     monkeypatch.setattr(mq, "get_branch_head", lambda branch: main_sha)
 
     def fake_combined(sha):
-        ctx = "CI / all-required (push)" if sha == main_sha else "CI / all-required (pull_request)"
-        return {"state": "success", "statuses": [{"context": ctx, "status": "success"}]}
+        if sha == main_sha:
+            return {"state": "success", "statuses": [{"context": "CI / all-required (push)", "status": "success"}]}
+        return {"state": "success", "statuses": [
+            {"context": "CI / all-required (pull_request)", "status": "success"},
+            {"context": "qa-review / approved (pull_request)", "status": "success"},
+            {"context": "security-review / approved (pull_request)", "status": "success"},
+            {"context": "sop-checklist / all-items-acked (pull_request)", "status": "success"},
+        ]}
     monkeypatch.setattr(mq, "get_combined_status", fake_combined)
 
     monkeypatch.setattr(mq, "list_candidate_issues", lambda *, auto_discover: [
@@ -479,8 +540,14 @@ def _fully_ready_process_once_monkeypatch(monkeypatch, mergeable, calls):
     monkeypatch.setattr(mq, "get_branch_head", lambda branch: main_sha)
 
     def fake_combined(sha):
-        ctx = "CI / all-required (push)" if sha == main_sha else "CI / all-required (pull_request)"
-        return {"state": "success", "statuses": [{"context": ctx, "status": "success"}]}
+        if sha == main_sha:
+            return {"state": "success", "statuses": [{"context": "CI / all-required (push)", "status": "success"}]}
+        return {"state": "success", "statuses": [
+            {"context": "CI / all-required (pull_request)", "status": "success"},
+            {"context": "qa-review / approved (pull_request)", "status": "success"},
+            {"context": "security-review / approved (pull_request)", "status": "success"},
+            {"context": "sop-checklist / all-items-acked (pull_request)", "status": "success"},
+        ]}
     monkeypatch.setattr(mq, "get_combined_status", fake_combined)
 
     monkeypatch.setattr(mq, "list_candidate_issues", lambda *, auto_discover: [
@@ -884,8 +951,14 @@ def _stale_pr_update_409_monkeypatch(monkeypatch, queued_issues, calls):
     monkeypatch.setattr(mq, "get_branch_head", lambda branch: main_sha)
 
     def fake_combined(sha):
-        ctx = "CI / all-required (push)" if sha == main_sha else "CI / all-required (pull_request)"
-        return {"state": "success", "statuses": [{"context": ctx, "status": "success"}]}
+        if sha == main_sha:
+            return {"state": "success", "statuses": [{"context": "CI / all-required (push)", "status": "success"}]}
+        return {"state": "success", "statuses": [
+            {"context": "CI / all-required (pull_request)", "status": "success"},
+            {"context": "qa-review / approved (pull_request)", "status": "success"},
+            {"context": "security-review / approved (pull_request)", "status": "success"},
+            {"context": "sop-checklist / all-items-acked (pull_request)", "status": "success"},
+        ]}
     monkeypatch.setattr(mq, "get_combined_status", fake_combined)
 
     # Scan-loop process_once enumerates candidates via list_candidate_issues.
@@ -1153,8 +1226,16 @@ def _wire_ready_process_once(monkeypatch, *, issues, pr_payload, calls):
     monkeypatch.setattr(mq, "get_branch_head", lambda branch: main_sha)
 
     def fake_combined(sha):
-        ctx = "CI / all-required (push)" if sha == main_sha else "CI / all-required (pull_request)"
-        return {"state": "success", "statuses": [{"context": ctx, "status": "success"}]}
+        if sha == main_sha:
+            return {"state": "success", "statuses": [
+                {"context": "CI / all-required (push)", "status": "success"},
+            ]}
+        return {"state": "success", "statuses": [
+            {"context": "CI / all-required (pull_request)", "status": "success"},
+            {"context": "qa-review / approved (pull_request)", "status": "success"},
+            {"context": "security-review / approved (pull_request)", "status": "success"},
+            {"context": "sop-checklist / all-items-acked (pull_request)", "status": "success"},
+        ]}
     monkeypatch.setattr(mq, "get_combined_status", fake_combined)
     monkeypatch.setattr(mq, "list_candidate_issues", lambda *, auto_discover: issues)
     monkeypatch.setattr(mq, "get_pull", lambda n: dict(pr_payload, number=n))
@@ -1335,8 +1416,14 @@ def _wire_multi_candidate_process_once(monkeypatch, *, issues, pulls, reviews, c
     monkeypatch.setattr(mq, "get_branch_head", lambda branch: MAIN_SHA)
 
     def fake_combined(sha):
-        ctx = "CI / all-required (push)" if sha == MAIN_SHA else "CI / all-required (pull_request)"
-        return {"state": "success", "statuses": [{"context": ctx, "status": "success"}]}
+        if sha == MAIN_SHA:
+            return {"state": "success", "statuses": [{"context": "CI / all-required (push)", "status": "success"}]}
+        return {"state": "success", "statuses": [
+            {"context": "CI / all-required (pull_request)", "status": "success"},
+            {"context": "qa-review / approved (pull_request)", "status": "success"},
+            {"context": "security-review / approved (pull_request)", "status": "success"},
+            {"context": "sop-checklist / all-items-acked (pull_request)", "status": "success"},
+        ]}
     monkeypatch.setattr(mq, "get_combined_status", fake_combined)
 
     monkeypatch.setattr(mq, "list_candidate_issues", lambda *, auto_discover: issues)
@@ -1468,7 +1555,12 @@ def test_hol_unready_red_required_ci_is_skipped_for_ready_pr(monkeypatch):
                     "statuses": [{"context": "CI / all-required (push)", "status": "success"}]}
         state = "failure" if sha == red_head else "success"
         return {"state": state,
-                "statuses": [{"context": "CI / all-required (pull_request)", "status": state}]}
+                "statuses": [
+                    {"context": "CI / all-required (pull_request)", "status": state},
+                    {"context": "qa-review / approved (pull_request)", "status": "success"},
+                    {"context": "security-review / approved (pull_request)", "status": "success"},
+                    {"context": "sop-checklist / all-items-acked (pull_request)", "status": "success"},
+                ]}
     monkeypatch.setattr(mq, "get_combined_status", fake_combined)
 
     rc = mq.process_once(dry_run=False)

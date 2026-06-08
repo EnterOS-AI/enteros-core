@@ -16,7 +16,7 @@ name: Lint workflow YAML (Gitea-1.22.6-hostile shapes)
 #
 # Empirical history this hardens against:
 #   - status-reaper rev1 caught rule-4 (name-collision) class
-#   - sop-tier-refire DOA'd on rule-2 (workflow_run partial)
+#   - sop-checklist DOA'd on rule-2 (workflow_run partial)
 #   - #319 bootstrap-paradox (chained-defect class, related)
 #   - internal#329 dispatcher race (adjacent)
 #   - 2026-05-11 publish-runtime: rule-1, 24h PyPI freeze

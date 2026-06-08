@@ -31,7 +31,7 @@
 #
 # REQUIRED_CHECKS (legacy) is a newline-separated list used when the
 # JSON variable is not set. Declared in the workflow YAML rather than
-# fetched from /branch_protections (which needs admin scope — sop-tier-bot
+# fetched from /branch_protections (which needs admin scope — 
 # has read-only). Trade dynamism for simplicity: when the required-check
 # set changes, update both branch protection AND this env. Keeping them
 # in sync is less complexity than granting the audit bot admin perms on

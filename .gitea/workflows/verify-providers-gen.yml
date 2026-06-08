@@ -26,7 +26,7 @@ name: verify-providers-gen
 #   * It is intentionally absent from ci.yml's job set so the ci-required-drift
 #     sentinel (jobs ↔ branch-protection ↔ audit-env) does NOT fire on it, and
 #     from branch protection (turning it into a hard merge gate has blast radius
-#     — operator GO required, same pattern as sop-tier-check / verify-providers-gen
+#     — operator GO required, same pattern as sop-checklist / verify-providers-gen
 #     on controlplane). Promote it into branch protection in a follow-up once
 #     P2 has soaked.
 # Until then it behaves like secret-scan / block-internal-paths: a standalone

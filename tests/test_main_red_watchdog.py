@@ -78,7 +78,7 @@ def wd_module():
         "GITEA_HOST": "git.example.test",
         "REPO": "owner/repo",
         "WATCH_BRANCH": "main",
-        "RED_LABEL": "tier:high",
+        "RED_LABEL": "ci-bp-drift",
     }
     with mock.patch.dict(os.environ, env, clear=False):
         spec = importlib.util.spec_from_file_location(
@@ -463,7 +463,7 @@ def test_red_detected_opens_issue(wd_module, monkeypatch):
         ("GET", "/repos/owner/repo/issues"): (200, []),  # no existing issue
         ("POST", "/repos/owner/repo/issues"): (201, {"number": 555}),
         ("GET", "/repos/owner/repo/labels"): (
-            200, [{"id": 9, "name": "tier:high"}],
+            200, [{"id": 9, "name": "ci-bp-drift"}],
         ),
         ("POST", "/repos/owner/repo/issues/555/labels"): (200, []),
     })
@@ -1063,7 +1063,7 @@ def test_head_recheck_files_when_still_red_after_settling(
         if method == "GET" and path == "/repos/owner/repo/issues":
             return (200, [])
         if method == "GET" and path == "/repos/owner/repo/labels":
-            return (200, [{"id": 9, "name": "tier:high"}])
+            return (200, [{"id": 9, "name": "ci-bp-drift"}])
         if method == "POST" and path == "/repos/owner/repo/issues":
             post_filed["value"] = True
             return (201, {"number": 999})
