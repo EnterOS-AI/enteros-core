@@ -14,35 +14,35 @@ spec.loader.exec_module(mq)
 def test_latest_statuses_dedupes_by_context_newest_first():
     statuses = [
         {"context": "CI / all-required (pull_request)", "status": "failure"},
-        {"context": "sop-checklist / all-items-acked (pull_request)", "state": "success"},
+        {"context": "sop-checklist / all-items-acked (pull_request_target)", "state": "success"},
         {"context": "CI / all-required (pull_request)", "status": "success"},
     ]
 
     latest = mq.latest_statuses_by_context(statuses)
 
     assert latest["CI / all-required (pull_request)"]["status"] == "failure"
-    assert latest["sop-checklist / all-items-acked (pull_request)"]["state"] == "success"
+    assert latest["sop-checklist / all-items-acked (pull_request_target)"]["state"] == "success"
 
 
 def test_required_contexts_green_rejects_missing_and_pending():
     latest = mq.latest_statuses_by_context([
         {"context": "CI / all-required (pull_request)", "status": "success"},
-        {"context": "sop-checklist / all-items-acked (pull_request)", "status": "pending"},
+        {"context": "sop-checklist / all-items-acked (pull_request_target)", "status": "pending"},
     ])
 
     ok, missing_or_bad = mq.required_contexts_green(
         latest,
         [
             "CI / all-required (pull_request)",
-            "sop-checklist / all-items-acked (pull_request)",
-            "qa-review / approved (pull_request)",
+            "sop-checklist / all-items-acked (pull_request_target)",
+            "qa-review / approved (pull_request_target)",
         ],
     )
 
     assert ok is False
     assert missing_or_bad == [
-        "sop-checklist / all-items-acked (pull_request)=pending",
-        "qa-review / approved (pull_request)=missing",
+        "sop-checklist / all-items-acked (pull_request_target)=pending",
+        "qa-review / approved (pull_request_target)=missing",
     ]
 
 
@@ -56,7 +56,7 @@ def test_required_contexts_green_rejects_volume_skipped():
     latest = mq.latest_statuses_by_context([
         {"context": "CI / all-required (pull_request)", "status": "success"},
         {
-            "context": "sop-checklist / all-items-acked (pull_request)",
+            "context": "sop-checklist / all-items-acked (pull_request_target)",
             "status": "pending",
             "description": "[volume-skipped] comment-cap=1000 hit; please file ...",
         },
@@ -66,12 +66,12 @@ def test_required_contexts_green_rejects_volume_skipped():
         latest,
         [
             "CI / all-required (pull_request)",
-            "sop-checklist / all-items-acked (pull_request)",
+            "sop-checklist / all-items-acked (pull_request_target)",
         ],
     )
 
     assert ok is False
-    assert "sop-checklist / all-items-acked (pull_request)=pending" in missing_or_bad
+    assert "sop-checklist / all-items-acked (pull_request_target)=pending" in missing_or_bad
 
 
 def test_choose_next_pr_sorts_by_queue_label_timestamp_then_number():
@@ -129,16 +129,16 @@ def _ready_kwargs(**overrides):
             "state": "success",
             "statuses": [
                 {"context": "CI / all-required (pull_request)", "status": "success"},
-                {"context": "qa-review / approved (pull_request)", "status": "success"},
-                {"context": "security-review / approved (pull_request)", "status": "success"},
-                {"context": "sop-checklist / all-items-acked (pull_request)", "status": "success"},
+                {"context": "qa-review / approved (pull_request_target)", "status": "success"},
+                {"context": "security-review / approved (pull_request_target)", "status": "success"},
+                {"context": "sop-checklist / all-items-acked (pull_request_target)", "status": "success"},
             ],
         },
         required_contexts=[
             "CI / all-required (pull_request)",
-            "qa-review / approved (pull_request)",
-            "security-review / approved (pull_request)",
-            "sop-checklist / all-items-acked (pull_request)",
+            "qa-review / approved (pull_request_target)",
+            "security-review / approved (pull_request_target)",
+            "sop-checklist / all-items-acked (pull_request_target)",
         ],
         required_approvals=2,
         approvers={"agent-reviewer-cr2", "agent-researcher"},
@@ -321,9 +321,9 @@ def test_governance_red_blocks_merge():
         "state": "failure",
         "statuses": [
             {"context": "CI / all-required (pull_request)", "status": "success"},
-            {"context": "qa-review / approved (pull_request)", "status": "failure"},
-            {"context": "security-review / approved (pull_request)", "status": "pending"},
-            {"context": "sop-checklist / all-items-acked (pull_request)", "status": "failure"},
+            {"context": "qa-review / approved (pull_request_target)", "status": "failure"},
+            {"context": "security-review / approved (pull_request_target)", "status": "pending"},
+            {"context": "sop-checklist / all-items-acked (pull_request_target)", "status": "failure"},
             {"context": "Staging SaaS / e2e (pull_request)", "status": "failure"},
         ],
     }
@@ -340,9 +340,9 @@ def test_non_required_advisory_red_does_not_block_merge():
         "state": "failure",  # combined polluted by advisory non-required reds
         "statuses": [
             {"context": "CI / all-required (pull_request)", "status": "success"},
-            {"context": "qa-review / approved (pull_request)", "status": "success"},
-            {"context": "security-review / approved (pull_request)", "status": "success"},
-            {"context": "sop-checklist / all-items-acked (pull_request)", "status": "success"},
+            {"context": "qa-review / approved (pull_request_target)", "status": "success"},
+            {"context": "security-review / approved (pull_request_target)", "status": "success"},
+            {"context": "sop-checklist / all-items-acked (pull_request_target)", "status": "success"},
             {"context": "Staging SaaS / e2e (pull_request)", "status": "failure"},
         ],
     }
@@ -450,9 +450,9 @@ def test_process_once_holds_pr_on_permanent_merge_error(monkeypatch):
             return {"state": "success", "statuses": [{"context": "CI / all-required (push)", "status": "success"}]}
         return {"state": "success", "statuses": [
             {"context": "CI / all-required (pull_request)", "status": "success"},
-            {"context": "qa-review / approved (pull_request)", "status": "success"},
-            {"context": "security-review / approved (pull_request)", "status": "success"},
-            {"context": "sop-checklist / all-items-acked (pull_request)", "status": "success"},
+            {"context": "qa-review / approved (pull_request_target)", "status": "success"},
+            {"context": "security-review / approved (pull_request_target)", "status": "success"},
+            {"context": "sop-checklist / all-items-acked (pull_request_target)", "status": "success"},
         ]}
     monkeypatch.setattr(mq, "get_combined_status", fake_combined)
 
@@ -523,9 +523,9 @@ def _fully_ready_process_once_monkeypatch(monkeypatch, mergeable, calls):
             return {"state": "success", "statuses": [{"context": "CI / all-required (push)", "status": "success"}]}
         return {"state": "success", "statuses": [
             {"context": "CI / all-required (pull_request)", "status": "success"},
-            {"context": "qa-review / approved (pull_request)", "status": "success"},
-            {"context": "security-review / approved (pull_request)", "status": "success"},
-            {"context": "sop-checklist / all-items-acked (pull_request)", "status": "success"},
+            {"context": "qa-review / approved (pull_request_target)", "status": "success"},
+            {"context": "security-review / approved (pull_request_target)", "status": "success"},
+            {"context": "sop-checklist / all-items-acked (pull_request_target)", "status": "success"},
         ]}
     monkeypatch.setattr(mq, "get_combined_status", fake_combined)
 
@@ -934,9 +934,9 @@ def _stale_pr_update_409_monkeypatch(monkeypatch, queued_issues, calls):
             return {"state": "success", "statuses": [{"context": "CI / all-required (push)", "status": "success"}]}
         return {"state": "success", "statuses": [
             {"context": "CI / all-required (pull_request)", "status": "success"},
-            {"context": "qa-review / approved (pull_request)", "status": "success"},
-            {"context": "security-review / approved (pull_request)", "status": "success"},
-            {"context": "sop-checklist / all-items-acked (pull_request)", "status": "success"},
+            {"context": "qa-review / approved (pull_request_target)", "status": "success"},
+            {"context": "security-review / approved (pull_request_target)", "status": "success"},
+            {"context": "sop-checklist / all-items-acked (pull_request_target)", "status": "success"},
         ]}
     monkeypatch.setattr(mq, "get_combined_status", fake_combined)
 
@@ -1211,9 +1211,9 @@ def _wire_ready_process_once(monkeypatch, *, issues, pr_payload, calls):
             ]}
         return {"state": "success", "statuses": [
             {"context": "CI / all-required (pull_request)", "status": "success"},
-            {"context": "qa-review / approved (pull_request)", "status": "success"},
-            {"context": "security-review / approved (pull_request)", "status": "success"},
-            {"context": "sop-checklist / all-items-acked (pull_request)", "status": "success"},
+            {"context": "qa-review / approved (pull_request_target)", "status": "success"},
+            {"context": "security-review / approved (pull_request_target)", "status": "success"},
+            {"context": "sop-checklist / all-items-acked (pull_request_target)", "status": "success"},
         ]}
     monkeypatch.setattr(mq, "get_combined_status", fake_combined)
     monkeypatch.setattr(mq, "list_candidate_issues", lambda *, auto_discover: issues)
@@ -1399,9 +1399,9 @@ def _wire_multi_candidate_process_once(monkeypatch, *, issues, pulls, reviews, c
             return {"state": "success", "statuses": [{"context": "CI / all-required (push)", "status": "success"}]}
         return {"state": "success", "statuses": [
             {"context": "CI / all-required (pull_request)", "status": "success"},
-            {"context": "qa-review / approved (pull_request)", "status": "success"},
-            {"context": "security-review / approved (pull_request)", "status": "success"},
-            {"context": "sop-checklist / all-items-acked (pull_request)", "status": "success"},
+            {"context": "qa-review / approved (pull_request_target)", "status": "success"},
+            {"context": "security-review / approved (pull_request_target)", "status": "success"},
+            {"context": "sop-checklist / all-items-acked (pull_request_target)", "status": "success"},
         ]}
     monkeypatch.setattr(mq, "get_combined_status", fake_combined)
 
@@ -1536,9 +1536,9 @@ def test_hol_unready_red_required_ci_is_skipped_for_ready_pr(monkeypatch):
         return {"state": state,
                 "statuses": [
                     {"context": "CI / all-required (pull_request)", "status": state},
-                    {"context": "qa-review / approved (pull_request)", "status": "success"},
-                    {"context": "security-review / approved (pull_request)", "status": "success"},
-                    {"context": "sop-checklist / all-items-acked (pull_request)", "status": "success"},
+                    {"context": "qa-review / approved (pull_request_target)", "status": "success"},
+                    {"context": "security-review / approved (pull_request_target)", "status": "success"},
+                    {"context": "sop-checklist / all-items-acked (pull_request_target)", "status": "success"},
                 ]}
     monkeypatch.setattr(mq, "get_combined_status", fake_combined)
 
