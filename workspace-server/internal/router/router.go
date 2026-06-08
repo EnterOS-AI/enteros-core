@@ -271,6 +271,7 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		// Lifecycle
 		wsAuth.GET("/state", wh.State)
 		wsAuth.POST("/restart", wh.Restart)
+		wsAuth.POST("/switch-provider", wh.SwitchProvider)
 		wsAuth.POST("/pause", wh.Pause)
 		wsAuth.POST("/resume", wh.Resume)
 		// Manual hibernate (opt-in, #711) — stops the container and sets status
