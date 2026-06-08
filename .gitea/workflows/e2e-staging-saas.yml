@@ -527,6 +527,7 @@ jobs:
   # therefore has no honest reason to be masked. Runs on push-to-main /
   # workflow_dispatch / cron only (needs live staging infra — never on PR, where
   # the pr-validate job above already posts the workflow's PR status).
+  # bp-required: pending #2430
   e2e-staging-concierge-user-tasks:
     name: E2E Staging Concierge user_tasks
     runs-on: ubuntu-latest
@@ -649,6 +650,7 @@ jobs:
   # a silently-missing platform-agent image can NEVER false-green this gate. Runs
   # on push-to-main / workflow_dispatch / cron only (needs live staging infra +
   # a model — never on PR, where pr-validate posts the workflow's PR status).
+  # bp-required: pending #2430
   e2e-staging-concierge-creates-workspace:
     name: E2E Staging Concierge Creates Workspace
     runs-on: ubuntu-latest
@@ -776,6 +778,9 @@ jobs:
   #     creds. GATING (no mask) — a broken test file fails at PR time.
   #   • concierge-staging (push-to-main/dispatch/cron): the real live run with
   #     staging creds + t.Cleanup teardown.
+  # bp-exempt: PR-time compile-only check (build the concierge e2e test, then
+  # skip execution — no staging creds on PR). pr-validate posts the workflow's
+  # PR status; this job is not itself a branch-protection gate.
   e2e-staging-concierge-compile-skip:
     name: E2E Staging Concierge (compile+skip)
     runs-on: ubuntu-latest
@@ -802,6 +807,7 @@ jobs:
           echo "$out" | grep -q "SKIP: TestConciergePlatformAgent_Staging" \
             || { echo "::error::expected a LOUD skip of TestConciergePlatformAgent_Staging without creds"; exit 1; }
 
+  # bp-required: pending #2430
   e2e-staging-concierge-platform:
     name: E2E Staging Concierge Platform Agent
     runs-on: ubuntu-latest
