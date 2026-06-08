@@ -54,6 +54,27 @@ from __future__ import annotations
 
 from typing import Iterable, Optional, Tuple
 
+# ---------------------------------------------------------------------------
+# Canonical Gitea review-state enum (EXACT match -- no case coercion).
+# ---------------------------------------------------------------------------
+#
+# Gitea's reviews API emits review.state as one of a fixed set of
+# UPPERCASE string constants: "APPROVED", "REQUEST_CHANGES",
+# "REQUEST_REVIEW", "COMMENT", "PENDING", "DISMISSED" (verified
+# against the live API across real molecule-core PRs). They are ALWAYS
+# uppercase on the wire.
+#
+# FAIL-CLOSED: we compare review.state to these constants with EXACT
+# equality. The previous code used str(state or "").upper(), which
+# coerced a lowercase/mixed-case "approved" or "request_changes" into
+# the canonical value and ACCEPTED it. A real Gitea row never carries a
+# lowercase state, so a case-variant value is the signature of a
+# hand-forged / spoofed row, not a legitimate review. Coercing it was a
+# residual fail-open (SEV-1 internal#812, RCs 9849/9851/9852). We reject
+# anything that is not byte-for-byte the canonical constant.
+STATE_APPROVED = "APPROVED"
+STATE_REQUEST_CHANGES = "REQUEST_CHANGES"
+
 
 # ---------------------------------------------------------------------------
 # Shared predicate — fail-closed on every condition
@@ -114,7 +135,10 @@ def is_genuine_approval(
     """
     if not isinstance(review, dict):
         return False
-    if str(review.get("state") or "").upper() != "APPROVED":
+    # EXACT-ENUM (fail-closed): no .upper()/.strip() coercion. A
+    # case-variant or whitespace-padded state is a forged row and is
+    # rejected, not normalised into APPROVED.
+    if review.get("state") != STATE_APPROVED:
         return False
     if not is_official_current_head(review, headsha):
         return False
@@ -133,7 +157,10 @@ def is_open_request_changes(review: object, *, headsha: str) -> bool:
     """
     if not isinstance(review, dict):
         return False
-    if str(review.get("state") or "").upper() != "REQUEST_CHANGES":
+    # EXACT-ENUM (fail-closed): same contract as is_genuine_approval. A
+    # lowercase/mixed-case "request_changes" must NOT be coerced into a
+    # block-erasing match; an exact REQUEST_CHANGES is required.
+    if review.get("state") != STATE_REQUEST_CHANGES:
         return False
     if not is_official_current_head(review, headsha):
         return False
@@ -194,8 +221,11 @@ def classify_reviews(
             continue
         if reviewer_set_set is not None and user not in reviewer_set_set:
             continue
-        state = str(review.get("state") or "").upper()
-        if state not in {"APPROVED", "REQUEST_CHANGES"}:
+        # EXACT-ENUM (fail-closed): exact constants only, no coercion. A
+        # case-coerced row must not become eligible to overwrite/erase a
+        # genuine per-user verdict in the reduce below.
+        state = review.get("state")
+        if state not in (STATE_APPROVED, STATE_REQUEST_CHANGES):
             continue
         # Fail-closed predicate BEFORE the reduce: official, not dismissed,
         # not stale, commit_id present AND == head. Invalid rows are dropped

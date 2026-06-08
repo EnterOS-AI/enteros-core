@@ -155,6 +155,23 @@ class IsGenuineApprovalContract(unittest.TestCase):
                     is_genuine_approval(_review(state=state), headsha=HEAD)
                 )
 
+    def test_rejects_case_coerced_approved_states(self):
+        """EXACT-ENUM fail-closed (RCs 9849/9851/9852): Gitea always emits
+        the canonical UPPERCASE "APPROVED". A lowercase/mixed-case/padded
+        value is the signature of a forged row and MUST be rejected, not
+        coerced via .upper() into an accepted APPROVED. Each of these was
+        ACCEPTED before the exact-enum fix."""
+        for state in (
+            "approved", "Approved", "ApProVeD", "APPROVED ", " APPROVED",
+            "approved\n", "\tAPPROVED",
+        ):
+            with self.subTest(state=state):
+                self.assertFalse(
+                    is_genuine_approval(_review(state=state), headsha=HEAD),
+                    f"case-coerced/padded state {state!r} must NOT count as "
+                    "a genuine approval",
+                )
+
     def test_rejects_non_official_approval(self):
         """Comment-based / non-official 'APPROVED' is REJECTED.
         PM: 'reject comment-based / non-official reviews'."""
@@ -240,6 +257,23 @@ class IsOpenRequestChangesContract(unittest.TestCase):
                     is_open_request_changes(
                         _review(state=state), headsha=HEAD
                     )
+                )
+
+    def test_rejects_case_coerced_request_changes_states(self):
+        """EXACT-ENUM fail-closed: a lowercase/mixed-case "request_changes"
+        must NOT be coerced into an open-block match. Before the exact-enum
+        fix, .upper() accepted these as REQUEST_CHANGES."""
+        for state in (
+            "request_changes", "Request_Changes", "REQUEST_CHANGES ",
+            " REQUEST_CHANGES", "request_changes\n",
+        ):
+            with self.subTest(state=state):
+                self.assertFalse(
+                    is_open_request_changes(
+                        _review(state=state), headsha=HEAD
+                    ),
+                    f"case-coerced/padded state {state!r} must NOT count as "
+                    "an open REQUEST_CHANGES",
                 )
 
     def test_rejects_when_dismissed(self):
@@ -340,6 +374,35 @@ class ClassifyReviewsContract(unittest.TestCase):
         ]
         approvers, _ = classify_reviews(reviews, headsha=HEAD)
         self.assertEqual(approvers, set())
+
+    def test_case_coerced_approved_not_counted(self):
+        """EXACT-ENUM via the reducer: a lowercase 'approved' (otherwise
+        valid official current-head row) must NOT be counted as an approver.
+        Before the fix, classify_reviews coerced it via .upper()."""
+        for state in ("approved", "Approved", "APPROVED "):
+            with self.subTest(state=state):
+                reviews = [
+                    _review(user="alice", state=state, commit_id=HEAD),
+                ]
+                approvers, request_changes = classify_reviews(
+                    reviews, headsha=HEAD
+                )
+                self.assertEqual(approvers, set())
+                self.assertEqual(request_changes, [])
+
+    def test_case_coerced_request_changes_not_silently_dropped(self):
+        """EXACT-ENUM via the reducer: a lowercase 'request_changes' must be
+        rejected (not coerced into a block). Crucially, it must NOT silently
+        erase a SAME-USER genuine current-head REQUEST_CHANGES posted
+        earlier — the case-variant later row is invalid and is ignored, so
+        the genuine block stands."""
+        reviews = [
+            _review(user="bob", state="REQUEST_CHANGES", commit_id=HEAD),
+            _review(user="bob", state="request_changes", commit_id=HEAD),
+        ]
+        approvers, request_changes = classify_reviews(reviews, headsha=HEAD)
+        self.assertIn("bob", request_changes)
+        self.assertNotIn("bob", approvers)
 
     def test_stale_head_request_changes_excluded(self):
         # A REQUEST_CHANGES on a previous head must NOT block the current head.

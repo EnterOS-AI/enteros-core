@@ -248,7 +248,7 @@ def test_genuine_approvals_counts_two_distinct_on_current_head():
         {"state": "APPROVED", "user": {"login": "agent-reviewer-cr2"},
          "official": True, "stale": False, "dismissed": False, "commit_id": "HEAD"},
     ]
-    approvers, rc = mq.genuine_approvals(reviews, head_sha="HEAD", reviewer_set=REVIEWERS)
+    approvers, rc = mq.genuine_approvals(reviews, headsha="HEAD", reviewer_set=REVIEWERS)
     assert approvers == {"agent-researcher", "agent-reviewer-cr2"}
     assert rc == []
 
@@ -265,7 +265,7 @@ def test_genuine_approvals_ignores_stale_dismissed_and_wrong_head():
         {"state": "APPROVED", "user": {"login": "agent-reviewer"},
          "official": True, "stale": False, "dismissed": False, "commit_id": "OLD"},
     ]
-    approvers, rc = mq.genuine_approvals(reviews, head_sha="HEAD", reviewer_set=REVIEWERS)
+    approvers, rc = mq.genuine_approvals(reviews, headsha="HEAD", reviewer_set=REVIEWERS)
     assert approvers == set()
     assert rc == []
 
@@ -279,7 +279,7 @@ def test_genuine_approvals_ignores_unofficial_and_outsiders():
         {"state": "APPROVED", "user": {"login": "hongming-codex-laptop"},
          "official": True, "stale": False, "dismissed": False, "commit_id": "HEAD"},
     ]
-    approvers, rc = mq.genuine_approvals(reviews, head_sha="HEAD", reviewer_set=REVIEWERS)
+    approvers, rc = mq.genuine_approvals(reviews, headsha="HEAD", reviewer_set=REVIEWERS)
     assert approvers == set()
 
 
@@ -291,7 +291,7 @@ def test_genuine_approvals_latest_review_supersedes_earlier():
         {"state": "REQUEST_CHANGES", "user": {"login": "agent-reviewer-cr2"},
          "official": True, "stale": False, "dismissed": False, "commit_id": "HEAD"},
     ]
-    approvers, rc = mq.genuine_approvals(reviews, head_sha="HEAD", reviewer_set=REVIEWERS)
+    approvers, rc = mq.genuine_approvals(reviews, headsha="HEAD", reviewer_set=REVIEWERS)
     assert approvers == set()
     assert rc == ["agent-reviewer-cr2"]
 

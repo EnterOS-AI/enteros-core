@@ -1122,7 +1122,7 @@ def _evaluate_candidate(
 
     reviews = get_pull_reviews(pr_number)
     approvers, request_changes = genuine_approvals(
-        reviews, head_sha=head_sha, reviewer_set=REVIEWER_SET
+        reviews, headsha=head_sha, reviewer_set=REVIEWER_SET
     )
 
     decision = evaluate_merge_readiness(
