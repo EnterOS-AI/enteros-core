@@ -225,6 +225,16 @@ func (e *proxyA2AError) Error() string {
 	return "proxy a2a error"
 }
 
+// EnqueueA2A is a method wrapper around the package-level EnqueueA2A function so
+// that *WorkspaceHandler satisfies the scheduler's A2AProxy interface. The
+// scheduler cannot call the package function directly (it would have to import
+// internal/handlers, but handlers already imports internal/scheduler → import
+// cycle), so it goes through this method on the proxy it already holds. Used by
+// the cron scheduler to durably buffer a tick when the target workspace is busy.
+func (h *WorkspaceHandler) EnqueueA2A(ctx context.Context, workspaceID, callerID string, priority int, body []byte, method, idempotencyKey string, expiresAt *time.Time) (string, int, error) {
+	return EnqueueA2A(ctx, workspaceID, callerID, priority, body, method, idempotencyKey, expiresAt)
+}
+
 // ProxyA2ARequest is the public wrapper for proxyA2ARequest, used by the
 // cron scheduler and other internal callers that need to send A2A messages
 // to workspaces programmatically (not from an HTTP handler).
