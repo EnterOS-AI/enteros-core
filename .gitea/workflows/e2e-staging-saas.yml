@@ -55,6 +55,7 @@ on:
       - 'tests/e2e/lib/aws_leak_check.sh'
       - 'tests/e2e/test_aws_leak_check.sh'
       - 'tests/e2e/test_staging_concierge_e2e.sh'
+      - 'tests/e2e/test_staging_concierge_creates_workspace_e2e.sh'
       - 'workspace-server/internal/staginge2e/**'
       - 'workspace-server/internal/handlers/platform_agent.go'
       - 'workspace-server/internal/handlers/user_tasks.go'
@@ -76,6 +77,7 @@ on:
       - 'tests/e2e/lib/aws_leak_check.sh'
       - 'tests/e2e/test_aws_leak_check.sh'
       - 'tests/e2e/test_staging_concierge_e2e.sh'
+      - 'tests/e2e/test_staging_concierge_creates_workspace_e2e.sh'
       - 'workspace-server/internal/staginge2e/**'
       - 'workspace-server/internal/handlers/platform_agent.go'
       - 'workspace-server/internal/handlers/user_tasks.go'
@@ -622,6 +624,137 @@ jobs:
           done
           if [ ${#leaks[@]} -gt 0 ]; then
             echo "::warning::concierge teardown left ${#leaks[@]} leak(s): ${leaks[*]}"
+          fi
+          exit 0
+
+  # ── CONCIERGE FUNCTIONAL: it ACTUALLY CREATES A WORKSPACE (real-LLM) ─────────
+  #
+  # Drives tests/e2e/test_staging_concierge_creates_workspace_e2e.sh — the
+  # RFC docs/design/rfc-platform-agent.md §11.4 "Reach" check turned into a gate:
+  # send the org concierge a natural-language A2A message ("create a workspace
+  # named e2e-cncrg-worker-<runid> with role engineer") and assert the
+  # DETERMINISTIC SIDE EFFECT — that named workspace now EXISTS in GET /workspaces
+  # — which can only happen if the concierge's LLM really invoked the
+  # create_workspace platform-MCP tool (a real org mutation), NOT just that a REST
+  # API returned 200.
+  #
+  # GATING (no continue-on-error), but FALSE-GREEN-PROOF via E2E_REQUIRE_LIVE=1:
+  # this is a REAL-LLM, REAL-tool test, so it depends on the concierge being
+  # provisioned on the DEDICATED platform-agent image (Dockerfile.platform-agent,
+  # ships /opt/molecule-mcp-server — the ONLY image where create_workspace lights
+  # up; see platform_agent.go's SELF-HOST CAVEAT). A parallel agent is wiring that
+  # image into the staging provision path. The script SKIPs LOUD when the
+  # concierge is absent / not online / not on the platform-agent image — but with
+  # E2E_REQUIRE_LIVE=1 the harness converts that skip into a HARD FAIL (exit 5) so
+  # a silently-missing platform-agent image can NEVER false-green this gate. Runs
+  # on push-to-main / workflow_dispatch / cron only (needs live staging infra +
+  # a model — never on PR, where pr-validate posts the workflow's PR status).
+  e2e-staging-concierge-creates-workspace:
+    name: E2E Staging Concierge Creates Workspace
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      MOLECULE_CP_URL: https://staging-api.moleculesai.app
+      MOLECULE_ADMIN_TOKEN: ${{ secrets.CP_STAGING_ADMIN_API_TOKEN }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: us-east-2
+      E2E_AWS_LEAK_CHECK: required
+      E2E_AWS_TERMINATE_LEAKS: '1'
+      # The concierge is platform_managed on SaaS (the CP-exported LLM proxy
+      # supplies its model — no BYOK key needed for the concierge itself). The
+      # MiniMax key is wired anyway so a staging image that boots the concierge
+      # BYOK-MiniMax (parallel-agent image work) still has a model; harmless when
+      # the concierge is platform-managed.
+      E2E_MINIMAX_API_KEY: ${{ secrets.MOLECULE_STAGING_MINIMAX_API_KEY }}
+      # False-green guard: a concierge that is absent / not on the platform-agent
+      # image / never online must FAIL this gate (exit 5), not silently skip.
+      E2E_REQUIRE_LIVE: '1'
+      E2E_RUN_ID: "${{ github.run_id }}-${{ github.run_attempt }}"
+      E2E_KEEP_ORG: ${{ github.event.inputs.keep_org && '1' || '0' }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.11"
+
+      - name: Verify admin token + AWS creds present
+        run: |
+          if [ -z "$MOLECULE_ADMIN_TOKEN" ]; then
+            echo "::error::CP_STAGING_ADMIN_API_TOKEN secret not set (Railway staging CP_ADMIN_API_TOKEN)"
+            exit 2
+          fi
+          for var in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; do
+            if [ -z "${!var:-}" ]; then
+              echo "::error::$var not set — EC2 leak verification cannot run"
+              exit 2
+            fi
+          done
+          echo "Admin token + AWS creds present ✓"
+
+      - name: CP staging health preflight
+        run: |
+          code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 10 "$MOLECULE_CP_URL/health")
+          if [ "$code" != "200" ]; then
+            echo "::error::Staging CP unhealthy (got HTTP $code). Skipping — not a workspace bug."
+            exit 1
+          fi
+          echo "Staging CP healthy ✓"
+
+      - name: Run concierge-creates-workspace functional E2E
+        run: bash tests/e2e/test_staging_concierge_creates_workspace_e2e.sh
+
+      - name: Teardown safety net (runs on cancel/failure)
+        if: always()
+        env:
+          ADMIN_TOKEN: ${{ secrets.CP_STAGING_ADMIN_API_TOKEN }}
+        run: |
+          # Sweep any e2e-cncrg-mk-YYYYMMDD-<run_id>-* org this run created if the
+          # script died before its EXIT trap fired. Run-id scoped so it never
+          # stomps a concurrent run's fresh tenant.
+          set +e
+          orgs=$(curl -sS "$MOLECULE_CP_URL/cp/admin/orgs" \
+            -H "Authorization: Bearer $ADMIN_TOKEN" 2>/dev/null \
+            | python3 -c "
+          import json, sys, os, datetime
+          run_id = os.environ.get('GITHUB_RUN_ID', '')
+          d = json.load(sys.stdin)
+          today = datetime.date.today()
+          yesterday = today - datetime.timedelta(days=1)
+          dates = (today.strftime('%Y%m%d'), yesterday.strftime('%Y%m%d'))
+          if run_id:
+              prefixes = tuple(f'e2e-cncrg-mk-{d}-{run_id}-' for d in dates)
+          else:
+              prefixes = tuple(f'e2e-cncrg-mk-{d}-' for d in dates)
+          candidates = [o['slug'] for o in d.get('orgs', [])
+                        if any(o.get('slug','').startswith(p) for p in prefixes)
+                        and o.get('instance_status') not in ('purged',)]
+          print('\n'.join(candidates))
+          " 2>/dev/null)
+          leaks=()
+          for slug in $orgs; do
+            echo "Safety-net teardown: $slug"
+            set +e
+            curl -sS -o /tmp/cncrg-mk-cleanup.out -w "%{http_code}" \
+              -X DELETE "$MOLECULE_CP_URL/cp/admin/tenants/$slug" \
+              -H "Authorization: Bearer $ADMIN_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "{\"confirm\":\"$slug\"}" >/tmp/cncrg-mk-cleanup.code
+            set -e
+            code=$(cat /tmp/cncrg-mk-cleanup.code 2>/dev/null || echo "000")
+            if [ "$code" = "200" ] || [ "$code" = "204" ]; then
+              echo "[teardown] deleted $slug (HTTP $code)"
+            else
+              echo "::warning::concierge-mk teardown for $slug returned HTTP $code — sweep-stale-e2e-orgs will catch it within ~45 min. Body: $(head -c 300 /tmp/cncrg-mk-cleanup.out 2>/dev/null)"
+              leaks+=("$slug")
+            fi
+          done
+          if [ ${#leaks[@]} -gt 0 ]; then
+            echo "::warning::concierge-mk teardown left ${#leaks[@]} leak(s): ${leaks[*]}"
           fi
           exit 0
 
