@@ -311,7 +311,22 @@ for slug in $valid_slugs; do
   fi
 done
 
-printf '\n== Test 11: ROLLBACK_TAG follows YYYYMMDD via NOW_OVERRIDE_DATE ==\n'
+printf '\n== Test 11: region validation — malicious region rejected with exit 64 (#676) ==\n'
+# Attack vectors: shell metacharacters, path traversal, command substitution.
+_invalid_regions='us;rm -rf / $(whoami) us"east-1 ../etc/passwd `id` $HOME us/east-1'
+for bad_region in $_invalid_regions; do
+  set +e
+  out=$(AWS_REGION="$bad_region" "$SCRIPT" --source-tag x --dest-tag y --tenants chloe-dong --mock-dir /nonexistent 2>&1); rc=$?
+  set -e
+  if [[ $rc -eq 64 ]] && printf '%s' "$out" | grep -q 'invalid AWS region'; then
+    PASS=$((PASS + 1)); printf '  ✓ region rejected: %s\n' "$(printf '%q' "$bad_region")"
+  else
+    FAIL=$((FAIL + 1)); FAIL_NAMES+=("region-reject:$bad_region")
+    printf '  ✗ region should be rejected: %s — got exit %s\n' "$(printf '%q' "$bad_region")" "$rc"
+  fi
+done
+
+printf '\n== Test 12: ROLLBACK_TAG follows YYYYMMDD via NOW_OVERRIDE_DATE ==\n'
 m=$(mkmock)
 mock_set "$m" aws_ecr_get_image       '{}' 0
 mock_set "$m" aws_ecr_describe_image  '' 1
@@ -333,7 +348,7 @@ fi
 assert_calls_contain "rollback tag uses NOW_OVERRIDE_DATE (20260603)" "$m" 'aws_ecr_put_image b-prev-20260603'
 rm -rf "$m"
 
-printf '\n== Test 12: empty source manifest fails preflight ==\n'
+printf '\n== Test 13: empty source manifest fails preflight ==\n'
 m=$(mkmock)
 mock_set "$m" aws_ecr_get_image '' 0   # rc=0 but empty body (the "None" case)
 out=$(run_script "$m")
@@ -341,7 +356,7 @@ assert_exit "empty source manifest fails preflight" "$out" 1
 assert_contains "empty manifest message" "$out" 'returned empty manifest'
 rm -rf "$m"
 
-printf '\n== Test 13: tenant_buildinfo failure during verify → rollback ==\n'
+printf '\n== Test 14: tenant_buildinfo failure during verify → rollback ==\n'
 m=$(mkmock)
 mock_set "$m" aws_ecr_get_image          '{"manifests":[]}' 0
 mock_set "$m" aws_ecr_describe_image     '' 1
@@ -355,7 +370,7 @@ assert_contains "logs buildinfo failure" "$out" '/buildinfo failed for chloe-don
 assert_contains "rollback fired after verify fail" "$out" 'ROLLBACK:'
 rm -rf "$m"
 
-printf '\n== Test 14: ssm_refresh_ecr_auth JSON escaping (CWE-78 / OFFSEC-001) ==\n'
+printf '\n== Test 15: ssm_refresh_ecr_auth JSON escaping (CWE-78 / OFFSEC-001) ==\n'
 # Verify the python3 snippet in ssm_refresh_ecr_auth produces valid JSON and
 # correctly escapes shell-injection characters in region + account ID fields.
 # The fix replaces unquoted shell-printf interpolation with json.dumps.

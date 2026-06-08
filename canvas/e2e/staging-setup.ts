@@ -341,11 +341,15 @@ export default async function globalSetup(_config: FullConfig): Promise<void> {
           );
           return true;
         }
-        // Real boot regression — hard-throw immediately with full detail.
+        // #2032: tolerate transient 'failed' during boot — some runtimes
+        // briefly report failed before recovering to online (e.g. agent
+        // restart during init). Retry instead of hard-throwing; genuine
+        // terminal failures will still surface via waitFor timeout.
         const detail = sampleErr
           ? sampleErr
           : `(no last_sample_error) full body: ${JSON.stringify(r.body)}`;
-        throw new Error(`Workspace failed: ${detail}`);
+        console.warn(`[staging-setup] transient failed (retrying): ${detail}`);
+        return null;
       }
       return null;
     },

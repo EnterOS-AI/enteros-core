@@ -81,7 +81,7 @@ jobs:
           # Gitea persona whose ONLY job is reading branch_protections
           # and posting the [ci-drift] tracking issue. The endpoint
           # `GET /repos/.../branch_protections/{branch}` requires
-          # repo-ADMIN role (Gitea 1.22.6) — SOP_TIER_CHECK_TOKEN and the
+          # repo-ADMIN role (Gitea 1.22.6) — the default GITHUB_TOKEN and the
           # auto-injected GITHUB_TOKEN do NOT have it (read-only / write
           # without admin), so the previous fallback chain 403'd.
           # Mirrors the controlplane fix landed in CP PR#134.
