@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"io"
 	"log"
 	"net/http"
@@ -61,12 +62,14 @@ func (h *WorkspaceHandler) SwitchProvider(c *gin.Context) {
 	}
 
 	var status, wsName, dbRuntime, oldProvider, dataPersistence string
+	var oldInstanceID sql.NullString
 	var tier int
 	err := db.DB.QueryRowContext(ctx, `
 		SELECT status, name, tier, COALESCE(runtime, 'claude-code'),
-		       COALESCE(compute->>'provider', ''), COALESCE(compute->>'data_persistence', '')
+		       COALESCE(compute->>'provider', ''), COALESCE(compute->>'data_persistence', ''),
+		       instance_id
 		FROM workspaces WHERE id = $1`, id,
-	).Scan(&status, &wsName, &tier, &dbRuntime, &oldProvider, &dataPersistence)
+	).Scan(&status, &wsName, &tier, &dbRuntime, &oldProvider, &dataPersistence, &oldInstanceID)
 	if err == sql.ErrNoRows || status == string(models.StatusRemoved) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "workspace not found"})
 		return
@@ -116,24 +119,50 @@ func (h *WorkspaceHandler) SwitchProvider(c *gin.Context) {
 	// --- ordered switch (see doc-comment) ---
 
 	// 1. Stop the OLD box with the OLD provider. DB is unchanged here, so
-	//    cpStopWithRetry resolves the old provider + old instance_id. Synchronous
-	//    (bounded retry); proceeds even on exhaustion so a stuck old box never
-	//    strands the switch — the audit log + reconciler are the backstop.
-	h.cpStopWithRetry(ctx, id, "SwitchProvider")
+	//    cpStopWithRetryErr resolves the old provider + old instance_id. Bounded
+	//    retry; on exhaustion it returns an error but we STILL proceed (a stuck
+	//    old box must not strand the switch) — except we capture the failure so
+	//    step 2.5 can emit a durable audit row, because step 2 nulls instance_id
+	//    and flips provider, which otherwise orphans the old box with no DB
+	//    pointer for the sweeper to find (review finding #3).
+	stopErr := h.cpStopWithRetryErr(ctx, id, "SwitchProvider", false)
 
-	// 2. Clear instance_id + write the new provider (jsonb_set preserves
-	//    instance_type/volume/display/data_persistence) + go provisioning.
-	if _, err := db.DB.ExecContext(ctx, `
+	// 2. Atomically claim the switch AND clear instance_id + write the new
+	//    provider. The CAS (status not already provisioning, provider still the
+	//    one we read) makes concurrent/duplicate switch calls safe: only the
+	//    first winner launches a provision; a racing call sees 0 rows → 409,
+	//    never a second provision against a second backend (review finding #4).
+	//    jsonb_set preserves instance_type/volume/display/data_persistence.
+	res, err := db.DB.ExecContext(ctx, `
 		UPDATE workspaces
 		SET instance_id = NULL,
 		    compute = jsonb_set(COALESCE(compute, '{}'::jsonb), '{provider}', to_jsonb($2::text)),
 		    status = $3, url = '', updated_at = now()
-		WHERE id = $1`, id, newProvider, models.StatusProvisioning); err != nil {
+		WHERE id = $1
+		  AND status <> $3
+		  AND COALESCE(compute->>'provider', '') IS NOT DISTINCT FROM $4`,
+		id, newProvider, models.StatusProvisioning, oldProvider)
+	if err != nil {
 		log.Printf("SwitchProvider: failed to write new provider for %s: %v", id, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to switch provider"})
 		return
 	}
-	log.Printf("SwitchProvider: %s %s → %s (old box stopped, reprovisioning)", id, effectiveOld, newProvider)
+	if n, _ := res.RowsAffected(); n == 0 {
+		// Lost the CAS: another switch already flipped the provider / set
+		// provisioning, or the row changed under us. Do NOT launch a second
+		// provision (would orphan a box).
+		c.JSON(http.StatusConflict, gin.H{"error": "ALREADY_SWITCHING", "detail": "a provider switch or provision is already in progress for this workspace"})
+		return
+	}
+
+	// 2.5. If the old box never confirmed stopped, the old instance is now
+	//      orphaned with no DB pointer (we just nulled instance_id). Emit a
+	//      durable audit row carrying the old instance_id + provider so a CP-side
+	//      reconciler can find and terminate it (review finding #3).
+	if stopErr != nil && oldInstanceID.Valid && oldInstanceID.String != "" {
+		h.emitSwitchProviderStopExhausted(ctx, id, oldInstanceID.String, effectiveOld, newProvider, stopErr)
+	}
+	log.Printf("SwitchProvider: %s %s → %s (old box stop err=%v, reprovisioning)", id, effectiveOld, newProvider, stopErr)
 	h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceProvisioning), id, map[string]interface{}{
 		"name":          wsName,
 		"tier":          tier,
@@ -155,4 +184,34 @@ func (h *WorkspaceHandler) SwitchProvider(c *gin.Context) {
 		"from":         effectiveOld,
 		"to":           newProvider,
 	})
+}
+
+// emitSwitchProviderStopExhausted records a durable audit row when a provider
+// switch could not confirm the OLD box stopped before its instance_id was
+// cleared from the row. Without it the old box is an un-pointed orphan that the
+// status='removed' sweeper won't catch; a CP-side reconciler reads these rows by
+// old_instance_id + old_provider to terminate the leaked box. Mirrors
+// emitDeleteTerminateRetryExhausted (workspace_dispatchers.go). Best-effort.
+func (h *WorkspaceHandler) emitSwitchProviderStopExhausted(ctx context.Context, workspaceID, oldInstanceID, oldProvider, newProvider string, cause error) {
+	if db.DB == nil {
+		return
+	}
+	payload, err := json.Marshal(map[string]any{
+		"workspace_id":    workspaceID,
+		"old_instance_id": oldInstanceID,
+		"old_provider":    oldProvider,
+		"new_provider":    newProvider,
+		"last_error":      cause.Error(),
+		"recovery_path":   "cp_orphan_reconciler",
+	})
+	if err != nil {
+		log.Printf("emitSwitchProviderStopExhausted: marshal failed for %s: %v", workspaceID, err)
+		return
+	}
+	if _, err := db.DB.ExecContext(ctx, `
+		INSERT INTO structure_events (event_type, workspace_id, payload, created_at)
+		VALUES ($1, $2, $3, now())
+	`, "workspace.provider.switch_stop_exhausted", workspaceID, payload); err != nil {
+		log.Printf("emitSwitchProviderStopExhausted: insert failed for %s: %v", workspaceID, err)
+	}
 }

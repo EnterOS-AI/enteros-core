@@ -24,9 +24,9 @@ func TestSwitchProvider_StopBeforeProviderWrite(t *testing.T) {
 		t.Fatalf("read source: %v", err)
 	}
 	stripped := stripGoComments(src)
-	stopIdx := bytes.Index(stripped, []byte("cpStopWithRetry(ctx, id, \"SwitchProvider\")"))
+	stopIdx := bytes.Index(stripped, []byte("cpStopWithRetryErr(ctx, id, \"SwitchProvider\""))
 	if stopIdx < 0 {
-		t.Fatal("SwitchProvider must stop the old box via cpStopWithRetry before reprovisioning")
+		t.Fatal("SwitchProvider must stop the old box via cpStopWithRetryErr before reprovisioning")
 	}
 	// the provider write is the jsonb_set on compute -> {provider}
 	writeIdx := bytes.Index(stripped, []byte("'{provider}'"))
@@ -39,6 +39,32 @@ func TestSwitchProvider_StopBeforeProviderWrite(t *testing.T) {
 	// and the instance_id must be cleared in the same UPDATE (retry-safety)
 	if !bytes.Contains(stripped, []byte("instance_id = NULL")) {
 		t.Fatal("SwitchProvider must clear instance_id when writing the new provider (retry-safety)")
+	}
+}
+
+// TestSwitchProvider_ConcurrencyGuardAndAudit pins the two hardening items from
+// the #2422 correctness review: (a) the provider-write is an atomic CAS so two
+// concurrent switches can't both launch a provision (orphan), and (b) a
+// stop-exhaustion emits a durable audit row carrying the old instance_id+provider
+// (else the old box orphans with no DB pointer once instance_id is nulled).
+func TestSwitchProvider_ConcurrencyGuardAndAudit(t *testing.T) {
+	wd, _ := os.Getwd()
+	src, err := os.ReadFile(filepath.Join(wd, "workspace_switch_provider.go"))
+	if err != nil {
+		t.Fatalf("read source: %v", err)
+	}
+	s := stripGoComments(src)
+	if !bytes.Contains(s, []byte("status <> $3")) || !bytes.Contains(s, []byte("IS NOT DISTINCT FROM $4")) {
+		t.Error("the provider-write UPDATE must be a CAS (status not already provisioning AND provider unchanged) to prevent a double-provision race")
+	}
+	if !bytes.Contains(s, []byte("RowsAffected")) || !bytes.Contains(s, []byte("ALREADY_SWITCHING")) {
+		t.Error("SwitchProvider must 409 ALREADY_SWITCHING when the CAS affects 0 rows (lost the race)")
+	}
+	if !bytes.Contains(s, []byte("cpStopWithRetryErr")) {
+		t.Error("SwitchProvider must use cpStopWithRetryErr to detect stop exhaustion")
+	}
+	if !bytes.Contains(s, []byte("emitSwitchProviderStopExhausted")) {
+		t.Error("SwitchProvider must emit an audit row with old instance_id+provider on stop exhaustion")
 	}
 }
 
