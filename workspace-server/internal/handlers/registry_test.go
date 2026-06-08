@@ -895,9 +895,13 @@ func TestValidateAgentURL_PendingPlatformTunnel(t *testing.T) {
 	}{
 		{"ws-abc123.moleculesai.app", true},
 		{"ws-abc123.staging.moleculesai.app", true},
-		{"ws-abc123.evil.com", false},       // not under the platform domain
-		{"api.moleculesai.app", false},      // no ws- prefix
-		{"ws-x.fakemoleculesai.app", false}, // lookalike domain, not a subdomain
+		{"WS-ABC123.MOLECULESAI.APP", true},          // case-insensitive DNS
+		{"ws-abc123.moleculesai.app.", true},         // FQDN trailing dot
+		{"WS-ABC123.STAGING.MOLECULESAI.APP.", true}, // both case + trailing dot
+		{"ws-abc123.evil.com", false},                // not under the platform domain
+		{"api.moleculesai.app", false},               // no ws- prefix
+		{"ws-x.fakemoleculesai.app", false},          // lookalike domain, not a subdomain
+		{"ws-abc123moleculesai.app", false},          // missing dot before platform domain
 	} {
 		if got := isPlatformTunnelHostname(tc.h); got != tc.want {
 			t.Errorf("isPlatformTunnelHostname(%q)=%v want %v", tc.h, got, tc.want)
