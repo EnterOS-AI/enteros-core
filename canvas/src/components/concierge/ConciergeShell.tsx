@@ -98,6 +98,7 @@ export function ConciergeShell() {
 
   const [railOpen, setRailOpen] = useState(false);
   const [sbTab, setSbTab] = useState<SbTab>("agents");
+  const [settingsTab, setSettingsTab] = useState<"platform" | "org">("platform");
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
 
   // Dynamic org name for the topbar. Sourced from GET /org/identity
@@ -510,6 +511,30 @@ export function ConciergeShell() {
                     </p>
                   </div>
 
+                  {/* Two tabs instead of one long sheet: Platform agent
+                      configuration vs Org & canvas settings. Reuses the same
+                      .sbTabs purple-underline tab style as the Home sub-tabs. */}
+                  <div className={s.sbTabs} role="tablist" aria-label="Settings sections">
+                    <button
+                      type="button"
+                      role="tab"
+                      aria-selected={settingsTab === "platform"}
+                      className={`${s.sbTab} ${settingsTab === "platform" ? s.active : ""}`}
+                      onClick={() => setSettingsTab("platform")}
+                    >
+                      Platform agent configuration
+                    </button>
+                    <button
+                      type="button"
+                      role="tab"
+                      aria-selected={settingsTab === "org"}
+                      className={`${s.sbTab} ${settingsTab === "org" ? s.active : ""}`}
+                      onClick={() => setSettingsTab("org")}
+                    >
+                      Org &amp; canvas settings
+                    </button>
+                  </div>
+
                   {/* Platform agent configuration — the FULL workspace tab UI
                       (Config, Plugins/Skills, Container, Display, Details,
                       Activity, Terminal, Channels, Schedule, Files, Memory,
@@ -518,40 +543,42 @@ export function ConciergeShell() {
                       surfaces can't drift. Pointed at the platform agent; the
                       panel owns its own local active-tab state so it doesn't
                       fight the map's node selection. */}
-                  <div className={s.scard}>
-                    <div className={s.scardHead}>
-                      <div className={s.scardTitle}>Platform agent configuration</div>
-                      <div className={s.scardDesc}>
-                        Update the concierge like any workspace: its config.yaml,
-                        plugins &amp; skills, container/compute, display, channels,
-                        schedule and more.
+                  {settingsTab === "platform" && (
+                    <div className={s.scard}>
+                      <div className={s.scardHead}>
+                        <div className={s.scardDesc}>
+                          Update the concierge like any workspace: its config.yaml,
+                          plugins &amp; skills, container/compute, display, channels,
+                          schedule and more.
+                        </div>
                       </div>
+                      {platformRoot ? (
+                        <div className={s.embedPanel}>
+                          <WorkspacePanelTabs key={platformRoot.id} node={platformRoot} defaultTab="config" />
+                        </div>
+                      ) : (
+                        <div className={s.scardDesc}>
+                          No platform agent yet. Spin one up from Home to configure it.
+                        </div>
+                      )}
                     </div>
-                    {platformRoot ? (
-                      <div className={s.embedPanel}>
-                        <WorkspacePanelTabs key={platformRoot.id} node={platformRoot} defaultTab="config" />
-                      </div>
-                    ) : (
-                      <div className={s.scardDesc}>
-                        No platform agent yet. Spin one up from Home to configure it.
-                      </div>
-                    )}
-                  </div>
+                  )}
 
-                  <div className={s.scard}>
-                    <div className={s.scardHead}>
-                      <div className={s.scardTitle}>Org &amp; canvas settings</div>
-                      <div className={s.scardDesc}>
-                        Secrets, workspace tokens, org API keys and organization
-                        identity. These also live behind the gear in the top bar.
+                  {settingsTab === "org" && (
+                    <div className={s.scard}>
+                      <div className={s.scardHead}>
+                        <div className={s.scardDesc}>
+                          Secrets, workspace tokens, org API keys and organization
+                          identity. These also live behind the gear in the top bar.
+                        </div>
                       </div>
+                      {platformId && (
+                        <div className={s.embedSettings}>
+                          <SettingsTabs workspaceId={platformId} />
+                        </div>
+                      )}
                     </div>
-                    {platformId && (
-                      <div className={s.embedSettings}>
-                        <SettingsTabs workspaceId={platformId} />
-                      </div>
-                    )}
-                  </div>
+                  )}
                 </div>
               </div>
             </div>
