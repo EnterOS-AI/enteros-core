@@ -80,6 +80,20 @@ services:
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:${CANVAS_PUBLISH_PORT:-3000},http://127.0.0.1:${CANVAS_PUBLISH_PORT:-3000},http://localhost:3001}
       RATE_LIMIT: "${RATE_LIMIT:-1000}"
       CONFIGS_DIR: /configs
+      # Runtime/template SSOT parity with production. The image bakes the FULL
+      # template set (claude-code-default, codex, google-adk, hermes, openclaw,
+      # seo-agent) at /workspace-configs-templates, but the ./workspace-configs-
+      # templates:/configs mount below only carries claude-code-default on the
+      # host — so without this, GET /templates (the runtime-picker SSOT) listed
+      # only claude-code locally while production lists them all. Pointing the
+      # template cache-dir at the baked bundle makes the local runtime LIST match
+      # production. NOTE: the local Docker provisioner bind-mounts a template
+      # from CONFIGS_HOST_DIR (host path) at provision time, and the host dir
+      # only has claude-code-default — so the other runtimes are SELECTABLE but
+      # only claude-code is PROVISIONABLE locally (their images + host templates
+      # aren't present in this lightweight dev stack). Real provisioning of the
+      # other runtimes is covered by the staging e2e, which carries all images.
+      TEMPLATE_CACHE_DIR: "${TEMPLATE_CACHE_DIR:-/workspace-configs-templates}"
       CONFIGS_HOST_DIR: "${CONFIGS_HOST_DIR:-${PWD}/workspace-configs-templates}"
       PLUGINS_HOST_DIR: "${PLUGINS_HOST_DIR:-${PWD}/plugins}"
       # github-app-auth plugin — injects GITHUB_TOKEN / GH_TOKEN into every
