@@ -148,6 +148,11 @@ jobs:
         run: $(go env GOPATH)/bin/golangci-lint run --timeout 3m ./...
       - if: ${{ needs.changes.outputs.platform == 'true' }}
         name: Diagnostic — per-package verbose 60s
+        # DIAGNOSTIC ONLY (continue-on-error below): this step exists to dump
+        # verbose per-package output for triage, NOT to gate. The blocking gate
+        # is "Run tests with coverage (blocking gate)" immediately below. The
+        # `set +e` / swallowed exits here are intentional — do not "fix" them
+        # like a gate; the real gate is the next step.
         run: |
           set +e
           go test -race -v -timeout 60s ./internal/handlers/... 2>&1 | tee /tmp/test-handlers.log
