@@ -405,6 +405,14 @@ jobs:
           bash scripts/test-promote-tenant-image.sh
 
       - if: ${{ needs.changes.outputs.scripts == 'true' }}
+        name: Drift guard — KI-013 container/volume naming (SEV #2499)
+        # KI-013 removed 12-char UUID truncation from container/volume names.
+        # E2E scripts must use FULL workspace IDs. This fail-closed guard
+        # prevents regressions where a new/modified script reintroduces the
+        # old truncated-name pattern (the root cause of SEV #2499).
+        run: bash .gitea/scripts/lint-e2e-ki013-container-names.sh
+
+      - if: ${{ needs.changes.outputs.scripts == 'true' }}
         name: Shellcheck promote-tenant-image script
         # scripts/ is excluded from the bulk shellcheck pass above (legacy
         # SC3040/SC3043 cleanup pending). Run shellcheck explicitly on
