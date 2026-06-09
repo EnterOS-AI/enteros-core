@@ -1578,8 +1578,9 @@ func RunningContainerName(ctx context.Context, cli *client.Client, workspaceID s
 			if renameErr := cli.ContainerRename(ctx, legacyName, newName); renameErr == nil {
 				log.Printf("Provisioner: renamed legacy container %s → %s", legacyName, newName)
 				return newName, nil
+			} else {
+				log.Printf("Provisioner: warning: failed to rename legacy container %s → %s: %v", legacyName, newName, renameErr)
 			}
-			log.Printf("Provisioner: warning: failed to rename legacy container %s → %s: %v", legacyName, newName, renameErr)
 		}
 		// Rename not possible (or new name already occupied) — return legacy
 		// name so the caller can still exec into the live container.
