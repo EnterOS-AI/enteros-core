@@ -280,7 +280,22 @@ func (h *WorkspaceHandler) Update(c *gin.Context) {
 				if normalizeCloudProvider(oldProvider.String) != normalizeCloudProvider(newComputeProvider) {
 					log.Printf("Update: cloud-provider switch for %s: %q -> %q; deprovisioning old box on old provider before overwriting compute",
 						id, normalizeCloudProvider(oldProvider.String), normalizeCloudProvider(newComputeProvider))
-					h.cpStopWithRetry(ctx, id, "provider-switch")
+					// Use the ERROR-returning variant and ABORT before overwriting
+					// compute if the old-box deprovision fails. If we proceeded, the
+					// old box would keep running on the OLD cloud while the row now
+					// records the NEW provider+instance — stranding it with no DB
+					// pointer (an UNRECOVERABLE cross-cloud orphan that no reconciler
+					// can map back). Aborting leaves the row pointing at the
+					// still-recoverable old box; the user can retry the switch. (The
+					// restart paths' void cpStopWithRetry is fine there because the
+					// box stays on the SAME cloud, so the provider record is unchanged
+					// and a provider-scoped sweep can still find it.)
+					if err := h.cpStopWithRetryErr(ctx, id, "provider-switch", false); err != nil {
+						log.Printf("Update: provider-switch for %s ABORTED — could not deprovision old box on %q (provider left unchanged, old box recoverable): %v",
+							id, normalizeCloudProvider(oldProvider.String), err)
+						c.JSON(http.StatusBadGateway, gin.H{"error": "could not deprovision the current cloud box; provider unchanged — please retry"})
+						return
+					}
 				}
 			}
 		}
