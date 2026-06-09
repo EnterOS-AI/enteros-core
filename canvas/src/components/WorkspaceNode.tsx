@@ -215,7 +215,7 @@ export function WorkspaceNode({ id, data }: NodeProps<Node<WorkspaceNodeData>>) 
         {/* Header row */}
         <div className="flex items-center justify-between gap-2 mb-2.5">
           <div className="flex items-center gap-2.5 min-w-0">
-            <div className={`w-2.5 h-2.5 rounded-full shrink-0 ${statusCfg.dot} ${statusCfg.glow} shadow-sm`} />
+            <div data-flight-anchor className={`w-2.5 h-2.5 rounded-full shrink-0 ${statusCfg.dot} ${statusCfg.glow} shadow-sm`} />
             <span className="text-[15px] font-semibold text-ink truncate leading-tight">
               {data.name}
             </span>
