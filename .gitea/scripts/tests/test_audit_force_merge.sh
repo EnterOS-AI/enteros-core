@@ -115,5 +115,78 @@ T16=$(validate_required_checks_json "main" '{"main":"CI / all-required"}')
 [ "$T16" = "false" ] || fail "T16: string branch entry should fail"
 pass "T16: string branch entry fails"
 
+# ---------------------------------------------------------------------------
+# T17+ — /statuses pagination (status-pagination RCA, #2440-family).
+# The reader now pages /commits/{sha}/statuses to exhaustion instead of reading
+# the capped combined /status view. These lock the page-accumulation,
+# newest-wins collapse, short-page stop, and fail-closed contracts.
+# ---------------------------------------------------------------------------
+
+# Page-body type validator used per page (bare array, not an object).
+validate_page_is_array() { jq -e 'type == "array"' >/dev/null 2>&1 && echo true || echo false; }
+
+# newest-wins collapse: emulate the script's CHECK_STATE overwrite loop.
+collapse_newest_per_context() {
+  declare -A CS
+  while IFS=$'\t' read -r ctx state; do
+    [ -n "$ctx" ] && CS[$ctx]="$state"
+  done < <(jq -r '.[] | "\(.context)\t\(.status)"')
+  state="${CS[CI / all-required (push)]:-missing}"
+  echo "$state"
+}
+
+# T17 — a bare JSON array page passes the per-page array check.
+T17=$(echo '[{"context":"c1","status":"success"}]' | validate_page_is_array)
+[ "$T17" = "true" ] || fail "T17: bare array page should pass array check"
+pass "T17: bare array page passes array check"
+
+# T18 — a non-array page (object) fails the per-page array check → fail-closed.
+T18=$(echo '{"statuses":[]}' | validate_page_is_array)
+[ "$T18" = "false" ] || fail "T18: object page should fail array check (fail-closed)"
+pass "T18: object page fails array check (fail-closed)"
+
+# T19 — required SUCCESS on PAGE 2 is FOUND after accumulation (not missing).
+#   page1: 100 noise rows (older ids); page2: the required-context success.
+PAGE1=$(jq -nc '[range(0;100) | {id:., context:("noise-\(.) (push)"), status:"pending"}]')
+PAGE2='[{"id":200,"context":"CI / all-required (push)","status":"success"}]'
+# Accumulation matching the script: two-arg `jq -s '.[0] + .[1]'` over the
+# running accumulator and the new page.
+ACCUM=$(jq -s '.[0] + .[1]' <(echo "$PAGE1") <(echo "$PAGE2"))
+LEN=$(echo "$ACCUM" | jq 'length')
+[ "$LEN" = "101" ] || fail "T19: accumulated length should be 101, got $LEN"
+RESULT=$(echo "$ACCUM" | collapse_newest_per_context)
+[ "$RESULT" = "success" ] || fail "T19: required success on page2 must be FOUND, got '$RESULT'"
+pass "T19: required success on page2 is found after pagination"
+
+# T20 — genuinely-absent required context across all pages stays 'missing'
+#       → fail-closed (counted as not-green, flags the force-merge).
+ABSENT=$(jq -nc '[range(0;100) | {id:., context:("noise-\(.) (push)"), status:"success"}]')
+RESULT2=$(echo "$ABSENT" | collapse_newest_per_context)
+[ "$RESULT2" = "missing" ] || fail "T20: absent required context must stay 'missing', got '$RESULT2'"
+pass "T20: genuinely-absent required context stays missing (fail-closed)"
+
+# T21 — newest-wins: an OLDER failure row for the same context must NOT shadow
+#       a NEWER success row (oldest-first append → last overwrite wins).
+DUP='[{"id":1,"context":"CI / all-required (push)","status":"failure"},
+      {"id":2,"context":"CI / all-required (push)","status":"success"}]'
+RESULT3=$(echo "$DUP" | collapse_newest_per_context)
+[ "$RESULT3" = "success" ] || fail "T21: newest (success) must win over older (failure), got '$RESULT3'"
+pass "T21: newest row per context wins after pagination collapse"
+
+# T22 — short-page stop condition: a page with fewer than PER_PAGE rows ends
+#       the loop. Emulate the numeric comparison the script uses.
+PER_PAGE=100
+PAGE_COUNT=$(echo "$PAGE2" | jq 'length')   # 1 row
+if [ "$PAGE_COUNT" -lt "$PER_PAGE" ]; then SHORT=stop; else SHORT=continue; fi
+[ "$SHORT" = "stop" ] || fail "T22: short page should stop pagination"
+pass "T22: short page stops pagination loop"
+
+# T23 — a full page (== PER_PAGE) continues the loop.
+FULL=$(jq -nc '[range(0;100) | {id:., context:"x", status:"success"}]')
+FULL_COUNT=$(echo "$FULL" | jq 'length')
+if [ "$FULL_COUNT" -lt "$PER_PAGE" ]; then CONT=stop; else CONT=continue; fi
+[ "$CONT" = "continue" ] || fail "T23: full page should continue pagination"
+pass "T23: full page continues pagination loop"
+
 echo
 echo "ALL AUDIT-FORCE-MERGE CHECKS PASSED"
