@@ -66,6 +66,14 @@ def build_plan(env: dict[str, str]) -> dict:
         "target_tag": target_tag,
         "soak_seconds": _int_env(env, "PROD_AUTO_DEPLOY_SOAK_SECONDS", 60, minimum=0),
         "batch_size": _int_env(env, "PROD_AUTO_DEPLOY_BATCH_SIZE", 3),
+        # Tolerate a small minority of individually-stuck tenants (e.g. a wedged
+        # data volume that won't recreate). They are QUARANTINED — shipped past
+        # so the healthy majority still lands the build — and reported for
+        # separate recovery, instead of one stuck tenant blocking the whole
+        # fleet deploy. The canary still must pass, the CP halts a batch the
+        # moment failures exceed this, and the cross-batch coverage gate below
+        # enforces the same tolerance globally. Default 1.
+        "max_stragglers": _int_env(env, "PROD_AUTO_DEPLOY_MAX_STRAGGLERS", 1, minimum=0),
         "dry_run": truthy_flag(env.get("PROD_AUTO_DEPLOY_DRY_RUN", "")),
         # confirm:true ack required by CP /cp/admin/tenants/redeploy-fleet
         # contract (cp#228 / task #308) for fleet-wide intent. Empty body
@@ -251,26 +259,41 @@ def rollout_stragglers(enumerated: list[str], results: list[dict]) -> list[str]:
     return sorted(s for s in dict.fromkeys(enumerated) if s not in verified)
 
 
-def assert_full_coverage(enumerated: list[str], aggregate: dict, dry_run: bool) -> None:
-    """Fail the rollout if any enumerated tenant is not on the target build.
+def assert_full_coverage(
+    enumerated: list[str], aggregate: dict, dry_run: bool, max_stragglers: int = 0
+) -> None:
+    """Gate the rollout on coverage, tolerating a quarantined straggler minority.
 
-    This is the no-silent-skip gate (internal#724). A dry run proves
-    nothing landed, so coverage is not asserted for it.
+    This is the no-silent-skip gate (internal#724) made resilient: every
+    enumerated tenant must be PROVEN on the target build, EXCEPT up to
+    ``max_stragglers`` individually-stuck tenants which are quarantined (shipped
+    past) and reported for separate recovery instead of blocking the whole
+    fleet deploy. Exceeding the tolerance is a systemic failure → RolloutFailed.
+    A dry run proves nothing landed, so coverage is not asserted for it.
     """
 
     if dry_run:
         return
     stragglers = rollout_stragglers(enumerated, aggregate.get("results") or [])
-    if stragglers:
+    if not stragglers:
+        return
+    # Surface the stragglers (for the step summary + recovery), gate or not.
+    aggregate["stragglers"] = stragglers
+    if len(stragglers) > max_stragglers:
         msg = (
             f"incomplete rollout: {len(stragglers)} tenant(s) not verified on target "
-            f"after redeploy-fleet: {', '.join(stragglers)} "
+            f"after redeploy-fleet (max tolerated {max_stragglers}): {', '.join(stragglers)} "
             f"(enumerated {len(set(enumerated))})"
         )
         aggregate["ok"] = False
         aggregate["error"] = msg
-        aggregate["stragglers"] = stragglers
         raise RolloutFailed(msg, aggregate)
+    # Within tolerance: shipped to the healthy majority; quarantine is loud,
+    # not fatal. The deploy succeeds; the stragglers need individual recovery.
+    print(
+        f"::warning::quarantined {len(stragglers)} straggler(s) (<= max {max_stragglers}); "
+        f"shipped to the rest of the fleet — these need recovery: {', '.join(stragglers)}"
+    )
 
 
 def execute_scoped_rollout(
@@ -325,7 +348,8 @@ def execute_scoped_rollout(
     # or one enumerated but never batched, is a straggler. Surfacing it as
     # a RolloutFailed makes the deploy step exit non-zero instead of
     # silently reporting success (the exact agents-team failure mode).
-    assert_full_coverage(all_slugs, aggregate, dry_run)
+    max_stragglers = int(base_body.get("max_stragglers") or 0)
+    assert_full_coverage(all_slugs, aggregate, dry_run, max_stragglers)
 
     return aggregate
 

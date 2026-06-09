@@ -351,7 +351,8 @@ def compute_ack_state(
             latest_directive[(user, slug)] = kind
 
     # Step 2: build candidate ackers per slug.
-    # Filter out self-acks and unknown slugs.
+    # Filter out self-acks and unknown slugs. Author self-ack is forbidden
+    # per .gitea/sop-checklist-config.yaml — a non-author peer must ack.
     ackers_per_slug: dict[str, list[str]] = {s: [] for s in items_by_slug}
     rejected_self: dict[str, list[str]] = {s: [] for s in items_by_slug}
     pending_team_check: dict[str, list[str]] = {s: [] for s in items_by_slug}

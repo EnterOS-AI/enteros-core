@@ -272,20 +272,6 @@ func MarkQueueItemFailed(ctx context.Context, id, errMsg string) {
 	}
 }
 
-// QueueDepth returns the number of currently-queued (not dispatched/completed)
-// items for a workspace. Used by the busy-return response body so callers
-// can see how many ahead of them.
-func QueueDepth(ctx context.Context, workspaceID string) int {
-	var n int
-	if err := db.DB.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM a2a_queue WHERE workspace_id = $1 AND status = 'queued'`,
-		workspaceID,
-	).Scan(&n); err != nil {
-		log.Printf("A2AQueue: QueueDepth query failed for workspace %s: %v", workspaceID, err)
-	}
-	return n
-}
-
 // DropStaleQueueItems marks queued items older than maxAge as 'dropped' with a
 // system-generated reason so PM agents stop processing stale post-incident noise.
 // Called with a workspaceID to scope cleanup to one workspace, or empty to sweep
