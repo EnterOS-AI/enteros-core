@@ -78,6 +78,12 @@ jobs:
       # even if the runner's $GITHUB_ENV propagation is flaky (#2468 RCA).
       MOLECULE_ENV: development
       SECRETS_ENCRYPTION_KEY: lpe2e-test-encryption-key-32bytes!!
+      # act_runner runs the job inside a Docker container, so /.dockerenv exists
+      # and the platform auto-detects platformInDocker=true. But the job container
+      # is NOT on molecule-core-net, so it cannot resolve workspace container
+      # hostnames (ws-<id>:8000). Force false so the proxy keeps using the
+      # host-mapped 127.0.0.1:<ephemeral_port> URL, which IS reachable.
+      MOLECULE_IN_DOCKER: false
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
@@ -132,7 +138,29 @@ jobs:
           # jobs or stale processes from prior cancelled runs (see #2450).
           PORT=$(python3 -c "import socket; s=socket.socket(); s.bind(('', 0)); print(s.getsockname()[1]); s.close()")
           echo "PORT=${PORT}" >> "$GITHUB_ENV"
-          echo "BASE=http://localhost:${PORT}" >> "$GITHUB_ENV"
+          echo "BASE=http://127.0.0.1:${PORT}" >> "$GITHUB_ENV"
+          # Discover an IP that Docker containers can use to reach the host platform.
+          # host.docker.internal is not reliably available on Linux (act_runner), so
+          # workspace containers cannot resolve it and fail to register/heartbeat.
+          # Workspace containers join molecule-core-net; the host is reachable via that
+          # network's gateway. Ensure the network exists first (the provisioner creates
+          # it lazily, but we need the gateway BEFORE starting the platform).
+          docker network inspect molecule-core-net >/dev/null 2>&1 || docker network create molecule-core-net >/dev/null
+          # Parse Gateway from raw JSON because --format '{{.IPAM.Config}}' is
+          # inconsistent across Docker versions (sometimes omits Gateway field).
+          PLATFORM_HOST_IP=$(docker network inspect molecule-core-net 2>/dev/null | sed -n 's/.*"Gateway": "\([^"]*\)".*/\1/p' | head -1)
+          if [ -z "$PLATFORM_HOST_IP" ]; then
+            PLATFORM_HOST_IP=$(docker network inspect bridge 2>/dev/null | sed -n 's/.*"Gateway": "\([^"]*\)".*/\1/p' | head -1)
+          fi
+          if [ -z "$PLATFORM_HOST_IP" ]; then
+            PLATFORM_HOST_IP=$(ip route | awk '/default/ {print $3}' | head -1 || true)
+          fi
+          if [ -z "$PLATFORM_HOST_IP" ]; then
+            echo "::error::Could not determine PLATFORM_HOST_IP for Docker containers to reach the platform"
+            exit 1
+          fi
+          echo "PLATFORM_HOST_IP=${PLATFORM_HOST_IP}"
+          echo "PLATFORM_URL=http://${PLATFORM_HOST_IP}:${PORT}" >> "$GITHUB_ENV"
           # Deterministic admin token: the script sends MOLECULE_ADMIN_TOKEN as the
           # bearer; the platform checks ADMIN_TOKEN. Set both to the same value.
           T="lpe2e-admin-${{ github.run_id }}-${{ github.run_attempt }}"
@@ -173,8 +201,10 @@ jobs:
         run: |
           # Bind to the dynamically allocated port (see #2450).
           # DATABASE_URL/REDIS_URL/ADMIN_TOKEN/MOLECULE_ENV are inherited from
-          # $GITHUB_ENV.
-          PORT=$PORT ./platform-server > platform.log 2>&1 &
+          # $GITHUB_ENV. PLATFORM_URL is also passed explicitly because
+          # $GITHUB_ENV propagation can be flaky on act_runner (#2468 RCA).
+          echo "starting platform with PLATFORM_URL=${PLATFORM_URL:-<fallback>} PORT=$PORT BIND_ADDR=0.0.0.0"
+          PORT=$PORT BIND_ADDR=0.0.0.0 PLATFORM_URL="${PLATFORM_URL:-http://host.docker.internal:$PORT}" ./platform-server > platform.log 2>&1 &
           echo $! > platform.pid
 
       - name: Wait for /health (+ migrations applied)
@@ -198,12 +228,26 @@ jobs:
             sleep 1
           done
 
+      - name: Verify platform reachable from molecule-core-net
+        run: |
+          echo "Testing platform reachability from molecule-core-net container..."
+          docker run --rm --network molecule-core-net alpine:latest sh -c "wget -qO- http://${PLATFORM_URL#http://}/health" || echo "WARN: platform not reachable from molecule-core-net"
+
       - name: Run local-provision lifecycle E2E (stub — REQUIRED)
         run: bash tests/e2e/test_local_provision_lifecycle_e2e.sh
 
       - name: Dump platform log on failure
         if: failure()
         run: cat workspace-server/platform.log || true
+
+      - name: Dump workspace container logs on failure
+        if: failure()
+        run: |
+          WS_NAME=$(docker ps --filter "name=ws-" --format '{{.Names}}' | head -1 || true)
+          if [ -n "$WS_NAME" ]; then
+            echo "=== Workspace container logs for $WS_NAME ==="
+            docker logs "$WS_NAME" 2>&1 | tail -n 80 || true
+          fi
 
       - name: Stop platform
         if: always()
@@ -248,6 +292,12 @@ jobs:
       # even if the runner's $GITHUB_ENV propagation is flaky (#2468 RCA).
       MOLECULE_ENV: development
       SECRETS_ENCRYPTION_KEY: lpe2e-test-encryption-key-32bytes!!
+      # act_runner runs the job inside a Docker container, so /.dockerenv exists
+      # and the platform auto-detects platformInDocker=true. But the job container
+      # is NOT on molecule-core-net, so it cannot resolve workspace container
+      # hostnames (ws-<id>:8000). Force false so the proxy keeps using the
+      # host-mapped 127.0.0.1:<ephemeral_port> URL, which IS reachable.
+      MOLECULE_IN_DOCKER: false
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
@@ -297,7 +347,29 @@ jobs:
           # jobs or stale processes from prior cancelled runs (see #2450).
           PORT=$(python3 -c "import socket; s=socket.socket(); s.bind(('', 0)); print(s.getsockname()[1]); s.close()")
           echo "PORT=${PORT}" >> "$GITHUB_ENV"
-          echo "BASE=http://localhost:${PORT}" >> "$GITHUB_ENV"
+          echo "BASE=http://127.0.0.1:${PORT}" >> "$GITHUB_ENV"
+          # Discover an IP that Docker containers can use to reach the host platform.
+          # host.docker.internal is not reliably available on Linux (act_runner), so
+          # workspace containers cannot resolve it and fail to register/heartbeat.
+          # Workspace containers join molecule-core-net; the host is reachable via that
+          # network's gateway. Ensure the network exists first (the provisioner creates
+          # it lazily, but we need the gateway BEFORE starting the platform).
+          docker network inspect molecule-core-net >/dev/null 2>&1 || docker network create molecule-core-net >/dev/null
+          # Parse Gateway from raw JSON because --format '{{.IPAM.Config}}' is
+          # inconsistent across Docker versions (sometimes omits Gateway field).
+          PLATFORM_HOST_IP=$(docker network inspect molecule-core-net 2>/dev/null | sed -n 's/.*"Gateway": "\([^"]*\)".*/\1/p' | head -1)
+          if [ -z "$PLATFORM_HOST_IP" ]; then
+            PLATFORM_HOST_IP=$(docker network inspect bridge 2>/dev/null | sed -n 's/.*"Gateway": "\([^"]*\)".*/\1/p' | head -1)
+          fi
+          if [ -z "$PLATFORM_HOST_IP" ]; then
+            PLATFORM_HOST_IP=$(ip route | awk '/default/ {print $3}' | head -1 || true)
+          fi
+          if [ -z "$PLATFORM_HOST_IP" ]; then
+            echo "::error::Could not determine PLATFORM_HOST_IP for Docker containers to reach the platform"
+            exit 1
+          fi
+          echo "PLATFORM_HOST_IP=${PLATFORM_HOST_IP}"
+          echo "PLATFORM_URL=http://${PLATFORM_HOST_IP}:${PORT}" >> "$GITHUB_ENV"
           T="lpe2e-real-admin-${{ github.run_id }}-${{ github.run_attempt }}"
           echo "ADMIN_TOKEN=${T}" >> "$GITHUB_ENV"
           echo "MOLECULE_ADMIN_TOKEN=${T}" >> "$GITHUB_ENV"
@@ -329,7 +401,8 @@ jobs:
       - name: Start platform (background)
         working-directory: workspace-server
         run: |
-          PORT=$PORT ./platform-server > platform.log 2>&1 &
+          echo "starting platform with PLATFORM_URL=${PLATFORM_URL:-<fallback>} PORT=$PORT BIND_ADDR=0.0.0.0"
+          PORT=$PORT BIND_ADDR=0.0.0.0 PLATFORM_URL="${PLATFORM_URL:-http://host.docker.internal:$PORT}" ./platform-server > platform.log 2>&1 &
           echo $! > platform.pid
 
       - name: Wait for /health (+ migrations applied)
@@ -350,6 +423,11 @@ jobs:
             [ "$(( $(date +%s) - start ))" -ge "$DEADLINE" ] && { echo "::error::platform not healthy in ${DEADLINE}s"; cat workspace-server/platform.log || true; exit 1; }
             sleep 1
           done
+
+      - name: Verify platform reachable from molecule-core-net
+        run: |
+          echo "Testing platform reachability from molecule-core-net container..."
+          docker run --rm --network molecule-core-net alpine:latest sh -c "wget -qO- http://${PLATFORM_URL#http://}/health" || echo "WARN: platform not reachable from molecule-core-net"
 
       - name: Run local-provision lifecycle E2E (real image + MiniMax LLM — ADVISORY)
         env:
@@ -374,6 +452,15 @@ jobs:
       - name: Dump platform log on failure
         if: failure()
         run: cat workspace-server/platform.log || true
+
+      - name: Dump workspace container logs on failure
+        if: failure()
+        run: |
+          WS_NAME=$(docker ps --filter "name=ws-" --format '{{.Names}}' | head -1 || true)
+          if [ -n "$WS_NAME" ]; then
+            echo "=== Workspace container logs for $WS_NAME ==="
+            docker logs "$WS_NAME" 2>&1 | tail -n 80 || true
+          fi
 
       - name: Stop platform
         if: always()
