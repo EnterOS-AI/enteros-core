@@ -198,11 +198,7 @@ const (
 
 // ConfigVolumeName returns the Docker named volume for a workspace's configs.
 func ConfigVolumeName(workspaceID string) string {
-	id := workspaceID
-	if len(id) > 12 {
-		id = id[:12]
-	}
-	return fmt.Sprintf("ws-%s-configs", id)
+	return fmt.Sprintf("ws-%s-configs", workspaceID)
 }
 
 // ClaudeSessionVolumeName returns the Docker named volume for a workspace's
@@ -210,11 +206,7 @@ func ConfigVolumeName(workspaceID string) string {
 // config volume so it can be discarded independently (via WORKSPACE_RESET_SESSION
 // or ?reset=true) without wiping the user's config. Issue #12.
 func ClaudeSessionVolumeName(workspaceID string) string {
-	id := workspaceID
-	if len(id) > 12 {
-		id = id[:12]
-	}
-	return fmt.Sprintf("ws-%s-claude-sessions", id)
+	return fmt.Sprintf("ws-%s-claude-sessions", workspaceID)
 }
 
 // Provisioner manages Docker containers for workspace agents.
@@ -233,11 +225,7 @@ func New() (*Provisioner, error) {
 
 // ContainerName returns the Docker container name for a workspace.
 func ContainerName(workspaceID string) string {
-	id := workspaceID
-	if len(id) > 12 {
-		id = id[:12]
-	}
-	return fmt.Sprintf("ws-%s", id)
+	return fmt.Sprintf("ws-%s", workspaceID)
 }
 
 // containerNamePrefix is the shared prefix every workspace container

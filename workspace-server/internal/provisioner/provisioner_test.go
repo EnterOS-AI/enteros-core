@@ -425,7 +425,7 @@ func TestContainerName(t *testing.T) {
 	}{
 		{"short", "ws-short"},
 		{"exactly12ch", "ws-exactly12ch"},
-		{"longer-than-twelve-characters", "ws-longer-than-"},
+		{"longer-than-twelve-characters", "ws-longer-than-twelve-characters"},
 		{"abc", "ws-abc"},
 	}
 
@@ -437,6 +437,17 @@ func TestContainerName(t *testing.T) {
 	}
 }
 
+// TestContainerName_DistinctSamePrefix12 is a regression guard for KI-013:
+// two UUIDs sharing the same first 12 characters must produce distinct
+// container names (the old 12-char truncation caused collisions).
+func TestContainerName_DistinctSamePrefix12(t *testing.T) {
+	id1 := "123456789abc-4def-1234-567890abcdef"
+	id2 := "123456789abc-4def-1234-567890abcdf0"
+	if ContainerName(id1) == ContainerName(id2) {
+		t.Fatalf("ContainerName must differ for same-first-12 UUIDs: both = %q", ContainerName(id1))
+	}
+}
+
 // TestConfigVolumeName verifies config volume naming.
 func TestConfigVolumeName(t *testing.T) {
 	tests := []struct {
@@ -445,7 +456,7 @@ func TestConfigVolumeName(t *testing.T) {
 	}{
 		{"short", "ws-short-configs"},
 		{"exactly12ch", "ws-exactly12ch-configs"},
-		{"longer-than-twelve-characters", "ws-longer-than--configs"},
+		{"longer-than-twelve-characters", "ws-longer-than-twelve-characters-configs"},
 		{"abc", "ws-abc-configs"},
 	}
 
@@ -457,10 +468,19 @@ func TestConfigVolumeName(t *testing.T) {
 	}
 }
 
+// TestConfigVolumeName_DistinctSamePrefix12 is a regression guard for KI-013.
+func TestConfigVolumeName_DistinctSamePrefix12(t *testing.T) {
+	id1 := "123456789abc-4def-1234-567890abcdef"
+	id2 := "123456789abc-4def-1234-567890abcdf0"
+	if ConfigVolumeName(id1) == ConfigVolumeName(id2) {
+		t.Fatalf("ConfigVolumeName must differ for same-first-12 UUIDs: both = %q", ConfigVolumeName(id1))
+	}
+}
+
 // ---------- #12 — claude-sessions volume naming ----------
 
 // TestClaudeSessionVolumeName_Deterministic: same ID → same volume name, and
-// the name follows the ws-<id[:12]>-claude-sessions shape used everywhere
+// the name follows the ws-<id>-claude-sessions shape used everywhere
 // else in the provisioner.
 func TestClaudeSessionVolumeName_Deterministic(t *testing.T) {
 	tests := []struct {
@@ -469,7 +489,7 @@ func TestClaudeSessionVolumeName_Deterministic(t *testing.T) {
 	}{
 		{"short", "ws-short-claude-sessions"},
 		{"exactly12ch", "ws-exactly12ch-claude-sessions"},
-		{"longer-than-twelve-characters", "ws-longer-than--claude-sessions"},
+		{"longer-than-twelve-characters", "ws-longer-than-twelve-characters-claude-sessions"},
 		{"abc", "ws-abc-claude-sessions"},
 	}
 	for _, tt := range tests {
@@ -481,6 +501,15 @@ func TestClaudeSessionVolumeName_Deterministic(t *testing.T) {
 		if again := ClaudeSessionVolumeName(tt.id); again != got {
 			t.Errorf("ClaudeSessionVolumeName not deterministic: %q vs %q", got, again)
 		}
+	}
+}
+
+// TestClaudeSessionVolumeName_DistinctSamePrefix12 is a regression guard for KI-013.
+func TestClaudeSessionVolumeName_DistinctSamePrefix12(t *testing.T) {
+	id1 := "123456789abc-4def-1234-567890abcdef"
+	id2 := "123456789abc-4def-1234-567890abcdf0"
+	if ClaudeSessionVolumeName(id1) == ClaudeSessionVolumeName(id2) {
+		t.Fatalf("ClaudeSessionVolumeName must differ for same-first-12 UUIDs: both = %q", ClaudeSessionVolumeName(id1))
 	}
 }
 
