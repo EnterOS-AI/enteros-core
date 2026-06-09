@@ -198,6 +198,11 @@ const (
 
 // ConfigVolumeName returns the Docker named volume for a workspace's configs.
 func ConfigVolumeName(workspaceID string) string {
+	return fmt.Sprintf("ws-%s-configs", workspaceID)
+}
+
+// legacyConfigVolumeName returns the pre-KI-013 truncated config volume name.
+func legacyConfigVolumeName(workspaceID string) string {
 	id := workspaceID
 	if len(id) > 12 {
 		id = id[:12]
@@ -210,6 +215,11 @@ func ConfigVolumeName(workspaceID string) string {
 // config volume so it can be discarded independently (via WORKSPACE_RESET_SESSION
 // or ?reset=true) without wiping the user's config. Issue #12.
 func ClaudeSessionVolumeName(workspaceID string) string {
+	return fmt.Sprintf("ws-%s-claude-sessions", workspaceID)
+}
+
+// legacyClaudeSessionVolumeName returns the pre-KI-013 truncated session volume name.
+func legacyClaudeSessionVolumeName(workspaceID string) string {
 	id := workspaceID
 	if len(id) > 12 {
 		id = id[:12]
@@ -233,6 +243,12 @@ func New() (*Provisioner, error) {
 
 // ContainerName returns the Docker container name for a workspace.
 func ContainerName(workspaceID string) string {
+	return fmt.Sprintf("ws-%s", workspaceID)
+}
+
+// legacyContainerName returns the pre-KI-013 truncated container name.
+// Used only for backward-compatible lookups during the deploy transition.
+func legacyContainerName(workspaceID string) string {
 	id := workspaceID
 	if len(id) > 12 {
 		id = id[:12]
@@ -474,7 +490,9 @@ func (p *Provisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string, e
 		return "", ErrNoBackend
 	}
 	name := ContainerName(cfg.WorkspaceID)
-	configVolume := ConfigVolumeName(cfg.WorkspaceID)
+	// KI-013 deploy safety: prefer legacy truncated config volume if it
+	// already exists, so pre-deploy workspace data is not orphaned.
+	configVolume := p.resolveConfigVolumeName(ctx, cfg.WorkspaceID)
 
 	// Create named volume for configs (idempotent — no-op if already exists)
 	_, err := p.cli.VolumeCreate(ctx, volume.CreateOptions{
@@ -569,7 +587,9 @@ func (p *Provisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string, e
 	// remove the existing volume before recreating it, so the agent
 	// boots with a clean session dir.
 	if cfg.Runtime == "claude-code" {
-		claudeSessionsVolume := ClaudeSessionVolumeName(cfg.WorkspaceID)
+		// KI-013 deploy safety: prefer legacy truncated session volume if it
+		// already exists, so pre-deploy session data is not orphaned.
+		claudeSessionsVolume := p.resolveClaudeSessionVolumeName(ctx, cfg.WorkspaceID)
 		resetEnv, _ := strconv.ParseBool(cfg.EnvVars["WORKSPACE_RESET_SESSION"])
 		if cfg.ResetClaudeSession || resetEnv {
 			if rmErr := p.cli.VolumeRemove(ctx, claudeSessionsVolume, true); rmErr != nil {
@@ -1288,7 +1308,7 @@ func (p *Provisioner) WriteAuthTokenToVolume(ctx context.Context, workspaceID, t
 	if p == nil || p.cli == nil {
 		return ErrNoBackend
 	}
-	volName := ConfigVolumeName(workspaceID)
+	volName := p.resolveConfigVolumeName(ctx, workspaceID)
 	resp, err := p.cli.ContainerCreate(ctx, &container.Config{
 		Image: "alpine",
 		Cmd:   []string{"sh", "-c", writeAuthTokenVolumeCmd()},
@@ -1315,6 +1335,33 @@ func (p *Provisioner) WriteAuthTokenToVolume(ctx context.Context, workspaceID, t
 	return nil
 }
 
+// resolveConfigVolumeName returns the effective config volume name for a
+// workspace, preferring the legacy truncated name if that volume already
+// exists (KI-013 deploy safety: pre-deploy volumes must not be orphaned).
+func (p *Provisioner) resolveConfigVolumeName(ctx context.Context, workspaceID string) string {
+	if p == nil || p.cli == nil {
+		return ConfigVolumeName(workspaceID)
+	}
+	legacy := legacyConfigVolumeName(workspaceID)
+	if _, err := p.cli.VolumeInspect(ctx, legacy); err == nil {
+		return legacy
+	}
+	return ConfigVolumeName(workspaceID)
+}
+
+// resolveClaudeSessionVolumeName returns the effective claude-sessions volume
+// name, preferring the legacy truncated name if that volume already exists.
+func (p *Provisioner) resolveClaudeSessionVolumeName(ctx context.Context, workspaceID string) string {
+	if p == nil || p.cli == nil {
+		return ClaudeSessionVolumeName(workspaceID)
+	}
+	legacy := legacyClaudeSessionVolumeName(workspaceID)
+	if _, err := p.cli.VolumeInspect(ctx, legacy); err == nil {
+		return legacy
+	}
+	return ClaudeSessionVolumeName(workspaceID)
+}
+
 // RemoveVolume removes the config volume for a workspace.
 // Also removes the claude-sessions volume (best-effort, may not exist
 // for non claude-code runtimes). Issue #12.
@@ -1322,16 +1369,22 @@ func (p *Provisioner) RemoveVolume(ctx context.Context, workspaceID string) erro
 	if p == nil || p.cli == nil {
 		return ErrNoBackend
 	}
-	volName := ConfigVolumeName(workspaceID)
-	if err := p.cli.VolumeRemove(ctx, volName, true); err != nil {
-		return fmt.Errorf("failed to remove volume %s: %w", volName, err)
+	// KI-013 deploy safety: remove both new full-ID name and legacy
+	// truncated name if present, so pre-deploy volumes are not orphaned.
+	removed := false
+	for _, volName := range []string{ConfigVolumeName(workspaceID), legacyConfigVolumeName(workspaceID)} {
+		if err := p.cli.VolumeRemove(ctx, volName, true); err == nil {
+			log.Printf("Provisioner: removed config volume %s", volName)
+			removed = true
+		}
 	}
-	log.Printf("Provisioner: removed config volume %s", volName)
-	csName := ClaudeSessionVolumeName(workspaceID)
-	if rmErr := p.cli.VolumeRemove(ctx, csName, true); rmErr != nil {
-		log.Printf("Provisioner: claude-sessions volume cleanup warning for %s: %v", csName, rmErr)
-	} else {
-		log.Printf("Provisioner: removed claude-sessions volume %s", csName)
+	if !removed {
+		return fmt.Errorf("failed to remove config volume for %s", workspaceID)
+	}
+	for _, csName := range []string{ClaudeSessionVolumeName(workspaceID), legacyClaudeSessionVolumeName(workspaceID)} {
+		if rmErr := p.cli.VolumeRemove(ctx, csName, true); rmErr == nil {
+			log.Printf("Provisioner: removed claude-sessions volume %s", csName)
+		}
 	}
 	return nil
 }
@@ -1354,37 +1407,34 @@ func (p *Provisioner) Stop(ctx context.Context, workspaceID string) error {
 	if p == nil || p.cli == nil {
 		return ErrNoBackend
 	}
-	name := ContainerName(workspaceID)
-
-	// Force-remove kills and removes in one atomic operation, bypassing
-	// the restart policy entirely.
-	err := p.cli.ContainerRemove(ctx, name, container.RemoveOptions{Force: true})
-	if err == nil {
-		log.Printf("Provisioner: stopped and removed container %s", name)
-		return nil
+	// KI-013 deploy safety: try new full-ID name first, then fall back to
+	// the old truncated name so pre-deploy containers are still stoppable.
+	names := []string{ContainerName(workspaceID), legacyContainerName(workspaceID)}
+	for _, name := range names {
+		// Force-remove kills and removes in one atomic operation, bypassing
+		// the restart policy entirely.
+		err := p.cli.ContainerRemove(ctx, name, container.RemoveOptions{Force: true})
+		if err == nil {
+			log.Printf("Provisioner: stopped and removed container %s", name)
+			return nil
+		}
+		if isContainerNotFound(err) {
+			// Try the next name (legacy fallback). If both miss, the
+			// container is genuinely gone — post-condition satisfied.
+			continue
+		}
+		if isRemovalInProgress(err) {
+			// Another concurrent caller is already removing this container.
+			log.Printf("Provisioner: container %s removal already in progress (no-op)", name)
+			return nil
+		}
+		// Real failure: daemon timeout, socket EOF, ctx cancellation, etc.
+		log.Printf("Provisioner: force-remove failed for %s: %v", name, err)
+		return fmt.Errorf("force-remove %s: %w", name, err)
 	}
-	if isContainerNotFound(err) {
-		// Container was already gone — the post-condition we want is
-		// satisfied. Don't surface as an error.
-		log.Printf("Provisioner: container %s already gone (no-op)", name)
-		return nil
-	}
-	if isRemovalInProgress(err) {
-		// Another concurrent caller (orphan sweeper, sibling cascade
-		// delete, manual `docker rm -f`) is already removing this
-		// container. The post-condition is the same as success: the
-		// container WILL be gone shortly. Surfacing this as a 500 on
-		// cascade-delete causes UI confusion ("workspace marked
-		// removed, but stop call(s) failed — please retry") even
-		// though retrying would just race the same in-flight removal.
-		log.Printf("Provisioner: container %s removal already in progress (no-op)", name)
-		return nil
-	}
-	// Real failure: daemon timeout, socket EOF, ctx cancellation, etc.
-	// Caller (workspace_crud.stopAndRemove, orphan_sweeper.sweepOnce)
-	// must propagate this so they can skip the follow-up RemoveVolume.
-	log.Printf("Provisioner: force-remove failed for %s: %v", name, err)
-	return fmt.Errorf("force-remove %s: %w", name, err)
+	// Both names missed — container was already gone.
+	log.Printf("Provisioner: container %s already gone (no-op)", ContainerName(workspaceID))
+	return nil
 }
 
 // IsRunning checks if a workspace container is currently running.
@@ -1444,16 +1494,20 @@ func RunningContainerName(ctx context.Context, cli *client.Client, workspaceID s
 	if cli == nil {
 		return "", ErrNoBackend
 	}
-	name := ContainerName(workspaceID)
-	info, err := cli.ContainerInspect(ctx, name)
-	if err != nil {
-		if isContainerNotFound(err) {
-			return "", nil
+	// KI-013 deploy safety: new full-ID name first, then fall back to the
+	// old truncated name so pre-deploy containers are still discoverable.
+	names := []string{ContainerName(workspaceID), legacyContainerName(workspaceID)}
+	for _, name := range names {
+		info, err := cli.ContainerInspect(ctx, name)
+		if err != nil {
+			if isContainerNotFound(err) {
+				continue
+			}
+			return "", err
 		}
-		return "", err
-	}
-	if info.State.Running {
-		return name, nil
+		if info.State.Running {
+			return name, nil
+		}
 	}
 	return "", nil
 }
