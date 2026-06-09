@@ -164,6 +164,7 @@ func (h *WorkspaceHandler) Update(c *gin.Context) {
 		}
 	}
 	var computeJSON string
+	var newComputeProvider string // hoisted: drives the cloud-provider switch detection below
 	computePatch := false
 	if rawCompute, ok := body["compute"]; ok {
 		computePatch = true
@@ -184,6 +185,7 @@ func (h *WorkspaceHandler) Update(c *gin.Context) {
 				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 				return
 			}
+			newComputeProvider = compute.Provider
 			encoded, err := workspaceComputeJSON(compute)
 			if err != nil {
 				log.Printf("Update compute encode error for %s: %v", id, err)
@@ -262,6 +264,55 @@ func (h *WorkspaceHandler) Update(c *gin.Context) {
 		needsRestart = true
 	}
 	if computePatch {
+		// Cloud-provider SWITCH (in-place): if the incoming provider differs from
+		// the one currently stored, the existing box lives on the OLD cloud. We
+		// MUST deprovision it on the OLD provider BEFORE overwriting compute —
+		// otherwise the subsequent "Save & Restart" restart's provider-aware
+		// deprovision (cpProv.Stop → resolveProvider reads compute->>'provider')
+		// would target the NEW cloud and ORPHAN the old box (a silently-billing
+		// leak). Cloud mode only (the local Docker provisioner has no cross-cloud
+		// concept; provider stays "" there so this never fires). After this, the
+		// canvas's restart provisions the box on the new cloud; its own Stop is a
+		// safe no-op (the box is already gone).
+		if h.cpProv != nil {
+			var oldProvider sql.NullString
+			err := db.DB.QueryRowContext(ctx, `SELECT compute->>'provider' FROM workspaces WHERE id = $1`, id).Scan(&oldProvider)
+			// FAIL-CLOSED on the read. The earlier `err == nil` gate was fail-OPEN:
+			// a transient/unexpected DB error here skipped the whole switch block and
+			// fell through to the compute UPDATE — so during a real switch the later
+			// provider-aware restart deprovision would target the NEW cloud and ORPHAN
+			// the old box (silent billing, unrecoverable). We cannot tell whether this
+			// is a cross-cloud switch without the old provider, so on any error other
+			// than "no such row" we abort exactly like a failed deprovision: compute
+			// untouched, old box still recoverable, user retries. (sql.ErrNoRows means
+			// there is genuinely no prior box — nothing to orphan — so it's safe to
+			// skip the switch and let the UPDATE proceed.)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				log.Printf("Update: provider-switch precheck for %s ABORTED — could not read current cloud provider (provider left unchanged): %v", id, err)
+				c.JSON(http.StatusBadGateway, gin.H{"error": "could not read the current cloud provider; provider unchanged — please retry"})
+				return
+			}
+			if err == nil && normalizeCloudProvider(oldProvider.String) != normalizeCloudProvider(newComputeProvider) {
+				log.Printf("Update: cloud-provider switch for %s: %q -> %q; deprovisioning old box on old provider before overwriting compute",
+					id, normalizeCloudProvider(oldProvider.String), normalizeCloudProvider(newComputeProvider))
+				// Use the ERROR-returning variant and ABORT before overwriting
+				// compute if the old-box deprovision fails. If we proceeded, the
+				// old box would keep running on the OLD cloud while the row now
+				// records the NEW provider+instance — stranding it with no DB
+				// pointer (an UNRECOVERABLE cross-cloud orphan that no reconciler
+				// can map back). Aborting leaves the row pointing at the
+				// still-recoverable old box; the user can retry the switch. (The
+				// restart paths' void cpStopWithRetry is fine there because the
+				// box stays on the SAME cloud, so the provider record is unchanged
+				// and a provider-scoped sweep can still find it.)
+				if err := h.cpStopWithRetryErr(ctx, id, "provider-switch", false); err != nil {
+					log.Printf("Update: provider-switch for %s ABORTED — could not deprovision old box on %q (provider left unchanged, old box recoverable): %v",
+						id, normalizeCloudProvider(oldProvider.String), err)
+					c.JSON(http.StatusBadGateway, gin.H{"error": "could not deprovision the current cloud box; provider unchanged — please retry"})
+					return
+				}
+			}
+		}
 		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET compute = $2::jsonb, updated_at = now() WHERE id = $1`, id, computeJSON); err != nil {
 			log.Printf("Update compute error for %s: %v", id, err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save compute config"})

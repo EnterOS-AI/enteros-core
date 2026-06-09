@@ -23,6 +23,13 @@ vi.mock("@/store/canvas", () => ({
   ),
 }));
 
+// SaaS so the editable cloud-provider selector renders (non-SaaS shows a read-only
+// badge). Existing tests keep provider=aws (default), which is omitted from the
+// PATCH payload, so their assertions are unaffected.
+vi.mock("@/lib/tenant", () => ({
+  isSaaSTenant: () => true,
+}));
+
 import { ContainerConfigTab } from "../ContainerConfigTab";
 
 afterEach(() => {
@@ -313,5 +320,68 @@ describe("ContainerConfigTab", () => {
 
     await waitFor(() => expect(restartWorkspace).toHaveBeenCalledWith("ws-compute", { applyTemplate: true }));
     expect(apiPatch).not.toHaveBeenCalled();
+  });
+
+  it("switches cloud provider — keys the instance-type list to the provider, confirms the recreate, and PATCHes the new provider", async () => {
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+    render(
+      <ContainerConfigTab
+        workspaceId="ws-switch"
+        data={{
+          runtime: "claude-code",
+          status: "online",
+          needsRestart: false,
+          activeTasks: 0,
+          maxConcurrentTasks: null,
+          workspaceAccess: "read-write",
+          deliveryMode: "push",
+          compute: { instance_type: "t3.large", provider: "aws", volume: { root_gb: 30 } },
+        }}
+      />,
+    );
+
+    const providerSel = screen.getByLabelText("Cloud provider");
+    expect(providerSel).toHaveProperty("value", "aws");
+    expect(screen.getByLabelText("Instance type")).toHaveProperty("value", "t3.large");
+
+    // Switch to Hetzner → the instance type resets to the Hetzner default (an AWS
+    // t3.* is invalid on Hetzner) and the options become Hetzner sizes.
+    fireEvent.change(providerSel, { target: { value: "hetzner" } });
+    expect(screen.getByLabelText("Instance type")).toHaveProperty("value", "cpx31");
+
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(apiPatch).toHaveBeenCalledTimes(1));
+    expect(confirmSpy).toHaveBeenCalled(); // destructive recreate confirmed
+    const body = apiPatch.mock.calls[0][1] as { compute: { provider?: string; instance_type?: string } };
+    expect(body.compute.provider).toBe("hetzner");
+    expect(body.compute.instance_type).toBe("cpx31");
+    confirmSpy.mockRestore();
+  });
+
+  it("does not treat a non-provider edit as a recreate (no confirm; aws default omitted)", async () => {
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+    render(
+      <ContainerConfigTab
+        workspaceId="ws-noswitch"
+        data={{
+          runtime: "claude-code",
+          status: "online",
+          needsRestart: false,
+          activeTasks: 0,
+          maxConcurrentTasks: null,
+          workspaceAccess: "read-write",
+          deliveryMode: "push",
+          compute: { instance_type: "t3.large", provider: "aws", volume: { root_gb: 30 } },
+        }}
+      />,
+    );
+
+    fireEvent.change(screen.getByLabelText("Root volume"), { target: { value: "60" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(apiPatch).toHaveBeenCalledTimes(1));
+    expect(confirmSpy).not.toHaveBeenCalled();
+    const body = apiPatch.mock.calls[0][1] as { compute: { provider?: string } };
+    expect(body.compute.provider).toBeUndefined(); // aws default omitted (wire unchanged)
+    confirmSpy.mockRestore();
   });
 });
