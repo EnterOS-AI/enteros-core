@@ -234,6 +234,13 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		// this specific workspace, or a control-plane-verified tenant session.
 		wsAuth.PATCH("", wh.Update)
 
+		// Compute options — SSOT for the canvas Container-Config tab's cloud-
+		// provider + instance-type dropdowns (core#2489). Returns the same
+		// provider/instance metadata validateWorkspaceCompute enforces, so the UI
+		// can never offer a (provider, instance-type) the PATCH then rejects with
+		// a 400. Static (derived from the in-binary allowlist) — no DB round-trip.
+		wsAuth.GET("/compute-options", wh.ComputeOptions)
+
 		// Lifecycle
 		wsAuth.GET("/state", wh.State)
 		wsAuth.POST("/restart", wh.Restart)

@@ -375,6 +375,103 @@ func TestWithStoredCompute_LoadsComputeForRestartPayloads(t *testing.T) {
 	}
 }
 
+// core#2489: the allowlist (validation set) MUST be derived from the ordered
+// lists the canvas renders, so the UI and the backend can never disagree about
+// which (provider, instance-type) pairs are valid. This pins that the derived
+// set exactly matches the ordered source — adding to one without the other fails.
+func TestComputeOptions_AllowlistDerivedFromOrderedSSOT(t *testing.T) {
+	// Every ordered instance type is in the validation set (and vice-versa).
+	for provider, types := range workspaceComputeInstanceTypesOrdered {
+		set, ok := workspaceComputeInstanceAllowlist[provider]
+		if !ok {
+			t.Fatalf("allowlist missing provider %q present in ordered SSOT", provider)
+		}
+		if len(set) != len(types) {
+			t.Fatalf("provider %q: ordered list (%d) and allowlist set (%d) drifted", provider, len(types), len(set))
+		}
+		for _, it := range types {
+			if _, ok := set[it]; !ok {
+				t.Fatalf("provider %q: ordered instance %q missing from validation allowlist", provider, it)
+			}
+		}
+	}
+	// No extra providers in the set that aren't in the ordered list.
+	if len(workspaceComputeInstanceAllowlist) != len(workspaceComputeInstanceTypesOrdered) {
+		t.Fatalf("allowlist has providers not present in the ordered SSOT")
+	}
+	// Provider allowlist derived from the ordered providers.
+	if len(workspaceComputeProviderAllowlist) != len(workspaceComputeProvidersOrdered) {
+		t.Fatalf("provider allowlist (%d) drifted from ordered providers (%d)", len(workspaceComputeProviderAllowlist), len(workspaceComputeProvidersOrdered))
+	}
+	for _, p := range workspaceComputeProvidersOrdered {
+		if _, ok := workspaceComputeProviderAllowlist[p]; !ok {
+			t.Fatalf("provider allowlist missing ordered provider %q", p)
+		}
+	}
+}
+
+// core#2489: the per-provider defaults the canvas pre-selects on a provider switch
+// MUST themselves be valid instance types for that provider — otherwise the switch
+// produces a PATCH the backend immediately rejects.
+func TestComputeOptions_DefaultsAreValidForTheirProvider(t *testing.T) {
+	for provider, def := range workspaceComputeDefaultInstanceByProvider {
+		if !instanceTypeAllowedForProvider(provider, def) {
+			t.Errorf("default instance %q for provider %q is not in that provider's allowlist", def, provider)
+		}
+	}
+	// Every provider must have a default (so the switch never lands on "").
+	for _, p := range workspaceComputeProvidersOrdered {
+		if workspaceComputeDefaultInstanceByProvider[p] == "" {
+			t.Errorf("provider %q has no default instance type", p)
+		}
+	}
+}
+
+// core#2489: the GET /compute-options endpoint returns exactly the SSOT data the
+// canvas renders dropdowns from. Every (provider, instance-type) it advertises
+// MUST pass validateWorkspaceCompute — the whole point of the consolidation.
+func TestWorkspaceComputeOptions_ReturnsSSOTAndEveryOptionValidates(t *testing.T) {
+	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-opts"}}
+	c.Request = httptest.NewRequest("GET", "/workspaces/ws-opts/compute-options", nil)
+
+	handler.ComputeOptions(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp workspaceComputeOptionsResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to parse compute-options response: %v", err)
+	}
+
+	// AWS first (default) in the provider order.
+	if len(resp.Providers) == 0 || resp.Providers[0] != "aws" {
+		t.Fatalf("providers = %v, want aws first", resp.Providers)
+	}
+	// Every advertised (provider, instance-type) must pass backend validation.
+	for _, provider := range resp.Providers {
+		types, ok := resp.InstanceTypes[provider]
+		if !ok || len(types) == 0 {
+			t.Fatalf("compute-options advertised provider %q with no instance types", provider)
+		}
+		for _, it := range types {
+			if !instanceTypeAllowedForProvider(provider, it) {
+				t.Errorf("compute-options advertised %q/%q which the backend rejects (DRIFT)", provider, it)
+			}
+		}
+		def := resp.Defaults[provider]
+		if def == "" {
+			t.Errorf("compute-options missing default for provider %q", provider)
+		} else if !instanceTypeAllowedForProvider(provider, def) {
+			t.Errorf("compute-options default %q for %q fails backend validation", def, provider)
+		}
+	}
+}
+
 func TestWorkspaceDisplay_NonDisplayWorkspaceReturnsUnavailable(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)

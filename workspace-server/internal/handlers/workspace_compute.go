@@ -31,26 +31,70 @@ type workspaceDisplayResponse struct {
 	Status    string `json:"status,omitempty"`
 }
 
-// workspaceComputeInstanceAllowlist is keyed by cloud provider (multi-provider /
-// in-place switch): each provider's box accepts only that provider's machine
-// sizes (an AWS t3.* is meaningless on Hetzner, and vice-versa). Mirrors the CP
-// provider SSOT — keep in lock-step with the controlplane provider configs
-// (Hetzner ServerType cpx*/cax*, GCP MachineType e2-*, AWS EC2 t3*/m6i*/c6i*).
-// TestValidateWorkspaceCompute_Provider / _InstanceTypePerProvider pin the sets.
-// "" provider = AWS default.
-var workspaceComputeInstanceAllowlist = map[string]map[string]struct{}{
+// SSOT for cloud-provider + instance-type metadata (core#2489).
+//
+// This file is the SINGLE source of truth the workspace-server validates
+// against AND the canvas Container-Config tab renders its dropdowns from (via
+// GET /workspaces/:id/compute-options, see ComputeOptions below). Previously the
+// canvas hardcoded a parallel copy of these lists in ContainerConfigTab.tsx; the
+// two could drift so the UI offered a (provider, instance-type) the backend
+// allowlist then rejected with a 400. The canvas now derives its options from
+// this endpoint, so drift is impossible by construction.
+//
+// The ordered slices below are the canonical form. workspaceComputeInstanceAllowlist
+// (the O(1) validation set) is DERIVED from them in init(), so the ordered list
+// the canvas renders and the set the backend validates can never disagree.
+//
+// Mirrors the CP provider SSOT — keep in lock-step with the controlplane provider
+// configs (Hetzner ServerType cpx*/cax*, GCP MachineType e2-*, AWS EC2
+// t3*/m6i*/c6i*). TestValidateWorkspaceCompute_Provider / _InstanceTypePerProvider
+// pin the sets. "" provider = AWS default.
+
+// workspaceComputeProvidersOrdered is the canonical provider order (AWS first =
+// default). The canvas renders the provider dropdown in this order.
+var workspaceComputeProvidersOrdered = []string{"aws", "hetzner", "gcp"}
+
+// workspaceComputeInstanceTypesOrdered lists each provider's machine sizes in the
+// order the canvas should render them. An AWS t3.* is meaningless on Hetzner, and
+// vice-versa, so the set is provider-scoped.
+var workspaceComputeInstanceTypesOrdered = map[string][]string{
 	"aws": {
-		"t3.medium": {}, "t3.large": {}, "t3.xlarge": {}, "t3.2xlarge": {},
-		"m6i.large": {}, "m6i.xlarge": {}, "c6i.xlarge": {},
+		"t3.medium", "t3.large", "t3.xlarge", "t3.2xlarge",
+		"m6i.large", "m6i.xlarge", "c6i.xlarge",
 	},
 	"hetzner": {
-		"cpx11": {}, "cpx21": {}, "cpx31": {}, "cpx41": {}, "cpx51": {},
-		"cax11": {}, "cax21": {}, "cax31": {}, "cax41": {},
+		"cpx11", "cpx21", "cpx31", "cpx41", "cpx51",
+		"cax11", "cax21", "cax31", "cax41",
 	},
 	"gcp": {
-		"e2-small": {}, "e2-medium": {},
-		"e2-standard-2": {}, "e2-standard-4": {}, "e2-standard-8": {},
+		"e2-small", "e2-medium",
+		"e2-standard-2", "e2-standard-4", "e2-standard-8",
 	},
+}
+
+// workspaceComputeDefaultInstanceByProvider is the per-provider default machine
+// size the canvas pre-selects when switching providers (an AWS t3.* is invalid on
+// Hetzner, so the switch resets to the new provider's default).
+var workspaceComputeDefaultInstanceByProvider = map[string]string{
+	"aws":     "t3.medium",
+	"hetzner": "cpx31",
+	"gcp":     "e2-standard-2",
+}
+
+// workspaceComputeInstanceAllowlist is the O(1) validation set, keyed by cloud
+// provider. DERIVED from workspaceComputeInstanceTypesOrdered in init() so the
+// ordered list (what the canvas renders) and the set (what the backend validates)
+// stay in lock-step — you cannot add an instance type to one without the other.
+var workspaceComputeInstanceAllowlist = map[string]map[string]struct{}{}
+
+func init() {
+	for provider, types := range workspaceComputeInstanceTypesOrdered {
+		set := make(map[string]struct{}, len(types))
+		for _, t := range types {
+			set[t] = struct{}{}
+		}
+		workspaceComputeInstanceAllowlist[provider] = set
+	}
 }
 
 // normalizeCloudProvider maps "" → "aws" so the in-place switch comparison
@@ -88,10 +132,15 @@ func instanceTypeAllowedForProvider(provider, instanceType string) bool {
 // change here (and the CP itself fail-closes an unwired provider with a 422).
 // "" = default (AWS) and is always accepted. This is the gate the switch-provider
 // flow reuses to reject a bad provider with a clean 400 before any CP round-trip.
-var workspaceComputeProviderAllowlist = map[string]struct{}{
-	"aws":     {},
-	"gcp":     {},
-	"hetzner": {},
+// DERIVED from workspaceComputeProvidersOrdered (the SSOT, core#2489) in init() so
+// the set the backend validates and the ordered list the canvas renders cannot
+// drift.
+var workspaceComputeProviderAllowlist = map[string]struct{}{}
+
+func init() {
+	for _, p := range workspaceComputeProvidersOrdered {
+		workspaceComputeProviderAllowlist[p] = struct{}{}
+	}
 }
 
 func validateWorkspaceCompute(compute models.WorkspaceCompute) error {
@@ -260,6 +309,55 @@ func withStoredCompute(ctx context.Context, workspaceID string, payload models.C
 	}
 	payload.Compute = compute
 	return payload
+}
+
+// workspaceComputeOptionsResponse is the SSOT payload the canvas Container-Config
+// tab consumes to populate its provider + instance-type dropdowns (core#2489).
+// It is derived entirely from the allowlist + defaults in this file, so the UI
+// can never offer a (provider, instance-type) the backend then rejects.
+type workspaceComputeOptionsResponse struct {
+	// Providers in canonical render order (AWS first = default).
+	Providers []string `json:"providers"`
+	// InstanceTypes per provider, in canonical render order.
+	InstanceTypes map[string][]string `json:"instanceTypes"`
+	// Defaults maps each provider → its default instance type (the canvas
+	// pre-selects this when switching providers).
+	Defaults map[string]string `json:"defaults"`
+}
+
+// buildComputeOptions assembles the SSOT response from the allowlist + defaults.
+// Pure (no DB / no gin) so it can be unit-tested directly and reused.
+func buildComputeOptions() workspaceComputeOptionsResponse {
+	providers := make([]string, len(workspaceComputeProvidersOrdered))
+	copy(providers, workspaceComputeProvidersOrdered)
+
+	instanceTypes := make(map[string][]string, len(workspaceComputeInstanceTypesOrdered))
+	for _, p := range providers {
+		src := workspaceComputeInstanceTypesOrdered[p]
+		dst := make([]string, len(src))
+		copy(dst, src)
+		instanceTypes[p] = dst
+	}
+
+	defaults := make(map[string]string, len(workspaceComputeDefaultInstanceByProvider))
+	for k, v := range workspaceComputeDefaultInstanceByProvider {
+		defaults[k] = v
+	}
+
+	return workspaceComputeOptionsResponse{
+		Providers:     providers,
+		InstanceTypes: instanceTypes,
+		Defaults:      defaults,
+	}
+}
+
+// ComputeOptions handles GET /workspaces/:id/compute-options. It returns the
+// cloud-provider + instance-type metadata the canvas Container-Config tab renders
+// its dropdowns from — the SAME data validateWorkspaceCompute enforces (core#2489).
+// Static (derived from the in-binary allowlist), so it needs no DB round-trip; the
+// :id is scoped only by the WorkspaceAuth middleware on the route group.
+func (h *WorkspaceHandler) ComputeOptions(c *gin.Context) {
+	c.JSON(200, buildComputeOptions())
 }
 
 // Display handles GET /workspaces/:id/display.
