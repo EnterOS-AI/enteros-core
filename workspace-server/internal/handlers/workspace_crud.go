@@ -164,6 +164,7 @@ func (h *WorkspaceHandler) Update(c *gin.Context) {
 		}
 	}
 	var computeJSON string
+	var newComputeProvider string // hoisted: drives the cloud-provider switch detection below
 	computePatch := false
 	if rawCompute, ok := body["compute"]; ok {
 		computePatch = true
@@ -184,6 +185,7 @@ func (h *WorkspaceHandler) Update(c *gin.Context) {
 				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 				return
 			}
+			newComputeProvider = compute.Provider
 			encoded, err := workspaceComputeJSON(compute)
 			if err != nil {
 				log.Printf("Update compute encode error for %s: %v", id, err)
@@ -262,6 +264,26 @@ func (h *WorkspaceHandler) Update(c *gin.Context) {
 		needsRestart = true
 	}
 	if computePatch {
+		// Cloud-provider SWITCH (in-place): if the incoming provider differs from
+		// the one currently stored, the existing box lives on the OLD cloud. We
+		// MUST deprovision it on the OLD provider BEFORE overwriting compute —
+		// otherwise the subsequent "Save & Restart" restart's provider-aware
+		// deprovision (cpProv.Stop → resolveProvider reads compute->>'provider')
+		// would target the NEW cloud and ORPHAN the old box (a silently-billing
+		// leak). Cloud mode only (the local Docker provisioner has no cross-cloud
+		// concept; provider stays "" there so this never fires). After this, the
+		// canvas's restart provisions the box on the new cloud; its own Stop is a
+		// safe no-op (the box is already gone).
+		if h.cpProv != nil {
+			var oldProvider sql.NullString
+			if err := db.DB.QueryRowContext(ctx, `SELECT compute->>'provider' FROM workspaces WHERE id = $1`, id).Scan(&oldProvider); err == nil {
+				if normalizeCloudProvider(oldProvider.String) != normalizeCloudProvider(newComputeProvider) {
+					log.Printf("Update: cloud-provider switch for %s: %q -> %q; deprovisioning old box on old provider before overwriting compute",
+						id, normalizeCloudProvider(oldProvider.String), normalizeCloudProvider(newComputeProvider))
+					h.cpStopWithRetry(ctx, id, "provider-switch")
+				}
+			}
+		}
 		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET compute = $2::jsonb, updated_at = now() WHERE id = $1`, id, computeJSON); err != nil {
 			log.Printf("Update compute error for %s: %v", id, err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save compute config"})

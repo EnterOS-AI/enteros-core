@@ -3,13 +3,36 @@
 import { useEffect, useMemo, useState } from "react";
 import { api } from "@/lib/api";
 import { runtimeDisplayName } from "@/lib/runtime-names";
+import { isSaaSTenant } from "@/lib/tenant";
 import { useCanvasStore, type WorkspaceNodeData } from "@/store/canvas";
 import type { WorkspaceCompute } from "@/store/socket";
 
-const INSTANCE_TYPES = ["t3.medium", "t3.large", "t3.xlarge", "t3.2xlarge", "m6i.large", "m6i.xlarge", "c6i.xlarge"];
+// Machine sizes keyed by cloud provider — an AWS t3.* is meaningless on Hetzner,
+// etc. MUST mirror the workspace-server workspaceComputeInstanceAllowlist (which
+// mirrors the CP provider configs); the PATCH validation rejects a mismatch 400.
+const INSTANCE_TYPES_BY_PROVIDER: Record<string, string[]> = {
+  aws: ["t3.medium", "t3.large", "t3.xlarge", "t3.2xlarge", "m6i.large", "m6i.xlarge", "c6i.xlarge"],
+  hetzner: ["cpx11", "cpx21", "cpx31", "cpx41", "cpx51", "cax11", "cax21", "cax31", "cax41"],
+  gcp: ["e2-small", "e2-medium", "e2-standard-2", "e2-standard-4", "e2-standard-8"],
+};
+const DEFAULT_INSTANCE_BY_PROVIDER: Record<string, string> = {
+  aws: "t3.medium", hetzner: "cpx31", gcp: "e2-standard-2",
+};
+const normalizeProvider = (p?: string): string => (p === "gcp" || p === "hetzner" ? p : "aws");
+const instanceTypesForProvider = (p?: string): string[] =>
+  INSTANCE_TYPES_BY_PROVIDER[normalizeProvider(p)] ?? INSTANCE_TYPES_BY_PROVIDER.aws;
+const defaultInstanceForProvider = (p?: string): string =>
+  DEFAULT_INSTANCE_BY_PROVIDER[normalizeProvider(p)] ?? "t3.medium";
+
+// Editable cloud-provider options (multi-provider RFC) — mirrors CreateWorkspaceDialog.
+const CLOUD_PROVIDER_OPTIONS = [
+  { value: "aws", label: "AWS (default)" },
+  { value: "gcp", label: "GCP" },
+  { value: "hetzner", label: "Hetzner" },
+];
+
 const RUNTIME_OPTIONS = ["claude-code", "codex", "hermes", "openclaw", "kimi", "kimi-cli", "external"];
 const RESOLUTIONS = ["1280x720", "1440x900", "1920x1080", "2560x1440"];
-const DEFAULT_HEADLESS_INSTANCE_TYPE = "t3.medium";
 const DEFAULT_HEADLESS_ROOT_GB = 30;
 
 type Props = {
@@ -23,6 +46,7 @@ type Props = {
 
 type FormState = {
   runtime: string;
+  provider: string; // cloud backend; editable in SaaS (in-place switch recreates the box)
   instanceType: string;
   rootGB: string;
   displayEnabled: boolean;
@@ -38,16 +62,16 @@ const DATA_PERSISTENCE_OPTIONS = ["", "persist", "ephemeral"];
 const dataPersistenceLabel = (v: string): string =>
   v === "persist" ? "Always keep (persist)" : v === "ephemeral" ? "Don't keep (ephemeral)" : "Auto";
 
-// Cloud/compute backend display name. The provider is chosen at create time and
-// is NOT editable here (changing a workspace's cloud requires a recreate), so
-// it renders as a read-only badge — but we must preserve it across Save (the
-// compute payload is rebuilt below, and dropping it would wipe the column).
+// Cloud/compute backend display name (read-only fallback for non-SaaS / legacy).
 const cloudProviderLabel = (v: string | undefined): string =>
   v === "gcp" ? "GCP" : v === "hetzner" ? "Hetzner" : "AWS";
 
 export function ContainerConfigTab({ workspaceId, data }: Props) {
+  // Provider is editable only in SaaS (CP-provisioned boxes). Local/Docker has no
+  // cloud-provider concept, so we keep the read-only badge there.
+  const isSaaS = useMemo(() => isSaaSTenant(), []);
   const runtime = data.runtime;
-  const provider = data.compute?.provider; // read-only; set at create time
+  const provider = data.compute?.provider;
   const instanceType = data.compute?.instance_type;
   const rootGB = data.compute?.volume?.root_gb;
   const displayMode = data.compute?.display?.mode;
@@ -56,8 +80,8 @@ export function ContainerConfigTab({ workspaceId, data }: Props) {
   const displayHeight = data.compute?.display?.height;
   const dataPersistence = data.compute?.data_persistence;
   const initial = useMemo(
-    () => formFromData({ runtime, instanceType, rootGB, displayMode, displayProtocol, displayWidth, displayHeight, dataPersistence }),
-    [runtime, instanceType, rootGB, displayMode, displayProtocol, displayWidth, displayHeight, dataPersistence],
+    () => formFromData({ runtime, provider, instanceType, rootGB, displayMode, displayProtocol, displayWidth, displayHeight, dataPersistence }),
+    [runtime, provider, instanceType, rootGB, displayMode, displayProtocol, displayWidth, displayHeight, dataPersistence],
   );
   const [form, setForm] = useState<FormState>(initial);
   const [saving, setSaving] = useState(false);
@@ -87,6 +111,21 @@ export function ContainerConfigTab({ workspaceId, data }: Props) {
     try {
       let applyTemplateOnRestart = data.applyTemplateOnRestart ?? false;
       if (dirty) {
+        // In-place cloud switch is DESTRUCTIVE: changing the provider recreates the
+        // box on the new cloud (the workspace-server deprovisions the old box on
+        // its old cloud first, then the restart provisions on the new one). Confirm
+        // before doing it — the current box and any non-persisted state are lost.
+        const providerChanged = normalizeProvider(form.provider) !== normalizeProvider(initial.provider);
+        if (providerChanged && typeof window !== "undefined") {
+          const ok = window.confirm(
+            `Switch this workspace to ${cloudProviderLabel(form.provider)}? This RECREATES the box on the new cloud — the current box and any non-persisted state are replaced.`,
+          );
+          if (!ok) {
+            setSaving(false);
+            return;
+          }
+        }
+
         const rootGB = parseInt(form.rootGB, 10);
         if (!Number.isFinite(rootGB)) {
           setError("Root volume must be a number");
@@ -102,10 +141,11 @@ export function ContainerConfigTab({ workspaceId, data }: Props) {
             : { mode: "none" },
           // internal#734: omit when "auto" so the wire/default behavior is unchanged.
           ...(form.dataPersistence ? { data_persistence: form.dataPersistence } : {}),
-          // Preserve the create-time cloud provider — it's not editable here, but
-          // this PATCH rebuilds the whole compute object, so omitting it would
-          // wipe the persisted provider (and mislead the badge after a Save).
-          ...(provider ? { provider } : {}),
+          // Cloud backend: send the (possibly switched) provider. Omit for the
+          // default (aws) so a non-switching AWS save keeps the wire unchanged;
+          // a switch TO aws (omit) vs FROM aws (explicit) both register correctly
+          // because the workspace-server normalizes ""→aws when diffing.
+          ...(normalizeProvider(form.provider) !== "aws" ? { provider: normalizeProvider(form.provider) } : {}),
         };
 
         const resp = await api.patch<{ needs_restart?: boolean }>(`/workspaces/${workspaceId}`, {
@@ -140,15 +180,16 @@ export function ContainerConfigTab({ workspaceId, data }: Props) {
         <div className="mb-3 flex items-center justify-between gap-3">
           <div className="flex items-center gap-2">
             <h3 className="text-sm font-semibold text-ink">Container Config</h3>
-            {/* Read-only cloud-provider badge — which cloud this workspace's box
-                runs on (AWS/GCP/Hetzner). Defaults to AWS when unset (legacy
-                rows). Set at create time in the Create Workspace dialog. */}
-            <span
-              title="Cloud provider for this workspace's compute (set at create time)"
-              className="rounded-full border border-line/60 bg-surface-sunken px-2 py-0.5 font-mono text-[10px] uppercase tracking-wide text-ink-mid"
-            >
-              {cloudProviderLabel(provider)}
-            </span>
+            {/* Non-SaaS (local/Docker) has no cloud-provider concept → read-only
+                badge. In SaaS the provider is an editable selector in the form. */}
+            {!isSaaS && (
+              <span
+                title="Cloud provider for this workspace's compute"
+                className="rounded-full border border-line/60 bg-surface-sunken px-2 py-0.5 font-mono text-[10px] uppercase tracking-wide text-ink-mid"
+              >
+                {cloudProviderLabel(provider)}
+              </span>
+            )}
           </div>
           {data.needsRestart && <span className="text-[11px] text-warm">Restart required</span>}
         </div>
@@ -162,11 +203,32 @@ export function ContainerConfigTab({ workspaceId, data }: Props) {
             optionLabel={runtimeDisplayName}
             onChange={(runtime) => setForm((s) => ({ ...s, runtime }))}
           />
+          {isSaaS && (
+            <SelectField
+              id="cloud-provider"
+              label="Cloud provider"
+              value={normalizeProvider(form.provider)}
+              options={CLOUD_PROVIDER_OPTIONS.map((p) => p.value)}
+              optionLabel={(v) => CLOUD_PROVIDER_OPTIONS.find((p) => p.value === v)?.label ?? v}
+              // Switching cloud resets the instance type to the new provider's
+              // default (an AWS t3.* is invalid on Hetzner, etc.) — also keeps the
+              // instance-type dropdown below in sync with the provider's sizes.
+              onChange={(provider) =>
+                setForm((s) => ({
+                  ...s,
+                  provider,
+                  instanceType: instanceTypesForProvider(provider).includes(s.instanceType)
+                    ? s.instanceType
+                    : defaultInstanceForProvider(provider),
+                }))
+              }
+            />
+          )}
           <SelectField
             id="instance-type"
             label="Instance type"
             value={form.instanceType}
-            options={INSTANCE_TYPES}
+            options={instanceTypesForProvider(form.provider)}
             onChange={(instanceType) => setForm((s) => ({ ...s, instanceType }))}
           />
           <label className="grid gap-1" htmlFor="root-volume-gb">
@@ -270,6 +332,7 @@ export function ContainerConfigTab({ workspaceId, data }: Props) {
 
 function formFromData(data: {
   runtime?: string;
+  provider?: string;
   instanceType?: string;
   rootGB?: number;
   displayMode?: string;
@@ -281,9 +344,11 @@ function formFromData(data: {
   const width = data.displayWidth ?? 1920;
   const height = data.displayHeight ?? 1080;
   const resolution = `${width}x${height}`;
+  const provider = normalizeProvider(data.provider);
   return {
     runtime: data.runtime || "claude-code",
-    instanceType: data.instanceType || DEFAULT_HEADLESS_INSTANCE_TYPE,
+    provider,
+    instanceType: data.instanceType || defaultInstanceForProvider(provider),
     rootGB: String(data.rootGB || DEFAULT_HEADLESS_ROOT_GB),
     displayEnabled: !!data.displayMode && data.displayMode !== "none",
     displayMode: data.displayMode && data.displayMode !== "none" ? data.displayMode : "desktop-control",
