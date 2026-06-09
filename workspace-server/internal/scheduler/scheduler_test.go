@@ -1163,3 +1163,109 @@ func TestSanitizeUTF8(t *testing.T) {
 		t.Errorf("sanitizeUTF8 did not produce valid UTF-8: %x", []byte(out))
 	}
 }
+
+// ── TestClassifyTaskState ───────────────────────────────────────────────────
+
+func TestClassifyTaskState_NoStatus(t *testing.T) {
+	result := map[string]json.RawMessage{"other": json.RawMessage(`"x"`)}
+	if got := classifyTaskState(result); got != "" {
+		t.Errorf("classifyTaskState(no status) = %q, want empty", got)
+	}
+}
+
+func TestClassifyTaskState_OKStates(t *testing.T) {
+	for _, state := range []string{"", "submitted", "working", "completed"} {
+		result := map[string]json.RawMessage{
+			"status": json.RawMessage(`{"state":"` + state + `"}`),
+		}
+		if got := classifyTaskState(result); got != "" {
+			t.Errorf("classifyTaskState(%q) = %q, want empty (OK state)", state, got)
+		}
+	}
+}
+
+func TestClassifyTaskState_FailureState(t *testing.T) {
+	result := map[string]json.RawMessage{
+		"status": json.RawMessage(`{"state":"failed"}`),
+	}
+	if got := classifyTaskState(result); got != "failed" {
+		t.Errorf("classifyTaskState(failed) = %q, want failed", got)
+	}
+}
+
+func TestClassifyTaskState_MalformedStatus(t *testing.T) {
+	result := map[string]json.RawMessage{
+		"status": json.RawMessage(`{broken`),
+	}
+	if got := classifyTaskState(result); got != "" {
+		t.Errorf("classifyTaskState(malformed) = %q, want empty", got)
+	}
+}
+
+// ── TestIsEmptyResponse ─────────────────────────────────────────────────────
+
+func TestIsEmptyResponse_EmptyBody(t *testing.T) {
+	if !isEmptyResponse([]byte{}) {
+		t.Error("isEmptyResponse(empty) should be true")
+	}
+}
+
+func TestIsEmptyResponse_NoResponseGenerated(t *testing.T) {
+	if !isEmptyResponse([]byte(`(no response generated)`)) {
+		t.Error("isEmptyResponse(no-response-generated) should be true")
+	}
+}
+
+func TestIsEmptyResponse_TextFieldEmpty(t *testing.T) {
+	if !isEmptyResponse([]byte(`{"result":{"parts":[{"text":""}]}}`)) {
+		t.Error("isEmptyResponse(empty text field) should be true")
+	}
+}
+
+func TestIsEmptyResponse_TextFieldNoResponse(t *testing.T) {
+	if !isEmptyResponse([]byte(`{"result":{"parts":[{"text":"(no response generated)"}]}}`)) {
+		t.Error("isEmptyResponse(text=no-response-generated) should be true")
+	}
+}
+
+func TestIsEmptyResponse_HasContent(t *testing.T) {
+	if isEmptyResponse([]byte(`{"result":{"parts":[{"text":"hello"}]}}`)) {
+		t.Error("isEmptyResponse(with content) should be false")
+	}
+}
+
+// ── TestA2AErrorFromBody ────────────────────────────────────────────────────
+
+func TestA2AErrorFromBody_Empty(t *testing.T) {
+	if got := a2aErrorFromBody([]byte{}); got != "" {
+		t.Errorf("a2aErrorFromBody(empty) = %q, want empty", got)
+	}
+}
+
+func TestA2AErrorFromBody_JSONRPCMessage(t *testing.T) {
+	body := []byte(`{"error":{"code":-32603,"message":"internal error"}}`)
+	if got := a2aErrorFromBody(body); got != "internal error" {
+		t.Errorf("a2aErrorFromBody(JSON-RPC) = %q, want internal error", got)
+	}
+}
+
+func TestA2AErrorFromBody_PlainString(t *testing.T) {
+	body := []byte(`{"error":"something went wrong"}`)
+	if got := a2aErrorFromBody(body); got != "something went wrong" {
+		t.Errorf("a2aErrorFromBody(plain) = %q, want something went wrong", got)
+	}
+}
+
+func TestA2AErrorFromBody_NoError(t *testing.T) {
+	body := []byte(`{"result":"ok"}`)
+	if got := a2aErrorFromBody(body); got != "" {
+		t.Errorf("a2aErrorFromBody(no error) = %q, want empty", got)
+	}
+}
+
+func TestA2AErrorFromBody_InvalidJSON(t *testing.T) {
+	body := []byte(`{broken`)
+	if got := a2aErrorFromBody(body); got != "" {
+		t.Errorf("a2aErrorFromBody(invalid) = %q, want empty", got)
+	}
+}
