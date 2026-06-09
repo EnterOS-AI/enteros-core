@@ -125,12 +125,12 @@ pass "T16: string branch entry fails"
 # Page-body type validator used per page (bare array, not an object).
 validate_page_is_array() { jq -e 'type == "array"' >/dev/null 2>&1 && echo true || echo false; }
 
-# newest-wins collapse: emulate the script's CHECK_STATE overwrite loop.
+# newest-wins collapse: mirror the script's max-by-id jq (order-independent).
 collapse_newest_per_context() {
   declare -A CS
   while IFS=$'\t' read -r ctx state; do
     [ -n "$ctx" ] && CS[$ctx]="$state"
-  done < <(jq -r '.[] | "\(.context)\t\(.status)"')
+  done < <(jq -r 'group_by(.context) | map(max_by(.id)) | .[] | "\(.context)\t\(.status)"')
   state="${CS[CI / all-required (push)]:-missing}"
   echo "$state"
 }
@@ -165,10 +165,11 @@ RESULT2=$(echo "$ABSENT" | collapse_newest_per_context)
 [ "$RESULT2" = "missing" ] || fail "T20: absent required context must stay 'missing', got '$RESULT2'"
 pass "T20: genuinely-absent required context stays missing (fail-closed)"
 
-# T21 — newest-wins: an OLDER failure row for the same context must NOT shadow
+# T21 — non-monotonic order: newest id (157, neither first nor last in list)
 #       a NEWER success row (oldest-first append → last overwrite wins).
-DUP='[{"id":1,"context":"CI / all-required (push)","status":"failure"},
-      {"id":2,"context":"CI / all-required (push)","status":"success"}]'
+DUP='[{"id":155,"context":"CI / all-required (push)","status":"pending"},
+      {"id":157,"context":"CI / all-required (push)","status":"success"},
+      {"id":125,"context":"CI / all-required (push)","status":"failure"}]'
 RESULT3=$(echo "$DUP" | collapse_newest_per_context)
 [ "$RESULT3" = "success" ] || fail "T21: newest (success) must win over older (failure), got '$RESULT3'"
 pass "T21: newest row per context wins after pagination collapse"
