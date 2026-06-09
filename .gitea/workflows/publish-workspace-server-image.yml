@@ -248,16 +248,36 @@ jobs:
             --tag "${STAGING_TENANT_IMAGE_NAME}:${TAG_LATEST}"
           )
 
-          docker buildx build \
-            --file ./workspace-server/Dockerfile.tenant \
-            --build-arg NEXT_PUBLIC_PLATFORM_URL= \
-            --build-arg GIT_SHA="${GIT_SHA}" \
-            --label "org.opencontainers.image.source=https://git.moleculesai.app/molecule-ai/${REPO}" \
-            --label "org.opencontainers.image.revision=${GIT_SHA}" \
-            --label "org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            --label "molecule.workflow.run_id=${GITHUB_RUN_ID}" \
-            "${build_tags[@]}" \
-            --push .
+          # Retry loop: buildkit EOF (internal#2468) is often transient on the
+          # publish runner under memory pressure. Up to 3 attempts with a fresh
+          # builder each time so a crashed buildkit doesn't poison the next try.
+          for attempt in 1 2 3; do
+            echo "::notice::Tenant image build attempt ${attempt}/3 ..."
+            builder="tenant-builder-${GITHUB_RUN_ID}-${attempt}"
+            docker buildx create --name "${builder}" --use >/dev/null 2>&1 || true
+            if docker buildx build \
+                --builder "${builder}" \
+                --file ./workspace-server/Dockerfile.tenant \
+                --build-arg NEXT_PUBLIC_PLATFORM_URL= \
+                --build-arg GIT_SHA="${GIT_SHA}" \
+                --label "org.opencontainers.image.source=https://git.moleculesai.app/molecule-ai/${REPO}" \
+                --label "org.opencontainers.image.revision=${GIT_SHA}" \
+                --label "org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                --label "molecule.workflow.run_id=${GITHUB_RUN_ID}" \
+                "${build_tags[@]}" \
+                --push .; then
+              docker buildx rm "${builder}" >/dev/null 2>&1 || true
+              echo "::notice::Tenant image build succeeded on attempt ${attempt}"
+              break
+            fi
+            echo "::warning::Tenant image build attempt ${attempt} failed — cleaning builder and retrying"
+            docker buildx rm "${builder}" >/dev/null 2>&1 || true
+            sleep 10
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::Tenant image build failed after 3 attempts"
+              exit 1
+            fi
+          done
 
   # bp-exempt: production deploy side-effect; merge is gated by CI / all-required and this job waits for push CI before acting.
   deploy-production:
