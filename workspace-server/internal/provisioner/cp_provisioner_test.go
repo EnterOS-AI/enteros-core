@@ -253,7 +253,7 @@ func TestStart_SendsTemplateAndGeneratedConfigFiles(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(tmpl, "config.yaml"), []byte("name: template\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(tmpl, "adapter.py"), bytes.Repeat([]byte("x"), cpConfigFilesMaxBytes), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(tmpl, "adapter.py"), bytes.Repeat([]byte("x"), cpConfigFilesMaxBytes-100), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Mkdir(filepath.Join(tmpl, "prompts"), 0o700); err != nil {
@@ -378,7 +378,7 @@ func TestStart_CollectsConfigFiles(t *testing.T) {
 	}
 	// adapter.py is within the size limit but is NOT config.yaml or prompts/,
 	// so isCPTemplateConfigFile must exclude it from the transport.
-	if err := os.WriteFile(filepath.Join(tmpl, "adapter.py"), bytes.Repeat([]byte("x"), cpConfigFilesMaxBytes), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(tmpl, "adapter.py"), bytes.Repeat([]byte("x"), cpConfigFilesMaxBytes-100), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
