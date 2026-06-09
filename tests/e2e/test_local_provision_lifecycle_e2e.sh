@@ -191,8 +191,7 @@ except Exception:
 }
 
 container_running() {  # container_running <ws-id>  -> echoes name if running
-  local short="${1:0:12}"
-  docker ps --filter "name=ws-${short}" --filter "status=running" --format '{{.Names}}' 2>/dev/null | head -1
+  docker ps --filter "name=ws-${1}" --filter "status=running" --format '{{.Names}}' 2>/dev/null | head -1
 }
 
 cleanup() {
@@ -203,16 +202,11 @@ cleanup() {
     # SCOPED teardown — only the workspace this test created. Never a blanket
     # sweep (other dev workspaces may be live on this shared daemon).
     e2e_delete_workspace "$WSID" "" >/dev/null 2>&1 || true
-    local short="${WSID:0:12}"
-    docker rm -f "ws-${short}" >/dev/null 2>&1 || true
-    # Volume naming is split in the provisioner: configs + claude-sessions use the
-    # 12-char short id (ConfigVolumeName/ClaudeSessionVolumeName), but the
-    # /workspace volume uses the FULL UUID (buildWorkspaceMount: ws-<id>-workspace).
-    # Remove BOTH forms so neither leaks.
+    docker rm -f "ws-${WSID}" >/dev/null 2>&1 || true
     docker volume rm -f \
-      "ws-${short}-configs" "ws-${short}-claude-sessions" \
-      "ws-${short}-workspace" "ws-${WSID}-workspace" >/dev/null 2>&1 || true
-    echo "cleaned workspace $WSID + ws-${short} container/volumes"
+      "ws-${WSID}-configs" "ws-${WSID}-claude-sessions" \
+      "ws-${WSID}-workspace" >/dev/null 2>&1 || true
+    echo "cleaned workspace $WSID + ws-${WSID} container/volumes"
   fi
   # Restore the cache tag to whatever it pointed at before we retagged it, so a
   # stub run doesn't leave the real claude-code tag aliased to the stub.
@@ -331,8 +325,7 @@ if [ -z "$WSID" ]; then
   exit 1
 fi
 pass "workspace created: $WSID"
-SHORT="${WSID:0:12}"
-CONFIG_VOL="ws-${SHORT}-configs"
+CONFIG_VOL="ws-${WSID}-configs"
 
 # Mint a workspace bearer for the WorkspaceAuth-gated secret + /restart calls.
 WTOKEN=$(e2e_mint_workspace_token "$WSID" || true)
@@ -437,7 +430,7 @@ for _ in $(seq 1 "$ONLINE_TIMEOUT"); do
 done
 check "workspace reached online (status=$STATUS)" "online" "$STATUS"
 RUN=$(container_running "$WSID")
-if [ -n "$RUN" ]; then pass "container running: $RUN"; else fail "no running ws-${WSID:0:12} container" "docker ps shows none"; fi
+if [ -n "$RUN" ]; then pass "container running: $RUN"; else fail "no running ws-${WSID} container" "docker ps shows none"; fi
 echo ""
 
 # ----------------------------------------------------------------------------

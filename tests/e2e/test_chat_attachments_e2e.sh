@@ -76,7 +76,7 @@ fi
 log "Step 3 — Seed a file inside /workspace and ask agent to reference it"
 # Relies on /workspace being writable by the platform (we copy as root via
 # docker exec, mimicking the path a real agent would use through its tools).
-CONTAINER=$(docker ps --format '{{.Names}}' | grep -E "^ws-${WSID:0:12}" | head -1)
+CONTAINER=$(docker ps --format '{{.Names}}' | grep -E "^ws-${WSID}" | head -1)
 [ -n "$CONTAINER" ] || { echo "container not found"; exit 1; }
 docker exec "$CONTAINER" sh -c 'echo "E2E report body $(date -u +%s)" > /workspace/e2e-report.txt'
 

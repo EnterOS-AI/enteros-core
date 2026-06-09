@@ -94,8 +94,8 @@ check_contains "Upload child prompt" "replaced" "$CHILD_UPLOAD"
 
 # Verify prompts in containers
 sleep 2
-ROOT_CONTAINER=$(docker ps --filter "name=ws-${ROOT:0:12}" -q | head -1)
-CHILD_CONTAINER=$(docker ps --filter "name=ws-${CHILD:0:12}" -q | head -1)
+ROOT_CONTAINER=$(docker ps --filter "name=ws-${ROOT}" -q | head -1)
+CHILD_CONTAINER=$(docker ps --filter "name=ws-${CHILD}" -q | head -1)
 
 ROOT_HAS_PROMPT=$(docker exec $ROOT_CONTAINER cat /configs/system-prompt.md 2>/dev/null | head -1)
 check_contains "Root container has prompt" "Root Agent" "$ROOT_HAS_PROMPT"
