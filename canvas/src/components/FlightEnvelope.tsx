@@ -40,14 +40,24 @@ export function FlightEnvelope({
     if (!el || typeof el.animate !== "function") return;
     const dx = to.x - from.x;
     const dy = to.y - from.y;
+    // Launch small from the source dot, GROW BIG as it crosses the gap (peak
+    // mid-flight), then SHRINK small as it lands on the target dot — reads as an
+    // envelope flung from one agent and received by the other. translate tracks
+    // the straight path (fraction == keyframe offset); scale arcs independently.
+    const at = (frac: number, scale: number, opacity: number, offset?: number) => ({
+      transform: `translate(-50%,-50%) translate(${dx * frac}px,${dy * frac}px) scale(${scale})`,
+      opacity,
+      ...(offset === undefined ? {} : { offset }),
+    });
     const anim = el.animate(
       [
-        { transform: "translate(-50%,-50%) translate(0px,0px) scale(0.45)", opacity: 0 },
-        { opacity: 1, offset: 0.16 },
-        { opacity: 1, offset: 0.8 },
-        { transform: `translate(-50%,-50%) translate(${dx}px,${dy}px) scale(1)`, opacity: 0 },
+        at(0, 0.5, 0),
+        at(0.2, 1.25, 1, 0.2), // faded in + grown
+        at(0.5, 1.7, 1, 0.5), // BIG at mid-flight
+        at(0.82, 1.05, 1, 0.82), // shrinking on approach
+        at(1, 0.5, 0), // small + faded out, arrived on the target dot
       ],
-      { duration: FLIGHT_DURATION_MS, easing: "cubic-bezier(0.45, 0, 0.25, 1)", fill: "forwards" },
+      { duration: FLIGHT_DURATION_MS, easing: "ease-in-out", fill: "forwards" },
     );
     return () => anim.cancel();
   }, [from.x, from.y, to.x, to.y]);
