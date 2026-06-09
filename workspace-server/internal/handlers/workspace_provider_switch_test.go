@@ -16,6 +16,10 @@ package handlers
 //      overwrite compute — leaving the row pointed at the recoverable old box
 //      (an unexpected UPDATE would fail sqlmock's expectations).
 //   3. A non-switch compute edit (same provider) does NOT deprovision anything.
+//   4. If the old-provider READ errors (transient DB fault, not sql.ErrNoRows),
+//      the handler FAILS CLOSED: aborts (502), deprovisions nothing, and does NOT
+//      overwrite compute — closing the fail-open read path that would otherwise
+//      orphan the old box on a real switch (security review RC 9895).
 
 import (
 	"bytes"
@@ -139,5 +143,38 @@ func TestWorkspaceUpdate_NoProviderSwitch_DoesNotDeprovision(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet/unexpected DB queries: %v", err)
+	}
+}
+
+// 4. Provider READ errors (transient DB fault) → fail-CLOSED: abort 502, no
+//    deprovision, no compute overwrite. A fail-open read (the old `err == nil`
+//    gate) would skip switch detection and overwrite compute → orphan the old
+//    cloud box. sqlmock has NO UPDATE/Stop expectations, so either an overwrite
+//    or a stray deprovision trips it.
+func TestWorkspaceUpdate_ProviderSwitch_AbortsOnProviderReadError(t *testing.T) {
+	mock := setupTestDB(t)
+	cp := &scriptedCPStop{}
+	h := newSwitchTestHandler(t, cp)
+
+	mock.ExpectQuery("SELECT EXISTS").WithArgs(switchTestWSID).
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+	// The old-provider read hits a transient error (NOT sql.ErrNoRows).
+	mock.ExpectQuery("compute->>'provider'").WithArgs(switchTestWSID).
+		WillReturnError(fmt.Errorf("connection reset by peer"))
+
+	c, w := newPatchContext(t, switchTestWSID,
+		`{"compute":{"instance_type":"cpx31","provider":"hetzner","volume":{"root_gb":30}}}`)
+	h.Update(c)
+
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("expected 502 when the provider read fails (fail-closed), got %d: %s", w.Code, w.Body.String())
+	}
+	if cp.calls != 0 {
+		t.Fatalf("must NOT deprovision when the current provider can't be read; got %d Stop calls", cp.calls)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		// An unexpected UPDATE here = compute was overwritten despite an unreadable
+		// provider → the fail-open orphan path is back.
+		t.Fatalf("compute must NOT be overwritten on a provider read error (fail-closed): %v", err)
 	}
 }
