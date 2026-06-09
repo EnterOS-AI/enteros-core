@@ -1481,6 +1481,12 @@ func TestMigrateVolumeIfNeeded_ExistingTruncatedVolume(t *testing.T) {
 			t.Fatalf("seed container failed: %v", err)
 		}
 	}
+	// Remove the seed container before migration so the legacy volume is
+	// no longer referenced by any container. The deferred remove above is a
+	// safety net for panic/early-return paths.
+	if err := cli.ContainerRemove(ctx, seedResp.ID, container.RemoveOptions{Force: true}); err != nil {
+		t.Fatalf("remove seed container: %v", err)
+	}
 
 	// 2. Run migration.
 	if err := p.migrateVolumeIfNeeded(ctx, newName, legacyName); err != nil {
