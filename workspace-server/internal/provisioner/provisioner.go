@@ -1421,6 +1421,11 @@ func (p *Provisioner) migrateVolumeIfNeeded(ctx context.Context, newName, legacy
 		}
 	}
 
+	// Explicitly remove the migration container before removing the legacy
+	// volume so the volume is no longer referenced. The deferred remove above
+	// is a safety-net for early-return paths.
+	_ = p.cli.ContainerRemove(ctx, resp.ID, container.RemoveOptions{Force: true})
+
 	// Best-effort cleanup of the legacy volume.  If removal fails (e.g. still
 	// referenced by a running container), the new volume is already populated
 	// and the next restart will retry.
