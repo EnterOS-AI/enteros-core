@@ -35,6 +35,9 @@ def test_build_plan_defaults_to_staging_sha_target_and_prod_cp():
         "canary_slug": "hongming",
         "soak_seconds": 60,
         "batch_size": 3,
+        # quarantine up to 1 individually-stuck tenant rather than blocking the
+        # whole fleet deploy (default).
+        "max_stragglers": 1,
         "dry_run": False,
         # cp#228 / task #308: fleet-wide intent must carry confirm:true.
         "confirm": True,
@@ -468,6 +471,72 @@ def test_scoped_rollout_passes_when_all_tenants_verified_on_target():
     )
     assert aggregate["ok"] is True
     assert "stragglers" not in aggregate
+
+
+def test_scoped_rollout_quarantines_straggler_within_tolerance():
+    # reno-stars never verifies on target; max_stragglers=1 tolerates it — the
+    # rollout still succeeds (ships to the healthy majority) and reports the
+    # quarantined straggler instead of failing the whole deploy.
+    def fake_redeploy(_cp_url, _token, body):
+        return 200, {
+            "ok": True,
+            "results": [
+                {"slug": s, "verified_on_target": (s != "reno-stars")}
+                for s in body["only_slugs"]
+            ],
+        }
+
+    aggregate = prod.execute_scoped_rollout(
+        {
+            "cp_url": "https://api.moleculesai.app",
+            "body": {
+                "target_tag": "staging-new",
+                "batch_size": 5,
+                "dry_run": False,
+                "confirm": True,
+                "max_stragglers": 1,
+            },
+        },
+        token="secret",
+        list_slugs=lambda _u, _t, _b: ["reno-stars", "agents-team", "hongming"],
+        redeploy=fake_redeploy,
+        sleep=lambda _s: None,
+    )
+    assert aggregate["ok"] is True
+    assert aggregate["stragglers"] == ["reno-stars"]
+
+
+def test_scoped_rollout_fails_when_stragglers_exceed_tolerance():
+    # Two tenants never verify; with max_stragglers=1 that is systemic → fail.
+    def fake_redeploy(_cp_url, _token, body):
+        return 200, {
+            "ok": True,
+            "results": [
+                {"slug": s, "verified_on_target": (s == "hongming")}
+                for s in body["only_slugs"]
+            ],
+        }
+
+    try:
+        prod.execute_scoped_rollout(
+            {
+                "cp_url": "https://api.moleculesai.app",
+                "body": {
+                    "target_tag": "staging-new",
+                    "batch_size": 5,
+                    "dry_run": False,
+                    "confirm": True,
+                    "max_stragglers": 1,
+                },
+            },
+            token="secret",
+            list_slugs=lambda _u, _t, _b: ["reno-stars", "agents-team", "hongming"],
+            redeploy=fake_redeploy,
+            sleep=lambda _s: None,
+        )
+        raise AssertionError("expected RolloutFailed when stragglers exceed tolerance")
+    except prod.RolloutFailed as exc:
+        assert "max tolerated 1" in str(exc)
 
 
 def test_scoped_rollout_dry_run_does_not_assert_coverage():
