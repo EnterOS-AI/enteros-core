@@ -488,6 +488,12 @@ echo ""
 # Step 5 — proxy reach (ws-<id>:8000 Docker-DNS rewrite, end to end).
 # ----------------------------------------------------------------------------
 echo "--- Step 5: proxy reach (POST /workspaces/$WSID/a2a) ---"
+# Debug: print the workspace URL the platform stored so SSRF failures are
+# actionable (#2468 RCA).
+WS_DEBUG=$(admin_curl "$BASE/workspaces/$WSID")
+WS_URL_DEBUG=$(ws_field "$WS_DEBUG" "url")
+WS_STATUS_DEBUG=$(ws_field "$WS_DEBUG" "status")
+echo "  workspace url=$WS_URL_DEBUG status=$WS_STATUS_DEBUG"
 # In minimax mode we send a DETERMINISTIC known-answer prompt and assert the
 # model echoes the answer back — proving a real LLM round-trip, not just
 # reachability. Otherwise a plain "ping".

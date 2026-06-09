@@ -74,6 +74,10 @@ jobs:
     env:
       PG_CONTAINER: pg-lpe2e-${{ github.run_id }}-${{ github.run_attempt }}
       REDIS_CONTAINER: redis-lpe2e-${{ github.run_id }}-${{ github.run_attempt }}
+      # Hard-code dev mode at the job level so the platform server ALWAYS sees it,
+      # even if the runner's $GITHUB_ENV propagation is flaky (#2468 RCA).
+      MOLECULE_ENV: development
+      SECRETS_ENCRYPTION_KEY: lpe2e-test-encryption-key-32bytes!!
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
@@ -254,6 +258,10 @@ jobs:
     env:
       PG_CONTAINER: pg-lpe2e-real-${{ github.run_id }}-${{ github.run_attempt }}
       REDIS_CONTAINER: redis-lpe2e-real-${{ github.run_id }}-${{ github.run_attempt }}
+      # Hard-code dev mode at the job level so the platform server ALWAYS sees it,
+      # even if the runner's $GITHUB_ENV propagation is flaky (#2468 RCA).
+      MOLECULE_ENV: development
+      SECRETS_ENCRYPTION_KEY: lpe2e-test-encryption-key-32bytes!!
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
