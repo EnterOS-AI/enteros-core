@@ -227,3 +227,58 @@ func TestCacheKey_SlugSeparator(t *testing.T) {
 		t.Errorf("cacheKey collides on ambiguous splits")
 	}
 }
+
+func TestTenantSlug(t *testing.T) {
+	t.Setenv("MOLECULE_ORG_SLUG", "acme-corp")
+	if got := tenantSlug(); got != "acme-corp" {
+		t.Errorf("tenantSlug() = %q, want %q", got, "acme-corp")
+	}
+}
+
+func TestTenantSlug_TrimSpace(t *testing.T) {
+	t.Setenv("MOLECULE_ORG_SLUG", "  spaced-slug  ")
+	if got := tenantSlug(); got != "spaced-slug" {
+		t.Errorf("tenantSlug() = %q, want %q", got, "spaced-slug")
+	}
+}
+
+func TestTenantSlug_Empty(t *testing.T) {
+	t.Setenv("MOLECULE_ORG_SLUG", "")
+	if got := tenantSlug(); got != "" {
+		t.Errorf("tenantSlug() = %q, want empty", got)
+	}
+}
+
+func TestCPSessionVerifyURL(t *testing.T) {
+	t.Setenv("CP_UPSTREAM_URL", "https://cp.test")
+	got := cpSessionVerifyURL("acme")
+	want := "https://cp.test/cp/auth/tenant-member?slug=acme"
+	if got != want {
+		t.Errorf("cpSessionVerifyURL() = %q, want %q", got, want)
+	}
+}
+
+func TestCPSessionVerifyURL_TrailingSlash(t *testing.T) {
+	t.Setenv("CP_UPSTREAM_URL", "https://cp.test/")
+	got := cpSessionVerifyURL("acme")
+	want := "https://cp.test/cp/auth/tenant-member?slug=acme"
+	if got != want {
+		t.Errorf("cpSessionVerifyURL() = %q, want %q", got, want)
+	}
+}
+
+func TestCPSessionVerifyURL_EscapeSlug(t *testing.T) {
+	t.Setenv("CP_UPSTREAM_URL", "https://cp.test")
+	got := cpSessionVerifyURL("acme corp")
+	want := "https://cp.test/cp/auth/tenant-member?slug=acme+corp"
+	if got != want {
+		t.Errorf("cpSessionVerifyURL() = %q, want %q", got, want)
+	}
+}
+
+func TestCPSessionVerifyURL_NoCPConfigured(t *testing.T) {
+	t.Setenv("CP_UPSTREAM_URL", "")
+	if got := cpSessionVerifyURL("acme"); got != "" {
+		t.Errorf("cpSessionVerifyURL() = %q, want empty when CP_UPSTREAM_URL unset", got)
+	}
+}
