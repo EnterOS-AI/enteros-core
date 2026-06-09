@@ -290,6 +290,33 @@ jobs:
           # / workspaces all landed by the migration replay step above).
           go test -tags=integration -timeout 5m -v ./internal/scheduler/ -run "^TestIntegration_"
 
+      - if: needs.detect-changes.outputs.handlers == 'true'
+        name: Migration replay-from-scratch gate (#2150)
+        env:
+          PGPASSWORD: test
+        run: |
+          # Issue #2150 (SOP internal#765): prove the FULL forward migration
+          # chain (.up + legacy .sql) replays from a blank schema via the
+          # PRODUCTION db.RunMigrations entrypoint — hard-fail on any error.
+          #
+          # This is the gap the psql apply loop above does NOT cover: that
+          # loop deliberately SKIPS failing migrations (`⊘ skipped`), so it
+          # stays green even if the chain stops replaying. The Go test below
+          # uses the real boot-time runner with hard-fail semantics, catching
+          # the #211 .down-wipe class and the 045 non-idempotent crash-loop
+          # class (it runs the chain twice).
+          #
+          # Run against a SEPARATE database so the destructive
+          # `DROP SCHEMA public CASCADE` inside the test never touches the
+          # `molecule` DB the handlers integration tests above migrated. No
+          # ordering coupling with the handlers step.
+          createdb -h "${PG_HOST}" -U postgres molecule_replay 2>/dev/null || \
+            psql -h "${PG_HOST}" -U postgres -d molecule \
+              -c "CREATE DATABASE molecule_replay" >/dev/null 2>&1 || true
+          INTEGRATION_DB_URL="postgres://postgres:test@${PG_HOST}:5432/molecule_replay?sslmode=disable" \
+            go test -tags=integration -timeout 5m -v ./internal/db/ \
+              -run '^TestIntegration_Migration|^TestIntegration_InitPostgres'
+
       - if: failure() && needs.detect-changes.outputs.handlers == 'true'
         name: Diagnostic dump on failure
         env:

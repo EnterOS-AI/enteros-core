@@ -30,6 +30,11 @@ PROFILES: dict[str, dict[str, str]] = {
             # workflow (they reuse its migrated Postgres), so changes to the
             # scheduler package must trigger the job too.
             r"|^workspace-server/internal/scheduler/"
+            # #2150: the db package's real-PG migration-replay-from-scratch
+            # + InitPostgres ping tests also run in this same workflow (they
+            # reuse its sibling Postgres, against a separate `molecule_replay`
+            # database). Changes to db must trigger the job too.
+            r"|^workspace-server/internal/db/"
             r"|^workspace-server/migrations/"
             r"|^\.gitea/workflows/handlers-postgres-integration\.yml$"
         ),
