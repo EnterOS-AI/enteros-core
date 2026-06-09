@@ -165,6 +165,28 @@ jobs:
           cache: 'npm'
           cache-dependency-path: canvas/package-lock.json
 
+      - name: Sweep stale e2e-chat testcontainers (self-heal prior leaks)
+        if: needs.detect-changes.outputs.chat == 'true'
+        run: |
+          # Prior e2e-chat runs that were cancelled/killed — or whose always()
+          # cleanup hit a wedged docker daemon — leak their pg-/redis-e2e-chat-*
+          # containers, which then pile up on the shared runner host (observed: 13
+          # such containers, up to 2 weeks old, on the operator daemon). Reap any
+          # e2e-chat container older than the job window so leaks self-heal every
+          # run instead of relying on each run's own cleanup succeeding. Age-based
+          # (>2h, well beyond the 15m job) so a CONCURRENT e2e-chat job's fresh
+          # containers are never touched. See controlplane#646.
+          now=$(date -u +%s)
+          docker ps -a --filter name=e2e-chat --format '{{.Names}}' | while read -r c; do
+            [ -n "$c" ] || continue
+            created=$(docker inspect -f '{{.Created}}' "$c" 2>/dev/null) || continue
+            cts=$(date -u -d "$created" +%s 2>/dev/null) || continue
+            if [ $(( now - cts )) -gt 7200 ]; then
+              echo "sweeping stale e2e-chat container $c (created $created)"
+              timeout 30 docker rm -f "$c" >/dev/null 2>&1 || true
+            fi
+          done
+
       - name: Start Postgres (docker)
         if: needs.detect-changes.outputs.chat == 'true'
         run: |
@@ -430,5 +452,7 @@ jobs:
       - name: Stop service containers
         if: always() && needs.detect-changes.outputs.chat == 'true'
         run: |
-          docker rm -f "$PG_CONTAINER" 2>/dev/null || true
-          docker rm -f "$REDIS_CONTAINER" 2>/dev/null || true
+          # timeout-wrap so a wedged docker daemon can't hang this always() step
+          # (a hung rm here is one way containers leak in the first place).
+          timeout 30 docker rm -f "$PG_CONTAINER" 2>/dev/null || true
+          timeout 30 docker rm -f "$REDIS_CONTAINER" 2>/dev/null || true
