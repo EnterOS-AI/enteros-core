@@ -1336,33 +1336,105 @@ func (p *Provisioner) WriteAuthTokenToVolume(ctx context.Context, workspaceID, t
 }
 
 // resolveConfigVolumeName returns the effective config volume name for a
-// workspace, preferring the legacy truncated name if that volume already
-// exists (KI-013 deploy safety: pre-deploy volumes must not be orphaned).
+// workspace.  KI-013 deploy safety: if a legacy truncated-name volume exists,
+// it is migrated in-place to the new full-ID name so existing workspace data
+// is preserved AND all workspaces eventually use collision-safe names.
 func (p *Provisioner) resolveConfigVolumeName(ctx context.Context, workspaceID string) string {
 	if p == nil || p.cli == nil {
 		return ConfigVolumeName(workspaceID)
 	}
+	newName := ConfigVolumeName(workspaceID)
 	legacy := legacyConfigVolumeName(workspaceID)
-	if _, err := p.cli.VolumeInspect(ctx, legacy); err == nil {
-		return legacy
+	if err := p.migrateVolumeIfNeeded(ctx, newName, legacy); err != nil {
+		log.Printf("Provisioner: volume migration warning for %s: %v", workspaceID, err)
 	}
-	return ConfigVolumeName(workspaceID)
+	return newName
 }
 
 // resolveClaudeSessionVolumeName returns the effective claude-sessions volume
-// name, preferring the legacy truncated name if that volume already exists.
+// name.  KI-013 deploy safety: legacy truncated-name volumes are migrated
+// in-place to the new full-ID name.
 func (p *Provisioner) resolveClaudeSessionVolumeName(ctx context.Context, workspaceID string) string {
 	if p == nil || p.cli == nil {
 		return ClaudeSessionVolumeName(workspaceID)
 	}
+	newName := ClaudeSessionVolumeName(workspaceID)
 	legacy := legacyClaudeSessionVolumeName(workspaceID)
-	if _, err := p.cli.VolumeInspect(ctx, legacy); err == nil {
-		return legacy
+	if err := p.migrateVolumeIfNeeded(ctx, newName, legacy); err != nil {
+		log.Printf("Provisioner: session volume migration warning for %s: %v", workspaceID, err)
 	}
-	return ClaudeSessionVolumeName(workspaceID)
+	return newName
+}
+
+// migrateVolumeIfNeeded renames a legacy truncated-name Docker volume to its
+// new full-ID name by copying data via a temporary alpine container.  If the
+// legacy volume does not exist, or the new volume already exists, this is a
+// no-op.  The operation is idempotent — calling it multiple times is safe.
+func (p *Provisioner) migrateVolumeIfNeeded(ctx context.Context, newName, legacyName string) error {
+	if p == nil || p.cli == nil {
+		return nil
+	}
+
+	// Legacy volume missing — nothing to migrate.
+	if _, err := p.cli.VolumeInspect(ctx, legacyName); err != nil {
+		return nil
+	}
+
+	// New volume already exists — migration already done (or new workspace).
+	if _, err := p.cli.VolumeInspect(ctx, newName); err == nil {
+		return nil
+	}
+
+	// Create the new volume.
+	if _, err := p.cli.VolumeCreate(ctx, volume.CreateOptions{
+		Name:   newName,
+		Labels: managedLabels(),
+	}); err != nil {
+		return fmt.Errorf("create new volume %s: %w", newName, err)
+	}
+
+	// Copy data from legacy to new via a short-lived alpine container.
+	resp, err := p.cli.ContainerCreate(ctx, &container.Config{
+		Image: "alpine",
+		Cmd:   []string{"sh", "-c", "cp -a /legacy/. /new/"},
+	}, &container.HostConfig{
+		Binds: []string{
+			legacyName + ":/legacy",
+			newName + ":/new",
+		},
+	}, nil, nil, "")
+	if err != nil {
+		return fmt.Errorf("create migration container: %w", err)
+	}
+	defer p.cli.ContainerRemove(ctx, resp.ID, container.RemoveOptions{Force: true})
+
+	if err := p.cli.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
+		return fmt.Errorf("start migration container: %w", err)
+	}
+
+	waitCh, errCh := p.cli.ContainerWait(ctx, resp.ID, container.WaitConditionNotRunning)
+	select {
+	case <-waitCh:
+	case err := <-errCh:
+		if err != nil {
+			return fmt.Errorf("migration container exited with error: %w", err)
+		}
+	}
+
+	// Best-effort cleanup of the legacy volume.  If removal fails (e.g. still
+	// referenced by a running container), the new volume is already populated
+	// and the next restart will retry.
+	if err := p.cli.VolumeRemove(ctx, legacyName, true); err != nil {
+		log.Printf("Provisioner: warning: failed to remove legacy volume %s after migration: %v", legacyName, err)
+	} else {
+		log.Printf("Provisioner: migrated legacy volume %s → %s", legacyName, newName)
+	}
+	return nil
 }
 
 // RemoveVolume removes the config volume for a workspace.
+// Also removes the claude-sessions volume (best-effort, may not exist
+// for non claude-code runtimes). Issue #12.
 // Also removes the claude-sessions volume (best-effort, may not exist
 // for non claude-code runtimes). Issue #12.
 func (p *Provisioner) RemoveVolume(ctx context.Context, workspaceID string) error {
@@ -1494,20 +1566,36 @@ func RunningContainerName(ctx context.Context, cli *client.Client, workspaceID s
 	if cli == nil {
 		return "", ErrNoBackend
 	}
-	// KI-013 deploy safety: new full-ID name first, then fall back to the
-	// old truncated name so pre-deploy containers are still discoverable.
-	names := []string{ContainerName(workspaceID), legacyContainerName(workspaceID)}
-	for _, name := range names {
-		info, err := cli.ContainerInspect(ctx, name)
-		if err != nil {
-			if isContainerNotFound(err) {
-				continue
+
+	newName := ContainerName(workspaceID)
+	legacyName := legacyContainerName(workspaceID)
+
+	// If a legacy container is still running, rename it in-place to the
+	// new full-ID name so all callers converge on collision-safe names.
+	legacyInfo, legacyErr := cli.ContainerInspect(ctx, legacyName)
+	if legacyErr == nil && legacyInfo.State.Running {
+		if _, newErr := cli.ContainerInspect(ctx, newName); isContainerNotFound(newErr) {
+			if renameErr := cli.ContainerRename(ctx, legacyName, newName); renameErr == nil {
+				log.Printf("Provisioner: renamed legacy container %s → %s", legacyName, newName)
+				return newName, nil
 			}
-			return "", err
+			log.Printf("Provisioner: warning: failed to rename legacy container %s → %s: %v", legacyName, newName, renameErr)
 		}
-		if info.State.Running {
-			return name, nil
+		// Rename not possible (or new name already occupied) — return legacy
+		// name so the caller can still exec into the live container.
+		return legacyName, nil
+	}
+
+	// Standard path: look for a running container with the new name.
+	info, err := cli.ContainerInspect(ctx, newName)
+	if err != nil {
+		if isContainerNotFound(err) {
+			return "", nil
 		}
+		return "", err
+	}
+	if info.State.Running {
+		return newName, nil
 	}
 	return "", nil
 }
