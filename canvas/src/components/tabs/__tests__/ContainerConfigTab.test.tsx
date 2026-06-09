@@ -3,12 +3,14 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const apiPatch = vi.fn();
+const apiGet = vi.fn();
 const updateNodeData = vi.fn();
 const restartWorkspace = vi.fn();
 
 vi.mock("@/lib/api", () => ({
   api: {
     patch: (path: string, body: unknown) => apiPatch(path, body),
+    get: (path: string) => apiGet(path),
   },
 }));
 
@@ -38,6 +40,12 @@ afterEach(() => {
 
 beforeEach(() => {
   apiPatch.mockReset();
+  apiGet.mockReset();
+  // Default: compute-options fetch rejects → component keeps its in-bundle
+  // fallback SSOT. Existing assertions (t3.medium / cpx31 / provider list) are
+  // satisfied by the fallback, which mirrors the server. Individual tests that
+  // exercise the fetch path override this with mockResolvedValueOnce.
+  apiGet.mockRejectedValue(new Error("no compute-options in this test"));
   restartWorkspace.mockReset();
   updateNodeData.mockReset();
 });
@@ -356,6 +364,76 @@ describe("ContainerConfigTab", () => {
     expect(body.compute.provider).toBe("hetzner");
     expect(body.compute.instance_type).toBe("cpx31");
     confirmSpy.mockRestore();
+  });
+
+  // core#2489: the provider + instance-type dropdowns are populated from the
+  // workspace-server SSOT (GET /workspaces/:id/compute-options), so the UI can't
+  // offer an option the backend then rejects. This proves the fetch drives the
+  // dropdowns: a server-only instance type appears once the fetch resolves.
+  it("populates instance-type options from the compute-options SSOT endpoint", async () => {
+    apiGet.mockResolvedValueOnce({
+      providers: ["aws", "hetzner", "gcp"],
+      instanceTypes: {
+        aws: ["t3.medium", "t3.large", "z9.future"], // z9.future is server-only
+        hetzner: ["cpx31"],
+        gcp: ["e2-standard-2"],
+      },
+      defaults: { aws: "t3.medium", hetzner: "cpx31", gcp: "e2-standard-2" },
+    });
+
+    render(
+      <ContainerConfigTab
+        workspaceId="ws-opts"
+        data={{
+          runtime: "claude-code",
+          status: "online",
+          needsRestart: false,
+          activeTasks: 0,
+          maxConcurrentTasks: null,
+          workspaceAccess: "none",
+          deliveryMode: "push",
+          compute: { instance_type: "t3.large", provider: "aws", volume: { root_gb: 30 } },
+        }}
+      />,
+    );
+
+    await waitFor(() => expect(apiGet).toHaveBeenCalledWith("/workspaces/ws-opts/compute-options"));
+    // The server-only instance type appears in the dropdown after the fetch.
+    await waitFor(() =>
+      expect(
+        Array.from(screen.getByLabelText("Instance type").querySelectorAll("option")).map((o) => o.getAttribute("value")),
+      ).toContain("z9.future"),
+    );
+  });
+
+  // core#2489: if the compute-options fetch fails, the dropdowns must stay usable
+  // via the in-bundle fallback (no crash, no empty selector).
+  it("falls back to the in-bundle option set when the compute-options fetch fails", async () => {
+    apiGet.mockRejectedValueOnce(new Error("network down"));
+
+    render(
+      <ContainerConfigTab
+        workspaceId="ws-opts"
+        data={{
+          runtime: "claude-code",
+          status: "online",
+          needsRestart: false,
+          activeTasks: 0,
+          maxConcurrentTasks: null,
+          workspaceAccess: "none",
+          deliveryMode: "push",
+          compute: { instance_type: "t3.large", provider: "aws", volume: { root_gb: 30 } },
+        }}
+      />,
+    );
+
+    await waitFor(() => expect(apiGet).toHaveBeenCalled());
+    // Fallback list still renders the known AWS sizes.
+    const values = Array.from(
+      screen.getByLabelText("Instance type").querySelectorAll("option"),
+    ).map((o) => o.getAttribute("value"));
+    expect(values).toContain("t3.medium");
+    expect(values).toContain("m6i.xlarge");
   });
 
   it("does not treat a non-provider edit as a recreate (no confirm; aws default omitted)", async () => {

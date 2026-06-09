@@ -7,29 +7,44 @@ import { isSaaSTenant } from "@/lib/tenant";
 import { useCanvasStore, type WorkspaceNodeData } from "@/store/canvas";
 import type { WorkspaceCompute } from "@/store/socket";
 
-// Machine sizes keyed by cloud provider — an AWS t3.* is meaningless on Hetzner,
-// etc. MUST mirror the workspace-server workspaceComputeInstanceAllowlist (which
-// mirrors the CP provider configs); the PATCH validation rejects a mismatch 400.
-const INSTANCE_TYPES_BY_PROVIDER: Record<string, string[]> = {
-  aws: ["t3.medium", "t3.large", "t3.xlarge", "t3.2xlarge", "m6i.large", "m6i.xlarge", "c6i.xlarge"],
-  hetzner: ["cpx11", "cpx21", "cpx31", "cpx41", "cpx51", "cax11", "cax21", "cax31", "cax41"],
-  gcp: ["e2-small", "e2-medium", "e2-standard-2", "e2-standard-4", "e2-standard-8"],
+// Cloud-provider + instance-type metadata (core#2489).
+//
+// SSOT lives in the workspace-server (workspace_compute.go's allowlist + defaults)
+// and is fetched at runtime from GET /workspaces/:id/compute-options, so the UI
+// can never offer a (provider, instance-type) the PATCH validation then rejects
+// with a 400. The constants below are ONLY a minimal offline fallback used until
+// the fetch resolves (or if it fails) — they mirror the server SSOT but are not
+// the source of truth. When the fetch succeeds, its data replaces them entirely.
+type ComputeOptions = {
+  providers: string[];
+  instanceTypes: Record<string, string[]>;
+  defaults: Record<string, string>;
 };
-const DEFAULT_INSTANCE_BY_PROVIDER: Record<string, string> = {
-  aws: "t3.medium", hetzner: "cpx31", gcp: "e2-standard-2",
-};
-const normalizeProvider = (p?: string): string => (p === "gcp" || p === "hetzner" ? p : "aws");
-const instanceTypesForProvider = (p?: string): string[] =>
-  INSTANCE_TYPES_BY_PROVIDER[normalizeProvider(p)] ?? INSTANCE_TYPES_BY_PROVIDER.aws;
-const defaultInstanceForProvider = (p?: string): string =>
-  DEFAULT_INSTANCE_BY_PROVIDER[normalizeProvider(p)] ?? "t3.medium";
 
-// Editable cloud-provider options (multi-provider RFC) — mirrors CreateWorkspaceDialog.
-const CLOUD_PROVIDER_OPTIONS = [
-  { value: "aws", label: "AWS (default)" },
-  { value: "gcp", label: "GCP" },
-  { value: "hetzner", label: "Hetzner" },
-];
+const FALLBACK_COMPUTE_OPTIONS: ComputeOptions = {
+  providers: ["aws", "hetzner", "gcp"],
+  instanceTypes: {
+    aws: ["t3.medium", "t3.large", "t3.xlarge", "t3.2xlarge", "m6i.large", "m6i.xlarge", "c6i.xlarge"],
+    hetzner: ["cpx11", "cpx21", "cpx31", "cpx41", "cpx51", "cax11", "cax21", "cax31", "cax41"],
+    gcp: ["e2-small", "e2-medium", "e2-standard-2", "e2-standard-4", "e2-standard-8"],
+  },
+  defaults: { aws: "t3.medium", hetzner: "cpx31", gcp: "e2-standard-2" },
+};
+
+const normalizeProvider = (p?: string): string => (p === "gcp" || p === "hetzner" ? p : "aws");
+const instanceTypesForProvider = (opts: ComputeOptions, p?: string): string[] =>
+  opts.instanceTypes[normalizeProvider(p)] ?? opts.instanceTypes.aws ?? FALLBACK_COMPUTE_OPTIONS.instanceTypes.aws;
+const defaultInstanceForProvider = (opts: ComputeOptions, p?: string): string =>
+  opts.defaults[normalizeProvider(p)] ?? "t3.medium";
+
+// Human labels for the cloud-provider selector. The option VALUES come from the
+// fetched SSOT (opts.providers); this only supplies display text + the default tag.
+const CLOUD_PROVIDER_LABELS: Record<string, string> = {
+  aws: "AWS (default)",
+  gcp: "GCP",
+  hetzner: "Hetzner",
+};
+const cloudProviderOptionLabel = (v: string): string => CLOUD_PROVIDER_LABELS[v] ?? v;
 
 const RUNTIME_OPTIONS = ["claude-code", "codex", "hermes", "openclaw", "kimi", "kimi-cli", "external"];
 const RESOLUTIONS = ["1280x720", "1440x900", "1920x1080", "2560x1440"];
@@ -87,12 +102,42 @@ export function ContainerConfigTab({ workspaceId, data }: Props) {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState(false);
+  // core#2489: provider + instance-type dropdowns are populated from the
+  // workspace-server SSOT (GET /workspaces/:id/compute-options) so they can't
+  // drift from what the PATCH validation accepts. Start from the offline fallback
+  // and replace it once the fetch resolves; on fetch error we keep the fallback
+  // (the dropdowns still work, just from the in-bundle mirror).
+  const [computeOptions, setComputeOptions] = useState<ComputeOptions>(FALLBACK_COMPUTE_OPTIONS);
 
   useEffect(() => {
     setForm(initial);
     setError(null);
     setSuccess(false);
   }, [initial]);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const opts = await api.get<Partial<ComputeOptions>>(`/workspaces/${workspaceId}/compute-options`);
+        if (cancelled) return;
+        // Defensive: only adopt a well-formed payload; otherwise keep the fallback.
+        if (opts && Array.isArray(opts.providers) && opts.providers.length > 0 && opts.instanceTypes && opts.defaults) {
+          setComputeOptions({
+            providers: opts.providers,
+            instanceTypes: opts.instanceTypes,
+            defaults: opts.defaults,
+          });
+        }
+      } catch {
+        // Fetch failed (offline / older server) — keep FALLBACK_COMPUTE_OPTIONS.
+        // The dropdowns stay usable; worst case they show the in-bundle mirror.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [workspaceId]);
 
   const workspaceAccess = formatAccess(data.workspaceAccess);
   const maxConcurrentTasks = data.maxConcurrentTasks ? String(data.maxConcurrentTasks) : "platform-managed";
@@ -208,8 +253,8 @@ export function ContainerConfigTab({ workspaceId, data }: Props) {
               id="cloud-provider"
               label="Cloud provider"
               value={normalizeProvider(form.provider)}
-              options={CLOUD_PROVIDER_OPTIONS.map((p) => p.value)}
-              optionLabel={(v) => CLOUD_PROVIDER_OPTIONS.find((p) => p.value === v)?.label ?? v}
+              options={computeOptions.providers}
+              optionLabel={cloudProviderOptionLabel}
               // Switching cloud resets the instance type to the new provider's
               // default (an AWS t3.* is invalid on Hetzner, etc.) — also keeps the
               // instance-type dropdown below in sync with the provider's sizes.
@@ -217,9 +262,9 @@ export function ContainerConfigTab({ workspaceId, data }: Props) {
                 setForm((s) => ({
                   ...s,
                   provider,
-                  instanceType: instanceTypesForProvider(provider).includes(s.instanceType)
+                  instanceType: instanceTypesForProvider(computeOptions, provider).includes(s.instanceType)
                     ? s.instanceType
-                    : defaultInstanceForProvider(provider),
+                    : defaultInstanceForProvider(computeOptions, provider),
                 }))
               }
             />
@@ -228,7 +273,7 @@ export function ContainerConfigTab({ workspaceId, data }: Props) {
             id="instance-type"
             label="Instance type"
             value={form.instanceType}
-            options={instanceTypesForProvider(form.provider)}
+            options={instanceTypesForProvider(computeOptions, form.provider)}
             onChange={(instanceType) => setForm((s) => ({ ...s, instanceType }))}
           />
           <label className="grid gap-1" htmlFor="root-volume-gb">
@@ -348,7 +393,10 @@ function formFromData(data: {
   return {
     runtime: data.runtime || "claude-code",
     provider,
-    instanceType: data.instanceType || defaultInstanceForProvider(provider),
+    // Falls back to the offline default only when no instance type is persisted;
+    // the server SSOT default matches FALLBACK_COMPUTE_OPTIONS, and the dropdown
+    // re-syncs to the fetched options once they resolve.
+    instanceType: data.instanceType || defaultInstanceForProvider(FALLBACK_COMPUTE_OPTIONS, provider),
     rootGB: String(data.rootGB || DEFAULT_HEADLESS_ROOT_GB),
     displayEnabled: !!data.displayMode && data.displayMode !== "none",
     displayMode: data.displayMode && data.displayMode !== "none" ? data.displayMode : "desktop-control",
