@@ -31,21 +31,87 @@ type workspaceDisplayResponse struct {
 	Status    string `json:"status,omitempty"`
 }
 
-var workspaceComputeInstanceAllowlist = map[string]struct{}{
-	"t3.medium":  {},
-	"t3.large":   {},
-	"t3.xlarge":  {},
-	"t3.2xlarge": {},
-	"m6i.large":  {},
-	"m6i.xlarge": {},
-	"c6i.xlarge": {},
+// workspaceComputeInstanceAllowlist is keyed by cloud provider (multi-provider /
+// in-place switch): each provider's box accepts only that provider's machine
+// sizes (an AWS t3.* is meaningless on Hetzner, and vice-versa). Mirrors the CP
+// provider SSOT — keep in lock-step with the controlplane provider configs
+// (Hetzner ServerType cpx*/cax*, GCP MachineType e2-*, AWS EC2 t3*/m6i*/c6i*).
+// TestValidateWorkspaceCompute_Provider / _InstanceTypePerProvider pin the sets.
+// "" provider = AWS default.
+var workspaceComputeInstanceAllowlist = map[string]map[string]struct{}{
+	"aws": {
+		"t3.medium": {}, "t3.large": {}, "t3.xlarge": {}, "t3.2xlarge": {},
+		"m6i.large": {}, "m6i.xlarge": {}, "c6i.xlarge": {},
+	},
+	"hetzner": {
+		"cpx11": {}, "cpx21": {}, "cpx31": {}, "cpx41": {}, "cpx51": {},
+		"cax11": {}, "cax21": {}, "cax31": {}, "cax41": {},
+	},
+	"gcp": {
+		"e2-small": {}, "e2-medium": {},
+		"e2-standard-2": {}, "e2-standard-4": {}, "e2-standard-8": {},
+	},
+}
+
+// normalizeCloudProvider maps "" → "aws" so the in-place switch comparison
+// treats the default and an explicit "aws" as the same cloud (no spurious switch).
+func normalizeCloudProvider(p string) string {
+	if p == "" {
+		return "aws"
+	}
+	return p
+}
+
+// instanceTypeAllowedForProvider reports whether instanceType is valid for the
+// given provider ("" → aws). Empty instanceType is always allowed (CP defaults).
+func instanceTypeAllowedForProvider(provider, instanceType string) bool {
+	if instanceType == "" {
+		return true
+	}
+	p := provider
+	if p == "" {
+		p = "aws"
+	}
+	set, ok := workspaceComputeInstanceAllowlist[p]
+	if !ok {
+		return false
+	}
+	_, ok = set[instanceType]
+	return ok
+}
+
+// workspaceComputeProviderAllowlist mirrors the controlplane cloud-provider SSOT
+// (controlplane internal/cloudprovider.Supported = {aws, hetzner, gcp}).
+// ws-server lives in a different repo and cannot import that package, so this is
+// a DELIBERATE mirror; TestValidateWorkspaceCompute_Provider pins the exact set
+// and this doc-comment names the SSOT, so a CP-side change forces a matching
+// change here (and the CP itself fail-closes an unwired provider with a 422).
+// "" = default (AWS) and is always accepted. This is the gate the switch-provider
+// flow reuses to reject a bad provider with a clean 400 before any CP round-trip.
+var workspaceComputeProviderAllowlist = map[string]struct{}{
+	"aws":     {},
+	"gcp":     {},
+	"hetzner": {},
 }
 
 func validateWorkspaceCompute(compute models.WorkspaceCompute) error {
-	if compute.InstanceType != "" {
-		if _, ok := workspaceComputeInstanceAllowlist[compute.InstanceType]; !ok {
-			return fmt.Errorf("unsupported compute.instance_type")
+	// Provider first (so the instance-type check below can be provider-scoped).
+	// "" = default (AWS). CP fail-closes an unwired provider with a 422; validating
+	// here gives a clean 400 before the round-trip and is the gate reused by the
+	// switch-provider flow. Mirrors the controlplane cloudprovider SSOT.
+	if compute.Provider != "" {
+		if _, ok := workspaceComputeProviderAllowlist[compute.Provider]; !ok {
+			return fmt.Errorf("unsupported compute.provider (want aws|gcp|hetzner)")
 		}
+	}
+	// Instance type must belong to the chosen provider (an AWS t3.* is invalid on
+	// Hetzner, etc.). Empty = CP default for the provider.
+	if !instanceTypeAllowedForProvider(compute.Provider, compute.InstanceType) {
+		prov := compute.Provider
+		if prov == "" {
+			prov = "aws"
+		}
+		return fmt.Errorf("unsupported compute.instance_type %q for provider %q", compute.InstanceType, prov)
 	}
 	if compute.Volume.RootGB != 0 {
 		if compute.Volume.RootGB < workspaceComputeDiskFloorGB || compute.Volume.RootGB > workspaceComputeDiskCeilingGB {

@@ -34,6 +34,11 @@ const (
 	// fireSchedule goroutine indefinitely, which blocked wg.Wait() in
 	// tick(), which stalled the entire scheduler until operator restart.
 	dbQueryTimeout = 10 * time.Second
+	// priorityTask mirrors handlers.PriorityTask (50) — the default FIFO A2A
+	// queue priority. Duplicated as a local const because the scheduler cannot
+	// import internal/handlers (handlers imports scheduler → cycle). Buffered
+	// cron ticks enqueue at the same priority as normal busy-retry A2A work.
+	priorityTask = 50
 )
 
 // sanitizeUTF8 replaces invalid UTF-8 byte sequences with the Unicode
@@ -48,9 +53,14 @@ func sanitizeUTF8(s string) string {
 }
 
 // A2AProxy is the interface the scheduler needs to send messages to workspaces.
-// WorkspaceHandler.ProxyA2ARequest satisfies this.
+// WorkspaceHandler.ProxyA2ARequest + WorkspaceHandler.EnqueueA2A satisfy this.
 type A2AProxy interface {
 	ProxyA2ARequest(ctx context.Context, workspaceID string, body []byte, callerID string, logActivity bool) (int, []byte, error)
+	// EnqueueA2A durably buffers an A2A message for a busy workspace; the
+	// drain dispatches it serially when the agent frees. idempotencyKey
+	// collapses duplicate pending buffers per (workspace,key). Returns the
+	// buffered entry id, the resulting pending depth, and any error.
+	EnqueueA2A(ctx context.Context, workspaceID, callerID string, priority int, body []byte, method, idempotencyKey string, expiresAt *time.Time) (string, int, error)
 }
 
 // Broadcaster records events and pushes them to WebSocket clients.
@@ -367,33 +377,6 @@ func (s *Scheduler) fireSchedule(ctx context.Context, sched scheduleRow) {
 		sched.WorkspaceID,
 	).Scan(&activeTasks, &maxConcurrent)
 	capCancel()
-	if capErr == nil && activeTasks >= maxConcurrent {
-		log.Printf("Scheduler: '%s' workspace %s at capacity (active_tasks=%d, max=%d), deferring up to 2 min",
-			sched.Name, short(sched.WorkspaceID, 12), activeTasks, maxConcurrent)
-		// Poll every 10s for up to 2 minutes
-		waited := false
-		for i := 0; i < 12; i++ {
-			time.Sleep(10 * time.Second)
-			pollCtx, pollCancel := context.WithTimeout(ctx, dbQueryTimeout)
-			err := db.DB.QueryRowContext(pollCtx,
-				`SELECT COALESCE(active_tasks, 0), COALESCE(max_concurrent_tasks, 1) FROM workspaces WHERE id = $1`,
-				sched.WorkspaceID,
-			).Scan(&activeTasks, &maxConcurrent)
-			pollCancel()
-			if err != nil || activeTasks < maxConcurrent {
-				waited = true
-				break
-			}
-		}
-		if !waited && activeTasks >= maxConcurrent {
-			log.Printf("Scheduler: skipping '%s' on busy workspace %s after 2 min wait (active_tasks=%d, max=%d)",
-				sched.Name, short(sched.WorkspaceID, 12), activeTasks, maxConcurrent)
-			s.recordSkipped(ctx, sched, activeTasks)
-			return
-		}
-		log.Printf("Scheduler: '%s' workspace %s has capacity after deferral, firing",
-			sched.Name, short(sched.WorkspaceID, 12))
-	}
 
 	fireCtx, cancel := context.WithTimeout(ctx, fireTimeout)
 	defer cancel()
@@ -402,6 +385,9 @@ func (s *Scheduler) fireSchedule(ctx context.Context, sched scheduleRow) {
 	// The agent sees recent peer messages before acting, enabling cross-agent
 	// awareness without explicit A2A delegation. Best-effort — if the fetch
 	// fails or the workspace has no Slack channels, the prompt is unchanged.
+	//
+	// Built BEFORE the capacity check so the busy-enqueue path below buffers
+	// the exact same A2A message the fire path would have dispatched.
 	prompt := sched.Prompt
 	if s.channels != nil {
 		if channelCtx := s.channels.FetchWorkspaceChannelContext(fireCtx, sched.WorkspaceID); channelCtx != "" {
@@ -423,6 +409,49 @@ func (s *Scheduler) fireSchedule(ctx context.Context, sched scheduleRow) {
 	})
 	if marshalErr != nil {
 		log.Printf("Scheduler '%s': json.Marshal a2aBody failed: %v", sched.Name, marshalErr)
+		return
+	}
+
+	// #969 → durable buffering. When the target workspace is busy
+	// (active_tasks >= max_concurrent_tasks) we do NOT skip the tick and we do
+	// NOT block the scheduler goroutine waiting for capacity. Instead we durably
+	// buffer the cron message, mirroring how busy A2A dispatches already buffer.
+	// The drain then dispatches it serially the moment the agent frees —
+	// execution stays one-at-a-time; max_concurrent_tasks is unchanged.
+	//
+	// This supersedes the previous "poll then recordSkipped" behavior, which
+	// dropped scheduled ticks on workspaces that stayed busy across the whole
+	// poll window.
+	//
+	// Idempotency key = sched.ID (the SCHEDULE id), NOT msgID/a random uuid.
+	// Keying by schedule_id means a busy agent buffers AT MOST ONE pending tick
+	// per schedule — the latest one wins, the obsolete newer tick is collapsed —
+	// so we hold the next tick instead of stacking a stale backlog.
+	if capErr == nil && activeTasks >= maxConcurrent {
+		// Buffered ticks expire at the next scheduled fire: a tick that's been
+		// sitting in the queue past when the cron would naturally tick again is
+		// stale, so let it expire rather than fire late. Best-effort — on a bad
+		// cron expr we enqueue with no TTL (NULL) rather than block the tick.
+		var expiresAt *time.Time
+		if nextRun, nrErr := ComputeNextRun(sched.CronExpr, sched.Timezone, time.Now()); nrErr == nil {
+			expiresAt = &nextRun
+		}
+		enqCtx, enqCancel := context.WithTimeout(ctx, dbQueryTimeout)
+		// Empty callerID = canvas-style (source_id NULL), matching the fire path.
+		qID, depth, enqErr := s.proxy.EnqueueA2A(enqCtx, sched.WorkspaceID, "", priorityTask, a2aBody, "message/send", sched.ID, expiresAt)
+		enqCancel()
+		if enqErr != nil {
+			// Enqueue failed — fall back to recording a skip so the liveness
+			// view still advances and the operator sees the error, rather than
+			// silently dropping the tick or firing into a busy agent.
+			log.Printf("Scheduler: '%s' enqueue on busy workspace %s failed, recording skip: %v",
+				sched.Name, short(sched.WorkspaceID, 12), enqErr)
+			s.recordSkipped(ctx, sched, activeTasks)
+			return
+		}
+		log.Printf("Scheduler: '%s' workspace %s busy (active_tasks=%d, max=%d) — enqueued tick %s (queue depth=%d), will drain when idle",
+			sched.Name, short(sched.WorkspaceID, 12), activeTasks, maxConcurrent, short(qID, 8), depth)
+		s.recordQueued(ctx, sched, activeTasks, qID, depth)
 		return
 	}
 
@@ -723,6 +752,74 @@ func (s *Scheduler) recordSkipped(ctx context.Context, sched scheduleRow, active
 			"schedule_id":   sched.ID,
 			"schedule_name": sched.Name,
 			"reason":        reason,
+		})
+	}
+}
+
+// recordQueued advances next_run_at and logs a cron_run activity entry with
+// status='queued' when the target workspace was busy and the tick was durably
+// buffered instead of fired. Mirrors recordSkipped (#115) but records a buffer,
+// not a drop: the drain will dispatch qID serially when the agent frees.
+// next_run_at still advances so the liveness view keeps ticking and the NEXT
+// cron slot enqueues (the schedule_id idempotency key then holds at most one
+// pending tick — the latest — per schedule).
+func (s *Scheduler) recordQueued(ctx context.Context, sched scheduleRow, activeTasks int, queueID string, depth int) {
+	reason := fmt.Sprintf("queued: workspace busy (active_tasks=%d), buffered (id=%s, depth=%d)", activeTasks, short(queueID, 8), depth)
+
+	nextRun, nextErr := ComputeNextRun(sched.CronExpr, sched.Timezone, time.Now())
+	var nextRunPtr *time.Time
+	if nextErr == nil {
+		nextRunPtr = &nextRun
+	} else {
+		// Same guard as recordSkipped/fireSchedule — preserve existing
+		// next_run_at rather than writing NULL on an unparseable cron expr.
+		log.Printf("Scheduler: ComputeNextRun error in recordQueued for '%s' (%s) — preserving existing next_run_at: %v",
+			sched.Name, sched.ID, nextErr)
+	}
+
+	queuedUpdCtx, queuedUpdCancel := context.WithTimeout(context.Background(), dbQueryTimeout)
+	if _, err := db.DB.ExecContext(queuedUpdCtx, `
+		UPDATE workspace_schedules
+		SET last_run_at = now(),
+		    next_run_at = COALESCE($2, next_run_at),
+		    run_count = run_count + 1,
+		    last_status = 'queued',
+		    last_error = $3,
+		    updated_at = now()
+		WHERE id = $1
+	`, sched.ID, nextRunPtr, sanitizeUTF8(reason)); err != nil {
+		log.Printf("Scheduler: '%s' queued update failed: %v", sched.Name, err)
+	}
+	queuedUpdCancel()
+
+	cronMeta, marshalErr := json.Marshal(map[string]interface{}{
+		"schedule_id":   sched.ID,
+		"schedule_name": sched.Name,
+		"cron_expr":     sched.CronExpr,
+		"queued":        true,
+		"active_tasks":  activeTasks,
+		"queue_id":      queueID,
+		"queue_depth":   depth,
+	})
+	if marshalErr != nil {
+		log.Printf("Scheduler '%s': json.Marshal cronMeta(queued) failed: %v", sched.Name, marshalErr)
+	} else {
+		queuedInsCtx, queuedInsCancel := context.WithTimeout(context.Background(), dbQueryTimeout)
+		if _, err := db.DB.ExecContext(queuedInsCtx, `
+			INSERT INTO activity_logs (workspace_id, activity_type, source_id, method, summary, request_body, status, error_detail, created_at)
+			VALUES ($1, 'cron_run', NULL, 'cron', $2, $3::jsonb, 'queued', $4, now())
+		`, sched.WorkspaceID, sanitizeUTF8("Cron queued (busy): "+sched.Name), string(cronMeta), sanitizeUTF8(reason)); err != nil {
+			log.Printf("Scheduler: '%s' queued activity log failed: %v", sched.Name, err)
+		}
+		queuedInsCancel()
+	}
+
+	if s.broadcaster != nil {
+		_ = s.broadcaster.RecordAndBroadcast(ctx, string(events.EventCronSkipped), sched.WorkspaceID, map[string]interface{}{
+			"schedule_id":   sched.ID,
+			"schedule_name": sched.Name,
+			"reason":        reason,
+			"queued":        true,
 		})
 	}
 }

@@ -97,10 +97,10 @@ type QueuedItem struct {
 // returns the new row ID + current queue depth. Caller MUST have already
 // determined the target is busy — this function does not check.
 //
-// Idempotency: when idempotencyKey is non-empty, the partial unique index
-// `idx_a2a_queue_idempotency` prevents duplicate active rows for the same
-// (workspace_id, idempotency_key). On conflict this returns the existing
-// row's ID so the caller's log still points at the live queue entry.
+// Idempotency: when idempotencyKey is non-empty, a duplicate active enqueue
+// for the same (workspace, key) is collapsed rather than double-buffered. On
+// a duplicate this returns the existing row's ID so the caller's log still
+// points at the live queue entry.
 func EnqueueA2A(
 	ctx context.Context,
 	workspaceID, callerID string,
@@ -127,6 +127,32 @@ func EnqueueA2A(
 	var expiresAtArg interface{}
 	if expiresAt != nil {
 		expiresAtArg = *expiresAt
+	}
+
+	// Supersede any already-expired pending row for this same key before we
+	// insert. The drain path skips expired pending rows, so such a row never
+	// completes on its own — it lingers in the active set and would block the
+	// conflict check below, silently swallowing this fresh enqueue. Retiring
+	// it here (a) frees the active set so the insert below proceeds and (b)
+	// cleans the stale row up so expired rows don't accumulate. Scoped to the
+	// idempotency key so unrelated traffic is untouched.
+	if idempotencyKey != "" {
+		if _, supErr := db.DB.ExecContext(ctx, `
+			UPDATE a2a_queue
+			SET status = 'dropped',
+			    last_error = 'superseded: expired before drain; replaced by a fresh enqueue'
+			WHERE workspace_id = $1
+			  AND idempotency_key = $2
+			  AND status = 'queued'
+			  AND expires_at IS NOT NULL
+			  AND expires_at <= now()
+		`, workspaceID, idempotencyKey); supErr != nil {
+			// Non-fatal: if the cleanup fails we still attempt the insert. Worst
+			// case the conflict path returns the (stale) existing row's id, which
+			// is the pre-fix behaviour — no new breakage introduced here.
+			log.Printf("A2AQueue: supersede-expired cleanup failed for workspace %s key %s: %v",
+				workspaceID, idempotencyKey, supErr)
+		}
 	}
 
 	// INSERT ... ON CONFLICT DO NOTHING RETURNING id. The conflict target

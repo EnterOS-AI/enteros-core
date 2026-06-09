@@ -105,6 +105,12 @@ import urllib.parse
 import urllib.request
 from typing import Any
 
+# SSOT fail-closed approval predicate (SEV-1 internal#812). review-check.sh
+# consumes the same module via _review_check_filter.py — do NOT duplicate
+# the predicate here. See _approval_validator.py for the fail-closed contract.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _approval_validator import classify_reviews as _classify_reviews_ssot  # noqa: E402
+
 
 def _env(key: str, *, default: str = "") -> str:
     return os.environ.get(key, default)
@@ -148,10 +154,23 @@ OPT_OUT_LABELS = {
 # branch-protection configuration. These are the uniform-gate checks that
 # must pass before any PR can merge (SOP tier removal makes them mandatory
 # for all PRs, not just tier:medium/tier:high).
+#
+# Context names use the (pull_request_target) suffix (not pull_request)
+# to match the workflow event_type that actually emits them — verified
+# live against PR#2419/#2331/etc.: the qa-review/security-review
+# workflows run on pull_request_target (their `on:` block uses
+# pull_request_target, not pull_request), and sop-checklist's
+# all-items-acked job also uses pull_request_target. The previous
+# (pull_request) suffix never matched the live emitted contexts,
+# which is what was painting ~16 ready PRs red (gate appeared
+# "missing" qa-review/security-review even after both passed).
+# Verified against the lint-bp-context-emit-match test which already
+# asserts (pull_request_target) for these names. No requirement
+# dropped; just a name correction.
 GOVERNANCE_REQUIRED_CONTEXTS = [
-    "qa-review / approved (pull_request)",
-    "security-review / approved (pull_request)",
-    "sop-checklist / all-items-acked (pull_request)",
+    "qa-review / approved (pull_request_target)",
+    "security-review / approved (pull_request_target)",
+    "sop-checklist / all-items-acked (pull_request_target)",
 ]
 REQUIRED_CONTEXTS_RAW = _env(
     "REQUIRED_CONTEXTS",
@@ -411,57 +430,26 @@ def get_branch_protection(branch: str) -> BranchProtection:
 def genuine_approvals(
     reviews: list[dict],
     *,
-    head_sha: str,
+    headsha: str,
     reviewer_set: set[str],
 ) -> tuple[set[str], list[str]]:
-    """Reduce a PR's reviews to genuine official approvals on the CURRENT head.
+    """Thin wrapper over the SSOT predicate in _approval_validator.py.
 
-    Returns (approvers, request_changes) where:
-      - approvers is the set of distinct logins (in reviewer_set) whose LATEST
-        review on the current head is an official, non-stale, non-dismissed
-        APPROVED, and
-      - request_changes is the list of logins (in reviewer_set) whose latest
-        official review on the current head is REQUEST_CHANGES.
+    All logic — the per-review commit_id / state / official / dismissed /
+    stale contract — lives in _approval_validator.classify_reviews. This
+    wrapper exists only to keep the call site (and external readers of
+    the symbol) stable. Do NOT add any per-review logic here; if you need
+    to change the predicate, edit _approval_validator.py.
 
-    "Current head" is enforced two ways, because Gitea exposes both signals:
-    a review must be `official` and NOT `stale`/`dismissed`, AND when the
-    review carries a commit_id it must equal head_sha. A review with no
-    commit_id but stale=False/dismissed=False is accepted (older Gitea rows).
-    We take each reviewer's LATEST submission (reviews arrive oldest-first), so
-    a later REQUEST_CHANGES correctly supersedes an earlier APPROVED and vice
-    versa.
+    See _approval_validator.py for the full fail-closed contract
+    (SEV-1 internal#812). The previous inline implementation had a
+    `if isinstance(commit_id, str) and commit_id and headsha:` guard that
+    silently accepted reviews with no commit_id; that fail-open surface is
+    now closed at the SSOT.
     """
-    latest_by_user: dict[str, dict] = {}
-    for review in reviews:
-        if not isinstance(review, dict):
-            continue
-        user = (review.get("user") or {}).get("login")
-        if not isinstance(user, str) or user not in reviewer_set:
-            continue
-        state = str(review.get("state") or "").upper()
-        if state not in {"APPROVED", "REQUEST_CHANGES"}:
-            continue  # ignore COMMENT/PENDING/DISMISSED-state rows
-        # reviews are returned oldest-first; later entries overwrite → latest wins
-        latest_by_user[user] = review
-
-    approvers: set[str] = set()
-    request_changes: list[str] = []
-    for user, review in latest_by_user.items():
-        if not review.get("official"):
-            continue
-        if review.get("stale") or review.get("dismissed"):
-            continue
-        commit_id = review.get("commit_id")
-        if isinstance(commit_id, str) and commit_id and head_sha:
-            if commit_id != head_sha:
-                continue  # review was on a previous head
-        state = str(review.get("state") or "").upper()
-        if state == "APPROVED":
-            approvers.add(user)
-        elif state == "REQUEST_CHANGES":
-            request_changes.append(user)
-    return approvers, request_changes
-
+    return _classify_reviews_ssot(
+        reviews, headsha=headsha, reviewer_set=reviewer_set
+    )
 
 def get_pull_reviews(pr_number: int) -> list[dict]:
     _, body = api("GET", f"/repos/{OWNER}/{NAME}/pulls/{pr_number}/reviews")
@@ -1134,7 +1122,7 @@ def _evaluate_candidate(
 
     reviews = get_pull_reviews(pr_number)
     approvers, request_changes = genuine_approvals(
-        reviews, head_sha=head_sha, reviewer_set=REVIEWER_SET
+        reviews, headsha=head_sha, reviewer_set=REVIEWER_SET
     )
 
     decision = evaluate_merge_readiness(

@@ -9,6 +9,7 @@ import { showToast } from "@/components/Toaster";
 import type { ActivityEntry } from "@/types/activity";
 import { Canvas } from "@/components/Canvas";
 import { CommunicationOverlay } from "@/components/CommunicationOverlay";
+import { MessageFlightHome } from "./MessageFlightHome";
 import { ChatTab } from "@/components/tabs/ChatTab";
 import { WorkspacePanelTabs } from "@/components/WorkspacePanelTabs";
 import { SettingsTabs } from "@/components/settings";
@@ -227,12 +228,17 @@ export function ConciergeShell() {
     const isRoot = depth === 0;
     const isPlatform = n.id === platformRoot?.id;
     const q = (n.data.activeTasks as number) ?? 0;
+    // Role can be a long descriptor (e.g. "Coding Executor (Kimi) — …"); render
+    // it compact (single-line, truncated by .wsRole) and surface the full text
+    // on hover via the native tooltip.
+    const roleLabel = isPlatform ? "platform" : n.data.role || "agent";
     const row = (
       <div
         role="button"
         tabIndex={0}
         data-testid="agent-tree-node"
         data-node-name={n.data.name}
+        data-ws-id={n.id}
         data-platform={isPlatform ? "true" : "false"}
         data-depth={depth}
         className={`${s.ws} ${selectedNodeId === n.id ? s.active : ""}`}
@@ -251,7 +257,7 @@ export function ConciergeShell() {
         <div className={s.wsMeta}>
           <div className={s.wsName}>{n.data.name}</div>
           <div className={s.wsSub}>
-            <span className={s.wsRole}>{isPlatform ? "platform" : n.data.role || "agent"}</span>
+            <span className={s.wsRole} title={roleLabel}>{roleLabel}</span>
             <span className={s.wsStatus} style={{ color: st.color }}>
               <span className={s.sdot} style={{ background: st.color }} />
               {st.label}
@@ -295,6 +301,8 @@ export function ConciergeShell() {
 
   return (
     <div className={s.root}>
+      {/* Envelope flies between agent rows on each delegate/message event. */}
+      <MessageFlightHome />
       <div className={`${s.app} ${railOpen ? s.railOpen : ""}`}>
         {/* ICON RAIL */}
         <nav className={s.rail}>

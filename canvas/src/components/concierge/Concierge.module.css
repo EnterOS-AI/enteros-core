@@ -134,9 +134,9 @@
 .ws.active .wsAv .dot { border-color: var(--card); }
 .wsMeta { min-width: 0; flex: 1; }
 .wsName { font-weight: 600; font-size: 13.5px; letter-spacing: -.01em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.wsSub { display: flex; align-items: center; gap: 6px; margin-top: 1px; }
-.wsRole { font-family: var(--mono); font-size: 10.5px; color: var(--tx-3); }
-.wsStatus { font-size: 10.5px; font-weight: 500; display: flex; align-items: center; gap: 4px; }
+.wsSub { display: flex; align-items: center; gap: 6px; margin-top: 1px; min-width: 0; }
+.wsRole { font-family: var(--mono); font-size: 10.5px; color: var(--tx-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; flex: 0 1 auto; }
+.wsStatus { font-size: 10.5px; font-weight: 500; display: flex; align-items: center; gap: 4px; flex: 0 0 auto; }
 .wsStatus .sdot { width: 6px; height: 6px; border-radius: 50%; }
 .rootTag { margin-left: auto; font-family: var(--mono); font-size: 9px; letter-spacing: .1em; text-transform: uppercase; color: var(--accent-2); background: var(--accent-soft); padding: 3px 6px; border-radius: 6px; border: 1px solid rgba(139,92,246,.28); }
 .wsQ { margin-left: auto; flex: 0 0 auto; font-family: var(--mono); font-size: 10px; font-weight: 700; color: var(--tx-2); background: var(--hair); border: 1px solid var(--hair-2); padding: 2px 7px; border-radius: 20px; display: inline-flex; align-items: center; gap: 4px; }

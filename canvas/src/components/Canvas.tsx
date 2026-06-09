@@ -17,6 +17,7 @@ import { WORKSPACE_KIND } from "@/lib/workspace-kind";
 import { stripPlatformRootForMap } from "@/store/canvas-topology";
 import { useTheme } from "@/lib/theme-provider";
 import { A2ATopologyOverlay } from "./A2ATopologyOverlay";
+import { MessageFlightLayer } from "./MessageFlightLayer";
 import { WorkspaceNode } from "./WorkspaceNode";
 import { SidePanel } from "./SidePanel";
 import { CreateWorkspaceButton } from "./CreateWorkspaceDialog";
@@ -371,6 +372,10 @@ function CanvasInner() {
             nodeBorderRadius={4}
           />
           <DropTargetBadge />
+          {/* Flies an envelope between agents on each delegate/message event.
+              Inside <ReactFlow> so its ViewportPortal renders in flow coords
+              and tracks pan/zoom. */}
+          <MessageFlightLayer />
         </ReactFlow>
 
         {/* Screen-reader live region — announces workspace count on initial load and

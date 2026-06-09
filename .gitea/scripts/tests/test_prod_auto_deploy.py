@@ -105,16 +105,25 @@ def test_build_plan_disable_flag_short_circuits_before_credentials():
     assert plan["disabled_reason"] == "PROD_AUTO_DEPLOY_DISABLED=true"
 
 
-def test_latest_status_for_context_uses_first_matching_status():
+def test_latest_status_for_context_picks_newest_by_id_regardless_of_order():
+    # The exhaustively-paginated /statuses list is ascending id order
+    # (oldest-first), the opposite of the combined /status view. The selector
+    # must collapse duplicate context rows to the NEWEST (max id) so a stale
+    # earlier run never shadows the current result, whichever way they arrive.
     statuses = [
-        {"context": "CI / all-required (push)", "status": "pending"},
-        {"context": "CI / all-required (pull_request)", "status": "success"},
-        {"context": "CI / all-required (push)", "status": "success"},
+        {"id": 10, "context": "CI / all-required (push)", "status": "pending"},
+        {"id": 11, "context": "CI / all-required (pull_request)", "status": "success"},
+        {"id": 12, "context": "CI / all-required (push)", "status": "success"},
     ]
 
     latest = prod.latest_status_for_context(statuses, "CI / all-required (push)")
 
-    assert latest == {"context": "CI / all-required (push)", "status": "pending"}
+    assert latest == {"id": 12, "context": "CI / all-required (push)", "status": "success"}
+
+    # Same rows shuffled (newest-first, as the combined view would deliver)
+    # must still resolve to the same newest row.
+    latest_rev = prod.latest_status_for_context(list(reversed(statuses)), "CI / all-required (push)")
+    assert latest_rev == {"id": 12, "context": "CI / all-required (push)", "status": "success"}
 
 
 def test_ci_context_state_handles_missing_and_gitea_status_key():
@@ -612,3 +621,123 @@ def test_superseded_by_none_for_latest_job_so_it_still_rolls(monkeypatch):
         )
         is None
     )
+
+
+# ---------------------------------------------------------------------------
+# /statuses pagination — required-context SUCCESS on page 2+ must be FOUND,
+# genuinely-absent context must STILL fail-closed (no fail-open).
+# Regression for the single-page-status bug (#2440-family, pagination RCA):
+# the combined /status view caps `statuses` at ~30, so on a high-churn commit
+# the still-current required-context row is pushed past page 1 and the reader
+# falsely reports it `missing`.
+# ---------------------------------------------------------------------------
+def _paged_statuses_stub(pages):
+    """Return a fake _api_json_list that serves `pages` keyed by ?page=N."""
+    def fake(url, _token):
+        # url looks like .../statuses?page=N&limit=100
+        page = 1
+        for part in url.split("?", 1)[-1].split("&"):
+            if part.startswith("page="):
+                page = int(part.split("=", 1)[1])
+        return pages.get(page, [])
+    return fake
+
+
+def test_fetch_all_statuses_finds_required_success_on_page_two(monkeypatch):
+    # Page 1 is a full 100 rows of unrelated/older churn; the required-context
+    # SUCCESS only appears on page 2. A single-page reader would miss it.
+    page1 = [
+        {"id": i, "context": f"noise-{i} (push)", "status": "pending"}
+        for i in range(100)
+    ]
+    page2 = [
+        {"id": 200, "context": "CI / all-required (push)", "status": "success"},
+        {"id": 201, "context": "Secret scan / Scan diff for credential-shaped strings (push)",
+         "status": "success"},
+    ]
+    monkeypatch.setattr(prod, "_api_json_list", _paged_statuses_stub({1: page1, 2: page2}))
+
+    rows = prod.fetch_all_statuses("git.moleculesai.app", "molecule-ai/molecule-core", "a" * 40, "tok")
+    # Must have walked to page 2 and accumulated every row.
+    assert len(rows) == 102
+    assert prod.ci_context_state(rows, "CI / all-required (push)") == "success"
+    assert (
+        prod.ci_context_state(
+            rows, "Secret scan / Scan diff for credential-shaped strings (push)"
+        )
+        == "success"
+    )
+
+
+def test_fetch_all_statuses_genuinely_absent_context_stays_missing(monkeypatch):
+    # The required context is on NO page → fail-closed: ci_context_state must
+    # report "missing", which context_is_satisfied() rejects → gate stays shut.
+    page1 = [
+        {"id": i, "context": f"noise-{i} (push)", "status": "success"}
+        for i in range(100)
+    ]
+    page2 = [{"id": 200, "context": "some-other (push)", "status": "success"}]
+    monkeypatch.setattr(prod, "_api_json_list", _paged_statuses_stub({1: page1, 2: page2}))
+
+    rows = prod.fetch_all_statuses("git.moleculesai.app", "molecule-ai/molecule-core", "b" * 40, "tok")
+    state = prod.ci_context_state(rows, "CI / all-required (push)")
+    assert state == "missing"
+    assert prod.context_is_satisfied(state) is False
+
+
+def test_fetch_all_statuses_fail_closed_on_page_error(monkeypatch):
+    # A page that raises (unreadable) must propagate, never silently truncate
+    # the scan and let the caller treat a partial list as complete.
+    def boom(url, _token):
+        if "page=2" in url:
+            raise RuntimeError("GET .../statuses?page=2 -> HTTP 502: bad gateway")
+        return [{"id": i, "context": f"n-{i}", "status": "success"} for i in range(100)]
+
+    monkeypatch.setattr(prod, "_api_json_list", boom)
+    try:
+        prod.fetch_all_statuses("h", "r", "c" * 40, "tok")
+    except RuntimeError as exc:
+        assert "502" in str(exc)
+    else:
+        raise AssertionError("expected page-2 error to propagate (fail-closed)")
+
+
+def test_wait_for_ci_context_succeeds_when_required_status_is_past_page_one(monkeypatch):
+    # End-to-end: the gate reads the EXHAUSTIVE list, so a required SUCCESS that
+    # only exists past page 1 lets the deploy proceed instead of timing out.
+    full = [
+        {"id": i, "context": f"noise-{i} (push)", "status": "success"}
+        for i in range(100)
+    ] + [
+        {"id": 500, "context": "CI / all-required (push)", "status": "success"},
+        {"id": 501, "context": "Secret scan / Scan diff for credential-shaped strings (push)",
+         "status": "success"},
+    ]
+    monkeypatch.setattr(prod, "fetch_all_statuses", lambda *a, **k: full)
+    result = prod.wait_for_ci_context(
+        {"GITHUB_SHA": "d" * 40, "GITEA_TOKEN": "tok", "CI_STATUS_TIMEOUT_SECONDS": "30"}
+    )
+    assert result == "success"
+
+
+def test_wait_for_ci_context_times_out_fail_closed_when_required_absent(monkeypatch):
+    # Genuinely-absent required context across all pages → never satisfied →
+    # the gate times out rather than green-lighting the deploy (no fail-open).
+    present_but_irrelevant = [
+        {"id": 500, "context": "some-other (push)", "status": "success"},
+    ]
+    monkeypatch.setattr(prod, "fetch_all_statuses", lambda *a, **k: present_but_irrelevant)
+    # Zero timeout + 0 interval → single poll then TimeoutError.
+    try:
+        prod.wait_for_ci_context(
+            {
+                "GITHUB_SHA": "e" * 40,
+                "GITEA_TOKEN": "tok",
+                "CI_STATUS_TIMEOUT_SECONDS": "1",
+                "CI_STATUS_POLL_INTERVAL_SECONDS": "1",
+            }
+        )
+    except TimeoutError as exc:
+        assert "missing" in str(exc)
+    else:
+        raise AssertionError("expected fail-closed TimeoutError, not a satisfied gate")

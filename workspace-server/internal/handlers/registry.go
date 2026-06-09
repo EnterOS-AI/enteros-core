@@ -309,6 +309,8 @@ func validateAgentURL(rawURL string) error {
 // (covers prod `*.moleculesai.app` and staging `*.staging.moleculesai.app`) and
 // is overridable via MOLECULE_APP_DOMAIN for other deployments.
 func isPlatformTunnelHostname(h string) bool {
+	// DNS is case-insensitive and FQDN-form hostnames may carry a trailing dot.
+	h = strings.ToLower(strings.TrimSuffix(h, "."))
 	if !strings.HasPrefix(h, "ws-") {
 		return false
 	}
@@ -316,6 +318,7 @@ func isPlatformTunnelHostname(h string) bool {
 	if domain == "" {
 		domain = "moleculesai.app"
 	}
+	domain = strings.ToLower(strings.TrimSuffix(domain, "."))
 	return strings.HasSuffix(h, "."+domain)
 }
 
@@ -722,6 +725,25 @@ func (h *RegistryHandler) Heartbeat(c *gin.Context) {
 		log.Printf("Heartbeat update error: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update"})
 		return
+	}
+
+	// #2421: backfill agent_card when the initial register failed and the
+	// heartbeat carries it. Only writes when NULL — never overwrites a
+	// reconciled or updated card. This is the recovery path for fast-cloud
+	// workspaces whose DNS wasn't ready at first register.
+	if len(payload.AgentCard) > 0 {
+		res, err := db.DB.ExecContext(ctx, `
+			UPDATE workspaces
+			SET agent_card = $2
+			WHERE id = $1 AND agent_card IS NULL
+		`, payload.WorkspaceID, payload.AgentCard)
+		if err != nil {
+			log.Printf("Registry heartbeat: agent_card backfill failed for %s: %v", payload.WorkspaceID, err)
+		} else {
+			if rows, _ := res.RowsAffected(); rows > 0 {
+				log.Printf("Registry heartbeat: backfilled agent_card for %s (initial register had failed)", payload.WorkspaceID)
+			}
+		}
 	}
 
 	// Refresh Redis TTL

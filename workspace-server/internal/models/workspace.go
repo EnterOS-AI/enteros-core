@@ -143,6 +143,12 @@ type HeartbeatPayload struct {
 	// false declared explicitly". Lets the platform distinguish "adapter
 	// said no native ownership" from "old runtime version, didn't say".
 	RuntimeMetadata *RuntimeMetadata `json:"runtime_metadata,omitempty"`
+
+	// AgentCard is sent by the runtime on heartbeat when the initial
+	// /registry/register failed and the workspace has no persisted agent_card.
+	// The heartbeat handler backfills NULL agent_card rows so the workspace
+	// can come online without requiring a full re-register. (#2421)
+	AgentCard json.RawMessage `json:"agent_card,omitempty"`
 }
 
 // RuntimeMetadata is the adapter-declared capability + override block

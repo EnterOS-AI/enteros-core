@@ -116,28 +116,65 @@ fi
 # 3. Status-check state at the PR HEAD (where checks ran). The merge
 #    commit doesn't get its own checks; we evaluate the PR's last
 #    commit, which is what branch protection compared against.
-# Fail-closed: verify HTTP 200. A 401/403/404 means the status is
-# unreadable — we must NOT treat that as "no statuses" and skip checks.
-STATUS_TMP=$(mktemp)
-STATUS_HTTP=$(curl -sS -o "$STATUS_TMP" -w '%{http_code}' -H "$AUTH" \
-  "${API}/repos/${OWNER}/${NAME}/commits/${HEAD_SHA}/status")
-STATUS=$(cat "$STATUS_TMP")
-rm -f "$STATUS_TMP"
-if [ "$STATUS_HTTP" != "200" ]; then
-  echo "::error::GET /commits/${HEAD_SHA}/status returned HTTP ${STATUS_HTTP} — cannot evaluate required checks."
-  exit 1
-fi
-# FAIL-CLOSED: a 200 status response missing the 'statuses' array, or with
-# 'statuses' set to a non-array type (null/string/object), must NOT be treated
-# as "no checks" — that would silently declare all checks green.
-if ! echo "$STATUS" | jq -e '(.statuses | type) == "array"' >/dev/null; then
-  echo "::error::GET /commits/${HEAD_SHA}/status returned HTTP 200 but 'statuses' is missing or not an array — cannot evaluate required checks."
-  exit 1
-fi
+#
+# Pagination (status-pagination RCA, #2440-family): the combined
+# /commits/{sha}/status endpoint caps its embedded `statuses` array at the
+# Gitea default page size (~30). On a high-churn PR an older-but-still-current
+# required-context SUCCESS row is pushed PAST that cap, so reading the combined
+# view would record that context as `missing` and emit a FALSE-POSITIVE
+# force-merge. We instead page through the dedicated /commits/{sha}/statuses
+# list to EXHAUSTION (until a short/empty page), accumulating every row.
+#
+# Fail-closed is preserved end to end: any non-200 page, or a page whose body
+# is not a JSON array, aborts with exit 1 (we never treat an unreadable/partial
+# page as "no checks"). A genuinely-absent required context appears on NO page,
+# so CHECK_STATE has no entry for it → `${...:-missing}` below keeps it
+# `missing` → it is still counted as not-green. No fail-open path is added.
+PER_PAGE=100
+page=1
+ALL_STATUSES_TMP=$(mktemp)
+printf '[]' > "$ALL_STATUSES_TMP"   # accumulator: a single JSON array of rows
+while :; do
+  STATUS_TMP=$(mktemp)
+  STATUS_HTTP=$(curl -sS -o "$STATUS_TMP" -w '%{http_code}' -H "$AUTH" \
+    "${API}/repos/${OWNER}/${NAME}/commits/${HEAD_SHA}/statuses?page=${page}&limit=${PER_PAGE}")
+  PAGE_BODY=$(cat "$STATUS_TMP")
+  rm -f "$STATUS_TMP"
+  if [ "$STATUS_HTTP" != "200" ]; then
+    rm -f "$ALL_STATUSES_TMP"
+    echo "::error::GET /commits/${HEAD_SHA}/statuses?page=${page} returned HTTP ${STATUS_HTTP} — cannot evaluate required checks."
+    exit 1
+  fi
+  # FAIL-CLOSED: the /statuses endpoint returns a bare JSON array. A non-array
+  # body (null/object/string) means the response is malformed — we must NOT
+  # treat that as "no checks", which would silently declare all checks green.
+  if ! echo "$PAGE_BODY" | jq -e 'type == "array"' >/dev/null 2>&1; then
+    rm -f "$ALL_STATUSES_TMP"
+    echo "::error::GET /commits/${HEAD_SHA}/statuses?page=${page} returned HTTP 200 but body is not a JSON array — cannot evaluate required checks."
+    exit 1
+  fi
+  PAGE_COUNT=$(echo "$PAGE_BODY" | jq 'length')
+  # Append this page's rows to the accumulator (insertion order is preserved
+  # but NOT relied upon — the collapse below selects max-by-id per context).
+  COMBINED=$(jq -s '.[0] + .[1]' "$ALL_STATUSES_TMP" <(echo "$PAGE_BODY"))
+  printf '%s' "$COMBINED" > "$ALL_STATUSES_TMP"
+  # Short page (fewer than PER_PAGE rows) ⇒ last page ⇒ stop.
+  if [ "$PAGE_COUNT" -lt "$PER_PAGE" ]; then
+    break
+  fi
+  page=$((page + 1))
+done
+STATUS=$(cat "$ALL_STATUSES_TMP")
+rm -f "$ALL_STATUSES_TMP"
 declare -A CHECK_STATE
+# Gitea's /commits/{sha}/statuses is roughly newest-first but NOT strictly
+# monotonic by id (observed first ids 157,155,156,… — local inversions from
+# re-runs and page boundaries), so neither first- nor last-occurrence reliably
+# yields the current row. Select the MAX-id row per context explicitly
+# (order-independent), matching prod-auto-deploy.py's latest_status_for_context.
 while IFS=$'\t' read -r ctx state; do
   [ -n "$ctx" ] && CHECK_STATE[$ctx]="$state"
-done < <(echo "$STATUS" | jq -r '.statuses | .[] | "\(.context)\t\(.status)"')
+done < <(echo "$STATUS" | jq -r 'group_by(.context) | map(max_by(.id)) | .[] | "\(.context)\t\(.status)"')
 
 # 4. For each required check, was it green at merge? YAML block scalars
 #    (`|`) leave a trailing newline; skip blank/whitespace-only lines.

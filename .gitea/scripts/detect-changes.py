@@ -26,10 +26,21 @@ PROFILES: dict[str, dict[str, str]] = {
         "handlers": (
             r"^workspace-server/internal/handlers/"
             r"|^workspace-server/internal/wsauth/"
+            # #2148: registry-auth real-PG integration tests (CanCommunicate
+            # parent_id hierarchy lives in internal/registry; org-admin token
+            # revoke/validate lives in internal/orgtoken) run in this same
+            # workflow, so a regression in either package MUST trigger the job.
+            r"|^workspace-server/internal/registry/"
+            r"|^workspace-server/internal/orgtoken/"
             # #2149: the scheduler real-PG integration tests run in this same
             # workflow (they reuse its migrated Postgres), so changes to the
             # scheduler package must trigger the job too.
             r"|^workspace-server/internal/scheduler/"
+            # #2150: the db package's real-PG migration-replay-from-scratch
+            # + InitPostgres ping tests also run in this same workflow (they
+            # reuse its sibling Postgres, against a separate `molecule_replay`
+            # database). Changes to db must trigger the job too.
+            r"|^workspace-server/internal/db/"
             r"|^workspace-server/migrations/"
             r"|^\.gitea/workflows/handlers-postgres-integration\.yml$"
         ),

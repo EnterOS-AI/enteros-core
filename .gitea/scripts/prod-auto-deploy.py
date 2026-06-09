@@ -95,17 +95,27 @@ def build_plan(env: dict[str, str]) -> dict:
 
 
 def latest_status_for_context(statuses: list[dict], context: str) -> dict | None:
-    """Return the first matching status.
+    """Return the NEWEST status row for ``context`` (highest ``id``).
 
-    Gitea's combined-status response is newest-first in practice. The merge
-    queue relies on the same contract; keeping the selector explicit makes
-    stale duplicate contexts easy to test.
+    This must work for BOTH orderings Gitea exposes: the combined
+    ``/status`` view is newest-first, but the exhaustively-paginated
+    ``/statuses`` list (see ``fetch_all_statuses``) is ascending id order
+    (oldest-first). Selecting by max ``id`` collapses duplicate context rows
+    to the current one regardless of input order, so a stale earlier run can
+    never shadow the latest result. Rows without an ``id`` are treated as
+    oldest (id -1) so a well-formed newer row always wins.
     """
-
+    newest: dict | None = None
+    newest_id = -1
     for status in statuses:
-        if status.get("context") == context:
-            return status
-    return None
+        if status.get("context") != context:
+            continue
+        raw_id = status.get("id")
+        sid = raw_id if isinstance(raw_id, int) else -1
+        if newest is None or sid >= newest_id:
+            newest = status
+            newest_id = sid
+    return newest
 
 
 def ci_context_state(statuses: list[dict], context: str) -> str:
@@ -351,6 +361,55 @@ def _api_json(url: str, token: str) -> dict:
         raise RuntimeError(f"GET {url} -> HTTP {exc.code}: {body}") from exc
 
 
+def _api_json_list(url: str, token: str) -> list:
+    """GET a Gitea list endpoint and return the JSON array.
+
+    Like ``_api_json`` but asserts the body is a list. Fail-closed: a non-list
+    body (or HTTP error) raises so the caller never mistakes an unreadable page
+    for "no more statuses" and silently truncates the required-context scan.
+    """
+    req = urllib.request.Request(url, headers={"Authorization": f"token {token}"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            body = json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:500]
+        raise RuntimeError(f"GET {url} -> HTTP {exc.code}: {detail}") from exc
+    if not isinstance(body, list):
+        raise RuntimeError(f"GET {url} -> expected JSON array, got {type(body).__name__}")
+    return body
+
+
+def fetch_all_statuses(host: str, repo: str, sha: str, token: str, page_size: int = 100) -> list[dict]:
+    """Return EVERY commit-status row for ``sha``, paginating to exhaustion.
+
+    The combined ``/commits/{sha}/status`` endpoint caps its embedded
+    ``statuses`` array at the Gitea default page size (~30). On a high-churn
+    commit, an older-but-still-current required-context SUCCESS row is pushed
+    PAST that cap, so a reader of the combined view sees the required context
+    as ``missing`` and either blocks (force-merge audit) or waits forever
+    (this deploy gate). We instead walk ``/commits/{sha}/statuses`` page by
+    page until a short/empty page, accumulating ALL rows.
+
+    Fail-closed: any page that errors or is not a list raises (see
+    ``_api_json_list``) — we never degrade to a partial list and call a deploy
+    green. A genuinely-absent required context simply never appears on ANY
+    page, so the caller's ``ci_context_state`` still reports ``missing`` and
+    the gate stays closed.
+    """
+    base = f"https://{host}/api/v1/repos/{repo}/commits/{sha}/statuses"
+    results: list[dict] = []
+    page = 1
+    while True:
+        page_url = f"{base}?page={page}&limit={page_size}"
+        rows = _api_json_list(page_url, token)
+        results.extend(r for r in rows if isinstance(r, dict))
+        if len(rows) < page_size:
+            break
+        page += 1
+    return results
+
+
 def _api_json_optional(url: str, token: str) -> tuple[int, dict | None]:
     req = urllib.request.Request(url, headers={"Authorization": f"token {token}"})
     try:
@@ -472,12 +531,19 @@ def wait_for_ci_context(env: dict[str, str]) -> str:
     if not token:
         raise ValueError("GITEA_TOKEN is required to wait for CI status")
 
-    url = f"https://{host}/api/v1/repos/{repo}/commits/{sha}/status"
     deadline = time.time() + timeout
     last_states: dict[str, str] = {}
     while time.time() <= deadline:
-        body = _api_json(url, token)
-        statuses = body.get("statuses") or []
+        # Read the FULL, exhaustively-paginated /statuses list — NOT the
+        # combined /status view, whose embedded `statuses` array is capped at
+        # the Gitea page size (~30). On a high-churn commit a required-context
+        # SUCCESS row lands past that cap and the combined view would report
+        # it `missing`, so this gate would wait until timeout and refuse a
+        # legitimate prod deploy. Fetching every page closes that hole.
+        # Fail-closed is preserved: a genuinely-absent required context is on
+        # NO page, so ci_context_state() still returns "missing" → never
+        # satisfied → the deploy stays blocked.
+        statuses = fetch_all_statuses(host, repo, sha, token)
         states = {context: ci_context_state(statuses, context) for context in contexts}
         for context, state in states.items():
             if state != last_states.get(context):

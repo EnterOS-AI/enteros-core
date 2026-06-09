@@ -162,6 +162,11 @@ describe("DisplayTab", () => {
       controller: "user",
       ttl_seconds: 300,
     });
+    // Defensive: the noVNC constructor is async (dynamic import), so wait
+    // for it to be called before asserting arguments (prevents flake in CI).
+    await waitFor(() => {
+      expect(mockRFBConstructor).toHaveBeenCalled();
+    });
     expect(mockRFBConstructor).toHaveBeenCalledWith(
       expect.any(HTMLElement),
       expect.stringContaining("/workspaces/ws-display/display/session/websockify"),

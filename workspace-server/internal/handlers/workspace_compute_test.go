@@ -36,6 +36,68 @@ func TestValidateWorkspaceCompute_RejectsUnknownInstanceType(t *testing.T) {
 	}
 }
 
+// Multi-provider: compute.provider must be "" (default AWS) or one of the wired
+// cloud backends. Pins the allowlist to the controlplane cloudprovider SSOT
+// (Supported = {aws, hetzner, gcp}); if the SSOT changes, update both sides.
+func TestValidateWorkspaceCompute_Provider(t *testing.T) {
+	for _, ok := range []string{"", "aws", "gcp", "hetzner"} {
+		c := models.WorkspaceCompute{Provider: ok}
+		if err := validateWorkspaceCompute(c); err != nil {
+			t.Errorf("provider=%q must be accepted: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"AWS", "azure", "digitalocean", "ec2", "google", "hetzner-cloud"} {
+		c := models.WorkspaceCompute{Provider: bad}
+		if err := validateWorkspaceCompute(c); err == nil {
+			t.Errorf("provider=%q must be rejected", bad)
+		}
+	}
+	// Pin the exact SSOT-mirrored set so a silent drift fails here.
+	want := map[string]struct{}{"aws": {}, "gcp": {}, "hetzner": {}}
+	if len(workspaceComputeProviderAllowlist) != len(want) {
+		t.Fatalf("provider allowlist drifted from SSOT {aws,gcp,hetzner}: %v", workspaceComputeProviderAllowlist)
+	}
+	for p := range want {
+		if _, ok := workspaceComputeProviderAllowlist[p]; !ok {
+			t.Fatalf("provider allowlist missing %q (SSOT drift)", p)
+		}
+	}
+}
+
+// Multi-provider / in-place switch: an instance type must belong to the chosen
+// provider — an AWS t3.* is meaningless on Hetzner, a cpx* on AWS, etc. Pins the
+// provider-keyed allowlist (mirrors the CP provider configs).
+func TestValidateWorkspaceCompute_InstanceTypePerProvider(t *testing.T) {
+	good := []struct{ provider, instance string }{
+		{"", "t3.medium"}, {"aws", "t3.2xlarge"}, {"aws", "c6i.xlarge"},
+		{"hetzner", "cpx31"}, {"hetzner", "cax41"},
+		{"gcp", "e2-standard-2"}, {"gcp", "e2-small"},
+		{"hetzner", ""}, {"gcp", ""}, // empty instance = CP default, always ok
+	}
+	for _, g := range good {
+		c := models.WorkspaceCompute{Provider: g.provider, InstanceType: g.instance}
+		if err := validateWorkspaceCompute(c); err != nil {
+			t.Errorf("provider=%q instance=%q must be accepted: %v", g.provider, g.instance, err)
+		}
+	}
+	bad := []struct{ provider, instance string }{
+		{"hetzner", "t3.medium"}, // AWS type on Hetzner
+		{"aws", "cpx31"},         // Hetzner type on AWS
+		{"gcp", "t3.large"},      // AWS type on GCP
+		{"hetzner", "e2-small"},  // GCP type on Hetzner
+		{"", "cpx31"},            // default(aws) + Hetzner type
+	}
+	for _, b := range bad {
+		c := models.WorkspaceCompute{Provider: b.provider, InstanceType: b.instance}
+		if err := validateWorkspaceCompute(c); err == nil {
+			t.Errorf("provider=%q instance=%q must be rejected (cross-provider instance type)", b.provider, b.instance)
+		}
+	}
+	if normalizeCloudProvider("") != "aws" || normalizeCloudProvider("hetzner") != "hetzner" {
+		t.Fatal("normalizeCloudProvider: \"\" must map to aws; explicit providers unchanged")
+	}
+}
+
 // internal#734: data_persistence enum. "" (auto), "persist", "ephemeral" are
 // the only accepted values; anything else is a clear 400 before the CP call.
 func TestValidateWorkspaceCompute_DataPersistence(t *testing.T) {
