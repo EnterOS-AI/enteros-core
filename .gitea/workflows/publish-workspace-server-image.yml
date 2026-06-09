@@ -530,7 +530,20 @@ jobs:
           STALE_COUNT=0
           UNREACHABLE_COUNT=0
           UNHEALTHY_COUNT=0
+          QUARANTINED_COUNT=0
+          # Quarantined stragglers: the CP shipped the build to the healthy
+          # majority and quarantined a small minority within tolerance
+          # (max_stragglers). They are reported + recovered SEPARATELY, so they
+          # must not red the strict per-tenant verify — otherwise one stuck
+          # tenant blocks the whole deploy, the all-or-nothing trap this fixes.
+          STRAGGLERS_LIST="$(jq -r '(.stragglers // [])[]' "$RESP" 2>/dev/null || true)"
+          is_straggler() { printf '%s\n' "$STRAGGLERS_LIST" | grep -qxF "$1"; }
           for slug in "${SLUGS[@]}"; do
+            if is_straggler "$slug"; then
+              echo "::warning::$slug is a QUARANTINED straggler — build shipped to the rest of the fleet; this tenant needs individual recovery. Skipping strict verify."
+              QUARANTINED_COUNT=$((QUARANTINED_COUNT + 1))
+              continue
+            fi
             healthz_ok="$(jq -r --arg slug "$slug" '.results[]? | select(.slug == $slug) | .healthz_ok' "$RESP" | tail -1)"
             if [ "$healthz_ok" != "true" ]; then
               echo "::error::$slug did not report healthz_ok=true in redeploy-fleet response."
@@ -580,6 +593,7 @@ jobs:
             echo "Stale tenants: $STALE_COUNT"
             echo "Unhealthy tenants: $UNHEALTHY_COUNT"
             echo "Unreachable tenants: $UNREACHABLE_COUNT"
+            echo "Quarantined stragglers (shipped past; need recovery): $QUARANTINED_COUNT"
           } >> "$GITHUB_STEP_SUMMARY"
 
           if [ "$STALE_COUNT" -gt 0 ] || [ "$UNHEALTHY_COUNT" -gt 0 ] || [ "$UNREACHABLE_COUNT" -gt 0 ]; then
