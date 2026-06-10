@@ -210,6 +210,60 @@ REQUIRED_APPROVALS_DEFAULT = int(_env("REQUIRED_APPROVALS", default="2") or "2")
 OWNER, NAME = (REPO.split("/", 1) + [""])[:2] if REPO else ("", "")
 API = f"https://{GITEA_HOST}/api/v1" if GITEA_HOST else ""
 
+# --------------------------------------------------------------------------
+# Conductor snapshot (operator-config#158)
+# --------------------------------------------------------------------------
+# When the conductor tick writes a state snapshot before running the passes,
+# both scripts see the SAME observed state instead of re-fetching independently
+# and potentially disagreeing within the same tick.
+# --------------------------------------------------------------------------
+
+
+def load_conductor_snapshot() -> dict | None:
+    """Load the conductor snapshot if present and fresh.
+
+    The snapshot is written by the conductor wrapper
+    (bin/molecule-core-cron-bot.sh conductor) to a path exported as
+    CONDUCTOR_SNAPSHOT_FILE. It contains open PRs + per-head combined
+    statuses + reviews captured in a single state-read.
+
+    Returns the parsed snapshot dict, or None if absent, unreadable,
+    or older than the freshness threshold (10 minutes — twice the */5
+    conductor cadence, so a single skipped tick does not invalidate it).
+    """
+    path = os.environ.get("CONDUCTOR_SNAPSHOT_FILE", "")
+    if not path:
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            snapshot = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"::notice::conductor snapshot unreadable ({exc}); self-fetching")
+        return None
+
+    if not isinstance(snapshot, dict):
+        return None
+
+    ts_str = snapshot.get("ts", "")
+    if ts_str:
+        try:
+            from datetime import datetime, timezone
+
+            ts = datetime.strptime(ts_str, "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=timezone.utc
+            )
+            age_sec = (datetime.now(timezone.utc) - ts).total_seconds()
+            if age_sec > 600:  # 10 minutes
+                print(
+                    f"::notice::conductor snapshot stale ({int(age_sec)}s); "
+                    "self-fetching"
+                )
+                return None
+        except ValueError:
+            pass  # malformed ts, treat as fresh (conservative)
+
+    return snapshot
+
 
 class ApiError(RuntimeError):
     pass
@@ -711,19 +765,36 @@ def get_branch_head(branch: str) -> str:
     return sha
 
 
+def _snapshot_status_for_sha(sha: str) -> dict | None:
+    """Return a Gitea-shaped combined-status dict from the conductor snapshot
+    if the SHA matches an open PR head, else None."""
+    snapshot = load_conductor_snapshot()
+    if snapshot is None:
+        return None
+    for pr in (snapshot.get("prs") or []):
+        if pr.get("head_sha") == sha:
+            statuses = pr.get("statuses") or []
+            return {
+                "state": pr.get("combined_state", "unknown"),
+                "statuses": [
+                    {"context": s.get("context"), "status": s.get("status")}
+                    for s in statuses
+                    if isinstance(s, dict)
+                ],
+            }
+    return None
+
+
 def get_combined_status(sha: str) -> dict:
     """Combined status + all individual statuses for `sha`.
 
-    The /status endpoint caps the `statuses` array at 30 entries (Gitea
-    default page size), so we fetch the full list via /statuses. The combined
-    `state` still comes from /status.
-
-    Fail-closed: BOTH the PRIMARY /status fetch AND the SECONDARY /statuses
-    enrichment must succeed. If either raises, the error propagates so the
-    caller skips this PR this tick (we never treat a failed status fetch as
-    green — dev-sop "no fail-open"). A paginated /statuses error must NOT
-    silently degrade to an incomplete status set.
+    Uses the conductor snapshot when available (same tick, same observed
+    state as the merge-queue pass), otherwise self-fetches via API.
     """
+    snapshot_status = _snapshot_status_for_sha(sha)
+    if snapshot_status is not None:
+        return snapshot_status
+
     _, combined = api("GET", f"/repos/{OWNER}/{NAME}/commits/{sha}/status")
     if not isinstance(combined, dict):
         raise ApiError(f"status for {sha} response not object")
@@ -747,7 +818,27 @@ def get_combined_status(sha: str) -> dict:
     return combined
 
 
+def _snapshot_pr_to_issue(pr_entry: dict) -> dict:
+    """Normalise a conductor-snapshot PR entry into the shape the queue
+    expects from /issues (number, title, labels, pull_request sub-dict)."""
+    return {
+        "number": pr_entry.get("number"),
+        "title": pr_entry.get("title"),
+        "labels": [{"name": n} for n in (pr_entry.get("labels") or [])],
+        "pull_request": {"draft": False},
+        "created_at": "",
+    }
+
+
 def list_queued_issues() -> list[dict]:
+    snapshot = load_conductor_snapshot()
+    if snapshot is not None:
+        prs = snapshot.get("prs") or []
+        return [
+            _snapshot_pr_to_issue(p)
+            for p in prs
+            if QUEUE_LABEL in (p.get("labels") or [])
+        ]
     return api_paginated(
         "GET",
         f"/repos/{OWNER}/{NAME}/issues",
@@ -768,6 +859,10 @@ def list_candidate_issues(*, auto_discover: bool) -> list[dict]:
     back to the legacy label-filtered listing (opt-IN). Opt-out filtering and
     draft-skipping happen in choose_next_candidate_issue, not here.
     """
+    snapshot = load_conductor_snapshot()
+    if snapshot is not None:
+        prs = snapshot.get("prs") or []
+        return [_snapshot_pr_to_issue(p) for p in prs]
     if not auto_discover:
         return list_queued_issues()
     return api_paginated(

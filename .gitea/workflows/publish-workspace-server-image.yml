@@ -190,6 +190,26 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd  # v4.0.0
 
+      # Docker layer cache (registry-backed). Each builder created by
+      # setup-buildx-action is an EPHEMERAL docker-container builder (fresh
+      # buildkit state every run), so without an external cache every main
+      # push rebuilds `go mod download` / npm layers from scratch — this job
+      # class is the slowest in CI (p50 228s, ~175 runs/wk). We export the
+      # build cache to a dedicated moving ECR tag (`:buildcache`, never a
+      # deploy tag) and import it on the next run, regardless of which
+      # runner/builder picks the job.
+      #   - mode=max: caches intermediate (builder-stage) layers too — the
+      #     final stage is a tiny alpine/distroless copy, so min mode would
+      #     cache nothing useful.
+      #   - image-manifest=true,oci-mediatypes=true: required for ECR, which
+      #     rejects the raw buildkit cache-manifest mediatype. Verified by a
+      #     real export+import round-trip against ECR on the publish host
+      #     (2026-06-09) before this change.
+      #   - ignore-error=true on cache-to: a cache EXPORT failure must never
+      #     fail the publish lane; worst case the next run is cold.
+      #   - cache-from on a missing tag (first run) is a warning, not an error.
+      #   - Concurrent publishes overwrite :buildcache last-writer-wins —
+      #     same best-effort semantics as :staging-latest.
       - name: Build & push platform image to ECR (staging-<sha> + staging-latest)
         env:
           IMAGE_NAME: ${{ env.IMAGE_NAME }}
@@ -212,6 +232,8 @@ jobs:
             --label "org.opencontainers.image.revision=${GIT_SHA}" \
             --label "org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             --label "molecule.workflow.run_id=${GITHUB_RUN_ID}" \
+            --cache-from "type=registry,ref=${IMAGE_NAME}:buildcache" \
+            --cache-to "type=registry,ref=${IMAGE_NAME}:buildcache,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true" \
             --tag "${IMAGE_NAME}:${TAG_SHA}" \
             --tag "${IMAGE_NAME}:${TAG_LATEST}" \
             --push .
@@ -251,6 +273,11 @@ jobs:
           # Retry loop: buildkit EOF (internal#2468) is often transient on the
           # publish runner under memory pressure. Up to 3 attempts with a fresh
           # builder each time so a crashed buildkit doesn't poison the next try.
+          # Registry layer cache (see platform-image step comment for the full
+          # rationale): the fresh-builder-per-attempt pattern means there is
+          # NEVER local cache here — cache-from gives retries AND the next run
+          # a warm start. Cache lives on the PRIMARY ECR only (the staging
+          # mirror is a push target, not a cache source).
           for attempt in 1 2 3; do
             echo "::notice::Tenant image build attempt ${attempt}/3 ..."
             builder="tenant-builder-${GITHUB_RUN_ID}-${attempt}"
@@ -264,6 +291,8 @@ jobs:
                 --label "org.opencontainers.image.revision=${GIT_SHA}" \
                 --label "org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
                 --label "molecule.workflow.run_id=${GITHUB_RUN_ID}" \
+                --cache-from "type=registry,ref=${TENANT_IMAGE_NAME}:buildcache" \
+                --cache-to "type=registry,ref=${TENANT_IMAGE_NAME}:buildcache,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true" \
                 "${build_tags[@]}" \
                 --push .; then
               docker buildx rm "${builder}" >/dev/null 2>&1 || true

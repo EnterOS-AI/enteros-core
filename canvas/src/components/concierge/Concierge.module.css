@@ -82,8 +82,19 @@
 /* ===== MAIN ===== */
 .main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 .topbar { height: 56px; flex: 0 0 56px; border-bottom: 1px solid var(--hair); background: var(--panel); display: flex; align-items: center; justify-content: space-between; padding: 0 18px 0 20px; }
-.org { display: flex; align-items: center; gap: 10px; cursor: pointer; padding: 6px 10px; border-radius: 9px; transition: .16s; margin-left: -6px; }
+.org { position: relative; display: flex; align-items: center; gap: 10px; cursor: pointer; padding: 6px 10px; border-radius: 9px; transition: .16s; margin-left: -6px; }
 .org:hover { background: var(--hair); }
+/* Org switcher dropdown */
+.orgMenu { position: absolute; top: calc(100% + 6px); left: 0; min-width: 220px; max-height: 320px; overflow-y: auto; padding: 5px; background: var(--bg-1, #1a1a22); border: 1px solid var(--hair-2); border-radius: 11px; box-shadow: 0 12px 32px rgba(0,0,0,.4); z-index: 50; }
+.orgMenuItem { width: 100%; display: flex; align-items: center; gap: 9px; padding: 7px 9px; border: none; background: transparent; border-radius: 8px; cursor: pointer; color: var(--tx-1); font-size: 13.5px; font-weight: 500; text-align: left; transition: .12s; }
+.orgMenuItem:hover { background: var(--hair); }
+.orgMenuCurrent { font-weight: 700; }
+.orgMenuBadge { width: 20px; height: 20px; border-radius: 6px; display: grid; place-items: center; background: linear-gradient(150deg,#2d2d36,#3a3a46); font-size: 11px; font-weight: 700; color: #d8d8e2; border: 1px solid var(--hair-2); flex: 0 0 auto; }
+:global([data-theme="light"]) .orgMenuBadge { background: linear-gradient(150deg,#7c3aed,#a78bfa); color: #fff; border: none; }
+.orgMenuName { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.orgMenuTick { color: var(--accent, #a78bfa); display: flex; flex: 0 0 auto; }
+.orgMenuTick svg { width: 14px; height: 14px; }
+.orgMenuEmpty { padding: 9px 11px; color: var(--tx-3); font-size: 13px; }
 .orgBadge { width: 24px; height: 24px; border-radius: 7px; display: grid; place-items: center; background: linear-gradient(150deg,#2d2d36,#3a3a46); font-size: 12px; font-weight: 700; color: #d8d8e2; border: 1px solid var(--hair-2); }
 :global([data-theme="light"]) .orgBadge { background: linear-gradient(150deg,#7c3aed,#a78bfa); color: #fff; border: none; }
 .orgName { font-weight: 600; font-size: 14.5px; letter-spacing: -.01em; }

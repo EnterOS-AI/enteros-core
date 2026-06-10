@@ -1,4 +1,4 @@
-import importlib.util
+import importlib
 import sys
 from pathlib import Path
 
@@ -1778,3 +1778,129 @@ def test_print_post_batch_summary_counts_correctly(capsys):
     assert "PR #1: state=ready" in out
     assert "PR #2: state=waiting" in out
     assert "PR #3: state=ineligible" in out
+
+
+# ---------------------------------------------------------------------------
+# Conductor snapshot consumption (operator-config#158 / molecule-core#2502)
+# ---------------------------------------------------------------------------
+
+import json
+import os
+import tempfile
+
+
+def _make_snapshot(prs, ts="2026-06-10T12:00:00Z"):
+    return {"ts": ts, "repo": "molecule-ai/molecule-core", "prs": prs}
+
+
+def test_list_candidate_issues_uses_snapshot_when_present(monkeypatch):
+    """When CONDUCTOR_SNAPSHOT_FILE is present and fresh, list_candidate_issues
+    returns the snapshot PRs instead of hitting the API."""
+    snapshot = _make_snapshot([
+        {"number": 10, "title": "PR 10", "head_sha": "a" * 40,
+         "labels": ["merge-queue"],
+         "combined_state": "success", "statuses": []},
+        {"number": 20, "title": "PR 20", "head_sha": "b" * 40,
+         "labels": [],
+         "combined_state": "success", "statuses": []},
+    ])
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(snapshot, f)
+        path = f.name
+    try:
+        monkeypatch.setenv("CONDUCTOR_SNAPSHOT_FILE", path)
+        # reload so load_conductor_snapshot sees the env var
+        candidates = mq.list_candidate_issues(auto_discover=True)
+        assert len(candidates) == 2
+        assert [c["number"] for c in candidates] == [10, 20]
+    finally:
+        os.unlink(path)
+
+
+def test_list_queued_issues_uses_snapshot_label_filter(monkeypatch):
+    """list_queued_issues (opt-IN mode) filters the snapshot by QUEUE_LABEL."""
+    snapshot = _make_snapshot([
+        {"number": 11, "title": "Labeled", "head_sha": "a" * 40,
+         "labels": ["merge-queue"], "combined_state": "success", "statuses": []},
+        {"number": 22, "title": "Unlabeled", "head_sha": "b" * 40,
+         "labels": [], "combined_state": "success", "statuses": []},
+    ])
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(snapshot, f)
+        path = f.name
+    try:
+        monkeypatch.setenv("CONDUCTOR_SNAPSHOT_FILE", path)
+        monkeypatch.setattr(mq, "QUEUE_LABEL", "merge-queue")
+        queued = mq.list_queued_issues()
+        assert len(queued) == 1
+        assert queued[0]["number"] == 11
+    finally:
+        os.unlink(path)
+
+
+def test_get_combined_status_uses_snapshot_when_sha_matches(monkeypatch):
+    """get_combined_status returns snapshot data when the SHA is an open PR head."""
+    head_sha = "c" * 40
+    snapshot = _make_snapshot([
+        {"number": 30, "title": "PR 30", "head_sha": head_sha,
+         "labels": [],
+         "combined_state": "failure",
+         "statuses": [
+             {"context": "CI / all-required (pull_request)", "status": "failure"},
+         ]},
+    ])
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(snapshot, f)
+        path = f.name
+    try:
+        monkeypatch.setenv("CONDUCTOR_SNAPSHOT_FILE", path)
+        combined = mq.get_combined_status(head_sha)
+        assert combined["state"] == "failure"
+        assert len(combined["statuses"]) == 1
+        assert combined["statuses"][0]["context"] == "CI / all-required (pull_request)"
+        assert combined["statuses"][0]["status"] == "failure"
+    finally:
+        os.unlink(path)
+
+
+def test_get_combined_status_self_fetches_when_sha_not_in_snapshot(monkeypatch):
+    """If the SHA is not in the snapshot, get_combined_status falls back to API."""
+    snapshot = _make_snapshot([
+        {"number": 40, "head_sha": "d" * 40, "labels": [],
+         "combined_state": "success", "statuses": []},
+    ])
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(snapshot, f)
+        path = f.name
+    try:
+        monkeypatch.setenv("CONDUCTOR_SNAPSHOT_FILE", path)
+        monkeypatch.setattr(mq, "OWNER", "o")
+        monkeypatch.setattr(mq, "NAME", "r")
+
+        def fake_api(method, path, **kw):
+            if path.endswith("/status"):
+                return 200, {"state": "success", "statuses": [{"context": "c1", "status": "success"}]}
+            if path.endswith("/statuses"):
+                return 200, []
+            raise mq.ApiError("unexpected")
+
+        monkeypatch.setattr(mq, "api", fake_api)
+        combined = mq.get_combined_status("e" * 40)
+        assert combined["state"] == "success"
+    finally:
+        os.unlink(path)
+
+
+def test_load_conductor_snapshot_ignores_stale_snapshot(monkeypatch):
+    """A snapshot older than 10 minutes is treated as absent (self-fetch)."""
+    from datetime import datetime, timezone, timedelta
+    old_ts = (datetime.now(timezone.utc) - timedelta(minutes=15)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    snapshot = _make_snapshot([{"number": 50, "head_sha": "f" * 40, "labels": []}], ts=old_ts)
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(snapshot, f)
+        path = f.name
+    try:
+        monkeypatch.setenv("CONDUCTOR_SNAPSHOT_FILE", path)
+        assert mq.load_conductor_snapshot() is None
+    finally:
+        os.unlink(path)

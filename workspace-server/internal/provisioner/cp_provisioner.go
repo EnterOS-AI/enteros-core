@@ -168,8 +168,17 @@ type cpProvisionRequest struct {
 	// DataPersistence is the per-workspace durable-data choice (internal#734);
 	// CP validates the enum at its provision edge and resolves the data volume
 	// from it. Empty = auto (omitted on the wire).
-	DataPersistence string                 `json:"data_persistence,omitempty"`
-	Display         WorkspaceDisplayConfig `json:"display,omitempty"`
+	DataPersistence string `json:"data_persistence,omitempty"`
+	// Kind forwards the workspace kind ("" / "workspace" ordinary, "platform"
+	// = the org concierge) so the CP can select the platform-agent image
+	// variant — the SaaS mirror of the local Docker provisioner's kind-driven
+	// image preference (RFC docs/design/rfc-platform-agent.md; core#2495 SSOT:
+	// the concierge is a normal workspace provisioned through this same path,
+	// differing ONLY in image + config overlay). Omitted when empty so the
+	// wire shape is unchanged for ordinary workspaces; an older CP simply
+	// ignores the field.
+	Kind    string                 `json:"kind,omitempty"`
+	Display WorkspaceDisplayConfig `json:"display,omitempty"`
 	PlatformURL     string                 `json:"platform_url"`
 	Env             map[string]string      `json:"env"`
 	// ConfigFiles are template + generated config files to write into the
@@ -262,6 +271,7 @@ func (p *CPProvisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string,
 		DiskGB:          cfg.DiskGB,
 		DataPersistence: cfg.DataPersistence,
 		Provider:        cfg.Provider,
+		Kind:            cfg.Kind,
 		Display:         cfg.Display,
 		PlatformURL:     cfg.PlatformURL,
 		Env:             env,

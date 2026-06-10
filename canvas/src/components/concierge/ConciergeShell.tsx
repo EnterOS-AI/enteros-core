@@ -4,7 +4,8 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { useCanvasStore, type TopView } from "@/store/canvas";
 import { WORKSPACE_KIND } from "@/lib/workspace-kind";
 import { useTheme } from "@/lib/theme-provider";
-import { api } from "@/lib/api";
+import { api, PLATFORM_URL } from "@/lib/api";
+import { switchOrgUrl } from "@/lib/org-switch";
 import { showToast } from "@/components/Toaster";
 import type { ActivityEntry } from "@/types/activity";
 import { Canvas } from "@/components/Canvas";
@@ -89,6 +90,25 @@ function activityText(a: ActivityEntry): string {
   return a.method ? `${verb} · ${a.method}` : verb;
 }
 
+
+/**
+ * resolveHomeChatTarget — which agent the Home chat panel talks to: the
+ * sidebar-selected node when it still exists, else the org root (concierge),
+ * else null. Resolving against live nodes means a deleted/vanished selection
+ * degrades to the root instead of a dead chat. Exported for unit tests.
+ */
+export function resolveHomeChatTarget<N extends { id: string }>(
+  nodes: N[],
+  selectedNodeId: string | null,
+  platformRoot: N | null,
+): N | null {
+  if (selectedNodeId) {
+    const selected = nodes.find((n) => n.id === selectedNodeId);
+    if (selected) return selected;
+  }
+  return platformRoot ?? null;
+}
+
 export function ConciergeShell() {
   const nodes = useCanvasStore((st) => st.nodes);
   const topView = useCanvasStore((st) => st.topView);
@@ -108,13 +128,18 @@ export function ConciergeShell() {
   // returns an empty name, so the topbar never breaks before the backend
   // lands.
   const [orgName, setOrgName] = useState("Molecule AI");
+  // Current org slug (from GET /org/identity) — used to highlight the active
+  // org in the switcher and to derive the apex domain for cross-org navigation.
+  const [orgSlug, setOrgSlug] = useState("");
   useEffect(() => {
     let cancelled = false;
     api
-      .get<{ name?: string }>("/org/identity")
+      .get<{ name?: string; slug?: string }>("/org/identity")
       .then((r) => {
         const name = (r?.name || "").trim();
         if (!cancelled && name) setOrgName(name);
+        const slug = (r?.slug || "").trim();
+        if (!cancelled && slug) setOrgSlug(slug);
       })
       .catch(() => {
         // No endpoint / not reachable — keep the "Molecule AI" fallback.
@@ -123,6 +148,47 @@ export function ConciergeShell() {
       cancelled = true;
     };
   }, []);
+
+  // --- Org switcher (topbar dropdown) ---
+  // Each org is its own tenant subdomain, so "switch" = navigate to
+  // <slug>.<apex>. The org list comes from the control plane (cross-origin,
+  // cookie-auth), fetched lazily the first time the menu opens.
+  const [orgMenuOpen, setOrgMenuOpen] = useState(false);
+  const [orgs, setOrgs] = useState<Array<{ slug: string; name?: string; id?: string }> | null>(null);
+  const toggleOrgMenu = useCallback(() => {
+    setOrgMenuOpen((open) => {
+      const next = !open;
+      if (next && orgs === null) {
+        fetch(`${PLATFORM_URL}/cp/orgs`, {
+          credentials: "include",
+          signal: AbortSignal.timeout(15_000),
+        })
+          .then((res) => (res.ok ? res.json() : Promise.reject(new Error(String(res.status)))))
+          .then((body: { orgs?: Array<{ slug: string; name?: string; id?: string }> } | Array<{ slug: string; name?: string; id?: string }>) => {
+            const list = Array.isArray(body) ? body : body.orgs ?? [];
+            setOrgs(list.filter((o) => o && o.slug));
+          })
+          .catch(() => setOrgs([])); // no list / not reachable → render "no other orgs"
+      }
+      return next;
+    });
+  }, [orgs]);
+  const switchOrg = useCallback(
+    (slug: string) => {
+      setOrgMenuOpen(false);
+      if (typeof window === "undefined") return;
+      const url = switchOrgUrl(window.location.hostname, window.location.protocol, orgSlug, slug);
+      if (url) window.location.href = url;
+    },
+    [orgSlug]
+  );
+  // Close the menu on any outside click.
+  useEffect(() => {
+    if (!orgMenuOpen) return;
+    const onDoc = () => setOrgMenuOpen(false);
+    document.addEventListener("click", onDoc);
+    return () => document.removeEventListener("click", onDoc);
+  }, [orgMenuOpen]);
 
   // Build the agent hierarchy from live nodes.
   const { roots, childrenOf } = useMemo(() => {
@@ -156,6 +222,16 @@ export function ConciergeShell() {
   );
 
   const platformId = platformRoot?.id ?? null;
+
+  // Home chat target: the agent SELECTED in the sidebar, falling back to the
+  // org root (the concierge). Pre-fix the panel was hard-pointed at the root,
+  // so clicking another agent highlighted it but the chat never switched.
+  const chatNode = useMemo(
+    () => resolveHomeChatTarget(nodes, selectedNodeId, platformRoot),
+    [nodes, selectedNodeId, platformRoot],
+  );
+  const chatId = chatNode?.id ?? null;
+  const chatIsRoot = chatId !== null && chatId === platformId;
 
   // ── live data: approvals + user-tasks (org-wide), activity (platform agent) ──
   const [approvals, setApprovals] = useState<PendingApproval[]>([]);
@@ -330,10 +406,51 @@ export function ConciergeShell() {
         <div className={s.main}>
           {/* TOPBAR */}
           <header className={s.topbar}>
-            <div className={s.org}>
+            <div
+              className={s.org}
+              role="button"
+              tabIndex={0}
+              aria-haspopup="menu"
+              aria-expanded={orgMenuOpen}
+              data-testid="topbar-org-switcher"
+              onClick={(e) => {
+                e.stopPropagation();
+                toggleOrgMenu();
+              }}
+            >
               <div className={s.orgBadge}>{initials(orgName).slice(0, 1)}</div>
               <span data-testid="topbar-org-name" className={s.orgName}>{orgName}</span>
               <span className={s.chev}><IcChevDown /></span>
+              {orgMenuOpen && (
+                <div
+                  className={s.orgMenu}
+                  role="menu"
+                  data-testid="topbar-org-menu"
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  {orgs === null ? (
+                    <div className={s.orgMenuEmpty}>Loading…</div>
+                  ) : orgs.length === 0 ? (
+                    <div className={s.orgMenuEmpty}>No other organizations</div>
+                  ) : (
+                    orgs.map((o) => (
+                      <button
+                        key={o.id || o.slug}
+                        type="button"
+                        role="menuitem"
+                        className={`${s.orgMenuItem} ${o.slug === orgSlug ? s.orgMenuCurrent : ""}`}
+                        onClick={() => switchOrg(o.slug)}
+                      >
+                        <span className={s.orgMenuBadge}>{initials(o.name || o.slug).slice(0, 1)}</span>
+                        <span className={s.orgMenuName}>{o.name || o.slug}</span>
+                        {o.slug === orgSlug && (
+                          <span className={s.orgMenuTick}><IcCheck /></span>
+                        )}
+                      </button>
+                    ))
+                  )}
+                </div>
+              )}
             </div>
             <div className={s.topbarRight}>
               <button className={s.iconPill} title="Search"><IcSearch /></button>
@@ -457,24 +574,24 @@ export function ConciergeShell() {
                   delivery-mode handling), pointed at the platform agent. A thin
                   concierge-styled header keeps the Home look; the ChatTab body
                   below is identical to the map path so features can't drift. */}
-              {platformId && platformRoot ? (
+              {chatId && chatNode ? (
                 <section className={s.chat}>
                   <div className={s.chatHead}>
                     <div className={s.chAv}><IcChat /></div>
                     <div className={s.chMeta}>
-                      <div className={s.chTitle}>{platformRoot.data.name ?? "Org Concierge"}</div>
+                      <div className={s.chTitle}>{chatNode.data.name ?? (chatIsRoot ? "Org Concierge" : "Agent")}</div>
                       <div className={s.chSub}>
                         {(() => {
                           const online =
-                            platformRoot.data.status === "online" ||
-                            platformRoot.data.status === "degraded";
+                            chatNode.data.status === "online" ||
+                            chatNode.data.status === "degraded";
                           return (
                             <>
                               <span
                                 className={s.sdot}
                                 style={{ background: online ? "var(--green)" : "var(--grey)" }}
                               />
-                              {online ? "online" : statusInfo(platformRoot.data.status ?? "").label} · platform agent
+                              {online ? "online" : statusInfo(chatNode.data.status ?? "").label} · {chatIsRoot ? "platform agent" : (chatNode.data.role || "agent")}
                             </>
                           );
                         })()}
@@ -482,7 +599,9 @@ export function ConciergeShell() {
                     </div>
                   </div>
                   <div className={s.embedChat}>
-                    <ChatTab key={platformId} workspaceId={platformId} data={platformRoot.data} />
+                    {/* key=chatId remounts ChatTab on selection change so the
+                        history/composer state never bleeds between agents. */}
+                    <ChatTab key={chatId} workspaceId={chatId} data={chatNode.data} />
                   </div>
                 </section>
               ) : (

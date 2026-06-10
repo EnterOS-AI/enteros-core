@@ -24,6 +24,17 @@ Three failure classes:
   F3  (B) and (C) are not set-equal. Audit env wider than protection
       → audit flags non-force-merges as force; narrower → real
       force-merges are missed.
+  F4  Context in (B) is emitted by NO workflow in .gitea/workflows/ at
+      all (repo-wide, case-correct generalization of F2, which only
+      covers `ci / `-prefixed names). This is the inverse-of-F2 hole and
+      the one that makes the `CI / all-required` aggregator's
+      name-vs-coverage gap safe: `all-required` is fail-closed over CI's
+      OWN jobs but CANNOT cover sibling required workflows
+      (`E2E API Smoke Test`, `Handlers Postgres Integration` — Gitea has
+      no cross-workflow `needs:`). F4 verifies each cross-workflow
+      required context still has a live emitter, so a renamed/deleted
+      sibling workflow that BP still requires is caught instead of
+      degrading to a silent absent-as-pending advisory gate.
 
 Idempotency:
   Searches OPEN issues by exact title prefix
@@ -380,6 +391,68 @@ def expected_context(job_key: str, workflow_name: str = "ci") -> str:
     return f"{workflow_name} / {job_key} (pull_request)"
 
 
+def workflow_emitted_contexts(wf_doc: dict) -> set[str]:
+    """The set of `pull_request` status-check contexts a SINGLE workflow
+    emits, computed from its real `name:` + each job's `name or key`.
+
+    Gitea reports a context as `{workflow.name} / {job.name|job.key}
+    (pull_request)`. Unlike `expected_context()` (which hard-codes the
+    lowercase literal `ci` and the bare job-KEY — a shape that does NOT
+    match this repo, whose workflow is `name: CI` and whose CI jobs DO
+    set per-job `name:`), this reads the authoritative names straight
+    from the parsed YAML, so the contexts it produces are byte-equal to
+    what BP records. Used by F4 (cross-workflow emitter existence).
+
+    Jobs whose `if:` gates on `github.event_name`/`github.ref` are still
+    emitters on the events they DO run — they remain in the set; F4 only
+    asserts *existence of an emitter*, never that it ran on a given
+    trigger."""
+    name = wf_doc.get("name")
+    if not isinstance(name, str) or not name:
+        return set()
+    jobs = wf_doc.get("jobs")
+    if not isinstance(jobs, dict):
+        return set()
+    out: set[str] = set()
+    for key, spec in jobs.items():
+        job_name = key
+        if isinstance(spec, dict) and isinstance(spec.get("name"), str) and spec["name"]:
+            job_name = spec["name"]
+        out.add(f"{name} / {job_name} (pull_request)")
+    return out
+
+
+def all_emitted_contexts(workflows_dir: str = ".gitea/workflows") -> set[str]:
+    """Union of `pull_request` contexts emitted by EVERY workflow in the
+    repo. F4 uses this to assert that each BP-required
+    `status_check_contexts` entry corresponds to a real emitting
+    workflow+job — closing the inverse-of-F2 hole where BP requires a
+    context that NO workflow produces (e.g. a sibling workflow like
+    `E2E API Smoke Test` or `Handlers Postgres Integration` was renamed
+    or deleted while still required, leaving BP demanding a green it can
+    never receive; Gitea treats absent-as-pending → silent advisory
+    gate). This is what makes the misleadingly-named `CI / all-required`
+    aggregator safe at the repo level: it only covers CI's own jobs, but
+    F4 guarantees the cross-workflow required contexts it CANNOT cover
+    are real and present."""
+    import glob as _glob
+
+    emitted: set[str] = set()
+    for path in sorted(_glob.glob(os.path.join(workflows_dir, "*.yml"))):
+        try:
+            with open(path, encoding="utf-8") as f:
+                doc = yaml.safe_load(f)
+        except (OSError, yaml.YAMLError):
+            # A single unparseable sibling workflow must not blind F4 to
+            # the rest. Skip it loudly; lint-workflow-yaml gates parse
+            # validity separately.
+            sys.stderr.write(f"::warning::F4: could not parse {path}, skipping\n")
+            continue
+        if isinstance(doc, dict):
+            emitted |= workflow_emitted_contexts(doc)
+    return emitted
+
+
 # --------------------------------------------------------------------------
 # Drift detection
 # --------------------------------------------------------------------------
@@ -531,6 +604,36 @@ def detect_drift(branch: str) -> tuple[list[str], dict]:
             + "\n".join(f"  - {c}" for c in stale_protection)
         )
 
+    # ----- F4: cross-workflow required context has no emitting workflow -----
+    # F2 (above) is scoped to `ci / `-prefixed contexts ONLY, and built
+    # from the hard-coded lowercase literal `ci` + bare job-keys — a shape
+    # that does NOT match this repo (workflow is `name: CI`, jobs set their
+    # own `name:`), so F2 is effectively dormant here. F4 is the
+    # case-correct, REPO-WIDE generalization: it parses every workflow's
+    # real `name:` + job `name|key` and asserts that EVERY BP-required
+    # context is actually emitted by some workflow.
+    #
+    # This is the gate that makes the `CI / all-required` aggregator's
+    # name-vs-coverage gap safe. `all-required` is fail-closed over CI's
+    # OWN jobs but — by Gitea's design (no cross-workflow `needs:`) — it
+    # CANNOT and does not cover sibling required workflows
+    # (`E2E API Smoke Test`, `Handlers Postgres Integration`). Those MUST
+    # be listed in BP independently. F4 verifies each such BP context
+    # still has a live emitter, so the inverse-of-F2 hole — BP requires a
+    # context that no workflow produces (rename/delete a sibling workflow
+    # while still required → Gitea treats absent-as-pending → silent
+    # advisory gate, and a red PR can look mergeable) — is caught.
+    repo_emitted = all_emitted_contexts(os.path.dirname(CI_WORKFLOW_PATH))
+    unemitted = sorted(c for c in contexts if c not in repo_emitted)
+    if unemitted:
+        findings.append(
+            "F4 — branch_protections/{br}.status_check_contexts entries that "
+            "NO workflow in .gitea/workflows/ emits "
+            "(stale required name → silent advisory gate; a red PR can look "
+            "mergeable):\n".format(br=branch)
+            + "\n".join(f"  - {c}" for c in unemitted)
+        )
+
     # ----- F3: audit env vs protection contexts (set-equal) -----
     only_in_env = sorted(env_set - contexts)
     only_in_protection = sorted(contexts - env_set)
@@ -556,6 +659,7 @@ def detect_drift(branch: str) -> tuple[list[str], dict]:
         "protection_contexts": sorted(contexts),
         "audit_env_checks": sorted(env_set),
         "expected_contexts": sorted(emitted_contexts),
+        "repo_emitted_contexts": sorted(repo_emitted),
     }
     return findings, debug
 

@@ -153,19 +153,17 @@ RT_HM_ID=$(echo "$R" | jq_extract "['id']")
 
 # Wait for containers to start (poll up to 30s for first one to appear)
 if command -v docker &>/dev/null; then
-  short_cc="${RT_CC_ID:0:12}"
   for _ in 1 2 3 4 5 6; do
     sleep 5
-    if docker inspect "ws-${short_cc}" >/dev/null 2>&1; then break; fi
+    if docker inspect "ws-${RT_CC_ID}" >/dev/null 2>&1; then break; fi
   done
 
   _check_image() {
     local ws_id="$1" expected_tag="$2" label="$3"
-    local short_id="${ws_id:0:12}"
     # Poll up to 30s for image to appear
     local actual_image="NOT_FOUND"
     for _ in 1 2 3 4 5 6; do
-      actual_image=$(docker inspect "ws-${short_id}" --format '{{.Config.Image}}' 2>/dev/null || echo "NOT_FOUND")
+      actual_image=$(docker inspect "ws-${ws_id}" --format '{{.Config.Image}}' 2>/dev/null || echo "NOT_FOUND")
       if echo "$actual_image" | grep -qF "$expected_tag"; then break; fi
       sleep 5
     done
@@ -216,10 +214,9 @@ if echo "$R" | grep -qF "saved"; then
   curl -s -X POST "$BASE/workspaces/$RT_CX_ID/restart" > /dev/null 2>&1
   # Poll up to 30s for the new container image to appear (restart can take a while)
   if command -v docker &>/dev/null; then
-    short_id="${RT_CX_ID:0:12}"
     for _ in 1 2 3 4 5 6; do
       sleep 5
-      actual=$(docker inspect "ws-${short_id}" --format '{{.Config.Image}}' 2>/dev/null || echo "")
+      actual=$(docker inspect "ws-${RT_CX_ID}" --format '{{.Config.Image}}' 2>/dev/null || echo "")
       if echo "$actual" | grep -qF "openclaw"; then break; fi
     done
     _check_image "$RT_CX_ID" "openclaw" "Runtime change codex to openclaw on restart"
