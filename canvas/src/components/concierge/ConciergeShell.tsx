@@ -89,6 +89,25 @@ function activityText(a: ActivityEntry): string {
   return a.method ? `${verb} · ${a.method}` : verb;
 }
 
+
+/**
+ * resolveHomeChatTarget — which agent the Home chat panel talks to: the
+ * sidebar-selected node when it still exists, else the org root (concierge),
+ * else null. Resolving against live nodes means a deleted/vanished selection
+ * degrades to the root instead of a dead chat. Exported for unit tests.
+ */
+export function resolveHomeChatTarget<N extends { id: string }>(
+  nodes: N[],
+  selectedNodeId: string | null,
+  platformRoot: N | null,
+): N | null {
+  if (selectedNodeId) {
+    const selected = nodes.find((n) => n.id === selectedNodeId);
+    if (selected) return selected;
+  }
+  return platformRoot ?? null;
+}
+
 export function ConciergeShell() {
   const nodes = useCanvasStore((st) => st.nodes);
   const topView = useCanvasStore((st) => st.topView);
@@ -156,6 +175,16 @@ export function ConciergeShell() {
   );
 
   const platformId = platformRoot?.id ?? null;
+
+  // Home chat target: the agent SELECTED in the sidebar, falling back to the
+  // org root (the concierge). Pre-fix the panel was hard-pointed at the root,
+  // so clicking another agent highlighted it but the chat never switched.
+  const chatNode = useMemo(
+    () => resolveHomeChatTarget(nodes, selectedNodeId, platformRoot),
+    [nodes, selectedNodeId, platformRoot],
+  );
+  const chatId = chatNode?.id ?? null;
+  const chatIsRoot = chatId !== null && chatId === platformId;
 
   // ── live data: approvals + user-tasks (org-wide), activity (platform agent) ──
   const [approvals, setApprovals] = useState<PendingApproval[]>([]);
@@ -457,24 +486,24 @@ export function ConciergeShell() {
                   delivery-mode handling), pointed at the platform agent. A thin
                   concierge-styled header keeps the Home look; the ChatTab body
                   below is identical to the map path so features can't drift. */}
-              {platformId && platformRoot ? (
+              {chatId && chatNode ? (
                 <section className={s.chat}>
                   <div className={s.chatHead}>
                     <div className={s.chAv}><IcChat /></div>
                     <div className={s.chMeta}>
-                      <div className={s.chTitle}>{platformRoot.data.name ?? "Org Concierge"}</div>
+                      <div className={s.chTitle}>{chatNode.data.name ?? (chatIsRoot ? "Org Concierge" : "Agent")}</div>
                       <div className={s.chSub}>
                         {(() => {
                           const online =
-                            platformRoot.data.status === "online" ||
-                            platformRoot.data.status === "degraded";
+                            chatNode.data.status === "online" ||
+                            chatNode.data.status === "degraded";
                           return (
                             <>
                               <span
                                 className={s.sdot}
                                 style={{ background: online ? "var(--green)" : "var(--grey)" }}
                               />
-                              {online ? "online" : statusInfo(platformRoot.data.status ?? "").label} · platform agent
+                              {online ? "online" : statusInfo(chatNode.data.status ?? "").label} · {chatIsRoot ? "platform agent" : (chatNode.data.role || "agent")}
                             </>
                           );
                         })()}
@@ -482,7 +511,9 @@ export function ConciergeShell() {
                     </div>
                   </div>
                   <div className={s.embedChat}>
-                    <ChatTab key={platformId} workspaceId={platformId} data={platformRoot.data} />
+                    {/* key=chatId remounts ChatTab on selection change so the
+                        history/composer state never bleeds between agents. */}
+                    <ChatTab key={chatId} workspaceId={chatId} data={chatNode.data} />
                   </div>
                 </section>
               ) : (
