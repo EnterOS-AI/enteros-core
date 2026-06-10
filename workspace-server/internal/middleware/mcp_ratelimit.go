@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -41,6 +42,11 @@ func NewMCPRateLimiter(rate int, interval time.Duration, ctx context.Context) *M
 		interval: interval,
 	}
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("mcp_ratelimit: PANIC in bucket cleanup: %v", r)
+			}
+		}()
 		ticker := time.NewTicker(5 * time.Minute)
 		defer ticker.Stop()
 		for {

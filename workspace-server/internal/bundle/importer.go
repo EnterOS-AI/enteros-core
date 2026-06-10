@@ -89,6 +89,11 @@ func Import(
 			// PluginsPath set by caller if available
 		}
 		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("bundle/importer: PANIC during provision start for %s: %v", wsID, r)
+				}
+			}()
 			provCtx, cancel := context.WithTimeout(context.Background(), provisioner.ProvisionTimeout)
 			defer cancel()
 			url, err := prov.Start(provCtx, cfg)

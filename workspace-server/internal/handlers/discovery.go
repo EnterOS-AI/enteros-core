@@ -252,7 +252,7 @@ func (h *DiscoveryHandler) Peers(c *gin.Context) {
 	// parent_id-bound branch enumerates siblings, and that is already scoped to
 	// one parent (one tenant).
 	if parentID.Valid {
-		siblings, _ := queryPeerMaps(`
+		siblings, _ := queryPeerMaps(ctx, `
 			SELECT w.id, w.name, COALESCE(w.role, ''), w.tier, w.status,
 				   COALESCE(w.agent_card, 'null'::jsonb), COALESCE(w.url, ''),
 				   w.parent_id, w.active_tasks
@@ -271,7 +271,7 @@ func (h *DiscoveryHandler) Peers(c *gin.Context) {
 	// self-delegation 400 in a tight loop (#383). The `w.id != $2`
 	// clause makes self-delegation-via-peer-list impossible regardless
 	// of DB state.
-	children, _ := queryPeerMaps(`
+	children, _ := queryPeerMaps(ctx, `
 		SELECT w.id, w.name, COALESCE(w.role, ''), w.tier, w.status,
 			   COALESCE(w.agent_card, 'null'::jsonb), COALESCE(w.url, ''),
 			   w.parent_id, w.active_tasks
@@ -284,7 +284,7 @@ func (h *DiscoveryHandler) Peers(c *gin.Context) {
 	// propagate that corruption back to the agent as a "peer who is also
 	// you" entry.
 	if parentID.Valid {
-		parent, _ := queryPeerMaps(`
+		parent, _ := queryPeerMaps(ctx, `
 			SELECT w.id, w.name, COALESCE(w.role, ''), w.tier, w.status,
 				   COALESCE(w.agent_card, 'null'::jsonb), COALESCE(w.url, ''),
 				   w.parent_id, w.active_tasks
@@ -353,8 +353,8 @@ func filterPeersByQuery(peers []map[string]interface{}, q string) []map[string]i
 }
 
 // queryPeerMaps returns clean JSON-serializable maps instead of Workspace structs.
-func queryPeerMaps(query string, args ...interface{}) ([]map[string]interface{}, error) {
-	rows, err := db.DB.Query(query, args...)
+func queryPeerMaps(ctx context.Context, query string, args ...interface{}) ([]map[string]interface{}, error) {
+	rows, err := db.DB.QueryContext(ctx, query, args...)
 	if err != nil {
 		log.Printf("queryPeerMaps error: %v", err)
 		return nil, err

@@ -567,6 +567,7 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create workspace"})
 		return
 	}
+	defer func() { _ = tx.Rollback() }()
 
 	maxConcurrent := payload.MaxConcurrentTasks
 	if maxConcurrent <= 0 {
