@@ -847,10 +847,12 @@ runtimes:
         # BYOK selection spelling used across the create/test corpus
         # (internal#718 P4 PR-1). Both forms route to anthropic-api.
         models:
+          - claude-fable-5
           - claude-sonnet-4-6
           - claude-opus-4-7
           - claude-haiku-4-5
           - claude-sonnet-4-5
+          - anthropic:claude-fable-5
           - anthropic:claude-sonnet-4-6
           - anthropic:claude-opus-4-7
           - anthropic:claude-haiku-4-5
@@ -883,6 +885,7 @@ runtimes:
       # template can offer no platform model absent from this set.
       - name: platform
         models:
+          - anthropic/claude-fable-5
           - anthropic/claude-opus-4-7
           - anthropic/claude-sonnet-4-6
           - moonshot/kimi-k2.6
