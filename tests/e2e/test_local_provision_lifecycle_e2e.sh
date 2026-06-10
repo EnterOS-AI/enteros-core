@@ -194,6 +194,28 @@ container_running() {  # container_running <ws-id>  -> echoes name if running
   docker ps --filter "name=ws-${1}" --filter "status=running" --format '{{.Names}}' 2>/dev/null | head -1
 }
 
+diagnose_provision() {
+  local wsid="${1:-}"
+  local container
+  container=$(container_running "$wsid")
+  echo "--- DIAGNOSE provisioning for $wsid ---"
+  echo "last_sample_error: ${LAST:-<none>}"
+  echo "container_running: ${container:-<none>}"
+  if [ -n "$container" ]; then
+    echo "--- container logs ($container) ---"
+    docker logs "$container" 2>&1 | tail -n 60 || true
+    echo "--- container env ---"
+    docker inspect "$container" --format '{{json .Config.Env}}' 2>&1 || true
+    echo "--- container reachability test ---"
+    docker exec "$container" sh -c 'echo "platform_url=$PLATFORM_URL"; wget -qO- "$PLATFORM_URL/health" 2>&1 || true' || true
+  fi
+  echo "--- all ws-* containers ---"
+  docker ps --filter "name=ws-" --format '{{.Names}} {{.Status}}' 2>/dev/null || true
+  echo "--- all ws-* volumes ---"
+  docker volume ls -q 2>/dev/null | grep '^ws-' || true
+  echo "--- end diagnose ---"
+}
+
 cleanup() {
   local rc=$?
   echo ""
@@ -429,6 +451,7 @@ for _ in $(seq 1 "$ONLINE_TIMEOUT"); do
   sleep 1
 done
 check "workspace reached online (status=$STATUS)" "online" "$STATUS"
+if [ "$FAIL" -gt 0 ]; then diagnose_provision "$WSID"; echo "=== Results: $PASS passed, $FAIL failed ==="; exit 1; fi
 RUN=$(container_running "$WSID")
 if [ -n "$RUN" ]; then pass "container running: $RUN"; else fail "no running ws-${WSID} container" "docker ps shows none"; fi
 echo ""
@@ -466,6 +489,7 @@ else
     sleep 1
   done
   check "workspace back online after restart (status=$STATUS)" "online" "$STATUS"
+  if [ "$FAIL" -gt 0 ]; then diagnose_provision "$WSID"; echo "=== Results: $PASS passed, $FAIL failed ==="; exit 1; fi
   # Explicit negative on the exact bug signature.
   if echo "$LAST" | grep -qiF "config volume is empty"; then
     fail "restart hit 'config volume is empty' — restart-survival REGRESSION" "$LAST"
