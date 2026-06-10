@@ -19,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	dockerimage "github.com/docker/docker/api/types/image"
@@ -227,9 +228,31 @@ func legacyClaudeSessionVolumeName(workspaceID string) string {
 	return fmt.Sprintf("ws-%s-claude-sessions", id)
 }
 
+// dockerClient is the subset of client.Client methods used by Provisioner.
+// Declared as an interface so tests can inject fakes without a real daemon.
+type dockerClient interface {
+	Close() error
+	ContainerCreate(ctx context.Context, config *container.Config, hostConfig *container.HostConfig, networkingConfig *network.NetworkingConfig, platform *ocispec.Platform, containerName string) (container.CreateResponse, error)
+	ContainerExecAttach(ctx context.Context, execID string, config container.ExecAttachOptions) (types.HijackedResponse, error)
+	ContainerExecCreate(ctx context.Context, container string, config container.ExecOptions) (container.ExecCreateResponse, error)
+	ContainerInspect(ctx context.Context, container string) (container.InspectResponse, error)
+	ContainerList(ctx context.Context, options container.ListOptions) ([]container.Summary, error)
+	ContainerLogs(ctx context.Context, container string, options container.LogsOptions) (io.ReadCloser, error)
+	ContainerRemove(ctx context.Context, container string, options container.RemoveOptions) error
+	ContainerRename(ctx context.Context, container, newContainerName string) error
+	ContainerStart(ctx context.Context, container string, options container.StartOptions) error
+	ContainerWait(ctx context.Context, container string, condition container.WaitCondition) (<-chan container.WaitResponse, <-chan error)
+	CopyToContainer(ctx context.Context, container, path string, content io.Reader, options container.CopyToContainerOptions) error
+	ImageInspect(ctx context.Context, image string, opts ...client.ImageInspectOption) (dockerimage.InspectResponse, error)
+	ImagePull(ctx context.Context, ref string, opts dockerimage.PullOptions) (io.ReadCloser, error)
+	VolumeCreate(ctx context.Context, options volume.CreateOptions) (volume.Volume, error)
+	VolumeInspect(ctx context.Context, volumeID string) (volume.Volume, error)
+	VolumeRemove(ctx context.Context, volumeID string, force bool) error
+}
+
 // Provisioner manages Docker containers for workspace agents.
 type Provisioner struct {
-	cli *client.Client
+	cli dockerClient
 }
 
 // New creates a new Provisioner connected to the local Docker daemon.
@@ -1336,33 +1359,113 @@ func (p *Provisioner) WriteAuthTokenToVolume(ctx context.Context, workspaceID, t
 }
 
 // resolveConfigVolumeName returns the effective config volume name for a
-// workspace, preferring the legacy truncated name if that volume already
-// exists (KI-013 deploy safety: pre-deploy volumes must not be orphaned).
+// workspace.  KI-013 deploy safety: if a legacy truncated-name volume exists,
+// it is migrated in-place to the new full-ID name so existing workspace data
+// is preserved AND all workspaces eventually use collision-safe names.
 func (p *Provisioner) resolveConfigVolumeName(ctx context.Context, workspaceID string) string {
 	if p == nil || p.cli == nil {
 		return ConfigVolumeName(workspaceID)
 	}
+	newName := ConfigVolumeName(workspaceID)
 	legacy := legacyConfigVolumeName(workspaceID)
-	if _, err := p.cli.VolumeInspect(ctx, legacy); err == nil {
-		return legacy
+	if err := p.migrateVolumeIfNeeded(ctx, newName, legacy); err != nil {
+		log.Printf("Provisioner: volume migration warning for %s: %v", workspaceID, err)
 	}
-	return ConfigVolumeName(workspaceID)
+	return newName
 }
 
 // resolveClaudeSessionVolumeName returns the effective claude-sessions volume
-// name, preferring the legacy truncated name if that volume already exists.
+// name.  KI-013 deploy safety: legacy truncated-name volumes are migrated
+// in-place to the new full-ID name.
 func (p *Provisioner) resolveClaudeSessionVolumeName(ctx context.Context, workspaceID string) string {
 	if p == nil || p.cli == nil {
 		return ClaudeSessionVolumeName(workspaceID)
 	}
+	newName := ClaudeSessionVolumeName(workspaceID)
 	legacy := legacyClaudeSessionVolumeName(workspaceID)
-	if _, err := p.cli.VolumeInspect(ctx, legacy); err == nil {
-		return legacy
+	if err := p.migrateVolumeIfNeeded(ctx, newName, legacy); err != nil {
+		log.Printf("Provisioner: session volume migration warning for %s: %v", workspaceID, err)
 	}
-	return ClaudeSessionVolumeName(workspaceID)
+	return newName
+}
+
+// migrateVolumeIfNeeded renames a legacy truncated-name Docker volume to its
+// new full-ID name by copying data via a temporary alpine container.  If the
+// legacy volume does not exist, or the new volume already exists, this is a
+// no-op.  The operation is idempotent — calling it multiple times is safe.
+func (p *Provisioner) migrateVolumeIfNeeded(ctx context.Context, newName, legacyName string) error {
+	if p == nil || p.cli == nil {
+		return nil
+	}
+
+	// Legacy volume missing — nothing to migrate.
+	if _, err := p.cli.VolumeInspect(ctx, legacyName); err != nil {
+		return nil
+	}
+
+	// New volume already exists — migration already done (or new workspace).
+	if _, err := p.cli.VolumeInspect(ctx, newName); err == nil {
+		return nil
+	}
+
+	// Create the new volume.
+	if _, err := p.cli.VolumeCreate(ctx, volume.CreateOptions{
+		Name:   newName,
+		Labels: managedLabels(),
+	}); err != nil {
+		return fmt.Errorf("create new volume %s: %w", newName, err)
+	}
+
+	// Copy data from legacy to new via a short-lived alpine container.
+	resp, err := p.cli.ContainerCreate(ctx, &container.Config{
+		Image: "alpine",
+		Cmd:   []string{"sh", "-c", "cp -a /legacy/. /new/"},
+	}, &container.HostConfig{
+		Binds: []string{
+			legacyName + ":/legacy",
+			newName + ":/new",
+		},
+	}, nil, nil, "")
+	if err != nil {
+		return fmt.Errorf("create migration container: %w", err)
+	}
+	defer p.cli.ContainerRemove(ctx, resp.ID, container.RemoveOptions{Force: true})
+
+	if err := p.cli.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
+		return fmt.Errorf("start migration container: %w", err)
+	}
+
+	waitCh, errCh := p.cli.ContainerWait(ctx, resp.ID, container.WaitConditionNotRunning)
+	select {
+	case waitResp := <-waitCh:
+		if waitResp.StatusCode != 0 {
+			return fmt.Errorf("migration copy failed (exit %d) — preserving legacy volume %s for retry", waitResp.StatusCode, legacyName)
+		}
+	case err := <-errCh:
+		if err != nil {
+			return fmt.Errorf("migration container exited with error: %w", err)
+		}
+	}
+
+	// Explicitly remove the migration container before removing the legacy
+	// volume so the volume is no longer referenced. The deferred remove above
+	// is a safety-net for early-return paths.
+	_ = p.cli.ContainerRemove(ctx, resp.ID, container.RemoveOptions{Force: true})
+
+	// Best-effort cleanup of the legacy volume.  If removal fails (e.g. still
+	// referenced by a running container), the new volume is already populated
+	// and the next restart will retry.
+	if err := p.cli.VolumeRemove(ctx, legacyName, true); err != nil {
+		log.Printf("Provisioner: warning: failed to remove legacy volume %s after migration: %v", legacyName, err)
+	} else {
+		log.Printf("Provisioner: migrated legacy volume %s → %s", legacyName, newName)
+	}
+	return nil
 }
 
 // RemoveVolume removes the config volume for a workspace.
+// Also removes the claude-sessions volume (best-effort, may not exist
+// for non claude-code runtimes). Issue #12.
 // Also removes the claude-sessions volume (best-effort, may not exist
 // for non claude-code runtimes). Issue #12.
 func (p *Provisioner) RemoveVolume(ctx context.Context, workspaceID string) error {
@@ -1490,24 +1593,56 @@ func (p *Provisioner) IsRunning(ctx context.Context, workspaceID string) (bool, 
 // transient errors into the same "" return as a genuinely-stopped container.
 // That hid daemon flakes as misleading 503 "container not running" responses
 // AND let the two impls drift on edge-case behavior. This is the SSOT.
-func RunningContainerName(ctx context.Context, cli *client.Client, workspaceID string) (string, error) {
+// isNilDockerClient reports whether cli is nil or a typed nil pointer
+// (e.g. (*client.Client)(nil) passed as a dockerClient interface value).
+// Required because a non-nil interface holding a nil pointer does not == nil.
+func isNilDockerClient(cli dockerClient) bool {
 	if cli == nil {
+		return true
+	}
+	switch c := cli.(type) {
+	case *client.Client:
+		return c == nil
+	default:
+		return false
+	}
+}
+
+func RunningContainerName(ctx context.Context, cli dockerClient, workspaceID string) (string, error) {
+	if isNilDockerClient(cli) {
 		return "", ErrNoBackend
 	}
-	// KI-013 deploy safety: new full-ID name first, then fall back to the
-	// old truncated name so pre-deploy containers are still discoverable.
-	names := []string{ContainerName(workspaceID), legacyContainerName(workspaceID)}
-	for _, name := range names {
-		info, err := cli.ContainerInspect(ctx, name)
-		if err != nil {
-			if isContainerNotFound(err) {
-				continue
+
+	newName := ContainerName(workspaceID)
+	legacyName := legacyContainerName(workspaceID)
+
+	// If a legacy container is still running, rename it in-place to the
+	// new full-ID name so all callers converge on collision-safe names.
+	legacyInfo, legacyErr := cli.ContainerInspect(ctx, legacyName)
+	if legacyErr == nil && legacyInfo.State.Running {
+		if _, newErr := cli.ContainerInspect(ctx, newName); isContainerNotFound(newErr) {
+			if renameErr := cli.ContainerRename(ctx, legacyName, newName); renameErr == nil {
+				log.Printf("Provisioner: renamed legacy container %s → %s", legacyName, newName)
+				return newName, nil
+			} else {
+				log.Printf("Provisioner: warning: failed to rename legacy container %s → %s: %v", legacyName, newName, renameErr)
 			}
-			return "", err
 		}
-		if info.State.Running {
-			return name, nil
+		// Rename not possible (or new name already occupied) — return legacy
+		// name so the caller can still exec into the live container.
+		return legacyName, nil
+	}
+
+	// Standard path: look for a running container with the new name.
+	info, err := cli.ContainerInspect(ctx, newName)
+	if err != nil {
+		if isContainerNotFound(err) {
+			return "", nil
 		}
+		return "", err
+	}
+	if info.State.Running {
+		return newName, nil
 	}
 	return "", nil
 }
@@ -1558,8 +1693,15 @@ func isRemovalInProgress(err error) bool {
 }
 
 // DockerClient returns the underlying Docker client for sharing with other handlers.
+// If the provisioner is backed by a fake (e.g. in unit tests), this returns nil.
 func (p *Provisioner) DockerClient() *client.Client {
-	return p.cli
+	if p == nil || p.cli == nil {
+		return nil
+	}
+	if c, ok := p.cli.(*client.Client); ok {
+		return c
+	}
+	return nil
 }
 
 // Close cleans up the Docker client.

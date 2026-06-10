@@ -2,14 +2,19 @@ package provisioner
 
 import (
 	"archive/tar"
+	"context"
 	"errors"
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/volume"
+	"github.com/docker/docker/client"
 )
 
 // TestValidateConfigSource covers issue #17: a workspace restart with no
@@ -1420,5 +1425,121 @@ func TestApplyTierConfig_T3_DefaultCap(t *testing.T) {
 	wantCPU := int64(defaultTier3CPUShares) * 1_000_000_000 / 1024
 	if hc.NanoCPUs != wantCPU {
 		t.Errorf("T3 default NanoCPUs: got %d, want %d", hc.NanoCPUs, wantCPU)
+	}
+}
+
+// TestMigrateVolumeIfNeeded_ExistingTruncatedVolume verifies the KI-013 deploy
+// safety path: when a legacy truncated-name volume already exists, data is
+// copied to the new full-ID name and the legacy volume is removed.  Existing
+// workspace state is preserved without operator intervention.
+func TestMigrateVolumeIfNeeded_ExistingTruncatedVolume(t *testing.T) {
+	ctx := context.Background()
+
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		t.Skip("docker client unavailable:", err)
+	}
+	if _, pingErr := cli.Ping(ctx); pingErr != nil {
+		t.Skip("docker daemon unreachable:", pingErr)
+	}
+
+	p := &Provisioner{cli: cli}
+	workspaceID := "test-migrate-" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	legacyName := legacyConfigVolumeName(workspaceID)
+	newName := ConfigVolumeName(workspaceID)
+
+	// Cleanup before and after (defensive — avoid pollution on retries).
+	_ = cli.VolumeRemove(ctx, legacyName, true)
+	_ = cli.VolumeRemove(ctx, newName, true)
+	defer func() {
+		_ = cli.VolumeRemove(ctx, legacyName, true)
+		_ = cli.VolumeRemove(ctx, newName, true)
+	}()
+
+	// 1. Create legacy volume and seed it with a sentinel file.
+	if _, err := cli.VolumeCreate(ctx, volume.CreateOptions{Name: legacyName}); err != nil {
+		t.Fatalf("create legacy volume: %v", err)
+	}
+	seedResp, err := cli.ContainerCreate(ctx, &container.Config{
+		Image: "alpine",
+		Cmd:   []string{"sh", "-c", "echo sentinel-data > /vol/sentinel.txt"},
+	}, &container.HostConfig{
+		Binds: []string{legacyName + ":/vol"},
+	}, nil, nil, "")
+	if err != nil {
+		t.Fatalf("create seed container: %v", err)
+	}
+	defer cli.ContainerRemove(ctx, seedResp.ID, container.RemoveOptions{Force: true})
+	if err := cli.ContainerStart(ctx, seedResp.ID, container.StartOptions{}); err != nil {
+		t.Fatalf("start seed container: %v", err)
+	}
+	waitCh, errCh := cli.ContainerWait(ctx, seedResp.ID, container.WaitConditionNotRunning)
+	select {
+	case <-waitCh:
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("seed container failed: %v", err)
+		}
+	}
+	// Remove the seed container before migration so the legacy volume is
+	// no longer referenced by any container. The deferred remove above is a
+	// safety net for panic/early-return paths.
+	if err := cli.ContainerRemove(ctx, seedResp.ID, container.RemoveOptions{Force: true}); err != nil {
+		t.Fatalf("remove seed container: %v", err)
+	}
+
+	// 2. Run migration.
+	if err := p.migrateVolumeIfNeeded(ctx, newName, legacyName); err != nil {
+		t.Fatalf("migrateVolumeIfNeeded failed: %v", err)
+	}
+
+	// 3. Legacy volume must be gone.
+	if _, inspectErr := cli.VolumeInspect(ctx, legacyName); inspectErr == nil {
+		t.Fatalf("legacy volume %s still exists after migration", legacyName)
+	}
+
+	// 4. New volume must exist and contain the sentinel file.
+	if _, inspectErr := cli.VolumeInspect(ctx, newName); inspectErr != nil {
+		t.Fatalf("new volume %s does not exist after migration: %v", newName, inspectErr)
+	}
+
+	readResp, err := cli.ContainerCreate(ctx, &container.Config{
+		Image: "alpine",
+		Cmd:   []string{"cat", "/vol/sentinel.txt"},
+	}, &container.HostConfig{
+		Binds: []string{newName + ":/vol"},
+	}, nil, nil, "")
+	if err != nil {
+		t.Fatalf("create read container: %v", err)
+	}
+	defer cli.ContainerRemove(ctx, readResp.ID, container.RemoveOptions{Force: true})
+	if err := cli.ContainerStart(ctx, readResp.ID, container.StartOptions{}); err != nil {
+		t.Fatalf("start read container: %v", err)
+	}
+	waitCh, errCh = cli.ContainerWait(ctx, readResp.ID, container.WaitConditionNotRunning)
+	select {
+	case <-waitCh:
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("read container failed: %v", err)
+		}
+	}
+
+	logs, err := cli.ContainerLogs(ctx, readResp.ID, container.LogsOptions{ShowStdout: true})
+	if err != nil {
+		t.Fatalf("read container logs: %v", err)
+	}
+	defer logs.Close()
+	data, err := io.ReadAll(logs)
+	if err != nil {
+		t.Fatalf("read logs: %v", err)
+	}
+	if !strings.Contains(string(data), "sentinel-data") {
+		t.Fatalf("new volume missing sentinel data; logs: %q", data)
+	}
+
+	// 5. Idempotency: second migration must be a no-op.
+	if err := p.migrateVolumeIfNeeded(ctx, newName, legacyName); err != nil {
+		t.Fatalf("second migration (idempotency) failed: %v", err)
 	}
 }
