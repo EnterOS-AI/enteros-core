@@ -919,6 +919,7 @@ func (h *WorkspaceHandler) Pause(c *gin.Context) {
 
 	// Collect this workspace + all descendants to pause
 	toPause := []struct{ id, name string }{{id, wsName}}
+	var descendantList []gin.H
 	rows, err := db.DB.QueryContext(ctx,
 		`WITH RECURSIVE descendants AS (
 			SELECT id, name FROM workspaces WHERE parent_id = $1 AND status NOT IN ('removed', 'paused')
@@ -934,11 +935,21 @@ func (h *WorkspaceHandler) Pause(c *gin.Context) {
 			var cid, cname string
 			if rows.Scan(&cid, &cname) == nil {
 				toPause = append(toPause, struct{ id, name string }{cid, cname})
+				descendantList = append(descendantList, gin.H{"id": cid, "name": cname})
 			}
 		}
 		if err := rows.Err(); err != nil {
 			log.Printf("Pause: descendant query rows.Err: %v", err)
 		}
+	}
+
+	// Default: single-workscope pause unless ?cascade=true
+	if c.Query("cascade") != "true" && len(descendantList) > 0 {
+		c.JSON(http.StatusConflict, gin.H{
+			"error":       "workspace has descendants — use ?cascade=true to pause all",
+			"descendants": descendantList,
+		})
+		return
 	}
 
 	// Stop containers and mark all as paused. StopWorkspaceAuto routes
@@ -1008,6 +1019,7 @@ func (h *WorkspaceHandler) Resume(c *gin.Context) {
 		tier              int
 	}
 	toResume := []wsInfo{{id, wsName, dbRuntime, tier}}
+	var descendantList []gin.H
 	rows, err := db.DB.QueryContext(ctx,
 		`WITH RECURSIVE descendants AS (
 			SELECT id, name, tier, COALESCE(runtime, 'claude-code') AS runtime FROM workspaces WHERE parent_id = $1 AND status = 'paused'
@@ -1023,11 +1035,21 @@ func (h *WorkspaceHandler) Resume(c *gin.Context) {
 			var ws wsInfo
 			if rows.Scan(&ws.id, &ws.name, &ws.tier, &ws.runtime) == nil {
 				toResume = append(toResume, ws)
+				descendantList = append(descendantList, gin.H{"id": ws.id, "name": ws.name})
 			}
 		}
 		if err := rows.Err(); err != nil {
 			log.Printf("Resume: descendant query rows.Err: %v", err)
 		}
+	}
+
+	// Default: single-workspace resume unless ?cascade=true
+	if c.Query("cascade") != "true" && len(descendantList) > 0 {
+		c.JSON(http.StatusConflict, gin.H{
+			"error":       "workspace has descendants — use ?cascade=true to resume all",
+			"descendants": descendantList,
+		})
+		return
 	}
 
 	// Re-provision all

@@ -379,6 +379,93 @@ func TestPauseHandler_SuccessNoChildren(t *testing.T) {
 	}
 }
 
+func TestPauseHandler_DescendantsNoCascadeReturns409(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+
+	mock.ExpectQuery("SELECT status, name FROM workspaces WHERE id =").
+		WithArgs("ws-pause-parent").
+		WillReturnRows(sqlmock.NewRows([]string{"status", "name"}).AddRow("online", "Parent Agent"))
+
+	mock.ExpectQuery("WITH RECURSIVE descendants").
+		WithArgs("ws-pause-parent").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name"}).
+			AddRow("ws-child-1", "Child 1").
+			AddRow("ws-child-2", "Child 2"))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-pause-parent"}}
+	c.Request = httptest.NewRequest("POST", "/workspaces/ws-pause-parent/pause", nil)
+
+	handler.Pause(c)
+
+	if w.Code != http.StatusConflict {
+		t.Errorf("expected 409, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if _, ok := resp["error"].(string); !ok {
+		t.Errorf("expected error message, got %v", resp)
+	}
+	if descs, ok := resp["descendants"].([]interface{}); !ok || len(descs) != 2 {
+		t.Errorf("expected 2 descendants, got %v", resp["descendants"])
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+func TestPauseHandler_DescendantsWithCascadeReturns200(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+
+	mock.ExpectQuery("SELECT status, name FROM workspaces WHERE id =").
+		WithArgs("ws-pause-parent-cascade").
+		WillReturnRows(sqlmock.NewRows([]string{"status", "name"}).AddRow("online", "Parent Agent"))
+
+	mock.ExpectQuery("WITH RECURSIVE descendants").
+		WithArgs("ws-pause-parent-cascade").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name"}).
+			AddRow("ws-child-1", "Child 1").
+			AddRow("ws-child-2", "Child 2"))
+
+	for _, wsID := range []string{"ws-pause-parent-cascade", "ws-child-1", "ws-child-2"} {
+		mock.ExpectExec("UPDATE workspaces SET status =").
+			WithArgs(models.StatusPaused, wsID).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+		mock.ExpectExec("INSERT INTO structure_events").
+			WillReturnResult(sqlmock.NewResult(0, 1))
+	}
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-pause-parent-cascade"}}
+	c.Request = httptest.NewRequest("POST", "/workspaces/ws-pause-parent-cascade/pause?cascade=true", nil)
+
+	handler.Pause(c)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if count, ok := resp["paused_count"].(float64); !ok || count != 3 {
+		t.Errorf("expected paused_count 3, got %v", resp["paused_count"])
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
 // ==================== POST /workspaces/:id/resume — additional coverage ====================
 
 func TestResumeHandler_NotPausedReturns404(t *testing.T) {
@@ -465,6 +552,110 @@ func TestResumeHandler_NilProvisionerReturns503(t *testing.T) {
 // Note: TestResumeHandler_ParentPausedBlocksResume requires a non-nil provisioner
 // (Resume checks provisioner before isParentPaused). This is covered in
 // handlers_additional_test.go's integration-style tests.
+
+func TestResumeHandler_DescendantsNoCascadeReturns409(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+	handler.SetCPProvisioner(&fakeCPProv{})
+
+	mock.ExpectQuery("SELECT name, tier, COALESCE").
+		WithArgs("ws-resume-parent").
+		WillReturnRows(sqlmock.NewRows([]string{"name", "tier", "runtime"}).
+			AddRow("Parent Agent", 1, "claude-code"))
+
+	// isParentPaused: no parent
+	mock.ExpectQuery("SELECT parent_id FROM workspaces WHERE id =").
+		WithArgs("ws-resume-parent").
+		WillReturnRows(sqlmock.NewRows([]string{"parent_id"}))
+
+	mock.ExpectQuery("WITH RECURSIVE descendants").
+		WithArgs("ws-resume-parent").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "tier", "runtime"}).
+			AddRow("ws-child-1", "Child 1", 1, "claude-code").
+			AddRow("ws-child-2", "Child 2", 1, "claude-code"))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-resume-parent"}}
+	c.Request = httptest.NewRequest("POST", "/workspaces/ws-resume-parent/resume", nil)
+
+	handler.Resume(c)
+
+	if w.Code != http.StatusConflict {
+		t.Errorf("expected 409, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if _, ok := resp["error"].(string); !ok {
+		t.Errorf("expected error message, got %v", resp)
+	}
+	if descs, ok := resp["descendants"].([]interface{}); !ok || len(descs) != 2 {
+		t.Errorf("expected 2 descendants, got %v", resp["descendants"])
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+func TestResumeHandler_DescendantsWithCascadeReturns200(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+	handler.SetCPProvisioner(&fakeCPProv{})
+
+	mock.ExpectQuery("SELECT name, tier, COALESCE").
+		WithArgs("ws-resume-parent-cascade").
+		WillReturnRows(sqlmock.NewRows([]string{"name", "tier", "runtime"}).
+			AddRow("Parent Agent", 1, "claude-code"))
+
+	// isParentPaused: no parent
+	mock.ExpectQuery("SELECT parent_id FROM workspaces WHERE id =").
+		WithArgs("ws-resume-parent-cascade").
+		WillReturnRows(sqlmock.NewRows([]string{"parent_id"}))
+
+	mock.ExpectQuery("WITH RECURSIVE descendants").
+		WithArgs("ws-resume-parent-cascade").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "tier", "runtime"}).
+			AddRow("ws-child-1", "Child 1", 1, "claude-code").
+			AddRow("ws-child-2", "Child 2", 1, "claude-code"))
+
+	for _, wsID := range []string{"ws-resume-parent-cascade", "ws-child-1", "ws-child-2"} {
+		mock.ExpectExec("UPDATE workspaces SET status =").
+			WithArgs(models.StatusProvisioning, wsID).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+		mock.ExpectExec("INSERT INTO structure_events").
+			WillReturnResult(sqlmock.NewResult(0, 1))
+		mock.ExpectQuery("SELECT COALESCE").
+			WithArgs(wsID).
+			WillReturnRows(sqlmock.NewRows([]string{"COALESCE"}).AddRow("{}"))
+	}
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-resume-parent-cascade"}}
+	c.Request = httptest.NewRequest("POST", "/workspaces/ws-resume-parent-cascade/resume?cascade=true", nil)
+
+	handler.Resume(c)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if count, ok := resp["resumed_count"].(float64); !ok || count != 3 {
+		t.Errorf("expected resumed_count 3, got %v", resp["resumed_count"])
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
 
 // ==================== HibernateWorkspace — TOCTOU fix (#819) ====================
 
