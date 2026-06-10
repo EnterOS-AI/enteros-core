@@ -1593,8 +1593,23 @@ func (p *Provisioner) IsRunning(ctx context.Context, workspaceID string) (bool, 
 // transient errors into the same "" return as a genuinely-stopped container.
 // That hid daemon flakes as misleading 503 "container not running" responses
 // AND let the two impls drift on edge-case behavior. This is the SSOT.
-func RunningContainerName(ctx context.Context, cli dockerClient, workspaceID string) (string, error) {
+// isNilDockerClient reports whether cli is nil or a typed nil pointer
+// (e.g. (*client.Client)(nil) passed as a dockerClient interface value).
+// Required because a non-nil interface holding a nil pointer does not == nil.
+func isNilDockerClient(cli dockerClient) bool {
 	if cli == nil {
+		return true
+	}
+	switch c := cli.(type) {
+	case *client.Client:
+		return c == nil
+	default:
+		return false
+	}
+}
+
+func RunningContainerName(ctx context.Context, cli dockerClient, workspaceID string) (string, error) {
+	if isNilDockerClient(cli) {
 		return "", ErrNoBackend
 	}
 
