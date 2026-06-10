@@ -19,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	dockerimage "github.com/docker/docker/api/types/image"
@@ -227,9 +228,31 @@ func legacyClaudeSessionVolumeName(workspaceID string) string {
 	return fmt.Sprintf("ws-%s-claude-sessions", id)
 }
 
+// dockerClient is the subset of client.Client methods used by Provisioner.
+// Declared as an interface so tests can inject fakes without a real daemon.
+type dockerClient interface {
+	Close() error
+	ContainerCreate(ctx context.Context, config *container.Config, hostConfig *container.HostConfig, networkingConfig *network.NetworkingConfig, platform *ocispec.Platform, containerName string) (container.CreateResponse, error)
+	ContainerExecAttach(ctx context.Context, execID string, config container.ExecAttachOptions) (types.HijackedResponse, error)
+	ContainerExecCreate(ctx context.Context, container string, config container.ExecOptions) (container.ExecCreateResponse, error)
+	ContainerInspect(ctx context.Context, container string) (container.InspectResponse, error)
+	ContainerList(ctx context.Context, options container.ListOptions) ([]container.Summary, error)
+	ContainerLogs(ctx context.Context, container string, options container.LogsOptions) (io.ReadCloser, error)
+	ContainerRemove(ctx context.Context, container string, options container.RemoveOptions) error
+	ContainerRename(ctx context.Context, container, newContainerName string) error
+	ContainerStart(ctx context.Context, container string, options container.StartOptions) error
+	ContainerWait(ctx context.Context, container string, condition container.WaitCondition) (<-chan container.WaitResponse, <-chan error)
+	CopyToContainer(ctx context.Context, container, path string, content io.Reader, options container.CopyToContainerOptions) error
+	ImageInspect(ctx context.Context, image string, opts ...client.ImageInspectOption) (dockerimage.InspectResponse, error)
+	ImagePull(ctx context.Context, ref string, opts dockerimage.PullOptions) (io.ReadCloser, error)
+	VolumeCreate(ctx context.Context, options volume.CreateOptions) (volume.Volume, error)
+	VolumeInspect(ctx context.Context, volumeID string) (volume.Volume, error)
+	VolumeRemove(ctx context.Context, volumeID string, force bool) error
+}
+
 // Provisioner manages Docker containers for workspace agents.
 type Provisioner struct {
-	cli *client.Client
+	cli dockerClient
 }
 
 // New creates a new Provisioner connected to the local Docker daemon.
@@ -1414,7 +1437,10 @@ func (p *Provisioner) migrateVolumeIfNeeded(ctx context.Context, newName, legacy
 
 	waitCh, errCh := p.cli.ContainerWait(ctx, resp.ID, container.WaitConditionNotRunning)
 	select {
-	case <-waitCh:
+	case waitResp := <-waitCh:
+		if waitResp.StatusCode != 0 {
+			return fmt.Errorf("migration copy failed (exit %d) — preserving legacy volume %s for retry", waitResp.StatusCode, legacyName)
+		}
 	case err := <-errCh:
 		if err != nil {
 			return fmt.Errorf("migration container exited with error: %w", err)
@@ -1567,7 +1593,7 @@ func (p *Provisioner) IsRunning(ctx context.Context, workspaceID string) (bool, 
 // transient errors into the same "" return as a genuinely-stopped container.
 // That hid daemon flakes as misleading 503 "container not running" responses
 // AND let the two impls drift on edge-case behavior. This is the SSOT.
-func RunningContainerName(ctx context.Context, cli *client.Client, workspaceID string) (string, error) {
+func RunningContainerName(ctx context.Context, cli dockerClient, workspaceID string) (string, error) {
 	if cli == nil {
 		return "", ErrNoBackend
 	}
@@ -1652,8 +1678,15 @@ func isRemovalInProgress(err error) bool {
 }
 
 // DockerClient returns the underlying Docker client for sharing with other handlers.
+// If the provisioner is backed by a fake (e.g. in unit tests), this returns nil.
 func (p *Provisioner) DockerClient() *client.Client {
-	return p.cli
+	if p == nil || p.cli == nil {
+		return nil
+	}
+	if c, ok := p.cli.(*client.Client); ok {
+		return c
+	}
+	return nil
 }
 
 // Close cleans up the Docker client.
