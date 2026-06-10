@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"log"
 	"os"
@@ -328,6 +329,8 @@ func (h *WorkspaceHandler) buildProvisionerConfig(
 				workspaceAccess = dbAccess
 			}
 			kind = dbKind
+		} else if err != sql.ErrNoRows {
+			log.Printf("ERROR: workspace kind lookup failed for %s: %v", workspaceID, err)
 		}
 	}
 	if workspacePath == "" {
