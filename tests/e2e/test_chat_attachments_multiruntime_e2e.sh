@@ -145,7 +145,7 @@ check_runtime() {
     fails=$((fails + 1)); return
   fi
   local container
-  container=$(docker ps --format '{{.Names}}' | grep -E "^ws-${wsid:0:12}" | head -1)
+  container=$(docker ps --format '{{.Names}}' | grep -E "^ws-${wsid}" | head -1)
   [ -z "$container" ] && { echo "FAIL $label: container not found"; fails=$((fails + 1)); return; }
 
   has_patch_in_container "$container" || { echo "FAIL $label: platform helpers missing"; fails=$((fails + 1)); return; }

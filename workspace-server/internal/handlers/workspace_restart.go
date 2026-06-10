@@ -15,6 +15,7 @@ import (
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provlog"
 	"github.com/gin-gonic/gin"
 )
@@ -393,7 +394,7 @@ func (h *WorkspaceHandler) restartRuntimeFromConfig(ctx context.Context, id, wsN
 		return dbRuntime
 	}
 	containerRuntime := dbRuntime
-	containerName := configDirName(id) // ws-{id[:12]}
+	containerName := provisioner.ContainerName(id) // ws-{id} (KI-013 full UUID)
 	if cfgBytes, readErr := h.provisioner.ExecRead(ctx, containerName, "/configs/config.yaml"); readErr == nil {
 		for _, line := range strings.Split(string(cfgBytes), "\n") {
 			line = strings.TrimSpace(line)

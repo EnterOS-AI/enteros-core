@@ -33,6 +33,7 @@ import (
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
@@ -239,7 +240,7 @@ func (h *WorkspaceHandler) applyConciergeProvisionConfig(
 		}
 	}
 	if len(base) == 0 && h.provisioner != nil {
-		if b, err := h.provisioner.ExecRead(ctx, configDirName(workspaceID), "/configs/config.yaml"); err == nil {
+		if b, err := h.provisioner.ExecRead(ctx, provisioner.ContainerName(workspaceID), "/configs/config.yaml"); err == nil {
 			base = b
 		}
 	}
@@ -399,7 +400,7 @@ func conciergeIdentityPresent(ctx context.Context, prov localProvisionerIsRunnin
 		// that doesn't expose ExecRead.
 		return true
 	}
-	body, err := reader.ExecRead(ctx, configDirName(id), "/configs/system-prompt.md")
+	body, err := reader.ExecRead(ctx, provisioner.ContainerName(id), "/configs/system-prompt.md")
 	if err != nil {
 		return false
 	}
