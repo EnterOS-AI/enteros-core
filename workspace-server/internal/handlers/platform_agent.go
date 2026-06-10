@@ -108,8 +108,13 @@ behalf, and keep them in the loop.
 // Entry shape pins the REAL image contract (agents-team pilot RCA,
 // 2026-06-10 — the previous block pointed at a /opt/molecule-mcp-server
 // path the image never shipped):
-//   - command `molecule-mcp` — Dockerfile.platform-agent npm-installs
-//     @molecule-ai/mcp-server globally, exposing exactly this bin on PATH.
+//   - command `molecule-platform-mcp` — Dockerfile.platform-agent symlinks
+//     the npm-installed @molecule-ai/mcp-server bin under this UNAMBIGUOUS
+//     name. The package's own bin name (`molecule-mcp`) COLLIDES with the
+//     runtime wheel's Python a2a inbox bridge at /usr/local/bin/molecule-mcp,
+//     which wins on PATH — the pilot's second-stage failure (2026-06-10):
+//     the config resolved to the Python bridge and the agent got a duplicate
+//     a2a server instead of the management registry.
 //   - env MOLECULE_MCP_MODE=management — the SAME binary serves the
 //     21-tool workspace a2a registry by default; only management mode
 //     registers the org-admin tools (list_workspaces et al). Without it
@@ -120,14 +125,14 @@ behalf, and keep them in the loop.
 // over process env, so the mode flag composes with those.
 //
 // SELF-HOST CAVEAT: the local stack provisions the concierge on the ordinary
-// `claude-code` image, which does NOT ship the molecule-mcp bin. The
+// `claude-code` image, which does NOT ship the molecule-platform-mcp bin. The
 // executor's _apply_extra_mcp_servers skips an entry whose command is
 // absent, so declaring this block can never crash the agent or wedge the SDK
 // init locally — the identity (system prompt) works everywhere; the org-admin
 // MCP tools only light up on the platform-agent image.
 const conciergeMCPServersBlock = `mcp_servers:
   - name: platform
-    command: molecule-mcp
+    command: molecule-platform-mcp
     env:
       MOLECULE_MCP_MODE: management
 `
@@ -210,6 +215,15 @@ func conciergePlatformMCPEnv(env map[string]string) {
 		}
 	}
 	setIfAbsent("MOLECULE_API_KEY", os.Getenv("ADMIN_TOKEN"))
+	// The management-mode tool registry (mcp-server >=1.5.0,
+	// src/tools/management/client.ts) authenticates with
+	// MOLECULE_ORG_API_KEY — a distinct env from the connectivity-preflight
+	// MOLECULE_API_KEY. The tenant ADMIN_TOKEN is a valid bearer for the
+	// tenant-admin surface those tools call (same header shape as the
+	// install/restart curls), so wire it under both names. Verified live on
+	// the agents-team pilot: with only MOLECULE_API_KEY set, every
+	// management tool returns AUTH_ERROR.
+	setIfAbsent("MOLECULE_ORG_API_KEY", os.Getenv("ADMIN_TOKEN"))
 	// MOLECULE_API_URL: prefer an explicit env, else the in-cluster platform URL.
 	apiURL := os.Getenv("MOLECULE_API_URL")
 	if apiURL == "" {

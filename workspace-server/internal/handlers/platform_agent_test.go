@@ -372,7 +372,7 @@ func TestConciergeIdentityFiles(t *testing.T) {
 	// Pins the REAL image contract (pilot RCA 2026-06-10): the bin on PATH
 	// + management mode — NOT the /opt node path the image never shipped,
 	// and NOT default (a2a) mode which has zero admin tools.
-	for _, want := range []string{"mcp_servers:", "name: platform", "command: molecule-mcp", "MOLECULE_MCP_MODE: management", "runtime: claude-code"} {
+	for _, want := range []string{"mcp_servers:", "name: platform", "command: molecule-platform-mcp", "MOLECULE_MCP_MODE: management", "runtime: claude-code"} {
 		if !strings.Contains(string(cfg), want) {
 			t.Errorf("config.yaml missing %q\n--- got ---\n%s", want, cfg)
 		}
@@ -388,7 +388,7 @@ func TestConciergeIdentityFiles(t *testing.T) {
 	if !ok {
 		t.Fatalf("overlay missing %s (the base-independent MCP declaration)", conciergeMCPFragmentFile)
 	}
-	for _, want := range []string{"name: platform", "command: molecule-mcp", "MOLECULE_MCP_MODE: management"} {
+	for _, want := range []string{"name: platform", "command: molecule-platform-mcp", "MOLECULE_MCP_MODE: management"} {
 		if !strings.Contains(string(frag), want) {
 			t.Errorf("%s missing %q", conciergeMCPFragmentFile, want)
 		}
@@ -486,6 +486,9 @@ func TestApplyConciergeProvisionConfig_OnlyPlatformGetsOrgMCP(t *testing.T) {
 		if _, ok := env["MOLECULE_API_KEY"]; ok {
 			t.Errorf("SECURITY: ordinary workspace leaked MOLECULE_API_KEY (org-admin token): %v", env)
 		}
+		if _, ok := env["MOLECULE_ORG_API_KEY"]; ok {
+			t.Errorf("SECURITY: ordinary workspace leaked MOLECULE_ORG_API_KEY: %v", env)
+		}
 		if _, ok := out["system-prompt.md"]; ok {
 			t.Error("ordinary workspace was given the concierge system prompt")
 		}
@@ -509,6 +512,9 @@ func TestApplyConciergeProvisionConfig_OnlyPlatformGetsOrgMCP(t *testing.T) {
 		out := h.applyConciergeProvisionConfig(context.Background(), "ws-concierge", "", cf, env, "Molecule AI Agent")
 		if env["MOLECULE_API_KEY"] != "secret-org-admin" {
 			t.Errorf("concierge did not receive the org-admin token; env=%v", env)
+		}
+		if env["MOLECULE_ORG_API_KEY"] != "secret-org-admin" {
+			t.Errorf("management tools auth env (MOLECULE_ORG_API_KEY) missing; env=%v", env)
 		}
 		if _, ok := out["system-prompt.md"]; !ok {
 			t.Error("concierge did not receive the system prompt")
