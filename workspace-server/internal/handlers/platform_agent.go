@@ -511,7 +511,7 @@ func installPlatformAgent(ctx context.Context, database *sql.DB, platformID, nam
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO workspaces (id, name, kind, tier, status, runtime, parent_id)
 		VALUES ($1, $2, 'platform', 0, 'offline', 'claude-code', NULL)
-		ON CONFLICT (id) DO UPDATE SET kind = 'platform', parent_id = NULL
+		ON CONFLICT (id) DO UPDATE SET kind = 'platform', runtime = 'claude-code', parent_id = NULL
 	`, platformID, name); err != nil {
 		return fmt.Errorf("upsert platform agent: %w", err)
 	}

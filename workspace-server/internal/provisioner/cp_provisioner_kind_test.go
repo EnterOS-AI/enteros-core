@@ -63,9 +63,13 @@ func TestStart_ForwardsPlatformKind(t *testing.T) {
 // CPs see byte-identical requests.
 func TestStart_OmitsKindForOrdinaryWorkspace(t *testing.T) {
 	p, body := startCaptureCP(t)
+	// Ordinary workspaces have kind="workspace" from the DB COALESCE;
+	// the CP provisioner must suppress it so omitempty keeps the wire
+	// shape unchanged (core#2498 truth-up).
 	_, err := p.Start(context.Background(), WorkspaceConfig{
 		WorkspaceID: "ws-ordinary",
 		Runtime:     "claude-code",
+		Kind:        "workspace",
 		PlatformURL: "https://acme.example.com",
 	})
 	if err != nil {

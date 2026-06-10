@@ -1,0 +1,12 @@
+# SSOT: the branch-protection REQUIRED status contexts on molecule-core
+# main. Authoritative for lint-no-coe-on-required (CI cannot always read
+# branch_protections; when a repo-admin token is present the lint also
+# live-cross-checks this list against BP and fails on drift).
+#
+# Form: "<workflow name> / <job name>" (event suffix stripped). Verified
+# 2026-06-10 against GET /api/v1/repos/molecule-ai/molecule-core/branch_protections.
+# Keep in sync with branch protection; lint-required-context-exists-in-bp
+# is the cousin that guards the other direction.
+CI / all-required
+E2E API Smoke Test / E2E API Smoke Test
+Handlers Postgres Integration / Handlers Postgres Integration

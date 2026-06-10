@@ -221,6 +221,37 @@ func validateWorkspaceDisplayDimensions(width, height int) error {
 	return nil
 }
 
+type computeProviderMetadata struct {
+	ID              string   `json:"id"`
+	Label           string   `json:"label"`
+	DefaultInstance string   `json:"default_instance"`
+	Instances       []string `json:"instances"`
+}
+
+type computeMetadataResponse struct {
+	Providers []computeProviderMetadata `json:"providers"`
+}
+
+// ComputeMetadata handles GET /compute/metadata — SSOT for cloud-provider +
+// instance-type allowlists consumed by the canvas ContainerConfigTab (and any
+// other client that needs to render a provider/instance selector).
+// Public, no auth: the data is platform constraints, not org secrets.
+func ComputeMetadata(c *gin.Context) {
+	// Deterministic order so tests (and UI dropdowns) are stable.
+	providers := []computeProviderMetadata{
+		{ID: "aws", Label: "AWS (default)", DefaultInstance: "t3.medium", Instances: []string{
+			"t3.medium", "t3.large", "t3.xlarge", "t3.2xlarge", "m6i.large", "m6i.xlarge", "c6i.xlarge",
+		}},
+		{ID: "gcp", Label: "GCP", DefaultInstance: "e2-standard-2", Instances: []string{
+			"e2-small", "e2-medium", "e2-standard-2", "e2-standard-4", "e2-standard-8",
+		}},
+		{ID: "hetzner", Label: "Hetzner", DefaultInstance: "cpx31", Instances: []string{
+			"cpx11", "cpx21", "cpx31", "cpx41", "cpx51", "cax11", "cax21", "cax31", "cax41",
+		}},
+	}
+	c.JSON(200, computeMetadataResponse{Providers: providers})
+}
+
 func workspaceComputeIsZero(compute models.WorkspaceCompute) bool {
 	return compute.InstanceType == "" &&
 		compute.Volume.RootGB == 0 &&

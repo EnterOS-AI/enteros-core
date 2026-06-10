@@ -798,3 +798,45 @@ func TestWorkspaceDisplaySession_NonDisplayWorkspaceDoesNotProxy(t *testing.T) {
 		t.Errorf("unmet sqlmock expectations: %v", err)
 	}
 }
+
+func TestComputeMetadata_ReturnsProviderAllowlist(t *testing.T) {
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest("GET", "/compute/metadata", nil)
+
+	ComputeMetadata(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp computeMetadataResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to parse response: %v", err)
+	}
+	if len(resp.Providers) != 3 {
+		t.Fatalf("expected 3 providers, got %d", len(resp.Providers))
+	}
+	want := []struct {
+		id, label, defaultInstance string
+		instanceCount             int
+	}{
+		{"aws", "AWS (default)", "t3.medium", 7},
+		{"gcp", "GCP", "e2-standard-2", 5},
+		{"hetzner", "Hetzner", "cpx31", 9},
+	}
+	for i, w := range want {
+		p := resp.Providers[i]
+		if p.ID != w.id {
+			t.Errorf("providers[%d].id = %q, want %q", i, p.ID, w.id)
+		}
+		if p.Label != w.label {
+			t.Errorf("providers[%d].label = %q, want %q", i, p.Label, w.label)
+		}
+		if p.DefaultInstance != w.defaultInstance {
+			t.Errorf("providers[%d].default_instance = %q, want %q", i, p.DefaultInstance, w.defaultInstance)
+		}
+		if len(p.Instances) != w.instanceCount {
+			t.Errorf("providers[%d].instances len = %d, want %d", i, len(p.Instances), w.instanceCount)
+		}
+	}
+}
