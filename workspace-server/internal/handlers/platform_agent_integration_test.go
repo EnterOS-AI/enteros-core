@@ -259,7 +259,6 @@ func TestIntegration_PlatformAgentInstall_StatusNotOnline(t *testing.T) {
 	conn := integrationDB_PlatformAgentInstall(t)
 	ctx := context.Background()
 
-	tag := uuid.New().String()[:8]
 	platformID := uuid.New().String()
 
 	cleanup := func() {
