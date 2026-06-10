@@ -252,11 +252,31 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
           }
           releaseSendGuards();
         })
-        .catch(() => {
+        .catch((e: unknown) => {
           if (sendTokenRef.current !== myToken) return;
           if (!sendingFromAPIRef.current) {
             sendInFlightRef.current = false;
             return;
+          }
+          // CLIENT TIMEOUT ≠ UNREACHABLE (jrs-auto, 2026-06-09). The A2A
+          // proxy holds this POST open for the agent's WHOLE turn; a long
+          // tool-calling turn routinely outlives the 120s client budget.
+          // AbortSignal.timeout firing after the server ACCEPTED and held
+          // the connection means the message was DELIVERED and the agent is
+          // still working — showing "agent may be unreachable" here is a
+          // false alarm (the user watches the agent run tools in the
+          // activity feed while the chat claims failure). Keep the thinking
+          // state up; the reply lands via the AGENT_MESSAGE WebSocket event,
+          // which releases the guards — exactly the documented poll-mode
+          // contract above. Genuine unreachability fails FAST (connection
+          // refused / 4xx / 5xx) and still takes the error branch; a truly
+          // dead agent is surfaced by the reactive-health path
+          // (maybeMarkContainerDead), not by this client timeout.
+          const isClientTimeout =
+            e !== null && typeof e === "object" &&
+            "name" in e && (e as { name: unknown }).name === "TimeoutError";
+          if (isClientTimeout) {
+            return; // delivered; reply (and guard release) arrives via WS
           }
           releaseSendGuards();
           setError("Failed to send message — agent may be unreachable");
