@@ -557,9 +557,16 @@ func installPlatformAgent(ctx context.Context, database *sql.DB, platformID, nam
 		// collides 23505 when N>1 old roots allowlisted the SAME plugin.
 		// INSERT…SELECT…ON CONFLICT DO NOTHING deduplicates; DELETE leftovers
 		// cleans the old-root rows (core#2508).
+		//
+		// Column-list matches the actual schema (026_org_plugin_allowlist.up.sql):
+		//   id, org_id, plugin_name, enabled_by, enabled_at
+		// id is auto-populated by gen_random_uuid(); enabled_by is NOT NULL but
+		// preserved from the old root row (same admin who enabled it);
+		// enabled_at is preserved verbatim (no audit-time rewrite on
+		// re-parenting — the original "when this was enabled" stays stable).
 		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO org_plugin_allowlist (org_id, plugin_name, created_at, updated_at)
-			SELECT $1, plugin_name, created_at, updated_at
+			INSERT INTO org_plugin_allowlist (org_id, plugin_name, enabled_by, enabled_at)
+			SELECT $1, plugin_name, enabled_by, enabled_at
 			FROM org_plugin_allowlist
 			WHERE org_id = $2
 			ON CONFLICT (org_id, plugin_name) DO NOTHING
