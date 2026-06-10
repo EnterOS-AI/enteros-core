@@ -142,16 +142,6 @@ func (f *compatFakeDockerClient) VolumeRemove(ctx context.Context, name string, 
 	return nil
 }
 
-// Helper: return true if a call matching prefix was recorded.
-func (f *compatFakeDockerClient) called(prefix string) bool {
-	for _, c := range f.calls {
-		if c == prefix {
-			return true
-		}
-	}
-	return false
-}
-
 // (c) RunningContainerName surfaces transient errors (not not-found).
 func TestRunningContainerName_TransientError(t *testing.T) {
 	ctx := context.Background()
