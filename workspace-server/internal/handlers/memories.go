@@ -107,7 +107,6 @@ func (h *MemoriesHandler) withMemoryV2APIs(plugin memoryPluginAPI, resolver name
 	return h
 }
 
-
 // Commit handles POST /workspaces/:id/memories
 // Stores a memory fact with a scope (LOCAL, TEAM, GLOBAL) and an optional
 // namespace (defaults to "general"). Namespaces implement the Holaboss
@@ -210,6 +209,26 @@ func (h *MemoriesHandler) Commit(c *gin.Context) {
 		c.JSON(http.StatusForbidden, gin.H{
 			"error": fmt.Sprintf("no writable namespace of kind %s for workspace %s", wantKind, workspaceID),
 		})
+		return
+	}
+
+	// Ensure the namespace row exists before the write — the plugin's
+	// CommitMemory contract is "namespace must already exist (auto-created
+	// by handler if not)" and memory_records carries an FK to
+	// memory_namespaces. The MCP tool path (mcp_tools_memory_v2.go) has
+	// always done this upsert; this HTTP path skipped it, so any workspace
+	// whose namespace row was never seeded (every workspace created after
+	// the Phase A2 backfill that only ever wrote through this surface —
+	// i.e. the runtime a2a commit_memory tool and the canvas) failed every
+	// write with `memory_records_namespace_fkey` (fleet-wide, 2026-06-10).
+	// UpsertNamespace is idempotent, so the extra round-trip on warm
+	// namespaces is a cheap no-op.
+	if _, err := h.memv2.plugin.UpsertNamespace(ctx, nsName, contract.NamespaceUpsert{Kind: kindFromNamespace(nsName)}); err != nil {
+		log.Printf(
+			"Commit memory namespace upsert error: workspace=%s scope=%s namespace=%s err_class=%T err=%q",
+			workspaceID, body.Scope, nsName, err, err,
+		)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store memory"})
 		return
 	}
 
