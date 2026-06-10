@@ -218,6 +218,19 @@ func (h *RequestsHandler) Get(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "query failed"})
 		return
 	}
+
+	// Workspace-token auth path: a workspace may read only a request it is a
+	// party to (requester or recipient). Cross-workspace read is forbidden
+	// (core#2542 full fix).
+	if workspaceID := c.Param("id"); workspaceID != "" {
+		isParty := (req.RequesterType == "agent" && req.RequesterID == workspaceID) ||
+			(req.RecipientType == "agent" && req.RecipientID == workspaceID)
+		if !isParty {
+			c.JSON(http.StatusForbidden, gin.H{"error": "not a participant"})
+			return
+		}
+	}
+
 	msgs, err := s.Messages(ctx, requestID)
 	if err != nil {
 		log.Printf("Get request messages error request=%s: %v", requestID, err)

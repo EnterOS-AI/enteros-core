@@ -265,6 +265,91 @@ func TestRequests_Get_NotFound(t *testing.T) {
 	}
 }
 
+// TestRequests_Get_AgentPath_Requester_200 verifies that the requester workspace
+// can read its own request on the workspace-token auth path.
+func TestRequests_Get_AgentPath_Requester_200(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewRequestsHandler(newTestBroadcaster())
+
+	mock.ExpectQuery("FROM requests WHERE id").
+		WithArgs("req-1").
+		WillReturnRows(oneRequestRow("req-1", "task", "ws-1", "agent", "ws-2", "pending"))
+	mock.ExpectQuery("FROM request_messages WHERE request_id").
+		WithArgs("req-1").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "request_id", "author_type", "author_id", "body", "created_at"}))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{
+		{Key: "requestId", Value: "req-1"},
+		{Key: "id", Value: "ws-1"},
+	}
+	c.Request = httptest.NewRequest("GET", "/", nil)
+
+	handler.Get(c)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200 for requester read, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestRequests_Get_AgentPath_Recipient_200 verifies that the recipient workspace
+// can read a request addressed to it on the workspace-token auth path.
+func TestRequests_Get_AgentPath_Recipient_200(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewRequestsHandler(newTestBroadcaster())
+
+	mock.ExpectQuery("FROM requests WHERE id").
+		WithArgs("req-1").
+		WillReturnRows(oneRequestRow("req-1", "approval", "ws-1", "agent", "ws-2", "pending"))
+	mock.ExpectQuery("FROM request_messages WHERE request_id").
+		WithArgs("req-1").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "request_id", "author_type", "author_id", "body", "created_at"}))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{
+		{Key: "requestId", Value: "req-1"},
+		{Key: "id", Value: "ws-2"},
+	}
+	c.Request = httptest.NewRequest("GET", "/", nil)
+
+	handler.Get(c)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200 for recipient read, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestRequests_Get_AgentPath_NonParticipant_403 verifies that a workspace that
+// is neither the requester nor the recipient gets 403 on the workspace-token
+// auth path (core#2542 full fix — read-path org-scoping).
+func TestRequests_Get_AgentPath_NonParticipant_403(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewRequestsHandler(newTestBroadcaster())
+
+	mock.ExpectQuery("FROM requests WHERE id").
+		WithArgs("req-1").
+		WillReturnRows(oneRequestRow("req-1", "task", "ws-1", "agent", "ws-2", "pending"))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{
+		{Key: "requestId", Value: "req-1"},
+		{Key: "id", Value: "ws-3"},
+	}
+	c.Request = httptest.NewRequest("GET", "/", nil)
+
+	handler.Get(c)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403 for non-participant read, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
 // ---------- Respond (valid + invalid action-for-kind) ----------
 
 func TestRequests_Respond_ApprovalApproved(t *testing.T) {
