@@ -369,9 +369,28 @@ func TestConciergeIdentityFiles(t *testing.T) {
 	if !ok {
 		t.Fatal("overlay missing config.yaml (mcp_servers should have been appended)")
 	}
-	for _, want := range []string{"mcp_servers:", "name: platform", "command: node", "/opt/molecule-mcp-server/dist/index.js", "runtime: claude-code"} {
+	// Pins the REAL image contract (pilot RCA 2026-06-10): the bin on PATH
+	// + management mode — NOT the /opt node path the image never shipped,
+	// and NOT default (a2a) mode which has zero admin tools.
+	for _, want := range []string{"mcp_servers:", "name: platform", "command: molecule-platform-mcp", "MOLECULE_MCP_MODE: management", "runtime: claude-code"} {
 		if !strings.Contains(string(cfg), want) {
 			t.Errorf("config.yaml missing %q\n--- got ---\n%s", want, cfg)
+		}
+	}
+	if strings.Contains(string(cfg), "/opt/molecule-mcp-server") {
+		t.Error("stale /opt path resurfaced — the image ships the molecule-mcp bin, not /opt/molecule-mcp-server")
+	}
+
+	// The standalone fragment ships ALWAYS, carrying the same declaration —
+	// the base-independent path that survives the SaaS restart-provision
+	// (where no base config is resolvable).
+	frag, ok := files[conciergeMCPFragmentFile]
+	if !ok {
+		t.Fatalf("overlay missing %s (the base-independent MCP declaration)", conciergeMCPFragmentFile)
+	}
+	for _, want := range []string{"name: platform", "command: molecule-platform-mcp", "MOLECULE_MCP_MODE: management"} {
+		if !strings.Contains(string(frag), want) {
+			t.Errorf("%s missing %q", conciergeMCPFragmentFile, want)
 		}
 	}
 
@@ -386,13 +405,19 @@ func TestConciergeIdentityFiles(t *testing.T) {
 		t.Errorf("mcp_servers: appears %d times, want exactly 1", n)
 	}
 
-	// No base config (couldn't read one): identity still lands; no config.yaml.
+	// No base config (couldn't read one): identity still lands; no config.yaml
+	// — but the fragment STILL ships, so the MCP declaration reaches the
+	// container even when every base resolution misses (the exact SaaS
+	// restart-provision gap that booted the pilot concierge toolless).
 	only := conciergeIdentityFiles("Org Concierge", nil)
 	if _, present := only["system-prompt.md"]; !present {
 		t.Error("system prompt must land even with no base config")
 	}
 	if _, present := only["config.yaml"]; present {
 		t.Error("no config.yaml overlay when there is no base to append onto")
+	}
+	if _, present := only[conciergeMCPFragmentFile]; !present {
+		t.Errorf("%s must ship even with no base config", conciergeMCPFragmentFile)
 	}
 }
 
@@ -461,11 +486,17 @@ func TestApplyConciergeProvisionConfig_OnlyPlatformGetsOrgMCP(t *testing.T) {
 		if _, ok := env["MOLECULE_API_KEY"]; ok {
 			t.Errorf("SECURITY: ordinary workspace leaked MOLECULE_API_KEY (org-admin token): %v", env)
 		}
+		if _, ok := env["MOLECULE_ORG_API_KEY"]; ok {
+			t.Errorf("SECURITY: ordinary workspace leaked MOLECULE_ORG_API_KEY: %v", env)
+		}
 		if _, ok := out["system-prompt.md"]; ok {
 			t.Error("ordinary workspace was given the concierge system prompt")
 		}
 		if strings.Contains(string(out["config.yaml"]), "mcp_servers") {
 			t.Error("SECURITY: ordinary workspace was given the platform mcp_servers config")
+		}
+		if _, ok := out[conciergeMCPFragmentFile]; ok {
+			t.Errorf("SECURITY: ordinary workspace was given %s", conciergeMCPFragmentFile)
 		}
 		if err := mock.ExpectationsWereMet(); err != nil {
 			t.Errorf("unmet sqlmock expectations: %v", err)
@@ -481,6 +512,9 @@ func TestApplyConciergeProvisionConfig_OnlyPlatformGetsOrgMCP(t *testing.T) {
 		out := h.applyConciergeProvisionConfig(context.Background(), "ws-concierge", "", cf, env, "Molecule AI Agent")
 		if env["MOLECULE_API_KEY"] != "secret-org-admin" {
 			t.Errorf("concierge did not receive the org-admin token; env=%v", env)
+		}
+		if env["MOLECULE_ORG_API_KEY"] != "secret-org-admin" {
+			t.Errorf("management tools auth env (MOLECULE_ORG_API_KEY) missing; env=%v", env)
 		}
 		if _, ok := out["system-prompt.md"]; !ok {
 			t.Error("concierge did not receive the system prompt")
