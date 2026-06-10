@@ -52,3 +52,37 @@ describe("FlightEnvelope", () => {
     expect(getByTestId("flight-envelope")).toBeTruthy();
   });
 });
+
+describe("EndpointBounce (sender flick + receiver catch)", () => {
+  it("renders a bounce element at BOTH endpoints (sender + receiver)", () => {
+    const { getAllByTestId } = render(
+      <FlightEnvelope from={{ x: 10, y: 20 }} to={{ x: 300, y: 400 }} kind="send" />,
+    );
+    const bounces = getAllByTestId("flight-endpoint-bounce");
+    expect(bounces).toHaveLength(2);
+    expect(bounces[0].style.left).toBe("10px");
+    expect(bounces[0].style.top).toBe("20px");
+    expect(bounces[1].style.left).toBe("300px");
+    expect(bounces[1].style.top).toBe("400px");
+  });
+
+  it("bounce dots/rings start invisible (WAAPI-unavailable degrade = nothing visible)", () => {
+    const { getAllByTestId } = render(
+      <FlightEnvelope from={{ x: 0, y: 0 }} to={{ x: 5, y: 5 }} kind="receive" />,
+    );
+    for (const el of getAllByTestId("flight-endpoint-bounce")) {
+      const dot = el.querySelector("[data-bounce-dot]");
+      const ring = el.querySelector("[data-bounce-ring]");
+      expect(dot?.getAttribute("opacity")).toBe("0");
+      expect(ring?.getAttribute("opacity")).toBe("0");
+    }
+  });
+
+  it("bounce colour matches the flight kind", () => {
+    const { getAllByTestId } = render(
+      <FlightEnvelope from={{ x: 0, y: 0 }} to={{ x: 5, y: 5 }} kind="task" />,
+    );
+    const dot = getAllByTestId("flight-endpoint-bounce")[0].querySelector("[data-bounce-dot]");
+    expect(dot?.getAttribute("fill")).toBe("#f5a623");
+  });
+});

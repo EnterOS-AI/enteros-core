@@ -6,7 +6,12 @@
  *  Uses the Web Animations API so the from/to delta can be dynamic per flight
  *  (a static CSS @keyframes can't translate to a runtime-computed point). */
 import { useEffect, useRef } from "react";
-import { FLIGHT_DURATION_MS, type A2AFlightKind } from "@/hooks/useA2AFlights";
+import {
+  BOUNCE_DURATION_MS,
+  FLIGHT_DURATION_MS,
+  RECEIVE_BOUNCE_DELAY_MS,
+  type A2AFlightKind,
+} from "@/hooks/useA2AFlights";
 
 /** Stroke colour by activity kind — mirrors CommunicationOverlay's palette
  *  (send = cyan, receive = violet/accent, task = warm) so the two surfaces
@@ -20,6 +25,108 @@ const KIND_COLOR: Record<A2AFlightKind, string> = {
 export interface Point {
   x: number;
   y: number;
+}
+
+/** EndpointBounce — a small bounce pulse rendered at a flight endpoint: the
+ *  sender "flicks" the envelope on launch and the receiver "catches" it on
+ *  landing (CTO ask, 2026-06-10 — both the canvas map and the concierge home
+ *  render flights through this one component, so both surfaces get it).
+ *
+ *  A filled dot that overshoots (scale up past 1, settle, fade) with a ring
+ *  expanding behind it — classic squash-free bounce that works at any zoom.
+ *  Same WAAPI degrade posture as the envelope: no Element.animate → render
+ *  nothing visible (opacity stays 0). */
+function EndpointBounce({
+  at,
+  color,
+  delayMs,
+}: {
+  at: Point;
+  color: string;
+  delayMs: number;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const el = ref.current;
+    if (!el || typeof el.animate !== "function") return;
+    const dot = el.querySelector<SVGElement>("[data-bounce-dot]");
+    const ring = el.querySelector<SVGElement>("[data-bounce-ring]");
+    const anims: Animation[] = [];
+    if (dot && typeof (dot as unknown as HTMLElement).animate === "function") {
+      anims.push(
+        (dot as unknown as HTMLElement).animate(
+          [
+            { transform: "scale(0.3)", opacity: 0 },
+            { transform: "scale(1.45)", opacity: 0.95, offset: 0.35 }, // overshoot
+            { transform: "scale(0.85)", opacity: 0.8, offset: 0.6 }, // bounce back
+            { transform: "scale(1.1)", opacity: 0.5, offset: 0.8 }, // settle hop
+            { transform: "scale(1)", opacity: 0 },
+          ],
+          { duration: BOUNCE_DURATION_MS, delay: delayMs, easing: "ease-out", fill: "both" },
+        ),
+      );
+    }
+    if (ring && typeof (ring as unknown as HTMLElement).animate === "function") {
+      anims.push(
+        (ring as unknown as HTMLElement).animate(
+          [
+            { transform: "scale(0.4)", opacity: 0.7 },
+            { transform: "scale(1.9)", opacity: 0 },
+          ],
+          { duration: BOUNCE_DURATION_MS, delay: delayMs, easing: "ease-out", fill: "both" },
+        ),
+      );
+    }
+    return () => anims.forEach((a) => a.cancel());
+  }, [delayMs]);
+
+  return (
+    <div
+      ref={ref}
+      data-testid="flight-endpoint-bounce"
+      aria-hidden="true"
+      style={{
+        position: "absolute",
+        left: at.x,
+        top: at.y,
+        width: 0,
+        height: 0,
+        pointerEvents: "none",
+        zIndex: 5,
+      }}
+    >
+      <svg
+        width="28"
+        height="28"
+        viewBox="0 0 28 28"
+        fill="none"
+        aria-hidden="true"
+        style={{ position: "absolute", left: -14, top: -14, overflow: "visible" }}
+      >
+        <circle
+          data-bounce-ring
+          cx="14"
+          cy="14"
+          r="9"
+          stroke={color}
+          strokeWidth="1.5"
+          fill="none"
+          opacity="0"
+          style={{ transformOrigin: "14px 14px" }}
+        />
+        <circle
+          data-bounce-dot
+          cx="14"
+          cy="14"
+          r="4.5"
+          fill={color}
+          opacity="0"
+          style={{ transformOrigin: "14px 14px" }}
+        />
+      </svg>
+    </div>
+  );
 }
 
 export function FlightEnvelope({
@@ -64,9 +171,14 @@ export function FlightEnvelope({
 
   const color = KIND_COLOR[kind];
   return (
-    <div
-      ref={ref}
-      data-testid="flight-envelope"
+    <>
+      {/* sender flick: bounce at the launch point as the envelope departs */}
+      <EndpointBounce at={from} color={color} delayMs={0} />
+      {/* receiver catch: bounce at the landing point as the envelope arrives */}
+      <EndpointBounce at={to} color={color} delayMs={RECEIVE_BOUNCE_DELAY_MS} />
+      <div
+        ref={ref}
+        data-testid="flight-envelope"
       aria-hidden="true"
       style={{
         position: "absolute",
@@ -88,7 +200,8 @@ export function FlightEnvelope({
           strokeLinecap="round"
           strokeLinejoin="round"
         />
-      </svg>
-    </div>
+        </svg>
+      </div>
+    </>
   );
 }
