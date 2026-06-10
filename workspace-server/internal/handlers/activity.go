@@ -77,19 +77,19 @@ func NewActivityHandler(b events.EventEmitter) *ActivityHandler {
 //  1. a2a-sdk v1 message-part envelope (peer_agent inbound):
 //
 //     {"jsonrpc":"2.0","method":"message/send","params":{
-//        "message":{"parts":[
-//          {"kind":"text", "text":"hi"},
-//          {"kind":"file", "file":{"uri":"workspace:foo.pdf","mime_type":"application/pdf","name":"foo.pdf"}},
-//          {"kind":"image","file":{"uri":"workspace:bar.png","mime_type":"image/png","name":"bar.png"}},
-//        ]}}}
+//     "message":{"parts":[
+//     {"kind":"text", "text":"hi"},
+//     {"kind":"file", "file":{"uri":"workspace:foo.pdf","mime_type":"application/pdf","name":"foo.pdf"}},
+//     {"kind":"image","file":{"uri":"workspace:bar.png","mime_type":"image/png","name":"bar.png"}},
+//     ]}}}
 //
 //  2. canvas chat_upload_receive flat manifest (canvas_user upload):
 //
 //     {"uri":"platform-pending:<ws>/<file>",
-//      "name":"pasted.png",
-//      "size":12345,
-//      "file_id":"<uuid>",
-//      "mimeType":"image/png"}
+//     "name":"pasted.png",
+//     "size":12345,
+//     "file_id":"<uuid>",
+//     "mimeType":"image/png"}
 //
 //     The canvas upload pipe writes a single manifest directly at the
 //     root of request_body (no JSON-RPC envelope) with camelCase
@@ -1008,9 +1008,28 @@ func logActivityExec(ctx context.Context, exec activityExecutor, broadcaster eve
 		traceStr = &s
 	}
 
+	// Agent-Liveness RFC, Layer 3 (A2): write-through the activity timestamp
+	// onto the workspaces row IN THE SAME STATEMENT as the activity_logs
+	// INSERT, via a CTE. Every activity_logs write IS, by definition, the
+	// workspace doing something, so this is the single canonical point to
+	// stamp last_activity_at — the stall-watchdog sweeper
+	// (handlers/stall_watchdog.go) reads it to tell a busy-but-silently-hung
+	// workspace from one that's actively producing activity (the case the
+	// Redis TTL liveness monitor and the status='failed' watchdog both miss,
+	// the one that let JRS sit dead for 2.5h).
+	//
+	// Folded into ONE statement (CTE) rather than a second ExecContext so it
+	// adds NO extra round-trip on this latency-critical path, commits
+	// atomically with the activity row in the Tx case, and — being one Exec
+	// whose text still contains `INSERT INTO activity_logs` — preserves the
+	// existing sqlmock expectations across the codebase. $1 (workspace_id) is
+	// reused by the UPDATE; arg list is otherwise unchanged.
 	if _, err := exec.ExecContext(ctx, `
-		INSERT INTO activity_logs (workspace_id, activity_type, source_id, target_id, method, summary, request_body, response_body, tool_trace, duration_ms, status, error_detail)
-		VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9::jsonb, $10, $11, $12)
+		WITH ins AS (
+			INSERT INTO activity_logs (workspace_id, activity_type, source_id, target_id, method, summary, request_body, response_body, tool_trace, duration_ms, status, error_detail)
+			VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9::jsonb, $10, $11, $12)
+		)
+		UPDATE workspaces SET last_activity_at = now() WHERE id = $1
 	`, params.WorkspaceID, params.ActivityType, params.SourceID, params.TargetID,
 		params.Method, params.Summary, reqStr, respStr, traceStr,
 		params.DurationMs, params.Status, params.ErrorDetail); err != nil {
