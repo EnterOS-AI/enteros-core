@@ -1543,3 +1543,65 @@ func TestMigrateVolumeIfNeeded_ExistingTruncatedVolume(t *testing.T) {
 		t.Fatalf("second migration (idempotency) failed: %v", err)
 	}
 }
+
+// TestInternalURL verifies the container-internal URL shape.
+func TestInternalURL(t *testing.T) {
+	tests := []struct {
+		id   string
+		want string
+	}{
+		{"abc123", "http://ws-abc123:8000"},
+		{"longer-than-twelve-characters", "http://ws-longer-than-twelve-characters:8000"},
+		{"", "http://ws-:8000"},
+	}
+	for _, tt := range tests {
+		got := InternalURL(tt.id)
+		if got != tt.want {
+			t.Errorf("InternalURL(%q) = %q, want %q", tt.id, got, tt.want)
+		}
+	}
+}
+
+// TestApplyTierResources verifies the direct memory/CPU resource application.
+// Note: the T2-fallback for unknown tiers is handled by ApplyTierConfig, not
+// this low-level helper.
+func TestApplyTierResources(t *testing.T) {
+	for _, k := range []string{"TIER2_MEMORY_MB", "TIER2_CPU_SHARES", "TIER3_MEMORY_MB", "TIER3_CPU_SHARES", "TIER4_MEMORY_MB", "TIER4_CPU_SHARES"} {
+		os.Unsetenv(k)
+	}
+
+	tests := []struct {
+		name         string
+		tier         int
+		wantMemory   int64
+		wantNanoCPUs int64
+		wantShares   int64
+	}{
+		{"T1 no cap", 1, 0, 0, 0},
+		{"T2 512MiB 1CPU", 2, 512 * 1024 * 1024, 1_000_000_000, 1024},
+		{"T3 2048MiB 2CPU", 3, 2048 * 1024 * 1024, 2_000_000_000, 2048},
+		{"T4 4096MiB 4CPU", 4, 4096 * 1024 * 1024, 4_000_000_000, 4096},
+		{"unknown tier no cap", 99, 0, 0, 0},
+		{"zero tier no cap", 0, 0, 0, 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			hc := &container.HostConfig{}
+			memMB, cpuShares := applyTierResources(hc, tt.tier)
+
+			if memMB != tt.wantMemory/(1024*1024) {
+				t.Errorf("memMB = %d, want %d", memMB, tt.wantMemory/(1024*1024))
+			}
+			if hc.Memory != tt.wantMemory {
+				t.Errorf("Memory = %d, want %d", hc.Memory, tt.wantMemory)
+			}
+			if hc.NanoCPUs != tt.wantNanoCPUs {
+				t.Errorf("NanoCPUs = %d, want %d", hc.NanoCPUs, tt.wantNanoCPUs)
+			}
+			if cpuShares != tt.wantShares {
+				t.Errorf("cpuShares = %d, want %d", cpuShares, tt.wantShares)
+			}
+		})
+	}
+}
