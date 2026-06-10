@@ -1789,8 +1789,20 @@ import os
 import tempfile
 
 
-def _make_snapshot(prs, ts="2026-06-10T12:00:00Z"):
-    return {"ts": ts, "repo": "molecule-ai/molecule-core", "prs": prs}
+def _fresh_ts():
+    # Conductor snapshots are only honored within a 10-minute freshness window
+    # (load_conductor_snapshot in gitea-merge-queue.py). A frozen literal ts
+    # goes stale the moment wall-clock passes that window, silently dropping the
+    # snapshot and self-fetching -> empty OWNER/NAME -> "/repos///" crash. Default
+    # to NOW so the snapshot is fresh whenever the suite runs. Tests that want a
+    # STALE snapshot pass ts= explicitly (test_load_conductor_snapshot_ignores_stale_snapshot).
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _make_snapshot(prs, ts=None):
+    return {"ts": ts if ts is not None else _fresh_ts(),
+            "repo": "molecule-ai/molecule-core", "prs": prs}
 
 
 def test_list_candidate_issues_uses_snapshot_when_present(monkeypatch):
