@@ -17,23 +17,46 @@ type ContainerChecker interface {
 }
 
 // DefaultRemoteStaleAfter is the default heartbeat-freshness window for
-// `runtime='external'` workspaces before they're marked offline. Chosen
-// slightly longer than the 60s Redis TTL so transient network hiccups
-// don't cause a flapping online/offline ping-pong on the canvas. Override
-// via `REMOTE_LIVENESS_STALE_AFTER` env var (integer seconds).
-const DefaultRemoteStaleAfter = 90 * time.Second
+// `runtime='external'` workspaces before they're marked offline.
+//
+// It must comfortably exceed the worst-case gap between two consecutive
+// heartbeats. The runtime's heartbeat task runs on its own ~30s asyncio
+// cadence, independent of turn processing (see workspace/heartbeat.py in
+// the runtime repo, and the contract documented on
+// models.HeartbeatPayload.RuntimeState: "The heartbeat task lives in its
+// own asyncio task and keeps pinging even when the agent runtime is
+// wedged"). 180s = 6 missed heartbeats tolerates a long synchronous busy
+// turn, GC pauses, and transient network hiccups without a false
+// "unreachable", while still flipping a genuinely-dead agent to
+// awaiting_agent within ~3 minutes.
+//
+// History: was 90s, which under load / a long busy turn could lag past
+// the window and falsely mark a busy agent stale → user saw "failed to
+// send". Raised to 180s in fix/agent-stale-window-and-heartbeat.
+//
+// Override via `REMOTE_LIVENESS_STALE_AFTER` env var (integer seconds).
+const DefaultRemoteStaleAfter = 180 * time.Second
 
 // remoteStaleAfter reads the override from env, falling back to default.
 // Called once per sweep tick — we don't cache because ops occasionally
 // tune this live via a container restart, and the overhead of reading
 // an env var on a 15s cadence is irrelevant.
+//
+// Parse rules match the envx helpers: unset / unparseable / non-positive
+// all fall back to the default. Unlike envx we log a single line on a
+// malformed override so a fat-fingered ops value (e.g. "180s" instead of
+// the integer-seconds "180") is visible instead of silently ignored.
 func remoteStaleAfter() time.Duration {
-	if v := os.Getenv("REMOTE_LIVENESS_STALE_AFTER"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			return time.Duration(n) * time.Second
-		}
+	v := os.Getenv("REMOTE_LIVENESS_STALE_AFTER")
+	if v == "" {
+		return DefaultRemoteStaleAfter
 	}
-	return DefaultRemoteStaleAfter
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		log.Printf("Health sweep: invalid REMOTE_LIVENESS_STALE_AFTER=%q (want positive integer seconds) — using default %s", v, DefaultRemoteStaleAfter)
+		return DefaultRemoteStaleAfter
+	}
+	return time.Duration(n) * time.Second
 }
 
 // StartHealthSweep periodically checks all "online" workspaces. For
