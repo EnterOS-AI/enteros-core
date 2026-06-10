@@ -258,7 +258,7 @@ func (h *RequestsHandler) Respond(c *gin.Context) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "request not found or already resolved"})
 			return
 		}
-		if errors.Is(err, ErrInvalidRequestAction) || errors.Is(err, ErrInvalidRequestParty) {
+		if errors.Is(err, ErrInvalidRequestAction) || errors.Is(err, ErrInvalidRequestParty) || errors.Is(err, ErrSelfResponse) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}

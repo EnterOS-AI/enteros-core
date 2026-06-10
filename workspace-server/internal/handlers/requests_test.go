@@ -371,6 +371,31 @@ func TestRequests_Respond_NotFound(t *testing.T) {
 	}
 }
 
+// TestRequests_Respond_SelfResponse_400 pins RC 10416: the requester must not
+// be able to approve/reject/done their own request.
+func TestRequests_Respond_SelfResponse_400(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewRequestsHandler(newTestBroadcaster())
+
+	// Requester is agent ws-1; responder is also agent ws-1 → self-response.
+	mock.ExpectQuery("FROM requests WHERE id").
+		WithArgs("req-1").
+		WillReturnRows(oneRequestRow("req-1", "approval", "ws-1", "user", "", "pending"))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "requestId", Value: "req-1"}}
+	c.Request = httptest.NewRequest("POST", "/", bytes.NewBufferString(`{"action":"approved","responder_type":"agent","responder_id":"ws-1"}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Respond(c)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for self-response, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
 // ---------- AddMessage → info_requested when recipient asks ----------
 
 func TestRequests_AddMessage_RecipientFlipsInfoRequested(t *testing.T) {
