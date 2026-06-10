@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/DATA-DOG/go-sqlmock"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
+	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/alicebob/miniredis/v2"
 	"github.com/redis/go-redis/v9"
 )
@@ -261,6 +261,102 @@ func TestRemoteStaleAfter_FallsBackOnGarbage(t *testing.T) {
 		if got := remoteStaleAfter(); got != DefaultRemoteStaleAfter {
 			t.Errorf("value %q: expected fallback to default, got %s", v, got)
 		}
+	}
+}
+
+// The default stale window must be 180s — long enough that a busy agent
+// whose own ~30s heartbeat task lags a few cycles behind a long
+// synchronous turn is NOT falsely marked unreachable. Pinned explicitly
+// so a future edit to the const trips this test rather than silently
+// re-narrowing the window (the 90s value caused the original
+// "marked unreachable while busy" bug).
+func TestRemoteStaleAfter_DefaultIs180s(t *testing.T) {
+	t.Setenv("REMOTE_LIVENESS_STALE_AFTER", "")
+	if got := remoteStaleAfter(); got != 180*time.Second {
+		t.Errorf("expected default 180s, got %s", got)
+	}
+	if DefaultRemoteStaleAfter != 180*time.Second {
+		t.Errorf("DefaultRemoteStaleAfter = %s, want 180s", DefaultRemoteStaleAfter)
+	}
+}
+
+// A valid integer-seconds override is honoured (ops live-tuning path).
+func TestRemoteStaleAfter_EnvOverrideParses(t *testing.T) {
+	t.Setenv("REMOTE_LIVENESS_STALE_AFTER", "240")
+	if got := remoteStaleAfter(); got != 240*time.Second {
+		t.Errorf("expected 240s from override, got %s", got)
+	}
+}
+
+// The sweep's cutoff is driven by remoteStaleAfter(): the query is
+// parameterized with that window in seconds. This proves the configurable
+// window actually flows into the staleness predicate (an agent that
+// heartbeated within the window falls OUTSIDE the cutoff and is never
+// returned by the query → not swept; one past it is). We assert the
+// bound arg equals the configured window for both the default and an
+// override.
+func TestSweepStaleRemoteWorkspaces_UsesConfiguredWindow(t *testing.T) {
+	cases := []struct {
+		name    string
+		env     string
+		wantSec int
+	}{
+		{"default 180s", "", 180},
+		{"override 300s", "300", 300},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("REMOTE_LIVENESS_STALE_AFTER", tc.env)
+			mock := setupTestDB(t)
+			setupTestRedis(t)
+
+			// No rows returned: simulates "every external agent
+			// heartbeated within the window" → none stale → no sweep.
+			mock.ExpectQuery(`FROM workspaces`).
+				WithArgs(tc.wantSec).
+				WillReturnRows(sqlmock.NewRows([]string{"id"}))
+
+			swept := 0
+			sweepStaleRemoteWorkspaces(context.Background(), func(_ context.Context, _ string) { swept++ })
+
+			if swept != 0 {
+				t.Errorf("no rows returned (all fresh) but %d swept", swept)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Errorf("query not invoked with window=%d: %v", tc.wantSec, err)
+			}
+		})
+	}
+}
+
+// Complement to the above: a workspace whose heartbeat is PAST the window
+// is returned by the cutoff query and gets swept to awaiting_agent. The
+// Postgres `now() - interval` arithmetic runs server-side, so the unit
+// boundary we can assert here is "row returned by the windowed query ⇒
+// swept"; combined with the no-rows case above this covers both sides of
+// the window.
+func TestSweepStaleRemoteWorkspaces_PastWindowIsSwept(t *testing.T) {
+	t.Setenv("REMOTE_LIVENESS_STALE_AFTER", "")
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+
+	mock.ExpectQuery(`FROM workspaces`).
+		WithArgs(180).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("ws-past-window"))
+	mock.ExpectExec(`UPDATE workspaces SET status =`).
+		WithArgs(models.StatusAwaitingAgent, "ws-past-window").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	var swept []string
+	sweepStaleRemoteWorkspaces(context.Background(), func(_ context.Context, id string) {
+		swept = append(swept, id)
+	})
+
+	if len(swept) != 1 || swept[0] != "ws-past-window" {
+		t.Errorf("expected ws-past-window swept, got %v", swept)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
 	}
 }
 

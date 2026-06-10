@@ -1185,7 +1185,12 @@ def _evaluate_candidate(
         print(f"::notice::PR #{pr_number} is a draft; skipping")
         return None, ctx
     if pr.get("base", {}).get("ref") != WATCH_BRANCH:
-        post_comment(pr_number, f"merge-queue: skipped; base branch is not `{WATCH_BRANCH}`.", dry_run=dry_run)
+        # SILENT skip (matches the draft/opt-out skips above): a stacked PR
+        # whose base is not main is re-evaluated EVERY conductor tick; posting
+        # a comment each time floods the PR (2026-06-10: ~74 stacked PRs ->
+        # ~28k skip comments + measurable operator load). A no-op observation
+        # must not write. The PR is auto-considered once its base becomes main.
+        print(f"::notice::PR #{pr_number} base is not `{WATCH_BRANCH}`; skipping (silent)")
         return None, ctx
     if pr.get("head", {}).get("repo_id") != pr.get("base", {}).get("repo_id"):
         post_comment(pr_number, "merge-queue: skipped; fork PRs are not supported by the serialized queue.", dry_run=dry_run)

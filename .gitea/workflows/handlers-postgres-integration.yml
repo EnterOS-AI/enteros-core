@@ -151,7 +151,8 @@ jobs:
           # redundant and corrupts it by untarring over the bind mount ("File
           # exists" -> "Failed to restore" -> partial cache -> linker/typecheck
           # errors on heavy jobs, e.g. test -race link "too many errors" and
-          # go-arch-lint "without types"). Fleet sweep after the cp ci.yml find.
+          # go-arch-lint "without types"). Fleet sweep cp#698 missed this
+          # workflow (found during the cp ci.yml sweep).
           cache: false
 
       - if: needs.detect-changes.outputs.handlers == 'true'
