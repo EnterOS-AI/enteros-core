@@ -197,6 +197,7 @@ const registerUpsertSQL = `
 const heartbeatUpdateSQL = `
 	UPDATE workspaces SET
 		last_heartbeat_at = now(),
+		status            = CASE WHEN status = 'provisioning' THEN 'online' ELSE status END,
 		updated_at        = now()
 	WHERE id = $1 AND status != 'removed'
 `
@@ -282,6 +283,45 @@ func TestIntegration_RegistryRowState_HeartbeatUpdatesLiveWorkspace(t *testing.T
 	}
 	if got := statusOf(t, conn, id); got != "online" {
 		t.Fatalf("live workspace heartbeat changed status unexpectedly: %q", got)
+	}
+}
+
+func TestIntegration_RegistryRowState_HeartbeatPromotesProvisioningToOnline(t *testing.T) {
+	conn := integrationAuthDB(t)
+	ctx := context.Background()
+
+	id := insertWorkspace(t, conn, "provisioning-ws", "provisioning", "")
+
+	if _, err := conn.ExecContext(ctx, heartbeatUpdateSQL, id); err != nil {
+		t.Fatalf("heartbeat update: %v", err)
+	}
+
+	if got := statusOf(t, conn, id); got != "online" {
+		t.Fatalf("provisioning workspace not promoted to online by heartbeat: status=%q, want 'online'", got)
+	}
+
+	var hb sql.NullTime
+	if err := conn.QueryRowContext(ctx,
+		`SELECT last_heartbeat_at FROM workspaces WHERE id = $1`, id).Scan(&hb); err != nil {
+		t.Fatalf("read last_heartbeat_at: %v", err)
+	}
+	if !hb.Valid {
+		t.Fatalf("provisioning workspace heartbeat did NOT bump last_heartbeat_at")
+	}
+}
+
+func TestIntegration_RegistryRowState_HeartbeatProvisioningAlreadyOnlineUnchanged(t *testing.T) {
+	conn := integrationAuthDB(t)
+	ctx := context.Background()
+
+	id := insertWorkspace(t, conn, "online-ws", "online", "")
+
+	if _, err := conn.ExecContext(ctx, heartbeatUpdateSQL, id); err != nil {
+		t.Fatalf("heartbeat update: %v", err)
+	}
+
+	if got := statusOf(t, conn, id); got != "online" {
+		t.Fatalf("online workspace status changed unexpectedly by heartbeat: status=%q, want 'online'", got)
 	}
 }
 
