@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/DATA-DOG/go-sqlmock"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/memory/contract"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/memory/namespace"
+	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/gin-gonic/gin"
 )
 
@@ -94,6 +94,103 @@ func TestMemoriesCommit_Local_Success(t *testing.T) {
 	}
 	if cap.Body.Source != contract.MemorySourceUser {
 		t.Errorf("expected source=user for HTTP Commit, got %q", cap.Body.Source)
+	}
+}
+
+// TestMemoriesCommit_UpsertsNamespaceBeforeWrite pins the fleet-wide
+// 2026-06-10 regression: the HTTP Commit path went straight to
+// plugin.CommitMemory without ensuring the namespace row exists, so any
+// workspace whose memory_namespaces row was never seeded (everything
+// created after the Phase A2 backfill that only wrote through this
+// surface — the runtime a2a commit_memory tool and the canvas) failed
+// every write with memory_records_namespace_fkey. The MCP tool path has
+// always upserted first; this asserts the HTTP path does too, and in
+// the right order.
+//
+// MUTATION: drop the UpsertNamespace call in MemoriesHandler.Commit →
+// calls slice misses "upsert" → RED (the exact production failure).
+func TestMemoriesCommit_UpsertsNamespaceBeforeWrite(t *testing.T) {
+	setupTestDB(t)
+	setupTestRedis(t)
+	var calls []string
+	var upsertNS string
+	var upsertKind contract.NamespaceKind
+	plugin := &stubMemoryPlugin{
+		upsertFn: func(_ context.Context, name string, body contract.NamespaceUpsert) (*contract.Namespace, error) {
+			calls = append(calls, "upsert")
+			upsertNS = name
+			upsertKind = body.Kind
+			return &contract.Namespace{Name: name, Kind: body.Kind}, nil
+		},
+		commitFn: func(_ context.Context, ns string, body contract.MemoryWrite) (*contract.MemoryWriteResponse, error) {
+			calls = append(calls, "commit")
+			return &contract.MemoryWriteResponse{ID: "mem-up-1", Namespace: ns}, nil
+		},
+	}
+	handler := NewMemoriesHandler().withMemoryV2APIs(
+		plugin,
+		memCommitResolver("ws-up", contract.NamespaceKindWorkspace),
+	)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-up"}}
+	c.Request = httptest.NewRequest("POST", "/", bytes.NewBufferString(`{"content":"first ever memory","scope":"LOCAL"}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Commit(c)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+	if len(calls) != 2 || calls[0] != "upsert" || calls[1] != "commit" {
+		t.Errorf("namespace must be upserted BEFORE the write, got call order %v", calls)
+	}
+	if upsertNS != "workspace:ws-up" {
+		t.Errorf("upsert namespace = %q, want workspace:ws-up", upsertNS)
+	}
+	if upsertKind != contract.NamespaceKindWorkspace {
+		t.Errorf("upsert kind = %q, want %q", upsertKind, contract.NamespaceKindWorkspace)
+	}
+}
+
+// TestMemoriesCommit_UpsertError_500 — an upsert failure must surface as
+// the same stable generic 500 (no plugin internals leaked) and must NOT
+// proceed to the write.
+func TestMemoriesCommit_UpsertError_500(t *testing.T) {
+	setupTestDB(t)
+	setupTestRedis(t)
+	commitCalled := false
+	plugin := &stubMemoryPlugin{
+		upsertFn: func(_ context.Context, _ string, _ contract.NamespaceUpsert) (*contract.Namespace, error) {
+			return nil, errors.New("plugin down")
+		},
+		commitFn: func(_ context.Context, ns string, _ contract.MemoryWrite) (*contract.MemoryWriteResponse, error) {
+			commitCalled = true
+			return &contract.MemoryWriteResponse{ID: "nope", Namespace: ns}, nil
+		},
+	}
+	handler := NewMemoriesHandler().withMemoryV2APIs(
+		plugin,
+		memCommitResolver("ws-up2", contract.NamespaceKindWorkspace),
+	)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-up2"}}
+	c.Request = httptest.NewRequest("POST", "/", bytes.NewBufferString(`{"content":"x","scope":"LOCAL"}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Commit(c)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("expected 500 on upsert failure, got %d: %s", w.Code, w.Body.String())
+	}
+	if !bytes.Contains(w.Body.Bytes(), []byte("failed to store memory")) {
+		t.Errorf("error body must stay the stable generic message, got %s", w.Body.String())
+	}
+	if commitCalled {
+		t.Error("CommitMemory must not run when the namespace upsert failed")
 	}
 }
 
@@ -663,6 +760,7 @@ func TestCommitMemory_LocalScope_NoDelimiterEscape(t *testing.T) {
 		t.Errorf("LOCAL memory content should be stored verbatim, got %q (expected %q)", cap.Body.Content, content)
 	}
 }
+
 // ---------- MemoriesHandler: Update (PATCH) ----------
 //
 // Pin the full Update flow: namespace-only edit, content edit (LOCAL),
