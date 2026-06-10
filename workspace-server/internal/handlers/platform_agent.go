@@ -506,9 +506,11 @@ func installPlatformAgent(ctx context.Context, database *sql.DB, platformID, nam
 	// 1. Ensure the platform-agent row exists as a kind='platform' root.
 	//    ON CONFLICT keeps it a platform root if it was pre-seeded; the row is
 	//    tier 0 and never billed/provisioned as an ordinary workspace EC2.
+	//    Status starts as 'offline' — there is no container yet; 'online' is a
+	//    green-dot lie until the first heartbeat (core#2508).
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO workspaces (id, name, kind, tier, status, runtime, parent_id)
-		VALUES ($1, $2, 'platform', 0, 'online', 'claude-code', NULL)
+		VALUES ($1, $2, 'platform', 0, 'offline', 'claude-code', NULL)
 		ON CONFLICT (id) DO UPDATE SET kind = 'platform', parent_id = NULL
 	`, platformID, name); err != nil {
 		return fmt.Errorf("upsert platform agent: %w", err)
@@ -517,8 +519,10 @@ func installPlatformAgent(ctx context.Context, database *sql.DB, platformID, nam
 	// 2. Capture the org's other current roots (everything at parent_id IS NULL
 	//    except the platform agent itself). In a one-org tenant DB this is the
 	//    single team root; the query tolerates 0 (already installed) or N.
+	//    FOR UPDATE prevents a root created mid-install from escaping re-parent
+	//    (core#2508).
 	rows, err := tx.QueryContext(ctx,
-		`SELECT id FROM workspaces WHERE parent_id IS NULL AND id <> $1`, platformID)
+		`SELECT id FROM workspaces WHERE parent_id IS NULL AND id <> $1 FOR UPDATE`, platformID)
 	if err != nil {
 		return fmt.Errorf("select old roots: %w", err)
 	}
@@ -549,9 +553,22 @@ func installPlatformAgent(ctx context.Context, database *sql.DB, platformID, nam
 			`UPDATE org_api_tokens SET org_id = $1 WHERE org_id = $2`, platformID, root); err != nil {
 			return fmt.Errorf("migrate org_api_tokens for %s: %w", root, err)
 		}
-		if _, err := tx.ExecContext(ctx,
-			`UPDATE org_plugin_allowlist SET org_id = $1 WHERE org_id = $2`, platformID, root); err != nil {
+		// org_plugin_allowlist has UNIQUE(org_id, plugin_name). A plain UPDATE
+		// collides 23505 when N>1 old roots allowlisted the SAME plugin.
+		// INSERT…SELECT…ON CONFLICT DO NOTHING deduplicates; DELETE leftovers
+		// cleans the old-root rows (core#2508).
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO org_plugin_allowlist (org_id, plugin_name, created_at, updated_at)
+			SELECT $1, plugin_name, created_at, updated_at
+			FROM org_plugin_allowlist
+			WHERE org_id = $2
+			ON CONFLICT (org_id, plugin_name) DO NOTHING
+		`, platformID, root); err != nil {
 			return fmt.Errorf("migrate org_plugin_allowlist for %s: %w", root, err)
+		}
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM org_plugin_allowlist WHERE org_id = $1`, root); err != nil {
+			return fmt.Errorf("delete old org_plugin_allowlist for %s: %w", root, err)
 		}
 	}
 

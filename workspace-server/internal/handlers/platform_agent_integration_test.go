@@ -186,3 +186,102 @@ func TestIntegration_PlatformAgentInstall_ReparentsRootAndMovesAnchors(t *testin
 		t.Fatalf("team roots after install = %d, want 0 (old root re-parented under platform agent)", nRoots)
 	}
 }
+
+// TestIntegration_PlatformAgentInstall_MultiRootAllowlistDedup guards the
+// UNIQUE(org_id, plugin_name) collision on org_plugin_allowlist. When N>1
+// old roots have allowlisted the SAME plugin, a plain UPDATE…SET org_id
+// collides 23505. The INSERT…SELECT…ON CONFLICT DO NOTHING + DELETE leftovers
+// path must survive this deterministically (core#2508).
+func TestIntegration_PlatformAgentInstall_MultiRootAllowlistDedup(t *testing.T) {
+	conn := integrationDB_PlatformAgentInstall(t)
+	ctx := context.Background()
+
+	tag := uuid.New().String()[:8]
+	prefix := fmt.Sprintf("itest-pallow-%s", tag)
+	rootA := uuid.New().String()
+	rootB := uuid.New().String()
+	platformID := uuid.New().String()
+
+	cleanup := func() {
+		_, _ = conn.ExecContext(ctx, `DELETE FROM org_plugin_allowlist WHERE plugin_name = $1`, prefix+"-plugin")
+		_, _ = conn.ExecContext(ctx, `DELETE FROM workspaces WHERE name LIKE $1`, prefix+"%")
+		_, _ = conn.ExecContext(ctx, `DELETE FROM workspaces WHERE id = $1`, platformID)
+	}
+	t.Cleanup(cleanup)
+	cleanup()
+
+	// Seed TWO old roots with the SAME plugin allowlisted.
+	for _, rid := range []string{rootA, rootB} {
+		if _, err := conn.ExecContext(ctx, `
+			INSERT INTO workspaces (id, name, tier, runtime, status, parent_id)
+			VALUES ($1, $2, 2, 'claude-code', 'online', NULL)`, rid, prefix+"-"+rid[:8]); err != nil {
+			t.Fatalf("seed root %s: %v", rid, err)
+		}
+		if _, err := conn.ExecContext(ctx, `
+			INSERT INTO org_plugin_allowlist (org_id, plugin_name, enabled_by)
+			VALUES ($1, $2, $3)`, rid, prefix+"-plugin", rid); err != nil {
+			t.Fatalf("seed allowlist for %s: %v", rid, err)
+		}
+	}
+
+	// Install must NOT fail with 23505 unique violation.
+	if err := installPlatformAgent(ctx, conn, platformID, "Org Concierge"); err != nil {
+		t.Fatalf("install with duplicate allowlist: %v", err)
+	}
+
+	// The platform agent must end up with exactly ONE row for the plugin.
+	var count int
+	if err := conn.QueryRowContext(ctx,
+		`SELECT count(*) FROM org_plugin_allowlist WHERE org_id = $1`, platformID).Scan(&count); err != nil {
+		t.Fatalf("count platform-agent allowlist: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("platform-agent allowlist count = %d, want 1 (deduped from 2 old roots)", count)
+	}
+
+	// Old roots must have ZERO allowlist rows left.
+	for _, rid := range []string{rootA, rootB} {
+		var left int
+		if err := conn.QueryRowContext(ctx,
+			`SELECT count(*) FROM org_plugin_allowlist WHERE org_id = $1`, rid).Scan(&left); err != nil {
+			t.Fatalf("count old-root allowlist %s: %v", rid, err)
+		}
+		if left != 0 {
+			t.Fatalf("old root %s still has %d allowlist rows, want 0 (leftovers deleted)", rid, left)
+		}
+	}
+}
+
+// TestIntegration_PlatformAgentInstall_StatusNotOnline prevents the green-dot
+// lie: a freshly inserted platform-agent row must NOT claim status='online'
+// when there is no container yet (core#2508).
+func TestIntegration_PlatformAgentInstall_StatusNotOnline(t *testing.T) {
+	conn := integrationDB_PlatformAgentInstall(t)
+	ctx := context.Background()
+
+	tag := uuid.New().String()[:8]
+	platformID := uuid.New().String()
+
+	cleanup := func() {
+		_, _ = conn.ExecContext(ctx, `DELETE FROM workspaces WHERE id = $1`, platformID)
+	}
+	t.Cleanup(cleanup)
+	cleanup()
+
+	if err := installPlatformAgent(ctx, conn, platformID, "Org Concierge"); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+
+	var status string
+	if err := conn.QueryRowContext(ctx,
+		`SELECT status FROM workspaces WHERE id = $1`, platformID).Scan(&status); err != nil {
+		t.Fatalf("read status: %v", err)
+	}
+	if status == "online" {
+		t.Fatalf("fresh platform-agent status=%q, must not be 'online' (no container yet)", status)
+	}
+	if status != "offline" {
+		// Allow future changes, but catch the specific lie.
+		t.Logf("fresh platform-agent status=%q (expected 'offline', but accepting non-online)", status)
+	}
+}
