@@ -348,6 +348,36 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		// AdminAuth-gated exactly like /approvals/pending.
 		r.GET("/user-tasks/pending", middleware.AdminAuth(db.DB), uth.ListAll)
 
+		// Requests — the unified Tasks + Approvals inbox (RFC P1). Generalizes
+		// approvals + user-tasks into one model keyed by kind. Auth is split the
+		// same way: per-workspace create/list under wsAuth (an agent acts with
+		// its workspace token); the cross-org pending view + the
+		// /requests/:requestId/* action paths are AdminAuth-gated for the canvas
+		// user. Because an AGENT can also respond to a request addressed to it
+		// (using its own workspace token), the action verbs are ALSO registered
+		// under the wsAuth /workspaces/:id/requests/:requestId/* prefix — same
+		// dual-surface pattern the brief calls for (agent = workspace token,
+		// canvas user = admin token), no new auth mechanism.
+		rqh := handlers.NewRequestsHandler(broadcaster)
+		wsAuth.POST("/requests", rqh.Create)
+		wsAuth.GET("/requests", rqh.ListOutgoing)
+		wsAuth.GET("/requests/inbox", rqh.ListInbox)
+		// Agent-side action verbs (workspace-token auth).
+		wsAuth.GET("/requests/:requestId", rqh.Get)
+		wsAuth.POST("/requests/:requestId/respond", rqh.Respond)
+		wsAuth.POST("/requests/:requestId/messages", rqh.AddMessage)
+		wsAuth.POST("/requests/:requestId/cancel", rqh.Cancel)
+		// Cross-org pending view for the canvas Tasks/Approvals tabs — AdminAuth
+		// like /user-tasks/pending. ?kind=task|approval drives each tab.
+		r.GET("/requests/pending", middleware.AdminAuth(db.DB), rqh.ListPending)
+		// Canvas-user action verbs (admin auth). Same handlers; the responder
+		// defaults to 'user' on this path.
+		reqAdmin := r.Group("", middleware.AdminAuth(db.DB))
+		reqAdmin.GET("/requests/:requestId", rqh.Get)
+		reqAdmin.POST("/requests/:requestId/respond", rqh.Respond)
+		reqAdmin.POST("/requests/:requestId/messages", rqh.AddMessage)
+		reqAdmin.POST("/requests/:requestId/cancel", rqh.Cancel)
+
 		// (TeamHandler is gone — #2864.) The visual canvas Collapse
 		// button calls PATCH /workspaces/:id { collapsed: true/false }
 		// (presentational toggle on canvas_layouts), NOT the destructive

@@ -41,8 +41,8 @@ type EventType string
 // scan-friendly as it grows.
 const (
 	// Chat / agent messaging — surfaces in canvas chat panels.
-	EventAgentMessage EventType = "AGENT_MESSAGE"
-	EventA2AResponse  EventType = "A2A_RESPONSE"
+	EventAgentMessage   EventType = "AGENT_MESSAGE"
+	EventA2AResponse    EventType = "A2A_RESPONSE"
 	EventActivityLogged EventType = "ACTIVITY_LOGGED"
 	EventChannelMessage EventType = "CHANNEL_MESSAGE"
 
@@ -59,11 +59,11 @@ const (
 	EventWorkspaceHeartbeat       EventType = "WORKSPACE_HEARTBEAT"
 
 	// Agent assignment + identity.
-	EventAgentAssigned     EventType = "AGENT_ASSIGNED"
-	EventAgentReplaced     EventType = "AGENT_REPLACED"
-	EventAgentRemoved      EventType = "AGENT_REMOVED"
-	EventAgentMoved        EventType = "AGENT_MOVED"
-	EventAgentCardUpdated  EventType = "AGENT_CARD_UPDATED"
+	EventAgentAssigned    EventType = "AGENT_ASSIGNED"
+	EventAgentReplaced    EventType = "AGENT_REPLACED"
+	EventAgentRemoved     EventType = "AGENT_REMOVED"
+	EventAgentMoved       EventType = "AGENT_MOVED"
+	EventAgentCardUpdated EventType = "AGENT_CARD_UPDATED"
 
 	// Delegation lifecycle.
 	EventDelegationSent     EventType = "DELEGATION_SENT"
@@ -72,7 +72,7 @@ const (
 	EventDelegationFailed   EventType = "DELEGATION_FAILED"
 
 	// Task progression + scheduler.
-	EventTaskUpdated EventType = "TASK_UPDATED"
+	EventTaskUpdated  EventType = "TASK_UPDATED"
 	EventCronExecuted EventType = "CRON_EXECUTED"
 	EventCronSkipped  EventType = "CRON_SKIPPED"
 
@@ -83,6 +83,13 @@ const (
 	// User tasks (agent → user asks).
 	EventUserTaskRequested EventType = "USER_TASK_REQUESTED"
 	EventUserTaskResolved  EventType = "USER_TASK_RESOLVED"
+
+	// Requests — the unified Tasks + Approvals inbox (RFC P1). REQUEST_CREATED
+	// pokes a recipient agent's inbox; REQUEST_RESPONDED is the async signal-back
+	// to the requester; REQUEST_MESSAGE is a More-Info thread reply.
+	EventRequestCreated   EventType = "REQUEST_CREATED"
+	EventRequestResponded EventType = "REQUEST_RESPONDED"
+	EventRequestMessage   EventType = "REQUEST_MESSAGE"
 
 	// Auth / credentials.
 	EventExternalCredentialsRotated EventType = "EXTERNAL_CREDENTIALS_ROTATED"
@@ -115,6 +122,9 @@ var AllEventTypes = []EventType{
 	EventDelegationSent,
 	EventDelegationStatus,
 	EventExternalCredentialsRotated,
+	EventRequestCreated,
+	EventRequestMessage,
+	EventRequestResponded,
 	EventTaskUpdated,
 	EventUserTaskRequested,
 	EventUserTaskResolved,
