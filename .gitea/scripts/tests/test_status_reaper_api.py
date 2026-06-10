@@ -167,3 +167,78 @@ def test_reap_preserves_failed_pr_context_without_push_success(monkeypatch):
 
     assert counters["preserved_pr_without_push_success"] == 2
     assert posted == []
+
+
+# ---------------------------------------------------------------------------
+# Conductor snapshot consumption (operator-config#158 / molecule-core#2502)
+# ---------------------------------------------------------------------------
+
+import os
+import tempfile
+
+
+def test_get_combined_status_uses_snapshot_when_sha_matches(monkeypatch):
+    """When the SHA is an open PR head in the conductor snapshot, get_combined_status
+    returns the snapshot data instead of calling the API."""
+    mod = load_reaper()
+    head_sha = "a" * 40
+    snapshot = {
+        "ts": "2026-06-10T12:00:00Z",
+        "repo": "molecule-ai/molecule-core",
+        "prs": [
+            {
+                "number": 99,
+                "title": "PR 99",
+                "head_sha": head_sha,
+                "labels": [],
+                "combined_state": "failure",
+                "statuses": [
+                    {"context": "CI / Platform (Go) (push)", "status": "failure"},
+                ],
+            }
+        ],
+    }
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(snapshot, f)
+        path = f.name
+    try:
+        monkeypatch.setenv("CONDUCTOR_SNAPSHOT_FILE", path)
+        import importlib
+        mod = load_reaper()  # reload to pick up env var
+        combined = mod.get_combined_status(head_sha)
+        assert combined["state"] == "failure"
+        assert len(combined["statuses"]) == 1
+        assert combined["statuses"][0]["context"] == "CI / Platform (Go) (push)"
+    finally:
+        os.unlink(path)
+
+
+def test_get_combined_status_self_fetches_when_sha_not_in_snapshot(monkeypatch):
+    """If the SHA is not in the snapshot, get_combined_status falls back to API."""
+    mod = load_reaper()
+    snapshot = {
+        "ts": "2026-06-10T12:00:00Z",
+        "repo": "molecule-ai/molecule-core",
+        "prs": [
+            {"number": 1, "head_sha": "b" * 40, "labels": [],
+             "combined_state": "success", "statuses": []},
+        ],
+    }
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(snapshot, f)
+        path = f.name
+    try:
+        monkeypatch.setenv("CONDUCTOR_SNAPSHOT_FILE", path)
+        import importlib
+        mod = load_reaper()
+
+        def fake_api(method, path, **kw):
+            if path.endswith("/status"):
+                return 200, {"state": "success", "statuses": []}
+            raise mod.ApiError("unexpected")
+
+        monkeypatch.setattr(mod, "api", fake_api)
+        combined = mod.get_combined_status("c" * 40)
+        assert combined["state"] == "success"
+    finally:
+        os.unlink(path)
