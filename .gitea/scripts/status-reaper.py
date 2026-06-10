@@ -154,6 +154,54 @@ CANCELLED_DESCRIPTION = "Has been cancelled"
 PUSH_SUFFIX = " (push)"
 PULL_REQUEST_SUFFIX = " (pull_request)"
 
+# --------------------------------------------------------------------------
+# Conductor snapshot (operator-config#158)
+# --------------------------------------------------------------------------
+# When the conductor tick writes a state snapshot before running the passes,
+# both scripts see the SAME observed state instead of re-fetching independently
+# and potentially disagreeing within the same tick.
+# --------------------------------------------------------------------------
+
+
+def load_conductor_snapshot() -> dict | None:
+    """Load the conductor snapshot if present and fresh.
+
+    Returns the parsed snapshot dict, or None if absent, unreadable,
+    or older than the freshness threshold (10 minutes).
+    """
+    path = os.environ.get("CONDUCTOR_SNAPSHOT_FILE", "")
+    if not path:
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            snapshot = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"::notice::conductor snapshot unreadable ({exc}); self-fetching")
+        return None
+
+    if not isinstance(snapshot, dict):
+        return None
+
+    ts_str = snapshot.get("ts", "")
+    if ts_str:
+        try:
+            from datetime import datetime, timezone
+
+            ts = datetime.strptime(ts_str, "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=timezone.utc
+            )
+            age_sec = (datetime.now(timezone.utc) - ts).total_seconds()
+            if age_sec > 600:  # 10 minutes
+                print(
+                    f"::notice::conductor snapshot stale ({int(age_sec)}s); "
+                    "self-fetching"
+                )
+                return None
+        except ValueError:
+            pass
+
+    return snapshot
+
 
 def _require_runtime_env() -> None:
     """Enforce env contract — called from `main()` only.
@@ -382,8 +430,23 @@ def get_combined_status(sha: str) -> dict:
           ],
           ...
         }
+    Uses the conductor snapshot when the SHA matches an open PR head,
+    otherwise self-fetches via API.
     Raises ApiError on non-2xx.
     """
+    snapshot = load_conductor_snapshot()
+    if snapshot is not None:
+        for pr in (snapshot.get("prs") or []):
+            if pr.get("head_sha") == sha:
+                statuses = pr.get("statuses") or []
+                return {
+                    "state": pr.get("combined_state", "unknown"),
+                    "statuses": [
+                        {"context": s.get("context"), "state": s.get("status")}
+                        for s in statuses
+                        if isinstance(s, dict)
+                    ],
+                }
     _, body = api("GET", f"/repos/{OWNER}/{NAME}/commits/{sha}/status")
     if not isinstance(body, dict):
         raise ApiError(f"status for {sha} response not a JSON object")
