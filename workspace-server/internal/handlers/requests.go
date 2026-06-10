@@ -228,8 +228,14 @@ func (h *RequestsHandler) Get(c *gin.Context) {
 }
 
 // Respond handles POST /requests/:requestId/respond — a terminal action
-// (done/rejected/approved), validated against the request's kind. responder
-// identity comes from the body; the canvas/admin path defaults to 'user'.
+// (done/rejected/approved), validated against the request's kind.
+//
+// REAL participant-binding (RC 10416 follow-up): on the workspace-token auth
+// path (/workspaces/:id/requests/...), the responder is BOUND to the
+// authenticated workspace — the body fields are ignored. This prevents a
+// workspace from impersonating a user or a different agent when responding.
+// The canvas/admin path continues to take responder from the body (defaults
+// to 'user' on the canvas).
 //
 //	@Summary	Respond to a request (done / rejected / approved)
 //	@Tags		requests
@@ -253,7 +259,16 @@ func (h *RequestsHandler) Respond(c *gin.Context) {
 		return
 	}
 
-	if _, err := h.store().Respond(ctx, requestID, body.Action, body.ResponderType, body.ResponderID); err != nil {
+	responderType := body.ResponderType
+	responderID := body.ResponderID
+
+	// Workspace-token auth path: bind responder to the authenticated workspace.
+	if workspaceID := c.Param("id"); workspaceID != "" {
+		responderType = "agent"
+		responderID = workspaceID
+	}
+
+	if _, err := h.store().Respond(ctx, requestID, body.Action, responderType, responderID); err != nil {
 		if errors.Is(err, ErrRequestNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "request not found or already resolved"})
 			return

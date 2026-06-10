@@ -396,6 +396,72 @@ func TestRequests_Respond_SelfResponse_400(t *testing.T) {
 	}
 }
 
+// TestRequests_Respond_AgentPath_BindsWorkspace verifies REAL participant-binding:
+// on the workspace-token auth path the responder is forced to the URL workspace,
+// ignoring any impersonation attempt in the body.
+func TestRequests_Respond_AgentPath_BindsWorkspace(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewRequestsHandler(newTestBroadcaster())
+
+	// Requester is agent ws-1; body claims self-response (ws-1), but the URL
+	// workspace is ws-2. Binding overrides the body, so responder = ws-2 and
+	// the call succeeds (not self-response).
+	mock.ExpectQuery("FROM requests WHERE id").
+		WithArgs("req-1").
+		WillReturnRows(oneRequestRow("req-1", "approval", "ws-1", "agent", "ws-2", "pending"))
+	mock.ExpectExec("UPDATE requests SET status").
+		WithArgs("approved", "agent", "ws-2", sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO structure_events").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{
+		{Key: "requestId", Value: "req-1"},
+		{Key: "id", Value: "ws-2"},
+	}
+	c.Request = httptest.NewRequest("POST", "/", bytes.NewBufferString(`{"action":"approved","responder_type":"agent","responder_id":"ws-1"}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Respond(c)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200 when bound responder differs from requester, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestRequests_Respond_AgentPath_SelfResponse_400 verifies that binding does
+// NOT bypass the self-response guard: when the URL workspace IS the requester,
+// the response is still rejected.
+func TestRequests_Respond_AgentPath_SelfResponse_400(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewRequestsHandler(newTestBroadcaster())
+
+	// Requester is agent ws-1; URL workspace is also ws-1 → bound responder is
+	// the requester → self-response.
+	mock.ExpectQuery("FROM requests WHERE id").
+		WithArgs("req-1").
+		WillReturnRows(oneRequestRow("req-1", "approval", "ws-1", "agent", "ws-2", "pending"))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{
+		{Key: "requestId", Value: "req-1"},
+		{Key: "id", Value: "ws-1"},
+	}
+	c.Request = httptest.NewRequest("POST", "/", bytes.NewBufferString(`{"action":"approved","responder_type":"agent","responder_id":"ws-2"}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Respond(c)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for bound self-response, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
 // ---------- AddMessage → info_requested when recipient asks ----------
 
 func TestRequests_AddMessage_RecipientFlipsInfoRequested(t *testing.T) {
