@@ -508,6 +508,13 @@ func installPlatformAgent(ctx context.Context, database *sql.DB, platformID, nam
 	//    tier 0 and never billed/provisioned as an ordinary workspace EC2.
 	//    Status starts as 'offline' — there is no container yet; 'online' is a
 	//    green-dot lie until the first heartbeat (core#2508).
+	//
+	//    parent_name_uniq collision: the platform-agent name is deterministic
+	//    and unique per org by construction (e.g. "Org Concierge"). A pre-
+	//    existing root with the same name is a data inconsistency; we fail loud
+	//    rather than silently rename/reparent, which could orphan billing or
+	//    provisioning state. The integration tests use unique names per fixture
+	//    to avoid cross-test collision (CR-A RC 10610).
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO workspaces (id, name, kind, tier, status, runtime, parent_id)
 		VALUES ($1, $2, 'platform', 0, 'offline', 'claude-code', NULL)
