@@ -469,6 +469,18 @@ func main() {
 	delegSweeper := handlers.NewDelegationSweeper(nil, nil)
 	go supervised.RunWithRecover(ctx, "delegation-sweeper", delegSweeper.Start)
 
+	// RFC unified-requests-inbox P4: idle-agent inbox-nudge sweeper. Pokes
+	// an IDLE online agent that has unhandled `requests` inbox items (stale
+	// >10min) with one A2A nudge so it re-checks its inbox, rate-limited to
+	// <=1 nudge per request per hour via requests.last_nudged_at. No-op until
+	// the P1 `requests` table (#2525) + the last_nudged_at column have rolled
+	// out. Disable via REQUEST_NUDGE_SWEEPER_DISABLED=true; tune cadence via
+	// REQUEST_NUDGE_SWEEPER_INTERVAL_S.
+	if !strings.EqualFold(os.Getenv("REQUEST_NUDGE_SWEEPER_DISABLED"), "true") {
+		nudgeSweeper := handlers.NewRequestNudgeSweeper(nil)
+		go supervised.RunWithRecover(ctx, "request-nudge-sweeper", nudgeSweeper.Start)
+	}
+
 	// Channel Manager — social channel integrations (Telegram, Slack, etc.)
 	channelMgr := channels.NewManager(wh, broadcaster)
 	go supervised.RunWithRecover(ctx, "channel-manager", channelMgr.Start)
