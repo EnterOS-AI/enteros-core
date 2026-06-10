@@ -268,6 +268,26 @@ func (h *RequestsHandler) Respond(c *gin.Context) {
 		responderID = workspaceID
 	}
 
+	// Workspace-token auth path: verify the caller is the request's recipient.
+	// Cross-workspace respond is forbidden — an agent must not terminate a
+	// request that was not addressed to it (core#2542 full fix).
+	if workspaceID := c.Param("id"); workspaceID != "" {
+		reqRow, err := h.store().Get(ctx, requestID)
+		if err != nil {
+			if errors.Is(err, ErrRequestNotFound) {
+				c.JSON(http.StatusNotFound, gin.H{"error": "request not found or already resolved"})
+				return
+			}
+			log.Printf("Respond authz error request=%s: %v", requestID, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to respond"})
+			return
+		}
+		if reqRow.RecipientType != "agent" || reqRow.RecipientID != workspaceID {
+			c.JSON(http.StatusForbidden, gin.H{"error": "not the recipient"})
+			return
+		}
+	}
+
 	if _, err := h.store().Respond(ctx, requestID, body.Action, responderType, responderID); err != nil {
 		if errors.Is(err, ErrRequestNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "request not found or already resolved"})
@@ -343,6 +363,26 @@ func (h *RequestsHandler) AddMessage(c *gin.Context) {
 func (h *RequestsHandler) Cancel(c *gin.Context) {
 	requestID := c.Param("requestId")
 	ctx := c.Request.Context()
+
+	// Workspace-token auth path: verify the caller is the request's requester.
+	// Cross-workspace cancel is forbidden — an agent must not withdraw a
+	// request it did not raise (core#2542 full fix).
+	if workspaceID := c.Param("id"); workspaceID != "" {
+		reqRow, err := h.store().Get(ctx, requestID)
+		if err != nil {
+			if errors.Is(err, ErrRequestNotFound) {
+				c.JSON(http.StatusNotFound, gin.H{"error": "request not found or already resolved"})
+				return
+			}
+			log.Printf("Cancel authz error request=%s: %v", requestID, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to cancel"})
+			return
+		}
+		if reqRow.RequesterType != "agent" || reqRow.RequesterID != workspaceID {
+			c.JSON(http.StatusForbidden, gin.H{"error": "not the requester"})
+			return
+		}
+	}
 
 	if err := h.store().Cancel(ctx, requestID); err != nil {
 		if errors.Is(err, ErrRequestNotFound) {

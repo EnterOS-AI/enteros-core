@@ -407,6 +407,10 @@ func TestRequests_Respond_AgentPath_BindsWorkspace(t *testing.T) {
 	// Requester is agent ws-1; body claims self-response (ws-1), but the URL
 	// workspace is ws-2. Binding overrides the body, so responder = ws-2 and
 	// the call succeeds (not self-response).
+	// Authz Get in handler, then store Get inside Respond.
+	mock.ExpectQuery("FROM requests WHERE id").
+		WithArgs("req-1").
+		WillReturnRows(oneRequestRow("req-1", "approval", "ws-1", "agent", "ws-2", "pending"))
 	mock.ExpectQuery("FROM requests WHERE id").
 		WithArgs("req-1").
 		WillReturnRows(oneRequestRow("req-1", "approval", "ws-1", "agent", "ws-2", "pending"))
@@ -432,16 +436,14 @@ func TestRequests_Respond_AgentPath_BindsWorkspace(t *testing.T) {
 	}
 }
 
-// TestRequests_Respond_AgentPath_SelfResponse_400 verifies that binding does
-// NOT bypass the self-response guard: when the URL workspace IS the requester,
-// the response is still rejected.
-func TestRequests_Respond_AgentPath_SelfResponse_400(t *testing.T) {
+// TestRequests_Respond_AgentPath_NotRecipient_403 verifies that an agent
+// cannot respond to a request that was not addressed to it (core#2542).
+func TestRequests_Respond_AgentPath_NotRecipient_403(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
 	handler := NewRequestsHandler(newTestBroadcaster())
 
-	// Requester is agent ws-1; URL workspace is also ws-1 → bound responder is
-	// the requester → self-response.
+	// Requester is ws-1, recipient is ws-2; URL workspace is ws-1 (not recipient).
 	mock.ExpectQuery("FROM requests WHERE id").
 		WithArgs("req-1").
 		WillReturnRows(oneRequestRow("req-1", "approval", "ws-1", "agent", "ws-2", "pending"))
@@ -453,6 +455,39 @@ func TestRequests_Respond_AgentPath_SelfResponse_400(t *testing.T) {
 		{Key: "id", Value: "ws-1"},
 	}
 	c.Request = httptest.NewRequest("POST", "/", bytes.NewBufferString(`{"action":"approved","responder_type":"agent","responder_id":"ws-2"}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Respond(c)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403 for non-recipient respond, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestRequests_Respond_AgentPath_SelfResponse_400 verifies that the
+// self-response guard still fires on the agent path when the request is
+// self-addressed (requester == recipient) and the caller tries to respond.
+func TestRequests_Respond_AgentPath_SelfResponse_400(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewRequestsHandler(newTestBroadcaster())
+
+	// Self-addressed request: requester = recipient = ws-1.
+	// Authz Get in handler, then store Get inside Respond.
+	mock.ExpectQuery("FROM requests WHERE id").
+		WithArgs("req-1").
+		WillReturnRows(oneRequestRow("req-1", "approval", "ws-1", "agent", "ws-1", "pending"))
+	mock.ExpectQuery("FROM requests WHERE id").
+		WithArgs("req-1").
+		WillReturnRows(oneRequestRow("req-1", "approval", "ws-1", "agent", "ws-1", "pending"))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{
+		{Key: "requestId", Value: "req-1"},
+		{Key: "id", Value: "ws-1"},
+	}
+	c.Request = httptest.NewRequest("POST", "/", bytes.NewBufferString(`{"action":"approved","responder_type":"agent","responder_id":"ws-1"}`))
 	c.Request.Header.Set("Content-Type", "application/json")
 
 	handler.Respond(c)
@@ -547,6 +582,33 @@ func TestRequests_Cancel_Success(t *testing.T) {
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestRequests_Cancel_AgentPath_NotRequester_403 verifies that an agent
+// cannot cancel a request it did not raise (core#2542).
+func TestRequests_Cancel_AgentPath_NotRequester_403(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewRequestsHandler(newTestBroadcaster())
+
+	// Requester is ws-1; URL workspace is ws-2 (not requester).
+	mock.ExpectQuery("FROM requests WHERE id").
+		WithArgs("req-1").
+		WillReturnRows(oneRequestRow("req-1", "task", "ws-1", "agent", "ws-2", "pending"))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{
+		{Key: "requestId", Value: "req-1"},
+		{Key: "id", Value: "ws-2"},
+	}
+	c.Request = httptest.NewRequest("POST", "/", nil)
+
+	handler.Cancel(c)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403 for non-requester cancel, got %d: %s", w.Code, w.Body.String())
 	}
 }
 
