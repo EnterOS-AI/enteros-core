@@ -106,6 +106,47 @@ except Exception:
     -H "X-Confirm-Name: $name" ${curl_args[@]+"${curl_args[@]}"} > /dev/null || true
 }
 
+# ---------------------------------------------------------------------------
+# Docker container / volume naming helpers (KI-013 / SEV-2499).
+#
+# KI-013 changed workspace container and volume names from truncated 12-char
+# IDs to full UUIDs. These helpers are the bash SSOT for that naming scheme.
+# They MUST be kept in sync with the Go equivalents in:
+#   workspace-server/internal/provisioner/provisioner.go
+#
+#   ContainerName(workspaceID)        -> ws-<workspaceID>
+#   ConfigVolumeName(workspaceID)     -> ws-<workspaceID>-configs
+#   ClaudeSessionVolumeName(wsID)     -> ws-<workspaceID>-claude-sessions
+#   buildWorkspaceMount(wsID)         -> ws-<workspaceID>-workspace
+#
+# The drift-guard script .gitea/scripts/lint-e2e-ki013-container-names.sh
+# fails CI if any e2e script uses bash substring truncation in a ws-* context.
+# ---------------------------------------------------------------------------
+
+# e2e_container_name returns the Docker container name for a workspace.
+# Keep in sync with provisioner.ContainerName.
+e2e_container_name() {
+  echo "ws-${1}"
+}
+
+# e2e_config_volume_name returns the Docker named volume for a workspace's
+# /configs directory. Keep in sync with provisioner.ConfigVolumeName.
+e2e_config_volume_name() {
+  echo "ws-${1}-configs"
+}
+
+# e2e_session_volume_name returns the Docker named volume for a workspace's
+# Claude Code session directory. Keep in sync with provisioner.ClaudeSessionVolumeName.
+e2e_session_volume_name() {
+  echo "ws-${1}-claude-sessions"
+}
+
+# e2e_workspace_volume_name returns the Docker named volume for a workspace's
+# /workspace directory. Keep in sync with buildWorkspaceMount in provisioner.go.
+e2e_workspace_volume_name() {
+  echo "ws-${1}-workspace"
+}
+
 e2e_cleanup_all_workspaces() {
   # GET /workspaces (list) is AdminAuth-gated (router.go:165). Send the platform
   # admin bearer if one is set so the list doesn't 401 → empty → no cleanup.
