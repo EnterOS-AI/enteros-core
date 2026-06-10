@@ -158,26 +158,36 @@ export function ConciergeShell() {
   const toggleOrgMenu = useCallback(() => {
     setOrgMenuOpen((open) => {
       const next = !open;
-      if (next && orgs === null) {
-        fetch(`${PLATFORM_URL}/cp/orgs`, {
-          credentials: "include",
-          signal: AbortSignal.timeout(15_000),
-        })
-          .then((res) => (res.ok ? res.json() : Promise.reject(new Error(String(res.status)))))
-          .then((body: { orgs?: Array<{ slug: string; name?: string; id?: string }> } | Array<{ slug: string; name?: string; id?: string }>) => {
-            const list = Array.isArray(body) ? body : body.orgs ?? [];
-            setOrgs(list.filter((o) => o && o.slug));
-          })
-          .catch(() => setOrgs([])); // no list / not reachable → render "no other orgs"
+      // Reset orgs to null when reopening after a previous error so we
+      // don't cache the empty "No other organizations" state forever.
+      // (core#2509)
+      if (next && orgs !== null && orgs.length === 0) {
+        setOrgs(null);
       }
       return next;
     });
   }, [orgs]);
+  // Fetch orgs when the menu opens and we have no cached list.
+  // Kept outside the setState updater to avoid StrictMode double-fetch.
+  // (core#2509)
+  useEffect(() => {
+    if (!orgMenuOpen || orgs !== null) return;
+    fetch(`${PLATFORM_URL}/cp/orgs`, {
+      credentials: "include",
+      signal: AbortSignal.timeout(15_000),
+    })
+      .then((res) => (res.ok ? res.json() : Promise.reject(new Error(String(res.status)))))
+      .then((body: { orgs?: Array<{ slug: string; name?: string; id?: string }> } | Array<{ slug: string; name?: string; id?: string }>) => {
+        const list = Array.isArray(body) ? body : body.orgs ?? [];
+        setOrgs(list.filter((o) => o && o.slug));
+      })
+      .catch(() => setOrgs([])); // no list / not reachable → render "no other orgs"
+  }, [orgMenuOpen, orgs]);
   const switchOrg = useCallback(
     (slug: string) => {
       setOrgMenuOpen(false);
       if (typeof window === "undefined") return;
-      const url = switchOrgUrl(window.location.hostname, window.location.protocol, orgSlug, slug);
+      const url = switchOrgUrl(window.location.host, window.location.protocol, orgSlug, slug);
       if (url) window.location.href = url;
     },
     [orgSlug]
@@ -416,6 +426,13 @@ export function ConciergeShell() {
               onClick={(e) => {
                 e.stopPropagation();
                 toggleOrgMenu();
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  toggleOrgMenu();
+                }
               }}
             >
               <div className={s.orgBadge}>{initials(orgName).slice(0, 1)}</div>

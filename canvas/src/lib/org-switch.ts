@@ -6,7 +6,7 @@
 // null when it's a no-op (same org / empty target) or the apex can't be resolved.
 
 export function switchOrgUrl(
-  hostname: string,
+  host: string,
   protocol: string,
   currentSlug: string,
   targetSlug: string,
@@ -14,10 +14,13 @@ export function switchOrgUrl(
   if (!targetSlug || targetSlug === currentSlug) return null;
   // Prefer stripping the known current-org label; otherwise drop the first
   // label as a best-effort apex (covers hosts we didn't seed a slug for).
+  // Guard: the derived apex must contain at least one dot so a 2-label host
+  // with an empty currentSlug does not yield a foreign apex (e.g.
+  // moleculesai.app → <slug>.app). (core#2509)
   const apex =
-    currentSlug && hostname.startsWith(`${currentSlug}.`)
-      ? hostname.slice(currentSlug.length + 1)
-      : hostname.split(".").slice(1).join(".");
-  if (!apex) return null;
+    currentSlug && host.startsWith(`${currentSlug}.`)
+      ? host.slice(currentSlug.length + 1)
+      : host.split(".").slice(1).join(".");
+  if (!apex || !apex.includes(".")) return null;
   return `${protocol}//${targetSlug}.${apex}`;
 }
