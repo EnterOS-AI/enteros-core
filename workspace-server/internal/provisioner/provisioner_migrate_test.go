@@ -116,13 +116,12 @@ func (f *fakeDockerClient) ContainerStart(ctx context.Context, id string, option
 
 func (f *fakeDockerClient) ContainerWait(ctx context.Context, id string, condition container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
 	waitCh := make(chan container.WaitResponse, 1)
-	errCh := make(chan error, 1)
+	errCh := make(chan error)
 	f.mu.Lock()
 	code := f.migrationExitCode
 	f.mu.Unlock()
 	waitCh <- container.WaitResponse{StatusCode: code}
 	close(waitCh)
-	close(errCh)
 	return waitCh, errCh
 }
 
