@@ -4,7 +4,8 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { useCanvasStore, type TopView } from "@/store/canvas";
 import { WORKSPACE_KIND } from "@/lib/workspace-kind";
 import { useTheme } from "@/lib/theme-provider";
-import { api } from "@/lib/api";
+import { api, PLATFORM_URL } from "@/lib/api";
+import { switchOrgUrl } from "@/lib/org-switch";
 import { showToast } from "@/components/Toaster";
 import type { ActivityEntry } from "@/types/activity";
 import { Canvas } from "@/components/Canvas";
@@ -108,13 +109,18 @@ export function ConciergeShell() {
   // returns an empty name, so the topbar never breaks before the backend
   // lands.
   const [orgName, setOrgName] = useState("Molecule AI");
+  // Current org slug (from GET /org/identity) — used to highlight the active
+  // org in the switcher and to derive the apex domain for cross-org navigation.
+  const [orgSlug, setOrgSlug] = useState("");
   useEffect(() => {
     let cancelled = false;
     api
-      .get<{ name?: string }>("/org/identity")
+      .get<{ name?: string; slug?: string }>("/org/identity")
       .then((r) => {
         const name = (r?.name || "").trim();
         if (!cancelled && name) setOrgName(name);
+        const slug = (r?.slug || "").trim();
+        if (!cancelled && slug) setOrgSlug(slug);
       })
       .catch(() => {
         // No endpoint / not reachable — keep the "Molecule AI" fallback.
@@ -123,6 +129,47 @@ export function ConciergeShell() {
       cancelled = true;
     };
   }, []);
+
+  // --- Org switcher (topbar dropdown) ---
+  // Each org is its own tenant subdomain, so "switch" = navigate to
+  // <slug>.<apex>. The org list comes from the control plane (cross-origin,
+  // cookie-auth), fetched lazily the first time the menu opens.
+  const [orgMenuOpen, setOrgMenuOpen] = useState(false);
+  const [orgs, setOrgs] = useState<Array<{ slug: string; name?: string; id?: string }> | null>(null);
+  const toggleOrgMenu = useCallback(() => {
+    setOrgMenuOpen((open) => {
+      const next = !open;
+      if (next && orgs === null) {
+        fetch(`${PLATFORM_URL}/cp/orgs`, {
+          credentials: "include",
+          signal: AbortSignal.timeout(15_000),
+        })
+          .then((res) => (res.ok ? res.json() : Promise.reject(new Error(String(res.status)))))
+          .then((body: { orgs?: Array<{ slug: string; name?: string; id?: string }> } | Array<{ slug: string; name?: string; id?: string }>) => {
+            const list = Array.isArray(body) ? body : body.orgs ?? [];
+            setOrgs(list.filter((o) => o && o.slug));
+          })
+          .catch(() => setOrgs([])); // no list / not reachable → render "no other orgs"
+      }
+      return next;
+    });
+  }, [orgs]);
+  const switchOrg = useCallback(
+    (slug: string) => {
+      setOrgMenuOpen(false);
+      if (typeof window === "undefined") return;
+      const url = switchOrgUrl(window.location.hostname, window.location.protocol, orgSlug, slug);
+      if (url) window.location.href = url;
+    },
+    [orgSlug]
+  );
+  // Close the menu on any outside click.
+  useEffect(() => {
+    if (!orgMenuOpen) return;
+    const onDoc = () => setOrgMenuOpen(false);
+    document.addEventListener("click", onDoc);
+    return () => document.removeEventListener("click", onDoc);
+  }, [orgMenuOpen]);
 
   // Build the agent hierarchy from live nodes.
   const { roots, childrenOf } = useMemo(() => {
@@ -330,10 +377,51 @@ export function ConciergeShell() {
         <div className={s.main}>
           {/* TOPBAR */}
           <header className={s.topbar}>
-            <div className={s.org}>
+            <div
+              className={s.org}
+              role="button"
+              tabIndex={0}
+              aria-haspopup="menu"
+              aria-expanded={orgMenuOpen}
+              data-testid="topbar-org-switcher"
+              onClick={(e) => {
+                e.stopPropagation();
+                toggleOrgMenu();
+              }}
+            >
               <div className={s.orgBadge}>{initials(orgName).slice(0, 1)}</div>
               <span data-testid="topbar-org-name" className={s.orgName}>{orgName}</span>
               <span className={s.chev}><IcChevDown /></span>
+              {orgMenuOpen && (
+                <div
+                  className={s.orgMenu}
+                  role="menu"
+                  data-testid="topbar-org-menu"
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  {orgs === null ? (
+                    <div className={s.orgMenuEmpty}>Loading…</div>
+                  ) : orgs.length === 0 ? (
+                    <div className={s.orgMenuEmpty}>No other organizations</div>
+                  ) : (
+                    orgs.map((o) => (
+                      <button
+                        key={o.id || o.slug}
+                        type="button"
+                        role="menuitem"
+                        className={`${s.orgMenuItem} ${o.slug === orgSlug ? s.orgMenuCurrent : ""}`}
+                        onClick={() => switchOrg(o.slug)}
+                      >
+                        <span className={s.orgMenuBadge}>{initials(o.name || o.slug).slice(0, 1)}</span>
+                        <span className={s.orgMenuName}>{o.name || o.slug}</span>
+                        {o.slug === orgSlug && (
+                          <span className={s.orgMenuTick}><IcCheck /></span>
+                        )}
+                      </button>
+                    ))
+                  )}
+                </div>
+              )}
             </div>
             <div className={s.topbarRight}>
               <button className={s.iconPill} title="Search"><IcSearch /></button>
