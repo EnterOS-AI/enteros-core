@@ -41,11 +41,11 @@ afterEach(() => {
 beforeEach(() => {
   apiPatch.mockReset();
   apiGet.mockReset();
-  // Default: compute-options fetch rejects → component keeps its in-bundle
+  // Default: /compute/metadata fetch rejects → component keeps its in-bundle
   // fallback SSOT. Existing assertions (t3.medium / cpx31 / provider list) are
   // satisfied by the fallback, which mirrors the server. Individual tests that
   // exercise the fetch path override this with mockResolvedValueOnce.
-  apiGet.mockRejectedValue(new Error("no compute-options in this test"));
+  apiGet.mockRejectedValue(new Error("no /compute/metadata in this test"));
   restartWorkspace.mockReset();
   updateNodeData.mockReset();
 });
@@ -367,18 +367,19 @@ describe("ContainerConfigTab", () => {
   });
 
   // core#2489: the provider + instance-type dropdowns are populated from the
-  // workspace-server SSOT (GET /workspaces/:id/compute-options), so the UI can't
-  // offer an option the backend then rejects. This proves the fetch drives the
+  // workspace-server SSOT (GET /compute/metadata), so the UI can't offer an
+  // option the backend then rejects. This proves the fetch drives the
   // dropdowns: a server-only instance type appears once the fetch resolves.
-  it("populates instance-type options from the compute-options SSOT endpoint", async () => {
+  it("populates instance-type options from the /compute/metadata SSOT endpoint", async () => {
     apiGet.mockResolvedValueOnce({
-      providers: ["aws", "hetzner", "gcp"],
-      instanceTypes: {
-        aws: ["t3.medium", "t3.large", "z9.future"], // z9.future is server-only
-        hetzner: ["cpx31"],
-        gcp: ["e2-standard-2"],
-      },
-      defaults: { aws: "t3.medium", hetzner: "cpx31", gcp: "e2-standard-2" },
+      providers: [
+        // Real server response shape: { id, label, default_instance, instances }.
+        // The "z9.future" instance is server-only — the in-bundle fallback doesn't
+        // list it; once the fetch resolves, it appears in the dropdown.
+        { id: "aws", label: "AWS (default)", default_instance: "t3.medium", instances: ["t3.medium", "t3.large", "z9.future"] },
+        { id: "hetzner", label: "Hetzner", default_instance: "cpx31", instances: ["cpx31"] },
+        { id: "gcp", label: "GCP", default_instance: "e2-standard-2", instances: ["e2-standard-2"] },
+      ],
     });
 
     render(
@@ -397,7 +398,7 @@ describe("ContainerConfigTab", () => {
       />,
     );
 
-    await waitFor(() => expect(apiGet).toHaveBeenCalledWith("/workspaces/ws-opts/compute-options"));
+    await waitFor(() => expect(apiGet).toHaveBeenCalledWith("/compute/metadata"));
     // The server-only instance type appears in the dropdown after the fetch.
     await waitFor(() =>
       expect(
@@ -406,9 +407,9 @@ describe("ContainerConfigTab", () => {
     );
   });
 
-  // core#2489: if the compute-options fetch fails, the dropdowns must stay usable
-  // via the in-bundle fallback (no crash, no empty selector).
-  it("falls back to the in-bundle option set when the compute-options fetch fails", async () => {
+  // core#2489: if the /compute/metadata fetch fails, the dropdowns must stay
+  // usable via the in-bundle fallback (no crash, no empty selector).
+  it("falls back to the in-bundle option set when the /compute/metadata fetch fails", async () => {
     apiGet.mockRejectedValueOnce(new Error("network down"));
 
     render(
