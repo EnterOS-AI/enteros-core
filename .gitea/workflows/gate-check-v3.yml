@@ -66,6 +66,13 @@ jobs:
   # bp-exempt: PR advisory bot; merge blocking is enforced by CI status and branch protection.
   gate-check:
     runs-on: ubuntu-latest
+    # Hard bound on a hung-while-running run so the advisory context
+    # CONCLUDES (continue-on-error: true -> ignored) instead of
+    # hanging unconcluded and 405-blocking the Gitea merge-check.
+    # Normal conclude-time is ~12-16s, so 10m is a 30x safety margin
+    # over a stuck Python tick. Does NOT fix a QUEUED-never-picked-up
+    # orphan (operator-side run-clearing needed for that).
+    timeout-minutes: 10
     # mc#1982: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
     continue-on-error: true  # Never block on our own detector failing
     steps:
