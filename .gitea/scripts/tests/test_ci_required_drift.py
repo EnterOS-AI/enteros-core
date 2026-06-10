@@ -275,3 +275,125 @@ def test_detect_drift_no_f1_when_needs_empty_even_with_jobs():
             findings, _ = drift.detect_drift("main")
 
     assert not any("F1 —" in f for f in findings)
+
+
+# ---------------------------------------------------------------------------
+# F4 — cross-workflow required-context emitter existence
+# (closes the `CI / all-required` name-vs-coverage hole: the sentinel is
+#  fail-closed over CI's own jobs but CANNOT cover sibling required
+#  workflows — Gitea has no cross-workflow `needs:` — so F4 guarantees each
+#  BP-required context still has a live emitting workflow.)
+# ---------------------------------------------------------------------------
+
+def test_workflow_emitted_contexts_uses_job_name_over_key():
+    """Job `name:` wins over key; missing name falls back to key."""
+    doc = {
+        "name": "E2E API Smoke Test",
+        "jobs": {
+            "detect-changes": {},  # no name -> key
+            "e2e-api": {"name": "E2E API Smoke Test"},
+        },
+    }
+    got = drift.workflow_emitted_contexts(doc)
+    assert got == {
+        "E2E API Smoke Test / detect-changes (pull_request)",
+        "E2E API Smoke Test / E2E API Smoke Test (pull_request)",
+    }
+
+
+def test_workflow_emitted_contexts_empty_when_no_name():
+    """A workflow with no top-level `name:` emits nothing F4 can match."""
+    assert drift.workflow_emitted_contexts({"jobs": {"x": {}}}) == set()
+
+
+def test_all_emitted_contexts_unions_workflow_dir(tmp_path):
+    """all_emitted_contexts globs *.yml and unions their emitter sets."""
+    wf = tmp_path / "wf"
+    wf.mkdir()
+    (wf / "a.yml").write_text(
+        "name: CI\njobs:\n  all-required:\n    runs-on: x\n", encoding="utf-8"
+    )
+    (wf / "b.yml").write_text(
+        "name: Handlers Postgres Integration\n"
+        "jobs:\n  integration:\n    name: Handlers Postgres Integration\n"
+        "    runs-on: x\n",
+        encoding="utf-8",
+    )
+    got = drift.all_emitted_contexts(str(wf))
+    assert "CI / all-required (pull_request)" in got
+    assert "Handlers Postgres Integration / Handlers Postgres Integration (pull_request)" in got
+
+
+def test_all_emitted_contexts_skips_unparseable(tmp_path):
+    """A single broken sibling workflow must not blind F4 to the rest."""
+    wf = tmp_path / "wf"
+    wf.mkdir()
+    (wf / "good.yml").write_text("name: CI\njobs:\n  j:\n    runs-on: x\n", encoding="utf-8")
+    (wf / "bad.yml").write_text("name: [unterminated\n  : : :\n", encoding="utf-8")
+    got = drift.all_emitted_contexts(str(wf))
+    assert "CI / j (pull_request)" in got
+
+
+# A BP fixture that includes the two cross-workflow required contexts.
+_BP_WITH_SIBLINGS = {
+    "status_check_contexts": [
+        "CI / all-required (pull_request)",
+        "E2E API Smoke Test / E2E API Smoke Test (pull_request)",
+        "Handlers Postgres Integration / Handlers Postgres Integration (pull_request)",
+    ]
+}
+
+# The matching set of repo-wide emitted contexts (what a correct repo produces).
+_EMITTED_OK = {
+    "CI / all-required (pull_request)",
+    "E2E API Smoke Test / E2E API Smoke Test (pull_request)",
+    "Handlers Postgres Integration / Handlers Postgres Integration (pull_request)",
+}
+
+
+def test_detect_drift_f4_silent_when_all_contexts_emitted():
+    """No F4 when every BP context has a live emitting workflow."""
+    ci = _make_ci_doc({"all-required": {}})
+    audit = _make_audit_doc(sorted(_BP_WITH_SIBLINGS["status_check_contexts"]))
+    with patch.object(drift, "load_yaml", side_effect=[ci, audit]):
+        with patch.object(drift, "api", return_value=(200, _BP_WITH_SIBLINGS)):
+            with patch.object(drift, "all_emitted_contexts", return_value=set(_EMITTED_OK)):
+                findings, debug = drift.detect_drift("main")
+    assert not any("F4 —" in f for f in findings)
+    assert debug["repo_emitted_contexts"] == sorted(_EMITTED_OK)
+
+
+def test_detect_drift_f4_fires_on_stale_cross_workflow_context():
+    """The core gate-hole regression: BP requires a cross-workflow context
+    (e.g. a renamed/deleted sibling workflow) that NO workflow emits.
+    F4 must fire — this is the inverse-of-F2 hole that makes a red PR look
+    mergeable if BP is ever trimmed/renamed around `CI / all-required`."""
+    ci = _make_ci_doc({"all-required": {}})
+    audit = _make_audit_doc(sorted(_BP_WITH_SIBLINGS["status_check_contexts"]))
+    # Handlers workflow got renamed -> its OLD BP context now has no emitter.
+    emitted_after_rename = {
+        "CI / all-required (pull_request)",
+        "E2E API Smoke Test / E2E API Smoke Test (pull_request)",
+        # Handlers context absent (renamed away)
+    }
+    with patch.object(drift, "load_yaml", side_effect=[ci, audit]):
+        with patch.object(drift, "api", return_value=(200, _BP_WITH_SIBLINGS)):
+            with patch.object(drift, "all_emitted_contexts", return_value=emitted_after_rename):
+                findings, _ = drift.detect_drift("main")
+    assert any("F4 —" in f for f in findings)
+    assert any("Handlers Postgres Integration" in f for f in findings)
+
+
+def test_detect_drift_f4_catches_all_required_only_trim():
+    """If BP is trimmed to JUST `CI / all-required` but E2E/Handlers are
+    still real workflows, F4 does NOT fire (no stale context) — but F3b
+    (env vs BP) / operator policy must keep them required. This asserts F4
+    does not false-positive on a correctly-emitted lone context."""
+    bp = {"status_check_contexts": ["CI / all-required (pull_request)"]}
+    ci = _make_ci_doc({"all-required": {}})
+    audit = _make_audit_doc(["CI / all-required (pull_request)"])
+    with patch.object(drift, "load_yaml", side_effect=[ci, audit]):
+        with patch.object(drift, "api", return_value=(200, bp)):
+            with patch.object(drift, "all_emitted_contexts", return_value=set(_EMITTED_OK)):
+                findings, _ = drift.detect_drift("main")
+    assert not any("F4 —" in f for f in findings)

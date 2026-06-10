@@ -516,6 +516,27 @@ jobs:
   all-required:
     # Aggregator sentinel — RFC internal#219 §2 (Phase 4 — closes internal#286).
     #
+    # ── SCOPE (read before trusting the name) ─────────────────────────
+    # "all-required" means "all of THIS workflow's (CI's) required jobs"
+    # — NOT "all of branch-protection's required checks". It is fail-
+    # closed over its `needs:` (the CI jobs below), but Gitea Actions has
+    # NO cross-workflow `needs:`, so this sentinel STRUCTURALLY CANNOT and
+    # does not cover sibling required workflows that live in their own
+    # files — notably:
+    #     • `E2E API Smoke Test`           (.gitea/workflows/e2e-api.yml)
+    #     • `Handlers Postgres Integration`(.gitea/workflows/handlers-postgres-integration.yml)
+    # Those emit their OWN status contexts and MUST be listed in branch
+    # protection `status_check_contexts` INDEPENDENTLY of this sentinel.
+    # They are today; do NOT trim BP down to just `CI / all-required` on
+    # the assumption that it covers them — it does not, and a red E2E /
+    # Handlers run would then look mergeable (observed: core PR #1086 @
+    # 9136d05a — `CI / all-required` green while E2E (id 48) + Handlers
+    # (id 47) were red; not exploitable only because BP still requires
+    # all three). The cross-workflow coverage is enforced separately by
+    # ci-required-drift.py's F4 check (every BP context must have a live
+    # emitting workflow), which is what keeps this name honest.
+    # ──────────────────────────────────────────────────────────────────
+    #
     # Emits `CI / all-required (<event>)` where <event> is the workflow trigger
     # (e.g. `CI / all-required (pull_request)`, `CI / all-required (push)`).
     # Branch protection requires the event-suffixed name —
