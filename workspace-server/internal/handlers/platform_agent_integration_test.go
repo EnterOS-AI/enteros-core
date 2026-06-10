@@ -68,12 +68,14 @@ func TestIntegration_PlatformAgentInstall_ReparentsRootAndMovesAnchors(t *testin
 	childID := uuid.New().String()
 	platformID := uuid.New().String()
 
+	paName := "Org Concierge " + tag
 	cleanup := func() {
 		_, _ = conn.ExecContext(ctx, `DELETE FROM org_plugin_allowlist WHERE plugin_name = $1`, prefix+"-plugin")
 		_, _ = conn.ExecContext(ctx, `DELETE FROM org_api_tokens WHERE prefix = $1`, tag)
 		// child + old root (prefixed names) first, then the platform agent by id
 		// (root.parent_id references it, so it must go last).
 		_, _ = conn.ExecContext(ctx, `DELETE FROM workspaces WHERE name LIKE $1`, prefix+"%")
+		_, _ = conn.ExecContext(ctx, `DELETE FROM workspaces WHERE name = $1`, paName)
 		_, _ = conn.ExecContext(ctx, `DELETE FROM workspaces WHERE id = $1`, platformID)
 	}
 	t.Cleanup(cleanup)
@@ -104,7 +106,7 @@ func TestIntegration_PlatformAgentInstall_ReparentsRootAndMovesAnchors(t *testin
 	}
 
 	// Install.
-	if err := installPlatformAgent(ctx, conn, platformID, "Org Concierge"); err != nil {
+	if err := installPlatformAgent(ctx, conn, platformID, paName); err != nil {
 		t.Fatalf("install: %v", err)
 	}
 
@@ -170,7 +172,7 @@ func TestIntegration_PlatformAgentInstall_ReparentsRootAndMovesAnchors(t *testin
 	assertState("first install")
 
 	// Idempotent: second install must not error or change state.
-	if err := installPlatformAgent(ctx, conn, platformID, "Org Concierge"); err != nil {
+	if err := installPlatformAgent(ctx, conn, platformID, paName); err != nil {
 		t.Fatalf("second install (idempotent): %v", err)
 	}
 	assertState("second install")
@@ -202,9 +204,11 @@ func TestIntegration_PlatformAgentInstall_MultiRootAllowlistDedup(t *testing.T) 
 	rootB := uuid.New().String()
 	platformID := uuid.New().String()
 
+	paName := "Org Concierge " + tag
 	cleanup := func() {
 		_, _ = conn.ExecContext(ctx, `DELETE FROM org_plugin_allowlist WHERE plugin_name = $1`, prefix+"-plugin")
 		_, _ = conn.ExecContext(ctx, `DELETE FROM workspaces WHERE name LIKE $1`, prefix+"%")
+		_, _ = conn.ExecContext(ctx, `DELETE FROM workspaces WHERE name = $1`, paName)
 		_, _ = conn.ExecContext(ctx, `DELETE FROM workspaces WHERE id = $1`, platformID)
 	}
 	t.Cleanup(cleanup)
@@ -225,7 +229,7 @@ func TestIntegration_PlatformAgentInstall_MultiRootAllowlistDedup(t *testing.T) 
 	}
 
 	// Install must NOT fail with 23505 unique violation.
-	if err := installPlatformAgent(ctx, conn, platformID, "Org Concierge"); err != nil {
+	if err := installPlatformAgent(ctx, conn, platformID, paName); err != nil {
 		t.Fatalf("install with duplicate allowlist: %v", err)
 	}
 
@@ -260,14 +264,16 @@ func TestIntegration_PlatformAgentInstall_StatusNotOnline(t *testing.T) {
 	ctx := context.Background()
 
 	platformID := uuid.New().String()
+	paName := "Org Concierge " + platformID[:8]
 
 	cleanup := func() {
+		_, _ = conn.ExecContext(ctx, `DELETE FROM workspaces WHERE name = $1`, paName)
 		_, _ = conn.ExecContext(ctx, `DELETE FROM workspaces WHERE id = $1`, platformID)
 	}
 	t.Cleanup(cleanup)
 	cleanup()
 
-	if err := installPlatformAgent(ctx, conn, platformID, "Org Concierge"); err != nil {
+	if err := installPlatformAgent(ctx, conn, platformID, paName); err != nil {
 		t.Fatalf("install: %v", err)
 	}
 
