@@ -16,7 +16,12 @@ vi.mock("@/hooks/useSocketEvent", () => ({
   },
 }));
 
-import { useA2AFlights, FLIGHT_DURATION_MS } from "@/hooks/useA2AFlights";
+import {
+  useA2AFlights,
+  FLIGHT_DURATION_MS,
+  BOUNCE_DURATION_MS,
+  RECEIVE_BOUNCE_DELAY_MS,
+} from "@/hooks/useA2AFlights";
 
 function setReducedMotion(reduce: boolean) {
   window.matchMedia = vi.fn().mockImplementation((q: string) => ({
@@ -92,13 +97,21 @@ describe("useA2AFlights", () => {
     expect(result.current).toHaveLength(0);
   });
 
-  it("expires a flight after the TTL", () => {
+  it("expires a flight after the TTL (outliving the receiver landing bounce)", () => {
     vi.useFakeTimers();
     const { result } = renderHook(() => useA2AFlights());
     act(() => h.captured?.(a2aSend()));
     expect(result.current).toHaveLength(1);
+    // The flight must SURVIVE past the envelope traversal — the receiver's
+    // landing bounce is still playing (it starts at ~0.82 of the flight and
+    // runs BOUNCE_DURATION_MS). Unmounting here would cut the catch mid-air.
     act(() => {
-      vi.advanceTimersByTime(FLIGHT_DURATION_MS + 300);
+      vi.advanceTimersByTime(FLIGHT_DURATION_MS + 100);
+    });
+    expect(result.current).toHaveLength(1);
+    // ...and expire once the landing bounce has finished too.
+    act(() => {
+      vi.advanceTimersByTime(RECEIVE_BOUNCE_DELAY_MS + BOUNCE_DURATION_MS - FLIGHT_DURATION_MS + 200);
     });
     expect(result.current).toHaveLength(0);
   });

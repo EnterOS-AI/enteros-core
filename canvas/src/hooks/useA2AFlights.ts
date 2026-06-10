@@ -28,7 +28,14 @@ export interface A2AFlight {
  *  Web-Animations duration; the extra tail gives the fade-out room to finish
  *  before the element unmounts. */
 export const FLIGHT_DURATION_MS = 1200;
-const FLIGHT_TTL_MS = FLIGHT_DURATION_MS + 120;
+// Endpoint-bounce timing (FlightEnvelope's EndpointBounce): the sender bounce
+// fires at launch; the receiver bounce fires on the final approach. Living
+// here (not FlightEnvelope.tsx) keeps the import direction one-way.
+export const BOUNCE_DURATION_MS = 420;
+export const RECEIVE_BOUNCE_DELAY_MS = Math.round(FLIGHT_DURATION_MS * 0.82);
+// TTL must outlive the LAST animation on the flight — the receiver's landing
+// bounce — not just the envelope traversal, or the layer unmounts mid-catch.
+const FLIGHT_TTL_MS = RECEIVE_BOUNCE_DELAY_MS + BOUNCE_DURATION_MS + 120;
 
 /** Cap concurrent envelopes so a delegation storm can't spawn unbounded DOM. */
 const MAX_CONCURRENT = 12;
