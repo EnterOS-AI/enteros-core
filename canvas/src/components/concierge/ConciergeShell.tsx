@@ -6,7 +6,6 @@ import { WORKSPACE_KIND } from "@/lib/workspace-kind";
 import { useTheme } from "@/lib/theme-provider";
 import { api, PLATFORM_URL } from "@/lib/api";
 import { switchOrgUrl } from "@/lib/org-switch";
-import { showToast } from "@/components/Toaster";
 import type { ActivityEntry } from "@/types/activity";
 import { Canvas } from "@/components/Canvas";
 import { CommunicationOverlay } from "@/components/CommunicationOverlay";
@@ -15,9 +14,10 @@ import { ChatTab } from "@/components/tabs/ChatTab";
 import { WorkspacePanelTabs } from "@/components/WorkspacePanelTabs";
 import { SettingsTabs } from "@/components/settings";
 import s from "./Concierge.module.css";
+import { RequestsInbox } from "./RequestsInbox";
 import {
   IcHome, IcOrgMap, IcSettings, IcSearch, IcBell, IcSun, IcMoon, IcChevDown,
-  IcQueue, IcCaret, IcMolecule, IcClock, IcCheck, IcTrash, IcChat,
+  IcQueue, IcCaret, IcMolecule, IcCheck, IcChat,
 } from "./icons";
 
 /* ── status → concept palette ─────────────────────────────────────────── */
@@ -55,25 +55,6 @@ function gradientFor(id: string): string {
 }
 
 type SbTab = "agents" | "tasks" | "approvals";
-
-interface PendingApproval {
-  id: string;
-  workspace_id: string;
-  workspace_name: string;
-  action: string;
-  reason: string | null;
-  status: string;
-  created_at: string;
-}
-interface UserTask {
-  id: string;
-  workspace_id: string;
-  workspace_name: string;
-  title: string;
-  detail: string | null;
-  status: string;
-  created_at: string;
-}
 
 /** ISO timestamp → "9:05 PM" (local). Empty string on a bad/missing value. */
 function clockTime(iso: string | null | undefined): string {
@@ -243,24 +224,15 @@ export function ConciergeShell() {
   const chatId = chatNode?.id ?? null;
   const chatIsRoot = chatId !== null && chatId === platformId;
 
-  // ── live data: approvals + user-tasks (org-wide), activity (platform agent) ──
-  const [approvals, setApprovals] = useState<PendingApproval[]>([]);
-  const [userTasks, setUserTasks] = useState<UserTask[]>([]);
+  // ── live data: requests (Tasks + Approvals, org-wide), activity (platform agent) ──
+  // The Tasks/Approvals tabs are now driven by the unified RequestsInbox
+  // component (RFC unified-requests-inbox P3) over /requests/pending?kind=…;
+  // the shell keeps only the per-tab pending counts so the tab badges render.
+  // The inbox owns its own fetch, optimistic update, live-refresh and
+  // More-Info thread — see RequestsInbox.tsx.
+  const [taskCount, setTaskCount] = useState(0);
+  const [apprCount, setApprCount] = useState(0);
   const [activity, setActivity] = useState<ActivityEntry[]>([]);
-  const [deciding, setDeciding] = useState<string | null>(null);
-  const [resolving, setResolving] = useState<string | null>(null);
-
-  const loadApprovals = useCallback(() => {
-    api.get<PendingApproval[]>("/approvals/pending")
-      .then((r) => setApprovals(r ?? []))
-      .catch(() => setApprovals([]));
-  }, []);
-  const loadUserTasks = useCallback(() => {
-    api.get<UserTask[]>("/user-tasks/pending")
-      .then((r) => setUserTasks(r ?? []))
-      .catch(() => setUserTasks([]));
-  }, []);
-  useEffect(() => { loadApprovals(); loadUserTasks(); }, [loadApprovals, loadUserTasks]);
 
   useEffect(() => {
     if (!platformId) return;
@@ -270,38 +242,6 @@ export function ConciergeShell() {
       .catch(() => { if (!cancelled) setActivity([]); });
     return () => { cancelled = true; };
   }, [platformId]);
-
-  const decide = useCallback(async (a: PendingApproval, decision: "approved" | "denied") => {
-    if (deciding) return;
-    setDeciding(a.id);
-    try {
-      await api.post(`/workspaces/${a.workspace_id}/approvals/${a.id}/decide`, {
-        decision, decided_by: "human",
-      });
-      showToast(decision === "approved" ? "Approved" : "Denied", decision === "approved" ? "success" : "info");
-      setApprovals((prev) => prev.filter((x) => x.id !== a.id));
-    } catch {
-      showToast("Failed to record decision", "error");
-    } finally {
-      setDeciding(null);
-    }
-  }, [deciding]);
-
-  const resolveTask = useCallback(async (t: UserTask, status: "done" | "dismissed") => {
-    if (resolving) return;
-    setResolving(t.id);
-    try {
-      await api.post(`/workspaces/${t.workspace_id}/user-tasks/${t.id}/resolve`, {
-        status, resolved_by: "human",
-      });
-      showToast(status === "done" ? "Marked done" : "Dismissed", status === "done" ? "success" : "info");
-      setUserTasks((prev) => prev.filter((x) => x.id !== t.id));
-    } catch {
-      showToast("Failed to resolve task", "error");
-    } finally {
-      setResolving(null);
-    }
-  }, [resolving]);
 
   const nav = (v: TopView) => setTopView(v);
 
@@ -490,10 +430,10 @@ export function ConciergeShell() {
                 <div className={s.sbTabs}>
                   <button data-testid="home-subtab-agents" className={`${s.sbTab} ${sbTab === "agents" ? s.active : ""}`} onClick={() => setSbTab("agents")}>Agents</button>
                   <button data-testid="home-subtab-tasks" className={`${s.sbTab} ${sbTab === "tasks" ? s.active : ""}`} onClick={() => setSbTab("tasks")}>
-                    Tasks{userTasks.length > 0 && <span className={s.cnt}>{userTasks.length}</span>}
+                    Tasks{taskCount > 0 && <span className={s.cnt}>{taskCount}</span>}
                   </button>
                   <button data-testid="home-subtab-approvals" className={`${s.sbTab} ${sbTab === "approvals" ? s.active : ""}`} onClick={() => setSbTab("approvals")}>
-                    Approvals{approvals.length > 0 && <span className={s.cnt}>{approvals.length}</span>}
+                    Approvals{apprCount > 0 && <span className={s.cnt}>{apprCount}</span>}
                   </button>
                 </div>
                 <div className={s.sbBody}>
@@ -524,65 +464,16 @@ export function ConciergeShell() {
                       </div>
                     </>
                   )}
-                  {sbTab === "tasks" && (
-                    <>
-                      {userTasks.length === 0 && (
-                        <div className={s.empty}>Nothing needs you right now. When an agent needs you to do something, it shows up here.</div>
-                      )}
-                      {userTasks.map((t) => (
-                        <div key={t.id} className={s.task}>
-                          <div className={s.taskRow}>
-                            <div className={`${s.taskIc} ${s.run}`}><IcClock /></div>
-                            <div className={s.taskMeta}>
-                              <div className={s.taskT}>{t.title}</div>
-                              <div className={s.taskS}>
-                                {t.workspace_name}<span className={s.pip} />asked {clockTime(t.created_at)}
-                              </div>
-                              {t.detail && (
-                                <div style={{ fontSize: 12, color: "var(--tx-3)", marginTop: 6, lineHeight: 1.45 }}>
-                                  {t.detail}
-                                </div>
-                              )}
-                            </div>
-                          </div>
-                          <div className={s.taskActions}>
-                            <button className={`${s.tbtn} ${s.done}`} disabled={resolving === t.id} onClick={() => resolveTask(t, "done")}>
-                              <IcCheck />Done
-                            </button>
-                            <button className={s.tbtn} disabled={resolving === t.id} onClick={() => resolveTask(t, "dismissed")}>
-                              Dismiss
-                            </button>
-                          </div>
-                        </div>
-                      ))}
-                    </>
-                  )}
-                  {sbTab === "approvals" && (
-                    <>
-                      {approvals.length === 0 && (
-                        <div className={s.empty}>No pending approvals. Destructive actions await sign-off here.</div>
-                      )}
-                      {approvals.map((a) => (
-                        <div key={a.id} className={s.apprCard} style={{ marginBottom: 7 }}>
-                          <div className={s.apprRow}>
-                            <div className={s.apprIc}><IcTrash /></div>
-                            <div className={s.apprMeta}>
-                              <div className={s.apprT}>{a.action.replace(/_/g, " ")} <code>{a.workspace_name}</code></div>
-                              <div className={s.apprS}>{a.reason || "destructive"}</div>
-                            </div>
-                          </div>
-                          <div className={s.apprActions}>
-                            <button className={`${s.btn} ${s.approve} ${s.flex}`} disabled={deciding === a.id} onClick={() => decide(a, "approved")}>
-                              {deciding === a.id ? "…" : "Approve"}
-                            </button>
-                            <button className={`${s.btn} ${s.deny} ${s.flex}`} disabled={deciding === a.id} onClick={() => decide(a, "denied")}>
-                              {deciding === a.id ? "…" : "Deny"}
-                            </button>
-                          </div>
-                        </div>
-                      ))}
-                    </>
-                  )}
+                  {/* Both inboxes stay mounted so their pending-count badges
+                      remain live on the tab bar even while the Agents tab is
+                      shown; only the active one is visible. Each owns its own
+                      fetch + optimistic update + live WS refresh. */}
+                  <div style={{ display: sbTab === "tasks" ? "block" : "none" }}>
+                    <RequestsInbox kind="task" onCountChange={setTaskCount} />
+                  </div>
+                  <div style={{ display: sbTab === "approvals" ? "block" : "none" }}>
+                    <RequestsInbox kind="approval" onCountChange={setApprCount} />
+                  </div>
                 </div>
               </aside>
 
