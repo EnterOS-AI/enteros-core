@@ -103,24 +103,45 @@ behalf, and keep them in the loop.
 // conciergeMCPServersBlock is the YAML appended to the concierge's config.yaml
 // so the runtime loads the org-admin platform MCP alongside the always-on a2a
 // server. The Phase-2 extra-MCP merge (claude_sdk_executor.py
-// _apply_extra_mcp_servers) reads this `mcp_servers:` list. The platform MCP
-// authenticates purely from the container env (MOLECULE_API_KEY /
-// MOLECULE_API_URL / MOLECULE_ORG_ID — wired by conciergePlatformMCPEnv), so no
-// per-server env block is needed here.
+// _apply_extra_mcp_servers) reads this `mcp_servers:` list.
+//
+// Entry shape pins the REAL image contract (agents-team pilot RCA,
+// 2026-06-10 — the previous block pointed at a /opt/molecule-mcp-server
+// path the image never shipped):
+//   - command `molecule-mcp` — Dockerfile.platform-agent npm-installs
+//     @molecule-ai/mcp-server globally, exposing exactly this bin on PATH.
+//   - env MOLECULE_MCP_MODE=management — the SAME binary serves the
+//     21-tool workspace a2a registry by default; only management mode
+//     registers the org-admin tools (list_workspaces et al). Without it
+//     the concierge gets a duplicate a2a server and zero admin tools.
+//
+// Auth comes from the container env (MOLECULE_API_KEY / MOLECULE_API_URL /
+// MOLECULE_ORG_ID — wired by conciergePlatformMCPEnv); MCP-host env merges
+// over process env, so the mode flag composes with those.
 //
 // SELF-HOST CAVEAT: the local stack provisions the concierge on the ordinary
-// `claude-code` image, which does NOT ship /opt/molecule-mcp-server. The
-// dedicated `platform-agent` image (Dockerfile.platform-agent) does. The
-// executor's _apply_extra_mcp_servers skips an entry whose command/script is
+// `claude-code` image, which does NOT ship the molecule-mcp bin. The
+// executor's _apply_extra_mcp_servers skips an entry whose command is
 // absent, so declaring this block can never crash the agent or wedge the SDK
 // init locally — the identity (system prompt) works everywhere; the org-admin
 // MCP tools only light up on the platform-agent image.
 const conciergeMCPServersBlock = `mcp_servers:
   - name: platform
-    command: node
-    args:
-      - /opt/molecule-mcp-server/dist/index.js
+    command: molecule-mcp
+    env:
+      MOLECULE_MCP_MODE: management
 `
+
+// conciergeMCPFragmentFile is the standalone overlay fragment carrying the
+// SAME declaration as conciergeMCPServersBlock. Written UNCONDITIONALLY by
+// conciergeIdentityFiles — unlike the config.yaml append, it does not depend
+// on resolving a base config. On the SaaS restart-provision path all three
+// base resolutions miss (no in-memory configFiles, no templatePath, no
+// exec-readable container), so the appended block silently never shipped and
+// the concierge booted without its admin MCP (the pilot's TOOLS-FAIL).
+// The runtime executor merges /configs/mcp_servers.yaml after config.yaml;
+// older runtimes ignore the extra file — strictly additive.
+const conciergeMCPFragmentFile = "mcp_servers.yaml"
 
 // SelfHostedPlatformAgentID is the deterministic platform-agent id used when no
 // control plane is present to derive a per-org id (self-hosted / local). There
@@ -159,6 +180,11 @@ func defaultPlatformAgentName() string {
 func conciergeIdentityFiles(name string, baseConfigYAML []byte) map[string][]byte {
 	files := map[string][]byte{
 		"system-prompt.md": []byte(fmt.Sprintf(conciergeSystemPromptTmpl, name)),
+		// Always-shipped fragment: declares the platform MCP regardless of
+		// whether a base config.yaml was resolvable (see
+		// conciergeMCPFragmentFile). Idempotent — fixed content, re-seeded
+		// every provision cycle, never touches config.yaml.
+		conciergeMCPFragmentFile: []byte(conciergeMCPServersBlock),
 	}
 	if len(baseConfigYAML) > 0 && !strings.Contains(string(baseConfigYAML), "\nmcp_servers:") &&
 		!strings.HasPrefix(string(baseConfigYAML), "mcp_servers:") {
