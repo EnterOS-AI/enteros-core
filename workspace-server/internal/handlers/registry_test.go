@@ -2432,41 +2432,51 @@ func TestRegister_SuccessClearsLastRegisterFailure(t *testing.T) {
 	broadcaster := newTestBroadcaster()
 	handler := NewRegistryHandler(broadcaster)
 
-	// C18: no live tokens → bootstrap-allowed.
+	// Mock sequence mirrors the actual Register success path in registry.go.
+	// 1. requireWorkspaceToken → HasAnyLiveToken: no live tokens → bootstrap-allowed.
 	mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM workspace_auth_tokens").
 		WithArgs("ws-reg-ok").
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
 
-	// resolveDeliveryMode (production selects delivery_mode AND runtime)
+	// 2. resolveDeliveryMode (production selects delivery_mode AND runtime).
 	mock.ExpectQuery("SELECT delivery_mode, runtime FROM workspaces").
 		WithArgs("ws-reg-ok").
 		WillReturnError(sql.ErrNoRows)
 
-	// URL SSRF check — internal platform tunnel, allowed.
-	mock.ExpectQuery("SELECT COALESCE\\(channel_config->>'app_public_key'").
+	// 3. agent_card identity reconcile (best-effort; no row yet).
+	mock.ExpectQuery("SELECT name, role FROM workspaces").
 		WithArgs("ws-reg-ok").
 		WillReturnError(sql.ErrNoRows)
 
-	// INSERT/UPDATE workspace row.
+	// 4. Upsert workspace row.
 	mock.ExpectExec("INSERT INTO workspaces").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	// Issue token (no live tokens).
+	// 5. Read-back URL for the WORKSPACE_ONLINE broadcast (best-effort).
+	mock.ExpectQuery("SELECT url FROM workspaces").
+		WithArgs("ws-reg-ok").
+		WillReturnError(sql.ErrNoRows)
+
+	// 6-7. Issue token (no live tokens → mint).
 	mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM workspace_auth_tokens").
 		WithArgs("ws-reg-ok").
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
 	mock.ExpectExec("INSERT INTO workspace_auth_tokens").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	// Clear last_register_failure_at.
-	mock.ExpectExec("UPDATE workspaces SET last_register_failure_at = NULL").
-		WithArgs("ws-reg-ok").
-		WillReturnResult(sqlmock.NewResult(0, 1))
-
-	// Lazy-heal platform_inbound_secret (optional, may no-op).
+	// 8-9. Lazy-heal platform_inbound_secret: read misses (ErrNoRows →
+	// ErrNoInboundSecret) so IssuePlatformInboundSecret mints inline.
 	mock.ExpectQuery("SELECT platform_inbound_secret FROM workspaces").
 		WithArgs("ws-reg-ok").
 		WillReturnError(sql.ErrNoRows)
+	mock.ExpectExec("UPDATE workspaces SET platform_inbound_secret").
+		WithArgs(sqlmock.AnyArg(), "ws-reg-ok").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// 10. Clear last_register_failure_at on success.
+	mock.ExpectExec("UPDATE workspaces SET last_register_failure_at = NULL").
+		WithArgs("ws-reg-ok").
+		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
