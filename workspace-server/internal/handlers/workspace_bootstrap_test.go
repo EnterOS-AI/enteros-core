@@ -24,6 +24,17 @@ func setupBootstrapHandler(t *testing.T) (*WorkspaceHandler, sqlmock.Sqlmock) {
 
 func TestBootstrapFailed_HappyPath(t *testing.T) {
 	h, mock := setupBootstrapHandler(t)
+	// Race-guard: captureRescueBundle (fired at workspace_bootstrap.go:104)
+	// dispatches via rescueDispatch = `go fn()`. The rescue goroutine
+	// reads db.DB (rescue.PersistBundle → rescuestore.NewPostgres(db.DB))
+	// and outlives this test unless we make it synchronous — and the
+	// test's setupTestDB t.Cleanup swaps db.DB back to prevDB in step 5,
+	// racing the goroutine's read in step 4. That's CR-A's #2490 race
+	// (the 0x...d548 db.DB race documented at handlers_test.go:32).
+	// rescueTestHarness makes rescueDispatch synchronous AND stubs the
+	// remote/redact so no real EIC/SSH fires; the test asserts the HTTP
+	// response + sqlmock expectations, not the rescue side effect.
+	rescueTestHarness(t, "i-crashed")
 
 	// UPDATE only flips from provisioning → re-check the predicate.
 	mock.ExpectExec(`UPDATE workspaces`).
@@ -103,6 +114,13 @@ func TestBootstrapFailed_TruncatesOversizedLogTail(t *testing.T) {
 	// walk); we just assert the handler succeeds and the final stored
 	// string contains the truncation marker.
 	h, mock := setupBootstrapHandler(t)
+	// Race-guard: same as TestBootstrapFailed_HappyPath — this test
+	// also reaches the rescue-dispatch path (affected==1 → call
+	// captureRescueBundle), so without the synchronous harness the
+	// rescue goroutine outlives the test and races db.DB in
+	// setupTestDB's t.Cleanup. See handlers_test.go:32 for the original
+	// 0x...d548 race diagnosis. CR-A #2490.
+	rescueTestHarness(t, "i-spammy")
 
 	longTail := make([]byte, 20000)
 	for i := range longTail {

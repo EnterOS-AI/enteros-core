@@ -481,6 +481,22 @@ func main() {
 		go supervised.RunWithRecover(ctx, "request-nudge-sweeper", nudgeSweeper.Start)
 	}
 
+	// Agent-Liveness RFC, Layer 3 (A2): stall-watchdog. Catches the
+	// "busy but silently hung" case the Redis TTL liveness monitor and the
+	// status='failed' watchdog both miss — a workspace that is status='online'
+	// with active_tasks>0 but has produced NO activity for too long (the case
+	// that let JRS sit dead ~2.5h). Two-stage: probe via A2A, then soft-restart
+	// (existing-volume, wh.RestartByID — the same path POST /workspaces/:id/
+	// restart uses) if still silent past the grace window; anti-flap cooldown.
+	// Defaults: 3min sweep, 12min stale, 5min probe-grace, 30min cooldown;
+	// override via STALL_WATCHDOG_*_S. Disable via STALL_WATCHDOG_DISABLED=true.
+	if !strings.EqualFold(os.Getenv("STALL_WATCHDOG_DISABLED"), "true") {
+		stallWatchdog := handlers.NewStallWatchdog(nil, wh.RestartByID)
+		go supervised.RunWithRecover(ctx, "stall-watchdog", stallWatchdog.Start)
+	} else {
+		log.Printf("StallWatchdog: disabled via STALL_WATCHDOG_DISABLED")
+	}
+
 	// Channel Manager — social channel integrations (Telegram, Slack, etc.)
 	channelMgr := channels.NewManager(wh, broadcaster)
 	go supervised.RunWithRecover(ctx, "channel-manager", channelMgr.Start)

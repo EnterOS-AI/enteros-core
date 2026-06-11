@@ -265,6 +265,91 @@ func TestRequests_Get_NotFound(t *testing.T) {
 	}
 }
 
+// TestRequests_Get_AgentPath_Requester_200 verifies that the requester workspace
+// can read its own request on the workspace-token auth path.
+func TestRequests_Get_AgentPath_Requester_200(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewRequestsHandler(newTestBroadcaster())
+
+	mock.ExpectQuery("FROM requests WHERE id").
+		WithArgs("req-1").
+		WillReturnRows(oneRequestRow("req-1", "task", "ws-1", "agent", "ws-2", "pending"))
+	mock.ExpectQuery("FROM request_messages WHERE request_id").
+		WithArgs("req-1").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "request_id", "author_type", "author_id", "body", "created_at"}))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{
+		{Key: "requestId", Value: "req-1"},
+		{Key: "id", Value: "ws-1"},
+	}
+	c.Request = httptest.NewRequest("GET", "/", nil)
+
+	handler.Get(c)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200 for requester read, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestRequests_Get_AgentPath_Recipient_200 verifies that the recipient workspace
+// can read a request addressed to it on the workspace-token auth path.
+func TestRequests_Get_AgentPath_Recipient_200(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewRequestsHandler(newTestBroadcaster())
+
+	mock.ExpectQuery("FROM requests WHERE id").
+		WithArgs("req-1").
+		WillReturnRows(oneRequestRow("req-1", "approval", "ws-1", "agent", "ws-2", "pending"))
+	mock.ExpectQuery("FROM request_messages WHERE request_id").
+		WithArgs("req-1").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "request_id", "author_type", "author_id", "body", "created_at"}))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{
+		{Key: "requestId", Value: "req-1"},
+		{Key: "id", Value: "ws-2"},
+	}
+	c.Request = httptest.NewRequest("GET", "/", nil)
+
+	handler.Get(c)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200 for recipient read, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestRequests_Get_AgentPath_NonParticipant_403 verifies that a workspace that
+// is neither the requester nor the recipient gets 403 on the workspace-token
+// auth path (core#2542 full fix — read-path org-scoping).
+func TestRequests_Get_AgentPath_NonParticipant_403(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewRequestsHandler(newTestBroadcaster())
+
+	mock.ExpectQuery("FROM requests WHERE id").
+		WithArgs("req-1").
+		WillReturnRows(oneRequestRow("req-1", "task", "ws-1", "agent", "ws-2", "pending"))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{
+		{Key: "requestId", Value: "req-1"},
+		{Key: "id", Value: "ws-3"},
+	}
+	c.Request = httptest.NewRequest("GET", "/", nil)
+
+	handler.Get(c)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403 for non-participant read, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
 // ---------- Respond (valid + invalid action-for-kind) ----------
 
 func TestRequests_Respond_ApprovalApproved(t *testing.T) {
@@ -371,6 +456,132 @@ func TestRequests_Respond_NotFound(t *testing.T) {
 	}
 }
 
+// TestRequests_Respond_SelfResponse_400 pins RC 10416: the requester must not
+// be able to approve/reject/done their own request.
+func TestRequests_Respond_SelfResponse_400(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewRequestsHandler(newTestBroadcaster())
+
+	// Requester is agent ws-1; responder is also agent ws-1 → self-response.
+	mock.ExpectQuery("FROM requests WHERE id").
+		WithArgs("req-1").
+		WillReturnRows(oneRequestRow("req-1", "approval", "ws-1", "user", "", "pending"))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "requestId", Value: "req-1"}}
+	c.Request = httptest.NewRequest("POST", "/", bytes.NewBufferString(`{"action":"approved","responder_type":"agent","responder_id":"ws-1"}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Respond(c)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for self-response, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestRequests_Respond_AgentPath_BindsWorkspace verifies REAL participant-binding:
+// on the workspace-token auth path the responder is forced to the URL workspace,
+// ignoring any impersonation attempt in the body.
+func TestRequests_Respond_AgentPath_BindsWorkspace(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewRequestsHandler(newTestBroadcaster())
+
+	// Requester is agent ws-1; body claims self-response (ws-1), but the URL
+	// workspace is ws-2. Binding overrides the body, so responder = ws-2 and
+	// the call succeeds (not self-response).
+	// Authz Get in handler, then store Get inside Respond.
+	mock.ExpectQuery("FROM requests WHERE id").
+		WithArgs("req-1").
+		WillReturnRows(oneRequestRow("req-1", "approval", "ws-1", "agent", "ws-2", "pending"))
+	mock.ExpectQuery("FROM requests WHERE id").
+		WithArgs("req-1").
+		WillReturnRows(oneRequestRow("req-1", "approval", "ws-1", "agent", "ws-2", "pending"))
+	mock.ExpectExec("UPDATE requests SET status").
+		WithArgs("approved", "agent", "ws-2", sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO structure_events").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{
+		{Key: "requestId", Value: "req-1"},
+		{Key: "id", Value: "ws-2"},
+	}
+	c.Request = httptest.NewRequest("POST", "/", bytes.NewBufferString(`{"action":"approved","responder_type":"agent","responder_id":"ws-1"}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Respond(c)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200 when bound responder differs from requester, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestRequests_Respond_AgentPath_NotRecipient_403 verifies that an agent
+// cannot respond to a request that was not addressed to it (core#2542).
+func TestRequests_Respond_AgentPath_NotRecipient_403(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewRequestsHandler(newTestBroadcaster())
+
+	// Requester is ws-1, recipient is ws-2; URL workspace is ws-1 (not recipient).
+	mock.ExpectQuery("FROM requests WHERE id").
+		WithArgs("req-1").
+		WillReturnRows(oneRequestRow("req-1", "approval", "ws-1", "agent", "ws-2", "pending"))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{
+		{Key: "requestId", Value: "req-1"},
+		{Key: "id", Value: "ws-1"},
+	}
+	c.Request = httptest.NewRequest("POST", "/", bytes.NewBufferString(`{"action":"approved","responder_type":"agent","responder_id":"ws-2"}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Respond(c)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403 for non-recipient respond, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestRequests_Respond_AgentPath_SelfResponse_400 verifies that the
+// self-response guard still fires on the agent path when the request is
+// self-addressed (requester == recipient) and the caller tries to respond.
+func TestRequests_Respond_AgentPath_SelfResponse_400(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewRequestsHandler(newTestBroadcaster())
+
+	// Self-addressed request: requester = recipient = ws-1.
+	// Authz Get in handler, then store Get inside Respond.
+	mock.ExpectQuery("FROM requests WHERE id").
+		WithArgs("req-1").
+		WillReturnRows(oneRequestRow("req-1", "approval", "ws-1", "agent", "ws-1", "pending"))
+	mock.ExpectQuery("FROM requests WHERE id").
+		WithArgs("req-1").
+		WillReturnRows(oneRequestRow("req-1", "approval", "ws-1", "agent", "ws-1", "pending"))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{
+		{Key: "requestId", Value: "req-1"},
+		{Key: "id", Value: "ws-1"},
+	}
+	c.Request = httptest.NewRequest("POST", "/", bytes.NewBufferString(`{"action":"approved","responder_type":"agent","responder_id":"ws-1"}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Respond(c)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for bound self-response, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
 // ---------- AddMessage → info_requested when recipient asks ----------
 
 func TestRequests_AddMessage_RecipientFlipsInfoRequested(t *testing.T) {
@@ -456,6 +667,33 @@ func TestRequests_Cancel_Success(t *testing.T) {
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestRequests_Cancel_AgentPath_NotRequester_403 verifies that an agent
+// cannot cancel a request it did not raise (core#2542).
+func TestRequests_Cancel_AgentPath_NotRequester_403(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewRequestsHandler(newTestBroadcaster())
+
+	// Requester is ws-1; URL workspace is ws-2 (not requester).
+	mock.ExpectQuery("FROM requests WHERE id").
+		WithArgs("req-1").
+		WillReturnRows(oneRequestRow("req-1", "task", "ws-1", "agent", "ws-2", "pending"))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{
+		{Key: "requestId", Value: "req-1"},
+		{Key: "id", Value: "ws-2"},
+	}
+	c.Request = httptest.NewRequest("POST", "/", nil)
+
+	handler.Cancel(c)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403 for non-requester cancel, got %d: %s", w.Code, w.Body.String())
 	}
 }
 

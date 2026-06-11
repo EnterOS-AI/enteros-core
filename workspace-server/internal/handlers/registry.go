@@ -331,6 +331,17 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 		return
 	}
 
+	// #2500 instrumentation: log non-200 boot Register outcomes so operators
+	// can distinguish 401 (C18 token race), 400 (push-URL invalid/empty),
+	// 403 (platform kind guard), 5xx (DB/internal error), or success from
+	// client timeout / unreachable $PLATFORM_URL.
+	registerStart := time.Now()
+	defer func(wsID string) {
+		if status := c.Writer.Status(); status != http.StatusOK {
+			log.Printf("Registry register: workspace=%s boot_register_failed status=%d duration=%s", wsID, status, time.Since(registerStart))
+		}
+	}(payload.ID)
+
 	// Validate explicit delivery_mode if the agent declared one; empty is
 	// allowed and resolves to the row's existing value (or "push" default)
 	// in the upsert below. See #2339 for the poll/push split rationale.
