@@ -102,7 +102,7 @@ try:
 except Exception:
   pass" 2>/dev/null || true)
   fi
-  curl -s -X DELETE "$BASE/workspaces/$wid?confirm=true" \
+  e2e_gated_admin_op "$wid" curl -s -X DELETE "$BASE/workspaces/$wid?confirm=true" \
     -H "X-Confirm-Name: $name" ${curl_args[@]+"${curl_args[@]}"} > /dev/null || true
 }
 
@@ -192,7 +192,7 @@ e2e_gated_admin_op() {
   local _wid="$1"; shift
   local _curl_args=("$@")
   local _resp
-  _resp=$(curl -s "${_curl_args[@]+"${_curl_args[@]}"}")
+  _resp=$("${_curl_args[@]}")
   # Detect pending_approval — Python parses + emits the approval_id on stdout
   # if present, empty string otherwise. JSON parse failure (e.g. 502 HTML) is
   # treated as "not gated" so the smoke fails on real errors rather than
@@ -216,7 +216,7 @@ except Exception:
     # Retry the original operation. The gate's consume-once
     # (approval_gate.go UPDATE … RETURNING id) means the SECOND call finds
     # the now-approved request and proceeds (returns true from gateDestructive).
-    _resp=$(curl -s "${_curl_args[@]+"${_curl_args[@]}"}")
+    _resp=$("${_curl_args[@]}")
   fi
   printf '%s' "$_resp"
 }
