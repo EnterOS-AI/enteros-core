@@ -74,7 +74,7 @@ jobs:
           # queue now reads the required status contexts from BRANCH PROTECTION
           # (status_check_contexts) so non-required governance reds (qa-review,
           # security-review, sop-checklist when not branch-required,
-          # E2E Chat, Staging SaaS, ci-arm64-advisory) cannot block a merge.
+          # E2E Chat, Staging SaaS) cannot block a merge.
           # If branch protection cannot be enumerated the queue HOLDS
           # (fail-closed). REQUIRED_APPROVALS below is only a fallback used when
           # branch protection does not specify required_approvals.
