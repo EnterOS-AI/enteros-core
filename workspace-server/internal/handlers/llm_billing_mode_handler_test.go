@@ -57,12 +57,12 @@ func expectDeriveShimQueries(m sqlmock.Sqlmock, wsID, runtime, model string) {
 	nullOverride()
 }
 
-// internal#718 P2-B: org rung retired. A no-override workspace's mode is now
-// DERIVED from its stored (runtime, model). A claude-code workspace with a
-// non-platform-deriving model (kimi-for-coding) resolves byok via
-// derived_provider — NOT the old "inherit org default".
+// internal#718 P2-B + core#2608: with no workspace override and an unset org
+// default, the mode is DERIVED from its stored (runtime, model). A claude-code
+// workspace with a non-platform-deriving model (kimi-for-coding) resolves byok
+// via derived_provider.
 func TestGetWorkspaceLLMBillingMode_HappyPath_DerivesByokFromModel(t *testing.T) {
-	t.Setenv("MOLECULE_LLM_BILLING_MODE", LLMBillingModeBYOK) // org env ignored now
+	t.Setenv("MOLECULE_LLM_BILLING_MODE", "") // no org default; derivation decides
 	mock := setupTestDB(t)
 	expectDeriveShimQueries(mock, testWSID, "claude-code", "kimi-for-coding")
 
@@ -144,7 +144,7 @@ func TestPutWorkspaceLLMBillingMode_SetByok(t *testing.T) {
 }
 
 func TestPutWorkspaceLLMBillingMode_ExplicitNullClearsOverride(t *testing.T) {
-	t.Setenv("MOLECULE_LLM_BILLING_MODE", LLMBillingModePlatformManaged)
+	t.Setenv("MOLECULE_LLM_BILLING_MODE", "") // no org default; derivation decides
 	withProxyConfigured(t) // SaaS context: cleared override → derived_default → platform_managed.
 	mock := setupTestDB(t)
 	mock.ExpectExec(`UPDATE workspaces SET llm_billing_mode = NULL WHERE id = \$1`).

@@ -1065,11 +1065,11 @@ func effectiveModelForBilling(model string, envVars map[string]string) string {
 type platformLLMEnvResult struct {
 	ResolvedMode     string
 	HasUsableLLMCred bool
-	// Source records which layer decided the mode (internal#718 P2-B):
-	// derived_provider (registry derivation), derived_default (derive failed →
-	// platform default), workspace_override (explicit operator pin), or
-	// constant_fallback (DB error). Surfaced for observability + asserted by the
-	// behavior-delta tests so a regression of "derived, not stored" flips red.
+	// Source records which layer decided the mode (internal#718 P2-B + core#2608):
+	// workspace_override, org_default, derived_provider (registry derivation),
+	// derived_default (derive failed → platform default), or constant_fallback
+	// (DB error). Surfaced for observability + asserted by the behavior-delta
+	// tests so a regression of "derived, not stored" flips red.
 	Source BillingModeSource
 }
 
@@ -1092,6 +1092,7 @@ func applyPlatformManagedLLMEnv(ctx context.Context, envVars map[string]string, 
 	// of recognized provider auth-env-var NAMES present in envVars (the same
 	// disambiguation input the registry uses to split oauth-vs-api). The org-env
 	// MOLECULE_LLM_BILLING_MODE is NO LONGER read into the decision (retired).
+	orgMode := strings.ToLower(strings.TrimSpace(os.Getenv("MOLECULE_LLM_BILLING_MODE")))
 	availableAuthEnv := availableAuthEnvNames(envVars)
 	// molecule-core#1994: derive billing mode from the EFFECTIVE model, not the
 	// raw payload.Model. On a re-provision (restart/resume/auto-restart) the
@@ -1106,7 +1107,7 @@ func applyPlatformManagedLLMEnv(ctx context.Context, envVars map[string]string, 
 	// read-path's — keeping the two resolvers in parity (the #1994 regression
 	// guard test asserts this).
 	effectiveModel := effectiveModelForBilling(model, envVars)
-	res, resolveErr := ResolveLLMBillingModeDerived(ctx, workspaceID, runtime, effectiveModel, availableAuthEnv)
+	res, resolveErr := ResolveLLMBillingModeDerived(ctx, workspaceID, runtime, effectiveModel, orgMode, availableAuthEnv)
 	if resolveErr != nil {
 		// resolveErr != nil ⇒ resolver hit a DB error AND already defaulted
 		// res.ResolvedMode to platform_managed. Log + proceed; the safe default
