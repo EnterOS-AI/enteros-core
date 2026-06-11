@@ -843,6 +843,10 @@ func TestSecretsSet_TriggersAutoRestart(t *testing.T) {
 	mock.ExpectExec("INSERT INTO workspace_secrets").
 		WithArgs("77777777-7777-7777-7777-777777777777", "NEW_KEY", sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	// autoRestartAllowed (core#2573) checks the target's kind before firing.
+	mock.ExpectQuery(`SELECT COALESCE\(kind`).
+		WithArgs("77777777-7777-7777-7777-777777777777").
+		WillReturnRows(sqlmock.NewRows([]string{"kind"}).AddRow("workspace"))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -910,6 +914,10 @@ func TestSecretsDelete_TriggersAutoRestart(t *testing.T) {
 	mock.ExpectExec("DELETE FROM workspace_secrets WHERE workspace_id").
 		WithArgs("cccccccc-cccc-cccc-cccc-cccccccccccc", "REMOVE_KEY").
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	// autoRestartAllowed (core#2573) checks the target's kind before firing.
+	mock.ExpectQuery(`SELECT COALESCE\(kind`).
+		WithArgs("cccccccc-cccc-cccc-cccc-cccccccccccc").
+		WillReturnRows(sqlmock.NewRows([]string{"kind"}).AddRow("workspace"))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)

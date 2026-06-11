@@ -257,6 +257,10 @@ func TestSecretsSet_AutoRestart(t *testing.T) {
 	mock.ExpectExec("INSERT INTO workspace_secrets").
 		WithArgs("550e8400-e29b-41d4-a716-446655440000", "DB_PASS", sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	// autoRestartAllowed (core#2573) checks the target's kind before firing.
+	mock.ExpectQuery(`SELECT COALESCE\(kind`).
+		WithArgs("550e8400-e29b-41d4-a716-446655440000").
+		WillReturnRows(sqlmock.NewRows([]string{"kind"}).AddRow("workspace"))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -444,6 +448,10 @@ func TestSecretsDelete_AutoRestart(t *testing.T) {
 	mock.ExpectExec("DELETE FROM workspace_secrets WHERE workspace_id").
 		WithArgs("550e8400-e29b-41d4-a716-446655440000", "OLD_KEY").
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	// autoRestartAllowed (core#2573) checks the target's kind before firing.
+	mock.ExpectQuery(`SELECT COALESCE\(kind`).
+		WithArgs("550e8400-e29b-41d4-a716-446655440000").
+		WillReturnRows(sqlmock.NewRows([]string{"kind"}).AddRow("workspace"))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -1330,6 +1338,95 @@ func TestSecretsDelete_SkipSelfRestart_WhenCallerIsTarget(t *testing.T) {
 	}
 }
 
+// TestSecretsSet_SkipAutoRestart_PlatformRoot (#2573): a secret write
+// targeting the org's kind='platform' concierge must NOT auto-restart it,
+// regardless of who the caller is. The management MCP authenticates with the
+// tenant ADMIN token (callerID == ""), so the self-write skip never fires for
+// the concierge — this kind check is what actually protects the org root.
+func TestSecretsSet_SkipAutoRestart_PlatformRoot(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+
+	restarted := make(chan string, 1)
+	restartFunc := func(wsID string) { restarted <- wsID }
+	handler := NewSecretsHandler(restartFunc)
+
+	mock.ExpectExec("INSERT INTO workspace_secrets").
+		WithArgs("550e8400-e29b-41d4-a716-446655440000", "TEST_SECRET", sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery(`SELECT COALESCE\(kind`).
+		WithArgs("550e8400-e29b-41d4-a716-446655440000").
+		WillReturnRows(sqlmock.NewRows([]string{"kind"}).AddRow("platform"))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "550e8400-e29b-41d4-a716-446655440000"}}
+	body := `{"key":"TEST_SECRET","value":"v"}`
+	c.Request = httptest.NewRequest("POST", "/workspaces/550e8400-e29b-41d4-a716-446655440000/secrets", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	// No workspace bearer / X-Workspace-ID: admin-token caller, callerID == "".
+
+	handler.Set(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	select {
+	case <-restarted:
+		t.Fatal("restart must NOT fire for a kind='platform' target")
+	case <-time.After(200 * time.Millisecond):
+		// Expected — no restart.
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// TestSecretsDelete_SkipAutoRestart_PlatformRoot (#2573): symmetric skip for
+// the DELETE path — cleaning up secrets on the concierge must not kill it.
+func TestSecretsDelete_SkipAutoRestart_PlatformRoot(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+
+	restarted := make(chan string, 1)
+	restartFunc := func(wsID string) { restarted <- wsID }
+	handler := NewSecretsHandler(restartFunc)
+
+	mock.ExpectExec("DELETE FROM workspace_secrets WHERE workspace_id").
+		WithArgs("550e8400-e29b-41d4-a716-446655440000", "TEST_SECRET").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery(`SELECT COALESCE\(kind`).
+		WithArgs("550e8400-e29b-41d4-a716-446655440000").
+		WillReturnRows(sqlmock.NewRows([]string{"kind"}).AddRow("platform"))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{
+		{Key: "id", Value: "550e8400-e29b-41d4-a716-446655440000"},
+		{Key: "key", Value: "TEST_SECRET"},
+	}
+	c.Request = httptest.NewRequest("DELETE", "/workspaces/550e8400-e29b-41d4-a716-446655440000/secrets/TEST_SECRET", nil)
+
+	handler.Delete(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	select {
+	case <-restarted:
+		t.Fatal("restart must NOT fire for a kind='platform' target")
+	case <-time.After(200 * time.Millisecond):
+		// Expected — no restart.
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
 // TestSetGlobal_SkipSelfRestart_WhenCallerIsAffected (#2573): when the org
 // platform agent (caller) sets a global secret, its own workspace must be
 // excluded from the fan-out restart so it isn't killed mid-turn.
@@ -1390,6 +1487,52 @@ func TestSetGlobal_SkipSelfRestart_WhenCallerIsAffected(t *testing.T) {
 	}
 }
 
+// TestSetGlobal_FanOutQuery_ExcludesPlatformRoot (#2573): the fan-out query
+// itself must exclude kind='platform' workspaces — the org root must never be
+// auto-restarted by a global-secret rotation. The regex pins the SQL filter;
+// rows returned already reflect it, so the assertion lives in the query match.
+func TestSetGlobal_FanOutQuery_ExcludesPlatformRoot(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+
+	restarted := make(chan string, 2)
+	restartFunc := func(wsID string) { restarted <- wsID }
+	handler := NewSecretsHandler(restartFunc)
+
+	mock.ExpectExec("INSERT INTO global_secrets").
+		WithArgs("ROTATED_KEY", sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	mock.ExpectQuery(`(?s)SELECT id FROM workspaces.*COALESCE\(kind, 'workspace'\) <> 'platform'`).
+		WithArgs("ROTATED_KEY").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("ws-a"))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	body := `{"key":"ROTATED_KEY","value":"v2"}`
+	c.Request = httptest.NewRequest("POST", "/admin/secrets", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.SetGlobal(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	select {
+	case id := <-restarted:
+		if id != "ws-a" {
+			t.Errorf("expected ws-a restarted, got %q", id)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("restart not fired for the affected regular workspace")
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
 // TestSecretsSet_SpoofedHeader_DoesNotSuppressRestart (core#2584 regression):
 // a request presenting a valid workspace bearer token MUST have its identity
 // derived from the token, NOT from a spoofed X-Workspace-ID header. If the
@@ -1413,6 +1556,10 @@ func TestSecretsSet_SpoofedHeader_DoesNotSuppressRestart(t *testing.T) {
 	// Token lookup: the bearer resolves to ws-caller, NOT the target.
 	mock.ExpectQuery(`SELECT t\.id, t\.workspace_id.*FROM workspace_auth_tokens t.*JOIN workspaces`).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "workspace_id"}).AddRow("tok-1", "ws-caller"))
+	// autoRestartAllowed (core#2573) checks the target's kind before firing.
+	mock.ExpectQuery(`SELECT COALESCE\(kind`).
+		WithArgs("550e8400-e29b-41d4-a716-446655440000").
+		WillReturnRows(sqlmock.NewRows([]string{"kind"}).AddRow("workspace"))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -1463,6 +1610,10 @@ func TestSecretsDelete_SpoofedHeader_DoesNotSuppressRestart(t *testing.T) {
 	// Token lookup: the bearer resolves to ws-caller, NOT the target.
 	mock.ExpectQuery(`SELECT t\.id, t\.workspace_id.*FROM workspace_auth_tokens t.*JOIN workspaces`).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "workspace_id"}).AddRow("tok-1", "ws-caller"))
+	// autoRestartAllowed (core#2573) checks the target's kind before firing.
+	mock.ExpectQuery(`SELECT COALESCE\(kind`).
+		WithArgs("550e8400-e29b-41d4-a716-446655440000").
+		WillReturnRows(sqlmock.NewRows([]string{"kind"}).AddRow("workspace"))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)

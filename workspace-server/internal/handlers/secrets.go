@@ -118,6 +118,46 @@ func NewSecretsHandler(restartFunc func(string)) *SecretsHandler {
 	return &SecretsHandler{restartFunc: restartFunc}
 }
 
+// autoRestartAllowed (core#2573) decides whether a secret change on
+// workspaceID may fire the auto-restart. Two skips:
+//
+//  1. Self-write: the caller IS the target workspace -- restarting would
+//     kill the writing agent mid-turn (original #2573 fix). Only covers
+//     callers that present a workspace token / X-Workspace-ID, which the
+//     concierge's management MCP does NOT (it authenticates with the
+//     tenant ADMIN token, so callerID is "" and skip 1 never fired --
+//     that gap terminated the org root's box twice on 2026-06-11, once
+//     costing a 14h outage).
+//  2. Platform root: the target is the org's kind='platform' concierge.
+//     An auto-restart here tears down the ORG ROOT's EC2 (terminate +
+//     re-provision, minutes of downtime, and the provision leg has
+//     failed silently before -- cp#691). The concierge picks changes up
+//     on its next explicit restart; the canvas Restart button covers
+//     operators who need it now.
+func autoRestartAllowed(ctx context.Context, callerID, workspaceID string) bool {
+	if callerID == workspaceID {
+		log.Printf("secrets: skipping auto-restart of %s (self-write, core#2573)", workspaceID)
+		return false
+	}
+	var kind string
+	if err := db.DB.QueryRowContext(ctx,
+		`SELECT COALESCE(kind, 'workspace') FROM workspaces WHERE id = $1`, workspaceID).
+		Scan(&kind); err != nil {
+		// Fail closed: if we cannot prove the target is a regular
+		// workspace, do NOT restart it -- a wrongly-fired restart on the
+		// org root is exactly the outage this guard exists to prevent,
+		// while a skipped restart just delays env propagation until the
+		// next explicit restart.
+		log.Printf("secrets: skipping auto-restart of %s (kind lookup failed, fail-closed: %v)", workspaceID, err)
+		return false
+	}
+	if kind == "platform" {
+		log.Printf("secrets: skipping auto-restart of %s (platform root, core#2573 -- restart explicitly to apply)", workspaceID)
+		return false
+	}
+	return true
+}
+
 // List handles GET /workspaces/:id/secrets
 // Returns a merged view: workspace-level overrides + inherited global secrets.
 // Each entry includes a "scope" field ("workspace" or "global") so the frontend
@@ -398,10 +438,10 @@ func (h *SecretsHandler) Set(c *gin.Context) {
 	// drain the detached restart goroutine before db.DB is swapped — see
 	// drainTestAsync in handlers_test.go and the canonical 69d9b4e3 fix.
 	//
-	// #2573: skip self-restart when the secret-write caller is the target
-	// workspace, to avoid killing the writing agent mid-turn.
+	// #2573: skip the auto-restart for self-writes AND for the platform
+	// root (see autoRestartAllowed for the full rationale).
 	callerID := callerWorkspaceID(c)
-	if h.restartFunc != nil && callerID != workspaceID {
+	if h.restartFunc != nil && autoRestartAllowed(c.Request.Context(), callerID, workspaceID) {
 		wsID := workspaceID
 		globalGoAsync(func() { h.restartFunc(wsID) })
 	}
@@ -449,9 +489,10 @@ func (h *SecretsHandler) Delete(c *gin.Context) {
 
 	// Auto-restart workspace to pick up removed secret.
 	// RFC internal#524 Layer 1: see Set() above for the drain rationale.
-	// #2573: skip self-restart when the secret-write caller is the target.
+	// #2573: skip the auto-restart for self-writes AND for the platform
+	// root (see autoRestartAllowed).
 	callerID := callerWorkspaceID(c)
-	if h.restartFunc != nil && callerID != workspaceID {
+	if h.restartFunc != nil && autoRestartAllowed(c.Request.Context(), callerID, workspaceID) {
 		wsID := workspaceID
 		globalGoAsync(func() { h.restartFunc(wsID) })
 	}
@@ -579,10 +620,15 @@ func (h *SecretsHandler) restartAllAffectedByGlobalKey(key, excludeWorkspaceID s
 		return
 	}
 	ctx := context.Background()
+	// core#2573: the org's kind='platform' root is excluded for the same
+	// reason autoRestartAllowed skips it -- an auto-restart terminates the
+	// org root's box. It picks up rotated globals on its next explicit
+	// restart.
 	rows, err := db.DB.QueryContext(ctx, `
 		SELECT id FROM workspaces
 		WHERE status NOT IN ('removed', 'paused')
 		  AND COALESCE(runtime, '') <> 'external'
+		  AND COALESCE(kind, 'workspace') <> 'platform'
 		  AND id NOT IN (
 		      SELECT workspace_id FROM workspace_secrets WHERE key = $1
 		  )
