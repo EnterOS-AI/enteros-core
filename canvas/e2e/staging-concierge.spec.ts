@@ -208,6 +208,25 @@ let platformInstalled = false;
 
 test.beforeEach(async ({ page, context }) => {
   const { tenantURL, tenantToken, workspaceId, orgID } = tenantEnv();
+  // Pre-seed a cookie-consent decision: the CookieConsent banner
+  // (canvas 0dd4f259) is a fixed bottom overlay at z-[9999] that
+  // intercepts pointer events on the nav rail — every click in this
+  // suite times out with "<section aria-labelledby=cookie-consent-title>
+  // intercepts pointer events" until a decision exists in localStorage.
+  // "rejected" matches the privacy-preserving default; nothing in these
+  // tests depends on optional cookies.
+  await context.addInitScript(() => {
+    window.localStorage.setItem(
+      "molecule_cookie_consent",
+      JSON.stringify({
+        decision: "rejected",
+        decidedAt: new Date().toISOString(),
+        // Must match CookieConsent.tsx CURRENT_VERSION or the record is
+        // ignored and the banner re-prompts.
+        version: 1,
+      }),
+    );
+  });
   await authenticate(context, tenantToken, workspaceId);
   const { installed } = await installPlatformAgent(page, tenantURL, tenantToken, orgID);
   platformInstalled = installed;
