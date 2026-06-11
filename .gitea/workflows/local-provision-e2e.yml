@@ -98,6 +98,10 @@ jobs:
           cache: false
           cache-dependency-path: workspace-server/go.sum
 
+      - name: Build e2e-names SSOT CLI
+        working-directory: workspace-server
+        run: go build -o /usr/local/bin/e2e-names ./cmd/e2e-names
+
       - name: Ensure provisioner network + pre-pull alpine
         run: |
           # The local provisioner attaches workspace containers to
@@ -106,6 +110,19 @@ jobs:
           # named config volume. Pre-pull + ensure the bridge (idempotent).
           docker pull alpine:3 >/dev/null
           docker network create molecule-core-net >/dev/null 2>&1 || true
+          # SEV-2499 / mc#2499: connect the act_runner job container to
+          # molecule-core-net so workspace containers can reach the platform
+          # server. Without this, the platform runs in the job container's
+          # namespace and workspace containers on molecule-core-net time out
+          # trying to reach the gateway IP (the host cannot forward to an
+          # unpublished container port).
+          JOB_CID="$(hostname)"
+          echo "JOB_CID=${JOB_CID}" >> "$GITHUB_ENV"
+          if docker network connect molecule-core-net "$JOB_CID" >/dev/null 2>&1; then
+            echo "Connected job container ($JOB_CID) to molecule-core-net."
+          else
+            echo "WARN: could not connect job container to molecule-core-net (fallback to gateway)."
+          fi
           echo "alpine:3 pre-pulled; molecule-core-net ensured."
 
       - name: Start Postgres (docker, ephemeral host port)

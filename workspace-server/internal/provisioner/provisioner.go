@@ -219,6 +219,12 @@ func ClaudeSessionVolumeName(workspaceID string) string {
 	return fmt.Sprintf("ws-%s-claude-sessions", workspaceID)
 }
 
+// WorkspaceVolumeName returns the Docker named volume for a workspace's
+// /workspace mount.
+func WorkspaceVolumeName(workspaceID string) string {
+	return fmt.Sprintf("ws-%s-workspace", workspaceID)
+}
+
 // legacyClaudeSessionVolumeName returns the pre-KI-013 truncated session volume name.
 func legacyClaudeSessionVolumeName(workspaceID string) string {
 	id := workspaceID
@@ -790,15 +796,13 @@ func (p *Provisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string, e
 func buildWorkspaceMount(cfg WorkspaceConfig) string {
 	// Named volume when no host path is configured.
 	if cfg.WorkspacePath == "" {
-		volumeName := fmt.Sprintf("ws-%s-workspace", cfg.WorkspaceID)
-		return fmt.Sprintf("%s:/workspace", volumeName)
+		return fmt.Sprintf("%s:/workspace", WorkspaceVolumeName(cfg.WorkspaceID))
 	}
 	// Host bind mount. Append :ro for read-only mode; otherwise default
 	// (implicit read-write). "none" explicitly opts out of the mount
 	// even when a path is set.
 	if cfg.WorkspaceAccess == WorkspaceAccessNone {
-		volumeName := fmt.Sprintf("ws-%s-workspace", cfg.WorkspaceID)
-		return fmt.Sprintf("%s:/workspace", volumeName)
+		return fmt.Sprintf("%s:/workspace", WorkspaceVolumeName(cfg.WorkspaceID))
 	}
 	if cfg.WorkspaceAccess == WorkspaceAccessReadOnly {
 		return fmt.Sprintf("%s:/workspace:ro", cfg.WorkspacePath)
