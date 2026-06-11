@@ -55,19 +55,24 @@ test.describe("Desktop ChatTab", () => {
       .click();
     // Wait for the side panel chat tab to be clickable, then click it.
     await page.locator('#tab-chat').click();
-    await page.waitForSelector("[data-testid='chat-panel']", { timeout: 5_000 });
+    // All chat selectors are scoped to #panel-chat (the map SidePanel
+    // tabpanel — instance-unique since the #2587 idPrefix fix): the
+    // hidden ConciergeShell mounts a SECOND ChatTab, so unscoped
+    // [data-testid='chat-panel'] / textarea selectors resolve to the
+    // invisible concierge copy first and time out.
+    await page.waitForSelector("#panel-chat [data-testid='chat-panel']", { timeout: 5_000 });
     // Wait for the workspace status to flip to online and the textarea to be enabled.
-    await expect(page.locator("textarea").first()).toBeEnabled({ timeout: 15_000 });
+    await expect(page.locator("#panel-chat textarea").first()).toBeEnabled({ timeout: 15_000 });
   });
 
   test("chat panel loads without error", async ({ page }) => {
     const hasEmptyState = await page.getByText("Send a message to start chatting.").isVisible().catch(() => false);
-    const hasHistory = await page.locator("[data-testid='chat-panel']").locator("div").count() > 3;
+    const hasHistory = await page.locator("#panel-chat [data-testid='chat-panel']").locator("div").count() > 3;
     expect(hasEmptyState || hasHistory).toBeTruthy();
   });
 
   test("send text message and receive echo response", async ({ page }) => {
-    const textarea = page.locator("textarea").first();
+    const textarea = page.locator("#panel-chat textarea").first();
     await textarea.fill("What is the weather?");
     await page.getByRole("button", { name: /Send/ }).first().click();
 
@@ -76,7 +81,7 @@ test.describe("Desktop ChatTab", () => {
   });
 
   test("history persists across reload", async ({ page }) => {
-    const textarea = page.locator("textarea").first();
+    const textarea = page.locator("#panel-chat textarea").first();
     await textarea.fill("Persistence test");
     await page.getByRole("button", { name: /Send/ }).first().click();
 
@@ -91,19 +96,19 @@ test.describe("Desktop ChatTab", () => {
       .first()
       .click();
     await page.locator('#tab-chat').click();
-    await page.waitForSelector("[data-testid='chat-panel']", { timeout: 5_000 });
+    await page.waitForSelector("#panel-chat [data-testid='chat-panel']", { timeout: 5_000 });
     // Wait for the workspace status to flip to online and the textarea to be enabled.
-    await expect(page.locator("textarea").first()).toBeEnabled({ timeout: 15_000 });
+    await expect(page.locator("#panel-chat textarea").first()).toBeEnabled({ timeout: 15_000 });
 
     await expect(page.getByText("Persistence test", { exact: true })).toBeVisible({ timeout: 5_000 });
     await expect(page.getByText("Echo: Persistence test")).toBeVisible({ timeout: 5_000 });
   });
 
   test("file attachment round-trip", async ({ page }) => {
-    const textarea = page.locator("textarea").first();
+    const textarea = page.locator("#panel-chat textarea").first();
     await textarea.fill("Please read this file");
 
-    const fileInput = page.locator("[data-testid='chat-panel'] input[type='file']").first();
+    const fileInput = page.locator("#panel-chat [data-testid='chat-panel'] input[type='file']").first();
     await fileInput.setInputFiles({
       name: "test.txt",
       mimeType: "text/plain",
@@ -118,7 +123,7 @@ test.describe("Desktop ChatTab", () => {
   });
 
   test("activity log appears during send", async ({ page }) => {
-    const textarea = page.locator("textarea").first();
+    const textarea = page.locator("#panel-chat textarea").first();
     await textarea.fill("Trigger activity");
     await page.getByRole("button", { name: /Send/ }).first().click();
 
@@ -176,13 +181,13 @@ test.describe("Desktop ChatTab — Markdown rendering", () => {
       .first()
       .click();
     await page.locator('#tab-chat').click();
-    await page.waitForSelector("[data-testid='chat-panel']", { timeout: 5_000 });
+    await page.waitForSelector("#panel-chat [data-testid='chat-panel']", { timeout: 5_000 });
     // Wait for the workspace status to flip to online and the textarea to be enabled.
-    await expect(page.locator("textarea").first()).toBeEnabled({ timeout: 15_000 });
+    await expect(page.locator("#panel-chat textarea").first()).toBeEnabled({ timeout: 15_000 });
   });
 
   test("code block renders <pre>", async ({ page }) => {
-    const textarea = page.locator("textarea").first();
+    const textarea = page.locator("#panel-chat textarea").first();
     await textarea.fill("```js\nconst x = 1;\n```");
     await page.getByRole("button", { name: /Send/ }).first().click();
 
@@ -194,7 +199,7 @@ test.describe("Desktop ChatTab — Markdown rendering", () => {
   });
 
   test("table renders <table>", async ({ page }) => {
-    const textarea = page.locator("textarea").first();
+    const textarea = page.locator("#panel-chat textarea").first();
     await textarea.fill("| A | B |\n|---|---|\n| 1 | 2 |");
     await page.getByRole("button", { name: /Send/ }).first().click();
 
