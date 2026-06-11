@@ -2366,14 +2366,17 @@ func TestRegister_FailureRecordsLastRegisterFailure(t *testing.T) {
 		WithArgs("ws-reg-fail").
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
 
-	// Update last_register_failure_at on 400 (invalid delivery_mode after auth).
+	// Authenticated post-auth failure: push-mode with no URL 400s at the
+	// url-required check (AFTER requireWorkspaceToken sets authOK=true), so the
+	// deferred handler stamps last_register_failure_at. (An invalid delivery_mode
+	// would 400 BEFORE auth — authOK=false — and must NOT stamp.)
 	mock.ExpectExec("UPDATE workspaces SET last_register_failure_at = now").
 		WithArgs("ws-reg-fail").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
-	body := `{"id":"ws-reg-fail","url":"http://example.com","agent_card":{"name":"test"},"delivery_mode":"invalid"}`
+	body := `{"id":"ws-reg-fail","agent_card":{"name":"test"},"delivery_mode":"push"}`
 	c.Request = httptest.NewRequest("POST", "/registry/register", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
@@ -2431,8 +2434,8 @@ func TestRegister_SuccessClearsLastRegisterFailure(t *testing.T) {
 		WithArgs("ws-reg-ok").
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
 
-	// resolveDeliveryMode
-	mock.ExpectQuery("SELECT delivery_mode FROM workspaces").
+	// resolveDeliveryMode (production selects delivery_mode AND runtime)
+	mock.ExpectQuery("SELECT delivery_mode, runtime FROM workspaces").
 		WithArgs("ws-reg-ok").
 		WillReturnError(sql.ErrNoRows)
 
