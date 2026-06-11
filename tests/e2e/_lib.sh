@@ -160,3 +160,63 @@ except Exception:
     e2e_delete_workspace "$_wid" "$_name"
   done
 }
+
+# e2e_gated_admin_op runs a curl invocation, and if the platform returns
+# 202/pending_approval (the admin-token path hitting approvals.IsGated — see
+# workspace-server/internal/handlers/approval_gate.go), auto-approves via
+# /workspaces/:id/approvals/:approvalId/decide and retries the operation.
+#
+# CR2 RC 10818 made the admin-token gate always-on (it was previously
+# org-token-only with a rollout flag). The E2E API Smoke harness uses the
+# platform admin bearer for workspace CRUD (create/delete), so Delete now
+# returns 202 pending_approval — which broke the smoke's
+# "DELETE /workspaces/:id" + "List after delete (count=1)" + "All deleted
+# (count=0)" assertions (job 468330, exitcode 6, 1m4s, NOT infra).
+#
+# The gate is CORRECT (delete_workspace is destructive; the reviewer's
+# verdict PASSED on all 4 axes). The harness needs the auto-approve loop,
+# NOT a policy.go narrowing — see CR-B 10858 / 10869 / 10870.
+#
+# Usage:
+#   R=$(e2e_gated_admin_op <workspace_id_for_approve> <curl args...>)
+#
+#   The workspace_id is used ONLY to build the /approvals/:id/decide URL
+#   (POST /workspaces has no workspace_id yet; pass "" and the helper
+#   will skip approve-on-202 — the gate never fires for create today).
+#   For DELETE/PATCH/CascadeDelete, pass the target workspace id.
+#
+# This helper preserves the security guarantee: the gate still fires for
+# every admin-token call. The harness is the auto-approver, simulating
+# the human-in-the-loop that production deployments use.
+e2e_gated_admin_op() {
+  local _wid="$1"; shift
+  local _curl_args=("$@")
+  local _resp
+  _resp=$(curl -s "${_curl_args[@]+"${_curl_args[@]}"}")
+  # Detect pending_approval — Python parses + emits the approval_id on stdout
+  # if present, empty string otherwise. JSON parse failure (e.g. 502 HTML) is
+  # treated as "not gated" so the smoke fails on real errors rather than
+  # silently retrying.
+  local _approval_id
+  _approval_id=$(printf '%s' "$_resp" | python3 -c "import json,sys
+try:
+  d=json.load(sys.stdin)
+  if d.get('status')=='pending_approval':
+    print(d.get('approval_id',''))
+except Exception:
+  pass" 2>/dev/null || true)
+  if [ -n "$_approval_id" ] && [ -n "$_wid" ]; then
+    # Auto-approve via the same admin bearer. 200 with approval_id consumed.
+    local _admin_auth=()
+    e2e_admin_auth_args _admin_auth
+    curl -s -X POST "$BASE/workspaces/$_wid/approvals/$_approval_id/decide" \
+      -H "Content-Type: application/json" \
+      -d '{"approved":true,"decided_by":"e2e-api-smoke"}' \
+      ${_admin_auth[@]+"${_admin_auth[@]}"} > /dev/null || true
+    # Retry the original operation. The gate's consume-once
+    # (approval_gate.go UPDATE … RETURNING id) means the SECOND call finds
+    # the now-approved request and proceeds (returns true from gateDestructive).
+    _resp=$(curl -s "${_curl_args[@]+"${_curl_args[@]}"}")
+  fi
+  printf '%s' "$_resp"
+}
