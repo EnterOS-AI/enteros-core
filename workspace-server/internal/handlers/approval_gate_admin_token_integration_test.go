@@ -53,6 +53,15 @@ func integrationDB_AdminTokenGate(t *testing.T) *sql.DB {
 // seedConciergeWorkspace inserts a root workspace (parent_id NULL) that acts as
 // the org concierge / platform agent. The gate's approval rows are keyed by
 // workspace_id, so a real row must exist.
+//
+// (core#2579) This helper ALSO sets the MOLECULE_PLATFORM_WORKSPACE_ID
+// env var to the seeded workspace UUID so the production approvalAnchorForGate(c)
+// logic (workspace-server/internal/handlers/org_tokens.go:approvalAnchorForGate)
+// resolves a real anchor for admin-token callers in the integration tests.
+// Without this env var, approvalAnchorForGate returns "" → the handler
+// returns the controlled 400 "no approval anchor" → the 3 tests that
+// expect 202 (pending_approval) would falsely FAIL. The env var is
+// restored on cleanup.
 func seedConciergeWorkspace(t *testing.T, conn *sql.DB) string {
 	t.Helper()
 	ctx := context.Background()
@@ -64,7 +73,23 @@ func seedConciergeWorkspace(t *testing.T, conn *sql.DB) string {
 	`, wsID, name); err != nil {
 		t.Fatalf("seed concierge workspace: %v", err)
 	}
+
+	// (core#2579) Set the platform-org workspace anchor for admin-token
+	// approval flows. The handler resolves admin-token callers' anchor
+	// from this env var (org_tokens.go:approvalAnchorForGate). Pre-#2579
+	// the tests didn't need this because the gate was INERT for admin
+	// tokens; post-#2579 the gate is always-on for admin-token, so the
+	// anchor must resolve to a real seeded workspace for the gate to
+	// fire (return 202) instead of fail-closed (return 400).
+	prevEnv, hadPrev := os.LookupEnv("MOLECULE_PLATFORM_WORKSPACE_ID")
+	os.Setenv("MOLECULE_PLATFORM_WORKSPACE_ID", wsID)
+
 	t.Cleanup(func() {
+		if hadPrev {
+			os.Setenv("MOLECULE_PLATFORM_WORKSPACE_ID", prevEnv)
+		} else {
+			os.Unsetenv("MOLECULE_PLATFORM_WORKSPACE_ID")
+		}
 		_, _ = conn.ExecContext(ctx, `DELETE FROM approval_requests WHERE workspace_id = $1`, wsID)
 		_, _ = conn.ExecContext(ctx, `DELETE FROM org_api_tokens WHERE name LIKE $1`, name+"%")
 		_, _ = conn.ExecContext(ctx, `DELETE FROM workspace_secrets WHERE workspace_id = $1`, wsID)
