@@ -713,6 +713,7 @@ func (h *RegistryHandler) Heartbeat(c *gin.Context) {
 				uptime_seconds    = $5,
 				current_task      = $6,
 				monthly_spend     = $7,
+				status            = CASE WHEN status = 'provisioning' THEN 'online' ELSE status END,
 				updated_at        = now()
 			WHERE id = $1 AND status != 'removed'
 		`, payload.WorkspaceID, payload.ErrorRate, payload.SampleError,
@@ -727,6 +728,7 @@ func (h *RegistryHandler) Heartbeat(c *gin.Context) {
 				active_tasks      = $4,
 				uptime_seconds    = $5,
 				current_task      = $6,
+				status            = CASE WHEN status = 'provisioning' THEN 'online' ELSE status END,
 				updated_at        = now()
 			WHERE id = $1 AND status != 'removed'
 		`, payload.WorkspaceID, payload.ErrorRate, payload.SampleError,
