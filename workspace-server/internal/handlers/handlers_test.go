@@ -237,9 +237,9 @@ func TestHeartbeatHandler_Normal(t *testing.T) {
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// Expect evaluateStatus SELECT
-	mock.ExpectQuery("SELECT status FROM workspaces WHERE id =").
+	mock.ExpectQuery("SELECT status, last_register_failure_at FROM workspaces WHERE id =").
 		WithArgs("ws-123").
-		WillReturnRows(sqlmock.NewRows([]string{"status"}).AddRow("online"))
+		WillReturnRows(sqlmock.NewRows([]string{"status", "last_register_failure_at"}).AddRow("online", nil))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -276,9 +276,9 @@ func TestHeartbeatHandler_Degraded(t *testing.T) {
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// Expect evaluateStatus SELECT — currently online
-	mock.ExpectQuery("SELECT status FROM workspaces WHERE id =").
+	mock.ExpectQuery("SELECT status, last_register_failure_at FROM workspaces WHERE id =").
 		WithArgs("ws-123").
-		WillReturnRows(sqlmock.NewRows([]string{"status"}).AddRow("online"))
+		WillReturnRows(sqlmock.NewRows([]string{"status", "last_register_failure_at"}).AddRow("online", nil))
 
 	// Expect status transition to degraded
 	mock.ExpectExec("UPDATE workspaces SET status =").
@@ -324,9 +324,9 @@ func TestHeartbeatHandler_Recovery(t *testing.T) {
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// Expect evaluateStatus SELECT — currently degraded
-	mock.ExpectQuery("SELECT status FROM workspaces WHERE id =").
+	mock.ExpectQuery("SELECT status, last_register_failure_at FROM workspaces WHERE id =").
 		WithArgs("ws-123").
-		WillReturnRows(sqlmock.NewRows([]string{"status"}).AddRow("degraded"))
+		WillReturnRows(sqlmock.NewRows([]string{"status", "last_register_failure_at"}).AddRow("degraded", nil))
 
 	// Expect status transition back to online
 	mock.ExpectExec("UPDATE workspaces SET status =").
@@ -720,9 +720,9 @@ func TestHeartbeatHandler_TaskChanged(t *testing.T) {
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// Expect evaluateStatus SELECT
-	mock.ExpectQuery("SELECT status FROM workspaces WHERE id =").
+	mock.ExpectQuery("SELECT status, last_register_failure_at FROM workspaces WHERE id =").
 		WithArgs("ws-123").
-		WillReturnRows(sqlmock.NewRows([]string{"status"}).AddRow("online"))
+		WillReturnRows(sqlmock.NewRows([]string{"status", "last_register_failure_at"}).AddRow("online", nil))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -906,9 +906,9 @@ func TestHeartbeatHandler_TaskUnchanged(t *testing.T) {
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// Expect evaluateStatus SELECT
-	mock.ExpectQuery("SELECT status FROM workspaces WHERE id =").
+	mock.ExpectQuery("SELECT status, last_register_failure_at FROM workspaces WHERE id =").
 		WithArgs("ws-123").
-		WillReturnRows(sqlmock.NewRows([]string{"status"}).AddRow("online"))
+		WillReturnRows(sqlmock.NewRows([]string{"status", "last_register_failure_at"}).AddRow("online", nil))
 
 	// NO TASK_UPDATED broadcast expected — task didn't change
 
@@ -949,9 +949,9 @@ func TestHeartbeatHandler_TaskCleared(t *testing.T) {
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// Expect evaluateStatus SELECT
-	mock.ExpectQuery("SELECT status FROM workspaces WHERE id =").
+	mock.ExpectQuery("SELECT status, last_register_failure_at FROM workspaces WHERE id =").
 		WithArgs("ws-123").
-		WillReturnRows(sqlmock.NewRows([]string{"status"}).AddRow("online"))
+		WillReturnRows(sqlmock.NewRows([]string{"status", "last_register_failure_at"}).AddRow("online", nil))
 
 	// TASK_UPDATED broadcast expected — changed from "old task" to ""
 	// (BroadcastOnly doesn't hit sqlmock, so no expectation needed)
@@ -1008,9 +1008,9 @@ func TestHeartbeatHandler_AlwaysBroadcastsHeartbeat(t *testing.T) {
 	mock.ExpectExec("UPDATE workspaces SET").
 		WithArgs("ws-123", 0.0, "", 1, 500, "doing work").
 		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectQuery("SELECT status FROM workspaces WHERE id =").
+	mock.ExpectQuery("SELECT status, last_register_failure_at FROM workspaces WHERE id =").
 		WithArgs("ws-123").
-		WillReturnRows(sqlmock.NewRows([]string{"status"}).AddRow("online"))
+		WillReturnRows(sqlmock.NewRows([]string{"status", "last_register_failure_at"}).AddRow("online", nil))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
