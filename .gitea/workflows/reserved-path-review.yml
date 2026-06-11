@@ -16,27 +16,30 @@
 # path. Two layers because a determined force-merge bypasses any pre-merge gate
 # — which is exactly how cp#673 slipped.
 #
-# SECURITY MODEL (mirrors audit-force-merge.yml): pull_request_target, but
-# with a refined checkout strategy that fixes the bootstrap / self-reference
-# problem:
-#   - The SCRIPT is checked out from the PR HEAD so it's always present,
-#     including on the bootstrap PR that INTRODUCES the gate itself
-#     (otherwise `bash .gitea/scripts/reserved-path-review.sh` would
-#     fail with "No such file or directory" — the gate would gate the
-#     very PR that adds the gate, an unfixable self-reference loop).
-#   - The reserved-paths MANIFEST (.gitea/reserved-paths.txt) is read
-#     from the BASE branch via `git show`, with a graceful fallback to
-#     the head's manifest ONLY for the bootstrap PR (the single PR that
-#     adds the manifest to the base). This preserves the original security
-#     intent: a PR author cannot widen the gate by adding new reserved
-#     patterns in their own PR (the manifest is base-sourced for every
-#     steady-state PR; only the bootstrap PR is the documented exception).
-#   - The SCRIPT itself is then un-tamperable in the steady state: a PR
-#     author cannot edit the gate logic to skip a reserved path on their
-#     own PR — base.sha pinning of the manifest, plus the SCRIPT
-#     deliberately checked out from the PR head (the gate's own
-#     bootstrap path) gives the standard "PR-author-can't-tamper"
-#     model once the gate is in place on base.
+# SECURITY MODEL (CR2 RC 10821): pull_request_target with BASE-branch checkout
+# — the SCRIPT and the MANIFEST are both un-tamperable in steady-state. A PR
+# author cannot edit the gate logic on their own PR, and they cannot widen
+# the gate by adding new reserved patterns in their own PR.
+#
+# Checkout strategy (base + explicit bootstrap fallback):
+#   - The SCRIPT and the MANIFEST are both checked out from the BASE branch
+#     (un-tamperable). The working tree contains BASE's version of every
+#     file. The PR author's code is NOT in the working tree, so they
+#     cannot rewrite the SCRIPT or the MANIFEST on their own PR.
+#   - Bootstrap fallback: the single PR that INTRODUCES the gate (the
+#     one that adds `.gitea/scripts/reserved-path-review.sh` to base) has
+#     no SCRIPT on BASE yet. The workflow detects `[ ! -f script ]` and
+#     pulls the SCRIPT from PR HEAD via `git fetch` + `git show`. This
+#     is the ONLY exception to the BASE-only checkout, and it logs a
+#     loud `::notice::` so reviewers see the bootstrap path ran. Every
+#     later PR will have the SCRIPT on BASE, so the fallback is a no-op.
+#   - The MANIFEST is read from BASE via `git show base.sha:.gitea/...`
+#     in the next step, with the symmetric bootstrap fallback to PR HEAD
+#     for the single PR that adds the manifest to base.
+#   - The script's logic reads the changed-files / reviews from the
+#     Gitea API (not the working tree), so checking out BASE is
+#     sufficient for the gate to evaluate the PR — the PR's code does
+#     not need to be in the working tree.
 
 name: reserved-path-review
 
@@ -60,13 +63,39 @@ jobs:
     # ready_for_review (above) when the draft is promoted.
     if: github.event.pull_request.draft == false
     steps:
-      - name: Check out PR HEAD (the gate SCRIPT must be present, including on the bootstrap PR)
+      - name: Check out BASE branch (SCRIPT un-tamperable in steady-state)
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
-          # PR head, NOT base ref — the gate SCRIPT itself must come from the PR
-          # (the bootstrap PR is the one that adds the script; without this
-          # the gate would never run on its own introducing PR).
-          ref: ${{ github.event.pull_request.head.sha }}
+          # BASE ref, NOT head — the SCRIPT (and every other gate asset)
+          # is un-tamperable on the PR author's own PR in steady-state.
+          # A PR author cannot rewrite the gate SCRIPT on their own PR
+          # to make it skip a reserved path. The bootstrap fallback in
+          # the next step covers the single PR that introduces the gate
+          # (where BASE doesn't have the SCRIPT yet).
+          ref: ${{ github.event.pull_request.base.sha }}
+      - name: Bootstrap fallback for the gate SCRIPT (only when base lacks it)
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          SCRIPT_PATH=".gitea/scripts/reserved-path-review.sh"
+          if [ ! -f "$SCRIPT_PATH" ]; then
+            # The BASE branch lacks the gate SCRIPT (the single PR that
+            # introduces the gate). Bootstrap fallback: pull the SCRIPT
+            # from PR HEAD via `git fetch` + `git show`. The MANIFEST
+            # (handled by the next step) and the API-driven changed-files
+            # / reviews logic are independent of the PR's code, so the
+            # SCRIPT is the only piece that needs to be present locally.
+            # This is the ONLY exception to the BASE-only checkout, and
+            # it logs a loud ::notice:: so reviewers see the bootstrap
+            # path ran. Every later PR will have the SCRIPT on BASE, so
+            # the fallback is a no-op.
+            echo "::notice::BASE branch lacks the gate SCRIPT — bootstrap fallback to PR head's SCRIPT (head.sha=${HEAD_SHA:0:10}). This is expected for the single PR that introduces the gate; every later PR will use the base's SCRIPT."
+            git fetch --depth=1 origin "${HEAD_SHA}" 2>/dev/null || git fetch origin "${HEAD_SHA}"
+            mkdir -p "$(dirname "$SCRIPT_PATH")"
+            git show "${HEAD_SHA}:${SCRIPT_PATH}" > "$SCRIPT_PATH"
+            chmod +x "$SCRIPT_PATH"
+          fi
       - name: Fetch BASE-branch reserved-paths manifest (security model)
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}

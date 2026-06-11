@@ -19,6 +19,13 @@
 #   T4  — manifest has one pattern, changed file does NOT match -> success (N/A)
 #   T5  — manifest has one pattern, changed file matches -> no N/A branch
 #   T6  — matcher's exit code 0/1/2 are all distinct (contract pin)
+#        T6a-d  bash -n + script's case statement pins (FAIL-CLOSED)
+#        T6d    workflow checks out BASE (CR2 RC 10821, SCRIPT un-tamperable)
+#        T6d-bootstrap  workflow has bootstrap fallback for the SCRIPT
+#        T6e    workflow fetches MANIFEST from BASE via git show
+#        T6f    workflow logs the manifest bootstrap fallback
+#        T6g    workflow has no unconditional-pass shortcut
+#        T6h    workflow passes RESERVED_PATHS_FILE explicitly
 #   T7  — bash syntax check (bash -n passes) for the live script
 #
 # Note: the script is the PREVENTIVE layer; the DETECTIVE backstop
@@ -197,18 +204,33 @@ else
   fail "T6c: live script missing the fail-closed log line"
 fi
 
-# T6d: checkout-ref contract pin — the workflow's checkout step must
-# check out the PR HEAD, NOT the base ref. The bootstrap PR that
-# introduces the script (this one) would fail with "No such file or
-# directory" if the workflow checked out base, because the script does
-# not exist on base yet. The fix is to checkout head so the gate SCRIPT
-# is always present, while the manifest is read from base via git show
-# (with a bootstrap fallback for the introducing PR).
-if grep -qE "Check out PR HEAD" "$WORKFLOW" \
-   && grep -qE "github\.event\.pull_request\.head\.sha" "$WORKFLOW"; then
-  pass "T6d: workflow checks out PR HEAD (so the gate script is present, including on the bootstrap PR)"
+# T6d: checkout-ref contract pin (CR2 RC 10821 — SCRIPT un-tamperable).
+# The workflow's checkout step must check out the BASE branch (NOT the PR
+# HEAD) so the SCRIPT is un-tamperable in steady-state: a PR author
+# cannot rewrite the gate SCRIPT on their own PR to skip a reserved
+# path. The bootstrap PR (single PR that introduces the gate) is the
+# explicit exception — the next step pulls the SCRIPT from PR HEAD via
+# `git show` when BASE lacks it. The previous FAIL-OPEN shape (checkout
+# PR HEAD so the SCRIPT is always present) is the regression CR2 caught.
+if grep -qE "Check out BASE branch" "$WORKFLOW" \
+   && grep -qE "github\.event\.pull_request\.base\.sha" "$WORKFLOW"; then
+  pass "T6d: workflow checks out BASE branch (SCRIPT un-tamperable; bootstrap fallback for the introducing PR is in the next step)"
 else
-  fail "T6d: workflow still checks out base (will fail with 'No such file or directory' on the bootstrap PR). Inspect reserved-path-review.yml."
+  fail "T6d: workflow still checks out PR HEAD (PR author can tamper with the gate SCRIPT on their own PR — CR2 RC 10821 regression). Inspect reserved-path-review.yml."
+fi
+
+# T6d-bootstrap: bootstrap-fallback for the SCRIPT contract pin. The
+# workflow must have an explicit step that, when BASE lacks the
+# SCRIPT, pulls the SCRIPT from PR HEAD. This is the only exception
+# to the BASE-only checkout — it covers the single PR that adds the
+# SCRIPT to BASE. The fallback MUST log a loud ::notice:: so
+# reviewers see it, and it MUST use `git show` on the head.sha (so
+# the head is fetched only when needed).
+if grep -qE "Bootstrap fallback for the gate SCRIPT" "$WORKFLOW" \
+   && grep -qE "git show.*HEAD_SHA.*(reserved-path-review\.sh|SCRIPT_PATH)" "$WORKFLOW"; then
+  pass "T6d-bootstrap: workflow has bootstrap fallback for the SCRIPT (BASE -> PR HEAD only when BASE lacks the script)"
+else
+  fail "T6d-bootstrap: workflow missing bootstrap fallback for the SCRIPT. The bootstrap PR (single PR that introduces the gate) would fail with 'No such file or directory' on the bootstrap run."
 fi
 
 # T6e: base-manifest fetch contract pin — the workflow must use
