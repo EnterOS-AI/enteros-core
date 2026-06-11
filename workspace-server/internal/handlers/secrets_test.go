@@ -1333,22 +1333,24 @@ func TestSecretsSet_SpoofedHeader_DoesNotSuppressRestart(t *testing.T) {
 	restartFunc := func(wsID string) { restarted <- wsID }
 	handler := NewSecretsHandler(restartFunc)
 
-	// Token lookup: the bearer resolves to ws-caller, NOT ws-target.
+	// #2584: production order is INSERT (mutation) THEN callerWorkspaceID
+	// (the bearer-token lookup) — sqlmock is ordered, so expect INSERT first.
+	mock.ExpectExec("INSERT INTO workspace_secrets").
+		WithArgs("550e8400-e29b-41d4-a716-446655440000", "DB_PASS", sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// Token lookup: the bearer resolves to ws-caller, NOT the target.
 	mock.ExpectQuery(`SELECT t\.id, t\.workspace_id.*FROM workspace_auth_tokens t.*JOIN workspaces`).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "workspace_id"}).AddRow("tok-1", "ws-caller"))
 
-	mock.ExpectExec("INSERT INTO workspace_secrets").
-		WithArgs("ws-target", "DB_PASS", sqlmock.AnyArg(), sqlmock.AnyArg()).
-		WillReturnResult(sqlmock.NewResult(0, 1))
-
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
-	c.Params = gin.Params{{Key: "id", Value: "ws-target"}}
+	c.Params = gin.Params{{Key: "id", Value: "550e8400-e29b-41d4-a716-446655440000"}}
 	body := `{"key":"DB_PASS","value":"password123"}`
-	c.Request = httptest.NewRequest("POST", "/workspaces/ws-target/secrets", bytes.NewBufferString(body))
+	c.Request = httptest.NewRequest("POST", "/workspaces/550e8400-e29b-41d4-a716-446655440000/secrets", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 	c.Request.Header.Set("Authorization", "Bearer fake-workspace-token")
-	c.Request.Header.Set("X-Workspace-ID", "ws-target") // spoofed to match target
+	c.Request.Header.Set("X-Workspace-ID", "550e8400-e29b-41d4-a716-446655440000") // spoofed to match target
 
 	handler.Set(c)
 
@@ -1358,8 +1360,8 @@ func TestSecretsSet_SpoofedHeader_DoesNotSuppressRestart(t *testing.T) {
 
 	select {
 	case id := <-restarted:
-		if id != "ws-target" {
-			t.Fatalf("expected restart of ws-target, got %s", id)
+		if id != "550e8400-e29b-41d4-a716-446655440000" {
+			t.Fatalf("expected restart of target workspace, got %s", id)
 		}
 		// restart fired — spoofed header did NOT suppress it
 	case <-time.After(200 * time.Millisecond):
@@ -1381,19 +1383,22 @@ func TestSecretsDelete_SpoofedHeader_DoesNotSuppressRestart(t *testing.T) {
 	restartFunc := func(wsID string) { restarted <- wsID }
 	handler := NewSecretsHandler(restartFunc)
 
+	// #2584: production order is DELETE (mutation) THEN callerWorkspaceID
+	// (the bearer-token lookup) — sqlmock is ordered, so expect DELETE first.
+	mock.ExpectExec("DELETE FROM workspace_secrets").
+		WithArgs("550e8400-e29b-41d4-a716-446655440000", "DB_PASS").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// Token lookup: the bearer resolves to ws-caller, NOT the target.
 	mock.ExpectQuery(`SELECT t\.id, t\.workspace_id.*FROM workspace_auth_tokens t.*JOIN workspaces`).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "workspace_id"}).AddRow("tok-1", "ws-caller"))
 
-	mock.ExpectExec("DELETE FROM workspace_secrets").
-		WithArgs("ws-target", "DB_PASS").
-		WillReturnResult(sqlmock.NewResult(0, 1))
-
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
-	c.Params = gin.Params{{Key: "id", Value: "ws-target"}, {Key: "key", Value: "DB_PASS"}}
-	c.Request = httptest.NewRequest("DELETE", "/workspaces/ws-target/secrets/DB_PASS", nil)
+	c.Params = gin.Params{{Key: "id", Value: "550e8400-e29b-41d4-a716-446655440000"}, {Key: "key", Value: "DB_PASS"}}
+	c.Request = httptest.NewRequest("DELETE", "/workspaces/550e8400-e29b-41d4-a716-446655440000/secrets/DB_PASS", nil)
 	c.Request.Header.Set("Authorization", "Bearer fake-workspace-token")
-	c.Request.Header.Set("X-Workspace-ID", "ws-target") // spoofed
+	c.Request.Header.Set("X-Workspace-ID", "550e8400-e29b-41d4-a716-446655440000") // spoofed
 
 	handler.Delete(c)
 
@@ -1403,8 +1408,8 @@ func TestSecretsDelete_SpoofedHeader_DoesNotSuppressRestart(t *testing.T) {
 
 	select {
 	case id := <-restarted:
-		if id != "ws-target" {
-			t.Fatalf("expected restart of ws-target, got %s", id)
+		if id != "550e8400-e29b-41d4-a716-446655440000" {
+			t.Fatalf("expected restart of target workspace, got %s", id)
 		}
 	case <-time.After(200 * time.Millisecond):
 		t.Fatal("restart MUST fire on DELETE when token-derived caller differs from target")
@@ -1427,12 +1432,15 @@ func TestSetGlobal_SpoofedHeader_DoesNotSuppressRestart(t *testing.T) {
 	restartFunc := func(wsID string) { restarted <- wsID }
 	handler := NewSecretsHandler(restartFunc)
 
-	mock.ExpectQuery(`SELECT t\.id, t\.workspace_id.*FROM workspace_auth_tokens t.*JOIN workspaces`).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "workspace_id"}).AddRow("tok-1", "ws-caller"))
-
+	// #2584: production order is INSERT (mutation) THEN callerWorkspaceID
+	// (the bearer-token lookup), THEN the affected-workspaces fan-out query.
 	mock.ExpectExec("INSERT INTO global_secrets").
 		WithArgs("GLOBAL_KEY", sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// Token lookup: bearer resolves to ws-caller (the exclusion), NOT the spoofed header.
+	mock.ExpectQuery(`SELECT t\.id, t\.workspace_id.*FROM workspace_auth_tokens t.*JOIN workspaces`).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "workspace_id"}).AddRow("tok-1", "ws-caller"))
 
 	// Affected workspaces: ws-target (does NOT have an overriding workspace secret).
 	mock.ExpectQuery("SELECT id FROM workspaces").
@@ -1478,12 +1486,15 @@ func TestDeleteGlobal_SpoofedHeader_DoesNotSuppressRestart(t *testing.T) {
 	restartFunc := func(wsID string) { restarted <- wsID }
 	handler := NewSecretsHandler(restartFunc)
 
-	mock.ExpectQuery(`SELECT t\.id, t\.workspace_id.*FROM workspace_auth_tokens t.*JOIN workspaces`).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "workspace_id"}).AddRow("tok-1", "ws-caller"))
-
+	// #2584: production order is DELETE (mutation) THEN callerWorkspaceID
+	// (the bearer-token lookup), THEN the affected-workspaces fan-out query.
 	mock.ExpectExec("DELETE FROM global_secrets").
 		WithArgs("GLOBAL_KEY").
 		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// Token lookup: bearer resolves to ws-caller (the exclusion), NOT the spoofed header.
+	mock.ExpectQuery(`SELECT t\.id, t\.workspace_id.*FROM workspace_auth_tokens t.*JOIN workspaces`).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "workspace_id"}).AddRow("tok-1", "ws-caller"))
 
 	mock.ExpectQuery("SELECT id FROM workspaces").
 		WithArgs("GLOBAL_KEY").
