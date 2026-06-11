@@ -8,7 +8,7 @@
 //
 //   docker run --rm -d --name pg-mem-integ \
 //     -e POSTGRES_PASSWORD=test -e POSTGRES_DB=molecule \
-//     -p 55432:5432 postgres:15-alpine
+//     -p 55432:5432 pgvector/pgvector:pg15-alpine
 //   sleep 4
 //   psql ... < workspace-server/cmd/memory-plugin-postgres/migrations/001_memory_v2.up.sql
 //   cd workspace-server
@@ -82,6 +82,13 @@ func memoryIntegrationDB(t *testing.T) *sql.DB {
 	// Apply memory plugin schema if tables are missing (the CI workflow
 	// only applies workspace-server/migrations/*.sql, not the plugin's
 	// own migrations under cmd/memory-plugin-postgres/migrations/).
+	//
+	// We create the pgvector extension first so the vector(1536) column
+	// type resolves. If the extension is unavailable, the test skips
+	// rather than failing with an opaque "relation does not exist".
+	if _, err := conn.ExecContext(ctx, `CREATE EXTENSION IF NOT EXISTS vector;`); err != nil {
+		t.Skipf("pgvector extension unavailable — memory integration tests require pgvector: %v", err)
+	}
 	if _, err := conn.ExecContext(ctx, `
 		CREATE TABLE IF NOT EXISTS memory_namespaces (
 		    name        TEXT PRIMARY KEY,
@@ -104,21 +111,21 @@ func memoryIntegrationDB(t *testing.T) *sql.DB {
 		    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 		);
 	`); err != nil {
-		// vector extension may not be available in lightweight test postgres.
-		// If the tables already exist from a previous test, we're fine.
-		if !strings.Contains(err.Error(), "already exists") {
-			t.Logf("memory schema apply (may be pre-existing): %v", err)
-		}
+		t.Fatalf("memory schema apply failed: %v", err)
 	}
 
 	// Clean slate: delete all memory rows so tests are hermetic.
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel2()
 	if _, err := conn.ExecContext(ctx2, `DELETE FROM memory_records`); err != nil {
-		t.Fatalf("cleanup memory_records: %v", err)
+		if !strings.Contains(err.Error(), "does not exist") {
+			t.Fatalf("cleanup memory_records: %v", err)
+		}
 	}
 	if _, err := conn.ExecContext(ctx2, `DELETE FROM memory_namespaces`); err != nil {
-		t.Fatalf("cleanup memory_namespaces: %v", err)
+		if !strings.Contains(err.Error(), "does not exist") {
+			t.Fatalf("cleanup memory_namespaces: %v", err)
+		}
 	}
 
 	t.Cleanup(func() { conn.Close() })
