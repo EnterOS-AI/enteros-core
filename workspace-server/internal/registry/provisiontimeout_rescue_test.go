@@ -51,7 +51,7 @@ func TestSweep_RescueFiresOnBootFailureVerdict(t *testing.T) {
 	rec := withRescueHook(t)
 
 	mock.ExpectQuery(`SELECT id, COALESCE\(runtime, ''\), COALESCE\(instance_id, ''\), EXTRACT`).
-		WillReturnRows(candidateRows([4]any{"ws-stuck", "codex", "i-0badf00d", 700}))
+		WillReturnRows(candidateRows([4]any{"ws-stuck", "codex", "i-0badf00d", 800}))
 	mock.ExpectExec(`UPDATE workspaces`).
 		WithArgs("ws-stuck", sqlmock.AnyArg(), sqlmock.AnyArg(), models.StatusFailed).
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -76,7 +76,7 @@ func TestSweep_RescueDoesNotFireOnRace(t *testing.T) {
 	rec := withRescueHook(t)
 
 	mock.ExpectQuery(`SELECT id, COALESCE\(runtime, ''\), COALESCE\(instance_id, ''\), EXTRACT`).
-		WillReturnRows(candidateRows([4]any{"ws-raced", "codex", "i-raced", 700}))
+		WillReturnRows(candidateRows([4]any{"ws-raced", "codex", "i-raced", 800}))
 	mock.ExpectExec(`UPDATE workspaces`).
 		WithArgs("ws-raced", sqlmock.AnyArg(), sqlmock.AnyArg(), models.StatusFailed).
 		WillReturnResult(sqlmock.NewResult(0, 0)) // raced — 0 rows
@@ -116,7 +116,7 @@ func TestSweep_RescueNilHookIsSafe(t *testing.T) {
 	t.Cleanup(func() { BootFailureRescueHook = prev })
 
 	mock.ExpectQuery(`SELECT id, COALESCE\(runtime, ''\), COALESCE\(instance_id, ''\), EXTRACT`).
-		WillReturnRows(candidateRows([4]any{"ws-stuck", "codex", "i-x", 700}))
+		WillReturnRows(candidateRows([4]any{"ws-stuck", "codex", "i-x", 800}))
 	mock.ExpectExec(`UPDATE workspaces`).
 		WithArgs("ws-stuck", sqlmock.AnyArg(), sqlmock.AnyArg(), models.StatusFailed).
 		WillReturnResult(sqlmock.NewResult(0, 1))

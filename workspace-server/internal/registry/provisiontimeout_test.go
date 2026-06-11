@@ -60,9 +60,9 @@ func candidateRows(rows ...[4]any) *sqlmock.Rows {
 func TestSweepStuckProvisioning_FlipsOverdue(t *testing.T) {
 	mock := setupTestDB(t)
 
-	// claude-code workspace, 700s old > 600s default timeout → flipped.
+	// claude-code workspace, 800s old > 720s default timeout → flipped.
 	mock.ExpectQuery(`SELECT id, COALESCE\(runtime, ''\), COALESCE\(instance_id, ''\), EXTRACT`).
-		WillReturnRows(candidateRows([4]any{"ws-stuck", "claude-code", "i-stuck", 700}))
+		WillReturnRows(candidateRows([4]any{"ws-stuck", "claude-code", "i-stuck", 800}))
 
 	mock.ExpectExec(`UPDATE workspaces`).
 		WithArgs("ws-stuck", sqlmock.AnyArg(), sqlmock.AnyArg(), models.StatusFailed).
@@ -147,7 +147,7 @@ func TestSweepStuckProvisioning_HermesPastDeadline(t *testing.T) {
 // unit test would catch it. This test fails on that refactor too.
 //
 // Scenario: a claude-code workspace 11 min old (660s). Default budget
-// is 10 min (600s) → without manifest override, this would be flipped
+// is 12 min (720s) → without manifest override, this would be flipped
 // to failed. Manifest override declares 1200s → it should be SPARED.
 // No UPDATE, no event emitted.
 func TestSweepStuckProvisioning_ManifestOverrideSparesRow(t *testing.T) {
@@ -225,7 +225,7 @@ func TestSweepStuckProvisioning_RaceSafe(t *testing.T) {
 	mock := setupTestDB(t)
 
 	mock.ExpectQuery(`SELECT id, COALESCE\(runtime, ''\), COALESCE\(instance_id, ''\), EXTRACT`).
-		WillReturnRows(candidateRows([4]any{"ws-raced", "claude-code", "i-raced", 700}))
+		WillReturnRows(candidateRows([4]any{"ws-raced", "claude-code", "i-raced", 800}))
 
 	mock.ExpectExec(`UPDATE workspaces`).
 		WithArgs("ws-raced", sqlmock.AnyArg(), sqlmock.AnyArg(), models.StatusFailed).
@@ -263,14 +263,14 @@ func TestSweepStuckProvisioning_NoStuck(t *testing.T) {
 
 // TestSweepStuckProvisioning_MultipleStuck covers the realistic case where
 // both agents (claude-code + hermes) are stuck — both should get flipped
-// and both should get events. claude-code at 11 min (over its 10-min
+// and both should get events. claude-code at ~13 min (over its 12-min
 // limit), hermes at 31 min (over its 30-min limit).
 func TestSweepStuckProvisioning_MultipleStuck(t *testing.T) {
 	mock := setupTestDB(t)
 
 	mock.ExpectQuery(`SELECT id, COALESCE\(runtime, ''\), COALESCE\(instance_id, ''\), EXTRACT`).
 		WillReturnRows(candidateRows(
-			[4]any{"ws-claude-code", "claude-code", "i-cc", 700},
+			[4]any{"ws-claude-code", "claude-code", "i-cc", 800},
 			[4]any{"ws-hermes", "hermes", "i-hh", 1860},
 		))
 
@@ -296,7 +296,7 @@ func TestSweepStuckProvisioning_BroadcastFailureDoesNotCrash(t *testing.T) {
 	mock := setupTestDB(t)
 
 	mock.ExpectQuery(`SELECT id, COALESCE\(runtime, ''\), COALESCE\(instance_id, ''\), EXTRACT`).
-		WillReturnRows(candidateRows([4]any{"ws-stuck", "claude-code", "i-stuck", 700}))
+		WillReturnRows(candidateRows([4]any{"ws-stuck", "claude-code", "i-stuck", 800}))
 	mock.ExpectExec(`UPDATE workspaces`).
 		WithArgs("ws-stuck", sqlmock.AnyArg(), sqlmock.AnyArg(), models.StatusFailed).
 		WillReturnResult(sqlmock.NewResult(0, 1))
