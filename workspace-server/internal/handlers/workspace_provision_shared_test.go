@@ -1314,7 +1314,7 @@ func TestApplyPlatformManagedLLMEnv_DERIVED_ByokNoCredentialFailsClosed(t *testi
 		WithArgs(wsID).
 		WillReturnRows(sqlmock.NewRows([]string{"llm_billing_mode"}).AddRow(nil)) // NO override → derive
 
-	t.Setenv("MOLECULE_LLM_BILLING_MODE", LLMBillingModePlatformManaged) // org env IGNORED now
+	t.Setenv("MOLECULE_LLM_BILLING_MODE", "") // no org default; derivation decides
 	t.Setenv("MOLECULE_LLM_BASE_URL", "https://api.example.test/api/v1/internal/llm/openai/v1")
 	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
 
