@@ -63,6 +63,22 @@ func (a *pgpluginAdapter) ForgetMemory(ctx context.Context, id string, _ contrac
 	return a.store.ForgetMemory(ctx, id, "")
 }
 
+// seedWorkspace inserts a workspaces row and returns its UUID. The
+// namespace resolver (and the handler's parent-id check for GLOBAL)
+// both need a real row with a valid UUID.
+func seedWorkspace(t *testing.T, conn *sql.DB, name string) string {
+	t.Helper()
+	var id string
+	if err := conn.QueryRowContext(context.Background(), `
+		INSERT INTO workspaces (id, name, status)
+		VALUES (gen_random_uuid(), $1, 'online')
+		RETURNING id
+	`, name).Scan(&id); err != nil {
+		t.Fatalf("seedWorkspace %q: %v", name, err)
+	}
+	return id
+}
+
 // memoryIntegrationDB returns a real postgres connection for memory tests.
 // It applies the memory plugin schema if missing and cleans up tables on
 // t.Cleanup so tests are hermetic.
@@ -144,13 +160,14 @@ func TestIntegration_MemoriesCommit_NoNamespace_UpsertsAndWrites(t *testing.T) {
 	conn := memoryIntegrationDB(t)
 	gin.SetMode(gin.TestMode)
 
+	wsID := seedWorkspace(t, conn, "fk-integ-ws")
 	adapter := &pgpluginAdapter{store: pgplugin.NewStore(conn)}
 	resolver := namespace.New(conn)
 	handler := NewMemoriesHandler().withMemoryV2APIs(adapter, resolver)
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
-	c.Params = gin.Params{{Key: "id", Value: "ws-fk-integ"}}
+	c.Params = gin.Params{{Key: "id", Value: wsID}}
 	c.Request = httptest.NewRequest("POST", "/", bytes.NewBufferString(`{"content":"integration test memory","scope":"LOCAL"}`))
 	c.Request.Header.Set("Content-Type", "application/json")
 
@@ -163,7 +180,7 @@ func TestIntegration_MemoriesCommit_NoNamespace_UpsertsAndWrites(t *testing.T) {
 	// Verify the namespace row was auto-created.
 	var nsCount int
 	err := conn.QueryRowContext(context.Background(),
-		`SELECT count(*) FROM memory_namespaces WHERE name = $1`, "workspace:ws-fk-integ").Scan(&nsCount)
+		`SELECT count(*) FROM memory_namespaces WHERE name = $1`, "workspace:"+wsID).Scan(&nsCount)
 	if err != nil {
 		t.Fatalf("select namespace: %v", err)
 	}
@@ -175,7 +192,7 @@ func TestIntegration_MemoriesCommit_NoNamespace_UpsertsAndWrites(t *testing.T) {
 	var memCount int
 	err = conn.QueryRowContext(context.Background(),
 		`SELECT count(*) FROM memory_records WHERE namespace = $1 AND content = $2`,
-		"workspace:ws-fk-integ", "integration test memory").Scan(&memCount)
+		"workspace:"+wsID, "integration test memory").Scan(&memCount)
 	if err != nil {
 		t.Fatalf("select memory record: %v", err)
 	}
@@ -191,19 +208,21 @@ func TestIntegration_MemoriesCommit_NamespaceAlreadyExists_Idempotent(t *testing
 	conn := memoryIntegrationDB(t)
 	gin.SetMode(gin.TestMode)
 
+	wsID := seedWorkspace(t, conn, "warm-ws")
 	store := pgplugin.NewStore(conn)
 	adapter := &pgpluginAdapter{store: store}
 	resolver := namespace.New(conn)
 	handler := NewMemoriesHandler().withMemoryV2APIs(adapter, resolver)
 
+	nsName := "workspace:" + wsID
 	// Pre-seed the namespace.
-	if _, err := store.UpsertNamespace(context.Background(), "workspace:ws-warm", contract.NamespaceUpsert{Kind: contract.NamespaceKindWorkspace}); err != nil {
+	if _, err := store.UpsertNamespace(context.Background(), nsName, contract.NamespaceUpsert{Kind: contract.NamespaceKindWorkspace}); err != nil {
 		t.Fatalf("pre-seed namespace: %v", err)
 	}
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
-	c.Params = gin.Params{{Key: "id", Value: "ws-warm"}}
+	c.Params = gin.Params{{Key: "id", Value: wsID}}
 	c.Request = httptest.NewRequest("POST", "/", bytes.NewBufferString(`{"content":"warm path memory","scope":"LOCAL"}`))
 	c.Request.Header.Set("Content-Type", "application/json")
 
@@ -216,7 +235,7 @@ func TestIntegration_MemoriesCommit_NamespaceAlreadyExists_Idempotent(t *testing
 	// Must still be exactly one namespace row.
 	var nsCount int
 	err := conn.QueryRowContext(context.Background(),
-		`SELECT count(*) FROM memory_namespaces WHERE name = $1`, "workspace:ws-warm").Scan(&nsCount)
+		`SELECT count(*) FROM memory_namespaces WHERE name = $1`, nsName).Scan(&nsCount)
 	if err != nil {
 		t.Fatalf("select namespace: %v", err)
 	}
