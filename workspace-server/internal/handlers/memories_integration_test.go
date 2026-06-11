@@ -84,10 +84,11 @@ func memoryIntegrationDB(t *testing.T) *sql.DB {
 	// own migrations under cmd/memory-plugin-postgres/migrations/).
 	//
 	// We create the pgvector extension first so the vector(1536) column
-	// type resolves. If the extension is unavailable, the test skips
-	// rather than failing with an opaque "relation does not exist".
+	// type resolves. The CI workflow uses pgvector/pgvector:pg15 and
+	// creates the extension before migrations; if it is still missing here,
+	// the test environment is mis-configured and must fail loud.
 	if _, err := conn.ExecContext(ctx, `CREATE EXTENSION IF NOT EXISTS vector;`); err != nil {
-		t.Skipf("pgvector extension unavailable — memory integration tests require pgvector: %v", err)
+		t.Fatalf("pgvector extension unavailable — memory integration tests require pgvector: %v", err)
 	}
 	if _, err := conn.ExecContext(ctx, `
 		CREATE TABLE IF NOT EXISTS memory_namespaces (

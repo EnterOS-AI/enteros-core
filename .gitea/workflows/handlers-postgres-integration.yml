@@ -208,6 +208,16 @@ jobs:
             echo "waiting for postgres at ${PG_HOST}:5432..."; sleep 2
           done
 
+          # core#2540: pgvector extension must be present BEFORE any migration
+          # or integration test that uses the vector(1536) type. The
+          # pgvector/pgvector:pg15 image ships the extension files but the
+          # extension is NOT auto-created in each database — we do it here
+          # once so both migrations (031_memories_pgvector) and handler
+          # integration tests (memories_integration_test.go) see the type.
+          psql -h "${PG_HOST}" -U postgres -d molecule -c \
+            "CREATE EXTENSION IF NOT EXISTS vector;" >/dev/null
+          echo "✓ pgvector extension ensured"
+
           # Apply every .up.sql in lexicographic order with
           # ON_ERROR_STOP=0 — failing migrations are SKIPPED rather than
           # blocking the suite. This handles the current schema state
