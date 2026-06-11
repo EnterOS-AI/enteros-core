@@ -1,0 +1,57 @@
+# reserved-path-review — PREVENTIVE layer of the self-merge guard.
+#
+# Precedent: cp#673 was author-self-merged (architectural change reserved for
+# CTO sign-off) without independent reserved-gate approval. Code was sound +
+# peer-reviewed so it was kept (accept-and-note, CTO 2026-06-11); this gate
+# closes the recurrence path.
+#
+# For any PR that touches a path in `.gitea/reserved-paths.txt`, this emits a
+# required commit status `reserved-path-review` that is RED until a DISTINCT
+# non-author (author != approver) approves the current head. Branch protection
+# requires the `reserved-path-review` context, so such a PR cannot be merged
+# via the normal path without independent sign-off.
+#
+# DETECTIVE backstop (admin/force-merge bypass): audit-force-merge.sh emits
+# `incident.reserved_self_merge` post-merge when author == merger on a reserved
+# path. Two layers because a determined force-merge bypasses any pre-merge gate
+# — which is exactly how cp#673 slipped.
+#
+# SECURITY MODEL (mirrors audit-force-merge.yml): pull_request_target +
+# base.sha checkout, so a PR author cannot rewrite this gate or the reserved-
+# paths file on their own PR — both are read from the BASE branch.
+
+name: reserved-path-review
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review]
+  # Re-evaluate when a review lands so the gate flips green on a non-author
+  # approval without needing a new push.
+  pull_request_review:
+    types: [submitted, dismissed, edited]
+
+permissions:
+  contents: read
+  pull-requests: read
+  statuses: write
+
+jobs:
+  reserved-path-review:
+    runs-on: ubuntu-latest
+    # Draft PRs can't merge anyway; skip to save a runner. Still runs on
+    # ready_for_review (above) when the draft is promoted.
+    if: github.event.pull_request.draft == false
+    steps:
+      - name: Check out BASE branch (gate + reserved-paths come from base)
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          # base.sha pinning, NOT base.ref — a fast-moving base can't slip a
+          # different gate script / reserved-paths file in under us.
+          ref: ${{ github.event.pull_request.base.sha }}
+      - name: Evaluate reserved-path non-author-approval gate
+        env:
+          GITEA_TOKEN: ${{ secrets.GITEA_TOKEN || secrets.GITHUB_TOKEN }}
+          GITEA_HOST: git.moleculesai.app
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: bash .gitea/scripts/reserved-path-review.sh
