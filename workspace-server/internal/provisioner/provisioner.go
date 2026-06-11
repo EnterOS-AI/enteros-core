@@ -98,6 +98,12 @@ const (
 	// dependency into the provisioner. Kept in sync with models.KindPlatform
 	// (a provisioner test asserts the two agree).
 	WorkspaceKindPlatform = "platform"
+
+	// alpineImage is the digest-pinned alpine image used for throwaway
+	// containers that read/write volumes or migrate data.  Pinning prevents
+	// supply-chain drift / compromised-tag attacks (core#2545).
+	// Matches workspace-server/Dockerfile FROM alpine:3.20@sha256:...
+	alpineImage = "alpine:3.20@sha256:c64c687cbea9300178b30c95835354e34c4e4febc4badfe27102879de0483b5e"
 )
 
 // WorkspaceConfig holds the parameters needed to provision a workspace container.
@@ -1262,7 +1268,7 @@ func (p *Provisioner) ExecRead(ctx context.Context, containerName, filePath stri
 // Used as a fallback when ExecRead fails (container already stopped).
 func (p *Provisioner) ReadFromVolume(ctx context.Context, volumeName, filePath string) ([]byte, error) {
 	resp, err := p.cli.ContainerCreate(ctx, &container.Config{
-		Image: "alpine",
+		Image: alpineImage,
 		Cmd:   []string{"cat", "/vol/" + filePath},
 	}, &container.HostConfig{
 		Binds: []string{volumeName + ":/vol:ro"},
@@ -1333,7 +1339,7 @@ func (p *Provisioner) WriteAuthTokenToVolume(ctx context.Context, workspaceID, t
 	}
 	volName := p.resolveConfigVolumeName(ctx, workspaceID)
 	resp, err := p.cli.ContainerCreate(ctx, &container.Config{
-		Image: "alpine",
+		Image: alpineImage,
 		Cmd:   []string{"sh", "-c", writeAuthTokenVolumeCmd()},
 		Env:   []string{"TOKEN=" + token},
 	}, &container.HostConfig{
@@ -1417,9 +1423,12 @@ func (p *Provisioner) migrateVolumeIfNeeded(ctx context.Context, newName, legacy
 	}
 
 	// Copy data from legacy to new via a short-lived alpine container.
+	// The trailing test guards against silent empty copies (e.g. legacy
+	// volume unexpectedly bare) which would leave the workspace without
+	// its config on restart.  Core#2545.
 	resp, err := p.cli.ContainerCreate(ctx, &container.Config{
-		Image: "alpine",
-		Cmd:   []string{"sh", "-c", "cp -a /legacy/. /new/"},
+		Image: alpineImage,
+		Cmd:   []string{"sh", "-c", "cp -a /legacy/. /new/ && test -n \"$(ls -A /new/)\""},
 	}, &container.HostConfig{
 		Binds: []string{
 			legacyName + ":/legacy",
@@ -1765,7 +1774,7 @@ func (p *Provisioner) VolumeHasFile(ctx context.Context, workspaceID, relPath st
 		return false, nil
 	}
 	resp, err := p.cli.ContainerCreate(ctx, &container.Config{
-		Image: "alpine",
+		Image: alpineImage,
 		Cmd:   []string{"test", "-f", "/vol/" + relPath},
 	}, &container.HostConfig{
 		Binds: []string{volName + ":/vol:ro"},
