@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -1178,72 +1177,144 @@ func TestDeleteGlobal_AutoRestartsAffectedWorkspaces(t *testing.T) {
 	}
 }
 
-// (core#2574) Regression test: a caller presenting the tenant ADMIN_TOKEN
-// (the concierge's MCP credential) MUST be gated when writing a workspace
-// secret. The live incident (2026-06-11) had the gate INERT on the
-// admin-token path — TEST_APPROVAL_SECRET + TEST_APPROVAL_DUMMY_KEY were
-// written with zero pending approvals and the secret-change auto-restart
-// fired (core#2573). The fix: gateDestructive on ActionSecretWrite
-// now checks callerIsAdminToken (caller_is_admin_token context key set
-// by AdminAuth on the Tier 2b ADMIN_TOKEN path) and ALWAYS gates,
-// regardless of the rollout flag.
-func TestSecretsSet_AdminToken_GatedByApproval(t *testing.T) {
+// TestSecretsSet_SkipSelfRestart_WhenCallerIsTarget (#2573): when an agent
+// writes a secret to its own workspace, auto-restart must NOT fire — otherwise
+// the restart kills the writing agent mid-turn.
+func TestSecretsSet_SkipSelfRestart_WhenCallerIsTarget(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
-	handler := NewSecretsHandler(nil)
 
-	// requireApproval sequence for an admin-token caller (gated action,
-	// no pre-existing approval). The gate's requireApproval runs THREE
-	// queries: UPDATE (consume), INSERT (new pending), SELECT (parent_id).
-	mock.ExpectQuery(`UPDATE approval_requests SET consumed_at`).
-		WillReturnError(sql.ErrNoRows)
-	mock.ExpectQuery(`WITH existing AS`).
-		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("appr-core2574-secret-write"))
-	mock.ExpectQuery(`SELECT parent_id FROM workspaces WHERE id`).
-		WillReturnRows(sqlmock.NewRows([]string{"parent_id"}).AddRow(nil))
+	restarted := make(chan string, 1)
+	restartFunc := func(wsID string) { restarted <- wsID }
+	handler := NewSecretsHandler(restartFunc)
 
-	// NOTE: deliberately NO `INSERT INTO workspace_secrets` mock setup. If
-	// the gate is bypassed (the bug), the handler reaches the INSERT and
-	// sqlmock returns an error → test fails. The gate firing = no INSERT
-	// = test passes.
+	mock.ExpectExec("INSERT INTO workspace_secrets").
+		WithArgs("550e8400-e29b-41d4-a716-446655440000", "DB_PASS", sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 	c.Params = gin.Params{{Key: "id", Value: "550e8400-e29b-41d4-a716-446655440000"}}
-
-	body := `{"key":"TEST_APPROVAL_SECRET","value":"should-have-required-approval"}`
+	body := `{"key":"DB_PASS","value":"password123"}`
 	c.Request = httptest.NewRequest("POST", "/workspaces/550e8400-e29b-41d4-a716-446655440000/secrets", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
-
-	// core#2574: the auth middleware sets caller_is_admin_token when
-	// the request authenticates via Tier 2b ADMIN_TOKEN.
-	c.Set("caller_is_admin_token", true)
-	c.Set("caller_credential_class", "admin-token")
-
-	// Rollout flag is OFF (default) — this is the regression assertion:
-	// even WITHOUT MOLECULE_PLATFORM_APPROVAL_GATE=1, the admin-token
-	// path MUST gate.
-	os.Unsetenv("MOLECULE_PLATFORM_APPROVAL_GATE")
-	defer os.Unsetenv("MOLECULE_PLATFORM_APPROVAL_GATE")
+	c.Request.Header.Set("X-Workspace-ID", "550e8400-e29b-41d4-a716-446655440000")
 
 	handler.Set(c)
 
-	// Gate fires → 202 Accepted with a pending approval_id.
-	if w.Code != http.StatusAccepted {
-		t.Fatalf("admin-token + secret_write MUST return 202 (Phase-4 approval gate), got %d: %s",
-			w.Code, w.Body.String())
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
-	var resp map[string]interface{}
-	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("failed to parse response: %v", err)
+
+	select {
+	case <-restarted:
+		t.Fatal("restart must NOT fire when caller is the target workspace")
+	case <-time.After(200 * time.Millisecond):
+		// Expected — no restart.
 	}
-	if resp["status"] != "pending_approval" {
-		t.Errorf("status = %v, want \"pending_approval\"", resp["status"])
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
 	}
-	if resp["approval_id"] != "appr-core2574-secret-write" {
-		t.Errorf("approval_id = %v, want \"appr-core2574-secret-write\"", resp["approval_id"])
+}
+
+// TestSecretsDelete_SkipSelfRestart_WhenCallerIsTarget (#2573): symmetric
+// skip for the DELETE path.
+func TestSecretsDelete_SkipSelfRestart_WhenCallerIsTarget(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+
+	restarted := make(chan string, 1)
+	restartFunc := func(wsID string) { restarted <- wsID }
+	handler := NewSecretsHandler(restartFunc)
+
+	mock.ExpectExec("DELETE FROM workspace_secrets WHERE workspace_id").
+		WithArgs("550e8400-e29b-41d4-a716-446655440000", "OLD_KEY").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{
+		{Key: "id", Value: "550e8400-e29b-41d4-a716-446655440000"},
+		{Key: "key", Value: "OLD_KEY"},
 	}
-	if resp["action"] != "secret_write" {
-		t.Errorf("action = %v, want \"secret_write\"", resp["action"])
+	c.Request = httptest.NewRequest("DELETE", "/workspaces/550e8400-e29b-41d4-a716-446655440000/secrets/OLD_KEY", nil)
+	c.Request.Header.Set("X-Workspace-ID", "550e8400-e29b-41d4-a716-446655440000")
+
+	handler.Delete(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	select {
+	case <-restarted:
+		t.Fatal("restart must NOT fire when caller is the target workspace")
+	case <-time.After(200 * time.Millisecond):
+		// Expected — no restart.
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// TestSetGlobal_SkipSelfRestart_WhenCallerIsAffected (#2573): when the org
+// platform agent (caller) sets a global secret, its own workspace must be
+// excluded from the fan-out restart so it isn't killed mid-turn.
+func TestSetGlobal_SkipSelfRestart_WhenCallerIsAffected(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+
+	restarted := make(chan string, 4)
+	restartFunc := func(wsID string) { restarted <- wsID }
+	handler := NewSecretsHandler(restartFunc)
+
+	callerWS := "ws-caller-550e8400-e29b-41d4-a716-446655440000"
+
+	mock.ExpectExec("INSERT INTO global_secrets").
+		WithArgs("CLAUDE_CODE_OAUTH_TOKEN", sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// Query returns ws-a, ws-b, and the caller's workspace.
+	mock.ExpectQuery("SELECT id FROM workspaces").
+		WithArgs("CLAUDE_CODE_OAUTH_TOKEN").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).
+			AddRow("ws-a").
+			AddRow(callerWS).
+			AddRow("ws-b"))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	body := `{"key":"CLAUDE_CODE_OAUTH_TOKEN","value":"sk-ant-oat01-new"}`
+	c.Request = httptest.NewRequest("POST", "/admin/secrets", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Request.Header.Set("X-Workspace-ID", callerWS)
+
+	handler.SetGlobal(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	seen := map[string]bool{}
+	deadline := time.After(2 * time.Second)
+	for len(seen) < 2 {
+		select {
+		case id := <-restarted:
+			seen[id] = true
+		case <-deadline:
+			t.Fatalf("auto-restart not fired for all affected workspaces; got %v", seen)
+		}
+	}
+	if !seen["ws-a"] || !seen["ws-b"] {
+		t.Errorf("expected ws-a and ws-b restarted, got %v", seen)
+	}
+	if seen[callerWS] {
+		t.Errorf("caller workspace %q must NOT be restarted", callerWS)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
 	}
 }

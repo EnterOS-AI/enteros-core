@@ -85,6 +85,23 @@ func rejectPlatformManagedDirectLLMBypassForWorkspace(c *gin.Context, workspaceI
 	return true
 }
 
+// callerWorkspaceID resolves the caller's workspace identity from the request.
+// It checks X-Workspace-ID first (set by A2A proxy and canvas clients), then
+// falls back to deriving the workspace from the bearer token. Returns empty
+// string when the caller cannot be identified (e.g. admin-token requests).
+func callerWorkspaceID(c *gin.Context) string {
+	if callerID := c.GetHeader("X-Workspace-ID"); callerID != "" {
+		return callerID
+	}
+	tok := wsauth.BearerTokenFromHeader(c.GetHeader("Authorization"))
+	if tok != "" {
+		if wsID, err := wsauth.WorkspaceFromToken(c.Request.Context(), db.DB, tok); err == nil {
+			return wsID
+		}
+	}
+	return ""
+}
+
 type SecretsHandler struct {
 	restartFunc func(workspaceID string) // Optional: auto-restart after secret change
 }
@@ -372,7 +389,11 @@ func (h *SecretsHandler) Set(c *gin.Context) {
 	// RFC internal#524 Layer 1: route through globalGoAsync so tests can
 	// drain the detached restart goroutine before db.DB is swapped — see
 	// drainTestAsync in handlers_test.go and the canonical 69d9b4e3 fix.
-	if h.restartFunc != nil {
+	//
+	// #2573: skip self-restart when the secret-write caller is the target
+	// workspace, to avoid killing the writing agent mid-turn.
+	callerID := callerWorkspaceID(c)
+	if h.restartFunc != nil && callerID != workspaceID {
 		wsID := workspaceID
 		globalGoAsync(func() { h.restartFunc(wsID) })
 	}
@@ -420,7 +441,9 @@ func (h *SecretsHandler) Delete(c *gin.Context) {
 
 	// Auto-restart workspace to pick up removed secret.
 	// RFC internal#524 Layer 1: see Set() above for the drain rationale.
-	if h.restartFunc != nil {
+	// #2573: skip self-restart when the secret-write caller is the target.
+	callerID := callerWorkspaceID(c)
+	if h.restartFunc != nil && callerID != workspaceID {
 		wsID := workspaceID
 		globalGoAsync(func() { h.restartFunc(wsID) })
 	}
@@ -516,8 +539,12 @@ func (h *SecretsHandler) SetGlobal(c *gin.Context) {
 	// (which itself spawns N more globalGoAsync restart calls below) before
 	// db.DB swap. Without this, the SELECT for affected workspaces races a
 	// subsequent test's db.DB restore.
+	//
+	// #2573: pass caller workspace ID so the writing agent doesn't restart
+	// itself mid-turn when it sets a global secret.
 	key := body.Key
-	globalGoAsync(func() { h.restartAllAffectedByGlobalKey(key) })
+	callerID := callerWorkspaceID(c)
+	globalGoAsync(func() { h.restartAllAffectedByGlobalKey(key, callerID) })
 
 	// Phase 1 audit: admin-scope secret write — high-value security event.
 	auditCtx := audit.WithActorKind(c.Request.Context(), audit.ActorAdmin)
@@ -536,7 +563,10 @@ func (h *SecretsHandler) SetGlobal(c *gin.Context) {
 // have a workspace-level override). Used on SetGlobal / DeleteGlobal so
 // rotated credentials (OAuth tokens, API keys) propagate without a manual
 // restart loop. See issue #15.
-func (h *SecretsHandler) restartAllAffectedByGlobalKey(key string) {
+//
+// #2573: excludeWorkspaceID prevents the writing agent's own workspace from
+// being restarted mid-turn when the org platform agent sets a global secret.
+func (h *SecretsHandler) restartAllAffectedByGlobalKey(key, excludeWorkspaceID string) {
 	if h.restartFunc == nil {
 		return
 	}
@@ -559,6 +589,9 @@ func (h *SecretsHandler) restartAllAffectedByGlobalKey(key string) {
 	for rows.Next() {
 		var id string
 		if err := rows.Scan(&id); err == nil {
+			if id == excludeWorkspaceID {
+				continue
+			}
 			ids = append(ids, id)
 		}
 	}
@@ -605,8 +638,11 @@ func (h *SecretsHandler) DeleteGlobal(c *gin.Context) {
 	// keep the stale env var until manual restart.
 	// RFC internal#524 Layer 1: globalGoAsync for the same drain rationale
 	// as SetGlobal above.
+	// #2573: pass caller workspace ID so the writing agent doesn't restart
+	// itself mid-turn when it deletes a global secret.
 	k := key
-	globalGoAsync(func() { h.restartAllAffectedByGlobalKey(k) })
+	callerID := callerWorkspaceID(c)
+	globalGoAsync(func() { h.restartAllAffectedByGlobalKey(k, callerID) })
 
 	// Phase 1 audit: admin-scope secret delete.
 	auditCtx := audit.WithActorKind(c.Request.Context(), audit.ActorAdmin)
