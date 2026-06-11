@@ -30,7 +30,6 @@ import (
 	"os"
 	"testing"
 
-	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/approvals"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -105,7 +104,7 @@ func TestIntegration_AdminToken_OrgTokenMint_WithoutApproval_Rejected(t *testing
 	t.Cleanup(func() { db.DB = prev })
 	setupTestRedis(t)
 
-	wsID := seedConciergeWorkspace(t, conn)
+	_ = seedConciergeWorkspace(t, conn)
 	os.Unsetenv("MOLECULE_PLATFORM_APPROVAL_GATE")
 
 	h := NewOrgTokenHandler()
@@ -200,7 +199,7 @@ func TestIntegration_AdminToken_OrgTokenMint_WithApproval_Succeeds(t *testing.T)
 	t.Cleanup(func() { db.DB = prev })
 	setupTestRedis(t)
 
-	wsID := seedConciergeWorkspace(t, conn)
+	_ = seedConciergeWorkspace(t, conn)
 	os.Unsetenv("MOLECULE_PLATFORM_APPROVAL_GATE")
 
 	h := NewOrgTokenHandler()
@@ -332,7 +331,7 @@ func TestIntegration_AdminToken_OrgTokenMint_ExploitRegression(t *testing.T) {
 	t.Cleanup(func() { db.DB = prev })
 	setupTestRedis(t)
 
-	wsID := seedConciergeWorkspace(t, conn)
+	_ = seedConciergeWorkspace(t, conn)
 
 	// The exploit ran with the default rollout flag OFF (no
 	// MOLECULE_PLATFORM_APPROVAL_GATE env var set). That is the
