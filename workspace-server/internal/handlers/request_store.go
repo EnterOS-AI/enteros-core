@@ -46,6 +46,10 @@ var ErrInvalidRequestKind = errors.New("request: kind must be 'task' or 'approva
 // author_type is outside the user/agent enum. Callers translate to HTTP 400.
 var ErrInvalidRequestParty = errors.New("request: type must be 'user' or 'agent'")
 
+// ErrSelfResponse is returned by Respond when the responder is the same party
+// as the requester (self-approval / self-rejection). Callers translate to HTTP 400.
+var ErrSelfResponse = errors.New("request: responder cannot be the requester")
+
 // CreateRequestInput is the set of fields Create needs. requester_* identifies
 // who raised it (for a per-workspace POST that is the calling agent); recipient_*
 // is who must act. Detail/OrgID/Priority are optional (zero values → NULL).
@@ -387,6 +391,14 @@ func (s *RequestStore) Respond(ctx context.Context, id, action, responderType, r
 	if err != nil {
 		return RequestRow{}, err
 	}
+
+	// SECURITY: prevent self-approval / self-rejection. The requester must not
+	// be the same party as the responder — that would let an agent approve its
+	// own tasks or a user self-approve their own requests (RC 10416).
+	if responderType == req.RequesterType && responderID == req.RequesterID {
+		return RequestRow{}, ErrSelfResponse
+	}
+
 	status, err := actionToStatus(req.Kind, action)
 	if err != nil {
 		return RequestRow{}, err

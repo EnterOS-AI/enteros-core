@@ -482,6 +482,34 @@ func TestConfigVolumeName_DistinctSamePrefix12(t *testing.T) {
 	}
 }
 
+// TestWorkspaceVolumeName verifies workspace volume naming.
+func TestWorkspaceVolumeName(t *testing.T) {
+	tests := []struct {
+		id   string
+		want string
+	}{
+		{"short", "ws-short-workspace"},
+		{"exactly12ch", "ws-exactly12ch-workspace"},
+		{"longer-than-twelve-characters", "ws-longer-than-twelve-characters-workspace"},
+		{"abc", "ws-abc-workspace"},
+	}
+	for _, tt := range tests {
+		got := WorkspaceVolumeName(tt.id)
+		if got != tt.want {
+			t.Errorf("WorkspaceVolumeName(%q) = %q, want %q", tt.id, got, tt.want)
+		}
+	}
+}
+
+// TestWorkspaceVolumeName_DistinctSamePrefix12 is a regression guard for KI-013.
+func TestWorkspaceVolumeName_DistinctSamePrefix12(t *testing.T) {
+	id1 := "123456789abc-4def-1234-567890abcdef"
+	id2 := "123456789abc-4def-1234-567890abcdf0"
+	if WorkspaceVolumeName(id1) == WorkspaceVolumeName(id2) {
+		t.Fatalf("WorkspaceVolumeName must differ for same-first-12 UUIDs: both = %q", WorkspaceVolumeName(id1))
+	}
+}
+
 // ---------- #12 — claude-sessions volume naming ----------
 
 // TestClaudeSessionVolumeName_Deterministic: same ID → same volume name, and

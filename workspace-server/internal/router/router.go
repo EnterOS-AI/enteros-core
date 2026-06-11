@@ -132,6 +132,13 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		c.JSON(200, uploads.DefaultUploadLimits())
 	})
 
+	// Compute metadata — public, no auth. SSOT for cloud-provider +
+	// instance-type allowlists so the canvas ContainerConfigTab (and any
+	// other client) renders selectors from the same source the PATCH
+	// validator uses. Prevents drift where the UI offers an instance the
+	// backend rejects (#2489).
+	r.GET("/compute/metadata", handlers.ComputeMetadata)
+
 	// /admin/liveness — per-subsystem last-tick timestamps. Operators read this
 	// to catch stuck-but-not-crashed goroutines (the failure mode that caused
 	// the 12h scheduler outage of 2026-04-14, issue #85). Any subsystem whose

@@ -262,6 +262,15 @@ func (p *CPProvisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string,
 		return "", fmt.Errorf("cp provisioner: collect config files: %w", err)
 	}
 
+	// Only forward kind for platform workspaces; omitempty hides it for ordinary
+	// workspaces so the wire shape is unchanged and older CPs see byte-identical
+	// requests.  Ordinary workspaces always have kind="workspace" from the DB
+	// COALESCE, so we must explicitly suppress it here (core#2498 truth-up).
+	kind := ""
+	if cfg.Kind == WorkspaceKindPlatform {
+		kind = cfg.Kind
+	}
+
 	req := cpProvisionRequest{
 		OrgID:           p.orgID,
 		WorkspaceID:     cfg.WorkspaceID,
@@ -271,7 +280,7 @@ func (p *CPProvisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string,
 		DiskGB:          cfg.DiskGB,
 		DataPersistence: cfg.DataPersistence,
 		Provider:        cfg.Provider,
-		Kind:            cfg.Kind,
+		Kind:            kind,
 		Display:         cfg.Display,
 		PlatformURL:     cfg.PlatformURL,
 		Env:             env,

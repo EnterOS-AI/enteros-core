@@ -218,6 +218,19 @@ func (h *RequestsHandler) Get(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "query failed"})
 		return
 	}
+
+	// Workspace-token auth path: a workspace may read only a request it is a
+	// party to (requester or recipient). Cross-workspace read is forbidden
+	// (core#2542 full fix).
+	if workspaceID := c.Param("id"); workspaceID != "" {
+		isParty := (req.RequesterType == "agent" && req.RequesterID == workspaceID) ||
+			(req.RecipientType == "agent" && req.RecipientID == workspaceID)
+		if !isParty {
+			c.JSON(http.StatusForbidden, gin.H{"error": "not a participant"})
+			return
+		}
+	}
+
 	msgs, err := s.Messages(ctx, requestID)
 	if err != nil {
 		log.Printf("Get request messages error request=%s: %v", requestID, err)
@@ -228,8 +241,14 @@ func (h *RequestsHandler) Get(c *gin.Context) {
 }
 
 // Respond handles POST /requests/:requestId/respond — a terminal action
-// (done/rejected/approved), validated against the request's kind. responder
-// identity comes from the body; the canvas/admin path defaults to 'user'.
+// (done/rejected/approved), validated against the request's kind.
+//
+// REAL participant-binding (RC 10416 follow-up): on the workspace-token auth
+// path (/workspaces/:id/requests/...), the responder is BOUND to the
+// authenticated workspace — the body fields are ignored. This prevents a
+// workspace from impersonating a user or a different agent when responding.
+// The canvas/admin path continues to take responder from the body (defaults
+// to 'user' on the canvas).
 //
 //	@Summary	Respond to a request (done / rejected / approved)
 //	@Tags		requests
@@ -253,12 +272,41 @@ func (h *RequestsHandler) Respond(c *gin.Context) {
 		return
 	}
 
-	if _, err := h.store().Respond(ctx, requestID, body.Action, body.ResponderType, body.ResponderID); err != nil {
+	responderType := body.ResponderType
+	responderID := body.ResponderID
+
+	// Workspace-token auth path: bind responder to the authenticated workspace.
+	if workspaceID := c.Param("id"); workspaceID != "" {
+		responderType = "agent"
+		responderID = workspaceID
+	}
+
+	// Workspace-token auth path: verify the caller is the request's recipient.
+	// Cross-workspace respond is forbidden — an agent must not terminate a
+	// request that was not addressed to it (core#2542 full fix).
+	if workspaceID := c.Param("id"); workspaceID != "" {
+		reqRow, err := h.store().Get(ctx, requestID)
+		if err != nil {
+			if errors.Is(err, ErrRequestNotFound) {
+				c.JSON(http.StatusNotFound, gin.H{"error": "request not found or already resolved"})
+				return
+			}
+			log.Printf("Respond authz error request=%s: %v", requestID, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to respond"})
+			return
+		}
+		if reqRow.RecipientType != "agent" || reqRow.RecipientID != workspaceID {
+			c.JSON(http.StatusForbidden, gin.H{"error": "not the recipient"})
+			return
+		}
+	}
+
+	if _, err := h.store().Respond(ctx, requestID, body.Action, responderType, responderID); err != nil {
 		if errors.Is(err, ErrRequestNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "request not found or already resolved"})
 			return
 		}
-		if errors.Is(err, ErrInvalidRequestAction) || errors.Is(err, ErrInvalidRequestParty) {
+		if errors.Is(err, ErrInvalidRequestAction) || errors.Is(err, ErrInvalidRequestParty) || errors.Is(err, ErrSelfResponse) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
@@ -328,6 +376,26 @@ func (h *RequestsHandler) AddMessage(c *gin.Context) {
 func (h *RequestsHandler) Cancel(c *gin.Context) {
 	requestID := c.Param("requestId")
 	ctx := c.Request.Context()
+
+	// Workspace-token auth path: verify the caller is the request's requester.
+	// Cross-workspace cancel is forbidden — an agent must not withdraw a
+	// request it did not raise (core#2542 full fix).
+	if workspaceID := c.Param("id"); workspaceID != "" {
+		reqRow, err := h.store().Get(ctx, requestID)
+		if err != nil {
+			if errors.Is(err, ErrRequestNotFound) {
+				c.JSON(http.StatusNotFound, gin.H{"error": "request not found or already resolved"})
+				return
+			}
+			log.Printf("Cancel authz error request=%s: %v", requestID, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to cancel"})
+			return
+		}
+		if reqRow.RequesterType != "agent" || reqRow.RequesterID != workspaceID {
+			c.JSON(http.StatusForbidden, gin.H{"error": "not the requester"})
+			return
+		}
+	}
 
 	if err := h.store().Cancel(ctx, requestID); err != nil {
 		if errors.Is(err, ErrRequestNotFound) {

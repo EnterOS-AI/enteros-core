@@ -190,8 +190,26 @@ except Exception:
   print('')"
 }
 
+# SEV-2499 SSOT: use the same Go naming helpers the provisioner uses so the
+# e2e script can never drift from the real naming convention. The CI job
+# pre-builds e2e-names to /usr/local/bin; local runs must build it once:
+#   go build -o /usr/local/bin/e2e-names ./cmd/e2e-names
+_e2e_name() {
+  local kind="$1" wid="$2"
+  if [ -x "$(command -v e2e-names)" ]; then
+    e2e-names "$kind" "$wid"
+  else
+    echo "SEV-2499: e2e-names not found in PATH — build it with: go build -o /usr/local/bin/e2e-names ./cmd/e2e-names" >&2
+    exit 2
+  fi
+}
+config_volume_name()   { _e2e_name config-volume   "$1"; }
+session_volume_name()  { _e2e_name session-volume  "$1"; }
+workspace_volume_name(){ _e2e_name workspace-volume "$1"; }
+container_name()       { _e2e_name container       "$1"; }
+
 container_running() {  # container_running <ws-id>  -> echoes name if running
-  docker ps --filter "name=$(e2e_container_name "$1")" --filter "status=running" --format '{{.Names}}' 2>/dev/null | head -1
+  docker ps --filter "name=$(container_name "$1")" --filter "status=running" --format '{{.Names}}' 2>/dev/null | head -1
 }
 
 diagnose_provision() {
@@ -224,11 +242,11 @@ cleanup() {
     # SCOPED teardown — only the workspace this test created. Never a blanket
     # sweep (other dev workspaces may be live on this shared daemon).
     e2e_delete_workspace "$WSID" "" >/dev/null 2>&1 || true
-    docker rm -f "$(e2e_container_name "$WSID")" >/dev/null 2>&1 || true
+    docker rm -f "$(container_name "$WSID")" >/dev/null 2>&1 || true
     docker volume rm -f \
-      "$(e2e_config_volume_name "$WSID")" "$(e2e_session_volume_name "$WSID")" \
-      "$(e2e_workspace_volume_name "$WSID")" >/dev/null 2>&1 || true
-    echo "cleaned workspace $WSID + $(e2e_container_name "$WSID") container/volumes"
+      "$(config_volume_name "$WSID")" "$(session_volume_name "$WSID")" \
+      "$(workspace_volume_name "$WSID")" >/dev/null 2>&1 || true
+    echo "cleaned workspace $WSID + $(container_name "$WSID") container/volumes"
   fi
   # Restore the cache tag to whatever it pointed at before we retagged it, so a
   # stub run doesn't leave the real claude-code tag aliased to the stub.
@@ -347,7 +365,7 @@ if [ -z "$WSID" ]; then
   exit 1
 fi
 pass "workspace created: $WSID"
-CONFIG_VOL="$(e2e_config_volume_name "$WSID")"
+CONFIG_VOL="$(config_volume_name "$WSID")"
 
 # Mint a workspace bearer for the WorkspaceAuth-gated secret + /restart calls.
 WTOKEN=$(e2e_mint_workspace_token "$WSID" || true)
@@ -453,7 +471,7 @@ done
 check "workspace reached online (status=$STATUS)" "online" "$STATUS"
 if [ "$FAIL" -gt 0 ]; then diagnose_provision "$WSID"; echo "=== Results: $PASS passed, $FAIL failed ==="; exit 1; fi
 RUN=$(container_running "$WSID")
-if [ -n "$RUN" ]; then pass "container running: $RUN"; else fail "no running $(e2e_container_name "$WSID") container" "docker ps shows none"; fi
+if [ -n "$RUN" ]; then pass "container running: $RUN"; else fail "no running ws-${WSID} container" "docker ps shows none"; fi
 echo ""
 
 # ----------------------------------------------------------------------------

@@ -175,6 +175,14 @@ def test_reap_preserves_failed_pr_context_without_push_success(monkeypatch):
 
 import os
 import tempfile
+from datetime import datetime, timezone
+
+
+def _fresh_ts():
+    # See test_gitea_merge_queue._fresh_ts: snapshots are only honored within a
+    # 10-minute freshness window; a frozen literal ts goes stale and triggers a
+    # self-fetch -> "/repos///" crash. Default to NOW.
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def test_get_combined_status_uses_snapshot_when_sha_matches(monkeypatch):
@@ -183,7 +191,7 @@ def test_get_combined_status_uses_snapshot_when_sha_matches(monkeypatch):
     mod = load_reaper()
     head_sha = "a" * 40
     snapshot = {
-        "ts": "2026-06-10T12:00:00Z",
+        "ts": _fresh_ts(),
         "repo": "molecule-ai/molecule-core",
         "prs": [
             {
@@ -217,7 +225,7 @@ def test_get_combined_status_self_fetches_when_sha_not_in_snapshot(monkeypatch):
     """If the SHA is not in the snapshot, get_combined_status falls back to API."""
     mod = load_reaper()
     snapshot = {
-        "ts": "2026-06-10T12:00:00Z",
+        "ts": _fresh_ts(),
         "repo": "molecule-ai/molecule-core",
         "prs": [
             {"number": 1, "head_sha": "b" * 40, "labels": [],
