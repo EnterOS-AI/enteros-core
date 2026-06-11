@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/DATA-DOG/go-sqlmock"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/gin-gonic/gin"
 )
 
@@ -349,14 +349,12 @@ func TestOrgTokenHandler_Create_ActorFromSession(t *testing.T) {
 	h, _, cleanup := setupOrgTokenTest(t)
 	defer cleanup()
 
-	// (core#2574 / #2579) Cookie present, no org_token_prefix, no
-	// org_token_id, no admin-token env var. The session path has
-	// no resolvable approval anchor — callerOrg returns "" and
-	// the env var is unset. Per approvalAnchorForGate contract,
-	// this returns a controlled 4xx. The gate works correctly:
-	// session callers cannot mint org tokens without an explicit
-	// org_id (set via the platform workspace env, or by calling
-	// through the concierge with an org-token credential).
+	// (core#2593) BYPASS-RESISTANCE: a raw Cookie header WITHOUT a
+	// CP-verified session (cp_session_actor unset) must NOT be
+	// treated as a human — otherwise any admin-token agent could
+	// skip the approval gate by attaching a junk Cookie. Such a
+	// caller has no org_token_id, no admin-token context and no
+	// anchor env → controlled 400, gate intact.
 	os.Unsetenv("MOLECULE_PLATFORM_WORKSPACE_ID")
 	defer os.Unsetenv("MOLECULE_PLATFORM_WORKSPACE_ID")
 	os.Unsetenv("MOLECULE_PLATFORM_APPROVAL_GATE")
@@ -369,6 +367,52 @@ func TestOrgTokenHandler_Create_ActorFromSession(t *testing.T) {
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("session caller without resolvable org_id MUST return 400, got %d: %s",
 			w.Code, w.Body.String())
+	}
+}
+
+// TestOrgTokenHandler_Create_VerifiedSession_SkipsGate (core#2593)
+// pins the human-mint path: a CP-VERIFIED session caller (AdminAuth
+// sets cp_session_actor only after VerifiedCPSession confirms the
+// WorkOS cookie upstream) mints WITHOUT an approval round-trip — the
+// human at the dashboard IS the approver, so 202-pending would be a
+// no-op loop. Live regression: Settings → Org API Keys → "+ New Key"
+// returned the anchor 400 because #2579 had no session branch.
+// The mock expects ONLY the orgtoken INSERT — any approval-flow SQL
+// would fail ExpectationsWereMet, proving the gate did not fire.
+func TestOrgTokenHandler_Create_VerifiedSession_SkipsGate(t *testing.T) {
+	h, mock, cleanup := setupOrgTokenTest(t)
+	defer cleanup()
+
+	os.Unsetenv("MOLECULE_PLATFORM_WORKSPACE_ID")
+	defer os.Unsetenv("MOLECULE_PLATFORM_WORKSPACE_ID")
+	os.Unsetenv("MOLECULE_PLATFORM_APPROVAL_GATE")
+	defer os.Unsetenv("MOLECULE_PLATFORM_APPROVAL_GATE")
+
+	const actor = "session:deadbeefcafe1234"
+	mock.ExpectQuery(`INSERT INTO org_api_tokens`).
+		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), "from-dashboard", actor, nil).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("tok-human"))
+
+	c, w := buildCtx("POST", "/org/tokens", `{"name":"from-dashboard"}`)
+	c.Set("cp_session_actor", actor)
+	h.Create(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("verified-session mint MUST return 200 (no approval round-trip), got %d: %s",
+			w.Code, w.Body.String())
+	}
+	var body struct {
+		ID     string `json:"id"`
+		Prefix string `json:"prefix"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if body.ID != "tok-human" {
+		t.Errorf("id = %q, want tok-human", body.ID)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet/extra SQL — approval-flow queries must NOT run for verified sessions: %v", err)
 	}
 }
 

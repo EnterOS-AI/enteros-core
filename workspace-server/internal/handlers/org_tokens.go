@@ -48,11 +48,11 @@ type createOrgTokenRequest struct {
 }
 
 type createOrgTokenResponse struct {
-	ID       string `json:"id"`
-	Prefix   string `json:"prefix"`
-	Name     string `json:"name,omitempty"`
-	Token    string `json:"auth_token"` // plaintext — shown ONCE
-	Warning  string `json:"warning"`    // UX hint: copy now
+	ID      string `json:"id"`
+	Prefix  string `json:"prefix"`
+	Name    string `json:"name,omitempty"`
+	Token   string `json:"auth_token"` // plaintext — shown ONCE
+	Warning string `json:"warning"`    // UX hint: copy now
 }
 
 // Create mints a new org token. The plaintext is returned exactly
@@ -100,18 +100,38 @@ func (h *OrgTokenHandler) Create(c *gin.Context) {
 	// concierge/platform root workspace (callerPlatformOrg); session
 	// callers fall through. If no anchor can be derived, return a
 	// controlled 4xx — never pass "" into the UUID query.
-	ws := approvalAnchorForGate(c)
-	if ws == "" {
-		log.Printf("OrgTokenHandler.Create: no approval anchor for caller class=%s (admin-token callers need MOLECULE_PLATFORM_WORKSPACE_ID; org-token callers need a token with a valid org_id; session callers need a concierge root)", orgTokenActorClass(c))
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": "no approval anchor for this caller class — set MOLECULE_PLATFORM_WORKSPACE_ID for admin-token callers, or call via a session / org-token with a valid org",
-		})
-		return
-	}
-	if !gateDestructive(c, nil, ws, approvals.ActionOrgTokenMint,
-		"mint org token "+req.Name,
-		map[string]interface{}{"actor": orgTokenActorClass(c), "name": req.Name, "workspace_id": ws}) {
-		return
+	// (core#2593) Verified-session (human) callers SKIP the approval
+	// gate by design: the gate exists to put a human between an AGENT
+	// and a privileged mint — when the minter IS a human at the
+	// dashboard (CP-verified WorkOS session; AdminAuth only sets
+	// cp_session_actor after VerifiedCPSession confirms the cookie
+	// upstream), routing them through a pending-approval that the same
+	// human would approve is a pure no-op round-trip. Live regression
+	// this fixes: Settings → Org API Keys → "+ New Key" returned the
+	// raw anchor 400 because approvalAnchorForGate had no session
+	// branch (the #2579 assumption "the UI mints via the concierge"
+	// was wrong — the canvas mints directly with the browser session).
+	//
+	// SECURITY: keyed on cp_session_actor (set ONLY post-verification),
+	// NEVER on the raw Cookie header — an admin-token agent attaching a
+	// junk Cookie header must NOT bypass the gate (pinned by
+	// TestOrgTokenHandler_Create_ActorFromSession).
+	if actor := callerVerifiedSessionActor(c); actor != "" {
+		log.Printf("orgtoken: mint by verified human session %s — approval gate bypassed by design (core#2593)", actor)
+	} else {
+		ws := approvalAnchorForGate(c)
+		if ws == "" {
+			log.Printf("OrgTokenHandler.Create: no approval anchor for caller class=%s (admin-token callers need MOLECULE_PLATFORM_WORKSPACE_ID; org-token callers need a token with a valid org_id)", orgTokenActorClass(c))
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": "no approval anchor for this caller class — set MOLECULE_PLATFORM_WORKSPACE_ID for admin-token callers, or call via an org-token with a valid org",
+			})
+			return
+		}
+		if !gateDestructive(c, nil, ws, approvals.ActionOrgTokenMint,
+			"mint org token "+req.Name,
+			map[string]interface{}{"actor": orgTokenActorClass(c), "name": req.Name, "workspace_id": ws}) {
+			return
+		}
 	}
 
 	createdBy, orgID := orgTokenActor(c)
@@ -148,7 +168,9 @@ func orgTokenActorClass(c *gin.Context) string {
 			return actorOrgTokenPrefix + s
 		}
 	}
-	if c.GetHeader("Cookie") != "" {
+	// Verified session only — the raw Cookie header is forgeable by
+	// bearer-authed agents and must not influence classification.
+	if callerVerifiedSessionActor(c) != "" {
 		return actorSession
 	}
 	return actorAdminToken
@@ -181,8 +203,8 @@ func (h *OrgTokenHandler) Revoke(c *gin.Context) {
 // and in mint/revoke audit logs. Kept as constants so the labels
 // are greppable across services (log pipelines, audit queries).
 const (
-	actorOrgTokenPrefix = "org-token:" // appended: 8-char plaintext prefix from the UI
-	actorSession        = "session"    // WorkOS-session-verified call
+	actorOrgTokenPrefix = "org-token:"  // appended: 8-char plaintext prefix from the UI
+	actorSession        = "session"     // WorkOS-session-verified call
 	actorAdminToken     = "admin-token" // bootstrap ADMIN_TOKEN env
 )
 
@@ -259,6 +281,27 @@ func approvalAnchorForGate(c *gin.Context) string {
 	return ""
 }
 
+// callerVerifiedSessionActor returns the cp_session_actor identity
+// ("session:<hash>") when — and ONLY when — the request authenticated
+// via a CP-VERIFIED WorkOS session cookie (AdminAuth sets the key
+// strictly after VerifiedCPSession confirms the cookie upstream
+// against /cp/auth/me). Returns "" for every bearer-authed caller,
+// including ones that happen to carry an unverified/junk Cookie
+// header. This is the human-vs-agent discriminator for the approval
+// gate (core#2593) — do NOT replace it with a raw Cookie check, which
+// any agent can forge.
+func callerVerifiedSessionActor(c *gin.Context) string {
+	v, ok := c.Get("cp_session_actor")
+	if !ok {
+		return ""
+	}
+	s, ok := v.(string)
+	if !ok {
+		return ""
+	}
+	return s
+}
+
 // orgTokenActor returns (createdBy, orgID) for the current request.
 //
 //   - If authed via another org token (org_token_id in context),
@@ -274,11 +317,14 @@ func orgTokenActor(c *gin.Context) (createdBy, orgID string) {
 			return actorOrgTokenPrefix + s, callerOrg(c)
 		}
 	}
-	// Session-tier auth doesn't stash a WorkOS user_id in the gin
-	// context today. Until it does, treat session requests as "session"
-	// with no org anchor.
-	if c.GetHeader("Cookie") != "" {
-		return actorSession, ""
+	// Verified-session callers carry the cp_session_actor identity
+	// ("session:<hash>") — record THAT as created_by so the audit
+	// trail distinguishes which human session minted the token.
+	// (Previously this keyed off the raw Cookie header, which both
+	// misattributed bearer-authed requests carrying incidental
+	// cookies AND lost the per-session identity.)
+	if actor := callerVerifiedSessionActor(c); actor != "" {
+		return actor, ""
 	}
 	return actorAdminToken, ""
 }
