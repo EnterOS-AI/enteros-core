@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 	"time"
 
@@ -176,6 +177,80 @@ func TestOrgTokenHandler_Create_ActorFromOrgTokenPrefix(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet: %v", err)
+	}
+}
+
+// (core#2574) Regression test: an admin-token-bearing caller (the
+// concierge agent holds $ADMIN_TOKEN) MUST be gated by the Phase-4
+// approval gate when minting an org token. The live incident (2026-06-11)
+// had the gate INERT on the admin-token path — two live full-tenant-admin
+// org API tokens were minted with zero pending approvals. The fix wires
+// gateDestructive into OrgTokenHandler.Create and the gate's
+// callerIsAdminToken detection overrides the rollout flag (admin-token
+// is ALWAYS gated when the action is gated, regardless of the flag).
+func TestOrgTokenHandler_Create_AdminToken_GatedByApproval(t *testing.T) {
+	h, mock, cleanup := setupOrgTokenTest(t)
+	defer cleanup()
+
+	// requireApproval sequence for an admin-token caller (gated action,
+	// no pre-existing approval):
+	//   1. UPDATE approval_requests SET consumed_at = now() … RETURNING id
+	//      → no row (sql.ErrNoRows)
+	//   2. WITH existing AS … INSERT INTO approval_requests … RETURNING id
+	//   3. SELECT parent_id FROM workspaces WHERE id → NULL
+	mock.ExpectQuery(`UPDATE approval_requests SET consumed_at`).
+		WillReturnError(sql.ErrNoRows)
+	mock.ExpectQuery(`WITH existing AS`).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("appr-core2574-org-mint"))
+	mock.ExpectQuery(`SELECT parent_id FROM workspaces WHERE id`).
+		WillReturnRows(sqlmock.NewRows([]string{"parent_id"}).AddRow(nil))
+
+	// NOTE: deliberately NO `INSERT INTO org_api_tokens` mock setup. If
+	// the gate is bypassed (the bug), the handler will reach the
+	// orgtoken.Issue call and try to run that INSERT against the mock,
+	// which has no expectation — sqlmock will return an error and the test
+	// will fail. The gate firing = no INSERT = test passes.
+
+	c, w := buildCtx("POST", "/org/tokens", `{"name":"concierge-rogue-mint"}`)
+	// core#2574: the auth middleware sets caller_is_admin_token when the
+	// request authenticates via Tier 2b ADMIN_TOKEN (or Tier 3 workspace-
+	// token fallback). Simulate that here.
+	c.Set("caller_is_admin_token", true)
+	c.Set("caller_credential_class", "admin-token")
+
+	// The rollout flag is OFF (default) — this is the regression
+	// assertion: even without MOLECULE_PLATFORM_APPROVAL_GATE, the
+	// admin-token path must gate.
+	os.Unsetenv("MOLECULE_PLATFORM_APPROVAL_GATE")
+	defer os.Unsetenv("MOLECULE_PLATFORM_APPROVAL_GATE")
+
+	h.Create(c)
+
+	// Gate fires → 202 Accepted with a pending approval_id.
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("admin-token + gated action MUST return 202 (Phase-4 approval gate), got %d: %s",
+			w.Code, w.Body.String())
+	}
+	var body struct {
+		Status     string `json:"status"`
+		ApprovalID string `json:"approval_id"`
+		Action     string `json:"action"`
+		Reason     string `json:"reason"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if body.Status != "pending_approval" {
+		t.Errorf("status = %q, want \"pending_approval\"", body.Status)
+	}
+	if body.ApprovalID != "appr-core2574-org-mint" {
+		t.Errorf("approval_id = %q, want \"appr-core2574-org-mint\"", body.ApprovalID)
+	}
+	if body.Action != "org_token_mint" {
+		t.Errorf("action = %q, want \"org_token_mint\"", body.Action)
+	}
+	if body.Reason == "" {
+		t.Errorf("reason text missing — operators need a human-readable explanation for the pending approval")
 	}
 }
 

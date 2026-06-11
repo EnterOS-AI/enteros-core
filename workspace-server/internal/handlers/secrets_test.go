@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -1174,5 +1175,75 @@ func TestDeleteGlobal_AutoRestartsAffectedWorkspaces(t *testing.T) {
 
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// (core#2574) Regression test: a caller presenting the tenant ADMIN_TOKEN
+// (the concierge's MCP credential) MUST be gated when writing a workspace
+// secret. The live incident (2026-06-11) had the gate INERT on the
+// admin-token path — TEST_APPROVAL_SECRET + TEST_APPROVAL_DUMMY_KEY were
+// written with zero pending approvals and the secret-change auto-restart
+// fired (core#2573). The fix: gateDestructive on ActionSecretWrite
+// now checks callerIsAdminToken (caller_is_admin_token context key set
+// by AdminAuth on the Tier 2b ADMIN_TOKEN path) and ALWAYS gates,
+// regardless of the rollout flag.
+func TestSecretsSet_AdminToken_GatedByApproval(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewSecretsHandler(nil)
+
+	// requireApproval sequence for an admin-token caller (gated action,
+	// no pre-existing approval). The gate's requireApproval runs THREE
+	// queries: UPDATE (consume), INSERT (new pending), SELECT (parent_id).
+	mock.ExpectQuery(`UPDATE approval_requests SET consumed_at`).
+		WillReturnError(sql.ErrNoRows)
+	mock.ExpectQuery(`WITH existing AS`).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("appr-core2574-secret-write"))
+	mock.ExpectQuery(`SELECT parent_id FROM workspaces WHERE id`).
+		WillReturnRows(sqlmock.NewRows([]string{"parent_id"}).AddRow(nil))
+
+	// NOTE: deliberately NO `INSERT INTO workspace_secrets` mock setup. If
+	// the gate is bypassed (the bug), the handler reaches the INSERT and
+	// sqlmock returns an error → test fails. The gate firing = no INSERT
+	// = test passes.
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "550e8400-e29b-41d4-a716-446655440000"}}
+
+	body := `{"key":"TEST_APPROVAL_SECRET","value":"should-have-required-approval"}`
+	c.Request = httptest.NewRequest("POST", "/workspaces/550e8400-e29b-41d4-a716-446655440000/secrets", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	// core#2574: the auth middleware sets caller_is_admin_token when
+	// the request authenticates via Tier 2b ADMIN_TOKEN.
+	c.Set("caller_is_admin_token", true)
+	c.Set("caller_credential_class", "admin-token")
+
+	// Rollout flag is OFF (default) — this is the regression assertion:
+	// even WITHOUT MOLECULE_PLATFORM_APPROVAL_GATE=1, the admin-token
+	// path MUST gate.
+	os.Unsetenv("MOLECULE_PLATFORM_APPROVAL_GATE")
+	defer os.Unsetenv("MOLECULE_PLATFORM_APPROVAL_GATE")
+
+	handler.Set(c)
+
+	// Gate fires → 202 Accepted with a pending approval_id.
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("admin-token + secret_write MUST return 202 (Phase-4 approval gate), got %d: %s",
+			w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to parse response: %v", err)
+	}
+	if resp["status"] != "pending_approval" {
+		t.Errorf("status = %v, want \"pending_approval\"", resp["status"])
+	}
+	if resp["approval_id"] != "appr-core2574-secret-write" {
+		t.Errorf("approval_id = %v, want \"appr-core2574-secret-write\"", resp["approval_id"])
+	}
+	if resp["action"] != "secret_write" {
+		t.Errorf("action = %v, want \"secret_write\"", resp["action"])
 	}
 }

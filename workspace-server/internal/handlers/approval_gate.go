@@ -142,21 +142,31 @@ func gateDestructive(c *gin.Context, b events.EventEmitter, workspaceID string, 
 	if !approvals.IsGated(action) {
 		return true
 	}
-	// Scope (RFC platform-agent Phase 4b). Wiring is a one-liner in each
-	// destructive handler; the activation policy lives here, centrally, so it is
-	// uniform and testable:
-	//   - default-OFF rollout flag, so the wiring is inert until an operator
-	//     enables it (mirrors the 3a/3c default-off design and protects existing
-	//     org-token automation from a surprise async-approval behaviour change);
-	//   - only callers holding an ORG token are gated. The platform agent runs
-	//     with MOLECULE_API_KEY=<org-admin token>, so the auth middleware sets
-	//     org_token_id. Ordinary workspace-token agents and human CP-session
-	//     operators (cp_session_actor — the approvers themselves) are NOT gated,
-	//     so normal operation is byte-identical. This realises the file-header
-	//     trust boundary ("anything holding an org-admin token still goes
-	//     through the gate") without gating everyone.
-	if !destructiveGateEnabled() || !callerHoldsOrgToken(c) {
-		return true
+	// Scope (RFC platform-agent Phase 4b, hardened by core#2574). The
+	// activation policy lives here, centrally, so it is uniform and testable:
+	//   - admin-token callers (Tier 2b ADMIN_TOKEN bootstrap + Tier 3
+	//     workspace-token fallback) are ALWAYS gated when the action is
+	//     gated — the rollout flag does NOT bypass them. This closes the
+	//     core#2574 privilege-escalation hole: the concierge agent holds
+	//     the tenant ADMIN_TOKEN and was minting org tokens + writing
+	//     secrets with ZERO pending approvals because the old code only
+	//     checked for org_token_id, which admin-token callers never set.
+	//     Admin-token-bearing agents are EXACTLY the human-in-the-loop
+	//     bypass risk the RFC Phase 4 was supposed to prevent.
+	//   - org-token callers (Tier 2a, user-minted via canvas UI) follow
+	//     the rollout flag (default-OFF; set MOLECULE_PLATFORM_APPROVAL_GATE=1
+	//     to enable). The default-off posture protects existing org-token
+	//     automation from a surprise async-approval behaviour change.
+	//   - non-agent callers (workspace tokens, session cookies) bypass
+	//     entirely — ordinary operation is byte-identical.
+	isAdminToken := callerIsAdminToken(c)
+	if !isAdminToken {
+		if !destructiveGateEnabled() {
+			return true
+		}
+		if !callerHoldsOrgToken(c) {
+			return true
+		}
 	}
 	approved, approvalID, err := requireApproval(c.Request.Context(), b, workspaceID, action, reason, contextMap)
 	if err != nil {
@@ -181,6 +191,9 @@ func gateDestructive(c *gin.Context, b events.EventEmitter, workspaceID string, 
 // MOLECULE_PLATFORM_APPROVAL_GATE=1 (or "true") — typically when the platform
 // agent is deployed to the org. Keeps 4b's wiring shipped-but-dormant, matching
 // the platform-agent feature's default-off posture (3a/3c).
+//
+// (core#2574) The flag is now an ORG-TOKEN-ONLY switch: the admin-token
+// path is gated regardless of the flag (see gateDestructive).
 func destructiveGateEnabled() bool {
 	v := os.Getenv("MOLECULE_PLATFORM_APPROVAL_GATE")
 	return v == "1" || v == "true"
@@ -193,4 +206,25 @@ func destructiveGateEnabled() bool {
 func callerHoldsOrgToken(c *gin.Context) bool {
 	_, ok := c.Get("org_token_id")
 	return ok
+}
+
+// callerIsAdminToken reports whether the request authenticated with the
+// tenant ADMIN_TOKEN (Tier 2b) or the Tier 3 workspace-token fallback
+// (which is admin-equivalent — closes #684 if the operator forgot to
+// set ADMIN_TOKEN). The auth middleware sets caller_is_admin_token in
+// both cases.
+//
+// (core#2574) This is the missing context that closes the privilege-
+// escalation bypass: the concierge agent holds ADMIN_TOKEN (NOT an
+// org token) and was minting org tokens + writing secrets with ZERO
+// pending approvals because callerHoldsOrgToken returned false for it
+// and the gate's rollout flag was off. The fix makes gateDestructive
+// always gate admin-token callers regardless of the rollout flag.
+func callerIsAdminToken(c *gin.Context) bool {
+	v, ok := c.Get("caller_is_admin_token")
+	if !ok {
+		return false
+	}
+	b, ok := v.(bool)
+	return ok && b
 }

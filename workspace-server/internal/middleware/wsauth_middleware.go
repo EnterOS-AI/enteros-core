@@ -245,6 +245,14 @@ func AdminAuth(database *sql.DB) gin.HandlerFunc {
 				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid admin auth token"})
 				return
 			}
+			// (core#2574) Mark the request as admin-token-authed so the
+			// approval gate can apply. Without this flag the gate's
+			// callerHoldsOrgToken helper only fires for org-token callers,
+			// and the concierge's admin-token path bypassed every gated
+			// verb (org_token_mint, secret_write) — see core#2574 for the
+			// live privilege-escalation evidence that motivated this fix.
+			c.Set("caller_is_admin_token", true)
+			c.Set("caller_credential_class", "admin-token")
 			c.Next()
 			return
 		}
@@ -255,6 +263,12 @@ func AdminAuth(database *sql.DB) gin.HandlerFunc {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid admin auth token"})
 			return
 		}
+		// (core#2574) Tier-3 fallback is also an "agent that can do org-admin
+		// things" — flag it for the gate too, so the gate doesn't accidentally
+		// bypass on a misconfigured deploy (no ADMIN_TOKEN, any workspace
+		// token accepted as admin). Without this, the bypass is silent.
+		c.Set("caller_is_admin_token", true)
+		c.Set("caller_credential_class", "admin-token-tier3-fallback")
 		c.Next()
 	}
 }

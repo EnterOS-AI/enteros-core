@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http"
 
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/approvals"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/orgtoken"
 	"github.com/gin-gonic/gin"
@@ -78,6 +79,30 @@ func (h *OrgTokenHandler) Create(c *gin.Context) {
 		return
 	}
 
+	// (core#2574) Phase-4 approval gate — org_token_mint is in the gated
+	// action set (approvals.ActionOrgTokenMint, approvals.IsGated). Without
+	// this gate call, an admin-token-bearing agent (the concierge uses
+	// MOLECULE_API_KEY = $ADMIN_TOKEN) could mint a full-tenant-admin org
+	// API token with ZERO pending approvals — a real privilege-escalation
+	// bypass that was exploited in the live incident (two live org tokens
+	// minted without human review, then operator-revoked). Now the agent
+	// gets HTTP 202 with an approval_id and has to retry after a human
+	// approves via /approvals/decide.
+	//
+	// workspaceID is empty for org-scoped operations (the approval row
+	// is keyed by workspace_id; the platform-org workspace is the concierge's
+	// own workspace, captured by the auth middleware as the caller's
+	// callerOrg() result — but at handler entry we use the caller's
+	// workspace from the org_token_id if present, else "" — the gate
+	// matches by (workspace_id, action, request_hash) so the same op
+	// retried by the same agent reuses its own pending approval).
+	ws := callerOrg(c)
+	if !gateDestructive(c, nil, ws, approvals.ActionOrgTokenMint,
+		"mint org token "+req.Name,
+		map[string]interface{}{"actor": orgTokenActorClass(c), "name": req.Name}) {
+		return
+	}
+
 	createdBy, orgID := orgTokenActor(c)
 
 	plaintext, id, err := orgtoken.Issue(c.Request.Context(), db.DB, req.Name, createdBy, orgID)
@@ -95,6 +120,27 @@ func (h *OrgTokenHandler) Create(c *gin.Context) {
 		Token:   plaintext,
 		Warning: "copy this token now; it will not be shown again",
 	})
+}
+
+// orgTokenActorClass returns the credential class label for the current
+// request, used in the approval gate's context (so an approval for "mint
+// from admin-token" cannot be replayed as "mint from org-token:abc" or
+// vice versa — the request_hash differs by credential class).
+func orgTokenActorClass(c *gin.Context) string {
+	if v, ok := c.Get("caller_credential_class"); ok {
+		if s, ok := v.(string); ok && s != "" {
+			return s
+		}
+	}
+	if v, ok := c.Get("org_token_prefix"); ok {
+		if s, ok := v.(string); ok && s != "" {
+			return actorOrgTokenPrefix + s
+		}
+	}
+	if c.GetHeader("Cookie") != "" {
+		return actorSession
+	}
+	return actorAdminToken
 }
 
 // Revoke flips revoked_at. 404 when the id doesn't exist OR was
