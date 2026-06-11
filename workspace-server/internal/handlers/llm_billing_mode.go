@@ -182,6 +182,18 @@ func orgDefaultForDisplay(orgMode string) string {
 	return LLMBillingModePlatformManaged
 }
 
+// recognizedOrgDefault returns the normalized, recognized org default value
+// and true when orgMode is a known billing mode (after trimming whitespace and
+// lower-casing). Callers use this single normalization point so the decision
+// semantics and the display value cannot drift.
+func recognizedOrgDefault(orgMode string) (string, bool) {
+	mode := strings.ToLower(strings.TrimSpace(orgMode))
+	if isKnownBillingMode(mode) {
+		return mode, true
+	}
+	return LLMBillingModePlatformManaged, false
+}
+
 // readWorkspaceBillingOverride reads the OPTIONAL explicit operator override
 // (workspaces.llm_billing_mode). Returns:
 //
@@ -239,13 +251,17 @@ func ResolveLLMBillingModeDerived(ctx context.Context, workspaceID, runtime, mod
 		// override exists (core#2608).
 		OrgDefault: orgDefaultForDisplay(orgMode),
 	}
+	// Normalize once and use the same value for both the decision and the
+	// empty-workspace path so callers cannot accidentally skip an org default
+	// because of casing or whitespace.
+	orgDefault, orgDefaultOK := recognizedOrgDefault(orgMode)
 
 	// Pre-provision context (no workspace row yet): no override to read.
 	// A recognized org default still applies (no DB needed); otherwise default
 	// closed. This path is reached from ResolveLLMBillingMode with an empty id.
 	if workspaceID == "" {
-		if orgMode != "" && isKnownBillingMode(orgMode) {
-			res.ResolvedMode = orgMode
+		if orgDefaultOK {
+			res.ResolvedMode = orgDefault
 			res.Source = BillingModeSourceOrgDefault
 			return res, nil
 		}
@@ -274,8 +290,8 @@ func ResolveLLMBillingModeDerived(ctx context.Context, workspaceID, runtime, mod
 	// models whose provider is not the closed `platform` provider. This closes
 	// core#2608: fresh SaaS tenants with platform_managed org default failed
 	// provision with MISSING_BYOK_CREDENTIAL because derivation ran first.
-	if orgMode != "" && isKnownBillingMode(orgMode) {
-		res.ResolvedMode = orgMode
+	if orgDefaultOK {
+		res.ResolvedMode = orgDefault
 		res.Source = BillingModeSourceOrgDefault
 		return res, nil
 	}
