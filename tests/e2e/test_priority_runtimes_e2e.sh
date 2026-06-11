@@ -838,8 +838,18 @@ print(json.dumps({'MINIMAX_API_KEY': os.environ['E2E_MINIMAX_API_KEY']}))
   # claude-code runtime image is already pulled; cold boot ~30-90s. The
   # first MiniMax cold-call can be slow but that's covered by send_test_prompt's
   # --max-time 180.
+  #
+  # Budget = 90s (was 240s): this is the BEST-EFFORT MiniMax arm (bestfail
+  # never reds the gate -- mock is the REQUIRE-LIVE backbone). 90s fully covers
+  # the documented claude-code cold-boot success window above, so a MiniMax
+  # workspace that genuinely converges is still caught + validated end-to-end;
+  # we only stop burning the extra 150s of dead-wait on the runs where it never
+  # leaves "provisioning" (the empirical CI case). E2E_MINIMAX_WAIT_SECS
+  # overrides if MiniMax CI provisioning is ever fixed. This step was ~80% of
+  # the REQUIRED "E2E API Smoke Test" wall-clock; cutting the dead-wait
+  # shortens every core PR time-to-merge without dropping a single assertion.
   local final
-  final=$(wait_for_status "$wsid" "online failed" 240) || true
+  final=$(wait_for_status "$wsid" "online failed" "${E2E_MINIMAX_WAIT_SECS:-90}") || true
   if [ "$final" != "online" ]; then
     bestfail "minimax workspace reaches online (best-effort)" "final status: $final"
     return 0
