@@ -30,7 +30,7 @@ name: lint-setup-go-cache
 # (advisory). FOLLOW-UP: after core#2524 merges and main is clean for
 # 3 days, flip continue-on-error -> false to make this a hard gate.
 # This PR already removes the default-true hits the sweep PR does not
-# touch (ci.yml, ci-arm64-advisory.yml, handlers-postgres-integration.yml,
+# touch (ci.yml, handlers-postgres-integration.yml,
 # weekly-platform-go.yml).
 
 on:
