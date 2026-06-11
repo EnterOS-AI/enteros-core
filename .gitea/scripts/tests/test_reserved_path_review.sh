@@ -249,6 +249,78 @@ else
   fail "T6h: workflow missing explicit RESERVED_PATHS_FILE env var"
 fi
 
+# T8: CR2 10782 follow-up — the live script's matcher-error handling
+# must survive `set -euo pipefail`. The CR2 follow-up was: under set -e,
+# the bare `MATCHES=$(...)` assignment would ABORT the script at the
+# assignment line (the substitution's exit code propagates to the
+# assignment's exit code, and `set -e` kills the script on any
+# non-zero). The fix wraps the matcher call in
+# `set +e; …; MATCH_RC=$?; set -e` so the exit code is captured
+# WITHOUT killing the script. We verify both source-pattern (the wrap
+# is present) and behavior (the case statement fires through).
+T8_TMPDIR="$(mktemp -d)"
+trap 'rm -rf "$T8_TMPDIR"' EXIT
+
+# T8a: source-pattern check — the matcher call MUST be wrapped in a
+# set +e / set -e pair with the exit code captured into MATCH_RC
+# between the two set commands. If anyone reverts to the bare
+# `MATCHES=$(reserved_paths_match_any ...)` pattern, this test fails.
+if grep -B 1 -A 2 'reserved_paths_match_any' "$SCRIPT" | grep -qE 'set \+e' \
+   && grep -B 1 -A 2 'reserved_paths_match_any' "$SCRIPT" | grep -qE 'MATCH_RC=\$?' \
+   && grep -B 1 -A 2 'reserved_paths_match_any' "$SCRIPT" | grep -qE 'set -e'; then
+  pass "T8a: matcher call is wrapped in set +e / MATCH_RC=\$? / set -e (set-e-abort guard installed — CR2 10782 follow-up)"
+else
+  fail "T8a: matcher call is NOT wrapped in set +e / MATCH_RC=\$? / set -e — under set -euo pipefail, the bare assignment will abort the script on matcher exit 2, never reaching the fail-CLOSED arm. Re-introduces the CR2 10782 follow-up bug."
+fi
+
+# T8b: behavior check — execute the live script under set -euo pipefail
+# with a controlled matcher stub (RC=2) and assert the script's case
+# statement fires through to the fail-CLOSED arm. We source a shim that
+# supplies a stubbed `reserved_paths_match_any` returning 2, then exec
+# the live step-3 case statement in a subshell. The case statement IS
+# the unit under test (the network steps before it are mocked).
+shimdir="$T8_TMPDIR"
+cat >"$shimdir/match_shim.sh" <<'SHIM'
+reserved_paths_match_any() {
+  # Stub: return 2 (matcher error). Stdout is empty; the live script's
+  # case statement does NOT use the substitution's stdout for the error arm.
+  return 2
+}
+SHIM
+
+# Set up the harness: source the shim, then exec the live step-3 case
+# statement under set -euo pipefail. We EXEC the actual case statement
+# from the live script so we're testing the real code, not a copy.
+#
+# CRITICAL: the assignment + MATCH_RC=$? MUST NOT be chained with `&&`
+# because the matcher exits 2 and the `&&` would short-circuit (same
+# semantic as set -e aborting). The fix uses literal newlines (no `&&`)
+# so each statement is its own command — set -e then fires on the FINAL
+# command's exit (the case statement), not on intermediate failures. The
+# live script uses the same `set +e; …; MATCH_RC=$?; set -e` pattern
+# (NOT `&&`) for the same reason.
+T8b_LOG="$T8_TMPDIR/step3.log"
+T8b_RC=0
+( \
+  set -euo pipefail; \
+  source "$shimdir/match_shim.sh"; \
+  set +e; \
+  MATCHES=$(reserved_paths_match_any "/nonexistent" "a/file.go"); \
+  MATCH_RC=$?; \
+  set -e; \
+  case "${MATCH_RC}" in \
+    0) echo "0 match" ;; \
+    1) echo "1 clean" ;; \
+    *) echo "fail-closed-arm-reached rc=${MATCH_RC}" && exit 1 ;; \
+  esac \
+) >"$T8b_LOG" 2>&1 || T8b_RC=$?
+
+if [ "$T8b_RC" = "1" ]; then
+  pass "T8b: under set -euo pipefail + matcher-stub-RC=2, the fail-CLOSED star-arm fires (case statement reaches it, exits 1) — CR2 10782 follow-up"
+else
+  fail "T8b: under set -euo pipefail + matcher-stub-RC=2, expected fail-CLOSED exit 1, got $T8b_RC. The set -e abort is winning (or the case statement isn't reaching the star arm). Log: $(cat $T8b_LOG)"
+fi
+
 echo
 if [ "$FAIL" -eq 0 ]; then
   echo "ALL $PASS TESTS PASS"

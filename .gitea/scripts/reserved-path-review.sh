@@ -91,8 +91,22 @@ done
 #    a spurious "no reserved path touched — gate N/A" success when the
 #    manifest was missing, silently letting reserved-path changes through.
 #    We now branch explicitly and fail-CLOSED on any non-0/1 (incl. 2).
+#
+#    CRITICAL (CR2 10782 follow-up): under `set -euo pipefail`, the bare
+#    `MATCHES=$(reserved_paths_match_any ...)` ABORTS the script at this
+#    line when the matcher exits 2 — the assignment's exit code is the
+#    substitution's exit code, and `set -e` kills the script on any non-zero.
+#    The fail-CLOSED `*)` arm below would NEVER run, defeating the fix.
+#    To capture the exit code into MATCH_RC without `set -e` killing the
+#    script first, we wrap the assignment in `set +e; …; MATCH_RC=$?; set -e`.
+#    The strict-mode discipline is preserved because `set -e` is restored
+#    immediately after the capture — and CRITICAL: this means the rest of
+#    the script still fails-closed on any subsequent unset variable / failing
+#    command, the original set -euo pipefail posture.
+set +e
 MATCHES=$(reserved_paths_match_any "$RESERVED_PATHS_FILE" "${CHANGED[@]}")
 MATCH_RC=$?
+set -e
 case "${MATCH_RC}" in
   0)
     echo "::notice::PR #${PR_NUMBER} touches reserved paths:"
