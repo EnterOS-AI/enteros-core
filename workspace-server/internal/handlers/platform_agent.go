@@ -163,6 +163,36 @@ const conciergeMCPFragmentFile = "mcp_servers.yaml"
 // sufficient and stable across restarts.
 var SelfHostedPlatformAgentID = uuid.NewSHA1(uuid.NameSpaceURL, []byte("molecule:self-hosted:platform-agent")).String()
 
+// platformRootWorkspaceID returns the org's single kind='platform' root
+// workspace id, or "" when there is none (pre-install / bootstrap) or more
+// than one (ambiguous — multi-org self-host DB; fail soft, change nothing).
+// Used by the workspace-create path to default parent_id (core#2609): a
+// workspace created without an explicit parent must land UNDER the org root,
+// not beside it — a parent_id-NULL orphan is outside the org subtree, so the
+// concierge cannot reach it over A2A ("cannot communicate per hierarchy
+// rules") and the canvas renders it depth-1 next to the root (#2601).
+func platformRootWorkspaceID(ctx context.Context) string {
+	rows, err := db.DB.QueryContext(ctx,
+		`SELECT id FROM workspaces WHERE COALESCE(kind, 'workspace') = 'platform' AND status != 'removed' LIMIT 2`)
+	if err != nil {
+		// Fail soft: defaulting the parent is best-effort; create must not
+		// fail because the root lookup hiccuped.
+		return ""
+	}
+	defer rows.Close()
+	ids := make([]string, 0, 2)
+	for rows.Next() {
+		var id string
+		if rows.Scan(&id) == nil {
+			ids = append(ids, id)
+		}
+	}
+	if len(ids) == 1 {
+		return ids[0]
+	}
+	return ""
+}
+
 // defaultPlatformAgentName returns the display name for the org's platform
 // agent (the concierge). When the tenant server is told its org's name via the
 // MOLECULE_ORG_NAME env (the self-hosted docker-compose sets it; SaaS passes an
