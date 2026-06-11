@@ -98,13 +98,13 @@ func TestGateDestructive_ScopeShortCircuits(t *testing.T) {
 
 	// flag OFF (default) + org-token + gated action → proceed (rollout dormant).
 	os.Unsetenv("MOLECULE_PLATFORM_APPROVAL_GATE")
-	if !gateDestructive(newCtx("org-token"), nil, "ws", approvals.ActionDeleteWorkspace, "r", nil) {
+	if !gateDestructive(newCtx("org-token"), nil, "ws", approvals.ActionSecretWrite, "r", nil) {
 		t.Error("flag off + org-token must proceed (gate dormant)")
 	}
 
 	// flag ON + NO agent credential (workspace/CP caller) → proceed.
 	t.Setenv("MOLECULE_PLATFORM_APPROVAL_GATE", "1")
-	if !gateDestructive(newCtx("none"), nil, "ws", approvals.ActionDeleteWorkspace, "r", nil) {
+	if !gateDestructive(newCtx("none"), nil, "ws", approvals.ActionSecretWrite, "r", nil) {
 		t.Error("non-agent caller must proceed (normal operation unchanged)")
 	}
 

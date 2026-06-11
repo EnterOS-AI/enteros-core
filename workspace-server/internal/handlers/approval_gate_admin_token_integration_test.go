@@ -129,7 +129,8 @@ func TestIntegration_AdminToken_OrgTokenMint_WithoutApproval_Rejected(t *testing
 	t.Cleanup(func() { db.DB = prev })
 	setupTestRedis(t)
 
-	_ = seedConciergeWorkspace(t, conn)
+	wsID := seedConciergeWorkspace(t, conn)
+	t.Setenv("MOLECULE_PLATFORM_WORKSPACE_ID", wsID)
 	os.Unsetenv("MOLECULE_PLATFORM_APPROVAL_GATE")
 
 	h := NewOrgTokenHandler()
@@ -224,7 +225,8 @@ func TestIntegration_AdminToken_OrgTokenMint_WithApproval_Succeeds(t *testing.T)
 	t.Cleanup(func() { db.DB = prev })
 	setupTestRedis(t)
 
-	_ = seedConciergeWorkspace(t, conn)
+	wsID := seedConciergeWorkspace(t, conn)
+	t.Setenv("MOLECULE_PLATFORM_WORKSPACE_ID", wsID)
 	os.Unsetenv("MOLECULE_PLATFORM_APPROVAL_GATE")
 
 	h := NewOrgTokenHandler()
@@ -356,7 +358,8 @@ func TestIntegration_AdminToken_OrgTokenMint_ExploitRegression(t *testing.T) {
 	t.Cleanup(func() { db.DB = prev })
 	setupTestRedis(t)
 
-	_ = seedConciergeWorkspace(t, conn)
+	wsID := seedConciergeWorkspace(t, conn)
+	t.Setenv("MOLECULE_PLATFORM_WORKSPACE_ID", wsID)
 
 	// The exploit ran with the default rollout flag OFF (no
 	// MOLECULE_PLATFORM_APPROVAL_GATE env var set). That is the
