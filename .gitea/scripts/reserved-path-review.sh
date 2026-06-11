@@ -83,14 +83,33 @@ while : ; do
 done
 
 # 3. Reserved-path match.
-if MATCHES=$(reserved_paths_match_any "$RESERVED_PATHS_FILE" "${CHANGED[@]}"); then
-  echo "::notice::PR #${PR_NUMBER} touches reserved paths:"
-  echo "$MATCHES" | sed 's/^/    /'
-else
-  echo "::notice::PR #${PR_NUMBER} touches no reserved path — gate N/A."
-  post_status "success" "No CTO-reserved path touched."
-  exit 0
-fi
+#    Matcher contract (reserved-path-match.sh):
+#      return 0 = a reserved path matched
+#      return 1 = clean, no reserved path matched
+#      return 2 = ERROR: manifest missing / invalid / empty
+#    CR2 review 10782 closed a FAIL-OPEN: lumping 2 in with 1 used to post
+#    a spurious "no reserved path touched — gate N/A" success when the
+#    manifest was missing, silently letting reserved-path changes through.
+#    We now branch explicitly and fail-CLOSED on any non-0/1 (incl. 2).
+MATCHES=$(reserved_paths_match_any "$RESERVED_PATHS_FILE" "${CHANGED[@]}")
+MATCH_RC=$?
+case "${MATCH_RC}" in
+  0)
+    echo "::notice::PR #${PR_NUMBER} touches reserved paths:"
+    echo "${MATCHES}" | sed 's/^/    /'
+    ;;
+  1)
+    echo "::notice::PR #${PR_NUMBER} touches no reserved path — gate N/A."
+    post_status "success" "No CTO-reserved path touched."
+    exit 0
+    ;;
+  *)
+    # 2 (or any other non-0/1) is an ERROR. Fail-CLOSED: do NOT pass.
+    echo "::error::reserved-paths.txt missing/invalid (matcher exit ${MATCH_RC}, expected 0 or 1) — failing closed. Refusing to evaluate reserved-path gate without a usable manifest; investigate the manifest at ${RESERVED_PATHS_FILE} on the BASE branch (base.sha) and re-run."
+    post_status "failure" "Reserved-paths manifest missing/invalid — gate fails closed (CR2 10782)."
+    exit 1
+    ;;
+esac
 
 # 4. Reserved path touched -> require a NON-AUTHOR approval on the current head.
 #    Gitea dismisses stale approvals on head-move, so an APPROVED+not-dismissed
