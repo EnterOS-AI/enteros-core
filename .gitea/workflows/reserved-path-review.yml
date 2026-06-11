@@ -84,50 +84,59 @@ jobs:
           # the next step covers the single PR that introduces the gate
           # (where BASE doesn't have the SCRIPT yet).
           ref: ${{ github.event.pull_request.base.sha }}
-      - name: Bootstrap fallback for the gate SCRIPT (only when base lacks it)
+      - name: Bootstrap fallback for the gate SCRIPT + helper (only when base lacks them)
         env:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
           SCRIPT_PATH=".gitea/scripts/reserved-path-review.sh"
-          if [ ! -f "$SCRIPT_PATH" ]; then
-            # The BASE branch lacks the gate SCRIPT (the single PR that
-            # introduces the gate). Bootstrap fallback: pull the SCRIPT
-            # from PR HEAD via `git fetch` + `git show`. The MANIFEST
-            # (handled by the next step) and the API-driven changed-files
-            # / reviews logic are independent of the PR's code, so the
-            # SCRIPT is the only piece that needs to be present locally.
-            # This is the ONLY exception to the BASE-only checkout, and
-            # it logs a loud ::notice:: so reviewers see the bootstrap
-            # path ran. Every later PR will have the SCRIPT on BASE, so
-            # the fallback is a no-op.
-            echo "::notice::BASE branch lacks the gate SCRIPT — bootstrap fallback to PR head's SCRIPT (head.sha=${HEAD_SHA:0:10}). This is expected for the single PR that introduces the gate; every later PR will use the base's SCRIPT."
+          # The gate SCRIPT `source`s its matcher helper, so BOTH must be
+          # present locally — fetching only the SCRIPT leaves it unable to
+          # source the helper at runtime (RC 10917: live job failed with
+          # "reserved-path-match.sh: No such file or directory").
+          HELPER_PATH=".gitea/scripts/reserved-path-match.sh"
+          if [ ! -f "$SCRIPT_PATH" ] || [ ! -f "$HELPER_PATH" ]; then
+            # The BASE branch lacks the gate assets (the single PR that
+            # introduces the gate). Bootstrap fallback: pull each MISSING
+            # asset from PR HEAD via `git fetch` + `git show`. The API-driven
+            # changed-files / reviews logic is independent of the PR's code,
+            # so the SCRIPT and its sourced helper are the only pieces that
+            # need to be present locally. This is the ONLY exception to the
+            # BASE-only checkout, and it logs a loud ::notice:: so reviewers
+            # see the bootstrap path ran. Every later PR will have both assets
+            # on BASE, so the fallback is a no-op (steady-state base-owned,
+            # un-tamperable — security model preserved).
+            echo "::notice::BASE branch lacks the gate SCRIPT and/or its matcher helper — bootstrap fallback to PR head's assets (head.sha=${HEAD_SHA:0:10}). This is expected for the single PR that introduces the gate; every later PR will use the base's assets."
             git fetch --depth=1 origin "${HEAD_SHA}" 2>/dev/null || git fetch origin "${HEAD_SHA}"
-            mkdir -p "$(dirname "$SCRIPT_PATH")"
-            git show "${HEAD_SHA}:${SCRIPT_PATH}" > "$SCRIPT_PATH"
-            chmod +x "$SCRIPT_PATH"
+            for asset in "$SCRIPT_PATH" "$HELPER_PATH"; do
+              if [ ! -f "$asset" ]; then
+                mkdir -p "$(dirname "$asset")"
+                git show "${HEAD_SHA}:${asset}" > "$asset"
+                chmod +x "$asset"
+              fi
+            done
           fi
       - name: Fetch BASE-branch reserved-paths manifest (security model)
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
           # The MANIFEST comes from BASE, not from the PR head. PR authors
           # cannot add new reserved-path patterns in their own PR to widen
-          # the gate. Bootstrap PR fallback: if base doesn't have the
-          # manifest yet (the single PR that introduces it), use the head's
-          # manifest and log loudly so reviewers know the bootstrap path ran.
-          if git show "${BASE_SHA}:.gitea/reserved-paths.txt" > .gitea/reserved-paths.txt.from-base 2>/dev/null; then
-            if [ -s .gitea/reserved-paths.txt.from-base ]; then
-              mv .gitea/reserved-paths.txt.from-base .gitea/reserved-paths.txt
-              echo "::notice::Using BASE-branch reserved-paths.txt (base.sha=${BASE_SHA:0:10}) — security model preserved"
-            else
-              echo "::notice::BASE-branch reserved-paths.txt is empty — bootstrap fallback to PR head's manifest (base.sha=${BASE_SHA:0:10})"
-              rm -f .gitea/reserved-paths.txt.from-base
-            fi
+          # the gate. Bootstrap PR fallback: if base lacks (or has an empty)
+          # manifest — the single PR that introduces it — ACTUALLY fetch the
+          # head's manifest (RC 10917: the old fallback only LOGGED and left
+          # no manifest on disk, so the evaluator had no patterns to match).
+          if git show "${BASE_SHA}:.gitea/reserved-paths.txt" > .gitea/reserved-paths.txt.from-base 2>/dev/null \
+             && [ -s .gitea/reserved-paths.txt.from-base ]; then
+            mv .gitea/reserved-paths.txt.from-base .gitea/reserved-paths.txt
+            echo "::notice::Using BASE-branch reserved-paths.txt (base.sha=${BASE_SHA:0:10}) — security model preserved"
           else
-            echo "::notice::BASE-branch has no reserved-paths.txt (base.sha=${BASE_SHA:0:10}) — bootstrap fallback to PR head's manifest. This is expected for the single PR that introduces the manifest; every later PR will use the base manifest."
             rm -f .gitea/reserved-paths.txt.from-base
+            echo "::notice::BASE-branch has no (or empty) reserved-paths.txt — bootstrap fallback to PR head's manifest (base.sha=${BASE_SHA:0:10}, head.sha=${HEAD_SHA:0:10}). Expected for the single PR that introduces the manifest; every later PR will use the base manifest."
+            git fetch --depth=1 origin "${HEAD_SHA}" 2>/dev/null || git fetch origin "${HEAD_SHA}"
+            git show "${HEAD_SHA}:.gitea/reserved-paths.txt" > .gitea/reserved-paths.txt
           fi
       - name: Evaluate reserved-path non-author-approval gate
         env:
