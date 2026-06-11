@@ -180,7 +180,7 @@ jobs:
             --health-retries 10 \
             -e POSTGRES_PASSWORD=test \
             -e POSTGRES_DB=molecule \
-            pgvector/pgvector:pg15-alpine >/dev/null
+            pgvector/pgvector:pg15 >/dev/null
 
           # Read back the bridge IP. Always present immediately after
           # `docker run -d` for bridge networks.

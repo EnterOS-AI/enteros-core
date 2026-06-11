@@ -8,7 +8,7 @@
 //
 //   docker run --rm -d --name pg-mem-integ \
 //     -e POSTGRES_PASSWORD=test -e POSTGRES_DB=molecule \
-//     -p 55432:5432 pgvector/pgvector:pg15-alpine
+//     -p 55432:5432 pgvector/pgvector:pg15
 //   sleep 4
 //   psql ... < workspace-server/cmd/memory-plugin-postgres/migrations/001_memory_v2.up.sql
 //   cd workspace-server
