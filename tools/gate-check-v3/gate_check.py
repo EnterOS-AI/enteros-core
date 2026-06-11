@@ -438,9 +438,9 @@ def signal_4_branch_divergence(
 # must pass before any PR can merge (SOP tier removal makes them mandatory
 # for all PRs, not just tier:medium/tier:high).
 GOVERNANCE_REQUIRED_CONTEXTS = [
-    "qa-review / approved (pull_request)",
-    "security-review / approved (pull_request)",
-    "sop-checklist / all-items-acked (pull_request)",
+    "qa-review / approved (pull_request_target)",
+    "security-review / approved (pull_request_target)",
+    "sop-checklist / all-items-acked (pull_request_target)",
 ]
 
 
