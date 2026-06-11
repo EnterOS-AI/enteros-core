@@ -64,6 +64,16 @@ interface Props {
   onTabChange?: (tab: PanelTab) => void;
   /** Initial tab for the uncontrolled (local-state) mode. Defaults to "chat". */
   defaultTab?: PanelTab;
+  /**
+   * Namespace for the tab/panel element ids (`{idPrefix}tab-chat`,
+   * `{idPrefix}panel-chat`). The primary map SidePanel keeps the default ""
+   * (stable `#tab-chat` hooks for tests/tools); any EMBEDDED instance MUST
+   * pass a unique prefix — two instances with the default collide on
+   * duplicate DOM ids, which is invalid HTML, breaks aria-controls, and
+   * broke the chat E2E with a Playwright strict-mode violation
+   * (`locator('#tab-chat') resolved to 2 elements`).
+   */
+  idPrefix?: string;
 }
 
 /**
@@ -75,7 +85,7 @@ interface Props {
  * Does NOT render the workspace header / meta pills / resize handle / footer —
  * those are host chrome and stay in the host (SidePanel for the map).
  */
-export function WorkspacePanelTabs({ node, activeTab, onTabChange, defaultTab = "chat" }: Props) {
+export function WorkspacePanelTabs({ node, activeTab, onTabChange, defaultTab = "chat", idPrefix = "" }: Props) {
   const restartWorkspace = useCanvasStore((s) => s.restartWorkspace);
 
   // Controlled when both props are present; otherwise own the state locally.
@@ -109,7 +119,7 @@ export function WorkspacePanelTabs({ node, activeTab, onTabChange, defaultTab = 
             else if (e.key === "End") { e.preventDefault(); next = WORKSPACE_PANEL_TABS.length - 1; }
             if (next !== null) {
               setTab(WORKSPACE_PANEL_TABS[next].id);
-              requestAnimationFrame(() => { const el = document.getElementById(`tab-${WORKSPACE_PANEL_TABS[next!].id}`); el?.focus(); el?.scrollIntoView({ block: "nearest", inline: "nearest" }); });
+              requestAnimationFrame(() => { const el = document.getElementById(`${idPrefix}tab-${WORKSPACE_PANEL_TABS[next!].id}`); el?.focus(); el?.scrollIntoView({ block: "nearest", inline: "nearest" }); });
             }
           }}
         >
@@ -117,10 +127,10 @@ export function WorkspacePanelTabs({ node, activeTab, onTabChange, defaultTab = 
             <button
               type="button"
               key={t.id}
-              id={`tab-${t.id}`}
+              id={`${idPrefix}tab-${t.id}`}
               role="tab"
               aria-selected={tab === t.id}
-              aria-controls={`panel-${t.id}`}
+              aria-controls={`${idPrefix}panel-${t.id}`}
               tabIndex={tab === t.id ? 0 : -1}
               onClick={() => setTab(t.id)}
               className={`shrink-0 px-3 py-2.5 text-[10px] font-medium tracking-wide transition-all rounded-t-lg mx-0.5 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/70 ${
@@ -167,8 +177,8 @@ export function WorkspacePanelTabs({ node, activeTab, onTabChange, defaultTab = 
       {/* Tab Content */}
       <div
         role="tabpanel"
-        id={`panel-${tab}`}
-        aria-labelledby={`tab-${tab}`}
+        id={`${idPrefix}panel-${tab}`}
+        aria-labelledby={`${idPrefix}tab-${tab}`}
         tabIndex={0}
         className="flex-1 overflow-y-auto focus:outline-none"
       >

@@ -418,7 +418,10 @@ test.describe("concierge Settings — two tabs", () => {
       wsTablist,
       "platform-agent Settings tab did not embed WorkspacePanelTabs",
     ).toBeVisible({ timeout: 15_000 });
-    await expect(page.locator("#tab-config")).toHaveAttribute(
+    // concierge-embedded WorkspacePanelTabs namespaces its ids with
+    // "concierge-" (duplicate-id fix); the bare #tab-* ids belong to the
+    // map SidePanel instance only.
+    await expect(page.locator("#concierge-tab-config")).toHaveAttribute(
       "aria-selected",
       "true",
     );
@@ -434,8 +437,8 @@ test.describe("concierge Settings — two tabs", () => {
       "schedule",
     ]) {
       await expect(
-        page.locator(`#tab-${id}`),
-        `WorkspacePanelTabs is missing #tab-${id}`,
+        page.locator(`#concierge-tab-${id}`),
+        `WorkspacePanelTabs is missing #concierge-tab-${id}`,
       ).toHaveCount(1);
     }
 
@@ -469,7 +472,7 @@ test.describe("concierge Settings — Config tab dropdowns", () => {
     ).toBeVisible({ timeout: 15_000 });
     // The runtime <select> sits under the "Runtime" label inside the Config
     // panel. Use the label association for a stable hook.
-    const runtimeByLabel = page.locator('#panel-config').getByLabel("Runtime", {
+    const runtimeByLabel = page.locator('#concierge-panel-config').getByLabel("Runtime", {
       exact: true,
     });
     await expect(
