@@ -702,6 +702,7 @@ func TestProxyA2A_CallerIDDerivedFromBearer(t *testing.T) {
 			sqlmock.AnyArg(), // $10 duration_ms
 			sqlmock.AnyArg(), // $11 status
 			sqlmock.AnyArg(), // $12 error_detail
+			sqlmock.AnyArg(), // $13 message_id (#2560 idempotent upsert)
 		).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
@@ -2055,6 +2056,7 @@ func TestHandleA2ADispatchError_BusyEnqueueLogsQueuedNotFailure(t *testing.T) {
 			sqlmock.AnyArg(),
 			"ok",
 			nil,
+			sqlmock.AnyArg(), // $13 message_id (#2560 idempotent upsert)
 		).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
