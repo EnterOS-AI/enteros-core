@@ -1247,3 +1247,353 @@ func TestSecretsSet_AdminToken_GatedByApproval(t *testing.T) {
 		t.Errorf("action = %v, want \"secret_write\"", resp["action"])
 	}
 }
+
+// TestSecretsSet_SkipSelfRestart_WhenCallerIsTarget (#2573): when an agent
+// writes a secret to its own workspace, auto-restart must NOT fire — otherwise
+// the restart kills the writing agent mid-turn.
+func TestSecretsSet_SkipSelfRestart_WhenCallerIsTarget(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+
+	restarted := make(chan string, 1)
+	restartFunc := func(wsID string) { restarted <- wsID }
+	handler := NewSecretsHandler(restartFunc)
+
+	mock.ExpectExec("INSERT INTO workspace_secrets").
+		WithArgs("550e8400-e29b-41d4-a716-446655440000", "DB_PASS", sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "550e8400-e29b-41d4-a716-446655440000"}}
+	body := `{"key":"DB_PASS","value":"password123"}`
+	c.Request = httptest.NewRequest("POST", "/workspaces/550e8400-e29b-41d4-a716-446655440000/secrets", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Request.Header.Set("X-Workspace-ID", "550e8400-e29b-41d4-a716-446655440000")
+
+	handler.Set(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	select {
+	case <-restarted:
+		t.Fatal("restart must NOT fire when caller is the target workspace")
+	case <-time.After(200 * time.Millisecond):
+		// Expected — no restart.
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// TestSecretsDelete_SkipSelfRestart_WhenCallerIsTarget (#2573): symmetric
+// skip for the DELETE path.
+func TestSecretsDelete_SkipSelfRestart_WhenCallerIsTarget(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+
+	restarted := make(chan string, 1)
+	restartFunc := func(wsID string) { restarted <- wsID }
+	handler := NewSecretsHandler(restartFunc)
+
+	mock.ExpectExec("DELETE FROM workspace_secrets WHERE workspace_id").
+		WithArgs("550e8400-e29b-41d4-a716-446655440000", "OLD_KEY").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{
+		{Key: "id", Value: "550e8400-e29b-41d4-a716-446655440000"},
+		{Key: "key", Value: "OLD_KEY"},
+	}
+	c.Request = httptest.NewRequest("DELETE", "/workspaces/550e8400-e29b-41d4-a716-446655440000/secrets/OLD_KEY", nil)
+	c.Request.Header.Set("X-Workspace-ID", "550e8400-e29b-41d4-a716-446655440000")
+
+	handler.Delete(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	select {
+	case <-restarted:
+		t.Fatal("restart must NOT fire when caller is the target workspace")
+	case <-time.After(200 * time.Millisecond):
+		// Expected — no restart.
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// TestSetGlobal_SkipSelfRestart_WhenCallerIsAffected (#2573): when the org
+// platform agent (caller) sets a global secret, its own workspace must be
+// excluded from the fan-out restart so it isn't killed mid-turn.
+func TestSetGlobal_SkipSelfRestart_WhenCallerIsAffected(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+
+	restarted := make(chan string, 4)
+	restartFunc := func(wsID string) { restarted <- wsID }
+	handler := NewSecretsHandler(restartFunc)
+
+	callerWS := "ws-caller-550e8400-e29b-41d4-a716-446655440000"
+
+	mock.ExpectExec("INSERT INTO global_secrets").
+		WithArgs("CLAUDE_CODE_OAUTH_TOKEN", sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// Query returns ws-a, ws-b, and the caller's workspace.
+	mock.ExpectQuery("SELECT id FROM workspaces").
+		WithArgs("CLAUDE_CODE_OAUTH_TOKEN").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).
+			AddRow("ws-a").
+			AddRow(callerWS).
+			AddRow("ws-b"))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	body := `{"key":"CLAUDE_CODE_OAUTH_TOKEN","value":"sk-ant-oat01-new"}`
+	c.Request = httptest.NewRequest("POST", "/admin/secrets", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Request.Header.Set("X-Workspace-ID", callerWS)
+
+	handler.SetGlobal(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	seen := map[string]bool{}
+	deadline := time.After(2 * time.Second)
+	for len(seen) < 2 {
+		select {
+		case id := <-restarted:
+			seen[id] = true
+		case <-deadline:
+			t.Fatalf("auto-restart not fired for all affected workspaces; got %v", seen)
+		}
+	}
+	if !seen["ws-a"] || !seen["ws-b"] {
+		t.Errorf("expected ws-a and ws-b restarted, got %v", seen)
+	}
+	if seen[callerWS] {
+		t.Errorf("caller workspace %q must NOT be restarted", callerWS)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// TestSecretsSet_SpoofedHeader_DoesNotSuppressRestart (core#2584 regression):
+// a request presenting a valid workspace bearer token MUST have its identity
+// derived from the token, NOT from a spoofed X-Workspace-ID header. If the
+// token says the caller is workspace A but the header claims workspace B
+// (the target), restart MUST still fire — the unsigned header must not
+// override authenticated identity.
+func TestSecretsSet_SpoofedHeader_DoesNotSuppressRestart(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+
+	restarted := make(chan string, 1)
+	restartFunc := func(wsID string) { restarted <- wsID }
+	handler := NewSecretsHandler(restartFunc)
+
+	// #2584: production order is INSERT (mutation) THEN callerWorkspaceID
+	// (the bearer-token lookup) — sqlmock is ordered, so expect INSERT first.
+	mock.ExpectExec("INSERT INTO workspace_secrets").
+		WithArgs("550e8400-e29b-41d4-a716-446655440000", "DB_PASS", sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// Token lookup: the bearer resolves to ws-caller, NOT the target.
+	mock.ExpectQuery(`SELECT t\.id, t\.workspace_id.*FROM workspace_auth_tokens t.*JOIN workspaces`).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "workspace_id"}).AddRow("tok-1", "ws-caller"))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "550e8400-e29b-41d4-a716-446655440000"}}
+	body := `{"key":"DB_PASS","value":"password123"}`
+	c.Request = httptest.NewRequest("POST", "/workspaces/550e8400-e29b-41d4-a716-446655440000/secrets", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Request.Header.Set("Authorization", "Bearer fake-workspace-token")
+	c.Request.Header.Set("X-Workspace-ID", "550e8400-e29b-41d4-a716-446655440000") // spoofed to match target
+
+	handler.Set(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	select {
+	case id := <-restarted:
+		if id != "550e8400-e29b-41d4-a716-446655440000" {
+			t.Fatalf("expected restart of target workspace, got %s", id)
+		}
+		// restart fired — spoofed header did NOT suppress it
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("restart MUST fire when token-derived caller differs from target; spoofed header must not suppress")
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// TestSecretsDelete_SpoofedHeader_DoesNotSuppressRestart (core#2584):
+// symmetric spoof-test for the DELETE path.
+func TestSecretsDelete_SpoofedHeader_DoesNotSuppressRestart(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+
+	restarted := make(chan string, 1)
+	restartFunc := func(wsID string) { restarted <- wsID }
+	handler := NewSecretsHandler(restartFunc)
+
+	// #2584: production order is DELETE (mutation) THEN callerWorkspaceID
+	// (the bearer-token lookup) — sqlmock is ordered, so expect DELETE first.
+	mock.ExpectExec("DELETE FROM workspace_secrets").
+		WithArgs("550e8400-e29b-41d4-a716-446655440000", "DB_PASS").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// Token lookup: the bearer resolves to ws-caller, NOT the target.
+	mock.ExpectQuery(`SELECT t\.id, t\.workspace_id.*FROM workspace_auth_tokens t.*JOIN workspaces`).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "workspace_id"}).AddRow("tok-1", "ws-caller"))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "550e8400-e29b-41d4-a716-446655440000"}, {Key: "key", Value: "DB_PASS"}}
+	c.Request = httptest.NewRequest("DELETE", "/workspaces/550e8400-e29b-41d4-a716-446655440000/secrets/DB_PASS", nil)
+	c.Request.Header.Set("Authorization", "Bearer fake-workspace-token")
+	c.Request.Header.Set("X-Workspace-ID", "550e8400-e29b-41d4-a716-446655440000") // spoofed
+
+	handler.Delete(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	select {
+	case id := <-restarted:
+		if id != "550e8400-e29b-41d4-a716-446655440000" {
+			t.Fatalf("expected restart of target workspace, got %s", id)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("restart MUST fire on DELETE when token-derived caller differs from target")
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// TestSetGlobal_SpoofedHeader_DoesNotSuppressRestart (core#2584):
+// global secret write with a spoofed X-Workspace-ID must use the token-derived
+// caller for the fan-out exclusion, not the header. ws-caller (from token) is
+// excluded; ws-target (from spoofed header) is NOT excluded and must be restarted.
+func TestSetGlobal_SpoofedHeader_DoesNotSuppressRestart(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+
+	restarted := make(chan string, 4)
+	restartFunc := func(wsID string) { restarted <- wsID }
+	handler := NewSecretsHandler(restartFunc)
+
+	// #2584: production order is INSERT (mutation) THEN callerWorkspaceID
+	// (the bearer-token lookup), THEN the affected-workspaces fan-out query.
+	mock.ExpectExec("INSERT INTO global_secrets").
+		WithArgs("GLOBAL_KEY", sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// Token lookup: bearer resolves to ws-caller (the exclusion), NOT the spoofed header.
+	mock.ExpectQuery(`SELECT t\.id, t\.workspace_id.*FROM workspace_auth_tokens t.*JOIN workspaces`).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "workspace_id"}).AddRow("tok-1", "ws-caller"))
+
+	// Affected workspaces: ws-target (does NOT have an overriding workspace secret).
+	mock.ExpectQuery("SELECT id FROM workspaces").
+		WithArgs("GLOBAL_KEY").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("ws-target"))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	body := `{"key":"GLOBAL_KEY","value":"global-val"}`
+	c.Request = httptest.NewRequest("POST", "/admin/secrets", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Request.Header.Set("Authorization", "Bearer fake-workspace-token")
+	c.Request.Header.Set("X-Workspace-ID", "ws-target") // spoofed
+
+	handler.SetGlobal(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	select {
+	case id := <-restarted:
+		if id != "ws-target" {
+			t.Fatalf("expected restart of ws-target, got %s", id)
+		}
+		// ws-target was restarted — it was NOT excluded (the exclusion was ws-caller from token)
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("ws-target MUST be restarted; spoofed header must not be used as exclusion")
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// TestDeleteGlobal_SpoofedHeader_DoesNotSuppressRestart (core#2584):
+// symmetric spoof-test for the global DELETE path.
+func TestDeleteGlobal_SpoofedHeader_DoesNotSuppressRestart(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+
+	restarted := make(chan string, 4)
+	restartFunc := func(wsID string) { restarted <- wsID }
+	handler := NewSecretsHandler(restartFunc)
+
+	// #2584: production order is DELETE (mutation) THEN callerWorkspaceID
+	// (the bearer-token lookup), THEN the affected-workspaces fan-out query.
+	mock.ExpectExec("DELETE FROM global_secrets").
+		WithArgs("GLOBAL_KEY").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// Token lookup: bearer resolves to ws-caller (the exclusion), NOT the spoofed header.
+	mock.ExpectQuery(`SELECT t\.id, t\.workspace_id.*FROM workspace_auth_tokens t.*JOIN workspaces`).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "workspace_id"}).AddRow("tok-1", "ws-caller"))
+
+	mock.ExpectQuery("SELECT id FROM workspaces").
+		WithArgs("GLOBAL_KEY").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("ws-target"))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "key", Value: "GLOBAL_KEY"}}
+	c.Request = httptest.NewRequest("DELETE", "/admin/secrets/GLOBAL_KEY", nil)
+	c.Request.Header.Set("Authorization", "Bearer fake-workspace-token")
+	c.Request.Header.Set("X-Workspace-ID", "ws-target") // spoofed
+
+	handler.DeleteGlobal(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	select {
+	case id := <-restarted:
+		if id != "ws-target" {
+			t.Fatalf("expected restart of ws-target, got %s", id)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("ws-target MUST be restarted on global DELETE; spoofed header must not be used as exclusion")
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
