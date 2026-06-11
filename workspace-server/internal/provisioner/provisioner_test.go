@@ -1471,7 +1471,7 @@ func TestMigrateVolumeIfNeeded_ExistingTruncatedVolume(t *testing.T) {
 		t.Skip("docker daemon unreachable:", pingErr)
 	}
 
-	p := &Provisioner{cli: cli}
+	p := &Provisioner{cli: cli, alpineImage: "alpine"}
 	workspaceID := "test-migrate-" + strconv.FormatInt(time.Now().UnixNano(), 10)
 	legacyName := legacyConfigVolumeName(workspaceID)
 	newName := ConfigVolumeName(workspaceID)

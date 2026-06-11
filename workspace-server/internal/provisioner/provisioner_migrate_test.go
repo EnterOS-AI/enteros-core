@@ -181,7 +181,7 @@ const migrateTestWorkspaceID = "abcdef1234567890"
 func TestResolveConfigVolumeName_LegacyExists_MigratesInPlace(t *testing.T) {
 	ctx := context.Background()
 	cli := newFakeDockerClient()
-	p := &Provisioner{cli: cli}
+	p := &Provisioner{cli: cli, alpineImage: "alpine"}
 
 	newName := ConfigVolumeName(migrateTestWorkspaceID)
 	legacyName := legacyConfigVolumeName(migrateTestWorkspaceID)
@@ -234,7 +234,7 @@ func TestResolveConfigVolumeName_LegacyExists_MigratesInPlace(t *testing.T) {
 func TestResolveConfigVolumeName_LegacyAbsent_NoMigration(t *testing.T) {
 	ctx := context.Background()
 	cli := newFakeDockerClient()
-	p := &Provisioner{cli: cli}
+	p := &Provisioner{cli: cli, alpineImage: "alpine"}
 
 	newName := ConfigVolumeName(migrateTestWorkspaceID)
 	legacyName := legacyConfigVolumeName(migrateTestWorkspaceID)
@@ -259,7 +259,7 @@ func TestResolveConfigVolumeName_LegacyAbsent_NoMigration(t *testing.T) {
 func TestResolveClaudeSessionVolumeName_LegacyExists_MigratesInPlace(t *testing.T) {
 	ctx := context.Background()
 	cli := newFakeDockerClient()
-	p := &Provisioner{cli: cli}
+	p := &Provisioner{cli: cli, alpineImage: "alpine"}
 
 	newName := ClaudeSessionVolumeName(migrateTestWorkspaceID)
 	legacyName := legacyClaudeSessionVolumeName(migrateTestWorkspaceID)
@@ -288,7 +288,7 @@ func TestResolveClaudeSessionVolumeName_LegacyExists_MigratesInPlace(t *testing.
 func TestResolveClaudeSessionVolumeName_LegacyAbsent_NoMigration(t *testing.T) {
 	ctx := context.Background()
 	cli := newFakeDockerClient()
-	p := &Provisioner{cli: cli}
+	p := &Provisioner{cli: cli, alpineImage: "alpine"}
 
 	newName := ClaudeSessionVolumeName(migrateTestWorkspaceID)
 	legacyName := legacyClaudeSessionVolumeName(migrateTestWorkspaceID)
@@ -308,7 +308,7 @@ func TestResolveClaudeSessionVolumeName_LegacyAbsent_NoMigration(t *testing.T) {
 func TestMigrateVolumeIfNeeded_CopyFails_PreservesLegacy(t *testing.T) {
 	ctx := context.Background()
 	cli := newFakeDockerClient()
-	p := &Provisioner{cli: cli}
+	p := &Provisioner{cli: cli, alpineImage: "alpine"}
 
 	newName := ConfigVolumeName(migrateTestWorkspaceID)
 	legacyName := legacyConfigVolumeName(migrateTestWorkspaceID)
@@ -328,7 +328,7 @@ func TestMigrateVolumeIfNeeded_CopyFails_PreservesLegacy(t *testing.T) {
 func TestStop_FullIDAbsent_LegacyRemoved(t *testing.T) {
 	ctx := context.Background()
 	cli := newFakeDockerClient()
-	p := &Provisioner{cli: cli}
+	p := &Provisioner{cli: cli, alpineImage: "alpine"}
 
 	newName := ContainerName(migrateTestWorkspaceID)
 	legacyName := legacyContainerName(migrateTestWorkspaceID)
@@ -355,7 +355,7 @@ func TestStop_FullIDAbsent_LegacyRemoved(t *testing.T) {
 func TestStop_BothAbsent_IsNoOp(t *testing.T) {
 	ctx := context.Background()
 	cli := newFakeDockerClient()
-	p := &Provisioner{cli: cli}
+	p := &Provisioner{cli: cli, alpineImage: "alpine"}
 
 	newName := ContainerName(migrateTestWorkspaceID)
 	legacyName := legacyContainerName(migrateTestWorkspaceID)
