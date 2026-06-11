@@ -595,7 +595,11 @@ export function ConciergeShell() {
                       </div>
                       {platformRoot ? (
                         <div className={s.embedPanel}>
-                          <WorkspacePanelTabs key={platformRoot.id} node={platformRoot} defaultTab="config" />
+                          {/* idPrefix: this is a SECOND WorkspacePanelTabs instance —
+                              without a namespace its tab/panel ids collide with the
+                              map SidePanel's (#tab-chat duplicated → invalid HTML,
+                              broken aria-controls, Playwright strict-mode failures). */}
+                          <WorkspacePanelTabs key={platformRoot.id} node={platformRoot} defaultTab="config" idPrefix="concierge-" />
                         </div>
                       ) : (
                         <div className={s.scardDesc}>
