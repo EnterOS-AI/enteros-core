@@ -57,7 +57,6 @@ permissions:
   statuses: write
 
 jobs:
-  # bp-required: pending #673 — the reserved-path-review self-merge guard
   # IS intended to be branch-protection-enforced (that's its purpose —
   # closes cp#673). But main BP currently has 0 status_check_contexts
   # (see .gitea/required-contexts.txt, only CI / all-required /
@@ -68,6 +67,7 @@ jobs:
   # cp#673. (The actual addition of `reserved-path-review` to main
   # BP status_check_contexts is an OPERATOR action — not in scope for
   # the lint or this PR.)
+  # bp-required: pending #673 — the reserved-path-review self-merge guard
   reserved-path-review:
     runs-on: ubuntu-latest
     # Draft PRs can't merge anyway; skip to save a runner. Still runs on
