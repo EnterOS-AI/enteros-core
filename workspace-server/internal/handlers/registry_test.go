@@ -2424,6 +2424,9 @@ func TestRegister_Unauthenticated401DoesNotStamp(t *testing.T) {
 // TestRegister_SuccessClearsLastRegisterFailure (#2530): a successful register
 // must clear last_register_failure_at so heartbeat can recover to online.
 func TestRegister_SuccessClearsLastRegisterFailure(t *testing.T) {
+	// SaaS mode so the platform-tunnel hostname (ws-reg-ok.moleculesai.app) is
+	// allowed while its DNS settles, instead of failing the SSRF DNS lookup in CI.
+	t.Setenv("MOLECULE_DEPLOY_MODE", "saas")
 	mock := setupTestDB(t)
 	setupTestRedis(t)
 	broadcaster := newTestBroadcaster()
