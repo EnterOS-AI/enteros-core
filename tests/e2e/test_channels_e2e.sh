@@ -122,10 +122,8 @@ cleanup() {
     wid="${pair%%|*}"; pair="${pair#*|}"
     tok="${pair%%|*}"; name="${pair#*|}"
     [ -z "$wid" ] && continue
-    local auth=("${ADMIN_AUTH[@]}")
-    [ -n "$tok" ] && auth=(-H "Authorization: Bearer $tok")
-    curl -s -X DELETE "$BASE/workspaces/$wid?confirm=true&purge=true" \
-      -H "X-Confirm-Name: $name" "${auth[@]}" >/dev/null 2>&1
+    e2e_gated_admin_op "$wid" curl -s -X DELETE "$BASE/workspaces/$wid?confirm=true&purge=true" \
+      -H "X-Confirm-Name: $name" "${ADMIN_AUTH[@]}" >/dev/null 2>&1
   done
   rm -rf "$WORK_DIR" 2>/dev/null
 }
@@ -418,17 +416,13 @@ fi
 # DELETE /workspaces/:id is AdminAuth-gated (router.go:167); Tier-2b rejects a
 # workspace bearer when ADMIN_TOKEN is set, so this MUST use the admin bearer.
 # X-Confirm-Name must equal the workspace name (the destructive-delete guard).
-PURGE_AUTH=("${ADMIN_AUTH[@]}")
-[ ${#PURGE_AUTH[@]} -eq 0 ] && [ -n "$WS_TARGET_TOK" ] && PURGE_AUTH=(-H "Authorization: Bearer $WS_TARGET_TOK")
-PURGE=$(curl -s -w $'\n%{http_code}' -X DELETE \
+PURGE=$(e2e_gated_admin_op "$WS_TARGET" curl -s -X DELETE \
   "$BASE/workspaces/$WS_TARGET?confirm=true&purge=true" \
-  -H "X-Confirm-Name: e2e-chan-target-$$" "${PURGE_AUTH[@]}")
-PURGE_CODE=$(printf '%s' "$PURGE" | tail -n1)
-PURGE_BODY=$(printf '%s' "$PURGE" | sed '$d')
-if [ "$PURGE_CODE" = "200" ] && printf '%s' "$PURGE_BODY" | grep -qF '"status":"purged"'; then
+  -H "X-Confirm-Name: e2e-chan-target-$$" "${ADMIN_AUTH[@]}")
+if printf '%s' "$PURGE" | grep -qF '"status":"purged"'; then
   pass "DELETE ?purge=true returned purged"
 else
-  fail "DELETE ?purge=true" "code=$PURGE_CODE body=$PURGE_BODY"
+  fail "DELETE ?purge=true" "body=$PURGE"
 fi
 # Target was purged → its token is revoked; query its channels with admin
 # bearer. The purge hard-deletes workspace_channels rows for the target.

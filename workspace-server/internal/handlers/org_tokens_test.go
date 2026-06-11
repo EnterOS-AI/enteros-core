@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -117,86 +119,256 @@ func TestOrgTokenHandler_Create_ActorFromAdminToken(t *testing.T) {
 	h, mock, cleanup := setupOrgTokenTest(t)
 	defer cleanup()
 
-	// No Cookie header, no org_token_prefix → actor should be
-	// "admin-token" (bootstrap path).
-	mock.ExpectQuery(`INSERT INTO org_api_tokens`).
-		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), "my-ci", actorAdminToken, nil).
-		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("tok-1"))
+	// (core#2574 / #2579) The Phase-4 approval gate now fires on
+	// admin-token org_token_mint. The test sets MOLECULE_PLATFORM_
+	// WORKSPACE_ID to derive the approval anchor, then mocks the
+	// approval flow + the post-gate INSERT.
+	const platformOrgWS = "00000000-0000-0000-0000-00000000aaff"
+	t.Setenv("MOLECULE_PLATFORM_WORKSPACE_ID", platformOrgWS)
+	os.Unsetenv("MOLECULE_PLATFORM_APPROVAL_GATE")
+	defer os.Unsetenv("MOLECULE_PLATFORM_APPROVAL_GATE")
+
+	// requireApproval's 3-query sequence for the gate (no prior approval):
+	mock.ExpectQuery(`UPDATE approval_requests SET consumed_at`).
+		WillReturnError(sql.ErrNoRows)
+	mock.ExpectQuery(`WITH existing AS`).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("appr-actor-admin"))
+	mock.ExpectQuery(`SELECT parent_id FROM workspaces WHERE id`).
+		WithArgs(platformOrgWS).
+		WillReturnRows(sqlmock.NewRows([]string{"parent_id"}).AddRow(nil))
+
+	// (core#2574 / #2579) Deliberately NO `INSERT INTO org_api_tokens`
+	// mock setup. The gate returns proceed=false → the post-gate
+	// orgtoken.Issue call is NEVER reached. If the gate is bypassed
+	// (regression), the unmocked INSERT will fail and this test
+	// will fail (sqlmock will surface the unfulfilled expectation
+	// as an error).
 
 	c, w := buildCtx("POST", "/org/tokens", `{"name":"my-ci"}`)
+	c.Set("caller_is_admin_token", true)
+	c.Set("caller_credential_class", "admin-token")
 	h.Create(c)
 
-	if w.Code != http.StatusOK {
-		t.Fatalf("want 200, got %d: %s", w.Code, w.Body.String())
+	// (core#2574 / #2579) Gate fires correctly → 202 with
+	// approval_id; the post-gate INSERT mock is therefore NOT
+	// called (gateDestructive returns false before orgtoken.Issue).
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("admin-token + gated action MUST return 202 (Phase-4 approval gate), got %d: %s",
+			w.Code, w.Body.String())
 	}
 	var body struct {
-		ID      string `json:"id"`
-		Prefix  string `json:"prefix"`
-		Name    string `json:"name"`
-		Token   string `json:"auth_token"`
-		Warning string `json:"warning"`
+		Status     string `json:"status"`
+		ApprovalID string `json:"approval_id"`
+		Action     string `json:"action"`
+		Reason     string `json:"reason"`
 	}
 	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	if body.Token == "" {
-		t.Errorf("plaintext auth_token missing from response")
+	if body.Status != "pending_approval" {
+		t.Errorf("status = %q, want pending_approval", body.Status)
 	}
-	if body.Prefix != body.Token[:8] {
-		t.Errorf("prefix %q should equal first 8 chars of token %q", body.Prefix, body.Token[:8])
+	if body.ApprovalID != "appr-actor-admin" {
+		t.Errorf("approval_id = %q, want appr-actor-admin", body.ApprovalID)
 	}
-	if body.Name != "my-ci" {
-		t.Errorf("name round-trip mismatch: %q", body.Name)
+	if body.Action != "org_token_mint" {
+		t.Errorf("action = %q, want org_token_mint", body.Action)
 	}
-	if body.Warning == "" {
-		t.Errorf("warning text missing")
-	}
+	// Sanity: post-gate INSERT was NOT called (gate fired).
 	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("unmet: %v", err)
+		t.Errorf("unmet (post-gate INSERT should not be called): %v", err)
 	}
 }
 
 func TestOrgTokenHandler_Create_ActorFromOrgTokenPrefix(t *testing.T) {
-	h, mock, cleanup := setupOrgTokenTest(t)
+	h, _, cleanup := setupOrgTokenTest(t)
 	defer cleanup()
 
-	// When an existing org token authenticated the mint, audit
-	// records "org-token:<prefix>" using the 8-char plaintext
-	// prefix from the presenter's token.
-	mock.ExpectQuery(`INSERT INTO org_api_tokens`).
-		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), nil, actorOrgTokenPrefix+"parent12", nil).
-		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("tok-new"))
+	// (core#2574 / #2579) The Phase-4 approval gate fires for ALL
+	// gated callers — org-token too. The caller's org_id is the
+	// approval anchor (callerOrg returns the token's org_id; the
+	// integration test only sets the prefix, so callerOrg returns ""
+	// here — but the gate is still in effect). The org-token-with-
+	// prefix context alone is not enough; a token record must also
+	// exist for the prefix to resolve to an org_id. This test now
+	// expects the 4xx (no anchor) since no platform workspace is
+	// set and the prefix is not backed by a token row. Pin the
+	// controlled-4xx contract for org-token-prefix-only requests.
+	os.Unsetenv("MOLECULE_PLATFORM_WORKSPACE_ID")
+	defer os.Unsetenv("MOLECULE_PLATFORM_WORKSPACE_ID")
+	os.Unsetenv("MOLECULE_PLATFORM_APPROVAL_GATE")
+	defer os.Unsetenv("MOLECULE_PLATFORM_APPROVAL_GATE")
 
 	c, w := buildCtx("POST", "/org/tokens", `{}`)
 	c.Set("org_token_prefix", "parent12")
 	h.Create(c)
 
-	if w.Code != http.StatusOK {
-		t.Fatalf("want 200, got %d: %s", w.Code, w.Body.String())
+	// Gate fires → 202 (NOT 200): the prefix is the actor label,
+	// but the actual approval anchor is the org_id (which the test
+	// does not provide via DB lookup). Empty anchor → 4xx.
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("org-token prefix without resolved org_id MUST return 400, got %d: %s",
+			w.Code, w.Body.String())
 	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("unmet: %v", err)
+}
+
+// (core#2574) Regression test: an admin-token-bearing caller (the
+// concierge agent holds $ADMIN_TOKEN) MUST be gated by the Phase-4
+// approval gate when minting an org token. The live incident (2026-06-11)
+// had the gate INERT on the admin-token path — two live full-tenant-admin
+// org API tokens were minted with zero pending approvals. The fix wires
+// gateDestructive into OrgTokenHandler.Create and the gate's
+// callerIsAdminToken detection overrides the rollout flag (admin-token
+// is ALWAYS gated when the action is gated, regardless of the flag).
+func TestOrgTokenHandler_Create_AdminToken_GatedByApproval(t *testing.T) {
+	h, mock, cleanup := setupOrgTokenTest(t)
+	defer cleanup()
+
+	// requireApproval sequence for an admin-token caller (gated action,
+	// no pre-existing approval):
+	//   1. UPDATE approval_requests SET consumed_at = now() … RETURNING id
+	//      → no row (sql.ErrNoRows)
+	//   2. WITH existing AS … INSERT INTO approval_requests … RETURNING id
+	//   3. SELECT parent_id FROM workspaces WHERE id → NULL
+	mock.ExpectQuery(`UPDATE approval_requests SET consumed_at`).
+		WillReturnError(sql.ErrNoRows)
+	mock.ExpectQuery(`WITH existing AS`).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("appr-core2574-org-mint"))
+	mock.ExpectQuery(`SELECT parent_id FROM workspaces WHERE id`).
+		WillReturnRows(sqlmock.NewRows([]string{"parent_id"}).AddRow(nil))
+
+	// NOTE: deliberately NO `INSERT INTO org_api_tokens` mock setup. If
+	// the gate is bypassed (the bug), the handler will reach the
+	// orgtoken.Issue call and try to run that INSERT against the mock,
+	// which has no expectation — sqlmock will return an error and the test
+	// will fail. The gate firing = no INSERT = test passes.
+
+	c, w := buildCtx("POST", "/org/tokens", `{"name":"concierge-rogue-mint"}`)
+	// core#2574: the auth middleware sets caller_is_admin_token when the
+	// request authenticates via Tier 2b ADMIN_TOKEN (or Tier 3 workspace-
+	// token fallback). Simulate that here.
+	c.Set("caller_is_admin_token", true)
+	c.Set("caller_credential_class", "admin-token")
+
+	// The rollout flag is OFF (default) — this is the regression
+	// assertion: even without MOLECULE_PLATFORM_APPROVAL_GATE, the
+	// admin-token path must gate.
+	os.Unsetenv("MOLECULE_PLATFORM_APPROVAL_GATE")
+	defer os.Unsetenv("MOLECULE_PLATFORM_APPROVAL_GATE")
+
+	// (core#2579) Admin-token callers need a valid UUID anchor for
+	// requireApproval's approval_requests.workspace_id query. Set the
+	// platform-org workspace ID for the duration of the test. The
+	// approval row keys by this UUID; the test's mock for the
+	// SELECT parent_id FROM workspaces query returns nil (a root
+	// workspace — the platform-org row is parent_id NULL).
+	const platformOrgWS = "00000000-0000-0000-0000-00000000aaff"
+	t.Setenv("MOLECULE_PLATFORM_WORKSPACE_ID", platformOrgWS)
+
+	h.Create(c)
+
+	// Gate fires → 202 Accepted with a pending approval_id.
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("admin-token + gated action MUST return 202 (Phase-4 approval gate), got %d: %s",
+			w.Code, w.Body.String())
+	}
+	var body struct {
+		Status     string `json:"status"`
+		ApprovalID string `json:"approval_id"`
+		Action     string `json:"action"`
+		Reason     string `json:"reason"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if body.Status != "pending_approval" {
+		t.Errorf("status = %q, want \"pending_approval\"", body.Status)
+	}
+	if body.ApprovalID != "appr-core2574-org-mint" {
+		t.Errorf("approval_id = %q, want \"appr-core2574-org-mint\"", body.ApprovalID)
+	}
+	if body.Action != "org_token_mint" {
+		t.Errorf("action = %q, want \"org_token_mint\"", body.Action)
+	}
+	if body.Reason == "" {
+		t.Errorf("reason text missing — operators need a human-readable explanation for the pending approval")
+	}
+}
+
+// TestOrgTokenHandler_Create_AdminToken_NoAnchor_Returns400 (core#2579)
+// pins the controlled-4xx behavior for the empty-anchor path: when
+// an admin-token caller hits org_token_mint WITHOUT
+// MOLECULE_PLATFORM_WORKSPACE_ID set, the handler returns 400 with a
+// clear hint (not 500, not a UUID-syntax error, not a silent
+// gate-bypass). Regression: previous code passed callerOrg(c)=""
+// directly into gateDestructive → requireApproval's
+// approval_requests.workspace_id query failed with
+// "invalid input syntax for type uuid: \"\"" → 500 from handler →
+// the unmonitored 500 looked like a transient infra failure, not a
+// security gate. The fix: derive a valid anchor FIRST (env-var for
+// admin-token, org_id for org-token, 4xx for everything else).
+func TestOrgTokenHandler_Create_AdminToken_NoAnchor_Returns400(t *testing.T) {
+	h, _, cleanup := setupOrgTokenTest(t)
+	defer cleanup()
+
+	// Admin-token caller with NO env var and no org_token_id →
+	// callerOrg="" → no approval anchor. UNSET the env explicitly
+	// to ensure a clean slate (other tests in the package may set it).
+	os.Unsetenv("MOLECULE_PLATFORM_WORKSPACE_ID")
+	defer os.Unsetenv("MOLECULE_PLATFORM_WORKSPACE_ID")
+	os.Unsetenv("MOLECULE_PLATFORM_APPROVAL_GATE")
+	defer os.Unsetenv("MOLECULE_PLATFORM_APPROVAL_GATE")
+
+	c, w := buildCtx("POST", "/org/tokens", `{"name":"rogue-mint-no-anchor"}`)
+	c.Set("caller_is_admin_token", true)
+	c.Set("caller_credential_class", "admin-token")
+
+	h.Create(c)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("admin-token WITHOUT platform workspace anchor MUST return 400 (controlled), got %d: %s",
+			w.Code, w.Body.String())
+	}
+	var body struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if body.Error == "" {
+		t.Errorf("error message missing — operators need the hint about MOLECULE_PLATFORM_WORKSPACE_ID")
+	}
+	// Sanity: the hint must mention the env var so an operator
+	// who hit this in prod knows exactly what to set.
+	if !strings.Contains(body.Error, "MOLECULE_PLATFORM_WORKSPACE_ID") {
+		t.Errorf("error message should mention the env var hint; got: %q", body.Error)
 	}
 }
 
 func TestOrgTokenHandler_Create_ActorFromSession(t *testing.T) {
-	h, mock, cleanup := setupOrgTokenTest(t)
+	h, _, cleanup := setupOrgTokenTest(t)
 	defer cleanup()
 
-	// Cookie present but no org_token_prefix — that's the canvas
-	// session path. Today recorded as bare "session". When the
-	// follow-up captures WorkOS user_id, this test changes to
-	// "session:user_01XXX".
-	mock.ExpectQuery(`INSERT INTO org_api_tokens`).
-		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), "from-browser", actorSession, nil).
-		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("tok-browser"))
+	// (core#2574 / #2579) Cookie present, no org_token_prefix, no
+	// org_token_id, no admin-token env var. The session path has
+	// no resolvable approval anchor — callerOrg returns "" and
+	// the env var is unset. Per approvalAnchorForGate contract,
+	// this returns a controlled 4xx. The gate works correctly:
+	// session callers cannot mint org tokens without an explicit
+	// org_id (set via the platform workspace env, or by calling
+	// through the concierge with an org-token credential).
+	os.Unsetenv("MOLECULE_PLATFORM_WORKSPACE_ID")
+	defer os.Unsetenv("MOLECULE_PLATFORM_WORKSPACE_ID")
+	os.Unsetenv("MOLECULE_PLATFORM_APPROVAL_GATE")
+	defer os.Unsetenv("MOLECULE_PLATFORM_APPROVAL_GATE")
 
 	c, w := buildCtx("POST", "/org/tokens", `{"name":"from-browser"}`)
 	c.Request.Header.Set("Cookie", "mcp_session=abc")
 	h.Create(c)
 
-	if w.Code != http.StatusOK {
-		t.Fatalf("want 200, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("session caller without resolvable org_id MUST return 400, got %d: %s",
+			w.Code, w.Body.String())
 	}
 }
 
@@ -224,16 +396,50 @@ func TestOrgTokenHandler_Create_NameTooLong400(t *testing.T) {
 func TestOrgTokenHandler_Create_EmptyBodyOK(t *testing.T) {
 	h, mock, cleanup := setupOrgTokenTest(t)
 	defer cleanup()
-	// Empty POST must still mint a token — name is optional.
+
+	// (core#2574 / #2579) Empty body → admin-token caller path
+	// (no Cookie, no org_token_prefix). With platform workspace
+	// set, the gate fires; the test mocks the approval flow.
+	const platformOrgWS = "00000000-0000-0000-0000-00000000aaff"
+	t.Setenv("MOLECULE_PLATFORM_WORKSPACE_ID", platformOrgWS)
+	os.Unsetenv("MOLECULE_PLATFORM_APPROVAL_GATE")
+	defer os.Unsetenv("MOLECULE_PLATFORM_APPROVAL_GATE")
+
+	mock.ExpectQuery(`UPDATE approval_requests SET consumed_at`).
+		WillReturnError(sql.ErrNoRows)
+	mock.ExpectQuery(`WITH existing AS`).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("appr-empty-body"))
+	mock.ExpectQuery(`SELECT parent_id FROM workspaces WHERE id`).
+		WithArgs(platformOrgWS).
+		WillReturnRows(sqlmock.NewRows([]string{"parent_id"}).AddRow(nil))
 	mock.ExpectQuery(`INSERT INTO org_api_tokens`).
 		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), nil, actorAdminToken, nil).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("tok-min"))
 
 	c, w := buildCtx("POST", "/org/tokens", "")
+	c.Set("caller_is_admin_token", true)
+	c.Set("caller_credential_class", "admin-token")
 	h.Create(c)
 
-	if w.Code != http.StatusOK {
-		t.Errorf("empty body should mint OK; got %d: %s", w.Code, w.Body.String())
+	// (core#2574 / #2579) Gate fires correctly → 202 with
+	// approval_id (admin-token + gated action). The pre-gate
+	// expectations are met (approval flow); the post-gate
+	// orgtoken.Issue INSERT was NOT called (gate returned false).
+	if w.Code != http.StatusAccepted {
+		t.Errorf("empty body admin-token: gate MUST return 202, got %d: %s", w.Code, w.Body.String())
+	}
+	var body struct {
+		Status     string `json:"status"`
+		ApprovalID string `json:"approval_id"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if body.Status != "pending_approval" {
+		t.Errorf("status = %q, want pending_approval", body.Status)
+	}
+	if body.ApprovalID != "appr-empty-body" {
+		t.Errorf("approval_id = %q, want appr-empty-body", body.ApprovalID)
 	}
 }
 

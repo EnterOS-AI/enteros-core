@@ -4,7 +4,9 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/approvals"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/orgtoken"
 	"github.com/gin-gonic/gin"
@@ -78,6 +80,40 @@ func (h *OrgTokenHandler) Create(c *gin.Context) {
 		return
 	}
 
+	// (core#2574) Phase-4 approval gate — org_token_mint is in the gated
+	// action set (approvals.ActionOrgTokenMint, approvals.IsGated). Without
+	// this gate call, an admin-token-bearing agent (the concierge uses
+	// MOLECULE_API_KEY = $ADMIN_TOKEN) could mint a full-tenant-admin org
+	// API token with ZERO pending approvals — a real privilege-escalation
+	// bypass that was exploited in the live incident (two live org tokens
+	// minted without human review, then operator-revoked). Now the agent
+	// gets HTTP 202 with an approval_id and has to retry after a human
+	// approves via /approvals/decide.
+	//
+	// (core#2579) Approvals are keyed by workspace_id (UUID, NOT NULL).
+	// The previous design passed callerOrg(c) as the anchor — but for
+	// admin-token callers callerOrg returns "" (no org_token_id in
+	// context), and "" into the UUID-backed approval query errors
+	// "invalid input syntax for type uuid" → handler 500. Fix: derive
+	// a VALID approval anchor per caller class. Org-token callers use
+	// their token's org_id (callerOrg); admin-token callers use the
+	// concierge/platform root workspace (callerPlatformOrg); session
+	// callers fall through. If no anchor can be derived, return a
+	// controlled 4xx — never pass "" into the UUID query.
+	ws := approvalAnchorForGate(c)
+	if ws == "" {
+		log.Printf("OrgTokenHandler.Create: no approval anchor for caller class=%s (admin-token callers need MOLECULE_PLATFORM_WORKSPACE_ID; org-token callers need a token with a valid org_id; session callers need a concierge root)", orgTokenActorClass(c))
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "no approval anchor for this caller class — set MOLECULE_PLATFORM_WORKSPACE_ID for admin-token callers, or call via a session / org-token with a valid org",
+		})
+		return
+	}
+	if !gateDestructive(c, nil, ws, approvals.ActionOrgTokenMint,
+		"mint org token "+req.Name,
+		map[string]interface{}{"actor": orgTokenActorClass(c), "name": req.Name, "workspace_id": ws}) {
+		return
+	}
+
 	createdBy, orgID := orgTokenActor(c)
 
 	plaintext, id, err := orgtoken.Issue(c.Request.Context(), db.DB, req.Name, createdBy, orgID)
@@ -95,6 +131,27 @@ func (h *OrgTokenHandler) Create(c *gin.Context) {
 		Token:   plaintext,
 		Warning: "copy this token now; it will not be shown again",
 	})
+}
+
+// orgTokenActorClass returns the credential class label for the current
+// request, used in the approval gate's context (so an approval for "mint
+// from admin-token" cannot be replayed as "mint from org-token:abc" or
+// vice versa — the request_hash differs by credential class).
+func orgTokenActorClass(c *gin.Context) string {
+	if v, ok := c.Get("caller_credential_class"); ok {
+		if s, ok := v.(string); ok && s != "" {
+			return s
+		}
+	}
+	if v, ok := c.Get("org_token_prefix"); ok {
+		if s, ok := v.(string); ok && s != "" {
+			return actorOrgTokenPrefix + s
+		}
+	}
+	if c.GetHeader("Cookie") != "" {
+		return actorSession
+	}
+	return actorAdminToken
 }
 
 // Revoke flips revoked_at. 404 when the id doesn't exist OR was
@@ -152,6 +209,54 @@ func callerOrg(c *gin.Context) string {
 		return ""
 	}
 	return orgID
+}
+
+// approvalAnchorForGate (core#2579) returns a NON-EMPTY workspace_id
+// suitable for the approval gate (requireApproval queries
+// approval_requests.workspace_id as a UUID, NOT NULL). Unlike
+// callerOrg — which intentionally returns "" for admin-token callers
+// so org_api_tokens.org_id is NULL (unanchored tokens, deny by
+// default) — the approval gate needs a stable anchor for EVERY caller
+// class:
+//
+//   - Org-token callers: callerOrg(c) (the token's org_id). Same
+//     anchor the minted token will be tied to, so the approval and
+//     the token are audit-co-located.
+//   - Admin-token callers: MOLECULE_PLATFORM_WORKSPACE_ID env var
+//     (operator-set UUID of the concierge/platform root workspace).
+//     This is the platform-org anchor — every admin-token approval
+//     for org_token_mint lives against the platform root, so a
+//     human approver sees ONE pending-approval inbox entry for
+//     "platform agent minted N org tokens this hour" instead of
+//     N entries scattered by unanchored orgs. Without this env var
+//     set, admin-token callers get "" (caller returns a controlled
+//     4xx, never passes "" into the UUID query).
+//   - Session callers: same as org-token callers (callerOrg). Today
+//     session callers have no org_token_id → callerOrg returns "" —
+//     these callers are blocked at the 4xx with a hint to set the
+//     platform workspace ID or use an org-token credential. Session
+//     paths through CP/UI are NOT expected to mint org tokens
+//     directly (the UI mints via the concierge, which is admin-token
+//     authenticated → covers via the admin-token branch above).
+//
+// CRITICAL (RCA on #2579): the previous code passed callerOrg(c)
+// directly to gateDestructive, which crashed with "invalid input
+// syntax for type uuid" when callerOrg returned "" (admin-token
+// callers). That crashed path returned 500 from the handler, which
+// silently bypassed the approval gate in a different way (caller
+// sees 500 → retries → eventually unblocks via unmonitored paths).
+// This helper is the fix: every caller class either gets a valid
+// UUID or a controlled 4xx.
+func approvalAnchorForGate(c *gin.Context) string {
+	if orgID := callerOrg(c); orgID != "" {
+		return orgID
+	}
+	if callerIsAdminToken(c) {
+		if v := os.Getenv("MOLECULE_PLATFORM_WORKSPACE_ID"); v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // orgTokenActor returns (createdBy, orgID) for the current request.

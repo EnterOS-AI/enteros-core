@@ -327,9 +327,13 @@ check "GET /bundles/export/:id" '"name":"Summarizer Agent"' "$BUNDLE"
 ORIG_NAME=$(echo "$BUNDLE" | python3 -c "import sys,json; print(json.load(sys.stdin)['name'])")
 ORIG_TIER=$(echo "$BUNDLE" | python3 -c "import sys,json; print(json.load(sys.stdin)['tier'])")
 
-# DELETE /workspaces/:id is admin-gated (router.go:167). X-Confirm-Name must
-# still match the workspace name even with admin auth.
-R=$(acurl -X DELETE "$BASE/workspaces/$SUM_ID?confirm=true" \
+# DELETE /workspaces/:id is admin-gated (router.go:167) AND now also
+# approvals-gated for admin-token callers (CR2 RC 10818 — the admin-token
+# gate is always-on; delete_workspace is in the gated map). X-Confirm-Name
+# must still match the workspace name. e2e_gated_admin_op auto-approves
+# the pending approval + retries the DELETE (so the harness sees the
+# real 200/'status:removed' result).
+R=$(e2e_gated_admin_op "$SUM_ID" acurl -X DELETE "$BASE/workspaces/$SUM_ID?confirm=true" \
   -H "X-Confirm-Name: Summarizer Agent")
 check "DELETE /workspaces/:id" '"status":"removed"' "$R"
 
@@ -345,9 +349,10 @@ check "List after delete (count=1)" "1" "$COUNT"
 echo ""
 echo "--- Bundle Round-Trip Test ---"
 
-# Delete the remaining parent Echo — DELETE is admin-gated (router.go:167);
-# the platform admin bearer (acurl) authorizes it. X-Confirm-Name still required.
-R=$(acurl -X DELETE "$BASE/workspaces/$ECHO_ID?confirm=true" \
+# Delete the remaining parent Echo — DELETE is admin-gated (router.go:167)
+# AND approvals-gated for admin-token callers (CR2 RC 10818). Use
+# e2e_gated_admin_op to auto-approve the pending approval + retry.
+R=$(e2e_gated_admin_op "$ECHO_ID" acurl -X DELETE "$BASE/workspaces/$ECHO_ID?confirm=true" \
   -H "X-Confirm-Name: Echo Agent v2")
 check "Delete before re-import" '"status":"removed"' "$R"
 
