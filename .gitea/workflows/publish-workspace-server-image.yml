@@ -227,6 +227,8 @@ jobs:
             docker login --username AWS --password-stdin "${ECR_REGISTRY}"
           docker buildx build \
             --file ./workspace-server/Dockerfile \
+            --provenance=false \
+            --sbom=false \
             --build-arg GIT_SHA="${GIT_SHA}" \
             --label "org.opencontainers.image.source=https://git.moleculesai.app/molecule-ai/${REPO}" \
             --label "org.opencontainers.image.revision=${GIT_SHA}" \
@@ -285,6 +287,8 @@ jobs:
             if docker buildx build \
                 --builder "${builder}" \
                 --file ./workspace-server/Dockerfile.tenant \
+                --provenance=false \
+                --sbom=false \
                 --build-arg NEXT_PUBLIC_PLATFORM_URL= \
                 --build-arg GIT_SHA="${GIT_SHA}" \
                 --label "org.opencontainers.image.source=https://git.moleculesai.app/molecule-ai/${REPO}" \
