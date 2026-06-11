@@ -1041,7 +1041,7 @@ func logActivityExec(ctx context.Context, exec activityExecutor, broadcaster eve
 			VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9::jsonb, $10, $11, $12, $13)
 			ON CONFLICT (workspace_id, message_id) WHERE message_id IS NOT NULL
 			DO UPDATE SET
-				response_body = EXCLUDED.response_body,
+				response_body = COALESCE(EXCLUDED.response_body, activity_logs.response_body),
 				status        = EXCLUDED.status,
 				duration_ms   = COALESCE(EXCLUDED.duration_ms, activity_logs.duration_ms),
 				error_detail  = EXCLUDED.error_detail,
