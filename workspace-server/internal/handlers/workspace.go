@@ -561,6 +561,18 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 		}
 	}
 
+	// core#2609: no explicit parent -> default under the org's platform root.
+	// Live failure this prevents: the enter-os concierge provisioned its team
+	// via the management surface, both workspaces landed parent_id NULL, and
+	// every delegation died with "cannot communicate per hierarchy rules".
+	// Best-effort: no platform root (or an ambiguous >1) leaves NULL intact,
+	// preserving bootstrap/self-host multi-root behavior.
+	if payload.ParentID == nil {
+		if rootID := platformRootWorkspaceID(ctx); rootID != "" {
+			payload.ParentID = &rootID
+		}
+	}
+
 	tx, txErr := db.DB.BeginTx(ctx, nil)
 	if txErr != nil {
 		log.Printf("Create workspace: begin tx error: %v", txErr)

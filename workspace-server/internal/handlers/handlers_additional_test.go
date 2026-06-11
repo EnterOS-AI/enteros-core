@@ -64,6 +64,83 @@ func TestWorkspaceCreate_WithParentID(t *testing.T) {
 
 // ---------- workspace.go: Create with explicit runtime ----------
 
+// TestWorkspaceCreate_DefaultsParentToPlatformRoot (core#2609): a create
+// without an explicit parent_id must land under the org's single platform
+// root — NOT as a parent_id-NULL orphan root, which A2A then walls off
+// ("cannot communicate per hierarchy rules") and the canvas renders depth-1
+// beside the root (#2601).
+func TestWorkspaceCreate_DefaultsParentToPlatformRoot(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", "/tmp/configs")
+
+	rootID := "11111111-2222-3333-4444-555555555555"
+	mock.ExpectQuery(`SELECT id FROM workspaces WHERE COALESCE\(kind, 'workspace'\) = 'platform'`).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(rootID))
+
+	mock.ExpectBegin()
+	mock.ExpectExec("INSERT INTO workspaces").
+		WithArgs(sqlmock.AnyArg(), "Team Member", nil, 3, "claude-code", rootID, nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+	mock.ExpectExec("INSERT INTO workspace_secrets").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO structure_events").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO workspace_auth_tokens").WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	body := `{"name":"Team Member","model":"anthropic:claude-opus-4-7"}`
+	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Create(c)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// TestWorkspaceCreate_NoPlatformRoot_KeepsNullParent (core#2609): with no
+// platform root in the DB (bootstrap / pre-install), the create keeps the
+// legacy NULL parent — defaulting is best-effort, never a new failure mode.
+func TestWorkspaceCreate_NoPlatformRoot_KeepsNullParent(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", "/tmp/configs")
+
+	mock.ExpectQuery(`SELECT id FROM workspaces WHERE COALESCE\(kind, 'workspace'\) = 'platform'`).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}))
+
+	mock.ExpectBegin()
+	mock.ExpectExec("INSERT INTO workspaces").
+		WithArgs(sqlmock.AnyArg(), "Bootstrap Root", nil, 3, "claude-code", (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+	mock.ExpectExec("INSERT INTO workspace_secrets").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO structure_events").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO workspace_auth_tokens").WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	body := `{"name":"Bootstrap Root","model":"anthropic:claude-opus-4-7"}`
+	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Create(c)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
 func TestWorkspaceCreate_ExplicitClaudeCodeRuntime(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
