@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
 	"github.com/DATA-DOG/go-sqlmock"
@@ -2344,6 +2345,193 @@ func TestHeartbeatHandler_OmitsSecretOnHealFailure(t *testing.T) {
 	_ = json.Unmarshal(w.Body.Bytes(), &resp)
 	if _, present := resp["platform_inbound_secret"]; present {
 		t.Errorf("expected platform_inbound_secret OMITTED on heal failure, got: %v", resp)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// TestRegister_FailureRecordsLastRegisterFailure (#2530): a non-200 register
+// must stamp last_register_failure_at so heartbeat can surface degraded status.
+func TestRegister_FailureRecordsLastRegisterFailure(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewRegistryHandler(broadcaster)
+
+	// requireWorkspaceToken checks hasLive then validates token.
+	mock.ExpectQuery("SELECT EXISTS").
+		WithArgs("ws-reg-fail").
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+
+	// Update last_register_failure_at on 401.
+	mock.ExpectExec("UPDATE workspaces SET last_register_failure_at = now").
+		WithArgs("ws-reg-fail").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	body := `{"workspace_id":"ws-reg-fail","url":"http://example.com"}`
+	c.Request = httptest.NewRequest("POST", "/registry/register", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Register(c)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// TestRegister_SuccessClearsLastRegisterFailure (#2530): a successful register
+// must clear last_register_failure_at so heartbeat can recover to online.
+func TestRegister_SuccessClearsLastRegisterFailure(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewRegistryHandler(broadcaster)
+
+	// C18: no live tokens → bootstrap-allowed.
+	mock.ExpectQuery("SELECT EXISTS").
+		WithArgs("ws-reg-ok").
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+
+	// resolveDeliveryMode
+	mock.ExpectQuery("SELECT delivery_mode FROM workspaces").
+		WithArgs("ws-reg-ok").
+		WillReturnError(sql.ErrNoRows)
+
+	// URL SSRF check — internal platform tunnel, allowed.
+	mock.ExpectQuery("SELECT COALESCE\\(channel_config->>'app_public_key'").
+		WithArgs("ws-reg-ok").
+		WillReturnError(sql.ErrNoRows)
+
+	// INSERT/UPDATE workspace row.
+	mock.ExpectExec("INSERT INTO workspaces").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// Issue token (no live tokens).
+	mock.ExpectQuery("SELECT EXISTS").
+		WithArgs("ws-reg-ok").
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+	mock.ExpectExec("INSERT INTO workspace_auth_tokens").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// Clear last_register_failure_at.
+	mock.ExpectExec("UPDATE workspaces SET last_register_failure_at = NULL").
+		WithArgs("ws-reg-ok").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// Lazy-heal platform_inbound_secret (optional, may no-op).
+	mock.ExpectQuery("SELECT platform_inbound_secret FROM workspaces").
+		WithArgs("ws-reg-ok").
+		WillReturnError(sql.ErrNoRows)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	body := `{"workspace_id":"ws-reg-ok","url":"http://ws-reg-ok.moleculesai.app/a2a"}`
+	c.Request = httptest.NewRequest("POST", "/registry/register", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Register(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// TestHeartbeat_RecentRegisterFailure_DegradesWorkspace (#2530): when
+// last_register_failure_at is within the 5-minute window, heartbeat must
+// flip the workspace from online to degraded.
+func TestHeartbeat_RecentRegisterFailure_DegradesWorkspace(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewRegistryHandler(broadcaster)
+
+	// prevTask SELECT
+	mock.ExpectQuery("SELECT COALESCE\\(current_task").
+		WithArgs("ws-degrade-reg").
+		WillReturnRows(sqlmock.NewRows([]string{"current_task"}).AddRow(""))
+
+	// heartbeat UPDATE
+	mock.ExpectExec("UPDATE workspaces SET").
+		WithArgs("ws-degrade-reg", 0.0, "", 0, 100, "").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// evaluateStatus SELECT — online with recent register failure
+	mock.ExpectQuery("SELECT status, last_register_failure_at FROM workspaces WHERE id =").
+		WithArgs("ws-degrade-reg").
+		WillReturnRows(sqlmock.NewRows([]string{"status", "last_register_failure_at"}).
+			AddRow("online", time.Now().Add(-2*time.Minute)))
+
+	// Degrade UPDATE
+	mock.ExpectExec("UPDATE workspaces SET status =").
+		WithArgs(models.StatusDegraded, "ws-degrade-reg").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// Broadcast degraded event
+	mock.ExpectExec("INSERT INTO structure_events").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	body := `{"workspace_id":"ws-degrade-reg","error_rate":0.0,"sample_error":"","active_tasks":0,"uptime_seconds":100}`
+	c.Request = httptest.NewRequest("POST", "/registry/heartbeat", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Heartbeat(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// TestHeartbeat_RecentRegisterFailure_BlocksRecovery (#2530): a degraded
+// workspace with a recent register failure must NOT be flipped back to online
+// by heartbeat, even when error_rate is low and runtime_state is empty.
+func TestHeartbeat_RecentRegisterFailure_BlocksRecovery(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewRegistryHandler(broadcaster)
+
+	// prevTask SELECT
+	mock.ExpectQuery("SELECT COALESCE\\(current_task").
+		WithArgs("ws-no-recover").
+		WillReturnRows(sqlmock.NewRows([]string{"current_task"}).AddRow(""))
+
+	// heartbeat UPDATE
+	mock.ExpectExec("UPDATE workspaces SET").
+		WithArgs("ws-no-recover", 0.0, "", 0, 100, "").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// evaluateStatus SELECT — degraded with recent register failure
+	mock.ExpectQuery("SELECT status, last_register_failure_at FROM workspaces WHERE id =").
+		WithArgs("ws-no-recover").
+		WillReturnRows(sqlmock.NewRows([]string{"status", "last_register_failure_at"}).
+			AddRow("degraded", time.Now().Add(-2*time.Minute)))
+
+	// NO recovery UPDATE expected — register failure blocks recovery.
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	body := `{"workspace_id":"ws-no-recover","error_rate":0.0,"sample_error":"","active_tasks":0,"uptime_seconds":100}`
+	c.Request = httptest.NewRequest("POST", "/registry/heartbeat", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Heartbeat(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet expectations: %v", err)

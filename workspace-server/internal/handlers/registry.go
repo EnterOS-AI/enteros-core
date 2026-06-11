@@ -339,6 +339,10 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 	defer func(wsID string) {
 		if status := c.Writer.Status(); status != http.StatusOK {
 			log.Printf("Registry register: workspace=%s boot_register_failed status=%d duration=%s", wsID, status, time.Since(registerStart))
+			// #2530: record register failure so heartbeat can surface degraded status.
+			if _, err := db.DB.ExecContext(context.Background(), `UPDATE workspaces SET last_register_failure_at = now() WHERE id = $1`, wsID); err != nil {
+				log.Printf("Registry register: failed to record failure timestamp for %s: %v", wsID, err)
+			}
 		}
 	}(payload.ID)
 
@@ -631,6 +635,11 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 	// whichever sub-step failed (read or mint). If the secret never lands,
 	// chat upload surfaces the issue loudly with the RFC-#2312 hint.
 
+	// #2530: clear register failure on success — the workspace is healthy.
+	if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET last_register_failure_at = NULL WHERE id = $1`, payload.ID); err != nil {
+		log.Printf("Registry register: failed to clear failure timestamp for %s: %v", payload.ID, err)
+	}
+
 	c.JSON(http.StatusOK, response)
 }
 
@@ -852,11 +861,13 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 	ctx := c.Request.Context()
 
 	var currentStatus string
-	err := db.DB.QueryRowContext(ctx, `SELECT status FROM workspaces WHERE id = $1`, payload.WorkspaceID).
-		Scan(&currentStatus)
+	var lastRegisterFailure sql.NullTime
+	err := db.DB.QueryRowContext(ctx, `SELECT status, last_register_failure_at FROM workspaces WHERE id = $1`, payload.WorkspaceID).
+		Scan(&currentStatus, &lastRegisterFailure)
 	if err != nil {
 		return
 	}
+	hasRecentRegisterFailure := lastRegisterFailure.Valid && time.Since(lastRegisterFailure.Time) < 5*time.Minute
 
 	// Self-reported runtime wedge: takes precedence over the error_rate
 	// path. The heartbeat task lives in its own asyncio task and keeps
@@ -903,6 +914,21 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 		})
 	}
 
+	// #2530: degrade when register has persistently failed within the last
+	// 5 minutes. A workspace whose auth token was lost after container re-create
+	// will 401 on every boot register; heartbeats keep it looking online while
+	// canvas chat delivery silently starves. Surfacing degraded gives the user
+	// a visible restart/credential-repair hint.
+	if currentStatus == "online" && hasRecentRegisterFailure {
+		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1, updated_at = now() WHERE id = $2 AND status = 'online'`, models.StatusDegraded, payload.WorkspaceID); err != nil {
+			log.Printf("Heartbeat: failed to mark %s degraded (register failure): %v", payload.WorkspaceID, err)
+		}
+		h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceDegraded), payload.WorkspaceID, map[string]interface{}{
+			"register_failure": true,
+			"sample_error":     "Register failed — workspace auth token may be stale. Restart or reprovision to recover.",
+		})
+	}
+
 	// Recovery from degraded → online when BOTH the error rate has
 	// fallen back AND the workspace is no longer reporting a wedge.
 	// The wedge condition is sticky for the process lifetime
@@ -912,7 +938,10 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 	//
 	// Skipped under native_status_mgmt for the same reason as the
 	// degrade branch above: the adapter owns the transition.
-	if !nativeStatus && currentStatus == "degraded" && payload.ErrorRate < 0.1 && payload.RuntimeState == "" {
+	//
+	// #2530: also require no recent register failure — the workspace stays
+	// degraded until a successful register clears the failure timestamp.
+	if !nativeStatus && currentStatus == "degraded" && payload.ErrorRate < 0.1 && payload.RuntimeState == "" && !hasRecentRegisterFailure {
 		// #73 guard: heartbeat recovery must not resurrect a removed workspace.
 		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1, updated_at = now() WHERE id = $2 AND status = 'degraded'`, models.StatusOnline, payload.WorkspaceID); err != nil {
 			log.Printf("Heartbeat: failed to recover %s to online: %v", payload.WorkspaceID, err)
