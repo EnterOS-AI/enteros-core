@@ -1024,15 +1024,34 @@ func logActivityExec(ctx context.Context, exec activityExecutor, broadcaster eve
 	// whose text still contains `INSERT INTO activity_logs` — preserves the
 	// existing sqlmock expectations across the codebase. $1 (workspace_id) is
 	// reused by the UPDATE; arg list is otherwise unchanged.
+	//
+	// #2560 (chat UX: persist in-flight exchange): the INSERT now also
+	// carries message_id ($13) and uses ON CONFLICT (workspace_id,
+	// message_id) DO UPDATE to attach the agent's response_body onto the
+	// SAME row that the ingest path (#2560) wrote at receipt — so a
+	// mid-turn leave/refresh shows the user message in chat-history
+	// (request_body from the ingest row), and the eventual completion
+	// stamps response_body + status onto the same row (no duplicate
+	// bubble). The conflict target only fires when message_id IS NOT NULL
+	// (idx_activity_logs_msg_id is partial); rows without message_id keep
+	// the original always-INSERT behavior.
 	if _, err := exec.ExecContext(ctx, `
 		WITH ins AS (
-			INSERT INTO activity_logs (workspace_id, activity_type, source_id, target_id, method, summary, request_body, response_body, tool_trace, duration_ms, status, error_detail)
-			VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9::jsonb, $10, $11, $12)
+			INSERT INTO activity_logs (workspace_id, activity_type, source_id, target_id, method, summary, request_body, response_body, tool_trace, duration_ms, status, error_detail, message_id)
+			VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9::jsonb, $10, $11, $12, $13)
+			ON CONFLICT (workspace_id, message_id) WHERE message_id IS NOT NULL
+			DO UPDATE SET
+				response_body = EXCLUDED.response_body,
+				status        = EXCLUDED.status,
+				duration_ms   = COALESCE(EXCLUDED.duration_ms, activity_logs.duration_ms),
+				error_detail  = EXCLUDED.error_detail,
+				tool_trace    = CASE WHEN EXCLUDED.tool_trace IS NOT NULL THEN EXCLUDED.tool_trace ELSE activity_logs.tool_trace END
 		)
 		UPDATE workspaces SET last_activity_at = now() WHERE id = $1
 	`, params.WorkspaceID, params.ActivityType, params.SourceID, params.TargetID,
 		params.Method, params.Summary, reqStr, respStr, traceStr,
-		params.DurationMs, params.Status, params.ErrorDetail); err != nil {
+		params.DurationMs, params.Status, params.ErrorDetail,
+		nilIfEmpty(params.MessageId)); err != nil {
 		return nil, err
 	}
 
@@ -1103,5 +1122,14 @@ type ActivityParams struct {
 	ToolTrace    json.RawMessage // tools/commands the agent actually invoked
 	DurationMs   *int
 	Status       string // ok, error, timeout
+	// MessageId, when non-empty, is persisted to activity_logs.message_id
+	// and is the conflict key for the partial unique index
+	// (idx_activity_logs_msg_id). The ingest path (#2560) sets this so a
+	// mid-turn leave/refresh shows the user message in chat-history
+	// hydration; the completion path (logA2ASuccess / logA2AReceiveQueued)
+	// also sets it and uses ON CONFLICT (workspace_id, message_id) DO
+	// UPDATE to stamp response_body onto the same row instead of inserting
+	// a duplicate. Empty for non-per-message activity (task_update, etc.).
+	MessageId string
 	ErrorDetail  *string
 }

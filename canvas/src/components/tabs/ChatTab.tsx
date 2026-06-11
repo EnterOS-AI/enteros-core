@@ -176,9 +176,35 @@ function MyChatPanel({ workspaceId, data }: Props) {
   // Scroll behavior across messages updates:
   //  - Prepend (loadOlder landed)  → restore the user's saved
   //    distance-from-bottom so their reading position is unchanged.
-  //  - Append / initial            → pin to latest bubble.
+  //  - Append / initial            → pin to latest bubble ONLY if the
+  //    user is at (or near) the bottom. The pre-#2560 behavior was
+  //    "always scroll", which yanks the viewport when the user has
+  //    scrolled up to read older history — they lose their place and
+  //    have to scroll back down. #2560 CTO ask: gate the same
+  //    append-scroll on the SAME at-bottom check that the activityLog
+  //    growth path uses below.
+  //
+  // The atBottom threshold (12px) is a small window to absorb subpixel
+  // rounding — a user who "is at the bottom" can be up to ~12px off
+  // without losing autoscroll. The listener is attached to the
+  // container, not window, because the chat is its own scrollable
+  // element; `passive: true` because we never call preventDefault.
   // useLayoutEffect (not useEffect) so scroll restoration runs BEFORE
   // paint — otherwise the user sees the page jump for one frame.
+  const [atBottom, setAtBottom] = useState(true);
+  useLayoutEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+    const update = () => {
+      const distanceFromBottom =
+        container.scrollHeight - container.scrollTop - container.clientHeight;
+      setAtBottom(distanceFromBottom <= 12);
+    };
+    update();
+    container.addEventListener("scroll", update, { passive: true });
+    return () => container.removeEventListener("scroll", update);
+  }, []);
+
   useLayoutEffect(() => {
     const container = containerRef.current;
     const anchor = history.scrollAnchorRef.current;
@@ -188,6 +214,9 @@ function MyChatPanel({ workspaceId, data }: Props) {
       history.messages.length > 0 &&
       history.messages[0].id !== anchor.expectFirstIdNotEqual
     ) {
+      // Anchor restore is loadOlder's contract — always restore
+      // regardless of at-bottom (the user's PRE-loadOlder position is
+      // the thing being preserved). Untouched by #2560.
       container.scrollTop = container.scrollHeight - anchor.savedDistanceFromBottom;
       history.scrollAnchorRef.current = null;
       return;
@@ -197,8 +226,22 @@ function MyChatPanel({ workspaceId, data }: Props) {
       bottomRef.current?.scrollIntoView({ behavior: "instant" as ScrollBehavior });
       return;
     }
+    // #2560: gate the message-append smooth-scroll on atBottom. If the
+    // user has scrolled up to read older history, do NOT yank.
+    if (!atBottom) return;
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [history.messages, history.scrollAnchorRef]);
+  }, [history.messages, history.scrollAnchorRef, atBottom]);
+
+  // #2560 (bottom-sticky autoscroll for accumulating tool calls): the
+  // existing message-append path doesn't fire on activityLog growth
+  // (deps were [history.messages]), so the user has to manually chase
+  // the live tool-call lines. Gate the same at-bottom check on the
+  // activity feed: if the user is at the bottom, follow the new
+  // lines; if they've scrolled up, NEVER yank.
+  useLayoutEffect(() => {
+    if (!atBottom) return;
+    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [activityLog, atBottom]);
 
   // Elapsed timer while sending
   useEffect(() => {
