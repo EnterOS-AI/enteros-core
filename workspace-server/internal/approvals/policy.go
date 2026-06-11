@@ -27,8 +27,10 @@ const (
 // (and gate the corresponding handler with requireApproval) to expand the
 // boundary; remove one to drop a gate. This is the only place the policy lives.
 var gated = map[Action]bool{
-	ActionSecretWrite:  true,
-	ActionOrgTokenMint: true,
+	ActionDeleteWorkspace: true,
+	ActionDeprovision:     true,
+	ActionSecretWrite:     true,
+	ActionOrgTokenMint:    true,
 }
 
 // IsGated reports whether action requires a human approval before executing.
