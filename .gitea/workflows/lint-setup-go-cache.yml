@@ -60,9 +60,9 @@ jobs:
     name: lint-setup-go-cache
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    # Advisory until core#2524 sweep merges + 3 clean days, then flip false.
-    # internal#881 Phase 3 mask — 14d forced-renewal cadence (flip after 3 clean days)
-    continue-on-error: true  # internal#881
+    # Hard gate: core#2524 sweep merged and main is clean (all setup-go steps
+    # set cache: false). The self-hosted fleet GOCACHE bind-mount is protected.
+    continue-on-error: false
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
