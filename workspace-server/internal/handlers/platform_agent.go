@@ -503,6 +503,19 @@ func installPlatformAgent(ctx context.Context, database *sql.DB, platformID, nam
 	}
 	defer func() { _ = tx.Rollback() }() // no-op after Commit
 
+	// 0. If a different platform root already exists, downgrade it to 'workspace'
+	//    so it no longer blocks the partial unique index uniq_workspaces_one_platform_root.
+	//    It will then be picked up as an old root and re-parented under the new
+	//    platform agent (defense-in-depth: covers pathological cases where a
+	//    platform root was created with a non-canonical id, e.g. test fixtures
+	//    or a prior failed migration).
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE workspaces SET kind = 'workspace', updated_at = now()
+		WHERE kind = 'platform' AND parent_id IS NULL AND id <> $1
+	`, platformID); err != nil {
+		return fmt.Errorf("downgrade existing platform root: %w", err)
+	}
+
 	// 1. Ensure the platform-agent row exists as a kind='platform' root.
 	//    ON CONFLICT keeps it a platform root if it was pre-seeded; the row is
 	//    tier 0 and never billed/provisioned as an ordinary workspace EC2.
