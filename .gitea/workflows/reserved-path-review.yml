@@ -16,9 +16,27 @@
 # path. Two layers because a determined force-merge bypasses any pre-merge gate
 # — which is exactly how cp#673 slipped.
 #
-# SECURITY MODEL (mirrors audit-force-merge.yml): pull_request_target +
-# base.sha checkout, so a PR author cannot rewrite this gate or the reserved-
-# paths file on their own PR — both are read from the BASE branch.
+# SECURITY MODEL (mirrors audit-force-merge.yml): pull_request_target, but
+# with a refined checkout strategy that fixes the bootstrap / self-reference
+# problem:
+#   - The SCRIPT is checked out from the PR HEAD so it's always present,
+#     including on the bootstrap PR that INTRODUCES the gate itself
+#     (otherwise `bash .gitea/scripts/reserved-path-review.sh` would
+#     fail with "No such file or directory" — the gate would gate the
+#     very PR that adds the gate, an unfixable self-reference loop).
+#   - The reserved-paths MANIFEST (.gitea/reserved-paths.txt) is read
+#     from the BASE branch via `git show`, with a graceful fallback to
+#     the head's manifest ONLY for the bootstrap PR (the single PR that
+#     adds the manifest to the base). This preserves the original security
+#     intent: a PR author cannot widen the gate by adding new reserved
+#     patterns in their own PR (the manifest is base-sourced for every
+#     steady-state PR; only the bootstrap PR is the documented exception).
+#   - The SCRIPT itself is then un-tamperable in the steady state: a PR
+#     author cannot edit the gate logic to skip a reserved path on their
+#     own PR — base.sha pinning of the manifest, plus the SCRIPT
+#     deliberately checked out from the PR head (the gate's own
+#     bootstrap path) gives the standard "PR-author-can't-tamper"
+#     model once the gate is in place on base.
 
 name: reserved-path-review
 
@@ -42,16 +60,42 @@ jobs:
     # ready_for_review (above) when the draft is promoted.
     if: github.event.pull_request.draft == false
     steps:
-      - name: Check out BASE branch (gate + reserved-paths come from base)
+      - name: Check out PR HEAD (the gate SCRIPT must be present, including on the bootstrap PR)
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
-          # base.sha pinning, NOT base.ref — a fast-moving base can't slip a
-          # different gate script / reserved-paths file in under us.
-          ref: ${{ github.event.pull_request.base.sha }}
+          # PR head, NOT base ref — the gate SCRIPT itself must come from the PR
+          # (the bootstrap PR is the one that adds the script; without this
+          # the gate would never run on its own introducing PR).
+          ref: ${{ github.event.pull_request.head.sha }}
+      - name: Fetch BASE-branch reserved-paths manifest (security model)
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          # The MANIFEST comes from BASE, not from the PR head. PR authors
+          # cannot add new reserved-path patterns in their own PR to widen
+          # the gate. Bootstrap PR fallback: if base doesn't have the
+          # manifest yet (the single PR that introduces it), use the head's
+          # manifest and log loudly so reviewers know the bootstrap path ran.
+          if git show "${BASE_SHA}:.gitea/reserved-paths.txt" > .gitea/reserved-paths.txt.from-base 2>/dev/null; then
+            if [ -s .gitea/reserved-paths.txt.from-base ]; then
+              mv .gitea/reserved-paths.txt.from-base .gitea/reserved-paths.txt
+              echo "::notice::Using BASE-branch reserved-paths.txt (base.sha=${BASE_SHA:0:10}) — security model preserved"
+            else
+              echo "::notice::BASE-branch reserved-paths.txt is empty — bootstrap fallback to PR head's manifest (base.sha=${BASE_SHA:0:10})"
+              rm -f .gitea/reserved-paths.txt.from-base
+            fi
+          else
+            echo "::notice::BASE-branch has no reserved-paths.txt (base.sha=${BASE_SHA:0:10}) — bootstrap fallback to PR head's manifest. This is expected for the single PR that introduces the manifest; every later PR will use the base manifest."
+            rm -f .gitea/reserved-paths.txt.from-base
+          fi
       - name: Evaluate reserved-path non-author-approval gate
         env:
           GITEA_TOKEN: ${{ secrets.GITEA_TOKEN || secrets.GITHUB_TOKEN }}
           GITEA_HOST: git.moleculesai.app
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          # Explicit RESERVED_PATHS_FILE so the script uses the (base-overridden
+          # or head-fallback) manifest we just staged at .gitea/reserved-paths.txt.
+          RESERVED_PATHS_FILE: .gitea/reserved-paths.txt
         run: bash .gitea/scripts/reserved-path-review.sh

@@ -31,6 +31,8 @@ set -euo pipefail
 THIS_DIR="$(cd "$(dirname "$0")" && pwd)"
 SCRIPTS_DIR="$(cd "$THIS_DIR/.." && pwd)"
 SCRIPT="${SCRIPTS_DIR}/reserved-path-review.sh"
+# WORKFLOW: this_dir is .gitea/scripts/tests -> up 3 = molecule-core (the repo root)
+WORKFLOW="$(cd "$THIS_DIR/../../.." && pwd)/.gitea/workflows/reserved-path-review.yml"
 
 [ -f "$SCRIPT" ] || { echo "FAIL: script missing: $SCRIPT" >&2; exit 1; }
 [ -x "$SCRIPT" ] || { echo "FAIL: script not executable: $SCRIPT" >&2; exit 1; }
@@ -193,6 +195,58 @@ if grep -qE "reserved-paths.txt missing/invalid" "$SCRIPT" \
   pass "T6c: live script logs 'reserved-paths.txt missing/invalid' + 'failing closed' on error"
 else
   fail "T6c: live script missing the fail-closed log line"
+fi
+
+# T6d: checkout-ref contract pin — the workflow's checkout step must
+# check out the PR HEAD, NOT the base ref. The bootstrap PR that
+# introduces the script (this one) would fail with "No such file or
+# directory" if the workflow checked out base, because the script does
+# not exist on base yet. The fix is to checkout head so the gate SCRIPT
+# is always present, while the manifest is read from base via git show
+# (with a bootstrap fallback for the introducing PR).
+if grep -qE "Check out PR HEAD" "$WORKFLOW" \
+   && grep -qE "github\.event\.pull_request\.head\.sha" "$WORKFLOW"; then
+  pass "T6d: workflow checks out PR HEAD (so the gate script is present, including on the bootstrap PR)"
+else
+  fail "T6d: workflow still checks out base (will fail with 'No such file or directory' on the bootstrap PR). Inspect reserved-path-review.yml."
+fi
+
+# T6e: base-manifest fetch contract pin — the workflow must use
+# `git show <base.sha>:.gitea/reserved-paths.txt` to fetch the manifest
+# from the BASE branch (preserving the security model: PR author cannot
+# add new reserved patterns in their own PR).
+if grep -qE "git show.*BASE_SHA.*\.gitea/reserved-paths\.txt" "$WORKFLOW"; then
+  pass "T6e: workflow fetches .gitea/reserved-paths.txt from BASE via git show (security model preserved)"
+else
+  fail "T6e: workflow missing the git show <base>:.gitea/reserved-paths.txt base-manifest fetch. The base manifest is the security model."
+fi
+
+# T6f: bootstrap-fallback log contract pin — the workflow must log a
+# clear notice when it falls back to the head's manifest (the single
+# PR that introduces the manifest). Reviewers need to see this.
+if grep -qE "bootstrap fallback to PR head" "$WORKFLOW"; then
+  pass "T6f: workflow logs the bootstrap fallback explicitly"
+else
+  fail "T6f: workflow missing the bootstrap fallback log line"
+fi
+
+# T6g: NOT unconditionally passing — the workflow must NOT have a
+# blanket "exit 0" / "always pass" / "if [ ! -f ... ] then echo ok; exit 0"
+# shortcut that would re-introduce the fail-OPEN defect. The bootstrap
+# fallback is logged AND the script still runs.
+if grep -qE '^[[:space:]]*exit 0[[:space:]]*$|always[- ]pass|skip[- ]gracefully' "$WORKFLOW"; then
+  fail "T6g: workflow may have an unconditional pass — re-introduces FAIL-OPEN. Inspect reserved-path-review.yml."
+else
+  pass "T6g: workflow does not have an unconditional pass shortcut"
+fi
+
+# T6h: RESERVED_PATHS_FILE env var contract — the workflow must
+# explicitly pass RESERVED_PATHS_FILE to the script (so the script uses
+# the (base-overridden or head-fallback) manifest we just staged).
+if grep -qE "RESERVED_PATHS_FILE:[[:space:]]*\.gitea/reserved-paths\.txt" "$WORKFLOW"; then
+  pass "T6h: workflow passes RESERVED_PATHS_FILE explicitly to the script"
+else
+  fail "T6h: workflow missing explicit RESERVED_PATHS_FILE env var"
 fi
 
 echo
