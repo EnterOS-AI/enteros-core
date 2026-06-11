@@ -695,9 +695,11 @@ func TestDiscover_TargetOffline(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"name", "runtime"}).AddRow("Offline Agent", "claude-code"))
 
 	// No cached internal URL → falls to DB status check → offline
-	mock.ExpectQuery("SELECT status, last_register_failure_at FROM workspaces WHERE id =").
+	// NOTE: Discover (discovery.go) selects ONLY status — distinct from the
+	// heartbeat evaluateStatus 2-col SELECT in registry.go.
+	mock.ExpectQuery("SELECT status FROM workspaces WHERE id =").
 		WithArgs("ws-off").
-		WillReturnRows(sqlmock.NewRows([]string{"status", "last_register_failure_at"}).AddRow("offline", nil))
+		WillReturnRows(sqlmock.NewRows([]string{"status"}).AddRow("offline"))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
