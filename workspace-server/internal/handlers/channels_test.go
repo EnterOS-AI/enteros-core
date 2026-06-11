@@ -1235,3 +1235,70 @@ func TestChannelHandler_Webhook_Discord_ValidSig_PingAccepted(t *testing.T) {
 		t.Fatalf("unmet sqlmock expectations: %v", err)
 	}
 }
+
+func TestMatchesChatID(t *testing.T) {
+	cases := []struct {
+		name   string
+		config map[string]interface{}
+		chatID string
+		want   bool
+	}{
+		{
+			name:   "exact match",
+			config: map[string]interface{}{"chat_id": "12345"},
+			chatID: "12345",
+			want:   true,
+		},
+		{
+			name:   "in comma-separated list",
+			config: map[string]interface{}{"chat_id": "111,222,333"},
+			chatID: "222",
+			want:   true,
+		},
+		{
+			name:   "whitespace trimming",
+			config: map[string]interface{}{"chat_id": " 111 , 222 , 333 "},
+			chatID: "222",
+			want:   true,
+		},
+		{
+			name:   "missing key",
+			config: map[string]interface{}{"other": "value"},
+			chatID: "12345",
+			want:   false,
+		},
+		{
+			name:   "wrong type (int)",
+			config: map[string]interface{}{"chat_id": 12345},
+			chatID: "12345",
+			want:   false,
+		},
+		{
+			name:   "substring non-match",
+			config: map[string]interface{}{"chat_id": "12345"},
+			chatID: "234",
+			want:   false,
+		},
+		{
+			name:   "empty chat_id string",
+			config: map[string]interface{}{"chat_id": ""},
+			chatID: "12345",
+			want:   false,
+		},
+		{
+			name:   "empty query chatID",
+			config: map[string]interface{}{"chat_id": "111,222"},
+			chatID: "",
+			want:   false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := matchesChatID(tc.config, tc.chatID)
+			if got != tc.want {
+				t.Errorf("matchesChatID(%v, %q) = %v, want %v", tc.config, tc.chatID, got, tc.want)
+			}
+		})
+	}
+}
