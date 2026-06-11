@@ -336,12 +336,20 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 	// 403 (platform kind guard), 5xx (DB/internal error), or success from
 	// client timeout / unreachable $PLATFORM_URL.
 	registerStart := time.Now()
+	authOK := false
 	defer func(wsID string) {
 		if status := c.Writer.Status(); status != http.StatusOK {
 			log.Printf("Registry register: workspace=%s boot_register_failed status=%d duration=%s", wsID, status, time.Since(registerStart))
 			// #2530: record register failure so heartbeat can surface degraded status.
-			if _, err := db.DB.ExecContext(context.Background(), `UPDATE workspaces SET last_register_failure_at = now() WHERE id = $1`, wsID); err != nil {
-				log.Printf("Registry register: failed to record failure timestamp for %s: %v", wsID, err)
+			// #2585 hardening: only stamp after the caller has authenticated
+			// (requireWorkspaceToken succeeded). Unauthenticated 401s must NOT
+			// mutate workspace state — otherwise anyone can POST /registry/register
+			// without a bearer and force a false-degraded status via the heartbeat
+			// 5-minute failure window.
+			if authOK {
+				if _, err := db.DB.ExecContext(context.Background(), `UPDATE workspaces SET last_register_failure_at = now() WHERE id = $1`, wsID); err != nil {
+					log.Printf("Registry register: failed to record failure timestamp for %s: %v", wsID, err)
+				}
 			}
 		}
 	}(payload.ID)
@@ -378,6 +386,7 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 	if err := h.requireWorkspaceToken(ctx, c, payload.ID); err != nil {
 		return // 401 response already written by requireWorkspaceToken
 	}
+	authOK = true
 
 	// SECURITY (privilege-escalation fix): the public register path must never
 	// CREATE or PROMOTE a row to kind='platform'. The org root is minted only by

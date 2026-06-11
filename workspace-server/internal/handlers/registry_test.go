@@ -2351,27 +2351,59 @@ func TestHeartbeatHandler_OmitsSecretOnHealFailure(t *testing.T) {
 	}
 }
 
-// TestRegister_FailureRecordsLastRegisterFailure (#2530): a non-200 register
-// must stamp last_register_failure_at so heartbeat can surface degraded status.
+// TestRegister_FailureRecordsLastRegisterFailure (#2530 / #2585): an
+// AUTHENTICATED non-200 register must stamp last_register_failure_at so
+// heartbeat can surface degraded status. Unauthenticated 401s must NOT stamp.
 func TestRegister_FailureRecordsLastRegisterFailure(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
 	broadcaster := newTestBroadcaster()
 	handler := NewRegistryHandler(broadcaster)
 
-	// requireWorkspaceToken checks hasLive then validates token.
-	mock.ExpectQuery("SELECT EXISTS").
+	// Bootstrap-allowed: no live tokens → requireWorkspaceToken returns nil,
+	// so authOK becomes true.
+	mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM workspace_auth_tokens").
 		WithArgs("ws-reg-fail").
-		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
 
-	// Update last_register_failure_at on 401.
+	// Update last_register_failure_at on 400 (invalid delivery_mode after auth).
 	mock.ExpectExec("UPDATE workspaces SET last_register_failure_at = now").
 		WithArgs("ws-reg-fail").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
-	body := `{"workspace_id":"ws-reg-fail","url":"http://example.com"}`
+	body := `{"id":"ws-reg-fail","url":"http://example.com","agent_card":{"name":"test"},"delivery_mode":"invalid"}`
+	c.Request = httptest.NewRequest("POST", "/registry/register", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Register(c)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// TestRegister_Unauthenticated401DoesNotStamp (#2585): a 401 from missing or
+// invalid bearer must NOT stamp last_register_failure_at, otherwise an
+// unauthenticated caller could force any workspace into degraded status.
+func TestRegister_Unauthenticated401DoesNotStamp(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewRegistryHandler(broadcaster)
+
+	// HasAnyLiveToken returns 1 — workspace already has an active token.
+	mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM workspace_auth_tokens").
+		WithArgs("ws-reg-unauth").
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	body := `{"id":"ws-reg-unauth","url":"http://example.com","agent_card":{"name":"test"}}`
 	c.Request = httptest.NewRequest("POST", "/registry/register", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
@@ -2380,6 +2412,7 @@ func TestRegister_FailureRecordsLastRegisterFailure(t *testing.T) {
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401, got %d: %s", w.Code, w.Body.String())
 	}
+	// No UPDATE expectation — unauthenticated 401 must not mutate workspace state.
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet expectations: %v", err)
 	}
@@ -2394,9 +2427,9 @@ func TestRegister_SuccessClearsLastRegisterFailure(t *testing.T) {
 	handler := NewRegistryHandler(broadcaster)
 
 	// C18: no live tokens → bootstrap-allowed.
-	mock.ExpectQuery("SELECT EXISTS").
+	mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM workspace_auth_tokens").
 		WithArgs("ws-reg-ok").
-		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
 
 	// resolveDeliveryMode
 	mock.ExpectQuery("SELECT delivery_mode FROM workspaces").
@@ -2413,9 +2446,9 @@ func TestRegister_SuccessClearsLastRegisterFailure(t *testing.T) {
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// Issue token (no live tokens).
-	mock.ExpectQuery("SELECT EXISTS").
+	mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM workspace_auth_tokens").
 		WithArgs("ws-reg-ok").
-		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
 	mock.ExpectExec("INSERT INTO workspace_auth_tokens").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
@@ -2431,7 +2464,7 @@ func TestRegister_SuccessClearsLastRegisterFailure(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
-	body := `{"workspace_id":"ws-reg-ok","url":"http://ws-reg-ok.moleculesai.app/a2a"}`
+	body := `{"id":"ws-reg-ok","url":"http://ws-reg-ok.moleculesai.app/a2a","agent_card":{"name":"test"}}`
 	c.Request = httptest.NewRequest("POST", "/registry/register", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
