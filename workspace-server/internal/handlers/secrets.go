@@ -86,18 +86,26 @@ func rejectPlatformManagedDirectLLMBypassForWorkspace(c *gin.Context, workspaceI
 }
 
 // callerWorkspaceID resolves the caller's workspace identity from the request.
-// It checks X-Workspace-ID first (set by A2A proxy and canvas clients), then
-// falls back to deriving the workspace from the bearer token. Returns empty
-// string when the caller cannot be identified (e.g. admin-token requests).
+// It prefers the authenticated bearer token (core#2584 hardening: never let an
+// unsigned header override token-derived identity), then falls back to the
+// X-Workspace-ID header for session/cookie callers and unauthenticated paths.
+// Returns empty string when the caller cannot be identified (e.g. admin-token
+// requests where the bearer is not a workspace token).
 func callerWorkspaceID(c *gin.Context) string {
-	if callerID := c.GetHeader("X-Workspace-ID"); callerID != "" {
-		return callerID
-	}
+	// 1. Authenticated workspace bearer token — highest trust.
 	tok := wsauth.BearerTokenFromHeader(c.GetHeader("Authorization"))
 	if tok != "" {
 		if wsID, err := wsauth.WorkspaceFromToken(c.Request.Context(), db.DB, tok); err == nil {
 			return wsID
 		}
+	}
+	// 2. Fallback: A2A proxy / canvas clients set this header for callers
+	// that do not present a workspace bearer (session cookies, some proxy
+	// paths). We do NOT honor this when a workspace token is present — that
+	// closes the header-spoof path where a mismatched X-Workspace-ID could
+	// suppress auto-restart for a non-self write.
+	if callerID := c.GetHeader("X-Workspace-ID"); callerID != "" {
+		return callerID
 	}
 	return ""
 }
