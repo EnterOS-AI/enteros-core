@@ -30,7 +30,22 @@ type ProvisionTimeoutEmitter interface {
 // image-pull + user-data execution on a cold EC2 worker while still
 // getting well ahead of the "15+ minute" stuck state users see in
 // production.
-const DefaultProvisioningTimeout = 10 * time.Minute
+// Bumped 10 -> 12 min: a fresh-provision cold boot was measured at
+// ~7 min on a clean instance (i-052962296ad0c7240, 2026-06-10:
+// launched 14:51:01Z, registered (/registry/register 200) 14:58:04Z;
+// cloud-init blame = 381s in config-scripts_user, ~1m47s of it the ECR
+// image pull. The slow tail of that boot distribution crosses the old
+// 10-min sweep, which then false-fails a workspace that is still
+// healthily booting and registers seconds later (the recurring MiniMax
+// workspace-0c96b3ab failure). 12 min clears the observed ~7 min boot
+// plus tail slack while staying ahead of the genuinely-stuck state.
+// NOTE: the CP-side bootstrap-watcher
+// (controlplane internal/provisioner/bootstrap_watcher.go
+// bootstrapTimeoutFn) still ENDS its serial-console crash-diagnosis at
+// 5 min for non-hermes runtimes. It does not flip-to-failed (this sweep
+// owns that verdict), but bump it to 12 min in lockstep so early-crash
+// reporting covers the full boot window.
+const DefaultProvisioningTimeout = 12 * time.Minute
 
 // HermesProvisioningTimeout matches the CP bootstrap-watcher's
 // runtime-aware deadline (cp#245) for hermes workspaces: 25 min watcher
