@@ -64,6 +64,13 @@ let currentClientHeight = 200;
 beforeEach(() => {
   apiGet.mockClear();
   apiPost.mockReset();
+  // useChatSend chains api.post(...).then(...) — a bare vi.fn() returns
+  // undefined and the .then throws an UNHANDLED TypeError that vitest
+  // surfaces nondeterministically (run-order/teardown timing), flipping
+  // the Canvas job red on unrelated PRs. A never-resolving promise keeps
+  // the send in-flight, which is exactly the state the scroll assertions
+  // exercise.
+  apiPost.mockImplementation(() => new Promise(() => {}));
   scrollIntoView = vi.fn();
   scrollEventListeners = [];
   currentScrollTop = 0;

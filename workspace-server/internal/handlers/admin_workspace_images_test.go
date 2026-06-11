@@ -230,3 +230,47 @@ func TestGHCRAuthHeader_TrimsWhitespace(t *testing.T) {
 		t.Errorf("password not trimmed: got %q", payload["password"])
 	}
 }
+
+func TestTemplateImageRef(t *testing.T) {
+	cases := []struct {
+		name           string
+		registryEnv    string
+		runtime        string
+		want           string
+	}{
+		{
+			name:        "default registry prefix",
+			registryEnv: "",
+			runtime:     "claude-code",
+			want:        "ghcr.io/molecule-ai/workspace-template-claude-code:latest",
+		},
+		{
+			name:        "custom ECR mirror prefix",
+			registryEnv: "123456789012.dkr.ecr.us-east-1.amazonaws.com/molecule-ai",
+			runtime:     "claude-code",
+			want:        "123456789012.dkr.ecr.us-east-1.amazonaws.com/molecule-ai/workspace-template-claude-code:latest",
+		},
+		{
+			name:        "self-hosted Gitea registry",
+			registryEnv: "git.moleculesai.app/molecule-ai",
+			runtime:     "gemini-cli",
+			want:        "git.moleculesai.app/molecule-ai/workspace-template-gemini-cli:latest",
+		},
+		{
+			name:        "runtime with hyphen",
+			registryEnv: "",
+			runtime:     "openclaw-runtime",
+			want:        "ghcr.io/molecule-ai/workspace-template-openclaw-runtime:latest",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("MOLECULE_IMAGE_REGISTRY", tc.registryEnv)
+			got := TemplateImageRef(tc.runtime)
+			if got != tc.want {
+				t.Errorf("TemplateImageRef(%q) = %q, want %q", tc.runtime, got, tc.want)
+			}
+		})
+	}
+}
