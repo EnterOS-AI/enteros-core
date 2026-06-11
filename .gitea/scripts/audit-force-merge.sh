@@ -88,9 +88,64 @@ fi
 
 MERGE_SHA=$(echo "$PR" | jq -r '.merge_commit_sha')
 MERGED_BY=$(echo "$PR" | jq -r '.merged_by.login')
+PR_AUTHOR=$(echo "$PR" | jq -r '.user.login // ""')
 TITLE=$(echo "$PR" | jq -r '.title // ""')
 BASE_BRANCH=$(echo "$PR" | jq -r '.base.ref')
 HEAD_SHA=$(echo "$PR" | jq -r '.head.sha')
+
+# 1b. DETECTIVE: reserved-path self-merge (author == merger). The preventive
+#     reserved-path-review gate blocks the normal merge button, but a
+#     determined admin/force-merge can still bypass it — that is exactly how
+#     cp#673 slipped. This backstop emits `incident.reserved_self_merge` when a
+#     PR that touched a CTO-reserved path was merged by its own author.
+#     Reserved-path set comes from the BASE checkout (.gitea/reserved-paths.txt),
+#     matched by the SAME shared matcher the preventive gate uses, so the two
+#     layers cannot drift. Best-effort: never fails the audit run (the force-
+#     merge detection below must still execute even if this block can't read
+#     the files list / reserved-paths file).
+RESERVED_PATHS_FILE="${RESERVED_PATHS_FILE:-.gitea/reserved-paths.txt}"
+_AUDIT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -n "$PR_AUTHOR" ] && [ "$PR_AUTHOR" = "$MERGED_BY" ] \
+   && [ -f "${_AUDIT_DIR}/reserved-path-match.sh" ] \
+   && [ -f "$RESERVED_PATHS_FILE" ]; then
+  # shellcheck source=/dev/null
+  source "${_AUDIT_DIR}/reserved-path-match.sh"
+  _RP_FILES=()
+  _rp_page=1
+  while : ; do
+    _rp_tmp=$(mktemp)
+    _rp_http=$(curl -sS -o "$_rp_tmp" -w '%{http_code}' -H "$AUTH" \
+      "${API}/repos/${OWNER}/${NAME}/pulls/${PR_NUMBER}/files?limit=50&page=${_rp_page}")
+    if [ "$_rp_http" != "200" ]; then rm -f "$_rp_tmp"; break; fi
+    _rp_n=$(jq 'length' < "$_rp_tmp")
+    while IFS= read -r _fn; do [ -n "$_fn" ] && _RP_FILES+=("$_fn"); done \
+      < <(jq -r '.[].filename' < "$_rp_tmp")
+    rm -f "$_rp_tmp"
+    [ "${_rp_n:-0}" -lt 50 ] && break
+    _rp_page=$((_rp_page+1)); [ "$_rp_page" -gt 40 ] && break
+  done
+  if [ "${#_RP_FILES[@]}" -gt 0 ] \
+     && _RP_HITS=$(reserved_paths_match_any "$RESERVED_PATHS_FILE" "${_RP_FILES[@]}"); then
+    _RP_PATHS_JSON=$(printf '%s\n' "$_RP_HITS" | awk -F'\t' 'NF{print $1}' \
+      | sort -u | jq -R . | jq -s .)
+    _RP_NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    jq -nc \
+      --arg event_type "incident.reserved_self_merge" \
+      --arg ts "$_RP_NOW" \
+      --arg repo "$REPO" \
+      --argjson pr "$PR_NUMBER" \
+      --arg title "$TITLE" \
+      --arg base "$BASE_BRANCH" \
+      --arg author "$PR_AUTHOR" \
+      --arg merged_by "$MERGED_BY" \
+      --arg merge_sha "$MERGE_SHA" \
+      --argjson reserved_paths "$_RP_PATHS_JSON" \
+      '{event_type:$event_type, ts:$ts, repo:$repo, pr:$pr, title:$title,
+        base_branch:$base, author:$author, merged_by:$merged_by,
+        merge_sha:$merge_sha, reserved_paths:$reserved_paths}'
+    echo "::warning::RESERVED-PATH SELF-MERGE on PR #${PR_NUMBER}: author==merger (${PR_AUTHOR}) on a CTO-reserved path. See incident.reserved_self_merge."
+  fi
+fi
 
 # 2. Required status checks — branch-aware JSON dict takes precedence.
 if [ -n "${REQUIRED_CHECKS_JSON:-}" ]; then

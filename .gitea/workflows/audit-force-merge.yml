@@ -1,9 +1,14 @@
 # audit-force-merge — emit `incident.force_merge` to runner stdout when
-# a PR is merged with required-status-checks not green. Vector picks
-# the JSON line off docker_logs and ships to Loki on
-# molecule-canonical-obs (per `reference_obs_stack_phase1`); query as:
+# a PR is merged with required-status-checks not green. ALSO emits
+# `incident.reserved_self_merge` when a PR that touched a CTO-reserved path
+# (.gitea/reserved-paths.txt) was merged by its own author (author==merger) —
+# the DETECTIVE backstop for the reserved-path-review preventive gate, since a
+# force-merge bypasses any pre-merge gate (cp#673 precedent). Vector picks the
+# JSON line off docker_logs and ships to Loki on molecule-canonical-obs (per
+# `reference_obs_stack_phase1`); query as:
 #
 #   {host="operator"} |= "event_type" |= "incident.force_merge" | json
+#   {host="operator"} |= "event_type" |= "incident.reserved_self_merge" | json
 #
 # Closes the §SOP-6 audit gap (the doc says force-merges write to
 # `structure_events`, but that table lives in the platform DB, not
