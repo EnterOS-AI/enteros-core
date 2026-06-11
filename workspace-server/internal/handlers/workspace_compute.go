@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
@@ -401,35 +402,35 @@ func (h *WorkspaceHandler) Display(c *gin.Context) {
 	).Scan(&raw, &instanceID)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			c.JSON(404, gin.H{"error": "workspace not found"})
+			c.JSON(http.StatusNotFound, gin.H{"error": "workspace not found"})
 			return
 		}
 		log.Printf("Display: load compute for %s failed: %v", workspaceID, err)
-		c.JSON(500, gin.H{"error": "failed to load display config"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load display config"})
 		return
 	}
 	var compute models.WorkspaceCompute
 	if raw != "" && raw != "{}" {
 		if err := json.Unmarshal([]byte(raw), &compute); err != nil {
 			log.Printf("Display: invalid compute JSON for %s: %v", workspaceID, err)
-			c.JSON(500, gin.H{"error": "invalid display config"})
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "invalid display config"})
 			return
 		}
 		if err := validateWorkspaceDisplayConfig(compute.Display); err != nil {
 			log.Printf("Display: invalid stored compute for %s: %v", workspaceID, err)
-			c.JSON(500, gin.H{"error": "invalid display config"})
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "invalid display config"})
 			return
 		}
 	}
 	if compute.Display.Mode == "" || compute.Display.Mode == "none" {
-		c.JSON(200, workspaceDisplayResponse{
+		c.JSON(http.StatusOK, workspaceDisplayResponse{
 			Available: false,
 			Reason:    "display_not_enabled",
 		})
 		return
 	}
 	if instanceID != "" {
-		c.JSON(200, workspaceDisplayResponse{
+		c.JSON(http.StatusOK, workspaceDisplayResponse{
 			Available: true,
 			Mode:      compute.Display.Mode,
 			Protocol:  compute.Display.Protocol,
@@ -439,7 +440,7 @@ func (h *WorkspaceHandler) Display(c *gin.Context) {
 		})
 		return
 	}
-	c.JSON(200, workspaceDisplayResponse{
+	c.JSON(http.StatusOK, workspaceDisplayResponse{
 		Available: false,
 		Reason:    "display_session_unavailable",
 		Mode:      compute.Display.Mode,
