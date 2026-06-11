@@ -223,6 +223,7 @@ function MyChatPanel({ workspaceId, data }: Props) {
     }
     if (!hasInitialScrollRef.current && history.messages.length > 0) {
       hasInitialScrollRef.current = true;
+      if (!atBottom) return;
       bottomRef.current?.scrollIntoView({ behavior: "instant" as ScrollBehavior });
       return;
     }
