@@ -442,6 +442,23 @@ func (h *WorkspaceHandler) proxyA2ARequest(ctx context.Context, workspaceID stri
 	}
 	body = normalizedBody
 
+	// #2560 (chat UX: persist in-flight exchange across leave/refresh):
+	// write the user message to activity_logs AT RECEIPT — before any of
+	// the downstream short-circuits (poll-mode, mock-runtime, push dispatch)
+	// run — so a mid-turn leave/refresh re-hydrates the user message
+	// instead of an empty pane. Idempotent on messageId via the partial
+	// unique index (idx_activity_logs_msg_id) + ON CONFLICT DO UPDATE in
+	// logActivityExec — a poll-mode re-persist (or a duplicated ingest
+	// from a retry) collapses to a single row, and the completion path
+	// (logA2ASuccess / logA2AReceiveQueued) stamps response_body onto
+	// the same row. No duplicate bubble in chat-history.
+	//
+	// Skipped when the body has no messageId (system callers, legacy
+	// a2a_send payloads) — the completion path remains authoritative.
+	if a2aMethod == "message/send" {
+		h.persistUserMessageAtIngest(ctx, workspaceID, callerID, body, a2aMethod)
+	}
+
 	// #2339 PR 2 — poll-mode short-circuit. When the target workspace
 	// is registered as delivery_mode=poll (e.g. an operator's laptop
 	// running molecule-mcp-claude-channel), the platform does NOT

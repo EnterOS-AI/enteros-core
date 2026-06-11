@@ -425,6 +425,7 @@ func (h *WorkspaceHandler) logA2ASuccess(ctx context.Context, workspaceID, calle
 		ToolTrace:    toolTrace,
 		DurationMs:   &durationMs,
 		Status:       logStatus,
+		MessageId:    extractMessageIdFromA2ABody(body),
 	})
 
 	if callerID == "" && statusCode < 400 {
@@ -725,6 +726,14 @@ func (h *WorkspaceHandler) logA2AReceiveQueued(ctx context.Context, workspaceID,
 	// his reported loss is THIS path; #1347 (push-mode, persists AFTER the
 	// poll short-circuit) structurally cannot cover it.
 	//
+	// #2560: this path ALSO sets the messageId on the activity row. If
+	// persistUserMessageAtIngest already wrote the same messageId (e.g.
+	// the poll short-circuit ran AFTER the ingest path on a request that
+	// got demoted to poll), the partial unique index
+	// (idx_activity_logs_msg_id) makes this a no-op via ON CONFLICT DO
+	// NOTHING — the existing row keeps the user message; the queued
+	// acknowledgment is still emitted; no duplicate bubble.
+	//
 	// Mirrors persistUserMessageAtIngest's discipline:
 	//   - context.WithoutCancel: a client disconnect on chat-exit (which
 	//     cancels the inbound request ctx) MUST NOT abort this write.
@@ -754,6 +763,109 @@ func (h *WorkspaceHandler) logA2AReceiveQueued(ctx context.Context, workspaceID,
 		Summary:      &summary,
 		RequestBody:  json.RawMessage(body),
 		Status:       "ok",
+		MessageId:    extractMessageIdFromA2ABody(body),
+	})
+}
+
+// extractMessageIdFromA2ABody reads params.message.messageId out of a
+// normalized A2A JSON-RPC body. Returns "" when the field is absent or
+// the body is malformed — the empty value opts the activity row out of
+// the messageId-keyed conflict path (the existing always-INSERT
+// behavior is preserved for non-per-message activity).
+func extractMessageIdFromA2ABody(body []byte) string {
+	if len(body) == 0 {
+		return ""
+	}
+	var env struct {
+		Params struct {
+			Message struct {
+				MessageID string `json:"messageId"`
+			} `json:"message"`
+		} `json:"params"`
+	}
+	if err := json.Unmarshal(body, &env); err != nil {
+		return ""
+	}
+	return env.Params.Message.MessageID
+}
+
+// persistUserMessageAtIngest writes the canvas user's outbound chat
+// message to activity_logs SYNCHRONOUSLY, BEFORE the agent dispatch
+// runs. The completion path (logA2ASuccess / logA2AReceiveQueued) then
+// uses ON CONFLICT (workspace_id, message_id) DO UPDATE to attach the
+// agent's response_body onto the SAME row, so a single activity_logs
+// row carries both the user message and the agent reply — the chat-
+// history reader (messagestore.PostgresMessageStore) emits one
+// (user, agent) pair per row, no duplicate bubble.
+//
+// Why before-dispatch (issue #2560): pre-fix the user message only
+// landed in activity_logs at turn completion (logA2ASuccess). A
+// mid-turn leave/refresh re-hydrated an empty pane plus typing dots
+// (the agent's currentTask was set but the request_body was missing),
+// and a workspace-server restart / deploy / OOM between the canvas
+// 200 and the goroutine's commit lost the message permanently
+// (chat-history is read back from activity_logs; no row == no message
+// on reopen). The synchronous ingest-row write closes both holes:
+// leave/refresh always sees the user message in chat-history
+// (request_body is there), and the message is durable on disk before
+// dispatch starts.
+//
+// Discipline (mirrors logA2AReceiveQueued):
+//   - context.WithoutCancel: a client disconnect on chat-exit (which
+//     cancels the inbound request ctx) MUST NOT abort this write.
+//   - SYNCHRONOUS (no goAsync): the row must be durable before dispatch.
+//   - Best-effort: LogActivity logs+swallows INSERT errors internally,
+//     so a DB hiccup never blocks the dispatch — behavior for that one
+//     request is never worse than the pre-fix "completion-only" path.
+//   - The post-commit broadcast fires inside LogActivity; the canvas
+//     may render the user message optimistically (it already has the
+//     local-state copy). A missed WS event is not data loss (durable
+//     row is the truth the canvas re-reads on reopen).
+//
+// When to call: for every A2A proxy entry that the user initiated
+// (canvas / canvas-user, or workspace-to-workspace delegation), AFTER
+// access control + budget + normalizeA2APayload, BEFORE the
+// delivery-mode / mock / dispatch short-circuits. The completion
+// path (logA2ASuccess for push, logA2AReceiveQueued for poll, and
+// the poll-ingest-persist pre-existing test) keys on the same
+// messageId, so a duplicated ingest collapses via ON CONFLICT to a
+// single row.
+func (h *WorkspaceHandler) persistUserMessageAtIngest(
+	ctx context.Context,
+	workspaceID, callerID string,
+	body []byte,
+	a2aMethod string,
+) {
+	messageId := extractMessageIdFromA2ABody(body)
+	// Without a messageId the row is not message-keyed; LogActivity's
+	// ON CONFLICT path won't fire (the partial unique index excludes
+	// NULL message_id) and we'd get a duplicate row if both ingest
+	// and completion paths ran. Skip the ingest — completion is
+	// authoritative for the non-message-keyed case (legacy a2a_send
+	// payloads, system callers, etc.).
+	if messageId == "" {
+		return
+	}
+
+	insCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+
+	var wsName string
+	db.DB.QueryRowContext(insCtx, `SELECT name FROM workspaces WHERE id = $1`, workspaceID).Scan(&wsName)
+	if wsName == "" {
+		wsName = workspaceID
+	}
+	summary := a2aMethod + " → " + wsName + " (ingest)"
+	LogActivity(insCtx, h.broadcaster, ActivityParams{
+		WorkspaceID:  workspaceID,
+		ActivityType: "a2a_receive",
+		SourceID:     nilIfEmpty(callerID),
+		TargetID:     &workspaceID,
+		Method:       &a2aMethod,
+		Summary:      &summary,
+		RequestBody:  json.RawMessage(body),
+		Status:       "ok",
+		MessageId:    messageId,
 	})
 }
 
