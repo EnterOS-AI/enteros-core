@@ -64,11 +64,11 @@ func TestIntegration_RequireApproval_GateCycle(t *testing.T) {
 		t.Fatalf("seed root workspace: %v", err)
 	}
 
-	action := approvals.ActionDeleteWorkspace
+	action := approvals.ActionSecretWrite
 	ctxA := map[string]interface{}{"target": "ws-A"}
 
 	// 1. First call → no approval yet → pending created.
-	ok, id1, err := requireApproval(ctx, b, wsID, action, "delete ws-A", ctxA)
+	ok, id1, err := requireApproval(ctx, b, wsID, action, "write secret ws-A", ctxA)
 	if err != nil {
 		t.Fatalf("call 1: %v", err)
 	}
