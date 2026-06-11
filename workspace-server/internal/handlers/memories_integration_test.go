@@ -63,22 +63,6 @@ func (a *pgpluginAdapter) ForgetMemory(ctx context.Context, id string, _ contrac
 	return a.store.ForgetMemory(ctx, id, "")
 }
 
-// seedWorkspace inserts a workspaces row and returns its UUID. The
-// namespace resolver (and the handler's parent-id check for GLOBAL)
-// both need a real row with a valid UUID.
-func seedWorkspace(t *testing.T, conn *sql.DB, name string) string {
-	t.Helper()
-	var id string
-	if err := conn.QueryRowContext(context.Background(), `
-		INSERT INTO workspaces (id, name, status)
-		VALUES (gen_random_uuid(), $1, 'online')
-		RETURNING id
-	`, name).Scan(&id); err != nil {
-		t.Fatalf("seedWorkspace %q: %v", name, err)
-	}
-	return id
-}
-
 // memoryIntegrationDB returns a real postgres connection for memory tests.
 // It applies the memory plugin schema if missing and cleans up tables on
 // t.Cleanup so tests are hermetic.
