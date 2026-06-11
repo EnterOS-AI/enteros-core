@@ -565,8 +565,9 @@ check "Delete PM requires name confirmation" '"destructive_action_requires_confi
 R=$(curl -s -X DELETE "$BASE/workspaces/$PM_ID" -H "X-Confirm-Name: Test PM")
 check "Delete PM requires cascade confirmation" '"confirmation_required"' "$R"
 
-# Delete with confirmation
-R=$(curl -s -X DELETE "$BASE/workspaces/$PM_ID?confirm=true" -H "X-Confirm-Name: Test PM")
+# Delete with confirmation. This destructive path is approval-gated for admin
+# callers, so drive the same approve-and-retry helper used by focused E2Es.
+R=$(e2e_gated_admin_op "$PM_ID" curl -s -X DELETE "$BASE/workspaces/$PM_ID?confirm=true" -H "X-Confirm-Name: Test PM")
 check "Delete PM cascades" '"cascade_deleted"' "$R"
 
 # Delete outsider
@@ -574,13 +575,15 @@ e2e_delete_workspace "$OUTSIDER_ID" "Test Outsider"
 
 # Clean up remaining workspaces (bundle imports, runtime test workspaces, etc.)
 sleep 2
-curl -s "$BASE/workspaces" | python3 -c "
-import json, sys, subprocess, time
-ws = json.load(sys.stdin)
-for w in ws:
-    time.sleep(0.5)  # avoid rate limit
-    subprocess.run(['curl', '-s', '-X', 'DELETE', '$BASE/workspaces/' + w['id'] + '?confirm=true', '-H', 'X-Confirm-Name: ' + w.get('name','')], capture_output=True)
-" 2>/dev/null
+while IFS=$'\t' read -r wid name; do
+    [ -z "$wid" ] && continue
+    sleep 0.5  # avoid rate limit
+    e2e_delete_workspace "$wid" "$name" >/dev/null 2>&1 || true
+done < <(curl -s "$BASE/workspaces" | python3 -c "
+import json, sys
+for w in json.load(sys.stdin):
+    print(str(w.get('id','')) + '\t' + str(w.get('name','')))
+" 2>/dev/null)
 
 # Poll for clean state up to 30s — DB cascade + container stop is async on busy systems
 for _ in 1 2 3 4 5 6; do

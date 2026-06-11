@@ -38,9 +38,11 @@ cleanup() {
     local rc=$?
     set +e
     if [ -n "$PARENT" ]; then
-        curl -sS -X DELETE "$BASE/workspaces/$PARENT?confirm=true&purge=true" \
+        local admin_auth=()
+        e2e_admin_auth_args admin_auth
+        e2e_gated_admin_op "$PARENT" curl -sS -X DELETE "$BASE/workspaces/$PARENT?confirm=true&purge=true" \
             -H "X-Confirm-Name: e2e-chat-upload" \
-            ${PARENT_TOK:+-H "Authorization: Bearer $PARENT_TOK"} >/dev/null 2>&1
+            "${admin_auth[@]}" >/dev/null 2>&1
     fi
     exit $rc
 }
