@@ -211,7 +211,7 @@ except Exception:
     e2e_admin_auth_args _admin_auth
     curl -s -X POST "$BASE/workspaces/$_wid/approvals/$_approval_id/decide" \
       -H "Content-Type: application/json" \
-      -d '{"approved":true,"decided_by":"e2e-api-smoke"}' \
+      -d '{"decision":"approved","decided_by":"e2e-api-smoke"}' \
       ${_admin_auth[@]+"${_admin_auth[@]}"} > /dev/null || true
     # Retry the original operation. The gate's consume-once
     # (approval_gate.go UPDATE … RETURNING id) means the SECOND call finds
