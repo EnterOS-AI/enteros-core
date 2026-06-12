@@ -606,14 +606,11 @@ jobs:
     runs-on: ci-meta
     timeout-minutes: 5
     steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        # Lightweight checkout so the extracted aggregation script is available.
+        # The job still does NO polling and NO API calls; gating remains the
+        # plain `needs:` edge.
       - name: Verify all aggregated CI jobs succeeded
-        # NO polling, NO API call, NO checkout. Because this job lists the
-        # aggregated jobs under `needs:` (without `if: always()`), Gitea only
-        # starts it once every need has reached SUCCESS — a failed/errored
-        # need short-circuits the job and propagates red to the
-        # `CI / all-required` context. This explicit check is a
-        # belt-and-suspenders assertion + a readable run summary; the real
-        # gating is the `needs:` edge itself.
         env:
           CHANGES_RESULT: ${{ needs.changes.result }}
           PLATFORM_RESULT: ${{ needs.platform-build.result }}

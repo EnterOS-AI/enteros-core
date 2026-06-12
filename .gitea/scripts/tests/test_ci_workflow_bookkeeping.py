@@ -120,8 +120,14 @@ def test_all_required_step_uses_extracted_script():
     all_required = _all_required(workflow)
     steps = all_required.get("steps", [])
     assert steps, "all-required job has no steps"
-    run_block = steps[0].get("run", "")
 
+    run_block = ""
+    for step in steps:
+        if step.get("name") == "Verify all aggregated CI jobs succeeded":
+            run_block = step.get("run", "")
+            break
+
+    assert run_block, "all-required verify step not found"
     assert "all-required-check.sh" in run_block, (
         "all-required step must invoke .gitea/scripts/all-required-check.sh"
     )
