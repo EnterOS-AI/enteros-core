@@ -12,11 +12,10 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// TestSwitchProvider_StopBeforeProviderWrite is the load-bearing ordering pin
-// (RFC #622 Hazard 1). The stop (cpStopWithRetry) MUST appear before the UPDATE
-// that writes the new provider — otherwise the stop resolves the new provider
-// and deprovisions the old box against the wrong backend, leaking it. A
-// source-level position check guards against a refactor reordering the two.
+// TestSwitchProvider_StopBeforeProviderWrite is the load-bearing ordering pin.
+// The stop helper MUST appear before the UPDATE that writes the new provider —
+// otherwise the teardown uses the wrong backend metadata and the old box leaks.
+// A source-level position check guards against a refactor reordering the two.
 func TestSwitchProvider_StopBeforeProviderWrite(t *testing.T) {
 	wd, _ := os.Getwd()
 	src, err := os.ReadFile(filepath.Join(wd, "workspace_switch_provider.go"))
@@ -34,7 +33,7 @@ func TestSwitchProvider_StopBeforeProviderWrite(t *testing.T) {
 		t.Fatal("SwitchProvider must write the new provider via jsonb_set on compute->{provider}")
 	}
 	if stopIdx >= writeIdx {
-		t.Fatalf("ORDERING HAZARD: cpStopWithRetry (idx %d) must come BEFORE the provider write (idx %d) — else the old box is deprovisioned with the new backend and leaks", stopIdx, writeIdx)
+		t.Fatalf("ORDERING HAZARD: stop helper (idx %d) must come BEFORE the provider write (idx %d) — else the old box is torn down with wrong backend metadata and leaks", stopIdx, writeIdx)
 	}
 	// and the instance_id must be cleared in the same UPDATE (retry-safety)
 	if !bytes.Contains(stripped, []byte("instance_id = NULL")) {
@@ -43,10 +42,10 @@ func TestSwitchProvider_StopBeforeProviderWrite(t *testing.T) {
 }
 
 // TestSwitchProvider_ConcurrencyGuardAndAudit pins the two hardening items from
-// the #2422 correctness review: (a) the provider-write is an atomic CAS so two
-// concurrent switches can't both launch a provision (orphan), and (b) a
-// stop-exhaustion emits a durable audit row carrying the old instance_id+provider
-// (else the old box orphans with no DB pointer once instance_id is nulled).
+// the correctness review: (a) the provider-write is an atomic CAS so two
+// concurrent switches can't both launch a provision, and (b) stop-exhaustion
+// emits a durable audit row carrying the old instance_id+provider so the old box
+// remains discoverable after instance_id is nulled.
 func TestSwitchProvider_ConcurrencyGuardAndAudit(t *testing.T) {
 	wd, _ := os.Getwd()
 	src, err := os.ReadFile(filepath.Join(wd, "workspace_switch_provider.go"))
@@ -64,7 +63,7 @@ func TestSwitchProvider_ConcurrencyGuardAndAudit(t *testing.T) {
 		t.Error("SwitchProvider must use cpStopWithRetryErr to detect stop exhaustion")
 	}
 	if !bytes.Contains(s, []byte("emitSwitchProviderStopExhausted")) {
-		t.Error("SwitchProvider must emit an audit row with old instance_id+provider on stop exhaustion")
+		t.Error("SwitchProvider must emit an audit row with old instance/provider metadata on stop exhaustion")
 	}
 }
 

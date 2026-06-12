@@ -21,20 +21,17 @@ import (
 // (agent_card, config, secrets, tokens, memory) lives in the tenant DB and is
 // preserved because the row is never deleted.
 //
-// CRITICAL ORDERING (the wrong-backend leak, RFC #622 Hazard 1): the stop must
-// run with the OLD provider BEFORE the DB provider is changed. cpStopWithRetry
-// resolves provider + instance_id from the workspaces row at call time; if we
-// wrote the new provider first, the stop would issue
-// DELETE …?instance_id=<old>&provider=<new> → CP routes teardown to the NEW
-// backend → the old box is never terminated and leaks (billed forever, and not
-// covered by the status='removed' orphan sweeper). So the sequence is strictly:
+// CRITICAL ORDERING: the stop must run with the OLD provider BEFORE the DB
+// provider is changed. The stop helper reads the current row at call time; if we
+// wrote the new provider first, the teardown request would target the wrong
+// backend and the old box would leak. So the sequence is strictly:
 //
 //  1. stop OLD box (DB still has old provider + old instance_id)
 //  2. clear instance_id + write new provider (jsonb_set, preserving the rest)
 //  3. provision NEW box (withStoredCompute now reads the new provider)
 //
 // Clearing instance_id in step 2 also makes a retried switch safe: a second call
-// finds no stale instance to (mis-)deprovision against the new backend.
+// finds no stale instance to act on with the new provider metadata.
 func (h *WorkspaceHandler) SwitchProvider(c *gin.Context) {
 	id := c.Param("id")
 	ctx := c.Request.Context()
@@ -118,13 +115,13 @@ func (h *WorkspaceHandler) SwitchProvider(c *gin.Context) {
 
 	// --- ordered switch (see doc-comment) ---
 
-	// 1. Stop the OLD box with the OLD provider. DB is unchanged here, so
-	//    cpStopWithRetryErr resolves the old provider + old instance_id. Bounded
-	//    retry; on exhaustion it returns an error but we STILL proceed (a stuck
-	//    old box must not strand the switch) — except we capture the failure so
-	//    step 2.5 can emit a durable audit row, because step 2 nulls instance_id
-	//    and flips provider, which otherwise orphans the old box with no DB
-	//    pointer for the sweeper to find (review finding #3).
+	// 1. Stop the OLD box with the OLD provider. DB is unchanged here, so the
+	//    stop helper reads the old provider + old instance_id. Bounded retry; on
+	//    exhaustion it returns an error but we STILL proceed (a stuck old box
+	//    must not strand the switch) — except we capture the failure so step 2.5
+	//    can emit a durable audit row, because step 2 nulls instance_id and flips
+	//    provider, which otherwise leaves the old box untracked by normal
+	//    lifecycle cleanup (review finding #3).
 	stopErr := h.cpStopWithRetryErr(ctx, id, "SwitchProvider", false)
 
 	// 2. Atomically claim the switch AND clear instance_id + write the new
@@ -150,15 +147,15 @@ func (h *WorkspaceHandler) SwitchProvider(c *gin.Context) {
 	if n, _ := res.RowsAffected(); n == 0 {
 		// Lost the CAS: another switch already flipped the provider / set
 		// provisioning, or the row changed under us. Do NOT launch a second
-		// provision (would orphan a box).
+		// provision (would leave an untracked box).
 		c.JSON(http.StatusConflict, gin.H{"error": "ALREADY_SWITCHING", "detail": "a provider switch or provision is already in progress for this workspace"})
 		return
 	}
 
-	// 2.5. If the old box never confirmed stopped, the old instance is now
-	//      orphaned with no DB pointer (we just nulled instance_id). Emit a
-	//      durable audit row carrying the old instance_id + provider so a CP-side
-	//      reconciler can find and terminate it (review finding #3).
+	// 2.5. If the old box never confirmed stopped, it may not be tracked by the
+	//      normal lifecycle cleanup after instance_id was nulled. Emit a durable
+	//      audit row carrying the old instance_id + provider so a platform cleanup
+	//      process can locate and terminate it (review finding #3).
 	if stopErr != nil && oldInstanceID.Valid && oldInstanceID.String != "" {
 		h.emitSwitchProviderStopExhausted(ctx, id, oldInstanceID.String, effectiveOld, newProvider, stopErr)
 	}
@@ -188,10 +185,9 @@ func (h *WorkspaceHandler) SwitchProvider(c *gin.Context) {
 
 // emitSwitchProviderStopExhausted records a durable audit row when a provider
 // switch could not confirm the OLD box stopped before its instance_id was
-// cleared from the row. Without it the old box is an un-pointed orphan that the
-// status='removed' sweeper won't catch; a CP-side reconciler reads these rows by
-// old_instance_id + old_provider to terminate the leaked box. Mirrors
-// emitDeleteTerminateRetryExhausted (workspace_dispatchers.go). Best-effort.
+// cleared from the row. Without it the old box may not be tracked by normal
+// lifecycle cleanup; a platform cleanup process reads these rows by
+// old_instance_id + old_provider to terminate the leaked box. Best-effort.
 func (h *WorkspaceHandler) emitSwitchProviderStopExhausted(ctx context.Context, workspaceID, oldInstanceID, oldProvider, newProvider string, cause error) {
 	if db.DB == nil {
 		return
@@ -202,7 +198,7 @@ func (h *WorkspaceHandler) emitSwitchProviderStopExhausted(ctx context.Context, 
 		"old_provider":    oldProvider,
 		"new_provider":    newProvider,
 		"last_error":      cause.Error(),
-		"recovery_path":   "cp_orphan_reconciler",
+		"recovery_path":   "platform_cleanup",
 	})
 	if err != nil {
 		log.Printf("emitSwitchProviderStopExhausted: marshal failed for %s: %v", workspaceID, err)
