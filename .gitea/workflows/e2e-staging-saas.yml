@@ -856,6 +856,12 @@ jobs:
       - name: Run concierge/platform-agent staginge2e
         working-directory: workspace-server
         run: go test -tags staging_e2e ./internal/staginge2e/ -run TestConciergePlatformAgent_Staging -count=1 -v -timeout 35m
+      # core#2606: a normal workspace raises task+approval to the user and they
+      # surface in the org pending view. Its own throwaway org (e2e-req-*) with
+      # t.Cleanup teardown; separate -run so a concierge failure doesn't mask it.
+      - name: Run workspace-requests staginge2e (core#2606)
+        working-directory: workspace-server
+        run: go test -tags staging_e2e ./internal/staginge2e/ -run TestWorkspaceCanRaiseTaskAndApprovalToUser -count=1 -v -timeout 30m
       # Teardown: the test installs a t.Cleanup admin-DELETE of its own tenant
       # (e2e-cncrg-* slug), running even on a t.Fatal. The age-guarded
       # sweep-stale-e2e-orgs workflow (30-min floor, e2e- prefix) is the final
