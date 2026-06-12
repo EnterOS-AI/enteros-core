@@ -225,7 +225,7 @@ diagnose_provision() {
     echo "--- container env ---"
     docker inspect "$container" --format '{{json .Config.Env}}' 2>&1 || true
     echo "--- container reachability test ---"
-    docker exec "$container" sh -c 'echo "platform_url=$PLATFORM_URL"; wget -qO- "$PLATFORM_URL/health" 2>&1 || true' || true
+    docker exec "$container" sh -c 'echo "platform_url=$PLATFORM_URL"; curl -sfS -m 5 "$PLATFORM_URL/health" 2>&1 || echo "WARN: curl probe failed (curl=$?)"' || true
   fi
   echo "--- all ws-* containers ---"
   docker ps --filter "name=ws-" --format '{{.Names}} {{.Status}}' 2>/dev/null || true
