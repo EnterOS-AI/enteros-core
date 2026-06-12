@@ -659,6 +659,10 @@ func TestRequests_AddMessage_AgentPath_Recipient_BindsToCaller(t *testing.T) {
 	handler := NewRequestsHandler(newTestBroadcaster())
 
 	// URL workspace ws-2 is the recipient. The body tries to spoof ws-EVIL.
+	// The handler's authz Get AND the store's own Get both fetch the row.
+	mock.ExpectQuery("FROM requests WHERE id").
+		WithArgs("req-1").
+		WillReturnRows(oneRequestRow("req-1", "task", "ws-1", "agent", "ws-2", "pending"))
 	mock.ExpectQuery("FROM requests WHERE id").
 		WithArgs("req-1").
 		WillReturnRows(oneRequestRow("req-1", "task", "ws-1", "agent", "ws-2", "pending"))
@@ -693,6 +697,10 @@ func TestRequests_AddMessage_AgentPath_Requester_BindsToCaller(t *testing.T) {
 	handler := NewRequestsHandler(newTestBroadcaster())
 
 	// URL workspace ws-1 is the requester. Body author_id is ignored.
+	// Handler authz Get + store Get → two fetches.
+	mock.ExpectQuery("FROM requests WHERE id").
+		WithArgs("req-1").
+		WillReturnRows(oneRequestRow("req-1", "task", "ws-1", "agent", "ws-2", "info_requested"))
 	mock.ExpectQuery("FROM requests WHERE id").
 		WithArgs("req-1").
 		WillReturnRows(oneRequestRow("req-1", "task", "ws-1", "agent", "ws-2", "info_requested"))
