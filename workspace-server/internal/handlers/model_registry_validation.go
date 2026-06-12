@@ -262,9 +262,15 @@ func globalSecretKeyNames(ctx context.Context) ([]string, bool) {
 	var keys []string
 	for rows.Next() {
 		var k string
-		if rows.Scan(&k) == nil {
-			keys = append(keys, k)
+		if err := rows.Scan(&k); err != nil {
+			log.Printf("byok-create-preflight: global_secrets key scan row failed (failing open; provision preflight backstops): %v", err)
+			return nil, false
 		}
+		keys = append(keys, k)
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("byok-create-preflight: global_secrets key scan iteration failed (failing open; provision preflight backstops): %v", err)
+		return nil, false
 	}
 	return keys, true
 }

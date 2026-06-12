@@ -6,6 +6,7 @@ package handlers
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -112,5 +113,66 @@ func TestListOfferedModels_ClaudeCode(t *testing.T) {
 	byok, ok := byID["claude-sonnet-4-6"]
 	if !ok || byok.PlatformBilled || len(byok.AuthEnv) == 0 {
 		t.Errorf("claude-sonnet-4-6 must be BYOK with auth_env: %+v (present=%v)", byok, ok)
+	}
+}
+
+// TestGlobalSecretKeyNames_QueryError: a failure to start the global_secrets
+// scan must fail open (ok=false) so the create gate does not 422 a legitimate
+// BYOK create on a transient DB blip.
+func TestGlobalSecretKeyNames_QueryError(t *testing.T) {
+	mock := setupTestDB(t)
+	mock.ExpectQuery("SELECT key FROM global_secrets").
+		WillReturnError(sql.ErrConnDone)
+
+	keys, ok := globalSecretKeyNames(context.Background())
+	if ok || keys != nil {
+		t.Errorf("expected fail-open on query error, got ok=%v keys=%v", ok, keys)
+	}
+}
+
+// TestGlobalSecretKeyNames_RowError: an iteration error surfaced by rows.Err()
+// after Next() returns false must fail open.
+func TestGlobalSecretKeyNames_RowError(t *testing.T) {
+	mock := setupTestDB(t)
+	rows := sqlmock.NewRows([]string{"key"}).AddRow("ANTHROPIC_API_KEY").RowError(0, sql.ErrConnDone)
+	mock.ExpectQuery("SELECT key FROM global_secrets").
+		WillReturnRows(rows)
+
+	keys, ok := globalSecretKeyNames(context.Background())
+	if ok || keys != nil {
+		t.Errorf("expected fail-open on rows.Err, got ok=%v keys=%v", ok, keys)
+	}
+}
+
+// TestGlobalSecretKeyNames_ScanError: a row that cannot scan must fail the
+// whole scan open rather than silently dropping the row and returning partial
+// keys.
+func TestGlobalSecretKeyNames_ScanError(t *testing.T) {
+	mock := setupTestDB(t)
+	// Mismatched column type triggers a scan error in sqlmock.
+	rows := sqlmock.NewRows([]string{"key"}).AddRow(12345)
+	mock.ExpectQuery("SELECT key FROM global_secrets").
+		WillReturnRows(rows)
+
+	keys, ok := globalSecretKeyNames(context.Background())
+	if ok || keys != nil {
+		t.Errorf("expected fail-open on scan error, got ok=%v keys=%v", ok, keys)
+	}
+}
+
+// TestGlobalSecretKeyNames_Success: happy path returns all key names and ok=true.
+func TestGlobalSecretKeyNames_Success(t *testing.T) {
+	mock := setupTestDB(t)
+	mock.ExpectQuery("SELECT key FROM global_secrets").
+		WillReturnRows(sqlmock.NewRows([]string{"key"}).
+			AddRow("ANTHROPIC_API_KEY").
+			AddRow("OPENAI_API_KEY"))
+
+	keys, ok := globalSecretKeyNames(context.Background())
+	if !ok {
+		t.Fatalf("expected ok=true, got ok=false")
+	}
+	if len(keys) != 2 || keys[0] != "ANTHROPIC_API_KEY" || keys[1] != "OPENAI_API_KEY" {
+		t.Errorf("expected [ANTHROPIC_API_KEY OPENAI_API_KEY], got %v", keys)
 	}
 }
