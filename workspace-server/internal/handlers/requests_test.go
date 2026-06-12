@@ -2,10 +2,13 @@ package handlers
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/gin-gonic/gin"
@@ -799,3 +802,148 @@ func TestRequests_ListPending_InvalidKind(t *testing.T) {
 		t.Errorf("expected 400 for invalid kind, got %d", w.Code)
 	}
 }
+
+// ---------- Requester notification on respond / more-info (CTO 2026-06-11) ----------
+
+// interceptRequestNotify swaps the package-level enqueue for the test and
+// returns a capture slice + restore func.
+func interceptRequestNotify(t *testing.T) *[]map[string]string {
+	t.Helper()
+	captured := &[]map[string]string{}
+	prev := requestNotifyEnqueue
+	requestNotifyEnqueue = func(ctx context.Context, workspaceID, callerID string, priority int, body []byte, method, idemKey string, expiresAt *time.Time) (string, int, error) {
+		*captured = append(*captured, map[string]string{
+			"workspace_id": workspaceID,
+			"method":       method,
+			"idem":         idemKey,
+			"body":         string(body),
+		})
+		return "q-1", 1, nil
+	}
+	t.Cleanup(func() { requestNotifyEnqueue = prev })
+	return captured
+}
+
+// TestRequests_Respond_NotifiesRequesterAgent: a terminal response on a
+// request raised by an AGENT must enqueue a message/send turn to that agent
+// — the user clicking Done/Approve must actually reach the requester.
+func TestRequests_Respond_NotifiesRequesterAgent(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewRequestsHandler(newTestBroadcaster())
+	captured := interceptRequestNotify(t)
+
+	mock.ExpectQuery("FROM requests WHERE id").
+		WithArgs("req-1").
+		WillReturnRows(oneRequestRow("req-1", "approval", "ws-agent-1", "user", "", "pending"))
+	mock.ExpectExec("UPDATE requests").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO structure_events").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "requestId", Value: "req-1"}}
+	c.Request = httptest.NewRequest("POST", "/", bytes.NewBufferString(`{"action":"approved","responder_id":"u-1"}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Respond(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if len(*captured) != 1 {
+		t.Fatalf("expected 1 requester notification, got %d", len(*captured))
+	}
+	n := (*captured)[0]
+	if n["workspace_id"] != "ws-agent-1" || n["method"] != "message/send" {
+		t.Errorf("notification misrouted: %+v", n)
+	}
+	if n["idem"] != "request-responded:req-1" {
+		t.Errorf("idempotency key = %q", n["idem"])
+	}
+	if !strings.Contains(n["body"], "approved") || !strings.Contains(n["body"], "Some title") {
+		t.Errorf("notification body missing outcome/title: %s", n["body"])
+	}
+}
+
+// TestRequests_AddMessage_MoreInfo_NotifiesRequesterAgent: a recipient-authored
+// More-Info message must reach the requester agent as a turn carrying the ask.
+func TestRequests_AddMessage_MoreInfo_NotifiesRequesterAgent(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewRequestsHandler(newTestBroadcaster())
+	captured := interceptRequestNotify(t)
+
+	mock.ExpectQuery("FROM requests WHERE id").
+		WithArgs("req-2").
+		WillReturnRows(oneRequestRow("req-2", "task", "ws-agent-1", "user", "u-1", "pending"))
+	mock.ExpectQuery("INSERT INTO request_messages").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("msg-9"))
+	mock.ExpectExec("UPDATE requests SET status = 'info_requested'").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO structure_events").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "requestId", Value: "req-2"}}
+	c.Request = httptest.NewRequest("POST", "/", bytesNewBufferStringHelper(`{"author_type":"user","author_id":"u-1","body":"which environment do you mean?"}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.AddMessage(c)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+	if len(*captured) != 1 {
+		t.Fatalf("expected 1 requester notification, got %d", len(*captured))
+	}
+	n := (*captured)[0]
+	if n["workspace_id"] != "ws-agent-1" || n["idem"] != "request-message:msg-9" {
+		t.Errorf("notification misrouted: %+v", n)
+	}
+	if !strings.Contains(n["body"], "which environment do you mean?") {
+		t.Errorf("notification body missing ask: %s", n["body"])
+	}
+}
+
+// TestRequests_Respond_NoNotifyForUserRequester: a request raised by a USER
+// must not enqueue an agent notification on respond.
+func TestRequests_Respond_NoNotifyForUserRequester(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewRequestsHandler(newTestBroadcaster())
+	captured := interceptRequestNotify(t)
+
+	mock.ExpectQuery("FROM requests WHERE id").
+		WithArgs("req-3").
+		WillReturnRows(sqlmock.NewRows(requestColumnNames).AddRow(
+			"req-3", "task", "user", "u-1", nil,
+			"agent", "ws-agent-2", "Some title", nil, "pending",
+			nil, nil, nil, "2026-06-10T00:00:00Z", "2026-06-10T00:00:00Z", nil,
+		))
+	mock.ExpectExec("UPDATE requests").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO structure_events").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "requestId", Value: "req-3"}}
+	c.Request = httptest.NewRequest("POST", "/", bytesNewBufferStringHelper(`{"action":"done","responder_type":"agent","responder_id":"ws-agent-2"}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Respond(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if len(*captured) != 0 {
+		t.Fatalf("expected no notification for user requester, got %d", len(*captured))
+	}
+}
+
+// bytesNewBufferStringHelper keeps the new tests free of an extra import
+// alias; identical to bytes.NewBufferString.
+func bytesNewBufferStringHelper(s string) *bytes.Buffer { return bytes.NewBufferString(s) }
