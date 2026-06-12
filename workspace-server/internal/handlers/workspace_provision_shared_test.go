@@ -284,6 +284,8 @@ func TestPrepareProvisionContext_ParentIDInjection(t *testing.T) {
 				Name:     "child",
 				Tier:     1,
 				ParentID: tc.parentID,
+				// core#2594: model required by the provision gate; unrelated to this test.
+				Model: "anthropic:claude-opus-4-7",
 			}
 			prepared, abort := handler.prepareProvisionContext(context.Background(), "ws-child", "/nonexistent", nil, payload, false)
 			if abort != nil {
@@ -393,6 +395,8 @@ func TestPrepareProvisionContext_InjectsGitHTTPCredsFromPersonaToken(t *testing.
 				Name: "Dev-A",
 				Role: tc.role,
 				Tier: 1,
+				// core#2594: model required by the provision gate; unrelated to this test.
+				Model: "anthropic:claude-opus-4-7",
 			}
 			prepared, abort := handler.prepareProvisionContext(
 				context.Background(), "ws-prod-team", "/nonexistent", nil, payload, false)
@@ -490,6 +494,8 @@ func TestPrepareProvisionContext_WorkspaceSecretWinsOverPersonaToken(t *testing.
 		Name: "Dev-A",
 		Role: "agent-dev-a",
 		Tier: 1,
+		// core#2594: model required by the provision gate; unrelated to this test.
+		Model: "anthropic:claude-opus-4-7",
 	}
 	prepared, abort := handler.prepareProvisionContext(
 		context.Background(), "ws-prod-team", "/nonexistent", nil, payload, false)
@@ -545,6 +551,10 @@ func TestPrepareProvisionContext_ByokWithTenantGlobalOAuthSucceeds(t *testing.T)
 		Name:    "Reno Stars SEO",
 		Runtime: "claude-code",
 		Tier:    1,
+		// core#2594: NO payload model on purpose — this test derives byok from
+		// the STORED MODEL secret ("opus"); the gate is satisfied by that stored
+		// model (loaded into envVars), so adding a payload model here would both
+		// override the derivation and is unnecessary.
 	}
 	prepared, abort := handler.prepareProvisionContext(
 		context.Background(), wsID, "/nonexistent", nil, payload, false)
@@ -594,6 +604,10 @@ func TestPrepareProvisionContext_ByokNoCredentialAtAnyScopeFailsClosed(t *testin
 		Name:    "Reno Stars SEO",
 		Runtime: "claude-code",
 		Tier:    1,
+		// core#2594: NO payload model — derives byok from the STORED MODEL
+		// ("opus"), which also satisfies the model gate. The abort under test is
+		// MISSING_BYOK_CREDENTIAL (no LLM cred), reached only because the model
+		// IS resolved.
 	}
 	prepared, abort := handler.prepareProvisionContext(
 		context.Background(), wsID, "/nonexistent", nil, payload, false)
@@ -973,17 +987,25 @@ func TestApplyRuntimeModelEnv_SetsUniversalMODELForAllRuntimes(t *testing.T) {
 	}
 }
 
-func TestApplyPlatformManagedLLMEnv_NonClaudeRuntimeDefaultsOpenAIProxyWhenNoWorkspaceKey(t *testing.T) {
+// core#2594: the MOLECULE_LLM_DEFAULT_MODEL env fail-open was REMOVED. Even
+// with the env set, a workspace provisioned with no model must NOT silently
+// inherit it — MODEL/MOLECULE_MODEL stay empty so the universal MISSING_MODEL
+// gate (in prepareProvisionContext) fails the provision CLOSED. The proxy creds
+// (the credential axis) are still wired; only the opaque model substitution is
+// gone.
+func TestApplyPlatformManagedLLMEnv_DoesNotInheritEnvDefaultModel_FailClosed(t *testing.T) {
 	t.Setenv("MOLECULE_LLM_BILLING_MODE", "platform_managed")
 	t.Setenv("MOLECULE_LLM_BASE_URL", "https://api.example.test/api/v1/internal/llm/openai/v1")
 	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
 	t.Setenv("MOLECULE_LLM_USAGE_URL", "https://api.example.test/api/v1/internal/llm/usage")
+	// Even though the (legacy) env default is present, it must be ignored.
 	t.Setenv("MOLECULE_LLM_DEFAULT_MODEL", "moonshot/kimi-k2.6")
 
 	envVars := map[string]string{}
 	applyPlatformManagedLLMEnv(context.Background(), envVars, "", "codex", "", nil)
 	applyRuntimeModelEnv(envVars, "codex", "")
 
+	// Credential axis still wired (proxy token + base url).
 	if got := envVars["OPENAI_BASE_URL"]; got != "https://api.example.test/api/v1/internal/llm/openai/v1" {
 		t.Fatalf("OPENAI_BASE_URL = %q", got)
 	}
@@ -993,11 +1015,12 @@ func TestApplyPlatformManagedLLMEnv_NonClaudeRuntimeDefaultsOpenAIProxyWhenNoWor
 	if got := envVars["MOLECULE_LLM_USAGE_TOKEN"]; got != "tenant-admin-token" {
 		t.Fatalf("MOLECULE_LLM_USAGE_TOKEN = %q", got)
 	}
-	if got := envVars["MODEL"]; got != "moonshot/kimi-k2.6" {
-		t.Fatalf("MODEL = %q", got)
+	// Model axis: the env default must NOT leak in — fail closed.
+	if got := envVars["MODEL"]; got != "" {
+		t.Fatalf("MODEL = %q, want empty (env default must not be inherited)", got)
 	}
-	if got := envVars["MOLECULE_MODEL"]; got != "moonshot/kimi-k2.6" {
-		t.Fatalf("MOLECULE_MODEL = %q", got)
+	if got := envVars["MOLECULE_MODEL"]; got != "" {
+		t.Fatalf("MOLECULE_MODEL = %q, want empty (env default must not be inherited)", got)
 	}
 }
 
@@ -1658,5 +1681,43 @@ func TestApplyRuntimeModelEnv_StaleMODELPROVIDERNeverLeaksIntoMODEL(t *testing.T
 	applyRuntimeModelEnv(envVarsH, "hermes", "")
 	if _, ok := envVarsH["HERMES_DEFAULT_MODEL"]; ok {
 		t.Errorf("hermes runtime must not leak MODEL_PROVIDER into HERMES_DEFAULT_MODEL")
+	}
+}
+
+// TestPrepareProvisionContext_NoModelFailsClosed is the core#2594 universal
+// model gate: a platform-managed workspace that reaches provisioning with NO
+// model (none in the payload, none stored) must abort MISSING_MODEL rather than
+// launch on the runtime's opaque default. The CP proxy env is supplied so the
+// credential gate passes and we reach the model gate.
+func TestPrepareProvisionContext_NoModelFailsClosed(t *testing.T) {
+	const wsID = "ws-no-model-2594"
+	t.Setenv("MOLECULE_LLM_BILLING_MODE", LLMBillingModePlatformManaged)
+	t.Setenv("MOLECULE_LLM_BASE_URL", "https://api.example.test/api/v1/internal/llm/openai/v1")
+	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
+
+	mock := setupTestDB(t)
+	mock.ExpectQuery(`SELECT key, encrypted_value, encryption_version FROM global_secrets`).
+		WillReturnRows(sqlmock.NewRows([]string{"key", "encrypted_value", "encryption_version"}))
+	// No stored MODEL — the workspace_secrets result is empty.
+	mock.ExpectQuery(`SELECT key, encrypted_value, encryption_version FROM workspace_secrets`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"key", "encrypted_value", "encryption_version"}))
+
+	handler := NewWorkspaceHandler(&captureBroadcaster{}, nil, "http://localhost:8080", t.TempDir())
+	// No payload model, ordinary (non-platform) workspace → applyConciergeProvisionConfig
+	// is a no-op (the kind probe returns "workspace"), so nothing sets a model.
+	payload := models.CreateWorkspacePayload{
+		Name:    "no-model",
+		Runtime: "claude-code",
+		Tier:    1,
+	}
+	prepared, abort := handler.prepareProvisionContext(
+		context.Background(), wsID, "/nonexistent", nil, payload, false)
+
+	if abort == nil {
+		t.Fatalf("expected MISSING_MODEL abort, got success (prepared=%v)", prepared)
+	}
+	if code, _ := abort.Extra["code"].(string); code != "MISSING_MODEL" {
+		t.Fatalf("abort.Extra[code] = %v, want MISSING_MODEL", abort.Extra["code"])
 	}
 }

@@ -106,3 +106,18 @@ func formatMissingPlatformProxyError() string {
 		"This is usually a transient boot-race; retry in 30 seconds. If it persists, verify the platform proxy " +
 		"is configured for this tenant/runtime and contact the platform team."
 }
+
+// formatMissingModelError builds the user-facing message for a provision that
+// reaches launch with no resolved model (core#2594). The platform no longer
+// substitutes a default model (the MOLECULE_LLM_DEFAULT_MODEL env fail-open was
+// removed); a model is required input. Rather than letting the runtime fall back
+// to its hardcoded anthropic:claude-opus-4-7, the provision fails closed here.
+func formatMissingModelError(mode string) string {
+	return fmt.Sprintf(
+		"this workspace (LLM billing mode %q) reached provisioning with no model set. "+
+			"The platform does not pick a default model — choose one under Config → Model "+
+			"(or set the MODEL workspace secret) and retry. Provisioning is refused rather "+
+			"than silently running an arbitrary model.",
+		mode,
+	)
+}

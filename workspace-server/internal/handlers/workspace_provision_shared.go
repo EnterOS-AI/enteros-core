@@ -270,6 +270,34 @@ func (h *WorkspaceHandler) prepareProvisionContext(
 	// on the auto-restart path (where the overlay is what introduces the files).
 	configFiles = h.applyConciergeProvisionConfig(ctx, workspaceID, templatePath, configFiles, envVars, payload.Name)
 
+	// core#2594: universal MODEL fail-closed gate. Runs AFTER every model-setting
+	// path (create payload → stored MODEL secret via applyRuntimeModelEnv → the
+	// concierge's declared model via applyConciergeProvisionConfig) and is the
+	// single place that refuses to launch a workspace with no resolved model.
+	//
+	// This replaces the deleted MOLECULE_LLM_DEFAULT_MODEL env fail-open: rather
+	// than silently substituting a server-env model (or letting the runtime fall
+	// back to its hardcoded anthropic:claude-opus-4-7), a workspace that reaches
+	// here with neither MOLECULE_MODEL nor MODEL set aborts with an actionable
+	// MISSING_MODEL error. Create already fails closed at the boundary; this
+	// catches every other provision path (restart/resume/auto-recover/import) so
+	// the guarantee holds "for everything".
+	//
+	// Scoped to NON-disabled billing: a "disabled" workspace runs no platform-
+	// billed LLM at all (terminal / file work), so requiring a model there would
+	// regress a legitimate no-LLM workspace — same scoping rationale as the
+	// MISSING_BYOK / MISSING_PLATFORM_PROXY credential gates above.
+	if llmRes.ResolvedMode != LLMBillingModeDisabled &&
+		strings.TrimSpace(envVars["MOLECULE_MODEL"]) == "" &&
+		strings.TrimSpace(envVars["MODEL"]) == "" {
+		msg := formatMissingModelError(llmRes.ResolvedMode)
+		log.Printf("Provisioner: ABORT workspace=%s — no resolved model (MISSING_MODEL, core#2594); refusing the runtime's opaque default", workspaceID)
+		return nil, &provisionAbort{
+			Msg:   msg,
+			Extra: map[string]interface{}{"error": msg, "code": "MISSING_MODEL", "billing_mode": llmRes.ResolvedMode, "issue": "2594"},
+		}
+	}
+
 	// Preflight #5: refuse to launch when config.yaml declares required
 	// env vars that are not set. Skipped in SaaS mode when configFiles
 	// is nil (CP-mode's cfg is built without local config bytes — the

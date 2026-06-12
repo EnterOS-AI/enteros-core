@@ -527,3 +527,75 @@ func TestApplyConciergeProvisionConfig_OnlyPlatformGetsOrgMCP(t *testing.T) {
 		}
 	})
 }
+
+// TestConciergeDeclaredModelIsRegistered is the fail-closed-at-CI guard for
+// core#2594: the platform agent's declared model MUST stay registered for its
+// runtime. If a registry/providers.yaml change ever drops it, this test (not a
+// silent prod fallback) catches it — ensureConciergeModel leaves the model
+// unset on a validation miss, which then fails the provision closed.
+func TestConciergeDeclaredModelIsRegistered(t *testing.T) {
+	if ok, why := validateRegisteredModelForRuntime(conciergeRuntime, conciergeDeclaredModel); !ok {
+		t.Fatalf("concierge declared model %q is NOT registered for runtime %q: %s",
+			conciergeDeclaredModel, conciergeRuntime, why)
+	}
+	if ok, why := validateDerivedProviderInRegistry(conciergeRuntime, conciergeDeclaredModel); !ok {
+		t.Fatalf("concierge declared model %q has no derivable registry provider for runtime %q: %s",
+			conciergeDeclaredModel, conciergeRuntime, why)
+	}
+}
+
+// TestEnsureConciergeModel_SeedsEnvAndPersistsWhenAbsent verifies ensureConciergeModel
+// seeds the container model env AND writes the MODEL secret when none is stored
+// (core#2594). The SELECT returns no row → it must INSERT the declared model.
+func TestEnsureConciergeModel_SeedsEnvAndPersistsWhenAbsent(t *testing.T) {
+	mock := setupTestDB(t)
+	const wsID = "concierge-ws-1"
+
+	// No stored MODEL yet.
+	mock.ExpectQuery(`SELECT encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1 AND key = 'MODEL'`).
+		WithArgs(wsID).
+		WillReturnError(sql.ErrNoRows)
+	// setModelSecret upserts the declared model.
+	mock.ExpectExec(`INSERT INTO workspace_secrets`).
+		WithArgs(wsID, sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	h := &WorkspaceHandler{}
+	envVars := map[string]string{}
+	h.ensureConciergeModel(context.Background(), wsID, envVars)
+
+	if got := envVars["MODEL"]; got != conciergeDeclaredModel {
+		t.Errorf("MODEL env = %q, want %q", got, conciergeDeclaredModel)
+	}
+	if got := envVars["MOLECULE_MODEL"]; got != conciergeDeclaredModel {
+		t.Errorf("MOLECULE_MODEL env = %q, want %q", got, conciergeDeclaredModel)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// TestEnsureConciergeModel_SkipsWriteWhenAlreadyCorrect verifies the idempotent
+// path: when the stored MODEL already equals the declared model, no write fires
+// (env is still seeded). encryption_version=0 = raw bytes (crypto disabled in test).
+func TestEnsureConciergeModel_SkipsWriteWhenAlreadyCorrect(t *testing.T) {
+	mock := setupTestDB(t)
+	const wsID = "concierge-ws-2"
+
+	mock.ExpectQuery(`SELECT encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1 AND key = 'MODEL'`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}).
+			AddRow([]byte(conciergeDeclaredModel), 0))
+	// NO ExpectExec — a write here would be an unmet/unexpected expectation.
+
+	h := &WorkspaceHandler{}
+	envVars := map[string]string{}
+	h.ensureConciergeModel(context.Background(), wsID, envVars)
+
+	if got := envVars["MODEL"]; got != conciergeDeclaredModel {
+		t.Errorf("MODEL env = %q, want %q", got, conciergeDeclaredModel)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}

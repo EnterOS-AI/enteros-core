@@ -116,7 +116,7 @@ func TestProvisionWorkspaceAuto_NoBackendMarksFailed(t *testing.T) {
 	// Do NOT call SetCPProvisioner — both backends nil.
 
 	ok := h.provisionWorkspaceAuto("ws-noback", "", nil, models.CreateWorkspacePayload{
-		Name: "noback", Tier: 1, Runtime: "claude-code",
+		Name: "noback", Tier: 1, Runtime: "claude-code", Model: "anthropic:claude-opus-4-7", // core#2594: model required by provision gate
 	})
 	if ok {
 		t.Fatalf("expected provisionWorkspaceAuto to return false with no backend wired")
@@ -162,7 +162,7 @@ func TestProvisionWorkspaceAuto_RoutesToCPWhenSet(t *testing.T) {
 
 	wsID := "ws-routes-to-cp-0123456789abcdef"
 	ok := h.provisionWorkspaceAuto(wsID, "", nil, models.CreateWorkspacePayload{
-		Name: "test", Tier: 1, Runtime: "claude-code",
+		Name: "test", Tier: 1, Runtime: "claude-code", Model: "anthropic:claude-opus-4-7", // core#2594: model required by provision gate
 	})
 	if !ok {
 		t.Fatalf("expected provisionWorkspaceAuto to return true with CP wired")
@@ -632,7 +632,7 @@ func TestRestartWorkspaceAuto_RoutesToCPWhenSet(t *testing.T) {
 
 	wsID := "ws-restart-routes-cp-0123456789ab"
 	ok := h.RestartWorkspaceAuto(context.Background(), wsID, "", nil, models.CreateWorkspacePayload{
-		Name: "restart-test", Tier: 1, Runtime: "claude-code",
+		Name: "restart-test", Tier: 1, Runtime: "claude-code", Model: "anthropic:claude-opus-4-7", // core#2594: model required by provision gate
 	})
 	if !ok {
 		t.Fatalf("expected RestartWorkspaceAuto to return true with CP wired")
@@ -696,7 +696,7 @@ func TestRestartWorkspaceAuto_RoutesToDockerWhenOnlyDocker(t *testing.T) {
 
 	wsID := "ws-restart-routes-docker"
 	ok := h.RestartWorkspaceAuto(context.Background(), wsID, "", nil, models.CreateWorkspacePayload{
-		Name: "restart-test", Tier: 1, Runtime: "claude-code",
+		Name: "restart-test", Tier: 1, Runtime: "claude-code", Model: "anthropic:claude-opus-4-7", // core#2594: model required by provision gate
 	})
 	if !ok {
 		t.Fatalf("expected RestartWorkspaceAuto to return true with Docker wired")
@@ -733,7 +733,7 @@ func TestRestartWorkspaceAuto_NoBackendMarksFailed(t *testing.T) {
 	// Neither SetCPProvisioner nor a Docker provisioner — both nil.
 
 	ok := h.RestartWorkspaceAuto(context.Background(), "ws-restart-noback", "", nil, models.CreateWorkspacePayload{
-		Name: "restart-test", Tier: 1, Runtime: "claude-code",
+		Name: "restart-test", Tier: 1, Runtime: "claude-code", Model: "anthropic:claude-opus-4-7", // core#2594: model required by provision gate
 	})
 	if ok {
 		t.Fatalf("expected RestartWorkspaceAuto to return false with no backend wired")
@@ -832,7 +832,7 @@ func TestProvisionWorkspaceAutoSync_RoutesToCPWhenSet(t *testing.T) {
 
 	wsID := "ws-sync-routes-cp"
 	ok := h.provisionWorkspaceAutoSync(wsID, "", nil, models.CreateWorkspacePayload{
-		Name: "sync-test", Tier: 1, Runtime: "claude-code",
+		Name: "sync-test", Tier: 1, Runtime: "claude-code", Model: "anthropic:claude-opus-4-7", // core#2594: model required by provision gate
 	})
 	if !ok {
 		t.Fatalf("expected provisionWorkspaceAutoSync to return true with CP wired")
@@ -860,7 +860,7 @@ func TestProvisionWorkspaceAutoSync_NoBackendMarksFailed(t *testing.T) {
 	h := NewWorkspaceHandler(bcast, nil, "http://localhost:8080", t.TempDir())
 
 	ok := h.provisionWorkspaceAutoSync("ws-sync-noback", "", nil, models.CreateWorkspacePayload{
-		Name: "sync-test", Tier: 1, Runtime: "claude-code",
+		Name: "sync-test", Tier: 1, Runtime: "claude-code", Model: "anthropic:claude-opus-4-7", // core#2594: model required by provision gate
 	})
 	if ok {
 		t.Fatalf("expected provisionWorkspaceAutoSync to return false with no backend wired")
