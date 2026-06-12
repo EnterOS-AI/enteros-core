@@ -342,15 +342,12 @@ test.describe("staging canvas tabs", () => {
     // selector wait below is what actually gates ready-for-interaction.
     await page.goto(tenantURL, { waitUntil: "domcontentloaded" });
 
-    // Canvas hydration races WebSocket connect + /workspaces fetch.
-    // Wait for the React Flow canvas wrapper (always present once
-    // hydrated, even with zero workspaces) or the hydration-error
-    // banner — whichever wins first. Previous version of this wait
-    // used `[role="tablist"]`, but that selector only appears AFTER
-    // a workspace node is clicked, so the wait would always time out
-    // at 45s before any meaningful failure surfaced.
+    // The staging canvas now hydrates the concierge shell first.
+    // Wait for the left-nav rail (concierge shell landmark) or the
+    // hydration-error banner — whichever wins first. Don't wait on
+    // networkidle: the shell keeps a WS + polling open.
     await page.waitForSelector(
-      '[aria-label="Molecule AI workspace canvas"], [data-testid="hydration-error"]',
+      '[data-testid="nav-home"], [data-testid="hydration-error"]',
       { timeout: 45_000 },
     );
 
@@ -369,6 +366,13 @@ test.describe("staging canvas tabs", () => {
       page.getByText("Something went wrong", { exact: false }),
       "app-level ErrorBoundary tripped during hydration",
     ).toHaveCount(0);
+
+    // The concierge shell renders before the workspace node card.
+    // Wait for the specific workspace node to appear before clicking.
+    await page.waitForSelector(
+      `[data-workspace-id="${workspaceId}"]`,
+      { timeout: 15_000 },
+    );
 
     // Click the workspace node to open the side panel. Try a data
     // attribute first, fall back to a generic role-based selector so
