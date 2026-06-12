@@ -477,7 +477,7 @@ func (s *RequestStore) Respond(ctx context.Context, id, action, responderType, r
 	// to call check_requests. Skip self-notification (agent responded to
 	// its own... impossible per the self-response guard, but cheap belt).
 	if req.RequesterType == "agent" && req.RequesterID != "" &&
-		!(responderType == "agent" && responderID == req.RequesterID) {
+		(responderType != "agent" || responderID != req.RequesterID) {
 		by := "the user"
 		if responderType == "agent" {
 			by = "agent " + responderID
