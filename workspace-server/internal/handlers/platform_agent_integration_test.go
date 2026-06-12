@@ -322,11 +322,37 @@ func TestIntegration_PlatformAgentInstall_OnConflictUpdatesRuntime(t *testing.T)
 	paName := "Org Concierge " + tag
 	staleRuntime := "codex" // deliberately non-canonical
 
+	// The schema has `uniq_workspaces_one_platform_root` (UNIQUE
+	// constraint allowing at most one row with kind='platform' AND
+	// parent_id IS NULL per database). A prior sibling test in this
+	// package (e.g. TestIntegration_PlatformAgentInstall_ReparentsRoot
+	// AndMovesAnchors) leaves a platform-agent row behind; its cleanup
+	// deletes by its OWN uuid+name, so by the time this test runs,
+	// the slot may or may not be free depending on test scheduling and
+	// whether the prior cleanup ran.
+	//
+	// To make this test robust to test ordering and to the
+	// existing-test-row state, the pre-seed cleanup nukes ANY existing
+	// platform-agent row (any uuid, any name) — the slot is
+	// single-tenant by design, so this is safe in a fresh CI database
+	// (this is the only writer of kind='platform' rows; sub-tests'
+	// cleanup removes them at the end of their own run). The
+	// post-test cleanup then removes our specific rows.
 	cleanup := func() {
 		_, _ = conn.ExecContext(ctx, `DELETE FROM workspaces WHERE name = $1`, paName)
 		_, _ = conn.ExecContext(ctx, `DELETE FROM workspaces WHERE id = $1`, platformID)
+		// Belt-and-suspenders: also drop any other platform-agent row
+		// left by a prior test that somehow didn't clean up, so the
+		// next test's seed has a free slot.
+		_, _ = conn.ExecContext(ctx, `DELETE FROM workspaces WHERE kind = 'platform' AND parent_id IS NULL AND id <> $1`, platformID)
 	}
 	t.Cleanup(cleanup)
+	// Pre-seed: clear the slot completely (nuke any pre-existing
+	// platform-agent row, including the unique-constraint violating one
+	// from a prior sibling test).
+	if _, err := conn.ExecContext(ctx, `DELETE FROM workspaces WHERE kind = 'platform' AND parent_id IS NULL`); err != nil {
+		t.Fatalf("pre-seed: delete existing platform-agent rows: %v", err)
+	}
 	cleanup()
 
 	// Case 1: ON CONFLICT path. Seed the platform-agent row with a STALE
