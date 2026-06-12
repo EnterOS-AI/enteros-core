@@ -149,8 +149,11 @@ func TestGlobalSecretKeyNames_RowError(t *testing.T) {
 // keys.
 func TestGlobalSecretKeyNames_ScanError(t *testing.T) {
 	mock := setupTestDB(t)
-	// Mismatched column type triggers a scan error in sqlmock.
-	rows := sqlmock.NewRows([]string{"key"}).AddRow(12345)
+	// A NULL value cannot Scan into a plain (non-pointer) string — the one
+	// shape that reliably errors at Scan time. (An int does NOT: database/sql
+	// converts int64→string, which is why the original 12345 fixture passed
+	// scanning and failed this test.)
+	rows := sqlmock.NewRows([]string{"key"}).AddRow(nil)
 	mock.ExpectQuery("SELECT key FROM global_secrets").
 		WillReturnRows(rows)
 
