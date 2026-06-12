@@ -107,8 +107,8 @@ def latest_status_for_context(statuses: list[dict], context: str) -> dict | None
 
     This must work for BOTH orderings Gitea exposes: the combined
     ``/status`` view is newest-first, but the exhaustively-paginated
-    ``/statuses`` list (see ``fetch_all_statuses``) is ascending id order
-    (oldest-first). Selecting by max ``id`` collapses duplicate context rows
+    ``/statuses`` list (see ``fetch_all_statuses``) is NEWEST-first on this
+    Gitea (verified 2026-06-12; an older comment claimed ascending). Selecting by max ``id`` collapses duplicate context rows
     to the current one regardless of input order, so a stale earlier run can
     never shadow the latest result. Rows without an ``id`` are treated as
     oldest (id -1) so a well-formed newer row always wins.
@@ -428,7 +428,15 @@ def fetch_all_statuses(host: str, repo: str, sha: str, token: str, page_size: in
         page_url = f"{base}?page={page}&limit={page_size}"
         rows = _api_json_list(page_url, token)
         results.extend(r for r in rows if isinstance(r, dict))
-        if len(rows) < page_size:
+        # Termination MUST be empty-page, not len(rows) < page_size: Gitea
+        # silently CLAMPS limit to its server max (50). With page_size=100
+        # every full page reads as "short" and pagination stopped after page
+        # 1 — and because /statuses returns NEWEST-first, a required context
+        # whose rows sat below the newest 50 was reported "missing" until the
+        # 3600s timeout (2026-06-12: e6307e2f prod auto-deploy blocked for an
+        # hour while the Secret scan SUCCESS row existed the whole time).
+        # One extra (empty) request per fetch is the price of correctness.
+        if not rows:
             break
         page += 1
     return results
