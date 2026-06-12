@@ -694,7 +694,18 @@ log "    MODEL_SLUG=$MODEL_SLUG"
 # regression guard) — deliberately untouched.
 #
 # Keep this strip-list BYTE-IN-SYNC with secrets.go platformManagedDirectLLMBypassKeys.
-BYOK_STRIP_KEYS="AI_GATEWAY_API_KEY ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ARCEEAI_API_KEY CLAUDE_CODE_OAUTH_TOKEN CODEX_AUTH_JSON DASHSCOPE_API_KEY DEEPSEEK_API_KEY GEMINI_API_KEY GLM_API_KEY HERMES_CUSTOM_API_KEY HERMES_CUSTOM_BASE_URL HF_TOKEN KIMI_API_KEY KIMI_CN_API_KEY MINIMAX_API_KEY MINIMAX_CN_API_KEY NOUS_API_KEY OPENAI_API_KEY OPENAI_BASE_URL OPENROUTER_API_KEY XAI_API_KEY ZAI_API_KEY"
+# EXCEPTION (7c657011): MINIMAX_API_KEY is intentionally NOT stripped. Controlplane
+# now validates BYOK model credentials at create-time (POST /workspaces) and returns
+# MISSING_BYOK_CREDENTIAL if the vendor key is absent from the create payload for a
+# BYOK model slug (MiniMax-M2.x). Stripping it here caused
+#   runs 352760/job 476956 + 352743/job 476924 @ main SHA 15872306
+# to fail at create, before the deferred write could run. Other MiniMax arms
+# (no MINIMAX_API_KEY in SECRETS_JSON) are unaffected; non-MiniMax arms are
+# unaffected (they never set MINIMAX_API_KEY in the first place). For the MiniMax
+# arm, MINIMAX_API_KEY now lands in CREATE_SECRETS_JSON, so DEFERRED_SECRETS_JSON
+# is '{}' and byok_opt_in_and_write_deferred becomes a no-op — controlplane's
+# create-time gate treats a vendor key in the payload as the byok signal.
+BYOK_STRIP_KEYS="AI_GATEWAY_API_KEY ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ARCEEAI_API_KEY CLAUDE_CODE_OAUTH_TOKEN CODEX_AUTH_JSON DASHSCOPE_API_KEY DEEPSEEK_API_KEY GEMINI_API_KEY GLM_API_KEY HERMES_CUSTOM_API_KEY HERMES_CUSTOM_BASE_URL HF_TOKEN KIMI_API_KEY KIMI_CN_API_KEY MINIMAX_CN_API_KEY NOUS_API_KEY OPENAI_API_KEY OPENAI_BASE_URL OPENROUTER_API_KEY XAI_API_KEY ZAI_API_KEY"
 # Split SECRETS_JSON into CREATE_SECRETS_JSON (gate-safe, written at create)
 # and DEFERRED_SECRETS_JSON (strip-listed keys, written AFTER byok opt-in).
 # Emit the two JSON blobs on SEPARATE LINES (not space-separated) — a value or
