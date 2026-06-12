@@ -81,10 +81,25 @@ if [ -z "$MEMORY_PLUGIN_DISABLE" ] && [ -n "$memory_plugin_wanted" ] && [ -n "$D
   # Wait up to 30s for /v1/health. Boot failure is fatal so a misconfigured
   # tenant crash-loops instead of silently serving cutover traffic against
   # a dead plugin.
+  #
+  # Probe via node: this image is node:20-alpine-based and node is
+  # guaranteed on PATH, while busybox wget is unreliable on slim
+  # alpine variants (some pin to the busybox applet which lacks
+  # --timeout=2 and exits non-zero on a successful HTTP 200 with an
+  # empty body, causing a false negative). node's stdlib http.get
+  # is portable across all our runtime adapter templates.
   health_port=${MEMORY_PLUGIN_LISTEN_ADDR#:}
   ready=0
   for _ in $(seq 1 30); do
-    if wget -qO- --timeout=2 "http://localhost:${health_port}/v1/health" >/dev/null 2>&1; then
+    if HEALTH_PORT="$health_port" node -e '
+const http = require("http");
+const port = process.env.HEALTH_PORT;
+const req = http.get({ host: "localhost", port, path: "/v1/health", timeout: 2000 }, (res) => {
+  process.exit(res.statusCode === 200 ? 0 : 1);
+});
+req.on("error", () => process.exit(1));
+req.on("timeout", () => { req.destroy(); process.exit(1); });
+' >/dev/null 2>&1; then
       ready=1
       break
     fi
