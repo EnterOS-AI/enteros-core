@@ -179,7 +179,7 @@ import { WorkspaceNode } from "../WorkspaceNode";
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 // Main node card uses data-testid to distinguish from handle anchors (also role=button)
-const getNode = () => screen.getByTestId("workspace-node");
+const getNode = (name = "Test Workspace") => screen.getByTestId(`workspace-node-${name}`);
 
 // Typed access to the shared mock state (set by the vi.mock factory)
 const mocks = () => globalThis.__workspaceNodeMocks!;
@@ -566,7 +566,7 @@ describe("WorkspaceNode — selection aria", () => {
 describe("WorkspaceNode — aria-label", () => {
   it("includes name and status in aria-label", () => {
     renderNode({ name: "MyAgent", status: "online" });
-    const label = getNode().getAttribute("aria-label");
+    const label = getNode("MyAgent").getAttribute("aria-label");
     expect(label).toContain("MyAgent");
     expect(label).toContain("online");
   });
