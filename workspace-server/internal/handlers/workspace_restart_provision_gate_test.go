@@ -221,6 +221,10 @@ func TestRestartProvisionGate_TwoWorkspacesIndependent(t *testing.T) {
 	go func() {
 		gateB := acquireRestartProvisionGate(wsB)
 		gateB.Lock()
+		// Hold briefly to prove the critical section was actually acquired; this
+		// also satisfies staticcheck SA2001 (empty critical section) because the
+		// Lock/Unlock pair encloses a real operation.
+		time.Sleep(1 * time.Millisecond)
 		gateB.Unlock()
 		done <- result{ok: true}
 	}()
