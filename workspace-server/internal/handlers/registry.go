@@ -436,12 +436,30 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 	//     validateAgentURL is intentional — a poll-mode workspace doesn't
 	//     need a publicly-routable URL, so a localhost / private IP /
 	//     missing URL is correct, not a mis-configuration.
+	// effectiveURL is where the workspace is reachable. Normally it's the
+	// runtime-supplied payload.URL. CROSS-CLOUD FALLBACK: an egress-only box
+	// (GCP/Hetzner, fronted by a Cloudflare tunnel) advertises its tunnel URL in
+	// the agent_card but registers with an EMPTY top-level url — its NIC-derived
+	// register URL is a private/unroutable address it correctly omits. Without a
+	// URL the push-mode guard rejects the registration, so the box never becomes
+	// deliverable (url/delivery_mode stay unset) and the scheduler fails every tick
+	// with "workspace has no URL". Recover the reachable URL from the agent_card —
+	// it is the tunnel hostname the platform itself provisioned for this box. AWS
+	// intra-VPC boxes send a non-empty url and are unaffected; poll-mode is untouched
+	// (it needs no url). Found via the agents-team SEO agent stuck 'failed' after the
+	// GCP-default flip (2026-06-11).
+	effectiveURL := payload.URL
 	if effectiveMode == models.DeliveryModePush {
-		if payload.URL == "" {
+		if effectiveURL == "" {
+			if cardURL := agentCardURL(payload.AgentCard); cardURL != "" {
+				effectiveURL = cardURL
+			}
+		}
+		if effectiveURL == "" {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "url is required for push-mode workspaces"})
 			return
 		}
-		if err := validateAgentURL(payload.URL); err != nil {
+		if err := validateAgentURL(effectiveURL); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
@@ -489,8 +507,8 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 	// matters for hybrid setups where a workspace was previously push
 	// and is being re-registered as poll).
 	var urlForUpsert sql.NullString
-	if payload.URL != "" {
-		urlForUpsert = sql.NullString{String: payload.URL, Valid: true}
+	if effectiveURL != "" {
+		urlForUpsert = sql.NullString{String: effectiveURL, Valid: true}
 	}
 
 	// modeForUpsert: empty payload value means "keep what's already on the
@@ -556,7 +574,7 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 	// empty string that another caller might mistake for "registered with
 	// no URL" vs "not yet registered". The proxy short-circuits poll-mode
 	// before consulting the URL cache anyway (see #2339 PR 2).
-	cachedURL := payload.URL
+	cachedURL := effectiveURL
 	var dbURL string
 	if err := db.DB.QueryRowContext(ctx, `SELECT url FROM workspaces WHERE id = $1`, payload.ID).Scan(&dbURL); err == nil {
 		if strings.HasPrefix(dbURL, "http://127.0.0.1") {
