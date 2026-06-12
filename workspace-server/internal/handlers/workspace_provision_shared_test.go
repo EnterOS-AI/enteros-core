@@ -1218,6 +1218,64 @@ func TestApplyPlatformManagedLLMEnv_ClaudeCodeByokKeepsOwnProviderEnv(t *testing
 	}
 }
 
+// TestApplyPlatformManagedLLMEnv_ClaudeCodeAttributionHeader is the CP#752 WS1b
+// regression guard: platform-managed claude-code workspaces must send the
+// per-workspace attribution header on every proxied Anthropic call, while BYOK
+// and non-claude-code platform-managed workspaces must NOT receive it.
+func TestApplyPlatformManagedLLMEnv_ClaudeCodeAttributionHeader(t *testing.T) {
+	const wsID = "88888888-8888-8888-8888-888888888888"
+	mock := setupTestDB(t)
+	mock.ExpectQuery(`SELECT llm_billing_mode FROM workspaces WHERE id = \$1`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"llm_billing_mode"}).AddRow(LLMBillingModePlatformManaged))
+
+	t.Setenv("MOLECULE_LLM_BILLING_MODE", "")
+	t.Setenv("MOLECULE_LLM_BASE_URL", "https://api.example.test/api/v1/internal/llm/openai/v1")
+	t.Setenv("MOLECULE_LLM_ANTHROPIC_BASE_URL", "https://api.example.test/api/v1/internal/llm/anthropic/v1")
+	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
+
+	// Platform-managed claude-code: header present and exact.
+	envVars := map[string]string{}
+	applyPlatformManagedLLMEnv(context.Background(), envVars, wsID, "claude-code", "sonnet", nil)
+	if got := envVars["ANTHROPIC_CUSTOM_HEADERS"]; got != "X-Molecule-Workspace-Id: "+wsID {
+		t.Fatalf("ANTHROPIC_CUSTOM_HEADERS = %q, want X-Molecule-Workspace-Id: %s", got, wsID)
+	}
+
+	// Non-claude-code platform-managed runtime: header absent (only claude-code
+	// uses the Anthropic CLI's ANTHROPIC_CUSTOM_HEADERS env var in this PR).
+	envVars = map[string]string{}
+	applyPlatformManagedLLMEnv(context.Background(), envVars, wsID, "codex", "gpt-5.5", nil)
+	if got, ok := envVars["ANTHROPIC_CUSTOM_HEADERS"]; ok {
+		t.Fatalf("ANTHROPIC_CUSTOM_HEADERS must NOT be injected for codex, got %q", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+func TestApplyPlatformManagedLLMEnv_ClaudeCodeAttributionHeaderAbsentForBYOK(t *testing.T) {
+	const wsID = "88888888-8888-8888-8888-888888888888"
+	mock := setupTestDB(t)
+	mock.ExpectQuery(`SELECT llm_billing_mode FROM workspaces WHERE id = \$1`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"llm_billing_mode"}).AddRow(LLMBillingModeBYOK))
+
+	t.Setenv("MOLECULE_LLM_BILLING_MODE", "")
+	t.Setenv("MOLECULE_LLM_BASE_URL", "https://api.example.test/api/v1/internal/llm/openai/v1")
+	t.Setenv("MOLECULE_LLM_ANTHROPIC_BASE_URL", "https://api.example.test/api/v1/internal/llm/anthropic/v1")
+	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
+
+	// BYOK claude-code: header absent (BYOK workspaces do not use the CP proxy).
+	envVars := map[string]string{}
+	applyPlatformManagedLLMEnv(context.Background(), envVars, wsID, "claude-code", "", nil)
+	if got, ok := envVars["ANTHROPIC_CUSTOM_HEADERS"]; ok {
+		t.Fatalf("ANTHROPIC_CUSTOM_HEADERS must NOT be injected for byok, got %q", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
 // TestApplyPlatformManagedLLMEnv_ByokGlobalScopeOAuthSurvivesAndRunsDirect is
 // the molecule-core#1994 (corrected-model) inversion of the former
 // internal#711 strip test, exercised through applyPlatformManagedLLMEnv. The
