@@ -1147,6 +1147,36 @@ def process_once(*, dry_run: bool = False) -> int:
     return 0
 
 
+def _early_skip_reason(
+    pr: dict,
+    *,
+    watch_branch: str,
+) -> tuple[str | None, str | None]:
+    """Return an observable skip reason for PRs that are not merge-eligible.
+
+    Returns (reason, pr_comment). When reason is non-None the PR should be
+    skipped by the queue. pr_comment is the body to post on the PR; None means
+    the skip is silent w.r.t. PR comments (the reason is still emitted as a
+    workflow notice by the caller). This keeps the early-skip decision pure and
+    unit-testable while preserving the observable-vs-silent distinction.
+    """
+    if pr.get("state") != "open":
+        return "not open", None
+    if OPT_OUT_LABELS & label_names(pr):
+        return "opt-out label", None
+    if pr.get("draft") is True:
+        return "draft", None
+    if pr.get("base", {}).get("ref") != watch_branch:
+        # Silent w.r.t. PR comments: stacked PRs whose base is not main are
+        # re-evaluated every conductor tick; posting a comment each time floods
+        # the PR. The caller still emits a workflow notice so the skip is
+        # observable in logs.
+        return f"base is not `{watch_branch}`", None
+    if pr.get("head", {}).get("repo_id") != pr.get("base", {}).get("repo_id"):
+        return "fork PR", "merge-queue: skipped; fork PRs are not supported by the serialized queue."
+    return None, None
+
+
 def _evaluate_candidate(
     issue: dict,
     *,
@@ -1171,29 +1201,13 @@ def _evaluate_candidate(
     pr_number = int(issue["number"])
     ctx = {"pr_number": pr_number}
     pr = get_pull(pr_number)
-    if pr.get("state") != "open":
-        print(f"::notice::PR #{pr_number} is not open; skipping")
-        return None, ctx
-    # Defensive opt-out/draft re-check on the authoritative pull payload: the
-    # /issues listing's label/draft view can lag, but the merge bar must respect
-    # the live pull state. (choose_candidate_issues already filtered on the
-    # listing; this guards against a stale listing racing a just-added opt-out.)
-    if OPT_OUT_LABELS & label_names(pr):
-        print(f"::notice::PR #{pr_number} carries an opt-out label; skipping")
-        return None, ctx
-    if pr.get("draft") is True:
-        print(f"::notice::PR #{pr_number} is a draft; skipping")
-        return None, ctx
-    if pr.get("base", {}).get("ref") != WATCH_BRANCH:
-        # SILENT skip (matches the draft/opt-out skips above): a stacked PR
-        # whose base is not main is re-evaluated EVERY conductor tick; posting
-        # a comment each time floods the PR (2026-06-10: ~74 stacked PRs ->
-        # ~28k skip comments + measurable operator load). A no-op observation
-        # must not write. The PR is auto-considered once its base becomes main.
-        print(f"::notice::PR #{pr_number} base is not `{WATCH_BRANCH}`; skipping (silent)")
-        return None, ctx
-    if pr.get("head", {}).get("repo_id") != pr.get("base", {}).get("repo_id"):
-        post_comment(pr_number, "merge-queue: skipped; fork PRs are not supported by the serialized queue.", dry_run=dry_run)
+    reason, pr_comment = _early_skip_reason(pr, watch_branch=WATCH_BRANCH)
+    if reason is not None:
+        # Observable in workflow logs (LOUD relative to silent disappearance),
+        # but avoid PR-comment noise for the high-volume skip classes.
+        print(f"::notice::PR #{pr_number} {reason}; skipping")
+        if pr_comment is not None:
+            post_comment(pr_number, pr_comment, dry_run=dry_run)
         return None, ctx
 
     head_sha = pr.get("head", {}).get("sha")

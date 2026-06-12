@@ -1916,3 +1916,105 @@ def test_load_conductor_snapshot_ignores_stale_snapshot(monkeypatch):
         assert mq.load_conductor_snapshot() is None
     finally:
         os.unlink(path)
+
+
+# --------------------------------------------------------------------------
+# Fix 3: non-main base PRs are skipped loudly/observably, not silently.
+# core#2548 stopped the per-tick PR-comment flood; the skip must still be
+# observable in workflow logs and must not affect legitimate main-targeted PRs.
+# --------------------------------------------------------------------------
+
+def _make_pr(**overrides) -> dict:
+    base = {
+        "state": "open",
+        "draft": False,
+        "labels": [],
+        "base": {"ref": "main", "repo_id": 1},
+        "head": {"repo_id": 1, "sha": "a" * 40},
+    }
+    base.update(overrides)
+    return base
+
+
+def test_early_skip_reason_skips_non_main_base_observably():
+    """A stacked PR whose base is not main is skipped with an observable reason
+    and NO PR comment (the observable path is the workflow notice)."""
+    pr = _make_pr(base={"ref": "feature/stacked", "repo_id": 1})
+    reason, comment = mq._early_skip_reason(pr, watch_branch="main")
+    assert reason == "base is not `main`"
+    assert comment is None
+
+
+def test_early_skip_reason_does_not_skip_main_targeted_pr():
+    """A legitimate main-targeted PR is not skipped for base reasons."""
+    pr = _make_pr()
+    reason, comment = mq._early_skip_reason(pr, watch_branch="main")
+    assert reason is None
+    assert comment is None
+
+
+def test_early_skip_reason_skips_fork_pr_with_comment():
+    """Fork PRs are skipped AND receive a PR comment (not silent)."""
+    pr = _make_pr(head={"repo_id": 2, "sha": "a" * 40})
+    reason, comment = mq._early_skip_reason(pr, watch_branch="main")
+    assert reason == "fork PR"
+    assert comment is not None
+    assert "fork PRs are not supported" in comment
+
+
+def test_early_skip_reason_skips_closed_draft_and_opt_out():
+    """Other early-skip classes produce observable reasons and no comment."""
+    assert mq._early_skip_reason(_make_pr(state="closed"), watch_branch="main") == ("not open", None)
+    assert mq._early_skip_reason(_make_pr(draft=True), watch_branch="main") == ("draft", None)
+    assert mq._early_skip_reason(
+        _make_pr(labels=[{"name": "do-not-auto-merge"}]), watch_branch="main"
+    ) == ("opt-out label", None)
+
+
+def test_evaluate_candidate_non_main_base_skips_without_comment(capsys, monkeypatch):
+    """End-to-end: _evaluate_candidate skips a non-main base PR, emits a workflow
+    notice, and does NOT post a PR comment."""
+    pr = _make_pr(number=42, base={"ref": "feature/stacked", "repo_id": 1})
+    monkeypatch.setattr(mq, "get_pull", lambda _n: pr)
+
+    comments_posted = []
+    monkeypatch.setattr(mq, "post_comment", lambda n, b, *, dry_run: comments_posted.append((n, b, dry_run)))
+
+    decision, ctx = mq._evaluate_candidate(
+        {"number": 42},
+        main_sha="m" * 40,
+        main_status={"state": "success", "statuses": []},
+        required_contexts=[],
+        required_approvals=2,
+        dry_run=False,
+    )
+
+    assert decision is None
+    assert ctx["pr_number"] == 42
+    assert comments_posted == []
+    captured = capsys.readouterr()
+    assert "base is not `main`" in captured.out
+    assert "skipping" in captured.out
+
+
+def test_evaluate_candidate_main_base_proceeds_to_merge_bar(monkeypatch):
+    """A main-targeted PR is not early-skipped; it reaches the merge-readiness
+    evaluation (which, with no statuses/approvals in this minimal mock, waits)."""
+    pr = _make_pr(number=99, base={"ref": "main", "repo_id": 1})
+    monkeypatch.setattr(mq, "get_pull", lambda _n: pr)
+    monkeypatch.setattr(mq, "get_pull_commits", lambda _n: [{"sha": "m" * 40}])
+    monkeypatch.setattr(mq, "get_combined_status", lambda _sha: {"state": "success", "statuses": []})
+    monkeypatch.setattr(mq, "get_pull_reviews", lambda _n: [])
+
+    decision, ctx = mq._evaluate_candidate(
+        {"number": 99},
+        main_sha="m" * 40,
+        main_status={"state": "success", "statuses": []},
+        required_contexts=[],
+        required_approvals=2,
+        dry_run=False,
+    )
+
+    assert decision is not None
+    assert ctx["pr_number"] == 99
+    assert decision.ready is False
