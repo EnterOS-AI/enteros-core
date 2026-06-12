@@ -630,6 +630,49 @@ jobs:
 
   # ── CONCIERGE FUNCTIONAL: it ACTUALLY CREATES A WORKSPACE (real-LLM) ─────────
   #
+  # core#2606: a NORMAL (non-platform) workspace raises a task + approval to the
+  # user via the wsAuth POST /workspaces/:id/requests endpoint, and both surface
+  # in the org's unified /requests/pending view. Its OWN job (not a step in the
+  # concierge job) so a concierge failure can never mask this proof (CR2 +
+  # Researcher review on #2660). Own throwaway org (e2e-req-*) with t.Cleanup
+  # teardown; skips LOUD without staging creds.
+  e2e-staging-workspace-requests:
+    name: E2E Staging Workspace Requests (core#2606)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    timeout-minutes: 35
+    permissions:
+      contents: read
+    env:
+      CP_BASE_URL: https://staging-api.moleculesai.app
+      CP_ADMIN_API_TOKEN: ${{ secrets.CP_STAGING_ADMIN_API_TOKEN }}
+      STAGING_E2E: '1'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: 'stable'
+          cache: false
+          cache-dependency-path: workspace-server/go.sum
+      - name: Verify admin token present
+        run: |
+          if [ -z "$CP_ADMIN_API_TOKEN" ]; then
+            echo "::error::CP_STAGING_ADMIN_API_TOKEN secret not set (Railway staging CP_ADMIN_API_TOKEN)"
+            exit 2
+          fi
+          echo "Admin token present"
+      - name: CP staging health preflight
+        run: |
+          code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 10 "$CP_BASE_URL/health")
+          if [ "$code" != "200" ]; then
+            echo "::error::Staging CP unhealthy (HTTP $code) — infra, not a workspace-requests bug."
+            exit 1
+          fi
+          echo "Staging CP healthy"
+      - name: Run workspace-requests staginge2e (core#2606)
+        working-directory: workspace-server
+        run: go test -tags staging_e2e ./internal/staginge2e/ -run TestWorkspaceCanRaiseTaskAndApprovalToUser -count=1 -v -timeout 30m
+
   # Drives tests/e2e/test_staging_concierge_creates_workspace_e2e.sh — the
   # RFC docs/design/rfc-platform-agent.md §11.4 "Reach" check turned into a gate:
   # send the org concierge a natural-language A2A message ("create a workspace
@@ -856,12 +899,6 @@ jobs:
       - name: Run concierge/platform-agent staginge2e
         working-directory: workspace-server
         run: go test -tags staging_e2e ./internal/staginge2e/ -run TestConciergePlatformAgent_Staging -count=1 -v -timeout 35m
-      # core#2606: a normal workspace raises task+approval to the user and they
-      # surface in the org pending view. Its own throwaway org (e2e-req-*) with
-      # t.Cleanup teardown; separate -run so a concierge failure doesn't mask it.
-      - name: Run workspace-requests staginge2e (core#2606)
-        working-directory: workspace-server
-        run: go test -tags staging_e2e ./internal/staginge2e/ -run TestWorkspaceCanRaiseTaskAndApprovalToUser -count=1 -v -timeout 30m
       # Teardown: the test installs a t.Cleanup admin-DELETE of its own tenant
       # (e2e-cncrg-* slug), running even on a t.Fatal. The age-guarded
       # sweep-stale-e2e-orgs workflow (30-min floor, e2e- prefix) is the final
