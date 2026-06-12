@@ -12,6 +12,7 @@ import { AttachmentPreview } from "./chat/AttachmentPreview";
 import { AgentCommsPanel } from "./chat/AgentCommsPanel";
 import { ChatErrorBanner } from "./chat/ChatErrorBanner";
 import { appendActivityLine } from "./chat/activityLog";
+import { ToolTraceChips } from "./chat/ToolTraceChips";
 import { runtimeDisplayName } from "@/lib/runtime-names";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { useChatHistory } from "./chat/hooks/useChatHistory";
@@ -600,6 +601,9 @@ function MyChatPanel({ workspaceId, data }: Props) {
                     />
                   ))}
                 </div>
+              )}
+              {msg.role === "agent" && msg.toolTrace && msg.toolTrace.length > 0 && (
+                <ToolTraceChips trace={msg.toolTrace} />
               )}
               <div className={`text-[9px] mt-1 ${msg.role === "user" ? "text-white/80" : "text-ink-mid"}`}>
                 {new Date(msg.timestamp).toLocaleTimeString()}

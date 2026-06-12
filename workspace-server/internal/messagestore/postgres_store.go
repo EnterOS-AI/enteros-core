@@ -90,8 +90,9 @@ func (s *PostgresMessageStore) List(ctx context.Context, workspaceID string, opt
 			status      string
 			rawRequest  sql.NullString
 			rawResponse sql.NullString
+			rawTrace    sql.NullString
 		)
-		if err := rows.Scan(&createdAt, &status, &rawRequest, &rawResponse); err != nil {
+		if err := rows.Scan(&createdAt, &status, &rawRequest, &rawResponse, &rawTrace); err != nil {
 			// Skip malformed row, continue. The error is logged at
 			// the caller (handler) layer; an isolated bad row should
 			// not abort the whole page.
@@ -105,7 +106,11 @@ func (s *PostgresMessageStore) List(ctx context.Context, workspaceID string, opt
 		if rawResponse.Valid {
 			responseBody = json.RawMessage(rawResponse.String)
 		}
-		messages = append(messages, activityRowToChatMessages(createdAt, status, requestBody, responseBody, IsInternalSelfMessage)...)
+		var toolTrace json.RawMessage
+		if rawTrace.Valid && rawTrace.String != "" && rawTrace.String != "null" {
+			toolTrace = json.RawMessage(rawTrace.String)
+		}
+		messages = append(messages, activityRowToChatMessages(createdAt, status, requestBody, responseBody, toolTrace, IsInternalSelfMessage)...)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, false, err
@@ -166,7 +171,7 @@ func reverseRowChunks(msgs []ChatMessage) []ChatMessage {
 func (s *PostgresMessageStore) queryActivityRows(ctx context.Context, workspaceID string, opts ListOptions) (*sql.Rows, error) {
 	if opts.HasBefore {
 		return s.db.QueryContext(ctx, `
-			SELECT created_at, status, request_body::text, response_body::text
+			SELECT created_at, status, request_body::text, response_body::text, tool_trace::text
 			FROM activity_logs
 			WHERE workspace_id = $1
 			  AND activity_type = 'a2a_receive'
@@ -177,7 +182,7 @@ func (s *PostgresMessageStore) queryActivityRows(ctx context.Context, workspaceI
 		`, workspaceID, opts.BeforeTS, opts.Limit)
 	}
 	return s.db.QueryContext(ctx, `
-		SELECT created_at, status, request_body::text, response_body::text
+		SELECT created_at, status, request_body::text, response_body::text, tool_trace::text
 		FROM activity_logs
 		WHERE workspace_id = $1
 		  AND activity_type = 'a2a_receive'
@@ -209,6 +214,7 @@ func activityRowToChatMessages(
 	status string,
 	requestBody json.RawMessage,
 	responseBody json.RawMessage,
+	toolTrace json.RawMessage,
 	internalSelf func(string) bool,
 ) []ChatMessage {
 	var out []ChatMessage
@@ -240,6 +246,7 @@ func activityRowToChatMessages(
 				Content:     agentText,
 				Attachments: agentAttachments,
 				Timestamp:   timestamp,
+				ToolTrace:   toolTrace,
 			})
 		}
 	}

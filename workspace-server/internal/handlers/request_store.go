@@ -484,7 +484,8 @@ func (s *RequestStore) Respond(ctx context.Context, id, action, responderType, r
 		}
 		s.notifyRequesterAgent(ctx, req,
 			"request-responded:"+req.ID,
-			fmt.Sprintf("Your %s request %q (id %s) was %s by %s. Use get_request for the thread or check_requests for all your outcomes.",
+			fmt.Sprintf("Your %s request %q (id %s) was %s by %s. Use get_request for the thread or check_requests for all your outcomes. "+
+				"If this outcome changes what you owe the user, acknowledge it briefly with send_message_to_user — this notification is a background turn and does NOT appear in their chat.",
 				req.Kind, req.Title, req.ID, status, by))
 	}
 
