@@ -13,6 +13,8 @@ import { AgentCommsPanel } from "./chat/AgentCommsPanel";
 import { ChatErrorBanner } from "./chat/ChatErrorBanner";
 import { appendActivityLine } from "./chat/activityLog";
 import { ToolTraceChips } from "./chat/ToolTraceChips";
+import { decisionForChip, decisionChipText } from "./chat/decisionChip";
+import { fetchSession } from "@/lib/auth";
 import { runtimeDisplayName } from "@/lib/runtime-names";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { useChatHistory } from "./chat/hooks/useChatHistory";
@@ -126,6 +128,17 @@ function MyChatPanel({ workspaceId, data }: Props) {
   const hasInitialScrollRef = useRef(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const dragDepthRef = useRef(0);
+  // Current user id, resolved the SAME way RequestsInbox sets responder_id
+  // ("admin" placeholder when no session). Gates the decision chip to the
+  // user's OWN responses (core#2636, CR2 fix).
+  const currentUserIdRef = useRef<string>("admin");
+  useEffect(() => {
+    let cancelled = false;
+    fetchSession()
+      .then((sess) => { if (!cancelled && sess?.user_id) currentUserIdRef.current = sess.user_id; })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
   const pasteCounterRef = useRef(0);
 
   const history = useChatHistory(workspaceId, containerRef);
@@ -148,6 +161,14 @@ function MyChatPanel({ workspaceId, data }: Props) {
     onActivityLog: (entry) => {
       if (!sending) return;
       setActivityLog((prev) => appendActivityLine(prev, entry));
+    },
+    onRequestResponded: (p) => {
+      const decision = decisionForChip(p, currentUserIdRef.current);
+      if (!decision) return;
+      history.setMessages((prev) => [
+        ...prev,
+        { ...createMessage("system", decisionChipText(decision, p.title)), decision },
+      ]);
     },
     onSendComplete: () => {
       if (sendingFromAPIRef.current) {
@@ -480,6 +501,17 @@ function MyChatPanel({ workspaceId, data }: Props) {
           </div>
         )}
         {history.messages.map((msg) => (
+          msg.decision ? (
+            <div key={msg.id} className="flex justify-center my-1">
+              <div className={`text-[10px] px-2 py-0.5 rounded-full border ${
+                msg.decision === "rejected"
+                  ? "text-bad border-bad/40 bg-bad/10"
+                  : "text-good border-good/40 bg-good/10 dark:text-good"
+              }`}>
+                {msg.decision === "rejected" ? "✕" : "✓"} {msg.content}
+              </div>
+            </div>
+          ) : (
           <div key={msg.id} className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}>
             <div
               className={`max-w-[85%] rounded-lg px-3 py-2 text-xs ${
@@ -610,6 +642,7 @@ function MyChatPanel({ workspaceId, data }: Props) {
               </div>
             </div>
           </div>
+          )
         ))}
 
         {/* Thinking indicator — shows when this tab is awaiting a reply

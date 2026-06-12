@@ -29,6 +29,11 @@ export interface ChatMessage {
   attachments?: ChatAttachment[];
   /** Tool-use chain for an agent turn (rehydrated from tool_trace). */
   toolTrace?: ToolTraceEntry[];
+  /** Set when this message is a user DECISION on a request (approve /
+   *  reject / mark-done) rather than a chat turn — rendered as a centered
+   *  chip in My Chat so the action is visible the moment it happens
+   *  (core#2636). */
+  decision?: "approved" | "rejected" | "done";
   timestamp: string; // ISO string for serialization
 }
 
