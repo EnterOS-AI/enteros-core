@@ -606,14 +606,11 @@ jobs:
     runs-on: ci-meta
     timeout-minutes: 5
     steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        # Lightweight checkout so the extracted aggregation script is available.
+        # The job still does NO polling and NO API calls; gating remains the
+        # plain `needs:` edge.
       - name: Verify all aggregated CI jobs succeeded
-        # NO polling, NO API call, NO checkout. Because this job lists the
-        # aggregated jobs under `needs:` (without `if: always()`), Gitea only
-        # starts it once every need has reached SUCCESS — a failed/errored
-        # need short-circuits the job and propagates red to the
-        # `CI / all-required` context. This explicit check is a
-        # belt-and-suspenders assertion + a readable run summary; the real
-        # gating is the `needs:` edge itself.
         env:
           CHANGES_RESULT: ${{ needs.changes.result }}
           PLATFORM_RESULT: ${{ needs.platform-build.result }}
@@ -623,28 +620,13 @@ jobs:
           CANVAS_DEPLOY_RESULT: ${{ needs.canvas-deploy-status.result }}
         run: |
           set -euo pipefail
-          fail=0
-          check() {
-            name="$1"; result="$2"
-            printf 'CI / %s = %s\n' "$name" "$result"
-            # `success` is the only green terminal state we accept. A plain
-            # `needs:` job is only started when all needs succeed, so reaching
-            # this step already implies success — but assert explicitly so a
-            # future `if: always()` reintroduction (which WOULD let non-success
-            # through) fails loudly instead of silently passing the gate.
-            if [ "$result" != "success" ]; then
-              echo "::error::aggregated CI job '${name}' did not succeed (result=${result})"
-              fail=1
-            fi
-          }
-          check "Detect changes"        "$CHANGES_RESULT"
-          check "Platform (Go)"         "$PLATFORM_RESULT"
-          check "Canvas (Next.js)"      "$CANVAS_RESULT"
-          check "Shellcheck (E2E scripts)" "$SHELLCHECK_RESULT"
-          check "Python Lint & Test"    "$PYTHON_LINT_RESULT"
-          check "Canvas Deploy Status"  "$CANVAS_DEPLOY_RESULT"
-          if [ "$fail" -ne 0 ]; then
-            echo "::error::all-required: one or more aggregated CI jobs did not succeed"
-            exit 1
-          fi
-          echo "OK: all aggregated CI jobs succeeded — CI / all-required green."
+          # Extracted to .gitea/scripts/all-required-check.sh and unit-tested
+          # in .gitea/scripts/tests/test_all_required_check.sh. Keep this step
+          # as a thin wrapper so the fail-closed contract is tested outside CI.
+          bash .gitea/scripts/all-required-check.sh \
+            "Detect changes"             "$CHANGES_RESULT" \
+            "Platform (Go)"              "$PLATFORM_RESULT" \
+            "Canvas (Next.js)"           "$CANVAS_RESULT" \
+            "Shellcheck (E2E scripts)"   "$SHELLCHECK_RESULT" \
+            "Python Lint & Test"         "$PYTHON_LINT_RESULT" \
+            "Canvas Deploy Status"       "$CANVAS_DEPLOY_RESULT"

@@ -50,14 +50,13 @@ from typing import Any
 def _load_required_sub_jobs_from_ci_yml(workflows_dir: str) -> list[str]:
     """Parse ci.yml and extract the all-required sentinel's sub-job contexts.
 
-    Supports two shapes of the all-required job run block:
-      1. Legacy Python f-string list (pre-2026-06-01):
-         f"CI / Detect changes ({event})"
-      2. Current shell-script shape (post-2026-06-01 scheduler fix):
-         check "Detect changes"        "$CHANGES_RESULT"
+    Derives sub-jobs from the authoritative `needs:` list plus each job's
+    display `name:`. This is more robust than parsing the `run:` block, which
+    has changed shape several times (Python f-string list, inline shell,
+    extracted shell script).
 
     Raises RuntimeError if ci.yml is missing, has no all-required job, or the
-    run block cannot be parsed.
+    sub-jobs cannot be derived.
     """
     ci_path = Path(workflows_dir) / "ci.yml"
     if not ci_path.exists():
@@ -74,39 +73,32 @@ def _load_required_sub_jobs_from_ci_yml(workflows_dir: str) -> list[str]:
     if not isinstance(all_required, dict):
         raise RuntimeError("ci.yml missing 'all-required' job")
 
-    steps = all_required.get("steps", [])
-    run_block = ""
-    for step in steps:
-        if isinstance(step, dict):
-            run_text = step.get("run", "")
-            if run_text:
-                run_block = run_text
-                break
-
-    if not run_block:
-        raise RuntimeError("all-required job missing run block")
-
     # Determine event suffix from the umbrella context we are watching.
     if UMBRELLA_CONTEXT.endswith(" (pull_request)"):
         suffix = "(pull_request)"
     elif UMBRELLA_CONTEXT.endswith(" (push)"):
         suffix = "(push)"
     else:
-        m = re.search(r' \(([^)]+)\)$', UMBRELLA_CONTEXT)
+        m = re.search(r" \(([^)]+)\)$", UMBRELLA_CONTEXT)
         suffix = m.group(1) if m else "pull_request"
 
-    # Try legacy f-string format first.
-    if "({event})" in run_block:
-        matches = re.findall(r'f["\'](.*?\(\{event\}\))["\']', run_block)
-        if matches:
-            return [m.replace("({event})", suffix) for m in matches]
+    needs = all_required.get("needs", [])
+    if isinstance(needs, str):
+        needs = [needs]
+    if not needs:
+        raise RuntimeError("all-required job has no needs: cannot derive sub-jobs")
 
-    # Try current shell-script format: check "Name" "$RESULT"
-    matches = re.findall(r'check\s+"([^"]+)"', run_block)
-    if matches:
-        return [f"CI / {name} {suffix}" for name in matches]
+    contexts = []
+    for key in needs:
+        job = jobs.get(key)
+        if not isinstance(job, dict):
+            raise RuntimeError(f"all-required needs unknown job {key!r}")
+        name = job.get("name")
+        if not name:
+            raise RuntimeError(f"job {key!r} has no name: cannot build status context")
+        contexts.append(f"CI / {name} {suffix}")
 
-    raise RuntimeError("unable to derive required sub-jobs from all-required run block")
+    return contexts
 
 
 # --------------------------------------------------------------------------
