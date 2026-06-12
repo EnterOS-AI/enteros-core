@@ -1296,12 +1296,24 @@ for KA_ATTEMPT in $(seq 1 6); do
   set -e
   KA_CODE=${KA_CODE:-000}
   KA_RESP=$(cat "$KA_TMP" 2>/dev/null || echo "")
-  if [ "$KA_RC" = "0" ] && [ "$KA_CODE" -ge 200 ] && [ "$KA_CODE" -lt 300 ]; then
+  # A2A terminal success = HTTP 2xx AND NOT a queued/busy transient envelope.
+  # The proxy returns 202 {queued:true} while the workspace/native session is
+  # busy; that is NOT a completed reply and must be retried (CP#752 / #2661
+  # robustness). Break only when we have a real terminal reply.
+  KA_IS_QUEUED=$(echo "$KA_RESP" | python3 -c "
+import json,sys
+try:
+    d=json.load(sys.stdin)
+    print('true' if d.get('queued') is True or (d.get('status') or '').lower() == 'queued' else 'false')
+except Exception:
+    print('false')
+" 2>/dev/null || echo "false")
+  if [ "$KA_RC" = "0" ] && [ "$KA_CODE" -ge 200 ] && [ "$KA_CODE" -lt 300 ] && [ "$KA_IS_QUEUED" != "true" ]; then
     break
   fi
   KA_SAFE_BODY=$(printf '%s' "$KA_RESP" | sanitize_http_body)
-  # Retry ONLY on transient transport errors — never on an agent-level
-  # error (those must surface and fail the gate).
+  # Retry on transient transport errors OR queued/busy A2A envelopes — never on
+  # an agent-level error (those must surface and fail the gate).
   # #2263: include the Cloudflare-shaped literal `error code: 502/504` token so a
   # bare edge/gateway 502 (no "Bad Gateway" body) is retried here the same way the
   # cold-start PONG probe (line ~800) and the delegation loop (line ~1234) already
@@ -1309,7 +1321,7 @@ for KA_ATTEMPT in $(seq 1 6); do
   # fell through to break and failed the gate on the first attempt (Platform Boot
   # job, task 268859). Bounded by the existing 6-attempt / sleep-10 loop — no new
   # sleep-as-fix; this only widens the transient-match to the sibling pattern.
-  if echo "$KA_CODE" | grep -Eq '^(502|503|504)$' && echo "$KA_SAFE_BODY" | grep -Eqi 'Service Unavailable|Bad Gateway|Gateway Timeout|error code: 502|error code: 504|workspace agent unreachable|connection refused|no healthy upstream|workspace agent busy|native_session'; then
+  if { echo "$KA_CODE" | grep -Eq '^(202|502|503|504)$'; } && echo "$KA_SAFE_BODY" | grep -Eqi 'Service Unavailable|Bad Gateway|Gateway Timeout|error code: 502|error code: 504|workspace agent unreachable|connection refused|no healthy upstream|workspace agent busy|native_session|queued'; then
     log "    known-answer A2A transient $KA_CODE attempt $KA_ATTEMPT/6: $KA_SAFE_BODY"
     if [ "$KA_ATTEMPT" -lt 6 ]; then sleep 10; continue; fi
   fi
@@ -1322,13 +1334,46 @@ if [ "$KA_RC" != "0" ] || [ "$KA_CODE" -lt 200 ] || [ "$KA_CODE" -ge 300 ]; then
 fi
 KA_TEXT=$(echo "$KA_RESP" | python3 -c "
 import json, sys
+def extract_text(d):
+    out = []
+    # Standard A2A JSON-RPC result.parts
+    for p in d.get('result', {}).get('parts', []) or []:
+        if p.get('kind') == 'text' or p.get('type') == 'text':
+            t = p.get('text') or ''
+            if t:
+                out.append(t)
+    # A2A Task status message parts
+    for p in d.get('result', {}).get('status', {}).get('message', {}).get('parts', []) or []:
+        if p.get('kind') == 'text' or p.get('type') == 'text':
+            t = p.get('text') or ''
+            if t:
+                out.append(t)
+    # Alternative message.parts placement
+    for p in d.get('result', {}).get('message', {}).get('parts', []) or []:
+        if p.get('kind') == 'text' or p.get('type') == 'text':
+            t = p.get('text') or ''
+            if t:
+                out.append(t)
+    # Artifacts
+    for a in d.get('result', {}).get('artifacts', []) or []:
+        for p in a.get('parts', []) or []:
+            if p.get('kind') == 'text' or p.get('type') == 'text':
+                t = p.get('text') or ''
+                if t:
+                    out.append(t)
+    return '\n'.join(out)
 try:
     d = json.load(sys.stdin)
-    parts = d.get('result', {}).get('parts', [])
-    print(parts[0].get('text', '') if parts else '')
+    print(extract_text(d))
 except Exception:
     print('')
 " 2>/dev/null || echo "")
+# Debuggability: if extraction is empty, surface what the proxy returned so a
+# queued/artifact/non-text shape does not silently fail the gate.
+if [ -z "$KA_TEXT" ]; then
+  KA_SAFE_BODY=$(printf '%s' "$KA_RESP" | sanitize_http_body)
+  log "    known-answer A2A extraction empty; response body: $KA_SAFE_BODY"
+fi
 # CORE GATE: contains PINEAPPLE (real round-trip) AND no error-as-text.
 a2a_assert_real_completion "$KA_TEXT" "PINEAPPLE" "A2A known-answer (parent, $RUNTIME/$MODEL_SLUG)"
 # Real, deterministic LLM round-trip proven — the load-bearing milestone for
