@@ -108,3 +108,23 @@ def test_all_required_needs_reference_real_jobs():
     job_keys = set(jobs)
     for dep in needs:
         assert dep in job_keys, f"all-required needs unknown job {dep!r}"
+
+
+def test_all_required_step_uses_extracted_script():
+    """Anti-inline regression: the all-required step must invoke the
+    extracted .gitea/scripts/all-required-check.sh script, not contain the
+    inline check() logic. This guarantees the fail-closed contract is tested
+    outside CI (test_all_required_check.sh) and cannot be silently re-inlined.
+    """
+    workflow = load_workflow("ci.yml")
+    all_required = _all_required(workflow)
+    steps = all_required.get("steps", [])
+    assert steps, "all-required job has no steps"
+    run_block = steps[0].get("run", "")
+
+    assert "all-required-check.sh" in run_block, (
+        "all-required step must invoke .gitea/scripts/all-required-check.sh"
+    )
+    assert "check()" not in run_block, (
+        "all-required step still contains inline check() function — re-inline regression"
+    )

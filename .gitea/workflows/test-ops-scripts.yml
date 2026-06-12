@@ -106,3 +106,11 @@ jobs:
           python -m unittest discover -p 'test_*.py' -v
       - name: Run .gitea/scripts pytest suite
         run: python -m pytest .gitea/scripts/tests -q
+
+      - name: all-required-check.sh fail-closed contract
+        # Regression lock for molecule-core#656 / #2615. The CI / all-required
+        # aggregation logic was extracted to .gitea/scripts/all-required-check.sh;
+        # this step runs its shell unit test so a weakening of the fail-closed
+        # contract (e.g. accepting skipped/failure as success, or re-inlining
+        # the logic into ci.yml) fails CI.
+        run: bash .gitea/scripts/tests/test_all_required_check.sh
