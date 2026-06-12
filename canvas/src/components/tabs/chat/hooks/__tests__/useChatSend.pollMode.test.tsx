@@ -142,27 +142,45 @@ describe("useChatSend — poll-mode (external/MCP) queued-200 handling — task 
     expect(result.current.sending).toBe(true);
   });
 
-  it("push-mode (real reply parts) still flips sending=false + creates an agent bubble — non-regression for the default path", async () => {
-    // Sanity-check the push path still works: a real reply must call
-    // onAgentMessage and flip sending=false. Without this assertion an
-    // overzealous "return early on any non-result body" would silently
-    // break the dominant push-mode path.
-    apiPostMock.mockResolvedValueOnce({
-      result: {
-        parts: [{ kind: "text", text: "hi from native workspace" }],
-      },
-    });
+  it("push-mode appends agent bubble even if guards were already released (no early-return drop)", async () => {
+    // Regression: an early-return on !sendingFromAPIRef.current dropped the
+    // synchronous HTTP reply when the guards had already been released (e.g.
+    // by a fast WebSocket event or an earlier timeout classification). The
+    // reply must still be parsed and appended; releaseSendGuards is
+    // idempotent and appendMessageDeduped collapses duplicates.
+    let resolvePost: (value: unknown) => void = () => {};
+    apiPostMock.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolvePost = resolve;
+        }),
+    );
 
     const onAgentMessage = vi.fn();
     const { result } = renderHook(() =>
-      useChatSend("ws-native-push", {
+      useChatSend("ws-push-early-release", {
         getHistoryMessages: () => [],
         onAgentMessage,
       }),
     );
 
     await act(async () => {
-      await result.current.sendMessage("native push test");
+      result.current.sendMessage("release then reply");
+      // Yield so the Promise is in flight and sendingFromAPIRef is true.
+      await Promise.resolve();
+    });
+
+    // Simulate an external release before the HTTP response lands.
+    act(() => {
+      result.current.releaseSendGuards();
+    });
+
+    await act(async () => {
+      resolvePost({
+        result: {
+          parts: [{ kind: "text", text: "reply after early release" }],
+        },
+      });
       await Promise.resolve();
     });
 
@@ -172,7 +190,6 @@ describe("useChatSend — poll-mode (external/MCP) queued-200 handling — task 
       content: string;
     };
     expect(msg.role).toBe("agent");
-    expect(msg.content).toBe("hi from native workspace");
-    expect(result.current.sending).toBe(false);
+    expect(msg.content).toBe("reply after early release");
   });
 });

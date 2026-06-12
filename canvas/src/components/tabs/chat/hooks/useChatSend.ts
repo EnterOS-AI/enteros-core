@@ -229,10 +229,14 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
         )
         .then((resp) => {
           if (sendTokenRef.current !== myToken) return;
-          if (!sendingFromAPIRef.current) {
-            sendInFlightRef.current = false;
-            return;
-          }
+          // Always process a synchronous push-mode 200 response. An earlier
+          // early-return on !sendingFromAPIRef.current dropped agent replies
+          // that arrived before the WebSocket path released the guards,
+          // leaving the user message visible with no Echo/reply bubble.
+          // releaseSendGuards is idempotent, and ChatTab deduplicates
+          // appendMessageDeduped within a short window, so processing here is
+          // safe even if a WS event already handled the reply.
+          //
           // Task #227 — poll-mode (external/MCP workspace) queued-200
           // short-circuit. ws-server's `proxyA2ARequest` returns
           // `{status:"queued", delivery_mode:"poll", ...}` immediately
