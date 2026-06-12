@@ -164,3 +164,27 @@ func TestReconcileAgentCardIdentity_PreservesOtherFields(t *testing.T) {
 		t.Errorf("skills not preserved: %v", got["skills"])
 	}
 }
+
+func TestAgentCardURL(t *testing.T) {
+	cases := []struct {
+		name string
+		card string
+		want string
+	}{
+		{"tunnel url", `{"name":"x","url":"https://ws-abc.moleculesai.app"}`, "https://ws-abc.moleculesai.app"},
+		{"private ip url", `{"url":"http://ip-172-31-1-1:8000"}`, "http://ip-172-31-1-1:8000"},
+		{"trims space", `{"url":"  https://x.example  "}`, "https://x.example"},
+		{"no url key", `{"name":"x"}`, ""},
+		{"empty url", `{"url":""}`, ""},
+		{"malformed", `not json`, ""},
+		{"null", `null`, ""},
+		{"url not a string", `{"url":123}`, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := agentCardURL([]byte(tc.card)); got != tc.want {
+				t.Errorf("agentCardURL(%s) = %q, want %q", tc.card, got, tc.want)
+			}
+		})
+	}
+}

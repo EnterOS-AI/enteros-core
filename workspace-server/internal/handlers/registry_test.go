@@ -2586,3 +2586,67 @@ func TestHeartbeat_RecentRegisterFailure_BlocksRecovery(t *testing.T) {
 		t.Errorf("unmet expectations: %v", err)
 	}
 }
+
+// ==================== Cross-cloud register: url fallback to agent_card (Bug A) ====================
+
+// TestRegister_PushModeFallsBackToAgentCardURL pins the cross-cloud delivery fix:
+// an egress-only box registers with an EMPTY top-level url but advertises its
+// tunnel url in the agent_card. Push-mode must NOT reject it — it must derive the
+// url from the agent_card so the workspace becomes deliverable. We assert the
+// derived url lands in the INSERT (then force the insert to fail to short-circuit
+// the rest of the success path, exactly like TestRegister_DBError).
+func TestRegister_PushModeFallsBackToAgentCardURL(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewRegistryHandler(newTestBroadcaster())
+
+	mock.ExpectQuery(`SELECT delivery_mode, runtime FROM workspaces WHERE id`).
+		WithArgs("ws-xcloud").
+		WillReturnError(sql.ErrNoRows)
+
+	// The INSERT must receive the agent_card's url as the url arg ($3), even
+	// though payload.url was "". A mismatch here = the fallback didn't fire.
+	// (Uses localhost — validateAgentURL does a live DNS resolve, so the test
+	// host must resolve; in prod the tunnel CNAME exists and resolves.)
+	mock.ExpectExec("INSERT INTO workspaces").
+		WithArgs("ws-xcloud", "ws-xcloud", "http://localhost:8000",
+			`{"name":"x","url":"http://localhost:8000"}`, "push", "").
+		WillReturnError(sql.ErrConnDone)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	body := `{"id":"ws-xcloud","url":"","agent_card":{"name":"x","url":"http://localhost:8000"}}`
+	c.Request = httptest.NewRequest("POST", "/registry/register", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	handler.Register(c)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("expected 500 (forced insert error after reaching it), got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations (derived url likely wrong): %v", err)
+	}
+}
+
+// TestRegister_PushModeNoURLNoCardURLStill400 proves the fallback doesn't mask a
+// genuine misconfiguration: push-mode with no url anywhere still 400s.
+func TestRegister_PushModeNoURLNoCardURLStill400(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewRegistryHandler(newTestBroadcaster())
+
+	mock.ExpectQuery(`SELECT delivery_mode, runtime FROM workspaces WHERE id`).
+		WithArgs("ws-nourl").
+		WillReturnError(sql.ErrNoRows)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	body := `{"id":"ws-nourl","url":"","agent_card":{"name":"x"}}`
+	c.Request = httptest.NewRequest("POST", "/registry/register", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	handler.Register(c)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 (no url in payload or agent_card), got %d: %s", w.Code, w.Body.String())
+	}
+}

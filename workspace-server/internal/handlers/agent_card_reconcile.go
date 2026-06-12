@@ -1,6 +1,24 @@
 package handlers
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"strings"
+)
+
+// agentCardURL extracts the advertised "url" from a runtime-supplied agent_card
+// blob, or "" if the card is absent/malformed or carries no url. It is the reach
+// address an egress-only (Cloudflare-tunnel-fronted) workspace box advertises even
+// when it registers with an empty top-level url, so the registration path can
+// recover a push-deliverable URL from it. Pure function — unit-tested alongside
+// reconcileAgentCardIdentity.
+func agentCardURL(card json.RawMessage) string {
+	var m map[string]any
+	if err := json.Unmarshal(card, &m); err != nil || m == nil {
+		return ""
+	}
+	u, _ := m["url"].(string)
+	return strings.TrimSpace(u)
+}
 
 // agent_card_reconcile.go — server-side repair for the fleet-wide
 // agent-card identity gap.
