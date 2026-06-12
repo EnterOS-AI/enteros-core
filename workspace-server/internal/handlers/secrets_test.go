@@ -290,6 +290,100 @@ func TestSecretsSet_AutoRestart(t *testing.T) {
 	}
 }
 
+// TestSecretsSet_NoAutoRestart_SelfWrite asserts core#2573 / #2605: when the
+// caller IS the target workspace, the secret write succeeds but auto-restart is
+// suppressed — restarting would tear down the writing agent mid-turn.
+func TestSecretsSet_NoAutoRestart_SelfWrite(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+
+	done := make(chan string, 1)
+	restartFunc := func(wsID string) { done <- wsID }
+	handler := NewSecretsHandler(restartFunc)
+
+	wsID := "550e8400-e29b-41d4-a716-446655440000"
+	mock.ExpectExec("INSERT INTO workspace_secrets").
+		WithArgs(wsID, "DB_PASS", sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	// autoRestartAllowed returns false on callerID == workspaceID before any
+	// DB kind lookup, so no SELECT COALESCE(kind...) expectation here.
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: wsID}}
+
+	body := `{"key":"DB_PASS","value":"password123"}`
+	c.Request = httptest.NewRequest("POST", "/workspaces/"+wsID+"/secrets", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Request.Header.Set("X-Workspace-ID", wsID) // caller == target
+
+	handler.Set(c)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	select {
+	case <-done:
+		t.Fatal("auto-restart MUST be skipped for a self-write")
+	case <-time.After(200 * time.Millisecond):
+		// expected: no restart
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// TestSecretsSet_NoAutoRestart_PlatformRoot asserts core#2573 / #2605: the
+// concierge (kind='platform') is the org root; secret writes/deletes there must
+// NOT auto-restart it, because that terminates the org root's box. This is the
+// code-side enforcement of the no-self-secret-ops / safe-approval rule.
+func TestSecretsSet_NoAutoRestart_PlatformRoot(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+
+	done := make(chan string, 1)
+	restartFunc := func(wsID string) { done <- wsID }
+	handler := NewSecretsHandler(restartFunc)
+
+	wsID := "550e8400-e29b-41d4-a716-446655440000"
+	mock.ExpectExec("INSERT INTO workspace_secrets").
+		WithArgs(wsID, "DB_PASS", sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	// Caller is unauthenticated admin-style, so autoRestartAllowed falls through
+	// to the kind lookup and must see 'platform'.
+	mock.ExpectQuery(`SELECT COALESCE\(kind`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"kind"}).AddRow("platform"))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: wsID}}
+
+	body := `{"key":"DB_PASS","value":"password123"}`
+	c.Request = httptest.NewRequest("POST", "/workspaces/"+wsID+"/secrets", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	// No X-Workspace-ID and no bearer token => callerID == "" (concierge MCP path).
+
+	handler.Set(c)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	select {
+	case <-done:
+		t.Fatal("auto-restart MUST be skipped for the platform root")
+	case <-time.After(200 * time.Millisecond):
+		// expected: no restart
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
 func TestSecretsSet_DBError(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
