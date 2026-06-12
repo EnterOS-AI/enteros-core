@@ -379,16 +379,19 @@ def test_signal_6_missing_required_context_returns_ci_pending(monkeypatch):
     monkeypatch.setattr(
         mod, "api_get",
         _signal_6_api_get(
-            required_checks=["qa-review / approved (pull_request)", "security-review / approved (pull_request)"],
+            required_checks=[
+                "qa-review / approved (pull_request_target)",
+                "security-review / approved (pull_request_target)",
+            ],
             statuses=[
-                {"context": "qa-review / approved (pull_request)", "status": "success"},
+                {"context": "qa-review / approved (pull_request_target)", "status": "success"},
                 # security-review is completely missing
             ],
         ),
     )
     result = mod.signal_6_ci(200, "molecule-ai/molecule-core")
     assert result["verdict"] == "CI_PENDING"
-    assert "security-review / approved (pull_request)" in result["pending_required"]
+    assert "security-review / approved (pull_request_target)" in result["pending_required"]
 
 
 def test_signal_6_pending_required_context_returns_ci_pending(monkeypatch):
@@ -398,20 +401,20 @@ def test_signal_6_pending_required_context_returns_ci_pending(monkeypatch):
         mod, "api_get",
         _signal_6_api_get(
             required_checks=[
-                "qa-review / approved (pull_request)",
-                "security-review / approved (pull_request)",
-                "sop-checklist / all-items-acked (pull_request)",
+                "qa-review / approved (pull_request_target)",
+                "security-review / approved (pull_request_target)",
+                "sop-checklist / all-items-acked (pull_request_target)",
             ],
             statuses=[
-                {"context": "qa-review / approved (pull_request)", "status": "success"},
-                {"context": "security-review / approved (pull_request)", "status": "pending"},
-                {"context": "sop-checklist / all-items-acked (pull_request)", "status": "success"},
+                {"context": "qa-review / approved (pull_request_target)", "status": "success"},
+                {"context": "security-review / approved (pull_request_target)", "status": "pending"},
+                {"context": "sop-checklist / all-items-acked (pull_request_target)", "status": "success"},
             ],
         ),
     )
     result = mod.signal_6_ci(200, "molecule-ai/molecule-core")
     assert result["verdict"] == "CI_PENDING"
-    assert "security-review / approved (pull_request)" in result["pending_required"]
+    assert "security-review / approved (pull_request_target)" in result["pending_required"]
 
 
 def test_signal_6_failing_required_context_returns_ci_fail(monkeypatch):
@@ -421,22 +424,22 @@ def test_signal_6_failing_required_context_returns_ci_fail(monkeypatch):
         mod, "api_get",
         _signal_6_api_get(
             required_checks=[
-                "qa-review / approved (pull_request)",
-                "security-review / approved (pull_request)",
-                "sop-checklist / all-items-acked (pull_request)",
+                "qa-review / approved (pull_request_target)",
+                "security-review / approved (pull_request_target)",
+                "sop-checklist / all-items-acked (pull_request_target)",
                 "CI / all-required (pull_request)",
             ],
             statuses=[
-                {"context": "qa-review / approved (pull_request)", "status": "failure"},
-                {"context": "security-review / approved (pull_request)", "status": "success"},
-                {"context": "sop-checklist / all-items-acked (pull_request)", "status": "success"},
+                {"context": "qa-review / approved (pull_request_target)", "status": "failure"},
+                {"context": "security-review / approved (pull_request_target)", "status": "success"},
+                {"context": "sop-checklist / all-items-acked (pull_request_target)", "status": "success"},
                 {"context": "CI / all-required (pull_request)", "status": "success"},
             ],
         ),
     )
     result = mod.signal_6_ci(200, "molecule-ai/molecule-core")
     assert result["verdict"] == "CI_FAIL"
-    assert "qa-review / approved (pull_request)" in result["failing_required"]
+    assert "qa-review / approved (pull_request_target)" in result["failing_required"]
 
 
 def test_signal_6_all_required_green_returns_clear(monkeypatch):
@@ -446,15 +449,15 @@ def test_signal_6_all_required_green_returns_clear(monkeypatch):
         mod, "api_get",
         _signal_6_api_get(
             required_checks=[
-                "qa-review / approved (pull_request)",
-                "security-review / approved (pull_request)",
-                "sop-checklist / all-items-acked (pull_request)",
+                "qa-review / approved (pull_request_target)",
+                "security-review / approved (pull_request_target)",
+                "sop-checklist / all-items-acked (pull_request_target)",
                 "CI / all-required (pull_request)",
             ],
             statuses=[
-                {"context": "qa-review / approved (pull_request)", "status": "success"},
-                {"context": "security-review / approved (pull_request)", "status": "success"},
-                {"context": "sop-checklist / all-items-acked (pull_request)", "status": "success"},
+                {"context": "qa-review / approved (pull_request_target)", "status": "success"},
+                {"context": "security-review / approved (pull_request_target)", "status": "success"},
+                {"context": "sop-checklist / all-items-acked (pull_request_target)", "status": "success"},
                 {"context": "CI / all-required (pull_request)", "status": "success"},
             ],
         ),
@@ -481,6 +484,85 @@ def test_signal_6_governance_checks_always_required_even_when_bp_empty(monkeypat
     )
     result = mod.signal_6_ci(200, "molecule-ai/molecule-core")
     assert result["verdict"] == "CI_PENDING"
-    assert "qa-review / approved (pull_request)" in result["pending_required"]
-    assert "security-review / approved (pull_request)" in result["pending_required"]
-    assert "sop-checklist / all-items-acked (pull_request)" in result["pending_required"]
+    assert "qa-review / approved (pull_request_target)" in result["pending_required"]
+    assert "security-review / approved (pull_request_target)" in result["pending_required"]
+    assert "sop-checklist / all-items-acked (pull_request_target)" in result["pending_required"]
+
+
+# ── Signal 6 regression tests for molecule-core#2589 ─────────────────────────
+
+TRUSTED_QA = "qa-review / approved (pull_request_target)"
+TRUSTED_SECURITY = "security-review / approved (pull_request_target)"
+TRUSTED_SOP = "sop-checklist / all-items-acked (pull_request_target)"
+UNTRUSTED_QA = "qa-review / approved (pull_request)"
+UNTRUSTED_SECURITY = "security-review / approved (pull_request)"
+UNTRUSTED_SOP = "sop-checklist / all-items-acked (pull_request)"
+
+
+def test_signal_6_trusted_governance_contexts_clear(monkeypatch):
+    """#2589 regression: gate is satisfied ONLY by trusted (pull_request_target)
+    governance contexts."""
+    mod = load_gate_check()
+    monkeypatch.setattr(
+        mod, "api_get",
+        _signal_6_api_get(
+            required_checks=[],
+            statuses=[
+                {"context": TRUSTED_QA, "status": "success"},
+                {"context": TRUSTED_SECURITY, "status": "success"},
+                {"context": TRUSTED_SOP, "status": "success"},
+            ],
+        ),
+    )
+    result = mod.signal_6_ci(200, "molecule-ai/molecule-core")
+    assert result["verdict"] == "CLEAR"
+    assert result["passing_required"] == [TRUSTED_QA, TRUSTED_SECURITY, TRUSTED_SOP]
+
+
+def test_signal_6_untrusted_governance_contexts_do_not_satisfy(monkeypatch):
+    """#2589 security regression: forged/untrusted (pull_request)-suffixed
+    governance statuses must NOT satisfy the gate."""
+    mod = load_gate_check()
+    monkeypatch.setattr(
+        mod, "api_get",
+        _signal_6_api_get(
+            required_checks=[],
+            statuses=[
+                # Attacker-controlled PR-head workflow posts the untrusted suffixes.
+                {"context": UNTRUSTED_QA, "status": "success"},
+                {"context": UNTRUSTED_SECURITY, "status": "success"},
+                {"context": UNTRUSTED_SOP, "status": "success"},
+            ],
+        ),
+    )
+    result = mod.signal_6_ci(200, "molecule-ai/molecule-core")
+    assert result["verdict"] in ("CI_PENDING", "CI_FAIL")
+    # Trusted contexts are still missing/unsatisfied.
+    for ctx in (TRUSTED_QA, TRUSTED_SECURITY, TRUSTED_SOP):
+        assert ctx in result["pending_required"]
+    # Untrusted contexts are NOT counted as passing governance.
+    for ctx in (UNTRUSTED_QA, UNTRUSTED_SECURITY, UNTRUSTED_SOP):
+        assert ctx not in result["passing_required"]
+
+
+def test_signal_6_status_collapse_uses_max_id(monkeypatch):
+    """Gitea /commits/<sha>/statuses is non-monotonic by id; the gate must
+    collapse duplicate contexts by max(id), not by list order."""
+    mod = load_gate_check()
+    monkeypatch.setattr(
+        mod, "api_get",
+        _signal_6_api_get(
+            required_checks=[TRUSTED_QA],
+            statuses=[
+                # Older id claims success; newer id claims failure.
+                # List order is deliberately opposite of id order.
+                {"id": 3, "context": TRUSTED_QA, "status": "failure"},
+                {"id": 1, "context": TRUSTED_QA, "status": "success"},
+                {"id": 2, "context": TRUSTED_QA, "status": "success"},
+            ],
+        ),
+    )
+    result = mod.signal_6_ci(200, "molecule-ai/molecule-core")
+    assert result["verdict"] == "CI_FAIL"
+    assert TRUSTED_QA in result["failing_required"]
+    assert result["all_check_statuses"][TRUSTED_QA] == "failure"

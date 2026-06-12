@@ -467,11 +467,19 @@ def signal_6_ci(pr_number: int, repo: str, branch: str | None = None, pr_data: d
     # Gitea Actions uses "status" (pending/success/failure) not "state" for
     # individual check entries. "state" is null for pending runs.
     # Exclude our own prior status to prevent self-referential failure loops.
-    check_statuses = {}
+    # Gitea /commits/<sha>/statuses is non-monotonic by id, so collapse by
+    # max(id) to guarantee the latest result for each context wins.
+    latest_by_context: dict[str, dict] = {}
     for s in combined.get("statuses") or []:
         ctx = s["context"]
-        if "gate-check" not in ctx.lower():
-            check_statuses[ctx] = s.get("status", "pending")
+        if "gate-check" in ctx.lower():
+            continue
+        existing = latest_by_context.get(ctx)
+        if existing is None or s.get("id", 0) > existing.get("id", 0):
+            latest_by_context[ctx] = s
+    check_statuses = {
+        ctx: s.get("status", "pending") for ctx, s in latest_by_context.items()
+    }
 
     # Try to get branch protection for required checks
     required_checks = []
