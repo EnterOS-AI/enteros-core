@@ -15,11 +15,18 @@ async function loadMessagesFromDB(
   try {
     const params = new URLSearchParams({ limit: String(limit) });
     if (beforeTs) params.set("before_ts", beforeTs);
-    const resp = await api.get<{ messages: ChatMessage[]; reached_end: boolean }>(
-      `/workspaces/${workspaceId}/chat-history?${params.toString()}`,
+    // The server emits ChatMessage with a snake_case `tool_trace` field
+    // (Go json tag). Map it onto the camelCase `toolTrace` the renderer
+    // reads so a rehydrated agent turn shows its tool chain (core#2636).
+    const resp = await api.get<{
+      messages: (ChatMessage & { tool_trace?: ChatMessage["toolTrace"] })[];
+      reached_end: boolean;
+    }>(`/workspaces/${workspaceId}/chat-history?${params.toString()}`);
+    const messages: ChatMessage[] = (resp.messages ?? []).map((m) =>
+      m.tool_trace?.length ? { ...m, toolTrace: m.tool_trace } : m,
     );
     return {
-      messages: resp.messages ?? [],
+      messages,
       error: null,
       reachedEnd: resp.reached_end,
     };

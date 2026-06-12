@@ -61,6 +61,7 @@ package messagestore
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 )
 
@@ -77,6 +78,13 @@ type ChatMessage struct {
 	Content     string           `json:"content"`
 	Attachments []ChatAttachment `json:"attachments,omitempty"`
 	Timestamp   string           `json:"timestamp"` // RFC3339, pinned to row.created_at
+	// ToolTrace is the agent turn's tool-use chain (the same
+	// metadata.tool_trace array the live progress feed renders), carried
+	// on the AGENT message so the chain survives a chat reload — without
+	// it the canvas dropped every tool step the moment the spinner
+	// cleared (core#2636). Raw passthrough of the stored JSON array of
+	// {tool, input} objects; omitted when the row has none.
+	ToolTrace json.RawMessage `json:"tool_trace,omitempty"`
 }
 
 // ChatAttachment mirrors canvas ChatAttachment / ParsedFilePart.

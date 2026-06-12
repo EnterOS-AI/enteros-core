@@ -12,12 +12,23 @@ export interface ChatAttachment {
   size?: number;
 }
 
+/** One tool-use step the agent ran during a turn — the persisted twin
+ *  of the live progress lines. Server stores these in the activity
+ *  row's tool_trace; the chat-history endpoint returns them on the
+ *  agent message so the chain survives a reload (core#2636). */
+export interface ToolTraceEntry {
+  tool: string;
+  input?: string;
+}
+
 export interface ChatMessage {
   id: string;
   role: "user" | "agent" | "system";
   content: string;
   /** Attachments sent with or returned alongside this message. */
   attachments?: ChatAttachment[];
+  /** Tool-use chain for an agent turn (rehydrated from tool_trace). */
+  toolTrace?: ToolTraceEntry[];
   timestamp: string; // ISO string for serialization
 }
 
@@ -25,6 +36,7 @@ export function createMessage(
   role: ChatMessage["role"],
   content: string,
   attachments?: ChatAttachment[],
+  toolTrace?: ToolTraceEntry[],
 ): ChatMessage {
   return Object.freeze({
     id: crypto.randomUUID(),
@@ -33,6 +45,7 @@ export function createMessage(
     // Conditional spread avoids `attachments: undefined` appearing in
     // Object.keys() when no attachments are provided.
     ...(attachments?.length ? { attachments } : {}),
+    ...(toolTrace?.length ? { toolTrace } : {}),
     timestamp: new Date().toISOString(),
   });
 }
