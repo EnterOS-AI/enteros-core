@@ -116,11 +116,7 @@ func sessionCachePut(key string, ok bool) {
 
 func init() {
 	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				log.Printf("session_auth: PANIC in cache sweeper: %v", r)
-			}
-		}()
+		defer recoverPanic("session_auth: cache sweeper")
 		// Jitter startup so restarts don't align sweeps.
 		time.Sleep(time.Duration(rand.Int64N(int64(sessionCacheSweepEvery))))
 		t := time.NewTicker(sessionCacheSweepEvery)
@@ -129,6 +125,30 @@ func init() {
 			sweepExpired()
 		}
 	}()
+}
+
+// recoverPanic is the canonical panic-recovery wrapper for the
+// long-lived background goroutines the workspace-server middleware
+// package runs (cache sweepers, rate-limit cleanup, session cache,
+// A2A SSE idle watcher, terminal bridges, importer provision
+// goroutine — see core#2125). It is invoked via `defer` at the
+// TOP of any goroutine that must not let a panic crash the process
+// (the package has no global recover; a panic that escapes a
+// goroutine takes the whole workspace-server down).
+//
+// The wrapper logs the recovered value with a caller-supplied
+// prefix so the operator can grep for the specific goroutine that
+// tripped, then returns. The deferred caller continues to its
+// function epilogue (typically `close(done)`).
+//
+// Refactored from inline `defer func() { if r := recover(); ... }()`
+// blocks (which were duplicated across 6 call sites in #2125) so
+// the panic-recovery contract is testable in one place — see
+// TestRecoverPanic_RecoversFromPanicInGoroutine in panic_recovery_test.go.
+func recoverPanic(prefix string) {
+	if r := recover(); r != nil {
+		log.Printf("%s: PANIC: %v", prefix, r)
+	}
 }
 
 // sweepExpired removes expired entries so a low-hit-rate cache still
