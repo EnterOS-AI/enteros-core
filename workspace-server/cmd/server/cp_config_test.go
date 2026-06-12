@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestRefreshEnvFromCP_NoopWhenNotSaaS: without MOLECULE_ORG_ID or
@@ -241,5 +242,61 @@ func TestRefreshEnvFromCP_RejectsOversizedValue(t *testing.T) {
 	if got := os.Getenv("MOLECULE_CP_SHARED_SECRET"); got != "original" {
 		t.Errorf("oversized value was applied — want %q, got %d bytes",
 			"original", len(got))
+	}
+}
+
+// TestRefreshEnvFromCP_ClientTimeoutFiresOnSlowUpstream: the
+// core#2125 fix replaced http.DefaultClient with
+// `&http.Client{Timeout: 10 * time.Second}`. This regression test
+// proves that a hung / slow upstream does NOT block the boot — the
+// client times out at 10s and refreshEnvFromCP returns an error
+// within a small bound. Without the timeout, this test would block
+// for 12s+ (the slow server's delay) AND the test would still pass
+// on the wrong invariant — so we ALSO assert the elapsed wall time
+// is well under the server delay (proving the timeout fired, not
+// the server response).
+//
+// Runtime cost: ~10s wall clock. Acceptable for a regression test
+// that runs once per CI build; the alternative (mock the http
+// transport) would test the mock, not the real http.Client.Timeout
+// contract — exactly the trade-off core#2125 is about.
+func TestRefreshEnvFromCP_ClientTimeoutFiresOnSlowUpstream(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping 10s slow-upstream test in -short mode")
+	}
+	// Server that delays 12s — LONGER than the 10s client timeout, so
+	// the timeout MUST fire first. If the timeout were absent (or set
+	// higher), this handler would run to completion and refreshEnvFromCP
+	// would return success after 12s — both wrong.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-time.After(12 * time.Second):
+		case <-r.Context().Done():
+		}
+	}))
+	defer srv.Close()
+
+	t.Setenv("MOLECULE_ORG_ID", "org-abc")
+	t.Setenv("ADMIN_TOKEN", "t")
+	t.Setenv("MOLECULE_CP_URL", srv.URL)
+
+	start := time.Now()
+	err := refreshEnvFromCP()
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatalf("expected timeout error on slow upstream, got nil (would mean the 10s timeout is missing)")
+	}
+	// Bound the elapsed time at 11s — the 10s client timeout + up to
+	// 1s of slack for goroutine scheduling. If this is > 11s, either
+	// the timeout was raised or the test server isn't actually slow.
+	if elapsed > 11*time.Second {
+		t.Errorf("refreshEnvFromCP took %v on a 12s-delay server; expected the 10s client timeout to fire first (elapsed < 11s)", elapsed)
+	}
+	// The error should mention timeout / deadline — proves the failure
+	// mode is the client.Timeout, not a misrouted request.
+	errStr := err.Error()
+	if !strings.Contains(errStr, "timeout") && !strings.Contains(errStr, "deadline") {
+		t.Errorf("error should mention timeout/deadline (the client.Timeout path), got: %v", err)
 	}
 }
