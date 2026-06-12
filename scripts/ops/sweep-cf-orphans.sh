@@ -72,6 +72,83 @@ need CP_STAGING_ADMIN_API_TOKEN
 
 log() { echo "[$(date -u +%H:%M:%S)] $*"; }
 
+# --- Preflight: verify CF auth + zone reachability BEFORE any gather/sweep ---
+# Why this exists (Researcher RCA, 2026-06-12, runs 352709/job 476863 +
+# 352596/job 476689 at SHA 15872306): the script previously proceeded
+# into the CP and EC2 gather (lines below) before hitting the CF DNS
+# list call. If the CF token was expired/revoked/wrong-scope, the CF
+# list call failed MID-RUN, after ~30s of wasted CP/AWS gather work,
+# and the operator got a half-completed audit log with no clear
+# signal about which step (CF token vs zone vs permission) was the
+# culprit. Fail-fast preflight: verify the token is active AND the
+# zone is reachable BEFORE any other work. On failure: exit non-zero,
+# NO destructive step is taken.
+log "Preflight: verifying CF token + zone (before any gather/sweep)..."
+PF_TOKEN_JSON=$(curl -sS -m 10 -H "Authorization: Bearer $CF_API_TOKEN" \
+  "https://api.cloudflare.com/client/v4/user/tokens/verify")
+if ! echo "$PF_TOKEN_JSON" | python3 -c '
+import json, sys
+try:
+    p = json.load(sys.stdin)
+except Exception as exc:
+    print(f"ERROR: non-JSON from /user/tokens/verify: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+if not p.get("success"):
+    errs = p.get("errors") or []
+    detail = "; ".join(
+        "{code}: {msg}".format(
+            code=e.get("code", "?"),
+            msg=e.get("message", "?"),
+        )
+        for e in errs
+    ) or "unknown"
+    print(f"ERROR: CF token verify returned success=false: {detail}", file=sys.stderr)
+    raise SystemExit(1)
+status = (p.get("result") or {}).get("status", "?")
+if status != "active":
+    print(f"ERROR: CF token is not active (status={status}) — sweep refused.", file=sys.stderr)
+    raise SystemExit(1)
+'; then
+  log "  CF preflight FAILED — token verify did not return active."
+  log "  Check CF_API_TOKEN (or CLOUDFLARE_API_TOKEN) is set, not expired, and not revoked."
+  exit 1
+fi
+log "  CF token active ✓"
+
+PF_ZONE_JSON=$(curl -sS -m 10 -H "Authorization: Bearer $CF_API_TOKEN" \
+  "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID")
+if ! echo "$PF_ZONE_JSON" | CF_ZONE_ID="$CF_ZONE_ID" python3 -c '
+import json, os, sys
+try:
+    p = json.load(sys.stdin)
+except Exception as exc:
+    print(f"ERROR: non-JSON from /zones/$CF_ZONE_ID: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+if not p.get("success"):
+    errs = p.get("errors") or []
+    detail = "; ".join(
+        "{code}: {msg}".format(
+            code=e.get("code", "?"),
+            msg=e.get("message", "?"),
+        )
+        for e in errs
+    ) or "unknown"
+    print(f"ERROR: zone lookup returned success=false: {detail}", file=sys.stderr)
+    raise SystemExit(1)
+res = p.get("result") or {}
+got_id = res.get("id")
+expected = os.environ["CF_ZONE_ID"]
+if got_id != expected:
+    print(f"ERROR: zone id mismatch — expected {expected!r}, got {got_id!r}", file=sys.stderr)
+    raise SystemExit(1)
+'; then
+  log "  CF preflight FAILED — zone $CF_ZONE_ID unreachable or token lacks Zone:Read on it."
+  log "  Check CF_ZONE_ID (or CLOUDFLARE_ZONE_ID) is the moleculesai.app zone id, and the token has Zone:Read on it."
+  exit 1
+fi
+log "  zone $CF_ZONE_ID reachable ✓"
+
+
 # --- Gather live sets ------------------------------------------------------
 
 log "Fetching CP prod org slugs..."
