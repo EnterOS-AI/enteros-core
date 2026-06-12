@@ -112,11 +112,11 @@ func TestModelsForRuntime_ExactModelIDs(t *testing.T) {
 			"sonnet", "opus", "haiku",
 			"anthropic:sonnet", "anthropic:opus", "anthropic:haiku",
 			// anthropic API versioned (bare + legacy colon-namespaced BYOK)
-			"claude-fable-5", "claude-sonnet-4-6", "claude-opus-4-7", "claude-haiku-4-5", "claude-sonnet-4-5",
-			"anthropic:claude-fable-5", "anthropic:claude-sonnet-4-6", "anthropic:claude-opus-4-7",
+			"claude-fable-5", "claude-sonnet-4-6", "claude-opus-4-7", "claude-opus-4-8", "claude-haiku-4-5", "claude-sonnet-4-5",
+			"anthropic:claude-fable-5", "anthropic:claude-sonnet-4-6", "anthropic:claude-opus-4-7", "anthropic:claude-opus-4-8",
 			"anthropic:claude-haiku-4-5", "anthropic:claude-sonnet-4-5",
 			// anthropic via platform proxy (namespaced)
-			"anthropic/claude-fable-5", "anthropic/claude-opus-4-7", "anthropic/claude-sonnet-4-6",
+			"anthropic/claude-fable-5", "anthropic/claude-opus-4-7", "anthropic/claude-opus-4-8", "anthropic/claude-sonnet-4-6",
 			// kimi (kimi-coding gateway, bare form only — colon-forms removed
 			// because claude-code's adapter cannot strip the moonshot: prefix;
 			// openclaw retains them natively, cp#521).
