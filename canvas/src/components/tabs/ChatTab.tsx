@@ -149,6 +149,21 @@ function MyChatPanel({ workspaceId, data }: Props) {
       if (!sending) return;
       setActivityLog((prev) => appendActivityLine(prev, entry));
     },
+    onRequestResponded: ({ status, responderType, title }) => {
+      // Only surface the USER's own decisions in My Chat — agent-side
+      // responses aren't the user's action (core#2636).
+      if (responderType !== "user") return;
+      const decision =
+        status === "approved" ? "approved" :
+        status === "rejected" ? "rejected" :
+        status === "done" ? "done" : null;
+      if (!decision) return;
+      const verb = decision === "approved" ? "approved" : decision === "rejected" ? "rejected" : "completed";
+      history.setMessages((prev) => [
+        ...prev,
+        { ...createMessage("system", `You ${verb}${title ? ` “${title}”` : " the request"}`), decision },
+      ]);
+    },
     onSendComplete: () => {
       if (sendingFromAPIRef.current) {
         releaseSendGuards();
@@ -480,6 +495,17 @@ function MyChatPanel({ workspaceId, data }: Props) {
           </div>
         )}
         {history.messages.map((msg) => (
+          msg.decision ? (
+            <div key={msg.id} className="flex justify-center my-1">
+              <div className={`text-[10px] px-2 py-0.5 rounded-full border ${
+                msg.decision === "rejected"
+                  ? "text-bad border-bad/40 bg-bad/10"
+                  : "text-good border-good/40 bg-good/10 dark:text-good"
+              }`}>
+                {msg.decision === "rejected" ? "✕" : "✓"} {msg.content}
+              </div>
+            </div>
+          ) : (
           <div key={msg.id} className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}>
             <div
               className={`max-w-[85%] rounded-lg px-3 py-2 text-xs ${
@@ -610,6 +636,7 @@ function MyChatPanel({ workspaceId, data }: Props) {
               </div>
             </div>
           </div>
+          )
         ))}
 
         {/* Thinking indicator — shows when this tab is awaiting a reply

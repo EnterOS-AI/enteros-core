@@ -465,6 +465,11 @@ func (s *RequestStore) Respond(ctx context.Context, id, action, responderType, r
 			"status":         status,
 			"responder_type": responderType,
 			"responder_id":   responderID,
+			// title + kind let the canvas render a live decision line in My
+			// Chat ("You approved 'X'") the moment a user responds, instead
+			// of the decision being invisible until a reload (core#2636).
+			"title": req.Title,
+			"kind":  req.Kind,
 		}); err != nil {
 			log.Printf("request: failed to broadcast responded for %s: %v", target, err)
 		}

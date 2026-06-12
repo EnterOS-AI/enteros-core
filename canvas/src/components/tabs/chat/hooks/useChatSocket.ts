@@ -10,6 +10,14 @@ export interface UseChatSocketCallbacks {
   onActivityLog?: (entry: string) => void;
   onSendComplete?: () => void;
   onSendError?: (error: string) => void;
+  /** A request the user (or an agent) responded to — drives the live
+   *  decision chip in My Chat (core#2636). */
+  onRequestResponded?: (p: {
+    status: string;
+    responderType: string;
+    title: string;
+    kind: string;
+  }) => void;
 }
 
 export function useChatSocket(
@@ -125,6 +133,17 @@ export function useChatSocket(
         if (task) {
           callbacksRef.current.onActivityLog?.(`⟳ ${task}`);
         }
+      } else if (
+        msg.event === "REQUEST_RESPONDED" &&
+        msg.workspace_id === workspaceId
+      ) {
+        const p = msg.payload || {};
+        callbacksRef.current.onRequestResponded?.({
+          status: (p.status as string) || "",
+          responderType: (p.responder_type as string) || "",
+          title: (p.title as string) || "",
+          kind: (p.kind as string) || "",
+        });
       }
     } catch {
       /* ignore */
