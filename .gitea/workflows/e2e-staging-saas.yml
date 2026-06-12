@@ -636,6 +636,7 @@ jobs:
   # concierge job) so a concierge failure can never mask this proof (CR2 +
   # Researcher review on #2660). Own throwaway org (e2e-req-*) with t.Cleanup
   # teardown; skips LOUD without staging creds.
+  # bp-required: pending #2619
   e2e-staging-workspace-requests:
     name: E2E Staging Workspace Requests (core#2606)
     runs-on: ubuntu-latest
