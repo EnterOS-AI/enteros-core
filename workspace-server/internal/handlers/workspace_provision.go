@@ -1006,21 +1006,15 @@ func effectiveModelForBilling(model string, envVars map[string]string) string {
 
 // applyPlatformManagedLLMEnv wires the control-plane LLM proxy into a
 // workspace only when the RESOLVED billing mode for this workspace is
-// platform_managed. "Resolved" means: the workspace-level override (if any)
-// wins over the org default (delivered via tenant_config in MOLECULE_LLM_BILLING_MODE).
+// platform_managed. "Resolved" is PER-WORKSPACE only: the workspace-level
+// override (if any) wins, else the mode is DERIVED from the workspace's
+// selected model/provider (platform-namespaced → platform_managed; a specific
+// vendor → byok). There is NO org-level billing mode (retired 2026-06-12); the
+// SSOT resolver (ResolveLLMBillingModeDerived) never reads any org input.
 //
-// Pre-internal#691 this gate read the org-level env var directly, which made
-// it impossible to mix billing modes across workspaces in the same org. The
-// resolver (ResolveLLMBillingMode) is the single source of truth now; the
-// architectural test asserts no remaining code path gates on os.Getenv
-// ("MOLECULE_LLM_BILLING_MODE") for strip-decision purposes — that env value
-// is still read INTO the resolver as the org-default input, but it is never
-// the final decision.
-//
-// Default-closed: any resolver error / NULL JOIN / garbled enum value
-// collapses to platform_managed (see llm_billing_mode.go for the contract).
-// This preserves the existing implicit default exactly while making the
-// per-workspace opt-out path safe.
+// Default-closed: any resolver error / garbled enum / underivable model
+// collapses to the deployment default (platform_managed when a proxy is wired,
+// byok on self-host — see llm_billing_mode.go).
 //
 // The resolved mode is exported into the workspace container as
 // MOLECULE_LLM_BILLING_MODE_RESOLVED so an in-container debug check can
@@ -1090,9 +1084,9 @@ func applyPlatformManagedLLMEnv(ctx context.Context, envVars map[string]string, 
 	// runtime + model + the workspace env, so it calls the DERIVED resolver
 	// directly (no DB round-trip for runtime/model). availableAuthEnv is the set
 	// of recognized provider auth-env-var NAMES present in envVars (the same
-	// disambiguation input the registry uses to split oauth-vs-api). The org-env
-	// MOLECULE_LLM_BILLING_MODE is NO LONGER read into the decision (retired).
-	orgMode := strings.ToLower(strings.TrimSpace(os.Getenv("MOLECULE_LLM_BILLING_MODE")))
+	// disambiguation input the registry uses to split oauth-vs-api). There is NO
+	// org-level billing mode input: the org-env MOLECULE_LLM_BILLING_MODE was
+	// fully retired (CTO 2026-06-12 — billing is per-workspace only).
 	availableAuthEnv := availableAuthEnvNames(envVars)
 	// molecule-core#1994: derive billing mode from the EFFECTIVE model, not the
 	// raw payload.Model. On a re-provision (restart/resume/auto-restart) the
@@ -1107,7 +1101,7 @@ func applyPlatformManagedLLMEnv(ctx context.Context, envVars map[string]string, 
 	// read-path's — keeping the two resolvers in parity (the #1994 regression
 	// guard test asserts this).
 	effectiveModel := effectiveModelForBilling(model, envVars)
-	res, resolveErr := ResolveLLMBillingModeDerived(ctx, workspaceID, runtime, effectiveModel, orgMode, availableAuthEnv)
+	res, resolveErr := ResolveLLMBillingModeDerived(ctx, workspaceID, runtime, effectiveModel, availableAuthEnv)
 	if resolveErr != nil {
 		// resolveErr != nil ⇒ resolver hit a DB error AND already defaulted
 		// res.ResolvedMode to platform_managed. Log + proceed; the safe default

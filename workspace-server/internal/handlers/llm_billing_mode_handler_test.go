@@ -35,14 +35,9 @@ const testWSID = "44444444-4444-4444-4444-444444444444"
 // read, and the workspace_secrets scan (for MODEL + auth-env names). model==""
 // means no MODEL secret row.
 func expectDeriveShimQueries(m sqlmock.Sqlmock, wsID, runtime, model string) {
-	nullOverride := func() {
-		m.ExpectQuery(`SELECT llm_billing_mode FROM workspaces WHERE id = \$1`).
-			WithArgs(wsID).
-			WillReturnRows(sqlmock.NewRows([]string{"llm_billing_mode"}).AddRow(nil))
-	}
-	// Order: override(NULL) shim check, runtime, secrets, override(NULL) again
-	// (the derived resolver re-checks the override as a complete SSOT).
-	nullOverride()
+	// Order: runtime, secrets, override(NULL). ResolveLLMBillingMode loads the
+	// derive inputs first, then ResolveLLMBillingModeDerived reads the override
+	// ONCE (the prior double-read was removed with the org-level path, 2026-06-12).
 	m.ExpectQuery(`SELECT runtime FROM workspaces WHERE id = \$1`).
 		WithArgs(wsID).
 		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow(runtime))
@@ -54,7 +49,9 @@ func expectDeriveShimQueries(m sqlmock.Sqlmock, wsID, runtime, model string) {
 	m.ExpectQuery(`SELECT key, encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1`).
 		WithArgs(wsID).
 		WillReturnRows(secretRows)
-	nullOverride()
+	m.ExpectQuery(`SELECT llm_billing_mode FROM workspaces WHERE id = \$1`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"llm_billing_mode"}).AddRow(nil))
 }
 
 // internal#718 P2-B + core#2608: with no workspace override and an unset org

@@ -28,7 +28,6 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"os"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -36,20 +35,18 @@ import (
 
 // GetWorkspaceLLMBillingMode handles GET /admin/workspaces/:id/llm-billing-mode.
 //
-// internal#718 P2-B: the resolution now DERIVES the provider from the
-// workspace's stored (runtime, model) via the registry (org rung retired). The
-// passed orgMode is ignored by the resolver; it is left here only to avoid
-// churning the call signature. The returned resolution matches what the
-// provision-time strip gate computes (same derived resolver), so operators see
-// the real platform-vs-byok decision + the derived provider in ProviderSelection.
+// Resolution DERIVES the provider from the workspace's stored (runtime, model)
+// via the registry — per-workspace only, no org-level billing mode (retired
+// 2026-06-12). The returned resolution matches what the provision-time strip
+// gate computes (same SSOT resolver), so operators see the real platform-vs-byok
+// decision + the derived provider in ProviderSelection.
 func GetWorkspaceLLMBillingMode(c *gin.Context) {
 	workspaceID := strings.TrimSpace(c.Param("id"))
 	if !uuidRegex.MatchString(workspaceID) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid workspace id"})
 		return
 	}
-	orgMode := strings.ToLower(strings.TrimSpace(os.Getenv("MOLECULE_LLM_BILLING_MODE")))
-	res, err := ResolveLLMBillingMode(c.Request.Context(), workspaceID, orgMode)
+	res, err := ResolveLLMBillingMode(c.Request.Context(), workspaceID)
 	if err != nil {
 		// Resolver returns a safe default-closed mode alongside the error;
 		// surface the error so the operator sees the DB issue, but the
@@ -140,8 +137,7 @@ func PutWorkspaceLLMBillingMode(c *gin.Context) {
 	}
 
 	// Read back the resolution so the response reflects post-write state.
-	orgMode := strings.ToLower(strings.TrimSpace(os.Getenv("MOLECULE_LLM_BILLING_MODE")))
-	res, resolveErr := ResolveLLMBillingMode(c.Request.Context(), workspaceID, orgMode)
+	res, resolveErr := ResolveLLMBillingMode(c.Request.Context(), workspaceID)
 	if resolveErr != nil {
 		// Write succeeded but readback failed — still return 200 with the
 		// best-effort resolution; the safe default is set even on error.

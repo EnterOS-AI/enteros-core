@@ -121,11 +121,9 @@ func TestApplyPlatformManagedLLMEnv_ReadProvisionParity(t *testing.T) {
 	const wsID = "6b66de8d-9337-4fb4-be8d-6d49dca0d809"
 
 	// ---- READ PATH ----
-	// ResolveLLMBillingMode reads in order: override (NULL) → runtime → secrets
-	// (MODEL=opus + the oauth key) → then ResolveLLMBillingModeDerived re-reads
-	// the override (NULL again).
+	// ResolveLLMBillingMode reads in order: runtime → secrets (MODEL=opus + the
+	// oauth key) → override (NULL, read once inside ResolveLLMBillingModeDerived).
 	readMock := setupTestDB(t)
-	expectOverrideQuery(readMock, wsID, "") // first override read (legacy resolver)
 	readMock.ExpectQuery(`SELECT runtime FROM workspaces WHERE id = \$1`).
 		WithArgs(wsID).
 		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("claude-code"))
@@ -134,9 +132,9 @@ func TestApplyPlatformManagedLLMEnv_ReadProvisionParity(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"key", "encrypted_value", "encryption_version"}).
 			AddRow("MODEL", []byte("opus"), 0).
 			AddRow("CLAUDE_CODE_OAUTH_TOKEN", []byte("RENO-OWN-OAUTH"), 0))
-	expectOverrideQuery(readMock, wsID, "") // second override read (derived resolver)
+	expectOverrideQuery(readMock, wsID, "") // override read (derived resolver)
 
-	readRes, err := ResolveLLMBillingMode(ctx, wsID, "")
+	readRes, err := ResolveLLMBillingMode(ctx, wsID)
 	if err != nil {
 		t.Fatalf("read-path resolve err: %v", err)
 	}

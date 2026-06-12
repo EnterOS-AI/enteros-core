@@ -255,20 +255,24 @@ func TestExtended_SecretsListEmpty(t *testing.T) {
 // ---------- TestSecretsSet (Extended) ----------
 
 func TestExtended_SecretsSet(t *testing.T) {
-	// internal#718 P2-B: the per-workspace strip gate keys off the DERIVED mode
-	// (org rung retired). This test's intent is the happy path of persisting a
-	// vendor key on a byok workspace; the realistic way a workspace is byok for
-	// a direct vendor-key write is an explicit operator override (the escape
-	// hatch the reject error itself points to: PUT /admin/.../llm-billing-mode).
-	// The override short-circuits the resolver to byok in a single read, so the
-	// bypass-list check is skipped and the write proceeds.
-	t.Setenv("MOLECULE_LLM_BILLING_MODE", "platform_managed") // org env ignored now
+	// The per-workspace key-write guard keys off the workspace's SELECTED model:
+	// a VENDOR model (kimi-for-coding → kimi-coding, IsPlatform=false) is a BYOK
+	// workspace, so writing a vendor key proceeds. Guard query order: runtime →
+	// secrets (MODEL) → (vendor only) override. (A platform model would block —
+	// see TestPlatformManagedLLMModeForWorkspace_GatesOnModelNotResolvedMode.)
 	mock := setupTestDB(t)
 	handler := NewSecretsHandler(nil)
 
+	mock.ExpectQuery(`SELECT runtime FROM workspaces WHERE id = \$1`).
+		WithArgs("22222222-2222-2222-2222-222222222222").
+		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("claude-code"))
+	mock.ExpectQuery(`SELECT key, encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1`).
+		WithArgs("22222222-2222-2222-2222-222222222222").
+		WillReturnRows(sqlmock.NewRows([]string{"key", "encrypted_value", "encryption_version"}).
+			AddRow("MODEL", []byte("kimi-for-coding"), 0))
 	mock.ExpectQuery(`SELECT llm_billing_mode FROM workspaces WHERE id = \$1`).
 		WithArgs("22222222-2222-2222-2222-222222222222").
-		WillReturnRows(sqlmock.NewRows([]string{"llm_billing_mode"}).AddRow(LLMBillingModeBYOK))
+		WillReturnRows(sqlmock.NewRows([]string{"llm_billing_mode"}).AddRow(nil))
 
 	// Expect INSERT (encrypted value is dynamic, use AnyArg)
 	mock.ExpectExec("INSERT INTO workspace_secrets").

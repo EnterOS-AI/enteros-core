@@ -1056,9 +1056,13 @@ func TestApplyPlatformManagedLLMEnv_ClaudeCodeUsesAnthropicProxyOverOAuth(t *tes
 	t.Setenv("MOLECULE_LLM_ANTHROPIC_BASE_URL", "https://api.example.test/api/v1/internal/llm/anthropic/v1")
 	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
 
+	// A PLATFORM-namespaced model id ⇒ the workspace SELECTED the Platform
+	// provider ⇒ platform_managed ⇒ the stray oauth is stripped and the proxy
+	// is injected. (A vendor model id would instead resolve byok and KEEP the
+	// oauth — covered by the byok tests.)
 	envVars := map[string]string{
 		"CLAUDE_CODE_OAUTH_TOKEN": "user-oauth-token",
-		"MODEL":                   "sonnet",
+		"MODEL":                   "anthropic/claude-sonnet-4-6",
 	}
 	applyPlatformManagedLLMEnv(context.Background(), envVars, "", "claude-code", "", nil)
 
@@ -1102,9 +1106,12 @@ func TestApplyPlatformManagedLLMEnv_ClaudeCodeStripsVendorBYOK(t *testing.T) {
 	t.Setenv("MOLECULE_LLM_ANTHROPIC_BASE_URL", "https://api.example.test/api/v1/internal/llm/anthropic/v1")
 	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
 
+	// A PLATFORM-namespaced model ⇒ platform_managed ⇒ a stray vendor key is
+	// stripped (the proxy is used). (If the workspace had SELECTED the MiniMax
+	// vendor model, it would resolve byok and KEEP its MiniMax key instead.)
 	envVars := map[string]string{
 		"MINIMAX_API_KEY": "user-minimax-key",
-		"MODEL":           "MiniMax-M2.7",
+		"MODEL":           "anthropic/claude-sonnet-4-6",
 	}
 	applyPlatformManagedLLMEnv(context.Background(), envVars, "", "claude-code", "", nil)
 

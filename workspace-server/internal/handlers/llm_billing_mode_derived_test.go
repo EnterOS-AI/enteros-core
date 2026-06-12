@@ -75,10 +75,10 @@ func TestResolveLLMBillingModeDerived_BehaviorDelta(t *testing.T) {
 			wantSource: BillingModeSourceDerivedProvider,
 		},
 		{
-			// NON-PLATFORM-DERIVED → byok (THE FIX). claude-code + the
-			// kimi-coding-native model derives to the non-platform kimi-coding
-			// provider → IsPlatform=false → byok. This is the Reno billing-leak
-			// class: pre-P2 it resolved platform_managed and ran on platform creds.
+			// NON-PLATFORM-DERIVED → byok (THE FIX). The workspace SELECTED a vendor
+			// model (kimi-for-coding → kimi-coding provider, IsPlatform=false) ⇒
+			// byok. The PROVIDER CHOICE is the signal — NOT key presence. Reno
+			// billing-leak class: pre-P2 this resolved platform_managed.
 			name:       "non_platform_derived_resolves_byok_THE_FIX",
 			runtime:    "claude-code",
 			model:      "kimi-for-coding",
@@ -87,7 +87,7 @@ func TestResolveLLMBillingModeDerived_BehaviorDelta(t *testing.T) {
 			wantSource: BillingModeSourceDerivedProvider,
 		},
 		{
-			// NON-PLATFORM vendor on codex: gpt-5.5 derives to `openai` (BYOK).
+			// NON-PLATFORM vendor on codex: gpt-5.5 → openai (vendor) → byok.
 			name:       "non_platform_openai_codex_byok",
 			runtime:    "codex",
 			model:      "gpt-5.5",
@@ -180,7 +180,7 @@ func TestResolveLLMBillingModeDerived_BehaviorDelta(t *testing.T) {
 			mock := setupTestDB(t)
 			expectOverrideQuery(mock, wsID, c.override)
 
-			res, err := ResolveLLMBillingModeDerived(ctx, wsID, c.runtime, c.model, "", c.authEnv)
+			res, err := ResolveLLMBillingModeDerived(ctx, wsID, c.runtime, c.model, c.authEnv)
 			if (err != nil) != c.wantErr {
 				t.Fatalf("err: got %v wantErr=%v", err, c.wantErr)
 			}
@@ -215,7 +215,7 @@ func TestResolveLLMBillingModeDerived_OverrideDBError_DefaultClosed(t *testing.T
 		WithArgs(wsID).
 		WillReturnError(errors.New("connection refused"))
 
-	res, err := ResolveLLMBillingModeDerived(ctx, wsID, "claude-code", "kimi-for-coding", "", nil)
+	res, err := ResolveLLMBillingModeDerived(ctx, wsID, "claude-code", "kimi-for-coding", nil)
 	if err == nil {
 		t.Fatalf("expected propagated DB error, got nil")
 	}
@@ -228,18 +228,20 @@ func TestResolveLLMBillingModeDerived_OverrideDBError_DefaultClosed(t *testing.T
 }
 
 // TestResolveLLMBillingModeDerived_EmptyWorkspaceID_PlatformDefault asserts the
-// pre-provision context (no workspace id, no override read) defaults to
-// platform_managed without a DB query.
+// pre-provision context (no workspace id, no override read) with NO model to
+// derive defaults to platform_managed without a DB query. (With a vendor model,
+// the pre-provision path derives byok like any other — that is the SELECTED
+// provider speaking; this test pins the no-model deployment default.)
 func TestResolveLLMBillingModeDerived_EmptyWorkspaceID_PlatformDefault(t *testing.T) {
 	withProxyConfigured(t) // SaaS context.
 	ctx := context.Background()
 	mock := setupTestDB(t) // no query expected
-	res, err := ResolveLLMBillingModeDerived(ctx, "", "claude-code", "kimi-for-coding", "", nil)
+	res, err := ResolveLLMBillingModeDerived(ctx, "", "claude-code", "", nil)
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
 	if res.ResolvedMode != LLMBillingModePlatformManaged {
-		t.Errorf("empty workspace id must default platform_managed, got %q", res.ResolvedMode)
+		t.Errorf("empty workspace id, no model must default platform_managed, got %q", res.ResolvedMode)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("sqlmock expectations: %v", err)
@@ -265,7 +267,7 @@ func TestResolveLLMBillingModeDerived_SelfHost_DefaultsBYOK(t *testing.T) {
 	t.Run("unset_model_defaults_byok_on_selfhost", func(t *testing.T) {
 		mock := setupTestDB(t)
 		expectOverrideQuery(mock, wsID, "") // NULL override
-		res, err := ResolveLLMBillingModeDerived(ctx, wsID, "claude-code", "", "", nil)
+		res, err := ResolveLLMBillingModeDerived(ctx, wsID, "claude-code", "", nil)
 		if err != nil {
 			t.Fatalf("unexpected err: %v", err)
 		}
@@ -283,7 +285,7 @@ func TestResolveLLMBillingModeDerived_SelfHost_DefaultsBYOK(t *testing.T) {
 	t.Run("unregistered_model_defaults_byok_on_selfhost", func(t *testing.T) {
 		mock := setupTestDB(t)
 		expectOverrideQuery(mock, wsID, "")
-		res, err := ResolveLLMBillingModeDerived(ctx, wsID, "claude-code", "totally-made-up-model-xyz", "", nil)
+		res, err := ResolveLLMBillingModeDerived(ctx, wsID, "claude-code", "totally-made-up-model-xyz", nil)
 		if err != nil {
 			t.Fatalf("unexpected err: %v", err)
 		}
@@ -300,7 +302,7 @@ func TestResolveLLMBillingModeDerived_SelfHost_DefaultsBYOK(t *testing.T) {
 
 	t.Run("empty_workspace_id_defaults_byok_on_selfhost", func(t *testing.T) {
 		mock := setupTestDB(t) // no query expected (pre-provision path)
-		res, err := ResolveLLMBillingModeDerived(ctx, "", "claude-code", "kimi-for-coding", "", nil)
+		res, err := ResolveLLMBillingModeDerived(ctx, "", "claude-code", "kimi-for-coding", nil)
 		if err != nil {
 			t.Fatalf("unexpected err: %v", err)
 		}
@@ -317,7 +319,7 @@ func TestResolveLLMBillingModeDerived_SelfHost_DefaultsBYOK(t *testing.T) {
 		// no-proxy default only governs the derive-failure fallback.
 		mock := setupTestDB(t)
 		expectOverrideQuery(mock, wsID, LLMBillingModePlatformManaged)
-		res, err := ResolveLLMBillingModeDerived(ctx, wsID, "claude-code", "", "", nil)
+		res, err := ResolveLLMBillingModeDerived(ctx, wsID, "claude-code", "", nil)
 		if err != nil {
 			t.Fatalf("unexpected err: %v", err)
 		}
@@ -333,83 +335,69 @@ func TestResolveLLMBillingModeDerived_SelfHost_DefaultsBYOK(t *testing.T) {
 	})
 }
 
-// TestResolveLLMBillingModeDerived_OrgDefaultWins asserts that a recognized
-// org default (delivered via MOLECULE_LLM_BILLING_MODE / tenant_config) takes
-// precedence over provider derivation when no workspace override exists. This
-// closes core#2608: fresh SaaS tenants with org default platform_managed failed
-// concierge provision because a non-platform-derived model flipped the workspace
-// to byok before any credential existed.
-func TestResolveLLMBillingModeDerived_OrgDefaultWins(t *testing.T) {
-	withProxyConfigured(t) // SaaS context.
+// TestResolveLLMBillingModeDerived_PerWorkspaceNoOrgDefault is the SSOT
+// regression after the org-level billing mode was fully removed (CTO
+// 2026-06-12). Billing is decided per-workspace ONLY: explicit override →
+// derive from model → deployment default-closed. There is NO org default
+// anywhere. On SaaS (proxy wired) a keyless vendor-model workspace "defaults to
+// platform" via the DEPLOYMENT fact PlatformManagedProxyConfigured(), not via
+// an org setting.
+func TestResolveLLMBillingModeDerived_PerWorkspaceNoOrgDefault(t *testing.T) {
+	withProxyConfigured(t) // SaaS context: PlatformManagedProxyConfigured() == true.
 	ctx := context.Background()
 	const wsID = "66666666-6666-6666-6666-666666666666"
 
-	t.Run("org_platform_managed_wins_over_non_platform_derive", func(t *testing.T) {
+	t.Run("vendor_model_is_byok_regardless_of_key", func(t *testing.T) {
+		// kimi-for-coding → kimi-coding vendor (IsPlatform=false) ⇒ byok. The
+		// SELECTED provider is the signal — NO key-presence check (a byok ws with
+		// no usable cred fails closed later at provision, which is correct).
 		mock := setupTestDB(t)
 		expectOverrideQuery(mock, wsID, "") // NULL override
-		res, err := ResolveLLMBillingModeDerived(ctx, wsID, "claude-code", "kimi-for-coding", LLMBillingModePlatformManaged, nil)
+		res, err := ResolveLLMBillingModeDerived(ctx, wsID, "claude-code", "kimi-for-coding", nil)
+		if err != nil {
+			t.Fatalf("unexpected err: %v", err)
+		}
+		if res.ResolvedMode != LLMBillingModeBYOK {
+			t.Errorf("vendor model: got %q want byok", res.ResolvedMode)
+		}
+		if res.Source != BillingModeSourceDerivedProvider {
+			t.Errorf("source: got %q want %q", res.Source, BillingModeSourceDerivedProvider)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("sqlmock expectations: %v", err)
+		}
+	})
+
+	t.Run("platform_model_is_platform_managed", func(t *testing.T) {
+		mock := setupTestDB(t)
+		expectOverrideQuery(mock, wsID, "") // NULL override
+		res, err := ResolveLLMBillingModeDerived(ctx, wsID, "claude-code", "anthropic/claude-opus-4-7", nil)
 		if err != nil {
 			t.Fatalf("unexpected err: %v", err)
 		}
 		if res.ResolvedMode != LLMBillingModePlatformManaged {
-			t.Errorf("org default platform_managed: got %q want platform_managed", res.ResolvedMode)
-		}
-		if res.Source != BillingModeSourceOrgDefault {
-			t.Errorf("source: got %q want %q", res.Source, BillingModeSourceOrgDefault)
-		}
-		if err := mock.ExpectationsWereMet(); err != nil {
-			t.Errorf("sqlmock expectations: %v", err)
-		}
-	})
-
-	t.Run("org_byok_wins_over_platform_derive", func(t *testing.T) {
-		mock := setupTestDB(t)
-		expectOverrideQuery(mock, wsID, "") // NULL override
-		res, err := ResolveLLMBillingModeDerived(ctx, wsID, "claude-code", "anthropic/claude-opus-4-7", LLMBillingModeBYOK, nil)
-		if err != nil {
-			t.Fatalf("unexpected err: %v", err)
-		}
-		if res.ResolvedMode != LLMBillingModeBYOK {
-			t.Errorf("org default byok: got %q want byok", res.ResolvedMode)
-		}
-		if res.Source != BillingModeSourceOrgDefault {
-			t.Errorf("source: got %q want %q", res.Source, BillingModeSourceOrgDefault)
-		}
-		if err := mock.ExpectationsWereMet(); err != nil {
-			t.Errorf("sqlmock expectations: %v", err)
-		}
-	})
-
-	t.Run("workspace_override_still_wins_over_org_default", func(t *testing.T) {
-		mock := setupTestDB(t)
-		expectOverrideQuery(mock, wsID, LLMBillingModeBYOK)
-		res, err := ResolveLLMBillingModeDerived(ctx, wsID, "claude-code", "anthropic/claude-opus-4-7", LLMBillingModePlatformManaged, nil)
-		if err != nil {
-			t.Fatalf("unexpected err: %v", err)
-		}
-		if res.ResolvedMode != LLMBillingModeBYOK {
-			t.Errorf("workspace override must beat org default: got %q want byok", res.ResolvedMode)
-		}
-		if res.Source != BillingModeSourceWorkspaceOverride {
-			t.Errorf("source: got %q want %q", res.Source, BillingModeSourceWorkspaceOverride)
-		}
-		if err := mock.ExpectationsWereMet(); err != nil {
-			t.Errorf("sqlmock expectations: %v", err)
-		}
-	})
-
-	t.Run("unrecognized_org_default_ignored", func(t *testing.T) {
-		mock := setupTestDB(t)
-		expectOverrideQuery(mock, wsID, "") // NULL override
-		res, err := ResolveLLMBillingModeDerived(ctx, wsID, "claude-code", "kimi-for-coding", "not-a-real-mode", nil)
-		if err != nil {
-			t.Fatalf("unexpected err: %v", err)
-		}
-		if res.ResolvedMode != LLMBillingModeBYOK {
-			t.Errorf("unrecognized org default ignored: got %q want byok", res.ResolvedMode)
+			t.Errorf("platform model: got %q want platform_managed", res.ResolvedMode)
 		}
 		if res.Source != BillingModeSourceDerivedProvider {
 			t.Errorf("source: got %q want %q", res.Source, BillingModeSourceDerivedProvider)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("sqlmock expectations: %v", err)
+		}
+	})
+
+	t.Run("explicit_workspace_override_wins", func(t *testing.T) {
+		mock := setupTestDB(t)
+		expectOverrideQuery(mock, wsID, LLMBillingModeBYOK)
+		res, err := ResolveLLMBillingModeDerived(ctx, wsID, "claude-code", "anthropic/claude-opus-4-7", nil)
+		if err != nil {
+			t.Fatalf("unexpected err: %v", err)
+		}
+		if res.ResolvedMode != LLMBillingModeBYOK {
+			t.Errorf("workspace override must win: got %q want byok", res.ResolvedMode)
+		}
+		if res.Source != BillingModeSourceWorkspaceOverride {
+			t.Errorf("source: got %q want %q", res.Source, BillingModeSourceWorkspaceOverride)
 		}
 		if err := mock.ExpectationsWereMet(); err != nil {
 			t.Errorf("sqlmock expectations: %v", err)

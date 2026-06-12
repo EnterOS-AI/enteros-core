@@ -575,25 +575,33 @@ func TestEnsureConciergeModel_SeedsEnvAndPersistsWhenAbsent(t *testing.T) {
 	}
 }
 
-// TestEnsureConciergeModel_SkipsWriteWhenAlreadyCorrect verifies the idempotent
-// path: when the stored MODEL already equals the declared model, no write fires
-// (env is still seeded). encryption_version=0 = raw bytes (crypto disabled in test).
-func TestEnsureConciergeModel_SkipsWriteWhenAlreadyCorrect(t *testing.T) {
+// TestEnsureConciergeModel_RespectsExistingModel is the SEED-ONLY regression
+// guard (CTO 2026-06-12): when a MODEL secret already exists — ESPECIALLY a
+// DIFFERENT, customer-picked one (e.g. they switched the concierge to
+// kimi-for-coding for BYOK) — ensureConciergeModel must NOT touch it: no write,
+// and it must NOT force the declared default back into the env. Pre-fix it
+// re-asserted conciergeDeclaredModel on every provision, silently reverting the
+// customer's choice. encryption_version=0 = raw bytes (crypto disabled in test).
+func TestEnsureConciergeModel_RespectsExistingModel(t *testing.T) {
 	mock := setupTestDB(t)
 	const wsID = "concierge-ws-2"
+	const customerModel = "kimi-for-coding" // the customer's explicit pick
 
 	mock.ExpectQuery(`SELECT encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1 AND key = 'MODEL'`).
 		WithArgs(wsID).
 		WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}).
-			AddRow([]byte(conciergeDeclaredModel), 0))
-	// NO ExpectExec — a write here would be an unmet/unexpected expectation.
+			AddRow([]byte(customerModel), 0))
+	// NO ExpectExec — any write would be an unmet/unexpected expectation.
 
 	h := &WorkspaceHandler{}
 	envVars := map[string]string{}
 	h.ensureConciergeModel(context.Background(), wsID, envVars)
 
-	if got := envVars["MODEL"]; got != conciergeDeclaredModel {
-		t.Errorf("MODEL env = %q, want %q", got, conciergeDeclaredModel)
+	// Must NOT have overwritten the env with the declared default — the customer's
+	// stored model wins and is wired by loadWorkspaceSecrets/applyRuntimeModelEnv,
+	// not by this seed-only helper.
+	if got := envVars["MODEL"]; got == conciergeDeclaredModel {
+		t.Errorf("MODEL env was forced to the declared default %q — must respect the customer's stored %q", conciergeDeclaredModel, customerModel)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations: %v", err)
