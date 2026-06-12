@@ -56,6 +56,45 @@ func TestWorkspaceCanRaiseTaskAndApprovalToUser(t *testing.T) {
 	t.Logf("both task + approval from a normal workspace surfaced in the org pending view ✓")
 }
 
+// TestExternalRuntimeWorkspaceCanRaiseTaskAndApproval is the EXTERNAL-runtime
+// half of the core#2606 coverage: the request/approval surface is SSOT-shared,
+// so a workspace on a NON-claude-code runtime (here codex, on the cheap
+// platform model openai/gpt-5.4-mini) must be able to raise a task AND an
+// approval into the user's unified inbox via the SAME wsAuth-gated
+// POST /workspaces/:id/requests endpoint. This closes the gap left by
+// TestWorkspaceCanRaiseTaskAndApprovalToUser (which only covered a normal
+// claude-code workspace) and proves the endpoint is runtime-agnostic — exactly
+// the "external + platform workspaces just inherit it SSOT-ly" design.
+func TestExternalRuntimeWorkspaceCanRaiseTaskAndApproval(t *testing.T) {
+	cfg := requireStagingEnv(t)
+	slug := fmt.Sprintf("e2e-extreq-%d", time.Now().Unix()%100000000)
+	t.Logf("external-runtime requests: slug=%s", slug)
+
+	orgID := adminCreateOrg(t, cfg, slug)
+	t.Cleanup(func() { adminDeleteTenant(t, cfg, slug) })
+	adminToken := tenantAdminToken(t, cfg, slug)
+	tenantHost := slug + "." + cfg.subdomainSuffix
+	waitForHTTP(t, tenantHost, http.StatusOK, 10*time.Minute, "tenant /health ready")
+
+	// An EXTERNAL runtime workspace (codex) on the cheapest platform model.
+	wsID := tenantCreateWorkspaceWithRuntime(t, cfg, tenantHost, adminToken, orgID, "ext-codex", "codex", "openai/gpt-5.4-mini")
+	t.Logf("external (codex) workspace created: %s", wsID)
+
+	// The request is raised against the wsAuth endpoint with the workspace's own
+	// token — no runtime boot required; the endpoint is what the SSOT a2a-bridge
+	// create_request/create_approval tools call regardless of runtime.
+	wsToken := mintWorkspaceToken(t, cfg, tenantHost, adminToken, orgID, wsID)
+
+	taskTitle := "e2e-2606 ext task " + slug
+	apprTitle := "e2e-2606 ext approval " + slug
+	raiseRequest(t, tenantHost, wsToken, orgID, wsID, "task", taskTitle)
+	raiseRequest(t, tenantHost, wsToken, orgID, wsID, "approval", apprTitle)
+
+	requirePending(t, tenantHost, adminToken, orgID, "task", taskTitle)
+	requirePending(t, tenantHost, adminToken, orgID, "approval", apprTitle)
+	t.Logf("both task + approval from an EXTERNAL (codex) workspace surfaced in the org pending view ✓")
+}
+
 // mintWorkspaceToken mints a workspace-scoped bearer via the admin surface.
 func mintWorkspaceToken(t *testing.T, cfg stagingCfg, host, adminToken, orgID, wsID string) string {
 	t.Helper()
