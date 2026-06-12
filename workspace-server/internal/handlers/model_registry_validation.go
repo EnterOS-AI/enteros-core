@@ -218,6 +218,15 @@ func validateBYOKCredentialSatisfiable(ctx context.Context, runtime, model strin
 	if prov.IsPlatform() {
 		return true, ""
 	}
+	// Atomic byok create: a payload secret the derived arm accepts satisfies
+	// the gate outright — no DB work (create(model, secrets) stays one call).
+	for _, want := range prov.AuthEnv {
+		for _, have := range payloadSecretKeys {
+			if have == want {
+				return true, ""
+			}
+		}
+	}
 	// BYOK-derived: widen the auth context with the tenant's global secret
 	// KEYS (names only, never values) and re-derive — a global key can both
 	// flip the arm disambiguation and satisfy the requirement. A failed key

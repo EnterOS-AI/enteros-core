@@ -522,11 +522,9 @@ func TestWorkspaceCreate_SecretPersistFails_RollsBack(t *testing.T) {
 	mock.ExpectBegin()
 	mock.ExpectExec("INSERT INTO workspaces").
 		WillReturnResult(sqlmock.NewResult(0, 1))
-	// Create() resolves billing mode per-workspace before the secret-strip gate.
-	// An explicit byok override short-circuits the resolver (precedence 1) so the
-	// OPENAI_API_KEY write is allowed and reaches the INSERT-and-fail path.
-	mock.ExpectQuery(`SELECT llm_billing_mode FROM workspaces WHERE id = \$1`).
-		WillReturnRows(sqlmock.NewRows([]string{"llm_billing_mode"}).AddRow(LLMBillingModeBYOK))
+	// core#2608 create-scope guard: the byok-form payload model derives a
+	// non-platform arm from CREATE inputs (no DB read), so the vendor-key
+	// write is allowed and reaches the INSERT-and-fail path directly.
 	mock.ExpectExec("INSERT INTO workspace_secrets").
 		WillReturnError(sql.ErrConnDone) // DB failure while writing secret
 	mock.ExpectRollback() // workspace insert must be rolled back
