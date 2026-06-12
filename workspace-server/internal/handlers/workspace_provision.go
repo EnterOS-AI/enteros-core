@@ -1204,6 +1204,12 @@ func applyPlatformManagedLLMEnv(ctx context.Context, envVars map[string]string, 
 	if runtimeUsesAnthropicNativeProxy(runtime) && anthropicBaseURL != "" {
 		envVars["ANTHROPIC_API_KEY"] = token
 		envVars["ANTHROPIC_BASE_URL"] = anthropicBaseURL
+		// CP#752 WS1b: claude-code uses the Anthropic CLI/SDK's
+		// ANTHROPIC_CUSTOM_HEADERS env var to attach per-workspace
+		// attribution headers on every proxied LLM call. The CP proxy
+		// (internal/handlers/llm_proxy.go resolveLLMProxyPrincipal)
+		// verifies the workspace id against the org; mismatch → 401.
+		envVars["ANTHROPIC_CUSTOM_HEADERS"] = fmt.Sprintf("X-Molecule-Workspace-Id: %s", workspaceID)
 	}
 
 	// core#2594: the MOLECULE_LLM_DEFAULT_MODEL env fail-open was REMOVED here.
