@@ -1282,7 +1282,7 @@ print(json.dumps({
 ")
 KA_TMP=$(mktemp -t known_answer_a2a.XXXXXX)
 KA_RESP=""
-for KA_ATTEMPT in $(seq 1 6); do
+for KA_ATTEMPT in $(seq 1 12); do
   : >"$KA_TMP"
   set +e
   KA_CODE=$(tenant_call POST "/workspaces/$PARENT_ID/a2a" \
@@ -1319,11 +1319,22 @@ except Exception:
   # cold-start PONG probe (line ~800) and the delegation loop (line ~1234) already
   # do. Without it, a single un-retried edge 502 right after a healthy round-trip
   # fell through to break and failed the gate on the first attempt (Platform Boot
-  # job, task 268859). Bounded by the existing 6-attempt / sleep-10 loop — no new
-  # sleep-as-fix; this only widens the transient-match to the sibling pattern.
-  if { echo "$KA_CODE" | grep -Eq '^(202|502|503|504)$'; } && echo "$KA_SAFE_BODY" | grep -Eqi 'Service Unavailable|Bad Gateway|Gateway Timeout|error code: 502|error code: 504|workspace agent unreachable|connection refused|no healthy upstream|workspace agent busy|native_session|queued'; then
-    log "    known-answer A2A transient $KA_CODE attempt $KA_ATTEMPT/6: $KA_SAFE_BODY"
-    if [ "$KA_ATTEMPT" -lt 6 ]; then sleep 10; continue; fi
+  # job, task 268859).
+  #
+  # 12 attempts / variable backoff mirrors the PONG probe above: a 502/503 from
+  # the proxy often means the container is being restarted (maybeMarkContainerDead
+  # path), and that restart can take 60-90s. The previous 6-attempt / 10s-fixed
+  # budget exhausted before the workspace came back (run 354601/job 480116).
+  if { echo "$KA_CODE" | grep -Eq '^(202|502|503|504)$'; } && echo "$KA_SAFE_BODY" | grep -Eqi 'Service Unavailable|Bad Gateway|Gateway Timeout|error code: 502|error code: 504|workspace agent unreachable|connection refused|no healthy upstream|workspace agent busy|native_session|queued|restarting|restart triggered'; then
+    log "    known-answer A2A transient $KA_CODE attempt $KA_ATTEMPT/12: $KA_SAFE_BODY"
+    if [ "$KA_ATTEMPT" -lt 12 ]; then
+      KA_SLEEP=10
+      if echo "$KA_SAFE_BODY" | grep -Eqi 'workspace agent busy|native_session|restarting|restart triggered'; then
+        KA_SLEEP=30
+      fi
+      sleep "$KA_SLEEP"
+      continue
+    fi
   fi
   break
 done
