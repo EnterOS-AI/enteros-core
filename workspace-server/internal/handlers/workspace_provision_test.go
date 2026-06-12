@@ -605,9 +605,9 @@ func TestEnsureDefaultConfig_ModelAlwaysTopLevel(t *testing.T) {
 				Model:   "test-model",
 			}
 			files, err := handler.ensureDefaultConfig("ws-"+runtime, payload)
-	if err != nil {
-		t.Fatalf("ensureDefaultConfig failed: %v", err)
-	}
+			if err != nil {
+				t.Fatalf("ensureDefaultConfig failed: %v", err)
+			}
 			configYAML := string(files["config.yaml"])
 			if !contains(configYAML, `model: "test-model"`) {
 				t.Errorf("config.yaml missing top-level (quoted) model for runtime %s, got:\n%s", runtime, configYAML)
@@ -1645,6 +1645,9 @@ func TestProvisionWorkspaceCP_NoInternalErrorsInBroadcast(t *testing.T) {
 		Name:    "ws-cp-1206",
 		Tier:    1,
 		Runtime: "claude-code",
+		// core#2594: a model is required — the provision gate fails closed
+		// without one. This test exercises a downstream path, so just supply one.
+		Model: "anthropic:claude-opus-4-7",
 	})
 
 	if cap.lastData == nil {
@@ -1858,6 +1861,9 @@ func TestProvisionWorkspaceCP_InstanceIDPersistFail_MarksFailed(t *testing.T) {
 		Name:    "ws-cp-orphan",
 		Tier:    1,
 		Runtime: "claude-code",
+		// core#2594: a model is required — the provision gate fails closed
+		// without one. This test exercises a downstream path, so just supply one.
+		Model: "anthropic:claude-opus-4-7",
 	})
 
 	if cap.lastData == nil {
@@ -1937,6 +1943,9 @@ func TestProvisionWorkspaceCP_InstanceIDPersistFail_RetrySucceeds(t *testing.T) 
 		Name:    "ws-cp-retry-ok",
 		Tier:    1,
 		Runtime: "claude-code",
+		// core#2594: a model is required — the provision gate fails closed
+		// without one. This test exercises a downstream path, so just supply one.
+		Model: "anthropic:claude-opus-4-7",
 	})
 
 	// No failure broadcast should have fired.

@@ -157,6 +157,7 @@ func TestProvisionWorkspaceCP_ConcurrentBurst_NoSilentDrop(t *testing.T) {
 				Name:    wsID,
 				Tier:    1,
 				Runtime: "claude-code",
+				Model:   "anthropic:claude-opus-4-7", // core#2594: model required by provision gate
 			})
 		}()
 	}

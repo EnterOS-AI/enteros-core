@@ -1206,14 +1206,21 @@ func applyPlatformManagedLLMEnv(ctx context.Context, envVars map[string]string, 
 		envVars["ANTHROPIC_BASE_URL"] = anthropicBaseURL
 	}
 
-	if model == "" && strings.TrimSpace(envVars["MOLECULE_MODEL"]) == "" && strings.TrimSpace(envVars["MODEL"]) == "" {
-		if defaultModel := strings.TrimSpace(os.Getenv("MOLECULE_LLM_DEFAULT_MODEL")); defaultModel != "" {
-			envVars["MOLECULE_MODEL"] = defaultModel
-		}
-	}
+	// core#2594: the MOLECULE_LLM_DEFAULT_MODEL env fail-open was REMOVED here.
+	// It silently injected MOLECULE_MODEL when a workspace reached provision with
+	// no resolvable model — an opaque, server-env-sourced substitution that hid
+	// the missing model (the concierge ran on it; see conciergeDeclaredModel).
+	// Per the CTO SSOT directive (2026-05-22, models/runtime_defaults.go) the
+	// platform must not default a workspace's model. Resolution is now stored-only
+	// (create requires it; the concierge declares its own); a workspace that still
+	// has no MOLECULE_MODEL/MODEL after all model-setting fails CLOSED at the
+	// universal MISSING_MODEL gate in prepareProvisionContext rather than letting
+	// the runtime pick its hardcoded anthropic:claude-opus-4-7 fallback.
+	//
 	// platform_managed: the CP proxy usage token (injected as ANTHROPIC_API_KEY
 	// / OPENAI_API_KEY above) IS the usable credential, so the workspace is
-	// never fail-closed on this path.
+	// never fail-closed on the CREDENTIAL axis on this path; the model axis is
+	// gated separately below.
 	return platformLLMEnvResult{ResolvedMode: res.ResolvedMode, HasUsableLLMCred: true, Source: res.Source}
 }
 

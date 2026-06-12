@@ -577,7 +577,7 @@ func TestSecretsDelete_AutoRestart(t *testing.T) {
 
 // ==================== GetModel ====================
 
-func TestSecretsGetModel_Default(t *testing.T) {
+func TestSecretsGetModel_Unresolved(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
 	handler := NewSecretsHandler(nil)
@@ -607,8 +607,11 @@ func TestSecretsGetModel_Default(t *testing.T) {
 	if resp["model"] != "" {
 		t.Errorf("expected empty model, got %v", resp["model"])
 	}
-	if resp["source"] != "default" {
-		t.Errorf("expected source 'default', got %v", resp["source"])
+	// core#2594: an absent MODEL secret is "unresolved", not "default" — the
+	// platform no longer substitutes a default model, so the empty state is
+	// reported truthfully (the workspace will fail closed at provision).
+	if resp["source"] != "unresolved" {
+		t.Errorf("expected source 'unresolved', got %v", resp["source"])
 	}
 
 	if err := mock.ExpectationsWereMet(); err != nil {

@@ -221,6 +221,38 @@ func TestConciergePlatformAgent_Staging(t *testing.T) {
 		t.Logf("kind discriminator correct on list + single for concierge and ordinary ws")
 	})
 
+	// ── Feature 2b: model endpoint contract (core#2594) ──────────────────────
+	t.Run("concierge_model_endpoint_contract", func(t *testing.T) {
+		// GET /workspaces/:id/model must return 200 with a "source" field on the
+		// concierge. core#2594 changed the empty-state source from "default" to
+		// "unresolved" (the platform no longer substitutes a default model); when
+		// the concierge has been provisioned it instead reports its declared model
+		// from workspace_secrets. This is a boot-free contract pin — the RESOLVED
+		// value (model == the declared model after a provision) is verified live
+		// post-deploy, not here, to avoid coupling CI to a concierge container
+		// boot (the cp#245 boot-timeout flake class).
+		hs, body := doTenantJSON(t, "GET", "https://"+host+"/workspaces/"+platformID+"/model", token, orgID, "")
+		if hs != http.StatusOK {
+			t.Fatalf("GET /workspaces/%s/model: HTTP %d (want 200): %s", platformID, hs, body)
+		}
+		src := jsonField(body, "source")
+		if src == "" {
+			t.Fatalf("GET /model returned 200 but no 'source' field: %s", body)
+		}
+		// Must be one of the two legitimate sources — and crucially NOT the
+		// retired "default" (which implied a silent fallback that no longer exists).
+		if src != "unresolved" && src != "workspace_secrets" {
+			t.Fatalf("GET /model source=%q — want 'unresolved' (not yet provisioned) or "+
+				"'workspace_secrets' (declared model persisted); 'default' was retired in core#2594: %s", src, body)
+		}
+		// If a model IS reported, the source must be the stored secret (never a
+		// guessed default) — fail-closed visibility.
+		if m := jsonField(body, "model"); m != "" && src != "workspace_secrets" {
+			t.Fatalf("GET /model reports model=%q but source=%q (a non-empty model must come from workspace_secrets): %s", m, src, body)
+		}
+		t.Logf("concierge /model contract OK (source=%q, model=%q)", src, jsonField(body, "model"))
+	})
+
 	// ── Feature 4: discovery peers admin auth (regression guard) ─────────────
 	t.Run("peers_admin_auth", func(t *testing.T) {
 		// The operator/tenant admin token MUST authenticate the platform agent's

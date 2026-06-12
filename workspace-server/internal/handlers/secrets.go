@@ -735,7 +735,16 @@ func (h *SecretsHandler) GetModel(c *gin.Context) {
 		`SELECT encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = $1 AND key = 'MODEL'`,
 		workspaceID).Scan(&modelBytes, &modelVersion)
 	if err == sql.ErrNoRows {
-		c.JSON(http.StatusOK, gin.H{"model": "", "source": "default"})
+		// core#2594: no stored model. Report source "unresolved" — NOT "default":
+		// the platform no longer provides a default model (the
+		// MOLECULE_LLM_DEFAULT_MODEL fail-open was removed), so an empty MODEL
+		// secret means the effective model is genuinely unresolved and the
+		// workspace will fail closed at provision rather than run an opaque
+		// default. "default" implied a silent fallback that no longer exists and
+		// misled the canvas Config tab into showing a blank as if intentional.
+		// (A correctly-provisioned concierge stores its declared model, so this
+		// branch is the genuine "model not set" state, surfaced truthfully.)
+		c.JSON(http.StatusOK, gin.H{"model": "", "source": "unresolved"})
 		return
 	}
 	if err != nil {
