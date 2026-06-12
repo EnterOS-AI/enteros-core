@@ -94,7 +94,7 @@ export function WorkspaceNode({ id, data }: NodeProps<Node<WorkspaceNodeData>>) 
     <div
       role="button"
       tabIndex={0}
-      data-testid="workspace-node"
+      data-testid={`workspace-node-${data.name}`}
       aria-label={
         isMisconfigured && configurationError
           ? `${data.name} workspace — agent not configured: ${configurationError}`

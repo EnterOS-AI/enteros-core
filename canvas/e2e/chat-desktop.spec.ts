@@ -48,11 +48,7 @@ test.describe("Desktop ChatTab", () => {
     // view and renders a matching wsName div, so an unscoped getByText
     // .first() can resolve to the invisible concierge node (DOM-order
     // dependent → alternating green/red on main).
-    await page
-      .locator(".react-flow__node")
-      .getByText(workspaceName, { exact: true })
-      .first()
-      .click();
+    await page.getByTestId(`workspace-node-${workspaceName}`).click();
     // Wait for the side panel chat tab to be clickable, then click it.
     await page.locator('#tab-chat').click();
     // All chat selectors are scoped to #panel-chat (the map SidePanel
@@ -90,11 +86,7 @@ test.describe("Desktop ChatTab", () => {
     await page.reload();
     await enterMapView(page);
     await page.waitForSelector(".react-flow__node", { timeout: 10_000 });
-    await page
-      .locator(".react-flow__node")
-      .getByText(workspaceName, { exact: true })
-      .first()
-      .click();
+    await page.getByTestId(`workspace-node-${workspaceName}`).click();
     await page.locator('#tab-chat').click();
     await page.waitForSelector("#panel-chat [data-testid='chat-panel']", { timeout: 5_000 });
     // Wait for the workspace status to flip to online and the textarea to be enabled.
@@ -175,11 +167,7 @@ test.describe("Desktop ChatTab — Markdown rendering", () => {
     if (await skipGuide2.isVisible().catch(() => false)) {
       await skipGuide2.click();
     }
-    await page
-      .locator(".react-flow__node")
-      .getByText(workspaceName, { exact: true })
-      .first()
-      .click();
+    await page.getByTestId(`workspace-node-${workspaceName}`).click();
     await page.locator('#tab-chat').click();
     await page.waitForSelector("#panel-chat [data-testid='chat-panel']", { timeout: 5_000 });
     // Wait for the workspace status to flip to online and the textarea to be enabled.

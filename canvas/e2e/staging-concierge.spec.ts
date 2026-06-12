@@ -381,10 +381,10 @@ test.describe("concierge Org map", () => {
     });
 
     // Normal workspaces render as map node cards (WorkspaceNode →
-    // data-testid="workspace-node"). The provisioned hermes workspace must
+    // data-testid="workspace-node-{name}"). The provisioned hermes workspace must
     // appear. expect.poll lets React Flow finish its layout pass.
     await expect
-      .poll(async () => page.locator('[data-testid="workspace-node"]').count(), {
+      .poll(async () => page.locator('[data-testid^="workspace-node-"]').count(), {
         message: "no workspace nodes rendered on the org map",
         timeout: 15_000,
       })
@@ -397,7 +397,7 @@ test.describe("concierge Org map", () => {
     // canvas-topology.ts). Only meaningful when we actually installed one.
     if (platformInstalled) {
       const platformNode = page.locator(
-        `[data-testid="workspace-node"][aria-label^="${PLATFORM_AGENT_NAME} workspace"]`,
+        `[data-testid^="workspace-node-"][aria-label^="${PLATFORM_AGENT_NAME} workspace"]`,
       );
       await expect(
         platformNode,
