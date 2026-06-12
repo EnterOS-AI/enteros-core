@@ -44,6 +44,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/crypto"
@@ -120,7 +121,7 @@ type BillingModeResolution struct {
 	WorkspaceID       string            `json:"workspace_id"`
 	ResolvedMode      string            `json:"resolved_mode"`
 	WorkspaceOverride *string           `json:"workspace_override"` // nil = inherit
-	OrgDefault        string            `json:"org_default"`        // RETIRED as a billing source (internal#718 P2-B); always platform_managed, kept for wire-compat
+	OrgDefault        string            `json:"org_default"`        // Org-level default delivered via tenant_config / MOLECULE_LLM_BILLING_MODE. Consulted in the decision when no workspace override exists (core#2608).
 	Source            BillingModeSource `json:"source"`
 	// ProviderSelection surfaces the DERIVED provider name (internal#718 P2-B)
 	// when the mode came from the registry derivation — the literal provider the
@@ -169,6 +170,30 @@ func isKnownBillingMode(s string) bool {
 	}
 }
 
+// orgDefaultForDisplay normalizes the raw org-mode string for the wire-format
+// OrgDefault field. Returns the recognized lower-case value when known, else
+// the closed platform default. This keeps the admin route response honest
+// about which org default was actually consulted.
+func orgDefaultForDisplay(orgMode string) string {
+	mode := strings.ToLower(strings.TrimSpace(orgMode))
+	if isKnownBillingMode(mode) {
+		return mode
+	}
+	return LLMBillingModePlatformManaged
+}
+
+// recognizedOrgDefault returns the normalized, recognized org default value
+// and true when orgMode is a known billing mode (after trimming whitespace and
+// lower-casing). Callers use this single normalization point so the decision
+// semantics and the display value cannot drift.
+func recognizedOrgDefault(orgMode string) (string, bool) {
+	mode := strings.ToLower(strings.TrimSpace(orgMode))
+	if isKnownBillingMode(mode) {
+		return mode, true
+	}
+	return LLMBillingModePlatformManaged, false
+}
+
 // readWorkspaceBillingOverride reads the OPTIONAL explicit operator override
 // (workspaces.llm_billing_mode). Returns:
 //
@@ -198,23 +223,19 @@ func readWorkspaceBillingOverride(ctx context.Context, workspaceID string) (stri
 }
 
 // ResolveLLMBillingModeDerived is the SSOT billing-mode resolver (internal#718
-// P2-B). It DERIVES the provider from (runtime, model) via the provider
-// registry and decides platform-vs-byok from IsPlatform(derived) — it does NOT
-// read a stored LLM_PROVIDER (superseding #1966's stored-read approach) and
-// does NOT read the org rung (retired, CTO 2026-05-27).
+// P2-B + core#2608). It consults (in precedence order):
 //
-// Precedence (highest first):
-//
-//  1. EXPLICIT operator override (workspaces.llm_billing_mode, a recognized
-//     value). The only stored billing signal that survives — an escape hatch,
-//     not the primary signal.
-//  2. DERIVE: providers.DeriveProvider(runtime, model, availableAuthEnv).
+//  1. EXPLICIT workspace operator override (workspaces.llm_billing_mode).
+//  2. ORG default (passed via tenant_config / MOLECULE_LLM_BILLING_MODE). A
+//     recognized org default wins over provider derivation so a SaaS org pinned
+//     to platform_managed is not flipped to byok for models whose provider is
+//     not the closed `platform` provider (core#2608 first-run failure).
+//  3. DERIVE: providers.DeriveProvider(runtime, model, availableAuthEnv).
 //     - resolves to the closed `platform` provider → platform_managed
-//     - resolves to any other (BYOK/third-party) provider → byok  ← THE FIX
-//  3. DEFAULT-CLOSED: derive fails (no model, unknown runtime, unregistered or
-//     ambiguous model) → platform_managed (CTO "unset → platform default"). A
-//     derive failure NEVER silently flips a workspace to byok (which would
-//     strip the platform creds it may legitimately need).
+//     - resolves to any other (BYOK/third-party) provider → byok
+//  4. DEFAULT-CLOSED: derive fails or org default is absent/unrecognized →
+//     platform_managed when a platform proxy is configured, else byok on
+//     self-host.
 //
 // availableAuthEnv is the set of auth-env-var NAMES present for the workspace
 // (never secret values) — the same disambiguation input DeriveProvider uses to
@@ -222,20 +243,28 @@ func readWorkspaceBillingOverride(ctx context.Context, workspaceID string) (stri
 //
 // A returned error never prevents a decision: ResolvedMode is always a valid
 // enum value (default-closed). The error is informational (log + surface).
-func ResolveLLMBillingModeDerived(ctx context.Context, workspaceID, runtime, model string, availableAuthEnv []string) (BillingModeResolution, error) {
+func ResolveLLMBillingModeDerived(ctx context.Context, workspaceID, runtime, model, orgMode string, availableAuthEnv []string) (BillingModeResolution, error) {
 	res := BillingModeResolution{
 		WorkspaceID: workspaceID,
-		// OrgDefault is retired as a billing source (internal#718 P2-B). Kept on
-		// the struct for wire-compat (admin route / CP mirror) but always the
-		// closed constant — never consulted in the decision.
-		OrgDefault: LLMBillingModePlatformManaged,
+		// OrgDefault reflects the passed org default for wire-compat /
+		// observability. It is consulted in the decision when no workspace
+		// override exists (core#2608).
+		OrgDefault: orgDefaultForDisplay(orgMode),
 	}
+	// Normalize once and use the same value for both the decision and the
+	// empty-workspace path so callers cannot accidentally skip an org default
+	// because of casing or whitespace.
+	orgDefault, orgDefaultOK := recognizedOrgDefault(orgMode)
 
-	// Pre-provision context (no workspace row yet): no override to read, default
-	// closed. (DeriveProvider could still run from the passed runtime/model, but
-	// the no-id path historically does no DB work and the strip gate only runs
-	// post-create, so keep it a pure default to preserve that contract.)
+	// Pre-provision context (no workspace row yet): no override to read.
+	// A recognized org default still applies (no DB needed); otherwise default
+	// closed. This path is reached from ResolveLLMBillingMode with an empty id.
 	if workspaceID == "" {
+		if orgDefaultOK {
+			res.ResolvedMode = orgDefault
+			res.Source = BillingModeSourceOrgDefault
+			return res, nil
+		}
 		res.ResolvedMode = defaultClosedBillingMode()
 		res.Source = BillingModeSourceDerivedDefault
 		return res, nil
@@ -255,7 +284,19 @@ func ResolveLLMBillingModeDerived(ctx context.Context, workspaceID, runtime, mod
 		return res, nil
 	}
 
-	// Precedence 2: DERIVE the provider from (runtime, model).
+	// Precedence 2: org default. A recognized org-level default (delivered via
+	// tenant_config / MOLECULE_LLM_BILLING_MODE) wins over provider derivation
+	// so a SaaS org pinned to platform_managed does not get flipped to byok for
+	// models whose provider is not the closed `platform` provider. This closes
+	// core#2608: fresh SaaS tenants with platform_managed org default failed
+	// provision with MISSING_BYOK_CREDENTIAL because derivation ran first.
+	if orgDefaultOK {
+		res.ResolvedMode = orgDefault
+		res.Source = BillingModeSourceOrgDefault
+		return res, nil
+	}
+
+	// Precedence 3: DERIVE the provider from (runtime, model).
 	manifest, mErr := providerRegistry()
 	if mErr != nil || manifest == nil {
 		// Registry unavailable (malformed embedded YAML — a build-time defect the
@@ -309,11 +350,9 @@ func ResolveLLMBillingModeDerived(ctx context.Context, workspaceID, runtime, mod
 // branch. The error is informational: log it, surface it to operators, but
 // the strip-gate decision is already safe.
 func ResolveLLMBillingMode(ctx context.Context, workspaceID, orgMode string) (BillingModeResolution, error) {
-	_ = orgMode // org rung retired (internal#718 P2-B); parameter ignored.
-
 	if workspaceID == "" {
 		// Pre-provision context (templating, validation): default closed, no DB.
-		return ResolveLLMBillingModeDerived(ctx, "", "", "", nil)
+		return ResolveLLMBillingModeDerived(ctx, "", "", "", orgMode, nil)
 	}
 
 	// Precedence 1: explicit operator override. Read it FIRST so an overridden
@@ -323,7 +362,7 @@ func ResolveLLMBillingMode(ctx context.Context, workspaceID, orgMode string) (Bi
 	if mode, ok, err := readWorkspaceBillingOverride(ctx, workspaceID); err != nil {
 		return BillingModeResolution{
 			WorkspaceID:  workspaceID,
-			OrgDefault:   LLMBillingModePlatformManaged,
+			OrgDefault:   orgDefaultForDisplay(orgMode),
 			ResolvedMode: LLMBillingModePlatformManaged,
 			Source:       BillingModeSourceConstantFallback,
 		}, err
@@ -331,7 +370,7 @@ func ResolveLLMBillingMode(ctx context.Context, workspaceID, orgMode string) (Bi
 		m := mode
 		return BillingModeResolution{
 			WorkspaceID:       workspaceID,
-			OrgDefault:        LLMBillingModePlatformManaged,
+			OrgDefault:        orgDefaultForDisplay(orgMode),
 			ResolvedMode:      mode,
 			WorkspaceOverride: &m,
 			Source:            BillingModeSourceWorkspaceOverride,
@@ -349,7 +388,7 @@ func ResolveLLMBillingMode(ctx context.Context, workspaceID, orgMode string) (Bi
 	// independently-callable SSOT rather than splitting its precedence across two
 	// functions.
 	runtime, model, authEnv := readWorkspaceDeriveInputs(ctx, workspaceID)
-	return ResolveLLMBillingModeDerived(ctx, workspaceID, runtime, model, authEnv)
+	return ResolveLLMBillingModeDerived(ctx, workspaceID, runtime, model, orgMode, authEnv)
 }
 
 // readWorkspaceDeriveInputs loads the workspace's stored runtime + selected
