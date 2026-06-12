@@ -382,6 +382,21 @@ func (h *WorkspaceHandler) applyConciergeProvisionConfig(
 // universal MISSING_MODEL gate then fails the provision CLOSED rather than
 // letting the runtime pick an opaque default.
 func (h *WorkspaceHandler) ensureConciergeModel(ctx context.Context, workspaceID string, envVars map[string]string) {
+	// SEED-ONLY (CTO 2026-06-12: customer setting > platform default; the
+	// concierge's model is changeable like any workspace, "anytime"). If a MODEL
+	// secret already exists — whether the original seed or a model the customer
+	// later picked in the canvas — RESPECT it: loadWorkspaceSecrets +
+	// applyRuntimeModelEnv have already put it in envVars, so do nothing. Only
+	// SEED the declared default when the concierge has no model at all (first
+	// boot). Pre-fix this function re-asserted conciergeDeclaredModel on EVERY
+	// provision, silently reverting the customer's pick (e.g. kimi-for-coding →
+	// moonshot/kimi-k2.6) — exactly the platform-overriding-customer violation
+	// the SSOT directive forbids.
+	if existing := readStoredModelSecret(ctx, workspaceID); existing != "" {
+		return // explicit model already set; never overwrite the customer's choice
+	}
+
+	// First boot — no model yet. Seed the concierge's declared default.
 	model := conciergeDeclaredModel
 	if ok, why := validateRegisteredModelForRuntime(conciergeRuntime, model); !ok {
 		log.Printf("Provisioner: concierge %s declared model %q is NOT registered for runtime %q (%s) — leaving model unset; provision will fail closed", workspaceID, model, conciergeRuntime, why)
@@ -394,27 +409,34 @@ func (h *WorkspaceHandler) ensureConciergeModel(ctx context.Context, workspaceID
 
 	// Seed the container env (precedence MOLECULE_MODEL > MODEL in the runtime).
 	// applyRuntimeModelEnv already ran with an empty payload model for the
-	// concierge (it has no stored MODEL on first boot), so set both canonical
-	// names here so this provision actually runs the declared model.
+	// concierge (no stored MODEL on first boot), so set both canonical names
+	// here so this provision actually runs the seeded default.
 	envVars["MOLECULE_MODEL"] = model
 	envVars["MODEL"] = model
 
 	// Persist so GET /workspaces/:id/model returns it (Config tab visibility).
-	// Idempotent: only write when the stored value differs, to avoid churning
-	// updated_at on every restart.
-	var stored []byte
-	var version int
-	err := db.DB.QueryRowContext(ctx,
-		`SELECT encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = $1 AND key = 'MODEL'`,
-		workspaceID).Scan(&stored, &version)
-	if err == nil {
-		if dec, decErr := crypto.DecryptVersioned(stored, version); decErr == nil && string(dec) == model {
-			return // already persisted with the right value
-		}
-	}
 	if setErr := setModelSecret(ctx, workspaceID, model); setErr != nil {
 		log.Printf("Provisioner: concierge %s persist MODEL secret failed: %v (env still seeded for this provision)", workspaceID, setErr)
 	}
+}
+
+// readStoredModelSecret returns the decrypted MODEL workspace_secret, or "" when
+// none is stored (or on any read/decrypt error — treated as "unset" so a
+// transient miss re-seeds rather than wedges). Used by ensureConciergeModel to
+// decide seed-vs-respect.
+func readStoredModelSecret(ctx context.Context, workspaceID string) string {
+	var stored []byte
+	var version int
+	if err := db.DB.QueryRowContext(ctx,
+		`SELECT encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = $1 AND key = 'MODEL'`,
+		workspaceID).Scan(&stored, &version); err != nil {
+		return ""
+	}
+	dec, err := crypto.DecryptVersioned(stored, version)
+	if err != nil {
+		return ""
+	}
+	return string(dec)
 }
 
 // EnsureSelfHostedPlatformAgent installs the org's platform agent (the concierge,

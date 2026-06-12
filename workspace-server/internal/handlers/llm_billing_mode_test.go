@@ -25,13 +25,13 @@ import (
 //     complete, independently-callable SSOT.
 //
 // model=="" means no MODEL secret row.
-func expectLegacyShimQueries(m sqlmock.Sqlmock, wsID, runtime, model string) {
-	nullOverride := func() {
-		m.ExpectQuery(`SELECT llm_billing_mode FROM workspaces WHERE id = \$1`).
-			WithArgs(wsID).
-			WillReturnRows(sqlmock.NewRows([]string{"llm_billing_mode"}).AddRow(nil))
-	}
-	nullOverride()
+// expectShimQueries mocks the query sequence ResolveLLMBillingMode issues: it
+// loads the derive inputs (runtime, secrets) then delegates to
+// ResolveLLMBillingModeDerived, which reads the override ONCE. Order: runtime →
+// secrets → override (single override read — the prior double-read was removed
+// when the org-level path was retired 2026-06-12). override="" mocks a NULL
+// (absent) override.
+func expectShimQueries(m sqlmock.Sqlmock, wsID, runtime, model, override string) {
 	m.ExpectQuery(`SELECT runtime FROM workspaces WHERE id = \$1`).
 		WithArgs(wsID).
 		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow(runtime))
@@ -42,7 +42,15 @@ func expectLegacyShimQueries(m sqlmock.Sqlmock, wsID, runtime, model string) {
 	m.ExpectQuery(`SELECT key, encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1`).
 		WithArgs(wsID).
 		WillReturnRows(secretRows)
-	nullOverride()
+	overrideRow := sqlmock.NewRows([]string{"llm_billing_mode"})
+	if override == "" {
+		overrideRow.AddRow(nil)
+	} else {
+		overrideRow.AddRow(override)
+	}
+	m.ExpectQuery(`SELECT llm_billing_mode FROM workspaces WHERE id = \$1`).
+		WithArgs(wsID).
+		WillReturnRows(overrideRow)
 }
 
 func TestResolveLLMBillingMode_LegacyShimDerives(t *testing.T) {
@@ -57,7 +65,6 @@ func TestResolveLLMBillingMode_LegacyShimDerives(t *testing.T) {
 	}
 	type tc struct {
 		name      string
-		orgMode   string
 		setupMock func(m sqlmock.Sqlmock)
 		want      want
 		wantErr   bool
@@ -65,79 +72,59 @@ func TestResolveLLMBillingMode_LegacyShimDerives(t *testing.T) {
 
 	cases := []tc{
 		{
-			// Explicit override still wins (first precedence).
-			name:    "explicit_override_byok_wins",
-			orgMode: "",
+			// Explicit per-workspace override wins (first precedence). Inputs are
+			// loaded first (runtime, secrets) then the override read decides.
+			name: "explicit_override_byok_wins",
 			setupMock: func(m sqlmock.Sqlmock) {
-				m.ExpectQuery(`SELECT llm_billing_mode FROM workspaces WHERE id = \$1`).
-					WithArgs(wsID).
-					WillReturnRows(sqlmock.NewRows([]string{"llm_billing_mode"}).AddRow(LLMBillingModeBYOK))
+				expectShimQueries(m, wsID, "claude-code", "anthropic/claude-opus-4-7", LLMBillingModeBYOK)
 			},
 			want: want{mode: LLMBillingModeBYOK, source: BillingModeSourceWorkspaceOverride, hasOverride: true},
 		},
 		{
-			// No override + org default platform_managed wins over non-platform derive.
-			name:    "org_default_platform_managed_wins_over_derive",
-			orgMode: LLMBillingModePlatformManaged,
+			// No override + vendor model → byok via derive (the SELECTED provider
+			// is the signal; no key-presence check).
+			name: "vendor_model_derives_byok",
 			setupMock: func(m sqlmock.Sqlmock) {
-				expectLegacyShimQueries(m, wsID, "claude-code", "kimi-for-coding")
-			},
-			want: want{mode: LLMBillingModePlatformManaged, source: BillingModeSourceOrgDefault, hasOverride: false},
-		},
-		{
-			// No override + no org default + non-platform-deriving model → byok via derive.
-			name:    "no_override_derives_byok_from_model",
-			orgMode: "",
-			setupMock: func(m sqlmock.Sqlmock) {
-				expectLegacyShimQueries(m, wsID, "claude-code", "kimi-for-coding")
+				expectShimQueries(m, wsID, "claude-code", "kimi-for-coding", "")
 			},
 			want: want{mode: LLMBillingModeBYOK, source: BillingModeSourceDerivedProvider, hasOverride: false},
 		},
 		{
-			// No override + no org default + platform-namespaced model → platform_managed.
-			name:    "no_override_derives_platform_from_model",
-			orgMode: "",
+			// No override + platform-namespaced model → platform_managed via derive.
+			name: "platform_model_derives_platform",
 			setupMock: func(m sqlmock.Sqlmock) {
-				expectLegacyShimQueries(m, wsID, "claude-code", "anthropic/claude-opus-4-7")
+				expectShimQueries(m, wsID, "claude-code", "anthropic/claude-opus-4-7", "")
 			},
 			want: want{mode: LLMBillingModePlatformManaged, source: BillingModeSourceDerivedProvider, hasOverride: false},
 		},
 		{
-			// No override + no org default + no model → derived_default → platform_managed.
-			name:    "no_override_no_model_platform_default",
-			orgMode: "",
+			// No override + no model → derived_default → platform_managed (proxy wired).
+			name: "no_model_deploy_default_platform",
 			setupMock: func(m sqlmock.Sqlmock) {
-				expectLegacyShimQueries(m, wsID, "claude-code", "")
+				expectShimQueries(m, wsID, "claude-code", "", "")
 			},
 			want: want{mode: LLMBillingModePlatformManaged, source: BillingModeSourceDerivedDefault, hasOverride: false},
 		},
 		{
-			// Garbled override is NOT honored — falls through to org default if present.
-			name:    "garbled_override_falls_through_to_org_default",
-			orgMode: LLMBillingModePlatformManaged,
+			// Garbled override is NOT honored — falls through to derivation. With no
+			// model it lands on the deployment default (platform_managed).
+			name: "garbled_override_falls_through_to_derive",
 			setupMock: func(m sqlmock.Sqlmock) {
-				// override read 1 (garbled → not honored), runtime, secrets,
-				// override read 2 (garbled again, derived resolver re-check).
-				m.ExpectQuery(`SELECT llm_billing_mode FROM workspaces WHERE id = \$1`).
-					WithArgs(wsID).
-					WillReturnRows(sqlmock.NewRows([]string{"llm_billing_mode"}).AddRow("byokk"))
+				expectShimQueries(m, wsID, "claude-code", "", "byokk")
+			},
+			want: want{mode: LLMBillingModePlatformManaged, source: BillingModeSourceDerivedDefault, hasOverride: false},
+		},
+		{
+			// DB error on the override read → default-closed + propagated error.
+			// (Inputs load first, then the override read errors.)
+			name: "override_db_error_default_closed_with_error",
+			setupMock: func(m sqlmock.Sqlmock) {
 				m.ExpectQuery(`SELECT runtime FROM workspaces WHERE id = \$1`).
 					WithArgs(wsID).
 					WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("claude-code"))
 				m.ExpectQuery(`SELECT key, encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1`).
 					WithArgs(wsID).
 					WillReturnRows(sqlmock.NewRows([]string{"key", "encrypted_value", "encryption_version"}))
-				m.ExpectQuery(`SELECT llm_billing_mode FROM workspaces WHERE id = \$1`).
-					WithArgs(wsID).
-					WillReturnRows(sqlmock.NewRows([]string{"llm_billing_mode"}).AddRow("byokk"))
-			},
-			want: want{mode: LLMBillingModePlatformManaged, source: BillingModeSourceOrgDefault, hasOverride: false},
-		},
-		{
-			// DB error on the override read → default-closed + propagated error.
-			name:    "override_db_error_default_closed_with_error",
-			orgMode: "",
-			setupMock: func(m sqlmock.Sqlmock) {
 				m.ExpectQuery(`SELECT llm_billing_mode FROM workspaces WHERE id = \$1`).
 					WithArgs(wsID).
 					WillReturnError(errors.New("connection refused"))
@@ -152,7 +139,7 @@ func TestResolveLLMBillingMode_LegacyShimDerives(t *testing.T) {
 			mock := setupTestDB(t)
 			c.setupMock(mock)
 
-			res, err := ResolveLLMBillingMode(ctx, wsID, c.orgMode)
+			res, err := ResolveLLMBillingMode(ctx, wsID)
 			if (err != nil) != c.wantErr {
 				t.Fatalf("err: got %v wantErr=%v", err, c.wantErr)
 			}
@@ -179,31 +166,12 @@ func TestResolveLLMBillingMode_EmptyWorkspaceID_PlatformDefault(t *testing.T) {
 	withProxyConfigured(t) // SaaS context.
 	ctx := context.Background()
 	mock := setupTestDB(t) // no DB read expected
-	res, err := ResolveLLMBillingMode(ctx, "", "")
+	res, err := ResolveLLMBillingMode(ctx, "")
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
 	if res.ResolvedMode != LLMBillingModePlatformManaged {
 		t.Errorf("empty ws id must default platform_managed, got %q", res.ResolvedMode)
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("sqlmock expectations: %v", err)
-	}
-}
-
-func TestResolveLLMBillingMode_EmptyWorkspaceID_OrgDefaultHonored(t *testing.T) {
-	withProxyConfigured(t)
-	ctx := context.Background()
-	mock := setupTestDB(t) // no DB read expected
-	res, err := ResolveLLMBillingMode(ctx, "", LLMBillingModeBYOK)
-	if err != nil {
-		t.Fatalf("unexpected err: %v", err)
-	}
-	if res.ResolvedMode != LLMBillingModeBYOK {
-		t.Errorf("empty ws id with org byok: got %q want byok", res.ResolvedMode)
-	}
-	if res.Source != BillingModeSourceOrgDefault {
-		t.Errorf("source: got %q want %q", res.Source, BillingModeSourceOrgDefault)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("sqlmock expectations: %v", err)
@@ -220,23 +188,12 @@ func TestResolveLLMBillingMode_ResolvedModeIsAlwaysValid(t *testing.T) {
 	const wsID = "22222222-2222-2222-2222-222222222222"
 
 	// Garbled override + no derivable model: must still resolve a known enum
-	// (platform_managed, default-closed). Query order: override(garbled),
-	// runtime, secrets, override(garbled again — derived resolver re-check).
+	// (platform_managed, default-closed). Query order: runtime, secrets, override
+	// (garbled → not honored → derive → no model → deployment default).
 	mock := setupTestDB(t)
-	mock.ExpectQuery(`SELECT llm_billing_mode FROM workspaces WHERE id = \$1`).
-		WithArgs(wsID).
-		WillReturnRows(sqlmock.NewRows([]string{"llm_billing_mode"}).AddRow("totally-bogus"))
-	mock.ExpectQuery(`SELECT runtime FROM workspaces WHERE id = \$1`).
-		WithArgs(wsID).
-		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("claude-code"))
-	mock.ExpectQuery(`SELECT key, encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1`).
-		WithArgs(wsID).
-		WillReturnRows(sqlmock.NewRows([]string{"key", "encrypted_value", "encryption_version"}))
-	mock.ExpectQuery(`SELECT llm_billing_mode FROM workspaces WHERE id = \$1`).
-		WithArgs(wsID).
-		WillReturnRows(sqlmock.NewRows([]string{"llm_billing_mode"}).AddRow("totally-bogus"))
+	expectShimQueries(mock, wsID, "claude-code", "", "totally-bogus")
 
-	res, err := ResolveLLMBillingMode(ctx, wsID, "")
+	res, err := ResolveLLMBillingMode(ctx, wsID)
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}

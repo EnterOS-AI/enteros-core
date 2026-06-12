@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"log"
 	"net/http"
-	"os"
 	"regexp"
 	"strings"
 
@@ -61,12 +60,39 @@ func isPlatformManagedDirectLLMBypassKey(key string) bool {
 // during a secret write still rejects the bypass-list keys — fail safer not
 // freer. This matches the resolver's documented contract.
 func platformManagedLLMModeForWorkspace(c *gin.Context, workspaceID string) bool {
-	orgMode := strings.ToLower(strings.TrimSpace(os.Getenv("MOLECULE_LLM_BILLING_MODE")))
-	res, err := ResolveLLMBillingMode(c.Request.Context(), workspaceID, orgMode)
-	if err != nil {
-		log.Printf("secrets: resolve billing mode for workspace=%s failed: %v (defaulting to platform_managed for safety)", workspaceID, err)
+	ctx := c.Request.Context()
+	// CTO 2026-06-12 (per-workspace BYOK SSOT) + CR (agent-researcher): block a
+	// vendor-key write whenever it would co-mingle with platform billing. The
+	// MODEL is checked FIRST: a platform-servable model (derives to the closed
+	// `platform` provider; the proxy serves it and bills the platform) blocks
+	// stray vendor-key co-storage REGARDLESS of any (possibly stale/incorrect)
+	// billing override — a platform model must never host a co-stored vendor key.
+	// Only a specific VENDOR model is a BYOK setup where the customer may write
+	// their own key (INCLUDING the first key, before billing has derived byok).
+	// For a vendor model, an explicit platform_managed override still forces the
+	// block (the operator chose managed billing → a vendor key would co-mingle).
+	runtime, model, authEnv := readWorkspaceDeriveInputs(ctx, workspaceID)
+	manifest, err := providerRegistry()
+	if err != nil || manifest == nil {
+		log.Printf("secrets: provider registry unavailable for workspace=%s: %v (blocking vendor-key write for safety)", workspaceID, err)
+		return true
 	}
-	return strings.EqualFold(res.ResolvedMode, LLMBillingModePlatformManaged)
+	provider, dErr := manifest.DeriveProvider(runtime, model, authEnv)
+	if dErr != nil {
+		// Unregistered / ambiguous / no model → cannot prove it's a vendor BYOK
+		// setup; block (safe default, matches the create-time only-registered gate).
+		return true
+	}
+	if provider.IsPlatform() {
+		// Platform-servable model → block, even under a byok override.
+		return true
+	}
+	// Vendor model: allow the key write UNLESS an explicit platform_managed
+	// override forces managed billing (then a vendor key would co-mingle).
+	if mode, ok, err := readWorkspaceBillingOverride(ctx, workspaceID); err == nil && ok {
+		return strings.EqualFold(mode, LLMBillingModePlatformManaged)
+	}
+	return false
 }
 
 // rejectPlatformManagedDirectLLMBypassForWorkspace is the per-workspace

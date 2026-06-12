@@ -1845,3 +1845,99 @@ func TestDeleteGlobal_SpoofedHeader_DoesNotSuppressRestart(t *testing.T) {
 		t.Errorf("unmet sqlmock expectations: %v", err)
 	}
 }
+
+// TestPlatformManagedLLMModeForWorkspace_GatesOnModelNotResolvedMode is the Fix C
+// guard regression (CTO 2026-06-12): the vendor-key-write guard must key off
+// whether the workspace's MODEL is platform-servable (derives to the closed
+// `platform` provider), NOT off the resolved billing mode. A workspace on a
+// VENDOR model must be allowed to write its own key — including the FIRST key,
+// before billing has derived byok (when the resolved mode is still the org
+// platform_managed fallback). A workspace on a PLATFORM model is blocked (a
+// stray vendor key would co-mingle with proxy billing).
+func TestPlatformManagedLLMModeForWorkspace_GatesOnModelNotResolvedMode(t *testing.T) {
+	overrideQ := `SELECT llm_billing_mode FROM workspaces WHERE id = \$1`
+	runtimeQ := `SELECT runtime FROM workspaces WHERE id = \$1`
+	secretsQ := `SELECT key, encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1`
+
+	newCtx := func(wsID string) *gin.Context {
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest("PUT", "/workspaces/"+wsID+"/secrets", nil)
+		return c
+	}
+
+	// Query order (new): runtime → secrets → (vendor only) override. A platform
+	// model short-circuits at IsPlatform and never reads the override.
+	vendorOK := func(m sqlmock.Sqlmock, wsID, override string) {
+		m.ExpectQuery(runtimeQ).WithArgs(wsID).
+			WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("claude-code"))
+		m.ExpectQuery(secretsQ).WithArgs(wsID).
+			WillReturnRows(sqlmock.NewRows([]string{"key", "encrypted_value", "encryption_version"}).
+				AddRow("MODEL", []byte("kimi-for-coding"), 0)) // vendor model
+		row := sqlmock.NewRows([]string{"llm_billing_mode"})
+		if override == "" {
+			row.AddRow(nil)
+		} else {
+			row.AddRow(override)
+		}
+		m.ExpectQuery(overrideQ).WithArgs(wsID).WillReturnRows(row)
+	}
+	platformModelOnly := func(m sqlmock.Sqlmock, wsID string) {
+		m.ExpectQuery(runtimeQ).WithArgs(wsID).
+			WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("claude-code"))
+		m.ExpectQuery(secretsQ).WithArgs(wsID).
+			WillReturnRows(sqlmock.NewRows([]string{"key", "encrypted_value", "encryption_version"}).
+				AddRow("MODEL", []byte("moonshot/kimi-k2.6"), 0)) // platform model — no override read
+	}
+
+	t.Run("vendor model + no override → NOT blocked (can add first BYOK key)", func(t *testing.T) {
+		mock := setupTestDB(t)
+		const wsID = "11111111-1111-1111-1111-111111111111"
+		vendorOK(mock, wsID, "")
+		if platformManagedLLMModeForWorkspace(newCtx(wsID), wsID) {
+			t.Error("vendor-model workspace must NOT be blocked from writing its own key")
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("sqlmock: %v", err)
+		}
+	})
+
+	t.Run("platform model → blocked", func(t *testing.T) {
+		mock := setupTestDB(t)
+		const wsID = "22222222-2222-2222-2222-222222222222"
+		platformModelOnly(mock, wsID)
+		if !platformManagedLLMModeForWorkspace(newCtx(wsID), wsID) {
+			t.Error("platform-model workspace must block stray vendor-key writes")
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("sqlmock: %v", err)
+		}
+	})
+
+	t.Run("platform model + byok override → STILL blocked (CR: co-mingle guard)", func(t *testing.T) {
+		// agent-researcher REQUEST_CHANGES: a platform-servable MODEL must stay
+		// protected even when a (stale/incorrect) byok override is set — the
+		// MODEL is checked first, so the override is never even read.
+		mock := setupTestDB(t)
+		const wsID = "33333333-3333-3333-3333-333333333333"
+		platformModelOnly(mock, wsID) // no override query — platform short-circuits
+		if !platformManagedLLMModeForWorkspace(newCtx(wsID), wsID) {
+			t.Error("platform model must block vendor-key writes even under a byok override")
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("sqlmock: %v", err)
+		}
+	})
+
+	t.Run("vendor model + platform_managed override → blocked (operator forced managed)", func(t *testing.T) {
+		mock := setupTestDB(t)
+		const wsID = "44444444-4444-4444-4444-444444444444"
+		vendorOK(mock, wsID, LLMBillingModePlatformManaged)
+		if !platformManagedLLMModeForWorkspace(newCtx(wsID), wsID) {
+			t.Error("vendor model with an explicit platform_managed override must block (co-mingle)")
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("sqlmock: %v", err)
+		}
+	})
+}
