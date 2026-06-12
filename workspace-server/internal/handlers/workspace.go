@@ -511,6 +511,26 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 			})
 			return
 		}
+
+		// core#2608 (CTO 2026-06-11 "hard fail — why does it even pass and
+		// create a not-working workspace"): a registered model that derives
+		// BYOK with no satisfiable credential in scope fails HERE, before any
+		// row exists, with the same actionable message provisioning would
+		// have produced minutes later on a dead node.
+		secretKeys := make([]string, 0, len(payload.Secrets))
+		for k := range payload.Secrets {
+			secretKeys = append(secretKeys, k)
+		}
+		if ok, why := validateBYOKCredentialSatisfiable(c.Request.Context(), payload.Runtime, payload.Model, secretKeys); !ok {
+			log.Printf("Create: 422 MISSING_BYOK_CREDENTIAL (runtime=%q model=%q): %s [core#2608 create-boundary hard-reject]", payload.Runtime, payload.Model, why)
+			c.JSON(http.StatusUnprocessableEntity, gin.H{
+				"error":   why,
+				"runtime": payload.Runtime,
+				"model":   payload.Model,
+				"code":    "MISSING_BYOK_CREDENTIAL",
+			})
+			return
+		}
 	}
 
 	ctx := c.Request.Context()
@@ -1002,17 +1022,17 @@ func scanWorkspaceRow(rows interface {
 	}
 
 	ws := map[string]interface{}{
-		"id":                   id,
-		"name":                 name,
-		"tier":                 tier,
-		"status":               status,
-		"url":                  url,
-		"parent_id":            parentID,
+		"id":        id,
+		"name":      name,
+		"tier":      tier,
+		"status":    status,
+		"url":       url,
+		"parent_id": parentID,
 		// kind discriminates the org-level platform agent ('platform') from
 		// ordinary workspaces ('workspace'). The canvas hides the platform
 		// root from the node graph (it's the undeletable org anchor) and uses
 		// it to resolve the concierge for the shell home/settings.
-		"kind": kind,
+		"kind":                 kind,
 		"active_tasks":         activeTasks,
 		"max_concurrent_tasks": maxConcurrentTasks,
 		"last_error_rate":      errorRate,
