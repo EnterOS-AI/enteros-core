@@ -290,3 +290,123 @@ func TestIntegration_PlatformAgentInstall_StatusNotOnline(t *testing.T) {
 		t.Logf("fresh platform-agent status=%q (expected 'offline', but accepting non-online)", status)
 	}
 }
+
+// TestIntegration_PlatformAgentInstall_OnConflictUpdatesRuntime locks in
+// the core#2496 root-fix. Pre-#2496, the ON CONFLICT clause on the
+// platform-agent upsert only set kind and parent_id; the runtime column
+// was left at its INSERT-time value (the schema default). So if a
+// platform-agent row had been self-registered first (creating a row with
+// the schema default runtime) and the install endpoint was then called,
+// the runtime would be left STALE — not updated to 'claude-code'.
+//
+// #2496 added `runtime = 'claude-code'` to the ON CONFLICT DO UPDATE
+// SET clause, so the runtime is now corrected on every install, not just
+// on the initial insert.
+//
+// This test seeds a platform-agent row with a NON-canonical runtime
+// ('codex' — anything other than 'claude-code'), then calls
+// installPlatformAgent. The post-install assertion is: the runtime
+// MUST be 'claude-code'. Pre-#2496, this assertion would fail; post-#2496,
+// the ON CONFLICT clause resets it.
+//
+// We also test the "fresh insert" path (no prior row) to confirm the
+// regression is specifically about the conflict-path; if a future refactor
+// accidentally drops the runtime from the INSERT VALUES too, that case
+// catches it.
+func TestIntegration_PlatformAgentInstall_OnConflictUpdatesRuntime(t *testing.T) {
+	conn := integrationDB_PlatformAgentInstall(t)
+	ctx := context.Background()
+
+	tag := uuid.New().String()[:8]
+	platformID := uuid.New().String()
+	paName := "Org Concierge " + tag
+	staleRuntime := "codex" // deliberately non-canonical
+
+	cleanup := func() {
+		_, _ = conn.ExecContext(ctx, `DELETE FROM workspaces WHERE name = $1`, paName)
+		_, _ = conn.ExecContext(ctx, `DELETE FROM workspaces WHERE id = $1`, platformID)
+	}
+	t.Cleanup(cleanup)
+	cleanup()
+
+	// Case 1: ON CONFLICT path. Seed the platform-agent row with a STALE
+	// runtime (simulates a self-registered row with the schema default).
+	// The seed is INSERT (not UPSERT) to deliberately NOT use the install
+	// endpoint's path — we're pre-arranging the conflict scenario.
+	if _, err := conn.ExecContext(ctx, `
+		INSERT INTO workspaces (id, name, kind, tier, status, runtime, parent_id)
+		VALUES ($1, $2, 'platform', 0, 'offline', $3, NULL)`,
+		platformID, paName, staleRuntime); err != nil {
+		t.Fatalf("seed stale platform agent: %v", err)
+	}
+
+	// Sanity: the seeded row has the stale runtime (not the canonical
+	// 'claude-code'). If this assertion fails, the seed is wrong; fix
+	// the seed, not the test assertion.
+	var seededRuntime string
+	if err := conn.QueryRowContext(ctx,
+		`SELECT runtime FROM workspaces WHERE id = $1`, platformID).Scan(&seededRuntime); err != nil {
+		t.Fatalf("read seeded runtime: %v", err)
+	}
+	if seededRuntime != staleRuntime {
+		t.Fatalf("seed precondition: runtime=%q, want %q (the test would be meaningless if the seed already had 'claude-code')",
+			seededRuntime, staleRuntime)
+	}
+
+	// Now call installPlatformAgent. Per the pre-#2496 bug, the
+	// ON CONFLICT DO UPDATE SET clause would have left runtime stuck
+	// at 'codex'. Per the #2496 fix, it must now be 'claude-code'.
+	if err := installPlatformAgent(ctx, conn, platformID, paName); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+
+	// PRIMARY ASSERTION: the runtime is 'claude-code' after install.
+	// Pre-#2496, the runtime would be 'codex' (stale). Post-#2496, the
+	// ON CONFLICT clause sets it to 'claude-code'.
+	var postInstallRuntime string
+	if err := conn.QueryRowContext(ctx,
+		`SELECT runtime FROM workspaces WHERE id = $1`, platformID).Scan(&postInstallRuntime); err != nil {
+		t.Fatalf("read post-install runtime: %v", err)
+	}
+	if postInstallRuntime != "claude-code" {
+		t.Fatalf("core#2496 regression: post-install runtime=%q, want 'claude-code'. "+
+			"This means the ON CONFLICT DO UPDATE SET clause is NOT setting runtime on the conflict path. "+
+			"Pre-#2496, the clause was: `ON CONFLICT (id) DO UPDATE SET kind = 'platform', parent_id = NULL` "+
+			"(no runtime update). Post-#2496, it MUST be: `... SET kind = 'platform', runtime = 'claude-code', parent_id = NULL`.",
+			postInstallRuntime)
+	}
+
+	// Sanity: a second install (still the conflict path) keeps runtime
+	// at 'claude-code' (idempotency assertion).
+	if err := installPlatformAgent(ctx, conn, platformID, paName); err != nil {
+		t.Fatalf("second install: %v", err)
+	}
+	var post2Runtime string
+	if err := conn.QueryRowContext(ctx,
+		`SELECT runtime FROM workspaces WHERE id = $1`, platformID).Scan(&post2Runtime); err != nil {
+		t.Fatalf("read post-second-install runtime: %v", err)
+	}
+	if post2Runtime != "claude-code" {
+		t.Fatalf("idempotent: post-second-install runtime=%q, want 'claude-code'", post2Runtime)
+	}
+
+	// Case 2: Fresh insert path. Verify the runtime='claude-code' is
+	// also set on the INSERT VALUES, not just on conflict. This guards
+	// against a future refactor that moves the runtime to the conflict
+	// clause only and removes it from the INSERT — a regression that
+	// would let a self-registering row skip the runtime entirely.
+	freshID := uuid.New().String()
+	freshName := "Org Concierge fresh " + tag
+	if err := installPlatformAgent(ctx, conn, freshID, freshName); err != nil {
+		t.Fatalf("fresh install: %v", err)
+	}
+	var freshRuntime string
+	if err := conn.QueryRowContext(ctx,
+		`SELECT runtime FROM workspaces WHERE id = $1`, freshID).Scan(&freshRuntime); err != nil {
+		t.Fatalf("read fresh runtime: %v", err)
+	}
+	if freshRuntime != "claude-code" {
+		t.Fatalf("fresh insert path: runtime=%q, want 'claude-code'", freshRuntime)
+	}
+	_, _ = conn.ExecContext(ctx, `DELETE FROM workspaces WHERE id = $1`, freshID)
+}
