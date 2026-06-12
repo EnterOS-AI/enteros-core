@@ -191,25 +191,42 @@ test.describe("staging canvas tabs", () => {
     const tenantURL = process.env.STAGING_TENANT_URL;
     const tenantToken = process.env.STAGING_TENANT_TOKEN;
     const workspaceId = process.env.STAGING_WORKSPACE_ID;
+    const orgID = process.env.STAGING_ORG_ID;
 
     // FAIL-CLOSED (not skip): STAGING was requested but global setup did
     // not export tenant state. A silent skip here would paint a broken
     // provision GREEN. This is the loud-fail the hardening mandates.
-    if (!tenantURL || !tenantToken || !workspaceId) {
+    //
+    // STAGING_ORG_ID is REQUIRED when STAGING was requested. The tenant
+    // platform's TenantGuard middleware (workspace-server
+    // middleware/tenant_guard.go) cross-org-gates every browser request —
+    // without X-Molecule-Org-Id, the canvas mounts, AuthGate fires
+    // /cp/auth/me, and the 401 from TenantGuard redirects away from the
+    // tenant URL before any panel settles. (Run 353448/job 478063 @ sha
+    // 57ff36de failed this exact way: "Failed to load" / hidden Echo
+    // nodes from the fallback layout.) Mirror staging-concierge.spec.ts
+    // 52-66, 91-96: resolve + fail-closed if STAGING_ORG_ID is unset
+    // when STAGING was requested.
+    if (!tenantURL || !tenantToken || !workspaceId || !orgID) {
       throw new Error(
         "staging-setup.ts did not export STAGING_TENANT_URL / " +
-          "STAGING_TENANT_TOKEN / STAGING_WORKSPACE_ID. CANVAS_E2E_STAGING=1 " +
-          "was set (staging WAS requested) but global setup produced no " +
-          "tenant — this is a provisioning failure, NOT a reason to skip. " +
-          "Check the [staging-setup] log above for the real error.",
+          "STAGING_TENANT_TOKEN / STAGING_WORKSPACE_ID / STAGING_ORG_ID. " +
+          "CANVAS_E2E_STAGING=1 was set (staging WAS requested) but global " +
+          "setup produced no tenant — this is a provisioning failure, NOT " +
+          "a reason to skip. Check the [staging-setup] log above for the " +
+          "real error.",
       );
     }
 
-    // Attach the per-tenant admin bearer to every outbound request.
-    // The tenant platform's AdminAuth middleware accepts this; no
-    // WorkOS session needed.
+    // Attach the per-tenant admin bearer AND the X-Molecule-Org-Id
+    // cross-org header to every outbound request. The tenant platform's
+    // AdminAuth middleware accepts the bearer; the TenantGuard
+    // middleware (workspace-server) requires X-Molecule-Org-Id. Both
+    // are needed; missing either is a HARD 401, not a graceful degrade.
+    // No WorkOS session needed.
     await context.setExtraHTTPHeaders({
       Authorization: `Bearer ${tenantToken}`,
+      "X-Molecule-Org-Id": orgID,
     });
 
     // canvas/src/components/AuthGate.tsx fetches /cp/auth/me on mount

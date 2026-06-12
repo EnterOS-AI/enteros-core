@@ -386,9 +386,12 @@ export default async function globalSetup(_config: FullConfig): Promise<void> {
   process.env.STAGING_WORKSPACE_ID = workspaceId;
   process.env.STAGING_TENANT_TOKEN = tenantToken;
   // The ephemeral org's UUID — exported so specs that route through the CP
-  // edge can send X-Molecule-Org-Id (workspace-server TenantGuard). The tabs
-  // harness hits the tenant box same-origin and doesn't need it, but the
-  // take-control gate (staging-display.spec.ts) does.
+  // edge can send X-Molecule-Org-Id (workspace-server TenantGuard). The
+  // tabs harness (staging-tabs.spec.ts) and the take-control gate
+  // (staging-display.spec.ts) both need it: TenantGuard rejects any
+  // browser request that lacks X-Molecule-Org-Id with 401, which
+  // surfaces as a hidden-Echo-node / "Failed to load" failure mode
+  // inside the panels (run 353448/job 478063 @ sha 57ff36de).
   process.env.STAGING_ORG_ID = orgID;
   console.log(`[staging-setup] Ready — ${stateFile}`);
 
