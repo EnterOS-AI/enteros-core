@@ -78,6 +78,77 @@ var RestartDebounceWindow = 60 * time.Second
 // workspace-server yet — that's a separate RFC.
 var restartByIDDropCounter atomic.Uint64
 
+// restartProvisionGates is a per-workspace mutex that serializes the
+// Stop+Start cycle for a given ws-<id>. Closes the race where manual
+// POST /workspaces/:id/restart (RestartWorkspaceAutoOpts) and programmatic
+// RestartByID (runRestartCycle) BOTH async-dispatch Stop→Start and
+// reached provisioner.Start twice for the same ws-<id>: the first call
+// created ws-{id} and started writing tokens, the second call raced in
+// and either (a) hit a Docker name conflict and markProvisionFailed
+// wedged the workspace to "failed", or (b) silently rotated/wrote
+// the bearer a second time and the second container start overlapped
+// the first. Both surfaced as the "401 invalid auth token" /
+// Docker-name-conflict symptom in #2659 Local Provision Lifecycle stub,
+// run 353677/job 478450.
+//
+// Each workspace gets its own *sync.Mutex on first use (sync.Map
+// LoadOrStore is the standard "map of locks" pattern — every workspace
+// that ever restarted keeps a tiny mutex in this map for the process
+// lifetime; if memory ever becomes a concern we can prune on workspace
+// removal, but workspace counts are small enough that it's a non-issue).
+//
+// The gate is intentionally separate from the existing `restartState`
+// (coalesceRestart) and the RestartDebounceWindow self-fire debounce:
+//   - restartState coalesces: collapses N rapid concurrent RestartByID
+//     calls into ≤2 sequential cycles (the in-flight one + one drain).
+//   - RestartDebounceWindow self-fire: drops successive RestartByID
+//     calls within 60s of the most recent cycle start (closes the
+//     probe-during-EC2-pending self-fire loop).
+//   - restartProvisionGate (THIS): the load-bearing exclusion that
+//     makes "only ONE Docker create per ws-<id> at a time" hold across
+//     the TWO different entry points (manual Restart HTTP + programmatic
+//     RestartByID). The existing two gates only cover the RestartByID
+//     path; the manual Restart HTTP handler bypassed both and called
+//     RestartWorkspaceAutoOpts directly.
+//
+// Both RestartWorkspaceAutoOpts and runRestartCycle acquire this gate
+// around their Stop+Start pair. A concurrent caller blocks (Go mutex
+// semantics) until the in-flight cycle completes — so the second
+// caller's Stop+Start runs AFTER the first's Start is fully done, and
+// the second's provisioner.Start is the only one in flight at a time.
+// The HTTP UX cost: a user double-clicking Restart gets a delayed
+// response on the second click (the second Stop+Start waits). That's
+// strictly better than the pre-fix behavior where the second click
+// wedged the workspace to "failed".
+var restartProvisionGates sync.Map // map[workspaceID]*sync.Mutex
+
+// acquireRestartProvisionGate returns the per-workspace mutex, creating
+// it on first use. Caller MUST defer Unlock after acquisition. The
+// mutex is intended to wrap the entire Stop+Start cycle, not just
+// provisioner.Start — the race is in the full sequence, not only Start.
+func acquireRestartProvisionGate(workspaceID string) *sync.Mutex {
+	sv, _ := restartProvisionGates.LoadOrStore(workspaceID, &sync.Mutex{})
+	return sv.(*sync.Mutex)
+}
+
+// tryAcquireRestartProvisionGate is the non-blocking variant. Returns
+// (gate, true) if the gate was acquired, (nil, false) if another
+// cycle is already in flight. Used by the manual Restart HTTP handler
+// to short-circuit a user double-click without queueing a second
+// Stop+Start behind the first — the second click returns an immediate
+// 409 with "restart already in progress" so the canvas can show a
+// clear message instead of the misleading "signal timed out" (which
+// was the pre-fix visible symptom on 2026-05-08).
+func tryAcquireRestartProvisionGate(workspaceID string) (*sync.Mutex, bool) {
+	gate := acquireRestartProvisionGate(workspaceID)
+	// Note: TryLock is Go 1.18+; this codebase already requires Go 1.25
+	// (see workspace-server/go.mod), so it's available without a build tag.
+	if !gate.TryLock() {
+		return gate, false
+	}
+	return gate, true
+}
+
 // fileWriteRestartDebounceWindow is the per-workspace coalescing window for
 // the file-write → RestartByID trigger fired by templates.go's WriteFile,
 // DeleteFile, and ReplaceFiles handlers (and template_import.go's variants).
@@ -810,8 +881,28 @@ func (h *WorkspaceHandler) cpStopWithRetryErr(ctx context.Context, workspaceID, 
 // outer pending-flag loop in RestartByID can correctly coalesce — if this
 // returned before the new container was up, the loop would race the
 // in-progress provision goroutine on the next iteration's Stop call.
+//
+// The cycle is wrapped in the per-workspace restart/provision GATE
+// (acquireRestartProvisionGate) so concurrent programmatic RestartByID
+// calls and the manual HTTP Restart handler (RestartWorkspaceAutoOpts)
+// cannot overlap their provisioner.Start calls for the same ws-<id>.
+// The outer coalesceRestart pending-flag already serializes N
+// programmatic RestartByID calls into ≤2 sequential cycles; this gate
+// closes the second class of race (manual + programmatic, or two
+// distinct programmatic entry points firing near-simultaneously) that
+// the pending-flag didn't cover.
 func (h *WorkspaceHandler) runRestartCycle(workspaceID string) {
 	ctx := context.Background()
+
+	// Per-workspace restart/provision gate. The same gate is acquired
+	// in RestartWorkspaceAutoOpts (the manual HTTP Restart path), so
+	// the manual and programmatic paths mutually exclude on Stop+Start.
+	// Held for the entire cycle (Stop → provision); the coalesceRestart
+	// drain loop's inner cycles re-use the same gate because the
+	// outer cycle holds it across the drain.
+	gate := acquireRestartProvisionGate(workspaceID)
+	gate.Lock()
+	defer gate.Unlock()
 
 	var wsName, status, dbRuntime string
 	var tier int
