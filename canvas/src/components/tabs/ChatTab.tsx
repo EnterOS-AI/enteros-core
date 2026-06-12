@@ -13,6 +13,8 @@ import { AgentCommsPanel } from "./chat/AgentCommsPanel";
 import { ChatErrorBanner } from "./chat/ChatErrorBanner";
 import { appendActivityLine } from "./chat/activityLog";
 import { ToolTraceChips } from "./chat/ToolTraceChips";
+import { decisionForChip, decisionChipText } from "./chat/decisionChip";
+import { fetchSession } from "@/lib/auth";
 import { runtimeDisplayName } from "@/lib/runtime-names";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { useChatHistory } from "./chat/hooks/useChatHistory";
@@ -126,6 +128,17 @@ function MyChatPanel({ workspaceId, data }: Props) {
   const hasInitialScrollRef = useRef(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const dragDepthRef = useRef(0);
+  // Current user id, resolved the SAME way RequestsInbox sets responder_id
+  // ("admin" placeholder when no session). Gates the decision chip to the
+  // user's OWN responses (core#2636, CR2 fix).
+  const currentUserIdRef = useRef<string>("admin");
+  useEffect(() => {
+    let cancelled = false;
+    fetchSession()
+      .then((sess) => { if (!cancelled && sess?.user_id) currentUserIdRef.current = sess.user_id; })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
   const pasteCounterRef = useRef(0);
 
   const history = useChatHistory(workspaceId, containerRef);
@@ -149,19 +162,12 @@ function MyChatPanel({ workspaceId, data }: Props) {
       if (!sending) return;
       setActivityLog((prev) => appendActivityLine(prev, entry));
     },
-    onRequestResponded: ({ status, responderType, title }) => {
-      // Only surface the USER's own decisions in My Chat — agent-side
-      // responses aren't the user's action (core#2636).
-      if (responderType !== "user") return;
-      const decision =
-        status === "approved" ? "approved" :
-        status === "rejected" ? "rejected" :
-        status === "done" ? "done" : null;
+    onRequestResponded: (p) => {
+      const decision = decisionForChip(p, currentUserIdRef.current);
       if (!decision) return;
-      const verb = decision === "approved" ? "approved" : decision === "rejected" ? "rejected" : "completed";
       history.setMessages((prev) => [
         ...prev,
-        { ...createMessage("system", `You ${verb}${title ? ` “${title}”` : " the request"}`), decision },
+        { ...createMessage("system", decisionChipText(decision, p.title)), decision },
       ]);
     },
     onSendComplete: () => {

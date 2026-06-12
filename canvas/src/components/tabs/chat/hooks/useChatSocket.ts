@@ -15,6 +15,7 @@ export interface UseChatSocketCallbacks {
   onRequestResponded?: (p: {
     status: string;
     responderType: string;
+    responderId: string;
     title: string;
     kind: string;
   }) => void;
@@ -141,6 +142,7 @@ export function useChatSocket(
         callbacksRef.current.onRequestResponded?.({
           status: (p.status as string) || "",
           responderType: (p.responder_type as string) || "",
+          responderId: (p.responder_id as string) || "",
           title: (p.title as string) || "",
           kind: (p.kind as string) || "",
         });
