@@ -110,9 +110,16 @@ jobs:
             --base-ref "${{ github.event.pull_request.base.ref }}" \
             --push-before "${GITHUB_EVENT_BEFORE:-}"
 
-  # Single-job-with-per-step-if pattern: always runs to satisfy the
-  # required-check name on branch protection; real work gates on the
-  # paths filter. See ci.yml's Platform (Go) for the same shape.
+  # ONE job (no job-level `if:`) that always runs and reports under the
+  # required-check name `Handlers Postgres Integration`. Real work is gated
+  # per-step on `needs.detect-changes.outputs.handlers`. Reason: Gitea
+  # registers a check run for every job that matches `name:`, and a job-level
+  # `if: false` produces a SKIPPED check run. Branch protection treats all
+  # check runs with a matching context name on the latest commit as a SET —
+  # any SKIPPED in the set fails the required-check eval, even with SUCCESS
+  # siblings. Collapsing to a single always-running job with conditional
+  # steps emits exactly one SUCCESS check run regardless of paths filter —
+  # branch-protection-clean. Mirrors e2e-api.yml (PR #2264 incident).
   integration:
     name: Handlers Postgres Integration
     needs: detect-changes
@@ -135,9 +142,12 @@ jobs:
       run:
         working-directory: workspace-server
     steps:
-      - if: needs.detect-changes.outputs.handlers != 'true'
+      - name: No-op pass (paths filter excluded this commit)
+        if: needs.detect-changes.outputs.handlers != 'true'
         working-directory: .
-        run: echo "No handlers/migrations changes — skipping; this job always runs to satisfy the required-check name."
+        run: |
+          echo "No handlers/migrations changes — Handlers Postgres Integration gate satisfied without running tests."
+          echo "::notice::Handlers Postgres Integration no-op pass (paths filter excluded this commit)."
 
       - if: needs.detect-changes.outputs.handlers == 'true'
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
