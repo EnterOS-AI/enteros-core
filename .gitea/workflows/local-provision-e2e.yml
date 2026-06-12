@@ -109,6 +109,11 @@ jobs:
           # lifecycle script also uses alpine to seed config.yaml into the
           # named config volume. Pre-pull + ensure the bridge (idempotent).
           docker pull alpine:3 >/dev/null
+          # Pre-pull the exact digest-pinned alpine image the platform server
+          # uses for token-write helper containers (workspace-server/Dockerfile
+          # and provisioner.go). Without this, the real-image advisory job can
+          # fail when the runner cache does not already contain the pinned SHA.
+          docker pull alpine:3.20@sha256:c64c687cbea9300178b30c95835354e34c4e4febc4badfe27102879de0483b5e >/dev/null
           docker network create molecule-core-net >/dev/null 2>&1 || true
           # SEV-2499 / mc#2499: connect the act_runner job container to
           # molecule-core-net so workspace containers can reach the platform
@@ -342,6 +347,9 @@ jobs:
       - name: Ensure provisioner network + pre-pull alpine
         run: |
           docker pull alpine:3 >/dev/null
+          # Pre-pull the exact digest-pinned alpine image the platform server
+          # uses for token-write helper containers.
+          docker pull alpine:3.20@sha256:c64c687cbea9300178b30c95835354e34c4e4febc4badfe27102879de0483b5e >/dev/null
           docker network create molecule-core-net >/dev/null 2>&1 || true
 
       - name: Start Postgres (docker, ephemeral host port)
