@@ -476,8 +476,16 @@ for _ in $(seq 1 "$ONLINE_TIMEOUT"); do
 done
 check "workspace reached online (status=$STATUS)" "online" "$STATUS"
 if [ "$FAIL" -gt 0 ]; then diagnose_provision "$WSID"; echo "=== Results: $PASS passed, $FAIL failed ==="; exit 1; fi
-RUN=$(container_running "$WSID")
-if [ -n "$RUN" ]; then pass "container running: $RUN"; else fail "no running ws-${WSID} container" "docker ps shows none"; fi
+# Bounded poll: the workspace can flip to 'online' as soon as the agent
+# registers, but the container may not be visible/stable on the shared
+# docker-host for another moment. Retry for up to 10s before failing hard.
+RUN=""
+for _ in $(seq 1 10); do
+  RUN=$(container_running "$WSID")
+  if [ -n "$RUN" ]; then break; fi
+  sleep 1
+done
+if [ -n "$RUN" ]; then pass "container running: $RUN"; else fail "no running ws-${WSID} container within 10s of online" "docker ps shows none"; fi
 echo ""
 
 # ----------------------------------------------------------------------------
