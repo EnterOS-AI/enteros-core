@@ -3,13 +3,9 @@ package middleware
 import (
 	"bytes"
 	"log"
-	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/gin-gonic/gin"
 )
 
 // TestRecoverPanic_RecoversFromPanicInGoroutine: the core#2125
@@ -106,65 +102,29 @@ func TestRecoverPanic_NoopOnNormalReturn(t *testing.T) {
 	}
 }
 
-// TestHTTPPanicRecovery_HandlerPanicReturns500: the CTO spec for
-// core#2125 regression asked for a test that exercises a HANDLER
-// panic through the real router/recovery middleware and asserts a
-// recovered 500 response (not a crashed process). core#2125 only
-// added per-goroutine `recover()` wrappers — it did NOT introduce
-// a project-wide HTTP-panic recovery middleware. So this test
-// documents the gap honestly: it wires the standard `gin.Recovery()`
-// middleware (which would be the right shape for a follow-up) over
-// a handler that panics, and asserts:
-//   1. the response status is 500 (NOT a connection-reset / crash)
-//   2. the test process is still alive after the panic (the
-//      recovery middleware caught it)
-//   3. a follow-up handler on the same engine still works (the
-//      engine is still in a serving state)
+// (REMOVED) TestHTTPPanicRecovery_HandlerPanicReturns500:
 //
-// This is the regression gate: if a future change accidentally
-// re-introduces a process-crash on a handler panic, the assertions
-// on (1) status=500 and (2)+(3) process-alive / engine-still-serving
-// will fail. See the PR body for the full gap analysis.
-func TestHTTPPanicRecovery_HandlerPanicReturns500(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	engine := gin.New()
-	engine.Use(gin.Recovery())
-
-	engine.GET("/panic", func(c *gin.Context) {
-		panic("simulated handler panic")
-	})
-	engine.GET("/after-panic", func(c *gin.Context) {
-		c.String(http.StatusOK, "still serving")
-	})
-
-	// (1) The panicking handler must return 500, not crash the engine.
-	w1 := httptest.NewRecorder()
-	req1 := httptest.NewRequest(http.MethodGet, "/panic", nil)
-	// Catch a process-level crash in a goroutine — the test should
-	// complete normally; the only way it fails is if the engine
-	// doesn't recover (we'd see a connection reset, not a 500).
-	func() {
-		defer func() {
-			if r := recover(); r != nil {
-				t.Fatalf("panic escaped gin.Recovery() at the test process level: %v", r)
-			}
-		}()
-		engine.ServeHTTP(w1, req1)
-	}()
-
-	if w1.Code != http.StatusInternalServerError {
-		t.Errorf("panicking handler: expected HTTP 500, got %d (body=%q)", w1.Code, w1.Body.String())
-	}
-
-	// (2)+(3) The engine must still be serving follow-up requests —
-	// a crashed engine would return connection-reset / EOF, not 200.
-	w2 := httptest.NewRecorder()
-	req2 := httptest.NewRequest(http.MethodGet, "/after-panic", nil)
-	engine.ServeHTTP(w2, req2)
-	if w2.Code != http.StatusOK {
-		t.Errorf("engine did not survive the panic — /after-panic expected 200, got %d (body=%q)", w2.Code, w2.Body.String())
-	}
-	if got := w2.Body.String(); got != "still serving" {
-		t.Errorf("/after-panic body: expected %q, got %q", "still serving", got)
-	}
-}
+//   Originally added in commit e4b649c9 to address CR2's first
+//   round of feedback ("exercise the real HTTP panic-recovery
+//   path"). On the second round of review, CR2 correctly flagged
+//   that the test wired a synthetic `gin.New() + gin.Recovery()`
+//   engine rather than the production `router.Setup` flow (which
+//   uses `gin.Default()`). Exercising the production router
+//   requires constructing ~10 dependencies (Hub, Broadcaster,
+//   Provisioner, handlers.WorkspaceHandler, etc.) — out of scope
+//   for this regression-test PR.
+//
+//   Per CR2's option 2 in the second review, the synthetic
+//   handler-panic coverage has been REMOVED from the PR. The
+//   PR's merge-blocking coverage is now narrowed to:
+//     (a) the real http client.Timeout regression (10s slow-
+//         upstream test against the production refreshEnvFromCP)
+//     (b) the recoverPanic helper contract (covered for the 3
+//         in-production call sites in internal/middleware: the
+//         session_auth sweeper, ratelimit cleanup, mcp_ratelimit
+//         cleanup)
+//   Adding a real production-router handler-panic regression is
+//   a candidate for a follow-up PR — the work is "make router.Setup
+//   testable with the minimum dependency surface, then assert
+//   500+no-crash through the real path", which is a non-trivial
+//   refactor on its own.
