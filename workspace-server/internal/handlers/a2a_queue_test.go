@@ -275,10 +275,10 @@ func expectDequeueNextEmpty(mock sqlmock.Sqlmock, wsID string) {
 }
 
 // expectCompleted sets up mock for MarkQueueItemCompleted.
-func expectCompleted(mock sqlmock.Sqlmock, id string) {
+func expectCompleted(mock sqlmock.Sqlmock, id string, respBody interface{}) {
 	mock.ExpectExec(
-		"UPDATE a2a_queue SET status = 'completed', completed_at = now() WHERE id = $1").
-		WithArgs(id).
+		"UPDATE a2a_queue SET status = 'completed', completed_at = now(), response_body = $2 WHERE id = $1").
+		WithArgs(id, respBody).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 }
 
@@ -313,7 +313,7 @@ func TestDrainQueueForWorkspace_Success_Completes(t *testing.T) {
 	defer srv.Close()
 	seedRedisURL(t, mr, item.WorkspaceID, srv.URL)
 
-	expectCompleted(mock, item.ID)
+	expectCompleted(mock, item.ID, `{"result":{"status":"ok"}}`)
 
 	handler.DrainQueueForWorkspace(context.Background(), item.WorkspaceID)
 
@@ -335,7 +335,7 @@ func TestDrainQueueForWorkspace_202Accepted_CompletesNotFailed(t *testing.T) {
 	defer srv.Close()
 	seedRedisURL(t, mr, item.WorkspaceID, srv.URL)
 
-	expectCompleted(mock, item.ID)
+	expectCompleted(mock, item.ID, nil)
 
 	handler.DrainQueueForWorkspace(context.Background(), item.WorkspaceID)
 
@@ -508,7 +508,7 @@ func TestDrainQueueForWorkspace_ClaimGuarding_SecondDrainGetsEmpty(t *testing.T)
 	srv := agentServer(`{"result":{}}`, http.StatusOK)
 	defer srv.Close()
 	seedRedisURL(t, mr, wsID, srv.URL)
-	expectCompleted(mock, item.ID)
+	expectCompleted(mock, item.ID, `{"result":{}}`)
 
 	handler.DrainQueueForWorkspace(context.Background(), wsID)
 

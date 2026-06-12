@@ -38,6 +38,7 @@ package handlers
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"log"
 	"net/http"
@@ -58,8 +59,8 @@ type QueueStatus struct {
 	EnqueuedAt   string  `json:"enqueued_at"`
 	DispatchedAt *string `json:"dispatched_at,omitempty"`
 	CompletedAt  *string `json:"completed_at,omitempty"`
-	ExpiresAt    *string `json:"expires_at,omitempty"`
-	ResponseBody []byte  `json:"response_body,omitempty"`
+	ExpiresAt    *string         `json:"expires_at,omitempty"`
+	ResponseBody json.RawMessage `json:"response_body,omitempty"`
 }
 
 // QueueStatusByID looks up the queue row and projects it for the public
@@ -79,13 +80,12 @@ type QueueStatus struct {
 func QueueStatusByID(ctx context.Context, queueID string) (*QueueStatus, error) {
 	var qs QueueStatus
 	var lastError, dispatchedAt, completedAt, expiresAt sql.NullString
-	var responseBody []byte
+	var responseBody json.RawMessage
 
-	// response_body lives on activity_logs (the stitched delegation row), not
-	// on a2a_queue itself. We pull both here in one round-trip via LEFT JOIN
-	// so a completed delegation surfaces its result inline — non-delegation
-	// queue rows simply won't have a matching activity_logs row and the field
-	// stays null.
+	// response_body now lives on the a2a_queue row itself so non-delegation
+	// A2A queue items (e.g. message/send queued while the target is busy) can
+	// surface their result. We still COALESCE with the legacy activity_logs
+	// delegation stitch so existing delegation flows keep working.
 	err := db.DB.QueryRowContext(ctx, `
 		SELECT
 			q.id,
@@ -98,7 +98,7 @@ func QueueStatusByID(ctx context.Context, queueID string) (*QueueStatus, error) 
 			q.dispatched_at::text,
 			q.completed_at::text,
 			q.expires_at::text,
-			al.response_body::text
+			COALESCE(q.response_body::text, al.response_body::text)
 		FROM a2a_queue q
 		LEFT JOIN activity_logs al
 			ON al.method = 'delegate_result'

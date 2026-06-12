@@ -953,7 +953,7 @@ func TestIntegration_A2AQueue_MarkCompletedAndFailed(t *testing.T) {
 	body := []byte(`{"test":true}`)
 	qid := seedA2AQueueItem(t, conn, wsID, "00000000-0000-0000-0000-000000000001", PriorityTask, body, "dispatched")
 
-	MarkQueueItemCompleted(context.Background(), qid)
+	MarkQueueItemCompleted(context.Background(), qid, nil)
 	var status string
 	if err := conn.QueryRowContext(context.Background(), `SELECT status FROM a2a_queue WHERE id = $1`, qid).Scan(&status); err != nil {
 		t.Fatalf("select after completed: %v", err)
