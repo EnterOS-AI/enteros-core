@@ -201,12 +201,12 @@ func (s *PostgresMessageStore) reconstructToolTracesFromAgentLog(
 		WHERE workspace_id = $1
 		  AND activity_type = 'agent_log'
 		  AND source_id = $1
-		  AND summary IS NOT NULL
-		  AND created_at >= $2
-		  AND created_at <= $3
+		  AND summary LIKE $2
+		  AND created_at >= $3
+		  AND created_at <= $4
 		ORDER BY created_at ASC
 		LIMIT 2000
-	`, workspaceID, minStart, maxEnd)
+	`, workspaceID, toolSummaryPrefix+"%", minStart, maxEnd)
 	if err != nil {
 		log.Printf("messagestore: agent_log tool-trace reconstruction query failed for %s: %v (chains omitted)", workspaceID, err)
 		return
@@ -250,13 +250,16 @@ type toolTraceEntry struct {
 	Input string `json:"input,omitempty"`
 }
 
+// toolSummaryPrefix marks a tool-use agent_log summary (the executor's
+// _report_tool_use writes "🛠 <tool>(…)"). The reconstruction query
+// filters to this prefix so NON-tool agent_log summaries that happen to
+// fall in the turn window are never rehydrated as fake tools (CR2).
+const toolSummaryPrefix = "🛠 "
+
 // toolNameFromSummary strips the leading "🛠 " marker from a tool-use
 // agent_log summary, leaving e.g. "mcp__platform__create_request(…)".
-// Non-tool summaries (no marker) pass through unchanged — harmless, but
-// the window query is already scoped to a turn's tool activity.
 func toolNameFromSummary(summary string) string {
-	const marker = "🛠 "
-	return strings.TrimPrefix(strings.TrimSpace(summary), marker)
+	return strings.TrimPrefix(strings.TrimSpace(summary), toolSummaryPrefix)
 }
 
 // reverseRowChunks groups msgs by adjacent same-Timestamp runs and

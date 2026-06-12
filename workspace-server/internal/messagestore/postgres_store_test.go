@@ -605,7 +605,7 @@ func TestList_ReconstructsToolTraceFromAgentLog(t *testing.T) {
 
 	// Reconstruction query: two tool steps inside [end-10s, end].
 	mock.ExpectQuery(`SELECT created_at, summary\s+FROM activity_logs\s+WHERE workspace_id = \$1\s+AND activity_type = 'agent_log'`).
-		WithArgs("ws-1", turnEnd.Add(-10000*1e6), turnEnd).
+		WithArgs("ws-1", "🛠 %", turnEnd.Add(-10000*1e6), turnEnd).
 		WillReturnRows(sqlmock.NewRows([]string{"created_at", "summary"}).
 			AddRow(mustParseTime(t, "2026-06-12T00:00:03Z"), "🛠 mcp__platform__create_approval(…)").
 			AddRow(mustParseTime(t, "2026-06-12T00:00:05Z"), "🛠 mcp__platform__create_request(…)"))
@@ -639,5 +639,67 @@ func TestList_ReconstructsToolTraceFromAgentLog(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// TestReconstruction_FiltersToToolMarker (CR2 on #2639): the SQL filters
+// agent_log summaries to the "🛠 " prefix so non-tool live-feed lines in
+// the same turn window are never rehydrated as fake tools. We assert the
+// query carries the marker LIKE arg, and that the only rows the DB is
+// asked to return (and thus bucket) are tool rows.
+func TestReconstruction_FiltersToToolMarker(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	turnEnd := mustParseTime(t, "2026-06-12T00:00:10Z")
+	mock.ExpectQuery(`SELECT created_at, status, request_body::text, response_body::text, tool_trace::text, duration_ms`).
+		WillReturnRows(sqlmock.NewRows([]string{"created_at", "status", "request_body", "response_body", "tool_trace", "duration_ms"}).
+			AddRow(turnEnd, "ok",
+				`{"params":{"message":{"parts":[{"kind":"text","text":"go"}]}}}`,
+				`{"result":"done"}`, nil, int64(10000)))
+
+	// The reconstruction query MUST pass the "🛠 %" LIKE arg — that is the
+	// DB-level guard that excludes non-tool agent_log summaries. sqlmock's
+	// WithArgs makes a missing/changed marker fail the expectation.
+	mock.ExpectQuery(`activity_type = 'agent_log'.*summary LIKE`).
+		WithArgs("ws-1", "🛠 %", turnEnd.Add(-10000*1e6), turnEnd).
+		WillReturnRows(sqlmock.NewRows([]string{"created_at", "summary"}).
+			AddRow(mustParseTime(t, "2026-06-12T00:00:04Z"), "🛠 Read(/tmp/x)"))
+
+	store := NewPostgresMessageStore(db)
+	msgs, _, err := store.List(context.Background(), "ws-1", ListOptions{Limit: 10})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet sqlmock expectations (marker LIKE arg missing?): %v", err)
+	}
+	var agent *ChatMessage
+	for i := range msgs {
+		if msgs[i].Role == "agent" {
+			agent = &msgs[i]
+		}
+	}
+	var entries []toolTraceEntry
+	if agent != nil && len(agent.ToolTrace) > 0 {
+		_ = json.Unmarshal(agent.ToolTrace, &entries)
+	}
+	if len(entries) != 1 || entries[0].Tool != "Read(/tmp/x)" {
+		t.Fatalf("want exactly the one marker tool, got %+v", entries)
+	}
+}
+
+// TestToolNameFromSummary_NonMarkerUnchanged: defensive — a summary
+// without the marker is returned as-is (the SQL filter is the primary
+// guard; this proves no accidental mangling if one slips through).
+func TestToolNameFromSummary_NonMarkerUnchanged(t *testing.T) {
+	if got := toolNameFromSummary("plain status line"); got != "plain status line" {
+		t.Errorf("got %q, want unchanged", got)
+	}
+	if got := toolNameFromSummary("🛠 Bash(ls)"); got != "Bash(ls)" {
+		t.Errorf("marker not stripped: %q", got)
 	}
 }
