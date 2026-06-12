@@ -151,9 +151,8 @@ func TestRestartProvisionGate_ConcurrentCyclesSerializeOnGate(t *testing.T) {
 	// a chance to interleave (it WON'T, if the gate is doing its job),
 	// (5) records its end time, (6) releases the gate.
 	var (
-		cycleStarts   atomic.Int32
-		cycleEnds     atomic.Int32
-		overlappedObs atomic.Int32
+		cycleStarts atomic.Int32
+		cycleEnds   atomic.Int32
 	)
 
 	cycle := func() {
@@ -191,7 +190,6 @@ func TestRestartProvisionGate_ConcurrentCyclesSerializeOnGate(t *testing.T) {
 	if got := cycleEnds.Load(); got != 2 {
 		t.Errorf("expected 2 cycle ends (matching starts), got %d — cycles overlapped inside the gate's critical section", got)
 	}
-	_ = overlappedObs // reserved for a future overlap-detection test variant
 }
 
 // TestRestartProvisionGate_TwoWorkspacesIndependent verifies the
