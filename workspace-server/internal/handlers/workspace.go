@@ -685,8 +685,27 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 	// Persist initial secrets from the create payload (inside same transaction).
 	// nil/empty map is a no-op.  Any failure rolls back the workspace insert
 	// so we never have a workspace row without its intended secrets.
+	//
+	// Vendor-key guard, CREATE scope (core#2608 companion): the stored-state
+	// resolver cannot see payload.Model yet (the MODEL secret persists after
+	// commit), so a byok create would always misresolve platform_managed here
+	// and reject the very credential the create-boundary gate REQUIRES in the
+	// payload. Derive from the CREATE inputs instead: when (runtime, model,
+	// payload keys) resolves a non-platform arm, vendor keys in this payload
+	// are the atomic-byok-create shape and are allowed; platform-resolving
+	// creates keep the full guard.
+	allowVendorKeysForByokCreate := false
+	if m, regErr := providerRegistry(); regErr == nil && m != nil {
+		keys := make([]string, 0, len(payload.Secrets))
+		for k := range payload.Secrets {
+			keys = append(keys, k)
+		}
+		if prov, dErr := m.DeriveProvider(payload.Runtime, strings.TrimSpace(payload.Model), keys); dErr == nil && !prov.IsPlatform() {
+			allowVendorKeysForByokCreate = true
+		}
+	}
 	for k, v := range payload.Secrets {
-		if rejectPlatformManagedDirectLLMBypassForWorkspace(c, id, k) {
+		if !allowVendorKeysForByokCreate && rejectPlatformManagedDirectLLMBypassForWorkspace(c, id, k) {
 			tx.Rollback() //nolint:errcheck
 			return
 		}

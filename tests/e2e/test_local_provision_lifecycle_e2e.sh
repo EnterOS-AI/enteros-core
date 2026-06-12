@@ -353,8 +353,14 @@ echo "--- Step 2: provision workspace (POST /workspaces) ---"
 # then trigger ONE clean provision via /restart. Seeding the volume is also what
 # makes the restart-survival assertion meaningful: the restart path reuses the
 # volume rather than any template.
+# core#2608: create is now ATOMIC for byok — the create-boundary gate
+# hard-rejects a byok model with no credential in scope, and the create-scope
+# vendor-key guard accepts the credential in the SAME payload (deriving from
+# the payload model instead of the not-yet-stored MODEL secret). So the dummy
+# key rides in the create body; the later flip+write steps remain as
+# idempotent belt-and-suspenders for the restart path.
 CREATE_BODY=$(cat <<JSON
-{"name":"Lifecycle E2E Stub","tier":2,"runtime":"$RUNTIME","model":"$LIFECYCLE_MODEL"}
+{"name":"Lifecycle E2E Stub","tier":2,"runtime":"$RUNTIME","model":"$LIFECYCLE_MODEL","secrets":{"$LIFECYCLE_LLM_KEY":"$LIFECYCLE_LLM_VALUE"}}
 JSON
 )
 RESP=$(admin_curl -X POST "$BASE/workspaces" -H "Content-Type: application/json" -d "$CREATE_BODY")
