@@ -784,17 +784,22 @@ func (h *RegistryHandler) Heartbeat(c *gin.Context) {
 	// heartbeat carries it. Only writes when NULL — never overwrites a
 	// reconciled or updated card. This is the recovery path for fast-cloud
 	// workspaces whose DNS wasn't ready at first register.
+	//
+	// #2659/#2665: also clear last_register_failure_at on this recovery,
+	// otherwise evaluateStatus keeps the workspace stuck in 'degraded'
+	// forever (degraded→online recovery requires no recent register failure).
 	if len(payload.AgentCard) > 0 {
 		res, err := db.DB.ExecContext(ctx, `
 			UPDATE workspaces
-			SET agent_card = $2
+			SET agent_card = $2,
+			    last_register_failure_at = NULL
 			WHERE id = $1 AND agent_card IS NULL
 		`, payload.WorkspaceID, payload.AgentCard)
 		if err != nil {
 			log.Printf("Registry heartbeat: agent_card backfill failed for %s: %v", payload.WorkspaceID, err)
 		} else {
 			if rows, _ := res.RowsAffected(); rows > 0 {
-				log.Printf("Registry heartbeat: backfilled agent_card for %s (initial register had failed)", payload.WorkspaceID)
+				log.Printf("Registry heartbeat: backfilled agent_card and cleared register-failure marker for %s (initial register had failed)", payload.WorkspaceID)
 			}
 		}
 	}

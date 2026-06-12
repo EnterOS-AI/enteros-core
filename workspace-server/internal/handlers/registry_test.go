@@ -942,6 +942,62 @@ func TestHeartbeatHandler_SkipsAgentCardBackfill_WhenAlreadySet(t *testing.T) {
 	}
 }
 
+// TestHeartbeatHandler_BackfillAgentCard_ClearsRegisterFailure verifies the
+// #2659/#2665 recovery path: a healthy heartbeat that backfills a missing
+// agent_card also clears last_register_failure_at, so a workspace that was
+// previously forced degraded by a transient register failure can recover to
+// online instead of staying stuck degraded forever.
+func TestHeartbeatHandler_BackfillAgentCard_ClearsRegisterFailure(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewRegistryHandler(broadcaster)
+
+	mock.ExpectQuery("SELECT COALESCE\\(current_task").
+		WithArgs("ws-degraded-register-fail").
+		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend"}).AddRow("", 0))
+
+	mock.ExpectExec("UPDATE workspaces SET").
+		WithArgs("ws-degraded-register-fail", 0.0, "", 0, 0, "").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// The heartbeat carries an agent_card and the row is NULL, so the backfill
+	// UPDATE must ALSO clear last_register_failure_at.
+	mock.ExpectExec("UPDATE workspaces SET agent_card =").
+		WithArgs("ws-degraded-register-fail", sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// Status check sees degraded, but last_register_failure_at is now NULL because
+	// the agent_card backfill UPDATE cleared it.
+	mock.ExpectQuery("SELECT status, last_register_failure_at FROM workspaces WHERE id =").
+		WithArgs("ws-degraded-register-fail").
+		WillReturnRows(sqlmock.NewRows([]string{"status", "last_register_failure_at"}).AddRow(models.StatusDegraded, nil))
+
+	// Because the failure marker was cleared by the backfill, evaluateStatus
+	// should now recover the workspace to online.
+	mock.ExpectExec("UPDATE workspaces SET status =").
+		WithArgs(models.StatusOnline, "ws-degraded-register-fail").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO structure_events").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+
+	body := `{"workspace_id":"ws-degraded-register-fail","agent_card":{"name":"recovered"}}`
+	c.Request = httptest.NewRequest("POST", "/registry/heartbeat", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Heartbeat(c)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
 // ------------------------------------------------------------
 // validateAgentURL (C6 SSRF fix)
 // ------------------------------------------------------------
