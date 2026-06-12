@@ -7,7 +7,11 @@ import { createMessage, type ChatMessage, type ChatAttachment } from "../types";
 import { extractFilesFromTask } from "../message-parser";
 
 interface A2APart {
-  kind: string;
+  kind?: string;
+  /** A2A v0.2 used `type` as the Part discriminator; v0.3 uses `kind`.
+   *  Real runtimes and third-party agents still emit both, so accept
+   *  either when `kind` is absent. */
+  type?: string;
   text?: string;
   file?: {
     name?: string;
@@ -21,6 +25,9 @@ interface A2AResponse {
   result?: {
     parts?: A2APart[];
     artifacts?: Array<{ parts: A2APart[] }>;
+    /** Standard A2A Task status; real runtimes place the agent's final
+     *  reply inside status.message.parts. */
+    status?: { message?: { parts?: A2APart[] } };
   };
   /** Set by ws-server's poll-mode short-circuit in `proxyA2ARequest`
    *  (a2a_proxy.go:416-431) when the target workspace is registered as
@@ -50,15 +57,24 @@ export function extractReplyText(resp: A2AResponse): string {
   const collect = (parts: A2APart[] | undefined): string => {
     if (!parts) return "";
     return parts
-      .filter((p) => p.kind === "text")
+      .filter((p) => p.kind === "text" || p.type === "text")
       .map((p) => p.text ?? "")
       .filter(Boolean)
       .join("\n");
   };
   const result = resp?.result;
   const collected: string[] = [];
+
+  // Standard A2A JSON-RPC: {result: {parts: [{kind: "text", text: "..."}]}}
   const fromParts = collect(result?.parts);
   if (fromParts) collected.push(fromParts);
+
+  // Standard A2A Task shape: the agent's reply can live in
+  // result.status.message.parts rather than directly on result.parts.
+  // Real runtimes (Claude Code, Hermes, etc.) commonly return this shape.
+  const fromStatusMessage = collect(result?.status?.message?.parts);
+  if (fromStatusMessage) collected.push(fromStatusMessage);
+
   if (result?.artifacts) {
     for (const a of result.artifacts) {
       const t = collect(a.parts);

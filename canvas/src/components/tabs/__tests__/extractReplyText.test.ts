@@ -41,6 +41,50 @@ describe("extractReplyText — A2A result path", () => {
     ).toBe("Hello world");
   });
 
+  it("extracts text from v0.2 parts using type=text", () => {
+    expect(
+      extractReplyText({ result: { parts: [{ type: "text", text: "v0.2 reply" }] } })
+    ).toBe("v0.2 reply");
+  });
+
+  it("prefers kind over type when both are present", () => {
+    expect(
+      extractReplyText({
+        result: { parts: [{ kind: "text", type: "file", text: "kind wins" }] },
+      })
+    ).toBe("kind wins");
+  });
+
+  it("extracts text from result.status.message.parts (standard A2A Task shape)", () => {
+    expect(
+      extractReplyText({
+        result: {
+          status: {
+            message: {
+              parts: [{ kind: "text", text: "Agent final reply" }],
+            },
+          },
+        },
+      })
+    ).toBe("Agent final reply");
+  });
+
+  it("combines result.parts, result.status.message.parts, and artifacts", () => {
+    expect(
+      extractReplyText({
+        result: {
+          parts: [{ kind: "text", text: "Top-level part" }],
+          status: {
+            message: {
+              parts: [{ kind: "text", text: "Status message part" }],
+            },
+          },
+          artifacts: [{ parts: [{ kind: "text", text: "Artifact part" }] }],
+        },
+      })
+    ).toBe("Top-level part\nStatus message part\nArtifact part");
+  });
+
   it("concatenates multiple text parts with newlines (no truncation)", () => {
     expect(
       extractReplyText({
