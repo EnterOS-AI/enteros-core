@@ -16,9 +16,13 @@ package handlers
 // non-registry runtimes).
 
 import (
+	"context"
 	"fmt"
+	"log"
 	"sort"
 	"strings"
+
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 )
 
 // validateRegisteredModelForRuntime reports whether (runtime, model) is
@@ -175,4 +179,92 @@ func validateDerivedProviderInRegistry(runtime, model string) (bool, string) {
 	return false, fmt.Sprintf(
 		"derived provider %q (for model %q on runtime %q) is not in the providers registry; pick a model whose derived provider is one of: %s",
 		p.Name, model, runtime, strings.Join(valid, ", "))
+}
+
+// validateBYOKCredentialSatisfiable (core#2608 hard-fail, CTO 2026-06-11):
+// a model that derives to a NON-platform (BYOK) provider is rejected at the
+// CREATE boundary unless a credential that provider accepts already exists in
+// scope — the payload's initial secrets or the tenant's global_secrets
+// (global scope COUNTS for byok: the #711 revert / Reno-Stars contract).
+// Without this gate, create succeeds and provisioning is GUARANTEED to fail
+// MISSING_BYOK_CREDENTIAL moments later, stranding a dead red node the user
+// has to debug (enter-os first-run, 2026-06-11).
+//
+// Semantics mirror the provision-time preflight, which REMAINS the backstop
+// (a credential can be deleted between create and a later re-provision):
+//   - platform-derived model     → allowed, no key needed, no DB work;
+//   - derive failure             → allowed (#1994: a derive failure defaults
+//     closed to platform_managed, never byok);
+//   - registry/lookup unavailable→ allowed (fail open HERE ONLY because the
+//     provision preflight backstops; a transient
+//     DB blip must not 422 a legitimate create);
+//   - byok-derived + no accepted credential at workspace OR org scope → 422.
+func validateBYOKCredentialSatisfiable(ctx context.Context, runtime, model string, payloadSecretKeys []string) (bool, string) {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return true, "" // MODEL_REQUIRED owns this.
+	}
+	m, err := providerRegistry()
+	if err != nil || m == nil {
+		return true, ""
+	}
+	// First derive with payload-scope auth names only: the platform slash-form
+	// ids (the SSOT default path) resolve without any credential context and
+	// must stay query-free on the happy path.
+	prov, dErr := m.DeriveProvider(runtime, model, payloadSecretKeys)
+	if dErr != nil {
+		return true, ""
+	}
+	if prov.IsPlatform() {
+		return true, ""
+	}
+	// BYOK-derived: widen the auth context with the tenant's global secret
+	// KEYS (names only, never values) and re-derive — a global key can both
+	// flip the arm disambiguation and satisfy the requirement. A failed key
+	// scan fails OPEN (per the contract above): rejecting on partial context
+	// would 422 legitimate byok creates whose credential lives at global
+	// scope (the Reno-Stars class) on any transient DB blip.
+	globalKeys, ok := globalSecretKeyNames(ctx)
+	if !ok {
+		return true, ""
+	}
+	avail := append(append([]string{}, payloadSecretKeys...), globalKeys...)
+	prov, dErr = m.DeriveProvider(runtime, model, avail)
+	if dErr != nil {
+		return true, ""
+	}
+	if prov.IsPlatform() {
+		return true, ""
+	}
+	for _, want := range prov.AuthEnv {
+		for _, have := range avail {
+			if have == want {
+				return true, ""
+			}
+		}
+	}
+	return false, fmt.Sprintf(
+		"model %q resolves to BYOK provider %q but no credential it accepts (%s) exists at workspace or org scope — the workspace would be created and then fail provisioning with MISSING_BYOK_CREDENTIAL. Add one of those secrets first, or pick a platform-billed model (the vendor/model slash form, e.g. moonshot/kimi-k2.6 — no key needed).",
+		model, prov.Name, strings.Join(prov.AuthEnv, ", "))
+}
+
+// globalSecretKeyNames returns the tenant's global_secrets key names (never
+// values) and whether the scan succeeded. A query error returns (nil, false)
+// with a log line — the caller fails open and the provision preflight
+// backstops.
+func globalSecretKeyNames(ctx context.Context) ([]string, bool) {
+	rows, err := db.DB.QueryContext(ctx, `SELECT key FROM global_secrets`)
+	if err != nil {
+		log.Printf("byok-create-preflight: global_secrets key scan failed (failing open; provision preflight backstops): %v", err)
+		return nil, false
+	}
+	defer rows.Close()
+	var keys []string
+	for rows.Next() {
+		var k string
+		if rows.Scan(&k) == nil {
+			keys = append(keys, k)
+		}
+	}
+	return keys, true
 }
