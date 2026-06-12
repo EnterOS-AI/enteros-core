@@ -106,8 +106,14 @@ class H(http.server.BaseHTTPRequestHandler):
         elif "dns_records" in rest:
             payload = {"success": True, "errors": [], "messages": [], "result": []}
         elif "zones/" in rest:
+            # URL is /client/v4/zones/{id}[/...]. rest is
+            # "client/v4/zones/{id}[/...]" so the zone id is the
+            # 4th segment (index 3). The previous seg[2] read
+            # literally the literal "zones" token, which made
+            # every active/down case return zone id "zones" and
+            # trip the preflight's mismatch check.
             seg = rest.split("/")
-            zone_id = seg[2] if len(seg) > 2 else "test"
+            zone_id = seg[3] if len(seg) > 3 else (seg[-1] if seg else "test")
             if scenario == "mismatch":
                 payload = {
                     "success": True, "errors": [], "messages": [],
@@ -138,12 +144,15 @@ srv = socketserver.TCPServer(("127.0.0.1", int(sys.argv[1])), H)
 srv.serve_forever()
 PYEOF
 
-# Find a free port
+# Find a free port. Use SO_REUSEADDR on the probe so we don't
+# lose a port to TIME_WAIT after the probe (which races the server's
+# bind in CI under load).
 PORT=""
 for tryport in $(seq 18080 18180); do
   if python3 -c "
 import socket, sys
 s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 try:
     s.bind(('127.0.0.1', $tryport))
 except OSError:
@@ -161,20 +170,50 @@ python3 "$SRVDIR/server.py" "$PORT" >"$SRVDIR/server.out" 2>&1 &
 SRV_PID=$!
 trap 'kill $SRV_PID 2>/dev/null || true; rm -rf "$SRVDIR"' EXIT
 
-# Wait for server to bind (up to 10s — startup can be slow on
-# busy CI runners; observed >1s locally when the shell is also busy
-# doing other work). 50 × 0.2s = 10s ceiling.
+# Wait for server to bind (up to 15s — startup can be slow on busy
+# CI runners, and a server that has bound-but-not-yet-accepting
+# needs a moment to enter its accept loop). Use a Python-based
+# readiness probe (TCP connect + HTTP GET + JSON parse) so we get
+# a single source of truth on "the mock can serve the canonical
+# request" rather than chaining curl + grep + shell, which has
+# racey pipe-handle interactions under load. Also verify the
+# server PID is still alive so a crash surfaces with its stderr
+# instead of timing out silently.
 ready=false
-for _ in $(seq 1 50); do
-  if curl -sS --max-time 1 "http://127.0.0.1:$PORT/client/v4/user/tokens/verify" 2>/dev/null | grep -q '"status":"active"'; then
+for _ in $(seq 1 75); do
+  if ! kill -0 "$SRV_PID" 2>/dev/null; then
+    cat "$SRVDIR/server.out" >&2 || true
+    fail "mock server PID $SRV_PID died during startup; stderr above"
+  fi
+  if python3 -c "
+import json, socket, sys, urllib.request, urllib.error
+try:
+    s = socket.create_connection(('127.0.0.1', $PORT), timeout=1)
+except (OSError, socket.timeout):
+    sys.exit(1)
+s.close()
+try:
+    r = urllib.request.urlopen('http://127.0.0.1:$PORT/client/v4/user/tokens/verify', timeout=2)
+    body = r.read().decode()
+except (urllib.error.URLError, OSError, socket.timeout):
+    sys.exit(1)
+try:
+    p = json.loads(body)
+except Exception:
+    sys.exit(1)
+if p.get('result', {}).get('status') == 'active':
+    sys.exit(0)
+sys.exit(1)
+" 2>/dev/null; then
     ready=true
     break
   fi
   sleep 0.2
 done
 if [[ "$ready" != "true" ]]; then
+  echo "mock server stderr/stdout so far:" >&2
   cat "$SRVDIR/server.out" >&2 || true
-  fail "mock server didn't come up on port $PORT"
+  fail "mock server didn't come up on port $PORT within 15s"
 fi
 pass "mock CF server up on http://127.0.0.1:$PORT"
 
@@ -189,7 +228,7 @@ MOCK_BASE_INACTIVE="http://127.0.0.1:$PORT/scenario-inactive/client/v4"
 MOCK_BASE_MISMATCH="http://127.0.0.1:$PORT/scenario-mismatch/client/v4"
 MOCK_BASE_DOWN="http://127.0.0.1:$PORT/scenario-down/client/v4"
 sed -i "s|$CF_BASE|$MOCK_BASE|g" "$WORK"
-EXPECTED_COUNT=3
+EXPECTED_COUNT=4
 ACTUAL_COUNT=$(grep -c "$MOCK_BASE" "$WORK" || true)
 [ "$ACTUAL_COUNT" = "$EXPECTED_COUNT" ] \
   || fail "expected $EXPECTED_COUNT occurrences of mock base in patched script, got: $ACTUAL_COUNT"
@@ -228,9 +267,14 @@ echo "$out_a" | grep -q "zone test-zone-id reachable" \
 pass "(a) preflight passes when token is active and zone is reachable"
 
 # (b) Inactive token — preflight fails BEFORE any gather work.
-# CRITICAL: the gather steps must NOT have happened.
+# CRITICAL: the gather steps must NOT have happened. Use the same
+# env as the success case (NOT just CF_API_TOKEN) so the script's
+# `need CF_ZONE_ID` guard passes and we actually exercise the
+# preflight's auth-failure path — otherwise a missing CF_ZONE_ID
+# would short-circuit at the `need` check, masking the regression
+# we want to catch.
 echo "=== (b) inactive token ==="
-out_b=$(env CF_API_TOKEN=inactive-token bash "$SRVDIR/patched-inactive.sh" 2>&1 || true)
+out_b=$(env "${ENV_TOKENS[@]}" CF_API_TOKEN=inactive-token bash "$SRVDIR/patched-inactive.sh" 2>&1 || true)
 echo "$out_b" | grep -q "CF preflight FAILED" \
   || fail "(b) expected 'CF preflight FAILED' in output, got: $(echo "$out_b" | head -10)"
 if echo "$out_b" | grep -qE "Fetching CP prod org slugs|Fetching live EC2 Name tags|Fetching Cloudflare DNS records"; then
