@@ -651,6 +651,100 @@ func TestRequests_AddMessage_RequesterDoesNotFlip(t *testing.T) {
 	}
 }
 
+// ---------- AddMessage workspace-token authz (core#2542 / core#2606) ----------
+
+func TestRequests_AddMessage_AgentPath_Recipient_BindsToCaller(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewRequestsHandler(newTestBroadcaster())
+
+	// URL workspace ws-2 is the recipient. The body tries to spoof ws-EVIL.
+	mock.ExpectQuery("FROM requests WHERE id").
+		WithArgs("req-1").
+		WillReturnRows(oneRequestRow("req-1", "task", "ws-1", "agent", "ws-2", "pending"))
+	// Handler must bind author to ws-2, not the spoofed body value.
+	mock.ExpectQuery("INSERT INTO request_messages").
+		WithArgs("req-1", "agent", "ws-2", "which file?").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("msg-1"))
+	mock.ExpectExec("UPDATE requests SET status = 'info_requested'").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO structure_events").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{
+		{Key: "requestId", Value: "req-1"},
+		{Key: "id", Value: "ws-2"},
+	}
+	c.Request = httptest.NewRequest("POST", "/", bytes.NewBufferString(`{"body":"which file?","author_type":"agent","author_id":"ws-EVIL"}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.AddMessage(c)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestRequests_AddMessage_AgentPath_Requester_BindsToCaller(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewRequestsHandler(newTestBroadcaster())
+
+	// URL workspace ws-1 is the requester. Body author_id is ignored.
+	mock.ExpectQuery("FROM requests WHERE id").
+		WithArgs("req-1").
+		WillReturnRows(oneRequestRow("req-1", "task", "ws-1", "agent", "ws-2", "info_requested"))
+	mock.ExpectQuery("INSERT INTO request_messages").
+		WithArgs("req-1", "agent", "ws-1", "here is the file").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("msg-2"))
+	// No status flip — requester is not the recipient.
+	mock.ExpectExec("INSERT INTO structure_events").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{
+		{Key: "requestId", Value: "req-1"},
+		{Key: "id", Value: "ws-1"},
+	}
+	c.Request = httptest.NewRequest("POST", "/", bytes.NewBufferString(`{"body":"here is the file","author_type":"agent","author_id":"ws-EVIL"}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.AddMessage(c)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestRequests_AddMessage_AgentPath_NonParticipant_403(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewRequestsHandler(newTestBroadcaster())
+
+	// URL workspace ws-3 is neither requester nor recipient.
+	mock.ExpectQuery("FROM requests WHERE id").
+		WithArgs("req-1").
+		WillReturnRows(oneRequestRow("req-1", "task", "ws-1", "agent", "ws-2", "pending"))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{
+		{Key: "requestId", Value: "req-1"},
+		{Key: "id", Value: "ws-3"},
+	}
+	c.Request = httptest.NewRequest("POST", "/", bytes.NewBufferString(`{"body":"pwned","author_type":"agent","author_id":"ws-2"}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.AddMessage(c)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for non-participant, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
 // ---------- Cancel ----------
 
 func TestRequests_Cancel_Success(t *testing.T) {
