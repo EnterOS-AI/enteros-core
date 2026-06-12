@@ -68,20 +68,22 @@ test.describe("Desktop ChatTab", () => {
   });
 
   test("send text message and receive echo response", async ({ page }) => {
+    const chat = page.locator("#panel-chat [data-testid='chat-panel']");
     const textarea = page.locator("#panel-chat textarea").first();
     await textarea.fill("What is the weather?");
     await page.getByRole("button", { name: /Send/ }).first().click();
 
-    await expect(page.getByText("What is the weather?", { exact: true })).toBeVisible({ timeout: 5_000 });
-    await expect(page.getByText("Echo: What is the weather?")).toBeVisible({ timeout: 15_000 });
+    await expect(chat.getByText("What is the weather?", { exact: true })).toBeVisible({ timeout: 5_000 });
+    await expect(chat.getByText("Echo: What is the weather?")).toBeVisible({ timeout: 15_000 });
   });
 
   test("history persists across reload", async ({ page }) => {
+    const chat = page.locator("#panel-chat [data-testid='chat-panel']");
     const textarea = page.locator("#panel-chat textarea").first();
     await textarea.fill("Persistence test");
     await page.getByRole("button", { name: /Send/ }).first().click();
 
-    await expect(page.getByText("Echo: Persistence test")).toBeVisible({ timeout: 15_000 });
+    await expect(chat.getByText("Echo: Persistence test")).toBeVisible({ timeout: 15_000 });
 
     await page.reload();
     await enterMapView(page);
@@ -92,11 +94,12 @@ test.describe("Desktop ChatTab", () => {
     // Wait for the workspace status to flip to online and the textarea to be enabled.
     await expect(page.locator("#panel-chat textarea").first()).toBeEnabled({ timeout: 15_000 });
 
-    await expect(page.getByText("Persistence test", { exact: true })).toBeVisible({ timeout: 5_000 });
-    await expect(page.getByText("Echo: Persistence test")).toBeVisible({ timeout: 5_000 });
+    await expect(chat.getByText("Persistence test", { exact: true })).toBeVisible({ timeout: 5_000 });
+    await expect(chat.getByText("Echo: Persistence test")).toBeVisible({ timeout: 5_000 });
   });
 
   test("file attachment round-trip", async ({ page }) => {
+    const chat = page.locator("#panel-chat [data-testid='chat-panel']");
     const textarea = page.locator("#panel-chat textarea").first();
     await textarea.fill("Please read this file");
 
@@ -111,7 +114,7 @@ test.describe("Desktop ChatTab", () => {
 
     await page.getByRole("button", { name: /Send/ }).first().click();
 
-    await expect(page.getByText("Echo: Please read this file")).toBeVisible({ timeout: 15_000 });
+    await expect(chat.getByText("Echo: Please read this file")).toBeVisible({ timeout: 15_000 });
   });
 
   test("activity log appears during send", async ({ page }) => {
@@ -175,25 +178,27 @@ test.describe("Desktop ChatTab — Markdown rendering", () => {
   });
 
   test("code block renders <pre>", async ({ page }) => {
+    const chat = page.locator("#panel-chat [data-testid='chat-panel']");
     const textarea = page.locator("#panel-chat textarea").first();
     await textarea.fill("```js\nconst x = 1;\n```");
     await page.getByRole("button", { name: /Send/ }).first().click();
 
-    await expect(page.getByText("Echo: ```js")).toBeVisible({ timeout: 15_000 });
+    await expect(chat.getByText("Echo: ```js")).toBeVisible({ timeout: 15_000 });
 
-    const pre = page.locator("pre").first();
+    const pre = chat.locator("pre").first();
     await expect(pre).toBeVisible({ timeout: 5_000 });
     await expect(pre).toContainText("const x = 1;");
   });
 
   test("table renders <table>", async ({ page }) => {
+    const chat = page.locator("#panel-chat [data-testid='chat-panel']");
     const textarea = page.locator("#panel-chat textarea").first();
     await textarea.fill("| A | B |\n|---|---|\n| 1 | 2 |");
     await page.getByRole("button", { name: /Send/ }).first().click();
 
-    await expect(page.getByText("Echo: | A | B |")).toBeVisible({ timeout: 15_000 });
+    await expect(chat.getByText("Echo: | A | B |")).toBeVisible({ timeout: 15_000 });
 
-    const table = page.locator("table").first();
+    const table = chat.locator("table").first();
     await expect(table).toBeVisible({ timeout: 5_000 });
     await expect(table).toContainText("A");
     await expect(table).toContainText("1");
