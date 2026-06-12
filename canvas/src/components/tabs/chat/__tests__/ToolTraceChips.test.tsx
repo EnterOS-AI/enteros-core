@@ -32,3 +32,23 @@ describe("ToolTraceChips (core#2636 tool-chain persistence)", () => {
     expect(screen.getByText("1 tool used")).toBeTruthy();
   });
 });
+
+describe("ToolTraceChips formatTool shapes", () => {
+  it("renders a reconstructed entry (no input) as-is, no doubled parens", () => {
+    const { container } = render(
+      <ToolTraceChips trace={[{ tool: "mcp__platform__create_request(…)" }]} />,
+    );
+    fireEvent.click(container.querySelector("button")!);
+    const li = container.querySelector("li")!;
+    expect(li.textContent).toBe("🛠 mcp__platform__create_request(…)");
+    // No doubled parens from the formatter appending its own "(…)".
+    expect(li.textContent).not.toContain("(…)(…)");
+  });
+  it("renders a column-source entry as tool(input)", () => {
+    const { container } = render(
+      <ToolTraceChips trace={[{ tool: "Read", input: "/tmp/foo" }]} />,
+    );
+    fireEvent.click(container.querySelector("button")!);
+    expect(container.querySelector("li")!.textContent).toBe("🛠 Read(/tmp/foo)");
+  });
+});

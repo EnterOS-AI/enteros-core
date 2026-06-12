@@ -83,6 +83,11 @@ func (s *PostgresMessageStore) List(ctx context.Context, workspaceID string, opt
 	defer rows.Close()
 
 	var messages []ChatMessage
+	// Turns whose agent message has no explicit tool_trace column but DID
+	// run for a measurable duration are candidates for reconstruction from
+	// the per-tool agent_log rows (the live-feed source) — see
+	// reconstructToolTracesFromAgentLog. Tracks (message index, window).
+	var reconstructTargets []agentTurnWindow
 	rowCount := 0
 	for rows.Next() {
 		var (
@@ -91,8 +96,9 @@ func (s *PostgresMessageStore) List(ctx context.Context, workspaceID string, opt
 			rawRequest  sql.NullString
 			rawResponse sql.NullString
 			rawTrace    sql.NullString
+			durationMs  sql.NullInt64
 		)
-		if err := rows.Scan(&createdAt, &status, &rawRequest, &rawResponse, &rawTrace); err != nil {
+		if err := rows.Scan(&createdAt, &status, &rawRequest, &rawResponse, &rawTrace, &durationMs); err != nil {
 			// Skip malformed row, continue. The error is logged at
 			// the caller (handler) layer; an isolated bad row should
 			// not abort the whole page.
@@ -110,10 +116,36 @@ func (s *PostgresMessageStore) List(ctx context.Context, workspaceID string, opt
 		if rawTrace.Valid && rawTrace.String != "" && rawTrace.String != "null" {
 			toolTrace = json.RawMessage(rawTrace.String)
 		}
+		before := len(messages)
 		messages = append(messages, activityRowToChatMessages(createdAt, status, requestBody, responseBody, toolTrace, IsInternalSelfMessage)...)
+		// If the row produced an agent message with NO explicit tool_trace
+		// but ran long enough to have invoked tools, mark it for
+		// agent_log reconstruction. duration_ms bounds the window
+		// [end-duration, end] the per-tool rows fall in.
+		if toolTrace == nil && durationMs.Valid && durationMs.Int64 > 0 {
+			for i := before; i < len(messages); i++ {
+				if messages[i].Role == "agent" {
+					reconstructTargets = append(reconstructTargets, agentTurnWindow{
+						msgIndex: i,
+						start:    createdAt.Add(-time.Duration(durationMs.Int64) * time.Millisecond),
+						end:      createdAt,
+					})
+				}
+			}
+		}
 	}
 	if err := rows.Err(); err != nil {
 		return nil, false, err
+	}
+
+	// Reconstruct tool chains for claude-code-style turns (tool steps are
+	// emitted as per-tool agent_log rows, not into the response metadata's
+	// tool_trace) so the canvas re-renders them after a reload — the
+	// platform agent + every claude-code workspace take this path
+	// (core#2636 follow-up). Best-effort: a query error leaves those turns
+	// without a chain rather than failing the whole page.
+	if len(reconstructTargets) > 0 {
+		s.reconstructToolTracesFromAgentLog(ctx, workspaceID, messages, reconstructTargets)
 	}
 
 	// Wire order: oldest-first within the page so canvas (and any
@@ -133,6 +165,98 @@ func (s *PostgresMessageStore) List(ctx context.Context, workspaceID string, opt
 
 	reachedEnd := rowCount < opts.Limit
 	return messages, reachedEnd, nil
+}
+
+// agentTurnWindow ties one agent ChatMessage (by slice index) to the
+// [start, end] wall-clock window of its turn, so per-tool agent_log rows
+// in that window can be reattached as the turn's tool chain.
+type agentTurnWindow struct {
+	msgIndex int
+	start    time.Time
+	end      time.Time
+}
+
+// reconstructToolTracesFromAgentLog fills ToolTrace for agent turns that
+// had none on the a2a_receive row, by reading the per-tool agent_log
+// rows (summary "🛠 <tool>(…)", source_id = the workspace itself) that
+// fall inside each turn's window. ONE batched query bounded by the
+// overall page span; each row is bucketed into the turn whose window
+// contains it. Mutates messages in place. Best-effort — logs and
+// returns on error.
+func (s *PostgresMessageStore) reconstructToolTracesFromAgentLog(
+	ctx context.Context, workspaceID string, messages []ChatMessage, targets []agentTurnWindow,
+) {
+	minStart, maxEnd := targets[0].start, targets[0].end
+	for _, t := range targets {
+		if t.start.Before(minStart) {
+			minStart = t.start
+		}
+		if t.end.After(maxEnd) {
+			maxEnd = t.end
+		}
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT created_at, summary
+		FROM activity_logs
+		WHERE workspace_id = $1
+		  AND activity_type = 'agent_log'
+		  AND source_id = $1
+		  AND summary IS NOT NULL
+		  AND created_at >= $2
+		  AND created_at <= $3
+		ORDER BY created_at ASC
+		LIMIT 2000
+	`, workspaceID, minStart, maxEnd)
+	if err != nil {
+		log.Printf("messagestore: agent_log tool-trace reconstruction query failed for %s: %v (chains omitted)", workspaceID, err)
+		return
+	}
+	defer rows.Close()
+
+	type logRow struct {
+		at      time.Time
+		summary string
+	}
+	var logs []logRow
+	for rows.Next() {
+		var at time.Time
+		var summary sql.NullString
+		if rows.Scan(&at, &summary) == nil && summary.Valid && summary.String != "" {
+			logs = append(logs, logRow{at: at, summary: summary.String})
+		}
+	}
+
+	for _, t := range targets {
+		var entries []toolTraceEntry
+		for _, lr := range logs {
+			if (lr.at.Equal(t.start) || lr.at.After(t.start)) && (lr.at.Equal(t.end) || lr.at.Before(t.end)) {
+				entries = append(entries, toolTraceEntry{Tool: toolNameFromSummary(lr.summary)})
+			}
+		}
+		if len(entries) == 0 {
+			continue
+		}
+		if raw, mErr := json.Marshal(entries); mErr == nil {
+			messages[t.msgIndex].ToolTrace = raw
+		}
+	}
+}
+
+// toolTraceEntry mirrors the canvas ToolTraceEntry / the tool_trace array
+// element shape ({tool, input}). Reconstructed rows carry only the tool
+// (the agent_log summary), no input.
+type toolTraceEntry struct {
+	Tool  string `json:"tool"`
+	Input string `json:"input,omitempty"`
+}
+
+// toolNameFromSummary strips the leading "🛠 " marker from a tool-use
+// agent_log summary, leaving e.g. "mcp__platform__create_request(…)".
+// Non-tool summaries (no marker) pass through unchanged — harmless, but
+// the window query is already scoped to a turn's tool activity.
+func toolNameFromSummary(summary string) string {
+	const marker = "🛠 "
+	return strings.TrimPrefix(strings.TrimSpace(summary), marker)
 }
 
 // reverseRowChunks groups msgs by adjacent same-Timestamp runs and
@@ -171,7 +295,7 @@ func reverseRowChunks(msgs []ChatMessage) []ChatMessage {
 func (s *PostgresMessageStore) queryActivityRows(ctx context.Context, workspaceID string, opts ListOptions) (*sql.Rows, error) {
 	if opts.HasBefore {
 		return s.db.QueryContext(ctx, `
-			SELECT created_at, status, request_body::text, response_body::text, tool_trace::text
+			SELECT created_at, status, request_body::text, response_body::text, tool_trace::text, duration_ms
 			FROM activity_logs
 			WHERE workspace_id = $1
 			  AND activity_type = 'a2a_receive'
@@ -182,7 +306,7 @@ func (s *PostgresMessageStore) queryActivityRows(ctx context.Context, workspaceI
 		`, workspaceID, opts.BeforeTS, opts.Limit)
 	}
 	return s.db.QueryContext(ctx, `
-		SELECT created_at, status, request_body::text, response_body::text, tool_trace::text
+		SELECT created_at, status, request_body::text, response_body::text, tool_trace::text, duration_ms
 		FROM activity_logs
 		WHERE workspace_id = $1
 		  AND activity_type = 'a2a_receive'

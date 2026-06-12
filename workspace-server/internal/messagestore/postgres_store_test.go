@@ -309,16 +309,16 @@ func TestList_WireOrderIsOldestFirstAcrossPagedRows(t *testing.T) {
 
 	// Server's SQL is ORDER BY created_at DESC. Build mock rows in
 	// THAT order so the row-aware reversal has work to do.
-	rows := sqlmock.NewRows([]string{"created_at", "status", "request_body", "response_body", "tool_trace"}).
+	rows := sqlmock.NewRows([]string{"created_at", "status", "request_body", "response_body", "tool_trace", "duration_ms"}).
 		AddRow(mustParseTime(t, "2026-05-05T00:03:00Z"), "ok",
 			`{"params":{"message":{"parts":[{"kind":"text","text":"u3"}]}}}`,
-			`{"result":"a3"}`, nil).
+			`{"result":"a3"}`, nil, nil).
 		AddRow(mustParseTime(t, "2026-05-05T00:02:00Z"), "ok",
 			`{"params":{"message":{"parts":[{"kind":"text","text":"u2"}]}}}`,
-			`{"result":"a2"}`, nil).
+			`{"result":"a2"}`, nil, nil).
 		AddRow(mustParseTime(t, "2026-05-05T00:01:00Z"), "ok",
 			`{"params":{"message":{"parts":[{"kind":"text","text":"u1"}]}}}`,
-			`{"result":"a1"}`, nil)
+			`{"result":"a1"}`, nil, nil)
 
 	mock.ExpectQuery(`SELECT created_at, status, request_body::text, response_body::text`).
 		WillReturnRows(rows)
@@ -581,5 +581,63 @@ func TestActivityRow_AgentMessageCarriesToolTrace(t *testing.T) {
 	}
 	if msgs[1].Role != "agent" || string(msgs[1].ToolTrace) != string(trace) {
 		t.Errorf("agent message must carry the tool_trace; got %q", string(msgs[1].ToolTrace))
+	}
+}
+
+// TestList_ReconstructsToolTraceFromAgentLog (core#2636 follow-up): a
+// claude-code turn stores tool steps as per-tool agent_log rows, not in
+// the response tool_trace column. List must reconstruct the chain from
+// those rows so the chat reload re-renders it.
+func TestList_ReconstructsToolTraceFromAgentLog(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	turnEnd := mustParseTime(t, "2026-06-12T00:00:10Z")
+	// a2a_receive turn: 10s duration, NULL tool_trace.
+	mock.ExpectQuery(`SELECT created_at, status, request_body::text, response_body::text, tool_trace::text, duration_ms`).
+		WillReturnRows(sqlmock.NewRows([]string{"created_at", "status", "request_body", "response_body", "tool_trace", "duration_ms"}).
+			AddRow(turnEnd, "ok",
+				`{"params":{"message":{"parts":[{"kind":"text","text":"do it"}]}}}`,
+				`{"result":"done"}`, nil, int64(10000)))
+
+	// Reconstruction query: two tool steps inside [end-10s, end].
+	mock.ExpectQuery(`SELECT created_at, summary\s+FROM activity_logs\s+WHERE workspace_id = \$1\s+AND activity_type = 'agent_log'`).
+		WithArgs("ws-1", turnEnd.Add(-10000*1e6), turnEnd).
+		WillReturnRows(sqlmock.NewRows([]string{"created_at", "summary"}).
+			AddRow(mustParseTime(t, "2026-06-12T00:00:03Z"), "🛠 mcp__platform__create_approval(…)").
+			AddRow(mustParseTime(t, "2026-06-12T00:00:05Z"), "🛠 mcp__platform__create_request(…)"))
+
+	store := NewPostgresMessageStore(db)
+	msgs, _, err := store.List(context.Background(), "ws-1", ListOptions{Limit: 10})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	var agent *ChatMessage
+	for i := range msgs {
+		if msgs[i].Role == "agent" {
+			agent = &msgs[i]
+		}
+	}
+	if agent == nil {
+		t.Fatalf("no agent message; got %+v", msgs)
+	}
+	if len(agent.ToolTrace) == 0 {
+		t.Fatalf("agent message has no reconstructed tool_trace")
+	}
+	var entries []toolTraceEntry
+	if err := json.Unmarshal(agent.ToolTrace, &entries); err != nil {
+		t.Fatalf("tool_trace not valid JSON: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("want 2 reconstructed tools, got %d: %+v", len(entries), entries)
+	}
+	if entries[0].Tool != "mcp__platform__create_approval(…)" {
+		t.Errorf("first tool = %q, want the 🛠-stripped summary", entries[0].Tool)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
 	}
 }
