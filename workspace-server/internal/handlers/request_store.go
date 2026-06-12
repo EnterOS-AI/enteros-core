@@ -21,11 +21,13 @@ package handlers
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
+	"github.com/google/uuid"
 )
 
 // ErrRequestNotFound is returned by Get/Respond/RequestInfo/Cancel/AddMessage
@@ -144,6 +146,39 @@ func broadcastTarget(requesterType, requesterID, recipientType, recipientID stri
 		return recipientID
 	}
 	return ""
+}
+
+// requestNotifyEnqueue is the a2a-queue enqueue used to deliver
+// request-outcome notifications to a REQUESTER agent as a real inbound turn.
+// Package-level var (default: the real EnqueueA2A) so tests can intercept —
+// mirrors RequestNudgeSweeper's enqueueFunc injection.
+var requestNotifyEnqueue enqueueFunc = EnqueueA2A
+
+// notifyRequesterAgent enqueues a message/send A2A turn to the requester
+// agent. Used on terminal responses and recipient-authored More-Info
+// messages (CTO 2026-06-11): a human clicking Done/Reject/Approve — or
+// asking for clarification — must reach the agent that raised the request
+// as an actual turn, not only as a structure event the agent never reads.
+// Best-effort: an enqueue failure is logged, never surfaced — the durable
+// truth is the requests row, and check_requests remains the pull path.
+func (s *RequestStore) notifyRequesterAgent(ctx context.Context, req RequestRow, idemKey, text string) {
+	body, err := json.Marshal(map[string]interface{}{
+		"method": "message/send",
+		"params": map[string]interface{}{
+			"message": map[string]interface{}{
+				"role":      "user",
+				"messageId": idemKey + "-" + uuid.New().String(),
+				"parts":     []map[string]interface{}{{"kind": "text", "text": text}},
+			},
+		},
+	})
+	if err != nil {
+		log.Printf("request: build requester notification for %s failed: %v", req.ID, err)
+		return
+	}
+	if _, _, err := requestNotifyEnqueue(ctx, req.RequesterID, "", PriorityInfo, body, "message/send", idemKey, nil); err != nil {
+		log.Printf("request: enqueue requester notification for %s -> %s failed: %v", req.ID, req.RequesterID, err)
+	}
 }
 
 // Create inserts a new pending request and broadcasts REQUEST_CREATED (anchored
@@ -435,6 +470,24 @@ func (s *RequestStore) Respond(ctx context.Context, id, action, responderType, r
 		}
 	}
 
+	// Deliver the outcome to the requester AGENT as a real inbound turn
+	// (core#2606 follow-up, CTO 2026-06-11). The REQUEST_RESPONDED event
+	// above only feeds the canvas/event stream; an agent waiting on an
+	// approval otherwise learns the decision only if something prompts it
+	// to call check_requests. Skip self-notification (agent responded to
+	// its own... impossible per the self-response guard, but cheap belt).
+	if req.RequesterType == "agent" && req.RequesterID != "" &&
+		(responderType != "agent" || responderID != req.RequesterID) {
+		by := "the user"
+		if responderType == "agent" {
+			by = "agent " + responderID
+		}
+		s.notifyRequesterAgent(ctx, req,
+			"request-responded:"+req.ID,
+			fmt.Sprintf("Your %s request %q (id %s) was %s by %s. Use get_request for the thread or check_requests for all your outcomes.",
+				req.Kind, req.Title, req.ID, status, by))
+	}
+
 	req.Status = status
 	req.ResponderType = &responderType
 	req.ResponderID = &responderID
@@ -511,6 +564,18 @@ func (s *RequestStore) AddMessage(ctx context.Context, id, authorType, authorID,
 		}); err != nil {
 			log.Printf("request: failed to broadcast message for %s: %v", id, err)
 		}
+	}
+
+	// More-Info from the recipient must reach a requester AGENT as a real
+	// turn (same rationale as the Respond notification — CTO 2026-06-11).
+	// Keyed per message so a multi-round clarification thread delivers each
+	// ask; the requester replies with add_request_message.
+	if authorType == req.RecipientType && authorID == req.RecipientID &&
+		req.RequesterType == "agent" && req.RequesterID != "" {
+		s.notifyRequesterAgent(ctx, req,
+			"request-message:"+messageID,
+			fmt.Sprintf("More info requested on your %s request %q (id %s): %s\nReply with add_request_message.",
+				req.Kind, req.Title, req.ID, body))
 	}
 
 	return messageID, nil

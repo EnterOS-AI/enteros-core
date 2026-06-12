@@ -322,6 +322,13 @@ func (h *RequestsHandler) Respond(c *gin.Context) {
 // More-Info thread. When the author is the recipient, the request flips to
 // info_requested.
 //
+// Workspace-token auth path (/workspaces/:id/requests/:requestId/messages):
+// the caller must be a participant (requester or recipient), and the author
+// identity is BOUND to the authenticated workspace — body author_type/author_id
+// are ignored. This prevents a workspace-token holder from spoofing another
+// party or flipping an unrelated request to info_requested (core#2542 /
+// core#2606).
+//
 //	@Summary	Add a message to a request's More-Info thread
 //	@Tags		requests
 //	@Accept		json
@@ -330,6 +337,7 @@ func (h *RequestsHandler) Respond(c *gin.Context) {
 //	@Param		body		body		AddRequestMessageBody	true	"Message"
 //	@Success	201			{object}	RequestMutationResponse
 //	@Failure	400			{object}	ErrorResponse
+//	@Failure	403			{object}	ErrorResponse
 //	@Failure	404			{object}	ErrorResponse
 //	@Failure	500			{object}	ErrorResponse
 //	@Router		/requests/{requestId}/messages [post]
@@ -344,7 +352,34 @@ func (h *RequestsHandler) AddMessage(c *gin.Context) {
 		return
 	}
 
-	messageID, err := h.store().AddMessage(ctx, requestID, body.AuthorType, body.AuthorID, body.Body)
+	authorType := body.AuthorType
+	authorID := body.AuthorID
+
+	// Workspace-token auth path: bind author to the authenticated workspace and
+	// verify the caller is a participant.
+	if workspaceID := c.Param("id"); workspaceID != "" {
+		authorType = "agent"
+		authorID = workspaceID
+
+		reqRow, err := h.store().Get(ctx, requestID)
+		if err != nil {
+			if errors.Is(err, ErrRequestNotFound) {
+				c.JSON(http.StatusNotFound, gin.H{"error": "request not found"})
+				return
+			}
+			log.Printf("AddMessage authz error request=%s: %v", requestID, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to add message"})
+			return
+		}
+		isParty := (reqRow.RequesterType == "agent" && reqRow.RequesterID == workspaceID) ||
+			(reqRow.RecipientType == "agent" && reqRow.RecipientID == workspaceID)
+		if !isParty {
+			c.JSON(http.StatusForbidden, gin.H{"error": "not a participant"})
+			return
+		}
+	}
+
+	messageID, err := h.store().AddMessage(ctx, requestID, authorType, authorID, body.Body)
 	if err != nil {
 		if errors.Is(err, ErrRequestNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "request not found"})
