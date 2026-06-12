@@ -100,31 +100,6 @@ func TestRestartProvisionGate_ConcurrentAcquiresSerialize(t *testing.T) {
 	wg.Wait()
 }
 
-// TestRestartProvisionGate_TryAcquireWhenBusyReturnsFalse verifies
-// the non-blocking variant: if a cycle is in flight, TryLock returns
-// false and the caller can short-circuit (the manual HTTP Restart
-// handler uses this to return an immediate 409 to a user double-click
-// instead of queueing a second Stop+Start behind the first).
-func TestRestartProvisionGate_TryAcquireWhenBusyReturnsFalse(t *testing.T) {
-	const wsID = "test-provgate-trylock"
-	resetRestartProvisionGateFor(wsID)
-
-	gate := acquireRestartProvisionGate(wsID)
-	gate.Lock()
-	defer gate.Unlock()
-
-	// From a different goroutine — sync.Mutex.TryLock is documented to
-	// return false correctly when called from a different goroutine,
-	// but Go's mutex has a known quirk where TryLock from the SAME
-	// goroutine that holds it returns false with the "already locked"
-	// status (not a deadlock). Since the gate is intended to be
-	// acquired across goroutines (HTTP handler + goAsync + RestartByID
-	// path), the same-goroutine test would still verify the contract.
-	if _, ok := tryAcquireRestartProvisionGate(wsID); ok {
-		t.Error("tryAcquireRestartProvisionGate returned true while the gate is held — TryLock is broken or the gate is the wrong instance")
-	}
-}
-
 // TestRestartProvisionGate_ConcurrentCyclesSerializeOnGate is the
 // end-to-end invariant test for the bug we're closing: when the
 // manual HTTP Restart path and the programmatic RestartByID path

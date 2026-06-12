@@ -131,24 +131,6 @@ func acquireRestartProvisionGate(workspaceID string) *sync.Mutex {
 	return sv.(*sync.Mutex)
 }
 
-// tryAcquireRestartProvisionGate is the non-blocking variant. Returns
-// (gate, true) if the gate was acquired, (nil, false) if another
-// cycle is already in flight. Used by the manual Restart HTTP handler
-// to short-circuit a user double-click without queueing a second
-// Stop+Start behind the first — the second click returns an immediate
-// 409 with "restart already in progress" so the canvas can show a
-// clear message instead of the misleading "signal timed out" (which
-// was the pre-fix visible symptom on 2026-05-08).
-func tryAcquireRestartProvisionGate(workspaceID string) (*sync.Mutex, bool) {
-	gate := acquireRestartProvisionGate(workspaceID)
-	// Note: TryLock is Go 1.18+; this codebase already requires Go 1.25
-	// (see workspace-server/go.mod), so it's available without a build tag.
-	if !gate.TryLock() {
-		return gate, false
-	}
-	return gate, true
-}
-
 // fileWriteRestartDebounceWindow is the per-workspace coalescing window for
 // the file-write → RestartByID trigger fired by templates.go's WriteFile,
 // DeleteFile, and ReplaceFiles handlers (and template_import.go's variants).

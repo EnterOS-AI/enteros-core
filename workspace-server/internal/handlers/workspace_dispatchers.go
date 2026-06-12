@@ -378,19 +378,27 @@ func (h *WorkspaceHandler) RestartWorkspaceAutoOpts(ctx context.Context, workspa
 	if h.cpProv != nil {
 		h.cpStopWithRetry(ctx, workspaceID, "RestartWorkspaceAuto")
 		// resetClaudeSession is Docker-only — CP has no session state to clear.
-		go func() {
+		// h.goAsync (not raw `go`) so the goroutine is TRACKED on h.asyncWG
+		// (shutdown/leak management + tests can waitAsyncForTest). The
+		// gate unlock is the provision leg's tail — it's the load-bearing
+		// exclusion that lets the second concurrent cycle start only after
+		// this one's Start is fully done.
+		h.goAsync(func() {
 			defer gate.Unlock()
 			h.provisionWorkspaceCP(workspaceID, templatePath, configFiles, payload)
-		}()
+		})
 		return true
 	}
 	if h.provisioner != nil {
 		// Docker.Stop has no retry — see docstring rationale.
 		h.provisioner.Stop(ctx, workspaceID)
-		go func() {
+		// h.goAsync for the same reason as the cpProv branch above — the
+		// per-workspace gate is held for the entire cycle (Stop done
+		// synchronously, then async provision that releases on completion).
+		h.goAsync(func() {
 			defer gate.Unlock()
 			h.provisionWorkspaceOpts(workspaceID, templatePath, configFiles, payload, resetClaudeSession)
-		}()
+		})
 		return true
 	}
 	// No backend wired — same shape as provisionWorkspaceAuto's no-backend
