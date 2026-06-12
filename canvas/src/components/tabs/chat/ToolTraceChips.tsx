@@ -45,8 +45,12 @@ export function ToolTraceChips({ trace }: { trace: ToolTraceEntry[] }) {
  *  inline chip and never render raw secrets (input is a stringified
  *  preview, not the live arg values). */
 function formatTool(t: ToolTraceEntry): string {
+  const tool = t.tool.trim();
   const input = (t.input ?? "").trim();
-  if (!input) return `${t.tool}(…)`;
+  // Reconstructed entries (agent_log source) already carry the full
+  // "name(…)" summary and no input — render as-is. Tool-trace-column
+  // entries carry a bare tool name + an input preview.
+  if (!input) return tool;
   const preview = input.length > 60 ? `${input.slice(0, 60)}…` : input;
-  return `${t.tool}(${preview})`;
+  return `${tool}(${preview})`;
 }
