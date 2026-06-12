@@ -56,19 +56,19 @@ test.describe("Desktop ChatTab", () => {
     // hidden ConciergeShell mounts a SECOND ChatTab, so unscoped
     // [data-testid='chat-panel'] / textarea selectors resolve to the
     // invisible concierge copy first and time out.
-    await page.waitForSelector("#panel-chat [data-testid='chat-panel']", { timeout: 5_000 });
+    await page.waitForSelector("#panel-chat [data-testid='chat-panel']:visible", { timeout: 5_000 });
     // Wait for the workspace status to flip to online and the textarea to be enabled.
     await expect(page.locator("#panel-chat textarea").first()).toBeEnabled({ timeout: 15_000 });
   });
 
   test("chat panel loads without error", async ({ page }) => {
     const hasEmptyState = await page.getByText("Send a message to start chatting.").isVisible().catch(() => false);
-    const hasHistory = await page.locator("#panel-chat [data-testid='chat-panel']").locator("div").count() > 3;
+    const hasHistory = await page.locator("#panel-chat [data-testid='chat-panel']:visible").locator("div").count() > 3;
     expect(hasEmptyState || hasHistory).toBeTruthy();
   });
 
   test("send text message and receive echo response", async ({ page }) => {
-    const chat = page.locator("#panel-chat [data-testid='chat-panel']");
+    const chat = page.locator("#panel-chat [data-testid='chat-panel']:visible");
     const textarea = page.locator("#panel-chat textarea").first();
     await textarea.fill("What is the weather?");
     await page.getByRole("button", { name: /Send/ }).first().click();
@@ -78,7 +78,7 @@ test.describe("Desktop ChatTab", () => {
   });
 
   test("history persists across reload", async ({ page }) => {
-    const chat = page.locator("#panel-chat [data-testid='chat-panel']");
+    const chat = page.locator("#panel-chat [data-testid='chat-panel']:visible");
     const textarea = page.locator("#panel-chat textarea").first();
     await textarea.fill("Persistence test");
     await page.getByRole("button", { name: /Send/ }).first().click();
@@ -90,7 +90,7 @@ test.describe("Desktop ChatTab", () => {
     await page.waitForSelector(".react-flow__node", { timeout: 10_000 });
     await page.getByTestId(`workspace-node-${workspaceName}`).click();
     await page.locator('#tab-chat').click();
-    await page.waitForSelector("#panel-chat [data-testid='chat-panel']", { timeout: 5_000 });
+    await page.waitForSelector("#panel-chat [data-testid='chat-panel']:visible", { timeout: 5_000 });
     // Wait for the workspace status to flip to online and the textarea to be enabled.
     await expect(page.locator("#panel-chat textarea").first()).toBeEnabled({ timeout: 15_000 });
 
@@ -99,11 +99,11 @@ test.describe("Desktop ChatTab", () => {
   });
 
   test("file attachment round-trip", async ({ page }) => {
-    const chat = page.locator("#panel-chat [data-testid='chat-panel']");
+    const chat = page.locator("#panel-chat [data-testid='chat-panel']:visible");
     const textarea = page.locator("#panel-chat textarea").first();
     await textarea.fill("Please read this file");
 
-    const fileInput = page.locator("#panel-chat [data-testid='chat-panel'] input[type='file']").first();
+    const fileInput = page.locator("#panel-chat [data-testid='chat-panel']:visible input[type='file']").first();
     await fileInput.setInputFiles({
       name: "test.txt",
       mimeType: "text/plain",
@@ -172,13 +172,13 @@ test.describe("Desktop ChatTab — Markdown rendering", () => {
     }
     await page.getByTestId(`workspace-node-${workspaceName}`).click();
     await page.locator('#tab-chat').click();
-    await page.waitForSelector("#panel-chat [data-testid='chat-panel']", { timeout: 5_000 });
+    await page.waitForSelector("#panel-chat [data-testid='chat-panel']:visible", { timeout: 5_000 });
     // Wait for the workspace status to flip to online and the textarea to be enabled.
     await expect(page.locator("#panel-chat textarea").first()).toBeEnabled({ timeout: 15_000 });
   });
 
   test("code block renders <pre>", async ({ page }) => {
-    const chat = page.locator("#panel-chat [data-testid='chat-panel']");
+    const chat = page.locator("#panel-chat [data-testid='chat-panel']:visible");
     const textarea = page.locator("#panel-chat textarea").first();
     await textarea.fill("```js\nconst x = 1;\n```");
     await page.getByRole("button", { name: /Send/ }).first().click();
@@ -191,7 +191,7 @@ test.describe("Desktop ChatTab — Markdown rendering", () => {
   });
 
   test("table renders <table>", async ({ page }) => {
-    const chat = page.locator("#panel-chat [data-testid='chat-panel']");
+    const chat = page.locator("#panel-chat [data-testid='chat-panel']:visible");
     const textarea = page.locator("#panel-chat textarea").first();
     await textarea.fill("| A | B |\n|---|---|\n| 1 | 2 |");
     await page.getByRole("button", { name: /Send/ }).first().click();
