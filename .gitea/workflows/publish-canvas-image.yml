@@ -95,7 +95,7 @@ jobs:
     # in this rollout (internal#462) so the precondition holds.
     runs-on: publish
     # Phase 3 (RFC #219 §1): surface broken workflows without blocking.
-    # mc#1982: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
+    # mc#2654: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
     continue-on-error: true
     outputs:
       # Exposed so promote-canvas re-points :latest to the EXACT per-commit tag
@@ -238,7 +238,7 @@ jobs:
     # Only on a real main push — workflow_dispatch / non-main never promotes.
     if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
     # Side-effect deploy only; the image publish above is the durable artifact.
-    # mc#1982: do NOT renew this mask silently — it mirrors deploy-production's
+    # mc#2654: do NOT renew this mask silently — it mirrors deploy-production's
     # contract (a flaky promote must not red the ship lane), tracked in core#2226.
     continue-on-error: true
     runs-on: publish

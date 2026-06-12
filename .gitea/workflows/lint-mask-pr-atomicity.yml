@@ -92,8 +92,8 @@ jobs:
     # Phase 3 (RFC #219 §1): surface broken shapes without blocking
     # PRs. Follow-up PR flips this to `false` once recent runs on main
     # are confirmed clean (eat-our-own-dogfood discipline mirrors
-    # PR#673's same-shape comment). Tracking: mc#1982.
-    # mc#1982: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
+    # PR#673's same-shape comment). Tracking: mc#2654.
+    # mc#2654: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
     continue-on-error: true
     steps:
       - name: Check out PR head with full history (need base SHA blobs)

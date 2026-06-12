@@ -172,7 +172,7 @@ jobs:
           echo "::group::pendinguploads exit=$pu_exit (last 100 lines)"
           tail -100 /tmp/test-pu.log
           echo "::endgroup::"
-        # mc#1982: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
+        # mc#2654: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
         continue-on-error: true
       - if: ${{ needs.changes.outputs.platform == 'true' }}
         name: Run tests with coverage (blocking gate)
