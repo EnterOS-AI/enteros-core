@@ -10,3 +10,4 @@
 CI / all-required
 E2E API Smoke Test / E2E API Smoke Test
 Handlers Postgres Integration / Handlers Postgres Integration
+E2E Peer Visibility (literal MCP list_peers) / E2E Peer Visibility
