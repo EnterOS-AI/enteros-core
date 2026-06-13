@@ -106,6 +106,56 @@ else
   echo "FAIL: error marker NOT detected in 'An Exception occurred'"; FAIL=$((FAIL + 1))
 fi
 
+# ---- redact_secrets (diagnostic-output safety) ----
+redact_check() {
+  local desc="$1"
+  local input="$2"
+  local must_not_contain="$3"
+  local output
+  output=$(printf '%s' "$input" | redact_secrets)
+  if printf '%s' "$output" | grep -qF "$must_not_contain"; then
+    echo "FAIL: $desc — secret/token leaked in redacted output"
+    FAIL=$((FAIL + 1))
+  else
+    echo "PASS: $desc (secret redacted)"
+    PASS=$((PASS + 1))
+  fi
+}
+
+redact_check "Authorization header value redacted" \
+  "Authorization: Bearer sk-ant-abc123XYZ" \
+  "sk-ant-abc123XYZ"
+redact_check "known API key redacted" \
+  '{"ANTHROPIC_API_KEY":"sk-ant-abc123","status":"ok"}' \
+  "sk-ant-abc123"
+redact_check "generic *_TOKEN redacted" \
+  'MINIMAX_API_KEY=mini-max-secret-token' \
+  "mini-max-secret-token"
+redact_check "URL query token redacted" \
+  "https://api.example.com/v1?token=supersecrettoken&status=400" \
+  "supersecrettoken"
+# _ResultError diagnostic path: the runtime surfaces upstream errors as text,
+# and that text can embed Authorization headers or API keys. Redaction must
+# scrub them without removing the useful failure classification/status.
+redact_check "_ResultError payload with embedded token redacted" \
+  'Agent error (_ResultError): HTTP 401 {\"error\":\"invalid auth\", \"Authorization\":\"Bearer sk-ant-leaked\"}' \
+  "sk-ant-leaked"
+if printf '%s' 'Agent error (_ResultError): HTTP 401 {"error":"invalid auth"}' | redact_secrets | grep -qF 'HTTP 401'; then
+  echo "PASS: _ResultError redaction preserves HTTP status context"
+  PASS=$((PASS + 1))
+else
+  echo "FAIL: _ResultError redaction stripped useful HTTP status context"
+  FAIL=$((FAIL + 1))
+fi
+# Positive: non-secret context (HTTP status, error message) must survive.
+if printf '%s' '{"status":401,"error":"invalid key"}' | redact_secrets | grep -qF '"status":401'; then
+  echo "PASS: redaction preserves non-secret HTTP status context"
+  PASS=$((PASS + 1))
+else
+  echo "FAIL: redaction stripped useful non-secret context"
+  FAIL=$((FAIL + 1))
+fi
+
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="
 [ "$FAIL" -eq 0 ]

@@ -57,6 +57,82 @@ a2a_completion_error_marker() {
   return 1
 }
 
+# redact_secrets
+#   Reads stdin, writes stdout with credential-looking values replaced by
+#   <REDACTED>. Used by diagnostic emitters so run logs stay secret-safe.
+#   Covers Authorization/Bearer headers, common key names, generic *_API_KEY /
+#   *_TOKEN / *_SECRET values, URL query credential params, and claude-code
+#   SDK-style credential keys. Preserves HTTP status codes and non-secret
+#   error context.
+redact_secrets() {
+  python3 "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/redact_secrets.py"
+}
+
+# diagnose_staging_result_error <workspace_id> <a2a_response> <context_label>
+#   Diagnostic-only helper for molecule-core#2712. When the canary agent
+#   returns a _ResultError / error-as-text payload, the RUN OUTPUT must show
+#   WHY the LLM/backend/runtime call failed, not just the wrapped error string.
+#   Emits (via redact_secrets):
+#     - the full A2A response JSON (so upstream HTTP status/body can be read)
+#     - the workspace's status, runtime_state, and last_sample_error
+#     - recent activity_logs rows (error_detail, status, summary)
+#   This does NOT change pass/fail semantics — the caller still fail()s.
+diagnose_staging_result_error() {
+  local ws_id="$1"
+  local a2a_resp="$2"
+  local ctx="${3:-A2A}"
+
+  log "── DIAGNOSTIC BURST ($ctx — staging LLM/backend/runtime failure) ──"
+
+  log "Full A2A response (redacted JSON):"
+  {
+    printf '%s\n' "$a2a_resp" | python3 -m json.tool 2>/dev/null || printf '%s\n' "$a2a_resp"
+  } | redact_secrets
+
+  if [ -n "$ws_id" ]; then
+    log "Workspace $ws_id snapshot:"
+    local ws_json
+    ws_json=$(tenant_call GET "/workspaces/$ws_id" 2>/dev/null || echo '{}')
+    {
+      printf '%s\n' "$ws_json" | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    print('  status          :', d.get('status', '?'))
+    print('  runtime_state   :', d.get('runtime_state', '?'))
+    print('  url             :', d.get('url', '?'))
+    print('  last_sample_error:', (d.get('last_sample_error') or '')[:500])
+except Exception as e:
+    print('  (workspace JSON parse error:', e, ')')
+"
+    } | redact_secrets 2>/dev/null || true
+
+    log "Recent activity logs for $ws_id:"
+    local activity_json
+    activity_json=$(tenant_call GET "/activity?workspace_id=$ws_id&limit=20" 2>/dev/null || echo '[]')
+    {
+      printf '%s\n' "$activity_json" | python3 -c "
+import json, sys
+try:
+    rows = json.load(sys.stdin)
+    for r in rows[:10]:
+        ts = r.get('created_at', '?')
+        typ = r.get('activity_type', '?')
+        st = r.get('status', '?')
+        summ = (r.get('summary') or '')[:120]
+        print(f'  - {ts} {typ} status={st} {summ}')
+        ed = r.get('error_detail')
+        if ed:
+            print('    error_detail:', str(ed)[:300])
+except Exception as e:
+    print('  (activity JSON parse error:', e, ')')
+"
+    } | redact_secrets 2>/dev/null || true
+  fi
+
+  log "── END DIAGNOSTIC ──"
+}
+
 # a2a_assert_real_completion <agent_text> <expected_token> <context_label>
 #   The CORE gate. Asserts the agent text:
 #     (a) does NOT contain any error-as-text marker (broken-agent trap), AND
