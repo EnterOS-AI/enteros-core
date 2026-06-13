@@ -180,13 +180,6 @@ describe("TermsGate — accept flow", () => {
     // Dialog is still open
     expect(screen.getByRole("dialog")).toBeTruthy();
   });
-
-  it.skip("disables the button while submitting (requires fake-timers around fireEvent.click)", async () => {
-    // This test requires vi.useFakeTimers() + act(() => { fireEvent.click(btn); vi.runAllTimers(); })
-    // to synchronously advance through the async boundary between click and fetch initiation.
-    // The current test structure fires the fetch before click, so this is skipped pending
-    // a refactor of the component to not initiate fetch synchronously on user gesture.
-  });
 });
 
 describe("TermsGate — I agree button accessibility", () => {
