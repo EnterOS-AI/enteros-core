@@ -133,7 +133,20 @@ if [ "$LIFECYCLE_LLM" = "minimax" ]; then
   # The real template boot is heavier than the stub; give it room (unless the
   # caller pinned ONLINE_TIMEOUT explicitly).
   [ "$ONLINE_TIMEOUT_EXPLICIT" -eq 0 ] && ONLINE_TIMEOUT=180
+  # Step 4 (restart-survival) has to wait for the REAL-image cold start on top
+  # of the same path — agent SDK boot + MiniMax LLM dial is the slowest leg.
+  # 240s gives the wedge-detector a chance to clear once the agent finally
+  # registers (registry.go's degraded→online path needs ~2-3 successful
+  # heartbeats after the wedge window).
+  [ "${RESTART_TIMEOUT_EXPLICIT:-0}" -eq 0 ] && RESTART_TIMEOUT=240
 fi
+
+# RESTART_TIMEOUT governs Step 4 (restart-survival poll). Default = same as
+# ONLINE_TIMEOUT for stub mode. LIFECYCLE_LLM=minimax above bumps it to 240s
+# for the real-image advisory lane. Callers can pin it via RESTART_TIMEOUT env.
+RESTART_TIMEOUT_EXPLICIT=0
+[ -n "${RESTART_TIMEOUT:-}" ] && RESTART_TIMEOUT_EXPLICIT=1
+RESTART_TIMEOUT="${RESTART_TIMEOUT:-$ONLINE_TIMEOUT}"
 
 # Image the provisioner should actually run. Default: build the stub. Override
 # to a real image (a pre-built tag) for the advisory lifecycle-only run.
@@ -214,11 +227,19 @@ container_running() {  # container_running <ws-id>  -> echoes name if running
 
 diagnose_provision() {
   local wsid="${1:-}"
+  local target_name
+  target_name=$(container_name "$wsid")
+  # EXACT-match the target container name. The old `container_running` used
+  # `docker ps --filter "name=ws-${wsid}"` which is a SUBSTRING match, so on a
+  # shared dev daemon with many stale ws-* containers from other dev activity
+  # it could return a non-target container (e.g. ws-${wsid}-stale) and dump
+  # its logs in the diagnostic — obscuring the real failure. Exact match
+  # fixes that (#2680).
   local container
-  container=$(container_running "$wsid")
-  echo "--- DIAGNOSE provisioning for $wsid ---"
+  container=$(docker ps --format '{{.Names}}' 2>/dev/null | grep -Fx "$target_name" || true)
+  echo "--- DIAGNOSE provisioning for $wsid (target=$target_name) ---"
   echo "last_sample_error: ${LAST:-<none>}"
-  echo "container_running: ${container:-<none>}"
+  echo "container_running (exact match): ${container:-<none>}"
   if [ -n "$container" ]; then
     echo "--- container logs ($container) ---"
     docker logs "$container" 2>&1 | tail -n 60 || true
@@ -227,8 +248,10 @@ diagnose_provision() {
     echo "--- container reachability test ---"
     docker exec "$container" sh -c 'echo "platform_url=$PLATFORM_URL"; curl -sfS -m 5 "$PLATFORM_URL/health" 2>&1 || echo "WARN: curl probe failed (curl=$?)"' || true
   fi
-  echo "--- all ws-* containers ---"
-  docker ps --filter "name=ws-" --format '{{.Names}} {{.Status}}' 2>/dev/null || true
+  # Other ws-* containers from sibling dev activity — clearly labelled as
+  # NOT the target so the failure-mode readout isn't mis-attributed.
+  echo "--- OTHER ws-* containers on this daemon (NOT the target) ---"
+  docker ps --format '{{.Names}} {{.Status}}' 2>/dev/null | grep -E '^ws-' | grep -vFx "$target_name" || echo "  (none)"
   echo "--- all ws-* volumes ---"
   docker volume ls -q 2>/dev/null | grep '^ws-' || true
   echo "--- end diagnose ---"
@@ -507,8 +530,15 @@ else
   # template/configFiles passed) — so this passes ONLY if the config volume
   # survived the stop and still has config.yaml. A regression (volume reaped /
   # emptied) surfaces as status=failed with the "config volume is empty" error.
+  #
+  # Use RESTART_TIMEOUT (defaults to ONLINE_TIMEOUT, bumped to 240s in
+  # LIFECYCLE_LLM=minimax mode — the real-image advisory lane). The wedge
+  # detector can legitimately flip status to 'degraded' during the cold-start
+  # window while heartbeats are still ramping up; that's NOT a failure here
+  # (the agent hasn't finished booting yet), so we keep polling until online
+  # OR failed OR the full RESTART_TIMEOUT.
   STATUS=""; LAST=""
-  for _ in $(seq 1 "$ONLINE_TIMEOUT"); do
+  for _ in $(seq 1 "$RESTART_TIMEOUT"); do
     WS=$(admin_curl "$BASE/workspaces/$WSID")
     STATUS=$(ws_field "$WS" "status")
     LAST=$(ws_field "$WS" "last_sample_error")
