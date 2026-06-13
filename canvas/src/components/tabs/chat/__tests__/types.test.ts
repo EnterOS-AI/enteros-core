@@ -200,3 +200,45 @@ describe("appendMessageDedupedById", () => {
     expect(next).toHaveLength(2);
   });
 });
+
+// createMessage id threading (core#2697 regression guard).
+//
+// The cross-device dedup above is only correct if the optimistic
+// bubble's id EQUALS the messageId the sender puts in the A2A
+// envelope (which the server echoes back as the USER_MESSAGE
+// message_id). The original ship generated those as TWO independent
+// crypto.randomUUID()s — so the echo never matched and the origin
+// device rendered its own message twice. The fix threads one id:
+// useChatSend mints `messageId` once, passes it to createMessage AND
+// the payload. These tests pin that createMessage honors a supplied
+// id so the wiring can't silently regress.
+describe("createMessage id threading", () => {
+  it("uses a supplied id verbatim (sender threads its messageId)", () => {
+    const mid = "11111111-2222-3333-4444-555555555555";
+    const msg = createMessage("user", "hi", undefined, undefined, mid);
+    expect(msg.id).toBe(mid);
+  });
+
+  it("generates a uuid when no id is supplied (back-compat)", () => {
+    const a = createMessage("agent", "hi");
+    const b = createMessage("agent", "hi");
+    expect(a.id).toBeTruthy();
+    expect(a.id).not.toBe(b.id);
+  });
+
+  it("the threaded id makes the USER_MESSAGE echo a no-op (end-to-end of the fix)", () => {
+    // Simulate the real send: one id for both the optimistic bubble
+    // and the server echo (which carries the same messageId).
+    const mid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    const optimistic = createMessage("user", "can you check this issue for me", undefined, undefined, mid);
+    const echo: ChatMessage = {
+      id: mid, // server broadcast pins message_id == sent messageId
+      role: "user",
+      content: "can you check this issue for me",
+      timestamp: new Date().toISOString(),
+    };
+    const next = appendMessageDedupedById([optimistic], echo);
+    expect(next).toHaveLength(1); // single bubble — the reported dup is gone
+    expect(next[0]).toBe(optimistic);
+  });
+});
