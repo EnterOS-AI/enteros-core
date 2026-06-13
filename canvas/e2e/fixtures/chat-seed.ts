@@ -84,7 +84,7 @@ export async function seedWorkspace(echoURL: string): Promise<SeededWorkspace> {
   const psql = [
     `PGPASSWORD=${pass} psql`,
     `-h ${host} -p ${port} -U ${user} -d ${db}`,
-    `-c "UPDATE workspaces SET status = 'online', url = '${echoURL}', platform_inbound_secret = '${inboundSecret}' WHERE id = '${ws.id}'"`,
+    `-c "UPDATE workspaces SET status = 'online', url = '${echoURL}', platform_inbound_secret = '${inboundSecret}', delivery_mode = 'push' WHERE id = '${ws.id}'"`,
   ].join(" ");
 
   try {
