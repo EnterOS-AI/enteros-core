@@ -127,7 +127,8 @@ ADMIN_TOKEN="${MOLECULE_ADMIN_TOKEN:?MOLECULE_ADMIN_TOKEN required — Railway s
 RUNTIME="${E2E_RUNTIME:-hermes}"
 PROVISION_TIMEOUT_SECS="${E2E_PROVISION_TIMEOUT_SECS:-900}"
 WORKSPACE_ONLINE_TIMEOUT_SECS="${E2E_WORKSPACE_ONLINE_TIMEOUT_SECS:-3600}"
-RUN_ID_SUFFIX="${E2E_RUN_ID:-$(date +%H%M%S)-$$}"
+# RUN_ID_SUFFIX removed (core#2782 follow-up shellcheck): the slug now comes
+# from make_collision_proof_slug below; the old suffix var is dead.
 MODE="${E2E_MODE:-full}"
 # `canary` is a legacy alias for `smoke` retained for back-compat with
 # any in-flight runner picking up an older workflow checkout during the
@@ -148,6 +149,8 @@ esac
 # 8-char uuid so every run gets a unique slug regardless of how
 # the workflow composes E2E_RUN_ID. Asserted via the unit test
 # tests/e2e/test_collision_proof_slug_unit.sh.
+# shellcheck source=lib/collision-proof-slug.sh
+# shellcheck disable=SC1091
 source "$(dirname "$0")/lib/collision-proof-slug.sh"
 if [ "$MODE" = "smoke" ]; then
   SLUG=$(make_collision_proof_slug "e2e-smoke" "${E2E_RUN_ID:-}")

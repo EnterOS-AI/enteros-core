@@ -94,7 +94,8 @@ RECONCILE_OFFLINE_TIMEOUT_SECS="${E2E_RECONCILE_OFFLINE_TIMEOUT_SECS:-180}"
 # SECONDARY bound: full existing-volume reprovision (new EC2 boot + agent
 # bootstrap) is a multi-minute cold path.
 REPROVISION_TIMEOUT_SECS="${E2E_REPROVISION_TIMEOUT_SECS:-600}"
-RUN_ID_SUFFIX="${E2E_RUN_ID:-$(date +%H%M%S)-$$}"
+# RUN_ID_SUFFIX removed (core#2782 follow-up shellcheck): the slug now comes
+# from make_collision_proof_slug below; the old suffix var is dead.
 
 # Slug MUST start with e2e- so sweep-stale-e2e-orgs.yml reaps any orphan this
 # run leaks (lint_cleanup_traps.sh enforces the e2e-/rt-e2e- prefix for any
@@ -105,6 +106,8 @@ RUN_ID_SUFFIX="${E2E_RUN_ID:-$(date +%H%M%S)-$$}"
 # collide (POST /cp/admin/orgs 409). The helper appends a random
 # 8-char uuid so every run gets a unique slug regardless of how
 # the workflow composes E2E_RUN_ID.
+# shellcheck source=lib/collision-proof-slug.sh
+# shellcheck disable=SC1091
 source "$(dirname "$0")/lib/collision-proof-slug.sh"
 SLUG=$(make_collision_proof_slug "e2e-rec" "${E2E_RUN_ID:-}")
 assert_collision_proof_slug "$SLUG" || fail "Bug in make_collision_proof_slug: produced non-collision-proof slug '$SLUG'"
