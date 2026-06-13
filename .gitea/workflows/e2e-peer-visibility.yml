@@ -163,15 +163,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
+    # SECURITY (RC #11317): NO secrets at job level. This job runs on
+    # pull_request (it is the always-running required-context emitter) and a
+    # job-level secret would be present in the env of the pull_request run —
+    # exfiltratable by an untrusted/fork PR even though the PR path only runs
+    # the secret-free bash-syntax validation step. The staging secrets
+    # (CP_STAGING_ADMIN_API_TOKEN + the three MOLECULE_STAGING_*_API_KEY) are
+    # therefore bound PER-STEP on the push/dispatch/cron-only steps below,
+    # each already guarded by `if: github.event_name != 'pull_request'`. Only
+    # non-secret env (URLs, run id, runtime list) lives at job level.
     env:
       MOLECULE_CP_URL: https://staging-api.moleculesai.app
-      MOLECULE_ADMIN_TOKEN: ${{ secrets.CP_STAGING_ADMIN_API_TOKEN }}
-      # LLM provider key so each runtime can authenticate at boot.
-      # Priority MiniMax → direct-Anthropic → OpenAI matches
-      # test_staging_full_saas.sh's secrets-injection chain.
-      E2E_MINIMAX_API_KEY: ${{ secrets.MOLECULE_STAGING_MINIMAX_API_KEY }}
-      E2E_ANTHROPIC_API_KEY: ${{ secrets.MOLECULE_STAGING_ANTHROPIC_API_KEY }}
-      E2E_OPENAI_API_KEY: ${{ secrets.MOLECULE_STAGING_OPENAI_API_KEY }}
       E2E_RUN_ID: "${{ github.run_id }}-${{ github.run_attempt }}"
       PV_RUNTIMES: "hermes openclaw claude-code"
 
@@ -210,6 +212,8 @@ jobs:
       # --- push/dispatch/cron + relevant change: the REAL staging E2E ------
       - name: Verify admin token present
         if: github.event_name != 'pull_request' && needs.changes.outputs.peervis == 'true'
+        env:
+          MOLECULE_ADMIN_TOKEN: ${{ secrets.CP_STAGING_ADMIN_API_TOKEN }}
         run: |
           if [ -z "$MOLECULE_ADMIN_TOKEN" ]; then
             echo "::error::CP_STAGING_ADMIN_API_TOKEN secret not set (Railway staging CP_ADMIN_API_TOKEN)"
@@ -219,6 +223,10 @@ jobs:
 
       - name: Verify an LLM key present
         if: github.event_name != 'pull_request' && needs.changes.outputs.peervis == 'true'
+        env:
+          E2E_MINIMAX_API_KEY: ${{ secrets.MOLECULE_STAGING_MINIMAX_API_KEY }}
+          E2E_ANTHROPIC_API_KEY: ${{ secrets.MOLECULE_STAGING_ANTHROPIC_API_KEY }}
+          E2E_OPENAI_API_KEY: ${{ secrets.MOLECULE_STAGING_OPENAI_API_KEY }}
         run: |
           if [ -z "${E2E_MINIMAX_API_KEY:-}" ] && [ -z "${E2E_ANTHROPIC_API_KEY:-}" ] && [ -z "${E2E_OPENAI_API_KEY:-}" ]; then
             echo "::error::No LLM provider key set — workspaces fail at boot with 'No provider API key found'. Set MOLECULE_STAGING_MINIMAX_API_KEY (or ANTHROPIC / OPENAI)."
@@ -238,6 +246,11 @@ jobs:
 
       - name: Run fresh-provision peer-visibility E2E (literal MCP list_peers)
         if: github.event_name != 'pull_request' && needs.changes.outputs.peervis == 'true'
+        env:
+          MOLECULE_ADMIN_TOKEN: ${{ secrets.CP_STAGING_ADMIN_API_TOKEN }}
+          E2E_MINIMAX_API_KEY: ${{ secrets.MOLECULE_STAGING_MINIMAX_API_KEY }}
+          E2E_ANTHROPIC_API_KEY: ${{ secrets.MOLECULE_STAGING_ANTHROPIC_API_KEY }}
+          E2E_OPENAI_API_KEY: ${{ secrets.MOLECULE_STAGING_OPENAI_API_KEY }}
         run: bash tests/e2e/test_peer_visibility_mcp_staging.sh
 
       # Belt-and-braces scoped teardown: the script installs an EXIT/INT/
@@ -317,7 +330,15 @@ jobs:
     # changes (dispatch/cron fail OPEN to peervis=true). NON-required context,
     # so a SKIPPED check run on an unrelated PR is harmless — only the
     # `E2E Peer Visibility` job (above) is branch-protection-required.
-    if: needs.changes.outputs.peervis == 'true'
+    #
+    # SECURITY (RC #11317): this job binds secrets at job level
+    # (E2E_CLAUDE_CODE_OAUTH_TOKEN + the three MOLECULE_STAGING_*_API_KEY), so
+    # it must NOT run on pull_request — an untrusted/fork PR run would have
+    # those secrets in its env. Excluding pull_request here mirrors the
+    # `github.event_name != 'pull_request'` guard on the staging steps above.
+    # Being non-required, the resulting SKIPPED check on PRs does not wedge
+    # branch protection.
+    if: github.event_name != 'pull_request' && needs.changes.outputs.peervis == 'true'
     runs-on: docker-host
     timeout-minutes: 30
     env:
