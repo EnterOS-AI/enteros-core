@@ -3,10 +3,12 @@
 import { useCallback, useEffect, useRef } from "react";
 import { useCanvasStore, type WorkspaceNodeData } from "@/store/canvas";
 import { useSocketEvent } from "@/hooks/useSocketEvent";
-import { createMessage, type ChatMessage } from "../types";
+import { createMessage, type ChatMessage, type ChatAttachment } from "../types";
 
 export interface UseChatSocketCallbacks {
   onAgentMessage?: (msg: ChatMessage) => void;
+  onUserMessageBroadcast?: (msg: ChatMessage) => void;
+  onSessionReset?: () => void;
   onActivityLog?: (entry: string) => void;
   onSendComplete?: () => void;
   onSendError?: (error: string) => void;
@@ -134,6 +136,60 @@ export function useChatSocket(
         if (task) {
           callbacksRef.current.onActivityLog?.(`⟳ ${task}`);
         }
+      } else if (
+        msg.event === "USER_MESSAGE" &&
+        msg.workspace_id === workspaceId
+      ) {
+        // Cross-device sync (core#2697). The server fans out a
+        // USER_MESSAGE event after persisting a canvas user's
+        // outbound chat message. Origin device already optimistically
+        // added the same id via onUserMessage; other devices
+        // (and the origin after a reload) append via the id-aware
+        // deduper, so a single bubble is rendered on every device.
+        //
+        // The payload shape mirrors AGENT_MESSAGE: {message_id,
+        // content, attachments?, workspace_id}. We re-construct a
+        // ChatMessage with the id pinned to the server's
+        // messageId — the origin's `createMessage` already used the
+        // same id (its messageId was crypto.randomUUID() at send
+        // time), so the id-aware dedup collapses the WS echo to a
+        // no-op on the origin device.
+        const p = msg.payload || {};
+        const messageId = (p.message_id as string) || "";
+        const content = (p.content as string) || "";
+        const rawAttachments = (p.attachments as Array<{
+          name?: string;
+          uri?: string;
+          mimeType?: string;
+          size?: number;
+        }>) || [];
+        const attachments: ChatAttachment[] = rawAttachments
+          .filter((a) => a && a.uri)
+          .map((a) => ({
+            name: a.name || "file",
+            uri: a.uri as string,
+            mimeType: a.mimeType,
+            size: a.size,
+          }));
+        if (messageId) {
+          const ts = new Date().toISOString();
+          const userMsg = Object.freeze({
+            id: messageId,
+            role: "user" as const,
+            content,
+            ...(attachments.length ? { attachments } : {}),
+            timestamp: ts,
+          });
+          callbacksRef.current.onUserMessageBroadcast?.(userMsg);
+        }
+      } else if (
+        msg.event === "SESSION_RESET" &&
+        msg.workspace_id === workspaceId
+      ) {
+        // "New session" pressed on one device — clear local view
+        // on every connected device. Idempotent: clearing an
+        // already-cleared view is a no-op (core#2697).
+        callbacksRef.current.onSessionReset?.();
       } else if (
         msg.event === "REQUEST_RESPONDED" &&
         msg.workspace_id === workspaceId

@@ -460,6 +460,12 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		chh := handlers.NewChatHistoryHandler(chatStore)
 		wsAuth.GET("/chat-history", chh.List)
 
+		// Chat session soft boundary (core#2697): the canvas
+		// "New session" button calls this to rotate the session
+		// marker and broadcast SESSION_RESET to other devices.
+		cssh := handlers.NewChatSessionHandler(broadcaster)
+		wsAuth.POST("/chat-session/new", cssh.NewSession)
+
 		// Config
 		cfgh := handlers.NewConfigHandler()
 		wsAuth.GET("/config", cfgh.Get)

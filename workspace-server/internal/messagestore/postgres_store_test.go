@@ -703,3 +703,96 @@ func TestToolNameFromSummary_NonMarkerUnchanged(t *testing.T) {
 		t.Errorf("marker not stripped: %q", got)
 	}
 }
+
+// =====================================================================
+// Session filter (core#2697) — the new chat-session soft boundary
+// composes with the existing before_ts cursor and the activity_type
+// + source_id predicates. The query is dynamic; these tests pin the
+// (HasBefore, HasSessionStarted) cartesian.
+// =====================================================================
+
+func TestChatHistory_SessionFilter_NoMarkerNoFilter(t *testing.T) {
+	// HasSessionStarted=false → no `created_at >= $N` predicate on
+	// the SQL. Pre-deploy workspaces (NULL marker) read history
+	// unchanged. The session filter is opt-in.
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+	store := &PostgresMessageStore{db: db}
+
+	mock.ExpectQuery("SELECT created_at, status, request_body::text").
+		WithArgs("ws-1", 100).
+		WillReturnRows(sqlmock.NewRows([]string{"created_at", "status", "request_body", "response_body", "tool_trace", "duration_ms"}))
+
+	_, _, err = store.List(context.Background(), "ws-1", ListOptions{Limit: 100})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+func TestChatHistory_SessionFilter_AppliesToQuery(t *testing.T) {
+	// HasSessionStarted=true with a marker → query binds the marker
+	// and the WHERE clause includes `created_at >= $N`. Catches
+	// regressions where the marker is silently dropped.
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+	store := &PostgresMessageStore{db: db}
+
+	marker := mustParseTime(t, "2026-05-01T00:00:00Z")
+	mock.ExpectQuery("SELECT created_at, status, request_body::text").
+		WithArgs("ws-1", marker, 100).
+		WillReturnRows(sqlmock.NewRows([]string{"created_at", "status", "request_body", "response_body", "tool_trace", "duration_ms"}))
+
+	_, _, err = store.List(context.Background(), "ws-1", ListOptions{
+		Limit:            100,
+		HasSessionStarted: true,
+		SessionStartedAt:  marker,
+	})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+func TestChatHistory_SessionFilter_ComposesWithBeforeCursor(t *testing.T) {
+	// Both filters present: SQL binds 3 args (workspace_id, marker,
+	// before_ts) and the WHERE has both predicates in the right
+	// order. Catches a regression where the dynamic WHERE clause
+	// mis-orders placeholders.
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+	store := &PostgresMessageStore{db: db}
+
+	marker := mustParseTime(t, "2026-05-01T00:00:00Z")
+	before := mustParseTime(t, "2026-05-15T00:00:00Z")
+	mock.ExpectQuery("SELECT created_at, status, request_body::text").
+		WithArgs("ws-1", marker, before, 50).
+		WillReturnRows(sqlmock.NewRows([]string{"created_at", "status", "request_body", "response_body", "tool_trace", "duration_ms"}))
+
+	_, _, err = store.List(context.Background(), "ws-1", ListOptions{
+		Limit:             50,
+		HasBefore:         true,
+		BeforeTS:          before,
+		HasSessionStarted: true,
+		SessionStartedAt:  marker,
+	})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}

@@ -112,6 +112,16 @@ type ListOptions struct {
 	// fallback would silently exclude the legitimate epoch-start case.
 	BeforeTS  time.Time
 	HasBefore bool
+
+	// SessionStartedAt filters out activity_logs rows that pre-date
+	// the workspace's current chat session boundary (core#2697). The
+	// canvas chat panel resets the marker when the user presses
+	// "New session" so the visible history is bounded to the current
+	// session. Stores MUST only consider this when HasSessionStarted
+	// is true; a zero-time fallback would silently exclude legitimate
+	// pre-marker rows when the column is NULL on the workspace.
+	SessionStartedAt  time.Time
+	HasSessionStarted bool
 }
 
 // MessageStore is the read-side interface. Implementations pluggable

@@ -1,5 +1,10 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { appendMessageDeduped, createMessage, type ChatMessage } from "../types";
+import {
+  appendMessageDeduped,
+  appendMessageDedupedById,
+  createMessage,
+  type ChatMessage,
+} from "../types";
 
 // Unit tests for appendMessageDeduped — the helper that collapses the
 // race between the HTTP /a2a .then() handler, the A2A_RESPONSE WS event,
@@ -95,6 +100,103 @@ describe("appendMessageDeduped", () => {
     // Tight 100 ms window — the 500 ms-old first message falls outside.
     const dup = createMessage("agent", "hello");
     const next = appendMessageDeduped([first], dup, 100);
+    expect(next).toHaveLength(2);
+  });
+});
+
+// Cross-device sync deduper (core#2697). The server fans out a
+// USER_MESSAGE WS event after a canvas user's outbound chat message
+// is durably persisted. Origin device already optimistically added
+// the message via onUserMessage with the same id (the id IS the
+// crypto.randomUUID() the client sent in the A2A envelope's
+// message.messageId). On the WS echo, appendMessageDedupedById
+// MUST collapse the duplicate so origin device renders one bubble.
+// Other devices (and the origin after a reload) receive the
+// broadcast with no prior copy and append fresh.
+//
+// The id-based dedup is strictly stronger than the time-windowed
+// one above: a match on id collapses regardless of timing. This
+// is the contract the cross-device-sync feature depends on.
+
+describe("appendMessageDedupedById", () => {
+  // Same setup as the appendMessageDeduped block above: the
+  // cross-device-sync tests don't strictly need fake timers (the
+  // id-based dedup is time-independent), but the timer-advance
+  // case in the "content matches but id differs" test (line 180
+  // in the prior head) requires vi.useFakeTimers to be active,
+  // otherwise vi.advanceTimersByTime is a no-op. Adding the
+  // same hooks here is consistent with the sibling describe
+  // block + protects any future test in this block from the
+  // same trap.
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-23T12:00:00.000Z"));
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("appends a new message when no prior entry shares the id", () => {
+    const msg = createMessage("user", "hello");
+    const next = appendMessageDedupedById([], msg);
+    expect(next).toHaveLength(1);
+    expect(next[0]).toBe(msg);
+  });
+
+  it("collapses a duplicate with the same id (origin device's WS echo)", () => {
+    // Origin device already optimistically added the message with
+    // the id. Server fans out a USER_MESSAGE event with the same
+    // id. The deduper MUST collapse to a single bubble.
+    const optimistic = createMessage("user", "hello");
+    // The server's WS echo carries the same id as the optimistic
+    // add. We simulate that by reusing optimistic.id on a fresh
+    // ChatMessage object (mirrors the broadcast shape).
+    const echo: ChatMessage = {
+      id: optimistic.id,
+      role: "user",
+      content: "hello",
+      timestamp: new Date().toISOString(),
+    };
+    const next = appendMessageDedupedById([optimistic], echo);
+    expect(next).toHaveLength(1);
+    // The original entry is preserved (the array is not a new
+    // reference, no re-render).
+    expect(next[0]).toBe(optimistic);
+  });
+
+  it("appends when ids differ (other device receives a fresh broadcast)", () => {
+    const first = createMessage("user", "hello");
+    const second = createMessage("user", "hello");
+    // Different crypto.randomUUID() per createMessage call — ids
+    // are independent even when content matches.
+    expect(first.id).not.toBe(second.id);
+    const next = appendMessageDedupedById([first], second);
+    expect(next).toHaveLength(2);
+  });
+
+  it("does NOT dedupe when msg.id is empty (fallback path)", () => {
+    // Defense: a message without an id (e.g. a legacy shape from
+    // an older broadcast or a test fixture) must NOT match against
+    // the entire history — that would silently drop a legitimate
+    // second message. Append fresh.
+    const first = createMessage("user", "hello");
+    const noId: ChatMessage = {
+      id: "",
+      role: "user",
+      content: "world",
+      timestamp: new Date().toISOString(),
+    };
+    const next = appendMessageDedupedById([first], noId);
+    expect(next).toHaveLength(2);
+  });
+
+  it("does NOT collapse entries that share content but not id", () => {
+    // Same content + different id = two distinct user messages
+    // (the user typed the same thing twice). Must render both.
+    const first = createMessage("user", "hi");
+    vi.advanceTimersByTime(50);
+    const second = createMessage("user", "hi");
+    const next = appendMessageDedupedById([first], second);
     expect(next).toHaveLength(2);
   });
 });

@@ -18,10 +18,15 @@ package handlers
 // tests cover the HTTP-shape concerns only.
 
 import (
+	"context"
+	"database/sql"
+	"errors"
+	"log"
 	"net/http"
 	"strconv"
 	"time"
 
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/messagestore"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -90,6 +95,21 @@ func (h *ChatHistoryHandler) List(c *gin.Context) {
 		opts.HasBefore = true
 	}
 
+	// Session boundary filter (core#2697). When the workspace has a
+	// non-NULL chat_session_started_at, restrict history to rows
+	// created at-or-after the marker. The store layer treats
+	// HasSessionStarted=false as "no filter" so pre-deploy
+	// workspaces (NULL marker) read history unchanged.
+	if sessionStartedAt, hasSession, err := lookupChatSessionStartedAt(c.Request.Context(), workspaceID); err != nil {
+		log.Printf("chat_history: session-started-at lookup failed for %s: %v (returning unfiltered history)", workspaceID, err)
+		// Best-effort: serve the page unfiltered rather than 5xx.
+		// The user can still scroll the full history; the boundary
+		// reset is delayed, not data-lost.
+	} else if hasSession {
+		opts.SessionStartedAt = sessionStartedAt
+		opts.HasSessionStarted = true
+	}
+
 	messages, reachedEnd, err := h.store.List(c.Request.Context(), workspaceID, opts)
 	if err != nil {
 		// Errors here are infra (DB unreachable, store impl failure).
@@ -110,4 +130,33 @@ func (h *ChatHistoryHandler) List(c *gin.Context) {
 		Messages:   messages,
 		ReachedEnd: reachedEnd,
 	})
+}
+
+// lookupChatSessionStartedAt reads the workspace's chat-session
+// boundary (core#2697). Returns (zero, false, nil) when the column is
+// NULL (no boundary set, OR the workspace was created before the
+// migration landed). Returns the error only on an infra failure — a
+// NULL column is NOT an error.
+//
+// Uses a short context timeout (1s) so a slow DB doesn't hold the
+// chat-history request hostage: the caller degrades to an unfiltered
+// page on timeout, which is the pre-PR behavior.
+func lookupChatSessionStartedAt(parentCtx context.Context, workspaceID string) (time.Time, bool, error) {
+	if db.DB == nil {
+		return time.Time{}, false, errors.New("db not initialized")
+	}
+	ctx, cancel := context.WithTimeout(parentCtx, 1*time.Second)
+	defer cancel()
+	var ts sql.NullTime
+	err := db.DB.QueryRowContext(ctx, `SELECT chat_session_started_at FROM workspaces WHERE id = $1`, workspaceID).Scan(&ts)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return time.Time{}, false, nil
+		}
+		return time.Time{}, false, err
+	}
+	if !ts.Valid {
+		return time.Time{}, false, nil
+	}
+	return ts.Time, true, nil
 }

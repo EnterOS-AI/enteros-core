@@ -957,6 +957,30 @@ func LogActivity(ctx context.Context, broadcaster events.EventEmitter, params Ac
 	hook()
 }
 
+// LogActivityWithResult is the error-returning variant of LogActivity.
+// It is identical to LogActivity EXCEPT it returns the INSERT error
+// instead of swallowing it, so callers that need to gate downstream
+// side effects (e.g. WebSocket broadcasts) on persist-success can
+// observe the outcome.
+//
+// The returned commitHook is the post-commit ACTIVITY_LOGGED
+// broadcast function. It is safe to call only when err is nil — on
+// err, the hook is nil and the caller MUST NOT invoke it (the
+// post-commit broadcast would be a phantom for a row that doesn't
+// exist).
+//
+// Use case (core#2697, CR2 #11302): persistUserMessageAtIngest
+// previously used LogActivity() and then unconditionally broadcast
+// a USER_MESSAGE event. LogActivity's "best-effort" contract
+// swallowed INSERT errors, so the USER_MESSAGE broadcast could
+// fire even when the activity_logs row was missing — a phantom
+// (every other device would render the bubble but the row would
+// not be in chat-history on reload). LogActivityWithResult lets
+// the caller gate the broadcast on actual persist-success.
+func LogActivityWithResult(ctx context.Context, broadcaster events.EventEmitter, params ActivityParams) (commitHook func(), err error) {
+	return logActivityExec(ctx, db.DB, broadcaster, params)
+}
+
 // LogActivityTx inserts the activity row inside the caller-provided tx
 // and returns a commitHook that fires the post-commit ACTIVITY_LOGGED
 // broadcast. Caller MUST invoke commitHook AFTER tx.Commit() — firing

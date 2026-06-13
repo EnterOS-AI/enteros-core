@@ -85,6 +85,31 @@ export function appendMessageDeduped(prev: ChatMessage[], msg: ChatMessage, dedu
   return [...prev, msg];
 }
 
+// appendMessageDedupedById is the cross-device sync deduper
+// (core#2697). When the server carries a stable `messageId`
+// (USER_MESSAGE broadcasts echo it back), collapse any tail entry
+// with the same id regardless of timing. Origin device already
+// optimistically added the message via onUserMessage; on the WS
+// echo the same id, the second append is a no-op. Other devices
+// receive the broadcast with no prior copy and append.
+//
+// Why a separate helper rather than widening appendMessageDeduped:
+// the id-aware contract is "duplicate if id matches AND ids are
+// stable," which is strictly stronger than the time-window
+// fallback. Mixing them in one function would force every caller
+// to thread an id-aware flag; the two paths are independent
+// (agent-message triple-delivery has no id, USER_MESSAGE
+// cross-device does).
+export function appendMessageDedupedById(
+  prev: ChatMessage[],
+  msg: ChatMessage,
+): ChatMessage[] {
+  if (msg.id) {
+    if (prev.some((m) => m.id === msg.id)) return prev;
+  }
+  return [...prev, msg];
+}
+
 function attachmentSignature(atts: ChatAttachment[] | undefined): string {
   if (!atts || atts.length === 0) return "";
   // URI is the stable identity — name can differ across delivery

@@ -45,6 +45,20 @@ const (
 	EventA2AResponse    EventType = "A2A_RESPONSE"
 	EventActivityLogged EventType = "ACTIVITY_LOGGED"
 	EventChannelMessage EventType = "CHANNEL_MESSAGE"
+	// EventUserMessage echoes a canvas user's outbound chat message to
+	// every connected device on the same workspace so a message typed on
+	// device A surfaces on device B in real time (core#2697). Payload
+	// shape mirrors AGENT_MESSAGE: {message_id, content, attachments?,
+	// workspace_id}. Only broadcast when the client supplied a
+	// messageId (the only path that has a stable identity for cross-
+	// device dedup).
+	EventUserMessage EventType = "USER_MESSAGE"
+	// EventSessionReset signals that the user pressed "New session" on
+	// one device; all other devices connected to the same workspace
+	// clear their local chat view to match (core#2697). The server
+	// also updates workspaces.chat_session_started_at so a fresh
+	// chat-history fetch filters out pre-marker rows.
+	EventSessionReset EventType = "SESSION_RESET"
 
 	// Workspace lifecycle.
 	EventWorkspaceProvisioning    EventType = "WORKSPACE_PROVISIONING"
@@ -125,9 +139,11 @@ var AllEventTypes = []EventType{
 	EventRequestCreated,
 	EventRequestMessage,
 	EventRequestResponded,
+	EventSessionReset,
 	EventTaskUpdated,
 	EventUserTaskRequested,
 	EventUserTaskResolved,
+	EventUserMessage,
 	EventWorkspaceAwaitingAgent,
 	EventWorkspaceDegraded,
 	EventWorkspaceHeartbeat,
