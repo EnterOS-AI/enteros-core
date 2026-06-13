@@ -645,3 +645,18 @@ describe("MobileChat — Agent Comms render parity (#231)", () => {
     });
   });
 });
+
+describe("MobileChat — thinking indicator (core#2720/#2745 parity)", () => {
+  it("shows the thinking indicator when the workspace reports a currentTask", () => {
+    const busy = { ...onlineNode, data: { ...onlineNode.data, currentTask: "downloading assets" } };
+    mockStoreState.nodes = [busy];
+    const { container } = renderChat(mockAgentId);
+    expect(container.querySelector('[data-testid="mobile-thinking-indicator"]')).not.toBeNull();
+  });
+
+  it("hides the thinking indicator when idle (online, no currentTask, not sending)", () => {
+    mockStoreState.nodes = [onlineNode];
+    const { container } = renderChat(mockAgentId);
+    expect(container.querySelector('[data-testid="mobile-thinking-indicator"]')).toBeNull();
+  });
+});
