@@ -35,8 +35,18 @@ func TestNilIfEmpty_NonEmptyString(t *testing.T) {
 // "system caller" semantic via source_id IS NULL (the existing
 // canvas /activity?source=canvas filter) and lets the queue-fallback
 // path find the row by the durable message_id.
+//
+// Scoped helper: callerIDToSourceID. Per the Researcher's RC
+// #11295 on the prior #2701 attempt, system-caller normalization
+// must NOT be in nilIfEmpty itself — nilIfEmpty is also used on
+// non-ID fields (Method, Summary, ErrorDetail, MessageId,
+// workspace_dir), and a method name like "system:foo" is a
+// legitimate value that should NOT be silently nulled. The
+// normalization is therefore scoped to the ONLY field that
+// actually needs it: a callerID being persisted as
+// activity_logs.SourceID.
 
-func TestNilIfEmpty_SystemCallerPrefixes(t *testing.T) {
+func TestCallerIDToSourceID_SystemCallerPrefixes(t *testing.T) {
 	cases := []string{
 		"system:restart-context",
 		"webhook:github",
@@ -45,7 +55,7 @@ func TestNilIfEmpty_SystemCallerPrefixes(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c, func(t *testing.T) {
-			got := nilIfEmpty(c)
+			got := callerIDToSourceID(c)
 			if got != nil {
 				t.Errorf("system caller %q: got %p (%q), want nil", c, got, *got)
 			}
@@ -53,26 +63,59 @@ func TestNilIfEmpty_SystemCallerPrefixes(t *testing.T) {
 	}
 }
 
-func TestNilIfEmpty_RealWorkspaceUUIDStillPreserved(t *testing.T) {
+func TestCallerIDToSourceID_RealWorkspaceUUIDStillPreserved(t *testing.T) {
 	// Regression guard: a real workspace UUID must pass through
 	// unchanged. The original #2694 RC closed because the fix
 	// accidentally collapsed real UUIDs to NULL; this case is the
 	// one that would have caught that.
 	cases := []string{
-		"ws-1",                          // op-style id
-		"01234567-89ab-cdef-0123-456789abcdef", // uuid
-		"agent-dev-b",                   // agent id (not a system prefix)
-		"canvas_user",                   // canvas user placeholder
+		"ws-1",                                    // op-style id
+		"01234567-89ab-cdef-0123-456789abcdef",   // uuid
+		"agent-dev-b",                             // agent id (not a system prefix)
+		"canvas_user",                             // canvas user placeholder
 	}
 	for _, c := range cases {
 		t.Run(c, func(t *testing.T) {
-			got := nilIfEmpty(c)
+			got := callerIDToSourceID(c)
 			if got == nil {
 				t.Errorf("real caller %q: got nil, want preserved pointer", c)
 				return
 			}
 			if *got != c {
 				t.Errorf("real caller %q: got %q, want preserved", c, *got)
+			}
+		})
+	}
+}
+
+func TestCallerIDToSourceID_EmptyString(t *testing.T) {
+	got := callerIDToSourceID("")
+	if got != nil {
+		t.Errorf("empty callerID: got %p, want nil", got)
+	}
+}
+
+// TestNilIfEmpty_NoSystemCallerNormalization guards the narrow
+// contract that prompted the RC #11295 fix. nilIfEmpty is used on
+// many non-ID fields (Method, Summary, ErrorDetail, MessageId,
+// workspace_dir); the system-caller normalization must NOT leak
+// into those callers. A method name like "system:foo" must pass
+// through unchanged.
+func TestNilIfEmpty_NoSystemCallerNormalization(t *testing.T) {
+	cases := []string{
+		"system:foo",                              // would-be method name
+		"webhook:github",                          // would-be method name
+		"channel:slack:C0123",                     // would-be channel id
+	}
+	for _, c := range cases {
+		t.Run(c, func(t *testing.T) {
+			got := nilIfEmpty(c)
+			if got == nil {
+				t.Errorf("nilIfEmpty on %q: got nil, want preserved pointer (the system-caller normalization must be scoped to callerIDToSourceID only)", c)
+				return
+			}
+			if *got != c {
+				t.Errorf("nilIfEmpty on %q: got %q, want preserved", c, *got)
 			}
 		})
 	}
