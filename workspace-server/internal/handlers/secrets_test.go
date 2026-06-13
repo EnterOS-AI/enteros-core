@@ -1297,6 +1297,15 @@ func TestSecretsSet_AdminToken_GatedByApproval(t *testing.T) {
 	setupTestRedis(t)
 	handler := NewSecretsHandler(nil)
 
+	// core#2566 self-DoS guard: the guard runs BEFORE the approval gate
+	// for admin-token callers. The target here is a regular workspace
+	// (kind='workspace'), so the guard passes and the approval gate
+	// takes over. Mock the kind lookup so the guard does not fail-closed
+	// on an unmocked query.
+	mock.ExpectQuery(`SELECT COALESCE\(kind`).
+		WithArgs("550e8400-e29b-41d4-a716-446655440000").
+		WillReturnRows(sqlmock.NewRows([]string{"kind"}).AddRow("workspace"))
+
 	// requireApproval sequence for an admin-token caller (gated action,
 	// no pre-existing approval). The gate's requireApproval runs THREE
 	// queries: UPDATE (consume), INSERT (new pending), SELECT (parent_id).
@@ -1940,4 +1949,228 @@ func TestPlatformManagedLLMModeForWorkspace_GatesOnModelNotResolvedMode(t *testi
 			t.Errorf("sqlmock: %v", err)
 		}
 	})
+}
+
+// =============================================================================
+// core#2566: concierge self-DoS guard for set_workspace_secret
+// =============================================================================
+//
+// The org-root concierge authenticates its management MCP with the tenant
+// ADMIN_TOKEN (AdminAuth, caller_is_admin_token=true). When the concierge
+// calls set_workspace_secret against its own workspace (kind='platform'),
+// any of (a) a future restart on the container, (b) env-var reload side
+// effects, or (c) the next concierge turn starting on a half-applied env
+// can terminate the org root mid-task — the live 2026-06-11 incident took
+// the concierge offline and required operator hand-repair.
+//
+// The guard: for admin-token callers, look up the target's kind and refuse
+// the write when it is 'platform'. Fail-closed on DB error. Session-cookie
+// (cp_session_actor) and ordinary workspace-token callers are NOT blocked —
+// they are human operators / non-concierge agents and may legitimately
+// need to write the concierge's own secrets.
+
+// TestSecretsSet_AdminTokenSelfWrite_Refused (#2566): an admin-token caller
+// writing a secret to the org-root (kind='platform') workspace MUST be
+// refused with 403. No secret row is written, no approval is created, and
+// the response carries a structured code so the caller can surface a
+// self-DoS-safe error to the user.
+func TestSecretsSet_AdminTokenSelfWrite_Refused(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewSecretsHandler(nil)
+
+	// Guard's kind lookup. If the guard were bypassed (the bug), the
+	// handler would proceed to the approval gate and sqlmock would NOT see
+	// this query, failing the test. Mock it now to drive the guard.
+	mock.ExpectQuery(`SELECT COALESCE\(kind`).
+		WithArgs("550e8400-e29b-41d4-a716-446655440000").
+		WillReturnRows(sqlmock.NewRows([]string{"kind"}).AddRow("platform"))
+
+	// NOTE: deliberately NO approval-gate queries, NO INSERT mock setup.
+	// A refused write must short-circuit BEFORE the gate — so neither is
+	// reached.
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "550e8400-e29b-41d4-a716-446655440000"}}
+	body := `{"key":"SELF_DOS_TEST","value":"x"}`
+	c.Request = httptest.NewRequest("POST", "/workspaces/550e8400-e29b-41d4-a716-446655440000/secrets", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	// core#2566: the concierge's MCP authenticates with the tenant
+	// ADMIN_TOKEN. AdminAuth sets these context keys.
+	c.Set("caller_is_admin_token", true)
+	c.Set("caller_credential_class", "admin-token")
+
+	handler.Set(c)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("admin-token self-write to kind='platform' MUST be refused with 403, got %d: %s",
+			w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to parse response: %v", err)
+	}
+	if resp["code"] != "CONCIERGE_SELF_WRITE_BLOCKED" {
+		t.Errorf("code = %v, want CONCIERGE_SELF_WRITE_BLOCKED", resp["code"])
+	}
+	if resp["workspace_id"] != "550e8400-e29b-41d4-a716-446655440000" {
+		t.Errorf("workspace_id = %v, want 550e8400-e29b-41d4-a716-446655440000", resp["workspace_id"])
+	}
+	if resp["key"] != "SELF_DOS_TEST" {
+		t.Errorf("key = %v, want SELF_DOS_TEST", resp["key"])
+	}
+	if errMsg, _ := resp["error"].(string); !strings.Contains(errMsg, "self-DoS") {
+		t.Errorf("error %q should mention self-DoS", errMsg)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// TestSecretsSet_AdminTokenOnOtherWorkspace_NotBlocked (#2566): the guard
+// is scoped to the concierge's OWN workspace. An admin-token write to a
+// regular workspace must NOT be blocked by this guard (it is still gated
+// by the Phase-4 approval gate in #2574, which returns 202).
+func TestSecretsSet_AdminTokenOnOtherWorkspace_NotBlocked(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewSecretsHandler(nil)
+
+	// Guard's kind lookup: target is a regular workspace, so the guard
+	// returns false and the approval gate takes over.
+	mock.ExpectQuery(`SELECT COALESCE\(kind`).
+		WithArgs("550e8400-e29b-41d4-a716-446655440000").
+		WillReturnRows(sqlmock.NewRows([]string{"kind"}).AddRow("workspace"))
+
+	// Approval gate (admin-token caller → always gated, regardless of
+	// rollout flag — see TestSecretsSet_AdminToken_GatedByApproval).
+	mock.ExpectQuery(`UPDATE approval_requests SET consumed_at`).
+		WillReturnError(sql.ErrNoRows)
+	mock.ExpectQuery(`WITH existing AS`).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("appr-core2566-allow"))
+	mock.ExpectQuery(`SELECT parent_id FROM workspaces WHERE id`).
+		WillReturnRows(sqlmock.NewRows([]string{"parent_id"}).AddRow(nil))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "550e8400-e29b-41d4-a716-446655440000"}}
+	body := `{"key":"NOT_SELF","value":"v"}`
+	c.Request = httptest.NewRequest("POST", "/workspaces/550e8400-e29b-41d4-a716-446655440000/secrets", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Set("caller_is_admin_token", true)
+	c.Set("caller_credential_class", "admin-token")
+
+	handler.Set(c)
+
+	// Guard did NOT block → approval gate fires → 202 (admin-token
+	// always gated). This proves the guard only fires on the platform
+	// root and lets ordinary writes fall through to the gate.
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("admin-token write to a regular workspace must fall through to the approval gate (202), got %d: %s",
+			w.Code, w.Body.String())
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// TestSecretsSet_AdminTokenKindLookupError_FailsClosed (#2566): when the
+// DB hiccup prevents verifying the target's kind, the guard refuses
+// the write (fail-closed). This is the safe default: a wrongly-fired
+// self-DoS is exactly the outage this guard exists to prevent, while
+// a refused write is just a retry after the DB hiccup clears.
+func TestSecretsSet_AdminTokenKindLookupError_FailsClosed(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewSecretsHandler(nil)
+
+	mock.ExpectQuery(`SELECT COALESCE\(kind`).
+		WithArgs("550e8400-e29b-41d4-a716-446655440000").
+		WillReturnError(sql.ErrConnDone) // arbitrary transient DB error
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "550e8400-e29b-41d4-a716-446655440000"}}
+	body := `{"key":"FAIL_CLOSED","value":"v"}`
+	c.Request = httptest.NewRequest("POST", "/workspaces/550e8400-e29b-41d4-a716-446655440000/secrets", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Set("caller_is_admin_token", true)
+	c.Set("caller_credential_class", "admin-token")
+
+	handler.Set(c)
+
+	// Fail-closed: 403 with CONCIERGE_SELF_WRITE_BLOCKED. We chose 403
+	// (not 500) because the guard is making a policy decision, not a
+	// transient error report — the operator sees the structured code
+	// and knows exactly why the write was refused. A 500 would invite
+	// a retry loop on a path that is fundamentally unsafe to retry.
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("admin-token write with kind-lookup failure must fail closed with 403, got %d: %s",
+			w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to parse response: %v", err)
+	}
+	if resp["code"] != "CONCIERGE_SELF_WRITE_BLOCKED" {
+		t.Errorf("code = %v, want CONCIERGE_SELF_WRITE_BLOCKED", resp["code"])
+	}
+	if errMsg, _ := resp["error"].(string); !strings.Contains(errMsg, "kind lookup failed") {
+		t.Errorf("error %q should mention the kind-lookup failure", errMsg)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// TestSecretsSet_SessionCookieCaller_NotBlocked (#2566): a human operator
+// using the canvas session cookie (cp_session_actor, NOT admin-token) MUST
+// NOT be blocked by this guard. The guard is scoped to AdminAuth
+// admin-token callers only — the concierge's surface. Operators must
+// retain the ability to write the concierge's own secrets through the
+// canvas Secrets tab, which uses the session tier.
+func TestSecretsSet_SessionCookieCaller_NotBlocked(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewSecretsHandler(nil)
+
+	// Guard's kind lookup: should NOT happen, because the caller is
+	// session-cookie, not admin-token. If the test fails with an unmet
+	// expectation here, the guard is over-firing.
+	//
+	// (No `SELECT COALESCE(kind` mock.)
+	//
+	// The handler proceeds past the (skipped) guard to the approval
+	// gate. Session cookies are not in the gated set, so the gate
+	// passes (returns true → handler INSERTs and 200s).
+	mock.ExpectExec("INSERT INTO workspace_secrets").
+		WithArgs("550e8400-e29b-41d4-a716-446655440000", "OPERATOR_SECRET", sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "550e8400-e29b-41d4-a716-446655440000"}}
+	body := `{"key":"OPERATOR_SECRET","value":"v"}`
+	c.Request = httptest.NewRequest("POST", "/workspaces/550e8400-e29b-41d4-a716-446655440000/secrets", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	// Session-cookie caller: cp_session_actor set, caller_is_admin_token
+	// is NOT set (AdminAuth's session tier does not flip that flag).
+	c.Set("cp_session_actor", "user-op-1234")
+
+	handler.Set(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("session-cookie caller must NOT be blocked by the self-DoS guard, got %d: %s",
+			w.Code, w.Body.String())
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
 }
