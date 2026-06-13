@@ -55,6 +55,14 @@ export ADMIN_TOKEN MOLECULE_ADMIN_TOKEN="${ADMIN_TOKEN}"
 ONLINE_TIMEOUT_EXPLICIT=0
 [ -n "${ONLINE_TIMEOUT:-}" ] && ONLINE_TIMEOUT_EXPLICIT=1
 ONLINE_TIMEOUT="${ONLINE_TIMEOUT:-90}"          # seconds to wait for online
+
+# Same pattern for RESTART_TIMEOUT (Step 4 restart-survival poll). Initialize
+# the _EXPLICIT flag and the default BEFORE the LIFECYCLE_LLM=minimax block
+# runs, so the minimax block can correctly see whether the caller pinned a
+# value and avoid clobbering it. (CR2 RC #11266 ordering fix.)
+RESTART_TIMEOUT_EXPLICIT=0
+[ -n "${RESTART_TIMEOUT:-}" ] && RESTART_TIMEOUT_EXPLICIT=1
+RESTART_TIMEOUT="${RESTART_TIMEOUT:-$ONLINE_TIMEOUT}"
 A2A_TIMEOUT="${A2A_TIMEOUT:-30}"
 STUB_DIR="$(cd "$(dirname "$0")/stub-runtime" && pwd)"
 RUNTIME="claude-code"
@@ -141,12 +149,10 @@ if [ "$LIFECYCLE_LLM" = "minimax" ]; then
   [ "${RESTART_TIMEOUT_EXPLICIT:-0}" -eq 0 ] && RESTART_TIMEOUT=240
 fi
 
-# RESTART_TIMEOUT governs Step 4 (restart-survival poll). Default = same as
-# ONLINE_TIMEOUT for stub mode. LIFECYCLE_LLM=minimax above bumps it to 240s
-# for the real-image advisory lane. Callers can pin it via RESTART_TIMEOUT env.
-RESTART_TIMEOUT_EXPLICIT=0
-[ -n "${RESTART_TIMEOUT:-}" ] && RESTART_TIMEOUT_EXPLICIT=1
-RESTART_TIMEOUT="${RESTART_TIMEOUT:-$ONLINE_TIMEOUT}"
+# RESTART_TIMEOUT governs Step 4 (restart-survival poll). The default
+# initialization + _EXPLICIT probe happen ABOVE this block (alongside
+# ONLINE_TIMEOUT), so the LIFECYCLE_LLM=minimax override below can
+# correctly see whether the caller pinned a value and avoid clobbering it.
 
 # Image the provisioner should actually run. Default: build the stub. Override
 # to a real image (a pre-built tag) for the advisory lifecycle-only run.
