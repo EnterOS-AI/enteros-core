@@ -2962,3 +2962,60 @@ func TestInjectCanvasUserIdentity_Nil(t *testing.T) {
 	}
 }
 
+
+// ==================== ProxyA2A — canvas cap-and-queue (core#2751) ====================
+
+// When A2A_CANVAS_SYNC_BUDGET > 0, a canvas turn that outlives the budget is
+// ack'd `{status:"queued"}` instead of holding the connection (which CF would
+// 524). The dispatch continues on its detached forward ctx; the reply reaches
+// the canvas via the AGENT_MESSAGE WS broadcast. Flag default 0 = unchanged
+// synchronous path (covered by the other ProxyA2A tests).
+func TestProxyA2A_CanvasCapAndQueue(t *testing.T) {
+	mock := setupTestDB(t)
+	mr := setupTestRedis(t)
+	allowLoopbackForTest(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+
+	// Agent that holds the connection PAST the budget (bounded sleep — no
+	// deadlock with agentServer.Close()). 600ms >> the 100ms budget, so the
+	// handler must cap-and-queue before the agent ever responds.
+	agentServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(600 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, `{"jsonrpc":"2.0","result":{"status":"ok"}}`)
+	}))
+	defer agentServer.Close()
+
+	mr.Set(fmt.Sprintf("ws:%s:url", "ws-capq"), agentServer.URL)
+	expectBudgetCheck(mock, "ws-capq")
+	// persistUserMessageAtIngest fires (in the detached goroutine) before the
+	// dispatch blocks — allow the INSERT. The .Maybe()-style tolerance: the
+	// async ordering means we don't assert ExpectationsWereMet strictly here.
+	mock.ExpectExec("INSERT INTO activity_logs").WillReturnResult(sqlmock.NewResult(0, 1))
+
+	t.Setenv("A2A_CANVAS_SYNC_BUDGET", "100ms")
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-capq"}}
+	// Canvas caller: NO X-Workspace-ID header → callerID == "".
+	body := `{"jsonrpc":"2.0","method":"message/send","params":{"message":{"role":"user","parts":[{"text":"long task"}]}}}`
+	c.Request = httptest.NewRequest("POST", "/workspaces/ws-capq/a2a", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	start := time.Now()
+	handler.ProxyA2A(c)
+	elapsed := time.Since(start)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 queued, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"queued"`) {
+		t.Errorf("expected queued ack, got: %s", w.Body.String())
+	}
+	// Returned at ~budget, NOT after the (blocked) agent — proves the cap fired.
+	if elapsed > 2*time.Second {
+		t.Errorf("handler held the connection (%v) instead of capping at the budget", elapsed)
+	}
+}
