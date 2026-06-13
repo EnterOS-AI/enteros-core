@@ -820,23 +820,49 @@ func (h *RegistryHandler) Heartbeat(c *gin.Context) {
 	// heartbeat carries it. Only writes when NULL — never overwrites a
 	// reconciled or updated card. This is the recovery path for fast-cloud
 	// workspaces whose DNS wasn't ready at first register.
-	//
-	// #2659/#2665: also clear last_register_failure_at on this recovery,
-	// otherwise evaluateStatus keeps the workspace stuck in 'degraded'
-	// forever (degraded→online recovery requires no recent register failure).
 	if len(payload.AgentCard) > 0 {
 		res, err := db.DB.ExecContext(ctx, `
 			UPDATE workspaces
-			SET agent_card = $2,
-			    last_register_failure_at = NULL
+			SET agent_card = $2
 			WHERE id = $1 AND agent_card IS NULL
 		`, payload.WorkspaceID, payload.AgentCard)
 		if err != nil {
 			log.Printf("Registry heartbeat: agent_card backfill failed for %s: %v", payload.WorkspaceID, err)
 		} else {
 			if rows, _ := res.RowsAffected(); rows > 0 {
-				log.Printf("Registry heartbeat: backfilled agent_card and cleared register-failure marker for %s (initial register had failed)", payload.WorkspaceID)
+				log.Printf("Registry heartbeat: backfilled agent_card for %s (initial register had failed)", payload.WorkspaceID)
 			}
+		}
+	}
+
+	// #2659/#2665/#2739: clear last_register_failure_at whenever a heartbeat
+	// carries a valid agent_card — NOT only on the agent_card-was-NULL backfill
+	// path above. A heartbeat with a card proves the runtime is alive and
+	// re-advertising the SAME reachable card the platform already trusts, so any
+	// recent register-400 was transient and must not keep the workspace pinned
+	// in 'degraded' until the 5-minute failure window ages out.
+	//
+	// #2739: on RESTART (vs first provision) the agent_card row is ALREADY
+	// populated, so the NULL-scoped backfill never fires and never cleared the
+	// marker. The restarted container's authenticated /registry/register can
+	// 400 with url_validate_failed (its Docker-internal hostname e.g.
+	// "212851b5693d" is not resolvable from the platform), stamping
+	// last_register_failure_at; with the card already present the marker stuck
+	// and evaluateStatus held the workspace degraded past the Local Provision
+	// Lifecycle restart-survival window (run 358593). Credentials are correctly
+	// projected post-restart (core#2709/#2712); this is purely the degraded->online
+	// recovery gap. Clearing on a card-bearing heartbeat is the same trust signal
+	// the success-on-register clear (register handler) relies on.
+	if len(payload.AgentCard) > 0 {
+		res, err := db.DB.ExecContext(ctx, `
+			UPDATE workspaces
+			SET last_register_failure_at = NULL
+			WHERE id = $1 AND last_register_failure_at IS NOT NULL
+		`, payload.WorkspaceID)
+		if err != nil {
+			log.Printf("Registry heartbeat: clear register-failure marker failed for %s: %v", payload.WorkspaceID, err)
+		} else if rows, _ := res.RowsAffected(); rows > 0 {
+			log.Printf("Registry heartbeat: cleared register-failure marker for %s (live card-bearing heartbeat after a transient register-400)", payload.WorkspaceID)
 		}
 	}
 
