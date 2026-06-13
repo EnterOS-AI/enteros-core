@@ -100,4 +100,20 @@ describe("useChatSend — multi-send (core#2697 feature 2)", () => {
     expect(result.current.error).toBeNull();
   });
 
+  it("a Cloudflare 522 (couldn't connect to origin) DOES surface the unreachable banner", async () => {
+    // CR2 distinction: 522 = CF couldn't establish a connection to the origin
+    // = genuinely unreachable. Unlike 524 (accepted + slow), 522 must NOT be
+    // swallowed — show the error so the user knows the message didn't land.
+    const err = Object.assign(new Error("API POST /workspaces/ws-1/a2a: 522 "), { status: 522 });
+    apiPostMock.mockRejectedValueOnce(err);
+    const { result } = renderHook(() =>
+      useChatSend("ws-1", { getHistoryMessages: () => [] }),
+    );
+    await act(async () => {
+      await result.current.sendMessage("hi");
+      await Promise.resolve(); await Promise.resolve();
+    });
+    expect(result.current.error).toMatch(/unreachable/i);
+  });
+
 });
