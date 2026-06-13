@@ -196,6 +196,13 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		// revoke the restart pipeline already does (issueAndInjectToken →
 		// RevokeAllForWorkspace); the SaaS path has no stale-token sweeper.
 		wsAdmin.POST("/admin/workspaces/:id/revoke-auth-tokens", wh.RevokeAuthTokens)
+		// Repoint a workspace's instance_id + compute.provider at the box on its
+		// NEW cloud after a cross-cloud migration cutover (#806). Without this the
+		// tenant's CP-instance reconciler keeps polling the stale (terminated) AWS
+		// instance_id, sees "offline", and self-heals by re-provisioning on AWS —
+		// fighting the migration into a split-brain. Pure record repoint (no
+		// deprovision); the CP migrator calls it once the cutover is verified.
+		wsAdmin.POST("/admin/workspaces/:id/set-compute-instance", wh.SetComputeInstance)
 		// Per-workspace LLM billing mode override (internal#691). Used by
 		// CP's /cp/admin/workspaces/:id/llm-billing-mode proxy + (via that
 		// proxy) by the canvas Config-tab "LLM Billing" section. Default-
