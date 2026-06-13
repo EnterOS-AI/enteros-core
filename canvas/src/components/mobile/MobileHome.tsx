@@ -53,10 +53,50 @@ export function MobileHome({
   );
 
   const compact = density === "compact";
-  const rootCount = useMemo(
-    () => agents.filter((a) => !a.parentId).length,
-    [agents],
-  );
+
+  // Agent HIERARCHY (core#2697 Phase 2): the desktop home is a parent→child
+  // tree (ConciergeShell); mobile was a flat list, hiding org structure +
+  // queue depth. Build the tree from parentId; render it for the default
+  // ("all") view with expand/collapse + a queue-count badge. Active filters
+  // keep the flat list (filtering a tree drops context).
+  const { childrenOf, roots } = useMemo(() => {
+    const ids = new Set(agents.map((a) => a.id));
+    const childrenOf = new Map<string, typeof agents>();
+    const roots: typeof agents = [];
+    for (const a of agents) {
+      const pid = a.parentId && ids.has(a.parentId) ? a.parentId : null;
+      if (pid) {
+        const arr = childrenOf.get(pid) ?? [];
+        arr.push(a);
+        childrenOf.set(pid, arr);
+      } else {
+        roots.push(a);
+      }
+    }
+    return { childrenOf, roots };
+  }, [agents]);
+
+  const [collapsed, setCollapsed] = useState<Set<string>>(() => new Set());
+  const toggle = (id: string) =>
+    setCollapsed((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+
+  const treeRows = useMemo(() => {
+    const out: { agent: (typeof agents)[number]; depth: number; hasChildren: boolean }[] = [];
+    const walk = (a: (typeof agents)[number], depth: number) => {
+      const kids = childrenOf.get(a.id) ?? [];
+      out.push({ agent: a, depth, hasChildren: kids.length > 0 });
+      if (kids.length && !collapsed.has(a.id)) for (const k of kids) walk(k, depth + 1);
+    };
+    for (const r of roots) walk(r, 0);
+    return out;
+  }, [roots, childrenOf, collapsed]);
+
+  const rootCount = roots.length;
 
   return (
     <div
@@ -154,7 +194,70 @@ export function MobileHome({
           padding: "0 14px",
         }}
       >
-        {filtered.length === 0 ? (
+        {filter === "all" ? (
+          treeRows.length === 0 ? (
+            <div style={{ padding: "40px 8px", textAlign: "center", color: p.text3, fontSize: 13 }}>
+              No agents yet.
+            </div>
+          ) : (
+            treeRows.map(({ agent, depth, hasChildren }) => (
+              <div
+                key={agent.id}
+                data-testid="agent-tree-row"
+                style={{ display: "flex", alignItems: "center", gap: 4, paddingLeft: depth * 16 }}
+              >
+                {hasChildren ? (
+                  <button
+                    type="button"
+                    onClick={() => toggle(agent.id)}
+                    aria-label={collapsed.has(agent.id) ? "Expand" : "Collapse"}
+                    style={{
+                      width: 18,
+                      height: 18,
+                      flexShrink: 0,
+                      border: "none",
+                      background: "none",
+                      color: p.text3,
+                      cursor: "pointer",
+                      fontSize: 11,
+                      lineHeight: 1,
+                    }}
+                  >
+                    {collapsed.has(agent.id) ? "▸" : "▾"}
+                  </button>
+                ) : (
+                  <span style={{ width: 18, flexShrink: 0 }} aria-hidden="true" />
+                )}
+                <div style={{ flex: 1, minWidth: 0, position: "relative" }}>
+                  <AgentCard agent={agent} dark={dark} compact={compact} onClick={() => onOpen(agent.id)} />
+                  {agent.calls > 0 && (
+                    <span
+                      aria-label={`${agent.calls} queued`}
+                      style={{
+                        position: "absolute",
+                        top: 8,
+                        right: 10,
+                        minWidth: 18,
+                        height: 18,
+                        padding: "0 5px",
+                        borderRadius: 9,
+                        background: p.accent,
+                        color: "#fff",
+                        fontSize: 10,
+                        fontWeight: 700,
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "center",
+                      }}
+                    >
+                      {agent.calls}
+                    </span>
+                  )}
+                </div>
+              </div>
+            ))
+          )
+        ) : filtered.length === 0 ? (
           <div
             style={{
               padding: "40px 8px",
