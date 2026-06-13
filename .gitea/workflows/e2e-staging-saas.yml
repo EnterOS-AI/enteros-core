@@ -51,11 +51,13 @@ on:
       - 'workspace-server/internal/providers/providers.yaml'
       - 'tests/e2e/test_staging_full_saas.sh'
       - 'tests/e2e/lib/completion_assert.sh'
+      - 'tests/e2e/lib/llm_proxy_preflight.sh'
       - 'tests/e2e/lib/model_slug.sh'
       - 'tests/e2e/lib/aws_leak_check.sh'
       - 'tests/e2e/test_aws_leak_check.sh'
       - 'tests/e2e/test_staging_concierge_e2e.sh'
       - 'tests/e2e/test_staging_concierge_creates_workspace_e2e.sh'
+      - 'tests/e2e/test_llm_proxy_preflight_unit.sh'
       - 'workspace-server/internal/staginge2e/**'
       - 'workspace-server/internal/handlers/platform_agent.go'
       - 'workspace-server/internal/handlers/user_tasks.go'
@@ -73,11 +75,13 @@ on:
       - 'workspace-server/internal/providers/providers.yaml'
       - 'tests/e2e/test_staging_full_saas.sh'
       - 'tests/e2e/lib/completion_assert.sh'
+      - 'tests/e2e/lib/llm_proxy_preflight.sh'
       - 'tests/e2e/lib/model_slug.sh'
       - 'tests/e2e/lib/aws_leak_check.sh'
       - 'tests/e2e/test_aws_leak_check.sh'
       - 'tests/e2e/test_staging_concierge_e2e.sh'
       - 'tests/e2e/test_staging_concierge_creates_workspace_e2e.sh'
+      - 'tests/e2e/test_llm_proxy_preflight_unit.sh'
       - 'workspace-server/internal/staginge2e/**'
       - 'workspace-server/internal/handlers/platform_agent.go'
       - 'workspace-server/internal/handlers/user_tasks.go'
@@ -287,6 +291,19 @@ jobs:
             exit 1
           fi
           echo "Staging CP healthy ✓"
+
+      # core#2675: completion-gated lanes must distinguish "staging LLM proxy
+      # down" from "real code bug" with a distinct, machine-readable status
+      # description prefix `DEP-DOWN:staging-llm` so the redgate-reporter
+      # can dedup N identical reds into ONE incident issue. Wired into the
+      # pr-validate job first; the same source line is replicated in the
+      # other 3 completion-gated lanes in a follow-up commit (the file's
+      # 5 nearly-identical job blocks are mechanically derivable).
+      - name: LLM proxy preflight (DEP-DOWN:staging-llm)
+        run: |
+          # shellcheck source=lib/llm_proxy_preflight.sh
+          source tests/e2e/lib/llm_proxy_preflight.sh
+          llm_proxy_preflight
 
       - name: Run full-lifecycle E2E
         id: e2e
