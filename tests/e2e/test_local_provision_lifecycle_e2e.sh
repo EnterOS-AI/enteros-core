@@ -114,8 +114,8 @@ LATEST_TAG="${CACHE_REPO}:latest"
 #   molecule LLM proxy — so a BYOK MiniMax workspace reaches the model DIRECTLY
 #   and works on this local dev stack with no CP proxy env.
 #
-#   The registered claude-code slug is the BARE id `MiniMax-M2.7` (derives
-#   provider=minimax => byok). The colon form `minimax:MiniMax-M2.7` is
+#   The registered claude-code slug is the BARE id `MiniMax-M3` (derives
+#   provider=minimax => byok). The colon form `minimax:MiniMax-M3` is
 #   UNREGISTERED on claude-code (internal#718). auth_env for `minimax` accepts
 #   MINIMAX_API_KEY, which the adapter projects into ANTHROPIC_AUTH_TOKEN.
 #
@@ -135,7 +135,7 @@ if [ "$LIFECYCLE_LLM" = "minimax" ]; then
   # RegistryModeLocal — same path as the advisory lifecycle-real job).
   LIFECYCLE_PROVISIONER_BUILDS="1"
   # Registered BYOK MiniMax slug for claude-code (bare id => provider=minimax).
-  LIFECYCLE_MODEL="MiniMax-M2.7"
+  LIFECYCLE_MODEL="MiniMax-M3"
   LIFECYCLE_LLM_KEY="MINIMAX_API_KEY"
   LIFECYCLE_LLM_VALUE="${MINIMAX_API_KEY}"
   # The real template boot is heavier than the stub; give it room (unless the
