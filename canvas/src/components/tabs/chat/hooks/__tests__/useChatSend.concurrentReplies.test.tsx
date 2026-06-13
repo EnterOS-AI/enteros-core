@@ -177,4 +177,41 @@ describe("useChatSend — concurrent replies (core#2725)", () => {
 
     expect(result.current.sending).toBe(false);
   });
+
+  it("finishes a late timeout/524 for a token whose WS completion already fired (CR2 #11463)", async () => {
+    // The WS onAgentMessage/onSendComplete can arrive BEFORE the HTTP request
+    // finally terminates with a timeout/524. Without handling, the catch would
+    // move the token back to pending-WS and leave the spinner stuck forever.
+    const send = deferred();
+    apiPostMock.mockImplementationOnce(() => send.promise);
+
+    const { result } = renderHook(() =>
+      useChatSend("ws-race", { getHistoryMessages: () => [] }),
+    );
+
+    await act(async () => {
+      await result.current.sendMessage("long turn");
+      await Promise.resolve();
+    });
+    expect(result.current.sending).toBe(true);
+
+    // WS completion arrives first.
+    act(() => {
+      result.current.releaseSendGuards();
+    });
+    // At this point the token is still HTTP in-flight but WS-completed.
+    expect(result.current.sending).toBe(true);
+
+    // Late client timeout lands.
+    const timeoutErr = new Error("signal timed out") as Error & { name: string };
+    timeoutErr.name = "TimeoutError";
+    await act(async () => {
+      send.reject(timeoutErr);
+      await Promise.resolve();
+    });
+
+    // The late timeout finishes its own token instead of re-pending.
+    expect(result.current.sending).toBe(false);
+    expect(result.current.error).toBeNull();
+  });
 });

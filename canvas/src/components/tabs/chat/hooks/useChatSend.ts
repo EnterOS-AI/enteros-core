@@ -145,18 +145,25 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
   // until the LAST pending send completes.
   //
   // Lifecycle:
-  //   - inFlightTokensRef:  POST dispatched, no terminal HTTP reply yet.
-  //   - pendingWSTokensRef: HTTP replied in a "delivered, await WS" state
-  //                         (queued poll-mode, client timeout, CF 524). The
-  //                         spinner stays up; releaseSendGuards prunes these
-  //                         when the AGENT_MESSAGE / onSendComplete WS event
-  //                         arrives.
-  //   - setupGuardRef:      brief synchronous guard so a double-click in the
-  //                         same tick dispatches only once. Released the moment
-  //                         the POST is fired, so distinct follow-up sends are
-  //                         never blocked.
+  //   - inFlightTokensRef:   POST dispatched, no terminal HTTP reply yet.
+  //   - pendingWSTokensRef:  HTTP replied in a "delivered, await WS" state
+  //                          (queued poll-mode, client timeout, CF 524). The
+  //                          spinner stays up; releaseSendGuards prunes these
+  //                          when the AGENT_MESSAGE / onSendComplete WS event
+  //                          arrives.
+  //   - wsCompletedTokensRef: tokens whose WS completion already fired while
+  //                           the HTTP request was still in-flight. A late
+  //                           timeout/524 for such a token must finish itself
+  //                           instead of moving back to pending-WS (which would
+  //                           leak the spinner because no future release will
+  //                           arrive). See CR2 review #11463.
+  //   - setupGuardRef:       brief synchronous guard so a double-click in the
+  //                          same tick dispatches only once. Released on the
+  //                          next microtask after the POST is fired, so
+  //                          distinct follow-up sends are never blocked.
   const inFlightTokensRef = useRef<Set<number>>(new Set());
   const pendingWSTokensRef = useRef<Set<number>>(new Set());
+  const wsCompletedTokensRef = useRef<Set<number>>(new Set());
   const sendingFromAPIRef = useRef(false);
   const nextTokenRef = useRef(1);
   const setupGuardRef = useRef(false);
@@ -171,9 +178,16 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
   }, []);
 
   const releaseSendGuards = useCallback(() => {
-    // Consumer (ChatTab) signals that the WS-driven send(s) completed. Only
-    // prune tokens that were waiting for WS; leave in-flight tokens alone so
-    // unrelated concurrent sends keep their spinner and reply routing.
+    // Consumer (ChatTab) signals that WS-driven send(s) completed. Snapshot all
+    // currently tracked tokens as WS-completed so late timeout/524 handlers
+    // know they can finish themselves instead of re-pending forever. Then
+    // prune the explicit WS-pending set.
+    for (const token of inFlightTokensRef.current) {
+      wsCompletedTokensRef.current.add(token);
+    }
+    for (const token of pendingWSTokensRef.current) {
+      wsCompletedTokensRef.current.add(token);
+    }
     pendingWSTokensRef.current.clear();
     syncSendingState();
   }, [syncSendingState]);
@@ -181,16 +195,23 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
   const finishSendToken = useCallback((token: number) => {
     inFlightTokensRef.current.delete(token);
     pendingWSTokensRef.current.delete(token);
+    wsCompletedTokensRef.current.delete(token);
     syncSendingState();
   }, [syncSendingState]);
 
   const pendSendTokenForWS = useCallback((token: number) => {
     // HTTP replied "queued / still alive via WS". Move from in-flight to the
     // WS-pending set so the spinner persists until releaseSendGuards is called.
+    // If the WS completion already fired for this token, finish immediately
+    // instead of re-pending forever (CR2 #11463).
+    if (wsCompletedTokensRef.current.has(token)) {
+      finishSendToken(token);
+      return;
+    }
     inFlightTokensRef.current.delete(token);
     pendingWSTokensRef.current.add(token);
     syncSendingState();
-  }, [syncSendingState]);
+  }, [syncSendingState, finishSendToken]);
 
   const clearError = useCallback(() => setError(null), []);
 
@@ -318,7 +339,14 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
           // ACTIVITY_LOGGED status="error"). Don't synthesise an empty
           // agent bubble.
           if (resp?.status === "queued") {
-            pendSendTokenForWS(myToken);
+            // If WS already completed for this token while the HTTP reply was
+            // in flight, finish immediately instead of re-pending forever
+            // (CR2 #11463).
+            if (wsCompletedTokensRef.current.has(myToken)) {
+              finishSendToken(myToken);
+            } else {
+              pendSendTokenForWS(myToken);
+            }
             return;
           }
 
