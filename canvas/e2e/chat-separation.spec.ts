@@ -8,8 +8,8 @@ import {
   seedChatHistory,
 } from "./fixtures/chat-seed";
 
-const API = process.env.E2E_API_URL ?? "http://localhost:8080";
 const PLATFORM_URL = process.env.E2E_PLATFORM_URL ?? "http://localhost:8080";
+const API = process.env.E2E_API_URL ?? PLATFORM_URL;
 const ADMIN_TOKEN = process.env.E2E_ADMIN_TOKEN ?? process.env.ADMIN_TOKEN;
 
 /** Enter the Org-map view so the Canvas (React Flow graph) mounts. */

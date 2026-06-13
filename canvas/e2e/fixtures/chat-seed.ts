@@ -152,6 +152,12 @@ export function startHeartbeat(
 
 /**
  * Seed chat-history rows for a workspace.
+ *
+ * Chat history is read from activity_logs via messagestore.MessageStore
+ * (workspace-server/internal/messagestore/postgres_store.go). We insert
+ * a2a_receive rows with source_id NULL (canvas-origin) so the
+ * /chat-history hydrator picks them up. Each message becomes its own row
+ * so arbitrary user/agent sequences can be seeded.
  */
 export async function seedChatHistory(
   workspaceId: string,
@@ -165,14 +171,34 @@ export async function seedChatHistory(
   if (!m) return;
   const [, user, pass, host, port, db] = m;
 
-  const values = messages
-    .map(
-      (msg, i) =>
-        `('${randomUUID()}', '${workspaceId}', '${msg.role}', '${msg.content.replace(/'/g, "''")}', NOW() - INTERVAL '${messages.length - i} seconds')`,
-    )
+  const escape = (s: string) => s.replace(/'/g, "''").replace(/\\/g, "\\\\");
+
+  const rows = messages
+    .map((msg, i) => {
+      const offsetSec = messages.length - i;
+      const requestBody =
+        msg.role === "user"
+          ? JSON.stringify({
+              params: {
+                message: {
+                  parts: [{ kind: "text", text: msg.content }],
+                },
+              },
+            })
+          : "{}";
+      const responseBody =
+        msg.role === "agent"
+          ? JSON.stringify({
+              result: {
+                parts: [{ kind: "text", text: msg.content }],
+              },
+            })
+          : "{}";
+      return `('${randomUUID()}', '${workspaceId}', 'a2a_receive', NULL, NULL, 'message/send', NULL, '${escape(requestBody)}'::jsonb, '${escape(responseBody)}'::jsonb, 0, 'ok', NOW() - INTERVAL '${offsetSec} seconds')`;
+    })
     .join(",");
 
-  const sql = `INSERT INTO chat_messages (id, workspace_id, role, content, created_at) VALUES ${values};`;
+  const sql = `INSERT INTO activity_logs (id, workspace_id, activity_type, source_id, target_id, method, summary, request_body, response_body, duration_ms, status, created_at) VALUES ${rows};`;
 
   const psql = `PGPASSWORD=${pass} psql -h ${host} -p ${port} -U ${user} -d ${db} -c "${sql}"`;
   execSync(psql, { stdio: "pipe", timeout: 10_000 });
