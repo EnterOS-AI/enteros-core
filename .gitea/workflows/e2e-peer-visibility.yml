@@ -76,33 +76,25 @@ name: E2E Peer Visibility (literal MCP list_peers)
 # template container boot/heartbeat. Container-mode runtime boot remains
 # available via PV_LOCAL_PROVISION_MODE=container for targeted debugging.
 
+# NO `paths:` FILTER — REQUIRED-CHECK CONTRACT (#1296, 2026-06-13).
+# The `E2E Peer Visibility` context is now a REQUIRED status check on
+# branch_protections/main. A required-check workflow must NOT carry an
+# `on: paths:` (or `paths-ignore:`) filter — lint-required-no-paths.py
+# hard-fails it, because a docs-only PR that doesn't match the glob would
+# never fire the workflow and the required context would sit `pending`
+# forever, wedging the PR (feedback_path_filtered_workflow_cant_be_required).
+#
+# Path-scoping is NOT lost — it moved into the `changes` detect job below
+# (detect-changes.py --profile peer-visibility → `peervis`) and is applied
+# PER-STEP inside the single always-running `peer-visibility` job. That job
+# emits exactly ONE check run under the required name `E2E Peer Visibility`
+# regardless of which paths changed — branch-protection-clean, exactly like
+# handlers-postgres-integration.yml (PR #2264 check_name_parity incident).
 on:
   push:
     branches: [main]
-    paths:
-      - 'workspace-server/internal/handlers/mcp.go'
-      - 'workspace-server/internal/handlers/mcp_tools.go'
-      - 'workspace-server/internal/middleware/**'
-      - 'workspace-server/internal/handlers/registry.go'
-      - 'workspace-server/internal/handlers/workspace.go'
-      - 'tests/e2e/test_peer_visibility_mcp_staging.sh'
-      - 'tests/e2e/test_peer_visibility_token_mint_staging.sh'
-      - 'tests/e2e/test_peer_visibility_mcp_local.sh'
-      - 'tests/e2e/lib/peer_visibility_assert.sh'
-      - '.gitea/workflows/e2e-peer-visibility.yml'
   pull_request:
     branches: [main]
-    paths:
-      - 'workspace-server/internal/handlers/mcp.go'
-      - 'workspace-server/internal/handlers/mcp_tools.go'
-      - 'workspace-server/internal/middleware/**'
-      - 'workspace-server/internal/handlers/registry.go'
-      - 'workspace-server/internal/handlers/workspace.go'
-      - 'tests/e2e/test_peer_visibility_mcp_staging.sh'
-      - 'tests/e2e/test_peer_visibility_token_mint_staging.sh'
-      - 'tests/e2e/test_peer_visibility_mcp_local.sh'
-      - 'tests/e2e/lib/peer_visibility_assert.sh'
-      - '.gitea/workflows/e2e-peer-visibility.yml'
   workflow_dispatch:
   schedule:
     # 07:30 UTC daily — catches AMI / template-hermes / template-openclaw
@@ -121,20 +113,74 @@ env:
   GITHUB_SERVER_URL: https://git.moleculesai.app
 
 jobs:
-  # PR path: post a real status under the required-ready check name so a
-  # workflow-only PR is never silently statusless. The actual EC2 E2E is
-  # push/dispatch/cron only (30+ min). This is NOT a fake-green mask of
-  # the real assertion — it validates the driving script's bash syntax
-  # and inline-python so a broken test script fails at PR time.
-  # bp-required: pending #1296 — PR emitter, not yet required (tracked in #1296).
-  pr-validate:
-    name: E2E Peer Visibility
+  # Path-scoping for the required `E2E Peer Visibility` gate. Replaces the
+  # old `on: paths:` filter (which a required check may not carry — see the
+  # `on:` header). Emits `peervis=true` when any peer-visibility-relevant
+  # file changed. On workflow_dispatch / schedule / a zero/unknown base SHA
+  # the detect helper fails OPEN (peervis=true) so manual + cron runs always
+  # exercise the real staging E2E. Mirrors ci.yml's `Detect changes` job.
+  changes:
+    name: detect-changes
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
-    timeout-minutes: 5
+    continue-on-error: false
+    outputs:
+      peervis: ${{ steps.filter.outputs.peervis }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # depth:2 covers the common push case; detect-changes.py fetches the
+          # exact PR base SHA itself when the shallow checkout lacks it.
+          fetch-depth: 2
+      - id: filter
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          python3 .gitea/scripts/detect-changes.py \
+            --profile peer-visibility \
+            --event-name "${{ github.event_name }}" \
+            --pr-base-sha "$PR_BASE_SHA" \
+            --base-ref "$PR_BASE_REF" \
+            --push-before "${GITHUB_EVENT_BEFORE:-$PUSH_BEFORE}"
+
+  # THE required-check emitter. ONE always-running job (no job-level `if:`)
+  # named `E2E Peer Visibility`, so it posts EXACTLY ONE check run under the
+  # required context regardless of event/paths — branch-protection-clean
+  # (feedback_branch_protection_check_name_parity; a job-level `if:` that
+  # skips would post a SKIPPED check run that fails the required eval even
+  # beside a SUCCESS sibling — the PR #2264 / handlers-postgres lesson).
+  # Exactly one of three per-step paths determines the result:
+  #   - pull_request           → validate the driving scripts' bash syntax
+  #                              (cheap; the 30+min EC2 E2E can't run per-PR).
+  #   - push/dispatch/cron + peervis → the REAL staging fresh-provision
+  #                              list_peers E2E (the objective proof).
+  #   - push + !peervis        → no-op pass (paths filter excluded this push).
+  # The LOCAL backend's real assertion runs in peer-visibility-local below.
+  peer-visibility:
+    name: E2E Peer Visibility
+    needs: changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    env:
+      MOLECULE_CP_URL: https://staging-api.moleculesai.app
+      MOLECULE_ADMIN_TOKEN: ${{ secrets.CP_STAGING_ADMIN_API_TOKEN }}
+      # LLM provider key so each runtime can authenticate at boot.
+      # Priority MiniMax → direct-Anthropic → OpenAI matches
+      # test_staging_full_saas.sh's secrets-injection chain.
+      E2E_MINIMAX_API_KEY: ${{ secrets.MOLECULE_STAGING_MINIMAX_API_KEY }}
+      E2E_ANTHROPIC_API_KEY: ${{ secrets.MOLECULE_STAGING_ANTHROPIC_API_KEY }}
+      E2E_OPENAI_API_KEY: ${{ secrets.MOLECULE_STAGING_OPENAI_API_KEY }}
+      E2E_RUN_ID: "${{ github.run_id }}-${{ github.run_attempt }}"
+      PV_RUNTIMES: "hermes openclaw claude-code"
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # --- PR path: cheap syntax validation (was the pr-validate job) ------
       - name: Validate driving scripts + shared assertion lib
+        if: github.event_name == 'pull_request'
         run: |
           bash -n tests/e2e/lib/peer_visibility_assert.sh
           echo "lib/peer_visibility_assert.sh — bash syntax OK"
@@ -154,6 +200,103 @@ jobs:
           echo "The LOCAL backend runs in the peer-visibility-local job"
           echo "below on this same PR (local docker-compose stack)."
 
+      # --- push/dispatch/cron, no relevant paths changed: no-op pass -------
+      - name: No-op pass (paths filter excluded this push)
+        if: github.event_name != 'pull_request' && needs.changes.outputs.peervis != 'true'
+        run: |
+          echo "No peer-visibility-relevant changes — E2E Peer Visibility gate satisfied without running the staging E2E."
+          echo "::notice::E2E Peer Visibility no-op pass (detect-changes profile peer-visibility excluded this push)."
+
+      # --- push/dispatch/cron + relevant change: the REAL staging E2E ------
+      - name: Verify admin token present
+        if: github.event_name != 'pull_request' && needs.changes.outputs.peervis == 'true'
+        run: |
+          if [ -z "$MOLECULE_ADMIN_TOKEN" ]; then
+            echo "::error::CP_STAGING_ADMIN_API_TOKEN secret not set (Railway staging CP_ADMIN_API_TOKEN)"
+            exit 2
+          fi
+          echo "Admin token present"
+
+      - name: Verify an LLM key present
+        if: github.event_name != 'pull_request' && needs.changes.outputs.peervis == 'true'
+        run: |
+          if [ -z "${E2E_MINIMAX_API_KEY:-}" ] && [ -z "${E2E_ANTHROPIC_API_KEY:-}" ] && [ -z "${E2E_OPENAI_API_KEY:-}" ]; then
+            echo "::error::No LLM provider key set — workspaces fail at boot with 'No provider API key found'. Set MOLECULE_STAGING_MINIMAX_API_KEY (or ANTHROPIC / OPENAI)."
+            exit 2
+          fi
+          echo "LLM key present"
+
+      - name: CP staging health preflight
+        if: github.event_name != 'pull_request' && needs.changes.outputs.peervis == 'true'
+        run: |
+          code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 10 "$MOLECULE_CP_URL/health")
+          if [ "$code" != "200" ]; then
+            echo "::error::Staging CP unhealthy (HTTP $code) — infra, not a workspace bug. Failing loud per feedback_fix_root_not_symptom."
+            exit 1
+          fi
+          echo "Staging CP healthy"
+
+      - name: Run fresh-provision peer-visibility E2E (literal MCP list_peers)
+        if: github.event_name != 'pull_request' && needs.changes.outputs.peervis == 'true'
+        run: bash tests/e2e/test_peer_visibility_mcp_staging.sh
+
+      # Belt-and-braces scoped teardown: the script installs an EXIT/INT/
+      # TERM trap, but if the runner itself is cancelled the trap may not
+      # fire. This always() step deletes ONLY the e2e-pv-<run_id> org this
+      # run created — never a cluster-wide sweep
+      # (feedback_never_run_cluster_cleanup_tests_on_live_platform). The
+      # admin DELETE is idempotent so double-invoking is safe;
+      # sweep-stale-e2e-orgs is the final net (slug starts with 'e2e-').
+      - name: Teardown safety net (runs on cancel/failure)
+        if: always() && github.event_name != 'pull_request' && needs.changes.outputs.peervis == 'true'
+        env:
+          ADMIN_TOKEN: ${{ secrets.CP_STAGING_ADMIN_API_TOKEN }}
+        run: |
+          set +e
+          orgs=$(curl -sS "$MOLECULE_CP_URL/cp/admin/orgs?limit=500" \
+            -H "Authorization: Bearer $ADMIN_TOKEN" 2>/dev/null \
+            | python3 -c "
+          import json, sys, os, datetime
+          run_id = os.environ.get('GITHUB_RUN_ID', '')
+          try:
+              d = json.load(sys.stdin)
+          except Exception:
+              print(''); sys.exit(0)
+          # ONLY sweep slugs from THIS run. e2e-pv-<YYYYMMDD>-<run_id>-...
+          # Sweep today AND yesterday's UTC date so a midnight-crossing run
+          # still matches its own slug (same bug class as the saas/canvas
+          # safety nets).
+          today = datetime.date.today()
+          yest = today - datetime.timedelta(days=1)
+          dates = (today.strftime('%Y%m%d'), yest.strftime('%Y%m%d'))
+          if run_id:
+              prefixes = tuple(f'e2e-pv-{dt}-{run_id}-' for dt in dates)
+          else:
+              prefixes = tuple(f'e2e-pv-{dt}-' for dt in dates)
+          orgs = d if isinstance(d, list) else d.get('orgs', [])
+          cands = [o['slug'] for o in orgs
+                   if any(o.get('slug','').startswith(p) for p in prefixes)
+                   and o.get('instance_status') not in ('purged',)]
+          print('\n'.join(cands))
+          " 2>/dev/null)
+          for slug in $orgs; do
+            echo "Safety-net teardown: $slug"
+            set +e
+            curl -sS -o /tmp/pv-cleanup.out -w "%{http_code}" \
+              -X DELETE "$MOLECULE_CP_URL/cp/admin/tenants/$slug" \
+              -H "Authorization: Bearer $ADMIN_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "{\"confirm\":\"$slug\"}" >/tmp/pv-cleanup.code
+            set -e
+            code=$(cat /tmp/pv-cleanup.code 2>/dev/null || echo "000")
+            if [ "$code" = "200" ] || [ "$code" = "204" ]; then
+              echo "[teardown] deleted $slug (HTTP $code)"
+            else
+              echo "::warning::pv teardown for $slug returned HTTP $code — sweep-stale-e2e-orgs will catch it within MAX_AGE_MINUTES. Body: $(head -c 300 /tmp/pv-cleanup.out 2>/dev/null)"
+            fi
+          done
+          exit 0
+
   # LOCAL gate: same byte-identical assertion against the local prod-mimic
   # docker-compose stack — the MANDATORY local-E2E that must run BEFORE
   # the staging E2E (feedback_mandatory_local_e2e_before_ship,
@@ -169,6 +312,12 @@ jobs:
   # bp-required: pending #1296
   peer-visibility-local:
     name: E2E Peer Visibility (local)
+    needs: changes
+    # Cost-gate the heavy local docker-compose E2E to peer-visibility-relevant
+    # changes (dispatch/cron fail OPEN to peervis=true). NON-required context,
+    # so a SKIPPED check run on an unrelated PR is harmless — only the
+    # `E2E Peer Visibility` job (above) is branch-protection-required.
+    if: needs.changes.outputs.peervis == 'true'
     runs-on: docker-host
     timeout-minutes: 30
     env:
@@ -323,112 +472,3 @@ jobs:
         run: |
           docker rm -f "$PG_CONTAINER" 2>/dev/null || true
           docker rm -f "$REDIS_CONTAINER" 2>/dev/null || true
-
-  # Real STAGING gate: provisions a throwaway org + sibling-per-runtime,
-  # drives the LITERAL list_peers MCP call per runtime, asserts 200 +
-  # expected peer set, then scoped teardown. push(main)/dispatch/cron only.
-  peer-visibility:
-    name: E2E Peer Visibility
-    runs-on: ubuntu-latest
-    if: github.event_name != 'pull_request'
-    timeout-minutes: 60
-
-    env:
-      MOLECULE_CP_URL: https://staging-api.moleculesai.app
-      MOLECULE_ADMIN_TOKEN: ${{ secrets.CP_STAGING_ADMIN_API_TOKEN }}
-      # LLM provider key so each runtime can authenticate at boot.
-      # Priority MiniMax → direct-Anthropic → OpenAI matches
-      # test_staging_full_saas.sh's secrets-injection chain.
-      E2E_MINIMAX_API_KEY: ${{ secrets.MOLECULE_STAGING_MINIMAX_API_KEY }}
-      E2E_ANTHROPIC_API_KEY: ${{ secrets.MOLECULE_STAGING_ANTHROPIC_API_KEY }}
-      E2E_OPENAI_API_KEY: ${{ secrets.MOLECULE_STAGING_OPENAI_API_KEY }}
-      E2E_RUN_ID: "${{ github.run_id }}-${{ github.run_attempt }}"
-      PV_RUNTIMES: "hermes openclaw claude-code"
-
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Verify admin token present
-        run: |
-          if [ -z "$MOLECULE_ADMIN_TOKEN" ]; then
-            echo "::error::CP_STAGING_ADMIN_API_TOKEN secret not set (Railway staging CP_ADMIN_API_TOKEN)"
-            exit 2
-          fi
-          echo "Admin token present"
-
-      - name: Verify an LLM key present
-        run: |
-          if [ -z "${E2E_MINIMAX_API_KEY:-}" ] && [ -z "${E2E_ANTHROPIC_API_KEY:-}" ] && [ -z "${E2E_OPENAI_API_KEY:-}" ]; then
-            echo "::error::No LLM provider key set — workspaces fail at boot with 'No provider API key found'. Set MOLECULE_STAGING_MINIMAX_API_KEY (or ANTHROPIC / OPENAI)."
-            exit 2
-          fi
-          echo "LLM key present"
-
-      - name: CP staging health preflight
-        run: |
-          code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 10 "$MOLECULE_CP_URL/health")
-          if [ "$code" != "200" ]; then
-            echo "::error::Staging CP unhealthy (HTTP $code) — infra, not a workspace bug. Failing loud per feedback_fix_root_not_symptom."
-            exit 1
-          fi
-          echo "Staging CP healthy"
-
-      - name: Run fresh-provision peer-visibility E2E (literal MCP list_peers)
-        run: bash tests/e2e/test_peer_visibility_mcp_staging.sh
-
-      # Belt-and-braces scoped teardown: the script installs an EXIT/INT/
-      # TERM trap, but if the runner itself is cancelled the trap may not
-      # fire. This always() step deletes ONLY the e2e-pv-<run_id> org this
-      # run created — never a cluster-wide sweep
-      # (feedback_never_run_cluster_cleanup_tests_on_live_platform). The
-      # admin DELETE is idempotent so double-invoking is safe;
-      # sweep-stale-e2e-orgs is the final net (slug starts with 'e2e-').
-      - name: Teardown safety net (runs on cancel/failure)
-        if: always()
-        env:
-          ADMIN_TOKEN: ${{ secrets.CP_STAGING_ADMIN_API_TOKEN }}
-        run: |
-          set +e
-          orgs=$(curl -sS "$MOLECULE_CP_URL/cp/admin/orgs?limit=500" \
-            -H "Authorization: Bearer $ADMIN_TOKEN" 2>/dev/null \
-            | python3 -c "
-          import json, sys, os, datetime
-          run_id = os.environ.get('GITHUB_RUN_ID', '')
-          try:
-              d = json.load(sys.stdin)
-          except Exception:
-              print(''); sys.exit(0)
-          # ONLY sweep slugs from THIS run. e2e-pv-<YYYYMMDD>-<run_id>-...
-          # Sweep today AND yesterday's UTC date so a midnight-crossing run
-          # still matches its own slug (same bug class as the saas/canvas
-          # safety nets).
-          today = datetime.date.today()
-          yest = today - datetime.timedelta(days=1)
-          dates = (today.strftime('%Y%m%d'), yest.strftime('%Y%m%d'))
-          if run_id:
-              prefixes = tuple(f'e2e-pv-{dt}-{run_id}-' for dt in dates)
-          else:
-              prefixes = tuple(f'e2e-pv-{dt}-' for dt in dates)
-          orgs = d if isinstance(d, list) else d.get('orgs', [])
-          cands = [o['slug'] for o in orgs
-                   if any(o.get('slug','').startswith(p) for p in prefixes)
-                   and o.get('instance_status') not in ('purged',)]
-          print('\n'.join(cands))
-          " 2>/dev/null)
-          for slug in $orgs; do
-            echo "Safety-net teardown: $slug"
-            set +e
-            curl -sS -o /tmp/pv-cleanup.out -w "%{http_code}" \
-              -X DELETE "$MOLECULE_CP_URL/cp/admin/tenants/$slug" \
-              -H "Authorization: Bearer $ADMIN_TOKEN" \
-              -H "Content-Type: application/json" \
-              -d "{\"confirm\":\"$slug\"}" >/tmp/pv-cleanup.code
-            set -e
-            code=$(cat /tmp/pv-cleanup.code 2>/dev/null || echo "000")
-            if [ "$code" = "200" ] || [ "$code" = "204" ]; then
-              echo "[teardown] deleted $slug (HTTP $code)"
-            else
-              echo "::warning::pv teardown for $slug returned HTTP $code — sweep-stale-e2e-orgs will catch it within MAX_AGE_MINUTES. Body: $(head -c 300 /tmp/pv-cleanup.out 2>/dev/null)"
-            fi
-          done
-          exit 0

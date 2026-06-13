@@ -48,6 +48,32 @@ PROFILES: dict[str, dict[str, str]] = {
     "e2e-api": {
         "api": r"^workspace-server/|^tests/e2e/|^\.gitea/workflows/e2e-api\.yml$",
     },
+    # #1296: the E2E Peer Visibility gate is being flipped to a REQUIRED
+    # status check. A required-check workflow may NOT carry an `on: paths:`
+    # filter (lint-required-no-paths.py / feedback_path_filtered_workflow_
+    # cant_be_required would wedge docs-only PRs). So the path-scoping that
+    # used to live in e2e-peer-visibility.yml's `on:` block moves here and
+    # is applied per-step inside the always-running job (mirrors the
+    # handlers-postgres shape). The pattern set MUST mirror the old `on:
+    # paths:` list, PLUS the wsauth + workspace_provision surface the
+    # token-kinds fix (PR#2682) introduced — a regression in either would
+    # break the literal list_peers assertion the gate exists to protect.
+    "peer-visibility": {
+        "peervis": (
+            r"^workspace-server/internal/handlers/mcp\.go$"
+            r"|^workspace-server/internal/handlers/mcp_tools\.go$"
+            r"|^workspace-server/internal/middleware/"
+            r"|^workspace-server/internal/handlers/registry\.go$"
+            r"|^workspace-server/internal/handlers/workspace\.go$"
+            r"|^workspace-server/internal/handlers/workspace_provision\.go$"
+            r"|^workspace-server/internal/wsauth/"
+            r"|^tests/e2e/test_peer_visibility_mcp_staging\.sh$"
+            r"|^tests/e2e/test_peer_visibility_token_mint_staging\.sh$"
+            r"|^tests/e2e/test_peer_visibility_mcp_local\.sh$"
+            r"|^tests/e2e/lib/peer_visibility_assert\.sh$"
+            r"|^\.gitea/workflows/e2e-peer-visibility\.yml$"
+        ),
+    },
 }
 
 
