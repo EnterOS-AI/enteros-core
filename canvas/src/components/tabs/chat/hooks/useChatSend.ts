@@ -140,33 +140,56 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
   const [sending, setSending] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const sendInFlightRef = useRef(false);
+  // core#2725: concurrent sends. Track every in-flight request by a unique
+  // token so replies are routed to the correct send and the spinner stays up
+  // until the LAST pending send completes. A separate `releasedTokensRef`
+  // holds tokens that the consumer (ChatTab) has signalled as complete via
+  // `releaseSendGuards` — this lets late HTTP replies for those tokens still
+  // process (push-mode race) without leaking tokens when a poll-mode WS
+  // completion arrives.
+  const inFlightTokensRef = useRef<Set<number>>(new Set());
+  const releasedTokensRef = useRef<Set<number>>(new Set());
   const sendingFromAPIRef = useRef(false);
-  const sendTokenRef = useRef(0);
+  const nextTokenRef = useRef(1);
   const optionsRef = useRef(options);
   optionsRef.current = options;
 
+  const syncSendingState = useCallback(() => {
+    const pending = inFlightTokensRef.current.size > 0;
+    setSending(pending);
+    sendingFromAPIRef.current = pending;
+  }, []);
+
   const releaseSendGuards = useCallback(() => {
+    // Consumer (ChatTab) signals that the current send(s) completed, usually
+    // via a WebSocket event. Move every in-flight token to `releasedTokensRef`
+    // so that a late HTTP reply can still be processed (push-mode race where
+    // release happens before the POST .then), while the UI guard bits reset.
+    for (const token of inFlightTokensRef.current) {
+      releasedTokensRef.current.add(token);
+    }
+    inFlightTokensRef.current.clear();
     setSending(false);
     sendingFromAPIRef.current = false;
-    sendInFlightRef.current = false;
   }, []);
+
+  const finishSendToken = useCallback((token: number) => {
+    inFlightTokensRef.current.delete(token);
+    releasedTokensRef.current.delete(token);
+    syncSendingState();
+  }, [syncSendingState]);
 
   const clearError = useCallback(() => setError(null), []);
 
   const sendMessage = useCallback(
     async (text: string, files: File[] = []) => {
       const trimmed = text.trim();
-      // Multi-send (core#2697 feature 2): do NOT block on `sending`. A user
-      // must be able to fire a follow-up while a prior message's agent reply
-      // is still pending — the server-side A2A queue is durable and orders
-      // them. `sendInFlightRef` is now only a brief re-entrancy guard for the
-      // synchronous setup (file upload + optimistic add + POST dispatch); it
-      // is released the moment the POST is FIRED (below), NOT held across the
-      // multi-minute reply wait, so the next send proceeds immediately.
+      // core#2725: do NOT block on an existing in-flight send. The server-side
+      // A2A queue is durable and orders multiple user messages. We only skip
+      // truly empty sends and uploads (the uploading flag is intentionally
+      // global: concurrent file uploads would race the single uploading UI
+      // state; text-only follow-ups are still accepted below).
       if ((!trimmed && files.length === 0) || uploading) return;
-      if (sendInFlightRef.current) return;
-      sendInFlightRef.current = true;
 
       let uploaded: ChatAttachment[] = [];
       if (files.length > 0) {
@@ -175,7 +198,6 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
           uploaded = await uploadChatFiles(workspaceId, files);
         } catch (e) {
           setUploading(false);
-          sendInFlightRef.current = false;
           // Error-reason routing (CTO 2026-05-19 on forensic a99ab0a1:
           // "if its file size issue, should have error that instead
           // saying timeout which is wrong"). Each cause maps to ITS
@@ -195,10 +217,10 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
       const userMsg = createMessage("user", trimmed, uploaded, undefined, messageId);
       optionsRef.current.onUserMessage?.(userMsg);
 
-      setSending(true);
-      sendingFromAPIRef.current = true;
       setError(null);
-      const myToken = ++sendTokenRef.current;
+      const myToken = nextTokenRef.current++;
+      inFlightTokensRef.current.add(myToken);
+      syncSendingState();
 
       const history = optionsRef.current
         .getHistoryMessages()
@@ -255,15 +277,14 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
           { timeoutMs: 30 * 60 * 1000 },
         )
         .then((resp) => {
-          if (sendTokenRef.current !== myToken) return;
-          // Always process a synchronous push-mode 200 response. An earlier
-          // early-return on !sendingFromAPIRef.current dropped agent replies
-          // that arrived before the WebSocket path released the guards,
-          // leaving the user message visible with no Echo/reply bubble.
-          // releaseSendGuards is idempotent, and ChatTab deduplicates
-          // appendMessageDeduped within a short window, so processing here is
-          // safe even if a WS event already handled the reply.
-          //
+          // core#2725: only process the reply that belongs to this token.
+          // If the token is neither in-flight nor released (e.g. a newer
+          // send was cancelled), drop it to avoid misrouted replies / duplicates.
+          if (
+            !inFlightTokensRef.current.has(myToken) &&
+            !releasedTokensRef.current.has(myToken)
+          ) return;
+
           // Task #227 — poll-mode (external/MCP workspace) queued-200
           // short-circuit. ws-server's `proxyA2ARequest` returns
           // `{status:"queued", delivery_mode:"poll", ...}` immediately
@@ -274,20 +295,15 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
           // `wait_for_message` poll.
           //
           // Keep the spinner up by deliberately NOT calling
-          // releaseSendGuards: the user-facing "thinking" state must
+          // finishSendToken: the user-facing "thinking" state must
           // persist until the AGENT_MESSAGE lands (handled by the
           // useChatSocket `onAgentMessage`/`onSendComplete` path) or an
           // explicit error fires (`onSendError` from an ACTIVITY_LOGGED
           // status="error"). Don't synthesise an empty agent bubble.
-          //
-          // sendInFlightRef stays true intentionally — it's the dedup
-          // guard for the user typing two messages back-to-back; for
-          // poll mode the second message would race the first agent's
-          // reply, so blocking is correct (matches push-mode behaviour
-          // where `sending` blocks the textarea).
           if (resp?.status === "queued") {
             return;
           }
+
           const replyText = extractReplyText(resp);
           const replyFiles = extractFilesFromTask(
             (resp?.result ?? {}) as Record<string, unknown>,
@@ -297,14 +313,14 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
               createMessage("agent", replyText, replyFiles),
             );
           }
-          releaseSendGuards();
+          finishSendToken(myToken);
         })
         .catch((e: unknown) => {
-          if (sendTokenRef.current !== myToken) return;
-          if (!sendingFromAPIRef.current) {
-            sendInFlightRef.current = false;
-            return;
-          }
+          if (
+            !inFlightTokensRef.current.has(myToken) &&
+            !releasedTokensRef.current.has(myToken)
+          ) return;
+
           // CLIENT TIMEOUT ≠ UNREACHABLE (jrs-auto, 2026-06-09). The A2A
           // proxy holds this POST open for the agent's WHOLE turn; a long
           // tool-calling turn routinely outlives the 120s client budget.
@@ -338,18 +354,12 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
           if (isClientTimeout || isCloudflareHeldRequest) {
             return; // delivered; reply (and guard release) arrives via WS
           }
-          releaseSendGuards();
+
+          finishSendToken(myToken);
           setError("Failed to send message — agent may be unreachable");
         });
-
-      // The POST is now in flight (the .then/.catch above run later, off the
-      // microtask queue). Release the re-entrancy guard immediately so the
-      // user can fire the NEXT message while this one's reply is still
-      // pending — true multi-send. `sending` stays true to keep the thinking
-      // indicator up; it no longer gates new sends.
-      sendInFlightRef.current = false;
     },
-    [workspaceId, uploading],
+    [workspaceId, uploading, syncSendingState, finishSendToken],
   );
 
   return {
