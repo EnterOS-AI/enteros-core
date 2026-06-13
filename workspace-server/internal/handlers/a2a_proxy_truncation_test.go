@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/gin-gonic/gin"
 )
 
