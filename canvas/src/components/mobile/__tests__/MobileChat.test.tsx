@@ -8,7 +8,7 @@
  * NOTE: No @testing-library/jest-dom — use DOM APIs.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, render, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import React from "react";
 
 import { MobileChat } from "../MobileChat";
@@ -643,5 +643,43 @@ describe("MobileChat — Agent Comms render parity (#231)", () => {
     await waitFor(() => {
       expect(container.textContent ?? "").toContain("Please review PR 42");
     });
+  });
+});
+
+describe("MobileChat — thinking indicator (core#2720/#2745 parity)", () => {
+  it("shows the thinking indicator when the workspace reports a currentTask", () => {
+    const busy = { ...onlineNode, data: { ...onlineNode.data, currentTask: "downloading assets" } };
+    mockStoreState.nodes = [busy];
+    const { container } = renderChat(mockAgentId);
+    expect(container.querySelector('[data-testid="mobile-thinking-indicator"]')).not.toBeNull();
+  });
+
+  it("hides the thinking indicator when idle (online, no currentTask, not sending)", () => {
+    mockStoreState.nodes = [onlineNode];
+    const { container } = renderChat(mockAgentId);
+    expect(container.querySelector('[data-testid="mobile-thinking-indicator"]')).toBeNull();
+  });
+});
+
+describe("MobileChat — multi-send tap path (CR2 #2762)", () => {
+  it("Send button stays ENABLED during an in-flight send (tap multi-send)", async () => {
+    mockStoreState.nodes = [onlineNode];
+    // First send hangs → sending stays true.
+    vi.spyOn(api, "post").mockReturnValueOnce(new Promise(() => {}));
+    const { container } = renderChat(mockAgentId);
+    const ta = container.querySelector("textarea") as HTMLTextAreaElement;
+    const sendBtn = () => container.querySelector('[aria-label="Send"]') as HTMLButtonElement;
+    await act(async () => {
+      fireEvent.change(ta, { target: { value: "first" } });
+    });
+    expect(sendBtn().disabled).toBe(false);
+    await act(async () => {
+      sendBtn().click(); // starts the hanging send → sending=true
+    });
+    // Type a follow-up; the button MUST remain tappable (pre-fix it disabled on `sending`).
+    await act(async () => {
+      fireEvent.change(ta, { target: { value: "second" } });
+    });
+    expect(sendBtn().disabled).toBe(false);
   });
 });

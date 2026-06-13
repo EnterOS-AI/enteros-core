@@ -241,9 +241,42 @@ export function MobileChat({
   });
 
   useChatSocket(agentId, {
-    onAgentMessage: appendMessageDeduped,
-    onSendComplete: releaseSendGuards,
+    // A reply landing / send completing PROVES the agent is reachable, so
+    // clear any stale "Failed to send" banner (core#2736) — mirrors ChatTab.
+    onAgentMessage: (m) => {
+      appendMessageDeduped(m);
+      clearError();
+    },
+    onSendComplete: () => {
+      releaseSendGuards();
+      clearError();
+    },
   });
+
+  // The agent is "thinking" when the user's send is in flight OR the workspace
+  // reports an in-flight task — either way it's reachable, so clear any stale
+  // "unreachable" banner the moment it's working (core#2745). Mirrors ChatTab.
+  const thinking = sending || !!node?.data?.currentTask;
+  useEffect(() => {
+    if (thinking) clearError();
+  }, [thinking, clearError]);
+
+  // Elapsed-seconds counter for the thinking indicator (core#2720/#2745) —
+  // ticks while the agent is working, resets when it stops. Gives the same
+  // "●●● Ns" feedback the desktop shows so a long turn doesn't look stalled.
+  const [thinkingElapsed, setThinkingElapsed] = useState(0);
+  useEffect(() => {
+    if (!thinking) {
+      setThinkingElapsed(0);
+      return;
+    }
+    setThinkingElapsed(0);
+    const started = performance.now();
+    const id = window.setInterval(() => {
+      setThinkingElapsed(Math.floor((performance.now() - started) / 1000));
+    }, 1000);
+    return () => window.clearInterval(id);
+  }, [thinking]);
 
   // Auto-grow the textarea: reset height to 'auto' so the scrollHeight
   // shrinks when the user deletes text, then size to scrollHeight up to
@@ -323,7 +356,12 @@ export function MobileChat({
 
   const send = async () => {
     const text = draft.trim();
-    if ((!text && pendingFiles.length === 0) || sending || !reachable) return;
+    // Multi-send (core#2726): do NOT gate on `sending`. The A2A proxy holds
+    // each turn open, but the user can fire follow-up messages while the agent
+    // is still working — useChatSend releases its in-flight guard right after
+    // the POST fires, so successive sends queue independently. (Desktop ChatTab
+    // shipped this; mobile reused the hook but still blocked here.)
+    if ((!text && pendingFiles.length === 0) || !reachable) return;
     clearError();
     setDraft("");
     const files = pendingFiles;
@@ -582,6 +620,27 @@ export function MobileChat({
               </div>
             );
           })}
+        {thinking && (
+          <div
+            data-testid="mobile-thinking-indicator"
+            aria-label={`Agent working, ${thinkingElapsed} seconds`}
+            style={{
+              alignSelf: "flex-start",
+              display: "flex",
+              alignItems: "center",
+              gap: 8,
+              padding: "8px 12px",
+              borderRadius: 14,
+              background: p.surface2,
+              color: p.text2,
+              fontSize: 12,
+              fontFamily: MOBILE_FONT_SANS,
+            }}
+          >
+            <span style={{ letterSpacing: 2, color: p.accent }}>●●●</span>
+            <span>{thinkingElapsed}s</span>
+          </div>
+        )}
         {sendError && (
           <div
             role="alert"
@@ -775,7 +834,12 @@ export function MobileChat({
           <button
             type="button"
             onClick={send}
-            disabled={(!draft.trim() && pendingFiles.length === 0) || !reachable || sending || uploading}
+            // Multi-send (core#2726): the tap button is mobile's PRIMARY send
+            // affordance, so it must NOT disable while `sending` — otherwise a
+            // follow-up message can't be tapped during an in-flight turn (CR2
+            // #2762). Gate only on empty input / unreachable / uploading; the
+            // hook handles concurrent sends.
+            disabled={(!draft.trim() && pendingFiles.length === 0) || !reachable || uploading}
             aria-label="Send"
             className="focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-100 dark:focus-visible:ring-offset-zinc-900"
             style={{
@@ -783,15 +847,15 @@ export function MobileChat({
               height: 36,
               borderRadius: 999,
               border: "none",
-              cursor: (draft.trim() || pendingFiles.length === 0) && !sending && !uploading ? "pointer" : "not-allowed",
+              cursor: (draft.trim() || pendingFiles.length === 0) && !uploading ? "pointer" : "not-allowed",
               flexShrink: 0,
               background:
-                (draft.trim() || pendingFiles.length > 0) && reachable && !sending && !uploading
+                (draft.trim() || pendingFiles.length > 0) && reachable && !uploading
                   ? p.accent
                   : dark
                     ? "#2a2823"
                     : "#ece9e0",
-              color: (draft.trim() || pendingFiles.length > 0) && reachable && !sending && !uploading ? "#fff" : p.text3,
+              color: (draft.trim() || pendingFiles.length > 0) && reachable && !uploading ? "#fff" : p.text3,
               display: "flex",
               alignItems: "center",
               justifyContent: "center",
