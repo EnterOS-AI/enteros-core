@@ -8,8 +8,8 @@ import {
   seedChatHistory,
 } from "./fixtures/chat-seed";
 
-const API = process.env.E2E_API_URL ?? "http://localhost:8080";
 const PLATFORM_URL = process.env.E2E_PLATFORM_URL ?? "http://localhost:8080";
+const API = process.env.E2E_API_URL ?? PLATFORM_URL;
 const ADMIN_TOKEN = process.env.E2E_ADMIN_TOKEN ?? process.env.ADMIN_TOKEN;
 
 /** Enter the Org-map view so the Canvas (React Flow graph) mounts. */
@@ -255,9 +255,11 @@ test.describe("Data Flow — Initial Prompt in Chat", () => {
     const stopHeartbeat = startHeartbeat(ws.id, ws.authToken);
 
     // Pre-seed chat history so the My Chat panel shows deterministic content.
+    // Include double quotes to regression-test shell-safe JSON quoting in
+    // seedChatHistory (CR2 #11517).
     await seedChatHistory(workspaceId, [
-      { role: "user", content: "Hello from seed" },
-      { role: "agent", content: "Hello back from seed" },
+      { role: "user", content: 'Hello from seed with "quotes"' },
+      { role: "agent", content: 'Hello back from seed with "quotes"' },
     ]);
 
     cleanup = async () => {
@@ -277,8 +279,8 @@ test.describe("Data Flow — Initial Prompt in Chat", () => {
 
   test("seeded chat history appears in My Chat", async ({ page }) => {
     const panel = page.locator("#panel-chat");
-    await expect(panel.getByText("Hello from seed")).toBeVisible({ timeout: 5_000 });
-    await expect(panel.getByText("Hello back from seed")).toBeVisible({ timeout: 5_000 });
+    await expect(panel.getByText('Hello from seed with "quotes"')).toBeVisible({ timeout: 5_000 });
+    await expect(panel.getByText('Hello back from seed with "quotes"')).toBeVisible({ timeout: 5_000 });
   });
 
   test("My Chat empty state is not shown when history exists", async ({ page }) => {

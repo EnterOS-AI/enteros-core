@@ -9,9 +9,44 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { execFileSync, execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 
 const PLATFORM_URL = process.env.E2E_PLATFORM_URL ?? "http://localhost:8080";
+
+interface PgCredentials {
+  user: string;
+  pass: string;
+  host: string;
+  port: string;
+  db: string;
+}
+
+function parseDbUrl(): PgCredentials | null {
+  const dbUrl = process.env.E2E_DATABASE_URL;
+  if (!dbUrl) return null;
+  const pgRegex = /postgres:\/\/([^:]+):([^@]+)@([^:]+):(\d+)\/([^?]+)/;
+  const m = dbUrl.match(pgRegex);
+  if (!m) return null;
+  const [, user, pass, host, port, db] = m;
+  return { user, pass, host, port, db };
+}
+
+function runPsql(sql: string, timeoutMs = 30_000): void {
+  const creds = parseDbUrl();
+  if (!creds) {
+    throw new Error("E2E_DATABASE_URL must be set for DB seeding");
+  }
+  const { user, pass, host, port, db } = creds;
+  execFileSync(
+    "psql",
+    ["-h", host, "-p", port, "-U", user, "-d", db, "-c", sql],
+    {
+      env: { ...process.env, PGPASSWORD: pass },
+      stdio: "pipe",
+      timeout: timeoutMs,
+    },
+  );
+}
 
 export interface SeededWorkspace {
   id: string;
@@ -62,16 +97,9 @@ export async function seedWorkspace(echoURL: string): Promise<SeededWorkspace> {
   // 2. Direct DB update: mark online + point url at echo runtime.
   //    The platform blocks loopback URLs at the API layer (SSRF guard),
   //    so we bypass via psql for local E2E.
-  const dbUrl = process.env.E2E_DATABASE_URL;
-  if (!dbUrl) {
+  if (!process.env.E2E_DATABASE_URL) {
     throw new Error("E2E_DATABASE_URL must be set for DB seeding");
   }
-  const pgRegex = /postgres:\/\/([^:]+):([^@]+)@([^:]+):(\d+)\/([^?]+)/;
-  const m = dbUrl.match(pgRegex);
-  if (!m) {
-    throw new Error(`Cannot parse E2E_DATABASE_URL: ${dbUrl}`);
-  }
-  const [, user, pass, host, port, db] = m;
 
   // Pre-seed a platform_inbound_secret so chat file uploads don't trigger
   // the lazy-heal 503 "retry in 30 s" path on first use.
@@ -81,17 +109,9 @@ export async function seedWorkspace(echoURL: string): Promise<SeededWorkspace> {
     ],
   ).join("");
 
-  const psql = [
-    `PGPASSWORD=${pass} psql`,
-    `-h ${host} -p ${port} -U ${user} -d ${db}`,
-    `-c "UPDATE workspaces SET status = 'online', url = '${echoURL}', platform_inbound_secret = '${inboundSecret}' WHERE id = '${ws.id}'"`,
-  ].join(" ");
-
-  try {
-    execSync(psql, { stdio: "pipe", timeout: 30_000 });
-  } catch (err) {
-    throw new Error(`DB update failed: ${err}`);
-  }
+  runPsql(
+    `UPDATE workspaces SET status = 'online', url = '${echoURL}', platform_inbound_secret = '${inboundSecret}', delivery_mode = 'push' WHERE id = '${ws.id}'`,
+  );
 
   cacheWorkspaceURL(ws.id, echoURL);
 
@@ -152,30 +172,49 @@ export function startHeartbeat(
 
 /**
  * Seed chat-history rows for a workspace.
+ *
+ * Chat history is read from activity_logs via messagestore.MessageStore
+ * (workspace-server/internal/messagestore/postgres_store.go). We insert
+ * a2a_receive rows with source_id NULL (canvas-origin) so the
+ * /chat-history hydrator picks them up. Each message becomes its own row
+ * so arbitrary user/agent sequences can be seeded.
  */
 export async function seedChatHistory(
   workspaceId: string,
   messages: Array<{ role: "user" | "agent"; content: string }>,
 ): Promise<void> {
-  const dbUrl = process.env.E2E_DATABASE_URL;
-  if (!dbUrl) return;
+  if (!process.env.E2E_DATABASE_URL) return;
 
-  const pgRegex = /postgres:\/\/([^:]+):([^@]+)@([^:]+):(\d+)\/([^?]+)/;
-  const m = dbUrl.match(pgRegex);
-  if (!m) return;
-  const [, user, pass, host, port, db] = m;
+  const escape = (s: string) => s.replace(/'/g, "''").replace(/\\/g, "\\\\");
 
-  const values = messages
-    .map(
-      (msg, i) =>
-        `('${randomUUID()}', '${workspaceId}', '${msg.role}', '${msg.content.replace(/'/g, "''")}', NOW() - INTERVAL '${messages.length - i} seconds')`,
-    )
+  const rows = messages
+    .map((msg, i) => {
+      const offsetSec = messages.length - i;
+      const requestBody =
+        msg.role === "user"
+          ? JSON.stringify({
+              params: {
+                message: {
+                  parts: [{ kind: "text", text: msg.content }],
+                },
+              },
+            })
+          : "{}";
+      const responseBody =
+        msg.role === "agent"
+          ? JSON.stringify({
+              result: {
+                parts: [{ kind: "text", text: msg.content }],
+              },
+            })
+          : "{}";
+      return `('${randomUUID()}', '${workspaceId}', 'a2a_receive', NULL, NULL, 'message/send', NULL, '${escape(requestBody)}'::jsonb, '${escape(responseBody)}'::jsonb, 0, 'ok', NOW() - INTERVAL '${offsetSec} seconds')`;
+    })
     .join(",");
 
-  const sql = `INSERT INTO chat_messages (id, workspace_id, role, content, created_at) VALUES ${values};`;
+  const sql = `INSERT INTO activity_logs (id, workspace_id, activity_type, source_id, target_id, method, summary, request_body, response_body, duration_ms, status, created_at) VALUES ${rows};`;
 
-  const psql = `PGPASSWORD=${pass} psql -h ${host} -p ${port} -U ${user} -d ${db} -c "${sql}"`;
-  execSync(psql, { stdio: "pipe", timeout: 10_000 });
+  runPsql(sql, 10_000);
 }
 
 /**
@@ -185,18 +224,10 @@ export async function seedChatHistory(
  * that can race or 500 on external workspaces.
  */
 export async function cleanupWorkspace(workspaceId: string): Promise<void> {
-  const dbUrl = process.env.E2E_DATABASE_URL;
-  if (!dbUrl) return;
-
-  const pgRegex = /postgres:\/\/([^:]+):([^@]+)@([^:]+):(\d+)\/([^?]+)/;
-  const m = dbUrl.match(pgRegex);
-  if (!m) return;
-  const [, user, pass, host, port, db] = m;
-
-  const psql = `PGPASSWORD=${pass} psql -h ${host} -p ${port} -U ${user} -d ${db} -c "DELETE FROM workspaces WHERE id = '${workspaceId}'"`;
+  if (!process.env.E2E_DATABASE_URL) return;
 
   try {
-    execSync(psql, { stdio: "pipe", timeout: 30_000 });
+    runPsql(`DELETE FROM workspaces WHERE id = '${workspaceId}'`);
   } catch {
     // Best-effort cleanup; don't fail the test suite if the row is already gone.
   }
