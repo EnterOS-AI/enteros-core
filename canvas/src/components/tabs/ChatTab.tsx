@@ -354,10 +354,15 @@ function MyChatPanel({ workspaceId, data }: Props) {
     if ((!text && files.length === 0) || !agentReachable || uploading) return;
     setInput("");
     setPendingFiles([]);
-    // Reset auto-grow height so the textarea collapses back to a
-    // single row after a send (core#2697).
+    // Reset auto-grow height so the textarea returns to its baseline
+    // single-row size after a send (core#2697). CLEAR the inline height
+    // (don't set "0px") — an empty string drops the imperative override
+    // so the `rows={1}` natural height governs again. Setting "0px" here
+    // collapsed the textarea to just its padding (no recompute fires
+    // until the next keystroke), leaving the input far smaller than its
+    // original size.
     if (textareaRef.current) {
-      textareaRef.current.style.height = "0px";
+      textareaRef.current.style.height = "";
       textareaRef.current.style.overflowY = "hidden";
     }
     clearSendError();
