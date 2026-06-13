@@ -434,6 +434,7 @@ func (h *WorkspaceHandler) logA2ASuccess(ctx context.Context, workspaceID, calle
 			"response_body": json.RawMessage(respBody),
 			"method":        a2aMethod,
 			"duration_ms":   durationMs,
+			"message_id":    extractMessageIdFromA2ABody(body),
 		})
 	}
 }

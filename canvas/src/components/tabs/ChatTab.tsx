@@ -157,7 +157,7 @@ function MyChatPanel({ workspaceId, data }: Props) {
     onUserMessage: (msg) => history.setMessages((prev) => [...prev, msg]),
     onAgentMessage: (msg) => history.setMessages((prev) => appendMessageDeduped(prev, msg)),
   });
-  const { sending, uploading, sendMessage, error: sendError, clearError: clearSendError, releaseSendGuards, sendingFromAPIRef } = chatSend;
+  const { sending, uploading, sendMessage, error: sendError, clearError: clearSendError, releaseSendGuards, sendingFromAPIRef, finishSendByMessageId } = chatSend;
 
   const displayError = error || sendError;
 
@@ -176,15 +176,10 @@ function MyChatPanel({ workspaceId, data }: Props) {
       history.setMessages((prev) => appendMessageDeduped(prev, msg));
       // A successful agent reply landing PROVES the agent is reachable, so
       // clear any stale "Failed to send — agent may be unreachable" banner
-      // (core#2697). Without this, a turn that errored-then-auto-healed (e.g.
-      // a context-overflow 400 retried on a fresh session) left the banner up
-      // even as the retry's reply arrived — the agent visibly working at "●●●
-      // Ns" with a red "unreachable" banner. Both error sources are cleared.
+      // (core#2697). The actual token cleanup happens in onSendComplete where
+      // we have the messageId for token-specific completion (#2759).
       setError(null);
       clearSendError();
-      if (sendingFromAPIRef.current) {
-        releaseSendGuards();
-      }
     },
     // Cross-device sync (core#2697). The origin device already
     // optimistically added the user message via onUserMessage;
@@ -214,12 +209,17 @@ function MyChatPanel({ workspaceId, data }: Props) {
         { ...createMessage("system", decisionChipText(decision, p.title)), decision },
       ]);
     },
-    onSendComplete: () => {
+    onSendComplete: (messageId) => {
       // Reply completed (poll-mode) → agent is reachable; clear any stale
       // send-error banner (core#2697, same rationale as onAgentMessage).
       setError(null);
       clearSendError();
-      if (sendingFromAPIRef.current) {
+      if (!sendingFromAPIRef.current) return;
+      if (messageId) {
+        finishSendByMessageId?.(messageId);
+      } else {
+        // Older ws-server builds or tool-originated messages don't carry a
+        // messageId — fall back to the coarse release.
         releaseSendGuards();
       }
     },

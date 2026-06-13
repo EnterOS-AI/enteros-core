@@ -180,8 +180,9 @@ describe("useChatSend — concurrent replies (core#2725)", () => {
 
   it("finishes a late timeout/524 for a token whose WS completion already fired (CR2 #11463)", async () => {
     // The WS onAgentMessage/onSendComplete can arrive BEFORE the HTTP request
-    // finally terminates with a timeout/524. Without handling, the catch would
-    // move the token back to pending-WS and leave the spinner stuck forever.
+    // finally terminates with a timeout/524. With token-specific completion,
+    // finishSendByMessageId(messageId) removes the exact token; the late
+    // timeout/524 then sees the token is gone and drops instead of re-pending.
     const send = deferred();
     apiPostMock.mockImplementationOnce(() => send.promise);
 
@@ -195,12 +196,13 @@ describe("useChatSend — concurrent replies (core#2725)", () => {
     });
     expect(result.current.sending).toBe(true);
 
-    // WS completion arrives first.
+    const messageId = (apiPostMock.mock.calls[0][1] as any).params.message.messageId;
+
+    // WS completion arrives first — finish the SPECIFIC token.
     act(() => {
-      result.current.releaseSendGuards();
+      result.current.finishSendByMessageId?.(messageId);
     });
-    // At this point the token is still HTTP in-flight but WS-completed.
-    expect(result.current.sending).toBe(true);
+    expect(result.current.sending).toBe(false);
 
     // Late client timeout lands.
     const timeoutErr = new Error("signal timed out") as Error & { name: string };
@@ -210,8 +212,56 @@ describe("useChatSend — concurrent replies (core#2725)", () => {
       await Promise.resolve();
     });
 
-    // The late timeout finishes its own token instead of re-pending.
+    // Spinner stays off; no error banner.
     expect(result.current.sending).toBe(false);
     expect(result.current.error).toBeNull();
+  });
+
+  it("does not contaminate an unrelated concurrent send on token-specific WS completion (CR2 #11466)", async () => {
+    const first = deferred();
+    const second = deferred();
+    apiPostMock
+      .mockImplementationOnce(() => first.promise)
+      .mockImplementationOnce(() => second.promise);
+
+    const { result } = renderHook(() =>
+      useChatSend("ws-mixed", { getHistoryMessages: () => [] }),
+    );
+
+    await act(async () => {
+      result.current.sendMessage("first");
+      await Promise.resolve();
+      result.current.sendMessage("second");
+      await Promise.resolve();
+    });
+    expect(result.current.sending).toBe(true);
+
+    const firstMessageId = (apiPostMock.mock.calls[0][1] as any).params.message.messageId;
+
+    // WS completion arrives ONLY for the first send.
+    act(() => {
+      result.current.finishSendByMessageId?.(firstMessageId);
+    });
+
+    // Second send is still in-flight → spinner stays up.
+    expect(result.current.sending).toBe(true);
+
+    // Second send later times out (no WS reply for it).
+    const timeoutErr = new Error("signal timed out") as Error & { name: string };
+    timeoutErr.name = "TimeoutError";
+    await act(async () => {
+      second.reject(timeoutErr);
+      await Promise.resolve();
+    });
+
+    // It moves to pending-WS (not finished), so spinner stays up until its
+    // own WS completion or releaseSendGuards.
+    expect(result.current.sending).toBe(true);
+
+    // Its own WS completion finally arrives.
+    act(() => {
+      result.current.releaseSendGuards();
+    });
+    expect(result.current.sending).toBe(false);
   });
 });

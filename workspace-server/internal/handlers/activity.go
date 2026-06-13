@@ -1125,6 +1125,9 @@ func logActivityExec(ctx context.Context, exec activityExecutor, broadcaster eve
 		if params.ErrorDetail != nil && *params.ErrorDetail != "" {
 			payload["error_detail"] = sanitizeErrorDetailForBroadcast(*params.ErrorDetail)
 		}
+		if params.MessageId != "" {
+			payload["message_id"] = params.MessageId
+		}
 	}
 
 	return func() {

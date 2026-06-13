@@ -10,7 +10,10 @@ export interface UseChatSocketCallbacks {
   onUserMessageBroadcast?: (msg: ChatMessage) => void;
   onSessionReset?: () => void;
   onActivityLog?: (entry: string) => void;
-  onSendComplete?: () => void;
+  /** Called when the server signals a send completed. `messageId` is the
+   *  client-generated message id from the A2A request, present for
+   *  canvas-originated sends when the server supports it. */
+  onSendComplete?: (messageId?: string) => void;
   onSendError?: (error: string) => void;
   /** A request the user (or an agent) responded to — drives the live
    *  decision chip in My Chat (core#2636). */
@@ -42,7 +45,10 @@ export function useChatSocket(
       );
     }
     if (msgs.length > 0) {
-      callbacksRef.current.onSendComplete?.();
+      // Pass the first consumed message's server-correlated messageId if
+      // available. The backend currently only populates this for A2A_RESPONSE
+      // events; AGENT_MESSAGE from tools leaves it undefined.
+      callbacksRef.current.onSendComplete?.(msgs[0].messageId);
     }
   }, [pendingAgentMsgs, workspaceId]);
 
@@ -72,7 +78,10 @@ export function useChatSocket(
             const sec = Math.round(durationMs / 1000);
             line = `← ${targetName} responded (${sec}s)`;
             const own = (targetId || msg.workspace_id) === workspaceId;
-            if (own) callbacksRef.current.onSendComplete?.();
+            if (own) {
+              const messageId = typeof p.message_id === "string" ? p.message_id : undefined;
+              callbacksRef.current.onSendComplete?.(messageId);
+            }
           } else if (status === "ok" && !durationMs) {
             // Task #227 — poll-mode (external/MCP workspace) queued receipt.
             // ws-server `logA2AReceiveQueued` writes a "received but no
