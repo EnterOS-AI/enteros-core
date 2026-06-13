@@ -139,7 +139,10 @@ func TestProxyA2A_LargeRequestWithinLimit(t *testing.T) {
 	c.Params = gin.Params{{Key: "id", Value: "ws-large-ok"}}
 
 	// Build a valid JSON-RPC body just under the new 16MB cap.
-	prefix := `{"jsonrpc":"2.0","id":"1","method":"message/send","params":{"message":{"role":"user","parts":[{"text":"`
+	// Include messageId and use the canonical v0.3 "kind" discriminator so
+	// normalizeA2APayload does not add fields during forwarding (which would
+	// change the body length and break the exact-length assertion).
+	prefix := `{"jsonrpc":"2.0","id":"1","method":"message/send","params":{"message":{"role":"user","messageId":"msg-1","parts":[{"kind":"text","text":"`
 	suffix := `"}]}}}`
 	paddingLen := maxProxyRequestBody - len(prefix) - len(suffix)
 	if paddingLen < 0 {
