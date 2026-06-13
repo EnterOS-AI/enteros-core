@@ -119,6 +119,23 @@ describe("appendMessageDeduped", () => {
 // is the contract the cross-device-sync feature depends on.
 
 describe("appendMessageDedupedById", () => {
+  // Same setup as the appendMessageDeduped block above: the
+  // cross-device-sync tests don't strictly need fake timers (the
+  // id-based dedup is time-independent), but the timer-advance
+  // case in the "content matches but id differs" test (line 180
+  // in the prior head) requires vi.useFakeTimers to be active,
+  // otherwise vi.advanceTimersByTime is a no-op. Adding the
+  // same hooks here is consistent with the sibling describe
+  // block + protects any future test in this block from the
+  // same trap.
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-23T12:00:00.000Z"));
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   it("appends a new message when no prior entry shares the id", () => {
     const msg = createMessage("user", "hello");
     const next = appendMessageDedupedById([], msg);
