@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -605,5 +606,48 @@ func TestEnsureConciergeModel_RespectsExistingModel(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// TestConciergeSystemPrompt_IncludesAckFirstDirective is the core#2724
+// regression guard. The concierge prompt (platform_agent.go:55+) is the
+// ONE workspace-server surface the runtime MCP preamble in
+// workspace-runtime#129 doesn't reach (the MCP preamble only fires when
+// mcp=True; the concierge runs on the dedicated platform-agent image
+// which has its own prompt composition path). Without an explicit
+// ack-first directive IN the concierge prompt, the org's only chat
+// front door goes silent for minutes on long orchestration turns — the
+// exact CTO-reported UX failure that #129 + #2724 are fixing.
+//
+// Pin: the concierge prompt must contain the ack-first directive
+// ("Acknowledge first" + "send_message_to_user" + the "On it — I'll do X
+// then Y" example). A future refactor that drops the directive
+// (regression) MUST fail this test BEFORE the UX is shipped broken.
+func TestConciergeSystemPrompt_IncludesAckFirstDirective(t *testing.T) {
+	prompt := fmt.Sprintf(conciergeSystemPromptTmpl, defaultPlatformAgentName())
+
+	// Must contain the directive header so a casual reader / agent
+	// notice it immediately.
+	if !strings.Contains(prompt, "Acknowledge first") {
+		t.Errorf("concierge prompt missing 'Acknowledge first' directive (core#2724):\n%s", prompt)
+	}
+	// Must reference the ack tool — the runtime preamble uses the
+	// same string so an agent that reads both surfaces gets the
+	// consistent instruction.
+	if !strings.Contains(prompt, "send_message_to_user") {
+		t.Errorf("concierge prompt missing 'send_message_to_user' reference (core#2724):\n%s", prompt)
+	}
+	// Must include a concrete example so the directive is
+	// interpretable, not just a slogan.
+	if !strings.Contains(prompt, "On it") {
+		t.Errorf("concierge prompt missing the 'On it — I'll do X then Y' example (core#2724):\n%s", prompt)
+	}
+	// The "Report back clearly" line is where the directive lives —
+	// the structural placement matters (it's the "synthesis" step
+	// of the concierge's responsibilities). A future refactor that
+	// moves the directive to a less prominent section should be a
+	// conscious choice, not an accident.
+	if !strings.Contains(prompt, "Report back clearly") {
+		t.Errorf("concierge prompt missing 'Report back clearly' section header (the ack-first directive should live in this section per core#2724):\n%s", prompt)
 	}
 }
