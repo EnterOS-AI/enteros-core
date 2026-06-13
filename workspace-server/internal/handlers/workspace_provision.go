@@ -1170,7 +1170,20 @@ func applyPlatformManagedLLMEnv(ctx context.Context, envVars map[string]string, 
 		// restart. Project the provider's preferred auth token env and Anthropic
 		// base URL from the workspace's available provider credential.
 		if res.ResolvedMode == LLMBillingModeBYOK && runtimeUsesAnthropicNativeProxy(runtime) {
-			if provider, ok := providerFromRegistry(derefOrEmpty(res.ProviderSelection)); ok && provider.AuthTokenEnv != "" {
+			providerName := derefOrEmpty(res.ProviderSelection)
+			// core#2712: a per-workspace billing-mode override (source=workspace_override)
+			// short-circuits ResolveLLMBillingModeDerived before it sets ProviderSelection,
+			// but the Anthropic-adapter projection still needs to know WHICH BYOK
+			// provider the workspace is running so it can map MINIMAX_API_KEY (etc.)
+			// to ANTHROPIC_AUTH_TOKEN. Derive it from the effective model when missing.
+			if providerName == "" && effectiveModel != "" {
+				if manifest, mErr := providerRegistry(); mErr == nil && manifest != nil {
+					if p, dErr := manifest.DeriveProvider(runtime, effectiveModel, availableAuthEnv); dErr == nil {
+						providerName = p.Name
+					}
+				}
+			}
+			if provider, ok := providerFromRegistry(providerName); ok && provider.AuthTokenEnv != "" {
 				if _, hasToken := envVars[provider.AuthTokenEnv]; !hasToken {
 					for _, authEnv := range provider.AuthEnv {
 						if v := strings.TrimSpace(envVars[authEnv]); v != "" {
