@@ -1456,3 +1456,74 @@ func TestSecretsSet_InvalidJSON(t *testing.T) {
 		t.Errorf("expected 400, got %d: %s", w.Code, w.Body.String())
 	}
 }
+
+// TestHeartbeatHandler_RegisterFailureClearedOnCardBearingRestart is core#2739:
+// a RESTARTED workspace already has a persisted agent_card, so the NULL-scoped
+// agent_card backfill (and its bundled register-failure clear) never fires.
+// The restarted container's authenticated /registry/register can 400 with
+// url_validate_failed (Docker-internal hostname unresolvable from the platform),
+// which stamps last_register_failure_at. Before the fix, that marker stuck and
+// evaluateStatus held the workspace 'degraded' past the Local Provision
+// Lifecycle restart-survival window (run 358593). The fix clears the marker on
+// ANY card-bearing heartbeat (the live card proves the runtime is reachable),
+// so a heartbeating restarted workspace recovers degraded->online promptly.
+//
+// This test asserts the decoupled clear runs even when agent_card already
+// exists (backfill affects 0 rows) and that recovery then proceeds.
+func TestHeartbeatHandler_RegisterFailureClearedOnCardBearingRestart(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewRegistryHandler(broadcaster)
+
+	// prevTask SELECT
+	mock.ExpectQuery("SELECT COALESCE\\(current_task").
+		WithArgs("ws-2739").
+		WillReturnRows(sqlmock.NewRows([]string{"current_task"}).AddRow(""))
+
+	// heartbeat UPDATE
+	mock.ExpectExec("UPDATE workspaces SET").
+		WithArgs("ws-2739", 0.0, "", 0, 120, "").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// agent_card backfill — restart case: card ALREADY exists, 0 rows affected.
+	mock.ExpectExec("UPDATE workspaces\\s+SET agent_card = \\$2").
+		WithArgs("ws-2739", sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+
+	// core#2739 decoupled clear — fires on the card-bearing heartbeat even
+	// though the backfill above changed nothing. 1 row: the stale marker is wiped.
+	mock.ExpectExec("UPDATE workspaces\\s+SET last_register_failure_at = NULL\\s+WHERE id = \\$1 AND last_register_failure_at IS NOT NULL").
+		WithArgs("ws-2739").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// evaluateStatus SELECT — workspace is degraded; failure marker is now NULL
+	// (the clear above wiped it in the real DB), so recovery is unblocked.
+	mock.ExpectQuery("SELECT status, last_register_failure_at FROM workspaces WHERE id =").
+		WithArgs("ws-2739").
+		WillReturnRows(sqlmock.NewRows([]string{"status", "last_register_failure_at"}).AddRow("degraded", nil))
+
+	// degraded -> online recovery
+	mock.ExpectExec("UPDATE workspaces SET status =").
+		WithArgs(models.StatusOnline, "ws-2739").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// WORKSPACE_ONLINE broadcast
+	mock.ExpectExec("INSERT INTO structure_events").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	body := `{"workspace_id":"ws-2739","error_rate":0.0,"sample_error":"","active_tasks":0,"uptime_seconds":120,"agent_card":{"name":"restarted-agent","url":"http://ws-2739:8000"}}`
+	c.Request = httptest.NewRequest("POST", "/registry/heartbeat", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Heartbeat(c)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
