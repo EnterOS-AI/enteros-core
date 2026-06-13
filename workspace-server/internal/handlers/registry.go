@@ -486,12 +486,20 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 			}
 		}
 		if effectiveURL == "" {
-			logRegister400Reason("url_required_for_push", payload.ID, payload, existingState, "effective_url_empty (payload.url="+payload.URL+", agent_card.url="+agentCardURL(payload.AgentCard)+")")
+			// Detail: which surface had a URL (so the operator can
+			// tell "no URL anywhere" from "URL in agent_card but
+			// not in payload"). NEVER log the raw URL (see RC
+			// #11335).
+			logRegister400Reason("url_required_for_push", payload.ID, payload, existingState, "effective_url_empty (payload_url_present="+urlPresence(payload.URL)+", agent_card_url_present="+urlPresence(agentCardURL(payload.AgentCard))+")")
 			c.JSON(http.StatusBadRequest, gin.H{"error": "url is required for push-mode workspaces"})
 			return
 		}
 		if err := validateAgentURL(effectiveURL); err != nil {
-			logRegister400Reason("url_validate_failed", payload.ID, payload, existingState, "url="+effectiveURL+" err="+err.Error())
+			// validateAgentURL returns a friendly CIDR label
+			// (e.g. "url targets a blocked address: RFC-1918
+			// private address") that does NOT contain the actual
+			// address. Safe to log.
+			logRegister400Reason("url_validate_failed", payload.ID, payload, existingState, err.Error())
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
@@ -1274,10 +1282,11 @@ type registerDiagnostics struct {
 // is written, so the next restart run will surface the cause
 // directly.
 func logRegister400Reason(reason, workspaceID string, payload models.RegisterPayload, existing registerDiagnostics, detail string) {
-	cardURL := agentCardURL(payload.AgentCard)
-	exURL := existing.ExistingURL
-	if exURL == "" {
-		exURL = "(new)"
+	cardURLPresence := urlPresence(agentCardURL(payload.AgentCard))
+	payloadURLPresence := urlPresence(payload.URL)
+	exURLPresence := "(new)"
+	if existing.ExistingURL != "" {
+		exURLPresence = "present"
 	}
 	exKind := existing.ExistingKind
 	if exKind == "" {
@@ -1287,10 +1296,23 @@ func logRegister400Reason(reason, workspaceID string, payload models.RegisterPay
 	if exMode == "" {
 		exMode = "(new)"
 	}
-	log.Printf("registry_register_400 workspace=%s reason=%s payload_url=%q payload_card_url=%q payload_kind=%q payload_delivery_mode=%q existing_url=%q existing_kind=%q existing_delivery_mode=%q detail=%q",
+	log.Printf("registry_register_400 workspace=%s reason=%s payload_url=%s payload_card_url=%s payload_kind=%q payload_delivery_mode=%q existing_url=%s existing_kind=%q existing_delivery_mode=%q detail=%q",
 		workspaceID, reason,
-		payload.URL, cardURL, payload.Kind, payload.DeliveryMode,
-		exURL, exKind, exMode,
+		payloadURLPresence, cardURLPresence, payload.Kind, payload.DeliveryMode,
+		exURLPresence, exKind, exMode,
 		detail,
 	)
+}
+
+// urlPresence reports "present" vs "absent" for a URL string,
+// without ever logging the URL value. Used by logRegister400Reason
+// to redact the URL columns (see RC #11335: workspace URLs can be
+// private — Hetzner 10.0.0.x, GCP 10.x.x.x, in-VPC 172.31.x.x —
+// and the prior implementation leaked them to anyone with Loki
+// read access).
+func urlPresence(url string) string {
+	if url == "" {
+		return "absent"
+	}
+	return "present"
 }
