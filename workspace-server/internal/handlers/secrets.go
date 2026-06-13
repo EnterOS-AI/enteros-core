@@ -144,6 +144,57 @@ func NewSecretsHandler(restartFunc func(string)) *SecretsHandler {
 	return &SecretsHandler{restartFunc: restartFunc}
 }
 
+// conciergeSelfSecretWriteBlocked (core#2566) reports whether a Set call
+// from the concierge/agent surface (AdminAuth ADMIN_TOKEN) targeting the
+// org's kind='platform' concierge workspace should be refused outright
+// (self-DoS guard). Returns a non-empty reason when blocked.
+//
+// Threat model (core#2566, 2026-06-11 live incident):
+//   - The concierge's management MCP authenticates with the tenant
+//     ADMIN token. On a Set call against the concierge's own workspace
+//     (kind='platform'), #2573's auto-restart skip *does* fire (skip 2
+//     covers kind='platform') — but that guard is best-effort and there
+//     is a second, earlier failure path: the secret write itself
+//     triggers env-var reload side effects inside the live container
+//     mid-turn, and any path that later invokes a restart (operator
+//     click, restart-on-failure watchdog, the next Set/Delete) tears
+//     the concierge down. The org root going offline has already cost
+//     a multi-hour outage once.
+//   - Approval gating (#2574) is necessary but NOT sufficient: an
+//     approval can be issued by a sleepy operator, and the concierge
+//     consuming it still self-DoSes. The only safe posture is to
+//     refuse the self-targeted write and force a human to apply the
+//     change through a non-agent path (canvas Secrets tab, operator
+//     session with explicit operator-action audit).
+//
+// Scope: AdminAuth admin-token callers ONLY. Session-cookie
+// (cp_session_actor) and ordinary workspace-token callers are NOT
+// blocked — they are human operators / non-concierge agents and may
+// legitimately need to write the concierge's own secrets.
+//
+// Fail-closed: if the kind lookup errors, we refuse the write (and
+// log) — a wrongly-fired write on the org root is exactly the outage
+// this guard exists to prevent, while a refused write is just a retry
+// after the DB hiccup clears.
+func conciergeSelfSecretWriteBlocked(c *gin.Context, targetWorkspaceID string) (bool, string) {
+	if !callerIsAdminToken(c) {
+		return false, ""
+	}
+	ctx := c.Request.Context()
+	var kind string
+	if err := db.DB.QueryRowContext(ctx,
+		`SELECT COALESCE(kind, 'workspace') FROM workspaces WHERE id = $1`, targetWorkspaceID).
+		Scan(&kind); err != nil {
+		// Fail closed — see doc comment.
+		log.Printf("secrets: blocking admin-token set_workspace_secret on %s (kind lookup failed, fail-closed: %v)", targetWorkspaceID, err)
+		return true, "self-DoS guard: workspace kind lookup failed; refusing to write to a workspace whose kind cannot be verified"
+	}
+	if kind == "platform" {
+		return true, "concierge cannot set_workspace_secret on its own platform-root workspace (self-DoS guard, core#2566); apply this secret through the canvas Secrets tab as a human operator"
+	}
+	return false, ""
+}
+
 // autoRestartAllowed (core#2573) decides whether a secret change on
 // workspaceID may fire the auto-restart. Two skips:
 //
@@ -409,6 +460,28 @@ func (h *SecretsHandler) Set(c *gin.Context) {
 		return
 	}
 	if rejectPlatformManagedDirectLLMBypassForWorkspace(c, workspaceID, body.Key) {
+		return
+	}
+
+	// core#2566: refuse concierge/agent self-targeted secret writes on the
+	// org-root (kind='platform') workspace. Fires BEFORE the approval gate so
+	// a refused write does not even create a pending approval — the operator
+	// is told to apply the change through the canvas Secrets tab instead, and
+	// the audit trail records the refused attempt.
+	if blocked, reason := conciergeSelfSecretWriteBlocked(c, workspaceID); blocked {
+		log.Printf("secrets: refusing admin-token set_workspace_secret on %s key=%s (core#2566 self-DoS guard): %s", workspaceID, body.Key, reason)
+		c.JSON(http.StatusForbidden, gin.H{
+			"error":        reason,
+			"workspace_id": workspaceID,
+			"key":          body.Key,
+			"code":         "CONCIERGE_SELF_WRITE_BLOCKED",
+		})
+		audit.Emit(c.Request.Context(), "secret.set.refused", map[string]any{
+			"workspace_id": workspaceID,
+			"key":          body.Key,
+			"reason":       "concierge_self_write_blocked",
+			"issue":        "core#2566",
+		})
 		return
 	}
 
