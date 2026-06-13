@@ -24,16 +24,20 @@
 --   The two are complementary — #129 catches the runtime-injected
 --   preamble, this seed catches the platform-injected instruction.
 --
--- Idempotency: ON CONFLICT (scope, scope_target, title) DO NOTHING
--- is the right shape for a re-applied migration (e.g. a reseed in
--- a fresh staging DB) — the row's content / priority / enabled
--- state are NOT updated, so a deliberate operator edit on
--- production survives the migration. The DO UPDATE branch would
--- silently clobber operator edits.
+-- Idempotency: INSERT ... WHERE NOT EXISTS (...), NOT ON CONFLICT.
+-- The `platform_instructions` table (created in migration 040) has
+-- only a UUID primary key plus the partial scope index — there is
+-- no unique constraint on (scope, scope_target, title), and
+-- PostgreSQL's ON CONFLICT (cols) DO NOTHING requires one.
+-- Adding a unique constraint would be a schema change with
+-- cross-cutting migration ordering risk; WHERE NOT EXISTS is
+-- idempotent against the CURRENT schema and survives a re-apply.
+-- The seed deliberately does NOT update an existing row's
+-- content/priority/enabled if one already matches the title —
+-- operator edits on production are preserved (same contract as
+-- ON CONFLICT DO NOTHING would have given us).
 INSERT INTO platform_instructions (scope, scope_target, title, content, priority, enabled)
-VALUES (
-    'global',
-    NULL,
+SELECT 'global', NULL,
     'Acknowledge-first responsiveness',
     -- Direct copy of the runtime preamble added in PR #129
     -- (molecule-ai-workspace-runtime feat/ack-first-responsiveness,
@@ -45,5 +49,9 @@ VALUES (
     '**Stay responsive — acknowledge first:** The moment you pick up a request that will take more than a few seconds, FIRST send a one-line acknowledgement + your plan with `send_message_to_user` (e.g. "On it — I''ll do X then Y, back shortly"), THEN start the work. For long tasks, drop a brief progress note when a phase finishes. Never go silent for minutes — a user with no acknowledgement assumes the agent is stuck.',
     100,  -- high priority so it''s near the top of the concatenated prompt
     true
-)
-ON CONFLICT (scope, scope_target, title) DO NOTHING;
+WHERE NOT EXISTS (
+    SELECT 1 FROM platform_instructions
+    WHERE scope = 'global'
+      AND scope_target IS NULL
+      AND title = 'Acknowledge-first responsiveness'
+);
