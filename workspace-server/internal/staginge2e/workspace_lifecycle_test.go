@@ -461,18 +461,27 @@ func tenantAdminToken(t *testing.T, cfg stagingCfg, slug string) string {
 	return ""
 }
 
-// tenantCreateWorkspace creates a workspace via the tenant ws-server, exercising
-// the full tenant → CP provisioner → EC2 path.
+// tenantCreateWorkspace creates a default claude-code workspace via the tenant
+// ws-server, exercising the full tenant → CP provisioner → EC2 path.
 func tenantCreateWorkspace(t *testing.T, cfg stagingCfg, host, token, orgID string) string {
+	t.Helper()
+	return tenantCreateWorkspaceWithRuntime(t, cfg, host, token, orgID, "core2332-life-e2e", "claude-code", "moonshot/kimi-k2.6")
+}
+
+// tenantCreateWorkspaceWithRuntime creates a workspace on a specific runtime +
+// model. Both must be a PLATFORM-namespaced pairing so billing resolves
+// platform_managed (no BYOK credential needed at create) — used by the
+// external-runtime request e2e (codex + the cheap openai/gpt-5.4-mini).
+func tenantCreateWorkspaceWithRuntime(t *testing.T, cfg stagingCfg, host, token, orgID, name, runtime, model string) string {
 	t.Helper()
 	url := "https://" + host + "/workspaces"
 	body := fmt.Sprintf(
 		`{"name":%q,"runtime":%q,"tier":%d,"model":%q,"billing_mode":%q,"provider":%q}`,
-		"core2332-life-e2e", "claude-code", 1, "moonshot/kimi-k2.6", "platform_managed", "platform",
+		name, runtime, 1, model, "platform_managed", "platform",
 	)
 	status, resp := doTenantJSON(t, "POST", url, token, orgID, body)
 	if status != http.StatusCreated && status != http.StatusOK {
-		t.Fatalf("tenant workspace create: HTTP %d: %s", status, resp)
+		t.Fatalf("tenant workspace create (runtime=%s model=%s): HTTP %d: %s", runtime, model, status, resp)
 	}
 	id := jsonField(resp, "id")
 	if id == "" {
