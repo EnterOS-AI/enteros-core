@@ -847,7 +847,10 @@ export function MobileChat({
               height: 36,
               borderRadius: 999,
               border: "none",
-              cursor: (draft.trim() || pendingFiles.length === 0) && !uploading ? "pointer" : "not-allowed",
+              cursor:
+                (draft.trim() || pendingFiles.length > 0) && reachable && !uploading
+                  ? "pointer"
+                  : "not-allowed",
               flexShrink: 0,
               background:
                 (draft.trim() || pendingFiles.length > 0) && reachable && !uploading
