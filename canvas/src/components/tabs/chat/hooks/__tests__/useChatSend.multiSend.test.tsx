@@ -69,6 +69,27 @@ describe("useChatSend — multi-send (core#2697 feature 2)", () => {
     expect(id1).not.toBe(id2);
   });
 
+  it("prevents a literal double-fire within the same synchronous tick", async () => {
+    // Click-spam / Enter held down should dispatch only ONE POST, even though
+    // the sending gate no longer blocks follow-up messages. The brief setup
+    // guard releases the moment the POST is fired.
+    apiPostMock.mockImplementation(() => new Promise(() => {}));
+    const onUserMessage = vi.fn();
+    const { result } = renderHook(() =>
+      useChatSend("ws-1", { getHistoryMessages: () => [], onUserMessage }),
+    );
+
+    await act(async () => {
+      // Fire twice without yielding — same synchronous tick.
+      result.current.sendMessage("double-click");
+      result.current.sendMessage("double-click");
+      await Promise.resolve();
+    });
+
+    expect(onUserMessage).toHaveBeenCalledTimes(1);
+    expect(apiPostMock).toHaveBeenCalledTimes(1);
+  });
+
   it("does not block on `sending` (an empty/whitespace send is still a no-op)", async () => {
     apiPostMock.mockImplementation(() => new Promise(() => {}));
     const onUserMessage = vi.fn();

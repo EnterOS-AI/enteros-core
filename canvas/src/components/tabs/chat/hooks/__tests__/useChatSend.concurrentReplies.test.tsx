@@ -58,6 +58,7 @@ describe("useChatSend — concurrent replies (core#2725)", () => {
 
     await act(async () => {
       result.current.sendMessage("first");
+      await Promise.resolve(); // let the setup guard release
       result.current.sendMessage("second");
       await Promise.resolve();
     });
@@ -95,6 +96,7 @@ describe("useChatSend — concurrent replies (core#2725)", () => {
 
     await act(async () => {
       result.current.sendMessage("first");
+      await Promise.resolve(); // let the setup guard release
       result.current.sendMessage("second");
       await Promise.resolve();
     });
@@ -115,4 +117,64 @@ describe("useChatSend — concurrent replies (core#2725)", () => {
     expect(result.current.sending).toBe(false);
   });
 
+  it("cleans up the poll-mode token when releaseSendGuards is called", async () => {
+    apiPostMock.mockResolvedValue({
+      status: "queued",
+      delivery_mode: "poll",
+      method: "message/send",
+    });
+
+    const { result } = renderHook(() =>
+      useChatSend("ws-poll", { getHistoryMessages: () => [] }),
+    );
+
+    await act(async () => {
+      await result.current.sendMessage("poll me");
+      await Promise.resolve();
+    });
+    expect(result.current.sending).toBe(true);
+
+    // The AGENT_MESSAGE / onSendComplete WS event arrives.
+    act(() => {
+      result.current.releaseSendGuards();
+    });
+
+    expect(result.current.sending).toBe(false);
+  });
+
+  it("keeps the spinner up when releaseSendGuards prunes one poll-mode send but another is still in flight", async () => {
+    const pushSend = deferred();
+    apiPostMock
+      .mockImplementationOnce(() => pushSend.promise)
+      .mockResolvedValueOnce({
+        status: "queued",
+        delivery_mode: "poll",
+        method: "message/send",
+      });
+
+    const { result } = renderHook(() =>
+      useChatSend("ws-mixed", { getHistoryMessages: () => [] }),
+    );
+
+    await act(async () => {
+      result.current.sendMessage("push-mode send");
+      result.current.sendMessage("poll-mode send");
+      await Promise.resolve();
+    });
+    expect(result.current.sending).toBe(true);
+
+    // Poll-mode send completes via WS; push-mode send is still HTTP pending.
+    act(() => {
+      result.current.releaseSendGuards();
+    });
+
+    expect(result.current.sending).toBe(true);
+
+    await act(async () => {
+      pushSend.resolve({ result: { parts: [{ kind: "text", text: "push reply" }] } });
+      await Promise.resolve();
+    });
+
+    expect(result.current.sending).toBe(false);
+  });
 });
