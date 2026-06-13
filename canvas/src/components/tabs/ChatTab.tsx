@@ -174,6 +174,14 @@ function MyChatPanel({ workspaceId, data }: Props) {
   useChatSocket(workspaceId, {
     onAgentMessage: (msg) => {
       history.setMessages((prev) => appendMessageDeduped(prev, msg));
+      // A successful agent reply landing PROVES the agent is reachable, so
+      // clear any stale "Failed to send — agent may be unreachable" banner
+      // (core#2697). Without this, a turn that errored-then-auto-healed (e.g.
+      // a context-overflow 400 retried on a fresh session) left the banner up
+      // even as the retry's reply arrived — the agent visibly working at "●●●
+      // Ns" with a red "unreachable" banner. Both error sources are cleared.
+      setError(null);
+      clearSendError();
       if (sendingFromAPIRef.current) {
         releaseSendGuards();
       }
@@ -207,6 +215,10 @@ function MyChatPanel({ workspaceId, data }: Props) {
       ]);
     },
     onSendComplete: () => {
+      // Reply completed (poll-mode) → agent is reachable; clear any stale
+      // send-error banner (core#2697, same rationale as onAgentMessage).
+      setError(null);
+      clearSendError();
       if (sendingFromAPIRef.current) {
         releaseSendGuards();
       }
