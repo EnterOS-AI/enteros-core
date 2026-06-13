@@ -1193,7 +1193,20 @@ func applyPlatformManagedLLMEnv(ctx context.Context, envVars map[string]string, 
 					}
 				}
 				if _, hasBase := envVars["ANTHROPIC_BASE_URL"]; !hasBase && provider.BaseURLAnthropic != "" {
-					envVars["ANTHROPIC_BASE_URL"] = provider.BaseURLAnthropic
+					// core#2748: the registry base_url_anthropic is PROXY-shaped and
+					// carries a trailing /v1 (providers.yaml follows the routing layer;
+					// see the minimax "PR-5" reconciliation comment). But THIS is the
+					// direct-BYOK adapter path: the claude-code Anthropic SDK appends
+					// /v1/messages to ANTHROPIC_BASE_URL itself. Projecting the proxy
+					// value verbatim yields a double /v1 (.../anthropic/v1/v1/messages)
+					// -> upstream 404, surfaced as "selected model may not exist or no
+					// access" (the #2748 engine outage; #2735 introduced this projection).
+					// Strip a single trailing /v1 (and any trailing slash) so the SDK
+					// re-append produces exactly one /v1. Correct for every anthropic-proto
+					// provider: minimax .../anthropic/v1->.../anthropic, kimi-coding
+					// .../coding/v1->.../coding, anthropic .../v1->root, moonshot likewise.
+					adapterBase := strings.TrimSuffix(strings.TrimRight(provider.BaseURLAnthropic, "/"), "/v1")
+					envVars["ANTHROPIC_BASE_URL"] = adapterBase
 				}
 			}
 		}

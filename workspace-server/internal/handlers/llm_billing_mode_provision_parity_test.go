@@ -475,13 +475,108 @@ func TestApplyPlatformManagedLLMEnv_BYOKMiniMaxWorkspaceOverrideProjectsCreds(t 
 	if got := envVars["ANTHROPIC_AUTH_TOKEN"]; got != "real-minimax-key" {
 		t.Fatalf("ANTHROPIC_AUTH_TOKEN = %q, want real-minimax-key", got)
 	}
-	if got := envVars["ANTHROPIC_BASE_URL"]; got != "https://api.minimax.io/anthropic/v1" {
-		t.Fatalf("ANTHROPIC_BASE_URL = %q, want https://api.minimax.io/anthropic/v1", got)
+	// core#2748: the adapter (claude-code Anthropic SDK) base must NOT carry a
+	// trailing /v1 — the SDK appends /v1/messages itself. The registry value is
+	// proxy-shaped (.../anthropic/v1); the projection strips the trailing /v1 so
+	// the effective endpoint is .../anthropic/v1/messages (HTTP 200), not the
+	// double-/v1 .../anthropic/v1/v1/messages (HTTP 404) that caused the outage.
+	if got := envVars["ANTHROPIC_BASE_URL"]; got != "https://api.minimax.io/anthropic" {
+		t.Fatalf("ANTHROPIC_BASE_URL = %q, want https://api.minimax.io/anthropic (no double /v1, core#2748)", got)
 	}
 	if got := envVars["MINIMAX_API_KEY"]; got != "real-minimax-key" {
 		t.Fatalf("MINIMAX_API_KEY was overwritten: %q", got)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("sqlmock expectations: %v", err)
+	}
+}
+
+// TestApplyPlatformManagedLLMEnv_AdapterBaseHasNoDoubleV1 is core#2748: the
+// direct-BYOK adapter path (claude-code Anthropic SDK) must project an
+// ANTHROPIC_BASE_URL that does NOT carry a trailing /v1, because the SDK
+// appends /v1/messages itself. #2735 introduced a projection that copied the
+// PROXY-shaped registry base_url_anthropic verbatim (which DOES end in /v1),
+// producing a double /v1 (.../v1/v1/messages -> upstream 404, surfaced as
+// "selected model may not exist or no access") and taking the coding engines
+// down.
+//
+// EMPIRICALLY PROVEN endpoint shapes the SDK derives from these bases:
+//   - minimax  base .../anthropic     -> .../anthropic/v1/messages   HTTP 200
+//     (vs .../anthropic/v1   -> .../anthropic/v1/v1/messages HTTP 404)
+//   - kimi     base .../coding        -> .../coding/v1/messages      HTTP 401 (path ok, auth-only)
+//     (vs .../coding/v1      -> .../coding/v1/v1/messages    HTTP 404)
+//   - anthropic base https://api.anthropic.com -> .../v1/messages    (canonical)
+//
+// Each case is a workspace_override BYOK claude-code provision: the resolver
+// returns early on the override with ProviderSelection=nil, so the projection
+// derives the provider from the stored effective model (the core#2712 path),
+// then injects the normalized adapter base.
+func TestApplyPlatformManagedLLMEnv_AdapterBaseHasNoDoubleV1(t *testing.T) {
+	const messagesSuffix = "/v1/messages" // what the claude-code Anthropic SDK appends
+
+	cases := []struct {
+		name         string
+		wsID         string
+		model        string
+		keyEnv       string // the BYOK vendor key env the workspace carries
+		keyVal       string
+		wantBase     string // projected ANTHROPIC_BASE_URL (no double /v1)
+		wantMessages string // proven-correct effective messages URL
+	}{
+		{
+			name:         "minimax",
+			wsID:         "11111111-1111-1111-1111-111111111111",
+			model:        "MiniMax-M3",
+			keyEnv:       "MINIMAX_API_KEY",
+			keyVal:       "mm-key",
+			wantBase:     "https://api.minimax.io/anthropic",
+			wantMessages: "https://api.minimax.io/anthropic/v1/messages",
+		},
+		{
+			name:         "kimi-for-coding",
+			wsID:         "22222222-2222-2222-2222-222222222222",
+			model:        "kimi-for-coding",
+			keyEnv:       "KIMI_API_KEY",
+			keyVal:       "kimi-key",
+			wantBase:     "https://api.kimi.com/coding",
+			wantMessages: "https://api.kimi.com/coding/v1/messages",
+		},
+		{
+			name:         "anthropic",
+			wsID:         "33333333-3333-3333-3333-333333333333",
+			model:        "claude-opus-4-8",
+			keyEnv:       "ANTHROPIC_API_KEY",
+			keyVal:       "sk-ant-key",
+			wantBase:     "https://api.anthropic.com",
+			wantMessages: "https://api.anthropic.com/v1/messages",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			mock := setupTestDB(t)
+			expectOverrideQuery(mock, tc.wsID, LLMBillingModeBYOK)
+
+			envVars := map[string]string{
+				"MODEL":   tc.model,
+				tc.keyEnv: tc.keyVal,
+			}
+			res := applyPlatformManagedLLMEnv(ctx, envVars, tc.wsID, "claude-code", "", nil)
+
+			if res.ResolvedMode != LLMBillingModeBYOK {
+				t.Fatalf("resolved mode = %q, want byok", res.ResolvedMode)
+			}
+			got := envVars["ANTHROPIC_BASE_URL"]
+			if got != tc.wantBase {
+				t.Fatalf("ANTHROPIC_BASE_URL = %q, want %q (no double /v1, core#2748)", got, tc.wantBase)
+			}
+			if got+messagesSuffix != tc.wantMessages {
+				t.Fatalf("effective messages URL = %q, want proven-correct %q", got+messagesSuffix, tc.wantMessages)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Errorf("sqlmock expectations: %v", err)
+			}
+		})
 	}
 }
