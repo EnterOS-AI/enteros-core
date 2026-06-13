@@ -243,31 +243,49 @@ func platformRootWorkspaceID(ctx context.Context) string {
 //     siblings of that root agent, and approval/discovery treat each NULL-parent
 //     row as its own org root, breaking hierarchy + delegation routing.
 //
-// Returns "" only when neither a single platform root NOR a single plain root
-// can be identified (0 or >1 of each), preserving bootstrap/self-host multi-root
-// behavior. The DURABLE fix is guaranteeing every org has a platform-agent at
-// provision; this is the safe runtime fallback until then.
+// The root fallback fires ONLY for the ZERO-platform case. When MULTIPLE
+// platform agents exist (ambiguous), we preserve the original fail-soft
+// behavior and return "" WITHOUT falling back to a root — picking a root there
+// would silently change the intended ambiguous-platform semantics (CR2 #2783).
+// Returns "" when: >1 platform; or 0 platform with 0/>1 roots — preserving
+// bootstrap/self-host multi-root behavior. The DURABLE fix is guaranteeing every
+// org has a platform-agent at provision; this is the safe runtime fallback.
 func defaultCreateParentID(ctx context.Context) string {
-	if rootID := platformRootWorkspaceID(ctx); rootID != "" {
-		return rootID
+	// Count platform-agent roots directly (LIMIT 2 distinguishes 0 / 1 / >1).
+	plats := queryUpToTwoIDs(ctx,
+		`SELECT id FROM workspaces WHERE COALESCE(kind, 'workspace') = 'platform' AND status != 'removed' LIMIT 2`)
+	if len(plats) == 1 {
+		return plats[0] // the platform-agent root (core#2609)
 	}
-	rows, err := db.DB.QueryContext(ctx,
+	if len(plats) >= 2 {
+		return "" // ambiguous platform — fail soft, do NOT fall back to a root
+	}
+	// Exactly ZERO platform agents → nest under the sole plain root if unambiguous.
+	roots := queryUpToTwoIDs(ctx,
 		`SELECT id FROM workspaces WHERE parent_id IS NULL AND status != 'removed' LIMIT 2`)
-	if err != nil {
-		return ""
-	}
-	defer rows.Close()
-	roots := make([]string, 0, 2)
-	for rows.Next() {
-		var id string
-		if rows.Scan(&id) == nil {
-			roots = append(roots, id)
-		}
-	}
 	if len(roots) == 1 {
 		return roots[0]
 	}
 	return ""
+}
+
+// queryUpToTwoIDs runs an id-selecting query (with its own LIMIT 2) and returns
+// up to two ids; on any error it returns an empty slice (fail-soft — defaulting
+// the parent is best-effort and must never fail the create).
+func queryUpToTwoIDs(ctx context.Context, query string) []string {
+	rows, err := db.DB.QueryContext(ctx, query)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	ids := make([]string, 0, 2)
+	for rows.Next() {
+		var id string
+		if rows.Scan(&id) == nil {
+			ids = append(ids, id)
+		}
+	}
+	return ids
 }
 
 // defaultPlatformAgentName returns the display name for the org's platform

@@ -684,4 +684,12 @@ func TestDefaultCreateParentID(t *testing.T) {
 			t.Fatalf("want empty (ambiguous multi-root), got %q", got)
 		}
 	})
+	t.Run("returns empty when MULTIPLE platform agents (ambiguous) — no root fallback (CR2 #2783)", func(t *testing.T) {
+		mock := setupTestDB(t)
+		// >1 platform → fail-soft empty; the root query must NOT run.
+		mock.ExpectQuery(platQ).WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("p1").AddRow("p2"))
+		if got := defaultCreateParentID(context.Background()); got != "" {
+			t.Fatalf("want empty (ambiguous multi-platform must NOT fall back to a root), got %q", got)
+		}
+	})
 }
