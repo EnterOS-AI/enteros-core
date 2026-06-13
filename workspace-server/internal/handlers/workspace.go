@@ -982,7 +982,7 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 		"status":           "provisioning",
 		"workspace_access": workspaceAccess,
 	}
-	if authToken, tokErr := wsauth.IssueToken(ctx, db.DB, id); tokErr != nil {
+	if authToken, tokErr := wsauth.IssueAPIToken(ctx, db.DB, id); tokErr != nil {
 		log.Printf("Create workspace %s: inline auth_token mint failed (non-fatal — caller can use POST /admin/workspaces/:id/tokens): %v", id, tokErr)
 	} else {
 		resp["auth_token"] = authToken

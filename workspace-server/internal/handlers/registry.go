@@ -622,7 +622,7 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 	// live token; they bootstrap one here on their next register call.
 	// New workspaces always pass through this path on their first boot.
 	response := gin.H{"status": "registered", "delivery_mode": effectiveMode}
-	if hasLive, hasLiveErr := wsauth.HasAnyLiveToken(ctx, db.DB, payload.ID); hasLiveErr == nil && !hasLive {
+	if hasLive, hasLiveErr := wsauth.HasLiveInstanceToken(ctx, db.DB, payload.ID); hasLiveErr == nil && !hasLive {
 		token, tokErr := wsauth.IssueToken(ctx, db.DB, payload.ID)
 		if tokErr != nil {
 			// Don't fail the whole register on token-issuance error — the
@@ -1141,11 +1141,14 @@ func (h *RegistryHandler) UpdateCard(c *gin.Context) {
 func (h *RegistryHandler) requireWorkspaceToken(
 	ctx gincontext, c *gin.Context, workspaceID string,
 ) error {
-	hasLive, err := wsauth.HasAnyLiveToken(ctx, db.DB, workspaceID)
+	// Bootstrap allowance keys on INSTANCE tokens only: a live API-kind
+	// token (the Create 201 bearer a platform caller holds) must not force
+	// the fresh, credential-less instance to present a bearer. core#1644.
+	hasLive, err := wsauth.HasLiveInstanceToken(ctx, db.DB, workspaceID)
 	if err != nil {
 		// DB error checking token existence — fail open so we don't take
 		// the whole heartbeat path down on a transient hiccup. Log loudly.
-		log.Printf("wsauth: HasAnyLiveToken(%s) failed: %v — allowing request", workspaceID, err)
+		log.Printf("wsauth: HasLiveInstanceToken(%s) failed: %v — allowing request", workspaceID, err)
 		return nil
 	}
 	if !hasLive {
