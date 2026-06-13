@@ -367,12 +367,52 @@ test.describe("staging canvas tabs", () => {
       "app-level ErrorBoundary tripped during hydration",
     ).toHaveCount(0);
 
-    // The concierge shell renders before the workspace node card.
-    // Wait for the specific workspace node to appear before clicking.
-    await page.waitForSelector(
-      `[data-workspace-id="${workspaceId}"]`,
-      { timeout: 15_000 },
-    );
+    // Navigate to the Org map view. WorkspaceNode is only rendered
+    // when topView === "map" (canvas/src/components/concierge/
+    // ConciergeShell.tsx:528 — the React Flow canvas mount is gated
+    // on the topView state). The default concierge view after
+    // hydration is "home" (Home chat panel), so without an explicit
+    // nav-map click the [data-workspace-id] selector below would
+    // wait for a node that isn't in the rendered tree at all —
+    // exactly the failure mode of #2721-deeper (Researcher RCA on
+    // run 358136 / job 486781, head 867557f08).
+    //
+    // staging-concierge.spec.ts:376 (the "Org map" test) does the
+    // same navTo(page, "map") and uses expect.poll on the
+    // [data-testid^="workspace-node-"] count — that's the proven
+    // pattern. We mirror it here, then layer the specific
+    // [data-workspace-id="$STAGING_WORKSPACE_ID"] selector on top
+    // for the per-workspace click target.
+    await page.locator('[data-testid="nav-map"]').click({ timeout: 10_000 });
+
+    // Wait for the React Flow canvas to mount, then poll for the
+    // workspace-node count (RFs layout pass takes a tick after the
+    // nav click) before drilling down to the specific workspace.
+    await expect(page.locator('[aria-label="Molecule AI workspace canvas"]')).toBeVisible({
+      timeout: 15_000,
+    });
+    await expect
+      .poll(async () => page.locator('[data-testid^="workspace-node-"]').count(), {
+        message: "no workspace nodes rendered on the org map after nav-map click",
+        timeout: 15_000,
+      })
+      .toBeGreaterThan(0);
+
+    // Now wait for the SPECIFIC workspace node we want — keyed by
+    // data-workspace-id (the UUID-keyed marker restored in #2729).
+    // expect.poll because React Flow's layout pass can take a tick
+    // to position the just-inserted node, and the node may render
+    // before the data-workspace-id attribute is committed to the DOM.
+    await expect
+      .poll(
+        async () =>
+          page.locator(`[data-workspace-id="${workspaceId}"]`).count(),
+        {
+          message: `workspace node with data-workspace-id=${workspaceId} never rendered on the org map`,
+          timeout: 15_000,
+        },
+      )
+      .toBeGreaterThan(0);
 
     // Click the workspace node to open the side panel. Try a data
     // attribute first, fall back to a generic role-based selector so
