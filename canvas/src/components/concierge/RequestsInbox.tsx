@@ -111,6 +111,11 @@ export function RequestsInbox({ kind, onCountChange }: RequestsInboxProps) {
   // TODO(multi-user): when the canvas grows real per-action attribution, plumb
   // the acting user through props instead of a single module-level resolve.
   const responderIdRef = useRef<string>("admin");
+  // core#2766: monotonic generation counter so a stale `/requests/pending`
+  // response from a previous `kind` cannot overwrite the list after a tab
+  // switch (or after a later live-refresh load).
+  const loadGenRef = useRef(0);
+
   useEffect(() => {
     let cancelled = false;
     fetchSession()
@@ -123,14 +128,31 @@ export function RequestsInbox({ kind, onCountChange }: RequestsInboxProps) {
     return () => { cancelled = true; };
   }, []);
 
+  // Increment the generation on unmount so any in-flight load cannot call
+  // setItems after this component instance is gone.
+  useEffect(() => {
+    return () => {
+      loadGenRef.current += 1;
+    };
+  }, []);
+
   const load = useCallback(() => {
+    const gen = ++loadGenRef.current;
+    // core#2766: clear stale rows the moment the kind changes so the user
+    // never sees approval cards under the Tasks tab (or vice-versa) while the
+    // new list is still fetching. This prevents the wrong-action race where a
+    // stale approval row could be actioned with action="done".
+    setItems([]);
+    onCountChange?.(0);
     api.get<RequestRow[]>(`/requests/pending?kind=${kind}`)
       .then((r) => {
+        if (gen !== loadGenRef.current) return; // stale response
         const list = r ?? [];
         setItems(list);
         onCountChange?.(list.length);
       })
       .catch(() => {
+        if (gen !== loadGenRef.current) return; // stale response
         setItems([]);
         onCountChange?.(0);
       });
@@ -197,7 +219,6 @@ export function RequestsInbox({ kind, onCountChange }: RequestsInboxProps) {
         <RequestItem
           key={r.id}
           row={r}
-          kind={kind}
           acting={acting === r.id}
           threadOpen={openThread === r.id}
           onRespond={respond}
@@ -211,7 +232,6 @@ export function RequestsInbox({ kind, onCountChange }: RequestsInboxProps) {
 
 interface RequestItemProps {
   row: RequestRow;
-  kind: RequestKind;
   acting: boolean;
   threadOpen: boolean;
   onRespond: (r: RequestRow, action: "done" | "rejected" | "approved") => void;
@@ -223,10 +243,14 @@ interface RequestItemProps {
  *  approval layout reuses the .apprCard classes. Both share the inline
  *  More-Info thread panel. */
 function RequestItem({
-  row, kind, acting, threadOpen, onRespond, onToggleThread, responderId,
+  row, acting, threadOpen, onRespond, onToggleThread, responderId,
 }: RequestItemProps) {
   const badge = statusLabel(row.status);
-  const isApproval = kind === "approval";
+  // core#2766: derive the card layout and primary action from the ROW'S kind,
+  // not from the selected tab. During a tab switch the old tab's rows are
+  // cleared, but if any stale render slips through it must not expose a
+  // task "Done" button on an approval row.
+  const isApproval = row.kind === "approval";
 
   // "Responder identity" on a resolved row (shows only if a resolved item
   // ever renders in this pending view — defensive, since pending excludes
@@ -296,7 +320,7 @@ function RequestItem({
 
   if (isApproval) {
     return (
-      <div className={s.apprCard} style={{ marginBottom: 7 }} data-testid="request-item" data-kind="approval">
+      <div className={s.apprCard} style={{ marginBottom: 7 }} data-testid="request-item" data-kind={row.kind}>
         <div className={s.apprRow}>
           <div className={s.apprIc}><IcTrash /></div>
           <div className={s.apprMeta}>
@@ -320,7 +344,7 @@ function RequestItem({
   }
 
   return (
-    <div className={s.task} data-testid="request-item" data-kind="task">
+    <div className={s.task} data-testid="request-item" data-kind={row.kind}>
       <div className={s.taskRow}>
         <div className={`${s.taskIc} ${s.run}`}><IcClock /></div>
         <div className={s.taskMeta}>
