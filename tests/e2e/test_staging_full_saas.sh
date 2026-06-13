@@ -149,23 +149,29 @@ esac
 # 8-char uuid so every run gets a unique slug regardless of how
 # the workflow composes E2E_RUN_ID. Asserted via the unit test
 # tests/e2e/test_collision_proof_slug_unit.sh.
+# Note: `source` + `assert_collision_proof_slug` happens AFTER
+# log/fail/ok are defined below (the assert calls `fail` on
+# mismatch). Avoid referencing `fail` before its definition.
 # shellcheck source=lib/collision-proof-slug.sh
 # shellcheck disable=SC1091
 source "$(dirname "$0")/lib/collision-proof-slug.sh"
+
+log()  { echo "[$(date +%H:%M:%S)] $*"; }
+fail() { echo "[$(date +%H:%M:%S)] ❌ $*" >&2; exit 1; }
+ok()   { echo "[$(date +%H:%M:%S)] ✅ $*"; }
+
+# Collision-proof slug construction (core#2782) — runs AFTER log/fail/ok
+# are defined so the assert below can call `fail` on mismatch.
+# Self-check: fail loud at harness startup if a future refactor
+# drops the uuid suffix (defense in depth — the unit test
+# already covers this, but a redundant check in the harness
+# itself is cheap).
 if [ "$MODE" = "smoke" ]; then
   SLUG=$(make_collision_proof_slug "e2e-smoke" "${E2E_RUN_ID:-}")
 else
   SLUG=$(make_collision_proof_slug "e2e" "${E2E_RUN_ID:-}")
 fi
-# Self-check: fail loud at harness startup if a future refactor
-# drops the uuid suffix (defense in depth — the unit test
-# already covers this, but a redundant check in the harness
-# itself is cheap).
 assert_collision_proof_slug "$SLUG" || fail "Bug in make_collision_proof_slug: produced non-collision-proof slug '$SLUG' (assert_collision_proof_slug failed)"
-
-log()  { echo "[$(date +%H:%M:%S)] $*"; }
-fail() { echo "[$(date +%H:%M:%S)] ❌ $*" >&2; exit 1; }
-ok()   { echo "[$(date +%H:%M:%S)] ✅ $*"; }
 
 # ─── fail-closed-on-skip live-lifecycle guard ───────────────────────────
 # E2E_REQUIRE_LIVE=1 (set by CI) asserts this run ACTUALLY exercised a full

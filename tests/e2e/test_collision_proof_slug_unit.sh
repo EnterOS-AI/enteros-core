@@ -113,6 +113,51 @@ test_large_run_id_uuid_preserved() {
   return 0
 }
 
+# Test 8 (CR2 #11506 robustness nit): the 64-char cap budget is
+# computed from the SANITIZED prefix length, not a hardcoded
+# 19-char assumption. A longer prefix gets less room for run_id
+# (and a shorter one gets more). The uuid anchor at the end is
+# always preserved. A 30-char prefix should still fit a
+# 20-char run_id + the 8-char uuid in 60 chars total.
+test_prefix_budget_dynamic() {
+  local s
+  s=$(make_collision_proof_slug "abcdefghijklmnopqrstuvwx-yz" "short-run")
+  if ! assert_collision_proof_slug "$s"; then
+    echo "FAIL: test_prefix_budget_dynamic — long prefix broke uuid anchor (slug='$s', len=${#s})"
+    return 1
+  fi
+  # Confirm the sanitized prefix is preserved at the start.
+  if ! printf '%s' "$s" | grep -q "^abcdefghijklmnopqrstuvwx-yz-"; then
+    echo "FAIL: test_prefix_budget_dynamic — sanitized prefix not preserved at start of '$s'"
+    return 1
+  fi
+  echo "PASS: test_prefix_budget_dynamic (slug=$s, len=${#s})"
+  return 0
+}
+
+# Test 9 (CR2 #11506 robustness nit): a pathological prefix longer
+# than the slug's max budget DROPS the run_id entirely and keeps
+# the prefix + date + uuid anchor. The slug remains collision-
+# proof via the 8-char uuid.
+test_pathological_prefix_drops_run_id() {
+  # SLUG_MAX_LEN=64; prefix=80 chars; 80 + 9 + 1 + 8 = 98 > 64 →
+  # run_id must be dropped to fit.
+  local s
+  s=$(make_collision_proof_slug "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "run-id-here")
+  if ! assert_collision_proof_slug "$s"; then
+    echo "FAIL: test_pathological_prefix_drops_run_id — uuid anchor lost on pathological prefix (slug='$s', len=${#s})"
+    return 1
+  fi
+  # The slug must fit in SLUG_MAX_LEN (the run_id drop is the
+  # load-bearing recovery for an over-long prefix).
+  if [ "${#s}" -gt 64 ]; then
+    echo "FAIL: test_pathological_prefix_drops_run_id — slug '${#s}' exceeds SLUG_MAX_LEN=64 after dropping run_id"
+    return 1
+  fi
+  echo "PASS: test_pathological_prefix_drops_run_id (slug=$s, len=${#s})"
+  return 0
+}
+
 test_slug_shape || failed=$((failed+1))
 test_same_run_id_different_slugs || failed=$((failed+1))
 test_prefix_preserved || failed=$((failed+1))
@@ -120,6 +165,8 @@ test_assert_rejects_malformed || failed=$((failed+1))
 test_assert_rejects_too_short || failed=$((failed+1))
 test_fallback_run_id || failed=$((failed+1))
 test_large_run_id_uuid_preserved || failed=$((failed+1))
+test_prefix_budget_dynamic || failed=$((failed+1))
+test_pathological_prefix_drops_run_id || failed=$((failed+1))
 
 if [ "$failed" -gt 0 ]; then
   echo "FAILED: $failed test(s)"

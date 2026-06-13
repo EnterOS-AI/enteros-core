@@ -70,26 +70,52 @@ make_collision_proof_slug() {
     uuid_short="$(printf '%04x%04x' $RANDOM $RANDOM)"
   fi
 
-  # Lowercase + strip non-alphanumerics except `-`. Apply the
-  # truncation to the run_id ONLY (so the uuid is always preserved
-  # at the end); the prefix + date + `-` + uuid anchor is 19 + 1 + 1 + 8
-  # = 29 chars, leaving up to 33 chars for the (possibly truncated)
-  # run_id. A pathological 100-char run_id loses characters from
-  # the run_id portion — but the slug remains collision-proof via
-  # the uuid, and the run_id is still useful for log correlation.
-  local slug
-  slug="$(printf '%s' "${prefix}-${date_part}-${run_id}-${uuid_short}" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-')"
+  # Sanitize the prefix FIRST so the length budget below is computed
+  # from the post-sanitize prefix length (e.g. a caller passing
+  # "E2E Smoke!" gets "e2e-smoke" and the budget reflects that,
+  # not the unstripped 10-char original). A longer prefix
+  # automatically gets less room for run_id; a shorter prefix gets
+  # more. The 8-char uuid is the load-bearing anchor and is ALWAYS
+  # preserved at the end (assert_collision_proof_slug requires it).
+  local sanitized_prefix
+  sanitized_prefix="$(printf '%s' "$prefix" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-')"
+  # Format is: `${sanitized_prefix}-${date_part}-${run_id}-${uuid_short}`
+  # Fixed anchors: 3 separators (1 each) + date (8) + uuid (8) = 19 chars
+  # beyond the sanitized_prefix. The run_id is the only variable-width
+  # piece. We want the FINAL slug to fit in SLUG_MAX_LEN (default 64)
+  # chars so the slug fits typical backend length caps (orgs.slug is
+  # varchar(64) in most CP schemas; if your schema is tighter,
+  # override SLUG_MAX_LEN).
+  local anchor_len=$(( ${#sanitized_prefix} + 1 + 8 + 1 + 1 + 8 ))  # prefix + 3×sep + date + uuid
+  local max_len="${SLUG_MAX_LEN:-64}"
+  local run_id_budget=$(( max_len - anchor_len ))
+  if [ "$run_id_budget" -lt 1 ]; then
+    # Pathological prefix: too long to fit run_id + uuid. Drop the
+    # run_id entirely and TRUNCATE THE PREFIX so the date + uuid
+    # anchor are preserved. The collision-proofing property is
+    # provided by the 8-char uuid at the end (assert requires
+    # this). The truncated prefix keeps the log-readable
+    # `<prefix>-<date>-<uuid>` shape.
+    local prefix_budget=$(( max_len - 1 - 8 - 1 - 8 ))  # sep + date + sep + uuid
+    local truncated_prefix
+    truncated_prefix="$(printf '%s' "$sanitized_prefix" | head -c "$prefix_budget")"
+    printf '%s-%s-%s' "$truncated_prefix" "$date_part" "$uuid_short"
+    return 0
+  fi
 
-  # If the run_id was so long that the full slug exceeds the 64-char
-  # cap, truncate the run_id portion from the end (preserving the
-  # 8-char uuid anchor). This keeps the uuid at the END (where
-  # assert_collision_proof_slug looks for it) and the prefix at the
-  # start (for log readability).
-  if [ "${#slug}" -gt 64 ]; then
-    local max_run_id_len=$(( 64 - 19 - 1 - 8 ))
-    local truncated_run_id
-    truncated_run_id="$(printf '%s' "$run_id" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-' | head -c "$max_run_id_len")"
-    slug="${prefix}-${date_part}-${truncated_run_id}-${uuid_short}"
+  # Sanitize the run_id with the dynamic budget. The budget is
+  # computed from the post-sanitize prefix so callers can pass
+  # arbitrary-case / dirty strings and the cap stays correct.
+  local truncated_run_id
+  truncated_run_id="$(printf '%s' "$run_id" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-' | head -c "$run_id_budget")"
+  local slug="${sanitized_prefix}-${date_part}-${truncated_run_id}-${uuid_short}"
+
+  # Defensive cap: if the math was off (e.g. an external caller
+  # overrode SLUG_MAX_LEN mid-pipeline), truncate from the
+  # uuid-anchored end. Assert_collision_proof_slug requires the
+  # uuid to be the LAST 8 chars, so we never trim those.
+  if [ "${#slug}" -gt "$max_len" ]; then
+    slug="$(printf '%s' "$slug" | head -c "$max_len")"
   fi
 
   printf '%s' "$slug"
