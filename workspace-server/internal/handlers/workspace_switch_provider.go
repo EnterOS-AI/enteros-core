@@ -116,32 +116,6 @@ func (h *WorkspaceHandler) SwitchProvider(c *gin.Context) {
 
 	// --- ordered switch (see doc-comment) ---
 
-	// COMMIT-OR-ROLLBACK pattern for the pre-claim. After step 1 sets
-	// status='provisioning', any error / ctx-cancellation before step 5
-	// completes the switch leaves the workspace stranded in 'provisioning'
-	// forever (CR2 #11486 follow-up finding). The defer reverts status
-	// to priorStatus on ANY error path; the `committed` flag is set ONLY
-	// when the switch fully reaches step 5 (provision dispatched). The
-	// rollback uses a fresh context (not the request ctx) so a client
-	// disconnect mid-switch still cleans up.
-	committed := false
-	priorStatus := status
-	defer func() {
-		if committed {
-			return
-		}
-		rollbackCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if _, err := db.DB.ExecContext(rollbackCtx, `
-			UPDATE workspaces
-			SET status = $2, updated_at = now()
-			WHERE id = $1
-			  AND status = $3`,
-			id, priorStatus, models.StatusProvisioning); err != nil {
-			log.Printf("SwitchProvider: status revert failed for %s (priorStatus=%q): %v — workspace may need operator intervention", id, priorStatus, err)
-		}
-	}()
-
 	// 1. PRE-CLAIM: atomically mark the switch as in-flight by setting
 	//    status='provisioning' WITHOUT changing the provider. The CAS
 	//    (`status<>'provisioning' AND provider unchanged`) prevents a
@@ -174,9 +148,47 @@ func (h *WorkspaceHandler) SwitchProvider(c *gin.Context) {
 		// the workspace is in initial provisioning, or the provider changed
 		// under us. Do NOT execute the stop — the box is owned by an
 		// in-flight provision/switch, not by us.
+		//
+		// CRITICAL: do NOT arm the commit-or-rollback defer here. A losing
+		// pre-claim means we did NOT flip status='provisioning' on this
+		// row — arming the defer would let the rollback (gated on
+		// `status = 'provisioning'`) clobber ANOTHER request's in-flight
+		// pre-claim to OUR priorStatus, stranding them. The defer is armed
+		// only after THIS request successfully wins the pre-claim (CR2
+		// #11493 ownership-ordering fix).
 		c.JSON(http.StatusConflict, gin.H{"error": "ALREADY_SWITCHING", "detail": "a provider switch or provision is already in progress for this workspace"})
 		return
 	}
+
+	// COMMIT-OR-ROLLBACK pattern for the pre-claim (armed AFTER pre-claim
+	// success per CR2 #11493). After step 1 sets status='provisioning',
+	// any error / ctx-cancellation before step 5 completes the switch
+	// leaves the workspace stranded in 'provisioning' forever (CR2
+	// #11486 follow-up finding). The defer reverts status to
+	// priorStatus on ANY error path; the `committed` flag is set ONLY
+	// when the switch fully reaches step 5 (provision dispatched). The
+	// rollback uses a fresh context (not the request ctx) so a client
+	// disconnect mid-switch still cleans up. The rollback UPDATE is
+	// gated on `status = 'provisioning'` so a concurrent
+	// switch/provision that has already advanced the status is not
+	// clobbered.
+	committed := false
+	priorStatus := status
+	defer func() {
+		if committed {
+			return
+		}
+		rollbackCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, err := db.DB.ExecContext(rollbackCtx, `
+			UPDATE workspaces
+			SET status = $2, updated_at = now()
+			WHERE id = $1
+			  AND status = $3`,
+			id, priorStatus, models.StatusProvisioning); err != nil {
+			log.Printf("SwitchProvider: status revert failed for %s (priorStatus=%q): %v — workspace may need operator intervention", id, priorStatus, err)
+		}
+	}()
 
 	// 2. Stop the OLD box with the OLD provider. DB still has the old
 	//    provider + old instance_id (the pre-claim only flipped status,

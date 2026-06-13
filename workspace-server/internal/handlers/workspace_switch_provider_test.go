@@ -152,16 +152,21 @@ func TestSwitchProvider_RejectsBadProvider(t *testing.T) {
 	}
 }
 
-// TestSwitchProvider_PreClaimRollbackOnError (CR2 #11486) is the
+// TestSwitchProvider_PreClaimRollbackOnError (CR2 #11486 + #11493) is the
 // source-level pin for the commit-or-rollback pattern added after the
 // pre-claim landed. The pre-claim sets status='provisioning'; without
 // the rollback defer, any error / ctx-cancellation between pre-claim
 // and step 5 (committed) would strand the workspace in 'provisioning'
 // forever. The defer must:
-//   1. Revert status to priorStatus on any error path (commit-or-rollback).
-//   2. Use a fresh context (not the request ctx) so client
+//   1. Be armed ONLY AFTER this request's pre-claim succeeds
+//      (CR2 #11493 ownership-ordering fix — a losing pre-claim must
+//      NOT arm the defer, otherwise the rollback UPDATE (gated on
+//      `status = 'provisioning'`) would clobber ANOTHER request's
+//      in-flight pre-claim to OUR priorStatus, stranding them).
+//   2. Revert status to priorStatus on any error path (commit-or-rollback).
+//   3. Use a fresh context (not the request ctx) so client
 //      disconnect mid-switch still cleans up.
-//   3. Set `committed = true` ONLY at the very end (after step 5).
+//   4. Set `committed = true` ONLY at the very end (after step 5).
 func TestSwitchProvider_PreClaimRollbackOnError(t *testing.T) {
 	wd, _ := os.Getwd()
 	src, err := os.ReadFile(filepath.Join(wd, "workspace_switch_provider.go"))
@@ -193,6 +198,39 @@ func TestSwitchProvider_PreClaimRollbackOnError(t *testing.T) {
 	// clobber a newer status set by a concurrent switch/provision.
 	if !bytes.Contains(s, []byte("AND status = $3")) {
 		t.Error("SwitchProvider's rollback UPDATE must be gated on `status = 'provisioning'` so a concurrent switch/provision that has already advanced the status is not clobbered")
+	}
+}
+
+// TestSwitchProvider_PreClaimLoserDoesNotArmRollback (CR2 #11493) is
+// the regression test for the ownership-ordering fix: the commit-or-
+// rollback defer MUST be armed AFTER the pre-claim's 0-rows return,
+// not before. A losing pre-claim must NOT arm the defer — otherwise
+// the rollback UPDATE (gated on `status = 'provisioning'`) could
+// clobber ANOTHER request's in-flight pre-claim to OUR priorStatus,
+// stranding them.
+//
+// Source-level position check: the `defer func() {` opening must
+// appear AFTER the `ALREADY_SWITCHING` 409 return (the losing
+// pre-claim path).
+func TestSwitchProvider_PreClaimLoserDoesNotArmRollback(t *testing.T) {
+	wd, _ := os.Getwd()
+	src, err := os.ReadFile(filepath.Join(wd, "workspace_switch_provider.go"))
+	if err != nil {
+		t.Fatalf("read source: %v", err)
+	}
+	stripped := stripGoComments(src)
+	// Find the ALREADY_SWITCHING 409 return — the losing-pre-claim path.
+	loseIdx := bytes.Index(stripped, []byte("ALREADY_SWITCHING"))
+	if loseIdx < 0 {
+		t.Fatal("SwitchProvider must have an ALREADY_SWITCHING 409 return on a lost pre-claim")
+	}
+	// Find the defer opening — must come AFTER the 409 return.
+	deferIdx := bytes.Index(stripped, []byte("defer func() {"))
+	if deferIdx < 0 {
+		t.Fatal("SwitchProvider must have a `defer func() { ... }` block for the commit-or-rollback pattern")
+	}
+	if deferIdx <= loseIdx {
+		t.Fatalf("OWNERSHIP-ORDERING BUG (CR2 #11493): the commit-or-rollback defer (idx %d) must be armed AFTER the losing-pre-claim 409 return (idx %d) — a losing pre-claim must NOT arm the defer, otherwise the rollback UPDATE (gated on `status = 'provisioning'`) would clobber another request's in-flight pre-claim to OUR priorStatus, stranding them", deferIdx, loseIdx)
 	}
 }
 
