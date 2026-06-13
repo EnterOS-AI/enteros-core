@@ -28,7 +28,7 @@ ADMIN_TOKEN="${MOLECULE_ADMIN_TOKEN:?MOLEC…OKEN required — Railway staging C
 # shellcheck source=lib/collision-proof-slug.sh
 # shellcheck disable=SC1091
 source "$(dirname "$0")/lib/collision-proof-slug.sh"
-SLUG=$(make_collision_proof_slug "e2e-mcp" "${E2E_RUN_ID:-}")
+SLUG="e2e-mcp-$(make_collision_proof_slug_suffix "${E2E_RUN_ID:-}")
 assert_collision_proof_slug "$SLUG" || fail "Bug in make_collision_proof_slug: produced non-collision-proof slug '$SLUG'"
 
 log()  { echo "[$(date +%H:%M:%S)] $*"; }

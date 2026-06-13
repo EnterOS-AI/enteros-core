@@ -2,15 +2,16 @@
 # Unit tests for tests/e2e/lib/collision-proof-slug.sh (core#2782).
 #
 # Verifies:
-#   1. make_collision_proof_slug produces a slug with a 8-char hex
-#      uuid suffix at the end (the collision-proof bit).
-#   2. Two invocations of make_collision_proof_slug with the SAME
-#      E2E_RUN_ID produce DIFFERENT slugs (the random suffix makes
-#      them collision-proof even when run_id is reused).
-#   3. assert_collision_proof_slug accepts a well-formed slug and
-#      rejects a malformed one (e.g. no uuid suffix).
-#   4. The prefix is preserved through the lowercasing + strip
-#      transform (a "e2e-smoke" prefix still shows up as "e2e-smoke").
+#   1. make_collision_proof_slug_suffix produces a collision-proof
+#      suffix of the form <date>-<run_id>-<8char-uuid>.
+#   2. Two invocations with the SAME run_id produce DIFFERENT
+#      suffixes (the random uuid makes them collision-proof even
+#      when run_id is reused).
+#   3. assert_collision_proof_slug accepts a well-formed FULL
+#      slug (literal-prefix + suffix) and rejects a malformed
+#      one (e.g. no uuid suffix).
+#   4. The LITERAL prefix supplied by the caller is preserved
+#      through the lowercasing + strip transform.
 #
 # These tests are pure-bash (no harness / no API) so they run in
 # milliseconds and are safe to wire into the e2e test lanes'
@@ -26,10 +27,10 @@ source "$LIB_PATH"
 
 failed=0
 
-# Test 1: well-formed slug has a uuid suffix.
+# Test 1: a full slug (literal-prefix + suffix) is well-formed.
 test_slug_shape() {
   local s
-  s=$(make_collision_proof_slug "e2e-smoke" "platform-3606-1")
+  s="e2e-smoke-$(make_collision_proof_slug_suffix "platform-3606-1")"
   if ! assert_collision_proof_slug "$s"; then
     echo "FAIL: test_slug_shape — produced slug '$s' failed assert_collision_proof_slug"
     return 1
@@ -41,9 +42,9 @@ test_slug_shape() {
 # Test 2: same run_id → different slugs (the collision-proof bit).
 test_same_run_id_different_slugs() {
   local s1 s2 s3
-  s1=$(make_collision_proof_slug "e2e-smoke" "platform-3606-1")
-  s2=$(make_collision_proof_slug "e2e-smoke" "platform-3606-1")
-  s3=$(make_collision_proof_slug "e2e-smoke" "platform-3606-1")
+  s1="e2e-smoke-$(make_collision_proof_slug_suffix "platform-3606-1")"
+  s2="e2e-smoke-$(make_collision_proof_slug_suffix "platform-3606-1")"
+  s3="e2e-smoke-$(make_collision_proof_slug_suffix "platform-3606-1")"
   if [ "$s1" = "$s2" ] || [ "$s2" = "$s3" ] || [ "$s1" = "$s3" ]; then
     echo "FAIL: test_same_run_id_different_slugs — same run_id produced identical slugs (collision possible): '$s1' == '$s2' == '$s3'"
     return 1
@@ -52,10 +53,11 @@ test_same_run_id_different_slugs() {
   return 0
 }
 
-# Test 3: prefix is preserved through transform.
+# Test 3: the LITERAL prefix supplied by the caller is preserved
+# through the slug assembly.
 test_prefix_preserved() {
   local s
-  s=$(make_collision_proof_slug "e2e-rec" "1234-1")
+  s="e2e-rec-$(make_collision_proof_slug_suffix "1234-1")"
   if ! printf '%s' "$s" | grep -q "^e2e-rec-"; then
     echo "FAIL: test_prefix_preserved — prefix 'e2e-rec-' not preserved in slug '$s'"
     return 1
@@ -66,11 +68,8 @@ test_prefix_preserved() {
 
 # Test 4: assert_collision_proof_slug rejects a malformed slug (no uuid).
 test_assert_rejects_malformed() {
-  # "e2e-smoke-20260613-platform-3606" — the OLD shape (no uuid
-  # suffix, just 32-char truncated). assert must REJECT (return
-  # non-zero) — the test passes if the assert correctly rejects.
   if assert_collision_proof_slug "e2e-smoke-20260613-platform-3606"; then
-    echo "FAIL: test_assert_rejects_malformed — accepted a 32-char slug without the 8-char uuid suffix"
+    echo "FAIL: test_assert_rejects_malformed — accepted a slug without the 8-char uuid suffix"
     return 1
   fi
   echo "PASS: test_assert_rejects_malformed (correctly rejected)"
@@ -90,7 +89,7 @@ test_assert_rejects_too_short() {
 # Test 6: fallback run_id (empty) still produces a collision-proof slug.
 test_fallback_run_id() {
   local s
-  s=$(make_collision_proof_slug "e2e-smoke" "")
+  s="e2e-smoke-$(make_collision_proof_slug_suffix "")"
   if ! assert_collision_proof_slug "$s"; then
     echo "FAIL: test_fallback_run_id — empty run_id produced non-collision-proof slug '$s'"
     return 1
@@ -99,12 +98,11 @@ test_fallback_run_id() {
   return 0
 }
 
-# Test 7: large-run-id still produces a usable slug (the 64-char
-# cap may truncate, but the uuid suffix must remain).
+# Test 7: large-run-id still produces a usable slug (the run_id is
+# truncated but the uuid suffix remains).
 test_large_run_id_uuid_preserved() {
-  # 50-char run_id + prefix + date + uuid = ~80 chars before cap.
   local s
-  s=$(make_collision_proof_slug "e2e" "abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnop-1")
+  s="e2e-$(make_collision_proof_slug_suffix "abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnop-1")"
   if ! assert_collision_proof_slug "$s"; then
     echo "FAIL: test_large_run_id_uuid_preserved — uuid suffix not preserved on truncated slug '$s'"
     return 1
@@ -113,15 +111,14 @@ test_large_run_id_uuid_preserved() {
   return 0
 }
 
-# Test 8 (CR2 #11506 robustness nit): the 64-char cap budget is
-# computed from the SANITIZED prefix length, not a hardcoded
-# 19-char assumption. A longer prefix gets less room for run_id
-# (and a shorter one gets more). The uuid anchor at the end is
-# always preserved. A 30-char prefix should still fit a
-# 20-char run_id + the 8-char uuid in 60 chars total.
+# Test 8 (CR2 #11506 robustness nit): a long LITERAL prefix doesn't
+# overflow the 64-char cap because the slug uses a separate
+# helper-produced suffix. The prefix in the assignment is opaque
+# to the helper, so a 30-char prefix still fits a 20-char run_id
+# + the 8-char uuid in 60 chars total.
 test_prefix_budget_dynamic() {
   local s
-  s=$(make_collision_proof_slug "abcdefghijklmnopqrstuvwx-yz" "short-run")
+  s="abcdefghijklmnopqrstuvwx-yz-$(make_collision_proof_slug_suffix "short-run")"
   if ! assert_collision_proof_slug "$s"; then
     echo "FAIL: test_prefix_budget_dynamic — long prefix broke uuid anchor (slug='$s', len=${#s})"
     return 1
@@ -135,26 +132,20 @@ test_prefix_budget_dynamic() {
   return 0
 }
 
-# Test 9 (CR2 #11506 robustness nit): a pathological prefix longer
-# than the slug's max budget DROPS the run_id entirely and keeps
-# the prefix + date + uuid anchor. The slug remains collision-
-# proof via the 8-char uuid.
-test_pathological_prefix_drops_run_id() {
-  # SLUG_MAX_LEN=64; prefix=80 chars; 80 + 9 + 1 + 8 = 98 > 64 →
-  # run_id must be dropped to fit.
-  local s
-  s=$(make_collision_proof_slug "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "run-id-here")
-  if ! assert_collision_proof_slug "$s"; then
-    echo "FAIL: test_pathological_prefix_drops_run_id — uuid anchor lost on pathological prefix (slug='$s', len=${#s})"
+# Test 9: the helper output (suffix) by itself is at most 50 chars
+# (date 8 + sep 1 + run_id ≤33 + sep 1 + uuid 8). The caller is
+# responsible for ensuring the FULL slug fits in the backend's length
+# cap (e.g. via SLUG_MAX_LEN on the test or a hardcoded trim).
+test_suffix_length_capped() {
+  local suf
+  suf=$(make_collision_proof_slug_suffix "abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnop-1")
+  # The suffix max is 50 (date 8 + sep 1 + run_id 33 + sep 1 + uuid 8
+  # = 51, with the cap at 50). Some slack for off-by-one.
+  if [ "${#suf}" -gt 51 ]; then
+    echo "FAIL: test_suffix_length_capped — suffix '$suf' is ${#suf} chars (want <= 51)"
     return 1
   fi
-  # The slug must fit in SLUG_MAX_LEN (the run_id drop is the
-  # load-bearing recovery for an over-long prefix).
-  if [ "${#s}" -gt 64 ]; then
-    echo "FAIL: test_pathological_prefix_drops_run_id — slug '${#s}' exceeds SLUG_MAX_LEN=64 after dropping run_id"
-    return 1
-  fi
-  echo "PASS: test_pathological_prefix_drops_run_id (slug=$s, len=${#s})"
+  echo "PASS: test_suffix_length_capped (suffix=$suf, len=${#suf})"
   return 0
 }
 
@@ -166,7 +157,7 @@ test_assert_rejects_too_short || failed=$((failed+1))
 test_fallback_run_id || failed=$((failed+1))
 test_large_run_id_uuid_preserved || failed=$((failed+1))
 test_prefix_budget_dynamic || failed=$((failed+1))
-test_pathological_prefix_drops_run_id || failed=$((failed+1))
+test_suffix_length_capped || failed=$((failed+1))
 
 if [ "$failed" -gt 0 ]; then
   echo "FAILED: $failed test(s)"

@@ -87,7 +87,7 @@ fail() { echo "[$(date +%H:%M:%S)] ❌ $*" >&2; exit 1; }
 ok()   { echo "[$(date +%H:%M:%S)] ✅ $*"; }
 
 # SLUG construction runs after log/fail/ok so the assert can call `fail`.
-SLUG=$(make_collision_proof_slug "e2e-cncrg" "${E2E_RUN_ID:-}")
+SLUG="e2e-cncrg-$(make_collision_proof_slug_suffix "${E2E_RUN_ID:-}")
 assert_collision_proof_slug "$SLUG" || fail "Bug in make_collision_proof_slug: produced non-collision-proof slug '$SLUG'"
 
 PASS=0

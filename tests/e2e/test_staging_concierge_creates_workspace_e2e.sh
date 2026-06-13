@@ -92,11 +92,12 @@ REQUIRE_LIVE="${E2E_REQUIRE_LIVE:-0}"
 # shellcheck disable=SC1091
 source "$(dirname "$0")/lib/collision-proof-slug.sh"
 
-# The workspace name we will ask the concierge to create. The RUN_ID
-# (now embedded in the collision-proof slug's 8-char uuid) makes it
-# unique per run so a poll for it can never collide with a sibling
-# run's name.
-WORKER_NAME="e2e-cncrg-worker-${E2E_RUN_ID:-$(date +%H%M%S)-$$}-$(cat /proc/sys/kernel/random/uuid 2>/dev/null | head -c 8 || echo $RANDOM$RANDOM | head -c 8)"
+# The workspace name we will ask the concierge to create. The literal
+# `e2e-cncrg-worker-` prefix is visible to the lint (so the SLUG=
+# has a covered e2e- prefix in the assignment); the uuid suffix
+# makes the name unique per run so a poll for it can never collide
+# with a sibling run's name.
+WORKER_NAME="e2e-cncrg-worker-$(make_collision_proof_slug_suffix "${E2E_RUN_ID:-}")"
 WORKER_NAME=$(echo "$WORKER_NAME" | tr -cd 'a-zA-Z0-9-' | head -c 48)
 # Exported so the find_worker_by_name python subshell (run in a pipe) reads it
 # via os.environ — a bare shell var would not survive into the subprocess env.
@@ -107,7 +108,7 @@ fail() { echo "[$(date +%H:%M:%S)] ❌ $*" >&2; exit 1; }
 ok()   { echo "[$(date +%H:%M:%S)] ✅ $*"; }
 
 # SLUG construction runs after log/fail/ok so the assert can call `fail`.
-SLUG=$(make_collision_proof_slug "e2e-cncrg-mk" "${E2E_RUN_ID:-}")
+SLUG="e2e-cncrg-mk-$(make_collision_proof_slug_suffix "${E2E_RUN_ID:-}")
 assert_collision_proof_slug "$SLUG" || fail "Bug in make_collision_proof_slug: produced non-collision-proof slug '$SLUG'"
 # skip_loud <reason>: honest skip when the concierge can't be exercised. In CI
 # (E2E_REQUIRE_LIVE=1) this is a HARD FAIL (exit 5) so a missing platform-agent

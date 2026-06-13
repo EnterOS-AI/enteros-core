@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Collision-proof slug generator for staging E2E harnesses (core#2782).
+# Collision-proof slug SUFFIX generator for staging E2E harnesses (core#2782).
 #
 # ROOT CAUSE (Researcher RCA #100639): staging Platform Boot fails at
 # POST /cp/admin/orgs HTTP 409 because the harness creates platform
@@ -15,38 +15,38 @@
 # staging E2E harness. The infra purge of existing stale slugs is
 # a separate owner/ops action (out of scope here per the ticket).
 #
-# Usage:
+# Usage (the literal prefix MUST be in the caller so lint_cleanup_traps.sh
+# can verify the SLUG=... assignment starts with a covered e2e-* or
+# rt-e2e-* prefix — see #11510):
+#
 #   source tests/e2e/lib/collision-proof-slug.sh
-#   SLUG=$(make_collision_proof_slug "e2e-smoke" "$E2E_RUN_ID")
+#   SLUG="e2e-smoke-$(make_collision_proof_slug_suffix "$E2E_RUN_ID")"
+#   assert_collision_proof_slug "$SLUG" || fail "..."
 #
-# Returns a slug of the form `<prefix>-YYYYMMDD-{RUN_ID}-{uuid}`.
-# The run_id portion is itself truncated to 32 chars (leaving room
-# for prefix + date + uuid) — the 8-char uuid suffix is ALWAYS
-# preserved (the run_id is the part that's allowed to lose
-# characters, the uuid never is). Length ceiling is ~62 chars
-# (`e2e-smoke-20260613-` (19) + truncated run_id (32) + `-` (1) +
-# `uuid` (8) = 60), well within typical backend limits.
+# The returned suffix is `<date>-<sanitized_run_id>-<uuid>`. The 8-char
+# uuid is sourced from /proc/sys/kernel/random/uuid on Linux, fallback
+# to two $RANDOM draws on macOS. 32 bits of entropy is enough to
+# defeat the original collision class.
 #
-# Asserts the slug is collision-proof (uuid suffix present) via
+# Asserts the full slug is collision-proof (uuid suffix present) via
 # assert_collision_proof_slug. Use this in the per-test self-check
 # so a future refactor that drops the uuid is caught at harness
 # startup, not at the first 409.
 
 set -uo pipefail
 
-# make_collision_proof_slug <prefix> <run_id>
-#   $1: Slug prefix (e.g. "e2e-smoke", "e2e-rec", "e2e-mcp", "e2e").
-#   $2: Run id (typically `$E2E_RUN_ID` from the workflow; falls back
+# make_collision_proof_slug_suffix <run_id>
+#   $1: Run id (typically `$E2E_RUN_ID` from the workflow; falls back
 #       to a wall-clock+PID value).
-#   Echoes a slug of the form `<prefix>-YYYYMMDD-{run_id}-{8char-uuid}`,
-#   lowercased, with non-alphanumerics stripped (except `-`). The 8-char
-#   uuid suffix is sourced from /proc/sys/kernel/random/uuid on Linux
-#   (deterministic fallback to `${RANDOM}${RANDOM}` on macOS) and
-#   makes any two slugs collide-proof even when the run_id is reused
-#   (e.g. retries with the same `github.run_id`).
-make_collision_proof_slug() {
-  local prefix="$1"
-  local run_id="${2:-}"
+#   Echoes a collision-proof SUFFIX of the form
+#   `<YYYYMMDD>-<sanitized_run_id>-<8char-uuid>`, lowercased, with
+#   non-alphanumerics stripped (except `-`). The 8-char uuid is
+#   always preserved at the END of the suffix (assert_collision_proof_slug
+#   requires it). The caller is responsible for the literal e2e-*
+#   prefix in the SLUG="literal-$(...)" assignment shape (lint
+#   requirement).
+make_collision_proof_slug_suffix() {
+  local run_id="${1:-}"
 
   # Fallback run_id when the workflow didn't set E2E_RUN_ID: a
   # wall-clock+PID combo that's unique per process invocation.
@@ -70,62 +70,31 @@ make_collision_proof_slug() {
     uuid_short="$(printf '%04x%04x' $RANDOM $RANDOM)"
   fi
 
-  # Sanitize the prefix FIRST so the length budget below is computed
-  # from the post-sanitize prefix length (e.g. a caller passing
-  # "E2E Smoke!" gets "e2e-smoke" and the budget reflects that,
-  # not the unstripped 10-char original). A longer prefix
-  # automatically gets less room for run_id; a shorter prefix gets
-  # more. The 8-char uuid is the load-bearing anchor and is ALWAYS
-  # preserved at the end (assert_collision_proof_slug requires it).
-  local sanitized_prefix
-  sanitized_prefix="$(printf '%s' "$prefix" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-')"
-  # Format is: `${sanitized_prefix}-${date_part}-${run_id}-${uuid_short}`
-  # Fixed anchors: 3 separators (1 each) + date (8) + uuid (8) = 19 chars
-  # beyond the sanitized_prefix. The run_id is the only variable-width
-  # piece. We want the FINAL slug to fit in SLUG_MAX_LEN (default 64)
-  # chars so the slug fits typical backend length caps (orgs.slug is
-  # varchar(64) in most CP schemas; if your schema is tighter,
-  # override SLUG_MAX_LEN).
-  local anchor_len=$(( ${#sanitized_prefix} + 1 + 8 + 1 + 1 + 8 ))  # prefix + 3×sep + date + uuid
-  local max_len="${SLUG_MAX_LEN:-64}"
-  local run_id_budget=$(( max_len - anchor_len ))
-  if [ "$run_id_budget" -lt 1 ]; then
-    # Pathological prefix: too long to fit run_id + uuid. Drop the
-    # run_id entirely and TRUNCATE THE PREFIX so the date + uuid
-    # anchor are preserved. The collision-proofing property is
-    # provided by the 8-char uuid at the end (assert requires
-    # this). The truncated prefix keeps the log-readable
-    # `<prefix>-<date>-<uuid>` shape.
-    local prefix_budget=$(( max_len - 1 - 8 - 1 - 8 ))  # sep + date + sep + uuid
-    local truncated_prefix
-    truncated_prefix="$(printf '%s' "$sanitized_prefix" | head -c "$prefix_budget")"
-    printf '%s-%s-%s' "$truncated_prefix" "$date_part" "$uuid_short"
-    return 0
-  fi
+  # Sanitize the run_id with the dynamic budget. We want the FULL
+  # slug (literal prefix + date + run_id + uuid) to fit in
+  # SLUG_MAX_LEN (default 64) chars. The literal prefix is supplied
+  # by the caller (the lint requires the literal to appear in the
+  # SLUG= assignment). Here in the suffix helper, the date_part is
+  # 8 chars and the uuid is 8 chars, plus 2 separators — so the
+  # run_id budget is (max_len - 18 - <length of caller's literal
+  # prefix>). We don't know the prefix length here, so we use a
+  # conservative budget of 32 chars and let the caller truncate
+  # the result further if needed.
+  local suffix_max_len="${SLUG_SUFFIX_MAX_LEN:-50}"  # date(8) + sep(1) + run_id(32) + sep(1) + uuid(8) = 50
+  local run_id_budget=$(( suffix_max_len - 8 - 1 - 8 ))  # 33
 
-  # Sanitize the run_id with the dynamic budget. The budget is
-  # computed from the post-sanitize prefix so callers can pass
-  # arbitrary-case / dirty strings and the cap stays correct.
-  local truncated_run_id
-  truncated_run_id="$(printf '%s' "$run_id" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-' | head -c "$run_id_budget")"
-  local slug="${sanitized_prefix}-${date_part}-${truncated_run_id}-${uuid_short}"
-
-  # Defensive cap: if the math was off (e.g. an external caller
-  # overrode SLUG_MAX_LEN mid-pipeline), truncate from the
-  # uuid-anchored end. Assert_collision_proof_slug requires the
-  # uuid to be the LAST 8 chars, so we never trim those.
-  if [ "${#slug}" -gt "$max_len" ]; then
-    slug="$(printf '%s' "$slug" | head -c "$max_len")"
-  fi
-
-  printf '%s' "$slug"
+  local sanitized_run_id
+  sanitized_run_id="$(printf '%s' "$run_id" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-' | head -c "$run_id_budget")"
+  printf '%s-%s-%s' "$date_part" "$sanitized_run_id" "$uuid_short"
 }
 
-# assert_collision_proof_slug <slug> is a unit test that asserts the
-# slug includes both the run_id AND a 8-char uuid-like suffix. It
-# exits 0 on a well-formed slug, 1 otherwise. Used in the per-test
-# self-check (below) to fail loud at harness startup if a test
-# regressed to the truncated shape.
+# assert_collision_proof_slug <slug> asserts the FULL slug (literal
+# prefix + suffix) ends in an 8-char uuid suffix. The literal
+# prefix in the SLUG=... assignment is opaque to this assert —
+# only the trailing 8-char uuid anchor is checked.
+#
+# Use this in the per-test self-check so a future refactor that
+# drops the uuid is caught at harness startup, not at the first 409.
 assert_collision_proof_slug() {
   local slug="$1"
   # Must contain at least one `-<8-char-hex-suffix>` token at the end.
@@ -141,4 +110,3 @@ assert_collision_proof_slug() {
   fi
   return 0
 }
-
