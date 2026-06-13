@@ -11,6 +11,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -73,8 +74,8 @@ func setPlatformInDockerForTest(v bool) func() {
 	return func() { platformInDocker = prev }
 }
 
-// maxProxyRequestBody is the maximum size of an A2A proxy request body (1MB).
-const maxProxyRequestBody = 1 << 20
+// maxProxyRequestBody is the maximum size of an A2A proxy request body (16MB).
+const maxProxyRequestBody = 16 << 20
 
 // systemCallerPrefixes are caller IDs that bypass workspace access control.
 // These are non-workspace internal callers (webhooks, system services, tests).
@@ -90,8 +91,28 @@ func isSystemCaller(callerID string) bool {
 	return false
 }
 
-// maxProxyResponseBody is the maximum size of an A2A proxy response body (10MB).
-const maxProxyResponseBody = 10 << 20
+// maxProxyResponseBody is the maximum size of an A2A proxy response body (64MB).
+const maxProxyResponseBody = 64 << 20
+
+// errA2ABodyTooLarge is returned by readBodyWithLimit when a body exceeds the
+// configured limit. Callers surface it as a loud 413 / truncated proxy error
+// instead of silently cutting the payload.
+var errA2ABodyTooLarge = errors.New("A2A body exceeds size limit")
+
+// readBodyWithLimit reads up to limit bytes from r. It returns an error
+// (wrapping errA2ABodyTooLarge) when the input is larger than limit so the
+// caller can fail loud instead of silently truncating. The returned body is
+// capped at limit bytes; on truncation it contains the first limit bytes read.
+func readBodyWithLimit(r io.Reader, limit int, kind string) ([]byte, error) {
+	body, err := io.ReadAll(io.LimitReader(r, int64(limit)+1))
+	if err != nil {
+		return body, err
+	}
+	if len(body) > limit {
+		return body[:limit], fmt.Errorf("%s body exceeds %d byte limit: %w", kind, limit, errA2ABodyTooLarge)
+	}
+	return body, nil
+}
 
 // a2aClient is a shared HTTP client for proxying A2A requests to workspace agents.
 //
@@ -264,10 +285,16 @@ func (h *WorkspaceHandler) ProxyA2A(c *gin.Context) {
 		// tSec == 0 means no timeout — use the raw context (no deadline)
 	}
 
-	// Read the incoming request body (capped at 1MB)
-	body, err := io.ReadAll(io.LimitReader(c.Request.Body, maxProxyRequestBody))
+	// Read the incoming request body (capped at maxProxyRequestBody). If the
+	// caller sends a larger body, fail LOUD with 413 instead of silently
+	// truncating mid-message (core#2677).
+	body, err := readBodyWithLimit(c.Request.Body, maxProxyRequestBody, "request")
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to read request body"})
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{
+			"error":     err.Error(),
+			"truncated": true,
+			"max_bytes": maxProxyRequestBody,
+		})
 		return
 	}
 
@@ -565,15 +592,19 @@ func (h *WorkspaceHandler) proxyA2ARequest(ctx context.Context, workspaceID stri
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	// Read agent response (capped at 10MB).
+	// Read agent response (capped at maxProxyResponseBody).
 	// #689: Do() succeeded, which means the target received the request and sent
 	// back response headers — delivery is confirmed. The body couldn't be
-	// fully read (connection drop, timeout mid-stream). Surface
-	// delivery_confirmed so callers can distinguish "not delivered" from
-	// "delivered, but response body lost". When delivery is confirmed,
-	// log the activity as successful (delivery happened) rather than leaving
-	// a false "failed" entry in the audit trail.
-	respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, maxProxyResponseBody))
+	// fully read (connection drop, timeout mid-stream, OR it exceeded the
+	// maxProxyResponseBody limit). Surface delivery_confirmed so callers can
+	// distinguish "not delivered" from "delivered, but response body lost".
+	// When delivery is confirmed, log the activity as successful (delivery
+	// happened) rather than leaving a false "failed" entry in the audit trail.
+	//
+	// core#2677: readBodyWithLimit detects oversize responses and returns an
+	// errA2ABodyTooLarge-wrapped error so we surface a loud "truncated" flag
+	// instead of silently cutting long agent replies.
+	respBody, readErr := readBodyWithLimit(resp.Body, maxProxyResponseBody, "response")
 	if readErr != nil {
 		deliveryConfirmed := resp.StatusCode >= 200 && resp.StatusCode < 400
 		log.Printf("ProxyA2A: body read failed for %s (status=%d delivery_confirmed=%v bytes_read=%d): %v",
@@ -598,11 +629,17 @@ func (h *WorkspaceHandler) proxyA2ARequest(ctx context.Context, workspaceID stri
 		if resp.StatusCode >= 300 {
 			errStatus = resp.StatusCode
 		}
+		errMsg := "failed to read agent response"
+		if errors.Is(readErr, errA2ABodyTooLarge) {
+			errMsg = readErr.Error()
+		}
 		return resp.StatusCode, respBody, &proxyA2AError{
 			Status: errStatus,
 			Response: gin.H{
-				"error":              "failed to read agent response",
+				"error":              errMsg,
 				"delivery_confirmed": deliveryConfirmed,
+				"truncated":          errors.Is(readErr, errA2ABodyTooLarge),
+				"max_bytes":          maxProxyResponseBody,
 			},
 		}
 	}
