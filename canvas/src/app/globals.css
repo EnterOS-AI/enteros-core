@@ -57,15 +57,21 @@
   /* Text */
   --color-ink: #21201b;
   --color-ink-mid: #5c5a52;
-  --color-ink-soft: #6f6c62;
+  --color-ink-soft: #656871;
 
-  /* Brand + state — purple accent (concept #7c3aed); light good/bad kept
-     slightly darker than the raw concept hues for WCAG AA on the paper tints. */
+  /* Brand + state — purple accent (concept #7c3aed). good/bad (LIGHT) are
+     darkened to actually clear WCAG AA 4.5:1 on their own 10%-tint badges
+     (`text-good` on `bg-good/10`): the old #0c8a52/#c2403c measured 3.87/4.46
+     (axe, molecule-app issue #48 + core#2742) — only NOW do they pass
+     (#2a6e44 → 5.33, #b0463f → 4.79). ink-soft #656871 too (4.84). These are
+     the UNIFIED values all three surfaces share (canvas / mobile-web palette /
+     molecule-app) — the cross-surface SSOT, gated by globals.a11y.test.ts.
+     Dark already passes AA (unchanged). */
   --color-accent: #7c3aed;
   --color-accent-strong: #6d28d9;
   --color-warm: #c47e12;
-  --color-good: #0c8a52;
-  --color-bad: #c2403c;
+  --color-good: #2a6e44;
+  --color-bad: #b0463f;
 }
 
 [data-theme="dark"] {
