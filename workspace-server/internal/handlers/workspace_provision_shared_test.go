@@ -1117,8 +1117,13 @@ func TestApplyPlatformManagedLLMEnv_BYOKMiniMaxProjectsAnthropicAdapterCreds(t *
 	if got := envVars["ANTHROPIC_AUTH_TOKEN"]; got != "user-minimax-key" {
 		t.Fatalf("ANTHROPIC_AUTH_TOKEN = %q, want user-minimax-key", got)
 	}
-	if got := envVars["ANTHROPIC_BASE_URL"]; got != "https://api.minimax.io/anthropic/v1" {
-		t.Fatalf("ANTHROPIC_BASE_URL = %q, want https://api.minimax.io/anthropic/v1", got)
+	// core#2748: adapter base must NOT carry a trailing /v1 — the claude-code
+	// Anthropic SDK appends /v1/messages itself. The proxy-shaped registry value
+	// .../anthropic/v1 is normalized to .../anthropic so the effective endpoint is
+	// .../anthropic/v1/messages (HTTP 200), not the double-/v1 .../v1/v1/messages
+	// (HTTP 404) that took the coding engines down.
+	if got := envVars["ANTHROPIC_BASE_URL"]; got != "https://api.minimax.io/anthropic" {
+		t.Fatalf("ANTHROPIC_BASE_URL = %q, want https://api.minimax.io/anthropic (no double /v1, core#2748)", got)
 	}
 	// The original MiniMax key is preserved too.
 	if got := envVars["MINIMAX_API_KEY"]; got != "user-minimax-key" {
