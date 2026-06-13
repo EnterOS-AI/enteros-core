@@ -246,10 +246,21 @@ func DequeueNext(ctx context.Context, workspaceID string) (*QueuedItem, error) {
 }
 
 // MarkQueueItemCompleted flips the queue row to 'completed' on a successful
-// drain dispatch.
-func MarkQueueItemCompleted(ctx context.Context, id string) {
+// drain dispatch. responseBody is persisted so callers polling
+// GET /workspaces/:id/a2a/queue/:queue_id can retrieve the actual agent reply
+// for non-delegation A2A queue items (e.g. message/send that got queued because
+// the target was busy). Pass nil when no payload exists (re-queued drain).
+func MarkQueueItemCompleted(ctx context.Context, id string, responseBody []byte) {
+	var respBody any
+	if len(responseBody) > 0 {
+		// Store as a JSONB value. The column accepts text that parses as JSON;
+		// passing the raw bytes through the driver is driver-dependent, so we
+		// hand it a string explicitly.
+		respBody = string(responseBody)
+	}
 	if _, err := db.DB.ExecContext(ctx,
-		`UPDATE a2a_queue SET status = 'completed', completed_at = now() WHERE id = $1`, id,
+		`UPDATE a2a_queue SET status = 'completed', completed_at = now(), response_body = $2 WHERE id = $1`,
+		id, respBody,
 	); err != nil {
 		log.Printf("A2AQueue: failed to mark %s completed: %v", id, err)
 	}
@@ -356,7 +367,7 @@ func (h *WorkspaceHandler) DrainQueueForWorkspace(ctx context.Context, workspace
 	// the next drain tick. Mark this attempt completed so we don't double-
 	// count attempts; the new (re-)queue row already exists.
 	if status == http.StatusAccepted {
-		MarkQueueItemCompleted(ctx, item.ID)
+		MarkQueueItemCompleted(ctx, item.ID, nil)
 		log.Printf("A2AQueue drain: %s re-queued (target still busy)", item.ID)
 		return
 	}
@@ -379,7 +390,7 @@ func (h *WorkspaceHandler) DrainQueueForWorkspace(ctx context.Context, workspace
 			item.ID, item.Attempts, errMsg)
 		return
 	}
-	MarkQueueItemCompleted(ctx, item.ID)
+	MarkQueueItemCompleted(ctx, item.ID, respBody)
 	log.Printf("A2AQueue drain: dispatched %s to workspace %s (attempt=%d)",
 		item.ID, workspaceID, item.Attempts)
 

@@ -1282,53 +1282,168 @@ print(json.dumps({
 ")
 KA_TMP=$(mktemp -t known_answer_a2a.XXXXXX)
 KA_RESP=""
-for KA_ATTEMPT in $(seq 1 6); do
+KA_QUEUE_ID=""
+for KA_ATTEMPT in $(seq 1 12); do
   : >"$KA_TMP"
-  set +e
-  KA_CODE=$(tenant_call POST "/workspaces/$PARENT_ID/a2a" \
-    --max-time 90 \
-    -H "Content-Type: application/json" \
-    -d "$KA_PAYLOAD" \
-    -o "$KA_TMP" \
-    -w '%{http_code}' \
-    2>/dev/null)
-  KA_RC=$?
-  set -e
-  KA_CODE=${KA_CODE:-000}
-  KA_RESP=$(cat "$KA_TMP" 2>/dev/null || echo "")
-  if [ "$KA_RC" = "0" ] && [ "$KA_CODE" -ge 200 ] && [ "$KA_CODE" -lt 300 ]; then
+  if [ -n "$KA_QUEUE_ID" ]; then
+    # We already have a queued work item — poll its status, don't re-POST.
+    # Re-POSTing while the original queued work is still pending collides with
+    # the native-session busy/drain window and reproduces the 502/empty failure.
+    set +e
+    KA_CODE=$(tenant_call GET "/workspaces/$PARENT_ID/a2a/queue/$KA_QUEUE_ID" \
+      --max-time 90 \
+      -o "$KA_TMP" \
+      -w '%{http_code}' \
+      2>/dev/null)
+    KA_RC=$?
+    set -e
+    KA_CODE=${KA_CODE:-000}
+    KA_RESP=$(cat "$KA_TMP" 2>/dev/null || echo "")
+    if [ "$KA_RC" = "0" ] && [ "$KA_CODE" -ge 200 ] && [ "$KA_CODE" -lt 300 ]; then
+      KA_Q_STATUS=$(echo "$KA_RESP" | python3 -c "
+import json,sys
+try:
+    print(json.load(sys.stdin).get('status',''))
+except Exception:
+    print('')
+" 2>/dev/null || echo "")
+      if [ "$KA_Q_STATUS" = "completed" ]; then
+        # The queue row stores the agent's A2A response in response_body.
+        KA_RESP=$(echo "$KA_RESP" | python3 -c "
+import json,sys
+try:
+    rb=json.load(sys.stdin).get('response_body')
+    print(json.dumps(rb) if rb is not None else '')
+except Exception:
+    print('')
+" 2>/dev/null || echo "")
+        if [ -n "$KA_RESP" ]; then
+          KA_CODE=200
+          break
+        fi
+      fi
+      # Still pending — poll again.
+      if echo "$KA_Q_STATUS" | grep -Eqi 'queued|dispatched|in_progress'; then
+        KA_SAFE_BODY=$(printf '%s' "$KA_RESP" | sanitize_http_body)
+        log "    known-answer queue poll attempt $KA_ATTEMPT/12 status=$KA_Q_STATUS: $KA_SAFE_BODY"
+        if [ "$KA_ATTEMPT" -lt 12 ]; then sleep 10; continue; fi
+      fi
+    fi
+    KA_SAFE_BODY=$(printf '%s' "$KA_RESP" | sanitize_http_body)
+    if echo "$KA_CODE" | grep -Eq '^(502|503|504)$' && echo "$KA_SAFE_BODY" | grep -Eqi 'Service Unavailable|Bad Gateway|Gateway Timeout|error code: 502|error code: 504|workspace agent unreachable|connection refused|no healthy upstream|workspace agent busy|native_session|restarting|restart triggered'; then
+      log "    known-answer queue poll transient $KA_CODE attempt $KA_ATTEMPT/12: $KA_SAFE_BODY"
+      if [ "$KA_ATTEMPT" -lt 12 ]; then
+        KA_SLEEP=10
+        if echo "$KA_SAFE_BODY" | grep -Eqi 'workspace agent busy|native_session|restarting|restart triggered'; then
+          KA_SLEEP=30
+        fi
+        sleep "$KA_SLEEP"
+        continue
+      fi
+    fi
+    break
+  else
+    # Initial POST (or retry before we have a queue_id). A 202 queued response
+    # transitions to the poll path above; a terminal 2xx breaks immediately.
+    set +e
+    KA_CODE=$(tenant_call POST "/workspaces/$PARENT_ID/a2a" \
+      --max-time 90 \
+      -H "Content-Type: application/json" \
+      -d "$KA_PAYLOAD" \
+      -o "$KA_TMP" \
+      -w '%{http_code}' \
+      2>/dev/null)
+    KA_RC=$?
+    set -e
+    KA_CODE=${KA_CODE:-000}
+    KA_RESP=$(cat "$KA_TMP" 2>/dev/null || echo "")
+    if [ "$KA_RC" = "0" ] && [ "$KA_CODE" -ge 200 ] && [ "$KA_CODE" -lt 300 ]; then
+      KA_IS_QUEUED=$(echo "$KA_RESP" | python3 -c "
+import json,sys
+try:
+    d=json.load(sys.stdin)
+    print('true' if d.get('queued') is True or (d.get('status') or '').lower() == 'queued' else 'false')
+except Exception:
+    print('false')
+" 2>/dev/null || echo "false")
+      if [ "$KA_IS_QUEUED" = "true" ]; then
+        KA_QUEUE_ID=$(echo "$KA_RESP" | python3 -c "
+import json,sys
+try:
+    print(json.load(sys.stdin).get('queue_id',''))
+except Exception:
+    print('')
+" 2>/dev/null || echo "")
+        if [ -n "$KA_QUEUE_ID" ]; then
+          log "    known-answer A2A queued (queue_id=$KA_QUEUE_ID); switching to poll"
+          continue
+        fi
+      else
+        break
+      fi
+    fi
+    KA_SAFE_BODY=$(printf '%s' "$KA_RESP" | sanitize_http_body)
+    if echo "$KA_CODE" | grep -Eq '^(502|503|504)$' && echo "$KA_SAFE_BODY" | grep -Eqi 'Service Unavailable|Bad Gateway|Gateway Timeout|error code: 502|error code: 504|workspace agent unreachable|connection refused|no healthy upstream|workspace agent busy|native_session|restarting|restart triggered'; then
+      log "    known-answer A2A transient $KA_CODE attempt $KA_ATTEMPT/12: $KA_SAFE_BODY"
+      if [ "$KA_ATTEMPT" -lt 12 ]; then
+        KA_SLEEP=10
+        if echo "$KA_SAFE_BODY" | grep -Eqi 'workspace agent busy|native_session|restarting|restart triggered'; then
+          KA_SLEEP=30
+        fi
+        sleep "$KA_SLEEP"
+        continue
+      fi
+    fi
     break
   fi
-  KA_SAFE_BODY=$(printf '%s' "$KA_RESP" | sanitize_http_body)
-  # Retry ONLY on transient transport errors — never on an agent-level
-  # error (those must surface and fail the gate).
-  # #2263: include the Cloudflare-shaped literal `error code: 502/504` token so a
-  # bare edge/gateway 502 (no "Bad Gateway" body) is retried here the same way the
-  # cold-start PONG probe (line ~800) and the delegation loop (line ~1234) already
-  # do. Without it, a single un-retried edge 502 right after a healthy round-trip
-  # fell through to break and failed the gate on the first attempt (Platform Boot
-  # job, task 268859). Bounded by the existing 6-attempt / sleep-10 loop — no new
-  # sleep-as-fix; this only widens the transient-match to the sibling pattern.
-  if echo "$KA_CODE" | grep -Eq '^(502|503|504)$' && echo "$KA_SAFE_BODY" | grep -Eqi 'Service Unavailable|Bad Gateway|Gateway Timeout|error code: 502|error code: 504|workspace agent unreachable|connection refused|no healthy upstream|workspace agent busy|native_session'; then
-    log "    known-answer A2A transient $KA_CODE attempt $KA_ATTEMPT/6: $KA_SAFE_BODY"
-    if [ "$KA_ATTEMPT" -lt 6 ]; then sleep 10; continue; fi
-  fi
-  break
 done
 rm -f "$KA_TMP"
 if [ "$KA_RC" != "0" ] || [ "$KA_CODE" -lt 200 ] || [ "$KA_CODE" -ge 300 ]; then
   KA_SAFE_BODY=$(printf '%s' "$KA_RESP" | sanitize_http_body)
-  fail "Known-answer A2A POST failed after $KA_ATTEMPT attempt(s) (curl_rc=$KA_RC, http=$KA_CODE): $KA_SAFE_BODY"
+  fail "Known-answer A2A failed after $KA_ATTEMPT attempt(s) (curl_rc=$KA_RC, http=$KA_CODE): $KA_SAFE_BODY"
 fi
 KA_TEXT=$(echo "$KA_RESP" | python3 -c "
 import json, sys
+def extract_text(d):
+    out = []
+    # Standard A2A JSON-RPC result.parts
+    for p in d.get('result', {}).get('parts', []) or []:
+        if p.get('kind') == 'text' or p.get('type') == 'text':
+            t = p.get('text') or ''
+            if t:
+                out.append(t)
+    # A2A Task status message parts
+    for p in d.get('result', {}).get('status', {}).get('message', {}).get('parts', []) or []:
+        if p.get('kind') == 'text' or p.get('type') == 'text':
+            t = p.get('text') or ''
+            if t:
+                out.append(t)
+    # Alternative message.parts placement
+    for p in d.get('result', {}).get('message', {}).get('parts', []) or []:
+        if p.get('kind') == 'text' or p.get('type') == 'text':
+            t = p.get('text') or ''
+            if t:
+                out.append(t)
+    # Artifacts
+    for a in d.get('result', {}).get('artifacts', []) or []:
+        for p in a.get('parts', []) or []:
+            if p.get('kind') == 'text' or p.get('type') == 'text':
+                t = p.get('text') or ''
+                if t:
+                    out.append(t)
+    return '\n'.join(out)
 try:
     d = json.load(sys.stdin)
-    parts = d.get('result', {}).get('parts', [])
-    print(parts[0].get('text', '') if parts else '')
+    print(extract_text(d))
 except Exception:
     print('')
 " 2>/dev/null || echo "")
+# Debuggability: if extraction is empty, surface what the proxy returned so a
+# queued/artifact/non-text shape does not silently fail the gate.
+if [ -z "$KA_TEXT" ]; then
+  KA_SAFE_BODY=$(printf '%s' "$KA_RESP" | sanitize_http_body)
+  log "    known-answer A2A extraction empty; response body: $KA_SAFE_BODY"
+fi
 # CORE GATE: contains PINEAPPLE (real round-trip) AND no error-as-text.
 a2a_assert_real_completion "$KA_TEXT" "PINEAPPLE" "A2A known-answer (parent, $RUNTIME/$MODEL_SLUG)"
 # Real, deterministic LLM round-trip proven — the load-bearing milestone for

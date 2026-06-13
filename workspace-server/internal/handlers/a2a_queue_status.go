@@ -38,6 +38,7 @@ package handlers
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"log"
 	"net/http"
@@ -58,8 +59,8 @@ type QueueStatus struct {
 	EnqueuedAt   string  `json:"enqueued_at"`
 	DispatchedAt *string `json:"dispatched_at,omitempty"`
 	CompletedAt  *string `json:"completed_at,omitempty"`
-	ExpiresAt    *string `json:"expires_at,omitempty"`
-	ResponseBody []byte  `json:"response_body,omitempty"`
+	ExpiresAt    *string         `json:"expires_at,omitempty"`
+	ResponseBody json.RawMessage `json:"response_body,omitempty"`
 }
 
 // QueueStatusByID looks up the queue row and projects it for the public
@@ -79,13 +80,17 @@ type QueueStatus struct {
 func QueueStatusByID(ctx context.Context, queueID string) (*QueueStatus, error) {
 	var qs QueueStatus
 	var lastError, dispatchedAt, completedAt, expiresAt sql.NullString
-	var responseBody []byte
+	// core#2671: scan the COALESCEd response_body into sql.NullString first.
+	// For queued/in-flight rows both q.response_body and the legacy stitch are
+	// NULL; database/sql cannot scan NULL directly into json.RawMessage, so a
+	// NullString avoids the "unsupported Scan" 500 and lets us return 200 with
+	// response_body omitted for in-flight items.
+	var responseBody sql.NullString
 
-	// response_body lives on activity_logs (the stitched delegation row), not
-	// on a2a_queue itself. We pull both here in one round-trip via LEFT JOIN
-	// so a completed delegation surfaces its result inline — non-delegation
-	// queue rows simply won't have a matching activity_logs row and the field
-	// stays null.
+	// response_body now lives on the a2a_queue row itself so non-delegation
+	// A2A queue items (e.g. message/send queued while the target is busy) can
+	// surface their result. We still COALESCE with the legacy activity_logs
+	// delegation stitch so existing delegation flows keep working.
 	err := db.DB.QueryRowContext(ctx, `
 		SELECT
 			q.id,
@@ -98,13 +103,19 @@ func QueueStatusByID(ctx context.Context, queueID string) (*QueueStatus, error) 
 			q.dispatched_at::text,
 			q.completed_at::text,
 			q.expires_at::text,
-			al.response_body::text
+			COALESCE(
+				q.response_body::text,
+				(
+					SELECT al.response_body::text
+					FROM activity_logs al
+					WHERE al.method = 'delegate_result'
+						AND al.target_id = q.workspace_id
+						AND al.workspace_id = q.caller_id
+						AND al.response_body->>'delegation_id' = (q.body->'params'->'message'->'metadata'->>'delegation_id')
+					LIMIT 1
+				)
+			)
 		FROM a2a_queue q
-		LEFT JOIN activity_logs al
-			ON al.method = 'delegate_result'
-			AND al.target_id = q.workspace_id
-			AND al.workspace_id = q.caller_id
-			AND al.response_body->>'delegation_id' = (q.body->'params'->'message'->'metadata'->>'delegation_id')
 		WHERE q.id = $1
 	`, queueID).Scan(
 		&qs.ID, &qs.WorkspaceID, &qs.Status, &qs.Priority, &qs.Attempts,
@@ -134,8 +145,8 @@ func QueueStatusByID(ctx context.Context, queueID string) (*QueueStatus, error) 
 		s := expiresAt.String
 		qs.ExpiresAt = &s
 	}
-	if len(responseBody) > 0 && qs.Status == "completed" {
-		qs.ResponseBody = responseBody
+	if responseBody.Valid && responseBody.String != "" && qs.Status == "completed" {
+		qs.ResponseBody = json.RawMessage(responseBody.String)
 	}
 
 	return &qs, nil
