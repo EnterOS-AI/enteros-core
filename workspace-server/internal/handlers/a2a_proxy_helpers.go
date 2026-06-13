@@ -316,7 +316,7 @@ func (h *WorkspaceHandler) logA2AFailure(ctx context.Context, workspaceID, calle
 		LogActivity(logCtx, h.broadcaster, ActivityParams{
 			WorkspaceID:  workspaceID,
 			ActivityType: "a2a_receive",
-			SourceID:     nilIfEmpty(callerID),
+			SourceID:     callerIDToSourceID(callerID),
 			TargetID:     &workspaceID,
 			Method:       &a2aMethod,
 			Summary:      &summary,
@@ -344,7 +344,7 @@ func (h *WorkspaceHandler) logA2ABusyQueued(ctx context.Context, workspaceID, ca
 		LogActivity(logCtx, h.broadcaster, ActivityParams{
 			WorkspaceID:  workspaceID,
 			ActivityType: "a2a_receive",
-			SourceID:     nilIfEmpty(callerID),
+			SourceID:     callerIDToSourceID(callerID),
 			TargetID:     &workspaceID,
 			Method:       &a2aMethod,
 			Summary:      &summary,
@@ -417,7 +417,7 @@ func (h *WorkspaceHandler) logA2ASuccess(ctx context.Context, workspaceID, calle
 	LogActivity(logCtx, h.broadcaster, ActivityParams{
 		WorkspaceID:  workspaceID,
 		ActivityType: "a2a_receive",
-		SourceID:     nilIfEmpty(callerID),
+		SourceID:     callerIDToSourceID(callerID),
 		TargetID:     &workspaceID,
 		Method:       &a2aMethod,
 		Summary:      &summary,
@@ -438,11 +438,70 @@ func (h *WorkspaceHandler) logA2ASuccess(ctx context.Context, workspaceID, calle
 	}
 }
 
+// nilIfEmpty returns nil for an empty string. The narrowest possible
+// contract: any other input is returned as a pointer to itself.
+//
+// nilIfEmpty is shared across many call sites — SourceID, TargetID,
+// Method, Summary, ErrorDetail, MessageId, workspace_dir — and
+// NOT ALL of them are caller identifiers. A system-caller
+// normalization (the kind callerIDToSourceID does below) would be
+// WRONG applied to a free-form string field like Method
+// (the value "system:foo" is a perfectly legitimate method name
+// that should NOT be silently nulled). System-caller handling is
+// therefore a SEPARATE helper, scoped to the only field that
+// actually needs it: the UUID-typed activity_logs.SourceID when
+// sourced from a callerID.
+//
+// Origin: prior #2701 attempt at this fix had the system-caller
+// check inline in nilIfEmpty; Researcher's RC #11295 caught the
+// too-generic contract (nilIfEmpty is also used on
+// method/summary/error-detail/message-id/workspace-dir, none of
+// which should be subject to system-caller normalization). The
+// scoped helper callerIDToSourceID is the corrected shape: same
+// intent, narrower surface, zero collateral on the other 6 callers.
 func nilIfEmpty(s string) *string {
 	if s == "" {
 		return nil
 	}
 	return &s
+}
+
+// callerIDToSourceID normalizes a callerID to *string for use as
+// activity_logs.SourceID. The column is UUID-typed; system-caller
+// strings like "system:restart-context" would poison the column
+// with a non-UUID value, break downstream joins (e.g. the canvas
+// /activity?source=canvas filter, which keys on source_id IS NULL),
+// and (most importantly for #2680) break the queue-fallback path
+// that lets a workspace recover from the post-restart wedge —
+// the recovery SELECT on activity_logs.message_id returns the
+// durable row, but every consumer of the row would crash on the
+// non-UUID source_id.
+//
+// Returns nil for:
+//   - empty callerID (no caller — agent initiated, user attribute
+//     is null)
+//   - system-caller prefix (matches isSystemCaller in
+//     a2a_proxy.go:85; preserves the "system caller" semantic via
+//     source_id IS NULL, the same way the canvas /activity
+//     filter already keys on)
+//
+// Returns &callerID for any real workspace UUID or op-style id
+// (preserves the row attribution so a per-workspace activity
+// filter still works).
+//
+// Idempotent + side-effect-free. Called from the 5 LogActivity
+// sites that previously used `SourceID: nilIfEmpty(callerID)`:
+// a2a_proxy_helpers.go:319, 347, 420, 863, 965.
+//
+// Mirrors the queue-side fix in #2696 (a2a_queue.caller_id) so
+// BOTH persisted-caller columns follow the same
+// isSystemCaller() → NULL normalization. Single source of truth
+// in a2a_proxy.go:84-91.
+func callerIDToSourceID(callerID string) *string {
+	if callerID == "" || isSystemCaller(callerID) {
+		return nil
+	}
+	return &callerID
 }
 
 // validateCallerToken enforces the Phase 30.5 auth-token contract on the
@@ -832,7 +891,7 @@ func (h *WorkspaceHandler) logA2AReceiveQueued(ctx context.Context, workspaceID,
 	LogActivity(insCtx, h.broadcaster, ActivityParams{
 		WorkspaceID:  workspaceID,
 		ActivityType: "a2a_receive",
-		SourceID:     nilIfEmpty(callerID),
+		SourceID:     callerIDToSourceID(callerID),
 		TargetID:     &workspaceID,
 		Method:       &a2aMethod,
 		Summary:      &summary,
@@ -934,7 +993,7 @@ func (h *WorkspaceHandler) persistUserMessageAtIngest(
 	LogActivity(insCtx, h.broadcaster, ActivityParams{
 		WorkspaceID:  workspaceID,
 		ActivityType: "a2a_receive",
-		SourceID:     nilIfEmpty(callerID),
+		SourceID:     callerIDToSourceID(callerID),
 		TargetID:     &workspaceID,
 		Method:       &a2aMethod,
 		Summary:      &summary,
