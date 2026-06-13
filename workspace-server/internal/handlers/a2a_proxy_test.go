@@ -2850,7 +2850,10 @@ func TestLookupDeliveryMode_ContextCanceled_FailsClosed(t *testing.T) {
 // ==================== a2aClient ResponseHeaderTimeout config ====================
 
 func TestA2AClientResponseHeaderTimeout(t *testing.T) {
-	const defaultTimeout = 5 * time.Minute
+	// core#2723 class: raised 5min→30min so long synchronous autonomous turns
+	// (e.g. a 443s "migrate from blob" run that errored with "timeout awaiting
+	// response headers") aren't cut short. Aligned to the agent ceiling + idle.
+	const defaultTimeout = 30 * time.Minute
 
 	// Default (unset env) — a2aClient was initialised at package load time.
 	if a2aClient.Transport.(*http.Transport).ResponseHeaderTimeout != defaultTimeout {
