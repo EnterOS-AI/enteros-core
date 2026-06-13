@@ -237,7 +237,22 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
               metadata: { history },
             },
           },
-          { timeoutMs: 120_000 },
+          // 30min — must exceed the server-side canvas idle watchdog
+          // (workspace-server/internal/handlers/a2a_proxy.go:1002 const
+          // defaultIdleTimeoutDuration = 30 * time.Minute, core#2723 / #2727
+          // raise). Pre-#2727 the server-side default was 5min; the 120s
+          // client-side timeout was BELOW the server idle and the
+          // isClientTimeout handler at useChatSend.ts:261-280 silently
+          // swallowed it (delivered; reply (and guard release) arrives via
+          // the AGENT_MESSAGE WS event). The 5min server raise moved the
+          // window to 5min, but a 300s+ chain still died client-side at
+          // 120s — half-fixed (#2723 ship didn't include the client
+          // alignment). The 30min server raise in #2727 makes a 30min
+          // client timeout safe, and the same isClientTimeout swallow
+          // path means a client timeout still doesn't surface "agent may
+          // be unreachable" — it just falls through to the WS-event
+          // delivery.
+          { timeoutMs: 30 * 60 * 1000 },
         )
         .then((resp) => {
           if (sendTokenRef.current !== myToken) return;
