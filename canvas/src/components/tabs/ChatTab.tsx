@@ -243,6 +243,22 @@ function MyChatPanel({ workspaceId, data }: Props) {
     }
   }, [data.status, clearSendError]);
 
+  // Clear any stale "Failed to send — agent may be unreachable" banner the
+  // moment the agent is demonstrably WORKING (core#2697). `thinking` is true
+  // when the user's send is in flight OR the workspace heartbeat reports an
+  // in-flight task — either way the agent is reachable, so an "unreachable"
+  // banner is self-contradictory (reported: banner shown beside a live
+  // "●●● 102s" timer + streaming tool calls on a long poll-mode turn).
+  // #2736 only cleared on a reply LANDING; this also clears the instant the
+  // agent starts/continues working, so the banner can't linger through a
+  // multi-minute turn that hasn't replied yet.
+  useEffect(() => {
+    if (thinking) {
+      setError(null);
+      clearSendError();
+    }
+  }, [thinking, clearSendError]);
+
   // Scroll behavior across messages updates:
   //  - Prepend (loadOlder landed)  → restore the user's saved
   //    distance-from-bottom so their reading position is unchanged.
