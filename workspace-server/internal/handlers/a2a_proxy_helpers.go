@@ -867,6 +867,19 @@ func (h *WorkspaceHandler) persistUserMessageAtIngest(
 		Status:       "ok",
 		MessageId:    messageId,
 	})
+
+	// Cross-device sync (core#2697). After the user message is durably
+	// persisted, broadcast a USER_MESSAGE event so every other device
+	// connected to this workspace renders the bubble in real time.
+	// Origin device already optimistically added the message via
+	// onUserMessage; on the WS echo the same id, the client-side id-
+	// based dedup collapses the duplicate (only the first writer wins).
+	// Fire only on a successful persist path: if LogActivity swallowed
+	// an INSERT error, the durable row is missing and a reload from
+	// chat-history would NOT show the message — the broadcast would be
+	// a phantom. Skipping keeps the "ws event mirrors on-disk truth"
+	// contract.
+	broadcastUserMessageFromA2ABody(h.broadcaster, workspaceID, messageId, body)
 }
 
 // readUsageMap extracts input_tokens / output_tokens from the "usage" key of m.
@@ -887,4 +900,140 @@ func readUsageMap(m map[string]json.RawMessage) (inputTokens, outputTokens int64
 		return 0, 0, false
 	}
 	return usage.InputTokens, usage.OutputTokens, true
+}
+
+// broadcastUserMessageFromA2ABody sends a USER_MESSAGE WebSocket event
+// derived from a canvas user's outbound A2A envelope. The event lets
+// every device connected to the workspace render the message in real
+// time (cross-device sync, core#2697).
+//
+// Why a server-side parser rather than re-broadcasting the raw body:
+//   - The payload shape needs to mirror the AGENT_MESSAGE wire shape
+//     ({message_id, content, attachments, workspace_id}) so the
+//     client's useChatSocket consumer can run a single appendMessage
+//     path for both directions.
+//   - The raw body is a full A2A JSON-RPC envelope (method, params,
+//     id, jsonrpc); the canvas listener would have to re-parse to
+//     extract the message bits, duplicating the client-side logic.
+//
+// Why no-op on parse failure: the persistUserMessageAtIngest caller
+// has already LogActivity'd the row with the raw body. A phantom-free
+// contract (ws event only when we successfully parsed the user
+// message) is more important than broadcasting malformed payloads — a
+// client receiving a broken USER_MESSAGE could not dedup or render
+// it usefully anyway, and the on-disk row remains the truth the
+// canvas re-reads on reload.
+func broadcastUserMessageFromA2ABody(
+	broadcaster events.EventEmitter,
+	workspaceID string,
+	messageId string,
+	body []byte,
+) {
+	if broadcaster == nil || messageId == "" {
+		return
+	}
+	text, attachments := extractUserTextAndAttachments(body)
+	if text == "" && len(attachments) == 0 {
+		return
+	}
+	payload := map[string]interface{}{
+		"message_id":   messageId,
+		"content":      text,
+		"workspace_id": workspaceID,
+	}
+	if len(attachments) > 0 {
+		payload["attachments"] = attachments
+	}
+	broadcaster.BroadcastOnly(workspaceID, string(events.EventUserMessage), payload)
+}
+
+// extractUserTextAndAttachments pulls the user-typed text + any
+// file attachments from an A2A message/send body. Mirrors the
+// canvas-side parts walker (canvas/.../message-parser.ts) so the
+// broadcast payload matches what the renderer would draw.
+//
+//   - text: the FIRST text-kind part's `text` (parts is treated as
+//     ordered; pre-existing canvas UI also renders the first text).
+//     Empty when no text part exists (attachments-only is valid).
+//   - attachments: every file-kind part's {name, mimeType, uri, size},
+//     preserved in order so the receiving device shows them in the
+//     same sequence the origin typed.
+//
+// Returns ("", nil) on any parse error or shape mismatch — the
+// caller treats that as "no broadcastable content" and skips the
+// event (the durable row is still authoritative).
+func extractUserTextAndAttachments(body []byte) (string, []map[string]interface{}) {
+	if len(body) == 0 {
+		return "", nil
+	}
+	var env struct {
+		Params struct {
+			Message struct {
+				Parts []map[string]interface{} `json:"parts"`
+			} `json:"message"`
+		} `json:"params"`
+	}
+	if err := json.Unmarshal(body, &env); err != nil {
+		return "", nil
+	}
+	var text string
+	var attachments []map[string]interface{}
+	for _, p := range env.Params.Message.Parts {
+		if p == nil {
+			continue
+		}
+		kind, _ := p["kind"].(string)
+		if kind == "" {
+			kind, _ = p["type"].(string)
+		}
+		switch kind {
+		case "text":
+			if text == "" {
+				if t, _ := p["text"].(string); t != "" {
+					text = t
+				}
+			}
+		case "file":
+			att := map[string]interface{}{}
+			if file, ok := p["file"].(map[string]interface{}); ok && file != nil {
+				if name, _ := file["name"].(string); name != "" {
+					att["name"] = name
+				}
+				if mt, _ := file["mimeType"].(string); mt != "" {
+					att["mimeType"] = mt
+				}
+				if uri, _ := file["uri"].(string); uri != "" {
+					att["uri"] = uri
+				}
+				if sz, ok := numericSizeFromAny(file["size"]); ok {
+					att["size"] = sz
+				}
+			}
+			// Only attach when we extracted a uri — a file part with
+			// no uri is malformed; the canvas can't render it.
+			if att["uri"] != "" {
+				if _, hasName := att["name"]; !hasName {
+					att["name"] = "file"
+				}
+				attachments = append(attachments, att)
+			}
+		}
+	}
+	return text, attachments
+}
+
+// numericSizeFromAny is the public helper variant of the canvas
+// parser's numericSize — Go side has no shared helper, so we keep
+// the local one to avoid a cross-package dependency for a one-liner.
+// Matches the JSON-decoded shapes: float64 (default), int64, int.
+func numericSizeFromAny(v interface{}) (int64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return int64(n), true
+	case int64:
+		return n, true
+	case int:
+		return int64(n), true
+	}
+	return 0, false
 }

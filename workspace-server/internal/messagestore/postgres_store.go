@@ -15,6 +15,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"log"
 	"path"
 	"strings"
@@ -296,27 +297,44 @@ func reverseRowChunks(msgs []ChatMessage) []ChatMessage {
 // parser without spinning a real DB. Internal — alternative impls
 // shouldn't depend on the SQL shape.
 func (s *PostgresMessageStore) queryActivityRows(ctx context.Context, workspaceID string, opts ListOptions) (*sql.Rows, error) {
-	if opts.HasBefore {
-		return s.db.QueryContext(ctx, `
-			SELECT created_at, status, request_body::text, response_body::text, tool_trace::text, duration_ms
-			FROM activity_logs
-			WHERE workspace_id = $1
-			  AND activity_type = 'a2a_receive'
-			  AND source_id IS NULL
-			  AND created_at < $2
-			ORDER BY created_at DESC
-			LIMIT $3
-		`, workspaceID, opts.BeforeTS, opts.Limit)
+	// Build the WHERE clause dynamically so we can compose
+	// (before_ts cursor) + (session_started_at filter) in any
+	// combination. Keeps the SQL shape flat and avoids a 4-arm
+	// switch on the (HasBefore, HasSessionStarted) cartesian
+	// product. The migration for chat_session_started_at is
+	// idempotent (ADD COLUMN IF NOT EXISTS) so a NULL marker on
+	// pre-deploy workspaces reads history with no filter — exactly
+	// the pre-PR behavior.
+	//
+	// core#2697: the session filter is `created_at >=
+	// $session_started_at` (inclusive on the lower bound). A user-
+	// typed message that lands in the same instant the marker is
+	// rotated should still be visible — exclusivity would silently
+	// drop the boundary message on a fast client.
+	args := []interface{}{workspaceID}
+	where := []string{
+		"workspace_id = $1",
+		"activity_type = 'a2a_receive'",
+		"source_id IS NULL",
 	}
-	return s.db.QueryContext(ctx, `
+	if opts.HasSessionStarted {
+		args = append(args, opts.SessionStartedAt)
+		where = append(where, fmt.Sprintf("created_at >= $%d", len(args)))
+	}
+	if opts.HasBefore {
+		args = append(args, opts.BeforeTS)
+		where = append(where, fmt.Sprintf("created_at < $%d", len(args)))
+	}
+	args = append(args, opts.Limit)
+	limitPlaceholder := fmt.Sprintf("$%d", len(args))
+	query := fmt.Sprintf(`
 		SELECT created_at, status, request_body::text, response_body::text, tool_trace::text, duration_ms
 		FROM activity_logs
-		WHERE workspace_id = $1
-		  AND activity_type = 'a2a_receive'
-		  AND source_id IS NULL
+		WHERE %s
 		ORDER BY created_at DESC
-		LIMIT $2
-	`, workspaceID, opts.Limit)
+		LIMIT %s
+	`, strings.Join(where, " AND "), limitPlaceholder)
+	return s.db.QueryContext(ctx, query, args...)
 }
 
 // errInvalidLimit is returned by List when opts.Limit ≤ 0.

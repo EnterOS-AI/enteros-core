@@ -5,7 +5,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { api } from "@/lib/api";
 import { useCanvasStore, type WorkspaceNodeData } from "@/store/canvas";
-import { type ChatMessage, type ChatAttachment, createMessage, appendMessageDeduped } from "./chat/types";
+import { type ChatMessage, type ChatAttachment, createMessage, appendMessageDeduped, appendMessageDedupedById } from "./chat/types";
 import { downloadChatFile, isPlatformAttachment } from "./chat/uploads";
 import { PendingAttachmentPill } from "./chat/AttachmentViews";
 import { AttachmentPreview } from "./chat/AttachmentPreview";
@@ -120,6 +120,8 @@ function MyChatPanel({ workspaceId, data }: Props) {
   const [agentReachable, setAgentReachable] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [confirmRestart, setConfirmRestart] = useState(false);
+  const [confirmNewSession, setConfirmNewSession] = useState(false);
+  const [newSessionPending, setNewSessionPending] = useState(false);
   const [dragOver, setDragOver] = useState(false);
 
   const containerRef = useRef<HTMLDivElement>(null);
@@ -128,6 +130,14 @@ function MyChatPanel({ workspaceId, data }: Props) {
   const hasInitialScrollRef = useRef(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const dragDepthRef = useRef(0);
+  // Textarea ref for the auto-grow handler (core#2697). Lives at
+  // the component scope so the onChange can resize the element
+  // itself, and the post-send reset (in handleSend) can collapse it
+  // back to a single row.
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  // Cap textarea at ~6 lines (core#2697). Past 6 lines the
+  // element scrolls internally rather than growing indefinitely.
+  const autoGrowMaxRows = 6;
   // Current user id, resolved the SAME way RequestsInbox sets responder_id
   // ("admin" placeholder when no session). Gates the decision chip to the
   // user's OWN responses (core#2636, CR2 fix).
@@ -157,6 +167,22 @@ function MyChatPanel({ workspaceId, data }: Props) {
       if (sendingFromAPIRef.current) {
         releaseSendGuards();
       }
+    },
+    // Cross-device sync (core#2697). The origin device already
+    // optimistically added the user message via onUserMessage;
+    // this is the WS echo of the same id, which appendMessageDedupedById
+    // collapses to a no-op. Other devices (or the origin after a
+    // reload) receive the broadcast and append fresh.
+    onUserMessageBroadcast: (msg) => {
+      history.setMessages((prev) => appendMessageDedupedById(prev, msg));
+    },
+    // "New session" pressed on one device: every other device
+    // clears its local view in lockstep. The marker rotation on
+    // the server means a subsequent /chat-history fetch filters
+    // out pre-marker rows, so the cleared view stays consistent
+    // on reload.
+    onSessionReset: () => {
+      history.setMessages([]);
     },
     onActivityLog: (entry) => {
       if (!sending) return;
@@ -317,9 +343,23 @@ function MyChatPanel({ workspaceId, data }: Props) {
   const handleSend = async () => {
     const text = input.trim();
     const files = pendingFiles;
-    if ((!text && files.length === 0) || !agentReachable || sending || uploading) return;
+    // Free multi-send (core#2697): the `sending` flag is no longer a
+    // gate. The hook tracks it purely for the "thinking" indicator;
+    // a second send in flight must not be blocked. The hook's
+    // sendInFlightRef + sendTokenRef still prevent double-fires
+    // for the SAME message (a click-spam on one message), which is
+    // what we want — but two distinct messages both go through.
+    // `uploading` stays a gate because file uploads are sequential
+    // at the wire level (same /chat/upload endpoint, race-prone).
+    if ((!text && files.length === 0) || !agentReachable || uploading) return;
     setInput("");
     setPendingFiles([]);
+    // Reset auto-grow height so the textarea collapses back to a
+    // single row after a send (core#2697).
+    if (textareaRef.current) {
+      textareaRef.current.style.height = "0px";
+      textareaRef.current.style.overflowY = "hidden";
+    }
     clearSendError();
     setError(null);
     await sendMessage(text, files);
@@ -334,6 +374,31 @@ function MyChatPanel({ workspaceId, data }: Props) {
     });
     if (fileInputRef.current) fileInputRef.current.value = "";
   };
+
+  // startNewSession: rotate the chat-session marker on the server
+  // (core#2697). The server broadcasts SESSION_RESET so other
+  // devices clear their local view; origin device also receives
+  // the event but the local clear is idempotent. Best-effort: on
+  // network failure we still clear locally so the user isn't
+  // blocked, and surface the error in the chat banner.
+  const startNewSession = useCallback(async () => {
+    setNewSessionPending(true);
+    // Optimistic local clear — even if the server round-trip
+    // fails, the user's "new session" intent is satisfied.
+    history.setMessages([]);
+    try {
+      await api.post(
+        `/workspaces/${workspaceId}/chat-session/new`,
+        {},
+        { timeoutMs: 10_000 },
+      );
+    } catch (e) {
+      const reason = e instanceof Error ? e.message : "unknown";
+      setError(`Couldn't start new session: ${reason}`);
+    } finally {
+      setNewSessionPending(false);
+    }
+  }, [workspaceId, history]);
 
   const removePendingFile = (index: number) =>
     setPendingFiles((prev) => prev.filter((_, i) => i !== index));
@@ -457,6 +522,22 @@ function MyChatPanel({ workspaceId, data }: Props) {
         </div>
       )}
       {/* Messages */}
+      <div className="flex items-center justify-end gap-2 px-3 py-1.5 border-b border-line/40 bg-surface-sunken shrink-0">
+        <span className="text-[10px] text-ink-soft flex-1">
+          {history.messages.length > 0
+            ? `${history.messages.length} message${history.messages.length === 1 ? "" : "s"} in this session`
+            : "New session"}
+        </span>
+        <button
+          onClick={() => setConfirmNewSession(true)}
+          disabled={newSessionPending}
+          aria-label="Start a new chat session"
+          title="Start a new chat session — clears visible history on every device"
+          className="text-[10px] font-medium text-ink-mid hover:text-ink px-2 py-0.5 rounded border border-line/60 hover:border-line transition-colors disabled:opacity-40"
+        >
+          {newSessionPending ? "Starting…" : "New session"}
+        </button>
+      </div>
       <div ref={containerRef} className="flex-1 overflow-y-auto p-3 space-y-3">
         {history.loading && (
           <div className="text-xs text-ink-mid text-center py-4">Loading chat history...</div>
@@ -712,7 +793,7 @@ function MyChatPanel({ workspaceId, data }: Props) {
           />
           <button
             onClick={() => fileInputRef.current?.click()}
-            disabled={!agentReachable || sending || uploading}
+            disabled={!agentReachable || uploading}
             aria-label="Attach file"
             title="Attach file"
             className="p-2 bg-surface-card hover:bg-surface-card border border-line rounded-lg text-ink-mid hover:text-ink transition-colors shrink-0 disabled:opacity-40"
@@ -722,9 +803,25 @@ function MyChatPanel({ workspaceId, data }: Props) {
             </svg>
           </button>
           <textarea
+            ref={textareaRef}
             aria-label="Message to agent"
             value={input}
-            onChange={(e) => setInput(e.target.value)}
+            onChange={(e) => {
+              setInput(e.target.value);
+              // Auto-grow: on each keystroke, reset height to 0 then
+              // expand to the natural content height, capped at ~6
+              // lines (autoGrowMaxRows). Reset to 0 first because
+              // scrollHeight on a textarea only grows — a longer
+              // message than the previous one needs the height
+              // released before it can re-flow (core#2697).
+              const el = e.currentTarget;
+              el.style.height = "0px";
+              const lineHeight = parseInt(getComputedStyle(el).lineHeight, 10) || 18;
+              const maxHeight = lineHeight * autoGrowMaxRows;
+              const next = Math.min(el.scrollHeight, maxHeight);
+              el.style.height = `${next}px`;
+              el.style.overflowY = el.scrollHeight > maxHeight ? "auto" : "hidden";
+            }}
             onKeyDown={(e) => {
               // IME-safe send: while a CJK / Japanese / Korean IME is
               // composing, Enter accepts the candidate selection — not a
@@ -748,13 +845,13 @@ function MyChatPanel({ workspaceId, data }: Props) {
             }}
             onPaste={onPasteIntoComposer}
             placeholder={agentReachable ? "Send a message... (Shift+Enter for new line, paste images to attach)" : `Agent is ${data.status}`}
-            disabled={!agentReachable || sending}
+            disabled={!agentReachable}
             rows={1}
             className="flex-1 bg-surface-card border border-line rounded-lg px-3 py-2 text-xs text-ink placeholder-ink-soft dark:bg-zinc-800 dark:border-zinc-600 dark:placeholder-zinc-500 focus:outline-none focus:border-accent focus-visible:ring-2 focus-visible:ring-accent/40 resize-none disabled:opacity-50"
           />
           <button
             onClick={handleSend}
-            disabled={(!input.trim() && pendingFiles.length === 0) || !agentReachable || sending || uploading}
+            disabled={(!input.trim() && pendingFiles.length === 0) || !agentReachable || uploading}
             className="px-4 py-2 bg-accent-strong hover:bg-accent text-xs font-medium rounded-lg text-white disabled:opacity-30 transition-colors shrink-0"
           >
             {uploading ? "Uploading…" : "Send"}
@@ -773,6 +870,19 @@ function MyChatPanel({ workspaceId, data }: Props) {
           setConfirmRestart(false);
         }}
         onCancel={() => setConfirmRestart(false)}
+      />
+
+      <ConfirmDialog
+        open={confirmNewSession}
+        title="New session"
+        message="Start a new chat session? Visible history will be cleared on this and other connected devices. Earlier messages stay on the server and won't be lost."
+        confirmLabel="Start new session"
+        confirmVariant="primary"
+        onConfirm={() => {
+          startNewSession();
+          setConfirmNewSession(false);
+        }}
+        onCancel={() => setConfirmNewSession(false)}
       />
     </div>
   );
