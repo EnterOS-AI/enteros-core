@@ -10,6 +10,7 @@ import {
 
 const API = process.env.E2E_API_URL ?? "http://localhost:8080";
 const PLATFORM_URL = process.env.E2E_PLATFORM_URL ?? "http://localhost:8080";
+const ADMIN_TOKEN = process.env.E2E_ADMIN_TOKEN ?? process.env.ADMIN_TOKEN;
 
 /** Enter the Org-map view so the Canvas (React Flow graph) mounts. */
 async function enterMapView(page: Page): Promise<void> {
@@ -43,13 +44,16 @@ async function openChatPanel(page: Page, workspaceName: string): Promise<void> {
   });
 }
 
-/** Post a message to the workspace via the A2A proxy so activity rows exist. */
-async function postA2AMessage(workspaceId: string, authToken: string, text: string) {
+/** Post a message to the workspace via the A2A proxy so activity rows exist.
+ *  `token` should be an org/admin token for canvas-origin rows (source_id NULL),
+ *  or the target workspace's own auth token for agent-origin rows
+ *  (source_id = workspace_id). */
+async function postA2AMessage(workspaceId: string, token: string, text: string) {
   const res = await fetch(`${PLATFORM_URL}/workspaces/${workspaceId}/a2a`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${authToken}`,
+      Authorization: `Bearer ${token}`,
     },
     body: JSON.stringify({
       method: "message/send",
@@ -155,14 +159,23 @@ test.describe("Activity API Source Filter", () => {
   let authToken = "";
 
   test.beforeAll(async () => {
+    if (!ADMIN_TOKEN) {
+      throw new Error(
+        "Activity source-filter tests require E2E_ADMIN_TOKEN or ADMIN_TOKEN to seed canvas-origin rows",
+      );
+    }
+
     const echo = await startEchoRuntime();
     const ws = await seedWorkspace(echo.baseURL);
     workspaceId = ws.id;
     authToken = ws.authToken;
     const stopHeartbeat = startHeartbeat(ws.id, ws.authToken);
 
-    // Generate a canvas-initiated activity entry deterministically.
-    await postA2AMessage(workspaceId, authToken, "source filter probe");
+    // Seed BOTH source classes deterministically:
+    //  - admin/org token → callerID is empty → source_id NULL (canvas-origin).
+    //  - workspace token → callerID resolves to the workspace → source_id non-null (agent-origin).
+    await postA2AMessage(workspaceId, ADMIN_TOKEN, "canvas source probe");
+    await postA2AMessage(workspaceId, authToken, "agent source probe");
 
     cleanup = async () => {
       stopHeartbeat();
@@ -182,6 +195,8 @@ test.describe("Activity API Source Filter", () => {
     expect(res.ok()).toBeTruthy();
     const entries = (await res.json()) as Array<{ source_id: unknown }>;
     expect(Array.isArray(entries)).toBeTruthy();
+    // False-green guard: an empty array would make the loop below pass vacuously.
+    expect(entries.length).toBeGreaterThan(0);
     for (const e of entries) {
       expect(e.source_id).toBeNull();
     }
@@ -194,10 +209,10 @@ test.describe("Activity API Source Filter", () => {
     expect(res.ok()).toBeTruthy();
     const entries = (await res.json()) as Array<{ source_id: unknown }>;
     expect(Array.isArray(entries)).toBeTruthy();
+    // False-green guard: an empty array would make the loop below pass vacuously.
+    expect(entries.length).toBeGreaterThan(0);
     for (const e of entries) {
-      if (e.source_id !== undefined) {
-        expect(e.source_id).not.toBeNull();
-      }
+      expect(e.source_id).not.toBeNull();
     }
   });
 
@@ -218,6 +233,8 @@ test.describe("Activity API Source Filter", () => {
       source_id: unknown;
     }>;
     expect(Array.isArray(entries)).toBeTruthy();
+    // False-green guard: an empty array would make the loop below pass vacuously.
+    expect(entries.length).toBeGreaterThan(0);
     for (const e of entries) {
       expect(e.activity_type).toBe("a2a_receive");
       expect(e.source_id).toBeNull();
