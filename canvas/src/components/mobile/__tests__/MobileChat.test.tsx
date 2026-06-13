@@ -258,10 +258,26 @@ describe("MobileChat — composer", () => {
     expect(sendBtn).toBeTruthy();
   });
 
-  it("Send button is disabled when textarea is empty (no draft)", () => {
+  it("Send button is disabled when textarea is empty (no draft)", async () => {
     const { container } = renderChat(mockAgentId);
     const sendBtn = container.querySelector('[aria-label="Send"]') as HTMLButtonElement;
     expect(sendBtn.disabled).toBe(true);
+  });
+
+  // Regression #2762-follow-up: the send cursor used `pendingFiles.length === 0`,
+  // so attaching a file without typing text left the button enabled but showed a
+  // `not-allowed` cursor. It must be consistent with the disabled prop.
+  it("Send button is enabled and shows pointer cursor when files are attached but draft is empty", async () => {
+    const { container } = renderChat(mockAgentId);
+    const fileInput = container.querySelector('input[type="file"]') as HTMLInputElement;
+    const file = new File(["hello"], "note.txt", { type: "text/plain" });
+    await act(async () => {
+      fireEvent.change(fileInput, { target: { files: [file] } });
+    });
+
+    const sendBtn = container.querySelector('[aria-label="Send"]') as HTMLButtonElement;
+    expect(sendBtn.disabled).toBe(false);
+    expect(sendBtn.style.cursor).toBe("pointer");
   });
 
   // Regression #224: the composer textarea must render with font-size
