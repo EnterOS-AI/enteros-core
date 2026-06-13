@@ -126,7 +126,9 @@ func seedA2AQueueItem(t *testing.T, conn *sql.DB, workspaceID, callerID string, 
 // noOpEmitter is a test-only stub that satisfies events.EventEmitter.
 type noOpEmitter struct{}
 
-func (noOpEmitter) RecordAndBroadcast(ctx context.Context, eventType string, workspaceID string, payload interface{}) error { return nil }
+func (noOpEmitter) RecordAndBroadcast(ctx context.Context, eventType string, workspaceID string, payload interface{}) error {
+	return nil
+}
 func (noOpEmitter) BroadcastOnly(workspaceID string, eventType string, payload interface{}) {}
 
 // newTestGinContext creates a gin.Context with an httptest recorder.
@@ -321,7 +323,7 @@ func TestIntegration_Notify_InvalidAttachment(t *testing.T) {
 func TestIntegration_ActivityList_FilterBySourceCanvas(t *testing.T) {
 	conn := integrationDB_ActivityDelegationA2A(t)
 	wsID := seedWorkspace(t, conn, "test-2151-source-canvas")
-	seedActivityLog(t, conn, wsID, "agent_log", "m1", "ok", nil, nil)           // canvas (source_id IS NULL)
+	seedActivityLog(t, conn, wsID, "agent_log", "m1", "ok", nil, nil) // canvas (source_id IS NULL)
 	peerID := seedWorkspace(t, conn, "test-2151-peer-canvas")
 	seedActivityLog(t, conn, wsID, "a2a_receive", "m2", "ok", &peerID, nil) // agent
 
@@ -1107,8 +1109,8 @@ func TestIntegration_A2AQueueStatus_MismatchedCaller(t *testing.T) {
 	c.Request.Header.Set("X-Workspace-ID", otherWS)
 	wh.GetA2AQueueStatus(c)
 
-	if w.Code != http.StatusNotFound {
-		t.Fatalf("GetA2AQueueStatus returned %d, want 404", w.Code)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("GetA2AQueueStatus returned %d, want 403", w.Code)
 	}
 }
 
@@ -1125,8 +1127,8 @@ func TestIntegration_A2AQueueStatus_MissingIdentity(t *testing.T) {
 	// No X-Workspace-ID, no org_token_id
 	wh.GetA2AQueueStatus(c)
 
-	if w.Code != http.StatusNotFound {
-		t.Fatalf("GetA2AQueueStatus returned %d, want 404", w.Code)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("GetA2AQueueStatus returned %d, want 401", w.Code)
 	}
 }
 
@@ -1143,5 +1145,12 @@ func TestIntegration_A2AQueueStatus_NonExistentQueueID(t *testing.T) {
 
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("GetA2AQueueStatus returned %d, want 404", w.Code)
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if retryable, _ := resp["retryable"].(bool); !retryable {
+		t.Fatalf("expected retryable=true for missing row, got %v", resp)
 	}
 }

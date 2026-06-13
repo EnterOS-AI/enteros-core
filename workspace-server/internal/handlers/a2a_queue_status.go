@@ -16,9 +16,15 @@ package handlers
 //     for the target workspace_id (target can see what's queued for it),
 //     OR an org-level token (canvas/admin) can see anything.
 //
-//   - 404 — not 403 — when the caller has no read access. The queue_id
-//     UUID is the access token; revealing "this queue_id exists but
-//     you can't see it" leaks the existence-of-other-callers' state.
+//   - Missing identity -> 401 Unauthorized (no existence leak).
+//
+//   - Authenticated caller, row not found -> 404 Not Found with
+//     retryable=true so 202-polling clients can retry the not-yet-enqueued
+//     window without treating it as a hard failure.
+//
+//   - Authenticated caller, row exists but no read access -> 403 Forbidden,
+//     distinct from the retryable 404 so the client knows to stop retrying
+//     and fix identity alignment.
 //
 // What the response body excludes:
 //
@@ -50,15 +56,15 @@ import (
 
 // QueueStatus is the public projection of an a2a_queue row.
 type QueueStatus struct {
-	ID           string  `json:"queue_id"`
-	WorkspaceID  string  `json:"workspace_id"`
-	Status       string  `json:"status"`
-	Priority     int     `json:"priority"`
-	Attempts     int     `json:"attempts"`
-	LastError    *string `json:"last_error,omitempty"`
-	EnqueuedAt   string  `json:"enqueued_at"`
-	DispatchedAt *string `json:"dispatched_at,omitempty"`
-	CompletedAt  *string `json:"completed_at,omitempty"`
+	ID           string          `json:"queue_id"`
+	WorkspaceID  string          `json:"workspace_id"`
+	Status       string          `json:"status"`
+	Priority     int             `json:"priority"`
+	Attempts     int             `json:"attempts"`
+	LastError    *string         `json:"last_error,omitempty"`
+	EnqueuedAt   string          `json:"enqueued_at"`
+	DispatchedAt *string         `json:"dispatched_at,omitempty"`
+	CompletedAt  *string         `json:"completed_at,omitempty"`
 	ExpiresAt    *string         `json:"expires_at,omitempty"`
 	ResponseBody json.RawMessage `json:"response_body,omitempty"`
 }
@@ -188,7 +194,10 @@ func queueRowAuthFields(ctx context.Context, queueID string) (callerID, workspac
 //  2. Look up queue row's (caller_id, workspace_id).
 //  3. Allow when caller's workspace == queue.caller_id OR
 //     == queue.workspace_id, OR caller has org-level access.
-//  4. Otherwise 404 (not 403) — see file-header rationale.
+//  4. Missing identity / auth mismatch -> non-retryable client error
+//     (401/403). Row not found for an authenticated caller -> 404 with
+//     retryable=true so polling clients can distinguish a not-yet-enqueued
+//     row from a hard not-found.
 func (h *WorkspaceHandler) GetA2AQueueStatus(c *gin.Context) {
 	ctx := c.Request.Context()
 	queueID := c.Param("queue_id")
@@ -210,16 +219,21 @@ func (h *WorkspaceHandler) GetA2AQueueStatus(c *gin.Context) {
 		}
 	}
 	if !isOrg && callerWorkspace == "" {
-		// No identity — treat as not-found rather than 401, matching the
-		// file-header existence-non-inference policy. A 401 would tell
-		// an attacker that the queue_id at least might exist.
-		c.JSON(http.StatusNotFound, gin.H{"error": "queue item not found"})
+		// Missing identity — tell the caller to authenticate/retry with
+		// proper credentials. This does NOT leak queue existence; an
+		// unauthenticated probe cannot tell whether the queue_id exists.
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "caller identity required"})
 		return
 	}
 
 	rowCallerID, rowWorkspaceID, err := queueRowAuthFields(ctx, queueID)
 	if errors.Is(err, sql.ErrNoRows) {
-		c.JSON(http.StatusNotFound, gin.H{"error": "queue item not found"})
+		// Authenticated caller, row absent. Return retryable so a client
+		// that just received a 202 {queue_id} can poll through the
+		// enqueue→persist replication window without treating this as a
+		// hard failure. A client with no active queue_id will timeout its
+		// own retry window and surface the not-found.
+		c.JSON(http.StatusNotFound, gin.H{"error": "queue item not found", "retryable": true})
 		return
 	}
 	if err != nil {
@@ -230,14 +244,15 @@ func (h *WorkspaceHandler) GetA2AQueueStatus(c *gin.Context) {
 
 	// Access check.
 	if !isOrg && callerWorkspace != rowCallerID && callerWorkspace != rowWorkspaceID {
-		// Collapse to 404 — see header.
-		c.JSON(http.StatusNotFound, gin.H{"error": "queue item not found"})
+		// Auth mismatch — distinct from missing row so the polling client
+		// knows to stop retrying and fix identity alignment.
+		c.JSON(http.StatusForbidden, gin.H{"error": "access denied"})
 		return
 	}
 
 	status, err := QueueStatusByID(ctx, queueID)
 	if errors.Is(err, sql.ErrNoRows) {
-		c.JSON(http.StatusNotFound, gin.H{"error": "queue item not found"})
+		c.JSON(http.StatusNotFound, gin.H{"error": "queue item not found", "retryable": true})
 		return
 	}
 	if err != nil {

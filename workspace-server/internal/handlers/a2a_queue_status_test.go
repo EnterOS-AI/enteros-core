@@ -3,10 +3,132 @@ package handlers
 import (
 	"context"
 	"database/sql"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/gin-gonic/gin"
 )
+
+// TestGetA2AQueueStatus_MissingIdentity proves an unauthenticated request gets
+// 401 without leaking whether the queue_id exists.
+func TestGetA2AQueueStatus_MissingIdentity(t *testing.T) {
+	setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-target"}, {Key: "queue_id", Value: "queue-abc"}}
+	c.Request = httptest.NewRequest("GET", "/workspaces/ws-target/a2a/queue/queue-abc", nil)
+
+	handler.GetA2AQueueStatus(c)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for missing identity, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestGetA2AQueueStatus_MissingRow_Retryable proves an authenticated caller
+// receives a 404 with retryable=true when the queue row doesn't exist, so a
+// client polling after a 202 knows to keep retrying.
+func TestGetA2AQueueStatus_MissingRow_Retryable(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+
+	queueID := "queue-missing"
+	mock.ExpectQuery(`SELECT caller_id, workspace_id FROM a2a_queue WHERE id = \$1`).
+		WithArgs(queueID).
+		WillReturnError(sql.ErrNoRows)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-target"}, {Key: "queue_id", Value: queueID}}
+	c.Request = httptest.NewRequest("GET", "/workspaces/ws-target/a2a/queue/"+queueID, nil)
+	c.Request.Header.Set("X-Workspace-ID", "ws-caller")
+
+	handler.GetA2AQueueStatus(c)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for missing row, got %d: %s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `"retryable":true`) {
+		t.Errorf("expected retryable=true in missing-row response, got %s", body)
+	}
+}
+
+// TestGetA2AQueueStatus_AuthMismatch proves an authenticated caller that is
+// neither the queue's caller nor the target workspace gets 403, telling the
+// client to stop retrying and fix identity alignment.
+func TestGetA2AQueueStatus_AuthMismatch(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+
+	queueID := "queue-other"
+	mock.ExpectQuery(`SELECT caller_id, workspace_id FROM a2a_queue WHERE id = \$1`).
+		WithArgs(queueID).
+		WillReturnRows(sqlmock.NewRows([]string{"caller_id", "workspace_id"}).AddRow("ws-real-caller", "ws-target"))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-target"}, {Key: "queue_id", Value: queueID}}
+	c.Request = httptest.NewRequest("GET", "/workspaces/ws-target/a2a/queue/"+queueID, nil)
+	c.Request.Header.Set("X-Workspace-ID", "ws-attacker")
+
+	handler.GetA2AQueueStatus(c)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for auth mismatch, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestGetA2AQueueStatus_TargetCallerCanRead proves the target workspace can
+// read a queue item queued for it and gets the public projection.
+func TestGetA2AQueueStatus_TargetCallerCanRead(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+
+	queueID := "queue-readable"
+	mock.ExpectQuery(`SELECT caller_id, workspace_id FROM a2a_queue WHERE id = \$1`).
+		WithArgs(queueID).
+		WillReturnRows(sqlmock.NewRows([]string{"caller_id", "workspace_id"}).AddRow("ws-caller", "ws-target"))
+	mock.ExpectQuery(`SELECT\s+q\.id,\s+q\.workspace_id,\s+q\.status,`).
+		WithArgs(queueID).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "workspace_id", "status", "priority", "attempts",
+			"last_error", "enqueued_at", "dispatched_at", "completed_at", "expires_at", "response_body",
+		}).AddRow(
+			queueID, "ws-target", "queued", 50, 0,
+			sql.NullString{Valid: false}, "2026-06-13T00:00:00Z",
+			sql.NullString{Valid: false}, sql.NullString{Valid: false},
+			sql.NullString{Valid: false}, nil,
+		))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-target"}, {Key: "queue_id", Value: queueID}}
+	c.Request = httptest.NewRequest("GET", "/workspaces/ws-target/a2a/queue/"+queueID, nil)
+	c.Request.Header.Set("X-Workspace-ID", "ws-target")
+
+	handler.GetA2AQueueStatus(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for authorized caller, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"status":"queued"`) {
+		t.Errorf("expected queued status in response, got %s", w.Body.String())
+	}
+}
 
 // TestQueueRowAuthFields_NilSafeScan proves queueRowAuthFields returns empty
 // strings (not a panic / garbage) when the a2a_queue row has NULL caller_id
