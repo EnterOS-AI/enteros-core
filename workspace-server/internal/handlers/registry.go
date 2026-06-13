@@ -1200,6 +1200,24 @@ func (h *RegistryHandler) UpdateCard(c *gin.Context) {
 // SECURITY NOTE: the grandfathering path is only safe during the
 // transition window. Once every running workspace has re-registered
 // post-upgrade, step 30.5 flips this to hard-require.
+//
+// core#2611 bootstrap-recovery re-check: when a bearer is presented and
+// ValidateToken rejects it, re-query HasLiveInstanceToken. If the
+// workspace now has ZERO live tokens (the previously-valid token was
+// revoked between the first check and the validation — e.g. the SaaS
+// provisioner's "revoke all then bootstrap-mint" sequence ran twice
+// during a double-provision race), the request is allowed through as a
+// fresh bootstrap. The agent's first register of the new incarnation
+// will mint a token. Without this re-check, the second box in the race
+// gets a permanent 401 — there is no live token to present, the box
+// is dead, and the runtime's 401-as-terminal posture wedges the
+// workspace "online-but-braindead".
+//
+// The re-check window is small (a few ms between the first HasLive
+// call and ValidateToken) and the bootstrap branch is already gated
+// to the no-live-tokens state, so the re-open does not weaken the
+// C18 anti-hijack guarantee (an attacker still cannot bootstrap
+// while ANY live token exists).
 func (h *RegistryHandler) requireWorkspaceToken(
 	ctx gincontext, c *gin.Context, workspaceID string,
 ) error {
@@ -1223,6 +1241,19 @@ func (h *RegistryHandler) requireWorkspaceToken(
 		return errors.New("missing token")
 	}
 	if err := wsauth.ValidateToken(ctx, db.DB, workspaceID, token); err != nil {
+		// core#2611: re-check for zero live tokens before returning 401.
+		// If the previously-valid token was revoked in the gap between
+		// HasLiveInstanceToken and ValidateToken (a SaaS provisioner's
+		// "revoke all" passing through, a CP double-provision race
+		// revoking the winner's token, etc.), the presented bearer is
+		// stale by definition — the workspace has no live token, so the
+		// only safe action is to re-open bootstrap. The caller's next
+		// /registry/register iteration will mint a fresh token.
+		nowLive, nowLiveErr := wsauth.HasLiveInstanceToken(ctx, db.DB, workspaceID)
+		if nowLiveErr == nil && !nowLive {
+			log.Printf("wsauth: core#2611 bootstrap-recovery for %s — bearer was revoked between HasLive and ValidateToken; re-opening bootstrap", workspaceID)
+			return nil
+		}
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid workspace auth token"})
 		return err
 	}
