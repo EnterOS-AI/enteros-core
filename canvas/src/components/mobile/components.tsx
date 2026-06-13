@@ -55,7 +55,7 @@ export function toMobileAgent(node: Node<WorkspaceNodeData>): MobileAgent {
 }
 
 // ── Tab bar ────────────────────────────────────────────────────
-export type MobileTabId = "agents" | "canvas" | "comms" | "me";
+export type MobileTabId = "agents" | "inbox" | "canvas" | "comms" | "me";
 
 export function TabBar({
   active,
@@ -69,6 +69,7 @@ export function TabBar({
   const p = usePalette(dark);
   const tabs: { id: MobileTabId; label: string; icon: keyof typeof Icons }[] = [
     { id: "agents", label: "Agents", icon: "list" },
+    { id: "inbox", label: "Inbox", icon: "bell" },
     { id: "canvas", label: "Canvas", icon: "graph" },
     { id: "comms", label: "Comms", icon: "pulse" },
     { id: "me", label: "Me", icon: "user" },

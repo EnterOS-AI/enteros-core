@@ -16,15 +16,16 @@ import { MobileChat } from "./MobileChat";
 import { MobileComms } from "./MobileComms";
 import { MobileDetail } from "./MobileDetail";
 import { MobileHome } from "./MobileHome";
+import { MobileInbox } from "./MobileInbox";
 import { MobileMe } from "./MobileMe";
 import { MobileSpawn } from "./MobileSpawn";
 import { usePalette } from "./palette";
 import { MobileAccentProvider } from "./palette-context";
 import { SearchDialog } from "@/components/SearchDialog";
 
-type Route = "home" | "canvas" | "detail" | "chat" | "comms" | "me";
+type Route = "home" | "canvas" | "detail" | "chat" | "comms" | "me" | "inbox";
 
-const ROUTES: Route[] = ["home", "canvas", "detail", "chat", "comms", "me"];
+const ROUTES: Route[] = ["home", "canvas", "detail", "chat", "comms", "me", "inbox"];
 
 const ACCENT_KEY = "molecule.mobile.accent";
 const DENSITY_KEY = "molecule.mobile.density";
@@ -136,6 +137,7 @@ export function MobileApp() {
   }, [density]);
 
   const activeTab: MobileTabId = useMemo(() => {
+    if (route === "inbox") return "inbox";
     if (route === "canvas") return "canvas";
     if (route === "comms") return "comms";
     if (route === "me") return "me";
@@ -144,6 +146,7 @@ export function MobileApp() {
 
   const onTabChange = (id: MobileTabId) => {
     if (id === "agents") setRoute("home");
+    else if (id === "inbox") setRoute("inbox");
     else if (id === "canvas") setRoute("canvas");
     else if (id === "comms") setRoute("comms");
     else if (id === "me") setRoute("me");
@@ -177,6 +180,7 @@ export function MobileApp() {
           onSpawn={() => setShowSpawn(true)}
         />
       )}
+      {route === "inbox" && <MobileInbox dark={dark} />}
       {route === "canvas" && (
         <MobileCanvas dark={dark} onOpen={openAgent} onSpawn={() => setShowSpawn(true)} />
       )}
