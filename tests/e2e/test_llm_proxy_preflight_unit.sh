@@ -136,7 +136,11 @@ test_proxy_unreachable() {
 test_200_empty_body() {
   PY_SERVER_PORT=0
   start_test_server "empty_200"
-  E2E_LLM_PROXY_URL="http://127.0.0.1:${PY_SERVER_PORT}/v1/chat/completions"
+  # E2E_LLM_PROXY_URL is read by the sourced llm_proxy_preflight helper
+  # (lib/llm_proxy_preflight.sh) via ${E2E_LLM_PROXY_URL:-}. Export it
+  # here so shellcheck doesn't false-positive SC2034 (appears unused) when
+  # the test file is checked in isolation.
+  export E2E_LLM_PROXY_URL="http://127.0.0.1:${PY_SERVER_PORT}/v1/chat/completions"
   local out rc
   out=$(llm_proxy_preflight 2>&1)
   rc=$?
@@ -160,7 +164,11 @@ test_200_empty_body() {
 test_ok() {
   PY_SERVER_PORT=0
   start_test_server "ok"
-  E2E_LLM_PROXY_URL="http://127.0.0.1:${PY_SERVER_PORT}/v1/chat/completions"
+  # E2E_LLM_PROXY_URL is read by the sourced llm_proxy_preflight helper
+  # (lib/llm_proxy_preflight.sh) via ${E2E_LLM_PROXY_URL:-}. Export it
+  # here so shellcheck doesn't false-positive SC2034 (appears unused) when
+  # the test file is checked in isolation.
+  export E2E_LLM_PROXY_URL="http://127.0.0.1:${PY_SERVER_PORT}/v1/chat/completions"
   local out rc
   out=$(llm_proxy_preflight 2>&1)
   rc=$?
@@ -179,7 +187,11 @@ test_ok() {
 test_503() {
   PY_SERVER_PORT=0
   start_test_server "down"
-  E2E_LLM_PROXY_URL="http://127.0.0.1:${PY_SERVER_PORT}/v1/chat/completions"
+  # E2E_LLM_PROXY_URL is read by the sourced llm_proxy_preflight helper
+  # (lib/llm_proxy_preflight.sh) via ${E2E_LLM_PROXY_URL:-}. Export it
+  # here so shellcheck doesn't false-positive SC2034 (appears unused) when
+  # the test file is checked in isolation.
+  export E2E_LLM_PROXY_URL="http://127.0.0.1:${PY_SERVER_PORT}/v1/chat/completions"
   local out rc
   out=$(llm_proxy_preflight 2>&1)
   rc=$?
