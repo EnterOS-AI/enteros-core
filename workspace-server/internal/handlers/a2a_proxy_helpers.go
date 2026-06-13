@@ -856,7 +856,23 @@ func (h *WorkspaceHandler) persistUserMessageAtIngest(
 		wsName = workspaceID
 	}
 	summary := a2aMethod + " → " + wsName + " (ingest)"
-	LogActivity(insCtx, h.broadcaster, ActivityParams{
+	// Phantom-guard (CR2 #11302): use the error-returning variant
+	// LogActivityWithResult so we observe the INSERT outcome. The
+	// plain LogActivity() swallows errors via log.Printf internally
+	// (its "best-effort" contract), which would let a USER_MESSAGE
+	// broadcast fire even when the activity_logs row is missing.
+	// The cross-device sync contract is "ws event mirrors on-disk
+	// truth" — a phantom USER_MESSAGE would render on every other
+	// device but vanish on reload (chat-history reads from
+	// activity_logs, the row is gone). Capture the hook + error;
+	// fire the ACTIVITY_LOGGED broadcast AND the USER_MESSAGE
+	// broadcast ONLY if the INSERT succeeded. A failed INSERT
+	// returns silently here (best-effort dispatch contract — the
+	// user's message may already be in the agent's hands via the
+	// post-dispatch path; the agent-side delivery is authoritative
+	// for the user-visible bubble, the activity_logs row is the
+	// post-hoc audit + chat-history hydration).
+	hook, logErr := LogActivityWithResult(insCtx, h.broadcaster, ActivityParams{
 		WorkspaceID:  workspaceID,
 		ActivityType: "a2a_receive",
 		SourceID:     nilIfEmpty(callerID),
@@ -867,6 +883,14 @@ func (h *WorkspaceHandler) persistUserMessageAtIngest(
 		Status:       "ok",
 		MessageId:    messageId,
 	})
+	if logErr != nil {
+		log.Printf("persistUserMessageAtIngest: activity_logs insert failed for workspace %s messageId %s: %v — skipping USER_MESSAGE broadcast (phantom guard)", workspaceID, messageId, logErr)
+		return
+	}
+	// Fire the ACTIVITY_LOGGED broadcast (LogActivity's post-commit
+	// hook) AND the cross-device USER_MESSAGE broadcast — both
+	// behind the persist-success gate.
+	hook()
 
 	// Cross-device sync (core#2697). After the user message is durably
 	// persisted, broadcast a USER_MESSAGE event so every other device
@@ -874,11 +898,6 @@ func (h *WorkspaceHandler) persistUserMessageAtIngest(
 	// Origin device already optimistically added the message via
 	// onUserMessage; on the WS echo the same id, the client-side id-
 	// based dedup collapses the duplicate (only the first writer wins).
-	// Fire only on a successful persist path: if LogActivity swallowed
-	// an INSERT error, the durable row is missing and a reload from
-	// chat-history would NOT show the message — the broadcast would be
-	// a phantom. Skipping keeps the "ws event mirrors on-disk truth"
-	// contract.
 	broadcastUserMessageFromA2ABody(h.broadcaster, workspaceID, messageId, body)
 }
 
