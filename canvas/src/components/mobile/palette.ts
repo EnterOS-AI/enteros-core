@@ -1,7 +1,17 @@
-// Mobile design system tokens — verbatim from the Claude Design handoff
-// (molecules-ai-mobile-app/project/shared.jsx). Kept as an inline-style
-// palette object so screens can mirror the design 1:1; theming routes
-// through `usePalette(dark)` exactly like the prototype.
+// Mobile design system tokens.
+//
+// SSOT (core#mobile-design-parity): the CORE palette — bg/surface/surface2/
+// border/divider/text/text2/text3 + the PURPLE brand accent — is kept in
+// sync with the canonical canvas @theme in
+// `molecule-core/canvas/src/app/globals.css` (the same app this mobile UI
+// ships inside). Earlier this palette shipped a divergent set built from a
+// Claude Design handoff (GREEN accent #2f9e6a + lighter warm-paper) — it now
+// adopts the canvas warm-paper + near-black-dark surfaces and the purple
+// accent so the mobile version has the SAME design as the desktop canvas.
+// `palette.ssot.test.ts` asserts these core values equal the canvas tokens;
+// `green`/`online` map to the canvas `good`, status/tier badges stay
+// mobile-specific. Don't hand-edit the core values to differ from canvas —
+// change the canvas SSOT and re-sync.
 
 export interface MobilePalette {
   bg: string;
@@ -37,16 +47,19 @@ export interface MobilePalette {
 }
 
 export const MOL_LIGHT: MobilePalette = {
-  bg: "#f6f4ef",
+  // Core — canvas @theme light SSOT (surface / surface-elevated /
+  // surface-card / line / line-soft / ink / ink-mid / ink-soft).
+  bg: "#f1efe8",
   surface: "#ffffff",
-  surface2: "#fbf9f4",
-  border: "rgba(40,30,20,0.08)",
-  divider: "rgba(40,30,20,0.06)",
-  text: "#29261b",
-  text2: "rgba(41,38,27,0.62)",
-  text3: "rgba(41,38,27,0.42)",
+  surface2: "#faf9f4",
+  border: "#ddd9cf",
+  divider: "#ebe8df",
+  text: "#21201b",
+  text2: "#5c5a52",
+  text3: "#6f6c62",
 
-  green: "#2f9e6a",
+  // green/online map to the canvas `good` (#0c8a52); soft/ink tints derived.
+  green: "#0c8a52",
   greenSoft: "#d9ebe0",
   greenInk: "#1f6a47",
 
@@ -57,7 +70,7 @@ export const MOL_LIGHT: MobilePalette = {
 
   t4SoftCard: "#f9ece0",
 
-  online: "#2f9e6a",
+  online: "#0c8a52",
   starting: "#e9b53b",
   degraded: "#d28a2a",
   failed: "#c8472a",
@@ -66,20 +79,22 @@ export const MOL_LIGHT: MobilePalette = {
 
   remote: "#7a4dd1",
   remoteBg: "#ede2ff",
-  accent: "#2f9e6a",
+  accent: "#7c3aed", // canvas purple brand (was green #2f9e6a)
 };
 
 export const MOL_DARK: MobilePalette = {
-  bg: "#15140f",
-  surface: "#1d1c17",
-  surface2: "#22211c",
-  border: "rgba(255,250,240,0.08)",
-  divider: "rgba(255,250,240,0.06)",
-  text: "#f1eee5",
-  text2: "rgba(241,238,229,0.6)",
-  text3: "rgba(241,238,229,0.38)",
+  // Core — canvas @theme dark SSOT (near-black surfaces + bright ink).
+  bg: "#08080a",
+  surface: "#16161d",
+  surface2: "#1b1b23",
+  border: "#26262e",
+  divider: "#1b1b22",
+  text: "#ececf1",
+  text2: "#9b9baa",
+  text3: "#65656f",
 
-  green: "#3eb37c",
+  // green/online map to the canvas dark `good` (#34d399).
+  green: "#34d399",
   greenSoft: "#1f3a2c",
   greenInk: "#7fd3a8",
 
@@ -90,7 +105,7 @@ export const MOL_DARK: MobilePalette = {
 
   t4SoftCard: "#2a1f17",
 
-  online: "#3eb37c",
+  online: "#34d399",
   starting: "#e9b53b",
   degraded: "#d28a2a",
   failed: "#d65a3e",
@@ -99,7 +114,7 @@ export const MOL_DARK: MobilePalette = {
 
   remote: "#a38aff",
   remoteBg: "#2a1f44",
-  accent: "#3eb37c",
+  accent: "#a78bfa", // canvas dark purple brand (was green #3eb37c)
 };
 
 /**
