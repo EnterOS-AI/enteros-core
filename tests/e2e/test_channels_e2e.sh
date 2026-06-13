@@ -70,8 +70,10 @@ FAIL=0
 WORK_DIR="$(mktemp -d)"
 WS_TARGET=""
 WS_SIBLING=""
+WS_PARENT=""
 WS_TARGET_TOK=""
 WS_SIBLING_TOK=""
+WS_PARENT_TOK=""
 MOCK_PID=""
 
 ADMIN_BEARER="${MOLECULE_ADMIN_TOKEN:-${ADMIN_TOKEN:-}}"
@@ -116,8 +118,9 @@ cleanup() {
     wait "$MOCK_PID" 2>/dev/null
   fi
   # Hard-purge any workspaces we created so repeat runs are deterministic.
-  for pair in "$WS_TARGET|$WS_TARGET_TOK|e2e-chan-target" \
-              "$WS_SIBLING|$WS_SIBLING_TOK|e2e-chan-sibling"; do
+  for pair in "$WS_TARGET|$WS_TARGET_TOK|e2e-chan-target-$$" \
+              "$WS_SIBLING|$WS_SIBLING_TOK|e2e-chan-sibling-$$" \
+              "$WS_PARENT|$WS_PARENT_TOK|e2e-chan-parent-$$"; do
     local wid tok name
     wid="${pair%%|*}"; pair="${pair#*|}"
     tok="${pair%%|*}"; name="${pair#*|}"
@@ -252,10 +255,18 @@ PY
 json_field() { python3 -c "import sys,json; print(json.load(sys.stdin).get('$1',''))"; }
 
 create_external_ws() {
-  local name="$1" resp wid
+  local name="$1" parent="${2:-}" resp wid parent_field=""
+  # core#2697: when no explicit parent is given, the server now defaults a new
+  # workspace's parent to the org's platform-agent root, or — absent one — the
+  # SOLE plain root. This test needs target + sibling to be genuine SIBLINGS
+  # (so purging the target must NOT cascade to the sibling), so callers pass an
+  # explicit shared parent. Without it the 2nd no-parent create would nest
+  # under the 1st (the sole root) and the purge-over-reach assertion would
+  # spuriously fail on the new default-parent behavior.
+  [ -n "$parent" ] && parent_field=",\"parent_id\":\"$parent\""
   resp=$(curl -s -X POST "$BASE/workspaces" "${ADMIN_AUTH[@]}" \
     -H "Content-Type: application/json" \
-    -d "{\"name\":\"$name\",\"runtime\":\"external\",\"external\":true,\"tier\":1}")
+    -d "{\"name\":\"$name\",\"runtime\":\"external\",\"external\":true,\"tier\":1$parent_field}")
   wid=$(printf '%s' "$resp" | json_field id)
   if [ -z "$wid" ]; then
     echo "FATAL: could not create workspace $name: $resp" >&2
@@ -280,9 +291,14 @@ fi
 start_mock
 
 # ── workspaces ──────────────────────────────────────────────────────────
-IFS=$'\t' read -r WS_TARGET WS_TARGET_TOK < <(create_external_ws "e2e-chan-target-$$")
-IFS=$'\t' read -r WS_SIBLING WS_SIBLING_TOK < <(create_external_ws "e2e-chan-sibling-$$")
-echo "target=$WS_TARGET sibling=$WS_SIBLING"
+# Create a common parent first, then nest target + sibling under it as genuine
+# siblings. This keeps the purge-over-reach invariant (purging target must not
+# touch sibling) independent of the core#2697 default-parent behavior, which
+# would otherwise nest the 2nd no-parent create under the 1st (the sole root).
+IFS=$'\t' read -r WS_PARENT WS_PARENT_TOK < <(create_external_ws "e2e-chan-parent-$$")
+IFS=$'\t' read -r WS_TARGET WS_TARGET_TOK < <(create_external_ws "e2e-chan-target-$$" "$WS_PARENT")
+IFS=$'\t' read -r WS_SIBLING WS_SIBLING_TOK < <(create_external_ws "e2e-chan-sibling-$$" "$WS_PARENT")
+echo "parent=$WS_PARENT target=$WS_TARGET sibling=$WS_SIBLING"
 
 WS_AUTH=("${ADMIN_AUTH[@]}")
 [ -n "$WS_TARGET_TOK" ] && WS_AUTH=(-H "Authorization: Bearer $WS_TARGET_TOK")

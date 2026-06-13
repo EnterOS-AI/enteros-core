@@ -202,21 +202,50 @@ const conciergeDeclaredModel = "moonshot/kimi-k2.6"
 // sufficient and stable across restarts.
 var SelfHostedPlatformAgentID = uuid.NewSHA1(uuid.NameSpaceURL, []byte("molecule:self-hosted:platform-agent")).String()
 
-// platformRootWorkspaceID returns the org's single kind='platform' root
-// workspace id, or "" when there is none (pre-install / bootstrap) or more
-// than one (ambiguous — multi-org self-host DB; fail soft, change nothing).
-// Used by the workspace-create path to default parent_id (core#2609): a
-// workspace created without an explicit parent must land UNDER the org root,
-// not beside it — a parent_id-NULL orphan is outside the org subtree, so the
-// concierge cannot reach it over A2A ("cannot communicate per hierarchy
-// rules") and the canvas renders it depth-1 next to the root (#2601).
-func platformRootWorkspaceID(ctx context.Context) string {
-	rows, err := db.DB.QueryContext(ctx,
+// defaultCreateParentID resolves the parent a NEW workspace should nest under
+// when the caller didn't pass one. Order:
+//  1. The org's platform-agent root (kind='platform'), if exactly one — the
+//     intended home (core#2609).
+//  2. FALLBACK (core#2697): when the org has NO platform-agent (e.g. a tenant
+//     provisioned with only a plain root workspace — JRS had just its SEO Agent
+//     at parent_id NULL), nest under the SOLE non-removed root workspace if there
+//     is exactly one. Without this, new workspaces scatter at bare root as
+//     siblings of that root agent, and approval/discovery treat each NULL-parent
+//     row as its own org root, breaking hierarchy + delegation routing.
+//
+// The root fallback fires ONLY for the ZERO-platform case. When MULTIPLE
+// platform agents exist (ambiguous), we preserve the original fail-soft
+// behavior and return "" WITHOUT falling back to a root — picking a root there
+// would silently change the intended ambiguous-platform semantics (CR2 #2783).
+// Returns "" when: >1 platform; or 0 platform with 0/>1 roots — preserving
+// bootstrap/self-host multi-root behavior. The DURABLE fix is guaranteeing every
+// org has a platform-agent at provision; this is the safe runtime fallback.
+func defaultCreateParentID(ctx context.Context) string {
+	// Count platform-agent roots directly (LIMIT 2 distinguishes 0 / 1 / >1).
+	plats := queryUpToTwoIDs(ctx,
 		`SELECT id FROM workspaces WHERE COALESCE(kind, 'workspace') = 'platform' AND status != 'removed' LIMIT 2`)
+	if len(plats) == 1 {
+		return plats[0] // the platform-agent root (core#2609)
+	}
+	if len(plats) >= 2 {
+		return "" // ambiguous platform — fail soft, do NOT fall back to a root
+	}
+	// Exactly ZERO platform agents → nest under the sole plain root if unambiguous.
+	roots := queryUpToTwoIDs(ctx,
+		`SELECT id FROM workspaces WHERE parent_id IS NULL AND status != 'removed' LIMIT 2`)
+	if len(roots) == 1 {
+		return roots[0]
+	}
+	return ""
+}
+
+// queryUpToTwoIDs runs an id-selecting query (with its own LIMIT 2) and returns
+// up to two ids; on any error it returns an empty slice (fail-soft — defaulting
+// the parent is best-effort and must never fail the create).
+func queryUpToTwoIDs(ctx context.Context, query string) []string {
+	rows, err := db.DB.QueryContext(ctx, query)
 	if err != nil {
-		// Fail soft: defaulting the parent is best-effort; create must not
-		// fail because the root lookup hiccuped.
-		return ""
+		return nil
 	}
 	defer rows.Close()
 	ids := make([]string, 0, 2)
@@ -226,10 +255,7 @@ func platformRootWorkspaceID(ctx context.Context) string {
 			ids = append(ids, id)
 		}
 	}
-	if len(ids) == 1 {
-		return ids[0]
-	}
-	return ""
+	return ids
 }
 
 // defaultPlatformAgentName returns the display name for the org's platform

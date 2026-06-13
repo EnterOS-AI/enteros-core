@@ -587,8 +587,13 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 	// every delegation died with "cannot communicate per hierarchy rules".
 	// Best-effort: no platform root (or an ambiguous >1) leaves NULL intact,
 	// preserving bootstrap/self-host multi-root behavior.
+	//
+	// core#2697: defaultCreateParentID also falls back to the SOLE plain root
+	// workspace when the org has no platform-agent — so tenants provisioned
+	// without a concierge (e.g. JRS's lone SEO Agent) nest new workspaces under
+	// that root instead of scattering them as bare-root siblings.
 	if payload.ParentID == nil {
-		if rootID := platformRootWorkspaceID(ctx); rootID != "" {
+		if rootID := defaultCreateParentID(ctx); rootID != "" {
 			payload.ParentID = &rootID
 		}
 	}
