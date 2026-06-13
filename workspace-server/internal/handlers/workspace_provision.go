@@ -1163,6 +1163,28 @@ func applyPlatformManagedLLMEnv(ctx context.Context, envVars map[string]string, 
 		// workspace-key, reno's own oauth). Only the inherited operator-store
 		// channel is provider-gated.
 		stripNonMatchingGlobalOriginLLMCreds(envVars, globalKeys, runtime, effectiveModel, availableAuthEnv)
+
+		// core#2709: claude-code's Anthropic SDK adapter reads ANTHROPIC_AUTH_TOKEN
+		// and ANTHROPIC_BASE_URL. A BYOK MiniMax workspace arrives here with
+		// MINIMAX_API_KEY but no Anthropic-shaped creds, so the adapter 401s after
+		// restart. Project the provider's preferred auth token env and Anthropic
+		// base URL from the workspace's available provider credential.
+		if res.ResolvedMode == LLMBillingModeBYOK && runtimeUsesAnthropicNativeProxy(runtime) {
+			if provider, ok := providerFromRegistry(derefOrEmpty(res.ProviderSelection)); ok && provider.AuthTokenEnv != "" {
+				if _, hasToken := envVars[provider.AuthTokenEnv]; !hasToken {
+					for _, authEnv := range provider.AuthEnv {
+						if v := strings.TrimSpace(envVars[authEnv]); v != "" {
+							envVars[provider.AuthTokenEnv] = v
+							break
+						}
+					}
+				}
+				if _, hasBase := envVars["ANTHROPIC_BASE_URL"]; !hasBase && provider.BaseURLAnthropic != "" {
+					envVars["ANTHROPIC_BASE_URL"] = provider.BaseURLAnthropic
+				}
+			}
+		}
+
 		return platformLLMEnvResult{
 			ResolvedMode:     res.ResolvedMode,
 			HasUsableLLMCred: hasAnyPlatformManagedLLMKey(envVars),
@@ -1199,7 +1221,15 @@ func applyPlatformManagedLLMEnv(ctx context.Context, envVars map[string]string, 
 		envVars["OPENAI_BASE_URL"] = baseURL
 	}
 	if runtimeUsesAnthropicNativeProxy(runtime) && anthropicBaseURL != "" {
-		envVars["ANTHROPIC_API_KEY"] = token
+		// core#2709: use the resolved provider's auth_token_env instead of
+		// hardcoding ANTHROPIC_API_KEY. MiniMax's Anthropic-compatible endpoint
+		// expects ANTHROPIC_AUTH_TOKEN, while the platform proxy surface expects
+		// ANTHROPIC_API_KEY.
+		anthropicTokenEnv := "ANTHROPIC_API_KEY"
+		if provider, ok := providerFromRegistry(derefOrEmpty(res.ProviderSelection)); ok && provider.AuthTokenEnv != "" {
+			anthropicTokenEnv = provider.AuthTokenEnv
+		}
+		envVars[anthropicTokenEnv] = token
 		envVars["ANTHROPIC_BASE_URL"] = anthropicBaseURL
 		// CP#752 WS1b: claude-code uses the Anthropic CLI/SDK's
 		// ANTHROPIC_CUSTOM_HEADERS env var to attach per-workspace
@@ -1309,6 +1339,26 @@ func stripNonMatchingGlobalOriginLLMCreds(envVars map[string]string, globalKeys 
 
 func runtimeUsesAnthropicNativeProxy(runtime string) bool {
 	return strings.EqualFold(strings.TrimSpace(runtime), "claude-code")
+}
+
+// providerFromRegistry looks up a provider by name in the cached embedded
+// providers manifest. It returns the provider and true if found. Used by
+// applyPlatformManagedLLMEnv to project the adapter-specific auth env / base
+// URL (e.g. ANTHROPIC_AUTH_TOKEN for MiniMax on claude-code).
+func providerFromRegistry(name string) (providers.Provider, bool) {
+	if name == "" {
+		return providers.Provider{}, false
+	}
+	manifest, err := providerRegistry()
+	if err != nil || manifest == nil {
+		return providers.Provider{}, false
+	}
+	for _, p := range manifest.Providers {
+		if strings.EqualFold(p.Name, name) {
+			return p, true
+		}
+	}
+	return providers.Provider{}, false
 }
 
 func firstNonEmptyEnv(names ...string) string {

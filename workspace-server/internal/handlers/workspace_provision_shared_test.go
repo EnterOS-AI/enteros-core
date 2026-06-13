@@ -1100,6 +1100,32 @@ func TestApplyPlatformManagedLLMEnv_ClaudeCodeInjectsAnthropicProxyWhenNoWorkspa
 	}
 }
 
+// TestApplyPlatformManagedLLMEnv_BYOKMiniMaxProjectsAnthropicAdapterCreds is
+// core#2709: a claude-code workspace using BYOK MiniMax arrives with only
+// MINIMAX_API_KEY. The Anthropic SDK adapter needs ANTHROPIC_AUTH_TOKEN and
+// ANTHROPIC_BASE_URL to authenticate against api.minimax.io/anthropic.
+func TestApplyPlatformManagedLLMEnv_BYOKMiniMaxProjectsAnthropicAdapterCreds(t *testing.T) {
+	envVars := map[string]string{
+		"MINIMAX_API_KEY": "user-minimax-key",
+		"MODEL":           "MiniMax-M2.7",
+	}
+	res := applyPlatformManagedLLMEnv(context.Background(), envVars, "", "claude-code", "MiniMax-M2.7", nil)
+
+	if res.ResolvedMode != LLMBillingModeBYOK {
+		t.Fatalf("resolved mode = %q, want byok", res.ResolvedMode)
+	}
+	if got := envVars["ANTHROPIC_AUTH_TOKEN"]; got != "user-minimax-key" {
+		t.Fatalf("ANTHROPIC_AUTH_TOKEN = %q, want user-minimax-key", got)
+	}
+	if got := envVars["ANTHROPIC_BASE_URL"]; got != "https://api.minimax.io/anthropic/v1" {
+		t.Fatalf("ANTHROPIC_BASE_URL = %q, want https://api.minimax.io/anthropic/v1", got)
+	}
+	// The original MiniMax key is preserved too.
+	if got := envVars["MINIMAX_API_KEY"]; got != "user-minimax-key" {
+		t.Fatalf("MINIMAX_API_KEY was overwritten: %q", got)
+	}
+}
+
 func TestApplyPlatformManagedLLMEnv_ClaudeCodeStripsVendorBYOK(t *testing.T) {
 	t.Setenv("MOLECULE_LLM_BILLING_MODE", "platform_managed")
 	t.Setenv("MOLECULE_LLM_BASE_URL", "https://api.example.test/api/v1/internal/llm/openai/v1")
