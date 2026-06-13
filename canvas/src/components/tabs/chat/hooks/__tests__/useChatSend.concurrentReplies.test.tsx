@@ -299,4 +299,49 @@ describe("useChatSend — concurrent replies (core#2725)", () => {
     expect(result.current.sending).toBe(false);
     expect(result.current.error).toBeNull();
   });
+
+  it("does not finish an unrelated concurrent send on token-specific error completion (Researcher #11471)", async () => {
+    // Simulates the ACTIVITY_LOGGED status=error path with message_id: an
+    // error completion for send A must finish only A's token, leaving send B
+    // pending until its own completion arrives.
+    apiPostMock
+      .mockResolvedValueOnce({
+        status: "queued",
+        delivery_mode: "poll",
+        method: "message/send",
+      })
+      .mockResolvedValueOnce({
+        status: "queued",
+        delivery_mode: "poll",
+        method: "message/send",
+      });
+
+    const { result } = renderHook(() =>
+      useChatSend("ws-poll-two", { getHistoryMessages: () => [] }),
+    );
+
+    await act(async () => {
+      result.current.sendMessage("poll one");
+      await Promise.resolve();
+      result.current.sendMessage("poll two");
+      await Promise.resolve();
+    });
+    expect(result.current.sending).toBe(true);
+
+    const firstMessageId = (apiPostMock.mock.calls[0][1] as any).params.message.messageId;
+
+    // Error completion arrives ONLY for the first send.
+    act(() => {
+      result.current.finishSendByMessageId?.(firstMessageId);
+    });
+
+    // Second send is still pending-WS → spinner stays up.
+    expect(result.current.sending).toBe(true);
+
+    // Second send completes via legacy fallback.
+    act(() => {
+      result.current.releaseSendGuards();
+    });
+    expect(result.current.sending).toBe(false);
+  });
 });

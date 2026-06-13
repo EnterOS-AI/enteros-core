@@ -43,12 +43,10 @@ export function useChatSocket(
       callbacksRef.current.onAgentMessage?.(
         createMessage("agent", m.content, m.attachments),
       );
-    }
-    if (msgs.length > 0) {
-      // Pass the first consumed message's server-correlated messageId if
-      // available. The backend currently only populates this for A2A_RESPONSE
-      // events; AGENT_MESSAGE from tools leaves it undefined.
-      callbacksRef.current.onSendComplete?.(msgs[0].messageId);
+      // Each consumed message may correspond to a distinct completed send.
+      // Finish the specific token by messageId; legacy payloads without an
+      // id fall back to the coarse release path.
+      callbacksRef.current.onSendComplete?.(m.messageId);
     }
   }, [pendingAgentMsgs, workspaceId]);
 
@@ -105,7 +103,8 @@ export function useChatSocket(
             line = `⚠ ${targetName} error`;
             const own = (targetId || msg.workspace_id) === workspaceId;
             if (own) {
-              callbacksRef.current.onSendComplete?.();
+              const messageId = typeof p.message_id === "string" ? p.message_id : undefined;
+              callbacksRef.current.onSendComplete?.(messageId);
               // internal#212 — surface the actionable, secret-safe
               // failure reason (provider HTTP status + error code +
               // human-readable message) the ws-server now puts on
