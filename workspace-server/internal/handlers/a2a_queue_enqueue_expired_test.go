@@ -104,6 +104,104 @@ func TestEnqueueA2A_ExpiredRowDoesNotBlockFreshTick(t *testing.T) {
 	}
 }
 
+// TestEnqueueA2A_SystemCallerNormalizesToNULLCallerID: the synthetic
+// "system:restart-context" callerID (and all systemCallerPrefixes:
+// webhook:, system:, test:, channel:) must be normalized to NULL in
+// the a2a_queue.caller_id bind parameter, NOT persisted as the literal
+// string. The column is UUID-typed (migrations/042_a2a_queue.up.sql:21),
+// so a literal-string insert would trip a Postgres UUID cast failure
+// → EnqueueA2A returns an error → the busy-A2A path falls through to
+// a 503 instead of queueing. See #2694 RC #99248 + #2693 for the
+// broader #2680 lineage. Real workspace UUIDs are passed through
+// unchanged (regression-guard).
+//
+// This test pins the new normalization contract. Without it, the
+// restart-context → busy-queue path would have appeared "fixed" by my
+// prior activity-log nilIfEmpty PR but still trip the UUID cast on
+// the queue insert (a different column, same callerID-typed poison).
+func TestEnqueueA2A_SystemCallerNormalizesToNULLCallerID(t *testing.T) {
+	// All 4 systemCallerPrefixes from a2a_proxy.go:82-84 must normalize
+	// to NULL in the caller_id bind. We test with "system:restart-context"
+	// (the actual offender) and the other 3 prefixes for full coverage.
+	systemCallerIDs := []string{
+		"webhook:github",
+		"system:restart-context", // the actual offender
+		"system:other-svc",
+		"test:integration-1",
+		"channel:discord",
+	}
+
+	for _, sysCaller := range systemCallerIDs {
+		mock := setupTestDBForQueueTests(t)
+
+		// No expired row for this key → the supersede UPDATE affects 0 rows.
+		expectSupersedeExpired(mock, enqWorkspaceID, enqKey, 0)
+		// The insert proceeds. The mock's ExpectExec will validate the bind
+		// parameter shape: caller_id must be a nil interface{} (NOT the
+		// literal system-prefix string). sqlmock's default comparison
+		// distinguishes nil from non-nil, so passing the literal string
+		// would fail the expectationsWereMet check.
+		const freshID = "fresh-id-sys-caller"
+		expectInsert(mock, freshID)
+		expectDepth(mock, enqWorkspaceID, 1)
+
+		nextRun := time.Now().Add(30 * time.Second)
+		id, depth, err := EnqueueA2A(
+			context.Background(), enqWorkspaceID, sysCaller, PriorityTask,
+			[]byte(enqBody), enqMethod, enqKey, &nextRun,
+		)
+		if err != nil {
+			t.Errorf("system-caller %q: EnqueueA2A returned error: %v", sysCaller, err)
+		}
+		if id != freshID {
+			t.Errorf("system-caller %q: expected fresh id %q, got %q", sysCaller, freshID, id)
+		}
+		if depth != 1 {
+			t.Errorf("system-caller %q: expected depth 1, got %d", sysCaller, depth)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("system-caller %q: unmet sqlmock expectations: %v "+
+				"(the literal callerID must have been normalized to NULL in the bind)", sysCaller, err)
+		}
+	}
+}
+
+// TestEnqueueA2A_RealWorkspaceUUIDPreserved: regression-guard that a real
+// workspace UUID-shaped callerID still gets persisted as a non-nil
+// bind parameter (otherwise we'd hide real-workspace attribution in the
+// queue row). The fix in #2694 must NOT regress this case.
+func TestEnqueueA2A_RealWorkspaceUUIDPreserved(t *testing.T) {
+	mock := setupTestDBForQueueTests(t)
+
+	expectSupersedeExpired(mock, enqWorkspaceID, enqKey, 0)
+	const freshID = "fresh-id-real-uuid"
+	expectInsert(mock, freshID)
+	expectDepth(mock, enqWorkspaceID, 1)
+
+	// A real workspace UUID-shaped string (no system prefix). Per the
+	// isSystemCaller() rule, this should NOT be normalized to NULL —
+	// it must be passed through as the caller_id bind.
+	realUUID := "9a40df22-ba4b-3fc0-75c1-66dd6869ff25" // a real UUID-shaped string
+	nextRun := time.Now().Add(30 * time.Second)
+	id, depth, err := EnqueueA2A(
+		context.Background(), enqWorkspaceID, realUUID, PriorityTask,
+		[]byte(enqBody), enqMethod, enqKey, &nextRun,
+	)
+	if err != nil {
+		t.Fatalf("real workspace UUID: EnqueueA2A returned error: %v", err)
+	}
+	if id != freshID {
+		t.Errorf("real workspace UUID: expected fresh id %q, got %q", freshID, id)
+	}
+	if depth != 1 {
+		t.Errorf("real workspace UUID: expected depth 1, got %d", depth)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("real workspace UUID: unmet sqlmock expectations: %v "+
+			"(a real workspace UUID-shaped callerID must be passed through, not normalized to NULL)", err)
+	}
+}
+
 // TestEnqueueA2A_NoExpiredRow_NormalEnqueue: when no expired row exists the
 // supersede UPDATE simply affects zero rows and the enqueue proceeds normally.
 func TestEnqueueA2A_NoExpiredRow_NormalEnqueue(t *testing.T) {
