@@ -27,6 +27,57 @@ func TestNilIfEmpty_NonEmptyString(t *testing.T) {
 	}
 }
 
+// System-caller normalization (core#2680, fix/restart-context-callerid-normalize).
+// A synthetic caller like "system:restart-context" must not be
+// persisted into the UUID-typed activity_logs.source_id column;
+// that path is the only one that lets a workspace recover from the
+// post-restart wedge. Normalizing to NULL preserves the
+// "system caller" semantic via source_id IS NULL (the existing
+// canvas /activity?source=canvas filter) and lets the queue-fallback
+// path find the row by the durable message_id.
+
+func TestNilIfEmpty_SystemCallerPrefixes(t *testing.T) {
+	cases := []string{
+		"system:restart-context",
+		"webhook:github",
+		"test:lifecycle-1",
+		"channel:slack:C0123",
+	}
+	for _, c := range cases {
+		t.Run(c, func(t *testing.T) {
+			got := nilIfEmpty(c)
+			if got != nil {
+				t.Errorf("system caller %q: got %p (%q), want nil", c, got, *got)
+			}
+		})
+	}
+}
+
+func TestNilIfEmpty_RealWorkspaceUUIDStillPreserved(t *testing.T) {
+	// Regression guard: a real workspace UUID must pass through
+	// unchanged. The original #2694 RC closed because the fix
+	// accidentally collapsed real UUIDs to NULL; this case is the
+	// one that would have caught that.
+	cases := []string{
+		"ws-1",                          // op-style id
+		"01234567-89ab-cdef-0123-456789abcdef", // uuid
+		"agent-dev-b",                   // agent id (not a system prefix)
+		"canvas_user",                   // canvas user placeholder
+	}
+	for _, c := range cases {
+		t.Run(c, func(t *testing.T) {
+			got := nilIfEmpty(c)
+			if got == nil {
+				t.Errorf("real caller %q: got nil, want preserved pointer", c)
+				return
+			}
+			if *got != c {
+				t.Errorf("real caller %q: got %q, want preserved", c, *got)
+			}
+		})
+	}
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // extractToolTrace tests
 // ─────────────────────────────────────────────────────────────────────────────

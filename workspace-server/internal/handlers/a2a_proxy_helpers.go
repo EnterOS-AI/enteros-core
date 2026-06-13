@@ -438,8 +438,36 @@ func (h *WorkspaceHandler) logA2ASuccess(ctx context.Context, workspaceID, calle
 	}
 }
 
+// nilIfEmpty returns nil for an empty string OR a system-caller
+// identifier (matching isSystemCaller in a2a_proxy.go:85). System
+// callers are synthetic IDs like "system:restart-context" that
+// carry a non-UUID semantic; persisting them to a UUID-typed
+// activity_logs.source_id column trips a cast failure downstream
+// and (more importantly) poisons the column with a string that
+// doesn't JOIN to workspaces.id, breaking the queue-fallback path
+// that lets a workspace recover from the post-restart wedge
+// (core#2680).
+//
+// Origin: #2693 (closes this fix) and the original #2680 RCA. The
+// call sites this fixes (a2a_proxy_helpers.go:319, 347, 420, 835,
+// 937 — all `SourceID: nilIfEmpty(callerID)` in LogActivity
+// invocations) used to write the raw "system:restart-context"
+// string into source_id; the post-restart A2A dispatch then
+// crashes on the UUID cast AND the recovery path can't find the
+// row by source_id. Normalizing to NULL preserves the
+// "this row came from a system caller" semantic via source_id
+// IS NULL (the existing query path already filters on that —
+// see the canvas /activity?source=canvas filter, which key on
+// source_id IS NULL).
+//
+// Idempotent: the change is 1 line (the early-return is extended
+// to also fire on isSystemCaller). All 5 call sites pick up the
+// new behavior without a per-site change. Mirrors the queue-side
+// fix in #2696 (a2a_queue.caller_id) so BOTH persisted-caller
+// columns follow the same isSystemCaller() → NULL normalization —
+// single source of truth in a2a_proxy.go:84-91.
 func nilIfEmpty(s string) *string {
-	if s == "" {
+	if s == "" || isSystemCaller(s) {
 		return nil
 	}
 	return &s
