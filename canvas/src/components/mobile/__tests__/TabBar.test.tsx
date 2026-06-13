@@ -26,10 +26,10 @@ afterEach(() => {
 // ─── Render ───────────────────────────────────────────────────────────────────
 
 describe("TabBar — render", () => {
-  it("renders 4 tab buttons", () => {
+  it("renders 5 tab buttons (Agents/Inbox/Canvas/Comms/Me)", () => {
     render(<TabBar active="agents" onChange={vi.fn()} dark={false} />);
     const tabs = document.querySelectorAll('[role="tab"]');
-    expect(tabs.length).toBe(4);
+    expect(tabs.length).toBe(5);
   });
 
   it("outer div has role=tablist and aria-label", () => {
@@ -102,10 +102,8 @@ describe("TabBar — interaction", () => {
     expect(document.activeElement).toBe(agentsTab);
 
     fireEvent.keyDown(agentsTab, { key: "ArrowRight" });
-    // onChange called for the next tab
-    expect(onChange).toHaveBeenCalledWith("canvas");
-    // Focus should move to the canvas tab
-    // Use setTimeout(0) trick — after state update, focus moves
+    // onChange called for the next tab (Inbox is now 2nd, after Agents)
+    expect(onChange).toHaveBeenCalledWith("inbox");
   });
 
   it("ArrowLeft on first tab wraps to last", () => {
@@ -143,12 +141,13 @@ describe("TabBar — interaction", () => {
 
   it("ArrowDown also navigates (aliases ArrowRight)", () => {
     const onChange = vi.fn();
-    render(<TabBar active="canvas" onChange={onChange} dark={false} />);
+    render(<TabBar active="inbox" onChange={onChange} dark={false} />);
     const tabs = document.querySelectorAll('[role="tab"]');
-    const canvasTab = tabs[1] as HTMLElement;
-    canvasTab.focus();
+    // tabs[1] is now Inbox; ArrowDown moves to the next tab (Canvas).
+    const inboxTab = tabs[1] as HTMLElement;
+    inboxTab.focus();
 
-    fireEvent.keyDown(canvasTab, { key: "ArrowDown" });
-    expect(onChange).toHaveBeenCalledWith("comms");
+    fireEvent.keyDown(inboxTab, { key: "ArrowDown" });
+    expect(onChange).toHaveBeenCalledWith("canvas");
   });
 });
