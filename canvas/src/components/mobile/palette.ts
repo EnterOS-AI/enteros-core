@@ -56,10 +56,11 @@ export const MOL_LIGHT: MobilePalette = {
   divider: "#ebe8df",
   text: "#21201b",
   text2: "#5c5a52",
-  text3: "#6f6c62",
+  text3: "#656871",
 
-  // green/online map to the canvas `good` (#0c8a52); soft/ink tints derived.
-  green: "#0c8a52",
+  // green/online map to the canvas `good` (#2a6e44, AA-hardened — core#2742);
+  // soft/ink tints derived.
+  green: "#2a6e44",
   greenSoft: "#d9ebe0",
   greenInk: "#1f6a47",
 
@@ -70,7 +71,7 @@ export const MOL_LIGHT: MobilePalette = {
 
   t4SoftCard: "#f9ece0",
 
-  online: "#0c8a52",
+  online: "#2a6e44",
   starting: "#e9b53b",
   degraded: "#d28a2a",
   failed: "#c8472a",
