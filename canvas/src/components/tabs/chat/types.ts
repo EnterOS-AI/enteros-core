@@ -42,9 +42,16 @@ export function createMessage(
   content: string,
   attachments?: ChatAttachment[],
   toolTrace?: ToolTraceEntry[],
+  id?: string,
 ): ChatMessage {
   return Object.freeze({
-    id: crypto.randomUUID(),
+    // When the caller supplies an id (the sender threads the SAME id it
+    // puts in the A2A payload's messageId), the USER_MESSAGE broadcast
+    // echo — which carries that messageId — dedups against this
+    // optimistic bubble (core#2697). Without it the optimistic id and
+    // the payload messageId were two independent randomUUIDs, so the
+    // origin device rendered its own message twice.
+    id: id ?? crypto.randomUUID(),
     role,
     content,
     // Conditional spread avoids `attachments: undefined` appearing in

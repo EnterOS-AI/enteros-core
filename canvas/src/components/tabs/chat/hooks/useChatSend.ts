@@ -180,7 +180,12 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
         setUploading(false);
       }
 
-      const userMsg = createMessage("user", trimmed, uploaded);
+      // One id, threaded through both the optimistic bubble and the A2A
+      // payload's messageId, so the server's USER_MESSAGE broadcast echo
+      // dedups against this bubble on the origin device (core#2697 —
+      // otherwise the sender saw its own message twice).
+      const messageId = crypto.randomUUID();
+      const userMsg = createMessage("user", trimmed, uploaded, undefined, messageId);
       optionsRef.current.onUserMessage?.(userMsg);
 
       setSending(true);
@@ -219,7 +224,7 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
             params: {
               message: {
                 role: "user",
-                messageId: crypto.randomUUID(),
+                messageId,
                 parts,
               },
               metadata: { history },
