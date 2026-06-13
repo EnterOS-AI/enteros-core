@@ -57,6 +57,48 @@ func TestQueueRowAuthFields_PopulatedRow(t *testing.T) {
 	}
 }
 
+// TestQueueStatusByID_NULLResponseBodyScan verifies that a queue row with
+// a NULL response_body (the common case for queued items that haven't completed
+// and have no legacy delegation stitch) scans cleanly into QueueStatus without
+// panics or spurious values. core#2671 regression guard — the helper projects
+// response_body through a COALESCE/subquery and must tolerate NULL results.
+func TestQueueStatusByID_NULLResponseBodyScan(t *testing.T) {
+	mock := setupTestDB(t)
+	queueID := "queue-null-resp"
+
+	mock.ExpectQuery(`SELECT\s+q\.id,\s+q\.workspace_id,\s+q\.status,\s+q\.priority,\s+q\.attempts,\s+q\.last_error,\s+q\.enqueued_at::text,\s+q\.dispatched_at::text,\s+q\.completed_at::text,\s+q\.expires_at::text,\s+COALESCE\(\s+q\.response_body::text,\s+\(\s+SELECT al\.response_body::text\s+FROM activity_logs al\s+WHERE al\.method = 'delegate_result'\s+AND al\.target_id = q\.workspace_id\s+AND al\.workspace_id = q\.caller_id\s+AND al\.response_body->>'delegation_id' = \(q\.body->'params'->'message'->'metadata'->>'delegation_id'\)\s+LIMIT 1\s+\)\s+\)\s+FROM a2a_queue q\s+WHERE q\.id = \$1`).
+		WithArgs(queueID).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "workspace_id", "status", "priority", "attempts",
+			"last_error", "enqueued_at", "dispatched_at", "completed_at", "expires_at", "response_body",
+		}).AddRow(
+			queueID, "ws-target", "queued", 50, 0,
+			sql.NullString{Valid: false}, "2026-06-13T00:00:00Z",
+			sql.NullString{Valid: false}, sql.NullString{Valid: false},
+			sql.NullString{Valid: false}, nil,
+		))
+
+	qs, err := QueueStatusByID(context.Background(), queueID)
+	if err != nil {
+		t.Fatalf("QueueStatusByID returned error: %v", err)
+	}
+	if qs == nil {
+		t.Fatal("QueueStatusByID returned nil")
+	}
+	if qs.ID != queueID {
+		t.Errorf("id = %q, want %q", qs.ID, queueID)
+	}
+	if qs.Status != "queued" {
+		t.Errorf("status = %q, want queued", qs.Status)
+	}
+	if qs.ResponseBody != nil {
+		t.Errorf("ResponseBody = %v, want nil for NULL response_body", qs.ResponseBody)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
 // TestExtractExpiresInSeconds covers the JSON parser used at enqueue time
 // to honor a caller-specified TTL. Zero return = "no TTL" — caller leaves
 // expires_at NULL on the queue row.
