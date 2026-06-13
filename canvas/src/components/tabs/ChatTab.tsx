@@ -161,6 +161,16 @@ function MyChatPanel({ workspaceId, data }: Props) {
 
   const displayError = error || sendError;
 
+  // The agent is "thinking" when EITHER the user's own send is in flight
+  // (`sending`) OR the workspace heartbeat reports an in-flight task
+  // (`data.currentTask` — the agent is busy on its own work, e.g. a cron
+  // tick or a long task). The thinking indicator's visibility, the elapsed
+  // timer, and the live activity feed must ALL key off this same flag —
+  // otherwise (core#2697 regression) the indicator shows on currentTask but
+  // the timer/feed stay gated on `sending`, leaving "●●● 0s" frozen with no
+  // live tool calls while the agent is plainly working.
+  const thinking = sending || !!data.currentTask;
+
   useChatSocket(workspaceId, {
     onAgentMessage: (msg) => {
       history.setMessages((prev) => appendMessageDeduped(prev, msg));
@@ -185,7 +195,7 @@ function MyChatPanel({ workspaceId, data }: Props) {
       history.setMessages([]);
     },
     onActivityLog: (entry) => {
-      if (!sending) return;
+      if (!thinking) return;
       setActivityLog((prev) => appendActivityLine(prev, entry));
     },
     onRequestResponded: (p) => {
@@ -294,7 +304,7 @@ function MyChatPanel({ workspaceId, data }: Props) {
 
   // Elapsed timer while sending
   useEffect(() => {
-    if (!sending) {
+    if (!thinking) {
       setThinkingElapsed(0);
       return;
     }
@@ -303,19 +313,19 @@ function MyChatPanel({ workspaceId, data }: Props) {
       setThinkingElapsed(Math.floor((Date.now() - startTime) / 1000));
     }, 1000);
     return () => clearInterval(timer);
-  }, [sending]);
+  }, [thinking]);
 
   // Live activity feed seed — clears when not sending. The actual
   // event subscription is unconditional below (useSocketEvent at the
   // top level — hooks can't be conditional). The handler gates on
   // `sending` itself so it's a no-op when idle.
   useEffect(() => {
-    if (!sending) {
+    if (!thinking) {
       setActivityLog([]);
       return;
     }
     setActivityLog([`Processing with ${runtimeDisplayName(data.runtime)}...`]);
-  }, [sending, data.runtime]);
+  }, [thinking, data.runtime]);
 
   // IntersectionObserver on the top sentinel. Fires loadOlder() the
   // moment the user scrolls within 200px of the top. AbortController
@@ -730,7 +740,7 @@ function MyChatPanel({ workspaceId, data }: Props) {
            OR when the workspace heartbeat reports an in-flight task
            (covers the "agent is already busy when I open the tab" case
            without locking the Send button on a stale currentTask). */}
-        {(sending || !!data.currentTask) && (
+        {thinking && (
           <div className="flex justify-start">
             <div className="bg-surface-card/50 border border-line/30 rounded-lg px-3 py-2 max-w-[85%]">
               <div className="flex items-center gap-2 text-xs text-ink-mid">
