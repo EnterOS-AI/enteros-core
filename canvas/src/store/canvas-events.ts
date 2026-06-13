@@ -71,7 +71,7 @@ export function handleCanvasEvent(
     nodes: Node<WorkspaceNodeData>[];
     edges: Edge[];
     selectedNodeId: string | null;
-    agentMessages: Record<string, Array<{ id: string; content: string; timestamp: string; attachments?: Array<{ name: string; uri: string; mimeType?: string; size?: number }> }>>;
+    agentMessages: Record<string, Array<{ id: string; content: string; timestamp: string; messageId?: string; attachments?: Array<{ name: string; uri: string; mimeType?: string; size?: number }> }>>;
   },
   set: (partial: Record<string, unknown>) => void,
 ): void {
@@ -440,6 +440,7 @@ export function handleCanvasEvent(
       if (content || (attachments && attachments.length > 0)) {
         const { agentMessages } = get();
         const existing = agentMessages[msg.workspace_id] || [];
+        const messageId = typeof msg.payload.message_id === "string" ? msg.payload.message_id : undefined;
         set({
           agentMessages: {
             ...agentMessages,
@@ -449,6 +450,7 @@ export function handleCanvasEvent(
                 id: crypto.randomUUID(),
                 content,
                 timestamp: new Date().toISOString(),
+                messageId,
                 ...(attachments && attachments.length > 0 ? { attachments } : {}),
               },
             ],
@@ -496,6 +498,7 @@ export function handleCanvasEvent(
         if (text || attachments.length > 0) {
           const { agentMessages } = get();
           const existing = agentMessages[msg.workspace_id] || [];
+          const messageId = typeof msg.payload.message_id === "string" ? msg.payload.message_id : undefined;
           set({
             agentMessages: {
               ...agentMessages,
@@ -505,7 +508,8 @@ export function handleCanvasEvent(
                   id: crypto.randomUUID(),
                   content: text,
                   timestamp: new Date().toISOString(),
-                  attachments: attachments.length > 0 ? attachments : undefined,
+                  messageId,
+                  ...(attachments.length > 0 ? { attachments } : {}),
                 },
               ],
             },

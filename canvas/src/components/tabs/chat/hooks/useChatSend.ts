@@ -140,33 +140,141 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
   const [sending, setSending] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const sendInFlightRef = useRef(false);
+  // core#2725: concurrent sends. Track every dispatched request by a unique
+  // token so replies are routed to the correct send and the spinner stays up
+  // until the LAST pending send completes.
+  //
+  // Lifecycle:
+  //   - inFlightTokensRef:    POST dispatched, no terminal HTTP reply yet.
+  //   - pendingWSTokensRef:   HTTP replied in a "delivered, await WS" state
+  //                           (queued poll-mode, client timeout, CF 524). The
+  //                           spinner stays up; finishSendByMessageId or
+  //                           releaseSendGuards prunes these.
+  //   - messageIdToTokenRef:  Map from client-generated messageId to token.
+  //                           Lets WebSocket completion events finish the
+  //                           SPECIFIC send they belong to, avoiding cross-send
+  //                           contamination (CR2 #11466).
+  //   - wsCompletedTokensRef: Legacy fallback set for older ws-server builds
+  //                           that do not broadcast a messageId. When a
+  //                           completion arrives without an id we can only
+  //                           release one token safely: the oldest pending-WS
+  //                           token is finished immediately, and if nothing is
+  //                           pending the oldest in-flight token is marked
+  //                           WS-completed so its own late timeout/524/queued
+  //                           response can finish itself without re-pending
+  //                           forever (CR2 #11454, #11470). A completion event
+  //                           with a messageId always targets exactly that
+  //                           send's token (CR2 #11466).
+  //   - setupGuardRef:        brief synchronous guard so a double-click in the
+  //                           same tick dispatches only once. Released on the
+  //                           next microtask after the POST is fired, so
+  //                           distinct follow-up sends are never blocked.
+  const inFlightTokensRef = useRef<Set<number>>(new Set());
+  const pendingWSTokensRef = useRef<Set<number>>(new Set());
+  const wsCompletedTokensRef = useRef<Set<number>>(new Set());
+  const messageIdToTokenRef = useRef<Map<string, number>>(new Map());
   const sendingFromAPIRef = useRef(false);
-  const sendTokenRef = useRef(0);
+  const nextTokenRef = useRef(1);
+  const setupGuardRef = useRef(false);
   const optionsRef = useRef(options);
   optionsRef.current = options;
 
-  const releaseSendGuards = useCallback(() => {
-    setSending(false);
-    sendingFromAPIRef.current = false;
-    sendInFlightRef.current = false;
+  const syncSendingState = useCallback(() => {
+    const pending =
+      inFlightTokensRef.current.size > 0 || pendingWSTokensRef.current.size > 0;
+    setSending(pending);
+    sendingFromAPIRef.current = pending;
   }, []);
+
+  const finishSendToken = useCallback((token: number) => {
+    inFlightTokensRef.current.delete(token);
+    pendingWSTokensRef.current.delete(token);
+    wsCompletedTokensRef.current.delete(token);
+    // Clean up the messageId mapping (linear scan is fine: N is tiny).
+    for (const [mid, tok] of messageIdToTokenRef.current) {
+      if (tok === token) {
+        messageIdToTokenRef.current.delete(mid);
+        break;
+      }
+    }
+    syncSendingState();
+  }, [syncSendingState]);
+
+  const finishSendByMessageId = useCallback((messageId: string) => {
+    const token = messageIdToTokenRef.current.get(messageId);
+    if (token !== undefined) {
+      finishSendToken(token);
+    }
+  }, [finishSendToken]);
+
+  const releaseSendGuards = useCallback((messageId?: string) => {
+    // Token-aware completion: modern ws-server builds echo the client-generated
+    // messageId, so we can finish EXACTLY the send that completed (CR2 #11466,
+    // #11454). This never touches unrelated concurrent sends.
+    if (messageId) {
+      finishSendByMessageId(messageId);
+      return;
+    }
+
+    // Legacy fallback for older ws-server builds that do not broadcast a
+    // messageId. Without an id we cannot know which send completed, but we CAN
+    // avoid the global-guard bug: only the single oldest token is released, so
+    // one send's completion never marks another's guard/spinner as done (CR2
+    // #11454). Prefer finishing the oldest pending-WS token first (typical for
+    // poll-mode replies); if nothing is pending, mark the oldest in-flight
+    // token as WS-completed so its own late timeout/524/queued response can
+    // finish itself instead of re-pending forever (CR2 #11470).
+    let oldestPending: number | undefined;
+    for (const token of pendingWSTokensRef.current) {
+      if (oldestPending === undefined || token < oldestPending) {
+        oldestPending = token;
+      }
+    }
+    if (oldestPending !== undefined) {
+      finishSendToken(oldestPending);
+      return;
+    }
+
+    let oldestInFlight: number | undefined;
+    for (const token of inFlightTokensRef.current) {
+      if (oldestInFlight === undefined || token < oldestInFlight) {
+        oldestInFlight = token;
+      }
+    }
+    if (oldestInFlight !== undefined) {
+      wsCompletedTokensRef.current.add(oldestInFlight);
+      syncSendingState();
+    }
+  }, [finishSendByMessageId, finishSendToken, syncSendingState]);
+
+  const pendSendTokenForWS = useCallback((token: number) => {
+    // HTTP replied "queued / still alive via WS". Move from in-flight to the
+    // WS-pending set so the spinner persists until finishSendByMessageId or
+    // releaseSendGuards cleans it up. If the WS completion already fired for
+    // this token (legacy fallback path), finish immediately instead of
+    // re-pending forever (CR2 #11470).
+    if (wsCompletedTokensRef.current.has(token)) {
+      finishSendToken(token);
+      return;
+    }
+    inFlightTokensRef.current.delete(token);
+    pendingWSTokensRef.current.add(token);
+    syncSendingState();
+  }, [syncSendingState, finishSendToken]);
 
   const clearError = useCallback(() => setError(null), []);
 
   const sendMessage = useCallback(
     async (text: string, files: File[] = []) => {
       const trimmed = text.trim();
-      // Multi-send (core#2697 feature 2): do NOT block on `sending`. A user
-      // must be able to fire a follow-up while a prior message's agent reply
-      // is still pending — the server-side A2A queue is durable and orders
-      // them. `sendInFlightRef` is now only a brief re-entrancy guard for the
-      // synchronous setup (file upload + optimistic add + POST dispatch); it
-      // is released the moment the POST is FIRED (below), NOT held across the
-      // multi-minute reply wait, so the next send proceeds immediately.
+      // core#2725: do NOT block on an existing in-flight send. The server-side
+      // A2A queue is durable and orders multiple user messages. We only skip
+      // truly empty sends, concurrent uploads (the uploading flag is
+      // intentionally global: concurrent file uploads would race the single
+      // uploading UI state), and same-tick duplicate dispatch (brief guard).
       if ((!trimmed && files.length === 0) || uploading) return;
-      if (sendInFlightRef.current) return;
-      sendInFlightRef.current = true;
+      if (setupGuardRef.current) return;
+      setupGuardRef.current = true;
 
       let uploaded: ChatAttachment[] = [];
       if (files.length > 0) {
@@ -175,7 +283,7 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
           uploaded = await uploadChatFiles(workspaceId, files);
         } catch (e) {
           setUploading(false);
-          sendInFlightRef.current = false;
+          setupGuardRef.current = false;
           // Error-reason routing (CTO 2026-05-19 on forensic a99ab0a1:
           // "if its file size issue, should have error that instead
           // saying timeout which is wrong"). Each cause maps to ITS
@@ -195,10 +303,11 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
       const userMsg = createMessage("user", trimmed, uploaded, undefined, messageId);
       optionsRef.current.onUserMessage?.(userMsg);
 
-      setSending(true);
-      sendingFromAPIRef.current = true;
       setError(null);
-      const myToken = ++sendTokenRef.current;
+      const myToken = nextTokenRef.current++;
+      inFlightTokensRef.current.add(myToken);
+      messageIdToTokenRef.current.set(messageId, myToken);
+      syncSendingState();
 
       const history = optionsRef.current
         .getHistoryMessages()
@@ -255,15 +364,15 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
           { timeoutMs: 30 * 60 * 1000 },
         )
         .then((resp) => {
-          if (sendTokenRef.current !== myToken) return;
-          // Always process a synchronous push-mode 200 response. An earlier
-          // early-return on !sendingFromAPIRef.current dropped agent replies
-          // that arrived before the WebSocket path released the guards,
-          // leaving the user message visible with no Echo/reply bubble.
-          // releaseSendGuards is idempotent, and ChatTab deduplicates
-          // appendMessageDeduped within a short window, so processing here is
-          // safe even if a WS event already handled the reply.
-          //
+          // core#2725: only process the reply that belongs to this token.
+          // If the token is neither in-flight nor pending-WS, it has already
+          // been finished or superseded — drop it to avoid misrouted replies
+          // / duplicates.
+          if (
+            !inFlightTokensRef.current.has(myToken) &&
+            !pendingWSTokensRef.current.has(myToken)
+          ) return;
+
           // Task #227 — poll-mode (external/MCP workspace) queued-200
           // short-circuit. ws-server's `proxyA2ARequest` returns
           // `{status:"queued", delivery_mode:"poll", ...}` immediately
@@ -273,21 +382,23 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
           // the AGENT_MESSAGE WebSocket event after the agent's next
           // `wait_for_message` poll.
           //
-          // Keep the spinner up by deliberately NOT calling
-          // releaseSendGuards: the user-facing "thinking" state must
-          // persist until the AGENT_MESSAGE lands (handled by the
-          // useChatSocket `onAgentMessage`/`onSendComplete` path) or an
-          // explicit error fires (`onSendError` from an ACTIVITY_LOGGED
-          // status="error"). Don't synthesise an empty agent bubble.
-          //
-          // sendInFlightRef stays true intentionally — it's the dedup
-          // guard for the user typing two messages back-to-back; for
-          // poll mode the second message would race the first agent's
-          // reply, so blocking is correct (matches push-mode behaviour
-          // where `sending` blocks the textarea).
+          // Keep the spinner up by moving the token to the WS-pending set;
+          // releaseSendGuards will prune it when the AGENT_MESSAGE lands
+          // (handled by useChatSocket `onAgentMessage`/`onSendComplete`)
+          // or an explicit error fires (`onSendError` from an
+          // ACTIVITY_LOGGED status="error"). Don't synthesise an empty
+          // agent bubble.
           if (resp?.status === "queued") {
+            // If WS already completed for this token via the legacy fallback
+            // path, finish immediately instead of re-pending forever.
+            if (wsCompletedTokensRef.current.has(myToken)) {
+              finishSendToken(myToken);
+            } else {
+              pendSendTokenForWS(myToken);
+            }
             return;
           }
+
           const replyText = extractReplyText(resp);
           const replyFiles = extractFilesFromTask(
             (resp?.result ?? {}) as Record<string, unknown>,
@@ -297,14 +408,14 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
               createMessage("agent", replyText, replyFiles),
             );
           }
-          releaseSendGuards();
+          finishSendToken(myToken);
         })
         .catch((e: unknown) => {
-          if (sendTokenRef.current !== myToken) return;
-          if (!sendingFromAPIRef.current) {
-            sendInFlightRef.current = false;
-            return;
-          }
+          if (
+            !inFlightTokensRef.current.has(myToken) &&
+            !pendingWSTokensRef.current.has(myToken)
+          ) return;
+
           // CLIENT TIMEOUT ≠ UNREACHABLE (jrs-auto, 2026-06-09). The A2A
           // proxy holds this POST open for the agent's WHOLE turn; a long
           // tool-calling turn routinely outlives the 120s client budget.
@@ -336,20 +447,23 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
           const status = (e as { status?: number } | null)?.status;
           const isCloudflareHeldRequest = status === 524;
           if (isClientTimeout || isCloudflareHeldRequest) {
+            pendSendTokenForWS(myToken);
             return; // delivered; reply (and guard release) arrives via WS
           }
-          releaseSendGuards();
+
+          finishSendToken(myToken);
           setError("Failed to send message — agent may be unreachable");
         });
 
       // The POST is now in flight (the .then/.catch above run later, off the
-      // microtask queue). Release the re-entrancy guard immediately so the
-      // user can fire the NEXT message while this one's reply is still
-      // pending — true multi-send. `sending` stays true to keep the thinking
-      // indicator up; it no longer gates new sends.
-      sendInFlightRef.current = false;
+      // microtask queue). Release the setup guard on the next microtask so
+      // a same-tick double-click is still deduped, while distinct follow-up
+      // sends in subsequent ticks proceed normally.
+      Promise.resolve().then(() => {
+        setupGuardRef.current = false;
+      });
     },
-    [workspaceId, uploading],
+    [workspaceId, uploading, syncSendingState, finishSendToken, pendSendTokenForWS],
   );
 
   return {
@@ -359,6 +473,7 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
     error,
     clearError,
     releaseSendGuards,
+    finishSendByMessageId,
     sendingFromAPIRef,
   };
 }

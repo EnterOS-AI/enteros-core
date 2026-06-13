@@ -176,15 +176,10 @@ function MyChatPanel({ workspaceId, data }: Props) {
       history.setMessages((prev) => appendMessageDeduped(prev, msg));
       // A successful agent reply landing PROVES the agent is reachable, so
       // clear any stale "Failed to send — agent may be unreachable" banner
-      // (core#2697). Without this, a turn that errored-then-auto-healed (e.g.
-      // a context-overflow 400 retried on a fresh session) left the banner up
-      // even as the retry's reply arrived — the agent visibly working at "●●●
-      // Ns" with a red "unreachable" banner. Both error sources are cleared.
+      // (core#2697). The actual token cleanup happens in onSendComplete where
+      // we have the messageId for token-specific completion (#2759).
       setError(null);
       clearSendError();
-      if (sendingFromAPIRef.current) {
-        releaseSendGuards();
-      }
     },
     // Cross-device sync (core#2697). The origin device already
     // optimistically added the user message via onUserMessage;
@@ -214,18 +209,22 @@ function MyChatPanel({ workspaceId, data }: Props) {
         { ...createMessage("system", decisionChipText(decision, p.title)), decision },
       ]);
     },
-    onSendComplete: () => {
-      // Reply completed (poll-mode) → agent is reachable; clear any stale
-      // send-error banner (core#2697, same rationale as onAgentMessage).
+    onSendComplete: (messageId) => {
+      // Reply completed (poll-mode or push-mode) → agent is reachable; clear
+      // any stale send-error banner (core#2697). Pass the messageId down so
+      // useChatSend finishes the EXACT send that completed. Older ws-server
+      // builds that omit messageId fall back to releasing the single oldest
+      // pending/in-flight token instead of clearing every guard (CR2 #11454).
       setError(null);
       clearSendError();
-      if (sendingFromAPIRef.current) {
-        releaseSendGuards();
-      }
+      if (!sendingFromAPIRef.current) return;
+      releaseSendGuards(messageId);
     },
-    onSendError: (err) => {
+    onSendError: (err, messageId) => {
       if (sendingFromAPIRef.current) {
-        releaseSendGuards();
+        // Per-send release: when the error broadcast carries a messageId,
+        // finish only that token. Legacy no-id path releases one token.
+        releaseSendGuards(messageId);
         setError(err);
       }
     },

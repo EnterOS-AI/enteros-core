@@ -10,8 +10,11 @@ export interface UseChatSocketCallbacks {
   onUserMessageBroadcast?: (msg: ChatMessage) => void;
   onSessionReset?: () => void;
   onActivityLog?: (entry: string) => void;
-  onSendComplete?: () => void;
-  onSendError?: (error: string) => void;
+  /** Called when the server signals a send completed. `messageId` is the
+   *  client-generated message id from the A2A request, present for
+   *  canvas-originated sends when the server supports it. */
+  onSendComplete?: (messageId?: string) => void;
+  onSendError?: (error: string, messageId?: string) => void;
   /** A request the user (or an agent) responded to — drives the live
    *  decision chip in My Chat (core#2636). */
   onRequestResponded?: (p: {
@@ -40,9 +43,10 @@ export function useChatSocket(
       callbacksRef.current.onAgentMessage?.(
         createMessage("agent", m.content, m.attachments),
       );
-    }
-    if (msgs.length > 0) {
-      callbacksRef.current.onSendComplete?.();
+      // Each consumed message may correspond to a distinct completed send.
+      // Finish the specific token by messageId; legacy payloads without an
+      // id fall back to the coarse release path.
+      callbacksRef.current.onSendComplete?.(m.messageId);
     }
   }, [pendingAgentMsgs, workspaceId]);
 
@@ -72,7 +76,10 @@ export function useChatSocket(
             const sec = Math.round(durationMs / 1000);
             line = `← ${targetName} responded (${sec}s)`;
             const own = (targetId || msg.workspace_id) === workspaceId;
-            if (own) callbacksRef.current.onSendComplete?.();
+            if (own) {
+              const messageId = typeof p.message_id === "string" ? p.message_id : undefined;
+              callbacksRef.current.onSendComplete?.(messageId);
+            }
           } else if (status === "ok" && !durationMs) {
             // Task #227 — poll-mode (external/MCP workspace) queued receipt.
             // ws-server `logA2AReceiveQueued` writes a "received but no
@@ -96,7 +103,8 @@ export function useChatSocket(
             line = `⚠ ${targetName} error`;
             const own = (targetId || msg.workspace_id) === workspaceId;
             if (own) {
-              callbacksRef.current.onSendComplete?.();
+              const messageId = typeof p.message_id === "string" ? p.message_id : undefined;
+              callbacksRef.current.onSendComplete?.(messageId);
               // internal#212 — surface the actionable, secret-safe
               // failure reason (provider HTTP status + error code +
               // human-readable message) the ws-server now puts on
@@ -113,7 +121,7 @@ export function useChatSocket(
               const reason = detail
                 ? detail
                 : "Agent error (Exception) — see workspace logs for details.";
-              callbacksRef.current.onSendError?.(reason);
+              callbacksRef.current.onSendError?.(reason, messageId);
             }
           }
         } else if (type === "a2a_send") {
