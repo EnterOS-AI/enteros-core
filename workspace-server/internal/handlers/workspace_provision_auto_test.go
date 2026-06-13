@@ -870,11 +870,16 @@ func TestProvisionWorkspaceAutoSync_NoBackendMarksFailed(t *testing.T) {
 	}
 }
 
-// TestRunRestartCycle_UsesProvisionWorkspaceAutoSync — source-level pin
-// that runRestartCycle (Site 4) routes through the sync dispatcher
-// instead of inlining the if-cpProv-else dispatch. Phase 2 PR-B of
-// #2799 migrated this site.
-func TestRunRestartCycle_UsesProvisionWorkspaceAutoSync(t *testing.T) {
+// TestRunRestartCycle_UsesProvisionWorkspaceAutoSyncLocked — source-level
+// pin that runRestartCycle (Site 4) routes through the sync dispatcher
+// (now the *Locked variant) instead of inlining the if-cpProv-else
+// dispatch. Phase 2 PR-B of #2799 migrated this site; core#2771 split
+// the sync dispatcher into Locked + unlocked variants and runRestartCycle
+// must use the Locked one because the per-workspace provision gate is
+// already HELD at the call site (acquired at the top of runRestartCycle
+// for the Stop+Start serialization — re-locking a non-reentrant
+// sync.Mutex would deadlock).
+func TestRunRestartCycle_UsesProvisionWorkspaceAutoSyncLocked(t *testing.T) {
 	wd, err := os.Getwd()
 	if err != nil {
 		t.Fatalf("getwd: %v", err)
@@ -884,9 +889,9 @@ func TestRunRestartCycle_UsesProvisionWorkspaceAutoSync(t *testing.T) {
 		t.Fatalf("read workspace_restart.go: %v", err)
 	}
 	stripped := stripGoComments(src)
-	if !bytes.Contains(stripped, []byte("h.provisionWorkspaceAutoSync(workspaceID")) {
-		t.Errorf("workspace_restart.go must call provisionWorkspaceAutoSync from runRestartCycle — current code does not. " +
-			"Phase 2 PR-B of #2799 migrated this site; do not regress to the inline if-cpProv-else dispatch.")
+	if !bytes.Contains(stripped, []byte("h.provisionWorkspaceAutoSyncLocked(workspaceID")) {
+		t.Errorf("workspace_restart.go must call provisionWorkspaceAutoSyncLocked from runRestartCycle — current code does not. " +
+			"Phase 2 PR-B of #2799 migrated this site; core#2771 split the sync dispatcher into Locked + unlocked variants and the runRestartCycle path uses the Locked one because the per-workspace provision gate is already held at the call site.")
 	}
 }
 

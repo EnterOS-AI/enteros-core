@@ -952,6 +952,12 @@ func (h *WorkspaceHandler) runRestartCycle(workspaceID string) {
 	// safe to start another restart cycle without racing this one's
 	// Stop call.
 	//
+	// core#2771: call the *Locked* variant — the per-workspace provision
+	// gate is ALREADY held by this cycle (acquired at the top of
+	// runRestartCycle, held for the entire Stop+Start). Calling the
+	// unlocked variant would re-lock the same non-reentrant sync.Mutex
+	// and deadlock the programmatic restart path.
+	//
 	// Pre-2026-05-05 this site inlined the if-cpProv-else dispatch. On
 	// SaaS the cycle would NPE inside provisionWorkspace's
 	// `h.provisioner.VolumeHasFile` call, get swallowed by
@@ -960,7 +966,7 @@ func (h *WorkspaceHandler) runRestartCycle(workspaceID string) {
 	// status='provisioning' (the UPDATE above already ran). User-
 	// observable result on SaaS pre-fix: dead workspace → manual canvas
 	// restart was the only recovery path.
-	h.provisionWorkspaceAutoSync(workspaceID, "", nil, payload)
+	h.provisionWorkspaceAutoSyncLocked(workspaceID, "", nil, payload)
 	// sendRestartContext is a one-way notification to the new container; safe
 	// to fire async — the next restart cycle won't depend on it completing.
 	// Tracked via h.goAsync so tests can wait for it via h.asyncWG before

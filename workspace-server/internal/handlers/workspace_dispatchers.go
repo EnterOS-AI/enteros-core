@@ -103,6 +103,20 @@ func (h *WorkspaceHandler) DefaultTier() int {
 // post-routing-but-pre-Start (mint secrets, render template, etc.)
 // lives in prepareProvisionContext (shared by both per-backend
 // goroutines).
+//
+// core#2771: acquire the per-workspace provision gate (acquireRestartProvisionGate)
+// HERE, before the async dispatch, so a Create call and a subsequent
+// Restart call for the same ws-<id> cannot both reach provisioner.Start
+// concurrently. Pre-fix the gate was only acquired by RestartWorkspaceAutoOpts
+// — the Create call started provision OUTSIDE the gate, so a near-
+// immediate /restart from the E2E (or an operator) raced into Docker
+// name conflict + markProvisionFailed → workspace wedged "failed"
+// (run 360209/job 490401, local-provision stub). The gate is now shared
+// by both entry points: create acquires and Lock()s it synchronously
+// (brief HTTP-handler block if a restart is in flight, which is the
+// correct serialization), the async provision goroutine holds it via
+// defer Unlock, and the gate is also released on the no-backend
+// markProvisionFailed path (no goroutine to defer from).
 func (h *WorkspaceHandler) provisionWorkspaceAuto(workspaceID, templatePath string, configFiles map[string][]byte, payload models.CreateWorkspacePayload) bool {
 	provlog.Event("provision.start", map[string]any{
 		"workspace_id": workspaceID,
@@ -112,17 +126,33 @@ func (h *WorkspaceHandler) provisionWorkspaceAuto(workspaceID, templatePath stri
 		"template":     payload.Template,
 		"sync":         false,
 	})
+	// core#2771: gate acquisition MUST be synchronous (before the
+	// goroutine spawn) so a concurrent restart for the same ws-<id>
+	// blocks in the calling HTTP handler, NOT in the goroutine. If
+	// acquisition were inside the goroutine, the create provision
+	// could run to provisioner.Start unblocked while a restart was
+	// still holding the gate from a prior cycle.
+	gate := acquireRestartProvisionGate(workspaceID)
+	gate.Lock()
 	if h.cpProv != nil {
-		h.goAsync(func() { h.provisionWorkspaceCP(workspaceID, templatePath, configFiles, payload) })
+		h.goAsync(func() {
+			defer gate.Unlock()
+			h.provisionWorkspaceCP(workspaceID, templatePath, configFiles, payload)
+		})
 		return true
 	}
 	if h.provisioner != nil {
-		h.goAsync(func() { h.provisionWorkspace(workspaceID, templatePath, configFiles, payload) })
+		h.goAsync(func() {
+			defer gate.Unlock()
+			h.provisionWorkspace(workspaceID, templatePath, configFiles, payload)
+		})
 		return true
 	}
-	// No backend wired — mark failed so the workspace doesn't linger in
-	// 'provisioning' for the full 10-minute sweep window. 10s is enough
-	// for the broadcast + single UPDATE inside markProvisionFailed.
+	// No backend wired — release the gate immediately (no goroutine
+	// to defer Unlock from) and mark failed so the workspace doesn't
+	// linger in 'provisioning' for the full 10-minute sweep window. 10s
+	// is enough for the broadcast + single UPDATE inside markProvisionFailed.
+	gate.Unlock()
 	log.Printf("provisionWorkspaceAuto: no provisioning backend wired for %s — marking failed (cpProv=nil, provisioner=nil)", workspaceID)
 	failCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -146,7 +176,43 @@ func (h *WorkspaceHandler) provisionWorkspaceAuto(workspaceID, templatePath stri
 // provisionWorkspaceAuto. The only difference is the goroutine wrapper.
 // Keep these two helpers in sync — when one grows a new arm (third
 // backend, retry semantics), the other should too.
+//
+// core#2771: acquires the per-workspace provision gate before doing
+// the provision work, then calls the Locked variant. Callers that
+// ALREADY hold the gate (e.g. runRestartCycle) must call
+// provisionWorkspaceAutoSyncLocked directly to avoid re-locking the
+// non-reentrant sync.Mutex. Provisioning a workspace under an
+// already-held gate is the contract: a Create call that races a
+// Restart's gate is blocked at the create side, NOT inside the
+// Restart's hold window.
+//
+// Why a non-reentrant mutex: the sync.Map-of-locks pattern
+// (acquireRestartProvisionGate) returns the same *sync.Mutex for a
+// given workspaceID across the process lifetime. Re-entrancy would
+// require either a counter (extra complexity, easy to leak) or a
+// different mutex type. The split-function pattern is the
+// std-lib-native way to model "caller may or may not hold the gate"
+// without giving up non-reentrance.
 func (h *WorkspaceHandler) provisionWorkspaceAutoSync(workspaceID, templatePath string, configFiles map[string][]byte, payload models.CreateWorkspacePayload) bool {
+	gate := acquireRestartProvisionGate(workspaceID)
+	gate.Lock()
+	defer gate.Unlock()
+	return h.provisionWorkspaceAutoSyncLocked(workspaceID, templatePath, configFiles, payload)
+}
+
+// provisionWorkspaceAutoSyncLocked is the locked variant — ASSUMES
+// acquireRestartProvisionGate(workspaceID) is already HELD by the
+// caller. Does the actual provision work (or no-backend mark-failed).
+// Split from provisionWorkspaceAutoSync to support callers that
+// already hold the gate (e.g. runRestartCycle, which acquires the
+// gate at the top of the cycle and holds it across Stop+provision
+// to serialize concurrent programmatic RestartByID paths against
+// the manual HTTP Restart path).
+//
+// Do NOT call this from a context that does NOT hold the gate —
+// the synchronization guarantee (Create+Restart serialize) is
+// broken if this is called outside an outer Lock+defer-Unlock scope.
+func (h *WorkspaceHandler) provisionWorkspaceAutoSyncLocked(workspaceID, templatePath string, configFiles map[string][]byte, payload models.CreateWorkspacePayload) bool {
 	provlog.Event("provision.start", map[string]any{
 		"workspace_id": workspaceID,
 		"name":         payload.Name,
@@ -163,7 +229,7 @@ func (h *WorkspaceHandler) provisionWorkspaceAutoSync(workspaceID, templatePath 
 		h.provisionWorkspace(workspaceID, templatePath, configFiles, payload)
 		return true
 	}
-	log.Printf("provisionWorkspaceAutoSync: no provisioning backend wired for %s — marking failed (cpProv=nil, provisioner=nil)", workspaceID)
+	log.Printf("provisionWorkspaceAutoSyncLocked: no provisioning backend wired for %s — marking failed (cpProv=nil, provisioner=nil)", workspaceID)
 	failCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	h.markProvisionFailed(failCtx, workspaceID,
