@@ -7,7 +7,7 @@
  * NOTE: No @testing-library/jest-dom — use DOM APIs.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render } from "@testing-library/react";
+import { cleanup, fireEvent, render } from "@testing-library/react";
 import React from "react";
 
 import { MobileHome } from "../MobileHome";
@@ -241,5 +241,26 @@ describe("MobileHome — dark mode", () => {
     mockStoreState.nodes = [onlineAgent];
     const { container } = renderHome({ dark: true });
     expect(container.querySelector("h1")?.textContent).toBe("Agents");
+  });
+});
+
+describe("MobileHome — agent hierarchy tree (core#2697 Phase 2)", () => {
+  it("renders parent + child as tree rows; collapsing the parent hides the child", () => {
+    const parent = makeNode({ name: "Parent Agent" });
+    parent.id = "ws-parent";
+    const child = makeNode({ name: "Child Agent", parentId: "ws-parent" });
+    mockStoreState.nodes = [parent, child];
+    const { container, getByText, getByLabelText, queryByText } = renderHome();
+    expect(container.querySelectorAll('[data-testid="agent-tree-row"]').length).toBe(2);
+    expect(getByText("Child Agent")).toBeTruthy();
+    fireEvent.click(getByLabelText("Collapse"));
+    expect(queryByText("Child Agent")).toBeNull();
+  });
+
+  it("shows a queue-count badge when an agent has active tasks", () => {
+    const busy = makeNode({ name: "Busy Agent", activeTasks: 3 });
+    mockStoreState.nodes = [busy];
+    const { getByLabelText } = renderHome();
+    expect(getByLabelText("3 queued")).toBeTruthy();
   });
 });
