@@ -95,6 +95,20 @@ export function WorkspaceNode({ id, data }: NodeProps<Node<WorkspaceNodeData>>) 
       role="button"
       tabIndex={0}
       data-testid={`workspace-node-${data.name}`}
+      // core#2721: E2E staging-tabs.spec.ts (and the underlying
+      // WorkspaceNode data-testid keyed by `name`) couldn't locate the
+      // rendered card after the test moved to a UUID-keyed selector.
+      // `data-testid` collides on name (e.g. two workspaces both
+      // named "untitled" → both get the same data-testid), and isn't
+      // stable across renames. `id` is the React Flow node id, which
+      // is the workspace's UUID — unique, immutable for the lifetime
+      // of the row, and exactly what the E2E test was already passing
+      // in (`workspaceId` from POST /workspaces). Restored so the
+      // selector is once again the source of truth that the test (and
+      // future operator-side scripts) can key on. Test for the
+      // presence: canvas/src/components/__tests__/WorkspaceNode.test.tsx
+      // (TestWorkspaceNode_HasDataWorkspaceIdAttribute).
+      data-workspace-id={id}
       aria-label={
         isMisconfigured && configurationError
           ? `${data.name} workspace — agent not configured: ${configurationError}`
