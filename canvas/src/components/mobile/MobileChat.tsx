@@ -21,6 +21,7 @@ import {
 } from "@/components/tabs/chat/hooks";
 import { AgentCommsPanel } from "@/components/tabs/chat/AgentCommsPanel";
 import { AttachmentPreview } from "@/components/tabs/chat/AttachmentPreview";
+import { ToolTraceChips } from "@/components/tabs/chat/ToolTraceChips";
 import { downloadChatFile } from "@/components/tabs/chat/uploads";
 
 import { toMobileAgent } from "./components";
@@ -606,6 +607,14 @@ export function MobileChat({
                       ))}
                     </div>
                   )}
+                  {/* Tool-call chain — reuse the desktop ChatTab renderer
+                      verbatim (#231 parity). Collapsed-by-default chip list
+                      under the agent bubble; previously mobile dropped the
+                      whole chain so a long tool-using turn rendered as a bare
+                      reply with no visible work. */}
+                  {!mine && m.toolTrace && m.toolTrace.length > 0 && (
+                    <ToolTraceChips trace={m.toolTrace} />
+                  )}
                   <div
                     style={{
                       fontSize: 10,
@@ -641,7 +650,16 @@ export function MobileChat({
             <span>{thinkingElapsed}s</span>
           </div>
         )}
-        {sendError && (
+        {/* Suppress the "Failed to send — agent may be unreachable" banner
+            while the agent is demonstrably WORKING (sending in flight OR the
+            workspace reports an in-flight task). The effect above only clears
+            on the thinking TRANSITION, so a non-524 send error that lands
+            mid-turn (e.g. a long poll-mode turn whose POST times out at the CF
+            edge while currentTask is still set) would otherwise show the
+            banner UNDER the live "●●● 148s" timer — the exact contradiction in
+            the report. Gating render on !thinking closes that for good; once
+            the turn ends, a still-unresolved error surfaces normally. */}
+        {sendError && !thinking && (
           <div
             role="alert"
             style={{
