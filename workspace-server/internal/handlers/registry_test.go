@@ -174,7 +174,7 @@ func TestRegister_200_DoesNotLogFailure(t *testing.T) {
 		WithArgs("ws-ok").
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
 	mock.ExpectExec("INSERT INTO workspace_auth_tokens").
-		WithArgs("ws-ok", sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WithArgs("ws-ok", sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 
 	w := httptest.NewRecorder()
@@ -1266,7 +1266,7 @@ func TestRegister_C18_BootstrapAllowedNoTokens(t *testing.T) {
 
 	// IssueToken INSERT.
 	mock.ExpectExec("INSERT INTO workspace_auth_tokens").
-		WithArgs("ws-new", sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WithArgs("ws-new", sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 
 	w := httptest.NewRecorder()

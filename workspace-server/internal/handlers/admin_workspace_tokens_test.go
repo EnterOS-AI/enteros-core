@@ -21,7 +21,7 @@ func TestAdminWorkspaceTokenHandler_Create_HappyPath(t *testing.T) {
 		WithArgs(wsUUID1).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
 	mock.ExpectExec(`INSERT INTO workspace_auth_tokens`).
-		WithArgs(wsUUID1, sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WithArgs(wsUUID1, sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 
 	w := makeReq(t, NewAdminWorkspaceTokenHandler().Create, "POST",

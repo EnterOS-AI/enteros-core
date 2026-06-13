@@ -46,7 +46,7 @@ func TestRotateExternalCredentials_HappyPath(t *testing.T) {
 
 	// 3. Mint a fresh token
 	mock.ExpectExec(`INSERT INTO workspace_auth_tokens`).
-		WithArgs("ws-ext", sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WithArgs("ws-ext", sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	w := httptest.NewRecorder()
