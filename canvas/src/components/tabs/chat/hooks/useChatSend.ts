@@ -155,17 +155,18 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
   //                           SPECIFIC send they belong to, avoiding cross-send
   //                           contamination (CR2 #11466).
   //   - wsCompletedTokensRef: Legacy fallback set for older ws-server builds
-  //                           that do not broadcast a messageId. When a
-  //                           completion arrives without an id the fallback
-  //                           degrades to a bounded oldest-token policy: it
-  //                           finishes the oldest pending-WS token (typical for
-  //                           poll-mode replies) or marks the oldest in-flight
-  //                           token as WS-completed so its own late
-  //                           timeout/524/queued response can finish itself.
-  //                           This prevents indefinite spinner leaks while
-  //                           keeping mis-attribution bounded to one token per
-  //                           completion; the modern messageId-aware path is
-  //                           preferred and fully supports concurrency.
+  //                           that do not broadcast a messageId. Without an id
+  //                           we cannot safely correlate a completion to a
+  //                           specific send when multiple sends are concurrent,
+  //                           so the fallback is intentionally conservative:
+  //                           it only acts when exactly one token is tracked.
+  //                           With one tracked token it finishes a pending-WS
+  //                           token or marks an in-flight token as
+  //                           WS-completed so its own late timeout/524/queued
+  //                           response can finish itself. With multiple tracked
+  //                           tokens the no-id completion is ignored; the
+  //                           modern messageId-aware path above is required for
+  //                           concurrent sends and remains preferred.
   //   - setupGuardRef:        brief synchronous guard so a double-click in the
   //                           same tick dispatches only once. Released on the
   //                           next microtask after the POST is fired, so
@@ -218,41 +219,32 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
     }
 
     // Legacy fallback for older ws-server builds that do not broadcast a
-    // messageId. Without an id we cannot correlate a completion to a specific
-    // send when multiple sends are concurrent, so we degrade to a bounded
-    // oldest-token policy instead of doing nothing forever: each no-id
-    // completion finishes at most one token, preferring the oldest pending-WS
-    // token (typical for poll-mode replies) and otherwise marking the oldest
-    // in-flight token as WS-completed so its own late timeout/524/queued
-    // response can finish itself. This prevents indefinite spinner leaks while
-    // keeping mis-attribution bounded to one token per completion. The modern
-    // messageId-aware path above remains preferred and fully supports
-    // concurrency.
+    // messageId. Without an id we cannot safely correlate a completion to a
+    // specific send when multiple sends are concurrent, so we only act when
+    // exactly one token is tracked. In that single-token case we finish a
+    // pending-WS token or mark the in-flight token as WS-completed so its own
+    // late timeout/524/queued response can finish itself. If more than one
+    // token is tracked we do nothing and rely on the modern messageId-aware
+    // path above, which is the only safe way to route concurrent completions.
     const totalTracked =
       inFlightTokensRef.current.size + pendingWSTokensRef.current.size;
-    if (totalTracked === 0) {
+    if (totalTracked !== 1) {
       return;
     }
 
-    let oldestPending: number | undefined;
-    for (const token of pendingWSTokensRef.current) {
-      if (oldestPending === undefined || token < oldestPending) {
-        oldestPending = token;
-      }
-    }
-    if (oldestPending !== undefined) {
-      finishSendToken(oldestPending);
+    const onlyPending = pendingWSTokensRef.current.values().next().value as
+      | number
+      | undefined;
+    if (onlyPending !== undefined) {
+      finishSendToken(onlyPending);
       return;
     }
 
-    let oldestInFlight: number | undefined;
-    for (const token of inFlightTokensRef.current) {
-      if (oldestInFlight === undefined || token < oldestInFlight) {
-        oldestInFlight = token;
-      }
-    }
-    if (oldestInFlight !== undefined) {
-      wsCompletedTokensRef.current.add(oldestInFlight);
+    const onlyInFlight = inFlightTokensRef.current.values().next().value as
+      | number
+      | undefined;
+    if (onlyInFlight !== undefined) {
+      wsCompletedTokensRef.current.add(onlyInFlight);
       syncSendingState();
     }
   }, [finishSendByMessageId, finishSendToken, syncSendingState]);

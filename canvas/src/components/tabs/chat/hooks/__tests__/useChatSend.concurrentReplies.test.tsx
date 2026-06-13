@@ -346,104 +346,45 @@ describe("useChatSend — concurrent replies (core#2725)", () => {
   });
 });
 
-describe("useChatSend — per-send guard release and late-return ordering (CR2 #11454 / Researcher #11453)", () => {
-  it("legacy releaseSendGuards drains one pending-WS token per no-id completion (core#2775)", async () => {
-    // Older ws-server builds do not broadcast messageId. The fallback cannot
-    // correlate a completion to a specific send, but it must still make
-    // bounded progress: each no-id completion finishes the oldest pending-WS
-    // token so the spinner cannot leak if only legacy completions arrive.
-    apiPostMock
-      .mockResolvedValueOnce({
-        status: "queued",
-        delivery_mode: "poll",
-        method: "message/send",
-      })
-      .mockResolvedValueOnce({
-        status: "queued",
-        delivery_mode: "poll",
-        method: "message/send",
-      });
+describe("useChatSend — legacy no-messageId fallback is exact-one-token conservative (core#2775)", () => {
+  it("legacy releaseSendGuards() with no messageId still handles late timeout/524 for a single tracked token (CR2 #11470)", async () => {
+    const send = deferred();
+    apiPostMock.mockImplementationOnce(() => send.promise);
 
     const { result } = renderHook(() =>
-      useChatSend("ws-poll-two-legacy", { getHistoryMessages: () => [] }),
+      useChatSend("ws-legacy", { getHistoryMessages: () => [] }),
     );
 
     await act(async () => {
-      result.current.sendMessage("poll one");
-      await Promise.resolve();
-      result.current.sendMessage("poll two");
+      await result.current.sendMessage("long turn");
       await Promise.resolve();
     });
     expect(result.current.sending).toBe(true);
 
-    // First no-id completion drains the oldest pending token.
+    // WS completion arrives without a messageId (legacy path). Exactly one
+    // token is tracked, so the fallback marks it as WS-completed.
     act(() => {
       result.current.releaseSendGuards();
     });
     expect(result.current.sending).toBe(true);
 
-    // Second no-id completion drains the remaining pending token.
-    act(() => {
-      result.current.releaseSendGuards();
-    });
-    expect(result.current.sending).toBe(false);
-  });
-
-  it("legacy releaseSendGuards marks one in-flight token per no-id completion for late timeout/524 pruning (core#2775)", async () => {
-    const first = deferred();
-    const second = deferred();
-    apiPostMock
-      .mockImplementationOnce(() => first.promise)
-      .mockImplementationOnce(() => second.promise);
-
-    const { result } = renderHook(() =>
-      useChatSend("ws-push-two-legacy", { getHistoryMessages: () => [] }),
-    );
-
-    await act(async () => {
-      result.current.sendMessage("first");
-      await Promise.resolve();
-      result.current.sendMessage("second");
-      await Promise.resolve();
-    });
-    expect(result.current.sending).toBe(true);
-
-    // First no-id completion marks only the oldest in-flight token.
-    act(() => {
-      result.current.releaseSendGuards();
-    });
-    expect(result.current.sending).toBe(true);
-
-    // That token's late 524 is pruned instead of being moved to pending-WS.
-    const cfErr = Object.assign(new Error("cf 524"), { status: 524 });
-    await act(async () => {
-      first.reject(cfErr);
-      await Promise.resolve();
-    });
-    expect(result.current.sending).toBe(true);
-
-    // Second no-id completion marks the remaining in-flight token.
-    act(() => {
-      result.current.releaseSendGuards();
-    });
-    expect(result.current.sending).toBe(true);
-
-    // Its late timeout is also pruned.
+    // Late client timeout lands.
     const timeoutErr = new Error("signal timed out") as Error & { name: string };
     timeoutErr.name = "TimeoutError";
     await act(async () => {
-      second.reject(timeoutErr);
+      send.reject(timeoutErr);
       await Promise.resolve();
     });
+
     expect(result.current.sending).toBe(false);
     expect(result.current.error).toBeNull();
   });
 
-  it("two concurrent legacy no-messageId sends that both become pending-WS are fully drained (no spinner leak)", async () => {
-    // Regression for the stuck-spinner class: both sends enter the WS-pending
-    // state (queued/timeout/524) and the only completions available are legacy
-    // no-messageId events. The fallback must drain one token per event so the
-    // spinner eventually clears.
+  it("does not release any token when a no-messageId completion arrives while multiple tokens are tracked (CR2 #11466 regression)", async () => {
+    // This is the key safety property: without a messageId we cannot know
+    // which send completed, so we must not guess. Two concurrent sends are
+    // in-flight; a legacy no-id completion arrives out of order. Neither
+    // token should be finished or marked WS-completed.
     const first = deferred();
     const second = deferred();
     apiPostMock
@@ -451,7 +392,7 @@ describe("useChatSend — per-send guard release and late-return ordering (CR2 #
       .mockImplementationOnce(() => second.promise);
 
     const { result } = renderHook(() =>
-      useChatSend("ws-legacy-pending-drain", { getHistoryMessages: () => [] }),
+      useChatSend("ws-legacy-two-inflight", { getHistoryMessages: () => [] }),
     );
 
     await act(async () => {
@@ -462,7 +403,56 @@ describe("useChatSend — per-send guard release and late-return ordering (CR2 #
     });
     expect(result.current.sending).toBe(true);
 
-    // Both HTTP requests time out; they move to pending-WS.
+    // Out-of-order legacy completion arrives while both sends are tracked.
+    act(() => {
+      result.current.releaseSendGuards();
+    });
+
+    // Neither token should be touched: spinner still up and both HTTP requests
+    // are still pending.
+    expect(result.current.sending).toBe(true);
+
+    // First HTTP reply lands; it should still resolve normally via the
+    // messageId-aware path if one is provided, or move to pending-WS.
+    await act(async () => {
+      first.resolve({ result: { parts: [{ kind: "text", text: "reply-one" }] } });
+      await Promise.resolve();
+    });
+
+    // First send done, second still in-flight.
+    expect(result.current.sending).toBe(true);
+
+    await act(async () => {
+      second.resolve({ result: { parts: [{ kind: "text", text: "reply-two" }] } });
+      await Promise.resolve();
+    });
+
+    expect(result.current.sending).toBe(false);
+  });
+
+  it("does not release any token when two sends are pending-WS and a no-messageId completion arrives", async () => {
+    // Both sends entered the WS-pending state via timeout/524/queued. A legacy
+    // no-id completion must not drain one of them, because it could be the
+    // wrong one.
+    const first = deferred();
+    const second = deferred();
+    apiPostMock
+      .mockImplementationOnce(() => first.promise)
+      .mockImplementationOnce(() => second.promise);
+
+    const { result } = renderHook(() =>
+      useChatSend("ws-legacy-two-pending", { getHistoryMessages: () => [] }),
+    );
+
+    await act(async () => {
+      result.current.sendMessage("first");
+      await Promise.resolve();
+      result.current.sendMessage("second");
+      await Promise.resolve();
+    });
+    expect(result.current.sending).toBe(true);
+
+    // Both HTTP requests fail into pending-WS.
     const timeoutErr = new Error("signal timed out") as Error & { name: string };
     timeoutErr.name = "TimeoutError";
     await act(async () => {
@@ -472,14 +462,23 @@ describe("useChatSend — per-send guard release and late-return ordering (CR2 #
     });
     expect(result.current.sending).toBe(true);
 
-    // Only legacy no-id completions are available; two of them drain both.
+    // Legacy no-id completion is ignored because two tokens are pending.
     act(() => {
       result.current.releaseSendGuards();
     });
     expect(result.current.sending).toBe(true);
 
+    // The only safe resolution is a messageId-aware completion for each send.
+    const firstMessageId = (apiPostMock.mock.calls[0][1] as any).params.message.messageId;
+    const secondMessageId = (apiPostMock.mock.calls[1][1] as any).params.message.messageId;
+
     act(() => {
-      result.current.releaseSendGuards();
+      result.current.finishSendByMessageId?.(firstMessageId);
+    });
+    expect(result.current.sending).toBe(true);
+
+    act(() => {
+      result.current.finishSendByMessageId?.(secondMessageId);
     });
     expect(result.current.sending).toBe(false);
     expect(result.current.error).toBeNull();
