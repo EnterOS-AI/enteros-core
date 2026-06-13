@@ -75,4 +75,14 @@ describe("ChatTab — stale error banner clears on a successful reply (core#2697
     act(() => { captured.onSendComplete?.(); });
     expect(clearErrorSpy).toHaveBeenCalled();
   });
+
+  it("clears the 'unreachable' banner while the agent is THINKING (currentTask set), before any reply", () => {
+    // The reported bug: banner shown beside a live "●●● 102s" timer on a long
+    // poll-mode turn that hadn't replied yet. data.currentTask set => thinking
+    // => the agent is reachable => the unreachable banner must clear on its own.
+    const busy = { status: "online" as const, runtime: "claude-code", currentTask: "downloading assets" } as unknown as Parameters<typeof ChatTab>[0]["data"];
+    render(<ChatTab workspaceId="ws-thinking" data={busy} />);
+    // Mount with currentTask set => the thinking-clears-error effect fires.
+    expect(clearErrorSpy).toHaveBeenCalled();
+  });
 });
