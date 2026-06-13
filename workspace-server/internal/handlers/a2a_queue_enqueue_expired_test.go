@@ -50,15 +50,46 @@ func expectSupersedeExpired(mock sqlmock.Sqlmock, workspaceID, key string, rowsR
 
 // expectInsert registers the INSERT ... ON CONFLICT DO NOTHING RETURNING id.
 // newID is the id the insert returns (non-conflict / fresh enqueue path).
-func expectInsert(mock sqlmock.Sqlmock, newID string) {
+//
+// expectedCallerIDBind pins the exact bind value the test expects for
+// the caller_id column. Pass:
+//   - sqlmock.AnyArg() for "I don't care" (used by the existing tests
+//     that don't pin the caller_id shape — they're not regression-tests
+//     for the system-caller normalization, just for the canonical
+//     enqueue path).
+//   - nil (sqlmock's nil interface{}) for system-caller prefixes — pins
+//     that the literal "system:restart-context" (or any other
+//     systemCallerPrefixes entry) is normalized to NULL in the bind
+//     parameter, not persisted as the literal string. This is the
+//     regression-test shape for #2694 RC #99248 (the busy-A2A path
+//     that tripped a UUID cast failure on a2a_queue.caller_id).
+//   - the actual workspace UUID string — pins that a real workspace
+//     UUID-shaped callerID is passed through unchanged (not
+//     normalized to NULL — that would hide real-workspace
+//     attribution in the queue row).
+//
+// The two new tests (TestEnqueueA2A_SystemCallerNormalizesToNULLCallerID
+// + TestEnqueueA2A_RealWorkspaceUUIDPreserved) use this helper with
+// explicit bind expectations to pin the new normalization contract.
+func expectInsert(mock sqlmock.Sqlmock, newID string, expectedCallerIDBind interface{}) {
+	// Only pin the caller_id bind (position 2). The other 6 parameters are
+	// not the focus of the system-caller normalization test — use
+	// sqlmock.AnyArg() so the helper doesn't break when a test passes
+	// different values for workspace_id / key / expires_at (e.g.
+	// NoKey_SkipsSupersede passes enqKey="" which becomes nil at the
+	// SQL bind per the EnqueueA2A code's if-idempotencyKey!=""). The
+	// point of the test is to pin caller_id specifically, not the rest
+	// of the row.
 	mock.ExpectQuery(`
 		INSERT INTO a2a_queue (workspace_id, caller_id, priority, body, method, idempotency_key, expires_at)
 		VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7)
 		ON CONFLICT (workspace_id, idempotency_key)
 			WHERE idempotency_key IS NOT NULL AND status IN ('queued','dispatched')
-			DO NOTHING
+		DO NOTHING
 		RETURNING id
-	`).WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(newID))
+	`).
+		WithArgs(sqlmock.AnyArg(), expectedCallerIDBind, sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(newID))
 }
 
 // expectDepth registers the trailing queue-depth count query.
@@ -81,7 +112,7 @@ func TestEnqueueA2A_ExpiredRowDoesNotBlockFreshTick(t *testing.T) {
 	expectSupersedeExpired(mock, enqWorkspaceID, enqKey, 1)
 	// With the active set cleared, the insert proceeds (no conflict) → new id.
 	const freshID = "fresh-tick-id"
-	expectInsert(mock, freshID)
+	expectInsert(mock, freshID, nil)
 	expectDepth(mock, enqWorkspaceID, 1)
 
 	nextRun := time.Now().Add(30 * time.Second)
@@ -142,7 +173,7 @@ func TestEnqueueA2A_SystemCallerNormalizesToNULLCallerID(t *testing.T) {
 		// distinguishes nil from non-nil, so passing the literal string
 		// would fail the expectationsWereMet check.
 		const freshID = "fresh-id-sys-caller"
-		expectInsert(mock, freshID)
+		expectInsert(mock, freshID, nil)
 		expectDepth(mock, enqWorkspaceID, 1)
 
 		nextRun := time.Now().Add(30 * time.Second)
@@ -173,15 +204,18 @@ func TestEnqueueA2A_SystemCallerNormalizesToNULLCallerID(t *testing.T) {
 func TestEnqueueA2A_RealWorkspaceUUIDPreserved(t *testing.T) {
 	mock := setupTestDBForQueueTests(t)
 
-	expectSupersedeExpired(mock, enqWorkspaceID, enqKey, 0)
-	const freshID = "fresh-id-real-uuid"
-	expectInsert(mock, freshID)
-	expectDepth(mock, enqWorkspaceID, 1)
-
 	// A real workspace UUID-shaped string (no system prefix). Per the
 	// isSystemCaller() rule, this should NOT be normalized to NULL —
-	// it must be passed through as the caller_id bind.
+	// it must be passed through as the caller_id bind. Declared BEFORE
+	// the expectInsert call so the literal is in scope when sqlmock
+	// matches the bind parameter (the helper pins the exact value).
 	realUUID := "9a40df22-ba4b-3fc0-75c1-66dd6869ff25" // a real UUID-shaped string
+
+	expectSupersedeExpired(mock, enqWorkspaceID, enqKey, 0)
+	const freshID = "fresh-id-real-uuid"
+	expectInsert(mock, freshID, realUUID)
+	expectDepth(mock, enqWorkspaceID, 1)
+
 	nextRun := time.Now().Add(30 * time.Second)
 	id, depth, err := EnqueueA2A(
 		context.Background(), enqWorkspaceID, realUUID, PriorityTask,
@@ -209,7 +243,7 @@ func TestEnqueueA2A_NoExpiredRow_NormalEnqueue(t *testing.T) {
 
 	expectSupersedeExpired(mock, enqWorkspaceID, enqKey, 0) // nothing to retire
 	const newID = "new-id"
-	expectInsert(mock, newID)
+	expectInsert(mock, newID, nil)
 	expectDepth(mock, enqWorkspaceID, 2)
 
 	nextRun := time.Now().Add(30 * time.Second)
@@ -239,7 +273,7 @@ func TestEnqueueA2A_NoKey_SkipsSupersede(t *testing.T) {
 
 	// No expectSupersedeExpired — it must NOT be issued when key is empty.
 	const newID = "no-key-id"
-	expectInsert(mock, newID)
+	expectInsert(mock, newID, nil)
 	expectDepth(mock, enqWorkspaceID, 1)
 
 	id, _, err := EnqueueA2A(
