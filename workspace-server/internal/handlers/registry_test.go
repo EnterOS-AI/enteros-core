@@ -2582,6 +2582,173 @@ func TestRegister_Unauthenticated401DoesNotStamp(t *testing.T) {
 	}
 }
 
+// TestRegister_BootstrapRecovery_StaleBearerZeroLiveTokens (#2611): the
+// watchdog double-provision race produces a "loser" box that presents a
+// bearer that was just revoked by the winner's mint. RequireWorkspaceToken
+// must re-check HasAnyLiveToken after ValidateToken rejects the bearer:
+// if the workspace now has zero live tokens (the previously-valid token
+// was revoked in the gap), the request is allowed through as a fresh
+// bootstrap. The agent's next register call mints a new token.
+//
+// Without the re-check, the loser box gets a permanent 401 — no live
+// token to present, the workspace is dead, and the runtime's
+// 401-as-terminal posture wedges the workspace "online-but-braindead".
+func TestRegister_BootstrapRecovery_StaleBearerZeroLiveTokens(t *testing.T) {
+	// SaaS mode so the platform-tunnel hostname is allowed.
+	t.Setenv("MOLECULE_DEPLOY_MODE", "saas")
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewRegistryHandler(broadcaster)
+
+	// Sequence mirrors Register success path, with the core#2611 recovery
+	// moment between queries #1 and #1.5.
+	//
+	// 1. requireWorkspaceToken → first HasAnyLiveToken: count=1 (live token
+	//    exists at the moment of the check — the race hasn't fired yet).
+	mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM workspace_auth_tokens").
+		WithArgs("ws-reg-bootstrap-recovery").
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+
+	// 1.5. ValidateToken → lookupTokenByHash: ErrNoRows (the live token
+	//      was revoked between the first HasAnyLiveToken and the
+	//      ValidateToken — the double-provision race).
+	mock.ExpectQuery("SELECT t.id, t.workspace_id FROM workspace_auth_tokens t JOIN workspaces w").
+		WithArgs(sqlmock.AnyArg()).
+		WillReturnError(sql.ErrNoRows)
+
+	// 1.7. core#2611 re-check HasAnyLiveToken: count=0 (zero live tokens
+	//      now — the previously-valid token was revoked, so the presented
+	//      bearer is stale by definition). The recovery branch fires,
+	//      returns nil, and the handler proceeds to the upsert.
+	mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM workspace_auth_tokens").
+		WithArgs("ws-reg-bootstrap-recovery").
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+
+	// 2. resolveDeliveryMode (production selects delivery_mode AND runtime).
+	mock.ExpectQuery("SELECT delivery_mode, runtime FROM workspaces").
+		WithArgs("ws-reg-bootstrap-recovery").
+		WillReturnError(sql.ErrNoRows)
+
+	// 3. agent_card identity reconcile (best-effort; no row yet).
+	mock.ExpectQuery("SELECT name, role FROM workspaces").
+		WithArgs("ws-reg-bootstrap-recovery").
+		WillReturnError(sql.ErrNoRows)
+
+	// 4. Upsert workspace row.
+	mock.ExpectExec("INSERT INTO workspaces").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// 5. Read-back URL for the WORKSPACE_ONLINE broadcast (best-effort).
+	mock.ExpectQuery("SELECT url FROM workspaces").
+		WithArgs("ws-reg-bootstrap-recovery").
+		WillReturnError(sql.ErrNoRows)
+
+	// 6. IssueToken gate: no live tokens → mint.
+	mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM workspace_auth_tokens").
+		WithArgs("ws-reg-bootstrap-recovery").
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+	mock.ExpectExec("INSERT INTO workspace_auth_tokens").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// 7-8. Lazy-heal platform_inbound_secret.
+	mock.ExpectQuery("SELECT platform_inbound_secret FROM workspaces").
+		WithArgs("ws-reg-bootstrap-recovery").
+		WillReturnError(sql.ErrNoRows)
+	mock.ExpectExec("UPDATE workspaces SET platform_inbound_secret").
+		WithArgs(sqlmock.AnyArg(), "ws-reg-bootstrap-recovery").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// 9. Clear last_register_failure_at on success.
+	mock.ExpectExec("UPDATE workspaces SET last_register_failure_at = NULL").
+		WithArgs("ws-reg-bootstrap-recovery").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	// Include a stale bearer so the ValidateToken path is exercised (not
+	// the "missing bearer → 401" path).
+	body := `{"id":"ws-reg-bootstrap-recovery","url":"http://ws-reg-bootstrap-recovery.moleculesai.app/a2a","agent_card":{"name":"test"}}`
+	c.Request = httptest.NewRequest("POST", "/registry/register", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Request.Header.Set("Authorization", "Bearer stale-revoked-bearer-from-previous-incarnation")
+
+	handler.Register(c)
+
+	// The recovery branch should have re-opened bootstrap. The handler
+	// proceeds to the upsert and returns 200, NOT 401. This is the
+	// observable fix: the loser box now succeeds instead of wedging.
+	if w.Code != http.StatusOK {
+		t.Fatalf("core#2611 bootstrap-recovery should re-open bootstrap when zero live tokens, got %d: %s",
+			w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to parse response: %v", err)
+	}
+	if resp["status"] != "registered" {
+		t.Errorf("status = %v, want \"registered\"", resp["status"])
+	}
+	// The handler must have minted a fresh token in the recovery branch.
+	if _, ok := resp["auth_token"]; !ok {
+		t.Error("auth_token missing from response — recovery branch should have minted a new one")
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// TestRegister_BootstrapRecovery_StaleBearerLiveTokensRemains (#2611
+// hardening): the recovery branch must NOT fire when the workspace STILL
+// has live tokens after the bearer validation fails. A stolen or
+// misconfigured bearer (live tokens present, presented bearer invalid)
+// must still 401 — the re-check only opens bootstrap when the live
+// token set is genuinely empty, never when one is still there.
+func TestRegister_BootstrapRecovery_StaleBearerLiveTokensRemains(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewRegistryHandler(broadcaster)
+
+	// 1. requireWorkspaceToken → first HasAnyLiveToken: count=1.
+	mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM workspace_auth_tokens").
+		WithArgs("ws-reg-no-recovery").
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+
+	// 1.5. ValidateToken → lookupTokenByHash: ErrNoRows (the presented
+	//      bearer is wrong / stale).
+	mock.ExpectQuery("SELECT t.id, t.workspace_id FROM workspace_auth_tokens t JOIN workspaces w").
+		WithArgs(sqlmock.AnyArg()).
+		WillReturnError(sql.ErrNoRows)
+
+	// 1.7. Re-check HasAnyLiveToken: count=1 (live tokens STILL exist).
+	//      The recovery branch must NOT fire — this is the C18 hardening:
+	//      a stolen/rotated/misconfigured bearer is still 401, not
+	//      silently re-bootstrapped.
+	mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM workspace_auth_tokens").
+		WithArgs("ws-reg-no-recovery").
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	body := `{"id":"ws-reg-no-recovery","url":"http://example.com","agent_card":{"name":"test"}}`
+	c.Request = httptest.NewRequest("POST", "/registry/register", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Request.Header.Set("Authorization", "Bearer wrong-bearer-but-live-tokens-exist")
+
+	handler.Register(c)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("stale bearer with live tokens still present MUST 401 (C18 hardening), got %d: %s",
+			w.Code, w.Body.String())
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
 // TestRegister_SuccessClearsLastRegisterFailure (#2530): a successful register
 // must clear last_register_failure_at so heartbeat can recover to online.
 func TestRegister_SuccessClearsLastRegisterFailure(t *testing.T) {
