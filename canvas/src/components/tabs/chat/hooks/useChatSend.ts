@@ -322,7 +322,17 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
           const isClientTimeout =
             e !== null && typeof e === "object" &&
             "name" in e && (e as { name: unknown }).name === "TimeoutError";
-          if (isClientTimeout) {
+          // CLOUDFLARE EDGE TIMEOUT ≠ UNREACHABLE (jrs-auto, 2026-06-13). The
+          // canvas→agent A2A POST is held open for the whole turn; a turn that
+          // runs longer than Cloudflare's ~100s edge limit gets a 524 (also
+          // 522/504) from CF — NOT from a dead agent. The agent is still
+          // working (visible in the activity feed) and its reply arrives via
+          // the AGENT_MESSAGE WebSocket event, exactly like the client-timeout
+          // case above. Treat these gateway timeouts the same: keep the
+          // thinking state, don't flash "agent may be unreachable".
+          const status = (e as { status?: number } | null)?.status;
+          const isGatewayTimeout = status === 524 || status === 522 || status === 504;
+          if (isClientTimeout || isGatewayTimeout) {
             return; // delivered; reply (and guard release) arrives via WS
           }
           releaseSendGuards();

@@ -82,4 +82,22 @@ describe("useChatSend — multi-send (core#2697 feature 2)", () => {
     expect(onUserMessage).not.toHaveBeenCalled();
     expect(apiPostMock).not.toHaveBeenCalled();
   });
+  it("treats a Cloudflare 524 gateway timeout as 'still processing' (no unreachable banner)", async () => {
+    // A long turn outlives CF's ~100s edge limit → api.post throws an Error
+    // with .status=524. The agent is still working; reply arrives via WS.
+    const err = Object.assign(new Error("API POST /workspaces/ws-1/a2a: 524 "), { status: 524 });
+    apiPostMock.mockRejectedValueOnce(err);
+    const onUserMessage = vi.fn();
+    const { result } = renderHook(() =>
+      useChatSend("ws-1", { getHistoryMessages: () => [], onUserMessage }),
+    );
+    await act(async () => {
+      await result.current.sendMessage("long migrate task");
+      await Promise.resolve(); await Promise.resolve();
+    });
+    // Spinner stays (sending true), NO error banner.
+    expect(result.current.sending).toBe(true);
+    expect(result.current.error).toBeNull();
+  });
+
 });

@@ -167,7 +167,12 @@ async function request<T>(
         if (err instanceof PlatformUnavailableError) throw err;
       }
     }
-    throw new Error(`API ${method} ${path}: ${res.status} ${text}`);
+    const apiErr = new Error(`API ${method} ${path}: ${res.status} ${text}`);
+    // Attach the HTTP status so callers can branch without parsing the
+    // message (e.g. useChatSend treats a Cloudflare 524/522/504 on a held
+    // long A2A turn as "still processing", not "agent unreachable").
+    (apiErr as Error & { status?: number }).status = res.status;
+    throw apiErr;
   }
   return res.json();
 }
