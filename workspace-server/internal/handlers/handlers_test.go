@@ -1060,6 +1060,11 @@ done:
 // (pre-fix behaviour) and the regression would slip in unnoticed.
 
 func TestParseIdleTimeoutEnv(t *testing.T) {
+	// core#2723: the default is the deployable safety margin for long
+	// blocking tool calls that stall the runtime heartbeat (raised 5m→30m).
+	if defaultIdleTimeoutDuration != 30*time.Minute {
+		t.Errorf("default idle timeout = %v, want 30m (core#2723)", defaultIdleTimeoutDuration)
+	}
 	cases := []struct {
 		name string
 		in   string
@@ -1067,6 +1072,7 @@ func TestParseIdleTimeoutEnv(t *testing.T) {
 	}{
 		{"empty falls back to default", "", defaultIdleTimeoutDuration},
 		{"valid positive integer parses to seconds", "120", 120 * time.Second},
+		{"longer override honored (30m)", "1800", 1800 * time.Second},
 		{"valid integer at minimum (1) is accepted", "1", 1 * time.Second},
 		{"non-numeric falls back to default", "foo", defaultIdleTimeoutDuration},
 		{"negative falls back to default", "-30", defaultIdleTimeoutDuration},
