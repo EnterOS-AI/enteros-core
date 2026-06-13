@@ -834,7 +834,12 @@ export function MobileChat({
           <button
             type="button"
             onClick={send}
-            disabled={(!draft.trim() && pendingFiles.length === 0) || !reachable || sending || uploading}
+            // Multi-send (core#2726): the tap button is mobile's PRIMARY send
+            // affordance, so it must NOT disable while `sending` — otherwise a
+            // follow-up message can't be tapped during an in-flight turn (CR2
+            // #2762). Gate only on empty input / unreachable / uploading; the
+            // hook handles concurrent sends.
+            disabled={(!draft.trim() && pendingFiles.length === 0) || !reachable || uploading}
             aria-label="Send"
             className="focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-100 dark:focus-visible:ring-offset-zinc-900"
             style={{
@@ -842,15 +847,15 @@ export function MobileChat({
               height: 36,
               borderRadius: 999,
               border: "none",
-              cursor: (draft.trim() || pendingFiles.length === 0) && !sending && !uploading ? "pointer" : "not-allowed",
+              cursor: (draft.trim() || pendingFiles.length === 0) && !uploading ? "pointer" : "not-allowed",
               flexShrink: 0,
               background:
-                (draft.trim() || pendingFiles.length > 0) && reachable && !sending && !uploading
+                (draft.trim() || pendingFiles.length > 0) && reachable && !uploading
                   ? p.accent
                   : dark
                     ? "#2a2823"
                     : "#ece9e0",
-              color: (draft.trim() || pendingFiles.length > 0) && reachable && !sending && !uploading ? "#fff" : p.text3,
+              color: (draft.trim() || pendingFiles.length > 0) && reachable && !uploading ? "#fff" : p.text3,
               display: "flex",
               alignItems: "center",
               justifyContent: "center",
