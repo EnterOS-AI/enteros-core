@@ -12,7 +12,7 @@
  * vi.resetModules() in afterEach undoes the mocks for other files.
  */
 import React from "react";
-import { render, screen, fireEvent, cleanup, act } from "@testing-library/react";
+import { render, screen, fireEvent, cleanup, act, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { RequestsInbox, type RequestRow } from "../RequestsInbox";
 import { showToast } from "@/components/Toaster";
@@ -182,6 +182,65 @@ describe("RequestsInbox — More Info thread", () => {
     await act(async () => { fireEvent.click(screen.getByRole("button", { name: /more info/i })); });
     const send = screen.getByTestId("more-info-send") as HTMLButtonElement;
     expect(send.disabled).toBe(true);
+  });
+});
+
+describe("RequestsInbox — tab-switch wrong-action race (core#2766)", () => {
+  it("clears stale rows immediately on kind switch before the new fetch resolves", async () => {
+    mockApiGet.mockResolvedValue([approvalRow("a1")]);
+    const { rerender } = render(<RequestsInbox kind="approval" />);
+    await waitFor(() =>
+      expect(screen.getByText("Delete production volume")).toBeTruthy(),
+    );
+    expect(screen.getByRole("button", { name: /approve/i })).toBeTruthy();
+
+    // Switch to the Tasks tab with a fetch that never resolves in this test.
+    mockApiGet.mockImplementation(() => new Promise(() => {}));
+    rerender(<RequestsInbox kind="task" />);
+
+    // The stale approval row must be gone instantly; otherwise the user could
+    // see approval cards under the Tasks tab and the wrong primary action.
+    expect(screen.queryByText("Delete production volume")).toBeNull();
+    expect(screen.queryByTestId("request-item")).toBeNull();
+    expect(screen.queryByRole("button", { name: /approve/i })).toBeNull();
+  });
+
+  it("ignores a stale approval fetch that resolves after switching to Tasks", async () => {
+    let resolveApproval: (value: RequestRow[]) => void = () => {};
+    mockApiGet.mockImplementation((path: string) => {
+      if (path === "/requests/pending?kind=approval") {
+        return new Promise<RequestRow[]>((res) => {
+          resolveApproval = res;
+        });
+      }
+      return Promise.resolve([]);
+    });
+
+    const { rerender } = render(<RequestsInbox kind="approval" />);
+    // The approval fetch is in flight but has not resolved yet.
+    expect(screen.queryByText("Delete production volume")).toBeNull();
+
+    // Switch to Tasks before the approval response lands.
+    rerender(<RequestsInbox kind="task" />);
+
+    // The old approval response finally arrives; it must be ignored.
+    await act(async () => {
+      resolveApproval([approvalRow("a1")]);
+    });
+    expect(screen.queryByText("Delete production volume")).toBeNull();
+    expect(screen.queryByTestId("request-item")).toBeNull();
+    expect(screen.queryByRole("button", { name: /approve/i })).toBeNull();
+  });
+
+  it("derives action buttons from row.kind, not the selected tab", async () => {
+    // Defensive: even if a mismatched row somehow reaches the list, its action
+    // must be driven by row.kind so an approval can never be actioned as "done".
+    mockApiGet.mockResolvedValue([approvalRow("a1")]);
+    await act(async () => { render(<RequestsInbox kind="task" />); });
+
+    expect(screen.queryByRole("button", { name: /done/i })).toBeNull();
+    expect(screen.getByRole("button", { name: /approve/i })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /reject/i })).toBeTruthy();
   });
 });
 
