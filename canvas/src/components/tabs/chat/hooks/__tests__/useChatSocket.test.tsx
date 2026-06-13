@@ -16,13 +16,18 @@ vi.mock("@/hooks/useSocketEvent", () => ({
 // useCanvasStore.getState().nodes for peer name resolution and reads
 // agentMessages via the selector form. Support both.
 vi.mock("@/store/canvas", () => {
+  const mockAgentMessages: Record<string, unknown[]> = {};
   const state = {
     nodes: [
       { id: "ws-self", data: { name: "Self" } },
       { id: "ws-peer", data: { name: "Peer Agent" } },
     ],
-    agentMessages: {} as Record<string, unknown[]>,
-    consumeAgentMessages: () => [],
+    agentMessages: mockAgentMessages,
+    consumeAgentMessages: (workspaceId: string) => {
+      const msgs = mockAgentMessages[workspaceId] ?? [];
+      mockAgentMessages[workspaceId] = [];
+      return msgs;
+    },
   };
   const hook = (selector?: (s: typeof state) => unknown) =>
     selector ? selector(state) : state;
@@ -31,9 +36,18 @@ vi.mock("@/store/canvas", () => {
 });
 
 import { useChatSocket } from "../useChatSocket";
+import { useCanvasStore } from "@/store/canvas";
+
+function getMockAgentMessages(): Record<string, unknown[]> {
+  return useCanvasStore.getState().agentMessages as Record<string, unknown[]>;
+}
 
 beforeEach(() => {
   capturedHandler = null;
+  const msgs = getMockAgentMessages();
+  for (const key of Object.keys(msgs)) {
+    delete msgs[key];
+  }
 });
 
 afterEach(() => {
@@ -207,5 +221,89 @@ describe("useChatSocket — surface error_detail to onSendError (internal#212)",
       );
     });
     expect(onSendError).not.toHaveBeenCalled();
+  });
+});
+
+describe("useChatSocket — token-specific completion on all paths (CR2 #11466 / Researcher #11471)", () => {
+  it("passes message_id through the ACTIVITY_LOGGED error branch so onSendComplete/error are token-specific", () => {
+    const onSendComplete = vi.fn();
+    const onSendError = vi.fn();
+    renderHook(() =>
+      useChatSocket("ws-self", {
+        onSendComplete,
+        onSendError,
+      }),
+    );
+
+    act(() => {
+      capturedHandler!({
+        event: "ACTIVITY_LOGGED",
+        workspace_id: "ws-self",
+        payload: {
+          activity_type: "a2a_receive",
+          method: "message/send",
+          status: "error",
+          target_id: "ws-self",
+          duration_ms: 1500,
+          message_id: "msg-a",
+          error_detail: "Provider 503",
+        },
+        timestamp: "2026-05-18T00:00:00Z",
+      });
+    });
+
+    expect(onSendComplete).toHaveBeenCalledTimes(1);
+    expect(onSendComplete).toHaveBeenCalledWith("msg-a");
+    expect(onSendError).toHaveBeenCalledTimes(1);
+    expect(onSendError.mock.calls[0][1]).toBe("msg-a");
+  });
+
+  it("falls back to legacy no-messageId completion only when message_id is absent", () => {
+    const onSendComplete = vi.fn();
+    renderHook(() =>
+      useChatSocket("ws-self", {
+        onSendComplete,
+      }),
+    );
+
+    act(() => {
+      capturedHandler!({
+        event: "ACTIVITY_LOGGED",
+        workspace_id: "ws-self",
+        payload: {
+          activity_type: "a2a_receive",
+          method: "message/send",
+          status: "error",
+          target_id: "ws-self",
+          duration_ms: 1500,
+          // message_id intentionally absent — old ws-server build.
+        },
+        timestamp: "2026-05-18T00:00:00Z",
+      });
+    });
+
+    expect(onSendComplete).toHaveBeenCalledTimes(1);
+    expect(onSendComplete.mock.calls[0][0]).toBeUndefined();
+  });
+
+  it("completes EVERY consumed agent message by its message_id, not just the first (batch consume)", () => {
+    getMockAgentMessages()["ws-self"] = [
+      { id: "1", content: "first", timestamp: new Date().toISOString(), messageId: "msg-1" },
+      { id: "2", content: "second", timestamp: new Date().toISOString(), messageId: "msg-2" },
+    ];
+
+    const onAgentMessage = vi.fn();
+    const onSendComplete = vi.fn();
+    renderHook(() =>
+      useChatSocket("ws-self", {
+        onAgentMessage,
+        onSendComplete,
+      }),
+    );
+
+    expect(onAgentMessage).toHaveBeenCalledTimes(2);
+    expect(onSendComplete).toHaveBeenCalledTimes(2);
+    expect(onSendComplete.mock.calls[0][0]).toBe("msg-1");
+    expect(onSendComplete.mock.calls[1][0]).toBe("msg-2");
   });
 });
