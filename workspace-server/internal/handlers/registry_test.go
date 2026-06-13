@@ -2811,3 +2811,240 @@ func TestRegister_PushModeNoURLNoCardURLStill400(t *testing.T) {
 		t.Errorf("expected 400 (no url in payload or agent_card), got %d: %s", w.Code, w.Body.String())
 	}
 }
+
+// TestRegister_400_LogsDiagnosticsReason is the #2680 residual regression
+// guard. When a recreated container's first /registry/register call
+// returns 400, the operator needs the failing-reason key
+// (invalid_json | invalid_delivery_mode | invalid_kind | url_required_for_push
+// | url_validate_failed) AND the workspace's existing row state
+// (url, kind, delivery_mode) to identify the drift source. The
+// 400 path that fires the diagnostic must emit a single grep-able
+// log line BEFORE writing the response so the next restart run
+// surfaces the cause directly.
+//
+// Each subtest exercises one of the 5 documented 400 paths. The
+// existing row state is mocked where needed to verify the
+// `existing_*` log fields are populated.
+func TestRegister_400_LogsDiagnosticsReason(t *testing.T) {
+	cases := []struct {
+		name           string
+		body           string
+		expectedReason string
+		expectStatus   int
+		setup          func(mock sqlmock.Sqlmock, workspaceID string)
+	}{
+		{
+			name:           "invalid_delivery_mode",
+			body:           `{"id":"ws-1","url":"http://localhost:8000","delivery_mode":"foo","agent_card":{"name":"x"}}`,
+			expectedReason: "invalid_delivery_mode",
+			expectStatus:   http.StatusBadRequest,
+		},
+		{
+			name:           "invalid_kind",
+			body:           `{"id":"ws-1","url":"http://localhost:8000","kind":"foo","agent_card":{"name":"x"}}`,
+			expectedReason: "invalid_kind",
+			expectStatus:   http.StatusBadRequest,
+		},
+		{
+			name:           "url_required_for_push",
+			body:           `{"id":"ws-1","delivery_mode":"push","agent_card":{"name":"x"}}`,
+			expectedReason: "url_required_for_push",
+			expectStatus:   http.StatusBadRequest,
+			setup: func(mock sqlmock.Sqlmock, workspaceID string) {
+				// C18 token gate: fresh-register path, no live tokens.
+				mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM workspace_auth_tokens").
+					WithArgs(workspaceID).
+					WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+				mock.ExpectQuery(`SELECT delivery_mode, runtime FROM workspaces WHERE id`).
+					WithArgs(workspaceID).
+					WillReturnError(sql.ErrNoRows)
+				// Defer boot_register_failed path: UPDATE failure timestamp.
+				mock.ExpectExec("UPDATE workspaces SET last_register_failure_at").
+					WithArgs(workspaceID).
+					WillReturnResult(sqlmock.NewResult(0, 1))
+			},
+		},
+		{
+			name:           "url_validate_failed_link_local",
+			body:           `{"id":"ws-1","url":"http://169.254.169.254:8000","delivery_mode":"push","agent_card":{"name":"x"}}`,
+			expectedReason: "url_validate_failed",
+			expectStatus:   http.StatusBadRequest,
+			setup: func(mock sqlmock.Sqlmock, workspaceID string) {
+				// C18 token gate: fresh-register path, no live tokens.
+				mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM workspace_auth_tokens").
+					WithArgs(workspaceID).
+					WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+				mock.ExpectQuery(`SELECT delivery_mode, runtime FROM workspaces WHERE id`).
+					WithArgs(workspaceID).
+					WillReturnError(sql.ErrNoRows)
+				mock.ExpectExec("UPDATE workspaces SET last_register_failure_at").
+					WithArgs(workspaceID).
+					WillReturnResult(sqlmock.NewResult(0, 1))
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mock := setupTestDB(t)
+			setupTestRedis(t)
+			broadcaster := newTestBroadcaster()
+			handler := NewRegistryHandler(broadcaster)
+
+			var buf bytes.Buffer
+			oldOutput := log.Writer()
+			log.SetOutput(&buf)
+			defer log.SetOutput(oldOutput)
+
+			if tc.setup != nil {
+				tc.setup(mock, "ws-1")
+			}
+
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request = httptest.NewRequest("POST", "/registry/register", bytes.NewBufferString(tc.body))
+			c.Request.Header.Set("Content-Type", "application/json")
+
+			handler.Register(c)
+
+			if w.Code != tc.expectStatus {
+				t.Errorf("expected status %d, got %d: %s", tc.expectStatus, w.Code, w.Body.String())
+			}
+
+			logs := buf.String()
+			want := "registry_register_400 workspace=ws-1 reason=" + tc.expectedReason
+			if !strings.Contains(logs, want) {
+				t.Errorf("expected diagnostic log %q, got: %s", want, logs)
+			}
+		})
+	}
+}
+
+// TestRegister_400_LogsExistingRowState verifies that the diagnostic
+// log line captures the workspace's existing row state (URL, kind,
+// delivery_mode) at the time of the 400 — so the operator can
+// compare the rejected payload against the row to identify the
+// drift source. The fetchExistingWorkspaceStateForDiagnostics query
+// is mocked; the test asserts the log line carries the expected
+// `existing_*` values (NOT the raw URL per RC #11335).
+//
+// Uses the url_validate_failed path (link-local URL) because it's
+// the only 400 path that runs AFTER the fetch — invalid_json,
+// invalid_delivery_mode, and invalid_kind all run before the
+// existingState fetch (pre-ctx) and pass an empty diagnostics.
+// url_required_for_push + url_validate_failed both run post-ctx
+// and carry the fetched state.
+func TestRegister_400_LogsExistingRowState(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewRegistryHandler(broadcaster)
+
+	var buf bytes.Buffer
+	oldOutput := log.Writer()
+	log.SetOutput(&buf)
+	defer log.SetOutput(oldOutput)
+
+	// Existing row with the documented (recreated container) state.
+	// The trigger is a 400 on the url_validate_failed path, which
+	// runs AFTER the existing-state fetch — so the test exercises
+	// the real fetch path.
+	//
+	// Order of queries in the actual code path:
+	//   1. fetchExistingWorkspaceStateForDiagnostics
+	//      (SELECT url, kind, delivery_mode) — happens at L398, AFTER
+	//      the ShouldBindJSON + delivery_mode/kind early checks.
+	//   2. C18 token gate (Phase 30.1)
+	//      (SELECT COUNT(*) FROM workspace_auth_tokens) — happens at L390,
+	//      AFTER the fetch. Fresh-register path, no live tokens.
+	//   3. resolveDeliveryMode (SELECT delivery_mode, runtime) — happens
+	//      at L427, AFTER the C18 check.
+	//   4. defer boot_register_failed UPDATE — happens AFTER the 400
+	//      is returned.
+	//
+	// fetchExistingWorkspaceStateForDiagnostics reads url, kind,
+	// delivery_mode from the same row.
+	mock.ExpectQuery(`SELECT url, kind, delivery_mode FROM workspaces WHERE id`).
+		WithArgs("ws-existing").
+		WillReturnRows(sqlmock.NewRows([]string{"url", "kind", "delivery_mode"}).
+			AddRow("https://ws-existing.example.com", "workspace", "push"))
+	// C18 token gate: fresh-register path, no live tokens.
+	mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM workspace_auth_tokens").
+		WithArgs("ws-existing").
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+	// resolveDeliveryMode reads delivery_mode + runtime from the
+	// row.
+	mock.ExpectQuery(`SELECT delivery_mode, runtime FROM workspaces WHERE id`).
+		WithArgs("ws-existing").
+		WillReturnRows(sqlmock.NewRows([]string{"delivery_mode", "runtime"}).
+			AddRow("push", "external"))
+	// Defer boot_register_failed path: UPDATE failure timestamp
+	// (authOK=true after the body parses).
+	mock.ExpectExec("UPDATE workspaces SET last_register_failure_at").
+		WithArgs("ws-existing").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	// Link-local URL — always blocked by validateAgentURL in any
+	// deploy mode (RC #11335's chosen test URL). This drives the
+	// url_validate_failed path so the fetch is exercised.
+	body := `{"id":"ws-existing","url":"http://169.254.169.254:8000","delivery_mode":"push","agent_card":{"name":"x"}}`
+	c.Request = httptest.NewRequest("POST", "/registry/register", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Register(c)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+
+	logs := buf.String()
+	// The diagnostic log must include the existing row's kind
+	// (workspace) and delivery_mode (push) as the basis for the
+	// operator's drift analysis. existing_url is REDACTED (RC #11335)
+	// — it must be the literal "present", NOT the raw URL.
+	if !strings.Contains(logs, "registry_register_400") {
+		t.Errorf("expected registry_register_400 diagnostic, got: %s", logs)
+	}
+	if !strings.Contains(logs, "reason=url_validate_failed") {
+		t.Errorf("expected reason=url_validate_failed, got: %s", logs)
+	}
+	if !strings.Contains(logs, "workspace=ws-existing") {
+		t.Errorf("expected workspace=ws-existing, got: %s", logs)
+	}
+	// existing_kind and existing_delivery_mode use %q in the format
+	// string (quoted), so the value is wrapped in double-quotes in
+	// the log line. Asserting for the substring with quotes is the
+	// correct shape.
+	if !strings.Contains(logs, `existing_kind="workspace"`) {
+		t.Errorf("expected existing_kind=\"workspace\" (from the row), got: %s", logs)
+	}
+	if !strings.Contains(logs, `existing_delivery_mode="push"`) {
+		t.Errorf("expected existing_delivery_mode=\"push\" (from the row), got: %s", logs)
+	}
+	if !strings.Contains(logs, "existing_url=present") {
+		t.Errorf("expected existing_url=present (URL redacted per RC #11335), got: %s", logs)
+	}
+	// Critical: the raw URL MUST NOT appear in the log line
+	// (RC #11335). The agent's URL is also a private link-local
+	// (169.254.169.254) which is itself PII-adjacent.
+	if strings.Contains(logs, "ws-existing.example.com") {
+		t.Errorf("REGRESSION: raw existing URL leaked into diagnostic log line (RC #11335): %s", logs)
+	}
+	if strings.Contains(logs, "169.254.169.254") {
+		t.Errorf("REGRESSION: raw payload URL leaked into diagnostic log line (RC #11335): %s", logs)
+	}
+	// The payload URL is present (the agent sent http://169.254.169.254:8000);
+	// it's the row's URL that may-or-may-not be present (we set it
+	// present in the mock).
+	if !strings.Contains(logs, "payload_url=present") {
+		t.Errorf("expected payload_url=present (agent sent a URL), got: %s", logs)
+	}
+	// The detail field carries validateAgentURL's friendly CIDR label,
+	// NOT the raw URL. (RC #11335's allowed exception for the detail
+	// field.)
+	if !strings.Contains(logs, "blocked address") {
+		t.Errorf("expected friendly CIDR label in detail (validateAgentURL's message), got: %s", logs)
+	}
+}

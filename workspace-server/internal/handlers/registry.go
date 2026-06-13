@@ -331,6 +331,12 @@ func isPlatformTunnelHostname(h string) bool {
 func (h *RegistryHandler) Register(c *gin.Context) {
 	var payload models.RegisterPayload
 	if err := c.ShouldBindJSON(&payload); err != nil {
+		// pre-ctx: the workspace's existing row state isn't fetched yet
+		// (we don't have ctx + we don't know the workspace ID until
+		// parse succeeds). Log with an empty diagnostics struct —
+		// the row state defaults to "(new)" in the log line, which is
+		// the right framing for a fresh-register parse failure.
+		logRegister400Reason("invalid_json", "", models.RegisterPayload{}, registerDiagnostics{}, err.Error())
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
 		return
 	}
@@ -362,6 +368,9 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 	// allowed and resolves to the row's existing value (or "push" default)
 	// in the upsert below. See #2339 for the poll/push split rationale.
 	if payload.DeliveryMode != "" && !models.IsValidDeliveryMode(payload.DeliveryMode) {
+		// pre-existingState (see L398): pass an empty struct; the row
+		// state defaults to "(new)" in the log line.
+		logRegister400Reason("invalid_delivery_mode", payload.ID, payload, registerDiagnostics{}, "payload.delivery_mode="+payload.DeliveryMode)
 		c.JSON(http.StatusBadRequest, gin.H{"error": "delivery_mode must be 'push' or 'poll'"})
 		return
 	}
@@ -370,11 +379,28 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 	// resolves to the row's existing value (or "workspace" default) in
 	// resolveKind below. Only the platform-agent container declares 'platform'.
 	if payload.Kind != "" && !models.IsValidKind(payload.Kind) {
+		logRegister400Reason("invalid_kind", payload.ID, payload, registerDiagnostics{}, "payload.kind="+payload.Kind)
 		c.JSON(http.StatusBadRequest, gin.H{"error": "kind must be 'workspace' or 'platform'"})
 		return
 	}
 
 	ctx := c.Request.Context()
+
+	// #2680 residual: register-400 diagnostics on the recreate path.
+	// When a recreated container's first /registry/register call returns
+	// 400, we need to know WHICH validation step fired (URL missing? URL
+	// in a private range? delivery_mode? kind? invalid JSON?) AND what
+	// the workspace's existing row state was at the time. Without this,
+	// the next restart run produces a 400 with no actionable signal —
+	// the deferred boot_register_failed log at the end of the function
+	// only fires AFTER the validation has already returned, so by the
+	// time it logs we have the status code but not the reason.
+	//
+	// Helper: logRegister400Reason captures the failure reason + the
+	// workspace's existing row state in a single grep-able line. Called
+	// by every 400 path below. Idempotent: writes to log.Printf only,
+	// does not mutate state.
+	existingState := h.fetchExistingWorkspaceStateForDiagnostics(ctx, payload.ID)
 
 	// C18: prevent workspace URL hijacking on re-registration.
 	//
@@ -460,10 +486,20 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 			}
 		}
 		if effectiveURL == "" {
+			// Detail: which surface had a URL (so the operator can
+			// tell "no URL anywhere" from "URL in agent_card but
+			// not in payload"). NEVER log the raw URL (see RC
+			// #11335).
+			logRegister400Reason("url_required_for_push", payload.ID, payload, existingState, "effective_url_empty (payload_url_present="+urlPresence(payload.URL)+", agent_card_url_present="+urlPresence(agentCardURL(payload.AgentCard))+")")
 			c.JSON(http.StatusBadRequest, gin.H{"error": "url is required for push-mode workspaces"})
 			return
 		}
 		if err := validateAgentURL(effectiveURL); err != nil {
+			// validateAgentURL returns a friendly CIDR label
+			// (e.g. "url targets a blocked address: RFC-1918
+			// private address") that does NOT contain the actual
+			// address. Safe to log.
+			logRegister400Reason("url_validate_failed", payload.ID, payload, existingState, err.Error())
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
@@ -1171,3 +1207,112 @@ func (h *RegistryHandler) requireWorkspaceToken(
 // see "gin.Context.Request.Context() is what we want" without re-typing
 // the import-heavy standard type.
 type gincontext = context.Context
+
+// fetchExistingWorkspaceStateForDiagnostics reads the workspace's
+// current row state (url, kind, delivery_mode) for the diagnostic
+// log line. Best-effort: a DB error here is logged+ignored; the
+// diagnostic line emits "(unavailable)" for the missing fields.
+//
+// Why best-effort: the diagnostic MUST NOT introduce a new failure
+// path. The function is called before the validation chain runs;
+// if it errored loudly the operator would see a SECOND 500 on top
+// of the original 400, and the new error would mask the original
+// cause. The defer boot_register_failed log captures the row's
+// failure timestamp for follow-up triage.
+func (h *RegistryHandler) fetchExistingWorkspaceStateForDiagnostics(ctx context.Context, workspaceID string) registerDiagnostics {
+	var d registerDiagnostics
+	if workspaceID == "" {
+		return d
+	}
+	var url, kind, mode sql.NullString
+	if err := db.DB.QueryRowContext(ctx,
+		`SELECT url, kind, delivery_mode FROM workspaces WHERE id = $1`,
+		workspaceID,
+	).Scan(&url, &kind, &mode); err == nil {
+		if url.Valid {
+			d.ExistingURL = url.String
+		}
+		if kind.Valid {
+			d.ExistingKind = kind.String
+		}
+		if mode.Valid {
+			d.ExistingDeliveryMode = mode.String
+		}
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		log.Printf("Registry register: diagnostics fetch failed for %s: %v", workspaceID, err)
+	}
+	return d
+}
+
+// registerDiagnostics captures the workspace's existing row state at
+// the time of a 400 response, so the operator can compare the
+// request payload against the row to identify the drift source.
+// All fields are best-effort; empty string means "unavailable"
+// (either the row didn't exist, the column was NULL, or the fetch
+// errored).
+type registerDiagnostics struct {
+	ExistingURL          string
+	ExistingKind         string
+	ExistingDeliveryMode string
+}
+
+// logRegister400Reason emits a single grep-able log line for every
+// 400 path in /registry/register. The line shape is stable
+// (`registry_register_400`) so operators can grep Loki for the
+// class. Fields:
+//   workspace_id         — the requested ID
+//   reason               — short key (invalid_json | invalid_delivery_mode |
+//                          invalid_kind | url_required_for_push | url_validate_failed)
+//   payload_url          — the URL the agent sent in the payload (may be empty)
+//   payload_card_url     — the URL the agent put in its agent_card (may be empty)
+//   payload_kind         — the kind the agent sent
+//   payload_delivery_mode — the delivery_mode the agent sent
+//   existing_url         — the URL already on the workspaces row (or "(new)")
+//   existing_kind        — the kind already on the row (or "(new)")
+//   existing_delivery_mode — the delivery_mode already on the row (or "(new)")
+//   detail               — the failure-specific detail (parse error, validation
+//                          error, missing-field note, etc.)
+//
+// The class is part of the #2680 residual: a recreated container's
+// first /registry/register call has been returning 400 with no
+// actionable signal. The deferred boot_register_failed log fires too
+// late (after the 400 has already been returned to the client) and
+// only carries the status code, not the reason. This line is
+// emitted synchronously inside each 400 path, BEFORE the response
+// is written, so the next restart run will surface the cause
+// directly.
+func logRegister400Reason(reason, workspaceID string, payload models.RegisterPayload, existing registerDiagnostics, detail string) {
+	cardURLPresence := urlPresence(agentCardURL(payload.AgentCard))
+	payloadURLPresence := urlPresence(payload.URL)
+	exURLPresence := "(new)"
+	if existing.ExistingURL != "" {
+		exURLPresence = "present"
+	}
+	exKind := existing.ExistingKind
+	if exKind == "" {
+		exKind = "(new)"
+	}
+	exMode := existing.ExistingDeliveryMode
+	if exMode == "" {
+		exMode = "(new)"
+	}
+	log.Printf("registry_register_400 workspace=%s reason=%s payload_url=%s payload_card_url=%s payload_kind=%q payload_delivery_mode=%q existing_url=%s existing_kind=%q existing_delivery_mode=%q detail=%q",
+		workspaceID, reason,
+		payloadURLPresence, cardURLPresence, payload.Kind, payload.DeliveryMode,
+		exURLPresence, exKind, exMode,
+		detail,
+	)
+}
+
+// urlPresence reports "present" vs "absent" for a URL string,
+// without ever logging the URL value. Used by logRegister400Reason
+// to redact the URL columns (see RC #11335: workspace URLs can be
+// private — Hetzner 10.0.0.x, GCP 10.x.x.x, in-VPC 172.31.x.x —
+// and the prior implementation leaked them to anyone with Loki
+// read access).
+func urlPresence(url string) string {
+	if url == "" {
+		return "absent"
+	}
+	return "present"
+}

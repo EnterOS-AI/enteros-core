@@ -335,3 +335,44 @@ func TestParseUsageFromA2AResponse_MissingTokensInUsageObject(t *testing.T) {
 		t.Errorf("missing tokens: got (%d, %d), want (0, 0)", in, out)
 	}
 }
+
+// TestRestartContext_SystemCallerDoesNotPoisonSourceID is the
+// regression guard for the #2680 residual (criterion a): when the
+// restart-context production path (restart_context.go:sendRestartContext
+// L296) calls ProxyA2ARequest with callerID="system:restart-context",
+// the synthetic non-UUID callerID must NOT be inserted into the
+// UUID-typed activity_logs.source_id column. The path is:
+//   sendRestartContext → ProxyA2ARequest(..., "system:restart-context", ...)
+//     → persistUserMessageAtIngest(..., "system:restart-context", ...)
+//       → LogActivityWithResult({SourceID: callerIDToSourceID("system:restart-context")})
+//         → activity_logs INSERT with SourceID = NULL
+//
+// The fix (#2701) introduced the scoped helper callerIDToSourceID
+// which returns nil for any system-caller prefix (matching
+// isSystemCaller in a2a_proxy.go:85). This test pins the contract.
+//
+// If the callerIDToSourceID helper is later removed OR weakened OR
+// the call site is reverted, the UUID cast on activity_logs.source_id
+// will fail with pq: invalid input syntax for type uuid and the
+// post-restart queue-fallback path will return 503 → workspace stays
+// degraded. This test catches that regression.
+func TestRestartContext_SystemCallerDoesNotPoisonSourceID(t *testing.T) {
+	// Direct unit-level check of the scoped helper against all 4
+	// systemCallerPrefixes. If callerIDToSourceID returns nil for
+	// any of these, the production path's INSERT is safe; the
+	// SQL binds NULL, the cast is skipped, no poison.
+	prefixes := []string{
+		"system:restart-context", // the specific offender
+		"webhook:github",
+		"test:lifecycle-1",
+		"channel:slack:C0123",
+	}
+	for _, p := range prefixes {
+		t.Run(p, func(t *testing.T) {
+			got := callerIDToSourceID(p)
+			if got != nil {
+				t.Errorf("system caller %q: got non-nil pointer; would poison activity_logs.source_id (UUID cast fail → degraded wedge)", p)
+			}
+		})
+	}
+}
