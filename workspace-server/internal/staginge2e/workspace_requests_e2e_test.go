@@ -110,8 +110,12 @@ func mintWorkspaceToken(t *testing.T, cfg stagingCfg, host, adminToken, orgID, w
 	return tok
 }
 
-// raiseRequest POSTs a task/approval to recipient=user as the workspace.
-func raiseRequest(t *testing.T, host, wsToken, orgID, wsID, kind, title string) {
+// raiseRequest POSTs a task/approval to recipient=user as the workspace and
+// returns the new request_id. Note recipient_id is EMPTY — the generic "the
+// user" — which is exactly what makes the More-Info reply path non-trivial
+// (the canvas posts the reply with a concrete author_id, see the More-Info
+// e2e below).
+func raiseRequest(t *testing.T, host, wsToken, orgID, wsID, kind, title string) string {
 	t.Helper()
 	url := "https://" + host + "/workspaces/" + wsID + "/requests"
 	body := fmt.Sprintf(
@@ -122,9 +126,75 @@ func raiseRequest(t *testing.T, host, wsToken, orgID, wsID, kind, title string) 
 	if status != http.StatusCreated && status != http.StatusOK {
 		t.Fatalf("raise %s request (workspace token, wsAuth): HTTP %d: %s", kind, status, resp)
 	}
-	if id := jsonField(resp, "request_id"); id == "" {
+	id := jsonField(resp, "request_id")
+	if id == "" {
 		t.Fatalf("raise %s request: no request_id: %s", kind, resp)
 	}
+	return id
+}
+
+// TestWorkspaceRequestMoreInfoFlipsToInfoRequested is the live proof of the
+// "agent doesn't receive the More-Info thread" fix. An agent→user request is
+// stored with an EMPTY recipient_id; the canvas posts the user's clarification
+// reply with a CONCRETE author_id ("admin"/session user). The OLD gate
+// (authorID == RecipientID) was "admin" == "" → false, so the request never
+// flipped to info_requested and the requester agent was never notified. The
+// fixed gate keys off "not the requester", so the same POST must now flip the
+// status to info_requested — the server-observable proof that the gate fired
+// (and therefore that the requester-agent A2A notification was enqueued).
+func TestWorkspaceRequestMoreInfoFlipsToInfoRequested(t *testing.T) {
+	cfg := requireStagingEnv(t)
+	slug := fmt.Sprintf("e2e-moreinfo-%d", time.Now().Unix()%100000000)
+	t.Logf("more-info: slug=%s", slug)
+
+	orgID := adminCreateOrg(t, cfg, slug)
+	t.Cleanup(func() { adminDeleteTenant(t, cfg, slug) })
+	adminToken := tenantAdminToken(t, cfg, slug)
+	tenantHost := slug + "." + cfg.subdomainSuffix
+	waitForHTTP(t, tenantHost, http.StatusOK, 10*time.Minute, "tenant /health ready")
+
+	wsID := tenantCreateWorkspace(t, cfg, tenantHost, adminToken, orgID)
+	wsToken := mintWorkspaceToken(t, cfg, tenantHost, adminToken, orgID, wsID)
+
+	// Agent raises an approval to the generic user (recipient_id="").
+	apprTitle := "e2e-moreinfo approval " + slug
+	reqID := raiseRequest(t, tenantHost, wsToken, orgID, wsID, "approval", apprTitle)
+	t.Logf("raised request %s", reqID)
+
+	// The user posts a More-Info reply via the admin-gated canvas path with a
+	// concrete author_id (exactly what RequestsInbox.tsx sends: author_type
+	// "user", author_id = session user_id or the "admin" placeholder).
+	msgURL := "https://" + tenantHost + "/requests/" + reqID + "/messages"
+	msgBody := `{"author_type":"user","author_id":"admin","body":"which environment do you mean?"}`
+	status, resp := doTenantJSON(t, "POST", msgURL, adminToken, orgID, msgBody)
+	if status != http.StatusCreated && status != http.StatusOK {
+		t.Fatalf("post more-info message (admin path): HTTP %d: %s", status, resp)
+	}
+
+	// GET the request and assert the status flipped to info_requested. Under the
+	// pre-fix gate it would still read "pending".
+	getURL := "https://" + tenantHost + "/requests/" + reqID
+	deadline := time.Now().Add(30 * time.Second)
+	var lastStatus string
+	for time.Now().Before(deadline) {
+		code, body := doTenantJSON(t, "GET", getURL, adminToken, orgID, "")
+		if code == http.StatusOK {
+			var rt struct {
+				Request struct {
+					Status string `json:"status"`
+				} `json:"request"`
+			}
+			if json.Unmarshal([]byte(body), &rt) == nil {
+				lastStatus = rt.Request.Status
+				if lastStatus == "info_requested" {
+					t.Logf("request %s flipped to info_requested after user More-Info ✓", reqID)
+					return
+				}
+			}
+		}
+		time.Sleep(2 * time.Second)
+	}
+	t.Fatalf("request %s never flipped to info_requested (last status %q) — More-Info gate did not fire", reqID, lastStatus)
 }
 
 // requirePending polls GET /requests/pending?kind= until `title` appears.
