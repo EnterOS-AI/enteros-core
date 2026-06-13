@@ -41,11 +41,57 @@ func TestSwitchProvider_StopBeforeProviderWrite(t *testing.T) {
 	}
 }
 
+// TestSwitchProvider_PreClaimGatesStop pins the CR2 #11473 blocking-finding
+// fix: the per-workspace stop helper MUST appear AFTER the pre-claim's
+// RowsAffected check, so a losing pre-claim returns 409 without ever
+// touching the stop. Pre-fix, the stop ran unconditionally before the
+// CAS — a request against a workspace that was already provisioning
+// would stop the in-flight box it didn't own (review finding: "the
+// loser should not be able to stop a box owned by an in-flight
+// provision/switch"). A source-level position check guards against
+// a refactor re-introducing the order.
+func TestSwitchProvider_PreClaimGatesStop(t *testing.T) {
+	wd, _ := os.Getwd()
+	src, err := os.ReadFile(filepath.Join(wd, "workspace_switch_provider.go"))
+	if err != nil {
+		t.Fatalf("read source: %v", err)
+	}
+	stripped := stripGoComments(src)
+	preClaimIdx := bytes.Index(stripped, []byte("preClaim, err := db.DB.ExecContext(ctx, `"))
+	if preClaimIdx < 0 {
+		t.Fatal("SwitchProvider must have a pre-claim UPDATE (the fix for CR2 #11473) — pre-claim gates the stop on a successful CAS")
+	}
+	preClaimLoseIdx := bytes.Index(stripped, []byte("ALREADY_SWITCHING"))
+	if preClaimLoseIdx < 0 {
+		t.Fatal("SwitchProvider must return ALREADY_SWITCHING on a lost pre-claim — this is the 409 path the pre-claim gates")
+	}
+	stopIdx := bytes.Index(stripped, []byte("cpStopWithRetryErr(ctx, id, \"SwitchProvider\""))
+	if stopIdx < 0 {
+		t.Fatal("SwitchProvider must call cpStopWithRetryErr for the OLD box")
+	}
+	// The 409-on-lost-pre-claim path must appear BEFORE the stop — the
+	// stop is gated on a successful pre-claim.
+	if preClaimLoseIdx >= stopIdx {
+		t.Fatalf("ORDERING HAZARD: the ALREADY_SWITCHING 409 path (idx %d) must come BEFORE the stop helper (idx %d) — a losing pre-claim must return 409 without ever touching the stop side effect (CR2 #11473)", preClaimLoseIdx, stopIdx)
+	}
+	// And the pre-claim itself must come before the stop too.
+	if preClaimIdx >= stopIdx {
+		t.Fatalf("ORDERING HAZARD: the pre-claim (idx %d) must come BEFORE the stop (idx %d)", preClaimIdx, stopIdx)
+	}
+}
+
 // TestSwitchProvider_ConcurrencyGuardAndAudit pins the two hardening items from
-// the correctness review: (a) the provider-write is an atomic CAS so two
-// concurrent switches can't both launch a provision, and (b) stop-exhaustion
-// emits a durable audit row carrying the old instance_id+provider so the old box
-// remains discoverable after instance_id is nulled.
+// the correctness review: (a) a switch is guarded by an atomic CAS (pre-claim
+// + provider write) so two concurrent switches can't both launch a provision
+// or both stop the same box, and (b) stop-exhaustion emits a durable audit
+// row carrying the old instance_id+provider so the old box remains
+// discoverable after instance_id is nulled.
+//
+// CR2 #11473 update: the original code did the stop BEFORE the CAS, so a
+// losing request still executed the stop side effect. The fix splits the
+// guard into a PRE-CLAIM (status='provisioning' only, provider unchanged)
+// and the provider write — the stop now runs ONLY after the pre-claim
+// succeeds, so a losing pre-claim returns 409 without stopping the box.
 func TestSwitchProvider_ConcurrencyGuardAndAudit(t *testing.T) {
 	wd, _ := os.Getwd()
 	src, err := os.ReadFile(filepath.Join(wd, "workspace_switch_provider.go"))
@@ -53,17 +99,30 @@ func TestSwitchProvider_ConcurrencyGuardAndAudit(t *testing.T) {
 		t.Fatalf("read source: %v", err)
 	}
 	s := stripGoComments(src)
-	if !bytes.Contains(s, []byte("status <> $3")) || !bytes.Contains(s, []byte("IS NOT DISTINCT FROM $4")) {
-		t.Error("the provider-write UPDATE must be a CAS (status not already provisioning AND provider unchanged) to prevent a double-provision race")
+	// Pre-claim: status='provisioning' with status<>provisioning CAS so
+	// the stop is gated on a successful claim. The pre-claim's WHERE
+	// clause must include BOTH `status <> $` AND a provider-unchanged
+	// check, so a losing race (workspace already provisioning, OR
+	// provider changed) returns 0 rows and 409s without stopping
+	// the box.
+	if !bytes.Contains(s, []byte("status <> $2")) || !bytes.Contains(s, []byte("IS NOT DISTINCT FROM $3")) {
+		t.Error("the PRE-CLAIM must be a CAS (status not already provisioning AND provider unchanged) — this is the guard that prevents a losing request from executing the stop side effect (CR2 #11473)")
 	}
 	if !bytes.Contains(s, []byte("RowsAffected")) || !bytes.Contains(s, []byte("ALREADY_SWITCHING")) {
-		t.Error("SwitchProvider must 409 ALREADY_SWITCHING when the CAS affects 0 rows (lost the race)")
+		t.Error("SwitchProvider must 409 ALREADY_SWITCHING when the pre-claim affects 0 rows (lost the race before the stop runs)")
 	}
 	if !bytes.Contains(s, []byte("cpStopWithRetryErr")) {
 		t.Error("SwitchProvider must use cpStopWithRetryErr to detect stop exhaustion")
 	}
 	if !bytes.Contains(s, []byte("emitSwitchProviderStopExhausted")) {
 		t.Error("SwitchProvider must emit an audit row with old instance/provider metadata on stop exhaustion")
+	}
+	// Routing invariant: the NEW-box provision must go through the
+	// central Auto dispatcher, not the direct per-backend body (this
+	// is the core#2422 RCA-tick fix that closes the Platform-Go red
+	// on TestNoCallSiteCallsDirectProvisionerExceptAuto).
+	if bytes.Contains(s, []byte("h.goAsync(func() { h.provisionWorkspaceCP(")) {
+		t.Error("SwitchProvider must route the NEW-box provision through provisionWorkspaceAuto, NOT through h.provisionWorkspaceCP directly (TestNoCallSiteCallsDirectProvisionerExceptAuto pin)")
 	}
 }
 

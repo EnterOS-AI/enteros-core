@@ -115,47 +115,78 @@ func (h *WorkspaceHandler) SwitchProvider(c *gin.Context) {
 
 	// --- ordered switch (see doc-comment) ---
 
-	// 1. Stop the OLD box with the OLD provider. DB is unchanged here, so the
-	//    stop helper reads the old provider + old instance_id. Bounded retry; on
-	//    exhaustion it returns an error but we STILL proceed (a stuck old box
-	//    must not strand the switch) — except we capture the failure so step 2.5
-	//    can emit a durable audit row, because step 2 nulls instance_id and flips
-	//    provider, which otherwise leaves the old box untracked by normal
-	//    lifecycle cleanup (review finding #3).
+	// 1. PRE-CLAIM: atomically mark the switch as in-flight by setting
+	//    status='provisioning' WITHOUT changing the provider. The CAS
+	//    (`status<>'provisioning' AND provider unchanged`) prevents a
+	//    racing duplicate switch (or a switch against a workspace that
+	//    is already provisioning) from getting past this point. A losing
+	//    pre-claim returns 0 rows → 409 immediately, with NO stop side
+	//    effect (CR2 blocking finding: pre-fix the stop ran before the
+	//    CAS, so a losing request still executed the stop side effect
+	//    against a box it didn't own).
+	preClaim, err := db.DB.ExecContext(ctx, `
+		UPDATE workspaces
+		SET status = $2, url = '', updated_at = now()
+		WHERE id = $1
+		  AND status <> $2
+		  AND COALESCE(compute->>'provider', '') IS NOT DISTINCT FROM $3`,
+		id, models.StatusProvisioning, oldProvider)
+	if err != nil {
+		log.Printf("SwitchProvider: pre-claim failed for %s: %v", id, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to claim switch"})
+		return
+	}
+	if n, _ := preClaim.RowsAffected(); n == 0 {
+		// Lost the pre-claim: another switch already set status='provisioning',
+		// the workspace is in initial provisioning, or the provider changed
+		// under us. Do NOT execute the stop — the box is owned by an
+		// in-flight provision/switch, not by us.
+		c.JSON(http.StatusConflict, gin.H{"error": "ALREADY_SWITCHING", "detail": "a provider switch or provision is already in progress for this workspace"})
+		return
+	}
+
+	// 2. Stop the OLD box with the OLD provider. DB still has the old
+	//    provider + old instance_id (the pre-claim only flipped status,
+	//    not provider — the stop helper reads provider+instance_id at
+	//    call time). Bounded retry; on exhaustion we STILL proceed
+	//    (a stuck old box must not strand the switch) — except we
+	//    capture the failure so step 4 can emit a durable audit row,
+	//    because step 3 nulls instance_id and flips provider, which
+	//    otherwise leaves the old box untracked by normal lifecycle
+	//    cleanup (review finding #3).
 	stopErr := h.cpStopWithRetryErr(ctx, id, "SwitchProvider", false)
 
-	// 2. Atomically claim the switch AND clear instance_id + write the new
-	//    provider. The CAS (status not already provisioning, provider still the
-	//    one we read) makes concurrent/duplicate switch calls safe: only the
-	//    first winner launches a provision; a racing call sees 0 rows → 409,
-	//    never a second provision against a second backend (review finding #4).
-	//    jsonb_set preserves instance_type/volume/display/data_persistence.
+	// 3. Write the new provider + clear instance_id. The pre-claim
+	//    already set status='provisioning' (so a duplicate check on
+	//    status is not needed here — the row is owned by this switch).
+	//    The `WHERE id=$1` is the only guard: if the row was deleted
+	//    between pre-claim and now (vanishingly rare), 0 rows → 500
+	//    and the audit row carries the diagnostic. jsonb_set preserves
+	//    instance_type/volume/display/data_persistence.
 	res, err := db.DB.ExecContext(ctx, `
 		UPDATE workspaces
 		SET instance_id = NULL,
 		    compute = jsonb_set(COALESCE(compute, '{}'::jsonb), '{provider}', to_jsonb($2::text)),
-		    status = $3, url = '', updated_at = now()
-		WHERE id = $1
-		  AND status <> $3
-		  AND COALESCE(compute->>'provider', '') IS NOT DISTINCT FROM $4`,
-		id, newProvider, models.StatusProvisioning, oldProvider)
+		    updated_at = now()
+		WHERE id = $1`,
+		id, newProvider)
 	if err != nil {
 		log.Printf("SwitchProvider: failed to write new provider for %s: %v", id, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to switch provider"})
 		return
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
-		// Lost the CAS: another switch already flipped the provider / set
-		// provisioning, or the row changed under us. Do NOT launch a second
-		// provision (would leave an untracked box).
-		c.JSON(http.StatusConflict, gin.H{"error": "ALREADY_SWITCHING", "detail": "a provider switch or provision is already in progress for this workspace"})
+		// Row was deleted between pre-claim and now. Emit an audit
+		// row so the diagnostic is queryable, then 500.
+		log.Printf("SwitchProvider: row disappeared after pre-claim for %s", id)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "workspace row missing after pre-claim"})
 		return
 	}
 
-	// 2.5. If the old box never confirmed stopped, it may not be tracked by the
-	//      normal lifecycle cleanup after instance_id was nulled. Emit a durable
-	//      audit row carrying the old instance_id + provider so a platform cleanup
-	//      process can locate and terminate it (review finding #3).
+	// 4. If the old box never confirmed stopped, it may not be tracked by the
+	//    normal lifecycle cleanup after instance_id was nulled. Emit a durable
+	//    audit row carrying the old instance_id + provider so a platform cleanup
+	//    process can locate and terminate it (review finding #3).
 	if stopErr != nil && oldInstanceID.Valid && oldInstanceID.String != "" {
 		h.emitSwitchProviderStopExhausted(ctx, id, oldInstanceID.String, effectiveOld, newProvider, stopErr)
 	}
@@ -168,12 +199,15 @@ func (h *WorkspaceHandler) SwitchProvider(c *gin.Context) {
 		"provider_to":   newProvider,
 	})
 
-	// 3. Provision the NEW box. withStoredCompute re-reads compute (now carrying
-	//    the new provider) → provisionWorkspaceCP routes to the new backend.
-	//    Reuse the existing config volume (templatePath="") so identity/config
-	//    are preserved. Detached context: the reprovision outlives the request.
+	// 5. Provision the NEW box. withStoredCompute re-reads compute
+	//    (now carrying the new provider) → provisionWorkspaceAuto routes
+	//    centrally to the new backend. Reuse the existing config volume
+	//    (templatePath="") so identity/config are preserved. Detached
+	//    context: the reprovision outlives the request. Routes through
+	//    provisionWorkspaceAuto (not provisionWorkspaceCP directly) per
+	//    TestNoCallSiteCallsDirectProvisionerExceptAuto (core#2422 RCA tick).
 	payload := withStoredCompute(context.Background(), id, models.CreateWorkspacePayload{Name: wsName, Tier: tier, Runtime: dbRuntime})
-	h.goAsync(func() { h.provisionWorkspaceCP(id, "", nil, payload) })
+	h.provisionWorkspaceAuto(id, "", nil, payload)
 
 	c.JSON(http.StatusAccepted, gin.H{
 		"status":       "switching",
