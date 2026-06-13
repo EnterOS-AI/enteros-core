@@ -358,7 +358,7 @@ func (h *WorkspaceHandler) logA2ABusyQueued(ctx context.Context, workspaceID, ca
 // logA2ASuccess records a successful A2A round-trip and (for canvas-initiated
 // 2xx/3xx responses) broadcasts an A2A_RESPONSE event so the frontend can
 // receive the reply without polling.
-func (h *WorkspaceHandler) logA2ASuccess(ctx context.Context, workspaceID, callerID string, body, respBody []byte, a2aMethod string, statusCode, durationMs int) {
+func (h *WorkspaceHandler) logA2ASuccess(ctx context.Context, workspaceID, callerID string, isCanvasUser bool, body, respBody []byte, a2aMethod string, statusCode, durationMs int) {
 	logStatus := "ok"
 	if statusCode >= 400 {
 		logStatus = "error"
@@ -429,7 +429,16 @@ func (h *WorkspaceHandler) logA2ASuccess(ctx context.Context, workspaceID, calle
 		MessageId:    extractMessageIdFromA2ABody(body),
 	})
 
-	if callerID == "" && statusCode < 400 {
+	// Broadcast A2A_RESPONSE for the CANVAS (so the reply reaches the frontend
+	// over WS, not just inline) — both the anonymous canvas (callerID == "")
+	// AND the authenticated canvas user (isCanvasUser, non-empty callerID via
+	// X-Workspace-ID + validateCallerToken). core#2751: the cap-and-queue path
+	// returns {queued} for canvas users and depends on THIS broadcast to
+	// deliver the reply. Safe on the synchronous path too — the canvas already
+	// receives both the inline HTTP reply and this WS event, and
+	// appendMessageDeduped collapses them by (role, content, 3s window), which
+	// is exactly why the anonymous canvas path doesn't double-render today.
+	if (callerID == "" || isCanvasUser) && statusCode < 400 {
 		h.broadcaster.BroadcastOnly(workspaceID, string(events.EventA2AResponse), map[string]interface{}{
 			"response_body": json.RawMessage(respBody),
 			"method":        a2aMethod,

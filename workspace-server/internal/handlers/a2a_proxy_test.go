@@ -2336,7 +2336,7 @@ func TestLogA2ASuccess_Smoke(t *testing.T) {
 	mock.ExpectExec("INSERT INTO activity_logs").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	handler.logA2ASuccess(context.Background(), "ws-ok", "", []byte(`{}`), []byte(`{"result":"x"}`), "message/send", 200, 10)
+	handler.logA2ASuccess(context.Background(), "ws-ok", "", false, []byte(`{}`), []byte(`{"result":"x"}`), "message/send", 200, 10)
 	time.Sleep(80 * time.Millisecond)
 }
 
@@ -2354,7 +2354,7 @@ func TestLogA2ASuccess_ErrorStatus(t *testing.T) {
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// callerID != "" also means no A2A_RESPONSE broadcast.
-	handler.logA2ASuccess(context.Background(), "ws-err", "ws-caller", []byte(`{}`), []byte(`{}`), "message/send", 500, 10)
+	handler.logA2ASuccess(context.Background(), "ws-err", "ws-caller", false, []byte(`{}`), []byte(`{}`), "message/send", 500, 10)
 	time.Sleep(80 * time.Millisecond)
 }
 
@@ -3017,5 +3017,61 @@ func TestProxyA2A_CanvasCapAndQueue(t *testing.T) {
 	// Returned at ~budget, NOT after the (blocked) agent — proves the cap fired.
 	if elapsed > 2*time.Second {
 		t.Errorf("handler held the connection (%v) instead of capping at the budget", elapsed)
+	}
+}
+
+
+// TestLogA2ASuccess_BroadcastsForCanvasUser pins core#2751: the A2A_RESPONSE
+// WS broadcast must fire for an AUTHENTICATED canvas user (isCanvasUser=true,
+// non-empty callerID via X-Workspace-ID) — not just the anonymous callerID==""
+// canvas — so the cap-and-queue async reply reaches the frontend. A real
+// workspace caller (isCanvasUser=false) still gets NO broadcast.
+func TestLogA2ASuccess_BroadcastsForCanvasUser(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	rec := &recordingBroadcaster{}
+	handler := NewWorkspaceHandler(rec, nil, "http://localhost:8080", t.TempDir())
+	waitForHandlerAsyncBeforeDBCleanup(t, handler)
+
+	mock.ExpectQuery(`SELECT name FROM workspaces WHERE id =`).
+		WithArgs("ws-cu").
+		WillReturnRows(sqlmock.NewRows([]string{"name"}).AddRow("Canvas Target"))
+	mock.ExpectExec("INSERT INTO activity_logs").WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// Authenticated canvas user: callerID non-empty, isCanvasUser=true.
+	handler.logA2ASuccess(context.Background(), "ws-cu", "ws-canvas-user", true, []byte(`{}`), []byte(`{"result":"hi"}`), "message/send", 200, 12)
+	time.Sleep(80 * time.Millisecond)
+
+	got := false
+	for _, c := range rec.calls {
+		if c.eventType == "A2A_RESPONSE" && c.workspaceID == "ws-cu" {
+			got = true
+		}
+	}
+	if !got {
+		t.Fatalf("expected A2A_RESPONSE broadcast for authenticated canvas user; recorded: %+v", rec.calls)
+	}
+}
+
+// A real workspace-to-workspace caller (isCanvasUser=false) gets NO A2A_RESPONSE.
+func TestLogA2ASuccess_NoBroadcastForWorkspaceCaller(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	rec := &recordingBroadcaster{}
+	handler := NewWorkspaceHandler(rec, nil, "http://localhost:8080", t.TempDir())
+	waitForHandlerAsyncBeforeDBCleanup(t, handler)
+
+	mock.ExpectQuery(`SELECT name FROM workspaces WHERE id =`).
+		WithArgs("ws-peer").
+		WillReturnRows(sqlmock.NewRows([]string{"name"}).AddRow("Peer"))
+	mock.ExpectExec("INSERT INTO activity_logs").WillReturnResult(sqlmock.NewResult(0, 1))
+
+	handler.logA2ASuccess(context.Background(), "ws-peer", "ws-other", false, []byte(`{}`), []byte(`{"result":"x"}`), "message/send", 200, 12)
+	time.Sleep(80 * time.Millisecond)
+
+	for _, c := range rec.calls {
+		if c.eventType == "A2A_RESPONSE" {
+			t.Fatalf("unexpected A2A_RESPONSE broadcast for a workspace-to-workspace caller")
+		}
 	}
 }

@@ -392,7 +392,7 @@ func (h *WorkspaceHandler) ProxyA2A(c *gin.Context) {
 	// runs on a detached ctx so its DB logging isn't cancelled when we return.
 	// Budget=0 (default) → the unchanged synchronous path below; no behavior
 	// change until an operator opts in. See the design on core#2751.
-	if budget := envx.Duration("A2A_CANVAS_SYNC_BUDGET", 0); budget > 0 && callerID == "" {
+	if budget := envx.Duration("A2A_CANVAS_SYNC_BUDGET", 0); budget > 0 && (callerID == "" || isCanvasUser) {
 		type a2aResult struct {
 			status int
 			body   []byte
@@ -609,7 +609,7 @@ func (h *WorkspaceHandler) proxyA2ARequest(ctx context.Context, workspaceID stri
 	// intent if anyone ever does that), BEFORE resolveAgentURL (mock
 	// has no URL — going through resolveAgentURL would 404 on the
 	// SELECT url since the row is provisioned as NULL).
-	if status, respBody, handled := h.handleMockA2A(ctx, workspaceID, callerID, body, a2aMethod, logActivity); handled {
+	if status, respBody, handled := h.handleMockA2A(ctx, workspaceID, callerID, isCanvasUser, body, a2aMethod, logActivity); handled {
 		return status, respBody, nil
 	}
 
@@ -675,7 +675,7 @@ func (h *WorkspaceHandler) proxyA2ARequest(ctx context.Context, workspaceID stri
 		log.Printf("ProxyA2A: body read failed for %s (status=%d delivery_confirmed=%v bytes_read=%d): %v",
 			workspaceID, resp.StatusCode, deliveryConfirmed, len(respBody), readErr)
 		if logActivity && deliveryConfirmed {
-			h.logA2ASuccess(ctx, workspaceID, callerID, body, respBody, a2aMethod, resp.StatusCode, durationMs)
+			h.logA2ASuccess(ctx, workspaceID, callerID, isCanvasUser, body, respBody, a2aMethod, resp.StatusCode, durationMs)
 		}
 		// Preserve the actual HTTP status code and any body bytes already read.
 		// Previously this returned (0, nil, error) which discarded both.
@@ -725,7 +725,7 @@ func (h *WorkspaceHandler) proxyA2ARequest(ctx context.Context, workspaceID stri
 	}
 
 	if logActivity {
-		h.logA2ASuccess(ctx, workspaceID, callerID, body, respBody, a2aMethod, resp.StatusCode, durationMs)
+		h.logA2ASuccess(ctx, workspaceID, callerID, isCanvasUser, body, respBody, a2aMethod, resp.StatusCode, durationMs)
 	}
 
 	// Track LLM token usage for cost transparency (#593).
