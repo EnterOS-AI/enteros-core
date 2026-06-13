@@ -188,6 +188,14 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		// so the canvas flips to failed in seconds instead of waiting
 		// for the 10-minute provision-timeout sweeper.
 		wsAdmin.POST("/admin/workspaces/:id/bootstrap-failed", wh.BootstrapFailed)
+		// Revoke a workspace's live auth tokens so its next /registry/register
+		// is bootstrap-allowed. The CP migrator calls this during a cross-cloud
+		// cutover: the migrated container boots with an empty /configs (no
+		// .auth_token — CP#672 doesn't persist /configs) and would otherwise
+		// 401 forever against the SOURCE box's still-live token. Mirrors the
+		// revoke the restart pipeline already does (issueAndInjectToken →
+		// RevokeAllForWorkspace); the SaaS path has no stale-token sweeper.
+		wsAdmin.POST("/admin/workspaces/:id/revoke-auth-tokens", wh.RevokeAuthTokens)
 		// Per-workspace LLM billing mode override (internal#691). Used by
 		// CP's /cp/admin/workspaces/:id/llm-billing-mode proxy + (via that
 		// proxy) by the canvas Config-tab "LLM Billing" section. Default-
