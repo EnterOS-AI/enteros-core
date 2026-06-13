@@ -98,13 +98,19 @@ func QueueStatusByID(ctx context.Context, queueID string) (*QueueStatus, error) 
 			q.dispatched_at::text,
 			q.completed_at::text,
 			q.expires_at::text,
-			COALESCE(q.response_body::text, al.response_body::text)
+			COALESCE(
+				q.response_body::text,
+				(
+					SELECT al.response_body::text
+					FROM activity_logs al
+					WHERE al.method = 'delegate_result'
+						AND al.target_id = q.workspace_id
+						AND al.workspace_id = q.caller_id
+						AND al.response_body->>'delegation_id' = (q.body->'params'->'message'->'metadata'->>'delegation_id')
+					LIMIT 1
+				)
+			)
 		FROM a2a_queue q
-		LEFT JOIN activity_logs al
-			ON al.method = 'delegate_result'
-			AND al.target_id = q.workspace_id
-			AND al.workspace_id = q.caller_id
-			AND al.response_body->>'delegation_id' = (q.body->'params'->'message'->'metadata'->>'delegation_id')
 		WHERE q.id = $1
 	`, queueID).Scan(
 		&qs.ID, &qs.WorkspaceID, &qs.Status, &qs.Priority, &qs.Attempts,
