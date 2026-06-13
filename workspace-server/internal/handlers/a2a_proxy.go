@@ -380,6 +380,50 @@ func (h *WorkspaceHandler) ProxyA2A(c *gin.Context) {
 		}
 	}
 
+	// CANVAS CAP-AND-QUEUE (core#2751, DEFAULT OFF). The canvas→agent POST is
+	// held for the whole turn; a turn longer than Cloudflare's ~100s edge limit
+	// returns a 524 (the recurring "Failed to send"). When A2A_CANVAS_SYNC_BUDGET
+	// > 0, cap the SYNCHRONOUS wait for canvas callers below that limit: if the
+	// turn hasn't finished by the budget, ack `{status:"queued"}` and let the
+	// dispatch finish on its own — proxyA2ARequest's dispatch already runs on a
+	// context.WithoutCancel forward ctx (idle-bounded), so it survives this
+	// handler returning, and the agent's reply reaches the canvas via the
+	// AGENT_MESSAGE WebSocket broadcast (the exact poll-mode contract). The work
+	// runs on a detached ctx so its DB logging isn't cancelled when we return.
+	// Budget=0 (default) → the unchanged synchronous path below; no behavior
+	// change until an operator opts in. See the design on core#2751.
+	if budget := envx.Duration("A2A_CANVAS_SYNC_BUDGET", 0); budget > 0 && (callerID == "" || isCanvasUser) {
+		type a2aResult struct {
+			status int
+			body   []byte
+			perr   *proxyA2AError
+		}
+		detached := context.WithoutCancel(ctx)
+		done := make(chan a2aResult, 1)
+		go func() {
+			s, b, pe := h.proxyA2ARequest(detached, workspaceID, body, callerID, true, isCanvasUser)
+			done <- a2aResult{s, b, pe}
+		}()
+		select {
+		case r := <-done:
+			if r.perr != nil {
+				for k, v := range r.perr.Headers {
+					c.Header(k, v)
+				}
+				c.JSON(r.perr.Status, r.perr.Response)
+				return
+			}
+			c.Data(r.status, "application/json", r.body)
+			return
+		case <-time.After(budget):
+			// Outlived CF's edge limit — ack queued; the goroutine finishes and
+			// the reply lands via WS. The canvas already treats `queued` as
+			// "still processing" (delivery_mode mirrors poll-mode).
+			c.JSON(http.StatusOK, gin.H{"status": "queued", "delivery_mode": "push-async", "method": "message/send"})
+			return
+		}
+	}
+
 	status, respBody, proxyErr := h.proxyA2ARequest(ctx, workspaceID, body, callerID, true, isCanvasUser)
 	if proxyErr != nil {
 		for k, v := range proxyErr.Headers {
@@ -565,7 +609,7 @@ func (h *WorkspaceHandler) proxyA2ARequest(ctx context.Context, workspaceID stri
 	// intent if anyone ever does that), BEFORE resolveAgentURL (mock
 	// has no URL — going through resolveAgentURL would 404 on the
 	// SELECT url since the row is provisioned as NULL).
-	if status, respBody, handled := h.handleMockA2A(ctx, workspaceID, callerID, body, a2aMethod, logActivity); handled {
+	if status, respBody, handled := h.handleMockA2A(ctx, workspaceID, callerID, isCanvasUser, body, a2aMethod, logActivity); handled {
 		return status, respBody, nil
 	}
 
@@ -631,7 +675,7 @@ func (h *WorkspaceHandler) proxyA2ARequest(ctx context.Context, workspaceID stri
 		log.Printf("ProxyA2A: body read failed for %s (status=%d delivery_confirmed=%v bytes_read=%d): %v",
 			workspaceID, resp.StatusCode, deliveryConfirmed, len(respBody), readErr)
 		if logActivity && deliveryConfirmed {
-			h.logA2ASuccess(ctx, workspaceID, callerID, body, respBody, a2aMethod, resp.StatusCode, durationMs)
+			h.logA2ASuccess(ctx, workspaceID, callerID, isCanvasUser, body, respBody, a2aMethod, resp.StatusCode, durationMs)
 		}
 		// Preserve the actual HTTP status code and any body bytes already read.
 		// Previously this returned (0, nil, error) which discarded both.
@@ -681,7 +725,7 @@ func (h *WorkspaceHandler) proxyA2ARequest(ctx context.Context, workspaceID stri
 	}
 
 	if logActivity {
-		h.logA2ASuccess(ctx, workspaceID, callerID, body, respBody, a2aMethod, resp.StatusCode, durationMs)
+		h.logA2ASuccess(ctx, workspaceID, callerID, isCanvasUser, body, respBody, a2aMethod, resp.StatusCode, durationMs)
 	}
 
 	// Track LLM token usage for cost transparency (#593).

@@ -181,7 +181,7 @@ func extractRequestID(body []byte) string {
 // mock reply in the trace alongside real-agent traffic. Without this
 // the demo would render messages on the canvas chat panel but a peer
 // node clicking through to its activity tab would see an empty list.
-func (h *WorkspaceHandler) handleMockA2A(ctx context.Context, workspaceID, callerID string, body []byte, a2aMethod string, logActivity bool) (int, []byte, bool) {
+func (h *WorkspaceHandler) handleMockA2A(ctx context.Context, workspaceID, callerID string, isCanvasUser bool, body []byte, a2aMethod string, logActivity bool) (int, []byte, bool) {
 	if lookupRuntime(ctx, workspaceID) != MockRuntimeName {
 		return 0, nil, false
 	}
@@ -204,7 +204,7 @@ func (h *WorkspaceHandler) handleMockA2A(ctx context.Context, workspaceID, calle
 		// is identical to a real agent reply. Status 200 + duration 0
 		// is the "synthesised reply" marker; activity_logs.duration_ms
 		// being 0 is harmless (real fast paths can hit 0 too).
-		h.logA2ASuccess(ctx, workspaceID, callerID, body, respBody, a2aMethod, http.StatusOK, 0)
+		h.logA2ASuccess(ctx, workspaceID, callerID, isCanvasUser, body, respBody, a2aMethod, http.StatusOK, 0)
 	}
 	return http.StatusOK, respBody, true
 }
