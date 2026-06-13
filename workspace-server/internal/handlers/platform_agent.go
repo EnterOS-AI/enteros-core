@@ -232,6 +232,44 @@ func platformRootWorkspaceID(ctx context.Context) string {
 	return ""
 }
 
+// defaultCreateParentID resolves the parent a NEW workspace should nest under
+// when the caller didn't pass one. Order:
+//  1. The org's platform-agent root (kind='platform'), if exactly one — the
+//     intended home (core#2609).
+//  2. FALLBACK (core#2697): when the org has NO platform-agent (e.g. a tenant
+//     provisioned with only a plain root workspace — JRS had just its SEO Agent
+//     at parent_id NULL), nest under the SOLE non-removed root workspace if there
+//     is exactly one. Without this, new workspaces scatter at bare root as
+//     siblings of that root agent, and approval/discovery treat each NULL-parent
+//     row as its own org root, breaking hierarchy + delegation routing.
+//
+// Returns "" only when neither a single platform root NOR a single plain root
+// can be identified (0 or >1 of each), preserving bootstrap/self-host multi-root
+// behavior. The DURABLE fix is guaranteeing every org has a platform-agent at
+// provision; this is the safe runtime fallback until then.
+func defaultCreateParentID(ctx context.Context) string {
+	if rootID := platformRootWorkspaceID(ctx); rootID != "" {
+		return rootID
+	}
+	rows, err := db.DB.QueryContext(ctx,
+		`SELECT id FROM workspaces WHERE parent_id IS NULL AND status != 'removed' LIMIT 2`)
+	if err != nil {
+		return ""
+	}
+	defer rows.Close()
+	roots := make([]string, 0, 2)
+	for rows.Next() {
+		var id string
+		if rows.Scan(&id) == nil {
+			roots = append(roots, id)
+		}
+	}
+	if len(roots) == 1 {
+		return roots[0]
+	}
+	return ""
+}
+
 // defaultPlatformAgentName returns the display name for the org's platform
 // agent (the concierge). When the tenant server is told its org's name via the
 // MOLECULE_ORG_NAME env (the self-hosted docker-compose sets it; SaaS passes an

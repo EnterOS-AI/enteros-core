@@ -651,3 +651,37 @@ func TestConciergeSystemPrompt_IncludesAckFirstDirective(t *testing.T) {
 		t.Errorf("concierge prompt missing 'Report back clearly' section header (the ack-first directive should live in this section per core#2724):\n%s", prompt)
 	}
 }
+
+// TestDefaultCreateParentID covers core#2697: new workspaces nest under the
+// platform-agent root when one exists, else fall back to the SOLE plain root
+// workspace (the JRS case — a lone SEO Agent at parent_id NULL), else "".
+func TestDefaultCreateParentID(t *testing.T) {
+	platQ := `SELECT id FROM workspaces WHERE COALESCE\(kind, 'workspace'\) = 'platform'`
+	rootQ := `SELECT id FROM workspaces WHERE parent_id IS NULL`
+
+	t.Run("prefers the platform-agent root when exactly one exists", func(t *testing.T) {
+		mock := setupTestDB(t)
+		mock.ExpectQuery(platQ).WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("plat-1"))
+		if got := defaultCreateParentID(context.Background()); got != "plat-1" {
+			t.Fatalf("want plat-1, got %q", got)
+		}
+	})
+
+	t.Run("falls back to the sole plain root when no platform-agent (JRS case)", func(t *testing.T) {
+		mock := setupTestDB(t)
+		mock.ExpectQuery(platQ).WillReturnRows(sqlmock.NewRows([]string{"id"})) // 0 platform
+		mock.ExpectQuery(rootQ).WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("seo-agent"))
+		if got := defaultCreateParentID(context.Background()); got != "seo-agent" {
+			t.Fatalf("want seo-agent (fallback to sole root), got %q", got)
+		}
+	})
+
+	t.Run("returns empty when no platform and multiple roots (ambiguous)", func(t *testing.T) {
+		mock := setupTestDB(t)
+		mock.ExpectQuery(platQ).WillReturnRows(sqlmock.NewRows([]string{"id"}))
+		mock.ExpectQuery(rootQ).WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("r1").AddRow("r2"))
+		if got := defaultCreateParentID(context.Background()); got != "" {
+			t.Fatalf("want empty (ambiguous multi-root), got %q", got)
+		}
+	})
+}
