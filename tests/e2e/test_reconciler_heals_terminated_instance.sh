@@ -97,6 +97,15 @@ REPROVISION_TIMEOUT_SECS="${E2E_REPROVISION_TIMEOUT_SECS:-600}"
 # RUN_ID_SUFFIX removed (core#2782 follow-up shellcheck): the slug now comes
 # from make_collision_proof_slug below; the old suffix var is dead.
 
+# log/fail/ok MUST be defined BEFORE the assert_collision_proof_slug call
+# below (which uses `|| fail "..."`). Defining them after the call would
+# error on a bad slug with `fail: command not found` instead of the
+# intended diagnostic — silent misbehaviour that the lint can't catch.
+# Mirrors the order in test_staging_full_saas.sh.
+log()  { echo "[$(date +%H:%M:%S)] $*"; }
+fail() { echo "[$(date +%H:%M:%S)] ❌ $*" >&2; exit 1; }
+ok()   { echo "[$(date +%H:%M:%S)] ✅ $*"; }
+
 # Slug MUST start with e2e- so sweep-stale-e2e-orgs.yml reaps any orphan this
 # run leaks (lint_cleanup_traps.sh enforces the e2e-/rt-e2e- prefix for any
 # staging tenant E2E; we honour it here too even though our filename isn't
@@ -111,10 +120,6 @@ REPROVISION_TIMEOUT_SECS="${E2E_REPROVISION_TIMEOUT_SECS:-600}"
 source "$(dirname "$0")/lib/collision-proof-slug.sh"
 SLUG="e2e-rec-$(make_collision_proof_slug_suffix "${E2E_RUN_ID:-}")
 assert_collision_proof_slug "$SLUG" || fail "Bug in make_collision_proof_slug: produced non-collision-proof slug '$SLUG'"
-
-log()  { echo "[$(date +%H:%M:%S)] $*"; }
-fail() { echo "[$(date +%H:%M:%S)] ❌ $*" >&2; exit 1; }
-ok()   { echo "[$(date +%H:%M:%S)] ✅ $*"; }
 
 # Per-runtime model slug dispatch — shared with the full-saas harness.
 # shellcheck disable=SC1091
