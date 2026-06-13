@@ -363,6 +363,18 @@ func (h *WorkspaceHandler) ProxyA2A(c *gin.Context) {
 		}
 	}
 
+	// core#2691: attach the authenticated human sender's identity to canvas_user
+	// messages, and fail-closed to UNAUTHENTICATED when it cannot be resolved.
+	if isCanvasUser {
+		ident := resolveCanvasIdentity(c)
+		body, err = injectCanvasUserIdentity(body, ident)
+		if err != nil {
+			log.Printf("ProxyA2A: failed to inject canvas identity: %v", err)
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid A2A body"})
+			return
+		}
+	}
+
 	status, respBody, proxyErr := h.proxyA2ARequest(ctx, workspaceID, body, callerID, true, isCanvasUser)
 	if proxyErr != nil {
 		for k, v := range proxyErr.Headers {

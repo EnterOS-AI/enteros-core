@@ -32,6 +32,22 @@ var sessionCache = struct {
 	entries map[string]sessionCacheEntry
 }{entries: make(map[string]sessionCacheEntry)}
 
+// identityCache holds short-lived /cp/auth/me responses for verified canvas
+// sessions. It is separate from sessionCache because a session may be valid
+// while the identity endpoint is temporarily unavailable, and we want the
+// identity lookup to retry without poisoning the session-validity cache.
+var identityCache = struct {
+	sync.Mutex
+	entries map[string]identityCacheEntry
+}{entries: make(map[string]identityCacheEntry)}
+
+type identityCacheEntry struct {
+	expiresAt time.Time
+	userID    string
+	email     string
+	ok        bool
+}
+
 const (
 	// Positive TTL: on the higher end because a valid session is
 	// stable until logout. 30s means logout or role change takes at
@@ -50,6 +66,12 @@ const (
 
 	// Sweeper runs opportunistically; cost is O(N) per sweep.
 	sessionCacheSweepEvery = 2 * time.Minute
+
+	// identityCache* mirror sessionCache but for /cp/auth/me results.
+	identityCacheTTLOK     = 30 * time.Second
+	identityCacheTTLFail   = 5 * time.Second
+	identityCacheMax       = 10_000
+	identityCacheSweepEvery = 2 * time.Minute
 )
 
 type sessionCacheEntry struct {
@@ -123,6 +145,7 @@ func init() {
 		defer t.Stop()
 		for range t.C {
 			sweepExpired()
+			sweepExpiredIdentity()
 		}
 	}()
 }
@@ -160,6 +183,17 @@ func sweepExpired() {
 	for k, e := range sessionCache.entries {
 		if now.After(e.expiresAt) {
 			delete(sessionCache.entries, k)
+		}
+	}
+}
+
+func sweepExpiredIdentity() {
+	now := time.Now()
+	identityCache.Lock()
+	defer identityCache.Unlock()
+	for k, e := range identityCache.entries {
+		if now.After(e.expiresAt) {
+			delete(identityCache.entries, k)
 		}
 	}
 }
@@ -254,4 +288,114 @@ func VerifiedCPSession(cookieHeader string) (valid, presented bool) {
 
 	sessionCachePut(key, true)
 	return true, true
+}
+
+// VerifiedCPIdentity resolves the authenticated user's identity from the
+// control plane's /cp/auth/me endpoint. It returns (userID, email, ok).
+// ok=false means the identity could not be resolved (no cookie, CP not
+// configured, non-200 response, or missing fields). The caller is expected
+// to label the message UNAUTHENTICATED in that case.
+//
+// Results are short-cached in identityCache so a burst of canvas messages
+// from the same session does not hammer the CP.
+func VerifiedCPIdentity(cookieHeader string) (userID, email string, ok bool) {
+	if cookieHeader == "" {
+		return "", "", false
+	}
+	slug := tenantSlug()
+	if slug == "" {
+		return "", "", false
+	}
+	base := strings.TrimRight(os.Getenv("CP_UPSTREAM_URL"), "/")
+	if base == "" {
+		return "", "", false
+	}
+
+	key := cacheKey(slug, cookieHeader)
+	if e, hit := identityCacheGet(key); hit {
+		return e.userID, e.email, e.ok
+	}
+
+	client := &http.Client{Timeout: 3 * time.Second}
+	req, err := http.NewRequest("GET", base+"/cp/auth/me", nil)
+	if err != nil {
+		log.Printf("VerifiedCPIdentity: build req: %v", err)
+		identityCachePut(key, "", "", false)
+		return "", "", false
+	}
+	req.Header.Set("Cookie", cookieHeader)
+	req.Header.Set("User-Agent", "molecule-tenant-platform/session-identity")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("VerifiedCPIdentity: upstream: %v", err)
+		identityCachePut(key, "", "", false)
+		return "", "", false
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		identityCachePut(key, "", "", false)
+		return "", "", false
+	}
+
+	var body struct {
+		UserID string `json:"user_id"`
+		Email  string `json:"email"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		log.Printf("VerifiedCPIdentity: decode: %v", err)
+		identityCachePut(key, "", "", false)
+		return "", "", false
+	}
+	if body.UserID == "" || body.Email == "" {
+		identityCachePut(key, "", "", false)
+		return "", "", false
+	}
+
+	identityCachePut(key, body.UserID, body.Email, true)
+	return body.UserID, body.Email, true
+}
+
+// identityCacheGet returns the cached identity entry and a hit flag.
+func identityCacheGet(key string) (identityCacheEntry, bool) {
+	identityCache.Lock()
+	defer identityCache.Unlock()
+	e, present := identityCache.entries[key]
+	if !present {
+		return identityCacheEntry{}, false
+	}
+	if time.Now().After(e.expiresAt) {
+		delete(identityCache.entries, key)
+		return identityCacheEntry{}, false
+	}
+	return e, true
+}
+
+// identityCachePut stores the identity result with the appropriate TTL and
+// keeps the cache bounded.
+func identityCachePut(key, userID, email string, ok bool) {
+	ttl := identityCacheTTLFail
+	if ok {
+		ttl = identityCacheTTLOK
+	}
+	identityCache.Lock()
+	defer identityCache.Unlock()
+	if len(identityCache.entries) >= identityCacheMax {
+		const evictBatch = 128
+		i := 0
+		for k := range identityCache.entries {
+			delete(identityCache.entries, k)
+			i++
+			if i >= evictBatch {
+				break
+			}
+		}
+	}
+	identityCache.entries[key] = identityCacheEntry{
+		expiresAt: time.Now().Add(ttl),
+		userID:    userID,
+		email:     email,
+		ok:        ok,
+	}
 }

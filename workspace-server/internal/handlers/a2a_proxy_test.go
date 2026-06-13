@@ -2886,3 +2886,76 @@ func TestA2AClientResponseHeaderTimeout(t *testing.T) {
 		}
 	})
 }
+
+// ==================== core#2691 canvas_user identity injection ====================
+
+func TestInjectCanvasUserIdentity_Authenticated(t *testing.T) {
+	body := []byte(`{"method":"message/send","params":{"message":{"role":"user","parts":[{"kind":"text","text":"hi"}]}}}`)
+	ident := &canvasIdentity{Status: "AUTHENTICATED", UserID: "u_123", Email: "kim@example.com"}
+
+	out, err := injectCanvasUserIdentity(body, ident)
+	if err != nil {
+		t.Fatalf("inject failed: %v", err)
+	}
+
+	var env map[string]interface{}
+	if err := json.Unmarshal(out, &env); err != nil {
+		t.Fatalf("unmarshal failed: %v", err)
+	}
+	meta := env["params"].(map[string]interface{})["metadata"].(map[string]interface{})
+	if meta["source"] != "canvas_user" {
+		t.Errorf("source = %v, want canvas_user", meta["source"])
+	}
+	if meta["user_identity_status"] != "AUTHENTICATED" {
+		t.Errorf("status = %v, want AUTHENTICATED", meta["user_identity_status"])
+	}
+	if meta["user_id"] != "u_123" {
+		t.Errorf("user_id = %v, want u_123", meta["user_id"])
+	}
+	if meta["email"] != "kim@example.com" {
+		t.Errorf("email = %v, want kim@example.com", meta["email"])
+	}
+	if meta["username"] != "kim@example.com" {
+		t.Errorf("username = %v, want kim@example.com", meta["username"])
+	}
+}
+
+func TestInjectCanvasUserIdentity_Unauthenticated(t *testing.T) {
+	body := []byte(`{"method":"message/send","params":{"message":{"role":"user","parts":[{"kind":"text","text":"hi"}]}}}`)
+	ident := &canvasIdentity{Status: "UNAUTHENTICATED"}
+
+	out, err := injectCanvasUserIdentity(body, ident)
+	if err != nil {
+		t.Fatalf("inject failed: %v", err)
+	}
+
+	var env map[string]interface{}
+	if err := json.Unmarshal(out, &env); err != nil {
+		t.Fatalf("unmarshal failed: %v", err)
+	}
+	meta := env["params"].(map[string]interface{})["metadata"].(map[string]interface{})
+	if meta["source"] != "canvas_user" {
+		t.Errorf("source = %v, want canvas_user", meta["source"])
+	}
+	if meta["user_identity_status"] != "UNAUTHENTICATED" {
+		t.Errorf("status = %v, want UNAUTHENTICATED", meta["user_identity_status"])
+	}
+	if _, ok := meta["user_id"]; ok {
+		t.Errorf("user_id should not be set for unauthenticated")
+	}
+	if _, ok := meta["email"]; ok {
+		t.Errorf("email should not be set for unauthenticated")
+	}
+}
+
+func TestInjectCanvasUserIdentity_Nil(t *testing.T) {
+	body := []byte(`{"method":"message/send","params":{"message":{"role":"user"}}}`)
+	out, err := injectCanvasUserIdentity(body, nil)
+	if err != nil {
+		t.Fatalf("nil identity should not error: %v", err)
+	}
+	if !bytes.Equal(out, body) {
+		t.Errorf("nil identity should return body unchanged")
+	}
+}
+
