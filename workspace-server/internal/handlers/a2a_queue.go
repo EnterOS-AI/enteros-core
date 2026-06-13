@@ -113,8 +113,20 @@ func EnqueueA2A(
 	if idempotencyKey != "" {
 		keyArg = idempotencyKey
 	}
+	// Normalize the callerID the same way nilIfEmpty does in
+	// a2a_proxy_helpers.go: system-caller prefixes (webhook:,
+	// system:, test:, channel:) are non-UUID routing markers, not real
+	// workspace ids. Persisting them to a2a_queue.caller_id (a
+	// UUID-typed column per migrations/042_a2a_queue.up.sql:21) would
+	// trip a Postgres UUID cast failure → "invalid input syntax for
+	// type uuid" → EnqueueA2A returns an error → the busy-A2A path
+	// falls through to a 503 instead of queueing. See #2694 RC
+	// #99248 for the symptom + #2693 for the broader #2680 lineage.
+	//
+	// Real workspace UUIDs are passed through unchanged so the
+	// queue-row attribution is preserved.
 	var callerArg interface{}
-	if callerID != "" {
+	if callerID != "" && !isSystemCaller(callerID) {
 		callerArg = callerID
 	}
 	var methodArg interface{}
