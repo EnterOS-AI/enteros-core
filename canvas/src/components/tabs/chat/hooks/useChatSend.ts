@@ -145,22 +145,28 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
   // until the LAST pending send completes.
   //
   // Lifecycle:
-  //   - inFlightTokensRef:   POST dispatched, no terminal HTTP reply yet.
-  //   - pendingWSTokensRef:  HTTP replied in a "delivered, await WS" state
-  //                          (queued poll-mode, client timeout, CF 524). The
-  //                          spinner stays up; releaseSendGuards prunes these
-  //                          when the AGENT_MESSAGE / onSendComplete WS event
-  //                          arrives.
-  //   - messageIdToTokenRef: Map from client-generated messageId to token.
-  //                          Lets WebSocket completion events finish the
-  //                          SPECIFIC send they belong to, avoiding cross-send
-  //                          contamination (CR2 #11466).
-  //   - setupGuardRef:       brief synchronous guard so a double-click in the
-  //                          same tick dispatches only once. Released on the
-  //                          next microtask after the POST is fired, so
-  //                          distinct follow-up sends are never blocked.
+  //   - inFlightTokensRef:    POST dispatched, no terminal HTTP reply yet.
+  //   - pendingWSTokensRef:   HTTP replied in a "delivered, await WS" state
+  //                           (queued poll-mode, client timeout, CF 524). The
+  //                           spinner stays up; finishSendByMessageId or
+  //                           releaseSendGuards prunes these.
+  //   - messageIdToTokenRef:  Map from client-generated messageId to token.
+  //                           Lets WebSocket completion events finish the
+  //                           SPECIFIC send they belong to, avoiding cross-send
+  //                           contamination (CR2 #11466).
+  //   - wsCompletedTokensRef: Legacy fallback set for older ws-server builds
+  //                           that do not broadcast a messageId. When
+  //                           releaseSendGuards() is called without a specific
+  //                           token, every currently tracked token is marked as
+  //                           WS-completed so a late timeout/524 can finish
+  //                           itself instead of re-pending forever (CR2 #11470).
+  //   - setupGuardRef:        brief synchronous guard so a double-click in the
+  //                           same tick dispatches only once. Released on the
+  //                           next microtask after the POST is fired, so
+  //                           distinct follow-up sends are never blocked.
   const inFlightTokensRef = useRef<Set<number>>(new Set());
   const pendingWSTokensRef = useRef<Set<number>>(new Set());
+  const wsCompletedTokensRef = useRef<Set<number>>(new Set());
   const messageIdToTokenRef = useRef<Map<string, number>>(new Map());
   const sendingFromAPIRef = useRef(false);
   const nextTokenRef = useRef(1);
@@ -176,9 +182,17 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
   }, []);
 
   const releaseSendGuards = useCallback(() => {
-    // Legacy coarse fallback: clear every token waiting for a WebSocket
-    // completion. Prefer finishSendByMessageId(messageId) for precise,
-    // cross-send-safe cleanup when the server provides the messageId.
+    // Legacy coarse fallback for older ws-server builds that do not broadcast
+    // a messageId. Mark every currently tracked token as WS-completed so a
+    // late timeout/524 for any of them can finish itself instead of re-pending
+    // forever (CR2 #11470). Prefer finishSendByMessageId(messageId) on modern
+    // servers for precise, cross-send-safe cleanup (CR2 #11466).
+    for (const token of inFlightTokensRef.current) {
+      wsCompletedTokensRef.current.add(token);
+    }
+    for (const token of pendingWSTokensRef.current) {
+      wsCompletedTokensRef.current.add(token);
+    }
     pendingWSTokensRef.current.clear();
     syncSendingState();
   }, [syncSendingState]);
@@ -186,6 +200,7 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
   const finishSendToken = useCallback((token: number) => {
     inFlightTokensRef.current.delete(token);
     pendingWSTokensRef.current.delete(token);
+    wsCompletedTokensRef.current.delete(token);
     // Clean up the messageId mapping (linear scan is fine: N is tiny).
     for (const [mid, tok] of messageIdToTokenRef.current) {
       if (tok === token) {
@@ -205,12 +220,18 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
 
   const pendSendTokenForWS = useCallback((token: number) => {
     // HTTP replied "queued / still alive via WS". Move from in-flight to the
-    // WS-pending set so the spinner persists until releaseSendGuards or
-    // finishSendByMessageId cleans it up.
+    // WS-pending set so the spinner persists until finishSendByMessageId or
+    // releaseSendGuards cleans it up. If the WS completion already fired for
+    // this token (legacy fallback path), finish immediately instead of
+    // re-pending forever (CR2 #11470).
+    if (wsCompletedTokensRef.current.has(token)) {
+      finishSendToken(token);
+      return;
+    }
     inFlightTokensRef.current.delete(token);
     pendingWSTokensRef.current.add(token);
     syncSendingState();
-  }, [syncSendingState]);
+  }, [syncSendingState, finishSendToken]);
 
   const clearError = useCallback(() => setError(null), []);
 
@@ -339,7 +360,13 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
           // ACTIVITY_LOGGED status="error"). Don't synthesise an empty
           // agent bubble.
           if (resp?.status === "queued") {
-            pendSendTokenForWS(myToken);
+            // If WS already completed for this token via the legacy fallback
+            // path, finish immediately instead of re-pending forever.
+            if (wsCompletedTokensRef.current.has(myToken)) {
+              finishSendToken(myToken);
+            } else {
+              pendSendTokenForWS(myToken);
+            }
             return;
           }
 

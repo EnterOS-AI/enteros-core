@@ -264,4 +264,39 @@ describe("useChatSend — concurrent replies (core#2725)", () => {
     });
     expect(result.current.sending).toBe(false);
   });
+
+  it("legacy fallback: releaseSendGuards() with no messageId still handles late timeout/524 (CR2 #11470)", async () => {
+    // Older ws-server builds do not broadcast messageId. releaseSendGuards()
+    // marks all tracked tokens as WS-completed so a subsequent late
+    // timeout/524 finishes itself rather than re-pending forever.
+    const send = deferred();
+    apiPostMock.mockImplementationOnce(() => send.promise);
+
+    const { result } = renderHook(() =>
+      useChatSend("ws-legacy", { getHistoryMessages: () => [] }),
+    );
+
+    await act(async () => {
+      await result.current.sendMessage("long turn");
+      await Promise.resolve();
+    });
+    expect(result.current.sending).toBe(true);
+
+    // WS completion arrives without a messageId (legacy path).
+    act(() => {
+      result.current.releaseSendGuards();
+    });
+    expect(result.current.sending).toBe(true);
+
+    // Late client timeout lands.
+    const timeoutErr = new Error("signal timed out") as Error & { name: string };
+    timeoutErr.name = "TimeoutError";
+    await act(async () => {
+      send.reject(timeoutErr);
+      await Promise.resolve();
+    });
+
+    expect(result.current.sending).toBe(false);
+    expect(result.current.error).toBeNull();
+  });
 });
