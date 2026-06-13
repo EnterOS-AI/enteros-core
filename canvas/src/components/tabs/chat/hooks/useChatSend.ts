@@ -157,7 +157,14 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
   const sendMessage = useCallback(
     async (text: string, files: File[] = []) => {
       const trimmed = text.trim();
-      if ((!trimmed && files.length === 0) || sending || uploading) return;
+      // Multi-send (core#2697 feature 2): do NOT block on `sending`. A user
+      // must be able to fire a follow-up while a prior message's agent reply
+      // is still pending — the server-side A2A queue is durable and orders
+      // them. `sendInFlightRef` is now only a brief re-entrancy guard for the
+      // synchronous setup (file upload + optimistic add + POST dispatch); it
+      // is released the moment the POST is FIRED (below), NOT held across the
+      // multi-minute reply wait, so the next send proceeds immediately.
+      if ((!trimmed && files.length === 0) || uploading) return;
       if (sendInFlightRef.current) return;
       sendInFlightRef.current = true;
 
@@ -306,8 +313,15 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
           releaseSendGuards();
           setError("Failed to send message — agent may be unreachable");
         });
+
+      // The POST is now in flight (the .then/.catch above run later, off the
+      // microtask queue). Release the re-entrancy guard immediately so the
+      // user can fire the NEXT message while this one's reply is still
+      // pending — true multi-send. `sending` stays true to keep the thinking
+      // indicator up; it no longer gates new sends.
+      sendInFlightRef.current = false;
     },
-    [workspaceId, sending, uploading],
+    [workspaceId, uploading],
   );
 
   return {
