@@ -87,7 +87,7 @@ func TestProxyA2A_RequestBodyTooLarge(t *testing.T) {
 
 	handler.ProxyA2A(c)
 
-	if w.Code != http.StatusPayloadTooLarge {
+	if w.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("expected status 413, got %d: %s", w.Code, w.Body.String())
 	}
 	var resp map[string]interface{}
