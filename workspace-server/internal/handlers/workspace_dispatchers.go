@@ -177,14 +177,42 @@ func (h *WorkspaceHandler) provisionWorkspaceAuto(workspaceID, templatePath stri
 // Keep these two helpers in sync — when one grows a new arm (third
 // backend, retry semantics), the other should too.
 //
-// core#2771: the same per-workspace provision gate as the async
-// variant is acquired synchronously BEFORE the call to provisionWorkspace*.
-// The gate is released by the caller once the synchronous provision
-// returns (no goroutine to defer from on this path). Without the gate
-// here, a Create→Sync path racing with a Restart for the same
-// ws-<id> would still reach provisioner.Start twice and trigger the
-// Docker name conflict.
+// core#2771: acquires the per-workspace provision gate before doing
+// the provision work, then calls the Locked variant. Callers that
+// ALREADY hold the gate (e.g. runRestartCycle) must call
+// provisionWorkspaceAutoSyncLocked directly to avoid re-locking the
+// non-reentrant sync.Mutex. Provisioning a workspace under an
+// already-held gate is the contract: a Create call that races a
+// Restart's gate is blocked at the create side, NOT inside the
+// Restart's hold window.
+//
+// Why a non-reentrant mutex: the sync.Map-of-locks pattern
+// (acquireRestartProvisionGate) returns the same *sync.Mutex for a
+// given workspaceID across the process lifetime. Re-entrancy would
+// require either a counter (extra complexity, easy to leak) or a
+// different mutex type. The split-function pattern is the
+// std-lib-native way to model "caller may or may not hold the gate"
+// without giving up non-reentrance.
 func (h *WorkspaceHandler) provisionWorkspaceAutoSync(workspaceID, templatePath string, configFiles map[string][]byte, payload models.CreateWorkspacePayload) bool {
+	gate := acquireRestartProvisionGate(workspaceID)
+	gate.Lock()
+	defer gate.Unlock()
+	return h.provisionWorkspaceAutoSyncLocked(workspaceID, templatePath, configFiles, payload)
+}
+
+// provisionWorkspaceAutoSyncLocked is the locked variant — ASSUMES
+// acquireRestartProvisionGate(workspaceID) is already HELD by the
+// caller. Does the actual provision work (or no-backend mark-failed).
+// Split from provisionWorkspaceAutoSync to support callers that
+// already hold the gate (e.g. runRestartCycle, which acquires the
+// gate at the top of the cycle and holds it across Stop+provision
+// to serialize concurrent programmatic RestartByID paths against
+// the manual HTTP Restart path).
+//
+// Do NOT call this from a context that does NOT hold the gate —
+// the synchronization guarantee (Create+Restart serialize) is
+// broken if this is called outside an outer Lock+defer-Unlock scope.
+func (h *WorkspaceHandler) provisionWorkspaceAutoSyncLocked(workspaceID, templatePath string, configFiles map[string][]byte, payload models.CreateWorkspacePayload) bool {
 	provlog.Event("provision.start", map[string]any{
 		"workspace_id": workspaceID,
 		"name":         payload.Name,
@@ -193,9 +221,6 @@ func (h *WorkspaceHandler) provisionWorkspaceAutoSync(workspaceID, templatePath 
 		"template":     payload.Template,
 		"sync":         true,
 	})
-	gate := acquireRestartProvisionGate(workspaceID)
-	gate.Lock()
-	defer gate.Unlock()
 	if h.cpProv != nil {
 		h.provisionWorkspaceCP(workspaceID, templatePath, configFiles, payload)
 		return true
@@ -204,7 +229,7 @@ func (h *WorkspaceHandler) provisionWorkspaceAutoSync(workspaceID, templatePath 
 		h.provisionWorkspace(workspaceID, templatePath, configFiles, payload)
 		return true
 	}
-	log.Printf("provisionWorkspaceAutoSync: no provisioning backend wired for %s — marking failed (cpProv=nil, provisioner=nil)", workspaceID)
+	log.Printf("provisionWorkspaceAutoSyncLocked: no provisioning backend wired for %s — marking failed (cpProv=nil, provisioner=nil)", workspaceID)
 	failCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	h.markProvisionFailed(failCtx, workspaceID,
