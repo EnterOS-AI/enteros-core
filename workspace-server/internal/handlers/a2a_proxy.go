@@ -979,6 +979,18 @@ func normalizeA2APayload(body []byte) ([]byte, string, *proxyA2AError) {
 // now broadcasts unconditionally — together either one alone closes the
 // gap, both together is defence in depth.
 //
+// 2026-06-13 (core#2723): raised 5min → 30min. The 30s WORKSPACE_HEARTBEAT
+// normally resets this long before 5min, so the window only matters when
+// the heartbeat STALLS — which happens when the runtime's asyncio
+// heartbeat task is starved by a long *blocking* tool call (e.g. a bulk
+// asset migration). A real long autonomous turn was getting cancelled at
+// ~300s mid-work ("tool chain lost"). The complete fix is runtime-side
+// (heartbeat on an independent thread, tracked in #2723); raising this
+// ceiling is the deployable safety margin so a multi-minute blocking step
+// survives. 30min matches the agent-to-agent absolute ceiling. The canvas
+// path has no separate ceiling, so this is its only deadline; a genuinely
+// dead agent is still surfaced by the reactive-health path, not this.
+//
 // Override via A2A_IDLE_TIMEOUT_SECONDS for ops who want to tune (e.g.
 // shorter for canary/test runners that want fail-fast on wedge, longer
 // for prod tenants running unusually slow plugins).
@@ -987,7 +999,7 @@ var idleTimeoutDuration = parseIdleTimeoutEnv(os.Getenv("A2A_IDLE_TIMEOUT_SECOND
 // defaultIdleTimeoutDuration is what parseIdleTimeoutEnv returns when
 // the env var is unset or invalid. Pulled out as a const so tests can
 // reference it without re-deriving the value.
-const defaultIdleTimeoutDuration = 5 * time.Minute
+const defaultIdleTimeoutDuration = 30 * time.Minute
 
 // parseIdleTimeoutEnv parses the A2A_IDLE_TIMEOUT_SECONDS value, falling
 // back to defaultIdleTimeoutDuration on empty / non-numeric / non-positive
