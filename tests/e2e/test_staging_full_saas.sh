@@ -142,14 +142,23 @@ case "$MODE" in
   *) echo "E2E_MODE must be 'full' or 'smoke' (got: $MODE)" >&2; exit 2 ;;
 esac
 
-# Smoke runs get a distinct slug prefix so their safety-net sweeper only
-# touches their own runs, not in-flight full runs.
+# Collision-proof slug (core#2782). The prior `head -c 32` truncation
+# dropped the run_attempt suffix and let two parallel/retry runs
+# collide (POST /cp/admin/orgs 409). The helper appends a random
+# 8-char uuid so every run gets a unique slug regardless of how
+# the workflow composes E2E_RUN_ID. Asserted via the unit test
+# tests/e2e/test_collision_proof_slug_unit.sh.
+source "$(dirname "$0")/lib/collision-proof-slug.sh"
 if [ "$MODE" = "smoke" ]; then
-  SLUG="e2e-smoke-$(date +%Y%m%d)-${RUN_ID_SUFFIX}"
+  SLUG=$(make_collision_proof_slug "e2e-smoke" "${E2E_RUN_ID:-}")
 else
-  SLUG="e2e-$(date +%Y%m%d)-${RUN_ID_SUFFIX}"
+  SLUG=$(make_collision_proof_slug "e2e" "${E2E_RUN_ID:-}")
 fi
-SLUG=$(echo "$SLUG" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-' | head -c 32)
+# Self-check: fail loud at harness startup if a future refactor
+# drops the uuid suffix (defense in depth — the unit test
+# already covers this, but a redundant check in the harness
+# itself is cheap).
+assert_collision_proof_slug "$SLUG" || fail "Bug in make_collision_proof_slug: produced non-collision-proof slug '$SLUG' (assert_collision_proof_slug failed)"
 
 log()  { echo "[$(date +%H:%M:%S)] $*"; }
 fail() { echo "[$(date +%H:%M:%S)] ❌ $*" >&2; exit 1; }
@@ -331,12 +340,26 @@ admin_call() {
 log "1/11 Creating org $SLUG via /cp/admin/orgs..."
 CREATE_RESP=$(admin_call POST /cp/admin/orgs \
   -d "{\"slug\":\"$SLUG\",\"name\":\"E2E $SLUG\",\"owner_user_id\":\"e2e-runner:$SLUG\"}")
-echo "$CREATE_RESP" | python3 -m json.tool >/dev/null || fail "Org create returned non-JSON: $CREATE_RESP"
+# core#2782: log the full 409 response body on a collision so the
+# stale-slug-vs-fresh-slug diagnostic is queryable from CI logs.
+# Pre-fix the JSON was piped to /dev/null (`python3 -m json.tool >/dev/null`)
+# which silently swallowed the body — triage on the 2026-06-12
+# staging Platform Boot red had to guess whether the 409 was a
+# slug collision or a different state-conflict. Logging the body
+# makes future collisions instantly diagnosable.
+CREATE_HTTP_CODE=$(echo "$CREATE_RESP" | head -c 1)
+if [ -z "$CREATE_HTTP_CODE" ] || ! echo "$CREATE_RESP" | python3 -m json.tool >/dev/null 2>&1; then
+  log "❌ Org create failed; raw response body: $CREATE_RESP"
+  fail "Org create returned non-JSON (see body above)"
+fi
 # Capture org_id for tenant-guard header on every subsequent tenant call.
 # Without X-Molecule-Org-Id matching MOLECULE_ORG_ID on the tenant, the
 # tenant-guard middleware returns 404 to avoid leaking tenant existence.
 ORG_ID=$(echo "$CREATE_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('id',''))")
-[ -z "$ORG_ID" ] && fail "Org create response missing 'id': $CREATE_RESP"
+[ -z "$ORG_ID" ] && {
+  log "❌ Org create response missing 'id'; raw body: $CREATE_RESP"
+  fail "Org create response missing 'id' (see body above)"
+}
 ok "Org created (id=$ORG_ID)"
 
 # ─── 2. Wait for tenant provisioning ────────────────────────────────────

@@ -100,8 +100,14 @@ RUN_ID_SUFFIX="${E2E_RUN_ID:-$(date +%H%M%S)-$$}"
 # run leaks (lint_cleanup_traps.sh enforces the e2e-/rt-e2e- prefix for any
 # staging tenant E2E; we honour it here too even though our filename isn't
 # *staging*).
-SLUG="e2e-rec-$(date +%Y%m%d)-${RUN_ID_SUFFIX}"
-SLUG=$(echo "$SLUG" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-' | head -c 32)
+# Collision-proof slug (core#2782). The prior `head -c 32` truncation
+# dropped the run_attempt suffix and let two parallel/retry runs
+# collide (POST /cp/admin/orgs 409). The helper appends a random
+# 8-char uuid so every run gets a unique slug regardless of how
+# the workflow composes E2E_RUN_ID.
+source "$(dirname "$0")/lib/collision-proof-slug.sh"
+SLUG=$(make_collision_proof_slug "e2e-rec" "${E2E_RUN_ID:-}")
+assert_collision_proof_slug "$SLUG" || fail "Bug in make_collision_proof_slug: produced non-collision-proof slug '$SLUG'"
 
 log()  { echo "[$(date +%H:%M:%S)] $*"; }
 fail() { echo "[$(date +%H:%M:%S)] ❌ $*" >&2; exit 1; }
