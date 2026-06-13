@@ -152,6 +152,50 @@ func TestSwitchProvider_RejectsBadProvider(t *testing.T) {
 	}
 }
 
+// TestSwitchProvider_PreClaimRollbackOnError (CR2 #11486) is the
+// source-level pin for the commit-or-rollback pattern added after the
+// pre-claim landed. The pre-claim sets status='provisioning'; without
+// the rollback defer, any error / ctx-cancellation between pre-claim
+// and step 5 (committed) would strand the workspace in 'provisioning'
+// forever. The defer must:
+//   1. Revert status to priorStatus on any error path (commit-or-rollback).
+//   2. Use a fresh context (not the request ctx) so client
+//      disconnect mid-switch still cleans up.
+//   3. Set `committed = true` ONLY at the very end (after step 5).
+func TestSwitchProvider_PreClaimRollbackOnError(t *testing.T) {
+	wd, _ := os.Getwd()
+	src, err := os.ReadFile(filepath.Join(wd, "workspace_switch_provider.go"))
+	if err != nil {
+		t.Fatalf("read source: %v", err)
+	}
+	s := stripGoComments(src)
+	// Commit-or-rollback flag
+	if !bytes.Contains(s, []byte("committed := false")) {
+		t.Error("SwitchProvider must declare a `committed := false` flag for the commit-or-rollback pattern (CR2 #11486)")
+	}
+	if !bytes.Contains(s, []byte("committed = true")) {
+		t.Error("SwitchProvider must set `committed = true` only after the provision is dispatched — the rollback defer reads this flag to decide whether to revert status")
+	}
+	// defer that checks the flag and reverts
+	if !bytes.Contains(s, []byte("defer func() {")) || !bytes.Contains(s, []byte("if committed {")) {
+		t.Error("SwitchProvider must have a defer that checks the `committed` flag and reverts status to priorStatus on any uncommitted path (CR2 #11486)")
+	}
+	// Rollback uses a fresh context (not the request ctx) so client
+	// disconnect mid-switch still cleans up.
+	if !bytes.Contains(s, []byte("rollbackCtx, cancel := context.WithTimeout(context.Background()")) {
+		t.Error("SwitchProvider's rollback defer must use a FRESH context (context.Background), not the request ctx — a cancelled request ctx would skip the cleanup and strand the workspace")
+	}
+	// priorStatus captured at the top of the function
+	if !bytes.Contains(s, []byte("priorStatus := status")) {
+		t.Error("SwitchProvider must capture `priorStatus := status` (the value from the lookup query) before the pre-claim so the rollback can restore it")
+	}
+	// The rollback UPDATE is gated on status='provisioning' so we don't
+	// clobber a newer status set by a concurrent switch/provision.
+	if !bytes.Contains(s, []byte("AND status = $3")) {
+		t.Error("SwitchProvider's rollback UPDATE must be gated on `status = 'provisioning'` so a concurrent switch/provision that has already advanced the status is not clobbered")
+	}
+}
+
 // TestSwitchProvider_RouteRegistered pins the route wiring.
 func TestSwitchProvider_RouteRegistered(t *testing.T) {
 	wd, _ := os.Getwd()

@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
@@ -115,6 +116,32 @@ func (h *WorkspaceHandler) SwitchProvider(c *gin.Context) {
 
 	// --- ordered switch (see doc-comment) ---
 
+	// COMMIT-OR-ROLLBACK pattern for the pre-claim. After step 1 sets
+	// status='provisioning', any error / ctx-cancellation before step 5
+	// completes the switch leaves the workspace stranded in 'provisioning'
+	// forever (CR2 #11486 follow-up finding). The defer reverts status
+	// to priorStatus on ANY error path; the `committed` flag is set ONLY
+	// when the switch fully reaches step 5 (provision dispatched). The
+	// rollback uses a fresh context (not the request ctx) so a client
+	// disconnect mid-switch still cleans up.
+	committed := false
+	priorStatus := status
+	defer func() {
+		if committed {
+			return
+		}
+		rollbackCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, err := db.DB.ExecContext(rollbackCtx, `
+			UPDATE workspaces
+			SET status = $2, updated_at = now()
+			WHERE id = $1
+			  AND status = $3`,
+			id, priorStatus, models.StatusProvisioning); err != nil {
+			log.Printf("SwitchProvider: status revert failed for %s (priorStatus=%q): %v — workspace may need operator intervention", id, priorStatus, err)
+		}
+	}()
+
 	// 1. PRE-CLAIM: atomically mark the switch as in-flight by setting
 	//    status='provisioning' WITHOUT changing the provider. The CAS
 	//    (`status<>'provisioning' AND provider unchanged`) prevents a
@@ -124,9 +151,15 @@ func (h *WorkspaceHandler) SwitchProvider(c *gin.Context) {
 	//    effect (CR2 blocking finding: pre-fix the stop ran before the
 	//    CAS, so a losing request still executed the stop side effect
 	//    against a box it didn't own).
+	//
+	// url is NOT touched here — the pre-claim only flips status. The
+	// later step 3 (provider write) nulls instance_id and the rollback
+	// above reverts only status, so we don't need to snapshot/restore
+	// url. Keeping the pre-claim minimal also means a failed
+	// pre-claim never needs a revert (the row is unchanged).
 	preClaim, err := db.DB.ExecContext(ctx, `
 		UPDATE workspaces
-		SET status = $2, url = '', updated_at = now()
+		SET status = $2, updated_at = now()
 		WHERE id = $1
 		  AND status <> $2
 		  AND COALESCE(compute->>'provider', '') IS NOT DISTINCT FROM $3`,
@@ -208,6 +241,12 @@ func (h *WorkspaceHandler) SwitchProvider(c *gin.Context) {
 	//    TestNoCallSiteCallsDirectProvisionerExceptAuto (core#2422 RCA tick).
 	payload := withStoredCompute(context.Background(), id, models.CreateWorkspacePayload{Name: wsName, Tier: tier, Runtime: dbRuntime})
 	h.provisionWorkspaceAuto(id, "", nil, payload)
+
+	// All 5 steps completed; mark the switch COMMITTED so the rollback
+	// defer does NOT revert status='provisioning'. The new provision is
+	// in flight on a goroutine and will progress to 'online' (or
+	// 'failed' via the central provision machinery) on its own.
+	committed = true
 
 	c.JSON(http.StatusAccepted, gin.H{
 		"status":       "switching",
