@@ -156,16 +156,16 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
   //                           contamination (CR2 #11466).
   //   - wsCompletedTokensRef: Legacy fallback set for older ws-server builds
   //                           that do not broadcast a messageId. When a
-  //                           completion arrives without an id and exactly one
-  //                           token is tracked, the oldest pending-WS token is
-  //                           finished immediately; if nothing is pending the
-  //                           oldest in-flight token is marked WS-completed so
-  //                           its own late timeout/524/queued response can finish
-  //                           itself. With multiple concurrent tokens the
-  //                           fallback is intentionally conservative and does
-  //                           nothing, avoiding out-of-order mis-release
-  //                           (core#2775). A completion event with a messageId
-  //                           always targets exactly that send's token.
+  //                           completion arrives without an id the fallback
+  //                           degrades to a bounded oldest-token policy: it
+  //                           finishes the oldest pending-WS token (typical for
+  //                           poll-mode replies) or marks the oldest in-flight
+  //                           token as WS-completed so its own late
+  //                           timeout/524/queued response can finish itself.
+  //                           This prevents indefinite spinner leaks while
+  //                           keeping mis-attribution bounded to one token per
+  //                           completion; the modern messageId-aware path is
+  //                           preferred and fully supports concurrency.
   //   - setupGuardRef:        brief synchronous guard so a double-click in the
   //                           same tick dispatches only once. Released on the
   //                           next microtask after the POST is fired, so
@@ -219,15 +219,18 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
 
     // Legacy fallback for older ws-server builds that do not broadcast a
     // messageId. Without an id we cannot correlate a completion to a specific
-    // send when multiple sends are concurrent. The conservative fix
-    // (core#2775): only act when exactly one token is tracked. With one token
-    // the oldest-token heuristic is exact; with multiple tokens we degrade by
-    // doing nothing, avoiding the out-of-order mis-release where completion B
-    // could finish or pend token A. The modern messageId-aware path above
-    // remains preferred and fully supports concurrency.
+    // send when multiple sends are concurrent, so we degrade to a bounded
+    // oldest-token policy instead of doing nothing forever: each no-id
+    // completion finishes at most one token, preferring the oldest pending-WS
+    // token (typical for poll-mode replies) and otherwise marking the oldest
+    // in-flight token as WS-completed so its own late timeout/524/queued
+    // response can finish itself. This prevents indefinite spinner leaks while
+    // keeping mis-attribution bounded to one token per completion. The modern
+    // messageId-aware path above remains preferred and fully supports
+    // concurrency.
     const totalTracked =
       inFlightTokensRef.current.size + pendingWSTokensRef.current.size;
-    if (totalTracked !== 1) {
+    if (totalTracked === 0) {
       return;
     }
 
