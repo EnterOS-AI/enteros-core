@@ -345,3 +345,208 @@ describe("useChatSend — concurrent replies (core#2725)", () => {
     expect(result.current.sending).toBe(false);
   });
 });
+
+describe("useChatSend — per-send guard release and late-return ordering (CR2 #11454 / Researcher #11453)", () => {
+  it("legacy releaseSendGuards only releases one pending-WS token and leaves another pending (poll-mode)", async () => {
+    apiPostMock
+      .mockResolvedValueOnce({
+        status: "queued",
+        delivery_mode: "poll",
+        method: "message/send",
+      })
+      .mockResolvedValueOnce({
+        status: "queued",
+        delivery_mode: "poll",
+        method: "message/send",
+      });
+
+    const { result } = renderHook(() =>
+      useChatSend("ws-poll-two-legacy", { getHistoryMessages: () => [] }),
+    );
+
+    await act(async () => {
+      result.current.sendMessage("poll one");
+      await Promise.resolve();
+      result.current.sendMessage("poll two");
+      await Promise.resolve();
+    });
+    expect(result.current.sending).toBe(true);
+
+    // Legacy completion with no messageId finishes exactly one pending send.
+    act(() => {
+      result.current.releaseSendGuards();
+    });
+    expect(result.current.sending).toBe(true);
+
+    // A second legacy completion finishes the remaining send.
+    act(() => {
+      result.current.releaseSendGuards();
+    });
+    expect(result.current.sending).toBe(false);
+  });
+
+  it("legacy releaseSendGuards only marks one in-flight token, leaving another spinning (push-mode)", async () => {
+    const first = deferred();
+    const second = deferred();
+    apiPostMock
+      .mockImplementationOnce(() => first.promise)
+      .mockImplementationOnce(() => second.promise);
+
+    const { result } = renderHook(() =>
+      useChatSend("ws-push-two-legacy", { getHistoryMessages: () => [] }),
+    );
+
+    await act(async () => {
+      result.current.sendMessage("first");
+      await Promise.resolve();
+      result.current.sendMessage("second");
+      await Promise.resolve();
+    });
+    expect(result.current.sending).toBe(true);
+
+    act(() => {
+      result.current.releaseSendGuards();
+    });
+    // Only the oldest in-flight token is marked completed; the other is untouched.
+    expect(result.current.sending).toBe(true);
+
+    // Resolve the oldest send — it finishes because it was marked completed.
+    await act(async () => {
+      first.resolve({ result: { parts: [{ kind: "text", text: "reply-one" }] } });
+      await Promise.resolve();
+    });
+    expect(result.current.sending).toBe(true);
+
+    // Resolve the second send.
+    await act(async () => {
+      second.resolve({ result: { parts: [{ kind: "text", text: "reply-two" }] } });
+      await Promise.resolve();
+    });
+    expect(result.current.sending).toBe(false);
+  });
+
+  it("late queued response still finishes its own token after a legacy early release (no re-pend)", async () => {
+    const send = deferred();
+    apiPostMock.mockImplementationOnce(() => send.promise);
+
+    const { result } = renderHook(() =>
+      useChatSend("ws-queued-late", { getHistoryMessages: () => [] }),
+    );
+
+    await act(async () => {
+      result.current.sendMessage("queued late");
+      await Promise.resolve();
+    });
+    expect(result.current.sending).toBe(true);
+
+    // Legacy early release (no messageId) marks the only in-flight token.
+    act(() => {
+      result.current.releaseSendGuards();
+    });
+    expect(result.current.sending).toBe(true);
+
+    // HTTP eventually returns the queued envelope.
+    await act(async () => {
+      send.resolve({
+        status: "queued",
+        delivery_mode: "poll",
+        method: "message/send",
+      });
+      await Promise.resolve();
+    });
+
+    // The queued path must finish the token instead of moving it back to
+    // pending-WS; otherwise the token leaks and the spinner never drops.
+    expect(result.current.sending).toBe(false);
+  });
+
+  it("late 524 response still finishes its own token after a legacy early release", async () => {
+    const send = deferred();
+    apiPostMock.mockImplementationOnce(() => send.promise);
+
+    const { result } = renderHook(() =>
+      useChatSend("ws-524-late", { getHistoryMessages: () => [] }),
+    );
+
+    await act(async () => {
+      result.current.sendMessage("524 late");
+      await Promise.resolve();
+    });
+    expect(result.current.sending).toBe(true);
+
+    act(() => {
+      result.current.releaseSendGuards();
+    });
+    expect(result.current.sending).toBe(true);
+
+    const err = Object.assign(new Error("cf 524"), { status: 524 });
+    await act(async () => {
+      send.reject(err);
+      await Promise.resolve();
+    });
+
+    expect(result.current.sending).toBe(false);
+    expect(result.current.error).toBeNull();
+  });
+
+  it("late timeout response still finishes its own token after a legacy early release", async () => {
+    const send = deferred();
+    apiPostMock.mockImplementationOnce(() => send.promise);
+
+    const { result } = renderHook(() =>
+      useChatSend("ws-timeout-late", { getHistoryMessages: () => [] }),
+    );
+
+    await act(async () => {
+      result.current.sendMessage("timeout late");
+      await Promise.resolve();
+    });
+    expect(result.current.sending).toBe(true);
+
+    act(() => {
+      result.current.releaseSendGuards();
+    });
+    expect(result.current.sending).toBe(true);
+
+    const timeoutErr = new Error("signal timed out") as Error & { name: string };
+    timeoutErr.name = "TimeoutError";
+    await act(async () => {
+      send.reject(timeoutErr);
+      await Promise.resolve();
+    });
+
+    expect(result.current.sending).toBe(false);
+    expect(result.current.error).toBeNull();
+  });
+
+  it("a send whose token was already finished by messageId drops a late timeout without re-pending (no leak)", async () => {
+    const send = deferred();
+    apiPostMock.mockImplementationOnce(() => send.promise);
+
+    const { result } = renderHook(() =>
+      useChatSend("ws-messageid-late", { getHistoryMessages: () => [] }),
+    );
+
+    await act(async () => {
+      result.current.sendMessage("messageId late");
+      await Promise.resolve();
+    });
+    expect(result.current.sending).toBe(true);
+
+    const messageId = (apiPostMock.mock.calls[0][1] as any).params.message.messageId;
+    act(() => {
+      result.current.releaseSendGuards(messageId);
+    });
+    expect(result.current.sending).toBe(false);
+
+    const timeoutErr = new Error("signal timed out") as Error & { name: string };
+    timeoutErr.name = "TimeoutError";
+    await act(async () => {
+      send.reject(timeoutErr);
+      await Promise.resolve();
+    });
+
+    expect(result.current.sending).toBe(false);
+    expect(result.current.error).toBeNull();
+  });
+});

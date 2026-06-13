@@ -155,11 +155,16 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
   //                           SPECIFIC send they belong to, avoiding cross-send
   //                           contamination (CR2 #11466).
   //   - wsCompletedTokensRef: Legacy fallback set for older ws-server builds
-  //                           that do not broadcast a messageId. When
-  //                           releaseSendGuards() is called without a specific
-  //                           token, every currently tracked token is marked as
-  //                           WS-completed so a late timeout/524 can finish
-  //                           itself instead of re-pending forever (CR2 #11470).
+  //                           that do not broadcast a messageId. When a
+  //                           completion arrives without an id we can only
+  //                           release one token safely: the oldest pending-WS
+  //                           token is finished immediately, and if nothing is
+  //                           pending the oldest in-flight token is marked
+  //                           WS-completed so its own late timeout/524/queued
+  //                           response can finish itself without re-pending
+  //                           forever (CR2 #11454, #11470). A completion event
+  //                           with a messageId always targets exactly that
+  //                           send's token (CR2 #11466).
   //   - setupGuardRef:        brief synchronous guard so a double-click in the
   //                           same tick dispatches only once. Released on the
   //                           next microtask after the POST is fired, so
@@ -181,22 +186,6 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
     sendingFromAPIRef.current = pending;
   }, []);
 
-  const releaseSendGuards = useCallback(() => {
-    // Legacy coarse fallback for older ws-server builds that do not broadcast
-    // a messageId. Mark every currently tracked token as WS-completed so a
-    // late timeout/524 for any of them can finish itself instead of re-pending
-    // forever (CR2 #11470). Prefer finishSendByMessageId(messageId) on modern
-    // servers for precise, cross-send-safe cleanup (CR2 #11466).
-    for (const token of inFlightTokensRef.current) {
-      wsCompletedTokensRef.current.add(token);
-    }
-    for (const token of pendingWSTokensRef.current) {
-      wsCompletedTokensRef.current.add(token);
-    }
-    pendingWSTokensRef.current.clear();
-    syncSendingState();
-  }, [syncSendingState]);
-
   const finishSendToken = useCallback((token: number) => {
     inFlightTokensRef.current.delete(token);
     pendingWSTokensRef.current.delete(token);
@@ -217,6 +206,46 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
       finishSendToken(token);
     }
   }, [finishSendToken]);
+
+  const releaseSendGuards = useCallback((messageId?: string) => {
+    // Token-aware completion: modern ws-server builds echo the client-generated
+    // messageId, so we can finish EXACTLY the send that completed (CR2 #11466,
+    // #11454). This never touches unrelated concurrent sends.
+    if (messageId) {
+      finishSendByMessageId(messageId);
+      return;
+    }
+
+    // Legacy fallback for older ws-server builds that do not broadcast a
+    // messageId. Without an id we cannot know which send completed, but we CAN
+    // avoid the global-guard bug: only the single oldest token is released, so
+    // one send's completion never marks another's guard/spinner as done (CR2
+    // #11454). Prefer finishing the oldest pending-WS token first (typical for
+    // poll-mode replies); if nothing is pending, mark the oldest in-flight
+    // token as WS-completed so its own late timeout/524/queued response can
+    // finish itself instead of re-pending forever (CR2 #11470).
+    let oldestPending: number | undefined;
+    for (const token of pendingWSTokensRef.current) {
+      if (oldestPending === undefined || token < oldestPending) {
+        oldestPending = token;
+      }
+    }
+    if (oldestPending !== undefined) {
+      finishSendToken(oldestPending);
+      return;
+    }
+
+    let oldestInFlight: number | undefined;
+    for (const token of inFlightTokensRef.current) {
+      if (oldestInFlight === undefined || token < oldestInFlight) {
+        oldestInFlight = token;
+      }
+    }
+    if (oldestInFlight !== undefined) {
+      wsCompletedTokensRef.current.add(oldestInFlight);
+      syncSendingState();
+    }
+  }, [finishSendByMessageId, finishSendToken, syncSendingState]);
 
   const pendSendTokenForWS = useCallback((token: number) => {
     // HTTP replied "queued / still alive via WS". Move from in-flight to the

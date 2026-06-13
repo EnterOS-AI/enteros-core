@@ -14,7 +14,7 @@ export interface UseChatSocketCallbacks {
    *  client-generated message id from the A2A request, present for
    *  canvas-originated sends when the server supports it. */
   onSendComplete?: (messageId?: string) => void;
-  onSendError?: (error: string) => void;
+  onSendError?: (error: string, messageId?: string) => void;
   /** A request the user (or an agent) responded to — drives the live
    *  decision chip in My Chat (core#2636). */
   onRequestResponded?: (p: {
@@ -121,7 +121,7 @@ export function useChatSocket(
               const reason = detail
                 ? detail
                 : "Agent error (Exception) — see workspace logs for details.";
-              callbacksRef.current.onSendError?.(reason);
+              callbacksRef.current.onSendError?.(reason, messageId);
             }
           }
         } else if (type === "a2a_send") {

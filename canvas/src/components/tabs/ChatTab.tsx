@@ -157,7 +157,7 @@ function MyChatPanel({ workspaceId, data }: Props) {
     onUserMessage: (msg) => history.setMessages((prev) => [...prev, msg]),
     onAgentMessage: (msg) => history.setMessages((prev) => appendMessageDeduped(prev, msg)),
   });
-  const { sending, uploading, sendMessage, error: sendError, clearError: clearSendError, releaseSendGuards, sendingFromAPIRef, finishSendByMessageId } = chatSend;
+  const { sending, uploading, sendMessage, error: sendError, clearError: clearSendError, releaseSendGuards, sendingFromAPIRef } = chatSend;
 
   const displayError = error || sendError;
 
@@ -210,22 +210,21 @@ function MyChatPanel({ workspaceId, data }: Props) {
       ]);
     },
     onSendComplete: (messageId) => {
-      // Reply completed (poll-mode) → agent is reachable; clear any stale
-      // send-error banner (core#2697, same rationale as onAgentMessage).
+      // Reply completed (poll-mode or push-mode) → agent is reachable; clear
+      // any stale send-error banner (core#2697). Pass the messageId down so
+      // useChatSend finishes the EXACT send that completed. Older ws-server
+      // builds that omit messageId fall back to releasing the single oldest
+      // pending/in-flight token instead of clearing every guard (CR2 #11454).
       setError(null);
       clearSendError();
       if (!sendingFromAPIRef.current) return;
-      if (messageId) {
-        finishSendByMessageId?.(messageId);
-      } else {
-        // Older ws-server builds or tool-originated messages don't carry a
-        // messageId — fall back to the coarse release.
-        releaseSendGuards();
-      }
+      releaseSendGuards(messageId);
     },
-    onSendError: (err) => {
+    onSendError: (err, messageId) => {
       if (sendingFromAPIRef.current) {
-        releaseSendGuards();
+        // Per-send release: when the error broadcast carries a messageId,
+        // finish only that token. Legacy no-id path releases one token.
+        releaseSendGuards(messageId);
         setError(err);
       }
     },
