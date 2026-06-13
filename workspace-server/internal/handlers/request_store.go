@@ -546,11 +546,18 @@ func (s *RequestStore) AddMessage(ctx context.Context, id, authorType, authorID,
 		return "", fmt.Errorf("request: add message: %w", err)
 	}
 
-	// If the author is the recipient (the one being asked), this message is a
-	// "please clarify" — flip to info_requested so the requester is prompted.
+	// A message from anyone OTHER than the requester is a "please clarify" back
+	// TO the requester — flip to info_requested so the requester is prompted.
+	// We key off "not the requester" rather than "is the recipient" on purpose:
+	// an agent→user request is stored with an EMPTY recipient_id (the generic
+	// "the user"), but the canvas posts the reply with a concrete author_id
+	// (the session user_id, or the "admin" placeholder). A strict
+	// authorID==RecipientID match would never hold for that common case, so the
+	// flip (and the requester notification below) would silently never fire.
 	// Only flip a non-terminal request; a closed request keeps its terminal
 	// status even if a late note is appended.
-	if authorType == req.RecipientType && authorID == req.RecipientID {
+	authoredByRequester := authorType == req.RequesterType && authorID == req.RequesterID
+	if !authoredByRequester {
 		if _, err := s.db.ExecContext(ctx, `
 			UPDATE requests SET status = 'info_requested', updated_at = now()
 			WHERE id = $1 AND status IN ('pending', 'info_requested')
@@ -572,12 +579,15 @@ func (s *RequestStore) AddMessage(ctx context.Context, id, authorType, authorID,
 		}
 	}
 
-	// More-Info from the recipient must reach a requester AGENT as a real
+	// More-Info from the other party must reach a requester AGENT as a real
 	// turn (same rationale as the Respond notification — CTO 2026-06-11).
+	// Same "not the requester" gate as the flip above: the user's reply on an
+	// agent→user request carries a concrete author_id while recipient_id is
+	// empty, so we must NOT require authorID==RecipientID here. We only skip
+	// when the requester authored the message (it would be notifying itself).
 	// Keyed per message so a multi-round clarification thread delivers each
 	// ask; the requester replies with add_request_message.
-	if authorType == req.RecipientType && authorID == req.RecipientID &&
-		req.RequesterType == "agent" && req.RequesterID != "" {
+	if !authoredByRequester && req.RequesterType == "agent" && req.RequesterID != "" {
 		s.notifyRequesterAgent(ctx, req,
 			"request-message:"+messageID,
 			fmt.Sprintf("More info requested on your %s request %q (id %s): %s\nReply with add_request_message.",

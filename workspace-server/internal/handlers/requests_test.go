@@ -1010,6 +1010,90 @@ func TestRequests_AddMessage_MoreInfo_NotifiesRequesterAgent(t *testing.T) {
 	}
 }
 
+// TestRequests_AddMessage_MoreInfo_GenericUserRecipient_NotifiesRequesterAgent
+// is the REAL production path: an agent→user request is stored with an EMPTY
+// recipient_id (the generic "the user"), but the canvas posts the More-Info
+// reply with a CONCRETE author_id (the session user_id, or the "admin"
+// placeholder when no session). The old gate (authorID == RecipientID) was
+// "admin" == "" → false, so neither the info_requested flip NOR the requester
+// notification ever fired — the agent silently never received the thread.
+// The fix keys off "not the requester", so this must now flip + notify.
+func TestRequests_AddMessage_MoreInfo_GenericUserRecipient_NotifiesRequesterAgent(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewRequestsHandler(newTestBroadcaster())
+	captured := interceptRequestNotify(t)
+
+	// recipient_id is EMPTY (generic user); author_id is the "admin" placeholder.
+	mock.ExpectQuery("FROM requests WHERE id").
+		WithArgs("req-7").
+		WillReturnRows(oneRequestRow("req-7", "approval", "ws-agent-1", "user", "", "pending"))
+	mock.ExpectQuery("INSERT INTO request_messages").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("msg-7"))
+	// Must STILL flip to info_requested even though author_id != recipient_id.
+	mock.ExpectExec("UPDATE requests SET status = 'info_requested'").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO structure_events").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "requestId", Value: "req-7"}}
+	c.Request = httptest.NewRequest("POST", "/", bytesNewBufferStringHelper(`{"author_type":"user","author_id":"admin","body":"which secret did you mean?"}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.AddMessage(c)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+	if len(*captured) != 1 {
+		t.Fatalf("expected 1 requester notification (generic-user recipient), got %d", len(*captured))
+	}
+	n := (*captured)[0]
+	if n["workspace_id"] != "ws-agent-1" || n["idem"] != "request-message:msg-7" {
+		t.Errorf("notification misrouted: %+v", n)
+	}
+	if !strings.Contains(n["body"], "which secret did you mean?") {
+		t.Errorf("notification body missing ask: %s", n["body"])
+	}
+}
+
+// TestRequests_AddMessage_RequesterReply_NoFlipNoNotify: when the REQUESTER
+// agent itself appends a message (replying to the clarification), it must NOT
+// flip to info_requested and must NOT notify itself.
+func TestRequests_AddMessage_RequesterReply_NoFlipNoNotify(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewRequestsHandler(newTestBroadcaster())
+	captured := interceptRequestNotify(t)
+
+	// Requester is agent ws-agent-1; the author IS that requester.
+	mock.ExpectQuery("FROM requests WHERE id").
+		WithArgs("req-8").
+		WillReturnRows(oneRequestRow("req-8", "task", "ws-agent-1", "user", "", "info_requested"))
+	mock.ExpectQuery("INSERT INTO request_messages").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("msg-8"))
+	// No status-flip UPDATE expected (requester-authored).
+	mock.ExpectExec("INSERT INTO structure_events").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "requestId", Value: "req-8"}}
+	c.Request = httptest.NewRequest("POST", "/", bytesNewBufferStringHelper(`{"author_type":"agent","author_id":"ws-agent-1","body":"I meant the staging DB secret."}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.AddMessage(c)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+	if len(*captured) != 0 {
+		t.Fatalf("requester-authored message must NOT self-notify; got %d", len(*captured))
+	}
+}
+
 // TestRequests_Respond_NoNotifyForUserRequester: a request raised by a USER
 // must not enqueue an agent notification on respond.
 func TestRequests_Respond_NoNotifyForUserRequester(t *testing.T) {
