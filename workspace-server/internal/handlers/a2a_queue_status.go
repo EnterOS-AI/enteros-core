@@ -80,7 +80,12 @@ type QueueStatus struct {
 func QueueStatusByID(ctx context.Context, queueID string) (*QueueStatus, error) {
 	var qs QueueStatus
 	var lastError, dispatchedAt, completedAt, expiresAt sql.NullString
-	var responseBody json.RawMessage
+	// core#2671: scan the COALESCEd response_body into sql.NullString first.
+	// For queued/in-flight rows both q.response_body and the legacy stitch are
+	// NULL; database/sql cannot scan NULL directly into json.RawMessage, so a
+	// NullString avoids the "unsupported Scan" 500 and lets us return 200 with
+	// response_body omitted for in-flight items.
+	var responseBody sql.NullString
 
 	// response_body now lives on the a2a_queue row itself so non-delegation
 	// A2A queue items (e.g. message/send queued while the target is busy) can
@@ -140,8 +145,8 @@ func QueueStatusByID(ctx context.Context, queueID string) (*QueueStatus, error) 
 		s := expiresAt.String
 		qs.ExpiresAt = &s
 	}
-	if len(responseBody) > 0 && qs.Status == "completed" {
-		qs.ResponseBody = responseBody
+	if responseBody.Valid && responseBody.String != "" && qs.Status == "completed" {
+		qs.ResponseBody = json.RawMessage(responseBody.String)
 	}
 
 	return &qs, nil
