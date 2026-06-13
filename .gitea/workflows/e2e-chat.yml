@@ -419,7 +419,7 @@ jobs:
           # explicit grep below is belt-and-braces: assert the list reporter
           # printed an executed-count summary, so a silent all-skip / no-op can
           # never report green.
-          npx playwright test e2e/chat-desktop.spec.ts e2e/chat-mobile.spec.ts \
+          npx playwright test e2e/chat-desktop.spec.ts e2e/chat-mobile.spec.ts e2e/chat-separation.spec.ts \
             --reporter=list 2>&1 | tee /tmp/pw-chat.out
           if ! grep -qE '[0-9]+ (passed|failed|skipped)' /tmp/pw-chat.out; then
             echo "::error::E2E Chat REQUIRE-LIVE: chat==true but Playwright reported no executed tests — specs missing or all-skipped, refusing to report green."

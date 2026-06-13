@@ -1,181 +1,240 @@
 import { test, expect } from "@playwright/test";
+import type { Page } from "@playwright/test";
+import { startEchoRuntime } from "./fixtures/echo-runtime";
+import {
+  seedWorkspace,
+  startHeartbeat,
+  cleanupWorkspace,
+  seedChatHistory,
+} from "./fixtures/chat-seed";
 
 const API = process.env.E2E_API_URL ?? "http://localhost:8080";
+const PLATFORM_URL = process.env.E2E_PLATFORM_URL ?? "http://localhost:8080";
+const ADMIN_TOKEN = process.env.E2E_ADMIN_TOKEN ?? process.env.ADMIN_TOKEN;
+
+/** Enter the Org-map view so the Canvas (React Flow graph) mounts. */
+async function enterMapView(page: Page): Promise<void> {
+  const btn = page.getByTestId("nav-map");
+  await expect(btn, "rail button nav-map missing").toBeVisible({ timeout: 10_000 });
+  await btn.click();
+}
+
+/** Open the seeded workspace's Chat side panel. */
+async function openChatPanel(page: Page, workspaceName: string): Promise<void> {
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await page.goto("/");
+  await enterMapView(page);
+  await page.waitForSelector(".react-flow__node", { timeout: 10_000 });
+
+  // Dismiss onboarding guide if present.
+  const skipGuide = page.getByText("Skip guide");
+  if (await skipGuide.isVisible().catch(() => false)) {
+    await skipGuide.click();
+  }
+
+  // Scope to the map-side panel (#2587) so we don't accidentally hit the
+  // hidden ConciergeShell copy of ChatTab.
+  await page.getByTestId(`workspace-node-${workspaceName}`).click();
+  await page.locator("#tab-chat").click();
+  await page.waitForSelector("#panel-chat [data-testid='chat-panel']:visible", {
+    timeout: 5_000,
+  });
+  await expect(page.locator("#panel-chat textarea").first()).toBeEnabled({
+    timeout: 15_000,
+  });
+}
+
+/** Post a message to the workspace via the A2A proxy so activity rows exist.
+ *  `token` should be an org/admin token for canvas-origin rows (source_id NULL),
+ *  or the target workspace's own auth token for agent-origin rows
+ *  (source_id = workspace_id). */
+async function postA2AMessage(workspaceId: string, token: string, text: string) {
+  const res = await fetch(`${PLATFORM_URL}/workspaces/${workspaceId}/a2a`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({
+      method: "message/send",
+      params: {
+        message: {
+          role: "user",
+          parts: [{ kind: "text", text }],
+        },
+      },
+    }),
+  });
+  if (!res.ok) {
+    throw new Error(`A2A post failed: ${res.status} ${await res.text()}`);
+  }
+}
 
 test.describe("Chat Sub-Tabs", () => {
+  let cleanup: () => Promise<void> = async () => {};
+  let workspaceId = "";
+  let workspaceName = "";
+
+  test.beforeAll(async () => {
+    const echo = await startEchoRuntime();
+    const ws = await seedWorkspace(echo.baseURL);
+    workspaceId = ws.id;
+    workspaceName = ws.name;
+    const stopHeartbeat = startHeartbeat(ws.id, ws.authToken);
+
+    cleanup = async () => {
+      stopHeartbeat();
+      await echo.stop();
+    };
+  });
+
+  test.afterAll(async () => {
+    await cleanupWorkspace(workspaceId);
+    await cleanup();
+  });
+
+  test.beforeEach(async ({ page }) => {
+    await openChatPanel(page, workspaceName);
+  });
+
   test("chat tab shows My Chat and Agent Comms sub-tabs", async ({ page }) => {
-    const res = await page.request.get(`${API}/workspaces`);
-    const workspaces = await res.json();
-    test.skip(workspaces.length === 0, "No workspaces to test");
-
-    await page.goto("/");
-    await page.waitForTimeout(3000);
-
-    // Click first workspace node
-    await page.locator(".react-flow__node").first().click();
-    await page.waitForTimeout(500);
-
-    // Click Chat tab
-    const chatTab = page.getByRole("button", { name: /Chat/ }).first();
-    await chatTab.click();
-    await page.waitForTimeout(500);
-
-    // Sub-tabs should be visible
-    await expect(page.locator("text=My Chat")).toBeVisible({ timeout: 3000 });
-    await expect(page.locator("text=Agent Comms")).toBeVisible({ timeout: 3000 });
+    const panel = page.locator("#panel-chat");
+    await expect(panel.getByRole("button", { name: "My Chat" })).toBeVisible();
+    await expect(panel.getByRole("button", { name: "Agent Comms" })).toBeVisible();
   });
 
   test("My Chat is selected by default", async ({ page }) => {
-    const res = await page.request.get(`${API}/workspaces`);
-    const workspaces = await res.json();
-    test.skip(workspaces.length === 0, "No workspaces");
-
-    await page.goto("/");
-    await page.waitForTimeout(3000);
-    await page.locator(".react-flow__node").first().click();
-    await page.waitForTimeout(500);
-    await page.getByRole("button", { name: /Chat/ }).first().click();
-    await page.waitForTimeout(500);
-
-    // My Chat sub-tab should have active styling (border-blue-500)
-    const myChatBtn = page.locator("button", { hasText: "My Chat" });
-    await expect(myChatBtn).toHaveClass(/border-blue-500/);
+    const myChatBtn = page
+      .locator("#panel-chat")
+      .getByRole("button", { name: "My Chat" });
+    await expect(myChatBtn).toHaveAttribute("aria-selected", "true");
   });
 
   test("switching to Agent Comms shows different content", async ({ page }) => {
-    const res = await page.request.get(`${API}/workspaces`);
-    const workspaces = await res.json();
-    test.skip(workspaces.length === 0, "No workspaces");
+    const panel = page.locator("#panel-chat");
+    await panel.getByRole("button", { name: "Agent Comms" }).click();
 
-    await page.goto("/");
-    await page.waitForTimeout(3000);
-    await page.locator(".react-flow__node").first().click();
-    await page.waitForTimeout(500);
-    await page.getByRole("button", { name: /Chat/ }).first().click();
-    await page.waitForTimeout(500);
-
-    // Click Agent Comms
-    await page.locator("button", { hasText: "Agent Comms" }).click();
-    await page.waitForTimeout(500);
-
-    // Should show empty state or agent comms messages
-    const hasEmpty = await page.locator("text=No agent-to-agent communications").isVisible().catch(() => false);
-    const hasMessages = await page.locator("[class*=cyan]").count() > 0;
-    expect(hasEmpty || hasMessages).toBeTruthy();
+    // Agent Comms should be selected and My Chat's textarea should not be visible.
+    await expect(
+      panel.getByRole("button", { name: "Agent Comms" }),
+    ).toHaveAttribute("aria-selected", "true");
+    await expect(panel.locator("textarea").first()).not.toBeVisible();
   });
 
   test("My Chat has input box, Agent Comms does not", async ({ page }) => {
-    const res = await page.request.get(`${API}/workspaces`);
-    const workspaces = await res.json();
-    test.skip(workspaces.length === 0, "No workspaces");
+    const panel = page.locator("#panel-chat");
 
-    await page.goto("/");
-    await page.waitForTimeout(3000);
-    await page.locator(".react-flow__node").first().click();
-    await page.waitForTimeout(500);
-    await page.getByRole("button", { name: /Chat/ }).first().click();
-    await page.waitForTimeout(500);
+    // My Chat has the textarea.
+    await expect(panel.locator("textarea").first()).toBeVisible();
 
-    // My Chat should have textarea
-    await expect(page.locator("textarea")).toBeVisible();
-
-    // Switch to Agent Comms
-    await page.locator("button", { hasText: "Agent Comms" }).click();
-    await page.waitForTimeout(500);
-
-    // Agent Comms should NOT have textarea
-    await expect(page.locator("textarea")).not.toBeVisible();
+    // Switch to Agent Comms.
+    await panel.getByRole("button", { name: "Agent Comms" }).click();
+    await expect(panel.locator("textarea").first()).not.toBeVisible();
   });
 
   test("switching back to My Chat preserves messages", async ({ page }) => {
-    const res = await page.request.get(`${API}/workspaces`);
-    const workspaces = await res.json();
-    test.skip(workspaces.length === 0, "No workspaces");
+    const panel = page.locator("#panel-chat");
 
-    await page.goto("/");
-    await page.waitForTimeout(3000);
-    await page.locator(".react-flow__node").first().click();
-    await page.waitForTimeout(500);
-    await page.getByRole("button", { name: /Chat/ }).first().click();
-    await page.waitForTimeout(1000);
+    // Send a message so there is content to preserve.
+    const textarea = panel.locator("textarea").first();
+    await textarea.fill("Persistence check");
+    await page.getByRole("button", { name: /Send/ }).first().click();
+    await expect(
+      panel.getByText("Echo: Persistence check"),
+    ).toBeVisible({ timeout: 15_000 });
 
-    // Check if there are messages or empty state in My Chat
-    const hasContent = await page.locator("text=No messages yet").isVisible().catch(() => false) ||
-      await page.locator("[class*=blue-600]").count() > 0;
+    // Switch to Agent Comms and back.
+    await panel.getByRole("button", { name: "Agent Comms" }).click();
+    await panel.getByRole("button", { name: "My Chat" }).click();
 
-    // Switch to Agent Comms and back
-    await page.locator("button", { hasText: "Agent Comms" }).click();
-    await page.waitForTimeout(300);
-    await page.locator("button", { hasText: "My Chat" }).click();
-    await page.waitForTimeout(300);
-
-    // Same content should be there
-    const hasContentAfter = await page.locator("text=No messages yet").isVisible().catch(() => false) ||
-      await page.locator("[class*=blue-600]").count() > 0;
-
-    // Both should be truthy (content exists before and after switch)
-    expect(hasContent || hasContentAfter).toBeTruthy();
+    // Message should still be there.
+    await expect(panel.getByText("Persistence check", { exact: true })).toBeVisible();
+    await expect(panel.getByText("Echo: Persistence check")).toBeVisible();
   });
 });
 
 test.describe("Activity API Source Filter", () => {
+  let cleanup: () => Promise<void> = async () => {};
+  let workspaceId = "";
+  let authToken = "";
+
+  test.beforeAll(async () => {
+    if (!ADMIN_TOKEN) {
+      throw new Error(
+        "Activity source-filter tests require E2E_ADMIN_TOKEN or ADMIN_TOKEN to seed canvas-origin rows",
+      );
+    }
+
+    const echo = await startEchoRuntime();
+    const ws = await seedWorkspace(echo.baseURL);
+    workspaceId = ws.id;
+    authToken = ws.authToken;
+    const stopHeartbeat = startHeartbeat(ws.id, ws.authToken);
+
+    // Seed BOTH source classes deterministically:
+    //  - admin/org token → callerID is empty → source_id NULL (canvas-origin).
+    //  - workspace token → callerID resolves to the workspace → source_id non-null (agent-origin).
+    await postA2AMessage(workspaceId, ADMIN_TOKEN, "canvas source probe");
+    await postA2AMessage(workspaceId, authToken, "agent source probe");
+
+    cleanup = async () => {
+      stopHeartbeat();
+      await echo.stop();
+    };
+  });
+
+  test.afterAll(async () => {
+    await cleanupWorkspace(workspaceId);
+    await cleanup();
+  });
+
   test("source=canvas returns only canvas-initiated entries", async ({ request }) => {
-    const wsRes = await request.get(`${API}/workspaces`);
-    const workspaces = await wsRes.json();
-    if (workspaces.length === 0) return;
-
-    const wsId = workspaces[0].id;
-    const res = await request.get(`${API}/workspaces/${wsId}/activity?source=canvas`);
+    const res = await request.get(
+      `${API}/workspaces/${workspaceId}/activity?source=canvas`,
+    );
     expect(res.ok()).toBeTruthy();
-    const entries = await res.json();
+    const entries = (await res.json()) as Array<{ source_id: unknown }>;
     expect(Array.isArray(entries)).toBeTruthy();
-
-    // All entries should have source_id null
+    // False-green guard: an empty array would make the loop below pass vacuously.
+    expect(entries.length).toBeGreaterThan(0);
     for (const e of entries) {
       expect(e.source_id).toBeNull();
     }
   });
 
   test("source=agent returns only agent-initiated entries", async ({ request }) => {
-    const wsRes = await request.get(`${API}/workspaces`);
-    const workspaces = await wsRes.json();
-    if (workspaces.length === 0) return;
-
-    const wsId = workspaces[0].id;
-    const res = await request.get(`${API}/workspaces/${wsId}/activity?source=agent`);
+    const res = await request.get(
+      `${API}/workspaces/${workspaceId}/activity?source=agent`,
+    );
     expect(res.ok()).toBeTruthy();
-    const entries = await res.json();
+    const entries = (await res.json()) as Array<{ source_id: unknown }>;
     expect(Array.isArray(entries)).toBeTruthy();
-
-    // All entries should have non-null source_id
+    // False-green guard: an empty array would make the loop below pass vacuously.
+    expect(entries.length).toBeGreaterThan(0);
     for (const e of entries) {
-      if (e.source_id !== undefined) {
-        expect(e.source_id).not.toBeNull();
-      }
+      expect(e.source_id).not.toBeNull();
     }
   });
 
   test("source=invalid returns 400", async ({ request }) => {
-    const wsRes = await request.get(`${API}/workspaces`);
-    const workspaces = await wsRes.json();
-    if (workspaces.length === 0) return;
-
-    const wsId = workspaces[0].id;
-    const res = await request.get(`${API}/workspaces/${wsId}/activity?source=bogus`);
+    const res = await request.get(
+      `${API}/workspaces/${workspaceId}/activity?source=bogus`,
+    );
     expect(res.status()).toBe(400);
   });
 
   test("source+type filters combine correctly", async ({ request }) => {
-    const wsRes = await request.get(`${API}/workspaces`);
-    const workspaces = await wsRes.json();
-    if (workspaces.length === 0) return;
-
-    const wsId = workspaces[0].id;
-    const res = await request.get(`${API}/workspaces/${wsId}/activity?type=a2a_receive&source=canvas`);
+    const res = await request.get(
+      `${API}/workspaces/${workspaceId}/activity?type=a2a_receive&source=canvas`,
+    );
     expect(res.ok()).toBeTruthy();
-    const entries = await res.json();
+    const entries = (await res.json()) as Array<{
+      activity_type: string;
+      source_id: unknown;
+    }>;
     expect(Array.isArray(entries)).toBeTruthy();
-
+    // False-green guard: an empty array would make the loop below pass vacuously.
+    expect(entries.length).toBeGreaterThan(0);
     for (const e of entries) {
       expect(e.activity_type).toBe("a2a_receive");
       expect(e.source_id).toBeNull();
@@ -184,152 +243,86 @@ test.describe("Activity API Source Filter", () => {
 });
 
 test.describe("Data Flow — Initial Prompt in Chat", () => {
-  test("initial prompt appears as user message in My Chat", async ({ page }) => {
-    // Find a workspace that has activity with source=canvas (initial prompt via proxy)
-    const wsRes = await page.request.get(`${API}/workspaces`);
-    const workspaces = await wsRes.json();
-    test.skip(workspaces.length === 0, "No workspaces");
+  let cleanup: () => Promise<void> = async () => {};
+  let workspaceId = "";
+  let workspaceName = "";
 
-    // Find a workspace with canvas-initiated activity
-    let targetWs: { id: string; name: string } | null = null;
-    for (const ws of workspaces) {
-      const actRes = await page.request.get(`${API}/workspaces/${ws.id}/activity?source=canvas&type=a2a_receive&limit=1`);
-      const entries = await actRes.json();
-      if (entries.length > 0) {
-        targetWs = ws;
-        break;
-      }
-    }
-    test.skip(!targetWs, "No workspace has canvas-initiated activity (initial prompt may not have run)");
+  test.beforeAll(async () => {
+    const echo = await startEchoRuntime();
+    const ws = await seedWorkspace(echo.baseURL);
+    workspaceId = ws.id;
+    workspaceName = ws.name;
+    const stopHeartbeat = startHeartbeat(ws.id, ws.authToken);
 
-    await page.goto("/");
-    await page.waitForTimeout(3000);
+    // Pre-seed chat history so the My Chat panel shows deterministic content.
+    await seedChatHistory(workspaceId, [
+      { role: "user", content: "Hello from seed" },
+      { role: "agent", content: "Hello back from seed" },
+    ]);
 
-    // Click the workspace node
-    const node = page.locator(`.react-flow__node`).filter({ hasText: targetWs!.name });
-    await node.first().click();
-    await page.waitForTimeout(500);
-
-    // Open Chat tab
-    await page.getByRole("button", { name: /Chat/ }).first().click();
-    await page.waitForTimeout(500);
-
-    // Ensure we're on My Chat
-    await page.locator("button", { hasText: "My Chat" }).click();
-    await page.waitForTimeout(2000);
-
-    // The chat should NOT show "No messages yet" — it should have the initial prompt
-    const emptyState = page.locator("text=No messages yet");
-    await expect(emptyState).not.toBeVisible({ timeout: 5000 });
-
-    // There should be at least one user message bubble (blue) and one agent message bubble
-    const userBubbles = page.locator('[class*="bg-blue-600"]');
-    const agentBubbles = page.locator('[class*="bg-zinc-800"]');
-    expect(await userBubbles.count()).toBeGreaterThan(0);
-    expect(await agentBubbles.count()).toBeGreaterThan(0);
+    cleanup = async () => {
+      stopHeartbeat();
+      await echo.stop();
+    };
   });
 
-  test("initial prompt text matches config content", async ({ page }) => {
-    const wsRes = await page.request.get(`${API}/workspaces`);
-    const workspaces = await wsRes.json();
-    test.skip(workspaces.length === 0, "No workspaces");
-
-    // Find workspace with activity
-    let targetWs: { id: string; name: string } | null = null;
-    let promptText = "";
-    for (const ws of workspaces) {
-      const actRes = await page.request.get(`${API}/workspaces/${ws.id}/activity?source=canvas&type=a2a_receive&limit=1`);
-      const entries = await actRes.json();
-      if (entries.length > 0) {
-        const reqBody = entries[0].request_body;
-        const parts = reqBody?.params?.message?.parts;
-        if (parts?.[0]?.text) {
-          targetWs = ws;
-          promptText = parts[0].text;
-          break;
-        }
-      }
-    }
-    test.skip(!targetWs, "No workspace has canvas-initiated activity with text");
-
-    await page.goto("/");
-    await page.waitForTimeout(3000);
-
-    const node = page.locator(`.react-flow__node`).filter({ hasText: targetWs!.name });
-    await node.first().click();
-    await page.waitForTimeout(500);
-    await page.getByRole("button", { name: /Chat/ }).first().click();
-    await page.waitForTimeout(500);
-    await page.locator("button", { hasText: "My Chat" }).click();
-    await page.waitForTimeout(2000);
-
-    // The first few words of the initial prompt should be visible in the chat
-    const firstWords = promptText.split(/\s+/).slice(0, 4).join(" ");
-    await expect(page.locator(`text=${firstWords}`).first()).toBeVisible({ timeout: 5000 });
+  test.afterAll(async () => {
+    await cleanupWorkspace(workspaceId);
+    await cleanup();
   });
 
-  test("agent response to initial prompt is visible", async ({ page }) => {
-    const wsRes = await page.request.get(`${API}/workspaces`);
-    const workspaces = await wsRes.json();
-    test.skip(workspaces.length === 0, "No workspaces");
+  test.beforeEach(async ({ page }) => {
+    await openChatPanel(page, workspaceName);
+  });
 
-    let targetWs: { id: string } | null = null;
-    let responseText = "";
-    for (const ws of workspaces) {
-      const actRes = await page.request.get(`${API}/workspaces/${ws.id}/activity?source=canvas&type=a2a_receive&limit=1`);
-      const entries = await actRes.json();
-      if (entries.length > 0 && entries[0].response_body) {
-        const result = entries[0].response_body.result;
-        const parts = result?.parts;
-        if (parts?.[0]?.text) {
-          targetWs = ws;
-          responseText = parts[0].text;
-          break;
-        }
-      }
-    }
-    test.skip(!targetWs, "No workspace has response in activity");
+  test("seeded chat history appears in My Chat", async ({ page }) => {
+    const panel = page.locator("#panel-chat");
+    await expect(panel.getByText("Hello from seed")).toBeVisible({ timeout: 5_000 });
+    await expect(panel.getByText("Hello back from seed")).toBeVisible({ timeout: 5_000 });
+  });
 
-    await page.goto("/");
-    await page.waitForTimeout(3000);
-    await page.locator(".react-flow__node").first().click();
-    await page.waitForTimeout(500);
-    await page.getByRole("button", { name: /Chat/ }).first().click();
-    await page.waitForTimeout(2000);
-
-    // Agent response should be visible — check for agent message bubble existence
-    // (response text varies per agent, so check for non-empty agent bubble instead of exact text)
-    await page.locator("button", { hasText: "My Chat" }).click();
-    await page.waitForTimeout(2000);
-    const agentBubbles = page.locator('[class*="bg-zinc-800"]');
-    expect(await agentBubbles.count()).toBeGreaterThan(0);
+  test("My Chat empty state is not shown when history exists", async ({ page }) => {
+    const panel = page.locator("#panel-chat");
+    await expect(panel.getByText("No messages yet")).not.toBeVisible();
   });
 });
 
 test.describe("No JS Errors", () => {
+  let cleanup: () => Promise<void> = async () => {};
+  let workspaceId = "";
+  let workspaceName = "";
+
+  test.beforeAll(async () => {
+    const echo = await startEchoRuntime();
+    const ws = await seedWorkspace(echo.baseURL);
+    workspaceId = ws.id;
+    workspaceName = ws.name;
+    const stopHeartbeat = startHeartbeat(ws.id, ws.authToken);
+
+    cleanup = async () => {
+      stopHeartbeat();
+      await echo.stop();
+    };
+  });
+
+  test.afterAll(async () => {
+    await cleanupWorkspace(workspaceId);
+    await cleanup();
+  });
+
   test("page loads without errors with chat sub-tabs", async ({ page }) => {
     const errors: string[] = [];
     page.on("pageerror", (err) => errors.push(err.message));
 
-    await page.goto("/");
-    await page.waitForTimeout(3000);
+    await openChatPanel(page, workspaceName);
 
-    const nodes = page.locator(".react-flow__node");
-    if (await nodes.count() > 0) {
-      await nodes.first().click();
-      await page.waitForTimeout(500);
-      await page.getByRole("button", { name: /Chat/ }).first().click();
-      await page.waitForTimeout(1000);
-
-      // Switch between tabs
-      await page.locator("button", { hasText: "Agent Comms" }).click();
-      await page.waitForTimeout(500);
-      await page.locator("button", { hasText: "My Chat" }).click();
-      await page.waitForTimeout(500);
-    }
+    // Switch between tabs.
+    const panel = page.locator("#panel-chat");
+    await panel.getByRole("button", { name: "Agent Comms" }).click();
+    await panel.getByRole("button", { name: "My Chat" }).click();
 
     const critical = errors.filter(
-      (e) => !e.includes("WebSocket") && !e.includes("favicon") && !e.includes("hydration")
+      (e) => !e.includes("WebSocket") && !e.includes("favicon") && !e.includes("hydration"),
     );
     expect(critical).toEqual([]);
   });
