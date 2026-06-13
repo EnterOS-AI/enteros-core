@@ -1350,6 +1350,15 @@ if echo "$AGENT_TEXT" | grep -qiF "message contained no text content"; then
   fail "A2A — EMPTY COMPLETION (backend regression, NOT a platform/workspace-server bug). The configured model (MODEL_SLUG=${MODEL_SLUG:-?}) returned a 2xx completion with no text part; the runtime surfaced 'message contained no text content.'. Operator action: check the staging LLM backend / proxy for the canary model (the claude-code MiniMax-BYOK default is the BARE registered id MiniMax-M2.7 — the colon minimax:MiniMax-M2.7 is UNREGISTERED on claude-code, internal#718) — empty assistant turns, not an auth/quota/boot fault. Raw: $AGENT_TEXT"
 fi
 # Generic catch-all — falls through if none of the known regressions hit.
+# _ResultError is the claude-code runtime surfacing an LLM/backend/runtime
+# failure AS text. Diagnose it explicitly (#2712) so the next canary run
+# prints the upstream error instead of forcing operators to scrape workspace
+# logs. The suite still fails; this is diagnostics-only.
+if echo "$AGENT_TEXT" | grep -qiF "_ResultError"; then
+  diagnose_staging_result_error "$PARENT_ID" "$A2A_RESP" "A2A parent _ResultError"
+  _redacted_agent_text=$(printf '%s' "$AGENT_TEXT" | redact_secrets)
+  fail "A2A — STAGING LLM/BACKEND/RUNTIME FAILURE (_ResultError). The canary agent surfaced its LLM/backend/runtime error as a text payload. See the diagnostic burst above for the full A2A response, workspace state, and recent activity logs (including any upstream HTTP status/body the runtime reported). Raw (redacted): ${_redacted_agent_text:0:500}"
+fi
 if echo "$AGENT_TEXT" | grep -qiE "error|exception"; then
   fail "A2A returned an error-shaped response: $AGENT_TEXT"
 fi
