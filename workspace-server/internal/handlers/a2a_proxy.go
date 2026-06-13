@@ -290,11 +290,15 @@ func (h *WorkspaceHandler) ProxyA2A(c *gin.Context) {
 	// truncating mid-message (core#2677).
 	body, err := readBodyWithLimit(c.Request.Body, maxProxyRequestBody, "request")
 	if err != nil {
-		c.JSON(http.StatusRequestEntityTooLarge, gin.H{
-			"error":     err.Error(),
-			"truncated": true,
-			"max_bytes": maxProxyRequestBody,
-		})
+		if errors.Is(err, errA2ABodyTooLarge) {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{
+				"error":     err.Error(),
+				"truncated": true,
+				"max_bytes": maxProxyRequestBody,
+			})
+		} else {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		}
 		return
 	}
 
