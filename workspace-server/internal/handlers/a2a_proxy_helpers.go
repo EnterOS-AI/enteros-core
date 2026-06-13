@@ -9,6 +9,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -470,6 +471,80 @@ func nilIfEmpty(s string) *string {
 // canvas user is identified by the human's session/admin/org credential, which
 // is independent of whether the identity workspace happens to hold peer tokens.
 //
+// canvasIdentity carries the authenticated human identity for a canvas_user
+// A2A message. Status is either "AUTHENTICATED" (UserID and Email are set) or
+// "UNAUTHENTICATED" (the session could not be resolved to a real user).
+type canvasIdentity struct {
+	Status string
+	UserID string
+	Email  string
+}
+
+// resolveCanvasIdentity resolves the human user's identity from the
+// control-plane session cookie. It returns UNAUTHENTICATED when the identity
+// cannot be resolved, so downstream flows can fail-closed on the explicit
+// marker instead of treating empty as some user.
+func resolveCanvasIdentity(c *gin.Context) *canvasIdentity {
+	cookie := c.GetHeader("Cookie")
+	if cookie == "" {
+		return &canvasIdentity{Status: "UNAUTHENTICATED"}
+	}
+	userID, email, ok := middleware.VerifiedCPIdentity(cookie)
+	if !ok {
+		return &canvasIdentity{Status: "UNAUTHENTICATED"}
+	}
+	return &canvasIdentity{
+		Status: "AUTHENTICATED",
+		UserID: userID,
+		Email:  email,
+	}
+}
+
+// injectCanvasUserIdentity enriches a canvas_user A2A message/send body with
+// the authenticated sender's identity. It mirrors how the Telegram channel
+// bridge attaches user_id and username to params.metadata, but uses verified
+// CP identity instead of platform-specific chat fields.
+//
+// On UNAUTHENTICATED it still stamps the explicit marker so identity-sensitive
+// flows can refuse rather than silently treating empty as a user.
+func injectCanvasUserIdentity(body []byte, ident *canvasIdentity) ([]byte, error) {
+	if ident == nil {
+		return body, nil
+	}
+
+	var env map[string]interface{}
+	if err := json.Unmarshal(body, &env); err != nil {
+		return nil, fmt.Errorf("unmarshal a2a body: %w", err)
+	}
+
+	paramsRaw, ok := env["params"].(map[string]interface{})
+	if !ok {
+		paramsRaw = make(map[string]interface{})
+		env["params"] = paramsRaw
+	}
+
+	metaRaw, ok := paramsRaw["metadata"].(map[string]interface{})
+	if !ok {
+		metaRaw = make(map[string]interface{})
+		paramsRaw["metadata"] = metaRaw
+	}
+
+	metaRaw["source"] = "canvas_user"
+	metaRaw["user_identity_status"] = ident.Status
+	if ident.Status == "AUTHENTICATED" {
+		metaRaw["user_id"] = ident.UserID
+		metaRaw["email"] = ident.Email
+		// Mirror Telegram's "username" field for consumers that expect it.
+		metaRaw["username"] = ident.Email
+	}
+
+	out, err := json.Marshal(env)
+	if err != nil {
+		return nil, fmt.Errorf("marshal a2a body: %w", err)
+	}
+	return out, nil
+}
+
 // On auth failure this writes the 401 via c and returns an error so the
 // handler aborts without running the proxy.
 func validateCallerToken(ctx context.Context, c *gin.Context, callerID string) (isCanvasUser bool, err error) {

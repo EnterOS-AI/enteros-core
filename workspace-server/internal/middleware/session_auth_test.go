@@ -17,6 +17,85 @@ func resetSessionCache() {
 	sessionCache.entries = make(map[string]sessionCacheEntry)
 }
 
+// resetIdentityCache clears global identity cache state between tests.
+func resetIdentityCache() {
+	identityCache.Lock()
+	defer identityCache.Unlock()
+	identityCache.entries = make(map[string]identityCacheEntry)
+}
+
+// mockCPMeServer builds an httptest server that returns the given
+// status/body for /cp/auth/me. Also tracks hit count via the returned atomic.
+func mockCPMeServer(t *testing.T, status int, body string) (*httptest.Server, *atomic.Int64) {
+	t.Helper()
+	hits := &atomic.Int64{}
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		if !strings.HasSuffix(r.URL.Path, "/cp/auth/me") {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(s.Close)
+	return s, hits
+}
+
+func TestVerifiedCPIdentity_ResolvesAndCaches(t *testing.T) {
+	resetIdentityCache()
+	srv, hits := mockCPMeServer(t, 200, `{"user_id":"u_123","email":"kim@example.com"}`)
+	t.Setenv("CP_UPSTREAM_URL", srv.URL)
+	t.Setenv("MOLECULE_ORG_SLUG", "acme")
+
+	uid, email, ok := VerifiedCPIdentity("session=valid")
+	if !ok || uid != "u_123" || email != "kim@example.com" {
+		t.Errorf("expected authenticated u_123/kim@example.com, got %q/%q/%v", uid, email, ok)
+	}
+	if hits.Load() != 1 {
+		t.Errorf("expected 1 upstream hit; got %d", hits.Load())
+	}
+
+	uid, email, ok = VerifiedCPIdentity("session=valid")
+	if !ok || uid != "u_123" || email != "kim@example.com" {
+		t.Errorf("cached call should resolve; got %q/%q/%v", uid, email, ok)
+	}
+	if hits.Load() != 1 {
+		t.Errorf("identity cache should prevent second upstream hit; got %d", hits.Load())
+	}
+}
+
+func TestVerifiedCPIdentity_MissingFields(t *testing.T) {
+	resetIdentityCache()
+	srv, _ := mockCPMeServer(t, 200, `{"user_id":"u_123"}`)
+	t.Setenv("CP_UPSTREAM_URL", srv.URL)
+	t.Setenv("MOLECULE_ORG_SLUG", "acme")
+
+	uid, email, ok := VerifiedCPIdentity("session=partial")
+	if ok {
+		t.Errorf("missing email should be unauthenticated; got %q/%q/%v", uid, email, ok)
+	}
+}
+
+func TestVerifiedCPIdentity_UpstreamError(t *testing.T) {
+	resetIdentityCache()
+	srv, _ := mockCPMeServer(t, 502, `{}`)
+	t.Setenv("CP_UPSTREAM_URL", srv.URL)
+	t.Setenv("MOLECULE_ORG_SLUG", "acme")
+
+	uid, email, ok := VerifiedCPIdentity("session=bad")
+	if ok {
+		t.Errorf("502 should be unauthenticated; got %q/%q/%v", uid, email, ok)
+	}
+}
+
+func TestVerifiedCPIdentity_NoCookie(t *testing.T) {
+	resetIdentityCache()
+	uid, email, ok := VerifiedCPIdentity("")
+	if ok || uid != "" || email != "" {
+		t.Errorf("empty cookie should be unauthenticated; got %q/%q/%v", uid, email, ok)
+	}
+}
+
 // mockCPServer builds an httptest server that returns the given
 // status/body for /cp/auth/tenant-member. Also tracks hit count via
 // the returned atomic so tests can verify cache behavior.
