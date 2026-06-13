@@ -446,3 +446,42 @@ func TestApplyPlatformManagedLLMEnv_ProxyEnvPresentInjectsCredential(t *testing.
 		t.Errorf("sqlmock expectations: %v", err)
 	}
 }
+
+// TestApplyPlatformManagedLLMEnv_BYOKMiniMaxWorkspaceOverrideProjectsCreds is
+// core#2712: a claude-code workspace with an explicit per-workspace BYOK
+// override and a stored MiniMax model must still project ANTHROPIC_AUTH_TOKEN
+// and ANTHROPIC_BASE_URL from MINIMAX_API_KEY.
+//
+// ResolveLLMBillingModeDerived returns early on a workspace_override with
+// ProviderSelection=nil. Without a fallback derivation here, the core#2709
+// projection block would skip because providerFromRegistry("") fails, leaving
+// the Anthropic SDK adapter credential-less after restart.
+func TestApplyPlatformManagedLLMEnv_BYOKMiniMaxWorkspaceOverrideProjectsCreds(t *testing.T) {
+	ctx := context.Background()
+	const wsID = "b4914c3d-7ce0-4e14-aa32-02da048e2ae7"
+
+	mock := setupTestDB(t)
+	expectOverrideQuery(mock, wsID, LLMBillingModeBYOK)
+
+	envVars := map[string]string{
+		"MODEL":           "MiniMax-M2.7",
+		"MINIMAX_API_KEY": "real-minimax-key",
+	}
+	res := applyPlatformManagedLLMEnv(ctx, envVars, wsID, "claude-code", "", nil)
+
+	if res.ResolvedMode != LLMBillingModeBYOK {
+		t.Fatalf("resolved mode = %q, want byok", res.ResolvedMode)
+	}
+	if got := envVars["ANTHROPIC_AUTH_TOKEN"]; got != "real-minimax-key" {
+		t.Fatalf("ANTHROPIC_AUTH_TOKEN = %q, want real-minimax-key", got)
+	}
+	if got := envVars["ANTHROPIC_BASE_URL"]; got != "https://api.minimax.io/anthropic/v1" {
+		t.Fatalf("ANTHROPIC_BASE_URL = %q, want https://api.minimax.io/anthropic/v1", got)
+	}
+	if got := envVars["MINIMAX_API_KEY"]; got != "real-minimax-key" {
+		t.Fatalf("MINIMAX_API_KEY was overwritten: %q", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations: %v", err)
+	}
+}
