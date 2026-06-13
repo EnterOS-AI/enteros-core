@@ -63,7 +63,14 @@ llm_proxy_preflight() {
   fi
 
   if [ -z "$proxy_url" ]; then
-    echo "::error::DEP-DOWN:staging-llm (config-missing) E2E_LLM_PROXY_URL is unset and could not be derived from MOLECULE_CP_URL"
+    # Config-missing is NOT a dependency-down condition — it is operator
+    # error (an E2E_LANE was wired without setting E2E_LLM_PROXY_URL or
+    # MOLECULE_CP_URL). Emit a distinct CONFIG-MISSING prefix so the
+    # redgate-reporter dedups separately: DEP-DOWN dedups against
+    # live dependency outages; CONFIG-MISSING dedups against the same
+    # misconfiguration across runs/lanes. Do NOT change the prefix
+    # without coordinating the redgate-reporter's parser.
+    echo "::error::CONFIG-MISSING:staging-llm-proxy-url E2E_LLM_PROXY_URL is unset and could not be derived from MOLECULE_CP_URL"
     return 71
   fi
 

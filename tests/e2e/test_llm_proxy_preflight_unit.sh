@@ -100,8 +100,16 @@ test_config_missing() {
     echo "  output: $out"
     return 1
   fi
-  if ! echo "$out" | grep -q "DEP-DOWN:staging-llm"; then
-    echo "FAIL: test_config_missing output missing DEP-DOWN:staging-llm prefix"
+  # Config-missing emits CONFIG-MISSING, NOT DEP-DOWN — see the lib's
+  # comment on the status description prefixes. The two dedup buckets
+  # are distinct in the redgate-reporter.
+  if ! echo "$out" | grep -q "CONFIG-MISSING:staging-llm-proxy-url"; then
+    echo "FAIL: test_config_missing output missing CONFIG-MISSING:staging-llm-proxy-url prefix"
+    echo "  output: $out"
+    return 1
+  fi
+  if echo "$out" | grep -q "DEP-DOWN:staging-llm"; then
+    echo "FAIL: test_config_missing output should NOT contain DEP-DOWN:staging-llm (config-missing is a separate dedup bucket)"
     echo "  output: $out"
     return 1
   fi
