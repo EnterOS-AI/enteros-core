@@ -28,7 +28,10 @@ test.describe("MobileChat", () => {
     await page.setViewportSize({ width: 375, height: 812 });
     // Navigate directly to the mobile chat view.
     await page.goto(`/?m=chat&a=${workspaceId}`);
-    await page.waitForSelector("[data-testid='chat-panel']", { timeout: 10_000 });
+    // Wait for the actual readiness signal: the chat-panel must be visible
+    // inside the mobile shell (not just in the DOM). This replaces the
+    // previous fixed 10s wait that raced app hydration.
+    await page.waitForSelector("[data-testid='chat-panel']:visible", { timeout: 15_000 });
     // Wait for the workspace status to flip to online and the textarea to be enabled.
     await expect(page.locator("textarea").first()).toBeEnabled({ timeout: 15_000 });
     // Dismiss onboarding guide if present.
@@ -75,7 +78,7 @@ test.describe("MobileChat", () => {
       { timeout: 15_000 },
     );
     await page.reload();
-    await page.waitForSelector("[data-testid='chat-panel']", { timeout: 10_000 });
+    await page.waitForSelector("[data-testid='chat-panel']:visible", { timeout: 15_000 });
     await historyResponse;
 
     await expect(page.getByText("Mobile persistence", { exact: true })).toBeVisible();
