@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
 
@@ -1116,5 +1117,94 @@ func TestInstructionsHandler_List_ScanErrorContinues(t *testing.T) {
 	// The valid row should still be returned (error is logged, not fatal)
 	if len(result) != 1 {
 		t.Fatalf("expected 1 instruction despite row error, got %d", len(result))
+	}
+}
+
+// TestInstructionsResolve_PicksUpAckFirstSeed is the core#2724 regression
+// guard for the seed migration
+// `20260613081005_platform_instructions_ack_first_seed`. The migration
+// inserts a global platform_instruction with title
+// "Acknowledge-first responsiveness" + the ack-first directive content.
+// This test pins that the resolver (1) finds the row when queried for
+// a workspace, and (2) surfaces the ack-first directive in the merged
+// instructions body that the runtime calls GET
+// /workspaces/:id/instructions/resolve to read.
+//
+// Without this test, a future refactor that:
+//   - renames the resolver's SELECT columns
+//   - moves the resolver to a different package
+//   - changes the response shape
+// could silently break the directive delivery path. The test catches
+// the regression at unit-test time, BEFORE the runtime fetches an
+// empty string and the concierge goes silent again.
+//
+// Also asserts the directive lands in the "Platform-Wide Rules"
+// (global) section, NOT the "Role-Specific Rules" (workspace) section
+// — a global-scope row placed in the workspace section would be a
+// silent scoping bug.
+func TestInstructionsResolve_PicksUpAckFirstSeed(t *testing.T) {
+	mock := setupTestDB(t)
+	h := NewInstructionsHandler()
+
+	wsID := "ws-ack-first-resolve"
+	w, c := newGetRequest("/workspaces/" + wsID + "/instructions/resolve")
+	c.Params = []gin.Param{{Key: "id", Value: wsID}}
+	c.Request = httptest.NewRequest(http.MethodGet, "/workspaces/"+wsID+"/instructions/resolve", nil)
+
+	// The seed migration's row (the exact title + content the
+	// migration inserts). Mocks the resolver's SELECT.
+	rows := sqlmock.NewRows(resolveCols).
+		AddRow(
+			"global",
+			"Acknowledge-first responsiveness",
+			"**Stay responsive — acknowledge first:** ...send a one-line acknowledgement + your plan with `send_message_to_user`...",
+		)
+	mock.ExpectQuery("SELECT scope, title, content FROM platform_instructions").
+		WithArgs(wsID).
+		WillReturnRows(rows)
+
+	h.Resolve(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var out struct {
+		WorkspaceID   string `json:"workspace_id"`
+		Instructions string `json:"instructions"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+		t.Fatalf("response not valid JSON: %v", err)
+	}
+	if out.WorkspaceID != wsID {
+		t.Errorf("expected workspace_id %s, got %s", wsID, out.WorkspaceID)
+	}
+	// Must surface the ack-first directive body somewhere in the
+	// merged instructions. The exact section structure is an
+	// implementation detail of the resolver; we only require the
+	// title + the directive phrase to be present.
+	if !strings.Contains(out.Instructions, "Acknowledge-first responsiveness") {
+		t.Errorf("instructions missing the ack-first title (core#2724 seed migration):\n%s", out.Instructions)
+	}
+	if !strings.Contains(out.Instructions, "send_message_to_user") {
+		t.Errorf("instructions missing the ack-first directive body (core#2724 seed migration):\n%s", out.Instructions)
+	}
+	// Global section must contain the row (scope='global' rows
+	// go in the "Platform-Wide Rules" section per the resolver's
+	// concatenation order). If the scoping logic ever changes, the
+	// row must still appear in the global section.
+	idxGlobalSection := strings.Index(out.Instructions, "Platform-Wide Rules")
+	idxAckFirst := strings.Index(out.Instructions, "Acknowledge-first responsiveness")
+	idxWorkspaceSection := strings.Index(out.Instructions, "Role-Specific Rules")
+	if idxGlobalSection < 0 || idxAckFirst < 0 {
+		t.Fatalf("expected both 'Platform-Wide Rules' and 'Acknowledge-first responsiveness' in instructions, got:\n%s", out.Instructions)
+	}
+	if idxAckFirst <= idxGlobalSection {
+		t.Errorf("ack-first title must appear AFTER 'Platform-Wide Rules' header (idx %d <= %d):\n%s", idxAckFirst, idxGlobalSection, out.Instructions)
+	}
+	if idxWorkspaceSection > 0 && idxAckFirst >= idxWorkspaceSection {
+		t.Errorf("ack-first title (global scope) must appear BEFORE 'Role-Specific Rules' header (idx %d >= %d) — a global row in the workspace section is a scoping bug:\n%s", idxAckFirst, idxWorkspaceSection, out.Instructions)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
 	}
 }
