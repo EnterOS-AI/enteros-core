@@ -390,7 +390,10 @@ func (h *WorkspaceHandler) buildProvisionerConfig(
 // provisioning continues — the workspace will get 401 on its first heartbeat
 // and can recover on the next restart.
 func (h *WorkspaceHandler) issueAndInjectToken(ctx context.Context, workspaceID string, cfg *provisioner.WorkspaceConfig) {
-	// Revoke any existing live tokens FIRST — this must run in both modes.
+	// Revoke existing live INSTANCE tokens FIRST — this must run in both
+	// modes. API-kind tokens (the Create 201 inline bearer, admin/Token
+	// mints) are deliberately NOT revoked: provisioning invalidating the
+	// caller bearer it just returned was the core#1644 contract break.
 	// In SaaS mode the revoke is load-bearing on re-provision: without it,
 	// the previous workspace instance's live token sits in the DB, and
 	// RegistryHandler.requireWorkspaceToken on the fresh instance's first
@@ -399,7 +402,7 @@ func (h *WorkspaceHandler) issueAndInjectToken(ctx context.Context, workspaceID 
 	// the CP provisioner doesn't carry cfg.ConfigFiles across user-data).
 	// Revoking clears the gate so the register handler's bootstrap path
 	// can mint a fresh token and return the plaintext in the response.
-	if err := wsauth.RevokeAllForWorkspace(ctx, db.DB, workspaceID); err != nil {
+	if err := wsauth.RevokeInstanceTokensForWorkspace(ctx, db.DB, workspaceID); err != nil {
 		log.Printf("Provisioner: failed to revoke existing tokens for %s: %v — skipping auth-token injection", workspaceID, err)
 		return
 	}

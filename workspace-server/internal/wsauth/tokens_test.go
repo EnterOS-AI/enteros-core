@@ -40,6 +40,7 @@ func TestIssueToken_PersistsHashNotPlaintext(t *testing.T) {
 			"ws-abc",
 			sqlmock.AnyArg(), // hash (bytea)
 			sqlmock.AnyArg(), // prefix
+			"instance",       // kind: IssueToken mints instance tokens
 		).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 
@@ -407,5 +408,62 @@ func TestValidateAnyToken_EmptyTokenRejected(t *testing.T) {
 	db, _ := setupMock(t)
 	if err := ValidateAnyToken(context.Background(), db, ""); err != ErrInvalidToken {
 		t.Errorf("got %v, want ErrInvalidToken", err)
+	}
+}
+
+
+// --- core#1644 token-kind contract -----------------------------------------
+
+func TestIssueAPIToken_PersistsAPIKind(t *testing.T) {
+	db, mock := setupMock(t)
+
+	mock.ExpectExec(`INSERT INTO workspace_auth_tokens`).
+		WithArgs("ws-abc", sqlmock.AnyArg(), sqlmock.AnyArg(), "api").
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	if _, err := IssueAPIToken(context.Background(), db, "ws-abc"); err != nil {
+		t.Fatalf("IssueAPIToken: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+func TestRevokeInstanceTokens_FiltersKind(t *testing.T) {
+	db, mock := setupMock(t)
+
+	// The revoke must carry the kind='instance' filter: provisioning kills
+	// the old runtime credential but MUST NOT clobber caller-held API
+	// tokens (the Create 201 contract — core#1644).
+	mock.ExpectExec(`UPDATE workspace_auth_tokens\s+SET revoked_at = now\(\)\s+WHERE workspace_id = \$1 AND revoked_at IS NULL AND kind = 'instance'`).
+		WithArgs("ws-abc").
+		WillReturnResult(sqlmock.NewResult(0, 2))
+
+	if err := RevokeInstanceTokensForWorkspace(context.Background(), db, "ws-abc"); err != nil {
+		t.Fatalf("RevokeInstanceTokensForWorkspace: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+func TestHasLiveInstanceToken_FiltersKind(t *testing.T) {
+	db, mock := setupMock(t)
+
+	// The bootstrap allowance counts only instance tokens: a live API token
+	// must not block the fresh instance's first register (core#1644).
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM workspace_auth_tokens\s+WHERE workspace_id = \$1 AND revoked_at IS NULL AND kind = 'instance'`).
+		WithArgs("ws-abc").
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+
+	live, err := HasLiveInstanceToken(context.Background(), db, "ws-abc")
+	if err != nil {
+		t.Fatalf("HasLiveInstanceToken: %v", err)
+	}
+	if live {
+		t.Errorf("expected no live instance token")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
 	}
 }

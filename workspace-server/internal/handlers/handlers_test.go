@@ -461,7 +461,7 @@ func TestWorkspaceCreate_ReturnsAuthToken_201(t *testing.T) {
 	// token_hash, prefix). This is the assertion that the new code path
 	// reaches the DB.
 	mock.ExpectExec("INSERT INTO workspace_auth_tokens").
-		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	w := httptest.NewRecorder()

@@ -46,7 +46,22 @@ var ErrInvalidToken = errors.New("invalid or revoked workspace token")
 // Callers should treat the returned string as secret material and pass it
 // straight to the agent (env var, bundle response body, etc.) without
 // logging it.
+// IssueToken mints an INSTANCE-kind token (held by the workspace runtime).
+// Kept under its original name so the register-bootstrap, docker-inject and
+// external pre-register call sites are unchanged.
 func IssueToken(ctx context.Context, db *sql.DB, workspaceID string) (string, error) {
+	return issueTokenKind(ctx, db, workspaceID, "instance")
+}
+
+// IssueAPIToken mints an API-kind token (held by a platform caller: the
+// POST /workspaces 201 inline bearer, TokenHandler.Create, the admin
+// first-bearer endpoint). API tokens SURVIVE provisioning (which revokes
+// only instance tokens) -- this is the core#1644 contract fix.
+func IssueAPIToken(ctx context.Context, db *sql.DB, workspaceID string) (string, error) {
+	return issueTokenKind(ctx, db, workspaceID, "api")
+}
+
+func issueTokenKind(ctx context.Context, db *sql.DB, workspaceID, kind string) (string, error) {
 	buf := make([]byte, tokenPayloadBytes)
 	if _, err := rand.Read(buf); err != nil {
 		return "", fmt.Errorf("wsauth: generate token: %w", err)
@@ -57,9 +72,9 @@ func IssueToken(ctx context.Context, db *sql.DB, workspaceID string) (string, er
 	prefix := plaintext[:tokenPrefixLen]
 
 	_, err := db.ExecContext(ctx, `
-		INSERT INTO workspace_auth_tokens (workspace_id, token_hash, prefix)
-		VALUES ($1, $2, $3)
-	`, workspaceID, hash[:], prefix)
+		INSERT INTO workspace_auth_tokens (workspace_id, token_hash, prefix, kind)
+		VALUES ($1, $2, $3, $4)
+	`, workspaceID, hash[:], prefix, kind)
 	if err != nil {
 		return "", fmt.Errorf("wsauth: persist token: %w", err)
 	}
@@ -198,6 +213,31 @@ func WorkspaceExists(ctx context.Context, db *sql.DB, workspaceID string) (bool,
 // the heartbeat handler — a legacy workspace that registered before
 // tokens existed needs exactly one issued on its first post-upgrade
 // heartbeat rather than being rejected outright.
+// RevokeInstanceTokensForWorkspace revokes only INSTANCE-kind tokens (the
+// runtime-held ones). Used by provisioning: the old instance's credential
+// must die and the fresh instance must get the bootstrap allowance, while
+// caller-held API tokens (the Create 201 contract) survive. core#1644.
+func RevokeInstanceTokensForWorkspace(ctx context.Context, db *sql.DB, workspaceID string) error {
+	_, err := db.ExecContext(ctx, `
+		UPDATE workspace_auth_tokens
+		SET revoked_at = now()
+		WHERE workspace_id = $1 AND revoked_at IS NULL AND kind = 'instance'`,
+		workspaceID)
+	return err
+}
+
+// HasLiveInstanceToken reports whether a live INSTANCE-kind token exists.
+// This is the register-bootstrap predicate: a live API token must NOT block
+// the fresh instance's first register. core#1644.
+func HasLiveInstanceToken(ctx context.Context, db *sql.DB, workspaceID string) (bool, error) {
+	var n int
+	err := db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM workspace_auth_tokens
+		WHERE workspace_id = $1 AND revoked_at IS NULL AND kind = 'instance'`,
+		workspaceID).Scan(&n)
+	return n > 0, err
+}
+
 func HasAnyLiveToken(ctx context.Context, db *sql.DB, workspaceID string) (bool, error) {
 	var n int
 	err := db.QueryRowContext(ctx, `

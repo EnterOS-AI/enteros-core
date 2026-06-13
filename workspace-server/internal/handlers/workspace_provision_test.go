@@ -1030,7 +1030,7 @@ func TestIssueAndInjectToken_HappyPath(t *testing.T) {
 
 	// IssueToken INSERT
 	mock.ExpectExec(`INSERT INTO workspace_auth_tokens`).
-		WithArgs("ws-418-happy", sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WithArgs("ws-418-happy", sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 
 	cfg := provisioner.WorkspaceConfig{}
@@ -1069,7 +1069,7 @@ func TestIssueAndInjectToken_RotatesExistingToken(t *testing.T) {
 
 	// IssueToken INSERT for the new token
 	mock.ExpectExec(`INSERT INTO workspace_auth_tokens`).
-		WithArgs("ws-418-rotate", sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WithArgs("ws-418-rotate", sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 
 	cfg := provisioner.WorkspaceConfig{
@@ -1135,7 +1135,7 @@ func TestIssueAndInjectToken_IssueFailSkipsInjection(t *testing.T) {
 		WillReturnResult(sqlmock.NewResult(0, 0))
 
 	mock.ExpectExec(`INSERT INTO workspace_auth_tokens`).
-		WithArgs("ws-418-issue-fail", sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WithArgs("ws-418-issue-fail", sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnError(fmt.Errorf("db: constraint violation"))
 
 	cfg := provisioner.WorkspaceConfig{}
@@ -1163,7 +1163,7 @@ func TestIssueAndInjectToken_NilConfigFilesAllocated(t *testing.T) {
 		WillReturnResult(sqlmock.NewResult(0, 0))
 
 	mock.ExpectExec(`INSERT INTO workspace_auth_tokens`).
-		WithArgs("ws-418-nil-cfg", sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WithArgs("ws-418-nil-cfg", sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 
 	cfg := provisioner.WorkspaceConfig{} // ConfigFiles intentionally nil
@@ -1834,7 +1834,7 @@ func TestProvisionWorkspaceCP_InstanceIDPersistFail_MarksFailed(t *testing.T) {
 		WithArgs("ws-cp-orphan").
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec(`INSERT INTO workspace_auth_tokens`).
-		WithArgs("ws-cp-orphan", sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WithArgs("ws-cp-orphan", sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectExec(`UPDATE workspaces SET platform_inbound_secret`).
 		WithArgs(sqlmock.AnyArg(), "ws-cp-orphan").
@@ -1920,7 +1920,7 @@ func TestProvisionWorkspaceCP_InstanceIDPersistFail_RetrySucceeds(t *testing.T) 
 		WithArgs("ws-cp-retry-ok").
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec(`INSERT INTO workspace_auth_tokens`).
-		WithArgs("ws-cp-retry-ok", sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WithArgs("ws-cp-retry-ok", sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectExec(`UPDATE workspaces SET platform_inbound_secret`).
 		WithArgs(sqlmock.AnyArg(), "ws-cp-retry-ok").

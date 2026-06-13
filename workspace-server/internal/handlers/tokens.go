@@ -117,7 +117,7 @@ func (h *TokenHandler) Create(c *gin.Context) {
 		return
 	}
 
-	token, err := wsauth.IssueToken(c.Request.Context(), db.DB, workspaceID)
+	token, err := wsauth.IssueAPIToken(c.Request.Context(), db.DB, workspaceID)
 	if err != nil {
 		log.Printf("tokens: issue failed for %s: %v", workspaceID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create token"})
