@@ -736,6 +736,25 @@ def test_api_raises_on_non_2xx(drift_module, monkeypatch):
     assert "HTTP 500" in str(excinfo.value)
 
 
+def test_api_raises_api_error_on_url_error(drift_module, monkeypatch):
+    """api() must map URLError (network/DNS/connection-refused) to ApiError.
+
+    A Gitea brown-out surfaces as urllib.error.URLError and previously
+    crashed the cron with an unhandled stack trace. Failing soft via
+    ApiError lets the hourly retry recover instead of spamming duplicates.
+    """
+
+    def fake_urlopen(req, timeout=30):
+        import urllib.error
+        raise urllib.error.URLError("connection refused during brown-out")
+
+    monkeypatch.setattr(drift_module.urllib.request, "urlopen", fake_urlopen)
+
+    with pytest.raises(drift_module.ApiError) as excinfo:
+        drift_module.api("GET", "/repos/owner/repo/issues")
+    assert "network error" in str(excinfo.value)
+
+
 def test_api_raises_on_json_decode_when_expected(drift_module, monkeypatch):
     """api(expect_json=True) raises ApiError if body is not valid JSON.
 

@@ -160,6 +160,12 @@ def api(
     except urllib.error.HTTPError as e:
         raw = e.read()
         status = e.code
+    except urllib.error.URLError as e:
+        # Network-level failures (DNS, connection refused, socket timeout) during
+        # a Gitea brown-out should fail soft via ApiError so the hourly cron can
+        # retry, instead of crashing with an unhandled stack trace.
+        reason = str(e.reason) if hasattr(e, "reason") else str(e)
+        raise ApiError(f"{method} {path} → network error: {reason}") from e
 
     if not (200 <= status < 300):
         snippet = raw[:500].decode("utf-8", errors="replace") if raw else ""
