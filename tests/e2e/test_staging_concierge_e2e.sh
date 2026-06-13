@@ -221,14 +221,47 @@ tenant_call() {  # <method> <path> [curl args…]
 }
 
 # Create an external workspace (row only — no EC2). Echoes its id.
+#
+# Bounded retry around the external-row create only. The external create still
+# runs a DB transaction + post-commit token/status work before returning 201,
+# so under staging control-plane latency the one-shot curl could exit rc=28
+# (CURL_COMMON --max-time 30 -> "curl: (28) Operation timed out") and the helper
+# parsed no id, hard-failing user_tasks before any assertion (issue #2743).
+# This is provisioning-latency flake, not a user_tasks contract failure -- so we
+# retry transient cases (rc=28 / connection error -> http 000, or 2xx-but-no-id)
+# with a longer per-call timeout (mirroring the teardown DELETE --max-time 120)
+# and short backoff. Semantic 4xx/5xx stay hard-red with the response body.
+CREATE_WS_ATTEMPTS=${CREATE_WS_ATTEMPTS:-5}
+CREATE_WS_MAX_TIME=${CREATE_WS_MAX_TIME:-90}
 create_external_ws() {  # <name>
-  local name="$1" resp
-  resp=$(tenant_call POST /workspaces -H "Content-Type: application/json" \
-    -d "{\"name\":\"$name\",\"tier\":1,\"runtime\":\"external\",\"external\":true}")
-  echo "$resp" | python3 -c "import sys,re
-b=sys.stdin.read()
+  local name="$1" attempt body code id rc
+  for attempt in $(seq 1 "$CREATE_WS_ATTEMPTS"); do
+    body=$(mktemp "$TMPDIR_E2E/ws_create.XXXXXX")
+    # Longer --max-time wins over CURL_COMMON's 30s (later flag); capture rc so
+    # rc=28 is classified as transient latency rather than a no-id hard fail.
+    set +e
+    code=$(tenant_call POST /workspaces --max-time "$CREATE_WS_MAX_TIME" \
+      -H "Content-Type: application/json" \
+      -d "{\"name\":\"$name\",\"tier\":1,\"runtime\":\"external\",\"external\":true}" \
+      -o "$body" -w "%{http_code}" 2>/dev/null)
+    rc=$?
+    set -e
+    id=$(python3 -c "import sys,re
+b=open('$body',encoding='utf-8').read()
 m=re.search(r'\"id\"\s*:\s*\"([^\"]+)\"', b)
-print(m.group(1) if m else '')"
+print(m.group(1) if m else '')" 2>/dev/null || echo '')
+    if [ -n "$id" ]; then echo "$id"; rm -f "$body"; return 0; fi
+    # Semantic failure (got an HTTP response in 4xx/5xx) -> hard-red immediately.
+    case "$code" in
+      4??|5??)
+        fail "external ws create '$name' failed HTTP $code: $(head -c 500 "$body")" ;;
+    esac
+    # Transient: rc=28 (timeout), connection error (code 000), or 2xx-with-no-id.
+    log "    ws create '$name' transient (attempt $attempt/$CREATE_WS_ATTEMPTS: curl rc=$rc http=$code) -- retrying"
+    rm -f "$body"
+    sleep $(( attempt * 3 ))
+  done
+  fail "external ws create '$name' returned no id after $CREATE_WS_ATTEMPTS attempts (last curl rc=$rc http=$code; staging control-plane latency, rc=28 class)"
 }
 
 # MCP JSON-RPC tools/call against /workspaces/:id/mcp. Echoes the result text
