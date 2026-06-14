@@ -94,6 +94,19 @@ services:
       CP_UPSTREAM_URL: "http://cp-stub:9090"
       RATE_LIMIT: "1000"
       CANVAS_PROXY_URL: "http://localhost:3000"
+      # LLM-proxy env vars required by assertManagedTenantHasLLMEnv
+      # (workspace-server/cmd/server/cp_config.go). With MOLECULE_ORG_ID
+      # + ADMIN_TOKEN both set, the boot assertion requires all 4
+      # LLM-proxy keys — otherwise it aborts the tenant boot with
+      # MISSING_CP_LLM_ENV and the harness healthcheck marks the
+      # container unhealthy. The harness doesn't exercise the LLM
+      # proxy (replays use hermes echo runtime or the cp-stub's
+      # canned replies), so the values are local-fixture placeholders
+      # that satisfy the assertion without resolving to a real proxy.
+      MOLECULE_LLM_USAGE_TOKEN: "harness-llm-usage-token"
+      MOLECULE_LLM_USAGE_URL: "http://cp-stub:9090/llm/usage"
+      MOLECULE_LLM_BASE_URL: "http://cp-stub:9090/llm/openai/v1"
+      MOLECULE_LLM_ANTHROPIC_BASE_URL: "http://cp-stub:9090/llm/anthropic/v1"
       # Memory v2 sidecar (PR #2906) bundles the plugin into the
       # tenant image and starts it before the main server. The plugin
       # runs `CREATE EXTENSION vector` on first boot, which fails on
@@ -149,6 +162,13 @@ services:
       CP_UPSTREAM_URL: "http://cp-stub:9090"
       RATE_LIMIT: "1000"
       CANVAS_PROXY_URL: "http://localhost:3000"
+      # LLM-proxy env vars (see assertManagedTenantHasLLMEnv in
+      # workspace-server/cmd/server/cp_config.go) — same placeholders
+      # as tenant-alpha; the harness doesn't exercise the LLM proxy.
+      MOLECULE_LLM_USAGE_TOKEN: "harness-llm-usage-token"
+      MOLECULE_LLM_USAGE_URL: "http://cp-stub:9090/llm/usage"
+      MOLECULE_LLM_BASE_URL: "http://cp-stub:9090/llm/openai/v1"
+      MOLECULE_LLM_ANTHROPIC_BASE_URL: "http://cp-stub:9090/llm/anthropic/v1"
       # Memory v2 sidecar (PR #2906) bundles the plugin into the
       # tenant image and starts it before the main server. The plugin
       # runs `CREATE EXTENSION vector` on first boot, which fails on
