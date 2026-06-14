@@ -838,7 +838,7 @@ func TestComputeMetadata_ReturnsProviderAllowlist(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d: %s", w.Code, w.Body.String())
 	}
-	var resp computeMetadataResponse
+	var resp workspaceComputeOptionsResponse
 	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("failed to parse response: %v", err)
 	}
@@ -846,29 +846,28 @@ func TestComputeMetadata_ReturnsProviderAllowlist(t *testing.T) {
 		t.Fatalf("expected 3 providers, got %d", len(resp.Providers))
 	}
 	want := []struct {
-		id, label, defaultInstance, displayDefault string
-		instanceCount                              int
+		id              string
+		defaultInstance string
+		displayDefault  string
+		instanceCount   int
 	}{
-		{"aws", "AWS (default)", "t3.medium", "t3.xlarge", 7},
-		{"gcp", "GCP", "e2-standard-2", "e2-standard-4", 5},
-		{"hetzner", "Hetzner", "cpx31", "cpx41", 9},
+		{"aws", "t3.medium", "t3.xlarge", 7},
+		{"gcp", "e2-standard-2", "e2-standard-4", 5},
+		{"hetzner", "cpx31", "cpx41", 9},
 	}
 	for i, w := range want {
 		p := resp.Providers[i]
-		if p.ID != w.id {
-			t.Errorf("providers[%d].id = %q, want %q", i, p.ID, w.id)
+		if p != w.id {
+			t.Errorf("providers[%d] = %q, want %q", i, p, w.id)
 		}
-		if p.Label != w.label {
-			t.Errorf("providers[%d].label = %q, want %q", i, p.Label, w.label)
+		if got := resp.Defaults[p]; got != w.defaultInstance {
+			t.Errorf("defaults[%q] = %q, want %q", p, got, w.defaultInstance)
 		}
-		if p.DefaultInstance != w.defaultInstance {
-			t.Errorf("providers[%d].default_instance = %q, want %q", i, p.DefaultInstance, w.defaultInstance)
+		if got := resp.DisplayDefaults[p]; got != w.displayDefault {
+			t.Errorf("display_defaults[%q] = %q, want %q", p, got, w.displayDefault)
 		}
-		if p.DisplayDefault != w.displayDefault {
-			t.Errorf("providers[%d].display_default = %q, want %q", i, p.DisplayDefault, w.displayDefault)
-		}
-		if len(p.Instances) != w.instanceCount {
-			t.Errorf("providers[%d].instances len = %d, want %d", i, len(p.Instances), w.instanceCount)
+		if got := len(resp.InstanceTypes[p]); got != w.instanceCount {
+			t.Errorf("instanceTypes[%q] len = %d, want %d", p, got, w.instanceCount)
 		}
 	}
 }

@@ -17,29 +17,22 @@ const mockGet = vi.mocked(api.get);
 const mockPost = vi.mocked(api.post);
 
 const SAMPLE_COMPUTE_METADATA = {
-  providers: [
-    {
-      id: "aws",
-      label: "AWS (default)",
-      default_instance: "t3.medium",
-      display_default: "t3.xlarge",
-      instances: ["t3.medium", "t3.large", "t3.xlarge", "t3.2xlarge", "m6i.large", "m6i.xlarge", "c6i.xlarge"],
-    },
-    {
-      id: "hetzner",
-      label: "Hetzner",
-      default_instance: "cpx31",
-      display_default: "cpx41",
-      instances: ["cpx11", "cpx21", "cpx31", "cpx41", "cpx51", "cax11", "cax21", "cax31", "cax41"],
-    },
-    {
-      id: "gcp",
-      label: "GCP",
-      default_instance: "e2-standard-2",
-      display_default: "e2-standard-4",
-      instances: ["e2-small", "e2-medium", "e2-standard-2", "e2-standard-4", "e2-standard-8"],
-    },
-  ],
+  providers: ["aws", "hetzner", "gcp"],
+  instanceTypes: {
+    aws: ["t3.medium", "t3.large", "t3.xlarge", "t3.2xlarge", "m6i.large", "m6i.xlarge", "c6i.xlarge"],
+    hetzner: ["cpx11", "cpx21", "cpx31", "cpx41", "cpx51", "cax11", "cax21", "cax31", "cax41"],
+    gcp: ["e2-small", "e2-medium", "e2-standard-2", "e2-standard-4", "e2-standard-8"],
+  },
+  defaults: {
+    aws: "t3.medium",
+    hetzner: "cpx31",
+    gcp: "e2-standard-2",
+  },
+  display_defaults: {
+    aws: "t3.xlarge",
+    hetzner: "cpx41",
+    gcp: "e2-standard-4",
+  },
 };
 
 const SAMPLE_WORKSPACES = [
@@ -338,7 +331,7 @@ describe("CreateWorkspaceDialog", () => {
     const instanceSelect = screen.getByLabelText("Instance") as HTMLSelectElement;
     await waitFor(() => {
       const optionValues = Array.from(instanceSelect.options).map((o) => o.value);
-      expect(optionValues).toEqual(SAMPLE_COMPUTE_METADATA.providers[0].instances);
+      expect(optionValues).toEqual(SAMPLE_COMPUTE_METADATA.instanceTypes.aws);
     });
   });
 
@@ -349,15 +342,10 @@ describe("CreateWorkspaceDialog", () => {
     mockGet.mockImplementation(async (url: string) => {
       if (url === "/compute/metadata") {
         return {
-          providers: [
-            {
-              id: "aws",
-              label: "AWS (default)",
-              default_instance: "t3.medium",
-              display_default: "t3.2xlarge",
-              instances: ["t3.medium", "t3.large", "t3.xlarge", "t3.2xlarge"],
-            },
-          ],
+          providers: ["aws"],
+          instanceTypes: { aws: ["t3.medium", "t3.large", "t3.xlarge", "t3.2xlarge"] },
+          defaults: { aws: "t3.medium" },
+          display_defaults: { aws: "t3.2xlarge" },
         };
       }
       if (url === "/templates") return SAMPLE_TEMPLATES as any;

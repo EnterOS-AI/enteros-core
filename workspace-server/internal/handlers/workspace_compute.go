@@ -399,18 +399,6 @@ func validateWorkspaceDisplayDimensions(width, height int) error {
 	return nil
 }
 
-type computeProviderMetadata struct {
-	ID              string   `json:"id"`
-	Label           string   `json:"label"`
-	DefaultInstance string   `json:"default_instance"`
-	DisplayDefault  string   `json:"display_default"`
-	Instances       []string `json:"instances"`
-}
-
-type computeMetadataResponse struct {
-	Providers []computeProviderMetadata `json:"providers"`
-}
-
 // ComputeMetadata handles GET /compute/metadata — SSOT for cloud-provider +
 // instance-type allowlists consumed by the canvas ContainerConfigTab (and any
 // other client that needs to render a provider/instance selector).
@@ -428,32 +416,24 @@ type computeMetadataResponse struct {
 func ComputeMetadata(c *gin.Context) {
 	// Render in the canvas-UX order (distinct from the validation
 	// order — see workspaceComputeMetadataRenderOrder doc), pulling
-	// the label + default + instance-types for each from the SSOT
-	// maps. Three lookups per provider; O(providers) total.
-	providers := make([]computeProviderMetadata, 0, len(workspaceComputeMetadataRenderOrder))
+	// the label + default + display-default + instance-types for each
+	// from the SSOT maps. O(providers) total.
+	providers := make([]string, 0, len(workspaceComputeMetadataRenderOrder))
+	instanceTypes := make(map[string][]string, len(workspaceComputeMetadataRenderOrder))
+	defaults := make(map[string]string, len(workspaceComputeMetadataRenderOrder))
+	displayDefaults := make(map[string]string, len(workspaceComputeMetadataRenderOrder))
 	for _, id := range workspaceComputeMetadataRenderOrder {
-		// Label is required (panicked in init() if missing). If a
-		// future provider is added without a label, this is a
-		// boot-time crash, not a silent empty label.
-		label := workspaceComputeProviderLabels[id]
-		// Default + instance-types are also required — same
-		// SSOT-consistency rationale. A provider without a
-		// default or with zero instance types would fail the
-		// validation step downstream, so we want the metadata
-		// endpoint to surface that as a panic at boot, not as
-		// a silent empty render.
-		defaultInstance := workspaceComputeDefaultInstanceByProvider[id]
-		displayDefault := workspaceComputeDisplayDefaultByProvider[id]
-		instances := workspaceComputeInstanceTypesOrdered[id]
-		providers = append(providers, computeProviderMetadata{
-			ID:              id,
-			Label:           label,
-			DefaultInstance: defaultInstance,
-			DisplayDefault:  displayDefault,
-			Instances:       instances,
-		})
+		providers = append(providers, id)
+		instanceTypes[id] = workspaceComputeInstanceTypesOrdered[id]
+		defaults[id] = workspaceComputeDefaultInstanceByProvider[id]
+		displayDefaults[id] = workspaceComputeDisplayDefaultByProvider[id]
 	}
-	c.JSON(200, computeMetadataResponse{Providers: providers})
+	c.JSON(200, workspaceComputeOptionsResponse{
+		Providers:       providers,
+		InstanceTypes:   instanceTypes,
+		Defaults:        defaults,
+		DisplayDefaults: displayDefaults,
+	})
 }
 
 func workspaceComputeIsZero(compute models.WorkspaceCompute) bool {

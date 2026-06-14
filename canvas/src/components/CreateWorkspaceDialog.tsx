@@ -10,7 +10,6 @@ import {
   displayDefaultForProvider,
   instanceTypesForProvider,
   parseComputeOptions,
-  providerLabel,
 } from "@/lib/compute-options";
 import { isSaaSTenant } from "@/lib/tenant";
 import { ExternalConnectModal, type ExternalConnectionInfo } from "./ExternalConnectModal";
@@ -58,6 +57,17 @@ interface TemplateSpec {
 }
 
 const DEFAULT_RUNTIME = "claude-code";
+
+// Human-readable labels for cloud-provider IDs. Provider ordering and
+// instance-type allowlists are SSOT from GET /compute/metadata; labels are
+// pure UI chrome and live next to the only consumer (#2489).
+const PROVIDER_LABELS: Record<string, string> = {
+  aws: "AWS (default)",
+  gcp: "GCP",
+  hetzner: "Hetzner",
+};
+const providerLabel = (id: string): string => PROVIDER_LABELS[id] ?? id;
+
 const RUNTIME_OPTIONS = [
   { value: "claude-code", label: "Claude Code" },
   { value: "codex", label: "OpenAI Codex CLI" },
@@ -672,7 +682,7 @@ export function CreateWorkspaceButton() {
                     >
                       {computeOptions.providers.map((p) => (
                         <option key={p} value={p}>
-                          {providerLabel(computeOptions, p)}
+                          {providerLabel(p)}
                         </option>
                       ))}
                     </select>

@@ -225,7 +225,7 @@ export function ContainerConfigTab({ workspaceId, data }: Props) {
               label="Cloud provider"
               value={normalizeProvider(form.provider)}
               options={computeOptions.providers}
-              optionLabel={(v) => computeOptions.labels[v] ?? v}
+              optionLabel={(v) => cloudProviderLabel(v)}
               // Switching cloud resets the instance type to the new provider's
               // default (an AWS t3.* is invalid on Hetzner, etc.) — also keeps the
               // instance-type dropdown below in sync with the provider's sizes.

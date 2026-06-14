@@ -22,7 +22,8 @@ import (
 // The contract being pinned:
 //   1. The route is registered and reachable.
 //   2. The route is PUBLIC — no AdminAuth, no WorkspaceAuth.
-//   3. The wire shape matches the canvas's expectation (same JSON keys).
+//   3. The wire shape matches the canvas's expectation (same JSON keys):
+//      { providers, instanceTypes, defaults, display_defaults }.
 //   4. The in-tree Go consumer (handlers.workspaceComputeInstanceAllowlist)
 //      AGREE with the endpoint's value.
 
@@ -54,12 +55,10 @@ func TestComputeMetadata_ReturnsExpectedShape(t *testing.T) {
 	r.ServeHTTP(w, req)
 
 	var got struct {
-		Providers []struct {
-			ID              string   `json:"id"`
-			Label           string   `json:"label"`
-			DefaultInstance string   `json:"default_instance"`
-			Instances       []string `json:"instances"`
-		} `json:"providers"`
+		Providers       []string            `json:"providers"`
+		InstanceTypes   map[string][]string `json:"instanceTypes"`
+		Defaults        map[string]string   `json:"defaults"`
+		DisplayDefaults map[string]string   `json:"display_defaults"`
 	}
 	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
 		t.Fatalf("unmarshal response: %v (body=%s)", err, w.Body.String())
@@ -69,26 +68,28 @@ func TestComputeMetadata_ReturnsExpectedShape(t *testing.T) {
 		t.Fatalf("expected 3 providers, got %d", len(got.Providers))
 	}
 	want := []struct {
-		id, label, defaultInstance string
-		instanceCount             int
+		id              string
+		defaultInstance string
+		displayDefault  string
+		instanceCount   int
 	}{
-		{"aws", "AWS (default)", "t3.medium", 7},
-		{"gcp", "GCP", "e2-standard-2", 5},
-		{"hetzner", "Hetzner", "cpx31", 9},
+		{"aws", "t3.medium", "t3.xlarge", 7},
+		{"gcp", "e2-standard-2", "e2-standard-4", 5},
+		{"hetzner", "cpx31", "cpx41", 9},
 	}
 	for i, w := range want {
 		p := got.Providers[i]
-		if p.ID != w.id {
-			t.Errorf("providers[%d].id = %q, want %q", i, p.ID, w.id)
+		if p != w.id {
+			t.Errorf("providers[%d] = %q, want %q", i, p, w.id)
 		}
-		if p.Label != w.label {
-			t.Errorf("providers[%d].label = %q, want %q", i, p.Label, w.label)
+		if got := got.Defaults[p]; got != w.defaultInstance {
+			t.Errorf("defaults[%q] = %q, want %q", p, got, w.defaultInstance)
 		}
-		if p.DefaultInstance != w.defaultInstance {
-			t.Errorf("providers[%d].default_instance = %q, want %q", i, p.DefaultInstance, w.defaultInstance)
+		if got := got.DisplayDefaults[p]; got != w.displayDefault {
+			t.Errorf("display_defaults[%q] = %q, want %q", p, got, w.displayDefault)
 		}
-		if len(p.Instances) != w.instanceCount {
-			t.Errorf("providers[%d].instances len = %d, want %d", i, len(p.Instances), w.instanceCount)
+		if got := len(got.InstanceTypes[p]); got != w.instanceCount {
+			t.Errorf("instanceTypes[%q] len = %d, want %d", p, got, w.instanceCount)
 		}
 	}
 }
@@ -107,18 +108,16 @@ func TestComputeMetadata_AgreesWithInTreeAllowlist(t *testing.T) {
 	r.ServeHTTP(w, req)
 
 	var got struct {
-		Providers []struct {
-			ID        string   `json:"id"`
-			Instances []string `json:"instances"`
-		} `json:"providers"`
+		Providers     []string            `json:"providers"`
+		InstanceTypes map[string][]string `json:"instanceTypes"`
 	}
 	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
 		t.Fatalf("unmarshal response: %v (body=%s)", err, w.Body.String())
 	}
 
 	for _, p := range got.Providers {
-		if len(p.Instances) == 0 {
-			t.Errorf("provider %q has empty instances", p.ID)
+		if len(got.InstanceTypes[p]) == 0 {
+			t.Errorf("provider %q has empty instances", p)
 		}
 	}
 }
