@@ -380,25 +380,40 @@ func (h *WorkspaceHandler) ProxyA2A(c *gin.Context) {
 		}
 	}
 
-	// CANVAS CAP-AND-QUEUE (core#2751, DEFAULT OFF). The canvas→agent POST is
+	// CANVAS CAP-AND-QUEUE (core#2751, DEFAULT ON). The canvas→agent POST is
 	// held for the whole turn; a turn longer than Cloudflare's ~100s edge limit
-	// returns a 524 (the recurring "Failed to send"). When A2A_CANVAS_SYNC_BUDGET
-	// > 0, cap the SYNCHRONOUS wait for canvas callers below that limit: if the
+	// returns a 524 (the recurring "Failed to send"). By default we cap the
+	// SYNCHRONOUS wait for canvas callers at 90s (just under CF's edge): if the
 	// turn hasn't finished by the budget, ack `{status:"queued"}` and let the
 	// dispatch finish on its own — proxyA2ARequest's dispatch already runs on a
 	// context.WithoutCancel forward ctx (idle-bounded), so it survives this
 	// handler returning, and the agent's reply reaches the canvas via the
 	// AGENT_MESSAGE WebSocket broadcast (the exact poll-mode contract). The work
 	// runs on a detached ctx so its DB logging isn't cancelled when we return.
-	// Budget=0 (default) → the unchanged synchronous path below; no behavior
-	// change until an operator opts in. See the design on core#2751.
-	if budget := envx.Duration("A2A_CANVAS_SYNC_BUDGET", 0); budget > 0 && (callerID == "" || isCanvasUser) {
+	//
+	// Operators can tune the budget via the env var (e.g. 60s for more
+	// conservative environments). The default of 90s is the durable fix that
+	// removes the CF 100s ceiling for the canvas path. envx.Duration treats
+	// 0/negative as "not set" and falls through to the default — to disable
+	// the cap, an operator must explicitly patch the default (a code change).
+	// See the design on core#2751.
+	//
+	// The budget lookup is extracted into canvasA2ASyncBudget (below) so the
+	// default value is unit-testable without source-string matching.
+	//
+	// Runtime kill-switch (core#2751 RC #11552): canvasA2ASyncDisabled()
+	// is the explicit opt-out that takes precedence over the budget value.
+	// When set, the entire cap-and-queue goroutine is skipped and the
+	// legacy synchronous path runs. Ops can flip this at runtime to
+	// disable the async path if it misbehaves in prod.
+	if !canvasA2ASyncDisabled() && canvasA2ASyncBudget() > 0 && (callerID == "" || isCanvasUser) {
 		type a2aResult struct {
 			status int
 			body   []byte
 			perr   *proxyA2AError
 		}
 		detached := context.WithoutCancel(ctx)
+		budget := canvasA2ASyncBudget() // local copy for the time.After below
 		done := make(chan a2aResult, 1)
 		go func() {
 			s, b, pe := h.proxyA2ARequest(detached, workspaceID, body, callerID, true, isCanvasUser)
@@ -1213,4 +1228,42 @@ func applyIdleTimeout(parent context.Context, b *events.Broadcaster, workspaceID
 		}
 	}()
 	return ctx, cancel
+}
+
+// canvasA2ASyncBudget is the extracted lookup for the cap-and-queue synchronous
+// wait (core#2751). Extracted from the ProxyA2A handler so the default value
+// can be unit-tested directly without source-string matching — a regression of
+// the default to 0 (legacy always-sync, which would re-expose the canvas path
+// to the 524+WS-starvation class) is caught by the unit test on this function.
+//
+// Default is 90s — just under Cloudflare's ~100s edge limit, so a turn that
+// outlives the budget triggers the queued ack before CF drops the request.
+//
+// The envx.Duration wrapper lets operators tune the budget
+// (A2A_CANVAS_SYNC_BUDGET=60s for more conservative environments) without a
+// code change. envx treats 0 / negative / invalid values as "not set" and
+// falls through to the default.
+//
+// **Runtime kill-switch (core#2751 RC #11552):** the cap-and-queue can
+// also be disabled at runtime by setting A2A_CANVAS_SYNC_DISABLE=1 (or any
+// truthy envx.Bool value). When set, ProxyA2A skips the cap-and-queue
+// goroutine entirely and uses the legacy synchronous path, regardless of
+// the budget value. Ops can flip this without a deploy if the async path
+// misbehaves in prod. The kill-switch is implemented as a SEPARATE env
+// var (not via the budget=0 path) because envx.Duration treats 0/negative
+// as "not set" and falls through to the default — there was no other
+// way to disable at runtime without a code change.
+func canvasA2ASyncBudget() time.Duration {
+	return envx.Duration("A2A_CANVAS_SYNC_BUDGET", 90*time.Second)
+}
+
+// canvasA2ASyncDisabled is the runtime kill-switch for the cap-and-queue
+// async-dispatch path. Returns true when A2A_CANVAS_SYNC_DISABLE is set
+// to a truthy value (per envx.Bool semantics: 1, t, true, TRUE, T —
+// NOT 0, f, false, F, empty). When true, ProxyA2A skips the
+// cap-and-queue goroutine entirely and uses the legacy synchronous
+// path. Extracted so the kill-switch default is unit-testable
+// independently of the budget value.
+func canvasA2ASyncDisabled() bool {
+	return envx.Bool("A2A_CANVAS_SYNC_DISABLE", false)
 }
