@@ -441,10 +441,17 @@ if [ "$LIFECYCLE_LLM" = "minimax" ]; then
   echo "  secret write (MODEL_PROVIDER): $(echo "$SECP" | head -c 120)"
 fi
 
-# #2851: the provisioner now injects MOLECULE_WORKSPACE_URL automatically so the
-# runtime advertises a host-reachable URL (http://localhost:<host-port>), which
-# the A2A proxy rewrites to ws-<id>:8000 when the platform runs inside Docker.
-# No manual workspace-secret injection is needed here.
+# #2851: override HOSTNAME in the workspace container so a runtime that computes
+# its self-URL from HOSTNAME does not advertise its Docker container short-ID
+# (e.g. 30e9e720fbc2), which the platform cannot resolve. The provisioner
+# injects MOLECULE_WORKSPACE_URL=http://localhost:<host-port>, but real templates
+# may fall back to HOSTNAME. localhost is explicitly allowed by name in dev-mode
+# SSRF validation and reaches the host-mapped workspace port from the host-network
+# act_runner job container.
+SECH=$(curl -s -X POST "$BASE/workspaces/$WSID/secrets" \
+  -H "Authorization: Bearer $WTOKEN" -H "Content-Type: application/json" \
+  -d '{"key":"HOSTNAME","value":"localhost"}')
+echo "  secret write (HOSTNAME): $(echo "$SECH" | head -c 120)"
 
 # Seed config.yaml directly into the named config volume so the provision (and
 # every later restart) has a config source. Create's byok-no-cred abort never
@@ -539,10 +546,19 @@ fi
 URL_HOST_AFTER="${WS_URL_AFTER#http://}"
 URL_HOST_AFTER="${URL_HOST_AFTER#https://}"
 URL_HOST_AFTER="${URL_HOST_AFTER%%:*}"
-if [ "$URL_HOST_AFTER" = "127.0.0.1" ] || [ "$URL_HOST_AFTER" = "localhost" ] || [ "$URL_HOST_AFTER" = "${PLATFORM_HOST_IP:-}" ]; then
+# #2851 fail-fast: the advertised hostname MUST resolve. Container short-IDs
+# (e.g. 30e9e720fbc2) do not resolve from the platform/A2A proxy and produce an
+# opaque empty-LLM-result failure downstream. Surface the DNS misconfiguration
+# here and now, before the MiniMax/proxy-reach round-trip.
+if ! python3 -c "import socket; socket.gethostbyname('$URL_HOST_AFTER')" 2>/dev/null; then
+  fail "workspace advertised URL does not resolve" "url=$WS_URL_AFTER host=$URL_HOST_AFTER cannot be resolved from the harness"
+  echo "=== Results: $PASS passed, $FAIL failed ==="; exit 1
+fi
+pass "workspace advertised URL resolves (host=$URL_HOST_AFTER)"
+if [ "$URL_HOST_AFTER" = "127.0.0.1" ] || [ "$URL_HOST_AFTER" = "localhost" ]; then
   pass "workspace registered a host-reachable URL (host=$URL_HOST_AFTER)"
 else
-  fail "workspace URL is not a host-reachable address" "url=$WS_URL_AFTER expected localhost/127.0.0.1 or PLATFORM_HOST_IP=${PLATFORM_HOST_IP:-<unset>}"
+  fail "workspace URL is not a host-reachable address" "url=$WS_URL_AFTER expected localhost/127.0.0.1"
 fi
 echo ""
 

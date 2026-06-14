@@ -193,6 +193,15 @@ jobs:
           fi
           echo "PLATFORM_HOST_IP=${PLATFORM_HOST_IP}"
           echo "PLATFORM_URL=http://${PLATFORM_HOST_IP}:${PORT}" >> "$GITHUB_ENV"
+          # #2851: the workspace runtime must advertise an address the platform can
+          # resolve and that /registry/register will accept. In self-hosted dev
+          # mode SSRF validation only allows "localhost" by name (RFC-1918 gateway
+          # IPs are rejected). The act_runner job container runs with host-network,
+          # so localhost:<host-port> reaches the host-mapped workspace port.
+          # Without this the runtime may fall back to its Docker container
+          # hostname (e.g. 30e9e720fbc2), which the platform cannot resolve and
+          # the A2A proxy rejects.
+          echo "MOLECULE_WORKSPACE_ADVERTISE_HOST=localhost" >> "$GITHUB_ENV"
           # Deterministic admin token: the script sends MOLECULE_ADMIN_TOKEN as the
           # bearer; the platform checks ADMIN_TOKEN. Set both to the same value.
           T="lpe2e-admin-${{ github.run_id }}-${{ github.run_attempt }}"
@@ -420,11 +429,15 @@ jobs:
           fi
           echo "PLATFORM_HOST_IP=${PLATFORM_HOST_IP}"
           echo "PLATFORM_URL=http://${PLATFORM_HOST_IP}:${PORT}" >> "$GITHUB_ENV"
-          # The workspace advertises localhost:<host-port> (the default when
-          # MOLECULE_WORKSPACE_ADVERTISE_HOST is unset). Because this job runs
-          # host-network, the platform reaches the container via 127.0.0.1; no
-          # gateway-IP advertisement is needed here and keeping it unset lets
-          # /registry/register accept the localhost URL.
+          # #2851: the workspace runtime must advertise an address the platform can
+          # resolve and that /registry/register will accept. In self-hosted dev
+          # mode SSRF validation only allows "localhost" by name (RFC-1918 gateway
+          # IPs are rejected). The act_runner job container runs with host-network,
+          # so localhost:<host-port> reaches the host-mapped workspace port.
+          # Without this the runtime may fall back to its Docker container
+          # hostname (e.g. 30e9e720fbc2), which the platform cannot resolve and
+          # the A2A proxy rejects.
+          echo "MOLECULE_WORKSPACE_ADVERTISE_HOST=localhost" >> "$GITHUB_ENV"
           T="lpe2e-real-admin-${{ github.run_id }}-${{ github.run_attempt }}"
           echo "ADMIN_TOKEN=${T}" >> "$GITHUB_ENV"
           echo "MOLECULE_ADMIN_TOKEN=${T}" >> "$GITHUB_ENV"
