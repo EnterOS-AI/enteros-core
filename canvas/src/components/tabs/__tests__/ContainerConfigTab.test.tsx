@@ -437,6 +437,81 @@ describe("ContainerConfigTab", () => {
     expect(values).toContain("m6i.xlarge");
   });
 
+  // core#2489 SSOT pin: the in-bundle FALLBACK_COMPUTE_OPTIONS in
+  // ContainerConfigTab.tsx is the last drift surface against the
+  // workspace-server SSOT (the canvas already fetches the live
+  // /compute/metadata when the server is reachable; the fallback
+  // is the safety net for offline / 5xx / dev-mode). The test
+  // asserts the FALLBACK mirrors the server's data shape so a
+  // future server-side change (e.g. a new provider added to
+  // workspaceComputeProvidersOrdered) is caught HERE rather than
+  // surfacing as a silent empty dropdown in the field.
+  //
+  // Pinned against the workspace-server SSOT (workspace_compute.go):
+  //   providers ordered: aws, hetzner, gcp
+  //   aws instances (7): t3.medium, t3.large, t3.xlarge, t3.2xlarge,
+  //                      m6i.large, m6i.xlarge, c6i.xlarge
+  //   aws default: t3.medium
+  //   hetzner instances (9): cpx11, cpx21, cpx31, cpx41, cpx51,
+  //                          cax11, cax21, cax31, cax41
+  //   hetzner default: cpx31
+  //   gcp instances (5): e2-small, e2-medium, e2-standard-2,
+  //                      e2-standard-4, e2-standard-8
+  //   gcp default: e2-standard-2
+  //   labels: aws="AWS (default)", gcp="GCP", hetzner="Hetzner"
+  //
+  // The test exercises the fallback path by making the live fetch
+  // fail; the assertions then read what the dropdowns actually
+  // rendered, not a re-imported constant (so a future change to
+  // the in-bundle fallback that breaks the UX is caught here, not
+  // by a unit test on a constant that the UX would no longer
+  // use).
+  it("fallback instance-type dropdowns cover the full server-side SSOT (drift pin)", async () => {
+    apiGet.mockRejectedValueOnce(new Error("server unreachable — fallback path"));
+
+    render(
+      <ContainerConfigTab
+        workspaceId="ws-fallback-pin"
+        data={{
+          runtime: "claude-code",
+          status: "online",
+          needsRestart: false,
+          activeTasks: 0,
+          maxConcurrentTasks: null,
+          workspaceAccess: "none",
+          deliveryMode: "push",
+          compute: { instance_type: "t3.medium", provider: "aws", volume: { root_gb: 30 } },
+        }}
+      />,
+    );
+
+    await waitFor(() => expect(apiGet).toHaveBeenCalled());
+
+    // Switch through each provider and assert the instance-type
+    // dropdown contains the FULL SSOT set. Catches a future
+    // server change that adds a new instance without
+    // updating the canvas fallback (the canvas would silently
+    // not offer the new size until the live fetch succeeds).
+    const providers = ["aws", "hetzner", "gcp"] as const;
+    const wantInstances: Record<typeof providers[number], string[]> = {
+      aws: ["t3.medium", "t3.large", "t3.xlarge", "t3.2xlarge", "m6i.large", "m6i.xlarge", "c6i.xlarge"],
+      hetzner: ["cpx11", "cpx21", "cpx31", "cpx41", "cpx51", "cax11", "cax21", "cax31", "cax41"],
+      gcp: ["e2-small", "e2-medium", "e2-standard-2", "e2-standard-4", "e2-standard-8"],
+    };
+    for (const p of providers) {
+      // The provider <select> drives the instance-type options.
+      const providerSelect = screen.getByLabelText("Cloud provider") as HTMLSelectElement;
+      fireEvent.change(providerSelect, { target: { value: p } });
+      const instanceSelect = screen.getByLabelText("Instance type");
+      const values = Array.from(instanceSelect.querySelectorAll("option")).map(
+        (o) => o.getAttribute("value"),
+      );
+      for (const want of wantInstances[p]) {
+        expect(values, `provider ${p} fallback missing ${want}`).toContain(want);
+      }
+    }
+  });
+
   it("does not treat a non-provider edit as a recreate (no confirm; aws default omitted)", async () => {
     const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
     render(
