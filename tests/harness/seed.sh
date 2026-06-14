@@ -25,11 +25,19 @@ source "$HERE/_curl.sh"
 
 create_workspace() {
     local tenant="$1" name="$2" tier="$3" parent="${4:-}"
+    # Use a platform-billed model (vendor/model slash form, e.g.
+    # moonshot/kimi-k2.6) — the harness has no BYOK credentials
+    # provisioned. `claude-code/sonnet` would 422 with
+    # MISSING_BYOK_CREDENTIAL (core#2608 create-boundary hard-reject);
+    # `mock/echo` is the runtime the harness actually uses for replays
+    # but POST /workspaces may not accept the slash form there.
+    # moonshot/kimi-k2.6 is platform-billed (no key needed) and
+    # supported by the harness's runtime registry.
     local body
     if [ -n "$parent" ]; then
-        body="{\"name\":\"$name\",\"tier\":$tier,\"parent_id\":\"$parent\",\"runtime\":\"claude-code\",\"model\":\"sonnet\"}"
+        body="{\"name\":\"$name\",\"tier\":$tier,\"parent_id\":\"$parent\",\"runtime\":\"moonshot\",\"model\":\"moonshot/kimi-k2.6\"}"
     else
-        body="{\"name\":\"$name\",\"tier\":$tier,\"runtime\":\"claude-code\",\"model\":\"sonnet\"}"
+        body="{\"name\":\"$name\",\"tier\":$tier,\"runtime\":\"moonshot\",\"model\":\"moonshot/kimi-k2.6\"}"
     fi
     local id
     if [ "$tenant" = "alpha" ]; then
