@@ -167,9 +167,17 @@ ok()   { echo "[$(date +%H:%M:%S)] ✅ $*"; }
 # already covers this, but a redundant check in the harness
 # itself is cheap).
 if [ "$MODE" = "smoke" ]; then
-  SLUG="e2e-smoke-$(make_collision_proof_slug_suffix "${E2E_RUN_ID:-}")"
+  # core#60: pass the prefix length (11 for "e2e-smoke-") so the
+  # helper's run_id budget is computed precisely against the CP's
+  # 31-char org-slug cap. Without this, the helper uses a
+  # conservative default and a future prefix change would silently
+  # produce over-cap slugs.
+  SLUG="e2e-smoke-$(make_collision_proof_slug_suffix "${E2E_RUN_ID:-}" 11)"
 else
-  SLUG="e2e-$(make_collision_proof_slug_suffix "${E2E_RUN_ID:-}")"
+  # core#60: pass the prefix length (4 for "e2e-"). The non-smoke
+  # path has the same 31-char CP cap, so the budget math is
+  # identical — just the prefix literal is shorter.
+  SLUG="e2e-$(make_collision_proof_slug_suffix "${E2E_RUN_ID:-}" 4)"
 fi
 assert_collision_proof_slug "$SLUG" || fail "Bug in make_collision_proof_slug: produced non-collision-proof slug '$SLUG' (assert_collision_proof_slug failed)"
 
@@ -347,18 +355,48 @@ admin_call() {
 
 # ─── 1. Create org via admin endpoint ───────────────────────────────────
 log "1/11 Creating org $SLUG via /cp/admin/orgs..."
-CREATE_RESP=$(admin_call POST /cp/admin/orgs \
-  -d "{\"slug\":\"$SLUG\",\"name\":\"E2E $SLUG\",\"owner_user_id\":\"e2e-runner:$SLUG\"}")
+# core#60: capture status + body explicitly with curl -w '%{http_code}'
+# -o bodyfile inside a set +e block (mirror the pattern at lines
+# 875-889 for the workspace-create call), so a 400/409 body is
+# ALWAYS logged for diagnosis instead of being swallowed by
+# CURL_COMMON's --fail-with-body + set -e aborting the script
+# before the body-logging line runs. The pre-fix code path
+# (admin_call POST ... bare in a $(...)) would propagate curl's
+# nonzero exit through the command substitution under
+# set -euo pipefail, aborting the whole harness with no body
+# in the CI logs.
+CREATE_BODYFILE="$(mktemp -t create-org-resp.XXXXXX)"
+trap 'rm -f "$CREATE_BODYFILE"' EXIT
+set +e
+CREATE_HTTP_CODE=$(curl "${CURL_COMMON[@]}" -X POST "$CP_URL/cp/admin/orgs" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"slug\":\"$SLUG\",\"name\":\"E2E $SLUG\",\"owner_user_id\":\"e2e-runner:$SLUG\"}" \
+  -o "$CREATE_BODYFILE" \
+  -w '%{http_code}')
+CURL_RC=$?
+set -e
+CREATE_RESP="$(cat "$CREATE_BODYFILE")"
 # core#2782: log the full 409 response body on a collision so the
 # stale-slug-vs-fresh-slug diagnostic is queryable from CI logs.
-# Pre-fix the JSON was piped to /dev/null (`python3 -m json.tool >/dev/null`)
-# which silently swallowed the body — triage on the 2026-06-12
-# staging Platform Boot red had to guess whether the 409 was a
-# slug collision or a different state-conflict. Logging the body
-# makes future collisions instantly diagnosable.
-CREATE_HTTP_CODE=$(echo "$CREATE_RESP" | head -c 1)
-if [ -z "$CREATE_HTTP_CODE" ] || ! echo "$CREATE_RESP" | python3 -m json.tool >/dev/null 2>&1; then
-  log "❌ Org create failed; raw response body: $CREATE_RESP"
+# Pre-#60 the JSON was piped to /dev/null (`python3 -m json.tool
+# >/dev/null`) which silently swallowed the body — triage on the
+# 2026-06-12 staging Platform Boot red had to guess whether the
+# 409 was a slug collision or a different state-conflict. With
+# the explicit -o bodyfile + -w '%{http_code}' above, the body
+# is always on disk for logging regardless of HTTP status.
+if [ "$CURL_RC" -ne 0 ] || [ "$CREATE_HTTP_CODE" -lt 200 ] || [ "$CREATE_HTTP_CODE" -ge 300 ]; then
+  log "❌ Org create failed (curl_rc=$CURL_RC http=$CREATE_HTTP_CODE slug_len=${#SLUG}); raw response body:"
+  log "--- BEGIN CREATE RESPONSE ---"
+  log "$CREATE_RESP"
+  log "--- END CREATE RESPONSE ---"
+  if [ "${#SLUG}" -gt 31 ]; then
+    fail "Org create returned non-2xx AND slug is ${#SLUG} chars (over the CP's 31-char cap). The slug helper's assertion should have caught this; check collision-proof-slug.sh's run_id_budget math."
+  fi
+  fail "Org create returned non-2xx (http=$CREATE_HTTP_CODE) — see body above. Common causes: 409=slug collision (a prior run left a stale org; the slug helper should prevent this — check E2E_RUN_ID propagation), 400=slug too long (should be caught by the 31-char cap assertion), 401=ADMIN_TOKEN not set or expired, 422=schema mismatch (check the -d payload matches the CP's expected shape)."
+fi
+if [ -z "$CREATE_RESP" ] || ! echo "$CREATE_RESP" | python3 -m json.tool >/dev/null 2>&1; then
+  log "❌ Org create returned non-JSON; raw body: $CREATE_RESP"
   fail "Org create returned non-JSON (see body above)"
 fi
 # Capture org_id for tenant-guard header on every subsequent tenant call.
@@ -369,7 +407,7 @@ ORG_ID=$(echo "$CREATE_RESP" | python3 -c "import json,sys; print(json.load(sys.
   log "❌ Org create response missing 'id'; raw body: $CREATE_RESP"
   fail "Org create response missing 'id' (see body above)"
 }
-ok "Org created (id=$ORG_ID)"
+ok "Org created (id=$ORG_ID http=$CREATE_HTTP_CODE slug_len=${#SLUG})"
 
 # ─── 2. Wait for tenant provisioning ────────────────────────────────────
 log "2/11 Waiting for tenant provisioning (up to ${PROVISION_TIMEOUT_SECS}s)..."
