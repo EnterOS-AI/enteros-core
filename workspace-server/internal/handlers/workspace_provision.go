@@ -634,6 +634,13 @@ var knownRuntimes = fallbackRuntimes
 
 func init() {
 	initKnownRuntimes()
+	// PR-B (RFC #2843 #24): populate the templateRepoByName map at
+	// boot so cfg.TemplateIdentity is non-empty for template-backed
+	// runtimes (claude-code / hermes / etc). The init() order matters:
+	// must follow initKnownRuntimes so the per-runtime manifestEntry
+	// lookups use the same set of normalized runtime names. Idempotent
+	// — both inits read manifestPath() (cached) and tolerate each other.
+	initTemplateRepoByName()
 }
 
 // yamlQuote emits a YAML double-quoted scalar that safely contains any
