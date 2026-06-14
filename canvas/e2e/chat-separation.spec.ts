@@ -191,6 +191,7 @@ test.describe("Activity API Source Filter", () => {
   test("source=canvas returns only canvas-initiated entries", async ({ request }) => {
     const res = await request.get(
       `${API}/workspaces/${workspaceId}/activity?source=canvas`,
+      { headers: { Authorization: `Bearer ${authToken}` } },
     );
     expect(res.ok()).toBeTruthy();
     const entries = (await res.json()) as Array<{ source_id: unknown }>;
@@ -205,6 +206,7 @@ test.describe("Activity API Source Filter", () => {
   test("source=agent returns only agent-initiated entries", async ({ request }) => {
     const res = await request.get(
       `${API}/workspaces/${workspaceId}/activity?source=agent`,
+      { headers: { Authorization: `Bearer ${authToken}` } },
     );
     expect(res.ok()).toBeTruthy();
     const entries = (await res.json()) as Array<{ source_id: unknown }>;
@@ -219,6 +221,7 @@ test.describe("Activity API Source Filter", () => {
   test("source=invalid returns 400", async ({ request }) => {
     const res = await request.get(
       `${API}/workspaces/${workspaceId}/activity?source=bogus`,
+      { headers: { Authorization: `Bearer ${authToken}` } },
     );
     expect(res.status()).toBe(400);
   });
@@ -226,6 +229,7 @@ test.describe("Activity API Source Filter", () => {
   test("source+type filters combine correctly", async ({ request }) => {
     const res = await request.get(
       `${API}/workspaces/${workspaceId}/activity?type=a2a_receive&source=canvas`,
+      { headers: { Authorization: `Bearer ${authToken}` } },
     );
     expect(res.ok()).toBeTruthy();
     const entries = (await res.json()) as Array<{
