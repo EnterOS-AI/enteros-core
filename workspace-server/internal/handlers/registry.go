@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -20,6 +21,32 @@ import (
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wsauth"
 	"github.com/gin-gonic/gin"
 )
+
+// isProvisionerHostPortURL reports whether u is a loopback URL with a port
+// other than 8000. Such URLs are written by the provisioner (via
+// MOLECULE_WORKSPACE_URL) and should be preserved across runtime registrations.
+// The 8000 fallback is the runtime's own default and is allowed to be
+// overwritten.
+func isProvisionerHostPortURL(u string) bool {
+	if u == "" {
+		return false
+	}
+	if !(strings.HasPrefix(u, "http://127.0.0.1:") || strings.HasPrefix(u, "http://localhost:")) {
+		return false
+	}
+	// Extract the trailing port.
+	port := u[strings.LastIndex(u, ":")+1:]
+	if port == "" {
+		return false
+	}
+	n, err := strconv.Atoi(port)
+	if err != nil {
+		return false
+	}
+	return n != 8000
+}
+
+
 
 // blockedRange is a named CIDR block so the conditional blocklist in
 // validateAgentURL reads as a slice of homogeneous values instead of
@@ -642,7 +669,7 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 	cachedURL := effectiveURL
 	var dbURL string
 	if err := db.DB.QueryRowContext(ctx, `SELECT url FROM workspaces WHERE id = $1`, payload.ID).Scan(&dbURL); err == nil {
-		if strings.HasPrefix(dbURL, "http://127.0.0.1") {
+		if isProvisionerHostPortURL(dbURL) {
 			cachedURL = dbURL
 		}
 	}
