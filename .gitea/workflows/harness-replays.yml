@@ -121,12 +121,13 @@ jobs:
               | bash .gitea/scripts/push-commits-diff-files.py \
               > .push-diff-files.txt 2>/dev/null || true
             DIFF_FILES=$(cat .push-diff-files.txt 2>/dev/null || true)
+            DIFF_FILES_FLAT=$(echo "$DIFF_FILES" | tr '\n' ',')
             if [ -n "$DIFF_FILES" ] && echo "$DIFF_FILES" | grep -qE '^workspace-server/|^canvas/|^tests/harness/|^.gitea/workflows/harness-replays\.yml$'; then
               echo "run=true" >> "$GITHUB_OUTPUT"
             else
               echo "run=false" >> "$GITHUB_OUTPUT"
             fi
-            echo "debug=push-files=$DIFF_FILES" >> "$GITHUB_OUTPUT"
+            echo "debug=push-files=$DIFF_FILES_FLAT" >> "$GITHUB_OUTPUT"
             exit 0
           else
             # New branch or github.event.before unavailable — run everything.
@@ -149,8 +150,9 @@ jobs:
             exit 0
           }
           DIFF_FILES=$(echo "$RESP" | bash .gitea/scripts/compare-api-diff-files.py 2>/dev/null || true)
+          DIFF_FILES_FLAT=$(echo "$DIFF_FILES" | tr '\n' ',')
 
-          echo "debug=diff-base=$BASE diff-files=$DIFF_FILES" >> "$GITHUB_OUTPUT"
+          echo "debug=diff-base=$BASE diff-files=$DIFF_FILES_FLAT" >> "$GITHUB_OUTPUT"
 
           if echo "$DIFF_FILES" | grep -qE '^workspace-server/|^canvas/|^tests/harness/|^.gitea/workflows/harness-replays\.yml$'; then
             echo "run=true" >> "$GITHUB_OUTPUT"

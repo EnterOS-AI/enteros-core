@@ -91,6 +91,7 @@ jobs:
           PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
           PUSH_BEFORE: ${{ github.event.before }}
         run: |
+          BASE_SHA="${PR_BASE_SHA:-$PUSH_BEFORE}"
           python3 .gitea/scripts/detect-changes.py \
             --profile ci \
             --event-name "${{ github.event_name }}" \
@@ -103,10 +104,10 @@ jobs:
             echo "canvas=true" >> "$GITHUB_OUTPUT"
             echo "python=true" >> "$GITHUB_OUTPUT"
             echo "scripts=true" >> "$GITHUB_OUTPUT"
-            echo "debug=detect-script-error event=${{ github.event_name }} base=${{ github.event.pull_request.base.sha || github.event.before }}" >> "$GITHUB_OUTPUT"
+            echo "debug=detect-script-error event=${{ github.event_name }} base=$BASE_SHA" >> "$GITHUB_OUTPUT"
             exit 0
           }
-          echo "debug=profile=ci event=${{ github.event_name }} base=${{ github.event.pull_request.base.sha || github.event.before }}" >> "$GITHUB_OUTPUT"
+          echo "debug=profile=ci event=${{ github.event_name }} base=$BASE_SHA" >> "$GITHUB_OUTPUT"
 
   # Platform (Go) — Go build/vet/test/lint + coverage gates. The job always
   # emits the required context, but expensive steps are path-scoped on every

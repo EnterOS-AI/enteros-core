@@ -104,6 +104,8 @@ jobs:
           fetch-depth: 2
       - id: filter
         run: |
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          BASE_SHA="${BASE_SHA:-${{ github.event.before }}}"
           python3 .gitea/scripts/detect-changes.py \
             --profile handlers-postgres \
             --event-name "${{ github.event_name }}" \
@@ -113,10 +115,10 @@ jobs:
             # Script crash / uncaught error: fail open so the integration gate
             # runs rather than silently no-oping a potentially-breaking PR.
             echo "handlers=true" >> "$GITHUB_OUTPUT"
-            echo "debug=detect-script-error event=${{ github.event_name }} base=${{ github.event.pull_request.base.sha || github.event.before }}" >> "$GITHUB_OUTPUT"
+            echo "debug=detect-script-error event=${{ github.event_name }} base=$BASE_SHA" >> "$GITHUB_OUTPUT"
             exit 0
           }
-          echo "debug=profile=handlers-postgres event=${{ github.event_name }} base=${{ github.event.pull_request.base.sha || github.event.before }}" >> "$GITHUB_OUTPUT"
+          echo "debug=profile=handlers-postgres event=${{ github.event_name }} base=$BASE_SHA" >> "$GITHUB_OUTPUT"
 
   # ONE job (no job-level `if:`) that always runs and reports under the
   # required-check name `Handlers Postgres Integration`. Real work is gated
