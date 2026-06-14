@@ -103,7 +103,7 @@ func TestCollectCPConfigFiles_DoSGuardStillBounds(t *testing.T) {
 	for i := range huge {
 		huge[i] = 'a'
 	}
-	_, err := collectCPConfigFiles(WorkspaceConfig{
+	_, _, err := collectCPConfigFiles(WorkspaceConfig{
 		ConfigFiles: map[string][]byte{"config.yaml": huge},
 	})
 	if err == nil {
@@ -128,7 +128,7 @@ func TestCollectCPConfigFiles_AcceptsSEOSizedBundle(t *testing.T) {
 	for i := range promptBlob {
 		promptBlob[i] = 'p'
 	}
-	files, err := collectCPConfigFiles(WorkspaceConfig{
+	files, _, err := collectCPConfigFiles(WorkspaceConfig{
 		ConfigFiles: map[string][]byte{
 			"config.yaml":       cfgBlob,
 			"prompts/system.md": promptBlob,
@@ -145,7 +145,7 @@ func TestCollectCPConfigFiles_AcceptsSEOSizedBundle(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(tmpl, "config.yaml"), cfgBlob, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := collectCPConfigFiles(WorkspaceConfig{TemplatePath: tmpl}); err != nil {
+	if _, _, err := collectCPConfigFiles(WorkspaceConfig{TemplatePath: tmpl}); err != nil {
 		t.Fatalf("collectCPConfigFiles rejected an SEO-sized template config.yaml: %v", err)
 	}
 }

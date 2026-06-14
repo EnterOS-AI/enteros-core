@@ -437,6 +437,107 @@ func TestStart_CollectsConfigFiles(t *testing.T) {
 	}
 }
 
+// TestStart_SendsTemplateAssetsOnSeparateField — the load-bearing
+// wire-shape test (RFC #2843 #24, Reviewer-CR2 addendum). When
+// cfg.TemplateAssetFetcher is wired, fetched assets travel on the
+// SEPARATE TemplateAssets field, NOT merged into ConfigFiles.
+// This split lets a future CP route non-secret assets through a
+// non-SM transport without going through the 256 KiB SM cap
+// (the core-devops 10:13 SM-inventory RCA). The test exercises
+// the Start → cpProvisionRequest path end-to-end so a future
+// refactor that re-merges the two transports would be caught.
+func TestStart_SendsTemplateAssetsOnSeparateField(t *testing.T) {
+	prov := &fakeTemplateAssetFetcher{
+		bundle: map[string][]byte{
+			"config.yaml":                    []byte("# from template repo"),
+			"prompts/system.md":              []byte("# template system prompt"),
+			"agent-skills/seo-audit/SKILL.md": []byte("# 716 KiB SEO skill goes here"),
+		},
+	}
+
+	var gotBody cpProvisionRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.WriteHeader(http.StatusCreated)
+		_, _ = io.WriteString(w, `{"instance_id":"i-abc123","state":"pending"}`)
+	}))
+	defer srv.Close()
+
+	p := &CPProvisioner{baseURL: srv.URL, orgID: "org-1", httpClient: srv.Client()}
+	_, err := p.Start(context.Background(), WorkspaceConfig{
+		WorkspaceID:         "ws-1",
+		Runtime:             "claude-code",
+		Tier:                2,
+		PlatformURL:         "http://tenant",
+		TemplateIdentity:    "seo-agent-v1.2.3",
+		TemplateAssetFetcher: prov,
+		// No cfg.ConfigFiles — pure fetcher path. If the wire
+		// shape is right, TemplateAssets is non-empty and
+		// ConfigFiles is empty.
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// 1. TemplateAssets must contain the fetched files.
+	if got, want := len(gotBody.TemplateAssets), 3; got != want {
+		t.Errorf("TemplateAssets length = %d, want %d (fetcher output must reach the wire)", got, want)
+	}
+	if got, want := string(gotBody.TemplateAssets["config.yaml"]), "# from template repo"; got != want {
+		t.Errorf("TemplateAssets[config.yaml] = %q, want %q", got, want)
+	}
+	if got, want := string(gotBody.TemplateAssets["prompts/system.md"]), "# template system prompt"; got != want {
+		t.Errorf("TemplateAssets[prompts/system.md] = %q, want %q", got, want)
+	}
+	if got, want := string(gotBody.TemplateAssets["agent-skills/seo-audit/SKILL.md"]), "# 716 KiB SEO skill goes here"; got != want {
+		t.Errorf("TemplateAssets[agent-skills/seo-audit/SKILL.md] = %q, want %q", got, want)
+	}
+
+	// 2. ConfigFiles must be empty — the transport split.
+	if got, want := len(gotBody.ConfigFiles), 0; got != want {
+		t.Errorf("ConfigFiles length = %d, want %d (transport split — fetched assets must NOT leak into the SM-bound ConfigFiles)", got, want)
+	}
+}
+
+// TestStart_AbortsOnFetcherAssetOutsideAllowlist — the
+// load-bearing blast-radius test (RC #11690). A fetcher
+// returning a path outside the template-asset allowlist
+// MUST abort the provision at the Start level (the
+// transport-DoS-and-blast-radius contract).
+func TestStart_AbortsOnFetcherAssetOutsideAllowlist(t *testing.T) {
+	prov := &fakeTemplateAssetFetcher{
+		bundle: map[string][]byte{
+			"MEMORY.md": []byte("# hostile — agent-owned curated memory must not be transported by the provision path"),
+		},
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("CP should not be called when fetcher returns a path outside the allowlist; got request: %+v", r)
+		w.WriteHeader(http.StatusCreated)
+		_, _ = io.WriteString(w, `{"instance_id":"i-abc123","state":"pending"}`)
+	}))
+	defer srv.Close()
+
+	p := &CPProvisioner{baseURL: srv.URL, orgID: "org-1", httpClient: srv.Client()}
+	_, err := p.Start(context.Background(), WorkspaceConfig{
+		WorkspaceID:         "ws-1",
+		Runtime:             "claude-code",
+		Tier:                2,
+		PlatformURL:         "http://tenant",
+		TemplateIdentity:    "seo-agent-v1.2.3",
+		TemplateAssetFetcher: prov,
+	})
+	if err == nil {
+		t.Fatal("expected Start to abort on fetcher-returned MEMORY.md path, got nil")
+	}
+	if !strings.Contains(err.Error(), "MEMORY.md") {
+		t.Errorf("expected error to mention the rejected path MEMORY.md, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "allowlist") {
+		t.Errorf("expected error to mention the allowlist, got: %v", err)
+	}
+}
+
 // TestStart_SymlinkTemplatePathError — a symlink TemplatePath should cause
 // collectCPConfigFiles to return an error, which Start must propagate.
 // Without this wiring, OFFSEC-010's root-symlink guard is dead code.
@@ -1176,7 +1277,7 @@ func TestCollectCPConfigFiles_SkipsSymlinks(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	files, err := collectCPConfigFiles(WorkspaceConfig{TemplatePath: tmpl})
+	files, _, err := collectCPConfigFiles(WorkspaceConfig{TemplatePath: tmpl})
 	if err != nil {
 		t.Fatalf("collectCPConfigFiles: %v", err)
 	}
@@ -1210,7 +1311,7 @@ func TestCollectCPConfigFiles_RejectsRootSymlink(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err := collectCPConfigFiles(WorkspaceConfig{TemplatePath: link})
+	_, _, err := collectCPConfigFiles(WorkspaceConfig{TemplatePath: link})
 	if err == nil {
 		t.Error("collectCPConfigFiles with symlink TemplatePath should return error")
 	}
