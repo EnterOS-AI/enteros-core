@@ -185,7 +185,26 @@ type cpProvisionRequest struct {
 	// EC2 instance's /configs directory. OFFSEC-010: collected by
 	// collectCPConfigFiles which rejects symlinks and non-regular files
 	// before including them. Serialised as base64 to avoid JSON escaping.
+	//
+	// ConfigFiles is the SM-bound bundle (the CP stages it through AWS
+	// Secrets Manager as molecule/workspace/<id>/config). It's the right
+	// transport for SMALL non-secret config text only — it has a 256 KiB
+	// cap and the SM transport is sized + scoped for *secrets*. See the
+	// core-devops 10:13 SM-inventory RCA.
 	ConfigFiles map[string]string `json:"config_files,omitempty"`
+
+	// TemplateAssets (RFC #2843 #24) are non-secret template assets
+	// (config.yaml + prompts/ + agent-skills/) fetched from a
+	// non-secret asset channel (template repo / Gitea shallow clone per
+	// RFC §4.2 transport option (a)). They travel on a SEPARATE wire
+	// field from ConfigFiles (the SM-bound bundle) so a future CP can
+	// route them through a non-secret transport without going through
+	// the SM cap. Serialised as base64 to avoid JSON escaping.
+	//
+	// Keys are restricted to the template-asset allowlist enforced by
+	// IsCPTemplateAssetPath (config.yaml / prompts/* / agent-skills/*);
+	// see collectCPConfigFiles for the enforcement.
+	TemplateAssets map[string][]byte `json:"template_assets,omitempty"`
 }
 
 type cpProvisionResponse struct {
@@ -257,7 +276,7 @@ func (p *CPProvisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string,
 	// - Caps total size at cpConfigFilesMaxBytes (a transport-DoS guard,
 	//   not the retired 12 KiB user-data ceiling — config now ships off
 	//   user-data via the CP's Secrets-Manager seeding path)
-	configFiles, err := collectCPConfigFiles(cfg)
+	configFiles, templateAssets, err := collectCPConfigFiles(cfg)
 	if err != nil {
 		return "", fmt.Errorf("cp provisioner: collect config files: %w", err)
 	}
@@ -285,6 +304,7 @@ func (p *CPProvisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string,
 		PlatformURL:     cfg.PlatformURL,
 		Env:             env,
 		ConfigFiles:     configFiles,
+		TemplateAssets:  templateAssets,
 	}
 
 	body, err := json.Marshal(req)
@@ -365,6 +385,18 @@ func (p *CPProvisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string,
 // growth (more schedules, longer prompts, more skills) never re-hits a wall.
 const cpConfigFilesMaxBytes = 256 << 10
 
+// cpTemplateAssetsMaxBytes bounds the aggregate TEMPLATE-ASSET payload
+// (config.yaml + prompts/* + agent-skills/*) delivered via the generic
+// non-secret asset channel (RFC #2843 #24). This is a SEPARATE, much larger
+// bound than cpConfigFilesMaxBytes: the config bundle is capped at 256 KiB
+// because it rides the Secrets-Manager/user-data transport, but template
+// ASSETS ride a non-secret channel with no SM size limit — so reusing the
+// 256 KiB cap here would re-create the original #2831 skill-drop failure (the
+// seo-all skill package alone is ~716 KiB). 16 MiB comfortably fits real skill
+// trees + prompts + config while still bounding a runaway/malicious fetcher
+// (pure transport-DoS guard, not a secrets-transport limit).
+const cpTemplateAssetsMaxBytes = 16 << 20
+
 // isCPTemplateConfigFile restricts which files from a template directory are
 // eligible for transport to the control plane. Only config.yaml (the runtime
 // entrypoint config) and files under prompts/ (system prompts) are needed;
@@ -375,9 +407,11 @@ func isCPTemplateConfigFile(name string) bool {
 	return name == "config.yaml" || strings.HasPrefix(name, "prompts/")
 }
 
-func collectCPConfigFiles(cfg WorkspaceConfig) (map[string]string, error) {
+func collectCPConfigFiles(cfg WorkspaceConfig) (map[string]string, map[string][]byte, error) {
 	files := make(map[string]string)
+	assets := make(map[string][]byte)
 	total := 0
+	totalAssets := 0
 	addFile := func(name string, data []byte) error {
 		name = filepath.ToSlash(filepath.Clean(name))
 		if name == "." || strings.HasPrefix(name, "../") || strings.HasPrefix(name, "/") || strings.Contains(name, "/../") {
@@ -390,6 +424,30 @@ func collectCPConfigFiles(cfg WorkspaceConfig) (map[string]string, error) {
 		files[name] = base64.StdEncoding.EncodeToString(data)
 		return nil
 	}
+	addAsset := func(name string, data []byte) error {
+		name = filepath.ToSlash(filepath.Clean(name))
+		if name == "." || strings.HasPrefix(name, "../") || strings.HasPrefix(name, "/") || strings.Contains(name, "/../") {
+			return fmt.Errorf("invalid template asset path %q", name)
+		}
+		// Blast-radius guard (RC #11690): a fetcher that returns
+		// paths outside the template-asset namespace is either
+		// a programming error or an attack. Either way, fail closed.
+		// Specifically excluded: MEMORY.md, USER.md, CLAUDE.md
+		// (curated durable memory — agent-owned state, reconciled by
+		// the boot entrypoint, NOT by this collect path), .claude/sessions/
+		// (Claude Code session dir, agent-owned), and any other
+		// agent-state path. The PM-flagged in #24_clarify invariant
+		// is enforced here in code, not in comments.
+		if !IsCPTemplateAssetPath(name) {
+			return fmt.Errorf("template asset path %q rejected: not in template-asset allowlist (config.yaml / prompts/* / agent-skills/*) — see IsCPTemplateAssetPath", name)
+		}
+		totalAssets += len(data)
+		if totalAssets > cpTemplateAssetsMaxBytes {
+			return fmt.Errorf("template assets exceed %d bytes", cpTemplateAssetsMaxBytes)
+		}
+		assets[name] = append([]byte(nil), data...)
+		return nil
+	}
 
 	if cfg.TemplatePath != "" {
 		// Reject symlinks on the root itself — WalkDir follows symlinks,
@@ -397,10 +455,10 @@ func collectCPConfigFiles(cfg WorkspaceConfig) (map[string]string, error) {
 		// would bypass the subsequent path-relativization checks below.
 		rootInfo, err := os.Lstat(cfg.TemplatePath)
 		if err != nil {
-			return nil, fmt.Errorf("collectCPConfigFiles: lstat template path: %w", err)
+			return nil, nil, fmt.Errorf("collectCPConfigFiles: lstat template path: %w", err)
 		}
 		if rootInfo.Mode()&os.ModeSymlink != 0 {
-			return nil, fmt.Errorf("collectCPConfigFiles: template path must not be a symlink")
+			return nil, nil, fmt.Errorf("collectCPConfigFiles: template path must not be a symlink")
 		}
 		err = filepath.WalkDir(cfg.TemplatePath, func(path string, d os.DirEntry, walkErr error) error {
 			if walkErr != nil {
@@ -438,18 +496,56 @@ func collectCPConfigFiles(cfg WorkspaceConfig) (map[string]string, error) {
 			return addFile(rel, data)
 		})
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
 	for name, data := range cfg.ConfigFiles {
 		if err := addFile(name, data); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
-	if len(files) == 0 {
-		return nil, nil
+
+	// RFC #2843 #24 — generic template-asset channel. When
+	// cfg.TemplateAssetFetcher is wired (SaaS) and
+	// cfg.TemplateIdentity is set, fetch the template's
+	// config.yaml + prompts/ + agent_skills/ via the
+	// non-secret asset channel (template repo, Gitea shallow
+	// clone per §4.2 transport option (a)) and land them in
+	// the SEPARATE TemplateAssets field of the provision
+	// request — NOT in ConfigFiles (the SM-bound bundle).
+	// The split is load-bearing: ConfigFiles is the bundle
+	// the CP stages through AWS Secrets Manager, which is
+	// sized + scoped for *secrets* and caps at 256 KiB. The
+	// 716 KiB SEO skill package can't ride SM and shouldn't
+	// try to (core-devops 10:13 SM-inventory RCA).
+	//
+	// The fetch is OPT-IN: nil fetcher = no-op (self-host
+	// default; falls through to the local TemplatePath path
+	// above). Every key in the fetcher's output is gated by
+	// IsCPTemplateAssetPath at the addAsset boundary above —
+	// paths outside the template-asset namespace abort the
+	// provision rather than silently sneaking MEMORY.md /
+	// CLAUDE.md / .claude/sessions/ into the bundle.
+	//
+	// The fetch is fail-closed: a transport error aborts
+	// the provision rather than regressing to stub-mode
+	// /configs (the same contract as the persisted-bundle
+	// provider in #2831 PIECE 1).
+	if cfg.TemplateAssetFetcher != nil && cfg.TemplateIdentity != "" {
+		fetchedAssets, fetchErr := cfg.TemplateAssetFetcher.Load(context.Background(), cfg.TemplateIdentity)
+		if fetchErr != nil {
+			return nil, nil, fmt.Errorf("collectCPConfigFiles: fetch template assets (RFC #2843 #24): %w", fetchErr)
+		}
+		for name, data := range fetchedAssets {
+			if err := addAsset(name, data); err != nil {
+				return nil, nil, err
+			}
+		}
 	}
-	return files, nil
+	if len(files) == 0 && len(assets) == 0 {
+		return nil, nil, nil
+	}
+	return files, assets, nil
 }
 
 // Stop terminates the workspace's EC2 instance via the control plane.

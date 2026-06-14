@@ -110,6 +110,7 @@ const (
 type WorkspaceConfig struct {
 	WorkspaceID     string
 	TemplatePath    string            // Host path to template dir to copy from (e.g. claude-code-default/)
+	TemplateIdentity string           // RFC #2843 #24: opaque token the TemplateAssetFetcher resolves to the template repo+ref (e.g. "claudius-v1.2.3" or a sha). Used by SaaS; ignored by the local-dir TemplatePath path.
 	ConfigFiles     map[string][]byte // Generated config files to write into /configs volume
 	PluginsPath     string            // Host path to plugins directory (mounted at /plugins)
 	WorkspacePath   string            // Host path to bind-mount as /workspace (if empty, uses Docker named volume)
@@ -131,6 +132,21 @@ type WorkspaceConfig struct {
 	WorkspaceSecretKeys map[string]struct{}
 	WorkspaceAccess     string // #65: "none" (default), "read_only", or "read_write"
 	ResetClaudeSession  bool   // #12: if true, discard the claude-sessions volume before start (fresh session dir)
+
+	// TemplateAssetFetcher (RFC #2843 #24) is the generic
+	// non-secret asset channel for template assets
+	// (config.yaml + prompts/ + agent-skills/). The fetcher
+	// resolves cfg.TemplateIdentity to a shallow clone of the
+	// template repo (Gitea per RFC §4.2 transport option (a))
+	// and returns the asset file map. nil = no provider wired
+	// (self-host default; falls through to the local TemplatePath
+	// path for the config bundle). For SaaS workspaces, main.go
+	// wires a real impl (Gitea shallow clone). When the fetcher
+	// is set, it MERGES with cfg.ConfigFiles (caller wins on
+	// conflict, like the prior PersistedBundleProvider pattern
+	// in #2831 PIECE 1) so the existing TemplatePath+ConfigFiles
+	// path keeps working for callers that don't opt in.
+	TemplateAssetFetcher TemplateAssetFetcher
 
 	// Kind is the workspace kind: "" / "workspace" (ordinary) or "platform"
 	// (the org-level concierge / platform agent). When "platform", the local
