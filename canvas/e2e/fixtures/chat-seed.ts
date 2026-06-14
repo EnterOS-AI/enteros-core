@@ -187,7 +187,12 @@ export async function seedChatHistory(
   workspaceId: string,
   messages: Array<{ role: "user" | "agent"; content: string }>,
 ): Promise<void> {
-  if (!process.env.E2E_DATABASE_URL) return;
+  // Fail-closed: this is a setup helper, not a test. Silently returning when
+  // the DB is unavailable would make downstream assertions pass vacuously
+  // (false-green) — the spec must fail if it cannot seed its fixtures.
+  if (!process.env.E2E_DATABASE_URL) {
+    throw new Error("E2E_DATABASE_URL must be set for chat-history seeding");
+  }
 
   const rows = messages
     .map((msg, i) => {
