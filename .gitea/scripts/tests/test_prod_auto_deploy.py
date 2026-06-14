@@ -2,6 +2,8 @@ import importlib.util
 import sys
 from pathlib import Path
 
+import pytest
+
 
 SCRIPT = Path(__file__).resolve().parents[1] / "prod-auto-deploy.py"
 spec = importlib.util.spec_from_file_location("prod_auto_deploy", SCRIPT)
@@ -286,6 +288,98 @@ def test_plan_scoped_rollout_preserves_canary_then_batches():
         "tenant-b",
         "tenant-c",
     ]
+
+
+def test_redeploy_scoped_retries_transient_502_then_succeeds(monkeypatch, capfd):
+    responses = [
+        (502, {"error": "Bad Gateway"}),
+        (503, {"error": "Service Unavailable"}),
+        (200, {"ok": True, "results": [{"slug": "hongming"}]}),
+    ]
+    calls = []
+    sleeps = []
+
+    def fake_cp_api_json(_method, _url, _token, body):
+        calls.append(body)
+        return responses.pop(0)
+
+    monkeypatch.setattr(prod, "cp_api_json", fake_cp_api_json)
+    monkeypatch.setattr(prod.time, "sleep", sleeps.append)
+
+    status, resp = prod.redeploy_scoped(
+        "https://api.moleculesai.app", "token", {"only_slugs": ["hongming"]}
+    )
+
+    assert status == 200
+    assert resp["ok"] is True
+    assert len(calls) == 3
+    assert sleeps == [5, 10]
+    captured = capfd.readouterr().out
+    assert "attempt 1/4" in captured
+    assert "attempt 2/4" in captured
+    assert "Bad Gateway" in captured
+    assert "Service Unavailable" in captured
+    assert "/cp/admin/tenants/redeploy-fleet" in captured
+
+
+def test_redeploy_scoped_gives_up_after_max_retries(monkeypatch, capfd):
+    responses = [
+        (502, {"error": "Bad Gateway"}),
+        (504, {"error": "Gateway Timeout"}),
+        (503, {"error": "Service Unavailable"}),
+        (503, {"error": "Service Unavailable"}),
+    ]
+    sleeps = []
+
+    def fake_cp_api_json(_method, _url, _token, _body):
+        return responses.pop(0)
+
+    monkeypatch.setattr(prod, "cp_api_json", fake_cp_api_json)
+    monkeypatch.setattr(prod.time, "sleep", sleeps.append)
+
+    status, resp = prod.redeploy_scoped(
+        "https://api.moleculesai.app", "token", {"only_slugs": ["hongming"]}
+    )
+
+    assert status == 503
+    assert resp["error"] == "Service Unavailable"
+    # No sleep after the final (4th) attempt.
+    assert sleeps == [5, 10, 20]
+    captured = capfd.readouterr().out
+    assert "attempt 4/4" in captured
+    assert "retries exhausted" in captured
+    assert "/cp/admin/tenants/redeploy-fleet" in captured
+
+
+def test_redeploy_scoped_does_not_retry_non_transient_errors(monkeypatch):
+    calls = []
+
+    def fake_cp_api_json(_method, _url, _token, body):
+        calls.append(body)
+        return 500, {"error": "Internal Server Error"}
+
+    monkeypatch.setattr(prod, "cp_api_json", fake_cp_api_json)
+    monkeypatch.setattr(prod.time, "sleep", lambda _s: pytest.fail("should not sleep on 500"))
+
+    status, resp = prod.redeploy_scoped(
+        "https://api.moleculesai.app", "token", {"only_slugs": ["hongming"]}
+    )
+
+    assert status == 500
+    assert resp["error"] == "Internal Server Error"
+    assert len(calls) == 1
+
+
+def test_raise_for_redeploy_result_surfaces_error_body():
+    with pytest.raises(RuntimeError) as exc_info:
+        prod._raise_for_redeploy_result(
+            502,
+            {"ok": False, "error": "upstream SSM throttled"},
+            ["hongming"],
+        )
+    assert "HTTP 502" in str(exc_info.value)
+    assert "upstream SSM throttled" in str(exc_info.value)
+    assert "hongming" in str(exc_info.value)
 
 
 def test_scoped_rollout_halts_after_failed_canary():

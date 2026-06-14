@@ -26,6 +26,14 @@ DEFAULT_REQUIRED_CONTEXTS = [
 TERMINAL_FAILURE_STATES = {"failure", "error", "cancelled", "canceled", "skipped"}
 REDEPLOY_PATH = "/cp/admin/tenants/redeploy-fleet"
 
+# Bounded retry for transient CP/gateway failures (e.g. 502 from an upstream
+# dependency like SSM during redeploy-fleet). A 502 on the canary should not
+# hard-halt the whole fleet rollout if a quick retry succeeds.
+REDEPLOY_RETRY_STATUSES = {502, 503, 504}
+# Initial attempt + this many retries. Delays are applied BEFORE each retry.
+REDEPLOY_MAX_RETRIES = 3
+REDEPLOY_RETRY_DELAYS_SECONDS = [5, 10, 20]
+
 
 def truthy_flag(value: str | None) -> bool:
     if value is None:
@@ -214,15 +222,59 @@ def plan_rollout_slugs(cp_url: str, token: str, body: dict, redeploy=None) -> li
     return slugs
 
 
+def _redeploy_error_detail(body: dict, max_len: int = 200) -> str:
+    """Extract a short, safe diagnostic string from a CP error body."""
+    detail = body.get("error") or body.get("message") or ""
+    if not detail:
+        detail = json.dumps(body)
+    return detail[:max_len]
+
+
 def redeploy_scoped(cp_url: str, token: str, body: dict) -> tuple[int, dict]:
-    return cp_api_json("POST", f"{cp_url}{REDEPLOY_PATH}", token, body)
+    """POST /cp/admin/tenants/redeploy-fleet with bounded transient retry.
+
+    CP can return 502/503/504 when an upstream dependency (SSM, ECS, etc.)
+    flakes. Retry a small number of times with increasing backoff before
+    giving up and letting the caller surface the failure.
+    """
+    url = f"{cp_url}{REDEPLOY_PATH}"
+    slugs = body.get("only_slugs") or []
+    slugs_text = ",".join(slugs)
+    total_attempts = 1 + REDEPLOY_MAX_RETRIES
+    status = 0
+    resp: dict = {}
+    for attempt in range(total_attempts):
+        status, resp = cp_api_json("POST", url, token, body)
+        if status not in REDEPLOY_RETRY_STATUSES:
+            return status, resp
+        detail = _redeploy_error_detail(resp)
+        if attempt < REDEPLOY_MAX_RETRIES:
+            delay = REDEPLOY_RETRY_DELAYS_SECONDS[attempt]
+            print(
+                f"::warning::redeploy-fleet returned HTTP {status} for "
+                f"only_slugs={slugs_text} at {url} "
+                f"(attempt {attempt + 1}/{total_attempts}, detail={detail!r}); "
+                f"retrying in {delay}s"
+            )
+            time.sleep(delay)
+        else:
+            print(
+                f"::warning::redeploy-fleet returned HTTP {status} for "
+                f"only_slugs={slugs_text} at {url} "
+                f"(attempt {attempt + 1}/{total_attempts}, detail={detail!r}); "
+                f"retries exhausted"
+            )
+    return status, resp
 
 
 def _raise_for_redeploy_result(status: int, body: dict, slugs: list[str]) -> None:
     if status != 200 or body.get("ok") is not True:
+        # Surface the CP error body when available so the operator sees the
+        # tenant-level reason (e.g. SSM timeout) instead of just the status.
+        detail = _redeploy_error_detail(body, max_len=500)
         raise RuntimeError(
             "redeploy scoped call failed for "
-            f"{','.join(slugs)}: HTTP {status}, ok={body.get('ok')}"
+            f"{','.join(slugs)}: HTTP {status}, ok={body.get('ok')}, detail={detail!r}"
         )
 
 
