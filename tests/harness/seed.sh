@@ -25,11 +25,25 @@ source "$HERE/_curl.sh"
 
 create_workspace() {
     local tenant="$1" name="$2" tier="$3" parent="${4:-}"
+    # Use the harness's default runtime (hermes echo — what the
+    # replays actually exercise; in the runtime registry allowlist)
+    # with a platform-billed model (vendor/model slash form
+    # `moonshot/kimi-k2.6` — no BYOK credential needed per
+    # workspace-server/cmd/server/cp_config.go + model_registry_validation.go).
+    # Earlier attempts that broke:
+    #   runtime=claude-code, model=sonnet  → 422 MISSING_BYOK_CREDENTIAL
+    #     (core#2608 create-boundary; harness provisions no OAuth token)
+    #   runtime=moonshot, model=moonshot/kimi-k2.6
+    #     → 422 FAIL-CLOSED "unsupported runtime moonshot" (moonshot is
+    #       not in the runtime registry; only the model field accepts
+    #       the vendor slash form)
+    #   runtime=hermes (no model)  → 422 FAIL-CLOSED "model is required"
+    #     (CTO 2026-05-22 SSOT directive forbids silent DefaultModel fallback)
     local body
     if [ -n "$parent" ]; then
-        body="{\"name\":\"$name\",\"tier\":$tier,\"parent_id\":\"$parent\",\"runtime\":\"claude-code\",\"model\":\"sonnet\"}"
+        body="{\"name\":\"$name\",\"tier\":$tier,\"parent_id\":\"$parent\",\"runtime\":\"hermes\",\"model\":\"moonshot/kimi-k2.6\"}"
     else
-        body="{\"name\":\"$name\",\"tier\":$tier,\"runtime\":\"claude-code\",\"model\":\"sonnet\"}"
+        body="{\"name\":\"$name\",\"tier\":$tier,\"runtime\":\"hermes\",\"model\":\"moonshot/kimi-k2.6\"}"
     fi
     local id
     if [ "$tenant" = "alpha" ]; then
@@ -73,6 +87,9 @@ echo "[seed]   beta-child   id=$BETA_CHILD_ID"
 #
 # Backwards-compat: ALPHA_ID + BETA_ID aliases keep pre-Phase-2 replays
 # working (they used these names for the alpha tenant's parent + child).
+# Also: ALPHA_WORKSPACE_ID + BETA_WORKSPACE_ID aliases for the canary-
+# smoke a2a-pong + org-create-400 replays (they expect a single
+# "workspace" name per tenant; defaulting to the parent).
 {
     echo "ALPHA_PARENT_ID=$ALPHA_PARENT_ID"
     echo "ALPHA_CHILD_ID=$ALPHA_CHILD_ID"
@@ -81,6 +98,12 @@ echo "[seed]   beta-child   id=$BETA_CHILD_ID"
     echo "# legacy aliases — pre-Phase-2 replays expect these names"
     echo "ALPHA_ID=$ALPHA_PARENT_ID"
     echo "BETA_ID=$ALPHA_CHILD_ID"
+    echo "# canary-smoke replays (a2a-pong, org-create-400) expect a single
+# workspace name per tenant; default to the parent workspace.
+# (The replays don't use child workspaces, so parent == "the
+# workspace" for their purposes.)"
+    echo "ALPHA_WORKSPACE_ID=$ALPHA_PARENT_ID"
+    echo "BETA_WORKSPACE_ID=$BETA_PARENT_ID"
 } > "$HERE/.seed.env"
 
 echo ""
