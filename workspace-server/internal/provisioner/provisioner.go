@@ -12,6 +12,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -575,6 +576,30 @@ func workspaceAdvertiseURL(hostPort string) string {
 	return fmt.Sprintf("http://%s:%s", host, hostPort)
 }
 
+// resolveStartWorkspaceHostURL computes the hostURL that StartWorkspace
+// should return to the platform. The host comes from workspaceAdvertiseURL
+// (env override → localhost); the port starts at hostPort and is swapped
+// to boundPort if Docker bound a different one.
+//
+// #2851 (registration-path fix): the persisted hostURL must be the
+// host-reachable advertise URL (not 127.0.0.1), so ProxyA2A's
+// resolveAgentURL doesn't rewrite it to the internal Docker hostname
+// (ws-<id>:8000) and isSafeURL then reject it. The env override lets
+// the operator point the runtime at the Docker host/gateway IP in
+// containerized-platform mode; the default "localhost" preserves the
+// pre-#2851 behavior when the platform runs on the host directly.
+func resolveStartWorkspaceHostURL(hostPort, boundPort string) string {
+	hostURL := workspaceAdvertiseURL(hostPort)
+	if boundPort == "" || boundPort == hostPort {
+		return hostURL
+	}
+	u, err := url.Parse(hostURL)
+	if err != nil || u.Hostname() == "" {
+		return hostURL
+	}
+	return fmt.Sprintf("http://%s:%s", u.Hostname(), boundPort)
+}
+
 // Start provisions and starts a workspace container.
 func (p *Provisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string, error) {
 	if p == nil || p.cli == nil {
@@ -833,10 +858,17 @@ func (p *Provisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string, e
 	// /configs and /workspace, then drops to agent via gosu). No per-start
 	// chown needed here.
 
-	// #2851: use the pre-allocated host port directly. The inspect loop below
-	// is kept as a verification that Docker bound the expected port, but the
-	// stable value comes from allocateHostPort above.
-	hostURL := fmt.Sprintf("http://127.0.0.1:%s", hostPort)
+	// #2851 (registration-path fix): use the host-reachable advertise URL
+	// (not just 127.0.0.1) as the hostURL persisted in the DB. When the
+	// platform itself runs inside an act_runner container, 127.0.0.1 in
+	// the workspace URL would force ProxyA2A's resolveAgentURL to rewrite
+	// to the internal Docker hostname (ws-<id>:8000), which isSafeURL then
+	// rejects as "workspace URL is not publicly routable". By persisting
+	// the advertise URL (172.18.0.1:<port> in containerized dev, or the
+	// operator's host IP in prod), the platform-facing URL is host-
+	// reachable, the resolveAgentURL rewrite doesn't kick in, and the
+	// dev-mode SSRF relaxation allows the 172.18/16 private range.
+	hostURL := resolveStartWorkspaceHostURL(hostPort, "")
 	for attempt := 0; attempt < 3; attempt++ {
 		info, inspectErr := p.cli.ContainerInspect(ctx, resp.ID)
 		if inspectErr != nil {
@@ -849,13 +881,9 @@ func (p *Provisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string, e
 		if attempt < 2 {
 			time.Sleep(500 * time.Millisecond) // wait for Docker to bind the port
 		} else {
-			log.Printf("Provisioner: container %s did not bind expected host port %s; falling back to inspect value", name, hostPort)
+			log.Printf("Provisioner: container %s did not bind expected host port %s; falling back to bound port (keeping advertise host)", name, hostPort)
 			if len(portBindings) > 0 {
-				boundIP := portBindings[0].HostIP
-				if boundIP == "" {
-					boundIP = "127.0.0.1"
-				}
-				hostURL = fmt.Sprintf("http://%s:%s", boundIP, portBindings[0].HostPort)
+				hostURL = resolveStartWorkspaceHostURL(hostPort, portBindings[0].HostPort)
 			}
 		}
 	}

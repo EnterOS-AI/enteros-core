@@ -1695,3 +1695,59 @@ func TestWorkspaceAdvertiseURL(t *testing.T) {
 		}
 	})
 }
+
+// TestResolveStartWorkspaceHostURL covers the #2851 registration-path fix:
+// the hostURL StartWorkspace persists in the DB must be the host-reachable
+// advertise URL (not 127.0.0.1) so ProxyA2A's resolveAgentURL doesn't
+// rewrite it to the internal Docker hostname. Each subtest pins the env
+// var then asserts the hostURL for both the initial and inspect-fallback
+// paths.
+func TestResolveStartWorkspaceHostURL(t *testing.T) {
+	t.Run("default localhost (no env override)", func(t *testing.T) {
+		t.Setenv("MOLECULE_WORKSPACE_ADVERTISE_HOST", "")
+		got := resolveStartWorkspaceHostURL("12345", "")
+		want := "http://localhost:12345"
+		if got != want {
+			t.Errorf("resolveStartWorkspaceHostURL = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("env override, no bound-port swap", func(t *testing.T) {
+		t.Setenv("MOLECULE_WORKSPACE_ADVERTISE_HOST", "172.18.0.1")
+		got := resolveStartWorkspaceHostURL("33605", "")
+		want := "http://172.18.0.1:33605"
+		if got != want {
+			t.Errorf("resolveStartWorkspaceHostURL = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("env override, bound port differs (inspect-fallback path keeps advertise host)", func(t *testing.T) {
+		t.Setenv("MOLECULE_WORKSPACE_ADVERTISE_HOST", "172.18.0.1")
+		// pre-allocated hostPort was 33605 but Docker bound 33606.
+		// Final URL must use the advertise host + the bound port.
+		got := resolveStartWorkspaceHostURL("33605", "33606")
+		want := "http://172.18.0.1:33606"
+		if got != want {
+			t.Errorf("resolveStartWorkspaceHostURL = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("env override, bound port matches (no-op)", func(t *testing.T) {
+		t.Setenv("MOLECULE_WORKSPACE_ADVERTISE_HOST", "192.168.65.2")
+		got := resolveStartWorkspaceHostURL("8080", "8080")
+		want := "http://192.168.65.2:8080"
+		if got != want {
+			t.Errorf("resolveStartWorkspaceHostURL = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("no env override, bound port swap (legacy 127.0.0.1 case)", func(t *testing.T) {
+		t.Setenv("MOLECULE_WORKSPACE_ADVERTISE_HOST", "")
+		// default "localhost" but bound port differs
+		got := resolveStartWorkspaceHostURL("8080", "9090")
+		want := "http://localhost:9090"
+		if got != want {
+			t.Errorf("resolveStartWorkspaceHostURL = %q, want %q", got, want)
+		}
+	})
+}
