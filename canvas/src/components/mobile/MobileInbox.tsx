@@ -169,7 +169,7 @@ export function MobileInbox({ dark }: { dark: boolean }) {
                 <button
                   type="button"
                   disabled={acting === r.id}
-                  onClick={() => respond(r, kind === "approval" ? "approved" : "done")}
+                  onClick={() => respond(r, r.kind === "approval" ? "approved" : "done")}
                   style={{
                     flex: 1,
                     padding: "9px 0",
@@ -184,7 +184,7 @@ export function MobileInbox({ dark }: { dark: boolean }) {
                     fontFamily: MOBILE_FONT_SANS,
                   }}
                 >
-                  {kind === "approval" ? "Approve" : "Done"}
+                  {r.kind === "approval" ? "Approve" : "Done"}
                 </button>
                 <button
                   type="button"
