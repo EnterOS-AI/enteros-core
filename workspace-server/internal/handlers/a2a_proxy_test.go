@@ -3258,7 +3258,7 @@ func TestProxyA2A_CanvasCapAndQueue_EndToEndContract(t *testing.T) {
 	var sawA2AResponse bool
 	var sawResponseBodyContent bool
 	for time.Now().Before(deadline) {
-		for _, c := range rec.calls {
+		for _, c := range rec.snapshotCalls() {
 			if c.eventType == "A2A_RESPONSE" && c.workspaceID == "ws-e2e" {
 				// Assert the originating message_id is carried so the
 				// canvas WS handler can attach the reply to the right
@@ -3290,10 +3290,10 @@ func TestProxyA2A_CanvasCapAndQueue_EndToEndContract(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	if !sawA2AResponse {
-		t.Fatalf("expected A2A_RESPONSE broadcast for ws-e2e with message_id=msg-e2e-001 within 2s; recorded: %+v", rec.calls)
+		t.Fatalf("expected A2A_RESPONSE broadcast for ws-e2e with message_id=msg-e2e-001 within 2s; recorded: %+v", rec.snapshotCalls())
 	}
 	if !sawResponseBodyContent {
-		t.Fatalf("expected A2A_RESPONSE payload to carry the agent's actual reply content (`reply:\"hello\"`) so the canvas can render it; recorded: %+v", rec.calls)
+		t.Fatalf("expected A2A_RESPONSE payload to carry the agent's actual reply content (`reply:\"hello\"`) so the canvas can render it; recorded: %+v", rec.snapshotCalls())
 	}
 }
 
@@ -3320,13 +3320,13 @@ func TestLogA2ASuccess_BroadcastsForCanvasUser(t *testing.T) {
 	time.Sleep(80 * time.Millisecond)
 
 	got := false
-	for _, c := range rec.calls {
+	for _, c := range rec.snapshotCalls() {
 		if c.eventType == "A2A_RESPONSE" && c.workspaceID == "ws-cu" {
 			got = true
 		}
 	}
 	if !got {
-		t.Fatalf("expected A2A_RESPONSE broadcast for authenticated canvas user; recorded: %+v", rec.calls)
+		t.Fatalf("expected A2A_RESPONSE broadcast for authenticated canvas user; recorded: %+v", rec.snapshotCalls())
 	}
 }
 
@@ -3346,7 +3346,7 @@ func TestLogA2ASuccess_NoBroadcastForWorkspaceCaller(t *testing.T) {
 	handler.logA2ASuccess(context.Background(), "ws-peer", "ws-other", false, []byte(`{}`), []byte(`{"result":"x"}`), "message/send", 200, 12)
 	time.Sleep(80 * time.Millisecond)
 
-	for _, c := range rec.calls {
+	for _, c := range rec.snapshotCalls() {
 		if c.eventType == "A2A_RESPONSE" {
 			t.Fatalf("unexpected A2A_RESPONSE broadcast for a workspace-to-workspace caller")
 		}

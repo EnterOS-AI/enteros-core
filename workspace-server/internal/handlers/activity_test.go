@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -849,6 +850,7 @@ func TestScanSessionSearchRows_RowsErrPropagates(t *testing.T) {
 // recordingBroadcaster records every BroadcastOnly invocation so a test
 // can assert what made it onto the wire. Implements events.EventEmitter.
 type recordingBroadcaster struct {
+	mu    sync.Mutex
 	calls []recordedBroadcast
 }
 
@@ -867,6 +869,8 @@ func (c *recordingBroadcaster) BroadcastOnly(workspaceID string, eventType strin
 	// what hub.Broadcast does before sending). json.RawMessage values in
 	// the source payload survive the round-trip as their underlying JSON.
 	raw, err := json.Marshal(payload)
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if err != nil {
 		c.calls = append(c.calls, recordedBroadcast{workspaceID, eventType, nil})
 		return
@@ -877,6 +881,17 @@ func (c *recordingBroadcaster) BroadcastOnly(workspaceID string, eventType strin
 		return
 	}
 	c.calls = append(c.calls, recordedBroadcast{workspaceID, eventType, out})
+}
+
+// snapshotCalls returns a copy of the recorded calls under the mutex so
+// tests can assert concurrently with BroadcastOnly without triggering the
+// -race detector.
+func (c *recordingBroadcaster) snapshotCalls() []recordedBroadcast {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]recordedBroadcast, len(c.calls))
+	copy(out, c.calls)
+	return out
 }
 
 // TestLogActivity_Broadcast_IncludesRequestAndResponseBodies pins the
