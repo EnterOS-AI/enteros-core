@@ -378,3 +378,78 @@ def test_reap_preserves_ci_pull_request_failure_even_when_target_passed(monkeypa
     assert counters["compensated_governance_shadow"] == 0
     assert counters["preserved_pr_without_push_success"] == 1
     assert posted == []
+
+
+def test_reap_preserves_non_governance_no_push_shadow_when_target_passed(monkeypatch):
+    mod = load_reaper()
+    posted = []
+    monkeypatch.setattr(
+        mod,
+        "post_compensating_status",
+        lambda sha, context, target_url, *, description="", dry_run=False: posted.append(
+            context
+        ),
+    )
+
+    # A no-push workflow that is NOT in the governance allowlist must be
+    # preserved even when its (pull_request_target) variant is green.
+    counters = mod.reap(
+        {"custom-audit": False},
+        {
+            "statuses": [
+                {
+                    "context": "custom-audit / check (pull_request_review)",
+                    "status": "failure",
+                },
+                {
+                    "context": "custom-audit / check (pull_request_target)",
+                    "status": "success",
+                },
+            ],
+        },
+        "db3b7a93e31adc0cb072a6d177d92dd73275a191",
+    )
+
+    assert counters["compensated_governance_shadow"] == 0
+    assert counters["preserved_non_push_suffix"] == 1
+    assert posted == []
+
+
+def test_reap_compensates_retired_sop_tier_check_shadow_when_target_passed(monkeypatch):
+    mod = load_reaper()
+    posted = []
+
+    def fake_post(sha, context, target_url, *, description="", dry_run=False):
+        posted.append((sha, context, target_url, description, dry_run))
+
+    monkeypatch.setattr(mod, "post_compensating_status", fake_post)
+
+    counters = mod.reap(
+        {"sop-tier-check": False},
+        {
+            "statuses": [
+                {
+                    "context": "sop-tier-check / tier-verify (pull_request)",
+                    "status": "failure",
+                    "target_url": "https://git.example.test/tier-pr",
+                },
+                {
+                    "context": "sop-tier-check / tier-verify (pull_request_target)",
+                    "status": "success",
+                },
+            ],
+        },
+        "db3b7a93e31adc0cb072a6d177d92dd73275a191",
+    )
+
+    assert counters["compensated_governance_shadow"] == 1
+    assert counters["preserved_governance_without_target_success"] == 0
+    assert posted == [
+        (
+            "db3b7a93e31adc0cb072a6d177d92dd73275a191",
+            "sop-tier-check / tier-verify (pull_request)",
+            "https://git.example.test/tier-pr",
+            mod.GOVERNANCE_SHADOW_COMPENSATION_DESCRIPTION,
+            False,
+        ),
+    ]

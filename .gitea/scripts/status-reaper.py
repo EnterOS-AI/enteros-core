@@ -161,6 +161,14 @@ PULL_REQUEST_SUFFIX = " (pull_request)"
 PULL_REQUEST_TARGET_SUFFIX = " (pull_request_target)"
 PULL_REQUEST_REVIEW_SUFFIX = " (pull_request_review)"
 
+# Governance workflows whose non-required `(pull_request)` / `(pull_request_review)`
+# shadows may be compensated when the trusted `(pull_request_target)` variant is
+# green. This is an EXACT allowlist — every other workflow is preserved, even if
+# it has no `push:` trigger, to avoid masking real failures.
+GOVERNANCE_SHADOW_ALLOWLIST = frozenset(
+    {"sop-checklist", "qa-review", "security-review", "sop-tier-check"}
+)
+
 # --------------------------------------------------------------------------
 # Conductor snapshot (operator-config#158)
 # --------------------------------------------------------------------------
@@ -507,21 +515,25 @@ def target_equivalent_context(context: str, source_suffix: str) -> str | None:
     return f"{workflow_name} / {job_name}{PULL_REQUEST_TARGET_SUFFIX}"
 
 
-def is_non_push_governance_context(
+def is_governance_shadow_context(
     context: str, workflow_trigger_map: dict[str, bool]
 ) -> bool:
-    """True if `context` belongs to a workflow that has no push: trigger.
+    """True if `context` is a compensatable governance shadow.
 
-    Governance workflows (sop-checklist, qa-review, security-review) emit
-    non-required `(pull_request)` / `(pull_request_review)` shadows alongside
-    the required `(pull_request_target)` context. Workflows that DO have a
-    push trigger are CI checks whose `(pull_request)` status is an independent
-    gate signal and must NOT be compensated here.
+    Only `(pull_request)` / `(pull_request_review)` contexts emitted by the
+    explicitly allowed governance workflows (`sop-checklist`, `qa-review`,
+    `security-review`, and the retired `sop-tier-check`) are eligible.
+    Workflows that DO have a `push:` trigger are excluded even if they are in
+    the allowlist — their PR/review status is an independent gate signal.
+    Unknown workflows or workflows not in the allowlist are preserved
+    (fail-closed: never mask a signal we can't classify).
     """
     for suffix in (PULL_REQUEST_SUFFIX, PULL_REQUEST_REVIEW_SUFFIX):
         parsed = parse_suffixed_context(context, suffix)
         if parsed is not None:
             workflow_name, _job_name = parsed
+            if workflow_name not in GOVERNANCE_SHADOW_ALLOWLIST:
+                return False
             has_push = workflow_trigger_map.get(workflow_name)
             # Only classify as a compensatable governance shadow when we know
             # the workflow and it is NOT push-triggered. Unknown workflows are
@@ -646,7 +658,7 @@ def reap(
         # target context succeeded, the shadow must not keep the aggregate
         # commit status red. CI workflows that also have a `push:` trigger are
         # excluded — their `(pull_request)` status is an independent gate.
-        if is_non_push_governance_context(context, workflow_trigger_map):
+        if is_governance_shadow_context(context, workflow_trigger_map):
             source_suffix = (
                 PULL_REQUEST_SUFFIX
                 if context.endswith(PULL_REQUEST_SUFFIX)
