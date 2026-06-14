@@ -25,20 +25,25 @@ source "$HERE/_curl.sh"
 
 create_workspace() {
     local tenant="$1" name="$2" tier="$3" parent="${4:-}"
-    # Use the harness's actual default runtime (hermes echo — what the
-    # replays use). The runtime registry loaded at tenant boot
-    # (workspaces can POST runtime="hermes"; the registry rejects
-    # any runtime not on its allowlist with FAIL-CLOSED 422).
-    # The model is the runtime's default — the harness doesn't
-    # exercise the LLM proxy (replays use the echo runtime), so
-    # specifying the model would just trip the core#2608
-    # create-boundary BYOK check. Leaving model empty uses the
-    # runtime's baked-in default (no BYOK check).
+    # Use the harness's default runtime (hermes echo — what the
+    # replays actually exercise; in the runtime registry allowlist)
+    # with a platform-billed model (vendor/model slash form
+    # `moonshot/kimi-k2.6` — no BYOK credential needed per
+    # workspace-server/cmd/server/cp_config.go + model_registry_validation.go).
+    # Earlier attempts that broke:
+    #   runtime=claude-code, model=sonnet  → 422 MISSING_BYOK_CREDENTIAL
+    #     (core#2608 create-boundary; harness provisions no OAuth token)
+    #   runtime=moonshot, model=moonshot/kimi-k2.6
+    #     → 422 FAIL-CLOSED "unsupported runtime moonshot" (moonshot is
+    #       not in the runtime registry; only the model field accepts
+    #       the vendor slash form)
+    #   runtime=hermes (no model)  → 422 FAIL-CLOSED "model is required"
+    #     (CTO 2026-05-22 SSOT directive forbids silent DefaultModel fallback)
     local body
     if [ -n "$parent" ]; then
-        body="{\"name\":\"$name\",\"tier\":$tier,\"parent_id\":\"$parent\",\"runtime\":\"hermes\"}"
+        body="{\"name\":\"$name\",\"tier\":$tier,\"parent_id\":\"$parent\",\"runtime\":\"hermes\",\"model\":\"moonshot/kimi-k2.6\"}"
     else
-        body="{\"name\":\"$name\",\"tier\":$tier,\"runtime\":\"hermes\"}"
+        body="{\"name\":\"$name\",\"tier\":$tier,\"runtime\":\"hermes\",\"model\":\"moonshot/kimi-k2.6\"}"
     fi
     local id
     if [ "$tenant" = "alpha" ]; then
