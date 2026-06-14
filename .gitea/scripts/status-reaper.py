@@ -143,6 +143,11 @@ PR_SHADOW_COMPENSATION_DESCRIPTION = (
     "shadowed by successful push status on same SHA; see "
     ".gitea/scripts/status-reaper.py)"
 )
+GOVERNANCE_SHADOW_COMPENSATION_DESCRIPTION = (
+    "Compensated by status-reaper (non-required pull_request/pull_request_review "
+    "governance shadow overridden by successful pull_request_target status; see "
+    ".gitea/scripts/status-reaper.py)"
+)
 CANCELLED_PUSH_COMPENSATION_DESCRIPTION = (
     "Compensated by status-reaper (push run was cancelled/superseded; "
     "Gitea 1.22.6 reports cancelled runs as failure statuses)"
@@ -153,6 +158,20 @@ CANCELLED_DESCRIPTION = "Has been cancelled"
 # default-branch workflow runs.
 PUSH_SUFFIX = " (push)"
 PULL_REQUEST_SUFFIX = " (pull_request)"
+PULL_REQUEST_TARGET_SUFFIX = " (pull_request_target)"
+PULL_REQUEST_REVIEW_SUFFIX = " (pull_request_review)"
+
+# Governance workflows whose non-required `(pull_request)` / `(pull_request_review)`
+# shadows may be compensated when the trusted `(pull_request_target)` variant is
+# green. This is an EXACT active allowlist — every other workflow is preserved,
+# even if it has no `push:` trigger, to avoid masking real failures.
+GOVERNANCE_SHADOW_ALLOWLIST = frozenset(
+    {"sop-checklist", "qa-review", "security-review"}
+)
+# Retired workflows whose historical shadow contexts still appear on old commits
+# and must remain compensatable even though the workflow YAML has been removed.
+# They are treated as known non-push when absent from the trigger map.
+GOVERNANCE_SHADOW_RETIRED_ALLOWLIST = frozenset({"sop-tier-check"})
 
 # --------------------------------------------------------------------------
 # Conductor snapshot (operator-config#158)
@@ -488,6 +507,51 @@ def push_equivalent_context(context: str) -> str | None:
     return f"{workflow_name} / {job_name}{PUSH_SUFFIX}"
 
 
+def target_equivalent_context(context: str, source_suffix: str) -> str | None:
+    """Return the matching `(pull_request_target)` context for a suffixed context.
+
+    Handles `(pull_request)` and `(pull_request_review)` governance shadows.
+    """
+    parsed = parse_suffixed_context(context, source_suffix)
+    if parsed is None:
+        return None
+    workflow_name, job_name = parsed
+    return f"{workflow_name} / {job_name}{PULL_REQUEST_TARGET_SUFFIX}"
+
+
+def is_governance_shadow_context(
+    context: str, workflow_trigger_map: dict[str, bool]
+) -> bool:
+    """True if `context` is a compensatable governance shadow.
+
+    Active governance workflows (`sop-checklist`, `qa-review`, `security-review`)
+    are compensatable only when their trigger map entry is explicitly `False`.
+    Retired workflows (`sop-tier-check`) may be absent from the trigger map
+    because their YAML was removed; they are treated as known non-push so their
+    historical shadow contexts remain compensatable.
+
+    Workflows that DO have a `push:` trigger are excluded even if they are in an
+    allowlist — their PR/review status is an independent gate signal. Unknown
+    workflows or workflows not in any allowlist are preserved (fail-closed).
+    """
+    for suffix in (PULL_REQUEST_SUFFIX, PULL_REQUEST_REVIEW_SUFFIX):
+        parsed = parse_suffixed_context(context, suffix)
+        if parsed is not None:
+            workflow_name, _job_name = parsed
+            if workflow_name in GOVERNANCE_SHADOW_RETIRED_ALLOWLIST:
+                # Retired workflow: absent from the trigger map is expected.
+                # Only a push-triggered retired workflow is preserved.
+                has_push = workflow_trigger_map.get(workflow_name)
+                return has_push is not True
+            if workflow_name not in GOVERNANCE_SHADOW_ALLOWLIST:
+                return False
+            # Active allowlist workflow: require an explicit known-no-push entry.
+            # If the parser ever misses the workflow, fail-closed (preserve).
+            has_push = workflow_trigger_map.get(workflow_name)
+            return has_push is False
+    return False
+
+
 # --------------------------------------------------------------------------
 # Compensating POST
 # --------------------------------------------------------------------------
@@ -562,6 +626,8 @@ def reap(
         "compensated_pr_shadowed_by_push_success": 0,
         "compensated_cancelled_push": 0,
         "preserved_pr_without_push_success": 0,
+        "compensated_governance_shadow": 0,
+        "preserved_governance_without_target_success": 0,
         "compensated_contexts": [],
     }
 
@@ -594,6 +660,36 @@ def reap(
             counters["preserved_non_failure"] += 1
             continue
 
+        # Governance shadow compensation (#2770 / #2767).
+        # Non-required `(pull_request)` and `(pull_request_review)` contexts
+        # emitted by governance workflows (sop-checklist, qa-review,
+        # security-review, retired sop-tier-check) are informational shadows
+        # of the required `(pull_request_target)` context. When the trusted
+        # target context succeeded, the shadow must not keep the aggregate
+        # commit status red. CI workflows that also have a `push:` trigger are
+        # excluded — their `(pull_request)` status is an independent gate.
+        if is_governance_shadow_context(context, workflow_trigger_map):
+            source_suffix = (
+                PULL_REQUEST_SUFFIX
+                if context.endswith(PULL_REQUEST_SUFFIX)
+                else PULL_REQUEST_REVIEW_SUFFIX
+            )
+            target_equivalent = target_equivalent_context(context, source_suffix)
+            if target_equivalent is not None and target_equivalent in successful_contexts:
+                post_compensating_status(
+                    sha,
+                    context,
+                    s.get("target_url"),
+                    description=GOVERNANCE_SHADOW_COMPENSATION_DESCRIPTION,
+                    dry_run=dry_run,
+                )
+                counters["compensated"] += 1
+                counters["compensated_governance_shadow"] += 1
+                counters["compensated_contexts"].append(context)
+            else:
+                counters["preserved_governance_without_target_success"] += 1
+            continue
+
         # Default-branch `pull_request` contexts can be stale shadows of
         # the exact same workflow/job already proven by the successful
         # `push` context on the same SHA. Compensate only that narrow
@@ -618,7 +714,7 @@ def reap(
 
         # Only `(push)`-suffix contexts hit the hardcoded-suffix bug.
         # Other failed contexts are preserved unless handled by the
-        # pull-request-shadow rule above.
+        # governance-shadow or pull-request-shadow rules above.
         if not context.endswith(PUSH_SUFFIX):
             counters["preserved_non_push_suffix"] += 1
             continue
@@ -766,6 +862,8 @@ def reap_branch(
             "compensated_pr_shadowed_by_push_success": 0,
             "compensated_cancelled_push": 0,
             "preserved_pr_without_push_success": 0,
+            "compensated_governance_shadow": 0,
+            "preserved_governance_without_target_success": 0,
             "compensated_per_sha": {},
             "sha_api_errors": 0,
             "skipped": True,
@@ -783,6 +881,8 @@ def reap_branch(
         "compensated_pr_shadowed_by_push_success": 0,
         "compensated_cancelled_push": 0,
         "preserved_pr_without_push_success": 0,
+        "compensated_governance_shadow": 0,
+        "preserved_governance_without_target_success": 0,
         "compensated_per_sha": {},
         "sha_api_errors": 0,
     }
@@ -825,6 +925,8 @@ def reap_branch(
             "compensated_pr_shadowed_by_push_success",
             "compensated_cancelled_push",
             "preserved_pr_without_push_success",
+            "compensated_governance_shadow",
+            "preserved_governance_without_target_success",
         ):
             aggregate[key] += per_sha[key]
 
