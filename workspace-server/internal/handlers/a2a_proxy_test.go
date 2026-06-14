@@ -3020,82 +3020,148 @@ func TestProxyA2A_CanvasCapAndQueue(t *testing.T) {
 	}
 }
 
-// TestProxyA2A_CanvasCapAndQueue_DefaultBudgetOn pins core#2751's durable
-// fix: A2A_CANVAS_SYNC_BUDGET must default to a non-zero value (90s —
-// just under Cloudflare's ~100s edge limit) so the canvas path is
-// always-async by default and the 524+WS-starvation class is closed
-// without an operator having to opt in via env var. The test unsets
-// the env var explicitly to verify the new default fires, then asserts
-// that a long-running agent gets the same `{status:"queued"}` ack as
-// the env-var-explicit path.
-func TestProxyA2A_CanvasCapAndQueue_DefaultBudgetOn(t *testing.T) {
-	// Unset the env var so we test the actual default (the test infra
-	// may have inherited a value from a parallel test or harness setup).
+// TestCanvasA2ASyncBudget_DefaultIs90s pins the core#2751 durable fix at
+// the unit level: the cap-and-queue synchronous-budget default must be
+// 90s (just under Cloudflare's ~100s edge limit). A regression to 0
+// (the legacy always-sync value) would re-expose the canvas path to
+// the 524+WS-starvation class. Test reads the function directly — no
+// ProxyA2A integration setup needed.
+func TestCanvasA2ASyncBudget_DefaultIs90s(t *testing.T) {
 	t.Setenv("A2A_CANVAS_SYNC_BUDGET", "")
+
+	got := canvasA2ASyncBudget()
+	want := 90 * time.Second
+	if got != want {
+		t.Fatalf("canvasA2ASyncBudget() = %v, want %v — default regression on the core#2751 durable fix (regression to 0 would re-expose canvas to CF 524)", got, want)
+	}
+	if got <= 0 {
+		t.Fatalf("canvasA2ASyncBudget() = %v, must be > 0 (a non-positive default would re-enable the legacy always-sync path that causes 524+WS-starvation)", got)
+	}
+}
+
+// TestCanvasA2ASyncBudget_EnvOverride covers the operator tuning path:
+// A2A_CANVAS_SYNC_BUDGET=60s → 60s cap; any other valid positive
+// duration → that duration. Invalid values fall back to the 90s default.
+//
+// Note: envx.Duration treats `0` and negative values as "not set" (the
+// `d > 0` check), so they fall through to the 90s default. This
+// matches the operator's mental model — a non-positive cap would
+// silently fall back to the safe default rather than disabling the
+// cap. The cap is only disabled by `0` reaching the handler's
+// `budget > 0` check, which requires the env var to be UNSET (in
+// which case the default 90s is returned and the cap fires). For
+// the legacy synchronous path, operators must either remove the
+// env var AND patch the default, or apply a hot-fix.
+func TestCanvasA2ASyncBudget_EnvOverride(t *testing.T) {
+	t.Setenv("A2A_CANVAS_SYNC_BUDGET", "60s")
+	if got := canvasA2ASyncBudget(); got != 60*time.Second {
+		t.Errorf("A2A_CANVAS_SYNC_BUDGET=60s should set the cap to 60s; got %v", got)
+	}
+
+	t.Setenv("A2A_CANVAS_SYNC_BUDGET", "120s")
+	if got := canvasA2ASyncBudget(); got != 120*time.Second {
+		t.Errorf("A2A_CANVAS_SYNC_BUDGET=120s should set the cap to 120s; got %v", got)
+	}
+
+	t.Setenv("A2A_CANVAS_SYNC_BUDGET", "invalid")
+	if got := canvasA2ASyncBudget(); got != 90*time.Second {
+		t.Errorf("invalid A2A_CANVAS_SYNC_BUDGET should fall back to the 90s default; got %v", got)
+	}
+
+	t.Setenv("A2A_CANVAS_SYNC_BUDGET", "0")
+	if got := canvasA2ASyncBudget(); got != 90*time.Second {
+		t.Errorf("A2A_CANVAS_SYNC_BUDGET=0 should fall back to the 90s default (envx treats 0 as not-set); got %v", got)
+	}
+}
+
+// TestProxyA2A_CanvasCapAndQueue_EndToEndContract pins the FULL contract
+// (core#2751): a canvas turn that outlives the synchronous budget returns
+// `{status:"queued"}` immediately, the dispatch continues on a detached
+// forward ctx, and the agent's eventual reply is durably logged + broadcast
+// as A2A_RESPONSE with the originating message_id (so the canvas WS handler
+// can attach the reply to the right chat bubble).
+//
+// Uses a SUB-BUDGET (50ms) to force the queued branch deterministically; the
+// agent server holds 500ms before replying, so the HTTP handler returns
+// `queued` well before the agent finishes. Then we wait for the detached
+// goroutine + broadcaster to complete and assert the recorder saw the
+// A2A_RESPONSE broadcast with the right message_id.
+func TestProxyA2A_CanvasCapAndQueue_EndToEndContract(t *testing.T) {
+	// Force the queued branch deterministically with a tiny budget.
+	t.Setenv("A2A_CANVAS_SYNC_BUDGET", "50ms")
 
 	mock := setupTestDB(t)
 	mr := setupTestRedis(t)
 	allowLoopbackForTest(t)
-	broadcaster := newTestBroadcaster()
-	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+	rec := &recordingBroadcaster{}
+	handler := NewWorkspaceHandler(rec, nil, "http://localhost:8080", t.TempDir())
+	waitForHandlerAsyncBeforeDBCleanup(t, handler)
 
-	// Agent that holds the connection well past any reasonable default
-	// budget (so a regressed default=0 would NOT cap-and-queue and this
-	// test would hang until httptest's own deadline).
+	// Agent holds the connection 500ms (>> 50ms budget → forces queued path).
 	agentServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		time.Sleep(2 * time.Second)
+		time.Sleep(500 * time.Millisecond)
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, `{"jsonrpc":"2.0","result":{"status":"ok"}}`)
+		fmt.Fprint(w, `{"jsonrpc":"2.0","id":"req-1","result":{"status":"ok","reply":"hello"}}`)
 	}))
 	defer agentServer.Close()
 
-	mr.Set(fmt.Sprintf("ws:%s:url", "ws-defbudget"), agentServer.URL)
-	expectBudgetCheck(mock, "ws-defbudget")
-	// persistUserMessageAtIngest fires (in the detached goroutine) before
-	// the dispatch blocks. .Maybe()-style tolerance: async ordering means
-	// we don't assert ExpectationsWereMet strictly.
+	mr.Set(fmt.Sprintf("ws:%s:url", "ws-e2e"), agentServer.URL)
+	expectBudgetCheck(mock, "ws-e2e")
+	// persistUserMessageAtIngest fires in the detached goroutine; also
+	// logA2ASuccess fires on agent reply. .Maybe()-style tolerance: async
+	// ordering means we don't strictly assert ExpectationsWereMet.
+	mock.ExpectExec("INSERT INTO activity_logs").WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec("INSERT INTO activity_logs").WillReturnResult(sqlmock.NewResult(0, 1))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
-	c.Params = gin.Params{{Key: "id", Value: "ws-defbudget"}}
-	body := `{"jsonrpc":"2.0","method":"message/send","params":{"message":{"role":"user","parts":[{"text":"long task"}]}}}`
-	c.Request = httptest.NewRequest("POST", "/workspaces/ws-defbudget/a2a", bytes.NewBufferString(body))
+	c.Params = gin.Params{{Key: "id", Value: "ws-e2e"}}
+	// message_id = "msg-e2e-001" — used to verify the broadcast carries
+	// the right originating message_id so the canvas can attach the reply
+	// to the right chat bubble.
+	body := `{"jsonrpc":"2.0","id":"req-1","method":"message/send","params":{"message":{"role":"user","messageId":"msg-e2e-001","parts":[{"text":"hi"}]}}}`
+	c.Request = httptest.NewRequest("POST", "/workspaces/ws-e2e/a2a", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
 	start := time.Now()
 	handler.ProxyA2A(c)
 	elapsed := time.Since(start)
 
-	// The default budget (90s) >> the 2-second agent hold, so the agent
-	// WINS the select and the actual response is returned (NOT a queued
-	// ack). This proves the default is a real cap, not a no-op, and that
-	// the agent's response is delivered when it completes within the
-	// budget. To force the queued path with the default 90s budget we'd
-	// need a >90s agent hold (not feasible in a test); the explicit-env
-	// test above covers the queued-ack path with a 100ms budget.
+	// 1. The HTTP response is the queued ack (not the agent reply).
 	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200 (actual agent reply within default budget), got %d: %s", w.Code, w.Body.String())
+		t.Fatalf("expected 200 queued, got %d: %s", w.Code, w.Body.String())
 	}
-	if !strings.Contains(w.Body.String(), `"result"`) {
-		t.Errorf("expected actual agent reply (with result field), got: %s", w.Body.String())
+	if !strings.Contains(w.Body.String(), `"queued"`) {
+		t.Errorf("expected queued ack (sub-budget forced the cap), got: %s", w.Body.String())
 	}
-	if elapsed > 5*time.Second {
-		t.Errorf("handler took too long (%v) — default budget should let the fast agent reply", elapsed)
+	if !strings.Contains(w.Body.String(), `"push-async"`) {
+		t.Errorf("expected delivery_mode:push-async, got: %s", w.Body.String())
 	}
-	// CRITICAL: confirm the default is non-zero (otherwise this test
-	// would have hung and timed out — the default being 0 means the
-	// select has no `time.After` arm, so the only exit is the goroutine
-	// completing, which the agent did in 2s. The fact that this test
-	// returns in ~2s is the behavioral proof that the default budget is
-	// in effect. Reaffirm structurally: read the source-line envx call
-	// and confirm it doesn't use 0 as the default.
-	src, err := os.ReadFile("a2a_proxy.go")
-	if err != nil {
-		t.Fatalf("read a2a_proxy.go: %v", err)
+	// Returned at ~budget, NOT after the (blocked) agent.
+	if elapsed > 300*time.Millisecond {
+		t.Errorf("handler held the connection (%v) instead of capping at the 50ms budget", elapsed)
 	}
-	if !strings.Contains(string(src), `envx.Duration("A2A_CANVAS_SYNC_BUDGET", 90*time.Second)`) {
-		t.Errorf("A2A_CANVAS_SYNC_BUDGET default must be 90*time.Second; the durable-fix envx call was regressed (regression on core#2751)")
+
+	// 2. Wait for the detached goroutine to finish + the broadcast to fire.
+	// The agent takes ~500ms; the broadcast is recorded synchronously
+	// inside logA2ASuccess. 2s is plenty of headroom.
+	deadline := time.Now().Add(2 * time.Second)
+	var sawA2AResponse bool
+	for time.Now().Before(deadline) {
+		for _, c := range rec.calls {
+			if c.eventType == "A2A_RESPONSE" && c.workspaceID == "ws-e2e" {
+				if mid, ok := c.payload["message_id"].(string); ok && mid == "msg-e2e-001" {
+					sawA2AResponse = true
+				}
+			}
+		}
+		if sawA2AResponse {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !sawA2AResponse {
+		t.Fatalf("expected A2A_RESPONSE broadcast for ws-e2e with message_id=msg-e2e-001 within 2s; recorded: %+v", rec.calls)
 	}
 }
 

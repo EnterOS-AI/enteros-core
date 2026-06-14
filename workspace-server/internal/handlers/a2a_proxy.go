@@ -391,12 +391,16 @@ func (h *WorkspaceHandler) ProxyA2A(c *gin.Context) {
 	// AGENT_MESSAGE WebSocket broadcast (the exact poll-mode contract). The work
 	// runs on a detached ctx so its DB logging isn't cancelled when we return.
 	//
-	// Operators can disable the cap by setting A2A_CANVAS_SYNC_BUDGET=0 (legacy
-	// synchronous path) or tune the budget via the env var (e.g. 60s for more
+	// Operators can tune the budget via the env var (e.g. 60s for more
 	// conservative environments). The default of 90s is the durable fix that
-	// removes the CF 100s ceiling for the canvas path. See the design on
-	// core#2751.
-	if budget := envx.Duration("A2A_CANVAS_SYNC_BUDGET", 90*time.Second); budget > 0 && (callerID == "" || isCanvasUser) {
+	// removes the CF 100s ceiling for the canvas path. envx.Duration treats
+	// 0/negative as "not set" and falls through to the default — to disable
+	// the cap, an operator must explicitly patch the default (a code change).
+	// See the design on core#2751.
+	//
+	// The budget lookup is extracted into canvasA2ASyncBudget (below) so the
+	// default value is unit-testable without source-string matching.
+	if budget := canvasA2ASyncBudget(); budget > 0 && (callerID == "" || isCanvasUser) {
 		type a2aResult struct {
 			status int
 			body   []byte
@@ -1217,4 +1221,22 @@ func applyIdleTimeout(parent context.Context, b *events.Broadcaster, workspaceID
 		}
 	}()
 	return ctx, cancel
+}
+
+// canvasA2ASyncBudget is the extracted lookup for the cap-and-queue synchronous
+// wait (core#2751). Extracted from the ProxyA2A handler so the default value
+// can be unit-tested directly without source-string matching — a regression of
+// the default to 0 (legacy always-sync, which would re-expose the canvas path
+// to the 524+WS-starvation class) is caught by the unit test on this function.
+//
+// Default is 90s — just under Cloudflare's ~100s edge limit, so a turn that
+// outlives the budget triggers the queued ack before CF drops the request.
+//
+// The envx.Duration wrapper lets operators tune the budget
+// (A2A_CANVAS_SYNC_BUDGET=60s for more conservative environments) without a
+// code change. envx treats 0 / negative / invalid values as "not set" and
+// falls through to the default; to disable the cap, an operator must patch
+// the default in the source.
+func canvasA2ASyncBudget() time.Duration {
+	return envx.Duration("A2A_CANVAS_SYNC_BUDGET", 90*time.Second)
 }
