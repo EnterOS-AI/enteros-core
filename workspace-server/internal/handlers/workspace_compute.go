@@ -170,56 +170,71 @@ var workspaceComputeProviderLabels = map[string]string{
 // TestComputeMetadata_SSOTInternalConsistency.
 var workspaceComputeMetadataRenderOrder = []string{"aws", "gcp", "hetzner"}
 
-func init() {
-	for _, p := range workspaceComputeProvidersOrdered {
-		workspaceComputeProviderAllowlist[p] = struct{}{}
-	}
-	// SSOT consistency check (core#2489, Researcher's RC #11736
-	// bidirectional-init fix): the labels map + render-order slice +
-	// instance-types map + defaults map must all reference the SAME
-	// set of providers as workspaceComputeProvidersOrdered. A
-	// mismatch in ANY direction is a drift bug:
-	//   - label without a provider: dead data (a future
-	//     workspaceComputeProvidersOrdered growth would miss the label)
-	//   - provider without a label: silent empty label in the
-	//     response (UX dead-end)
-	//   - render-order entry without a provider: dead data
-	//   - provider missing from render order: silent omission from
-	//     the dropdown (the user couldn't switch to that provider)
-	//   - render-order entry without a default: silent empty
-	//     default (the canvas would have to fall back to a hardcoded
-	//     "t3.medium" or fail)
-	//   - render-order entry with empty instance-types: silent
-	//     empty dropdown
-	// Every direction is enforced. The check is intentionally
-	// strict (panics on first mismatch) — these are static in-binary
-	// data, not user input, and any mismatch is a compile-time
-	// mistake that must surface at boot, not in a logged endpoint
-	// response. Pinned in lockstep with
-	// TestComputeMetadata_SSOTInternalConsistency.
-	ssotSet := make(map[string]struct{}, len(workspaceComputeProvidersOrdered))
-	for _, p := range workspaceComputeProvidersOrdered {
+// checkComputeSSOTConsistency is the bidirectional SSOT consistency
+// check (core#2489, Researcher's RC #11736 + CR2's RC #11738). It
+// enforces the full invariant between the SSOT data shapes:
+//   - labels map keys == providers slice entries
+//   - render-order slice is a permutation of providers slice (same
+//     set, no duplicates)
+//   - every rendered provider has a default + non-empty instance-types
+//
+// A mismatch in ANY direction panics. The check is extracted as a
+// pure function (no side effects, no init() dependency) so the test
+// suite can invoke it against MUTATED SSOT data (negative cases:
+// missing label, missing render entry, duplicate render entry,
+// missing default, empty instance-types) and assert the panic
+// behavior. A future regression in the production init() — e.g.
+// someone removing the panic for "weird but tolerable" cases —
+// would be caught by the negative tests calling this function.
+//
+// Every direction is enforced:
+//   - label without a provider: dead data (a future
+//     workspaceComputeProvidersOrdered growth would miss the label)
+//   - provider without a label: silent empty label in the
+//     response (UX dead-end)
+//   - render-order entry without a provider: dead data
+//   - provider missing from render order: silent omission from
+//     the dropdown (the user couldn't switch to that provider)
+//   - render-order entry without a default: silent empty
+//     default (the canvas would have to fall back to a hardcoded
+//     "t3.medium" or fail)
+//   - render-order entry with empty instance-types: silent
+//     empty dropdown
+//   - duplicate render-order entry: render would silently drop
+//     one (the second occurrence overwrites the map)
+//
+// Pinned in lockstep with TestComputeMetadata_SSOTInternalConsistency
+// + the negative TestComputeMetadata_InitPanics* family.
+func checkComputeSSOTConsistency(
+	providers []string,
+	labels map[string]string,
+	renderOrder []string,
+	defaults map[string]string,
+	instanceTypes map[string][]string,
+) {
+	ssotSet := make(map[string]struct{}, len(providers))
+	for _, p := range providers {
 		ssotSet[p] = struct{}{}
 	}
 	// 1. labels keys ⊆ providers keys AND providers keys ⊆ labels keys
 	//    (bidirectional — every provider has a label, every label
 	//    has a provider).
-	labelsSet := make(map[string]struct{}, len(workspaceComputeProviderLabels))
-	for p := range workspaceComputeProviderLabels {
+	labelsSet := make(map[string]struct{}, len(labels))
+	for p := range labels {
 		if _, ok := ssotSet[p]; !ok {
 			panic(fmt.Sprintf("workspaceComputeProviderLabels has key %q not in workspaceComputeProvidersOrdered", p))
 		}
 		labelsSet[p] = struct{}{}
 	}
-	for _, p := range workspaceComputeProvidersOrdered {
+	for _, p := range providers {
 		if _, ok := labelsSet[p]; !ok {
 			panic(fmt.Sprintf("workspaceComputeProvidersOrdered has entry %q with no label in workspaceComputeProviderLabels", p))
 		}
 	}
 	// 2. render-order is a permutation of providers: every entry
 	//    has a provider, every provider has an entry, no duplicates.
-	renderSet := make(map[string]struct{}, len(workspaceComputeMetadataRenderOrder))
-	for _, p := range workspaceComputeMetadataRenderOrder {
+	renderSet := make(map[string]struct{}, len(renderOrder))
+	for _, p := range renderOrder {
 		if _, ok := ssotSet[p]; !ok {
 			panic(fmt.Sprintf("workspaceComputeMetadataRenderOrder has entry %q not in workspaceComputeProvidersOrdered", p))
 		}
@@ -228,7 +243,7 @@ func init() {
 		}
 		renderSet[p] = struct{}{}
 	}
-	for _, p := range workspaceComputeProvidersOrdered {
+	for _, p := range providers {
 		if _, ok := renderSet[p]; !ok {
 			panic(fmt.Sprintf("workspaceComputeProvidersOrdered has entry %q missing from workspaceComputeMetadataRenderOrder", p))
 		}
@@ -238,14 +253,34 @@ func init() {
 	//    default falls back to "t3.medium" via the consumer
 	//    helper, but a missing default is a UX dead-end we want
 	//    to catch at boot, not in the field).
-	for _, p := range workspaceComputeMetadataRenderOrder {
-		if _, ok := workspaceComputeDefaultInstanceByProvider[p]; !ok {
+	for _, p := range renderOrder {
+		if _, ok := defaults[p]; !ok {
 			panic(fmt.Sprintf("workspaceComputeMetadataRenderOrder has entry %q with no default in workspaceComputeDefaultInstanceByProvider", p))
 		}
-		if len(workspaceComputeInstanceTypesOrdered[p]) == 0 {
+		if len(instanceTypes[p]) == 0 {
 			panic(fmt.Sprintf("workspaceComputeMetadataRenderOrder has entry %q with empty instance-types list", p))
 		}
 	}
+}
+
+func init() {
+	for _, p := range workspaceComputeProvidersOrdered {
+		workspaceComputeProviderAllowlist[p] = struct{}{}
+	}
+	// SSOT consistency check (core#2489, Researcher's RC #11736
+	// bidirectional-init fix): the production init guard delegates
+	// to the pure checkComputeSSOTConsistency function above so
+	// the test suite can exercise the same logic against MUTATED
+	// SSOT data (negative cases) and prove the panic behavior.
+	// See checkComputeSSOTConsistency's doc-comment for the full
+	// rationale + the list of drift bugs each direction prevents.
+	checkComputeSSOTConsistency(
+		workspaceComputeProvidersOrdered,
+		workspaceComputeProviderLabels,
+		workspaceComputeMetadataRenderOrder,
+		workspaceComputeDefaultInstanceByProvider,
+		workspaceComputeInstanceTypesOrdered,
+	)
 }
 
 func validateWorkspaceCompute(compute models.WorkspaceCompute) error {

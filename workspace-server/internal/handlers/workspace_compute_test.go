@@ -901,76 +901,255 @@ func TestComputeMetadata_SSOTInternalConsistency(t *testing.T) {
 	}
 }
 
-// TestComputeMetadata_InitBidirectionalPanics pins that the
-// init() guard (Researcher RC #11736) is BIRECTIONAL — a
-// mismatch in ANY direction (labels missing a provider, provider
-// missing a label, render-order missing a provider, render-order
-// with a duplicate, render-order entry without a default,
-// render-order entry with empty instance-types) crashes the
-// process at boot. The test invokes the init logic via a
-// small helper that mirrors the same checks, so a future
-// regression in the production init() is caught here even if
-// the package init already ran at test-load time.
-//
-// The test intentionally does NOT exercise the package init
-// itself (Go's init semantics mean the package init runs exactly
-// once at load; a second invocation is not possible). Instead,
-// the helper checks the same invariants the init enforces,
-// against a copy of the SSOT data, and panics on mismatch. A
-// mismatch caught here would also be caught by the package
-// init at process boot — this is the "readable contract pin"
-// while the package init is the "boot-time fail-closed."
-func TestComputeMetadata_InitBidirectionalPanics(t *testing.T) {
-	// invokeSSOTConsistencyCheck mirrors the production init()'s
-	// SSOT consistency checks (the bidirectional version after
-	// Researcher's RC #11736 fix). Returns nil on success,
-	// panics on mismatch. We invoke it with the LIVE SSOT data
-	// and expect nil (the test then proves the invariant holds
-	// in production; a regression in the data would panic here
-	// just as it would in the package init).
-	invokeSSOTConsistencyCheck := func() {
-		ssotSet := make(map[string]struct{}, len(workspaceComputeProvidersOrdered))
-		for _, p := range workspaceComputeProvidersOrdered {
-			ssotSet[p] = struct{}{}
+// TestComputeMetadata_InitPanicsOnLabelMissingFromProviders is
+// the negative case for direction 1.a (label without a
+// provider). The production init() guard must panic on this
+// mutation. The check is the PRODUCTION checkComputeSSOTConsistency
+// function (not a local mirror) so a future regression that
+// weakens the production check is caught here.
+func TestComputeMetadata_InitPanicsOnLabelMissingFromProviders(t *testing.T) {
+	// Mutate: add a "future-cloud" label that has no provider entry.
+	mutatedLabels := make(map[string]string, len(workspaceComputeProviderLabels)+1)
+	for k, v := range workspaceComputeProviderLabels {
+		mutatedLabels[k] = v
+	}
+	mutatedLabels["future-cloud"] = "Future Cloud"
+
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected panic on label-without-provider, got nil (production checkComputeSSOTConsistency is too lenient)")
 		}
-		labelsSet := make(map[string]struct{}, len(workspaceComputeProviderLabels))
-		for p := range workspaceComputeProviderLabels {
-			if _, ok := ssotSet[p]; !ok {
-				panic("label without provider")
-			}
-			labelsSet[p] = struct{}{}
+		// Sanity check: the panic message must mention the bad key.
+		msg, _ := r.(string)
+		if !strings.Contains(msg, "future-cloud") {
+			t.Errorf("panic message should mention the offending key 'future-cloud', got: %q", msg)
 		}
-		for _, p := range workspaceComputeProvidersOrdered {
-			if _, ok := labelsSet[p]; !ok {
-				panic("provider without label")
-			}
+	}()
+
+	checkComputeSSOTConsistency(
+		workspaceComputeProvidersOrdered,
+		mutatedLabels,
+		workspaceComputeMetadataRenderOrder,
+		workspaceComputeDefaultInstanceByProvider,
+		workspaceComputeInstanceTypesOrdered,
+	)
+}
+
+// TestComputeMetadata_InitPanicsOnProviderMissingLabel is the
+// negative case for direction 1.b (provider without a label).
+// A new provider added to the ordered slice without a matching
+// label entry would silently render an empty string in the
+// /compute/metadata response — the production check must panic.
+func TestComputeMetadata_InitPanicsOnProviderMissingLabel(t *testing.T) {
+	// Mutate: add "new-cloud" to providers but no label for it.
+	mutatedProviders := append([]string{}, workspaceComputeProvidersOrdered...)
+	mutatedProviders = append(mutatedProviders, "new-cloud")
+
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected panic on provider-without-label, got nil (production checkComputeSSOTConsistency is too lenient)")
 		}
-		renderSet := make(map[string]struct{}, len(workspaceComputeMetadataRenderOrder))
-		for _, p := range workspaceComputeMetadataRenderOrder {
-			if _, ok := ssotSet[p]; !ok {
-				panic("render-order entry without provider")
-			}
-			if _, dup := renderSet[p]; dup {
-				panic("render-order duplicate")
-			}
-			renderSet[p] = struct{}{}
+		msg, _ := r.(string)
+		if !strings.Contains(msg, "new-cloud") {
+			t.Errorf("panic message should mention the offending provider 'new-cloud', got: %q", msg)
 		}
-		for _, p := range workspaceComputeProvidersOrdered {
-			if _, ok := renderSet[p]; !ok {
-				panic("provider missing from render order")
-			}
+	}()
+
+	checkComputeSSOTConsistency(
+		mutatedProviders,
+		workspaceComputeProviderLabels,
+		workspaceComputeMetadataRenderOrder,
+		workspaceComputeDefaultInstanceByProvider,
+		workspaceComputeInstanceTypesOrdered,
+	)
+}
+
+// TestComputeMetadata_InitPanicsOnRenderOrderEntryMissingProvider
+// is the negative case for direction 2.a (render-order entry
+// without a provider). A render entry for an unknown provider
+// would silently render a dropdown row with no instances — the
+// production check must panic.
+func TestComputeMetadata_InitPanicsOnRenderOrderEntryMissingProvider(t *testing.T) {
+	// Mutate: add a "ghost-provider" entry to render order
+	// (no matching provider).
+	mutatedRender := append([]string{}, workspaceComputeMetadataRenderOrder...)
+	mutatedRender = append(mutatedRender, "ghost-provider")
+
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected panic on render-order-entry-without-provider, got nil (production checkComputeSSOTConsistency is too lenient)")
 		}
-		for _, p := range workspaceComputeMetadataRenderOrder {
-			if _, ok := workspaceComputeDefaultInstanceByProvider[p]; !ok {
-				panic("render-order entry without default")
-			}
-			if len(workspaceComputeInstanceTypesOrdered[p]) == 0 {
-				panic("render-order entry with empty instance-types")
-			}
+		msg, _ := r.(string)
+		if !strings.Contains(msg, "ghost-provider") {
+			t.Errorf("panic message should mention the offending entry 'ghost-provider', got: %q", msg)
+		}
+	}()
+
+	checkComputeSSOTConsistency(
+		workspaceComputeProvidersOrdered,
+		workspaceComputeProviderLabels,
+		mutatedRender,
+		workspaceComputeDefaultInstanceByProvider,
+		workspaceComputeInstanceTypesOrdered,
+	)
+}
+
+// TestComputeMetadata_InitPanicsOnProviderMissingFromRenderOrder
+// is the negative case for direction 2.b (provider missing from
+// render order). A new provider added without a render-order
+// entry would silently be absent from the canvas dropdown —
+// the production check must panic.
+func TestComputeMetadata_InitPanicsOnProviderMissingFromRenderOrder(t *testing.T) {
+	// Mutate: add "new-cloud" to providers + labels, but NOT
+	// to render order.
+	mutatedProviders := append([]string{}, workspaceComputeProvidersOrdered...)
+	mutatedProviders = append(mutatedProviders, "new-cloud")
+	mutatedLabels := make(map[string]string, len(workspaceComputeProviderLabels)+1)
+	for k, v := range workspaceComputeProviderLabels {
+		mutatedLabels[k] = v
+	}
+	mutatedLabels["new-cloud"] = "New Cloud"
+
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected panic on provider-missing-from-render-order, got nil (production checkComputeSSOTConsistency is too lenient)")
+		}
+		msg, _ := r.(string)
+		if !strings.Contains(msg, "new-cloud") {
+			t.Errorf("panic message should mention the offending provider 'new-cloud', got: %q", msg)
+		}
+	}()
+
+	checkComputeSSOTConsistency(
+		mutatedProviders,
+		mutatedLabels,
+		workspaceComputeMetadataRenderOrder,
+		workspaceComputeDefaultInstanceByProvider,
+		workspaceComputeInstanceTypesOrdered,
+	)
+}
+
+// TestComputeMetadata_InitPanicsOnDuplicateRenderOrderEntry is
+// the negative case for direction 2.c (duplicate render-order
+// entry). A duplicate in the slice would silently overwrite the
+// first occurrence in the map — the production check must panic.
+func TestComputeMetadata_InitPanicsOnDuplicateRenderOrderEntry(t *testing.T) {
+	// Mutate: add a second "aws" entry to render order.
+	mutatedRender := append([]string{}, workspaceComputeMetadataRenderOrder...)
+	mutatedRender = append(mutatedRender, "aws") // duplicate
+
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected panic on duplicate-render-order-entry, got nil (production checkComputeSSOTConsistency is too lenient)")
+		}
+		msg, _ := r.(string)
+		if !strings.Contains(msg, "duplicate") {
+			t.Errorf("panic message should mention the duplicate, got: %q", msg)
+		}
+	}()
+
+	checkComputeSSOTConsistency(
+		workspaceComputeProvidersOrdered,
+		workspaceComputeProviderLabels,
+		mutatedRender,
+		workspaceComputeDefaultInstanceByProvider,
+		workspaceComputeInstanceTypesOrdered,
+	)
+}
+
+// TestComputeMetadata_InitPanicsOnRenderOrderEntryMissingDefault
+// is the negative case for direction 3.a (render-order entry
+// without a default). A render entry whose provider has no
+// default would silently fall back to "t3.medium" in the
+// consumer helper — the production check must panic.
+func TestComputeMetadata_InitPanicsOnRenderOrderEntryMissingDefault(t *testing.T) {
+	// Mutate: remove the "gcp" default.
+	mutatedDefaults := make(map[string]string, len(workspaceComputeDefaultInstanceByProvider))
+	for k, v := range workspaceComputeDefaultInstanceByProvider {
+		if k == "gcp" {
+			continue
+		}
+		mutatedDefaults[k] = v
+	}
+
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected panic on render-order-entry-without-default, got nil (production checkComputeSSOTConsistency is too lenient)")
+		}
+		msg, _ := r.(string)
+		if !strings.Contains(msg, "gcp") {
+			t.Errorf("panic message should mention the offending provider 'gcp', got: %q", msg)
+		}
+	}()
+
+	checkComputeSSOTConsistency(
+		workspaceComputeProvidersOrdered,
+		workspaceComputeProviderLabels,
+		workspaceComputeMetadataRenderOrder,
+		mutatedDefaults,
+		workspaceComputeInstanceTypesOrdered,
+	)
+}
+
+// TestComputeMetadata_InitPanicsOnRenderOrderEntryEmptyInstanceTypes
+// is the negative case for direction 3.b (render-order entry with
+// empty instance-types). A render entry whose provider has an
+// empty instance-types list would silently render an empty
+// dropdown — the production check must panic.
+func TestComputeMetadata_InitPanicsOnRenderOrderEntryEmptyInstanceTypes(t *testing.T) {
+	// Mutate: empty the "hetzner" instance-types list.
+	mutatedInstances := make(map[string][]string, len(workspaceComputeInstanceTypesOrdered))
+	for k, v := range workspaceComputeInstanceTypesOrdered {
+		if k == "hetzner" {
+			mutatedInstances[k] = []string{} // empty
+		} else {
+			mutatedInstances[k] = v
 		}
 	}
-	// Against the LIVE SSOT, the check must NOT panic. (If it
-	// did, the package init would have panicked at process boot,
-	// and we wouldn't have reached this test.)
-	invokeSSOTConsistencyCheck()
+
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected panic on render-order-entry-with-empty-instance-types, got nil (production checkComputeSSOTConsistency is too lenient)")
+		}
+		msg, _ := r.(string)
+		if !strings.Contains(msg, "hetzner") {
+			t.Errorf("panic message should mention the offending provider 'hetzner', got: %q", msg)
+		}
+	}()
+
+	checkComputeSSOTConsistency(
+		workspaceComputeProvidersOrdered,
+		workspaceComputeProviderLabels,
+		workspaceComputeMetadataRenderOrder,
+		workspaceComputeDefaultInstanceByProvider,
+		mutatedInstances,
+	)
+}
+
+// TestComputeMetadata_InitAcceptsLiveSSOT pins the positive case
+// against the PRODUCTION checkComputeSSOTConsistency function
+// (not a local mirror) so a future regression in the production
+// check that would weaken the LIVE-SSOT case is caught here. The
+// package init has already run at process boot; this test is the
+// "readable contract pin" while the package init is the
+// "boot-time fail-closed." Pairs with the negative
+// TestComputeMetadata_InitPanics* family above.
+func TestComputeMetadata_InitAcceptsLiveSSOT(t *testing.T) {
+	// MUST not panic. (If it did, the package init would have
+	// panicked at process boot, and we wouldn't have reached
+	// this test.)
+	checkComputeSSOTConsistency(
+		workspaceComputeProvidersOrdered,
+		workspaceComputeProviderLabels,
+		workspaceComputeMetadataRenderOrder,
+		workspaceComputeDefaultInstanceByProvider,
+		workspaceComputeInstanceTypesOrdered,
+	)
 }
