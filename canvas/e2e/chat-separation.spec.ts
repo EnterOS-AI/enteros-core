@@ -264,7 +264,7 @@ test.describe("Activity API Source Filter", () => {
     expect(res.status()).toBe(400);
   });
 
-  test("source+type filters combine correctly", async ({ request }) => {
+  test("source+type filters combine correctly (canvas)", async ({ request }) => {
     const res = await request.get(
       `${API}/workspaces/${workspaceId}/activity?type=a2a_receive&source=canvas`,
       { headers: { Authorization: `Bearer ${authToken}` } },
@@ -283,6 +283,27 @@ test.describe("Activity API Source Filter", () => {
       expect(e.source_id).toBeNull();
     }
     expect(entries.some((e) => requestBodyText(e.request_body) === "canvas source probe")).toBe(true);
+  });
+
+  test("source+type filters combine correctly (agent)", async ({ request }) => {
+    const res = await request.get(
+      `${API}/workspaces/${workspaceId}/activity?type=a2a_receive&source=agent`,
+      { headers: { Authorization: `Bearer ${authToken}` } },
+    );
+    expect(res.ok()).toBeTruthy();
+    const entries = (await res.json()) as Array<{
+      activity_type: string;
+      source_id: unknown;
+      request_body: unknown;
+    }>;
+    expect(Array.isArray(entries)).toBeTruthy();
+    // False-green guard: an empty array would make the loop below pass vacuously.
+    expect(entries.length).toBeGreaterThan(0);
+    for (const e of entries) {
+      expect(e.activity_type).toBe("a2a_receive");
+      expect(e.source_id).not.toBeNull();
+    }
+    expect(entries.some((e) => requestBodyText(e.request_body) === "agent source probe")).toBe(true);
   });
 });
 
