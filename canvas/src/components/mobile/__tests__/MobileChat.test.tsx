@@ -763,3 +763,120 @@ describe("MobileChat — multi-send tap path (CR2 #2762)", () => {
     });
   });
 });
+
+describe("MobileChat — tool-call chain (#231 desktop parity)", () => {
+  beforeEach(() => {
+    mockStoreState.nodes = [onlineNode];
+  });
+
+  it("renders the tool-call chain from an agent message's tool_trace", async () => {
+    // useChatHistory maps the API's snake_case tool_trace → toolTrace.
+    vi.spyOn(api, "get").mockResolvedValueOnce({
+      messages: [
+        {
+          id: "m-trace",
+          role: "agent",
+          content: "done",
+          timestamp: "2026-04-25T10:00:01Z",
+          tool_trace: [
+            { tool: "Bash", input: "ls -la" },
+            { tool: "Read", input: "/tmp/x" },
+          ],
+        },
+      ],
+      reached_end: true,
+    });
+    let r: ReturnType<typeof renderChat>;
+    await act(async () => {
+      r = renderChat(mockAgentId);
+    });
+    const { container } = r!;
+    // Collapsed-by-default: the count header is shown (previously mobile
+    // dropped the whole chain — the reported "missing tool call chain").
+    expect(container.textContent ?? "").toContain("2 tools used");
+    // Expand → the individual tool entries appear.
+    const toggle = Array.from(container.querySelectorAll("button")).find((b) =>
+      (b.textContent ?? "").includes("tools used"),
+    ) as HTMLButtonElement;
+    expect(toggle).toBeTruthy();
+    await act(async () => {
+      toggle.click();
+    });
+    expect(container.textContent ?? "").toContain("Bash");
+    expect(container.textContent ?? "").toContain("Read");
+  });
+
+  it("shows no tool-chain affordance for an agent message without tool_trace", async () => {
+    vi.spyOn(api, "get").mockResolvedValueOnce({
+      messages: [
+        { id: "m-plain", role: "agent", content: "hi", timestamp: "2026-04-25T10:00:01Z" },
+      ],
+      reached_end: true,
+    });
+    let r: ReturnType<typeof renderChat>;
+    await act(async () => {
+      r = renderChat(mockAgentId);
+    });
+    expect(r!.container.textContent ?? "").not.toContain("tools used");
+  });
+});
+
+describe("MobileChat — send-error banner suppressed while working (report: banner under ●●● 148s)", () => {
+  const busyNode = {
+    ...onlineNode,
+    id: "ws-busy",
+    data: { ...onlineNode.data, currentTask: "downloading 1100 files" },
+  };
+
+  it("does NOT show the 'unreachable' banner while the agent is working (currentTask set)", async () => {
+    mockStoreState.nodes = [busyNode];
+    // The send POST fails with a 504 (non-524) → useChatSend sets the
+    // "agent may be unreachable" error. But the workspace reports an in-flight
+    // task, so thinking=true and the banner must stay HIDDEN (the agent is
+    // provably reachable — the exact contradiction in the screenshot).
+    vi.spyOn(api, "post").mockRejectedValue(
+      Object.assign(new Error("API POST /workspaces/ws-busy/a2a: 504 "), { status: 504 }),
+    );
+    const { container } = renderChat("ws-busy");
+    const ta = container.querySelector("textarea") as HTMLTextAreaElement;
+    const sendBtn = () =>
+      container.querySelector('[aria-label="Send"]') as HTMLButtonElement;
+    await act(async () => {
+      fireEvent.change(ta, { target: { value: "hi" } });
+    });
+    await act(async () => {
+      sendBtn().click();
+    });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    // No "unreachable" banner while currentTask drives the thinking indicator.
+    expect(container.textContent ?? "").not.toMatch(/unreachable/i);
+    // …and the thinking indicator IS present (proving thinking=true, the state
+    // under which the old code wrongly showed the banner).
+    expect(
+      container.querySelector('[data-testid="mobile-thinking-indicator"]'),
+    ).not.toBeNull();
+  });
+
+  it("DOES show the banner when a send fails and the agent is NOT working", async () => {
+    mockStoreState.nodes = [onlineNode]; // currentTask: "" → not thinking once send settles
+    vi.spyOn(api, "post").mockRejectedValue(
+      Object.assign(new Error("API POST /workspaces/ws-chat-test/a2a: 522 "), { status: 522 }),
+    );
+    const { container } = renderChat(mockAgentId);
+    const ta = container.querySelector("textarea") as HTMLTextAreaElement;
+    const sendBtn = () =>
+      container.querySelector('[aria-label="Send"]') as HTMLButtonElement;
+    await act(async () => {
+      fireEvent.change(ta, { target: { value: "hi" } });
+    });
+    await act(async () => {
+      sendBtn().click();
+    });
+    await waitFor(() => {
+      expect(container.textContent ?? "").toMatch(/unreachable/i);
+    });
+  });
+});

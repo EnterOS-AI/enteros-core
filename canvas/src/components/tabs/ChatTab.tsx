@@ -806,7 +806,14 @@ function MyChatPanel({ workspaceId, data }: Props) {
           inline JSX hardcoded "see workspace logs for details" with
           no link — there is no separate Logs tab. */}
       <ChatErrorBanner
-        message={displayError}
+        // Suppress the banner while the agent is demonstrably WORKING. The
+        // clear-on-thinking effect above only fires on the thinking
+        // TRANSITION, so a send error that lands mid-turn (a long poll-mode
+        // turn whose POST times out at the CF edge while currentTask is still
+        // set) would otherwise show "unreachable" beside the live "●●● Ns"
+        // timer. Gating render on !thinking is the durable fix (mirrors
+        // MobileChat); a still-unresolved error resurfaces once the turn ends.
+        message={thinking ? null : displayError}
         isOnline={isOnline}
         onRestart={() => setConfirmRestart(true)}
       />
