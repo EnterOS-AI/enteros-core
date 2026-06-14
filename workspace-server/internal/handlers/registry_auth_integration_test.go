@@ -157,6 +157,44 @@ func statusOf(t *testing.T, conn *sql.DB, id string) string {
 	return status
 }
 
+// insertWorkspaceWithURL creates a workspace row with an explicit URL
+// (the provisioner-set host-port URL the CASE-preservation tests need
+// pre-populated). Returns the DB-generated UUID. Mirrors insertWorkspace
+// but additionally writes the `url` column on insert.
+func insertWorkspaceWithURL(t *testing.T, conn *sql.DB, name, status, url string) string {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var id string
+	err := conn.QueryRowContext(ctx, `
+		INSERT INTO workspaces (name, status, parent_id, delivery_mode, url)
+		VALUES ($1, $2, NULL, 'push', NULLIF($3, ''))
+		RETURNING id
+	`, name, status, url).Scan(&id)
+	if err != nil {
+		t.Fatalf("insertWorkspaceWithURL(%s): %v", name, err)
+	}
+	return id
+}
+
+// urlOf reads a workspace row's current url, failing the test if the row
+// is gone or the url is NULL. Used by the CASE-preservation tests to
+// verify the upsert preserved (or did not preserve) the expected URL.
+func urlOf(t *testing.T, conn *sql.DB, id string) string {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var url sql.NullString
+	err := conn.QueryRowContext(ctx, `SELECT url FROM workspaces WHERE id = $1`, id).Scan(&url)
+	if err != nil {
+		t.Fatalf("urlOf(%s): %v", id, err)
+	}
+	if !url.Valid {
+		t.Fatalf("urlOf(%s): row has NULL url", id)
+	}
+	return url.String
+}
+
 // ---------------------------------------------------------------------------
 // 1 — registry register/heartbeat row-state: the #73 tombstone guard.
 //
@@ -176,8 +214,25 @@ const registerUpsertSQL = `
 	INSERT INTO workspaces (id, name, url, agent_card, status, last_heartbeat_at, delivery_mode)
 	VALUES ($1, $2, $3, $4::jsonb, 'online', now(), $5)
 	ON CONFLICT (id) DO UPDATE SET
+		-- Preserve the provisioner-set host-port URL. The provisioner
+		-- injects MOLECULE_WORKSPACE_URL=<host-port> into the container
+		-- env (buildStartWorkspaceEnv in workspace-server), so the
+		-- runtime should register that same URL. The runtime's
+		-- resolve_workspace_url honors MOLECULE_WORKSPACE_URL at highest
+		-- precedence, so when the env propagation is correct, the
+		-- runtime's URL == provisioner's URL. When env propagation is
+		-- broken (real-image lifecycle E2E gap that bit 3 rounds
+		-- running), the runtime falls back to http://HOSTNAME:8000
+		-- — the port 8000 makes it distinguishable from the
+		-- provisioner's host-port (typically >30000). Preserve the
+		-- provisioner's URL when its port != 8000.
 		url = CASE
-			WHEN workspaces.url LIKE 'http://127.0.0.1%' THEN workspaces.url
+			WHEN workspaces.url IS NOT NULL
+			     AND workspaces.url != ''
+			     AND (workspaces.url LIKE 'http://127.0.0.1:%'
+			          OR workspaces.url LIKE 'http://localhost:%')
+			     AND CAST(substring(workspaces.url FROM ':([0-9]+)$') AS int) <> 8000
+			THEN workspaces.url
 			ELSE EXCLUDED.url
 		END,
 		agent_card = EXCLUDED.agent_card,
@@ -234,6 +289,114 @@ func TestIntegration_RegistryRowState_RegisterUpsertsLiveWorkspaceToOnline(t *te
 
 	if got := statusOf(t, conn, id); got != "online" {
 		t.Fatalf("live workspace register: status=%q, want 'online'", got)
+	}
+}
+
+// TestIntegration_RegistryRowState_RegisterPreservesProvisionerHostPort covers
+// the #2851 round-4 / Researcher #11798 close-out: when the provisioner has
+// already set a host-port URL on the row (e.g. http://localhost:41751 via
+// buildStartWorkspaceEnv) and the runtime re-registers with the same
+// host-port URL (or any non-8000 URL on the localhost/127.0.0.1 prefix),
+// the upsert must preserve the EXISTING URL (not overwrite with EXCLUDED).
+// Regression of the round-3 11798 gap.
+func TestIntegration_RegistryRowState_RegisterPreservesProvisionerHostPort(t *testing.T) {
+	conn := integrationAuthDB(t)
+	ctx := context.Background()
+
+	id := insertWorkspace(t, conn, "hostport-ws", "online", "http://localhost:41751")
+
+	// Re-register with the SAME host-port URL. The provisioner would have
+	// injected this same URL via MOLECULE_WORKSPACE_URL, so the runtime's
+	// EXCLUDED.url == existing url. The CASE should preserve either way.
+	if _, err := conn.ExecContext(ctx, registerUpsertSQL,
+		id, id, "http://localhost:41751", `{"name":"x"}`, "push"); err != nil {
+		t.Fatalf("register upsert: %v", err)
+	}
+	if got := urlOf(t, conn, id); got != "http://localhost:41751" {
+		t.Fatalf("host-port URL not preserved: got %q, want http://localhost:41751", got)
+	}
+
+	// Re-register with a DIFFERENT host-port URL on the same prefix. The
+	// provisioner is allowed to update the host-port (e.g. after a restart
+	// allocated a new port). The CASE should still preserve the row's
+	// existing host-port URL — the runtime shouldn't be able to silently
+	// rewrite the port without re-provisioning.
+	if _, err := conn.ExecContext(ctx, registerUpsertSQL,
+		id, id, "http://localhost:50000", `{"name":"x"}`, "push"); err != nil {
+		t.Fatalf("register upsert 2: %v", err)
+	}
+	if got := urlOf(t, conn, id); got != "http://localhost:41751" {
+		t.Fatalf("host-port URL changed on re-register: got %q, want preserved http://localhost:41751", got)
+	}
+
+	// Same with the legacy 127.0.0.1 prefix (back-compat).
+	insertWorkspaceWithURL(t, conn, "hostport-ws-legacy", "online", "http://127.0.0.1:33605")
+	if _, err := conn.ExecContext(ctx, registerUpsertSQL,
+		"hostport-ws-legacy", "hostport-ws-legacy", "http://127.0.0.1:33605", `{"name":"x"}`, "push"); err != nil {
+		t.Fatalf("register upsert 3 (127.0.0.1): %v", err)
+	}
+	if got := urlOf(t, conn, "hostport-ws-legacy"); got != "http://127.0.0.1:33605" {
+		t.Fatalf("legacy 127.0.0.1 host-port URL not preserved: got %q, want http://127.0.0.1:33605", got)
+	}
+}
+
+// TestIntegration_RegistryRowState_RegisterOverwritesRuntime8000 covers the
+// "runtime's wrong localhost:8000 fallback overwriting the provisioner's
+// host-port" case: the CASE excludes port 8000 (which is the runtime's
+// listen-port fallback, NOT the provisioner's host-port) so the upsert
+// overwrites with EXCLUDED.url — but EXCLUDED.url in this scenario is
+// ALSO 8000, so the net result is the row's URL is 8000 (which is
+// wrong but reflects the runtime's broken env propagation — the
+// underlying fix is the buildStartWorkspaceEnv injection, not the CASE).
+func TestIntegration_RegistryRowState_RegisterOverwritesRuntime8000(t *testing.T) {
+	conn := integrationAuthDB(t)
+	ctx := context.Background()
+
+	// Provisioner set the legacy 127.0.0.1:<port> URL (pre-round-3 path).
+	id := insertWorkspace(t, conn, "port8000-ws", "online", "http://127.0.0.1:8000")
+	// Runtime re-registers with its localhost:8000 fallback.
+	if _, err := conn.ExecContext(ctx, registerUpsertSQL,
+		id, id, "http://localhost:8000", `{"name":"x"}`, "push"); err != nil {
+		t.Fatalf("register upsert: %v", err)
+	}
+	// CASE excludes port 8000 → falls through to EXCLUDED.url → row = localhost:8000.
+	if got := urlOf(t, conn, id); got != "http://localhost:8000" {
+		t.Fatalf("port-8000 case: got %q, want http://localhost:8000 (CASE excluded, EXCLUDED wins)", got)
+	}
+
+	// And vice-versa (existing localhost:8000 + runtime 127.0.0.1:8000):
+	insertWorkspaceWithURL(t, conn, "port8000-ws-2", "online", "http://localhost:8000")
+	if _, err := conn.ExecContext(ctx, registerUpsertSQL,
+		"port8000-ws-2", "port8000-ws-2", "http://127.0.0.1:8000", `{"name":"x"}`, "push"); err != nil {
+		t.Fatalf("register upsert 2: %v", err)
+	}
+	if got := urlOf(t, conn, "port8000-ws-2"); got != "http://127.0.0.1:8000" {
+		t.Fatalf("port-8000 reverse: got %q, want http://127.0.0.1:8000", got)
+	}
+}
+
+// TestIntegration_RegistryRowState_RegisterOverwritesNonLocalhost covers the
+// "the row's existing URL is a non-localhost URL (e.g. https://example.com/foo
+// or http://192.168.1.100:8080) — the CASE only matches localhost/127.0.0.1
+// prefix, so non-localhost URLs are NOT preserved; EXCLUDED.url wins".
+// This is the defense-in-depth: non-localhost URLs that shouldn't be in
+// workspaces.url (SSRF defense) get overwritten by the runtime's
+// validateAgentURL-checked URL.
+func TestIntegration_RegistryRowState_RegisterOverwritesNonLocalhost(t *testing.T) {
+	conn := integrationAuthDB(t)
+	ctx := context.Background()
+
+	// Legacy state: a non-localhost URL snuck into the row (shouldn't happen
+	// in practice post-#1130, but if it did, the upsert must not preserve
+	// it — EXCLUDED.url is the new URL and the runtime's
+	// validateAgentURL already gated it).
+	id := insertWorkspace(t, conn, "nonlocal-ws", "online", "http://192.168.1.100:8080")
+	if _, err := conn.ExecContext(ctx, registerUpsertSQL,
+		id, id, "http://localhost:41751", `{"name":"x"}`, "push"); err != nil {
+		t.Fatalf("register upsert: %v", err)
+	}
+	if got := urlOf(t, conn, id); got != "http://localhost:41751" {
+		t.Fatalf("non-localhost URL not overwritten: got %q, want http://localhost:41751", got)
 	}
 }
 

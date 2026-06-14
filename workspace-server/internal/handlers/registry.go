@@ -578,26 +578,26 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 		INSERT INTO workspaces (id, name, url, agent_card, status, last_heartbeat_at, delivery_mode, kind)
 		VALUES ($1, $2, $3, $4::jsonb, 'online', now(), $5, COALESCE(NULLIF($6, ''), 'workspace'))
 		ON CONFLICT (id) DO UPDATE SET
-			// Preserve the provisioner-set host-port URL. The provisioner
-			// injects MOLECULE_WORKSPACE_URL=<host-port> into the container
-			// env (buildStartWorkspaceEnv in workspace-server), so the
-			// runtime should register that same URL. The runtime's
-			// resolve_workspace_url honors MOLECULE_WORKSPACE_URL at highest
-			// precedence, so when the env propagation is correct, the
-			// runtime's URL == provisioner's URL. When env propagation is
-			// broken (real-image lifecycle E2E gap that bit 3 rounds
-			// running), the runtime falls back to http://HOSTNAME:8000
-			// — the port 8000 makes it distinguishable from the
-			// provisioner's host-port (typically >30000). Preserve the
-			// provisioner's URL when its port != 8000.
-			//
-			// Researcher #11798: round-3 fix changed the provisioner
-			// from http://127.0.0.1 to http://localhost (the
-			// workspaceAdvertiseURL default), but the Register handler
-			// only matched the legacy 127.0.0.1 prefix, so the upsert
-			// overwrote the provisioner's URL with the runtime's 8000
-			// fallback. Generalize to match any host-prefixed
-			// host-port URL whose port != 8000.
+			-- Preserve the provisioner-set host-port URL. The provisioner
+			-- injects MOLECULE_WORKSPACE_URL=<host-port> into the container
+			-- env (buildStartWorkspaceEnv in workspace-server), so the
+			-- runtime should register that same URL. The runtime's
+			-- resolve_workspace_url honors MOLECULE_WORKSPACE_URL at highest
+			-- precedence, so when the env propagation is correct, the
+			-- runtime's URL == provisioner's URL. When env propagation is
+			-- broken (real-image lifecycle E2E gap that bit 3 rounds
+			-- running), the runtime falls back to http://HOSTNAME:8000
+			-- — the port 8000 makes it distinguishable from the
+			-- provisioner's host-port (typically >30000). Preserve the
+			-- provisioner's URL when its port != 8000.
+			--
+			-- Researcher #11798: round-3 fix changed the provisioner
+			-- from http://127.0.0.1 to http://localhost (the
+			-- workspaceAdvertiseURL default), but the Register handler
+			-- only matched the legacy 127.0.0.1 prefix, so the upsert
+			-- overwrote the provisioner's URL with the runtime's 8000
+			-- fallback. Generalize to match any host-prefixed
+			-- host-port URL whose port != 8000.
 			url = CASE
 				WHEN workspaces.url IS NOT NULL
 				     AND workspaces.url != ''
