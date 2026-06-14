@@ -840,3 +840,63 @@ func TestComputeMetadata_ReturnsProviderAllowlist(t *testing.T) {
 		}
 	}
 }
+
+// TestComputeMetadata_SSOTInternalConsistency pins that the SSOT
+// additions (workspaceComputeProviderLabels, workspaceComputeMetadataRenderOrder)
+// are kept in lock-step with the existing SSOT maps
+// (workspaceComputeProvidersOrdered, workspaceComputeInstanceTypesOrdered,
+// workspaceComputeDefaultInstanceByProvider). A label without a provider
+// is a UX dead-end; a render-order entry without a label is a render
+// bug; a default/instance-types map without a render-order entry is a
+// silent missing-option. The init() panic catches these at boot
+// (defense in depth), but this test is the readable contract pin.
+//
+// Behavior-preserving: the EXISTING TestComputeMetadata_ReturnsProviderAllowlist
+// already pins the output shape; this test pins the SSOT internal
+// relationships that prevent the output from drifting.
+func TestComputeMetadata_SSOTInternalConsistency(t *testing.T) {
+	// Labels map keys must match the provider set.
+	ssotSet := make(map[string]struct{})
+	for _, p := range workspaceComputeProvidersOrdered {
+		ssotSet[p] = struct{}{}
+	}
+	for p := range workspaceComputeProviderLabels {
+		if _, ok := ssotSet[p]; !ok {
+			t.Errorf("workspaceComputeProviderLabels has key %q not in workspaceComputeProvidersOrdered", p)
+		}
+	}
+	// Every provider in the SSOT must have a label.
+	for _, p := range workspaceComputeProvidersOrdered {
+		if _, ok := workspaceComputeProviderLabels[p]; !ok {
+			t.Errorf("workspaceComputeProvidersOrdered has entry %q with no label in workspaceComputeProviderLabels", p)
+		}
+	}
+	// Render-order slice must be a permutation of the provider set.
+	if len(workspaceComputeMetadataRenderOrder) != len(workspaceComputeProvidersOrdered) {
+		t.Errorf("workspaceComputeMetadataRenderOrder has %d entries, want %d (one per provider)",
+			len(workspaceComputeMetadataRenderOrder), len(workspaceComputeProvidersOrdered))
+	}
+	renderSet := make(map[string]struct{}, len(workspaceComputeMetadataRenderOrder))
+	for _, p := range workspaceComputeMetadataRenderOrder {
+		renderSet[p] = struct{}{}
+		if _, ok := ssotSet[p]; !ok {
+			t.Errorf("workspaceComputeMetadataRenderOrder has entry %q not in workspaceComputeProvidersOrdered", p)
+		}
+	}
+	for p := range ssotSet {
+		if _, ok := renderSet[p]; !ok {
+			t.Errorf("workspaceComputeProvidersOrdered has entry %q missing from workspaceComputeMetadataRenderOrder", p)
+		}
+	}
+	// Every provider in the render order must have a default + non-empty
+	// instance types (a render entry with empty instances is a
+	// UX dead-end — the canvas would render an empty dropdown).
+	for _, p := range workspaceComputeMetadataRenderOrder {
+		if _, ok := workspaceComputeDefaultInstanceByProvider[p]; !ok {
+			t.Errorf("workspaceComputeMetadataRenderOrder has entry %q with no default in workspaceComputeDefaultInstanceByProvider", p)
+		}
+		if len(workspaceComputeInstanceTypesOrdered[p]) == 0 {
+			t.Errorf("workspaceComputeMetadataRenderOrder has entry %q with empty instance-types list", p)
+		}
+	}
+}

@@ -138,9 +138,64 @@ func instanceTypeAllowedForProvider(provider, instanceType string) bool {
 // drift.
 var workspaceComputeProviderAllowlist = map[string]struct{}{}
 
+// workspaceComputeProviderLabels is the human-readable label the canvas
+// renders for each provider (e.g. "AWS (default)" vs the raw "aws"). The
+// "(default)" suffix on the default-provider label is the canvas's
+// visual cue for the auto-selected provider — preserving it here keeps
+// the UX signal the canvas already depends on. Computed labels
+// (e.g. "(default)") MUST stay aligned with the empty-string convention
+// in normalizeCloudProvider; if a future change makes the default
+// non-AWS, update the "aws" entry's label at the same time.
+//
+// DERIVED validation: the keys must match workspaceComputeProvidersOrdered
+// (enforced in init()); a label without a provider (or vice-versa) would
+// be a real drift bug. Pinned by TestComputeMetadata_SSOTInternalConsistency.
+var workspaceComputeProviderLabels = map[string]string{
+	"aws":     "AWS (default)",
+	"gcp":     "GCP",
+	"hetzner": "Hetzner",
+}
+
+// workspaceComputeMetadataRenderOrder is the provider order the canvas
+// Container-Config tab renders its dropdown in. Distinct from
+// workspaceComputeProvidersOrdered (the validation + ComputeOptions
+// order) because the canvas UX wants AWS first, then GCP, then
+// Hetzner (so the most-used provider is at the top of the dropdown).
+// The internal SSOT and the canvas render order are SEPARATE
+// concerns on purpose — a future canvas UX change (e.g. alphabetical)
+// should not force a re-order of the validation order.
+//
+// Must contain the same set of providers as
+// workspaceComputeProvidersOrdered; pinned by
+// TestComputeMetadata_SSOTInternalConsistency.
+var workspaceComputeMetadataRenderOrder = []string{"aws", "gcp", "hetzner"}
+
 func init() {
 	for _, p := range workspaceComputeProvidersOrdered {
 		workspaceComputeProviderAllowlist[p] = struct{}{}
+	}
+	// SSOT consistency check (core#2489): the labels map + render-order
+	// slice + providers slice + instance-types map + defaults map must
+	// all reference the same set of providers. A label without a
+	// provider (or vice-versa) is a drift bug; a render-order entry
+	// without a label is a render-order typo. The check is intentionally
+	// strict (panics on first mismatch) — these are static in-binary
+	// data, not user input, and any mismatch is a compile-time
+	// mistake that must surface at boot, not in a logged endpoint
+	// response.
+	ssotSet := make(map[string]struct{}, len(workspaceComputeProvidersOrdered))
+	for _, p := range workspaceComputeProvidersOrdered {
+		ssotSet[p] = struct{}{}
+	}
+	for p := range workspaceComputeProviderLabels {
+		if _, ok := ssotSet[p]; !ok {
+			panic(fmt.Sprintf("workspaceComputeProviderLabels has key %q not in workspaceComputeProvidersOrdered", p))
+		}
+	}
+	for _, p := range workspaceComputeMetadataRenderOrder {
+		if _, ok := ssotSet[p]; !ok {
+			panic(fmt.Sprintf("workspaceComputeMetadataRenderOrder has entry %q not in workspaceComputeProvidersOrdered", p))
+		}
 	}
 }
 
@@ -237,18 +292,41 @@ type computeMetadataResponse struct {
 // instance-type allowlists consumed by the canvas ContainerConfigTab (and any
 // other client that needs to render a provider/instance selector).
 // Public, no auth: the data is platform constraints, not org secrets.
+//
+// DERIVES from the workspaceCompute* SSOT maps above (core#2489); does NOT
+// hardcode any provider/instance/default data inline. The previous inline
+// hardcoded list drifted in two places: (a) provider order didn't match the
+// validation order (aws/gcp/hetzner here vs aws/hetzner/gcp in the SSOT
+// slice), and (b) labels weren't defined anywhere — they were inline strings
+// that would silently rot if a new provider was added. Both fixes are SSOT
+// additions + this derived read, NOT a behavior change (the test
+// TestComputeMetadata_ReturnsProviderAllowlist pins the exact previous
+// output).
 func ComputeMetadata(c *gin.Context) {
-	// Deterministic order so tests (and UI dropdowns) are stable.
-	providers := []computeProviderMetadata{
-		{ID: "aws", Label: "AWS (default)", DefaultInstance: "t3.medium", Instances: []string{
-			"t3.medium", "t3.large", "t3.xlarge", "t3.2xlarge", "m6i.large", "m6i.xlarge", "c6i.xlarge",
-		}},
-		{ID: "gcp", Label: "GCP", DefaultInstance: "e2-standard-2", Instances: []string{
-			"e2-small", "e2-medium", "e2-standard-2", "e2-standard-4", "e2-standard-8",
-		}},
-		{ID: "hetzner", Label: "Hetzner", DefaultInstance: "cpx31", Instances: []string{
-			"cpx11", "cpx21", "cpx31", "cpx41", "cpx51", "cax11", "cax21", "cax31", "cax41",
-		}},
+	// Render in the canvas-UX order (distinct from the validation
+	// order — see workspaceComputeMetadataRenderOrder doc), pulling
+	// the label + default + instance-types for each from the SSOT
+	// maps. Three lookups per provider; O(providers) total.
+	providers := make([]computeProviderMetadata, 0, len(workspaceComputeMetadataRenderOrder))
+	for _, id := range workspaceComputeMetadataRenderOrder {
+		// Label is required (panicked in init() if missing). If a
+		// future provider is added without a label, this is a
+		// boot-time crash, not a silent empty label.
+		label := workspaceComputeProviderLabels[id]
+		// Default + instance-types are also required — same
+		// SSOT-consistency rationale. A provider without a
+		// default or with zero instance types would fail the
+		// validation step downstream, so we want the metadata
+		// endpoint to surface that as a panic at boot, not as
+		// a silent empty render.
+		defaultInstance := workspaceComputeDefaultInstanceByProvider[id]
+		instances := workspaceComputeInstanceTypesOrdered[id]
+		providers = append(providers, computeProviderMetadata{
+			ID:              id,
+			Label:           label,
+			DefaultInstance: defaultInstance,
+			Instances:       instances,
+		})
 	}
 	c.JSON(200, computeMetadataResponse{Providers: providers})
 }
