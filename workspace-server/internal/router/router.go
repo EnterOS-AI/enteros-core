@@ -358,6 +358,13 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		wsAuth.POST("/approvals", apph.Create)
 		wsAuth.GET("/approvals", apph.List)
 		wsAuth.POST("/approvals/:approvalId/decide", apph.Decide)
+		// Requester-initiated withdraw (#66): the agent that raised
+		// the approval can pull it back before any human acts on it.
+		// Mirrors the requests.Cancel authz model — workspace-token
+		// path is authz-checked against the row's creator workspace
+		// (NOT the path :id) to handle cross-workspace approval
+		// gates (#2574 / #2593).
+		wsAuth.POST("/approvals/:approvalId/withdraw", apph.Withdraw)
 		// /approvals/pending is a cross-workspace admin path; WorkspaceAuth cannot
 		// be used here (no workspace scope), but it still needs auth so an
 		// unauthenticated caller cannot enumerate all pending approvals across the

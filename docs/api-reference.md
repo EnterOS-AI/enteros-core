@@ -43,6 +43,7 @@ Full contract: `docs/runbooks/admin-auth.md`.
 | WS | /workspaces/:id/terminal | terminal.go |
 | POST/GET | /workspaces/:id/approvals | approvals.go |
 | POST | /workspaces/:id/approvals/:id/decide | approvals.go |
+| POST | /workspaces/:id/approvals/:id/withdraw | approvals.go — requester pulls back a pending approval (#66) |
 | GET | /approvals/pending | approvals.go |
 | POST/GET | /workspaces/:id/memories | memories.go |
 | DELETE | /workspaces/:id/memories/:id | memories.go |

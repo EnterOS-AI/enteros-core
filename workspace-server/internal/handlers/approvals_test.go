@@ -354,3 +354,194 @@ func TestApprovals_Decide_MissingDecision(t *testing.T) {
 		t.Errorf("expected 400, got %d", w.Code)
 	}
 }
+
+// ---------- ApprovalsHandler: Withdraw (#66) ----------
+
+// TestApprovals_Withdraw_Success is the happy path. Caller's
+// workspace token (URL :id=ws-1) matches the row's creator
+// workspace_id, the row is currently 'pending', the UPDATE flips
+// it to 'withdrawn', and the broadcaster records APPROVAL_WITHDRAWN.
+func TestApprovals_Withdraw_Success(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewApprovalsHandler(broadcaster)
+
+	// Read creator workspace (authz lookup).
+	mock.ExpectQuery("SELECT workspace_id::text FROM approval_requests WHERE id").
+		WithArgs("appr-1").
+		WillReturnRows(sqlmock.NewRows([]string{"workspace_id"}).AddRow("ws-1"))
+
+	// State-guarded UPDATE (only flips pending → withdrawn).
+	mock.ExpectExec("UPDATE approval_requests").
+		WithArgs("appr-1").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// Broadcast APPROVAL_WITHDRAWN.
+	mock.ExpectExec("INSERT INTO structure_events").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-1"}, {Key: "approvalId", Value: "appr-1"}}
+	c.Request = httptest.NewRequest("POST", "/", nil)
+
+	handler.Withdraw(c)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["status"] != "withdrawn" {
+		t.Errorf("expected status 'withdrawn', got %v", resp["status"])
+	}
+	if resp["approval_id"] != "appr-1" {
+		t.Errorf("expected approval_id appr-1, got %v", resp["approval_id"])
+	}
+}
+
+// TestApprovals_Withdraw_NotPendingReturns409 — the state guard.
+// Row exists but is no longer 'pending' (a human approver
+// already decided, or another withdraw raced and won). The
+// UPDATE affects 0 rows → 409 Conflict. The caller can
+// distinguish "row vanished" (404) from "row exists but
+// already moved" (409), and the latter is the right answer
+// here so the requester can refresh its local view.
+func TestApprovals_Withdraw_NotPendingReturns409(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewApprovalsHandler(newTestBroadcaster())
+
+	mock.ExpectQuery("SELECT workspace_id::text FROM approval_requests WHERE id").
+		WithArgs("appr-1").
+		WillReturnRows(sqlmock.NewRows([]string{"workspace_id"}).AddRow("ws-1"))
+
+	// UPDATE finds 0 rows (status no longer pending).
+	mock.ExpectExec("UPDATE approval_requests").
+		WithArgs("appr-1").
+		WillReturnResult(sqlmock.NewResult(0, 0))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-1"}, {Key: "approvalId", Value: "appr-1"}}
+	c.Request = httptest.NewRequest("POST", "/", nil)
+
+	handler.Withdraw(c)
+
+	if w.Code != http.StatusConflict {
+		t.Errorf("expected 409, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestApprovals_Withdraw_NotFound — the approval row doesn't
+// exist (or the UUID is malformed). Both cases return 404 —
+// the caller can't withdraw either way.
+func TestApprovals_Withdraw_NotFound(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewApprovalsHandler(newTestBroadcaster())
+
+	mock.ExpectQuery("SELECT workspace_id::text FROM approval_requests WHERE id").
+		WithArgs("missing").
+		WillReturnError(errPGRowNotFound())
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-1"}, {Key: "approvalId", Value: "missing"}}
+	c.Request = httptest.NewRequest("POST", "/", nil)
+
+	handler.Withdraw(c)
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("expected 404, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestApprovals_Withdraw_CrossWorkspaceAuthzReject — the
+// load-bearing authz test (PM/Researcher guardrail 7600d2ed).
+// The caller's path :id (ws-evil) does NOT match the row's
+// creator workspace_id (ws-1). Without the authz check, a
+// malicious caller could withdraw any approval they could
+// guess the UUID of. The 403 short-circuits BEFORE the UPDATE
+// runs, so the row is left untouched.
+func TestApprovals_Withdraw_CrossWorkspaceAuthzReject(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewApprovalsHandler(newTestBroadcaster())
+
+	// Row's creator is ws-1.
+	mock.ExpectQuery("SELECT workspace_id::text FROM approval_requests WHERE id").
+		WithArgs("appr-1").
+		WillReturnRows(sqlmock.NewRows([]string{"workspace_id"}).AddRow("ws-1"))
+
+	// No UPDATE expected — authz rejects before we get there.
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-evil"}, {Key: "approvalId", Value: "appr-1"}}
+	c.Request = httptest.NewRequest("POST", "/", nil)
+
+	handler.Withdraw(c)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("mock expectations not met (authz check should have short-circuited before UPDATE): %v", err)
+	}
+}
+
+// TestApprovals_Withdraw_CrossWorkspaceGateOK — the
+// cross-workspace approval-gate scenario (#2574 / #2593) where
+// the approval row's creator is a different workspace from the
+// gate's workspace. The authz anchor is the row's creator
+// workspace_id, NOT the path :id, so when the caller presents
+// the CREATOR's token (path :id=ws-1, row's ws-1), withdraw
+// proceeds normally. This is the case that the "use path :id"
+// authz model would have wrongly rejected.
+func TestApprovals_Withdraw_CrossWorkspaceGateOK(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewApprovalsHandler(broadcaster)
+
+	// Row's creator is ws-1 (the underlying requesting workspace).
+	mock.ExpectQuery("SELECT workspace_id::text FROM approval_requests WHERE id").
+		WithArgs("appr-1").
+		WillReturnRows(sqlmock.NewRows([]string{"workspace_id"}).AddRow("ws-1"))
+
+	mock.ExpectExec("UPDATE approval_requests").
+		WithArgs("appr-1").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	mock.ExpectExec("INSERT INTO structure_events").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-1"}, {Key: "approvalId", Value: "appr-1"}}
+	c.Request = httptest.NewRequest("POST", "/", nil)
+
+	handler.Withdraw(c)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// errPGRowNotFound returns the pgx-style "no rows in result set"
+// error so the Withdraw handler hits the 404 path. Used by
+// TestApprovals_Withdraw_NotFound to keep the test free of
+// pgx imports (the rest of the suite uses sqlmock which already
+// pulls pgx in transitively).
+func errPGRowNotFound() error {
+	return &pgRowNotFoundErr{}
+}
+
+// pgRowNotFoundErr is a tiny error type satisfying the error
+// interface. The Withdraw handler treats any non-nil error from
+// the authz-lookup QueryRow as a "row not found" → 404.
+type pgRowNotFoundErr struct{}
+
+func (e *pgRowNotFoundErr) Error() string { return "no rows in result set" }
