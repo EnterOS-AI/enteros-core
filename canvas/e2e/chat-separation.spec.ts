@@ -10,7 +10,6 @@ import {
 
 const PLATFORM_URL = process.env.E2E_PLATFORM_URL ?? "http://localhost:8080";
 const API = process.env.E2E_API_URL ?? PLATFORM_URL;
-const ADMIN_TOKEN = process.env.E2E_ADMIN_TOKEN ?? process.env.ADMIN_TOKEN;
 
 /** Enter the Org-map view so the Canvas (React Flow graph) mounts. */
 async function enterMapView(page: Page): Promise<void> {
@@ -45,16 +44,30 @@ async function openChatPanel(page: Page, workspaceName: string): Promise<void> {
 }
 
 /** Post a message to the workspace via the A2A proxy so activity rows exist.
- *  `token` should be an org/admin token for canvas-origin rows (source_id NULL),
- *  or the target workspace's own auth token for agent-origin rows
- *  (source_id = workspace_id). */
-async function postA2AMessage(workspaceId: string, token: string, text: string) {
+ *  `source` determines the auth shape, which in turn determines
+ *  activity_logs.source_id:
+ *    - "canvas": no workspace-resolving auth, no X-Workspace-ID → callerID
+ *      empty → source_id NULL (the /activity?source=canvas filter).
+ *    - "agent": workspace bearer token → callerID = workspace →
+ *      source_id = workspace_id (the /activity?source=agent filter).
+ */
+async function postA2AMessage(
+  workspaceId: string,
+  source: "canvas" | "agent",
+  text: string,
+  workspaceAuthToken: string,
+) {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (source === "agent") {
+    headers.Authorization = `Bearer ${workspaceAuthToken}`;
+  }
+  // canvas-source intentionally sends no bearer and no X-Workspace-ID so the
+  // proxy cannot derive a workspace callerID. This is the only way to produce
+  // the source_id NULL rows that the source=canvas endpoint keys on.
+
   const res = await fetch(`${PLATFORM_URL}/workspaces/${workspaceId}/a2a`, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${token}`,
-    },
+    headers,
     body: JSON.stringify({
       method: "message/send",
       params: {
@@ -68,6 +81,23 @@ async function postA2AMessage(workspaceId: string, token: string, text: string) 
   if (!res.ok) {
     throw new Error(`A2A post failed: ${res.status} ${await res.text()}`);
   }
+}
+
+/** Extract the text payload from an activity_logs request_body envelope. */
+function requestBodyText(reqBody: unknown): string {
+  if (typeof reqBody !== "object" || reqBody === null) return "";
+  const params = (reqBody as Record<string, unknown>).params;
+  if (typeof params !== "object" || params === null) return "";
+  const message = (params as Record<string, unknown>).message;
+  if (typeof message !== "object" || message === null) return "";
+  const parts = (message as Record<string, unknown>).parts;
+  if (!Array.isArray(parts)) return "";
+  for (const part of parts) {
+    if (typeof part === "object" && part !== null && typeof (part as Record<string, unknown>).text === "string") {
+      return (part as Record<string, string>).text;
+    }
+  }
+  return "";
 }
 
 test.describe("Chat Sub-Tabs", () => {
@@ -159,23 +189,19 @@ test.describe("Activity API Source Filter", () => {
   let authToken = "";
 
   test.beforeAll(async () => {
-    if (!ADMIN_TOKEN) {
-      throw new Error(
-        "Activity source-filter tests require E2E_ADMIN_TOKEN or ADMIN_TOKEN to seed canvas-origin rows",
-      );
-    }
-
     const echo = await startEchoRuntime();
     const ws = await seedWorkspace(echo.baseURL);
     workspaceId = ws.id;
     authToken = ws.authToken;
     const stopHeartbeat = startHeartbeat(ws.id, ws.authToken);
 
-    // Seed BOTH source classes deterministically:
-    //  - admin/org token → callerID is empty → source_id NULL (canvas-origin).
-    //  - workspace token → callerID resolves to the workspace → source_id non-null (agent-origin).
-    await postA2AMessage(workspaceId, ADMIN_TOKEN, "canvas source probe");
-    await postA2AMessage(workspaceId, authToken, "agent source probe");
+    // Seed BOTH source classes deterministically through the real A2A proxy:
+    //  - canvas-source: no workspace-resolving auth → callerID empty →
+    //    source_id NULL (matches /activity?source=canvas).
+    //  - agent-source: workspace bearer token → callerID = workspace →
+    //    source_id = workspace_id (matches /activity?source=agent).
+    await postA2AMessage(workspaceId, "canvas", "canvas source probe", authToken);
+    await postA2AMessage(workspaceId, "agent", "agent source probe", authToken);
 
     cleanup = async () => {
       stopHeartbeat();
@@ -194,13 +220,19 @@ test.describe("Activity API Source Filter", () => {
       { headers: { Authorization: `Bearer ${authToken}` } },
     );
     expect(res.ok()).toBeTruthy();
-    const entries = (await res.json()) as Array<{ source_id: unknown }>;
+    const entries = (await res.json()) as Array<{
+      source_id: unknown;
+      request_body: unknown;
+    }>;
     expect(Array.isArray(entries)).toBeTruthy();
     // False-green guard: an empty array would make the loop below pass vacuously.
     expect(entries.length).toBeGreaterThan(0);
     for (const e of entries) {
       expect(e.source_id).toBeNull();
     }
+    // The seeded canvas probe must be present; if source separation broke and
+    // the canvas probe was logged as agent-sourced, this would fail.
+    expect(entries.some((e) => requestBodyText(e.request_body) === "canvas source probe")).toBe(true);
   });
 
   test("source=agent returns only agent-initiated entries", async ({ request }) => {
@@ -209,13 +241,19 @@ test.describe("Activity API Source Filter", () => {
       { headers: { Authorization: `Bearer ${authToken}` } },
     );
     expect(res.ok()).toBeTruthy();
-    const entries = (await res.json()) as Array<{ source_id: unknown }>;
+    const entries = (await res.json()) as Array<{
+      source_id: unknown;
+      request_body: unknown;
+    }>;
     expect(Array.isArray(entries)).toBeTruthy();
     // False-green guard: an empty array would make the loop below pass vacuously.
     expect(entries.length).toBeGreaterThan(0);
     for (const e of entries) {
       expect(e.source_id).not.toBeNull();
     }
+    // The seeded agent probe must be present; if source separation broke and
+    // the agent probe was logged as canvas-sourced, this would fail.
+    expect(entries.some((e) => requestBodyText(e.request_body) === "agent source probe")).toBe(true);
   });
 
   test("source=invalid returns 400", async ({ request }) => {
@@ -226,7 +264,7 @@ test.describe("Activity API Source Filter", () => {
     expect(res.status()).toBe(400);
   });
 
-  test("source+type filters combine correctly", async ({ request }) => {
+  test("source+type filters combine correctly (canvas)", async ({ request }) => {
     const res = await request.get(
       `${API}/workspaces/${workspaceId}/activity?type=a2a_receive&source=canvas`,
       { headers: { Authorization: `Bearer ${authToken}` } },
@@ -235,6 +273,7 @@ test.describe("Activity API Source Filter", () => {
     const entries = (await res.json()) as Array<{
       activity_type: string;
       source_id: unknown;
+      request_body: unknown;
     }>;
     expect(Array.isArray(entries)).toBeTruthy();
     // False-green guard: an empty array would make the loop below pass vacuously.
@@ -243,6 +282,28 @@ test.describe("Activity API Source Filter", () => {
       expect(e.activity_type).toBe("a2a_receive");
       expect(e.source_id).toBeNull();
     }
+    expect(entries.some((e) => requestBodyText(e.request_body) === "canvas source probe")).toBe(true);
+  });
+
+  test("source+type filters combine correctly (agent)", async ({ request }) => {
+    const res = await request.get(
+      `${API}/workspaces/${workspaceId}/activity?type=a2a_receive&source=agent`,
+      { headers: { Authorization: `Bearer ${authToken}` } },
+    );
+    expect(res.ok()).toBeTruthy();
+    const entries = (await res.json()) as Array<{
+      activity_type: string;
+      source_id: unknown;
+      request_body: unknown;
+    }>;
+    expect(Array.isArray(entries)).toBeTruthy();
+    // False-green guard: an empty array would make the loop below pass vacuously.
+    expect(entries.length).toBeGreaterThan(0);
+    for (const e of entries) {
+      expect(e.activity_type).toBe("a2a_receive");
+      expect(e.source_id).not.toBeNull();
+    }
+    expect(entries.some((e) => requestBodyText(e.request_body) === "agent source probe")).toBe(true);
   });
 });
 
