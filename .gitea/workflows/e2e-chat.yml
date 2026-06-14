@@ -124,12 +124,10 @@ jobs:
     #       renamed/moved spec or stray test.only can no longer green the lane.
     #     - REQUIRE-LIVE guard in "Run Playwright E2E tests" → chat==true must
     #       actually execute >=1 test, else exit 1.
+    #     - chat-desktop.spec.ts asserts echo-runtime.lastRequest after each
+    #       round-trip, so an optimistic client-side render cannot pass without
+    #       a real A2A request reaching the server (core#2796 follow-up).
     #   STILL BLOCKS PROMOTION:
-    #     - The echo round-trip asserts on rendered "Echo: ..." text but never
-    #       asserts the echo runtime actually RECEIVED the A2A request
-    #       (fixtures/echo-runtime.ts exposes lastRequest, unused) — an
-    #       optimistic client-side render could pass without a real round-trip.
-    #       Add a server-received assertion before required.
     #     - The "No-op pass" path (detect-changes chat!=true) is a legitimate
     #       paths-filter skip, but a required gate needs it to be a neutral
     #       check, not a green "success", so a skipped heavy lane can't be

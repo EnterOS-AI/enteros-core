@@ -1,6 +1,6 @@
 import { test, expect } from "@playwright/test";
 import type { Page } from "@playwright/test";
-import { startEchoRuntime } from "./fixtures/echo-runtime";
+import { startEchoRuntime, type EchoRuntime } from "./fixtures/echo-runtime";
 import { seedWorkspace, startHeartbeat, cleanupWorkspace, runPsql } from "./fixtures/chat-seed";
 
 /** Enter the Org-map view so the Canvas (React Flow graph) mounts. */
@@ -14,17 +14,18 @@ test.describe("Desktop ChatTab", () => {
   let cleanup: () => Promise<void> = async () => {};
   let workspaceId = "";
   let workspaceName = "";
+  let echoRuntime: EchoRuntime;
 
   test.beforeAll(async () => {
-    const echo = await startEchoRuntime();
-    const ws = await seedWorkspace(echo.baseURL);
+    echoRuntime = await startEchoRuntime();
+    const ws = await seedWorkspace(echoRuntime.baseURL);
     workspaceId = ws.id;
     workspaceName = ws.name;
     const stopHeartbeat = startHeartbeat(ws.id, ws.authToken);
 
     cleanup = async () => {
       stopHeartbeat();
-      await echo.stop();
+      await echoRuntime.stop();
     };
   });
 
@@ -86,6 +87,11 @@ test.describe("Desktop ChatTab", () => {
 
     await expect(chat.getByText("What is the weather?", { exact: true })).toBeVisible({ timeout: 5_000 });
     await expect(chat.getByText("Echo: What is the weather?")).toBeVisible({ timeout: 15_000 });
+
+    // Regression guard: assert the echo runtime actually RECEIVED the A2A
+    // request, not just that the UI rendered something that looks like an echo.
+    expect(echoRuntime.lastRequest).not.toBeNull();
+    expect(echoRuntime.lastRequest!.text).toBe("What is the weather?");
   });
 
   test("history persists across reload", async ({ page }) => {
@@ -95,6 +101,10 @@ test.describe("Desktop ChatTab", () => {
     await page.getByRole("button", { name: /Send/ }).first().click();
 
     await expect(chat.getByText("Echo: Persistence test")).toBeVisible({ timeout: 15_000 });
+
+    // Confirm the round-trip reached the echo runtime before reloading.
+    expect(echoRuntime.lastRequest).not.toBeNull();
+    expect(echoRuntime.lastRequest!.text).toBe("Persistence test");
 
     await page.reload();
     await enterMapView(page);
@@ -126,6 +136,11 @@ test.describe("Desktop ChatTab", () => {
     await page.getByRole("button", { name: /Send/ }).first().click();
 
     await expect(chat.getByText("Echo: Please read this file")).toBeVisible({ timeout: 15_000 });
+
+    // Confirm the file payload reached the echo runtime, not just the UI.
+    expect(echoRuntime.lastRequest).not.toBeNull();
+    expect(echoRuntime.lastRequest!.text).toBe("Please read this file");
+    expect(echoRuntime.lastRequest!.files).toHaveLength(1);
   });
 });
 
@@ -133,17 +148,18 @@ test.describe("Desktop ChatTab — Markdown rendering", () => {
   let cleanup: () => Promise<void> = async () => {};
   let workspaceId = "";
   let workspaceName = "";
+  let echoRuntime: EchoRuntime;
 
   test.beforeAll(async () => {
-    const echo = await startEchoRuntime();
-    const ws = await seedWorkspace(echo.baseURL);
+    echoRuntime = await startEchoRuntime();
+    const ws = await seedWorkspace(echoRuntime.baseURL);
     workspaceId = ws.id;
     workspaceName = ws.name;
     const stopHeartbeat = startHeartbeat(ws.id, ws.authToken);
 
     cleanup = async () => {
       stopHeartbeat();
-      await echo.stop();
+      await echoRuntime.stop();
     };
   });
 
