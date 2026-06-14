@@ -366,33 +366,17 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
           { timeoutMs: 30 * 60 * 1000 },
         )
         .then((resp) => {
-          // core#2725: only process the reply that belongs to this token.
-          // If the token is neither in-flight nor pending-WS, it has already
-          // been finished or superseded — drop it to avoid misrouted replies
-          // / duplicates.
-          if (
-            !inFlightTokensRef.current.has(myToken) &&
-            !pendingWSTokensRef.current.has(myToken)
-          ) return;
-
-          // Task #227 — poll-mode (external/MCP workspace) queued-200
-          // short-circuit. ws-server's `proxyA2ARequest` returns
-          // `{status:"queued", delivery_mode:"poll", ...}` immediately
-          // when the target has no URL (delivery_mode=poll), BEFORE the
-          // agent has produced any reply. There is no `result.parts`
-          // payload here — the actual reply will arrive separately via
-          // the AGENT_MESSAGE WebSocket event after the agent's next
-          // `wait_for_message` poll.
-          //
-          // Keep the spinner up by moving the token to the WS-pending set;
-          // releaseSendGuards will prune it when the AGENT_MESSAGE lands
-          // (handled by useChatSocket `onAgentMessage`/`onSendComplete`)
-          // or an explicit error fires (`onSendError` from an
-          // ACTIVITY_LOGGED status="error"). Don't synthesise an empty
-          // agent bubble.
+          // Poll-mode queued short-circuit (external/MCP workspace): the
+          // server returns `{status:"queued"}` immediately and the real reply
+          // arrives later via the AGENT_MESSAGE WebSocket event.
           if (resp?.status === "queued") {
-            // If WS already completed for this token via the legacy fallback
-            // path, finish immediately instead of re-pending forever.
+            if (
+              !inFlightTokensRef.current.has(myToken) &&
+              !pendingWSTokensRef.current.has(myToken)
+            ) {
+              // Already finished by a WS event (legacy fallback raced ahead).
+              return;
+            }
             if (wsCompletedTokensRef.current.has(myToken)) {
               finishSendToken(myToken);
             } else {
@@ -401,6 +385,14 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
             return;
           }
 
+          // Push-mode synchronous reply: process the agent message even if a
+          // WebSocket completion event (ACTIVITY_LOGGED or AGENT_MESSAGE)
+          // already finished this token. Without this, a fast echo/reply that
+          // triggers a WS completion before the HTTP 200 lands would have its
+          // token removed here and the reply bubble would never render
+          // (core#2786 / #2759). Token cleanup is idempotent; ChatTab's
+          // message dedup handles the rare case where both paths carry the
+          // same content.
           const replyText = extractReplyText(resp);
           const replyFiles = extractFilesFromTask(
             (resp?.result ?? {}) as Record<string, unknown>,

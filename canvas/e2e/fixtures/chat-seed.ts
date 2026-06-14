@@ -21,7 +21,7 @@ interface PgCredentials {
   db: string;
 }
 
-function parseDbUrl(): PgCredentials | null {
+export function parseDbUrl(): PgCredentials | null {
   const dbUrl = process.env.E2E_DATABASE_URL;
   if (!dbUrl) return null;
   const pgRegex = /postgres:\/\/([^:]+):([^@]+)@([^:]+):(\d+)\/([^?]+)/;
@@ -31,13 +31,13 @@ function parseDbUrl(): PgCredentials | null {
   return { user, pass, host, port, db };
 }
 
-function runPsql(sql: string, timeoutMs = 30_000): void {
+export function runPsql(sql: string, timeoutMs = 30_000): string {
   const creds = parseDbUrl();
   if (!creds) {
     throw new Error("E2E_DATABASE_URL must be set for DB seeding");
   }
   const { user, pass, host, port, db } = creds;
-  execFileSync(
+  const out = execFileSync(
     "psql",
     ["-h", host, "-p", port, "-U", user, "-d", db, "-c", sql],
     {
@@ -46,6 +46,7 @@ function runPsql(sql: string, timeoutMs = 30_000): void {
       timeout: timeoutMs,
     },
   );
+  return out.toString();
 }
 
 export interface SeededWorkspace {
@@ -75,6 +76,7 @@ export async function seedWorkspace(echoURL: string): Promise<SeededWorkspace> {
       external: true,
       runtime: "external",
       url: echoURL,
+      delivery_mode: "push",
     }),
   });
   if (!createRes.ok) {
