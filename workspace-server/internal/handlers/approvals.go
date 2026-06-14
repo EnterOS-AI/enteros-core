@@ -84,17 +84,10 @@ func (h *ApprovalsHandler) Create(c *gin.Context) {
 
 // ListAll handles GET /approvals/pending
 // Returns all pending approvals across all workspaces (for canvas polling).
-// Auto-expires approvals older than 10 minutes.
+// Approvals are long-lived until the user Decides or the requesting workspace
+// withdraws them; there is no time-based auto-expiry (CTO directive).
 func (h *ApprovalsHandler) ListAll(c *gin.Context) {
 	ctx := c.Request.Context()
-
-	// Auto-expire stale approvals (older than 10 min)
-	if _, err := db.DB.ExecContext(ctx, `
-		UPDATE approval_requests SET status = 'denied', decided_by = 'auto-expired', decided_at = now()
-		WHERE status = 'pending' AND created_at < now() - interval '10 minutes'
-	`); err != nil {
-		log.Printf("approvals: auto-expire failed: %v", err)
-	}
 
 	rows, err := db.DB.QueryContext(ctx, `
 		SELECT a.id, a.workspace_id, w.name, a.action, a.reason, a.status, a.created_at
