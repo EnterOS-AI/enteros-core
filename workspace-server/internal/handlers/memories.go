@@ -32,7 +32,9 @@ type secretPatternEntry struct {
 // env-var assignments (OPENAI_API_KEY=sk-...) are caught before the generic
 // sk-* or base64 patterns consume only part of the match.
 //
-// Covered by SAFE-T1201 (issue #838).
+// Covered by SAFE-T1201 (issue #838). Extended by issue #2832 to cover raw
+// tokens pasted without an env-var wrapper, DATABASE_URL with embedded
+// credentials, and PEM-encoded private keys.
 var memorySecretPatterns = []secretPatternEntry{
 	// Env-var assignments:  ANTHROPIC_API_KEY=sk-ant-...  GITHUB_TOKEN=ghp_...
 	{regexp.MustCompile(`(?i)\b[A-Z][A-Z0-9_]*_API_KEY\s*=\s*\S+`), "API_KEY"},
@@ -40,6 +42,40 @@ var memorySecretPatterns = []secretPatternEntry{
 	{regexp.MustCompile(`(?i)\b[A-Z][A-Z0-9_]*_SECRET\s*=\s*\S+`), "SECRET"},
 	// HTTP Bearer header values
 	{regexp.MustCompile(`Bearer\s+\S+`), "BEARER_TOKEN"},
+	// PEM-encoded private keys (OPENSSH / RSA / EC / DSA / generic).
+	// OPENSSH is the most specific, so check it FIRST; the generic
+	// "PRIVATE KEY" pattern below also matches the OPENSSH header
+	// (the `[ A-Z]+` char class allows the space in "OPENSSH PRIVATE
+	// KEY"), so ordering matters — the OPENSSH-specific label wins
+	// because it matches first.
+	{regexp.MustCompile(`-----BEGIN OPENSSH PRIVATE KEY-----[\s\S]*?-----END OPENSSH PRIVATE KEY-----`), "OPENSSH_PRIVATE_KEY"},
+	{regexp.MustCompile(`-----BEGIN[ A-Z]+PRIVATE KEY-----[\s\S]*?-----END[ A-Z]+PRIVATE KEY-----`), "PRIVATE_KEY"},
+	// DATABASE_URL with embedded credentials:
+	//   postgres://user:pass@host:5432/db
+	//   postgresql://user:pass@host/db?sslmode=require
+	//   mysql://user:pass@host:3306/db
+	//   mongodb://user:pass@host:27017/db
+	//   mongodb+srv://user:pass@cluster/db
+	//   redis://:pass@host:6379/0          ← user part may be EMPTY
+	//     (Redis URLs omit the username when only an AUTH password is set)
+	// The credential segment is the part between `://` and `@`. The
+	// user part is optional (Redis can pass a bare password); the
+	// password part is required. The scheme allowlist keeps the
+	// regex from over-matching arbitrary `user:pass@` substrings in
+	// prose.
+	{regexp.MustCompile(`(?i)\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp|amqps)://(?:[^\s/@:]*:[^\s/@]+)@[^\s/]+`), "DB_URL_WITH_CREDENTIALS"},
+	// Raw GitHub / Vercel / AWS / Perplexity tokens — pasted in chat
+	// without an env-var wrapper. Each prefix is provider-specific and
+	// well-known; matching the prefix + 16+ chars of base64-ish body
+	// keeps false-positives low.
+	{regexp.MustCompile(`\bghp_[A-Za-z0-9]{16,}`), "GITHUB_PAT"},
+	{regexp.MustCompile(`\bghs_[A-Za-z0-9]{16,}`), "GITHUB_OAUTH"},
+	{regexp.MustCompile(`\bghu_[A-Za-z0-9]{16,}`), "GITHUB_USER_TOKEN"},
+	{regexp.MustCompile(`\bghr_[A-Za-z0-9]{16,}`), "GITHUB_REFRESH_TOKEN"},
+	{regexp.MustCompile(`\bgithub_pat_[A-Za-z0-9_]{16,}`), "GITHUB_FINEGRAINED_PAT"},
+	{regexp.MustCompile(`\bvc_[A-Za-z0-9]{16,}`), "VERCEL_TOKEN"},
+	{regexp.MustCompile(`\bAKIA[A-Z0-9]{16}`), "AWS_ACCESS_KEY_ID"},
+	{regexp.MustCompile(`\bpplx-[A-Za-z0-9]{20,}`), "PERPLEXITY_API_KEY"},
 	// OpenAI / Anthropic sk-... key format
 	{regexp.MustCompile(`sk-[A-Za-z0-9\-_]{16,}`), "SK_TOKEN"},
 	// context7 tokens
