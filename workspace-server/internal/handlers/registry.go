@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -20,6 +21,30 @@ import (
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wsauth"
 	"github.com/gin-gonic/gin"
 )
+
+// isProvisionerHostPortURL reports whether u is a loopback URL with a port
+// other than 8000. Such URLs are written by the provisioner (via
+// MOLECULE_WORKSPACE_URL) and should be preserved across runtime registrations.
+// The 8000 fallback is the runtime's own default and is allowed to be
+// overwritten.
+func isProvisionerHostPortURL(u string) bool {
+	if u == "" {
+		return false
+	}
+	if !strings.HasPrefix(u, "http://127.0.0.1:") && !strings.HasPrefix(u, "http://localhost:") {
+		return false
+	}
+	// Extract the trailing port.
+	port := u[strings.LastIndex(u, ":")+1:]
+	if port == "" {
+		return false
+	}
+	n, err := strconv.Atoi(port)
+	if err != nil {
+		return false
+	}
+	return n != 8000
+}
 
 // blockedRange is a named CIDR block so the conditional blocklist in
 // validateAgentURL reads as a slice of homogeneous values instead of
@@ -578,8 +603,33 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 		INSERT INTO workspaces (id, name, url, agent_card, status, last_heartbeat_at, delivery_mode, kind)
 		VALUES ($1, $2, $3, $4::jsonb, 'online', now(), $5, COALESCE(NULLIF($6, ''), 'workspace'))
 		ON CONFLICT (id) DO UPDATE SET
+			-- Preserve the provisioner-set host-port URL. The provisioner
+			-- injects MOLECULE_WORKSPACE_URL=<host-port> into the container
+			-- env (buildStartWorkspaceEnv in workspace-server), so the
+			-- runtime should register that same URL. The runtime's
+			-- resolve_workspace_url honors MOLECULE_WORKSPACE_URL at highest
+			-- precedence, so when the env propagation is correct, the
+			-- runtime's URL == provisioner's URL. When env propagation is
+			-- broken (real-image lifecycle E2E gap that bit 3 rounds
+			-- running), the runtime falls back to http://HOSTNAME:8000
+			-- — the port 8000 makes it distinguishable from the
+			-- provisioner's host-port (typically >30000). Preserve the
+			-- provisioner's URL when its port != 8000.
+			--
+			-- Researcher #11798: round-3 fix changed the provisioner
+			-- from http://127.0.0.1 to http://localhost (the
+			-- workspaceAdvertiseURL default), but the Register handler
+			-- only matched the legacy 127.0.0.1 prefix, so the upsert
+			-- overwrote the provisioner's URL with the runtime's 8000
+			-- fallback. Generalize to match any host-prefixed
+			-- host-port URL whose port != 8000.
 			url = CASE
-				WHEN workspaces.url LIKE 'http://127.0.0.1%' THEN workspaces.url
+				WHEN workspaces.url IS NOT NULL
+				     AND workspaces.url != ''
+				     AND (workspaces.url LIKE 'http://127.0.0.1:%'
+				          OR workspaces.url LIKE 'http://localhost:%')
+				     AND CAST(substring(workspaces.url FROM ':([0-9]+)$') AS int) <> 8000
+				THEN workspaces.url
 				ELSE EXCLUDED.url
 			END,
 			agent_card = EXCLUDED.agent_card,
@@ -617,7 +667,7 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 	cachedURL := effectiveURL
 	var dbURL string
 	if err := db.DB.QueryRowContext(ctx, `SELECT url FROM workspaces WHERE id = $1`, payload.ID).Scan(&dbURL); err == nil {
-		if strings.HasPrefix(dbURL, "http://127.0.0.1") {
+		if isProvisionerHostPortURL(dbURL) {
 			cachedURL = dbURL
 		}
 	}

@@ -522,10 +522,12 @@ done
 if [ -n "$RUN" ]; then pass "container running: $RUN"; else fail "no running ws-${WSID} container within 10s of online" "docker ps shows none"; fi
 
 # #2851: fail fast if the workspace advertised an unresolvable/unreachable URL.
-# The provisioner now makes the runtime advertise http://localhost:<host-port>,
-# which the platform stores as http://127.0.0.1:<host-port>. The A2A proxy
-# rewrites that to ws-<id>:8000 when the platform runs inside Docker, so the
-# URL stored in the registry should always be a host-reachable loopback address.
+# The provisioner now makes the runtime advertise http://localhost:<host-port>
+# by default, which the platform stores as http://127.0.0.1:<host-port>. The A2A
+# proxy rewrites that to ws-<id>:8000 when the platform runs inside Docker, so
+# the URL stored in the registry should always be a host-reachable address.
+# When the platform itself is containerized, MOLECULE_WORKSPACE_ADVERTISE_HOST
+# points the runtime at the Docker gateway IP instead; accept that too.
 # (The end-to-end proxy reach in Step 5 is the real reachability proof; this
 # assertion just surfaces hostname/DNS misconfiguration early.)
 WS_URL_AFTER=$(ws_field "$WS" "url")
@@ -534,10 +536,13 @@ if [ -n "$WS_URL_AFTER" ]; then
 else
   fail "workspace URL is empty after reaching online" "registry row has no url"
 fi
-if echo "$WS_URL_AFTER" | grep -qE '^https?://(127\.0\.0\.1|localhost):'; then
-  pass "workspace registered a host-reachable loopback URL"
+URL_HOST_AFTER="${WS_URL_AFTER#http://}"
+URL_HOST_AFTER="${URL_HOST_AFTER#https://}"
+URL_HOST_AFTER="${URL_HOST_AFTER%%:*}"
+if [ "$URL_HOST_AFTER" = "127.0.0.1" ] || [ "$URL_HOST_AFTER" = "localhost" ] || [ "$URL_HOST_AFTER" = "${PLATFORM_HOST_IP:-}" ]; then
+  pass "workspace registered a host-reachable URL (host=$URL_HOST_AFTER)"
 else
-  fail "workspace URL is not a host-reachable loopback address" "url=$WS_URL_AFTER"
+  fail "workspace URL is not a host-reachable address" "url=$WS_URL_AFTER expected localhost/127.0.0.1 or PLATFORM_HOST_IP=${PLATFORM_HOST_IP:-<unset>}"
 fi
 echo ""
 

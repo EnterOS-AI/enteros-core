@@ -324,13 +324,13 @@ jobs:
       # even if the runner's $GITHUB_ENV propagation is flaky (#2468 RCA).
       MOLECULE_ENV: development
       SECRETS_ENCRYPTION_KEY: lpe2e-test-encryption-key-32bytes!!
-      # #2851: the provisioner now makes the workspace advertise http://localhost:<host-port>.
-      # When the platform itself runs inside Docker, the A2A proxy rewrites the
-      # stored http://127.0.0.1:<host-port> URL to ws-<id>:8000, so keep the job
-      # container on molecule-core-net and Docker-aware mode so that Docker-DNS
-      # name resolves. Dev mode already relaxes private-range SSRF checks, so SaaS
-      # deploy mode is no longer required.
-      MOLECULE_IN_DOCKER: true
+      # #2851 fix follow-up: act_runner executes this job container in host-network
+      # mode, so the platform process shares the host's loopback. The A2A proxy
+      # must therefore keep the stored http://127.0.0.1:<host-port> URL as-is;
+      # enabling Docker-aware rewrite would synthesize ws-<id>:8000, which the
+      # host-network platform cannot resolve. Leave MOLECULE_IN_DOCKER=false so
+      # the proxy uses the host-mapped port directly (same as lifecycle-stub).
+      MOLECULE_IN_DOCKER: false
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
@@ -356,14 +356,10 @@ jobs:
           # uses for token-write helper containers.
           docker pull alpine:3.20@sha256:c64c687cbea9300178b30c95835354e34c4e4febc4badfe27102879de0483b5e >/dev/null
           docker network create molecule-core-net >/dev/null 2>&1 || true
-          # #2851: connect the act_runner job container to molecule-core-net so the
-          # platform process can resolve ws-<id>:8000 workspace URLs.
-          JOB_CID="$(hostname)"
-          if docker network connect molecule-core-net "$JOB_CID" >/dev/null 2>&1; then
-            echo "Connected job container ($JOB_CID) to molecule-core-net."
-          else
-            echo "WARN: could not connect job container to molecule-core-net (already connected or fallback)."
-          fi
+          # Workspace containers join molecule-core-net. The act_runner job
+          # container runs host-network, so connecting it to the bridge is not
+          # possible, but the bridge itself must exist for sibling workspace
+          # containers to communicate.
 
       - name: Start Postgres (docker, ephemeral host port)
         run: |
@@ -424,6 +420,11 @@ jobs:
           fi
           echo "PLATFORM_HOST_IP=${PLATFORM_HOST_IP}"
           echo "PLATFORM_URL=http://${PLATFORM_HOST_IP}:${PORT}" >> "$GITHUB_ENV"
+          # The workspace advertises localhost:<host-port> (the default when
+          # MOLECULE_WORKSPACE_ADVERTISE_HOST is unset). Because this job runs
+          # host-network, the platform reaches the container via 127.0.0.1; no
+          # gateway-IP advertisement is needed here and keeping it unset lets
+          # /registry/register accept the localhost URL.
           T="lpe2e-real-admin-${{ github.run_id }}-${{ github.run_attempt }}"
           echo "ADMIN_TOKEN=${T}" >> "$GITHUB_ENV"
           echo "MOLECULE_ADMIN_TOKEN=${T}" >> "$GITHUB_ENV"
