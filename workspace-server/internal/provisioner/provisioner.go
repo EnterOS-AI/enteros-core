@@ -561,8 +561,18 @@ func allocateHostPort() (string, error) {
 // handler layer then stores the equivalent http://127.0.0.1:<port> URL and
 // the A2A proxy rewrites it to ws-<id>:8000 when the platform itself runs
 // inside Docker.
+//
+// #2851 follow-up: when the platform also runs inside a container, the
+// workspace must advertise the Docker host/gateway IP (PLATFORM_HOST_IP) so
+// the platform container can reach the host-mapped workspace port. The
+// operator sets MOLECULE_WORKSPACE_ADVERTISE_HOST to override the default
+// "localhost".
 func workspaceAdvertiseURL(hostPort string) string {
-	return fmt.Sprintf("http://localhost:%s", hostPort)
+	host := os.Getenv("MOLECULE_WORKSPACE_ADVERTISE_HOST")
+	if host == "" {
+		host = "localhost"
+	}
+	return fmt.Sprintf("http://%s:%s", host, hostPort)
 }
 
 // Start provisions and starts a workspace container.
@@ -595,10 +605,12 @@ func (p *Provisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string, e
 	}
 	log.Printf("Provisioner: config volume %s ready", configVolume)
 
-	// #2851: tell the runtime exactly which URL to advertise. localhost is
-	// accepted by registry validateAgentURL; the handler layer then stores the
-	// equivalent http://127.0.0.1:<port> URL and the A2A proxy rewrites it to
-	// ws-<id>:8000 when the platform itself runs inside Docker.
+	// #2851: tell the runtime exactly which URL to advertise. The default
+	// "localhost" is accepted by registry validateAgentURL; the handler layer
+	// then stores the equivalent http://127.0.0.1:<port> URL and the A2A proxy
+	// rewrites it to ws-<id>:8000 when the platform itself runs inside Docker.
+	// When the platform is also containerized, MOLECULE_WORKSPACE_ADVERTISE_HOST
+	// points the runtime at the Docker host/gateway IP instead.
 	advertiseURL := workspaceAdvertiseURL(hostPort)
 	env := append(buildContainerEnv(cfg), fmt.Sprintf("MOLECULE_WORKSPACE_URL=%s", advertiseURL))
 

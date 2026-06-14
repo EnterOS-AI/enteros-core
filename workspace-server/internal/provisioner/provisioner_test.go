@@ -1669,9 +1669,29 @@ func TestAllocateHostPort(t *testing.T) {
 }
 
 func TestWorkspaceAdvertiseURL(t *testing.T) {
-	got := workspaceAdvertiseURL("12345")
-	want := "http://localhost:12345"
-	if got != want {
-		t.Errorf("workspaceAdvertiseURL = %q, want %q", got, want)
-	}
+	t.Run("default localhost", func(t *testing.T) {
+		got := workspaceAdvertiseURL("12345")
+		want := "http://localhost:12345"
+		if got != want {
+			t.Errorf("workspaceAdvertiseURL = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("MOLECULE_WORKSPACE_ADVERTISE_HOST override", func(t *testing.T) {
+		t.Setenv("MOLECULE_WORKSPACE_ADVERTISE_HOST", "192.168.1.100")
+		got := workspaceAdvertiseURL("12345")
+		want := "http://192.168.1.100:12345"
+		if got != want {
+			t.Errorf("workspaceAdvertiseURL = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("empty env defaults to localhost", func(t *testing.T) {
+		t.Setenv("MOLECULE_WORKSPACE_ADVERTISE_HOST", "")
+		got := workspaceAdvertiseURL("12345")
+		want := "http://localhost:12345"
+		if got != want {
+			t.Errorf("workspaceAdvertiseURL = %q, want %q", got, want)
+		}
+	})
 }

@@ -424,6 +424,12 @@ jobs:
           fi
           echo "PLATFORM_HOST_IP=${PLATFORM_HOST_IP}"
           echo "PLATFORM_URL=http://${PLATFORM_HOST_IP}:${PORT}" >> "$GITHUB_ENV"
+          # #2851: the platform itself runs inside this act_runner container, so
+          # the workspace must advertise the Docker host/gateway IP — not
+          # localhost — for the platform container to reach the host-mapped
+          # workspace port. The provisioner reads this env var and injects it
+          # as MOLECULE_WORKSPACE_URL.
+          echo "MOLECULE_WORKSPACE_ADVERTISE_HOST=${PLATFORM_HOST_IP}" >> "$GITHUB_ENV"
           T="lpe2e-real-admin-${{ github.run_id }}-${{ github.run_attempt }}"
           echo "ADMIN_TOKEN=${T}" >> "$GITHUB_ENV"
           echo "MOLECULE_ADMIN_TOKEN=${T}" >> "$GITHUB_ENV"
