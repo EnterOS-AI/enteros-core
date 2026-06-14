@@ -52,6 +52,10 @@ concurrency:
 
 env:
   GITHUB_SERVER_URL: https://git.moleculesai.app
+  # #2520: GCP-class runners (e2-standard-8, shared Intel) boot the platform
+  # ~33% slower than AMD/dedicated runners. Keep the default generous so a
+  # slow provisioner/image-pull does not false-positive as a platform failure.
+  PLATFORM_BOOT_DEADLINE: 480
 
 jobs:
   # ===========================================================================
@@ -237,7 +241,7 @@ jobs:
 
       - name: Wait for /health (+ migrations applied)
         run: |
-          DEADLINE=300; PID="$(cat workspace-server/platform.pid 2>/dev/null || true)"; start=$(date +%s)
+          DEADLINE=${PLATFORM_BOOT_DEADLINE:-300}; PID="$(cat workspace-server/platform.pid 2>/dev/null || true)"; start=$(date +%s)
           while :; do
             # Verify OUR server is still alive before trusting /health. Our server
             # binds the allocated port or exits FATAL, so "our PID alive" <=>
@@ -457,7 +461,7 @@ jobs:
 
       - name: Wait for /health (+ migrations applied)
         run: |
-          DEADLINE=300; PID="$(cat workspace-server/platform.pid 2>/dev/null || true)"; start=$(date +%s)
+          DEADLINE=${PLATFORM_BOOT_DEADLINE:-300}; PID="$(cat workspace-server/platform.pid 2>/dev/null || true)"; start=$(date +%s)
           while :; do
             # Verify OUR server is still alive before trusting /health. Our server
             # binds the allocated port or exits FATAL, so checking our PID first
