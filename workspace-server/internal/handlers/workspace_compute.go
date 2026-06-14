@@ -403,6 +403,7 @@ type computeProviderMetadata struct {
 	ID              string   `json:"id"`
 	Label           string   `json:"label"`
 	DefaultInstance string   `json:"default_instance"`
+	DisplayDefault  string   `json:"display_default"`
 	Instances       []string `json:"instances"`
 }
 
@@ -442,11 +443,13 @@ func ComputeMetadata(c *gin.Context) {
 		// endpoint to surface that as a panic at boot, not as
 		// a silent empty render.
 		defaultInstance := workspaceComputeDefaultInstanceByProvider[id]
+		displayDefault := workspaceComputeDisplayDefaultByProvider[id]
 		instances := workspaceComputeInstanceTypesOrdered[id]
 		providers = append(providers, computeProviderMetadata{
 			ID:              id,
 			Label:           label,
 			DefaultInstance: defaultInstance,
+			DisplayDefault:  displayDefault,
 			Instances:       instances,
 		})
 	}

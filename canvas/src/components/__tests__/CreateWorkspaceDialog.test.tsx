@@ -16,6 +16,32 @@ import { api } from "@/lib/api";
 const mockGet = vi.mocked(api.get);
 const mockPost = vi.mocked(api.post);
 
+const SAMPLE_COMPUTE_METADATA = {
+  providers: [
+    {
+      id: "aws",
+      label: "AWS (default)",
+      default_instance: "t3.medium",
+      display_default: "t3.xlarge",
+      instances: ["t3.medium", "t3.large", "t3.xlarge", "t3.2xlarge", "m6i.large", "m6i.xlarge", "c6i.xlarge"],
+    },
+    {
+      id: "hetzner",
+      label: "Hetzner",
+      default_instance: "cpx31",
+      display_default: "cpx41",
+      instances: ["cpx11", "cpx21", "cpx31", "cpx41", "cpx51", "cax11", "cax21", "cax31", "cax41"],
+    },
+    {
+      id: "gcp",
+      label: "GCP",
+      default_instance: "e2-standard-2",
+      display_default: "e2-standard-4",
+      instances: ["e2-small", "e2-medium", "e2-standard-2", "e2-standard-4", "e2-standard-8"],
+    },
+  ],
+};
+
 const SAMPLE_WORKSPACES = [
   { id: "ws-1", name: "Platform Team", tier: 1 },
   { id: "ws-2", name: "Research Agent", tier: 2 },
@@ -102,6 +128,10 @@ beforeEach(() => {
     if (url === "/templates") {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       return SAMPLE_TEMPLATES as any;
+    }
+    if (url === "/compute/metadata") {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      return SAMPLE_COMPUTE_METADATA as any;
     }
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     return SAMPLE_WORKSPACES as any;
@@ -288,6 +318,68 @@ describe("CreateWorkspaceDialog", () => {
     expect(body.llm_provider).toBe("platform");
     expect(body.compute).toEqual({
       instance_type: "t3.xlarge",
+      volume: { root_gb: 80 },
+      display: {
+        mode: "desktop-control",
+        protocol: "novnc",
+        width: 1920,
+        height: 1080,
+      },
+    });
+  });
+
+  it("drives display instance-type options from /compute/metadata SSOT", async () => {
+    await openDialog();
+    fireEvent.change(screen.getByPlaceholderText("e.g. SEO Agent"), {
+      target: { value: "Desktop Agent" },
+    });
+    fireEvent.click(screen.getByLabelText("Enable display"));
+
+    const instanceSelect = screen.getByLabelText("Instance") as HTMLSelectElement;
+    await waitFor(() => {
+      const optionValues = Array.from(instanceSelect.options).map((o) => o.value);
+      expect(optionValues).toEqual(SAMPLE_COMPUTE_METADATA.providers[0].instances);
+    });
+  });
+
+  it("consumes the SSOT display default instead of the in-bundle fallback", async () => {
+    // Override the /compute/metadata mock so AWS display_default differs from the
+    // bundled FALLBACK_COMPUTE_OPTIONS. This proves the dialog reads the live SSOT
+    // value and does not silently fall back to the offline bundle.
+    mockGet.mockImplementation(async (url: string) => {
+      if (url === "/compute/metadata") {
+        return {
+          providers: [
+            {
+              id: "aws",
+              label: "AWS (default)",
+              default_instance: "t3.medium",
+              display_default: "t3.2xlarge",
+              instances: ["t3.medium", "t3.large", "t3.xlarge", "t3.2xlarge"],
+            },
+          ],
+        };
+      }
+      if (url === "/templates") return SAMPLE_TEMPLATES as any;
+      return SAMPLE_WORKSPACES as any;
+    });
+
+    await openDialog();
+    fireEvent.change(screen.getByPlaceholderText("e.g. SEO Agent"), {
+      target: { value: "SSOT Display Agent" },
+    });
+    fireEvent.click(screen.getByLabelText("Enable display"));
+
+    const instanceSelect = screen.getByLabelText("Instance") as HTMLSelectElement;
+    await waitFor(() => expect(instanceSelect.value).toBe("t3.2xlarge"));
+
+    const createBtn = screen.getAllByRole("button").find((b) => b.textContent === "Create");
+    fireEvent.click(createBtn!);
+
+    await waitFor(() => expect(mockPost).toHaveBeenCalled());
+    const body = mockPost.mock.calls[0][1] as Record<string, unknown>;
+    expect(body.compute).toEqual({
+      instance_type: "t3.2xlarge",
       volume: { root_gb: 80 },
       display: {
         mode: "desktop-control",

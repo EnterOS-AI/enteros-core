@@ -846,12 +846,12 @@ func TestComputeMetadata_ReturnsProviderAllowlist(t *testing.T) {
 		t.Fatalf("expected 3 providers, got %d", len(resp.Providers))
 	}
 	want := []struct {
-		id, label, defaultInstance string
-		instanceCount              int
+		id, label, defaultInstance, displayDefault string
+		instanceCount                              int
 	}{
-		{"aws", "AWS (default)", "t3.medium", 7},
-		{"gcp", "GCP", "e2-standard-2", 5},
-		{"hetzner", "Hetzner", "cpx31", 9},
+		{"aws", "AWS (default)", "t3.medium", "t3.xlarge", 7},
+		{"gcp", "GCP", "e2-standard-2", "e2-standard-4", 5},
+		{"hetzner", "Hetzner", "cpx31", "cpx41", 9},
 	}
 	for i, w := range want {
 		p := resp.Providers[i]
@@ -863,6 +863,9 @@ func TestComputeMetadata_ReturnsProviderAllowlist(t *testing.T) {
 		}
 		if p.DefaultInstance != w.defaultInstance {
 			t.Errorf("providers[%d].default_instance = %q, want %q", i, p.DefaultInstance, w.defaultInstance)
+		}
+		if p.DisplayDefault != w.displayDefault {
+			t.Errorf("providers[%d].display_default = %q, want %q", i, p.DisplayDefault, w.displayDefault)
 		}
 		if len(p.Instances) != w.instanceCount {
 			t.Errorf("providers[%d].instances len = %d, want %d", i, len(p.Instances), w.instanceCount)

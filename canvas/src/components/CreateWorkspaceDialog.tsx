@@ -3,6 +3,15 @@
 import { useState, useEffect, useRef, useCallback, useId, useMemo } from "react";
 import * as Dialog from "@radix-ui/react-dialog";
 import { api } from "@/lib/api";
+import {
+  FALLBACK_COMPUTE_OPTIONS,
+  type ComputeOptions,
+  defaultInstanceForProvider,
+  displayDefaultForProvider,
+  instanceTypesForProvider,
+  parseComputeOptions,
+  providerLabel,
+} from "@/lib/compute-options";
 import { isSaaSTenant } from "@/lib/tenant";
 import { ExternalConnectModal, type ExternalConnectionInfo } from "./ExternalConnectModal";
 import {
@@ -57,19 +66,7 @@ const RUNTIME_OPTIONS = [
   { value: "openclaw", label: "OpenClaw" },
 ];
 const BASE_RUNTIME_TEMPLATE_IDS = new Set(["claude-code-default", "codex", "google-adk", "hermes", "openclaw"]);
-const DEFAULT_HEADLESS_INSTANCE_TYPE = "t3.medium";
 const DEFAULT_HEADLESS_ROOT_GB = 30;
-const DEFAULT_DISPLAY_INSTANCE_TYPE = "t3.xlarge";
-
-// Per-workspace cloud/compute backend (multi-provider RFC). "aws" is the default
-// EC2 path; "gcp"/"hetzner" route to the matching CP WorkspaceProvisioner. A
-// workspace whose cloud differs from its tenant's is reached over a per-workspace
-// Cloudflare tunnel (runtime#95). Distinct from the LLM/model provider.
-const CLOUD_PROVIDER_OPTIONS = [
-  { value: "aws", label: "AWS (default)" },
-  { value: "gcp", label: "GCP" },
-  { value: "hetzner", label: "Hetzner" },
-];
 const DEFAULT_DISPLAY_ROOT_GB = 80;
 
 export function CreateWorkspaceButton() {
@@ -84,19 +81,35 @@ export function CreateWorkspaceButton() {
   const [error, setError] = useState<string | null>(null);
   const [workspaces, setWorkspaces] = useState<WorkspaceOption[]>([]);
   const [displayEnabled, setDisplayEnabled] = useState(false);
-  const [displayInstanceType, setDisplayInstanceType] = useState(DEFAULT_DISPLAY_INSTANCE_TYPE);
+  const [displayInstanceType, setDisplayInstanceType] = useState(
+    displayDefaultForProvider(FALLBACK_COMPUTE_OPTIONS),
+  );
   const [displayRootGB, setDisplayRootGB] = useState(String(DEFAULT_DISPLAY_ROOT_GB));
   const [displayResolution, setDisplayResolution] = useState("1920x1080");
   // Cloud/compute backend for the workspace box (multi-provider, per-workspace).
   // "aws" default; "gcp"/"hetzner" route to the matching CP WorkspaceProvisioner
   // (a non-tenant-cloud box is reached over a per-workspace tunnel, runtime#95).
   const [cloudProvider, setCloudProvider] = useState("aws");
+  // SSOT provider + instance-type metadata from GET /compute/metadata. Starts from
+  // the offline fallback and is replaced once the fetch resolves; on fetch error we
+  // keep the fallback so the dialog stays usable.
+  const [computeOptions, setComputeOptions] = useState<ComputeOptions>(FALLBACK_COMPUTE_OPTIONS);
   // Templates fetched from /api/templates — drives the dynamic provider
   // filter below. Same data source ConfigTab uses (PR #2454). When the
   // selected template declares `runtime_config.providers` in its
   // config.yaml, the modal surfaces only those providers in the
   // <select>. Provider/model options are derived from template models.
   const [templateSpecs, setTemplateSpecs] = useState<TemplateSpec[]>([]);
+
+  // Keep the selected display instance type valid when the cloud provider or SSOT
+  // options change. If the current value is not offered for the provider, fall back
+  // to the provider's SSOT display default.
+  useEffect(() => {
+    const valid = instanceTypesForProvider(computeOptions, cloudProvider);
+    if (!valid.includes(displayInstanceType)) {
+      setDisplayInstanceType(displayDefaultForProvider(computeOptions, cloudProvider));
+    }
+  }, [cloudProvider, computeOptions, displayInstanceType]);
   // External-runtime path: skip docker provision, mint a workspace_auth_token,
   // and surface the connection snippet in a modal after create. When
   // isExternal is true the template and model fields are hidden (they're
@@ -277,13 +290,12 @@ export function CreateWorkspaceButton() {
     setBudgetLimit("");
     setError(null);
     setDisplayEnabled(false);
-    setDisplayInstanceType(DEFAULT_DISPLAY_INSTANCE_TYPE);
     setDisplayRootGB(String(DEFAULT_DISPLAY_ROOT_GB));
     setDisplayResolution("1920x1080");
-    setCloudProvider("aws");
     setExternalRuntime("external");
     setLLMSelection({ providerId: "", model: "", envVars: [] });
     setLLMSecret("");
+
     api
       .get<WorkspaceOption[]>("/workspaces")
       .then((ws) => setWorkspaces(ws))
@@ -292,6 +304,33 @@ export function CreateWorkspaceButton() {
       .get<TemplateSpec[]>("/templates")
       .then((rows) => setTemplateSpecs(Array.isArray(rows) ? rows : []))
       .catch(() => { /* keep empty; create stays blocked until the catalog loads */ });
+
+    // Load SSOT compute metadata, then reset provider + display defaults from it.
+    // We fetch fresh each time the dialog opens because the server SSOT can change
+    // without a page reload.
+    api
+      .get<unknown>("/compute/metadata")
+      .then((resp) => {
+        const parsed = parseComputeOptions(resp);
+        if (parsed) {
+          setComputeOptions(parsed);
+          const nextProvider = parsed.providers[0] ?? "aws";
+          setCloudProvider(nextProvider);
+          setDisplayInstanceType(displayDefaultForProvider(parsed, nextProvider));
+        } else {
+          resetToFallbackCompute();
+        }
+      })
+      .catch(() => {
+        resetToFallbackCompute();
+      });
+
+    function resetToFallbackCompute() {
+      setComputeOptions(FALLBACK_COMPUTE_OPTIONS);
+      setCloudProvider("aws");
+      setDisplayInstanceType(displayDefaultForProvider(FALLBACK_COMPUTE_OPTIONS));
+    }
+
     // defaultTier is stable for the session (derived from window.location),
     // safe to omit from deps.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -376,7 +415,7 @@ export function CreateWorkspaceButton() {
                     ...(isSaaS ? { provider: cloudProvider } : {}),
                   }
                 : {
-                    instance_type: DEFAULT_HEADLESS_INSTANCE_TYPE,
+                    instance_type: defaultInstanceForProvider(computeOptions, cloudProvider),
                     volume: { root_gb: DEFAULT_HEADLESS_ROOT_GB },
                     display: { mode: "none" },
                     ...(isSaaS ? { provider: cloudProvider } : {}),
@@ -631,9 +670,9 @@ export function CreateWorkspaceButton() {
                       onChange={(e) => setCloudProvider(e.target.value)}
                       className="w-full bg-surface-card/60 border border-line/50 rounded-lg px-3 py-2 text-sm text-ink focus:outline-none focus:border-accent/60 focus:ring-1 focus:ring-accent/20 transition-colors"
                     >
-                      {CLOUD_PROVIDER_OPTIONS.map((p) => (
-                        <option key={p.value} value={p.value}>
-                          {p.label}
+                      {computeOptions.providers.map((p) => (
+                        <option key={p} value={p}>
+                          {providerLabel(computeOptions, p)}
                         </option>
                       ))}
                     </select>
@@ -661,10 +700,11 @@ export function CreateWorkspaceButton() {
                         onChange={(e) => setDisplayInstanceType(e.target.value)}
                         className="w-full bg-surface-card/60 border border-line/50 rounded-lg px-2 py-2 text-xs text-ink focus:outline-none focus:border-accent/60 focus:ring-1 focus:ring-accent/20 transition-colors"
                       >
-                        <option value="t3.large">t3.large</option>
-                        <option value="t3.xlarge">t3.xlarge</option>
-                        <option value="m6i.xlarge">m6i.xlarge</option>
-                        <option value="c6i.xlarge">c6i.xlarge</option>
+                        {instanceTypesForProvider(computeOptions, cloudProvider).map((it) => (
+                          <option key={it} value={it}>
+                            {it}
+                          </option>
+                        ))}
                       </select>
                     </div>
                     <div>
