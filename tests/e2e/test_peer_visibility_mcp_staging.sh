@@ -108,7 +108,13 @@ fail() { echo "[$(date +%H:%M:%S)] ❌ $*" >&2; exit 1; }
 ok()   { echo "[$(date +%H:%M:%S)] ✅ $*"; }
 
 # SLUG construction runs after log/fail/ok so the assert can call `fail`.
-SLUG="e2e-pv-$(make_collision_proof_slug_suffix "${E2E_RUN_ID:-}")"
+# core#65: pass prefix_len=7 ("e2e-pv-") so the helper's run_id
+# budget is computed precisely against the CP's 31-char org-slug
+# cap (the prior 33-char slug like
+# `e2e-pv-20260614-364043-2-e560b630` was rejected by the CP
+# with HTTP 400 BEFORE the MCP call, breaking the
+# core-main "E2E Peer Visibility (push)" lane).
+SLUG="e2e-pv-$(make_collision_proof_slug_suffix "${E2E_RUN_ID:-}" 7)"
 assert_collision_proof_slug "$SLUG" || fail "Bug in make_collision_proof_slug: produced non-collision-proof slug '$SLUG'"
 
 admin_call() {

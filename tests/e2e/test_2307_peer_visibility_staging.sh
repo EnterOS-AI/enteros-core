@@ -33,7 +33,7 @@ ok()   { echo "[$(date +%H:%M:%S)] ✅ $*"; }
 # shellcheck source=lib/collision-proof-slug.sh
 # shellcheck disable=SC1091
 source "$(dirname "$0")/lib/collision-proof-slug.sh"
-SLUG="e2e-2307-$(make_collision_proof_slug_suffix "${E2E_RUN_ID:-}")"
+SLUG="e2e-2307-$(make_collision_proof_slug_suffix "${E2E_RUN_ID:-}" 8)"
 assert_collision_proof_slug "$SLUG" || fail "Bug in make_collision_proof_slug: produced non-collision-proof slug '$SLUG'"
 
 ORG_ID=""

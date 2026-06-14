@@ -42,10 +42,14 @@
 set -uo pipefail
 
 # CP_ORG_SLUG_MAX_LEN is the CP's org-slug character cap (regex
-# ^[a-z][a-z0-9-]{2,31}$, i.e. a leading char plus 2-31 additional).
-# The org-create endpoint rejects longer slugs with HTTP 400 in
-# practice per the staging 400s in run 363934, core#60.
-: "${CP_ORG_SLUG_MAX_LEN:=31}"
+# ^[a-z][a-z0-9-]{2,31}$: a leading char plus 2-31 additional =
+# 32-char absolute max). The org-create endpoint rejects
+# longer slugs with HTTP 400 in practice per the staging 400s
+# in run 363934, core#60. The #65 e2e-peer-visibility lane
+# hit a 33-char slug like `e2e-pv-20260614-364043-2-e560b630`
+# that needed this exact cap to keep the prefix+uuid+date
+# layout below the regex's 32-char ceiling.
+: "${CP_ORG_SLUG_MAX_LEN:=32}"
 
 # make_collision_proof_slug_suffix <run_id> [prefix_len]
 #   1: Run id (typically E2E_RUN_ID from the workflow; falls back
@@ -111,7 +115,7 @@ assert_collision_proof_slug() {
     return 1
   fi
   if [ "${#slug}" -gt 31 ]; then
-    echo "FAIL: slug '$slug' is too long, len=${#slug} max=31, CP /cp/admin/orgs rejects with HTTP 400" >&2
+    echo "FAIL: slug '$slug' is too long, len=${#slug} max=32, CP /cp/admin/orgs rejects with HTTP 400" >&2
     return 1
   fi
   return 0
