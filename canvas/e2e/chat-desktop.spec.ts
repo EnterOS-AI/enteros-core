@@ -122,18 +122,10 @@ test.describe("Desktop ChatTab", () => {
     await textarea.fill("Trigger activity");
     await page.getByRole("button", { name: /Send/ }).first().click();
 
-    // FALSE-GREEN FIX: the prior `.catch(() => {})` swallowed the assertion
-    // entirely, so this test passed whether or not the activity log ever
-    // rendered. The activity-log container is optional per layout, so we
-    // gate on its presence in the DOM: if it's not part of this layout,
-    // skip explicitly (a recorded skip, not a silent pass); if it IS
-    // present, it MUST become visible during the send flow — that's the
-    // behaviour this test exists to protect.
-    const activityLog = page.locator("[data-testid='activity-log']").first();
-    if ((await activityLog.count()) === 0) {
-      test.skip(true, "activity-log not part of this layout");
-      return;
-    }
+    // The activity log renders inline in the current ChatTab layout while the
+    // agent is thinking. It must become visible during the send flow and then
+    // clears once the response arrives.
+    const activityLog = page.locator("#panel-chat [data-testid='activity-log']").first();
     await expect(activityLog).toBeVisible({ timeout: 10_000 });
   });
 });
