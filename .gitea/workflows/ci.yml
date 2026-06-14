@@ -80,6 +80,7 @@ jobs:
       canvas: ${{ steps.check.outputs.canvas }}
       python: ${{ steps.check.outputs.python }}
       scripts: ${{ steps.check.outputs.scripts }}
+      debug: ${{ steps.check.outputs.debug }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -90,12 +91,23 @@ jobs:
           PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
           PUSH_BEFORE: ${{ github.event.before }}
         run: |
+          BASE_SHA="${PR_BASE_SHA:-$PUSH_BEFORE}"
           python3 .gitea/scripts/detect-changes.py \
             --profile ci \
             --event-name "${{ github.event_name }}" \
             --pr-base-sha "$PR_BASE_SHA" \
             --base-ref "$PR_BASE_REF" \
-            --push-before "${GITHUB_EVENT_BEFORE:-$PUSH_BEFORE}"
+            --push-before "${GITHUB_EVENT_BEFORE:-$PUSH_BEFORE}" || {
+            # Script crash / uncaught error: fail open so every CI profile
+            # runs rather than silently no-oping a potentially-breaking PR.
+            echo "platform=true" >> "$GITHUB_OUTPUT"
+            echo "canvas=true" >> "$GITHUB_OUTPUT"
+            echo "python=true" >> "$GITHUB_OUTPUT"
+            echo "scripts=true" >> "$GITHUB_OUTPUT"
+            echo "debug=detect-script-error event=${{ github.event_name }} base=$BASE_SHA" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+          echo "debug=profile=ci event=${{ github.event_name }} base=$BASE_SHA" >> "$GITHUB_OUTPUT"
 
   # Platform (Go) — Go build/vet/test/lint + coverage gates. The job always
   # emits the required context, but expensive steps are path-scoped on every
@@ -126,7 +138,9 @@ jobs:
     steps:
       - if: ${{ needs.changes.outputs.platform != 'true' }}
         working-directory: .
-        run: echo "No workspace-server/** changes — Platform (Go) gate satisfied without running Go build/test/lint."
+        run: |
+          echo "No workspace-server/** changes — Platform (Go) gate satisfied without running Go build/test/lint."
+          echo "::notice::detect-changes debug: ${{ needs.changes.outputs.debug }}"
       - if: ${{ needs.changes.outputs.platform == 'true' }}
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - if: ${{ needs.changes.outputs.platform == 'true' }}
@@ -303,7 +317,9 @@ jobs:
     steps:
       - if: ${{ needs.changes.outputs.canvas != 'true' }}
         working-directory: .
-        run: echo "No canvas/** changes — Canvas (Next.js) gate satisfied without running npm build/test."
+        run: |
+          echo "No canvas/** changes — Canvas (Next.js) gate satisfied without running npm build/test."
+          echo "::notice::detect-changes debug: ${{ needs.changes.outputs.debug }}"
       - if: ${{ needs.changes.outputs.canvas == 'true' }}
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - if: ${{ needs.changes.outputs.canvas == 'true' }}
@@ -351,7 +367,9 @@ jobs:
     continue-on-error: false
     steps:
       - if: ${{ needs.changes.outputs.scripts != 'true' }}
-        run: echo "No tests/e2e, scripts, or infra/scripts changes — Shellcheck gate satisfied without running script checks."
+        run: |
+          echo "No tests/e2e, scripts, or infra/scripts changes — Shellcheck gate satisfied without running script checks."
+          echo "::notice::detect-changes debug: ${{ needs.changes.outputs.debug }}"
       - if: ${{ needs.changes.outputs.scripts == 'true' }}
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - if: ${{ needs.changes.outputs.scripts == 'true' }}

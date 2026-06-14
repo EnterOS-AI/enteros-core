@@ -96,6 +96,7 @@ jobs:
     continue-on-error: true
     outputs:
       canvas: ${{ steps.decide.outputs.canvas }}
+      debug: ${{ steps.decide.outputs.debug }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -109,6 +110,7 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "canvas=true" >> "$GITHUB_OUTPUT"
+            echo "debug=manual-trigger event=${{ github.event_name }}" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           BASE="${GITHUB_BASE_REF:-${{ github.event.before }}}"
@@ -117,6 +119,7 @@ jobs:
           fi
           if [ -z "$BASE" ] || echo "$BASE" | grep -qE '^0+$'; then
             echo "canvas=true" >> "$GITHUB_OUTPUT"
+            echo "debug=new-branch-fallback base=$BASE" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           if ! git cat-file -e "$BASE" 2>/dev/null; then
@@ -124,15 +127,19 @@ jobs:
           fi
           if ! git cat-file -e "$BASE" 2>/dev/null; then
             echo "canvas=true" >> "$GITHUB_OUTPUT"
+            echo "debug=base-missing-fallback base=$BASE" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           CHANGED=$(git diff --name-only "$BASE" HEAD)
+          CHANGED_FLAT=$(echo "$CHANGED" | tr '\n' ',')
           if ! echo "$CHANGED" | grep -qE '^(canvas/|\.gitea/workflows/e2e-staging-canvas\.yml$)'; then
             echo "canvas=false" >> "$GITHUB_OUTPUT"
+            echo "debug=no-matching-paths base=$BASE changed=$CHANGED_FLAT" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           if [ "${{ github.event_name }}" != "pull_request" ]; then
             echo "canvas=true" >> "$GITHUB_OUTPUT"
+            echo "debug=non-pr-run base=$BASE changed=$CHANGED_FLAT" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -141,13 +148,23 @@ jobs:
           printf 'header = "Authorization: token %s"\n' "$GITEA_TOKEN" > "$authfile"
           labels=$(curl -fsS -K "$authfile" \
             "${{ github.server_url }}/api/v1/repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels" \
-            | python3 -c 'import json,sys; print("\n".join(label.get("name","") for label in json.load(sys.stdin)))')
+            | python3 -c 'import json,sys; print("\n".join(label.get("name","") for label in json.load(sys.stdin)))') || {
+            # Labels API unavailable: fail open so the E2E gate runs rather
+            # than silently no-oping a potentially-breaking PR.
+            rm -f "$authfile"
+            echo "canvas=true" >> "$GITHUB_OUTPUT"
+            echo "debug=labels-api-unavailable pr=${{ github.event.pull_request.number }} base=$BASE changed=$CHANGED_FLAT" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
           rm -f "$authfile"
+          LABELS_FLAT=$(echo "$labels" | tr '\n' ',')
           if printf '%s\n' "$labels" | grep -qx "$QUEUE_LABEL"; then
             echo "canvas=true" >> "$GITHUB_OUTPUT"
+            echo "debug=merge-queue-labeled base=$BASE changed=$CHANGED_FLAT" >> "$GITHUB_OUTPUT"
           else
             echo "PR is not in merge-queue; skipping heavy E2E Staging Canvas for normal PR path."
             echo "canvas=false" >> "$GITHUB_OUTPUT"
+            echo "debug=no-merge-queue-label base=$BASE changed=$CHANGED_FLAT labels=$LABELS_FLAT" >> "$GITHUB_OUTPUT"
           fi
 
   # ONE job (no job-level `if:`) that always runs and reports under the
@@ -184,6 +201,7 @@ jobs:
         run: |
           echo "No canvas / workflow changes — E2E Staging Canvas gate satisfied without running tests."
           echo "::notice::E2E Staging Canvas no-op pass (paths filter excluded this commit)."
+          echo "::notice::detect-changes debug: ${{ needs.detect-changes.outputs.debug }}"
 
       - if: needs.detect-changes.outputs.canvas == 'true'
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2

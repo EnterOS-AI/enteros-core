@@ -125,6 +125,7 @@ jobs:
     continue-on-error: false
     outputs:
       peervis: ${{ steps.filter.outputs.peervis }}
+      debug: ${{ steps.filter.outputs.debug }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -137,12 +138,20 @@ jobs:
           PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
           PUSH_BEFORE: ${{ github.event.before }}
         run: |
+          BASE_SHA="${PR_BASE_SHA:-$PUSH_BEFORE}"
           python3 .gitea/scripts/detect-changes.py \
             --profile peer-visibility \
             --event-name "${{ github.event_name }}" \
             --pr-base-sha "$PR_BASE_SHA" \
             --base-ref "$PR_BASE_REF" \
-            --push-before "${GITHUB_EVENT_BEFORE:-$PUSH_BEFORE}"
+            --push-before "${GITHUB_EVENT_BEFORE:-$PUSH_BEFORE}" || {
+            # Script crash / uncaught error: fail open so the E2E gate runs
+            # rather than silently no-oping a potentially-breaking PR.
+            echo "peervis=true" >> "$GITHUB_OUTPUT"
+            echo "debug=detect-script-error event=${{ github.event_name }} base=$BASE_SHA" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+          echo "debug=profile=peer-visibility event=${{ github.event_name }} base=$BASE_SHA" >> "$GITHUB_OUTPUT"
 
   # THE required-check emitter. ONE always-running job (no job-level `if:`)
   # named `E2E Peer Visibility`, so it posts EXACTLY ONE check run under the
@@ -208,6 +217,7 @@ jobs:
         run: |
           echo "No peer-visibility-relevant changes — E2E Peer Visibility gate satisfied without running the staging E2E."
           echo "::notice::E2E Peer Visibility no-op pass (detect-changes profile peer-visibility excluded this push)."
+          echo "::notice::detect-changes debug: ${{ needs.changes.outputs.debug }}"
 
       # --- push/dispatch/cron + relevant change: the REAL staging E2E ------
       - name: Verify admin token present

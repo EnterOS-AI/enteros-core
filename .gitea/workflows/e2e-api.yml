@@ -128,18 +128,31 @@ jobs:
     continue-on-error: false
     outputs:
       api: ${{ steps.decide.outputs.api }}
+      debug: ${{ steps.decide.outputs.debug }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
       - id: decide
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PUSH_BEFORE: ${{ github.event.before }}
         run: |
+          BASE_SHA="${PR_BASE_SHA:-$PUSH_BEFORE}"
           python3 .gitea/scripts/detect-changes.py \
             --profile e2e-api \
             --event-name "${{ github.event_name }}" \
-            --pr-base-sha "${{ github.event.pull_request.base.sha }}" \
-            --base-ref "${{ github.event.pull_request.base.ref }}" \
-            --push-before "${GITHUB_EVENT_BEFORE:-${{ github.event.before }}}"
+            --pr-base-sha "$PR_BASE_SHA" \
+            --base-ref "$PR_BASE_REF" \
+            --push-before "${GITHUB_EVENT_BEFORE:-$PUSH_BEFORE}" || {
+            # Script crash / uncaught error: fail open so the E2E gate runs
+            # rather than silently no-oping a potentially-breaking PR.
+            echo "api=true" >> "$GITHUB_OUTPUT"
+            echo "debug=detect-script-error event=${{ github.event_name }} base=$BASE_SHA" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+          echo "debug=profile=e2e-api event=${{ github.event_name }} base=$BASE_SHA" >> "$GITHUB_OUTPUT"
 
   # ONE job (no job-level `if:`) that always runs and reports under the
   # required-check name `E2E API Smoke Test`. Real work is gated per-step
@@ -179,6 +192,7 @@ jobs:
         run: |
           echo "No workspace-server / tests/e2e / workflow changes — E2E API gate satisfied without running tests."
           echo "::notice::E2E API Smoke Test no-op pass (paths filter excluded this commit)."
+          echo "::notice::detect-changes debug: ${{ needs.detect-changes.outputs.debug }}"
       - if: needs.detect-changes.outputs.api == 'true'
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - if: needs.detect-changes.outputs.api == 'true'
