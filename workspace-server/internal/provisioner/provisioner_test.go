@@ -1751,3 +1751,72 @@ func TestResolveStartWorkspaceHostURL(t *testing.T) {
 		}
 	})
 }
+
+
+// TestBuildStartWorkspaceEnv covers the #2851 production-path env injection
+// gap that bit 3 rounds running (Researcher #11798 / #11787 close-out).
+// The provisioner's Start() must inject MOLECULE_WORKSPACE_URL=<host-port>
+// into the container env so the runtime's resolve_workspace_url
+// (highest precedence for the env var) returns the same host-port URL
+// the provisioner persisted. When env propagation is broken
+// (the real-image lifecycle E2E gap), the runtime falls back to
+// http://HOSTNAME:8000 — the Register handler's upsert must then
+// preserve the provisioner's URL (the Register handler fix is in
+// registry.go, this test covers the provisioner side).
+func TestBuildStartWorkspaceEnv(t *testing.T) {
+	cfg := WorkspaceConfig{
+		WorkspaceID: "ws-test-1",
+		Tier:        1,
+		PlatformURL: "http://platform:8080",
+	}
+
+	find := func(env []string, key string) string {
+		for _, e := range env {
+			if len(e) >= len(key)+1 && e[:len(key)+1] == key+"=" {
+				return e[len(key)+1:]
+			}
+		}
+		return ""
+	}
+
+	t.Run("default localhost (no env override)", func(t *testing.T) {
+		t.Setenv("MOLECULE_WORKSPACE_ADVERTISE_HOST", "")
+		env := buildStartWorkspaceEnv(cfg, "41751")
+		got := find(env, "MOLECULE_WORKSPACE_URL")
+		want := "http://localhost:41751"
+		if got != want {
+			t.Errorf("MOLECULE_WORKSPACE_URL = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("env override (containerized-platform path)", func(t *testing.T) {
+		t.Setenv("MOLECULE_WORKSPACE_ADVERTISE_HOST", "172.18.0.1")
+		env := buildStartWorkspaceEnv(cfg, "33605")
+		got := find(env, "MOLECULE_WORKSPACE_URL")
+		want := "http://172.18.0.1:33605"
+		if got != want {
+			t.Errorf("MOLECULE_WORKSPACE_URL = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("env injection comes AFTER buildContainerEnv (last-wins for docker -e)", func(t *testing.T) {
+		t.Setenv("MOLECULE_WORKSPACE_ADVERTISE_HOST", "")
+		env := buildStartWorkspaceEnv(cfg, "12345")
+		var workspaceURLIdx, workspaceIDIdx int
+		workspaceURLIdx, workspaceIDIdx = -1, -1
+		for i, e := range env {
+			if len(e) > 22 && e[:23] == "MOLECULE_WORKSPACE_URL=" {
+				workspaceURLIdx = i
+			}
+			if len(e) > 12 && e[:13] == "WORKSPACE_ID=" {
+				workspaceIDIdx = i
+			}
+		}
+		if workspaceURLIdx == -1 {
+			t.Fatal("MOLECULE_WORKSPACE_URL not in env")
+		}
+		if workspaceURLIdx <= workspaceIDIdx {
+			t.Errorf("MOLECULE_WORKSPACE_URL (idx %d) must come AFTER buildContainerEnv entries (WORKSPACE_ID idx %d) for docker -e last-wins", workspaceURLIdx, workspaceIDIdx)
+		}
+	})
+}

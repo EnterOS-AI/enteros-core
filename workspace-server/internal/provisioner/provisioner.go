@@ -576,6 +576,24 @@ func workspaceAdvertiseURL(hostPort string) string {
 	return fmt.Sprintf("http://%s:%s", host, hostPort)
 }
 
+// buildStartWorkspaceEnv assembles the full env for the workspace container,
+// including the platform-injected MOLECULE_WORKSPACE_URL. Extracted from
+// Start() so the production-path env injection is unit-testable without a
+// Docker daemon (Researcher #11798 / #11787 close-out — the gap that bit
+// 3 rounds running: in real-image lifecycle E2E, the runtime's resolve_workspace_url
+// fell back to http://localhost:8000 because the provisioner's
+// MOLECULE_WORKSPACE_URL injection was not exercised in tests, and the
+// Register handler's URL-preservation CASE only matched the legacy
+// 127.0.0.1 prefix — so the upsert overwrote the host-port URL with the
+// runtime's 8000 fallback. Both gaps closed: this helper ensures the
+// injection happens, and the Register handler's CASE now also matches
+// the localhost prefix the provisioner uses after round-3).
+func buildStartWorkspaceEnv(cfg WorkspaceConfig, hostPort string) []string {
+	return append(buildContainerEnv(cfg),
+		fmt.Sprintf("MOLECULE_WORKSPACE_URL=%s", workspaceAdvertiseURL(hostPort)))
+}
+
+
 // resolveStartWorkspaceHostURL computes the hostURL that StartWorkspace
 // should return to the platform. The host comes from workspaceAdvertiseURL
 // (env override → localhost); the port starts at hostPort and is swapped
@@ -630,14 +648,17 @@ func (p *Provisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string, e
 	}
 	log.Printf("Provisioner: config volume %s ready", configVolume)
 
-	// #2851: tell the runtime exactly which URL to advertise. The default
-	// "localhost" is accepted by registry validateAgentURL; the handler layer
-	// then stores the equivalent http://127.0.0.1:<port> URL and the A2A proxy
-	// rewrites it to ws-<id>:8000 when the platform itself runs inside Docker.
-	// When the platform is also containerized, MOLECULE_WORKSPACE_ADVERTISE_HOST
-	// points the runtime at the Docker host/gateway IP instead.
+	// #2851 (round-4 production-injection fix): tell the runtime exactly which
+	// URL to advertise. The helper injects MOLECULE_WORKSPACE_URL=<host-port>
+	// into the container env (host-port URL, not the runtime's listen-port
+	// 8000 fallback). The runtime's resolve_workspace_url honors
+	// MOLECULE_WORKSPACE_URL at highest precedence, so the registered URL
+	// matches the host-port the provisioner allocated — preventing the
+	// "registered as localhost:8000 but the host-port is 41751" gap
+	// that bit 3 rounds running in production (the real-image lifecycle
+	// E2E ProxyA2A path).
+	env := buildStartWorkspaceEnv(cfg, hostPort)
 	advertiseURL := workspaceAdvertiseURL(hostPort)
-	env := append(buildContainerEnv(cfg), fmt.Sprintf("MOLECULE_WORKSPACE_URL=%s", advertiseURL))
 
 	image, imgErr := selectImage(cfg)
 	if imgErr != nil {
