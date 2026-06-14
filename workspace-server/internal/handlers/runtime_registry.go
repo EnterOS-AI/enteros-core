@@ -201,22 +201,38 @@ var templateRepoByName = make(map[string]templateRepoRef)
 // (alongside initKnownRuntimes) to populate the repo map. The
 // fallback set returns an empty map — external/kimi/kimi-cli/mock
 // have no manifest entry by design.
+//
+// Reconcile-on-every-boot: the map is RESET at the start of every
+// call, then re-populated from the current manifest. Stale entries
+// (runtimes removed from the manifest) are dropped; the consumer
+// (collectCPConfigFiles + the SCAFFOLD gate) can rely on the map
+// being exactly the current manifest's runtimes. The reset is
+// critical for the every-boot reconcile semantic — without it,
+// dropping a template from the manifest would leave its identity
+// resolvable, and the fetcher would attempt a no-longer-existing
+// repo. Idempotent for the same manifest input.
 func initTemplateRepoByName() {
 	path := manifestPath()
 	if path == "" {
 		log.Printf("template repo registry: manifest.json not found, no template repos available")
+		templateRepoByName = make(map[string]templateRepoRef)
 		return
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		log.Printf("template repo registry: manifest.json load failed (%v) — no template repos", err)
+		templateRepoByName = make(map[string]templateRepoRef)
 		return
 	}
 	var m manifestFile
 	if err := json.Unmarshal(data, &m); err != nil {
 		log.Printf("template repo registry: manifest.json parse failed (%v) — no template repos", err)
+		templateRepoByName = make(map[string]templateRepoRef)
 		return
 	}
+	// Reconcile: reset, then re-populate. Stale entries from a
+	// previous manifest are dropped — see func comment.
+	templateRepoByName = make(map[string]templateRepoRef, len(m.WorkspaceTemplates))
 	for _, e := range m.WorkspaceTemplates {
 		// Same normalization as loadRuntimesFromManifest: strip
 		// the "-default" suffix so the runtime identifier is
