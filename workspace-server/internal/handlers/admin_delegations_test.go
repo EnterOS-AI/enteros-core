@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -301,6 +302,104 @@ func TestAdminDelegations_Stats_EmptyTable(t *testing.T) {
 		if v != 0 {
 			t.Errorf("empty table → all counts zero; %s=%d", k, v)
 		}
+	}
+}
+
+func TestAdminDelegations_List_RowsErr_PartialResults(t *testing.T) {
+	mock := setupTestDB(t)
+	h := NewAdminDelegationsHandler(nil)
+
+	now := time.Now()
+	rows := sqlmock.NewRows([]string{
+		"delegation_id", "caller_id", "callee_id", "task_preview",
+		"status", "last_heartbeat", "deadline", "result_preview", "error_detail",
+		"retry_count", "created_at", "updated_at",
+	}).
+		AddRow("deleg-1", "caller-1", "callee-1", "task 1", "queued", now, now.Add(time.Hour), nil, nil, 0, now, now).
+		AddRow("deleg-2", "caller-2", "callee-2", "task 2", "dispatched", now, now.Add(time.Hour), nil, nil, 0, now, now).
+		RowError(1, errors.New("storage engine fault"))
+
+	mock.ExpectQuery(`SELECT delegation_id`).
+		WithArgs("queued", "dispatched", "in_progress", 100).
+		WillReturnRows(rows)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest("GET", "/admin/delegations", nil)
+	h.List(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var body struct {
+		Delegations []any `json:"delegations"`
+		Count       int   `json:"count"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if body.Count != 1 {
+		t.Errorf("expected 1 partial result, got %d", body.Count)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet: %v", err)
+	}
+}
+
+func TestAdminDelegations_Stats_QueryError_Returns500(t *testing.T) {
+	mock := setupTestDB(t)
+	h := NewAdminDelegationsHandler(nil)
+
+	mock.ExpectQuery(`SELECT status, COUNT\(\*\) FROM delegations GROUP BY status`).
+		WillReturnError(errors.New("db down"))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest("GET", "/admin/delegations/stats", nil)
+	h.Stats(c)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("expected 500, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet: %v", err)
+	}
+}
+
+func TestAdminDelegations_Stats_RowsErr_Returns200(t *testing.T) {
+	// rows.Err() after the scan loop is non-fatal — the handler logs and
+	// returns whatever counts were successfully read. The exact row that
+	// sqlmock loses depends on driver internals, so we only assert the
+	// happy-path row and the HTTP status, not the presence/absence of the
+	// row after the injected error.
+	mock := setupTestDB(t)
+	h := NewAdminDelegationsHandler(nil)
+
+	rows := sqlmock.NewRows([]string{"status", "count"}).
+		AddRow("in_progress", 7).
+		AddRow("completed", 130).
+		RowError(1, errors.New("storage engine fault"))
+
+	mock.ExpectQuery(`SELECT status, COUNT\(\*\) FROM delegations GROUP BY status`).
+		WillReturnRows(rows)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest("GET", "/admin/delegations/stats", nil)
+	h.Stats(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var stats map[string]int
+	if err := json.Unmarshal(w.Body.Bytes(), &stats); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if stats["in_progress"] != 7 {
+		t.Errorf("in_progress: expected 7, got %d", stats["in_progress"])
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet: %v", err)
 	}
 }
 
