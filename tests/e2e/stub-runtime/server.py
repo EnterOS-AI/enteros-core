@@ -83,11 +83,15 @@ HOSTNAME = os.environ.get("HOSTNAME", "").strip()  # docker sets this to the con
 #     address (0.0.0.0:8000, reachable as ws-<id>:8000 on the bridge) is what
 #     the proxy actually hits — independent of the URL string we register.
 #
-# Net: register a name-form localhost URL purely to satisfy push-mode's
-# "url required + must pass SSRF check" and to get our auth_token. Routing is
-# handled by the provisioner-stored 127.0.0.1 URL + the proxy rewrite.
+# Net: register a host-reachable localhost URL. The provisioner injects the
+# correct host-mapped port via MOLECULE_WORKSPACE_URL (#2851); prefer that and
+# fall back to the legacy STUB_REGISTER_URL or the internal listen port.
 _short = WORKSPACE_ID[:12] if len(WORKSPACE_ID) > 12 else WORKSPACE_ID
-SELF_URL = os.environ.get("STUB_REGISTER_URL", f"http://localhost:{PORT}")
+SELF_URL = (
+    os.environ.get("STUB_REGISTER_URL")
+    or os.environ.get("MOLECULE_WORKSPACE_URL")
+    or f"http://localhost:{PORT}"
+)
 
 CONFIG_PATH = (os.environ.get("WORKSPACE_CONFIG_PATH") or "/configs").rstrip("/")
 AUTH_TOKEN_FILE = f"{CONFIG_PATH}/.auth_token"
