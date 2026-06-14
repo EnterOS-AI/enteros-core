@@ -82,7 +82,12 @@ ok()   { echo "[$(date +%H:%M:%S)] ✅ $*"; }
 # shellcheck source=lib/collision-proof-slug.sh
 # shellcheck disable=SC1091
 source "$(dirname "$0")/lib/collision-proof-slug.sh"
-SLUG="cp455-${RUNTIME}-$(make_collision_proof_slug_suffix "${E2E_RUN_ID:-}")"
+# Compute the prefix length dynamically: "cp455-" (6 chars) +
+# RUNTIME length. RUNTIME is set by the harness to one of the
+# known runtime names (claude-code, codex, hermes, openclaw),
+# so the prefix is bounded.
+SLUG_PREFIX="cp455-${RUNTIME}-"
+SLUG="${SLUG_PREFIX}$(make_collision_proof_slug_suffix "${E2E_RUN_ID:-}" ${#SLUG_PREFIX})"
 assert_collision_proof_slug "$SLUG" || fail "Bug in make_collision_proof_slug: produced non-collision-proof slug '$SLUG'"
 
 WORKSPACE_ID=""

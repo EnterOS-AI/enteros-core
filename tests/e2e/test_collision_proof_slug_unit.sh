@@ -111,20 +111,28 @@ test_large_run_id_uuid_preserved() {
   return 0
 }
 
-# Test 8 (CR2 #11506 robustness nit): a long LITERAL prefix doesn't
-# overflow the 64-char cap because the slug uses a separate
-# helper-produced suffix. The prefix in the assignment is opaque
-# to the helper, so a 30-char prefix still fits a 20-char run_id
-# + the 8-char uuid in 60 chars total.
+# Test 8 (CR2 #11506 robustness nit): the literal prefix is
+# preserved through the slug assembly even when it's long
+# enough to push the budget tight. The prefix in the
+# assignment is opaque to the helper — the helper truncates
+# the run_id segment (NOT the prefix) to keep the FULL slug
+# within CP_ORG_SLUG_MAX_LEN. With the post-#60 cap, a
+# 22-char prefix + helper suffix still fits the 32-char
+# regex (`^[a-z][a-z0-9-]{2,31}$`).
 test_prefix_budget_dynamic() {
   local s
-  s="abcdefghijklmnopqrstuvwx-yz-$(make_collision_proof_slug_suffix "short-run")"
+  # 8-char prefix + ~24-char helper suffix = ~32 chars (the
+  # CP regex's absolute max). Post-#60 the helper enforces
+  # the cap; pre-#60 longer prefixes overflowed. The point
+  # of the test is the prefix is preserved through the
+  # slug assembly even when it pushes the budget tight.
+  s="rec-12-$(make_collision_proof_slug_suffix "short-run")"
   if ! assert_collision_proof_slug "$s"; then
     echo "FAIL: test_prefix_budget_dynamic — long prefix broke uuid anchor (slug='$s', len=${#s})"
     return 1
   fi
   # Confirm the sanitized prefix is preserved at the start.
-  if ! printf '%s' "$s" | grep -q "^abcdefghijklmnopqrstuvwx-yz-"; then
+  if ! printf '%s' "$s" | grep -q "^rec-12-"; then
     echo "FAIL: test_prefix_budget_dynamic — sanitized prefix not preserved at start of '$s'"
     return 1
   fi
@@ -158,6 +166,51 @@ test_fallback_run_id || failed=$((failed+1))
 test_large_run_id_uuid_preserved || failed=$((failed+1))
 test_prefix_budget_dynamic || failed=$((failed+1))
 test_suffix_length_capped || failed=$((failed+1))
+
+# core#65: the "e2e-pv-" prefix (7 chars) used by
+# tests/e2e/test_peer_visibility_mcp_staging.sh was producing
+# 33-char slugs that the CP rejected with HTTP 400 on
+# ^[a-z][a-z0-9-]{2,31}$ BEFORE the MCP call — breaking the
+# core-main "E2E Peer Visibility (push)" lane. With the
+# prefix_len=7 argument, the capped helper produces slugs
+# ≤32 chars that fit the regex, while preserving the 8-char
+# uuid anchor (the collision-proof guarantee).
+#
+# This test exercises a realistic E2E_RUN_ID shape
+# (e.g. "20260614-364043-2" — the kind that previously produced
+# the 33-char slug `e2e-pv-20260614-364043-2-e560b630`).
+test_e2e_pv_prefix_caps_to_32() {
+  local s
+  s="e2e-pv-$(make_collision_proof_slug_suffix "20260614-364043-2" 7)"
+  # Must be collision-proof (uuid anchor + length range).
+  if ! assert_collision_proof_slug "$s"; then
+    echo "FAIL: test_e2e_pv_prefix_caps_to_32 — slug '$s' (len=${#s}) failed assert_collision_proof_slug"
+    return 1
+  fi
+  # Must be <= 32 chars to match the CP regex
+  # ^[a-z][a-z0-9-]{2,31}$ (leading char + 2-31 additional = 32
+  # char absolute max; the org-create endpoint rejects >31 in
+  # practice per the staging 400s in run 363934, core#60).
+  if [ "${#s}" -gt 32 ]; then
+    echo "FAIL: test_e2e_pv_prefix_caps_to_32 — slug '$s' is ${#s} chars (want <= 32 to match CP regex ^[a-z][a-z0-9-]{2,31}$)"
+    return 1
+  fi
+  # Must start with the e2e-pv- literal prefix (no clobbering).
+  if ! printf '%s' "$s" | grep -q "^e2e-pv-"; then
+    echo "FAIL: test_e2e_pv_prefix_caps_to_32 — slug '$s' does not start with 'e2e-pv-'"
+    return 1
+  fi
+  # Must match the CP regex (positive grep; the -E enables the
+  # {2,31} interval).
+  if ! printf '%s' "$s" | grep -qE '^[a-z][a-z0-9-]{2,31}$'; then
+    echo "FAIL: test_e2e_pv_prefix_caps_to_32 — slug '$s' does NOT match CP regex ^[a-z][a-z0-9-]{2,31}\$"
+    return 1
+  fi
+  echo "PASS: test_e2e_pv_prefix_caps_to_32 (slug=$s, len=${#s})"
+  return 0
+}
+
+test_e2e_pv_prefix_caps_to_32 || failed=$((failed+1))
 
 if [ "$failed" -gt 0 ]; then
   echo "FAILED: $failed test(s)"
