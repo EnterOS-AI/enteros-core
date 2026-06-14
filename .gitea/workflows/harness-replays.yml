@@ -291,6 +291,12 @@ jobs:
         # service with the stale-handler problem AND no env dep.
         if: needs.detect-changes.outputs.run == 'true'
         working-directory: tests/harness
+        env:
+          # docker compose validates the whole compose.yml even when only
+          # building cp-stub; tenant-alpha/beta require SECRETS_ENCRYPTION_KEY.
+          # up.sh generates the real key later. A placeholder is fine here
+          # because cp-stub does not use it.
+          SECRETS_ENCRYPTION_KEY: rebuild-cp-stub-placeholder
         run: |
           docker compose -f compose.yml build --no-cache cp-stub
 
