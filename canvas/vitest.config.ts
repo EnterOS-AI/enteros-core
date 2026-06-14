@@ -32,8 +32,7 @@ export default defineConfig({
     // graph import for @/components/* and @/lib/* + first React
     // render) consistently consumes 5-7 seconds for the first
     // synchronous test in heavyweight component files
-    // (ActivityTab.test.tsx, CreateWorkspaceDialog.test.tsx,
-    // ConfigTab.provider.test.tsx) — even though every subsequent
+    // (ActivityTab.test.tsx, CreateWorkspaceDialog.test.tsx) — even though every subsequent
     // test in the same file completes in 100-1500ms.
     //
     // Empirically the worst observed first-test was 6453ms in a
