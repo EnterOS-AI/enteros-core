@@ -163,11 +163,15 @@ PULL_REQUEST_REVIEW_SUFFIX = " (pull_request_review)"
 
 # Governance workflows whose non-required `(pull_request)` / `(pull_request_review)`
 # shadows may be compensated when the trusted `(pull_request_target)` variant is
-# green. This is an EXACT allowlist — every other workflow is preserved, even if
-# it has no `push:` trigger, to avoid masking real failures.
+# green. This is an EXACT active allowlist — every other workflow is preserved,
+# even if it has no `push:` trigger, to avoid masking real failures.
 GOVERNANCE_SHADOW_ALLOWLIST = frozenset(
-    {"sop-checklist", "qa-review", "security-review", "sop-tier-check"}
+    {"sop-checklist", "qa-review", "security-review"}
 )
+# Retired workflows whose historical shadow contexts still appear on old commits
+# and must remain compensatable even though the workflow YAML has been removed.
+# They are treated as known non-push when absent from the trigger map.
+GOVERNANCE_SHADOW_RETIRED_ALLOWLIST = frozenset({"sop-tier-check"})
 
 # --------------------------------------------------------------------------
 # Conductor snapshot (operator-config#158)
@@ -520,27 +524,31 @@ def is_governance_shadow_context(
 ) -> bool:
     """True if `context` is a compensatable governance shadow.
 
-    Only `(pull_request)` / `(pull_request_review)` contexts emitted by the
-    explicitly allowed governance workflows (`sop-checklist`, `qa-review`,
-    `security-review`, and the retired `sop-tier-check`) are eligible.
-    Workflows that DO have a `push:` trigger are excluded even if they are in
-    the allowlist — their PR/review status is an independent gate signal.
-    Retired workflows may be absent from the trigger map (the workflow file was
-    removed); they are treated as non-push so their historical shadow contexts
-    remain compensatable. Unknown workflows or workflows not in the allowlist
-    are preserved (fail-closed: never mask a signal we can't classify).
+    Active governance workflows (`sop-checklist`, `qa-review`, `security-review`)
+    are compensatable only when their trigger map entry is explicitly `False`.
+    Retired workflows (`sop-tier-check`) may be absent from the trigger map
+    because their YAML was removed; they are treated as known non-push so their
+    historical shadow contexts remain compensatable.
+
+    Workflows that DO have a `push:` trigger are excluded even if they are in an
+    allowlist — their PR/review status is an independent gate signal. Unknown
+    workflows or workflows not in any allowlist are preserved (fail-closed).
     """
     for suffix in (PULL_REQUEST_SUFFIX, PULL_REQUEST_REVIEW_SUFFIX):
         parsed = parse_suffixed_context(context, suffix)
         if parsed is not None:
             workflow_name, _job_name = parsed
+            if workflow_name in GOVERNANCE_SHADOW_RETIRED_ALLOWLIST:
+                # Retired workflow: absent from the trigger map is expected.
+                # Only a push-triggered retired workflow is preserved.
+                has_push = workflow_trigger_map.get(workflow_name)
+                return has_push is not True
             if workflow_name not in GOVERNANCE_SHADOW_ALLOWLIST:
                 return False
+            # Active allowlist workflow: require an explicit known-no-push entry.
+            # If the parser ever misses the workflow, fail-closed (preserve).
             has_push = workflow_trigger_map.get(workflow_name)
-            # Retired allowlist workflows may be missing from the map; treat
-            # absence as "known non-push". Active allowlist workflows that
-            # genuinely have a push trigger are preserved.
-            return has_push is not True
+            return has_push is False
     return False
 
 

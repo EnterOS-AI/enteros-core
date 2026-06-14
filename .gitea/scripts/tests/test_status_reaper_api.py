@@ -500,6 +500,43 @@ def test_reap_compensates_retired_sop_tier_check_when_missing_from_trigger_map(m
     ]
 
 
+def test_reap_preserves_active_governance_shadow_when_missing_from_trigger_map(monkeypatch):
+    """Active governance workflows must be explicitly known-no-push in the trigger
+    map. If the parser/discovery misses them, the reaper must fail-closed and
+    preserve their shadow rather than auto-green it."""
+    mod = load_reaper()
+    posted = []
+    monkeypatch.setattr(
+        mod,
+        "post_compensating_status",
+        lambda sha, context, target_url, *, description="", dry_run=False: posted.append(
+            context
+        ),
+    )
+
+    counters = mod.reap(
+        # Deliberately omit qa-review from the trigger map.
+        {},
+        {
+            "statuses": [
+                {
+                    "context": "qa-review / approved (pull_request_review)",
+                    "status": "failure",
+                },
+                {
+                    "context": "qa-review / approved (pull_request_target)",
+                    "status": "success",
+                },
+            ],
+        },
+        "db3b7a93e31adc0cb072a6d177d92dd73275a191",
+    )
+
+    assert counters["compensated_governance_shadow"] == 0
+    assert counters["compensated"] == 0
+    assert posted == []
+
+
 @pytest.mark.parametrize(
     "context",
     [
