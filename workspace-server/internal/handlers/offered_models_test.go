@@ -310,37 +310,72 @@ func TestListOfferedModels_BYOKAuthEnv(t *testing.T) {
 	})
 }
 
-// TestListOfferedModels_AmbiguousModelSkipped: when DeriveProvider
-// returns an error for a model id (ambiguous prefix, no native arm,
-// etc.), the handler silently drops that model from the response —
-// the create gate will reject the model id at provision time
-// anyway, but the agent should not see a menu entry it cannot
-// actually use. This pins the `continue` path in the loop.
+// TestListOfferedModels_AmbiguousModelSkipped: pins the `continue` path
+// in the handler's per-model loop — when DeriveProvider returns an
+// error for a model id, the handler silently drops that model from
+// the response. The create gate would reject such a model at
+// provision time anyway, so the agent must not see a menu entry it
+// cannot actually use.
 //
-// The fixture triggers DeriveProvider's fail-closed ambiguity
-// branch: a model id ("shared-gpt-4o") is in NO provider's exact
-// Models list, so the step-3 exact-match disambiguation does not
-// fire; the id matches BOTH providers' ModelPrefixMatch, so the
-// step-5 auth-env disambiguation is the only remaining
-// tie-breaker; with no auth context (the handler passes nil),
-// DeriveProvider errors. Sibling id "alpha-only" is in a single
-// native arm's exact-list, so it resolves cleanly.
+// CRITICAL: the test must exercise the branch with a model id that
+// is ACTUALLY RETURNED BY `m.ModelsForRuntime(runtime)`. The handler
+// only iterates that set; a model id not in it never enters the
+// loop, so the `dErr != nil { continue }` branch is never reached
+// and the test becomes tautological (would pass even if the branch
+// were deleted).
+//
+// Fixture recipe (per CR2 #11570): a runtime ref whose `Name`
+// references a provider that is NOT in the provider catalog. The
+// fixture is built directly as a `*providers.Manifest` (bypassing
+// `parseManifest` validation, which would reject the dangling ref
+// at load time — that's a load-time check, not a runtime invariant;
+// the runtime code only consults the catalog when DeriveProvider
+// looks the ref up by name). Effect:
+//
+//  1. `ModelsForRuntime("split")` iterates `ref.Models` and
+//     returns BOTH "alpha-survives" and "ghost-drops" (de-duped,
+//     native-declaration order).
+//  2. Handler iterates and calls `DeriveProvider("split", id, nil)`.
+//  3. For "alpha-survives" — listed under `real-co`, which IS in
+//     the catalog. DeriveProvider step 3 finds it in `byName`,
+//     adds to `exact`, `len(exact)==1`, returns the real-co
+//     provider. No error.
+//  4. For "ghost-drops" — listed under `ghost-co`, which is NOT
+//     in the catalog. DeriveProvider step 3 tries `byName["ghost-co"]`
+//     and gets `ok=false`, so it does NOT add to `exact`. Step 4
+//     iterates native providers, but only `real-co` is in
+//     `byName`; "ghost-drops" does not match `^alpha-` so
+//     `matched` ends up empty. Step 6 errors with
+//     "unregistered/unselectable" — exactly the dErr the handler
+//     is supposed to swallow.
+//
+// The sibling "alpha-survives" must still appear in the response;
+// only "ghost-drops" is dropped. This is the load-bearing
+// distinction: if the handler accidentally treated the error as a
+// 500 or returned an empty list, the sibling would disappear and
+// the test would fail loudly.
 func TestListOfferedModels_AmbiguousModelSkipped(t *testing.T) {
 	manifest := &providers.Manifest{
 		Providers: []providers.Provider{
-			// Both providers' prefixes match "shared-gpt-4o".
-			{Name: "alpha-co", ModelPrefixMatch: "^shared-", AuthEnv: []string{"ALPHA_KEY"}},
-			{Name: "beta-co", ModelPrefixMatch: "^shared-", AuthEnv: []string{"BETA_KEY"}},
+			// The ONLY provider in the catalog. Its prefix matches
+			// "alpha-*" but NOT "ghost-*", so the dangling-ref model
+			// is invisible to step 4.
+			{Name: "real-co", ModelPrefixMatch: "^alpha-", AuthEnv: []string{"REAL_KEY"}},
 		},
 		Runtimes: map[string]providers.RuntimeNativeSet{
 			"split": {
 				Providers: []providers.RuntimeProviderRef{
-					// "alpha-only" is exact-listed under alpha-co only —
-					// resolves cleanly. "shared-gpt-4o" is in NO exact
-					// list, so step 3 doesn't fire and the prefix
-					// ambiguity errors out.
-					{Name: "alpha-co", Models: []string{"alpha-only"}},
-					{Name: "beta-co", Models: []string{}},
+					// Real ref + listed sibling. This arm resolves
+					// cleanly through step 3.
+					{Name: "real-co", Models: []string{"alpha-survives"}},
+					// Ghost ref + listed model. The ref name
+					// "ghost-co" is NOT in the provider catalog, so
+					// step 3 cannot resolve "ghost-drops" to any
+					// provider and step 4 has no matching regex →
+					// DeriveProvider errors. ModelsForRuntime still
+					// returns "ghost-drops" (it doesn't validate
+					// ref.Name against the catalog at runtime).
+					{Name: "ghost-co", Models: []string{"ghost-drops"}},
 				},
 			},
 		},
@@ -361,14 +396,16 @@ func TestListOfferedModels_AmbiguousModelSkipped(t *testing.T) {
 		for _, m := range resp.Models {
 			got[m.Model] = true
 		}
-		// shared-gpt-4o must be SKIPPED (DeriveProvider errors on
-		// prefix ambiguity without auth context). alpha-only must
-		// SURVIVE (single native arm).
-		if got["shared-gpt-4o"] {
-			t.Errorf("ambiguous model must be dropped, but shared-gpt-4o is in response: %+v", resp.Models)
+		// ghost-drops MUST be dropped (DeriveProvider errored on it —
+		// the dangling-ref path that the `continue` branch swallows).
+		if got["ghost-drops"] {
+			t.Errorf("ghost-listed model with no catalog provider must be dropped, but ghost-drops is in response: %+v", resp.Models)
 		}
-		if !got["alpha-only"] {
-			t.Errorf("unambiguous model must survive, but alpha-only is missing: %+v", resp.Models)
+		// alpha-survives MUST survive (clean step-3 resolution). If
+		// the handler swallowed the loop entirely on any error,
+		// this assertion would fail.
+		if !got["alpha-survives"] {
+			t.Errorf("sibling must survive alongside the dropped entry, but alpha-survives is missing: %+v", resp.Models)
 		}
 	})
 }
