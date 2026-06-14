@@ -93,6 +93,7 @@ jobs:
     continue-on-error: false
     outputs:
       handlers: ${{ steps.filter.outputs.handlers }}
+      debug: ${{ steps.filter.outputs.debug }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -108,7 +109,14 @@ jobs:
             --event-name "${{ github.event_name }}" \
             --pr-base-sha "${{ github.event.pull_request.base.sha }}" \
             --base-ref "${{ github.event.pull_request.base.ref }}" \
-            --push-before "${GITHUB_EVENT_BEFORE:-}"
+            --push-before "${GITHUB_EVENT_BEFORE:-}" || {
+            # Script crash / uncaught error: fail open so the integration gate
+            # runs rather than silently no-oping a potentially-breaking PR.
+            echo "handlers=true" >> "$GITHUB_OUTPUT"
+            echo "debug=detect-script-error event=${{ github.event_name }} base=${{ github.event.pull_request.base.sha || github.event.before }}" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+          echo "debug=profile=handlers-postgres event=${{ github.event_name }} base=${{ github.event.pull_request.base.sha || github.event.before }}" >> "$GITHUB_OUTPUT"
 
   # ONE job (no job-level `if:`) that always runs and reports under the
   # required-check name `Handlers Postgres Integration`. Real work is gated
@@ -148,6 +156,7 @@ jobs:
         run: |
           echo "No handlers/migrations changes — Handlers Postgres Integration gate satisfied without running tests."
           echo "::notice::Handlers Postgres Integration no-op pass (paths filter excluded this commit)."
+          echo "::notice::detect-changes debug: ${{ needs.detect-changes.outputs.debug }}"
 
       - if: needs.detect-changes.outputs.handlers == 'true'
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
