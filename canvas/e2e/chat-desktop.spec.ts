@@ -1,7 +1,7 @@
 import { test, expect } from "@playwright/test";
 import type { Page } from "@playwright/test";
 import { startEchoRuntime } from "./fixtures/echo-runtime";
-import { seedWorkspace, startHeartbeat, cleanupWorkspace } from "./fixtures/chat-seed";
+import { seedWorkspace, startHeartbeat, cleanupWorkspace, runPsql } from "./fixtures/chat-seed";
 
 /** Enter the Org-map view so the Canvas (React Flow graph) mounts. */
 async function enterMapView(page: Page): Promise<void> {
@@ -65,6 +65,17 @@ test.describe("Desktop ChatTab", () => {
     const hasEmptyState = await page.getByText("Send a message to start chatting.").isVisible().catch(() => false);
     const hasHistory = await page.locator("#panel-chat [data-testid='chat-panel']:visible").locator("div").count() > 3;
     expect(hasEmptyState || hasHistory).toBeTruthy();
+  });
+
+  test("echo fixture workspace is configured for push delivery", async () => {
+    // Regression for #2786: external echo-runtime workspaces must be push-mode
+    // so the proxy dispatches synchronously to the echo URL. Poll-mode defaults
+    // short-circuit to {status:'queued'} and the inline echo never renders.
+    const out = runPsql(
+      `SELECT delivery_mode FROM workspaces WHERE id = '${workspaceId}';`,
+      10_000,
+    );
+    expect(out).toContain("push");
   });
 
   test("send text message and receive echo response", async ({ page }) => {
