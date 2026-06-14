@@ -44,9 +44,38 @@ export function runPsql(sql: string, timeoutMs = 30_000): string {
       env: { ...process.env, PGPASSWORD: pass },
       stdio: "pipe",
       timeout: timeoutMs,
+      encoding: "utf8",
     },
   );
   return out.toString();
+}
+
+/**
+ * Execute a read-only psql query and return each row parsed as JSON.
+ * The caller is responsible for making the query return exactly one JSON
+ * value per output line (e.g. with `row_to_json` or `jsonb_agg`).
+ */
+export function queryPsql<T>(sql: string, timeoutMs = 30_000): T[] {
+  const creds = parseDbUrl();
+  if (!creds) {
+    throw new Error("E2E_DATABASE_URL must be set for DB seeding");
+  }
+  const { user, pass, host, port, db } = creds;
+  const out = execFileSync(
+    "psql",
+    ["-h", host, "-p", port, "-U", user, "-d", db, "-tA", "-c", sql],
+    {
+      env: { ...process.env, PGPASSWORD: pass },
+      stdio: "pipe",
+      timeout: timeoutMs,
+      encoding: "utf8",
+    },
+  );
+  return out
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .map((line) => JSON.parse(line) as T);
 }
 
 export interface SeededWorkspace {
