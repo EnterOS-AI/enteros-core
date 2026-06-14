@@ -303,7 +303,7 @@ func TestIntegration_RegistryRowState_RegisterPreservesProvisionerHostPort(t *te
 	conn := integrationAuthDB(t)
 	ctx := context.Background()
 
-	id := insertWorkspace(t, conn, "hostport-ws", "online", "http://localhost:41751")
+	id := insertWorkspaceWithURL(t, conn, "hostport-ws", "online", "http://localhost:41751")
 
 	// Re-register with the SAME host-port URL. The provisioner would have
 	// injected this same URL via MOLECULE_WORKSPACE_URL, so the runtime's
@@ -330,12 +330,12 @@ func TestIntegration_RegistryRowState_RegisterPreservesProvisionerHostPort(t *te
 	}
 
 	// Same with the legacy 127.0.0.1 prefix (back-compat).
-	insertWorkspaceWithURL(t, conn, "hostport-ws-legacy", "online", "http://127.0.0.1:33605")
+	id2 := insertWorkspaceWithURL(t, conn, "hostport-ws-legacy", "online", "http://127.0.0.1:33605")
 	if _, err := conn.ExecContext(ctx, registerUpsertSQL,
-		"hostport-ws-legacy", "hostport-ws-legacy", "http://127.0.0.1:33605", `{"name":"x"}`, "push"); err != nil {
+		id2, "hostport-ws-legacy", "http://127.0.0.1:33605", `{"name":"x"}`, "push"); err != nil {
 		t.Fatalf("register upsert 3 (127.0.0.1): %v", err)
 	}
-	if got := urlOf(t, conn, "hostport-ws-legacy"); got != "http://127.0.0.1:33605" {
+	if got := urlOf(t, conn, id2); got != "http://127.0.0.1:33605" {
 		t.Fatalf("legacy 127.0.0.1 host-port URL not preserved: got %q, want http://127.0.0.1:33605", got)
 	}
 }
@@ -353,7 +353,7 @@ func TestIntegration_RegistryRowState_RegisterOverwritesRuntime8000(t *testing.T
 	ctx := context.Background()
 
 	// Provisioner set the legacy 127.0.0.1:<port> URL (pre-round-3 path).
-	id := insertWorkspace(t, conn, "port8000-ws", "online", "http://127.0.0.1:8000")
+	id := insertWorkspaceWithURL(t, conn, "port8000-ws", "online", "http://127.0.0.1:8000")
 	// Runtime re-registers with its localhost:8000 fallback.
 	if _, err := conn.ExecContext(ctx, registerUpsertSQL,
 		id, id, "http://localhost:8000", `{"name":"x"}`, "push"); err != nil {
@@ -365,12 +365,12 @@ func TestIntegration_RegistryRowState_RegisterOverwritesRuntime8000(t *testing.T
 	}
 
 	// And vice-versa (existing localhost:8000 + runtime 127.0.0.1:8000):
-	insertWorkspaceWithURL(t, conn, "port8000-ws-2", "online", "http://localhost:8000")
+	id2 := insertWorkspaceWithURL(t, conn, "port8000-ws-2", "online", "http://localhost:8000")
 	if _, err := conn.ExecContext(ctx, registerUpsertSQL,
-		"port8000-ws-2", "port8000-ws-2", "http://127.0.0.1:8000", `{"name":"x"}`, "push"); err != nil {
+		id2, "port8000-ws-2", "http://127.0.0.1:8000", `{"name":"x"}`, "push"); err != nil {
 		t.Fatalf("register upsert 2: %v", err)
 	}
-	if got := urlOf(t, conn, "port8000-ws-2"); got != "http://127.0.0.1:8000" {
+	if got := urlOf(t, conn, id2); got != "http://127.0.0.1:8000" {
 		t.Fatalf("port-8000 reverse: got %q, want http://127.0.0.1:8000", got)
 	}
 }
@@ -390,7 +390,7 @@ func TestIntegration_RegistryRowState_RegisterOverwritesNonLocalhost(t *testing.
 	// in practice post-#1130, but if it did, the upsert must not preserve
 	// it — EXCLUDED.url is the new URL and the runtime's
 	// validateAgentURL already gated it).
-	id := insertWorkspace(t, conn, "nonlocal-ws", "online", "http://192.168.1.100:8080")
+	id := insertWorkspaceWithURL(t, conn, "nonlocal-ws", "online", "http://192.168.1.100:8080")
 	if _, err := conn.ExecContext(ctx, registerUpsertSQL,
 		id, id, "http://localhost:41751", `{"name":"x"}`, "push"); err != nil {
 		t.Fatalf("register upsert: %v", err)

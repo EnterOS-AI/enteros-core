@@ -31,7 +31,7 @@ func isProvisionerHostPortURL(u string) bool {
 	if u == "" {
 		return false
 	}
-	if !(strings.HasPrefix(u, "http://127.0.0.1:") || strings.HasPrefix(u, "http://localhost:")) {
+	if !strings.HasPrefix(u, "http://127.0.0.1:") && !strings.HasPrefix(u, "http://localhost:") {
 		return false
 	}
 	// Extract the trailing port.
@@ -45,8 +45,6 @@ func isProvisionerHostPortURL(u string) bool {
 	}
 	return n != 8000
 }
-
-
 
 // blockedRange is a named CIDR block so the conditional blocklist in
 // validateAgentURL reads as a slice of homogeneous values instead of
