@@ -767,7 +767,12 @@ export function MobileChat({
           <button
             type="button"
             onClick={() => fileInputRef.current?.click()}
-            disabled={!reachable || sending || uploading}
+            // Multi-send parity (core#2726 / CR2 #2762): the attach button
+            // must NOT disable while a send is in flight, so the user can add
+            // attachments to a follow-up message while the agent is still
+            // working. Keep the uploading gate (single concurrent upload) and
+            // the reachable gate (offline agent).
+            disabled={!reachable || uploading}
             aria-label="Attach"
             className="focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-100 dark:focus-visible:ring-offset-zinc-900"
             style={{
@@ -775,14 +780,14 @@ export function MobileChat({
               height: 32,
               borderRadius: 999,
               border: "none",
-              cursor: reachable && !sending && !uploading ? "pointer" : "not-allowed",
+              cursor: reachable && !uploading ? "pointer" : "not-allowed",
               background: "transparent",
               color: p.text3,
               flexShrink: 0,
               display: "flex",
               alignItems: "center",
               justifyContent: "center",
-              opacity: !reachable || sending || uploading ? 0.4 : 1,
+              opacity: !reachable || uploading ? 0.4 : 1,
             }}
           >
             {Icons.attach({ size: 16 })}

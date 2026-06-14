@@ -678,8 +678,11 @@ describe("MobileChat — thinking indicator (core#2720/#2745 parity)", () => {
 });
 
 describe("MobileChat — multi-send tap path (CR2 #2762)", () => {
-  it("Send button stays ENABLED during an in-flight send (tap multi-send)", async () => {
+  beforeEach(() => {
     mockStoreState.nodes = [onlineNode];
+  });
+
+  it("Send button stays ENABLED during an in-flight send (tap multi-send)", async () => {
     // First send hangs → sending stays true.
     vi.spyOn(api, "post").mockReturnValueOnce(new Promise(() => {}));
     const { container } = renderChat(mockAgentId);
@@ -697,5 +700,66 @@ describe("MobileChat — multi-send tap path (CR2 #2762)", () => {
       fireEvent.change(ta, { target: { value: "second" } });
     });
     expect(sendBtn().disabled).toBe(false);
+  });
+
+  it("Attach button stays ENABLED during an in-flight send (core#2762 follow-up)", async () => {
+    // First send hangs → sending stays true.
+    vi.spyOn(api, "post").mockReturnValueOnce(new Promise(() => {}));
+    const { container } = renderChat(mockAgentId);
+    const ta = container.querySelector("textarea") as HTMLTextAreaElement;
+    const sendBtn = container.querySelector('[aria-label="Send"]') as HTMLButtonElement;
+    const attachBtn = container.querySelector('[aria-label="Attach"]') as HTMLButtonElement;
+
+    await act(async () => {
+      fireEvent.change(ta, { target: { value: "first" } });
+    });
+    await act(async () => {
+      sendBtn.click();
+    });
+
+    // Attach must remain usable while the send is in flight.
+    expect(attachBtn.disabled).toBe(false);
+
+    // Selecting a file while sending should add it to the pending list.
+    const fileInput = container.querySelector('input[type="file"]') as HTMLInputElement;
+    const file = new File(["hello"], "note.txt", { type: "text/plain" });
+    await act(async () => {
+      fireEvent.change(fileInput, { target: { files: [file] } });
+    });
+    expect(container.textContent ?? "").toContain("note.txt");
+  });
+
+  it("clears the send-error banner when a follow-up send starts (multi-send banner-clear)", async () => {
+    const postSpy = vi.spyOn(api, "post");
+    // First send fails → error banner.
+    postSpy.mockRejectedValueOnce(new Error("boom"));
+    // Second send succeeds → banner must clear.
+    postSpy.mockResolvedValueOnce({ result: { parts: [] } });
+
+    const { container } = renderChat(mockAgentId);
+    const ta = container.querySelector("textarea") as HTMLTextAreaElement;
+    const sendBtn = container.querySelector('[aria-label="Send"]') as HTMLButtonElement;
+
+    await act(async () => {
+      fireEvent.change(ta, { target: { value: "first" } });
+    });
+    await act(async () => {
+      sendBtn.click();
+    });
+    await waitFor(() => {
+      expect(container.textContent ?? "").toContain("unreachable");
+    });
+
+    // Start a follow-up send; the banner should clear as soon as the new
+    // send is dispatched (send() calls clearError before awaiting the POST).
+    await act(async () => {
+      fireEvent.change(ta, { target: { value: "second" } });
+    });
+    await act(async () => {
+      sendBtn.click();
+    });
+    await waitFor(() => {
+      expect(container.textContent ?? "").not.toContain("unreachable");
+    });
   });
 });
