@@ -444,6 +444,196 @@ GOVERNANCE_REQUIRED_CONTEXTS = [
 ]
 
 
+# ── Signal 7: destructive-diff guard (core#2875) ────────────────────────────
+
+# Detects a stale-or-destructive PR: a branch that has either
+# (a) inherited massive destructive changes from its base (the
+# pre-stale state of the base has since been heavily edited on the
+# target branch, so the PR is now reverting large swaths of current
+# main), OR
+# (b) grown the destructive diff itself (files_changed >= 200 OR
+# net_deleted_lines >= 5000).
+#
+# Real example (the RCA that motivated this guard): PR #1100 was an
+# all-required-green stale branch whose current head reverted 481
+# files / -55k lines of current main. The all-required status
+# check was green but the diff was destructive. This signal blocks
+# that case at the gate level so it can never silently merge.
+#
+# Two-tier heuristic per Researcher's #2875 proposal:
+#   - BLOCK: high-confidence destructive condition (the destructive
+#     diff + the branch-diverged / stale state) AND not explicitly
+#     opted out via a refactor / migration / generated label.
+#   - WARN: moderate drift (commits_behind > 10, or any of the
+#     high-confidence thresholds halved) — operator should review.
+#   - CLEAR: no destructive pattern detected.
+#
+# All PR-file count + line-count comes from the Gitea PR-files API
+# (paginated; sum of `additions` + `deletions`). Refactor/migration
+# exemptions are read from PR labels (no PR-body parsing).
+REFACTOR_EXEMPT_LABELS = {"refactor", "migration", "generated", "vendor"}
+
+
+def _pr_diff_stats(pr_number: int, repo: str) -> dict:
+    """Fetch PR file changes + sum to (files_changed, added_lines, deleted_lines).
+
+    Returns an empty dict on API error — the caller treats missing data as
+    'cannot compute' (which falls into the WARN tier, not BLOCK, to avoid
+    false-positive blocks on transient API failures).
+    """
+    try:
+        files = api_list(f"/repos/{repo}/pulls/{pr_number}/files", per_page=200)
+    except GiteaError as e:
+        return {"error": str(e)}
+
+    files_changed = 0
+    added = 0
+    deleted = 0
+    for f in files:
+        # The Gitea PR-files API uses `additions` and `deletions` per file.
+        # Some older versions use `additions`/`deletions`; normalize both.
+        files_changed += 1
+        added += int(f.get("additions", 0) or 0)
+        deleted += int(f.get("deletions", 0) or 0)
+    return {
+        "files_changed": files_changed,
+        "added_lines": added,
+        "deleted_lines": deleted,
+        "net_deleted_lines": max(0, deleted - added),
+    }
+
+
+def _pr_has_refactor_exemption(pr_data: dict) -> bool:
+    """True iff the PR has a label in REFACTOR_EXEMPT_LABELS (e.g. 'refactor',
+    'migration', 'generated', 'vendor') that opts it out of the destructive
+    BLOCK. The exemption is LABEL-only (not PR-body-marker) because labels
+    are the canonical signal already understood by the rest of the gate
+    stack. Refactor-exempt PRs still get the WARN tier (not CLEAR) so
+    operators can see the destructive diff size — they just don't get
+    a BLOCK.
+    """
+    for label in pr_data.get("labels", []) or []:
+        name = (label.get("name") or "").lower()
+        if name in REFACTOR_EXEMPT_LABELS:
+            return True
+    return False
+
+
+def signal_7_destructive_diff_guard(
+    pr_number: int, repo: str, pr_data: dict | None = None
+) -> dict:
+    """core#2875 — BLOCK a PR when its destructive diff + branch-diverged
+    state match a high-confidence destructive pattern (a stale branch
+    that would silently revert large swaths of current main).
+
+    Computes:
+      - diff stats (files_changed, deleted_lines, net_deleted_lines)
+        from the PR-files API.
+      - branch divergence (base.sha vs current target-branch HEAD) and
+        commits_behind via signal_4's helper.
+      - refactor exemption via PR labels.
+
+    Verdict:
+      - BLOCK  when (files>=200 OR net_deleted>=5000 OR deleted>=10000)
+                AND (diverged OR commits_behind>20)
+                AND no refactor exemption.
+      - WARN   when (files>=50 OR net_deleted>=1000 OR deleted>=2000)
+                OR commits_behind>10.
+                (WARN also surfaces on API errors so transient fetches don't
+                silently pass.)
+      - CLEAR  otherwise.
+    """
+    if pr_data is None:
+        owner, name = repo.split("/", 1)
+        pr_data = api_get(f"/repos/{owner}/{name}/pulls/{pr_number}")
+
+    # Branch divergence: reuse the signal_4 helper's data
+    # (no need to re-derive diverged + commits_behind here).
+    sig4 = signal_4_branch_divergence(pr_number, repo, pr_data=pr_data)
+    diverged = bool(sig4.get("diverged", False))
+    commits_behind = int(sig4.get("commits_behind", 0) or 0)
+
+    # Diff stats from the PR-files API.
+    stats = _pr_diff_stats(pr_number, repo)
+    if "error" in stats:
+        # Cannot compute — surface as WARN (transient API failure
+        # shouldn't silently pass a destructive PR, but also shouldn't
+        # BLOCK on a missing-files transient).
+        return {
+            "signal": "destructive_diff_guard",
+            "verdict": "WARNING",
+            "reason": "could not fetch PR files API: " + stats["error"],
+            "diverged": diverged,
+            "commits_behind": commits_behind,
+        }
+
+    files_changed = stats["files_changed"]
+    deleted_lines = stats["deleted_lines"]
+    net_deleted = stats["net_deleted_lines"]
+    has_refactor_exemption = _pr_has_refactor_exemption(pr_data)
+
+    # High-confidence destructive condition:
+    #   - any of the destructive diff thresholds
+    #   - AND (branch is diverged OR has been sitting behind >20 commits)
+    #   - AND the PR is not explicitly opted out via a refactor/migration label.
+    destructive_diff = (
+        files_changed >= 200
+        or net_deleted >= 5000
+        or deleted_lines >= 10000
+    )
+    is_stale = diverged or commits_behind > 20
+    if destructive_diff and is_stale and not has_refactor_exemption:
+        return {
+            "signal": "destructive_diff_guard",
+            "verdict": "BLOCKED",
+            "diverged": diverged,
+            "commits_behind": commits_behind,
+            "files_changed": files_changed,
+            "added_lines": stats["added_lines"],
+            "deleted_lines": deleted_lines,
+            "net_deleted_lines": net_deleted,
+            "refactor_exemption": False,
+            "reason": (
+                f"destructive diff (files={files_changed}, net_deleted={net_deleted}, "
+                f"deleted={deleted_lines}) + stale branch "
+                f"(diverged={diverged}, commits_behind={commits_behind})"
+            ),
+        }
+
+    # Moderate-drift WARN: any of the moderate thresholds
+    # (operator should review but the PR isn't blocked).
+    moderate = (
+        files_changed >= 50
+        or net_deleted >= 1000
+        or deleted_lines >= 2000
+        or commits_behind > 10
+    )
+    if moderate:
+        return {
+            "signal": "destructive_diff_guard",
+            "verdict": "WARNING",
+            "diverged": diverged,
+            "commits_behind": commits_behind,
+            "files_changed": files_changed,
+            "added_lines": stats["added_lines"],
+            "deleted_lines": deleted_lines,
+            "net_deleted_lines": net_deleted,
+            "refactor_exemption": has_refactor_exemption,
+        }
+
+    return {
+        "signal": "destructive_diff_guard",
+        "verdict": "CLEAR",
+        "diverged": diverged,
+        "commits_behind": commits_behind,
+        "files_changed": files_changed,
+        "added_lines": stats["added_lines"],
+        "deleted_lines": deleted_lines,
+        "net_deleted_lines": net_deleted,
+        "refactor_exemption": has_refactor_exemption,
+    }
+
+
 def signal_6_ci(pr_number: int, repo: str, branch: str | None = None, pr_data: dict | None = None) -> dict:
     """
     Query combined CI status for PR head commit.
@@ -667,6 +857,7 @@ def run(repo: str, pr_number: int, post_comment: bool = False) -> dict:
             signal_3_staleness(pr_number, repo),
             signal_4_branch_divergence(pr_number, repo, pr_data=pr),
             signal_6_ci(pr_number, repo, branch=base_ref, pr_data=pr),
+            signal_7_destructive_diff_guard(pr_number, repo, pr_data=pr),
         ]
         verdict, blockers = compute_verdict(gates)
 

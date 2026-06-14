@@ -566,3 +566,264 @@ def test_signal_6_status_collapse_uses_max_id(monkeypatch):
     assert result["verdict"] == "CI_FAIL"
     assert TRUSTED_QA in result["failing_required"]
     assert result["all_check_statuses"][TRUSTED_QA] == "failure"
+
+
+
+# ── core#2875 — signal_7 destructive-diff guard tests ───────────────────────
+
+
+def test_signal_7_clear_when_diff_and_branch_both_small(monkeypatch):
+    mod = load_gate_check()
+    monkeypatch.setattr(mod, "signal_4_branch_divergence", lambda *a, **kw: {
+        "signal": "branch_divergence", "verdict": "CLEAR",
+        "diverged": False, "commits_behind": 0, "pr_files_count": 0,
+        "inherited_files": [], "new_work_files": [], "inherited_fraction": 0.0,
+    })
+    monkeypatch.setattr(mod, "_pr_diff_stats", lambda *a, **kw: {
+        "files_changed": 5, "added_lines": 10, "deleted_lines": 5, "net_deleted_lines": 0,
+    })
+    result = mod.signal_7_destructive_diff_guard(200, "molecule-ai/molecule-core", pr_data={"labels": []})
+    assert result["verdict"] == "CLEAR"
+    assert result["files_changed"] == 5
+    assert result["diverged"] is False
+
+
+def test_signal_7_warn_on_moderate_files_changed(monkeypatch):
+    mod = load_gate_check()
+    monkeypatch.setattr(mod, "signal_4_branch_divergence", lambda *a, **kw: {
+        "signal": "branch_divergence", "verdict": "CLEAR",
+        "diverged": False, "commits_behind": 0, "pr_files_count": 0,
+        "inherited_files": [], "new_work_files": [], "inherited_fraction": 0.0,
+    })
+    monkeypatch.setattr(mod, "_pr_diff_stats", lambda *a, **kw: {
+        "files_changed": 60, "added_lines": 100, "deleted_lines": 50, "net_deleted_lines": 0,
+    })
+    result = mod.signal_7_destructive_diff_guard(200, "molecule-ai/molecule-core", pr_data={"labels": []})
+    assert result["verdict"] == "WARNING"
+    assert result["files_changed"] == 60
+
+
+def test_signal_7_warn_on_moderate_net_deleted(monkeypatch):
+    mod = load_gate_check()
+    monkeypatch.setattr(mod, "signal_4_branch_divergence", lambda *a, **kw: {
+        "signal": "branch_divergence", "verdict": "CLEAR",
+        "diverged": False, "commits_behind": 0, "pr_files_count": 0,
+        "inherited_files": [], "new_work_files": [], "inherited_fraction": 0.0,
+    })
+    monkeypatch.setattr(mod, "_pr_diff_stats", lambda *a, **kw: {
+        "files_changed": 10, "added_lines": 100, "deleted_lines": 1500, "net_deleted_lines": 1400,
+    })
+    result = mod.signal_7_destructive_diff_guard(200, "molecule-ai/molecule-core", pr_data={"labels": []})
+    assert result["verdict"] == "WARNING"
+    assert result["net_deleted_lines"] == 1400
+
+
+def test_signal_7_warn_on_commits_behind_above_moderate(monkeypatch):
+    mod = load_gate_check()
+    monkeypatch.setattr(mod, "signal_4_branch_divergence", lambda *a, **kw: {
+        "signal": "branch_divergence", "verdict": "WARNING",
+        "diverged": True, "commits_behind": 15, "pr_files_count": 5,
+        "inherited_files": [], "new_work_files": [], "inherited_fraction": 0.0,
+    })
+    monkeypatch.setattr(mod, "_pr_diff_stats", lambda *a, **kw: {
+        "files_changed": 5, "added_lines": 10, "deleted_lines": 5, "net_deleted_lines": 0,
+    })
+    result = mod.signal_7_destructive_diff_guard(200, "molecule-ai/molecule-core", pr_data={"labels": []})
+    assert result["verdict"] == "WARNING"
+    assert result["commits_behind"] == 15
+
+
+def test_signal_7_block_on_high_confidence_destructive_diff(monkeypatch):
+    """The core#1100 / #2875 case: 481 files / -55k diff + stale branch."""
+    mod = load_gate_check()
+    monkeypatch.setattr(mod, "signal_4_branch_divergence", lambda *a, **kw: {
+        "signal": "branch_divergence", "verdict": "WARNING",
+        "diverged": True, "commits_behind": 25, "pr_files_count": 250,
+        "inherited_files": ["a.py", "b.py"], "new_work_files": ["c.py"], "inherited_fraction": 0.67,
+    })
+    monkeypatch.setattr(mod, "_pr_diff_stats", lambda *a, **kw: {
+        "files_changed": 481, "added_lines": 1000, "deleted_lines": 55800, "net_deleted_lines": 54800,
+    })
+    result = mod.signal_7_destructive_diff_guard(200, "molecule-ai/molecule-core", pr_data={"labels": []})
+    assert result["verdict"] == "BLOCKED"
+    assert result["files_changed"] == 481
+    assert result["net_deleted_lines"] == 54800
+    assert result["diverged"] is True
+    assert "destructive diff" in result["reason"]
+
+
+def test_signal_7_block_when_only_one_threshold_trips_but_branch_diverged(monkeypatch):
+    mod = load_gate_check()
+    monkeypatch.setattr(mod, "signal_4_branch_divergence", lambda *a, **kw: {
+        "signal": "branch_divergence", "verdict": "WARNING",
+        "diverged": True, "commits_behind": 25, "pr_files_count": 250,
+        "inherited_files": ["a.py"], "new_work_files": ["c.py"], "inherited_fraction": 0.5,
+    })
+    monkeypatch.setattr(mod, "_pr_diff_stats", lambda *a, **kw: {
+        "files_changed": 250, "added_lines": 200, "deleted_lines": 50, "net_deleted_lines": 0,
+    })
+    result = mod.signal_7_destructive_diff_guard(200, "molecule-ai/molecule-core", pr_data={"labels": []})
+    assert result["verdict"] == "BLOCKED"
+
+
+def test_signal_7_no_block_if_diff_destructive_but_branch_not_diverged(monkeypatch):
+    """Destructive diff alone (no stale branch) does NOT BLOCK —
+    prevents false-positive on large but intentional PRs."""
+    mod = load_gate_check()
+    monkeypatch.setattr(mod, "signal_4_branch_divergence", lambda *a, **kw: {
+        "signal": "branch_divergence", "verdict": "CLEAR",
+        "diverged": False, "commits_behind": 0, "pr_files_count": 0,
+        "inherited_files": [], "new_work_files": [], "inherited_fraction": 0.0,
+    })
+    monkeypatch.setattr(mod, "_pr_diff_stats", lambda *a, **kw: {
+        "files_changed": 481, "added_lines": 1000, "deleted_lines": 55800, "net_deleted_lines": 54800,
+    })
+    result = mod.signal_7_destructive_diff_guard(200, "molecule-ai/molecule-core", pr_data={"labels": []})
+    assert result["verdict"] == "WARNING"
+
+
+def test_signal_7_refactor_label_exempts_block(monkeypatch):
+    mod = load_gate_check()
+    monkeypatch.setattr(mod, "signal_4_branch_divergence", lambda *a, **kw: {
+        "signal": "branch_divergence", "verdict": "WARNING",
+        "diverged": True, "commits_behind": 25, "pr_files_count": 250,
+        "inherited_files": [], "new_work_files": [], "inherited_fraction": 0.5,
+    })
+    monkeypatch.setattr(mod, "_pr_diff_stats", lambda *a, **kw: {
+        "files_changed": 481, "added_lines": 1000, "deleted_lines": 55800, "net_deleted_lines": 54800,
+    })
+    result = mod.signal_7_destructive_diff_guard(
+        200, "molecule-ai/molecule-core",
+        pr_data={"labels": [{"name": "refactor"}, {"name": "needs_review"}]},
+    )
+    assert result["verdict"] == "WARNING"
+    assert result["refactor_exemption"] is True
+
+
+def test_signal_7_migration_label_exempts_block(monkeypatch):
+    mod = load_gate_check()
+    monkeypatch.setattr(mod, "signal_4_branch_divergence", lambda *a, **kw: {
+        "signal": "branch_divergence", "verdict": "WARNING",
+        "diverged": True, "commits_behind": 25, "pr_files_count": 250,
+        "inherited_files": [], "new_work_files": [], "inherited_fraction": 0.5,
+    })
+    monkeypatch.setattr(mod, "_pr_diff_stats", lambda *a, **kw: {
+        "files_changed": 300, "added_lines": 100, "deleted_lines": 8000, "net_deleted_lines": 7900,
+    })
+    result = mod.signal_7_destructive_diff_guard(
+        200, "molecule-ai/molecule-core",
+        pr_data={"labels": [{"name": "migration"}]},
+    )
+    assert result["verdict"] == "WARNING"
+    assert result["refactor_exemption"] is True
+
+
+def test_signal_7_generated_label_exempts_block(monkeypatch):
+    mod = load_gate_check()
+    monkeypatch.setattr(mod, "signal_4_branch_divergence", lambda *a, **kw: {
+        "signal": "branch_divergence", "verdict": "WARNING",
+        "diverged": True, "commits_behind": 25, "pr_files_count": 250,
+        "inherited_files": [], "new_work_files": [], "inherited_fraction": 0.5,
+    })
+    monkeypatch.setattr(mod, "_pr_diff_stats", lambda *a, **kw: {
+        "files_changed": 250, "added_lines": 50, "deleted_lines": 100, "net_deleted_lines": 50,
+    })
+    result = mod.signal_7_destructive_diff_guard(
+        200, "molecule-ai/molecule-core",
+        pr_data={"labels": [{"name": "generated"}]},
+    )
+    assert result["verdict"] == "WARNING"
+
+
+def test_signal_7_vendor_label_exempts_block(monkeypatch):
+    mod = load_gate_check()
+    monkeypatch.setattr(mod, "signal_4_branch_divergence", lambda *a, **kw: {
+        "signal": "branch_divergence", "verdict": "WARNING",
+        "diverged": True, "commits_behind": 25, "pr_files_count": 250,
+        "inherited_files": [], "new_work_files": [], "inherited_fraction": 0.5,
+    })
+    monkeypatch.setattr(mod, "_pr_diff_stats", lambda *a, **kw: {
+        "files_changed": 300, "added_lines": 10, "deleted_lines": 20000, "net_deleted_lines": 19990,
+    })
+    result = mod.signal_7_destructive_diff_guard(
+        200, "molecule-ai/molecule-core",
+        pr_data={"labels": [{"name": "vendor"}]},
+    )
+    assert result["verdict"] == "WARNING"
+
+
+def test_signal_7_case_insensitive_label_match(monkeypatch):
+    mod = load_gate_check()
+    monkeypatch.setattr(mod, "signal_4_branch_divergence", lambda *a, **kw: {
+        "signal": "branch_divergence", "verdict": "WARNING",
+        "diverged": True, "commits_behind": 25, "pr_files_count": 250,
+        "inherited_files": [], "new_work_files": [], "inherited_fraction": 0.5,
+    })
+    monkeypatch.setattr(mod, "_pr_diff_stats", lambda *a, **kw: {
+        "files_changed": 481, "added_lines": 1000, "deleted_lines": 55800, "net_deleted_lines": 54800,
+    })
+    result = mod.signal_7_destructive_diff_guard(
+        200, "molecule-ai/molecule-core",
+        pr_data={"labels": [{"name": "Refactor"}]},
+    )
+    assert result["verdict"] == "WARNING"
+    assert result["refactor_exemption"] is True
+
+
+def test_signal_7_files_api_error_returns_warning(monkeypatch):
+    """A transient PR-files API error must surface as WARN, not BLOCK
+    (transient failure shouldn't gate-block a real PR)."""
+    mod = load_gate_check()
+    monkeypatch.setattr(mod, "signal_4_branch_divergence", lambda *a, **kw: {
+        "signal": "branch_divergence", "verdict": "CLEAR",
+        "diverged": False, "commits_behind": 0, "pr_files_count": 0,
+        "inherited_files": [], "new_work_files": [], "inherited_fraction": 0.0,
+    })
+    monkeypatch.setattr(mod, "_pr_diff_stats", lambda *a, **kw: {"error": "404 page not found"})
+    result = mod.signal_7_destructive_diff_guard(200, "molecule-ai/molecule-core", pr_data={"labels": []})
+    assert result["verdict"] == "WARNING"
+    assert "could not fetch PR files API" in result["reason"]
+
+
+def test_signal_7_net_deleted_uses_max_zero_underflow(monkeypatch):
+    """A PR that ADDS more than it deletes (a large refactor rewrite) should
+    have net_deleted_lines=0, NOT a negative number. The block must
+    use net_deleted_lines (>= 5000), not raw deleted_lines minus added_lines."""
+    mod = load_gate_check()
+    monkeypatch.setattr(mod, "signal_4_branch_divergence", lambda *a, **kw: {
+        "signal": "branch_divergence", "verdict": "WARNING",
+        "diverged": True, "commits_behind": 25, "pr_files_count": 250,
+        "inherited_files": [], "new_work_files": [], "inherited_fraction": 0.5,
+    })
+    # deleted=100, added=200 → net should clamp to 0 (not -100)
+    monkeypatch.setattr(mod, "_pr_diff_stats", lambda *a, **kw: {
+        "files_changed": 5, "added_lines": 200, "deleted_lines": 100, "net_deleted_lines": 0,
+    })
+    result = mod.signal_7_destructive_diff_guard(200, "molecule-ai/molecule-core", pr_data={"labels": []})
+    # files=5 (small) + net=0 (small) + diverged → moderate? files<50, net<1000, deleted<2000, commits_behind>10 → WARN
+    assert result["net_deleted_lines"] == 0
+
+
+def test_signal_7_refactor_exempt_with_still_high_diff_surfaces_numbers(monkeypatch):
+    """When refactor-exemption applies, the WARN result should still
+    surface the destructive numbers so an operator can review the size."""
+    mod = load_gate_check()
+    monkeypatch.setattr(mod, "signal_4_branch_divergence", lambda *a, **kw: {
+        "signal": "branch_divergence", "verdict": "WARNING",
+        "diverged": True, "commits_behind": 25, "pr_files_count": 250,
+        "inherited_files": [], "new_work_files": [], "inherited_fraction": 0.5,
+    })
+    monkeypatch.setattr(mod, "_pr_diff_stats", lambda *a, **kw: {
+        "files_changed": 481, "added_lines": 1000, "deleted_lines": 55800, "net_deleted_lines": 54800,
+    })
+    result = mod.signal_7_destructive_diff_guard(
+        200, "molecule-ai/molecule-core",
+        pr_data={"labels": [{"name": "refactor"}]},
+    )
+    assert result["verdict"] == "WARNING"
+    # WARN still surfaces the destructive numbers for human review
+    assert result["files_changed"] == 481
+    assert result["net_deleted_lines"] == 54800
+    assert result["deleted_lines"] == 55800
+    assert result["diverged"] is True
+    assert result["refactor_exemption"] is True
