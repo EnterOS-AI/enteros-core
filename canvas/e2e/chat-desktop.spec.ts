@@ -1,7 +1,7 @@
 import { test, expect } from "@playwright/test";
 import type { Page } from "@playwright/test";
 import { startEchoRuntime, type EchoRuntime } from "./fixtures/echo-runtime";
-import { seedWorkspace, startHeartbeat, cleanupWorkspace, runPsql } from "./fixtures/chat-seed";
+import { seedWorkspace, startHeartbeat, cleanupWorkspace, runPsql, seedChatHistory } from "./fixtures/chat-seed";
 
 /** Enter the Org-map view so the Canvas (React Flow graph) mounts. */
 async function enterMapView(page: Page): Promise<void> {
@@ -22,6 +22,15 @@ test.describe("Desktop ChatTab", () => {
     workspaceId = ws.id;
     workspaceName = ws.name;
     const stopHeartbeat = startHeartbeat(ws.id, ws.authToken);
+
+    // Seed chat history so the "chat panel loads" test starts from a
+    // non-empty transcript state. Without this, the panel may render the
+    // empty placeholder on first open, making the hasHistory assertion
+    // false-red even though the fixture is otherwise correct.
+    await seedChatHistory(workspaceId, [
+      { role: "user", content: "Hello from seed" },
+      { role: "agent", content: "Echo: Hello from seed" },
+    ]);
 
     cleanup = async () => {
       stopHeartbeat();
@@ -65,7 +74,12 @@ test.describe("Desktop ChatTab", () => {
   test("chat panel loads without error", async ({ page }) => {
     const hasEmptyState = await page.getByText("Send a message to start chatting.").isVisible().catch(() => false);
     const hasHistory = await page.locator("#panel-chat [data-testid='chat-panel']:visible").locator("div").count() > 3;
-    expect(hasEmptyState || hasHistory).toBeTruthy();
+    // The workspace is seeded with chat history; empty-state here is a
+    // hydration/render failure, not a valid initial condition. Require
+    // history AND reject empty state to avoid the false-green where the
+    // panel renders the empty placeholder but no seeded transcript.
+    expect(hasHistory, "seeded chat history should be visible in the panel").toBeTruthy();
+    expect(hasEmptyState, "empty state should not appear when seeded history exists").toBeFalsy();
   });
 
   test("echo fixture workspace is configured for push delivery", async () => {
