@@ -86,7 +86,7 @@ case "$HEALTH_CODE" in
     *)             ko "alpha /health did not respond ok: $HEALTH" ;;
 esac
 
-WS=$(curl_alpha_admin "$BASE/admin/workspaces/$ALPHA_WORKSPACE_ID")
+WS=$(curl_alpha_admin "$BASE/workspaces/$ALPHA_WORKSPACE_ID")
 WS_ID=$(echo "$WS" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("id") or d.get("workspace_id") or "")' 2>/dev/null || echo "")
 if [ -n "$WS_ID" ]; then
     ok "seeded workspace resolves (id=$WS_ID)"
