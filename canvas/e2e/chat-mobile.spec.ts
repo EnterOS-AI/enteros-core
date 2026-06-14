@@ -1,6 +1,6 @@
 import { test, expect } from "@playwright/test";
 import { startEchoRuntime } from "./fixtures/echo-runtime";
-import { seedWorkspace, startHeartbeat, cleanupWorkspace } from "./fixtures/chat-seed";
+import { seedWorkspace, startHeartbeat, cleanupWorkspace, seedChatHistory } from "./fixtures/chat-seed";
 
 
 test.describe("MobileChat", () => {
@@ -12,6 +12,15 @@ test.describe("MobileChat", () => {
     const ws = await seedWorkspace(echo.baseURL);
     workspaceId = ws.id;
     const stopHeartbeat = startHeartbeat(ws.id, ws.authToken);
+
+    // Seed chat history so the "chat panel loads" test starts from a
+    // non-empty transcript state. Without this, the panel may render the
+    // empty placeholder on first open, making the hasHistory assertion
+    // false-red even though the fixture is otherwise correct.
+    await seedChatHistory(workspaceId, [
+      { role: "user", content: "Hello from mobile seed" },
+      { role: "agent", content: "Echo: Hello from mobile seed" },
+    ]);
 
     cleanup = async () => {
       stopHeartbeat();
@@ -44,7 +53,12 @@ test.describe("MobileChat", () => {
   test("chat panel loads without error", async ({ page }) => {
     const hasEmptyState = await page.getByText("Send a message to start chatting.").isVisible().catch(() => false);
     const hasHistory = await page.locator("[data-testid='chat-panel']").locator("div").count() > 3;
-    expect(hasEmptyState || hasHistory).toBeTruthy();
+    // The workspace is seeded with chat history; empty-state here is a
+    // hydration/render failure, not a valid initial condition. Require
+    // history AND reject empty state to avoid the false-green where the
+    // panel renders the empty placeholder but no seeded transcript.
+    expect(hasHistory, "seeded chat history should be visible in the panel").toBeTruthy();
+    expect(hasEmptyState, "empty state should not appear when seeded history exists").toBeFalsy();
   });
 
   test("send text message and receive echo response", async ({ page }) => {
