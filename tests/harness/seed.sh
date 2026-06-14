@@ -25,19 +25,20 @@ source "$HERE/_curl.sh"
 
 create_workspace() {
     local tenant="$1" name="$2" tier="$3" parent="${4:-}"
-    # Use a platform-billed model (vendor/model slash form, e.g.
-    # moonshot/kimi-k2.6) — the harness has no BYOK credentials
-    # provisioned. `claude-code/sonnet` would 422 with
-    # MISSING_BYOK_CREDENTIAL (core#2608 create-boundary hard-reject);
-    # `mock/echo` is the runtime the harness actually uses for replays
-    # but POST /workspaces may not accept the slash form there.
-    # moonshot/kimi-k2.6 is platform-billed (no key needed) and
-    # supported by the harness's runtime registry.
+    # Use the harness's actual default runtime (hermes echo — what the
+    # replays use). The runtime registry loaded at tenant boot
+    # (workspaces can POST runtime="hermes"; the registry rejects
+    # any runtime not on its allowlist with FAIL-CLOSED 422).
+    # The model is the runtime's default — the harness doesn't
+    # exercise the LLM proxy (replays use the echo runtime), so
+    # specifying the model would just trip the core#2608
+    # create-boundary BYOK check. Leaving model empty uses the
+    # runtime's baked-in default (no BYOK check).
     local body
     if [ -n "$parent" ]; then
-        body="{\"name\":\"$name\",\"tier\":$tier,\"parent_id\":\"$parent\",\"runtime\":\"moonshot\",\"model\":\"moonshot/kimi-k2.6\"}"
+        body="{\"name\":\"$name\",\"tier\":$tier,\"parent_id\":\"$parent\",\"runtime\":\"hermes\"}"
     else
-        body="{\"name\":\"$name\",\"tier\":$tier,\"runtime\":\"moonshot\",\"model\":\"moonshot/kimi-k2.6\"}"
+        body="{\"name\":\"$name\",\"tier\":$tier,\"runtime\":\"hermes\"}"
     fi
     local id
     if [ "$tenant" = "alpha" ]; then
