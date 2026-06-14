@@ -3044,14 +3044,10 @@ func TestCanvasA2ASyncBudget_DefaultIs90s(t *testing.T) {
 // duration → that duration. Invalid values fall back to the 90s default.
 //
 // Note: envx.Duration treats `0` and negative values as "not set" (the
-// `d > 0` check), so they fall through to the 90s default. This
-// matches the operator's mental model — a non-positive cap would
-// silently fall back to the safe default rather than disabling the
-// cap. The cap is only disabled by `0` reaching the handler's
-// `budget > 0` check, which requires the env var to be UNSET (in
-// which case the default 90s is returned and the cap fires). For
-// the legacy synchronous path, operators must either remove the
-// env var AND patch the default, or apply a hot-fix.
+// `d > 0` check), so they fall through to the 90s default. The
+// runtime kill-switch A2A_CANVAS_SYNC_DISABLE (separate env var) is
+// the operator's way to disable the cap at runtime — see
+// TestCanvasA2ASyncDisabled.
 func TestCanvasA2ASyncBudget_EnvOverride(t *testing.T) {
 	t.Setenv("A2A_CANVAS_SYNC_BUDGET", "60s")
 	if got := canvasA2ASyncBudget(); got != 60*time.Second {
@@ -3071,6 +3067,118 @@ func TestCanvasA2ASyncBudget_EnvOverride(t *testing.T) {
 	t.Setenv("A2A_CANVAS_SYNC_BUDGET", "0")
 	if got := canvasA2ASyncBudget(); got != 90*time.Second {
 		t.Errorf("A2A_CANVAS_SYNC_BUDGET=0 should fall back to the 90s default (envx treats 0 as not-set); got %v", got)
+	}
+}
+
+// TestCanvasA2ASyncDisabled pins the runtime kill-switch (core#2751 RC
+// #11552): A2A_CANVAS_SYNC_DISABLE=1 (or any truthy value) flips the
+// canvas to the legacy synchronous path, independent of the budget.
+// Defaults to false (cap enabled). Truthy values: 1, t, true, TRUE, T
+// (per envx.Bool semantics). Falsy: 0, f, false, FALSE, F, empty.
+func TestCanvasA2ASyncDisabled(t *testing.T) {
+	t.Setenv("A2A_CANVAS_SYNC_DISABLE", "")
+	if got := canvasA2ASyncDisabled(); got != false {
+		t.Errorf("A2A_CANVAS_SYNC_DISABLE unset should be false (cap enabled); got %v", got)
+	}
+
+	t.Setenv("A2A_CANVAS_SYNC_DISABLE", "1")
+	if got := canvasA2ASyncDisabled(); got != true {
+		t.Errorf("A2A_CANVAS_SYNC_DISABLE=1 should disable the cap; got %v", got)
+	}
+
+	t.Setenv("A2A_CANVAS_SYNC_DISABLE", "true")
+	if got := canvasA2ASyncDisabled(); got != true {
+		t.Errorf("A2A_CANVAS_SYNC_DISABLE=true should disable the cap; got %v", got)
+	}
+
+	t.Setenv("A2A_CANVAS_SYNC_DISABLE", "0")
+	if got := canvasA2ASyncDisabled(); got != false {
+		t.Errorf("A2A_CANVAS_SYNC_DISABLE=0 should leave the cap enabled; got %v", got)
+	}
+
+	t.Setenv("A2A_CANVAS_SYNC_DISABLE", "false")
+	if got := canvasA2ASyncDisabled(); got != false {
+		t.Errorf("A2A_CANVAS_SYNC_DISABLE=false should leave the cap enabled; got %v", got)
+	}
+
+	t.Setenv("A2A_CANVAS_SYNC_DISABLE", "invalid")
+	if got := canvasA2ASyncDisabled(); got != false {
+		t.Errorf("invalid A2A_CANVAS_SYNC_DISABLE should fall back to false (cap enabled); got %v", got)
+	}
+}
+
+// TestProxyA2A_CanvasCapAndQueue_RuntimeKillSwitchDisabled pins the
+// integration behavior: when A2A_CANVAS_SYNC_DISABLE=1, a canvas turn
+// that WOULD exceed the synchronous budget (e.g., a tiny 50ms budget
+// + a slow 500ms agent) does NOT return `{status:"queued"}` — the
+// kill-switch forces the legacy synchronous path, the handler waits
+// the full agent duration, and the actual reply is returned inline.
+//
+// This is the CTO-priority ops escape hatch for the durable fix: if
+// the async path misbehaves in prod, ops can disable it without a
+// deploy. This test proves the disable actually works.
+func TestProxyA2A_CanvasCapAndQueue_RuntimeKillSwitchDisabled(t *testing.T) {
+	// Sub-budget (50ms) to force the queued path... if the kill-switch
+	// were NOT honored, this would trigger the queued ack. The kill-
+	// switch inverts the expectation: the handler should wait the full
+	// agent hold and return the actual reply.
+	t.Setenv("A2A_CANVAS_SYNC_BUDGET", "50ms")
+	t.Setenv("A2A_CANVAS_SYNC_DISABLE", "1")
+
+	mock := setupTestDB(t)
+	mr := setupTestRedis(t)
+	allowLoopbackForTest(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+	waitForHandlerAsyncBeforeDBCleanup(t, handler)
+
+	// Agent holds 500ms (>> 50ms budget — would force queued path if
+	// the kill-switch were not honored).
+	agentServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(500 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, `{"jsonrpc":"2.0","id":"req-1","result":{"status":"ok","reply":"kill-switch-disabled-reply"}}`)
+	}))
+	defer agentServer.Close()
+
+	mr.Set(fmt.Sprintf("ws:%s:url", "ws-killswitch"), agentServer.URL)
+	expectBudgetCheck(mock, "ws-killswitch")
+	// persistUserMessageAtIngest + logA2ASuccess fire on the synchronous
+	// path (no detached goroutine). .Maybe()-style tolerance.
+	mock.ExpectExec("INSERT INTO activity_logs").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO activity_logs").WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-killswitch"}}
+	body := `{"jsonrpc":"2.0","id":"req-1","method":"message/send","params":{"message":{"role":"user","messageId":"msg-ks-001","parts":[{"text":"hi"}]}}}`
+	c.Request = httptest.NewRequest("POST", "/workspaces/ws-killswitch/a2a", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	start := time.Now()
+	handler.ProxyA2A(c)
+	elapsed := time.Since(start)
+
+	// 1. The HTTP response is the ACTUAL AGENT REPLY (not the queued
+	// ack). The kill-switch forces the legacy synchronous path, so the
+	// handler waits the full agent duration.
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 (agent reply), got %d: %s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), `"queued"`) {
+		t.Errorf("kill-switch should suppress the queued ack; got: %s", w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"kill-switch-disabled-reply"`) {
+		t.Errorf("expected actual agent reply (containing the reply field), got: %s", w.Body.String())
+	}
+	// 2. The handler waited the full ~500ms agent hold (NOT ~50ms
+	// budget). Proves the kill-switch bypasses the cap-and-queue
+	// goroutine entirely.
+	if elapsed < 400*time.Millisecond {
+		t.Errorf("handler returned too quickly (%v); the kill-switch should NOT have fired the queued-ack path — the agent should have replied inline after ~500ms", elapsed)
+	}
+	if elapsed > 1*time.Second {
+		t.Errorf("handler took too long (%v); expected ~500ms agent hold", elapsed)
 	}
 }
 

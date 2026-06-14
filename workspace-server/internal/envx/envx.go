@@ -37,3 +37,19 @@ func Int64(name string, def int64) int64 {
 	}
 	return def
 }
+
+// Bool reads `name` as a boolean. Returns `def` when unset or unparseable.
+// Truthy values per strconv.ParseBool: 1, t, T, TRUE, true, True.
+// Falsy: 0, f, F, FALSE, false, False, empty.
+// All other values (including "yes", "on", "y", "n") are unparseable and
+// return def. Use Bool for feature flags where the operator's mental
+// model is "set truthy to enable" — a misconfigured value falls through
+// to the safe default rather than silently enabling a feature.
+func Bool(name string, def bool) bool {
+	if v := os.Getenv(name); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			return b
+		}
+	}
+	return def
+}
