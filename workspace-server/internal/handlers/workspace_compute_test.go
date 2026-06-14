@@ -427,6 +427,35 @@ func TestComputeOptions_DefaultsAreValidForTheirProvider(t *testing.T) {
 	}
 }
 
+// TestComputeOptions_DisplayDefaultsAreValidForTheirProvider is
+// the core#2489-A phase-2 enabler: the new
+// workspaceComputeDisplayDefaultByProvider map (the per-provider
+// display-mode default — distinct from the headless default
+// because display boxes need a larger default like t3.xlarge)
+// MUST satisfy the same allowlist + coverage invariant as the
+// existing defaults map. Codifying the prior hardcoded
+// `DEFAULT_DISPLAY_INSTANCE_TYPE = "t3.xlarge"` canvas
+// constant into the SSOT means the SSOT now drives the
+// canvas's display-mode default — the canvas PR that
+// REPLACES the hardcoded constant can rely on this test as
+// the contract pin.
+func TestComputeOptions_DisplayDefaultsAreValidForTheirProvider(t *testing.T) {
+	for provider, def := range workspaceComputeDisplayDefaultByProvider {
+		if !instanceTypeAllowedForProvider(provider, def) {
+			t.Errorf("display-default instance %q for provider %q is not in that provider's allowlist (a bad display-default would silently break the canvas's create flow)", def, provider)
+		}
+	}
+	// Every provider must have a display-default (so the create
+	// flow's display-mode branch never lands on "" — would
+	// silently fall back to the canvas's hardcoded t3.xlarge,
+	// defeating the SSOT).
+	for _, p := range workspaceComputeProvidersOrdered {
+		if workspaceComputeDisplayDefaultByProvider[p] == "" {
+			t.Errorf("provider %q has no display-default instance type (the canvas's CreateWorkspaceDialog would silently fall back to the hardcoded t3.xlarge — exactly the #2489 drift we're consolidating)", p)
+		}
+	}
+}
+
 // core#2489: the GET /compute-options endpoint returns exactly the SSOT data the
 // canvas renders dropdowns from. Every (provider, instance-type) it advertises
 // MUST pass validateWorkspaceCompute — the whole point of the consolidation.
@@ -818,7 +847,7 @@ func TestComputeMetadata_ReturnsProviderAllowlist(t *testing.T) {
 	}
 	want := []struct {
 		id, label, defaultInstance string
-		instanceCount             int
+		instanceCount              int
 	}{
 		{"aws", "AWS (default)", "t3.medium", 7},
 		{"gcp", "GCP", "e2-standard-2", 5},
@@ -837,6 +866,43 @@ func TestComputeMetadata_ReturnsProviderAllowlist(t *testing.T) {
 		}
 		if len(p.Instances) != w.instanceCount {
 			t.Errorf("providers[%d].instances len = %d, want %d", i, len(p.Instances), w.instanceCount)
+		}
+	}
+}
+
+// TestComputeOptions_ResponseIncludesDisplayDefaults pins the
+// core#2489-A phase-2 enabler: the /compute/metadata response
+// (or buildComputeOptions() directly) must include the new
+// `display_defaults` field so the canvas's CreateWorkspaceDialog
+// (follow-up PR) can REPLACE the hardcoded
+// `DEFAULT_DISPLAY_INSTANCE_TYPE = "t3.xlarge"` constant.
+// Codifies the SSOT contract for the display-mode create flow.
+func TestComputeOptions_ResponseIncludesDisplayDefaults(t *testing.T) {
+	resp := buildComputeOptions()
+	if len(resp.DisplayDefaults) == 0 {
+		t.Fatal("buildComputeOptions() returned empty DisplayDefaults; the core#2489 phase-2 enabler is missing")
+	}
+	wantDefaults := map[string]string{
+		"aws":     "t3.xlarge",
+		"hetzner": "cpx41",
+		"gcp":     "e2-standard-4",
+	}
+	for provider, want := range wantDefaults {
+		got, ok := resp.DisplayDefaults[provider]
+		if !ok {
+			t.Errorf("buildComputeOptions().DisplayDefaults missing provider %q (was: %v)", provider, resp.DisplayDefaults)
+			continue
+		}
+		if got != want {
+			t.Errorf("buildComputeOptions().DisplayDefaults[%q] = %q, want %q (matches the canvas's prior hardcoded t3.xlarge constant)", provider, got, want)
+		}
+	}
+	// Every Providers entry must have a DisplayDefaults entry
+	// (the SSOT-consistency check enforces this at boot, but a
+	// test pin makes the contract greppable).
+	for _, p := range resp.Providers {
+		if _, ok := resp.DisplayDefaults[p]; !ok {
+			t.Errorf("buildComputeOptions() has provider %q with no DisplayDefaults entry", p)
 		}
 	}
 }
@@ -932,6 +998,7 @@ func TestComputeMetadata_InitPanicsOnLabelMissingFromProviders(t *testing.T) {
 		mutatedLabels,
 		workspaceComputeMetadataRenderOrder,
 		workspaceComputeDefaultInstanceByProvider,
+		workspaceComputeDisplayDefaultByProvider,
 		workspaceComputeInstanceTypesOrdered,
 	)
 }
@@ -962,6 +1029,7 @@ func TestComputeMetadata_InitPanicsOnProviderMissingLabel(t *testing.T) {
 		workspaceComputeProviderLabels,
 		workspaceComputeMetadataRenderOrder,
 		workspaceComputeDefaultInstanceByProvider,
+		workspaceComputeDisplayDefaultByProvider,
 		workspaceComputeInstanceTypesOrdered,
 	)
 }
@@ -993,6 +1061,7 @@ func TestComputeMetadata_InitPanicsOnRenderOrderEntryMissingProvider(t *testing.
 		workspaceComputeProviderLabels,
 		mutatedRender,
 		workspaceComputeDefaultInstanceByProvider,
+		workspaceComputeDisplayDefaultByProvider,
 		workspaceComputeInstanceTypesOrdered,
 	)
 }
@@ -1029,6 +1098,7 @@ func TestComputeMetadata_InitPanicsOnProviderMissingFromRenderOrder(t *testing.T
 		mutatedLabels,
 		workspaceComputeMetadataRenderOrder,
 		workspaceComputeDefaultInstanceByProvider,
+		workspaceComputeDisplayDefaultByProvider,
 		workspaceComputeInstanceTypesOrdered,
 	)
 }
@@ -1058,6 +1128,7 @@ func TestComputeMetadata_InitPanicsOnDuplicateRenderOrderEntry(t *testing.T) {
 		workspaceComputeProviderLabels,
 		mutatedRender,
 		workspaceComputeDefaultInstanceByProvider,
+		workspaceComputeDisplayDefaultByProvider,
 		workspaceComputeInstanceTypesOrdered,
 	)
 }
@@ -1093,6 +1164,48 @@ func TestComputeMetadata_InitPanicsOnRenderOrderEntryMissingDefault(t *testing.T
 		workspaceComputeProviderLabels,
 		workspaceComputeMetadataRenderOrder,
 		mutatedDefaults,
+		workspaceComputeDisplayDefaultByProvider,
+		workspaceComputeInstanceTypesOrdered,
+	)
+}
+
+// TestComputeMetadata_InitPanicsOnRenderOrderEntryMissingDisplayDefault
+// is the core#2489-A negative case for direction 3.c (render-
+// order entry without a display-default). A render entry whose
+// provider has no display-default would silently fall back to
+// the canvas's hardcoded "t3.xlarge" in CreateWorkspaceDialog
+// — silently re-introducing the EXACT drift bug #2489 was
+// opened to fix. The production check must panic.
+func TestComputeMetadata_InitPanicsOnRenderOrderEntryMissingDisplayDefault(t *testing.T) {
+	// Mutate: remove the "gcp" display-default.
+	mutatedDisplayDefaults := make(map[string]string, len(workspaceComputeDisplayDefaultByProvider))
+	for k, v := range workspaceComputeDisplayDefaultByProvider {
+		if k == "gcp" {
+			continue
+		}
+		mutatedDisplayDefaults[k] = v
+	}
+
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected panic on render-order-entry-without-display-default, got nil (production checkComputeSSOTConsistency is too lenient)")
+		}
+		msg, _ := r.(string)
+		if !strings.Contains(msg, "gcp") {
+			t.Errorf("panic message should mention the offending provider 'gcp', got: %q", msg)
+		}
+		if !strings.Contains(msg, "display-default") {
+			t.Errorf("panic message should mention 'display-default' (so a future maintainer can grep the message), got: %q", msg)
+		}
+	}()
+
+	checkComputeSSOTConsistency(
+		workspaceComputeProvidersOrdered,
+		workspaceComputeProviderLabels,
+		workspaceComputeMetadataRenderOrder,
+		workspaceComputeDefaultInstanceByProvider,
+		mutatedDisplayDefaults,
 		workspaceComputeInstanceTypesOrdered,
 	)
 }
@@ -1129,6 +1242,7 @@ func TestComputeMetadata_InitPanicsOnRenderOrderEntryEmptyInstanceTypes(t *testi
 		workspaceComputeProviderLabels,
 		workspaceComputeMetadataRenderOrder,
 		workspaceComputeDefaultInstanceByProvider,
+		workspaceComputeDisplayDefaultByProvider,
 		mutatedInstances,
 	)
 }
@@ -1150,6 +1264,7 @@ func TestComputeMetadata_InitAcceptsLiveSSOT(t *testing.T) {
 		workspaceComputeProviderLabels,
 		workspaceComputeMetadataRenderOrder,
 		workspaceComputeDefaultInstanceByProvider,
+		workspaceComputeDisplayDefaultByProvider,
 		workspaceComputeInstanceTypesOrdered,
 	)
 }
