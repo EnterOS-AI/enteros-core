@@ -109,6 +109,18 @@ Delete from core: `EnableSEOSkillPackage`, `SEOSkillPackageFiles()`, `SEOSkillCo
 - **Per-template flags (`EnableSEOSkillPackage`, status quo of #2838):** O(templates) patches, layering violation, ships disabled; rejected (this RFC deletes it).
 - **Bake skills into the runtime image:** couples per-template content to image builds, breaks the "template owns its skills" SSOT; rejected.
 
+## 10a. Sibling anti-pattern found in the audit: the concierge identity is hardcoded in core
+
+The same "should be a template, not a patch" smell exists for the **org concierge / platform agent**. `workspace-server/internal/handlers/platform_agent.go` hardcodes its entire identity in Go:
+- `conciergeSystemPromptTmpl` — the full "You are … the Org Concierge / org orchestrator" system prompt (string literal).
+- `conciergeMCPServersBlock` — its `mcp_servers:` config block.
+- `conciergeDeclaredModel = "moonshot/kimi-k2.6"`, `conciergeRuntime = "claude-code"`.
+- `conciergeIdentityFiles()` overlays these as `system-prompt.md` + `config.yaml` at provision.
+
+The concierge has an image (`Dockerfile.platform-agent`) but **no template home for its identity** — so its prompt/config/model live as core string literals, exactly like the SEO skill files did. The fix is the same abstraction: make the concierge a **platform-agent template** (prompt/config/model in template files) delivered via this RFC's generic asset channel, and delete the `conciergeSystemPromptTmpl`/`conciergeMCPServersBlock`/`conciergeIdentityFiles` literals from core. The asset channel introduced here is the enabler for removing **both** the SEO patch **and** the concierge hardcoding.
+
+**Audit scope notes:** per-runtime branches in core (e.g. `if runtime == "hermes"` for provision-timeout/config paths) are adapter/registry concerns, not per-template patches — lower priority, candidates for data-driven cleanup but not in this RFC. No plugin-behavior was found hardcoded in core (the plugin system is used for extensions). The two clear "should be a template" patches are: (1) SEO skill package, (2) concierge identity.
+
 ## 10. What we keep
 - The merged runtime memory fix (#125/#134) — orthogonal.
 - #2838's reconciliation scaffold + allowlist (the generic half) — retained; only the SEO-specific injection is removed.
