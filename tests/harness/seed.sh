@@ -87,6 +87,9 @@ echo "[seed]   beta-child   id=$BETA_CHILD_ID"
 #
 # Backwards-compat: ALPHA_ID + BETA_ID aliases keep pre-Phase-2 replays
 # working (they used these names for the alpha tenant's parent + child).
+# Also: ALPHA_WORKSPACE_ID + BETA_WORKSPACE_ID aliases for the canary-
+# smoke a2a-pong + org-create-400 replays (they expect a single
+# "workspace" name per tenant; defaulting to the parent).
 {
     echo "ALPHA_PARENT_ID=$ALPHA_PARENT_ID"
     echo "ALPHA_CHILD_ID=$ALPHA_CHILD_ID"
@@ -95,6 +98,12 @@ echo "[seed]   beta-child   id=$BETA_CHILD_ID"
     echo "# legacy aliases — pre-Phase-2 replays expect these names"
     echo "ALPHA_ID=$ALPHA_PARENT_ID"
     echo "BETA_ID=$ALPHA_CHILD_ID"
+    echo "# canary-smoke replays (a2a-pong, org-create-400) expect a single
+# workspace name per tenant; default to the parent workspace.
+# (The replays don't use child workspaces, so parent == "the
+# workspace" for their purposes.)"
+    echo "ALPHA_WORKSPACE_ID=$ALPHA_PARENT_ID"
+    echo "BETA_WORKSPACE_ID=$BETA_PARENT_ID"
 } > "$HERE/.seed.env"
 
 echo ""
