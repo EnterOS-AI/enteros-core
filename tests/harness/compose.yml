@@ -48,6 +48,16 @@ services:
     environment:
       PORT: "9090"
       CP_STUB_PEERS_MODE: "${CP_STUB_PEERS_MODE:-}"
+    # #2867 address-fix: replays run on the host (./run-all-replays.sh),
+    # not inside a harness-net container, so the cp-stub's port 9090
+    # MUST be published to the host loopback. Without this, the
+    # canary-smoke-org-create-400-capture replay gets "could not
+    # resolve host cp-stub" / HTTP 000 (the harness job 501121
+    # round-7 failure). Note: the cf-proxy (line ~212) already does
+    # this for port 8080; the cp-stub was the only service missing
+    # a host-side mapping.
+    ports:
+      - "9090:9090"
     networks: [harness-net]
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O- http://localhost:9090/healthz || exit 1"]

@@ -66,7 +66,7 @@ echo "[replay] phase 2: POST /cp/admin/orgs with a known-bad payload (missing ow
 # we can also capture the HTTP status code (admin_call returns
 # nothing on non-2xx because of --fail-with-body under set -e).
 #
-# The cp-stub is called DIRECTLY (http://cp-stub:9090) — NOT through
+# The cp-stub is called DIRECTLY (http://localhost:9090) — NOT through
 # the cf-proxy/tenant-proxy chain. Reason: the tenant's cp-proxy
 # allowlist intentionally blocks /cp/admin/* paths (security
 # boundary, cp_proxy_test.go line 30: "cross-tenant admin list
@@ -81,7 +81,7 @@ HTTP_CODE=$(curl -sS --fail-with-body --max-time 30 \
     -w "%{http_code}" \
     -H "Authorization: Bearer ${ALPHA_ADMIN_TOKEN}" \
     -H "Content-Type: application/json" \
-    -X POST "http://cp-stub:9090/cp/admin/orgs" \
+    -X POST "http://localhost:9090/cp/admin/orgs" \
     -d "{\"slug\":\"$ORG_CREATE_400_CAPTURE_SLUG\",\"name\":\"replay-bad-org\"}" \
     || true)
 # Reset the exit-code from the curl --fail-with-body so set -e
