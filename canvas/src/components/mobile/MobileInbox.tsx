@@ -45,13 +45,31 @@ export function MobileInbox({ dark }: { dark: boolean }) {
     return () => { cancelled = true; };
   }, []);
 
+  // Guard against stale fetches: when the user switches tabs, a previous
+  // in-flight fetch for the old kind must not overwrite the list after the
+  // new tab's load clears it (CR2 #11478).
+  const loadSeqRef = useRef(0);
   const load = useCallback(() => {
+    const seq = ++loadSeqRef.current;
+    // core#2766 / CR2 #11478: clear stale rows the moment the kind changes
+    // so the user never sees approval cards under the Tasks tab (or
+    // vice-versa) while the new list is still fetching.
+    setItems([]);
     setLoading(true);
     api
       .get<RequestRow[]>(`/requests/pending?kind=${kind}`)
-      .then((rows) => setItems(Array.isArray(rows) ? rows : []))
-      .catch(() => setItems([]))
-      .finally(() => setLoading(false));
+      .then((rows) => {
+        if (seq !== loadSeqRef.current) return; // stale response
+        setItems(Array.isArray(rows) ? rows : []);
+      })
+      .catch(() => {
+        if (seq !== loadSeqRef.current) return; // stale response
+        setItems([]);
+      })
+      .finally(() => {
+        if (seq !== loadSeqRef.current) return; // stale response
+        setLoading(false);
+      });
   }, [kind]);
 
   useEffect(() => { load(); }, [load]);
