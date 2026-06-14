@@ -65,13 +65,23 @@ echo "[replay] phase 2: POST /cp/admin/orgs with a known-bad payload (missing ow
 # shape. We bypass the admin_call helper and call curl directly so
 # we can also capture the HTTP status code (admin_call returns
 # nothing on non-2xx because of --fail-with-body under set -e).
+#
+# The cp-stub is called DIRECTLY (http://cp-stub:9090) — NOT through
+# the cf-proxy/tenant-proxy chain. Reason: the tenant's cp-proxy
+# allowlist intentionally blocks /cp/admin/* paths (security
+# boundary, cp_proxy_test.go line 30: "cross-tenant admin list
+# (lateral movement)") — admin operations don't traverse the
+# tenant proxy in the production path either (real CP admin ops
+# call the CP directly, not through the tenant's cf-proxy). This
+# replay is a harness-capture of the cp-stub's 400+JSON shape; it
+# is NOT a production-path E2E. The staging script (test_staging_full_saas.sh)
+# exercises the production path separately.
 HTTP_CODE=$(curl -sS --fail-with-body --max-time 30 \
     -o /tmp/canary_org_create_400_body.$$ \
     -w "%{http_code}" \
-    -H "Host: ${ALPHA_HOST}" \
     -H "Authorization: Bearer ${ALPHA_ADMIN_TOKEN}" \
     -H "Content-Type: application/json" \
-    -X POST "$BASE/cp/admin/orgs" \
+    -X POST "http://cp-stub:9090/cp/admin/orgs" \
     -d "{\"slug\":\"$ORG_CREATE_400_CAPTURE_SLUG\",\"name\":\"replay-bad-org\"}" \
     || true)
 # Reset the exit-code from the curl --fail-with-body so set -e
