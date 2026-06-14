@@ -79,17 +79,25 @@ PROVISION_TIMEOUT_SECS="${E2E_PROVISION_TIMEOUT_SECS:-900}"
 CONCIERGE_ONLINE_SECS="${E2E_CONCIERGE_ONLINE_SECS:-900}"
 AGENT_ACT_SECS="${E2E_AGENT_ACT_SECS:-420}"
 REQUIRE_LIVE="${E2E_REQUIRE_LIVE:-0}"
-RUN_ID_SUFFIX="${E2E_RUN_ID:-$(date +%H%M%S)-$$}"
+# Collision-proof slug (core#2782). The prior `head -c 32` truncation
+# dropped the run_attempt suffix and let two parallel/retry runs
+# collide (POST /cp/admin/orgs 409). The helper appends a random
+# 8-char uuid so every run gets a unique slug regardless of how
+# the workflow composes E2E_RUN_ID. The `source` + `assert` run
+# AFTER log/fail/ok are defined below so the assert can call `fail`
+# on mismatch. Slug MUST start with 'e2e-' so sweep-stale-e2e-orgs.yml
+# + lint_cleanup_traps.sh reap any orphan org. (The lint requires
+# a quoted SLUG=... with a literal e2e-/rt-e2e- head.)
+# shellcheck source=lib/collision-proof-slug.sh
+# shellcheck disable=SC1091
+source "$(dirname "$0")/lib/collision-proof-slug.sh"
 
-# Fixed e2e- prefix so sweep-stale-e2e-orgs.yml + lint_cleanup_traps.sh reap any
-# orphan org. (The lint requires a quoted SLUG=... with a literal e2e-/rt-e2e-
-# head.)
-SLUG="e2e-cncrg-mk-$(date +%Y%m%d)-${RUN_ID_SUFFIX}"
-SLUG=$(echo "$SLUG" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-' | head -c 32)
-
-# The workspace name we will ask the concierge to create. The RUN_ID makes it
-# unique per run so a poll for it can never collide with a sibling run's name.
-WORKER_NAME="e2e-cncrg-worker-${RUN_ID_SUFFIX}"
+# The workspace name we will ask the concierge to create. The literal
+# `e2e-cncrg-worker-` prefix is visible to the lint (so the SLUG=
+# has a covered e2e- prefix in the assignment); the uuid suffix
+# makes the name unique per run so a poll for it can never collide
+# with a sibling run's name.
+WORKER_NAME="e2e-cncrg-worker-$(make_collision_proof_slug_suffix "${E2E_RUN_ID:-}")"
 WORKER_NAME=$(echo "$WORKER_NAME" | tr -cd 'a-zA-Z0-9-' | head -c 48)
 # Exported so the find_worker_by_name python subshell (run in a pipe) reads it
 # via os.environ — a bare shell var would not survive into the subprocess env.
@@ -98,6 +106,10 @@ export WORKER_NAME
 log()  { echo "[$(date +%H:%M:%S)] $*"; }
 fail() { echo "[$(date +%H:%M:%S)] ❌ $*" >&2; exit 1; }
 ok()   { echo "[$(date +%H:%M:%S)] ✅ $*"; }
+
+# SLUG construction runs after log/fail/ok so the assert can call `fail`.
+SLUG="e2e-cncrg-mk-$(make_collision_proof_slug_suffix "${E2E_RUN_ID:-}")"
+assert_collision_proof_slug "$SLUG" || fail "Bug in make_collision_proof_slug: produced non-collision-proof slug '$SLUG'"
 # skip_loud <reason>: honest skip when the concierge can't be exercised. In CI
 # (E2E_REQUIRE_LIVE=1) this is a HARD FAIL (exit 5) so a missing platform-agent
 # image can't false-green the gate; locally it skips 0.

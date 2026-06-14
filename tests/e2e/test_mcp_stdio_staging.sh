@@ -17,14 +17,28 @@ set -euo pipefail
 
 CP_URL="${MOLECULE_CP_URL:-https://staging-api.moleculesai.app}"
 ADMIN_TOKEN="${MOLECULE_ADMIN_TOKEN:?MOLEC…OKEN required — Railway staging CP_ADMIN_API_TOKEN}"
-RUN_ID_SUFFIX="${E2E_RUN_ID:-$(date +%H%M%S)-$$}"
+# RUN_ID_SUFFIX removed (core#2782 follow-up shellcheck): the slug now comes
+# from make_collision_proof_slug below; the old suffix var is dead.
 
-SLUG="e2e-mcp-$(date +%Y%m%d)-${RUN_ID_SUFFIX}"
-SLUG=$(echo "$SLUG" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-' | head -c 32)
-
+# log/fail/ok MUST be defined BEFORE the assert_collision_proof_slug call
+# below (which uses `|| fail "..."`). Defining them after the call would
+# error on a bad slug with `fail: command not found` instead of the
+# intended diagnostic — silent misbehaviour that the lint can't catch.
+# Mirrors the order in test_staging_full_saas.sh.
 log()  { echo "[$(date +%H:%M:%S)] $*"; }
 fail() { echo "[$(date +%H:%M:%S)] ❌ $*" >&2; exit 1; }
 ok()   { echo "[$(date +%H:%M:%S)] ✅ $*"; }
+
+# Collision-proof slug (core#2782). The prior `head -c 32` truncation
+# dropped the run_attempt suffix and let two parallel/retry runs
+# collide (POST /cp/admin/orgs 409). The helper appends a random
+# 8-char uuid so every run gets a unique slug regardless of how
+# the workflow composes E2E_RUN_ID.
+# shellcheck source=lib/collision-proof-slug.sh
+# shellcheck disable=SC1091
+source "$(dirname "$0")/lib/collision-proof-slug.sh"
+SLUG="e2e-mcp-$(make_collision_proof_slug_suffix "${E2E_RUN_ID:-}")"
+assert_collision_proof_slug "$SLUG" || fail "Bug in make_collision_proof_slug: produced non-collision-proof slug '$SLUG'"
 
 CURL_COMMON=(-sS --fail-with-body --max-time 30)
 

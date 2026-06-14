@@ -80,14 +80,24 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib/peer_visibility_assert.sh"
 
 CP_URL="${MOLECULE_CP_URL:-https://staging-api.moleculesai.app}"
 ADMIN_TOKEN="${MOLECULE_ADMIN_TOKEN:?MOLECULE_ADMIN_TOKEN required — Railway staging CP_ADMIN_API_TOKEN}"
-RUN_ID_SUFFIX="${E2E_RUN_ID:-$(date +%H%M%S)-$$}"
+# RUN_ID_SUFFIX removed (core#2782 follow-up shellcheck): the slug
+# now comes from make_collision_proof_slug below; the old suffix
+# var is dead.
 PV_RUNTIMES="${PV_RUNTIMES:-hermes openclaw claude-code}"
 PROVISION_TIMEOUT_SECS="${E2E_PROVISION_TIMEOUT_SECS:-1800}"
 
-# Slug MUST start with 'e2e-' so the sweep-stale-e2e-orgs safety net
-# (EPHEMERAL_PREFIXES) catches any leak this run fails to tear down.
-SLUG="e2e-pv-$(date +%Y%m%d)-${RUN_ID_SUFFIX}"
-SLUG=$(echo "$SLUG" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-' | head -c 32)
+# Collision-proof slug (core#2782). The prior `head -c 32` truncation
+# dropped the run_attempt suffix and let two parallel/retry runs
+# collide (POST /cp/admin/orgs 409). The helper appends a random
+# 8-char uuid so every run gets a unique slug regardless of how
+# the workflow composes E2E_RUN_ID. The `source` + `assert` run
+# AFTER log/fail/ok are defined below so the assert can call `fail`
+# on mismatch. Slug MUST start with 'e2e-' so the
+# sweep-stale-e2e-orgs safety net (EPHEMERAL_PREFIXES) catches any
+# leak this run fails to tear down.
+# shellcheck source=lib/collision-proof-slug.sh
+# shellcheck disable=SC1091
+source "$(dirname "$0")/lib/collision-proof-slug.sh"
 
 ORG_ID=""
 TENANT_URL=""
@@ -96,6 +106,10 @@ TENANT_TOKEN=""
 log()  { echo "[$(date +%H:%M:%S)] $*"; }
 fail() { echo "[$(date +%H:%M:%S)] ❌ $*" >&2; exit 1; }
 ok()   { echo "[$(date +%H:%M:%S)] ✅ $*"; }
+
+# SLUG construction runs after log/fail/ok so the assert can call `fail`.
+SLUG="e2e-pv-$(make_collision_proof_slug_suffix "${E2E_RUN_ID:-}")"
+assert_collision_proof_slug "$SLUG" || fail "Bug in make_collision_proof_slug: produced non-collision-proof slug '$SLUG'"
 
 admin_call() {
   local method="$1" path="$2"; shift 2

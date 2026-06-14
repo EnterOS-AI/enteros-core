@@ -84,7 +84,9 @@ set -euo pipefail
 CP_URL="${MOLECULE_CP_URL:-https://staging-api.moleculesai.app}"
 ADMIN_TOKEN="${MOLECULE_ADMIN_TOKEN:?MOLECULE_ADMIN_TOKEN required — Railway staging CP_ADMIN_API_TOKEN}"
 PROVISION_TIMEOUT_SECS="${E2E_PROVISION_TIMEOUT_SECS:-900}"
-RUN_ID_SUFFIX="${E2E_RUN_ID:-$(date +%H%M%S)-$$}"
+# RUN_ID_SUFFIX removed (core#2782 follow-up shellcheck): the slug
+# now comes from make_collision_proof_slug below; the old suffix
+# var is dead.
 STALE_WAIT_SECS="${E2E_STALE_WAIT_SECS:-180}"
 # Readiness-poll deadline for the sweep transition (step 6). Must exceed
 # STALE_WAIT_SECS (the no-heartbeat window) by at least one sweep
@@ -94,12 +96,24 @@ STALE_POLL_DEADLINE_SECS="${E2E_STALE_POLL_DEADLINE_SECS:-240}"
 TRANSIENT_RETRIES="${E2E_TRANSIENT_RETRIES:-8}"
 REQUIRE_LIVE="${E2E_REQUIRE_LIVE:-0}"
 
-SLUG="e2e-ext-$(date +%Y%m%d)-${RUN_ID_SUFFIX}"
-SLUG=$(echo "$SLUG" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-' | head -c 32)
+# Collision-proof slug (core#2782). The prior `head -c 32` truncation
+# dropped the run_attempt suffix and let two parallel/retry runs
+# collide (POST /cp/admin/orgs 409). The helper appends a random
+# 8-char uuid so every run gets a unique slug regardless of how
+# the workflow composes E2E_RUN_ID. The `source` + `assert` run
+# AFTER log/fail/ok are defined below so the assert can call `fail`
+# on mismatch.
+# shellcheck source=lib/collision-proof-slug.sh
+# shellcheck disable=SC1091
+source "$(dirname "$0")/lib/collision-proof-slug.sh"
 
 log()  { echo "[$(date +%H:%M:%S)] $*"; }
 fail() { echo "[$(date +%H:%M:%S)] ❌ $*" >&2; exit 1; }
 ok()   { echo "[$(date +%H:%M:%S)] ✅ $*"; }
+
+# SLUG construction runs after log/fail/ok so the assert can call `fail`.
+SLUG="e2e-ext-$(make_collision_proof_slug_suffix "${E2E_RUN_ID:-}")"
+assert_collision_proof_slug "$SLUG" || fail "Bug in make_collision_proof_slug: produced non-collision-proof slug '$SLUG'"
 
 # REQUIRE_LIVE bookkeeping: count the four awaiting_agent transitions the
 # test is contracted to prove. The EXIT trap fails-closed (exit 5) if the

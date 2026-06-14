@@ -94,18 +94,32 @@ RECONCILE_OFFLINE_TIMEOUT_SECS="${E2E_RECONCILE_OFFLINE_TIMEOUT_SECS:-180}"
 # SECONDARY bound: full existing-volume reprovision (new EC2 boot + agent
 # bootstrap) is a multi-minute cold path.
 REPROVISION_TIMEOUT_SECS="${E2E_REPROVISION_TIMEOUT_SECS:-600}"
-RUN_ID_SUFFIX="${E2E_RUN_ID:-$(date +%H%M%S)-$$}"
+# RUN_ID_SUFFIX removed (core#2782 follow-up shellcheck): the slug now comes
+# from make_collision_proof_slug below; the old suffix var is dead.
+
+# log/fail/ok MUST be defined BEFORE the assert_collision_proof_slug call
+# below (which uses `|| fail "..."`). Defining them after the call would
+# error on a bad slug with `fail: command not found` instead of the
+# intended diagnostic — silent misbehaviour that the lint can't catch.
+# Mirrors the order in test_staging_full_saas.sh.
+log()  { echo "[$(date +%H:%M:%S)] $*"; }
+fail() { echo "[$(date +%H:%M:%S)] ❌ $*" >&2; exit 1; }
+ok()   { echo "[$(date +%H:%M:%S)] ✅ $*"; }
 
 # Slug MUST start with e2e- so sweep-stale-e2e-orgs.yml reaps any orphan this
 # run leaks (lint_cleanup_traps.sh enforces the e2e-/rt-e2e- prefix for any
 # staging tenant E2E; we honour it here too even though our filename isn't
 # *staging*).
-SLUG="e2e-rec-$(date +%Y%m%d)-${RUN_ID_SUFFIX}"
-SLUG=$(echo "$SLUG" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-' | head -c 32)
-
-log()  { echo "[$(date +%H:%M:%S)] $*"; }
-fail() { echo "[$(date +%H:%M:%S)] ❌ $*" >&2; exit 1; }
-ok()   { echo "[$(date +%H:%M:%S)] ✅ $*"; }
+# Collision-proof slug (core#2782). The prior `head -c 32` truncation
+# dropped the run_attempt suffix and let two parallel/retry runs
+# collide (POST /cp/admin/orgs 409). The helper appends a random
+# 8-char uuid so every run gets a unique slug regardless of how
+# the workflow composes E2E_RUN_ID.
+# shellcheck source=lib/collision-proof-slug.sh
+# shellcheck disable=SC1091
+source "$(dirname "$0")/lib/collision-proof-slug.sh"
+SLUG="e2e-rec-$(make_collision_proof_slug_suffix "${E2E_RUN_ID:-}")"
+assert_collision_proof_slug "$SLUG" || fail "Bug in make_collision_proof_slug: produced non-collision-proof slug '$SLUG'"
 
 # Per-runtime model slug dispatch — shared with the full-saas harness.
 # shellcheck disable=SC1091
