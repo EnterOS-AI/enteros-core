@@ -166,6 +166,7 @@ Backward-compatible admin aliases also exist under `/admin/secrets`.
 | `POST` | `/workspaces/:id/approvals` | Create approval request |
 | `GET` | `/workspaces/:id/approvals` | List approvals for a workspace |
 | `POST` | `/workspaces/:id/approvals/:approvalId/decide` | Approve or deny |
+| `POST` | `/workspaces/:id/approvals/:approvalId/withdraw` | Requester pulls back a pending approval (issue #66). Authz is against the row's creator workspace, not the path `:id`, so it works correctly under cross-workspace approval gates (#2574 / #2593). |
 
 ### Team operations
 
