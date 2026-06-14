@@ -376,7 +376,36 @@ func (h *WorkspaceHandler) buildProvisionerConfig(
 		// RuntimeImages[Runtime] :latest lookup, which is what the dead
 		// reader's sql.ErrNoRows path was producing already.
 		Image: "",
+
+		// RFC #2843 #24 PR-B — wire the generic template-asset
+		// channel. cfg.TemplateIdentity is derived from the
+		// runtime_registry (manifest.json's workspace_templates
+		// entry for this runtime) — the format is "<repo>@<ref>"
+		// (the giteaTemplateAssetFetcher parses this further as
+		// "<owner>/<repo>@<ref>"). External-like runtimes
+		// (external / kimi / kimi-cli / mock) have NO template
+		// repo, so the identity is left empty — the SCAFFOLD
+		// gate in collectCPConfigFiles treats empty identity as
+		// "skip the fetcher" (pre-scaffold behavior preserved).
+		//
+		// The fetcher itself is assigned by the caller (main.go
+		// for SaaS, or a test helper) via h.giteaTemplateFetcher
+		// — wired here so the fetcher resolution is one place,
+		// not duplicated across first-provision + restart paths.
+		// nil fetcher = "no fetcher wired" (self-host default;
+		// falls through to the local TemplatePath path).
+		TemplateIdentity:     templateIdentityForRuntimeOrEmpty(payload.Runtime),
+		TemplateAssetFetcher: h.giteaTemplateFetcher,
 	}
+}
+
+// templateIdentityForRuntimeOrEmpty is a tiny wrapper around
+// templateIdentityForRuntime that returns "" on miss (rather
+// than the (string, bool) tuple). Used at the call site so
+// the assignment can be a single expression.
+func templateIdentityForRuntimeOrEmpty(runtime string) string {
+	id, _ := templateIdentityForRuntime(runtime)
+	return id
 }
 
 // issueAndInjectToken rotates the workspace auth token and injects the
@@ -605,6 +634,13 @@ var knownRuntimes = fallbackRuntimes
 
 func init() {
 	initKnownRuntimes()
+	// PR-B (RFC #2843 #24): populate the templateRepoByName map at
+	// boot so cfg.TemplateIdentity is non-empty for template-backed
+	// runtimes (claude-code / hermes / etc). The init() order matters:
+	// must follow initKnownRuntimes so the per-runtime manifestEntry
+	// lookups use the same set of normalized runtime names. Idempotent
+	// — both inits read manifestPath() (cached) and tolerate each other.
+	initTemplateRepoByName()
 }
 
 // yamlQuote emits a YAML double-quoted scalar that safely contains any

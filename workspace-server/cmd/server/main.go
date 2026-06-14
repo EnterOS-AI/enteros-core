@@ -249,6 +249,22 @@ func main() {
 		wh.SetCPProvisioner(cpProv)
 	}
 
+	// PR-B (RFC #2843 #24): wire the Gitea TemplateAssetFetcher.
+	// nil-if-empty + WARN: if the token isn't set, log a warning
+	// and stay in the "no fetcher wired" state. The SCAFFOLD gate
+	// in collectCPConfigFiles treats nil fetcher as "skip the
+	// fetcher" — pre-scaffold behavior preserved for self-host /
+	// unconfigured tenants. baseURL has a production default
+	// (https://git.moleculesai.app) but is overridable for staging
+	// or per-deployment Gitea mirrors.
+	if token := templateRepoToken(); token != "" {
+		baseURL := envOr("MOLECULE_GITEA_BASE_URL", "https://git.moleculesai.app")
+		wh.SetGiteaTemplateFetcher(provisioner.NewGiteaTemplateAssetFetcher(baseURL, token, nil))
+		log.Printf("template repo fetcher: wired (baseURL=%q, token set)", baseURL)
+	} else {
+		log.Printf("template repo fetcher: MOLECULE_TEMPLATE_REPO_TOKEN unset; fetcher disabled (self-host default / SCAFFOLD-gate skip)")
+	}
+
 	// Self-hosted platform-agent boot-provision (Change 1). The line-128 seed
 	// only creates the concierge DB ROW; on a fresh self-host that leaves it
 	// with no container (status='failed'/'online' but nothing running). Now that
@@ -665,6 +681,18 @@ func templateCacheToken() string {
 		}
 	}
 	return ""
+}
+
+// templateRepoToken returns the per-deployment READ-ONLY Gitea PAT
+// used by the Gitea TemplateAssetFetcher (RFC #2843 #24 PR-B).
+// Distinct from templateCacheToken (which is for the template cache,
+// a different feature) so a tenant can rotate the fetcher token
+// without touching the cache token. nil-if-empty + WARN: callers
+// should treat empty as "fetcher disabled" (self-host default — the
+// SCAFFOLD gate in collectCPConfigFiles treats nil fetcher as
+// "skip the fetcher", pre-scaffold behavior preserved).
+func templateRepoToken() string {
+	return strings.TrimSpace(os.Getenv("MOLECULE_TEMPLATE_REPO_TOKEN"))
 }
 
 func shouldRefreshTemplateCache(token, manifestPath string) bool {

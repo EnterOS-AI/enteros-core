@@ -6,10 +6,17 @@ package handlers
 //   2. "external" is always injected, even on manifests without it.
 //   3. Missing file / malformed JSON returns error, caller uses
 //      fallback (tested at the initKnownRuntimes level via integration).
+//   4. initTemplateRepoByName populates the map at the prod-init
+//      path (PR-B / RFC #2843 #24 contract-pin: the map must be
+//      non-empty after init for shipped runtimes).
+//   5. initTemplateRepoByName is idempotent + reconciles stale
+//      entries on every-boot (a runtime removed from the manifest
+//      must NOT be resolvable in the map after the next init).
 
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -125,4 +132,191 @@ func keys(m map[string]struct{}) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// TestTemplateIdentityForRuntime pins the runtime -> "<repo>@<ref>"
+// mapping that drives cfg.TemplateIdentity (RFC #2843 #24 PR-B).
+// Loads the real manifest.json (test setup already has it), then
+// asserts the wire shape for a known runtime + the empty-result
+// for the BYO-compute meta-runtimes (external / kimi / kimi-cli /
+// mock / unknown).
+func TestTemplateIdentityForRuntime(t *testing.T) {
+	path := manifestPath()
+	if path == "" {
+		t.Skip("manifest.json not discoverable from this test cwd")
+	}
+	// Force the repo registry to load from the same path
+	// (idempotent — safe to call multiple times).
+	initTemplateRepoByName()
+
+	// Sanity: a real template-backed runtime resolves to a
+	// "<repo>@<ref>" identity.
+	id, ok := templateIdentityForRuntime("claude-code")
+	if !ok {
+		t.Errorf("claude-code should resolve to an identity (manifest has it), got none")
+	} else {
+		// Identity must contain an @ and a slash (the fetcher
+		// parses this as "<owner>/<repo>@<ref>").
+		if !strings.Contains(id, "@") || !strings.Contains(id, "/") {
+			t.Errorf("claude-code identity %q doesn't look like \"<owner>/<repo>@<ref>\"", id)
+		}
+		// Identity must NOT be empty (the SCAFFOLD gate in
+		// collectCPConfigFiles would skip the fetcher on empty).
+		if id == "" {
+			t.Errorf("claude-code identity is empty; should be \"<repo>@<ref>\"")
+		}
+	}
+
+	// BYO-compute meta-runtimes have no template repo — the
+	// lookup MUST return (empty, false) so the SCAFFOLD gate
+	// skips the fetcher for them (preserves pre-scaffold
+	// behavior).
+	for _, rt := range []string{"external", "kimi", "kimi-cli", "mock", "unknown-runtime-xyz"} {
+		id2, ok2 := templateIdentityForRuntime(rt)
+		if ok2 {
+			t.Errorf("runtime %q should NOT have a template identity (BYO-compute / unknown), got identity=%q", rt, id2)
+		}
+		if id2 != "" {
+			t.Errorf("runtime %q identity should be empty, got %q", rt, id2)
+		}
+	}
+}
+
+// TestTemplateIdentityForRuntimeOrEmpty pins the
+// single-expression wrapper used at the call site in
+// buildProvisionerConfig.
+func TestTemplateIdentityForRuntimeOrEmpty(t *testing.T) {
+	if manifestPath() == "" {
+		t.Skip("manifest.json not discoverable from this test cwd")
+	}
+	initTemplateRepoByName()
+	if got := templateIdentityForRuntimeOrEmpty("claude-code"); got == "" {
+		t.Error("claude-code should return a non-empty identity")
+	}
+	if got := templateIdentityForRuntimeOrEmpty("external"); got != "" {
+		t.Errorf("external should return empty, got %q", got)
+	}
+	if got := templateIdentityForRuntimeOrEmpty("unknown-xyz"); got != "" {
+		t.Errorf("unknown-xyz should return empty, got %q", got)
+	}
+}
+
+// TestInitTemplateRepoByName_PopulatesMap_FromTempManifest pins the
+// PR-B contract-pin: the prod-init path must populate templateRepoByName
+// from a real manifest so cfg.TemplateIdentity is non-empty for
+// template-backed runtimes at boot. Uses a temp manifest.json (via
+// the WORKSPACE_MANIFEST_PATH env var, read by manifestPath()) so the
+// test doesn't depend on a real manifest being present.
+//
+// This is the load-bearing test PM required: "Keep a test asserting
+// the prod-init path populates it (so this can't regress to test-only)".
+func TestInitTemplateRepoByName_PopulatesMap_FromTempManifest(t *testing.T) {
+	// Write a temp manifest.json with a known set of template
+	// runtimes.
+	dir := t.TempDir()
+	manifestPath := filepath.Join(dir, "manifest.json")
+	manifest := `{
+		"workspace_templates": [
+			{"name": "claude-code-default", "repo": "molecule-ai/t-cc", "ref": "main"},
+			{"name": "hermes", "repo": "molecule-ai/t-hermes", "ref": "v1.2.3"},
+			{"name": "codex", "repo": "molecule-ai/t-codex", "ref": "main"}
+		]
+	}`
+	if err := os.WriteFile(manifestPath, []byte(manifest), 0600); err != nil {
+		t.Fatalf("write temp manifest: %v", err)
+	}
+	// Point manifestPath() at the temp file (it reads
+	// WORKSPACE_MANIFEST_PATH first).
+	t.Setenv("WORKSPACE_MANIFEST_PATH", manifestPath)
+
+	// Run the prod-init path.
+	initTemplateRepoByName()
+
+	// Assert the map is populated for the shipped runtimes.
+	cases := []struct {
+		runtime string
+		wantRepo string
+		wantRef  string
+	}{
+		{"claude-code", "molecule-ai/t-cc", "main"},
+		{"hermes", "molecule-ai/t-hermes", "v1.2.3"},
+		{"codex", "molecule-ai/t-codex", "main"},
+	}
+	for _, c := range cases {
+		rr, ok := templateRepoByName[c.runtime]
+		if !ok {
+			t.Errorf("runtime %q missing from templateRepoByName after init (got %d entries)", c.runtime, len(templateRepoByName))
+			continue
+		}
+		if rr.Repo != c.wantRepo {
+			t.Errorf("runtime %q: want repo=%q, got %q", c.runtime, c.wantRepo, rr.Repo)
+		}
+		if rr.Ref != c.wantRef {
+			t.Errorf("runtime %q: want ref=%q, got %q", c.runtime, c.wantRef, rr.Ref)
+		}
+	}
+
+	// Assert the lookup function returns the expected identity.
+	for _, c := range cases {
+		id, ok := templateIdentityForRuntime(c.runtime)
+		if !ok {
+			t.Errorf("templateIdentityForRuntime(%q) returned (empty, false); want (non-empty, true)", c.runtime)
+			continue
+		}
+		want := c.wantRepo + "@" + c.wantRef
+		if id != want {
+			t.Errorf("templateIdentityForRuntime(%q) = %q, want %q", c.runtime, id, want)
+		}
+	}
+}
+
+// TestInitTemplateRepoByName_ReconcilesStaleEntries pins the
+// every-boot reconcile property: a runtime removed from the manifest
+// between two init calls must NOT be resolvable in the map after
+// the second init. This catches the "stale entry persists" bug that
+// would otherwise let the fetcher attempt a no-longer-existing repo.
+func TestInitTemplateRepoByName_ReconcilesStaleEntries(t *testing.T) {
+	dir := t.TempDir()
+	manifestPath := filepath.Join(dir, "manifest.json")
+	t.Setenv("WORKSPACE_MANIFEST_PATH", manifestPath)
+
+	// First manifest: claude-code + hermes present.
+	if err := os.WriteFile(manifestPath, []byte(`{
+		"workspace_templates": [
+			{"name": "claude-code-default", "repo": "molecule-ai/t-cc", "ref": "main"},
+			{"name": "hermes", "repo": "molecule-ai/t-hermes", "ref": "main"}
+		]
+	}`), 0600); err != nil {
+		t.Fatalf("write manifest v1: %v", err)
+	}
+	initTemplateRepoByName()
+	if _, ok := templateRepoByName["claude-code"]; !ok {
+		t.Fatalf("after first init: claude-code missing")
+	}
+	if _, ok := templateRepoByName["hermes"]; !ok {
+		t.Fatalf("after first init: hermes missing")
+	}
+
+	// Second manifest: hermes REMOVED. claude-code unchanged.
+	if err := os.WriteFile(manifestPath, []byte(`{
+		"workspace_templates": [
+			{"name": "claude-code-default", "repo": "molecule-ai/t-cc", "ref": "main"}
+		]
+	}`), 0600); err != nil {
+		t.Fatalf("write manifest v2: %v", err)
+	}
+	initTemplateRepoByName()
+
+	// claude-code still resolves.
+	if _, ok := templateRepoByName["claude-code"]; !ok {
+		t.Errorf("after second init: claude-code should still resolve (it stayed in the manifest)")
+	}
+	// hermes must be GONE — the manifest removed it.
+	if _, ok := templateRepoByName["hermes"]; ok {
+		t.Errorf("after second init: hermes should NOT resolve (it was removed from the manifest); the every-boot reconcile failed")
+	}
+	// And the lookup returns ok=false for hermes.
+	if id, ok := templateIdentityForRuntime("hermes"); ok || id != "" {
+		t.Errorf("templateIdentityForRuntime(hermes) should return (\"\", false), got (%q, %v)", id, ok)
+	}
 }
