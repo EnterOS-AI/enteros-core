@@ -17,7 +17,7 @@
 # signal that the 2-genuine review needs. Tracking the work in the linked
 # issue lets us burn down the xfails as separate PRs land.
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-echo "[replay] __XFAIL__:#2863:CP-stub 401 on workspace start (30s provisioning stall)"
+echo "[replay] __SKIP__:#2863:CP-stub 401 on workspace start (30s provisioning stall)"
 exit 0
 
 set -euo pipefail
