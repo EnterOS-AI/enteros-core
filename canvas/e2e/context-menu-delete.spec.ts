@@ -40,11 +40,8 @@ test.describe("Context Menu → Delete Confirm", () => {
     page,
     request,
   }) => {
-    // Regression: this test must run from an empty canvas so the old
-    // suite-level `test.skip()` cannot mask a failure to create/register.
-    const before = await request.get(`${API}/workspaces`);
-    const beforeWorkspaces = (await before.json()) as Array<{ id: string; name: string }>;
-    expect(beforeWorkspaces).toHaveLength(0);
+    // Fail-closed: this test seeds its own workspace and targets it by name.
+    // It does NOT assume an empty canvas, and it never calls test.skip().
 
     // 1. Create a workspace to delete (leaf node — no children, no cascade)
     const { id: wsId } = await seedWorkspace(request, "E2E Delete Test");
