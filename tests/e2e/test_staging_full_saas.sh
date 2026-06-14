@@ -366,7 +366,19 @@ log "1/11 Creating org $SLUG via /cp/admin/orgs..."
 # set -euo pipefail, aborting the whole harness with no body
 # in the CI logs.
 CREATE_BODYFILE="$(mktemp -t create-org-resp.XXXXXX)"
-trap 'rm -f "$CREATE_BODYFILE"' EXIT
+# core#60 trap-chain: the prior `trap 'rm -f "$CREATE_BODYFILE"' EXIT`
+# overwrote the cleanup_org EXIT trap at line 330, leaking the
+# staging org/resources if the bodyfile path succeeded and a
+# later step (or the org-create call itself) failed. The fix:
+# append a chained cleanup that calls the PREVIOUS EXIT trap
+# (captured via `trap -p EXIT`) AND removes the bodyfile. The
+# trap -p command prints the current EXIT trap in a form
+# suitable for re-evaluation, so we can prepend our bodyfile
+# cleanup while preserving cleanup_org for the rest of the
+# EXIT-triggered teardown.
+# core#60 RC #11654 #2.
+prev_exit_trap="$(trap -p EXIT | sed -E "s/^trap -- '//; s/'$ EXIT$//")"
+trap 'rm -f "$CREATE_BODYFILE"; '"${prev_exit_trap}" EXIT
 set +e
 CREATE_HTTP_CODE=$(curl "${CURL_COMMON[@]}" -X POST "$CP_URL/cp/admin/orgs" \
   -H "Authorization: Bearer $ADMIN_TOKEN" \

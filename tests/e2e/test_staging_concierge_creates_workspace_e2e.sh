@@ -97,7 +97,7 @@ source "$(dirname "$0")/lib/collision-proof-slug.sh"
 # has a covered e2e- prefix in the assignment); the uuid suffix
 # makes the name unique per run so a poll for it can never collide
 # with a sibling run's name.
-WORKER_NAME="e2e-cncrg-worker-$(make_collision_proof_slug_suffix "${E2E_RUN_ID:-}" 18)"
+WORKER_NAME="e2e-cncrg-worker-$(make_collision_proof_slug_suffix "${E2E_RUN_ID:-}" 17)"
 WORKER_NAME=$(echo "$WORKER_NAME" | tr -cd 'a-zA-Z0-9-' | head -c 48)
 # Exported so the find_worker_by_name python subshell (run in a pipe) reads it
 # via os.environ — a bare shell var would not survive into the subprocess env.
@@ -108,7 +108,7 @@ fail() { echo "[$(date +%H:%M:%S)] ❌ $*" >&2; exit 1; }
 ok()   { echo "[$(date +%H:%M:%S)] ✅ $*"; }
 
 # SLUG construction runs after log/fail/ok so the assert can call `fail`.
-SLUG="e2e-cncrg-mk-$(make_collision_proof_slug_suffix "${E2E_RUN_ID:-}" 12)"
+SLUG="e2e-cncrg-mk-$(make_collision_proof_slug_suffix "${E2E_RUN_ID:-}" 13)"
 assert_collision_proof_slug "$SLUG" || fail "Bug in make_collision_proof_slug: produced non-collision-proof slug '$SLUG'"
 # skip_loud <reason>: honest skip when the concierge can't be exercised. In CI
 # (E2E_REQUIRE_LIVE=1) this is a HARD FAIL (exit 5) so a missing platform-agent
