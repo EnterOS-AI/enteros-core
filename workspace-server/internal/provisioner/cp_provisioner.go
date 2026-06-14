@@ -385,6 +385,18 @@ func (p *CPProvisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string,
 // growth (more schedules, longer prompts, more skills) never re-hits a wall.
 const cpConfigFilesMaxBytes = 256 << 10
 
+// cpTemplateAssetsMaxBytes bounds the aggregate TEMPLATE-ASSET payload
+// (config.yaml + prompts/* + agent-skills/*) delivered via the generic
+// non-secret asset channel (RFC #2843 #24). This is a SEPARATE, much larger
+// bound than cpConfigFilesMaxBytes: the config bundle is capped at 256 KiB
+// because it rides the Secrets-Manager/user-data transport, but template
+// ASSETS ride a non-secret channel with no SM size limit — so reusing the
+// 256 KiB cap here would re-create the original #2831 skill-drop failure (the
+// seo-all skill package alone is ~716 KiB). 16 MiB comfortably fits real skill
+// trees + prompts + config while still bounding a runaway/malicious fetcher
+// (pure transport-DoS guard, not a secrets-transport limit).
+const cpTemplateAssetsMaxBytes = 16 << 20
+
 // isCPTemplateConfigFile restricts which files from a template directory are
 // eligible for transport to the control plane. Only config.yaml (the runtime
 // entrypoint config) and files under prompts/ (system prompts) are needed;
@@ -430,8 +442,8 @@ func collectCPConfigFiles(cfg WorkspaceConfig) (map[string]string, map[string][]
 			return fmt.Errorf("template asset path %q rejected: not in template-asset allowlist (config.yaml / prompts/* / agent-skills/*) — see IsCPTemplateAssetPath", name)
 		}
 		totalAssets += len(data)
-		if totalAssets > cpConfigFilesMaxBytes {
-			return fmt.Errorf("template assets exceed %d bytes", cpConfigFilesMaxBytes)
+		if totalAssets > cpTemplateAssetsMaxBytes {
+			return fmt.Errorf("template assets exceed %d bytes", cpTemplateAssetsMaxBytes)
 		}
 		assets[name] = append([]byte(nil), data...)
 		return nil
