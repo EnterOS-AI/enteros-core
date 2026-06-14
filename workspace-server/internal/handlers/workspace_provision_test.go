@@ -1177,6 +1177,76 @@ func TestIssueAndInjectToken_NilConfigFilesAllocated(t *testing.T) {
 	}
 }
 
+// TestEnsureConfigFiles_AllocatesWhenNil pins the de-dup helper
+// (the ensureConfigFiles extraction in workspace_provision.go).
+// Behavior: the helper allocates a fresh map when the input
+// pointer has a nil ConfigFiles, AND returns the same map for
+// subsequent writes to be visible to the caller. This is the
+// exact contract the previous inline `if cfg.ConfigFiles == nil`
+// check had, but extracted so the two inject sites
+// (issueAndInjectToken + issueAndInjectInboundSecret) share it.
+func TestEnsureConfigFiles_AllocatesWhenNil(t *testing.T) {
+	cfg := &provisioner.WorkspaceConfig{} // ConfigFiles intentionally nil
+	files := ensureConfigFiles(cfg)
+	if files == nil {
+		t.Fatal("ensureConfigFiles returned nil; expected a non-nil map (allocates on demand)")
+	}
+	if cfg.ConfigFiles == nil {
+		t.Fatal("ensureConfigFiles must populate cfg.ConfigFiles (the caller's pointer is the source of truth)")
+	}
+	// Assert the returned map and cfg.ConfigFiles are the SAME
+	// underlying hash table (de-dup contract: writes through the
+	// returned map must be visible via cfg.ConfigFiles). The
+	// mapsSamePointer sentinel-write trick handles both the populated
+	// and empty cases.
+	if !mapsSamePointer(files, cfg.ConfigFiles) {
+		t.Error("ensureConfigFiles must return the SAME map as cfg.ConfigFiles (so writes are visible to the caller)")
+	}
+	// Write a key and confirm it's visible via cfg.ConfigFiles.
+	files["scaffold-key"] = []byte("scaffold-value")
+	if got := cfg.ConfigFiles["scaffold-key"]; string(got) != "scaffold-value" {
+		t.Errorf("write through returned map not visible via cfg.ConfigFiles: got %q", got)
+	}
+}
+
+// TestEnsureConfigFiles_ReusesWhenNonNil pins the de-dup helper's
+// no-op case: when cfg.ConfigFiles is already allocated, the
+// helper returns the same map (no new allocation, no copy).
+// This is the "everyday" path — most callers pass a pre-populated
+// ConfigFiles map.
+func TestEnsureConfigFiles_ReusesWhenNonNil(t *testing.T) {
+	existing := map[string][]byte{
+		"config.yaml": []byte("# caller override"),
+	}
+	cfg := &provisioner.WorkspaceConfig{ConfigFiles: existing}
+	files := ensureConfigFiles(cfg)
+	if !mapsSamePointer(files, existing) {
+		t.Error("ensureConfigFiles must return the SAME map when ConfigFiles is already non-nil (no copy)")
+	}
+	// Caller's pre-populated entries are preserved.
+	if got := files["config.yaml"]; string(got) != "# caller override" {
+		t.Errorf("pre-populated entry missing: got %q", got)
+	}
+}
+
+// mapsSamePointer reports whether m1 and m2 are the same map
+// (same underlying hash table). Go maps are reference types;
+// you can compare pointers indirectly by inserting a sentinel
+// into one and checking it appears in the other. This is the
+// "do they share state" test we need for the de-dup contract.
+func mapsSamePointer(m1, m2 map[string][]byte) bool {
+	if m1 == nil || m2 == nil {
+		return m1 == nil && m2 == nil
+	}
+	// Sentinel-via-write trick: write a unique key to m1, see if
+	// m2 sees it. If both maps share the same underlying hash
+	// table (the de-dup contract), m2 will see the same write.
+	m1["__scaffold_probe__"] = []byte("__scaffold_probe__")
+	defer delete(m1, "__scaffold_probe__")
+	_, ok := m2["__scaffold_probe__"]
+	return ok
+}
+
 // contains is a helper for substring matching in tests
 func contains(s, substr string) bool {
 	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsStr(s, substr))
