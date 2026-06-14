@@ -72,14 +72,14 @@ test.describe("Desktop ChatTab", () => {
   });
 
   test("chat panel loads without error", async ({ page }) => {
-    const hasEmptyState = await page.getByText("Send a message to start chatting.").isVisible().catch(() => false);
-    const hasHistory = await page.locator("#panel-chat [data-testid='chat-panel']:visible").locator("div").count() > 3;
+    const chat = page.locator("#panel-chat [data-testid='chat-panel']:visible");
+    const emptyState = chat.getByText("Send a message to start chatting.");
     // The workspace is seeded with chat history; empty-state here is a
-    // hydration/render failure, not a valid initial condition. Require
-    // history AND reject empty state to avoid the false-green where the
-    // panel renders the empty placeholder but no seeded transcript.
-    expect(hasHistory, "seeded chat history should be visible in the panel").toBeTruthy();
-    expect(hasEmptyState, "empty state should not appear when seeded history exists").toBeFalsy();
+    // hydration/render failure, not a valid initial condition. Assert the
+    // seeded transcript renders AND the empty placeholder is absent.
+    await expect(chat.getByText("Hello from seed", { exact: true })).toBeVisible({ timeout: 5_000 });
+    await expect(chat.getByText("Echo: Hello from seed")).toBeVisible({ timeout: 5_000 });
+    await expect(emptyState).toBeHidden();
   });
 
   test("echo fixture workspace is configured for push delivery", async () => {
