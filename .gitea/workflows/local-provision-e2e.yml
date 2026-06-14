@@ -320,13 +320,13 @@ jobs:
       # even if the runner's $GITHUB_ENV propagation is flaky (#2468 RCA).
       MOLECULE_ENV: development
       SECRETS_ENCRYPTION_KEY: lpe2e-test-encryption-key-32bytes!!
-      # #2851: the real workspace advertises its container DNS name (ws-<id>:8000).
-      # Connect the job container to molecule-core-net below and run the platform
-      # in Docker-aware mode so the proxy resolves workspace container names.
-      # SaaS deploy mode lets the registry validator accept the private Docker-network
-      # IP that ws-<id> resolves to, since this advisory lane is a single-host test.
+      # #2851: the provisioner now makes the workspace advertise http://localhost:<host-port>.
+      # When the platform itself runs inside Docker, the A2A proxy rewrites the
+      # stored http://127.0.0.1:<host-port> URL to ws-<id>:8000, so keep the job
+      # container on molecule-core-net and Docker-aware mode so that Docker-DNS
+      # name resolves. Dev mode already relaxes private-range SSRF checks, so SaaS
+      # deploy mode is no longer required.
       MOLECULE_IN_DOCKER: true
-      MOLECULE_DEPLOY_MODE: saas
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5

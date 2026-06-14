@@ -1633,3 +1633,43 @@ func TestApplyTierResources(t *testing.T) {
 		})
 	}
 }
+
+// ---------- #2851 host-port advertisement ----------
+
+func TestAllocateHostPort(t *testing.T) {
+	port1, err := allocateHostPort()
+	if err != nil {
+		t.Fatalf("allocateHostPort failed: %v", err)
+	}
+	if port1 == "" {
+		t.Fatal("allocateHostPort returned empty port")
+	}
+	if port1 == "0" {
+		t.Fatalf("allocateHostPort returned port 0")
+	}
+
+	port2, err := allocateHostPort()
+	if err != nil {
+		t.Fatalf("second allocateHostPort failed: %v", err)
+	}
+	if port2 == port1 {
+		t.Fatalf("allocateHostPort returned the same port twice: %s", port1)
+	}
+
+	// Verify the port is actually numeric and in the ephemeral range.
+	n, err := strconv.Atoi(port1)
+	if err != nil {
+		t.Fatalf("allocateHostPort returned non-numeric port %q: %v", port1, err)
+	}
+	if n < 1024 || n > 65535 {
+		t.Fatalf("allocateHostPort returned out-of-range port %d", n)
+	}
+}
+
+func TestWorkspaceAdvertiseURL(t *testing.T) {
+	got := workspaceAdvertiseURL("12345")
+	want := "http://localhost:12345"
+	if got != want {
+		t.Errorf("workspaceAdvertiseURL = %q, want %q", got, want)
+	}
+}

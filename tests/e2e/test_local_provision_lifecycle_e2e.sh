@@ -441,16 +441,10 @@ if [ "$LIFECYCLE_LLM" = "minimax" ]; then
   echo "  secret write (MODEL_PROVIDER): $(echo "$SECP" | head -c 120)"
 fi
 
-# #2851: the runtime derives its advertised A2A URL from HOSTNAME (Docker sets
-# this to the container id, e.g. 30e9e720fbc2, which the platform host cannot
-# resolve → registry_register_400). Inject MOLECULE_WORKSPACE_URL via a workspace
-# secret so the runtime registers the reachable container DNS name instead.
-WS_CONTAINER_NAME=$(container_name "$WSID")
-WS_URL="http://${WS_CONTAINER_NAME}:8000"
-SECP=$(curl -s -X POST "$BASE/workspaces/$WSID/secrets" \
-  -H "Authorization: Bearer $WTOKEN" -H "Content-Type: application/json" \
-  -d "{\"key\":\"MOLECULE_WORKSPACE_URL\",\"value\":\"${WS_URL}\"}")
-echo "  secret write (MOLECULE_WORKSPACE_URL): $(echo "$SECP" | head -c 120)"
+# #2851: the provisioner now injects MOLECULE_WORKSPACE_URL automatically so the
+# runtime advertises a host-reachable URL (http://localhost:<host-port>), which
+# the A2A proxy rewrites to ws-<id>:8000 when the platform runs inside Docker.
+# No manual workspace-secret injection is needed here.
 
 # Seed config.yaml directly into the named config volume so the provision (and
 # every later restart) has a config source. Create's byok-no-cred abort never
