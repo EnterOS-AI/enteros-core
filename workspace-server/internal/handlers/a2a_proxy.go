@@ -380,19 +380,23 @@ func (h *WorkspaceHandler) ProxyA2A(c *gin.Context) {
 		}
 	}
 
-	// CANVAS CAP-AND-QUEUE (core#2751, DEFAULT OFF). The canvas→agent POST is
+	// CANVAS CAP-AND-QUEUE (core#2751, DEFAULT ON). The canvas→agent POST is
 	// held for the whole turn; a turn longer than Cloudflare's ~100s edge limit
-	// returns a 524 (the recurring "Failed to send"). When A2A_CANVAS_SYNC_BUDGET
-	// > 0, cap the SYNCHRONOUS wait for canvas callers below that limit: if the
+	// returns a 524 (the recurring "Failed to send"). By default we cap the
+	// SYNCHRONOUS wait for canvas callers at 90s (just under CF's edge): if the
 	// turn hasn't finished by the budget, ack `{status:"queued"}` and let the
 	// dispatch finish on its own — proxyA2ARequest's dispatch already runs on a
 	// context.WithoutCancel forward ctx (idle-bounded), so it survives this
 	// handler returning, and the agent's reply reaches the canvas via the
 	// AGENT_MESSAGE WebSocket broadcast (the exact poll-mode contract). The work
 	// runs on a detached ctx so its DB logging isn't cancelled when we return.
-	// Budget=0 (default) → the unchanged synchronous path below; no behavior
-	// change until an operator opts in. See the design on core#2751.
-	if budget := envx.Duration("A2A_CANVAS_SYNC_BUDGET", 0); budget > 0 && (callerID == "" || isCanvasUser) {
+	//
+	// Operators can disable the cap by setting A2A_CANVAS_SYNC_BUDGET=0 (legacy
+	// synchronous path) or tune the budget via the env var (e.g. 60s for more
+	// conservative environments). The default of 90s is the durable fix that
+	// removes the CF 100s ceiling for the canvas path. See the design on
+	// core#2751.
+	if budget := envx.Duration("A2A_CANVAS_SYNC_BUDGET", 90*time.Second); budget > 0 && (callerID == "" || isCanvasUser) {
 		type a2aResult struct {
 			status int
 			body   []byte
