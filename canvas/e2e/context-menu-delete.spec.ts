@@ -1,4 +1,4 @@
-import { test, expect } from "@playwright/test";
+import { test, expect, type APIRequestContext } from "@playwright/test";
 
 /**
  * Playwright E2E for context-menu → delete confirm flow.
@@ -15,37 +15,39 @@ import { test, expect } from "@playwright/test";
  */
 const API = process.env.E2E_API_URL ?? "http://localhost:8080";
 
-test.describe("Context Menu → Delete Confirm", () => {
-  test.beforeEach(async ({ request }) => {
-    // Ensure at least one workspace exists so the menu can be triggered
-    const res = await request.get(`${API}/workspaces`);
-    const workspaces = (await res.json()) as Array<{ id: string; name: string }>;
-    if (workspaces.length === 0) {
-      test.skip("No workspaces on canvas — cannot test context menu");
-    }
+/** Create and register a leaf workspace that will render on the canvas. */
+async function seedWorkspace(request: APIRequestContext, name: string) {
+  const create = await request.post(`${API}/workspaces`, {
+    data: { name, tier: 1, runtime: "claude-code" },
+    headers: { "Content-Type": "application/json" },
+  });
+  const workspace = (await create.json()) as { id: string; name: string };
+
+  await request.post(`${API}/registry/register`, {
+    data: {
+      id: workspace.id,
+      url: `http://localhost:9999`,
+      agent_card: { name, skills: [] },
+    },
+    headers: { "Content-Type": "application/json" },
   });
 
+  return workspace;
+}
+
+test.describe("Context Menu → Delete Confirm", () => {
   test("Delete button opens ConfirmDialog and clicking Confirm deletes the workspace", async ({
     page,
     request,
   }) => {
-    // 1. Create a workspace to delete (leaf node — no children, no cascade)
-    const create = await request.post(`${API}/workspaces`, {
-      data: { name: "E2E Delete Test", tier: 1, runtime: "claude-code" },
-      headers: { "Content-Type": "application/json" },
-    });
-    const workspace = (await create.json()) as { id: string; name: string };
-    const wsId = workspace.id;
+    // Regression: this test must run from an empty canvas so the old
+    // suite-level `test.skip()` cannot mask a failure to create/register.
+    const before = await request.get(`${API}/workspaces`);
+    const beforeWorkspaces = (await before.json()) as Array<{ id: string; name: string }>;
+    expect(beforeWorkspaces).toHaveLength(0);
 
-    // Register so the node appears online on the canvas
-    await request.post(`${API}/registry/register`, {
-      data: {
-        id: wsId,
-        url: `http://localhost:9999`,
-        agent_card: { name: "E2E Delete Test", skills: [] },
-      },
-      headers: { "Content-Type": "application/json" },
-    });
+    // 1. Create a workspace to delete (leaf node — no children, no cascade)
+    const { id: wsId } = await seedWorkspace(request, "E2E Delete Test");
 
     // 2. Open the canvas and wait for the workspace node
     await page.goto("/", { waitUntil: "networkidle" });
@@ -89,31 +91,18 @@ test.describe("Context Menu → Delete Confirm", () => {
   });
 
   test("Cancel closes the dialog and the workspace remains", async ({ page, request }) => {
-    const res = await request.get(`${API}/workspaces`);
-    const workspaces = (await res.json()) as Array<{ id: string; name: string }>;
-    if (workspaces.length === 0) {
-      test.skip("No workspaces");
-    }
-
-    const ws = workspaces[0];
-
-    // Register if not already
-    await request.post(`${API}/registry/register`, {
-      data: { id: ws.id, url: `http://localhost:9999`, agent_card: { name: ws.name, skills: [] } },
-      headers: { "Content-Type": "application/json" },
-    });
+    // Seed our own workspace so this test is fail-closed and does not depend
+    // on leftovers from earlier suites.
+    const { name: wsName } = await seedWorkspace(request, "E2E Cancel Test");
 
     await page.goto("/", { waitUntil: "networkidle" });
     await page.waitForTimeout(2000);
 
-    const node = page.locator(`.react-flow__node`).filter({ hasText: ws.name }).first();
+    const node = page.locator(`.react-flow__node`).filter({ hasText: wsName }).first();
     await node.click({ button: "right" });
 
     const menu = page.locator('[role="menu"]').first();
     await expect(menu).toBeVisible();
-
-    // Get workspace name before we click Delete (can't easily look it up after)
-    const wsName = ws.name;
 
     await menu.getByRole("menuitem").filter({ hasText: /Delete/i }).click();
     const dialog = page.locator('[role="dialog"]');
