@@ -45,34 +45,39 @@ def main() -> None:
 
     # Path 1: top-level `files` (newer Gitea versions, and the
     # branch-to-branch `base...head` shape commonly used by detect-
-    # changes in harness-replays.yml). Each entry is a file object
-    # with at minimum a `filename` key.
+    # changes in harness-replays.yml). Each entry may be:
+    #   - a dict with `filename` (and sometimes `new_path`/`old_path`)
+    #   - a bare string path
     for f in (data.get("files") or []):
         if isinstance(f, dict):
             fn = f.get("filename", "") or f.get("new_path", "") or f.get("old_path", "")
             if fn:
                 filenames.add(fn)
         elif isinstance(f, str) and f:
-            # Some response shapes are just strings; accept those too.
             filenames.add(f)
 
-    # Path 2: per-commit `files` (the shape documented at script
-    # creation; still populated for at least the SRE-verified
-    # branch-to-branch call). Only used as a fallback if Path 1
-    # yielded nothing — if the top-level `files` had data, we trust
-    # that and skip the per-commit walk to avoid double-listing the
-    # same file across multiple commits.
-    if not filenames:
-        for commit in (data.get("commits") or []):
-            if not isinstance(commit, dict):
-                continue
-            for f in (commit.get("files") or []):
-                if isinstance(f, dict):
-                    fn = f.get("filename", "") or f.get("new_path", "") or f.get("old_path", "")
-                    if fn:
-                        filenames.add(fn)
-                elif isinstance(f, str) and f:
-                    filenames.add(f)
+    # Path 2: per-commit `files` (the SRE-verified shape from 751c98ce;
+    # in some Gitea versions `commits[].files` is populated but the
+    # top-level `files` is empty — the SRE saw exactly this for the
+    # branch-to-branch Compare API). ALWAYS walk this path too, not
+    # just as a fallback, because the two paths can have DIFFERENT
+    # content in the same response (the top-level is the deduplicated
+    # union; the per-commit is per-commit; a file modified in commit
+    # 2 only may not appear in commit 1's per-commit but always appears
+    # in the top-level — but a file ADDED in commit 2 only shows up
+    # in commit 2's per-commit and ALSO in the top-level, so in
+    # practice the union should match. The defensive walk handles
+    # edge cases where the Gitea instance's union is incomplete).
+    for commit in (data.get("commits") or []):
+        if not isinstance(commit, dict):
+            continue
+        for f in (commit.get("files") or []):
+            if isinstance(f, dict):
+                fn = f.get("filename", "") or f.get("new_path", "") or f.get("old_path", "")
+                if fn:
+                    filenames.add(fn)
+            elif isinstance(f, str) and f:
+                filenames.add(f)
 
     if filenames:
         sys.stdout.write("\n".join(sorted(filenames)))
