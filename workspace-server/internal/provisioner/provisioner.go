@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -536,6 +537,34 @@ func InternalURL(workspaceID string) string {
 	return fmt.Sprintf("http://%s:%s", ContainerName(workspaceID), DefaultPort)
 }
 
+// allocateHostPort binds a temporary TCP listener on 127.0.0.1:0 and returns
+// the allocated ephemeral port. The listener is closed before returning, so
+// the port is free for Docker to bind. This lets the provisioner advertise a
+// stable, host-reachable workspace URL (http://localhost:<port>) before the
+// container exists, eliminating the race where the runtime registers its
+// unresolvable Docker container-id hostname.
+func allocateHostPort() (string, error) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return "", fmt.Errorf("failed to allocate ephemeral host port: %w", err)
+	}
+	defer l.Close()
+	addr, ok := l.Addr().(*net.TCPAddr)
+	if !ok {
+		return "", fmt.Errorf("unexpected listener address type %T", l.Addr())
+	}
+	return strconv.Itoa(addr.Port), nil
+}
+
+// workspaceAdvertiseURL returns the URL the runtime should advertise at
+// register time. localhost is accepted by registry validateAgentURL; the
+// handler layer then stores the equivalent http://127.0.0.1:<port> URL and
+// the A2A proxy rewrites it to ws-<id>:8000 when the platform itself runs
+// inside Docker.
+func workspaceAdvertiseURL(hostPort string) string {
+	return fmt.Sprintf("http://localhost:%s", hostPort)
+}
+
 // Start provisions and starts a workspace container.
 func (p *Provisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string, error) {
 	if p == nil || p.cli == nil {
@@ -546,8 +575,18 @@ func (p *Provisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string, e
 	// already exists, so pre-deploy workspace data is not orphaned.
 	configVolume := p.resolveConfigVolumeName(ctx, cfg.WorkspaceID)
 
+	// #2851: allocate a stable host port BEFORE building container env so the
+	// runtime can advertise a host-reachable URL. The alternative — letting
+	// Docker pick an ephemeral port and inspecting after start — leaves the
+	// runtime guessing its own address and registering an unresolvable
+	// container-id hostname.
+	hostPort, err := allocateHostPort()
+	if err != nil {
+		return "", err
+	}
+
 	// Create named volume for configs (idempotent — no-op if already exists)
-	_, err := p.cli.VolumeCreate(ctx, volume.CreateOptions{
+	_, err = p.cli.VolumeCreate(ctx, volume.CreateOptions{
 		Name:   configVolume,
 		Labels: managedLabels(),
 	})
@@ -556,7 +595,12 @@ func (p *Provisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string, e
 	}
 	log.Printf("Provisioner: config volume %s ready", configVolume)
 
-	env := buildContainerEnv(cfg)
+	// #2851: tell the runtime exactly which URL to advertise. localhost is
+	// accepted by registry validateAgentURL; the handler layer then stores the
+	// equivalent http://127.0.0.1:<port> URL and the A2A proxy rewrites it to
+	// ws-<id>:8000 when the platform itself runs inside Docker.
+	advertiseURL := workspaceAdvertiseURL(hostPort)
+	env := append(buildContainerEnv(cfg), fmt.Sprintf("MOLECULE_WORKSPACE_URL=%s", advertiseURL))
 
 	image, imgErr := selectImage(cfg)
 	if imgErr != nil {
@@ -662,7 +706,7 @@ func (p *Provisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string, e
 		RestartPolicy: container.RestartPolicy{Name: "unless-stopped"},
 		PortBindings: nat.PortMap{
 			nat.Port(DefaultPort + "/tcp"): []nat.PortBinding{
-				{HostIP: "127.0.0.1", HostPort: ""}, // Ephemeral host port
+				{HostIP: "127.0.0.1", HostPort: hostPort}, // Pre-allocated stable host port (#2851)
 			},
 		},
 	}
@@ -777,30 +821,34 @@ func (p *Provisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string, e
 	// /configs and /workspace, then drops to agent via gosu). No per-start
 	// chown needed here.
 
-	// Resolve the host-mapped port. Retry inspect up to 3 times if Docker hasn't
-	// bound the ephemeral port yet (rare race under heavy load).
-	hostURL := InternalURL(cfg.WorkspaceID) // fallback to Docker-internal
+	// #2851: use the pre-allocated host port directly. The inspect loop below
+	// is kept as a verification that Docker bound the expected port, but the
+	// stable value comes from allocateHostPort above.
+	hostURL := fmt.Sprintf("http://127.0.0.1:%s", hostPort)
 	for attempt := 0; attempt < 3; attempt++ {
 		info, inspectErr := p.cli.ContainerInspect(ctx, resp.ID)
 		if inspectErr != nil {
 			break
 		}
 		portBindings := info.NetworkSettings.Ports[nat.Port(DefaultPort+"/tcp")]
-		if len(portBindings) > 0 {
-			hostPort := portBindings[0].HostPort
-			hostIP := portBindings[0].HostIP
-			if hostIP == "" {
-				hostIP = "127.0.0.1"
-			}
-			hostURL = fmt.Sprintf("http://%s:%s", hostIP, hostPort)
+		if len(portBindings) > 0 && portBindings[0].HostPort == hostPort {
 			break
 		}
 		if attempt < 2 {
 			time.Sleep(500 * time.Millisecond) // wait for Docker to bind the port
+		} else {
+			log.Printf("Provisioner: container %s did not bind expected host port %s; falling back to inspect value", name, hostPort)
+			if len(portBindings) > 0 {
+				boundIP := portBindings[0].HostIP
+				if boundIP == "" {
+					boundIP = "127.0.0.1"
+				}
+				hostURL = fmt.Sprintf("http://%s:%s", boundIP, portBindings[0].HostPort)
+			}
 		}
 	}
 
-	log.Printf("Provisioner: started container %s for workspace %s at %s (internal: %s)", name, cfg.WorkspaceID, hostURL, InternalURL(cfg.WorkspaceID))
+	log.Printf("Provisioner: started container %s for workspace %s at %s (advertise: %s, internal: %s)", name, cfg.WorkspaceID, hostURL, advertiseURL, InternalURL(cfg.WorkspaceID))
 	return hostURL, nil
 }
 

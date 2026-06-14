@@ -441,6 +441,11 @@ if [ "$LIFECYCLE_LLM" = "minimax" ]; then
   echo "  secret write (MODEL_PROVIDER): $(echo "$SECP" | head -c 120)"
 fi
 
+# #2851: the provisioner now injects MOLECULE_WORKSPACE_URL automatically so the
+# runtime advertises a host-reachable URL (http://localhost:<host-port>), which
+# the A2A proxy rewrites to ws-<id>:8000 when the platform runs inside Docker.
+# No manual workspace-secret injection is needed here.
+
 # Seed config.yaml directly into the named config volume so the provision (and
 # every later restart) has a config source. Create's byok-no-cred abort never
 # wrote it, and this dev stack ships no claude-code template in the platform's
@@ -515,6 +520,25 @@ for _ in $(seq 1 10); do
   sleep 1
 done
 if [ -n "$RUN" ]; then pass "container running: $RUN"; else fail "no running ws-${WSID} container within 10s of online" "docker ps shows none"; fi
+
+# #2851: fail fast if the workspace advertised an unresolvable/unreachable URL.
+# The provisioner now makes the runtime advertise http://localhost:<host-port>,
+# which the platform stores as http://127.0.0.1:<host-port>. The A2A proxy
+# rewrites that to ws-<id>:8000 when the platform runs inside Docker, so the
+# URL stored in the registry should always be a host-reachable loopback address.
+# (The end-to-end proxy reach in Step 5 is the real reachability proof; this
+# assertion just surfaces hostname/DNS misconfiguration early.)
+WS_URL_AFTER=$(ws_field "$WS" "url")
+if [ -n "$WS_URL_AFTER" ]; then
+  pass "workspace registered a non-empty URL: $WS_URL_AFTER"
+else
+  fail "workspace URL is empty after reaching online" "registry row has no url"
+fi
+if echo "$WS_URL_AFTER" | grep -qE '^https?://(127\.0\.0\.1|localhost):'; then
+  pass "workspace registered a host-reachable loopback URL"
+else
+  fail "workspace URL is not a host-reachable loopback address" "url=$WS_URL_AFTER"
+fi
 echo ""
 
 # ----------------------------------------------------------------------------

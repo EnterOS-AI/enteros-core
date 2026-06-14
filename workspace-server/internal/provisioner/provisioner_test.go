@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -1631,5 +1632,46 @@ func TestApplyTierResources(t *testing.T) {
 				t.Errorf("cpuShares = %d, want %d", cpuShares, tt.wantShares)
 			}
 		})
+	}
+}
+
+// ---------- #2851 host-port advertisement ----------
+
+func TestAllocateHostPort(t *testing.T) {
+	port, err := allocateHostPort()
+	if err != nil {
+		t.Fatalf("allocateHostPort failed: %v", err)
+	}
+	if port == "" {
+		t.Fatal("allocateHostPort returned empty port")
+	}
+	if port == "0" {
+		t.Fatalf("allocateHostPort returned port 0")
+	}
+
+	// Verify the port is actually numeric and in the ephemeral range.
+	n, err := strconv.Atoi(port)
+	if err != nil {
+		t.Fatalf("allocateHostPort returned non-numeric port %q: %v", port, err)
+	}
+	if n < 1024 || n > 65535 {
+		t.Fatalf("allocateHostPort returned out-of-range port %d", n)
+	}
+
+	// Verify the port is genuinely free for Docker to bind. (We don't assert
+	// uniqueness across two calls — the OS may immediately reuse a just-closed
+	// ephemeral port under heavy load.)
+	l, err := net.Listen("tcp", "127.0.0.1:"+port)
+	if err != nil {
+		t.Fatalf("allocateHostPort returned port %s that is not bindable: %v", port, err)
+	}
+	l.Close()
+}
+
+func TestWorkspaceAdvertiseURL(t *testing.T) {
+	got := workspaceAdvertiseURL("12345")
+	want := "http://localhost:12345"
+	if got != want {
+		t.Errorf("workspaceAdvertiseURL = %q, want %q", got, want)
 	}
 }
