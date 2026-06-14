@@ -64,10 +64,18 @@ for replay in "${REPLAYS[@]}"; do
     name=$(basename "$replay" .sh)
     echo ""
     echo "[run-all] ━━━ $name ━━━"
-    if bash "$replay"; then
-        # Replays signal "skip" by exiting 0 with a __SKIP__ marker in stdout —
-        # but we capture that as a pass here since the script exited 0. The
-        # skip is documented in the script's own output. CI uses pass/fail.
+    out=$(mktemp)
+    rc=0
+    bash "$replay" >"$out" 2>&1 || rc=$?
+    # Stream the replay output so logs remain useful.
+    cat "$out"
+    if [ "$rc" -eq 0 ] && grep -qE '^\[replay\] __(SKIP|XFAIL)__' "$out"; then
+        # Replays signal "skip" by exiting 0 with a __SKIP__ or __XFAIL__
+        # marker in stdout. Count them as skips, not passes, so the harness
+        # gate doesn't false-green on xfails that test nothing.
+        SKIP_COUNT=$((SKIP_COUNT + 1))
+        echo "[run-all] SKIP: $name"
+    elif [ "$rc" -eq 0 ]; then
         PASS_COUNT=$((PASS_COUNT + 1))
         echo "[run-all] PASS: $name"
     else
@@ -75,11 +83,12 @@ for replay in "${REPLAYS[@]}"; do
         FAILED_NAMES+=("$name")
         echo "[run-all] FAIL: $name"
     fi
+    rm -f "$out"
 done
 
 echo ""
 echo "[run-all] ============================="
-echo "[run-all] Replay summary: ${PASS_COUNT} passed, ${FAIL_COUNT} failed (of ${#REPLAYS[@]} total)"
+echo "[run-all] Replay summary: ${PASS_COUNT} passed, ${FAIL_COUNT} failed, ${SKIP_COUNT} skipped (of ${#REPLAYS[@]} total)"
 if [ ${FAIL_COUNT} -gt 0 ]; then
     echo "[run-all] Failed:"
     for name in "${FAILED_NAMES[@]}"; do
