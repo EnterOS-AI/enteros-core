@@ -145,21 +145,16 @@ export async function startEchoRuntime(): Promise<EchoRuntime> {
             ? "Echo: received your file(s)."
             : "Echo: hello";
 
-        // Allow the activity-log assertion in chat-desktop.spec.ts to observe
-        // the thinking state before the instant echo reply clears it.
-        const delayMs = text === "Trigger activity" ? 800 : 0;
-        setTimeout(() => {
-          const response = {
-            jsonrpc: "2.0",
-            id: rpc.id ?? null,
-            result: {
-              parts: [{ kind: "text", text: replyText }],
-            },
-          };
+        const response = {
+          jsonrpc: "2.0",
+          id: rpc.id ?? null,
+          result: {
+            parts: [{ kind: "text", text: replyText }],
+          },
+        };
 
-          res.writeHead(200);
-          res.end(JSON.stringify(response));
-        }, delayMs);
+        res.writeHead(200);
+        res.end(JSON.stringify(response));
       } catch {
         res.writeHead(400);
         res.end(JSON.stringify({ error: "invalid json" }));
