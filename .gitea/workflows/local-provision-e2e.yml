@@ -320,12 +320,13 @@ jobs:
       # even if the runner's $GITHUB_ENV propagation is flaky (#2468 RCA).
       MOLECULE_ENV: development
       SECRETS_ENCRYPTION_KEY: lpe2e-test-encryption-key-32bytes!!
-      # act_runner runs the job inside a Docker container, so /.dockerenv exists
-      # and the platform auto-detects platformInDocker=true. But the job container
-      # is NOT on molecule-core-net, so it cannot resolve workspace container
-      # hostnames (ws-<id>:8000). Force false so the proxy keeps using the
-      # host-mapped 127.0.0.1:<ephemeral_port> URL, which IS reachable.
-      MOLECULE_IN_DOCKER: false
+      # #2851: the real workspace advertises its container DNS name (ws-<id>:8000).
+      # Connect the job container to molecule-core-net below and run the platform
+      # in Docker-aware mode so the proxy resolves workspace container names.
+      # SaaS deploy mode lets the registry validator accept the private Docker-network
+      # IP that ws-<id> resolves to, since this advisory lane is a single-host test.
+      MOLECULE_IN_DOCKER: true
+      MOLECULE_DEPLOY_MODE: saas
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
@@ -351,6 +352,14 @@ jobs:
           # uses for token-write helper containers.
           docker pull alpine:3.20@sha256:c64c687cbea9300178b30c95835354e34c4e4febc4badfe27102879de0483b5e >/dev/null
           docker network create molecule-core-net >/dev/null 2>&1 || true
+          # #2851: connect the act_runner job container to molecule-core-net so the
+          # platform process can resolve ws-<id>:8000 workspace URLs.
+          JOB_CID="$(hostname)"
+          if docker network connect molecule-core-net "$JOB_CID" >/dev/null 2>&1; then
+            echo "Connected job container ($JOB_CID) to molecule-core-net."
+          else
+            echo "WARN: could not connect job container to molecule-core-net (already connected or fallback)."
+          fi
 
       - name: Start Postgres (docker, ephemeral host port)
         run: |

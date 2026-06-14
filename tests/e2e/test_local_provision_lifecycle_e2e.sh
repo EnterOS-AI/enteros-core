@@ -441,6 +441,17 @@ if [ "$LIFECYCLE_LLM" = "minimax" ]; then
   echo "  secret write (MODEL_PROVIDER): $(echo "$SECP" | head -c 120)"
 fi
 
+# #2851: the runtime derives its advertised A2A URL from HOSTNAME (Docker sets
+# this to the container id, e.g. 30e9e720fbc2, which the platform host cannot
+# resolve → registry_register_400). Inject MOLECULE_WORKSPACE_URL via a workspace
+# secret so the runtime registers the reachable container DNS name instead.
+WS_CONTAINER_NAME=$(container_name "$WSID")
+WS_URL="http://${WS_CONTAINER_NAME}:8000"
+SECP=$(curl -s -X POST "$BASE/workspaces/$WSID/secrets" \
+  -H "Authorization: Bearer $WTOKEN" -H "Content-Type: application/json" \
+  -d "{\"key\":\"MOLECULE_WORKSPACE_URL\",\"value\":\"${WS_URL}\"}")
+echo "  secret write (MOLECULE_WORKSPACE_URL): $(echo "$SECP" | head -c 120)"
+
 # Seed config.yaml directly into the named config volume so the provision (and
 # every later restart) has a config source. Create's byok-no-cred abort never
 # wrote it, and this dev stack ships no claude-code template in the platform's
@@ -515,6 +526,22 @@ for _ in $(seq 1 10); do
   sleep 1
 done
 if [ -n "$RUN" ]; then pass "container running: $RUN"; else fail "no running ws-${WSID} container within 10s of online" "docker ps shows none"; fi
+
+# #2851: fail fast if the workspace advertised an unresolvable/unreachable URL.
+# The MiniMax round-trip fails opaquely when the proxy cannot reach the agent;
+# asserting the registered URL is set and reachable surfaces hostname/DNS issues
+# at the registration layer instead.
+WS_URL_AFTER=$(ws_field "$WS" "url")
+if [ -n "$WS_URL_AFTER" ]; then
+  pass "workspace registered a non-empty URL: $WS_URL_AFTER"
+else
+  fail "workspace URL is empty after reaching online" "registry row has no url"
+fi
+if docker run --rm --network molecule-core-net alpine:latest sh -c "wget -qO- ${WS_URL_AFTER}/.well-known/agent-card.json >/dev/null 2>&1" 2>/dev/null; then
+  pass "workspace URL is reachable from molecule-core-net"
+else
+  fail "workspace URL is not reachable from molecule-core-net" "url=$WS_URL_AFTER"
+fi
 echo ""
 
 # ----------------------------------------------------------------------------
