@@ -212,6 +212,37 @@ test_e2e_pv_prefix_caps_to_32() {
 
 test_e2e_pv_prefix_caps_to_32 || failed=$((failed+1))
 
+# core#2839 follow-up: the concierge "creates workspace" staging E2E
+# uses a 13-char literal prefix (`e2e-cncrg-mk-`). With the corrected
+# helper budget (prefix_len + N + 18 <= CP_ORG_SLUG_MAX_LEN) this
+# prefix leaves room for a 1-char run_id segment plus the 8-hex uuid
+# anchor, keeping the full slug ≤32 chars and matching the CP regex
+# ^[a-z][a-z0-9-]{2,31}$.
+test_e2e_cncrg_mk_prefix_caps_to_32() {
+  local s
+  s="e2e-cncrg-mk-$(make_collision_proof_slug_suffix "20260614-498600-1" 13)"
+  if ! assert_collision_proof_slug "$s"; then
+    echo "FAIL: test_e2e_cncrg_mk_prefix_caps_to_32 — slug '$s' (len=${#s}) failed assert_collision_proof_slug"
+    return 1
+  fi
+  if [ "${#s}" -gt 32 ]; then
+    echo "FAIL: test_e2e_cncrg_mk_prefix_caps_to_32 — slug '$s' is ${#s} chars (want <= 32 to match CP regex ^[a-z][a-z0-9-]{2,31}$)"
+    return 1
+  fi
+  if ! printf '%s' "$s" | grep -q "^e2e-cncrg-mk-"; then
+    echo "FAIL: test_e2e_cncrg_mk_prefix_caps_to_32 — slug '$s' does not start with 'e2e-cncrg-mk-'"
+    return 1
+  fi
+  if ! printf '%s' "$s" | grep -qE '^[a-z][a-z0-9-]{2,31}$'; then
+    echo "FAIL: test_e2e_cncrg_mk_prefix_caps_to_32 — slug '$s' does NOT match CP regex ^[a-z][a-z0-9-]{2,31}\$"
+    return 1
+  fi
+  echo "PASS: test_e2e_cncrg_mk_prefix_caps_to_32 (slug=$s, len=${#s})"
+  return 0
+}
+
+test_e2e_cncrg_mk_prefix_caps_to_32 || failed=$((failed+1))
+
 if [ "$failed" -gt 0 ]; then
   echo "FAILED: $failed test(s)"
   exit 1

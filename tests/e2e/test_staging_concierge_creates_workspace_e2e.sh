@@ -93,11 +93,11 @@ REQUIRE_LIVE="${E2E_REQUIRE_LIVE:-0}"
 source "$(dirname "$0")/lib/collision-proof-slug.sh"
 
 # The workspace name we will ask the concierge to create. The literal
-# `e2e-cncrg-worker-` prefix is visible to the lint (so the SLUG=
+# `e2e-cncrg-w-` prefix is visible to the lint (so the SLUG=
 # has a covered e2e- prefix in the assignment); the uuid suffix
 # makes the name unique per run so a poll for it can never collide
 # with a sibling run's name.
-WORKER_NAME="e2e-cncrg-worker-$(make_collision_proof_slug_suffix "${E2E_RUN_ID:-}" 17)"
+WORKER_NAME="e2e-cncrg-w-$(make_collision_proof_slug_suffix "${E2E_RUN_ID:-}" 12)"
 WORKER_NAME=$(echo "$WORKER_NAME" | tr -cd 'a-zA-Z0-9-' | head -c 48)
 # Exported so the find_worker_by_name python subshell (run in a pipe) reads it
 # via os.environ — a bare shell var would not survive into the subprocess env.

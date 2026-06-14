@@ -85,12 +85,13 @@ make_collision_proof_slug_suffix() {
   fi
 
   # Suffix layout: <date:8> + - + <run_id:N> + - + <uuid:8> = N+18 chars.
-  # Full slug: <prefix_len> + 1 (separator) + (N+18) = prefix_len + N + 19.
-  # Cap: prefix_len + N + 19 <= CP_ORG_SLUG_MAX_LEN
-  #      => N <= CP_ORG_SLUG_MAX_LEN - prefix_len - 19
-  local run_id_budget=$(( CP_ORG_SLUG_MAX_LEN - prefix_len - 19 ))
+  # The caller's literal prefix already includes its trailing separator,
+  # so the full slug is <prefix_len> + (N+18) = prefix_len + N + 18.
+  # Cap: prefix_len + N + 18 <= CP_ORG_SLUG_MAX_LEN
+  #      => N <= CP_ORG_SLUG_MAX_LEN - prefix_len - 18
+  local run_id_budget=$(( CP_ORG_SLUG_MAX_LEN - prefix_len - 18 ))
   if [ "$run_id_budget" -lt 1 ]; then
-    echo "make_collision_proof_slug_suffix: caller prefix (${prefix_len} chars) too long for CP_ORG_SLUG_MAX_LEN=${CP_ORG_SLUG_MAX_LEN}; uuid anchor (8 chars) + date (8 chars) + 3 separators = 19 chars minimum, no room for run_id segment. Shorten the prefix literal in the SLUG= assignment." >&2
+    echo "make_collision_proof_slug_suffix: caller prefix (${prefix_len} chars) too long for CP_ORG_SLUG_MAX_LEN=${CP_ORG_SLUG_MAX_LEN}; date (8 chars) + uuid anchor (8 chars) + 2 separators = 18 chars minimum after the prefix, no room for run_id segment. Shorten the prefix literal in the SLUG= assignment." >&2
     return 1
   fi
 
