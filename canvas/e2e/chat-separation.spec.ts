@@ -6,6 +6,7 @@ import {
   startHeartbeat,
   cleanupWorkspace,
   seedChatHistory,
+  queryPsql,
 } from "./fixtures/chat-seed";
 
 const PLATFORM_URL = process.env.E2E_PLATFORM_URL ?? "http://localhost:8080";
@@ -351,6 +352,101 @@ test.describe("Data Flow — Initial Prompt in Chat", () => {
   test("My Chat empty state is not shown when history exists", async ({ page }) => {
     const panel = panelLocator(page);
     await expect(panel.getByText("No messages yet")).not.toBeVisible();
+  });
+});
+
+const describeWithDb = process.env.E2E_DATABASE_URL
+  ? test.describe
+  : test.describe.skip;
+
+describeWithDb("Chat seed DB round-trip", () => {
+  let cleanup: () => Promise<void> = async () => {};
+  let workspaceId = "";
+
+  test.beforeAll(async () => {
+    const echo = await startEchoRuntime();
+    const ws = await seedWorkspace(echo.baseURL);
+    workspaceId = ws.id;
+    const stopHeartbeat = startHeartbeat(ws.id, ws.authToken);
+
+    // Seed tricky payloads: double quotes, backslashes, apostrophes, and a
+    // newline. If the JSON is mangled by shell/SQL quoting, the round-trip
+    // assertion below will fail instead of silently passing.
+    await seedChatHistory(workspaceId, [
+      {
+        role: "user",
+        content: 'User said "hello" and \\backslash\\ plus an apostrophe\'s test',
+      },
+      {
+        role: "agent",
+        content: 'Agent replied "ok"\nwith a newline',
+      },
+    ]);
+
+    cleanup = async () => {
+      stopHeartbeat();
+      await echo.stop();
+    };
+  });
+
+  test.afterAll(async () => {
+    await cleanupWorkspace(workspaceId);
+    await cleanup();
+  });
+
+  test("seeded jsonb round-trips exactly through psql", async () => {
+    interface SeededActivityRow {
+      id: string;
+      workspace_id: string;
+      activity_type: string;
+      source_id: string | null;
+      method: string;
+      request_body: unknown;
+      response_body: unknown;
+      status: string;
+      duration_ms: number;
+      created_at: string;
+    }
+
+    const rows = queryPsql<
+      SeededActivityRow[]
+    >(`SELECT jsonb_agg(row_to_json(t) ORDER BY t.created_at) FROM (SELECT id, workspace_id, activity_type, source_id, method, request_body, response_body, status, duration_ms, created_at FROM activity_logs WHERE workspace_id = '${workspaceId}' ORDER BY created_at) t`)[0];
+
+    expect(rows).toHaveLength(2);
+
+    const [userRow, agentRow] = rows;
+
+    expect(userRow.activity_type).toBe("a2a_receive");
+    expect(userRow.source_id).toBeNull();
+    expect(userRow.method).toBe("message/send");
+    expect(userRow.request_body).toEqual({
+      params: {
+        message: {
+          parts: [
+            {
+              kind: "text",
+              text: 'User said "hello" and \\backslash\\ plus an apostrophe\'s test',
+            },
+          ],
+        },
+      },
+    });
+    expect(userRow.response_body).toEqual({});
+
+    expect(agentRow.activity_type).toBe("a2a_receive");
+    expect(agentRow.source_id).toBeNull();
+    expect(agentRow.method).toBe("message/send");
+    expect(agentRow.request_body).toEqual({});
+    expect(agentRow.response_body).toEqual({
+      result: {
+        parts: [
+          {
+            kind: "text",
+            text: 'Agent replied "ok"\nwith a newline',
+          },
+        ],
+      },
+    });
   });
 });
 
