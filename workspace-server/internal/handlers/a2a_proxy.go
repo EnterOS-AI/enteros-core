@@ -415,7 +415,9 @@ func (h *WorkspaceHandler) ProxyA2A(c *gin.Context) {
 		detached := context.WithoutCancel(ctx)
 		budget := canvasA2ASyncBudget() // local copy for the time.After below
 		done := make(chan a2aResult, 1)
+		h.asyncWG.Add(1)
 		go func() {
+			defer h.asyncWG.Done()
 			s, b, pe := h.proxyA2ARequest(detached, workspaceID, body, callerID, true, isCanvasUser)
 			done <- a2aResult{s, b, pe}
 		}()
