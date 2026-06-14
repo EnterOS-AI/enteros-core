@@ -24,6 +24,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"sync/atomic"
 )
 
@@ -63,6 +64,60 @@ func main() {
 					"healthz_ok":    true,
 				},
 			},
+		})
+	})
+
+	// /cp/admin/orgs — POST. Mirrors the real CP's orgs.go:267-295 +
+	// router.go:437 validation shape: org-create requires slug, name,
+	// and owner_user_id. The harness's canary-smoke-org-create-400-capture
+	// replay (tests/harness/replays/) posts a payload missing
+	// owner_user_id and asserts the stub returns 400 + a parseable JSON
+	// body naming the missing fields. This is the harness-capture path
+	// for the real core#2737 staging 400-body-loss (the staging script
+	// eats the body under set -e + admin_call; the harness proves the
+	// pattern works locally).
+	//
+	// Burn-down for #2864: registering this handler un-arms the
+	// canary-smoke-org-create-400-capture xfail.
+	mux.HandleFunc("/cp/admin/orgs", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, 405, map[string]any{"error": "method not allowed; expected POST"})
+			return
+		}
+		var payload struct {
+			Slug        string `json:"slug"`
+			Name        string `json:"name"`
+			OwnerUserID string `json:"owner_user_id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			writeJSON(w, 400, map[string]any{"error": "invalid JSON: " + err.Error()})
+			return
+		}
+		var missing []string
+		if payload.Slug == "" {
+			missing = append(missing, "slug")
+		}
+		if payload.Name == "" {
+			missing = append(missing, "name")
+		}
+		if payload.OwnerUserID == "" {
+			missing = append(missing, "owner_user_id")
+		}
+		if len(missing) > 0 {
+			writeJSON(w, 400, map[string]any{
+				"error":  strings.Join(missing, ", ") + " are required",
+				"fields": missing,
+			})
+			return
+		}
+		// If the payload is valid, return 201 (real CP behavior). The
+		// replay doesn't exercise this path — it specifically tests the
+		// 400 + body shape on a bad payload — but returning 201 keeps
+		// the stub honest for any future replay that wants to test
+		// the happy path.
+		writeJSON(w, 201, map[string]any{
+			"ok":   true,
+			"slug": payload.Slug,
 		})
 	})
 

@@ -1,24 +1,16 @@
 #!/usr/bin/env bash
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# XFAIL — issue #2864
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# This replay is currently marked xfail (expected to fail). The underlying
-# issue is tracked at https://git.moleculesai.app/molecule-ai/molecule-core/issues/2864
-# Reason: cp-stub lacks /cp/admin/orgs route (404) + 400 body empty under set -e
+# canary-smoke-org-create-400-capture — core#2737 staging 400-body-loss capture.
 #
-# To un-xfail (when the underlying issue is fixed):
-#   1. Remove the `exit 0` line below
-#   2. Update the issue #2864 with a "fixed" comment + link to the fix PR
-#   3. Verify the replay runs end-to-end with PASS in the local harness
-#   4. The Harness Replays workflow will then surface the real pass signal
+# Reproduces the staging SaaS smoke canary (test_staging_full_saas.sh:368-420)
+# locally: POST /cp/admin/orgs with a known-bad payload (missing owner_user_id)
+# and assert the response is 400 + a parseable JSON body naming the missing
+# fields. The staging script's admin_call + set -e combo eats the body under
+# the failure-shape path; this harness-capture proves the pattern works
+# locally so the staging fix (per Researcher #101104) can mirror it.
 #
-# Why we xfail (not skip, not fix): the underlying issues are out of scope
-# for PR #2821 (which captures the canary failures) but block the green CI
-# signal that the 2-genuine review needs. Tracking the work in the linked
-# issue lets us burn down the xfails as separate PRs land.
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-echo "[replay] __XFAIL__:#2864:cp-stub lacks /cp/admin/orgs route (404) + 400 body empty under set -e"
-exit 0
+# Burn-down for #2864: was previously xfail'd (PR #2821 tracking issue);
+# the cp-stub now implements /cp/admin/orgs (mirror of the real CP's
+# orgs.go:267-295 validation shape), so this replay is re-armed.
 
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -73,13 +65,23 @@ echo "[replay] phase 2: POST /cp/admin/orgs with a known-bad payload (missing ow
 # shape. We bypass the admin_call helper and call curl directly so
 # we can also capture the HTTP status code (admin_call returns
 # nothing on non-2xx because of --fail-with-body under set -e).
+#
+# The cp-stub is called DIRECTLY (http://localhost:9090) — NOT through
+# the cf-proxy/tenant-proxy chain. Reason: the tenant's cp-proxy
+# allowlist intentionally blocks /cp/admin/* paths (security
+# boundary, cp_proxy_test.go line 30: "cross-tenant admin list
+# (lateral movement)") — admin operations don't traverse the
+# tenant proxy in the production path either (real CP admin ops
+# call the CP directly, not through the tenant's cf-proxy). This
+# replay is a harness-capture of the cp-stub's 400+JSON shape; it
+# is NOT a production-path E2E. The staging script (test_staging_full_saas.sh)
+# exercises the production path separately.
 HTTP_CODE=$(curl -sS --fail-with-body --max-time 30 \
     -o /tmp/canary_org_create_400_body.$$ \
     -w "%{http_code}" \
-    -H "Host: ${ALPHA_HOST}" \
     -H "Authorization: Bearer ${ALPHA_ADMIN_TOKEN}" \
     -H "Content-Type: application/json" \
-    -X POST "$BASE/cp/admin/orgs" \
+    -X POST "http://localhost:9090/cp/admin/orgs" \
     -d "{\"slug\":\"$ORG_CREATE_400_CAPTURE_SLUG\",\"name\":\"replay-bad-org\"}" \
     || true)
 # Reset the exit-code from the curl --fail-with-body so set -e
