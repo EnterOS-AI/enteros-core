@@ -117,10 +117,6 @@ func TestApprovals_ListAll_Empty(t *testing.T) {
 	setupTestRedis(t)
 	handler := NewApprovalsHandler(newTestBroadcaster())
 
-	// Auto-expire stale approvals
-	mock.ExpectExec("UPDATE approval_requests SET status = 'denied'").
-		WillReturnResult(sqlmock.NewResult(0, 0))
-
 	// Query all pending
 	mock.ExpectQuery("SELECT a.id, a.workspace_id, w.name, a.action, a.reason, a.status, a.created_at FROM approval_requests a").
 		WillReturnRows(sqlmock.NewRows([]string{"id", "workspace_id", "name", "action", "reason", "status", "created_at"}))
@@ -146,9 +142,6 @@ func TestApprovals_ListAll_WithResults(t *testing.T) {
 	setupTestRedis(t)
 	handler := NewApprovalsHandler(newTestBroadcaster())
 
-	mock.ExpectExec("UPDATE approval_requests SET status = 'denied'").
-		WillReturnResult(sqlmock.NewResult(0, 0))
-
 	reason := "needs review"
 	rows := sqlmock.NewRows([]string{"id", "workspace_id", "name", "action", "reason", "status", "created_at"}).
 		AddRow("appr-1", "ws-1", "Test WS", "run_script", &reason, "pending", "2024-01-01T00:00:00Z").
@@ -170,6 +163,39 @@ func TestApprovals_ListAll_WithResults(t *testing.T) {
 	json.Unmarshal(w.Body.Bytes(), &result)
 	if len(result) != 2 {
 		t.Errorf("expected 2 approvals, got %d", len(result))
+	}
+}
+
+func TestApprovals_ListAll_OldPendingStaysPending(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewApprovalsHandler(newTestBroadcaster())
+
+	// Regression: a pending approval older than 10 minutes must NOT be auto-expired
+	// by ListAll. It should still be returned as pending.
+	reason := "needs review"
+	rows := sqlmock.NewRows([]string{"id", "workspace_id", "name", "action", "reason", "status", "created_at"}).
+		AddRow("appr-old", "ws-1", "Test WS", "run_script", &reason, "pending", "2020-01-01T00:00:00Z")
+
+	mock.ExpectQuery("SELECT a.id, a.workspace_id, w.name").
+		WillReturnRows(rows)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest("GET", "/approvals/pending", nil)
+
+	handler.ListAll(c)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var result []map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &result)
+	if len(result) != 1 {
+		t.Errorf("expected 1 approval, got %d", len(result))
+	}
+	if result[0]["status"] != "pending" {
+		t.Errorf("expected status 'pending', got %v", result[0]["status"])
 	}
 }
 
