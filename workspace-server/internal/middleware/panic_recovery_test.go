@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"log"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -28,8 +29,12 @@ import (
 // Runtime: sub-millisecond.
 func TestRecoverPanic_RecoversFromPanicInGoroutine(t *testing.T) {
 	// Capture the log output so we can assert the prefix appears
-	// and the recovered value is included.
-	var buf bytes.Buffer
+	// and the recovered value is included. The buffer is wrapped
+	// in a mutex (syncBuffer below) so the goroutine's log.Printf
+	// write and the test's buf.String() read are synchronized —
+	// core#2834: the prior `bytes.Buffer` direct-use was a
+	// concurrent read/write that the -race detector flagged.
+	var buf syncBuffer
 	prevWriter := log.Writer()
 	prevFlags := log.Flags()
 	log.SetOutput(&buf)
@@ -41,8 +46,17 @@ func TestRecoverPanic_RecoversFromPanicInGoroutine(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		defer recoverPanic("test_goroutine")
+		// Defer order matters: `defer close(done)` is registered
+		// FIRST, `defer recoverPanic(...)` is registered LAST.
+		// LIFO execution runs recoverPanic first (which writes
+		// the log line via log.Printf), then close(done) — so
+		// the test's <-done unblock happens AFTER the log write
+		// is complete. The prior code had the defers in the
+		// opposite order, which let close(done) fire before
+		// log.Printf finished writing to the buffer (core#2834
+		// data race).
 		defer close(done)
+		defer recoverPanic("test_goroutine")
 		panic("simulated panic value")
 	}()
 
@@ -74,7 +88,10 @@ func TestRecoverPanic_RecoversFromPanicInGoroutine(t *testing.T) {
 // must not emit a spurious "PANIC" line in that case (which would
 // page operators for nothing and obscure the real signal).
 func TestRecoverPanic_NoopOnNormalReturn(t *testing.T) {
-	var buf bytes.Buffer
+	// Use the same mutex-guarded buffer (core#2834) so this test
+	// stays -race-clean if a future change ever makes recoverPanic
+	// write to the buffer on the normal-return path.
+	var buf syncBuffer
 	prevWriter := log.Writer()
 	prevFlags := log.Flags()
 	log.SetOutput(&buf)
@@ -86,8 +103,12 @@ func TestRecoverPanic_NoopOnNormalReturn(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		defer recoverPanic("normal_return_goroutine")
+		// Same defer order as the panic-recovery test: close(done)
+		// registered first so LIFO runs recoverPanic first (no-op
+		// on the normal-return path, but keeps the pattern uniform
+		// and future-proof).
 		defer close(done)
+		defer recoverPanic("normal_return_goroutine")
 		// No panic — just return.
 	}()
 
@@ -128,3 +149,41 @@ func TestRecoverPanic_NoopOnNormalReturn(t *testing.T) {
 //   testable with the minimum dependency surface, then assert
 //   500+no-crash through the real path", which is a non-trivial
 //   refactor on its own.
+
+// syncBuffer wraps a bytes.Buffer with a mutex so the log goroutine
+// (called via log.Printf -> log.Output -> Write) and the test's
+// subsequent String() read are serialized. Without this wrapper,
+// core#2834 flagged a concurrent read/write on the underlying
+// bytes.Buffer that the -race detector caught intermittently on
+// the repo-wide `go test -race` step.
+//
+// Why a mutex and not a channel: the standard `log` package
+// already holds its OWN internal mutex around calls to
+// io.Writer.Write, but that mutex does NOT synchronize with
+// reads from the test goroutine — it only serializes concurrent
+// writers. The test's buf.String() read from a separate goroutine
+// is a separate access path that the log package knows nothing
+// about, so the race detector flags the (write, read) pair.
+// syncBuffer provides the cross-goroutine happens-before edge
+// the race detector needs to see.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+// Write satisfies io.Writer for log.SetOutput. Holds the mutex
+// around the underlying bytes.Buffer.Write call.
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+// String returns a snapshot of the buffer's contents. Holds the
+// mutex around the underlying bytes.Buffer.String call so the
+// read is synchronized with concurrent Write calls.
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
+}
