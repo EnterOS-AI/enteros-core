@@ -269,7 +269,7 @@ jobs:
         if: needs.detect-changes.outputs.run == 'true'
         run: pip install -r tests/harness/requirements.txt
 
-      - name: Rebuild cp-stub from source (RC #11812 stale-build fix)
+      - name: Rebuild cp-stub from source (RC #11812 + RC #11815 narrow fix)
         # Why this step exists: tests/harness/up.sh's \`build\` block is
         # gated by \`--rebuild\` (no default rebuild), so without an
         # explicit \`docker compose build\` the CI uses the cached cp-stub
@@ -279,13 +279,20 @@ jobs:
         # the catch-all (handler not implemented), even though the
         # source has the handler. \`--no-cache\` ensures the rebuilt image
         # pulls the current main.go from the checked-out branch.
-        # Same pattern as the "Pre-clone manifest deps" step above:
-        # build the image from source BEFORE the harness boots.
+        #
+        # RC #11815 NARROW FIX: only cp-stub is rebuilt here. The
+        # tenants (tenant-alpha/tenant-beta) need SECRETS_ENCRYPTION_KEY
+        # which tests/harness/up.sh generates (with \`openssl rand -base64
+        # 32\`) and exports — up.sh runs AFTER this pre-build step, so
+        # building the tenants here would fail with missing env. The
+        # tenants get built later by up.sh (the harness's own \`build\`
+        # block doesn't need --rebuild, so the cached tenant images are
+        # fine for the non-handler-bug surface). cp-stub is the only
+        # service with the stale-handler problem AND no env dep.
         if: needs.detect-changes.outputs.run == 'true'
         working-directory: tests/harness
         run: |
           docker compose -f compose.yml build --no-cache cp-stub
-          docker compose -f compose.yml build --no-cache tenant-alpha tenant-beta
 
       - name: Run all replays against the harness
         # run-all-replays.sh: boot via up.sh → seed via seed.sh → run
