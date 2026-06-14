@@ -84,8 +84,10 @@ func (h *ApprovalsHandler) Create(c *gin.Context) {
 
 // ListAll handles GET /approvals/pending
 // Returns all pending approvals across all workspaces (for canvas polling).
-// Approvals are long-lived until the user Decides or the requester explicitly
-// cancels/denies them; there is no time-based auto-expiry (CTO directive).
+// Approvals are long-lived until a human Decides (approve or deny); there is
+// no time-based auto-expiry (CTO directive). A requester-initiated
+// withdraw/cancel endpoint does not yet exist and is tracked as a separate
+// follow-up.
 func (h *ApprovalsHandler) ListAll(c *gin.Context) {
 	ctx := c.Request.Context()
 
