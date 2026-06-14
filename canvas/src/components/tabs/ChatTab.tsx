@@ -784,7 +784,7 @@ function MyChatPanel({ workspaceId, data }: Props) {
                 {thinkingElapsed}s
               </div>
               {activityLog.length > 0 && (
-                <div className="mt-1.5 text-[9px] text-ink-mid space-y-0.5">
+                <div data-testid="activity-log" className="mt-1.5 text-[9px] text-ink-mid space-y-0.5">
                   <div className="text-ink-mid">Processing with {runtimeDisplayName(data.runtime)}...</div>
                   {activityLog.map((line, i) => (
                     <div key={line + i} className="pl-2 border-l border-line">◇ {line}</div>
