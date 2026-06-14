@@ -2976,6 +2976,7 @@ func TestProxyA2A_CanvasCapAndQueue(t *testing.T) {
 	allowLoopbackForTest(t)
 	broadcaster := newTestBroadcaster()
 	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+	waitForHandlerAsyncBeforeDBCleanup(t, handler)
 
 	// Agent that holds the connection PAST the budget (bounded sleep — no
 	// deadlock with agentServer.Close()). 600ms >> the 100ms budget, so the
