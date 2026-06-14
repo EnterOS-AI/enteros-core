@@ -82,6 +82,27 @@ var workspaceComputeDefaultInstanceByProvider = map[string]string{
 	"gcp":     "e2-standard-2",
 }
 
+// workspaceComputeDisplayDefaultByProvider is the per-provider default machine
+// size the canvas pre-selects for DISPLAY-mode create flows. Distinct from
+// workspaceComputeDefaultInstanceByProvider because display-mode boxes need
+// a larger default (t3.xlarge vs t3.medium on AWS) — the create flow's
+// display-mode branch codifies the prior hardcoded
+// `DEFAULT_DISPLAY_INSTANCE_TYPE = "t3.xlarge"` constant in
+// canvas/src/components/CreateWorkspaceDialog.tsx so the SSOT can drive it
+// instead of a parallel canvas-side mirror (core#2489 phase-2 enabler).
+//
+// MUST stay in lock-step with workspaceComputeProvidersOrdered — the SSOT-
+// consistency check in init() panics if a provider is added here without
+// a default in the parent map (or vice versa). Same bidirectional invariant
+// as workspaceComputeProviderLabels / workspaceComputeDefaultInstanceByProvider.
+// Pinned by TestComputeMetadata_SSOTInternalConsistency (extended for this
+// map in the #2489-A follow-up).
+var workspaceComputeDisplayDefaultByProvider = map[string]string{
+	"aws":     "t3.xlarge",
+	"hetzner": "cpx41",
+	"gcp":     "e2-standard-4",
+}
+
 // workspaceComputeInstanceAllowlist is the O(1) validation set, keyed by cloud
 // provider. DERIVED from workspaceComputeInstanceTypesOrdered in init() so the
 // ordered list (what the canvas renders) and the set (what the backend validates)
@@ -177,15 +198,19 @@ var workspaceComputeMetadataRenderOrder = []string{"aws", "gcp", "hetzner"}
 //   - render-order slice is a permutation of providers slice (same
 //     set, no duplicates)
 //   - every rendered provider has a default + non-empty instance-types
+//   - every rendered provider has a display-default (added in #2489-A
+//     follow-up so the canvas's CreateWorkspaceDialog display-mode
+//     hardcoded t3.xlarge can be REPLACED, not paralleled)
 //
 // A mismatch in ANY direction panics. The check is extracted as a
 // pure function (no side effects, no init() dependency) so the test
 // suite can invoke it against MUTATED SSOT data (negative cases:
 // missing label, missing render entry, duplicate render entry,
-// missing default, empty instance-types) and assert the panic
-// behavior. A future regression in the production init() — e.g.
-// someone removing the panic for "weird but tolerable" cases —
-// would be caught by the negative tests calling this function.
+// missing default, missing display-default, empty instance-types)
+// and assert the panic behavior. A future regression in the
+// production init() — e.g. someone removing the panic for "weird
+// but tolerable" cases — would be caught by the negative tests
+// calling this function.
 //
 // Every direction is enforced:
 //   - label without a provider: dead data (a future
@@ -198,6 +223,12 @@ var workspaceComputeMetadataRenderOrder = []string{"aws", "gcp", "hetzner"}
 //   - render-order entry without a default: silent empty
 //     default (the canvas would have to fall back to a hardcoded
 //     "t3.medium" or fail)
+//   - render-order entry without a display-default: silent empty
+//     display-default (the canvas's CreateWorkspaceDialog would
+//     fall back to a hardcoded "t3.xlarge" — which is the EXACT
+//     drift bug #2489 was opened to fix; this panic prevents a
+//     future regression where someone adds a new provider but
+//     forgets the display-default)
 //   - render-order entry with empty instance-types: silent
 //     empty dropdown
 //   - duplicate render-order entry: render would silently drop
@@ -210,6 +241,7 @@ func checkComputeSSOTConsistency(
 	labels map[string]string,
 	renderOrder []string,
 	defaults map[string]string,
+	displayDefaults map[string]string,
 	instanceTypes map[string][]string,
 ) {
 	ssotSet := make(map[string]struct{}, len(providers))
@@ -248,14 +280,19 @@ func checkComputeSSOTConsistency(
 			panic(fmt.Sprintf("workspaceComputeProvidersOrdered has entry %q missing from workspaceComputeMetadataRenderOrder", p))
 		}
 	}
-	// 3. every rendered provider has a default + non-empty
-	//    instance-types (the canvas relies on both; an empty
-	//    default falls back to "t3.medium" via the consumer
-	//    helper, but a missing default is a UX dead-end we want
-	//    to catch at boot, not in the field).
+	// 3. every rendered provider has a default + a display-default
+	//    + non-empty instance-types (the canvas relies on all three;
+	//    an empty default falls back to "t3.medium" via the consumer
+	//    helper, an empty display-default falls back to "t3.xlarge"
+	//    via the CreateWorkspaceDialog hardcoded constant, and a
+	//    missing instance-types is a UX dead-end — we want all
+	//    three caught at boot, not in the field).
 	for _, p := range renderOrder {
 		if _, ok := defaults[p]; !ok {
 			panic(fmt.Sprintf("workspaceComputeMetadataRenderOrder has entry %q with no default in workspaceComputeDefaultInstanceByProvider", p))
+		}
+		if _, ok := displayDefaults[p]; !ok {
+			panic(fmt.Sprintf("workspaceComputeMetadataRenderOrder has entry %q with no display-default in workspaceComputeDisplayDefaultByProvider (core#2489 phase-2 enabler) — this would silently re-introduce the CreateWorkspaceDialog hardcoded `t3.xlarge` drift bug", p))
 		}
 		if len(instanceTypes[p]) == 0 {
 			panic(fmt.Sprintf("workspaceComputeMetadataRenderOrder has entry %q with empty instance-types list", p))
@@ -279,6 +316,7 @@ func init() {
 		workspaceComputeProviderLabels,
 		workspaceComputeMetadataRenderOrder,
 		workspaceComputeDefaultInstanceByProvider,
+		workspaceComputeDisplayDefaultByProvider,
 		workspaceComputeInstanceTypesOrdered,
 	)
 }
@@ -515,8 +553,19 @@ type workspaceComputeOptionsResponse struct {
 	// InstanceTypes per provider, in canonical render order.
 	InstanceTypes map[string][]string `json:"instanceTypes"`
 	// Defaults maps each provider → its default instance type (the canvas
-	// pre-selects this when switching providers).
+	// pre-selects this when switching providers; headless create flow).
 	Defaults map[string]string `json:"defaults"`
+	// DisplayDefaults maps each provider → its default instance type for
+	// DISPLAY-mode create flows. Distinct from Defaults because display
+	// boxes need a larger default (t3.xlarge vs t3.medium on AWS). The
+	// canvas's CreateWorkspaceDialog currently hardcodes the display
+	// default as t3.xlarge (parallel to this map's value); the canvas
+	// migration to consume this field is a follow-up PR (core#2489
+	// phase-2). Codified here as the SSOT so the canvas-side constant
+	// can be REPLACED (not paralleled) once the canvas PR lands.
+	// Same bidirectional SSOT-consistency invariant as Defaults: keys
+	// must match the Providers slice (panicked in init() otherwise).
+	DisplayDefaults map[string]string `json:"display_defaults"`
 }
 
 // buildComputeOptions assembles the SSOT response from the allowlist + defaults.
@@ -538,10 +587,16 @@ func buildComputeOptions() workspaceComputeOptionsResponse {
 		defaults[k] = v
 	}
 
+	displayDefaults := make(map[string]string, len(workspaceComputeDisplayDefaultByProvider))
+	for k, v := range workspaceComputeDisplayDefaultByProvider {
+		displayDefaults[k] = v
+	}
+
 	return workspaceComputeOptionsResponse{
-		Providers:     providers,
-		InstanceTypes: instanceTypes,
-		Defaults:      defaults,
+		Providers:       providers,
+		InstanceTypes:   instanceTypes,
+		Defaults:        defaults,
+		DisplayDefaults: displayDefaults,
 	}
 }
 
