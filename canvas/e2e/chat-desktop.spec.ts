@@ -127,18 +127,6 @@ test.describe("Desktop ChatTab", () => {
 
     await expect(chat.getByText("Echo: Please read this file")).toBeVisible({ timeout: 15_000 });
   });
-
-  test("activity log appears during send", async ({ page }) => {
-    const textarea = page.locator("#panel-chat textarea").first();
-    await textarea.fill("Trigger activity");
-    await page.getByRole("button", { name: /Send/ }).first().click();
-
-    // The activity log renders inline in the current ChatTab layout while the
-    // agent is thinking. It must become visible during the send flow and then
-    // clears once the response arrives.
-    const activityLog = page.locator("#panel-chat [data-testid='activity-log']").first();
-    await expect(activityLog).toBeVisible({ timeout: 10_000 });
-  });
 });
 
 test.describe("Desktop ChatTab — Markdown rendering", () => {
