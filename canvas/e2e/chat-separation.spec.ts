@@ -18,7 +18,7 @@ async function enterMapView(page: Page): Promise<void> {
   await btn.click();
 }
 
-/** Open the seeded workspace's Chat side panel. */
+/** Open the seeded workspace's Chat side panel (scoped to the visible panel). */
 async function openChatPanel(page: Page, workspaceName: string): Promise<void> {
   await page.setViewportSize({ width: 1280, height: 800 });
   await page.goto("/");
@@ -38,11 +38,13 @@ async function openChatPanel(page: Page, workspaceName: string): Promise<void> {
   await page.waitForSelector("#panel-chat [data-testid='chat-panel']:visible", {
     timeout: 5_000,
   });
-  await expect(page.locator("#panel-chat textarea").first()).toBeEnabled({
+  await expect(page.locator("#panel-chat [data-testid='chat-panel']:visible textarea").first()).toBeEnabled({
     timeout: 15_000,
   });
 }
 
+const panelLocator = (page: Page) =>
+  page.locator("#panel-chat [data-testid='chat-panel']:visible");
 /** Post a message to the workspace via the A2A proxy so activity rows exist.
  *  `source` determines the auth shape, which in turn determines
  *  activity_logs.source_id:
@@ -128,7 +130,7 @@ test.describe("Chat Sub-Tabs", () => {
   });
 
   test("chat tab shows My Chat and Agent Comms sub-tabs", async ({ page }) => {
-    const panel = page.locator("#panel-chat");
+    const panel = panelLocator(page);
     await expect(panel.getByRole("button", { name: "My Chat" })).toBeVisible();
     await expect(panel.getByRole("button", { name: "Agent Comms" })).toBeVisible();
   });
@@ -141,7 +143,7 @@ test.describe("Chat Sub-Tabs", () => {
   });
 
   test("switching to Agent Comms shows different content", async ({ page }) => {
-    const panel = page.locator("#panel-chat");
+    const panel = panelLocator(page);
     await panel.getByRole("button", { name: "Agent Comms" }).click();
 
     // Agent Comms should be selected and My Chat's textarea should not be visible.
@@ -152,7 +154,7 @@ test.describe("Chat Sub-Tabs", () => {
   });
 
   test("My Chat has input box, Agent Comms does not", async ({ page }) => {
-    const panel = page.locator("#panel-chat");
+    const panel = panelLocator(page);
 
     // My Chat has the textarea.
     await expect(panel.locator("textarea").first()).toBeVisible();
@@ -163,7 +165,7 @@ test.describe("Chat Sub-Tabs", () => {
   });
 
   test("switching back to My Chat preserves messages", async ({ page }) => {
-    const panel = page.locator("#panel-chat");
+    const panel = panelLocator(page);
 
     // Send a message so there is content to preserve.
     const textarea = panel.locator("textarea").first();
@@ -343,13 +345,13 @@ test.describe("Data Flow — Initial Prompt in Chat", () => {
   });
 
   test("seeded chat history appears in My Chat", async ({ page }) => {
-    const panel = page.locator("#panel-chat");
+    const panel = panelLocator(page);
     await expect(panel.getByText('Hello from seed with "quotes"')).toBeVisible({ timeout: 5_000 });
     await expect(panel.getByText('Hello back from seed with "quotes"')).toBeVisible({ timeout: 5_000 });
   });
 
   test("My Chat empty state is not shown when history exists", async ({ page }) => {
-    const panel = page.locator("#panel-chat");
+    const panel = panelLocator(page);
     await expect(panel.getByText("No messages yet")).not.toBeVisible();
   });
 });
@@ -384,7 +386,7 @@ test.describe("No JS Errors", () => {
     await openChatPanel(page, workspaceName);
 
     // Switch between tabs.
-    const panel = page.locator("#panel-chat");
+    const panel = panelLocator(page);
     await panel.getByRole("button", { name: "Agent Comms" }).click();
     await panel.getByRole("button", { name: "My Chat" }).click();
 

@@ -609,3 +609,46 @@ describe("useChatSend — legacy no-messageId fallback is exact-one-token conser
     expect(result.current.error).toBeNull();
   });
 });
+
+describe("useChatSend — push-mode reply is not dropped by a racing WS completion (core#2786)", () => {
+  it("renders the push-mode echo reply even when onSendComplete finishes the token first", async () => {
+    const send = deferred();
+    apiPostMock.mockImplementationOnce(() => send.promise);
+
+    const onAgentMessage = vi.fn();
+    const { result } = renderHook(() =>
+      useChatSend("push-echo-ws-race", {
+        getHistoryMessages: () => [],
+        onAgentMessage,
+      }),
+    );
+
+    await act(async () => {
+      await result.current.sendMessage("echo me");
+      await Promise.resolve();
+    });
+    expect(result.current.sending).toBe(true);
+
+    const messageId = (apiPostMock.mock.calls[0][1] as { params: { message: { messageId: string } } }).params.message.messageId;
+
+    // A WebSocket completion event (ACTIVITY_LOGGED status=ok with messageId,
+    // or AGENT_MESSAGE) can arrive before the HTTP 200 on a fast echo/reply.
+    // It finishes the token — the spinner must drop.
+    act(() => {
+      result.current.finishSendByMessageId?.(messageId);
+    });
+    expect(result.current.sending).toBe(false);
+
+    // The late HTTP push-mode reply still carries the actual content and MUST
+    // be rendered; otherwise the echo bubble never appears (core#2786).
+    await act(async () => {
+      send.resolve({ result: { parts: [{ kind: "text", text: "Echo: echo me" }] } });
+      await Promise.resolve();
+    });
+
+    expect(onAgentMessage).toHaveBeenCalledTimes(1);
+    expect((onAgentMessage.mock.calls[0][0] as { content: string }).content).toBe(
+      "Echo: echo me",
+    );
+  });
+});
