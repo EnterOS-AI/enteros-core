@@ -131,24 +131,22 @@ test.describe("Chat Sub-Tabs", () => {
 
   test("chat tab shows My Chat and Agent Comms sub-tabs", async ({ page }) => {
     const panel = panelLocator(page);
-    await expect(panel.getByRole("button", { name: "My Chat" })).toBeVisible();
-    await expect(panel.getByRole("button", { name: "Agent Comms" })).toBeVisible();
+    await expect(panel.getByRole("tab", { name: "My Chat" })).toBeVisible();
+    await expect(panel.getByRole("tab", { name: "Agent Comms" })).toBeVisible();
   });
 
   test("My Chat is selected by default", async ({ page }) => {
-    const myChatBtn = page
-      .locator("#panel-chat")
-      .getByRole("button", { name: "My Chat" });
+    const myChatBtn = panelLocator(page).getByRole("tab", { name: "My Chat" });
     await expect(myChatBtn).toHaveAttribute("aria-selected", "true");
   });
 
   test("switching to Agent Comms shows different content", async ({ page }) => {
     const panel = panelLocator(page);
-    await panel.getByRole("button", { name: "Agent Comms" }).click();
+    await panel.getByRole("tab", { name: "Agent Comms" }).click();
 
     // Agent Comms should be selected and My Chat's textarea should not be visible.
     await expect(
-      panel.getByRole("button", { name: "Agent Comms" }),
+      panel.getByRole("tab", { name: "Agent Comms" }),
     ).toHaveAttribute("aria-selected", "true");
     await expect(panel.locator("textarea").first()).not.toBeVisible();
   });
@@ -160,7 +158,7 @@ test.describe("Chat Sub-Tabs", () => {
     await expect(panel.locator("textarea").first()).toBeVisible();
 
     // Switch to Agent Comms.
-    await panel.getByRole("button", { name: "Agent Comms" }).click();
+    await panel.getByRole("tab", { name: "Agent Comms" }).click();
     await expect(panel.locator("textarea").first()).not.toBeVisible();
   });
 
@@ -176,8 +174,8 @@ test.describe("Chat Sub-Tabs", () => {
     ).toBeVisible({ timeout: 15_000 });
 
     // Switch to Agent Comms and back.
-    await panel.getByRole("button", { name: "Agent Comms" }).click();
-    await panel.getByRole("button", { name: "My Chat" }).click();
+    await panel.getByRole("tab", { name: "Agent Comms" }).click();
+    await panel.getByRole("tab", { name: "My Chat" }).click();
 
     // Message should still be there.
     await expect(panel.getByText("Persistence check", { exact: true })).toBeVisible();
@@ -387,8 +385,8 @@ test.describe("No JS Errors", () => {
 
     // Switch between tabs.
     const panel = panelLocator(page);
-    await panel.getByRole("button", { name: "Agent Comms" }).click();
-    await panel.getByRole("button", { name: "My Chat" }).click();
+    await panel.getByRole("tab", { name: "Agent Comms" }).click();
+    await panel.getByRole("tab", { name: "My Chat" }).click();
 
     const critical = errors.filter(
       (e) => !e.includes("WebSocket") && !e.includes("favicon") && !e.includes("hydration"),
