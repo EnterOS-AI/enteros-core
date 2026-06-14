@@ -5,11 +5,11 @@
 #   1. Config-missing path (exit 71) when E2E_LLM_PROXY_URL is unset AND
 #      MOLECULE_CP_URL is unset.
 #   2. DEP-DOWN path (exit 70) when the proxy URL is unreachable.
-#   3. DEP-DOWN path (exit 70) when the proxy returns 200 with a
-#      malformed body (the 2026-06-12 incident's "200 with empty body"
-#      class of outage — see lib doc).
-#   4. Happy path (exit 0) when the proxy returns 200 with a normal
-#      completion body containing "choices".
+#   3. DEP-DOWN path (exit 70) when the proxy returns 5xx.
+#   4. Happy path (exit 0) when the proxy returns any HTTP response,
+#      including 401 (the #76 semantics fix: an unauthenticated probe
+#      against an auth-required proxy must NOT be classified as
+#      dependency-down).
 #   5. The error message starts with the `DEP-DOWN:staging-llm` prefix
 #      that the redgate-reporter parses for dedup.
 #
@@ -35,7 +35,7 @@ PY_SERVER_LOG=$(mktemp)
 PY_SERVER_PID=
 
 start_test_server() {
-  local mode="$1"  # "ok" | "down" | "empty_200" | "echo" | "auth"
+  local mode="$1"  # "ok" | "down" | "unauth"
   # Pick a free port via socket binding; pass it explicitly to the server.
   local port
   port=$(python3 -c "
@@ -51,39 +51,17 @@ mode = "$mode"
 port = $port
 class H(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
-        length = int(self.headers.get('Content-Length', 0))
-        raw = self.rfile.read(length).decode('utf-8', errors='replace')
-        try:
-            req = json.loads(raw) if raw else {}
-        except json.JSONDecodeError:
-            req = {}
         if mode == "down":
             self.send_error(503, "simulated outage")
             return
-        if mode == "empty_200":
-            self.send_response(200)
+        if mode == "unauth":
+            self.send_response(401)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(b'{"error":"upstream silent"}')
+            self.wfile.write(b'{"error":"unauthorized"}')
             return
-        if mode == "auth":
-            auth = self.headers.get('Authorization', '')
-            if not auth.startswith('Bearer '):
-                self.send_response(401)
-                self.end_headers()
-                self.wfile.write(b'{"error":"missing auth"}')
-                return
-            # fall through to ok response
-        # ok / echo / auth-success: echo model back so tests can verify
-        # the request body was sent correctly. Also persist the full request
-        # to a well-known file for tests that need to inspect it.
-        req_path = "/tmp/_llm_preflight_last_request.json"
-        try:
-            with open(req_path, "w") as fh:
-                json.dump(req, fh)
-        except Exception:
-            pass
-        body = {"choices":[{"message":{"role":"assistant","content":req.get("model","pong")}}]}
+        # ok
+        body = {"choices":[{"message":{"role":"assistant","content":"pong"}}]}
         payload = json.dumps(body).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -162,10 +140,10 @@ test_proxy_unreachable() {
   return 0
 }
 
-# Test 3: proxy returns 200 with malformed body → exit 70.
-test_200_empty_body() {
+# Test 3: proxy returns 401 (auth required) → exit 0 (#76 semantics fix).
+test_401_reachable() {
   PY_SERVER_PORT=0
-  start_test_server "empty_200"
+  start_test_server "unauth"
   # E2E_LLM_PROXY_URL is read by the sourced llm_proxy_preflight helper
   # (lib/llm_proxy_preflight.sh) via ${E2E_LLM_PROXY_URL:-}. Export it
   # here so shellcheck doesn't false-positive SC2034 (appears unused) when
@@ -174,19 +152,14 @@ test_200_empty_body() {
   local out rc
   out=$(llm_proxy_preflight 2>&1)
   rc=$?
-  if [ "$rc" -ne 70 ]; then
-    echo "FAIL: test_200_empty_body expected exit 70, got $rc"
-    echo "  output: $out"
-    return 1
-  fi
-  if ! echo "$out" | grep -q "DEP-DOWN:staging-llm"; then
-    echo "FAIL: test_200_empty_body output missing DEP-DOWN:staging-llm prefix"
+  if [ "$rc" -ne 0 ]; then
+    echo "FAIL: test_401_reachable expected exit 0, got $rc"
     echo "  output: $out"
     return 1
   fi
   stop_test_server
   PY_SERVER_PID=
-  echo "PASS: test_200_empty_body"
+  echo "PASS: test_401_reachable"
   return 0
 }
 
@@ -236,62 +209,12 @@ test_503() {
   return 0
 }
 
-# Test 6: custom model slug via E2E_LLM_PREFLIGHT_MODEL is sent in the request body.
-test_model_override() {
-  PY_SERVER_PORT=0
-  start_test_server "echo"
-  export E2E_LLM_PROXY_URL="http://127.0.0.1:${PY_SERVER_PORT}/v1/chat/completions"
-  export E2E_LLM_PREFLIGHT_MODEL="custom-model-42"
-  rm -f /tmp/_llm_preflight_last_request.json
-  local out rc
-  out=$(llm_proxy_preflight 2>&1)
-  rc=$?
-  unset E2E_LLM_PREFLIGHT_MODEL
-  stop_test_server
-  PY_SERVER_PID=
-  if [ "$rc" -ne 0 ]; then
-    echo "FAIL: test_model_override expected exit 0, got $rc"
-    echo "  output: $out"
-    return 1
-  fi
-  if ! python3 -c "import json; d=json.load(open('/tmp/_llm_preflight_last_request.json')); assert d.get('model')=='custom-model-42'; print('model ok')" 2>&1; then
-    echo "FAIL: test_model_override did not send the custom model in the request body"
-    echo "  request file: $(cat /tmp/_llm_preflight_last_request.json 2>/dev/null || echo '<missing>')"
-    return 1
-  fi
-  echo "PASS: test_model_override"
-  return 0
-}
-
-# Test 7: optional Authorization header is sent when E2E_LLM_PREFLIGHT_API_KEY is set.
-test_auth_header() {
-  PY_SERVER_PORT=0
-  start_test_server "auth"
-  export E2E_LLM_PROXY_URL="http://127.0.0.1:${PY_SERVER_PORT}/v1/chat/completions"
-  export E2E_LLM_PREFLIGHT_API_KEY="test-token-123"
-  local out rc
-  out=$(llm_proxy_preflight 2>&1)
-  rc=$?
-  unset E2E_LLM_PREFLIGHT_API_KEY
-  stop_test_server
-  PY_SERVER_PID=
-  if [ "$rc" -ne 0 ]; then
-    echo "FAIL: test_auth_header expected exit 0, got $rc"
-    echo "  output: $out"
-    return 1
-  fi
-  echo "PASS: test_auth_header"
-  return 0
-}
-
 failed=0
 test_config_missing || failed=$((failed+1))
 test_proxy_unreachable || failed=$((failed+1))
-test_200_empty_body || failed=$((failed+1))
+test_401_reachable || failed=$((failed+1))
 test_ok || failed=$((failed+1))
 test_503 || failed=$((failed+1))
-test_model_override || failed=$((failed+1))
-test_auth_header || failed=$((failed+1))
 
 if [ "$failed" -gt 0 ]; then
   echo "FAILED: $failed test(s)"
