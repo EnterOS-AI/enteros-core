@@ -174,27 +174,76 @@ func init() {
 	for _, p := range workspaceComputeProvidersOrdered {
 		workspaceComputeProviderAllowlist[p] = struct{}{}
 	}
-	// SSOT consistency check (core#2489): the labels map + render-order
-	// slice + providers slice + instance-types map + defaults map must
-	// all reference the same set of providers. A label without a
-	// provider (or vice-versa) is a drift bug; a render-order entry
-	// without a label is a render-order typo. The check is intentionally
+	// SSOT consistency check (core#2489, Researcher's RC #11736
+	// bidirectional-init fix): the labels map + render-order slice +
+	// instance-types map + defaults map must all reference the SAME
+	// set of providers as workspaceComputeProvidersOrdered. A
+	// mismatch in ANY direction is a drift bug:
+	//   - label without a provider: dead data (a future
+	//     workspaceComputeProvidersOrdered growth would miss the label)
+	//   - provider without a label: silent empty label in the
+	//     response (UX dead-end)
+	//   - render-order entry without a provider: dead data
+	//   - provider missing from render order: silent omission from
+	//     the dropdown (the user couldn't switch to that provider)
+	//   - render-order entry without a default: silent empty
+	//     default (the canvas would have to fall back to a hardcoded
+	//     "t3.medium" or fail)
+	//   - render-order entry with empty instance-types: silent
+	//     empty dropdown
+	// Every direction is enforced. The check is intentionally
 	// strict (panics on first mismatch) — these are static in-binary
 	// data, not user input, and any mismatch is a compile-time
 	// mistake that must surface at boot, not in a logged endpoint
-	// response.
+	// response. Pinned in lockstep with
+	// TestComputeMetadata_SSOTInternalConsistency.
 	ssotSet := make(map[string]struct{}, len(workspaceComputeProvidersOrdered))
 	for _, p := range workspaceComputeProvidersOrdered {
 		ssotSet[p] = struct{}{}
 	}
+	// 1. labels keys ⊆ providers keys AND providers keys ⊆ labels keys
+	//    (bidirectional — every provider has a label, every label
+	//    has a provider).
+	labelsSet := make(map[string]struct{}, len(workspaceComputeProviderLabels))
 	for p := range workspaceComputeProviderLabels {
 		if _, ok := ssotSet[p]; !ok {
 			panic(fmt.Sprintf("workspaceComputeProviderLabels has key %q not in workspaceComputeProvidersOrdered", p))
 		}
+		labelsSet[p] = struct{}{}
 	}
+	for _, p := range workspaceComputeProvidersOrdered {
+		if _, ok := labelsSet[p]; !ok {
+			panic(fmt.Sprintf("workspaceComputeProvidersOrdered has entry %q with no label in workspaceComputeProviderLabels", p))
+		}
+	}
+	// 2. render-order is a permutation of providers: every entry
+	//    has a provider, every provider has an entry, no duplicates.
+	renderSet := make(map[string]struct{}, len(workspaceComputeMetadataRenderOrder))
 	for _, p := range workspaceComputeMetadataRenderOrder {
 		if _, ok := ssotSet[p]; !ok {
 			panic(fmt.Sprintf("workspaceComputeMetadataRenderOrder has entry %q not in workspaceComputeProvidersOrdered", p))
+		}
+		if _, dup := renderSet[p]; dup {
+			panic(fmt.Sprintf("workspaceComputeMetadataRenderOrder has duplicate entry %q", p))
+		}
+		renderSet[p] = struct{}{}
+	}
+	for _, p := range workspaceComputeProvidersOrdered {
+		if _, ok := renderSet[p]; !ok {
+			panic(fmt.Sprintf("workspaceComputeProvidersOrdered has entry %q missing from workspaceComputeMetadataRenderOrder", p))
+		}
+	}
+	// 3. every rendered provider has a default + non-empty
+	//    instance-types (the canvas relies on both; an empty
+	//    default falls back to "t3.medium" via the consumer
+	//    helper, but a missing default is a UX dead-end we want
+	//    to catch at boot, not in the field).
+	for _, p := range workspaceComputeMetadataRenderOrder {
+		if _, ok := workspaceComputeDefaultInstanceByProvider[p]; !ok {
+			panic(fmt.Sprintf("workspaceComputeMetadataRenderOrder has entry %q with no default in workspaceComputeDefaultInstanceByProvider", p))
+		}
+		if len(workspaceComputeInstanceTypesOrdered[p]) == 0 {
+			panic(fmt.Sprintf("workspaceComputeMetadataRenderOrder has entry %q with empty instance-types list", p))
 		}
 	}
 }
