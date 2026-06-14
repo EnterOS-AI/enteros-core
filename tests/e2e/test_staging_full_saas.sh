@@ -366,22 +366,31 @@ log "1/11 Creating org $SLUG via /cp/admin/orgs..."
 # set -euo pipefail, aborting the whole harness with no body
 # in the CI logs.
 CREATE_BODYFILE="$(mktemp -t create-org-resp.XXXXXX)"
-# core#60 trap-chain + exit-code preservation: the prior
+# core#60 trap-chain + exit-code preservation (RC #11654 #2,
+# #11654 #3, #11673, #11674): the prior
 # `trap 'rm -f "$CREATE_BODYFILE"' EXIT` overwrote the
 # cleanup_org EXIT trap at line 330, leaking the staging
 # org/resources if the bodyfile path succeeded and a later
-# step failed. The fix: capture the previous EXIT trap via
-# `trap -p EXIT`, then install a chained EXIT trap that
-# (a) records the script's exit code FIRST into a local
-# variable `ec`, (b) removes the bodyfile, (c) re-installs
-# the previous trap (so it stays installed for any further
-# EXIT signal), and (d) `exit $ec` preserves the script's
-# exit code. Without (d), the trap chain's exit code would
-# be `cleanup_org`'s own exit, masking the real failure
-# from CI.
-# core#60 RC #11654 #2 + exit-code preservation #11654 #3.
+# step failed. Worse, re-installing the previous trap
+# during EXIT handling and then exiting with `(exit $ec)`
+# does NOT actually invoke the re-installed trap body — a
+# trap that fires during another trap's body does not chain.
+# The fix: extract cleanup_org's command body via `trap -p
+# EXIT`, then build a single EXIT trap that (a) captures
+# the script's exit code FIRST into a file-scoped
+# `__org_create_bodyfile_ec` (file-scoped via export so the
+# trap-string evaluator can see it), (b) removes the
+# bodyfile, (c) explicitly invokes the captured
+# cleanup_org body inline (not as a re-registered trap),
+# (d) propagates the original exit code to CI. The capture
+# uses `trap -p EXIT` which prints the current trap in a
+# form suitable for re-evaluation; the `sed` extracts the
+# command body (the original trap was set with
+# `trap cleanup_org EXIT INT TERM` so the captured string
+# is just `cleanup_org`).
+__org_create_bodyfile_ec=""
 prev_exit_trap="$(trap -p EXIT | sed -E "s/^trap -- '//; s/'$ EXIT$//")"
-trap 'ec=$?; rm -f "$CREATE_BODYFILE"; trap -- '"'"'${prev_exit_trap}'"'"' EXIT; (exit $ec)' EXIT
+trap '__org_create_bodyfile_ec=$?; rm -f "$CREATE_BODYFILE"; '"${prev_exit_trap}"'; exit "${__org_create_bodyfile_ec}"' EXIT
 set +e
 CREATE_HTTP_CODE=$(curl "${CURL_COMMON[@]}" -X POST "$CP_URL/cp/admin/orgs" \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
@@ -405,10 +414,10 @@ if [ "$CURL_RC" -ne 0 ] || [ "$CREATE_HTTP_CODE" -lt 200 ] || [ "$CREATE_HTTP_CO
   log "--- BEGIN CREATE RESPONSE ---"
   log "$CREATE_RESP"
   log "--- END CREATE RESPONSE ---"
-  if [ "${#SLUG}" -gt 31 ]; then
-    fail "Org create returned non-2xx AND slug is ${#SLUG} chars (over the CP's 31-char cap). The slug helper's assertion should have caught this; check collision-proof-slug.sh's run_id_budget math."
+  if [ "${#SLUG}" -gt 32 ]; then
+    fail "Org create returned non-2xx AND slug is ${#SLUG} chars (over the CP's 32-char cap). The slug helper's assertion should have caught this; check collision-proof-slug.sh's run_id_budget math."
   fi
-  fail "Org create returned non-2xx (http=$CREATE_HTTP_CODE) — see body above. Common causes: 409=slug collision (a prior run left a stale org; the slug helper should prevent this — check E2E_RUN_ID propagation), 400=slug too long (should be caught by the 31-char cap assertion), 401=ADMIN_TOKEN not set or expired, 422=schema mismatch (check the -d payload matches the CP's expected shape)."
+  fail "Org create returned non-2xx (http=$CREATE_HTTP_CODE) — see body above. Common causes: 409=slug collision (a prior run left a stale org; the slug helper should prevent this — check E2E_RUN_ID propagation), 400=slug too long (should be caught by the 32-char cap assertion), 401=ADMIN_TOKEN not set or expired, 422=schema mismatch (check the -d payload matches the CP's expected shape)."
 fi
 if [ -z "$CREATE_RESP" ] || ! echo "$CREATE_RESP" | python3 -m json.tool >/dev/null 2>&1; then
   log "❌ Org create returned non-JSON; raw body: $CREATE_RESP"
