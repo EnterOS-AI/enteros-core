@@ -97,6 +97,36 @@ else
     exit 1
 fi
 
+# Wait for the workspace to be READY (status flips from "provisioning"
+# → ready once the hermes runtime registers its URL via /registry/register).
+# The prior Phase B POST /a2a failed with 503
+# `{"error":"workspace has no URL","status":"provisioning"}` because the
+# provisioning goroutine hadn't completed yet (typically ~5-15s in the
+# harness). Polling GET /workspaces/{ID} for a non-empty `url` field
+# is the standard readiness signal (see workspace_provision.go:182
+# — the URL UPDATE is what marks provisioning as effectively complete
+# for A2A purposes).
+echo "[replay] waiting for workspace to be ready (URL registered) ..."
+PROVISION_DEADLINE=$(( $(date +%s) + ${POLL_TIMEOUT_SECS:-30} ))
+PROVISION_ITERATIONS=0
+WS_URL=""
+while [ "$(date +%s)" -lt "$PROVISION_DEADLINE" ]; do
+    PROVISION_ITERATIONS=$((PROVISION_ITERATIONS + 1))
+    WS=$(curl_alpha_admin "$BASE/workspaces/$ALPHA_WORKSPACE_ID")
+    WS_URL=$(printf '%s' "$WS" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("url") or "")' 2>/dev/null || echo "")
+    if [ -n "$WS_URL" ]; then
+        ok "workspace ready (iterations=$PROVISION_ITERATIONS, url=$WS_URL)"
+        break
+    fi
+    sleep 1
+done
+if [ -z "$WS_URL" ]; then
+    ko "workspace never became ready after ${POLL_TIMEOUT_SECS:-30}s (iterations=$PROVISION_ITERATIONS) — provisioning stalled"
+    echo "[replay] FAIL — workspace provisioning did not complete"
+    echo "  PASS=$PASS FAIL=$FAIL"
+    exit 1
+fi
+
 # ---------------------------------------------------------------- Phase B
 # Mint a per-workspace bearer token (the canary does the equivalent via
 # its /admin/workspaces/:id/tokens route).
