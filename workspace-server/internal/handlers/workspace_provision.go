@@ -422,10 +422,7 @@ func (h *WorkspaceHandler) issueAndInjectToken(ctx context.Context, workspaceID 
 		return
 	}
 
-	if cfg.ConfigFiles == nil {
-		cfg.ConfigFiles = make(map[string][]byte)
-	}
-	cfg.ConfigFiles[".auth_token"] = []byte(token)
+	ensureConfigFiles(cfg)[".auth_token"] = []byte(token)
 	// Option B (issue #1877): write token to volume BEFORE ContainerStart.
 	// Pre-write eliminates the race window where a restarted container could
 	// read a stale /configs/.auth_token before WriteFilesToContainer runs.
@@ -472,11 +469,34 @@ func (h *WorkspaceHandler) issueAndInjectInboundSecret(ctx context.Context, work
 		return
 	}
 
+	ensureConfigFiles(cfg)[".platform_inbound_secret"] = []byte(secret)
+	log.Printf("Provisioner: injected platform_inbound_secret for workspace %s into config volume", workspaceID)
+}
+
+// ensureConfigFiles returns cfg.ConfigFiles as a non-nil
+// map[string][]byte, allocating it if necessary. Extracted
+// from the two inject sites (issueAndInjectToken +
+// issueAndInjectInboundSecret) that previously each had a
+// `if cfg.ConfigFiles == nil { cfg.ConfigFiles = make(...) }`
+// ceremony — same pattern, repeated.
+//
+// Behavior-preserving: the helper does EXACTLY what the inline
+// check did. The allocation is lazy (on first write only), the
+// returned map is the SAME map cfg.ConfigFiles points to
+// (so subsequent writes are visible to the caller), and the
+// no-op case (already-allocated map) is a pointer return with
+// no allocation.
+//
+// Note: this helper is the "extend" direction — it allocates
+// ONLY when nil. The contract is "I want to write a key; give
+// me a writable map." Readers should use cfg.ConfigFiles
+// directly (with a nil-check if they need to distinguish
+// "not yet populated" from "populated with zero keys").
+func ensureConfigFiles(cfg *provisioner.WorkspaceConfig) map[string][]byte {
 	if cfg.ConfigFiles == nil {
 		cfg.ConfigFiles = make(map[string][]byte)
 	}
-	cfg.ConfigFiles[".platform_inbound_secret"] = []byte(secret)
-	log.Printf("Provisioner: injected platform_inbound_secret for workspace %s into config volume", workspaceID)
+	return cfg.ConfigFiles
 }
 
 // findTemplateByName looks for a workspace-configs-templates directory matching a name.
