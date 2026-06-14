@@ -446,6 +446,45 @@ func collectCPConfigFiles(cfg WorkspaceConfig) (map[string]string, error) {
 			return nil, err
 		}
 	}
+
+	// RFC #2843 #24 — generic template-asset channel. When
+	// cfg.TemplateAssetFetcher is wired (SaaS) and
+	// cfg.TemplateIdentity is set, fetch the template's
+	// config.yaml + prompts/ + agent_skills/ via the
+	// non-secret asset channel (template repo, Gitea shallow
+	// clone per §4.2 transport option (a)) and merge into
+	// the bundle. Caller's cfg.ConfigFiles win on conflict
+	// (the merge happens BEFORE this loop, so any caller
+	// overrides are preserved). The fetch is OPT-IN: nil
+	// fetcher = no-op (self-host default; falls through to
+	// the local TemplatePath path above).
+	//
+	// CRITICAL preserve/blast-radius axis (PM-flagged):
+	// this fetcher ONLY materializes template assets (config +
+	// prompts + skills). It does NOT touch agent-owned state
+	// (memory, ~/.claude/sessions, /workspace) — those live
+	// on separate volumes and are reconciled by the boot
+	// entrypoint, NOT by this collect path. The fetch is
+	// fail-closed: a transport error aborts the provision
+	// rather than regressing to stub-mode /configs (the same
+	// contract as the persisted-bundle provider in #2831
+	// PIECE 1).
+	if cfg.TemplateAssetFetcher != nil && cfg.TemplateIdentity != "" {
+		assets, fetchErr := cfg.TemplateAssetFetcher.Load(context.Background(), cfg.TemplateIdentity)
+		if fetchErr != nil {
+			return nil, fmt.Errorf("collectCPConfigFiles: fetch template assets (RFC #2843 #24): %w", fetchErr)
+		}
+		for name, data := range assets {
+			if err := addFile(name, data); err != nil {
+				return nil, err
+			}
+		}
+	}
+	for name, data := range cfg.ConfigFiles {
+		if err := addFile(name, data); err != nil {
+			return nil, err
+		}
+	}
 	if len(files) == 0 {
 		return nil, nil
 	}
