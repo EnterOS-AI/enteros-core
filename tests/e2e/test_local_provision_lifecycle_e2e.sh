@@ -522,19 +522,22 @@ done
 if [ -n "$RUN" ]; then pass "container running: $RUN"; else fail "no running ws-${WSID} container within 10s of online" "docker ps shows none"; fi
 
 # #2851: fail fast if the workspace advertised an unresolvable/unreachable URL.
-# The MiniMax round-trip fails opaquely when the proxy cannot reach the agent;
-# asserting the registered URL is set and reachable surfaces hostname/DNS issues
-# at the registration layer instead.
+# The provisioner now makes the runtime advertise http://localhost:<host-port>,
+# which the platform stores as http://127.0.0.1:<host-port>. The A2A proxy
+# rewrites that to ws-<id>:8000 when the platform runs inside Docker, so the
+# URL stored in the registry should always be a host-reachable loopback address.
+# (The end-to-end proxy reach in Step 5 is the real reachability proof; this
+# assertion just surfaces hostname/DNS misconfiguration early.)
 WS_URL_AFTER=$(ws_field "$WS" "url")
 if [ -n "$WS_URL_AFTER" ]; then
   pass "workspace registered a non-empty URL: $WS_URL_AFTER"
 else
   fail "workspace URL is empty after reaching online" "registry row has no url"
 fi
-if docker run --rm --network molecule-core-net alpine:latest sh -c "wget -qO- ${WS_URL_AFTER}/.well-known/agent-card.json >/dev/null 2>&1" 2>/dev/null; then
-  pass "workspace URL is reachable from molecule-core-net"
+if echo "$WS_URL_AFTER" | grep -qE '^https?://(127\.0\.0\.1|localhost):'; then
+  pass "workspace registered a host-reachable loopback URL"
 else
-  fail "workspace URL is not reachable from molecule-core-net" "url=$WS_URL_AFTER"
+  fail "workspace URL is not a host-reachable loopback address" "url=$WS_URL_AFTER"
 fi
 echo ""
 
