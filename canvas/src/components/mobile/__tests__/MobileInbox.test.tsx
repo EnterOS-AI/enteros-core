@@ -84,28 +84,25 @@ describe("MobileInbox", () => {
     // Switch to Tasks before the task fetch resolves.
     fireEvent.click(getByRole("tab", { name: "Tasks" }));
 
-    // Stale approval row is still visible.
-    expect(getByText("Delete prod secret?")).toBeTruthy();
-    // Primary action is still "Approve", not "Done".
-    expect(getByRole("button", { name: "Approve" })).toBeTruthy();
+    // Switch to Tasks. The new load clears stale rows immediately.
+    fireEvent.click(getByRole("tab", { name: "Tasks" }));
+    expect(queryByText("Delete prod secret?")).toBeNull();
 
+    // The old approval fetch now resolves. With the sequence guard it
+    // must be ignored: the Task tab should NOT show approval rows.
     await act(async () => {
-      fireEvent.click(getByRole("button", { name: "Approve" }));
+      approvalFetch.resolve([approval]);
+    });
+    await waitFor(() => {
+      expect(queryByText("Delete prod secret?")).toBeNull();
     });
 
-    // Must post the approval action, never the task action.
-    expect(api.post).toHaveBeenCalledWith(
-      "/requests/req-1/respond",
-      expect.objectContaining({ action: "approved" }),
-    );
-    expect(api.post).not.toHaveBeenCalledWith(
-      "/requests/req-1/respond",
-      expect.objectContaining({ action: "done" }),
-    );
-
+    // Once the task fetch resolves, the Tasks tab shows its own content.
     await act(async () => {
       taskFetch.resolve([]);
     });
-    await waitFor(() => expect(queryByText("Delete prod secret?")).toBeNull());
+    await waitFor(() => {
+      expect(getByText(/No pending tasks/i)).toBeTruthy();
+    });
   });
 });
