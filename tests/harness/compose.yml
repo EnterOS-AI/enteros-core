@@ -64,7 +64,7 @@ services:
       POSTGRES_DB: molecule
     networks: [harness-net]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U harness"]
+      test: ["CMD-SHELL", "pg_isready -U harness -d molecule"]
       interval: 2s
       timeout: 5s
       retries: 10
@@ -130,7 +130,7 @@ services:
       POSTGRES_DB: molecule
     networks: [harness-net]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U harness"]
+      test: ["CMD-SHELL", "pg_isready -U harness -d molecule"]
       interval: 2s
       timeout: 5s
       retries: 10
