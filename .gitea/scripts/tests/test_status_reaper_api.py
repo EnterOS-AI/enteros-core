@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import pathlib
+import pytest
 import urllib.error
 
 
@@ -411,7 +412,7 @@ def test_reap_preserves_non_governance_no_push_shadow_when_target_passed(monkeyp
     )
 
     assert counters["compensated_governance_shadow"] == 0
-    assert counters["preserved_non_push_suffix"] == 1
+    assert counters["compensated"] == 0
     assert posted == []
 
 
@@ -453,3 +454,99 @@ def test_reap_compensates_retired_sop_tier_check_shadow_when_target_passed(monke
             False,
         ),
     ]
+
+
+def test_reap_compensates_retired_sop_tier_check_when_missing_from_trigger_map(monkeypatch):
+    """The retired sop-tier-check workflow file is intentionally removed, so the
+    real workflow trigger map will not contain it. It must still be compensatable
+    because it is explicitly allowlisted as a retired governance shadow."""
+    mod = load_reaper()
+    posted = []
+
+    def fake_post(sha, context, target_url, *, description="", dry_run=False):
+        posted.append((sha, context, target_url, description, dry_run))
+
+    monkeypatch.setattr(mod, "post_compensating_status", fake_post)
+
+    counters = mod.reap(
+        # Deliberately omit sop-tier-check from the trigger map.
+        {},
+        {
+            "statuses": [
+                {
+                    "context": "sop-tier-check / tier-verify (pull_request)",
+                    "status": "failure",
+                    "target_url": "https://git.example.test/tier-pr",
+                },
+                {
+                    "context": "sop-tier-check / tier-verify (pull_request_target)",
+                    "status": "success",
+                },
+            ],
+        },
+        "db3b7a93e31adc0cb072a6d177d92dd73275a191",
+    )
+
+    assert counters["compensated_governance_shadow"] == 1
+    assert counters["preserved_governance_without_target_success"] == 0
+    assert posted == [
+        (
+            "db3b7a93e31adc0cb072a6d177d92dd73275a191",
+            "sop-tier-check / tier-verify (pull_request)",
+            "https://git.example.test/tier-pr",
+            mod.GOVERNANCE_SHADOW_COMPENSATION_DESCRIPTION,
+            False,
+        ),
+    ]
+
+
+@pytest.mark.parametrize(
+    "context",
+    [
+        "gate-check-v3 / gate (pull_request)",
+        "reserved-path-review / check (pull_request_review)",
+        "lint-required-no-paths / lint (pull_request)",
+        "lint-required-context-exists-in-bp / lint (pull_request_review)",
+        "audit-force-merge / audit (pull_request)",
+        "status-reaper / reap (pull_request_review)",
+        "umbrella-reaper / reap (pull_request)",
+    ],
+)
+def test_reap_preserves_named_non_governance_no_push_shadows(context, monkeypatch):
+    """Real merge-control/lint/audit workflows that are NOT in the governance
+    allowlist must be preserved even when they have no push trigger and their
+    (pull_request_target) variant is green. Auto-greening these would mask real
+    failures."""
+    mod = load_reaper()
+    posted = []
+    monkeypatch.setattr(
+        mod,
+        "post_compensating_status",
+        lambda sha, context, target_url, *, description="", dry_run=False: posted.append(
+            context
+        ),
+    )
+
+    workflow_name = context.split(" / ", 1)[0]
+    counters = mod.reap(
+        {workflow_name: False},
+        {
+            "statuses": [
+                {
+                    "context": context,
+                    "status": "failure",
+                },
+                {
+                    "context": context.replace(
+                        " (pull_request)", " (pull_request_target)"
+                    ).replace(" (pull_request_review)", " (pull_request_target)"),
+                    "status": "success",
+                },
+            ],
+        },
+        "db3b7a93e31adc0cb072a6d177d92dd73275a191",
+    )
+
+    assert counters["compensated_governance_shadow"] == 0
+    assert counters["compensated"] == 0
+    assert posted == []

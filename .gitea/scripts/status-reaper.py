@@ -525,8 +525,10 @@ def is_governance_shadow_context(
     `security-review`, and the retired `sop-tier-check`) are eligible.
     Workflows that DO have a `push:` trigger are excluded even if they are in
     the allowlist — their PR/review status is an independent gate signal.
-    Unknown workflows or workflows not in the allowlist are preserved
-    (fail-closed: never mask a signal we can't classify).
+    Retired workflows may be absent from the trigger map (the workflow file was
+    removed); they are treated as non-push so their historical shadow contexts
+    remain compensatable. Unknown workflows or workflows not in the allowlist
+    are preserved (fail-closed: never mask a signal we can't classify).
     """
     for suffix in (PULL_REQUEST_SUFFIX, PULL_REQUEST_REVIEW_SUFFIX):
         parsed = parse_suffixed_context(context, suffix)
@@ -535,10 +537,10 @@ def is_governance_shadow_context(
             if workflow_name not in GOVERNANCE_SHADOW_ALLOWLIST:
                 return False
             has_push = workflow_trigger_map.get(workflow_name)
-            # Only classify as a compensatable governance shadow when we know
-            # the workflow and it is NOT push-triggered. Unknown workflows are
-            # preserved (fail-closed: don't mask a signal we can't classify).
-            return has_push is False
+            # Retired allowlist workflows may be missing from the map; treat
+            # absence as "known non-push". Active allowlist workflows that
+            # genuinely have a push trigger are preserved.
+            return has_push is not True
     return False
 
 
