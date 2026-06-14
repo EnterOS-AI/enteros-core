@@ -63,6 +63,17 @@ type WorkspaceHandler struct {
 	// registered; Registry.Run handles a nil receiver as a no-op so the
 	// hot path stays a single nil-pointer compare.
 	envMutators *provisionhook.Registry
+	// giteaTemplateFetcher is the per-deployment TemplateAssetFetcher
+	// (RFC #2843 #24 PR-B) wired from main.go. nil = no fetcher
+	// wired (self-host default; the SCAFFOLD gate in
+	// collectCPConfigFiles treats nil fetcher as "skip the
+	// fetcher", pre-scaffold behavior preserved). When non-nil,
+	// the fetcher is called on EVERY provision AND every restart
+	// (buildProvisionerConfig is the single source of truth for
+	// WorkspaceConfig across both paths) — collectCPConfigFiles
+	// reconciles every boot, not just first provision, per the
+	// dispatch's "every boot" requirement.
+	giteaTemplateFetcher provisioner.TemplateAssetFetcher
 	// stopFnOverride is set exclusively in tests to intercept provisioner.Stop
 	// calls made by HibernateWorkspace without requiring a running Docker daemon.
 	// Always nil in production; the real provisioner path is used when nil.
@@ -239,6 +250,16 @@ func (h *WorkspaceHandler) SetCPProvisioner(cp provisioner.CPProvisionerAPI) {
 // provisions — only invoke during single-threaded init.
 func (h *WorkspaceHandler) SetEnvMutators(r *provisionhook.Registry) {
 	h.envMutators = r
+}
+
+// SetGiteaTemplateFetcher wires the per-deployment TemplateAssetFetcher
+// (RFC #2843 #24 PR-B). Nil is fine (self-host default; the SCAFFOLD
+// gate in collectCPConfigFiles treats nil as "skip the fetcher").
+// Production wires a giteaTemplateAssetFetcher with baseURL +
+// per-identity READ-ONLY Gitea PAT (threaded from Infisical SSOT).
+// Tests pass a stub.
+func (h *WorkspaceHandler) SetGiteaTemplateFetcher(f provisioner.TemplateAssetFetcher) {
+	h.giteaTemplateFetcher = f
 }
 
 // TokenRegistry returns the provisionhook.Registry so the router can

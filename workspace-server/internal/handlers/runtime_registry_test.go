@@ -10,6 +10,7 @@ package handlers
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -125,4 +126,71 @@ func keys(m map[string]struct{}) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// TestTemplateIdentityForRuntime pins the runtime -> "<repo>@<ref>"
+// mapping that drives cfg.TemplateIdentity (RFC #2843 #24 PR-B).
+// Loads the real manifest.json (test setup already has it), then
+// asserts the wire shape for a known runtime + the empty-result
+// for the BYO-compute meta-runtimes (external / kimi / kimi-cli /
+// mock / unknown).
+func TestTemplateIdentityForRuntime(t *testing.T) {
+	path := manifestPath()
+	if path == "" {
+		t.Skip("manifest.json not discoverable from this test cwd")
+	}
+	// Force the repo registry to load from the same path
+	// (idempotent — safe to call multiple times).
+	initTemplateRepoByName()
+
+	// Sanity: a real template-backed runtime resolves to a
+	// "<repo>@<ref>" identity.
+	id, ok := templateIdentityForRuntime("claude-code")
+	if !ok {
+		t.Errorf("claude-code should resolve to an identity (manifest has it), got none")
+	} else {
+		// Identity must contain an @ and a slash (the fetcher
+		// parses this as "<owner>/<repo>@<ref>").
+		if !strings.Contains(id, "@") || !strings.Contains(id, "/") {
+			t.Errorf("claude-code identity %q doesn't look like \"<owner>/<repo>@<ref>\"", id)
+		}
+		// Identity must NOT be empty (the SCAFFOLD gate in
+		// collectCPConfigFiles would skip the fetcher on empty).
+		if id == "" {
+			t.Errorf("claude-code identity is empty; should be \"<repo>@<ref>\"")
+		}
+	}
+
+	// BYO-compute meta-runtimes have no template repo — the
+	// lookup MUST return (empty, false) so the SCAFFOLD gate
+	// skips the fetcher for them (preserves pre-scaffold
+	// behavior).
+	for _, rt := range []string{"external", "kimi", "kimi-cli", "mock", "unknown-runtime-xyz"} {
+		id2, ok2 := templateIdentityForRuntime(rt)
+		if ok2 {
+			t.Errorf("runtime %q should NOT have a template identity (BYO-compute / unknown), got identity=%q", rt, id2)
+		}
+		if id2 != "" {
+			t.Errorf("runtime %q identity should be empty, got %q", rt, id2)
+		}
+	}
+}
+
+// TestTemplateIdentityForRuntimeOrEmpty pins the
+// single-expression wrapper used at the call site in
+// buildProvisionerConfig.
+func TestTemplateIdentityForRuntimeOrEmpty(t *testing.T) {
+	if manifestPath() == "" {
+		t.Skip("manifest.json not discoverable from this test cwd")
+	}
+	initTemplateRepoByName()
+	if got := templateIdentityForRuntimeOrEmpty("claude-code"); got == "" {
+		t.Error("claude-code should return a non-empty identity")
+	}
+	if got := templateIdentityForRuntimeOrEmpty("external"); got != "" {
+		t.Errorf("external should return empty, got %q", got)
+	}
+	if got := templateIdentityForRuntimeOrEmpty("unknown-xyz"); got != "" {
+		t.Errorf("unknown-xyz should return empty, got %q", got)
+	}
 }

@@ -60,6 +60,7 @@ func manifestPath() string {
 type manifestEntry struct {
 	Name string `json:"name"`
 	Repo string `json:"repo"`
+	Ref  string `json:"ref"`
 }
 
 type manifestFile struct {
@@ -177,4 +178,63 @@ func initKnownRuntimes() {
 		names = append(names, k)
 	}
 	log.Printf("runtime registry: loaded %d runtimes from %s: %v", len(loaded), path, names)
+}
+
+// templateRepoRef is the parsed manifest entry needed to
+// derive a TemplateIdentity for the Gitea fetcher. The
+// identity is "<repo>@<ref>" (the giteaTemplateAssetFetcher
+// parses this as "<owner>/<repo>@<ref>").
+type templateRepoRef struct {
+	Repo string // e.g. "molecule-ai/molecule-ai-workspace-template-claude-code"
+	Ref  string // e.g. "main" or a pinned tag/sha
+}
+
+// templateRepoByName holds the runtime → (repo, ref) mapping
+// parsed from manifest.json at boot. Empty for runtimes that
+// have no template repo (external, kimi, kimi-cli, mock —
+// caller leaves cfg.TemplateIdentity empty for those, which
+// the SCAFFOLD gate in collectCPConfigFiles treats as
+// "skip the fetcher", pre-scaffold behavior preserved).
+var templateRepoByName = make(map[string]templateRepoRef)
+
+// initTemplateRepoByName is called from the package init chain
+// (alongside initKnownRuntimes) to populate the repo map. The
+// fallback set returns an empty map — external/kimi/kimi-cli/mock
+// have no manifest entry by design.
+func initTemplateRepoByName() {
+	path := manifestPath()
+	if path == "" {
+		log.Printf("template repo registry: manifest.json not found, no template repos available")
+		return
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		log.Printf("template repo registry: manifest.json load failed (%v) — no template repos", err)
+		return
+	}
+	var m manifestFile
+	if err := json.Unmarshal(data, &m); err != nil {
+		log.Printf("template repo registry: manifest.json parse failed (%v) — no template repos", err)
+		return
+	}
+	for _, e := range m.WorkspaceTemplates {
+		// Same normalization as loadRuntimesFromManifest: strip
+		// the "-default" suffix so the runtime identifier is
+		// the map key, not the template-variant name.
+		name := strings.TrimSuffix(e.Name, "-default")
+		templateRepoByName[name] = templateRepoRef{Repo: e.Repo, Ref: e.Ref}
+	}
+}
+
+// templateIdentityForRuntime returns the Gitea template identity
+// for the given runtime name, or "" + false if the runtime has
+// no template repo (external / kimi / kimi-cli / mock / unknown).
+// The format is "<repo>@<ref>" — the giteaTemplateAssetFetcher
+// parses this further as "<owner>/<repo>@<ref>".
+func templateIdentityForRuntime(runtime string) (string, bool) {
+	rr, ok := templateRepoByName[runtime]
+	if !ok {
+		return "", false
+	}
+	return rr.Repo + "@" + rr.Ref, true
 }
