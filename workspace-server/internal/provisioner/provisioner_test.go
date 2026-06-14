@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -1637,33 +1638,34 @@ func TestApplyTierResources(t *testing.T) {
 // ---------- #2851 host-port advertisement ----------
 
 func TestAllocateHostPort(t *testing.T) {
-	port1, err := allocateHostPort()
+	port, err := allocateHostPort()
 	if err != nil {
 		t.Fatalf("allocateHostPort failed: %v", err)
 	}
-	if port1 == "" {
+	if port == "" {
 		t.Fatal("allocateHostPort returned empty port")
 	}
-	if port1 == "0" {
+	if port == "0" {
 		t.Fatalf("allocateHostPort returned port 0")
 	}
 
-	port2, err := allocateHostPort()
-	if err != nil {
-		t.Fatalf("second allocateHostPort failed: %v", err)
-	}
-	if port2 == port1 {
-		t.Fatalf("allocateHostPort returned the same port twice: %s", port1)
-	}
-
 	// Verify the port is actually numeric and in the ephemeral range.
-	n, err := strconv.Atoi(port1)
+	n, err := strconv.Atoi(port)
 	if err != nil {
-		t.Fatalf("allocateHostPort returned non-numeric port %q: %v", port1, err)
+		t.Fatalf("allocateHostPort returned non-numeric port %q: %v", port, err)
 	}
 	if n < 1024 || n > 65535 {
 		t.Fatalf("allocateHostPort returned out-of-range port %d", n)
 	}
+
+	// Verify the port is genuinely free for Docker to bind. (We don't assert
+	// uniqueness across two calls — the OS may immediately reuse a just-closed
+	// ephemeral port under heavy load.)
+	l, err := net.Listen("tcp", "127.0.0.1:"+port)
+	if err != nil {
+		t.Fatalf("allocateHostPort returned port %s that is not bindable: %v", port, err)
+	}
+	l.Close()
 }
 
 func TestWorkspaceAdvertiseURL(t *testing.T) {
