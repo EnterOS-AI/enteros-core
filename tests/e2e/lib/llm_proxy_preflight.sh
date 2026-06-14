@@ -78,20 +78,38 @@ llm_proxy_preflight() {
   # name is a no-op for the liveness check (any model id that the proxy
   # will accept is fine; the proxy returns 200 + completion for healthy
   # provider keys and 5xx/timeout for outage conditions).
+  #
+  # #76 root cause: the hard-coded namespaced slug `minimax/MiniMax-M2.7`
+  # is rejected by the staging LLM proxy's model validation, so the
+  # preflight false-reds while the real E2E (which uses the bare slug
+  # `MiniMax-M2.7`) would succeed. Default to the bare slug and allow
+  # per-lane override via E2E_LLM_PREFLIGHT_MODEL.
+  local model="${E2E_LLM_PREFLIGHT_MODEL:-MiniMax-M2.7}"
+  local api_key="${E2E_LLM_PREFLIGHT_API_KEY:-}"
   local body
-  body=$(cat <<'JSON'
-{"model":"minimax/MiniMax-M2.7","max_tokens":1,"messages":[{"role":"user","content":"pong"}]}
+  body=$(cat <<JSON
+{"model":"$model","max_tokens":1,"messages":[{"role":"user","content":"pong"}]}
 JSON
 )
 
-  local tmpfile http_code
+  local tmpfile http_code curl_opts
   tmpfile=$(mktemp)
   # shellcheck disable=SC2064
   trap "rm -f '$tmpfile'" RETURN
 
-  http_code=$(curl -sS -o "$tmpfile" -w "%{http_code}" \
-    --max-time "$timeout_secs" \
-    -H "Content-Type: application/json" \
+  curl_opts=(
+    -sS
+    -L
+    -o "$tmpfile"
+    -w "%{http_code}"
+    --max-time "$timeout_secs"
+    -H "Content-Type: application/json"
+  )
+  if [ -n "$api_key" ]; then
+    curl_opts+=(-H "Authorization: Bearer $api_key")
+  fi
+
+  http_code=$(curl "${curl_opts[@]}" \
     -X POST \
     -d "$body" \
     "$proxy_url" 2>/dev/null) || http_code="000"

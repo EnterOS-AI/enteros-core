@@ -35,7 +35,7 @@ PY_SERVER_LOG=$(mktemp)
 PY_SERVER_PID=
 
 start_test_server() {
-  local mode="$1"  # "ok" | "down" | "empty_200"
+  local mode="$1"  # "ok" | "down" | "empty_200" | "echo" | "auth"
   # Pick a free port via socket binding; pass it explicitly to the server.
   local port
   port=$(python3 -c "
@@ -51,6 +51,12 @@ mode = "$mode"
 port = $port
 class H(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
+        length = int(self.headers.get('Content-Length', 0))
+        raw = self.rfile.read(length).decode('utf-8', errors='replace')
+        try:
+            req = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            req = {}
         if mode == "down":
             self.send_error(503, "simulated outage")
             return
@@ -60,8 +66,24 @@ class H(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b'{"error":"upstream silent"}')
             return
-        # ok
-        body = {"choices":[{"message":{"role":"assistant","content":"pong"}}]}
+        if mode == "auth":
+            auth = self.headers.get('Authorization', '')
+            if not auth.startswith('Bearer '):
+                self.send_response(401)
+                self.end_headers()
+                self.wfile.write(b'{"error":"missing auth"}')
+                return
+            # fall through to ok response
+        # ok / echo / auth-success: echo model back so tests can verify
+        # the request body was sent correctly. Also persist the full request
+        # to a well-known file for tests that need to inspect it.
+        req_path = "/tmp/_llm_preflight_last_request.json"
+        try:
+            with open(req_path, "w") as fh:
+                json.dump(req, fh)
+        except Exception:
+            pass
+        body = {"choices":[{"message":{"role":"assistant","content":req.get("model","pong")}}]}
         payload = json.dumps(body).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -214,12 +236,62 @@ test_503() {
   return 0
 }
 
+# Test 6: custom model slug via E2E_LLM_PREFLIGHT_MODEL is sent in the request body.
+test_model_override() {
+  PY_SERVER_PORT=0
+  start_test_server "echo"
+  export E2E_LLM_PROXY_URL="http://127.0.0.1:${PY_SERVER_PORT}/v1/chat/completions"
+  export E2E_LLM_PREFLIGHT_MODEL="custom-model-42"
+  rm -f /tmp/_llm_preflight_last_request.json
+  local out rc
+  out=$(llm_proxy_preflight 2>&1)
+  rc=$?
+  unset E2E_LLM_PREFLIGHT_MODEL
+  stop_test_server
+  PY_SERVER_PID=
+  if [ "$rc" -ne 0 ]; then
+    echo "FAIL: test_model_override expected exit 0, got $rc"
+    echo "  output: $out"
+    return 1
+  fi
+  if ! python3 -c "import json; d=json.load(open('/tmp/_llm_preflight_last_request.json')); assert d.get('model')=='custom-model-42'; print('model ok')" 2>&1; then
+    echo "FAIL: test_model_override did not send the custom model in the request body"
+    echo "  request file: $(cat /tmp/_llm_preflight_last_request.json 2>/dev/null || echo '<missing>')"
+    return 1
+  fi
+  echo "PASS: test_model_override"
+  return 0
+}
+
+# Test 7: optional Authorization header is sent when E2E_LLM_PREFLIGHT_API_KEY is set.
+test_auth_header() {
+  PY_SERVER_PORT=0
+  start_test_server "auth"
+  export E2E_LLM_PROXY_URL="http://127.0.0.1:${PY_SERVER_PORT}/v1/chat/completions"
+  export E2E_LLM_PREFLIGHT_API_KEY="test-token-123"
+  local out rc
+  out=$(llm_proxy_preflight 2>&1)
+  rc=$?
+  unset E2E_LLM_PREFLIGHT_API_KEY
+  stop_test_server
+  PY_SERVER_PID=
+  if [ "$rc" -ne 0 ]; then
+    echo "FAIL: test_auth_header expected exit 0, got $rc"
+    echo "  output: $out"
+    return 1
+  fi
+  echo "PASS: test_auth_header"
+  return 0
+}
+
 failed=0
 test_config_missing || failed=$((failed+1))
 test_proxy_unreachable || failed=$((failed+1))
 test_200_empty_body || failed=$((failed+1))
 test_ok || failed=$((failed+1))
 test_503 || failed=$((failed+1))
+test_model_override || failed=$((failed+1))
+test_auth_header || failed=$((failed+1))
 
 if [ "$failed" -gt 0 ]; then
   echo "FAILED: $failed test(s)"
