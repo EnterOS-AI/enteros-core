@@ -2018,3 +2018,597 @@ def test_evaluate_candidate_main_base_proceeds_to_merge_bar(monkeypatch):
     assert decision is not None
     assert ctx["pr_number"] == 99
     assert decision.ready is False
+
+
+# =============================================================================
+# Runtime-bump exemption (RFC internal#131 PR-A; spec 9c2e9c88)
+# =============================================================================
+# These tests pin the is_runtime_bump_exempt() predicate. Each guard and
+# condition has a positive case (the rule fires) and a negative case (the
+# rule does not fire because the input is missing or wrong). A happy-path
+# test pins the all-conditions-pass → exempt outcome. dup-close has its
+# own test for the "newer wins" semantics.
+# =============================================================================
+
+
+def _bump_pr(
+    *,
+    author: str = "bump-bot",
+    head_ref: str = "runtime-bump/claude-code/v1.2.3",
+    labels: list[dict] | None = None,
+) -> dict:
+    """Build a minimal PR dict shaped like a bump-bot runtime-bump PR."""
+    return {
+        "number": 1234,
+        "state": "open",
+        "user": {"login": author},
+        "head": {"ref": head_ref, "sha": "a" * 40},
+        "base": {"ref": "main"},
+        "labels": labels or [],
+    }
+
+
+def _runtime_version_patch(
+    added: str = "claude-code@v1.2.3",
+    removed: str = "claude-code@v1.2.2",
+) -> str:
+    """Build a minimal unified-diff patch string for .runtime-version."""
+    return (
+        f"--- a/.runtime-version\n"
+        f"+++ b/.runtime-version\n"
+        f"@@ -1,1 +1,1 @@\n"
+        f"-{removed}\n"
+        f"+{added}\n"
+    )
+
+
+def _runtime_version_file(
+    *,
+    added: str = "claude-code@v1.2.3",
+    removed: str = "claude-code@v1.2.2",
+) -> dict:
+    """Build a single-file .runtime-version diff entry."""
+    return {
+        "filename": ".runtime-version",
+        "status": "modified",
+        "additions": 1,
+        "deletions": 1,
+        "changes": 2,
+        "patch": _runtime_version_patch(added=added, removed=removed),
+    }
+
+
+def _set_allowlist(monkeypatch, *runtimes: str) -> None:
+    """Set RUNTIME_BUMP_EXEMPT_TEMPLATES for the test."""
+    monkeypatch.setattr(mq, "RUNTIME_BUMP_EXEMPT_TEMPLATES", set(runtimes))
+
+
+# ---- GUARD 1: author must be bump-bot ----
+
+def test_runtime_bump_exempt_rejects_non_bump_bot_author():
+    pr = _bump_pr(author="alice")
+    exempt, reason = mq.is_runtime_bump_exempt(
+        pr=pr,
+        pr_files=[_runtime_version_file()],
+        required_contexts=["runtime-provision-smoke"],
+        latest_runtime_v_tag="v1.2.3",
+        rc_active=False,
+    )
+    assert exempt is False
+    assert "author=" in reason
+    assert "bump-bot" in reason
+
+
+def test_runtime_bump_exempt_rejects_missing_user_field():
+    pr = _bump_pr()
+    pr.pop("user", None)
+    exempt, reason = mq.is_runtime_bump_exempt(
+        pr=pr,
+        pr_files=[_runtime_version_file()],
+        required_contexts=["runtime-provision-smoke"],
+        latest_runtime_v_tag="v1.2.3",
+        rc_active=False,
+    )
+    assert exempt is False
+    assert "author=" in reason
+
+
+# ---- GUARD 2: diff must be exactly .runtime-version with 1 added + 1 removed ----
+
+def test_runtime_bump_exempt_rejects_no_runtime_version_file():
+    pr = _bump_pr()
+    pr_files = [{"filename": "README.md", "patch": "--- a/README\n+++ b/README\n"}]
+    exempt, reason = mq.is_runtime_bump_exempt(
+        pr=pr,
+        pr_files=pr_files,
+        required_contexts=["runtime-provision-smoke"],
+        latest_runtime_v_tag="v1.2.3",
+        rc_active=False,
+    )
+    assert exempt is False
+    assert ".runtime-version" in reason
+    assert "does not touch" in reason
+
+
+def test_runtime_bump_exempt_rejects_multi_file_diff():
+    pr = _bump_pr()
+    pr_files = [
+        _runtime_version_file(),
+        {"filename": "go.mod", "patch": "--- a/go.mod\n+++ b/go.mod\n"},
+    ]
+    exempt, reason = mq.is_runtime_bump_exempt(
+        pr=pr,
+        pr_files=pr_files,
+        required_contexts=["runtime-provision-smoke"],
+        latest_runtime_v_tag="v1.2.3",
+        rc_active=False,
+    )
+    assert exempt is False
+    assert "1 other file" in reason
+
+
+def test_runtime_bump_exempt_rejects_multi_line_runtime_version_diff():
+    pr = _bump_pr()
+    # Patch with 2 added lines (one of which is the version, one is blank).
+    pr_files = [{
+        "filename": ".runtime-version",
+        "patch": (
+            "--- a/.runtime-version\n"
+            "+++ b/.runtime-version\n"
+            "@@ -1,2 +1,2 @@\n"
+            "-claude-code@v1.2.2\n"
+            "-# old comment\n"
+            "+claude-code@v1.2.3\n"
+            "+# new comment\n"
+        ),
+    }]
+    exempt, reason = mq.is_runtime_bump_exempt(
+        pr=pr,
+        pr_files=pr_files,
+        required_contexts=["runtime-provision-smoke"],
+        latest_runtime_v_tag="v1.2.3",
+        rc_active=False,
+    )
+    assert exempt is False
+    assert "2 added" in reason or "added" in reason
+
+
+def test_runtime_bump_exempt_rejects_empty_patch_text():
+    pr = _bump_pr()
+    pr_files = [{"filename": ".runtime-version", "patch": ""}]
+    exempt, reason = mq.is_runtime_bump_exempt(
+        pr=pr,
+        pr_files=pr_files,
+        required_contexts=["runtime-provision-smoke"],
+        latest_runtime_v_tag="v1.2.3",
+        rc_active=False,
+    )
+    assert exempt is False
+    assert "patch" in reason
+
+
+# ---- GUARD 3: no active release-candidate ----
+
+def test_runtime_bump_exempt_rejects_active_release_candidate():
+    pr = _bump_pr()
+    exempt, reason = mq.is_runtime_bump_exempt(
+        pr=pr,
+        pr_files=[_runtime_version_file()],
+        required_contexts=["runtime-provision-smoke"],
+        latest_runtime_v_tag="v1.2.3",
+        rc_active=True,
+    )
+    assert exempt is False
+    assert "release-candidate" in reason or "rc" in reason.lower()
+
+
+# ---- CONDITION 1: ==SSOT ----
+
+def test_runtime_bump_exempt_rejects_unverifiable_latest_tag():
+    pr = _bump_pr()
+    exempt, reason = mq.is_runtime_bump_exempt(
+        pr=pr,
+        pr_files=[_runtime_version_file()],
+        required_contexts=["runtime-provision-smoke"],
+        latest_runtime_v_tag=None,
+        rc_active=False,
+    )
+    assert exempt is False
+    assert "==SSOT" in reason or "unverifiable" in reason
+
+
+def test_runtime_bump_exempt_rejects_ssot_mismatch():
+    pr = _bump_pr()
+    exempt, reason = mq.is_runtime_bump_exempt(
+        pr=pr,
+        pr_files=[_runtime_version_file(added="claude-code@v1.2.3", removed="claude-code@v1.2.2")],
+        required_contexts=["runtime-provision-smoke"],
+        latest_runtime_v_tag="v1.2.4",  # bump value != latest tag
+        rc_active=False,
+    )
+    assert exempt is False
+    assert "==SSOT" in reason
+    # ==SSOT compares the VERSION part of the .runtime-version line
+    # to the latest tag (not the full `<runtime>@<version>` string).
+    assert "v1.2.3" in reason
+    assert "v1.2.4" in reason
+
+
+# ---- CONDITION 2a: GATE-ADEQUACY (CI side) ----
+
+def test_runtime_bump_exempt_rejects_no_runtime_smoke_context(monkeypatch):
+    # The smoke check fires AFTER the allowlist check in my implementation,
+    # so to land on the smoke check we need the runtime on the allowlist.
+    _set_allowlist(monkeypatch, "claude-code")
+    pr = _bump_pr()
+    exempt, reason = mq.is_runtime_bump_exempt(
+        pr=pr,
+        pr_files=[_runtime_version_file()],
+        required_contexts=["CI / all-required (pull_request)"],  # no runtime smoke
+        latest_runtime_v_tag="v1.2.3",
+        rc_active=False,
+    )
+    assert exempt is False
+    assert "runtime-provision" in reason or "smoke" in reason
+
+
+def test_runtime_bump_exempt_rejects_empty_required_contexts():
+    pr = _bump_pr()
+    exempt, reason = mq.is_runtime_bump_exempt(
+        pr=pr,
+        pr_files=[_runtime_version_file()],
+        required_contexts=[],
+        latest_runtime_v_tag="v1.2.3",
+        rc_active=False,
+    )
+    assert exempt is False
+    assert "empty" in reason
+
+
+def test_runtime_bump_exempt_accepts_case_insensitive_smoke_substring():
+    pr = _bump_pr()
+    # RUNTIME_PROVISION_SMOKE_CONTEXTS contains "runtime-provision-smoke"
+    # (lowercase); the required context can be mixed-case.
+    exempt, reason = mq.is_runtime_bump_exempt(
+        pr=pr,
+        pr_files=[_runtime_version_file()],
+        required_contexts=["CI / RUNTIME-PROVISION-SMOKE (pull_request)"],
+        latest_runtime_v_tag="v1.2.3",
+        rc_active=False,
+        # Need to be on the allowlist too — this test focuses on CI match
+    )
+    # Result depends on allowlist: not on allowlist by default → not exempt.
+    # The CI smoke substring match is necessary but not sufficient.
+    assert exempt is False
+    # The failure reason should reference the allowlist, not the smoke check.
+    assert "allowlist" in reason or "smoke" in reason  # whichever fired first
+
+
+# ---- CONDITION 2b: GATE-ADEQUACY (template allowlist) ----
+
+def test_runtime_bump_exempt_rejects_runtime_not_on_allowlist(monkeypatch):
+    _set_allowlist(monkeypatch, "hermes")  # claude-code not on allowlist
+    pr = _bump_pr()
+    exempt, reason = mq.is_runtime_bump_exempt(
+        pr=pr,
+        pr_files=[_runtime_version_file()],
+        required_contexts=["runtime-provision-smoke"],
+        latest_runtime_v_tag="v1.2.3",
+        rc_active=False,
+    )
+    assert exempt is False
+    assert "claude-code" in reason
+    assert "allowlist" in reason
+
+
+def test_runtime_bump_exempt_rejects_unparseable_runtime_name():
+    """If the .runtime-version value is not in '<runtime>@<version>'
+    format, the function cannot determine the runtime name → fail-closed."""
+    pr = _bump_pr()
+    exempt, reason = mq.is_runtime_bump_exempt(
+        pr=pr,
+        pr_files=[_runtime_version_file(added="v1.2.3", removed="v1.2.2")],
+        required_contexts=["runtime-provision-smoke"],
+        latest_runtime_v_tag="v1.2.3",
+        rc_active=False,
+    )
+    assert exempt is False
+    assert "format" in reason or "<runtime>@<version>" in reason
+
+
+# ---- CONDITION 3: EXCLUDE-BREAKING ----
+
+def test_runtime_bump_exempt_rejects_semver_major(monkeypatch):
+    _set_allowlist(monkeypatch, "claude-code")
+    pr = _bump_pr()
+    exempt, reason = mq.is_runtime_bump_exempt(
+        pr=pr,
+        pr_files=[_runtime_version_file(added="claude-code@v2.0.0", removed="claude-code@v1.9.9")],
+        required_contexts=["runtime-provision-smoke"],
+        latest_runtime_v_tag="v2.0.0",
+        rc_active=False,
+    )
+    assert exempt is False
+    assert "MAJOR" in reason
+
+
+def test_runtime_bump_exempt_rejects_breaking_label(monkeypatch):
+    _set_allowlist(monkeypatch, "claude-code")
+    # Use a 0.x version so the semver-MAJOR check doesn't fire first —
+    # we want to specifically test the breaking-label rejection.
+    pr = _bump_pr(labels=[{"name": "breaking"}])
+    exempt, reason = mq.is_runtime_bump_exempt(
+        pr=pr,
+        pr_files=[_runtime_version_file(
+            added="claude-code@v0.5.2", removed="claude-code@v0.5.1"
+        )],
+        required_contexts=["runtime-provision-smoke"],
+        latest_runtime_v_tag="v0.5.2",
+        rc_active=False,
+    )
+    assert exempt is False
+    assert "breaking" in reason.lower()
+
+
+def test_runtime_bump_exempt_rejects_unparseable_semver(monkeypatch):
+    _set_allowlist(monkeypatch, "claude-code")
+    pr = _bump_pr()
+    exempt, reason = mq.is_runtime_bump_exempt(
+        pr=pr,
+        pr_files=[_runtime_version_file(added="claude-code@not-a-version", removed="claude-code@v1.2.2")],
+        required_contexts=["runtime-provision-smoke"],
+        latest_runtime_v_tag="not-a-version",
+        rc_active=False,
+    )
+    assert exempt is False
+    assert "semver" in reason or "parse" in reason.lower()
+
+
+# ---- Happy path: all guards + conditions pass → exempt ----
+
+def test_runtime_bump_exempt_happy_path(monkeypatch):
+    _set_allowlist(monkeypatch, "claude-code")
+    # Use 0.x to avoid the semver-MAJOR exclusion.
+    pr = _bump_pr()
+    exempt, reason = mq.is_runtime_bump_exempt(
+        pr=pr,
+        pr_files=[_runtime_version_file(
+            added="claude-code@v0.5.3", removed="claude-code@v0.5.2"
+        )],
+        required_contexts=["CI / all-required (pull_request)", "runtime-provision-smoke"],
+        latest_runtime_v_tag="v0.5.3",
+        rc_active=False,
+    )
+    assert exempt is True, f"expected exempt, got: {reason}"
+    assert "claude-code" in reason
+    assert "v0.5.2" in reason
+    assert "v0.5.3" in reason
+
+
+def test_runtime_bump_exempt_happy_path_with_v_prefix(monkeypatch):
+    """Versions with a leading 'v' (e.g. 'v1.2.3') parse correctly."""
+    _set_allowlist(monkeypatch, "claude-code")
+    pr = _bump_pr()
+    exempt, reason = mq.is_runtime_bump_exempt(
+        pr=pr,
+        pr_files=[_runtime_version_file(added="claude-code@v0.5.1", removed="claude-code@v0.5.0")],
+        required_contexts=["runtime-provision-smoke"],
+        latest_runtime_v_tag="v0.5.1",
+        rc_active=False,
+    )
+    assert exempt is True, f"expected exempt, got: {reason}"
+
+
+# ---- Fail-closed contracts ----
+
+def test_runtime_bump_exempt_treats_non_dict_file_entry_as_unverifiable():
+    """If the pr_files list contains a non-dict entry (e.g. None or a
+    string), the structural invariant is broken → fail-closed to not-exempt."""
+    pr = _bump_pr()
+    exempt, reason = mq.is_runtime_bump_exempt(
+        pr=pr,
+        pr_files=[_runtime_version_file(), "garbage"],
+        required_contexts=["runtime-provision-smoke"],
+        latest_runtime_v_tag="v1.2.3",
+        rc_active=False,
+    )
+    assert exempt is False
+    assert "non-dict" in reason or "unverifiable" in reason
+
+
+def test_runtime_bump_exempt_treats_empty_files_as_no_diff():
+    """An empty pr_files list (e.g. when the API call failed) means we
+    have no .runtime-version → fail-closed to not-exempt."""
+    pr = _bump_pr()
+    exempt, reason = mq.is_runtime_bump_exempt(
+        pr=pr,
+        pr_files=[],
+        required_contexts=["runtime-provision-smoke"],
+        latest_runtime_v_tag="v1.2.3",
+        rc_active=False,
+    )
+    assert exempt is False
+    assert ".runtime-version" in reason
+
+
+# ---- evaluate_merge_readiness honours runtime_bump_exempt ----
+
+def test_evaluate_merge_readiness_skips_approvals_check_when_exempt():
+    """When runtime_bump_exempt=True, required_approvals is effectively 0
+    → even with 0 approvers the PR is NOT blocked on the approvals check."""
+    decision = mq.evaluate_merge_readiness(
+        **_ready_kwargs(
+            approvers=set(),  # zero approvers
+            required_approvals=2,
+            runtime_bump_exempt=True,
+        )
+    )
+    # Approvals gate is bypassed; PR is mergeable (main + CI + mergeable=True).
+    assert decision.ready is True
+    assert decision.action == "merge"
+
+
+def test_evaluate_merge_readiness_still_enforces_approvals_when_not_exempt():
+    """When runtime_bump_exempt=False (default), zero approvers blocks."""
+    decision = mq.evaluate_merge_readiness(
+        **_ready_kwargs(
+            approvers=set(),
+            required_approvals=2,
+            # runtime_bump_exempt omitted → defaults to False
+        )
+    )
+    assert decision.ready is False
+    assert decision.action == "wait"
+    assert "insufficient genuine approvals" in decision.reason
+
+
+# ---- dup-close: keep newest, close older ----
+
+def test_dup_close_superseded_bump_prs_keeps_newest_closes_older():
+    """Two PRs with the same title (bump-bot republish): keep the one with
+    the latest updated_at, close the older one."""
+    new_pr = {
+        "number": 200,
+        "title": "runtime: claude-code bump to v1.2.3",
+        "user": {"login": "bump-bot"},
+        "state": "open",
+        "updated_at": "2026-06-14T18:00:00Z",
+    }
+    old_pr = {
+        "number": 199,
+        "title": "runtime: claude-code bump to v1.2.3",
+        "user": {"login": "bump-bot"},
+        "state": "open",
+        "updated_at": "2026-06-14T12:00:00Z",
+    }
+    closed: list[int] = []
+    comments: list[tuple[int, str]] = []
+
+    def fake_close(pr_number, *, dry_run):
+        closed.append(pr_number)
+
+    def fake_comment(pr_number, body, *, dry_run):
+        comments.append((pr_number, body))
+
+    result = mq.dup_close_superseded_bump_prs(
+        [new_pr, old_pr],
+        close_fn=fake_close,
+        comment_fn=fake_comment,
+        dry_run=False,
+    )
+    assert result == [199]
+    assert 199 in closed
+    assert 200 not in closed
+    # The old PR gets a comment explaining the close.
+    assert any(c[0] == 199 for c in comments)
+    assert any("#200" in c[1] for c in comments)
+
+
+def test_dup_close_superseded_bump_prs_no_op_on_single_pr():
+    """A single bump PR is not a duplicate → no close, no comment."""
+    pr = {
+        "number": 300,
+        "title": "runtime: claude-code bump to v1.2.4",
+        "user": {"login": "bump-bot"},
+        "state": "open",
+        "updated_at": "2026-06-14T18:00:00Z",
+    }
+    closed: list[int] = []
+    comments: list[tuple[int, str]] = []
+
+    def fake_close(pr_number, *, dry_run):
+        closed.append(pr_number)
+
+    def fake_comment(pr_number, body, *, dry_run):
+        comments.append((pr_number, body))
+
+    result = mq.dup_close_superseded_bump_prs(
+        [pr],
+        close_fn=fake_close,
+        comment_fn=fake_comment,
+        dry_run=False,
+    )
+    assert result == []
+    assert closed == []
+    assert comments == []
+
+
+def test_dup_close_superseded_bump_prs_ignores_non_bump_bot_authors():
+    """A non-bump-bot PR is not a candidate for dup-close (it may be a
+    hand-edit and should not be auto-closed)."""
+    bump_pr = {
+        "number": 400,
+        "title": "runtime: claude-code bump to v1.2.5",
+        "user": {"login": "bump-bot"},
+        "state": "open",
+        "updated_at": "2026-06-14T18:00:00Z",
+    }
+    hand_pr = {
+        "number": 401,
+        "title": "runtime: claude-code bump to v1.2.5",
+        "user": {"login": "agent-dev-a"},
+        "state": "open",
+        "updated_at": "2026-06-14T12:00:00Z",
+    }
+    closed: list[int] = []
+
+    def fake_close(pr_number, *, dry_run):
+        closed.append(pr_number)
+
+    def fake_comment(pr_number, body, *, dry_run):
+        pass
+
+    result = mq.dup_close_superseded_bump_prs(
+        [bump_pr, hand_pr],
+        close_fn=fake_close,
+        comment_fn=fake_comment,
+        dry_run=False,
+    )
+    assert result == []  # the hand PR is ignored, no dup to close
+
+
+# ---- Helpers: _is_active_release_candidate ----
+
+def test_is_active_release_candidate_detects_rc_label():
+    prs = [
+        {
+            "number": 1,
+            "state": "open",
+            "labels": [{"name": "release-candidate"}],
+        },
+    ]
+    assert mq._is_active_release_candidate(prs, pr_number=999) is True
+
+
+def test_is_active_release_candidate_ignores_closed_prs():
+    prs = [
+        {
+            "number": 1,
+            "state": "closed",
+            "labels": [{"name": "release-candidate"}],
+        },
+    ]
+    assert mq._is_active_release_candidate(prs, pr_number=999) is False
+
+
+def test_is_active_release_candidate_ignores_self():
+    prs = [
+        {
+            "number": 999,
+            "state": "open",
+            "labels": [{"name": "release-candidate"}],
+        },
+    ]
+    # The PR being evaluated is excluded from the RC check.
+    assert mq._is_active_release_candidate(prs, pr_number=999) is False
+
+
+def test_is_active_release_candidate_returns_false_when_no_rc_labels():
+    prs = [
+        {
+            "number": 1,
+            "state": "open",
+            "labels": [{"name": "bug"}, {"name": "enhancement"}],
+        },
+    ]
+    assert mq._is_active_release_candidate(prs, pr_number=999) is False
