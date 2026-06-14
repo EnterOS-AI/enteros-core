@@ -269,6 +269,24 @@ jobs:
         if: needs.detect-changes.outputs.run == 'true'
         run: pip install -r tests/harness/requirements.txt
 
+      - name: Rebuild cp-stub from source (RC #11812 stale-build fix)
+        # Why this step exists: tests/harness/up.sh's \`build\` block is
+        # gated by \`--rebuild\` (no default rebuild), so without an
+        # explicit \`docker compose build\` the CI uses the cached cp-stub
+        # image — which was built BEFORE the new /cp/admin/orgs handler
+        # landed in tests/harness/cp-stub/main.go. Symptom: the
+        # canary-smoke-org-create-400-capture replay gets HTTP 501 from
+        # the catch-all (handler not implemented), even though the
+        # source has the handler. \`--no-cache\` ensures the rebuilt image
+        # pulls the current main.go from the checked-out branch.
+        # Same pattern as the "Pre-clone manifest deps" step above:
+        # build the image from source BEFORE the harness boots.
+        if: needs.detect-changes.outputs.run == 'true'
+        working-directory: tests/harness
+        run: |
+          docker compose -f compose.yml build --no-cache cp-stub
+          docker compose -f compose.yml build --no-cache tenant-alpha tenant-beta
+
       - name: Run all replays against the harness
         # run-all-replays.sh: boot via up.sh → seed via seed.sh → run
         # every replays/*.sh → tear down via down.sh on EXIT (trap).
