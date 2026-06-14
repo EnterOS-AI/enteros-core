@@ -178,14 +178,16 @@ export function startHeartbeat(
  * a2a_receive rows with source_id NULL (canvas-origin) so the
  * /chat-history hydrator picks them up. Each message becomes its own row
  * so arbitrary user/agent sequences can be seeded.
+ *
+ * The JSON payloads are passed through psql as dollar-quoted literals so
+ * message text containing quotes, backslashes, or other special characters
+ * is preserved exactly and cannot break the SQL string escaping.
  */
 export async function seedChatHistory(
   workspaceId: string,
   messages: Array<{ role: "user" | "agent"; content: string }>,
 ): Promise<void> {
   if (!process.env.E2E_DATABASE_URL) return;
-
-  const escape = (s: string) => s.replace(/'/g, "''").replace(/\\/g, "\\\\");
 
   const rows = messages
     .map((msg, i) => {
@@ -208,7 +210,14 @@ export async function seedChatHistory(
               },
             })
           : "{}";
-      return `('${randomUUID()}', '${workspaceId}', 'a2a_receive', NULL, NULL, 'message/send', NULL, '${escape(requestBody)}'::jsonb, '${escape(responseBody)}'::jsonb, 0, 'ok', NOW() - INTERVAL '${offsetSec} seconds')`;
+
+      // Use a per-row random dollar-quoting tag so the message content
+      // cannot accidentally close the literal.
+      const tag = `J${randomUUID().replace(/[^A-Za-z0-9]/g, "")}`;
+      const reqLit = `$${tag}$${requestBody}$${tag}$`;
+      const respLit = `$${tag}$${responseBody}$${tag}$`;
+
+      return `('${randomUUID()}', '${workspaceId}', 'a2a_receive', NULL, NULL, 'message/send', NULL, ${reqLit}::jsonb, ${respLit}::jsonb, 0, 'ok', NOW() - INTERVAL '${offsetSec} seconds')`;
     })
     .join(",");
 
