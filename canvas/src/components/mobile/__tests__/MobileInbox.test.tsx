@@ -15,6 +15,7 @@ vi.mock("@/lib/auth", () => ({ fetchSession: vi.fn().mockResolvedValue({ user_id
 vi.mock("@/hooks/useSocketEvent", () => ({ useSocketEvent: vi.fn() }));
 
 import { api } from "@/lib/api";
+import type { RequestRow } from "@/components/concierge/RequestsInbox";
 import { MobileInbox } from "../MobileInbox";
 
 const approval = {
@@ -29,6 +30,16 @@ beforeEach(() => {
   vi.mocked(api.get).mockResolvedValue([approval]);
   vi.mocked(api.post).mockResolvedValue({});
 });
+
+function deferred<T = unknown>() {
+  let resolve: (value: T) => void = () => {};
+  let reject: (reason?: unknown) => void = () => {};
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
 
 describe("MobileInbox", () => {
   it("loads pending approvals from /requests/pending?kind=approval", async () => {
@@ -51,9 +62,50 @@ describe("MobileInbox", () => {
     expect(container.querySelectorAll('[data-testid="inbox-row"]').length).toBe(0);
   });
 
-  it("shows an empty state when there are no pending requests", async () => {
-    vi.mocked(api.get).mockResolvedValue([]);
-    const { getByText } = render(<MobileInbox dark={false} />);
-    await waitFor(() => getByText(/No pending approvals/i));
+  it("does not action a stale approval row as a task during tab switch (core#2766)", async () => {
+    // Simulate a delayed task fetch after switching tabs. The old approval row
+    // is still rendered while the new fetch is in flight; its primary action
+    // must remain "approved", not flip to "done" because the active tab changed.
+    const approvalFetch = deferred<RequestRow[]>();
+    const taskFetch = deferred<RequestRow[]>();
+    vi.mocked(api.get).mockImplementation((url: string | undefined) => {
+      if (typeof url === "string" && url.includes("kind=approval")) {
+        return approvalFetch.promise as Promise<unknown>;
+      }
+      return taskFetch.promise as Promise<unknown>;
+    });
+
+    const { getByRole, getByText, queryByText } = render(<MobileInbox dark={false} />);
+    await act(async () => {
+      approvalFetch.resolve([approval]);
+    });
+    await waitFor(() => expect(getByText("Delete prod secret?")).toBeTruthy());
+
+    // Switch to Tasks before the task fetch resolves.
+    fireEvent.click(getByRole("tab", { name: "Tasks" }));
+
+    // Stale approval row is still visible.
+    expect(getByText("Delete prod secret?")).toBeTruthy();
+    // Primary action is still "Approve", not "Done".
+    expect(getByRole("button", { name: "Approve" })).toBeTruthy();
+
+    await act(async () => {
+      fireEvent.click(getByRole("button", { name: "Approve" }));
+    });
+
+    // Must post the approval action, never the task action.
+    expect(api.post).toHaveBeenCalledWith(
+      "/requests/req-1/respond",
+      expect.objectContaining({ action: "approved" }),
+    );
+    expect(api.post).not.toHaveBeenCalledWith(
+      "/requests/req-1/respond",
+      expect.objectContaining({ action: "done" }),
+    );
+
+    await act(async () => {
+      taskFetch.resolve([]);
+    });
+    await waitFor(() => expect(queryByText("Delete prod secret?")).toBeNull());
   });
 });
