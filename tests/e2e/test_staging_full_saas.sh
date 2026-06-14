@@ -167,9 +167,9 @@ ok()   { echo "[$(date +%H:%M:%S)] ✅ $*"; }
 # already covers this, but a redundant check in the harness
 # itself is cheap).
 if [ "$MODE" = "smoke" ]; then
-  SLUG="e2e-smoke-$(make_collision_proof_slug_suffix "${E2E_RUN_ID:-}")
+  SLUG="e2e-smoke-$(make_collision_proof_slug_suffix "${E2E_RUN_ID:-}")"
 else
-  SLUG="e2e-$(make_collision_proof_slug_suffix "${E2E_RUN_ID:-}")
+  SLUG="e2e-$(make_collision_proof_slug_suffix "${E2E_RUN_ID:-}")"
 fi
 assert_collision_proof_slug "$SLUG" || fail "Bug in make_collision_proof_slug: produced non-collision-proof slug '$SLUG' (assert_collision_proof_slug failed)"
 
