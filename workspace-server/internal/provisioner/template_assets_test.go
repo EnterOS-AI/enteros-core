@@ -479,3 +479,52 @@ func keysOfAssetMap(m map[string][]byte) []string {
 func stringsContains(s, substr string) bool {
 	return strings.Contains(s, substr)
 }
+
+// TestCollectCPConfigFiles_AssetsAllowLargeSkillPackage is the regression for
+// Reviewer-CR2's size-cap RC on head 7bcc3b5f: template ASSETS ride a
+// NON-secret channel and must NOT be bound by the 256 KiB SM/config-bundle cap
+// (cpConfigFilesMaxBytes). Reusing that cap re-creates the original #2831
+// skill-drop — the motivating 716 KiB seo-all package would abort client-side.
+// A >256 KiB asset payload must SUCCEED on TemplateAssets (bounded only by the
+// far larger cpTemplateAssetsMaxBytes DoS guard) while ConfigFiles stays capped.
+func TestCollectCPConfigFiles_AssetsAllowLargeSkillPackage(t *testing.T) {
+	// 716 KiB skill blob — over the old 256 KiB cap, well under the asset bound.
+	big := make([]byte, 716<<10)
+	for i := range big {
+		big[i] = 'x'
+	}
+	prov := &fakeTemplateAssetFetcher{
+		bundle: map[string][]byte{
+			"config.yaml":                         []byte("# from template repo"),
+			"agent-skills/seo-audit/big-skill.md": big,
+		},
+	}
+	cfg := WorkspaceConfig{
+		TemplateIdentity:     "seo-agent-v1.2.3",
+		TemplateAssetFetcher: prov,
+	}
+
+	_, assets, err := collectCPConfigFiles(cfg)
+	if err != nil {
+		t.Fatalf("a %d-byte skill package must succeed on the non-secret asset channel (no SM cap), got error: %v", len(big), err)
+	}
+	if got := len(assets["agent-skills/seo-audit/big-skill.md"]); got != len(big) {
+		t.Errorf("expected the full %d-byte skill in TemplateAssets, got %d", len(big), got)
+	}
+}
+
+// TestCollectCPConfigFiles_ConfigFilesStillCappedAt256K pins that lifting the
+// asset cap did NOT relax the SM/user-data transport limit: the SM-bound
+// ConfigFiles bundle keeps its 256 KiB cap (cpConfigFilesMaxBytes).
+func TestCollectCPConfigFiles_ConfigFilesStillCappedAt256K(t *testing.T) {
+	big := make([]byte, (256<<10)+1)
+	for i := range big {
+		big[i] = 'y'
+	}
+	cfg := WorkspaceConfig{
+		ConfigFiles: map[string][]byte{"system-prompt.md": big},
+	}
+	if _, _, err := collectCPConfigFiles(cfg); err == nil {
+		t.Fatal("ConfigFiles over 256 KiB must still be rejected (SM/user-data transport cap unchanged)")
+	}
+}
