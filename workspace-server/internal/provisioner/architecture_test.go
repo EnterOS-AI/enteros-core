@@ -127,6 +127,15 @@ func TestNoSEOPatchSymbolsInCore(t *testing.T) {
 	// (provisioner, handlers, etc.) — the patch was per-template
 	// content in core, no package is a valid home.
 	var hits []string
+	// Resolve the current test file's absolute path so the
+	// self-exclude can match by exact path, not by basename
+	// (a basename match would skip EVERY architecture_test.go
+	// in the tree — workspace-server has them under
+	// internal/{models,db,provisioner,wsauth}/ — and create
+	// a blind spot where forbidden SEO symbols in a sibling
+	// architecture test would pass silently). Researcher
+	// RC #11684.
+	selfPath, _ := filepath.Abs("architecture_test.go")
 	err := filepath.Walk(root, func(path string, info os.FileInfo, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -144,8 +153,12 @@ func TestNoSEOPatchSymbolsInCore(t *testing.T) {
 		// Skip THIS test file itself — it lists the forbidden
 		// symbols as documentation. Excluding self from the grep
 		// is necessary to avoid a self-match (the grep-gate would
-		// fail on the very file that defines it).
-		if strings.HasSuffix(path, "architecture_test.go") {
+		// fail on the very file that defines it). Match by EXACT
+		// absolute path so sibling architecture_test.go files
+		// (workspace-server/internal/{models,db,wsauth}/) are
+		// still grep'd — they could legitimately contain the
+		// forbidden SEO symbols and must be caught.
+		if path == selfPath || strings.HasSuffix(path, "/"+filepath.Base(selfPath)) && path == selfPath {
 			return nil
 		}
 		b, readErr := os.ReadFile(path)
