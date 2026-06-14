@@ -114,8 +114,8 @@ assert_collision_proof_slug() {
     echo "FAIL: slug '$slug' is too short to be collision-proof, len=${#slug} want >=24" >&2
     return 1
   fi
-  if [ "${#slug}" -gt 31 ]; then
-    echo "FAIL: slug '$slug' is too long, len=${#slug} max=32, CP /cp/admin/orgs rejects with HTTP 400" >&2
+  if [ "${#slug}" -gt "${CP_ORG_SLUG_MAX_LEN}" ]; then
+    echo "FAIL: slug '$slug' is too long, len=${#slug} max=${CP_ORG_SLUG_MAX_LEN}, CP /cp/admin/orgs rejects with HTTP 400" >&2
     return 1
   fi
   return 0
