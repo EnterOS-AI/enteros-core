@@ -232,6 +232,15 @@ func (h *WorkspaceHandler) maybeRestartAfterFileWrite(workspaceID string) {
 // pending=true and the outer coalesceRestart loop will drain by running
 // ANOTHER full cycle, ec2_stopped of the just-booted instance →
 // re-provision. That's the self-fire loop closed by this gate.
+// restartSettleWindow is the post-restart window during which a single
+// IsRunning=false probe is NOT trusted. A workspace that just had its
+// config.yaml PUT and was restarted can report IsRunning=false while the
+// agent is still registering its first heartbeat / settling the container.
+// Widening the self-fire guard to cover this window prevents a lone flaky
+// probe from clearing the workspace URL and re-triggering a destructive
+// restart. core#2929.
+const restartSettleWindow = 30 * time.Second
+
 func isRestarting(workspaceID string) bool {
 	sv, ok := restartStates.Load(workspaceID)
 	if !ok {
@@ -241,6 +250,41 @@ func isRestarting(workspaceID string) bool {
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	return state.running
+}
+
+// inRestartSettleWindow reports whether workspaceID is within
+// restartSettleWindow of its most recent restart start. This widens the
+// self-fire guard beyond the in-flight restart flag to cover the settle
+// window right after a config-PUT restart. core#2929.
+func inRestartSettleWindow(workspaceID string) bool {
+	sv, ok := restartStates.Load(workspaceID)
+	if !ok {
+		return false
+	}
+	state := sv.(*restartState)
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.restartStartedAt.IsZero() {
+		return false
+	}
+	return time.Since(state.restartStartedAt) < restartSettleWindow
+}
+
+// lastRestartStartedAt returns the timestamp recorded when the most recent
+// restart cycle started for workspaceID, if any. Used by the settle-window
+// heartbeat freshness check in maybeMarkContainerDead. core#2929.
+func lastRestartStartedAt(workspaceID string) (time.Time, bool) {
+	sv, ok := restartStates.Load(workspaceID)
+	if !ok {
+		return time.Time{}, false
+	}
+	state := sv.(*restartState)
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.restartStartedAt.IsZero() {
+		return time.Time{}, false
+	}
+	return state.restartStartedAt, true
 }
 
 // isParentPaused checks if any ancestor of the workspace is paused.

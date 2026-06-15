@@ -117,8 +117,9 @@ func TestMaybeMarkContainerDead_SkippedWhileRestarting(t *testing.T) {
 	h := newSelfFireHandler(t)
 	h.provisioner = stub
 
-	if got := h.maybeMarkContainerDead(context.Background(), wsID); got != false {
-		t.Errorf("maybeMarkContainerDead must return false while restarting, got %v", got)
+	dead, _, _ := h.maybeMarkContainerDead(context.Background(), wsID, "", []byte("{}"), "message/send", 0, false)
+	if dead != false {
+		t.Errorf("maybeMarkContainerDead must return false while restarting, got %v", dead)
 	}
 	if stub.calls != 0 {
 		t.Errorf("IsRunning must not be called while restarting (Layer 1 gate broken); got %d calls", stub.calls)

@@ -33,10 +33,17 @@ import (
 //   - the workspace DOES have a recent heartbeat but we see N consecutive
 //     dead observations within the debounce window.
 const (
-	recentHeartbeatWindow          = 15 * time.Second
-	containerDeadDebounceThreshold = 2
-	containerDeadDebounceWindow    = 30 * time.Second
+	recentHeartbeatWindow             = 15 * time.Second
+	containerDeadDebounceThreshold    = 2
+	containerDeadDebounceWindow       = 30 * time.Second
+	containerDeadReprobeDelay         = 500 * time.Millisecond
+	containerDeadHeartbeatWaitTimeout = 2 * time.Second
 )
+
+// containerDeadReprobeDelayV is a mutable copy so tests can shrink the
+// settle-window re-probe to zero. Package-level to avoid plumbing through
+// the handler struct. core#2929.
+var containerDeadReprobeDelayV = containerDeadReprobeDelay
 
 // proxyDispatchBuildError is a sentinel wrapper for failures inside
 // http.NewRequestWithContext. handleA2ADispatchError unwraps it to emit the
@@ -61,9 +68,15 @@ func (h *WorkspaceHandler) handleA2ADispatchError(ctx context.Context, workspace
 
 	log.Printf("ProxyA2A forward error: %v", err)
 
-	containerDead := h.maybeMarkContainerDead(ctx, workspaceID)
+	dead, queuedStatus, queuedBody := h.maybeMarkContainerDead(ctx, workspaceID, callerID, body, a2aMethod, durationMs, logActivity)
 
-	if containerDead {
+	if queuedStatus != 0 {
+		// maybeMarkContainerDead decided the container is alive-but-busy/settling
+		// and enqueued the request. Return the 202 Accepted response directly.
+		return queuedStatus, queuedBody, nil
+	}
+
+	if dead {
 		if logActivity {
 			h.logA2AFailure(ctx, workspaceID, callerID, body, a2aMethod, err, durationMs)
 		}
@@ -204,78 +217,153 @@ func (h *WorkspaceHandler) handleA2ADispatchError(ctx context.Context, workspace
 //
 // #2929 hardening: do NOT recycle a recently-alive workspace on a single
 // transient A2A 503 / IsRunning flake. We guard the restart with:
-//   1. A recent-heartbeat check (last_heartbeat_at within 15s).
-//   2. When the heartbeat is recent, require 2 consecutive dead observations
-//      within 30s before declaring dead.
-//   3. Treat IsRunning transport errors as "assume alive" instead of dead.
-func (h *WorkspaceHandler) maybeMarkContainerDead(ctx context.Context, workspaceID string) bool {
+//   1. A widened self-fire guard that also covers the post-restart settle
+//      window (not just a restart currently in-flight).
+//   2. A re-probe delay after a lone IsRunning=false before trusting it.
+//   3. A recent-heartbeat / fresh-post-restart-heartbeat check. When
+//      transport-liveness is green we enqueue the request (202 queued)
+//      instead of clearing the workspace URL and restarting.
+//   4. Treat IsRunning transport errors as "assume alive" instead of dead.
+//
+// Returns (dead, httpStatus, responseBody). When httpStatus is non-zero the
+// caller must return that response directly (e.g., 202 Accepted queued).
+func (h *WorkspaceHandler) maybeMarkContainerDead(ctx context.Context, workspaceID, callerID string, body []byte, a2aMethod string, durationMs int, logActivity bool) (bool, int, []byte) {
 	var wsRuntime string
 	db.DB.QueryRowContext(ctx, `SELECT COALESCE(runtime, 'claude-code') FROM workspaces WHERE id = $1`, workspaceID).Scan(&wsRuntime)
 	if isExternalLikeRuntime(wsRuntime) {
-		return false
+		return false, 0, nil
 	}
 	if !h.HasProvisioner() {
-		return false
+		return false, 0, nil
 	}
-	// Restart-aware short-circuit: during the 20-30s EC2-pending window of
-	// an in-flight restart, the workspace's url='' and IsRunning() returns
-	// false → looks indistinguishable from a dead container. Pre-fix this
-	// fired a fresh RestartByID for the just-launched instance, which
-	// coalesceRestart's pending-flag drained by running ANOTHER full
-	// stop+provision cycle (= ec2_stopped of the still-pending instance
-	// → re-provision). That's the 4x reprov thrash class. Skip the
-	// container-dead path while a restart is in flight; the in-flight
-	// restart's own provisionWorkspaceAutoSync will surface a real failure
-	// (markProvisionFailed) if the new container never comes up. Issue
-	// internal#544.
+
+	// Layer 1 self-fire guard: skip the container-dead path while a restart
+	// is in flight AND during the post-restart settle window. During the
+	// settle window a config-PUT-restarted container can report
+	// IsRunning=false before its first heartbeat arrives; a lone false must
+	// not trigger RestartByID and clear the URL. core#2929.
 	if isRestarting(workspaceID) {
 		log.Printf("ProxyA2A: maybeMarkContainerDead skipped for %s — restart already in flight (self-fire guard)", workspaceID)
-		return false
+		return false, 0, nil
+	}
+	settling := inRestartSettleWindow(workspaceID)
+	if settling {
+		log.Printf("ProxyA2A: maybeMarkContainerDead for %s is in post-restart settle window — using conservative path", workspaceID)
 	}
 
 	// #2929: recent-heartbeat guard. A workspace that heartbeated seconds
 	// ago is almost certainly alive; a single proxy/transport flake should
 	// not kill it. We still run IsRunning below, but a recent heartbeat
-	// puts us on the debounced path.
+	// puts us on the debounced/enqueued path.
 	recentHeartbeat := h.hasRecentHeartbeat(ctx, workspaceID)
 
-	var running bool
-	var inspectErr error
-	if h.provisioner != nil {
-		running, inspectErr = h.provisioner.IsRunning(ctx, workspaceID)
-	} else {
-		// SaaS path: ask the CP about the EC2 state. Same (true, err) on
-		// transport errors contract — keeps the caller on the alive path
-		// instead of triggering a restart cascade on a flaky CP call.
-		running, inspectErr = h.cpProv.IsRunning(ctx, workspaceID)
+	// If we're in the settle window, also check whether a heartbeat arrived
+	// strictly AFTER the restart started (i.e. a genuine post-restart PONG).
+	freshHeartbeat := false
+	if settling {
+		if restartStart, ok := lastRestartStartedAt(workspaceID); ok {
+			// waitForFreshHeartbeat is the same correlated check used by the
+			// restart-context sender: url non-empty + heartbeat newer than the
+			// restart start. A short timeout is enough — the heartbeat we're
+			// looking for already happened or is imminent.
+			freshHeartbeat = waitForFreshHeartbeat(ctx, workspaceID, restartStart, containerDeadHeartbeatWaitTimeout)
+		}
 	}
+
+	probe := func() (bool, error) {
+		if h.provisioner != nil {
+			return h.provisioner.IsRunning(ctx, workspaceID)
+		}
+		return h.cpProv.IsRunning(ctx, workspaceID)
+	}
+
+	running, inspectErr := probe()
 	if inspectErr != nil {
 		// Transient backend error (Docker daemon EOF, CP HTTP 5xx, etc.).
 		// IsRunning's contract returns (true, err) in this case so we stay
 		// on the alive path without triggering a restart cascade.
 		log.Printf("ProxyA2A: IsRunning for %s returned transient error (assuming alive): %v", workspaceID, inspectErr)
-		return false
+		return false, 0, nil
 	}
 	if running {
 		h.resetDeadProbe(workspaceID)
-		return false
+		return false, 0, nil
 	}
 
-	// Container is not running. If we have no recent heartbeat, preserve the
+	// First probe says not running. In the recent-heartbeat or settle-window
+	// cases, do not trust a single false — re-probe after a short delay. A
+	// transient container-settle flap resolves itself on the second probe.
+	if recentHeartbeat || freshHeartbeat || settling {
+		time.Sleep(containerDeadReprobeDelayV)
+		running2, inspectErr2 := probe()
+		if inspectErr2 != nil {
+			log.Printf("ProxyA2A: IsRunning re-probe for %s returned transient error (assuming alive): %v", workspaceID, inspectErr2)
+			return false, 0, nil
+		}
+		if running2 {
+			log.Printf("ProxyA2A: IsRunning re-probe for %s now reports running — settling transient, not dead", workspaceID)
+			h.resetDeadProbe(workspaceID)
+			return false, 0, nil
+		}
+	}
+
+	// Still not running after the re-probe. If transport-liveness is green,
+	// the agent is alive-but-busy/settling; queue the request instead of
+	// clearing the URL and restarting. core#2929.
+	if recentHeartbeat || freshHeartbeat {
+		log.Printf("ProxyA2A: container for %s not running but heartbeat is recent — enqueuing instead of restarting", workspaceID)
+		return h.enqueueBusyA2A(ctx, workspaceID, callerID, body, a2aMethod, durationMs, logActivity)
+	}
+
+	// No recent/fresh heartbeat and not in the settle window: preserve the
 	// pre-#2929 immediate-dead behavior so dead EC2 instances still recover
 	// on the first failed request (hongmingwang incident recovery path).
-	if !recentHeartbeat {
-		return h.declareContainerDead(ctx, workspaceID)
+	if !settling {
+		return h.declareContainerDead(ctx, workspaceID), 0, nil
 	}
 
-	// Recent heartbeat but IsRunning says not-running: debounce. Require N
+	// Settle window but no fresh heartbeat yet: debounce. Require N
 	// consecutive observations within the window before we believe it.
 	if !h.incrementDeadProbe(workspaceID) {
-		log.Printf("ProxyA2A: container for %s looks dead but has recent heartbeat — debouncing (%d/%d within %s)",
+		log.Printf("ProxyA2A: container for %s looks dead in settle window — debouncing (%d/%d within %s)",
 			workspaceID, h.deadProbeCount(workspaceID), containerDeadDebounceThreshold, containerDeadDebounceWindow)
-		return false
+		return false, 0, nil
 	}
-	return h.declareContainerDead(ctx, workspaceID)
+	return h.declareContainerDead(ctx, workspaceID), 0, nil
+}
+
+// enqueueBusyA2A enqueues the current request for drain on the next idle
+// heartbeat. Returns (dead=false, http.StatusAccepted, queuedBody) on success,
+// or (false, 0, nil) if the queue insert failed so the caller can fall back to
+// its normal error path. core#2929.
+func (h *WorkspaceHandler) enqueueBusyA2A(ctx context.Context, workspaceID, callerID string, body []byte, a2aMethod string, durationMs int, logActivity bool) (bool, int, []byte) {
+	idempotencyKey := extractIdempotencyKey(body)
+	var expiresAt *time.Time
+	if secs := extractExpiresInSeconds(body); secs > 0 {
+		t := time.Now().Add(time.Duration(secs) * time.Second)
+		expiresAt = &t
+	}
+	qid, depth, qerr := EnqueueA2A(
+		ctx, workspaceID, callerID, PriorityTask, body, a2aMethod, idempotencyKey, expiresAt,
+	)
+	if qerr == nil {
+		log.Printf("ProxyA2A: target %s busy/settling — enqueued as %s (depth=%d)", workspaceID, qid, depth)
+		if logActivity {
+			h.logA2ABusyQueued(ctx, workspaceID, callerID, body, a2aMethod, durationMs)
+		}
+		respBody, marshalErr := json.Marshal(gin.H{
+			"queued":      true,
+			"queue_id":    qid,
+			"queue_depth": depth,
+			"message":     "workspace agent busy — request queued, will dispatch when capacity available",
+		})
+		if marshalErr != nil {
+			log.Printf("ProxyA2A %s: json.Marshal respBody failed: %v", workspaceID, marshalErr)
+		}
+		return false, http.StatusAccepted, respBody
+	}
+	log.Printf("ProxyA2A: enqueue for %s failed (%v) — falling back to 503", workspaceID, qerr)
+	return false, 0, nil
 }
 
 // hasRecentHeartbeat returns true if the workspace has a last_heartbeat_at
