@@ -528,3 +528,72 @@ func TestCollectCPConfigFiles_ConfigFilesStillCappedAt256K(t *testing.T) {
 		t.Fatal("ConfigFiles over 256 KiB must still be rejected (SM/user-data transport cap unchanged)")
 	}
 }
+
+// TestSelectTemplateAssetFetcher_SaaS_GiteaFetcher covers the SaaS
+// selection: the Gitea fetcher is wired (authenticated when the
+// token is set, unauthenticated/public when empty — the public-fetch
+// activation default for the molecule-ai/* PUBLIC templates).
+func TestSelectTemplateAssetFetcher_SaaS_GiteaFetcher(t *testing.T) {
+	// With token
+	sel := SelectTemplateAssetFetcher(func() bool { return true }, "http://gitea", "the-token")
+	if sel.Fetcher == nil {
+		t.Fatal("SaaS + token: expected non-nil fetcher")
+	}
+	if !sel.Authenticated {
+		t.Error("SaaS + token: expected Authenticated=true")
+	}
+	if sel.Mode == "self-host-noop" {
+		t.Errorf("SaaS + token: expected non-noop mode, got %q", sel.Mode)
+	}
+	// Without token (PR-B public-fetch default)
+	sel2 := SelectTemplateAssetFetcher(func() bool { return true }, "http://gitea", "")
+	if sel2.Fetcher == nil {
+		t.Fatal("SaaS + no token: expected non-nil fetcher (public-fetch)")
+	}
+	if sel2.Authenticated {
+		t.Error("SaaS + no token: expected Authenticated=false (public-fetch)")
+	}
+	if sel2.Mode == "self-host-noop" {
+		t.Errorf("SaaS + no token: expected non-noop mode, got %q", sel2.Mode)
+	}
+}
+
+// TestSelectTemplateAssetFetcher_SelfHost_NoopFetcher covers the
+// self-host selection: the no-op fetcher is wired regardless of
+// token state (self-host doesn't need an external asset channel).
+func TestSelectTemplateAssetFetcher_SelfHost_NoopFetcher(t *testing.T) {
+	// With token (token is IGNORED on self-host)
+	sel := SelectTemplateAssetFetcher(func() bool { return false }, "http://gitea", "the-token")
+	if sel.Fetcher == nil {
+		t.Fatal("self-host: expected non-nil fetcher (no-op default)")
+	}
+	if sel.Authenticated {
+		t.Error("self-host: expected Authenticated=false (no-op never sends auth headers)")
+	}
+	if sel.Mode != "self-host-noop" {
+		t.Errorf("self-host: expected Mode=self-host-noop, got %q", sel.Mode)
+	}
+	// The fetcher's Load must return (nil, nil) — "no assets" signal.
+	assets, err := sel.Fetcher.Load(t.Context(), "molecule-ai/workspace-template-seo@main")
+	if err != nil {
+		t.Errorf("self-host no-op Load: expected nil error, got %v", err)
+	}
+	if len(assets) != 0 {
+		t.Errorf("self-host no-op Load: expected empty map, got %d entries: %v", len(assets), keysOf(assets))
+	}
+}
+
+// TestSelectTemplateAssetFetcher_NilSaaSCheck_FallsBackToNoop covers
+// the safe default: a nil isSaaSTenant closure is treated as
+// "not SaaS" (no-op fetcher), so a misconfigured selection never
+// accidentally routes a self-host deployment to the real Gitea
+// fetcher.
+func TestSelectTemplateAssetFetcher_NilSaaSCheck_FallsBackToNoop(t *testing.T) {
+	sel := SelectTemplateAssetFetcher(nil, "http://gitea", "the-token")
+	if sel.Fetcher == nil {
+		t.Fatal("nil isSaaSTenant closure: expected non-nil fetcher (no-op default)")
+	}
+	if sel.Mode != "self-host-noop" {
+		t.Errorf("nil isSaaSTenant closure: expected Mode=self-host-noop, got %q", sel.Mode)
+	}
+}
