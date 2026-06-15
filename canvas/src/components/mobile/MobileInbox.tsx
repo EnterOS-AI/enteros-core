@@ -33,6 +33,11 @@ export function MobileInbox({ dark }: { dark: boolean }) {
   const [items, setItems] = useState<RequestRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [acting, setActing] = useState<string | null>(null);
+  // Audit F1: track backend fetch failure distinctly so the list can render
+  // a retry affordance instead of the silent "No pending approvals" empty
+  // state. A genuine backend outage during a destructive-approvals review
+  // must NOT look like a clean inbox.
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   // Responder identity — the same resolution RequestsInbox uses (session
   // user_id, "admin" placeholder when unauthenticated).
@@ -49,22 +54,42 @@ export function MobileInbox({ dark }: { dark: boolean }) {
   // in-flight fetch for the old kind must not overwrite the list after the
   // new tab's load clears it (CR2 #11478).
   const loadSeqRef = useRef(0);
+  // Audit F3: track rows the user has just optimistically acted on. A
+  // REQUEST_RESPONDED WS event fired by OUR server (in response to our own
+  // POST) can race with the optimistic removal — the WS-triggered load()
+  // may re-fetch a list that still contains the row (the POST hasn't
+  // landed server-side yet), and a naive setItems would briefly re-render
+  // the just-approved row (the "flicker" report). Filtering the just-acted
+  // set on load() return closes the race; the set is cleared on POST
+  // completion (success drops it because the server no longer returns the
+  // row; failure drops it because the catch re-loads from server truth).
+  const justActedRef = useRef<Set<string>>(new Set());
   const load = useCallback(() => {
     const seq = ++loadSeqRef.current;
     // core#2766 / CR2 #11478: clear stale rows the moment the kind changes
     // so the user never sees approval cards under the Tasks tab (or
     // vice-versa) while the new list is still fetching.
     setItems([]);
+    setLoadError(null);
     setLoading(true);
     api
       .get<RequestRow[]>(`/requests/pending?kind=${kind}`)
       .then((rows) => {
         if (seq !== loadSeqRef.current) return; // stale response
-        setItems(Array.isArray(rows) ? rows : []);
+        const arr = Array.isArray(rows) ? rows : [];
+        // F3: filter out rows the user has just acted on so a racing
+        // WS-triggered load doesn't re-surface them in the brief window
+        // between optimistic-removal and POST completion.
+        setItems(arr.filter((r) => !justActedRef.current.has(r.id)));
       })
       .catch(() => {
         if (seq !== loadSeqRef.current) return; // stale response
         setItems([]);
+        // F1: surface the failure distinctly. The render path below
+        // shows a retry affordance + role="alert" instead of the
+        // "No pending approvals" copy that would falsely suggest a
+        // clean inbox during a backend outage.
+        setLoadError("Could not load pending requests.");
       })
       .finally(() => {
         if (seq !== loadSeqRef.current) return; // stale response
@@ -82,8 +107,11 @@ export function MobileInbox({ dark }: { dark: boolean }) {
     async (r: RequestRow, action: "done" | "rejected" | "approved") => {
       if (acting) return;
       setActing(r.id);
-      // Optimistic: drop the row immediately; restore on failure.
-      const prev = items;
+      // Optimistic: drop the row immediately. The server is the source of
+      // truth, so on failure we re-load() rather than restoring a stale
+      // `items` snapshot (Audit F2: a `setItems(prev)` snapshot would wipe
+      // any rows that arrived via WS during the in-flight POST).
+      justActedRef.current.add(r.id);
       setItems((cur) => cur.filter((x) => x.id !== r.id));
       try {
         await api.post(`/requests/${r.id}/respond`, {
@@ -91,13 +119,22 @@ export function MobileInbox({ dark }: { dark: boolean }) {
           responder_type: "user",
           responder_id: responderIdRef.current,
         });
+        // F3: POST succeeded — the server now treats r as responded, so
+        // future loads won't return it. Drop from justActedRef.
+        justActedRef.current.delete(r.id);
       } catch {
-        setItems(prev); // restore on failure
+        // F2: re-fetch from server truth (preserves any rows that arrived
+        // via WS during the in-flight POST — restoring a stale `items`
+        // snapshot here would wipe them). Also drops the row from
+        // justActedRef so the server's re-fetched list (with the row
+        // still pending) is rendered as-is.
+        justActedRef.current.delete(r.id);
+        load();
       } finally {
         setActing(null);
       }
     },
-    [acting, items],
+    [acting, load],
   );
 
   const subTabs: { id: InboxKind; label: string }[] = useMemo(
@@ -154,6 +191,44 @@ export function MobileInbox({ dark }: { dark: boolean }) {
       <div style={{ flex: 1, overflowY: "auto", padding: "12px 16px", display: "flex", flexDirection: "column", gap: 10 }}>
         {loading && items.length === 0 ? (
           <div style={{ color: p.text3, fontSize: 13, textAlign: "center", marginTop: 40 }}>Loading…</div>
+        ) : loadError && items.length === 0 ? (
+          // F1: backend fetch failure renders a distinct error/retry state
+          // (NOT the silent "No pending approvals" empty copy). Critical for
+          // destructive-approvals review — a clean-looking inbox during a
+          // backend outage would let destructive actions go unreviewed.
+          <div
+            role="alert"
+            data-testid="inbox-load-error"
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              alignItems: "center",
+              gap: 10,
+              marginTop: 40,
+              padding: "0 16px",
+            }}
+          >
+            <div style={{ color: p.failed, fontSize: 13, textAlign: "center" }}>{loadError}</div>
+            <button
+              type="button"
+              onClick={load}
+              aria-label="Retry loading pending requests"
+              data-testid="inbox-retry"
+              style={{
+                padding: "6px 14px",
+                borderRadius: 14,
+                border: `0.5px solid ${p.failed}`,
+                background: "transparent",
+                color: p.failed,
+                fontSize: 12,
+                fontWeight: 600,
+                cursor: "pointer",
+                fontFamily: MOBILE_FONT_SANS,
+              }}
+            >
+              Retry
+            </button>
+          </div>
         ) : items.length === 0 ? (
           <div style={{ color: p.text3, fontSize: 13, textAlign: "center", marginTop: 40 }}>
             {kind === "approval"
