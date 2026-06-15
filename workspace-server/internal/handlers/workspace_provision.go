@@ -1324,7 +1324,9 @@ func applyPlatformManagedLLMEnv(ctx context.Context, envVars map[string]string, 
 	// core#2594: the MOLECULE_LLM_DEFAULT_MODEL env fail-open was REMOVED here.
 	// It silently injected MOLECULE_MODEL when a workspace reached provision with
 	// no resolvable model — an opaque, server-env-sourced substitution that hid
-	// the missing model (the concierge ran on it; see conciergeDeclaredModel).
+	// the missing model (the concierge ran on it; see the platform-agent
+	// template's `model:` declaration in
+	// molecule-ai-workspace-template-platform-agent/config.yaml).
 	// Per the CTO SSOT directive (2026-05-22, models/runtime_defaults.go) the
 	// platform must not default a workspace's model. Resolution is now stored-only
 	// (create requires it; the concierge declares its own); a workspace that still
