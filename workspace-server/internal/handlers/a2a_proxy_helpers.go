@@ -122,8 +122,16 @@ func (h *WorkspaceHandler) handleA2ADispatchError(ctx context.Context, workspace
 			t := time.Now().Add(time.Duration(secs) * time.Second)
 			expiresAt = &t
 		}
-		if qid, depth, qerr := EnqueueA2A(
-			ctx, workspaceID, callerID, PriorityTask, body, a2aMethod, idempotencyKey, expiresAt,
+		// #2930 part B: the inbound request context will be cancelled as soon as
+		// the HTTP handler returns. The enqueue must survive that cancellation
+		// so the queued item is durably persisted; otherwise a client disconnect
+		// or timeout between the 202 response and the INSERT silently loses the
+		// request (fail-open). Use context.WithoutCancel to preserve trace values
+		// and attach a bounded timeout so a hung queue INSERT does not leak.
+		enqueueCtx, enqueueCancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer enqueueCancel()
+		if qid, depth, qerr := h.enqueueA2A(
+			enqueueCtx, workspaceID, callerID, PriorityTask, body, a2aMethod, idempotencyKey, expiresAt,
 		); qerr == nil {
 			log.Printf("ProxyA2A: target %s busy — enqueued as %s (depth=%d)", workspaceID, qid, depth)
 			if logActivity {

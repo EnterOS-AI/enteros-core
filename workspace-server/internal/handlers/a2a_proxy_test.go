@@ -2080,6 +2080,51 @@ func TestHandleA2ADispatchError_BusyEnqueueLogsQueuedNotFailure(t *testing.T) {
 	}
 }
 
+// TestHandleA2ADispatchError_BusyEnqueueDetachedContext is the regression guard
+// for #2930 part B. The busy-path enqueue must not run on the inbound request
+// context: that context is cancelled the moment the HTTP handler returns, and a
+// cancelled INSERT would silently drop the queued request. We pass an already-
+// cancelled context and verify that the function passed to enqueueA2A is
+// detached (no cancellation, bounded deadline).
+func TestHandleA2ADispatchError_BusyEnqueueDetachedContext(t *testing.T) {
+	setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
+	waitForHandlerAsyncBeforeDBCleanup(t, handler)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel before the call so a non-detached enqueue would see ctx.Err() != nil
+
+	var gotCtx context.Context
+	handler.enqueueA2A = func(ctx context.Context, workspaceID, callerID string, priority int, body []byte, method, idempotencyKey string, expiresAt *time.Time) (string, int, error) {
+		gotCtx = ctx
+		if ctx.Err() != nil {
+			t.Errorf("enqueueA2A called with a cancelled context: %v", ctx.Err())
+		}
+		if _, ok := ctx.Deadline(); !ok {
+			t.Error("expected enqueue context to carry a bounded deadline")
+		}
+		return "11111111-1111-1111-1111-111111111111", 1, nil
+	}
+
+	status, body, perr := handler.handleA2ADispatchError(
+		ctx, "ws-detached", "", []byte("{}"), "message/send",
+		context.DeadlineExceeded, 180002, false,
+	)
+	if perr != nil {
+		t.Fatalf("expected busy enqueue success, got proxy error: %+v", perr)
+	}
+	if status != http.StatusAccepted {
+		t.Fatalf("got status %d, want 202", status)
+	}
+	if !bytes.Contains(body, []byte(`"queued":true`)) {
+		t.Fatalf("expected queued response body, got %s", string(body))
+	}
+	if gotCtx == nil {
+		t.Fatal("enqueueA2A was not called")
+	}
+}
+
 func TestHandleA2ADispatchError_BuildError(t *testing.T) {
 	setupTestDB(t)
 	setupTestRedis(t)
