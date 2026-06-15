@@ -692,6 +692,7 @@ def test_signal_7_refactor_label_exempts_block(monkeypatch):
     monkeypatch.setattr(mod, "_pr_diff_stats", lambda *a, **kw: {
         "files_changed": 481, "added_lines": 1000, "deleted_lines": 55800, "net_deleted_lines": 54800,
     })
+    monkeypatch.setattr(mod, "_label_appliers", lambda *a, **kw: {"refactor": {"core-lead"}})
     result = mod.signal_7_destructive_diff_guard(
         200, "molecule-ai/molecule-core",
         pr_data={"labels": [{"name": "refactor"}, {"name": "needs_review"}]},
@@ -710,6 +711,7 @@ def test_signal_7_migration_label_exempts_block(monkeypatch):
     monkeypatch.setattr(mod, "_pr_diff_stats", lambda *a, **kw: {
         "files_changed": 300, "added_lines": 100, "deleted_lines": 8000, "net_deleted_lines": 7900,
     })
+    monkeypatch.setattr(mod, "_label_appliers", lambda *a, **kw: {"migration": {"core-lead"}})
     result = mod.signal_7_destructive_diff_guard(
         200, "molecule-ai/molecule-core",
         pr_data={"labels": [{"name": "migration"}]},
@@ -728,6 +730,7 @@ def test_signal_7_generated_label_exempts_block(monkeypatch):
     monkeypatch.setattr(mod, "_pr_diff_stats", lambda *a, **kw: {
         "files_changed": 250, "added_lines": 50, "deleted_lines": 100, "net_deleted_lines": 50,
     })
+    monkeypatch.setattr(mod, "_label_appliers", lambda *a, **kw: {"generated": {"core-lead"}})
     result = mod.signal_7_destructive_diff_guard(
         200, "molecule-ai/molecule-core",
         pr_data={"labels": [{"name": "generated"}]},
@@ -745,6 +748,7 @@ def test_signal_7_vendor_label_exempts_block(monkeypatch):
     monkeypatch.setattr(mod, "_pr_diff_stats", lambda *a, **kw: {
         "files_changed": 300, "added_lines": 10, "deleted_lines": 20000, "net_deleted_lines": 19990,
     })
+    monkeypatch.setattr(mod, "_label_appliers", lambda *a, **kw: {"vendor": {"core-lead"}})
     result = mod.signal_7_destructive_diff_guard(
         200, "molecule-ai/molecule-core",
         pr_data={"labels": [{"name": "vendor"}]},
@@ -762,12 +766,65 @@ def test_signal_7_case_insensitive_label_match(monkeypatch):
     monkeypatch.setattr(mod, "_pr_diff_stats", lambda *a, **kw: {
         "files_changed": 481, "added_lines": 1000, "deleted_lines": 55800, "net_deleted_lines": 54800,
     })
+    monkeypatch.setattr(mod, "_label_appliers", lambda *a, **kw: {"refactor": {"core-lead"}})
     result = mod.signal_7_destructive_diff_guard(
         200, "molecule-ai/molecule-core",
         pr_data={"labels": [{"name": "Refactor"}]},
     )
     assert result["verdict"] == "WARNING"
     assert result["refactor_exemption"] is True
+
+
+def test_signal_7_author_self_applied_refactor_label_does_not_exempt(monkeypatch):
+    """core#2884: an author who can write labels must not be able to
+    self-apply 'refactor' and downgrade their own destructive diff
+    from BLOCK to WARN."""
+    mod = load_gate_check()
+    monkeypatch.setattr(mod, "signal_4_branch_divergence", lambda *a, **kw: {
+        "signal": "branch_divergence", "verdict": "WARNING",
+        "diverged": True, "commits_behind": 25, "pr_files_count": 250,
+        "inherited_files": [], "new_work_files": [], "inherited_fraction": 0.5,
+    })
+    monkeypatch.setattr(mod, "_pr_diff_stats", lambda *a, **kw: {
+        "files_changed": 481, "added_lines": 1000, "deleted_lines": 55800, "net_deleted_lines": 54800,
+    })
+    # Author applied the exempt label themselves — must NOT be honored.
+    monkeypatch.setattr(mod, "_label_appliers", lambda *a, **kw: {"refactor": {"agent-dev-a"}})
+    result = mod.signal_7_destructive_diff_guard(
+        200, "molecule-ai/molecule-core",
+        pr_data={
+            "user": {"login": "agent-dev-a"},
+            "labels": [{"name": "refactor"}],
+        },
+    )
+    assert result["verdict"] == "BLOCKED"
+    assert result["refactor_exemption"] is False
+    assert "destructive diff" in result["reason"]
+
+
+def test_signal_7_refactor_exemption_rejected_when_timeline_unavailable(monkeypatch):
+    """If the timeline API cannot prove a non-author applied the label,
+    fail closed and do not honor the exemption."""
+    mod = load_gate_check()
+    monkeypatch.setattr(mod, "signal_4_branch_divergence", lambda *a, **kw: {
+        "signal": "branch_divergence", "verdict": "WARNING",
+        "diverged": True, "commits_behind": 25, "pr_files_count": 250,
+        "inherited_files": [], "new_work_files": [], "inherited_fraction": 0.5,
+    })
+    monkeypatch.setattr(mod, "_pr_diff_stats", lambda *a, **kw: {
+        "files_changed": 481, "added_lines": 1000, "deleted_lines": 55800, "net_deleted_lines": 54800,
+    })
+    # Timeline API returned nothing / errored — no proof of non-author applier.
+    monkeypatch.setattr(mod, "_label_appliers", lambda *a, **kw: {})
+    result = mod.signal_7_destructive_diff_guard(
+        200, "molecule-ai/molecule-core",
+        pr_data={
+            "user": {"login": "agent-dev-a"},
+            "labels": [{"name": "refactor"}],
+        },
+    )
+    assert result["verdict"] == "BLOCKED"
+    assert result["refactor_exemption"] is False
 
 
 def test_signal_7_files_api_error_returns_warning(monkeypatch):
@@ -816,6 +873,7 @@ def test_signal_7_refactor_exempt_with_still_high_diff_surfaces_numbers(monkeypa
     monkeypatch.setattr(mod, "_pr_diff_stats", lambda *a, **kw: {
         "files_changed": 481, "added_lines": 1000, "deleted_lines": 55800, "net_deleted_lines": 54800,
     })
+    monkeypatch.setattr(mod, "_label_appliers", lambda *a, **kw: {"refactor": {"core-lead"}})
     result = mod.signal_7_destructive_diff_guard(
         200, "molecule-ai/molecule-core",
         pr_data={"labels": [{"name": "refactor"}]},
