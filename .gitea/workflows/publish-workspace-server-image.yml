@@ -324,6 +324,10 @@ jobs:
     name: Staging auto-deploy
     needs: build-and-push
     if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    # Serialize staging fleet redeploys so two rapid main pushes don't both hit
+    # /cp/admin/tenants/redeploy-fleet concurrently (CR2 12046).
+    concurrency:
+      group: staging-fleet-deploy
     # A failed staging redeploy must fail the run so it is visible.
     continue-on-error: false
     # Publish/release lane (mc#2942) — same reserved capacity as prod.
