@@ -203,6 +203,18 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		// fighting the migration into a split-brain. Pure record repoint (no
 		// deprovision); the CP migrator calls it once the cutover is verified.
 		wsAdmin.POST("/admin/workspaces/:id/set-compute-instance", wh.SetComputeInstance)
+		// Admin-triggered restart of a workspace — the partner of the
+		// user-facing POST /workspaces/:id/restart (which uses the
+		// workspace's own bearer). The CP migrator calls this after a
+		// cross-cloud migration cutover to re-inject LLM creds via the
+		// loadWorkspaceSecrets path (today's 2026-06-15 fleet-credential
+		// incident root-cause durable fix — see PRs #824 (CP) and this
+		// one (tenant partner)). The handler fires wh.RestartByID async
+		// and returns 202 Accepted immediately; the actual restart
+		// happens in the background and the migrator's strengthened
+		// health check (assertCompletionServes in CP#824) verifies the
+		// cred re-injection landed.
+		wsAdmin.POST("/admin/workspaces/:id/restart", wh.AdminRestart)
 		// Per-workspace LLM billing mode override (internal#691). Used by
 		// CP's /cp/admin/workspaces/:id/llm-billing-mode proxy + (via that
 		// proxy) by the canvas Config-tab "LLM Billing" section. Default-
