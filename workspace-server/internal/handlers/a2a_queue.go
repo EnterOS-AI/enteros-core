@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"sync"
 	"time"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
@@ -80,6 +81,15 @@ const (
 	PriorityCritical = 100
 	PriorityTask     = 50
 	PriorityInfo     = 10
+)
+
+// A2A queue sweeper constants (#2930). The sweeper is an independent periodic
+// drain fallback so that queued requests are not stranded when a workspace
+// stops heartbeating (e.g., after the restart-trigger in #2929).
+const (
+	a2aQueueSweeperInterval    = 10 * time.Second
+	a2aQueueSweeperBatchCap    = 8
+	a2aQueueSweeperStatusAlert = 10 // log a warning every N stranded items
 )
 
 // QueuedItem is what the heartbeat drain path pulls off the queue.
@@ -348,73 +358,79 @@ func DropStaleQueueItems(ctx context.Context, workspaceID string, maxAgeMinutes 
 	return int(rows), nil
 }
 
-// DrainQueueForWorkspace pulls one queued item and dispatches it via the
-// same ProxyA2ARequest path a live caller would use. Idempotent and
-// concurrency-safe — multiple concurrent calls for the same workspace are
+// DrainQueueForWorkspace pulls queued items (up to `capacity`) and dispatches
+// each via the same ProxyA2ARequest path a live caller would use. Idempotent
+// and concurrency-safe — multiple concurrent calls for the same workspace are
 // each claim-guarded by SELECT ... FOR UPDATE SKIP LOCKED in DequeueNext.
 //
 // Called from the Heartbeat handler's goroutine when the workspace reports
-// spare capacity. Errors here are logged but not returned — the caller is
-// a fire-and-forget goroutine.
-func (h *WorkspaceHandler) DrainQueueForWorkspace(ctx context.Context, workspaceID string) {
-	item, err := DequeueNext(ctx, workspaceID)
-	if err != nil {
-		log.Printf("A2AQueue drain: dequeue failed for %s: %v", workspaceID, err)
+// spare capacity, and from the periodic A2A queue sweeper as a fallback when
+// heartbeats stop (#2930). Errors here are logged but not returned — callers
+// are fire-and-forget goroutines.
+func (h *WorkspaceHandler) DrainQueueForWorkspace(ctx context.Context, workspaceID string, capacity int) {
+	if capacity <= 0 {
 		return
 	}
-	if item == nil {
-		return // queue empty, no work
-	}
-
-	callerID := ""
-	if item.CallerID.Valid {
-		callerID = item.CallerID.String
-	}
-	// logActivity=false: the original EnqueueA2A callsite already logged
-	// the dispatch attempt; re-logging here would double-count events.
-	status, respBody, proxyErr := h.proxyA2ARequest(ctx, workspaceID, item.Body, callerID, false, false)
-
-	// 202 Accepted = the dispatch was itself queued again (target still busy).
-	// That's not a failure — the queued item just stays queued naturally on
-	// the next drain tick. Mark this attempt completed so we don't double-
-	// count attempts; the new (re-)queue row already exists.
-	if status == http.StatusAccepted {
-		MarkQueueItemCompleted(ctx, item.ID, nil)
-		log.Printf("A2AQueue drain: %s re-queued (target still busy)", item.ID)
-		return
-	}
-
-	if proxyErr != nil {
-		// Defensive: proxyErr.Response is gin.H (map[string]interface{}). The
-		// "error" key is conventionally a string but can be missing or non-
-		// string in edge paths (e.g. a future error builder using a typed
-		// struct). Cast safely so a missing key doesn't crash the platform —
-		// today's outage was caused by an unchecked .(string) here.
-		errMsg, _ := proxyErr.Response["error"].(string)
-		if errMsg == "" {
-			errMsg = http.StatusText(proxyErr.Status)
-			if errMsg == "" {
-				errMsg = "unknown drain dispatch error"
-			}
+	for i := 0; i < capacity; i++ {
+		item, err := DequeueNext(ctx, workspaceID)
+		if err != nil {
+			log.Printf("A2AQueue drain: dequeue failed for %s: %v", workspaceID, err)
+			return
 		}
-		MarkQueueItemFailed(ctx, item.ID, errMsg)
-		log.Printf("A2AQueue drain: dispatch for %s failed (attempt=%d): %s",
-			item.ID, item.Attempts, errMsg)
-		return
-	}
-	MarkQueueItemCompleted(ctx, item.ID, respBody)
-	log.Printf("A2AQueue drain: dispatched %s to workspace %s (attempt=%d)",
-		item.ID, workspaceID, item.Attempts)
+		if item == nil {
+			return // queue empty, no work
+		}
 
-	// Stitch the response back to the originating delegation row, if this
-	// queue item was a delegation. Without this, check_task_status would
-	// see status='queued' (set by the executeDelegation queued-branch) and
-	// the LLM would think the work was never done. We embed delegation_id
-	// in params.message.metadata at Delegate-handler time; pull it out
-	// here and UPDATE the delegate_result row so the original caller can
-	// observe the real reply.
-	if delegationID := extractDelegationIDFromBody(item.Body); delegationID != "" {
-		h.stitchDrainResponseToDelegation(ctx, callerID, item.WorkspaceID, delegationID, respBody)
+		callerID := ""
+		if item.CallerID.Valid {
+			callerID = item.CallerID.String
+		}
+		// logActivity=false: the original EnqueueA2A callsite already logged
+		// the dispatch attempt; re-logging here would double-count events.
+		status, respBody, proxyErr := h.proxyA2ARequest(ctx, workspaceID, item.Body, callerID, false, false)
+
+		// 202 Accepted = the dispatch was itself queued again (target still busy).
+		// That's not a failure — the queued item just stays queued naturally on
+		// the next drain tick. Mark this attempt completed so we don't double-
+		// count attempts; the new (re-)queue row already exists.
+		if status == http.StatusAccepted {
+			MarkQueueItemCompleted(ctx, item.ID, nil)
+			log.Printf("A2AQueue drain: %s re-queued (target still busy)", item.ID)
+			continue
+		}
+
+		if proxyErr != nil {
+			// Defensive: proxyErr.Response is gin.H (map[string]interface{}). The
+			// "error" key is conventionally a string but can be missing or non-
+			// string in edge paths (e.g. a future error builder using a typed
+			// struct). Cast safely so a missing key doesn't crash the platform —
+			// today's outage was caused by an unchecked .(string) here.
+			errMsg, _ := proxyErr.Response["error"].(string)
+			if errMsg == "" {
+				errMsg = http.StatusText(proxyErr.Status)
+				if errMsg == "" {
+					errMsg = "unknown drain dispatch error"
+				}
+			}
+			MarkQueueItemFailed(ctx, item.ID, errMsg)
+			log.Printf("A2AQueue drain: dispatch for %s failed (attempt=%d): %s",
+				item.ID, item.Attempts, errMsg)
+			continue
+		}
+		MarkQueueItemCompleted(ctx, item.ID, respBody)
+		log.Printf("A2AQueue drain: dispatched %s to workspace %s (attempt=%d)",
+			item.ID, workspaceID, item.Attempts)
+
+		// Stitch the response back to the originating delegation row, if this
+		// queue item was a delegation. Without this, check_task_status would
+		// see status='queued' (set by the executeDelegation queued-branch) and
+		// the LLM would think the work was never done. We embed delegation_id
+		// in params.message.metadata at Delegate-handler time; pull it out
+		// here and UPDATE the delegate_result row so the original caller can
+		// observe the real reply.
+		if delegationID := extractDelegationIDFromBody(item.Body); delegationID != "" {
+			h.stitchDrainResponseToDelegation(ctx, callerID, item.WorkspaceID, delegationID, respBody)
+		}
 	}
 }
 
@@ -499,4 +515,104 @@ func (h *WorkspaceHandler) stitchDrainResponseToDelegation(ctx context.Context, 
 			"via":              "queue_drain",
 		})
 	}
+}
+
+// StartA2AQueueSweeper starts the independent periodic drain fallback required
+// by #2930. It is intentionally decoupled from the target workspace's heartbeat:
+// if a workspace stops heartbeating (offline, flapping, restart wedge), queued
+// requests would otherwise sit until TTL and then be silently dropped.
+//
+// The sweeper runs on a fixed interval, scans for workspaces with pending
+// non-expired queue rows and status 'online' or 'degraded', and drains up to
+// max_concurrent_tasks items per workspace per tick. Drain dispatches are run
+// via globalGoAsync so they are detached from the caller and use the same
+// ProxyA2ARequest path as heartbeat-driven drains.
+func (h *WorkspaceHandler) StartA2AQueueSweeper(ctx context.Context) {
+	if !h.HasProvisioner() {
+		// No provisioner means there is no local runtime to drain to (external/
+		// mock-only deployment). Skip the sweeper rather than spin no-ops.
+		return
+	}
+	log.Println("A2AQueue sweeper: starting independent periodic drain fallback")
+	go func() {
+		ticker := time.NewTicker(a2aQueueSweeperInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				log.Println("A2AQueue sweeper: shutting down")
+				return
+			case <-ticker.C:
+				h.sweepA2AQueue(ctx)
+			}
+		}
+	}()
+}
+
+// sweepA2AQueue finds online/degraded workspaces with pending queued items and
+// drains each in a detached goroutine.
+func (h *WorkspaceHandler) sweepA2AQueue(ctx context.Context) {
+	rows, err := db.DB.QueryContext(ctx, `
+		SELECT q.workspace_id, COALESCE(w.max_concurrent_tasks, 1) AS capacity
+		FROM a2a_queue q
+		JOIN workspaces w ON w.id = q.workspace_id
+		WHERE q.status = 'queued'
+		  AND (q.expires_at IS NULL OR q.expires_at > now())
+		  AND w.status IN ('online', 'degraded')
+		GROUP BY q.workspace_id, w.max_concurrent_tasks
+	`)
+	if err != nil {
+		log.Printf("A2AQueue sweeper: scan failed: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	var wg sync.WaitGroup
+	for rows.Next() {
+		var workspaceID string
+		var capacity int
+		if err := rows.Scan(&workspaceID, &capacity); err != nil {
+			log.Printf("A2AQueue sweeper: scan row failed: %v", err)
+			continue
+		}
+		if capacity > a2aQueueSweeperBatchCap {
+			capacity = a2aQueueSweeperBatchCap
+		}
+		if capacity <= 0 {
+			continue
+		}
+		// Bound per-tick work: the heartbeat path already drains up to
+		// (max_concurrent - active_tasks) on every beat. The sweeper is a
+		// safety net, not a throughput pump.
+		wg.Add(1)
+		globalGoAsync(func(ws string, cap int) func() {
+			return func() {
+				defer wg.Done()
+				h.DrainQueueForWorkspace(ctx, ws, cap)
+			}
+		}(workspaceID, capacity))
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("A2AQueue sweeper: row iteration failed: %v", err)
+	}
+	// Wait for this tick's drains before returning so shutdown is clean.
+	wg.Wait()
+}
+
+// CountStrandedQueueItems returns the number of queued items for workspaces
+// that are not online/degraded (e.g., offline or provisioning). Used for
+// alerting/metrics rather than silently dropping at TTL.
+func CountStrandedQueueItems(ctx context.Context) (int, error) {
+	var count int
+	err := db.DB.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM a2a_queue q
+		JOIN workspaces w ON w.id = q.workspace_id
+		WHERE q.status = 'queued'
+		  AND (q.expires_at IS NULL OR q.expires_at > now())
+		  AND w.status NOT IN ('online', 'degraded')
+	`).Scan(&count)
+	if err != nil {
+		return 0, err
+	}
+	return count, nil
 }

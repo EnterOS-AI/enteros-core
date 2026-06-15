@@ -275,6 +275,10 @@ func main() {
 		wh.SetCPProvisioner(cpProv)
 	}
 
+	// #2930: independent A2A queue sweeper so queued requests drain even when a
+	// workspace stops heartbeating (e.g., after a transient restart trigger).
+	go wh.StartA2AQueueSweeper(ctx)
+
 	// PR-B (RFC #2843 #24): wire the Gitea TemplateAssetFetcher.
 	// nil-if-empty + WARN: if the token isn't set, log a warning
 	// and stay in the "no fetcher wired" state. The SCAFFOLD gate
