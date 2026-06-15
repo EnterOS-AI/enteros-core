@@ -248,6 +248,30 @@ func (h *WorkspaceHandler) Update(c *gin.Context) {
 	}
 	needsRestart := false
 	if runtime, ok := body["runtime"]; ok {
+		// (runtime, model) compatibility validation (the new field a PATCH can
+		// change). model is NOT patchable per the body whitelist above, so the
+		// post-PATCH model is the workspace's CURRENT model — fetched here
+		// rather than re-parsed from the body. The (newRuntime, currentModel)
+		// pair is what the boot path will try to resolve; an unroutable pair
+		// is rejected at the API boundary instead of wedging the agent at
+		// boot. validateRegisteredModelForRuntime is the same SSOT the
+		// create-boundary uses (workspace_crud.go create + llm_billing_mode
+		// resolver); mirroring it here keeps the PATCH-runtime path consistent
+		// and catches the drift surface CR2 found on the #21 review.
+		var currentModel sql.NullString
+		if err := db.DB.QueryRowContext(ctx,
+			`SELECT COALESCE(model, '') FROM workspaces WHERE id = $1`, id,
+		).Scan(&currentModel); err != nil {
+			log.Printf("Update runtime validation: read current model for %s: %v", id, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read current model for runtime compatibility check"})
+			return
+		}
+		if ok, reason := validateRegisteredModelForRuntime(runtime.(string), currentModel.String); !ok {
+			log.Printf("Update: PATCH runtime=%q on %s REJECTED (model=%q is not registered for that runtime): %s",
+				runtime.(string), id, currentModel.String, reason)
+			c.JSON(http.StatusBadRequest, gin.H{"error": reason})
+			return
+		}
 		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET runtime = $2, updated_at = now() WHERE id = $1`, id, runtime); err != nil {
 			log.Printf("Update runtime error for %s: %v", id, err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save runtime"})
