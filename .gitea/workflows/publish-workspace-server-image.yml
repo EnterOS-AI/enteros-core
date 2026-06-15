@@ -83,7 +83,7 @@ env:
 
 jobs:
   build-and-push:
-    # Dedicated publish/release lane (internal#462 / #394 / #399). This
+    # Dedicated publish/release lane (mc#2942 / #394 / #399). This
     # is a post-merge ship job (on: push:main) — it must NOT FIFO-compete
     # with PR required-CI on the shared pool (PR#1350's prod image build
     # was delayed ~25min this way). The `publish` label resolves ONLY to
@@ -324,9 +324,9 @@ jobs:
     name: Staging auto-deploy
     needs: build-and-push
     if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-    # Side-effect deploy; image publish success is the durable artifact.
-    continue-on-error: true
-    # Publish/release lane (internal#462) — same reserved capacity as prod.
+    # A failed staging redeploy must fail the run so it is visible.
+    continue-on-error: false
+    # Publish/release lane (mc#2942) — same reserved capacity as prod.
     runs-on: publish
     timeout-minutes: 25
     env:
@@ -361,7 +361,6 @@ jobs:
               confirm: true
             }')
           echo "POST $CP_URL/cp/admin/tenants/redeploy-fleet"
-          echo "  body: $BODY"
           HTTP_RESPONSE=$(mktemp)
           HTTP_CODE_FILE=$(mktemp)
           # Route -w into its own tempfile so curl's exit code (e.g. 56 on
@@ -377,19 +376,22 @@ jobs:
           set -e
           HTTP_CODE=$(cat "$HTTP_CODE_FILE" 2>/dev/null || echo "000")
           [ -z "$HTTP_CODE" ] && HTTP_CODE="000"
-          echo "HTTP $HTTP_CODE"
-          cat "$HTTP_RESPONSE" | jq . || cat "$HTTP_RESPONSE"
+          OK=$(jq -r '.ok // "false"' "$HTTP_RESPONSE")
+          TOTAL=$(jq -r '(.results | length) // 0' "$HTTP_RESPONSE")
+          HEALTHY=$(jq -r '[.results[]? | select(.healthz_ok == true)] | length' "$HTTP_RESPONSE")
+          echo "HTTP $HTTP_CODE ok=$OK total=$TOTAL healthy=$HEALTHY"
           {
             echo "## Staging tenant redeploy fleet"
             echo ""
             echo "**Target tag:** \`staging-latest\`"
             echo "**HTTP:** $HTTP_CODE"
+            echo "**ok:** $OK  **total:** $TOTAL  **healthy:** $HEALTHY"
             echo ""
             echo "### Per-tenant result"
             echo ""
-            echo '| Slug | Phase | SSM Status | Exit | Healthz | Error |'
-            echo '|------|-------|------------|------|---------|-------|'
-            jq -r '.results[]? | "| \(.slug) | \(.phase) | \(.ssm_status // "-") | \(.ssm_exit_code) | \(.healthz_ok) | \(.error // "-") |"' "$HTTP_RESPONSE" || true
+            echo '| Slug | Phase | SSM Status | Exit | Healthz |'
+            echo '|------|-------|------------|------|---------|'
+            jq -r '.results[]? | "| \(.slug) | \(.phase) | \(.ssm_status // "-") | \(.ssm_exit_code) | \(.healthz_ok) |"' "$HTTP_RESPONSE" || true
           } >> "$GITHUB_STEP_SUMMARY"
           OK=$(jq -r '.ok // "false"' "$HTTP_RESPONSE")
           if [ "$HTTP_CODE" != "200" ] || [ "$OK" != "true" ]; then
@@ -463,7 +465,7 @@ jobs:
     if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
     # Side-effect deploy only; image publish success is the durable artifact. mc#2654
     continue-on-error: true
-    # Publish/release lane (internal#462) — production deploy of a merged
+    # Publish/release lane (mc#2942) — production deploy of a merged
     # fix; reserved capacity, never queued behind PR-CI.
     runs-on: publish
     timeout-minutes: 90
