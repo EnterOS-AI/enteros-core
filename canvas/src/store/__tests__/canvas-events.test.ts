@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { handleCanvasEvent, resetProvisioningSequence } from "../canvas-events";
+import { handleCanvasEvent, resetProvisioningSequence, __pendingOnlineSizeForTest } from "../canvas-events";
 import type { WSMessage } from "../socket";
 import type { WorkspaceNodeData } from "../canvas";
 import type { Node, Edge } from "@xyflow/react";
@@ -96,6 +96,15 @@ describe("handleCanvasEvent – WORKSPACE_ONLINE", () => {
 
     const updated = (set.mock.calls[0][0] as { nodes: Node<WorkspaceNodeData>[] }).nodes;
     expect(updated.find((n) => n.id === "ws-2")!.data.status).toBe("offline");
+  });
+
+  it("caps the unknown-workspace buffer so a dropped PROVISIONING cannot grow it forever", () => {
+    resetProvisioningSequence();
+    const { get, set } = makeStore([]);
+    for (let i = 0; i < 1100; i++) {
+      handleCanvasEvent(makeMsg({ event: "WORKSPACE_ONLINE", workspace_id: `ws-${i}` }), get, set);
+    }
+    expect(__pendingOnlineSizeForTest()).toBe(1000);
   });
 });
 
