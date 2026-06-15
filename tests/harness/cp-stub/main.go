@@ -8,9 +8,9 @@
 // activates, and tests exercise the real tenant→CP wire.
 //
 // This is NOT a CP reimplementation. It serves the minimum surface to:
-//   1. Boot the tenant image without /cp/* breaking the canvas bootstrap.
-//   2. Replay specific bug classes (e.g. /cp/* returns 404, returns 5xx,
-//      returns malformed JSON) by toggling env vars.
+//  1. Boot the tenant image without /cp/* breaking the canvas bootstrap.
+//  2. Replay specific bug classes (e.g. /cp/* returns 404, returns 5xx,
+//     returns malformed JSON) by toggling env vars.
 //
 // Scope is bounded by what the tenant + canvas actually call. Add new
 // handlers as new replay scenarios demand them. Drift from real CP is
@@ -21,6 +21,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -32,6 +33,18 @@ import (
 // was invoked. Replay scripts assert > 0 to confirm the workflow's redeploy
 // step actually reached the stub (catches misrouted CP_URL configs).
 var redeployFleetCalls atomic.Int64
+
+// provisionCalls tracks how many times /cp/workspaces/provision was
+// invoked. Phase 1 of the #2863 burn-down: a green-counter for the
+// cp-stub-provision-config replay that proves the harness provision
+// call actually reached the stub (and didn't fly past to real prod CP
+// via the env-var mismatch on CP_UPSTREAM_URL vs CP_PROVISION_URL).
+var provisionCalls atomic.Int64
+
+// tenantsConfigCalls tracks how many times /cp/tenants/config was
+// invoked. Companion counter for the same Phase 1 burn-down — proves
+// the harness config-fetch also reached the stub.
+var tenantsConfigCalls atomic.Int64
 
 func main() {
 	mux := http.NewServeMux()
@@ -121,11 +134,116 @@ func main() {
 		})
 	})
 
+	// /cp/workspaces/provision — Phase 1 of the #2863 burn-down. The
+	// real CP returns 201 + a provision-response shape that the tenant
+	// Go code (workspace-server's CPProvisioner.Start in
+	// internal/provisioner/cp_provisioner.go:339-363) treats as
+	// success. That client (the cpProvisionResponse struct) reads
+	// exactly two fields on success: instance_id + state. The
+	// cp-stub mirrors that contract — 201 + those two fields — so
+	// the harness-tenant Go code (which uses the REAL
+	// CPProvisioner client) treats the response as a successful
+	// provision. Anything else and the client falls into its
+	// failure branch with `provision failed (200): <unstructured
+	// body>` (the exact failure mode the CR2 review_id 11928
+	// flagged on the prior head 30a6bea: 200 instead of 201, no
+	// instance_id/state fields, → guaranteed fail-branch).
+	//
+	// cp-stub is permissive on input (no auth header check, empty
+	// body OK, no payload-field validation) — the call's purpose is
+	// to PROVE the request reached the stub + the env-var redirect
+	// is wired. Field validation lives in the real CP in production.
+	mux.HandleFunc("/cp/workspaces/provision", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, 405, map[string]any{
+				"error": "cp-stub: /cp/workspaces/provision only accepts POST",
+			})
+			return
+		}
+		provisionCalls.Add(1)
+		// Parse body for shape (default to harness-ws if empty)
+		wsID := "harness-ws"
+		if r.Body != nil {
+			body, _ := io.ReadAll(r.Body)
+			var payload map[string]any
+			if json.Unmarshal(body, &payload) == nil {
+				if v, ok := payload["workspace_id"].(string); ok && v != "" {
+					wsID = v
+				}
+			}
+		}
+		// Stub instance id + state — matches the real CP's success-path
+		// contract. EC2 instance ids start with "i-" (the real CP
+		// generates them via EC2 RunInstances; the stub is a stand-in,
+		// but the prefix keeps any future real-CP log-reader from
+		// false-flagging the stub response as malformed). "running"
+		// matches the prod happy path; the harness doesn't await
+		// any state transition.
+		instanceID := "i-stub-" + wsID
+		state := "running"
+		log.Printf("cp-stub: /cp/workspaces/provision called (count=%d) -> %s (instance_id=%s, state=%s)", provisionCalls.Load(), wsID, instanceID, state)
+		writeJSON(w, 201, map[string]any{
+			// Fields the tenant Go code reads (cpProvisionResponse
+			// struct in internal/provisioner/cp_provisioner.go:210-215):
+			// instance_id (string) + state (string). Mandatory.
+			"instance_id": instanceID,
+			"state":       state,
+			// Observability fields — the real CP returns these too
+			// (the real CPProvisioner.client ignores them, but they
+			// appear in the wire log + in any future tool that
+			// inspects the response). Mirror the prior head's
+			// payload shape for minimum drift from the 30a6bea
+			// contract.
+			"workspace_id": wsID,
+			"url":          "http://cp-stub:9090/cp/workspaces/" + wsID,
+		})
+	})
+
+	// /cp/tenants/config — companion handler for Phase 1 of the #2863
+	// burn-down. Mirrors the real CP's tenant-config response shape
+	// (cp_config.go:47-63 in molecule-core): returns the runtime
+	// registry, LLM endpoints, and feature flags a tenant needs to
+	// bootstrap. The stub returns a minimal but valid config — enough
+	// for the harness tenant to complete its boot sequence without
+	// falling through to a real CP call.
+	mux.HandleFunc("/cp/tenants/config", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeJSON(w, 405, map[string]any{
+				"error": "cp-stub: /cp/tenants/config only accepts GET",
+			})
+			return
+		}
+		tenantsConfigCalls.Add(1)
+		log.Printf("cp-stub: /cp/tenants/config called (count=%d)", tenantsConfigCalls.Load())
+		writeJSON(w, 200, map[string]any{
+			"tenant_id": "harness-tenant",
+			"runtimes": []string{
+				"claude-code",
+				"hermes",
+				"openclaw",
+				"codex",
+				"google-adk",
+				"seo-agent",
+			},
+			"llm_endpoints": map[string]string{
+				"openai":    "http://cp-stub:9090/llm/openai/v1",
+				"anthropic": "http://cp-stub:9090/llm/anthropic/v1",
+			},
+			"feature_flags": map[string]bool{
+				"canvas_async_dispatch":   true,
+				"runtime_provision_smoke": true,
+				"secrets_encryption_key":  true,
+			},
+		})
+	})
+
 	// __stub/state — expose stub state (counters) so replay scripts can
 	// assert the tenant actually reached us. Read-only.
 	mux.HandleFunc("/__stub/state", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{
 			"redeploy_fleet_calls": redeployFleetCalls.Load(),
+			"provision_calls":      provisionCalls.Load(),
+			"tenants_config_calls": tenantsConfigCalls.Load(),
 		})
 	})
 
