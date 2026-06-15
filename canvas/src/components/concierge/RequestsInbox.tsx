@@ -1,6 +1,8 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { api } from "@/lib/api";
 import { fetchSession } from "@/lib/auth";
 import { showToast } from "@/components/Toaster";
@@ -331,7 +333,7 @@ function RequestItem({
               <span data-testid="request-status">{badge}</span>
               {" · asked "}{clockTime(row.created_at)}
             </div>
-            {row.detail && <div className={s.apprS} style={{ marginTop: 4 }}>{row.detail}</div>}
+            {row.detail && <RequestBody body={row.detail} />}
             {resolvedBy && <div className={s.apprS} style={{ marginTop: 4 }}>{resolvedBy}</div>}
           </div>
         </div>
@@ -355,9 +357,7 @@ function RequestItem({
             {" · asked "}{clockTime(row.created_at)}
           </div>
           {row.detail && (
-            <div style={{ fontSize: 12, color: "var(--tx-3)", marginTop: 6, lineHeight: 1.45 }}>
-              {row.detail}
-            </div>
+            <RequestBody body={row.detail} />
           )}
           {resolvedBy && (
             <div style={{ fontSize: 12, color: "var(--tx-3)", marginTop: 6 }}>{resolvedBy}</div>
@@ -367,6 +367,59 @@ function RequestItem({
       {actions}
       {threadOpen && (
         <MoreInfoThread requestId={row.id} responderId={responderId} />
+      )}
+    </div>
+  );
+}
+
+/** Approximate characters that fit in one line inside the 296 px sidebar card. */
+const BODY_CHARS_PER_LINE = 48;
+const BODY_MAX_LINES = 4;
+
+function bodyNeedsClamp(body: string): boolean {
+  const lines = body.split("\n").length;
+  return lines > BODY_MAX_LINES || body.length > BODY_CHARS_PER_LINE * BODY_MAX_LINES;
+}
+
+/** Open links from agent-authored markdown in a new tab so the canvas stays put. */
+function SafeLink({ href, children, ...rest }: React.AnchorHTMLAttributes<HTMLAnchorElement>) {
+  return (
+    <a href={href} target="_blank" rel="noopener noreferrer" {...rest}>
+      {children}
+    </a>
+  );
+}
+
+/** Shared markdown body for Task + Approval cards.
+ *
+ * - Renders markdown (bold, inline/fenced code, lists, headers, links) using the
+ *   same react-markdown + remark-gfm stack as chat messages.
+ * - HTML is escaped by default (no raw HTML / XSS).
+ * - Long bodies are clamped to ~4 lines with a Show more / Show less toggle.
+ */
+function RequestBody({ body }: { body: string | null | undefined }) {
+  const [expanded, setExpanded] = useState(false);
+  if (!body) return null;
+
+  const clamp = !expanded && bodyNeedsClamp(body);
+
+  return (
+    <div className={s.reqBodyWrap} data-testid="request-body">
+      <hr className={s.reqDivider} />
+      <div className={`${s.reqBody} ${clamp ? s.reqBodyClamped : ""}`}>
+        <ReactMarkdown remarkPlugins={[remarkGfm]} components={{ a: SafeLink }}>
+          {body}
+        </ReactMarkdown>
+      </div>
+      {bodyNeedsClamp(body) && (
+        <button
+          type="button"
+          className={s.reqShowMore}
+          onClick={() => setExpanded((v) => !v)}
+          aria-expanded={expanded}
+        >
+          {expanded ? "Show less" : "Show more"}
+        </button>
       )}
     </div>
   );

@@ -185,6 +185,56 @@ describe("RequestsInbox — More Info thread", () => {
   });
 });
 
+describe("RequestsInbox — card body markdown + truncation", () => {
+  it("renders markdown formatting instead of raw literals", async () => {
+    mockApiGet.mockResolvedValue([
+      { ...taskRow("t1"), detail: "**bold** and `code` and [link](https://example.com)" },
+    ]);
+    const { container } = await act(async () => render(<RequestsInbox kind="task" />));
+
+    expect(container.querySelector("strong")?.textContent).toBe("bold");
+    expect(container.querySelector("code")?.textContent).toBe("code");
+    const link = container.querySelector("a");
+    expect(link).toBeTruthy();
+    expect(link?.getAttribute("href")).toBe("https://example.com");
+    expect(link?.getAttribute("target")).toBe("_blank");
+    expect(screen.queryByText("\*\*bold\*\*")).toBeNull();
+  });
+
+  it("renders lists and fenced code blocks", async () => {
+    mockApiGet.mockResolvedValue([
+      {
+        ...taskRow("t1"),
+        detail: "- one\n- two\n\n```\nhello\n```",
+      },
+    ]);
+    const { container } = await act(async () => render(<RequestsInbox kind="task" />));
+
+    expect(container.querySelectorAll("li").length).toBe(2);
+    expect(container.querySelector("pre")?.textContent).toContain("hello");
+  });
+
+  it("shows a Show more / Show less toggle for long bodies", async () => {
+    const longDetail = "Line one.\nLine two.\nLine three.\nLine four.\nLine five.\nLine six.";
+    mockApiGet.mockResolvedValue([{ ...taskRow("t1"), detail: longDetail }]);
+    await act(async () => { render(<RequestsInbox kind="task" />); });
+
+    const toggle = screen.getByRole("button", { name: /show more/i });
+    expect(toggle).toBeTruthy();
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+
+    await act(async () => { fireEvent.click(toggle); });
+    expect(screen.getByRole("button", { name: /show less/i })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /show less/i }).getAttribute("aria-expanded")).toBe("true");
+  });
+
+  it("does not show a toggle for short bodies", async () => {
+    mockApiGet.mockResolvedValue([taskRow("t1")]);
+    await act(async () => { render(<RequestsInbox kind="task" />); });
+    expect(screen.queryByRole("button", { name: /show more/i })).toBeNull();
+  });
+});
+
 describe("RequestsInbox — tab-switch wrong-action race (core#2766)", () => {
   it("clears stale rows immediately on kind switch before the new fetch resolves", async () => {
     mockApiGet.mockResolvedValue([approvalRow("a1")]);
