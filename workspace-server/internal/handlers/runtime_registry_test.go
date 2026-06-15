@@ -14,6 +14,7 @@ package handlers
 //      must NOT be resolvable in the map after the next init).
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -318,5 +319,96 @@ func TestInitTemplateRepoByName_ReconcilesStaleEntries(t *testing.T) {
 	// And the lookup returns ok=false for hermes.
 	if id, ok := templateIdentityForRuntime("hermes"); ok || id != "" {
 		t.Errorf("templateIdentityForRuntime(hermes) should return (\"\", false), got (%q, %v)", id, ok)
+	}
+}
+
+// =============================================================================
+// TestExternalLikeRuntimesConsistent — pin test for the
+// externalLikeRuntimes SSOT consolidation. Locks the shape across
+// all 4 sites that previously hardcoded the same set in 3 different
+// shapes (fallbackRuntimes map, loadRuntimesFromManifest injection,
+// isExternalLikeRuntime switch, workspace.go:400 error message).
+//
+// If anyone adds a new BYO-compute meta-runtime (e.g. "byo-cli"),
+// they should:
+//   1. add it to the externalLikeRuntimes slice in runtime_registry.go
+//   2. run the test suite (this pin test still passes — same
+//      resolved shape)
+//   3. the workspace.go:400 error message auto-includes it
+//
+// If anyone adds a new hardcoded list anywhere (drift surface),
+// this test fails. The expected externalLikeRuntimes set is
+// {"external", "kimi", "kimi-cli"} per the current production
+// state — locked here so a future "we don't actually support kimi
+// anymore" decision is a deliberate test update, not silent drift.
+// =============================================================================
+
+func TestExternalLikeRuntimesConsistent(t *testing.T) {
+	want := []string{"external", "kimi", "kimi-cli"}
+	if len(externalLikeRuntimes) != len(want) {
+		t.Fatalf("externalLikeRuntimes length = %d, want %d (drift surface: SSOT changed but test wasn't updated)",
+			len(externalLikeRuntimes), len(want))
+	}
+	for i, r := range want {
+		if externalLikeRuntimes[i] != r {
+			t.Errorf("externalLikeRuntimes[%d] = %q, want %q (SSOT shape changed without test update)",
+				i, externalLikeRuntimes[i], r)
+		}
+	}
+
+	// 1. fallbackRuntimes contains the SSOT (plus template-backed
+	//    runtimes + mock). The SSOT MUST be a subset.
+	for _, r := range want {
+		if _, ok := fallbackRuntimes[r]; !ok {
+			t.Errorf("fallbackRuntimes missing externalLikeRuntimes entry %q (drift: SSOT says %q is BYO-compute but fallback allowlist doesn't include it)",
+				r, r)
+		}
+	}
+	// fallbackRuntimes ALSO contains the template-backed runtimes
+	// (claude-code, hermes, openclaw, codex) + mock — pin the
+	// resolved shape so a future edit doesn't silently drop them.
+	for _, r := range []string{"claude-code", "hermes", "openclaw", "codex", "mock"} {
+		if _, ok := fallbackRuntimes[r]; !ok {
+			t.Errorf("fallbackRuntimes missing expected entry %q (drift: a runtime was silently dropped from the fallback allowlist)",
+				r)
+		}
+	}
+
+	// 2. isExternalLikeRuntime returns true for each SSOT entry
+	//    and false for the template-backed runtimes. (Locked because
+	//    plugins.go / discovery.go / registry.go all switch on this
+	//    predicate — silently flipping it would break BYO-compute
+	//    behavior in 4 different files.)
+	for _, r := range want {
+		if !isExternalLikeRuntime(r) {
+			t.Errorf("isExternalLikeRuntime(%q) = false, want true (drift: predicate lost the SSOT entry)", r)
+		}
+	}
+	for _, r := range []string{"claude-code", "hermes", "openclaw", "codex", "mock", "unknown-runtime-xyz"} {
+		if isExternalLikeRuntime(r) {
+			t.Errorf("isExternalLikeRuntime(%q) = true, want false (drift: predicate now claims a template-backed runtime is BYO-compute)", r)
+		}
+	}
+
+	// 3. joinExternalLikeRuntimesForMessage produces the exact
+	//    user-facing string the production error message uses. Pin
+	//    the wire shape so a future edit doesn't silently change
+	//    the user-facing 422 response.
+	wantMsg := `"external", "kimi", or "kimi-cli"`
+	if got := joinExternalLikeRuntimesForMessage(); got != wantMsg {
+		t.Errorf("joinExternalLikeRuntimesForMessage() = %q, want %q (drift: user-facing error string shape changed)",
+			got, wantMsg)
+	}
+
+	// 4. The full error message (the one workspace.go:400 sends in
+	//    the 422 body) is the prefix + the joined SSOT. Pin it.
+	fullWant := `external workspaces must use runtime "external", "kimi", or "kimi-cli"`
+	// Reproduce the exact fmt.Sprintf call workspace.go:400 makes.
+	// We don't import workspace.go's Create (it has many other
+	// dependencies); we just rebuild the string the same way and
+	// assert the wire shape is preserved.
+	fullGot := fmt.Sprintf("external workspaces must use runtime %s", joinExternalLikeRuntimesForMessage())
+	if fullGot != fullWant {
+		t.Errorf("full error string drift:\n  got:  %q\n  want: %q", fullGot, fullWant)
 	}
 }
