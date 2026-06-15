@@ -169,7 +169,15 @@ jobs:
           [ -z "$HTTP_CODE" ] && HTTP_CODE="000"
 
           echo "HTTP $HTTP_CODE"
-          cat "$HTTP_RESPONSE" | jq . || cat "$HTTP_RESPONSE"
+          # REDACT the raw CP/SSM response in the runner log (Rule 8 —
+          # the previous `cat $HTTP_RESPONSE | jq . || cat $HTTP_RESPONSE`
+          # leaked the raw ValidationException into the persistent CI log
+          # on 2026-06-15 staging run 509031, masking the actual cause).
+          # Print ONLY: HTTP status code, a count, and a success/failure
+          # boolean. Per-tenant details (with the .error field redacted to
+          # a boolean) go to the GITHUB_STEP_SUMMARY for operator visibility.
+          REDACTED_BODY="$(jq -c '{ok, result_count: (.results // [] | length), stragglers_count: ((.stragglers // []) | length), http_code: ("'"$HTTP_CODE"'")}' "$HTTP_RESPONSE" 2>/dev/null || echo '{"ok":"unparseable","http_code":"'"$HTTP_CODE"'"}')"
+          echo "$REDACTED_BODY"
 
           {
             echo "## Staging tenant redeploy fleet"
@@ -182,9 +190,13 @@ jobs:
             echo ""
             echo "### Per-tenant result"
             echo ""
+            # REDACT `.error` to a boolean (Rule 8 — the previous
+            # `\(.error // "-")` printed the raw error string, including
+            # SSM ValidationExceptions with operator-sensitive values, into
+            # the persistent CI log).
             echo '| Slug | Phase | SSM Status | Exit | Healthz | Error |'
             echo '|------|-------|------------|------|---------|-------|'
-            jq -r '.results[]? | "| \(.slug) | \(.phase) | \(.ssm_status // "-") | \(.ssm_exit_code) | \(.healthz_ok) | \(.error // "-") |"' "$HTTP_RESPONSE" || true
+            jq -r '.results[]? | "| \(.slug) | \(.phase) | \(.ssm_status // "-") | \(.ssm_exit_code) | \(.healthz_ok) | \((.error // "") != "") |"' "$HTTP_RESPONSE" 2>/dev/null || true
           } >> "$GITHUB_STEP_SUMMARY"
 
           # Distinguish "real fleet failure" from "E2E teardown race".
