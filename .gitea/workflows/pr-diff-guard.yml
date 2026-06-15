@@ -13,10 +13,10 @@ permissions:
   contents: read
 
 jobs:
+  # bp-required: pending #2875
+  # New gate; wiring into branch protection will follow once it has
+  # green history and the thresholds are calibrated.
   diff-guard:
-    # bp-required: pending #2875
-    # New gate; wiring into branch protection will follow once it has
-    # green history and the thresholds are calibrated.
     name: PR diff guard
     runs-on: ubuntu-latest
     timeout-minutes: 5
