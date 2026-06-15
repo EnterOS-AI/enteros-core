@@ -87,6 +87,9 @@ jobs:
     # both jobs on the same label avoids workspace-volume cross-host
     # surprises and keeps the routing rule discoverable in one place.
     runs-on: docker-host
+    # Path-filter step should be quick; 10 min kills a wedged runner
+    # without waiting for the runner-level cap.
+    timeout-minutes: 10
     # mc#1982 Phase 3 (RFC §1): surface broken workflows without blocking.
     # mc#1982: mask removed. If regressions appear, root-fix the underlying
     # test — do NOT renew the mask silently.
@@ -139,6 +142,9 @@ jobs:
     # mc#1529 §1: must run on operator-host (where `molecule-core-net`
     # exists). See detect-changes for the full routing rationale.
     runs-on: docker-host
+    # Real cost is ~30s-to-few-min (postgres cache + build + suites);
+    # 15 min kills a wedged run promptly.
+    timeout-minutes: 15
     # mc#1982 Phase 3 (RFC §1): surface broken workflows without blocking.
     # mc#1982: mask removed. If regressions appear, root-fix the underlying
     # test — do NOT renew the mask silently.
