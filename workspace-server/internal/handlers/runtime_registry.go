@@ -26,6 +26,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -67,25 +68,82 @@ type manifestFile struct {
 	WorkspaceTemplates []manifestEntry `json:"workspace_templates"`
 }
 
+// joinExternalLikeRuntimesForMessage returns the runtime list as it
+// appears in user-facing error messages, e.g. `"external", "kimi", or
+// "kimi-cli"`. Oxford-comma style for 3+ items, plain "or" for 2.
+// Each item is Go-quoted (with surrounding double quotes) so the
+// message reads naturally for an operator typing it.
+//
+// Used by workspace.go:400 (the "external workspaces must use
+// runtime ..." error). Derived from the externalLikeRuntimes SSOT
+// so adding a new BYO-compute meta-runtime only requires updating
+// the SSOT in one place.
+func joinExternalLikeRuntimesForMessage() string {
+	quoted := make([]string, len(externalLikeRuntimes))
+	for i, r := range externalLikeRuntimes {
+		quoted[i] = fmt.Sprintf("%q", r)
+	}
+	switch len(quoted) {
+	case 0:
+		return ""
+	case 1:
+		return quoted[0]
+	case 2:
+		return quoted[0] + " or " + quoted[1]
+	default:
+		return strings.Join(quoted[:len(quoted)-1], ", ") + ", or " + quoted[len(quoted)-1]
+	}
+}
+
+// externalLikeRuntimes is the SINGLE source of truth for the set of
+// "BYO-compute meta-runtimes" (operator-managed, no platform-owned
+// container or EC2). These runtimes share behavior around
+// delivery_mode defaulting, plugin install, restart, and discovery,
+// and are always available regardless of what manifest.json says
+// (they have no template repo).
+//
+// Before this constant the same set was hardcoded in 3 separate
+// places in this file (fallbackRuntimes, loadRuntimesFromManifest
+// injection, isExternalLikeRuntime switch) + 1 string-literal in
+// workspace.go:400. Adding a new BYO-compute meta-runtime required
+// updating all 4 sites in lockstep; missing one was a silent drift
+// surface. The TestExternalLikeRuntimesConsistent pin test in
+// runtime_registry_test.go locks the shape across all 4 sites.
+//
+// "mock" is intentionally NOT in this set — it's a virtual
+// workspace with hardcoded canned A2A replies (no container, no
+// EC2, no template repo) but it's never user-selected (only the
+// funding-demo org uses it), so it doesn't share the BYO-compute
+// predicate behavior with external/kimi/kimi-cli.
+var externalLikeRuntimes = []string{"external", "kimi", "kimi-cli"}
+
 // fallbackRuntimes is used when manifest.json can't be loaded. Keeps
 // tests + dev containers working even if the file isn't mounted.
 // Kept slightly broader than the original hardcoded map so a stale
 // manifest doesn't silently drop a runtime that was previously
 // supported in the wild. "external" is always a valid runtime —
 // manifest or not — because it has no template repo.
-var fallbackRuntimes = map[string]struct{}{
-	"claude-code": {},
-	"hermes":      {},
-	"openclaw":    {},
-	"codex":       {},
-	"external":    {},
-	"kimi":        {},
-	"kimi-cli":    {},
-	// mock — virtual workspace with hardcoded canned A2A replies.
-	// No container, no EC2, no template repo. See mock_runtime.go
-	// for the full rationale (200-workspace funding-demo org).
-	"mock": {},
-}
+//
+// The 3 externalLikeRuntimes + mock are derived from the SSOT
+// (externalLikeRuntimes + the separate "mock" entry) so adding a
+// new BYO-compute meta-runtime only requires updating
+// externalLikeRuntimes above.
+var fallbackRuntimes = func() map[string]struct{} {
+	out := map[string]struct{}{
+		"claude-code": {},
+		"hermes":      {},
+		"openclaw":    {},
+		"codex":       {},
+		// mock — virtual workspace with hardcoded canned A2A replies.
+		// No container, no EC2, no template repo. See mock_runtime.go
+		// for the full rationale (200-workspace funding-demo org).
+		"mock": {},
+	}
+	for _, r := range externalLikeRuntimes {
+		out[r] = struct{}{}
+	}
+	return out
+}()
 
 // loadRuntimesFromManifest builds the runtime allowlist from
 // manifest.json. Each workspace_templates[].name is normalized to its
@@ -106,19 +164,22 @@ func loadRuntimesFromManifest(path string) (map[string]struct{}, error) {
 	if err := json.Unmarshal(data, &m); err != nil {
 		return nil, err
 	}
+	// The 3 externalLikeRuntimes + mock are ALWAYS available
+	// regardless of what the manifest contains (they have no
+	// template repo, so the manifest doesn't know about them).
+	// Injected here from the SSOT (externalLikeRuntimes + the
+	// separate "mock" entry) so adding a new BYO-compute
+	// meta-runtime only requires updating externalLikeRuntimes
+	// above. See TestExternalLikeRuntimesConsistent for the
+	// pin test that locks this shape.
 	out := map[string]struct{}{
-		// external is ALWAYS available — it has no template repo, so
-		// the manifest doesn't know about it. Injected here so we
-		// don't need a special-case in every caller.
-		"external": {},
-		// kimi and kimi-cli are BYO-compute meta-runtimes (same shape
-		// as external). No template repo; injected like external.
-		"kimi":     {},
-		"kimi-cli": {},
 		// mock is ALWAYS available for the same reason as external:
 		// virtual workspace, no template repo, never spawns a
 		// container. See mock_runtime.go.
 		"mock": {},
+	}
+	for _, r := range externalLikeRuntimes {
+		out[r] = struct{}{}
 	}
 	for _, e := range m.WorkspaceTemplates {
 		name := strings.TrimSpace(e.Name)
@@ -139,10 +200,16 @@ func loadRuntimesFromManifest(path string) (map[string]struct{}, error) {
 // (operator-managed, no platform-owned container or EC2). These runtimes
 // share behavior around delivery_mode defaulting, plugin install, restart,
 // and discovery.
+//
+// The set is derived from the externalLikeRuntimes SSOT (above) so
+// adding a new BYO-compute meta-runtime only requires updating
+// externalLikeRuntimes in one place — see
+// TestExternalLikeRuntimesConsistent for the pin test.
 func isExternalLikeRuntime(runtime string) bool {
-	switch runtime {
-	case "external", "kimi", "kimi-cli":
-		return true
+	for _, r := range externalLikeRuntimes {
+		if r == runtime {
+			return true
+		}
 	}
 	return false
 }
