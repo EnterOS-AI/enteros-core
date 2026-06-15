@@ -68,8 +68,17 @@ var memorySecretPatterns = []secretPatternEntry{
 	// without an env-var wrapper. Each prefix is provider-specific and
 	// well-known; matching the prefix + 16+ chars of base64-ish body
 	// keeps false-positives low.
+	//
+	// GitHub token prefix legend:
+	//   ghp_  → personal access token (classic)
+	//   gho_  → OAuth user token
+	//   ghu_  → user-to-server token
+	//   ghs_  → GitHub App server-to-server token
+	//   ghr_  → refresh token
+	//   github_pat_ → fine-grained PAT
 	{regexp.MustCompile(`\bghp_[A-Za-z0-9]{16,}`), "GITHUB_PAT"},
-	{regexp.MustCompile(`\bghs_[A-Za-z0-9]{16,}`), "GITHUB_OAUTH"},
+	{regexp.MustCompile(`\bgho_[A-Za-z0-9]{16,}`), "GITHUB_OAUTH"},
+	{regexp.MustCompile(`\bghs_[A-Za-z0-9]{16,}`), "GITHUB_APP_SERVER_TOKEN"},
 	{regexp.MustCompile(`\bghu_[A-Za-z0-9]{16,}`), "GITHUB_USER_TOKEN"},
 	{regexp.MustCompile(`\bghr_[A-Za-z0-9]{16,}`), "GITHUB_REFRESH_TOKEN"},
 	{regexp.MustCompile(`\bgithub_pat_[A-Za-z0-9_]{16,}`), "GITHUB_FINEGRAINED_PAT"},

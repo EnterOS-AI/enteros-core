@@ -706,6 +706,37 @@ func TestRedactSecrets_GitHubPAT_Raw_IsRedacted(t *testing.T) {
 	}
 }
 
+func TestRedactSecrets_GitHubOAuth_Raw_IsRedacted(t *testing.T) {
+	// gho_ is the GitHub OAuth user-token prefix. It was missing from the
+	// redaction table and was incorrectly lumped under the ghs_ label.
+	input := "my github oauth: gho_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	out, changed := redactSecrets("ws-1", input)
+	if !changed {
+		t.Errorf("raw GitHub OAuth token was not redacted in %q", input)
+	}
+	if !strings.Contains(out, "[REDACTED:GITHUB_OAUTH]") {
+		t.Errorf("expected [REDACTED:GITHUB_OAUTH] in output, got: %q", out)
+	}
+	if strings.Contains(out, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") {
+		t.Errorf("plaintext token leaked through: %q", out)
+	}
+}
+
+func TestRedactSecrets_GitHubAppServerToken_Raw_IsRedacted(t *testing.T) {
+	// ghs_ is a GitHub App server-to-server token, not an OAuth token.
+	input := "github app token: ghs_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	out, changed := redactSecrets("ws-1", input)
+	if !changed {
+		t.Errorf("raw GitHub App server-to-server token was not redacted in %q", input)
+	}
+	if !strings.Contains(out, "[REDACTED:GITHUB_APP_SERVER_TOKEN]") {
+		t.Errorf("expected [REDACTED:GITHUB_APP_SERVER_TOKEN] in output, got: %q", out)
+	}
+	if strings.Contains(out, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") {
+		t.Errorf("plaintext token leaked through: %q", out)
+	}
+}
+
 func TestRedactSecrets_GitHubFineGrainedPAT_Raw_IsRedacted(t *testing.T) {
 	// Fine-grained PAT format: github_pat_ + 82+ chars. Test fixture
 	// uses a clearly-fake body (80 chars) that satisfies the
