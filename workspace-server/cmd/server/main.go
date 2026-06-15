@@ -63,6 +63,32 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// isSaaSDeployment reports whether this tenant platform is
+// running in SaaS cross-EC2 mode (mirrors handlers.saasMode;
+// duplicated here because the helpers package is unexported
+// and main.go is a separate package — would be a cycle).
+//
+// Resolution order:
+//  1. MOLECULE_DEPLOY_MODE set — explicit operator flag is authoritative.
+//     "saas" → true. "self-hosted"/"selfhosted"/"standalone" → false.
+//     Unknown values log a warning + fall closed to false.
+//  2. MOLECULE_DEPLOY_MODE unset — fall back to MOLECULE_ORG_ID presence.
+func isSaaSDeployment() bool {
+	raw := strings.TrimSpace(os.Getenv("MOLECULE_DEPLOY_MODE"))
+	if raw != "" {
+		switch strings.ToLower(raw) {
+		case "saas":
+			return true
+		case "self-hosted", "selfhosted", "standalone":
+			return false
+		default:
+			log.Printf("isSaaSDeployment: MOLECULE_DEPLOY_MODE=%q not recognised; falling back to strict (non-SaaS) mode. Valid values: saas | self-hosted.", raw)
+			return false
+		}
+	}
+	return strings.TrimSpace(os.Getenv("MOLECULE_ORG_ID")) != ""
+}
+
 func main() {
 	// .env auto-load: in dev, the operator keeps MOLECULE_ENV /
 	// DATABASE_URL / etc. in the monorepo's .env file. Loading it here
@@ -257,12 +283,33 @@ func main() {
 	// unconfigured tenants. baseURL has a production default
 	// (https://git.moleculesai.app) but is overridable for staging
 	// or per-deployment Gitea mirrors.
-	if token := templateRepoToken(); token != "" {
-		baseURL := envOr("MOLECULE_GITEA_BASE_URL", "https://git.moleculesai.app")
-		wh.SetGiteaTemplateFetcher(provisioner.NewGiteaTemplateAssetFetcher(baseURL, token, nil))
-		log.Printf("template repo fetcher: wired (baseURL=%q, token set)", baseURL)
-	} else {
-		log.Printf("template repo fetcher: MOLECULE_TEMPLATE_REPO_TOKEN unset; fetcher disabled (self-host default / SCAFFOLD-gate skip)")
+	// PR-B keystone (RFC #2843 #24): wire the template-asset fetcher
+	// via the selection helper. SaaS deployments get the real
+	// Gitea fetcher (public-fetch when MOLECULE_TEMPLATE_REPO_TOKEN
+	// is empty per the CTO public-fetch GO; authenticated when set
+	// for the future private-template / rate-limit CTO-grant item).
+	// Self-host deployments get the no-op fetcher (self-host uses
+	// the local TemplatePath + ConfigFiles path for /configs and
+	// does not need an external asset channel). The token is
+	// OPTIONAL for SaaS (the molecule-ai/* template repos are
+	// PUBLIC — verified: GET /repos/.../archive/main.tar.gz returns
+	// 200 with no Authorization header). baseURL has a production
+	// default (https://git.moleculesai.app) but is overridable via
+	// MOLECULE_GITEA_BASE_URL for staging or per-deployment Gitea
+	// mirrors.
+	token := templateRepoToken()
+	baseURL := envOr("MOLECULE_GITEA_BASE_URL", "https://git.moleculesai.app")
+	sel := provisioner.SelectTemplateAssetFetcher(isSaaSDeployment, baseURL, token)
+	wh.SetGiteaTemplateFetcher(sel.Fetcher)
+	switch sel.Mode {
+	case "self-host-noop":
+		log.Printf("template repo fetcher: wired (no-op — self-host default, no external asset channel)")
+	default:
+		if sel.Authenticated {
+			log.Printf("template repo fetcher: wired (baseURL=%q, SaaS, token set — authenticated)", baseURL)
+		} else {
+			log.Printf("template repo fetcher: wired (baseURL=%q, SaaS, no token — public unauthenticated fetch)", baseURL)
+		}
 	}
 
 	// Self-hosted platform-agent boot-provision (Change 1). The line-128 seed

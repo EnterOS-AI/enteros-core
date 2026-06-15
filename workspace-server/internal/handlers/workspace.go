@@ -397,7 +397,11 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 	if payload.External && !isExternalLikeRuntime(payload.Runtime) {
 		log.Printf("Create: FAIL-CLOSED — external workspace requested with non-external runtime %q", payload.Runtime)
 		c.JSON(http.StatusUnprocessableEntity, gin.H{
-			"error":   "external workspaces must use runtime \"external\", \"kimi\", or \"kimi-cli\"",
+			// Build the runtime list from the externalLikeRuntimes SSOT
+			// (single source of truth) so adding a new BYO-compute
+			// meta-runtime only requires updating the SSOT in
+			// runtime_registry.go — see TestExternalLikeRuntimesConsistent.
+			"error":   fmt.Sprintf("external workspaces must use runtime %s", joinExternalLikeRuntimesForMessage()),
 			"runtime": payload.Runtime,
 			"code":    "RUNTIME_UNSUPPORTED",
 		})

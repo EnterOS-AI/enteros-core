@@ -158,20 +158,101 @@ func TestGiteaTemplateAssetFetcher_FailsClosedOnTransportError(t *testing.T) {
 	}
 }
 
-// TestGiteaTemplateAssetFetcher_RejectsEmptyToken pins the
-// security guard: an empty token (which would otherwise be
-// sent as "Authorization: token " with no credential) is
-// rejected at construction time. A forgotten token init would
-// otherwise silently fail-against-anonymous-requests, which
-// Gitea would 401 on — better to fail loud at Load time.
-func TestGiteaTemplateAssetFetcher_RejectsEmptyToken(t *testing.T) {
-	f := NewGiteaTemplateAssetFetcher("http://example.com", "", nil)
-	_, err := f.Load(context.Background(), "owner/repo@main")
-	if err == nil {
-		t.Fatal("expected error on empty token, got nil (security guard violated)")
+// TestGiteaTemplateAssetFetcher_EmptyToken_OmitsAuthHeader pins
+// the public-fetch activation (driver RC 11907 on #2903, the
+// runtime defect that the prior code rejected an empty token and
+// left SaaS-no-token tenants with ZERO templates). The new
+// contract: empty token → UNAUTHENTICATED request (Authorization
+// header is OMITTED, NOT sent as "token " with an empty value,
+// which Gitea 401s on as a malformed credential). This is the
+// load-bearing pin that catches a regression to the buggy
+// "always send Authorization" behavior.
+//
+// The test asserts three things:
+//  1. NO "Authorization" header is set on the outgoing request
+//     (the request map's lookup returns the zero value and the
+//     "explicit" map presence is false — net/http normalizes
+//     headers into a map[string][]string where unset keys are
+//     simply absent, so a missing key and a ""-valued key are
+//     distinguishable).
+//  2. Load returns no error (a request was issued and a 200
+//     response was processed into assets).
+//  3. Assets are returned (the public-fetch path actually
+//     delivered a payload, not an empty map).
+func TestGiteaTemplateAssetFetcher_EmptyToken_OmitsAuthHeader(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Pin: NO Authorization header should reach the server.
+		if vals, ok := r.Header["Authorization"]; ok {
+			t.Errorf("expected NO Authorization header, got %q (empty-token public-fetch must omit, not send \"token \" with empty value)", vals)
+		}
+		w.Header().Set("Content-Type", "application/gzip")
+		gz := gzip.NewWriter(w)
+		tw := tar.NewWriter(gz)
+		mustWriteTar(t, tw, "repo-sha/config.yaml", []byte("# public-template config\n"))
+		_ = tw.Close()
+		_ = gz.Close()
+	}))
+	defer srv.Close()
+
+	f := NewGiteaTemplateAssetFetcher(srv.URL, "", nil)
+	assets, err := f.Load(context.Background(), "owner/repo@main")
+	if err != nil {
+		t.Fatalf("Load: %v (empty-token public-fetch should succeed, NOT error)", err)
 	}
-	if !strings.Contains(err.Error(), "token") {
-		t.Errorf("error should mention token, got: %v", err)
+	mustHaveKey(t, assets, "config.yaml")
+	if len(assets) != 1 {
+		t.Errorf("expected 1 asset, got %d: %v", len(assets), keysOf(assets))
+	}
+}
+
+// TestGiteaTemplateAssetFetcher_EmptyToken_RealHTTP_NoAuthHeader_Success
+// is the dispatch-required end-to-end pin: an empty token results
+// in a real httptest-served HTTP request that has NO Authorization
+// header, returns 200, and the fetcher's Load returns the parsed
+// allowlisted assets. This is the bug that driver RC 11907 caught
+// — the prior code's empty-token rejection at Load time meant a
+// SaaS tenant with no MOLECULE_TEMPLATE_REPO_TOKEN got ZERO
+// templates. The flip-side regression we guard against: a future
+// refactor that re-introduces "Authorization: token " (empty value)
+// would Gitea-401 and the same runtime defect returns. The header
+// MUST be omitted, not just empty-valued.
+func TestGiteaTemplateAssetFetcher_EmptyToken_RealHTTP_NoAuthHeader_Success(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Server-side assertion: NO Authorization header on the
+		// request. We use Header map presence (not just Get,
+		// which returns "" for both "absent" and "set to empty").
+		// The map check is the load-bearing pin — it would
+		// catch a regression to "Authorization: token " (empty
+		// value) since net/http would set the key in the map
+		// but with a [""] value, which still trips this check.
+		if _, ok := r.Header["Authorization"]; ok {
+			t.Errorf("server saw Authorization header (value=%q) — empty-token public-fetch must OMIT the header, not send an empty value", r.Header.Get("Authorization"))
+		}
+		w.Header().Set("Content-Type", "application/gzip")
+		w.WriteHeader(http.StatusOK)
+		gz := gzip.NewWriter(w)
+		tw := tar.NewWriter(gz)
+		// Multiple allowlisted paths so the test verifies the
+		// full extraction path on the public-fetch activation,
+		// not just a minimal 1-asset happy path.
+		mustWriteTar(t, tw, "repo-sha/config.yaml", []byte("# public-template config\n"))
+		mustWriteTar(t, tw, "repo-sha/prompts/system.md", []byte("# public-template system prompt\n"))
+		mustWriteTar(t, tw, "repo-sha/agent-skills/skill-x/SKILL.md", []byte("# public-template skill\n"))
+		_ = tw.Close()
+		_ = gz.Close()
+	}))
+	defer srv.Close()
+
+	f := NewGiteaTemplateAssetFetcher(srv.URL, "", srv.Client())
+	assets, err := f.Load(context.Background(), "owner/repo@main")
+	if err != nil {
+		t.Fatalf("Load: %v (empty-token public-fetch should succeed against a public-template mock)", err)
+	}
+	mustHaveKey(t, assets, "config.yaml")
+	mustHaveKey(t, assets, "prompts/system.md")
+	mustHaveKey(t, assets, "agent-skills/skill-x/SKILL.md")
+	if len(assets) != 3 {
+		t.Errorf("expected 3 assets, got %d: %v", len(assets), keysOf(assets))
 	}
 }
 

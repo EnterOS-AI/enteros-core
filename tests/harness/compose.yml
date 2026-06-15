@@ -102,6 +102,17 @@ services:
       ADMIN_TOKEN: "harness-admin-token-alpha"
       MOLECULE_ORG_ID: "harness-org-alpha"
       CP_UPSTREAM_URL: "http://cp-stub:9090"
+      # Phase 1 of the #2863 burn-down: CPProvisioner
+      # (workspace-server/internal/provisioner/cp_provisioner.go:78-86)
+      # reads CP_PROVISION_URL first, then MOLECULE_CP_URL, then
+      # defaults to real prod. CP_UPSTREAM_URL alone is NOT in the
+      # read order, so the harness provision call flew past cp-stub
+      # to real prod → 401 → 30s provisioning stall. Add both names
+      # (belt-and-suspenders — same value either way) so the harness
+      # provision + config calls land on cp-stub. NO
+      # MOLECULE_CP_SHARED_SECRET / ADMIN_TOKEN — cp-stub is permissive.
+      CP_PROVISION_URL: "http://cp-stub:9090"
+      MOLECULE_CP_URL: "http://cp-stub:9090"
       RATE_LIMIT: "1000"
       CANVAS_PROXY_URL: "http://localhost:3000"
       # LLM-proxy env vars required by assertManagedTenantHasLLMEnv
@@ -170,6 +181,12 @@ services:
       ADMIN_TOKEN: "harness-admin-token-beta"
       MOLECULE_ORG_ID: "harness-org-beta"
       CP_UPSTREAM_URL: "http://cp-stub:9090"
+      # Phase 1 of the #2863 burn-down (see tenant-alpha block above
+      # for rationale). Belt-and-suspenders: both env var names point
+      # at cp-stub so the provision + config calls land on the stub
+      # rather than flying past to real prod.
+      CP_PROVISION_URL: "http://cp-stub:9090"
+      MOLECULE_CP_URL: "http://cp-stub:9090"
       RATE_LIMIT: "1000"
       CANVAS_PROXY_URL: "http://localhost:3000"
       # LLM-proxy env vars (see assertManagedTenantHasLLMEnv in

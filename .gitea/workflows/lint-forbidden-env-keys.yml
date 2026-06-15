@@ -155,6 +155,18 @@ jobs:
             found=$(grep -rn --include='*.go' --exclude='*_test.go' "\"${k}\"" "$SCAN_ROOT" 2>/dev/null \
                     | grep -v -F -f "$EXEMPT_FILTER" || true)
             if [ -n "$found" ]; then
+              # Filter out the LABEL side of a redaction regexp-tuple —
+              # {regexp.MustCompile(`<re>`), "<KEY>"} — which is a
+              # security CONTROL (the label is just the canonical
+              # deny-listed env-var name used to tag what the redaction
+              # strips), not an actual env-injection. The pattern is
+              # anchored on the per-iteration $k; lines that don't
+              # contain the regexp.MustCompile(...), "<k>" shape
+              # (envVars["<k>"] = ..., os.Getenv("<k>"), etc.) pass
+              # through unchanged. core#2918.
+              found=$(echo "$found" | grep -vE 'regexp\.MustCompile\([^)]+\)\s*,\s*"'"${k}"'"' || true)
+            fi
+            if [ -n "$found" ]; then
               HITS="${HITS}${found}\n"
             fi
           done
@@ -163,6 +175,11 @@ jobs:
           for prefix in "${FORBIDDEN_PREFIXES[@]}"; do
             found=$(grep -rnE --include='*.go' --exclude='*_test.go' "\"${prefix}[A-Z0-9_]+\"" "$SCAN_ROOT" 2>/dev/null \
                     | grep -v -F -f "$EXEMPT_FILTER" || true)
+            if [ -n "$found" ]; then
+              # Same redaction-tuple-LABEL filter as the exact-match scan
+              # (the deny-prefix family can show up in redaction labels too).
+              found=$(echo "$found" | grep -vE 'regexp\.MustCompile\([^)]+\)\s*,\s*"'"${prefix}"'[A-Z0-9_]+"' || true)
+            fi
             if [ -n "$found" ]; then
               HITS="${HITS}${found}\n"
             fi
@@ -282,6 +299,16 @@ jobs:
             # but not:
             #   - // see GITEA_TOKEN below   (no quotes)
             found=$(grep -nE "\"(${KEY_ALT})\"" "$f" 2>/dev/null || true)
+            # Filter out the LABEL side of a redaction regexp-tuple —
+            # {regexp.MustCompile(`<re>`), "<KEY>"} — which is a
+            # security CONTROL, not an actual tenant-writer surface
+            # injection. Same rationale as the scan job's
+            # LABEL_EXCLUDE filter (core#2918). The per-iteration
+            # KEY_ALT is the alternation; the LABEL_EXCLUDE alternation
+            # matches any of them in the redaction-tuple-LABEL slot.
+            if [ -n "$found" ]; then
+              found=$(echo "$found" | grep -vE 'regexp\.MustCompile\([^)]+\)\s*,\s*"('"${KEY_ALT}"')"' || true)
+            fi
             if [ -n "$found" ]; then
               HITS="${HITS}--- ${f} ---\n${found}\n"
             fi

@@ -375,6 +375,39 @@ describe("health check", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Connect timeout
+// ---------------------------------------------------------------------------
+
+describe("connect timeout", () => {
+  it("closes the socket and schedules a reconnect if onopen never fires", () => {
+    connectSocket();
+    const ws = getLastWS();
+    vi.advanceTimersByTime(10_000);
+    expect(ws.closeCallCount).toBeGreaterThanOrEqual(1);
+    vi.advanceTimersByTime(1100);
+    expect(MockWebSocket.instances.length).toBeGreaterThan(1);
+  });
+
+  it("does not fire when onopen happens within the timeout window", () => {
+    connectSocket();
+    const ws = getLastWS();
+    ws.triggerOpen();
+    vi.advanceTimersByTime(10_000);
+    expect(ws.closeCallCount).toBe(0);
+    expect(MockWebSocket.instances).toHaveLength(1);
+  });
+
+  it("clears the timeout on disconnect", () => {
+    const clearTimeoutSpy = vi.spyOn(globalThis, "clearTimeout");
+    connectSocket();
+    disconnectSocket();
+    // One of the cleared timeouts is the connect timeout.
+    expect(clearTimeoutSpy).toHaveBeenCalled();
+    clearTimeoutSpy.mockRestore();
+  });
+});
+
 // Rehydrate dedup logic itself is exercised by `RehydrateDedup` unit
 // tests in this file (below). End-to-end coupling through the
 // dynamic-imported `@/lib/api` was non-trivial under our existing
