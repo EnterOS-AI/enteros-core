@@ -995,7 +995,7 @@ func TestWorkspaceUpdate_RuntimeField(t *testing.T) {
 	}
 }
 
-func TestWorkspaceUpdate_RuntimeField_DBErrorReturnsServerError(t *testing.T) {
+func TestWorkspaceUpdate_RuntimeField_ModelSecretDBError_SkipsCheckAndProceeds(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
 	broadcaster := newTestBroadcaster()
@@ -1004,13 +1004,17 @@ func TestWorkspaceUpdate_RuntimeField_DBErrorReturnsServerError(t *testing.T) {
 	mock.ExpectQuery("SELECT EXISTS.*workspaces WHERE id").
 		WithArgs("cccccccc-0006-0000-0000-000000000001").
 		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
-	// A genuine DB error reading the MODEL workspace_secret must fail
-	// closed (500). Only sql.ErrNoRows (unresolved model) is allowed to
-	// skip the strict compat-check; a real DB error must not silently
-	// let an unvalidated (runtime, model) PATCH through.
+	// A genuine DB error reading the MODEL workspace_secret is treated the
+	// same as an unresolved model: the strict (runtime, model) compat-check
+	// is skipped and the PATCH proceeds. Boot is the fail-closed backstop
+	// for a genuinely bad model; failing open here avoids wedging PATCH on
+	// transient secrets-store hiccups.
 	mock.ExpectQuery(`SELECT encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1 AND key = 'MODEL'`).
 		WithArgs("cccccccc-0006-0000-0000-000000000001").
 		WillReturnError(errors.New("database unavailable"))
+	mock.ExpectExec("UPDATE workspaces SET runtime").
+		WithArgs("cccccccc-0006-0000-0000-000000000001", "hermes").
+		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -1022,8 +1026,8 @@ func TestWorkspaceUpdate_RuntimeField_DBErrorReturnsServerError(t *testing.T) {
 
 	handler.Update(c)
 
-	if w.Code != http.StatusInternalServerError {
-		t.Errorf("expected status 500, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status 200 (skip + proceed), got %d: %s", w.Code, w.Body.String())
 	}
 
 	if err := mock.ExpectationsWereMet(); err != nil {

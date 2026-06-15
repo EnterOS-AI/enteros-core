@@ -285,12 +285,6 @@ func (h *WorkspaceHandler) Update(c *gin.Context) {
 		// Reading the column wedged this PATCH at 500 for workspaces whose
 		// model is only in workspace_secrets (e.g. JRS: GET /model →
 		// source:"workspace_secrets"). Read it the same way GetModel does.
-		runtimeStr, typeOK := runtime.(string)
-		if !typeOK {
-			log.Printf("Update: PATCH runtime on %s REJECTED (not a string)", id)
-			c.JSON(http.StatusBadRequest, gin.H{"error": "runtime must be a string"})
-			return
-		}
 		var currentModel string
 		var mEnc []byte
 		var mVer int
@@ -302,30 +296,26 @@ func (h *WorkspaceHandler) Update(c *gin.Context) {
 			if dec, derr := crypto.DecryptVersioned(mEnc, mVer); derr == nil {
 				currentModel = string(dec)
 			} else {
-				log.Printf("Update runtime: decrypt MODEL secret for %s failed: %v", id, derr)
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to decrypt model secret"})
-				return
+				log.Printf("Update runtime: decrypt MODEL secret for %s failed: %v (skipping strict compat-check)", id, derr)
 			}
 		case errors.Is(mErr, sql.ErrNoRows):
 			// No stored model → unresolved. Skip the strict (runtime, model)
 			// check; a genuinely missing model fails closed at boot, not here.
 		default:
-			log.Printf("Update runtime: read MODEL secret for %s: %v", id, mErr)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read model secret"})
-			return
+			log.Printf("Update runtime: read MODEL secret for %s: %v (skipping strict compat-check)", id, mErr)
 		}
 		// Only enforce the (runtime, model) pair when we actually HAVE a model.
 		if currentModel != "" {
-			if ok, reason := validateRegisteredModelForRuntime(runtimeStr, currentModel); !ok {
+			if ok, reason := validateRegisteredModelForRuntime(runtime.(string), currentModel); !ok {
 				log.Printf("Update: PATCH runtime=%q on %s REJECTED (model=%q is not registered for that runtime): %s",
-					runtimeStr, id, currentModel, reason)
+					runtime.(string), id, currentModel, reason)
 				// 422 = syntactically valid PATCH body, but the (runtime, model)
 				// pair is unroutable per the registry SSOT.
 				c.JSON(http.StatusUnprocessableEntity, gin.H{"error": reason})
 				return
 			}
 		}
-		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET runtime = $2, updated_at = now() WHERE id = $1`, id, runtimeStr); err != nil {
+		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET runtime = $2, updated_at = now() WHERE id = $1`, id, runtime); err != nil {
 			log.Printf("Update runtime error for %s: %v", id, err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save runtime"})
 			return
