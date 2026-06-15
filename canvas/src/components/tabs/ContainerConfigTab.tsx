@@ -2,48 +2,18 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { api } from "@/lib/api";
+import {
+  FALLBACK_COMPUTE_OPTIONS,
+  type ComputeOptions,
+  defaultInstanceForProvider,
+  instanceTypesForProvider,
+  normalizeProvider,
+  parseComputeOptions,
+} from "@/lib/compute-options";
 import { runtimeDisplayName } from "@/lib/runtime-names";
 import { isSaaSTenant } from "@/lib/tenant";
 import { useCanvasStore, type WorkspaceNodeData } from "@/store/canvas";
 import type { WorkspaceCompute } from "@/store/socket";
-
-// Cloud-provider + instance-type metadata (core#2489).
-//
-// SSOT lives in the workspace-server (workspace_compute.go's allowlist + defaults)
-// and is fetched at runtime from GET /compute/metadata (public, workspace-
-// independent endpoint — the data is platform constraints, not org secrets), so
-// the UI can never offer a (provider, instance-type) the PATCH validation then
-// rejects with a 400. The constants below are ONLY a minimal offline fallback
-// used until the fetch resolves (or if it fails) — they mirror the server SSOT
-// but are not the source of truth. When the fetch succeeds, its data replaces
-// them entirely.
-//
-// Response shape (workspace-server):
-//   { providers: [{ id: "aws", label: "AWS (default)", default_instance: "t3.medium",
-//                    instances: ["t3.medium", ...] }, ...] }
-type ComputeOptions = {
-  providers: string[];
-  instanceTypes: Record<string, string[]>;
-  defaults: Record<string, string>;
-  labels: Record<string, string>;
-};
-
-const FALLBACK_COMPUTE_OPTIONS: ComputeOptions = {
-  providers: ["aws", "hetzner", "gcp"],
-  instanceTypes: {
-    aws: ["t3.medium", "t3.large", "t3.xlarge", "t3.2xlarge", "m6i.large", "m6i.xlarge", "c6i.xlarge"],
-    hetzner: ["cpx11", "cpx21", "cpx31", "cpx41", "cpx51", "cax11", "cax21", "cax31", "cax41"],
-    gcp: ["e2-small", "e2-medium", "e2-standard-2", "e2-standard-4", "e2-standard-8"],
-  },
-  defaults: { aws: "t3.medium", hetzner: "cpx31", gcp: "e2-standard-2" },
-  labels: { aws: "AWS (default)", gcp: "GCP", hetzner: "Hetzner" },
-};
-
-const normalizeProvider = (p?: string): string => (p === "gcp" || p === "hetzner" ? p : "aws");
-const instanceTypesForProvider = (opts: ComputeOptions, p?: string): string[] =>
-  opts.instanceTypes[normalizeProvider(p)] ?? opts.instanceTypes.aws ?? FALLBACK_COMPUTE_OPTIONS.instanceTypes.aws;
-const defaultInstanceForProvider = (opts: ComputeOptions, p?: string): string =>
-  opts.defaults[normalizeProvider(p)] ?? "t3.medium";
 
 const RUNTIME_OPTIONS = ["claude-code", "codex", "hermes", "openclaw", "kimi", "kimi-cli", "external"];
 const RESOLUTIONS = ["1280x720", "1440x900", "1920x1080", "2560x1440"];
@@ -121,33 +91,14 @@ export function ContainerConfigTab({ workspaceId, data }: Props) {
         // /compute/metadata is a public, workspace-independent endpoint (the data
         // is platform constraints, not org secrets) — no need to refetch on
         // workspaceId change; one fetch per tab mount is enough.
-        const resp = await api.get<{
-          providers?: Array<{ id: string; label?: string; default_instance?: string; instances?: string[] }>;
-        }>("/compute/metadata");
+        const resp = await api.get<unknown>("/compute/metadata");
         if (cancelled) return;
         // Defensive: only adopt a well-formed payload; otherwise keep the fallback.
         // Map the server's per-provider object shape into the flat internal
         // ComputeOptions shape the helpers + selectors consume.
-        if (resp && Array.isArray(resp.providers) && resp.providers.length > 0) {
-          const providers: string[] = [];
-          const instanceTypes: Record<string, string[]> = {};
-          const defaults: Record<string, string> = {};
-          const labels: Record<string, string> = {};
-          for (const p of resp.providers) {
-            if (!p || typeof p.id !== "string" || !p.id) continue;
-            providers.push(p.id);
-            if (Array.isArray(p.instances) && p.instances.length > 0) instanceTypes[p.id] = p.instances;
-            if (typeof p.default_instance === "string" && p.default_instance) defaults[p.id] = p.default_instance;
-            if (typeof p.label === "string" && p.label) labels[p.id] = p.label;
-          }
-          if (providers.length > 0) {
-            setComputeOptions({
-              providers,
-              instanceTypes: Object.keys(instanceTypes).length > 0 ? instanceTypes : FALLBACK_COMPUTE_OPTIONS.instanceTypes,
-              defaults: Object.keys(defaults).length > 0 ? defaults : FALLBACK_COMPUTE_OPTIONS.defaults,
-              labels: Object.keys(labels).length > 0 ? labels : FALLBACK_COMPUTE_OPTIONS.labels,
-            });
-          }
+        const parsed = parseComputeOptions(resp);
+        if (parsed) {
+          setComputeOptions(parsed);
         }
       } catch {
         // Fetch failed (offline / older server) — keep FALLBACK_COMPUTE_OPTIONS.
@@ -274,7 +225,7 @@ export function ContainerConfigTab({ workspaceId, data }: Props) {
               label="Cloud provider"
               value={normalizeProvider(form.provider)}
               options={computeOptions.providers}
-              optionLabel={(v) => computeOptions.labels[v] ?? v}
+              optionLabel={(v) => cloudProviderLabel(v)}
               // Switching cloud resets the instance type to the new provider's
               // default (an AWS t3.* is invalid on Hetzner, etc.) — also keeps the
               // instance-type dropdown below in sync with the provider's sizes.

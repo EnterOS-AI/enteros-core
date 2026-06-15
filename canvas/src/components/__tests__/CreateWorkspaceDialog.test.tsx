@@ -16,6 +16,25 @@ import { api } from "@/lib/api";
 const mockGet = vi.mocked(api.get);
 const mockPost = vi.mocked(api.post);
 
+const SAMPLE_COMPUTE_METADATA = {
+  providers: ["aws", "hetzner", "gcp"],
+  instanceTypes: {
+    aws: ["t3.medium", "t3.large", "t3.xlarge", "t3.2xlarge", "m6i.large", "m6i.xlarge", "c6i.xlarge"],
+    hetzner: ["cpx11", "cpx21", "cpx31", "cpx41", "cpx51", "cax11", "cax21", "cax31", "cax41"],
+    gcp: ["e2-small", "e2-medium", "e2-standard-2", "e2-standard-4", "e2-standard-8"],
+  },
+  defaults: {
+    aws: "t3.medium",
+    hetzner: "cpx31",
+    gcp: "e2-standard-2",
+  },
+  display_defaults: {
+    aws: "t3.xlarge",
+    hetzner: "cpx41",
+    gcp: "e2-standard-4",
+  },
+};
+
 const SAMPLE_WORKSPACES = [
   { id: "ws-1", name: "Platform Team", tier: 1 },
   { id: "ws-2", name: "Research Agent", tier: 2 },
@@ -102,6 +121,10 @@ beforeEach(() => {
     if (url === "/templates") {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       return SAMPLE_TEMPLATES as any;
+    }
+    if (url === "/compute/metadata") {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      return SAMPLE_COMPUTE_METADATA as any;
     }
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     return SAMPLE_WORKSPACES as any;
@@ -296,6 +319,120 @@ describe("CreateWorkspaceDialog", () => {
         height: 1080,
       },
     });
+  });
+
+  it("drives display instance-type options from /compute/metadata SSOT", async () => {
+    await openDialog();
+    fireEvent.change(screen.getByPlaceholderText("e.g. SEO Agent"), {
+      target: { value: "Desktop Agent" },
+    });
+    fireEvent.click(screen.getByLabelText("Enable display"));
+
+    const instanceSelect = screen.getByLabelText("Instance") as HTMLSelectElement;
+    await waitFor(() => {
+      const optionValues = Array.from(instanceSelect.options).map((o) => o.value);
+      expect(optionValues).toEqual(SAMPLE_COMPUTE_METADATA.instanceTypes.aws);
+    });
+  });
+
+  it("consumes the SSOT display default instead of the in-bundle fallback", async () => {
+    // Override the /compute/metadata mock so AWS display_default differs from the
+    // bundled FALLBACK_COMPUTE_OPTIONS. This proves the dialog reads the live SSOT
+    // value and does not silently fall back to the offline bundle.
+    mockGet.mockImplementation(async (url: string) => {
+      if (url === "/compute/metadata") {
+        return {
+          providers: ["aws"],
+          instanceTypes: { aws: ["t3.medium", "t3.large", "t3.xlarge", "t3.2xlarge"] },
+          defaults: { aws: "t3.medium" },
+          display_defaults: { aws: "t3.2xlarge" },
+        };
+      }
+      if (url === "/templates") return SAMPLE_TEMPLATES as any;
+      return SAMPLE_WORKSPACES as any;
+    });
+
+    await openDialog();
+    fireEvent.change(screen.getByPlaceholderText("e.g. SEO Agent"), {
+      target: { value: "SSOT Display Agent" },
+    });
+    fireEvent.click(screen.getByLabelText("Enable display"));
+
+    const instanceSelect = screen.getByLabelText("Instance") as HTMLSelectElement;
+    await waitFor(() => expect(instanceSelect.value).toBe("t3.2xlarge"));
+
+    const createBtn = screen.getAllByRole("button").find((b) => b.textContent === "Create");
+    fireEvent.click(createBtn!);
+
+    await waitFor(() => expect(mockPost).toHaveBeenCalled());
+    const body = mockPost.mock.calls[0][1] as Record<string, unknown>;
+    expect(body.compute).toEqual({
+      instance_type: "t3.2xlarge",
+      volume: { root_gb: 80 },
+      display: {
+        mode: "desktop-control",
+        protocol: "novnc",
+        width: 1920,
+        height: 1080,
+      },
+    });
+  });
+
+  it("consumes a non-AWS SSOT display default when the cloud provider changes", async () => {
+    // Make the canvas think it is running on a SaaS tenant so the cloud-provider
+    // selector is rendered. Hetzner's SSOT display default (cpx51) differs from
+    // the in-bundle fallback (cpx41), proving the dropdown reads display_defaults
+    // for the selected provider rather than always defaulting to AWS.
+    const originalLocation = window.location;
+    vi.stubGlobal("location", { ...originalLocation, hostname: "acme.moleculesai.app" });
+
+    mockGet.mockImplementation(async (url: string) => {
+      if (url === "/compute/metadata") {
+        return {
+          providers: ["aws", "hetzner"],
+          instanceTypes: {
+            aws: ["t3.medium", "t3.xlarge"],
+            hetzner: ["cpx31", "cpx41", "cpx51"],
+          },
+          defaults: { aws: "t3.medium", hetzner: "cpx31" },
+          display_defaults: { aws: "t3.xlarge", hetzner: "cpx51" },
+        };
+      }
+      if (url === "/templates") return SAMPLE_TEMPLATES as any;
+      return SAMPLE_WORKSPACES as any;
+    });
+
+    await openDialog();
+    fireEvent.change(screen.getByPlaceholderText("e.g. SEO Agent"), {
+      target: { value: "Hetzner Display Agent" },
+    });
+
+    fireEvent.change(screen.getByLabelText("Cloud provider") as HTMLSelectElement, {
+      target: { value: "hetzner" },
+    });
+    fireEvent.click(screen.getByLabelText("Enable display"));
+
+    const instanceSelect = screen.getByLabelText("Instance") as HTMLSelectElement;
+    await waitFor(() => expect(instanceSelect.value).toBe("cpx51"));
+
+    const createBtn = screen.getAllByRole("button").find((b) => b.textContent === "Create");
+    fireEvent.click(createBtn!);
+
+    await waitFor(() => expect(mockPost).toHaveBeenCalled());
+    const body = mockPost.mock.calls[0][1] as Record<string, unknown>;
+    expect(body.compute).toEqual({
+      instance_type: "cpx51",
+      volume: { root_gb: 80 },
+      display: {
+        mode: "desktop-control",
+        protocol: "novnc",
+        width: 1920,
+        height: 1080,
+      },
+      provider: "hetzner",
+    });
+
+    vi.stubGlobal("location", originalLocation);
   });
 
   it("sends BYOK API key secrets when API key auth mode is selected", async () => {

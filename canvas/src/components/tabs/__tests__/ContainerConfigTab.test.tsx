@@ -372,14 +372,22 @@ describe("ContainerConfigTab", () => {
   // dropdowns: a server-only instance type appears once the fetch resolves.
   it("populates instance-type options from the /compute/metadata SSOT endpoint", async () => {
     apiGet.mockResolvedValueOnce({
-      providers: [
-        // Real server response shape: { id, label, default_instance, instances }.
-        // The "z9.future" instance is server-only — the in-bundle fallback doesn't
-        // list it; once the fetch resolves, it appears in the dropdown.
-        { id: "aws", label: "AWS (default)", default_instance: "t3.medium", instances: ["t3.medium", "t3.large", "z9.future"] },
-        { id: "hetzner", label: "Hetzner", default_instance: "cpx31", instances: ["cpx31"] },
-        { id: "gcp", label: "GCP", default_instance: "e2-standard-2", instances: ["e2-standard-2"] },
-      ],
+      providers: ["aws", "hetzner", "gcp"],
+      instanceTypes: {
+        aws: ["t3.medium", "t3.large", "z9.future"],
+        hetzner: ["cpx31"],
+        gcp: ["e2-standard-2"],
+      },
+      defaults: {
+        aws: "t3.medium",
+        hetzner: "cpx31",
+        gcp: "e2-standard-2",
+      },
+      display_defaults: {
+        aws: "t3.xlarge",
+        hetzner: "cpx41",
+        gcp: "e2-standard-4",
+      },
     });
 
     render(
@@ -458,7 +466,8 @@ describe("ContainerConfigTab", () => {
   //   gcp instances (5): e2-small, e2-medium, e2-standard-2,
   //                      e2-standard-4, e2-standard-8
   //   gcp default: e2-standard-2
-  //   labels: aws="AWS (default)", gcp="GCP", hetzner="Hetzner"
+  //   display defaults: aws="t3.xlarge", gcp="e2-standard-4",
+  //                     hetzner="cpx41"
   //
   // The test exercises the fallback path by making the live fetch
   // fail; the assertions then read what the dropdowns actually
