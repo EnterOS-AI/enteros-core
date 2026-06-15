@@ -30,6 +30,7 @@ import (
 	"os"
 	"strings"
 
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/crypto"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
@@ -174,14 +175,24 @@ func conciergePlatformMCPEnv(env map[string]string) {
 // kind='platform' workspace (create, restart, auto-recover). It is a no-op
 // for ordinary workspaces.
 //
-// Post RFC #2843 §10a: the concierge's identity (system prompt, model,
-// runtime, MCP wiring) is delivered via the molecule-ai-workspace-template-
+// Post RFC #2843 §10a: the concierge's PROMPT + MCP-wiring identity (system
+// prompt, agent-skills) is delivered via the molecule-ai-workspace-template-
 // platform-agent template and applied like any other runtime template. This
-// hook's only remaining responsibilities are (1) inject the platform-MCP env
-// (org-admin token + platform URL + org id) and (2) the per-instance
-// {{CONCIERGE_NAME}} substitution in the delivered system-prompt.md
-// (recommended in the PR — see the PR description for the rationale vs
-// the alternative of dropping the dynamic name).
+// hook's responsibilities are (0) SEED the concierge's declared model so the
+// provision passes the universal MISSING_MODEL gate (core#2594), (1) inject the
+// platform-MCP env (org-admin token + platform URL + org id) and (2) the
+// per-instance {{CONCIERGE_NAME}} substitution in the system-prompt.md.
+//
+// IMPORTANT (incident 2026-06-15, regression from #2919): the model is NOT
+// delivered via the template. The MISSING_MODEL gate reads the stored MODEL
+// workspace_secret at provision time — BEFORE any template config.yaml is
+// fetched — so a model-less platform agent fails closed ("reached provisioning
+// with no model set"). #2919 removed the model-seed on the theory the
+// platform-agent template would supply it, but that template entry was never
+// added to the manifest. The concierge is the platform-agent PRODUCT itself, so
+// it carries an explicit declared model in code (core#2594) exactly as a
+// template declares one — this is the SSOT-correct source, not a stopgap. The
+// CI test TestApplyConciergeProvisionConfig_SeedsModel gates against re-removal.
 //
 // Returns the (possibly newly-allocated) configFiles map so the caller can
 // rebind it — configFiles is nil on the auto-restart path, where this is the
@@ -202,6 +213,14 @@ func (h *WorkspaceHandler) applyConciergeProvisionConfig(
 	if kind != models.KindPlatform {
 		return configFiles
 	}
+
+	// 0. Concierge model (core#2594). The platform agent carries an explicit,
+	//    SSOT-declared model so it never relies on a silent default. The
+	//    universal MISSING_MODEL gate (prepareProvisionContext) reads the stored
+	//    MODEL secret at provision time — before any template config.yaml is
+	//    fetched — so this MUST run here, not be deferred to the template.
+	//    Seed-only: it respects a model the customer later picked.
+	h.ensureConciergeModel(ctx, workspaceID, envVars)
 
 	// 1. Platform-MCP env (org-admin token + platform URL + org id).
 	conciergePlatformMCPEnv(envVars)
@@ -250,6 +269,89 @@ func substituteConciergeName(prompt []byte, name string) []byte {
 	// the legacy strings.Replace(s, old, new, -1) "replace all" idiom
 	// with the dedicated stdlib helper.
 	return []byte(strings.ReplaceAll(string(prompt), conciergeNamePlaceholder, name))
+}
+
+// conciergeRuntime is the runtime the platform agent (concierge) always runs as
+// (the platform-agent image variant of 'claude-code'). conciergeDeclaredModel is
+// validated against the registry for this runtime before being seeded.
+const conciergeRuntime = "claude-code"
+
+// conciergeDeclaredModel is the platform agent's OWN declared model — a
+// first-class product decision, NOT a generic platform default. It mirrors a
+// template's runtime_config.model SSOT. The SSOT directive
+// (feedback_workspace_model_required_no_platform_default...) forbids the platform
+// from defaulting a USER workspace's model, but the concierge IS the
+// platform-agent product, so it declares its own model exactly as a template
+// declares one (core#2594).
+const conciergeDeclaredModel = "moonshot/kimi-k2.6"
+
+// ensureConciergeModel makes the platform agent's model explicit (core#2594).
+// It (1) seeds the container model env for the current provision and (2)
+// persists the MODEL workspace_secret so the read endpoint / canvas Config tab
+// surface the resolved model. The model is the concierge's declared SSOT model,
+// validated against the registry for its runtime. If validation fails (registry
+// drift — a build bug caught by the model-registry CI test), it sets NOTHING:
+// the downstream universal MISSING_MODEL gate then fails the provision CLOSED
+// rather than letting the runtime pick an opaque default.
+func (h *WorkspaceHandler) ensureConciergeModel(ctx context.Context, workspaceID string, envVars map[string]string) {
+	// SEED-ONLY (CTO 2026-06-12: customer setting > platform default; the
+	// concierge's model is changeable like any workspace, "anytime"). If a MODEL
+	// secret already exists — whether the original seed or a model the customer
+	// later picked in the canvas — RESPECT it: loadWorkspaceSecrets +
+	// applyRuntimeModelEnv have already put it in envVars, so do nothing. Only
+	// SEED the declared default when the concierge has no model at all (first
+	// boot). Re-asserting on EVERY provision would silently revert the customer's
+	// pick — exactly the platform-overriding-customer violation the SSOT
+	// directive forbids.
+	if existing := readStoredModelSecret(ctx, workspaceID); existing != "" {
+		return // explicit model already set; never overwrite the customer's choice
+	}
+
+	// First boot — no model yet. Seed the concierge's declared default, but only
+	// if it is genuinely routable for the runtime; otherwise leave it unset and
+	// let the MISSING_MODEL gate fail closed (loud) rather than seed a model the
+	// platform cannot actually route to (silent late failure).
+	model := conciergeDeclaredModel
+	if ok, why := validateRegisteredModelForRuntime(conciergeRuntime, model); !ok {
+		log.Printf("Provisioner: concierge %s declared model %q is NOT registered for runtime %q (%s) — leaving model unset; provision will fail closed", workspaceID, model, conciergeRuntime, why)
+		return
+	}
+	if ok, why := validateDerivedProviderInRegistry(conciergeRuntime, model); !ok {
+		log.Printf("Provisioner: concierge %s declared model %q has no derivable registry provider for runtime %q (%s) — leaving model unset; provision will fail closed", workspaceID, model, conciergeRuntime, why)
+		return
+	}
+
+	// Seed the container env (precedence MOLECULE_MODEL > MODEL in the runtime).
+	// applyRuntimeModelEnv already ran with an empty payload model for the
+	// concierge (no stored MODEL on first boot), so set both canonical names
+	// here so this provision actually runs the seeded default.
+	envVars["MOLECULE_MODEL"] = model
+	envVars["MODEL"] = model
+
+	// Persist so GET /workspaces/:id/model returns it (Config tab visibility) and
+	// the next provision's readStoredModelSecret takes the respect-existing path.
+	if setErr := setModelSecret(ctx, workspaceID, model); setErr != nil {
+		log.Printf("Provisioner: concierge %s persist MODEL secret failed: %v (env still seeded for this provision)", workspaceID, setErr)
+	}
+}
+
+// readStoredModelSecret returns the decrypted MODEL workspace_secret, or "" when
+// none is stored (or on any read/decrypt error — treated as "unset" so a
+// transient miss re-seeds rather than wedges). Used by ensureConciergeModel to
+// decide seed-vs-respect.
+func readStoredModelSecret(ctx context.Context, workspaceID string) string {
+	var stored []byte
+	var version int
+	if err := db.DB.QueryRowContext(ctx,
+		`SELECT encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = $1 AND key = 'MODEL'`,
+		workspaceID).Scan(&stored, &version); err != nil {
+		return ""
+	}
+	dec, err := crypto.DecryptVersioned(stored, version)
+	if err != nil {
+		return ""
+	}
+	return string(dec)
 }
 
 // EnsureSelfHostedPlatformAgent installs the org's platform agent (the concierge,
