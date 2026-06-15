@@ -600,11 +600,11 @@ func TestUpdate_Runtime_RegisteredModelForRuntime_Passes(t *testing.T) {
 	mock.ExpectQuery(`SELECT EXISTS\(SELECT 1 FROM workspaces WHERE id = \$1\)`).
 		WithArgs(wsID).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
-	// New (newRuntime, currentModel) check — model is read so we can
-	// pair it with the new runtime.
-	mock.ExpectQuery(`SELECT COALESCE\(model, ''\) FROM workspaces WHERE id = \$1`).
+	// New (newRuntime, currentModel) check — the RESOLVED model is read from
+	// the MODEL workspace_secret (the SSOT), not the workspaces.model column.
+	mock.ExpectQuery(`SELECT encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1 AND key = 'MODEL'`).
 		WithArgs(wsID).
-		WillReturnRows(sqlmock.NewRows([]string{"model"}).AddRow("moonshot/kimi-k2.6"))
+		WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}).AddRow([]byte("moonshot/kimi-k2.6"), 0))
 	// The validation passes (moonshot/kimi-k2.6 is a registered model
 	// for claude-code in the harness's provider registry), so the
 	// UPDATE proceeds.
@@ -649,9 +649,9 @@ func TestUpdate_Runtime_UnroutableModel_Fails422(t *testing.T) {
 	// "unroutable/unknown" has no model-prefix matches in any runtime's
 	// native provider set, and doesn't appear on any runtime's
 	// ModelsForRuntime list — both checks fail.
-	mock.ExpectQuery(`SELECT COALESCE\(model, ''\) FROM workspaces WHERE id = \$1`).
+	mock.ExpectQuery(`SELECT encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1 AND key = 'MODEL'`).
 		WithArgs(wsID).
-		WillReturnRows(sqlmock.NewRows([]string{"model"}).AddRow("unroutable/unknown"))
+		WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}).AddRow([]byte("unroutable/unknown"), 0))
 
 	body := map[string]interface{}{"runtime": "claude-code"}
 	b, _ := json.Marshal(body)
@@ -711,5 +711,41 @@ func TestUpdate_Runtime_UnknownPseudoRuntime_Fails422(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// TestUpdate_Runtime_ModelUnresolved_SkipsCheckAndProceeds pins the JRS-conversion
+// fix: the compat-check reads the RESOLVED model from the MODEL workspace_secret,
+// not the workspaces.model column (which wedged the PATCH at 500 for workspaces
+// whose model lives only in workspace_secrets). When the MODEL secret is absent
+// (sql.ErrNoRows), the strict (runtime, model) check is SKIPPED — the boot path
+// fail-closes on a genuinely missing model — so the PATCH must NOT 500 and must
+// proceed to update the runtime.
+func TestUpdate_Runtime_ModelUnresolved_SkipsCheckAndProceeds(t *testing.T) {
+	wsID := "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+	mock, r := setupWorkspaceCrudTest(t)
+	h := newWorkspaceCrudHandler(t)
+	r.PATCH("/workspaces/:id", h.Update)
+
+	mock.ExpectQuery(`SELECT EXISTS\(SELECT 1 FROM workspaces WHERE id = \$1\)`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+	// No MODEL secret → ErrNoRows → unresolved → strict check skipped (NOT 500).
+	mock.ExpectQuery(`SELECT encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1 AND key = 'MODEL'`).
+		WithArgs(wsID).
+		WillReturnError(sql.ErrNoRows)
+	mock.ExpectExec(`UPDATE workspaces\s+SET runtime = \$2`).
+		WithArgs(wsID, "claude-code").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	body := map[string]interface{}{"runtime": "claude-code"}
+	b, _ := json.Marshal(body)
+	req, _ := http.NewRequest("PATCH", "/workspaces/"+wsID, bytes.NewReader(b))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200 (unresolved model → skip check, proceed), got %d: %s", w.Code, w.Body.String())
 	}
 }
