@@ -20,6 +20,7 @@ env:
   GITHUB_SERVER_URL: https://git.moleculesai.app
 
 jobs:
+  # bp-exempt: informational lint; not a branch-protection required gate.
   lint:
     name: Lint publish-runner timeout-minutes
     runs-on: ubuntu-latest
