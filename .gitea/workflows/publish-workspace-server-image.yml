@@ -464,7 +464,9 @@ jobs:
     needs: build-and-push
     if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
     # Side-effect deploy only; image publish success is the durable artifact. mc#2654
-    continue-on-error: true
+    # mc#2942: production fleet redeploy failures MUST fail the run so on-call
+    # sees a broken rollout immediately instead of it going unnoticed.
+    continue-on-error: false
     # Publish/release lane (mc#2942) — production deploy of a merged
     # fix; reserved capacity, never queued behind PR-CI.
     runs-on: publish
