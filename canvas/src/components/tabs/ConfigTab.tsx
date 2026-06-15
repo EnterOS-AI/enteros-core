@@ -443,6 +443,12 @@ export function ConfigTab({ workspaceId }: Props) {
   // save propagate-and-restart even when the user didn't touch the model.
   // Capturing the actual rendered value covers both.
   const [originalModel, setOriginalModel] = useState("");
+  // core#2594: source of the loaded model value. "workspace_secrets" means
+  // the model is persisted in the DB; "unresolved" means the workspace is
+  // running with a runtime-env-derived model and the canvas has no stored
+  // value to display. Used to show a "derived from environment" hint and to
+  // block Save from appearing to wipe env-derived routing.
+  const [modelSource, setModelSource] = useState<"workspace_secrets" | "unresolved" | null>(null);
   const successTimerRef = useRef<ReturnType<typeof setTimeout>>(undefined);
 
   useEffect(() => {
@@ -480,11 +486,12 @@ export function ConfigTab({ workspaceId }: Props) {
     const [wsRes, modelRes] = await Promise.all([
       api.get<{ runtime?: string; tier?: number }>(`/workspaces/${workspaceId}`)
         .catch(() => ({} as { runtime?: string; tier?: number })),
-      api.get<{ model?: string }>(`/workspaces/${workspaceId}/model`)
-        .catch(() => ({} as { model?: string })),
+      api.get<{ model?: string; source?: "workspace_secrets" | "unresolved" }>(`/workspaces/${workspaceId}/model`)
+        .catch(() => ({} as { model?: string; source?: "workspace_secrets" | "unresolved" })),
     ]);
     const wsMetadataRuntime = (wsRes.runtime || "").trim();
     const wsMetadataModel = (modelRes.model || "").trim();
+    setModelSource(modelRes.source ?? (wsMetadataModel ? "workspace_secrets" : "unresolved"));
     const wsMetadataTier: number | null =
       typeof wsRes.tier === "number" ? wsRes.tier : null;
     setProvider("");
@@ -915,6 +922,12 @@ export function ConfigTab({ workspaceId }: Props) {
 
   const providerDirty = provider !== originalProvider;
   const isDirty = (rawMode ? rawDraft !== originalYaml : toYaml(config) !== originalYaml) || providerDirty;
+  // core#2594: an env-resolved workspace has no stored model. Saving while
+  // the model dropdown is still empty can't "wipe" routing (handleSave skips
+  // an empty /model PUT), but it is confusing and can stall the user on other
+  // fields without surfacing why. Block save until a model is picked.
+  const modelUnresolved = modelSource === "unresolved" && !currentModelId;
+  const canSave = isDirty && !modelUnresolved;
 
   if (loading) {
     return <div className="p-4 text-xs text-ink-mid">Loading config...</div>;
@@ -1001,6 +1014,16 @@ export function ConfigTab({ workspaceId }: Props) {
                 ))}
               </select>
             </div>
+            {/* core#2594: env-resolved workspaces have no stored model/provider.
+                Surface that clearly so users don't see empty required dropdowns
+                on a healthy workspace, and can't hit Save expecting it to stay
+                empty (which would otherwise look like it "wiped" routing). */}
+            {modelSource === "unresolved" && !currentModelId && (
+              <div className="px-2 py-1.5 bg-surface-sunken/50 border border-line/60 rounded text-[10px] text-ink-mid">
+                <span className="font-medium text-ink">Provider and model are derived from the workspace runtime environment.</span>{" "}
+                They are not stored in config.yaml. Select a model below to persist them.
+              </div>
+            )}
             {/* Shared Provider→Model selector. Same component renders in
                 MissingKeysModal (deploy onboarding) so the dropdown UX is
                 identical across all three surfaces. Provider field maps
@@ -1311,7 +1334,7 @@ export function ConfigTab({ workspaceId }: Props) {
         <button
           type="button"
           onClick={() => handleSave(true)}
-          disabled={!isDirty || saving}
+          disabled={!canSave || saving}
           // Same accent-LIGHTER fix shipped on every other tab.
           className="px-3 py-1.5 bg-accent hover:bg-accent-strong text-xs rounded text-white disabled:opacity-30 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-1 focus-visible:ring-offset-surface"
         >
@@ -1320,7 +1343,7 @@ export function ConfigTab({ workspaceId }: Props) {
         <button
           type="button"
           onClick={() => handleSave(false)}
-          disabled={!isDirty || saving}
+          disabled={!canSave || saving}
           className="px-3 py-1.5 bg-surface-card hover:bg-surface-card text-xs rounded text-ink-mid disabled:opacity-30 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-1"
         >
           Save
