@@ -55,8 +55,8 @@ func (f *fakeTemplateAssetFetcher) Load(_ context.Context, templateIdentity stri
 func TestCollectCPConfigFiles_MergesFetcherAssets(t *testing.T) {
 	prov := &fakeTemplateAssetFetcher{
 		bundle: map[string][]byte{
-			"config.yaml":                    []byte("# from template repo"),
-			"prompts/system.md":              []byte("# template system prompt"),
+			"config.yaml":                     []byte("# from template repo"),
+			"prompts/system.md":               []byte("# template system prompt"),
 			"agent-skills/seo-audit/SKILL.md": []byte("# seo skill"),
 		},
 	}
@@ -183,7 +183,7 @@ func TestCollectCPConfigFiles_EmptyIdentityNoop(t *testing.T) {
 		bundle: map[string][]byte{"config.yaml": []byte("# unexpected")},
 	}
 	cfg := WorkspaceConfig{
-		TemplateIdentity:     "", // empty
+		TemplateIdentity:     "",   // empty
 		TemplateAssetFetcher: prov, // wired but no identity
 	}
 	_, _, err := collectCPConfigFiles(cfg)
@@ -392,7 +392,7 @@ func TestCollectCPConfigFiles_RejectsFetcherAssetOutsideAllowlist(t *testing.T) 
 func TestCollectCPConfigFiles_FetcherAssetsRawBytes(t *testing.T) {
 	prov := &fakeTemplateAssetFetcher{
 		bundle: map[string][]byte{
-			"config.yaml":                    []byte("# raw bytes, will be base64 by marshaler"),
+			"config.yaml":                     []byte("# raw bytes, will be base64 by marshaler"),
 			"agent-skills/seo-audit/SKILL.md": []byte("raw-skill"),
 		},
 	}
@@ -442,8 +442,8 @@ func TestCollectCPConfigFiles_NoAssetsWhenNoFetcher(t *testing.T) {
 func TestCollectCPConfigFiles_PreservesCallerConfigFiles(t *testing.T) {
 	cfg := WorkspaceConfig{
 		ConfigFiles: map[string][]byte{
-			"config.yaml":        []byte("# caller"),
-			"generated.secret":   []byte("not really a secret"),
+			"config.yaml":      []byte("# caller"),
+			"generated.secret": []byte("not really a secret"),
 		},
 	}
 	files, assets, err := collectCPConfigFiles(cfg)

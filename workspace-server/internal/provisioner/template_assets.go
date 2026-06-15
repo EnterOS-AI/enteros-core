@@ -182,15 +182,15 @@ type FetcherSelection struct {
 func SelectTemplateAssetFetcher(isSaaSTenant func() bool, baseURL, token string) FetcherSelection {
 	if isSaaSTenant == nil || !isSaaSTenant() {
 		return FetcherSelection{
-			Fetcher:      NoopTemplateAssetFetcher(),
+			Fetcher:       NoopTemplateAssetFetcher(),
 			Authenticated: false,
-			Mode:         "self-host-noop",
+			Mode:          "self-host-noop",
 		}
 	}
 	// SaaS: real Gitea fetcher (public-fetch if token empty, authenticated if set)
 	return FetcherSelection{
-		Fetcher:      NewGiteaTemplateAssetFetcher(baseURL, token, nil),
+		Fetcher:       NewGiteaTemplateAssetFetcher(baseURL, token, nil),
 		Authenticated: token != "",
-		Mode:         "saas-gitea-public", // PR-B's CTO public-fetch is the SaaS default
+		Mode:          "saas-gitea-public", // PR-B's CTO public-fetch is the SaaS default
 	}
 }
