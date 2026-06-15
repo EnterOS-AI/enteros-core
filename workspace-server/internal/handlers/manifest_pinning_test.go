@@ -127,15 +127,26 @@ func giteaReachableForTest() bool {
 	return true
 }
 
-// giteaBasicAuthForTest returns a Basic auth header value built from
-// the agent's Gitea credentials (GIT_HTTP_PASSWORD env). The pinning
-// tests need the same auth the runtime's giteaTemplateAssetFetcher
-// uses, otherwise the API returns 404 for private repos / commits
-// outside the public ACL. The auth is read from env (not hardcoded)
-// so a CI env without the var gets an empty header (which the API
-// still serves for public repos; private-repo assertions would skip).
+// giteaBasicAuthForTest returns an Authorization header value built from
+// the Gitea credentials available in the test env. Order of preference
+// matches the runtime's giteaTemplateAssetFetcher (cmd/server/main.go
+// and internal/provisioner/localbuild.go read MOLECULE_GITEA_TOKEN as
+// the SSOT token for private templates):
+//  1. MOLECULE_GITEA_TOKEN — bearer token (matches runtime; gives
+//     access to private repos like molecule-ai-workspace-template-google-adk
+//     and molecule-ai-workspace-template-seo-agent).
+//  2. GIT_HTTP_USERNAME + GIT_HTTP_PASSWORD — basic auth (legacy
+//     CI path; some jobs set these for git clone URLs).
+//  3. empty — public-only assertions only; private-repo assertions
+//     return 404 (test fails-closed with a clear message).
 func giteaBasicAuthForTest(t *testing.T) string {
 	t.Helper()
+	if tok := os.Getenv("MOLECULE_GITEA_TOKEN"); tok != "" {
+		// Gitea bearer-token auth (header value: "token <tok>").
+		// Matches the runtime's giteaTemplateAssetFetcher path so
+		// the test validates the SAME auth scope the runtime uses.
+		return "token " + tok
+	}
 	user := os.Getenv("GIT_HTTP_USERNAME")
 	pass := os.Getenv("GIT_HTTP_PASSWORD")
 	if user == "" || pass == "" {
@@ -153,6 +164,9 @@ func giteaBasicAuthForTest(t *testing.T) string {
 // (called at module-init time before any *testing.T exists) can
 // still emit auth.
 func giteaBasicAuthForTestProbe() string {
+	if tok := os.Getenv("MOLECULE_GITEA_TOKEN"); tok != "" {
+		return "token " + tok
+	}
 	user := os.Getenv("GIT_HTTP_USERNAME")
 	pass := os.Getenv("GIT_HTTP_PASSWORD")
 	if user == "" || pass == "" {
