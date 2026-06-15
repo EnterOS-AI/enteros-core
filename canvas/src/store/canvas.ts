@@ -20,6 +20,7 @@ import {
   CHILD_DEFAULT_WIDTH,
   PARENT_BOTTOM_PADDING,
   PARENT_SIDE_PADDING,
+  TopologyCycleError,
 } from "./canvas-topology";
 
 /**
@@ -488,7 +489,10 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
     const absOf = (id: string | null | undefined): { x: number; y: number } => {
       let sum = { x: 0, y: 0 };
       let cursor: string | null | undefined = id;
+      const seen = new Set<string>();
       while (cursor) {
+        if (seen.has(cursor)) break;
+        seen.add(cursor);
         const n = byId.get(cursor);
         if (!n) break;
         sum = { x: sum.x + n.position.x, y: sum.y + n.position.y };
@@ -499,7 +503,10 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
     const depthOf = (id: string | null | undefined): number => {
       let d = 0;
       let cursor: string | null | undefined = id;
+      const seen = new Set<string>();
       while (cursor) {
+        if (seen.has(cursor)) break;
+        seen.add(cursor);
         const n = byId.get(cursor);
         if (!n) break;
         cursor = n.data.parentId;
@@ -693,9 +700,12 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
 
   isDescendant: (ancestorId, nodeId) => {
     const { nodes } = get();
+    const seen = new Set<string>();
     let current = nodes.find((n) => n.id === nodeId);
     while (current?.data.parentId) {
       if (current.data.parentId === ancestorId) return true;
+      if (seen.has(current.data.parentId)) return false;
+      seen.add(current.data.parentId);
       current = nodes.find((n) => n.id === current?.data.parentId);
     }
     return false;
@@ -716,7 +726,10 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
     const absOf = (id: string | null): { x: number; y: number } => {
       let sum = { x: 0, y: 0 };
       let cursor: string | null = id;
+      const seen = new Set<string>();
       while (cursor) {
+        if (seen.has(cursor)) break;
+        seen.add(cursor);
         const n = nodes.find((nn) => nn.id === cursor);
         if (!n) break;
         sum = { x: sum.x + n.position.x, y: sum.y + n.position.y };
@@ -745,7 +758,10 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
     const depthOf = (id: string | null | undefined): number => {
       let d = 0;
       let cursor: string | null | undefined = id;
+      const seen = new Set<string>();
       while (cursor) {
+        if (seen.has(cursor)) break;
+        seen.add(cursor);
         const n = nodes.find((nn) => nn.id === cursor);
         if (!n) break;
         cursor = n.data.parentId;
@@ -948,12 +964,24 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
         currentParentSizes.set(n.id, { width: w, height: h });
       }
     }
-    const { nodes, edges } = buildNodesAndEdges(
-      live,
-      layoutOverrides,
-      currentParentSizes,
-    );
-    set({ nodes, edges });
+    try {
+      const { nodes, edges } = buildNodesAndEdges(
+        live,
+        layoutOverrides,
+        currentParentSizes,
+      );
+      set({ nodes, edges });
+    } catch (err) {
+      // Fail closed: cyclic/corrupt topology must not hang or blank the app.
+      // Surface a retryable error state and keep the previous nodes so the
+      // user isn't left with an empty canvas.
+      const message =
+        err instanceof TopologyCycleError
+          ? `Workspace map has a cyclic parent chain: ${err.message}. Please reload or contact support.`
+          : "Failed to render workspace map: corrupt topology. Please reload or contact support.";
+      set({ hydrationError: message });
+      return;
+    }
     for (const [nodeId, { x, y }] of layoutOverrides) {
       api.patch(`/workspaces/${nodeId}`, { x, y }).catch(() => {});
     }
@@ -1077,7 +1105,10 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
     const absOf = (id: string | null | undefined): { x: number; y: number } => {
       let sum = { x: 0, y: 0 };
       let cursor: string | null | undefined = id;
+      const seen = new Set<string>();
       while (cursor) {
+        if (seen.has(cursor)) break;
+        seen.add(cursor);
         const n = nodes.find((nn) => nn.id === cursor);
         if (!n) break;
         sum = { x: sum.x + n.position.x, y: sum.y + n.position.y };

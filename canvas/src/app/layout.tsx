@@ -23,6 +23,7 @@ const monoFont = JetBrains_Mono({
 import { AuthGate } from "@/components/AuthGate";
 import { CookieConsent } from "@/components/CookieConsent";
 import { PurchaseSuccessModal } from "@/components/PurchaseSuccessModal";
+import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { ThemeProvider } from "@/lib/theme-provider";
 import {
   THEME_COOKIE,
@@ -245,11 +246,12 @@ export default async function RootLayout({
       </head>
       <body className={`bg-surface text-ink ${interFont.variable} ${monoFont.variable}`}>
         <ThemeProvider initialTheme={theme}>
-          {/* AuthGate is a client component; it checks the session on mount
-              and bounces anonymous users to the control plane's login page
-              when running on a tenant subdomain. Non-SaaS hosts (localhost,
-              vercel preview URL, apex) pass through unchanged. */}
-          <AuthGate>{children}</AuthGate>
+          {/* ErrorBoundary is a client component; it catches render crashes
+              anywhere inside AuthGate / children so a single failing view
+              degrades to a reloadable fallback instead of a blank white screen. */}
+          <ErrorBoundary>
+            <AuthGate>{children}</AuthGate>
+          </ErrorBoundary>
           <CookieConsent />
           {/* Demo Mock #1: post-purchase success toast. Mounted at the
               layout level so it persists across page state transitions

@@ -1,5 +1,11 @@
 import { describe, it, expect } from "vitest";
-import { buildNodesAndEdges, extractSkillNames, computeAutoLayout } from "../canvas-topology";
+import {
+  buildNodesAndEdges,
+  extractSkillNames,
+  computeAutoLayout,
+  sortParentsBeforeChildren,
+  TopologyCycleError,
+} from "../canvas-topology";
 import type { WorkspaceData } from "../socket";
 
 // ---------------------------------------------------------------------------
@@ -485,5 +491,40 @@ describe("buildNodesAndEdges – child rescue heuristic", () => {
     // child counts). Verify the intermediate case is preserved.
     const child = scenario({ x: PARENT_ABS.x + 100, y: PARENT_ABS.y + 50 });
     expect(child.position).toEqual({ x: 100, y: 50 });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Cycle guards
+// ---------------------------------------------------------------------------
+
+describe("sortParentsBeforeChildren – cyclic parent chain", () => {
+  it("bails and returns the original array instead of hanging", () => {
+    const nodes = [
+      { id: "a", parentId: "b" },
+      { id: "b", parentId: "a" },
+    ];
+    const result = sortParentsBeforeChildren(nodes);
+    expect(result).toBe(nodes);
+    expect(result).toHaveLength(2);
+  });
+
+  it("still returns a topologically sorted array for acyclic input", () => {
+    const nodes = [
+      { id: "child", parentId: "parent" },
+      { id: "parent" },
+    ];
+    const result = sortParentsBeforeChildren(nodes);
+    expect(result.map((n) => n.id)).toEqual(["parent", "child"]);
+  });
+});
+
+describe("buildNodesAndEdges – cyclic parent chain", () => {
+  it("throws TopologyCycleError instead of hanging", () => {
+    const workspaces = [
+      makeWS({ id: "a", parent_id: "b" }),
+      makeWS({ id: "b", parent_id: "a" }),
+    ];
+    expect(() => buildNodesAndEdges(workspaces)).toThrow(TopologyCycleError);
   });
 });

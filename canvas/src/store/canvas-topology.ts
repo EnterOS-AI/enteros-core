@@ -3,6 +3,15 @@ import type { WorkspaceData } from "./socket";
 import type { WorkspaceNodeData } from "./canvas";
 import { WORKSPACE_KIND } from "@/lib/workspace-kind";
 
+/** Thrown when workspace parent chains contain a cycle. Catching this at
+ *  load time lets the UI surface a degraded state instead of hanging. */
+export class TopologyCycleError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "TopologyCycleError";
+  }
+}
+
 const H_SPACING = 320;
 const V_SPACING = 200;
 
@@ -25,17 +34,38 @@ export function sortParentsBeforeChildren<T extends { id: string; parentId?: str
 ): T[] {
   const byId = new Map(nodes.map((n) => [n.id, n]));
   const visited = new Set<string>();
+  const visiting = new Set<string>();
   const out: T[] = [];
+
   const visit = (n: T) => {
     if (visited.has(n.id)) return;
+    if (visiting.has(n.id)) {
+      throw new TopologyCycleError(
+        `cyclic parent chain detected at workspace ${n.id}`,
+      );
+    }
+    visiting.add(n.id);
     if (n.parentId) {
       const parent = byId.get(n.parentId);
       if (parent && !visited.has(parent.id)) visit(parent);
     }
+    visiting.delete(n.id);
     visited.add(n.id);
     out.push(n);
   };
-  for (const n of nodes) visit(n);
+
+  try {
+    for (const n of nodes) visit(n);
+  } catch (err) {
+    if (err instanceof TopologyCycleError) {
+      // Fail-closed: a corrupt cycle is not recoverable by re-ordering.
+      // Return the input unchanged so callers (e.g. drag re-parent) don't
+      // hang, and let the next full hydrate surface the topology error.
+      return nodes;
+    }
+    throw err;
+  }
+
   // Separate roots, valid children, and orphans:
   // - roots: no parentId — true tree roots
   // - valid children: has parentId pointing to an existing node
@@ -323,12 +353,20 @@ export function buildNodesAndEdges(
   // after their parent regardless of the order the API returned them.
   const byId = new Map(workspaces.map((w) => [w.id, w]));
   const visited = new Set<string>();
+  const visiting = new Set<string>();
   const sorted: WorkspaceData[] = [];
   function visit(ws: WorkspaceData) {
     if (visited.has(ws.id)) return;
+    if (visiting.has(ws.id)) {
+      throw new TopologyCycleError(
+        `cyclic parent chain detected at workspace ${ws.id}`,
+      );
+    }
+    visiting.add(ws.id);
     if (ws.parent_id && byId.has(ws.parent_id) && !visited.has(ws.parent_id)) {
       visit(byId.get(ws.parent_id)!);
     }
+    visiting.delete(ws.id);
     visited.add(ws.id);
     sorted.push(ws);
   }
