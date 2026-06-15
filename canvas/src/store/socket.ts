@@ -66,6 +66,12 @@ export class RehydrateDedup {
  *  for a duplicate fetch. */
 export const FALLBACK_POLL_MS = 10_000;
 
+/** Maximum time to wait for a WebSocket handshake before giving up and
+ *  scheduling a reconnect. Without this the browser can leave a socket in
+ *  CONNECTING for ~75s (Chrome SYN-SENT behavior), leaving the UI silently
+ *  stuck. The fallback poll keeps /workspaces fresh in parallel. */
+const CONNECT_TIMEOUT_MS = 10_000;
+
 class ReconnectingSocket {
   private ws: WebSocket | null = null;
   private attempt = 0;
@@ -73,6 +79,7 @@ class ReconnectingSocket {
   private lastEventTime = 0;
   private healthCheckTimer: ReturnType<typeof setInterval> | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private connectTimeoutTimer: ReturnType<typeof setTimeout> | null = null;
   // Polls /workspaces while the WS is unhealthy so the canvas reflects
   // truth even when realtime events aren't arriving. Without this the
   // store can stay frozen for minutes — e.g. workspaces transition
@@ -118,6 +125,7 @@ class ReconnectingSocket {
     this.startFallbackPoll();
     const ws = new WebSocket(this.url);
     this.ws = ws;
+    this.startConnectTimeout(ws);
 
     ws.onopen = () => {
       if (this.disposed || this.ws !== ws) {
@@ -126,6 +134,7 @@ class ReconnectingSocket {
         try { ws.close(); } catch { /* noop */ }
         return;
       }
+      this.clearConnectTimeout();
       this.attempt = 0;
       this.lastEventTime = Date.now();
       useCanvasStore.getState().setWsStatus("connected");
@@ -157,12 +166,11 @@ class ReconnectingSocket {
       // corresponds to the WS we just tore down (prevents a stale
       // onclose from a zombie socket from re-arming the loop).
       if (this.disposed || this.ws !== ws) return;
+      this.clearConnectTimeout();
       this.stopHealthCheck();
       useCanvasStore.getState().setWsStatus("connecting");
       this.startFallbackPoll();
-      const delay = Math.min(1000 * 2 ** this.attempt, 30000);
-      this.attempt++;
-      this.reconnectTimer = setTimeout(() => this.connect(), delay);
+      this.scheduleReconnect();
     };
 
     ws.onerror = () => {
@@ -190,6 +198,37 @@ class ReconnectingSocket {
       clearInterval(this.healthCheckTimer);
       this.healthCheckTimer = null;
     }
+  }
+
+  private startConnectTimeout(ws: WebSocket) {
+    this.clearConnectTimeout();
+    this.connectTimeoutTimer = setTimeout(() => {
+      this.handleConnectTimeout(ws);
+    }, CONNECT_TIMEOUT_MS);
+  }
+
+  private clearConnectTimeout() {
+    if (this.connectTimeoutTimer) {
+      clearTimeout(this.connectTimeoutTimer);
+      this.connectTimeoutTimer = null;
+    }
+  }
+
+  private handleConnectTimeout(ws: WebSocket) {
+    if (this.disposed || this.ws !== ws) return;
+    // Abandon this socket before closing it so the real onclose doesn't
+    // double-schedule a reconnect.
+    this.ws = null;
+    try { ws.close(); } catch { /* noop */ }
+    useCanvasStore.getState().setWsStatus("connecting");
+    this.startFallbackPoll();
+    this.scheduleReconnect();
+  }
+
+  private scheduleReconnect() {
+    const delay = Math.min(1000 * 2 ** this.attempt, 30000);
+    this.attempt++;
+    this.reconnectTimer = setTimeout(() => this.connect(), delay);
   }
 
   /** While the WS is in connecting/disconnected limbo, poll /workspaces
@@ -249,6 +288,7 @@ class ReconnectingSocket {
     this.disposed = true;
     this.stopHealthCheck();
     this.stopFallbackPoll();
+    this.clearConnectTimeout();
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;

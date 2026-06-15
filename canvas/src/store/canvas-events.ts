@@ -35,8 +35,27 @@ export function resetProvisioningSequence(): void {
  *  WORKSPACE_PROVISIONING — buffered here so the late-arriving
  *  provision event can immediately flip to the correct status
  *  instead of leaving the node stuck as "provisioning" forever.
- *  Cleared when applied, or on module reset (tests). */
+ *  Cleared when applied, on module reset (tests), or when the cap
+ *  evicts the oldest entry. */
 const _pendingOnline = new Set<string>();
+
+// Defensive cap: a dropped PROVISIONING event would otherwise let this
+// buffer grow without bound for the lifetime of the session.
+const PENDING_ONLINE_MAX = 1000;
+
+function bufferPendingOnline(id: string): void {
+  if (_pendingOnline.size >= PENDING_ONLINE_MAX) {
+    // Sets preserve insertion order; evict the oldest buffered id.
+    const oldest = _pendingOnline.values().next().value;
+    if (oldest !== undefined) _pendingOnline.delete(oldest);
+  }
+  _pendingOnline.add(id);
+}
+
+/** Exposed for unit tests only. */
+export function __pendingOnlineSizeForTest(): number {
+  return _pendingOnline.size;
+}
 
 /** Debounced parent-grow. Each child arrival schedules this; the
  *  timer keeps resetting as more siblings land, so the actual
@@ -86,7 +105,7 @@ export function handleCanvasEvent(
         // this tab joined mid-deploy). Buffer so the later PROVISIONING
         // handler can flip status in one pass instead of leaving the
         // node stuck in "provisioning" forever.
-        _pendingOnline.add(msg.workspace_id);
+        bufferPendingOnline(msg.workspace_id);
         break;
       }
       // Flip incoming edge from blueprint → laser so the link is
