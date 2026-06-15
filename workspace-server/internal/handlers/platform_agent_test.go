@@ -462,6 +462,12 @@ func TestApplyConciergeProvisionConfig_OnlyPlatformGetsOrgMCP(t *testing.T) {
 	t.Setenv("PLATFORM_URL", "http://platform:8080")
 	h := &WorkspaceHandler{}
 	const kindQuery = `SELECT COALESCE\(kind, 'workspace'\) FROM workspaces WHERE id =`
+	// ensureConciergeModel (step 0, platform kind only) reads the stored MODEL
+	// secret to decide seed-vs-respect. These subtests are about MCP/name, so
+	// they stub an EXISTING model → ensureConciergeModel returns early (no
+	// INSERT). The seed path itself is covered by
+	// TestApplyConciergeProvisionConfig_SeedsModel.
+	const modelSelQuery = `SELECT encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1 AND key = 'MODEL'`
 
 	t.Run("ordinary workspace gets NO org MCP, NO admin token, NO substitution", func(t *testing.T) {
 		mock := setupTestDB(t)
@@ -500,6 +506,9 @@ func TestApplyConciergeProvisionConfig_OnlyPlatformGetsOrgMCP(t *testing.T) {
 		mock := setupTestDB(t)
 		mock.ExpectQuery(kindQuery).WithArgs("ws-concierge").
 			WillReturnRows(sqlmock.NewRows([]string{"kind"}).AddRow("platform"))
+		mock.ExpectQuery(modelSelQuery).WithArgs("ws-concierge").
+			WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}).
+				AddRow([]byte("moonshot/kimi-k2.6"), 0))
 		env := map[string]string{}
 		cf := map[string][]byte{
 			"config.yaml":      []byte("runtime: claude-code\nmodel: moonshot/kimi-k2.6\n"),
@@ -536,6 +545,9 @@ func TestApplyConciergeProvisionConfig_OnlyPlatformGetsOrgMCP(t *testing.T) {
 		mock := setupTestDB(t)
 		mock.ExpectQuery(kindQuery).WithArgs("ws-concierge").
 			WillReturnRows(sqlmock.NewRows([]string{"kind"}).AddRow("platform"))
+		mock.ExpectQuery(modelSelQuery).WithArgs("ws-concierge").
+			WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}).
+				AddRow([]byte("moonshot/kimi-k2.6"), 0))
 		env := map[string]string{}
 		// Already-substituted prompt (a re-provision of a running concierge).
 		cf := map[string][]byte{
@@ -556,12 +568,108 @@ func TestApplyConciergeProvisionConfig_OnlyPlatformGetsOrgMCP(t *testing.T) {
 	})
 }
 
+// TestApplyConciergeProvisionConfig_SeedsModel is the CI regression gate for
+// the 2026-06-15 incident: #2919 removed the concierge model-seed, so every
+// fresh platform-agent provision reached the universal MISSING_MODEL gate
+// (core#2594) with no stored model and failed closed ("reached provisioning
+// with no model set"). It passed CI because no test (and no e2e) provisions a
+// fresh platform agent through the model path. This test asserts the seed
+// fires for a model-less platform agent, is SEED-ONLY (respects a customer's
+// later pick), and never touches ordinary workspaces.
+func TestApplyConciergeProvisionConfig_SeedsModel(t *testing.T) {
+	h := &WorkspaceHandler{}
+	const kindQuery = `SELECT COALESCE\(kind, 'workspace'\) FROM workspaces WHERE id =`
+	const modelSelQuery = `SELECT encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1 AND key = 'MODEL'`
+	const modelInsert = `INSERT INTO workspace_secrets`
+
+	t.Run("fresh platform agent with NO stored model gets the declared model seeded + persisted", func(t *testing.T) {
+		mock := setupTestDB(t)
+		mock.ExpectQuery(kindQuery).WithArgs("ws-fresh").
+			WillReturnRows(sqlmock.NewRows([]string{"kind"}).AddRow("platform"))
+		// No MODEL row yet (first boot) → readStoredModelSecret returns "".
+		mock.ExpectQuery(modelSelQuery).WithArgs("ws-fresh").
+			WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}))
+		// Seed path must PERSIST the declared model.
+		mock.ExpectExec(modelInsert).
+			WithArgs("ws-fresh", sqlmock.AnyArg(), sqlmock.AnyArg()).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+
+		env := map[string]string{}
+		h.applyConciergeProvisionConfig(context.Background(), "ws-fresh", "", nil, env, "Org Concierge")
+
+		// THE regression assertion: without this seed the provision hits
+		// MISSING_MODEL and fails closed. Both canonical env names must carry
+		// the declared model so the runtime actually boots on it this provision.
+		if env["MODEL"] != conciergeDeclaredModel {
+			t.Errorf("fresh concierge did not seed MODEL=%q; got %q (env=%v) — MISSING_MODEL would fail this provision closed", conciergeDeclaredModel, env["MODEL"], env)
+		}
+		if env["MOLECULE_MODEL"] != conciergeDeclaredModel {
+			t.Errorf("fresh concierge did not seed MOLECULE_MODEL=%q; got %q", conciergeDeclaredModel, env["MOLECULE_MODEL"])
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("unmet sqlmock expectations (the MODEL secret was not persisted): %v", err)
+		}
+	})
+
+	t.Run("SEED-ONLY: an existing customer model is respected, never overwritten", func(t *testing.T) {
+		mock := setupTestDB(t)
+		mock.ExpectQuery(kindQuery).WithArgs("ws-picked").
+			WillReturnRows(sqlmock.NewRows([]string{"kind"}).AddRow("platform"))
+		// Customer already picked a model — stored MODEL secret present.
+		mock.ExpectQuery(modelSelQuery).WithArgs("ws-picked").
+			WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}).
+				AddRow([]byte("anthropic:claude-opus-4-8"), 0))
+		// NO ExpectExec: ensureConciergeModel must return early (no re-seed,
+		// no INSERT) — re-asserting the default would silently revert the pick.
+
+		env := map[string]string{}
+		h.applyConciergeProvisionConfig(context.Background(), "ws-picked", "", nil, env, "Org Concierge")
+
+		if env["MODEL"] == conciergeDeclaredModel {
+			t.Errorf("seed-only violated: ensureConciergeModel overwrote the customer's model with the declared default")
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("unmet sqlmock expectations (an unexpected INSERT means it re-seeded over the customer's pick): %v", err)
+		}
+	})
+
+	t.Run("ordinary workspace never seeds a model (no model queries at all)", func(t *testing.T) {
+		mock := setupTestDB(t)
+		mock.ExpectQuery(kindQuery).WithArgs("ws-ordinary").
+			WillReturnRows(sqlmock.NewRows([]string{"kind"}).AddRow("workspace"))
+		// No model SELECT/INSERT expected — the hook returns before step 0.
+
+		env := map[string]string{}
+		h.applyConciergeProvisionConfig(context.Background(), "ws-ordinary", "", nil, env, "Worker")
+
+		if _, ok := env["MODEL"]; ok {
+			t.Errorf("ordinary workspace had a model seeded — the concierge model-seed must be platform-kind only; env=%v", env)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("unmet sqlmock expectations (ordinary workspace ran a model query): %v", err)
+		}
+	})
+}
+
 // TestNoConciergeLiteralsInCore is the regression guard for the RFC #2843
-// §10a de-hardcode: the concierge's identity (system prompt, model, runtime,
-// MCP wiring) MUST live in the platform-agent template, not as Go string
-// literals in core. A future re-introduction of the consts would silently
-// regress the SSOT; this test fails on a fresh build if any of the deleted
-// identifiers reappear as bare Go references in the package source.
+// §10a de-hardcode: the concierge's PROMPT + MCP-wiring identity (system
+// prompt template, MCP-servers block, identity files) MUST live in the
+// platform-agent template, not as Go string literals in core. A future
+// re-introduction of those consts would silently regress the SSOT; this test
+// fails on a fresh build if any of the banned identifiers reappear as bare Go
+// references in the package source.
+//
+// NOTE (incident 2026-06-15): conciergeDeclaredModel is DELIBERATELY NOT
+// banned. The model is the ONE concierge identity element that legitimately
+// lives in core: the universal MISSING_MODEL gate (core#2594) reads the stored
+// MODEL secret at provision time — BEFORE any template config.yaml is fetched —
+// so the model MUST be seeded from a core-resident declared value, not deferred
+// to template delivery. #2919 wrongly lumped the model in with the prompt/MCP
+// literals and banned it here; removing the model-seed regressed every fresh
+// platform-agent provision to MISSING_MODEL fail-closed. The concierge IS the
+// platform-agent product, so it declares its own model exactly as a template
+// does (this is SSOT-correct, not a hardcoded platform default). The seeding is
+// gated by TestApplyConciergeProvisionConfig_SeedsModel.
 //
 // This is a grep over the package — brittle by design (intentionally so:
 // the concierge-literal pattern was the exact failure mode of the
@@ -572,7 +680,6 @@ func TestNoConciergeLiteralsInCore(t *testing.T) {
 		"conciergeSystemPromptTmpl",
 		"conciergeMCPServersBlock",
 		"conciergeMCPFragmentFile",
-		"conciergeDeclaredModel",
 		"conciergeIdentityFiles",
 	}
 	for _, id := range banned {
