@@ -132,6 +132,16 @@ jobs:
     # this cap catches any step that leaks past that. Set well above 10m so
     # the per-step timeout is the active constraint.
     timeout-minutes: 15
+    # MOLECULE_GITEA_TOKEN: the manifest_pinning tests in
+    # internal/handlers/manifest_pinning_test.go (RFC #2927) call the
+    # Gitea API to verify the pinned SHAs are reachable + that
+    # workspace_template entries' trees contain config.yaml. Private
+    # template repos (molecule-ai-workspace-template-google-adk,
+    # molecule-ai-workspace-template-seo-agent) return 404 without
+    # auth — same secret as harness-replays.yml uses for
+    # clone-manifest.sh.
+    env:
+      MOLECULE_GITEA_TOKEN: ${{ secrets.AUTO_SYNC_TOKEN }}
     defaults:
       run:
         working-directory: workspace-server

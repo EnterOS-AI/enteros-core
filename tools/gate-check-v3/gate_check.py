@@ -503,18 +503,62 @@ def _pr_diff_stats(pr_number: int, repo: str) -> dict:
     }
 
 
-def _pr_has_refactor_exemption(pr_data: dict) -> bool:
+def _label_appliers(pr_number: int, repo: str) -> dict[str, set[str]]:
+    """Fetch the issue timeline and return a mapping from lowercase label
+    name to the set of logins that applied that label.
+
+    Fail-closed: if the timeline API is unreachable or returns unexpected
+    data, returns an empty mapping so no label exemption can be proven.
+    """
+    owner, name = repo.split("/", 1)
+    try:
+        events = api_list(f"/repos/{owner}/{name}/issues/{pr_number}/timeline")
+    except GiteaError:
+        return {}
+    appliers: dict[str, set[str]] = {}
+    for event in events:
+        if event.get("type") != "label":
+            continue
+        # Gitea encodes label ADD as body="1" and label REMOVE as body="".
+        # Only ADD events count as applying the label; counting removals would
+        # let a non-author who *removed* an exempt label enable an author who
+        # re-added it — inverting the self-exemption guard (core#2884).
+        if (event.get("body") or "") != "1":
+            continue
+        label = event.get("label") or {}
+        label_name = (label.get("name") or "").lower()
+        user = (event.get("user") or {}).get("login", "")
+        if not label_name or not user:
+            continue
+        appliers.setdefault(label_name, set()).add(user)
+    return appliers
+
+
+def _pr_has_refactor_exemption(pr_data: dict, pr_number: int, repo: str) -> bool:
     """True iff the PR has a label in REFACTOR_EXEMPT_LABELS (e.g. 'refactor',
     'migration', 'generated', 'vendor') that opts it out of the destructive
-    BLOCK. The exemption is LABEL-only (not PR-body-marker) because labels
-    are the canonical signal already understood by the rest of the gate
-    stack. Refactor-exempt PRs still get the WARN tier (not CLEAR) so
-    operators can see the destructive diff size — they just don't get
-    a BLOCK.
+    BLOCK, AND that label was applied by someone other than the PR author.
+
+    Defense-in-depth against self-exemption (core#2884): a PR author with
+    label-write permission cannot attach an exempt label to their own
+    destructive diff and downgrade a BLOCK to WARN. The exemption is still
+    LABEL-based (not PR-body-marker) because labels are the canonical signal
+    already understood by the rest of the gate stack.
+
+    Refactor-exempt PRs still get the WARN tier (not CLEAR) so operators
+    can see the destructive diff size — they just don't get a BLOCK.
     """
+    author = (pr_data.get("user") or {}).get("login", "")
+    appliers = _label_appliers(pr_number, repo)
     for label in pr_data.get("labels", []) or []:
         name = (label.get("name") or "").lower()
-        if name in REFACTOR_EXEMPT_LABELS:
+        if name not in REFACTOR_EXEMPT_LABELS:
+            continue
+        # Require proof that a non-author applied this label. If we cannot
+        # determine who applied it (timeline missing / API error), fail
+        # closed and do not honor the exemption.
+        label_appliers = appliers.get(name, set())
+        if any(login != author for login in label_appliers):
             return True
     return False
 
@@ -531,7 +575,8 @@ def signal_7_destructive_diff_guard(
         from the PR-files API.
       - branch divergence (base.sha vs current target-branch HEAD) and
         commits_behind via signal_4's helper.
-      - refactor exemption via PR labels.
+      - refactor exemption via PR labels applied by a non-author (core#2884
+        defense-in-depth: author-self-applied exempt labels are ignored).
 
     Verdict:
       - BLOCK  when (files>=200 OR net_deleted>=5000 OR deleted>=10000)
@@ -570,7 +615,7 @@ def signal_7_destructive_diff_guard(
     files_changed = stats["files_changed"]
     deleted_lines = stats["deleted_lines"]
     net_deleted = stats["net_deleted_lines"]
-    has_refactor_exemption = _pr_has_refactor_exemption(pr_data)
+    has_refactor_exemption = _pr_has_refactor_exemption(pr_data, pr_number, repo)
 
     # High-confidence destructive condition:
     #   - any of the destructive diff thresholds
