@@ -821,6 +821,56 @@ def is_runtime_bump_exempt(
     )
 
 
+def _parse_bump_pr_title(title: str) -> tuple[str, str] | None:
+    """Parse a bump-bot PR title into (runtime_name, version).
+
+    Returns None if the title doesn't match a recognized bump-bot
+    format. The caller treats a None return as "singleton bucket, no
+    dedup possible" (fail-safe — a non-matching title is never
+    spuriously grouped with anything else).
+
+    Recognized formats (per the 9c2e9c88 spec):
+      - "runtime:<runtime>-<version>"  (no leading 'v' on version)
+      - "<runtime> bump to <version>"  (version may or may not have leading 'v')
+      - "runtime: <runtime> bump to <version>"  (hybrid: prefix + verb form)
+
+    Examples:
+      "runtime:claude-code-v1.2.3"          -> ("claude-code", "v1.2.3")
+      "claude-code bump to v1.2.3"         -> ("claude-code", "v1.2.3")
+      "runtime: claude-code bump to v1.2.3"-> ("claude-code", "v1.2.3")
+      "kimi-cli bump to v0.5.0"            -> ("kimi-cli", "v0.5.0")
+      "fix typo in docs"                    -> None
+    """
+    if not isinstance(title, str) or not title:
+        return None
+    # The "runtime:" prefix is optional — strip it if present so we can
+    # use a single regex for the two body forms.
+    body = title[len("runtime:"):].lstrip() if title.startswith("runtime:") else title
+    # Format 1: "<runtime>-<version>" — runtime name is the substring
+    # before the last "-v<MAJOR>.<MINOR>.<PATCH>" suffix.
+    m = re.search(r"-v\d+\.\d+\.\d+\s*$", body)
+    if m:
+        runtime_name = body[: m.start()].strip()
+        version = body[m.start() + 1 :].strip()
+        if runtime_name and version:
+            return (runtime_name, version)
+    # Format 2: "<runtime> bump to <version>"
+    m = re.match(
+        r"^(?P<runtime>\S+)\s+bump to\s+(?P<version>v?\d+\.\d+\.\d+)\s*$",
+        body,
+    )
+    if m:
+        runtime_name = m.group("runtime").strip()
+        version = m.group("version").strip()
+        # Normalize version to leading "v" so the dedup key matches across
+        # formats (e.g. "1.2.3" from format 1 == "v1.2.3" from format 2).
+        if not version.startswith("v"):
+            version = "v" + version
+        if runtime_name and version:
+            return (runtime_name, version)
+    return None
+
+
 def dup_close_superseded_bump_prs(
     prs: list[dict],
     *,
@@ -849,6 +899,17 @@ def dup_close_superseded_bump_prs(
     """
     # Bucket PRs by (runtime, version). Skip PRs that aren't
     # single-line .runtime-version bumps authored by bump-bot.
+    #
+    # Title-based parsing: bump-bot PR titles follow one of two stable
+    # formats per the 9c2e9c88 spec:
+    #   - "runtime:<runtime>-<version>"  (e.g. "runtime:claude-code-v1.2.3")
+    #   - "<runtime> bump to <version>"  (e.g. "claude-code bump to v1.2.3")
+    # We parse the title to extract (runtime, version) explicitly so the
+    # bucket key matches the documented dedup semantic ("newest per
+    # (runtime, version)"). A title that doesn't match either format is
+    # treated as its own single-PR bucket — the per-PR close guard
+    # (`if len(group) <= 1: continue`) makes that a no-op. This is
+    # fail-safe: a non-standard title is never spuriously closed.
     buckets: dict[tuple[str, str], list[dict]] = {}
     for pr in prs:
         if not isinstance(pr, dict):
@@ -856,35 +917,14 @@ def dup_close_superseded_bump_prs(
         author = (pr.get("user") or {}).get("login", "")
         if author != RUNTIME_BUMP_BOT_USER:
             continue
-        # The PR's `body` field carries the rendered diff URL but not the
-        # patch; the full diff inspection is the caller's responsibility
-        # (in production, the caller pre-fetches pr_files and only passes
-        # PRs that are single-line bumps; here we accept any bump-bot PR
-        # so the caller can opt to do its own pre-filtering).
-        title = pr.get("title", "")
-        # Heuristic: bump PR titles follow `runtime:<runtime>-<version>`
-        # or `<runtime> bump to <version>`. We don't try to parse — the
-        # caller is expected to filter to bump PRs upstream. Here we
-        # bucket by (number) only, then post-close the older ones.
         number = int(pr.get("number", 0))
         if not number:
             continue
-        # Use a single "open bump PRs" bucket (we don't have the diff
-        # at this layer). The caller is expected to pass ONLY the PRs
-        # that are clean single-line .runtime-version bumps, so any
-        # remaining dupes are by construction same-(runtime, version).
-        # Without the diff, the safest dedup is to keep the newest
-        # across the whole bump-bot set; this errs on the side of
-        # closing more rather than fewer.
-        key = ("bump", str(number))
-        # We treat the whole bump-bot PR set as one bucket per PR
-        # (number is unique). To implement the "newest per
-        # (runtime,version)" semantics, the caller is expected to
-        # group by (runtime, version) and call us once per group.
-        # But for the conservative always-safe path, we keep this
-        # function per-call and let the caller drive grouping.
-        _ = key
-        buckets.setdefault(("bump", title), []).append(pr)
+        runtime_v = _parse_bump_pr_title(pr.get("title", ""))
+        # Group by (runtime, version); non-matching titles get a unique
+        # sentinel key so they end up in a singleton bucket (no-op).
+        bucket_key = runtime_v if runtime_v is not None else (str(number), "")
+        buckets.setdefault(bucket_key, []).append(pr)
 
     closed: list[int] = []
     for _key, group in buckets.items():

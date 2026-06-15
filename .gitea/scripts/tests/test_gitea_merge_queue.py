@@ -2265,23 +2265,29 @@ def test_runtime_bump_exempt_rejects_empty_required_contexts():
     assert "empty" in reason
 
 
-def test_runtime_bump_exempt_accepts_case_insensitive_smoke_substring():
+def test_runtime_bump_exempt_accepts_case_insensitive_smoke_substring(monkeypatch):
+    """The smoke-context substring match is case-INsensitive: a required
+    context named `CI / RUNTIME-PROVISION-SMOKE (pull_request)` (uppercase
+    "RUNTIME-PROVISION-SMOKE") should still satisfy the gate when
+    RUNTIME_PROVISION_SMOKE_CONTEXTS contains the lowercase form. The
+    runtime must also be on the allowlist for the exemption to actually
+    fire — this test sets the allowlist so the smoke check is the one
+    under test."""
+    _set_allowlist(monkeypatch, "claude-code")
     pr = _bump_pr()
-    # RUNTIME_PROVISION_SMOKE_CONTEXTS contains "runtime-provision-smoke"
-    # (lowercase); the required context can be mixed-case.
     exempt, reason = mq.is_runtime_bump_exempt(
         pr=pr,
-        pr_files=[_runtime_version_file()],
+        pr_files=[_runtime_version_file(added="claude-code@v0.5.1", removed="claude-code@v0.5.0")],
         required_contexts=["CI / RUNTIME-PROVISION-SMOKE (pull_request)"],
-        latest_runtime_v_tag="v1.2.3",
+        latest_runtime_v_tag="v0.5.1",
         rc_active=False,
-        # Need to be on the allowlist too — this test focuses on CI match
     )
-    # Result depends on allowlist: not on allowlist by default → not exempt.
-    # The CI smoke substring match is necessary but not sufficient.
-    assert exempt is False
-    # The failure reason should reference the allowlist, not the smoke check.
-    assert "allowlist" in reason or "smoke" in reason  # whichever fired first
+    # All guards + conditions satisfied: exempt=True. The smoke match
+    # being case-insensitive is what lets the uppercase required context
+    # satisfy the lowercase substring list.
+    assert exempt is True, f"expected exempt (smoke match should be case-insensitive), got: {reason}"
+    assert "v0.5.0" in reason
+    assert "v0.5.1" in reason
 
 
 # ---- CONDITION 2b: GATE-ADEQUACY (template allowlist) ----
@@ -2565,6 +2571,86 @@ def test_dup_close_superseded_bump_prs_ignores_non_bump_bot_authors():
         dry_run=False,
     )
     assert result == []  # the hand PR is ignored, no dup to close
+
+
+# ---- Helpers: _parse_bump_pr_title ----
+
+def test_parse_bump_pr_title_format_1_runtime_dash_version():
+    """Format 1: 'runtime:<name>-v<ver>' — the dash form used by some
+    bump-bot configs (no space, no 'bump to' verb)."""
+    assert mq._parse_bump_pr_title("runtime:claude-code-v1.2.3") == ("claude-code", "v1.2.3")
+    assert mq._parse_bump_pr_title("runtime:kimi-cli-v0.5.0") == ("kimi-cli", "v0.5.0")
+
+
+def test_parse_bump_pr_title_format_2_bump_to():
+    """Format 2: '<name> bump to <ver>' — the verb form."""
+    assert mq._parse_bump_pr_title("claude-code bump to v1.2.3") == ("claude-code", "v1.2.3")
+    # Version without leading 'v' should be normalized to leading 'v'.
+    assert mq._parse_bump_pr_title("claude-code bump to 1.2.3") == ("claude-code", "v1.2.3")
+
+
+def test_parse_bump_pr_title_hybrid_runtime_prefix_and_bump_to():
+    """Hybrid: 'runtime: <name> bump to <ver>' — the prefix is decorative;
+    the body uses the verb form. The runtime name is the segment between
+    the prefix and the verb, the version is what comes after 'bump to'."""
+    assert mq._parse_bump_pr_title("runtime: claude-code bump to v1.2.3") == ("claude-code", "v1.2.3")
+
+
+def test_parse_bump_pr_title_normalizes_version_across_formats():
+    """Same (runtime, version) from different title formats MUST produce
+    the same bucket key — otherwise dedup would fragment across formats
+    and the auto-merge exemption would still race stale vs fresh CI."""
+    a = mq._parse_bump_pr_title("runtime:claude-code-v1.2.3")
+    b = mq._parse_bump_pr_title("claude-code bump to v1.2.3")
+    c = mq._parse_bump_pr_title("claude-code bump to 1.2.3")
+    d = mq._parse_bump_pr_title("runtime: claude-code bump to v1.2.3")
+    assert a == b == c == d, (
+        f"dedup key must be stable across title formats; got: "
+        f"a={a} b={b} c={c} d={d}"
+    )
+
+
+def test_parse_bump_pr_title_unrecognized_returns_none():
+    """Titles that don't match any bump-bot format return None — the
+    caller treats these as singleton buckets (no spurious dedup)."""
+    assert mq._parse_bump_pr_title("fix typo in docs") is None
+    assert mq._parse_bump_pr_title("") is None
+    assert mq._parse_bump_pr_title("runtime:") is None  # prefix only
+    assert mq._parse_bump_pr_title("runtime: claude-code") is None  # no version
+    assert mq._parse_bump_pr_title("claude-code bumped v1.2.3") is None  # wrong verb
+    # Non-semver version is not a bump-bot format
+    assert mq._parse_bump_pr_title("claude-code bump to latest") is None
+
+
+def test_dup_close_superseded_bump_prs_separate_runtime_versions():
+    """Two bump-bot PRs with DIFFERENT (runtime, version) tuples are not
+    dupes — they land in separate buckets and are not closed. Pins
+    that the parser actually distinguishes versions."""
+    pr_v123 = {
+        "number": 500,
+        "title": "runtime: claude-code bump to v1.2.3",
+        "user": {"login": "bump-bot"},
+        "state": "open",
+        "updated_at": "2026-06-14T18:00:00Z",
+    }
+    pr_v124 = {
+        "number": 501,
+        "title": "runtime: claude-code bump to v1.2.4",
+        "user": {"login": "bump-bot"},
+        "state": "open",
+        "updated_at": "2026-06-14T18:00:00Z",
+    }
+    closed: list[int] = []
+    def fake_close(pr_number, *, dry_run): closed.append(pr_number)
+    def fake_comment(pr_number, body, *, dry_run): pass
+    result = mq.dup_close_superseded_bump_prs(
+        [pr_v123, pr_v124],
+        close_fn=fake_close,
+        comment_fn=fake_comment,
+        dry_run=False,
+    )
+    assert result == []
+    assert closed == []
 
 
 # ---- Helpers: _is_active_release_candidate ----
