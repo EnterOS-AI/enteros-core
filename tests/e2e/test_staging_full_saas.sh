@@ -239,9 +239,24 @@ E2E_TMP_FILES=()
 # and exits 0 so the advisory staging gate goes green-with-skip rather than
 # false-red on a known transient A2A-layer degradation. The trap still tears
 # down the org.
+#
+# Fail-closed on repeated skips: a broadly broken agent that triggers skips on
+# every A2A call would otherwise paint the advisory lane green while masking a
+# real regression. We allow one distinct skip reason per run; a second distinct
+# reason (or any repeated skip after the cap) converts to a hard failure.
+INFRA_SKIP_REASONS=""
 infra_skip() {
   local reason="$1"
   local detail="${2:-}"
+  case " $INFRA_SKIP_REASONS " in
+    *" $reason "*) ;;
+    *) INFRA_SKIP_REASONS="$INFRA_SKIP_REASONS $reason" ;;
+  esac
+  local distinct_count
+  distinct_count=$(echo "$INFRA_SKIP_REASONS" | wc -w | tr -d ' ')
+  if [ "$distinct_count" -ge 2 ]; then
+    fail "infra-skip cap exceeded ($distinct_count distinct reasons:${INFRA_SKIP_REASONS:-none}) — refusing false-green on repeated A2A-layer degradation"
+  fi
   echo "[$(date +%H:%M:%S)] ⚠️  scan_status: infra-skip:${reason}${detail:+ $detail}"
   exit 0
 }
@@ -1265,11 +1280,13 @@ except Exception:
       done
       rm -f "$poll_tmp"
       # Ran out of queue poll attempts.
-      # core#2917: if a gateway error preceded a queued task that never
-      # drained, treat it as a transient A2A-layer infra-skip rather than
-      # a workspace-code failure. Verified signature: 502/503/504 on an
-      # initial POST, queue_id assigned, then 30/30 polls stuck in queued/
-      # dispatched/in_progress/empty (never completed/failed/dropped).
+      # core#2917: if a gateway-edge error preceded a queued task that never
+      # drained, treat it as a transient A2A-layer infra-skip rather than a
+      # workspace-code failure. The flag is only set for edge signals (Bad
+      # Gateway/Gateway Timeout/error-code 502/504/no healthy upstream), never
+      # for agent-origin signals that could mask a real regression.
+      # Verified signature: 502/503/504 on an initial POST, queue_id assigned,
+      # then 30/30 polls stuck in queued/dispatched/in_progress/empty.
       case "$last_qstatus" in
         queued|dispatched|in_progress|"")
           if [ "$a2a_gateway_error_seen" = "1" ] && [ -n "$qid" ]; then
@@ -1324,16 +1341,27 @@ except Exception:
 
     local safe_body
     safe_body=$(printf '%s' "$resp" | sanitize_http_body)
-    if echo "$code" | grep -Eq '^(502|503|504)$' && echo "$safe_body" | grep -Eqi 'Service Unavailable|Bad Gateway|Gateway Timeout|error code: 502|error code: 504|workspace agent unreachable|connection refused|no healthy upstream|workspace agent busy|native_session|restarting|restart triggered'; then
-      a2a_gateway_error_seen=1
-      echo "    $label A2A transient $code attempt $attempt/12: $safe_body" >&2
-      if [ "$attempt" -lt 12 ]; then
-        local sleep_sec=10
-        if echo "$safe_body" | grep -Eqi 'workspace agent busy|native_session|restarting|restart triggered'; then
-          sleep_sec=30
+    if echo "$code" | grep -Eq '^(502|503|504)$'; then
+      # core#2917: split gateway-edge signals (unambiguous transient infra,
+      # eligible for the queue-timeout infra-skip) from agent-origin signals
+      # that can hide a real workspace-agent regression. Only edge signals set
+      # a2a_gateway_error_seen; agent-origin retries are still allowed but will
+      # never skip-to-green if the queue never drains.
+      if echo "$safe_body" | grep -Eqi 'Service Unavailable|Bad Gateway|Gateway Timeout|error code: 502|error code: 504|no healthy upstream'; then
+        a2a_gateway_error_seen=1
+        echo "    $label A2A transient gateway $code attempt $attempt/12: $safe_body" >&2
+        if [ "$attempt" -lt 12 ]; then
+          sleep 10
+          continue
         fi
-        sleep "$sleep_sec"
-        continue
+      elif echo "$safe_body" | grep -Eqi 'workspace agent unreachable|connection refused|workspace agent busy|native_session|restarting|restart triggered'; then
+        echo "    $label A2A agent-origin $code attempt $attempt/12: $safe_body" >&2
+        if [ "$attempt" -lt 12 ]; then
+          # Agent restart/cold-start can take tens of seconds; keep polling,
+          # but do NOT treat this as an edge-gateway transient eligible for skip.
+          sleep 30
+          continue
+        fi
       fi
     fi
     break
