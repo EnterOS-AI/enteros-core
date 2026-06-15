@@ -5,9 +5,10 @@ package provisioner
 //
 // The IMAGE-BAKED impl (workspace-server/Dockerfile.platform-agent)
 // bakes the concierge's identity (config.yaml +
-// prompts/concierge.md + mcp_servers.yaml) from the platform-agent
-// TEMPLATE REPO into the platform-agent image at
-// /opt/molecule-platform-agent-template/. The driver hard-requirement:
+// prompts/concierge.md + mcp_servers.yaml + identity-fallback.sh)
+// from the platform-agent TEMPLATE REPO into the platform-agent
+// image at /opt/molecule-platform-agent-template/. The driver
+// hard-requirement:
 // "The image-baked config.yaml + prompts/concierge.md +
 // mcp_servers.yaml MUST be SOURCED FROM the platform-agent TEMPLATE
 // REPO (single SSOT = PR #1's content) — NOT vendored/duplicated in
@@ -47,16 +48,17 @@ package provisioner
 // (the publish-workspace-server-image.yml workflow does this via
 // the post-pre-clone test step).
 //
-// Test scope: the 3 files the Dockerfile COPYs (config.yaml,
-// mcp_servers.yaml, prompts/concierge.md). A future concierge-
-// identity change that adds a new file MUST also extend the
-// expectedImageBakedFiles list here; the Dockerfile-side check
-// catches the missing COPY, and the SSOT-side check (when run)
-// catches the missing identity file in the template repo.
+// Test scope: the 4 files the Dockerfile COPYs (config.yaml,
+// mcp_servers.yaml, prompts/concierge.md, identity-fallback.sh).
+// A future concierge-identity change that adds a new file MUST also
+// extend the expectedImageBakedFiles list here; the Dockerfile-side
+// check catches the missing COPY, and the SSOT-side check (when
+// run) catches the missing identity file in the template repo.
 
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -70,10 +72,24 @@ import (
 // Paths are RELATIVE to the SSOT root (the platform-agent template
 // repo). The Dockerfile's PLATFORM_AGENT_TEMPLATE_DIR build-arg
 // points at this same root.
+//
+// The "identity-fallback.sh" entry is the boot-time per-file copy
+// script (template-platform-agent #2, copied into the image and
+// invoked from the platform-agent entrypoint). It's a 1st-class
+// IMAGE-BAKED asset (NOT metadata / not a future change) — the
+// runtime /opt→/configs fallback (workspace-runtime PR #141
+// load_config) and the boot-time /opt→/configs fallback (this
+// Dockerfile's entrypoint) are complementary, and BOTH need the
+// image-baked copy at /opt/.../identity-fallback.sh in the build
+// to close the self-host + pre-#29-bootstrap window. Listed here
+// so the SSOT-side check rejects a template-repo that ships the
+// script (correctly, in the platform-agent template) without the
+// matching Dockerfile COPY (regression).
 var expectedImageBakedFiles = []string{
 	"config.yaml",
 	"mcp_servers.yaml",
 	"prompts/concierge.md",
+	"identity-fallback.sh",
 }
 
 // isConciergeIdentityPath reports whether a path in the platform-agent
@@ -88,6 +104,9 @@ var expectedImageBakedFiles = []string{
 //   - "config.yaml"        — runtime entrypoint config
 //   - "mcp_servers.yaml"   — MCP wiring (overlay)
 //   - "prompts/*"          — system prompts
+//   - "identity-fallback.sh" — boot-time /opt→/configs copy script
+//                              (template-platform-agent #2, invoked
+//                              from the platform-agent entrypoint)
 //
 // A future RFC that adds a new namespace (e.g. "hooks/*") MUST
 // extend this function AND the Dockerfile AND expectedImageBakedFiles
@@ -96,6 +115,7 @@ func isConciergeIdentityPath(rel string) bool {
 	rel = filepath.ToSlash(filepath.Clean(rel))
 	return rel == "config.yaml" ||
 		rel == "mcp_servers.yaml" ||
+		rel == "identity-fallback.sh" ||
 		strings.HasPrefix(rel, "prompts/")
 }
 
@@ -289,15 +309,110 @@ func TestPlatformAgentImageDriftGate(t *testing.T) {
 	}
 }
 
+// TestPlatformAgentEntrypointWiring pins the boot-time identity-
+// fallback wiring. The IMAGE_BAKED_IDENTITY_PRESENT echo-marker
+// that the #2919 PR shipped was a log line that did nothing — a
+// partial-template / no-fetch self-host concierge would still
+// MISSING_MODEL fail at runtime because /configs would be empty
+// even though /opt/molecule-platform-agent-template/ had the
+// content. This test pins the WIRE-UP shape that closes the gap:
+//
+//   1. Dockerfile.platform-agent defines a /entrypoint-platform-agent.sh
+//      heredoc that invokes identity-fallback.sh BEFORE handing off
+//      to /entrypoint.sh (the base image's entrypoint). The
+//      identity-fallback.sh script is the WORKING /opt→/configs
+//      fill-absent-only copy from template-platform-agent #2.
+//   2. The Dockerfile's ENTRYPOINT directive points at the new
+//      /entrypoint-platform-agent.sh (NOT the base image's
+//      /entrypoint.sh). Otherwise the wiring is dormant — the
+//      fallback would never fire.
+//   3. The IMAGE_BAKED_IDENTITY_PRESENT echo-only marker is GONE.
+//      A regression that re-adds the echo marker would re-introduce
+//      the dormant-fallback bug (script exists but never runs).
+//
+// Why pin the wiring here (not in a shell-script test): the
+// Dockerfile is the source-of-truth for the IMAGE-BAKED impl, and
+// the drift-gate already pins the Dockerfile's other shape
+// invariants (COPY lines, build-arg, destination path). Adding
+// entrypoint-wiring pins to the same file keeps the IMAGE-BAKED
+// image contract in a single test surface — operators / reviewers
+// reading TestPlatformAgentImageDriftGate see the full contract
+// (data + activation), not just the COPY instructions.
+//
+// A future change that moves the entrypoint to a different
+// filename / different invocation order must update this test
+// in lockstep. The shape (identity-fallback.sh + /entrypoint.sh
+// handoff) is the load-bearing part; the names are conventions.
+func TestPlatformAgentEntrypointWiring(t *testing.T) {
+	dockerfilePath := filepath.Join("..", "..", "Dockerfile.platform-agent")
+	dockerfile, err := os.ReadFile(dockerfilePath)
+	if err != nil {
+		t.Fatalf("read %s: %v", dockerfilePath, err)
+	}
+	dockerfileStr := string(dockerfile)
+
+	// 1. Heredoc-defined entrypoint-platform-agent.sh: must exist,
+	//    must invoke identity-fallback.sh, must hand off to
+	//    /entrypoint.sh (the base image's entrypoint).
+	if !strings.Contains(dockerfileStr, "/entrypoint-platform-agent.sh") {
+		t.Errorf("Dockerfile.platform-agent is missing /entrypoint-platform-agent.sh — the platform-agent entrypoint is the load-bearing wire-up that activates the /opt→/configs fallback at boot")
+	}
+	if !strings.Contains(dockerfileStr, "identity-fallback.sh") {
+		t.Errorf("Dockerfile.platform-agent does not reference identity-fallback.sh — the boot-time /opt→/configs fill-absent-only copy script (template-platform-agent #2) is the WORKING fallback that replaces the IMAGE_BAKED_IDENTITY_PRESENT echo-only marker")
+	}
+	// The hand-off: the new entrypoint must exec /entrypoint.sh
+	// (the base image's entrypoint) with the CMD args. A regression
+	// that omits the hand-off would skip the docker-socket group
+	// setup + memory-plugin sidecar + su-exec /platform boot.
+	if !strings.Contains(dockerfileStr, "exec /entrypoint.sh \"$@\"") {
+		t.Errorf("Dockerfile.platform-agent entrypoint does not exec /entrypoint.sh \"$@\" — the platform-agent entrypoint must hand off to the base image's entrypoint (docker-socket group setup, memory-plugin sidecar, su-exec /platform); a regression here would skip the base-image boot")
+	}
+
+	// 2. ENTRYPOINT directive: must point at the new entrypoint
+	//    (NOT the base /entrypoint.sh). The default ENTRYPOINT
+	//    (inherited from the base image) is /entrypoint.sh; a
+	//    regression that omits the override would activate the
+	//    identity-fallback.sh script via COPY but never invoke
+	//    it at boot — the dormant-fallback bug.
+	if !strings.Contains(dockerfileStr, `ENTRYPOINT ["/entrypoint-platform-agent.sh"]`) {
+		t.Errorf(`Dockerfile.platform-agent is missing ENTRYPOINT ["/entrypoint-platform-agent.sh"] — the platform-agent entrypoint override is what activates the identity-fallback at boot; without it the script is COPY'd into the image but never runs`)
+	}
+
+	// 3. The IMAGE_BAKED_IDENTITY_PRESENT echo-only marker MUST
+	//    be GONE. The marker was a no-op log line that did nothing;
+	//    re-introducing it would either (a) replace the
+	//    identity-fallback.sh COPY (regression — fallback never
+	//    fires) or (b) coexist with the script (which is fine but
+	//    leaves a confusing dead file at /opt/.../IMAGE_BAKED_
+	//    IDENTITY_PRESENT). Either way it's a regression marker.
+	//
+	// Pin pattern: a non-comment line that creates the marker
+	// file (the original #2919 PR's `RUN echo ... > ...IMAGE_BAKED
+	// _IDENTITY_PRESENT` heredoc). A comment that mentions the
+	// marker name is fine (documentation); a creation line is a
+	// regression. The check requires the marker name to be on a
+	// line that ALSO contains a shell-creating token (`>`, `tee`,
+	// `cp`, or the start of a `RUN` directive with a heredoc) —
+	// this is intentionally a coarse heuristic, not a full
+	// Dockerfile parser, but it's tight enough to catch the
+	// regression while not flagging the explanatory comment.
+	markerCreationRegex := regexp.MustCompile(`(?m)^[^#]*IMAGE_BAKED_IDENTITY_PRESENT[^#]*(>|tee |cp |<<)`)
+	if markerCreationRegex.MatchString(dockerfileStr) {
+		t.Errorf("Dockerfile.platform-agent still creates the IMAGE_BAKED_IDENTITY_PRESENT echo-only marker — the marker was a no-op log line that did nothing; the identity-fallback.sh script (template-platform-agent #2) is the real working fallback. The marker creation line must be removed when the script is wired in.")
+	}
+}
+
 // scanConciergeIdentityFiles walks the platform-agent template repo
 // and returns the RELATIVE paths of every file in the concierge-
-// identity namespace (config.yaml + mcp_servers.yaml + prompts/).
-// Non-identity files (README, .gitignore, etc.) are filtered out.
+// identity namespace (config.yaml + mcp_servers.yaml +
+// identity-fallback.sh + prompts/). Non-identity files (README,
+// .gitignore, etc.) are filtered out.
 //
 // Errors are returned for filesystem-walk failures; the caller turns
 // them into a t.Errorf (so other checks still run). The walk is
 // deliberately non-recursive beyond the namespace prefix — the
-// concierge's identity is config + mcp + prompts, nothing nested.
+// concierge's identity is config + mcp + fallback-script + prompts,
+// nothing nested.
 func scanConciergeIdentityFiles(ssotRoot string) ([]string, error) {
 	var identity []string
 	entries, err := os.ReadDir(ssotRoot)
@@ -305,7 +420,8 @@ func scanConciergeIdentityFiles(ssotRoot string) ([]string, error) {
 		return nil, err
 	}
 	for _, e := range entries {
-		// Top-level files: config.yaml, mcp_servers.yaml
+		// Top-level files: config.yaml, mcp_servers.yaml,
+		// identity-fallback.sh
 		if !e.IsDir() {
 			if isConciergeIdentityPath(e.Name()) {
 				identity = append(identity, e.Name())

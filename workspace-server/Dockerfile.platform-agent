@@ -18,16 +18,18 @@
 #
 # SSOT contract (driver hard-requirement on the IMAGE-BAKED impl):
 # The image-baked content (config.yaml + prompts/concierge.md +
-# mcp_servers.yaml) is SOURCED FROM the platform-agent TEMPLATE REPO,
-# NOT vendored/duplicated in core. A CI DRIFT-GATE
+# mcp_servers.yaml + identity-fallback.sh) is SOURCED FROM the
+# platform-agent TEMPLATE REPO, NOT vendored/duplicated in core. A CI
+# DRIFT-GATE
 # (workspace-server/internal/provisioner/platform_agent_image_drift_test.go,
 # pinned against /opt/molecule-platform-agent-template/{config.yaml,
-# mcp_servers.yaml,prompts/concierge.md} vs the pre-cloned
-# .tenant-bundle-deps/workspace-configs-templates/platform-agent/
-# source) asserts byte-equal at build time. A future drift would
-# fail the drift-gate test (go test -run TestPlatformAgentImageDriftGate),
-# catching it BEFORE the image is published — so image snapshot +
-# template can NEVER diverge in production without a CI-red signal.
+# mcp_servers.yaml,prompts/concierge.md,identity-fallback.sh} vs the
+# pre-cloned .tenant-bundle-deps/workspace-configs-templates/platform-
+# agent/ source) asserts byte-equal at build time. A future drift
+# would fail the drift-gate test (go test -run
+# TestPlatformAgentImageDriftGate), catching it BEFORE the image is
+# published — so image snapshot + template can NEVER diverge in
+# production without a CI-red signal.
 #
 # Build context: same as Dockerfile. The platform-agent template
 # content is pre-cloned by scripts/clone-manifest.sh into
@@ -52,6 +54,20 @@
 # channel remains the SSOT-delivery path; the image-baked copy is
 # a last-resort fallback (intentionally NOT a parallel SSOT — the
 # drift-gate enforces single-SSOT).
+#
+# The identity-fallback.sh script is the WORKING fallback (the
+# IMAGE_BAKED_IDENTITY_PRESENT echo-only marker that the #2919 PR
+# shipped was a log line that did nothing — this PR's companion
+# template-platform-agent PR adds the real script). The platform-
+# agent entrypoint sources the script at boot, BEFORE handing off
+# to the base image's /entrypoint.sh. Fill-absent-only: a delivered
+# /configs/* (asset-channel SSOT) is NEVER overwritten; the image-
+# baked copy is the safety net for self-host + pre-#29-bootstrap
+# windows where neither the asset channel nor the local template
+# path is guaranteed to be available. See
+# template-platform-agent #2 (identity-fallback.sh) for the script
+# semantics — SRC=/opt/molecule-platform-agent-template, DST=/configs,
+# fail-soft on missing SRC.
 
 ARG BASE_IMAGE=molecule-local/platform:latest
 FROM ${BASE_IMAGE}
@@ -77,14 +93,52 @@ ARG PLATFORM_AGENT_TEMPLATE_DIR=.tenant-bundle-deps/workspace-configs-templates/
 COPY ${PLATFORM_AGENT_TEMPLATE_DIR}/config.yaml /opt/molecule-platform-agent-template/config.yaml
 COPY ${PLATFORM_AGENT_TEMPLATE_DIR}/mcp_servers.yaml /opt/molecule-platform-agent-template/mcp_servers.yaml
 COPY ${PLATFORM_AGENT_TEMPLATE_DIR}/prompts/ /opt/molecule-platform-agent-template/prompts/
+# The boot-time identity-fallback script. Sourced at container start
+# (see /entrypoint-platform-agent.sh below) to fill ABSENT files at
+# /configs/ from the image-baked /opt path. The script is the SSOT in
+# the platform-agent TEMPLATE REPO — drift-gate
+# (platform_agent_image_drift_test.go) catches content drift between
+# this COPY source and the image-baked destination.
+COPY ${PLATFORM_AGENT_TEMPLATE_DIR}/identity-fallback.sh /opt/molecule-platform-agent-template/identity-fallback.sh
+RUN chmod +x /opt/molecule-platform-agent-template/identity-fallback.sh
 
-# PLATFORM-AGENT IDENTITY (image-baked fallback) — when the asset-
-# channel deliver is unavailable (self-host without
-# MOLECULE_TEMPLATE_REPO_TOKEN, pre-#29-activation bootstrap), the
-# concierge's identity (config.yaml + prompts/concierge.md +
-# mcp_servers.yaml) is read from the image-baked path. The runtime
-# must be aware of this fallback so a misconfigured operator sees
-# a clear log line (NOT a silent miss).
-RUN echo '#!/bin/sh' > /opt/molecule-platform-agent-template/IMAGE_BAKED_IDENTITY_PRESENT && \
-    echo 'echo "platform-agent: image-baked identity present at /opt/molecule-platform-agent-template/ (last-resort fallback for self-host + pre-#29-activation)" >&2' >> /opt/molecule-platform-agent-template/IMAGE_BAKED_IDENTITY_PRESENT && \
-    chmod +x /opt/molecule-platform-agent-template/IMAGE_BAKED_IDENTITY_PRESENT
+# PLATFORM-AGENT ENTRYPOINT — runs identity-fallback.sh FIRST (fills
+# absent /configs/ files from the image-baked /opt path; the
+# asset-channel deliver is the SSOT post-#29-activation, this is the
+# self-host + pre-#29-bootstrap safety net), then hands off to the
+# base image's /entrypoint.sh (which does docker-socket group setup,
+# memory-plugin sidecar spawn-gate, then exec su-exec platform
+# /platform).
+#
+# Why a separate entrypoint (not extending /entrypoint.sh in core):
+# the IMAGE-BAKED identity-fallback is a platform-agent-specific
+# concern — the base /entrypoint.sh stays the single runtime entry
+# for the ordinary /platform image, and the platform-agent variant
+# overrides only the boot hook. The script is sourced (not exec'd)
+# so a missing-script failure bubbles up cleanly (su-exec will still
+# run /platform; the runtime's MISSING_MODEL fail-closed surfaces
+# the operator-visible error in that case).
+COPY <<'ENTRY' /entrypoint-platform-agent.sh
+#!/bin/sh
+# /opt/molecule-platform-agent-template/identity-fallback.sh: per-
+# file copy of ABSENT files from the image-baked SSOT path to
+# /configs/. The asset-channel deliver (post-#29-activation) is the
+# authoritative path when it lands; this is the safety net for self-
+# host + pre-#29-bootstrap windows where neither the asset channel
+# nor the local template path is guaranteed to be available.
+if [ -x /opt/molecule-platform-agent-template/identity-fallback.sh ]; then
+    /opt/molecule-platform-agent-template/identity-fallback.sh || {
+        echo "platform-agent: ⚠️ identity-fallback.sh failed (see prior log lines); continuing boot — runtime will MISSING_MODEL fail-closed if /configs is empty" >&2
+    }
+else
+    echo "platform-agent: identity-fallback.sh not present (image built without it); skipping fallback (runtime will MISSING_MODEL fail-closed)" >&2
+fi
+# Hand off to the base image's entrypoint (docker-socket group
+# setup, memory-plugin sidecar spawn-gate, then su-exec platform
+# /platform). Pass through any CMD args (the platform-agent image
+# is invoked the same way as the base — operator/CI sets CMD as
+# needed; this entrypoint is transparent to the args).
+exec /entrypoint.sh "$@"
+ENTRY
+RUN chmod +x /entrypoint-platform-agent.sh
+ENTRYPOINT ["/entrypoint-platform-agent.sh"]
