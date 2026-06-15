@@ -5,9 +5,9 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -352,74 +352,53 @@ func TestMaybeProvisionPlatformAgentOnBoot_SkipsRunningWithIdentity(t *testing.T
 // TestConciergeIdentityFiles asserts the overlay: a system-prompt.md carrying
 // the Org-Concierge identity, and a config.yaml that gains the platform
 // mcp_servers entry — appended idempotently onto the base config.
-func TestConciergeIdentityFiles(t *testing.T) {
-	base := []byte("name: \"Org Concierge\"\nruntime: claude-code\nmodel: \"sonnet\"\n")
-	files := conciergeIdentityFiles("Molecule AI Agent", base)
+// TestSubstituteConciergeName asserts the {{CONCIERGE_NAME}} substitution
+// used by applyConciergeProvisionConfig to bake the per-instance concierge
+// name into the template-delivered system-prompt.md at provision time
+// (RFC #2843 §10a; PR recommendation (a) — substitute, per the driver's
+// "you decide in review" call). The runtime's build_system_prompt does NOT
+// template prompt files, so this is the only place the per-instance name
+// reaches the agent. Idempotent: re-substituting a name into a
+// already-substituted prompt is a no-op (the placeholder is gone).
+func TestSubstituteConciergeName(t *testing.T) {
+	tmpl := []byte("# You are {{CONCIERGE_NAME}} — the Org Concierge\n\n" +
+		"You are the organization's **platform agent**.\n")
 
-	sp, ok := files["system-prompt.md"]
-	if !ok {
-		t.Fatal("overlay missing system-prompt.md")
-	}
-	for _, want := range []string{"Molecule AI Agent", "Org Concierge", "platform agent", "delegate", "approv"} {
-		if !strings.Contains(string(sp), want) {
-			t.Errorf("system-prompt.md missing %q", want)
+	t.Run("replaces the placeholder with the per-instance name", func(t *testing.T) {
+		got := substituteConciergeName(tmpl, "Molecule AI Agent")
+		if !strings.Contains(string(got), "Molecule AI Agent") {
+			t.Errorf("substituted prompt missing the name:\n%s", got)
 		}
-	}
-
-	cfg, ok := files["config.yaml"]
-	if !ok {
-		t.Fatal("overlay missing config.yaml (mcp_servers should have been appended)")
-	}
-	// Pins the REAL image contract (pilot RCA 2026-06-10): the bin on PATH
-	// + management mode — NOT the /opt node path the image never shipped,
-	// and NOT default (a2a) mode which has zero admin tools.
-	for _, want := range []string{"mcp_servers:", "name: platform", "command: molecule-platform-mcp", "MOLECULE_MCP_MODE: management", "runtime: claude-code"} {
-		if !strings.Contains(string(cfg), want) {
-			t.Errorf("config.yaml missing %q\n--- got ---\n%s", want, cfg)
+		if strings.Contains(string(got), "{{CONCIERGE_NAME}}") {
+			t.Errorf("placeholder survived substitution:\n%s", got)
 		}
-	}
-	if strings.Contains(string(cfg), "/opt/molecule-mcp-server") {
-		t.Error("stale /opt path resurfaced — the image ships the molecule-mcp bin, not /opt/molecule-mcp-server")
-	}
+	})
 
-	// The standalone fragment ships ALWAYS, carrying the same declaration —
-	// the base-independent path that survives the SaaS restart-provision
-	// (where no base config is resolvable).
-	frag, ok := files[conciergeMCPFragmentFile]
-	if !ok {
-		t.Fatalf("overlay missing %s (the base-independent MCP declaration)", conciergeMCPFragmentFile)
-	}
-	for _, want := range []string{"name: platform", "command: molecule-platform-mcp", "MOLECULE_MCP_MODE: management"} {
-		if !strings.Contains(string(frag), want) {
-			t.Errorf("%s missing %q", conciergeMCPFragmentFile, want)
+	t.Run("replaces all occurrences (not just the first)", func(t *testing.T) {
+		multi := []byte("{{CONCIERGE_NAME}} sees {{CONCIERGE_NAME}} and only {{CONCIERGE_NAME}} acts.")
+		got := substituteConciergeName(multi, "Mia")
+		want := "Mia sees Mia and only Mia acts."
+		if string(got) != want {
+			t.Errorf("multi-occurrence substitution:\n got: %q\nwant: %q", got, want)
 		}
-	}
+	})
 
-	// Idempotent: re-applying onto an already-patched config does NOT add a
-	// second mcp_servers block and does NOT emit a config.yaml overlay (nothing
-	// to change), so the count of "mcp_servers:" stays exactly one.
-	files2 := conciergeIdentityFiles("Molecule AI Agent", cfg)
-	if _, present := files2["config.yaml"]; present {
-		t.Error("re-apply should NOT re-emit config.yaml when mcp_servers is already present")
-	}
-	if n := strings.Count(string(cfg), "mcp_servers:"); n != 1 {
-		t.Errorf("mcp_servers: appears %d times, want exactly 1", n)
-	}
+	t.Run("is a no-op when the placeholder is absent (idempotent re-provision)", func(t *testing.T) {
+		alreadySubstituted := []byte("# You are Mia — the Org Concierge\n")
+		got := substituteConciergeName(alreadySubstituted, "Mia")
+		if string(got) != string(alreadySubstituted) {
+			t.Errorf("idempotent re-provision changed the prompt:\n got: %q\nwant: %q", got, alreadySubstituted)
+		}
+	})
 
-	// No base config (couldn't read one): identity still lands; no config.yaml
-	// — but the fragment STILL ships, so the MCP declaration reaches the
-	// container even when every base resolution misses (the exact SaaS
-	// restart-provision gap that booted the pilot concierge toolless).
-	only := conciergeIdentityFiles("Org Concierge", nil)
-	if _, present := only["system-prompt.md"]; !present {
-		t.Error("system prompt must land even with no base config")
-	}
-	if _, present := only["config.yaml"]; present {
-		t.Error("no config.yaml overlay when there is no base to append onto")
-	}
-	if _, present := only[conciergeMCPFragmentFile]; !present {
-		t.Errorf("%s must ship even with no base config", conciergeMCPFragmentFile)
-	}
+	t.Run("empty prompt is a no-op (don't panic on len=0)", func(t *testing.T) {
+		if got := substituteConciergeName(nil, "Mia"); got != nil {
+			t.Errorf("nil prompt should round-trip; got %q", got)
+		}
+		if got := substituteConciergeName([]byte{}, "Mia"); len(got) != 0 {
+			t.Errorf("empty prompt should round-trip; got %q", got)
+		}
+	})
 }
 
 // TestConciergePlatformMCPEnv asserts the platform-MCP env wiring: ADMIN_TOKEN →
@@ -471,18 +450,30 @@ func TestConciergePlatformMCPEnv(t *testing.T) {
 // org-admin credential) natively — otherwise any workspace could drive org-admin
 // actions (create_workspace, set_secret, …). Gate is keyed off the DB kind column
 // (SSOT, protected by the one-platform-root CHECK constraint).
+//
+// Post RFC #2843 §10a: the concierge's identity (system prompt, model, MCP
+// declaration) is delivered via the platform-agent template. The provision
+// hook's only remaining work is (1) inject the platform-MCP env and (2) the
+// {{CONCIERGE_NAME}} substitution in the template-delivered system-prompt.md.
+// This test asserts both halves: the security boundary (only kind=platform gets
+// the org-admin token) AND the new substitution behavior.
 func TestApplyConciergeProvisionConfig_OnlyPlatformGetsOrgMCP(t *testing.T) {
 	t.Setenv("ADMIN_TOKEN", "secret-org-admin")
 	t.Setenv("PLATFORM_URL", "http://platform:8080")
 	h := &WorkspaceHandler{}
 	const kindQuery = `SELECT COALESCE\(kind, 'workspace'\) FROM workspaces WHERE id =`
 
-	t.Run("ordinary workspace gets NO org MCP and NO admin token", func(t *testing.T) {
+	t.Run("ordinary workspace gets NO org MCP, NO admin token, NO substitution", func(t *testing.T) {
 		mock := setupTestDB(t)
 		mock.ExpectQuery(kindQuery).WithArgs("ws-ordinary").
 			WillReturnRows(sqlmock.NewRows([]string{"kind"}).AddRow("workspace"))
 		env := map[string]string{}
-		cf := map[string][]byte{"config.yaml": []byte("runtime: claude-code\n")}
+		// Ordinary workspaces may have a non-concierge system-prompt.md in
+		// configFiles; the hook must NOT touch it.
+		cf := map[string][]byte{
+			"config.yaml":      []byte("runtime: claude-code\n"),
+			"system-prompt.md": []byte("{{CONCIERGE_NAME}} substitute me"),
+		}
 		out := h.applyConciergeProvisionConfig(context.Background(), "ws-ordinary", "", cf, env, "Worker")
 		if _, ok := env["MOLECULE_API_KEY"]; ok {
 			t.Errorf("SECURITY: ordinary workspace leaked MOLECULE_API_KEY (org-admin token): %v", env)
@@ -490,26 +481,30 @@ func TestApplyConciergeProvisionConfig_OnlyPlatformGetsOrgMCP(t *testing.T) {
 		if _, ok := env["MOLECULE_ORG_API_KEY"]; ok {
 			t.Errorf("SECURITY: ordinary workspace leaked MOLECULE_ORG_API_KEY: %v", env)
 		}
-		if _, ok := out["system-prompt.md"]; ok {
-			t.Error("ordinary workspace was given the concierge system prompt")
+		if strings.Contains(string(out["system-prompt.md"]), "Worker") {
+			t.Errorf("ordinary workspace had its system-prompt substituted — the concierge hook must no-op for kind != platform; got:\n%s", out["system-prompt.md"])
 		}
-		if strings.Contains(string(out["config.yaml"]), "mcp_servers") {
-			t.Error("SECURITY: ordinary workspace was given the platform mcp_servers config")
-		}
-		if _, ok := out[conciergeMCPFragmentFile]; ok {
-			t.Errorf("SECURITY: ordinary workspace was given %s", conciergeMCPFragmentFile)
-		}
+		// CR2 RC 11903 SA9003: the previous assertion
+		// ('ordinary workspace had its system-prompt substituted — the
+		// concierge hook must no-op for kind != platform') is the
+		// load-bearing check. A separate '{{CONCIERGE_NAME}}'-survives
+		// assertion would be tautological here (ordinary workspaces
+		// legitimately carry the placeholder; the hook only runs for
+		// kind=platform). Removed the dead if-block.
 		if err := mock.ExpectationsWereMet(); err != nil {
 			t.Errorf("unmet sqlmock expectations: %v", err)
 		}
 	})
 
-	t.Run("platform agent DOES get the org MCP and admin token", func(t *testing.T) {
+	t.Run("platform agent gets org MCP env + admin token + {{CONCIERGE_NAME}} substitution", func(t *testing.T) {
 		mock := setupTestDB(t)
 		mock.ExpectQuery(kindQuery).WithArgs("ws-concierge").
 			WillReturnRows(sqlmock.NewRows([]string{"kind"}).AddRow("platform"))
 		env := map[string]string{}
-		cf := map[string][]byte{"config.yaml": []byte("runtime: claude-code\n")}
+		cf := map[string][]byte{
+			"config.yaml":      []byte("runtime: claude-code\nmodel: moonshot/kimi-k2.6\n"),
+			"system-prompt.md": []byte("# You are {{CONCIERGE_NAME}} — the Org Concierge\n"),
+		}
 		out := h.applyConciergeProvisionConfig(context.Background(), "ws-concierge", "", cf, env, "Molecule AI Agent")
 		if env["MOLECULE_API_KEY"] != "secret-org-admin" {
 			t.Errorf("concierge did not receive the org-admin token; env=%v", env)
@@ -517,11 +512,43 @@ func TestApplyConciergeProvisionConfig_OnlyPlatformGetsOrgMCP(t *testing.T) {
 		if env["MOLECULE_ORG_API_KEY"] != "secret-org-admin" {
 			t.Errorf("management tools auth env (MOLECULE_ORG_API_KEY) missing; env=%v", env)
 		}
-		if _, ok := out["system-prompt.md"]; !ok {
-			t.Error("concierge did not receive the system prompt")
+		// The dispatch's recommendation (a): substitute the per-instance name
+		// into the template-delivered system-prompt.md. Verify the
+		// placeholder is gone and the name is baked in.
+		if !strings.Contains(string(out["system-prompt.md"]), "Molecule AI Agent") {
+			t.Errorf("{{CONCIERGE_NAME}} was not substituted with the per-instance name:\n%s", out["system-prompt.md"])
 		}
-		if !strings.Contains(string(out["config.yaml"]), "mcp_servers") {
-			t.Error("concierge did not receive the platform mcp_servers config")
+		if strings.Contains(string(out["system-prompt.md"]), "{{CONCIERGE_NAME}}") {
+			t.Errorf("{{CONCIERGE_NAME}} placeholder survived substitution:\n%s", out["system-prompt.md"])
+		}
+		// config.yaml must NOT have an mcp_servers block — the template's
+		// mcp_servers.yaml overlay handles that, and the dispatch's explicit
+		// directive is "PICK ONE, don't double-declare."
+		if strings.Contains(string(out["config.yaml"]), "mcp_servers") {
+			t.Errorf("config.yaml must not have an mcp_servers block (the seeded mcp_servers.yaml overlay handles it; got double-declaration):\n%s", out["config.yaml"])
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("unmet sqlmock expectations: %v", err)
+		}
+	})
+
+	t.Run("idempotent re-provision on the platform agent (no double-substitution)", func(t *testing.T) {
+		mock := setupTestDB(t)
+		mock.ExpectQuery(kindQuery).WithArgs("ws-concierge").
+			WillReturnRows(sqlmock.NewRows([]string{"kind"}).AddRow("platform"))
+		env := map[string]string{}
+		// Already-substituted prompt (a re-provision of a running concierge).
+		cf := map[string][]byte{
+			"system-prompt.md": []byte("# You are Molecule AI Agent — the Org Concierge\n"),
+		}
+		out := h.applyConciergeProvisionConfig(context.Background(), "ws-concierge", "", cf, env, "Molecule AI Agent")
+		if !strings.Contains(string(out["system-prompt.md"]), "Molecule AI Agent") {
+			t.Errorf("re-provision lost the name:\n%s", out["system-prompt.md"])
+		}
+		// Count of the name (must be exactly 1 — a naive re-substitute would
+		// produce "Molecule AI Agent Molecule AI Agent" or similar).
+		if n := strings.Count(string(out["system-prompt.md"]), "Molecule AI Agent"); n != 1 {
+			t.Errorf("name appears %d times in re-provisioned prompt; want 1 (idempotent):\n%s", n, out["system-prompt.md"])
 		}
 		if err := mock.ExpectationsWereMet(); err != nil {
 			t.Errorf("unmet sqlmock expectations: %v", err)
@@ -529,126 +556,50 @@ func TestApplyConciergeProvisionConfig_OnlyPlatformGetsOrgMCP(t *testing.T) {
 	})
 }
 
-// TestConciergeDeclaredModelIsRegistered is the fail-closed-at-CI guard for
-// core#2594: the platform agent's declared model MUST stay registered for its
-// runtime. If a registry/providers.yaml change ever drops it, this test (not a
-// silent prod fallback) catches it — ensureConciergeModel leaves the model
-// unset on a validation miss, which then fails the provision closed.
-func TestConciergeDeclaredModelIsRegistered(t *testing.T) {
-	if ok, why := validateRegisteredModelForRuntime(conciergeRuntime, conciergeDeclaredModel); !ok {
-		t.Fatalf("concierge declared model %q is NOT registered for runtime %q: %s",
-			conciergeDeclaredModel, conciergeRuntime, why)
-	}
-	if ok, why := validateDerivedProviderInRegistry(conciergeRuntime, conciergeDeclaredModel); !ok {
-		t.Fatalf("concierge declared model %q has no derivable registry provider for runtime %q: %s",
-			conciergeDeclaredModel, conciergeRuntime, why)
-	}
-}
-
-// TestEnsureConciergeModel_SeedsEnvAndPersistsWhenAbsent verifies ensureConciergeModel
-// seeds the container model env AND writes the MODEL secret when none is stored
-// (core#2594). The SELECT returns no row → it must INSERT the declared model.
-func TestEnsureConciergeModel_SeedsEnvAndPersistsWhenAbsent(t *testing.T) {
-	mock := setupTestDB(t)
-	const wsID = "concierge-ws-1"
-
-	// No stored MODEL yet.
-	mock.ExpectQuery(`SELECT encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1 AND key = 'MODEL'`).
-		WithArgs(wsID).
-		WillReturnError(sql.ErrNoRows)
-	// setModelSecret upserts the declared model.
-	mock.ExpectExec(`INSERT INTO workspace_secrets`).
-		WithArgs(wsID, sqlmock.AnyArg(), sqlmock.AnyArg()).
-		WillReturnResult(sqlmock.NewResult(0, 1))
-
-	h := &WorkspaceHandler{}
-	envVars := map[string]string{}
-	h.ensureConciergeModel(context.Background(), wsID, envVars)
-
-	if got := envVars["MODEL"]; got != conciergeDeclaredModel {
-		t.Errorf("MODEL env = %q, want %q", got, conciergeDeclaredModel)
-	}
-	if got := envVars["MOLECULE_MODEL"]; got != conciergeDeclaredModel {
-		t.Errorf("MOLECULE_MODEL env = %q, want %q", got, conciergeDeclaredModel)
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("unmet sqlmock expectations: %v", err)
-	}
-}
-
-// TestEnsureConciergeModel_RespectsExistingModel is the SEED-ONLY regression
-// guard (CTO 2026-06-12): when a MODEL secret already exists — ESPECIALLY a
-// DIFFERENT, customer-picked one (e.g. they switched the concierge to
-// kimi-for-coding for BYOK) — ensureConciergeModel must NOT touch it: no write,
-// and it must NOT force the declared default back into the env. Pre-fix it
-// re-asserted conciergeDeclaredModel on every provision, silently reverting the
-// customer's choice. encryption_version=0 = raw bytes (crypto disabled in test).
-func TestEnsureConciergeModel_RespectsExistingModel(t *testing.T) {
-	mock := setupTestDB(t)
-	const wsID = "concierge-ws-2"
-	const customerModel = "kimi-for-coding" // the customer's explicit pick
-
-	mock.ExpectQuery(`SELECT encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1 AND key = 'MODEL'`).
-		WithArgs(wsID).
-		WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}).
-			AddRow([]byte(customerModel), 0))
-	// NO ExpectExec — any write would be an unmet/unexpected expectation.
-
-	h := &WorkspaceHandler{}
-	envVars := map[string]string{}
-	h.ensureConciergeModel(context.Background(), wsID, envVars)
-
-	// Must NOT have overwritten the env with the declared default — the customer's
-	// stored model wins and is wired by loadWorkspaceSecrets/applyRuntimeModelEnv,
-	// not by this seed-only helper.
-	if got := envVars["MODEL"]; got == conciergeDeclaredModel {
-		t.Errorf("MODEL env was forced to the declared default %q — must respect the customer's stored %q", conciergeDeclaredModel, customerModel)
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("unmet sqlmock expectations: %v", err)
-	}
-}
-
-// TestConciergeSystemPrompt_IncludesAckFirstDirective is the core#2724
-// regression guard. The concierge prompt (platform_agent.go:55+) is the
-// ONE workspace-server surface the runtime MCP preamble in
-// workspace-runtime#129 doesn't reach (the MCP preamble only fires when
-// mcp=True; the concierge runs on the dedicated platform-agent image
-// which has its own prompt composition path). Without an explicit
-// ack-first directive IN the concierge prompt, the org's only chat
-// front door goes silent for minutes on long orchestration turns — the
-// exact CTO-reported UX failure that #129 + #2724 are fixing.
+// TestNoConciergeLiteralsInCore is the regression guard for the RFC #2843
+// §10a de-hardcode: the concierge's identity (system prompt, model, runtime,
+// MCP wiring) MUST live in the platform-agent template, not as Go string
+// literals in core. A future re-introduction of the consts would silently
+// regress the SSOT; this test fails on a fresh build if any of the deleted
+// identifiers reappear as bare Go references in the package source.
 //
-// Pin: the concierge prompt must contain the ack-first directive
-// ("Acknowledge first" + "send_message_to_user" + the "On it — I'll do X
-// then Y" example). A future refactor that drops the directive
-// (regression) MUST fail this test BEFORE the UX is shipped broken.
-func TestConciergeSystemPrompt_IncludesAckFirstDirective(t *testing.T) {
-	prompt := fmt.Sprintf(conciergeSystemPromptTmpl, defaultPlatformAgentName())
-
-	// Must contain the directive header so a casual reader / agent
-	// notice it immediately.
-	if !strings.Contains(prompt, "Acknowledge first") {
-		t.Errorf("concierge prompt missing 'Acknowledge first' directive (core#2724):\n%s", prompt)
+// This is a grep over the package — brittle by design (intentionally so:
+// the concierge-literal pattern was the exact failure mode of the
+// pre-#10a code, and a re-introduction must be caught at CI time, not in
+// code review).
+func TestNoConciergeLiteralsInCore(t *testing.T) {
+	banned := []string{
+		"conciergeSystemPromptTmpl",
+		"conciergeMCPServersBlock",
+		"conciergeMCPFragmentFile",
+		"conciergeDeclaredModel",
+		"conciergeIdentityFiles",
 	}
-	// Must reference the ack tool — the runtime preamble uses the
-	// same string so an agent that reads both surfaces gets the
-	// consistent instruction.
-	if !strings.Contains(prompt, "send_message_to_user") {
-		t.Errorf("concierge prompt missing 'send_message_to_user' reference (core#2724):\n%s", prompt)
-	}
-	// Must include a concrete example so the directive is
-	// interpretable, not just a slogan.
-	if !strings.Contains(prompt, "On it") {
-		t.Errorf("concierge prompt missing the 'On it — I'll do X then Y' example (core#2724):\n%s", prompt)
-	}
-	// The "Report back clearly" line is where the directive lives —
-	// the structural placement matters (it's the "synthesis" step
-	// of the concierge's responsibilities). A future refactor that
-	// moves the directive to a less prominent section should be a
-	// conscious choice, not an accident.
-	if !strings.Contains(prompt, "Report back clearly") {
-		t.Errorf("concierge prompt missing 'Report back clearly' section header (the ack-first directive should live in this section per core#2724):\n%s", prompt)
+	for _, id := range banned {
+		// grep the source tree under workspace-server/internal/handlers for
+		// the bare identifier. We allow the identifier to appear inside this
+		// test (the regression guard itself) but nowhere else.
+		out, err := exec.Command("grep", "-r", "--include=*.go",
+			"-l", id, ".").CombinedOutput()
+		if err != nil {
+			// grep returns 1 when no matches — that's the PASS case.
+			if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
+				continue
+			}
+			t.Fatalf("grep failed: %v\n%s", err, out)
+		}
+		// If grep found matches, every file is either this test or the
+		// production file's doc comment. Production file references must be
+		// only in the doc-comment block that explains the de-hardcode (and
+		// even there, the comments have been carefully worded to avoid
+		// bare-identifier resolution). Allow this specific test file.
+		for _, line := range bytes.Split(bytes.TrimSpace(out), []byte{'\n'}) {
+			fname := string(bytes.TrimPrefix(line, []byte("./")))
+			if fname == "platform_agent_test.go" {
+				continue // regression guard itself
+			}
+			t.Errorf("concierge literal %q reappeared in %s — RFC #2843 §10a de-hardcode REGRESSED", id, fname)
+		}
 	}
 }
 

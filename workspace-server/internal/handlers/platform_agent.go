@@ -28,10 +28,8 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
 
-	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/crypto"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
@@ -39,162 +37,21 @@ import (
 	"github.com/google/uuid"
 )
 
-// conciergeSystemPrompt is the identity seeded into the platform agent's
-// /configs/system-prompt.md. It makes the concierge BE the Org Concierge —
-// the org root (kind='platform'), the user's universal A2A peer and default
-// chat target — instead of booting as a generic claude-code coding assistant.
+// The concierge system-prompt template, the concierge MCP servers block, the
+// concierge MCP fragment file (mcp_servers.yaml), the concierge runtime, the
+// concierge declared model, and the concierge identity files function were
+// REMOVED as part of RFC #2843 §10a (the concierge de-hardcode migration). The
+// concierge's identity — system prompt, model, runtime, MCP wiring — is now
+// delivered via the molecule-ai-workspace-template-platform-agent template
+// (manifest.json workspace_templates entry) and applied like any other runtime
+// template. ZERO concierge literals remain in core.
 //
-// Grounded in the RFC (docs/design/rfc-platform-agent.md §1-2): it IS the org,
-// orchestrates the org via the platform MCP (the 87-tool org-admin surface) +
-// a2a delegation, and routes destructive ops through human approval. The prompt
-// is identity-only and works LOCALLY regardless of whether the platform MCP
-// binary is present — the org-admin tools simply aren't available until the
-// agent runs on the dedicated platform-agent image.
-//
-// %s is the concierge's display name (defaultPlatformAgentName()).
-const conciergeSystemPromptTmpl = `# You are %s — the Org Concierge
-
-You are the organization's **platform agent**: the single org-root agent
-(kind=platform) that sits above every workspace. You are the user's one front
-door to the whole organization — their universal peer and default chat target.
-You are NOT a generic coding assistant; you are an **org orchestrator**.
-
-## What you are
-
-- **You are the org.** Every team and workspace in this organization lives under
-  you in the agent hierarchy. When the user talks to the org, they talk to you.
-- **You orchestrate; you don't do the work yourself.** Break a request down and
-  delegate it to the right workspace(s). Spin up new workspaces/agents when the
-  org doesn't yet have the right team.
-- **You manage the org through tools, not guesswork.** You hold the
-  platform-management MCP (the org-admin surface: list/create/delete workspaces,
-  assign agents, set secrets, manage channels/schedules, delegate, chat with any
-  agent). Always inspect real state with these tools before acting — never assume
-  the org's shape from memory.
-
-## How you work
-
-1. **Recall first.** At the start of a conversation, recall prior context so you
-   continue org work coherently across restarts.
-2. **Understand the ask, then act.** For "spin up an SEO team that publishes
-   weekly", that means: create the workspaces, assign the agents, wire the
-   schedule — using the platform MCP — not a paragraph of instructions for the
-   user to run by hand.
-3. **Delegate via A2A.** Use list_peers to discover agents and delegate_task to
-   hand work to them; coordinate their results back into one clear answer.
-4. **Report back clearly.** Synthesize what the org did into a concise summary
-   for the user. **Acknowledge first, then work:** the moment you pick up a
-   request that will take more than a few seconds, FIRST send a one-line
-   acknowledgement + your plan with the send_message_to_user tool (e.g. "On it —
-   I'll do X then Y, back shortly"), THEN start the work. For long tasks,
-   drop a brief progress note when a phase finishes. Never go silent for
-   minutes — a user with no acknowledgement assumes the agent is stuck.
-   (core#2724: the concierge prompt is the one workspace-server surface
-   the runtime MCP preamble in workspace-runtime PR #129 doesn't reach;
-   the parallel platform_instruction seed migration
-   20260613081005_platform_instructions_ack_first_seed covers the
-   rest of the org.)
-
-## Guardrails
-
-- **Destructive operations are human-approved.** Deleting a workspace,
-  deprovisioning, writing secrets, or minting org tokens go through the approvals
-  subsystem — the platform returns a pending approval and the user decides. Never
-  try to route around the gate.
-- **Stay inside this org.** You can reach every workspace in your organization
-  and only this organization; tenant isolation is enforced server-side.
-- **Be honest about capability.** If the org-admin tools aren't available in this
-  environment (e.g. a local/dev image without the platform MCP), say so plainly
-  and fall back to A2A delegation + advising the user — do not fabricate results.
-- **Never run secret operations against your own workspace.** Secret writes and
-  deletes auto-restart the target workspace; when the target is you, the
-  platform tears down YOUR box mid-turn. If asked to test or demonstrate the
-  approval flow, use create_approval / create_request (no side effects). If
-  those tools are unavailable, use a naturally gated operation such as
-  mint_org_token (it returns a pending approval the user can deny) — never a
-  secret write — or say plainly that you lack a no-side-effect approval tool
-  and ask how to proceed. Never improvise a demo with a destructive or
-  state-changing operation.
-
-You have full org-management authority. Use it deliberately, on the user's
-behalf, and keep them in the loop.
-`
-
-// conciergeMCPServersBlock is the YAML appended to the concierge's config.yaml
-// so the runtime loads the org-admin platform MCP alongside the always-on a2a
-// server. The Phase-2 extra-MCP merge (claude_sdk_executor.py
-// _apply_extra_mcp_servers) reads this `mcp_servers:` list.
-//
-// Entry shape pins the REAL image contract (agents-team pilot RCA,
-// 2026-06-10 — the previous block pointed at a /opt/molecule-mcp-server
-// path the image never shipped):
-//   - command `molecule-platform-mcp` — Dockerfile.platform-agent symlinks
-//     the npm-installed @molecule-ai/mcp-server bin under this UNAMBIGUOUS
-//     name. The package's own bin name (`molecule-mcp`) COLLIDES with the
-//     runtime wheel's Python a2a inbox bridge at /usr/local/bin/molecule-mcp,
-//     which wins on PATH — the pilot's second-stage failure (2026-06-10):
-//     the config resolved to the Python bridge and the agent got a duplicate
-//     a2a server instead of the management registry.
-//   - env MOLECULE_MCP_MODE=management — the SAME binary serves the
-//     21-tool workspace a2a registry by default; only management mode
-//     registers the org-admin tools (list_workspaces et al). Without it
-//     the concierge gets a duplicate a2a server and zero admin tools.
-//
-// Auth comes from the container env (MOLECULE_API_KEY / MOLECULE_API_URL /
-// MOLECULE_ORG_ID — wired by conciergePlatformMCPEnv); MCP-host env merges
-// over process env, so the mode flag composes with those.
-//
-// SELF-HOST CAVEAT: the local stack provisions the concierge on the ordinary
-// `claude-code` image, which does NOT ship the molecule-platform-mcp bin. The
-// executor's _apply_extra_mcp_servers skips an entry whose command is
-// absent, so declaring this block can never crash the agent or wedge the SDK
-// init locally — the identity (system prompt) works everywhere; the org-admin
-// MCP tools only light up on the platform-agent image.
-const conciergeMCPServersBlock = `mcp_servers:
-  - name: platform
-    command: molecule-platform-mcp
-    env:
-      MOLECULE_MCP_MODE: management
-`
-
-// conciergeMCPFragmentFile is the standalone overlay fragment carrying the
-// SAME declaration as conciergeMCPServersBlock. Written UNCONDITIONALLY by
-// conciergeIdentityFiles — unlike the config.yaml append, it does not depend
-// on resolving a base config. On the SaaS restart-provision path all three
-// base resolutions miss (no in-memory configFiles, no templatePath, no
-// exec-readable container), so the appended block silently never shipped and
-// the concierge booted without its admin MCP (the pilot's TOOLS-FAIL).
-// The runtime executor merges /configs/mcp_servers.yaml after config.yaml;
-// older runtimes ignore the extra file — strictly additive.
-const conciergeMCPFragmentFile = "mcp_servers.yaml"
-
-// conciergeRuntime is the runtime the platform agent (concierge) always runs as
-// — installPlatformAgent hardcodes it (kind='platform' rows insert runtime
-// 'claude-code'). conciergeDeclaredModel is validated against the registry for
-// THIS runtime at provision time.
-const conciergeRuntime = "claude-code"
-
-// conciergeDeclaredModel is the platform agent's OWN declared model — a
-// deliberate part of the platform-agent product spec, mirroring the claude-code
-// template's `runtime_config.model` SSOT. It is NOT a generic "platform default
-// for user workspaces": the CTO SSOT directive (2026-05-22,
-// feedback_workspace_model_required_no_platform_default_dynamic_credential_intake)
-// forbids the platform from defaulting a USER workspace's model — model is
-// required user input there. The concierge is the platform-agent product itself
-// (installed by the platform, not a user), so it carries an explicit declared
-// model exactly as a template declares one.
-//
-// core#2594: before this, the concierge had NO stored model. It ran kimi ONLY
-// because the provision path's MOLECULE_LLM_DEFAULT_MODEL env fail-open injected
-// MOLECULE_MODEL; with that fail-open removed, a model-less concierge would
-// silently drop to the runtime's hardcoded `anthropic:claude-opus-4-7` fallback
-// (molecule_runtime/config.py _picked_model_from_env). Storing the model
-// explicitly (a) makes GET /workspaces/:id/model — and the canvas Config tab —
-// show the resolved model instead of blank, and (b) lets the provision path fail
-// CLOSED (no opaque substitution) for everything else. The value matches the
-// prod MOLECULE_LLM_DEFAULT_MODEL the concierge already runs on, so this is
-// behavior-preserving. A CI test asserts it stays registered for the runtime.
-const conciergeDeclaredModel = "moonshot/kimi-k2.6"
+// A minimal {{CONCIERGE_NAME}} substitution is performed by
+// applyConciergeProvisionConfig (see PR description for the substitution
+// recommendation: option (a) — substitute, with the per-instance name; the
+// template's prompts/concierge.md already has the placeholder where the name
+// goes). The MCP env (conciergePlatformMCPEnv) is still concierge-specific
+// because the env wiring is per-MCP-binary, not per-template.
 
 // SelfHostedPlatformAgentID is the deterministic platform-agent id used when no
 // control plane is present to derive a per-org id (self-hosted / local). There
@@ -271,36 +128,11 @@ func defaultPlatformAgentName() string {
 	return "Org Concierge"
 }
 
-// conciergeIdentityFiles returns the overlay config files that turn an ordinary
-// claude-code workspace into the Org Concierge: the system-prompt.md identity
-// and a config.yaml that declares the platform MCP. These are written on top of
-// the workspace template at provision time (provisioner writes ConfigFiles AFTER
-// CopyTemplateToContainer), so they survive restarts — every provision re-seeds
-// the identity from the single source here.
-//
-// baseConfigYAML is the config.yaml the concierge would otherwise boot with
-// (the template's, the freshly-generated one, or — on auto-restart — the live
-// container's). We append the mcp_servers block only when it is not already
-// present, so re-applying is idempotent and never duplicates the block. When
-// baseConfigYAML is empty (we couldn't read a base) we overlay only the system
-// prompt and leave config.yaml to the template — the identity still lands; the
-// MCP simply isn't declared that cycle (the next provision with a readable base
-// adds it).
-func conciergeIdentityFiles(name string, baseConfigYAML []byte) map[string][]byte {
-	files := map[string][]byte{
-		"system-prompt.md": []byte(fmt.Sprintf(conciergeSystemPromptTmpl, name)),
-		// Always-shipped fragment: declares the platform MCP regardless of
-		// whether a base config.yaml was resolvable (see
-		// conciergeMCPFragmentFile). Idempotent — fixed content, re-seeded
-		// every provision cycle, never touches config.yaml.
-		conciergeMCPFragmentFile: []byte(conciergeMCPServersBlock),
-	}
-	if len(baseConfigYAML) > 0 && !strings.Contains(string(baseConfigYAML), "\nmcp_servers:") &&
-		!strings.HasPrefix(string(baseConfigYAML), "mcp_servers:") {
-		files["config.yaml"] = appendYAMLBlock(baseConfigYAML, conciergeMCPServersBlock)
-	}
-	return files
-}
+// (the concierge identity files function removed in RFC #2843 §10a — the concierge's
+// identity is now delivered via the platform-agent template's
+// prompts/concierge.md + config.yaml + mcp_servers.yaml, applied like
+// any other runtime template. See substituteConciergeName below for
+// the only remaining per-instance identity step.)
 
 // conciergePlatformMCPEnv injects the env the platform MCP child reads at spawn
 // (RFC §5.5/§5.6). The org-admin token is ADMIN_TOKEN on self-host; the platform
@@ -337,19 +169,23 @@ func conciergePlatformMCPEnv(env map[string]string) {
 	setIfAbsent("MOLECULE_ORG_ID", os.Getenv("MOLECULE_ORG_ID"))
 }
 
-// applyConciergeProvisionConfig is the provision-time hook that makes the
-// platform agent boot as the concierge. Called from prepareProvisionContext for
-// EVERY provision of a kind='platform' workspace (create, restart, auto-recover)
-// so the identity + platform-MCP declaration are re-seeded each cycle and never
-// drift. It is a no-op for ordinary workspaces.
+// applyConciergeProvisionConfig is the provision-time hook for the platform
+// agent. Called from prepareProvisionContext for EVERY provision of a
+// kind='platform' workspace (create, restart, auto-recover). It is a no-op
+// for ordinary workspaces.
 //
-// It (1) injects the platform-MCP env into envVars and (2) merges the concierge
-// overlay files (system-prompt.md + a config.yaml carrying mcp_servers) into the
-// returned configFiles map, which the provisioner writes on top of the template.
+// Post RFC #2843 §10a: the concierge's identity (system prompt, model,
+// runtime, MCP wiring) is delivered via the molecule-ai-workspace-template-
+// platform-agent template and applied like any other runtime template. This
+// hook's only remaining responsibilities are (1) inject the platform-MCP env
+// (org-admin token + platform URL + org id) and (2) the per-instance
+// {{CONCIERGE_NAME}} substitution in the delivered system-prompt.md
+// (recommended in the PR — see the PR description for the rationale vs
+// the alternative of dropping the dynamic name).
 //
 // Returns the (possibly newly-allocated) configFiles map so the caller can
 // rebind it — configFiles is nil on the auto-restart path, where this is the
-// thing that introduces the overlay.
+// thing that introduces the substitution.
 func (h *WorkspaceHandler) applyConciergeProvisionConfig(
 	ctx context.Context,
 	workspaceID, templatePath string,
@@ -367,112 +203,53 @@ func (h *WorkspaceHandler) applyConciergeProvisionConfig(
 		return configFiles
 	}
 
-	// 0. Concierge model (core#2594). The platform agent carries an explicit,
-	//    SSOT-declared model so it never relies on a silent default — neither the
-	//    (now-removed) MOLECULE_LLM_DEFAULT_MODEL env fail-open nor the runtime's
-	//    hardcoded anthropic:claude-opus-4-7 fallback. Seed the container env for
-	//    THIS provision AND persist the MODEL workspace_secret so GET /model (the
-	//    canvas Config tab) shows the resolved model. Self-healing: a pre-existing
-	//    concierge with no stored model gets it on its next provision cycle.
-	h.ensureConciergeModel(ctx, workspaceID, envVars)
-
 	// 1. Platform-MCP env (org-admin token + platform URL + org id).
 	conciergePlatformMCPEnv(envVars)
 
-	// 2. Resolve the base config.yaml to append mcp_servers onto, in priority
-	//    order: the in-memory configFiles (fresh provision), the template dir
-	//    (apply-template provision), then the live container (auto-restart,
-	//    configFiles == nil + templatePath == ""). Any miss falls through.
-	var base []byte
-	if configFiles != nil {
-		base = configFiles["config.yaml"]
-	}
-	if len(base) == 0 && templatePath != "" {
-		if b, err := os.ReadFile(filepath.Join(templatePath, "config.yaml")); err == nil {
-			base = b
-		}
-	}
-	if len(base) == 0 && h.provisioner != nil {
-		if b, err := h.provisioner.ExecRead(ctx, provisioner.ContainerName(workspaceID), "/configs/config.yaml"); err == nil {
-			base = b
-		}
-	}
-
-	overlay := conciergeIdentityFiles(name, base)
+	// 2. {{CONCIERGE_NAME}} substitution in the template-delivered
+	//    system-prompt.md. The runtime's build_system_prompt does NOT
+	//    template prompt files, so we do the minimal per-instance
+	//    substitution here at provision time. The template's
+	//    prompts/concierge.md carries the {{CONCIERGE_NAME}} placeholder
+	//    where the per-instance name goes. Idempotent: a re-provision
+	//    re-runs the substitution; the result is stable.
 	if configFiles == nil {
 		configFiles = map[string][]byte{}
 	}
-	for k, v := range overlay {
-		configFiles[k] = v
+	if prompt, ok := configFiles["system-prompt.md"]; ok {
+		configFiles["system-prompt.md"] = substituteConciergeName(prompt, name)
 	}
-	log.Printf("Provisioner: applied concierge identity overlay for platform agent %s (system-prompt + %d config file(s))", workspaceID, len(overlay))
+	log.Printf("Provisioner: applied platform-agent env + {{CONCIERGE_NAME}} substitution for %s (name=%q, %d config file(s))",
+		workspaceID, name, len(configFiles))
 	return configFiles
 }
 
-// ensureConciergeModel makes the platform agent's model explicit (core#2594).
-// It (1) seeds the container model env for the current provision and (2)
-// persists the MODEL workspace_secret so the read endpoint / canvas Config tab
-// surface the resolved model. The model is the concierge's declared SSOT model,
-// validated against the registry for its runtime. If validation fails (registry
-// drift — a build bug caught by the CI test), it sets NOTHING: the downstream
-// universal MISSING_MODEL gate then fails the provision CLOSED rather than
-// letting the runtime pick an opaque default.
-func (h *WorkspaceHandler) ensureConciergeModel(ctx context.Context, workspaceID string, envVars map[string]string) {
-	// SEED-ONLY (CTO 2026-06-12: customer setting > platform default; the
-	// concierge's model is changeable like any workspace, "anytime"). If a MODEL
-	// secret already exists — whether the original seed or a model the customer
-	// later picked in the canvas — RESPECT it: loadWorkspaceSecrets +
-	// applyRuntimeModelEnv have already put it in envVars, so do nothing. Only
-	// SEED the declared default when the concierge has no model at all (first
-	// boot). Pre-fix this function re-asserted conciergeDeclaredModel on EVERY
-	// provision, silently reverting the customer's pick (e.g. kimi-for-coding →
-	// moonshot/kimi-k2.6) — exactly the platform-overriding-customer violation
-	// the SSOT directive forbids.
-	if existing := readStoredModelSecret(ctx, workspaceID); existing != "" {
-		return // explicit model already set; never overwrite the customer's choice
-	}
+// conciergeNamePlaceholder is the {{CONCIERGE_NAME}} marker the template's
+// prompts/concierge.md carries where the per-instance name goes. The runtime's
+// build_system_prompt does NOT template prompt files, so applyConciergeProvisionConfig
+// performs the substitution at provision time (RFC #2843 §10a).
+const conciergeNamePlaceholder = "{{CONCIERGE_NAME}}"
 
-	// First boot — no model yet. Seed the concierge's declared default.
-	model := conciergeDeclaredModel
-	if ok, why := validateRegisteredModelForRuntime(conciergeRuntime, model); !ok {
-		log.Printf("Provisioner: concierge %s declared model %q is NOT registered for runtime %q (%s) — leaving model unset; provision will fail closed", workspaceID, model, conciergeRuntime, why)
-		return
+// substituteConciergeName replaces every occurrence of the {{CONCIERGE_NAME}}
+// placeholder in a system-prompt byte slice with the per-instance concierge
+// name. Stable: if the placeholder is absent, the input is returned
+// unchanged. No other templating is performed — keep this minimal.
+func substituteConciergeName(prompt []byte, name string) []byte {
+	if len(prompt) == 0 {
+		return prompt
 	}
-	if ok, why := validateDerivedProviderInRegistry(conciergeRuntime, model); !ok {
-		log.Printf("Provisioner: concierge %s declared model %q has no derivable registry provider for runtime %q (%s) — leaving model unset; provision will fail closed", workspaceID, model, conciergeRuntime, why)
-		return
-	}
-
-	// Seed the container env (precedence MOLECULE_MODEL > MODEL in the runtime).
-	// applyRuntimeModelEnv already ran with an empty payload model for the
-	// concierge (no stored MODEL on first boot), so set both canonical names
-	// here so this provision actually runs the seeded default.
-	envVars["MOLECULE_MODEL"] = model
-	envVars["MODEL"] = model
-
-	// Persist so GET /workspaces/:id/model returns it (Config tab visibility).
-	if setErr := setModelSecret(ctx, workspaceID, model); setErr != nil {
-		log.Printf("Provisioner: concierge %s persist MODEL secret failed: %v (env still seeded for this provision)", workspaceID, setErr)
-	}
-}
-
-// readStoredModelSecret returns the decrypted MODEL workspace_secret, or "" when
-// none is stored (or on any read/decrypt error — treated as "unset" so a
-// transient miss re-seeds rather than wedges). Used by ensureConciergeModel to
-// decide seed-vs-respect.
-func readStoredModelSecret(ctx context.Context, workspaceID string) string {
-	var stored []byte
-	var version int
-	if err := db.DB.QueryRowContext(ctx,
-		`SELECT encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = $1 AND key = 'MODEL'`,
-		workspaceID).Scan(&stored, &version); err != nil {
-		return ""
-	}
-	dec, err := crypto.DecryptVersioned(stored, version)
-	if err != nil {
-		return ""
-	}
-	return string(dec)
+	// Use a single allocation to avoid multiple string-to-byte conversions
+	// on the hot path. strings.Replace is in the standard library and
+	// handles the empty-name case safely (the placeholder is replaced
+	// with "" — leaving the prompt with a blank first line. We
+	// intentionally do NOT guard against empty name here: the caller
+	// (defaultPlatformAgentName) guarantees a non-empty name; if it
+	// somehow becomes empty, an empty first line is the louder failure
+	// mode (visible in the agent's startup log) than a silent skip.
+	// CR2 RC 11903 QF1004: strings.ReplaceAll (replaces all) replaces
+	// the legacy strings.Replace(s, old, new, -1) "replace all" idiom
+	// with the dedicated stdlib helper.
+	return []byte(strings.ReplaceAll(string(prompt), conciergeNamePlaceholder, name))
 }
 
 // EnsureSelfHostedPlatformAgent installs the org's platform agent (the concierge,
