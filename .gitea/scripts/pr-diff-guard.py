@@ -60,8 +60,14 @@ def main() -> int:
         git("fetch", "origin", base_ref)
 
     # Find merge base so the diff reflects only what the PR added, not main
-    # drift since the branch was created.
-    merge_base = git("merge-base", f"origin/{base_ref}", head_sha).strip()
+    # drift since the branch was created. If no merge base exists (e.g.,
+    # unrelated-history branch), fall back to the base ref itself — the guard
+    # should still catch a massive destructive diff.
+    try:
+        merge_base = git("merge-base", f"origin/{base_ref}", head_sha).strip()
+    except subprocess.CalledProcessError:
+        print(f"::warning::no merge base with origin/{base_ref}; falling back to direct diff")
+        merge_base = f"origin/{base_ref}"
 
     # Diff stat.
     numstat = git("diff", "--numstat", f"{merge_base}..{head_sha}").strip()
