@@ -91,6 +91,7 @@ jobs:
     # OUTSIDE the managed 1..20 range) so a merged fix's image build
     # starts immediately while PR-CI keeps the general pool.
     runs-on: publish
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2

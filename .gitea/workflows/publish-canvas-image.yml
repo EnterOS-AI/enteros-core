@@ -94,6 +94,7 @@ jobs:
     # before any runner advertised it (see #576). The lane is registered
     # in this rollout (internal#462) so the precondition holds.
     runs-on: publish
+    timeout-minutes: 45
     # Phase 3 (RFC #219 §1): surface broken workflows without blocking.
     # mc#2654: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
     continue-on-error: true
