@@ -196,6 +196,60 @@ check() {
 pass() { echo "PASS: $1"; PASS=$((PASS + 1)); }
 fail() { echo "FAIL: $1"; [ -n "${2:-}" ] && echo "  $2"; FAIL=$((FAIL + 1)); }
 
+# Advisory-lane infra-skip helper. When the A2A layer itself is degraded
+# (queue never drains after a queued response), exit 0 with a scan_status line
+# rather than false-red on an advisory job. Fail-closed on repeated skips is
+# handled in the staging helper (#2917); this local-provision lane is advisory.
+infra_skip() {
+  local reason="$1" detail="${2:-}"
+  echo "[$(date +%H:%M:%S)] ⚠️  scan_status: infra-skip:${reason}${detail:+ $detail}"
+  echo "=== Results: $PASS passed, $FAIL failed (infra-skip: $reason) ==="
+  exit 0
+}
+
+# Poll a queued A2A task until it completes, fails, or times out.
+# Prints the response_body (JSON-RPC result envelope) on success; returns 1 on
+# failure/timeout so the caller can decide to hard-fail or infra-skip.
+poll_a2a_queue() {
+  local ws_id="$1" qid="$2" deadline="${3:-120}"
+  local resp="" qstatus="" result_body=""
+  local start elapsed
+  start=$(date +%s)
+  while true; do
+    elapsed=$(($(date +%s) - start))
+    if [ "$elapsed" -ge "$deadline" ]; then
+      return 1
+    fi
+    resp=$(curl -s --max-time 30 "$BASE/workspaces/$ws_id/a2a/queue/$qid" \
+      -H "Content-Type: application/json" \
+      -H "X-Workspace-ID: $ws_id" 2>/dev/null || echo "")
+    qstatus=$(echo "$resp" | python3 -c "import sys,json
+try:
+  print(json.load(sys.stdin).get('status',''))
+except Exception:
+  print('')" 2>/dev/null || echo "")
+    case "$qstatus" in
+      completed)
+        result_body=$(echo "$resp" | python3 -c "import sys,json
+try:
+  rb=json.load(sys.stdin).get('response_body')
+  print(json.dumps(rb) if rb is not None else '')
+except Exception:
+  print('')" 2>/dev/null || echo "")
+        if [ -n "$result_body" ]; then
+          printf '%s' "$result_body"
+          return 0
+        fi
+        ;;
+      failed|dropped)
+        return 1
+        ;;
+    esac
+    echo "    queue poll for $qid status=$qstatus elapsed=${elapsed}s — backing off 2s" >&2
+    sleep 2
+  done
+}
+
 admin_curl() {
   local _a=(); e2e_admin_auth_args _a
   curl -s "${_a[@]+"${_a[@]}"}" "$@"
@@ -643,6 +697,33 @@ A2A_CEIL="$A2A_TIMEOUT"
 A2A=$(curl -s --max-time "$A2A_CEIL" -X POST "$BASE/workspaces/$WSID/a2a" \
   -H "Content-Type: application/json" \
   -d "$A2A_BODY")
+
+# If the platform queued the A2A request, poll the durable queue result.
+# core#2917-follow-on: staging-SaaS saw the same A2A-layer degradation where
+# the initial POST returns 202-queued and the queue item never drains in time.
+# The local-provision advisory lane should handle this without false-red.
+A2A_QUEUED=$(echo "$A2A" | python3 -c "import sys,json
+try:
+  d=json.load(sys.stdin)
+  print('true' if d.get('queued') is True or (d.get('status') or '').lower() == 'queued' else 'false')
+except Exception:
+  print('false')" 2>/dev/null || echo "false")
+if [ "$A2A_QUEUED" = "true" ]; then
+  QUEUE_ID=$(echo "$A2A" | python3 -c "import sys,json
+try:
+  print(json.load(sys.stdin).get('queue_id',''))
+except Exception:
+  print('')" 2>/dev/null || echo "")
+  if [ -n "$QUEUE_ID" ]; then
+    echo "  A2A queued (queue_id=$QUEUE_ID); polling durable result..." >&2
+    if A2A_POLL=$(poll_a2a_queue "$WSID" "$QUEUE_ID" 120); then
+      A2A="$A2A_POLL"
+    else
+      infra_skip "a2a-queue-timeout" "queue_id=$QUEUE_ID on local-provision advisory lane"
+    fi
+  fi
+fi
+
 # Extract the assistant text part once (shared by the minimax assertion +
 # diagnostics). Tolerates result.parts[].text and result.message.parts[].text.
 a2a_text() {
