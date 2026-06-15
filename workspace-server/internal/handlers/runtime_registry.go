@@ -59,9 +59,10 @@ func manifestPath() string {
 // manifestEntry mirrors the shape of a workspace_templates item.
 // Only the fields we read are declared; extras are ignored.
 type manifestEntry struct {
-	Name string `json:"name"`
-	Repo string `json:"repo"`
-	Ref  string `json:"ref"`
+	Name    string `json:"name"`
+	Repo    string `json:"repo"`
+	Ref     string `json:"ref"`
+	Runtime string `json:"runtime"` // optional base runtime identifier for template variants (e.g. "seo-agent" → "claude-code")
 }
 
 type manifestFile struct {
@@ -190,7 +191,13 @@ func loadRuntimesFromManifest(path string) (map[string]struct{}, error) {
 		// Convention: "<runtime>-default" is the vanilla variant of
 		// <runtime>. Strip the suffix so both `claude-code` and
 		// `claude-code-default` resolve to the same runtime.
+		// If the manifest entry declares an explicit `runtime`, use it
+		// as the base runtime identifier (e.g. the "seo-agent" template
+		// is a claude-code variant, not a runtime of its own).
 		name = strings.TrimSuffix(name, "-default")
+		if strings.TrimSpace(e.Runtime) != "" {
+			name = strings.TrimSpace(e.Runtime)
+		}
 		out[name] = struct{}{}
 	}
 	return out, nil
@@ -245,6 +252,26 @@ func initKnownRuntimes() {
 		names = append(names, k)
 	}
 	log.Printf("runtime registry: loaded %d runtimes from %s: %v", len(loaded), path, names)
+}
+
+// isKnownRuntime reports whether runtime is a recognized workspace runtime
+// (first-party template-backed, external-like meta-runtime, or mock).
+// Safe to call before initKnownRuntimes — falls back to the compile-time
+// fallbackRuntimes map.
+func isKnownRuntime(runtime string) bool {
+	if _, ok := knownRuntimes[runtime]; ok {
+		return true
+	}
+	// externalLikeRuntimes and mock are always valid, even when the manifest
+	// is missing and knownRuntimes is still the fallback set (which already
+	// includes them, but re-checking is cheap and explicit).
+	if isExternalLikeRuntime(runtime) {
+		return true
+	}
+	if runtime == "mock" {
+		return true
+	}
+	return false
 }
 
 // templateRepoRef is the parsed manifest entry needed to

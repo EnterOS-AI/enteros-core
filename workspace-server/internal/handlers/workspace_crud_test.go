@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
@@ -675,4 +676,40 @@ func TestUpdate_Runtime_UnroutableModel_Fails422(t *testing.T) {
 	// sqlmock's ExpectationsWereMet fires on the failure path too
 	// (mock has unconsumed expectations).
 	_ = mock
+}
+
+// TestUpdate_Runtime_UnknownPseudoRuntime_Fails422 pins the runtime-identity
+// gate on PATCH: a template variant slug such as "seo-agent" is NOT a runtime,
+// so the PATCH must be rejected before the (runtime, model) compatibility
+// check runs. Prevents the customer incident where a conversion wrote
+// runtime="seo-agent" and the workspace failed to boot because no adapter
+// recognizes the pseudo-runtime.
+func TestUpdate_Runtime_UnknownPseudoRuntime_Fails422(t *testing.T) {
+	wsID := "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+	mock, r := setupWorkspaceCrudTest(t)
+	h := newWorkspaceCrudHandler(t)
+	r.PATCH("/workspaces/:id", h.Update)
+
+	mock.ExpectQuery(`SELECT EXISTS\(SELECT 1 FROM workspaces WHERE id = \$1\)`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+	// The model compatibility query is intentionally NOT mocked: the
+	// unknown-runtime rejection must happen before that DB read.
+
+	body := map[string]interface{}{"runtime": "seo-agent"}
+	b, _ := json.Marshal(body)
+	req, _ := http.NewRequest("PATCH", "/workspaces/"+wsID, bytes.NewReader(b))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Errorf("expected 422 (unknown runtime), got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "unsupported workspace runtime") {
+		t.Errorf("expected 'unsupported workspace runtime' reason, got %s", w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
 }

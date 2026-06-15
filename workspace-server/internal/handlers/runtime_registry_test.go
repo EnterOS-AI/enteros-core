@@ -55,6 +55,34 @@ func TestLoadRuntimesFromManifest_StripsDefaultSuffix(t *testing.T) {
 	}
 }
 
+func TestLoadRuntimesFromManifest_UsesExplicitRuntimeForVariants(t *testing.T) {
+	// Template variants such as "seo-agent" declare an explicit base
+	// runtime in manifest.json. The variant name must NOT become a
+	// standalone runtime identifier, or PATCH /workspaces/:id could
+	// persist a pseudo-runtime that no adapter recognizes.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "manifest.json")
+	err := os.WriteFile(path, []byte(`{
+		"workspace_templates": [
+			{"name": "claude-code-default", "repo": "org/t-cc"},
+			{"name": "seo-agent", "repo": "org/t-seo", "runtime": "claude-code"}
+		]
+	}`), 0600)
+	if err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	got, err := loadRuntimesFromManifest(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if _, ok := got["claude-code"]; !ok {
+		t.Errorf("expected base runtime 'claude-code' in set, got=%v", keys(got))
+	}
+	if _, ok := got["seo-agent"]; ok {
+		t.Errorf("template variant 'seo-agent' must NOT be exposed as a runtime, got=%v", keys(got))
+	}
+}
+
 func TestLoadRuntimesFromManifest_ExternalAlwaysInjected(t *testing.T) {
 	// Even a manifest without external (which matches reality —
 	// external has no template repo) must still produce "external"
@@ -115,6 +143,11 @@ func TestRealManifestParses(t *testing.T) {
 			t.Errorf("real manifest should not expose unsupported runtime %q — got=%v", removed, keys(got))
 		}
 	}
+	for _, variant := range templateVariantNamesForTest() {
+		if _, ok := got[variant]; ok {
+			t.Errorf("real manifest should not expose template variant %q as a runtime — got=%v", variant, keys(got))
+		}
+	}
 }
 
 func retiredRuntimeNamesForTest() []string {
@@ -125,6 +158,13 @@ func retiredRuntimeNamesForTest() []string {
 		"gemini" + "-cli",
 		"lang" + "graph",
 	}
+}
+
+// templateVariantNamesForTest are template slugs that must NOT be exposed as
+// standalone runtime identifiers. They are selected via the `template` field
+// (or manifest runtime mapping) and resolve to a base runtime at create time.
+func templateVariantNamesForTest() []string {
+	return []string{"seo-agent"}
 }
 
 func keys(m map[string]struct{}) []string {

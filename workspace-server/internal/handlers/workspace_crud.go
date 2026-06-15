@@ -248,6 +248,27 @@ func (h *WorkspaceHandler) Update(c *gin.Context) {
 	}
 	needsRestart := false
 	if runtime, ok := body["runtime"]; ok {
+		// Reject non-string or unrecognized runtime values before the model-
+		// compatibility check. Prevents template slugs such as "seo-agent"
+		// (a claude-code template variant) from being persisted as a runtime,
+		// which wedges the workspace on the next boot because no adapter
+		// recognizes the pseudo-runtime. Matches the create-boundary's
+		// knownRuntimes gate (workspace.go:427).
+		runtimeStr, typeOK := runtime.(string)
+		if !typeOK {
+			log.Printf("Update: PATCH runtime on %s REJECTED (not a string)", id)
+			c.JSON(http.StatusBadRequest, gin.H{"error": "runtime must be a string"})
+			return
+		}
+		if !isKnownRuntime(runtimeStr) {
+			log.Printf("Update: PATCH runtime=%q on %s REJECTED (unknown runtime)", runtimeStr, id)
+			c.JSON(http.StatusUnprocessableEntity, gin.H{
+				"error":   "unsupported workspace runtime",
+				"runtime": runtimeStr,
+				"code":    "RUNTIME_UNSUPPORTED",
+			})
+			return
+		}
 		// (runtime, model) compatibility validation (the new field a PATCH can
 		// change). model is NOT patchable per the body whitelist above, so the
 		// post-PATCH model is the workspace's CURRENT model — fetched here
@@ -266,9 +287,9 @@ func (h *WorkspaceHandler) Update(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read current model for runtime compatibility check"})
 			return
 		}
-		if ok, reason := validateRegisteredModelForRuntime(runtime.(string), currentModel.String); !ok {
+		if ok, reason := validateRegisteredModelForRuntime(runtimeStr, currentModel.String); !ok {
 			log.Printf("Update: PATCH runtime=%q on %s REJECTED (model=%q is not registered for that runtime): %s",
-				runtime.(string), id, currentModel.String, reason)
+				runtimeStr, id, currentModel.String, reason)
 			// 422 (Unprocessable Entity) matches the create-boundary's
 			// validateRegisteredModelForRuntime path (secrets.go:942, 952
 			// + workspace_crud.go create) — both reviewers flagged the
@@ -278,7 +299,7 @@ func (h *WorkspaceHandler) Update(c *gin.Context) {
 			c.JSON(http.StatusUnprocessableEntity, gin.H{"error": reason})
 			return
 		}
-		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET runtime = $2, updated_at = now() WHERE id = $1`, id, runtime); err != nil {
+		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET runtime = $2, updated_at = now() WHERE id = $1`, id, runtimeStr); err != nil {
 			log.Printf("Update runtime error for %s: %v", id, err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save runtime"})
 			return
