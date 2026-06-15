@@ -5,15 +5,12 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/gin-gonic/gin"
 )
 
-// urlParse is a tiny wrapper so table-driven tests can keep their lines short.
-func urlParse(s string) (*url.URL, error) { return url.Parse(s) }
 
 // expectWorkspaceURLLookup programs the sqlmock to answer the SELECT that
 // TranscriptHandler.Get issues for `agent_card->>'url'`. Tests call this
@@ -122,6 +119,7 @@ func TestTranscript_ProxyPropagatesAllowlistedQueryParams(t *testing.T) {
 func TestTranscript_RejectsCloudMetadataIP(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
+	setSSRFCheckForTest(true)
 	h := NewTranscriptHandler()
 
 	wsID := expectWorkspaceURLLookup(mock,"http://169.254.169.254/")
@@ -139,6 +137,7 @@ func TestTranscript_RejectsCloudMetadataIP(t *testing.T) {
 func TestTranscript_RejectsNonHTTPScheme(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
+	setSSRFCheckForTest(true)
 	h := NewTranscriptHandler()
 
 	wsID := expectWorkspaceURLLookup(mock,"file:///etc/passwd")
@@ -156,6 +155,7 @@ func TestTranscript_RejectsNonHTTPScheme(t *testing.T) {
 func TestTranscript_RejectsMetadataHostname(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
+	setSSRFCheckForTest(true)
 	h := NewTranscriptHandler()
 
 	wsID := expectWorkspaceURLLookup(mock,"http://metadata.google.internal/computeMetadata/v1/")
@@ -173,6 +173,7 @@ func TestTranscript_RejectsMetadataHostname(t *testing.T) {
 func TestTranscript_RejectsLinkLocalIPv6(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
+	setSSRFCheckForTest(true)
 	h := NewTranscriptHandler()
 
 	wsID := expectWorkspaceURLLookup(mock,"http://[fe80::1]/")
@@ -187,41 +188,21 @@ func TestTranscript_RejectsLinkLocalIPv6(t *testing.T) {
 	}
 }
 
-// validateWorkspaceURL unit tests — pure function, no DB/Redis needed.
-func TestValidateWorkspaceURL(t *testing.T) {
-	cases := []struct {
-		name    string
-		raw     string
-		wantErr bool
-	}{
-		{"http localhost allowed (dev)", "http://127.0.0.1:8000", false},
-		{"https public allowed", "https://agent.example.com", false},
-		{"docker internal allowed", "http://host.docker.internal:8000", false},
-		{"IMDS IP rejected", "http://169.254.169.254", true},
-		{"GCP metadata hostname rejected", "http://metadata.google.internal", true},
-		{"Azure metadata rejected", "http://metadata.azure.com", true},
-		{"file scheme rejected", "file:///etc/passwd", true},
-		{"gopher rejected", "gopher://internal:70/", true},
-		{"IPv6 link-local rejected", "http://[fe80::1]", true},
-		{"IPv4 link-local multicast rejected", "http://224.0.0.1", true},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			u, parseErr := urlParse(tc.raw)
-			if parseErr != nil && !tc.wantErr {
-				t.Fatalf("parse error: %v", parseErr)
-			}
-			if parseErr != nil {
-				return // unparseable URLs are rejected upstream; not this function's job
-			}
-			err := validateWorkspaceURL(u)
-			if tc.wantErr && err == nil {
-				t.Errorf("expected error for %q, got nil", tc.raw)
-			}
-			if !tc.wantErr && err != nil {
-				t.Errorf("expected OK for %q, got %v", tc.raw, err)
-			}
-		})
+func TestTranscript_RejectsLoopbackURL(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	setSSRFCheckForTest(true)
+	h := NewTranscriptHandler()
+
+	wsID := expectWorkspaceURLLookup(mock, "http://127.0.0.1:8080/")
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: wsID}}
+	c.Request = httptest.NewRequest("GET", "/workspaces/"+wsID+"/transcript", nil)
+	h.Get(c)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for loopback URL, got %d: %s", w.Code, w.Body.String())
 	}
 }
 

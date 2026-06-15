@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -1212,6 +1213,21 @@ func (h *RegistryHandler) UpdateCard(c *gin.Context) {
 	// Phase 30.1 — same bootstrap-aware token gate as Heartbeat.
 	if err := h.requireWorkspaceToken(c.Request.Context(), c, payload.WorkspaceID); err != nil {
 		return // response already written
+	}
+
+	// Validate agent_card.url if present — prevents SSRF via transcript proxy
+	// (issue #2130). An attacker who compromises a workspace token could
+	// register a metadata endpoint as the agent_card url and trick the
+	// platform into forwarding the caller's bearer token to it.
+	var card struct {
+		URL string `json:"url"`
+	}
+	if err := json.Unmarshal(payload.AgentCard, &card); err == nil && card.URL != "" {
+		if err := isSafeURL(card.URL); err != nil {
+			log.Printf("UpdateCard: workspace %s agent_card url rejected: %v", payload.WorkspaceID, err)
+			c.JSON(http.StatusBadRequest, gin.H{"error": "workspace URL not allowed"})
+			return
+		}
 	}
 
 	agentCardStr := string(payload.AgentCard)

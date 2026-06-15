@@ -780,6 +780,48 @@ func TestUpdateCard_DBError(t *testing.T) {
 	}
 }
 
+func TestUpdateCard_RejectsMetadataURL(t *testing.T) {
+	setupTestDB(t)
+	setupTestRedis(t)
+	setSSRFCheckForTest(true)
+	broadcaster := newTestBroadcaster()
+	handler := NewRegistryHandler(broadcaster)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+
+	body := `{"workspace_id":"ws-card","agent_card":{"name":"evil","url":"http://169.254.169.254/latest/meta-data/"}}`
+	c.Request = httptest.NewRequest("POST", "/registry/update-card", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.UpdateCard(c)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for metadata URL in agent_card, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestUpdateCard_RejectsNonHTTPScheme(t *testing.T) {
+	setupTestDB(t)
+	setupTestRedis(t)
+	setSSRFCheckForTest(true)
+	broadcaster := newTestBroadcaster()
+	handler := NewRegistryHandler(broadcaster)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+
+	body := `{"workspace_id":"ws-card","agent_card":{"name":"evil","url":"file:///etc/passwd"}}`
+	c.Request = httptest.NewRequest("POST", "/registry/update-card", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.UpdateCard(c)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for file:// scheme in agent_card, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
 // TestRegister_GuardAgainstResurrectingRemovedRow verifies the #73 fix:
 // the ON CONFLICT UPSERT must carry a `WHERE status IS DISTINCT FROM 'removed'`
 // clause so that a late heartbeat from a workspace that was just deleted

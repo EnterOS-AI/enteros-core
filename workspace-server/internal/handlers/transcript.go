@@ -12,13 +12,10 @@ package handlers
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"log"
-	"net"
 	"net/http"
 	"net/url"
-	"strings"
 	"time"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
@@ -60,15 +57,19 @@ func (h *TranscriptHandler) Get(c *gin.Context) {
 
 	// workspaceURL comes from agent_card which is attacker-writable via
 	// /registry/register — treat it as untrusted and validate before the
-	// outbound HTTP call to prevent SSRF (issue #272).
+	// outbound HTTP call to prevent SSRF (issue #272 / #2130).
+	// isSafeURL is the production policy used by A2A/MCP dispatch; it
+	// includes DNS resolution checks and blocks loopback/private/metadata
+	// targets that validateWorkspaceURL previously allowed.
+	if err := isSafeURL(workspaceURL); err != nil {
+		log.Printf("transcript: workspace %s URL rejected: %v", workspaceID, err)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "workspace URL not allowed"})
+		return
+	}
+
 	target, err := url.Parse(workspaceURL)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid workspace URL"})
-		return
-	}
-	if err := validateWorkspaceURL(target); err != nil {
-		log.Printf("transcript: workspace %s URL rejected: %v", workspaceID, err)
-		c.JSON(http.StatusBadRequest, gin.H{"error": "workspace URL not allowed"})
 		return
 	}
 	target.Path = "/transcript"
@@ -122,57 +123,3 @@ func (h *TranscriptHandler) Get(c *gin.Context) {
 	c.Data(resp.StatusCode, resp.Header.Get("Content-Type"), body)
 }
 
-// validateWorkspaceURL enforces that the agent_card URL is safe to
-// proxy to. agent_card is attacker-writable via /registry/register so
-// any workspace-token holder could otherwise point the URL at cloud
-// metadata (169.254.169.254), the Docker host, or other internal
-// services reachable from the platform container.
-//
-// Policy:
-//   - scheme must be http or https (no file://, gopher://, ftp://, etc.)
-//   - host must be present
-//   - block cloud metadata endpoints (IMDS, GCP, Azure)
-//   - block link-local IPs (169.254/16 IPv4, fe80::/10 IPv6)
-//   - loopback is allowed — local dev runs workspaces on 127.0.0.1
-//   - Docker internal hostnames (host.docker.internal, *.molecule-core-net)
-//     are allowed; the whole threat model assumes the platform already
-//     trusts peers on that network
-func validateWorkspaceURL(u *url.URL) error {
-	if u.Scheme != "http" && u.Scheme != "https" {
-		return fmt.Errorf("unsupported scheme %q", u.Scheme)
-	}
-	host := u.Hostname()
-	if host == "" {
-		return fmt.Errorf("empty host")
-	}
-
-	// Hostname blocklist (pre-IP-parse — these are usually resolved by
-	// the HTTP stack, not by us).
-	lower := strings.ToLower(host)
-	for _, banned := range []string{
-		"metadata.google.internal",
-		"metadata.azure.com",
-		"metadata",
-	} {
-		if lower == banned {
-			return fmt.Errorf("metadata hostname blocked: %s", host)
-		}
-	}
-
-	// IP-literal checks.
-	if ip := net.ParseIP(host); ip != nil {
-		// IMDS / cloud metadata.
-		if ip.String() == "169.254.169.254" {
-			return fmt.Errorf("cloud metadata endpoint blocked")
-		}
-		// Link-local: IPv4 169.254.0.0/16, IPv6 fe80::/10.
-		if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
-			return fmt.Errorf("link-local address blocked: %s", host)
-		}
-		// IPv6 unique local fd00::/8 — used by some IMDS implementations.
-		if ip.To4() == nil && len(ip) == net.IPv6len && ip[0] == 0xfd {
-			return fmt.Errorf("IPv6 unique-local address blocked: %s", host)
-		}
-	}
-	return nil
-}
