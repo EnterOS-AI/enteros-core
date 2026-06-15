@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/approvals"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/crypto"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
@@ -279,25 +280,44 @@ func (h *WorkspaceHandler) Update(c *gin.Context) {
 		// create-boundary uses (workspace_crud.go create + llm_billing_mode
 		// resolver); mirroring it here keeps the PATCH-runtime path consistent
 		// and catches the drift surface CR2 found on the #21 review.
-		var currentModel sql.NullString
-		if err := db.DB.QueryRowContext(ctx,
-			`SELECT COALESCE(model, '') FROM workspaces WHERE id = $1`, id,
-		).Scan(&currentModel); err != nil {
-			log.Printf("Update runtime validation: read current model for %s: %v", id, err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read current model for runtime compatibility check"})
+		// The CURRENT model lives in the MODEL workspace_secret (the SSOT that
+		// GET /model + the boot path use), NOT the workspaces.model column.
+		// Reading the column wedged this PATCH at 500 for workspaces whose
+		// model is only in workspace_secrets (e.g. JRS: GET /model →
+		// source:"workspace_secrets"). Read it the same way GetModel does.
+		var currentModel string
+		var mEnc []byte
+		var mVer int
+		mErr := db.DB.QueryRowContext(ctx,
+			`SELECT encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = $1 AND key = 'MODEL'`, id,
+		).Scan(&mEnc, &mVer)
+		switch {
+		case mErr == nil:
+			if dec, derr := crypto.DecryptVersioned(mEnc, mVer); derr == nil {
+				currentModel = string(dec)
+			} else {
+				log.Printf("Update runtime: decrypt MODEL secret for %s failed: %v", id, derr)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to decrypt model secret"})
+				return
+			}
+		case errors.Is(mErr, sql.ErrNoRows):
+			// No stored model → unresolved. Skip the strict (runtime, model)
+			// check; a genuinely missing model fails closed at boot, not here.
+		default:
+			log.Printf("Update runtime: read MODEL secret for %s: %v", id, mErr)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read model secret"})
 			return
 		}
-		if ok, reason := validateRegisteredModelForRuntime(runtimeStr, currentModel.String); !ok {
-			log.Printf("Update: PATCH runtime=%q on %s REJECTED (model=%q is not registered for that runtime): %s",
-				runtimeStr, id, currentModel.String, reason)
-			// 422 (Unprocessable Entity) matches the create-boundary's
-			// validateRegisteredModelForRuntime path (secrets.go:942, 952
-			// + workspace_crud.go create) — both reviewers flagged the
-			// original 400 as inconsistent. 422 = "syntactically valid
-			// PATCH body, but the (runtime, model) pair is unroutable
-			// per the registry SSOT", which is the precise semantic.
-			c.JSON(http.StatusUnprocessableEntity, gin.H{"error": reason})
-			return
+		// Only enforce the (runtime, model) pair when we actually HAVE a model.
+		if currentModel != "" {
+			if ok, reason := validateRegisteredModelForRuntime(runtimeStr, currentModel); !ok {
+				log.Printf("Update: PATCH runtime=%q on %s REJECTED (model=%q is not registered for that runtime): %s",
+					runtimeStr, id, currentModel, reason)
+				// 422 = syntactically valid PATCH body, but the (runtime, model)
+				// pair is unroutable per the registry SSOT.
+				c.JSON(http.StatusUnprocessableEntity, gin.H{"error": reason})
+				return
+			}
 		}
 		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET runtime = $2, updated_at = now() WHERE id = $1`, id, runtimeStr); err != nil {
 			log.Printf("Update runtime error for %s: %v", id, err)
