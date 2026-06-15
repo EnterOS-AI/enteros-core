@@ -99,6 +99,7 @@ import argparse
 import dataclasses
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.parse
@@ -206,6 +207,70 @@ REVIEWER_SET = {
 # authoritative value is read from branch protection at runtime; this is only
 # the fallback when BP does not specify one.
 REQUIRED_APPROVALS_DEFAULT = int(_env("REQUIRED_APPROVALS", default="2") or "2")
+
+# --------------------------------------------------------------------------
+# Runtime-bump auto-merge exemption (RFC internal#131 PR-A, dispatch 9c2e9c88)
+# --------------------------------------------------------------------------
+# The bump-bot publishes single-line .runtime-version bumps when a runtime-v
+# release lands. These PRs are TRIVIAL by construction (one-file, one-line,
+# identical mechanical pattern), and the runtime-smoke CI on the PR is
+# designed to be the actual proof — the new runtime has been provisioned +
+# run a workspace on it. We trust a curated allowlist of "boring" runtimes
+# (currently empty by default; CEO-Asst populates per runtime policy) to
+# auto-merge such bumps WITHOUT 2-genuine review — but ONLY if every guard
+# and condition below holds. This exists to break the rebase-churn loop
+# for runtime-v releases (otherwise every bump queues behind normal review
+# cadence and lands a day late).
+#
+# FAIL-CLOSED: any guard/condition that is unverifiable → NOT exempt. The
+# PR routes through the normal 2-genuine path instead. We never auto-merge
+# on uncertainty.
+RUNTIME_BUMP_BOT_USER = _env("RUNTIME_BUMP_BOT_USER", default="bump-bot")
+# Allowlist of runtime names that are eligible for the exemption. Populated
+# by the CEO-Asst via env var (comma-separated). Default empty = no runtime
+# is eligible; the function is a no-op until the CEO-Asst opts a runtime in.
+# RUNTIME_BUMP_EXEMPT_TEMPLATES values must match the runtime identifier in
+# .runtime-version (e.g. "claude-code", "hermes", "kimi-cli"), NOT the
+# repository name.
+RUNTIME_BUMP_EXEMPT_TEMPLATES = {
+    name.strip()
+    for name in _env("RUNTIME_BUMP_EXEMPT_TEMPLATES", default="").split(",")
+    if name.strip()
+}
+# Subset of branch-protection REQUIRED contexts that prove the PR was
+# actually verified by a real runtime-provision/compat smoke (i.e. the CI
+# job provisions a workspace on the new runtime and runs a basic task —
+# NOT a static build/lint/unit-test job). The PR is GATE-ADEQUATE only if
+# at least ONE of these (case-insensitive substring match) appears in the
+# required_contexts set the queue loaded from branch protection. Adding
+# a new runtime-smoke job to BP without adding the context name here will
+# silently disable the exemption for that job — the fail-closed design
+# deliberately errs on the side of falling back to 2-genuine.
+RUNTIME_PROVISION_SMOKE_CONTEXTS = {
+    name.strip().lower()
+    for name in _env(
+        "RUNTIME_PROVISION_SMOKE_CONTEXTS",
+        default=(
+            "runtime-provision-smoke,"
+            "runtime-compat-smoke,"
+            "e2e-runtime-provision"
+        ),
+    ).split(",")
+    if name.strip()
+}
+# Labels that mark a runtime-bump as breaking. EXCLUDE-BREAKING (condition
+# 3) treats any of these as "not eligible", regardless of semver. The
+# bump-bot is not expected to add these labels — the set is a safety net
+# for the case where a human adds one mid-flight (e.g. "the API changed,
+# callers need a rewire" mid-bump).
+BREAKING_LABELS = {
+    name.strip()
+    for name in _env(
+        "BREAKING_LABELS",
+        default="breaking,breaking-change,requires-consumer-wiring",
+    ).split(",")
+    if name.strip()
+}
 
 OWNER, NAME = (REPO.split("/", 1) + [""])[:2] if REPO else ("", "")
 API = f"https://{GITEA_HOST}/api/v1" if GITEA_HOST else ""
@@ -520,6 +585,389 @@ def label_names(issue: dict) -> set[str]:
     }
 
 
+# --------------------------------------------------------------------------
+# Runtime-bump exemption (RFC internal#131 PR-A; spec 9c2e9c88)
+# --------------------------------------------------------------------------
+# Helpers + the is_runtime_bump_exempt() predicate. Wired into
+# evaluate_merge_readiness via the runtime_bump_exempt flag (when True, the
+# required-approvals check is skipped — the 2-genuine convention is
+# intentionally bypassed for these PRs). The runtime-smoke CI context is
+# STILL required (it's a required_contexts check, not an approvals check,
+# so the exemption does not weaken the CI gate).
+# --------------------------------------------------------------------------
+
+# File touched by a qualifying runtime-bump. The bump-bot writes the new
+# version as the ONLY changed line in this file; the line is also the ONLY
+# removed line (the old version). Any other file touched, or multiple
+# lines, fails the single-line guard and the PR is treated as non-bump.
+RUNTIME_VERSION_FILE = ".runtime-version"
+
+
+def _runtime_version_added_removed_lines(patch: str) -> tuple[int, int, str | None, str | None]:
+    """Parse a unified-diff patch string and return the (added, removed) line
+    counts AND the values of the single added/removed non-header lines.
+
+    A runtime-bump patch has exactly ONE added line (the new version) and
+    ONE removed line (the old version). If either count differs, the PR is
+    not a clean single-line bump and is rejected by the guard.
+
+    Header lines (`+++`, `---`) are excluded. Empty lines (a `+` or `-`
+    with no content) are treated as a valid line — but a runtime-bump
+    would not have one (the version is always a non-empty string).
+    """
+    added = 0
+    removed = 0
+    added_value: str | None = None
+    removed_value: str | None = None
+    for line in patch.splitlines():
+        if line.startswith("+++") or line.startswith("---"):
+            continue
+        if line.startswith("+"):
+            added += 1
+            # Strip the leading `+` and any trailing newline. Preserve
+            # the value verbatim so ==SSOT can compare it to the runtime-v
+            # release tag without ambiguity (no trim, no strip).
+            added_value = line[1:]
+        elif line.startswith("-"):
+            removed += 1
+            removed_value = line[1:]
+    return added, removed, added_value, removed_value
+
+
+def is_runtime_bump_exempt(
+    *,
+    pr: dict,
+    pr_files: list[dict],
+    required_contexts: list[str],
+    latest_runtime_v_tag: str | None,
+    rc_active: bool,
+) -> tuple[bool, str]:
+    """Decide whether a PR is a qualifying runtime-bump eligible for the
+    auto-merge exemption. Returns (exempt, reason).
+
+    FAIL-CLOSED: every guard/condition that is unverifiable → NOT exempt.
+    The PR routes through the normal 2-genuine path. We never auto-merge
+    on uncertainty.
+
+    GUARDS (all must hold):
+      1. author == bump-bot (RUNTIME_BUMP_BOT_USER)
+      2. diff touches EXACTLY .runtime-version AND has exactly 1 added +
+         1 removed non-header line in that file
+      3. no active release-candidate in progress (rc_active == False)
+      4. all required CI contexts green — ENFORCED in evaluate_merge_readiness,
+         not here; the exemption skips the approvals check, not the CI gate
+
+    CONDITIONS (all must hold):
+      1. ==SSOT: the added value == the latest runtime-v release tag
+         (NOT merely "valid semver"; the value must match a real release
+         the runtime repo has published)
+      2a. GATE-ADEQUACY: the loaded required_contexts set includes a real
+         runtime-provision/compat smoke context (a job that provisions +
+         runs a workspace on the new runtime — NOT static build/lint)
+      2b. GATE-ADEQUACY: the runtime name (parsed from the .runtime-version
+         header) is on RUNTIME_BUMP_EXEMPT_TEMPLATES
+      3. EXCLUDE-BREAKING: the new version is NOT semver-MAJOR (major>0)
+         AND the PR has no breaking label (BREAKING_LABELS)
+    """
+    # GUARD 1: author must be bump-bot. Fail-closed: a missing/unknown
+    # user is NOT bump-bot.
+    author = (pr.get("user") or {}).get("login", "")
+    if not isinstance(author, str) or author != RUNTIME_BUMP_BOT_USER:
+        return False, f"author={author!r} != RUNTIME_BUMP_BOT_USER={RUNTIME_BUMP_BOT_USER!r}"
+
+    # GUARD 2: diff must be EXACTLY .runtime-version, with exactly one
+    # added line and one removed line (the old → new version swap).
+    runtime_file = None
+    other_files = 0
+    for entry in pr_files:
+        if not isinstance(entry, dict):
+            # FAIL-CLOSED: an unparseable file entry is a structural
+            # anomaly; we can't prove the diff is single-file. Default
+            # to non-exempt.
+            return False, "pr_files contains non-dict entry (unverifiable)"
+        filename = entry.get("filename", "")
+        if filename == RUNTIME_VERSION_FILE:
+            if runtime_file is not None:
+                # The same file appears twice in the diff listing
+                # (shouldn't happen for a real PR but be defensive).
+                return False, f"{RUNTIME_VERSION_FILE} appears multiple times in diff"
+            runtime_file = entry
+        else:
+            other_files += 1
+    if runtime_file is None:
+        return False, f"diff does not touch {RUNTIME_VERSION_FILE}"
+    if other_files > 0:
+        return False, f"diff touches {other_files} other file(s) besides {RUNTIME_VERSION_FILE}"
+
+    patch = runtime_file.get("patch", "")
+    if not isinstance(patch, str) or not patch:
+        return False, f"{RUNTIME_VERSION_FILE} diff has no patch text (unverifiable)"
+
+    added, removed, added_value, removed_value = _runtime_version_added_removed_lines(patch)
+    if added != 1 or removed != 1:
+        return (
+            False,
+            f"{RUNTIME_VERSION_FILE} diff has {added} added + {removed} removed "
+            f"non-header lines (must be exactly 1 each)",
+        )
+    if not added_value or not removed_value:
+        return False, f"{RUNTIME_VERSION_FILE} diff added/removed value is empty"
+
+    # Parse the .runtime-version line into runtime name + version. The
+    # format is `<runtime-name>@<version>` (e.g. `claude-code@v1.2.3`).
+    # Both pieces are needed: the runtime name for the allowlist, the
+    # version for the ==SSOT check and the semver-major check. If the
+    # format is not parseable, fail-closed: we cannot determine which
+    # runtime the bump is for, so the exemption cannot be safely
+    # granted.
+    if "@" not in added_value:
+        return (
+            False,
+            f"{RUNTIME_VERSION_FILE} value {added_value!r} is not in "
+            f"'<runtime>@<version>' format (cannot determine runtime name "
+            f"for allowlist + ==SSOT checks)",
+        )
+    runtime_name, _, version_part = added_value.partition("@")
+    if not runtime_name or not version_part:
+        return (
+            False,
+            f"{RUNTIME_VERSION_FILE} value {added_value!r} has empty "
+            f"runtime or version after partition",
+        )
+
+    # GUARD 3: no active RC in progress. The caller computes this (it
+    # needs to inspect PR list for an active `release-candidate` PR);
+    # we trust the boolean, but a missing/None is treated as
+    # unverifiable → fail-closed.
+    if rc_active is True:
+        return False, "active release-candidate PR in progress"
+
+    # CONDITION 1: ==SSOT. The VERSION part of the .runtime-version
+    # line must equal the latest runtime-v release tag (NOT the full
+    # `<runtime>@<version>` string — the tag is just the version,
+    # e.g. `v1.2.3`). None means the caller couldn't determine the
+    # latest tag (network error, missing repo, etc.) → fail-closed.
+    if not isinstance(latest_runtime_v_tag, str) or not latest_runtime_v_tag:
+        return False, "latest runtime-v release tag is unverifiable (==SSOT)"
+    if version_part != latest_runtime_v_tag:
+        return (
+            False,
+            f"==SSOT mismatch: .runtime-version version={version_part!r} "
+            f"!= latest runtime-v tag={latest_runtime_v_tag!r}",
+        )
+
+    # CONDITION 2a: GATE-ADEQUACY (CI side). At least one of the
+    # required contexts (case-insensitive substring match against
+    # RUNTIME_PROVISION_SMOKE_CONTEXTS) must be in the loaded
+    # required_contexts set. Empty required_contexts → fail-closed.
+    if not required_contexts:
+        return False, "required_contexts is empty (no CI gate to verify against)"
+    required_contexts_lower = [c.lower() for c in required_contexts]
+    has_runtime_smoke = any(
+        any(smoke in ctx for smoke in RUNTIME_PROVISION_SMOKE_CONTEXTS)
+        for ctx in required_contexts_lower
+    )
+    if not has_runtime_smoke:
+        return (
+            False,
+            f"required_contexts has no runtime-provision/compat smoke "
+            f"(looked for any of: {sorted(RUNTIME_PROVISION_SMOKE_CONTEXTS)})",
+        )
+
+    # CONDITION 2b: GATE-ADEQUACY (template side). The runtime name
+    # (parsed above from the .runtime-version header) must be on the
+    # allowlist.
+    if runtime_name not in RUNTIME_BUMP_EXEMPT_TEMPLATES:
+        return (
+            False,
+            f"runtime {runtime_name!r} not on RUNTIME_BUMP_EXEMPT_TEMPLATES "
+            f"allowlist (currently: {sorted(RUNTIME_BUMP_EXEMPT_TEMPLATES)})",
+        )
+
+    # CONDITION 3: EXCLUDE-BREAKING. Semver-MAJOR (the major part of
+    # the version is > 0) → not eligible. A leading 'v' is tolerated
+    # (`v1.2.3` → major=1). Unparseable versions → fail-closed.
+    clean_version = version_part.lstrip("v")
+    try:
+        major_str, _, _ = clean_version.split(".", 2)
+        major_int = int(major_str)
+    except (ValueError, IndexError):
+        return (
+            False,
+            f"version {version_part!r} is not parseable as semver "
+            f"(major.minor.patch)",
+        )
+    if major_int > 0:
+        return (
+            False,
+            f"semver-MAJOR bump ({version_part}): major={major_int} > 0 → not eligible",
+        )
+
+    # CONDITION 3 (cont): breaking label check. The bump-bot is not
+    # expected to set these, but a human might have added one
+    # mid-flight. Empty pr_labels → trivially passes.
+    pr_labels = label_names(pr)
+    breaking_present = pr_labels & BREAKING_LABELS
+    if breaking_present:
+        return (
+            False,
+            f"PR has breaking label(s): {sorted(breaking_present)}",
+        )
+
+    return True, (
+        f"runtime-bump exempt: bump-bot single-line .runtime-version "
+        f"{removed_value!r}→{added_value!r}; runtime={runtime_name!r}; "
+        f"==SSOT; smoke context present; allowlist hit; semver-minor"
+    )
+
+
+def _parse_bump_pr_title(title: str) -> tuple[str, str] | None:
+    """Parse a bump-bot PR title into (runtime_name, version).
+
+    Returns None if the title doesn't match a recognized bump-bot
+    format. The caller treats a None return as "singleton bucket, no
+    dedup possible" (fail-safe — a non-matching title is never
+    spuriously grouped with anything else).
+
+    Recognized formats (per the 9c2e9c88 spec):
+      - "runtime:<runtime>-<version>"  (no leading 'v' on version)
+      - "<runtime> bump to <version>"  (version may or may not have leading 'v')
+      - "runtime: <runtime> bump to <version>"  (hybrid: prefix + verb form)
+
+    Examples:
+      "runtime:claude-code-v1.2.3"          -> ("claude-code", "v1.2.3")
+      "claude-code bump to v1.2.3"         -> ("claude-code", "v1.2.3")
+      "runtime: claude-code bump to v1.2.3"-> ("claude-code", "v1.2.3")
+      "kimi-cli bump to v0.5.0"            -> ("kimi-cli", "v0.5.0")
+      "fix typo in docs"                    -> None
+    """
+    if not isinstance(title, str) or not title:
+        return None
+    # The "runtime:" prefix is optional — strip it if present so we can
+    # use a single regex for the two body forms.
+    body = title[len("runtime:"):].lstrip() if title.startswith("runtime:") else title
+    # Format 1: "<runtime>-<version>" — runtime name is the substring
+    # before the last "-v<MAJOR>.<MINOR>.<PATCH>" suffix.
+    m = re.search(r"-v\d+\.\d+\.\d+\s*$", body)
+    if m:
+        runtime_name = body[: m.start()].strip()
+        version = body[m.start() + 1 :].strip()
+        if runtime_name and version:
+            return (runtime_name, version)
+    # Format 2: "<runtime> bump to <version>"
+    m = re.match(
+        r"^(?P<runtime>\S+)\s+bump to\s+(?P<version>v?\d+\.\d+\.\d+)\s*$",
+        body,
+    )
+    if m:
+        runtime_name = m.group("runtime").strip()
+        version = m.group("version").strip()
+        # Normalize version to leading "v" so the dedup key matches across
+        # formats (e.g. "1.2.3" from format 1 == "v1.2.3" from format 2).
+        if not version.startswith("v"):
+            version = "v" + version
+        if runtime_name and version:
+            return (runtime_name, version)
+    return None
+
+
+def dup_close_superseded_bump_prs(
+    prs: list[dict],
+    *,
+    close_fn: "callable",
+    comment_fn: "callable",
+    dry_run: bool = False,
+) -> list[int]:
+    """Close all but the newest open auto-bump PR per (runtime_name, version)
+    tuple. Returns the list of PR numbers that were closed.
+
+    Rationale: when the bump-bot republishes a bump (e.g. CI was red on the
+    first push, so the bot repushed with the same version), or when a new
+    version lands while the old one is still open, multiple bump PRs can
+    race for the same (runtime, version) slot. The exemption would auto-merge
+    the OLDEST one first (FIFO) — but the OLDEST one has stale CI, and
+    merging it would skip the new smoke run. We close the older ones (and
+    post a comment) so the auto-merge path only ever sees the freshest.
+
+    "Newest" = latest `updated_at` then highest `number` (both stable Gitea
+    fields). PRs not authored by the bump-bot, or PRs whose diff is not a
+    clean single-line .runtime-version bump, are ignored (not eligible for
+    closure via this path — they may be hand-edits).
+
+    `close_fn(pr_number, *, dry_run)` and `comment_fn(pr_number, body, *, dry_run)`
+    are injected so the function is unit-testable without a live Gitea.
+    """
+    # Bucket PRs by (runtime, version). Skip PRs that aren't
+    # single-line .runtime-version bumps authored by bump-bot.
+    #
+    # Title-based parsing: bump-bot PR titles follow one of two stable
+    # formats per the 9c2e9c88 spec:
+    #   - "runtime:<runtime>-<version>"  (e.g. "runtime:claude-code-v1.2.3")
+    #   - "<runtime> bump to <version>"  (e.g. "claude-code bump to v1.2.3")
+    # We parse the title to extract (runtime, version) explicitly so the
+    # bucket key matches the documented dedup semantic ("newest per
+    # (runtime, version)"). A title that doesn't match either format is
+    # treated as its own single-PR bucket — the per-PR close guard
+    # (`if len(group) <= 1: continue`) makes that a no-op. This is
+    # fail-safe: a non-standard title is never spuriously closed.
+    buckets: dict[tuple[str, str], list[dict]] = {}
+    for pr in prs:
+        if not isinstance(pr, dict):
+            continue
+        author = (pr.get("user") or {}).get("login", "")
+        if author != RUNTIME_BUMP_BOT_USER:
+            continue
+        number = int(pr.get("number", 0))
+        if not number:
+            continue
+        runtime_v = _parse_bump_pr_title(pr.get("title", ""))
+        # Group by (runtime, version); non-matching titles get a unique
+        # sentinel key so they end up in a singleton bucket (no-op).
+        bucket_key = runtime_v if runtime_v is not None else (str(number), "")
+        buckets.setdefault(bucket_key, []).append(pr)
+
+    closed: list[int] = []
+    for _key, group in buckets.items():
+        if len(group) <= 1:
+            continue
+        # Sort newest-first by (updated_at desc, number desc).
+        group_sorted = sorted(
+            group,
+            key=lambda p: (
+                p.get("updated_at", ""),
+                int(p.get("number", 0)),
+            ),
+            reverse=True,
+        )
+        keep = group_sorted[0]
+        for stale in group_sorted[1:]:
+            stale_number = int(stale.get("number", 0))
+            keep_number = int(keep.get("number", 0))
+            body = (
+                f"Closing as superseded by #{keep_number} "
+                f"(newer bump-bot PR for the same runtime-version slot; "
+                f"the auto-merge exemption auto-merged the freshest to "
+                f"avoid merging stale CI)."
+            )
+            try:
+                comment_fn(stale_number, body, dry_run=dry_run)
+            except ApiError:
+                # Comment is best-effort; the close is what matters.
+                pass
+            try:
+                close_fn(stale_number, dry_run=dry_run)
+            except ApiError as exc:
+                # Don't crash the tick on a single close failure; log
+                # and continue. The other dupes in the same group
+                # still need closing.
+                sys.stderr.write(
+                    f"::warning::dup-close failed for PR #{stale_number}: {exc}\n"
+                )
+                continue
+            closed.append(stale_number)
+    return closed
+
+
 def choose_next_queued_issue(
     issues: list[dict],
     *,
@@ -665,6 +1113,7 @@ def evaluate_merge_readiness(
     pr_has_current_base: bool,
     mergeable: bool | None,
     pr_labels: set[str] | None = None,
+    runtime_bump_exempt: bool = False,
 ) -> MergeDecision:
     # 1) Main's push-required contexts must be green. Combined state can be
     #    "failure" due to non-blocking jobs (continue-on-error: true) that do
@@ -689,12 +1138,22 @@ def evaluate_merge_readiness(
         )
 
     # 3) Enough distinct genuine official approvals on the current head.
-    if len(approvers) < required_approvals:
+    #    The runtime-bump exemption (RFC internal#131) bypasses this check
+    #    for single-line .runtime-version bumps authored by bump-bot when
+    #    the runtime-smoke CI is present in the required_contexts. The
+    #    exemption does NOT bypass any CI gate (step 4 still requires
+    #    every required context to be green) and does NOT bypass main's
+    #    push-required gate (step 1). It ONLY bypasses the human-approvals
+    #    bar, which a bot cannot satisfy by construction. Required
+    #    approvals is forced to 0 for the check below when the exemption
+    #    holds.
+    effective_required_approvals = 0 if runtime_bump_exempt else required_approvals
+    if len(approvers) < effective_required_approvals:
         return MergeDecision(
             False, "wait",
             f"insufficient genuine approvals on current head: have "
             f"{len(approvers)} ({', '.join(sorted(approvers)) or 'none'}), "
-            f"need {required_approvals}",
+            f"need {effective_required_approvals}",
         )
 
     # 4) Every REQUIRED status context must be green. This includes both
@@ -946,6 +1405,23 @@ def add_label_by_name(pr_number: int, label_name: str, *, dry_run: bool) -> None
     )
 
 
+def close_pull(pr_number: int, *, dry_run: bool) -> None:
+    """Close a PR (issues endpoint; PRs are issues in Gitea's data model).
+
+    Used by dup_close_superseded_bump_prs() to retire older bump-bot
+    PRs that have been superseded by a fresh bump. Network/HTTP
+    errors propagate as ApiError so the caller can decide whether
+    to log-and-continue or fail the tick.
+
+    The body is intentionally empty (Gitea does not require a close
+    reason; the explanatory comment is posted separately).
+    """
+    if dry_run:
+        print(f"::notice::(dry-run) would close PR #{pr_number}")
+        return
+    api("PATCH", f"/repos/{OWNER}/{NAME}/issues/{pr_number}", body={"state": "closed"})
+
+
 def hold_pr(pr_number: int, hold_note: str, *, dry_run: bool) -> None:
     """Apply HOLD_LABEL to a wedged PR so the queue advances past it.
 
@@ -1043,6 +1519,35 @@ def process_once(*, dry_run: bool = False) -> int:
             f"(auto_discover={'on' if AUTO_DISCOVER else 'off'})"
         )
         return 0
+
+    # Runtime-bump dup-close (RFC internal#131 PR-A). If multiple bump-bot
+    # PRs are open for the same (runtime, version) slot (e.g. the bot
+    # repushed after a red CI run), the OLDEST has stale CI. The exemption
+    # would auto-merge the first one the FIFO scan reaches — but we want
+    # the FRESHEST to win (its smoke run is the relevant one). Close all
+    # but the freshest per group so the auto-merge path only ever sees
+    # the fresh bump. Best-effort: a single close failure logs and
+    # continues (does NOT abort the tick).
+    try:
+        closed_dups = dup_close_superseded_bump_prs(
+            candidates,
+            close_fn=close_pull,
+            comment_fn=post_comment,
+            dry_run=dry_run,
+        )
+        if closed_dups:
+            print(
+                f"::notice::dup-close retired {len(closed_dups)} superseded "
+                f"bump PR(s): {closed_dups}"
+            )
+    except ApiError as exc:
+        # Defensive: dup_close_superseded_bump_prs catches per-close
+        # ApiError internally; an outer raise means something more
+        # fundamental is wrong. Log and continue — dup-close is an
+        # optimization, not a gate.
+        sys.stderr.write(
+            f"::warning::dup-close encountered unexpected error: {exc}\n"
+        )
 
     # HOL fix: SCAN THROUGH the FIFO candidate list until a PR we can ACT on is
     # found, instead of locking on the oldest and waiting. A non-ready candidate
@@ -1147,6 +1652,140 @@ def process_once(*, dry_run: bool = False) -> int:
     return 0
 
 
+def get_pull_diff_files(pr_number: int) -> list[dict]:
+    """Fetch the list of files changed in a PR with their unified-diff patch.
+
+    Gitea endpoint: GET /repos/{owner}/{name}/pulls/{pr}/files. Returns a
+    list of `{filename, status, additions, deletions, changes, patch}` dicts.
+    The `patch` field is the unified diff (may be None/empty for binary
+    files or files beyond the Gitea diff-size cap).
+
+    Used by is_runtime_bump_exempt() to inspect the .runtime-version diff
+    (the only file a qualifying bump touches). Network/HTTP errors are
+    caught and converted to ApiError by the api() helper; the caller
+    treats an empty list as "no diff info available" (fail-closed: the
+    exemption check will see an empty pr_files and reject the PR).
+
+    Fail-safe: in addition to ApiError, any other exception (a malformed
+    URL, a urllib transport error, a JSON decode failure, etc.) is
+    swallowed and an empty list returned. is_runtime_bump_exempt() will
+    then reject the PR (no .runtime-version found), so the PR takes the
+    normal 2-genuine path. The empty list is the fail-closed sentinel.
+    """
+    try:
+        _, body = api("GET", f"/repos/{OWNER}/{NAME}/pulls/{pr_number}/files")
+    except (ApiError, ValueError, TypeError) as exc:
+        # ValueError: malformed URL (urllib raised this in test monkeypatches
+        # that don't set a real host). TypeError: rare but defensive. ApiError:
+        # the documented HTTP failure mode. All three mean "diff not
+        # fetchable" → fail-closed empty list.
+        sys.stderr.write(
+            f"::warning::get_pull_diff_files failed for PR #{pr_number}: {exc}\n"
+        )
+        return []
+    if not isinstance(body, list):
+        return []
+    return body
+
+
+def latest_runtime_v_tag_for(pr: dict) -> str | None:
+    """Query the runtime repo for the latest runtime-v release tag matching
+    the .runtime-version bump on `pr`. Returns the tag string, or None if
+    it can't be determined (network error, no matching repo, no tags, etc.).
+
+    FAIL-CLOSED contract: returning None is enough to fail the ==SSOT
+    condition in is_runtime_bump_exempt — the PR will not be exempted.
+
+    The lookup strategy:
+      1. Read the runtime name from the pr's head branch name
+         (bump-bot uses branch names like `runtime-bump/claude-code/v1.2.3`
+         per the 9c2e9c88 spec; if the branch doesn't match, return None).
+      2. Query the runtime repo's tags list
+         (GET /repos/molecule-ai/molecule-ai-runtime-{name}/tags).
+      3. Return the most recent tag that is exactly a `vMAJOR.MINOR.PATCH`
+         version (so a v0.x.y dev tag doesn't accidentally satisfy).
+
+    To keep the implementation minimal and testable, the runtime repo name
+    is derived from a convention: the runtime name (extracted from the
+    branch) maps to `molecule-ai/molecule-ai-runtime-<name>`. If the
+    convention doesn't hold for a given runtime, the operator can set
+    RUNTIME_BUMP_REPO_TEMPLATE env var to override (e.g.
+    `org/repo-{name}-runtime`).
+    """
+    repo_template = _env(
+        "RUNTIME_BUMP_REPO_TEMPLATE",
+        default="molecule-ai/molecule-ai-runtime-{name}",
+    )
+    # Extract the runtime name from the branch. The branch format is
+    # `runtime-bump/<runtime-name>/v<version>` per the 9c2e9c88 spec.
+    head = pr.get("head") or {}
+    branch = head.get("ref", "") if isinstance(head, dict) else ""
+    if not isinstance(branch, str) or not branch.startswith("runtime-bump/"):
+        return None
+    parts = branch.split("/")
+    if len(parts) != 3:
+        return None
+    runtime_name = parts[1]
+    if not runtime_name:
+        return None
+    runtime_repo = repo_template.format(name=runtime_name)
+    try:
+        owner, name = runtime_repo.split("/", 1)
+    except ValueError:
+        return None
+    try:
+        _, tags = api("GET", f"/repos/{owner}/{name}/tags", query={"limit": "20"})
+    except ApiError:
+        return None
+    if not isinstance(tags, list):
+        return None
+    # Pick the most recent tag that looks like a clean semver `vX.Y.Z`
+    # (filter out pre-release / build-metadata / non-version tags).
+    semver_re = re.compile(r"^v\d+\.\d+\.\d+$")
+    for tag in tags:
+        if not isinstance(tag, dict):
+            continue
+        tag_name = tag.get("name", "")
+        if isinstance(tag_name, str) and semver_re.match(tag_name):
+            return tag_name
+    return None
+
+
+def _is_active_release_candidate(prs: list[dict], *, pr_number: int) -> bool:
+    """True if any open PR (other than `pr_number`) carries a label
+    indicating a release-candidate is in progress.
+
+    The label name is taken from RELEASE_CANDIDATE_LABELS env var
+    (comma-separated, default "release-candidate,rc"). An open PR
+    carrying ANY of these labels blocks the runtime-bump exemption —
+    the bump would race with the RC and potentially land before the
+    RC smoke completes.
+    """
+    rc_labels = {
+        name.strip()
+        for name in _env(
+            "RELEASE_CANDIDATE_LABELS",
+            default="release-candidate,rc",
+        ).split(",")
+        if name.strip()
+    }
+    for other in prs:
+        if not isinstance(other, dict):
+            continue
+        try:
+            other_number = int(other.get("number", 0))
+        except (TypeError, ValueError):
+            continue
+        if other_number == pr_number:
+            continue  # don't count the PR being evaluated
+        if other.get("state") != "open":
+            continue
+        other_labels = label_names(other)
+        if other_labels & rc_labels:
+            return True
+    return False
+
+
 def _early_skip_reason(
     pr: dict,
     *,
@@ -1239,6 +1878,63 @@ def _evaluate_candidate(
         reviews, headsha=head_sha, reviewer_set=REVIEWER_SET
     )
 
+    # Runtime-bump exemption (RFC internal#131). Compute the exempt flag here
+    # so it flows into evaluate_merge_readiness. The check itself lives in
+    # is_runtime_bump_exempt() and is fail-closed — any unverifiable guard
+    # or condition returns (False, reason), in which case the PR takes the
+    # normal 2-genuine path. The PR is exempt ONLY if every guard + every
+    # condition holds, AND an active release-candidate is NOT in progress.
+    #
+    # Fail-safe wrap: each helper (get_pull_diff_files,
+    # latest_runtime_v_tag_for, _is_active_release_candidate) issues its own
+    # API calls. A network blip or a partial outage must not abort the
+    # whole tick; on error we default to NOT exempt (the PR takes the
+    # normal 2-genuine path). This is consistent with the fail-closed
+    # design: when in doubt, require 2-genuine.
+    runtime_bump_exempt = False
+    exempt_reason = "exemption check not run"
+    try:
+        pr_files = get_pull_diff_files(pr_number)
+        latest_tag = latest_runtime_v_tag_for(pr)
+        try:
+            rc_prs = list_candidate_issues(auto_discover=False)
+        except (ApiError, ValueError, TypeError) as exc:
+            # list_candidate_issues can also hit the network via
+            # api_paginated; if it errors here, treat as "no active RC"
+            # (the conservative read — the PR may be exempted if every
+            # other condition holds, but only when the call succeeds
+            # and returns a clean list). Logging only — fail-closed
+            # elsewhere (empty pr_files / None latest_tag → not exempt).
+            sys.stderr.write(
+                f"::warning::list_candidate_issues for RC check failed on "
+                f"PR #{pr_number}: {exc}\n"
+            )
+            rc_prs = []
+        rc_active = _is_active_release_candidate(prs=rc_prs, pr_number=pr_number)
+        runtime_bump_exempt, exempt_reason = is_runtime_bump_exempt(
+            pr=pr,
+            pr_files=pr_files,
+            required_contexts=required_contexts,
+            latest_runtime_v_tag=latest_tag,
+            rc_active=rc_active,
+        )
+    except (ApiError, ValueError, TypeError) as exc:
+        # API error fetching diff / tag / RC status → fail-closed:
+        # treat as not exempt, continue with normal 2-genuine path.
+        runtime_bump_exempt = False
+        exempt_reason = f"exemption check errored (fail-closed): {exc}"
+    if runtime_bump_exempt:
+        # Observable so an audit can confirm WHY the approvals gate was
+        # bypassed. The reason is also returned via the MergeDecision
+        # field if a merge decision is taken.
+        print(f"::notice::PR #{pr_number} runtime-bump exempt: {exempt_reason}")
+    else:
+        # Only log "not exempt" at debug level (we don't want to spam
+        # the workflow log for the common case). The decision.reason
+        # returned by evaluate_merge_readiness will carry the real
+        # "insufficient genuine approvals" message on the normal path.
+        pass
+
     decision = evaluate_merge_readiness(
         main_status=main_status,
         pr_status=pr_status,
@@ -1249,6 +1945,7 @@ def _evaluate_candidate(
         pr_has_current_base=current_base,
         mergeable=mergeable,
         pr_labels=pr_labels,
+        runtime_bump_exempt=runtime_bump_exempt,
     )
     return decision, ctx
 
