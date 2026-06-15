@@ -36,10 +36,6 @@ import (
 	"time"
 )
 
-func readFilePinningTest(path string) ([]byte, error) {
-	return os.ReadFile(path)
-}
-
 // readRealManifestForPinningTest finds molecule-core/manifest.json by
 // walking up from the test file's directory. The test lives at
 // workspace-server/internal/handlers/; molecule-core/manifest.json
