@@ -1,9 +1,9 @@
+// @vitest-environment jsdom
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 // ---------------------------------------------------------------------------
-// We test ErrorBoundary in a pure-unit style by instantiating the class
-// directly, avoiding the need for a full React DOM renderer (which the
-// project's vitest environment = "node" does not provide).
+// We test ErrorBoundary both in pure-unit style (class instantiation) and
+// with React DOM rendering to verify it catches child render throws.
 // ---------------------------------------------------------------------------
 
 // Mock fetch globally so transitive imports of api.ts don't blow up
@@ -12,6 +12,7 @@ globalThis.fetch = vi.fn(() =>
 );
 
 import React from "react";
+import { render, screen, cleanup, fireEvent } from "@testing-library/react";
 import { ErrorBoundary } from "../ErrorBoundary";
 
 // ---------------------------------------------------------------------------
@@ -21,6 +22,13 @@ import { ErrorBoundary } from "../ErrorBoundary";
 function createInstance(props: { children: React.ReactNode } = { children: null }) {
   const instance = new ErrorBoundary(props);
   return instance;
+}
+
+function Thrower({ shouldThrow }: { shouldThrow: boolean }) {
+  if (shouldThrow) {
+    throw new Error("boom");
+  }
+  return <div data-testid="child">healthy child</div>;
 }
 
 // ---------------------------------------------------------------------------
@@ -36,6 +44,7 @@ describe("ErrorBoundary", () => {
 
   afterEach(() => {
     consoleErrorSpy.mockRestore();
+    cleanup();
   });
 
   // ---- static getDerivedStateFromError -----------------------------------
@@ -123,5 +132,35 @@ describe("ErrorBoundary", () => {
     const json = JSON.stringify(result);
     expect(json).toContain("Unknown error");
     expect(json).toContain("Something went wrong");
+  });
+
+  // ---- DOM integration: catches child render throws ---------------------
+
+  it("renders a fallback when a child throws during render", () => {
+    render(
+      <ErrorBoundary>
+        <Thrower shouldThrow={true} />
+      </ErrorBoundary>,
+    );
+    expect(screen.getByRole("alert")).toBeDefined();
+    expect(screen.queryByText("Something went wrong")).not.toBeNull();
+    expect(screen.queryByText("boom")).not.toBeNull();
+  });
+
+  it("reload button calls window.location.reload", () => {
+    const reload = vi.fn();
+    Object.defineProperty(window, "location", {
+      value: { reload },
+      writable: true,
+    });
+
+    render(
+      <ErrorBoundary>
+        <Thrower shouldThrow={true} />
+      </ErrorBoundary>,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /reload/i }));
+    expect(reload).toHaveBeenCalled();
   });
 });

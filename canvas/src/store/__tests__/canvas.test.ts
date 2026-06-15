@@ -6,8 +6,10 @@ global.fetch = vi.fn(() =>
 );
 
 import { useCanvasStore, summarizeWorkspaceCapabilities } from "../canvas";
+import type { WorkspaceNodeData } from "../canvas";
 import { __resetTombstonesForTest } from "../deleteTombstones";
 import type { WorkspaceData, WSMessage } from "../socket";
+import type { Node } from "@xyflow/react";
 
 // Helper to build a WorkspaceData object with sensible defaults
 function makeWS(overrides: Partial<WorkspaceData> & { id: string }): WorkspaceData {
@@ -31,6 +33,36 @@ function makeWS(overrides: Partial<WorkspaceData> & { id: string }): WorkspaceDa
     budget_limit: null,
     ...overrides,
   };
+}
+
+function makeNode(
+  overrides: Partial<WorkspaceNodeData> & { id: string; parentId?: string | null },
+): Node<WorkspaceNodeData> {
+  const { id, parentId, ...dataOverrides } = overrides;
+  const ws = makeWS({ id });
+  return {
+    id,
+    type: "workspaceNode",
+    position: { x: 0, y: 0 },
+    data: {
+      name: ws.name,
+      status: ws.status,
+      tier: ws.tier,
+      agentCard: ws.agent_card,
+      activeTasks: ws.active_tasks,
+      collapsed: ws.collapsed,
+      role: ws.role,
+      lastErrorRate: ws.last_error_rate,
+      lastSampleError: ws.last_sample_error,
+      url: ws.url,
+      parentId: parentId ?? ws.parent_id,
+      currentTask: ws.current_task,
+      runtime: ws.runtime,
+      needsRestart: false,
+      budgetLimit: ws.budget_limit,
+      ...dataOverrides,
+    },
+  } as Node<WorkspaceNodeData>;
 }
 
 function makeMsg(overrides: Partial<WSMessage> & { event: string; workspace_id: string }): WSMessage {
@@ -1243,5 +1275,62 @@ describe("moveNode", () => {
         }),
       );
     });
+  });
+});
+
+// ---------- cycle guards (#2601 follow-up) ----------
+
+describe("hydrate – cyclic parent chain", () => {
+  it("sets hydrationError and preserves existing nodes instead of hanging", () => {
+    useCanvasStore.getState().hydrate([
+      makeWS({ id: "existing", name: "Existing" }),
+    ]);
+    const before = useCanvasStore.getState().nodes;
+    expect(before).toHaveLength(1);
+
+    useCanvasStore.getState().hydrate([
+      makeWS({ id: "a", parent_id: "b" }),
+      makeWS({ id: "b", parent_id: "a" }),
+    ]);
+
+    expect(useCanvasStore.getState().hydrationError).toContain("cyclic parent chain");
+    expect(useCanvasStore.getState().nodes).toEqual(before);
+  });
+});
+
+describe("isDescendant – cyclic parent chain", () => {
+  it("returns false instead of hanging when the ancestor is not reachable", () => {
+    useCanvasStore.setState({
+      nodes: [
+        makeNode({ id: "a", parentId: null }),
+        makeNode({ id: "b", parentId: "c" }),
+        makeNode({ id: "c", parentId: "b" }),
+      ],
+    });
+    expect(useCanvasStore.getState().isDescendant("a", "b")).toBe(false);
+  });
+});
+
+describe("arrangeChildren – cyclic parent chain", () => {
+  it("does not hang on a cycle", () => {
+    useCanvasStore.setState({
+      nodes: [
+        makeNode({ id: "a", parentId: "b" }),
+        makeNode({ id: "b", parentId: "a" }),
+      ],
+    });
+    expect(() => useCanvasStore.getState().arrangeChildren("a")).not.toThrow();
+  });
+});
+
+describe("nestNode – cyclic parent chain", () => {
+  it("does not hang when current data contains a cycle", async () => {
+    useCanvasStore.setState({
+      nodes: [
+        makeNode({ id: "a", parentId: "b" }),
+        makeNode({ id: "b", parentId: "a" }),
+      ],
+    });
+    await expect(useCanvasStore.getState().nestNode("a", null)).resolves.toBeUndefined();
   });
 });
