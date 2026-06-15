@@ -68,6 +68,18 @@ clone_one_with_retry() {
 
         if [ "$ref" = "main" ]; then
             if git clone --depth=1 -q "$url" "$tdir/$name"; then return 0; fi
+        elif echo "$ref" | grep -qE '^[0-9a-f]{40}$'; then
+            # Pinned SHA (RFC #2927 manifest ref-pinning): `--branch <sha>` fails
+            # with "Remote branch <sha> not found" because git's --branch only
+            # resolves named refs. Clone the full repo (no --depth so the SHA
+            # is reachable in history) then check out the pinned SHA.
+            if git clone -q "$url" "$tdir/$name" \
+                && (cd "$tdir/$name" && git checkout -q "$ref"); then
+                # Drop .git after checkout — we only need the tree (matches
+                # the post-clone .git strip below in clone_category).
+                rm -rf "$tdir/$name/.git"
+                return 0
+            fi
         else
             if git clone --depth=1 -q --branch "$ref" "$url" "$tdir/$name"; then return 0; fi
         fi
