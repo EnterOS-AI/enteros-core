@@ -1,11 +1,15 @@
 package handlers
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/gin-gonic/gin"
@@ -382,4 +386,73 @@ func TestTranscript_DisablesRedirects_DoesNotForwardAuthToRedirectTarget(t *test
 	// The SSRF fix's contract is: 302 surfaces + redirect target NOT
 	// hit + bearer NOT forwarded to the target. Both checked above.
 	_ = w.Header().Get("Location")
+}
+
+// TestTranscript_DialGuardBlocksBeforeConnect pins the #2132 fast-follow
+// (Researcher RC 103905): the dial-time IP guard runs in
+// net.Dialer.Control, which fires AFTER getaddrinfo but BEFORE the
+// TCP connect() syscall. The prior POST-DIAL safeDialContext (dialed
+// then closed on a blocked IP) left a port-scan side-channel: a TCP
+// SYN was sent to the internal target, opening a connection that
+// could be observed by the target's stack (and potentially logged
+// by IMDS as a credential-exfil probe). This test asserts:
+//
+//  1. A direct dial to a loopback address via safeDialer() returns
+//     an *ssrfDialError (the SSRF policy was enforced).
+//  2. NO TCP connection was opened on the listener (the
+//     connect() syscall never ran; Control rejected it first).
+//
+// The test bypasses the front-door isSafeURL gate by using safeDialer()
+// directly — the front-door gate would otherwise block loopback before
+// the dialer runs. The point of this test is the dialer's behavior
+// in isolation (the belt-and-suspenders for DNS-rebinding TOCTOU).
+func TestTranscript_DialGuardBlocksBeforeConnect(t *testing.T) {
+	// Stand up a real TCP listener on loopback. The handler that
+	// counts accepts runs in a goroutine; if Control does its job
+	// the connect() syscall never runs, no SYN arrives, and the
+	// accept count stays at 0.
+	var acceptCount int
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer listener.Close()
+	go func() {
+		for {
+			conn, aerr := listener.Accept()
+			if aerr != nil {
+				return // listener closed → test over
+			}
+			acceptCount++
+			_ = conn.Close()
+		}
+	}()
+
+	// Now dial the listener's address via safeDialer(). This
+	// exercises the same Control path the transcript proxy uses.
+	// The address is 127.0.0.1 (loopback) which isSafeURL rejects
+	// in production; the dialer's Control must intercept and
+	// return an error BEFORE the connect() syscall.
+	addr := listener.Addr().String()
+	conn, dialErr := safeDialer().DialContext(context.Background(), "tcp", addr)
+	if conn != nil {
+		_ = conn.Close()
+	}
+	if dialErr == nil {
+		t.Fatalf("expected dial to be blocked by Control, but it succeeded (conn=%v)", conn)
+	}
+	var ssrfErr *ssrfDialError
+	if !errors.As(dialErr, &ssrfErr) {
+		t.Fatalf("expected *ssrfDialError, got %T: %v", dialErr, dialErr)
+	}
+	if !ssrfErr.ip.IsLoopback() {
+		t.Errorf("expected loopback IP in error, got %v", ssrfErr.ip)
+	}
+
+	// Give the OS a moment to deliver any in-flight SYNs (none
+	// should arrive, but the accept loop is async).
+	time.Sleep(50 * time.Millisecond)
+	if acceptCount != 0 {
+		t.Errorf("listener accepted %d connections — Control did NOT block the dial before connect() (port-scan side-channel open)", acceptCount)
+	}
 }
