@@ -246,7 +246,10 @@ func substituteConciergeName(prompt []byte, name string) []byte {
 	// (defaultPlatformAgentName) guarantees a non-empty name; if it
 	// somehow becomes empty, an empty first line is the louder failure
 	// mode (visible in the agent's startup log) than a silent skip.
-	return []byte(strings.Replace(string(prompt), conciergeNamePlaceholder, name, -1))
+	// CR2 RC 11903 QF1004: strings.ReplaceAll (replaces all) replaces
+	// the legacy strings.Replace(s, old, new, -1) "replace all" idiom
+	// with the dedicated stdlib helper.
+	return []byte(strings.ReplaceAll(string(prompt), conciergeNamePlaceholder, name))
 }
 
 // EnsureSelfHostedPlatformAgent installs the org's platform agent (the concierge,

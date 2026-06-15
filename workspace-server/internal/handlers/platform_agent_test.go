@@ -484,12 +484,13 @@ func TestApplyConciergeProvisionConfig_OnlyPlatformGetsOrgMCP(t *testing.T) {
 		if strings.Contains(string(out["system-prompt.md"]), "Worker") {
 			t.Errorf("ordinary workspace had its system-prompt substituted — the concierge hook must no-op for kind != platform; got:\n%s", out["system-prompt.md"])
 		}
-		if strings.Contains(string(out["system-prompt.md"]), "{{CONCIERGE_NAME}}") {
-			// Ordinary workspaces can carry the placeholder for unrelated
-			// reasons; we just assert we didn't SUBSTITUTE it (the previous
-			// assertion catches that — placeholder survives, but the name
-			// must not have been baked in). Pass.
-		}
+		// CR2 RC 11903 SA9003: the previous assertion
+		// ('ordinary workspace had its system-prompt substituted — the
+		// concierge hook must no-op for kind != platform') is the
+		// load-bearing check. A separate '{{CONCIERGE_NAME}}'-survives
+		// assertion would be tautological here (ordinary workspaces
+		// legitimately carry the placeholder; the hook only runs for
+		// kind=platform). Removed the dead if-block.
 		if err := mock.ExpectationsWereMet(); err != nil {
 			t.Errorf("unmet sqlmock expectations: %v", err)
 		}
