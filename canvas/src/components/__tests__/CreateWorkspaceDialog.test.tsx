@@ -378,6 +378,63 @@ describe("CreateWorkspaceDialog", () => {
     });
   });
 
+  it("consumes a non-AWS SSOT display default when the cloud provider changes", async () => {
+    // Make the canvas think it is running on a SaaS tenant so the cloud-provider
+    // selector is rendered. Hetzner's SSOT display default (cpx51) differs from
+    // the in-bundle fallback (cpx41), proving the dropdown reads display_defaults
+    // for the selected provider rather than always defaulting to AWS.
+    const originalLocation = window.location;
+    vi.stubGlobal("location", { ...originalLocation, hostname: "acme.moleculesai.app" });
+
+    mockGet.mockImplementation(async (url: string) => {
+      if (url === "/compute/metadata") {
+        return {
+          providers: ["aws", "hetzner"],
+          instanceTypes: {
+            aws: ["t3.medium", "t3.xlarge"],
+            hetzner: ["cpx31", "cpx41", "cpx51"],
+          },
+          defaults: { aws: "t3.medium", hetzner: "cpx31" },
+          display_defaults: { aws: "t3.xlarge", hetzner: "cpx51" },
+        };
+      }
+      if (url === "/templates") return SAMPLE_TEMPLATES as any;
+      return SAMPLE_WORKSPACES as any;
+    });
+
+    await openDialog();
+    fireEvent.change(screen.getByPlaceholderText("e.g. SEO Agent"), {
+      target: { value: "Hetzner Display Agent" },
+    });
+
+    fireEvent.change(screen.getByLabelText("Cloud provider") as HTMLSelectElement, {
+      target: { value: "hetzner" },
+    });
+    fireEvent.click(screen.getByLabelText("Enable display"));
+
+    const instanceSelect = screen.getByLabelText("Instance") as HTMLSelectElement;
+    await waitFor(() => expect(instanceSelect.value).toBe("cpx51"));
+
+    const createBtn = screen.getAllByRole("button").find((b) => b.textContent === "Create");
+    fireEvent.click(createBtn!);
+
+    await waitFor(() => expect(mockPost).toHaveBeenCalled());
+    const body = mockPost.mock.calls[0][1] as Record<string, unknown>;
+    expect(body.compute).toEqual({
+      instance_type: "cpx51",
+      volume: { root_gb: 80 },
+      display: {
+        mode: "desktop-control",
+        protocol: "novnc",
+        width: 1920,
+        height: 1080,
+      },
+      provider: "hetzner",
+    });
+
+    vi.stubGlobal("location", originalLocation);
+  });
+
   it("sends BYOK API key secrets when API key auth mode is selected", async () => {
     await openDialog();
     fireEvent.change(screen.getByPlaceholderText("e.g. SEO Agent"), {
