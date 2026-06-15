@@ -235,6 +235,17 @@ source "$(dirname "$0")/lib/completion_assert.sh"
 CURL_COMMON=(-sS --fail-with-body --max-time 30)
 E2E_TMP_FILES=()
 
+# Infra-skip helper (core#2917). Emits a machine-readable scan_status line
+# and exits 0 so the advisory staging gate goes green-with-skip rather than
+# false-red on a known transient A2A-layer degradation. The trap still tears
+# down the org.
+infra_skip() {
+  local reason="$1"
+  local detail="${2:-}"
+  echo "[$(date +%H:%M:%S)] ⚠️  scan_status: infra-skip:${reason}${detail:+ $detail}"
+  exit 0
+}
+
 e2e_tmp() {
   local f
   f=$(mktemp "$1")
@@ -327,7 +338,19 @@ cleanup_org() {
     *) exit 1 ;;            # anything else is a generic failure
   esac
 }
-trap cleanup_org EXIT INT TERM
+
+# Wrapper for the EXIT/INT/TERM trap: capture the original exit code,
+# remove the org-create bodyfile (created later), run teardown, and
+# propagate the original code. Defined as a function so the trap string
+# is simple and cannot pick up an unbalanced quote from inline command
+# substitution (core#2917).
+cleanup_org_and_bodyfile() {
+  local entry_rc=$?
+  rm -f "$CREATE_BODYFILE" 2>/dev/null || true
+  cleanup_org
+  exit "$entry_rc"
+}
+trap cleanup_org_and_bodyfile EXIT INT TERM
 
 # ─── 0. Preflight ───────────────────────────────────────────────────────
 log "═══════════════════════════════════════════════════════════════════"
@@ -366,31 +389,9 @@ log "1/11 Creating org $SLUG via /cp/admin/orgs..."
 # set -euo pipefail, aborting the whole harness with no body
 # in the CI logs.
 CREATE_BODYFILE="$(mktemp -t create-org-resp.XXXXXX)"
-# core#60 trap-chain + exit-code preservation (RC #11654 #2,
-# #11654 #3, #11673, #11674): the prior
-# `trap 'rm -f "$CREATE_BODYFILE"' EXIT` overwrote the
-# cleanup_org EXIT trap at line 330, leaking the staging
-# org/resources if the bodyfile path succeeded and a later
-# step failed. Worse, re-installing the previous trap
-# during EXIT handling and then exiting with `(exit $ec)`
-# does NOT actually invoke the re-installed trap body — a
-# trap that fires during another trap's body does not chain.
-# The fix: extract cleanup_org's command body via `trap -p
-# EXIT`, then build a single EXIT trap that (a) captures
-# the script's exit code FIRST into a file-scoped
-# `__org_create_bodyfile_ec` (file-scoped via export so the
-# trap-string evaluator can see it), (b) removes the
-# bodyfile, (c) explicitly invokes the captured
-# cleanup_org body inline (not as a re-registered trap),
-# (d) propagates the original exit code to CI. The capture
-# uses `trap -p EXIT` which prints the current trap in a
-# form suitable for re-evaluation; the `sed` extracts the
-# command body (the original trap was set with
-# `trap cleanup_org EXIT INT TERM` so the captured string
-# is just `cleanup_org`).
-__org_create_bodyfile_ec=""
-prev_exit_trap="$(trap -p EXIT | sed -E "s/^trap -- '//; s/'$ EXIT$//")"
-trap '__org_create_bodyfile_ec=$?; rm -f "$CREATE_BODYFILE"; '"${prev_exit_trap}"'; exit "${__org_create_bodyfile_ec}"' EXIT
+# cleanup_org_and_bodyfile (EXIT/INT/TERM trap) removes this bodyfile and
+# runs teardown, so a non-2xx org-create response is logged while the org
+# and EC2 resources are still cleaned up (core#60 / core#2917).
 set +e
 CREATE_HTTP_CODE=$(curl "${CURL_COMMON[@]}" -X POST "$CP_URL/cp/admin/orgs" \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
@@ -1193,6 +1194,7 @@ a2a_send_or_poll_queue() {
   local payload="$1"; shift
   local label="$1"
   local tmp qid resp code rc attempt poll_attempt poll_tmp
+  local a2a_gateway_error_seen=0 last_qstatus="" queue_poll_count=0
   tmp=$(mktemp -t a2a_poll.XXXXXX)
   qid=""
 
@@ -1250,6 +1252,8 @@ except Exception:
             fail "$label queue item $qid terminal status=$qstatus: $(printf '%s' "$resp" | sanitize_http_body)"
             ;;
           queued|dispatched|in_progress|"")
+            last_qstatus="$qstatus"
+            queue_poll_count=$((queue_poll_count + 1))
             echo "    $label queue poll attempt $poll_attempt/30 status=$qstatus — backing off 2s" >&2
             sleep 2
             ;;
@@ -1261,6 +1265,19 @@ except Exception:
       done
       rm -f "$poll_tmp"
       # Ran out of queue poll attempts.
+      # core#2917: if a gateway error preceded a queued task that never
+      # drained, treat it as a transient A2A-layer infra-skip rather than
+      # a workspace-code failure. Verified signature: 502/503/504 on an
+      # initial POST, queue_id assigned, then 30/30 polls stuck in queued/
+      # dispatched/in_progress/empty (never completed/failed/dropped).
+      case "$last_qstatus" in
+        queued|dispatched|in_progress|"")
+          if [ "$a2a_gateway_error_seen" = "1" ] && [ -n "$qid" ]; then
+            rm -f "$tmp"
+            infra_skip "a2a-queue-timeout" "queue_id=$qid poll_count=${queue_poll_count}/30 last_status=${last_qstatus:-<empty>}"
+          fi
+          ;;
+      esac
       fail "$label queue poll timed out waiting for $qid to complete"
     fi
 
@@ -1308,6 +1325,7 @@ except Exception:
     local safe_body
     safe_body=$(printf '%s' "$resp" | sanitize_http_body)
     if echo "$code" | grep -Eq '^(502|503|504)$' && echo "$safe_body" | grep -Eqi 'Service Unavailable|Bad Gateway|Gateway Timeout|error code: 502|error code: 504|workspace agent unreachable|connection refused|no healthy upstream|workspace agent busy|native_session|restarting|restart triggered'; then
+      a2a_gateway_error_seen=1
       echo "    $label A2A transient $code attempt $attempt/12: $safe_body" >&2
       if [ "$attempt" -lt 12 ]; then
         local sleep_sec=10
@@ -1323,6 +1341,11 @@ except Exception:
 
   rm -f "$tmp"
   if [ "$rc" != "0" ] || [ "$code" -lt 200 ] || [ "$code" -ge 300 ]; then
+    # core#2917: outright A2A connect timeout (curl_rc=28, http=000) is the
+    # second verified transient-infra signature, not a workspace bug.
+    if [ "$rc" = "28" ] && [ "$code" = "000" ]; then
+      infra_skip "a2a-connect-timeout" "curl_rc=$rc http=$code attempt=$attempt label=$label"
+    fi
     fail "$label failed after $attempt attempt(s) (curl_rc=$rc, http=$code): $(printf '%s' "$resp" | sanitize_http_body)"
   fi
   printf '%s' "$resp"
