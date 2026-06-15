@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -747,5 +748,34 @@ func TestUpdate_Runtime_ModelUnresolved_SkipsCheckAndProceeds(t *testing.T) {
 
 	if w.Code != http.StatusOK {
 		t.Errorf("expected 200 (unresolved model → skip check, proceed), got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestUpdate_Runtime_ModelSecretDBError_Fails500 pins that a genuine DB error
+// reading the MODEL workspace_secret is fail-closed (500). Only sql.ErrNoRows
+// (unresolved model) skips the strict compat-check; real DB/decrypt errors
+// must not silently let an unvalidated (runtime, model) PATCH through.
+func TestUpdate_Runtime_ModelSecretDBError_Fails500(t *testing.T) {
+	wsID := "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+	mock, r := setupWorkspaceCrudTest(t)
+	h := newWorkspaceCrudHandler(t)
+	r.PATCH("/workspaces/:id", h.Update)
+
+	mock.ExpectQuery(`SELECT EXISTS\(SELECT 1 FROM workspaces WHERE id = \$1\)`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+	mock.ExpectQuery(`SELECT encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1 AND key = 'MODEL'`).
+		WithArgs(wsID).
+		WillReturnError(errors.New("database unavailable"))
+
+	body := map[string]interface{}{"runtime": "claude-code"}
+	b, _ := json.Marshal(body)
+	req, _ := http.NewRequest("PATCH", "/workspaces/"+wsID, bytes.NewReader(b))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("expected 500 (genuine DB error), got %d: %s", w.Code, w.Body.String())
 	}
 }
