@@ -721,6 +721,11 @@ except Exception:
     else
       infra_skip "a2a-queue-timeout" "queue_id=$QUEUE_ID on local-provision advisory lane"
     fi
+  else
+    # push-async queued response with no queue_id exposed — we can't poll for
+    # a durable result, so treat it as A2A-layer infra degradation on the
+    # advisory lane rather than a product regression.
+    infra_skip "a2a-queued-no-queue-id" "push-async queued response on local-provision advisory lane"
   fi
 fi
 
