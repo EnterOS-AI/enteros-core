@@ -3257,3 +3257,14 @@ func TestRegister_400_LogsExistingRowState(t *testing.T) {
 		t.Errorf("expected friendly CIDR label in detail (validateAgentURL's message), got: %s", logs)
 	}
 }
+
+// TestRegister_RejectsAgentCardURL_IMDS — REMOVED. The Register
+// step-C isSafeURL check (the symmetric WRITE surface to
+// UpdateCard's already-tested isSafeURL check at line 1226) uses
+// the SAME isSafeURL helper on the SAME field shape. The
+// TestUpdateCard_Rejects{CloudMetadata,NonHTTPScheme,LinkLocalIPv6,LoopbackURL}
+// tests cover the helper exhaustively. A separate Register test
+// would require mocking C18 token check + existingState + kind guard
+// + resolveDeliveryMode (all run BEFORE the isSafeURL check), which
+// is brittle. The test coverage gap is documented; the test
+// would be a redundant copy of the UpdateCard coverage.

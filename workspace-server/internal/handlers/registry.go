@@ -507,6 +507,25 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 	// GCP-default flip (2026-06-11).
 	effectiveURL := payload.URL
 	if effectiveMode == models.DeliveryModePush {
+		// SSRF hardening (Researcher #2132 / RC 103771, step C):
+		// isSafeURL the embedded agent_card.url at WRITE time. payload.URL
+		// alone is insufficient — the agent_card URL is the surface
+		// that gets broadcast via the registry + read by every other
+		// component (transcript proxy, A2A dispatch, etc.). Without
+		// this check, a Register with a safe payload.URL but a
+		// poisoned agent_card.url stores a SSRF landmine that the
+		// transcript proxy's front-door isSafeURL would catch per
+		// request, but the BROADCAST surface is still the bad URL
+		// (peer A2A dispatch could follow it). The UpdateCard path
+		// already does this check at line 1226; Register is the
+		// symmetric WRITE surface.
+		if cardURL := agentCardURL(payload.AgentCard); cardURL != "" {
+			if err := isSafeURL(cardURL); err != nil {
+				logRegister400Reason("agent_card_url_rejected", payload.ID, payload, existingState, err.Error())
+				c.JSON(http.StatusBadRequest, gin.H{"error": "workspace agent_card URL not allowed"})
+				return
+			}
+		}
 		if effectiveURL == "" {
 			if cardURL := agentCardURL(payload.AgentCard); cardURL != "" {
 				effectiveURL = cardURL

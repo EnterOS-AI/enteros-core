@@ -83,6 +83,27 @@ func setupTestDB(t *testing.T) sqlmock.Sqlmock {
 	}
 	prevDB := db.DB
 	db.DB = mockDB
+
+	// Disable SSRF checks for the duration of this test only. Restore
+	// the previous state via t.Cleanup so that TestIsSafeURL_* tests
+	// (which run with SSRF enabled) are not affected by state leak.
+	//
+	// REGISTRATION ORDER MATTERS (#2132 D step, Researcher RC 103771):
+	// t.Cleanup runs hooks in LIFO order. We register the SSRF-state
+	// restore FIRST so it runs LAST in cleanup, AFTER the db.DB
+	// restore. The natural order — db.DB swap-back, THEN
+	// ssrfCheckEnabled restore — matches the natural ordering of
+	// the state mutations in setupTestDB itself (db.DB first,
+	// ssrfCheckEnabled second). Reversing the order caused
+	// Platform(Go) failures in the prior shape when a test enabled
+	// SSRF via setSSRFCheckForTest(true) — the LIFO swap put the
+	// SSRF restore BEFORE the db.DB swap, leaving a window where
+	// db.DB was the previous (real) DB while ssrfCheckEnabled was
+	// the test's true (mid-test). Reordering the registrations
+	// closes the window.
+	restore := setSSRFCheckForTest(false)
+	t.Cleanup(restore)
+
 	t.Cleanup(func() {
 		// Drain detached async goroutines (e.g. goAsync(RestartByID),
 		// which reads db.DB in runRestartCycle before its provisioner
@@ -93,12 +114,6 @@ func setupTestDB(t *testing.T) sqlmock.Sqlmock {
 		db.DB = prevDB
 		mockDB.Close()
 	})
-
-	// Disable SSRF checks for the duration of this test only. Restore
-	// the previous state via t.Cleanup so that TestIsSafeURL_* tests
-	// (which run with SSRF enabled) are not affected by state leak.
-	restore := setSSRFCheckForTest(false)
-	t.Cleanup(restore)
 
 	// The wsauth.platform_inbound_secret cache (#189) is package-level
 	// state in another package — without a reset between tests, a
