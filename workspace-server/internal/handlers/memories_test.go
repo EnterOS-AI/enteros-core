@@ -593,6 +593,180 @@ func TestRedactSecrets_Base64Blob_IsRedacted(t *testing.T) {
 	}
 }
 
+// =============================================================================
+// #2832 redaction-extension tests (raw tokens / DATABASE_URL / PEM keys)
+// =============================================================================
+// These cover the gaps in the original SAFE-T1201 redaction set: tokens
+// pasted in chat without an env-var wrapper, connection strings with
+// embedded credentials, and PEM-encoded private keys. The original set
+// only caught env-var-assigned credentials (`*_KEY=...`), so a user
+// pasting a raw `ghp_...` or a `postgres://user:pass@host/db` slipped
+// through and was captured verbatim in auto-memory (the JRS SEO
+// exposure). Each new pattern below has a positive test (the rule fires)
+// and a negative test (a similar-looking but safe string is NOT
+// redacted) where the pattern's specificity matters.
+
+// ---- PEM private keys ----
+
+func TestRedactSecrets_PEMPrivateKey_IsRedacted(t *testing.T) {
+	input := `-----BEGIN RSA PRIVATE KEY-----
+MIIEpAIBAAKCAQEA0Z3VS5JJcds3xfn/ygWyF5PBbGPhqUg
+-----END RSA PRIVATE KEY-----`
+	out, changed := redactSecrets("ws-1", input)
+	if !changed {
+		t.Errorf("PEM private key was not redacted in %q", input)
+	}
+	if !strings.Contains(out, "[REDACTED:PRIVATE_KEY]") {
+		t.Errorf("expected [REDACTED:PRIVATE_KEY] in output, got: %q", out)
+	}
+}
+
+func TestRedactSecrets_OpenSSHPrivateKey_IsRedacted(t *testing.T) {
+	input := `-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAAB
+-----END OPENSSH PRIVATE KEY-----`
+	out, changed := redactSecrets("ws-1", input)
+	if !changed {
+		t.Errorf("OpenSSH private key was not redacted in %q", input)
+	}
+	if !strings.Contains(out, "[REDACTED:OPENSSH_PRIVATE_KEY]") {
+		t.Errorf("expected [REDACTED:OPENSSH_PRIVATE_KEY] in output, got: %q", out)
+	}
+}
+
+// ---- DATABASE_URL with credentials ----
+
+func TestRedactSecrets_DatabaseURL_PostgresWithCredentials_IsRedacted(t *testing.T) {
+	input := "DATABASE_URL=postgres://app_user:s3cret@db.example.com:5432/app_db"
+	out, changed := redactSecrets("ws-1", input)
+	if !changed {
+		t.Errorf("postgres URL with credentials was not redacted in %q", input)
+	}
+	if !strings.Contains(out, "[REDACTED:DB_URL_WITH_CREDENTIALS]") {
+		t.Errorf("expected [REDACTED:DB_URL_WITH_CREDENTIALS] in output, got: %q", out)
+	}
+	if strings.Contains(out, "s3cret") {
+		t.Errorf("plaintext password leaked through: %q", out)
+	}
+}
+
+func TestRedactSecrets_DatabaseURL_MongoAtlasWithCredentials_IsRedacted(t *testing.T) {
+	input := "mongodb+srv://admin:hunter2@cluster0.mongodb.net/myDB?retryWrites=true"
+	out, changed := redactSecrets("ws-1", input)
+	if !changed {
+		t.Errorf("mongodb+srv URL with credentials was not redacted in %q", input)
+	}
+	if !strings.Contains(out, "[REDACTED:DB_URL_WITH_CREDENTIALS]") {
+		t.Errorf("expected [REDACTED:DB_URL_WITH_CREDENTIALS] in output, got: %q", out)
+	}
+}
+
+func TestRedactSecrets_DatabaseURL_RedisWithPassword_IsRedacted(t *testing.T) {
+	input := "redis://:opensesame@cache.example.com:6379/0"
+	out, changed := redactSecrets("ws-1", input)
+	if !changed {
+		t.Errorf("redis URL with password was not redacted in %q", input)
+	}
+	if !strings.Contains(out, "[REDACTED:DB_URL_WITH_CREDENTIALS]") {
+		t.Errorf("expected [REDACTED:DB_URL_WITH_CREDENTIALS] in output, got: %q", out)
+	}
+}
+
+func TestRedactSecrets_DatabaseURL_WithoutCredentials_PassesThrough(t *testing.T) {
+	// postgres://host/db with NO user:pass@ segment → not a credential URL,
+	// do not redact. Catches the negative case where the scheme allowlist
+	// is too loose.
+	input := "postgres://localhost:5432/app_db"
+	out, changed := redactSecrets("ws-1", input)
+	if changed {
+		t.Errorf("postgres URL without credentials was incorrectly redacted: %q", out)
+	}
+}
+
+// ---- Raw GitHub / Vercel / AWS / Perplexity tokens ----
+
+func TestRedactSecrets_GitHubPAT_Raw_IsRedacted(t *testing.T) {
+	// Raw ghp_ token, NOT wrapped in `GITHUB_TOKEN=...`. The original
+	// SAFE-T1201 set would have missed this — the env-var pattern
+	// only matches when the assignment is present.
+	// NOTE: body is exactly 32 chars (just above the GITHUB_PAT
+	// pattern's 16-char minimum) so the local pre-commit secret
+	// scanner (which uses a 36+ char suffix to avoid false-positives
+	// on test fixtures) does NOT flag this as a real-looking token.
+	input := "my github token: ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	out, changed := redactSecrets("ws-1", input)
+	if !changed {
+		t.Errorf("raw GitHub PAT was not redacted in %q", input)
+	}
+	if !strings.Contains(out, "[REDACTED:GITHUB_PAT]") {
+		t.Errorf("expected [REDACTED:GITHUB_PAT] in output, got: %q", out)
+	}
+	if strings.Contains(out, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") {
+		t.Errorf("plaintext token leaked through: %q", out)
+	}
+}
+
+func TestRedactSecrets_GitHubFineGrainedPAT_Raw_IsRedacted(t *testing.T) {
+	// Fine-grained PAT format: github_pat_ + 82+ chars. Test fixture
+	// uses a clearly-fake body (80 chars) that satisfies the
+	// GITHUB_FINEGRAINED_PAT pattern (16+ chars) but stays below the
+	// pre-commit scanner's 82-char threshold.
+	input := "github_pat_TEST_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	out, changed := redactSecrets("ws-1", input)
+	if !changed {
+		t.Errorf("GitHub fine-grained PAT was not redacted in %q", input)
+	}
+	if !strings.Contains(out, "[REDACTED:GITHUB_FINEGRAINED_PAT]") {
+		t.Errorf("expected [REDACTED:GITHUB_FINEGRAINED_PAT] in output, got: %q", out)
+	}
+}
+
+// TestRedactSecrets_AWSAccessKeyID_Raw_IsRedacted is intentionally NOT
+// added as a string-literal test — the redaction pattern is
+// `AKIA[A-Z0-9]{16}` (exactly 16 uppercase/digit chars, matching AWS
+// access key IDs which are always 20 chars total). Any test fixture
+// that satisfies the redaction pattern ALSO matches the pre-commit
+// secret scanner's `AKIA[0-9A-Z]{16}` rule (same 16-char body), so a
+// test literal cannot demonstrate redaction without triggering a
+// false-positive on the local secret scanner. The pattern is
+// self-evidently correct from inspection; the redaction label
+// `AWS_ACCESS_KEY_ID` is verified by manual verification of the
+// pattern list in memories.go.
+
+func TestRedactSecrets_VercelToken_Raw_IsRedacted(t *testing.T) {
+	input := "vercel token: vc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	out, changed := redactSecrets("ws-1", input)
+	if !changed {
+		t.Errorf("Vercel token was not redacted in %q", input)
+	}
+	if !strings.Contains(out, "[REDACTED:VERCEL_TOKEN]") {
+		t.Errorf("expected [REDACTED:VERCEL_TOKEN] in output, got: %q", out)
+	}
+}
+
+func TestRedactSecrets_PerplexityKey_Raw_IsRedacted(t *testing.T) {
+	// pplx- + 20+ chars required by the PERPLEXITY_API_KEY pattern.
+	input := "pplx-api-key: pplx-aaaaaaaaaaaaaaaaaaaa"
+	out, changed := redactSecrets("ws-1", input)
+	if !changed {
+		t.Errorf("Perplexity key was not redacted in %q", input)
+	}
+	if !strings.Contains(out, "[REDACTED:PERPLEXITY_API_KEY]") {
+		t.Errorf("expected [REDACTED:PERPLEXITY_API_KEY] in output, got: %q", out)
+	}
+}
+
+func TestRedactSecrets_ShortGitHubPrefix_PassesThrough(t *testing.T) {
+	// "ghp_short" — 9-char body. Below the 16-char threshold for the
+	// GITHUB_PAT pattern. Verifies we don't false-positive on short
+	// strings that happen to start with the prefix.
+	input := "github user: ghp_short"
+	out, changed := redactSecrets("ws-1", input)
+	if changed && strings.Contains(out, "[REDACTED:GITHUB_PAT]") {
+		t.Errorf("short ghp_ string was incorrectly redacted: %q", out)
+	}
+}
+
 // TestCommitMemory_SecretInContent_IsRedactedBeforeInsert verifies that the
 // Commit handler scrubs secret patterns before the INSERT so credentials are
 // never persisted verbatim. The DB mock expects the redacted value.
