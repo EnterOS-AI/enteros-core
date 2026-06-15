@@ -17,6 +17,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"syscall"
 	"time"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
@@ -70,19 +71,23 @@ func NewTranscriptHandler() *TranscriptHandler {
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
 				return http.ErrUseLastResponse
 			},
-			// Dial-time IP guard. net.Dialer.Control runs after
-			// getaddrinfo but before the TCP SYN, on every dial
-			// (initial + every connection in a redirect chain). The
-			// isSafeURL helper reuses the same allow/deny policy as
-			// the front-door (loopback / private / metadata /
+			// Dial-time IP guard. net.Dialer.Control runs after the
+			// socket is created + after getaddrinfo but BEFORE the
+			// TCP connect() syscall. Rejecting in Control means no
+			// TCP SYN is sent — no port-scan side-channel against
+			// IMDS / private / link-local targets. The isSafeURL
+			// helper reuses the same allow/deny policy as the
+			// front-door (loopback / private / metadata /
 			// link-local blocked in production; the SaaS-mode
-			// private-range relaxation is honored here too so a
+			// private-range relaxation is honored here too so an
 			// intra-VPC workspace target still works).
 			//
-			// The Control callback runs in the dialer's goroutine, so
-			// it must not block. isSafeURL is in-memory + fast.
+			// The Control callback runs in the dialer's goroutine,
+			// so it must not block. isSafeURL is in-memory + fast
+			// (does a single getaddrinfo for the IP, no network
+			// round-trip for already-IP addresses).
 			Transport: &http.Transport{
-				DialContext:           safeDialContext,
+				DialContext:           safeDialer().DialContext,
 				ForceAttemptHTTP2:     true,
 				MaxIdleConns:          100,
 				IdleConnTimeout:       90 * time.Second,
@@ -93,45 +98,72 @@ func NewTranscriptHandler() *TranscriptHandler {
 	}
 }
 
-// safeDialContext is the dial-context function used by the
-// transcript proxy. It wraps net.Dialer's DialContext with an
-// isSafeURL post-resolution check on the IP the dialer is about to
-// use (closes the DNS-rebinding TOCTOU + redirect-target rebinding
-// vectors in #2132 / RC 103771).
-//
-// The function signature matches net.Dialer's DialContext so it can
-// be passed via http.Transport.DialContext. The IP guard runs in
-// the dialer's goroutine, so it must not block.
-func safeDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
-	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
-	conn, err := dialer.DialContext(ctx, network, addr)
-	if err != nil {
-		return nil, err
+// safeDialer returns a *net.Dialer wired with safeDialControl as its
+// Control callback. net.Dialer.Control runs after getaddrinfo but
+// before the TCP connect() syscall, so an error return blocks the
+// SYN from ever going out (no port-scan side-channel against blocked
+// targets). The function exists as a constructor so the test suite
+// can also construct a dialer that exercises the same control path
+// without needing to spin up an http.Transport.
+func safeDialer() *net.Dialer {
+	return &net.Dialer{
+		Timeout:    10 * time.Second,
+		KeepAlive:  30 * time.Second,
+		Control:    safeDialControl,
 	}
-	// POST-resolution IP guard. The conn.LocalAddr is the local
-	// side; the RemoteAddr is the resolved IP we just dialed. We
-	// validate the RemoteAddr's IP against isSafeURL's policy. Note
-	// the host:port form; the IP is the first component.
-	remote := conn.RemoteAddr().String()
-	if host, _, splitErr := net.SplitHostPort(remote); splitErr == nil {
-		if ip := net.ParseIP(host); ip != nil {
-			// Reuse the SSRF policy. isSafeURL takes a URL but
-			// the policy is purely IP-based; we construct a
-			// throwaway URL to reuse the helper.
-			if err := isSafeURL("http://" + ip.String() + "/"); err != nil {
-				_ = conn.Close()
-				return nil, &ssrfDialError{ip: ip, reason: err}
-			}
-		}
-	}
-	return conn, nil
 }
 
-// ssrfDialError is the error type returned by safeDialContext when
-// the post-resolution IP fails the isSafeURL policy. The error
-// message includes the IP and the policy reason so the platform
-// log surfaces the SSRF attempt (the workspace agent_card.url
-// embedding attack in #2132 / RC 103771).
+// safeDialControl is the net.Dialer.Control callback that enforces
+// the SSRF policy at the dial layer. It runs after DNS resolution
+// (the address parameter carries the resolved IP) and before the
+// TCP connect() syscall — returning a non-nil error here prevents
+// the SYN from going out, closing the port-scan side-channel that
+// the prior POST-DIAL safeDialContext (which dialed then closed)
+// left open against IMDS / private / link-local targets.
+//
+// Reuses isSafeURL as the policy (the same one the front-door gate
+// runs) so there's a single source of truth for allow/deny. The
+// "is already an IP" fast path is intentional: by the time Control
+// runs, getaddrinfo has already resolved, so the address is
+// `ip:port` form. If for some reason the dialer passes a hostname
+// (e.g., IPv6 bracket form), the policy is still applied via the
+// constructed URL — the constructor handles both shapes.
+func safeDialControl(network, address string, _ syscall.RawConn) error {
+	host, _, splitErr := net.SplitHostPort(address)
+	if splitErr != nil {
+		// Not host:port — shouldn't happen post-resolution, but if
+		// it does, fall through (the dialer will surface the parse
+		// error downstream; don't preempt).
+		return nil
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		// Not a literal IP — Control must have been called with
+		// an unresolved hostname (Go's dialer normally resolves
+		// first, but custom resolvers can defer). Re-resolve here
+		// so the SSRF policy is still applied.
+		if ips, lookupErr := net.LookupIP(host); lookupErr == nil {
+			for _, candidate := range ips {
+				if safeErr := isSafeURL("http://" + candidate.String() + "/"); safeErr != nil {
+					return &ssrfDialError{ip: candidate, reason: safeErr}
+				}
+			}
+		}
+		return nil
+	}
+	if safeErr := isSafeURL("http://" + ip.String() + "/"); safeErr != nil {
+		return &ssrfDialError{ip: ip, reason: safeErr}
+	}
+	return nil
+}
+
+// ssrfDialError is the error type returned by safeDialControl when
+// the resolved IP fails the isSafeURL policy. The error message
+// includes the IP and the policy reason so the platform log
+// surfaces the SSRF attempt (the workspace agent_card.url
+// embedding attack in #2132 / RC 103771). Returned from
+// net.Dialer.Control, so it propagates out of DialContext as the
+// dial error — the http.Client surfaces it to the caller.
 type ssrfDialError struct {
 	ip     net.IP
 	reason error
