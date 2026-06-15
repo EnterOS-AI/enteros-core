@@ -31,7 +31,7 @@
     {"name": "openclaw", "repo": "molecule-ai/molecule-ai-workspace-template-openclaw", "ref": "143e69b56f2530433141f5a87373e8a76578c52e"},
     {"name": "codex", "repo": "molecule-ai/molecule-ai-workspace-template-codex", "ref": "070447a0afdf66ae6f2bb166ac3e2b2884456951"},
     {"name": "google-adk", "repo": "molecule-ai/molecule-ai-workspace-template-google-adk", "ref": "3f9fd7ef6ea4dd912bb65446607f3c3c991ea76e"},
-    {"name": "seo-agent", "repo": "molecule-ai/molecule-ai-workspace-template-seo-agent", "ref": "51bee3c0de03c7d38ddc153e7b9dc70e19ededd6"}
+    {"name": "seo-agent", "repo": "molecule-ai/molecule-ai-workspace-template-seo-agent", "ref": "51bee3c0de03c7d38ddc153e7b9dc70e19ededd6", "runtime": "claude-code"}
   ],
   "org_templates": [
     {"name": "molecule-dev", "repo": "molecule-ai/molecule-ai-org-template-molecule-dev", "ref": "990d7b23f65dadd7afe05958a77eeb74082b4feb"},
