@@ -24,7 +24,9 @@
 #
 # What this replay asserts (each phase is a separate OK/KO):
 #   Phase 1 — initial state: provision_calls=0, tenants_config_calls=0
-#   Phase 2 — POST /cp/workspaces/provision → 200 + valid shape
+#   Phase 2 — POST /cp/workspaces/provision → 201 + valid shape
+#             (instance_id + state, matching the REAL CPProvisioner
+#             client contract in internal/provisioner/cp_provisioner.go)
 #             AND __/stub/state.provision_calls == 1
 #   Phase 3 — GET /cp/tenants/config → 200 + valid shape
 #             AND __/stub/state.tenants_config_calls == 1
@@ -71,8 +73,15 @@ echo "[replay]   initial provision_calls=$INITIAL_PROVISION tenants_config_calls
 ok "captured initial __/stub/state"
 
 # ---------------------------------------------------------------- Phase 2
-# POST /cp/workspaces/provision. The cp-stub should return 200 + a
-# workspace descriptor shape (workspace_id, status, phase, url). After
+# POST /cp/workspaces/provision. The cp-stub should return 201 + a
+# provision-response shape that matches the REAL CPProvisioner client's
+# contract (internal/provisioner/cp_provisioner.go:339-363 + the
+# cpProvisionResponse struct at :210-215). The client treats 201 as
+# success and reads instance_id + state. The prior cp-stub contract
+# (200 + workspace_id/status/phase/url) was incorrect — it sent the
+# client into its failure branch with `provision failed (200):
+# <unstructured body>`, which the CR2 review_id 11928 flagged on the
+# prior head 30a6bea. After
 # the call, the __/stub/state.provision_calls counter should have
 # incremented by exactly 1.
 echo "[replay] phase 2: POST /cp/workspaces/provision ..."
@@ -99,16 +108,19 @@ BODY=$(echo "$RESP" | sed '$d')
 echo "[replay]   HTTP $HTTP_CODE"
 echo "[replay]   body: $BODY"
 
-if [ "$HTTP_CODE" = "200" ]; then
-    ok "POST /cp/workspaces/provision returned 200 (cp-stub handler reachable)"
+if [ "$HTTP_CODE" = "201" ]; then
+    ok "POST /cp/workspaces/provision returned 201 (cp-stub handler reachable, matches CPProvisioner success contract)"
 else
-    ko "POST /cp/workspaces/provision returned $HTTP_CODE (expected 200 — cp-stub handler not wired, or env-var redirect failed)"
+    ko "POST /cp/workspaces/provision returned $HTTP_CODE (expected 201 — cp-stub handler not wired, or env-var redirect failed, or the response shape regressed to non-201)"
 fi
 
-# Assert the response shape — must include workspace_id, status, phase, url
-# matching the real CP's response shape. Future drift here means the
-# tenant Go code will need to be updated to match the new shape.
-for field in workspace_id status phase url; do
+# Assert the response shape — must include instance_id + state
+# (the two fields the real CPProvisioner.client reads on success).
+# workspace_id + url are also returned for observability (mirrors the
+# real CP's wire log) but are NOT consumed by the client; we assert
+# them too as a wire-shape drift-gate (any future change to the
+# real CP's response should be reflected in the stub, and vice versa).
+for field in instance_id state workspace_id url; do
     if echo "$BODY" | python3 -c "
 import json,sys
 d = json.loads(sys.stdin.read())

@@ -135,15 +135,24 @@ func main() {
 	})
 
 	// /cp/workspaces/provision — Phase 1 of the #2863 burn-down. The
-	// real CP returns 200 with a workspace descriptor; we mirror that
-	// shape so the harness-tenant Go code (workspace-server's
-	// provisionWorkspace path) treats our response as a successful
-	// provision. The cp-stub is permissive: no auth header check
-	// (matches the other /cp/* handlers above), empty body is OK
-	// (defaults workspace_id to "harness-ws"), and we don't validate
-	// payload fields — the call's purpose is to PROVE the request
-	// reached the stub, not to test field validation (the real CP
-	// has its own validation in production).
+	// real CP returns 201 + a provision-response shape that the tenant
+	// Go code (workspace-server's CPProvisioner.Start in
+	// internal/provisioner/cp_provisioner.go:339-363) treats as
+	// success. That client (the cpProvisionResponse struct) reads
+	// exactly two fields on success: instance_id + state. The
+	// cp-stub mirrors that contract — 201 + those two fields — so
+	// the harness-tenant Go code (which uses the REAL
+	// CPProvisioner client) treats the response as a successful
+	// provision. Anything else and the client falls into its
+	// failure branch with `provision failed (200): <unstructured
+	// body>` (the exact failure mode the CR2 review_id 11928
+	// flagged on the prior head 30a6bea: 200 instead of 201, no
+	// instance_id/state fields, → guaranteed fail-branch).
+	//
+	// cp-stub is permissive on input (no auth header check, empty
+	// body OK, no payload-field validation) — the call's purpose is
+	// to PROVE the request reached the stub + the env-var redirect
+	// is wired. Field validation lives in the real CP in production.
 	mux.HandleFunc("/cp/workspaces/provision", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeJSON(w, 405, map[string]any{
@@ -163,11 +172,29 @@ func main() {
 				}
 			}
 		}
-		log.Printf("cp-stub: /cp/workspaces/provision called (count=%d) -> %s", provisionCalls.Load(), wsID)
-		writeJSON(w, 200, map[string]any{
+		// Stub instance id + state — matches the real CP's success-path
+		// contract. EC2 instance ids start with "i-" (the real CP
+		// generates them via EC2 RunInstances; the stub is a stand-in,
+		// but the prefix keeps any future real-CP log-reader from
+		// false-flagging the stub response as malformed). "running"
+		// matches the prod happy path; the harness doesn't await
+		// any state transition.
+		instanceID := "i-stub-" + wsID
+		state := "running"
+		log.Printf("cp-stub: /cp/workspaces/provision called (count=%d) -> %s (instance_id=%s, state=%s)", provisionCalls.Load(), wsID, instanceID, state)
+		writeJSON(w, 201, map[string]any{
+			// Fields the tenant Go code reads (cpProvisionResponse
+			// struct in internal/provisioner/cp_provisioner.go:210-215):
+			// instance_id (string) + state (string). Mandatory.
+			"instance_id": instanceID,
+			"state":       state,
+			// Observability fields — the real CP returns these too
+			// (the real CPProvisioner.client ignores them, but they
+			// appear in the wire log + in any future tool that
+			// inspects the response). Mirror the prior head's
+			// payload shape for minimum drift from the 30a6bea
+			// contract.
 			"workspace_id": wsID,
-			"status":       "provisioning",
-			"phase":        "initiated",
 			"url":          "http://cp-stub:9090/cp/workspaces/" + wsID,
 		})
 	})
