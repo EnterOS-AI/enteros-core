@@ -103,3 +103,94 @@ func IsCPTemplateAssetPath(name string) bool {
 		strings.HasPrefix(name, "prompts/") ||
 		strings.HasPrefix(name, "agent-skills/")
 }
+
+// noopTemplateAssetFetcher is the self-host default fetcher (PR-B
+// selection, RFC #2843 #24). It returns (nil, nil) — "no assets to
+// add" — so the call site in collectCPConfigFiles treats the
+// workspace as a self-host: the /configs path comes from the local
+// TemplatePath (cfg.TemplatePath) + cfg.ConfigFiles only, and the
+// new TemplateAssets wire field is empty.
+//
+// Why explicit and not nil-interface: WorkspaceConfig's
+// TemplateAssetFetcher is a non-nil interface-typed field in the SaaS
+// path, so the SaaS codepath can rely on "interface always set"
+// without nil-checks. Using a no-op default (rather than nil) keeps
+// the field type uniform across deployments and makes
+// "self-host = no-op fetcher" an explicit choice rather than an
+// accidental absence.
+//
+// Memory-preserving: the no-op is the only state. The fetcher is
+// stateless; concurrent Load calls are safe.
+type noopTemplateAssetFetcher struct{}
+
+// Load on noopTemplateAssetFetcher returns (nil, nil) — the
+// "no assets" signal. Tests pin this contract.
+func (noopTemplateAssetFetcher) Load(_ context.Context, _ string) (map[string][]byte, error) {
+	return nil, nil
+}
+
+// NoopTemplateAssetFetcher returns the no-op fetcher suitable
+// as the self-host default. Exported so main.go can wire it
+// via the fetcher-selection helper.
+func NoopTemplateAssetFetcher() TemplateAssetFetcher {
+	return noopTemplateAssetFetcher{}
+}
+
+// FetcherSelection is the result of choosing which
+// TemplateAssetFetcher to wire based on deployment mode (SaaS
+// vs self-host) and per-deployment token state.
+type FetcherSelection struct {
+	// Fetcher is the chosen fetcher. For SaaS this is the Gitea
+	// fetcher; for self-host this is the no-op fetcher. Never
+	// nil — the selection helper always returns a usable
+	// fetcher (no-op for self-host is still a valid choice).
+	Fetcher TemplateAssetFetcher
+
+	// Authenticated reports whether the chosen fetcher will send
+	// an Authorization header. For self-host's no-op fetcher
+	// this is false (no-op never sends headers); for SaaS this
+	// is true iff a non-empty token was supplied. Logged at
+	// boot to make the active mode obvious.
+	Authenticated bool
+
+	// Mode is a short human-readable label for the active mode
+	// (e.g. "saas-gitea", "saas-gitea-public", "self-host-noop").
+	// Used only for boot-time logging — not load-bearing.
+	Mode string
+}
+
+// SelectTemplateAssetFetcher chooses the fetcher to wire for the
+// current deployment. The selection matrix:
+//
+//   - isSaaSTenant() && token != ""  -> real Gitea fetcher, Authenticated=true
+//   - isSaaSTenant() && token == ""  -> real Gitea fetcher, Authenticated=false
+//     (the public-fetch activation: molecule-ai/* templates are PUBLIC)
+//   - !isSaaSTenant()                 -> no-op fetcher, Authenticated=false
+//     (self-host doesn't need an external asset channel —
+//     cfg.TemplatePath + cfg.ConfigFiles handle /configs locally)
+//
+// PR-B keystone (RFC #2843 #24): the token is OPTIONAL. SaaS
+// callers may leave the token empty (public-fetch activation)
+// and still get the real Gitea fetcher. Self-host callers always
+// get the no-op.
+//
+// The isSaaSTenant function is plumbed in as an argument rather
+// than a package-level lookup so the selection is testable in
+// isolation (production callers pass a closure over the
+// canonical isSaaSTenant helper, tests pass a closure that
+// returns a fixed value).
+func SelectTemplateAssetFetcher(isSaaSTenant func() bool, baseURL, token string) FetcherSelection {
+	if isSaaSTenant == nil || !isSaaSTenant() {
+		return FetcherSelection{
+			Fetcher:       NoopTemplateAssetFetcher(),
+			Authenticated: false,
+			Mode:          "self-host-noop",
+		}
+	}
+	// SaaS: real Gitea fetcher (public-fetch if token empty, authenticated if set)
+	return FetcherSelection{
+		Fetcher:       NewGiteaTemplateAssetFetcher(baseURL, token, nil),
+		Authenticated: token != "",
+		Mode:          "saas-gitea-public", // PR-B's CTO public-fetch is the SaaS default
+	}
+}

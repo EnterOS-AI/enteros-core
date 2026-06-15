@@ -35,12 +35,24 @@ package provisioner
 //
 // Auth: per-identity READ-ONLY Gitea token. The token is threaded
 // from Infisical SSOT (per #2676 program) into the fetcher via the
-// Token field. The token MUST be a per-identity PAT scoped to the
-// template repo with read-only access — NOT a founder PAT, NOT a
-// workspace-admin PAT. Workspace-server never logs or echoes the
-// token (the httpClient logs are scrubbed via the standard net/http
-// strip-header path; the token is in the Authorization header,
-// which net/http does not log by default).
+// Token field. When the token is set, it MUST be a per-identity PAT
+// scoped to the template repo with read-only access — NOT a founder
+// PAT, NOT a workspace-admin PAT.
+//
+// PUBLIC FETCH (empty token): when the token is empty, the fetcher
+// performs an UNAUTHENTICATED request — the Authorization header
+// is OMITTED ENTIRELY (not sent as "token " with an empty value,
+// which Gitea would 401 as a malformed credential). This enables
+// the public-fetch activation: SaaS tenants without a configured
+// MOLECULE_TEMPLATE_REPO_TOKEN can still fetch molecule-ai/*
+// templates, which are PUBLIC repos on the Gitea instance. Self-
+// host callers use the no-op fetcher and never reach this code path.
+//
+// Workspace-server never logs or echoes the token (the httpClient
+// logs are scrubbed via the standard net/http strip-header path;
+// the token is in the Authorization header, which net/http does
+// not log by default). The empty-token path sends NO header at all
+// (strictly less information disclosure than a populated header).
 //
 // NO SIZE CAP: the existing #2845 acbc0da9 added a 16MiB bound
 // for TemplateAssets in collectCPConfigFiles (separate from the
@@ -126,12 +138,19 @@ func parseTemplateIdentity(identity string) (owner, repo, ref string, err error)
 // Load fetches the template's tarball archive and returns the
 // allowlisted asset map. See the package doc-comment for the full
 // transport + allowlist contract.
+//
+// PUBLIC FETCH (empty token): when f.token is empty, the fetcher
+// sends an UNAUTHENTICATED request (NO Authorization header). This
+// is the public-fetch activation that lets SaaS tenants without a
+// configured MOLECULE_TEMPLATE_REPO_TOKEN fetch PUBLIC template
+// repos. The earlier code rejected an empty token at Load time
+// (forcing SaaS-no-token tenants to fetch ZERO templates — a
+// runtime defect caught by the driver in #2903 review). Empty
+// token + non-empty token both go through the same code path
+// below; the only difference is the optional Authorization header.
 func (f *giteaTemplateAssetFetcher) Load(ctx context.Context, templateIdentity string) (map[string][]byte, error) {
 	if f.baseURL == "" {
 		return nil, errors.New("giteaTemplateAssetFetcher: baseURL is empty")
-	}
-	if f.token == "" {
-		return nil, errors.New("giteaTemplateAssetFetcher: token is empty (per-identity READ-ONLY Gitea PAT required)")
 	}
 	owner, repo, ref, err := parseTemplateIdentity(templateIdentity)
 	if err != nil {
@@ -143,7 +162,13 @@ func (f *giteaTemplateAssetFetcher) Load(ctx context.Context, templateIdentity s
 	if err != nil {
 		return nil, fmt.Errorf("giteaTemplateAssetFetcher: build request: %w", err)
 	}
-	req.Header.Set("Authorization", "token "+f.token)
+	// Only set Authorization when a token is configured. Sending
+	// "token " with an empty value would be a malformed credential
+	// that Gitea 401s on — strictly worse than sending no header at
+	// all (which is what the public path needs).
+	if f.token != "" {
+		req.Header.Set("Authorization", "token "+f.token)
+	}
 	req.Header.Set("Accept", "application/gzip, application/octet-stream")
 
 	resp, err := f.httpClient.Do(req)
