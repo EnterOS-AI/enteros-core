@@ -2120,7 +2120,8 @@ func TestMaybeMarkContainerDead_NilProvisioner(t *testing.T) {
 		WithArgs("ws-nilprov").
 		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("claude-code"))
 
-	if got := handler.maybeMarkContainerDead(context.Background(), "ws-nilprov"); got {
+	dead, _, _ := handler.maybeMarkContainerDead(context.Background(), "ws-nilprov", "", []byte("{}"), "message/send", 0, false)
+	if dead {
 		t.Error("expected false when provisioner is nil")
 	}
 }
@@ -2142,12 +2143,15 @@ func TestMaybeMarkContainerDead_CPOnly_NotRunning(t *testing.T) {
 	mock.ExpectQuery(`SELECT COALESCE\(runtime, 'claude-code'\) FROM workspaces WHERE id =`).
 		WithArgs("ws-saas-dead").
 		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("hermes"))
+	mock.ExpectQuery(`SELECT last_heartbeat_at FROM workspaces WHERE id =`).
+		WithArgs("ws-saas-dead").
+		WillReturnRows(sqlmock.NewRows([]string{"last_heartbeat_at"}).AddRow(sql.NullTime{}))
 	mock.ExpectExec(`UPDATE workspaces SET status =`).
 		WithArgs(models.StatusOffline, "ws-saas-dead").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	got := handler.maybeMarkContainerDead(context.Background(), "ws-saas-dead")
-	if !got {
+	dead, _, _ := handler.maybeMarkContainerDead(context.Background(), "ws-saas-dead", "", []byte("{}"), "message/send", 0, false)
+	if !dead {
 		t.Fatal("expected true (cpProv reports not running) — without cpProv consultation, SaaS dead-agent recovery is impossible")
 	}
 	if cp.calls != 1 {
@@ -2171,8 +2175,12 @@ func TestMaybeMarkContainerDead_CPOnly_Running(t *testing.T) {
 	mock.ExpectQuery(`SELECT COALESCE\(runtime, 'claude-code'\) FROM workspaces WHERE id =`).
 		WithArgs("ws-saas-alive").
 		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("hermes"))
+	mock.ExpectQuery(`SELECT last_heartbeat_at FROM workspaces WHERE id =`).
+		WithArgs("ws-saas-alive").
+		WillReturnRows(sqlmock.NewRows([]string{"last_heartbeat_at"}).AddRow(sql.NullTime{}))
 
-	if got := handler.maybeMarkContainerDead(context.Background(), "ws-saas-alive"); got {
+	dead, _, _ := handler.maybeMarkContainerDead(context.Background(), "ws-saas-alive", "", []byte("{}"), "message/send", 0, false)
+	if dead {
 		t.Error("expected false when cpProv reports running — must not recycle a healthy agent")
 	}
 	if cp.calls != 1 {
@@ -2278,15 +2286,17 @@ func TestMaybeMarkContainerDead_ExternalRuntime(t *testing.T) {
 		WithArgs("ws-ext").
 		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("external"))
 
-	if got := handler.maybeMarkContainerDead(context.Background(), "ws-ext"); got {
+	dead, _, _ := handler.maybeMarkContainerDead(context.Background(), "ws-ext", "", []byte("{}"), "message/send", 0, false)
+	if dead {
 		t.Error("expected false for external runtime")
 	}
 }
 
 // #2929: a recent heartbeat + IsRunning=false should NOT declare the
-// container dead on the first observation. The second observation within
-// the debounce window should.
-func TestMaybeMarkContainerDead_RecentHeartbeat_Debounces(t *testing.T) {
+// container dead. The function re-probes after a short delay and, if still
+// not running, enqueues the request rather than clearing the URL and
+// restarting.
+func TestMaybeMarkContainerDead_RecentHeartbeat_DoesNotRestart(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
 	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
@@ -2294,10 +2304,14 @@ func TestMaybeMarkContainerDead_RecentHeartbeat_Debounces(t *testing.T) {
 	cp := &fakeCPProv{running: false}
 	handler.SetCPProvisioner(cp)
 
+	// Speed the test: zero the reprobe delay. The second probe still runs.
+	origDelay := containerDeadReprobeDelayV
+	containerDeadReprobeDelayV = 0
+	defer func() { containerDeadReprobeDelayV = origDelay }()
+
 	recentHB := time.Now()
 	wsid := "ws-debounce"
 
-	// First observation: recent heartbeat, not running → debounce, no UPDATE.
 	mock.ExpectQuery(`SELECT COALESCE\(runtime, 'claude-code'\) FROM workspaces WHERE id =`).
 		WithArgs(wsid).
 		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("hermes"))
@@ -2305,29 +2319,97 @@ func TestMaybeMarkContainerDead_RecentHeartbeat_Debounces(t *testing.T) {
 		WithArgs(wsid).
 		WillReturnRows(sqlmock.NewRows([]string{"last_heartbeat_at"}).AddRow(recentHB))
 
-	if got := handler.maybeMarkContainerDead(context.Background(), wsid); got {
-		t.Fatal("first dead observation with recent heartbeat should be debounced, not restarted")
+	dead, status, _ := handler.maybeMarkContainerDead(context.Background(), wsid, "", []byte(`{"jsonrpc":"2.0","method":"message/send"}`), "message/send", 0, false)
+	if dead {
+		t.Fatal("dead observation with recent heartbeat should not declare container dead")
 	}
-	if cp.calls != 1 {
-		t.Errorf("first observation: expected 1 IsRunning call, got %d", cp.calls)
+	// It re-probes, so two IsRunning calls even with delay=0.
+	if cp.calls != 2 {
+		t.Errorf("expected 2 IsRunning calls (probe + re-probe), got %d", cp.calls)
 	}
+	// If EnqueueA2A fails (no DB expectations here) it returns status=0 and
+	// lets the caller fall back to its normal error path. The critical
+	// invariant is that the workspace was NOT marked offline/restarting.
+	_ = status
+}
 
-	// Second observation within the window → threshold reached, restart.
+// #2929: when there is no recent heartbeat and IsRunning=false, the
+// container is declared dead immediately (preserves dead-EC2 recovery).
+func TestMaybeMarkContainerDead_NoRecentHeartbeat_DeclaresDead(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
+	waitForHandlerAsyncBeforeDBCleanup(t, handler)
+	cp := &fakeCPProv{running: false}
+	handler.SetCPProvisioner(cp)
+
+	wsid := "ws-no-hb-dead"
 	mock.ExpectQuery(`SELECT COALESCE\(runtime, 'claude-code'\) FROM workspaces WHERE id =`).
 		WithArgs(wsid).
 		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("hermes"))
 	mock.ExpectQuery(`SELECT last_heartbeat_at FROM workspaces WHERE id =`).
 		WithArgs(wsid).
-		WillReturnRows(sqlmock.NewRows([]string{"last_heartbeat_at"}).AddRow(recentHB))
+		WillReturnRows(sqlmock.NewRows([]string{"last_heartbeat_at"}).AddRow(sql.NullTime{}))
 	mock.ExpectExec(`UPDATE workspaces SET status =`).
 		WithArgs(models.StatusOffline, wsid).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	if got := handler.maybeMarkContainerDead(context.Background(), wsid); !got {
-		t.Fatal("second dead observation with recent heartbeat should declare dead")
+	dead, _, _ := handler.maybeMarkContainerDead(context.Background(), wsid, "", []byte("{}"), "message/send", 0, false)
+	if !dead {
+		t.Fatal("expected dead when there is no recent heartbeat and IsRunning=false")
+	}
+	if cp.calls != 1 {
+		t.Errorf("expected 1 IsRunning call, got %d", cp.calls)
+	}
+}
+
+// #2929 regression: in the post-restart settle window, a single IsRunning=false
+// must NOT nuke a PONG-healthy container's URL. Evidence: job 506813 saw the
+// agent PONG 0.7s before a lone false probe; pre-fix that cleared the URL,
+// flipped status offline, and self-fired a restart.
+func TestMaybeMarkContainerDead_SettleWindow_DoesNotClearURL(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
+	waitForHandlerAsyncBeforeDBCleanup(t, handler)
+	cp := &fakeCPProv{running: false}
+	handler.SetCPProvisioner(cp)
+
+	origDelay := containerDeadReprobeDelayV
+	containerDeadReprobeDelayV = 0
+	defer func() { containerDeadReprobeDelayV = origDelay }()
+
+	wsid := "ws-settle-window"
+	recentHB := time.Now()
+
+	// Stamp a restart that has *finished* (running=false) but is still inside
+	// the settle window. This is the exact state after a config-PUT restart
+	// where the container is alive-but-settling.
+	sv, _ := restartStates.LoadOrStore(wsid, &restartState{})
+	state := sv.(*restartState)
+	state.mu.Lock()
+	state.running = false
+	state.restartStartedAt = time.Now()
+	state.mu.Unlock()
+	defer restartStates.Delete(wsid)
+
+	if !inRestartSettleWindow(wsid) {
+		t.Fatal("test setup failed: workspace should be in restart settle window")
+	}
+
+	mock.ExpectQuery(`SELECT COALESCE\(runtime, 'claude-code'\) FROM workspaces WHERE id =`).
+		WithArgs(wsid).
+		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("hermes"))
+	mock.ExpectQuery(`SELECT last_heartbeat_at FROM workspaces WHERE id =`).
+		WithArgs(wsid).
+		WillReturnRows(sqlmock.NewRows([]string{"last_heartbeat_at"}).AddRow(recentHB))
+
+	dead, _, _ := handler.maybeMarkContainerDead(context.Background(), wsid, "", []byte(`{"jsonrpc":"2.0","method":"message/send"}`), "message/send", 0, false)
+	if dead {
+		t.Fatal("single IsRunning=false in post-restart settle window must not declare container dead")
 	}
 	if cp.calls != 2 {
-		t.Errorf("second observation: expected 2 IsRunning calls total, got %d", cp.calls)
+		t.Errorf("expected 2 IsRunning calls (probe + re-probe), got %d", cp.calls)
 	}
 }
 
@@ -2348,14 +2430,15 @@ func TestMaybeMarkContainerDead_InspectErr_AssumesAlive(t *testing.T) {
 		WithArgs(wsid).
 		WillReturnRows(sqlmock.NewRows([]string{"last_heartbeat_at"}).AddRow(sql.NullTime{}))
 
-	if got := handler.maybeMarkContainerDead(context.Background(), wsid); got {
+	dead, _, _ := handler.maybeMarkContainerDead(context.Background(), wsid, "", []byte("{}"), "message/send", 0, false)
+	if dead {
 		t.Error("transient IsRunning error should be treated as alive, not dead")
 	}
 }
 
-// #2929: a successful IsRunning=true observation resets any accumulated
-// dead-probe counter.
-func TestMaybeMarkContainerDead_RunningTrue_ResetsDeadProbe(t *testing.T) {
+// #2929: a successful IsRunning=true observation after a re-probe resets the
+// dead-probe state and does not restart.
+func TestMaybeMarkContainerDead_RunningTrueAfterReprobe_Resets(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
 	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
@@ -2364,18 +2447,25 @@ func TestMaybeMarkContainerDead_RunningTrue_ResetsDeadProbe(t *testing.T) {
 	wsid := "ws-alive-resets"
 	recentHB := time.Now()
 
-	// One dead observation with recent heartbeat accumulates a probe.
+	origDelay := containerDeadReprobeDelayV
+	containerDeadReprobeDelayV = 0
+	defer func() { containerDeadReprobeDelayV = origDelay }()
+
+	// First observation: recent heartbeat but IsRunning=false. The re-probe
+	// also returns false, so the request is enqueued (or falls back) and the
+	// workspace is not marked dead.
 	mock.ExpectQuery(`SELECT COALESCE\(runtime, 'claude-code'\) FROM workspaces WHERE id =`).
 		WithArgs(wsid).
 		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("hermes"))
 	mock.ExpectQuery(`SELECT last_heartbeat_at FROM workspaces WHERE id =`).
 		WithArgs(wsid).
 		WillReturnRows(sqlmock.NewRows([]string{"last_heartbeat_at"}).AddRow(recentHB))
-	if got := handler.maybeMarkContainerDead(context.Background(), wsid); got {
-		t.Fatal("expected first observation to be debounced")
+	dead, _, _ := handler.maybeMarkContainerDead(context.Background(), wsid, "", []byte("{}"), "message/send", 0, false)
+	if dead {
+		t.Fatal("expected first observation to be debounced/enqueued, not dead")
 	}
 
-	// Next observation says running=true → resets counter and does NOT restart.
+	// Next observation says running=true → no restart.
 	cp.running = true
 	mock.ExpectQuery(`SELECT COALESCE\(runtime, 'claude-code'\) FROM workspaces WHERE id =`).
 		WithArgs(wsid).
@@ -2383,20 +2473,9 @@ func TestMaybeMarkContainerDead_RunningTrue_ResetsDeadProbe(t *testing.T) {
 	mock.ExpectQuery(`SELECT last_heartbeat_at FROM workspaces WHERE id =`).
 		WithArgs(wsid).
 		WillReturnRows(sqlmock.NewRows([]string{"last_heartbeat_at"}).AddRow(recentHB))
-	if got := handler.maybeMarkContainerDead(context.Background(), wsid); got {
-		t.Error("running=true should reset dead probe and not restart")
-	}
-
-	// One more dead observation is now back to count=1, not threshold.
-	cp.running = false
-	mock.ExpectQuery(`SELECT COALESCE\(runtime, 'claude-code'\) FROM workspaces WHERE id =`).
-		WithArgs(wsid).
-		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("hermes"))
-	mock.ExpectQuery(`SELECT last_heartbeat_at FROM workspaces WHERE id =`).
-		WithArgs(wsid).
-		WillReturnRows(sqlmock.NewRows([]string{"last_heartbeat_at"}).AddRow(recentHB))
-	if got := handler.maybeMarkContainerDead(context.Background(), wsid); got {
-		t.Fatal("expected dead probe to have been reset; first post-reset observation should be debounced")
+	dead, _, _ = handler.maybeMarkContainerDead(context.Background(), wsid, "", []byte("{}"), "message/send", 0, false)
+	if dead {
+		t.Error("running=true should not restart")
 	}
 }
 

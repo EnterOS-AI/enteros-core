@@ -808,7 +808,11 @@ func (h *WorkspaceHandler) proxyA2ARequest(ctx context.Context, workspaceID stri
 		// authoritative check) but the empty-body case is what makes
 		// this fix necessary.
 		if isUpstreamDeadStatus(resp.StatusCode) {
-			if h.maybeMarkContainerDead(ctx, workspaceID) {
+			dead, queuedStatus, queuedBody := h.maybeMarkContainerDead(ctx, workspaceID, callerID, body, a2aMethod, durationMs, logActivity)
+			if queuedStatus != 0 {
+				return queuedStatus, queuedBody, nil
+			}
+			if dead {
 				return 0, nil, &proxyA2AError{
 					Status:   http.StatusServiceUnavailable,
 					Headers:  map[string]string{"Retry-After": "15"},
