@@ -106,6 +106,10 @@ jobs:
             "workspace-server/internal/handlers/workspace_provision_forbidden_env_test.go"
             "workspace-server/internal/provisioner/provisioner.go"
             "workspace-server/internal/provisioner/provisioner_test.go"
+            # Class 3 — secret redaction table: the quoted forbidden names here
+            # are category labels for regexps that *strip* secrets from memory
+            # content, not env-var injection sinks. core#2918.
+            "workspace-server/internal/handlers/memories.go"
             # Class 2 — pre-existing persona-fallback / org-helper paths
             # that set the GITEA_TOKEN fallback lane (stripped downstream
             # by provisioner.buildContainerEnv per forensic #145). The
