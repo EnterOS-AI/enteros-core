@@ -2242,6 +2242,7 @@ func TestStopForRestart_NoProvisioner_NoOp(t *testing.T) {
 // can check `calls == 0` after a sync barrier.
 type fakeCPProv struct {
 	running    bool
+	err        error
 	calls      int
 	stopCalls  int
 	startCalls int
@@ -2264,7 +2265,7 @@ func (f *fakeCPProv) GetConsoleOutput(_ context.Context, _ string) (string, erro
 }
 func (f *fakeCPProv) IsRunning(_ context.Context, _ string) (bool, error) {
 	f.calls++
-	return f.running, nil
+	return f.running, f.err
 }
 
 // external runtime → false regardless of provisioner.
@@ -2279,6 +2280,123 @@ func TestMaybeMarkContainerDead_ExternalRuntime(t *testing.T) {
 
 	if got := handler.maybeMarkContainerDead(context.Background(), "ws-ext"); got {
 		t.Error("expected false for external runtime")
+	}
+}
+
+// #2929: a recent heartbeat + IsRunning=false should NOT declare the
+// container dead on the first observation. The second observation within
+// the debounce window should.
+func TestMaybeMarkContainerDead_RecentHeartbeat_Debounces(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
+	waitForHandlerAsyncBeforeDBCleanup(t, handler)
+	cp := &fakeCPProv{running: false}
+	handler.SetCPProvisioner(cp)
+
+	recentHB := time.Now()
+	wsid := "ws-debounce"
+
+	// First observation: recent heartbeat, not running → debounce, no UPDATE.
+	mock.ExpectQuery(`SELECT COALESCE\(runtime, 'claude-code'\) FROM workspaces WHERE id =`).
+		WithArgs(wsid).
+		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("hermes"))
+	mock.ExpectQuery(`SELECT last_heartbeat_at FROM workspaces WHERE id =`).
+		WithArgs(wsid).
+		WillReturnRows(sqlmock.NewRows([]string{"last_heartbeat_at"}).AddRow(recentHB))
+
+	if got := handler.maybeMarkContainerDead(context.Background(), wsid); got {
+		t.Fatal("first dead observation with recent heartbeat should be debounced, not restarted")
+	}
+	if cp.calls != 1 {
+		t.Errorf("first observation: expected 1 IsRunning call, got %d", cp.calls)
+	}
+
+	// Second observation within the window → threshold reached, restart.
+	mock.ExpectQuery(`SELECT COALESCE\(runtime, 'claude-code'\) FROM workspaces WHERE id =`).
+		WithArgs(wsid).
+		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("hermes"))
+	mock.ExpectQuery(`SELECT last_heartbeat_at FROM workspaces WHERE id =`).
+		WithArgs(wsid).
+		WillReturnRows(sqlmock.NewRows([]string{"last_heartbeat_at"}).AddRow(recentHB))
+	mock.ExpectExec(`UPDATE workspaces SET status =`).
+		WithArgs(models.StatusOffline, wsid).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if got := handler.maybeMarkContainerDead(context.Background(), wsid); !got {
+		t.Fatal("second dead observation with recent heartbeat should declare dead")
+	}
+	if cp.calls != 2 {
+		t.Errorf("second observation: expected 2 IsRunning calls total, got %d", cp.calls)
+	}
+}
+
+// #2929: IsRunning returning a transport error must be treated as alive,
+// not as a dead container.
+func TestMaybeMarkContainerDead_InspectErr_AssumesAlive(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
+	cp := &fakeCPProv{err: errors.New("cp timeout")}
+	handler.SetCPProvisioner(cp)
+
+	wsid := "ws-inspect-err"
+	mock.ExpectQuery(`SELECT COALESCE\(runtime, 'claude-code'\) FROM workspaces WHERE id =`).
+		WithArgs(wsid).
+		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("hermes"))
+	mock.ExpectQuery(`SELECT last_heartbeat_at FROM workspaces WHERE id =`).
+		WithArgs(wsid).
+		WillReturnRows(sqlmock.NewRows([]string{"last_heartbeat_at"}).AddRow(sql.NullTime{}))
+
+	if got := handler.maybeMarkContainerDead(context.Background(), wsid); got {
+		t.Error("transient IsRunning error should be treated as alive, not dead")
+	}
+}
+
+// #2929: a successful IsRunning=true observation resets any accumulated
+// dead-probe counter.
+func TestMaybeMarkContainerDead_RunningTrue_ResetsDeadProbe(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
+	cp := &fakeCPProv{running: false}
+	handler.SetCPProvisioner(cp)
+	wsid := "ws-alive-resets"
+	recentHB := time.Now()
+
+	// One dead observation with recent heartbeat accumulates a probe.
+	mock.ExpectQuery(`SELECT COALESCE\(runtime, 'claude-code'\) FROM workspaces WHERE id =`).
+		WithArgs(wsid).
+		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("hermes"))
+	mock.ExpectQuery(`SELECT last_heartbeat_at FROM workspaces WHERE id =`).
+		WithArgs(wsid).
+		WillReturnRows(sqlmock.NewRows([]string{"last_heartbeat_at"}).AddRow(recentHB))
+	if got := handler.maybeMarkContainerDead(context.Background(), wsid); got {
+		t.Fatal("expected first observation to be debounced")
+	}
+
+	// Next observation says running=true → resets counter and does NOT restart.
+	cp.running = true
+	mock.ExpectQuery(`SELECT COALESCE\(runtime, 'claude-code'\) FROM workspaces WHERE id =`).
+		WithArgs(wsid).
+		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("hermes"))
+	mock.ExpectQuery(`SELECT last_heartbeat_at FROM workspaces WHERE id =`).
+		WithArgs(wsid).
+		WillReturnRows(sqlmock.NewRows([]string{"last_heartbeat_at"}).AddRow(recentHB))
+	if got := handler.maybeMarkContainerDead(context.Background(), wsid); got {
+		t.Error("running=true should reset dead probe and not restart")
+	}
+
+	// One more dead observation is now back to count=1, not threshold.
+	cp.running = false
+	mock.ExpectQuery(`SELECT COALESCE\(runtime, 'claude-code'\) FROM workspaces WHERE id =`).
+		WithArgs(wsid).
+		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("hermes"))
+	mock.ExpectQuery(`SELECT last_heartbeat_at FROM workspaces WHERE id =`).
+		WithArgs(wsid).
+		WillReturnRows(sqlmock.NewRows([]string{"last_heartbeat_at"}).AddRow(recentHB))
+	if got := handler.maybeMarkContainerDead(context.Background(), wsid); got {
+		t.Fatal("expected dead probe to have been reset; first post-reset observation should be debounced")
 	}
 }
 

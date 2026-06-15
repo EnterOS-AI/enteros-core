@@ -25,6 +25,19 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// Reactive container-death debounce constants (#2929). A single A2A
+// forward error or one flaky IsRunning probe must not restart a
+// recently-alive workspace. We only declare the container dead when:
+//   - the workspace has NOT heartbeated recently, AND IsRunning reports
+//     not-running (immediate-dead path, preserving dead-EC2 recovery); OR
+//   - the workspace DOES have a recent heartbeat but we see N consecutive
+//     dead observations within the debounce window.
+const (
+	recentHeartbeatWindow          = 15 * time.Second
+	containerDeadDebounceThreshold = 2
+	containerDeadDebounceWindow    = 30 * time.Second
+)
+
 // proxyDispatchBuildError is a sentinel wrapper for failures inside
 // http.NewRequestWithContext. handleA2ADispatchError unwraps it to emit the
 // "failed to create proxy request" 500 instead of the standard 502/503 paths.
@@ -171,6 +184,30 @@ func (h *WorkspaceHandler) handleA2ADispatchError(ctx context.Context, workspace
 // with no auto-recovery and Cloudflare in front would mask the response with
 // its own error page. The 2026-04-30 hongmingwang.moleculesai.app
 // canvas-chat-to-dead-workspace incident traces to exactly this gap.
+// maybeMarkContainerDead runs the reactive health check after a forward error.
+// If the workspace's compute (Docker container OR EC2 instance) is no longer
+// running (and the workspace isn't external), it marks the workspace offline,
+// clears Redis state, broadcasts WORKSPACE_OFFLINE, and triggers an async
+// restart. Returns true when the compute was found dead.
+//
+// Provisioner selection (mutually exclusive in production):
+//   - h.provisioner != nil  → local Docker deployment; IsRunning does docker inspect.
+//   - h.cpProv != nil       → SaaS / EC2 deployment; IsRunning calls CP's
+//     /cp/workspaces/:id/status to read the EC2 state.
+//
+// Pre-fix this function ONLY consulted h.provisioner — for SaaS tenants
+// (h.provisioner=nil, h.cpProv=set) it short-circuited to false on every
+// call, so a dead EC2 agent would propagate upstream 502/503/504 to canvas
+// with no auto-recovery and Cloudflare in front would mask the response with
+// its own error page. The 2026-04-30 hongmingwang.moleculesai.app
+// canvas-chat-to-dead-workspace incident traces to exactly this gap.
+//
+// #2929 hardening: do NOT recycle a recently-alive workspace on a single
+// transient A2A 503 / IsRunning flake. We guard the restart with:
+//   1. A recent-heartbeat check (last_heartbeat_at within 15s).
+//   2. When the heartbeat is recent, require 2 consecutive dead observations
+//      within 30s before declaring dead.
+//   3. Treat IsRunning transport errors as "assume alive" instead of dead.
 func (h *WorkspaceHandler) maybeMarkContainerDead(ctx context.Context, workspaceID string) bool {
 	var wsRuntime string
 	db.DB.QueryRowContext(ctx, `SELECT COALESCE(runtime, 'claude-code') FROM workspaces WHERE id = $1`, workspaceID).Scan(&wsRuntime)
@@ -196,6 +233,12 @@ func (h *WorkspaceHandler) maybeMarkContainerDead(ctx context.Context, workspace
 		return false
 	}
 
+	// #2929: recent-heartbeat guard. A workspace that heartbeated seconds
+	// ago is almost certainly alive; a single proxy/transport flake should
+	// not kill it. We still run IsRunning below, but a recent heartbeat
+	// puts us on the debounced path.
+	recentHeartbeat := h.hasRecentHeartbeat(ctx, workspaceID)
+
 	var running bool
 	var inspectErr error
 	if h.provisioner != nil {
@@ -211,11 +254,52 @@ func (h *WorkspaceHandler) maybeMarkContainerDead(ctx context.Context, workspace
 		// IsRunning's contract returns (true, err) in this case so we stay
 		// on the alive path without triggering a restart cascade.
 		log.Printf("ProxyA2A: IsRunning for %s returned transient error (assuming alive): %v", workspaceID, inspectErr)
-	}
-	if running {
 		return false
 	}
+	if running {
+		h.resetDeadProbe(workspaceID)
+		return false
+	}
+
+	// Container is not running. If we have no recent heartbeat, preserve the
+	// pre-#2929 immediate-dead behavior so dead EC2 instances still recover
+	// on the first failed request (hongmingwang incident recovery path).
+	if !recentHeartbeat {
+		return h.declareContainerDead(ctx, workspaceID)
+	}
+
+	// Recent heartbeat but IsRunning says not-running: debounce. Require N
+	// consecutive observations within the window before we believe it.
+	if !h.incrementDeadProbe(workspaceID) {
+		log.Printf("ProxyA2A: container for %s looks dead but has recent heartbeat — debouncing (%d/%d within %s)",
+			workspaceID, h.deadProbeCount(workspaceID), containerDeadDebounceThreshold, containerDeadDebounceWindow)
+		return false
+	}
+	return h.declareContainerDead(ctx, workspaceID)
+}
+
+// hasRecentHeartbeat returns true if the workspace has a last_heartbeat_at
+// within recentHeartbeatWindow. Missing/null heartbeat is treated as not
+// recent.
+func (h *WorkspaceHandler) hasRecentHeartbeat(ctx context.Context, workspaceID string) bool {
+	var lastHB *time.Time
+	if err := db.DB.QueryRowContext(ctx,
+		`SELECT last_heartbeat_at FROM workspaces WHERE id = $1`, workspaceID,
+	).Scan(&lastHB); err != nil {
+		log.Printf("ProxyA2A: failed to read last_heartbeat_at for %s: %v", workspaceID, err)
+		return false
+	}
+	if lastHB == nil {
+		return false
+	}
+	return time.Since(*lastHB) <= recentHeartbeatWindow
+}
+
+// declareContainerDead is the single point that marks a workspace offline,
+// clears keys, broadcasts OFFLINE, and triggers an async restart.
+func (h *WorkspaceHandler) declareContainerDead(ctx context.Context, workspaceID string) bool {
 	log.Printf("ProxyA2A: container for %s is dead — marking offline and triggering restart", workspaceID)
+	h.resetDeadProbe(workspaceID)
 	if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1, updated_at = now() WHERE id = $2 AND status NOT IN ('removed', 'provisioning')`, models.StatusOffline, workspaceID); err != nil {
 		log.Printf("ProxyA2A: failed to mark workspace %s offline: %v", workspaceID, err)
 	}
@@ -228,6 +312,35 @@ func (h *WorkspaceHandler) maybeMarkContainerDead(ctx context.Context, workspace
 	// correct site at a2a_proxy.go:648.
 	h.goAsync(func() { h.RestartByID(workspaceID) })
 	return true
+}
+
+// incrementDeadProbe records another dead-looking observation for workspaceID
+// and returns true when the threshold is reached within the debounce window.
+func (h *WorkspaceHandler) incrementDeadProbe(workspaceID string) bool {
+	h.deadProbeMu.Lock()
+	defer h.deadProbeMu.Unlock()
+	now := time.Now()
+	rec, ok := h.deadProbeAttempts[workspaceID]
+	if !ok || now.Sub(rec.first) > containerDeadDebounceWindow {
+		rec = deadProbeRecord{count: 1, first: now, last: now}
+	} else {
+		rec.count++
+		rec.last = now
+	}
+	h.deadProbeAttempts[workspaceID] = rec
+	return rec.count >= containerDeadDebounceThreshold
+}
+
+func (h *WorkspaceHandler) resetDeadProbe(workspaceID string) {
+	h.deadProbeMu.Lock()
+	defer h.deadProbeMu.Unlock()
+	delete(h.deadProbeAttempts, workspaceID)
+}
+
+func (h *WorkspaceHandler) deadProbeCount(workspaceID string) int {
+	h.deadProbeMu.Lock()
+	defer h.deadProbeMu.Unlock()
+	return h.deadProbeAttempts[workspaceID].count
 }
 
 // preflightContainerHealth runs a proactive Provisioner.IsRunning check
