@@ -899,6 +899,14 @@ describe("hydrationError", () => {
     expect(useCanvasStore.getState().nodes).toHaveLength(1);
     expect(useCanvasStore.getState().nodes[0].id).toBe("ws-x");
   });
+
+  it("successful hydrate clears a previous hydrationError", () => {
+    useCanvasStore.getState().setHydrationError("previous failure");
+    useCanvasStore.getState().hydrate([makeWS({ id: "ws-y", name: "Y" })]);
+    expect(useCanvasStore.getState().hydrationError).toBeNull();
+    expect(useCanvasStore.getState().nodes).toHaveLength(1);
+    expect(useCanvasStore.getState().nodes[0].id).toBe("ws-y");
+  });
 });
 
 // ---------- ACTIVITY_LOGGED event ----------

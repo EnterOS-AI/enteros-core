@@ -970,11 +970,15 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
         layoutOverrides,
         currentParentSizes,
       );
-      set({ nodes, edges });
+      // Clear any stale hydration error from a previous failed load so a
+      // successful rehydrate does not leave the user staring at an old
+      // error banner (core#2921).
+      set({ nodes, edges, hydrationError: null });
     } catch (err) {
       // Fail closed: cyclic/corrupt topology must not hang or blank the app.
       // Surface a retryable error state and keep the previous nodes so the
       // user isn't left with an empty canvas.
+      console.error("Canvas hydration failed:", err);
       const message =
         err instanceof TopologyCycleError
           ? `Workspace map has a cyclic parent chain: ${err.message}. Please reload or contact support.`

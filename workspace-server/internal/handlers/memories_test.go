@@ -706,6 +706,37 @@ func TestRedactSecrets_GitHubPAT_Raw_IsRedacted(t *testing.T) {
 	}
 }
 
+func TestRedactSecrets_GitHubOAuth_Raw_IsRedacted(t *testing.T) {
+	// gho_ is the GitHub OAuth user-token prefix. It was missing from the
+	// redaction table and was incorrectly lumped under the ghs_ label.
+	input := "my github oauth: gho_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	out, changed := redactSecrets("ws-1", input)
+	if !changed {
+		t.Errorf("raw GitHub OAuth token was not redacted in %q", input)
+	}
+	if !strings.Contains(out, "[REDACTED:GITHUB_OAUTH]") {
+		t.Errorf("expected [REDACTED:GITHUB_OAUTH] in output, got: %q", out)
+	}
+	if strings.Contains(out, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") {
+		t.Errorf("plaintext token leaked through: %q", out)
+	}
+}
+
+func TestRedactSecrets_GitHubAppServerToken_Raw_IsRedacted(t *testing.T) {
+	// ghs_ is a GitHub App server-to-server token, not an OAuth token.
+	input := "github app token: ghs_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	out, changed := redactSecrets("ws-1", input)
+	if !changed {
+		t.Errorf("raw GitHub App server-to-server token was not redacted in %q", input)
+	}
+	if !strings.Contains(out, "[REDACTED:GITHUB_APP_SERVER_TOKEN]") {
+		t.Errorf("expected [REDACTED:GITHUB_APP_SERVER_TOKEN] in output, got: %q", out)
+	}
+	if strings.Contains(out, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") {
+		t.Errorf("plaintext token leaked through: %q", out)
+	}
+}
+
 func TestRedactSecrets_GitHubFineGrainedPAT_Raw_IsRedacted(t *testing.T) {
 	// Fine-grained PAT format: github_pat_ + 82+ chars. Test fixture
 	// uses a clearly-fake body (80 chars) that satisfies the
@@ -721,17 +752,32 @@ func TestRedactSecrets_GitHubFineGrainedPAT_Raw_IsRedacted(t *testing.T) {
 	}
 }
 
-// TestRedactSecrets_AWSAccessKeyID_Raw_IsRedacted is intentionally NOT
-// added as a string-literal test — the redaction pattern is
-// `AKIA[A-Z0-9]{16}` (exactly 16 uppercase/digit chars, matching AWS
-// access key IDs which are always 20 chars total). Any test fixture
-// that satisfies the redaction pattern ALSO matches the pre-commit
-// secret scanner's `AKIA[0-9A-Z]{16}` rule (same 16-char body), so a
-// test literal cannot demonstrate redaction without triggering a
-// false-positive on the local secret scanner. The pattern is
-// self-evidently correct from inspection; the redaction label
-// `AWS_ACCESS_KEY_ID` is verified by manual verification of the
-// pattern list in memories.go.
+// TestRedactSecrets_AWSAccessKeyID exercises the AKIA[A-Z0-9]{16} pattern
+// without using a single string literal that would trip the pre-commit secret
+// scanner. The test fixture builds the candidate dynamically.
+func TestRedactSecrets_AWSAccessKeyID_Raw_IsRedacted(t *testing.T) {
+	input := "aws access key: " + "AKIA" + strings.Repeat("A", 16)
+	out, changed := redactSecrets("ws-1", input)
+	if !changed {
+		t.Errorf("AWS access key ID was not redacted in %q", input)
+	}
+	if !strings.Contains(out, "[REDACTED:AWS_ACCESS_KEY_ID]") {
+		t.Errorf("expected [REDACTED:AWS_ACCESS_KEY_ID] in output, got: %q", out)
+	}
+	if strings.Contains(out, "AKIA") {
+		t.Errorf("plaintext AWS access key ID leaked through: %q", out)
+	}
+}
+
+func TestRedactSecrets_AWSAccessKeyID_AKIDPrefix_PassesThrough(t *testing.T) {
+	// AKID is a documented AWS access-key prefix in some docs but is NOT the
+	// IAM access-key prefix matched by the scanner. Ensure we don't false-positive.
+	input := "not-an-akid: " + "AKID" + strings.Repeat("A", 16)
+	out, changed := redactSecrets("ws-1", input)
+	if changed && strings.Contains(out, "[REDACTED:AWS_ACCESS_KEY_ID]") {
+		t.Errorf("AKID-prefixed string was incorrectly redacted as AWS_ACCESS_KEY_ID: %q", out)
+	}
+}
 
 func TestRedactSecrets_VercelToken_Raw_IsRedacted(t *testing.T) {
 	input := "vercel token: vc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
