@@ -1379,6 +1379,24 @@ except Exception:
   printf '%s' "$resp"
 }
 
+# When a2a_send_or_poll_queue hits a verified transient-infra signature it
+# calls infra_skip(), but because the function is invoked via command
+# substitution, bash exit 0 only terminates the subshell and the captured
+# marker is returned as stdout. Detect that marker in the parent shell and
+# re-invoke infra_skip so the whole advisory lane actually skips instead of
+# falling through to the real-completion gate and failing.
+a2a_handle_infra_skip() {
+  local output="$1" label="${2:-$1}"
+  case "$output" in
+    *"scan_status: infra-skip:"*)
+      local reason detail
+      reason=$(printf '%s' "$output" | sed -n 's/.*scan_status: infra-skip:\([^[:space:]]*\).*/\1/p')
+      detail=$(printf '%s' "$output" | sed -n 's/.*scan_status: infra-skip:[^[:space:]]*[[:space:]][[:space:]]*\(.*\)/\1/p')
+      infra_skip "${reason:-a2a-layer}" "${detail:-$label}"
+      ;;
+  esac
+}
+
 # ─── 8. A2A round-trip on parent ───────────────────────────────────────
 log "8/11 Sending A2A message to parent — expecting agent response..."
 # Smoke prompt phrasing — DO NOT trim back to the bare "Reply with exactly: PONG"
@@ -1421,6 +1439,7 @@ print(json.dumps({
 # core#2437 part B: send A2A and, if the agent is busy/starting, poll the
 # queue status endpoint until the durable result is available.
 A2A_RESP=$(a2a_send_or_poll_queue "$PARENT_ID" "$A2A_PAYLOAD" "A2A parent")
+a2a_handle_infra_skip "$A2A_RESP" "A2A parent"
 AGENT_TEXT=$(echo "$A2A_RESP" | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
@@ -1547,6 +1566,7 @@ print(json.dumps({
 ")
 # core#2437 part B: send A2A and poll queue status if the agent queues it.
 KA_RESP=$(a2a_send_or_poll_queue "$PARENT_ID" "$KA_PAYLOAD" "A2A known-answer")
+a2a_handle_infra_skip "$KA_RESP" "A2A known-answer"
 KA_TEXT=$(echo "$KA_RESP" | python3 -c "
 import json, sys
 def extract_text(d):

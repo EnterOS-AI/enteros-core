@@ -315,7 +315,35 @@ func TestDrainQueueForWorkspace_Success_Completes(t *testing.T) {
 
 	expectCompleted(mock, item.ID, `{"result":{"status":"ok"}}`)
 
-	handler.DrainQueueForWorkspace(context.Background(), item.WorkspaceID)
+	handler.DrainQueueForWorkspace(context.Background(), item.WorkspaceID, 1)
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// TestDrainQueueForWorkspace_BatchCapacity_DrainsMultiple: with capacity=2,
+// two queued items are dequeued and dispatched in one call (#2930 batching).
+func TestDrainQueueForWorkspace_BatchCapacity_DrainsMultiple(t *testing.T) {
+	wsID := "ws-batch"
+	item1 := drainItem(wsID)
+	item1.ID = "qid-batch-1"
+	item2 := drainItem(wsID)
+	item2.ID = "qid-batch-2"
+
+	mock, handler, mr := drainSetup(t, wsID)
+	expectDequeueNextOk(mock, item1)
+	expectQueueBudgetCheck(mock, wsID)
+	expectCompleted(mock, item1.ID, `{"result":{"status":"ok"}}`)
+	expectDequeueNextOk(mock, item2)
+	expectQueueBudgetCheck(mock, wsID)
+	expectCompleted(mock, item2.ID, `{"result":{"status":"ok"}}`)
+
+	srv := agentServer(`{"result":{"status":"ok"}}`, http.StatusOK)
+	defer srv.Close()
+	seedRedisURL(t, mr, wsID, srv.URL)
+
+	handler.DrainQueueForWorkspace(context.Background(), wsID, 2)
 
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations: %v", err)
@@ -337,7 +365,7 @@ func TestDrainQueueForWorkspace_202Accepted_CompletesNotFailed(t *testing.T) {
 
 	expectCompleted(mock, item.ID, nil)
 
-	handler.DrainQueueForWorkspace(context.Background(), item.WorkspaceID)
+	handler.DrainQueueForWorkspace(context.Background(), item.WorkspaceID, 1)
 
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations: %v", err)
@@ -358,7 +386,7 @@ func TestDrainQueueForWorkspace_ProxyErrResponseNil_NoPanic(t *testing.T) {
 
 	expectFailed(mock, item.ID, "Bad Gateway")
 
-	handler.DrainQueueForWorkspace(context.Background(), item.WorkspaceID)
+	handler.DrainQueueForWorkspace(context.Background(), item.WorkspaceID, 1)
 
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations: %v", err)
@@ -379,7 +407,7 @@ func TestDrainQueueForWorkspace_ProxyErrMissingErrorKey_UsesStatusText(t *testin
 
 	expectFailed(mock, item.ID, "Internal Server Error")
 
-	handler.DrainQueueForWorkspace(context.Background(), item.WorkspaceID)
+	handler.DrainQueueForWorkspace(context.Background(), item.WorkspaceID, 1)
 
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations: %v", err)
@@ -400,7 +428,7 @@ func TestDrainQueueForWorkspace_ProxyErrNonStringError_NoPanic(t *testing.T) {
 
 	expectFailed(mock, item.ID, "Service Unavailable")
 
-	handler.DrainQueueForWorkspace(context.Background(), item.WorkspaceID)
+	handler.DrainQueueForWorkspace(context.Background(), item.WorkspaceID, 1)
 
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations: %v", err)
@@ -422,7 +450,7 @@ func TestDrainQueueForWorkspace_ProxyErrWithStringError_UsesErrorMessage(t *test
 
 	expectFailed(mock, item.ID, wantErrMsg)
 
-	handler.DrainQueueForWorkspace(context.Background(), item.WorkspaceID)
+	handler.DrainQueueForWorkspace(context.Background(), item.WorkspaceID, 1)
 
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations: %v", err)
@@ -436,7 +464,7 @@ func TestDrainQueueForWorkspace_EmptyQueue_NoOps(t *testing.T) {
 
 	expectDequeueNextEmpty(mock, "ws-empty")
 
-	handler.DrainQueueForWorkspace(context.Background(), "ws-empty")
+	handler.DrainQueueForWorkspace(context.Background(), "ws-empty", 1)
 
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations: %v", err)
@@ -455,7 +483,7 @@ func TestDrainQueueForWorkspace_DequeueError_LogsAndReturns(t *testing.T) {
 		WillReturnError(sql.ErrConnDone)
 	mock.ExpectRollback()
 
-	handler.DrainQueueForWorkspace(context.Background(), "ws-dequeue-err")
+	handler.DrainQueueForWorkspace(context.Background(), "ws-dequeue-err", 1)
 
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations: %v", err)
@@ -484,7 +512,7 @@ func TestDrainQueueForWorkspace_MaxAttempts_FailsRatherThanRetries(t *testing.T)
 
 	expectFailed(mock, item.ID, "agent unreachable")
 
-	handler.DrainQueueForWorkspace(context.Background(), item.WorkspaceID)
+	handler.DrainQueueForWorkspace(context.Background(), item.WorkspaceID, 1)
 
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations: %v", err)
@@ -510,13 +538,13 @@ func TestDrainQueueForWorkspace_ClaimGuarding_SecondDrainGetsEmpty(t *testing.T)
 	seedRedisURL(t, mr, wsID, srv.URL)
 	expectCompleted(mock, item.ID, `{"result":{}}`)
 
-	handler.DrainQueueForWorkspace(context.Background(), wsID)
+	handler.DrainQueueForWorkspace(context.Background(), wsID, 1)
 
 	// Drain 2: same workspace — queue is empty because item was dispatched.
 	// Register expectations for the second drain.
 	expectDequeueNextEmpty(mock, wsID)
 
-	handler.DrainQueueForWorkspace(context.Background(), wsID)
+	handler.DrainQueueForWorkspace(context.Background(), wsID, 1)
 
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations: %v", err)

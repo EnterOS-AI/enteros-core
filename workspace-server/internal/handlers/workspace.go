@@ -78,6 +78,10 @@ type WorkspaceHandler struct {
 	// calls made by HibernateWorkspace without requiring a running Docker daemon.
 	// Always nil in production; the real provisioner path is used when nil.
 	stopFnOverride func(ctx context.Context, workspaceID string)
+	// enqueueA2A is the function handleA2ADispatchError calls to persist a busy
+	// A2A request to a2a_queue. Always EnqueueA2A in production; tests swap it
+	// to assert the passed context is detached from the inbound request (#2930).
+	enqueueA2A func(ctx context.Context, workspaceID, callerID string, priority int, body []byte, method, idempotencyKey string, expiresAt *time.Time) (string, int, error)
 	// provisionTimeouts caches per-runtime provision-timeout values from
 	// template manifests (#2054 phase 2). Lazy-init on first scan; see
 	// runtime_provision_timeouts.go for the loader contract.
@@ -206,6 +210,7 @@ func NewWorkspaceHandler(b events.EventEmitter, p *provisioner.Provisioner, plat
 		platformURL:       platformURL,
 		configsDir:        configsDir,
 		deadProbeAttempts: make(map[string]deadProbeRecord),
+		enqueueA2A:        EnqueueA2A,
 	}
 	// Only assign p when the concrete pointer is non-nil. Without this
 	// guard, a `NewWorkspaceHandler(..., nil, ...)` call (which all the

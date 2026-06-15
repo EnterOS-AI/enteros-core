@@ -99,8 +99,9 @@ var saasModeWarnUnknownOnce sync.Once
 // QueueDrainFunc dispatches one queued A2A item on behalf of the caller.
 // Injected at construction to avoid a WorkspaceHandler import cycle in
 // RegistryHandler. Called from a goroutine spawned inside Heartbeat when
-// the workspace reports spare capacity (#1870 Phase 1).
-type QueueDrainFunc func(ctx context.Context, workspaceID string)
+// the workspace reports spare capacity (#1870 Phase 1), and from the
+// periodic A2A queue sweeper (#2930).
+type QueueDrainFunc func(ctx context.Context, workspaceID string, capacity int)
 
 type RegistryHandler struct {
 	broadcaster *events.Broadcaster
@@ -1197,7 +1198,11 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 			// through globalGoAsync so test cleanup waits for it.
 			drainCtx := context.WithoutCancel(ctx)
 			wsID := payload.WorkspaceID
-			globalGoAsync(func() { h.drainQueue(drainCtx, wsID) })
+			capacity := maxConcurrent - payload.ActiveTasks
+			if capacity < 1 {
+				capacity = 1
+			}
+			globalGoAsync(func() { h.drainQueue(drainCtx, wsID, capacity) })
 		}
 	}
 }
