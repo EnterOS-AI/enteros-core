@@ -2014,6 +2014,12 @@ func TestRegister_AllowsAlreadyPlatformReRegister(t *testing.T) {
 		WithArgs(wsID).
 		WillReturnRows(sqlmock.NewRows([]string{"kind"}).AddRow("platform"))
 
+	// Issue #2970: platform-agent identity gate — payload.kind="platform", so we
+	// verify the seeded MODEL workspace_secret exists before marking online.
+	mock.ExpectQuery("SELECT EXISTS\\(SELECT 1 FROM workspace_secrets WHERE workspace_id = \\$1 AND key = 'MODEL'\\)").
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+
 	// delivery_mode="push" is set explicitly, so resolveDeliveryMode
 	// short-circuits (no SELECT delivery_mode lookup). The upsert MUST carry
 	// kind="platform" as the 6th arg.
@@ -2124,6 +2130,57 @@ func TestRegister_RejectsPlatformPromotion(t *testing.T) {
 
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("promote workspace->platform: expected 403, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// TestRegister_PlatformAgentMissingModelSecret_FailsClosed guards issue #2970:
+// a platform agent that reaches /registry/register without a seeded MODEL
+// workspace_secret must NOT be marked online. Instead the workspace is marked
+// 'failed' and the register call returns 400, so a generic/model-less concierge
+// cannot serve users.
+func TestRegister_PlatformAgentMissingModelSecret_FailsClosed(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewRegistryHandler(broadcaster)
+
+	const wsID = "ws-platform-no-model"
+
+	// Bootstrap path — no live tokens.
+	mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM workspace_auth_tokens").
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+
+	// kind precheck: existing row is kind="platform".
+	mock.ExpectQuery("SELECT kind FROM workspaces WHERE id").
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"kind"}).AddRow("platform"))
+
+	// Identity gate: payload.kind="platform" → check MODEL secret → absent.
+	mock.ExpectQuery("SELECT EXISTS\\(SELECT 1 FROM workspace_secrets WHERE workspace_id = \\$1 AND key = 'MODEL'\\)").
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+
+	// Gate failure broadcasts WORKSPACE_PROVISION_FAILED and marks the row failed.
+	mock.ExpectExec("INSERT INTO structure_events").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("UPDATE workspaces SET status = \\$3, last_sample_error = \\$2, updated_at = now\\(\\) WHERE id = \\$1").
+		WithArgs(wsID, sqlmock.AnyArg(), models.StatusFailed).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest("POST", "/registry/register",
+		bytes.NewBufferString(`{"id":"`+wsID+`","url":"http://localhost:9100","delivery_mode":"push","kind":"platform","agent_card":{"name":"concierge"}}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Register(c)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("platform agent missing MODEL secret: expected 400, got %d: %s", w.Code, w.Body.String())
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet expectations: %v", err)

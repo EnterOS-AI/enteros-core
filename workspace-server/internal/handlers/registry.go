@@ -353,6 +353,33 @@ func isPlatformTunnelHostname(h string) bool {
 	return strings.HasSuffix(h, "."+domain)
 }
 
+// platformAgentHasModelSecret reports whether the workspace has a MODEL
+// workspace_secret. The concierge's declared model is seeded by
+// ensureConciergeModel before every platform-agent provision; a platform agent
+// that reaches registration without this secret has not received its identity
+// and must not be marked online.
+func (h *RegistryHandler) platformAgentHasModelSecret(ctx context.Context, workspaceID string) (bool, error) {
+	var exists bool
+	err := db.DB.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM workspace_secrets WHERE workspace_id = $1 AND key = 'MODEL')`,
+		workspaceID).Scan(&exists)
+	return exists, err
+}
+
+// markWorkspaceFailed updates a workspace row to status='failed' and broadcasts
+// WORKSPACE_PROVISION_FAILED. It is a RegistryHandler-local fallback for the
+// fail-closed platform-agent identity gate; the WorkspaceHandler's
+// markProvisionFailed is the primary path during provisioning.
+func (h *RegistryHandler) markWorkspaceFailed(ctx context.Context, workspaceID, msg string) {
+	extra := map[string]interface{}{"error": msg, "code": "PLATFORM_AGENT_IDENTITY_GATE"}
+	h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceProvisionFailed), workspaceID, extra)
+	if _, dbErr := db.DB.ExecContext(ctx,
+		`UPDATE workspaces SET status = $3, last_sample_error = $2, updated_at = now() WHERE id = $1`,
+		workspaceID, msg, models.StatusFailed); dbErr != nil {
+		log.Printf("markWorkspaceFailed: db update failed for %s: %v", workspaceID, dbErr)
+	}
+}
+
 // Register handles POST /registry/register
 // Upserts workspace, sets Redis TTL, broadcasts WORKSPACE_ONLINE.
 func (h *RegistryHandler) Register(c *gin.Context) {
@@ -482,6 +509,33 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 		log.Printf("Registry register: resolveDeliveryMode failed for %s: %v", payload.ID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "registration failed"})
 		return
+	}
+
+	// Issue #2970: fail CLOSED if a platform agent reaches registration without
+	// the seeded MODEL workspace_secret. The MISSING_MODEL gate in
+	// prepareProvisionContext is the primary defense, but if a model-less/identity-
+	// less concierge somehow boots on a path that bypasses that gate (e.g. an old
+	// or generic image), this second-layer guard prevents it from ever marking
+	// itself online-routable. Instead we mark the workspace failed so the canvas
+	// surfaces a provision failure rather than serving users a generic Claude Code.
+	//
+	// existingState.ExistingKind is populated by fetchExistingWorkspaceStateForDiagnostics
+	// (best-effort). We treat "platform" literally; any other value (including "(new)"
+	// or "(unavailable)") means the gate does not apply unless payload.Kind itself is
+	// "platform" (covered by the privilege-escalation precheck above).
+	if payload.Kind == models.KindPlatform || existingState.ExistingKind == models.KindPlatform {
+		if hasModel, mErr := h.platformAgentHasModelSecret(ctx, payload.ID); mErr != nil {
+			log.Printf("Registry register: model secret lookup failed for %s: %v", payload.ID, mErr)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "registration failed"})
+			return
+		} else if !hasModel {
+			msg := "platform agent registered without a seeded MODEL secret; refusing online"
+			log.Printf("Registry register: %s (workspace=%s)", msg, payload.ID)
+			h.markWorkspaceFailed(ctx, payload.ID, msg)
+			logRegister400Reason("platform_agent_model_missing", payload.ID, payload, existingState, msg)
+			c.JSON(http.StatusBadRequest, gin.H{"error": "platform agent identity incomplete"})
+			return
+		}
 	}
 
 	// URL handling diverges by mode:
