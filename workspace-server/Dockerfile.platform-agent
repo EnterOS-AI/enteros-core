@@ -99,6 +99,16 @@ COPY ${PLATFORM_AGENT_TEMPLATE_DIR}/prompts/ /opt/molecule-platform-agent-templa
 # the platform-agent TEMPLATE REPO — drift-gate
 # (platform_agent_image_drift_test.go) catches content drift between
 # this COPY source and the image-baked destination.
+#
+# RCA 12124 (DRIVER-ESCALATED live prod identity): the script MUST
+# write /configs/system-prompt.md (the file the
+# conciergeIdentityPresent probe at platform_agent.go:399 reads) —
+# NOT just /configs/prompts/concierge.md. Prior shape had a
+# conditional write (`if [ ! -s "$DST/system-prompt.md" ]`) which
+# could fail to fire after a partial-template run; the fixed script
+# in the template-platform-agent repo (PR-side, merged to template
+# main) is unconditional: always writes /configs/system-prompt.md
+# from prompts/concierge.md + {{CONCIERGE_NAME}} substitution.
 COPY ${PLATFORM_AGENT_TEMPLATE_DIR}/identity-fallback.sh /opt/molecule-platform-agent-template/identity-fallback.sh
 RUN chmod +x /opt/molecule-platform-agent-template/identity-fallback.sh
 
