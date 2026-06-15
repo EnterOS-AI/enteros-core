@@ -313,6 +313,149 @@ jobs:
             fi
           done
 
+  # Staging auto-deploy: every workspace-server image publish on main should
+  # roll out to the staging fleet so code fixes reach staging without a
+  # manual workflow_dispatch. Gitea 1.22.6 does not support workflow_run, so
+  # the redeploy lives in this workflow as a dependent job (guaranteed to run
+  # after the image is published). Closes the deploy-lag where merged fixes
+  # built a new image but never reached staging tenants
+  # (Researcher RCA #2929 comment 103252).
+  deploy-staging:
+    name: Staging auto-deploy
+    needs: build-and-push
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    # Side-effect deploy; image publish success is the durable artifact.
+    continue-on-error: true
+    # Publish/release lane (internal#462) — same reserved capacity as prod.
+    runs-on: publish
+    timeout-minutes: 25
+    env:
+      CP_URL: ${{ vars.STAGING_CP_URL || 'https://staging-api.moleculesai.app' }}
+      CP_STAGING_ADMIN_API_TOKEN: ${{ secrets.CP_STAGING_ADMIN_API_TOKEN }}
+    steps:
+      - name: Wait for ECR tag propagation
+        # ECR replication can lag ~15-30s after the push; mirrors the GHCR
+        # propagation sleep in redeploy-tenants-on-staging.yml.
+        run: sleep 30
+
+      - name: Call staging-CP redeploy-fleet
+        run: |
+          set -euo pipefail
+          if [ -z "${CP_STAGING_ADMIN_API_TOKEN:-}" ]; then
+            echo "::error::staging redeploy cannot run — CP_STAGING_ADMIN_API_TOKEN secret missing"
+            echo "::error::set it at Settings → Secrets and Variables → Actions; pull from staging-CP's CP_ADMIN_API_TOKEN env in Railway."
+            exit 1
+          fi
+          BODY=$(jq -nc \
+            --arg tag "staging-latest" \
+            --arg canary "" \
+            --argjson soak 60 \
+            --argjson batch 3 \
+            --argjson dry false \
+            '{
+              target_tag: $tag,
+              canary_slug: $canary,
+              soak_seconds: $soak,
+              batch_size: $batch,
+              dry_run: $dry,
+              confirm: true
+            }')
+          echo "POST $CP_URL/cp/admin/tenants/redeploy-fleet"
+          echo "  body: $BODY"
+          HTTP_RESPONSE=$(mktemp)
+          HTTP_CODE_FILE=$(mktemp)
+          # Route -w into its own tempfile so curl's exit code (e.g. 56 on
+          # connection-reset) cannot pollute the captured stdout. Same fix
+          # shape as redeploy-tenants-on-staging.yml.
+          set +e
+          curl -sS -o "$HTTP_RESPONSE" -w '%{http_code}' \
+            -m 1200 \
+            -H "Authorization: Bearer $CP_STAGING_ADMIN_API_TOKEN" \
+            -H "Content-Type: application/json" \
+            -X POST "$CP_URL/cp/admin/tenants/redeploy-fleet" \
+            -d "$BODY" >"$HTTP_CODE_FILE"
+          set -e
+          HTTP_CODE=$(cat "$HTTP_CODE_FILE" 2>/dev/null || echo "000")
+          [ -z "$HTTP_CODE" ] && HTTP_CODE="000"
+          echo "HTTP $HTTP_CODE"
+          cat "$HTTP_RESPONSE" | jq . || cat "$HTTP_RESPONSE"
+          {
+            echo "## Staging tenant redeploy fleet"
+            echo ""
+            echo "**Target tag:** \`staging-latest\`"
+            echo "**HTTP:** $HTTP_CODE"
+            echo ""
+            echo "### Per-tenant result"
+            echo ""
+            echo '| Slug | Phase | SSM Status | Exit | Healthz | Error |'
+            echo '|------|-------|------------|------|---------|-------|'
+            jq -r '.results[]? | "| \(.slug) | \(.phase) | \(.ssm_status // "-") | \(.ssm_exit_code) | \(.healthz_ok) | \(.error // "-") |"' "$HTTP_RESPONSE" || true
+          } >> "$GITHUB_STEP_SUMMARY"
+          OK=$(jq -r '.ok // "false"' "$HTTP_RESPONSE")
+          if [ "$HTTP_CODE" != "200" ] || [ "$OK" != "true" ]; then
+            echo "::error::redeploy-fleet reported failure (HTTP $HTTP_CODE ok=$OK)"
+            exit 1
+          fi
+          cp "$HTTP_RESPONSE" "$RUNNER_TEMP/redeploy-response.json"
+
+      - name: Verify each staging tenant /buildinfo matches published SHA
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+          TENANT_DOMAIN: 'staging.moleculesai.app'
+        run: |
+          set -euo pipefail
+          RESP="$RUNNER_TEMP/redeploy-response.json"
+          if [ ! -s "$RESP" ]; then
+            echo "::error::redeploy-response.json missing or empty"
+            exit 1
+          fi
+          mapfile -t SLUGS < <(jq -r '.results[]? | select(.healthz_ok == true) | .slug' "$RESP")
+          if [ ${#SLUGS[@]} -eq 0 ]; then
+            echo "::warning::No staging tenants reported healthz_ok — nothing to verify"
+            exit 0
+          fi
+          echo "Verifying ${#SLUGS[@]} staging tenant(s) against EXPECTED_SHA=${EXPECTED_SHA:0:7}..."
+          SETTLE_BUDGET_SECONDS="240"
+          SETTLE_INTERVAL_SECONDS="20"
+          STALE_COUNT=0
+          UNREACHABLE_COUNT=0
+          for slug in "${SLUGS[@]}"; do
+            url="https://${slug}.${TENANT_DOMAIN}/buildinfo"
+            deadline=$(( $(date +%s) + SETTLE_BUDGET_SECONDS ))
+            actual=""
+            last_actual=""
+            on_target=false
+            while :; do
+              body="$(curl -sS --max-time 30 --retry 3 --retry-delay 5 --retry-connrefused "$url" || true)"
+              actual="$(echo "$body" | jq -r '.git_sha // ""' 2>/dev/null || echo "")"
+              [ -n "$actual" ] && last_actual="$actual"
+              if [ "$actual" = "$EXPECTED_SHA" ]; then
+                on_target=true
+                break
+              fi
+              now=$(date +%s)
+              if [ "$now" -ge "$deadline" ]; then
+                break
+              fi
+              remaining=$(( deadline - now ))
+              echo "$slug: waiting for target SHA (have '${actual:0:7}', want ${EXPECTED_SHA:0:7}; ${remaining}s left)"
+              sleep "$SETTLE_INTERVAL_SECONDS"
+            done
+            if [ "$on_target" = true ]; then
+              echo "$slug: ${actual:0:7}"
+            elif [ -z "$last_actual" ]; then
+              echo "::error::$slug did not return /buildinfo after deploy (waited ${SETTLE_BUDGET_SECONDS}s)."
+              UNREACHABLE_COUNT=$((UNREACHABLE_COUNT + 1))
+            else
+              echo "::error::$slug is stale: actual=${last_actual:0:7}, expected=${EXPECTED_SHA:0:7} (waited ${SETTLE_BUDGET_SECONDS}s)"
+              STALE_COUNT=$((STALE_COUNT + 1))
+            fi
+          done
+          if [ "$STALE_COUNT" -gt 0 ] || [ "$UNREACHABLE_COUNT" -gt 0 ]; then
+            echo "::error::Staging verify failed — stale=$STALE_COUNT unreachable=$UNREACHABLE_COUNT"
+            exit 1
+          fi
+
   # bp-exempt: production deploy side-effect; merge is gated by CI / all-required and this job waits for push CI before acting.
   deploy-production:
     name: Production auto-deploy
