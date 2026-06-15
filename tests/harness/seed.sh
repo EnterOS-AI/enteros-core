@@ -104,6 +104,13 @@ echo "[seed]   beta-child   id=$BETA_CHILD_ID"
 # workspace" for their purposes.)"
     echo "ALPHA_WORKSPACE_ID=$ALPHA_PARENT_ID"
     echo "BETA_WORKSPACE_ID=$BETA_PARENT_ID"
+    # CP_STUB_BASE — the URL the host uses to reach the cp-stub service.
+    # Replays run on the host (./run-all-replays.sh — see compose.yml's
+    # #2867 address-fix), and compose publishes cp-stub's port 9090 to
+    # the host loopback (cp-stub.ports: "9090:9090"). Default to
+    # http://localhost:9090; allow override via env for staging mirrors
+    # where the cp-stub is reachable at a different host/port.
+    echo "CP_STUB_BASE=${CP_STUB_BASE:-http://localhost:9090}"
 } > "$HERE/.seed.env"
 
 echo ""
