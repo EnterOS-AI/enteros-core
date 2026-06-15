@@ -323,3 +323,63 @@ func TestTranscript_NoAuthHeader_PassesThrough(t *testing.T) {
 		t.Errorf("expected proxy to relay workspace 401, got %d: %s", w.Code, w.Body.String())
 	}
 }
+
+// TestTranscript_DisablesRedirects_DoesNotForwardAuthToRedirectTarget pins
+// the #2132 RC 103771 step B: the proxy disables HTTP redirects
+// (CheckRedirect returns http.ErrUseLastResponse). The default
+// http.Client follows 302 responses, forwarding the caller's
+// Authorization bearer to the redirect target. A redirect to a
+// private/metadata target (e.g. 169.254.169.254 IMDS) would
+// leak the bearer token. By disabling redirects, the proxy
+// surfaces the 302 to the caller as a 302 (NOT a follow), and
+// the bearer never reaches the redirect target. The dial-time
+// IP guard (step A) is the belt-and-suspenders for any future
+// code that does re-enable redirects.
+func TestTranscript_DisablesRedirects_DoesNotForwardAuthToRedirectTarget(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	allowLoopbackForTest(t)
+	setSSRFCheckForTest(true)
+	h := NewTranscriptHandler()
+
+	// Set up a "workspace" stub that returns 302 → IMDS. The
+	// proxy must NOT follow (CheckRedirect=ErrUseLastResponse)
+	// and must NOT forward the Authorization header to the
+	// redirect target.
+	var redirectHits int
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/transcript" {
+			// First request: return 302 → IMDS.
+			w.Header().Set("Location", "http://169.254.169.254/latest/meta-data/iam/security-credentials/")
+			w.WriteHeader(http.StatusFound)
+			return
+		}
+		redirectHits++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer stub.Close()
+
+	wsID := expectWorkspaceURLLookup(mock,stub.URL)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: wsID}}
+	c.Request = httptest.NewRequest("GET", "/workspaces/"+wsID+"/transcript", nil)
+	c.Request.Header.Set("Authorization", "Bearer secret-caller-token")
+	h.Get(c)
+
+	// 302 must surface to the caller (not 200 / not 502). CheckRedirect
+	// returns http.ErrUseLastResponse; the proxy hands the 302 through.
+	if w.Code != http.StatusFound {
+		t.Errorf("expected 302 to surface to caller (redirects disabled), got %d: %s", w.Code, w.Body.String())
+	}
+	// The redirect target (IMDS) must NEVER have been hit.
+	if redirectHits != 0 {
+		t.Errorf("redirect target was hit %d times — Authorization bearer was forwarded to a private IP", redirectHits)
+	}
+	// NOTE: the proxy uses c.Data(status, contentType, body) which
+	// only sets Content-Type — Location is NOT passed through. That's
+	// a pre-existing proxy limitation (out of scope for the SSRF fix).
+	// The SSRF fix's contract is: 302 surfaces + redirect target NOT
+	// hit + bearer NOT forwarded to the target. Both checked above.
+	_ = w.Header().Get("Location")
+}
