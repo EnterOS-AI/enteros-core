@@ -97,10 +97,26 @@ type WorkspaceHandler struct {
 	// main.go attaches this alongside namespaceCleanupFn when
 	// MEMORY_PLUGIN_URL is set (memBundle.Plugin).
 	seedMemoryPlugin seedMemoryPluginAPI
+	// deadProbeMu guards deadProbeAttempts, the per-workspace debounce
+	// state used by maybeMarkContainerDead. A transient A2A forward error
+	// or a single flaky IsRunning probe must not recycle a recently-alive
+	// container (#2929). Protected because ProxyA2A is called concurrently.
+	deadProbeMu sync.Mutex
+	deadProbeAttempts map[string]deadProbeRecord
+
 	// asyncWG tracks goroutines launched by goAsync so tests can wait
 	// for async DB users (restart, provision) before asserting results.
 	// Matches the pattern from main commit 1c3b4ff3.
 	asyncWG sync.WaitGroup
+}
+
+// deadProbeRecord tracks consecutive "container looks dead" observations
+// for a workspace. first marks the initial observation in the current
+// window; count is the number of observations since first.
+type deadProbeRecord struct {
+	count int
+	first time.Time
+	last  time.Time
 }
 
 // seedMemoryPluginAPI is the slice of the v2 memory plugin client that
@@ -186,9 +202,10 @@ func waitGlobalAsyncForTest() {
 
 func NewWorkspaceHandler(b events.EventEmitter, p *provisioner.Provisioner, platformURL, configsDir string) *WorkspaceHandler {
 	h := &WorkspaceHandler{
-		broadcaster: b,
-		platformURL: platformURL,
-		configsDir:  configsDir,
+		broadcaster:       b,
+		platformURL:       platformURL,
+		configsDir:        configsDir,
+		deadProbeAttempts: make(map[string]deadProbeRecord),
 	}
 	// Only assign p when the concrete pointer is non-nil. Without this
 	// guard, a `NewWorkspaceHandler(..., nil, ...)` call (which all the
