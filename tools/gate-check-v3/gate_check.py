@@ -519,6 +519,12 @@ def _label_appliers(pr_number: int, repo: str) -> dict[str, set[str]]:
     for event in events:
         if event.get("type") != "label":
             continue
+        # Gitea encodes label ADD as body="1" and label REMOVE as body="".
+        # Only ADD events count as applying the label; counting removals would
+        # let a non-author who *removed* an exempt label enable an author who
+        # re-added it — inverting the self-exemption guard (core#2884).
+        if (event.get("body") or "") != "1":
+            continue
         label = event.get("label") or {}
         label_name = (label.get("name") or "").lower()
         user = (event.get("user") or {}).get("login", "")

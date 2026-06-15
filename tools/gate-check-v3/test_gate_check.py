@@ -802,6 +802,64 @@ def test_signal_7_author_self_applied_refactor_label_does_not_exempt(monkeypatch
     assert "destructive diff" in result["reason"]
 
 
+def test_signal_7_non_author_label_remove_does_not_enable_author_self_exempt(monkeypatch):
+    """core#2884 follow-up: a non-author who REMOVED the exempt label must
+    not be counted as an applier. If the only non-author timeline event is a
+    removal, the author-applied label is still treated as self-exempt and the
+    destructive diff remains BLOCKED."""
+    mod = load_gate_check()
+    monkeypatch.setattr(mod, "signal_4_branch_divergence", lambda *a, **kw: {
+        "signal": "branch_divergence", "verdict": "WARNING",
+        "diverged": True, "commits_behind": 25, "pr_files_count": 250,
+        "inherited_files": [], "new_work_files": [], "inherited_fraction": 0.5,
+    })
+    monkeypatch.setattr(mod, "_pr_diff_stats", lambda *a, **kw: {
+        "files_changed": 481, "added_lines": 1000, "deleted_lines": 55800, "net_deleted_lines": 54800,
+    })
+    # Timeline has a removal by a non-author but no non-author ADD.
+    # The helper filters removals, so only the author add remains.
+    monkeypatch.setattr(mod, "_label_appliers", lambda *a, **kw: {"refactor": {"agent-dev-a"}})
+    result = mod.signal_7_destructive_diff_guard(
+        200, "molecule-ai/molecule-core",
+        pr_data={
+            "user": {"login": "agent-dev-a"},
+            "labels": [{"name": "refactor"}],
+        },
+    )
+    assert result["verdict"] == "BLOCKED"
+    assert result["refactor_exemption"] is False
+
+
+def test_label_appliers_ignores_label_removals(monkeypatch):
+    """_label_appliers must only count label ADD events (body=='1'), not
+    removals (body==''), so a non-author removal cannot bypass the actor check."""
+    mod = load_gate_check()
+
+    def fake_api_list(path):
+        if path == "/repos/molecule-ai/molecule-core/issues/200/timeline":
+            return [
+                {
+                    "id": 1,
+                    "type": "label",
+                    "body": "1",  # ADD by author
+                    "user": {"login": "agent-dev-a"},
+                    "label": {"name": "refactor"},
+                },
+                {
+                    "id": 2,
+                    "type": "label",
+                    "body": "",  # REMOVE by non-author — must be ignored
+                    "user": {"login": "core-lead"},
+                    "label": {"name": "refactor"},
+                },
+            ]
+        raise AssertionError(f"unexpected api_list: {path}")
+
+    monkeypatch.setattr(mod, "api_list", fake_api_list)
+    appliers = mod._label_appliers(200, "molecule-ai/molecule-core")
+    assert appliers == {"refactor": {"agent-dev-a"}}
+
+
 def test_signal_7_refactor_exemption_rejected_when_timeline_unavailable(monkeypatch):
     """If the timeline API cannot prove a non-author applied the label,
     fail closed and do not honor the exemption."""
