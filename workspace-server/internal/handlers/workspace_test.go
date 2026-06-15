@@ -958,6 +958,14 @@ func TestWorkspaceUpdate_RuntimeField(t *testing.T) {
 	mock.ExpectQuery("SELECT EXISTS.*workspaces WHERE id").
 		WithArgs("cccccccc-0006-0000-0000-000000000000").
 		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+	// New (newRuntime, currentModel) compatibility check (#2926):
+	// the PATCH-runtime path now reads the current model + validates
+	// (runtime, model) against the provider registry. moonshot/kimi-k2.6
+	// is registered for claude-code in the harness's provider registry
+	// (providers.yaml:919) so the validation passes + the UPDATE proceeds.
+	mock.ExpectQuery(`SELECT COALESCE\(model, ''\) FROM workspaces WHERE id = \$1`).
+		WithArgs("cccccccc-0006-0000-0000-000000000000").
+		WillReturnRows(sqlmock.NewRows([]string{"model"}).AddRow("moonshot/kimi-k2.6"))
 	mock.ExpectExec("UPDATE workspaces SET runtime").
 		WithArgs("cccccccc-0006-0000-0000-000000000000", "claude-code").
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -997,6 +1005,14 @@ func TestWorkspaceUpdate_RuntimeField_DBErrorReturnsServerError(t *testing.T) {
 	mock.ExpectQuery("SELECT EXISTS.*workspaces WHERE id").
 		WithArgs("cccccccc-0006-0000-0000-000000000001").
 		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+	// New (newRuntime, currentModel) compatibility check (#2926):
+	// the SELECT COALESCE must succeed (the UPDATE is the one that
+	// errors out). moonshot/kimi-k2.6 is registered for hermes
+	// (providers.yaml:919) so the validation passes + the UPDATE is
+	// attempted, where the sqlmock is set to return the DB error.
+	mock.ExpectQuery(`SELECT COALESCE\(model, ''\) FROM workspaces WHERE id = \$1`).
+		WithArgs("cccccccc-0006-0000-0000-000000000001").
+		WillReturnRows(sqlmock.NewRows([]string{"model"}).AddRow("moonshot/kimi-k2.6"))
 	mock.ExpectExec("UPDATE workspaces SET runtime").
 		WithArgs("cccccccc-0006-0000-0000-000000000001", "hermes").
 		WillReturnError(errors.New("database unavailable"))

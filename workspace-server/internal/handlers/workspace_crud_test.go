@@ -626,14 +626,14 @@ func TestUpdate_Runtime_RegisteredModelForRuntime_Passes(t *testing.T) {
 	}
 }
 
-// TestUpdate_Runtime_UnroutableModel_Fails400 pins the (runtime, model)
+// TestUpdate_Runtime_UnroutableModel_Fails422 pins the (runtime, model)
 // compatibility check REJECT path: the new runtime + current model pair
 // is unroutable (the model isn't registered for that runtime AND no
-// provider prefix-matches a native arm). Rejected with 400 + the
+// provider prefix-matches a native arm). Rejected with 422 + the
 // registry-SSOT reason. The PATCH does NOT update the DB (the UPDATE
 // exec is NOT mocked, so unmet-expectations would fire if the UPDATE
-// happened — but we only check the 400 response code here).
-func TestUpdate_Runtime_UnroutableModel_Fails400(t *testing.T) {
+// happened — but we only check the 422 response code here).
+func TestUpdate_Runtime_UnroutableModel_Fails422(t *testing.T) {
 	wsID := "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 	mock, r := setupWorkspaceCrudTest(t)
 	h := newWorkspaceCrudHandler(t)
@@ -659,8 +659,14 @@ func TestUpdate_Runtime_UnroutableModel_Fails400(t *testing.T) {
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
-	if w.Code != http.StatusBadRequest {
-		t.Errorf("expected 400 (unroutable (runtime, model)), got %d: %s", w.Code, w.Body.String())
+	// 422 (Unprocessable Entity) matches the create-boundary's
+	// validateRegisteredModelForRuntime path (secrets.go:942, 952 +
+	// workspace_crud.go create) — 422-align per CR2 + Researcher's
+	// review on the 400→422 consistency ask. Precise semantic: the
+	// PATCH body is syntactically valid, but the (runtime, model) pair
+	// is unroutable per the registry SSOT.
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Errorf("expected 422 (unroutable (runtime, model)), got %d: %s", w.Code, w.Body.String())
 	}
 	// The UPDATE should NOT have fired. ExpectationsWereMet is
 	// informational (the unmet-expectations log would surface in

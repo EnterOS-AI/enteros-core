@@ -269,7 +269,13 @@ func (h *WorkspaceHandler) Update(c *gin.Context) {
 		if ok, reason := validateRegisteredModelForRuntime(runtime.(string), currentModel.String); !ok {
 			log.Printf("Update: PATCH runtime=%q on %s REJECTED (model=%q is not registered for that runtime): %s",
 				runtime.(string), id, currentModel.String, reason)
-			c.JSON(http.StatusBadRequest, gin.H{"error": reason})
+			// 422 (Unprocessable Entity) matches the create-boundary's
+			// validateRegisteredModelForRuntime path (secrets.go:942, 952
+			// + workspace_crud.go create) — both reviewers flagged the
+			// original 400 as inconsistent. 422 = "syntactically valid
+			// PATCH body, but the (runtime, model) pair is unroutable
+			// per the registry SSOT", which is the precise semantic.
+			c.JSON(http.StatusUnprocessableEntity, gin.H{"error": reason})
 			return
 		}
 		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET runtime = $2, updated_at = now() WHERE id = $1`, id, runtime); err != nil {
