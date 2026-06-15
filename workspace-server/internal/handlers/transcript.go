@@ -12,6 +12,8 @@ package handlers
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -142,11 +144,27 @@ func safeDialControl(network, address string, _ syscall.RawConn) error {
 		// an unresolved hostname (Go's dialer normally resolves
 		// first, but custom resolvers can defer). Re-resolve here
 		// so the SSRF policy is still applied.
-		if ips, lookupErr := net.LookupIP(host); lookupErr == nil {
-			for _, candidate := range ips {
-				if safeErr := isSafeURL("http://" + candidate.String() + "/"); safeErr != nil {
-					return &ssrfDialError{ip: candidate, reason: safeErr}
-				}
+		//
+		// FAIL-CLOSED hardening (Researcher RC 103980/12169, non-blocking
+		// nit on merged #2967): if LookupIP errored OR returned an
+		// empty result, treat the hostname as UNSAFE and block the
+		// dial. The prior code's fall-through `return nil` would have
+		// let an unresolvable / empty-result hostname through, which
+		// is a fail-open. The SSRF policy is deny-by-default — a
+		// hostname we can't positively verify is safe is treated as
+		// unsafe.
+		ips, lookupErr := net.LookupIP(host)
+		if lookupErr != nil {
+			log.Printf("safeDialControl: hostname %q LookupIP errored: %v (treating as unsafe — FAIL-CLOSED)", host, lookupErr)
+			return &ssrfDialError{host: host, reason: fmt.Errorf("hostname resolution failed: %w", lookupErr)}
+		}
+		if len(ips) == 0 {
+			log.Printf("safeDialControl: hostname %q LookupIP returned no addresses (treating as unsafe — FAIL-CLOSED)", host)
+			return &ssrfDialError{host: host, reason: errors.New("hostname resolution returned no addresses")}
+		}
+		for _, candidate := range ips {
+			if safeErr := isSafeURL("http://" + candidate.String() + "/"); safeErr != nil {
+				return &ssrfDialError{ip: candidate, reason: safeErr}
 			}
 		}
 		return nil
@@ -158,19 +176,31 @@ func safeDialControl(network, address string, _ syscall.RawConn) error {
 }
 
 // ssrfDialError is the error type returned by safeDialControl when
-// the resolved IP fails the isSafeURL policy. The error message
-// includes the IP and the policy reason so the platform log
-// surfaces the SSRF attempt (the workspace agent_card.url
-// embedding attack in #2132 / RC 103771). Returned from
-// net.Dialer.Control, so it propagates out of DialContext as the
-// dial error — the http.Client surfaces it to the caller.
+// the resolved IP fails the isSafeURL policy, OR when the hostname
+// could not be resolved (LookupIP error / empty result) and the
+// dial-time guard is failing closed. The error message includes the
+// IP (when known) OR the hostname (when the IP couldn't be resolved)
+// plus the policy reason so the platform log surfaces the SSRF
+// attempt (the workspace agent_card.url embedding attack in
+// #2132 / RC 103771, and the unresolvable-hostname fail-closed
+// hardening in RC 103980/12169). Returned from net.Dialer.Control,
+// so it propagates out of DialContext as the dial error — the
+// http.Client surfaces it to the caller.
 type ssrfDialError struct {
-	ip     net.IP
+	ip     net.IP   // set when the IP is known (blocked-IP case)
+	host   string   // set when the hostname couldn't be resolved (LookupIP error / empty)
 	reason error
 }
 
 func (e *ssrfDialError) Error() string {
-	return "ssrf: dial-time IP " + e.ip.String() + " blocked: " + e.reason.Error()
+	switch {
+	case e.ip != nil:
+		return "ssrf: dial-time IP " + e.ip.String() + " blocked: " + e.reason.Error()
+	case e.host != "":
+		return "ssrf: dial-time hostname " + e.host + " blocked: " + e.reason.Error()
+	default:
+		return "ssrf: dial-time target blocked: " + e.reason.Error()
+	}
 }
 
 // Get handles GET /workspaces/:id/transcript?since=N&limit=N.
