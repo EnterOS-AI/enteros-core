@@ -590,6 +590,10 @@ func main() {
 	// require a plugins/ dir on disk (nil in CP/SaaS mode).
 	pluginRegistry := plugins.NewRegistry()
 	pluginRegistry.Register(plugins.NewGithubResolver())
+	// gitea:// — private-repo-subpath resolver used by declared plugins
+	// (RFC#2843). Shared with the drift sweeper so gitea-sourced plugins
+	// get drift detection too.
+	pluginRegistry.Register(plugins.NewGiteaResolver())
 	refreshTemplatesHTTP := func(c *gin.Context) (any, error) {
 		ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Minute)
 		defer cancel()

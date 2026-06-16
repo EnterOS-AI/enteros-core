@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -75,6 +76,16 @@ func (r *LocalResolver) Fetch(ctx context.Context, spec string, dst string) (str
 
 // copyTree does a recursive copy honouring ctx cancellation. Avoids a
 // dependency on os/exec (no need to shell out to cp).
+//
+// Symlinks are SKIPPED, not followed. filepath.Walk reports a symlink as a
+// non-directory entry, and copyFile uses os.Open (which follows symlinks) —
+// so a committed symlink in the source tree (e.g. `leak.txt -> /etc/passwd`
+// or `-> ../../SECRET`) would otherwise copy the TARGET's content into the
+// staged plugin dir, escaping the source subtree. We Lstat each entry and
+// skip symlinks with a warning rather than hard-failing: a template author's
+// stray symlink shouldn't block an otherwise-valid install, and a skipped
+// link simply means the (untrusted) link target is never read. The Walk-
+// supplied info is from os.Lstat already, so we can use it directly.
 func copyTree(ctx context.Context, src, dst string) error {
 	return filepath.Walk(src, func(path string, info os.FileInfo, walkErr error) error {
 		if walkErr != nil {
@@ -82,6 +93,13 @@ func copyTree(ctx context.Context, src, dst string) error {
 		}
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		// filepath.Walk lstats entries, so info already reflects the link
+		// itself (not its target). Skip any symlink so we never read through
+		// it into content outside the source subtree.
+		if info.Mode()&os.ModeSymlink != 0 {
+			log.Printf("plugins: copyTree skipping symlink %q (symlinks are not followed for safety)", path)
+			return nil
 		}
 		rel, err := filepath.Rel(src, path)
 		if err != nil {

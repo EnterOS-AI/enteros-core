@@ -82,6 +82,91 @@ func recordWorkspacePluginInstall(
 	return err
 }
 
+// DeclaredPlugin is a (plugin_name, source_raw) pair from a workspace's
+// DECLARED plugin set (workspace_declared_plugins). source_raw is the full
+// source-contract string the template put in `plugins:` and is passed verbatim
+// to the install pipeline by the post-online reconcile (RFC#2843).
+type DeclaredPlugin struct {
+	PluginName string
+	SourceRaw  string
+}
+
+// recordDeclaredPlugin upserts a row in workspace_declared_plugins. Called at
+// org/import time (org_import.go) for each merged plugin entry so the
+// post-online reconcile knows the DESIRED plugin set. Idempotent:
+// ON CONFLICT refreshes source_raw (a re-import with a moved ref updates it).
+func recordDeclaredPlugin(ctx context.Context, workspaceID, pluginName, sourceRaw string) error {
+	if workspaceID == "" || pluginName == "" || sourceRaw == "" {
+		return errors.New("recordDeclaredPlugin: missing required field")
+	}
+	if db.DB == nil {
+		return nil // nil in unit tests; declaration is test-only there
+	}
+	_, err := db.DB.ExecContext(ctx, `
+		INSERT INTO workspace_declared_plugins (workspace_id, plugin_name, source_raw)
+		VALUES ($1, $2, $3)
+		ON CONFLICT (workspace_id, plugin_name)
+		DO UPDATE SET source_raw = EXCLUDED.source_raw, updated_at = NOW()
+	`, workspaceID, pluginName, sourceRaw)
+	return err
+}
+
+// listDeclaredPlugins returns the declared plugin set for a workspace. The
+// reconcile diffs this against the installed set (workspace_plugins) to find
+// what to install. Returns an empty slice (not an error) when the workspace
+// has no declarations — the common case for workspaces with no plugins.
+func listDeclaredPlugins(ctx context.Context, workspaceID string) ([]DeclaredPlugin, error) {
+	if db.DB == nil {
+		return nil, nil
+	}
+	rows, err := db.DB.QueryContext(ctx, `
+		SELECT plugin_name, source_raw
+		  FROM workspace_declared_plugins
+		 WHERE workspace_id = $1
+		 ORDER BY plugin_name
+	`, workspaceID)
+	if err != nil {
+		return nil, fmt.Errorf("listDeclaredPlugins: query: %w", err)
+	}
+	defer rows.Close()
+	var out []DeclaredPlugin
+	for rows.Next() {
+		var d DeclaredPlugin
+		if scanErr := rows.Scan(&d.PluginName, &d.SourceRaw); scanErr != nil {
+			return nil, fmt.Errorf("listDeclaredPlugins: scan: %w", scanErr)
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// listInstalledPluginNames returns the set of plugin names already recorded as
+// installed for a workspace (workspace_plugins). The reconcile treats a name
+// present here as "installed" and skips it — the DB record is the backend-
+// agnostic install SSOT (written by both the Docker and EIC install paths),
+// so the reconcile doesn't need to exec into the container to diff.
+func listInstalledPluginNames(ctx context.Context, workspaceID string) (map[string]bool, error) {
+	out := map[string]bool{}
+	if db.DB == nil {
+		return out, nil
+	}
+	rows, err := db.DB.QueryContext(ctx, `
+		SELECT plugin_name FROM workspace_plugins WHERE workspace_id = $1
+	`, workspaceID)
+	if err != nil {
+		return nil, fmt.Errorf("listInstalledPluginNames: query: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		if scanErr := rows.Scan(&name); scanErr != nil {
+			return nil, fmt.Errorf("listInstalledPluginNames: scan: %w", scanErr)
+		}
+		out[name] = true
+	}
+	return out, rows.Err()
+}
+
 // deleteWorkspacePluginRow removes the workspace_plugins row for a workspace/plugin
 // pair. Called by the uninstall path so the row doesn't persist with a stale
 // installed_sha after the plugin has been removed from the container.

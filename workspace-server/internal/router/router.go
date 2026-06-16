@@ -743,6 +743,12 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 	plgh := handlers.NewPluginsHandler(pluginsDir, dockerCli, wh.RestartByID).
 		WithRuntimeLookup(runtimeLookup).
 		WithInstanceIDLookup(instanceIDLookup)
+	// RFC#2843 #32: wire the post-online declared-plugin reconcile into the
+	// registry heartbeat handler. plgh is constructed after rh, so this
+	// late-wiring (same pattern as rh.SetQueueDrainFunc above) is where the
+	// hook lands. Declared plugins now install dynamically on transition-to-
+	// online via the install pipeline, NOT through the provisioning channel.
+	rh.SetReconcileFunc(plgh.ReconcileWorkspacePlugins)
 	r.GET("/plugins", plgh.ListRegistry)
 	r.GET("/plugins/sources", plgh.ListSources)
 	wsAuth.GET("/plugins", plgh.ListInstalled)

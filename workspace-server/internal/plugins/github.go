@@ -146,6 +146,35 @@ func (r *GithubResolver) Fetch(ctx context.Context, spec string, dst string) (st
 	return repo, nil
 }
 
+// credUserinfoRE matches the "user:pass@" (or "user@") userinfo component of a
+// URL so we can strip embedded credentials before they reach a log line. The
+// Gitea/GitHub resolvers inject a read-only PAT into the clone URL's userinfo
+// (scheme://<token>:x-oauth-basic@host/...); on a clone/fetch failure the raw
+// tokenized URL would otherwise be formatted into the wrapped error (which is
+// logged server-side). Matches any scheme, requires "//" so we don't clobber
+// e.g. "scp-style" host:path or unrelated "@" in commit messages.
+var credUserinfoRE = regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.\-]*://)[^/@\s]*@`)
+
+// redactURLCreds replaces "scheme://user:pass@host" with "scheme://***@host"
+// in s, so a token injected into a clone URL's userinfo never reaches a log
+// line. Applied to BOTH the git args and the captured output inside the git
+// runners — this is the single chokepoint every resolver (gitea Fetch,
+// ResolveRef, drift sweeper, github resolver) flows through, so redacting here
+// covers every call path at the source.
+func redactURLCreds(s string) string {
+	return credUserinfoRE.ReplaceAllString(s, "${1}***@")
+}
+
+// redactArgs returns a copy of args with any embedded URL credentials redacted.
+// Never mutates the caller's slice.
+func redactArgs(args []string) []string {
+	out := make([]string, len(args))
+	for i, a := range args {
+		out[i] = redactURLCreds(a)
+	}
+	return out
+}
+
 // runGitOneLine runs git with args in dir and returns stdout trimmed.
 // Returns "" on error (caller decides whether to treat it as fatal).
 func runGitOneLine(ctx context.Context, dir string, args ...string) (string, error) {
@@ -159,7 +188,10 @@ func runGitOneLine(ctx context.Context, dir string, args ...string) (string, err
 	cmd.Env = childEnv
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return "", fmt.Errorf("git %v: %w (output: %s)", args, err, string(out))
+		// Redact any token embedded in the URL userinfo from BOTH the args and
+		// the git output before it lands in a (server-side-logged) error.
+		return "", fmt.Errorf("git %v: %w (output: %s)",
+			redactArgs(args), err, redactURLCreds(string(out)))
 	}
 	return string(out), nil
 }
@@ -186,7 +218,13 @@ func defaultGitRunner(ctx context.Context, dir string, args ...string) error {
 	cmd.Env = childEnv
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("git %v: %w (output: %s)", args, err, string(out))
+		// Redact any token embedded in the URL userinfo from BOTH the args and
+		// the git output before it propagates into a (server-side-logged)
+		// error. This is the source-of-truth chokepoint: every resolver call
+		// path (gitea Fetch/ResolveRef, drift sweeper, github resolver) wraps
+		// this error, so redacting here covers them all.
+		return fmt.Errorf("git %v: %w (output: %s)",
+			redactArgs(args), err, redactURLCreds(string(out)))
 	}
 	return nil
 }

@@ -1,17 +1,22 @@
 name: template-delivery-e2e
 
 # RFC #2843 regression gate — provisions a fresh tenant + fresh seo-agent and
-# asserts the template-asset channel actually delivers config + prompts +
-# agent-skills + model end to end. This is the gate that would have caught the
-# 2026-06-15 incident family (#2919 model/identity drop + #32 skill drop):
-# nothing else in CI provisions a fresh agent and inspects the DELIVERED
-# /configs.
+# asserts BOTH delivery channels work end to end. This is the gate that would
+# have caught the 2026-06-15 incident family (#2919 model/identity drop + #32
+# skill drop): nothing else in CI provisions a fresh agent and inspects the
+# DELIVERED /configs.
+#
+# TWO CHANNELS (post-decoupling, RFC #2843 #32):
+#   - TEMPLATE-ASSET channel (provisioning-time): config.yaml + prompts + model.
+#   - DYNAMIC PLUGIN channel (post-online): agent-skills are PLUGINS — the
+#     seo-agent declares seo-all and the post-online reconcile installs it to
+#     /configs/plugins/seo-all/. The e2e asserts the skill arrives via the
+#     PLUGIN channel and NOT the asset channel (negative control).
 #
 # STAGED ROLLOUT (do NOT make required until green):
-#   Phase 1 (now): advisory — runs on the relevant paths + main + dispatch,
-#                  reports RED while the delivery bugs (#2955, #32) are open.
-#                  This proves the gate correctly DETECTS the bug.
-#   Phase 2 (after #2955 + #32 land + this goes green twice): remove
+#   Phase 1 (now): advisory — runs on the relevant paths + main + dispatch.
+#                  Asserts the new two-channel contract.
+#   Phase 2 (after this goes green twice on the new contract): remove
 #                  continue-on-error and add this check to branch protection
 #                  required_status_checks so a future delivery regression is
 #                  merge-blocking.
@@ -30,6 +35,11 @@ on:
       - 'workspace-server/internal/provisioner/cp_provisioner.go'
       - 'workspace-server/internal/handlers/platform_agent.go'
       - 'workspace-server/cmd/server/main.go'
+      - 'workspace-server/internal/handlers/org_import.go'
+      - 'workspace-server/internal/handlers/plugins_reconcile.go'
+      - 'workspace-server/internal/handlers/plugins_install_pipeline.go'
+      - 'workspace-server/internal/handlers/plugins_tracking.go'
+      - 'workspace-server/internal/plugins/source.go'
       - 'manifest.json'
       - 'tests/e2e/test_template_delivery_e2e.sh'
       - '.gitea/workflows/template-delivery-e2e.yml'
@@ -40,6 +50,11 @@ on:
       - 'workspace-server/internal/provisioner/cp_provisioner.go'
       - 'workspace-server/internal/handlers/platform_agent.go'
       - 'workspace-server/cmd/server/main.go'
+      - 'workspace-server/internal/handlers/org_import.go'
+      - 'workspace-server/internal/handlers/plugins_reconcile.go'
+      - 'workspace-server/internal/handlers/plugins_install_pipeline.go'
+      - 'workspace-server/internal/handlers/plugins_tracking.go'
+      - 'workspace-server/internal/plugins/source.go'
       - 'manifest.json'
       - 'tests/e2e/test_template_delivery_e2e.sh'
       - '.gitea/workflows/template-delivery-e2e.yml'
@@ -53,7 +68,8 @@ jobs:
     name: Template-asset delivery (fresh seo-agent boots WITH skills)
     runs-on: ubuntu-latest
     # Phase 1: advisory. Remove this line in Phase 2 to make it merge-blocking.
-    continue-on-error: true
+    # mc#2996 — Phase 2 promotion tracker (remove continue-on-error; forced 14d renewal cadence).
+    continue-on-error: true  # mc#2996
     timeout-minutes: 30
     env:
       MOLECULE_CP_URL: ${{ vars.CP_URL || 'https://staging-api.moleculesai.app' }}

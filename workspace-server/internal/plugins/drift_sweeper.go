@@ -139,11 +139,11 @@ func sweepDriftOnce(parent context.Context, resolver PluginResolver) {
 
 	for rows.Next() {
 		var row struct {
-			id          string
-			workspaceID string
-			pluginName  string
-			sourceRaw   string
-			trackedRef  string
+			id           string
+			workspaceID  string
+			pluginName   string
+			sourceRaw    string
+			trackedRef   string
 			installedSHA string
 		}
 		if scanErr := rows.Scan(&row.id, &row.workspaceID, &row.pluginName,
@@ -213,6 +213,19 @@ func resolveLatestSHA(ctx context.Context, resolver PluginResolver, sourceRaw, t
 		spec = strings.SplitN(spec, "#", 2)[0] + refSuffix
 	} else {
 		spec = spec + refSuffix
+	}
+
+	// Pick the resolver by scheme. gitea:// sources (private-repo-subpath,
+	// RFC#2843) need the GiteaResolver — it injects the PAT and clones the
+	// right host; the GithubResolver would clone github.com and 404. Default
+	// to github for github:// and any other git-backed scheme.
+	if strings.HasPrefix(sourceRaw, "gitea://") {
+		gt := NewGiteaResolver()
+		resolvedSHA, err := gt.ResolveRef(ctx, spec)
+		if err != nil {
+			return "", fmt.Errorf("resolve %s: %w", spec, err)
+		}
+		return resolvedSHA, nil
 	}
 
 	// Use the github resolver directly — it handles the fetch + rev-parse.

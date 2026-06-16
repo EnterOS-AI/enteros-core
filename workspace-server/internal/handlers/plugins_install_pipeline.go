@@ -167,15 +167,15 @@ func (h *PluginsHandler) resolveAndStage(ctx context.Context, req installRequest
 		}
 	}
 
-	// Pinned-ref enforcement for github:// sources (SAFE-T1102).
+	// Pinned-ref enforcement for git-backed sources (SAFE-T1102).
 	// An unpinned spec (no #<tag/sha> suffix) installs from a mutable
 	// default-branch tip whose content can change silently between an
 	// audit and the actual install. Require explicit pinning unless the
 	// operator opts in via PLUGIN_ALLOW_UNPINNED=true.
-	if source.Scheme == "github" && !strings.Contains(source.Spec, "#") {
+	if (source.Scheme == "github" || source.Scheme == "gitea") && !strings.Contains(source.Spec, "#") {
 		if os.Getenv("PLUGIN_ALLOW_UNPINNED") != "true" {
 			return nil, newHTTPErr(http.StatusUnprocessableEntity, gin.H{
-				"error":  `unpinned github source: append a tag or commit SHA (e.g. "github://owner/repo#v1.2.0"). Set PLUGIN_ALLOW_UNPINNED=true to override`,
+				"error":  `unpinned plugin source: append a tag or commit SHA (e.g. "` + source.Scheme + `://owner/repo#v1.2.0"). Set PLUGIN_ALLOW_UNPINNED=true to override`,
 				"source": source.Raw(),
 			})
 		}
@@ -212,13 +212,13 @@ func (h *PluginsHandler) resolveAndStage(ctx context.Context, req installRequest
 		})
 	}
 
-	// Capture the installed SHA from github:// sources for drift detection.
-	// GithubResolver.LastSHA() is set by Fetch after a successful clone.
-	// Type-assert is safe because resolver was obtained via Resolve(), which
-	// returns the concrete GithubResolver for github:// sources.
+	// Capture the installed SHA from git-backed sources for drift detection.
+	// The resolver sets LastSHA() during Fetch after a successful clone. Both
+	// GithubResolver and GiteaResolver expose it; type-assert against a small
+	// interface so adding a third git-backed scheme later needs no change here.
 	var installedSHA string
-	if gh, ok := resolver.(*plugins.GithubResolver); ok {
-		installedSHA = gh.LastSHA()
+	if sha, ok := resolver.(interface{ LastSHA() string }); ok {
+		installedSHA = sha.LastSHA()
 	}
 
 	if err := validatePluginName(pluginName); err != nil {

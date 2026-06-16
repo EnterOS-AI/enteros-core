@@ -235,12 +235,25 @@ func TestPlatformAgentImageDriftGate(t *testing.T) {
 
 	for _, rel := range expectedImageBakedFiles {
 		// The Dockerfile uses two patterns: COPY <rel> /opt/...
-		// for the top-level files (config.yaml, mcp_servers.yaml)
-		// and COPY <dir>/ /opt/.../  for the prompts/ directory.
-		// We check that EITHER pattern appears for the expected file.
-		topLevel := `COPY ${PLATFORM_AGENT_TEMPLATE_DIR}/` + rel
-		dirPattern := `COPY ${PLATFORM_AGENT_TEMPLATE_DIR}/` + filepath.Dir(rel) + `/`
-		if !strings.Contains(dockerfileStr, topLevel) && !strings.Contains(dockerfileStr, dirPattern) {
+		// for the top-level files (config.yaml, mcp_servers.yaml,
+		// identity-fallback.sh) and COPY <dir>/ /opt/.../ for the
+		// prompts/ directory. We check that EITHER pattern appears
+		// for the expected file.
+		//
+		// COPY may carry build-flags between the verb and the source
+		// arg — e.g. `COPY --chmod=0755 ${PLATFORM_AGENT_TEMPLATE_DIR}/
+		// identity-fallback.sh ...` (e4efc35d switched identity-
+		// fallback.sh from `RUN chmod` to `COPY --chmod` because the
+		// non-root tenant base can't `RUN chmod`). The matcher must
+		// tolerate any such `--flag[=value]` tokens; a literal-substring
+		// match on `COPY ${...}/` would false-fail the drift-gate the
+		// moment a COPY grows a flag. Match `COPY` + optional flags +
+		// the source path via regex (whitespace-flexible).
+		quotedDir := regexp.QuoteMeta(`${PLATFORM_AGENT_TEMPLATE_DIR}/`)
+		copyFlags := `(?:\s+--\S+)*` // zero or more `--flag[=val]` tokens
+		topLevel := regexp.MustCompile(`COPY` + copyFlags + `\s+` + quotedDir + regexp.QuoteMeta(rel) + `\b`)
+		dirPattern := regexp.MustCompile(`COPY` + copyFlags + `\s+` + quotedDir + regexp.QuoteMeta(filepath.Dir(rel)) + `/`)
+		if !topLevel.MatchString(dockerfileStr) && !dirPattern.MatchString(dockerfileStr) {
 			t.Errorf("Dockerfile COPY missing: %s — the IMAGE-BAKED impl must COPY %s from the platform-agent template SSOT; if a new identity file is added, update Dockerfile.platform-agent AND expectedImageBakedFiles", rel, rel)
 		}
 	}

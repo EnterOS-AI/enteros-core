@@ -212,6 +212,87 @@ func TestDefaultGitRunner_UsesWorkingDirHomeFallback(t *testing.T) {
 	}
 }
 
+// ---- B1: PAT redaction in error / log output (SAFE; reviewer repro) ----
+
+// TestRedactURLCreds_StripsToken asserts redactURLCreds removes a token
+// embedded in the URL userinfo while keeping the rest of the message.
+func TestRedactURLCreds_StripsToken(t *testing.T) {
+	const tok = "SUPERSECRET-TOKEN-12345"
+	cases := []struct {
+		name string
+		in   string
+	}{
+		{"token:password form", "git [clone --depth=1 -- https://" + tok + ":x-oauth-basic@git.moleculesai.app/molecule-ai/repo.git target]"},
+		{"token-only userinfo", "fatal: could not read from https://" + tok + "@git.moleculesai.app/o/r.git"},
+		{"fetch args", "fetch --depth=1 -- https://" + tok + ":x-oauth-basic@git.moleculesai.app/o/r.git main"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := redactURLCreds(c.in)
+			if strings.Contains(got, tok) {
+				t.Fatalf("token leaked after redaction: %q", got)
+			}
+			if !strings.Contains(got, "git.moleculesai.app") {
+				t.Errorf("host should be preserved, got %q", got)
+			}
+			if !strings.Contains(got, "***@") {
+				t.Errorf("expected redaction marker ***@, got %q", got)
+			}
+		})
+	}
+}
+
+// TestDefaultGitRunner_RedactsTokenOnFailure forces a git failure with a
+// token-bearing clone URL in the args and asserts the token does NOT appear in
+// the returned error. This is the generic-failure branch (NOT NotFound): the
+// error propagates up through resolver wraps and is logged server-side, so the
+// token must never reach it.
+func TestDefaultGitRunner_RedactsTokenOnFailure(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed on this system")
+	}
+	const tok = "SUPERSECRET-TOKEN-12345"
+	// A bogus host so the clone fails fast (DNS/connect error → generic
+	// failure branch, not "repository not found").
+	url := "https://" + tok + ":x-oauth-basic@127.0.0.1:1/molecule-ai/repo.git"
+	err := defaultGitRunner(context.Background(), t.TempDir(),
+		"clone", "--depth=1", "--", url, filepath.Join(t.TempDir(), "out"))
+	if err == nil {
+		t.Fatal("expected clone failure against bogus host")
+	}
+	if strings.Contains(err.Error(), tok) {
+		t.Fatalf("PAT leaked into defaultGitRunner error: %v", err)
+	}
+	if !strings.Contains(err.Error(), "127.0.0.1") {
+		t.Errorf("host should survive redaction (sanity): %v", err)
+	}
+}
+
+// TestGiteaResolver_GenericFailureDoesNotLeakToken drives the full Gitea
+// Fetch generic-failure path with a real (token-injected) clone URL and
+// asserts the token never appears in the returned error. Covers the
+// non-NotFound branch end-to-end, including the runner-wrapped %w.
+func TestGiteaResolver_GenericFailureDoesNotLeakToken(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed on this system")
+	}
+	const tok = "SUPERSECRET-TOKEN-12345"
+	t.Setenv("MOLECULE_TEMPLATE_REPO_TOKEN", tok)
+	r := &GiteaResolver{
+		GitRunner: defaultGitRunner,
+		// Bogus reachable-but-failing host so we hit the generic branch.
+		BaseURL:  "https://127.0.0.1:1",
+		TokenEnv: "MOLECULE_TEMPLATE_REPO_TOKEN",
+	}
+	_, err := r.Fetch(context.Background(), "molecule-ai/repo#main", t.TempDir())
+	if err == nil {
+		t.Fatal("expected clone failure against bogus host")
+	}
+	if strings.Contains(err.Error(), tok) {
+		t.Fatalf("PAT leaked into GiteaResolver.Fetch error: %v", err)
+	}
+}
+
 func TestGithubResolver_NilGitRunnerUsesDefault(t *testing.T) {
 	// Passing nil GitRunner should fall back to defaultGitRunner. With no
 	// git on PATH, that fallback errors — we don't need real git here.

@@ -197,3 +197,42 @@ func TestParseSource_BareNameStillAccepted(t *testing.T) {
 		t.Errorf("bare name broke: %+v err=%v", s, err)
 	}
 }
+
+// ---- PluginNameFromSource (RFC#2843 declared-plugin name derivation) ----
+
+func TestPluginNameFromSource(t *testing.T) {
+	cases := []struct {
+		in      string
+		want    string
+		wantErr bool
+	}{
+		{in: "seo-all", want: "seo-all"}, // bare → local
+		{in: "local://my-plugin", want: "my-plugin"},
+		{in: "github://owner/repo#v1.0", want: "repo"},
+		{in: "github://owner/repo", want: "repo"},
+		{
+			in:   "gitea://molecule-ai/molecule-ai-workspace-template-seo-agent/agent-skills/seo-all#main",
+			want: "seo-all",
+		},
+		{in: "gitea://o/r#main", want: "r"},        // gitea whole-repo
+		{in: "gitea://o/r/a/b/c#main", want: "c"},  // deep subpath → last seg
+		{in: "clawhub://thing@1.2", wantErr: true}, // unknown naming rule
+		{in: "", wantErr: true},
+	}
+	for _, c := range cases {
+		got, err := PluginNameFromSource(c.in)
+		if c.wantErr {
+			if err == nil {
+				t.Errorf("PluginNameFromSource(%q): expected error, got %q", c.in, got)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("PluginNameFromSource(%q): unexpected err %v", c.in, err)
+			continue
+		}
+		if got != c.want {
+			t.Errorf("PluginNameFromSource(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}

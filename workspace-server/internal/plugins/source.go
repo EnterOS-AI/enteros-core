@@ -103,6 +103,55 @@ func ParseSource(input string) (Source, error) {
 	return Source{Scheme: scheme, Spec: spec}, nil
 }
 
+// PluginNameFromSource derives the install name (/configs/plugins/<name>/
+// directory key) a source spec WILL resolve to, WITHOUT fetching. The
+// post-online reconcile (RFC#2843) needs this at declaration time — before
+// the box is online and a real Fetch is possible — to (a) record the declared
+// row's plugin_name and (b) diff declared-vs-installed.
+//
+// The derivation MUST match each resolver's Fetch return value:
+//   - local://<name>                       → <name>
+//   - github://<owner>/<repo>[#ref]        → <repo>
+//   - gitea://<owner>/<repo>[/<sub...>][#ref]
+//     → last subpath segment, or <repo> when no subpath
+//   - bare "<name>"                         → <name>  (treated as local)
+//
+// Returns an error for unparseable input or a scheme whose naming rule isn't
+// known here (so a new resolver can't silently get a wrong declared name).
+func PluginNameFromSource(input string) (string, error) {
+	src, err := ParseSource(input)
+	if err != nil {
+		return "", err
+	}
+	switch src.Scheme {
+	case "local":
+		return src.Spec, nil
+	case "github":
+		// "<owner>/<repo>[#ref]" → repo segment.
+		spec := src.Spec
+		if i := strings.Index(spec, "#"); i >= 0 {
+			spec = spec[:i]
+		}
+		parts := strings.Split(strings.Trim(spec, "/"), "/")
+		if len(parts) < 2 || parts[1] == "" {
+			return "", fmt.Errorf("github source %q: cannot derive plugin name", input)
+		}
+		return parts[1], nil
+	case "gitea":
+		p, err := parseGiteaSpec(src.Spec)
+		if err != nil {
+			return "", err
+		}
+		if p.subpath != "" {
+			seg := strings.Split(p.subpath, "/")
+			return seg[len(seg)-1], nil
+		}
+		return p.repo, nil
+	default:
+		return "", fmt.Errorf("source %q: cannot derive plugin name for scheme %q", input, src.Scheme)
+	}
+}
+
 // Registry holds the set of registered SourceResolvers keyed by scheme.
 //
 // Writes (Register) should happen at startup on a single goroutine, but

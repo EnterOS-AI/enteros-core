@@ -66,6 +66,19 @@ type PluginsHandler struct {
 	// callers still pass *plugins.Registry, which satisfies the
 	// interface — see the compile-time assertion above.
 	sources pluginSources
+	// deliverOverride lets tests substitute the container-delivery step of
+	// the post-online reconcile (RFC#2843) without standing up Docker or an
+	// EC2 instance. nil in production → the reconcile calls deliverToContainer.
+	deliverOverride func(ctx context.Context, workspaceID string, r *stageResult) error
+}
+
+// deliver dispatches the container-delivery step, honouring the test
+// override when set. Centralises the nil-check so the reconcile reads cleanly.
+func (h *PluginsHandler) deliver(ctx context.Context, workspaceID string, r *stageResult) error {
+	if h.deliverOverride != nil {
+		return h.deliverOverride(ctx, workspaceID, r)
+	}
+	return h.deliverToContainer(ctx, workspaceID, r)
 }
 
 // NewPluginsHandler constructs a PluginsHandler with the default source
@@ -77,6 +90,11 @@ func NewPluginsHandler(pluginsDir string, docker *client.Client, restartFunc fun
 	sources := plugins.NewRegistry()
 	sources.Register(plugins.NewLocalResolver(pluginsDir))
 	sources.Register(plugins.NewGithubResolver())
+	// gitea:// resolves a (private) Gitea repo subpath with PAT auth —
+	// the channel declared plugins use post-boot (RFC#2843). Reads its PAT
+	// from MOLECULE_TEMPLATE_REPO_TOKEN at Fetch time (CP PR#850 places it
+	// on every tenant box).
+	sources.Register(plugins.NewGiteaResolver())
 	logInstallLimitsOnce(os.Stderr)
 	return &PluginsHandler{
 		pluginsDir:  pluginsDir,

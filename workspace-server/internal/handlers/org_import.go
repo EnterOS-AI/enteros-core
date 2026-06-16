@@ -22,6 +22,7 @@ import (
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/plugins"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provlog"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/scheduler"
@@ -345,32 +346,42 @@ func (h *OrgHandler) createWorkspaceTree(ws OrgWorkspace, parentID *string, absX
 			}
 		}
 
-		// Pre-install plugins: copy from registry into configFiles as plugins/<name>/*.
-		// Per-workspace plugins UNION with defaults.plugins (issue #68).
-		// A leading "!" or "-" on a per-workspace entry opts that plugin out.
-		plugins := mergePlugins(defaults.Plugins, ws.Plugins)
-		if len(plugins) > 0 {
-			if configFiles == nil {
-				configFiles = map[string][]byte{}
+		// RFC#2843 #32: declared plugins are NOT bundled into configFiles (the
+		// provisioning channel) anymore. The CTO ruling is that agent-skills
+		// are PLUGINS and must install DYNAMICALLY after the workspace boots
+		// online, via the existing plugin install pipeline — never through
+		// Secrets Manager or the template-asset relay. So instead of copying
+		// the plugin tree into configFiles here, we PERSIST the declared set
+		// (workspace_declared_plugins) and let the post-online reconcile
+		// (registry heartbeat → ReconcileWorkspacePlugins) install them from
+		// their source-contract specs once the box is reachable.
+		//
+		// Per-workspace plugins UNION with defaults.plugins (issue #68); a
+		// leading "!" or "-" on a per-workspace entry opts that plugin out.
+		// Each entry is a source-contract string (e.g.
+		// "gitea://owner/repo/subpath#ref" or a bare local name); the install
+		// name is derived from the source so the reconcile can diff declared
+		// vs installed without fetching.
+		seenPluginNames := map[string]string{} // name → first source that claimed it
+		for _, pluginSource := range mergePlugins(defaults.Plugins, ws.Plugins) {
+			pluginName, nameErr := plugins.PluginNameFromSource(pluginSource)
+			if nameErr != nil {
+				log.Printf("Org import: skipping plugin %q for %s — cannot derive install name: %v",
+					pluginSource, ws.Name, nameErr)
+				continue
 			}
-			pluginsBase, _ := filepath.Abs(filepath.Join(h.configsDir, "..", "plugins"))
-			for _, pluginName := range plugins {
-				pluginSrc := filepath.Join(pluginsBase, pluginName)
-				if info, err := os.Stat(pluginSrc); err != nil || !info.IsDir() {
-					log.Printf("Org import: plugin %s not found at %s, skipping", pluginName, pluginSrc)
-					continue
-				}
-				filepath.Walk(pluginSrc, func(path string, info os.FileInfo, err error) error {
-					if err != nil || info.IsDir() {
-						return nil
-					}
-					rel, _ := filepath.Rel(pluginSrc, path)
-					data, readErr := os.ReadFile(path)
-					if readErr == nil {
-						configFiles["plugins/"+pluginName+"/"+rel] = data
-					}
-					return nil
-				})
+			// Two declared sources whose last segment collapses to the same
+			// install name silently overwrite each other in
+			// workspace_declared_plugins (ON CONFLICT). Warn so the operator
+			// can spot the shadowing — the later source wins on re-import.
+			if prevSource, dup := seenPluginNames[pluginName]; dup && prevSource != pluginSource {
+				log.Printf("Org import: WARNING plugin name collision for %s — %q and %q both derive name %q; the latter overwrites the former",
+					ws.Name, prevSource, pluginSource, pluginName)
+			}
+			seenPluginNames[pluginName] = pluginSource
+			if recErr := recordDeclaredPlugin(ctx, id, pluginName, pluginSource); recErr != nil {
+				log.Printf("Org import: failed to record declared plugin %s (%s) for %s: %v",
+					pluginName, pluginSource, ws.Name, recErr)
 			}
 		}
 

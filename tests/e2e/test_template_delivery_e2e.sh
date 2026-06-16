@@ -1,22 +1,37 @@
 #!/usr/bin/env bash
-# Template-asset DELIVERY e2e (RFC #2843) — the regression gate for the
+# Template DELIVERY e2e (RFC #2843) — the regression gate for the
 # 2026-06-15 incident family (#2919 + #2843 rollout). It provisions a FRESH
-# tenant + a FRESH seo-agent workspace and asserts the template-asset channel
-# actually delivers config + prompts + AGENT-SKILLS + model end to end.
+# tenant + a FRESH seo-agent workspace and asserts the TWO delivery channels
+# each deliver what they own, end to end.
+#
+# TWO CHANNELS (RFC #2843 #32, post-decoupling):
+#   1. TEMPLATE-ASSET channel (provisioning-time): config.yaml + prompts +
+#      model. Delivered during provisioning, present the moment the box is
+#      online.
+#   2. DYNAMIC PLUGIN channel (post-online): agent-skills are PLUGINS. They are
+#      NO LONGER delivered via the template-asset / provisioning channel. The
+#      seo-agent DECLARES the seo-all plugin (source
+#      gitea://molecule-ai/molecule-ai-workspace-template-seo-agent/agent-skills/seo-all#main),
+#      and the post-online reconcile (registry heartbeat transition-to-online →
+#      ReconcileWorkspacePlugins) installs it through the existing plugin
+#      install pipeline. It lands at /configs/plugins/seo-all/ (SKILL.md
+#      present) after the online→reconcile→install→restart cycle.
 #
 # WHY THIS EXISTS — the bugs that shipped green because nothing asserted this:
 #   1. concierge booted with no MODEL  (MISSING_MODEL fail-closed) — #2966
 #   2. concierge booted with no IDENTITY (generic Claude Code)     — #2955
-#   3. seo-agent booted with config+prompts but NO agent-skills/   — #32
+#   3. seo-agent booted but the seo-all skill never installed       — #32
 # The unit/drift tests did not catch any of these because none provision a
 # fresh agent end-to-end and inspect the DELIVERED /configs. This does.
 #
 # Assertions (each maps to a real incident):
 #   A. seo-agent reaches online                       (catches MISSING_MODEL)
 #   B. GET /model == the template's declared model    (catches model drop)
-#   C. config.yaml delivered + REAL (> 1 KiB, not the 218 B default stub)
-#   D. prompts/ delivered (identity prompt present)   (catches identity drop)
-#   E. agent-skills/seo-all/SKILL.md delivered        (catches skill drop, #32)
+#   C. config.yaml delivered + REAL (> 1 KiB) via the ASSET channel
+#   D. prompts/ delivered (identity prompt) via the ASSET channel
+#   E. plugins/seo-all/SKILL.md installed via the post-online PLUGIN reconcile
+#      (catches skill drop, #32) — NOT the asset channel. Polled, because the
+#      install fires AFTER online and triggers a container restart.
 #
 # Auth model + org-provision/teardown shape mirror test_staging_concierge_e2e.sh.
 #
@@ -26,7 +41,9 @@
 # Optional:
 #   E2E_SEO_TEMPLATE       default seo-agent
 #   E2E_EXPECTED_MODEL     default moonshot/kimi-k2.6
+#   E2E_EXPECTED_PLUGIN    default seo-all  (install name = last subpath segment)
 #   E2E_PROVISION_TIMEOUT_SECS  default 900
+#   E2E_PLUGIN_INSTALL_TIMEOUT_SECS default 600 (online→reconcile→install→restart)
 #   E2E_KEEP_ORG           1 → skip teardown (debug)
 #
 # Exit: 0 pass | 1 assertion fail | 2 missing env | 3 provision timeout
@@ -36,7 +53,9 @@ CP_URL="${MOLECULE_CP_URL:-https://staging-api.moleculesai.app}"
 ADMIN_TOKEN="${MOLECULE_ADMIN_TOKEN:?MOLECULE_ADMIN_TOKEN required — Railway CP_ADMIN_API_TOKEN}"
 SEO_TEMPLATE="${E2E_SEO_TEMPLATE:-seo-agent}"
 EXPECTED_MODEL="${E2E_EXPECTED_MODEL:-moonshot/kimi-k2.6}"
+EXPECTED_PLUGIN="${E2E_EXPECTED_PLUGIN:-seo-all}"
 PROVISION_TIMEOUT_SECS="${E2E_PROVISION_TIMEOUT_SECS:-900}"
+PLUGIN_INSTALL_TIMEOUT_SECS="${E2E_PLUGIN_INSTALL_TIMEOUT_SECS:-600}"
 
 # Collision-proof slug (random suffix), same convention as the sibling harness.
 RAND=$(head -c4 /dev/urandom | od -An -tx1 | tr -d ' \n')
@@ -158,18 +177,59 @@ d=json.load(sys.stdin); print(len(d) if isinstance(d,list) else 0)
 [ "${PROMPTS:-0}" -gt 0 ] || fail "D: prompts/ empty — identity prompt NOT delivered"
 ok "D: prompts/ delivered ($PROMPTS file(s))"
 
-# E. agent-skills/seo-all delivered — THE #32 regression assertion
-SKILLS=$(tenant_call GET "/workspaces/$WID/files?path=agent-skills/seo-all" | python3 -c "
+# E. plugins/seo-all/SKILL.md installed via the post-online PLUGIN reconcile —
+#    THE #32 regression assertion, under the NEW (RFC #2843) contract.
+#
+# The seo-all skill is NO LONGER on /configs via the asset channel. The
+# seo-agent template DECLARES it as a plugin; the registry heartbeat's
+# transition-to-online fires ReconcileWorkspacePlugins, which installs the
+# declared plugin through the standard pipeline. It lands at
+# /configs/plugins/seo-all/ with SKILL.md (+ a .complete marker), and a
+# first-time install triggers a container restart — so it is NOT present at
+# the instant of online. We POLL the asset channel paths are already asserted
+# (C/D above); here we wait for the plugin to land.
+#
+# Negative control: the skill MUST NOT arrive via the OLD asset path. If
+# agent-skills/seo-all/SKILL.md shows up, the decoupling regressed (the
+# provisioning channel is still smuggling skills) — fail loudly.
+PLUGIN_PATH="plugins/$EXPECTED_PLUGIN"
+log "E: polling for plugin '$EXPECTED_PLUGIN' at /configs/$PLUGIN_PATH (≤${PLUGIN_INSTALL_TIMEOUT_SECS}s; online→reconcile→install→restart)"
+
+# Negative control — old asset-channel path must stay EMPTY.
+OLD_ASSET=$(tenant_call GET "/workspaces/$WID/files?path=agent-skills/$EXPECTED_PLUGIN" | python3 -c "
 import json,sys
 d=json.load(sys.stdin)
 paths=[f.get('path','') for f in d] if isinstance(d,list) else []
-print('SKILL_MD' if any(p.endswith('SKILL.md') for p in paths) else ('NONEMPTY' if paths else 'EMPTY'))
+print('SKILL_MD' if any(p.endswith('SKILL.md') for p in paths) else 'EMPTY')
 " 2>/dev/null || echo EMPTY)
-case "$SKILLS" in
-  SKILL_MD|NONEMPTY) ok "E: agent-skills/seo-all delivered ($SKILLS)";;
-  *) fail "E: agent-skills/seo-all EMPTY — the seo-all skill pack was NOT delivered (#32 regression). The whole point of the SEO agent is missing.";;
-esac
+[ "$OLD_ASSET" = "SKILL_MD" ] && fail "E(neg): agent-skills/$EXPECTED_PLUGIN/SKILL.md present on the OLD asset channel — RFC#2843 decoupling REGRESSED; the provisioning channel is still delivering skills (it must not)."
+ok "E(neg): old asset-channel agent-skills/$EXPECTED_PLUGIN empty (decoupling holds)"
 
-ok "ALL DELIVERY ASSERTIONS PASSED — config + prompts + skills + model reached /configs"
-echo "PASS template-delivery-e2e: slug=$SLUG ws=$WID model=$MODEL config=${CFG_SIZE}B skills=$SKILLS" >&2
+PDEADLINE=$(( $(date +%s) + PLUGIN_INSTALL_TIMEOUT_SECS )); PLAST=""
+SKILLS=EMPTY
+while true; do
+  if [ "$(date +%s)" -gt "$PDEADLINE" ]; then
+    fail "E: plugin '$EXPECTED_PLUGIN' never installed at /configs/$PLUGIN_PATH within ${PLUGIN_INSTALL_TIMEOUT_SECS}s — the post-online reconcile did NOT install the declared seo-all plugin (#32 regression under the new dynamic-plugin contract). last=$PLAST"
+  fi
+  SKILLS=$(tenant_call GET "/workspaces/$WID/files?path=$PLUGIN_PATH" | python3 -c "
+import json,sys
+try: d=json.load(sys.stdin)
+except Exception: d=None
+paths=[f.get('path','') for f in d] if isinstance(d,list) else []
+# SKILL.md = the skill landed; .complete = atomic install finished; else partial/empty.
+if any(p.endswith('SKILL.md') for p in paths): print('SKILL_MD')
+elif any(p.endswith('.complete') for p in paths): print('COMPLETE_NO_SKILL')
+elif paths: print('NONEMPTY')
+else: print('EMPTY')
+" 2>/dev/null || echo EMPTY)
+  [ "$SKILLS" != "$PLAST" ] && { log "    plugin status → $SKILLS"; PLAST="$SKILLS"; }
+  case "$SKILLS" in
+    SKILL_MD) break;;            # the load-bearing success: the skill is on disk
+    *) sleep 15;;                # EMPTY / NONEMPTY / COMPLETE_NO_SKILL → keep polling (restart in flight)
+  esac
+done
+ok "E: plugin '$EXPECTED_PLUGIN' installed via post-online reconcile — /configs/$PLUGIN_PATH/SKILL.md present"
+
+ok "ALL DELIVERY ASSERTIONS PASSED — asset channel: config+prompts+model; plugin channel: $EXPECTED_PLUGIN"
+echo "PASS template-delivery-e2e: slug=$SLUG ws=$WID model=$MODEL config=${CFG_SIZE}B plugin=$EXPECTED_PLUGIN($SKILLS)" >&2
 exit 0

@@ -106,6 +106,11 @@ type QueueDrainFunc func(ctx context.Context, workspaceID string, capacity int)
 type RegistryHandler struct {
 	broadcaster *events.Broadcaster
 	drainQueue  QueueDrainFunc // nil-safe: Heartbeat skips drain when unset
+	// reconcilePlugins installs declared-but-missing plugins when a workspace
+	// transitions to online (RFC#2843 #32). nil-safe: Heartbeat skips the
+	// reconcile when unset (e.g. unit tests, CP/SaaS mode without a plugins
+	// handler). Wired by the router to PluginsHandler.ReconcileWorkspacePlugins.
+	reconcilePlugins ReconcileFunc
 }
 
 func NewRegistryHandler(b *events.Broadcaster) *RegistryHandler {
@@ -117,6 +122,28 @@ func NewRegistryHandler(b *events.Broadcaster) *RegistryHandler {
 // keeps RegistryHandler's import list clean.
 func (h *RegistryHandler) SetQueueDrainFunc(f QueueDrainFunc) {
 	h.drainQueue = f
+}
+
+// SetReconcileFunc wires the post-online plugin reconcile hook (RFC#2843).
+// Router wires this to PluginsHandler.ReconcileWorkspacePlugins after both
+// handlers are constructed (same late-wiring pattern as SetQueueDrainFunc),
+// keeping RegistryHandler free of a plugins-handler import.
+func (h *RegistryHandler) SetReconcileFunc(f ReconcileFunc) {
+	h.reconcilePlugins = f
+}
+
+// fireReconcileOnline fires the declared-plugin reconcile for a workspace that
+// has just transitioned to online. Fire-and-forget via globalGoAsync so the
+// heartbeat handler returns immediately; the reconcile owns its own deadline.
+// nil-safe + uses context.WithoutCancel because the heartbeat ctx expires when
+// the handler returns, well before a plugin clone+deliver completes.
+func (h *RegistryHandler) fireReconcileOnline(ctx context.Context, workspaceID string) {
+	if h.reconcilePlugins == nil {
+		return
+	}
+	rctx := context.WithoutCancel(ctx)
+	wsID := workspaceID
+	globalGoAsync(func() { h.reconcilePlugins(rctx, wsID) })
 }
 
 // validateAgentURL rejects URLs that could be used as SSRF vectors against
@@ -1170,6 +1197,8 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 			log.Printf("Heartbeat: failed to recover %s to online: %v", payload.WorkspaceID, err)
 		}
 		h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceOnline), payload.WorkspaceID, map[string]interface{}{})
+		// RFC#2843: reconcile declared plugins on transition-to-online.
+		h.fireReconcileOnline(ctx, payload.WorkspaceID)
 	}
 
 	// Recovery: if workspace was offline but is now sending heartbeats, bring it back online.
@@ -1180,6 +1209,8 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 			log.Printf("Heartbeat: failed to recover %s from offline: %v", payload.WorkspaceID, err)
 		}
 		h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceOnline), payload.WorkspaceID, map[string]interface{}{})
+		// RFC#2843: reconcile declared plugins on transition-to-online.
+		h.fireReconcileOnline(ctx, payload.WorkspaceID)
 	}
 
 	// Auto-recovery: if a workspace is marked "provisioning" but is actively sending
@@ -1197,6 +1228,10 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 		h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceOnline), payload.WorkspaceID, map[string]interface{}{
 			"recovered_from": currentStatus,
 		})
+		// RFC#2843: reconcile declared plugins on transition-to-online. This
+		// is the primary path for a freshly-provisioned workspace's first
+		// boot — provisioning→online is the only transition a new box makes.
+		h.fireReconcileOnline(ctx, payload.WorkspaceID)
 	}
 
 	// Auto-recovery from awaiting_agent: external workspaces are flipped
@@ -1225,6 +1260,8 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 		h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceOnline), payload.WorkspaceID, map[string]interface{}{
 			"recovered_from": currentStatus,
 		})
+		// RFC#2843: reconcile declared plugins on transition-to-online.
+		h.fireReconcileOnline(ctx, payload.WorkspaceID)
 	}
 
 	// Auto-recovery from failed: the provision-timeout sweeper
@@ -1248,6 +1285,8 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 		h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceOnline), payload.WorkspaceID, map[string]interface{}{
 			"recovered_from": currentStatus,
 		})
+		// RFC#2843: reconcile declared plugins on transition-to-online.
+		h.fireReconcileOnline(ctx, payload.WorkspaceID)
 	}
 
 	// #1870 Phase 1: drain one queued A2A request if the target reports
@@ -1461,18 +1500,19 @@ type registerDiagnostics struct {
 // 400 path in /registry/register. The line shape is stable
 // (`registry_register_400`) so operators can grep Loki for the
 // class. Fields:
-//   workspace_id         — the requested ID
-//   reason               — short key (invalid_json | invalid_delivery_mode |
-//                          invalid_kind | url_required_for_push | url_validate_failed)
-//   payload_url          — the URL the agent sent in the payload (may be empty)
-//   payload_card_url     — the URL the agent put in its agent_card (may be empty)
-//   payload_kind         — the kind the agent sent
-//   payload_delivery_mode — the delivery_mode the agent sent
-//   existing_url         — the URL already on the workspaces row (or "(new)")
-//   existing_kind        — the kind already on the row (or "(new)")
-//   existing_delivery_mode — the delivery_mode already on the row (or "(new)")
-//   detail               — the failure-specific detail (parse error, validation
-//                          error, missing-field note, etc.)
+//
+//	workspace_id         — the requested ID
+//	reason               — short key (invalid_json | invalid_delivery_mode |
+//	                       invalid_kind | url_required_for_push | url_validate_failed)
+//	payload_url          — the URL the agent sent in the payload (may be empty)
+//	payload_card_url     — the URL the agent put in its agent_card (may be empty)
+//	payload_kind         — the kind the agent sent
+//	payload_delivery_mode — the delivery_mode the agent sent
+//	existing_url         — the URL already on the workspaces row (or "(new)")
+//	existing_kind        — the kind already on the row (or "(new)")
+//	existing_delivery_mode — the delivery_mode already on the row (or "(new)")
+//	detail               — the failure-specific detail (parse error, validation
+//	                       error, missing-field note, etc.)
 //
 // The class is part of the #2680 residual: a recreated container's
 // first /registry/register call has been returning 400 with no
