@@ -109,8 +109,11 @@ COPY ${PLATFORM_AGENT_TEMPLATE_DIR}/prompts/ /opt/molecule-platform-agent-templa
 # in the template-platform-agent repo (PR-side, merged to template
 # main) is unconditional: always writes /configs/system-prompt.md
 # from prompts/concierge.md + {{CONCIERGE_NAME}} substitution.
-COPY ${PLATFORM_AGENT_TEMPLATE_DIR}/identity-fallback.sh /opt/molecule-platform-agent-template/identity-fallback.sh
-RUN chmod +x /opt/molecule-platform-agent-template/identity-fallback.sh
+# COPY --chmod sets +x at copy time (buildx-native). A `RUN chmod` fails with
+# "Operation not permitted" when the base image runs as a non-root user — the
+# live platform-tenant base does, whereas the dead molecule-ai/platform base was
+# root, which masked this. --chmod works regardless of base USER.
+COPY --chmod=0755 ${PLATFORM_AGENT_TEMPLATE_DIR}/identity-fallback.sh /opt/molecule-platform-agent-template/identity-fallback.sh
 
 # PLATFORM-AGENT ENTRYPOINT — runs identity-fallback.sh FIRST (fills
 # absent /configs/ files from the image-baked /opt path; the
@@ -128,7 +131,7 @@ RUN chmod +x /opt/molecule-platform-agent-template/identity-fallback.sh
 # so a missing-script failure bubbles up cleanly (su-exec will still
 # run /platform; the runtime's MISSING_MODEL fail-closed surfaces
 # the operator-visible error in that case).
-COPY <<'ENTRY' /entrypoint-platform-agent.sh
+COPY --chmod=0755 <<'ENTRY' /entrypoint-platform-agent.sh
 #!/bin/sh
 # /opt/molecule-platform-agent-template/identity-fallback.sh: per-
 # file copy of ABSENT files from the image-baked SSOT path to
@@ -150,5 +153,4 @@ fi
 # needed; this entrypoint is transparent to the args).
 exec /entrypoint.sh "$@"
 ENTRY
-RUN chmod +x /entrypoint-platform-agent.sh
 ENTRYPOINT ["/entrypoint-platform-agent.sh"]
