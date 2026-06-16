@@ -882,10 +882,26 @@ func (h *RegistryHandler) Heartbeat(c *gin.Context) {
 		return // response already written
 	}
 
-	// Read previous current_task to detect changes (before the UPDATE)
+	// Read previous current_task + status to detect changes (before the UPDATE).
+	//
+	// prevStatus is load-bearing for the RFC#2843 #32 plugin reconcile: the
+	// main heartbeat UPDATE below SELF-HEALS status provisioning→online INLINE
+	// (the `CASE WHEN status = 'provisioning' THEN 'online'` clause). That flip
+	// happens BEFORE evaluateStatus runs, so by the time evaluateStatus reads
+	// currentStatus it is already 'online' and its `currentStatus ==
+	// "provisioning"` branch (which fires fireReconcileOnline) never matches on
+	// the normal fresh-boot path — the runtime only ever calls
+	// /registry/heartbeat, never /registry/register, so this IS the path every
+	// new workspace takes. The result: declared plugins never installed on a
+	// fresh seo-agent (the #32 regression). Capturing prevStatus here lets us
+	// fire the reconcile when THIS heartbeat performed the provisioning→online
+	// flip, independent of evaluateStatus. evaluateStatus still owns the OTHER
+	// recovery transitions (offline/degraded/awaiting_agent/failed→online),
+	// which the inline CASE does not touch.
 	var prevTask string
 	var prevSpend int64
-	if err := db.DB.QueryRowContext(ctx, `SELECT COALESCE(current_task, ''), COALESCE(monthly_spend, 0) FROM workspaces WHERE id = $1`, payload.WorkspaceID).Scan(&prevTask, &prevSpend); err != nil {
+	var prevStatus string
+	if err := db.DB.QueryRowContext(ctx, `SELECT COALESCE(current_task, ''), COALESCE(monthly_spend, 0), COALESCE(status, '') FROM workspaces WHERE id = $1`, payload.WorkspaceID).Scan(&prevTask, &prevSpend, &prevStatus); err != nil {
 		log.Printf("registry heartbeat: prev_task query failed for workspace %s: %v", payload.WorkspaceID, err)
 	}
 
@@ -966,6 +982,21 @@ func (h *RegistryHandler) Heartbeat(c *gin.Context) {
 		log.Printf("Heartbeat update error: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update"})
 		return
+	}
+
+	// RFC#2843 #32: fire the declared-plugin reconcile when THIS heartbeat just
+	// performed the provisioning→online self-heal (the inline CASE in the UPDATE
+	// above). This is the primary fresh-boot transition: a newly-provisioned
+	// workspace is created with status='provisioning', the runtime's first
+	// heartbeat flips it to 'online' via that CASE, and there is no
+	// /registry/register on the boot path. Without firing here, the reconcile
+	// hook in evaluateStatus never sees a provisioning→online transition (the
+	// CASE already moved the row to 'online' before evaluateStatus reads
+	// currentStatus), so declared plugins (e.g. seo-all) never install. Firing
+	// is idempotent — ReconcileWorkspacePlugins diffs declared-vs-installed and
+	// no-ops when everything is present — and nil-safe via fireReconcileOnline.
+	if prevStatus == string(models.StatusProvisioning) {
+		h.fireReconcileOnline(ctx, payload.WorkspaceID)
 	}
 
 	// #2421: backfill agent_card when the initial register failed and the
@@ -1213,12 +1244,18 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 		h.fireReconcileOnline(ctx, payload.WorkspaceID)
 	}
 
-	// Auto-recovery: if a workspace is marked "provisioning" but is actively sending
-	// heartbeats, it has successfully started up. Transition to "online" so the scheduler
-	// and A2A proxy can dispatch tasks to it. The provisioner does not call
-	// /registry/register on container start — only the heartbeat loop does, so this
-	// transition is the only mechanism that moves newly-started workspaces out of
-	// the phantom-idle state. (#1784)
+	// Auto-recovery: if a workspace is STILL marked "provisioning" by the time
+	// this branch runs, transition it to "online". Defense-in-depth only: the
+	// main heartbeat UPDATE above already self-heals provisioning→online via its
+	// inline CASE, so on the normal path currentStatus is 'online' here and this
+	// branch is a no-op. It still covers any future path that reaches
+	// evaluateStatus with a 'provisioning' row that the inline CASE missed. (#1784)
+	//
+	// NOTE (RFC#2843 #32): because the inline CASE pre-empts this branch on the
+	// real fresh-boot path, the declared-plugin reconcile is fired from the
+	// heartbeat handler itself (on prevStatus=='provisioning'), NOT only here —
+	// see the fireReconcileOnline call right after the main UPDATE. Do not rely
+	// on this branch as the reconcile trigger; it does not fire for new boxes.
 	if currentStatus == "provisioning" {
 		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1, updated_at = now() WHERE id = $2 AND status = 'provisioning'`, models.StatusOnline, payload.WorkspaceID); err != nil {
 			log.Printf("Heartbeat: failed to transition %s from provisioning to online: %v", payload.WorkspaceID, err)
