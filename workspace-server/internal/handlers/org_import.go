@@ -298,6 +298,7 @@ func (h *OrgHandler) createWorkspaceTree(ws OrgWorkspace, parentID *string, absX
 		// whether to do prep at all.
 		payload := models.CreateWorkspacePayload{
 			Name: ws.Name, Tier: tier, Runtime: runtime, Model: model,
+			Template:        ws.Template,
 			WorkspaceDir:    ws.WorkspaceDir,
 			WorkspaceAccess: workspaceAccess,
 		}

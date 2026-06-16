@@ -59,15 +59,15 @@ func (h *WorkspaceHandler) SwitchProvider(c *gin.Context) {
 		return
 	}
 
-	var status, wsName, dbRuntime, oldProvider, dataPersistence string
+	var status, wsName, dbRuntime, dbTemplate, oldProvider, dataPersistence string
 	var oldInstanceID sql.NullString
 	var tier int
 	err := db.DB.QueryRowContext(ctx, `
-		SELECT status, name, tier, COALESCE(runtime, 'claude-code'),
+		SELECT status, name, tier, COALESCE(runtime, 'claude-code'), COALESCE(template, ''),
 		       COALESCE(compute->>'provider', ''), COALESCE(compute->>'data_persistence', ''),
 		       instance_id
 		FROM workspaces WHERE id = $1`, id,
-	).Scan(&status, &wsName, &tier, &dbRuntime, &oldProvider, &dataPersistence, &oldInstanceID)
+	).Scan(&status, &wsName, &tier, &dbRuntime, &dbTemplate, &oldProvider, &dataPersistence, &oldInstanceID)
 	if err == sql.ErrNoRows || status == string(models.StatusRemoved) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "workspace not found"})
 		return
@@ -251,7 +251,7 @@ func (h *WorkspaceHandler) SwitchProvider(c *gin.Context) {
 	//    context: the reprovision outlives the request. Routes through
 	//    provisionWorkspaceAuto (not provisionWorkspaceCP directly) per
 	//    TestNoCallSiteCallsDirectProvisionerExceptAuto (core#2422 RCA tick).
-	payload := withStoredCompute(context.Background(), id, models.CreateWorkspacePayload{Name: wsName, Tier: tier, Runtime: dbRuntime})
+	payload := withStoredCompute(context.Background(), id, models.CreateWorkspacePayload{Name: wsName, Tier: tier, Runtime: dbRuntime, Template: dbTemplate})
 	h.provisionWorkspaceAuto(id, "", nil, payload)
 
 	// All 5 steps completed; mark the switch COMMITTED so the rollback

@@ -752,6 +752,62 @@ func (h *WorkspaceHandler) CascadeDelete(ctx context.Context, id string, erase b
 	return descendantIDs, stopErrs, nil
 }
 
+// PatchTemplate handles PATCH /workspaces/:id/template.
+// It sets the installed template for an existing workspace without changing
+// its engine runtime. A restart/re-provision is required for the template
+// assets to be fetched and applied.
+//
+// Auth: admin/CP-gated at the router (mirrors PATCH /workspaces/:id/budget).
+func (h *WorkspaceHandler) PatchTemplate(c *gin.Context) {
+	id := c.Param("id")
+	if err := validateWorkspaceID(id); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	var body struct {
+		Template string `json:"template" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "template is required"})
+		return
+	}
+
+	if !isKnownTemplate(body.Template) {
+		log.Printf("PatchTemplate: %q is not a known workspace template", body.Template)
+		c.JSON(http.StatusUnprocessableEntity, gin.H{
+			"error":    "unsupported workspace template",
+			"template": body.Template,
+			"code":     "TEMPLATE_UNSUPPORTED",
+		})
+		return
+	}
+
+	var exists bool
+	if err := db.DB.QueryRowContext(c.Request.Context(),
+		`SELECT EXISTS(SELECT 1 FROM workspaces WHERE id = $1)`, id,
+	).Scan(&exists); err != nil {
+		log.Printf("PatchTemplate: existence check failed for %s: %v", id, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "lookup failed"})
+		return
+	}
+	if !exists {
+		c.JSON(http.StatusNotFound, gin.H{"error": "workspace not found"})
+		return
+	}
+
+	if _, err := db.DB.ExecContext(c.Request.Context(),
+		`UPDATE workspaces SET template = $2, updated_at = now() WHERE id = $1`, id, body.Template,
+	); err != nil {
+		log.Printf("PatchTemplate: update failed for %s: %v", id, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update template"})
+		return
+	}
+
+	log.Printf("PatchTemplate: workspace %s template updated to %q", id, body.Template)
+	c.JSON(http.StatusOK, gin.H{"status": "updated", "needs_restart": true})
+}
+
 // validateWorkspaceID returns an error when id is not a valid UUID.
 // #687: prevents 500s from Postgres when a garbage string (e.g. ../../etc/passwd)
 // is passed as the :id path parameter.

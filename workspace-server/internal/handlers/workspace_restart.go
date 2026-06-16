@@ -315,11 +315,11 @@ func (h *WorkspaceHandler) Restart(c *gin.Context) {
 	id := c.Param("id")
 	ctx := c.Request.Context()
 
-	var status, wsName, dbRuntime string
+	var status, wsName, dbRuntime, dbTemplate string
 	var tier int
 	err := db.DB.QueryRowContext(ctx,
-		`SELECT status, name, tier, COALESCE(runtime, 'claude-code') FROM workspaces WHERE id = $1`, id,
-	).Scan(&status, &wsName, &tier, &dbRuntime)
+		`SELECT status, name, tier, COALESCE(runtime, 'claude-code'), COALESCE(template, '') FROM workspaces WHERE id = $1`, id,
+	).Scan(&status, &wsName, &tier, &dbRuntime, &dbTemplate)
 	if err == sql.ErrNoRows {
 		c.JSON(http.StatusNotFound, gin.H{"error": "workspace not found"})
 		return
@@ -442,8 +442,8 @@ func (h *WorkspaceHandler) Restart(c *gin.Context) {
 	}
 
 	var configFiles map[string][]byte
-	payload := withStoredCompute(ctx, id, models.CreateWorkspacePayload{Name: wsName, Tier: tier, Runtime: containerRuntime})
-	log.Printf("Restart: workspace %s (%s) runtime=%q", wsName, id, containerRuntime)
+	payload := withStoredCompute(ctx, id, models.CreateWorkspacePayload{Name: wsName, Tier: tier, Runtime: containerRuntime, Template: dbTemplate})
+	log.Printf("Restart: workspace %s (%s) runtime=%q template=%q", wsName, id, containerRuntime, dbTemplate)
 
 	// #12: ?reset=true (or body.Reset) discards the claude-sessions volume
 	// before restart, giving the agent a clean /root/.claude/sessions dir.
@@ -931,11 +931,11 @@ func (h *WorkspaceHandler) runRestartCycle(workspaceID string) {
 	gate.Lock()
 	defer gate.Unlock()
 
-	var wsName, status, dbRuntime string
+	var wsName, status, dbRuntime, dbTemplate string
 	var tier int
 	err := db.DB.QueryRowContext(ctx,
-		`SELECT name, status, tier, COALESCE(runtime, 'claude-code') FROM workspaces WHERE id = $1 AND status NOT IN ('removed', 'paused', 'hibernated')`, workspaceID,
-	).Scan(&wsName, &status, &tier, &dbRuntime)
+		`SELECT name, status, tier, COALESCE(runtime, 'claude-code'), COALESCE(template, '') FROM workspaces WHERE id = $1 AND status NOT IN ('removed', 'paused', 'hibernated')`, workspaceID,
+	).Scan(&wsName, &status, &tier, &dbRuntime, &dbTemplate)
 	if err != nil {
 		return // includes paused/hibernated — don't auto-restart those
 	}
@@ -958,7 +958,7 @@ func (h *WorkspaceHandler) runRestartCycle(workspaceID string) {
 		time.Sleep(10 * time.Second)
 	}
 
-	log.Printf("Auto-restart: restarting %s (%s) runtime=%q (was: %s)", wsName, workspaceID, dbRuntime, status)
+	log.Printf("Auto-restart: restarting %s (%s) runtime=%q template=%q (was: %s)", wsName, workspaceID, dbRuntime, dbTemplate, status)
 
 	// #125 Phase 1: send pre-restart drain signal to the workspace agent.
 	// For native_session targets, A2A messages go directly to the SDK session
@@ -979,11 +979,11 @@ func (h *WorkspaceHandler) runRestartCycle(workspaceID string) {
 		log.Printf("Auto-restart: failed to set provisioning status for %s: %v", workspaceID, err)
 	}
 	h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceProvisioning), workspaceID, map[string]interface{}{
-		"name": wsName, "tier": tier, "runtime": dbRuntime,
+		"name": wsName, "tier": tier, "runtime": dbRuntime, "template": dbTemplate,
 	})
 
 	// Runtime from DB — no more config file parsing
-	payload := withStoredCompute(ctx, workspaceID, models.CreateWorkspacePayload{Name: wsName, Tier: tier, Runtime: dbRuntime})
+	payload := withStoredCompute(ctx, workspaceID, models.CreateWorkspacePayload{Name: wsName, Tier: tier, Runtime: dbRuntime, Template: dbTemplate})
 
 	// RFC#2843 #33 + SaaS restart re-stub fix: on SaaS (cpProv), restore the
 	// persisted template AND resolve its LOCAL template dir so the re-provision
@@ -1142,11 +1142,11 @@ func (h *WorkspaceHandler) Resume(c *gin.Context) {
 	id := c.Param("id")
 	ctx := c.Request.Context()
 
-	var wsName, dbRuntime string
+	var wsName, dbRuntime, dbTemplate string
 	var tier int
 	err := db.DB.QueryRowContext(ctx,
-		`SELECT name, tier, COALESCE(runtime, 'claude-code') FROM workspaces WHERE id = $1 AND status = 'paused'`, id,
-	).Scan(&wsName, &tier, &dbRuntime)
+		`SELECT name, tier, COALESCE(runtime, 'claude-code'), COALESCE(template, '') FROM workspaces WHERE id = $1 AND status = 'paused'`, id,
+	).Scan(&wsName, &tier, &dbRuntime, &dbTemplate)
 	if err == sql.ErrNoRows {
 		c.JSON(http.StatusNotFound, gin.H{"error": "workspace not found or not paused"})
 		return
@@ -1172,17 +1172,17 @@ func (h *WorkspaceHandler) Resume(c *gin.Context) {
 
 	// Collect this workspace + all paused descendants to resume
 	type wsInfo struct {
-		id, name, runtime string
-		tier              int
+		id, name, runtime, template string
+		tier                        int
 	}
-	toResume := []wsInfo{{id, wsName, dbRuntime, tier}}
+	toResume := []wsInfo{{id, wsName, dbRuntime, dbTemplate, tier}}
 	var descendantList []gin.H
 	rows, err := db.DB.QueryContext(ctx,
 		`WITH RECURSIVE descendants AS (
-			SELECT id, name, tier, COALESCE(runtime, 'claude-code') AS runtime FROM workspaces WHERE parent_id = $1 AND status = 'paused'
+			SELECT id, name, tier, COALESCE(runtime, 'claude-code') AS runtime, COALESCE(template, '') AS template FROM workspaces WHERE parent_id = $1 AND status = 'paused'
 			UNION ALL
-			SELECT w.id, w.name, w.tier, COALESCE(w.runtime, 'claude-code') FROM workspaces w JOIN descendants d ON w.parent_id = d.id WHERE w.status = 'paused'
-		) SELECT id, name, tier, runtime FROM descendants`, id)
+			SELECT w.id, w.name, w.tier, COALESCE(w.runtime, 'claude-code'), COALESCE(w.template, '') FROM workspaces w JOIN descendants d ON w.parent_id = d.id WHERE w.status = 'paused'
+		) SELECT id, name, tier, runtime, template FROM descendants`, id)
 	if err != nil {
 		log.Printf("Resume: descendant query failed for %s: %v", id, err)
 	}
@@ -1190,7 +1190,7 @@ func (h *WorkspaceHandler) Resume(c *gin.Context) {
 		defer rows.Close()
 		for rows.Next() {
 			var ws wsInfo
-			if rows.Scan(&ws.id, &ws.name, &ws.tier, &ws.runtime) == nil {
+			if rows.Scan(&ws.id, &ws.name, &ws.tier, &ws.runtime, &ws.template) == nil {
 				toResume = append(toResume, ws)
 				descendantList = append(descendantList, gin.H{"id": ws.id, "name": ws.name})
 			}
@@ -1216,16 +1216,11 @@ func (h *WorkspaceHandler) Resume(c *gin.Context) {
 			log.Printf("Resume: failed to set provisioning status for %s: %v", ws.id, err)
 		}
 		h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceProvisioning), ws.id, map[string]interface{}{
-			"name": ws.name, "tier": ws.tier, "runtime": ws.runtime,
+			"name": ws.name, "tier": ws.tier, "runtime": ws.runtime, "template": ws.template,
 		})
-		payload := withStoredCompute(ctx, ws.id, models.CreateWorkspacePayload{Name: ws.name, Tier: ws.tier, Runtime: ws.runtime})
-		// RFC#2843 #33: restore the persisted template on SaaS resume so config +
-		// prompts re-deliver (see runRestartCycle for the full rationale).
-		if h.cpProv != nil {
-			if storedTmpl := storedWorkspaceTemplate(ctx, ws.id); storedTmpl != "" {
-				payload.Template = storedTmpl
-			}
-		}
+		// Phase 1 template decoupling: the workspace row stores the template
+		// explicitly, so resume carries it through CreateWorkspacePayload.
+		payload := withStoredCompute(ctx, ws.id, models.CreateWorkspacePayload{Name: ws.name, Tier: ws.tier, Runtime: ws.runtime, Template: ws.template})
 		// Resume is provision-only (workspace is paused, no live container
 		// to stop). provisionWorkspaceAuto handles backend routing and the
 		// no-backend mark-failed fallback identically to Create. Pre-

@@ -681,10 +681,10 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 	// returns the actually-persisted name (which we MUST thread back into
 	// payload + broadcast so the canvas displays what the DB has).
 	const insertWorkspaceSQL = `
-		INSERT INTO workspaces (id, name, role, tier, runtime, status, parent_id, workspace_dir, workspace_access, budget_limit, max_concurrent_tasks, delivery_mode)
-		VALUES ($1, $2, $3, $4, $5, 'provisioning', $6, $7, $8, $9, $10, $11)
+		INSERT INTO workspaces (id, name, role, tier, runtime, template, status, parent_id, workspace_dir, workspace_access, budget_limit, max_concurrent_tasks, delivery_mode)
+		VALUES ($1, $2, $3, $4, $5, $6, 'provisioning', $7, $8, $9, $10, $11, $12)
 	`
-	insertArgs := []any{id, payload.Name, role, payload.Tier, payload.Runtime, payload.ParentID, workspaceDir, workspaceAccess, payload.BudgetLimit, maxConcurrent, deliveryMode}
+	insertArgs := []any{id, payload.Name, role, payload.Tier, payload.Runtime, payload.Template, payload.ParentID, workspaceDir, workspaceAccess, payload.BudgetLimit, maxConcurrent, deliveryMode}
 	persistedName, currentTx, err := insertWorkspaceWithNameRetry(
 		ctx,
 		tx,

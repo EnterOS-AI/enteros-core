@@ -348,3 +348,32 @@ func templateIdentityForRuntime(runtime string) (string, bool) {
 	}
 	return rr.Repo + "@" + rr.Ref, true
 }
+
+// isKnownTemplate reports whether name is a registered workspace template in
+// manifest.json. The empty string is intentionally NOT known — it is the
+// "no installed template" sentinel and falls back to runtime resolution.
+func isKnownTemplate(name string) bool {
+	if name == "" {
+		return false
+	}
+	_, ok := templateRepoByName[name]
+	return ok
+}
+
+// resolveTemplateIdentity returns the Gitea template identity (repo@ref) for a
+// workspace. If a template is explicitly installed, it wins; otherwise the
+// runtime's default template is used. This is the SSOT for the RFC #2843 asset
+// fetcher and for the control-plane provision wire.
+//
+// Fail-closed: an explicitly set but unknown template returns ("", false) so
+// callers can surface a 422 instead of silently degrading to the runtime
+// fallback (matches the create-boundary posture for unknown runtimes).
+func resolveTemplateIdentity(template, runtime string) (string, bool) {
+	if template != "" {
+		if rr, ok := templateRepoByName[template]; ok {
+			return rr.Repo + "@" + rr.Ref, true
+		}
+		return "", false
+	}
+	return templateIdentityForRuntime(runtime)
+}

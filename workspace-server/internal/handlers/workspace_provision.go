@@ -384,6 +384,7 @@ func (h *WorkspaceHandler) buildProvisionerConfig(
 	return provisioner.WorkspaceConfig{
 		WorkspaceID:     workspaceID,
 		TemplatePath:    templatePath,
+		Template:        payload.Template,
 		ConfigFiles:     configFiles,
 		PluginsPath:     pluginsPath,
 		WorkspacePath:   workspacePath,
@@ -418,34 +419,25 @@ func (h *WorkspaceHandler) buildProvisionerConfig(
 		// reader's sql.ErrNoRows path was producing already.
 		Image: "",
 
-		// RFC #2843 #24 PR-B — wire the generic template-asset
-		// channel. cfg.TemplateIdentity is derived from the
-		// runtime_registry (manifest.json's workspace_templates
-		// entry for this runtime) — the format is "<repo>@<ref>"
-		// (the giteaTemplateAssetFetcher parses this further as
-		// "<owner>/<repo>@<ref>"). External-like runtimes
-		// (external / kimi / kimi-cli / mock) have NO template
-		// repo, so the identity is left empty — the SCAFFOLD
-		// gate in collectCPConfigFiles treats empty identity as
-		// "skip the fetcher" (pre-scaffold behavior preserved).
-		//
-		// The fetcher itself is assigned by the caller (main.go
-		// for SaaS, or a test helper) via h.giteaTemplateFetcher
-		// — wired here so the fetcher resolution is one place,
-		// not duplicated across first-provision + restart paths.
-		// nil fetcher = "no fetcher wired" (self-host default;
-		// falls through to the local TemplatePath path).
-		TemplateIdentity:     templateIdentityForTemplateOrRuntime(conciergeTemplateOrDefault(kind, payload.Template), payload.Runtime),
+		// RFC #2843 #24 PR-B + Phase 1 template decoupling: derive the
+		// template identity from the installed template first, falling back
+		// to the runtime's default template. For kind='platform' concierges
+		// with no explicit template, force "platform-agent" so the concierge
+		// persona/config is delivered (RFC §5.7; #30/#2970). The empty
+		// identity tells the SCAFFOLD gate in collectCPConfigFiles to skip
+		// the fetcher (external runtimes).
+		TemplateIdentity:     templateIdentityOrEmpty(resolveTemplateIdentity(conciergeTemplateOrDefault(kind, payload.Template), payload.Runtime)),
 		TemplateAssetFetcher: h.giteaTemplateFetcher,
 	}
 }
 
-// templateIdentityForRuntimeOrEmpty is a tiny wrapper around
-// templateIdentityForRuntime that returns "" on miss (rather
-// than the (string, bool) tuple). Used at the call site so
-// the assignment can be a single expression.
-func templateIdentityForRuntimeOrEmpty(runtime string) string {
-	id, _ := templateIdentityForRuntime(runtime)
+// templateIdentityOrEmpty is a tiny wrapper around resolveTemplateIdentity
+// that returns "" on miss (rather than the (string, bool) tuple). Used at the
+// call site so the assignment can be a single expression.
+func templateIdentityOrEmpty(id string, ok bool) string {
+	if !ok {
+		return ""
+	}
 	return id
 }
 
@@ -469,7 +461,7 @@ func templateIdentityForTemplateOrRuntime(template, runtime string) string {
 			return id
 		}
 	}
-	return templateIdentityForRuntimeOrEmpty(runtime)
+	return templateIdentityOrEmpty(templateIdentityForRuntime(runtime))
 }
 
 // issueAndInjectToken rotates the workspace auth token and injects the
