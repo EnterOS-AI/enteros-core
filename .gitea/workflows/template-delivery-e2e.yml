@@ -1,0 +1,71 @@
+name: template-delivery-e2e
+
+# RFC #2843 regression gate — provisions a fresh tenant + fresh seo-agent and
+# asserts the template-asset channel actually delivers config + prompts +
+# agent-skills + model end to end. This is the gate that would have caught the
+# 2026-06-15 incident family (#2919 model/identity drop + #32 skill drop):
+# nothing else in CI provisions a fresh agent and inspects the DELIVERED
+# /configs.
+#
+# STAGED ROLLOUT (do NOT make required until green):
+#   Phase 1 (now): advisory — runs on the relevant paths + main + dispatch,
+#                  reports RED while the delivery bugs (#2955, #32) are open.
+#                  This proves the gate correctly DETECTS the bug.
+#   Phase 2 (after #2955 + #32 land + this goes green twice): remove
+#                  continue-on-error and add this check to branch protection
+#                  required_status_checks so a future delivery regression is
+#                  merge-blocking.
+#
+# Cost: provisions ONE throwaway tenant + ONE seo-agent (real EC2), teardown
+# trap deletes the org even on failure. Path-filtered so it only runs when the
+# delivery code actually changes.
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [main]
+    paths:
+      - 'workspace-server/internal/provisioner/template_assets.go'
+      - 'workspace-server/internal/provisioner/gitea_template_assets.go'
+      - 'workspace-server/internal/provisioner/cp_provisioner.go'
+      - 'workspace-server/internal/handlers/platform_agent.go'
+      - 'workspace-server/cmd/server/main.go'
+      - 'manifest.json'
+      - 'tests/e2e/test_template_delivery_e2e.sh'
+      - '.gitea/workflows/template-delivery-e2e.yml'
+  pull_request:
+    paths:
+      - 'workspace-server/internal/provisioner/template_assets.go'
+      - 'workspace-server/internal/provisioner/gitea_template_assets.go'
+      - 'workspace-server/internal/provisioner/cp_provisioner.go'
+      - 'workspace-server/internal/handlers/platform_agent.go'
+      - 'workspace-server/cmd/server/main.go'
+      - 'manifest.json'
+      - 'tests/e2e/test_template_delivery_e2e.sh'
+      - '.gitea/workflows/template-delivery-e2e.yml'
+
+concurrency:
+  group: template-delivery-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  delivery:
+    name: Template-asset delivery (fresh seo-agent boots WITH skills)
+    runs-on: ubuntu-latest
+    # Phase 1: advisory. Remove this line in Phase 2 to make it merge-blocking.
+    continue-on-error: true
+    timeout-minutes: 30
+    env:
+      MOLECULE_CP_URL: ${{ vars.CP_URL || 'https://staging-api.moleculesai.app' }}
+      MOLECULE_ADMIN_TOKEN: ${{ secrets.CP_ADMIN_API_TOKEN }}
+      E2E_EXPECTED_MODEL: moonshot/kimi-k2.6
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify required secret present
+        run: |
+          if [ -z "${MOLECULE_ADMIN_TOKEN:-}" ]; then
+            echo "::error::CP_ADMIN_API_TOKEN secret not set — cannot run delivery e2e"
+            exit 2
+          fi
+      - name: Run template-asset delivery e2e
+        run: bash tests/e2e/test_template_delivery_e2e.sh
