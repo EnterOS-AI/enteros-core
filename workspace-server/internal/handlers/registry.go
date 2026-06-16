@@ -898,10 +898,18 @@ func (h *RegistryHandler) Heartbeat(c *gin.Context) {
 	// flip, independent of evaluateStatus. evaluateStatus still owns the OTHER
 	// recovery transitions (offline/degraded/awaiting_agent/failed→online),
 	// which the inline CASE does not touch.
+	//
+	// IMPORTANT (enum scan): `status` is a NOT-NULL `workspace_status` ENUM.
+	// Do NOT wrap it in COALESCE(status, '') — the '' literal is coerced to
+	// the enum type and Postgres rejects it with `invalid input value for
+	// enum workspace_status: ""`, failing the WHOLE row scan. That left
+	// prevStatus = "" on every heartbeat, so the prevStatus=='provisioning'
+	// reconcile trigger NEVER fired (the #32 regression returned). Select the
+	// column bare; it is never NULL.
 	var prevTask string
 	var prevSpend int64
 	var prevStatus string
-	if err := db.DB.QueryRowContext(ctx, `SELECT COALESCE(current_task, ''), COALESCE(monthly_spend, 0), COALESCE(status, '') FROM workspaces WHERE id = $1`, payload.WorkspaceID).Scan(&prevTask, &prevSpend, &prevStatus); err != nil {
+	if err := db.DB.QueryRowContext(ctx, `SELECT COALESCE(current_task, ''), COALESCE(monthly_spend, 0), status FROM workspaces WHERE id = $1`, payload.WorkspaceID).Scan(&prevTask, &prevSpend, &prevStatus); err != nil {
 		log.Printf("registry heartbeat: prev_task query failed for workspace %s: %v", payload.WorkspaceID, err)
 	}
 

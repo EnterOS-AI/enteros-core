@@ -271,7 +271,14 @@ func TestHeartbeatHandler_ProvisioningToOnline(t *testing.T) {
 
 	// prevTask + prevStatus SELECT — prevStatus='provisioning' is the state a
 	// freshly-created workspace is in before its first heartbeat.
-	mock.ExpectQuery("SELECT COALESCE\\(current_task").
+	//
+	// The matcher pins `status` selected BARE (not COALESCE-wrapped): `status`
+	// is a NOT-NULL workspace_status ENUM, and COALESCE(status, '') coerces ''
+	// to the enum → Postgres `invalid input value for enum workspace_status: ""`
+	// → the whole row scan fails → prevStatus stays "" → this reconcile trigger
+	// NEVER fires (the live #32 regression). Requiring `, status FROM workspaces`
+	// here makes a re-introduced COALESCE(status, ...) fail this unit test.
+	mock.ExpectQuery("SELECT COALESCE\\(current_task, ''\\), COALESCE\\(monthly_spend, 0\\), status FROM workspaces").
 		WithArgs("ws-provisioning").
 		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "provisioning"))
 
