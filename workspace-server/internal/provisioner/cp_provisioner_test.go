@@ -447,11 +447,12 @@ func TestStart_CollectsConfigFiles(t *testing.T) {
 // the Start → cpProvisionRequest path end-to-end so a future
 // refactor that re-merges the two transports would be caught.
 func TestStart_SendsTemplateAssetsOnSeparateField(t *testing.T) {
+	// RFC#2843 #32: agent-skills are plugins now and are NOT carried on the
+	// asset channel — the fetcher emits only config.yaml + prompts/*.
 	prov := &fakeTemplateAssetFetcher{
 		bundle: map[string][]byte{
-			"config.yaml":                    []byte("# from template repo"),
-			"prompts/system.md":              []byte("# template system prompt"),
-			"agent-skills/seo-audit/SKILL.md": []byte("# 716 KiB SEO skill goes here"),
+			"config.yaml":       []byte("# from template repo"),
+			"prompts/system.md": []byte("# template system prompt"),
 		},
 	}
 
@@ -465,11 +466,11 @@ func TestStart_SendsTemplateAssetsOnSeparateField(t *testing.T) {
 
 	p := &CPProvisioner{baseURL: srv.URL, orgID: "org-1", httpClient: srv.Client()}
 	_, err := p.Start(context.Background(), WorkspaceConfig{
-		WorkspaceID:         "ws-1",
-		Runtime:             "claude-code",
-		Tier:                2,
-		PlatformURL:         "http://tenant",
-		TemplateIdentity:    "seo-agent-v1.2.3",
+		WorkspaceID:          "ws-1",
+		Runtime:              "claude-code",
+		Tier:                 2,
+		PlatformURL:          "http://tenant",
+		TemplateIdentity:     "seo-agent-v1.2.3",
 		TemplateAssetFetcher: prov,
 		// No cfg.ConfigFiles — pure fetcher path. If the wire
 		// shape is right, TemplateAssets is non-empty and
@@ -479,8 +480,9 @@ func TestStart_SendsTemplateAssetsOnSeparateField(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 
-	// 1. TemplateAssets must contain the fetched files.
-	if got, want := len(gotBody.TemplateAssets), 3; got != want {
+	// 1. TemplateAssets must contain the fetched files (config.yaml + prompts
+	//    only — agent-skills are plugins now, RFC#2843 #32).
+	if got, want := len(gotBody.TemplateAssets), 2; got != want {
 		t.Errorf("TemplateAssets length = %d, want %d (fetcher output must reach the wire)", got, want)
 	}
 	if got, want := string(gotBody.TemplateAssets["config.yaml"]), "# from template repo"; got != want {
@@ -488,9 +490,6 @@ func TestStart_SendsTemplateAssetsOnSeparateField(t *testing.T) {
 	}
 	if got, want := string(gotBody.TemplateAssets["prompts/system.md"]), "# template system prompt"; got != want {
 		t.Errorf("TemplateAssets[prompts/system.md] = %q, want %q", got, want)
-	}
-	if got, want := string(gotBody.TemplateAssets["agent-skills/seo-audit/SKILL.md"]), "# 716 KiB SEO skill goes here"; got != want {
-		t.Errorf("TemplateAssets[agent-skills/seo-audit/SKILL.md] = %q, want %q", got, want)
 	}
 
 	// 2. ConfigFiles must be empty — the transport split.
@@ -520,11 +519,11 @@ func TestStart_AbortsOnFetcherAssetOutsideAllowlist(t *testing.T) {
 
 	p := &CPProvisioner{baseURL: srv.URL, orgID: "org-1", httpClient: srv.Client()}
 	_, err := p.Start(context.Background(), WorkspaceConfig{
-		WorkspaceID:         "ws-1",
-		Runtime:             "claude-code",
-		Tier:                2,
-		PlatformURL:         "http://tenant",
-		TemplateIdentity:    "seo-agent-v1.2.3",
+		WorkspaceID:          "ws-1",
+		Runtime:              "claude-code",
+		Tier:                 2,
+		PlatformURL:          "http://tenant",
+		TemplateIdentity:     "seo-agent-v1.2.3",
 		TemplateAssetFetcher: prov,
 	})
 	if err == nil {

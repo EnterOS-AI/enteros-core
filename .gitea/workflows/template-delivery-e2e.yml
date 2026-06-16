@@ -36,6 +36,8 @@ on:
       - 'workspace-server/internal/handlers/platform_agent.go'
       - 'workspace-server/cmd/server/main.go'
       - 'workspace-server/internal/handlers/org_import.go'
+      - 'workspace-server/internal/handlers/workspace.go'
+      - 'workspace-server/internal/handlers/template_plugins.go'
       - 'workspace-server/internal/handlers/plugins_reconcile.go'
       - 'workspace-server/internal/handlers/plugins_install_pipeline.go'
       - 'workspace-server/internal/handlers/plugins_tracking.go'
@@ -51,6 +53,8 @@ on:
       - 'workspace-server/internal/handlers/platform_agent.go'
       - 'workspace-server/cmd/server/main.go'
       - 'workspace-server/internal/handlers/org_import.go'
+      - 'workspace-server/internal/handlers/workspace.go'
+      - 'workspace-server/internal/handlers/template_plugins.go'
       - 'workspace-server/internal/handlers/plugins_reconcile.go'
       - 'workspace-server/internal/handlers/plugins_install_pipeline.go'
       - 'workspace-server/internal/handlers/plugins_tracking.go'
@@ -64,8 +68,14 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Job renamed for the RFC#2843 #32 two-channel contract (config+prompts via
+  # the asset channel; seo-all installs via the post-online plugin reconcile,
+  # not at boot). Renaming the job changes the emitted status context.
+  # bp-exempt: advisory Phase-1 gate (continue-on-error, mc#2996) — informational, not a required BP context.
   delivery:
-    name: Template-asset delivery (fresh seo-agent boots WITH skills)
+    # No colon in the name — lint-required-context's PyYAML AST parse rejects an
+    # unquoted scalar containing a colon.
+    name: Template-asset delivery (fresh seo-agent — config+prompts via asset channel, seo-all via plugin reconcile)
     runs-on: ubuntu-latest
     # Phase 1: advisory. Remove this line in Phase 2 to make it merge-blocking.
     # mc#2996 — Phase 2 promotion tracker (remove continue-on-error; forced 14d renewal cadence).

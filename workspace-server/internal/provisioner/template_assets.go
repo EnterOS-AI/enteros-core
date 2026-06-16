@@ -3,12 +3,17 @@ package provisioner
 // template_assets.go — generic template-asset channel (RFC #2843 #24).
 //
 // This is the "generic, non-secret asset channel" the RFC proposes:
-// a workspace's template assets (config.yaml + prompts/ + agent-skills/)
-// are materialized from a template identity (resolved by the caller —
+// a workspace's template assets (config.yaml + prompts/) are
+// materialized from a template identity (resolved by the caller —
 // the template repo path, a cached ref, etc.) rather than forced
 // through the AWS Secrets Manager config bundle path that caps at
-// cpConfigFilesMaxBytes (256 KiB) and silently drops any skill over
-// the cap.
+// cpConfigFilesMaxBytes (256 KiB).
+//
+// agent-skills are NO LONGER carried on this channel (RFC#2843 #32):
+// skills are PLUGINS now, installed dynamically post-online via the
+// plugin pipeline (the gitea:// plugin resolver reads the
+// agent-skills/<skill> subpath from the template repo at install
+// time). See IsCPTemplateAssetPath for the load-bearing allowlist.
 //
 // The fetcher is interface-typed so tests inject fakes and the real
 // implementation (in main.go) wires the Gitea shallow-clone per
@@ -48,14 +53,15 @@ import (
 )
 
 // TemplateAssetFetcher materializes a template's
-// config.yaml + prompts/ + agent-skills/ from a non-secret
-// asset channel (template repo, Gitea shallow clone per
-// RFC #2843 §4.2). Returned paths are RELATIVE to the
-// template asset root (e.g. "config.yaml", "prompts/system.md",
-// "agent-skills/seo-audit/SKILL.md") and the bytes are raw
+// config.yaml + prompts/ from a non-secret asset channel
+// (template repo, Gitea shallow clone per RFC #2843 §4.2).
+// Returned paths are RELATIVE to the template asset root (e.g.
+// "config.yaml", "prompts/system.md") and the bytes are raw
 // file contents (not base64-encoded — the generic channel
 // does not require encoding; the wire format encodes per
-// its own transport).
+// its own transport). agent-skills/* paths are NOT eligible
+// (RFC#2843 #32 — skills are plugins now; see IsCPTemplateAssetPath)
+// and are rejected at the consumer boundary if returned.
 //
 // Returned errors: a transport / resolution failure is
 // returned as a non-nil error so the caller can abort the
@@ -79,14 +85,28 @@ type TemplateAssetFetcher interface {
 //
 //   - "config.yaml" — the runtime entrypoint config
 //   - "prompts/*"   — system prompts
-//   - "agent-skills/*" — the agent's skill packages
 //
 // Everything else is REJECTED. Specifically excluded:
-// MEMORY.md / USER.md (curated durable memory — agent-owned
-// state, reconciled by the boot entrypoint, not by this
-// collect path), CLAUDE.md (runtime memory file, agent-owned),
-// .claude/sessions/* (Claude Code session dir, agent-owned),
-// anything outside the template-asset namespace.
+//   - "agent-skills/*" — agent skills are NO LONGER asset-channel
+//     eligible (RFC#2843 #32). Skills are PLUGINS now: they install
+//     DYNAMICALLY after the workspace boots online, via the plugin
+//     install pipeline (gitea:// plugin source → the reconcile reads
+//     the agent-skills/<skill> subpath from the template repo at
+//     INSTALL time), NOT through this provisioning-time asset channel.
+//     Keeping agent-skills/* in this allowlist re-created the original
+//     #2831 failure: the ~716 KiB seo-all skill tree got pulled into
+//     the provision request, which fail-closed BEFORE the CP was ever
+//     called (the asset payload no longer rides SM, but the skills
+//     have no business in the provision payload at all now that they
+//     are plugins). The skill files MUST remain in the template repo
+//     (the gitea:// plugin resolver reads them at install time) — this
+//     allowlist only governs what the PROVISION-TIME asset channel
+//     carries.
+//   - MEMORY.md / USER.md (curated durable memory — agent-owned state,
+//     reconciled by the boot entrypoint, not by this collect path),
+//   - CLAUDE.md (runtime memory file, agent-owned),
+//   - .claude/sessions/* (Claude Code session dir, agent-owned),
+//   - anything outside the template-asset namespace.
 //
 // Path normalization: the function applies filepath.ToSlash
 // + filepath.Clean before matching, so Windows-style
@@ -100,8 +120,7 @@ type TemplateAssetFetcher interface {
 func IsCPTemplateAssetPath(name string) bool {
 	name = filepath.ToSlash(filepath.Clean(name))
 	return name == "config.yaml" ||
-		strings.HasPrefix(name, "prompts/") ||
-		strings.HasPrefix(name, "agent-skills/")
+		strings.HasPrefix(name, "prompts/")
 }
 
 // noopTemplateAssetFetcher is the self-host default fetcher (PR-B

@@ -110,21 +110,21 @@ const (
 
 // WorkspaceConfig holds the parameters needed to provision a workspace container.
 type WorkspaceConfig struct {
-	WorkspaceID     string
-	TemplatePath    string            // Host path to template dir to copy from (e.g. claude-code-default/)
-	TemplateIdentity string           // RFC #2843 #24: opaque token the TemplateAssetFetcher resolves to the template repo+ref (e.g. "claudius-v1.2.3" or a sha). Used by SaaS; ignored by the local-dir TemplatePath path.
-	ConfigFiles     map[string][]byte // Generated config files to write into /configs volume
-	PluginsPath     string            // Host path to plugins directory (mounted at /plugins)
-	WorkspacePath   string            // Host path to bind-mount as /workspace (if empty, uses Docker named volume)
-	Tier            int
-	Runtime         string // "claude-code" (default), "codex", "hermes", "openclaw", etc.
-	InstanceType    string // Optional CP EC2 instance type override (SaaS only)
-	DiskGB          int32  // Optional CP root volume size override in GiB (SaaS only)
-	DataPersistence string // internal#734: "persist"|"ephemeral"|"" — durable-data choice forwarded to CP (SaaS only)
-	Provider        string // multi-provider RFC: ""/"aws"|"hetzner"|"gcp" compute backend for the workspace box (per-workspace; distinct from LLM/model provider). Forwarded to CP.
-	Display         WorkspaceDisplayConfig
-	EnvVars         map[string]string // Additional env vars (API keys, etc.)
-	PlatformURL     string
+	WorkspaceID      string
+	TemplatePath     string            // Host path to template dir to copy from (e.g. claude-code-default/)
+	TemplateIdentity string            // RFC #2843 #24: opaque token the TemplateAssetFetcher resolves to the template repo+ref (e.g. "claudius-v1.2.3" or a sha). Used by SaaS; ignored by the local-dir TemplatePath path.
+	ConfigFiles      map[string][]byte // Generated config files to write into /configs volume
+	PluginsPath      string            // Host path to plugins directory (mounted at /plugins)
+	WorkspacePath    string            // Host path to bind-mount as /workspace (if empty, uses Docker named volume)
+	Tier             int
+	Runtime          string // "claude-code" (default), "codex", "hermes", "openclaw", etc.
+	InstanceType     string // Optional CP EC2 instance type override (SaaS only)
+	DiskGB           int32  // Optional CP root volume size override in GiB (SaaS only)
+	DataPersistence  string // internal#734: "persist"|"ephemeral"|"" — durable-data choice forwarded to CP (SaaS only)
+	Provider         string // multi-provider RFC: ""/"aws"|"hetzner"|"gcp" compute backend for the workspace box (per-workspace; distinct from LLM/model provider). Forwarded to CP.
+	Display          WorkspaceDisplayConfig
+	EnvVars          map[string]string // Additional env vars (API keys, etc.)
+	PlatformURL      string
 
 	// WorkspaceSecretKeys are env keys authored via the workspace_secrets table
 	// (user/org-admin set, per-workspace). The Forensic #145 SCM-write-token
@@ -137,7 +137,8 @@ type WorkspaceConfig struct {
 
 	// TemplateAssetFetcher (RFC #2843 #24) is the generic
 	// non-secret asset channel for template assets
-	// (config.yaml + prompts/ + agent-skills/). The fetcher
+	// (config.yaml + prompts/ — agent-skills are plugins now,
+	// RFC#2843 #32, and are not carried here). The fetcher
 	// resolves cfg.TemplateIdentity to a shallow clone of the
 	// template repo (Gitea per RFC §4.2 transport option (a))
 	// and returns the asset file map. nil = no provider wired
@@ -282,7 +283,7 @@ type dockerClient interface {
 
 // Provisioner manages Docker containers for workspace agents.
 type Provisioner struct {
-	cli        dockerClient
+	cli         dockerClient
 	alpineImage string // overridable in tests; production uses the digest-pinned default
 }
 
@@ -592,7 +593,6 @@ func buildStartWorkspaceEnv(cfg WorkspaceConfig, hostPort string) []string {
 	return append(buildContainerEnv(cfg),
 		fmt.Sprintf("MOLECULE_WORKSPACE_URL=%s", workspaceAdvertiseURL(hostPort)))
 }
-
 
 // resolveStartWorkspaceHostURL computes the hostURL that StartWorkspace
 // should return to the platform. The host comes from workspaceAdvertiseURL

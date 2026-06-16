@@ -7,8 +7,9 @@ package provisioner
 // Transport: GET {baseURL}/api/v1/repos/<owner>/<repo>/archive/<ref>.tar.gz
 // with header "Authorization: token <token>" → stream-extract the
 // tarball → return map[relpath][]byte for ONLY allowlisted paths
-// (config.yaml + prompts/** + agent-skills/**) → strip the archive's
-// top-level dir prefix.
+// (config.yaml + prompts/** — agent-skills are plugins now, RFC#2843
+// #32, and are skipped by the IsCPTemplateAssetPath filter) → strip
+// the archive's top-level dir prefix.
 //
 // Template identity format: "<owner>/<repo>@<ref>" (e.g.
 // "molecule-ai/workspace-template-claude-code@main"). The caller
@@ -22,14 +23,16 @@ package provisioner
 // persisted-bundle provider in #2831 PIECE 1).
 //
 // Memory-preservation: this fetcher ONLY materializes TEMPLATE
-// ASSETS (config.yaml + prompts/* + agent-skills/*). The existing
-// IsCPTemplateAssetPath allowlist in the consumer (collectCPConfigFiles)
-// is the load-bearing guard against a fetcher that returns a path
-// outside the template-asset namespace (e.g. /workspace, MEMORY.md,
-// USER.md, CLAUDE.md, .claude/sessions/*) — those would either be
-// rejected by the allowlist (provision aborts) or, if they somehow
-// slipped through, would land in the SEPARATE TemplateAssets field
-// rather than the SM-bound ConfigFiles field. The transport split
+// ASSETS (config.yaml + prompts/*). agent-skills/* are NOT carried
+// (RFC#2843 #32 — skills are plugins now, installed post-online); the
+// IsCPTemplateAssetPath filter below skips them. That same allowlist
+// in the consumer (collectCPConfigFiles) is the load-bearing guard
+// against a fetcher that returns a path outside the template-asset
+// namespace (e.g. agent-skills/*, /workspace, MEMORY.md, USER.md,
+// CLAUDE.md, .claude/sessions/*) — those would either be rejected by
+// the allowlist (provision aborts) or, if they somehow slipped
+// through, would land in the SEPARATE TemplateAssets field rather
+// than the SM-bound ConfigFiles field. The transport split
 // (TemplateAssets vs ConfigFiles) is the second line of defense
 // against clobbering agent-owned state.
 //
@@ -221,7 +224,10 @@ func (f *giteaTemplateAssetFetcher) Load(ctx context.Context, templateIdentity s
 		// (collectCPConfigFiles) ALSO gates on IsCPTemplateAssetPath;
 		// skipping non-allowlisted entries here is a free perf win
 		// (don't allocate bytes for paths the consumer will reject)
-		// and a cleaner audit log.
+		// and a cleaner audit log. Per RFC#2843 #32 this also skips the
+		// (potentially large) agent-skills/* tree — skills are plugins
+		// now, fetched at install time by the gitea:// plugin resolver,
+		// NOT carried on this provisioning-time channel.
 		if !IsCPTemplateAssetPath(rel) {
 			continue
 		}

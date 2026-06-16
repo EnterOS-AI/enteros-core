@@ -415,8 +415,10 @@ func templateIdentityForRuntimeOrEmpty(runtime string) string {
 // template VARIANT like seo-agent has runtime="claude-code" but
 // template="seo-agent"; keying the fetch on runtime looked up
 // templateRepoByName["claude-code"] (no such key) → empty identity → the
-// fetcher delivered NOTHING, so agent-skills/seo-all never reached the box
-// (config.yaml + prompts arrived via the legacy SM path, masking it). #32.
+// fetcher delivered NOTHING, so the seo-agent box got a stub config.yaml.
+// With this fix the seo-agent identity resolves and config.yaml + prompts
+// arrive via the asset channel. (agent-skills/seo-all is no longer carried
+// here at all — RFC#2843 #32: skills are plugins, installed post-online.)
 // Falls back to runtime for the common case where runtime==template name
 // (hermes/codex/openclaw/google-adk), and to "" when neither resolves (external
 // runtimes — collectCPConfigFiles treats empty identity as "skip the fetcher").

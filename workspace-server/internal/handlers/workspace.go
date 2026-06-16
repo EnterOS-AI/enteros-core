@@ -105,7 +105,7 @@ type WorkspaceHandler struct {
 	// state used by maybeMarkContainerDead. A transient A2A forward error
 	// or a single flaky IsRunning probe must not recycle a recently-alive
 	// container (#2929). Protected because ProxyA2A is called concurrently.
-	deadProbeMu sync.Mutex
+	deadProbeMu       sync.Mutex
 	deadProbeAttempts map[string]deadProbeRecord
 
 	// asyncWG tracks goroutines launched by goAsync so tests can wait
@@ -1005,6 +1005,28 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 				log.Printf("Create %s: template schedule partial-seed: seeded=%d skipped=%d total=%d", id, seeded, skipped, len(templateScheds))
 			} else {
 				log.Printf("Create %s: seeded %d/%d template schedules", id, seeded, len(templateScheds))
+			}
+		}
+	}
+
+	// Record the template's declared plugins (RFC#2843 #32) so the post-online
+	// reconcile (ReconcileWorkspacePlugins) installs them once the box is
+	// reachable. agent-skills are PLUGINS now — they install dynamically
+	// post-online, NOT via the provisioning channel — so a Create that omits
+	// this step leaves workspace_declared_plugins empty, the reconcile no-ops,
+	// and (e.g.) seo-all never installs. This mirrors the org_import.go loop;
+	// recordDeclaredPlugin upserts ON CONFLICT so it is idempotent across
+	// re-creates. Non-fatal: a broken plugins block must never block
+	// provisioning (the workspace row is already live).
+	if provisionOK && templatePath != "" {
+		if declaredPlugins, parseErr := parseTemplatePlugins(templatePath); parseErr != nil {
+			log.Printf("Create %s: parsing template plugins: %v (continuing)", id, parseErr)
+		} else if len(declaredPlugins) > 0 {
+			recorded, skipped := seedTemplatePlugins(ctx, id, declaredPlugins)
+			if skipped > 0 {
+				log.Printf("Create %s: template declared-plugin partial-record: recorded=%d skipped=%d total=%d", id, recorded, skipped, len(declaredPlugins))
+			} else {
+				log.Printf("Create %s: recorded %d/%d template declared plugins", id, recorded, len(declaredPlugins))
 			}
 		}
 	}

@@ -11,9 +11,9 @@ package provisioner
 //      SM-bound ConfigFiles).
 //   3. Every key in the fetcher's output is gated by
 //      IsCPTemplateAssetPath. Paths outside the template-asset
-//      allowlist (config.yaml / prompts/* / agent-skills/*) ABORT
-//      the provision — Reviewer-CR2 RC #11690's load-bearing
-//      blast-radius guard.
+//      allowlist (config.yaml / prompts/* only — agent-skills are
+//      plugins now, RFC#2843 #32) ABORT the provision — Reviewer-CR2
+//      RC #11690's load-bearing blast-radius guard.
 //   4. A transport error on the fetcher ABORTS the provision
 //      (fail-closed; never regresses to stub /configs).
 //   5. Nil fetcher = no-op (self-host default; the existing
@@ -55,9 +55,8 @@ func (f *fakeTemplateAssetFetcher) Load(_ context.Context, templateIdentity stri
 func TestCollectCPConfigFiles_MergesFetcherAssets(t *testing.T) {
 	prov := &fakeTemplateAssetFetcher{
 		bundle: map[string][]byte{
-			"config.yaml":                     []byte("# from template repo"),
-			"prompts/system.md":               []byte("# template system prompt"),
-			"agent-skills/seo-audit/SKILL.md": []byte("# seo skill"),
+			"config.yaml":       []byte("# from template repo"),
+			"prompts/system.md": []byte("# template system prompt"),
 		},
 	}
 	cfg := WorkspaceConfig{
@@ -69,13 +68,15 @@ func TestCollectCPConfigFiles_MergesFetcherAssets(t *testing.T) {
 	if err != nil {
 		t.Fatalf("collectCPConfigFiles: %v", err)
 	}
-	// All 3 fetched assets land in TemplateAssets (the
+	// The fetched assets land in TemplateAssets (the
 	// non-secret transport), NOT in ConfigFiles (the SM-bound
 	// bundle). The transport split is the load-bearing fix.
+	// NB (RFC#2843 #32): agent-skills/* are NOT carried on this
+	// channel anymore — skills are plugins. Only config.yaml +
+	// prompts/* are asset-eligible.
 	wantKeys := []string{
 		"config.yaml",
 		"prompts/system.md",
-		"agent-skills/seo-audit/SKILL.md",
 	}
 	for _, wk := range wantKeys {
 		if _, ok := assets[wk]; !ok {
@@ -88,6 +89,33 @@ func TestCollectCPConfigFiles_MergesFetcherAssets(t *testing.T) {
 	// Fetcher was called once with the right identity.
 	if len(prov.calls) != 1 || prov.calls[0] != "seo-agent-v1.2.3" {
 		t.Errorf("expected one Load call with identity=seo-agent-v1.2.3, got calls=%v", prov.calls)
+	}
+}
+
+// TestCollectCPConfigFiles_RejectsAgentSkillsAsset is the RFC#2843 #32
+// regression: a fetcher that returns an agent-skills/* path must ABORT the
+// provision (skills are plugins now, NOT asset-channel eligible). Before #32
+// the allowlist admitted agent-skills/* and the ~716 KiB seo-all tree got
+// pulled into the provision payload, which fail-closed BEFORE the CP was ever
+// called. Guards against re-adding agent-skills/* to IsCPTemplateAssetPath.
+func TestCollectCPConfigFiles_RejectsAgentSkillsAsset(t *testing.T) {
+	prov := &fakeTemplateAssetFetcher{
+		bundle: map[string][]byte{
+			"config.yaml":                     []byte("# from template repo"),
+			"agent-skills/seo-audit/SKILL.md": []byte("# 716 KiB skill tree does not belong here"),
+		},
+	}
+	cfg := WorkspaceConfig{
+		TemplateIdentity:     "seo-agent-v1.2.3",
+		TemplateAssetFetcher: prov,
+	}
+
+	_, _, err := collectCPConfigFiles(cfg)
+	if err == nil {
+		t.Fatal("expected collectCPConfigFiles to abort when fetcher returns an agent-skills/* path, got nil")
+	}
+	if !stringsContains(err.Error(), "allowlist") {
+		t.Errorf("expected the reject error to mention the allowlist, got: %v", err)
 	}
 }
 
@@ -138,9 +166,9 @@ func TestCollectCPConfigFiles_CallerWinsOnConfigFiles(t *testing.T) {
 // /configs (the same fail-closed contract as the
 // persisted-bundle provider in #2831 PIECE 1). If a future
 // refactor swallows the fetch error, the bundle would
-// silently miss the agent-skills/ files and the workspace
-// would boot with a stub config — the exact regression
-// this test guards against.
+// silently miss the config.yaml + prompts files and the
+// workspace would boot with a stub config — the exact
+// regression this test guards against.
 func TestCollectCPConfigFiles_FetcherErrorAborts(t *testing.T) {
 	prov := &fakeTemplateAssetFetcher{err: errors.New("gitea 503")}
 	cfg := WorkspaceConfig{
@@ -221,17 +249,22 @@ func TestIsCPTemplateAssetPath_AllowsPromptsPrefix(t *testing.T) {
 	}
 }
 
-// TestIsCPTemplateAssetPath_AllowsAgentSkillsPrefix pins
-// the agent-skills/* namespace (the load-bearing addition
-// for the 716 KiB SEO skill package per core-devops 10:13).
-func TestIsCPTemplateAssetPath_AllowsAgentSkillsPrefix(t *testing.T) {
-	for _, ok := range []string{
+// TestIsCPTemplateAssetPath_RejectsAgentSkillsPrefix pins the RFC#2843 #32
+// contract: agent-skills/* is NO LONGER asset-channel eligible. Skills are
+// PLUGINS now — they install dynamically post-online via the plugin pipeline
+// (the gitea:// resolver reads agent-skills/<skill> from the template repo at
+// install time), NOT through the provisioning-time asset channel. Keeping
+// agent-skills/* in the allowlist re-created the #32 fresh-seo-agent provision
+// failure (the ~716 KiB seo-all tree pulled into the provision payload).
+func TestIsCPTemplateAssetPath_RejectsAgentSkillsPrefix(t *testing.T) {
+	for _, bad := range []string{
 		"agent-skills/seo-audit/SKILL.md",
 		"agent-skills/seo-audit/manifest.yaml",
 		"agent-skills/index.json",
+		"agent-skills/seo-all/SKILL.md",
 	} {
-		if !IsCPTemplateAssetPath(ok) {
-			t.Errorf("expected %q to be allowed", ok)
+		if IsCPTemplateAssetPath(bad) {
+			t.Errorf("expected %q to be REJECTED (agent-skills are plugins now, RFC#2843 #32)", bad)
 		}
 	}
 }
@@ -392,8 +425,8 @@ func TestCollectCPConfigFiles_RejectsFetcherAssetOutsideAllowlist(t *testing.T) 
 func TestCollectCPConfigFiles_FetcherAssetsRawBytes(t *testing.T) {
 	prov := &fakeTemplateAssetFetcher{
 		bundle: map[string][]byte{
-			"config.yaml":                     []byte("# raw bytes, will be base64 by marshaler"),
-			"agent-skills/seo-audit/SKILL.md": []byte("raw-skill"),
+			"config.yaml":          []byte("# raw bytes, will be base64 by marshaler"),
+			"prompts/seo-agent.md": []byte("raw-prompt"),
 		},
 	}
 	cfg := WorkspaceConfig{
@@ -407,8 +440,8 @@ func TestCollectCPConfigFiles_FetcherAssetsRawBytes(t *testing.T) {
 	if got := string(assets["config.yaml"]); got != "# raw bytes, will be base64 by marshaler" {
 		t.Errorf("expected raw bytes in TemplateAssets, got %q (encoding happens at marshal time, not at collect time)", got)
 	}
-	if got := string(assets["agent-skills/seo-audit/SKILL.md"]); got != "raw-skill" {
-		t.Errorf("expected raw skill bytes in TemplateAssets, got %q", got)
+	if got := string(assets["prompts/seo-agent.md"]); got != "raw-prompt" {
+		t.Errorf("expected raw prompt bytes in TemplateAssets, got %q", got)
 	}
 }
 
@@ -480,23 +513,28 @@ func stringsContains(s, substr string) bool {
 	return strings.Contains(s, substr)
 }
 
-// TestCollectCPConfigFiles_AssetsAllowLargeSkillPackage is the regression for
+// TestCollectCPConfigFiles_AssetsNotBoundBy256KCap is the regression for
 // Reviewer-CR2's size-cap RC on head 7bcc3b5f: template ASSETS ride a
 // NON-secret channel and must NOT be bound by the 256 KiB SM/config-bundle cap
-// (cpConfigFilesMaxBytes). Reusing that cap re-creates the original #2831
-// skill-drop — the motivating 716 KiB seo-all package would abort client-side.
-// A >256 KiB asset payload must SUCCEED on TemplateAssets (bounded only by the
-// far larger cpTemplateAssetsMaxBytes DoS guard) while ConfigFiles stays capped.
-func TestCollectCPConfigFiles_AssetsAllowLargeSkillPackage(t *testing.T) {
-	// 716 KiB skill blob — over the old 256 KiB cap, well under the asset bound.
+// (cpConfigFilesMaxBytes). A >256 KiB asset payload must SUCCEED on
+// TemplateAssets (bounded only by the far larger cpTemplateAssetsMaxBytes DoS
+// guard) while ConfigFiles stays capped.
+//
+// NB (RFC#2843 #32): agent-skills are NO LONGER asset-eligible (skills are
+// plugins now), so this uses a large prompts/* asset — the largest legitimate
+// asset payload after the skill tree was removed from the channel. In practice
+// the seo-agent asset set is tiny (config.yaml ~8 KiB + prompts ~8 KiB); this
+// test only pins that the asset cap is the larger one, not the SM cap.
+func TestCollectCPConfigFiles_AssetsNotBoundBy256KCap(t *testing.T) {
+	// 716 KiB prompt blob — over the old 256 KiB cap, well under the asset bound.
 	big := make([]byte, 716<<10)
 	for i := range big {
 		big[i] = 'x'
 	}
 	prov := &fakeTemplateAssetFetcher{
 		bundle: map[string][]byte{
-			"config.yaml":                         []byte("# from template repo"),
-			"agent-skills/seo-audit/big-skill.md": big,
+			"config.yaml":           []byte("# from template repo"),
+			"prompts/big-prompt.md": big,
 		},
 	}
 	cfg := WorkspaceConfig{
@@ -506,10 +544,10 @@ func TestCollectCPConfigFiles_AssetsAllowLargeSkillPackage(t *testing.T) {
 
 	_, assets, err := collectCPConfigFiles(cfg)
 	if err != nil {
-		t.Fatalf("a %d-byte skill package must succeed on the non-secret asset channel (no SM cap), got error: %v", len(big), err)
+		t.Fatalf("a %d-byte prompts asset must succeed on the non-secret asset channel (no SM cap), got error: %v", len(big), err)
 	}
-	if got := len(assets["agent-skills/seo-audit/big-skill.md"]); got != len(big) {
-		t.Errorf("expected the full %d-byte skill in TemplateAssets, got %d", len(big), got)
+	if got := len(assets["prompts/big-prompt.md"]); got != len(big) {
+		t.Errorf("expected the full %d-byte prompt in TemplateAssets, got %d", len(big), got)
 	}
 }
 

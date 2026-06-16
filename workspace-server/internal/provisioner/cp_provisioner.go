@@ -177,10 +177,10 @@ type cpProvisionRequest struct {
 	// differing ONLY in image + config overlay). Omitted when empty so the
 	// wire shape is unchanged for ordinary workspaces; an older CP simply
 	// ignores the field.
-	Kind    string                 `json:"kind,omitempty"`
-	Display WorkspaceDisplayConfig `json:"display,omitempty"`
-	PlatformURL     string                 `json:"platform_url"`
-	Env             map[string]string      `json:"env"`
+	Kind        string                 `json:"kind,omitempty"`
+	Display     WorkspaceDisplayConfig `json:"display,omitempty"`
+	PlatformURL string                 `json:"platform_url"`
+	Env         map[string]string      `json:"env"`
 	// ConfigFiles are template + generated config files to write into the
 	// EC2 instance's /configs directory. OFFSEC-010: collected by
 	// collectCPConfigFiles which rejects symlinks and non-regular files
@@ -194,15 +194,16 @@ type cpProvisionRequest struct {
 	ConfigFiles map[string]string `json:"config_files,omitempty"`
 
 	// TemplateAssets (RFC #2843 #24) are non-secret template assets
-	// (config.yaml + prompts/ + agent-skills/) fetched from a
-	// non-secret asset channel (template repo / Gitea shallow clone per
-	// RFC §4.2 transport option (a)). They travel on a SEPARATE wire
-	// field from ConfigFiles (the SM-bound bundle) so a future CP can
-	// route them through a non-secret transport without going through
-	// the SM cap. Serialised as base64 to avoid JSON escaping.
+	// (config.yaml + prompts/ — agent-skills are plugins now, RFC#2843
+	// #32) fetched from a non-secret asset channel (template repo /
+	// Gitea shallow clone per RFC §4.2 transport option (a)). They
+	// travel on a SEPARATE wire field from ConfigFiles (the SM-bound
+	// bundle) so a future CP can route them through a non-secret
+	// transport without going through the SM cap. Serialised as base64
+	// to avoid JSON escaping.
 	//
 	// Keys are restricted to the template-asset allowlist enforced by
-	// IsCPTemplateAssetPath (config.yaml / prompts/* / agent-skills/*);
+	// IsCPTemplateAssetPath (config.yaml / prompts/* only);
 	// see collectCPConfigFiles for the enforcement.
 	TemplateAssets map[string][]byte `json:"template_assets,omitempty"`
 }
@@ -386,15 +387,15 @@ func (p *CPProvisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string,
 const cpConfigFilesMaxBytes = 256 << 10
 
 // cpTemplateAssetsMaxBytes bounds the aggregate TEMPLATE-ASSET payload
-// (config.yaml + prompts/* + agent-skills/*) delivered via the generic
-// non-secret asset channel (RFC #2843 #24). This is a SEPARATE, much larger
-// bound than cpConfigFilesMaxBytes: the config bundle is capped at 256 KiB
-// because it rides the Secrets-Manager/user-data transport, but template
-// ASSETS ride a non-secret channel with no SM size limit — so reusing the
-// 256 KiB cap here would re-create the original #2831 skill-drop failure (the
-// seo-all skill package alone is ~716 KiB). 16 MiB comfortably fits real skill
-// trees + prompts + config while still bounding a runaway/malicious fetcher
-// (pure transport-DoS guard, not a secrets-transport limit).
+// (config.yaml + prompts/* — agent-skills are NO LONGER carried here per
+// RFC#2843 #32; they are plugins installed post-online) delivered via the
+// generic non-secret asset channel (RFC #2843 #24). This is a SEPARATE bound
+// from cpConfigFilesMaxBytes: the config bundle is capped at 256 KiB because
+// it rides the Secrets-Manager/user-data transport, while template ASSETS
+// ride a non-secret channel. With skills removed the legitimate payload is
+// tiny (config.yaml ~8 KiB + prompts ~8 KiB), but we keep a generous 16 MiB
+// bound as a pure transport-DoS guard (not a secrets-transport limit) so a
+// runaway/malicious fetcher can't stream an unbounded body.
 const cpTemplateAssetsMaxBytes = 16 << 20
 
 // isCPTemplateConfigFile restricts which files from a template directory are
@@ -432,14 +433,18 @@ func collectCPConfigFiles(cfg WorkspaceConfig) (map[string]string, map[string][]
 		// Blast-radius guard (RC #11690): a fetcher that returns
 		// paths outside the template-asset namespace is either
 		// a programming error or an attack. Either way, fail closed.
-		// Specifically excluded: MEMORY.md, USER.md, CLAUDE.md
-		// (curated durable memory — agent-owned state, reconciled by
-		// the boot entrypoint, NOT by this collect path), .claude/sessions/
-		// (Claude Code session dir, agent-owned), and any other
-		// agent-state path. The PM-flagged in #24_clarify invariant
-		// is enforced here in code, not in comments.
+		// Specifically excluded: agent-skills/* (RFC#2843 #32 — skills
+		// are plugins now, installed post-online, NOT carried on this
+		// provisioning-time channel; keeping them here re-created the
+		// #2831/#32 716 KiB skill-tree-in-provision-payload failure),
+		// MEMORY.md, USER.md, CLAUDE.md (curated durable memory —
+		// agent-owned state, reconciled by the boot entrypoint, NOT by
+		// this collect path), .claude/sessions/ (Claude Code session
+		// dir, agent-owned), and any other agent-state path. The
+		// PM-flagged in #24_clarify invariant is enforced here in code,
+		// not in comments.
 		if !IsCPTemplateAssetPath(name) {
-			return fmt.Errorf("template asset path %q rejected: not in template-asset allowlist (config.yaml / prompts/* / agent-skills/*) — see IsCPTemplateAssetPath", name)
+			return fmt.Errorf("template asset path %q rejected: not in template-asset allowlist (config.yaml / prompts/* only — agent-skills are plugins now, RFC#2843 #32) — see IsCPTemplateAssetPath", name)
 		}
 		totalAssets += len(data)
 		if totalAssets > cpTemplateAssetsMaxBytes {
@@ -508,24 +513,29 @@ func collectCPConfigFiles(cfg WorkspaceConfig) (map[string]string, map[string][]
 	// RFC #2843 #24 — generic template-asset channel. When
 	// cfg.TemplateAssetFetcher is wired (SaaS) and
 	// cfg.TemplateIdentity is set, fetch the template's
-	// config.yaml + prompts/ + agent_skills/ via the
-	// non-secret asset channel (template repo, Gitea shallow
-	// clone per §4.2 transport option (a)) and land them in
-	// the SEPARATE TemplateAssets field of the provision
-	// request — NOT in ConfigFiles (the SM-bound bundle).
-	// The split is load-bearing: ConfigFiles is the bundle
-	// the CP stages through AWS Secrets Manager, which is
-	// sized + scoped for *secrets* and caps at 256 KiB. The
-	// 716 KiB SEO skill package can't ride SM and shouldn't
-	// try to (core-devops 10:13 SM-inventory RCA).
+	// config.yaml + prompts/ via the non-secret asset channel
+	// (template repo, Gitea shallow clone per §4.2 transport
+	// option (a)) and land them in the SEPARATE TemplateAssets
+	// field of the provision request — NOT in ConfigFiles (the
+	// SM-bound bundle). The split is load-bearing: ConfigFiles is
+	// the bundle the CP stages through AWS Secrets Manager, which
+	// is sized + scoped for *secrets* and caps at 256 KiB.
+	//
+	// agent-skills are NOT fetched here anymore (RFC#2843 #32):
+	// skills are plugins, installed post-online via the plugin
+	// pipeline (gitea:// resolver reads agent-skills/<skill> from
+	// the template repo at install time). The asset payload is
+	// therefore tiny (config.yaml + prompts), well under any cap —
+	// this is the #32 fix for fresh-seo-agent provision failing
+	// closed on a 716 KiB skill tree.
 	//
 	// The fetch is OPT-IN: nil fetcher = no-op (self-host
 	// default; falls through to the local TemplatePath path
 	// above). Every key in the fetcher's output is gated by
 	// IsCPTemplateAssetPath at the addAsset boundary above —
-	// paths outside the template-asset namespace abort the
-	// provision rather than silently sneaking MEMORY.md /
-	// CLAUDE.md / .claude/sessions/ into the bundle.
+	// paths outside the template-asset namespace (agent-skills/*,
+	// MEMORY.md, CLAUDE.md, .claude/sessions/) abort the provision
+	// rather than silently sneaking into the bundle.
 	//
 	// The fetch is fail-closed: a transport error aborts
 	// the provision rather than regressing to stub-mode

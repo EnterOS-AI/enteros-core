@@ -8,9 +8,10 @@ package provisioner
 // Tests use httptest.NewServer to serve a real .tar.gz
 // generated in-memory (no real Gitea instance needed). The
 // dispatch's required test surface:
-//   - happy path: assert ALL asset paths incl agent-skills are
-//     returned (must FAIL if skills dropped)
-//   - allowlist filter: non-allowlisted paths are excluded
+//   - happy path: assert config.yaml + prompts/* are returned and
+//     agent-skills/* are SKIPPED (RFC#2843 #32 — skills are plugins
+//     now, fetched at install time, NOT on this asset channel)
+//   - allowlist filter: non-allowlisted paths (incl agent-skills) excluded
 //   - fail-closed: transport / extract errors surface as errors
 //   - identity parsing: malformed identities return errors
 
@@ -29,10 +30,12 @@ import (
 
 // TestGiteaTemplateAssetFetcher_HappyPath pins the production
 // contract: a real .tar.gz archive containing config.yaml +
-// prompts/ + agent-skills/ is fetched, parsed, and returned
-// as a map with all three namespaces populated. The dispatch
-// explicitly calls out: "must FAIL if skills dropped" — this
-// test is the load-bearing check for that.
+// prompts/ + agent-skills/ is fetched and parsed; config.yaml +
+// prompts/* are returned, and agent-skills/* are SKIPPED (RFC#2843
+// #32 — skills are plugins now, fetched at install time by the
+// gitea:// plugin resolver, NOT carried on this asset channel). The
+// skill files MUST still exist in the repo archive — they are the
+// plugin source — they are just not asset-delivered.
 func TestGiteaTemplateAssetFetcher_HappyPath(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Verify the request shape.
@@ -43,8 +46,10 @@ func TestGiteaTemplateAssetFetcher_HappyPath(t *testing.T) {
 			t.Errorf("unexpected Authorization header: %q", got)
 		}
 		// Serve a real .tar.gz with config.yaml + prompts/system.md +
-		// agent-skills/seo-audit/SKILL.md wrapped in the
-		// "<repo>-<sha>" top-level dir Gitea uses.
+		// agent-skills/seo-audit/* wrapped in the "<repo>-<sha>"
+		// top-level dir Gitea uses. The skill files are present in the
+		// archive (they ARE the plugin source) but must be SKIPPED by
+		// the fetcher (RFC#2843 #32).
 		w.Header().Set("Content-Type", "application/gzip")
 		w.WriteHeader(http.StatusOK)
 		gz := gzip.NewWriter(w)
@@ -64,15 +69,15 @@ func TestGiteaTemplateAssetFetcher_HappyPath(t *testing.T) {
 		t.Fatalf("Load: %v", err)
 	}
 
-	// All 3 allowlisted namespaces must be present. Per the
-	// dispatch: "must FAIL if skills dropped" — assert skill
-	// files explicitly.
+	// config.yaml + prompts/* are returned; agent-skills/* are SKIPPED
+	// (RFC#2843 #32 — skills are plugins now). The skill files exist in
+	// the repo archive but must NOT appear in the asset map.
 	mustHaveKey(t, assets, "config.yaml")
 	mustHaveKey(t, assets, "prompts/system.md")
-	mustHaveKey(t, assets, "agent-skills/seo-audit/SKILL.md")
-	mustHaveKey(t, assets, "agent-skills/seo-audit/manifest.yaml")
-	if len(assets) != 4 {
-		t.Errorf("expected 4 assets, got %d: %v", len(assets), keysOf(assets))
+	mustNotHaveKey(t, assets, "agent-skills/seo-audit/SKILL.md")
+	mustNotHaveKey(t, assets, "agent-skills/seo-audit/manifest.yaml")
+	if len(assets) != 2 {
+		t.Errorf("expected 2 assets (config.yaml + prompts/system.md), got %d: %v", len(assets), keysOf(assets))
 	}
 }
 
@@ -91,8 +96,9 @@ func TestGiteaTemplateAssetFetcher_AllowsOnlyAllowlistedPaths(t *testing.T) {
 		// Allowlisted.
 		mustWriteTar(t, tw, "repo-sha/config.yaml", []byte("ok"))
 		mustWriteTar(t, tw, "repo-sha/prompts/x.md", []byte("ok"))
-		mustWriteTar(t, tw, "repo-sha/agent-skills/skill-x/SKILL.md", []byte("ok"))
-		// NOT allowlisted — must be excluded.
+		// NOT allowlisted — must be excluded. agent-skills/* are plugins
+		// now (RFC#2843 #32) and are no longer asset-eligible.
+		mustWriteTar(t, tw, "repo-sha/agent-skills/skill-x/SKILL.md", []byte("plugin-source-not-asset"))
 		mustWriteTar(t, tw, "repo-sha/CLAUDE.md", []byte("agent-owned"))
 		mustWriteTar(t, tw, "repo-sha/MEMORY.md", []byte("agent-owned"))
 		mustWriteTar(t, tw, "repo-sha/USER.md", []byte("agent-owned"))
@@ -112,15 +118,15 @@ func TestGiteaTemplateAssetFetcher_AllowsOnlyAllowlistedPaths(t *testing.T) {
 	// Allowlisted keys present.
 	mustHaveKey(t, assets, "config.yaml")
 	mustHaveKey(t, assets, "prompts/x.md")
-	mustHaveKey(t, assets, "agent-skills/skill-x/SKILL.md")
-	// Non-allowlisted keys EXCLUDED.
+	// Non-allowlisted keys EXCLUDED — incl agent-skills/* (RFC#2843 #32).
+	mustNotHaveKey(t, assets, "agent-skills/skill-x/SKILL.md")
 	mustNotHaveKey(t, assets, "CLAUDE.md")
 	mustNotHaveKey(t, assets, "MEMORY.md")
 	mustNotHaveKey(t, assets, "USER.md")
 	mustNotHaveKey(t, assets, ".claude/sessions/foo.json")
 	mustNotHaveKey(t, assets, "adapter.py")
-	if len(assets) != 3 {
-		t.Errorf("expected 3 allowlisted assets, got %d: %v", len(assets), keysOf(assets))
+	if len(assets) != 2 {
+		t.Errorf("expected 2 allowlisted assets, got %d: %v", len(assets), keysOf(assets))
 	}
 }
 
@@ -237,6 +243,8 @@ func TestGiteaTemplateAssetFetcher_EmptyToken_RealHTTP_NoAuthHeader_Success(t *t
 		// not just a minimal 1-asset happy path.
 		mustWriteTar(t, tw, "repo-sha/config.yaml", []byte("# public-template config\n"))
 		mustWriteTar(t, tw, "repo-sha/prompts/system.md", []byte("# public-template system prompt\n"))
+		// agent-skills present in the repo but SKIPPED by the fetcher
+		// (RFC#2843 #32 — plugins, not assets).
 		mustWriteTar(t, tw, "repo-sha/agent-skills/skill-x/SKILL.md", []byte("# public-template skill\n"))
 		_ = tw.Close()
 		_ = gz.Close()
@@ -250,9 +258,9 @@ func TestGiteaTemplateAssetFetcher_EmptyToken_RealHTTP_NoAuthHeader_Success(t *t
 	}
 	mustHaveKey(t, assets, "config.yaml")
 	mustHaveKey(t, assets, "prompts/system.md")
-	mustHaveKey(t, assets, "agent-skills/skill-x/SKILL.md")
-	if len(assets) != 3 {
-		t.Errorf("expected 3 assets, got %d: %v", len(assets), keysOf(assets))
+	mustNotHaveKey(t, assets, "agent-skills/skill-x/SKILL.md")
+	if len(assets) != 2 {
+		t.Errorf("expected 2 assets (config.yaml + prompts/system.md), got %d: %v", len(assets), keysOf(assets))
 	}
 }
 
