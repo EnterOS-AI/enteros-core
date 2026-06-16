@@ -218,7 +218,14 @@ jobs:
       #   - cache-from on a missing tag (first run) is a warning, not an error.
       #   - Concurrent publishes overwrite :buildcache last-writer-wins —
       #     same best-effort semantics as :staging-latest.
+      # NOTE: molecule-ai/platform is now ORPHANED — the concierge image was
+      # repointed to FROM platform-tenant (the live workspace-server image), and
+      # nothing else consumes molecule-ai/platform (it has not built since
+      # 2026-05-15). continue-on-error so a failure of this dead base build can
+      # never block the tenant + platform-agent builds below. Remove this step
+      # entirely in a follow-up once confirmed no consumer remains.
       - name: Build & push platform image to ECR (staging-<sha> + staging-latest)
+        continue-on-error: true
         env:
           IMAGE_NAME: ${{ env.IMAGE_NAME }}
           TAG_SHA: staging-${{ steps.tags.outputs.sha }}
@@ -246,44 +253,6 @@ jobs:
             --cache-to "type=registry,ref=${IMAGE_NAME}:buildcache,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true" \
             --tag "${IMAGE_NAME}:${TAG_SHA}" \
             --tag "${IMAGE_NAME}:${TAG_LATEST}" \
-            --push .
-
-      # Build + push the CONCIERGE platform-agent image. Extends the base
-      # platform image (just built above, passed via BASE_IMAGE) with the
-      # concierge identity baked from the platform-agent template (staged at
-      # .tenant-bundle-deps/workspace-configs-templates/platform-agent by the
-      # Pre-clone step from the manifest platform-agent entry). MUST run AFTER
-      # the base platform build (FROM ${IMAGE_NAME}:${TAG_SHA}). The CP selects
-      # this image for kind=platform (core#2495); without it the concierge boots
-      # with no identity (#2919 image-bake / #2955 identity-fallback.sh).
-      - name: Build & push platform-agent image to ECR (staging-<sha> + staging-latest)
-        env:
-          IMAGE_NAME: ${{ env.IMAGE_NAME }}
-          PLATFORM_AGENT_IMAGE_NAME: ${{ env.PLATFORM_AGENT_IMAGE_NAME }}
-          TAG_SHA: staging-${{ steps.tags.outputs.sha }}
-          TAG_LATEST: staging-latest
-          GIT_SHA: ${{ steps.tags.outputs.sha }}
-          REPO: ${{ github.event.repository.name }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
-        run: |
-          set -euo pipefail
-          ECR_REGISTRY="${PLATFORM_AGENT_IMAGE_NAME%%/*}"
-          aws ecr get-login-password --region us-east-2 | \
-            docker login --username AWS --password-stdin "${ECR_REGISTRY}"
-          docker buildx build \
-            --file ./workspace-server/Dockerfile.platform-agent \
-            --build-arg BASE_IMAGE="${IMAGE_NAME}:${TAG_SHA}" \
-            --provenance=false \
-            --sbom=false \
-            --build-arg GIT_SHA="${GIT_SHA}" \
-            --label "org.opencontainers.image.source=https://git.moleculesai.app/molecule-ai/${REPO}" \
-            --label "org.opencontainers.image.revision=${GIT_SHA}" \
-            --label "org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            --label "molecule.workflow.run_id=${GITHUB_RUN_ID}" \
-            --cache-from "type=registry,ref=${PLATFORM_AGENT_IMAGE_NAME}:buildcache" \
-            --cache-to "type=registry,ref=${PLATFORM_AGENT_IMAGE_NAME}:buildcache,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true" \
-            --tag "${PLATFORM_AGENT_IMAGE_NAME}:${TAG_SHA}" \
-            --tag "${PLATFORM_AGENT_IMAGE_NAME}:${TAG_LATEST}" \
             --push .
 
       # Build + push tenant image (Go platform + Next.js canvas in one image).
@@ -357,6 +326,55 @@ jobs:
               exit 1
             fi
           done
+
+      # Build + push the CONCIERGE platform-agent image. Extends the LIVE
+      # platform-tenant image (built just above) with the concierge identity
+      # baked from the platform-agent template (staged at .tenant-bundle-deps/
+      # workspace-configs-templates/platform-agent by the Pre-clone step from
+      # the manifest platform-agent entry). MUST run AFTER the tenant build —
+      # FROM ${TENANT_IMAGE_NAME}:${TAG_SHA}, the live workspace-server image
+      # concierges already run (it has /entrypoint.sh = entrypoint-tenant.sh,
+      # which the platform-agent wrapper chains to). The dead molecule-ai/platform
+      # base (unbuilt since 2026-05-15) is deliberately NOT used. CP selects this
+      # image for kind=platform (core#2495); without it the concierge boots with
+      # no identity (#2919 image-bake / #2955 identity-fallback.sh).
+      - name: Build & push platform-agent image to ECR (staging-<sha> + staging-latest)
+        env:
+          TENANT_IMAGE_NAME: ${{ env.TENANT_IMAGE_NAME }}
+          PLATFORM_AGENT_IMAGE_NAME: ${{ env.PLATFORM_AGENT_IMAGE_NAME }}
+          TAG_SHA: staging-${{ steps.tags.outputs.sha }}
+          TAG_LATEST: staging-latest
+          GIT_SHA: ${{ steps.tags.outputs.sha }}
+          REPO: ${{ github.event.repository.name }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: us-east-2
+        run: |
+          set -euo pipefail
+          ECR_REGISTRY="${PLATFORM_AGENT_IMAGE_NAME%%/*}"
+          aws ecr get-login-password --region us-east-2 | \
+            docker login --username AWS --password-stdin "${ECR_REGISTRY}"
+          builder="pa-builder-${GITHUB_RUN_ID}"
+          docker buildx create --name "${builder}" --use >/dev/null 2>&1 || true
+          docker buildx build \
+            --builder "${builder}" \
+            --file ./workspace-server/Dockerfile.platform-agent \
+            --build-arg BASE_IMAGE="${TENANT_IMAGE_NAME}:${TAG_SHA}" \
+            --provenance=false \
+            --sbom=false \
+            --build-arg GIT_SHA="${GIT_SHA}" \
+            --label "org.opencontainers.image.source=https://git.moleculesai.app/molecule-ai/${REPO}" \
+            --label "org.opencontainers.image.revision=${GIT_SHA}" \
+            --label "org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --label "molecule.workflow.run_id=${GITHUB_RUN_ID}" \
+            --cache-from "type=registry,ref=${PLATFORM_AGENT_IMAGE_NAME}:buildcache" \
+            --cache-to "type=registry,ref=${PLATFORM_AGENT_IMAGE_NAME}:buildcache,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true" \
+            --tag "${PLATFORM_AGENT_IMAGE_NAME}:${TAG_SHA}" \
+            --tag "${PLATFORM_AGENT_IMAGE_NAME}:${TAG_LATEST}" \
+            --push . || { docker buildx rm "${builder}" >/dev/null 2>&1 || true; echo "::error::platform-agent image build failed"; exit 1; }
+          docker buildx rm "${builder}" >/dev/null 2>&1 || true
+          echo "::notice::platform-agent image pushed: ${PLATFORM_AGENT_IMAGE_NAME}:${TAG_SHA}"
 
   # Staging auto-deploy: every workspace-server image publish on main should
   # roll out to the staging fleet so code fixes reach staging without a
