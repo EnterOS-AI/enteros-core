@@ -242,6 +242,40 @@ func TestTemplateIdentityForRuntimeOrEmpty(t *testing.T) {
 	}
 }
 
+// TestTemplateIdentityForTemplateOrRuntime is the #32 regression gate: a
+// template VARIANT (seo-agent, runtime=claude-code) must resolve its fetch
+// identity from the TEMPLATE (seo-agent), not the runtime (claude-code).
+// Before the fix the fetch keyed on runtime → resolved the claude-code-default
+// template → delivered NONE of seo-agent's agent-skills/seo-all. This asserts
+// the variant resolves to its own repo, falls back to runtime when no template,
+// and stays empty for external runtimes.
+func TestTemplateIdentityForTemplateOrRuntime(t *testing.T) {
+	if manifestPath() == "" {
+		t.Skip("manifest.json not discoverable from this test cwd")
+	}
+	initTemplateRepoByName()
+
+	// VARIANT: template=seo-agent + runtime=claude-code must resolve to the
+	// SEO-AGENT repo, NOT the claude-code template. THIS is the regression.
+	seo := templateIdentityForTemplateOrRuntime("seo-agent", "claude-code")
+	if seo == "" || !strings.Contains(seo, "seo-agent") {
+		t.Errorf("seo-agent variant must resolve to the seo-agent template identity; got %q", seo)
+	}
+	cc := templateIdentityForTemplateOrRuntime("", "claude-code")
+	if seo == cc {
+		t.Errorf("seo-agent variant resolved to the SAME identity as claude-code (%q) — the fetch is keying on runtime, not template (#32 regression)", seo)
+	}
+
+	// FALLBACK: no template → use the runtime (runtime==template-name case).
+	if got := templateIdentityForTemplateOrRuntime("", "hermes"); got == "" {
+		t.Error("empty template should fall back to the runtime (hermes) identity")
+	}
+	// Unknown template falls back to runtime, then to "".
+	if got := templateIdentityForTemplateOrRuntime("no-such-template", "external"); got != "" {
+		t.Errorf("unknown template + external runtime should be empty, got %q", got)
+	}
+}
+
 // TestInitTemplateRepoByName_PopulatesMap_FromTempManifest pins the
 // PR-B contract-pin: the prod-init path must populate templateRepoByName
 // from a real manifest so cfg.TemplateIdentity is non-empty for
