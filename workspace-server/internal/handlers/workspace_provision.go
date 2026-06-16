@@ -394,7 +394,7 @@ func (h *WorkspaceHandler) buildProvisionerConfig(
 		// not duplicated across first-provision + restart paths.
 		// nil fetcher = "no fetcher wired" (self-host default;
 		// falls through to the local TemplatePath path).
-		TemplateIdentity:     templateIdentityForRuntimeOrEmpty(payload.Runtime),
+		TemplateIdentity:     templateIdentityForTemplateOrRuntime(payload.Template, payload.Runtime),
 		TemplateAssetFetcher: h.giteaTemplateFetcher,
 	}
 }
@@ -406,6 +406,27 @@ func (h *WorkspaceHandler) buildProvisionerConfig(
 func templateIdentityForRuntimeOrEmpty(runtime string) string {
 	id, _ := templateIdentityForRuntime(runtime)
 	return id
+}
+
+// templateIdentityForTemplateOrRuntime resolves the template-asset fetch
+// identity, preferring the explicit TEMPLATE over the runtime. The manifest's
+// workspace_templates (templateRepoByName) are keyed by TEMPLATE NAME
+// (claude-code-default, seo-agent, platform-agent, …), NOT by runtime. A
+// template VARIANT like seo-agent has runtime="claude-code" but
+// template="seo-agent"; keying the fetch on runtime looked up
+// templateRepoByName["claude-code"] (no such key) → empty identity → the
+// fetcher delivered NOTHING, so agent-skills/seo-all never reached the box
+// (config.yaml + prompts arrived via the legacy SM path, masking it). #32.
+// Falls back to runtime for the common case where runtime==template name
+// (hermes/codex/openclaw/google-adk), and to "" when neither resolves (external
+// runtimes — collectCPConfigFiles treats empty identity as "skip the fetcher").
+func templateIdentityForTemplateOrRuntime(template, runtime string) string {
+	if t := strings.TrimSpace(template); t != "" {
+		if id, ok := templateIdentityForRuntime(t); ok {
+			return id
+		}
+	}
+	return templateIdentityForRuntimeOrEmpty(runtime)
 }
 
 // issueAndInjectToken rotates the workspace auth token and injects the
