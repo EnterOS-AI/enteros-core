@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
@@ -165,6 +166,93 @@ func listInstalledPluginNames(ctx context.Context, workspaceID string) (map[stri
 		out[name] = true
 	}
 	return out, rows.Err()
+}
+
+// listInstalledPlugins returns the installed plugin set for a workspace as
+// (plugin_name, source_raw) pairs from workspace_plugins. Unlike
+// listInstalledPluginNames (which the reconcile uses for a present/absent diff),
+// this carries the source so the boot-install desired-set can re-fetch a
+// user-installed plugin that the template never declared (RFC#2843 #42). A row
+// with an empty source_raw is skipped — it can't be re-fetched on boot.
+func listInstalledPlugins(ctx context.Context, workspaceID string) ([]DeclaredPlugin, error) {
+	if db.DB == nil {
+		return nil, nil
+	}
+	rows, err := db.DB.QueryContext(ctx, `
+		SELECT plugin_name, source_raw
+		  FROM workspace_plugins
+		 WHERE workspace_id = $1
+		 ORDER BY plugin_name
+	`, workspaceID)
+	if err != nil {
+		return nil, fmt.Errorf("listInstalledPlugins: query: %w", err)
+	}
+	defer rows.Close()
+	var out []DeclaredPlugin
+	for rows.Next() {
+		var d DeclaredPlugin
+		if scanErr := rows.Scan(&d.PluginName, &d.SourceRaw); scanErr != nil {
+			return nil, fmt.Errorf("listInstalledPlugins: scan: %w", scanErr)
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// desiredPluginSources computes the boot-install desired-set for a workspace as
+// the UNION of its DECLARED plugins (template intent, workspace_declared_plugins)
+// and its INSTALLED plugins (the live runtime set, workspace_plugins), keyed by
+// plugin_name. This is the set the runtime-image entrypoint re-establishes in
+// /configs/plugins on EVERY (re)provision.
+//
+// Why the union (RFC#2843 #42): a restart is a fresh ephemeral instance, so the
+// box is rebuilt purely from this set. Stamping DECLARED-only wiped any plugin a
+// user installed at runtime via install_plugin (recorded in workspace_plugins,
+// never in workspace_declared_plugins) — it silently vanished on the next
+// restart. Stamping INSTALLED-only would drop a declared plugin whose first
+// install hasn't been recorded yet (first boot, before the post-online reconcile
+// runs). The union covers both: declared seeds first boot; installed preserves
+// user additions across restarts.
+//
+// On a name collision (declared AND installed — the steady state for a template
+// plugin after its first reconcile) the INSTALLED source wins: it reflects what
+// is actually running, including any ref the user re-pinned via install_plugin.
+// Returns sources sorted by plugin_name for a stable env value. Rows with an
+// empty source_raw are skipped (nothing to fetch).
+func desiredPluginSources(ctx context.Context, workspaceID string) ([]string, error) {
+	declared, err := listDeclaredPlugins(ctx, workspaceID)
+	if err != nil {
+		return nil, fmt.Errorf("desiredPluginSources: declared: %w", err)
+	}
+	installed, err := listInstalledPlugins(ctx, workspaceID)
+	if err != nil {
+		return nil, fmt.Errorf("desiredPluginSources: installed: %w", err)
+	}
+	// byName: declared first (seed), then installed overrides on collision.
+	byName := make(map[string]string, len(declared)+len(installed))
+	names := make([]string, 0, len(declared)+len(installed))
+	add := func(p DeclaredPlugin) {
+		src := strings.TrimSpace(p.SourceRaw)
+		if p.PluginName == "" || src == "" {
+			return
+		}
+		if _, seen := byName[p.PluginName]; !seen {
+			names = append(names, p.PluginName)
+		}
+		byName[p.PluginName] = src
+	}
+	for _, d := range declared {
+		add(d)
+	}
+	for _, i := range installed {
+		add(i) // installed source wins on collision
+	}
+	sort.Strings(names)
+	out := make([]string, 0, len(names))
+	for _, n := range names {
+		out = append(out, byName[n])
+	}
+	return out, nil
 }
 
 // deleteWorkspacePluginRow removes the workspace_plugins row for a workspace/plugin
