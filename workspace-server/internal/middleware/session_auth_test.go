@@ -116,7 +116,7 @@ func mockCPServer(t *testing.T, status int, body string) (*httptest.Server, *ato
 
 func TestVerifiedCPSession_EmptyCookie(t *testing.T) {
 	resetSessionCache()
-	ok, presented := VerifiedCPSession("")
+	ok, presented, _ := VerifiedCPSession("")
 	if ok || presented {
 		t.Errorf("empty cookie should be (false, false); got (%v, %v)", ok, presented)
 	}
@@ -126,7 +126,7 @@ func TestVerifiedCPSession_NoSlugConfigured(t *testing.T) {
 	resetSessionCache()
 	t.Setenv("CP_UPSTREAM_URL", "https://cp.test")
 	t.Setenv("MOLECULE_ORG_SLUG", "")
-	ok, presented := VerifiedCPSession("session=foo")
+	ok, presented, _ := VerifiedCPSession("session=foo")
 	// Without a slug we can't ask about tenant membership. Must
 	// refuse (false, false) — caller falls through to bearer tier.
 	if ok || presented {
@@ -138,7 +138,7 @@ func TestVerifiedCPSession_NoCPConfigured(t *testing.T) {
 	resetSessionCache()
 	t.Setenv("CP_UPSTREAM_URL", "")
 	t.Setenv("MOLECULE_ORG_SLUG", "acme")
-	ok, presented := VerifiedCPSession("session=foo")
+	ok, presented, _ := VerifiedCPSession("session=foo")
 	// Self-hosted path: CP not configured, but cookie WAS presented.
 	// Presented=true lets the caller know not to fall through to
 	// bearer as if no credential arrived.
@@ -153,7 +153,7 @@ func TestVerifiedCPSession_MemberTrue(t *testing.T) {
 	t.Setenv("CP_UPSTREAM_URL", srv.URL)
 	t.Setenv("MOLECULE_ORG_SLUG", "acme")
 
-	ok, presented := VerifiedCPSession("session=valid")
+	ok, presented, _ := VerifiedCPSession("session=valid")
 	if !ok || !presented {
 		t.Errorf("valid member should be (true, true); got (%v, %v)", ok, presented)
 	}
@@ -162,7 +162,7 @@ func TestVerifiedCPSession_MemberTrue(t *testing.T) {
 	}
 
 	// Second call must be served from cache.
-	ok, _ = VerifiedCPSession("session=valid")
+	ok, _, _ = VerifiedCPSession("session=valid")
 	if !ok {
 		t.Errorf("cached call should still be true")
 	}
@@ -178,7 +178,7 @@ func TestVerifiedCPSession_MemberFalse(t *testing.T) {
 	t.Setenv("CP_UPSTREAM_URL", srv.URL)
 	t.Setenv("MOLECULE_ORG_SLUG", "acme")
 
-	ok, presented := VerifiedCPSession("session=wrong-tenant")
+	ok, presented, _ := VerifiedCPSession("session=wrong-tenant")
 	if ok || !presented {
 		t.Errorf("non-member should be (false, true); got (%v, %v)", ok, presented)
 	}
@@ -186,7 +186,7 @@ func TestVerifiedCPSession_MemberFalse(t *testing.T) {
 		t.Fatalf("expected 1 upstream hit")
 	}
 	// Cached negatively.
-	_, _ = VerifiedCPSession("session=wrong-tenant")
+	_, _, _ = VerifiedCPSession("session=wrong-tenant")
 	if hits.Load() != 1 {
 		t.Errorf("negative result should cache too; got %d hits", hits.Load())
 	}
@@ -198,7 +198,7 @@ func TestVerifiedCPSession_Upstream401(t *testing.T) {
 	t.Setenv("CP_UPSTREAM_URL", srv.URL)
 	t.Setenv("MOLECULE_ORG_SLUG", "acme")
 
-	ok, presented := VerifiedCPSession("session=expired")
+	ok, presented, _ := VerifiedCPSession("session=expired")
 	if ok || !presented {
 		t.Errorf("401 upstream should be (false, true); got (%v, %v)", ok, presented)
 	}
@@ -210,7 +210,7 @@ func TestVerifiedCPSession_MalformedJSON(t *testing.T) {
 	t.Setenv("CP_UPSTREAM_URL", srv.URL)
 	t.Setenv("MOLECULE_ORG_SLUG", "acme")
 
-	ok, presented := VerifiedCPSession("session=broken")
+	ok, presented, _ := VerifiedCPSession("session=broken")
 	if ok || !presented {
 		t.Errorf("malformed body should be (false, true); got (%v, %v)", ok, presented)
 	}
@@ -222,7 +222,7 @@ func TestVerifiedCPSession_TransportErrorNotCached(t *testing.T) {
 	t.Setenv("CP_UPSTREAM_URL", "http://127.0.0.1:1")
 	t.Setenv("MOLECULE_ORG_SLUG", "acme")
 
-	ok, presented := VerifiedCPSession("session=whatever")
+	ok, presented, _ := VerifiedCPSession("session=whatever")
 	if ok || !presented {
 		t.Errorf("transport error should be (false, true); got (%v, %v)", ok, presented)
 	}
@@ -257,12 +257,12 @@ func TestVerifiedCPSession_CrossTenantIsolation(t *testing.T) {
 	cookie := "session=shared-auth"
 
 	t.Setenv("MOLECULE_ORG_SLUG", "acme")
-	if ok, _ := VerifiedCPSession(cookie); !ok {
+	if ok, _, _ := VerifiedCPSession(cookie); !ok {
 		t.Errorf("acme should say member=true")
 	}
 
 	t.Setenv("MOLECULE_ORG_SLUG", "bob")
-	if ok, _ := VerifiedCPSession(cookie); ok {
+	if ok, _, _ := VerifiedCPSession(cookie); ok {
 		t.Errorf("bob tenant must NOT accept acme cookie despite same session bytes")
 	}
 	if len(reqs) != 2 {
@@ -276,7 +276,7 @@ func TestSessionCache_BoundedEviction(t *testing.T) {
 	// Not testing exact eviction policy (random) — just that we
 	// don't grow unbounded.
 	for i := 0; i < sessionCacheMax+500; i++ {
-		sessionCachePut(fmt.Sprintf("k%d", i), true)
+		sessionCachePut(fmt.Sprintf("k%d", i), true, "")
 	}
 	sessionCache.Lock()
 	n := len(sessionCache.entries)
@@ -295,7 +295,7 @@ func TestSessionCache_ExpiredEntryIgnored(t *testing.T) {
 		ok:        true,
 	}
 	sessionCache.Unlock()
-	if ok, hit := sessionCacheGet(key); ok || hit {
+	if ok, _, hit := sessionCacheGet(key); ok || hit {
 		t.Errorf("expired entry must not hit; got ok=%v hit=%v", ok, hit)
 	}
 }
