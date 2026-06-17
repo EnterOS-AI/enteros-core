@@ -110,13 +110,26 @@ func (h *PluginsHandler) ReconcileWorkspacePlugins(ctx context.Context, workspac
 			continue
 		}
 
-		deliverErr := h.deliver(ctx, workspaceID, stage)
-		stage.cleanup()
-		if deliverErr != nil {
+		// RFC#2843 #38: the runtime-image entrypoint boot-installs declared
+		// plugins to the box on EVERY boot, BEFORE this online-transition
+		// reconcile runs — so by now the plugin is typically already on the box.
+		// If present, record the tracking row WITHOUT re-delivering via EIC +
+		// restarting: the EIC push + restartFunc was the redundant churn (one
+		// wasted full re-provision per fresh workspace — the observed ~12-min
+		// reprovision). Only deliver when the plugin is NOT already present
+		// (boot-install disabled/failed, or a non-boot-install path) — the
+		// safety net. pluginPresentOnBox is conservative (false on any
+		// uncertainty) so a genuinely-missing install is never silently skipped.
+		if h.pluginPresentOnBox(ctx, workspaceID, stage.PluginName) {
+			log.Printf("Plugin reconcile: workspace=%s plugin=%s already on box (boot-installed) — recording tracking row only, no re-deliver/restart",
+				workspaceID, stage.PluginName)
+		} else if deliverErr := h.deliver(ctx, workspaceID, stage); deliverErr != nil {
+			stage.cleanup()
 			log.Printf("Plugin reconcile: workspace=%s plugin=%s deliver failed: %v",
 				workspaceID, d.PluginName, deliverErr)
 			continue
 		}
+		stage.cleanup()
 
 		if recErr := recordWorkspacePluginInstall(
 			ctx, workspaceID, stage.PluginName, stage.Source.Raw(), track, stage.InstalledSHA,
@@ -139,6 +152,26 @@ func (h *PluginsHandler) ReconcileWorkspacePlugins(ctx context.Context, workspac
 		log.Printf("Plugin reconcile: workspace=%s complete — installed=%d skipped(already-present)=%d declared=%d",
 			workspaceID, installedCount, skipped, len(declared))
 	}
+}
+
+// pluginPresentOnBox reports whether the plugin is already installed on the
+// workspace box — e.g. delivered by the runtime-image boot-install
+// (RFC#2843 #32) before this online-transition reconcile runs. Used to skip the
+// redundant EIC re-deliver + restart that caused the per-fresh-workspace
+// reprovision churn (#38). CONSERVATIVE by design: returns false on any
+// uncertainty (not SaaS / no instance / read error / empty manifest), so the
+// caller falls back to delivering — a genuinely-missing install is never
+// silently skipped, only a confirmed-present one is deduped.
+func (h *PluginsHandler) pluginPresentOnBox(ctx context.Context, workspaceID, pluginName string) bool {
+	instanceID, runtime := h.lookupSaaSDispatch(workspaceID)
+	if instanceID == "" {
+		return false // not a SaaS box we can probe — deliver as before
+	}
+	data, err := readPluginManifestViaEIC(ctx, instanceID, runtime, pluginName)
+	if err != nil || len(data) == 0 {
+		return false // can't confirm presence — fall back to deliver
+	}
+	return true
 }
 
 // cleanup removes the staged tempdir. Mirrors the defer the interactive

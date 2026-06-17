@@ -228,3 +228,38 @@ func TestProvisioningChannelCarriesNoPlugins(t *testing.T) {
 			"so the post-online reconcile can install them")
 	}
 }
+
+// TestReconcile_BootInstalled_RecordsWithoutDeliver pins the RFC#2843 #38 fix:
+// when the plugin is already on the box (boot-installed by the runtime-image
+// entrypoint before this online-transition reconcile runs), the reconcile must
+// record the tracking row but NOT re-deliver via EIC + restart (the churn that
+// caused one wasted re-provision per fresh workspace).
+func TestReconcile_BootInstalled_RecordsWithoutDeliver(t *testing.T) {
+	mock, cleanup := withMockDB(t)
+	defer cleanup()
+	h, delivered := newReconcileHandler(t)
+	// SaaS box present + manifest read returns non-empty → pluginPresentOnBox=true.
+	h.instanceIDLookup = func(string) (string, error) { return "i-boot", nil }
+	orig := readPluginManifestViaEIC
+	readPluginManifestViaEIC = func(ctx context.Context, instanceID, runtime, pluginName string) ([]byte, error) {
+		return []byte("name: seo-all\n"), nil
+	}
+	defer func() { readPluginManifestViaEIC = orig }()
+
+	expectDeclared(mock,
+		[]DeclaredPlugin{{PluginName: "seo-all", SourceRaw: "local://seo-all"}},
+		nil,
+	)
+	// Tracking row IS still recorded (so drift/UI work) — just no deliver/restart.
+	mock.ExpectExec(`INSERT INTO workspace_plugins`).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	h.ReconcileWorkspacePlugins(context.Background(), "ws-1")
+
+	if len(*delivered) != 0 {
+		t.Fatalf("boot-installed plugin must NOT be re-delivered (no EIC push/restart churn), but delivered %v", *delivered)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet DB expectations (tracking row must still be recorded): %v", err)
+	}
+}
