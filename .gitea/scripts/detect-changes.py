@@ -74,6 +74,35 @@ PROFILES: dict[str, dict[str, str]] = {
             r"|^\.gitea/workflows/e2e-peer-visibility\.yml$"
         ),
     },
+    # mc#2996 / RFC#2843 #37: the template-delivery e2e is being flipped to a
+    # REQUIRED status check. A required-check workflow may NOT carry an `on:
+    # paths:` filter (lint-required-no-paths.py / feedback_path_filtered_
+    # workflow_cant_be_required would wedge docs-only PRs), so the path-scoping
+    # that used to live in template-delivery-e2e.yml's `on:` block moves here
+    # and is applied per-step inside the always-running job (mirrors the
+    # peer-visibility shape). This set MUST mirror the old `on: paths:` list —
+    # the delivery surface (provisioning asset channel + post-online plugin
+    # reconcile) whose regressions this gate exists to catch.
+    "template-delivery": {
+        "delivery": (
+            r"^workspace-server/internal/provisioner/template_assets\.go$"
+            r"|^workspace-server/internal/provisioner/gitea_template_assets\.go$"
+            r"|^workspace-server/internal/provisioner/cp_provisioner\.go$"
+            r"|^workspace-server/internal/handlers/platform_agent\.go$"
+            r"|^workspace-server/cmd/server/main\.go$"
+            r"|^workspace-server/internal/handlers/org_import\.go$"
+            r"|^workspace-server/internal/handlers/workspace\.go$"
+            r"|^workspace-server/internal/handlers/template_plugins\.go$"
+            r"|^workspace-server/internal/handlers/plugins_reconcile\.go$"
+            r"|^workspace-server/internal/handlers/registry\.go$"
+            r"|^workspace-server/internal/handlers/plugins_install_pipeline\.go$"
+            r"|^workspace-server/internal/handlers/plugins_tracking\.go$"
+            r"|^workspace-server/internal/plugins/source\.go$"
+            r"|^manifest\.json$"
+            r"|^tests/e2e/test_template_delivery_e2e\.sh$"
+            r"|^\.gitea/workflows/template-delivery-e2e\.yml$"
+        ),
+    },
 }
 
 
