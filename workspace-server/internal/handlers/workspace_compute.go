@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
@@ -524,6 +525,30 @@ func withStoredCompute(ctx context.Context, workspaceID string, payload models.C
 	}
 	payload.Compute = compute
 	return payload
+}
+
+// storedWorkspaceTemplate returns the template a workspace was created from
+// (workspaces.template), or "" if none / unavailable. RFC#2843 #33: the
+// auto-restart cycle uses this to restore payload.Template on the SaaS
+// re-provision so config.yaml + prompts (and the declared-plugin reconcile)
+// are re-delivered from the SAME template — instead of re-provisioning with
+// template="" which degraded the box to a 218-byte stub and dropped skills.
+// Fail-soft: any error (missing column on an un-migrated DB, no row) → "".
+func storedWorkspaceTemplate(ctx context.Context, workspaceID string) string {
+	if db.DB == nil {
+		return ""
+	}
+	var tmpl string
+	if err := db.DB.QueryRowContext(ctx,
+		`SELECT COALESCE(template, '') FROM workspaces WHERE id = $1`,
+		workspaceID,
+	).Scan(&tmpl); err != nil {
+		if err != sql.ErrNoRows {
+			log.Printf("storedWorkspaceTemplate: load template for %s failed: %v", workspaceID, err)
+		}
+		return ""
+	}
+	return strings.TrimSpace(tmpl)
 }
 
 // workspaceComputeOptionsResponse is the SSOT payload the canvas Container-Config

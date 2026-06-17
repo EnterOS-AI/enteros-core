@@ -984,6 +984,18 @@ func (h *WorkspaceHandler) runRestartCycle(workspaceID string) {
 	// Runtime from DB — no more config file parsing
 	payload := withStoredCompute(ctx, workspaceID, models.CreateWorkspacePayload{Name: wsName, Tier: tier, Runtime: dbRuntime})
 
+	// RFC#2843 #33: on SaaS (cpProv), restore the persisted template so the
+	// re-provision re-delivers config.yaml + prompts — TemplateIdentity is
+	// derived from payload.Template (workspace_provision.go). Without this the
+	// SaaS re-provision ran with template="" → 218-byte stub config + dropped
+	// skills on every restart. Docker keeps its persistent config volume, so it
+	// retains the "do not re-apply templates" behavior (template left empty).
+	if h.cpProv != nil {
+		if storedTmpl := storedWorkspaceTemplate(ctx, workspaceID); storedTmpl != "" {
+			payload.Template = storedTmpl
+		}
+	}
+
 	// Snapshot restart-context data before the new session overwrites
 	// last_heartbeat_at. Issue #19 Layer 1.
 	restartData := loadRestartContextData(ctx, workspaceID)
@@ -1185,6 +1197,13 @@ func (h *WorkspaceHandler) Resume(c *gin.Context) {
 			"name": ws.name, "tier": ws.tier, "runtime": ws.runtime,
 		})
 		payload := withStoredCompute(ctx, ws.id, models.CreateWorkspacePayload{Name: ws.name, Tier: ws.tier, Runtime: ws.runtime})
+		// RFC#2843 #33: restore the persisted template on SaaS resume so config +
+		// prompts re-deliver (see runRestartCycle for the full rationale).
+		if h.cpProv != nil {
+			if storedTmpl := storedWorkspaceTemplate(ctx, ws.id); storedTmpl != "" {
+				payload.Template = storedTmpl
+			}
+		}
 		// Resume is provision-only (workspace is paused, no live container
 		// to stop). provisionWorkspaceAuto handles backend routing and the
 		// no-backend mark-failed fallback identically to Create. Pre-

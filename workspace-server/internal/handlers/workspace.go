@@ -734,6 +734,21 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 		}
 	}
 
+	// RFC#2843 #33: persist the template name so the RESTART / re-provision path
+	// can re-deliver the SAME template's config.yaml + prompts (and re-run the
+	// declared-plugin reconcile). Without this, the auto-restart cycle rebuilds
+	// the provision payload with template="" → the SaaS re-provision has no
+	// TemplateIdentity → config degrades to a 218-byte stub and skills drop on
+	// every restart. Non-fatal: a write failure must not abort an otherwise-good
+	// create (the row is live; restart just falls back to the old stub behavior).
+	if t := strings.TrimSpace(payload.Template); t != "" {
+		if _, dbErr := tx.ExecContext(ctx,
+			`UPDATE workspaces SET template = $2, updated_at = now() WHERE id = $1`,
+			id, t); dbErr != nil {
+			log.Printf("Create workspace %s: failed to persist template %q: %v (continuing — restart will fall back to stub config)", id, t, dbErr)
+		}
+	}
+
 	// Persist initial secrets from the create payload (inside same transaction).
 	// nil/empty map is a no-op.  Any failure rolls back the workspace insert
 	// so we never have a workspace row without its intended secrets.
