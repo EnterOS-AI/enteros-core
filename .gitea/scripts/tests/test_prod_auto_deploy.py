@@ -290,6 +290,61 @@ def test_plan_scoped_rollout_preserves_canary_then_batches():
     ]
 
 
+def test_rollout_uses_elevated_http_timeout(monkeypatch):
+    """RFC#2843 #41: the real rollout POST must use the elevated read budget so
+    a slow/dead tenant can't time the client out before the CP returns results.
+    """
+    seen_timeouts = []
+
+    def fake_cp_api_json(_method, _url, _token, body, timeout=None):
+        seen_timeouts.append(timeout)
+        # Return a verified result so coverage passes and the loop completes.
+        return 200, {"ok": True, "results": [{"slug": s, "verified_on_target": True}
+                                             for s in (body.get("only_slugs") or [])]}
+
+    monkeypatch.setattr(prod, "cp_api_json", fake_cp_api_json)
+
+    plan = {
+        "cp_url": "https://api.moleculesai.app",
+        "rollout_http_timeout": 600,
+        "body": {"target_tag": "staging-abc", "batch_size": 3, "max_stragglers": 1},
+    }
+    prod.execute_scoped_rollout(
+        plan,
+        "token",
+        list_slugs=lambda _u, _t, _b: ["reno-stars", "philbrew-erton"],
+    )
+    # Every real rollout POST went through redeploy_scoped → cp_api_json with the
+    # elevated budget, never the fast 120s default.
+    assert seen_timeouts, "expected at least one rollout POST"
+    assert all(t == 600 for t in seen_timeouts), seen_timeouts
+
+
+def test_cp_api_json_socket_timeout_becomes_retryable_504(monkeypatch):
+    """A bare socket read timeout must surface as a synthetic 504 (retryable),
+    not crash the run with an unhandled exception (RFC#2843 #41).
+    """
+    def boom(_req, timeout=None):
+        raise TimeoutError("read operation timed out")
+
+    monkeypatch.setattr(prod.urllib.request, "urlopen", boom)
+    status, body = prod.cp_api_json("POST", "https://api.moleculesai.app/x", "tok", {"a": 1}, timeout=5)
+    assert status == 504
+    assert "timed out" in body["error"]
+    assert status in prod.REDEPLOY_RETRY_STATUSES
+
+
+def test_build_plan_sets_rollout_timeout_default_and_floor():
+    base_env = {"GITHUB_SHA": "deadbeef0000"}
+    plan = prod.build_plan(dict(base_env))
+    assert plan["rollout_http_timeout"] == prod.ROLLOUT_HTTP_TIMEOUT_DEFAULT_SECONDS
+    # A configured value below the fast-call floor is rejected (keeps the rollout
+    # budget from ever shrinking below the dry-run budget).
+    import pytest as _pytest
+    with _pytest.raises(ValueError):
+        prod.build_plan({**base_env, "PROD_AUTO_DEPLOY_ROLLOUT_HTTP_TIMEOUT_SECONDS": "30"})
+
+
 def test_redeploy_scoped_retries_transient_502_then_succeeds(monkeypatch, capfd):
     responses = [
         (502, {"error": "Bad Gateway"}),
@@ -299,7 +354,7 @@ def test_redeploy_scoped_retries_transient_502_then_succeeds(monkeypatch, capfd)
     calls = []
     sleeps = []
 
-    def fake_cp_api_json(_method, _url, _token, body):
+    def fake_cp_api_json(_method, _url, _token, body, timeout=None):
         calls.append(body)
         return responses.pop(0)
 
@@ -331,7 +386,7 @@ def test_redeploy_scoped_gives_up_after_max_retries(monkeypatch, capfd):
     ]
     sleeps = []
 
-    def fake_cp_api_json(_method, _url, _token, _body):
+    def fake_cp_api_json(_method, _url, _token, _body, timeout=None):
         return responses.pop(0)
 
     monkeypatch.setattr(prod, "cp_api_json", fake_cp_api_json)
@@ -354,7 +409,7 @@ def test_redeploy_scoped_gives_up_after_max_retries(monkeypatch, capfd):
 def test_redeploy_scoped_does_not_retry_non_transient_errors(monkeypatch):
     calls = []
 
-    def fake_cp_api_json(_method, _url, _token, body):
+    def fake_cp_api_json(_method, _url, _token, body, timeout=None):
         calls.append(body)
         return 500, {"error": "Internal Server Error"}
 

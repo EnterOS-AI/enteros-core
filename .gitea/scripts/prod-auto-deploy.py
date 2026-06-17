@@ -34,6 +34,27 @@ REDEPLOY_RETRY_STATUSES = {502, 503, 504}
 REDEPLOY_MAX_RETRIES = 3
 REDEPLOY_RETRY_DELAYS_SECONDS = [5, 10, 20]
 
+# HTTP read budgets for the CP calls.
+#
+# DEFAULT_CP_HTTP_TIMEOUT_SECONDS bounds the fast calls (CI-status reads, the
+# dry-run plan enumeration) — they return in well under a second.
+#
+# ROLLOUT_HTTP_TIMEOUT_DEFAULT_SECONDS bounds the REAL (non-dry-run) rollout
+# POST, which blocks server-side for the whole batch: the CP redeploys a batch's
+# tenants CONCURRENTLY and only responds once the SLOWEST one finishes — up to
+# the CP's PerTenantTimeout (5m SSM default) plus the /healthz settle (90s) for a
+# stuck or dead box. The old hardcoded 120s read timeout was SHORTER than that
+# worst case, so a single unreachable tenant (e.g. a CF-525 box whose SSM agent
+# never answers — philbrew-erton, RFC#2843 #41) made this client abandon the
+# call with an empty response BEFORE the CP could return the per-tenant results
+# that the max_stragglers quarantine acts on. Net effect: the healthy majority
+# shipped, but the deploy reported ok=false (result_count=0) and SKIPPED the
+# :latest promote — so brand-new provisions kept pulling the stale image. Give
+# the rollout POST a budget that comfortably exceeds the concurrent-batch worst
+# case so the designed quarantine path can actually run.
+DEFAULT_CP_HTTP_TIMEOUT_SECONDS = 120
+ROLLOUT_HTTP_TIMEOUT_DEFAULT_SECONDS = 600
+
 
 def truthy_flag(value: str | None) -> bool:
     if value is None:
@@ -107,6 +128,15 @@ def build_plan(env: dict[str, str]) -> dict:
         "target_tag": target_tag,
         "cp_url": cp_url,
         "body": body,
+        # Read budget for the real rollout POST (see ROLLOUT_HTTP_TIMEOUT_*).
+        # Floor at the fast-call default so a misconfig can't shrink it below
+        # the dry-run budget.
+        "rollout_http_timeout": _int_env(
+            env,
+            "PROD_AUTO_DEPLOY_ROLLOUT_HTTP_TIMEOUT_SECONDS",
+            ROLLOUT_HTTP_TIMEOUT_DEFAULT_SECONDS,
+            minimum=DEFAULT_CP_HTTP_TIMEOUT_SECONDS,
+        ),
     }
 
 
@@ -184,7 +214,13 @@ def scoped_redeploy_body(base: dict, slugs: list[str]) -> dict:
     return body
 
 
-def cp_api_json(method: str, url: str, token: str, body: dict | None = None) -> tuple[int, dict]:
+def cp_api_json(
+    method: str,
+    url: str,
+    token: str,
+    body: dict | None = None,
+    timeout: int = DEFAULT_CP_HTTP_TIMEOUT_SECONDS,
+) -> tuple[int, dict]:
     data = None
     headers = {
         "Authorization": f"Bearer {token}",
@@ -195,7 +231,7 @@ def cp_api_json(method: str, url: str, token: str, body: dict | None = None) -> 
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.status, json.loads(resp.read())
     except urllib.error.HTTPError as exc:
         raw = exc.read().decode("utf-8", errors="replace")
@@ -204,6 +240,14 @@ def cp_api_json(method: str, url: str, token: str, body: dict | None = None) -> 
         except json.JSONDecodeError:
             parsed = {"error": raw[:500]}
         return exc.code, parsed
+    except (TimeoutError, urllib.error.URLError) as exc:
+        # A socket read timeout (or transient connection drop) is NOT an HTTP
+        # status — without this branch it propagates as an unhandled exception
+        # and crashes the run with a bare "read operation timed out" (the
+        # RFC#2843 #41 symptom). Surface it as a synthetic 504 so the bounded
+        # redeploy retry treats it like an upstream gateway timeout.
+        reason = getattr(exc, "reason", exc)
+        return 504, {"error": f"request to {url} timed out or failed: {reason}"}
 
 
 def plan_rollout_slugs(cp_url: str, token: str, body: dict, redeploy=None) -> list[str]:
@@ -230,12 +274,22 @@ def _redeploy_error_detail(body: dict, max_len: int = 200) -> str:
     return detail[:max_len]
 
 
-def redeploy_scoped(cp_url: str, token: str, body: dict) -> tuple[int, dict]:
+def redeploy_scoped(
+    cp_url: str,
+    token: str,
+    body: dict,
+    timeout: int = DEFAULT_CP_HTTP_TIMEOUT_SECONDS,
+) -> tuple[int, dict]:
     """POST /cp/admin/tenants/redeploy-fleet with bounded transient retry.
 
     CP can return 502/503/504 when an upstream dependency (SSM, ECS, etc.)
     flakes. Retry a small number of times with increasing backoff before
     giving up and letting the caller surface the failure.
+
+    ``timeout`` is the per-attempt HTTP read budget. The real rollout passes
+    ROLLOUT_HTTP_TIMEOUT_* so a slow/dead tenant can't time the client out
+    before the CP returns the per-tenant results (RFC#2843 #41); dry-run /
+    plan calls keep the fast default.
     """
     url = f"{cp_url}{REDEPLOY_PATH}"
     slugs = body.get("only_slugs") or []
@@ -244,7 +298,7 @@ def redeploy_scoped(cp_url: str, token: str, body: dict) -> tuple[int, dict]:
     status = 0
     resp: dict = {}
     for attempt in range(total_attempts):
-        status, resp = cp_api_json("POST", url, token, body)
+        status, resp = cp_api_json("POST", url, token, body, timeout=timeout)
         if status not in REDEPLOY_RETRY_STATUSES:
             return status, resp
         detail = _redeploy_error_detail(resp)
@@ -357,18 +411,30 @@ def execute_scoped_rollout(
 ) -> dict:
     cp_url = plan["cp_url"]
     base_body = plan["body"]
+    rollout_timeout = int(plan.get("rollout_http_timeout") or ROLLOUT_HTTP_TIMEOUT_DEFAULT_SECONDS)
     all_slugs = list_slugs(cp_url, token, base_body)
     batch_size = int(base_body.get("batch_size") or 1)
     canary_slug = str(base_body.get("canary_slug") or "").strip()
     dry_run = bool(base_body.get("dry_run"))
     aggregate = {"ok": True, "results": []}
 
+    # The real rollout POST blocks for the whole concurrent batch; give it the
+    # elevated read budget so a slow/dead tenant can't time the client out
+    # before the CP returns results (RFC#2843 #41). Only the production
+    # redeploy_scoped accepts a timeout; an injected test double keeps its
+    # 3-arg shape, so wrap only when we hold the real callable.
+    if redeploy is redeploy_scoped:
+        def rollout_redeploy(u, t, b):
+            return redeploy_scoped(u, t, b, timeout=rollout_timeout)
+    else:
+        rollout_redeploy = redeploy
+
     if canary_slug:
         if canary_slug not in all_slugs:
             raise RuntimeError(f"configured canary slug {canary_slug!r} is not a running tenant")
         body = scoped_redeploy_body(base_body, [canary_slug])
         print(f"POST {cp_url}{REDEPLOY_PATH} only_slugs={','.join(body['only_slugs'])}")
-        status, resp = redeploy(cp_url, token, body)
+        status, resp = rollout_redeploy(cp_url, token, body)
         aggregate["results"].extend(resp.get("results") or [])
         try:
             _raise_for_redeploy_result(status, resp, [canary_slug])
@@ -385,7 +451,7 @@ def execute_scoped_rollout(
     for group in chunks(remaining, batch_size):
         body = scoped_redeploy_body(base_body, group)
         print(f"POST {cp_url}{REDEPLOY_PATH} only_slugs={','.join(group)}")
-        status, resp = redeploy(cp_url, token, body)
+        status, resp = rollout_redeploy(cp_url, token, body)
         aggregate["results"].extend(resp.get("results") or [])
         try:
             _raise_for_redeploy_result(status, resp, group)
