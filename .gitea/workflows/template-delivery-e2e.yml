@@ -14,12 +14,21 @@ name: template-delivery-e2e
 #     PLUGIN channel and NOT the asset channel (negative control).
 #
 # STAGED ROLLOUT (do NOT make required until green):
-#   Phase 1 (now): advisory — runs on the relevant paths + main + dispatch.
+#   Phase 1 (done): advisory — runs on the relevant paths + main + dispatch.
 #                  Asserts the new two-channel contract.
-#   Phase 2 (after this goes green twice on the new contract): remove
-#                  continue-on-error and add this check to branch protection
-#                  required_status_checks so a future delivery regression is
-#                  merge-blocking.
+#   Phase 2a (THIS change, mc#2996): HARDEN the asset-channel assertions so the
+#                  gate is reliable enough to make required. The C (config.yaml)
+#                  + D (prompts) checks now poll within E2E_ASSET_SETTLE_SECS: a
+#                  freshly-online tenant's /configs inspection endpoint can be
+#                  transiently slow / time out the first read (the 9c2161d red was
+#                  `curl: (28) ... 0 bytes` → config read as size 0, a FALSE stub,
+#                  not a real delivery failure). A genuine stub still fails after
+#                  the budget. continue-on-error STAYS in this PR — the flip is
+#                  gated by lint-pre-flip-continue-on-error on recent green main
+#                  runs, which this hardening produces.
+#   Phase 2b (follow-up, after 2a is green on main): remove continue-on-error and
+#                  add the emitted context to branch protection
+#                  required_status_checks → a delivery regression is merge-blocking.
 #
 # Cost: provisions ONE throwaway tenant + ONE seo-agent (real EC2), teardown
 # trap deletes the org even on failure. Path-filtered so it only runs when the
@@ -73,14 +82,17 @@ jobs:
   # Job renamed for the RFC#2843 #32 two-channel contract (config+prompts via
   # the asset channel; seo-all installs via the post-online plugin reconcile,
   # not at boot). Renaming the job changes the emitted status context.
-  # bp-exempt: advisory Phase-1 gate (continue-on-error, mc#2996) — informational, not a required BP context.
+  # bp-exempt: Phase 2a — still advisory (continue-on-error) while the hardened
+  # asset assertions bank green main runs; lint-pre-flip-continue-on-error then
+  # permits the Phase-2b flip + branch-protection add (mc#2996).
   delivery:
     # No colon in the name — lint-required-context's PyYAML AST parse rejects an
     # unquoted scalar containing a colon.
     name: Template-asset delivery (fresh seo-agent — config+prompts via asset channel, seo-all via plugin reconcile)
     runs-on: ubuntu-latest
-    # Phase 1: advisory. Remove this line in Phase 2 to make it merge-blocking.
-    # mc#2996 — Phase 2 promotion tracker (remove continue-on-error; forced 14d renewal cadence).
+    # Phase 2a: STILL advisory. The flip to required (remove this line + add to
+    # branch protection) is Phase 2b, gated by lint-pre-flip-continue-on-error on
+    # the green main runs this hardening produces. mc#2996.
     continue-on-error: true  # mc#2996
     timeout-minutes: 30
     env:

@@ -56,6 +56,15 @@ EXPECTED_MODEL="${E2E_EXPECTED_MODEL:-moonshot/kimi-k2.6}"
 EXPECTED_PLUGIN="${E2E_EXPECTED_PLUGIN:-seo-all}"
 PROVISION_TIMEOUT_SECS="${E2E_PROVISION_TIMEOUT_SECS:-900}"
 PLUGIN_INSTALL_TIMEOUT_SECS="${E2E_PLUGIN_INSTALL_TIMEOUT_SECS:-600}"
+# Settle budget for the ASSET-channel assertions (C config.yaml, D prompts).
+# A freshly-online tenant's /configs inspection endpoint (execs into the
+# container) can be transiently slow or time out the first read — observed:
+# `curl: (28) ... 0 bytes` on a just-online box → config.yaml read as size 0 →
+# false "stub" failure. The assertions poll within this budget and only FAIL
+# after it expires, so a genuine stub still fails loudly (the gate's real
+# signal) while a transient/early read no longer false-negatives. Required for
+# this gate to be merge-blocking without flaking (mc#2996 Phase 2).
+ASSET_SETTLE_SECS="${E2E_ASSET_SETTLE_SECS:-180}"
 
 # Collision-proof slug (random suffix), same convention as the sibling harness.
 RAND=$(head -c4 /dev/urandom | od -An -tx1 | tr -d ' \n')
@@ -160,21 +169,31 @@ MODEL=$(tenant_call GET "/workspaces/$WID/model" | python3 -c "import json,sys;p
 ok "B: model=$MODEL"
 
 # C. config.yaml delivered + REAL (not the 218 B default stub)
-CFG_SIZE=$(tenant_call GET "/workspaces/$WID/files" | python3 -c "
+# D. prompts/ delivered (identity prompt)
+#
+# Both read the tenant's /configs inspection endpoint, which can be transiently
+# slow / time out on a just-online box. Poll within ASSET_SETTLE_SECS so a
+# transient read or a not-yet-settled volume retries; only fail AFTER the budget
+# (a real stub stays a stub). The LAST observed values feed the failure message.
+ASSET_DEADLINE=$(( $(date +%s) + ASSET_SETTLE_SECS )); CFG_SIZE=0; PROMPTS=0
+while true; do
+  CFG_SIZE=$(tenant_call GET "/workspaces/$WID/files" | python3 -c "
 import json,sys
 for f in json.load(sys.stdin):
     if f.get('path')=='config.yaml': print(f.get('size',0)); break
 else: print(0)
 " 2>/dev/null || echo 0)
-[ "${CFG_SIZE:-0}" -gt 1024 ] || fail "C: config.yaml size=$CFG_SIZE B (≤1KiB ⇒ default stub, template config NOT delivered)"
-ok "C: config.yaml delivered ($CFG_SIZE B)"
-
-# D. prompts/ delivered (identity prompt)
-PROMPTS=$(tenant_call GET "/workspaces/$WID/files?path=prompts" | python3 -c "
+  PROMPTS=$(tenant_call GET "/workspaces/$WID/files?path=prompts" | python3 -c "
 import json,sys
 d=json.load(sys.stdin); print(len(d) if isinstance(d,list) else 0)
 " 2>/dev/null || echo 0)
-[ "${PROMPTS:-0}" -gt 0 ] || fail "D: prompts/ empty — identity prompt NOT delivered"
+  { [ "${CFG_SIZE:-0}" -gt 1024 ] && [ "${PROMPTS:-0}" -gt 0 ]; } && break
+  [ "$(date +%s)" -gt "$ASSET_DEADLINE" ] && break
+  sleep 10
+done
+[ "${CFG_SIZE:-0}" -gt 1024 ] || fail "C: config.yaml size=$CFG_SIZE B after ${ASSET_SETTLE_SECS}s (≤1KiB ⇒ default stub, template config NOT delivered)"
+ok "C: config.yaml delivered ($CFG_SIZE B)"
+[ "${PROMPTS:-0}" -gt 0 ] || fail "D: prompts/ empty after ${ASSET_SETTLE_SECS}s — identity prompt NOT delivered"
 ok "D: prompts/ delivered ($PROMPTS file(s))"
 
 # E. plugins/seo-all/SKILL.md installed via the post-online PLUGIN reconcile —
