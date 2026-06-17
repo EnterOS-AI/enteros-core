@@ -340,6 +340,31 @@ func (h *WorkspaceHandler) buildProvisionerConfig(
 		workspaceAccess = provisioner.WorkspaceAccessNone
 	}
 
+	// RFC#2843 #32: stamp the workspace's DECLARED plugin sources (the DB
+	// desired-set) into the box env so the boot-install step (CP
+	// userdata_containerized.go) re-establishes /configs/plugins on EVERY
+	// (re)provision — surviving the ephemeral-instance restart that a
+	// post-online EIC push could not (root-caused 2026-06-17: restart = fresh
+	// instance, plugin lived only on the destroyed instance's disk). The box
+	// fetches each source itself (gitea:// via its read-only PAT); only the
+	// small source LIST rides the env, never the skill content. Non-fatal.
+	if declared, derr := listDeclaredPlugins(ctx, workspaceID); derr != nil {
+		log.Printf("workspace provision: list declared plugins for %s: %v (continuing without MOLECULE_DECLARED_PLUGINS)", workspaceID, derr)
+	} else if len(declared) > 0 {
+		srcs := make([]string, 0, len(declared))
+		for _, d := range declared {
+			if s := strings.TrimSpace(d.SourceRaw); s != "" {
+				srcs = append(srcs, s)
+			}
+		}
+		if len(srcs) > 0 {
+			if envVars == nil {
+				envVars = make(map[string]string)
+			}
+			envVars["MOLECULE_DECLARED_PLUGINS"] = strings.Join(srcs, ",")
+		}
+	}
+
 	return provisioner.WorkspaceConfig{
 		WorkspaceID:     workspaceID,
 		TemplatePath:    templatePath,
