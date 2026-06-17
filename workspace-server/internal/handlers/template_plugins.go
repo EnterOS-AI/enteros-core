@@ -134,3 +134,28 @@ func seedTemplatePlugins(ctx context.Context, workspaceID string, sources []stri
 	}
 	return recorded, skipped
 }
+
+
+// parseTemplatePluginsFromBytes parses the  list from raw config.yaml
+// bytes — the SaaS sibling of parseTemplatePlugins. On a fresh SaaS tenant the
+// template config arrives via the Gitea asset channel (not a local dir), so the
+// declared-plugin SSOT is those fetched bytes, not a local templatePath (which
+// may be empty or fall back to <runtime>-default and miss the real template's
+// plugins:). RFC#2843 #32.
+func parseTemplatePluginsFromBytes(data []byte) ([]string, error) {
+	if len(data) == 0 {
+		return nil, nil
+	}
+	if int64(len(data)) > maxTemplateConfigYAMLBytes {
+		return nil, fmt.Errorf("template config.yaml exceeds %d-byte cap", maxTemplateConfigYAMLBytes)
+	}
+	var cfg templateConfigPlugins
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("parse template config.yaml plugins: %w", err)
+	}
+	merged := mergePlugins(nil, cfg.Plugins)
+	if len(merged) > maxTemplatePlugins {
+		return nil, fmt.Errorf("template declares %d plugins; cap is %d", len(merged), maxTemplatePlugins)
+	}
+	return merged, nil
+}

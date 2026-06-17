@@ -1031,6 +1031,25 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 		}
 	}
 
+	// RFC#2843 #32: on SaaS the DELIVERED template config (with plugins:) arrives
+	// via the Gitea asset channel, NOT the local templatePath (which on a fresh
+	// tenant is empty or falls back to <runtime>-default and misses the real
+	// template's plugins:). Record declared plugins from the SAME fetched config
+	// the asset channel delivers so the post-online reconcile installs them.
+	// Idempotent (seedTemplatePlugins upserts ON CONFLICT); non-fatal.
+	if provisionOK && h.giteaTemplateFetcher != nil && payload.Template != "" {
+		if identity := templateIdentityForTemplateOrRuntime(payload.Template, payload.Runtime); identity != "" {
+			if fetched, ferr := h.giteaTemplateFetcher.Load(ctx, identity); ferr != nil {
+				log.Printf("Create %s: fetch template assets for declared-plugins: %v (continuing)", id, ferr)
+			} else if declaredPlugins, perr := parseTemplatePluginsFromBytes(fetched["config.yaml"]); perr != nil {
+				log.Printf("Create %s: parsing fetched template plugins: %v (continuing)", id, perr)
+			} else if len(declaredPlugins) > 0 {
+				recorded, skipped := seedTemplatePlugins(ctx, id, declaredPlugins)
+				log.Printf("Create %s: recorded %d/%d fetched-template declared plugins (skipped=%d)", id, recorded, len(declaredPlugins), skipped)
+			}
+		}
+	}
+
 	// Mint the workspace's first bearer token and return it inline
 	// (#1644). Pre-fix, callers had to make a separate POST to
 	// /admin/workspaces/:id/tokens (production path, AdminAuth-gated,
