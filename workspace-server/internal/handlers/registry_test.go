@@ -199,6 +199,79 @@ func TestRegister_200_DoesNotLogFailure(t *testing.T) {
 	}
 }
 
+// TestRegister_FiresReconcile_OnProvisioningToOnline is the RFC#2843 #32
+// regression for the SECOND root cause: on the CP/SaaS boot path the runtime
+// calls POST /registry/register BEFORE it heartbeats, and register sets
+// status='online'. So the heartbeat handler's prevStatus=='provisioning' fire
+// (PR #3002/#3004) never matches — the row is already 'online' by the first
+// heartbeat. The declared-plugin reconcile (seo-all) therefore never installed
+// on a fresh prod seo-agent. This asserts register fires the reconcile when it
+// performs the provisioning→online transition. The prev-status SELECT uses
+// bare `status` (NOT-NULL enum; COALESCE(status,'') is rejected by Postgres).
+func TestRegister_FiresReconcile_OnProvisioningToOnline(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewRegistryHandler(broadcaster)
+
+	reconcileFired := make(chan string, 4)
+	handler.SetReconcileFunc(func(_ context.Context, workspaceID string) {
+		reconcileFired <- workspaceID
+	})
+
+	mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM workspace_auth_tokens").
+		WithArgs("ws-prov").
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+	mock.ExpectQuery(`SELECT delivery_mode, runtime FROM workspaces WHERE id`).
+		WithArgs("ws-prov").
+		WillReturnRows(sqlmock.NewRows([]string{"delivery_mode", "runtime"}).AddRow("push", "claude-code"))
+	// The reconcile-trigger prev-status read — only runs because ReconcileFunc
+	// is wired. Returns 'provisioning' = the state before this register.
+	mock.ExpectQuery("SELECT status FROM workspaces WHERE id").
+		WithArgs("ws-prov").
+		WillReturnRows(sqlmock.NewRows([]string{"status"}).AddRow("provisioning"))
+	mock.ExpectExec("INSERT INTO workspaces").
+		WithArgs("ws-prov", "ws-prov", "http://localhost:9100", `{"name":"prov-agent"}`, "push", "").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery("SELECT url FROM workspaces WHERE id").
+		WithArgs("ws-prov").
+		WillReturnRows(sqlmock.NewRows([]string{"url"}).AddRow("http://localhost:9100"))
+	mock.ExpectExec("INSERT INTO structure_events").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM workspace_auth_tokens").
+		WithArgs("ws-prov").
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+	mock.ExpectExec("INSERT INTO workspace_auth_tokens").
+		WithArgs("ws-prov", sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest("POST", "/registry/register",
+		bytes.NewBufferString(`{"id":"ws-prov","url":"http://localhost:9100","agent_card":{"name":"prov-agent"}}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Register(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// fire-and-forget via globalGoAsync; wait briefly.
+	select {
+	case got := <-reconcileFired:
+		if got != "ws-prov" {
+			t.Errorf("reconcile fired for wrong workspace: got %q", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("RFC#2843 #32 regression: reconcile did NOT fire on provisioning→online register")
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
 // ==================== Heartbeat — offline → online recovery ====================
 
 func TestHeartbeatHandler_OfflineToOnline(t *testing.T) {

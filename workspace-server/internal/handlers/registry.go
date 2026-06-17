@@ -686,6 +686,35 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 	// just made.
 	modeForUpsert := effectiveMode
 
+	// RFC#2843 #32: capture the pre-upsert status so we can fire the
+	// declared-plugin reconcile when THIS register performs the
+	// provisioning→online transition. On the CP/SaaS boot path the runtime
+	// calls POST /registry/register FIRST (before any heartbeat) and the
+	// upsert below sets status='online' unconditionally — so the heartbeat
+	// handler's prevStatus=='provisioning' trigger never matches (the row is
+	// already 'online' by the first heartbeat). Register is therefore the real
+	// fresh-boot provisioning→online transition for CP workspaces, and the
+	// reconcile must fire here too. Best-effort: a failed read leaves
+	// prevStatusForReconcile = "" and simply skips the fire (the heartbeat path
+	// remains the fallback for any runtime that registers without flipping
+	// status). status is a NOT-NULL enum — select it bare (never COALESCE to '',
+	// which Postgres rejects as an invalid enum literal and fails the scan).
+	//
+	// Guarded on h.reconcilePlugins != nil so the extra read only runs when the
+	// reconcile hook is actually wired (production router). Unit tests that don't
+	// wire a ReconcileFunc skip this query entirely (no mock churn).
+	var prevStatusForReconcile string
+	if h.reconcilePlugins != nil {
+		if err := db.DB.QueryRowContext(ctx, `SELECT status FROM workspaces WHERE id = $1`, payload.ID).Scan(&prevStatusForReconcile); err != nil {
+			// sql.ErrNoRows on a brand-new workspace is expected (INSERT path);
+			// leave prevStatusForReconcile empty so we don't fire on first create
+			// (provisioning is recorded by POST /workspaces; the row exists by the
+			// time the runtime registers, so the provisioning→online case is the
+			// UPDATE branch below).
+			prevStatusForReconcile = ""
+		}
+	}
+
 	// Upsert workspace: update url, agent_card, status, delivery_mode if already exists.
 	// On INSERT (workspace not yet created via POST /workspaces), use ID as name placeholder.
 	// Keep existing URL if provisioner already set a host-accessible one (starts with http://127.0.0.1).
@@ -755,6 +784,20 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 	// Set Redis liveness key
 	if err := db.SetOnline(ctx, payload.ID); err != nil {
 		log.Printf("Registry redis error: %v", err)
+	}
+
+	// RFC#2843 #32: fire the declared-plugin reconcile when THIS register just
+	// transitioned the workspace provisioning→online. This is the primary
+	// fresh-boot transition on the CP/SaaS path (runtime registers before it
+	// heartbeats, and the upsert above set status='online'), so without firing
+	// here the seo-agent's declared seo-all plugin never installs. Idempotent
+	// (ReconcileWorkspacePlugins diffs declared-vs-installed and no-ops when
+	// present) and nil-safe via fireReconcileOnline; fire-and-forget so register
+	// returns immediately. The heartbeat handler keeps its own
+	// prevStatus=='provisioning' fire as a fallback for runtimes that reach
+	// online via heartbeat self-heal rather than register.
+	if prevStatusForReconcile == string(models.StatusProvisioning) {
+		h.fireReconcileOnline(ctx, payload.ID)
 	}
 
 	// Cache URL — prefer existing provisioner URL over agent-reported one.
