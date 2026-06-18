@@ -393,12 +393,24 @@ func (h *RegistryHandler) platformAgentHasModelSecret(ctx context.Context, works
 	return exists, err
 }
 
-// platformAgentMCPServerPresent reports whether the runtime declared the
-// platform-agent image's /opt/molecule-mcp-server binary present. The payload
-// field is a pointer so an absent declaration (nil) is treated as false —
-// fail-closed: an old/generic runtime cannot prove it has the concierge MCP.
+// platformAgentMCPServerPresent reports whether the concierge's MCP server
+// should be considered present for the fail-closed online gate (#2970).
+//
+// The payload field is a pointer to distinguish three states:
+//   - nil   → the runtime did NOT report the field at all. This is a runtime
+//     PREDATING the #147 contract (mcp_server_present on register/heartbeat).
+//     The concierge image bakes /opt/molecule-mcp-server unconditionally, so an
+//     old runtime that simply can't SPEAK the contract must NOT be fail-closed —
+//     that would take every concierge offline the moment this gate deploys ahead
+//     of the runtime release that adds the field (the exact rollout-order hazard
+//     that fail-closed #2989 + a pre-#147 concierge image hit on 2026-06-18:
+//     test3 + the fleet would be marked failed despite a present MCP binary).
+//     Treat nil as ALLOW (unknown ⇒ don't block) for backward-compat.
+//   - &true  → runtime affirmatively reports the binary present → allow.
+//   - &false → a #147-aware runtime affirmatively reports it ABSENT → fail-closed
+//     (the real signal this gate exists to catch).
 func (h *RegistryHandler) platformAgentMCPServerPresent(present *bool) bool {
-	return present != nil && *present
+	return present == nil || *present
 }
 
 // markWorkspaceFailed updates a workspace row to status='failed' and broadcasts
