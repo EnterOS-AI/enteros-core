@@ -286,6 +286,25 @@ func workspaceMemoryNamespace(workspaceID string) string {
 	return fmt.Sprintf("workspace:%s", workspaceID)
 }
 
+// conciergeTemplateOrDefault forces the platform-agent template for a
+// kind='platform' concierge when no explicit template is set. RFC §5.7: the
+// concierge identity (config.yaml + prompts/concierge.md + mcp_servers.yaml) is
+// delivered "like any other runtime template" via the platform-agent template
+// entry. But the platform-agent workspace row was upserted with no `template`
+// (platform_agent.go installPlatformAgent), so payload.Template was empty and
+// the identity resolved to the GENERIC claude-code-default config — the
+// concierge booted online but with no persona ("doesn't know it's the platform
+// agent", #30/#2970). Forcing "platform-agent" here makes the asset fetcher pull
+// the concierge identity for every concierge provision/restart, new or existing,
+// without depending on the row's template column being backfilled. An explicit
+// template (set by a future caller) still wins.
+func conciergeTemplateOrDefault(kind, template string) string {
+	if kind == models.KindPlatform && strings.TrimSpace(template) == "" {
+		return "platform-agent"
+	}
+	return template
+}
+
 func (h *WorkspaceHandler) buildProvisionerConfig(
 	ctx context.Context,
 	workspaceID, templatePath string,
@@ -416,7 +435,7 @@ func (h *WorkspaceHandler) buildProvisionerConfig(
 		// not duplicated across first-provision + restart paths.
 		// nil fetcher = "no fetcher wired" (self-host default;
 		// falls through to the local TemplatePath path).
-		TemplateIdentity:     templateIdentityForTemplateOrRuntime(payload.Template, payload.Runtime),
+		TemplateIdentity:     templateIdentityForTemplateOrRuntime(conciergeTemplateOrDefault(kind, payload.Template), payload.Runtime),
 		TemplateAssetFetcher: h.giteaTemplateFetcher,
 	}
 }

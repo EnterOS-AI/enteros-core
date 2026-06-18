@@ -587,9 +587,9 @@ func installPlatformAgent(ctx context.Context, database *sql.DB, platformID, nam
 	//    provisioning state. The integration tests use unique names per fixture
 	//    to avoid cross-test collision (CR-A RC 10610).
 	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO workspaces (id, name, kind, tier, status, runtime, parent_id)
-		VALUES ($1, $2, 'platform', 0, 'offline', 'claude-code', NULL)
-		ON CONFLICT (id) DO UPDATE SET kind = 'platform', runtime = 'claude-code', parent_id = NULL
+		INSERT INTO workspaces (id, name, kind, tier, status, runtime, parent_id, template)
+		VALUES ($1, $2, 'platform', 0, 'offline', 'claude-code', NULL, 'platform-agent')
+		ON CONFLICT (id) DO UPDATE SET kind = 'platform', runtime = 'claude-code', parent_id = NULL, template = 'platform-agent'
 	`, platformID, name); err != nil {
 		return fmt.Errorf("upsert platform agent: %w", err)
 	}
