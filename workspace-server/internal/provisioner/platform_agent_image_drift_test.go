@@ -223,7 +223,16 @@ func resolveSSOTRoot(t *testing.T) (path string, available bool) {
 //     "someone vendored the config into core"); AND
 //   - a FULL SSOT-content gate that runs on the publish workflow
 //     (catches "image-baked content drifted from template repo").
+func skipIfPlatformAgentImageRemoved(t *testing.T) {
+	dockerfilePath := filepath.Join("..", "..", "Dockerfile.platform-agent")
+	if _, err := os.Stat(dockerfilePath); os.IsNotExist(err) {
+		t.Skipf("%s was removed in #3027 (core no longer builds the platform-agent image); this drift-gate is stale and will be removed once the permanent cleanup PR lands", dockerfilePath)
+	}
+}
+
 func TestPlatformAgentImageDriftGate(t *testing.T) {
+	skipIfPlatformAgentImageRemoved(t)
+
 	// === Half 1: Dockerfile-side checks (always run) ===
 
 	dockerfilePath := filepath.Join("..", "..", "Dockerfile.platform-agent")
@@ -357,6 +366,8 @@ func TestPlatformAgentImageDriftGate(t *testing.T) {
 // in lockstep. The shape (identity-fallback.sh + /entrypoint.sh
 // handoff) is the load-bearing part; the names are conventions.
 func TestPlatformAgentEntrypointWiring(t *testing.T) {
+	skipIfPlatformAgentImageRemoved(t)
+
 	dockerfilePath := filepath.Join("..", "..", "Dockerfile.platform-agent")
 	dockerfile, err := os.ReadFile(dockerfilePath)
 	if err != nil {
