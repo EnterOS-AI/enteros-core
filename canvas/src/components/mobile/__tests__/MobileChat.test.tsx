@@ -762,6 +762,27 @@ describe("MobileChat — multi-send tap path (CR2 #2762)", () => {
       expect(container.textContent ?? "").not.toContain("unreachable");
     });
   });
+
+  it("restores composer draft after a genuine send error (mc#2908 F7)", async () => {
+    vi.spyOn(api, "post").mockRejectedValueOnce(new Error("boom"));
+
+    const { container } = renderChat(mockAgentId);
+    const ta = container.querySelector("textarea") as HTMLTextAreaElement;
+    const sendBtn = container.querySelector('[aria-label="Send"]') as HTMLButtonElement;
+
+    await act(async () => {
+      fireEvent.change(ta, { target: { value: "retry me" } });
+    });
+    await act(async () => {
+      sendBtn.click();
+    });
+    await waitFor(() => {
+      expect(container.textContent ?? "").toContain("unreachable");
+    });
+
+    // Composer should be restored so the user can retry without retyping.
+    expect(ta.value).toBe("retry me");
+  });
 });
 
 describe("MobileChat — tool-call chain (#231 desktop parity)", () => {
