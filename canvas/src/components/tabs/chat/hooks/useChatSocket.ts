@@ -211,8 +211,10 @@ export function useChatSocket(
           kind: (p.kind as string) || "",
         });
       }
-    } catch {
-      /* ignore */
+    } catch (err) {
+      // Don't silently swallow socket message parse/handling errors;
+      // otherwise malformed payloads fail invisibly (mc#2908 F6).
+      console.error("useChatSocket: failed to handle WebSocket message", err);
     }
   });
 }
