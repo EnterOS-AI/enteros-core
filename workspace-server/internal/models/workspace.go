@@ -102,6 +102,11 @@ type RegisterPayload struct {
 	// the row to be its own org root (parent_id IS NULL) and to be the only
 	// platform agent in the org — enforced by the Register handler.
 	Kind string `json:"kind,omitempty"`
+	// MCPServerPresent is the runtime's declaration that the platform-agent
+	// image's baked /opt/molecule-mcp-server binary is present. For platform
+	// agents the controlplane treats nil/false as fail-closed (RCA #2970).
+	// Non-platform workspaces may omit this field.
+	MCPServerPresent *bool `json:"mcp_server_present,omitempty"`
 }
 
 type HeartbeatPayload struct {
@@ -149,6 +154,10 @@ type HeartbeatPayload struct {
 	// The heartbeat handler backfills NULL agent_card rows so the workspace
 	// can come online without requiring a full re-register. (#2421)
 	AgentCard json.RawMessage `json:"agent_card,omitempty"`
+	// MCPServerPresent mirrors the register payload field on every heartbeat
+	// so the fail-closed platform-agent gate can block recovery paths that
+	// would otherwise resurrect an mcp-less concierge (RCA #2970).
+	MCPServerPresent *bool `json:"mcp_server_present,omitempty"`
 }
 
 // RuntimeMetadata is the adapter-declared capability + override block

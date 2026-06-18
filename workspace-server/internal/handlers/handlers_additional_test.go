@@ -455,15 +455,15 @@ func TestHeartbeat_ExactThreshold_Degraded(t *testing.T) {
 
 	mock.ExpectQuery("SELECT COALESCE\\(current_task").
 		WithArgs("ws-edge").
-		WillReturnRows(sqlmock.NewRows([]string{"current_task"}).AddRow(""))
+		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend"}).AddRow("", 0))
 	mock.ExpectExec("UPDATE workspaces SET").
 		WithArgs("ws-edge", 0.5, "edge case", 0, 500, "").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// error_rate == 0.5 should trigger degraded (>= 0.5)
-	mock.ExpectQuery("SELECT status, last_register_failure_at FROM workspaces WHERE id =").
+	mock.ExpectQuery("SELECT status, kind, last_register_failure_at FROM workspaces WHERE id =").
 		WithArgs("ws-edge").
-		WillReturnRows(sqlmock.NewRows([]string{"status", "last_register_failure_at"}).AddRow("online", nil))
+		WillReturnRows(sqlmock.NewRows([]string{"status", "kind", "last_register_failure_at"}).AddRow("online", "", nil))
 	mock.ExpectExec("UPDATE workspaces SET status =").
 		WithArgs(models.StatusDegraded, "ws-edge").
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -496,15 +496,15 @@ func TestHeartbeat_DegradedRecovery(t *testing.T) {
 
 	mock.ExpectQuery("SELECT COALESCE\\(current_task").
 		WithArgs("ws-rec").
-		WillReturnRows(sqlmock.NewRows([]string{"current_task"}).AddRow(""))
+		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend"}).AddRow("", 0))
 	mock.ExpectExec("UPDATE workspaces SET").
 		WithArgs("ws-rec", 0.05, "", 1, 2000, "").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// Currently degraded, error_rate < 0.1 → should recover to online
-	mock.ExpectQuery("SELECT status, last_register_failure_at FROM workspaces WHERE id =").
+	mock.ExpectQuery("SELECT status, kind, last_register_failure_at FROM workspaces WHERE id =").
 		WithArgs("ws-rec").
-		WillReturnRows(sqlmock.NewRows([]string{"status", "last_register_failure_at"}).AddRow("degraded", nil))
+		WillReturnRows(sqlmock.NewRows([]string{"status", "kind", "last_register_failure_at"}).AddRow("degraded", "", nil))
 	mock.ExpectExec("UPDATE workspaces SET status =").
 		WithArgs(models.StatusOnline, "ws-rec").
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -538,15 +538,15 @@ func TestHeartbeat_ErrorRateDegrade_Guarded(t *testing.T) {
 
 	mock.ExpectQuery("SELECT COALESCE\\(current_task").
 		WithArgs("ws-degrade-guard").
-		WillReturnRows(sqlmock.NewRows([]string{"current_task"}).AddRow(""))
+		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend"}).AddRow("", 0))
 	mock.ExpectExec("UPDATE workspaces SET").
 		WithArgs("ws-degrade-guard", 0.6, "", 1, 100, "").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// Stale read: heartbeat started before CascadeDelete set status='removed'
-	mock.ExpectQuery("SELECT status, last_register_failure_at FROM workspaces WHERE id =").
+	mock.ExpectQuery("SELECT status, kind, last_register_failure_at FROM workspaces WHERE id =").
 		WithArgs("ws-degrade-guard").
-		WillReturnRows(sqlmock.NewRows([]string{"status", "last_register_failure_at"}).AddRow("online", nil))
+		WillReturnRows(sqlmock.NewRows([]string{"status", "kind", "last_register_failure_at"}).AddRow("online", "", nil))
 
 	// Guarded UPDATE returns 0 rows because row is actually 'removed'
 	mock.ExpectExec("UPDATE workspaces SET status =.*AND status = 'online'").
@@ -584,15 +584,15 @@ func TestHeartbeat_DegradedRecovery_Guarded(t *testing.T) {
 
 	mock.ExpectQuery("SELECT COALESCE\\(current_task").
 		WithArgs("ws-recover-guard").
-		WillReturnRows(sqlmock.NewRows([]string{"current_task"}).AddRow(""))
+		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend"}).AddRow("", 0))
 	mock.ExpectExec("UPDATE workspaces SET").
 		WithArgs("ws-recover-guard", 0.05, "", 1, 100, "").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// Stale read: heartbeat started before CascadeDelete set status='removed'
-	mock.ExpectQuery("SELECT status, last_register_failure_at FROM workspaces WHERE id =").
+	mock.ExpectQuery("SELECT status, kind, last_register_failure_at FROM workspaces WHERE id =").
 		WithArgs("ws-recover-guard").
-		WillReturnRows(sqlmock.NewRows([]string{"status", "last_register_failure_at"}).AddRow("degraded", nil))
+		WillReturnRows(sqlmock.NewRows([]string{"status", "kind", "last_register_failure_at"}).AddRow("degraded", "", nil))
 
 	// Guarded UPDATE returns 0 rows because row is actually 'removed'
 	mock.ExpectExec("UPDATE workspaces SET status =.*AND status = 'degraded'").
@@ -1479,7 +1479,7 @@ func TestHeartbeatHandler_RegisterFailureClearedOnCardBearingRestart(t *testing.
 	// prevTask SELECT
 	mock.ExpectQuery("SELECT COALESCE\\(current_task").
 		WithArgs("ws-2739").
-		WillReturnRows(sqlmock.NewRows([]string{"current_task"}).AddRow(""))
+		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend"}).AddRow("", 0))
 
 	// heartbeat UPDATE
 	mock.ExpectExec("UPDATE workspaces SET").
@@ -1499,9 +1499,9 @@ func TestHeartbeatHandler_RegisterFailureClearedOnCardBearingRestart(t *testing.
 
 	// evaluateStatus SELECT — workspace is degraded; failure marker is now NULL
 	// (the clear above wiped it in the real DB), so recovery is unblocked.
-	mock.ExpectQuery("SELECT status, last_register_failure_at FROM workspaces WHERE id =").
+	mock.ExpectQuery("SELECT status, kind, last_register_failure_at FROM workspaces WHERE id =").
 		WithArgs("ws-2739").
-		WillReturnRows(sqlmock.NewRows([]string{"status", "last_register_failure_at"}).AddRow("degraded", nil))
+		WillReturnRows(sqlmock.NewRows([]string{"status", "kind", "last_register_failure_at"}).AddRow("degraded", "", nil))
 
 	// degraded -> online recovery
 	mock.ExpectExec("UPDATE workspaces SET status =").

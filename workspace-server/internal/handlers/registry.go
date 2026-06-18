@@ -393,12 +393,24 @@ func (h *RegistryHandler) platformAgentHasModelSecret(ctx context.Context, works
 	return exists, err
 }
 
+// platformAgentMCPServerPresent reports whether the runtime declared the
+// platform-agent image's /opt/molecule-mcp-server binary present. The payload
+// field is a pointer so an absent declaration (nil) is treated as false —
+// fail-closed: an old/generic runtime cannot prove it has the concierge MCP.
+func (h *RegistryHandler) platformAgentMCPServerPresent(present *bool) bool {
+	return present != nil && *present
+}
+
 // markWorkspaceFailed updates a workspace row to status='failed' and broadcasts
 // WORKSPACE_PROVISION_FAILED. It is a RegistryHandler-local fallback for the
 // fail-closed platform-agent identity gate; the WorkspaceHandler's
 // markProvisionFailed is the primary path during provisioning.
-func (h *RegistryHandler) markWorkspaceFailed(ctx context.Context, workspaceID, msg string) {
-	extra := map[string]interface{}{"error": msg, "code": "PLATFORM_AGENT_IDENTITY_GATE"}
+func (h *RegistryHandler) markWorkspaceFailed(ctx context.Context, workspaceID, msg, reason string) {
+	extra := map[string]interface{}{
+		"error":  msg,
+		"code":   "PLATFORM_AGENT_IDENTITY_GATE",
+		"reason": reason,
+	}
 	h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceProvisionFailed), workspaceID, extra)
 	if _, dbErr := db.DB.ExecContext(ctx,
 		`UPDATE workspaces SET status = $3, last_sample_error = $2, updated_at = now() WHERE id = $1`,
@@ -539,27 +551,45 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 	}
 
 	// Issue #2970: fail CLOSED if a platform agent reaches registration without
-	// the seeded MODEL workspace_secret. The MISSING_MODEL gate in
+	// BOTH the seeded MODEL workspace_secret AND the platform-agent image's baked
+	// /opt/molecule-mcp-server binary. The MISSING_MODEL gate in
 	// prepareProvisionContext is the primary defense, but if a model-less/identity-
-	// less concierge somehow boots on a path that bypasses that gate (e.g. an old
-	// or generic image), this second-layer guard prevents it from ever marking
+	// less/mcp-less concierge somehow boots on a path that bypasses that gate (e.g.
+	// an old or generic image), this second-layer guard prevents it from ever marking
 	// itself online-routable. Instead we mark the workspace failed so the canvas
 	// surfaces a provision failure rather than serving users a generic Claude Code.
+	//
+	// The runtime declares mcp-server availability via payload.mcp_server_present.
+	// A nil/false value is fail-closed: an undeclared or missing MCP server cannot be
+	// trusted for a concierge.
 	//
 	// existingState.ExistingKind is populated by fetchExistingWorkspaceStateForDiagnostics
 	// (best-effort). We treat "platform" literally; any other value (including "(new)"
 	// or "(unavailable)") means the gate does not apply unless payload.Kind itself is
 	// "platform" (covered by the privilege-escalation precheck above).
 	if payload.Kind == models.KindPlatform || existingState.ExistingKind == models.KindPlatform {
-		if hasModel, mErr := h.platformAgentHasModelSecret(ctx, payload.ID); mErr != nil {
+		hasModel, mErr := h.platformAgentHasModelSecret(ctx, payload.ID)
+		if mErr != nil {
 			log.Printf("Registry register: model secret lookup failed for %s: %v", payload.ID, mErr)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "registration failed"})
 			return
-		} else if !hasModel {
-			msg := "platform agent registered without a seeded MODEL secret; refusing online"
+		}
+		hasMCP := h.platformAgentMCPServerPresent(payload.MCPServerPresent)
+		if !hasModel || !hasMCP {
+			var msg, reason, logCode string
+			switch {
+			case !hasModel:
+				msg = "platform agent registered without a seeded MODEL secret; refusing online"
+				reason = "model_missing"
+				logCode = "platform_agent_model_missing"
+			case !hasMCP:
+				msg = "platform agent registered without /opt/molecule-mcp-server; refusing online"
+				reason = "mcp_server_missing"
+				logCode = "platform_agent_mcp_server_missing"
+			}
 			log.Printf("Registry register: %s (workspace=%s)", msg, payload.ID)
-			h.markWorkspaceFailed(ctx, payload.ID, msg)
-			logRegister400Reason("platform_agent_model_missing", payload.ID, payload, existingState, msg)
+			h.markWorkspaceFailed(ctx, payload.ID, msg, reason)
+			logRegister400Reason(logCode, payload.ID, payload, existingState, msg)
 			c.JSON(http.StatusBadRequest, gin.H{"error": "platform agent identity incomplete"})
 			return
 		}
@@ -1193,13 +1223,49 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 	ctx := c.Request.Context()
 
 	var currentStatus string
+	var currentKind string
 	var lastRegisterFailure sql.NullTime
-	err := db.DB.QueryRowContext(ctx, `SELECT status, last_register_failure_at FROM workspaces WHERE id = $1`, payload.WorkspaceID).
-		Scan(&currentStatus, &lastRegisterFailure)
+	err := db.DB.QueryRowContext(ctx, `SELECT status, kind, last_register_failure_at FROM workspaces WHERE id = $1`, payload.WorkspaceID).
+		Scan(&currentStatus, &currentKind, &lastRegisterFailure)
 	if err != nil {
 		return
 	}
 	hasRecentRegisterFailure := lastRegisterFailure.Valid && time.Since(lastRegisterFailure.Time) < 5*time.Minute
+
+	// FAIL-CLOSED concierge online-marking gate (RCA #2970).
+	// A kind='platform' workspace that has lost either its seeded MODEL secret or
+	// the image-baked /opt/molecule-mcp-server binary must never be allowed back
+	// to status='online' via heartbeat recovery. The Register handler already gates
+	// the initial online marking; this gate closes the heartbeat-driven recovery
+	// paths (provisioning/failed/offline/awaiting_agent/degraded → online) that
+	// would otherwise resurrect a model-less/mcp-less concierge and let it serve
+	// users generic Claude Code.
+	//
+	// The runtime now declares mcp-server availability via
+	// payload.mcp_server_present on every heartbeat/register call. nil/false is
+	// fail-closed: an old/generic runtime cannot prove it is a real concierge.
+	if currentKind == models.KindPlatform {
+		hasModel, mErr := h.platformAgentHasModelSecret(ctx, payload.WorkspaceID)
+		if mErr != nil {
+			log.Printf("Heartbeat: model secret lookup failed for platform agent %s: %v", payload.WorkspaceID, mErr)
+			return
+		}
+		hasMCP := h.platformAgentMCPServerPresent(payload.MCPServerPresent)
+		if !hasModel || !hasMCP {
+			var msg, reason string
+			switch {
+			case !hasModel:
+				msg = "platform agent heartbeat denied: no seeded MODEL workspace_secret; refusing to mark online (RCA #2970 FAIL-CLOSED)"
+				reason = "model_missing"
+			case !hasMCP:
+				msg = "platform agent heartbeat denied: /opt/molecule-mcp-server missing; refusing to mark online (RCA #2970 FAIL-CLOSED)"
+				reason = "mcp_server_missing"
+			}
+			log.Printf("Heartbeat: %s (workspace=%s)", msg, payload.WorkspaceID)
+			h.markWorkspaceFailed(ctx, payload.WorkspaceID, msg, reason)
+			return
+		}
+	}
 
 	// Self-reported runtime wedge: takes precedence over the error_rate
 	// path. The heartbeat task lives in its own asyncio task and keeps

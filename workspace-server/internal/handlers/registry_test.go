@@ -291,9 +291,9 @@ func TestHeartbeatHandler_OfflineToOnline(t *testing.T) {
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// Expect evaluateStatus SELECT — currently offline
-	mock.ExpectQuery("SELECT status, last_register_failure_at FROM workspaces WHERE id =").
+	mock.ExpectQuery("SELECT status, kind, last_register_failure_at FROM workspaces WHERE id =").
 		WithArgs("ws-offline").
-		WillReturnRows(sqlmock.NewRows([]string{"status", "last_register_failure_at"}).AddRow("offline", nil))
+		WillReturnRows(sqlmock.NewRows([]string{"status", "kind", "last_register_failure_at"}).AddRow("offline", "", nil))
 
 	// Expect status transition back to online
 	mock.ExpectExec("UPDATE workspaces SET status =").
@@ -362,9 +362,9 @@ func TestHeartbeatHandler_ProvisioningToOnline(t *testing.T) {
 
 	// evaluateStatus SELECT — reads the post-CASE status ('online'), so its own
 	// provisioning→online branch does NOT fire (no duplicate transition exec).
-	mock.ExpectQuery("SELECT status, last_register_failure_at FROM workspaces WHERE id =").
+	mock.ExpectQuery("SELECT status, kind, last_register_failure_at FROM workspaces WHERE id =").
 		WithArgs("ws-provisioning").
-		WillReturnRows(sqlmock.NewRows([]string{"status", "last_register_failure_at"}).AddRow("online", nil))
+		WillReturnRows(sqlmock.NewRows([]string{"status", "kind", "last_register_failure_at"}).AddRow("online", "", nil))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -414,9 +414,9 @@ func TestHeartbeatHandler_FailedToOnline(t *testing.T) {
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// evaluateStatus SELECT — currently failed (provision-timeout sweeper flip)
-	mock.ExpectQuery("SELECT status, last_register_failure_at FROM workspaces WHERE id =").
+	mock.ExpectQuery("SELECT status, kind, last_register_failure_at FROM workspaces WHERE id =").
 		WithArgs("ws-failed").
-		WillReturnRows(sqlmock.NewRows([]string{"status", "last_register_failure_at"}).AddRow("failed", nil))
+		WillReturnRows(sqlmock.NewRows([]string{"status", "kind", "last_register_failure_at"}).AddRow("failed", "", nil))
 
 	// the new failed → online recovery transition
 	mock.ExpectExec("UPDATE workspaces SET status =").
@@ -463,9 +463,9 @@ func TestHeartbeatHandler_AwaitingAgentToOnline(t *testing.T) {
 		WithArgs("ws-external", 0.0, "", 0, 60, "").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	mock.ExpectQuery("SELECT status, last_register_failure_at FROM workspaces WHERE id =").
+	mock.ExpectQuery("SELECT status, kind, last_register_failure_at FROM workspaces WHERE id =").
 		WithArgs("ws-external").
-		WillReturnRows(sqlmock.NewRows([]string{"status", "last_register_failure_at"}).AddRow("awaiting_agent", nil))
+		WillReturnRows(sqlmock.NewRows([]string{"status", "kind", "last_register_failure_at"}).AddRow("awaiting_agent", "", nil))
 
 	// The new branch — UPDATE ... WHERE status = 'awaiting_agent'
 	mock.ExpectExec("UPDATE workspaces SET status =").
@@ -586,9 +586,9 @@ func TestHeartbeatHandler_OnlineStaysOnline(t *testing.T) {
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// evaluateStatus: online with error_rate 0.2 — below 0.5 threshold, stays online
-	mock.ExpectQuery("SELECT status, last_register_failure_at FROM workspaces WHERE id =").
+	mock.ExpectQuery("SELECT status, kind, last_register_failure_at FROM workspaces WHERE id =").
 		WithArgs("ws-stable").
-		WillReturnRows(sqlmock.NewRows([]string{"status", "last_register_failure_at"}).AddRow("online", nil))
+		WillReturnRows(sqlmock.NewRows([]string{"status", "kind", "last_register_failure_at"}).AddRow("online", "", nil))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -635,9 +635,9 @@ func TestHeartbeatHandler_RuntimeWedged_FlipsOnlineToDegraded(t *testing.T) {
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// evaluateStatus: currentStatus = online
-	mock.ExpectQuery("SELECT status, last_register_failure_at FROM workspaces WHERE id =").
+	mock.ExpectQuery("SELECT status, kind, last_register_failure_at FROM workspaces WHERE id =").
 		WithArgs("ws-wedged").
-		WillReturnRows(sqlmock.NewRows([]string{"status", "last_register_failure_at"}).AddRow("online", nil))
+		WillReturnRows(sqlmock.NewRows([]string{"status", "kind", "last_register_failure_at"}).AddRow("online", "", nil))
 
 	// The wedge-handling branch fires the degraded UPDATE with the
 	// `AND status = 'online'` guard (race-safe against concurrent
@@ -688,9 +688,9 @@ func TestHeartbeatHandler_DegradedRecoversOnlyAfterWedgeClears(t *testing.T) {
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// currentStatus = degraded
-	mock.ExpectQuery("SELECT status, last_register_failure_at FROM workspaces WHERE id =").
+	mock.ExpectQuery("SELECT status, kind, last_register_failure_at FROM workspaces WHERE id =").
 		WithArgs("ws-still-wedged").
-		WillReturnRows(sqlmock.NewRows([]string{"status", "last_register_failure_at"}).AddRow("degraded", nil))
+		WillReturnRows(sqlmock.NewRows([]string{"status", "kind", "last_register_failure_at"}).AddRow("degraded", "", nil))
 
 	// No additional UPDATE expected — the recovery branch's
 	// `runtime_state == ""` guard blocks the flip back to online.
@@ -733,9 +733,9 @@ func TestHeartbeatHandler_DegradedToOnline_AfterWedgeClears(t *testing.T) {
 		WithArgs("ws-recovered", 0.0, "", 0, 30, "").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	mock.ExpectQuery("SELECT status, last_register_failure_at FROM workspaces WHERE id =").
+	mock.ExpectQuery("SELECT status, kind, last_register_failure_at FROM workspaces WHERE id =").
 		WithArgs("ws-recovered").
-		WillReturnRows(sqlmock.NewRows([]string{"status", "last_register_failure_at"}).AddRow("degraded", nil))
+		WillReturnRows(sqlmock.NewRows([]string{"status", "kind", "last_register_failure_at"}).AddRow("degraded", "", nil))
 
 	// Recovery UPDATE fires (degraded → online).
 	mock.ExpectExec("UPDATE workspaces SET status =").
@@ -978,7 +978,7 @@ func TestHeartbeat_SkipsRemovedRows(t *testing.T) {
 		WillReturnResult(sqlmock.NewResult(0, 0))
 
 	// evaluateStatus SELECT
-	mock.ExpectQuery("SELECT status, last_register_failure_at FROM workspaces WHERE id").
+	mock.ExpectQuery("SELECT status, kind, last_register_failure_at FROM workspaces WHERE id").
 		WithArgs("ws-zombie").
 		WillReturnError(sql.ErrNoRows) // row effectively removed from view
 
@@ -1019,9 +1019,9 @@ func TestHeartbeatHandler_BackfillsAgentCard_WhenNull(t *testing.T) {
 		WithArgs("ws-nocard", sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	mock.ExpectQuery("SELECT status, last_register_failure_at FROM workspaces WHERE id =").
+	mock.ExpectQuery("SELECT status, kind, last_register_failure_at FROM workspaces WHERE id =").
 		WithArgs("ws-nocard").
-		WillReturnRows(sqlmock.NewRows([]string{"status", "last_register_failure_at"}).AddRow(models.StatusOnline, nil))
+		WillReturnRows(sqlmock.NewRows([]string{"status", "kind", "last_register_failure_at"}).AddRow(models.StatusOnline, "", nil))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -1059,9 +1059,9 @@ func TestHeartbeatHandler_SkipsAgentCardBackfill_WhenAlreadySet(t *testing.T) {
 		WithArgs("ws-hascard", sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 0))
 
-	mock.ExpectQuery("SELECT status, last_register_failure_at FROM workspaces WHERE id =").
+	mock.ExpectQuery("SELECT status, kind, last_register_failure_at FROM workspaces WHERE id =").
 		WithArgs("ws-hascard").
-		WillReturnRows(sqlmock.NewRows([]string{"status", "last_register_failure_at"}).AddRow(models.StatusOnline, nil))
+		WillReturnRows(sqlmock.NewRows([]string{"status", "kind", "last_register_failure_at"}).AddRow(models.StatusOnline, "", nil))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -1107,9 +1107,9 @@ func TestHeartbeatHandler_BackfillAgentCard_ClearsRegisterFailure(t *testing.T) 
 
 	// Status check sees degraded, but last_register_failure_at is now NULL because
 	// the agent_card backfill UPDATE cleared it.
-	mock.ExpectQuery("SELECT status, last_register_failure_at FROM workspaces WHERE id =").
+	mock.ExpectQuery("SELECT status, kind, last_register_failure_at FROM workspaces WHERE id =").
 		WithArgs("ws-degraded-register-fail").
-		WillReturnRows(sqlmock.NewRows([]string{"status", "last_register_failure_at"}).AddRow(models.StatusDegraded, nil))
+		WillReturnRows(sqlmock.NewRows([]string{"status", "kind", "last_register_failure_at"}).AddRow(models.StatusDegraded, "", nil))
 
 	// Because the failure marker was cleared by the backfill, evaluateStatus
 	// should now recover the workspace to online.
@@ -1754,9 +1754,9 @@ func TestHeartbeat_MonthlySpend_WithinBounds(t *testing.T) {
 		WithArgs("ws-spend-ok", 0.0, "", 0, 0, "", int64(15000)). // $150.00
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	mock.ExpectQuery("SELECT status, last_register_failure_at FROM workspaces WHERE id").
+	mock.ExpectQuery("SELECT status, kind, last_register_failure_at FROM workspaces WHERE id").
 		WithArgs("ws-spend-ok").
-		WillReturnRows(sqlmock.NewRows([]string{"status", "last_register_failure_at"}).AddRow("online", nil))
+		WillReturnRows(sqlmock.NewRows([]string{"status", "kind", "last_register_failure_at"}).AddRow("online", "", nil))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -1790,9 +1790,9 @@ func TestHeartbeat_MonthlySpend_NegativeClamped(t *testing.T) {
 		WithArgs("ws-spend-neg", 0.0, "", 0, 0, "").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	mock.ExpectQuery("SELECT status, last_register_failure_at FROM workspaces WHERE id").
+	mock.ExpectQuery("SELECT status, kind, last_register_failure_at FROM workspaces WHERE id").
 		WithArgs("ws-spend-neg").
-		WillReturnRows(sqlmock.NewRows([]string{"status", "last_register_failure_at"}).AddRow("online", nil))
+		WillReturnRows(sqlmock.NewRows([]string{"status", "kind", "last_register_failure_at"}).AddRow("online", "", nil))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -1826,9 +1826,9 @@ func TestHeartbeat_MonthlySpend_OverflowClamped(t *testing.T) {
 		WithArgs("ws-spend-overflow", 0.0, "", 0, 0, "", int64(1_000_000_000_000)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	mock.ExpectQuery("SELECT status, last_register_failure_at FROM workspaces WHERE id").
+	mock.ExpectQuery("SELECT status, kind, last_register_failure_at FROM workspaces WHERE id").
 		WithArgs("ws-spend-overflow").
-		WillReturnRows(sqlmock.NewRows([]string{"status", "last_register_failure_at"}).AddRow("online", nil))
+		WillReturnRows(sqlmock.NewRows([]string{"status", "kind", "last_register_failure_at"}).AddRow("online", "", nil))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -1861,9 +1861,9 @@ func TestHeartbeat_MonthlySpend_ExactCap(t *testing.T) {
 		WithArgs("ws-spend-cap", 0.0, "", 0, 0, "", int64(1_000_000_000_000)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	mock.ExpectQuery("SELECT status, last_register_failure_at FROM workspaces WHERE id").
+	mock.ExpectQuery("SELECT status, kind, last_register_failure_at FROM workspaces WHERE id").
 		WithArgs("ws-spend-cap").
-		WillReturnRows(sqlmock.NewRows([]string{"status", "last_register_failure_at"}).AddRow("online", nil))
+		WillReturnRows(sqlmock.NewRows([]string{"status", "kind", "last_register_failure_at"}).AddRow("online", "", nil))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -1897,9 +1897,9 @@ func TestHeartbeat_MonthlySpend_Zero_NoUpdate(t *testing.T) {
 		WithArgs("ws-spend-zero", 0.0, "", 0, 0, "").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	mock.ExpectQuery("SELECT status, last_register_failure_at FROM workspaces WHERE id").
+	mock.ExpectQuery("SELECT status, kind, last_register_failure_at FROM workspaces WHERE id").
 		WithArgs("ws-spend-zero").
-		WillReturnRows(sqlmock.NewRows([]string{"status", "last_register_failure_at"}).AddRow("online", nil))
+		WillReturnRows(sqlmock.NewRows([]string{"status", "kind", "last_register_failure_at"}).AddRow("online", "", nil))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -2143,7 +2143,7 @@ func TestRegister_AllowsAlreadyPlatformReRegister(t *testing.T) {
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 	c.Request = httptest.NewRequest("POST", "/registry/register",
-		bytes.NewBufferString(`{"id":"`+wsID+`","url":"http://localhost:9100","delivery_mode":"push","kind":"platform","agent_card":{"name":"concierge"}}`))
+		bytes.NewBufferString(`{"id":"`+wsID+`","url":"http://localhost:9100","delivery_mode":"push","kind":"platform","mcp_server_present":true,"agent_card":{"name":"concierge"}}`))
 	c.Request.Header.Set("Content-Type", "application/json")
 
 	handler.Register(c)
@@ -2270,7 +2270,7 @@ func TestRegister_PlatformAgentMissingModelSecret_FailsClosed(t *testing.T) {
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 	c.Request = httptest.NewRequest("POST", "/registry/register",
-		bytes.NewBufferString(`{"id":"`+wsID+`","url":"http://localhost:9100","delivery_mode":"push","kind":"platform","agent_card":{"name":"concierge"}}`))
+		bytes.NewBufferString(`{"id":"`+wsID+`","url":"http://localhost:9100","delivery_mode":"push","kind":"platform","mcp_server_present":true,"agent_card":{"name":"concierge"}}`))
 	c.Request.Header.Set("Content-Type", "application/json")
 
 	handler.Register(c)
@@ -2559,9 +2559,9 @@ func TestHeartbeatHandler_DeliversPlatformInboundSecret(t *testing.T) {
 		WithArgs("ws-with-secret", 0.0, "", 0, 100, "").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	mock.ExpectQuery("SELECT status, last_register_failure_at FROM workspaces WHERE id =").
+	mock.ExpectQuery("SELECT status, kind, last_register_failure_at FROM workspaces WHERE id =").
 		WithArgs("ws-with-secret").
-		WillReturnRows(sqlmock.NewRows([]string{"status", "last_register_failure_at"}).AddRow("online", nil))
+		WillReturnRows(sqlmock.NewRows([]string{"status", "kind", "last_register_failure_at"}).AddRow("online", "", nil))
 
 	// readOrLazyHealInboundSecret — short-circuit: secret already on file.
 	mock.ExpectQuery(`SELECT platform_inbound_secret FROM workspaces WHERE id = \$1`).
@@ -2614,9 +2614,9 @@ func TestHeartbeatHandler_LazyHealsPlatformInboundSecret(t *testing.T) {
 		WithArgs("ws-needs-heal", 0.0, "", 0, 100, "").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	mock.ExpectQuery("SELECT status, last_register_failure_at FROM workspaces WHERE id =").
+	mock.ExpectQuery("SELECT status, kind, last_register_failure_at FROM workspaces WHERE id =").
 		WithArgs("ws-needs-heal").
-		WillReturnRows(sqlmock.NewRows([]string{"status", "last_register_failure_at"}).AddRow("online", nil))
+		WillReturnRows(sqlmock.NewRows([]string{"status", "kind", "last_register_failure_at"}).AddRow("online", "", nil))
 
 	// readOrLazyHealInboundSecret — NULL column triggers mint.
 	mock.ExpectQuery(`SELECT platform_inbound_secret FROM workspaces WHERE id = \$1`).
@@ -2670,9 +2670,9 @@ func TestHeartbeatHandler_OmitsSecretOnHealFailure(t *testing.T) {
 		WithArgs("ws-heal-fails", 0.0, "", 0, 100, "").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	mock.ExpectQuery("SELECT status, last_register_failure_at FROM workspaces WHERE id =").
+	mock.ExpectQuery("SELECT status, kind, last_register_failure_at FROM workspaces WHERE id =").
 		WithArgs("ws-heal-fails").
-		WillReturnRows(sqlmock.NewRows([]string{"status", "last_register_failure_at"}).AddRow("online", nil))
+		WillReturnRows(sqlmock.NewRows([]string{"status", "kind", "last_register_failure_at"}).AddRow("online", "", nil))
 
 	// Read returns NULL → mint is attempted...
 	mock.ExpectQuery(`SELECT platform_inbound_secret FROM workspaces WHERE id = \$1`).
@@ -3037,10 +3037,10 @@ func TestHeartbeat_RecentRegisterFailure_DegradesWorkspace(t *testing.T) {
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// evaluateStatus SELECT — online with recent register failure
-	mock.ExpectQuery("SELECT status, last_register_failure_at FROM workspaces WHERE id =").
+	mock.ExpectQuery("SELECT status, kind, last_register_failure_at FROM workspaces WHERE id =").
 		WithArgs("ws-degrade-reg").
-		WillReturnRows(sqlmock.NewRows([]string{"status", "last_register_failure_at"}).
-			AddRow("online", time.Now().Add(-2*time.Minute)))
+		WillReturnRows(sqlmock.NewRows([]string{"status", "kind", "last_register_failure_at"}).
+			AddRow("online", "", time.Now().Add(-2*time.Minute)))
 
 	// Degrade UPDATE
 	mock.ExpectExec("UPDATE workspaces SET status =").
@@ -3087,10 +3087,10 @@ func TestHeartbeat_RecentRegisterFailure_BlocksRecovery(t *testing.T) {
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// evaluateStatus SELECT — degraded with recent register failure
-	mock.ExpectQuery("SELECT status, last_register_failure_at FROM workspaces WHERE id =").
+	mock.ExpectQuery("SELECT status, kind, last_register_failure_at FROM workspaces WHERE id =").
 		WithArgs("ws-no-recover").
-		WillReturnRows(sqlmock.NewRows([]string{"status", "last_register_failure_at"}).
-			AddRow("degraded", time.Now().Add(-2*time.Minute)))
+		WillReturnRows(sqlmock.NewRows([]string{"status", "kind", "last_register_failure_at"}).
+			AddRow("degraded", "", time.Now().Add(-2*time.Minute)))
 
 	// NO recovery UPDATE expected — register failure blocks recovery.
 
@@ -3421,3 +3421,112 @@ func TestRegister_400_LogsExistingRowState(t *testing.T) {
 // + resolveDeliveryMode (all run BEFORE the isSafeURL check), which
 // is brittle. The test coverage gap is documented; the test
 // would be a redundant copy of the UpdateCard coverage.
+
+// TestRegister_PlatformAgentMissingMCPServer_FailsClosed guards the second half
+// of issue #2970: a platform agent whose runtime reports mcp_server_present=false
+// (or omits the field) must NOT be marked online, even when the MODEL secret is
+// present. Fail-closed on the MCP server prevents a generic-image concierge from
+// booting as a routable platform agent.
+func TestRegister_PlatformAgentMissingMCPServer_FailsClosed(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewRegistryHandler(broadcaster)
+
+	const wsID = "ws-platform-no-mcp"
+
+	// Bootstrap path — no live tokens.
+	mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM workspace_auth_tokens").
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+
+	// kind precheck: existing row is kind="platform".
+	mock.ExpectQuery("SELECT kind FROM workspaces WHERE id").
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"kind"}).AddRow("platform"))
+
+	// MODEL secret exists, but the runtime declares the MCP server absent.
+	mock.ExpectQuery("SELECT EXISTS\\(SELECT 1 FROM workspace_secrets WHERE workspace_id = \\$1 AND key = 'MODEL'\\)").
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+
+	// Gate failure broadcasts WORKSPACE_PROVISION_FAILED and marks the row failed.
+	mock.ExpectExec("INSERT INTO structure_events").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("UPDATE workspaces SET status = \\$3, last_sample_error = \\$2, updated_at = now\\(\\) WHERE id = \\$1").
+		WithArgs(wsID, sqlmock.AnyArg(), models.StatusFailed).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest("POST", "/registry/register",
+		bytes.NewBufferString(`{"id":"`+wsID+`","url":"http://localhost:9100","delivery_mode":"push","kind":"platform","mcp_server_present":false,"agent_card":{"name":"concierge"}}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Register(c)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("platform agent missing MCP server: expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// TestHeartbeat_PlatformAgentMissingMCPServer_FailsClosed guards the heartbeat
+// recovery side of issue #2970: a kind='platform' workspace whose runtime reports
+// mcp_server_present=false must NOT recover to 'online' on heartbeat. Instead it
+// is marked 'failed' so the canvas surfaces a provision failure.
+func TestHeartbeat_PlatformAgentMissingMCPServer_FailsClosed(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewRegistryHandler(broadcaster)
+
+	const wsID = "ws-platform-heartbeat-no-mcp"
+
+	// prevTask SELECT — use loose regex to match 3-col query on main
+	mock.ExpectQuery("SELECT COALESCE\\(current_task").
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"current_task"}).AddRow(""))
+
+	// Heartbeat UPDATE (MonthlySpend=0 branch)
+	mock.ExpectExec("UPDATE workspaces SET").
+		WithArgs(wsID, 0.0, "", 0, 60, "").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// evaluateStatus SELECT — platform agent currently in provisioning
+	// (the recovery path most likely to resurrect a broken concierge).
+	mock.ExpectQuery("SELECT status, kind, last_register_failure_at FROM workspaces WHERE id =").
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"status", "kind", "last_register_failure_at"}).
+			AddRow("provisioning", "platform", nil))
+
+	// MODEL secret exists, but MCP server is absent.
+	mock.ExpectQuery("SELECT EXISTS\\(SELECT 1 FROM workspace_secrets WHERE workspace_id = \\$1 AND key = 'MODEL'\\)").
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+
+	// Gate failure: broadcast WORKSPACE_PROVISION_FAILED + mark failed.
+	mock.ExpectExec("INSERT INTO structure_events").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("UPDATE workspaces SET status = \\$3, last_sample_error = \\$2, updated_at = now\\(\\) WHERE id = \\$1").
+		WithArgs(wsID, sqlmock.AnyArg(), models.StatusFailed).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+
+	body := `{"workspace_id":"` + wsID + `","error_rate":0.0,"sample_error":"","active_tasks":0,"uptime_seconds":60,"mcp_server_present":false}`
+	c.Request = httptest.NewRequest("POST", "/registry/heartbeat", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Heartbeat(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("heartbeat mcp gate: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}

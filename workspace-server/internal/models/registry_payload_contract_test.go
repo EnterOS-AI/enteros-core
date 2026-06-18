@@ -53,7 +53,8 @@ const runtimeRegisterBody = `{
     "skills": [{"id": "coding", "name": "coding", "description": "coding", "tags": []}],
     "capabilities": {"streaming": true, "pushNotifications": false},
     "configuration_status": "ready"
-  }
+  },
+  "mcp_server_present": false
 }`
 
 func TestRegisterPayload_RuntimeBodyBinds(t *testing.T) {
@@ -69,6 +70,9 @@ func TestRegisterPayload_RuntimeBodyBinds(t *testing.T) {
 	}
 	if p.URL == "" {
 		t.Error("url should round-trip from the runtime body")
+	}
+	if p.MCPServerPresent == nil {
+		t.Error("mcp_server_present must decode (nil would be fail-closed)")
 	}
 }
 
@@ -98,7 +102,8 @@ const runtimeHeartbeatBody = `{
   "sample_error": "",
   "active_tasks": 0,
   "current_task": "",
-  "uptime_seconds": 42
+  "uptime_seconds": 42,
+  "mcp_server_present": false
 }`
 
 func TestHeartbeatPayload_RuntimeBodyBinds(t *testing.T) {
@@ -111,6 +116,9 @@ func TestHeartbeatPayload_RuntimeBodyBinds(t *testing.T) {
 	}
 	if p.UptimeSeconds != 42 {
 		t.Errorf("uptime_seconds not decoded: %d", p.UptimeSeconds)
+	}
+	if p.MCPServerPresent == nil {
+		t.Error("mcp_server_present must decode (nil would be fail-closed)")
 	}
 }
 

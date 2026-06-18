@@ -36,7 +36,7 @@ func TestHeartbeat_NativeStatusMgmt_SkipsDegradeInference(t *testing.T) {
 	// prevTask SELECT (before UPDATE)
 	mock.ExpectQuery("SELECT COALESCE\\(current_task").
 		WithArgs("ws-native-status").
-		WillReturnRows(sqlmock.NewRows([]string{"current_task"}).AddRow(""))
+		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend"}).AddRow("", 0))
 
 	// heartbeat UPDATE — same as the non-native path
 	mock.ExpectExec("UPDATE workspaces SET").
@@ -48,9 +48,9 @@ func TestHeartbeat_NativeStatusMgmt_SkipsDegradeInference(t *testing.T) {
 	// MUST NOT. We deliberately don't ExpectExec the degrade UPDATE
 	// — sqlmock fails the test if any UPDATE happens that wasn't
 	// expected, which is the regression cover.
-	mock.ExpectQuery("SELECT status, last_register_failure_at FROM workspaces WHERE id =").
+	mock.ExpectQuery("SELECT status, kind, last_register_failure_at FROM workspaces WHERE id =").
 		WithArgs("ws-native-status").
-		WillReturnRows(sqlmock.NewRows([]string{"status", "last_register_failure_at"}).AddRow("online", nil))
+		WillReturnRows(sqlmock.NewRows([]string{"status", "kind", "last_register_failure_at"}).AddRow("online", "", nil))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -89,7 +89,7 @@ func TestHeartbeat_NativeStatusMgmt_SkipsRecovery(t *testing.T) {
 
 	mock.ExpectQuery("SELECT COALESCE\\(current_task").
 		WithArgs("ws-native-recovery").
-		WillReturnRows(sqlmock.NewRows([]string{"current_task"}).AddRow(""))
+		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend"}).AddRow("", 0))
 
 	// heartbeat UPDATE — error_rate=0.05 would fire recovery
 	mock.ExpectExec("UPDATE workspaces SET").
@@ -99,9 +99,9 @@ func TestHeartbeat_NativeStatusMgmt_SkipsRecovery(t *testing.T) {
 	// evaluateStatus SELECT — currently degraded; recovery branch
 	// would normally fire UPDATE → online + WORKSPACE_ONLINE broadcast.
 	// Under native_status_mgmt, neither should run.
-	mock.ExpectQuery("SELECT status, last_register_failure_at FROM workspaces WHERE id =").
+	mock.ExpectQuery("SELECT status, kind, last_register_failure_at FROM workspaces WHERE id =").
 		WithArgs("ws-native-recovery").
-		WillReturnRows(sqlmock.NewRows([]string{"status", "last_register_failure_at"}).AddRow("degraded", nil))
+		WillReturnRows(sqlmock.NewRows([]string{"status", "kind", "last_register_failure_at"}).AddRow("degraded", "", nil))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -135,7 +135,7 @@ func TestHeartbeat_NativeStatusMgmt_WedgedStillRespected(t *testing.T) {
 
 	mock.ExpectQuery("SELECT COALESCE\\(current_task").
 		WithArgs("ws-wedged").
-		WillReturnRows(sqlmock.NewRows([]string{"current_task"}).AddRow(""))
+		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend"}).AddRow("", 0))
 
 	// heartbeat UPDATE — RuntimeState="wedged" means sample_error
 	// reflects the wedge reason, error_rate stays 0
@@ -144,9 +144,9 @@ func TestHeartbeat_NativeStatusMgmt_WedgedStillRespected(t *testing.T) {
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// evaluateStatus SELECT — currently online, wedged branch SHOULD fire
-	mock.ExpectQuery("SELECT status, last_register_failure_at FROM workspaces WHERE id =").
+	mock.ExpectQuery("SELECT status, kind, last_register_failure_at FROM workspaces WHERE id =").
 		WithArgs("ws-wedged").
-		WillReturnRows(sqlmock.NewRows([]string{"status", "last_register_failure_at"}).AddRow("online", nil))
+		WillReturnRows(sqlmock.NewRows([]string{"status", "kind", "last_register_failure_at"}).AddRow("online", "", nil))
 
 	// Wedged degrade UPDATE — must still happen even with native_status_mgmt
 	mock.ExpectExec("UPDATE workspaces SET status =").

@@ -244,7 +244,7 @@ func TestHeartbeatHandler_Normal(t *testing.T) {
 	// Expect prevTask SELECT (before UPDATE)
 	mock.ExpectQuery("SELECT COALESCE\\(current_task").
 		WithArgs("ws-123").
-		WillReturnRows(sqlmock.NewRows([]string{"current_task"}).AddRow(""))
+		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend"}).AddRow("", 0))
 
 	// Expect heartbeat UPDATE
 	mock.ExpectExec("UPDATE workspaces SET").
@@ -252,9 +252,9 @@ func TestHeartbeatHandler_Normal(t *testing.T) {
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// Expect evaluateStatus SELECT
-	mock.ExpectQuery("SELECT status, last_register_failure_at FROM workspaces WHERE id =").
+	mock.ExpectQuery("SELECT status, kind, last_register_failure_at FROM workspaces WHERE id =").
 		WithArgs("ws-123").
-		WillReturnRows(sqlmock.NewRows([]string{"status", "last_register_failure_at"}).AddRow("online", nil))
+		WillReturnRows(sqlmock.NewRows([]string{"status", "kind", "last_register_failure_at"}).AddRow("online", "", nil))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -283,7 +283,7 @@ func TestHeartbeatHandler_Degraded(t *testing.T) {
 	// Expect prevTask SELECT (before UPDATE)
 	mock.ExpectQuery("SELECT COALESCE\\(current_task").
 		WithArgs("ws-123").
-		WillReturnRows(sqlmock.NewRows([]string{"current_task"}).AddRow(""))
+		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend"}).AddRow("", 0))
 
 	// Expect heartbeat UPDATE
 	mock.ExpectExec("UPDATE workspaces SET").
@@ -291,9 +291,9 @@ func TestHeartbeatHandler_Degraded(t *testing.T) {
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// Expect evaluateStatus SELECT — currently online
-	mock.ExpectQuery("SELECT status, last_register_failure_at FROM workspaces WHERE id =").
+	mock.ExpectQuery("SELECT status, kind, last_register_failure_at FROM workspaces WHERE id =").
 		WithArgs("ws-123").
-		WillReturnRows(sqlmock.NewRows([]string{"status", "last_register_failure_at"}).AddRow("online", nil))
+		WillReturnRows(sqlmock.NewRows([]string{"status", "kind", "last_register_failure_at"}).AddRow("online", "", nil))
 
 	// Expect status transition to degraded
 	mock.ExpectExec("UPDATE workspaces SET status =").
@@ -331,7 +331,7 @@ func TestHeartbeatHandler_Recovery(t *testing.T) {
 	// Expect prevTask SELECT (before UPDATE)
 	mock.ExpectQuery("SELECT COALESCE\\(current_task").
 		WithArgs("ws-123").
-		WillReturnRows(sqlmock.NewRows([]string{"current_task"}).AddRow(""))
+		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend"}).AddRow("", 0))
 
 	// Expect heartbeat UPDATE
 	mock.ExpectExec("UPDATE workspaces SET").
@@ -339,9 +339,9 @@ func TestHeartbeatHandler_Recovery(t *testing.T) {
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// Expect evaluateStatus SELECT — currently degraded
-	mock.ExpectQuery("SELECT status, last_register_failure_at FROM workspaces WHERE id =").
+	mock.ExpectQuery("SELECT status, kind, last_register_failure_at FROM workspaces WHERE id =").
 		WithArgs("ws-123").
-		WillReturnRows(sqlmock.NewRows([]string{"status", "last_register_failure_at"}).AddRow("degraded", nil))
+		WillReturnRows(sqlmock.NewRows([]string{"status", "kind", "last_register_failure_at"}).AddRow("degraded", "", nil))
 
 	// Expect status transition back to online
 	mock.ExpectExec("UPDATE workspaces SET status =").
@@ -727,7 +727,7 @@ func TestHeartbeatHandler_TaskChanged(t *testing.T) {
 	// Expect prevTask SELECT — currently "old task"
 	mock.ExpectQuery("SELECT COALESCE\\(current_task").
 		WithArgs("ws-123").
-		WillReturnRows(sqlmock.NewRows([]string{"current_task"}).AddRow("old task"))
+		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend"}).AddRow("old task", 0))
 
 	// Expect heartbeat UPDATE with new task
 	mock.ExpectExec("UPDATE workspaces SET").
@@ -735,9 +735,9 @@ func TestHeartbeatHandler_TaskChanged(t *testing.T) {
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// Expect evaluateStatus SELECT
-	mock.ExpectQuery("SELECT status, last_register_failure_at FROM workspaces WHERE id =").
+	mock.ExpectQuery("SELECT status, kind, last_register_failure_at FROM workspaces WHERE id =").
 		WithArgs("ws-123").
-		WillReturnRows(sqlmock.NewRows([]string{"status", "last_register_failure_at"}).AddRow("online", nil))
+		WillReturnRows(sqlmock.NewRows([]string{"status", "kind", "last_register_failure_at"}).AddRow("online", "", nil))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -913,7 +913,7 @@ func TestHeartbeatHandler_TaskUnchanged(t *testing.T) {
 	// Expect prevTask SELECT — task is already "doing work"
 	mock.ExpectQuery("SELECT COALESCE\\(current_task").
 		WithArgs("ws-123").
-		WillReturnRows(sqlmock.NewRows([]string{"current_task"}).AddRow("doing work"))
+		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend"}).AddRow("doing work", 0))
 
 	// Expect heartbeat UPDATE with same task
 	mock.ExpectExec("UPDATE workspaces SET").
@@ -921,9 +921,9 @@ func TestHeartbeatHandler_TaskUnchanged(t *testing.T) {
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// Expect evaluateStatus SELECT
-	mock.ExpectQuery("SELECT status, last_register_failure_at FROM workspaces WHERE id =").
+	mock.ExpectQuery("SELECT status, kind, last_register_failure_at FROM workspaces WHERE id =").
 		WithArgs("ws-123").
-		WillReturnRows(sqlmock.NewRows([]string{"status", "last_register_failure_at"}).AddRow("online", nil))
+		WillReturnRows(sqlmock.NewRows([]string{"status", "kind", "last_register_failure_at"}).AddRow("online", "", nil))
 
 	// NO TASK_UPDATED broadcast expected — task didn't change
 
@@ -956,7 +956,7 @@ func TestHeartbeatHandler_TaskCleared(t *testing.T) {
 	// Expect prevTask SELECT — was doing something
 	mock.ExpectQuery("SELECT COALESCE\\(current_task").
 		WithArgs("ws-123").
-		WillReturnRows(sqlmock.NewRows([]string{"current_task"}).AddRow("old task"))
+		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend"}).AddRow("old task", 0))
 
 	// Expect heartbeat UPDATE with empty task
 	mock.ExpectExec("UPDATE workspaces SET").
@@ -964,9 +964,9 @@ func TestHeartbeatHandler_TaskCleared(t *testing.T) {
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// Expect evaluateStatus SELECT
-	mock.ExpectQuery("SELECT status, last_register_failure_at FROM workspaces WHERE id =").
+	mock.ExpectQuery("SELECT status, kind, last_register_failure_at FROM workspaces WHERE id =").
 		WithArgs("ws-123").
-		WillReturnRows(sqlmock.NewRows([]string{"status", "last_register_failure_at"}).AddRow("online", nil))
+		WillReturnRows(sqlmock.NewRows([]string{"status", "kind", "last_register_failure_at"}).AddRow("online", "", nil))
 
 	// TASK_UPDATED broadcast expected — changed from "old task" to ""
 	// (BroadcastOnly doesn't hit sqlmock, so no expectation needed)
@@ -1019,13 +1019,13 @@ func TestHeartbeatHandler_AlwaysBroadcastsHeartbeat(t *testing.T) {
 	// Pre-fix this path emitted ZERO broadcasts.
 	mock.ExpectQuery("SELECT COALESCE\\(current_task").
 		WithArgs("ws-123").
-		WillReturnRows(sqlmock.NewRows([]string{"current_task"}).AddRow("doing work"))
+		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend"}).AddRow("doing work", 0))
 	mock.ExpectExec("UPDATE workspaces SET").
 		WithArgs("ws-123", 0.0, "", 1, 500, "doing work").
 		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectQuery("SELECT status, last_register_failure_at FROM workspaces WHERE id =").
+	mock.ExpectQuery("SELECT status, kind, last_register_failure_at FROM workspaces WHERE id =").
 		WithArgs("ws-123").
-		WillReturnRows(sqlmock.NewRows([]string{"status", "last_register_failure_at"}).AddRow("online", nil))
+		WillReturnRows(sqlmock.NewRows([]string{"status", "kind", "last_register_failure_at"}).AddRow("online", "", nil))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
