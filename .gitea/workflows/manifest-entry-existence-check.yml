@@ -29,6 +29,7 @@ permissions:
   contents: read
 
 jobs:
+  # bp-required: pending #2185 — new PR-time gate; branch-protection update tracked in the same issue.
   check-entries:
     name: Verify manifest entries exist on Gitea
     runs-on: ubuntu-latest
