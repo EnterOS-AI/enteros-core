@@ -94,12 +94,18 @@ export function useChatHistory(
     const oldest = oldestMessageRef.current;
     if (!oldest) return;
     const container = containerRef?.current;
-    if (!container) return;
+    // Scroll anchoring is only possible when a container ref is wired;
+    // otherwise still load older messages instead of silently no-oping
+    // (mc#2908 F9).
+    if (container) {
+      scrollAnchorRef.current = {
+        savedDistanceFromBottom: container.scrollHeight - container.scrollTop,
+        expectFirstIdNotEqual: oldest.id,
+      };
+    } else {
+      scrollAnchorRef.current = null;
+    }
     inflightRef.current = true;
-    scrollAnchorRef.current = {
-      savedDistanceFromBottom: container.scrollHeight - container.scrollTop,
-      expectFirstIdNotEqual: oldest.id,
-    };
     fetchTokenRef.current += 1;
     const myToken = fetchTokenRef.current;
     setLoadingOlder(true);
