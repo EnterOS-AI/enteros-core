@@ -521,7 +521,7 @@ export function MobileChat({
             Loading chat history…
           </div>
         )}
-        {tab === "my" && !historyLoading && historyError && messages.length === 0 && (
+        {tab === "my" && !historyLoading && historyError && (
           <div
             role="alert"
             style={{
