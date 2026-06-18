@@ -222,6 +222,44 @@ func (h *WorkspaceHandler) applyConciergeProvisionConfig(
 	//    Seed-only: it respects a model the customer later picked.
 	h.ensureConciergeModel(ctx, workspaceID, envVars)
 
+	// 0b. Concierge LLM provider pin (companion to the model seed). The
+	//    molecule-runtime wheel DERIVES a provider slug from the model id
+	//    ("moonshot/kimi-k2.6" -> "moonshot" via _derive_provider_from_model),
+	//    which is a model-PREFIX on the `platform` provider, NOT a provider
+	//    NAME — so the claude-code adapter's _resolve_provider fail-closes
+	//    ("provider='moonshot' but it is not in the providers registry") and
+	//    the concierge boots configuration_status=not_configured: online but
+	//    unable to run a single turn (last_outbound_at stays null).
+	//
+	//    The platform-agent template config.yaml's `provider: platform` field
+	//    does NOT fix this on SaaS: the on-box /configs/config.yaml is the
+	//    BAKED base-image config (the box reports the base claude-code image's
+	//    8-entry provider registry, not the platform-agent template's 3), so
+	//    the template `provider:` scalar never reaches the adapter. Seeding
+	//    LLM_PROVIDER (env, highest precedence in the wheel's
+	//    LLM_PROVIDER > YAML provider: > derive chain; injected via the
+	//    workspace secret) is the robust pin — it survives restart and the
+	//    regenerated config.yaml. Verified on prod: setting LLM_PROVIDER=platform
+	//    flipped a stuck concierge from not_configured to ready + responding.
+	//    Seed-only + gated to the platform-managed model namespace so it never
+	//    overrides a BYOK/self-host concierge (see ensureConciergeProvider).
+	h.ensureConciergeProvider(ctx, workspaceID, envVars)
+
+	// 0c. Declare the concierge's management MCP as a PLUGIN (RFC:
+	//    rfc-platform-mcp-as-plugin). The asset-channel mcp_servers.yaml does NOT
+	//    reach the on-box /configs (the box runs the baked base-image config), so
+	//    the concierge boots with no management MCP — generic Claude Code, no
+	//    create_workspace. Routing it through the plugin channel (the path that
+	//    reliably delivers skills) fixes that: declare it here so the post-online
+	//    reconcile + boot-install wire molecule-platform-mcp via MCPServerAdaptor.
+	//    This declaration runs ONLY on the kind=platform concierge (this function
+	//    is kind-gated) → it is the primary entitlement gate for the privileged
+	//    org-admin MCP; recordDeclaredPlugin fail-closes the same name for any
+	//    non-platform workspace as defense-in-depth. Idempotent (upsert).
+	if rec, skip := seedTemplatePlugins(ctx, workspaceID, []string{conciergePlatformMCPPlugin}); skip > 0 {
+		log.Printf("Provisioner: concierge %s could not declare %q plugin (recorded=%d skipped=%d) — management MCP may be absent until next provision", workspaceID, conciergePlatformMCPPlugin, rec, skip)
+	}
+
 	// 1. Platform-MCP env (org-admin token + platform URL + org id).
 	conciergePlatformMCPEnv(envVars)
 
@@ -352,6 +390,116 @@ func readStoredModelSecret(ctx context.Context, workspaceID string) string {
 		return ""
 	}
 	return string(dec)
+}
+
+// conciergeProvider is the provider-registry NAME the concierge's declared
+// platform-managed model resolves to. The platform agent is always
+// platform-managed (billing/audit flow through the platform LLM proxy), so the
+// provider is unconditionally "platform" for the platform-managed model family.
+const conciergeProvider = "platform"
+
+// platformManagedModelPrefix is the model-id namespace served by the platform
+// LLM proxy that ALSO collides with the wheel's provider derivation (the slug
+// before '/' is "moonshot", not a registry name). A concierge whose effective
+// model carries this prefix MUST have its provider pinned to `platform`
+// explicitly; without the pin the claude-code adapter fail-closes. Gating on
+// this prefix keeps the seed from touching a BYOK/self-host concierge whose
+// model resolves cleanly on its own (e.g. `sonnet` -> anthropic-oauth).
+const platformManagedModelPrefix = "moonshot/"
+
+// conciergePlatformMCPPlugin is the management-MCP plugin the concierge declares
+// (repo molecule-ai-plugin-molecule-platform-mcp). It wires the `molecule-mcp`
+// server (MOLECULE_MCP_MODE=management — create_workspace, list_workspaces, …)
+// into the Claude Code runtime via the plugin channel's MCPServerAdaptor,
+// replacing the baked-image + asset-channel mcp_servers.yaml path that does NOT
+// reach the on-box config (RFC: rfc-platform-mcp-as-plugin). Declaring it here —
+// from the kind=platform-only applyConciergeProvisionConfig — IS the primary
+// entitlement gate (no user workspace runs this path); recordDeclaredPlugin adds
+// a defense-in-depth refusal for this PRIVILEGED name on any non-platform
+// workspace. The post-online reconcile + boot-install then install it.
+const conciergePlatformMCPPlugin = "molecule-platform-mcp"
+
+// ensureConciergeProvider pins the concierge's LLM provider to `platform` (core
+// companion to ensureConciergeModel). It guarantees the env-level provider pin
+// that the runtime needs, independent of the template config.yaml (which is NOT
+// delivered to the on-box /configs — the box uses the baked base-image config).
+//
+// SEED-ONLY, keyed on the LLM_PROVIDER secret (NOT MODEL) so an EXISTING
+// concierge that already has a MODEL secret still receives the provider pin on
+// its next provision, while a provider the customer later pinned in the canvas
+// (which writes LLM_PROVIDER) is respected. GATED on the effective model's
+// platform-managed namespace so it never forces `platform` onto a BYOK or
+// self-hosted concierge running a non-proxy model.
+func (h *WorkspaceHandler) ensureConciergeProvider(ctx context.Context, workspaceID string, envVars map[string]string) {
+	// Respect an explicit provider already set (customer canvas pick or a prior
+	// seed): loadWorkspaceSecrets already injected it into envVars. Do nothing.
+	if existing := readStoredProviderSecret(ctx, workspaceID); existing != "" {
+		return
+	}
+
+	// Effective model for this provision. In production envVars["MODEL"] is
+	// ALWAYS populated before this runs — either by loadWorkspaceSecrets +
+	// applyRuntimeModelEnv (an existing/customer model) or by ensureConciergeModel
+	// just above (the fresh-boot seed) — so reading it here is sufficient and
+	// avoids a redundant secret decrypt.
+	model := strings.TrimSpace(envVars["MODEL"])
+	// Only pin when the model is in the platform-managed namespace that needs it.
+	// A non-platform model (e.g. `sonnet`, a BYOK `claude-…`) resolves on its
+	// own; forcing `platform` there would mis-route auth and break the agent.
+	if !strings.HasPrefix(strings.ToLower(model), platformManagedModelPrefix) {
+		return
+	}
+
+	envVars["LLM_PROVIDER"] = conciergeProvider
+	if setErr := setProviderSecret(ctx, workspaceID, conciergeProvider); setErr != nil {
+		log.Printf("Provisioner: concierge %s persist LLM_PROVIDER secret failed: %v (env still seeded for this provision)", workspaceID, setErr)
+	} else {
+		log.Printf("Provisioner: concierge %s pinned LLM_PROVIDER=%s for platform-managed model %q", workspaceID, conciergeProvider, model)
+	}
+}
+
+// readStoredProviderSecret returns the decrypted LLM_PROVIDER workspace_secret,
+// or "" when none is stored (or on any read/decrypt error — treated as "unset"
+// so a transient miss re-seeds rather than wedges). Mirrors readStoredModelSecret.
+func readStoredProviderSecret(ctx context.Context, workspaceID string) string {
+	var stored []byte
+	var version int
+	if err := db.DB.QueryRowContext(ctx,
+		`SELECT encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = $1 AND key = 'LLM_PROVIDER'`,
+		workspaceID).Scan(&stored, &version); err != nil {
+		return ""
+	}
+	dec, err := crypto.DecryptVersioned(stored, version)
+	if err != nil {
+		return ""
+	}
+	return string(dec)
+}
+
+// setProviderSecret persists (or clears, when provider == "") the LLM_PROVIDER
+// workspace_secret. Mirrors setModelSecret (secrets.go). LLM_PROVIDER is the
+// provider-slug pin the molecule-runtime wheel reads at highest precedence; it
+// is injected into the container as an env var by loadWorkspaceSecrets, so it
+// survives restarts and the regenerated on-box config.yaml.
+func setProviderSecret(ctx context.Context, workspaceID, provider string) error {
+	if provider == "" {
+		_, err := db.DB.ExecContext(ctx,
+			`DELETE FROM workspace_secrets WHERE workspace_id = $1 AND key = 'LLM_PROVIDER'`,
+			workspaceID)
+		return err
+	}
+	encrypted, err := crypto.Encrypt([]byte(provider))
+	if err != nil {
+		return err
+	}
+	version := crypto.CurrentEncryptionVersion()
+	_, err = db.DB.ExecContext(ctx, `
+		INSERT INTO workspace_secrets (workspace_id, key, encrypted_value, encryption_version)
+		VALUES ($1, 'LLM_PROVIDER', $2, $3)
+		ON CONFLICT (workspace_id, key) DO UPDATE
+			SET encrypted_value = $2, encryption_version = $3, updated_at = now()
+	`, workspaceID, encrypted, version)
+	return err
 }
 
 // EnsureSelfHostedPlatformAgent installs the org's platform agent (the concierge,

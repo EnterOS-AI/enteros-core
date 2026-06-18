@@ -468,6 +468,14 @@ func TestApplyConciergeProvisionConfig_OnlyPlatformGetsOrgMCP(t *testing.T) {
 	// INSERT). The seed path itself is covered by
 	// TestApplyConciergeProvisionConfig_SeedsModel.
 	const modelSelQuery = `SELECT encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1 AND key = 'MODEL'`
+	// ensureConciergeProvider (step 0b, platform kind only) reads the stored
+	// LLM_PROVIDER secret to decide seed-vs-respect. In these MCP/name subtests
+	// the test env carries no MODEL (loadWorkspaceSecrets is not run), so the
+	// provider gate (platform-managed model namespace) is not met and NO
+	// LLM_PROVIDER INSERT fires — only the existence SELECT. The seed itself is
+	// covered by TestApplyConciergeProvisionConfig_SeedsProvider.
+	const providerSelQuery = `SELECT encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1 AND key = 'LLM_PROVIDER'`
+	const declaredInsert = `INSERT INTO workspace_declared_plugins`
 
 	t.Run("ordinary workspace gets NO org MCP, NO admin token, NO substitution", func(t *testing.T) {
 		mock := setupTestDB(t)
@@ -509,6 +517,15 @@ func TestApplyConciergeProvisionConfig_OnlyPlatformGetsOrgMCP(t *testing.T) {
 		mock.ExpectQuery(modelSelQuery).WithArgs("ws-concierge").
 			WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}).
 				AddRow([]byte("moonshot/kimi-k2.6"), 0))
+		// ensureConciergeProvider existence check (env has no MODEL here → no pin).
+		mock.ExpectQuery(providerSelQuery).WithArgs("ws-concierge").
+			WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}))
+		// recordDeclaredPlugin: privileged-plugin kind precheck (→platform) + declared INSERT.
+		mock.ExpectQuery(kindQuery).WithArgs("ws-concierge").
+			WillReturnRows(sqlmock.NewRows([]string{"kind"}).AddRow("platform"))
+		mock.ExpectExec(declaredInsert).
+			WithArgs("ws-concierge", sqlmock.AnyArg(), sqlmock.AnyArg()).
+			WillReturnResult(sqlmock.NewResult(0, 1))
 		env := map[string]string{}
 		cf := map[string][]byte{
 			"config.yaml":      []byte("runtime: claude-code\nmodel: moonshot/kimi-k2.6\n"),
@@ -548,6 +565,14 @@ func TestApplyConciergeProvisionConfig_OnlyPlatformGetsOrgMCP(t *testing.T) {
 		mock.ExpectQuery(modelSelQuery).WithArgs("ws-concierge").
 			WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}).
 				AddRow([]byte("moonshot/kimi-k2.6"), 0))
+		mock.ExpectQuery(providerSelQuery).WithArgs("ws-concierge").
+			WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}))
+		// recordDeclaredPlugin: privileged-plugin kind precheck (→platform) + declared INSERT.
+		mock.ExpectQuery(kindQuery).WithArgs("ws-concierge").
+			WillReturnRows(sqlmock.NewRows([]string{"kind"}).AddRow("platform"))
+		mock.ExpectExec(declaredInsert).
+			WithArgs("ws-concierge", sqlmock.AnyArg(), sqlmock.AnyArg()).
+			WillReturnResult(sqlmock.NewResult(0, 1))
 		env := map[string]string{}
 		// Already-substituted prompt (a re-provision of a running concierge).
 		cf := map[string][]byte{
@@ -580,7 +605,9 @@ func TestApplyConciergeProvisionConfig_SeedsModel(t *testing.T) {
 	h := &WorkspaceHandler{}
 	const kindQuery = `SELECT COALESCE\(kind, 'workspace'\) FROM workspaces WHERE id =`
 	const modelSelQuery = `SELECT encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1 AND key = 'MODEL'`
-	const modelInsert = `INSERT INTO workspace_secrets`
+	const providerSelQuery = `SELECT encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1 AND key = 'LLM_PROVIDER'`
+	const declaredInsert = `INSERT INTO workspace_declared_plugins`
+	const secretInsert = `INSERT INTO workspace_secrets`
 
 	t.Run("fresh platform agent with NO stored model gets the declared model seeded + persisted", func(t *testing.T) {
 		mock := setupTestDB(t)
@@ -590,10 +617,24 @@ func TestApplyConciergeProvisionConfig_SeedsModel(t *testing.T) {
 		mock.ExpectQuery(modelSelQuery).WithArgs("ws-fresh").
 			WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}))
 		// Seed path must PERSIST the declared model.
-		mock.ExpectExec(modelInsert).
+		mock.ExpectExec(secretInsert).
+			WithArgs("ws-fresh", sqlmock.AnyArg(), sqlmock.AnyArg()).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+		// ensureConciergeProvider: no LLM_PROVIDER yet → existence SELECT empty;
+		// the just-seeded MODEL (moonshot/…) meets the platform namespace gate,
+		// so the provider pin is PERSISTED too.
+		mock.ExpectQuery(providerSelQuery).WithArgs("ws-fresh").
+			WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}))
+		mock.ExpectExec(secretInsert).
 			WithArgs("ws-fresh", sqlmock.AnyArg(), sqlmock.AnyArg()).
 			WillReturnResult(sqlmock.NewResult(0, 1))
 
+		// recordDeclaredPlugin: privileged-plugin kind precheck (→platform) + declared INSERT.
+		mock.ExpectQuery(kindQuery).WithArgs("ws-fresh").
+			WillReturnRows(sqlmock.NewRows([]string{"kind"}).AddRow("platform"))
+		mock.ExpectExec(declaredInsert).
+			WithArgs("ws-fresh", sqlmock.AnyArg(), sqlmock.AnyArg()).
+			WillReturnResult(sqlmock.NewResult(0, 1))
 		env := map[string]string{}
 		h.applyConciergeProvisionConfig(context.Background(), "ws-fresh", "", nil, env, "Org Concierge")
 
@@ -606,8 +647,13 @@ func TestApplyConciergeProvisionConfig_SeedsModel(t *testing.T) {
 		if env["MOLECULE_MODEL"] != conciergeDeclaredModel {
 			t.Errorf("fresh concierge did not seed MOLECULE_MODEL=%q; got %q", conciergeDeclaredModel, env["MOLECULE_MODEL"])
 		}
+		// Companion provider pin: the concierge can't run a turn without it
+		// (moonshot/… derives a non-registry provider name → adapter fail-closes).
+		if env["LLM_PROVIDER"] != conciergeProvider {
+			t.Errorf("fresh concierge did not seed LLM_PROVIDER=%q; got %q (env=%v) — concierge would boot not_configured", conciergeProvider, env["LLM_PROVIDER"], env)
+		}
 		if err := mock.ExpectationsWereMet(); err != nil {
-			t.Errorf("unmet sqlmock expectations (the MODEL secret was not persisted): %v", err)
+			t.Errorf("unmet sqlmock expectations (MODEL or LLM_PROVIDER secret not persisted): %v", err)
 		}
 	})
 
@@ -619,9 +665,20 @@ func TestApplyConciergeProvisionConfig_SeedsModel(t *testing.T) {
 		mock.ExpectQuery(modelSelQuery).WithArgs("ws-picked").
 			WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}).
 				AddRow([]byte("anthropic:claude-opus-4-8"), 0))
-		// NO ExpectExec: ensureConciergeModel must return early (no re-seed,
+		// NO model ExpectExec: ensureConciergeModel must return early (no re-seed,
 		// no INSERT) — re-asserting the default would silently revert the pick.
+		// ensureConciergeProvider runs its existence SELECT, but the test env
+		// carries no MODEL and the customer's model is non-platform-namespace, so
+		// NO provider pin fires either.
+		mock.ExpectQuery(providerSelQuery).WithArgs("ws-picked").
+			WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}))
 
+		// recordDeclaredPlugin: privileged-plugin kind precheck (→platform) + declared INSERT.
+		mock.ExpectQuery(kindQuery).WithArgs("ws-picked").
+			WillReturnRows(sqlmock.NewRows([]string{"kind"}).AddRow("platform"))
+		mock.ExpectExec(declaredInsert).
+			WithArgs("ws-picked", sqlmock.AnyArg(), sqlmock.AnyArg()).
+			WillReturnResult(sqlmock.NewResult(0, 1))
 		env := map[string]string{}
 		h.applyConciergeProvisionConfig(context.Background(), "ws-picked", "", nil, env, "Org Concierge")
 
@@ -647,6 +704,117 @@ func TestApplyConciergeProvisionConfig_SeedsModel(t *testing.T) {
 		}
 		if err := mock.ExpectationsWereMet(); err != nil {
 			t.Errorf("unmet sqlmock expectations (ordinary workspace ran a model query): %v", err)
+		}
+	})
+}
+
+// TestApplyConciergeProvisionConfig_SeedsProvider is the CI regression gate for
+// the concierge non-response incident (prod 2026-06-18): the concierge booted
+// online but configuration_status=not_configured because the runtime wheel
+// derives provider="moonshot" from the model id "moonshot/kimi-k2.6" (a
+// model-PREFIX on the `platform` provider, NOT a provider NAME), and the
+// claude-code adapter fail-closes. The template config.yaml `provider:` field
+// does not reach the on-box config, so core MUST seed the LLM_PROVIDER env pin
+// (the highest-precedence, restart-surviving signal). Verified on prod test3:
+// setting LLM_PROVIDER=platform flipped not_configured → ready + responding.
+func TestApplyConciergeProvisionConfig_SeedsProvider(t *testing.T) {
+	h := &WorkspaceHandler{}
+	const kindQuery = `SELECT COALESCE\(kind, 'workspace'\) FROM workspaces WHERE id =`
+	const modelSelQuery = `SELECT encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1 AND key = 'MODEL'`
+	const providerSelQuery = `SELECT encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1 AND key = 'LLM_PROVIDER'`
+	const declaredInsert = `INSERT INTO workspace_declared_plugins`
+	const secretInsert = `INSERT INTO workspace_secrets`
+
+	t.Run("existing platform-managed concierge with NO provider gets LLM_PROVIDER=platform pinned", func(t *testing.T) {
+		mock := setupTestDB(t)
+		mock.ExpectQuery(kindQuery).WithArgs("ws-heal").
+			WillReturnRows(sqlmock.NewRows([]string{"kind"}).AddRow("platform"))
+		// Existing platform model → ensureConciergeModel respects it (no INSERT).
+		mock.ExpectQuery(modelSelQuery).WithArgs("ws-heal").
+			WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}).
+				AddRow([]byte(conciergeDeclaredModel), 0))
+		// No LLM_PROVIDER yet → existence SELECT empty, then PERSIST the pin.
+		mock.ExpectQuery(providerSelQuery).WithArgs("ws-heal").
+			WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}))
+		mock.ExpectExec(secretInsert).
+			WithArgs("ws-heal", sqlmock.AnyArg(), sqlmock.AnyArg()).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+
+		// Simulate loadWorkspaceSecrets having populated MODEL into the env
+		// (the production precondition for an existing-model concierge).
+		// recordDeclaredPlugin: privileged-plugin kind precheck (→platform) + declared INSERT.
+		mock.ExpectQuery(kindQuery).WithArgs("ws-heal").
+			WillReturnRows(sqlmock.NewRows([]string{"kind"}).AddRow("platform"))
+		mock.ExpectExec(declaredInsert).
+			WithArgs("ws-heal", sqlmock.AnyArg(), sqlmock.AnyArg()).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+		env := map[string]string{"MODEL": conciergeDeclaredModel}
+		h.applyConciergeProvisionConfig(context.Background(), "ws-heal", "", nil, env, "Org Concierge")
+
+		if env["LLM_PROVIDER"] != conciergeProvider {
+			t.Errorf("existing platform-managed concierge did not get LLM_PROVIDER=%q pinned; got %q (env=%v)", conciergeProvider, env["LLM_PROVIDER"], env)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("unmet sqlmock expectations (LLM_PROVIDER pin not persisted): %v", err)
+		}
+	})
+
+	t.Run("SEED-ONLY: a customer-picked provider is respected, never overwritten", func(t *testing.T) {
+		mock := setupTestDB(t)
+		mock.ExpectQuery(kindQuery).WithArgs("ws-prov-picked").
+			WillReturnRows(sqlmock.NewRows([]string{"kind"}).AddRow("platform"))
+		mock.ExpectQuery(modelSelQuery).WithArgs("ws-prov-picked").
+			WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}).
+				AddRow([]byte(conciergeDeclaredModel), 0))
+		// Customer already pinned a provider in the canvas → existence SELECT
+		// returns it → NO INSERT (respecting the pick).
+		mock.ExpectQuery(providerSelQuery).WithArgs("ws-prov-picked").
+			WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}).
+				AddRow([]byte("anthropic-api"), 0))
+
+		// recordDeclaredPlugin: privileged-plugin kind precheck (→platform) + declared INSERT.
+		mock.ExpectQuery(kindQuery).WithArgs("ws-prov-picked").
+			WillReturnRows(sqlmock.NewRows([]string{"kind"}).AddRow("platform"))
+		mock.ExpectExec(declaredInsert).
+			WithArgs("ws-prov-picked", sqlmock.AnyArg(), sqlmock.AnyArg()).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+		env := map[string]string{"MODEL": conciergeDeclaredModel, "LLM_PROVIDER": "anthropic-api"}
+		h.applyConciergeProvisionConfig(context.Background(), "ws-prov-picked", "", nil, env, "Org Concierge")
+
+		if env["LLM_PROVIDER"] != "anthropic-api" {
+			t.Errorf("seed-only violated: overwrote the customer's provider pick (got %q)", env["LLM_PROVIDER"])
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("unmet sqlmock expectations (an unexpected INSERT means it re-pinned over the customer's pick): %v", err)
+		}
+	})
+
+	t.Run("non-platform model namespace does NOT get a platform provider pin", func(t *testing.T) {
+		mock := setupTestDB(t)
+		mock.ExpectQuery(kindQuery).WithArgs("ws-byok").
+			WillReturnRows(sqlmock.NewRows([]string{"kind"}).AddRow("platform"))
+		mock.ExpectQuery(modelSelQuery).WithArgs("ws-byok").
+			WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}).
+				AddRow([]byte("sonnet"), 0))
+		// Existence SELECT runs; model "sonnet" resolves on its own (anthropic-
+		// oauth alias), so the gate is NOT met → NO provider INSERT.
+		mock.ExpectQuery(providerSelQuery).WithArgs("ws-byok").
+			WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}))
+
+		// recordDeclaredPlugin: privileged-plugin kind precheck (→platform) + declared INSERT.
+		mock.ExpectQuery(kindQuery).WithArgs("ws-byok").
+			WillReturnRows(sqlmock.NewRows([]string{"kind"}).AddRow("platform"))
+		mock.ExpectExec(declaredInsert).
+			WithArgs("ws-byok", sqlmock.AnyArg(), sqlmock.AnyArg()).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+		env := map[string]string{"MODEL": "sonnet"}
+		h.applyConciergeProvisionConfig(context.Background(), "ws-byok", "", nil, env, "Org Concierge")
+
+		if _, ok := env["LLM_PROVIDER"]; ok {
+			t.Errorf("non-platform model wrongly got LLM_PROVIDER pinned (%q) — would mis-route a BYOK/self-host concierge", env["LLM_PROVIDER"])
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("unmet sqlmock expectations: %v", err)
 		}
 	})
 }
@@ -748,6 +916,62 @@ func TestDefaultCreateParentID(t *testing.T) {
 		mock.ExpectQuery(platQ).WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("p1").AddRow("p2"))
 		if got := defaultCreateParentID(context.Background()); got != "" {
 			t.Fatalf("want empty (ambiguous multi-platform must NOT fall back to a root), got %q", got)
+		}
+	})
+}
+
+// TestRecordDeclaredPlugin_PrivilegedPluginEntitlement is the security gate for
+// the org-management MCP plugin (RFC: rfc-platform-mcp-as-plugin). The privileged
+// plugin carries the org-admin tool surface, so recordDeclaredPlugin — the single
+// chokepoint every declaration path flows through — must REFUSE it for any
+// non-platform workspace, regardless of how the declaration was sourced (template
+// seed, org_import, or a user-authored workspace.yaml). This closes the
+// privilege-escalation vector where a user workspace lists the plugin to mint
+// itself org-admin tools.
+func TestRecordDeclaredPlugin_PrivilegedPluginEntitlement(t *testing.T) {
+	const kindQuery = `SELECT COALESCE\(kind, 'workspace'\) FROM workspaces WHERE id =`
+	const declaredInsert = `INSERT INTO workspace_declared_plugins`
+
+	t.Run("platform concierge MAY declare the privileged management MCP", func(t *testing.T) {
+		mock := setupTestDB(t)
+		mock.ExpectQuery(kindQuery).WithArgs("ws-concierge").
+			WillReturnRows(sqlmock.NewRows([]string{"kind"}).AddRow("platform"))
+		mock.ExpectExec(declaredInsert).
+			WithArgs("ws-concierge", conciergePlatformMCPPlugin, sqlmock.AnyArg()).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+		if err := recordDeclaredPlugin(context.Background(), "ws-concierge", conciergePlatformMCPPlugin, conciergePlatformMCPPlugin); err != nil {
+			t.Fatalf("platform concierge declaration of the management MCP must succeed: %v", err)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("unmet sqlmock expectations: %v", err)
+		}
+	})
+
+	t.Run("non-platform workspace is REFUSED — no INSERT (privilege-escalation guard)", func(t *testing.T) {
+		mock := setupTestDB(t)
+		mock.ExpectQuery(kindQuery).WithArgs("ws-user").
+			WillReturnRows(sqlmock.NewRows([]string{"kind"}).AddRow("workspace"))
+		// NO ExpectExec: the gate MUST refuse before any INSERT fires.
+		err := recordDeclaredPlugin(context.Background(), "ws-user", conciergePlatformMCPPlugin, conciergePlatformMCPPlugin)
+		if err == nil {
+			t.Fatal("a non-platform workspace MUST NOT be able to declare the privileged management MCP plugin")
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("unmet sqlmock expectations (an INSERT fired — that is the privilege escalation this gate must stop): %v", err)
+		}
+	})
+
+	t.Run("an ordinary plugin skips the kind precheck entirely (no extra query)", func(t *testing.T) {
+		mock := setupTestDB(t)
+		// No kind precheck for non-privileged names — straight to the upsert.
+		mock.ExpectExec(declaredInsert).
+			WithArgs("ws-user", "browser-automation", sqlmock.AnyArg()).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+		if err := recordDeclaredPlugin(context.Background(), "ws-user", "browser-automation", "browser-automation"); err != nil {
+			t.Fatalf("ordinary plugin declaration must succeed: %v", err)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("unmet sqlmock expectations: %v", err)
 		}
 	})
 }

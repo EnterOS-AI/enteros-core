@@ -16,6 +16,7 @@ import (
 	"strings"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
 )
 
 // trackedRefValues is the closed set of bare-string values the
@@ -102,6 +103,24 @@ func recordDeclaredPlugin(ctx context.Context, workspaceID, pluginName, sourceRa
 	}
 	if db.DB == nil {
 		return nil // nil in unit tests; declaration is test-only there
+	}
+	// Entitlement gate (defense-in-depth) for the PRIVILEGED org-management MCP
+	// plugin. It carries the org-admin tool surface (create_workspace, …), so it
+	// may be declared ONLY on the org-root kind='platform' concierge. Core
+	// declares it exactly once, from the kind-gated applyConciergeProvisionConfig;
+	// this is the single chokepoint EVERY declaration path flows through (template
+	// seed, org_import, a user-authored workspace.yaml), so refusing it here for a
+	// non-platform workspace closes the privilege-escalation vector regardless of
+	// declaration source. Fail-closed on a kind read error.
+	if pluginName == conciergePlatformMCPPlugin {
+		var kind string
+		if err := db.DB.QueryRowContext(ctx,
+			`SELECT COALESCE(kind, 'workspace') FROM workspaces WHERE id = $1`, workspaceID).Scan(&kind); err != nil {
+			return fmt.Errorf("recordDeclaredPlugin: kind precheck for privileged plugin %q on %s: %w", pluginName, workspaceID, err)
+		}
+		if kind != models.KindPlatform {
+			return fmt.Errorf("recordDeclaredPlugin: refusing to declare privileged plugin %q on non-platform workspace %s (kind=%s)", pluginName, workspaceID, kind)
+		}
 	}
 	_, err := db.DB.ExecContext(ctx, `
 		INSERT INTO workspace_declared_plugins (workspace_id, plugin_name, source_raw)

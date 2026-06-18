@@ -229,7 +229,17 @@ func TestPlatformAgentImageDriftGate(t *testing.T) {
 	dockerfilePath := filepath.Join("..", "..", "Dockerfile.platform-agent")
 	dockerfile, err := os.ReadFile(dockerfilePath)
 	if err != nil {
-		t.Fatalf("read %s: %v — the drift-gate requires Dockerfile.platform-agent to live next to the other Dockerfiles; verify the path", dockerfilePath, err)
+		// #3027 moved the platform-agent image build (and Dockerfile.platform-agent)
+		// OUT of core into molecule-ai-workspace-template-claude-code, and
+		// rfc-platform-mcp-as-plugin retires the baked-image identity path in favor
+		// of delivering the management MCP as a plugin. This core-resident drift
+		// gate therefore has nothing to read; the SSOT-integrity check it performed
+		// now belongs in the template repo's CI. SKIP (not fatal) so the gate stops
+		// red-blocking every workspace-server PR; tracked for re-homing/removal.
+		if os.IsNotExist(err) {
+			t.Skipf("Dockerfile.platform-agent not in core (moved to template repo in #3027; baked-image path retired per rfc-platform-mcp-as-plugin) — drift gate re-homes to the template repo")
+		}
+		t.Fatalf("read %s: %v", dockerfilePath, err)
 	}
 	dockerfileStr := string(dockerfile)
 
@@ -360,6 +370,11 @@ func TestPlatformAgentEntrypointWiring(t *testing.T) {
 	dockerfilePath := filepath.Join("..", "..", "Dockerfile.platform-agent")
 	dockerfile, err := os.ReadFile(dockerfilePath)
 	if err != nil {
+		// See TestPlatformAgentImageDriftGate: Dockerfile.platform-agent moved
+		// out of core (#3027); baked-image path retired (rfc-platform-mcp-as-plugin).
+		if os.IsNotExist(err) {
+			t.Skipf("Dockerfile.platform-agent not in core (moved to template repo in #3027) — entrypoint-wiring gate re-homes to the template repo")
+		}
 		t.Fatalf("read %s: %v", dockerfilePath, err)
 	}
 	dockerfileStr := string(dockerfile)
