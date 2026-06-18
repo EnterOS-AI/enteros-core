@@ -67,6 +67,24 @@ func recordWorkspacePluginInstall(
 	if workspaceID == "" || pluginName == "" || sourceRaw == "" {
 		return errors.New("recordWorkspacePluginInstall: missing required field")
 	}
+
+	// Entitlement gate (defense-in-depth) for the PRIVILEGED org-management MCP
+	// plugin. The install path (workspace_plugins) unions into the boot-install set
+	// without re-validation, so a non-platform workspace that somehow staged the
+	// plugin files could get the management MCP installed. Refuse the privileged
+	// name here, mirroring the gate in recordDeclaredPlugin. Fail-closed on a kind
+	// read error.
+	if pluginName == conciergePlatformMCPPlugin {
+		var kind string
+		if err := db.DB.QueryRowContext(ctx,
+			`SELECT COALESCE(kind, 'workspace') FROM workspaces WHERE id = $1`, workspaceID).Scan(&kind); err != nil {
+			return fmt.Errorf("recordWorkspacePluginInstall: kind precheck for privileged plugin %q on %s: %w", pluginName, workspaceID, err)
+		}
+		if kind != models.KindPlatform {
+			return fmt.Errorf("recordWorkspacePluginInstall: refusing to install privileged plugin %q on non-platform workspace %s (kind=%s)", pluginName, workspaceID, kind)
+		}
+	}
+
 	canonicalTrack, err := validateTrackedRef(track)
 	if err != nil {
 		return err
