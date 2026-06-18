@@ -476,7 +476,7 @@ func validateDiscoveryCaller(ctx context.Context, c *gin.Context, workspaceID st
 		// (same product spec as WorkspaceAuth). Checked before the
 		// per-workspace token so an org-key presenter doesn't hit the
 		// narrower failure path.
-		if _, _, _, err := orgtoken.Validate(ctx, db.DB, tok); err == nil {
+		if _, _, _, err := orgtoken.Validate(ctx, db.DB, tok, orgtoken.AuditLogRequestContextFromGin(c), ""); err == nil {
 			return nil
 		} else if !errors.Is(err, orgtoken.ErrInvalidToken) {
 			log.Printf("wsauth: discovery orgtoken.Validate(%s): datastore lookup failed (returning 503): %v", workspaceID, err)

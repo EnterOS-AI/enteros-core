@@ -653,13 +653,13 @@ func TestIntegration_OrgToken_RevokeStopsValidation(t *testing.T) {
 	// org_id references workspaces(id); anchor the token to a real org root.
 	org := insertWorkspace(t, conn, "org-root", "online", "")
 
-	plaintext, id, err := orgtoken.Issue(ctx, conn, "ci-token", "tester", org)
+	plaintext, id, err := orgtoken.Issue(ctx, conn, "ci-token", "tester", org, orgtoken.AuditLogRequestContext{})
 	if err != nil {
 		t.Fatalf("Issue: %v", err)
 	}
 
 	// Live token validates and reports its org anchor.
-	gotID, _, gotOrg, err := orgtoken.Validate(ctx, conn, plaintext)
+	gotID, _, gotOrg, err := orgtoken.Validate(ctx, conn, plaintext, orgtoken.AuditLogRequestContext{}, "")
 	if err != nil {
 		t.Fatalf("Validate (live): %v", err)
 	}
@@ -671,7 +671,7 @@ func TestIntegration_OrgToken_RevokeStopsValidation(t *testing.T) {
 	}
 
 	// First revoke flips live → revoked.
-	transitioned, err := orgtoken.Revoke(ctx, conn, id)
+	transitioned, err := orgtoken.Revoke(ctx, conn, id, orgtoken.AuditLogRequestContext{}, "tester")
 	if err != nil {
 		t.Fatalf("Revoke: %v", err)
 	}
@@ -680,12 +680,12 @@ func TestIntegration_OrgToken_RevokeStopsValidation(t *testing.T) {
 	}
 
 	// Revoked token MUST NOT validate.
-	if _, _, _, err := orgtoken.Validate(ctx, conn, plaintext); err != orgtoken.ErrInvalidToken {
+	if _, _, _, err := orgtoken.Validate(ctx, conn, plaintext, orgtoken.AuditLogRequestContext{}, ""); err != orgtoken.ErrInvalidToken {
 		t.Fatalf("Validate after revoke: want ErrInvalidToken, got %v (revoked_at filter regressed)", err)
 	}
 
 	// Idempotent re-revoke reports false (already revoked), not an error.
-	transitioned2, err := orgtoken.Revoke(ctx, conn, id)
+	transitioned2, err := orgtoken.Revoke(ctx, conn, id, orgtoken.AuditLogRequestContext{}, "tester")
 	if err != nil {
 		t.Fatalf("re-Revoke: %v", err)
 	}
@@ -700,15 +700,15 @@ func TestIntegration_OrgToken_ListExcludesRevoked(t *testing.T) {
 
 	org := insertWorkspace(t, conn, "org-root", "online", "")
 
-	_, liveID, err := orgtoken.Issue(ctx, conn, "live", "tester", org)
+	_, liveID, err := orgtoken.Issue(ctx, conn, "live", "tester", org, orgtoken.AuditLogRequestContext{})
 	if err != nil {
 		t.Fatalf("Issue live: %v", err)
 	}
-	_, deadID, err := orgtoken.Issue(ctx, conn, "dead", "tester", org)
+	_, deadID, err := orgtoken.Issue(ctx, conn, "dead", "tester", org, orgtoken.AuditLogRequestContext{})
 	if err != nil {
 		t.Fatalf("Issue dead: %v", err)
 	}
-	if _, err := orgtoken.Revoke(ctx, conn, deadID); err != nil {
+	if _, err := orgtoken.Revoke(ctx, conn, deadID, orgtoken.AuditLogRequestContext{}, "tester"); err != nil {
 		t.Fatalf("Revoke dead: %v", err)
 	}
 
@@ -733,7 +733,7 @@ func TestIntegration_OrgToken_ListExcludesRevoked(t *testing.T) {
 	if ok, err := orgtoken.HasAnyLive(ctx, conn); err != nil || !ok {
 		t.Fatalf("HasAnyLive (one live): ok=%v err=%v, want true,nil", ok, err)
 	}
-	if _, err := orgtoken.Revoke(ctx, conn, liveID); err != nil {
+	if _, err := orgtoken.Revoke(ctx, conn, liveID, orgtoken.AuditLogRequestContext{}, "tester"); err != nil {
 		t.Fatalf("Revoke live: %v", err)
 	}
 	if ok, err := orgtoken.HasAnyLive(ctx, conn); err != nil || ok {

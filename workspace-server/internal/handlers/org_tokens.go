@@ -136,7 +136,7 @@ func (h *OrgTokenHandler) Create(c *gin.Context) {
 
 	createdBy, orgID := orgTokenActor(c)
 
-	plaintext, id, err := orgtoken.Issue(c.Request.Context(), db.DB, req.Name, createdBy, orgID)
+	plaintext, id, err := orgtoken.Issue(c.Request.Context(), db.DB, req.Name, createdBy, orgID, orgtoken.AuditLogRequestContextFromGin(c))
 	if err != nil {
 		log.Printf("orgtoken issue: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to mint token"})
@@ -184,7 +184,8 @@ func (h *OrgTokenHandler) Revoke(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "id required"})
 		return
 	}
-	ok, err := orgtoken.Revoke(c.Request.Context(), db.DB, id)
+	actor, _ := orgTokenActor(c)
+	ok, err := orgtoken.Revoke(c.Request.Context(), db.DB, id, orgtoken.AuditLogRequestContextFromGin(c), actor)
 	if err != nil {
 		log.Printf("orgtoken revoke: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to revoke"})
@@ -194,7 +195,6 @@ func (h *OrgTokenHandler) Revoke(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "token not found or already revoked"})
 		return
 	}
-	actor, _ := orgTokenActor(c)
 	log.Printf("orgtoken: revoked id=%s by=%s", id, actor)
 	c.JSON(http.StatusOK, gin.H{"revoked": id})
 }

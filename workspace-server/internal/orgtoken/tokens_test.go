@@ -24,8 +24,11 @@ func TestIssue_StoresHashNotPlaintext(t *testing.T) {
 	mock.ExpectQuery(`INSERT INTO org_api_tokens`).
 		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), "my-ci", "user_01", "org-1").
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("tok-1"))
+	mock.ExpectExec(`INSERT INTO org_token_audit_logs`).
+		WithArgs("tok-1", "mint", "user_01", "org-1", nil, nil, sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	plaintext, id, err := Issue(context.Background(), db, "my-ci", "user_01", "org-1")
+	plaintext, id, err := Issue(context.Background(), db, "my-ci", "user_01", "org-1", AuditLogRequestContext{})
 	if err != nil {
 		t.Fatalf("Issue: %v", err)
 	}
@@ -52,8 +55,11 @@ func TestIssue_EmptyNameAndCreatedByStoreNull(t *testing.T) {
 	mock.ExpectQuery(`INSERT INTO org_api_tokens`).
 		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), nil, nil, nil).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("tok-min"))
+	mock.ExpectExec(`INSERT INTO org_token_audit_logs`).
+		WithArgs("tok-min", "mint", "", nil, nil, nil, sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	_, _, err = Issue(context.Background(), db, "", "", "")
+	_, _, err = Issue(context.Background(), db, "", "", "", AuditLogRequestContext{})
 	if err != nil {
 		t.Fatalf("Issue: %v", err)
 	}
@@ -79,7 +85,7 @@ func TestValidate_HappyPath(t *testing.T) {
 		WithArgs("tok-live").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	id, prefix, _, err := Validate(context.Background(), db, plaintext)
+	id, prefix, _, err := Validate(context.Background(), db, plaintext, AuditLogRequestContext{}, "")
 	if err != nil {
 		t.Fatalf("Validate: %v", err)
 	}
@@ -94,7 +100,7 @@ func TestValidate_HappyPath(t *testing.T) {
 func TestValidate_EmptyPlaintextRejected(t *testing.T) {
 	db, _, _ := sqlmock.New()
 	defer db.Close()
-	if _, _, _, err := Validate(context.Background(), db, ""); !errors.Is(err, ErrInvalidToken) {
+	if _, _, _, err := Validate(context.Background(), db, "", AuditLogRequestContext{}, ""); !errors.Is(err, ErrInvalidToken) {
 		t.Errorf("empty plaintext should be ErrInvalidToken, got %v", err)
 	}
 }
@@ -109,8 +115,11 @@ func TestValidate_UnknownHashErrInvalid(t *testing.T) {
 	mock.ExpectQuery(`SELECT id, prefix, org_id FROM org_api_tokens`).
 		WithArgs(sqlmock.AnyArg()).
 		WillReturnError(sql.ErrNoRows)
+	mock.ExpectExec(`INSERT INTO org_token_audit_logs`).
+		WithArgs(nil, "validate_fail", "org-token:<short>", nil, nil, nil, sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	if _, _, _, err := Validate(context.Background(), db, "ghost"); !errors.Is(err, ErrInvalidToken) {
+	if _, _, _, err := Validate(context.Background(), db, "ghost", AuditLogRequestContext{}, ""); !errors.Is(err, ErrInvalidToken) {
 		t.Errorf("unknown hash should be ErrInvalidToken, got %v", err)
 	}
 }
@@ -126,8 +135,11 @@ func TestValidate_RevokedTokenNotAccepted(t *testing.T) {
 	mock.ExpectQuery(`SELECT id, prefix, org_id FROM org_api_tokens`).
 		WithArgs(sqlmock.AnyArg()).
 		WillReturnError(sql.ErrNoRows)
+	mock.ExpectExec(`INSERT INTO org_token_audit_logs`).
+		WithArgs(nil, "validate_fail", "org-token:revoked-", nil, nil, nil, sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	if _, _, _, err := Validate(context.Background(), db, "revoked-plaintext"); !errors.Is(err, ErrInvalidToken) {
+	if _, _, _, err := Validate(context.Background(), db, "revoked-plaintext", AuditLogRequestContext{}, ""); !errors.Is(err, ErrInvalidToken) {
 		t.Errorf("revoked token should be ErrInvalidToken, got %v", err)
 	}
 }
@@ -176,7 +188,10 @@ func TestRevoke_HappyPathAndIdempotent(t *testing.T) {
 	mock.ExpectExec(`UPDATE org_api_tokens`).
 		WithArgs("tok-1").
 		WillReturnResult(sqlmock.NewResult(0, 1))
-	ok, err := Revoke(context.Background(), db, "tok-1")
+	mock.ExpectExec(`INSERT INTO org_token_audit_logs`).
+		WithArgs("tok-1", "revoke", "tester", nil, nil, nil, sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	ok, err := Revoke(context.Background(), db, "tok-1", AuditLogRequestContext{}, "tester")
 	if err != nil || !ok {
 		t.Errorf("first revoke: got (%v, %v), want (true, nil)", ok, err)
 	}
@@ -186,7 +201,7 @@ func TestRevoke_HappyPathAndIdempotent(t *testing.T) {
 	mock.ExpectExec(`UPDATE org_api_tokens`).
 		WithArgs("tok-1").
 		WillReturnResult(sqlmock.NewResult(0, 0))
-	ok, err = Revoke(context.Background(), db, "tok-1")
+	ok, err = Revoke(context.Background(), db, "tok-1", AuditLogRequestContext{}, "tester")
 	if err != nil || ok {
 		t.Errorf("second revoke: got (%v, %v), want (false, nil)", ok, err)
 	}
