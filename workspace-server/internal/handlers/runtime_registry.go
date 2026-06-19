@@ -46,7 +46,7 @@ func manifestPath() string {
 		return "/app/manifest.json"
 	}
 	// Dev: cwd + ../../manifest.json (run from workspace-server/cmd/server).
-	for _, p := range []string{"manifest.json", "../manifest.json", "../../manifest.json"} {
+	for _, p := range []string{"manifest.json", "../manifest.json", "../../manifest.json", "../../../manifest.json"} {
 		if abs, err := filepath.Abs(p); err == nil {
 			if _, err := os.Stat(abs); err == nil {
 				return abs
