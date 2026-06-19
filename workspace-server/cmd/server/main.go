@@ -386,6 +386,20 @@ func main() {
 		go wh.RestartByID(workspaceID)
 	}
 
+	// 2026-06-19 a2a RCA (#3057): wedged-agent handler. Initial
+	// implementation is log + broadcast only — auto-restart is a
+	// follow-up gated on ops review (a wedge can mask a busy agent
+	// that's just slow; restarting such an agent loses in-flight
+	// state). The broadcast event lets the canvas flag the wedge
+	// status and operators inspect the tuple.
+	onWorkspaceWedged := func(innerCtx context.Context, workspaceID string) {
+		if err := broadcaster.RecordAndBroadcast(innerCtx, "WORKSPACE_WEDGED", workspaceID, map[string]interface{}{
+			"reason": "active_tasks>0 with no outbound A2A and no heartbeat — alive-but-wedged",
+		}); err != nil {
+			log.Printf("Wedged broadcast error for %s: %v", workspaceID, err)
+		}
+	}
+
 	// Start Liveness Monitor — Redis TTL expiry-based offline detection + auto-restart
 	go supervised.RunWithRecover(ctx, "liveness-monitor", func(c context.Context) {
 		registry.StartLivenessMonitor(c, onWorkspaceOffline)
@@ -408,6 +422,16 @@ func main() {
 	// orchestration was wrong. See #2392's CI failure for the trace.
 	go supervised.RunWithRecover(ctx, "health-sweep", func(c context.Context) {
 		registry.StartHealthSweep(c, prov, 15*time.Second, onWorkspaceOffline)
+	})
+
+	// 2026-06-19 a2a RCA (#3057): a separate monitor for the
+	// alive-but-wedged case (active_tasks>0, no outbound, no heartbeat)
+	// that the existing health-sweep misses because the Docker container
+	// is still up (TCP connect succeeds) and the dead-origin HTTP-status
+	// check isUpstreamDeadStatus is not triggered. Initial handler is
+	// log-only; a gated auto-restart is a follow-up.
+	go supervised.RunWithRecover(ctx, "wedged-agent-monitor", func(c context.Context) {
+		registry.StartWedgedAgentMonitor(c, onWorkspaceWedged)
 	})
 
 	// Orphan-container reconcile sweep — finds running containers
