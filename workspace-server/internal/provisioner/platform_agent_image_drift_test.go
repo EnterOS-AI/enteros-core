@@ -141,7 +141,9 @@ func hasDockerfileCopyForRel(dockerfileStr, rel string) bool {
 
 	// Match: COPY [flags] ${PLATFORM_AGENT_TEMPLATE_DIR}/<rel> ...
 	// or:    COPY [flags] ${PLATFORM_AGENT_TEMPLATE_DIR}/<dir>/ ...
-	pattern := `(?m)^COPY(?:\s+--[A-Za-z0-9=]+)?\s+\$\{PLATFORM_AGENT_TEMPLATE_DIR\}/(?:` + relRe + `|` + dirRe + `)\s`
+	// Flags are zero or more `--flag[=value]` tokens (e.g. --chmod=0755,
+	// --chown=app:app, --chown=1000:1000) before the source path.
+	pattern := `(?m)^COPY(?:\s+--\S+)*\s+\$\{PLATFORM_AGENT_TEMPLATE_DIR\}/(?:` + relRe + `|` + dirRe + `)\s`
 	matched, err := regexp.MatchString(pattern, dockerfileStr)
 	if err != nil {
 		// regexp.QuoteMeta only produces safe patterns; a compile error
@@ -167,6 +169,18 @@ func TestHasDockerfileCopyForRel(t *testing.T) {
 		{
 			name:        "top-level file COPY with --chmod",
 			dockerfile:  "COPY --chmod=0755 ${PLATFORM_AGENT_TEMPLATE_DIR}/identity-fallback.sh /opt/molecule-platform-agent-template/identity-fallback.sh\n",
+			rel:         "identity-fallback.sh",
+			wantMatched: true,
+		},
+		{
+			name:        "top-level file COPY with --chown",
+			dockerfile:  "COPY --chown=1000:1000 ${PLATFORM_AGENT_TEMPLATE_DIR}/identity-fallback.sh /opt/molecule-platform-agent-template/identity-fallback.sh\n",
+			rel:         "identity-fallback.sh",
+			wantMatched: true,
+		},
+		{
+			name:        "top-level file COPY with multiple flags",
+			dockerfile:  "COPY --chmod=0755 --chown=node:node ${PLATFORM_AGENT_TEMPLATE_DIR}/identity-fallback.sh /opt/molecule-platform-agent-template/identity-fallback.sh\n",
 			rel:         "identity-fallback.sh",
 			wantMatched: true,
 		},
