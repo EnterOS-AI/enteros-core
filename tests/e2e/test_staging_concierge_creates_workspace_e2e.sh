@@ -348,85 +348,133 @@ create_workspace tool — that is the parallel-agent image work this gate depend
 done
 ok "Concierge online + routable (url assigned)"
 
-# ─── 4.5. A2A-probe: assert the concierge actually HAS the create_workspace tool ─
-# core#3081: the previous false-green slipped because everyone checked proxies
-# (molecule-mcp-server installed, the concierge image baked, the platform
-# route reachable) — but the actual tool the LLM needs to invoke was not in
-# the concierge's mcp_servers. This probe reads the concierge's MCP server
-# wiring (the /configs/mcp_servers.yaml overlay seeded at provision by
-# applyConciergeProvisionConfig) and asserts the molecule-platform server is
-# declared with the create_workspace capability surfaced, BEFORE we spend
-# LLM-budget driving the agent through a failing tool call. Fails LOUD with
-# the actual mcp_servers content so the operator can see whether the overlay
-# is missing, misnamed, or simply doesn't expose the tool.
-log "4.5/6 A2A-probe: asserting concierge's mcp_servers.yaml exposes mcp__molecule-platform__create_workspace..."
-MCP_HTTP=$(tenant_call GET "/workspaces/$CONCIERGE_ID/files/mcp_servers.yaml" -w '\n%{http_code}' 2>/dev/null || echo "")
-# tenant_call always exits 0 on transport-level success (the HTTP-code goes in
-# the body via -w). Split body / status.
-MCP_BODY=$(printf '%s' "$MCP_HTTP" | sed '$d')
-MCP_STATUS=$(printf '%s' "$MCP_HTTP" | tail -n1)
-if [ "$MCP_STATUS" != "200" ]; then
-  skip_loud "GET /workspaces/$CONCIERGE_ID/files/mcp_servers.yaml returned HTTP $MCP_STATUS — the concierge's MCP overlay is NOT mounted (image missing mcp_servers.yaml or /configs overlay not applied). Without it the concierge has no mcp__molecule-platform__create_workspace tool. Body: $(echo "$MCP_BODY" | head -c 300)"
+# ─── 4.5. A2A-probe: assert the concierge's RUNTIME tool list includes ─────────
+# mcp__molecule-platform__create_workspace (not just that the config declared it).
+#
+# core#3081 / Researcher #12646: the previous false-green slipped because the
+# test asserted the mcp_servers.yaml TEXT, which only proves a config file
+# exists on disk — it does NOT prove the concierge's LLM can actually call
+# the tool. The whole point of the gate is to assert REAL capability: a
+# runtime, live, actually-callable tool — not a proxy (file presence, plugin
+# install, platform-agent image presence, mcp_servers.yaml text).
+#
+# Mechanism: send a structured A2A `message/send` envelope to the concierge
+# asking it to enumerate its MCP tool names by their literal namespaced
+# identifiers (the `mcp__<server>__<tool>` form that Claude Code's tool
+# dispatcher uses), then parse the reply for the literal
+# `mcp__molecule-platform__create_workspace` string. This is LLM-mediated
+# (the concierge LLM must respond) but goes through the SAME A2A channel
+# the real create_workspace call (5/6) will use, so a missing tool shows up
+# as a missing-string-in-reply here, before the LLM-budget is burned on the
+# 7-minute cold-concierge tool call that will never succeed.
+#
+# Defensive parsing: the concierge LLM may list tools in a few formats
+# (`mcp__molecule-platform__create_workspace`, `create_workspace`, or as a
+# JSON array). We accept any of the literal namespaced form OR a JSON array
+# containing the namespaced form. A "yes" in any format is a PASS; an absent
+# namespaced identifier is a HARD FAIL (skip_loud + E2E_REQUIRE_LIVE=1 →
+# exit 5).
+log "4.5/6 A2A-probe: asserting the concierge's RUNTIME tool list exposes mcp__molecule-platform__create_workspace..."
+# Cold concierge: same wide per-call window + cold-start 5xx retry as the
+# real create call (5/6). 5 attempts × 15 s sleep keeps the probe bounded
+# at ~90 s worst-case — well under the 7 min cold-concierge call we'd
+# otherwise burn in 5/6 if the tool is missing.
+PROBE_PROMPT='List every MCP tool you have access to, by its full namespaced identifier (e.g. mcp__server-name__tool-name). Output ONLY a JSON array of strings, no commentary, no markdown fence. Example: ["mcp__memory__commit_memory", "mcp__platform__create_workspace"]. Reply with [] if you have no MCP tools.'
+A2A_PROBE_TMP="$TMPDIR_E2E/a2a_probe_out"
+PROBE_TEXT=""
+PROBE_OK=0
+for PROBE_ATTEMPT in $(seq 1 5); do
+  : >"$A2A_PROBE_TMP"
+  set +e
+  PROBE_CODE=$(tenant_call POST "/workspaces/$CONCIERGE_ID/a2a" \
+    --max-time "$AGENT_ACT_SECS" \
+    -H "Content-Type: application/json" \
+    -d "$(WORKER_NAME="$WORKER_NAME" PROBE_PROMPT="$PROBE_PROMPT" python3 -c "
+import json, os
+print(json.dumps({
+    'jsonrpc': '2.0',
+    'method': 'message/send',
+    'id': 'e2e-cncrg-mk-probe-1',
+    'params': {
+        'message': {
+            'role': 'user',
+            'messageId': 'e2e-probe-' + os.urandom(4).hex(),
+            'parts': [{'kind': 'text', 'text': os.environ['PROBE_PROMPT']}],
+        }
+    }
+}))")" \
+    -o "$A2A_PROBE_TMP" -w '%{http_code}' 2>/dev/null)
+  PROBE_RC=$?
+  set -e
+  PROBE_CODE=${PROBE_CODE:-000}
+  PROBE_RESP=$(cat "$A2A_PROBE_TMP" 2>/dev/null || echo "")
+  if [ "$PROBE_RC" = "0" ] && [ "$PROBE_CODE" -ge 200 ] && [ "$PROBE_CODE" -lt 300 ]; then
+    PROBE_OK=1
+    break
+  fi
+  if echo "$PROBE_CODE" | grep -Eq '^(502|503|504)$'; then
+    log "    A2A-probe cold-start attempt $PROBE_ATTEMPT/5 returned $PROBE_CODE — retrying"
+    [ "$PROBE_ATTEMPT" -lt 5 ] && { sleep 15; continue; }
+  fi
+  break
+done
+if [ "$PROBE_OK" != "1" ]; then
+  fail "A2A-probe POST /workspaces/$CONCIERGE_ID/a2a failed (curl_rc=$PROBE_RC, http=$PROBE_CODE) after $PROBE_ATTEMPT attempt(s): $(echo "$PROBE_RESP" | head -c 400)"
 fi
-# Parse YAML minimally with python3 (PyYAML is on the runner; if absent the
-# script SKIPs LOUD — never a false-green). The wire format is the same
-# `mcp_servers.<name>.{command, env}` shape the concierge template ships.
-if ! printf '%s' "$MCP_BODY" | python3 -c "
+PROBE_TEXT=$(echo "$PROBE_RESP" | python3 -c "
 import sys, json
-try:
-    import yaml  # type: ignore
-except ImportError:
-    print('__no_yaml__'); sys.exit(0)
-try:
-    d = yaml.safe_load(sys.stdin)
-except Exception as e:
-    print('__yaml_parse_error__:' + str(e)); sys.exit(0)
-if not isinstance(d, dict):
-    print('__not_mapping__'); sys.exit(0)
-servers = d.get('mcp_servers') if isinstance(d.get('mcp_servers'), dict) else d
-hit = ''
-for name, spec in servers.items() if isinstance(servers, dict) else []:
-    if not isinstance(spec, dict):
-        continue
-    cmd = spec.get('command')
-    if not isinstance(cmd, list):
-        cmd = [cmd] if isinstance(cmd, str) else []
-    cmd_str = ' '.join(str(c) for c in cmd)
-    # The platform MCP is served by either the molecule-mcp-server binary
-    # (current SSOT) or the legacy molecule-platform server name (still
-    # accepted — namespacing `mcp__molecule-platform__create_workspace` means
-    # the server name 'molecule-platform' is the wire-format contract).
-    is_platform = (
-        'molecule-mcp-server' in cmd_str
-        or 'molecule-platform' in name
-        or 'molecule-platform' in cmd_str
-    )
-    if is_platform and 'create_workspace' in cmd_str + ' ' + json.dumps(spec):
-        hit = name
-        break
-print('HIT=' + hit if hit else 'NO_HIT')
-" 2>/dev/null > /tmp/concierge-mcp-probe.out; then
-  skip_loud "python3 probe crashed: $(cat /tmp/concierge-mcp-probe.out 2>/dev/null || echo unknown)"
-fi
-PROBE_OUT=$(cat /tmp/concierge-mcp-probe.out 2>/dev/null || echo "")
-case "$PROBE_OUT" in
-  HIT=*)
-    ok "A2A-probe PASS: concierge mcp_servers.yaml declares '${PROBE_OUT#HIT=}' with create_workspace — tool is real, not just 'plugin installed'"
+try: d = json.load(sys.stdin)
+except Exception: print(''); sys.exit(0)
+parts = (d.get('result') or {}).get('parts', []) if isinstance(d, dict) else []
+print(parts[0].get('text','') if parts else '')" 2>/dev/null || echo "")
+log "    concierge probe reply (first 300 chars): $(echo "$PROBE_TEXT" | head -c 300)"
+
+# Decide: does the literal `mcp__molecule-platform__create_workspace` appear
+# anywhere in the reply text?  We strip a leading/trailing markdown fence if
+# present (some LLM outputs wrap the JSON array in ```json ... ```) and parse
+# for the namespaced identifier.
+PROBE_VERDICT=$(printf '%s' "$PROBE_TEXT" | python3 -c "
+import sys, json, re
+text = sys.stdin.read()
+if not text:
+    print('EMPTY'); sys.exit(0)
+# Accept the namespaced identifier directly (covers the prose-format reply).
+if 'mcp__molecule-platform__create_workspace' in text:
+    print('HIT'); sys.exit(0)
+# Tolerate the LLM wrapping the JSON array in a markdown fence (the
+# literal triple-backtick form) or padding it with prose. Pull the first
+# [...] match and parse as JSON; accept any list element containing the
+# namespaced identifier.
+m = re.search(r'\[[^\]]*\]', text, re.S)
+if m:
+    try:
+        arr = json.loads(m.group(0))
+        if isinstance(arr, list):
+            for t in arr:
+                if isinstance(t, str) and 'mcp__molecule-platform__create_workspace' in t:
+                    print('HIT'); sys.exit(0)
+    except Exception:
+        pass
+print('NO_HIT')
+" 2>/dev/null || echo "PARSE_ERR")
+case "$PROBE_VERDICT" in
+  HIT)
+    ok "A2A-probe PASS: concierge's RUNTIME tool list contains mcp__molecule-platform__create_workspace — REAL capability confirmed (not just a config-text proxy)"
     ;;
   NO_HIT)
-    skip_loud "A2A-probe FAIL: concierge mcp_servers.yaml does NOT expose mcp__molecule-platform__create_workspace. Body: $(echo "$MCP_BODY" | head -c 600)"
+    skip_loud "A2A-probe FAIL: concierge's reply does NOT contain mcp__molecule-platform__create_workspace. The tool is NOT in the LLM's runtime tool list — even if /configs/mcp_servers.yaml declares it, the concierge's MCP layer is not surfacing it to the LLM (overlay applied to wrong path, server name mismatch, or molecule-mcp-server not actually running). Reply: $(echo "$PROBE_TEXT" | head -c 600)"
     ;;
-  __no_yaml__)
-    skip_loud "A2A-probe SKIP: PyYAML not on the runner — install python3-yaml to make this probe gating. The downstream message/send assertion still runs as the soft check."
+  EMPTY)
+    skip_loud "A2A-probe FAIL: concierge returned no text part to the tool-list probe. The A2A channel is up (HTTP 2xx) but the LLM did not reply — could be a cold-start model-load failure, a missing model, or a wired-but-not-running MCP server. Reply was empty."
     ;;
-  __yaml_parse_error__:*|__not_mapping__)
-    skip_loud "A2A-probe SKIP: mcp_servers.yaml did not parse as a YAML mapping (${PROBE_OUT#__}) — the overlay may be a different shape on this image. Body: $(echo "$MCP_BODY" | head -c 400)"
+  PARSE_ERR)
+    skip_loud "A2A-probe FAIL: probe response did not parse as JSON-RPC text. Transport was up (HTTP 2xx) but the envelope shape is wrong — possible concierge runtime regression. Reply: $(echo "$PROBE_TEXT" | head -c 600)"
     ;;
   *)
-    skip_loud "A2A-probe UNKNOWN: probe produced '$PROBE_OUT' (no recognised verdict). Body: $(echo "$MCP_BODY" | head -c 400)"
+    skip_loud "A2A-probe FAIL: probe produced unknown verdict '$PROBE_VERDICT'. Reply: $(echo "$PROBE_TEXT" | head -c 400)"
     ;;
 esac
-unset MCP_BODY MCP_STATUS MCP_HTTP
+unset PROBE_TEXT PROBE_RESP PROBE_CODE PROBE_RC PROBE_VERDICT A2A_PROBE_TMP
 
 # Pre-state: the worker MUST NOT exist yet (so its later appearance is causally
 # the concierge's doing, not a pre-existing row).

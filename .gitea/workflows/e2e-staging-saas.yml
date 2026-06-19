@@ -40,54 +40,23 @@ name: E2E Staging SaaS (full lifecycle)
 
 on:
   # Trunk-based (Phase 3 of internal#81): main is the only branch.
+  #
+  # core#3081 / lint-required-no-paths: NO `paths:` filter on either push or
+  # pull_request. The `E2E Staging Concierge Creates Workspace` job is now in
+  # .gitea/required-contexts.txt (merge-blocking), and lint-required-no-paths
+  # rejects any required workflow that path-filters its `on:` block — a
+  # path-filtered required context degrades the merge gate to a silent
+  # indefinite pending (Gitea 1.22.6 reports it as pending, never success,
+  # for PRs whose diff doesn't match the glob — wedging docs-only PRs
+  # forever; see feedback_path_filtered_workflow_cant_be_required).
+  #
+  # Per-job gating is moved to the job level (`if:` guards below) so the
+  # slow provisioning jobs (e2e-staging-saas, e2e-staging-platform-boot)
+  # still skip on docs-only PRs, but the workflow ITSELF is unconditional.
   push:
     branches: [main]
-    paths:
-      - 'workspace-server/internal/handlers/registry.go'
-      - 'workspace-server/internal/handlers/workspace_provision.go'
-      - 'workspace-server/internal/handlers/a2a_proxy.go'
-      - 'workspace-server/internal/middleware/**'
-      - 'workspace-server/internal/provisioner/**'
-      - 'workspace-server/internal/providers/providers.yaml'
-      - 'tests/e2e/test_staging_full_saas.sh'
-      - 'tests/e2e/lib/completion_assert.sh'
-      - 'tests/e2e/lib/llm_proxy_preflight.sh'
-      - 'tests/e2e/lib/model_slug.sh'
-      - 'tests/e2e/lib/aws_leak_check.sh'
-      - 'tests/e2e/test_aws_leak_check.sh'
-      - 'tests/e2e/test_staging_concierge_e2e.sh'
-      - 'tests/e2e/test_staging_concierge_creates_workspace_e2e.sh'
-      - 'tests/e2e/test_llm_proxy_preflight_unit.sh'
-      - 'workspace-server/internal/staginge2e/**'
-      - 'workspace-server/internal/handlers/platform_agent.go'
-      - 'workspace-server/internal/handlers/user_tasks.go'
-      - 'workspace-server/internal/handlers/llm_billing_mode_handler.go'
-      - 'workspace-server/internal/handlers/discovery.go'
-      - '.gitea/workflows/e2e-staging-saas.yml'
   pull_request:
     branches: [main]
-    paths:
-      - 'workspace-server/internal/handlers/registry.go'
-      - 'workspace-server/internal/handlers/workspace_provision.go'
-      - 'workspace-server/internal/handlers/a2a_proxy.go'
-      - 'workspace-server/internal/middleware/**'
-      - 'workspace-server/internal/provisioner/**'
-      - 'workspace-server/internal/providers/providers.yaml'
-      - 'tests/e2e/test_staging_full_saas.sh'
-      - 'tests/e2e/lib/completion_assert.sh'
-      - 'tests/e2e/lib/llm_proxy_preflight.sh'
-      - 'tests/e2e/lib/model_slug.sh'
-      - 'tests/e2e/lib/aws_leak_check.sh'
-      - 'tests/e2e/test_aws_leak_check.sh'
-      - 'tests/e2e/test_staging_concierge_e2e.sh'
-      - 'tests/e2e/test_staging_concierge_creates_workspace_e2e.sh'
-      - 'tests/e2e/test_llm_proxy_preflight_unit.sh'
-      - 'workspace-server/internal/staginge2e/**'
-      - 'workspace-server/internal/handlers/platform_agent.go'
-      - 'workspace-server/internal/handlers/user_tasks.go'
-      - 'workspace-server/internal/handlers/llm_billing_mode_handler.go'
-      - 'workspace-server/internal/handlers/discovery.go'
-      - '.gitea/workflows/e2e-staging-saas.yml'
   workflow_dispatch:
   schedule:
     # 07:00 UTC every day — catches AMI drift, WorkOS cert rotation,
@@ -139,6 +108,12 @@ jobs:
   e2e-staging-saas:
     name: E2E Staging SaaS
     runs-on: ubuntu-latest
+    # core#3081: gate the slow full-lifecycle job to push/dispatch/cron now
+    # that the workflow's `paths:` filter has been removed (lint-required-no-paths
+    # compliance — see the on: block comment). The pre-#3081 behaviour of firing
+    # on path-matched PRs was an optimization; with the lint's no-paths rule in
+    # force, the equivalent optimization moves to the job's `if:` guard.
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
     # Phase 3 (RFC #219 §1): surface broken workflows without blocking.
     # mc#2654: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
     continue-on-error: true
@@ -402,6 +377,10 @@ jobs:
   e2e-staging-platform-boot:
     name: E2E Staging Platform Boot
     runs-on: ubuntu-latest
+    # core#3081: gate the slow platform-boot job to push/dispatch/cron now
+    # that the workflow's `paths:` filter has been removed (lint-required-no-paths
+    # compliance). Matches the pattern of the other slow jobs in this workflow.
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
     # Phase 3 (RFC #219 §1): surface without blocking until the de-flake window
     # closes. mc#2654: do NOT renew this mask silently — the gate-making plan
     # tracks the flip to false under #2187.
@@ -753,12 +732,10 @@ jobs:
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: "3.11"
-
-      # core#3081: install PyYAML so the concierge-creates-workspace test script
-      # can parse /configs/mcp_servers.yaml (the A2A-probe step 4.5/6). Pinned
-      # to a known-good range; deterministic across runner image rotations.
-      - name: Install PyYAML (A2A-probe dependency)
-        run: python3 -m pip install --quiet "PyYAML>=6.0,<7"
+        # core#3081: PyYAML is NO LONGER a dependency of the test script — the
+        # A2A-probe (step 4.5/6) now goes through the A2A channel (live
+        # message/send + JSON + regex parse), not a yaml.read of mcp_servers.yaml.
+        # The earlier PyYAML install was for the now-removed config-text probe.
 
       - name: Verify admin token + AWS creds present
         run: |
@@ -783,23 +760,14 @@ jobs:
           fi
           echo "Staging CP healthy ✓"
 
-      # core#3081: explicit A2A-probe step (sibling to the script-internal one).
-      # Probes the SAME concierge's mcp_servers.yaml the script probes (4.5/6
-      # inside the test) via the workspace-server's /files/* endpoint. The
-      # script's probe is the GATE — this step is a GitHub-Actions-visible
-      # status line that surfaces the verdict BEFORE the LLM turn, so a missing
-      # overlay shows up as a "A2A-probe: FAIL" line in the UI even on a
-      # green-rerun. Failures here are advisory (exit 0 on a missing overlay
-      # because the script-internal probe is the GATE) — we don't want a probe
-      # config error to mask the real gate verdict.
-      - name: A2A-probe concierge MCP tool list (advisory, gate is in the test script)
-        env:
-          E2E_PROBE_ADMIN_TOKEN: ${{ secrets.CP_STAGING_ADMIN_API_TOKEN }}
-        run: |
-          echo "A2A-probe step is a status-line advertisement for the script's gate"
-          echo "(real probe verdict comes from test_staging_concierge_creates_workspace_e2e.sh step 4.5/6)"
-          exit 0
-
+      # core#3081: the A2A-probe (asserting the live concierge's tool list
+      # actually contains mcp__molecule-platform__create_workspace, not just
+      # that the mcp_servers.yaml text declared it) lives INSIDE the test
+      # script as step 4.5/6 — it is the GATE. A separate "advisory" step
+      # here would mask failure (Researcher finding #2 from PR #3085 review).
+      # The script-internal probe fails HARD on a missing tool via
+      # E2E_REQUIRE_LIVE=1 (exit 5), so a missing overlay produces a clear
+      # ::error:: line and a red job status — not a green mask.
       - name: Run concierge-creates-workspace functional E2E
         run: bash tests/e2e/test_staging_concierge_creates_workspace_e2e.sh
 
