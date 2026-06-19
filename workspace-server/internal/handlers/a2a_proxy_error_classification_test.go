@@ -9,6 +9,7 @@ package handlers
 
 import (
 	"errors"
+	"io"
 	"net/http"
 	"strings"
 	"testing"
@@ -149,12 +150,11 @@ func TestClassificationFromDeliveryConfirmed(t *testing.T) {
 // double-classify or misclassify at the call site).
 func TestIsUpstreamBusyError_DoesNotSetClassification(t *testing.T) {
 	busyErr := &proxyA2AError{Status: http.StatusServiceUnavailable}
-	if !isUpstreamBusyError(errors.New("EOF")) {
-		// sanity: a synthetic EOF does classify as busy at the predicate
-		// level, but the proxyA2AError's Classification field is set by
-		// the caller at construction time, not by this predicate.
-		t.Skip("predicate semantics changed — update this test")
-	}
+	// Call the predicate with a canonical busy-shaped error. The KEY
+	// assertion is that isUpstreamBusyError is a pure predicate and does
+	// NOT mutate proxyA2AError.Classification — callers set the field at
+	// construction time, not by invoking the predicate.
+	_ = isUpstreamBusyError(io.EOF)
 	// The KEY assertion: isUpstreamBusyError is a pure predicate and
 	// does NOT mutate proxyA2AError.Classification. Callers must set
 	// the field at construction.
