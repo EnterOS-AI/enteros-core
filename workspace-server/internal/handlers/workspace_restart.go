@@ -418,7 +418,7 @@ func (h *WorkspaceHandler) Restart(c *gin.Context) {
 		"runtime": containerRuntime,
 	})
 
-	templatePath, configLabel := resolveRestartTemplate(h.configsDir, wsName, dbRuntime, restartTemplateInput{
+	templatePath, configLabel := resolveRestartTemplate(h.configsDir, wsName, dbRuntime, dbTemplate, restartTemplateInput{
 		Template:      body.Template,
 		ApplyTemplate: body.ApplyTemplate,
 		RebuildConfig: body.RebuildConfig,

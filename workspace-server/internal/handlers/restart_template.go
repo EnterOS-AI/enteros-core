@@ -39,7 +39,11 @@ type restartTemplateInput struct {
 //  3. `RebuildConfig=true` → org-templates recovery fallback (#239).
 //  4. `ApplyTemplate=true` + non-empty dbRuntime → runtime-default template
 //     (e.g. `hermes-default/`) for runtime-change workflows.
-//  5. Fall through → empty path + "existing-volume" label. Provisioner
+//  5. Persisted `dbTemplate` (set by PATCH /workspaces/:id/template) when no
+//     explicit body template was supplied. This makes `PATCH template=...`
+//     followed by a plain `POST /restart` actually apply the newly stored
+//     template instead of silently reusing the existing config volume.
+//  6. Fall through → empty path + "existing-volume" label. Provisioner
 //     reuses the workspace's existing config volume from the previous run.
 //
 // Returns (templatePath, configLabel). An empty templatePath is the signal
@@ -48,7 +52,7 @@ type restartTemplateInput struct {
 //
 // Pure function: no writes, no DB access, no network. Safe to unit-test
 // with just a temp directory.
-func resolveRestartTemplate(configsDir, wsName, dbRuntime string, body restartTemplateInput) (templatePath, configLabel string) {
+func resolveRestartTemplate(configsDir, wsName, dbRuntime, dbTemplate string, body restartTemplateInput) (templatePath, configLabel string) {
 	template := body.Template
 
 	// Tier 2: name-based auto-match, gated on ApplyTemplate.
@@ -102,7 +106,22 @@ func resolveRestartTemplate(configsDir, wsName, dbRuntime string, body restartTe
 		}
 	}
 
-	// Tier 5: reuse existing volume. This is the default, and the path
+	// Tier 5: persisted template from PATCH /workspaces/:id/template.
+	// When the caller supplied no explicit body template, fall back to the
+	// template stored in the DB. This makes `PATCH template=seo-agent`
+	// followed by `POST /restart` with no body apply the newly installed
+	// template instead of reusing the stale config volume.
+	if body.Template == "" && dbTemplate != "" {
+		if candidatePath, resolveErr := resolveInsideRoot(configsDir, dbTemplate); resolveErr != nil {
+			log.Printf("Restart: invalid persisted template %q: %v — proceeding without it", dbTemplate, resolveErr)
+		} else if _, err := os.Stat(candidatePath); err == nil {
+			return candidatePath, dbTemplate
+		} else {
+			log.Printf("Restart: persisted template %q dir not found — proceeding without it", dbTemplate)
+		}
+	}
+
+	// Tier 6: reuse existing volume. This is the default, and the path
 	// the Canvas Save+Restart flow MUST hit to preserve user edits.
 	return "", "existing-volume"
 }
