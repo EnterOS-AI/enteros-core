@@ -312,6 +312,15 @@ func TestMaybeProvisionPlatformAgentOnBoot_RestartsRunningButVanilla(t *testing.
 	mock.ExpectQuery(`SELECT id, status FROM workspaces WHERE kind = 'platform'`).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "status"}).AddRow(bootPlatformID, "online"))
 
+	// The running-but-vanilla path re-declares the management MCP plugin before
+	// restarting so the post-restart boot-install sees the declaration.
+	const kindQuery = `SELECT COALESCE\(kind, 'workspace'\) FROM workspaces WHERE id =`
+	mock.ExpectQuery(kindQuery).WithArgs(bootPlatformID).
+		WillReturnRows(sqlmock.NewRows([]string{"kind"}).AddRow("platform"))
+	mock.ExpectExec(`INSERT INTO workspace_declared_plugins`).
+		WithArgs(bootPlatformID, conciergePlatformMCPPlugin, sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
 	// Running, but ExecRead of system-prompt.md returns vanilla content (no
 	// "Org Concierge") → identity absent → restart.
 	prov := &stubBootProvExec{stubBootProv: stubBootProv{running: true}, systemPrompt: "generic coding assistant"}

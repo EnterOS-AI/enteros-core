@@ -613,18 +613,22 @@ func MaybeProvisionPlatformAgentOnBoot(ctx context.Context, database *sql.DB, pr
 	// Already online AND a live container? Then it's running — but it may be a
 	// concierge that pre-dates the identity overlay (booted as a vanilla
 	// claude-code agent with no system-prompt.md). Probe for the concierge
-	// identity; if it's missing, restart ONCE so the provision path re-seeds the
-	// overlay. This is what makes the seed idempotent + self-applying on the
-	// EXISTING concierge (the deterministic self-hosted id), not just new
-	// installs. IsRunning is the authoritative liveness check; status is the
-	// cheap one.
+	// identity; if it's missing, re-declare the management MCP plugin in the DB
+	// BEFORE restarting so the post-restart reconcile + boot-install see it, then
+	// restart ONCE so the provision path re-seeds the overlay. This is what makes
+	// the seed idempotent + self-applying on the EXISTING concierge (the
+	// deterministic self-hosted id), not just new installs. IsRunning is the
+	// authoritative liveness check; status is the cheap one.
 	running, _ := prov.IsRunning(ctx, id)
 	if running {
 		if conciergeIdentityPresent(ctx, prov, id) {
 			log.Printf("boot: platform-agent %s already running with concierge identity — skipping", id)
 			return
 		}
-		log.Printf("boot: platform-agent %s running but MISSING concierge identity — restarting once to apply the system prompt + platform MCP", id)
+		log.Printf("boot: platform-agent %s running but MISSING concierge identity — re-declaring management MCP and restarting once to apply the system prompt + platform MCP", id)
+		if rec, skip := seedTemplatePlugins(ctx, id, []string{conciergePlatformMCPPlugin}); skip > 0 {
+			log.Printf("boot: concierge %s could not re-declare %q plugin (recorded=%d skipped=%d) — management MCP may be absent until next provision", id, conciergePlatformMCPPlugin, rec, skip)
+		}
 		go restartByID(id)
 		return
 	}
