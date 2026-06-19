@@ -168,6 +168,24 @@ func conciergePlatformMCPEnv(env map[string]string) {
 	}
 	setIfAbsent("MOLECULE_API_URL", apiURL)
 	setIfAbsent("MOLECULE_ORG_ID", os.Getenv("MOLECULE_ORG_ID"))
+
+	// Authenticate the on-box plugin boot-install's gitea fetch (core#3065).
+	// The concierge declares its management MCP as a PRIVATE gitea:// plugin
+	// (molecule-ai-plugin-molecule-platform-mcp). The runtime's boot-install
+	// fetches it via curl + ~/.netrc, which setup-gitea-netrc.sh builds from
+	// GIT_HTTP_USERNAME / GIT_HTTP_PASSWORD. The concierge has no per-persona git
+	// token (applyAgentGitHTTPCreds no-ops for it), so without these the fetch is
+	// UNAUTHENTICATED → 404 on the private repo → plugin never installs → no
+	// create_workspace (verified live post-#872). Use the read-only
+	// MOLECULE_TEMPLATE_REPO_TOKEN the box already holds for fetching template/
+	// plugin repos, in the SAME basic-auth shape the Go gitea resolver uses (the
+	// PAT as the username + literal "x-oauth-basic" password — see
+	// plugins/gitea.go resolveURL). setIfAbsent so an operator-supplied GIT_HTTP_*
+	// or a real persona token still wins.
+	if tok := strings.TrimSpace(os.Getenv("MOLECULE_TEMPLATE_REPO_TOKEN")); tok != "" {
+		setIfAbsent("GIT_HTTP_USERNAME", tok)
+		setIfAbsent("GIT_HTTP_PASSWORD", "x-oauth-basic")
+	}
 }
 
 // applyConciergeProvisionConfig is the provision-time hook for the platform
