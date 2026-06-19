@@ -8,7 +8,6 @@
 package handlers
 
 import (
-	"errors"
 	"net/http"
 	"strings"
 	"testing"
@@ -148,19 +147,30 @@ func TestClassificationFromDeliveryConfirmed(t *testing.T) {
 // doesn't try to bake the classification INTO the predicate (which would
 // double-classify or misclassify at the call site).
 func TestIsUpstreamBusyError_DoesNotSetClassification(t *testing.T) {
-	busyErr := &proxyA2AError{Status: http.StatusServiceUnavailable}
-	if !isUpstreamBusyError(errors.New("EOF")) {
-		// sanity: a synthetic EOF does classify as busy at the predicate
-		// level, but the proxyA2AError's Classification field is set by
-		// the caller at construction time, not by this predicate.
-		t.Skip("predicate semantics changed — update this test")
+	// Build a *proxyA2AError that the predicate will classify as busy
+	// (its Error() string contains "EOF") and that already carries the
+	// busy_retryable classification set by the construction site. This is
+	// the real input shape: callers wrap a busy-shaped error with
+	// Classification="busy_retryable" and then pass the same error to
+	// isUpstreamBusyError. The predicate must stay pure.
+	busyErr := &proxyA2AError{
+		Status:         http.StatusServiceUnavailable,
+		Classification: "busy_retryable",
+		Response:       gin.H{"error": "EOF"},
 	}
-	// The KEY assertion: isUpstreamBusyError is a pure predicate and
-	// does NOT mutate proxyA2AError.Classification. Callers must set
-	// the field at construction.
-	if busyErr.Classification != "" {
+
+	// The predicate must classify this as upstream-busy.
+	if !isUpstreamBusyError(busyErr) {
+		t.Errorf("isUpstreamBusyError(busyErr) = false, want true")
+	}
+
+	// The load-bearing mutation guard: invoking the predicate directly on a
+	// *proxyA2AError must NOT mutate Classification. The predicate is a pure
+	// classifier; callers set Classification at construction time, not by
+	// calling this helper.
+	if busyErr.Classification != "busy_retryable" {
 		t.Errorf("isUpstreamBusyError must not mutate proxyA2AError.Classification; "+
-			"got %q after a busy-shaped error (the field is set at construction, "+
+			"got %q after invoking the predicate (the field is set at construction, "+
 			"not by the predicate)", busyErr.Classification)
 	}
 }
@@ -263,5 +273,4 @@ func TestUpstreamDead_ConstructionSites(t *testing.T) {
 // These imports are used by the tests above. If a future refactor removes
 // any of them, the test file will fail to compile — that is intentional,
 // it forces whoever removes the dependency to also update the test.
-var _ = errors.New
 var _ = http.StatusOK
