@@ -937,9 +937,9 @@ func TestRecordDeclaredPlugin_PrivilegedPluginEntitlement(t *testing.T) {
 		mock.ExpectQuery(kindQuery).WithArgs("ws-concierge").
 			WillReturnRows(sqlmock.NewRows([]string{"kind"}).AddRow("platform"))
 		mock.ExpectExec(declaredInsert).
-			WithArgs("ws-concierge", conciergePlatformMCPPlugin, sqlmock.AnyArg()).
+			WithArgs("ws-concierge", conciergePlatformMCPName, sqlmock.AnyArg()).
 			WillReturnResult(sqlmock.NewResult(0, 1))
-		if err := recordDeclaredPlugin(context.Background(), "ws-concierge", conciergePlatformMCPPlugin, conciergePlatformMCPPlugin); err != nil {
+		if err := recordDeclaredPlugin(context.Background(), "ws-concierge", conciergePlatformMCPName, conciergePlatformMCPSource); err != nil {
 			t.Fatalf("platform concierge declaration of the management MCP must succeed: %v", err)
 		}
 		if err := mock.ExpectationsWereMet(); err != nil {
@@ -952,7 +952,7 @@ func TestRecordDeclaredPlugin_PrivilegedPluginEntitlement(t *testing.T) {
 		mock.ExpectQuery(kindQuery).WithArgs("ws-user").
 			WillReturnRows(sqlmock.NewRows([]string{"kind"}).AddRow("workspace"))
 		// NO ExpectExec: the gate MUST refuse before any INSERT fires.
-		err := recordDeclaredPlugin(context.Background(), "ws-user", conciergePlatformMCPPlugin, conciergePlatformMCPPlugin)
+		err := recordDeclaredPlugin(context.Background(), "ws-user", conciergePlatformMCPName, conciergePlatformMCPSource)
 		if err == nil {
 			t.Fatal("a non-platform workspace MUST NOT be able to declare the privileged management MCP plugin")
 		}

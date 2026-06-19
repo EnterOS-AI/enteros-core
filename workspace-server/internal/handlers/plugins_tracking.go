@@ -112,7 +112,7 @@ func recordDeclaredPlugin(ctx context.Context, workspaceID, pluginName, sourceRa
 	// seed, org_import, a user-authored workspace.yaml), so refusing it here for a
 	// non-platform workspace closes the privilege-escalation vector regardless of
 	// declaration source. Fail-closed on a kind read error.
-	if pluginName == conciergePlatformMCPPlugin {
+	if pluginName == conciergePlatformMCPName {
 		var kind string
 		if err := db.DB.QueryRowContext(ctx,
 			`SELECT COALESCE(kind, 'workspace') FROM workspaces WHERE id = $1`, workspaceID).Scan(&kind); err != nil {

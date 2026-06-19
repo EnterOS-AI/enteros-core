@@ -256,8 +256,8 @@ func (h *WorkspaceHandler) applyConciergeProvisionConfig(
 	//    is kind-gated) → it is the primary entitlement gate for the privileged
 	//    org-admin MCP; recordDeclaredPlugin fail-closes the same name for any
 	//    non-platform workspace as defense-in-depth. Idempotent (upsert).
-	if rec, skip := seedTemplatePlugins(ctx, workspaceID, []string{conciergePlatformMCPPlugin}); skip > 0 {
-		log.Printf("Provisioner: concierge %s could not declare %q plugin (recorded=%d skipped=%d) — management MCP may be absent until next provision", workspaceID, conciergePlatformMCPPlugin, rec, skip)
+	if rec, skip := seedTemplatePlugins(ctx, workspaceID, []string{conciergePlatformMCPSource}); skip > 0 {
+		log.Printf("Provisioner: concierge %s could not declare %q plugin (recorded=%d skipped=%d) — management MCP may be absent until next provision", workspaceID, conciergePlatformMCPSource, rec, skip)
 	}
 
 	// 1. Platform-MCP env (org-admin token + platform URL + org id).
@@ -407,17 +407,36 @@ const conciergeProvider = "platform"
 // model resolves cleanly on its own (e.g. `sonnet` -> anthropic-oauth).
 const platformManagedModelPrefix = "moonshot/"
 
-// conciergePlatformMCPPlugin is the management-MCP plugin the concierge declares
-// (repo molecule-ai-plugin-molecule-platform-mcp). It wires the `molecule-mcp`
+// The management-MCP plugin the concierge declares. It wires the `molecule-mcp`
 // server (MOLECULE_MCP_MODE=management — create_workspace, list_workspaces, …)
 // into the Claude Code runtime via the plugin channel's MCPServerAdaptor,
 // replacing the baked-image + asset-channel mcp_servers.yaml path that does NOT
-// reach the on-box config (RFC: rfc-platform-mcp-as-plugin). Declaring it here —
-// from the kind=platform-only applyConciergeProvisionConfig — IS the primary
+// reach the on-box config (RFC: rfc-platform-mcp-as-plugin). Declaring it from
+// the kind=platform-only applyConciergeProvisionConfig IS the primary
 // entitlement gate (no user workspace runs this path); recordDeclaredPlugin adds
 // a defense-in-depth refusal for this PRIVILEGED name on any non-platform
 // workspace. The post-online reconcile + boot-install then install it.
-const conciergePlatformMCPPlugin = "molecule-platform-mcp"
+//
+// conciergePlatformMCPSource MUST be a gitea:// source, not a bare name: the
+// box's boot-install (runtime-image entrypoint) ONLY fetches gitea:// sources
+// and SKIPS anything else ("skip unsupported source"). A bare name parses to the
+// `local` scheme, which only resolves plugins baked into the image — and this is
+// a brand-new Gitea-only plugin repo, so a bare name would never be fetched.
+//
+// It MUST also carry a pinned #ref: the gitea resolver rejects an unpinned spec
+// in production (PLUGIN_ALLOW_UNPINNED is unset by default — see plugins/gitea.go),
+// so an unpinned source would record the declaration but then FAIL to fetch at
+// boot-install time → no management MCP, no create_workspace. #main matches the
+// established seo-all convention (gitea.go example). The #ref does NOT affect
+// PluginNameFromSource, so conciergePlatformMCPName below is unchanged.
+const conciergePlatformMCPSource = "gitea://molecule-ai/molecule-ai-plugin-molecule-platform-mcp#main"
+
+// conciergePlatformMCPName is the install NAME plugins.PluginNameFromSource
+// derives from the gitea:// source above (the repo segment, no subpath). It is
+// what gets written to workspace_declared_plugins.plugin_name and what the
+// recordDeclaredPlugin entitlement gate matches on — so it MUST equal the
+// derivation, not the human label "molecule-platform-mcp".
+const conciergePlatformMCPName = "molecule-ai-plugin-molecule-platform-mcp"
 
 // ensureConciergeProvider pins the concierge's LLM provider to `platform` (core
 // companion to ensureConciergeModel). It guarantees the env-level provider pin
