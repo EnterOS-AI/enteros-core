@@ -150,17 +150,22 @@ func TestClassificationFromDeliveryConfirmed(t *testing.T) {
 // double-classify or misclassify at the call site).
 func TestIsUpstreamBusyError_DoesNotSetClassification(t *testing.T) {
 	busyErr := &proxyA2AError{Status: http.StatusServiceUnavailable}
-	// Call the predicate with a canonical busy-shaped error. The KEY
-	// assertion is that isUpstreamBusyError is a pure predicate and does
-	// NOT mutate proxyA2AError.Classification — callers set the field at
-	// construction time, not by invoking the predicate.
-	_ = isUpstreamBusyError(io.EOF)
-	// The KEY assertion: isUpstreamBusyError is a pure predicate and
-	// does NOT mutate proxyA2AError.Classification. Callers must set
-	// the field at construction.
+
+	// Canonical busy-shaped input must still classify as busy. This fails
+	// closed if the predicate ever stops treating EOF / timeout / reset
+	// errors as upstream-busy.
+	if !isUpstreamBusyError(io.EOF) {
+		t.Errorf("isUpstreamBusyError(io.EOF) = false, want true")
+	}
+
+	// The load-bearing mutation guard: invoke the predicate directly on a
+	// *proxyA2AError and prove it does NOT mutate Classification. The
+	// predicate is a pure classifier; callers set Classification at
+	// construction time, not by calling this helper.
+	_ = isUpstreamBusyError(busyErr)
 	if busyErr.Classification != "" {
 		t.Errorf("isUpstreamBusyError must not mutate proxyA2AError.Classification; "+
-			"got %q after a busy-shaped error (the field is set at construction, "+
+			"got %q after invoking the predicate (the field is set at construction, "+
 			"not by the predicate)", busyErr.Classification)
 	}
 }
