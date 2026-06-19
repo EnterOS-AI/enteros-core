@@ -412,8 +412,28 @@ jobs:
             jq -r '.results[]? | "| \(.slug) | \(.phase) | \(.ssm_status // "-") | \(.ssm_exit_code) | \(.healthz_ok) |"' "$HTTP_RESPONSE" || true
           } >> "$GITHUB_STEP_SUMMARY"
           OK=$(jq -r '.ok // "false"' "$HTTP_RESPONSE")
-          if [ "$HTTP_CODE" != "200" ] || [ "$OK" != "true" ]; then
+          FAILED_SLUGS=$(jq -r '
+            .results[]?
+            | select((.healthz_ok != true) or (.ssm_status != "Success"))
+            | .slug' "$HTTP_RESPONSE" 2>/dev/null || true)
+          EPHEMERAL_PREFIX_RE='^(e2e-|rt-e2e-)'
+          NON_EPHEMERAL_FAILED=$(printf '%s\n' "$FAILED_SLUGS" | grep -v '^$' | grep -Ev "$EPHEMERAL_PREFIX_RE" || true)
+
+          if [ "$HTTP_CODE" = "200" ] && [ "$OK" = "true" ]; then
+            : # happy path
+          elif [ "$HTTP_CODE" = "500" ] && [ -z "$NON_EPHEMERAL_FAILED" ] && [ -n "$FAILED_SLUGS" ]; then
+            COUNT=$(printf '%s\n' "$FAILED_SLUGS" | grep -Ec "$EPHEMERAL_PREFIX_RE" || true)
+            echo "::warning::redeploy-fleet returned HTTP 500 but every failed tenant ($COUNT) is ephemeral (e2e-*/rt-e2e-*) — treating as teardown race, soft-warning."
+            printf '%s\n' "$FAILED_SLUGS" | sed 's/^/::warning::  failed: /'
+          elif [ "$HTTP_CODE" != "200" ] || [ "$OK" != "true" ]; then
             echo "::error::redeploy-fleet reported failure (HTTP $HTTP_CODE ok=$OK)"
+            echo "::group::Per-tenant redeploy-fleet results"
+            jq -r '.results[]? | "\(.slug) phase=\(.phase) ssm=\(.ssm_status // "-") exit=\(.ssm_exit_code) healthz=\(.healthz_ok)"' "$HTTP_RESPONSE" || true
+            if [ -n "$NON_EPHEMERAL_FAILED" ]; then
+              echo "non-ephemeral tenant(s) failed:"
+              printf '%s\n' "$NON_EPHEMERAL_FAILED" | sed 's/^/  /'
+            fi
+            echo "::endgroup::"
             exit 1
           fi
           cp "$HTTP_RESPONSE" "$RUNNER_TEMP/redeploy-response.json"
