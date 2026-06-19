@@ -432,8 +432,8 @@ func (h *DelegationHandler) executeDelegation(ctx context.Context, sourceID, tar
 	// This check MUST run before the transient-retry gate so a delivery-confirmed
 	// partial-body 2xx response is never retried.
 	if isDeliveryConfirmedSuccess(proxyErr, status, respBody) {
-		log.Printf("Delegation %s: completed with delivery error (status=%d, respBody=%d bytes, proxyErr=%v) — treating as success",
-			delegationID, status, len(respBody), proxyErr.Error())
+		log.Printf("Delegation %s: completed with delivery error (status=%d, respBody=%d bytes, proxyErr=%v, classification=%s) — treating as success",
+			delegationID, status, len(respBody), proxyErr.Error(), proxyErr.Classification)
 		goto handleSuccess
 	}
 
@@ -458,7 +458,17 @@ func (h *DelegationHandler) executeDelegation(ctx context.Context, sourceID, tar
 	}
 
 	if proxyErr != nil {
-		log.Printf("Delegation %s: step=handling_failure err=%v", delegationID, proxyErr)
+		// 2026-06-19 a2a RCA (#3056): surface the classification so log
+		// scrapers + monitoring can tell busy_retryable (transient
+		// backpressure) and delivered (2xx with transport blip) apart from
+		// upstream_dead (genuine container failure). Previously all three
+		// surfaced as the same opaque "proxy a2a error" string, which
+		// made a single-threaded busy spike look like a fleet outage.
+		classification := ""
+		if proxyErr.Classification != "" {
+			classification = " classification=" + proxyErr.Classification
+		}
+		log.Printf("Delegation %s: step=handling_failure err=%v%s", delegationID, proxyErr, classification)
 		log.Printf("Delegation %s: failed — %s", delegationID, proxyErr.Error())
 		h.updateDelegationStatus(ctx, sourceID, delegationID, "failed", proxyErr.Error())
 
