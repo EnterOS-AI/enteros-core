@@ -119,6 +119,107 @@ func isConciergeIdentityPath(rel string) bool {
 		strings.HasPrefix(rel, "prompts/")
 }
 
+// hasDockerfileCopyForRel reports whether Dockerfile.platform-agent contains
+// a COPY instruction for the expected IMAGE-BAKED file `rel` (relative to the
+// platform-agent template SSOT root). The Dockerfile uses two patterns:
+//
+//   - COPY ${PLATFORM_AGENT_TEMPLATE_DIR}/<rel> ...   for top-level files
+//     (config.yaml, mcp_servers.yaml, identity-fallback.sh).
+//   - COPY ${PLATFORM_AGENT_TEMPLATE_DIR}/<dir>/ ...  for directory-baked
+//     content (prompts/concierge.md is shipped via the prompts/ dir copy).
+//
+// COPY instructions may also carry Dockerfile flags such as
+// `--chmod=0755` before the source path, so the matcher permits an
+// optional flag segment between `COPY` and the source path.
+//
+// This helper centralises the pattern matching so the test body stays readable
+// and the two valid COPY shapes are documented in one place.
+func hasDockerfileCopyForRel(dockerfileStr, rel string) bool {
+	rel = filepath.ToSlash(filepath.Clean(rel))
+	relRe := regexp.QuoteMeta(rel)
+	dirRe := regexp.QuoteMeta(filepath.Dir(rel) + "/")
+
+	// Match: COPY [flags] ${PLATFORM_AGENT_TEMPLATE_DIR}/<rel> ...
+	// or:    COPY [flags] ${PLATFORM_AGENT_TEMPLATE_DIR}/<dir>/ ...
+	// Flags are zero or more `--flag[=value]` tokens (e.g. --chmod=0755,
+	// --chown=app:app, --chown=1000:1000) before the source path.
+	pattern := `(?m)^COPY(?:\s+--\S+)*\s+\$\{PLATFORM_AGENT_TEMPLATE_DIR\}/(?:` + relRe + `|` + dirRe + `)\s`
+	matched, err := regexp.MatchString(pattern, dockerfileStr)
+	if err != nil {
+		// regexp.QuoteMeta only produces safe patterns; a compile error
+		// here is a test-authoring bug, not a product failure.
+		panic("invalid hasDockerfileCopyForRel pattern: " + err.Error())
+	}
+	return matched
+}
+
+func TestHasDockerfileCopyForRel(t *testing.T) {
+	tests := []struct {
+		name        string
+		dockerfile  string
+		rel         string
+		wantMatched bool
+	}{
+		{
+			name:        "top-level file COPY",
+			dockerfile:  "COPY ${PLATFORM_AGENT_TEMPLATE_DIR}/config.yaml /opt/molecule-platform-agent-template/config.yaml\n",
+			rel:         "config.yaml",
+			wantMatched: true,
+		},
+		{
+			name:        "top-level file COPY with --chmod",
+			dockerfile:  "COPY --chmod=0755 ${PLATFORM_AGENT_TEMPLATE_DIR}/identity-fallback.sh /opt/molecule-platform-agent-template/identity-fallback.sh\n",
+			rel:         "identity-fallback.sh",
+			wantMatched: true,
+		},
+		{
+			name:        "top-level file COPY with --chown",
+			dockerfile:  "COPY --chown=1000:1000 ${PLATFORM_AGENT_TEMPLATE_DIR}/identity-fallback.sh /opt/molecule-platform-agent-template/identity-fallback.sh\n",
+			rel:         "identity-fallback.sh",
+			wantMatched: true,
+		},
+		{
+			name:        "top-level file COPY with multiple flags",
+			dockerfile:  "COPY --chmod=0755 --chown=node:node ${PLATFORM_AGENT_TEMPLATE_DIR}/identity-fallback.sh /opt/molecule-platform-agent-template/identity-fallback.sh\n",
+			rel:         "identity-fallback.sh",
+			wantMatched: true,
+		},
+		{
+			name:        "directory COPY for nested file",
+			dockerfile:  "COPY ${PLATFORM_AGENT_TEMPLATE_DIR}/prompts/ /opt/molecule-platform-agent-template/prompts/\n",
+			rel:         "prompts/concierge.md",
+			wantMatched: true,
+		},
+		{
+			name:        "missing COPY",
+			dockerfile:  "RUN echo no-copy\n",
+			rel:         "config.yaml",
+			wantMatched: false,
+		},
+		{
+			name:        "wrong source variable",
+			dockerfile:  "COPY ${OTHER_DIR}/config.yaml /opt/molecule-platform-agent-template/config.yaml\n",
+			rel:         "config.yaml",
+			wantMatched: false,
+		},
+		{
+			name:        "nested file missing directory COPY",
+			dockerfile:  "COPY ${PLATFORM_AGENT_TEMPLATE_DIR}/prompts/concierge.md /opt/molecule-platform-agent-template/prompts/concierge.md\n",
+			rel:         "prompts/concierge.md",
+			wantMatched: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := hasDockerfileCopyForRel(tt.dockerfile, tt.rel)
+			if got != tt.wantMatched {
+				t.Errorf("hasDockerfileCopyForRel(%q, %q) = %v, want %v", tt.dockerfile, tt.rel, got, tt.wantMatched)
+			}
+		})
+	}
+}
+
 // canonicalPlatformAgentSSOTRelPath is the default SSOT path the
 // drift-gate reads from when PLATFORM_AGENT_TEMPLATE_REPO_PATH is
 // unset, RELATIVE TO THE REPO ROOT. It mirrors Dockerfile.platform-
@@ -253,26 +354,7 @@ func TestPlatformAgentImageDriftGate(t *testing.T) {
 	dockerfileStr := string(dockerfile)
 
 	for _, rel := range expectedImageBakedFiles {
-		// The Dockerfile uses two patterns: COPY <rel> /opt/...
-		// for the top-level files (config.yaml, mcp_servers.yaml,
-		// identity-fallback.sh) and COPY <dir>/ /opt/.../ for the
-		// prompts/ directory. We check that EITHER pattern appears
-		// for the expected file.
-		//
-		// COPY may carry build-flags between the verb and the source
-		// arg — e.g. `COPY --chmod=0755 ${PLATFORM_AGENT_TEMPLATE_DIR}/
-		// identity-fallback.sh ...` (e4efc35d switched identity-
-		// fallback.sh from `RUN chmod` to `COPY --chmod` because the
-		// non-root tenant base can't `RUN chmod`). The matcher must
-		// tolerate any such `--flag[=value]` tokens; a literal-substring
-		// match on `COPY ${...}/` would false-fail the drift-gate the
-		// moment a COPY grows a flag. Match `COPY` + optional flags +
-		// the source path via regex (whitespace-flexible).
-		quotedDir := regexp.QuoteMeta(`${PLATFORM_AGENT_TEMPLATE_DIR}/`)
-		copyFlags := `(?:\s+--\S+)*` // zero or more `--flag[=val]` tokens
-		topLevel := regexp.MustCompile(`COPY` + copyFlags + `\s+` + quotedDir + regexp.QuoteMeta(rel) + `\b`)
-		dirPattern := regexp.MustCompile(`COPY` + copyFlags + `\s+` + quotedDir + regexp.QuoteMeta(filepath.Dir(rel)) + `/`)
-		if !topLevel.MatchString(dockerfileStr) && !dirPattern.MatchString(dockerfileStr) {
+		if !hasDockerfileCopyForRel(dockerfileStr, rel) {
 			t.Errorf("Dockerfile COPY missing: %s — the IMAGE-BAKED impl must COPY %s from the platform-agent template SSOT; if a new identity file is added, update Dockerfile.platform-agent AND expectedImageBakedFiles", rel, rel)
 		}
 	}
