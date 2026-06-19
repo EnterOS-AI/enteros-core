@@ -177,6 +177,11 @@ func (h *WorkspaceHandler) handleA2ADispatchError(ctx context.Context, workspace
 				"busy":        true,
 				"retry_after": busyRetryAfterSeconds,
 			},
+			// 2026-06-19 a2a RCA (#3056): distinguish "agent mid-turn,
+			// retry with backoff" from "agent dead, restart triggered"
+			// and "transport blip after a 2xx body" so monitoring
+			// doesn't count transient backpressure as a fleet outage.
+			Classification: "busy_retryable",
 		}
 	}
 	if logActivity {

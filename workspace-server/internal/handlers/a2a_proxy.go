@@ -172,6 +172,29 @@ type proxyA2AError struct {
 	// Optional response headers (e.g. Retry-After on 503-busy). Kept separate
 	// from Response so the handler can set real HTTP headers, not just JSON.
 	Headers map[string]string
+	// Classification lets callers and monitoring distinguish the distinct
+	// failure modes the proxy used to collapse into a single opaque
+	// "proxy a2a error" string. Possible values:
+	//   - "" (uncategorized; backward-compatible default — most existing call
+	//     sites that did not set this field pre-fix)
+	//   - "busy_retryable" — agent is mid-turn; safe to retry with Retry-After.
+	//     The target is alive and the message was likely delivered / is being
+	//     processed. Monitoring MUST NOT count this as a failure.
+	//   - "delivered" — 2xx response was received, the error is a post-response
+	//     transport blip (e.g. connection reset after the agent wrote the body).
+	//     The agent completed the work; the delegation should be marked
+	//     completed/success, not failed. Monitoring MUST NOT count this as a
+	//     failure.
+	//   - "upstream_dead" — dead-origin status family (502/503-restarting/504
+	//     plus CF 521/522/523/524). Triggers reactive container restart.
+	//     Genuine failure; counts as a delegation failure.
+	//
+	// Per the 2026-06-19 a2a RCA (#3056): the previous opaque
+	// "proxy a2a error" string forced monitoring to read the same string for
+	// transient backpressure, post-response blips, AND dead containers, so a
+	// single-threaded busy spike looked like a fleet outage. With this field,
+	// PM/monitoring consume the classification, not the string.
+	Classification string
 }
 
 // busyRetryAfterSeconds is the Retry-After hint returned with 503-busy
@@ -241,14 +264,45 @@ func isUpstreamDeadStatus(status int) bool {
 	return false
 }
 
+// classificationFromDeliveryConfirmed returns the proxyA2AError
+// classification that corresponds to the deliveryConfirmed flag set by the
+// 2xx-body-read-error path. When deliveryConfirmed is true, the agent wrote
+// a 2xx (or 3xx) response that we partially or fully received before the
+// transport error fired — the work IS done, the error is on the wire. We
+// mark the error as "delivered" so monitoring/PM can distinguish it from a
+// real failure. When deliveryConfirmed is false, no classification is set
+// (a non-2xx agent response or empty body is a real failure, not a
+// delivery blip, and the existing log shape stays intact for backward
+// compatibility with log parsers).
+//
+// 2026-06-19 a2a RCA (#3056). See proxyA2AError.Classification for the
+// full set of possible values.
+func classificationFromDeliveryConfirmed(deliveryConfirmed bool) string {
+	if deliveryConfirmed {
+		return "delivered"
+	}
+	return ""
+}
+
 func (e *proxyA2AError) Error() string {
-	if e == nil || e.Response == nil {
-		return "proxy a2a error"
+	if e == nil {
+		return ""
 	}
-	if msg, ok := e.Response["error"].(string); ok && msg != "" {
-		return msg
+	base := "proxy a2a error"
+	if e.Response != nil {
+		if msg, ok := e.Response["error"].(string); ok && msg != "" {
+			base = msg
+		}
 	}
-	return "proxy a2a error"
+	if e.Classification == "" {
+		return base
+	}
+	// Suffix the classification so callers (and humans tailing logs) can
+	// tell apart the three distinct conditions without having to inspect
+	// the response body shape. Monitoring/PM should consume the
+	// Classification field directly, not parse this string — this is for
+	// log readability only.
+	return base + " [" + e.Classification + "]"
 }
 
 // EnqueueA2A is a method wrapper around the package-level EnqueueA2A function so
@@ -723,6 +777,18 @@ func (h *WorkspaceHandler) proxyA2ARequest(ctx context.Context, workspaceID stri
 				"truncated":          errors.Is(readErr, errA2ABodyTooLarge),
 				"max_bytes":          maxProxyResponseBody,
 			},
+			// 2026-06-19 a2a RCA (#3056): when the agent completed the
+			// work and the proxy just failed to read the full body, the
+			// delegation is a SUCCESS — executeDelegation's
+			// isDeliveryConfirmedSuccess() check promotes it to the
+			// handleSuccess path. Marking it as "delivered" makes the
+			// classification visible to monitoring/PM; the prior opaque
+			// "proxy a2a error" string made it look like a failure
+			// even when the agent returned a 2xx body. Skipped when
+			// deliveryConfirmed is false (the response was non-2xx or
+			// the body was empty) — those are real failures, not
+			// delivery blips.
+			Classification: classificationFromDeliveryConfirmed(deliveryConfirmed),
 		}
 	}
 
@@ -817,6 +883,12 @@ func (h *WorkspaceHandler) proxyA2ARequest(ctx context.Context, workspaceID stri
 					Status:   http.StatusServiceUnavailable,
 					Headers:  map[string]string{"Retry-After": "15"},
 					Response: gin.H{"error": "workspace agent unreachable — container restart triggered", "restarting": true, "retry_after": 15},
+					// 2026-06-19 a2a RCA (#3056): the dead-origin family
+					// (502/504/521/522/523/524 + 503-restarting) is the only
+					// classification that genuinely counts as a failure.
+					// Distinct from busy_retryable (alive agent, mid-turn)
+					// and delivered (2xx with transport blip).
+					Classification: "upstream_dead",
 				}
 			}
 		}
