@@ -139,7 +139,7 @@ export function useChatHistory(
     loadInitial,
     loadOlder,
     appendMessageDeduped: (msg: ChatMessage) =>
-      setMessages((prev) => appendMessageDedupedFn(prev, msg)),
+      setMessages((prev) => appendMessageDedupedFn(prev, msg).slice(-MAX_MESSAGES)),
     setMessages,
     scrollAnchorRef,
   };

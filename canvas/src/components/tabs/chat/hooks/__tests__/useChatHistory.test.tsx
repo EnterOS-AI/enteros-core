@@ -78,4 +78,33 @@ describe("useChatHistory — message buffer cap (mobile-chat audit F4)", () => {
     // Some of the oldest loaded history should have been evicted by the cap.
     expect(result.current.messages.some((m) => m.id === "msg-1580")).toBe(false);
   });
+
+  it("caps the in-memory message buffer at MAX_MESSAGES on live append", async () => {
+    // Seed a small initial history.
+    const initial = Array.from({ length: 10 }, (_, i) => makeMsg(i + 1));
+    apiGet.mockResolvedValueOnce({
+      messages: initial,
+      reached_end: true,
+    });
+
+    const { result } = renderHook(() => useChatHistory("ws-1"));
+
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(result.current.messages).toHaveLength(10);
+
+    // Append enough distinct messages to exceed MAX_MESSAGES.
+    await act(async () => {
+      for (let i = 11; i <= 520; i++) {
+        result.current.appendMessageDeduped(makeMsg(i));
+      }
+    });
+
+    expect(result.current.messages.length).toBeLessThanOrEqual(500);
+    // The newest appended messages must survive the cap.
+    expect(result.current.messages.some((m) => m.id === "msg-520")).toBe(true);
+    expect(result.current.messages.some((m) => m.id === "msg-519")).toBe(true);
+    // The oldest initial messages should have been evicted.
+    expect(result.current.messages.some((m) => m.id === "msg-1")).toBe(false);
+    expect(result.current.messages.some((m) => m.id === "msg-10")).toBe(false);
+  });
 });
