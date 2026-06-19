@@ -25,6 +25,7 @@ import (
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/memory/contract"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/registry"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wsauth"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/pkg/provisionhook"
 	"github.com/gin-gonic/gin"
@@ -1354,6 +1355,26 @@ func (h *WorkspaceHandler) Get(c *gin.Context) {
 	} else {
 		ws["last_outbound_at"] = nil
 	}
+
+	// 2026-06-19 a2a RCA (#3057): surface a `wedged` boolean so
+	// operators and the canvas can detect the alive-but-wedged case
+	// (active_tasks>0, no outbound, no heartbeat) without manually
+	// inspecting the tuple. The predicate is the same one the
+	// wedged-agent monitor uses internally (registry.IsWedgedAgent),
+	// so the flag and the monitor can never disagree. Threshold comes
+	// from the same env var override; default 5 minutes. Active
+	// tasks and last_heartbeat_at are already in the scanned row
+	// (`ws`); last_outbound_at was just fetched above.
+	activeTasksVal, _ := ws["active_tasks"].(int)
+	var lastHeartbeat sql.NullTime
+	if hb, ok := ws["last_heartbeat_at"].(time.Time); ok {
+		lastHeartbeat = sql.NullTime{Time: hb, Valid: true}
+	} else if hbStr, ok := ws["last_heartbeat_at"].(string); ok {
+		if parsed, perr := time.Parse(time.RFC3339Nano, hbStr); perr == nil {
+			lastHeartbeat = sql.NullTime{Time: parsed, Valid: true}
+		}
+	}
+	ws["wedged"] = registry.IsWedgedAgent(activeTasksVal, lastOutbound, lastHeartbeat, registry.WedgedThresholdForHTTP())
 
 	// #2054 phase 2: per-runtime provision-timeout for canvas's
 	// ProvisioningTimeout banner.
