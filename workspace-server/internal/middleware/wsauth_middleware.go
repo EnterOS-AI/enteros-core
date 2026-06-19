@@ -114,8 +114,9 @@ func WorkspaceAuth(database *sql.DB) gin.HandlerFunc {
 		// control plane confirms membership in this tenant. Referer/Origin
 		// are forgeable and must never authenticate workspace data routes.
 		if cookieHeader := c.GetHeader("Cookie"); cookieHeader != "" {
-			if ok, _ := VerifiedCPSession(cookieHeader); ok {
+			if ok, _, userID := VerifiedCPSession(cookieHeader); ok {
 				c.Set("cp_session_actor", cpSessionActor(cookieHeader))
+				c.Set("cp_session_user_id", userID)
 				c.Next()
 				return
 			}
@@ -193,8 +194,9 @@ func AdminAuth(database *sql.DB) gin.HandlerFunc {
 		// hosted / dev deploys without a CP fall through to the
 		// bearer-only path unchanged.
 		if cookieHeader := c.GetHeader("Cookie"); cookieHeader != "" {
-			if ok, _ := VerifiedCPSession(cookieHeader); ok {
+			if ok, _, userID := VerifiedCPSession(cookieHeader); ok {
 				c.Set("cp_session_actor", cpSessionActor(cookieHeader))
+				c.Set("cp_session_user_id", userID)
 				c.Next()
 				return
 			}
@@ -444,6 +446,6 @@ func IsVerifiedCanvasSession(c *gin.Context) bool {
 	if cookie == "" {
 		return false
 	}
-	valid, _ := VerifiedCPSession(cookie)
+	valid, _, _ := VerifiedCPSession(cookie)
 	return valid
 }

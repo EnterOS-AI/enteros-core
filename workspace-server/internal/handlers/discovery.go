@@ -494,14 +494,15 @@ func validateDiscoveryCaller(ctx context.Context, c *gin.Context, workspaceID st
 	}
 
 	// No bearer: SaaS-canvas path authenticates via a CP-session cookie.
-	// VerifiedCPSession returns (valid, presented):
-	//   - (false, false) = no cookie, 401 (missing auth)
-	//   - (true, true)   = valid session, allow
-	//   - (false, true)  = cookie presented but invalid, 401
-	if ok, presented := middleware.VerifiedCPSession(c.GetHeader("Cookie")); presented {
-		if ok {
-			return nil
-		}
+	// VerifiedCPSession returns (valid, presented, userID):
+	//   - (false, "", false) = no cookie, 401 (missing auth)
+	//   - (true, userID, true)   = valid session, allow
+	//   - (false, "", true)  = cookie presented but invalid, 401
+	ok, presented, _ := middleware.VerifiedCPSession(c.GetHeader("Cookie"))
+	if ok {
+		return nil
+	}
+	if presented {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid session"})
 		return errors.New("invalid session")
 	}

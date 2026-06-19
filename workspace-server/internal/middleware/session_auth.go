@@ -77,6 +77,7 @@ const (
 type sessionCacheEntry struct {
 	expiresAt time.Time
 	ok        bool
+	userID    string
 }
 
 // cacheKey derives the lookup key. Using sha256 here isn't about
@@ -90,19 +91,19 @@ func cacheKey(slug, cookie string) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// sessionCacheGet returns (ok, hit). hit=false means expired or absent.
-func sessionCacheGet(key string) (ok bool, hit bool) {
+// sessionCacheGet returns (ok, userID, hit). hit=false means expired or absent.
+func sessionCacheGet(key string) (ok bool, userID string, hit bool) {
 	sessionCache.Lock()
 	defer sessionCache.Unlock()
 	e, present := sessionCache.entries[key]
 	if !present {
-		return false, false
+		return false, "", false
 	}
 	if time.Now().After(e.expiresAt) {
 		delete(sessionCache.entries, key)
-		return false, false
+		return false, "", false
 	}
-	return e.ok, true
+	return e.ok, e.userID, true
 }
 
 // sessionCachePut stores the result with the appropriate TTL. On
@@ -110,7 +111,7 @@ func sessionCacheGet(key string) (ok bool, hit bool) {
 // bounded. This isn't LRU — we don't need precise recency, just
 // ceiling behaviour. Random eviction is O(1) expected and avoids
 // the bookkeeping of a doubly-linked list.
-func sessionCachePut(key string, ok bool) {
+func sessionCachePut(key string, ok bool, userID string) {
 	ttl := sessionCacheTTLFail
 	if ok {
 		ttl = sessionCacheTTLOK
@@ -133,6 +134,7 @@ func sessionCachePut(key string, ok bool) {
 	sessionCache.entries[key] = sessionCacheEntry{
 		expiresAt: time.Now().Add(ttl),
 		ok:        ok,
+		userID:    userID,
 	}
 }
 
@@ -222,30 +224,35 @@ func tenantSlug() string {
 // any WorkOS-authed user could hit /cp/auth/me successfully; only
 // actual org members pass /cp/auth/tenant-member?slug=<us>.
 //
-// Returns (false, false) when no cookie at all, so callers can
+// The returned userID is the WorkOS user_id when valid is true; otherwise
+// it is empty. Callers that need the user_id for audit (e.g. org-token
+// mint provenance) should use this value rather than making a second
+// /cp/auth/me round-trip.
+//
+// Returns (false, "", false) when no cookie at all, so callers can
 // distinguish "no credential presented" (fall through to bearer)
 // from "credential presented but invalid" (abort with 401).
 //
-// Also returns (false, false) when MOLECULE_ORG_SLUG isn't configured
+// Also returns (false, "", false) when MOLECULE_ORG_SLUG isn't configured
 // — fail-safe: better to refuse session auth than to accept it
 // without knowing which tenant we ARE. Deployments that want session
 // auth MUST set both CP_UPSTREAM_URL and MOLECULE_ORG_SLUG.
-func VerifiedCPSession(cookieHeader string) (valid, presented bool) {
+func VerifiedCPSession(cookieHeader string) (valid bool, presented bool, userID string) {
 	if cookieHeader == "" {
-		return false, false
+		return false, false, ""
 	}
 	slug := tenantSlug()
 	if slug == "" {
-		return false, false
+		return false, false, ""
 	}
 	verifyURL := cpSessionVerifyURL(slug)
 	if verifyURL == "" {
-		return false, true
+		return false, true, ""
 	}
 
 	key := cacheKey(slug, cookieHeader)
-	if ok, hit := sessionCacheGet(key); hit {
-		return ok, true
+	if ok, uid, hit := sessionCacheGet(key); hit {
+		return ok, true, uid
 	}
 
 	// Short timeout — a slow CP mustn't gate every canvas render.
@@ -253,7 +260,7 @@ func VerifiedCPSession(cookieHeader string) (valid, presented bool) {
 	req, err := http.NewRequest("GET", verifyURL, nil)
 	if err != nil {
 		log.Printf("VerifiedCPSession: build req: %v", err)
-		return false, true
+		return false, true, ""
 	}
 	req.Header.Set("Cookie", cookieHeader)
 	req.Header.Set("User-Agent", "molecule-tenant-platform/session-verifier")
@@ -264,13 +271,13 @@ func VerifiedCPSession(cookieHeader string) (valid, presented bool) {
 		// NOTE: we deliberately do NOT cache transport failures.
 		// Caching them would mean a 3s CP blip locks out all users
 		// for the negative-TTL window. Next request retries.
-		return false, true
+		return false, true, ""
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		sessionCachePut(key, false)
-		return false, true
+		sessionCachePut(key, false, "")
+		return false, true, ""
 	}
 
 	var body struct {
@@ -278,16 +285,16 @@ func VerifiedCPSession(cookieHeader string) (valid, presented bool) {
 		UserID string `json:"user_id"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		sessionCachePut(key, false)
-		return false, true
+		sessionCachePut(key, false, "")
+		return false, true, ""
 	}
 	if !body.Member || body.UserID == "" {
-		sessionCachePut(key, false)
-		return false, true
+		sessionCachePut(key, false, "")
+		return false, true, ""
 	}
 
-	sessionCachePut(key, true)
-	return true, true
+	sessionCachePut(key, true, body.UserID)
+	return true, true, body.UserID
 }
 
 // VerifiedCPIdentity resolves the authenticated user's identity from the

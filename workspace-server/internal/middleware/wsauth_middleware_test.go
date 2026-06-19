@@ -143,6 +143,9 @@ func TestWorkspaceAuth_VerifiedTenantSessionCookie_AllowsCanvas(t *testing.T) {
 		if _, ok := c.Get("cp_session_actor"); !ok {
 			t.Errorf("cp_session_actor was not set")
 		}
+		if uid, ok := c.Get("cp_session_user_id"); !ok || uid != "u_1" {
+			t.Errorf("cp_session_user_id not set correctly, got %v", uid)
+		}
 		c.JSON(http.StatusOK, gin.H{"ok": true})
 	})
 
@@ -405,6 +408,9 @@ func TestAdminAuth_VerifiedCPSession_SetsSessionActor(t *testing.T) {
 		}
 		if actor == cookie {
 			t.Fatalf("cp_session_actor must not expose the raw cookie")
+		}
+		if uid, ok := c.Get("cp_session_user_id"); !ok || uid != "u_1" {
+			t.Fatalf("cp_session_user_id = %v, want u_1", uid)
 		}
 		c.JSON(http.StatusOK, gin.H{"ok": true})
 	})

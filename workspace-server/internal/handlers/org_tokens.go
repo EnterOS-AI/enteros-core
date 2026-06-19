@@ -307,8 +307,10 @@ func callerVerifiedSessionActor(c *gin.Context) string {
 //   - If authed via another org token (org_token_id in context),
 //     createdBy = "org-token:<prefix>" and orgID = token's org_id.
 //   - If authed via session cookie (AdminAuth's session tier),
-//     createdBy = "session", orgID = "" (session → org mapping not
-//     available in the handler; must be filled by the CP or left null).
+//     createdBy = "session:<workos_user_id>" when cp_session_user_id is
+//     available, otherwise "session", and orgID = "" (session → org mapping
+//     not available in the handler; must be filled by the CP or left null).
+//     Capturing the WorkOS user_id closes KI-004 item 5.
 //   - If ADMIN_TOKEN / bootstrap, createdBy = "admin-token",
 //     orgID = "".
 func orgTokenActor(c *gin.Context) (createdBy, orgID string) {
@@ -318,12 +320,15 @@ func orgTokenActor(c *gin.Context) (createdBy, orgID string) {
 		}
 	}
 	// Verified-session callers carry the cp_session_actor identity
-	// ("session:<hash>") — record THAT as created_by so the audit
-	// trail distinguishes which human session minted the token.
-	// (Previously this keyed off the raw Cookie header, which both
-	// misattributed bearer-authed requests carrying incidental
-	// cookies AND lost the per-session identity.)
+	// ("session:<hash>") — record the cp_session_user_id as created_by
+	// so the audit trail names the actual WorkOS user, not just a
+	// session hash. Fall back to "session" when the user_id is absent.
 	if actor := callerVerifiedSessionActor(c); actor != "" {
+		if uid, ok := c.Get("cp_session_user_id"); ok {
+			if s, ok := uid.(string); ok && s != "" {
+				return actorSession + ":" + s, ""
+			}
+		}
 		return actor, ""
 	}
 	return actorAdminToken, ""

@@ -388,13 +388,15 @@ func TestOrgTokenHandler_Create_VerifiedSession_SkipsGate(t *testing.T) {
 	os.Unsetenv("MOLECULE_PLATFORM_APPROVAL_GATE")
 	defer os.Unsetenv("MOLECULE_PLATFORM_APPROVAL_GATE")
 
-	const actor = "session:deadbeefcafe1234"
+	const actor = "session"
+	const userID = "u_dashboard_user_42"
 	mock.ExpectQuery(`INSERT INTO org_api_tokens`).
-		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), "from-dashboard", actor, nil).
+		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), "from-dashboard", actor+":"+userID, nil).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("tok-human"))
 
 	c, w := buildCtx("POST", "/org/tokens", `{"name":"from-dashboard"}`)
 	c.Set("cp_session_actor", actor)
+	c.Set("cp_session_user_id", userID)
 	h.Create(c)
 
 	if w.Code != http.StatusOK {
